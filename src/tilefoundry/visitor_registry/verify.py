@@ -566,6 +566,7 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: t
                         bound.enter_context(binders.bind(s.var, s))
             return
         case LetStmt():
+            verify_expression_placement(stmt.value, modes, where="ExecutionScope")
             binders.uses(stmt.value, stmt)
             value_ty = ctx.type_of(stmt.value)
             if stmt.var.type != value_ty:
@@ -627,6 +628,15 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: t
             return
         case Evaluate():
             binders.uses((stmt.callable, stmt.args), stmt)
+            if modes and isinstance(
+                stmt.callable, (Launch, SymbolRef, PrimFunction, ModuleList)
+            ):
+                raise VerifyError(
+                    f"call inside ExecutionScope {modes[-1]!r}: reaching "
+                    f"{getattr(stmt.callable, 'name', type(stmt.callable).__name__)!r} "
+                    "from inside a mode needs callee verification that knows the mode, "
+                    "which this build does not have yet; inline the computation instead"
+                )
             if isinstance(stmt.callable, Launch):
                 _verify_launch(stmt, fn, module_context, ctx)
             elif isinstance(stmt.callable, SymbolRef):
@@ -636,6 +646,8 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: t
             else:
                 op = stmt.callable
                 verify_op_placement(op, modes, where="ExecutionScope")
+                for argument in stmt.args:
+                    verify_expression_placement(argument, modes, where="ExecutionScope")
                 ctx.mesh_scope = tuple(scope)
                 ctx.current_mesh = None
                 for mesh in scope:
@@ -660,6 +672,47 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: t
         binders.uses(field_val, stmt)
         _reject_nested_alloc_tensor(field_val, at_letstmt_value=False)
         _check_embedded_sharding(field_val, scope, fn)
+
+
+def _call_like(value) -> bool:
+    """Whether *value* reaches a callable other than a direct declared operation."""
+    return isinstance(value, (SymbolRef, PrimFunction, ModuleList, Launch)) or (
+        isinstance(value, Call) and not isinstance(value.target, Op)
+    )
+
+
+def verify_expression_placement(value, modes: tuple, *, where: str) -> None:
+    """Check every operation reachable from one expression under the modes in force.
+
+    Placement is a property of the whole statement, not only of the operation a
+    statement happens to evaluate. An operation can appear in a LetStmt value, in
+    a call argument, in a tensor view chain or behind a retained callee, and each
+    of those positions is an equally good hiding place for something the mode
+    does not admit. The whole expression is walked so that "inside the with-block"
+    means the same thing as "checked".
+
+    A callable that is not a direct operation is refused inside a mode while
+    callee verification is not mode-aware: a callee is verified where it is
+    defined, which says nothing about the mode at the call site, so admitting it
+    here would be a loophole rather than a check.
+    """
+    if not modes:
+        for reachable in collect_exprs(value) if isinstance(value, Expr) else ():
+            if isinstance(reachable, Call):
+                verify_op_placement(reachable.target, modes, where=where)
+        return
+    for reachable in collect_exprs(value) if isinstance(value, Expr) else ():
+        if not isinstance(reachable, Call):
+            continue
+        target = reachable.target
+        if _call_like(target):
+            raise VerifyError(
+                f"call to {getattr(target, 'name', type(target).__name__)!r} inside "
+                f"{where} {modes[-1]!r}: a call inside an execution region needs "
+                "callee verification that knows the mode, which this build does not "
+                "have yet; inline the computation instead"
+            )
+        verify_op_placement(target, modes, where=where)
 
 
 def verify_op_placement(op, modes: tuple, *, where: str = "execution region") -> None:
@@ -1130,7 +1183,7 @@ def _iter_all_stmts(body):
         yield s
         if isinstance(s, Sequential):
             stack.extend(s.body)
-        elif isinstance(s, (For, While, MeshScope)):
+        elif isinstance(s, (For, While, MeshScope, ExecutionScope)):
             stack.append(s.body)
         elif isinstance(s, If):
             stack.append(s.then_body)
