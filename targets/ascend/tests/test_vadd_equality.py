@@ -28,10 +28,27 @@ What is checked, in order:
 7. the mask is load-bearing: driving vadd with a half-active predicate writes the
    active half and preserves the inactive half, which an all-ones mask cannot show.
 
+WHAT THE FIRST REAL RUN MUST SHOW. This file has never executed. When it does, the
+run is only evidence if it reports:
+
+  * the interpreter identity, printed by the driver, naming the conda env of record;
+  * every check above as ok, with the count matching the number of checks;
+  * specifically, the reparsed_ set present and green. A run that reports only the
+    built-IR flow, or silently omits the reparsed set, has not tested the emitted
+    program and must be treated as incomplete rather than passing;
+  * the printed inside/outside instruction lists, so a reader can see the placement
+    is what was claimed rather than inferring it from a boolean;
+  * on failure, a non-zero exit AND a printed produced/expected line. A run that
+    fails without those two things has failed in the harness, not in the program.
+
+Two failure modes to expect and read correctly. A NOT_RUN (exit 3) means torch was
+not importable and says NOTHING about M3. An ERROR (exit 2) means a case raised,
+which is a harness or fixture defect, not a wrong verdict -- the verdicts are PASS
+(0) and FAIL (1). Distinguishing them matters because only FAIL is a statement about
+the chain.
+
 Exit codes: 0 PASS, 1 FAIL, 2 ERROR, 3 NOT_RUN (no torch).
 """
-from __future__ import annotations
-
 import sys
 from pathlib import Path
 

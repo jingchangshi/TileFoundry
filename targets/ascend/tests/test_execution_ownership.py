@@ -15,13 +15,33 @@ TensorView over register storage -- cannot arise in this build: a view over an
 integer address is required to be shared-memory, so it has no register form. That
 is stated here rather than silently assumed.
 
-Run with the approved container interpreter; this file needs no test framework.
+COVERAGE, stated precisely so it is not over-read: the ownership rule has ONE
+constructible refusal (a private allocation hoisted outside its region) plus the
+external-parameter case. The sibling-region case is included but is NOT a second
+ownership negative -- the lexical binder refuses it first, and the case asserts that
+openly. Do not describe this file as four independent ownership controls.
+
+WHAT THE FIRST REAL RUN MUST SHOW. This file has never executed. When it does, the
+run is only evidence if it reports:
+
+  * the interpreter identity, printed by the driver, naming the conda env of record;
+  * the positive control as ok AND ACCEPTED -- this is the load-bearing line. A run
+    where the positive control fails, or where it is never reached because an
+    earlier case raised, proves nothing: every negative below can pass for free if
+    the fixture refuses everything;
+  * each negative naming the layer that refused, with the layer text printed next to
+    it, so a reviewer can see the rule that fired rather than trusting the label;
+  * the closing layer summary line, showing which layers were actually exercised.
+
+A negative that refuses for the wrong reason is a FAILED check here, not a near
+miss: the assertions pin both the message and the layer. If the first run shows a
+refusal arriving from a layer that does not encode the rule, the fixture is wrong
+and must be re-pointed -- not the assertion widened.
+
+Run with the interpreter of record, inside a container; this file needs no framework.
 
     PYTHONPATH=<repo>/src:<repo>/targets/ascend \
-        <interpreter> targets/ascend/tests/test_execution_ownership.py
-
-NOTE: this file was syntax-checked but NOT executed -- the container exec channel
-was wedged when it was written. Do not treat it as evidence.
+        python targets/ascend/tests/test_execution_ownership.py
 """
 from __future__ import annotations
 
