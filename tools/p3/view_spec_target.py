@@ -102,8 +102,19 @@ def main() -> int:
         i1.validate_views(tuple(rr)); his_rr = "ACCEPT"
     except Exception as e:  # noqa: BLE001
         his_rr = getattr(e, "reason", "error")
-    print("  same-dtype overlapping W x R: my spec=FORBID, his=%s" % his_same)
-    print("  diff-dtype overlapping R x R: my spec=ALLOW, his=%s" % his_rr)
+    print("  same-dtype overlapping W x R: my spec=FORBID, his=%s (NON-CONFORMING if ACCEPT)" % his_same)
+    print("  diff-dtype overlapping R x R: my spec=ALLOW, his=%s (NON-CONFORMING if rejected)" % his_rr)
+    # PINNING ASSERTIONS under the Lead ruling (access-based)
+    pin_same = [adapt(x) for x in same]
+    res_same = check(roots, pin_same, {pin_same[0].name: "write", pin_same[1].name: "read"})
+    if not res_same["VIEW_OVERLAP_INCOMPATIBLE"]:
+        print("  PIN FAIL: same-dtype W x R must be FORBIDDEN"); fails += 1
+    pin_rr = [adapt(x) for x in rr]
+    res_rr = check(roots, pin_rr, {pin_rr[0].name: "read", pin_rr[1].name: "read"})
+    if any(res_rr.values()):
+        print("  PIN FAIL: cross-dtype R x R must be ALLOWED"); fails += 1
+    if fails == 0:
+        print("  PINNING CASES: HOLD")
     print("  allocation generation on his objects: ABSENT -> my STALE rule cannot be evaluated")
     print("  count cap on his objects: ABSENT -> my EXTENT rule cannot be evaluated")
     return 0 if fails == 0 else 1

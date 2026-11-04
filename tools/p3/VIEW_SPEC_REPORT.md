@@ -87,3 +87,47 @@ view_spec.alias_conflicts(views, accesses) is the public entry point: pairs of d
 views on one root whose ranges intersect with a write on either side. P4 alias/plan checks
 must call THIS function (not a copy) so the plan and the view contract share one definition
 and cannot drift apart. The rule is access-based, matching section 2.
+
+
+### LEAD RULING (binding): ACCESS-BASED is the contract
+
+Ruled 2026-11-04: the aliasing hazard is a WRITE and a READ against intersecting bytes
+whose ORDER is undefined; the element width is irrelevant to that hazard. Therefore:
+  * any two distinct views on one root with intersecting byte ranges where EITHER side is
+    written are FORBIDDEN -- same-dtype W x R is exactly as unsafe as cross-dtype;
+  * read/read is ALLOWED regardless of dtype.
+I1's dtype-based validator (forbid only when element sizes differ) is NON-CONFORMING with
+this contract and must change; this spec does not adapt to it.
+
+Pinning cases (must hold forever):
+  BOTH bf16, overlapping, one WRITE one READ      -> spec FORBIDS (VIEW_OVERLAP_INCOMPATIBLE)
+  bf16 vs f32, overlapping, BOTH READ             -> spec ALLOWS
+
+Re-run status (updated). The original 7-case run was against sha 61a28adf and is NOT
+carried forward. I1 then changed the file; the re-run below is against sha
+b7d29757f763890f843937defe94056e661f3da1ecf927036d5ede021eb0bc6b (still UNTRACKED), and is
+valid only for that sha:
+  valid_full_bf16_to_f32              my [] = his ACCEPT                      CONFORMS
+  valid_read_read_overlap_diff_dtype  my [] = his ACCEPT                      CONFORMS (fixed)
+  misaligned                          VIEW_MISALIGNED_OFFSET = his misaligned  CONFORMS
+  range_exceeds_parent                VIEW_RANGE_OVERFLOWS_PARENT = his OOB    CONFORMS
+  extent_overflow                     VIEW_EXTENT_OVERFLOW = his ACCEPT        expected gap
+  stale_after_realloc                 VIEW_STALE_AFTER_REALLOC = his ACCEPT    expected gap
+  overlap_write_read_same_dtype       VIEW_OVERLAP_INCOMPATIBLE = his ACCEPT   NON-CONFORMING
+  => 7/7 matrix PASS; PINNING CASES HOLD in the spec.
+  => STILL NON-CONFORMING on same-dtype W x R: his validator ACCEPTs it. Root cause: his
+     DtypeViewSpec carries NO access/write field, so an access-based overlap rule cannot be
+     expressed at all. He needs an access kind on the view (or validate_views must take
+     accesses). Until then P4 must NOT rely on his validator for the write/read hazard.
+
+STALENESS and the ELEMENT-COUNT CAP remain spec/plan-level only: his object carries
+neither, so the target-side validator does not validate them; nothing may be read as target
+validation of those two.
+
+### Spec/plan-level only (not validated target-side)
+
+STALENESS (allocation generation) and the ELEMENT-COUNT CAP live at the SPEC/PLAN level.
+I1's DtypeViewSpec carries neither field, so the target-side validator does not validate
+them. Nothing here may be read as "the target validates staleness/count-limit"; those two
+rules are enforced only by this spec and (once wired) by P4. Stated so no claim outruns the
+evidence.
