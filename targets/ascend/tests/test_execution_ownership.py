@@ -253,11 +253,15 @@ def check_same_width_integer_is_refused() -> None:
     layer = LAYERS[before]
 
     # The dtype contract is stated in TWO places on purpose: the operand pattern on
-    # the declaration, and the verifier rule that reads the actual operand type. A
-    # refusal from EITHER is the same contract enforced. Being refused by the
-    # PATTERN is the better outcome -- the declaration itself carries the rule, so it
-    # fires before any instruction is admitted -- so pattern is the expected layer
-    # here and the verifier rule is the backstop for operands arriving another way.
+    # the declaration, and verify_operand_lanes, which reads the actual operand type.
+    # A refusal from EITHER is the same contract enforced, so both are accepted here.
+    #
+    # WHICH ONE FIRES FIRST is decided by the walker order, not by preference: on the
+    # direct-operation route the operand rules run BEFORE the matcher, so the
+    # verifier refusal is the one that arrives and the pattern is the backstop for
+    # operands reaching the matcher by another route. I am recording that rather than
+    # claiming the pattern fires first, which would be a nice story about the earliest
+    # possible point and not what the code does.
     assert layer in (LAYER_PATTERN, LAYER_VERIFIER), (
         f"refused by {layer!r}, which does not encode the element type: {message}"
     )
@@ -284,8 +288,9 @@ def check_half_width_lane_extent_is_refused() -> None:
     layer = LAYERS[before]
 
     # The lane count is asserted on the layer that carries the extent, not merely on
-    # the exception. Two layers encode it: the shape/projection pattern (the extent
-    # is part of the declaration) and verify_operand_lanes (the named rule).
+    # the exception. Two layers encode it -- the shape/projection pattern and
+    # verify_operand_lanes -- and by the same walker order as above the named rule
+    # is the one expected to arrive on this route.
     assert layer in (LAYER_SHAPE, LAYER_LANES), (
         f"refused by {layer!r}, which does not encode the lane count: {message}"
     )
