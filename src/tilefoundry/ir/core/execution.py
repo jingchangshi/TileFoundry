@@ -159,6 +159,11 @@ def execution_kind_of(surface: object) -> ExecutionKind | None:
     return declared if isinstance(declared, ExecutionKind) else None
 
 
+def execution_kind_for_surface(surface: str, *, dialect: str = "T") -> ExecutionKind | None:
+    """The declaration whose surface spelling is *surface* in *dialect*, or None."""
+    return _SURFACES.get((dialect, surface))
+
+
 def declared_kinds() -> tuple[ExecutionKind, ...]:
     """Every registered declaration, in registration order."""
     return tuple(_KINDS.values())
@@ -207,6 +212,7 @@ __all__ = [
     "declared_kinds",
     "declared_mask_width",
     "execution_kind",
+    "execution_kind_for_surface",
     "execution_kind_of",
     "register_execution_kind",
     "region_requirement",

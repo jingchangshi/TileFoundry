@@ -9,6 +9,7 @@ import isl
 from tilefoundry.ir.core import Expr, Var, get_metadata
 from tilefoundry.ir.core.expr import SSAValue
 from tilefoundry.ir.hir.loop_region import LoopRegion
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.isl_interop import dim_range
 from tilefoundry.ir.types import Mesh, Topology
@@ -575,7 +576,7 @@ class IterationScope:
         widest span is an upper bound on every coordinate's count, which is
         what every consumer of a trip count already reads it as.
         """
-        if isinstance(self.owner, MeshRegion) or self.parent is None:
+        if isinstance(self.owner, (MeshRegion, ExecutionRegion)) or self.parent is None:
             return 1, AnalysisPrecision.EXACT
         owner = self.owner
         span = simplify_dim(DimSub, (owner.extent, owner.start))
@@ -768,6 +769,10 @@ class ScopeBuilder(ValuationVisitor[None]):
         )
 
     def visit_leaf_MeshRegion(self, expr, operands, ctx):
+        self._record(expr, ctx, forward=SSAValue.leaves(expr.body))
+
+    def visit_leaf_ExecutionRegion(self, expr, operands, ctx):
+        """Record a mode region as forwarding its body, as a mesh region does."""
         self._record(expr, ctx, forward=SSAValue.leaves(expr.body))
 
     def visit_leaf_LoopRegion(self, expr, operands, ctx):

@@ -9,6 +9,7 @@ from tilefoundry.ir.core import Call, Constant, Expr, IRMetadata, Var, get_metad
 from tilefoundry.ir.core.expr import SSAValue
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.tensor.empty import Empty
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
@@ -39,7 +40,7 @@ class RegionInterval:
 
     """One mesh region's entry and exit events on the structured timeline."""
 
-    region: MeshRegion
+    region: MeshRegion | ExecutionRegion
     entered_at: int
     exited_at: int
 
@@ -99,7 +100,7 @@ class LivenessVisitor(ValuationVisitor[None]):
         values = collect_exprs(function.body) if function.body is not None else ()
         bound_ids = {id(parameter) for parameter in function.params}
         for value in values:
-            if isinstance(value, MeshRegion):
+            if isinstance(value, (MeshRegion, ExecutionRegion)):
                 bound_ids.update(id(parameter) for parameter in value.params)
             elif isinstance(value, LoopRegion):
                 bound_ids.add(id(value.induction_var))
@@ -224,6 +225,29 @@ class LivenessVisitor(ValuationVisitor[None]):
 
     def visit_MeshRegion(self, region: MeshRegion, ctx=None) -> None:
         """Make the argument/parameter and body/result binding edges explicit."""
+        for argument in region.args:
+            self.visit(argument, ctx)
+        argument_use = self.next_event()
+        for argument in region.args:
+            self.use(argument, argument_use)
+        parameter_definition = self.next_event()
+        for parameter in region.params:
+            self.define(parameter, parameter_definition)
+
+        inner = self.on_region_start(region, ctx)
+        self.visit(region.body, inner)
+        body_use = self.next_event()
+        self.use(region.body, body_use)
+        self.regions.append(RegionInterval(region, argument_use, body_use))
+        self.define(region, self.next_event())
+
+    def visit_ExecutionRegion(self, region: ExecutionRegion, ctx=None) -> None:
+        """Give a mode region the same argument/parameter/body edges as a mesh one.
+
+        The mode changes what may cross the boundary, not how the boundary is
+        named: the args are read outside, the params are defined at entry, and
+        the body's value is the region's one result.
+        """
         for argument in region.args:
             self.visit(argument, ctx)
         argument_use = self.next_event()

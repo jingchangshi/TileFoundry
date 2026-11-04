@@ -30,6 +30,7 @@ from tilefoundry.ir.core import (
     attach_metadata,
     get_metadata,
 )
+from tilefoundry.ir.core.execution import execution_kind_for_surface
 from tilefoundry.ir.core.param_def import variadic_item_annotation
 from tilefoundry.ir.hir.nn.matmul import MatMul
 from tilefoundry.ir.pattern import _mangle_variant_name
@@ -4379,6 +4380,21 @@ def _scoped_region(mesh, body, params=(), args=()):
     )
 
 
+def _scoped_execution_region(kind, body, params=(), args=()):
+    """Build a type-transparent HIR execution region.
+
+    The region types as its body does: which execution mode ran the work is not
+    a fact about the shape of what came out of it.
+    """
+    return runtime.ExecutionRegion(
+        kind=kind.name,
+        params=tuple(params),
+        args=tuple(args),
+        body=body,
+        type=body.type,
+    )
+
+
 def _region_captures(node, context, excluded=frozenset()):
     """Capture outer expression bindings for one region boundary."""
 
@@ -4480,7 +4496,7 @@ def _bind_region_results(context, region, names, node):
         context.lexical_scope.define(name, projection)
 
 
-def _rebind_through_region(context, mesh, names, frame, node, params=(), args=()):
+def _rebind_through_region(context, build, names, frame, node, params=(), args=()):
     """Point escaped names at a region result, whether or not it has a body value.
 
     A region's computed values are named, and those names are how code after it
@@ -4491,15 +4507,108 @@ def _rebind_through_region(context, mesh, names, frame, node, params=(), args=()
     """
     values = [(name, frame[name]) for name in names]
     if len(values) == 1:
-        scoped = _scoped_region(mesh, values[0][1], params, args)
+        scoped = build(values[0][1], params, args)
         _bind_region_results(context, scoped, [values[0][0]], node)
         return values[0][0]
     tuple_type = runtime.TupleType(fields=tuple(value.type for _name, value in values))
     tuple_body = runtime.IrTuple(type=tuple_type, elements=tuple(value for _name, value in values))
-    scoped = _scoped_region(mesh, tuple_body, params, args)
+    scoped = build(tuple_body, params, args)
     _bind_region_results(context, scoped, [name for name, _value in values], node)
     return values[0][0]
 
+
+def _with_execution_kind(context_expr):
+    """The execution kind a with-statement context expression names, or None.
+
+    Read off the syntax rather than the declaration registry: this runs while
+    the with-statement is being matched, before its context child is resolved.
+    A name the registry does not declare is not an execution region, so the
+    mesh reading gets its chance and the statement fails there if it is neither.
+    """
+    if not isinstance(context_expr, ast.Call) or context_expr.args or context_expr.keywords:
+        return None
+    func = context_expr.func
+    if not isinstance(func, ast.Attribute):
+        return None
+    return execution_kind_for_surface(func.attr)
+
+class ExecutionContextPattern(ElementPattern):
+    """The context expression of a with-statement naming one execution mode.
+
+    A surface marker is a declaration, not an operation: it is resolved by name
+    through the same registry the dialect tree reads, so a with-statement over
+    T.SimdVF states a mode and nothing else. It is deliberately not a Mesh
+    pattern -- entering a mode does not open participants, and a mesh with no
+    extent has no meaning.
+    """
+
+    element_name = "execution_context"
+    syntax = LazyPattern(
+        lambda: BindPattern(
+            AstNodePattern(
+                ast.Call,
+                FieldPattern(
+                    "func",
+                    AstNodePattern(
+                        ast.Attribute,
+                        FieldPattern(
+                            "attr", CapturePattern("surface", lambda value, context: value)
+                        ),
+                    ),
+                ),
+                FieldPattern("args", SequencePattern()),
+                FieldPattern("keywords", SequencePattern()),
+            ),
+            ExecutionContextPattern.enter,
+        )
+    )
+
+    @staticmethod
+    def enter(
+        node: object, context: MatchContext, matched: AstMatch[Any]
+    ) -> AstMatch[Any] | MatchFailure | None:
+        assert isinstance(node, ast.Call)
+        surface = matched.captures.get("surface")
+        kind = execution_kind_for_surface(surface) if isinstance(surface, str) else None
+        if kind is None:
+            return None
+        return dataclasses.replace(
+            matched,
+            pattern_id="execution.context",
+            branch_id="execution_context",
+            captures={**matched.captures, "kind": kind},
+        )
+
+    @staticmethod
+    def construct(match, children, context):
+        return match.captures["kind"]
+
+    RULES: ClassVar[tuple[AstRule[Any], ...]] = ()
+
+
+def _enter_execution_scope(context, kind, *, matched, node):
+    """Record the execution mode a with-statement puts in force for its body.
+
+    The mode is tracked on the parse state so a nested with-statement can be
+    refused while the body is still being built, and so the frame it adds is
+    popped by the same statement that pushed it.
+    """
+    if context.function is None:
+        raise ParseError.from_node(
+            node, context, "an execution region requires function context"
+        )
+    state = context.function.state
+    enclosing = state.execution_stack[-1] if state.execution_stack else None
+    if enclosing is not None and not enclosing.nestable:
+        raise ParseError.from_node(
+            node,
+            context,
+            f"{kind.surface} cannot be entered inside {enclosing.surface}: "
+            f"execution region {enclosing.name!r} is not nestable",
+        )
+    state.execution_stack.append(kind)
+    context.lexical_scope.push_frame()
+    context.lexical_scope.define(_TYPE_INFER_CONTEXT, _parser_infer_context(context))
 
 class WithPattern(ElementPattern):
     element_name = "with"
@@ -4512,14 +4621,20 @@ class WithPattern(ElementPattern):
                     SequencePattern(
                         AstNodePattern(
                             ast.withitem,
-                            FieldPattern("optional_vars", AstNodePattern(ast.Name)),
+                            FieldPattern(
+                                "optional_vars",
+                                OptionalPattern(AstNodePattern(ast.Name)),
+                            ),
                             FieldPattern(
                                 "context_expr",
                                 ChildPattern(
-                                    "mesh",
-                                    MeshContextPattern(),
-                                    "mesh_context",
-                                    "mesh",
+                                    "context_expr",
+                                    ChoicePattern(
+                                        MeshContextPattern(),
+                                        ExecutionContextPattern(),
+                                    ),
+                                    "with_context",
+                                    "with_context",
                                 ),
                             ),
                         )
@@ -4544,55 +4659,90 @@ class WithPattern(ElementPattern):
     def enter(node: object, context: MatchContext, matched: AstMatch[Any]) -> AstMatch[Any] | None:
         assert isinstance(node, ast.With)
         item = node.items[0]
-        assert isinstance(item.optional_vars, ast.Name)
-        binding = item.optional_vars.id
+        binding = item.optional_vars.id if isinstance(item.optional_vars, ast.Name) else None
+        kind = _with_execution_kind(item.context_expr)
+        if kind is not None and context.function is not None:
+            if context.function.dialect != "hir":
+                raise ParseError.from_node(
+                    node,
+                    context,
+                    f"{kind.surface} states an authored execution mode; it belongs in a hir function",
+                )
+            if binding is not None:
+                raise ParseError.from_node(
+                    node,
+                    context,
+                    f"{kind.surface} opens an execution region, not a scope of participants; "
+                    f"it binds no name, so drop the {binding!r} target",
+                )
+        if kind is None and binding is None:
+            raise ParseError.from_node(
+                node,
+                context,
+                f"{ast.unparse(item.context_expr)!r} opens neither a Mesh scope nor a "
+                "declared execution region; a Mesh scope also requires a binding name",
+            )
         params, args = _region_captures(node, context)
+        if kind is not None:
+            _enter_execution_scope(context, kind, matched=matched, node=node)
+        children = [
+            AstChild(
+                "execution" if kind is not None else "mesh",
+                ExecutionContextPattern() if kind is not None else MeshContextPattern(),
+                item.context_expr,
+                "execution_context" if kind is not None else "mesh_context",
+                "execution_context" if kind is not None else "mesh",
+                values={} if kind is not None else {"mesh_binding": binding},
+            ),
+            AstChild(
+                "body",
+                BlockPattern(),
+                _body_as_ast_module(node.body),
+                "block",
+                "with_body",
+                lexical_bindings=(
+                    _region_capture_bindings(params, context)
+                    if context.function.dialect == "hir"
+                    else None
+                ),
+                values={
+                    "loop_captures": (
+                        *context.values.get("loop_captures", ()), *zip(params, args)
+                    )
+                },
+            ),
+        ]
         return dataclasses.replace(
             matched,
-            pattern_id="statement.with_mesh",
-            branch_id="with_mesh",
+            pattern_id="statement.with_execution" if kind is not None else "statement.with_mesh",
+            branch_id="with_execution" if kind is not None else "with_mesh",
             captures={
                 **matched.captures,
                 "binding": binding,
+                "kind": kind,
                 "region_params": params,
                 "region_args": args,
             },
-            children=(
-                AstChild(
-                    "mesh",
-                    MeshContextPattern(),
-                    item.context_expr,
-                    "mesh_context",
-                    "mesh",
-                    values={"mesh_binding": binding},
-                ),
-                AstChild(
-                    "body",
-                    BlockPattern(),
-                    _body_as_ast_module(node.body),
-                    "block",
-                    "with_body",
-                    lexical_bindings=(
-                        _region_capture_bindings(params, context)
-                        if context.function.dialect == "hir"
-                        else None
-                    ),
-                    values={
-                        "loop_captures": (
-                            *context.values.get("loop_captures", ()), *zip(params, args)
-                        )
-                    },
-                ),
-            ),
+            children=tuple(children),
         )
 
     @staticmethod
     def construct(match, children, context):
         if context.function is None:
             raise ParseError.from_node(match.node, context, "`with` requires function context")
-        mesh = children["mesh"]
+        kind = match.captures.get("kind")
         frame = context.lexical_scope.pop_frame()
-        frame.pop(match.captures["binding"], None)
+        binding = match.captures.get("binding")
+        if binding is not None:
+            frame.pop(binding, None)
+        if kind is not None:
+            if not context.function.state.execution_stack:
+                raise ParseError.from_node(match.node, context, "Execution stack is unbalanced")
+            active_kind = context.function.state.execution_stack.pop()
+            if active_kind is not kind:
+                raise ParseError.from_node(match.node, context, "Execution stack is unbalanced")
+            return WithPattern._construct_execution(match, children, context, kind, frame)
+        mesh = children["mesh"]
         if not context.function.state.mesh_stack:
             raise ParseError.from_node(match.node, context, "Mesh stack is unbalanced")
         active_mesh = context.function.state.mesh_stack.pop()
@@ -4601,31 +4751,75 @@ class WithPattern(ElementPattern):
         if context.function.dialect == "hir":
             body = children["body"]
             params = match.captures.get("region_params", ())
-            entry = {param.name: param for param in params}
-            live = context.live_out[match.node]
-            escaping = tuple(
-                name
-                for name, value in frame.items()
-                if isinstance(value, runtime.Expr)
-                and value is not entry.get(name)
-                and (context.lexical_scope.lookup(name) is not None or name in live)
-            )
             args = match.captures.get("region_args", ())
-            rebound = None
-            if escaping:
-                rebound = _rebind_through_region(
-                    context, mesh, escaping, frame, match.node, params, args
-                )
+            escaping, rebound = WithPattern._rebind_escapes(
+                context, match, frame, params, args, lambda body, p, a: _scoped_region(mesh, body, p, a)
+            )
             if body is not None and (
                 rebound is None or isinstance(match.node.body[-1], ast.Return)
             ):
                 return _scoped_region(mesh, body, params, args)
             return None if rebound is None else context.lexical_scope.lookup(rebound)
-        binding = runtime.Var(
+        binding_var = runtime.Var(
             type=runtime.TensorType.scalar(runtime.DType.i64, storage=runtime.StorageKind.RMEM),
-            name=match.captures["binding"],
+            name=binding,
         )
-        return runtime.MeshScope(mesh=mesh, binding=binding, body=children["body"])
+        return runtime.MeshScope(mesh=mesh, binding=binding_var, body=children["body"])
+
+    @staticmethod
+    def _rebind_escapes(context, match, frame, params, args, build):
+        """Rebind the names this region rebinds outside it, if any escape."""
+        entry = {param.name: param for param in params}
+        live = context.live_out[match.node]
+        escaping = tuple(
+            name
+            for name, value in frame.items()
+            if isinstance(value, runtime.Expr)
+            and value is not entry.get(name)
+            and (context.lexical_scope.lookup(name) is not None or name in live)
+        )
+        if not escaping:
+            return escaping, None
+        return escaping, _rebind_through_region(
+            context, build, escaping, frame, match.node, params, args
+        )
+
+    @staticmethod
+    def _construct_execution(match, children, context, kind, frame):
+        """Build the execution region this with-statement opened.
+
+        The body leaves through one value, so a mode that computes something
+        has exactly one way out and register-private values cannot ride along.
+        """
+        if context.function.dialect != "hir":
+            raise ParseError.from_node(
+                match.node,
+                context,
+                f"{kind.surface} opens an authored execution region; it has no TIR spelling here",
+            )
+        params = match.captures.get("region_params", ())
+        args = match.captures.get("region_args", ())
+        body = children["body"]
+        escaping, rebound = WithPattern._rebind_escapes(
+            context,
+            match,
+            frame,
+            params,
+            args,
+            lambda value, p, a: _scoped_execution_region(kind, value, p, a),
+        )
+        if body is not None and (rebound is None or isinstance(match.node.body[-1], ast.Return)):
+            return _scoped_execution_region(kind, body, params, args)
+        if rebound is None:
+            if body is not None:
+                return _scoped_execution_region(kind, body, params, args)
+            raise ParseError.from_node(
+                match.node,
+                context,
+                f"{kind.surface} region computes nothing to leave it; "
+                "give the region a returning body",
+            )
+        return context.lexical_scope.lookup(rebound)
 
     RULES: ClassVar[tuple[AstRule[Any], ...]] = ()
 

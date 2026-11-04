@@ -17,6 +17,8 @@ from tilefoundry.ir.core.metadata import diagnostic_location
 from tilefoundry.ir.core.module import Module, ModuleList, resolve_symbol
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
+from tilefoundry.ir.core.execution import declared_kinds, execution_kind
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
 from tilefoundry.ir.hir.specialize import canonical_specialization_signature
@@ -88,6 +90,74 @@ def verify_region_isolated(region: LoopRegion | MeshRegion, ctx=None) -> None:
         ctx.error(region, message)
     raise VerifyError(f"{type(region).__name__}: {message}")
 
+
+
+
+def execution_kind_declaration(kind: str):
+    """The declaration named *kind*, or a precise refusal when none declares it.
+
+    A region that names no declared mode has no boundary to check, so an unknown
+    kind is refused rather than treated as an unconstrained region. The same is
+    true of a declaration that states no mask width: a mode whose instructions
+    cannot be bounded cannot be checked, and passing it would be a silent
+    admission of every width.
+    """
+    declared = execution_kind(kind)
+    if declared is None:
+        raise VerifyError(
+            f"execution region names undeclared kind {kind!r}; declared kinds are "
+            f"{tuple(item.name for item in declared_kinds())!r}"
+        )
+    return declared
+
+
+def current_execution_kinds(ctx) -> tuple:
+    """The execution modes in force at *ctx*, outermost first."""
+    if ctx is None:
+        return ()
+    held = [
+        ctx_.owner.declaration()
+        for ctx_ in ctx.ancestors()
+        if isinstance(ctx_.owner, ExecutionRegion)
+    ]
+    return tuple(reversed(held))
+
+
+def verify_execution_boundary(region, ctx=None) -> None:
+    """Check one execution region states a mode that can be entered here.
+
+    Two questions, both about the boundary rather than the body: does the mode
+    exist with a mask width its instructions can be held to, and is the topology
+    it requires the one in force. The body is the body walker s question.
+    """
+    declared = execution_kind_declaration(region.kind)
+    if declared.mask_width_bits is None:
+        message = (
+            f"execution region {declared.name!r} declares no mask width; "
+            "a mode whose element width is unstated cannot bound its instructions"
+        )
+        if ctx is not None:
+            ctx.error(region, message)
+        raise VerifyError(f"ExecutionRegion: {message}")
+    for enclosing in current_execution_kinds(ctx):
+        if enclosing.name == declared.name and not declared.nestable:
+            message = (
+                f"execution region {declared.name!r} re-enters a mode already in force; "
+                "this kind is not nestable"
+            )
+            if ctx is not None:
+                ctx.error(region, message)
+            raise VerifyError(f"ExecutionRegion: {message}")
+    known = {level.name for level in (ctx.topologies or ())} if ctx is not None else set()
+    for topology in declared.required_topologies:
+        if known and topology not in known:
+            message = (
+                f"execution region {declared.name!r} requires topology {topology!r}, "
+                f"which the declaration does not have; it has {tuple(sorted(known))!r}"
+            )
+            if ctx is not None:
+                ctx.error(region, message)
+            raise VerifyError(f"ExecutionRegion: {message}")
 
 def verify_value_layouts(expr):
     """Require concrete tensor layouts on values, independently of annotations."""

@@ -21,6 +21,7 @@ from tilefoundry.evaluator.value import (
 from tilefoundry.ir.core import Call, Constant, Tuple, Var, describe_expr
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.pattern import locate_dim_var
 from tilefoundry.ir.types.dim import DimVar
@@ -97,6 +98,22 @@ class EvaluatorVisitor(ExprVisitor):
         if len(args) != len(region.params):
             raise EvalError(
                 f"evaluator: MeshRegion expects {len(region.params)} args, got {len(args)}"
+            )
+        memo = {id(param): (param, value) for param, value in zip(region.params, args)}
+        return EvaluatorVisitor(memo=memo).visit(region.body, ctx)
+
+    def visit_ExecutionRegion(self, region: ExecutionRegion, ctx: EvaluateContext) -> Value:
+        """Evaluate a mode region as its body, with captures bound outside it.
+
+        A mode does not compute anything of its own: it states what the work
+        inside may do. Evaluation therefore binds the captures and evaluates the
+        body, and a register-private value never leaves because the body's value
+        is the region's value.
+        """
+        args = tuple(self.visit(arg, ctx) for arg in region.args)
+        if len(args) != len(region.params):
+            raise EvalError(
+                f"evaluator: ExecutionRegion expects {len(region.params)} args, got {len(args)}"
             )
         memo = {id(param): (param, value) for param, value in zip(region.params, args)}
         return EvaluatorVisitor(memo=memo).visit(region.body, ctx)

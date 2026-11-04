@@ -1,5 +1,13 @@
 """TileFoundry Ascend950PR backend (Scheduled HIR / TIR analysis; contract + planning + reference eval).
 
-This package is a self-contained Ascend target bundle. It does not import the
-TileFoundry core so it can be exercised with any Python that has numpy and z3.
+The contract, planning and reference-evaluation parts of this bundle are
+self-contained so they can be exercised with any Python that has numpy and z3.
+Declaring a Target is the one part that reaches the core, because a Target is a
+core value; importing the package is what publishes this device's execution
+surface and its Target.
 """
+
+from tilefoundry_ascend import ir as _ir  # noqa: F401  (registers the surface)
+from tilefoundry_ascend.tf_target import Ascend950PRTarget  # noqa: F401
+
+__all__ = ["Ascend950PRTarget"]
