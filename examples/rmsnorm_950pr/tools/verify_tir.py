@@ -269,6 +269,18 @@ ARTIFACT_REJECTIONS = {
                 "expect_nonzero_exit": True,
                 "contains": "does not match smem",
             },
+            {
+                "name": "mask_without_producer",
+                "why": "a predicated op whose mask no instruction wrote is reading a "
+                       "register nothing produced; lowering must refuse it.",
+                "stage": "finalize",
+                "replace": [
+                    ("pred = tf.schedule((mask,), op=T.ascend_pset(elem_width=32))", ""),
+                    ("(hl, hr, pred, acc)", "(hl, hr, mask, acc)"),
+                ],
+                "expect_nonzero_exit": True,
+                "contains": "no producing instruction",
+            },
         ],
     },
 }
@@ -277,12 +289,12 @@ ARTIFACT_REJECTIONS = {
 #: Recorded so the gap is visible rather than papered over with a case that cannot
 #: fire. Dropping the pset and feeding the mask tensor straight to ascend_vadd is
 #: ACCEPTED today (finalize exit 0); there is no "mask has no producer" check.
-KNOWN_UNENFORCED = {
-    "vf_vadd.py": [
-        {"proposal": "drop the pset so the mask has no producer",
-         "observed": "finalize exit 0 -- accepted; no producer check exists"},
-    ],
-}
+#: Empty now: the producerless-mask gap this once recorded was CLOSED upstream in
+#: TileFoundry 0550703 (verify_predicate_producers), and is asserted as a real
+#: rejection in ARTIFACT_REJECTIONS["vf_vadd.py"]. Kept as a dict so a future
+#: unenforced proposal has a home -- but a case that DOES fire belongs in
+#: ARTIFACT_REJECTIONS, not here, or it becomes a lie.
+KNOWN_UNENFORCED = {}
 
 
 def run_rejections(source_text: str, source_path: str, entry: str, kind: str, record: dict) -> bool:
