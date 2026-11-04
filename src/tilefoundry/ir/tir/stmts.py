@@ -70,6 +70,29 @@ class MeshScope(Stmt):
 
 
 @dataclass(unsafe_hash=True)
+class ExecutionScope(Stmt):
+    """Run body in one declared execution mode; not a mesh, opens no participants.
+
+    The scope is the TIR spelling of an HIR execution region: it fixes the
+    execution mode that the operations inside it are checked against, and its
+    boundary is where register-private values must stop.
+    """
+
+    kind: str
+
+    body: Sequential
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, str) or not self.kind:
+            raise ValueError("ExecutionScope: kind must be a non-empty string")
+        if not isinstance(self.body, Sequential):
+            raise TypeError(
+                f"ExecutionScope {self.kind!r}: body must be a Sequential, "
+                f"got {type(self.body).__name__}"
+            )
+
+
+@dataclass(unsafe_hash=True)
 class Return(Stmt):
     """Empty return; tir functions have no value return."""
 
@@ -89,6 +112,7 @@ __all__ = [
     "While",
     "If",
     "MeshScope",
+    "ExecutionScope",
     "Return",
     "Evaluate",
 ]
