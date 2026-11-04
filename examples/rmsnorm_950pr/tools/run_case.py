@@ -1,43 +1,30 @@
 #!/usr/bin/env python3
 """Run one Twin case on the real 950PR: numeric check, compile snapshot, paired
-benchmark against the frozen v33 baseline. One case per process."""
+benchmark against the frozen v33 baseline. One case per process.
+
+Exit codes (propagated to the caller, NOT swallowed):
+  0  numerical PASS (0 mismatches under the frozen protocol) and bitwise-stable
+  1  numerical FAIL or instability
+  2  ERROR (unexpected exception)
+  3  NOT_RUN (torch_npu absent) -- no device touched, no result
+ 75  BLOCKED_ENV (device not authorised) -- refused before importing torch_npu
+"""
 from __future__ import annotations
 import argparse, hashlib, importlib.util, json, os, statistics, sys, traceback
 from pathlib import Path
 
-
-# --------------------------------------------------------------- device gate
-#
-# THIS PATH MAY NOT TOUCH A DEVICE WITHOUT EXPLICIT AUTHORISATION.
-#
-# The script used to import torch_npu and call torch.npu.set_device(0) as its first
-# act, with no gate at all. During a host-wide device freeze that is a violation
-# waiting to happen, and the cost is not hypothetical: in this program a device open
-# at 13:46:26 was followed 32 s later by a host-wide docker exec stall, with the card
-# already held by other tenants. A FAILED aclInit still OPENS the device node, so
-# "it only errored" is not a defence -- the open happens either way.
-#
-# Two rules, in this order:
-#   1. Presence is checked with find_spec, NEVER by importing. Importing torch_npu
-#      loads libhccl and reaches the CANN stack, which is already device-adjacent;
-#      the refusal has to happen before that, not after.
-#   2. set_device is called only on the authorised path. It is never reached by
-#      default, and never "just to see".
-#
-# Exit 75 is BLOCKED_ENV: the run did not happen. That is not a pass and not a
-# failure -- there is no result, and reporting one would be a fabrication.
-BLOCKED_ENV = 75      # consistent with the adapter; NOT_RUN below keeps suite meaning
-NOT_RUN = 3           # suite convention: a dependency is unavailable
+BLOCKED_ENV = 75
+NOT_RUN = 3
 DEVICE_AUTH_ENV = "TF_DEVICE_AUTH"
+FROZEN_PROTOCOL = ("/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam"
+                   "/artifacts/run01/p0/precision_protocol.json")
 
 
 def device_authorised() -> bool:
-    """Explicit, per-invocation authorisation. Absence is refusal, never a default."""
     return os.environ.get(DEVICE_AUTH_ENV, "").strip() == "1"
 
 
 def torch_npu_present() -> bool:
-    """Is torch_npu installed? Answered WITHOUT importing it (see rule 1)."""
     try:
         return importlib.util.find_spec("torch_npu") is not None
     except (ImportError, ValueError):
@@ -45,56 +32,37 @@ def torch_npu_present() -> bool:
 
 
 def refuse_unless_authorised(device_index: int) -> None:
-    """Refuse loudly, or return having done nothing at all.
-
-    Deliberately takes no action when authorised: authorisation is a precondition
-    this function checks, not a capability it grants.
-    """
     if not torch_npu_present():
-        print(
-            "NOT_RUN: torch_npu is not importable, so this case cannot run.\n"
-            "  No device was touched. This is NOT a pass: nothing was measured.",
-            file=sys.stderr,
-        )
+        print("NOT_RUN: torch_npu is not importable. No device touched; nothing measured.",
+              file=sys.stderr)
         raise SystemExit(NOT_RUN)
-
     if not device_authorised():
-        # One message, joined: multiple print() arguments would render as a tuple,
-        # which is the kind of cosmetic bug that makes a refusal unreadable exactly
-        # when someone needs to read it.
-        message = "\n".join([
+        print("\n".join([
             "BLOCKED_ENV: refusing to touch device %d." % device_index,
             "  torch_npu is present, so this script would open a device node.",
-            "  Authorisation was not supplied, and absence of authorisation is a",
-            "  refusal -- not a default.",
-            "",
-            "  The run did not happen. This is not a pass and not a failure: there is",
-            "  no result to report, and reporting one would be a fabrication.",
-            "",
-            "  Why: a device open at 13:46:26 in this program preceded a host-wide",
-            "  exec stall 32 s later, with the card already held by other tenants.",
-            "  A failed aclInit still opens the device node.",
-            "",
-            "  To authorise deliberately, set %s=1 for this invocation only, once the" % DEVICE_AUTH_ENV,
-            "  host has been cleared by the admin.",
-        ])
-        print(message, file=sys.stderr)
+            "  Authorisation was not supplied; absence is a refusal, not a default.",
+            "  Set %s=1 for this invocation only, after the admin has cleared the host." % DEVICE_AUTH_ENV,
+        ]), file=sys.stderr)
         raise SystemExit(BLOCKED_ENV)
+    print("DEVICE AUTHORISED (%s=1): device %d. Timings are PROVISIONAL (shared card)."
+          % (DEVICE_AUTH_ENV, device_index), file=sys.stderr)
 
-    # Reached only with authorisation. Said out loud so the log records that this
-    # run was authorised rather than merely unguarded.
-    print(
-        "DEVICE AUTHORISED (%s=1): opening device %d.\n"
-        "  Any timings below are PROVISIONAL; they describe a shared card, not"
-        " exclusive use." % (DEVICE_AUTH_ENV, device_index),
-        file=sys.stderr,
-    )
 
-def sha256_text(t):
+def sha256_text(t: str) -> str:
     return hashlib.sha256(t.encode()).hexdigest()
 
 
-def main():
+def load_frozen_protocol(path: str) -> dict:
+    text = Path(path).read_text()
+    data = json.loads(text)
+    if data.get("status") != "FROZEN":
+        raise SystemExit(
+            "REFUSED: protocol %s has status=%r, not FROZEN. An unfrozen protocol "
+            "must not be used to pass or fail a candidate." % (path, data.get("status")))
+    return data
+
+
+def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--case-id", required=True)
     ap.add_argument("--shape", type=int, nargs=2, required=True)
@@ -106,19 +74,21 @@ def main():
     ap.add_argument("--device", type=int, default=0)
     ap.add_argument("--windows", type=int, default=20)
     ap.add_argument("--iters", type=int, default=10)
-    ap.add_argument("--baseline-kernel", default="/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/reference/kernel_v33.py")
+    ap.add_argument("--protocol", default=FROZEN_PROTOCOL,
+                    help="FROZEN precision protocol (status must be FROZEN)")
+    ap.add_argument("--baseline-kernel",
+                    default="/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/reference/kernel_v33.py")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    # Refuse BEFORE importing torch_npu. The order here is the protection.
     refuse_unless_authorised(args.device)
+    protocol = load_frozen_protocol(args.protocol)
 
     import torch, torch_npu, tilelang
     try:
         tilelang.disable_cache()
     except Exception:
         pass
-    # Reached only because the guard above authorised it. Never unconditional.
     torch.npu.set_device(args.device)
     sys.path.insert(0, "/home/s00653124/workspace/TileFoundry/examples/rmsnorm_950pr")
     from runtime_model import RuntimeModel, check_case, paired_benchmark
@@ -133,37 +103,98 @@ def main():
     (out / "kernel_source.txt").write_text(src)
     devname = torch.npu.get_device_name(args.device)
 
-    device_info = {"device_index": args.device, "device_name": devname,
-                   "torch": torch.__version__, "torch_npu": getattr(torch_npu, "__version__", None),
-                   "tilelang": getattr(tilelang, "__version__", None),
-                   "tilelang_file": getattr(tilelang, "__file__", None), "cann": __import__("os").environ.get("ASCEND_HOME_PATH"),
-                   "kernel_source_sha256": sha256_text(src), "cache_key": cfg.cache_key()}
+    try:
+        import importlib.metadata as _md
+        tvm_ffi_ver = _md.version("apache-tvm-ffi")
+    except Exception:
+        tvm_ffi_ver = None
+
+    protocol_text = Path(args.protocol).read_text()
+    device_info = {
+        "device_index": args.device, "device_name": devname,
+        "torch": torch.__version__,
+        "torch_npu": getattr(torch_npu, "__version__", None),
+        "tilelang": getattr(tilelang, "__version__", None),
+        "tilelang_file": getattr(tilelang, "__file__", None),
+        "tvm_ffi": tvm_ffi_ver,
+        "cann": os.environ.get("ASCEND_HOME_PATH"),
+        "python": sys.version.split()[0], "python_exe": sys.executable,
+        "ascend_rt_visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+        "protocol_id": protocol.get("protocol_id"),
+        "protocol_path": str(Path(args.protocol).resolve()),
+        "protocol_sha256": sha256_text(protocol_text),
+        "kernel_source_sha256": sha256_text(src), "cache_key": cfg.cache_key(),
+    }
     (out / "device_info.json").write_text(json.dumps(device_info, indent=2))
 
-    numeric = check_case(model, torch, args.device)
+    numeric = check_case(model, torch, args.device, protocol, save_dir=str(out))
     (out / "numeric.json").write_text(json.dumps(numeric, indent=2))
+    (out / "patterns_report.json").write_text(json.dumps(numeric["patterns"], indent=2))
 
-    # baseline v33 module (fresh import; loop mode set; cache cleared)
     spec = importlib.util.spec_from_file_location("v33_base", args.baseline_kernel)
-    base = importlib.util.module_from_spec(spec); sys.modules["v33_base"] = base; spec.loader.exec_module(base)
+    base = importlib.util.module_from_spec(spec); sys.modules["v33_base"] = base
+    spec.loader.exec_module(base)
     base.LOOP_MODE = args.loop_mode; base._KERNELS.clear()
 
     def baseline_run(x, w, eps):
         return base.run(x, w, eps)
 
-    bench = paired_benchmark(model, baseline_run, torch, args.device, windows=args.windows, iters=args.iters)
+    bench = paired_benchmark(model, baseline_run, torch, args.device,
+                             windows=args.windows, iters=args.iters)
     (out / "paired_benchmark.json").write_text(json.dumps(bench, indent=2))
 
-    summary = {"case_id": args.case_id, "device_family": "Ascend950PR", "device_name": devname,
-               "numerical_passed": numeric["numerical_passed"],
-               "stability_ok": numeric["stability"]["all_bitwise_equal_first"],
-               "baseline_median_ms": bench["baseline_median"], "candidate_median_ms": bench["candidate_median"],
-               "speedup_median": bench["speedup_median"],
-               "kernel_source_sha256": device_info["kernel_source_sha256"]}
+    acc = numeric["accuracy_summary"]
+    stability_ok = bool(numeric["stability"]["all_bitwise_equal_first"])
+    numeric_ok = bool(numeric["numerical_passed"])
+    exit_code = 0 if (numeric_ok and stability_ok) else 1
+
+    clearly_faster = (
+        bench["baseline_median"] > bench["candidate_median"]
+        and bench["speedup_median"] > 1.05
+        and all(b > c for b, c in zip(bench["baseline_ms"], bench["candidate_ms"]))
+    )
+    perf_verdict = "CLEAR_GAIN" if clearly_faster else "NO_CLEAR_GAIN"
+
+    summary = {
+        "case_id": args.case_id, "device_family": "Ascend950PR", "device_name": devname,
+        "protocol_id": protocol.get("protocol_id"),
+        "protocol_sha256": device_info["protocol_sha256"],
+        "numerical_passed": numeric_ok, "stability_ok": stability_ok,
+        "accuracy": {
+            "max_abs": acc["max_abs"], "max_rel": acc["max_rel"],
+            "total_mismatch": acc["total_mismatch"],
+            "atol": acc["atol"], "rtol": acc["rtol"],
+            "max_abs_le_atol_alone": acc["max_abs_le_atol_alone"],
+            "deterministic_patterns_exact": acc["deterministic_patterns_exact"],
+            "pass_rule": acc["pass_rule"],
+            "per_pattern": acc["per_pattern"],
+        },
+        "performance": {
+            "verdict": perf_verdict,
+            "baseline_median_ms": bench["baseline_median"],
+            "candidate_median_ms": bench["candidate_median"],
+            "speedup_median": bench["speedup_median"],
+            "paired_windows": bench["windows"],
+            "provisional_shared_card": True,
+        },
+        "exit_code": exit_code,
+        "kernel_source_sha256": device_info["kernel_source_sha256"],
+    }
     (out / "summary.json").write_text(json.dumps(summary, indent=2))
+    (out / "exit_code.txt").write_text(str(exit_code))
     print(json.dumps(summary))
-    sys.stdout.flush(); os._exit(0)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        rc = main()
+    except SystemExit:
+        raise
+    except Exception:
+        traceback.print_exc()
+        rc = 2
+    sys.stdout.flush(); sys.stderr.flush()
+    # os._exit avoids a hang in NPU/tilelang interpreter teardown; it carries the
+    # REAL code computed above, not a constant 0.
+    os._exit(rc)
