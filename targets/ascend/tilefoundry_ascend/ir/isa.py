@@ -35,6 +35,15 @@ class InstructionContract:
     latency_model: Optional[int] = None
     ii_model: Optional[int] = None
     semantics: str = ""
+    # P2: lane/predicate/element-width surface, explicit rather than implied.
+    lane_count: int = 64
+    # BF16 lanes are packed two per 32-bit carrier; 16 names the packed width, 32 f32.
+    element_widths: tuple = (32,)
+    predicate_rule: str = (
+        "one predicate bit per lane; an inactive lane keeps the destination bits unchanged"
+    )
+    rounding: str = "per-element round-to-nearest-even to the element width (see bf16)"
+    reduction_order: str = ""
 
 
 def _c(**kw):
@@ -65,12 +74,14 @@ ISA = {
                 required_region="simdvf", core_affinity="aiv", resource="vector",
                 completion="issue", result="vreg(acc)",
                 latency_model=4, ii_model=1,
-                semantics="acc = acc + a*b (fused multiply-add into acc); loop-carried."),
+                semantics="acc = acc + a*b (fused multiply-add into acc); loop-carried.",
+                element_widths=(16, 32)),
     "vadd": _c(name="vadd", category="elementwise",
                operands=(Operand("a", READ, "vreg"), Operand("b", READ, "vreg")),
                compute_domain="64 lanes", elem_width_bits=32, required_region="simdvf",
                core_affinity="aiv", resource="vector", completion="issue", result="vreg",
-               latency_model=3, ii_model=1, semantics="dst = a + b"),
+               latency_model=3, ii_model=1, semantics="dst = a + b",
+               element_widths=(16, 32)),
     "vadds": _c(name="vadds", category="elementwise",
                 operands=(Operand("a", READ, "vreg"), Operand("s", READ, "scalar")),
                 compute_domain="64 lanes", elem_width_bits=32, required_region="simdvf",
@@ -85,13 +96,16 @@ ISA = {
                operands=(Operand("a", READ, "vreg"), Operand("b", READ, "vreg")),
                compute_domain="64 lanes", elem_width_bits=32, required_region="simdvf",
                core_affinity="aiv", resource="vector", completion="issue", result="vreg",
-               latency_model=3, ii_model=1, semantics="dst = a * b"),
+               latency_model=3, ii_model=1, semantics="dst = a * b",
+               element_widths=(16, 32)),
     "vcadd": _c(name="vcadd", category="reduce",
                 operands=(Operand("src", READ, "vreg"),), compute_domain="64 lanes",
                 elem_width_bits=32, required_region="simdvf", core_affinity="aiv",
                 resource="vector", completion="issue", result="vreg",
                 latency_model=3, ii_model=1,
-                semantics="PAIRWISE add reduction: dst[i] = src[2i]+src[2i+1] in the low half. 6 calls reduce 64->1."),
+                semantics="PAIRWISE add reduction: dst[i] = src[2i]+src[2i+1] in the low half. 6 calls reduce 64->1.",
+                element_widths=(16, 32),
+                reduction_order="pairwise tree: bf16(a+b) at each level; six calls take 64 lanes to 1"),
     "vdupv": _c(name="vdupv", category="elementwise",
                 operands=(Operand("src", READ, "vreg"),), compute_domain="64 lanes",
                 elem_width_bits=32, required_region="simdvf", core_affinity="aiv",
