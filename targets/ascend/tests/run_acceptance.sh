@@ -153,6 +153,10 @@ run p3_carrier       "$PY" "$REPO/targets/ascend/tests/test_p3_carrier.py"
 run p3_mask_closure  "$PY" "$REPO/targets/ascend/tests/test_p3_mask_closure.py"
 run p3_chain_numeric "$PY" "$REPO/targets/ascend/tests/test_p3_chain_numeric.py"
 run p3_vcvt          "$PY" "$REPO/targets/ascend/tests/test_p3_vcvt.py"
+# (3c) The RMSNorm structural kernels (level-1 D=256 and the compliant level-2 BATCH=2 D=4096).
+# They are CPU-only and self-contained; they belong in the aggregate gate like every child.
+run rmsnorm_row      "$PY" "$REPO/targets/ascend/tests/test_rmsnorm_row.py"
+run rmsnorm_d4096    "$PY" "$REPO/targets/ascend/tests/test_rmsnorm_d.py" --tiles 64 --batch 2 --fixture rmsnorm_main.py
 
 # (4) The legacy paths that must not regress, so a green M3 cannot come from
 # breaking CUDA or the copy lowering.

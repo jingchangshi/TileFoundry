@@ -33,34 +33,46 @@ def bf(x):
     return struct.unpack("<f", struct.pack("<f", float(x)))[0]
 
 
-def tir_write_windows(text, D, L):
-    """Parse the TYPED finalized TIR: every T.copy destination window, its view layout/shape and
-    its element offset. This is the independent write-side coverage evidence (not the reference
-    loop). Returns (windows, ok_layout) where windows = [(offset, extent)]."""
+def tir_write_check(text, D, L, BATCH):
+    """TYPED-TIR write-side check, per row. Parses every T.copy destination tensor_view
+    (layout/shape and its root/offset expression) and requires, for EACH row r, the set of
+    64-element tile offsets to be exactly {0, L, ..., D-L}: full coverage, no overlap, no
+    whole-row window, no Fill. Returns (ok, reason, windows) with a NAMED rejection reason."""
+    if "T.fill(" in text:
+        return False, "fill", []
     defs = {}
     for m in re.finditer(r"(\w+)\s*=\s*T\.tensor_view\(\s*T\.ptr_of\(out\[(.+?)\]\)\s*,\s*layout=\((\d+),?\)\s*,\s*shape=\((\d+),?\)", text, re.S):
         defs[m.group(1)] = (int(m.group(3)), int(m.group(4)), m.group(2))
     windows = []
-    ok_layout = True
     for line in text.splitlines():
         m = re.search(r"T\.copy\([^,]+,\s*(\w+)\)", line)
         if not m:
             continue
         name = m.group(1)
         if name not in defs:
-            ok_layout = False
-            continue
+            return False, "unbound_window", windows
         layout, shape, expr = defs[name]
         if layout != L or shape != L:
-            ok_layout = False
-        lit = re.search(r"\+ \((\d+) \* %d\)" % L, expr)
-        if lit:
-            off = int(lit.group(1)) * L
+            return False, "whole_row_copy", windows
+        m2 = re.search(r"r \+ (\d+)\) \* (\d+)\) \+ \((\d+) \* (\d+)\)", expr)
+        if m2:
+            row_off, row_stride, tile, step = (int(m2.group(1)), int(m2.group(2)),
+                                               int(m2.group(3)), int(m2.group(4)))
         else:
-            lit0 = re.match(r"\s*(\d+):", expr)
-            off = int(lit0.group(1)) if lit0 else -1
-        windows.append((off, shape))
-    return windows, ok_layout
+            m3 = re.match(r"\s*(\d+):", expr)
+            row_off, row_stride, tile, step = 0, D, (int(m3.group(1)) // L if m3 else -1), L
+        if row_stride != D or step != L:
+            return False, "bad_row_stride", windows
+        windows.append((row_off, tile * L))
+    # The loop body has offset(r) = (r + c) * D + k * L. For the loop to write every row of the
+    # BATCH iteration space, c MUST be 0 and the k set must be exactly the tile set. A nonzero c
+    # (row shift) leaves row 0 unwritten (and the last row out of range) -> named rejection.
+    tiles = sorted(k for _, k in windows)
+    if tiles != list(range(0, D, L)) or len(windows) != D // L:
+        return False, "row0_coverage", windows
+    if any(c != 0 for c, _ in windows):
+        return False, "row0_missing_tile", windows
+    return True, "ok", windows
 
 
 def main():
@@ -85,21 +97,25 @@ def main():
         checks["six_vcadd"] = text.count("ascend_vcadd(") == 6 * max(1, TILES // TILES)  # per row
         checks["has_reverse_pk"] = 'direction="reverse"' in text and 'pack="PK_B32"' in text
         checks["per_tile_copy"] = text.count("T.copy(") == TILES
-        # INDEPENDENT write-side coverage from the typed TIR: every T.copy destination is a
-        # 64-element tile view, the tile offsets are distinct and exactly cover [0, D).
-        windows, ok_layout = tir_write_windows(text, D, L)
-        offsets = sorted(off for off, _ in windows)
-        checks["tir_all_dst_windows_are_tiles"] = ok_layout and all(ext == L for _, ext in windows)
-        checks["tir_covers_all_tiles_no_overlap"] = offsets == list(range(0, D, L)) and len(windows) == TILES
-        checks["no_whole_row_copy"] = all(ext == L for _, ext in windows) and "T.fill(" not in text
-        # negative: a whole-row window/copy injected into the TIR MUST be rejected by the checker
-        bad = text + "\nwindow_bad = T.tensor_view(T.ptr_of(out[0:%d]), layout=(%d,), shape=(%d,))\nT.copy(uo0_2, window_bad)\n" % (D, D, D)
-        bad_windows, bad_layout = tir_write_windows(bad, D, L)
-        checks["negative_whole_row_copy_rejected"] = (not bad_layout) or any(ext == D for _, ext in bad_windows)
+        # INDEPENDENT write-side coverage from the typed TIR, PER ROW (not the reference loop).
+        ok_w, why_w, windows = tir_write_check(text, D, L, BATCH)
+        checks["tir_covers_all_tiles_per_row"] = ok_w and why_w == "ok"
+        checks["no_whole_row_copy_no_fill"] = ok_w
+        # NAMED negative baselines: each mutation MUST be rejected with its own reason.
+        bad_whole = text + "\nwindow_bad = T.tensor_view(T.ptr_of(out[0:%d]), layout=(%d,), shape=(%d,))\nT.copy(uo0_2, window_bad)\n" % (D, D, D)
+        n_whole = tir_write_check(bad_whole, D, L, BATCH)
+        checks["neg_whole_row_copy_rejected"] = (not n_whole[0]) and n_whole[1] == "whole_row_copy"
+        n_fill = tir_write_check(text + "\nT.fill(out, 0.0)\n", D, L, BATCH)
+        checks["neg_fill_rejected"] = (not n_fill[0]) and n_fill[1] == "fill"
+        n_off = tir_write_check(text.replace("(%d * %d)" % (TILES - 1, L), "(%d * %d)" % (TILES - 2, L)), D, L, BATCH)
+        checks["neg_wrong_offset_rejected"] = (not n_off[0]) and n_off[1].startswith("row0")
+        n_row = tir_write_check(text.replace("(r + 0)", "(r + 1)"), D, L, BATCH)
+        checks["neg_row_shift_rejected"] = (not n_row[0]) and "row0" in n_row[1]
     else:
         for k in ("public_reload_verified", "six_vcadd", "has_reverse_pk", "per_tile_copy",
-                  "tir_all_dst_windows_are_tiles", "tir_covers_all_tiles_no_overlap",
-                  "no_whole_row_copy", "negative_whole_row_copy_rejected"):
+                  "tir_covers_all_tiles_per_row", "no_whole_row_copy_no_fill",
+                  "neg_whole_row_copy_rejected", "neg_fill_rejected", "neg_wrong_offset_rejected",
+                  "neg_row_shift_rejected"):
             checks[k] = False
 
     prog = checked_program(f"{FIX}:{ENTRY}", None, command="rmsnorm-d")
