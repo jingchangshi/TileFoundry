@@ -73,8 +73,21 @@ tools/p2/cross_check_impl.py, read-only on the target-side module:
 ## P2 CEILING (nothing downstream may silently assume these)
 
 1. vcadd lane-reduction order (tree vs sequential vs hardware hierarchy).
-2. ACCUMULATOR COUNT -- FLAGGED TO LEAD, touches the design baseline: the design says
-   four; kernel_v33's rows=4 path shows TWO (acc0, acc1). Unresolved.
+2. ACCUMULATOR COUNT -- explicit contract field, PROVISIONALLY ruled by the Lead
+   (architect confirmation pending; this is NOT settled by me):
+   - BASELINE OF RECORD FOR NUMERIC CLAIMS = TWO. Numeric claims are made against the
+     shipped, executable reference/kernel_v33.py, whose rows=4 path uses TWO accumulators
+     (acc0, acc1).
+   - The design's FOUR is recorded as a DESIGN VARIANT / TARGET, not the contract: there is
+     no executable four-accumulator form, and numerics must not be pinned to something
+     unbuilt.
+   - REQUIRED CONSEQUENCE IN CODE: the ISA must declare the accumulator count EXPLICITLY
+     as a contract field (never implicit), and the reduction order must be stated as
+     DEPENDING on that field, so a future four-accumulator variant cannot silently change
+     numerics. bf16_reference.py carries ACCUMULATOR_COUNT_BASELINE = 2 as that explicit
+     field, with the same provisional note.
+   Status: PROVISIONAL Lead ruling; architect asked to confirm. Treat TWO as the claim
+   baseline, FOUR as an unbuilt target, until that confirmation lands.
 3. Fusion / wider intermediates (reference rounds f32 after every mul and add).
 4. rsqrt precision (vdiv(1, vsqrt) vs an approximate rsqrt instruction).
 5. Denormal FTZ/DAZ on device (reference is IEEE, no flush).

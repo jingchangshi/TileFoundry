@@ -128,9 +128,18 @@ def f32_round(x: float) -> float:
         return math.inf if x > 0 else -math.inf
 
 
-# Documented accumulation order used by the reference model.
+# PROVISIONAL (Lead ruling; architect confirmation pending -- NOT settled by this reference):
+#   baseline of record for NUMERIC CLAIMS = TWO accumulators, because numeric claims are made
+#   against the shipped, executable reference/kernel_v33.py whose rows=4 path uses TWO.
+#   The design's FOUR is a design variant/target, not the contract (no executable form).
+# CONTRACT REQUIREMENT: the ISA must declare the accumulator count explicitly as a contract
+#   field and state that the reduction order DEPENDS on it, so a four-accumulator variant
+#   cannot silently change numerics. ACCUMULATOR_COUNT_BASELINE is that field here.
+ACCUMULATOR_COUNT_BASELINE = 2
+
+# Documented accumulation order used by the reference model (a CHOICE, not a fact).
 REFERENCE_REDUCTION_ORDER = {
-    "accumulators": 2,
+    "accumulators": ACCUMULATOR_COUNT_BASELINE,
     "accumulator_assignment": "round-robin over chunk index (acc0 even, acc1 odd)",
     "per_accumulator_order": "increasing chunk index",
     "accumulator_combine": "acc0 + acc1 in index order",
@@ -139,7 +148,7 @@ REFERENCE_REDUCTION_ORDER = {
 }
 
 
-def dot_bf16_reference(values, accumulators: int = 2):
+def dot_bf16_reference(values, accumulators: int = ACCUMULATOR_COUNT_BASELINE):
     """Reference sum of x*x over bf16-decoded chunk vectors, in binary32."""
     acc = [0.0] * accumulators
     for i, v in enumerate(values):
@@ -153,6 +162,6 @@ def dot_bf16_reference(values, accumulators: int = 2):
 
 __all__ = ["round_half_even", "f32_bits_to_fraction", "fraction_to_bf16_bits",
            "bf16_bits_to_fraction", "bf16_from_f32_bits", "f32_round",
-           "dot_bf16_reference", "REFERENCE_REDUCTION_ORDER",
+           "dot_bf16_reference", "REFERENCE_REDUCTION_ORDER", "ACCUMULATOR_COUNT_BASELINE",
            "BF16_MIN_NORMAL", "BF16_MAX_NORMAL", "BF16_MIN_SUBNORMAL",
            "BF16_SUBNORMAL_HALF", "BF16_OVERFLOW_MIDPOINT"]
