@@ -178,13 +178,14 @@ def check_accumulation_is_fp32_not_perstep_bf16() -> None:
 
 
 def check_accumulator_contract_is_per_case() -> None:
-    """STRUCTURAL check only: declared per-case count and merge consistency.
+    """DISCRIMINATING per-case count check (minimal vector supplied by the Lead).
 
-    It does NOT claim numeric order discrimination: on exact sums a 2-chain and a 4-chain
-    computation can be bit-identical, so a mutant forcing 2 -> 4 could survive a purely
-    numeric assertion. What is established is the CONTRACT SHAPE: the count is declared per
-    case (rows=4 four chains balanced, rows<=2 two), no ISA field carries a global count,
-    and an undeclared count or a merge inconsistent with the count is refused.
+    [2^24, 1, -2^24, 0] then zeros gives 0 under the 4-chain balanced merge and 1 under the
+    2-chain merge: strided chain assignment puts 2^24 and -2^24 in different 4-chains so the
+    merge cancels, while the 2-chain split keeps 1 in the second chain. Forcing 2 -> 4
+    therefore changes the result and FAILS the assertion. Also verifies the contract shape:
+    rows=4 -> four chains ((0+1)+(2+3)), rows<=2 -> two chains (0+1), no ISA global count,
+    and undeclared counts / inconsistent merges refused.
     """
     from tilefoundry_ascend.ir.isa import ISA, PER_CASE_ACCUMULATOR_CONTRACT
 
@@ -198,11 +199,19 @@ def check_accumulator_contract_is_per_case() -> None:
     assert rows4["chains"] == 4 and rows4["merge"] == "((0+1)+(2+3))", rows4
     assert rows2["chains"] == 2 and rows2["merge"] == "(0+1)", rows2
     assert "127-140" in rows4["evidence"] and "253-260" in rows2["evidence"]
-    lanes = [bf16.encode(float(index + 1)) for index in range(bf16.LANES)]
+    # DISCRIMINATING vector: 1.0 under two chains, 0.0 under four chains.
+    lanes = [bf16.encode(value) for value in (2.0 ** 24, 1.0, -(2.0 ** 24), 0.0)]
+    lanes += [bf16.encode(0.0)] * (bf16.LANES - 4)
     four = bf16.vcadd_v33(lanes, rows4["chains"], rows4["merge"])
     two = bf16.vcadd_v33(lanes, rows2["chains"], rows2["merge"])
+    assert four == bf16.encode(0.0), f"four chains gave 0x{four:04X}, expected 0x0000"
+    assert two == bf16.encode(1.0), f"two chains gave 0x{two:04X}, expected 0x3F80"
+    assert four != two, "the vector must discriminate the two chain counts"
     assert four == _ref_v33(lanes, 4, rows4["merge"])
     assert two == _ref_v33(lanes, 2, rows2["merge"])
+    # A mutant that forces 2 -> 4 would return 0, so the expected-1 assertion kills it.
+    forced_four = bf16.vcadd_v33(lanes, 4, rows4["merge"])
+    assert forced_four != two, "forcing 2 -> 4 chains did not change the result"
     # A count that v33 never uses, or a merge that does not match it, is refused.
     for bad_chains in (3, 1, 8):
         try:
