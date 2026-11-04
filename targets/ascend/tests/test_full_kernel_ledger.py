@@ -72,7 +72,7 @@ def main():
     except LedgerError:
         checks["mut_drop_whole_vf_task_rejected"] = True
 
-    unknown = [a for a in problem.accesses if a.offset_status != "KNOWN"]
+    unknown = [a for a in problem.accesses if a.offset_status != "BYTES"]
     checks["offset_unknown_reported"] = len(unknown) > 0
     try:
         require_concrete_offset(problem); checks["offset_unknown_refused"] = False

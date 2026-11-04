@@ -53,7 +53,7 @@ def main():
     # negative: constant-0 extractor must be killed
     defaulted = dataclasses.replace(
         problem,
-        accesses=[dataclasses.replace(a, byte_offset=0) if a.offset_status != "KNOWN" else a for a in problem.accesses],
+        accesses=[dataclasses.replace(a, byte_offset=0) if a.offset_status != "BYTES" else a for a in problem.accesses],
     )
     try:
         assert_no_default_zero(defaulted); checks["constant_zero_extractor_killed"] = False
@@ -93,7 +93,7 @@ def main():
     # negative: change an offset -> Problem changes
     shifted = dataclasses.replace(
         problem,
-        accesses=[dataclasses.replace(a, byte_offset=4) if a.offset_status == "KNOWN" else a for a in problem.accesses],
+        accesses=[dataclasses.replace(a, byte_offset=4) if a.offset_status == "BYTES" else a for a in problem.accesses],
     )
     checks["mut_change_offset_changes_problem"] = (
         [a.byte_offset for a in shifted.accesses] != [a.byte_offset for a in problem.accesses]
