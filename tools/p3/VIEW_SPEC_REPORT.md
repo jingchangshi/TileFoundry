@@ -48,3 +48,42 @@ This work is CPU-only and cites no CANN/ISA evidence. Therefore:
 Consequence: passing these checks means the view obeys OUR contract, not that the device
 would fault otherwise. Any claim that "hardware forbids X" needs a selected-build microtest;
 until then X is policy. This ceiling is deliberate.
+
+
+## 4. Target-side adaptation (I1's DtypeViewSpec, READ-ONLY)
+
+Adapter: tools/p3/view_spec_target.py. It loads I1's class by path and adapts his objects
+into GmemRoot/OffsetView; it never writes to his file.
+State at wiring time: src/tilefoundry/ir/types/dtype_view.py was UNTRACKED (uncommitted),
+sha256 61a28adf64440bda8a4c74cad92ad2e9e45f7319b3ce5fd0a262ddc611a6986a. Results are
+valid for THAT sha only; re-run after he lands it.
+
+On his real view objects (7/7 cases PASS):
+  valid_full_bf16_to_f32                 my rules []                              he ACCEPTs
+  valid_read_read_overlap_diff_dtype     my rules []                              he REJECTs (drift)
+  misaligned                             VIEW_MISALIGNED_OFFSET                   he: misaligned
+  range_exceeds_parent                   VIEW_RANGE_OVERFLOWS_PARENT              he: out-of-bounds
+  overlap_write_read_same_dtype          VIEW_OVERLAP_INCOMPATIBLE                he ACCEPTs (drift)
+  extent_overflow                        VIEW_EXTENT_OVERFLOW                     he ACCEPTs (no cap)
+  stale_after_realloc                    VIEW_STALE_AFTER_REALLOC                 he ACCEPTs (no generation)
+
+### Drift that must be reconciled (not papered over)
+1. OVERLAP POLICY DIFFERS. This spec forbids any distinct-view overlap with a WRITE on
+   either side (access-based). I1's validator forbids overlap only when the two views have
+   DIFFERENT element sizes (dtype-based). Consequently:
+     - same-dtype overlapping W x R: spec FORBIDS, his ACCEPTS;
+     - different-dtype overlapping R x R: spec ALLOWS, his REJECTS.
+   These are not the same contract. P4 must not mix them.
+2. NO ALLOCATION GENERATION on his objects -> the STALE rule cannot be evaluated on them;
+   the adapter had to supply a generation to exercise it.
+3. NO COUNT CAP on his objects -> the EXTENT rule cannot be evaluated on them; he catches
+   only the byte-range consequence (out-of-bounds).
+4. His validator correctly REFUSES the motivating same-element-count bf16->f32 view as
+   out-of-bounds (it needs twice the bytes), which matches the reported blocker.
+
+## 5. P4 alias/plan wiring
+
+view_spec.alias_conflicts(views, accesses) is the public entry point: pairs of distinct
+views on one root whose ranges intersect with a write on either side. P4 alias/plan checks
+must call THIS function (not a copy) so the plan and the view contract share one definition
+and cannot drift apart. The rule is access-based, matching section 2.

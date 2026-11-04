@@ -101,6 +101,24 @@ def _overlaps(views: list[OffsetView], roots: dict[str, GmemRoot],
     return tags
 
 
+def alias_conflicts(views: list[OffsetView], accesses: dict[str, str]) -> list[tuple]:
+    """Pairs of distinct views on one root whose ranges intersect with a write on either
+    side. PUBLIC entry point for the P4 alias/plan checks, so the view contract and the
+    plan cannot drift apart."""
+    out = []
+    for a in range(len(views)):
+        for b in range(a + 1, len(views)):
+            va, vb = views[a], views[b]
+            if va.root != vb.root:
+                continue
+            sa, ea = va.byte_offset, va.byte_offset + va.byte_length
+            sb, eb = vb.byte_offset, vb.byte_offset + vb.byte_length
+            if sa < eb and sb < ea and (accesses.get(va.name) == "write"
+                                        or accesses.get(vb.name) == "write"):
+                out.append((va.name, vb.name))
+    return out
+
+
 def check(roots: dict[str, GmemRoot], views: list[OffsetView],
           accesses: dict[str, str]) -> dict[str, list[str]]:
     """Return {rule: [messages]} for every violated rule."""
