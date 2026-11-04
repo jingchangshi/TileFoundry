@@ -914,6 +914,15 @@ def verify_operand_dtypes(op, declared, name: str) -> None:
             getattr(option, "name", None)
             for option in getattr(dtype, "patterns", (dtype,))
         )
+        if names == ("bool",):
+            # The predicate register is a mask, not an element: it is one bit per
+            # lane and no arithmetic is performed on it, so the element-type rule
+            # does not apply to it. Without this exemption every instruction that
+            # WRITES the predicate -- pset -- would be refused by a rule about
+            # elements, which is the positive part of the chain failing its own
+            # check. The extent rule above already exempts it for the same reason;
+            # the two must agree or the chain is unverifiable.
+            continue
         if any(name_ not in allowed for name_ in names):
             raise VerifyError(
                 f"{name}: operand {param.name!r} is declared as {names!r} but execution "
