@@ -986,6 +986,16 @@ def verify_predicate_producers(scope_stmt) -> None:
     instruction READS are subjects: pset's own dst is WRITE and is not a read, so pset
     is not asked to have produced the mask it produces.
 
+    GRANULARITY is the second half of the producer check. In a mode that declares TWO
+    independently checked mask widths (arithmetic 32, conversion 16 -- see
+    verify_op_placement), "a mask was written" is not enough: the writer must have
+    DECLARED the width it produced, and that width must match the class of the reader.
+    A bool tensor's shape says nothing about the physical PREG encoding, so shape is
+    never used here. The mode declares both widths, so this rule is FAIL-CLOSED inside
+    it: a producer with no declared width, or a producer that is not a declared mask
+    producer at all, is refused by name rather than skipped. Modes that do not declare
+    two widths keep the original behaviour (the check simply does not apply).
+
     Ordering under control flow is conservative: a write inside an If branch or a loop
     body does not dominate statements after the construct (it may not have executed),
     so it is not carried out of the construct. A write before the construct does
@@ -997,6 +1007,47 @@ def verify_predicate_producers(scope_stmt) -> None:
         return  # an undeclared kind is refused by the scope check; not this rule
 
     produced = set()  # ids of Vars WRITTEN by a statement already passed in this chain
+    # id(Var) -> (producer op, declared mask width or None). Kept in lockstep with
+    # 'produced' through the Sequential/For/If walks below, so the granularity recorded
+    # is always the LAST writer before the read (the same writer dominance uses).
+    produced_mask = {}
+    two_widths = declared.mask_width_bits is not None and declared.conversion_mask_width_bits is not None
+
+    def expected_width(op):
+        """The width a reader's declared mask class needs, or None when not applicable."""
+        if not two_widths:
+            return None, None
+        mask_class = getattr(type(op), "mask_class", "arithmetic")
+        if mask_class == "conversion":
+            return declared.conversion_mask_width_bits, "conversion"
+        if mask_class == "arithmetic":
+            return declared.mask_width_bits, "arithmetic"
+        return None, None
+
+    def require_granularity(op, arg, name, operand):
+        """Fail closed: the mask's producer must have declared the reader's width."""
+        expected, mask_class = expected_width(op)
+        if expected is None:
+            return
+        producer_op, width = produced_mask.get(id(arg), (None, None))
+        producer_name = getattr(producer_op, "name", type(producer_op).__name__)
+        declared_producer = getattr(type(producer_op), "mask_width_attribute", None) is not None
+        if not declared_producer:
+            raise VerifyError(
+                f"{name}: predicate operand {operand!r} was written by {producer_name!r}, "
+                "which is not a declared mask producer; in execution region "
+                f"{declared.name!r} a mask must be produced by a pset that states its "
+                "element width, otherwise its granularity is unknown and the predicate "
+                "encoding cannot be checked"
+            )
+        if width is None or width != expected:
+            raise VerifyError(
+                f"{name}: predicate operand {operand!r} is produced by {producer_name!r} "
+                f"at {width!r}-bit mask granularity, but a {mask_class} instruction in "
+                f"execution region {declared.name!r} requires a {expected}-bit mask "
+                "produced by a pset of the same granularity in this region instance; a "
+                "bool tensor's shape does not encode the predicate granularity"
+            )
 
     def writes_of(stmt):
         """(param, arg) pairs of *stmt* whose operand carries the WRITE effect."""
@@ -1053,6 +1104,7 @@ def verify_predicate_producers(scope_stmt) -> None:
                     if not is_predicate_read(param):
                         continue
                     if isinstance(arg, Var) and id(arg) in produced:
+                        require_granularity(op, arg, name, arg.name)
                         continue
                     operand = getattr(arg, "name", type(arg).__name__)
                     raise VerifyError(
@@ -1065,21 +1117,30 @@ def verify_predicate_producers(scope_stmt) -> None:
             for _param, arg in writes_of(stmt):
                 if isinstance(arg, Var):
                     produced.add(id(arg))
+                    produced_mask[id(arg)] = (op, declared_mask_width(op))
             return
         if isinstance(stmt, (For, While)):
             saved = set(produced)
+            saved_mask = dict(produced_mask)
             visit(stmt.body)
             produced.clear()
             produced.update(saved)
+            produced_mask.clear()
+            produced_mask.update(saved_mask)
             return
         if isinstance(stmt, If):
             saved = set(produced)
+            saved_mask = dict(produced_mask)
             visit(stmt.then_body)
             produced.clear()
             produced.update(saved)
+            produced_mask.clear()
+            produced_mask.update(saved_mask)
             visit(stmt.else_body)
             produced.clear()
             produced.update(saved)
+            produced_mask.clear()
+            produced_mask.update(saved_mask)
             return
         # LetStmt / anything else: an allocation binds a name, it does not produce a
         # mask, so it has no ordering effect here.

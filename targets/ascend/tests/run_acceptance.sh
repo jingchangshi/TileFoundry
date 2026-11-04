@@ -81,12 +81,24 @@ for pkg in torch z3_solver isl_python; do
 done
 echo
 
+# A green line in the log is not a green run. Each child reports its own exit; the
+# runner must also CARRY those exits into its own status, or a child that fails (or is
+# replaced by a stub that fails) leaves the script returning 0. Verified by injection:
+# replacing one child with exit 17 used to leave the aggregate at 0. Nothing below
+# changes what a child does; it only stops the aggregate from discarding its verdict.
+FAILURES=0
+FAILED_NAMES=""
 run() {
   name=$1
   shift
   echo "--- $name ---"
   "$@"
-  echo "exit=$?"
+  status=$?
+  echo "exit=$status"
+  if [ "$status" -ne 0 ]; then
+    FAILURES=$((FAILURES + 1))
+    FAILED_NAMES="${FAILED_NAMES} ${name}:${status}"
+  fi
   echo
 }
 
@@ -149,3 +161,9 @@ run copy_slice_equality "$PY" "$REPO/targets/ascend/tests/test_copy_slice_equali
 run cuda_rmem_analyze  "$PY" -m tilefoundry.cli analyze "$REPO/tests/nvidia/cuda/fixtures/placed/square_cuda.py:Model.main"
 
 echo "== done: read exit codes above, not this line =="
+if [ "$FAILURES" -ne 0 ]; then
+  echo "aggregate=FAILED children=${FAILED_NAMES}" >&2
+  exit 1
+fi
+echo "aggregate=ok every child exit 0"
+exit 0

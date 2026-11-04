@@ -256,7 +256,11 @@ class TirBuilder:
                 expr.name if isinstance(expr, Var) else "value",
                 ctx.authored_values.get(id(expr)),
             )
-            if type_.storage is StorageKind.RMEM:
+            # A mode-private register class (RMEM element registers and CARRIER
+            # transport windows) is allocated as a register, not as an addressable
+            # smem/gmem buffer. A carrier has no byte address and must not be charged
+            # to the UB budget; it exists only inside the region that owns it.
+            if type_.storage in (StorageKind.RMEM, StorageKind.CARRIER):
                 storage_type = type_
                 var = Var(stem, type=storage_type)
                 ctx.builder.bind(

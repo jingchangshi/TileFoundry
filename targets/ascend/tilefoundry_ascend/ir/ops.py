@@ -82,6 +82,16 @@ _IN_VREG_OR_CARRIER = OrPattern(
     TensorPattern(dtype=DType.bf16, storage=StorageKind.CARRIER),
 )
 
+#: Exact signatures for the two vcvt directions. The carrier is a DISTINCT register
+#: class: a bf16 value in CARRIER is a transport window, not an f32 element register.
+#: The union is written as exact alternatives, and _VcvtSignature below is the rule that
+#: actually checks which alternative each operand took (an OrPattern alone is not a
+#: cross-operand proof).
+_IN_CARRIER = TensorPattern(dtype=DType.bf16, storage=StorageKind.CARRIER)
+_IN_F32_RMEM = TensorPattern(dtype=DType.f32, storage=StorageKind.RMEM)
+_IN_CARRIER_OR_F32 = OrPattern(_IN_CARRIER, _IN_F32_RMEM)
+_IN_F32_OR_CARRIER = OrPattern(_IN_F32_RMEM, _IN_CARRIER)
+
 
 class _VldDist(Constraint):
     """Tie dist to the exact load signature: UNPK_B16 <-> bf16 src / carrier dst.
@@ -114,30 +124,80 @@ class _VldDist(Constraint):
         )
 
 
-class _VldDist(Constraint):
-    """A bf16 vld must state UNPK_B16; an f32 vld must state no dist.
+class _VcvtSignature(Constraint):
+    """The two exact vcvt signatures, checked across src, dst AND the attributes.
 
-    The dist attribute is part of the contract, not decoration: a packed bf16 load and a
-    plain f32 load address different elements, so a load that states neither is refused
-    rather than assumed.
+    A carrier window is not an f32 element register and an f32 register is not a
+    carrier. Direction is EXPLICIT (no inference from operand shape): forward reads a
+    carrier and writes f32, reverse reads f32 and writes a carrier. part is explicit
+    and must be 0; elem_width is the declared CONVERSION mask granularity, 16 =
+    min(bf16, f32), never a number inferred from a bool tensor's shape.
+
+    The attributes reach this rule through the same constraint map as vld's dist
+    (instruction.py: check_call adds every declared attribute), so a missing or wrong
+    part/width/direction is refused rather than defaulted.
     """
 
     def __init__(self) -> None:
         object.__setattr__(self, "field", "dtype")
         object.__setattr__(self, "left", "src")
-        object.__setattr__(self, "right", "src")
+        object.__setattr__(self, "right", "dst")
 
     def holds(self, operands: dict) -> bool:
-        dtype = getattr(operands.get("src"), "dtype", None)
-        if dtype is None:
-            return True
-        dist = operands.get("dist")
-        if dtype == DType.bf16:
-            return dist == "UNPK_B16"
-        return dist is None
+        src, dst = operands.get("src"), operands.get("dst")
+        if src is None or dst is None:
+            return False
+        direction = operands.get("direction")
+        part = operands.get("part")
+        width = operands.get("elem_width")
+        if direction not in ("forward", "reverse"):
+            return False
+        if isinstance(part, bool) or not isinstance(part, int) or part != 0:
+            return False
+        if isinstance(width, bool) or not isinstance(width, int) or width != 16:
+            return False
+        src_dtype = getattr(src, "dtype", None)
+        dst_dtype = getattr(dst, "dtype", None)
+        src_storage = getattr(src, "storage", None)
+        dst_storage = getattr(dst, "storage", None)
+        if direction == "forward":
+            return (
+                src_dtype == DType.bf16
+                and src_storage is StorageKind.CARRIER
+                and dst_dtype == DType.f32
+                and dst_storage is StorageKind.RMEM
+            )
+        return (
+            src_dtype == DType.f32
+            and src_storage is StorageKind.RMEM
+            and dst_dtype == DType.bf16
+            and dst_storage is StorageKind.CARRIER
+        )
 
     def written(self) -> str:
-        return "bf16 loads state dist=UNPK_B16 and f32 loads state no dist"
+        return (
+            "ascend_vcvt forward reads a bf16 CARRIER and writes an f32 RMEM, reverse reads "
+            "an f32 RMEM and writes a bf16 CARRIER; direction must be stated, part must be "
+            "STATED as the int 0 (a missing part is refused by name here), and the conversion "
+            "mask granularity elem_width must be 16"
+        )
+
+    def refused(self, operands: dict) -> str:
+        src, dst = operands.get("src"), operands.get("dst")
+
+        def describe(value):
+            if value is None:
+                return "None"
+            dtype = getattr(getattr(value, "dtype", None), "name", None)
+            storage = getattr(getattr(value, "storage", None), "name", None)
+            return f"{dtype}/{storage}"
+
+        return (
+            f"ascend_vcvt: src={describe(src)} dst={describe(dst)} "
+            f"direction={operands.get('direction')!r} part={operands.get('part')!r} "
+            f"elem_width={operands.get('elem_width')!r}; reads {self.written()}"
+        )
+
 
 INSIDE = RegionRequirement(kind=SIMD_VF_KIND, placement="inside")
 OUTSIDE = RegionRequirement(kind=SIMD_VF_KIND, placement="outside")
@@ -222,6 +282,69 @@ class Pset(Op):
     elem_width = ParamDef(kind="attribute", annotation=int)
 
 
+@register_op(dialect="T", category="ascend", name="ascend_pset16")
+class Pset16(Op):
+    """Conversion-granularity predicate set: a mask produced at 16-bit granularity.
+
+    pset32 stays reserved for FP32 arithmetic. A bf16<->f32 conversion selects
+    elements at min(src, dst) width = 16, so this is a NEW producer form with the
+    granularity declared on the instruction; it is not a second compute mode and the
+    bool tensor shape still does not encode the predicate encoding. Declaring 16 here
+    is checked against conversion_mask_width_bits, so a pset16 stating 32 is refused
+    by name at placement.
+    """
+
+    capability = OpCapability(None)
+    execution_mesh = _AIV
+    execution_region = INSIDE
+    mask_width_attribute = "elem_width"
+    mask_class = "conversion"
+
+    dst = ParamDef(kind="input", effect=WRITE, pattern=_IN_PREG)
+    elem_width = ParamDef(kind="attribute", annotation=int)
+
+
+@register_op(dialect="T", category="ascend", name="ascend_vcvt")
+class Vcvt(Op):
+    """Carrier-window <-> f32 conversion, predicated at conversion granularity.
+
+    The forward path is the only consumer of an UNPK_B16 carrier window; a plain f32
+    register is NOT a carrier. part is an explicit attribute (0), direction states
+    which of the two exact signatures applies, and elem_width is the declared 16-bit
+    conversion mask granularity. The mask is a VALUE produced by a pset in the same
+    region instance before this instruction, not an attribute: the predicate-producer
+    rule checks its dominance and its declared granularity.
+
+    This is a CPU software model of the declared contract. The native PREG encoding,
+    the physical part selection and the rounding/layout of a real 950PR issue are
+    UNSOURCED until 03-20; nothing here claims a native instruction's exact behaviour.
+    """
+
+    capability = OpCapability(None)
+    execution_mesh = _AIV
+    execution_region = INSIDE
+    mask_width_attribute = "elem_width"
+    mask_class = "conversion"
+    transport_dtypes = (DType.bf16,)
+
+    src = ParamDef(kind="input", effect=READ, pattern=_IN_CARRIER_OR_F32)
+    mask = ParamDef(kind="input", effect=READ, pattern=_IN_PREG)
+    dst = ParamDef(kind="input", effect=WRITE, pattern=_IN_F32_OR_CARRIER)
+
+    direction = ParamDef(kind="attribute", annotation=str)
+    # part is OPTIONAL at construction on purpose: a missing part must reach the same
+    # checked contract as part=1 or a wrong type and be REFUSED BY NAME there, rather
+    # than crashing in Op.__init__ with a TypeError that is no verdict at all.
+    part = ParamDef(kind="attribute", annotation=int, optional=True, default=None)
+    elem_width = ParamDef(kind="attribute", annotation=int)
+
+    between = (
+        SameConstraint("shape", "src", "dst"),
+        SameConstraint("shape", "src", "mask"),
+        _VcvtSignature(),
+    )
+
+
 @register_op(dialect="T", category="ascend", name="ascend_vadd")
 class Vadd(Op):
     """Predicated lane add, instruction ``vadd``: active lanes take ``a + b``.
@@ -249,7 +372,7 @@ class Vadd(Op):
     )
 
 
-for _op in (GmToUb, UbToGm, Vld, Vsts, Pset, Vadd):
+for _op in (GmToUb, UbToGm, Vld, Vsts, Pset, Pset16, Vcvt, Vadd):
     register_access_relation(_op)(identity_relations)
 
 
@@ -283,6 +406,16 @@ def _infer_pset(call, ctx):
     return UnitType()
 
 
+@register_typeinfer(Pset16)
+def _infer_pset16(call, ctx):
+    return UnitType()
+
+
+@register_typeinfer(Vcvt)
+def _infer_vcvt(call, ctx):
+    return UnitType()
+
+
 @register_typeinfer(Vadd)
 def _infer_vadd(call, ctx):
     return UnitType()
@@ -297,6 +430,35 @@ def _verify_pset(call, ctx):
         ctx.error(call, f"Pset: elem_width must be an int bit width, got {width!r}")
     if dst.dtype != DType.bool:
         ctx.error(call, f"Pset: dst must hold a predicate (bool), got {dst.dtype.name}")
+
+
+@register_verify_stmt(Vcvt)
+def _verify_vcvt(call, ctx):
+    """The mask is a real bool predicate covering exactly the converted lanes."""
+    src, mask, dst = (ctx.type_of(arg) for arg in call.args)
+    if mask.dtype != DType.bool:
+        ctx.error(call, f"Vcvt: mask must be a predicate (bool), got {mask.dtype.name}")
+    if tuple(mask.shape) != tuple(src.shape):
+        ctx.error(
+            call,
+            f"Vcvt: mask covers {tuple(mask.shape)} lanes but the source has {tuple(src.shape)}",
+        )
+    if tuple(dst.shape) != tuple(src.shape):
+        ctx.error(call, f"Vcvt: dst {tuple(dst.shape)} does not cover {tuple(src.shape)}")
+
+
+@register_verify_stmt(Pset16)
+def _verify_pset16(call, ctx):
+    """The producer states the conversion granularity explicitly: 16, not a shape."""
+    dst = ctx.type_of(call.args[0])
+    width = call.target.elem_width
+    if isinstance(width, bool) or not isinstance(width, int) or width != 16:
+        ctx.error(
+            call,
+            f"Pset16: elem_width must be the int 16 for a conversion mask, got {width!r}",
+        )
+    if dst.dtype != DType.bool:
+        ctx.error(call, f"Pset16: dst must hold a predicate (bool), got {dst.dtype.name}")
 
 
 @register_verify_stmt(Vadd)
@@ -335,6 +497,36 @@ def _eval_vsts(ctx):
 
 @register_schedule_eval(Pset)
 def _eval_pset(ctx):
+    shape = tuple(ctx.result_type.shape)
+    return TensorValue(data=torch.ones(shape, dtype=torch.bool), type=ctx.result_type)
+
+
+@register_schedule_eval(Vcvt)
+def _eval_vcvt(ctx):
+    """Software model of the declared conversion, with an explicit part mapping.
+
+    The carrier window is 64 words of 32 bits; each word holds two bf16 halves. This
+    model carries ONE bf16 value per word -- the half part=0 consumes -- as the logical
+    element of a (64,) carrier tensor. The unconsumed half is NOT simulated: its native
+    encoding is UNSOURCED. part is checked by _VcvtSignature, so part=1 never reaches
+    here. The f32 result is built from the 16 bf16 BITS by a shift into the high half of
+    an f32 word, not by an identity copy. Inactive lanes keep what dst held, exactly as
+    the predicated vadd does, so the mask is load-bearing here too.
+    """
+    src, mask, dst = (value.data for value in ctx.args)
+    active = mask.to(torch.bool)
+    if ctx.op.direction == "forward":
+        bits = src.reshape(-1).view(torch.int16).to(torch.int32)
+        converted = (bits << 16).view(torch.float32).reshape(src.shape)
+    else:
+        # Reverse: f32 -> bf16, RNE model (torch CPU), typed as a carrier in the IR.
+        # Native packing/rounding is UNSOURCED until 03-20.
+        converted = src.to(torch.bfloat16)
+    return TensorValue(data=torch.where(active, converted, dst), type=ctx.result_type)
+
+
+@register_schedule_eval(Pset16)
+def _eval_pset16(ctx):
     shape = tuple(ctx.result_type.shape)
     return TensorValue(data=torch.ones(shape, dtype=torch.bool), type=ctx.result_type)
 

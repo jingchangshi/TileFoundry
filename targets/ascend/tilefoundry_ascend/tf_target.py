@@ -72,6 +72,13 @@ class Ascend950PRTarget(Target):
                 # Aggregate register-file capacity is not sourced yet. 256 B is
                 # one vector register's width, not the per-AIV register budget.
                 ExplicitMemoryLevelFacts("rmem", None, "aiv", "aiv"),
+                # CARRIER is a DISTINCT register class (bf16 transport windows), not
+                # smem/UB and not an f32 element register. Declaring it here is what
+                # lets the allocation analysis give a private carrier value a lifetime
+                # without charging it to the 256 KiB UB budget. Aggregate capacity is
+                # UNSOURCED (None), exactly as for rmem; 256 B/window is a register
+                # width, never a total budget.
+                ExplicitMemoryLevelFacts("carrier", None, "aiv", "aiv"),
             ),
             implicit_levels=(
                 ImplicitMemoryLevelFacts("l2", None, "target"),
