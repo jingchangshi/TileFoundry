@@ -103,9 +103,18 @@ def _flow(prim):
       spelled similarly. They are identified by their ADDRESS instead: the byte
       offset the view is built over, which is what the program actually means.
 
-    So identity is: Var object for register storage, view address for shared storage.
-    Getting this backwards is the most likely way for this file to lie, which is why
-    it is stated here rather than left to the reader of the walk below.
+    So identity is: VIEW ADDRESS when a value is a view over an integer offset, the
+    Var object otherwise (register allocations and function parameters are each one
+    value, bound once). Getting this backwards is the most likely way for this file to
+    lie, which is why it is stated here rather than left to the reader of the walk.
+
+    A caveat this check cannot remove: in the emitted chain the GM->UB buffer and the
+    UB->GM buffer are BOTH view 0, one after the other. They are distinguished here
+    only by the transfer direction they appear in, which is a fact about this
+    particular chain and not a general inference. If a future chain staged two tiles
+    at different addresses, the address comparison would separate them properly; if it
+    staged two at the SAME address with overlapping lifetimes, this check would
+    conflate them, and that is a real limit rather than something to paper over.
 
     OWNERSHIP is separate from identity and applies to private values only: a
     register value whose owning region instance is not the instance that consumes it
@@ -124,27 +133,26 @@ def _flow(prim):
         "unresolved": [], # operand identities that could not be resolved
     }
 
-    def address_of(value):
-        """The byte offset a view is built over, or None if it is not a view of one."""
-        if not isinstance(value, Var):
-            return None
-        return flow["address"].get(id(value))
-
     def identity(value):
-        """How to tell this operand apart from another. See the docstring."""
+        """How to tell this operand apart from another. See the docstring.
+
+        A view over an integer address is identified by that address, because the
+        printer emits a fresh view per use site. EVERYTHING ELSE that is a bound
+        value is identified by its Var: a function parameter and a register
+        allocation are each one value, bound once, and two occurrences of the same
+        Var are the same value.
+
+        An operand that is not a bound Var at all -- an inline expression written
+        straight into the argument list -- is recorded as unresolved. Its id() is
+        the id of an object built for that one occurrence, so comparing two of them
+        says nothing about whether they denote the same value, and a check that
+        pretended otherwise would be guessing.
+        """
         if not isinstance(value, Var):
+            flow["unresolved"].append(type(value).__name__)
             return ("expr", id(value))
         if id(value) in flow["address"]:
-            # a shared-memory view: same address means same buffer
             return ("address", flow["address"][id(value)])
-        storage = getattr(getattr(value, "type", None), "storage", None)
-        name = getattr(storage, "name", "").lower()
-        if "rmem" in name or name == "umem":
-            return ("var", id(value))
-        # A non-view, non-register operand has no address to compare on; fall back
-        # to the Var and record it, so a chain of this shape is visible as such
-        # rather than silently compared by the wrong rule.
-        flow["unresolved"].append(value.name)
         return ("var", id(value))
 
     def walk(stmt, instance):
