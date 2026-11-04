@@ -88,7 +88,10 @@ def main():
     checks["neg_pseudo_solve_N_A_04_05"] = True
 
     for key, value in checks.items():
-        print(("ok   " if value else "FAIL ") + key)
+        # Each row prints its NAME and an explicit verdict: PASS for the positive control,
+        # REFUSED when the single defect was rejected by a named refusal.
+        verdict = ("PASS" if key.startswith("positive_control") else "REFUSED") if value else "FAIL"
+        print(f"{verdict:<9} {key}")
     if not all(checks.values()):
         print(f"{sum(not value for value in checks.values())}/{len(checks)} FAILED"); return 1
     print(f"{len(checks)}/{len(checks)} checks passed")
