@@ -33,6 +33,7 @@ from tilefoundry.ir.core.expr import SSAValue
 from tilefoundry.ir.core.kinds import BinaryKind
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.core.param_def import MemoryEffect
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.math.binary import Binary as HirBinary
@@ -46,7 +47,14 @@ from tilefoundry.ir.isl_interop import isl_to_dim, layout_to_isl_map
 from tilefoundry.ir.tir.arith import Binary as TirBinary
 from tilefoundry.ir.tir.memory import AllocTensor, Copy, Fill, PtrOf, TensorView
 from tilefoundry.ir.tir.prim_function import PrimFunction
-from tilefoundry.ir.tir.stmts import Evaluate, For, LetStmt, MeshScope, Sequential
+from tilefoundry.ir.tir.stmts import (
+    Evaluate,
+    ExecutionScope,
+    For,
+    LetStmt,
+    MeshScope,
+    Sequential,
+)
 from tilefoundry.ir.types import (
     Broadcast,
     ComposedLayout,
@@ -166,12 +174,12 @@ class TirBuilder:
         ))
 
     @contextmanager
-    def region(self, *, owner=None, mesh=None, binding=None, loop=None):
+    def region(self, *, owner=None, mesh=None, binding=None, loop=None, execution=None):
         if mesh is not None and owner is None:
             current = self.blocks[-1].mesh
             if current is not None and current == mesh:
                 mesh = None
-        if mesh is not None or loop is not None:
+        if mesh is not None or loop is not None or execution is not None:
             region = TirScope(mesh if mesh is not None else self.blocks[-1].mesh, owner)
             if binding is not None:
                 region.bound[id(binding)] = binding
@@ -193,20 +201,25 @@ class TirBuilder:
             self.blocks.pop()
             if loop is not None:
                 self.loops.pop()
-        if mesh is not None or loop is not None:
+        if mesh is not None or loop is not None or execution is not None:
             pending = [region.result]
             while pending:
                 value = pending.pop()
                 if isinstance(value, Var) and id(value) in region.bound:
-                    raise LoweringError(
-                        f"value {value.name!r} escapes region mesh {mesh or region.mesh!r}"
+                    where = (
+                        f"execution region {execution!r}"
+                        if execution is not None
+                        else f"region mesh {mesh or region.mesh!r}"
                     )
+                    raise LoweringError(f"value {value.name!r} escapes {where}")
                 if isinstance(value, View):
                     pending.extend((value.base, *value.starts))
                 elif isinstance(value, Expr) and not isinstance(value, Var):
                     pending.extend(expr_children(value))
         if mesh is not None:
             self.add(MeshScope(mesh, binding, self.build(region)))
+        elif execution is not None:
+            self.add(ExecutionScope(execution, self.build(region)))
         elif loop is not None:
             self.add(For(*loop, self.build(region)))
 
@@ -1248,7 +1261,7 @@ class Lowering(ValuationVisitor[Expr | View]):
     def visit(self, expr, ctx=None, *, dimension=False):
         if ctx is None:
             ctx = self.locations.get(id(expr), self.context)
-            if isinstance(expr, (MeshRegion, LoopRegion)):
+            if isinstance(expr, (MeshRegion, LoopRegion, ExecutionRegion)):
                 ctx = ctx.parent
         if dimension:
             if isinstance(expr, Expr):
@@ -1273,7 +1286,7 @@ class Lowering(ValuationVisitor[Expr | View]):
             elements = tuple(self.visit(element, ctx=ctx) for element in expr.elements)
             result = Tuple(elements, type=TupleType(tuple(element.type for element in elements)))
         else:
-            if isinstance(expr, (LoopRegion, MeshRegion)) and id(expr) not in self._memo:
+            if isinstance(expr, (LoopRegion, MeshRegion, ExecutionRegion)) and id(expr) not in self._memo:
                 values = tuple(self.visit(arg, ctx=ctx) for arg in expr.args)
                 for index, (param, value) in enumerate(zip(expr.params, values, strict=True)):
                     if not isinstance(expr, LoopRegion) or index >= len(expr.yield_values):
@@ -1342,6 +1355,19 @@ class Lowering(ValuationVisitor[Expr | View]):
             ctx.names.fresh("cta" if region is ctx.function.body else "scope"), type=_BINDING
         )
         with ctx.builder.region(mesh=mesh, binding=binding, owner=region) as scope:
+            result = self.visit(region.body, self.on_region_start(region, ctx))
+            scope.result = result
+        return result
+
+    def visit_ExecutionRegion(self, region: ExecutionRegion, ctx):
+        """Lower a mode region to a TIR ExecutionScope around its body.
+
+        The scope states the mode; it opens no participants, so the mesh in
+        force is the one the region was entered under. The region has exactly one
+        result, which is what makes register non-escape a property of the
+        produced IR rather than a promise about the body.
+        """
+        with ctx.builder.region(execution=region.kind, owner=region) as scope:
             result = self.visit(region.body, self.on_region_start(region, ctx))
             scope.result = result
         return result

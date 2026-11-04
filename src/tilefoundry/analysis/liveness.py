@@ -242,11 +242,14 @@ class LivenessVisitor(ValuationVisitor[None]):
         self.define(region, self.next_event())
 
     def visit_ExecutionRegion(self, region: ExecutionRegion, ctx=None) -> None:
-        """Give a mode region the same argument/parameter/body edges as a mesh one.
+        """Record a mode region's edges without opening a residency window.
 
-        The mode changes what may cross the boundary, not how the boundary is
-        named: the args are read outside, the params are defined at entry, and
-        the body's value is the region's one result.
+        The args are read outside, the params are defined at entry, and the
+        body's value is the region's one result -- the same edges a mesh region
+        contributes. It contributes no ``RegionInterval``, because an interval
+        asks which storage is resident *for a set of participants*, and a mode
+        opens none: the storage in a mode region is resident for the mesh the
+        region was entered under, whose own interval already spans this body.
         """
         for argument in region.args:
             self.visit(argument, ctx)
@@ -261,7 +264,6 @@ class LivenessVisitor(ValuationVisitor[None]):
         self.visit(region.body, inner)
         body_use = self.next_event()
         self.use(region.body, body_use)
-        self.regions.append(RegionInterval(region, argument_use, body_use))
         self.define(region, self.next_event())
 
     def visit_LoopRegion(self, region: LoopRegion, ctx=None) -> None:

@@ -30,7 +30,7 @@ from tilefoundry.ir.core import (
     attach_metadata,
     get_metadata,
 )
-from tilefoundry.ir.core.execution import execution_kind_for_surface
+from tilefoundry.ir.core.execution import execution_kind_of
 from tilefoundry.ir.core.param_def import variadic_item_annotation
 from tilefoundry.ir.hir.nn.matmul import MatMul
 from tilefoundry.ir.pattern import _mangle_variant_name
@@ -4517,29 +4517,44 @@ def _rebind_through_region(context, build, names, frame, node, params=(), args=(
     return values[0][0]
 
 
-def _with_execution_kind(context_expr):
+def _execution_surface_kind(func_node, context):
+    """The execution kind a with-statement context call names, or None.
+
+    Resolved, not spelled: the callee is evaluated to the object it denotes and
+    that object is asked for its declaration. A foreign qualifier therefore
+    cannot borrow the surface name -- an attribute that merely ends in the same
+    word is a different object, and an unresolvable one is no mode at all --
+    while an alias that denotes the same marker is accepted, because identity
+    is what a declaration is.
+    """
+    try:
+        resolved = _resolve_reference(func_node, context)
+    except ParseError:
+        return None
+    return execution_kind_of(resolved)
+
+
+def _with_execution_kind(context_expr, context):
     """The execution kind a with-statement context expression names, or None.
 
-    Read off the syntax rather than the declaration registry: this runs while
-    the with-statement is being matched, before its context child is resolved.
-    A name the registry does not declare is not an execution region, so the
-    mesh reading gets its chance and the statement fails there if it is neither.
+    A context expression that is not a bare, argument-free call of a declared
+    surface denotes no mode, so the Mesh reading gets its chance and the
+    statement fails there when it is neither.
     """
     if not isinstance(context_expr, ast.Call) or context_expr.args or context_expr.keywords:
         return None
-    func = context_expr.func
-    if not isinstance(func, ast.Attribute):
-        return None
-    return execution_kind_for_surface(func.attr)
+    return _execution_surface_kind(context_expr.func, context)
+
 
 class ExecutionContextPattern(ElementPattern):
     """The context expression of a with-statement naming one execution mode.
 
-    A surface marker is a declaration, not an operation: it is resolved by name
-    through the same registry the dialect tree reads, so a with-statement over
-    T.SimdVF states a mode and nothing else. It is deliberately not a Mesh
-    pattern -- entering a mode does not open participants, and a mesh with no
-    extent has no meaning.
+    A surface marker is a declaration, not an operation: the callee is resolved to
+    the object it denotes, and that object is asked for its declaration. So
+    T.SimdVF, an alias denoting it and a re-import of it all state the same mode,
+    while an attribute that merely spells the word on some other owner does not.
+    It is deliberately not a Mesh pattern -- entering a mode does not open
+    participants, and a mesh with no extent has no meaning.
     """
 
     element_name = "execution_context"
@@ -4549,12 +4564,7 @@ class ExecutionContextPattern(ElementPattern):
                 ast.Call,
                 FieldPattern(
                     "func",
-                    AstNodePattern(
-                        ast.Attribute,
-                        FieldPattern(
-                            "attr", CapturePattern("surface", lambda value, context: value)
-                        ),
-                    ),
+                    ChoicePattern(AstNodePattern(ast.Name), AstNodePattern(ast.Attribute)),
                 ),
                 FieldPattern("args", SequencePattern()),
                 FieldPattern("keywords", SequencePattern()),
@@ -4568,8 +4578,7 @@ class ExecutionContextPattern(ElementPattern):
         node: object, context: MatchContext, matched: AstMatch[Any]
     ) -> AstMatch[Any] | MatchFailure | None:
         assert isinstance(node, ast.Call)
-        surface = matched.captures.get("surface")
-        kind = execution_kind_for_surface(surface) if isinstance(surface, str) else None
+        kind = _execution_surface_kind(node.func, context)
         if kind is None:
             return None
         return dataclasses.replace(
@@ -4660,7 +4669,7 @@ class WithPattern(ElementPattern):
         assert isinstance(node, ast.With)
         item = node.items[0]
         binding = item.optional_vars.id if isinstance(item.optional_vars, ast.Name) else None
-        kind = _with_execution_kind(item.context_expr)
+        kind = _with_execution_kind(item.context_expr, context)
         if kind is not None and context.function is not None:
             if context.function.dialect != "hir":
                 raise ParseError.from_node(

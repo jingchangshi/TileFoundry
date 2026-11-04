@@ -239,6 +239,23 @@ class InstantiateDimensionCloner(ExprCloner):
             type=substitute_dims(region.type, self.dims),
         )
 
+    def visit_ExecutionRegion(self, region, ctx=None):
+        """Substitute a mode region without breaking its own bindings.
+
+        The params are visited *before* the body, exactly as they are for a mesh
+        region: the cloner memoizes by source identity, so visiting a param first
+        is what makes every use of it in the body resolve to the same cloned
+        object. Rebuilding the body first would leave the params and their uses as
+        different Vars, which is not a specialised region but a broken binding.
+        """
+        return dataclasses.replace(
+            region,
+            args=tuple(self.visit(arg) for arg in region.args),
+            params=tuple(self.visit(param) for param in region.params),
+            body=self.visit(region.body),
+            type=substitute_dims(region.type, self.dims),
+        )
+
     def visit_LoopRegion(self, region, ctx=None):
         def bound(value):
             if is_dim_expr(value):

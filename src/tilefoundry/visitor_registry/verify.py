@@ -17,7 +17,11 @@ from tilefoundry.ir.core.metadata import diagnostic_location
 from tilefoundry.ir.core.module import Module, ModuleList, resolve_symbol
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
-from tilefoundry.ir.core.execution import declared_kinds, execution_kind
+from tilefoundry.ir.core.execution import (
+    declared_kinds,
+    execution_kind,
+    region_requirement,
+)
 from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
@@ -30,6 +34,7 @@ from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.shape import ShapeOf
 from tilefoundry.ir.tir.stmt import Stmt
 from tilefoundry.ir.tir.stmts import (
+    ExecutionScope,
     Evaluate,
     For,
     If,
@@ -112,7 +117,7 @@ def execution_kind_declaration(kind: str):
 
 
 def current_execution_kinds(ctx) -> tuple:
-    """The execution modes in force at *ctx*, outermost first."""
+    """The execution modes in force at *ctx*, innermost first."""
     if ctx is None:
         return ()
     held = [
@@ -120,44 +125,80 @@ def current_execution_kinds(ctx) -> tuple:
         for ctx_ in ctx.ancestors()
         if isinstance(ctx_.owner, ExecutionRegion)
     ]
-    return tuple(reversed(held))
+    return tuple(held)
 
 
-def verify_execution_boundary(region, ctx=None) -> None:
-    """Check one execution region states a mode that can be entered here.
+def _mesh_topology_names(mesh) -> tuple[str, ...]:
+    """The level names of *mesh*, or an empty tuple when it states none."""
+    if mesh is None:
+        return ()
+    return tuple(
+        str(getattr(topology, "name", topology)) for topology in getattr(mesh, "topologies", ())
+    )
 
-    Two questions, both about the boundary rather than the body: does the mode
-    exist with a mask width its instructions can be held to, and is the topology
-    it requires the one in force. The body is the body walker s question.
+
+def verify_execution_boundary(region, ctx) -> None:
+    """Check one execution region states a mode that may be entered here.
+
+    Everything here is about the boundary; the body is the body walker s
+    question. Four refusals, each of which would otherwise be a silent yes:
+
+    - a kind nothing declares, which has no rules to hold the region to;
+    - a declaration with no mask width, whose instructions cannot be bounded;
+    - a declaration with no required topology, which names no domain at all;
+    - an enclosing mode that is not nestable, which for the parser and for
+      this check alike means no execution region may be entered inside it.
+
+    The domain itself is read off the mesh *in force at the region*, never off
+    the module declaration: a module that declares an AIV level says what the
+    program may use, not that every region in it runs there. A region with no
+    mesh in force therefore states a mode with nowhere to run and is refused,
+    which is also why a module declaring no topologies cannot slip through as
+    an empty set that trivially contains the requirement.
     """
+    if ctx is None:
+        raise VerifyError(
+            "ExecutionRegion: this boundary cannot be checked without a lexical "
+            "context; the kind, the domain in force and the enclosing modes are all "
+            "properties of where the region sits. Verify it from a walk that has one."
+        )
     declared = execution_kind_declaration(region.kind)
     if declared.mask_width_bits is None:
-        message = (
+        ctx.error(
+            region,
             f"execution region {declared.name!r} declares no mask width; "
-            "a mode whose element width is unstated cannot bound its instructions"
+            "a mode whose element width is unstated cannot bound its instructions",
         )
-        if ctx is not None:
-            ctx.error(region, message)
-        raise VerifyError(f"ExecutionRegion: {message}")
-    for enclosing in current_execution_kinds(ctx):
-        if enclosing.name == declared.name and not declared.nestable:
-            message = (
-                f"execution region {declared.name!r} re-enters a mode already in force; "
-                "this kind is not nestable"
+    if not declared.required_topologies:
+        ctx.error(
+            region,
+            f"execution region {declared.name!r} declares no required topology; "
+            "a mode with no domain is not a mode this program can be checked against",
+        )
+    for outer in current_execution_kinds(ctx):
+        if not outer.nestable:
+            ctx.error(
+                region,
+                f"execution region {declared.name!r} is entered inside "
+                f"{outer.name!r}, which is not nestable; no execution region may be "
+                "opened inside it",
             )
-            if ctx is not None:
-                ctx.error(region, message)
-            raise VerifyError(f"ExecutionRegion: {message}")
-    known = {level.name for level in (ctx.topologies or ())} if ctx is not None else set()
+    in_force = _mesh_topology_names(getattr(ctx, "current_mesh", None))
+    if not in_force:
+        ctx.error(
+            region,
+            f"execution region {declared.name!r} requires topology "
+            f"{declared.required_topologies!r} but no mesh is in force at the region; "
+            "a mode needs a domain to run in, not only a declaration",
+        )
     for topology in declared.required_topologies:
-        if known and topology not in known:
-            message = (
+        if topology not in in_force:
+            ctx.error(
+                region,
                 f"execution region {declared.name!r} requires topology {topology!r}, "
-                f"which the declaration does not have; it has {tuple(sorted(known))!r}"
+                f"which the mesh in force does not have; it has {in_force!r}",
             )
-            if ctx is not None:
-                ctx.error(region, message)
-            raise VerifyError(f"ExecutionRegion: {message}")
+
 
 def verify_value_layouts(expr):
     """Require concrete tensor layouts on values, independently of annotations."""
@@ -512,7 +553,7 @@ class _Binders:
             self.visible.remove(id(var))
 
 
-def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders):
+def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: tuple = ()):
     for _, value in _iter_stmt_expr_fields(stmt):
         if isinstance(value, Expr):
             verify_value_layouts(value)
@@ -520,7 +561,7 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders):
         case Sequential():
             with ExitStack() as bound:
                 for s in stmt.body:
-                    _walk_stmt(s, ctx, scope, fn, module_context, binders)
+                    _walk_stmt(s, ctx, scope, fn, module_context, binders, modes)
                     if isinstance(s, LetStmt):
                         bound.enter_context(binders.bind(s.var, s))
             return
@@ -557,24 +598,28 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders):
             ):
                 raise VerifyError("For.induction_var must be rank-0 integer")
             with binders.bind(stmt.induction_var, stmt):
-                _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders)
+                _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders, modes)
             return
         case While():
             binders.uses(stmt.cond, stmt)
             _check_rank0_bool(ctx, stmt, stmt.cond)
-            _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders)
+            _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders, modes)
             return
         case If():
             binders.uses(stmt.cond, stmt)
             _check_rank0_bool(ctx, stmt, stmt.cond)
-            _walk_stmt(stmt.then_body, ctx, scope, fn, module_context, binders)
-            _walk_stmt(stmt.else_body, ctx, scope, fn, module_context, binders)
+            _walk_stmt(stmt.then_body, ctx, scope, fn, module_context, binders, modes)
+            _walk_stmt(stmt.else_body, ctx, scope, fn, module_context, binders, modes)
             return
         case MeshScope():
             scope.append(stmt.mesh)
             with binders.bind(stmt.binding, stmt):
-                _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders)
+                _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders, modes)
             scope.pop()
+            return
+        case ExecutionScope():
+            _verify_execution_scope(stmt, ctx, scope, modes)
+            _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders, (*modes, stmt.kind))
             return
         case Return():
             for _name, value in _iter_stmt_expr_fields(stmt):
@@ -590,6 +635,7 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders):
                 _verify_retained_call(stmt, fn, module_context, ctx)
             else:
                 op = stmt.callable
+                verify_op_placement(op, modes, where="ExecutionScope")
                 ctx.mesh_scope = tuple(scope)
                 ctx.current_mesh = None
                 for mesh in scope:
@@ -614,6 +660,96 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders):
         binders.uses(field_val, stmt)
         _reject_nested_alloc_tensor(field_val, at_letstmt_value=False)
         _check_embedded_sharding(field_val, scope, fn)
+
+
+def verify_op_placement(op, modes: tuple, *, where: str = "execution region") -> None:
+    """Check one operation is legal in the execution modes in force.
+
+    A mode is not a hint. Every operation states its placement, and an
+    operation that states none may not run inside a mode: the alternative --
+    treating "no declaration" as "allowed anywhere" -- is exactly how a legacy
+    CUDA-thread binary becomes a vector instruction because it happened to be
+    written inside the with-block. Outside a mode the same rule refuses an
+    operation that says it belongs inside one, so the declaration is enforced
+    in both directions rather than only where it is convenient.
+    """
+    requirement = region_requirement(op)
+    name = getattr(op, "name", type(op).__name__)
+    if not modes:
+        if requirement is not None and requirement.placement == "inside":
+            raise VerifyError(
+                f"{name}: this operation declares it belongs inside execution region "
+                f"{requirement.kind!r}, but no execution region is in force at it"
+            )
+        return
+    if requirement is None:
+        raise VerifyError(
+            f"{name}: this operation declares no execution placement and may not run "
+            f"inside {where} {modes[-1]!r}; a mode admits only operations written for it"
+        )
+    if requirement.placement == "outside":
+        raise VerifyError(
+            f"{name}: this operation declares it belongs outside an execution region "
+            f"but runs inside {where} {modes[-1]!r}"
+        )
+    if requirement.kind != modes[-1]:
+        raise VerifyError(
+            f"{name}: this operation belongs inside execution region "
+            f"{requirement.kind!r} but runs inside {modes[-1]!r}"
+        )
+
+
+def _verify_execution_scope(stmt, ctx, scope, modes: tuple) -> None:
+    """Check a TIR mode scope states a mode this point in the program allows.
+
+    The same four boundary questions the HIR region answers, asked of the TIR
+    node, because a lowered scope is a second entry point into the same claims
+    and a check that only ran before lowering is not a check on the program that
+    is shipped. The TIR scope carries its kind as a string and opens no
+    participants, so the mesh is read off the lexical scopes already open.
+    """
+    declared = execution_kind(stmt.kind)
+    if declared is None:
+        raise VerifyError(
+            f"ExecutionScope names undeclared kind {stmt.kind!r}; declared kinds are "
+            f"{tuple(item.name for item in declared_kinds())!r}"
+        )
+    if declared.mask_width_bits is None:
+        raise VerifyError(
+            f"ExecutionScope {declared.name!r} declares no mask width; a mode whose "
+            "element width is unstated cannot bound its instructions"
+        )
+    if not declared.required_topologies:
+        raise VerifyError(
+            f"ExecutionScope {declared.name!r} declares no required topology; "
+            "a mode with no domain cannot be checked against this program"
+        )
+    for outer in modes:
+        outer_declared = execution_kind(outer)
+        if outer_declared is None:
+            raise VerifyError(f"ExecutionScope encloses undeclared kind {outer!r}")
+        if not outer_declared.nestable:
+            raise VerifyError(
+                f"ExecutionScope {declared.name!r} is nested inside {outer_declared.name!r}, "
+                "which is not nestable; no execution scope may be opened inside it"
+            )
+    in_force = tuple(
+        str(getattr(level, "name", level))
+        for mesh in scope
+        for level in getattr(mesh, "topologies", ())
+    )
+    if not in_force:
+        raise VerifyError(
+            f"ExecutionScope {declared.name!r} requires topology "
+            f"{declared.required_topologies!r} but no MeshScope encloses it; "
+            "a mode needs a domain to run in, not only a declaration"
+        )
+    for topology in declared.required_topologies:
+        if topology not in in_force:
+            raise VerifyError(
+                f"ExecutionScope {declared.name!r} requires topology {topology!r}, "
+                f"which the enclosing MeshScope does not have; it has {in_force!r}"
+            )
 
 
 def _iter_stmt_expr_fields(stmt):
