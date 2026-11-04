@@ -46,3 +46,19 @@ dyn and recompute give identical values (as expected).
 The oracle is a faithful FP32-accumulation model EXCEPT where the lane-reduction order is
 unresolved. Until a selected-build microtest pins that order, agreement with the oracle
 cannot distinguish the correct tree from a placeholder that happens to sum similarly.
+
+
+## Scalar semantics (visible in every diff)
+
+The oracle multiplies by a FLOAT32-ROUNDED scalar (v33's scale lives in FP32). This is a
+deliberate, stated choice, not an exact-scalar model. The distinction is observable:
+  0x3f81 (bf16) * 0x1.02fa0be82fa0cp+0
+    -> 0x3f82 with the f32-rounded scalar
+    -> 0x3f83 with the exact scalar
+Verified by "python tools/p3/rmsnorm_oracle.py --out X --scalar-demo". MANIFEST.json records
+scalar_semantics accordingly. Any future diff must state which scalar semantics it used.
+
+## Credit scope
+
+Software oracle credit only. Native vcadd table and FP32-vs-BF16 semantics are NOT
+accepted. check_reduction_order_observable must not be cited (tautology; see p2 REPORT 10).

@@ -17,6 +17,9 @@ v33 semantics it models (from reference/kernel_v33.py, SHA c6c37fb7... == P0 pin
   * y = FP32(x*scale*w) and a SINGLE RNE to BF16 on store.
 
 Assumptions (not fixed by the spec; see the report): vcadd as pairwise adjacent halving;
+SCALAR SEMANTICS: this oracle multiplies by a FLOAT32-ROUNDED scalar (v33's scale is FP32).
+An exact-scalar multiply would differ: 0x3f81 * 0x1.02fa0be82fa0cp+0 gives bf16 0x3f82 with
+the f32-rounded scalar but 0x3f83 with the exact scalar (demonstrated by --scalar-demo).
 vmula as two roundings (mul then add) rather than a fused single-rounding FMA.
 
 Outputs: <out>/<case>/<pattern>.y_bf16.npy (uint16) + MANIFEST.json.
@@ -169,6 +172,7 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--self-check", action="store_true")
+    ap.add_argument("--scalar-demo", action="store_true")
     args = ap.parse_args()
     if args.self_check:
         from fractions import Fraction
@@ -190,6 +194,17 @@ def main() -> int:
                 bad += 1
         print("self-check bad:", bad)
         return 0 if bad == 0 else 1
+    if args.scalar_demo:
+        from fractions import Fraction
+        scalar = float.fromhex("0x1.02fa0be82fa0cp+0")
+        lane = p2.bf16_bits_to_fraction(0x3f81)
+        exact_bits = p2.fraction_to_bf16_bits(lane * Fraction(scalar))
+        p32 = np.float32(np.float32(float(lane)) * np.float32(scalar))
+        f32_bits = p2.fraction_to_bf16_bits(Fraction(float(p32)))
+        print("scalar exact:", repr(scalar))
+        print("exact-scalar bf16:    0x%04X" % exact_bits)
+        print("f32-rounded-scalar bf16: 0x%04X" % f32_bits)
+        return 0 if (exact_bits, f32_bits) == (0x3F83, 0x3F82) else 1
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     results = []
     for case in SHAPES:
@@ -207,6 +222,7 @@ def main() -> int:
         "merge": {"prefill": "((a0+a1)+(a2+a3))", "decode": "(a0+a1)"},
         "vcadd_model": "UNRESOLVED: pairwise-halving PLACEHOLDER only; must be pinned by a selected-build microtest against simd_inst.h 688-702 (asc_reduce_sum PAT_VL1) / 681-684 (vcpadd asc_pair_reduce_sum)",
         "vmula_model": "mul then add, two FP32 roundings (ASSUMED)",
+        "scalar_semantics": "FLOAT32-ROUNDED scalar (v33 scale is FP32); exact scalar differs: 0x3f81*0x1.02fa0be82fa0cp+0 -> 0x3f82 (f32 scalar) vs 0x3f83 (exact)",
         "patterns": list(PATTERNS), "shapes": {k: list(v) for k, v in SHAPES.items()},
         "results": results,
     }

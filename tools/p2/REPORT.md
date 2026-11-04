@@ -136,3 +136,19 @@ that C++ / an exact selected-build microtest, not inferred from a Python comment
 
 Therefore: the reduction order is UNRESOLVED pending an exact selected-build microtest.
 Any "pairwise halving" statement in tools/p3 is a PLACEHOLDER model, not a claim.
+
+
+## 10. check_reduction_order_observable is a TAUTOLOGY - do not cite it
+
+The shipped check_reduction_order_observable is a tautology: replacing the pairwise
+reducer with a constant 0 still passes it. It is NOT evidence of order observability and
+must not be cited as such until I1 fixes it and adds the constant-reducer mutant as a
+permanent negative. The vcadd order remains UNRESOLVED (section 9).
+
+## 11. Credit scope (from the Lead/architect)
+
+Software-exact quantizer results are accepted as the strongest positive evidence (65,280
+finite codepoints; 32,639 adjacent intervals with midpoint +/- gap/2^40 and ties; overflow
+controls; 8,192 add/mul predicate checks; 64 independent pairwise math cases). BUT the
+native vcadd table and FP32-vs-BF16 semantics are NOT accepted. This is SOFTWARE ORACLE
+CREDIT ONLY.
