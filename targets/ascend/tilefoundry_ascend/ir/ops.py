@@ -27,7 +27,7 @@ from tilefoundry.ir.core import Op, OpCapability
 from tilefoundry.ir.core.execution import RegionRequirement
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
-from tilefoundry.ir.pattern import OrPattern, SameConstraint, TensorPattern, utils
+from tilefoundry.ir.pattern import Constraint, OrPattern, SameConstraint, TensorPattern, utils
 from tilefoundry.ir.types import DType, StorageKind, UnitType
 from tilefoundry.utils.lazy import torch
 from tilefoundry.visitor_registry import register_typeinfer, register_verify_stmt
@@ -50,6 +50,11 @@ _AIV = utils.memory_execution_mesh()
 #: add" a checked claim instead of a docstring.
 VECTOR_DTYPES: tuple[DType, ...] = (DType.f32,)
 
+#: Staging loads also carry bf16, v33's input format: GM/UB hold packed bf16 and vld with
+#: dist="UNPK_B16" unpacks it. This does NOT widen the COMPUTE dtype set -- arithmetic
+#: instructions still take f32 and the mode's element width still checks them.
+LOAD_DTYPES: tuple[DType, ...] = (DType.f32, DType.bf16)
+
 
 def _operands_in(storage: StorageKind, *dtypes: DType) -> TensorPattern:
     """A tensor in *storage* whose dtype is one of *dtypes*.
@@ -66,6 +71,35 @@ _IN_GMEM = utils.tensor_in(StorageKind.GMEM)
 _IN_UB = _operands_in(StorageKind.SMEM, *VECTOR_DTYPES)
 _IN_VREG = _operands_in(StorageKind.RMEM, *VECTOR_DTYPES)
 _IN_PREG = TensorPattern(dtype=DType.bool, storage=StorageKind.RMEM)
+_IN_GMEM_LOAD = TensorPattern(dtype=OrPattern(DType.f32, DType.bf16), storage=StorageKind.GMEM)
+_IN_UB_LOAD = _operands_in(StorageKind.SMEM, *LOAD_DTYPES)
+_IN_VREG_LOAD = _operands_in(StorageKind.RMEM, *LOAD_DTYPES)
+
+
+class _VldDist(Constraint):
+    """A bf16 vld must state UNPK_B16; an f32 vld must state no dist.
+
+    The dist attribute is part of the contract, not decoration: a packed bf16 load and a
+    plain f32 load address different elements, so a load that states neither is refused
+    rather than assumed.
+    """
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "field", "dtype")
+        object.__setattr__(self, "left", "src")
+        object.__setattr__(self, "right", "src")
+
+    def holds(self, operands: dict) -> bool:
+        dtype = getattr(operands.get("src"), "dtype", None)
+        if dtype is None:
+            return True
+        dist = operands.get("dist")
+        if dtype == DType.bf16:
+            return dist == "UNPK_B16"
+        return dist is None
+
+    def written(self) -> str:
+        return "bf16 loads state dist=UNPK_B16 and f32 loads state no dist"
 
 INSIDE = RegionRequirement(kind=SIMD_VF_KIND, placement="inside")
 OUTSIDE = RegionRequirement(kind=SIMD_VF_KIND, placement="outside")
@@ -79,8 +113,8 @@ class GmToUb(Op):
     execution_mesh = _AIV
     execution_region = OUTSIDE
 
-    src = ParamDef(kind="input", effect=READ, pattern=_IN_GMEM)
-    dst = ParamDef(kind="input", effect=WRITE, pattern=_IN_UB)
+    src = ParamDef(kind="input", effect=READ, pattern=_IN_GMEM_LOAD)
+    dst = ParamDef(kind="input", effect=WRITE, pattern=_IN_UB_LOAD)
 
     between = (SameConstraint("shape", "src", "dst"), SameConstraint("dtype", "src", "dst"))
 
@@ -93,8 +127,8 @@ class UbToGm(Op):
     execution_mesh = _AIV
     execution_region = OUTSIDE
 
-    src = ParamDef(kind="input", effect=READ, pattern=_IN_UB)
-    dst = ParamDef(kind="input", effect=WRITE, pattern=_IN_GMEM)
+    src = ParamDef(kind="input", effect=READ, pattern=_IN_UB_LOAD)
+    dst = ParamDef(kind="input", effect=WRITE, pattern=_IN_GMEM_LOAD)
 
     between = (SameConstraint("shape", "src", "dst"), SameConstraint("dtype", "src", "dst"))
 
