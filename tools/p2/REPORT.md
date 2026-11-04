@@ -73,7 +73,7 @@ tools/p2/cross_check_impl.py, read-only on the target-side module:
 ## P2 CEILING (nothing downstream may silently assume these)
 
 1. vcadd lane-reduction order (tree vs sequential vs hardware hierarchy).
-2. ACCUMULATOR COUNT -- explicit contract field, PROVISIONALLY ruled by the Lead
+2. [RETRACTED -- see section 8; the text below is kept for the record] ACCUMULATOR COUNT -- was PROVISIONALLY ruled by the Lead
    (architect confirmation pending; this is NOT settled by me):
    - BASELINE OF RECORD FOR NUMERIC CLAIMS = TWO. Numeric claims are made against the
      shipped, executable reference/kernel_v33.py, whose rows=4 path uses TWO accumulators
@@ -96,3 +96,43 @@ tools/p2/cross_check_impl.py, read-only on the target-side module:
 
 Consequence: numeric agreement pins only the determined parts; it is NOT proof of the
 hardware reduction order, and the accumulator count is an open design question.
+
+
+## 8. RETRACTION of the provisional accumulator ruling (do not build on item 2 above)
+
+Retracted: the claim "TWO is the baseline of record" was WRONG. It mistook the rows<=2
+fallback path for the main path. Verified against the pinned reference
+reference/kernel_v33.py, whose SHA was re-checked as
+c6c37fb751d0afe439006a953d5518724166a7375bc5201bfdb9acb61b93d909 == the P0 pin.
+
+Corrected record (per-case, from the pinned source):
+  * prefill 8192x4096: _rows_per_core(8192) == 4 (8192 % 4 == 0 and 8192//4 == 2048 >= 56).
+    The rows==4 path (kernel_v33.py lines 127-140) declares FOUR fp32 chains
+    acc0_0..acc0_3, one vmula chain per chunk lane group (chunk index % 4), and merges them
+    BALANCED as ((acc0_0 + acc0_1) + (acc0_2 + acc0_3)). stages=4, yver=2.
+  * decode 64x4096: _rows_per_core(64) == 1 (64//4=16 < 56, 64//2=32 < 56, 64//1=64 >= 56),
+    so the rows<=2 fallback is used: TWO fp32 chains (acc0, acc1), merge (acc0 + acc1).
+    stages=2, yver=1.
+
+Two corrections that follow:
+  (a) The accumulator count is PER-CASE, part of the algorithm / scheduled-HIR numerical
+      contract -- NOT a universal primitive ISA field and NOT one global constant.
+  (b) ALL accumulation is FP32 AFTER the BF16->FP32 conversion (vld dist="UNPK_B16" then
+      vcvt to "float32"; vmula are float32). A reducer that rounds each step to BF16 is a
+      TOY and is NOT v33 accumulation semantics. Any reference or test that does per-step
+      BF16 rounding must be labelled a toy, not a contract.
+
+Consequence for the P3 oracle: it models v33 (FP32 accumulation, 4 chains for prefill /
+2 for decode, balanced merge), not the earlier global-2 assumption.
+
+
+## 9. vcadd reduction order is UNSOURCED and UNRESOLVED
+
+The earlier "6 vcadd" description is a PYTHON DOCSTRING reading, not proof. Against the
+current TileLang C++ it is UNSOURCED: simd_inst.h 688-702 uses asc_reduce_sum with
+PAT_VL1, and vcpadd 681-684 uses asc_pair_reduce_sum. Those are the actual primitives the
+selected build uses; the exact lane reduction tree they implement must be established from
+that C++ / an exact selected-build microtest, not inferred from a Python comment.
+
+Therefore: the reduction order is UNRESOLVED pending an exact selected-build microtest.
+Any "pairwise halving" statement in tools/p3 is a PLACEHOLDER model, not a claim.

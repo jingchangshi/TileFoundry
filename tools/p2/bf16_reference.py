@@ -128,18 +128,19 @@ def f32_round(x: float) -> float:
         return math.inf if x > 0 else -math.inf
 
 
-# PROVISIONAL (Lead ruling; architect confirmation pending -- NOT settled by this reference):
-#   baseline of record for NUMERIC CLAIMS = TWO accumulators, because numeric claims are made
-#   against the shipped, executable reference/kernel_v33.py whose rows=4 path uses TWO.
-#   The design's FOUR is a design variant/target, not the contract (no executable form).
-# CONTRACT REQUIREMENT: the ISA must declare the accumulator count explicitly as a contract
-#   field and state that the reduction order DEPENDS on it, so a four-accumulator variant
-#   cannot silently change numerics. ACCUMULATOR_COUNT_BASELINE is that field here.
-ACCUMULATOR_COUNT_BASELINE = 2
+# RETRACTED (see tools/p2/REPORT.md section 8): a single global accumulator count is WRONG.
+# The count is PER-CASE and belongs to the algorithm / scheduled-HIR numerical contract.
+# Verified against the pinned reference/kernel_v33.py (SHA c6c37fb7... == P0 pin):
+ACCUMULATOR_CHAINS = {
+    "prefill_8192x4096": 4,   # rows==4 path: acc0_0..acc0_3, balanced ((0+1)+(2+3))
+    "decode_64x4096": 2,      # rows<=2 fallback: acc0, acc1, merge (0+1)
+}
+# Retained only as the fallback value; NOT a universal contract:
+ACCUMULATOR_COUNT_BASELINE = 2  # RETRACTED as a global contract; see ACCUMULATOR_CHAINS
 
 # Documented accumulation order used by the reference model (a CHOICE, not a fact).
 REFERENCE_REDUCTION_ORDER = {
-    "accumulators": ACCUMULATOR_COUNT_BASELINE,
+    "accumulators": "per-case (see ACCUMULATOR_CHAINS)",
     "accumulator_assignment": "round-robin over chunk index (acc0 even, acc1 odd)",
     "per_accumulator_order": "increasing chunk index",
     "accumulator_combine": "acc0 + acc1 in index order",
@@ -162,6 +163,6 @@ def dot_bf16_reference(values, accumulators: int = ACCUMULATOR_COUNT_BASELINE):
 
 __all__ = ["round_half_even", "f32_bits_to_fraction", "fraction_to_bf16_bits",
            "bf16_bits_to_fraction", "bf16_from_f32_bits", "f32_round",
-           "dot_bf16_reference", "REFERENCE_REDUCTION_ORDER", "ACCUMULATOR_COUNT_BASELINE",
+           "dot_bf16_reference", "REFERENCE_REDUCTION_ORDER", "ACCUMULATOR_CHAINS",
            "BF16_MIN_NORMAL", "BF16_MAX_NORMAL", "BF16_MIN_SUBNORMAL",
            "BF16_SUBNORMAL_HALF", "BF16_OVERFLOW_MIDPOINT"]

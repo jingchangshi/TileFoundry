@@ -85,7 +85,10 @@ def _finite_bf16(rng) -> int:
 
 
 def _bf16_linear_fold(values) -> int:
-    """Independent bf16-step linear fold, using only the reference.
+    """TOY reducer: rounds every step to BF16. NOT v33 accumulation semantics.
+
+    v33 accumulates in FP32 after BF16->FP32 conversion (see tools/p2/REPORT.md section 8).
+    This fold exists only to show that a different rounding choice changes the bits.
 
     Stops (returning the inf bits) if a step overflows the bf16 range.
     """
