@@ -36,7 +36,7 @@ if "torch_npu" in sys.modules:
     raise SystemExit("REFUSED: torch_npu is loaded; this check is CPU-only")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-FIX = os.path.join(ROOT, "examples", "rmsnorm_950pr", "scheduled.py")
+FIX = os.path.join(ROOT, "targets", "ascend", "tests", "fixtures", "rmsnorm", "rmsnorm_row.py")
 ENTRY = "RMSNormRow"
 L, D, EPS = 64, 256, 1e-6
 ATOL, RTOL = 0.02, 0.01

@@ -16,7 +16,8 @@ if "torch_npu" in sys.modules:
     raise SystemExit("REFUSED: torch_npu loaded; CPU-only")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-FIX = os.path.join(ROOT, "examples", "rmsnorm_950pr", "scheduled_d.py")
+FIXDIR = os.path.join(ROOT, "targets", "ascend", "tests", "fixtures", "rmsnorm")
+FIX = os.path.join(FIXDIR, "rmsnorm_d512.py")
 ENTRY = "RMSNormD"
 L, EPS, ATOL, RTOL = 64, 1e-6, 0.02, 0.01
 
@@ -36,7 +37,7 @@ def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--tiles", type=int, required=True)
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--fixture", default="scheduled_d.py"); args = ap.parse_args()
-    global FIX; FIX = os.path.join(ROOT, "examples", "rmsnorm_950pr", args.fixture)
+    global FIX; FIX = os.path.join(FIXDIR, args.fixture)
     TILES = args.tiles; BATCH = args.batch; D = TILES * L
     from tilefoundry.cli.source import checked_program, load_authored_ir
     from tilefoundry.evaluator import evaluate
@@ -82,7 +83,7 @@ def main():
             if gv != 0: tile_nonzero[t] = True
     checks["mismatch_zero"] = mism == 0
     checks["coverage_all_tiles_nonzero"] = all(tile_nonzero)
-    checks["coverage_full_no_overlap"] = all(c == L for c in tile_seen) and sum(tile_seen) == BATCH * D
+    checks["coverage_full_no_overlap"] = all(c == L * BATCH for c in tile_seen) and sum(tile_seen) == BATCH * D
     for name, ok in checks.items(): print(("ok   " if ok else "FAIL ") + name)
     print(f"mismatch={mism} max_abs={maxabs:.6g} atol={ATOL} rtol={RTOL}")
     if not all(checks.values()):
