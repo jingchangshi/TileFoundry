@@ -628,15 +628,12 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: t
             return
         case Evaluate():
             binders.uses((stmt.callable, stmt.args), stmt)
-            if modes and isinstance(
-                stmt.callable, (Launch, SymbolRef, PrimFunction, ModuleList)
-            ):
-                raise VerifyError(
-                    f"call inside ExecutionScope {modes[-1]!r}: reaching "
-                    f"{getattr(stmt.callable, 'name', type(stmt.callable).__name__)!r} "
-                    "from inside a mode needs callee verification that knows the mode, "
-                    "which this build does not have yet; inline the computation instead"
-                )
+            # Every operand is scanned under the modes in force, whichever route
+            # the callable itself takes. Doing this per-route meant a computed
+            # instruction target skipped the scan entirely.
+            for argument in stmt.args:
+                verify_expression_placement(argument, modes, where="ExecutionScope")
+            verify_evaluate_callable(stmt.callable, modes)
             if isinstance(stmt.callable, Launch):
                 _verify_launch(stmt, fn, module_context, ctx)
             elif isinstance(stmt.callable, SymbolRef):
@@ -646,8 +643,6 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: t
             else:
                 op = stmt.callable
                 verify_op_placement(op, modes, where="ExecutionScope")
-                for argument in stmt.args:
-                    verify_expression_placement(argument, modes, where="ExecutionScope")
                 ctx.mesh_scope = tuple(scope)
                 ctx.current_mesh = None
                 for mesh in scope:
@@ -750,6 +745,33 @@ def verify_op_placement(op, modes: tuple, *, where: str = "execution region") ->
             f"{name}: this operation belongs inside execution region "
             f"{requirement.kind!r} but runs inside {modes[-1]!r}"
         )
+
+
+def verify_evaluate_callable(callable_value, modes: tuple) -> None:
+    """Check the callable slot of one Evaluate under the modes in force.
+
+    A computed instance target is a ``Call`` here, and it reaches the retained
+    route -- the same route as a direct reference to a PrimFunction. Listing the
+    rejection set by the shapes an author might write rather than by the routes
+    the walker actually takes is what left ``Call`` out: the guard named four
+    types, the dispatch handled five, and an instruction selected at runtime
+    walked straight past the mode.
+
+    While no callee verification carries a mode stack, there is no honest answer
+    for any of these inside a mode, so all of them are refused rather than
+    admitted by the route they happen to arrive on.
+    """
+    if not modes:
+        return
+    if isinstance(callable_value, Call):
+        name = getattr(callable_value.target, "name", type(callable_value.target).__name__)
+    else:
+        name = getattr(callable_value, "name", type(callable_value).__name__)
+    raise VerifyError(
+        f"call to {name!r} inside ExecutionScope {modes[-1]!r}: a call inside an "
+        "execution region needs callee verification that knows the mode, which this "
+        "build does not have yet; inline the computation instead"
+    )
 
 
 def _verify_execution_scope(stmt, ctx, scope, modes: tuple) -> None:
@@ -998,7 +1020,11 @@ def _retained_callee(target, frame):
     inner = None if frame is None else frame._callee_context(Call(target, (), type=UnitType()))
     callee = inner.function if inner is not None else target
     if not isinstance(callee, PrimFunction):
-        raise VerifyError(f"TIR instance entry {callee.name!r} is not a PrimFunction")
+        # The label has to survive the failure it reports: a computed instance
+        # target resolves to whatever the projection returns, so reading `.name`
+        # off it unconditionally turned this diagnostic into an AttributeError.
+        label = getattr(callee, "name", None) or type(callee).__name__
+        raise VerifyError(f"TIR instance entry {label!r} is not a PrimFunction")
     return callee, inner
 
 
