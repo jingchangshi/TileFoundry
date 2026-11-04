@@ -70,6 +70,7 @@ from tilefoundry.ir.types import (
     TensorType,
     TupleType,
 )
+from tilefoundry.ir.types.dtype_view import DtypeViewError, DtypeViewSpec, validate_view
 from tilefoundry.ir.types.dim import (
     DimAdd,
     DimFloorDiv,
@@ -1204,7 +1205,58 @@ class LoweringContext(TypeInferContext):
                     result = self.builder.declare(source, ctx=self, values=values)
                     self.allocations[source] = result
             if desired.storage is StorageKind.GMEM and desired.dtype != result.type.dtype:
-                raise LoweringError("gmem cross-dtype reuse has no offset-view representation")
+                # A GMEM root read at another element size is an EXPLICIT aliasing view:
+                # element size, BYTE offset, extent, alignment and the aliased root are
+                # stated, and an unsound view is refused by name. It is never a silent copy
+                # and never a fabricated in-place conversion.
+                element_bytes = desired.dtype.bit_width // 8
+                root_element_bytes = result.type.dtype.bit_width // 8
+                root_dims = tuple(result.type.shape)
+                view_dims = tuple(desired.shape)
+                if not all(isinstance(dim, int) for dim in (*root_dims, *view_dims)):
+                    raise LoweringError(
+                        f"{_label(expr)}: gmem dtype view needs static extents, got root "
+                        f"{root_dims} and view {view_dims}"
+                    )
+                root_bytes = root_element_bytes * prod(root_dims)
+                spec = DtypeViewSpec(
+                    root=str(id(result.base) if isinstance(result, View) else id(result)),
+                    dtype=str(desired.dtype),
+                    element_bytes=element_bytes,
+                    byte_offset=0,
+                    extent=prod(view_dims),
+                    alignment=element_bytes,
+                    root_bytes=root_bytes,
+                    access="read",
+                )
+                try:
+                    validate_view(spec)
+                except DtypeViewError as error:
+                    raise LoweringError(
+                        f"{_label(expr)}: gmem dtype view refused ({error}); the same logical "
+                        "extent at a wider element size does not fit the root's bytes, so this "
+                        "needs a conversion into a new buffer, not an alias"
+                    ) from error
+                base = result.base if isinstance(result, View) else result
+                pointer_type = PointerType(desired.dtype, desired.storage)
+                pointer = self.builder.bind(
+                    Var(self.names.fresh("gmem_view_pointer"), type=pointer_type),
+                    Call(PtrOf(), (base,), type=pointer_type),
+                )
+                layout = (
+                    desired.layout.layout
+                    if isinstance(desired.layout, ShardLayout)
+                    else desired.layout
+                )
+                type_ = replace(desired, layout=layout)
+                result = self.builder.bind(
+                    Var(self.names.fresh("gmem_view"), type=type_),
+                    Call(
+                        TensorView(layout=layout, shape=tuple(type_.shape)),
+                        (pointer,),
+                        type=type_,
+                    ),
+                )
             if desired.storage is StorageKind.SMEM and desired.dtype != result.type.dtype:
                 root = self.storage.answers[leaf].chain[-1]
                 result = self.builder.declare(root, ctx=self, values=values, desired=desired)
