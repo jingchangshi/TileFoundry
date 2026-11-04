@@ -423,7 +423,8 @@ class Vdup(Op):
 
     mask = ParamDef(kind="input", effect=READ, pattern=_IN_PREG)
     dst = ParamDef(kind="input", effect=READ | WRITE, pattern=_IN_VREG)
-    value = ParamDef(kind="attribute", annotation=float)
+    scalar = ParamDef(kind="input", effect=READ, optional=True, default=None)
+    value = ParamDef(kind="attribute", annotation=float, optional=True, default=None)
 
 
 @register_op(dialect="T", category="ascend", name="ascend_vadds")
@@ -437,7 +438,8 @@ class Vadds(Op):
     a = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
     mask = ParamDef(kind="input", effect=READ, pattern=_IN_PREG)
     dst = ParamDef(kind="input", effect=READ | WRITE, pattern=_IN_VREG)
-    value = ParamDef(kind="attribute", annotation=float)
+    scalar = ParamDef(kind="input", effect=READ, optional=True, default=None)
+    value = ParamDef(kind="attribute", annotation=float, optional=True, default=None)
 
     between = (
         SameConstraint("shape", "a", "dst"),
@@ -456,7 +458,8 @@ class Vmuls(Op):
     a = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
     mask = ParamDef(kind="input", effect=READ, pattern=_IN_PREG)
     dst = ParamDef(kind="input", effect=READ | WRITE, pattern=_IN_VREG)
-    value = ParamDef(kind="attribute", annotation=float)
+    scalar = ParamDef(kind="input", effect=READ, optional=True, default=None)
+    value = ParamDef(kind="attribute", annotation=float, optional=True, default=None)
 
     between = (
         SameConstraint("shape", "a", "dst"),
@@ -739,37 +742,53 @@ def _verify_vmula(call, ctx):
         ctx.error(call, "Vmula: a, b and acc must have one shape and dtype")
 
 
+def _check_lane_scalar(call, ctx, index, label):
+    """Either a real scalar attribute, or exactly one 0-d f32 RUNTIME operand (never a folded const).
+
+    The runtime form exists so a kernel ABI scalar (v33: eps: T.float32) is not baked into a
+    magic constant; a constant-folded literal is refused by name.
+    """
+    if len(call.args) > index:
+        sc = ctx.type_of(call.args[index])
+        if tuple(sc.shape) != () or sc.dtype != DType.f32:
+            ctx.error(call, f"{label}: the runtime scalar operand must be a 0-d f32, got shape {tuple(sc.shape)} dtype {sc.dtype.name}")
+        if getattr(call.args[index], "is_const", True):
+            ctx.error(call, f"{label}: the scalar operand must be a 0-d RUNTIME value, not a constant-folded literal")
+        if isinstance(getattr(call.target, "value", None), (int, float)):
+            ctx.error(call, f"{label}: give EITHER the value attribute OR the runtime scalar operand, not both")
+        return
+    if isinstance(call.target.value, bool) or not isinstance(call.target.value, (int, float)):
+        ctx.error(call, f"{label}: value must be a real scalar, got {call.target.value!r}")
+
+
 @register_verify_stmt(Vdup)
 def _verify_vdup(call, ctx):
-    mask, dst = (ctx.type_of(arg) for arg in call.args)
+    mask, dst = (ctx.type_of(arg) for arg in call.args[:2])
     if mask.dtype != DType.bool:
         ctx.error(call, f"Vdup: mask must be a predicate (bool), got {mask.dtype.name}")
     if tuple(mask.shape) != tuple(dst.shape):
         ctx.error(call, f"Vdup: mask covers {tuple(mask.shape)} lanes but dst has {tuple(dst.shape)}")
-    if isinstance(call.target.value, bool) or not isinstance(call.target.value, (int, float)):
-        ctx.error(call, f"Vdup: value must be a real scalar, got {call.target.value!r}")
+    _check_lane_scalar(call, ctx, 2, "Vdup")
 
 
 @register_verify_stmt(Vadds)
 def _verify_vadds(call, ctx):
-    a, mask, dst = (ctx.type_of(arg) for arg in call.args)
+    a, mask, dst = (ctx.type_of(arg) for arg in call.args[:3])
     if mask.dtype != DType.bool or tuple(mask.shape) != tuple(a.shape):
         ctx.error(call, "Vadds: the mask must be a bool predicate covering the data lanes")
     if dst.shape != a.shape or dst.dtype != a.dtype:
         ctx.error(call, "Vadds: dst must match a")
-    if isinstance(call.target.value, bool) or not isinstance(call.target.value, (int, float)):
-        ctx.error(call, f"Vadds: value must be a real scalar, got {call.target.value!r}")
+    _check_lane_scalar(call, ctx, 3, "Vadds")
 
 
 @register_verify_stmt(Vmuls)
 def _verify_vmuls(call, ctx):
-    a, mask, dst = (ctx.type_of(arg) for arg in call.args)
+    a, mask, dst = (ctx.type_of(arg) for arg in call.args[:3])
     if mask.dtype != DType.bool or tuple(mask.shape) != tuple(a.shape):
         ctx.error(call, "Vmuls: the mask must be a bool predicate covering the data lanes")
     if dst.shape != a.shape or dst.dtype != a.dtype:
         ctx.error(call, "Vmuls: dst must match a")
-    if isinstance(call.target.value, bool) or not isinstance(call.target.value, (int, float)):
-        ctx.error(call, f"Vmuls: value must be a real scalar, got {call.target.value!r}")
+    _check_lane_scalar(call, ctx, 3, "Vmuls")
 
 
 def _check_binary_mask(call, ctx, a, b, mask, dst, label):
@@ -898,26 +917,34 @@ def _eval_vmula(ctx):
     return TensorValue(data=torch.where(active, acc + a * b, acc), type=ctx.result_type)
 
 
+def _lane_scalar(ctx, index: int) -> float:
+    """The lane scalar: a 0-d f32 RUNTIME operand when present, else the instruction attribute."""
+    if len(ctx.args) > index:
+        return float(ctx.args[index].data.reshape(()).item())
+    return float(ctx.op.value)
+
+
 @register_schedule_eval(Vdup)
 def _eval_vdup(ctx):
-    mask, dst = (value.data for value in ctx.args)
+    mask, dst = (value.data for value in ctx.args[:2])
     active = mask.to(torch.bool)
-    filled = torch.full_like(dst, float(ctx.op.value))
+    filled = torch.full_like(dst, _lane_scalar(ctx, 2))
     return TensorValue(data=torch.where(active, filled, dst), type=ctx.result_type)
 
 
 @register_schedule_eval(Vadds)
 def _eval_vadds(ctx):
-    a, mask, dst = (value.data for value in ctx.args)
+    a, mask, dst = (value.data for value in ctx.args[:3])
     active = mask.to(torch.bool)
-    return TensorValue(data=torch.where(active, a + float(ctx.op.value), dst), type=ctx.result_type)
+    return TensorValue(data=torch.where(active, a + _lane_scalar(ctx, 3), dst), type=ctx.result_type)
 
 
 @register_schedule_eval(Vmuls)
 def _eval_vmuls(ctx):
-    a, mask, dst = (value.data for value in ctx.args)
+    a, mask, dst = (value.data for value in ctx.args[:3])
     active = mask.to(torch.bool)
-    return TensorValue(data=torch.where(active, a * float(ctx.op.value), dst), type=ctx.result_type)
+    return TensorValue(data=torch.where(active, a * _lane_scalar(ctx, 3), dst), type=ctx.result_type)
+
 
 
 @register_schedule_eval(Vmul)
