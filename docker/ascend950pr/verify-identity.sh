@@ -50,7 +50,7 @@ if [ -r "$ENV_FILE" ]; then
             die "$ENV_FILE:$lineno: duplicate key: $key"
         fi
         case "$key" in
-            CONTAINER_USER|CONTAINER_UID|CONTAINER_GID|CONTAINER_HOME|SUPPLEMENTARY_GIDS|CONTAINER_NAME|IMAGE|HOST_REPO|HOST_VENV|HOST_CANN|TF_REQUIRE_EXCLUSIVE) ;;
+            CONTAINER_USER|CONTAINER_UID|CONTAINER_GID|CONTAINER_HOME|SUPPLEMENTARY_GIDS|CONTAINER_NAME|IMAGE|HOST_REPO|HOST_CANN|HOST_VENV|NPU_PYTHON|NPU_ENV_DIR|MOUNT_NPU_ENV|TF_REQUIRE_EXCLUSIVE) ;;
             *) die "$ENV_FILE:$lineno: unknown key: $key" ;;
         esac
         CONFIG[$key]="$value"
@@ -67,12 +67,35 @@ if [ -r "$ENV_FILE" ] && [ "$(stat -c '%a' "$ENV_FILE" 2>/dev/null)" != "600" ];
     log "note: $ENV_FILE is mode $(stat -c '%a' "$ENV_FILE" 2>/dev/null), expected 600"
 fi
 
-CONTAINER_NAME="${CONTAINER_NAME:-${CONFIG[CONTAINER_NAME]:-}}"
-CONTAINER_USER="${CONTAINER_USER:-${CONFIG[CONTAINER_USER]:-}}"
-EXPECT_UID="${CONTAINER_UID:-${CONFIG[CONTAINER_UID]:-}}"
-EXPECT_GID="${CONTAINER_GID:-${CONFIG[CONTAINER_GID]:-}}"
-EXPECT_HOME="${CONTAINER_HOME:-${CONFIG[CONTAINER_HOME]:-}}"
-SUPP_GIDS="${SUPPLEMENTARY_GIDS:-${CONFIG[SUPPLEMENTARY_GIDS]:-}}"
+# The configuration file is the sole source of these values. An export of the
+# same name is a contradiction, not an override: honouring it would mean the
+# identity verified need not be the one written down, which defeats the purpose.
+conflict=()
+check_conflict() {
+    local key="$1" exported="$2" recorded="${3:-}"
+    if [ -n "$exported" ] && [ "$exported" != "$recorded" ]; then
+        conflict+=("$key: exported as '$exported', but the file says '${recorded:-<absent>}'")
+    fi
+}
+check_conflict CONTAINER_USER "${CONTAINER_USER:-}" "${CONFIG[CONTAINER_USER]:-}"
+check_conflict CONTAINER_UID "${CONTAINER_UID:-}" "${CONFIG[CONTAINER_UID]:-}"
+check_conflict CONTAINER_GID "${CONTAINER_GID:-}" "${CONFIG[CONTAINER_GID]:-}"
+check_conflict CONTAINER_HOME "${CONTAINER_HOME:-}" "${CONFIG[CONTAINER_HOME]:-}"
+check_conflict CONTAINER_NAME "${CONTAINER_NAME:-}" "${CONFIG[CONTAINER_NAME]:-}"
+check_conflict SUPPLEMENTARY_GIDS "${SUPPLEMENTARY_GIDS:-}" "${CONFIG[SUPPLEMENTARY_GIDS]:-}"
+if [ "${#conflict[@]}" -gt 0 ]; then
+    log 'refusing: the environment contradicts the configuration file'
+    for item in "${conflict[@]}"; do log "  $item"; done
+    log '  The file is authoritative. Unset the export, or change the file.'
+    exit 2
+fi
+
+CONTAINER_NAME="${CONFIG[CONTAINER_NAME]:-}"
+CONTAINER_USER="${CONFIG[CONTAINER_USER]:-}"
+EXPECT_UID="${CONFIG[CONTAINER_UID]:-}"
+EXPECT_GID="${CONFIG[CONTAINER_GID]:-}"
+EXPECT_HOME="${CONFIG[CONTAINER_HOME]:-}"
+SUPP_GIDS="${CONFIG[SUPPLEMENTARY_GIDS]:-}"
 
 # --- required values -------------------------------------------------------
 # A missing identity value is refused rather than defaulted. Defaulting to the
@@ -93,13 +116,21 @@ if ! docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
 fi
 
 # --- the container is asked, not assumed ----------------------------------
+#
+# HOME is READ, never injected. The previous version passed -e HOME=$EXPECT_HOME
+# and then asked the container what HOME was, so a wrong expected HOME passed by
+# construction: it compared the value it had just supplied against itself.
 # Each answer is captured with its own exit status. A docker exec that fails
 # returns empty, and empty must not be compared to empty and called a match.
-x() { docker exec -u "$CONTAINER_USER" -e "HOME=$EXPECT_HOME" "$CONTAINER_NAME" "$@" 2>/dev/null; }
+x() { docker exec -u "$CONTAINER_USER" "$CONTAINER_NAME" "$@" 2>/dev/null; }
 
 actual_uid="$(x id -u)"; uid_rc=$?
 actual_gid="$(x id -g)"; gid_rc=$?
-actual_home="$(x printenv HOME)"; home_rc=$?
+# docker exec -u supplies a HOME of its own, so asking printenv HOME directly
+# would report the value docker chose, not the account's. The passwd entry is the
+# container's own record of where the account lives, and nothing we pass to the
+# exec can change it.
+actual_home="$(x getent passwd "$CONTAINER_USER" | cut -d: -f6)"; home_rc=$?
 
 fail=0
 if [ "$uid_rc" -ne 0 ]; then

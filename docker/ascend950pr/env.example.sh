@@ -33,8 +33,30 @@ IMAGE=tilefoundry-ascend950pr-dev:24.04
 
 # --- paths ----------------------------------------------------------------
 HOST_REPO=/home/s00653124/workspace/TileFoundry
-HOST_VENV=/home/s00653124/workspace/tfpy312
 HOST_CANN=/data/pri/cann-9.2.0
+
+# --- TWO interpreters, and they are not interchangeable --------------------
+#
+# HOST_VENV is the CPU environment. It has NO torch_npu and must not get one:
+# TileFoundry analyze / finalize / equality are CPU work, and adding a device
+# runtime to the interpreter that produces compiler evidence would change what
+# that evidence was produced on. Verified: `import torch_npu` raises
+# ModuleNotFoundError in tfpy312.
+#
+# NPU_PYTHON is the Runtime Twin interpreter. It is the only one that can run
+# device work, and it is owned by another group -- mount it READ-ONLY. Nothing
+# here writes to it, and nothing here installs into it.
+#
+# Requiring CANN to be sourced first is not incidental: without it torch_npu
+# fails to import with "libhccl.so: cannot open shared object file", which reads
+# like a broken environment rather than an unexported one. Verified both ways.
+HOST_VENV=/home/s00653124/workspace/tfpy312
+NPU_PYTHON=/data/miniconda3/envs/l00849257/bin/python
+NPU_ENV_DIR=/data/miniconda3/envs/l00849257
+
+# Whether NPU_PYTHON is mounted into the container. Device cases need it; CPU
+# cases do not, and leaving it out is the smaller surface.
+MOUNT_NPU_ENV=0
 
 # --- device ---------------------------------------------------------------
 # Deliberately NOT configured here: a device id authorizes ONE run and is

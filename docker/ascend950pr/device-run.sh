@@ -142,28 +142,152 @@ if [ "$MODE" = npu ]; then
         exit 2
     fi
     sel="$HERE/device-select.sh"
-    if [ -x "$sel" ]; then
-        sel_args=(--device "$TF_DEVICE_ID")
-        [ "${TF_REQUIRE_EXCLUSIVE:-0}" = 1 ] && sel_args+=(--exclusive)
-        if "$sel" "${sel_args[@]}" > "$RUNDIR/device-select.txt" 2>&1; then
-            log 'device selection ok; see device-select.txt'
-        else
-            sel_rc=$?
-            log "device selection refused (exit $sel_rc); see device-select.txt"
-            if [ "$sel_rc" -eq 75 ]; then
-                log 'BLOCKED_ENV: the device run did not happen.'
-            fi
-            cat "$RUNDIR/device-select.txt" >&2 || true
-            trap - EXIT
-            flock -u 9
-            exit "$sel_rc"
-        fi
-    else
+    if [ ! -x "$sel" ]; then
         log 'device-select.sh missing; refusing to run device work unselected'
         trap - EXIT
         flock -u 9
         exit 2
     fi
+    sel_args=(--device "$TF_DEVICE_ID")
+    [ "${TF_REQUIRE_EXCLUSIVE:-0}" = 1 ] && sel_args+=(--exclusive)
+    if "$sel" "${sel_args[@]}" > "$RUNDIR/device-select.txt" 2>&1; then
+        log 'device selection ok; see device-select.txt'
+    else
+        sel_rc=$?
+        log "device selection refused (exit $sel_rc); see device-select.txt"
+        if [ "$sel_rc" -eq 75 ]; then
+            log 'BLOCKED_ENV: the device run did not happen.'
+        fi
+        cat "$RUNDIR/device-select.txt" >&2 || true
+        trap - EXIT
+        flock -u 9
+        exit "$sel_rc"
+    fi
+
+    # The selection must be RESOLVED HERE, in the caller, and then carried into
+    # the payload explicitly.
+    #
+    # device-select.sh exports ASCEND_RT_VISIBLE_DEVICES into its OWN shell, and
+    # that shell exits. Running it as a child therefore selected a device for a
+    # process that then ended: the payload started with the variable UNSET and
+    # inherited whatever the container was fixed at. A request for device 1 on a
+    # container bound to device 0 silently ran on device 0 -- the substitution
+    # this whole module exists to refuse.
+    SELECTED_DEVICE="$(sed -n 's/^device_id=//p' "$RUNDIR/device-select.txt" | head -1)"
+    if [ "${SELECTED_DEVICE:-}" != "$TF_DEVICE_ID" ]; then
+        log "selection did not report the requested device:"
+        log "  requested: $TF_DEVICE_ID"
+        log "  selection reported: ${SELECTED_DEVICE:-<nothing>}"
+        trap - EXIT
+        flock -u 9
+        exit 2
+    fi
+    log "device selection resolved in this shell: $SELECTED_DEVICE"
+
+    # Export it so the payload inherits it, and record it as part of the run.
+    export ASCEND_RT_VISIBLE_DEVICES="$SELECTED_DEVICE"
+    printf 'selected_device: %s\n' "$SELECTED_DEVICE" >> "$RUNDIR/attribution.txt"
+
+    # A docker exec is a separate process tree, so the export above reaches it
+    # only if it is named on the command line. The flag is injected into the
+    # caller's argv rather than left to the caller to remember.
+    # A docker exec is a separate process tree: the export above reaches it only
+    # if the variable is named on the docker command line. Rather than ask the
+    # caller to remember `-e`, the flag is injected here, into the argv that will
+    # actually run.
+    if [ "$1" = docker ]; then
+        shift
+        # The word "docker" is restored below; dropping it would leave "exec" as
+        # the command and the whole payload would fail to launch.
+        # Find the subcommand (exec) and insert the -e after it, before the
+        # container name, which is where docker expects options.
+        new_args=(docker)
+        injected=0
+        while [ "$#" -gt 0 ]; do
+            new_args+=("$1")
+            if [ "$1" = exec ] && [ "$injected" = 0 ]; then
+                new_args+=(-e "ASCEND_RT_VISIBLE_DEVICES=$SELECTED_DEVICE")
+                injected=1
+            fi
+            shift
+        done
+        if [ "$injected" = 0 ]; then
+            log 'refusing: could not find `exec` in the docker command to carry the selection'
+            trap - EXIT
+            flock -u 9
+            exit 2
+        fi
+        set -- "${new_args[@]}"
+        # Remember which container the payload targets, so reachability can be
+        # checked against it rather than against the host. Parsed by walking the
+        # argv: after `exec`, `-e` consumes the NEXT word, so the word after -e is
+        # a value and not the container. Treating it as the container name is how
+        # a presence check silently inspects the wrong thing.
+        SEL_CONTAINER=""
+        skip_next=0
+        saw_exec=0
+        for a in "${new_args[@]}"; do
+            if [ "$skip_next" = 1 ]; then skip_next=0; continue; fi
+            if [ "$a" = "-e" ] || [ "$a" = "-u" ] || [ "$a" = "--env" ]; then
+                skip_next=1
+                continue
+            fi
+            if [ "$a" = "exec" ]; then saw_exec=1; continue; fi
+            case "$a" in
+                -*|*=*) continue ;;
+                docker) continue ;;
+            esac
+            if [ "$saw_exec" = 1 ]; then SEL_CONTAINER="$a"; break; fi
+        done
+        if [ -n "${SEL_CONTAINER:-}" ]; then SEL_IN_CONTAINER=1; fi
+        log "payload will run with ASCEND_RT_VISIBLE_DEVICES=$SELECTED_DEVICE"
+    fi
+fi
+
+# SCOPE: this check needs to know which container the payload targets, so it runs
+# only when the payload is a `docker exec`. A payload that runs directly on the
+# host is not confined by a container's device binds, so container reachability
+# is not the relevant question for it -- the host presence check already done
+# applies there. Stated explicitly because "not checked" must not be mistaken for
+# "checked and passed".
+# A device id that exists on the HOST but is not bound into the container would
+# let the payload run against whatever the container does have -- the exact
+# substitution this module refuses. Presence is therefore checked where the
+# payload will actually run, not only on the host.
+if [ "$MODE" = npu ] && [ "${SEL_IN_CONTAINER:-0}" = 1 ]; then
+    if ! docker exec "$SEL_CONTAINER" test -e "/dev/davinci$SELECTED_DEVICE" 2>/dev/null; then
+        log "BLOCKED: device $SELECTED_DEVICE is not bound into $SEL_CONTAINER."
+        log "  the container exposes: $(docker exec "$SEL_CONTAINER" sh -c 'ls /dev/davinci* 2>/dev/null' 2>/dev/null | tr '\n' ' ')"
+        log '  Refusing to run: the payload would execute against a different'
+        log '  device than the one requested, which is not evidence about the'
+        log '  device that was named.'
+        trap - EXIT
+        flock -u 9
+        exit 2
+    fi
+    log "device $SELECTED_DEVICE is bound into $SEL_CONTAINER"
+fi
+
+# In-payload assertion. Whatever the payload is, it must see exactly the device
+# that was requested -- checked from inside this script, where the environment
+# the payload inherits is the one visible here.
+if [ "$MODE" = npu ]; then
+    if [ "${ASCEND_RT_VISIBLE_DEVICES:-}" != "${SELECTED_DEVICE:-}" ]; then
+        log 'refusing to run: the payload would not see the selected device.'
+        log "  selected: ${SELECTED_DEVICE:-<none>}"
+        log "  ASCEND_RT_VISIBLE_DEVICES here: ${ASCEND_RT_VISIBLE_DEVICES:-<unset>}"
+        trap - EXIT
+        flock -u 9
+        exit 2
+    fi
+    visible_count="$(printf '%s' "$ASCEND_RT_VISIBLE_DEVICES" | tr ',' '\n' | grep -c .)"
+    if [ "$visible_count" -ne 1 ]; then
+        log "refusing to run: expected exactly one visible device, got $visible_count"
+        trap - EXIT
+        flock -u 9
+        exit 2
+    fi
+    log "payload assertion: exactly one device visible ($ASCEND_RT_VISIBLE_DEVICES)"
 fi
 
 npu-smi info > "$RUNDIR/npu-smi.before.txt" 2>&1

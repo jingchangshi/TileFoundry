@@ -88,9 +88,14 @@ require(isinstance(peak, int) and not isinstance(peak, bool) and peak > 0,
 artifacts = report.get("artifacts") or {}
 npubin = artifacts.get("npubin")
 objects = artifacts.get("object")
-require(isinstance(npubin, int), "artifacts.npubin missing")
-require(isinstance(npubin, int) and npubin > 0,
-        "no .npubin produced: the compiler emitted no kernel image")
+# Specifically an INTEGER >= 1. Python's bool is a subclass of int, so
+# isinstance(True, int) is True and `true` would satisfy a naive check -- a
+# receipt claiming npubin: true would pass while reporting no count at all.
+require(isinstance(npubin, int) and not isinstance(npubin, bool),
+        "artifacts.npubin must be an integer count, got %r" % (npubin,))
+require(isinstance(npubin, int) and not isinstance(npubin, bool) and npubin >= 1,
+        "artifacts.npubin is %r: no .npubin produced, the compiler emitted no kernel image"
+        % (npubin,))
 
 # 5. Synchronization succeeded; when it did not, the ORIGINAL error text is
 #    carried rather than replaced by a summary of it.
@@ -104,12 +109,14 @@ if sync_ok is not True:
 
 # 6. Exactly one device visible to the process. A filter that silently expanded
 #    to every card would make a run on the wrong board look correct.
+# An INTEGER COUNT equal to 1, not any single non-empty string. "banana" is one
+# non-empty string and would satisfy a split-on-comma test; so would "0". The
+# count is what the field must carry, and it must be exactly 1.
 visible = report.get("visibleDevices")
-require(isinstance(visible, str), "visibleDevices missing")
-if isinstance(visible, str):
-    ids = [part for part in visible.split(",") if part.strip()]
-    require(len(ids) == 1,
-            "expected exactly one visible device, receipt records %r" % (visible,))
+require(isinstance(visible, int) and not isinstance(visible, bool),
+        "visibleDevices must be an integer count of visible devices, got %r" % (visible,))
+require(isinstance(visible, int) and not isinstance(visible, bool) and visible == 1,
+        "visibleDevices is %r: expected exactly 1 visible device" % (visible,))
 
 print("receipt: %s" % path)
 print("fields checked: %d, failures: %d" % (checked, len(failures)))
