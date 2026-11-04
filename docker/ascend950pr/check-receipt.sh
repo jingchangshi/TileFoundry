@@ -119,18 +119,21 @@ require(isinstance(visible, int) and not isinstance(visible, bool) and visible =
         "visibleDevices is %r: expected exactly 1 visible device" % (visible,))
 
 print("receipt: %s" % path)
-print("fields checked: %d, failures: %d" % (checked, len(failures)))
+print("fields checked: %d, schema failures: %d" % (checked, len(failures)))
 print("deviceMoves=%r npuPeakMemoryBytes=%r npubin=%r objects=%r synchronizeOk=%r"
       % (moves, peak, npubin, objects, sync_ok))
 
 if failures:
-    print("RESULT: FAIL")
+    print("RESULT: SCHEMA-FAIL")
     for item in failures:
         print("  - %s" % item)
     sys.exit(1)
 
-print("RESULT: PASS")
-print("NOTE: a PASS here means a compiled kernel ran on one device. It is not a")
-print("      claim about timing, which is shared-tenant and provisional.")
+print("RESULT: SCHEMA-OK")
+print("NOTE: this is SCHEMA validation only. It records that the receipt has the")
+print("      required fields, of the right types, and not trivially satisfied.")
+print("      It does NOT attest that a kernel ran, that a device was used, or that")
+print("      the numbers are correct: the receipt is written by the same process it")
+print("      describes. A schema check cannot detect a deliberate one.")
 sys.exit(0)
 PY
