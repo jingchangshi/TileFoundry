@@ -54,7 +54,10 @@ def verify_build(tl_root: Path) -> dict:
     v = (tl_root / "VERSION").read_text().strip()
     h = (tl_root / "src/tl_templates/ascend/simd_inst.h")
     s = (tl_root / "tilelang/ascend/language/simd.py")
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tl_root,
+    # root in the container cannot read a user-owned repo without safe.directory; that is
+    # an ownership guard, not a source difference.
+    head = subprocess.run(["git", "-c", "safe.directory=" + str(tl_root),
+                          "-C", str(tl_root), "rev-parse", "HEAD"],
                           capture_output=True, text=True, timeout=30).stdout.strip()
     got = {"tilelang_version": v, "tilelang_git_head": head,
            "simd_inst_h_sha256": sha256_file(h), "simd_py_sha256": sha256_file(s)}
