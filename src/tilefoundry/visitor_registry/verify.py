@@ -47,7 +47,7 @@ from tilefoundry.ir.tir.stmts import (
     While,
 )
 from tilefoundry.ir.tir.symbol_ref import SymbolRef
-from tilefoundry.ir.types import DType, TensorType, UnitType
+from tilefoundry.ir.types import DType, StorageKind, TensorType, UnitType
 from tilefoundry.ir.types.callable_type import callable_type_for_prim_function
 from tilefoundry.ir.types.dim import (
     DimAdd,
@@ -880,7 +880,13 @@ def verify_operand_lanes(stmt, modes: tuple) -> None:
         if dtype_name == "bool":
             # the predicate: owned by the instruction that consumes it
             continue
-        allowed = tuple(getattr(dtype, "name", None) for dtype in declared.element_dtypes)
+        if storage is StorageKind.CARRIER:
+            # The carrier register class is BF16 TRANSPORT/CONVERSION, not a compute
+            # register. It is exempt from the compute-dtype rule exactly as the predicate
+            # is, and stays fully checked for lane extent below. This ADDS a capability; it
+            # does not disable the check for compute registers.
+            pass
+        allowed = tuple(getattr(dtype, "name", None) for dtype in declared.element_dtypes) if storage is not StorageKind.CARRIER else ()
         if allowed and dtype_name not in allowed:
             raise VerifyError(
                 f"{name}: operand of type {dtype_name} in "
@@ -933,12 +939,10 @@ def verify_operand_dtypes(op, declared, name: str) -> None:
             # check. The extent rule above already exempts it for the same reason;
             # the two must agree or the chain is unverifiable.
             continue
-        transport = tuple(
-            getattr(dtype, "name", None) for dtype in getattr(type(op), "transport_dtypes", ())
-        )
-        if transport and any(name_ in transport for name_ in names):
-            # Narrow transport/conversion capability declared per instruction: vld/vcvt/
-            # vsts carry bf16 carriers. Arithmetic instructions declare none and stay f32.
+        if getattr(pattern, "storage", None) is StorageKind.CARRIER:
+            # Same capability split at the pattern level: a carrier operand is transport/
+            # conversion, not a compute element. Every other operand is still checked, so
+            # bf16 in an element register stays refused.
             continue
         if any(name_ not in allowed for name_ in names):
             raise VerifyError(
