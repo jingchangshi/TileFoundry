@@ -14,7 +14,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -108,6 +111,9 @@ def run_probe(probe_name: str, kind: str, default_case: str, build_kernel,
     ap.add_argument("--execute", action="store_true",
                     help="REQUIRED to touch the device; --plan is CPU-only")
     ap.add_argument("--timeout", type=int, default=180)
+    ap.add_argument("--launch-watchdog", type=int, default=60,
+                    help="host-side watchdog seconds around launch+synchronize; on expiry "
+                         "record the phase and os._exit(124) WITHOUT killing the device or resetting")
     ap.add_argument("--tilelang-root", default=str(DEFAULT_TL))
     args = ap.parse_args()
     case = load_case(args.case)
@@ -137,18 +143,59 @@ def run_probe(probe_name: str, kind: str, default_case: str, build_kernel,
         print("REFUSED: --six-calls needs a six-call kernel builder", file=sys.stderr)
         return 2
     kernel = (build_kernel_six(T) if args.six_calls else build_kernel(T))
+    outdir = Path(args.out)
+    outdir.mkdir(parents=True, exist_ok=True)
+    phases = {}
+    t_start = time.monotonic()
+
+    def mark(name):
+        phases[name] = {"wall": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "elapsed_s": round(time.monotonic() - t_start, 3)}
+        (outdir / "phases.json").write_text(json.dumps(phases, indent=2))
+
+    def watchdog_fire():
+        mark("launch_watchdog_fired")
+        (outdir / "WATCHDOG_FIRED.txt").write_text(
+            "launch watchdog fired after %ss; last phase=%s; host exited 124; device NOT "
+            "reset/killed\n" % (args.launch_watchdog, sorted(phases)[-2] if len(phases) > 1 else "?"))
+        # write a minimal device_window marker before the hard host exit
+        (outdir / "device_window_watchdog.json").write_text(json.dumps(
+            {"probe": probe_name, "case": args.case, "phases": phases,
+             "watchdog_s": args.launch_watchdog, "status": "WATCHDOG_FIRED"}, indent=2))
+        sys.stdout.flush(); sys.stderr.flush()
+        os._exit(124)
+
     with DeviceWindow(args.out, args.timeout) as window:
         window.report.update({"build": build, "probe": probe_name, "case": args.case,
-                              "tilelang": getattr(tilelang, "__version__", None)})
+                              "tilelang": getattr(tilelang, "__version__", None),
+                              "launch_watchdog_s": args.launch_watchdog})
+        mark("start")
+        mark("compile_start")
         compiled = tilelang.compile(kernel, target="ascend", out_idx=[3])
+        mark("compile_done")
         src = compiled.get_kernel_source()
-        (Path(args.out) / "kernel_source.txt").write_text(src)
+        (outdir / "kernel_source.txt").write_text(src)
         window.report["kernel_source_sha256"] = hashlib.sha256(src.encode()).hexdigest()
+        try:
+            window.report["compiled_repr"] = repr(compiled)[:300]
+        except Exception:  # noqa: BLE001
+            window.report["compiled_repr"] = None
         t0, t1, t2 = make_tensors(torch, case, kind, "npu:0")
-        with torch.no_grad():
-            y = compiled(t0, t1, t2)
+        mark("tensors_ready")
+        wd = threading.Timer(args.launch_watchdog, watchdog_fire)
+        wd.daemon = True
+        wd.start()
+        try:
+            mark("launch_start")
+            with torch.no_grad():
+                y = compiled(t0, t1, t2)
+            mark("launch_returned")
             torch.npu.synchronize()
-        obs = observed_bits(torch, y)
+            mark("sync_done")
+            obs = observed_bits(torch, y)
+            mark("readback_done")
+        finally:
+            wd.cancel()
         verdict = compare(case, obs)
         result = {"case": args.case, "probe": probe_name, "build": build,
                   "status": "UNSOURCED / UNVALIDATED until architect 03-20 ruling",
@@ -157,8 +204,11 @@ def run_probe(probe_name: str, kind: str, default_case: str, build_kernel,
                                 or case.get("src0_bits"),
                   "dst_prefill_bits": case.get("dst_prefill_bits", ZEROS),
                   "observed_bits": obs, "comparison": verdict}
-        (Path(args.out) / "observed_bits.json").write_text(json.dumps(result, indent=2))
+        (outdir / "observed_bits.json").write_text(json.dumps(result, indent=2))
+        mark("json_written")
+        window.report["phases"] = phases
         window.report["observation_captured"] = True
         print(json.dumps({"case": args.case, "observed_bits_lane0": obs[0],
-                          "model_matches": verdict["model_matches"]}, indent=2))
+                          "model_matches": verdict["model_matches"],
+                          "phases": phases}, indent=2))
     return 0
