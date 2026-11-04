@@ -199,11 +199,53 @@ if [ "$MODE" = npu ]; then
         shift
         # The word "docker" is restored below; dropping it would leave "exec" as
         # the command and the whole payload would fail to launch.
-        # Find the subcommand (exec) and insert the -e after it, before the
-        # container name, which is where docker expects options.
+        #
+        # A `-e ASCEND_RT_VISIBLE_DEVICES=...` already present in the caller's
+        # argv is REMOVED first. Docker lets a later -e win, so merely appending
+        # ours would leave the caller able to override the selection by adding
+        # their own later. Removing every copy and inserting exactly one makes
+        # the value unambiguous rather than order-dependent.
         new_args=(docker)
         injected=0
+        dropped=0
+        skip_next=0
         while [ "$#" -gt 0 ]; do
+            if [ "$skip_next" = 1 ]; then
+                skip_next=0; shift; continue
+            fi
+            if [ "$1" = "-e" ] || [ "$1" = "--env" ]; then
+                case "${2:-}" in
+                    ASCEND_RT_VISIBLE_DEVICES=*)
+                        # A caller-supplied filter is REFUSED, not silently
+                        # replaced. Docker applies the LAST -e for a variable, so
+                        # appending ours after theirs would let them win; dropping
+                        # theirs would mean running a device the caller explicitly
+                        # named and being told nothing about it. Both are worse
+                        # than stopping, so the conflict is named and the run does
+                        # not start.
+                        supplied="${2#ASCEND_RT_VISIBLE_DEVICES=}"
+                        if [ "$supplied" != "$SELECTED_DEVICE" ]; then
+                            log "refusing: the caller supplies a device filter that contradicts the selection"
+                            log "  selection (TF_DEVICE_ID/--device): $SELECTED_DEVICE"
+                            log "  caller $1 $2"
+                            log "  These name different devices. One of them is wrong, and"
+                            log "  guessing which would produce evidence about a device"
+                            log "  nobody agreed on."
+                            trap - EXIT
+                            flock -u 9
+                            exit 2
+                        fi
+                        log "caller supplies a matching filter ($1 $2); keeping a single copy"
+                        dropped=$((dropped + 1))
+                        shift 2
+                        continue
+                        ;;
+                esac
+                new_args+=("$1" "${2:-}")
+                skip_next=1
+                shift
+                continue
+            fi
             new_args+=("$1")
             if [ "$1" = exec ] && [ "$injected" = 0 ]; then
                 new_args+=(-e "ASCEND_RT_VISIBLE_DEVICES=$SELECTED_DEVICE")
@@ -217,12 +259,9 @@ if [ "$MODE" = npu ]; then
             flock -u 9
             exit 2
         fi
+        [ "$dropped" -gt 0 ] && log "deduplicated $dropped caller-supplied ASCEND_RT_VISIBLE_DEVICES setting(s)"
         set -- "${new_args[@]}"
-        # Remember which container the payload targets, so reachability can be
-        # checked against it rather than against the host. Parsed by walking the
-        # argv: after `exec`, `-e` consumes the NEXT word, so the word after -e is
-        # a value and not the container. Treating it as the container name is how
-        # a presence check silently inspects the wrong thing.
+        # Find the container name: the first non-option word after `exec`.
         SEL_CONTAINER=""
         skip_next=0
         saw_exec=0
@@ -234,13 +273,36 @@ if [ "$MODE" = npu ]; then
             fi
             if [ "$a" = "exec" ]; then saw_exec=1; continue; fi
             case "$a" in
-                -*|*=*) continue ;;
-                docker) continue ;;
+                -*|*=*|docker) continue ;;
             esac
             if [ "$saw_exec" = 1 ]; then SEL_CONTAINER="$a"; break; fi
         done
         if [ -n "${SEL_CONTAINER:-}" ]; then SEL_IN_CONTAINER=1; fi
-        log "payload will run with ASCEND_RT_VISIBLE_DEVICES=$SELECTED_DEVICE"
+
+        # The assertion belongs INSIDE the container, wrapping the real workload.
+        # Checking the wrapper's own environment proves nothing about what the
+        # workload sees: the wrapper never enters the container. This prefix runs
+        # in the container, reads the environment the workload actually inherits,
+        # and aborts before the workload starts if it disagrees.
+        assertion="v=\${ASCEND_RT_VISIBLE_DEVICES:-<UNSET>}; wanted=$SELECTED_DEVICE; n=\$(printf %s \"\$v\" | tr \",\" \"\\n\" | grep -c .); if [ \"\$v\" != \"\$wanted\" ] || [ \"\$n\" -ne 1 ]; then echo \"DEVICE-ASSERT-FAIL: payload sees ASCEND_RT_VISIBLE_DEVICES=\$v (\$n device(s)), expected exactly 1 matching \$wanted\" >&2; exit 97; fi; echo \"DEVICE-ASSERT-OK: payload sees exactly one device (\$v)\"; exec \"\$@\""
+        # Rebuild argv: keep everything up to and including the container name,
+        # then insert sh -c <assertion> before the original command.
+        final=()
+        seen_container=0
+        skip_next=0
+        for a in "${new_args[@]}"; do
+            if [ "$skip_next" = 1 ]; then skip_next=0; final+=("$a"); continue; fi
+            if [ "$a" = "-e" ] || [ "$a" = "-u" ] || [ "$a" = "--env" ]; then
+                skip_next=1; final+=("$a"); continue
+            fi
+            final+=("$a")
+            if [ "$seen_container" = 0 ] && [ "$a" = "$SEL_CONTAINER" ]; then
+                seen_container=1
+                final+=(sh -c "$assertion" --)
+            fi
+        done
+        set -- "${final[@]}"
+        log "payload will run with ASCEND_RT_VISIBLE_DEVICES=$SELECTED_DEVICE (asserted inside the container)"
     fi
 fi
 
