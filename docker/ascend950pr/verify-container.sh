@@ -101,7 +101,11 @@ if [ "$MODE" = npu ]; then
     printf ' Reason: on this platform the NPU runtime requires root to enter.\n'
     printf ' A non-root NPU attempt is not representative, so this mode is\n'
     printf ' entered deliberately, not by omission.\n'
+    printf ' NOTE: running as root is NOT device proof. Every check below is\n'
+    printf ' the same CPU-side analyze/finalize/equality suite, executed as root.\n'
+    printf ' No device kernel is executed by this script in either mode.\n'
     printf ' Scope: device access only. This does not license driver or CANN\n'
+    printf ' changes, and it does not make the container a sandbox.\n'
     printf ' changes, and it does not make the container a sandbox.\n'
     printf ' Mode: npu; user: %s (uid %s)\n' "$(id -un)" "$(id -u)"
     printf '================================================================\n'
@@ -122,7 +126,8 @@ fi
 printf 'TileFoundry Ascend950PR container verification\n'
 printf 'host: %s\n' "$(hostname)"
 printf 'date: %s\n' "$(date -Is)"
-printf 'mode: %s\n' "$MODE"
+    printf 'mode: %s\n' "$MODE"
+    printf 'device_kernel_executed: no\n'
 printf 'user: %s (uid %s)\n' "$(id -un)" "$(id -u)"
 
 
@@ -216,4 +221,5 @@ if [ "$failures" -ne 0 ]; then
     exit 1
 fi
 printf 'RESULT: PASS\n'
+printf 'SCOPE: %s-mode checks; no device kernel executed\n' "$MODE"
 exit 0

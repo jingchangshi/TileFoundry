@@ -83,3 +83,67 @@ This container is for running TileFoundry, not for changing the machine:
 - record an `npu-smi info` snapshot before and after each run;
 - on a shared server, any timing number is provisional. Numerics are not
   affected by other tenants; latency is.
+## Scripts
+
+| script | purpose |
+| --- | --- |
+| `create-container.sh` | create the container from the image |
+| `verify-container.sh` | verify the environment from inside it |
+| `verify-identity.sh` | verify the container account by asking the container |
+| `device-select.sh` | require an explicit device, report occupancy |
+| `device-run.sh` | serialized device run with per-run evidence |
+| `check-receipt.sh` | judge a device receipt; missing data is false |
+| `manifest.sh` | record the stack a baseline ran on |
+
+## Configuration
+
+`env.example.sh` is the single source of configuration. Copy it once:
+
+```
+cp env.example.sh env.sh
+chmod 600 env.sh
+```
+
+`env.sh` is git-ignored and never committed. It is parsed as data, never
+executed; unknown or duplicate keys fail rather than being ignored. Exporting
+the same names in a shell has no effect, so a stale export cannot silently
+override what the machine says it is.
+
+A device id is deliberately **not** in the file: it authorizes one run, not a
+machine. Pass `--device N` or set `TF_DEVICE_ID` per invocation.
+
+## Two modes
+
+On this platform NPU cases must enter as root, while CPU-only work must not.
+
+```
+# CPU-only analyze / finalize / equality: ordinary account, required
+docker exec -u <user> <container> bash verify-container.sh
+
+# On-device work: root, and only when asked for
+docker exec <container> bash verify-container.sh --npu
+```
+
+Root without `--npu` is refused (exit 2) as an accident; `--npu` without root
+is also refused (exit 2), because that attempt is not representative. Root does
+not authorize a device: `--npu` still requires an explicit device id.
+
+## Occupancy is reported, not enforced
+
+This is a shared server and a busy card is not a fact about the code under
+test. `device-select.sh` records who is on the card and proceeds. Setting
+`TF_REQUIRE_EXCLUSIVE=1` turns a held card into **BLOCKED_ENV** (exit 75) --
+the run is reported as not having happened, never as having passed.
+
+## What the evidence does and does not prove
+
+`verify-container.sh` runs the same CPU-side analyze/finalize/equality suite in
+both modes. `--npu` changes the identity it runs as, not what it runs. Its PASS
+is evidence about the root environment, **not** about the device, and it is
+labelled that way in the log and the manifest. No device kernel has been
+executed by this container; `torch_npu` is not installed in the venv.
+
+A device PASS requires a receipt that passes `check-receipt.sh`: both markers
+distinguished, tensors actually moved, peak allocation > 0, at least one
+`.npubin`, synchronization successful with the original error text carried, and
+exactly one visible device. Missing data is false.

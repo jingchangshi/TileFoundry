@@ -125,6 +125,45 @@ if [ "$MODE" = npu ]; then
     log ' Running device work. This is deliberate, recorded, and scoped to'
     log ' device access -- no driver or CANN changes, no other tenant touched.'
     log '================================================================'
+    # Root does not authorize a device: a device id must still be named, and
+    # it is never discovered or substituted. device-select.sh refuses without
+    # one, reports occupancy rather than enforcing it, and yields BLOCKED_ENV
+    # (75) if exclusive access was asked for and the card is held -- so a busy
+    # card can never be mistaken for a passing run.
+    # An unset device id is refused explicitly rather than through ${VAR:?},
+    # which exits 1 and would be indistinguishable from the selection itself
+    # failing for another reason.
+    if [ -z "${TF_DEVICE_ID:-}" ]; then
+        log 'BLOCKED: --npu requires an explicit device. Pass --device N or TF_DEVICE_ID=N.'
+        log '  A device is never discovered or substituted: a run against a device'
+        log '  the operator did not name is not evidence about the device they meant.'
+        trap - EXIT
+        flock -u 9
+        exit 2
+    fi
+    sel="$HERE/device-select.sh"
+    if [ -x "$sel" ]; then
+        sel_args=(--device "$TF_DEVICE_ID")
+        [ "${TF_REQUIRE_EXCLUSIVE:-0}" = 1 ] && sel_args+=(--exclusive)
+        if "$sel" "${sel_args[@]}" > "$RUNDIR/device-select.txt" 2>&1; then
+            log 'device selection ok; see device-select.txt'
+        else
+            sel_rc=$?
+            log "device selection refused (exit $sel_rc); see device-select.txt"
+            if [ "$sel_rc" -eq 75 ]; then
+                log 'BLOCKED_ENV: the device run did not happen.'
+            fi
+            cat "$RUNDIR/device-select.txt" >&2 || true
+            trap - EXIT
+            flock -u 9
+            exit "$sel_rc"
+        fi
+    else
+        log 'device-select.sh missing; refusing to run device work unselected'
+        trap - EXIT
+        flock -u 9
+        exit 2
+    fi
 fi
 
 npu-smi info > "$RUNDIR/npu-smi.before.txt" 2>&1
