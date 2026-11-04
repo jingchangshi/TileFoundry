@@ -68,3 +68,31 @@ MOUNT_NPU_ENV=0
 # a card guaranteed free, in which case a busy card yields BLOCKED_ENV -- the
 # run is reported as not having happened, never as having passed.
 TF_REQUIRE_EXCLUSIVE=0
+
+# --- CPU work must never touch the NPU, including at IMPORT time -------------
+#
+# TORCH_DEVICE_BACKEND_AUTOLOAD=0 is REQUIRED for every CPU-only invocation, and
+# it is a safety setting rather than a speed knob.
+#
+# This image ships the torch_npu build. On import, torch auto-loads the NPU
+# backend extension, which OPENS THE DEVICE PATH -- and with the device stack
+# unavailable it raises
+#
+#     RuntimeError: Failed to load the backend extension: torch_npu.
+#
+# So a plain `import torch` in this image is already a device-path touch, before
+# a single line of the test has run. That was found the hard way: two CPU
+# equality tests reported NOT_RUN for a reason that had nothing to do with their
+# module, and every one of them had walked onto the frozen device path merely by
+# importing torch.
+#
+# With the variable set, measured in-container: torch 2.12.0+cpu, torch_npu NOT
+# loaded, cuda False, exit 0. CPU arithmetic, no device, no ambiguity.
+#
+# MECHANISM WARNING: this file is parsed as DATA by the host scripts and passed
+# to `docker run -e`. Docker exec does NOT inherit the entrypoint environment
+# (see entry.sh), so a value set only here does NOT reach a later `docker exec`.
+# Until the image carries it as an ENV (see Dockerfile), every `docker exec` that
+# imports torch must pass `-e TORCH_DEVICE_BACKEND_AUTOLOAD=0` explicitly. The
+# acceptance script exports it itself so it is correct either way.
+TORCH_DEVICE_BACKEND_AUTOLOAD=0

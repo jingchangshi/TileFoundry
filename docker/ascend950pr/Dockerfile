@@ -64,8 +64,20 @@ ARG LLVM_VERSION=18
 # ARG UBUNTU_MIRROR=http://mirrors.aliyun.com/ubuntu/
 ARG UBUNTU_MIRROR=http://repo.huaweicloud.com/ubuntu/
 
+# TORCH_DEVICE_BACKEND_AUTOLOAD=0 is a SAFETY setting, not a speed one.
+#
+# This image ships the torch_npu build, so `import torch` auto-loads the NPU
+# backend extension: a device-path touch before any CPU test runs, and a hard
+# RuntimeError when the device stack is unavailable. Setting it at the IMAGE
+# level is the only place that reaches a bare `docker exec`, because docker
+# exec does not inherit the entrypoint environment (see entry.sh). Device work
+# opts back in per invocation instead of every CPU invocation opting out.
+#
+# NOTE: no inline comments inside the ENV continuation below. Docker would fold
+# them into the value.
 ENV LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8
+    LC_ALL=C.UTF-8 \
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0
 
 # ---------------------------------------------------------------------------
 # System packages.
