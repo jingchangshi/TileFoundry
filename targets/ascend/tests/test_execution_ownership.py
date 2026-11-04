@@ -183,13 +183,30 @@ def check_hoisted_private_allocation_is_refused() -> None:
     assert "private to execution region" in message, message
 
 
-def check_sibling_region_reuse_is_refused() -> None:
-    """A second region instance reading the first instance private register.
+def check_sibling_region_reuse_cannot_arise() -> None:
+    """A second region instance reaching the first instance private register.
 
-    Two sibling regions are two instances, not one: the second has its own
-    register file, so a value created in the first is not merely out of scope, it
-    belongs to a different instance. This is the case a rule that only asked "was
-    it allocated inside some region" would wrongly accept.
+    This is recorded as a REFUSAL THAT COMES FROM A DIFFERENT RULE, deliberately,
+    because the alternative -- advertising it as an ownership control -- would be
+    claiming coverage that is not there.
+
+    Two sibling regions are two instances, so intuitively the second should be
+    refused for reading another instance register file. It cannot be constructed: a
+    private value is only visible where it is bound, every binding here is scoped to
+    its own Sequential, and the only way to make a value visible inside the second
+    region is to bind it OUTSIDE both -- which is the hoisted-allocation case, and
+    that is refused at the allocation before either region is reached.
+
+    So the lexical binder refuses first, and the ownership question never arises.
+    That is a fact about the LANGUAGE, not a gap being papered over, and the case is
+    kept because it is the assertion that would notice if it stopped being true: if
+    the binder one day admitted an out-of-scope Var, this case would report the
+    ownership refusal instead of the binder one and FAIL, which is exactly what we
+    would want to see.
+
+    Consequence to keep in mind when reading the coverage: the ownership rule has
+    ONE constructible negative (the hoisted allocation), plus the external-parameter
+    case. It does not have two independent ones.
     """
     reg_stmt, reg = _bind("a", _tensor())
     ub_stmt, ub = _bind("ub", _tensor(storage="smem"))
@@ -203,7 +220,9 @@ def check_sibling_region_reuse_is_refused() -> None:
         body=Sequential(body=(Evaluate(callable=Vld(), args=(ub2, reg)),)),
     )
     message = _refusal(_function((), ub_stmt, first, ub2_stmt, second))
-    assert "private to execution region" in message, message
+    assert "outside the scope that binds it" in message, message
+    assert "private to execution region" not in message, message
+    print("     refused by the lexical binder, not the ownership rule")
 
 
 def check_same_width_integer_is_refused() -> None:
@@ -288,7 +307,7 @@ CHECKS = (
     check_positive_control_is_accepted,
     check_external_private_parameter_is_refused,
     check_hoisted_private_allocation_is_refused,
-    check_sibling_region_reuse_is_refused,
+    check_sibling_region_reuse_cannot_arise,
     check_same_width_integer_is_refused,
     check_half_width_lane_extent_is_refused,
 )
