@@ -107,6 +107,7 @@ from tilefoundry.visitor_registry.buffer_alias import aliased_operand
 from tilefoundry.visitor_registry.candidates import (
     candidate_operands,
     candidate_ops,
+    select_instruction,
     sole_candidate,
 )
 from tilefoundry.visitor_registry.contexts import TypeInferContext, ValuationContext
@@ -1066,9 +1067,25 @@ class StoragePlan:
 class IssuePlan:
     """Instruction selection and one shared geometric projection, without admission."""
 
-    def op(self, call):
+    def op(self, call, ctx=None):
         if isinstance(call.target, ScheduleOp):
             return call.target.op
+        target = None if ctx is None else getattr(ctx, "target", None)
+        inside = ctx is not None and bool(getattr(ctx, "executions", ()))
+        active_kind = ctx.executions[-1] if ctx is not None and inside else None
+        if target is not None:
+            # Target-aware selection lives in the candidates registry, not here: the same
+            # rule must be what the reporting path shows. A target that declares no
+            # scoped candidates for this op returns None and falls through to the global
+            # single-candidate query below, which is exactly today's behaviour for CUDA.
+            try:
+                selected = select_instruction(
+                    call, target=target, inside=inside, active_kind=active_kind
+                )
+            except ScheduleRefusal as error:
+                raise LoweringError(str(error)) from error
+            if selected is not None:
+                return selected
         candidates = candidate_ops(type(call.target))
         if not candidates:
             raise LoweringError(
@@ -1150,6 +1167,7 @@ class LoweringContext(TypeInferContext):
     allocations: dict = field(default_factory=dict)
     parameters: dict = field(default_factory=dict)
     authored_values: dict = field(default_factory=dict)
+    executions: list = field(default_factory=list)
 
     def value(self, leaf):
         result = self.memo[id(leaf.expr)][1]
@@ -1367,9 +1385,13 @@ class Lowering(ValuationVisitor[Expr | View]):
         result, which is what makes register non-escape a property of the
         produced IR rather than a promise about the body.
         """
-        with ctx.builder.region(execution=region.kind, owner=region) as scope:
-            result = self.visit(region.body, self.on_region_start(region, ctx))
-            scope.result = result
+        ctx.executions.append(region.kind)
+        try:
+            with ctx.builder.region(execution=region.kind, owner=region) as scope:
+                result = self.visit(region.body, self.on_region_start(region, ctx))
+                scope.result = result
+        finally:
+            ctx.executions.pop()
         return result
 
     def visit_LoopRegion(self, loop: LoopRegion, ctx) -> Expr:
@@ -1466,7 +1488,7 @@ class Lowering(ValuationVisitor[Expr | View]):
             )
         if name == "InsertSlice":
             return self.visit_InsertSlice(call, operands, ctx)
-        op = ctx.issues.op(call)
+        op = ctx.issues.op(call, ctx=ctx)
         return getattr(self, f"visit_{type(op).__name__}", self.instruction)(
             call, op, operands, ctx
         )

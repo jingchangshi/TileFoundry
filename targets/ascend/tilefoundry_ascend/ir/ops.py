@@ -267,3 +267,28 @@ def _eval_vadd(ctx):
     a, b, mask, dst = (value.data for value in ctx.args)
     active = mask.to(torch.bool)
     return TensorValue(data=torch.where(active, a + b, dst), type=ctx.result_type)
+
+# --- target-scoped automatic selection for the generic copy / reshard ---
+#
+# A generic storage-changing Reshard (a copy with no tf.schedule) has to become the
+# RIGHT Ascend move for its direction. These four are offered ONLY when the
+# Ascend950PR target is the one lowering the program; they are not added to the global
+# candidate list, so CUDA keeps its single global Copy carrier and sole_candidate stays
+# unambiguous there.
+#
+# Resolution is by PLACEMENT then declared operand storages:
+#   outside a mode  gm->smem  -> ascend_gm_to_ub        smem->gmem -> ascend_ub_to_gm
+#   inside a SimdVF smem->rmem -> ascend_vld            rmem->smem -> ascend_vsts
+# More than one fit is refused as ambiguous; none fitting is refused with the list. That
+# logic lives in tilefoundry.visitor_registry.candidates.select_instruction, shared by
+# lowering and reporting, rather than being a late substitution in the converter.
+from tilefoundry.ir.hir.sharding.reshard import Reshard as _HirReshard  # noqa: E402
+from tilefoundry.visitor_registry.candidates import (  # noqa: E402
+    register_target_candidates as _register_target_candidates,
+)
+
+_register_target_candidates(
+    "ascend950pr",
+    _HirReshard,
+    (GmToUb, UbToGm, Vld, Vsts),
+)

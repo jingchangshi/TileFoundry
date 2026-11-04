@@ -11,7 +11,8 @@ from tilefoundry.ir.core.metadata import SourceSpanMetadata
 from tilefoundry.ir.hir.schedule import ScheduleRefusal, match_instruction
 from tilefoundry.ir.types import StorageKind, TensorType
 from tilefoundry.ir.types.dim import is_dim_op_call
-from tilefoundry.ir.visitor import collect_exprs
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
+from tilefoundry.ir.visitor import collect_exprs, expr_children
 from tilefoundry.schedule._reporting import capability_families
 from tilefoundry.target import Target
 from tilefoundry.visitor_registry.access_relation import access_relation_registry
@@ -19,7 +20,9 @@ from tilefoundry.visitor_registry.buffer_alias import aliased_operand
 from tilefoundry.visitor_registry.candidates import (
     candidate_operands,
     candidate_ops,
+    select_instruction,
     sole_candidate,
+    target_candidate_ops,
 )
 from tilefoundry.visitor_registry.contexts import TypeInferContext, ValuationContext
 from tilefoundry.visitor_registry.valuation import ValuationVisitor
@@ -34,6 +37,20 @@ def _instructions(target: Target) -> tuple[tuple[type, OpCapability], ...]:
         for capability in capabilities
     )
 
+
+def _calls_inside_execution(function) -> set[int]:
+    """Ids of calls that sit inside an HIR execution region in *function*."""
+    inside: set[int] = set()
+    stack = [(function.body, False)]
+    while stack:
+        expr, seen = stack.pop()
+        if expr is None:
+            continue
+        nested = seen or isinstance(expr, ExecutionRegion)
+        if nested and isinstance(expr, Call):
+            inside.add(id(expr))
+        stack.extend((child, nested) for child in expr_children(expr))
+    return inside
 
 def candidates(
     module, entry, *, source: str | None = None
@@ -54,6 +71,9 @@ def candidates(
                 ),
             )
         )
+    inside_ids: set[int] = set()
+    for frame in frames:
+        inside_ids |= _calls_inside_execution(frame.function)
     declared = _instructions(target)
     type_printer = PythonPrinter()
     pattern_printer = PatternPrinter()
@@ -66,7 +86,12 @@ def candidates(
             or not isinstance(call.type, TensorType)
         ):
             continue
-        instructions = candidate_ops(type(call.target))
+        # Global carriers plus the ones THIS target scopes to the same HIR op. The
+        # scoped ones are what let a generic, unscheduled op be reported/selected for
+        # Ascend without changing the global list a CUDA program sees.
+        instructions = candidate_ops(type(call.target)) + target_candidate_ops(
+            target, type(call.target)
+        )
         if not instructions or aliased_operand(call) is not None:
             continue
         if call.type.storage is StorageKind.UMAT and call.type.shape == ():
@@ -76,12 +101,20 @@ def candidates(
         frame, mesh = context, context.current_mesh
         level = None if mesh is None else mesh.topologies[-1].name
         usable, refused = [], []
+        try:
+            default_op = sole_candidate(
+                call, target=target, inside=id(call) in inside_ids
+            )
+        except ScheduleRefusal:
+            # The target scopes candidates but none fits this call; report no default
+            # rather than inventing one. The lowering path raises the same refusal.
+            default_op = None
         for op_type, capability in declared:
             if op_type not in instructions:
                 continue
             identifier = op_identifier(capability.declaration or op_type)
             try:
-                attributes, types = candidate_operands(call, op_type)
+                attributes, types = candidate_operands(call, op_type, target=target)
                 if capability.attribute is not None:
                     attributes[capability.attribute] = capability.declaration
                 instances = match_instruction(op_type, attributes, types, mesh, frame=frame)
@@ -94,7 +127,7 @@ def candidates(
                 "id": identifier,
                 **pattern_printer.match_data(tuple(match.path for match in instances)),
             }
-            if sole_candidate(call) is not None:
+            if default_op is not None and type(default_op) is op_type:
                 candidate["default"] = True
             usable.append(candidate)
         parameters = [
