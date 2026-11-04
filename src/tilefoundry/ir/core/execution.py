@@ -80,6 +80,9 @@ class ExecutionKind:
     surface: str
     register_storages: tuple[StorageKind, ...] = ()
     mask_width_bits: int | None = None
+    #: Granularity of a CONVERSION mask (bf16<->f32 uses 16), checked independently of the
+    #: arithmetic mask width. One mode identity, two declared properties; neither defaults.
+    conversion_mask_width_bits: int | None = None
     lane_count: int | None = None
     element_dtypes: tuple = ()
     required_topologies: tuple[str, ...] = ()
@@ -98,12 +101,17 @@ class ExecutionKind:
             )
         if any(not isinstance(storage, StorageKind) for storage in self.register_storages):
             raise TypeError("ExecutionKind: register_storages must be StorageKind values")
-        width = self.mask_width_bits
-        if width is not None and (isinstance(width, bool) or not isinstance(width, int) or width < 1):
-            raise ValueError(
-                f"ExecutionKind {self.name!r}: mask_width_bits must be a positive int, "
-                f"got {width!r}"
-            )
+        for label, width in (
+            ("mask_width_bits", self.mask_width_bits),
+            ("conversion_mask_width_bits", self.conversion_mask_width_bits),
+        ):
+            if width is not None and (
+                isinstance(width, bool) or not isinstance(width, int) or width < 1
+            ):
+                raise ValueError(
+                    f"ExecutionKind {self.name!r}: {label} must be a positive int, gained "
+                    f"{width!r}"
+                )
         lanes = self.lane_count
         if lanes is not None and (isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1):
             raise ValueError(

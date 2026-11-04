@@ -36,6 +36,9 @@ SIMD_VF_LANES = 64
 SIMD_VF_ELEMENT_WIDTH_BITS = 32
 """Element width pset(32) selects for the f32 subset; not a lane count."""
 
+SIMD_VF_CONVERSION_WIDTH_BITS = 16
+"""Conversion mask granularity for bf16<->f32: min(source,target) width, checked separately."""
+
 
 def _declare() -> ExecutionKind:
     return register_execution_kind(
@@ -43,8 +46,9 @@ def _declare() -> ExecutionKind:
             name=SIMD_VF_KIND,
             surface=SIMD_VF_SURFACE,
             # The vector and predicate registers are the mode private working set.
-            register_storages=(StorageKind.RMEM,),
+            register_storages=(StorageKind.RMEM, StorageKind.CARRIER),
             mask_width_bits=SIMD_VF_ELEMENT_WIDTH_BITS,
+            conversion_mask_width_bits=SIMD_VF_CONVERSION_WIDTH_BITS,
             lane_count=SIMD_VF_LANES,
             element_dtypes=(DType.f32,),
             required_topologies=("aiv",),

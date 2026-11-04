@@ -1112,12 +1112,30 @@ def verify_op_placement(op, modes: tuple, *, where: str = "execution region") ->
     declared = execution_kind(requirement.kind)
     width = declared_mask_width(op)
     if width is not None and declared is not None:
-        if width != declared.mask_width_bits:
+        # ONE mode identity, TWO independently checked widths: an ARITHMETIC instruction is
+        # bound to mask_width_bits, a CONVERSION instruction to conversion_mask_width_bits.
+        # Neither check may be satisfied by defaulting.
+        mask_class = getattr(type(op), "mask_class", "arithmetic")
+        if mask_class not in ("arithmetic", "conversion"):
+            raise VerifyError(
+                f"{name}: mask_class {mask_class!r} is not 'arithmetic' or 'conversion'"
+            )
+        expected = (
+            declared.mask_width_bits
+            if mask_class == "arithmetic"
+            else declared.conversion_mask_width_bits
+        )
+        if expected is None:
+            raise VerifyError(
+                f"{name}: a {mask_class} instruction needs execution region "
+                f"{declared.name!r} to declare a {mask_class} mask width, and it does not"
+            )
+        if width != expected:
             raise VerifyError(
                 f"{name}: states element width {width} but execution region "
-                f"{declared.name!r} declares {declared.mask_width_bits}; an operation "
-                "addressing a different element width is addressing lanes this mode "
-                "does not have"
+                f"{declared.name!r} declares {expected} for {mask_class} instructions; an "
+                "operation addressing a different element width is addressing lanes this "
+                "mode does not have"
             )
     if declared is not None:
         verify_operand_dtypes(op, declared, name)
