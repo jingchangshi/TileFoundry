@@ -116,6 +116,17 @@ def run() -> dict:
         )
         return record
 
+    # Device access is forbidden while the host filesystem wedge is investigated, and
+    # nothing here needs one: this is CPU arithmetic and IR evaluation. If the NPU
+    # stack somehow arrived, stop rather than proceed.
+    if "torch_npu" in sys.modules:
+        record.update(
+            status="REFUSED",
+            exit_code=EXIT_ERROR,
+            reason="torch_npu is loaded; this check must never touch the device stack",
+        )
+        return record
+
     try:
         from tilefoundry.evaluator import evaluate
 

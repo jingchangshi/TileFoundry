@@ -161,7 +161,17 @@ def runCase(name, body, expected, why):
     return False
 
 
+def _refuse_device_stack() -> None:
+    """Stop if the NPU stack is loaded. Nothing here needs a device."""
+    if "torch_npu" in sys.modules:
+        raise SystemExit(
+            "REFUSED: torch_npu is loaded in this process. This check is CPU-only and"
+            " must never touch the device stack."
+        )
+
+
 def main() -> int:
+    _refuse_device_stack()
     results = [runCase(*case) for case in CASES]
     print(f"{sum(results)}/{len(results)} cases refused for their pinned reason")
     return 0 if all(results) else 1

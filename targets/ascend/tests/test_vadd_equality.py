@@ -308,12 +308,32 @@ def _structure(prim):
     return found
 
 
+def _refuse_device_stack() -> None:
+    """Fail loudly if anything has put the NPU stack on this process.
+
+    Nothing in this file needs a device: every check is CPU arithmetic and IR
+    inspection. Importing torch_npu or touching a davinci node is forbidden here,
+    because a host-wide filesystem wedge correlates with a davinci0 open. A test
+    that silently dragged the device stack in would be doing the one thing this
+    module must never do, so it stops instead of proceeding.
+    """
+    import sys
+
+    if "torch_npu" in sys.modules:
+        raise SystemExit(
+            "REFUSED: torch_npu is loaded in this process. This check is CPU-only and"
+            " must never touch the device stack."
+        )
+
+
 def main() -> int:
     try:
         import torch
     except Exception as error:  # noqa: BLE001 -- any import failure is NOT_RUN
         print(f"NOT_RUN torch is not importable: {error!r}")
         return NOT_RUN
+
+    _refuse_device_stack()
 
     from tilefoundry.analysis import analyze
     from tilefoundry.cli.source import checked_program, load_authored_ir

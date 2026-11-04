@@ -352,7 +352,24 @@ CHECKS = (
 )
 
 
+def _refuse_device_stack() -> None:
+    """Stop if the NPU stack is loaded. Nothing here needs a device.
+
+    This file is pure IR construction and verification, so a loaded torch_npu can
+    only have arrived by accident -- and device access is forbidden while the host
+    filesystem wedge is under investigation.
+    """
+    import sys
+
+    if "torch_npu" in sys.modules:
+        raise SystemExit(
+            "REFUSED: torch_npu is loaded in this process. This check is CPU-only and"
+            " must never touch the device stack."
+        )
+
+
 def main() -> int:
+    _refuse_device_stack()
     failed = 0
     for check in CHECKS:
         try:

@@ -12,7 +12,18 @@ Run with the approved container interpreter; this file needs no test framework.
 """
 from __future__ import annotations
 
+import sys
+
 import tilefoundry_ascend  # noqa: F401  (registers the SimdVF surface)
+
+# Device access is forbidden while the host filesystem wedge is investigated, and
+# nothing here needs one: these cases are IR construction and verification. If the
+# NPU stack somehow arrived, stop rather than proceed.
+if "torch_npu" in sys.modules:
+    raise SystemExit(
+        "REFUSED: torch_npu is loaded in this process. This check is CPU-only and must"
+        " never touch the device stack."
+    )
 
 from tilefoundry.ir.core import Call, Var, VerifyError
 from tilefoundry.ir.core.kinds import BinaryKind
