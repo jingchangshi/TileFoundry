@@ -8,7 +8,7 @@ coverage/numeric checks FAIL. CPU software model; UNCREDITED. Not the production
 Exit codes: 0 PASS, 1 FAIL, 2 ERROR, 3 NOT_RUN.
 """
 from __future__ import annotations
-import argparse, math, os, struct, subprocess, sys
+import argparse, math, os, re, struct, subprocess, sys
 import tilefoundry_ascend  # noqa: F401
 import torch
 
@@ -33,6 +33,36 @@ def bf(x):
     return struct.unpack("<f", struct.pack("<f", float(x)))[0]
 
 
+def tir_write_windows(text, D, L):
+    """Parse the TYPED finalized TIR: every T.copy destination window, its view layout/shape and
+    its element offset. This is the independent write-side coverage evidence (not the reference
+    loop). Returns (windows, ok_layout) where windows = [(offset, extent)]."""
+    defs = {}
+    for m in re.finditer(r"(\w+)\s*=\s*T\.tensor_view\(\s*T\.ptr_of\(out\[(.+?)\]\)\s*,\s*layout=\((\d+),?\)\s*,\s*shape=\((\d+),?\)", text, re.S):
+        defs[m.group(1)] = (int(m.group(3)), int(m.group(4)), m.group(2))
+    windows = []
+    ok_layout = True
+    for line in text.splitlines():
+        m = re.search(r"T\.copy\([^,]+,\s*(\w+)\)", line)
+        if not m:
+            continue
+        name = m.group(1)
+        if name not in defs:
+            ok_layout = False
+            continue
+        layout, shape, expr = defs[name]
+        if layout != L or shape != L:
+            ok_layout = False
+        lit = re.search(r"\+ \((\d+) \* %d\)" % L, expr)
+        if lit:
+            off = int(lit.group(1)) * L
+        else:
+            lit0 = re.match(r"\s*(\d+):", expr)
+            off = int(lit0.group(1)) if lit0 else -1
+        windows.append((off, shape))
+    return windows, ok_layout
+
+
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--tiles", type=int, required=True)
     ap.add_argument("--batch", type=int, default=1)
@@ -54,11 +84,22 @@ def main():
         checks["public_reload_verified"] = True
         checks["six_vcadd"] = text.count("ascend_vcadd(") == 6 * max(1, TILES // TILES)  # per row
         checks["has_reverse_pk"] = 'direction="reverse"' in text and 'pack="PK_B32"' in text
-        checks["per_tile_copy"] = text.count("T.copy(") >= TILES  # one copy per tile at least
-        # no whole-block copy: every T.copy dst window must be a 64-len tile view, none 512/other
-        checks["no_whole_block_copy"] = ("layout=(%d,)" % D) not in " ".join(l for l in text.splitlines() if "T.copy(" in l)
+        checks["per_tile_copy"] = text.count("T.copy(") == TILES
+        # INDEPENDENT write-side coverage from the typed TIR: every T.copy destination is a
+        # 64-element tile view, the tile offsets are distinct and exactly cover [0, D).
+        windows, ok_layout = tir_write_windows(text, D, L)
+        offsets = sorted(off for off, _ in windows)
+        checks["tir_all_dst_windows_are_tiles"] = ok_layout and all(ext == L for _, ext in windows)
+        checks["tir_covers_all_tiles_no_overlap"] = offsets == list(range(0, D, L)) and len(windows) == TILES
+        checks["no_whole_row_copy"] = all(ext == L for _, ext in windows) and "T.fill(" not in text
+        # negative: a whole-row window/copy injected into the TIR MUST be rejected by the checker
+        bad = text + "\nwindow_bad = T.tensor_view(T.ptr_of(out[0:%d]), layout=(%d,), shape=(%d,))\nT.copy(uo0_2, window_bad)\n" % (D, D, D)
+        bad_windows, bad_layout = tir_write_windows(bad, D, L)
+        checks["negative_whole_row_copy_rejected"] = (not bad_layout) or any(ext == D for _, ext in bad_windows)
     else:
-        for k in ("public_reload_verified", "six_vcadd", "has_reverse_pk", "per_tile_copy", "no_whole_block_copy"):
+        for k in ("public_reload_verified", "six_vcadd", "has_reverse_pk", "per_tile_copy",
+                  "tir_all_dst_windows_are_tiles", "tir_covers_all_tiles_no_overlap",
+                  "no_whole_row_copy", "negative_whole_row_copy_rejected"):
             checks[k] = False
 
     prog = checked_program(f"{FIX}:{ENTRY}", None, command="rmsnorm-d")
