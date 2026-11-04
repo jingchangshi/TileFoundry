@@ -38,32 +38,39 @@ def _instructions(target: Target) -> tuple[tuple[type, OpCapability], ...]:
     )
 
 
-def _calls_inside_execution(function) -> set[int]:
-    """Ids of calls that sit inside an HIR execution region in *function*."""
-    inside: set[int] = set()
-    stack = [(function.body, False)]
+def _execution_context(function) -> dict[int, str]:
+    """Call id -> the ACTIVE execution kind where that call lexically executes.
+
+    Classification is by LEXICAL definition/evaluation context, not by recursive
+    data-dependency reachability:
+
+    * an ExecutionRegion ARGS are the captured values and are evaluated in the
+      ENCLOSING context; a producer whose result a VF body captures is still lexically
+      outside and must NOT be reported as inside (that mistake dropped gm_to_ub from the
+      outside default set);
+    * only the region BODY executes in the region kind, and that kind is the ACTIVE kind
+      for everything reachable through it until an inner region changes it.
+
+    Returning the kind (not just a boolean) is what lets the report resolve placement
+    with the same active-kind rule the lowering uses; a call absent from the map is
+    outside every execution region.
+    """
+    active: dict[int, str] = {}
+    stack: list[tuple[object, str | None]] = [(function.body, None)]
     while stack:
-        expr, seen = stack.pop()
+        expr, kind = stack.pop()
         if expr is None:
             continue
         if isinstance(expr, ExecutionRegion):
-            # LEXICAL classification, not data-dependency reachability.
-            #
-            # An ExecutionRegion args are the CAPTURED values and are evaluated in the
-            # enclosing scope; only body executes inside the mode. Walking the args as
-            # "inside" marked an outside producer inside merely because a VF body used
-            # its result, which then dropped that producer from the outside default set
-            # (the reported default list was missing gm_to_ub). A producer consumed by a
-            # VF body is still lexically outside and stays outside here.
             for arg in expr.args:
-                stack.append((arg, seen))
-            stack.append((expr.body, True))
+                stack.append((arg, kind))
+            stack.append((expr.body, expr.kind))
             continue
-        if seen and isinstance(expr, Call):
-            inside.add(id(expr))
+        if kind is not None and isinstance(expr, Call):
+            active[id(expr)] = kind
         for child in expr_children(expr):
-            stack.append((child, seen))
-    return inside
+            stack.append((child, kind))
+    return active
 
 def candidates(
     module, entry, *, source: str | None = None
@@ -84,9 +91,9 @@ def candidates(
                 ),
             )
         )
-    inside_ids: set[int] = set()
+    execution_context: dict[int, str] = {}
     for frame in frames:
-        inside_ids |= _calls_inside_execution(frame.function)
+        execution_context.update(_execution_context(frame.function))
     declared = _instructions(target)
     type_printer = PythonPrinter()
     pattern_printer = PatternPrinter()
@@ -115,8 +122,9 @@ def candidates(
         level = None if mesh is None else mesh.topologies[-1].name
         usable, refused = [], []
         try:
+            active_kind = execution_context.get(id(call))
             default_op = sole_candidate(
-                call, target=target, inside=id(call) in inside_ids
+                call, target=target, inside=active_kind is not None, active_kind=active_kind
             )
         except ScheduleRefusal:
             # The target scopes candidates but none fits this call; report no default
