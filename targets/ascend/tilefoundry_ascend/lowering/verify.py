@@ -22,7 +22,7 @@ from dataclasses import dataclass
 _WAIT = re.compile(r"wait_flag\s+(?P<ch>\w+)\[(?P<slot>\d+)\]\s+gen=(?P<gen>\d+)\s+flag=(?P<flag>\d+)\s*#.*t=(?P<t>\d+)")
 _SET = re.compile(r"set_flag\s+(?P<ch>\w+)\[(?P<slot>\d+)\]\s+gen=(?P<gen>\d+)\s+flag=(?P<flag>\d+)\s*#.*t=(?P<t>\d+)")
 _OP = re.compile(r"(?P<op>mte2|mte3|simdvf)\s+(?P<task>\w+)\s+slot=(?P<slot>\d+)\s+t=(?P<t>\d+)")
-_DRAIN = re.compile(r"^drain\(\)")
+_DRAIN = re.compile(r"^drain\(\)\s*(?:#.*)?$")
 
 
 @dataclass
@@ -102,6 +102,11 @@ def verify(problem, text: str):
         if (d["set"] and d["wait"] and d["set"] != d["wait"]) or len(d["set"]) > 1 or len(d["wait"]) > 1:
             errors.append("[M6-FLAG-MISMATCH] channel %s set %s wait %s"
                           % (ch, sorted(d["set"]), sorted(d["wait"])))
+    # M6-UNKNOWN-CHANNEL: a WAIT/SET on a channel outside the known sync set is rejected.
+    _KNOWN_CHANNELS = {"x_ready", "x_free", "y_ready", "y_free", "w_ready", "w_conv"}
+    for e in ev:
+        if e.kind in ("WAIT", "SET") and e.channel not in _KNOWN_CHANNELS:
+            errors.append("[M6-UNKNOWN-CHANNEL] unknown sync channel: " + e.channel)
     # [M6-MISSING-X-FREE-WAIT]
     xload_mtes = [e for e in ev if e.kind == "MTE2" and e.t >= Vx]
     n_xfree_wait = sum(1 for e in ev if e.kind == "WAIT" and e.channel == "x_free")
