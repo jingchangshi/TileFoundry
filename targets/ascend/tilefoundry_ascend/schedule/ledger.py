@@ -26,10 +26,25 @@ from tilefoundry.ir.tir.stmts import Evaluate, ExecutionScope, For, If, LetStmt,
 
 #: TIR instruction class name -> [(operand index, mode)]; mode is "read" | "write".
 _ACTION_EFFECTS = {
+    # data movement
     "Vld": ((0, "read"), (1, "write")),
     "Vsts": ((0, "read"), (1, "write")),
     "GmToUb": ((0, "read"), (1, "write")),
     "UbToGm": ((0, "read"), (1, "write")),
+    # VF tasks: every register read/write is an access (so whole-VF tasks are visible)
+    "Vcadd": ((0, "read"), (1, "write")),
+    "Vcvt": ((0, "read"), (1, "read"), (2, "write")),
+    "Vmula": ((0, "read"), (1, "read"), (2, "read"), (3, "write")),
+    "Vadd": ((0, "read"), (1, "read"), (2, "read"), (3, "write")),
+    "Vmul": ((0, "read"), (1, "read"), (2, "read"), (3, "write")),
+    "Vdiv": ((0, "read"), (1, "read"), (2, "read"), (3, "write")),
+    "Vadds": ((0, "read"), (1, "read"), (2, "write")),
+    "Vmuls": ((0, "read"), (1, "read"), (2, "write")),
+    "Vsqrt": ((0, "read"), (1, "read"), (2, "write")),
+    "Vdup": ((0, "read"), (1, "write")),
+    "Vdupv": ((0, "read"), (1, "write")),
+    "Pset": ((0, "write"),),
+    "Pset16": ((0, "write"),),
 }
 
 
@@ -40,6 +55,7 @@ class LedgerError(ValueError):
 @dataclass(frozen=True)
 class LedgerEntry:
     action_id: str
+    instruction: str
     op: str
     root: str
     root_kind: str
@@ -48,6 +64,8 @@ class LedgerEntry:
     byte_footprint: int
     byte_offset: Optional[int]      # None == OFFSET_UNKNOWN
     logical_iteration: str
+    iteration_path: str
+    iteration_extent: str
     path: str
 
 
@@ -152,7 +170,9 @@ def extract_ledger(function) -> Ledger:
                 walk(child, path + (f"s{index}",), loops)
             return
         if isinstance(stmt, For):
-            walk(stmt.body, path + (f"for:{getattr(stmt.induction_var, 'name', 'i')}",), loops + (str(getattr(stmt.induction_var, "name", "i")),))
+            name = str(getattr(stmt.induction_var, "name", "i"))
+            extent = str(getattr(stmt, "stop", ""))
+            walk(stmt.body, path + (f"for:{name}",), loops + ((name, extent),))
             return
         if isinstance(stmt, (MeshScope, ExecutionScope)):
             walk(stmt.body, path + (type(stmt).__name__,), loops)
@@ -171,10 +191,22 @@ def extract_ledger(function) -> Ledger:
         if not isinstance(stmt, Evaluate):
             return
         op = stmt.callable
-        if isinstance(op, Call):
-            op = op.target
-        if isinstance(op, ScheduleOp):
-            op = op.op
+        seen_ops = set()
+        while True:
+            if isinstance(op, Var):
+                key = getattr(op, "name", None)
+                if key in seen_ops or key not in defs:
+                    break
+                seen_ops.add(key)
+                op = defs[key]
+                continue
+            if isinstance(op, Call):
+                op = op.target
+                continue
+            if isinstance(op, ScheduleOp):
+                op = op.op
+                continue
+            break
         if isinstance(op, Copy):
             name, effects = "copy", ((0, "read"), (1, "write"))
         elif isinstance(op, Fill):
@@ -200,6 +232,7 @@ def extract_ledger(function) -> Ledger:
             ledger.entries.append(
                 LedgerEntry(
                     action_id="/".join((ledger.function, *path, f"{name}:{operand}")),
+                    instruction="/".join((ledger.function, *path)),
                     op=name,
                     root=root,
                     root_kind=root_kind,
@@ -207,7 +240,9 @@ def extract_ledger(function) -> Ledger:
                     mode=mode,
                     byte_footprint=_shape_bytes(type_),
                     byte_offset=offset_of(arg),
-                    logical_iteration=(loops[-1] if loops else "outside"),
+                    logical_iteration=(loops[-1][0] if loops else "outside"),
+                    iteration_path="/".join(name for name, _ in loops) or "outside",
+                    iteration_extent=(loops[-1][1] if loops else "1"),
                     path="/".join(path),
                 )
             )
@@ -219,6 +254,7 @@ def extract_ledger(function) -> Ledger:
 @dataclass(frozen=True)
 class ProblemAccess:
     task: str
+    instruction: str
     root: str
     root_kind: str
     space: str
@@ -227,6 +263,8 @@ class ProblemAccess:
     byte_offset: Optional[int]
     offset_status: str  # "KNOWN" | "OFFSET_UNKNOWN"
     logical_iteration: str
+    iteration_path: str
+    iteration_extent: str
 
 
 @dataclass
@@ -256,6 +294,7 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
     accesses = [
         ProblemAccess(
             task=entry.action_id,
+            instruction=entry.instruction,
             root=entry.root,
             root_kind=entry.root_kind,
             space=entry.space,
@@ -264,6 +303,8 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
             byte_offset=entry.byte_offset,
             offset_status="KNOWN" if entry.byte_offset is not None else "OFFSET_UNKNOWN",
             logical_iteration=entry.logical_iteration,
+            iteration_path=entry.iteration_path,
+            iteration_extent=entry.iteration_extent,
         )
         for entry in ledger.entries
     ]

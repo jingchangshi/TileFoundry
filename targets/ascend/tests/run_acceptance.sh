@@ -161,6 +161,7 @@ run aiv56_ownership  "$PY" "$REPO/targets/ascend/tests/test_aiv56_ownership.py"
 run eps_runtime      "$PY" "$REPO/targets/ascend/tests/test_eps_runtime.py"
 run aiv56_tir        "$PY" "$REPO/targets/ascend/tests/test_aiv56_tir.py"
 run emission_ledger  "$PY" "$REPO/targets/ascend/tests/test_emission_ledger.py"
+run full_kernel_ledger "$PY" "$REPO/targets/ascend/tests/test_full_kernel_ledger.py"
 
 # (4) The legacy paths that must not regress, so a green M3 cannot come from
 # breaking CUDA or the copy lowering.
