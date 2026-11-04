@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Adapt I1's DtypeViewSpec objects into this spec's GmemRoot/OffsetView (READ-ONLY).
+"""Adapt I1's committed DtypeViewSpec into this spec's GmemRoot/OffsetView (READ-ONLY).
 
-Reports, for I1's REAL view objects, which of the five rules fire, and the two valid
-controls. Also reports where HIS validation and THIS spec DISAGREE, so the drift is visible
-rather than papered over. This never writes to his file and never mutates his classes.
+Reports per-case CONFORMANCE of the target-side validator against the Lead ruling
+(access-based overlap): each case says what this spec decides, what his validator decides,
+and whether they conform. Two scope gaps are expected and labelled (no generation, no
+element cap). This never writes to his file.
 
-Run: PYTHONPATH=tools/p3 python tools/p3/view_spec_target.py [path-to-dtype_view.py]
+Run: PYTHONPATH=tools/p3 python tools/p3/view_spec_target.py [path]
 """
 from __future__ import annotations
 
@@ -36,48 +37,45 @@ def adapt(view, generation=0) -> OffsetView:
 def main() -> int:
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_I1
     if not path.is_file():
-        print("no I1 dtype_view.py at", path); return 75
+        print("no dtype_view.py at", path); return 75
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
     i1 = load_i1(path)
     Spec = i1.DtypeViewSpec
     print("I1 dtype_view.py sha256:", sha)
-    print("(state: file is UNTRACKED in git; results are valid for THIS sha only)\n")
+    print("(committed at 81bf059; this run is valid for THIS sha only)\n")
 
     root = GmemRoot("buf", 0, 1024, generation=0)
     roots = {"buf": root}
     big_roots = {"big": GmemRoot("big", 0, 1 << 40, generation=0)}
 
-    def v(dtype, off, extent):
-        return Spec(root="buf", dtype=dtype, element_bytes=DTYPE_WIDTH[dtype],
+    def v(dtype, off, extent, access, root_name="buf", root_bytes=1024):
+        return Spec(root=root_name, dtype=dtype, element_bytes=DTYPE_WIDTH[dtype],
                     byte_offset=off, extent=extent, alignment=DTYPE_WIDTH[dtype],
-                    root_bytes=1024)
+                    root_bytes=root_bytes, access=access)
 
-    cases = []
-    # two valid controls
-    cases.append(("valid_full_bf16_to_f32", [v("f32", 0, 256)], {"0": "read"}, None, "read"))
-    cases.append(("valid_read_read_overlap_diff_dtype",
-                  [v("bf16", 0, 256), v("f32", 256, 64)], {"0": "read", "1": "read"}, None, "read"))
-    # five rules
-    cases.append(("misaligned", [v("f32", 2, 8)], {"0": "read"}, "VIEW_MISALIGNED_OFFSET", "read"))
-    cases.append(("range_exceeds_parent", [v("f32", 768, 128)], {"0": "read"},
-                  "VIEW_RANGE_OVERFLOWS_PARENT", "read"))
-    cases.append(("overlap_write_read_same_dtype",
-                  [v("bf16", 0, 256), v("bf16", 256, 128)], {"0": "write", "1": "read"},
-                  "VIEW_OVERLAP_INCOMPATIBLE", "read"))
-    extent_view = Spec(root="big", dtype="u8", element_bytes=1, byte_offset=0,
-                       extent=(1 << 32) + 1, alignment=1, root_bytes=1 << 40)
-    cases.append(("extent_overflow", [extent_view], {"0": "read"},
-                  "VIEW_EXTENT_OVERFLOW", "read"))
-    cases.append(("stale_after_realloc", [v("f32", 0, 8)], {"0": "read"},
-                  "VIEW_STALE_AFTER_REALLOC", "read_generation_1"))
+    extent_view = v("u8", 0, (1 << 32) + 1, "read", root_name="big", root_bytes=1 << 40)
 
-    print("%-34s %-34s %-22s %s" % ("case", "my rules on HIS objects", "his validate_view", "verdict"))
-    print("-" * 118)
+    cases = [
+        ("valid_full_bf16_to_f32", roots, [v("f32", 0, 256, "read")], {0: "read"}, None, 0),
+        ("valid_read_read_overlap_diff_dtype", roots,
+         [v("bf16", 0, 256, "read"), v("f32", 256, 64, "read")], {0: "read", 1: "read"}, None, 0),
+        ("misaligned", roots, [v("f32", 2, 8, "read")], {0: "read"}, "VIEW_MISALIGNED_OFFSET", 0),
+        ("range_exceeds_parent", roots, [v("f32", 768, 128, "read")], {0: "read"},
+         "VIEW_RANGE_OVERFLOWS_PARENT", 0),
+        ("overlap_write_read_same_dtype", roots,
+         [v("bf16", 0, 256, "write"), v("bf16", 256, 128, "read")], {0: "write", 1: "read"},
+         "VIEW_OVERLAP_INCOMPATIBLE", 0),
+        ("extent_overflow", big_roots, [extent_view], {0: "read"}, "VIEW_EXTENT_OVERFLOW", 0),
+        ("stale_after_realloc", roots, [v("f32", 0, 8, "read")], {0: "read"},
+         "VIEW_STALE_AFTER_REALLOC", 1),
+    ]
+
+    print("%-34s %-30s %-22s %s" % ("case", "my spec", "his validator", "conformance"))
+    print("-" * 112)
     fails = 0
-    for name, his_views, accesses, expected, mode in cases:
-        rts = big_roots if name == "extent_overflow" else roots
-        views = [adapt(x, 1 if mode == "read_generation_1" else 0) for x in his_views]
-        acc = {views[i].name: kind for i, kind in ((int(k), vv) for k, vv in accesses.items())}
+    for name, rts, his_views, access_map, expected, gen in cases:
+        views = [adapt(x, gen) for x in his_views]
+        acc = {views[i].name: kind for i, kind in access_map.items()}
         res = check(rts, views, acc)
         fired = sorted(r for r, m in res.items() if m)
         try:
@@ -87,36 +85,31 @@ def main() -> int:
             his = getattr(e, "reason", type(e).__name__)
         ok = (fired == [expected]) if expected else (not fired)
         fails += 0 if ok else 1
-        print("%-34s %-34s %-22s %s" % (name, fired or "[]", his, "PASS" if ok else "DRIFT/FAIL"))
-    print("-" * 118)
+        if name in ("extent_overflow", "stale_after_realloc"):
+            conf = "SCOPE GAP (spec/plan only)"
+        elif name == "overlap_write_read_same_dtype":
+            conf = "CONFORMS" if his == "overlapping-write" else "NON-CONFORMING"
+        elif name == "valid_read_read_overlap_diff_dtype":
+            conf = "CONFORMS" if his == "ACCEPT" else "NON-CONFORMING"
+        else:
+            conf = "n/a (single-view rule)"
+        print("%-34s %-30s %-22s %s" % (name, fired or "[]", his, conf))
+    print("-" * 112)
 
-    # explicit drift probes
-    print("\nDRIFT PROBES (my spec vs his validator):")
-    same = [v("bf16", 0, 256), v("bf16", 256, 128)]
-    try:
-        i1.validate_views(tuple(same)); his_same = "ACCEPT"
-    except Exception as e:  # noqa: BLE001
-        his_same = getattr(e, "reason", "error")
-    rr = [v("bf16", 0, 256), v("f32", 256, 64)]
-    try:
-        i1.validate_views(tuple(rr)); his_rr = "ACCEPT"
-    except Exception as e:  # noqa: BLE001
-        his_rr = getattr(e, "reason", "error")
-    print("  same-dtype overlapping W x R: my spec=FORBID, his=%s (NON-CONFORMING if ACCEPT)" % his_same)
-    print("  diff-dtype overlapping R x R: my spec=ALLOW, his=%s (NON-CONFORMING if rejected)" % his_rr)
-    # PINNING ASSERTIONS under the Lead ruling (access-based)
-    pin_same = [adapt(x) for x in same]
-    res_same = check(roots, pin_same, {pin_same[0].name: "write", pin_same[1].name: "read"})
-    if not res_same["VIEW_OVERLAP_INCOMPATIBLE"]:
-        print("  PIN FAIL: same-dtype W x R must be FORBIDDEN"); fails += 1
-    pin_rr = [adapt(x) for x in rr]
-    res_rr = check(roots, pin_rr, {pin_rr[0].name: "read", pin_rr[1].name: "read"})
-    if any(res_rr.values()):
-        print("  PIN FAIL: cross-dtype R x R must be ALLOWED"); fails += 1
-    if fails == 0:
-        print("  PINNING CASES: HOLD")
-    print("  allocation generation on his objects: ABSENT -> my STALE rule cannot be evaluated")
-    print("  count cap on his objects: ABSENT -> my EXTENT rule cannot be evaluated")
+    print("\nPINNING CASES (Lead ruling: access-based)")
+    same = [adapt(v("bf16", 0, 256, "write")), adapt(v("bf16", 256, 128, "read"))]
+    r_same = check(roots, same, {same[0].name: "write", same[1].name: "read"})
+    rr = [adapt(v("bf16", 0, 256, "read")), adapt(v("f32", 256, 64, "read"))]
+    r_rr = check(roots, rr, {rr[0].name: "read", rr[1].name: "read"})
+    pin_ok = bool(r_same["VIEW_OVERLAP_INCOMPATIBLE"]) and not any(r_rr.values())
+    print("  same-dtype overlapping W x R -> spec %s" %
+          ("FORBIDS" if r_same["VIEW_OVERLAP_INCOMPATIBLE"] else "ALLOWS"))
+    print("  cross-dtype overlapping R x R -> spec %s" %
+          ("FORBIDS" if any(r_rr.values()) else "ALLOWS"))
+    print("  PINNING CASES:", "HOLD" if pin_ok else "FAIL")
+    fails += 0 if pin_ok else 1
+    print("  allocation generation: his object carries NONE -> staleness is spec/plan only")
+    print("  element-count cap:     his object carries NONE -> extent is spec/plan only")
     return 0 if fails == 0 else 1
 
 

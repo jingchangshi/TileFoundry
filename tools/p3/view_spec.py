@@ -104,7 +104,11 @@ def _overlaps(views: list[OffsetView], roots: dict[str, GmemRoot],
 def alias_conflicts(views: list[OffsetView], accesses: dict[str, str]) -> list[tuple]:
     """Pairs of distinct views on one root whose ranges intersect with a write on either
     side. PUBLIC entry point for the P4 alias/plan checks, so the view contract and the
-    plan cannot drift apart."""
+    plan cannot drift apart.
+
+    BINDING-INDEPENDENT BY DESIGN: this takes only views and accesses and never asks where
+    a value is bound or how long it lives. Region/mesh scoping (e.g. "value escapes region
+    mesh") is a separate concern and must not be folded into the alias rule."""
     out = []
     for a in range(len(views)):
         for b in range(a + 1, len(views)):

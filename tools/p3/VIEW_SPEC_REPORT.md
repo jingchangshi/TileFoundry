@@ -103,22 +103,21 @@ Pinning cases (must hold forever):
   BOTH bf16, overlapping, one WRITE one READ      -> spec FORBIDS (VIEW_OVERLAP_INCOMPATIBLE)
   bf16 vs f32, overlapping, BOTH READ             -> spec ALLOWS
 
-Re-run status (updated). The original 7-case run was against sha 61a28adf and is NOT
-carried forward. I1 then changed the file; the re-run below is against sha
-b7d29757f763890f843937defe94056e661f3da1ecf927036d5ede021eb0bc6b (still UNTRACKED), and is
-valid only for that sha:
-  valid_full_bf16_to_f32              my [] = his ACCEPT                      CONFORMS
-  valid_read_read_overlap_diff_dtype  my [] = his ACCEPT                      CONFORMS (fixed)
-  misaligned                          VIEW_MISALIGNED_OFFSET = his misaligned  CONFORMS
-  range_exceeds_parent                VIEW_RANGE_OVERFLOWS_PARENT = his OOB    CONFORMS
-  extent_overflow                     VIEW_EXTENT_OVERFLOW = his ACCEPT        expected gap
-  stale_after_realloc                 VIEW_STALE_AFTER_REALLOC = his ACCEPT    expected gap
-  overlap_write_read_same_dtype       VIEW_OVERLAP_INCOMPATIBLE = his ACCEPT   NON-CONFORMING
-  => 7/7 matrix PASS; PINNING CASES HOLD in the spec.
-  => STILL NON-CONFORMING on same-dtype W x R: his validator ACCEPTs it. Root cause: his
-     DtypeViewSpec carries NO access/write field, so an access-based overlap rule cannot be
-     expressed at all. He needs an access kind on the view (or validate_views must take
-     accesses). Until then P4 must NOT rely on his validator for the write/read hazard.
+Re-run status (updated again). I1 COMMITTED dtype_view.py as 81bf059, sha256
+23560f6f27c99b1af89cfa659ba3fa2930a839a8f51f5ab186f01347022b06c7; this supersedes the
+untracked b7d29757 and its result is RETIRED. Per-case conformance against the committed sha:
+  valid_full_bf16_to_f32              spec [] / ACCEPT                     ok
+  valid_read_read_overlap_diff_dtype  spec [] / his ACCEPT                CONFORMS
+  misaligned                          VIEW_MISALIGNED_OFFSET / misaligned  CONFORMS
+  range_exceeds_parent                VIEW_RANGE_OVERFLOWS_PARENT / OOB    CONFORMS
+  overlap_write_read_same_dtype       VIEW_OVERLAP_INCOMPATIBLE /
+                                      his overlapping-write                CONFORMS
+  extent_overflow                     VIEW_EXTENT_OVERFLOW / his ACCEPT    SCOPE GAP (expected)
+  stale_after_realloc                 VIEW_STALE_AFTER_REALLOC / his ACCEPT SCOPE GAP (expected)
+Pinning cases HOLD: same-dtype W x R FORBIDDEN, cross-dtype R x R ALLOWED.
+I1's access field is REQUIRED with no default, so an undeclared write is impossible; his
+docstring now states it carries no GENERATION and no ELEMENT-COUNT CAP, which matches this
+spec's position that those two are spec/plan-level only.
 
 STALENESS and the ELEMENT-COUNT CAP remain spec/plan-level only: his object carries
 neither, so the target-side validator does not validate them; nothing may be read as target
@@ -131,3 +130,13 @@ I1's DtypeViewSpec carries neither field, so the target-side validator does not 
 them. Nothing here may be read as "the target validates staleness/count-limit"; those two
 rules are enforced only by this spec and (once wired) by P4. Stated so no claim outruns the
 evidence.
+
+
+## 6. Binding independence (do not conflate with the mesh-escape blocker)
+
+I1's next blocker is that the gmem_view VALUE ESCAPES the mesh region at finalize
+("value gmem_view escapes region mesh"). That is a SCOPING problem: where a value is bound
+and how long it lives, NOT whether the byte-range alias is sound. alias_conflicts(views,
+accesses) is therefore kept INDEPENDENT of any binding/scope: it takes views and accesses
+only, and never asks where a value is defined. Do not fold region scoping into the alias
+rule; they are different concerns with different evidence.
