@@ -7,6 +7,7 @@ from tilefoundry.inspection.printer_base import PythonPrinter
 from tilefoundry.ir.core import Call, Constant, Op, Tuple, Var
 from tilefoundry.ir.core.kinds import BinaryKind
 from tilefoundry.ir.core.module import Module, ModuleList
+from tilefoundry.ir.core.execution import execution_kind
 from tilefoundry.ir.core.param_def import collect_param_defs
 from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.ir.hir.tensor.slice import Slice
@@ -16,6 +17,7 @@ from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.shape import ShapeOf
 from tilefoundry.ir.tir.stmts import (
     Evaluate,
+    ExecutionScope,
     For,
     LetStmt,
     MeshScope,
@@ -240,6 +242,23 @@ class TirPrinter(PythonPrinter, StmtVisitor[list[str]], ExprVisitor[str]):
         self.context.push_mesh(stmt.mesh, self.visit(stmt.binding))
         lines.extend(self._body(stmt.body))
         self.context.pop_mesh()
+        return lines
+
+    def visit_ExecutionScope(self, stmt, ctx=None):
+        """An execution mode, printed as the with-block that enters it.
+
+        The kind is a registry name (``ascend.simdvf``) while the surface is one
+        identifier, so the printed line is resolved back through the declaration
+        rather than by splitting the name: a mode whose surface and name disagree
+        would otherwise print something that cannot reparse.
+        """
+        declared = execution_kind(stmt.kind)
+        if declared is None:
+            raise ValueError(
+                f"cannot print ExecutionScope {stmt.kind!r}: no declaration states it"
+            )
+        lines = [f"{self.indent}with T.{declared.surface}():"]
+        lines.extend(self._body(stmt.body))
         return lines
 
     def visit_For(self, stmt, ctx=None):

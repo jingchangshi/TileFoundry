@@ -12,6 +12,7 @@ from typing import Iterable
 
 from tilefoundry.inspection.tir_printer import TirPrinter
 from tilefoundry.ir.core import Expr, Op, Var, VerifyError
+from tilefoundry.ir.core.execution import declared_mask_width, is_structural
 from tilefoundry.ir.core.expr import Call, Constant
 from tilefoundry.ir.core.metadata import diagnostic_location
 from tilefoundry.ir.core.module import Module, ModuleList, resolve_symbol
@@ -567,6 +568,7 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: t
             return
         case LetStmt():
             verify_expression_placement(stmt.value, modes, where="ExecutionScope")
+            verify_allocation_placement(stmt.value, modes, _modes_used_by(fn))
             binders.uses(stmt.value, stmt)
             value_ty = ctx.type_of(stmt.value)
             if stmt.var.type != value_ty:
@@ -700,6 +702,8 @@ def verify_expression_placement(value, modes: tuple, *, where: str) -> None:
         if not isinstance(reachable, Call):
             continue
         target = reachable.target
+        if is_structural(target):
+            continue
         if _call_like(target):
             raise VerifyError(
                 f"call to {getattr(target, 'name', type(target).__name__)!r} inside "
@@ -708,6 +712,61 @@ def verify_expression_placement(value, modes: tuple, *, where: str) -> None:
                 "have yet; inline the computation instead"
             )
         verify_op_placement(target, modes, where=where)
+
+
+def _modes_used_by(fn) -> frozenset:
+    """Every execution mode this function enters, anywhere in its body."""
+    return frozenset(
+        stmt.kind for stmt in _iter_all_stmts(fn.body) if isinstance(stmt, ExecutionScope)
+    )
+
+
+def verify_allocation_placement(value, modes: tuple, enclosing: frozenset = frozenset()) -> None:
+    """Refuse a region-private allocation made outside the region that owns it.
+
+    A register value is private to its mode: it exists because the mode has a
+    register file, and it has no meaning in an issue stream that is not the vector
+    one. So an allocation of register storage *outside* the mode is not a
+    near-miss to be repaired later -- it is a buffer that should not exist, and a
+    later pass that hoists one "for reuse" would be manufacturing exactly the
+    value this rule forbids.
+
+    Checked at the allocation rather than at its uses because the allocation is
+    where the lifetime is decided. A use outside the region is then impossible
+    without also crossing the binding scope, which the binder check already
+    refuses.
+
+    The rule is stated relative to the modes *this function* enters, not to every
+    kind any loaded target declares. Register storage is not globally private: it
+    is private to a mode, and a program with no mode has none. Keying off the
+    registry instead would make one target program unverifiable because another
+    target happened to be imported into the same process, which is a property of
+    the process rather than of the program.
+    """
+    for reachable in collect_exprs(value) if isinstance(value, Expr) else ():
+        if not isinstance(reachable, Call):
+            continue
+        type_ = getattr(reachable, "type", None)
+        storage = getattr(type_, "storage", None)
+        if storage is None:
+            continue
+        for declared in declared_kinds():
+            if not declared.owns_storage(storage):
+                continue
+            if declared.name in modes or declared.name not in enclosing:
+                continue
+            holder = modes[-1] if modes else None
+            where = (
+                f"runs inside {holder!r}"
+                if holder is not None
+                else "runs outside every execution region"
+            )
+            raise VerifyError(
+                f"allocation of {storage.name.lower()} storage for "
+                f"{getattr(type_, 'shape', ())!s} {where}: {storage.name.lower()} is "
+                f"private to execution region {declared.name!r}, so it may only be "
+                "allocated inside that region"
+            )
 
 
 def verify_op_placement(op, modes: tuple, *, where: str = "execution region") -> None:
@@ -745,6 +804,16 @@ def verify_op_placement(op, modes: tuple, *, where: str = "execution region") ->
             f"{name}: this operation belongs inside execution region "
             f"{requirement.kind!r} but runs inside {modes[-1]!r}"
         )
+    declared = execution_kind(requirement.kind)
+    width = declared_mask_width(op)
+    if width is not None and declared is not None:
+        if width != declared.mask_width_bits:
+            raise VerifyError(
+                f"{name}: states element width {width} but execution region "
+                f"{declared.name!r} declares {declared.mask_width_bits}; an operation "
+                "addressing a different element width is addressing lanes this mode "
+                "does not have"
+            )
 
 
 def verify_evaluate_callable(callable_value, modes: tuple) -> None:

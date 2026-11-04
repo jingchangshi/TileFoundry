@@ -4671,12 +4671,6 @@ class WithPattern(ElementPattern):
         binding = item.optional_vars.id if isinstance(item.optional_vars, ast.Name) else None
         kind = _with_execution_kind(item.context_expr, context)
         if kind is not None and context.function is not None:
-            if context.function.dialect != "hir":
-                raise ParseError.from_node(
-                    node,
-                    context,
-                    f"{kind.surface} states an authored execution mode; it belongs in a hir function",
-                )
             if binding is not None:
                 raise ParseError.from_node(
                     node,
@@ -4750,6 +4744,12 @@ class WithPattern(ElementPattern):
             active_kind = context.function.state.execution_stack.pop()
             if active_kind is not kind:
                 raise ParseError.from_node(match.node, context, "Execution stack is unbalanced")
+            if context.function.dialect != "hir":
+                # The same surface, read back as the statement it lowers to. A
+                # TIR function has no yield and no region captures: it is a
+                # straight-line body in which the mode is a lexical scope, so the
+                # printed form reloads as the scope rather than as a region.
+                return runtime.ExecutionScope(kind=kind.name, body=children["body"])
             return WithPattern._construct_execution(match, children, context, kind, frame)
         mesh = children["mesh"]
         if not context.function.state.mesh_stack:

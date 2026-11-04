@@ -204,6 +204,34 @@ def declared_mask_width(op: Any) -> int | None:
     return value
 
 
+STRUCTURAL_MARKER = "structural_expression"
+"""Class attribute marking an operation as structure rather than computation.
+
+A shape, view, allocator or scalar-constant operation states what the program
+is laid out as, not what runs on an engine. Such an operation has no placement
+of its own: it is not that it may appear anywhere, it is that "inside a mode"
+does not describe it. Keeping that distinction explicit is what stops the rule
+from forcing dimensions and allocations to masquerade as vector instructions to
+get past the boundary.
+
+The subset is deliberately small and opt-in. An operation that says nothing is
+still refused inside a mode: silence is not a claim of harmlessness.
+"""
+
+
+def register_structural(*ops: type) -> tuple[type, ...]:
+    """Mark operations as structural expressions, admitted in any mode."""
+    for op in ops:
+        setattr(op, STRUCTURAL_MARKER, True)
+    return ops
+
+
+def is_structural(op: Any) -> bool:
+    """Whether *op* is declared structural rather than computational."""
+    declaration = op if isinstance(op, type) else type(op)
+    return getattr(declaration, STRUCTURAL_MARKER, False) is True
+
+
 __all__ = [
     "ExecutionKind",
     "Placement",
@@ -213,7 +241,10 @@ __all__ = [
     "declared_mask_width",
     "execution_kind",
     "execution_kind_for_surface",
+    "STRUCTURAL_MARKER",
     "execution_kind_of",
+    "is_structural",
     "register_execution_kind",
+    "register_structural",
     "region_requirement",
 ]
