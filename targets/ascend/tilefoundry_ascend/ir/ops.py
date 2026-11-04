@@ -199,6 +199,30 @@ class _VcvtSignature(Constraint):
         )
 
 
+class _VstsPack(Constraint):
+    """Tie the store's pack to the exact signature: carrier <-> PK_B32, f32 <-> no pack."""
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "field", "dtype")
+        object.__setattr__(self, "left", "src")
+        object.__setattr__(self, "right", "dst")
+
+    def holds(self, operands: dict) -> bool:
+        src = operands.get("src")
+        if src is None:
+            return False
+        pack = operands.get("pack")
+        if getattr(src, "storage", None) is StorageKind.CARRIER:
+            return getattr(src, "dtype", None) == DType.bf16 and pack == "PK_B32"
+        return pack is None
+
+    def written(self) -> str:
+        return (
+            "a carrier window store must state pack=PK_B32 and land in bf16 UB; a plain f32 "
+            "store states no pack"
+        )
+
+
 INSIDE = RegionRequirement(kind=SIMD_VF_KIND, placement="inside")
 OUTSIDE = RegionRequirement(kind=SIMD_VF_KIND, placement="outside")
 
@@ -258,10 +282,20 @@ class Vsts(Op):
     execution_mesh = _AIV
     execution_region = INSIDE
 
-    src = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
-    dst = ParamDef(kind="input", effect=WRITE, pattern=_IN_UB)
+    src = ParamDef(kind="input", effect=READ, pattern=_IN_VREG_OR_CARRIER)
+    # The reverse conversion path stores a bf16 carrier window into a bf16 UB tile, so the
+    # destination admits bf16 as well as f32 (the dtype constraint still forces src==dst).
+    dst = ParamDef(kind="input", effect=WRITE, pattern=_IN_UB_STAGE)
+    #: pack states how a carrier window is written back to UB. The reverse conversion
+    #: path packs two bf16 halves per 32-bit word (PK_B32); a plain f32 store states no
+    #: pack. An optional attribute checked by the rule below, so it cannot default.
+    pack = ParamDef(kind="attribute", annotation=str, optional=True, default=None)
 
-    between = (SameConstraint("shape", "src", "dst"), SameConstraint("dtype", "src", "dst"))
+    between = (
+        SameConstraint("shape", "src", "dst"),
+        SameConstraint("dtype", "src", "dst"),
+        _VstsPack(),
+    )
 
 
 @register_op(dialect="T", category="ascend", name="ascend_pset")
@@ -345,6 +379,194 @@ class Vcvt(Op):
     )
 
 
+@register_op(dialect="T", category="ascend", name="ascend_vmula")
+class Vmula(Op):
+    """Predicated FP32 multiply-accumulate into acc: acc = acc + a * b.
+
+    acc is READ|WRITE, not WRITE: an inactive lane keeps the value it carried into this
+    issue, which is what makes the predicate observable and what makes a chain of vmula
+    calls a loop-carried accumulation rather than a rename. The model is an UNFUSED
+    two-step FP32 multiply then add. Whether the native issue fuses the multiply and the
+    add (one rounding) is ASSUMED-UNKNOWN and UNSOURCED against the selected build: no
+    native credit is claimed, and the model states which one it implements.
+    """
+
+    capability = OpCapability(None)
+    execution_mesh = _AIV
+    execution_region = INSIDE
+
+    a = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
+    b = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
+    mask = ParamDef(kind="input", effect=READ, pattern=_IN_PREG)
+    acc = ParamDef(kind="input", effect=READ | WRITE, pattern=_IN_VREG)
+
+    between = (
+        SameConstraint("shape", "a", "b"),
+        SameConstraint("shape", "a", "acc"),
+        SameConstraint("dtype", "a", "b"),
+        SameConstraint("dtype", "a", "acc"),
+    )
+
+
+@register_op(dialect="T", category="ascend", name="ascend_vdup")
+class Vdup(Op):
+    """Broadcast one FP32 scalar into every ACTIVE lane of dst.
+
+    dst is READ|WRITE: an inactive lane keeps what it held, so the predicate is
+    observable here exactly as in vadd. The scalar is an instruction attribute in this
+    model (ABI: a Python float rendered into the TIR call), never a lane count.
+    """
+
+    capability = OpCapability(None)
+    execution_mesh = _AIV
+    execution_region = INSIDE
+
+    mask = ParamDef(kind="input", effect=READ, pattern=_IN_PREG)
+    dst = ParamDef(kind="input", effect=READ | WRITE, pattern=_IN_VREG)
+    value = ParamDef(kind="attribute", annotation=float)
+
+
+@register_op(dialect="T", category="ascend", name="ascend_vadds")
+class Vadds(Op):
+    """Predicated lane add of an FP32 scalar: dst = a + value on active lanes."""
+
+    capability = OpCapability(None)
+    execution_mesh = _AIV
+    execution_region = INSIDE
+
+    a = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
+    mask = ParamDef(kind="input", effect=READ, pattern=_IN_PREG)
+    dst = ParamDef(kind="input", effect=READ | WRITE, pattern=_IN_VREG)
+    value = ParamDef(kind="attribute", annotation=float)
+
+    between = (
+        SameConstraint("shape", "a", "dst"),
+        SameConstraint("dtype", "a", "dst"),
+    )
+
+
+@register_op(dialect="T", category="ascend", name="ascend_vmuls")
+class Vmuls(Op):
+    """Predicated lane multiply by an FP32 scalar: dst = a * value on active lanes."""
+
+    capability = OpCapability(None)
+    execution_mesh = _AIV
+    execution_region = INSIDE
+
+    a = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
+    mask = ParamDef(kind="input", effect=READ, pattern=_IN_PREG)
+    dst = ParamDef(kind="input", effect=READ | WRITE, pattern=_IN_VREG)
+    value = ParamDef(kind="attribute", annotation=float)
+
+    between = (
+        SameConstraint("shape", "a", "dst"),
+        SameConstraint("dtype", "a", "dst"),
+    )
+
+
+@register_op(dialect="T", category="ascend", name="ascend_vmul")
+class Vmul(Op):
+    """Predicated FP32 multiply: dst = a * b on active lanes."""
+
+    capability = OpCapability(None)
+    execution_mesh = _AIV
+    execution_region = INSIDE
+
+    a = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
+    b = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
+    mask = ParamDef(kind="input", effect=READ, pattern=_IN_PREG)
+    dst = ParamDef(kind="input", effect=READ | WRITE, pattern=_IN_VREG)
+
+    between = (
+        SameConstraint("shape", "a", "b"),
+        SameConstraint("shape", "a", "dst"),
+        SameConstraint("dtype", "a", "b"),
+        SameConstraint("dtype", "a", "dst"),
+    )
+
+
+@register_op(dialect="T", category="ascend", name="ascend_vsqrt")
+class Vsqrt(Op):
+    """Predicated FP32 square root: dst = sqrt(a). NOT a reciprocal-square-root.
+
+    The body needs rstd = 1 / sqrt(mean(x^2) + eps), written as an exact vsqrt followed by
+    an explicit vdiv, never as an rsqrt approximation. Whether the native sqrt is
+    correctly rounded is UNSOURCED; this model uses IEEE sqrt.
+    """
+
+    capability = OpCapability(None)
+    execution_mesh = _AIV
+    execution_region = INSIDE
+
+    a = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
+    mask = ParamDef(kind="input", effect=READ, pattern=_IN_PREG)
+    dst = ParamDef(kind="input", effect=READ | WRITE, pattern=_IN_VREG)
+
+    between = (SameConstraint("shape", "a", "dst"), SameConstraint("dtype", "a", "dst"))
+
+
+@register_op(dialect="T", category="ascend", name="ascend_vdiv")
+class Vdiv(Op):
+    """Predicated FP32 divide: dst = a / b on active lanes."""
+
+    capability = OpCapability(None)
+    execution_mesh = _AIV
+    execution_region = INSIDE
+
+    a = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
+    b = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
+    mask = ParamDef(kind="input", effect=READ, pattern=_IN_PREG)
+    dst = ParamDef(kind="input", effect=READ | WRITE, pattern=_IN_VREG)
+
+    between = (
+        SameConstraint("shape", "a", "b"),
+        SameConstraint("shape", "a", "dst"),
+        SameConstraint("dtype", "a", "b"),
+        SameConstraint("dtype", "a", "dst"),
+    )
+
+
+@register_op(dialect="T", category="ascend", name="ascend_vcadd")
+class Vcadd(Op):
+    """One step of a pairwise reduction tree: dst[i] = src[2i] + src[2i+1], i < lanes/2.
+
+    The reduction WIDTH is an explicit attribute (lanes), so the six source calls
+    64->32->16->8->4->2 are a real SSA chain and dropping one leaves a partial sum. This
+    model does NOT broadcast: only the first lanes/2 lanes of dst are written and the rest
+    keep their value, so a broadcast is an explicit ascend_vdupv (POS_LOWEST). The native
+    reduction tree and output layout are UNSOURCED / UNVALIDATED -- this is the software
+    model of the DECLARED shape of the reduction, not evidence about the hardware.
+    """
+
+    capability = OpCapability(None)
+    execution_mesh = _AIV
+    execution_region = INSIDE
+
+    src = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
+    dst = ParamDef(kind="input", effect=READ | WRITE, pattern=_IN_VREG)
+    lanes = ParamDef(kind="attribute", annotation=int)
+
+    between = (SameConstraint("shape", "src", "dst"), SameConstraint("dtype", "src", "dst"))
+
+
+@register_op(dialect="T", category="ascend", name="ascend_vdupv")
+class Vdupv(Op):
+    """Broadcast one LANE POSITION of src to every lane of dst (POS_LOWEST = position 0).
+
+    The broadcast a reduction needs is THIS explicit instruction, never baked into vcadd.
+    """
+
+    capability = OpCapability(None)
+    execution_mesh = _AIV
+    execution_region = INSIDE
+
+    src = ParamDef(kind="input", effect=READ, pattern=_IN_VREG)
+    dst = ParamDef(kind="input", effect=WRITE, pattern=_IN_VREG)
+    position = ParamDef(kind="attribute", annotation=int)
+
+    between = (SameConstraint("shape", "src", "dst"), SameConstraint("dtype", "src", "dst"))
+
+
 @register_op(dialect="T", category="ascend", name="ascend_vadd")
 class Vadd(Op):
     """Predicated lane add, instruction ``vadd``: active lanes take ``a + b``.
@@ -372,7 +594,7 @@ class Vadd(Op):
     )
 
 
-for _op in (GmToUb, UbToGm, Vld, Vsts, Pset, Pset16, Vcvt, Vadd):
+for _op in (GmToUb, UbToGm, Vld, Vsts, Pset, Pset16, Vcvt, Vadd, Vmula, Vdup, Vadds, Vmuls, Vmul, Vsqrt, Vdiv, Vcadd, Vdupv):
     register_access_relation(_op)(identity_relations)
 
 
@@ -413,6 +635,51 @@ def _infer_pset16(call, ctx):
 
 @register_typeinfer(Vcvt)
 def _infer_vcvt(call, ctx):
+    return UnitType()
+
+
+@register_typeinfer(Vmula)
+def _infer_vmula(call, ctx):
+    return UnitType()
+
+
+@register_typeinfer(Vdup)
+def _infer_vdup(call, ctx):
+    return UnitType()
+
+
+@register_typeinfer(Vadds)
+def _infer_vadds(call, ctx):
+    return UnitType()
+
+
+@register_typeinfer(Vmuls)
+def _infer_vmuls(call, ctx):
+    return UnitType()
+
+
+@register_typeinfer(Vmul)
+def _infer_vmul(call, ctx):
+    return UnitType()
+
+
+@register_typeinfer(Vsqrt)
+def _infer_vsqrt(call, ctx):
+    return UnitType()
+
+
+@register_typeinfer(Vdiv)
+def _infer_vdiv(call, ctx):
+    return UnitType()
+
+
+@register_typeinfer(Vcadd)
+def _infer_vcadd(call, ctx):
+    return UnitType()
+
+
+@register_typeinfer(Vdupv)
+def _infer_vdupv(call, ctx):
     return UnitType()
 
 
@@ -459,6 +726,98 @@ def _verify_pset16(call, ctx):
         )
     if dst.dtype != DType.bool:
         ctx.error(call, f"Pset16: dst must hold a predicate (bool), got {dst.dtype.name}")
+
+
+@register_verify_stmt(Vmula)
+def _verify_vmula(call, ctx):
+    a, b, mask, acc = (ctx.type_of(arg) for arg in call.args)
+    if mask.dtype != DType.bool:
+        ctx.error(call, f"Vmula: mask must be a predicate (bool), got {mask.dtype.name}")
+    if tuple(mask.shape) != tuple(a.shape):
+        ctx.error(call, f"Vmula: mask covers {tuple(mask.shape)} lanes but the data has {tuple(a.shape)}")
+    if b.shape != a.shape or b.dtype != a.dtype or acc.shape != a.shape or acc.dtype != a.dtype:
+        ctx.error(call, "Vmula: a, b and acc must have one shape and dtype")
+
+
+@register_verify_stmt(Vdup)
+def _verify_vdup(call, ctx):
+    mask, dst = (ctx.type_of(arg) for arg in call.args)
+    if mask.dtype != DType.bool:
+        ctx.error(call, f"Vdup: mask must be a predicate (bool), got {mask.dtype.name}")
+    if tuple(mask.shape) != tuple(dst.shape):
+        ctx.error(call, f"Vdup: mask covers {tuple(mask.shape)} lanes but dst has {tuple(dst.shape)}")
+    if isinstance(call.target.value, bool) or not isinstance(call.target.value, (int, float)):
+        ctx.error(call, f"Vdup: value must be a real scalar, got {call.target.value!r}")
+
+
+@register_verify_stmt(Vadds)
+def _verify_vadds(call, ctx):
+    a, mask, dst = (ctx.type_of(arg) for arg in call.args)
+    if mask.dtype != DType.bool or tuple(mask.shape) != tuple(a.shape):
+        ctx.error(call, "Vadds: the mask must be a bool predicate covering the data lanes")
+    if dst.shape != a.shape or dst.dtype != a.dtype:
+        ctx.error(call, "Vadds: dst must match a")
+    if isinstance(call.target.value, bool) or not isinstance(call.target.value, (int, float)):
+        ctx.error(call, f"Vadds: value must be a real scalar, got {call.target.value!r}")
+
+
+@register_verify_stmt(Vmuls)
+def _verify_vmuls(call, ctx):
+    a, mask, dst = (ctx.type_of(arg) for arg in call.args)
+    if mask.dtype != DType.bool or tuple(mask.shape) != tuple(a.shape):
+        ctx.error(call, "Vmuls: the mask must be a bool predicate covering the data lanes")
+    if dst.shape != a.shape or dst.dtype != a.dtype:
+        ctx.error(call, "Vmuls: dst must match a")
+    if isinstance(call.target.value, bool) or not isinstance(call.target.value, (int, float)):
+        ctx.error(call, f"Vmuls: value must be a real scalar, got {call.target.value!r}")
+
+
+def _check_binary_mask(call, ctx, a, b, mask, dst, label):
+    if mask.dtype != DType.bool or tuple(mask.shape) != tuple(a.shape):
+        ctx.error(call, f"{label}: the mask must be a bool predicate covering the data lanes")
+    if b.shape != a.shape or b.dtype != a.dtype or dst.shape != a.shape or dst.dtype != a.dtype:
+        ctx.error(call, f"{label}: a, b and dst must have one shape and dtype")
+
+
+@register_verify_stmt(Vmul)
+def _verify_vmul(call, ctx):
+    a, b, mask, dst = (ctx.type_of(arg) for arg in call.args)
+    _check_binary_mask(call, ctx, a, b, mask, dst, "Vmul")
+
+
+@register_verify_stmt(Vdiv)
+def _verify_vdiv(call, ctx):
+    a, b, mask, dst = (ctx.type_of(arg) for arg in call.args)
+    _check_binary_mask(call, ctx, a, b, mask, dst, "Vdiv")
+
+
+@register_verify_stmt(Vsqrt)
+def _verify_vsqrt(call, ctx):
+    a, mask, dst = (ctx.type_of(arg) for arg in call.args)
+    if mask.dtype != DType.bool or tuple(mask.shape) != tuple(a.shape):
+        ctx.error(call, "Vsqrt: the mask must be a bool predicate covering the data lanes")
+    if dst.shape != a.shape or dst.dtype != a.dtype:
+        ctx.error(call, "Vsqrt: dst must match a")
+
+
+@register_verify_stmt(Vcadd)
+def _verify_vcadd(call, ctx):
+    src, dst = (ctx.type_of(arg) for arg in call.args)
+    lanes = call.target.lanes
+    if isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 2 or lanes > 64 or lanes & (lanes - 1):
+        ctx.error(call, f"Vcadd: lanes must be a power of two in [2, 64], got {lanes!r}")
+    if dst.shape != src.shape or dst.dtype != src.dtype:
+        ctx.error(call, "Vcadd: dst must match src")
+
+
+@register_verify_stmt(Vdupv)
+def _verify_vdupv(call, ctx):
+    src, dst = (ctx.type_of(arg) for arg in call.args)
+    position = call.target.position
+    if isinstance(position, bool) or not isinstance(position, int) or not 0 <= position < 64:
+        ctx.error(call, f"Vdupv: position must be an int lane in [0, 64), got {position!r}")
+    if dst.shape != src.shape or dst.dtype != src.dtype:
+        ctx.error(call, "Vdupv: dst must match src")
 
 
 @register_verify_stmt(Vadd)
@@ -529,6 +888,75 @@ def _eval_vcvt(ctx):
 def _eval_pset16(ctx):
     shape = tuple(ctx.result_type.shape)
     return TensorValue(data=torch.ones(shape, dtype=torch.bool), type=ctx.result_type)
+
+
+@register_schedule_eval(Vmula)
+def _eval_vmula(ctx):
+    a, b, mask, acc = (value.data for value in ctx.args)
+    active = mask.to(torch.bool)
+    # UNFUSED model: multiply rounds, then add rounds. Native FMA fusion ASSUMED-UNKNOWN.
+    return TensorValue(data=torch.where(active, acc + a * b, acc), type=ctx.result_type)
+
+
+@register_schedule_eval(Vdup)
+def _eval_vdup(ctx):
+    mask, dst = (value.data for value in ctx.args)
+    active = mask.to(torch.bool)
+    filled = torch.full_like(dst, float(ctx.op.value))
+    return TensorValue(data=torch.where(active, filled, dst), type=ctx.result_type)
+
+
+@register_schedule_eval(Vadds)
+def _eval_vadds(ctx):
+    a, mask, dst = (value.data for value in ctx.args)
+    active = mask.to(torch.bool)
+    return TensorValue(data=torch.where(active, a + float(ctx.op.value), dst), type=ctx.result_type)
+
+
+@register_schedule_eval(Vmuls)
+def _eval_vmuls(ctx):
+    a, mask, dst = (value.data for value in ctx.args)
+    active = mask.to(torch.bool)
+    return TensorValue(data=torch.where(active, a * float(ctx.op.value), dst), type=ctx.result_type)
+
+
+@register_schedule_eval(Vmul)
+def _eval_vmul(ctx):
+    a, b, mask, dst = (value.data for value in ctx.args)
+    active = mask.to(torch.bool)
+    return TensorValue(data=torch.where(active, a * b, dst), type=ctx.result_type)
+
+
+@register_schedule_eval(Vdiv)
+def _eval_vdiv(ctx):
+    a, b, mask, dst = (value.data for value in ctx.args)
+    active = mask.to(torch.bool)
+    return TensorValue(data=torch.where(active, a / b, dst), type=ctx.result_type)
+
+
+@register_schedule_eval(Vsqrt)
+def _eval_vsqrt(ctx):
+    a, mask, dst = (value.data for value in ctx.args)
+    active = mask.to(torch.bool)
+    return TensorValue(data=torch.where(active, torch.sqrt(a), dst), type=ctx.result_type)
+
+
+@register_schedule_eval(Vcadd)
+def _eval_vcadd(ctx):
+    src, dst = (value.data for value in ctx.args)
+    n = int(ctx.op.lanes)
+    half = n // 2
+    out = dst.clone()
+    # Pairwise reduction of the DECLARED width only. No broadcast here.
+    out[:half] = src[0:n:2] + src[1:n:2]
+    return TensorValue(data=out, type=ctx.result_type)
+
+
+@register_schedule_eval(Vdupv)
+def _eval_vdupv(ctx):
+    src, dst = (value.data for value in ctx.args)
+    position = int(ctx.op.position)
+    return TensorValue(data=torch.full_like(dst, src[position]), type=ctx.result_type)
 
 
 @register_schedule_eval(Vadd)
