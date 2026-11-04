@@ -326,7 +326,23 @@ def main(argv=None) -> int:
 
     artifact = Path(args.artifact).resolve()
     if not artifact.is_file():
+        # A refusal emits a report on every path, so a caller can tell WHY it
+        # was refused without parsing stderr. The alternative -- prose on stderr
+        # for one refusal and JSON for another -- makes the reason unreadable to
+        # exactly the automated checks that need to read it.
+        report = {
+            "tool": "check_copy_slice",
+            "generated_at": _now(),
+            "requested": {"source": str(artifact), "entry": args.entry},
+            "status": "ERROR",
+            "exit_code": ERROR,
+            "error": "no such artifact: " + str(artifact),
+        }
+        text = json.dumps(report, indent=2)
+        print(text)
         print("check_copy_slice: error: no such artifact: " + str(artifact), file=sys.stderr)
+        if args.out:
+            Path(args.out).write_text(text + "\n", encoding="utf-8")
         return ERROR
 
     # The caller names a source AND an entry, and the check runs against

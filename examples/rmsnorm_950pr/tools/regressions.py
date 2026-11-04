@@ -232,6 +232,90 @@ def check_m2b_copy(scratch: Path) -> dict:
     return record
 
 
+def _ran_to_completion(record: dict) -> bool:
+    """Whether the command actually ran and exited, as opposed to never starting.
+
+    run_command returns an exit_code only on the completed path. A launch
+    failure (FileNotFoundError) carries status ERROR and no exit_code; a
+    timeout carries status FAIL with an error and also no exit_code. Neither
+    is a refusal by the tool under test -- nothing was asked of it.
+    """
+    return record.get("exit_code") is not None and not record.get("error")
+
+
+def _emitted_report(record: dict) -> dict | None:
+    """The JSON report the tool printed, or None if it did not print one.
+
+    The tool writes the report to stdout on the success path. A refusal prints
+    its report there too, so the marker is read from the field that is
+    actually populated rather than from one that never is.
+    """
+    text = record.get("stdout") or ""
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        parsed = json.loads(text[start:])
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _classify_refusal(record: dict, expected_exit: int = 2) -> dict:
+    """Decide whether this record is a GENUINE refusal, and say why.
+
+    Three outcomes are distinguished, because collapsing them is how a guard
+    passes for the wrong reason:
+
+        refused        ran to completion, exited with the expected code, and
+                       its report states no substitution
+        not_run        never started, or timed out: nothing was refused
+        accepted       ran, but exited 0 or reported a substitution
+
+    A launch failure and a timeout are NOT refusals. Treating "did not exit 0"
+    as refusal makes every broken harness look like a passing guard.
+    """
+    if not _ran_to_completion(record):
+        return {
+            "outcome": "not_run",
+            "reason": record.get("error") or "no exit code: the process did not complete",
+        }
+    exit_code = record.get("exit_code")
+    if exit_code == 0:
+        return {"outcome": "accepted", "reason": "exited 0, so nothing was refused"}
+    if exit_code != expected_exit:
+        return {
+            "outcome": "wrong_exit",
+            "reason": "exited %s, expected %d for this refusal" % (exit_code, expected_exit),
+        }
+    report = _emitted_report(record)
+    if report is None:
+        return {
+            "outcome": "wrong_exit",
+            "reason": "refused without an emitted report, so the reason cannot be checked",
+        }
+    # A refusal must actually name the problem, not merely fail. The tool has
+    # two refusal reasons and each is pinned; anything else is not a refusal
+    # this guard accepts as evidence.
+    error_text = str(report.get("error") or "")
+    if not any(
+        marker in error_text
+        for marker in ("no registered case for", "no such artifact")
+    ):
+        return {
+            "outcome": "wrong_exit",
+            "reason": "refused for an unstated or unrelated reason: " + (error_text[:120] or "<empty>"),
+        }
+    if report.get("delegated_to_default_case") is not None or report.get(
+        "delegated_from"
+    ) is not None:
+        return {
+            "outcome": "accepted",
+            "reason": "refused, but the report shows a substitution happened anyway",
+        }
+    return {"outcome": "refused", "reason": error_text[:120]}
+
+
 def check_no_silent_fallback() -> dict:
     """check_copy_slice.py refuses an unregistered source/entry instead of
     reporting the default artifact's verdict.
@@ -240,7 +324,16 @@ def check_no_silent_fallback() -> dict:
     custom case and then forward the DEFAULT artifact anyway, so a caller who
     named a source that was not registered still got exit 0 and a PASS about
     copy_slice.py. A verdict about a program the caller never named is worse
-    than no verdict, so the refusal is now asserted rather than assumed.
+    than no verdict.
+
+    Two ways this guard could pass without proving anything, both closed:
+
+      * reading a field that is never populated (the marker is in `stdout`),
+      * treating "did not exit 0" as a refusal, which counts a launch failure
+        or a timeout as a pass.
+
+    Both controls are permanent cases below, so a future edit that
+    reintroduces either one fails here instead of silently passing.
     """
     tool = TOOLS_DIR / "check_copy_slice.py"
     if not tool.is_file():
@@ -251,8 +344,7 @@ def check_no_silent_fallback() -> dict:
         }
 
     real = REPO_ROOT / "examples/rmsnorm_950pr/copy_slice.py"
-    cases = [
-        # (label, argv, expected non-zero because)
+    requests = [
         (
             "absent_entry",
             [str(real), "NotARealEntry"],
@@ -272,30 +364,96 @@ def check_no_silent_fallback() -> dict:
 
     results = {}
     ok = True
-    for label, argv, why in cases:
+    for label, argv, why in requests:
         record = run_command(
             "fallback_" + label,
             [PYTHON, str(tool)] + argv,
             timeout=300.0,
         )
-        refused = record.get("exit_code") != 0
-        # A refusal that passed the default artifact would still be a silent
-        # fallback, so the emitted report is read for the fallback marker too.
-        fell_back = "delegated_to_default_case" in (
-            record.get("stdout_tail") or ""
-        )
+        verdict = _classify_refusal(record)
         results[label] = {
             "argv": argv,
             "expectation": why,
             "exit_code": record.get("exit_code"),
-            "refused": refused,
-            "fell_back_to_default": fell_back,
+            "outcome": verdict["outcome"],
+            "detail": verdict["reason"],
         }
-        ok = ok and refused and not fell_back
+        ok = ok and verdict["outcome"] == "refused"
+
+    # --- permanent controls: the guard itself must reject these -------------
+    # Each is a record shaped like a way the guard could be fooled. The guard
+    # is applied to them directly; a control "passes" when the guard REFUSES to
+    # call it a refusal.
+    controls = {
+        "fell_back_despite_exit_2": (
+            {
+                "status": "COMPLETED",
+                "exit_code": 2,
+                "stdout": json.dumps(
+                    {
+                        "status": "PASS",
+                        "delegated_to_default_case": True,
+                        "error": "no registered case for x:y",
+                    }
+                ),
+                "stderr": "",
+            },
+            "a refusal that substituted the default artifact anyway",
+        ),
+        "launch_failure": (
+            {
+                "status": "ERROR",
+                "error": "interpreter not found: /nope/python",
+                "stdout": "",
+                "stderr": "",
+            },
+            "the process never started, so nothing was refused",
+        ),
+        "timeout": (
+            {
+                "status": "FAIL",
+                "error": "timed out after 300.0s",
+                "stdout": "",
+                "stderr": "",
+            },
+            "the process did not finish, so nothing was refused",
+        ),
+        "accepted_exit_zero": (
+            {"status": "COMPLETED", "exit_code": 0, "stdout": "{}", "stderr": ""},
+            "exited 0, so it accepted the request",
+        ),
+        "wrong_exit_code": (
+            {
+                "status": "COMPLETED",
+                "exit_code": 1,
+                "stdout": json.dumps({"error": "no registered case for x:y"}),
+                "stderr": "",
+            },
+            "refused with the wrong exit code",
+        ),
+        "refused_without_an_emitted_report": (
+            {"status": "COMPLETED", "exit_code": 2, "stdout": "", "stderr": "boom"},
+            "refused without stating why",
+        ),
+    }
+
+    control_results = {}
+    for label, (record, why) in controls.items():
+        verdict = _classify_refusal(record)
+        # The control is satisfied when the guard does NOT call it a refusal.
+        rejected = verdict["outcome"] != "refused"
+        control_results[label] = {
+            "why_this_is_not_a_refusal": why,
+            "guard_said": verdict["outcome"],
+            "detail": verdict["reason"],
+            "guard_rejected_it": rejected,
+        }
+        ok = ok and rejected
 
     return {
         "check": "no_silent_fallback",
         "cases": results,
+        "guard_controls": control_results,
         "status": "PASS" if ok else "FAIL",
         "exit_code": PASS if ok else FAIL,
     }
