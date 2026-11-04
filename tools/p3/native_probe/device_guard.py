@@ -82,6 +82,14 @@ class DeviceWindow:
             raise GuardError("DEVICE_AUTH_MISSING", "TF_DEVICE_AUTH=1 is required for this invocation")
         if os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").strip() != "0":
             raise GuardError("DEVICE_ID_MISMATCH", "ASCEND_RT_VISIBLE_DEVICES must be 0")
+        self.out.mkdir(parents=True, exist_ok=True)
+        if os.environ.get("TF_DEVICE_LOCK_HELD", "").strip() == "1":
+            # ONE holder per run: the parent shell (run_all_cases.sh or the 03-20 wrapper)
+            # holds the canonical flock. A child must NOT take a second lock.
+            self.report["lock_held_by_parent"] = True
+            self.report["lock"] = str(LOCK) + " (held by parent)"
+            self._snapshot("npu-smi.before.txt")
+            return self
         import fcntl
         self.fh = LOCK.open("a+")
         try:
@@ -90,7 +98,7 @@ class DeviceWindow:
             self.fh.close(); self.fh = None
             raise GuardError("DEVICE_LOCK_HELD",
                              "another team measurement job holds %s; do NOT enter" % LOCK) from exc
-        self.out.mkdir(parents=True, exist_ok=True)
+        self.report["lock_held_by_parent"] = False
         self._snapshot("npu-smi.before.txt")
         return self
 
