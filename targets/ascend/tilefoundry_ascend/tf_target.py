@@ -4,6 +4,11 @@ Registered as a first-class Target so normal spec/target discovery, fact
 projection and the schedule-finalize path can consume it. Storage names reuse
 the existing StorageKind vocabulary (gmem/smem/rmem) so TF type and allocation
 analyses keep working without a parallel space enum.
+
+Scope of this declaration: it states AIV-only synchronous execution and coarse
+spatial ownership. It does not model AIC reachability, VF register classes,
+PREG/VREG escape rules, or MTE issue/completion; those are separate P1/P2
+obligations.
 """
 from __future__ import annotations
 
@@ -26,20 +31,31 @@ from tilefoundry.target.facts import (
 )
 from tilefoundry.utils.python_source import PythonExpr
 
+DEFAULT_AIV = 56
+DEFAULT_AIC = 28
 UB_BYTES = 256 * 1024
-VREG_BYTES = 256
 
 
 @register_target
 @dataclass(frozen=True)
 class Ascend950PRTarget(Target):
-    """Ascend950PR device: 56 AIV / 28 AIC, GM + UB + VREG/PREG."""
+    """Ascend950PR device: AIV execution domain, GM + UB + register file."""
 
     name = "ascend950pr"
-    aiv_count: int = 56
-    aic_count: int = 28
+    aiv_count: int = DEFAULT_AIV
+    aic_count: int = DEFAULT_AIC
+
+    def __post_init__(self) -> None:
+        for field_name in ("aiv_count", "aic_count"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(
+                    f"Ascend950PRTarget: {field_name} must be a positive int, got {value!r}"
+                )
 
     def _topology(self) -> TopologyFacts:
+        # AIV first because it is the only admitted execution level here; AIC is
+        # a sibling engine, not a nested level under AIV.
         return TopologyFacts(
             (
                 TopologyLevelFacts("aiv", self.aiv_count, self.aiv_count, from_target=True),
@@ -53,7 +69,9 @@ class Ascend950PRTarget(Target):
             explicit_levels=(
                 ExplicitMemoryLevelFacts("gmem", None, "target", TARGET_MEMORY_OWNER),
                 ExplicitMemoryLevelFacts("smem", UB_BYTES, "aiv", "aiv"),
-                ExplicitMemoryLevelFacts("rmem", VREG_BYTES, "aiv", "aiv"),
+                # Aggregate register-file capacity is not sourced yet. 256 B is
+                # one vector register's width, not the per-AIV register budget.
+                ExplicitMemoryLevelFacts("rmem", None, "aiv", "aiv"),
             ),
             implicit_levels=(
                 ImplicitMemoryLevelFacts("l2", None, "target"),
@@ -77,9 +95,15 @@ class Ascend950PRTarget(Target):
 
     def to_python(self) -> PythonExpr:
         if type(self) is Ascend950PRTarget:
+            fields = []
+            if self.aiv_count != DEFAULT_AIV:
+                fields.append(f"aiv_count={self.aiv_count}")
+            if self.aic_count != DEFAULT_AIC:
+                fields.append(f"aic_count={self.aic_count}")
+            args = ", ".join(fields)
             return PythonExpr(
                 ("from tilefoundry_ascend.tf_target import Ascend950PRTarget",),
-                "Ascend950PRTarget()",
+                f"Ascend950PRTarget({args})",
             )
         return super().to_python()
 
