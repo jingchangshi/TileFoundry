@@ -55,25 +55,32 @@ def main() -> int:
 
     extent_view = v("u8", 0, (1 << 32) + 1, "read", root_name="big", root_bytes=1 << 40)
 
+    # (name, roots, his_views, access_map, spec_rule, generation, REQUIRED target outcome)
+    # The REQUIRED outcome is the Lead ruling restated as an assertion about HIS validator.
+    # None means "no target-side requirement for this row" (single-view rules and the two
+    # declared scope gaps), and is printed as such rather than counted as conforming.
     cases = [
-        ("valid_full_bf16_to_f32", roots, [v("f32", 0, 256, "read")], {0: "read"}, None, 0),
+        ("valid_full_bf16_to_f32", roots, [v("f32", 0, 256, "read")], {0: "read"}, None, 0, None),
         ("valid_read_read_overlap_diff_dtype", roots,
-         [v("bf16", 0, 256, "read"), v("f32", 256, 64, "read")], {0: "read", 1: "read"}, None, 0),
-        ("misaligned", roots, [v("f32", 2, 8, "read")], {0: "read"}, "VIEW_MISALIGNED_OFFSET", 0),
+         [v("bf16", 0, 256, "read"), v("f32", 256, 64, "read")], {0: "read", 1: "read"}, None, 0,
+         "ACCEPT"),
+        ("misaligned", roots, [v("f32", 2, 8, "read")], {0: "read"}, "VIEW_MISALIGNED_OFFSET", 0,
+         None),
         ("range_exceeds_parent", roots, [v("f32", 768, 128, "read")], {0: "read"},
-         "VIEW_RANGE_OVERFLOWS_PARENT", 0),
+         "VIEW_RANGE_OVERFLOWS_PARENT", 0, None),
         ("overlap_write_read_same_dtype", roots,
          [v("bf16", 0, 256, "write"), v("bf16", 256, 128, "read")], {0: "write", 1: "read"},
-         "VIEW_OVERLAP_INCOMPATIBLE", 0),
-        ("extent_overflow", big_roots, [extent_view], {0: "read"}, "VIEW_EXTENT_OVERFLOW", 0),
+         "VIEW_OVERLAP_INCOMPATIBLE", 0, "overlapping-write"),
+        ("extent_overflow", big_roots, [extent_view], {0: "read"}, "VIEW_EXTENT_OVERFLOW", 0, None),
         ("stale_after_realloc", roots, [v("f32", 0, 8, "read")], {0: "read"},
-         "VIEW_STALE_AFTER_REALLOC", 1),
+         "VIEW_STALE_AFTER_REALLOC", 1, None),
     ]
 
     print("%-34s %-30s %-22s %s" % ("case", "my spec", "his validator", "conformance"))
     print("-" * 112)
     fails = 0
-    for name, rts, his_views, access_map, expected, gen in cases:
+    nonconforming = []
+    for name, rts, his_views, access_map, expected, gen, expect_target in cases:
         views = [adapt(x, gen) for x in his_views]
         acc = {views[i].name: kind for i, kind in access_map.items()}
         res = check(rts, views, acc)
@@ -85,16 +92,28 @@ def main() -> int:
             his = getattr(e, "reason", type(e).__name__)
         ok = (fired == [expected]) if expected else (not fired)
         fails += 0 if ok else 1
-        if name in ("extent_overflow", "stale_after_realloc"):
-            conf = "SCOPE GAP (spec/plan only)"
-        elif name == "overlap_write_read_same_dtype":
-            conf = "CONFORMS" if his == "overlapping-write" else "NON-CONFORMING"
-        elif name == "valid_read_read_overlap_diff_dtype":
-            conf = "CONFORMS" if his == "ACCEPT" else "NON-CONFORMING"
+        if expect_target is None:
+            # Declared as NOT checked here (single-view rule, or the two scope gaps stated in
+            # the I1 module docstring). Printed, never silently counted as CONFORMS.
+            conf = ("SCOPE-GAP"
+                    if name in ("extent_overflow", "stale_after_realloc")
+                    else "N/A-SINGLE-VIEW")
+        elif his == expect_target:
+            conf = "CONFORMS"
         else:
-            conf = "n/a (single-view rule)"
+            # AUDIT HOLE FIXED: a non-conforming target is a FAILURE of this cross-check, so
+            # it must move the exit code. Printing NON-CONFORMING and exiting 0 would let a
+            # wrong target validator (or a later regression in the real one) pass unnoticed.
+            conf = "NON-CONFORMING"
+            nonconforming.append("%s: target said %r, Lead ruling requires %r"
+                                 % (name, his, expect_target))
+            fails += 1
         print("%-34s %-30s %-22s %s" % (name, fired or "[]", his, conf))
     print("-" * 112)
+    print("target conformance is part of THIS exit code: %d NON-CONFORMING row(s)"
+          % len(nonconforming))
+    for line in nonconforming:
+        print("  NON-CONFORMING:", line)
 
     print("\nPINNING CASES (Lead ruling: access-based)")
     same = [adapt(v("bf16", 0, 256, "write")), adapt(v("bf16", 256, 128, "read"))]
@@ -110,6 +129,8 @@ def main() -> int:
     fails += 0 if pin_ok else 1
     print("  allocation generation: his object carries NONE -> staleness is spec/plan only")
     print("  element-count cap:     his object carries NONE -> extent is spec/plan only")
+    print("\nOVERALL:", "PASS (every checked row conforms)" if fails == 0
+          else "FAIL (%d failed row(s), including %d NON-CONFORMING)" % (fails, len(nonconforming)))
     return 0 if fails == 0 else 1
 
 

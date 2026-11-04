@@ -82,25 +82,6 @@ def _tags(root: GmemRoot, view: OffsetView) -> list[str]:
     return tags
 
 
-def _overlaps(views: list[OffsetView], roots: dict[str, GmemRoot],
-              accesses: dict[str, str]) -> list[str]:
-    """Incompatible aliasing: distinct views on one root whose ranges intersect and
-    where at least one side writes. read/read is compatible."""
-    tags = []
-    for a in range(len(views)):
-        for b in range(a + 1, len(views)):
-            va, vb = views[a], views[b]
-            if va.root != vb.root:
-                continue
-            ra, rb = roots[va.root], roots[vb.root]
-            sa, ea = ra.base_byte + va.byte_offset, ra.base_byte + va.byte_offset + va.byte_length
-            sb, eb = rb.base_byte + vb.byte_offset, rb.base_byte + vb.byte_offset + vb.byte_length
-            if sa < eb and sb < ea:  # intersect
-                if accesses.get(va.name) == "write" or accesses.get(vb.name) == "write":
-                    tags.append("VIEW_OVERLAP_INCOMPATIBLE")
-    return tags
-
-
 def alias_conflicts(views: list[OffsetView], accesses: dict[str, str]) -> list[tuple]:
     """Pairs of distinct views on one root whose ranges intersect with a write on either
     side. PUBLIC entry point for the P4 alias/plan checks, so the view contract and the
@@ -108,7 +89,12 @@ def alias_conflicts(views: list[OffsetView], accesses: dict[str, str]) -> list[t
 
     BINDING-INDEPENDENT BY DESIGN: this takes only views and accesses and never asks where
     a value is bound or how long it lives. Region/mesh scoping (e.g. "value escapes region
-    mesh") is a separate concern and must not be folded into the alias rule."""
+    mesh") is a separate concern and must not be folded into the alias rule.
+
+    THIS IS THE ONLY OVERLAP IMPLEMENTATION IN THIS MODULE. check() delegates every
+    overlap decision here; there is deliberately no second range-intersection loop, so the
+    view contract and the plan checks cannot drift apart. A caller that needs a different
+    answer must change this function, not add a parallel one."""
     out = []
     for a in range(len(views)):
         for b in range(a + 1, len(views)):
@@ -125,12 +111,19 @@ def alias_conflicts(views: list[OffsetView], accesses: dict[str, str]) -> list[t
 
 def check(roots: dict[str, GmemRoot], views: list[OffsetView],
           accesses: dict[str, str]) -> dict[str, list[str]]:
-    """Return {rule: [messages]} for every violated rule."""
+    """Return {rule: [messages]} for every violated rule.
+
+    Overlap legality is delegated to alias_conflicts() -- the single alias entry point
+    also used by the P4 plan checks. No second intersection loop is allowed here: a
+    divergence between what this spec decides and what the plan checks decide is exactly
+    the drift the unique entry point exists to prevent."""
     out: dict[str, list[str]] = {r: [] for r in RULES}
+    known: list[OffsetView] = []
     for view in views:
         if view.root not in roots:
             out["VIEW_STALE_AFTER_REALLOC"].append("%s: unknown parent root %r" % (view.name, view.root))
             continue
+        known.append(view)
         root = roots[view.root]
         for tag in _tags(root, view):
             out[tag].append("%s: root=%s offset=%d dtype=%s count=%d range=[%d,%d) parent=[%d,%d)"
@@ -138,8 +131,9 @@ def check(roots: dict[str, GmemRoot], views: list[OffsetView],
                                root.base_byte + view.byte_offset,
                                root.base_byte + view.byte_offset + view.byte_length,
                                root.base_byte, root.end))
-    for msg in _overlaps(views, roots, accesses):
-        out[msg].append("distinct views alias with a write on one side")
+    for name_a, name_b in alias_conflicts(known, accesses):
+        out["VIEW_OVERLAP_INCOMPATIBLE"].append(
+            "%s/%s: distinct views alias with a write on one side" % (name_a, name_b))
     return out
 
 

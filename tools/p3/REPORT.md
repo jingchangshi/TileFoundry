@@ -1,7 +1,39 @@
 # P3 numeric oracle: what it determines and what it assumes
 
+> **03-21 RETRACTION (read the sections below with this in force).** This report describes
+> the PRE-03-21 oracle, which GENERATED its own inputs (numpy RNG, **row-wise W** of shape
+> (rows,D)) instead of consuming the runner's persisted X[M,D]/W[D]. Those inputs are not
+> the device inputs, so every statement below about per-case reference values, patterns,
+> seeds, loop modes, or agreement with device output is **VOID as same-input evidence**:
+> V01 per-case reference summary; V02 "Input generators"; V03 "Inputs are BF16"; V04 the
+> 8 run-P3-20261104T2305/*.y_bf16.npy files and their MANIFEST; V05 "dyn and recompute give
+> identical values" (two labels on one self-generated output); V06 prefill random statistics
+> (the same seed was reused for each 256-row block, 32 identical copies); V07 any claim of
+> oracle-vs-device agreement for the 4/2-chain construction; V08 deterministic bit-exactness
+> as an oracle result; V09 old seed/pattern/shape fields as protocol coverage; V10 treating
+> those outputs as "the independent reference for the device diff". Full list, the fresh
+> recomputation and the quantified old-vs-actual divergence (99.6–99.95% bit mismatch on
+> every non-zero pattern) are in
+> `artifacts/run03/w2/03-21/INPUT_ABI.md` and `old_vs_actual_divergence.json`.
+> NOT void: the bf16 encoder self-check, --scalar-demo, the frozen tolerance protocol, and
+> the UNSOURCED/UNVALIDATED status of the native vcadd tree.
+> The current `tools/p3/rmsnorm_oracle.py` consumes runner artifacts READ-ONLY with
+> per-file sha256 and refuses a non-conforming input ABI; `--run-dir` is mandatory.
+>
+> **RULING UPDATE 2026-11-05T00:44+08:00** (`architect_ruling_03_21b_actual_inputs_run2.md`):
+> V01–V10 below are **I2 VOID item IDs, not the masterplan V01–V10 acceptance command cards**.
+> The old same-input/device/protocol-coverage relation **NEVER HELD** (not "once accepted,
+> now void"); the old numbers still describe their own software corpus. V03 is narrowed to
+> the unbound-source inference (BF16/RNE codec properties remain valid); V06 keeps the
+> full-size 8192x4096 array (the defect is the 32 repeated random blocks and runner
+> identity, NOT the shape); V08 leaves the frozen det-bits-exact obligation intact; V10
+> rejects any blanket void — the run2 ACTUAL-INPUT independent audit (164 files /
+> `c8e21a39…` limited receipt) remains valid, not withdrawn/downgraded/upgraded.
+> See `artifacts/run03/w2/03-21/INPUT_ABI.md`.
+
 Oracle: tools/p3/rmsnorm_oracle.py. Outputs: artifacts/run02/p3_oracle/run-P3-20261104T2305
-(16 case/pattern files as uint16 BF16 bits + MANIFEST.json).
+(16 case/pattern files as uint16 BF16 bits + MANIFEST.json) — **VOID as comparison
+evidence, see the retraction above; retained only as a historical record**.
 
 ## ORACLE-DETERMINED (exact, from the frozen protocol and the pinned reference)
 
