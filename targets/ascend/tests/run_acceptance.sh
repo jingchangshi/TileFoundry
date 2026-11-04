@@ -67,6 +67,12 @@ run framework_import   "$PY" -c "import tilefoundry, tilefoundry_ascend; print('
 # script is CPU-only evidence and says NOTHING about the NPU. It was already true;
 # now it is also impossible to misread, because there is no device line to mistake
 # for a device result.
+# If a future change ever adds a device line here, it must come through the gate
+# first. The gate refuses unless authorised AND handed pre-checked occupancy
+# evidence, because a probe expected to fail at aclInit still opens the node. This
+# script has no device line today, so the gate is sourced and never called -- but
+# it is sourced so the rule is in force the moment someone adds one.
+. "$(dirname "$0")/device_precondition.sh"
 echo "--- device_stack: NOT TOUCHED BY DESIGN ---"
 echo "NPU EVIDENCE: NONE. This script does not import torch_npu, source CANN, or open"
 echo "              any /dev/davinci* node. Every line below is CPU arithmetic and IR"
