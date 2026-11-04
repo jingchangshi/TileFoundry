@@ -78,7 +78,13 @@ CONTAINER_HOSTNAME="${CONTAINER_HOSTNAME:-}"
 SUPPLEMENTARY_GIDS="${SUPPLEMENTARY_GIDS:-}"
 CONTAINER_HOME="${CONTAINER_HOME:-}"
 NETWORK="${NETWORK:-host}"
-PRIVILEGED="${PRIVILEGED:-true}"
+# Defaults to FALSE, deliberately departing from the reference (which defaulted
+# true). Under --privileged the --device list is advisory: the container can
+# open every host device regardless of what is listed. Unprivileged, the list
+# is a hard limit, so NPU_DEVICES actually confines the container. On a shared
+# host that difference is the whole point, so the safe value is the default and
+# privilege has to be asked for explicitly.
+PRIVILEGED="${PRIVILEGED:-false}"
 CGROUPNS="${CGROUPNS:-host}"
 SECURITY_OPTS="${SECURITY_OPTS:-label=disable}"
 SHM_SIZE="${SHM_SIZE:-512g}"
@@ -294,6 +300,12 @@ docker_run_argv() {
     )
     if [ "$PRIVILEGED" = true ]; then
         DOCKER_RUN+=(--privileged)
+        if [ -n "$NPU_DEVICES" ]; then
+            # Say this out loud rather than letting the operator believe the
+            # device list is confining the container. It is not.
+            log "WARNING: PRIVILEGED=true makes NPU_DEVICES advisory;"
+            log "         the container can open every host device."
+        fi
     fi
     for opt in "${SECURITY_OPTS_ARR[@]:-}"; do
         [ -n "$opt" ] && DOCKER_RUN+=(--security-opt "$opt")

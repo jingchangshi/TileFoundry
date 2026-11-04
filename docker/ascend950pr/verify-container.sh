@@ -14,6 +14,10 @@
 #   2  a required check could not run
 #
 # This script must be run INSIDE the container.
+# -u is required, not optional: an unset variable must be an error here rather
+# than an empty string. Several checks below ask whether something is SET, so a
+# silently empty CANN root would make "set_env.sh missing" read as "CANN fine",
+# which is the failure mode this script exists to prevent.
 set -uo pipefail
 
 CANN_ROOT="${CANN_ROOT:-/data/pri/cann-9.2.0}"
@@ -50,9 +54,23 @@ not_run() {
     failures=$((failures + 1))
 }
 
+# entry.sh creates and verifies the container account but does NOT drop to it:
+# the entrypoint keeps running as root and `docker exec` runs as root too unless
+# told otherwise. So a caller who forgets `-u` gets a root shell, and every
+# check below would then describe a root environment while looking identical.
+# Fail closed rather than report a pass from a context nobody intended.
+if [ "$(id -u)" -eq 0 ]; then
+    printf 'verify-container.sh: refusing to run as root.\n' >&2
+    printf '  entry.sh does not drop privileges, so this means `docker exec`\n' >&2
+    printf '  was invoked without -u. Re-run as the container account:\n' >&2
+    printf '    docker exec -u <user> <container> bash %s\n' "$0" >&2
+    exit 2
+fi
+
 printf 'TileFoundry Ascend950PR container verification\n'
 printf 'host: %s\n' "$(hostname)"
 printf 'date: %s\n' "$(date -Is)"
+printf 'user: %s (uid %s)\n' "$(id -un)" "$(id -u)"
 
 # --- identity -------------------------------------------------------------
 hr; printf '[identity]\n'; id | sed 's/^/  /'; uname -a | sed 's/^/  /'
@@ -74,14 +92,36 @@ else
     not_run cann_set_env "no readable set_env.sh under $CANN_ROOT/cann"
 fi
 
-# Sourcing set_env.sh must not fail and must populate the toolchain paths.
+# Sourcing set_env.sh must succeed AND must populate the toolchain paths.
+#
+# The status of `source` is captured inside the subshell, immediately after it
+# and on its own statement. An earlier revision ran `source; printf ...` and
+# then read $? outside, so the number reported was the exit status of the
+# printf -- always 0. A broken set_env.sh would have been recorded as a pass.
+# The assertions about what it exported are checked separately from the
+# status, so neither can hide the other.
 if [ -r "$CANN_ROOT/cann/set_env.sh" ]; then
     hr; printf '[cann] sourcing set_env.sh\n'
-    # shellcheck disable=SC1090
-    ( set +u; . "$CANN_ROOT/cann/set_env.sh" >/dev/null 2>&1; printf '  ASCEND_TOOLKIT_HOME=%s\n' "${ASCEND_TOOLKIT_HOME:-<unset>}"; printf '  ASCEND_HOME_PATH=%s\n' "${ASCEND_HOME_PATH:-<unset>}"; printf '  PATH has cann: %s\n' "$(printf '%s' "$PATH" | grep -c cann)" )
-    src_rc=$?
-    printf '  -> exit %d\n' "$src_rc"
-    [ "$src_rc" -eq 0 ] || failures=$((failures + 1))
+    cann_env="$(
+        set +u
+        # shellcheck disable=SC1090
+        . "$CANN_ROOT/cann/set_env.sh" >/dev/null 2>&1
+        printf 'source_rc=%s\n' "$?"
+        printf 'ASCEND_TOOLKIT_HOME=%s\n' "${ASCEND_TOOLKIT_HOME:-<unset>}"
+        printf 'ASCEND_HOME_PATH=%s\n' "${ASCEND_HOME_PATH:-<unset>}"
+        printf 'PATH_has_cann=%s\n' "$(printf '%s' "$PATH" | grep -c cann)"
+    )"
+    printf '%s\n' "$cann_env" | sed 's/^/  /'
+    src_rc="$(printf '%s\n' "$cann_env" | sed -n 's/^source_rc=//p')"
+    if [ "${src_rc:-missing}" != "0" ]; then
+        printf '  !! sourcing set_env.sh failed with status %s\n' "${src_rc:-missing}"
+        failures=$((failures + 1))
+    fi
+    toolkit_home="$(printf '%s\n' "$cann_env" | sed -n 's/^ASCEND_TOOLKIT_HOME=//p')"
+    if [ -z "${toolkit_home:-}" ] || [ "${toolkit_home:-}" = "<unset>" ]; then
+        printf '  !! set_env.sh succeeded but did not export ASCEND_TOOLKIT_HOME\n'
+        failures=$((failures + 1))
+    fi
 fi
 
 # --- the mounted venv -----------------------------------------------------
