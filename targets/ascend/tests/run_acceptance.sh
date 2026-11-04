@@ -164,6 +164,7 @@ run emission_ledger  "$PY" "$REPO/targets/ascend/tests/test_emission_ledger.py"
 run full_kernel_ledger "$PY" "$REPO/targets/ascend/tests/test_full_kernel_ledger.py"
 run ledger_tasks_digest "$PY" "$REPO/targets/ascend/tests/test_ledger_tasks_digest.py"
 run p4_negative_matrix "$PY" "$REPO/targets/ascend/tests/test_p4_negative_matrix.py"
+run p4_hir_offset_digest "$PY" "$REPO/targets/ascend/tests/test_p4_hir_offset_digest.py"
 
 # (4) The legacy paths that must not regress, so a green M3 cannot come from
 # breaking CUDA or the copy lowering.

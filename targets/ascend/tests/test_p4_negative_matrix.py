@@ -91,11 +91,16 @@ def main():
     add("CHANGED", "changed_root_digest",
         build_problem(dataclasses.replace(ledger, entries=[dataclasses.replace(first, root="x2")] + ledger.entries[1:])).source_digest
         != problem.source_digest)
-    symbolic = next((e for e in ledger.entries if e.source_offset == "symbolic"), ledger.entries[0])
+    # The digest follows the typed offset STRUCTURE, not the human string: mutating the structure
+    # changes the digest, while a string-only edit must NOT change it (the old broken probe).
+    symbolic = next((e for e in ledger.entries if e.byte_offset is None), ledger.entries[0])
     symbolic_index = next(i for i, e in enumerate(ledger.entries) if e is symbolic)
     shifted_ledger = dataclasses.replace(
-        ledger, entries=ledger.entries[:symbolic_index] + [dataclasses.replace(symbolic, source_offset="symbolic+1")] + ledger.entries[symbolic_index + 1:])
+        ledger, entries=ledger.entries[:symbolic_index] + [dataclasses.replace(symbolic, offset_structure=symbolic.offset_structure + (("const", 64),))] + ledger.entries[symbolic_index + 1:])
     add("CHANGED", "changed_symbolic_offset_digest", build_problem(shifted_ledger).problem_digest != problem.problem_digest)
+    string_only_ledger = dataclasses.replace(
+        ledger, entries=ledger.entries[:symbolic_index] + [dataclasses.replace(symbolic, source_offset="hand-edited")] + ledger.entries[symbolic_index + 1:])
+    add("PASS", "neg_string_only_offset_rejected", build_problem(string_only_ledger).problem_digest == problem.problem_digest)
     add("CHANGED", "changed_iteration_digest",
         build_problem(dataclasses.replace(ledger, entries=[dataclasses.replace(first, iteration_path="other")] + ledger.entries[1:])).source_digest
         != problem.source_digest)

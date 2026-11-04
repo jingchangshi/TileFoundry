@@ -67,6 +67,8 @@ class LedgerEntry:
     byte_offset: Optional[int]      # None == OFFSET_UNKNOWN
     source_offset: str              # raw TIR slice starts (literal list or 'symbolic')
     attrs: tuple                    # op attributes: (('pack', 'PK_B32'), ('direction', 'reverse'), ...)
+    offset_structure: tuple          # canonical typed structure of the window offset (op/args/consts/vars)
+    guard: tuple                     # canonical keys of the enclosing If conditions (guard provenance)
     logical_iteration: str
     iteration_path: str
     iteration_extent: str
@@ -102,6 +104,47 @@ def _slice_starts(expr) -> tuple:
     if isinstance(expr, Slice):
         starts = tuple(getattr(expr, "starts", ()) or ())
         return starts if all(isinstance(start, int) for start in starts) else ()
+    return ()
+
+
+
+
+def _expr_key(expr) -> tuple:
+    """Canonical structural key of a typed TIR expression (no id(obj), no string collapse)."""
+    if isinstance(expr, Constant):
+        return ("const", getattr(expr, "value", None))
+    if isinstance(expr, Var):
+        return ("var", str(getattr(expr, "name", None)))
+    if isinstance(expr, Call):
+        target = getattr(expr, "target", None)
+        name = getattr(target, "name", None) or type(target).__name__
+        attrs = []
+        for key in sorted(getattr(type(target), "__dataclass_fields__", {}) or {}):
+            value = getattr(target, key, None)
+            if isinstance(value, (str, int, bool)):
+                attrs.append((key, value))
+            elif value is not None and type(value).__name__.endswith("Kind"):
+                attrs.append((key, str(value)))
+        return ("call", str(name), [_expr_key(arg) for arg in expr.args], attrs)
+    if isinstance(expr, Tuple):
+        return ("tuple", [_expr_key(element) for element in expr.elements])
+    return ("opaque", type(expr).__name__)
+
+
+def _slice_exprs(expr) -> tuple:
+    """The typed start expressions of the Slice inside a PtrOf/TensorView chain."""
+    if isinstance(expr, Call) and isinstance(expr.target, TensorView):
+        if expr.args and isinstance(expr.args[0], Constant) and isinstance(expr.args[0].value, int):
+            return (expr.args[0],)
+        return _slice_exprs(expr.args[0]) if expr.args else ()
+    if isinstance(expr, Call) and isinstance(expr.target, PtrOf):
+        return _slice_exprs(expr.args[0]) if expr.args else ()
+    if isinstance(expr, Call) and isinstance(expr.target, Slice):
+        if len(expr.args) > 1 and isinstance(expr.args[1], Tuple):
+            return tuple(expr.args[1].elements)
+        return ()
+    if isinstance(expr, Slice):
+        return tuple(getattr(expr, "starts", ()) or ())
     return ()
 
 
@@ -156,47 +199,51 @@ def _root_of(var, views: dict, defs: dict) -> tuple:
 def extract_ledger(function) -> Ledger:
     """Walk the typed TIR and record every actual memory action with a stable id."""
     ledger = Ledger(function=str(getattr(function, "name", "function")))
-    views: dict = {}  # view var name -> (root name, root kind, literal starts, alloc path)
+    views: dict = {}  # view var name -> (root name, root kind, start exprs, alloc path)
     defs: dict = {}   # var name -> defining value (for root resolution)
 
-    def source_offset_of(var) -> str:
+    def starts_of(var) -> tuple:
         name = getattr(var, "name", None)
-        if name in views and views[name][2]:
-            return ",".join(str(start) for start in views[name][2])
-        return "symbolic"
+        return views[name][2] if name in views else ()
+
+    def source_offset_of(var) -> str:
+        starts = starts_of(var)
+        return ",".join(str(start) for start in starts) if starts else "symbolic"
+
+    def offset_structure_of(var) -> tuple:
+        starts = starts_of(var)
+        return tuple(_expr_key(start) for start in starts)
 
     def offset_of(var) -> Optional[int]:
-        name = getattr(var, "name", None)
-        if name not in views:
-            return None
-        starts = views[name][2]
-        if starts and all(isinstance(start, int) for start in starts):
-            return sum(starts)
+        starts = starts_of(var)
+        if starts and all(isinstance(start, Constant) and isinstance(getattr(start, "value", None), int) for start in starts):
+            return sum(int(start.value) for start in starts)
         return None
 
-    def walk(stmt, path: tuple, loops: tuple) -> None:
+    def walk(stmt, path: tuple, loops: tuple, guards: tuple) -> None:
         if isinstance(stmt, Sequential):
             for index, child in enumerate(stmt.body):
-                walk(child, path + (f"s{index}",), loops)
+                walk(child, path + (f"s{index}",), loops, guards)
             return
         if isinstance(stmt, For):
             name = str(getattr(stmt.induction_var, "name", "i"))
             extent = str(getattr(stmt, "stop", ""))
-            walk(stmt.body, path + (f"for:{name}",), loops + ((name, extent),))
+            walk(stmt.body, path + (f"for:{name}",), loops + ((name, extent),), guards)
             return
         if isinstance(stmt, (MeshScope, ExecutionScope)):
-            walk(stmt.body, path + (type(stmt).__name__,), loops)
+            walk(stmt.body, path + (type(stmt).__name__,), loops, guards)
             return
         if isinstance(stmt, If):
-            walk(stmt.then_body, path + ("then",), loops)
-            walk(stmt.else_body, path + ("else",), loops)
+            condition = _expr_key(stmt.cond)
+            walk(stmt.then_body, path + ("then",), loops, guards + (("then", condition),))
+            walk(stmt.else_body, path + ("else",), loops, guards + (("else", condition),))
             return
         if isinstance(stmt, LetStmt):
             value = stmt.value
             defs[str(getattr(stmt.var, "name", ""))] = value
             if isinstance(value, Call) and isinstance(value.target, (TensorView, PtrOf)):
                 root, kind = _root_of(value.args[0] if value.args else value, views, defs)
-                views[str(getattr(stmt.var, "name", ""))] = (root, kind, _slice_starts(value), "/".join(path))
+                views[str(getattr(stmt.var, "name", ""))] = (root, kind, _slice_exprs(value), "/".join(path))
             return
         if not isinstance(stmt, Evaluate):
             return
@@ -251,6 +298,8 @@ def extract_ledger(function) -> Ledger:
                     byte_footprint=_shape_bytes(type_),
                     byte_offset=offset_of(arg),
                     source_offset=source_offset_of(arg),
+                    offset_structure=offset_structure_of(arg),
+                    guard=guards,
                     attrs=tuple(
                         (key, getattr(op, key))
                         for key in ("pack", "direction", "part", "elem_width")
@@ -263,7 +312,7 @@ def extract_ledger(function) -> Ledger:
                 )
             )
 
-    walk(function.body, (), ())
+    walk(function.body, (), (), ())
     return ledger
 
 
@@ -279,6 +328,8 @@ class ProblemAccess:
     byte_offset: Optional[int]
     source_offset: str
     attrs: tuple
+    offset_structure: tuple
+    guard: tuple
     normalized_offset: Optional[int]
     offset_status: str  # "BYTES" | "OFFSET_UNKNOWN"
     logical_iteration: str
@@ -342,6 +393,8 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
             byte_offset=entry.byte_offset,
             source_offset=entry.source_offset,
             attrs=entry.attrs,
+            offset_structure=entry.offset_structure,
+            guard=entry.guard,
             normalized_offset=entry.byte_offset,
             offset_status="BYTES" if entry.byte_offset is not None else "OFFSET_UNKNOWN",
             logical_iteration=entry.logical_iteration,
@@ -406,8 +459,9 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
                 'action_id': entry.action_id, 'instruction': entry.instruction, 'op': entry.op,
                 'root': entry.root, 'root_kind': entry.root_kind, 'space': entry.space,
                 'mode': entry.mode, 'byte_footprint': entry.byte_footprint,
-                'byte_offset': entry.byte_offset, 'source_offset': entry.source_offset,
-                'attrs': list(entry.attrs), 'iteration_path': entry.iteration_path,
+                'byte_offset': entry.byte_offset,
+                'attrs': list(entry.attrs), 'offset_structure': entry.offset_structure,
+                'guard': entry.guard, 'iteration_path': entry.iteration_path,
                 'iteration_extent': entry.iteration_extent,
             }
             for entry in ledger.entries
@@ -432,6 +486,8 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
     )
     problem_digest_payload = problem.as_dict()
     problem_digest_payload.pop('problem_digest', None)
+    for access_payload in problem_digest_payload.get('accesses', []):
+        access_payload.pop('source_offset', None)  # human string, not part of the canonical input
     problem.problem_digest = hashlib.sha256(
         json.dumps(problem_digest_payload, sort_keys=True, default=str).encode()
     ).hexdigest()[:16]
