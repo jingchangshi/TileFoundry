@@ -33,7 +33,7 @@ from tilefoundry.ir.core import Call, Var, VerifyError
 from tilefoundry.ir.tir.memory import AllocTensor
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Evaluate, ExecutionScope, LetStmt, MeshScope, Sequential
-from tilefoundry.ir.types import Mesh, TensorType, Topology, make_tensor_type
+from tilefoundry.ir.types import DType, Mesh, TensorType, Topology, make_tensor_type
 from tilefoundry_ascend.ir.ops import Vadd, Vld
 from tilefoundry.visitor_registry.verify import verify_prim_function
 
@@ -43,7 +43,21 @@ AIV = Mesh((Topology("aiv", 1),), (1,), ("core",))
 
 
 def _tensor(shape=(LANES,), dtype="f32", storage="rmem") -> TensorType:
-    return make_tensor_type(shape, dtype=dtype, storage=storage)
+    """A tensor type built with REAL DType descriptors, not dtype name strings.
+
+    ``make_tensor_type`` normalizes ``storage`` from a string but NOT ``dtype``: it
+    stores whatever it is handed, and ``TensorType.__post_init__`` only touches
+    storage and shape. So ``make_tensor_type(..., dtype="f32")`` produces a type
+    whose ``dtype`` is the STRING "f32", which compares unequal to ``DType.f32`` and
+    has no ``.name``. A fixture built that way is not testing the rules it names:
+    a dtype-reading check sees ``None`` and refuses for the wrong reason, and a
+    pattern expecting ``DType.f32`` never matches.
+
+    Resolving here keeps every case honest. It is also why the positive control is
+    the load-bearing case: it is the one that would have caught this, because a
+    string-dtype fixture refuses everything and passes every negative for free.
+    """
+    return make_tensor_type(shape, dtype=DType.from_name(dtype), storage=storage)
 
 
 def _bind(name: str, type_: TensorType) -> tuple:

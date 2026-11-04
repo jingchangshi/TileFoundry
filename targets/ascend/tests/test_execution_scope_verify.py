@@ -20,14 +20,24 @@ from tilefoundry.ir.tir.arith import Binary
 from tilefoundry.ir.tir.memory import AllocTensor
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Evaluate, ExecutionScope, LetStmt, MeshScope, Sequential
-from tilefoundry.ir.types import Mesh, TensorType, Topology, make_tensor_type
+from tilefoundry.ir.types import DType, Mesh, TensorType, Topology, make_tensor_type
 from tilefoundry.visitor_registry.verify import verify_prim_function
 
 AIV = Mesh((Topology("aiv", 1),), (1,), ("core",))
 
 
 def _tensor() -> TensorType:
-    return make_tensor_type((64,), dtype="f32", storage="smem")
+    """A shared-memory f32 tile, built with a REAL DType descriptor.
+
+    ``make_tensor_type`` normalizes ``storage`` from a string but NOT ``dtype``, so
+    passing ``dtype="f32"`` yields a type whose dtype is the string, not
+    ``DType.f32``: it compares unequal to the descriptor and has no ``.name``. Every
+    check in this file is about placement, and placement does not read the dtype,
+    which is why the string version passed -- but a dtype-reading rule added later
+    would see ``None`` here and refuse for the wrong reason, or skip. Resolving it
+    costs nothing and removes that trap.
+    """
+    return make_tensor_type((64,), dtype=DType.f32, storage="smem")
 
 
 def _bound_function(*statements) -> tuple[PrimFunction, Var]:
