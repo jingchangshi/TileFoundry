@@ -27,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from .memory import SPACE_FACTS, MemorySpaceFacts
+from .memory import REGISTER, SPACE_FACTS, MemorySpaceFacts
 
 GMEM = "gmem"
 SMEM = "smem"
@@ -36,6 +36,9 @@ L1 = "L1"
 SLAB = "slab"
 
 SPACE_OF = {"gmem": "ascend.gm", "smem": "ascend.ub", "rmem": "ascend.vreg", "L1": "ascend.l1", "slab": "ascend.ub"}
+# An explicit physical request maps to the PHYSICAL space's default semantic space.
+# ascend.ub maps to smem (not slab): slab is a ROLE (versioned ring), never a physical id.
+PHYSICAL_TO_SPACE = {"ascend.gm": "gmem", "ascend.ub": "smem", "ascend.vreg": "rmem", "ascend.l1": "L1"}
 
 
 class PlacementRefusal(ValueError):
@@ -55,6 +58,8 @@ class SpaceSemantics:
     usable_bytes: Optional[int]
     capacity_known: bool
     source: str
+    # For register classes this is the WIDTH of one register, NOT an aggregate bound.
+    register_width_bytes: Optional[int] = None
 
     def as_dict(self) -> dict:
         return {
@@ -63,6 +68,7 @@ class SpaceSemantics:
             "capacity_rule": self.capacity_rule, "alignment": self.alignment,
             "nominal_bytes": self.nominal_bytes, "usable_bytes": self.usable_bytes,
             "capacity_known": self.capacity_known, "source": self.source,
+            "register_width_bytes": self.register_width_bytes,
         }
 
 
@@ -87,10 +93,15 @@ def space_semantics(space: str) -> SpaceSemantics:
             facts.alignment, facts.nominal_bytes, facts.usable_bytes, capacity_known, facts.source,
         )
     if space == RMEM:
+        # CATEGORY CORRECTION: 256 B is the WIDTH of ONE register, not an aggregate bound.
+        # Using it as the rmem capacity was a category error; the register COUNT is
+        # UNSOURCED, so rmem states NO aggregate capacity and NO nominal total.
         return SpaceSemantics(
             RMEM, physical, "VF-private vector/predicate registers", facts.owner, True,
-            "per-register 256 B; aggregate register budget UNSOURCED",
-            facts.alignment, facts.nominal_bytes, facts.usable_bytes, capacity_known, facts.source,
+            "one register is 256 B; the register COUNT is UNSOURCED, so no aggregate rmem "
+            "capacity is claimed (per-register width is not a bound)",
+            facts.alignment, None, None, False, facts.source,
+            register_width_bytes=facts.nominal_bytes,
         )
     role = {
         GMEM: "device-global shared storage; function inputs and outputs",
@@ -141,12 +152,23 @@ def classify(access: AccessSpec) -> str:
         facts = _facts(access.wants)
         if not facts.allocatable:
             raise PlacementRefusal(f"{access.name}: {access.wants} is declared non-allocatable")
-        if access.wants == "ascend.l1" and access.domain != "aic":
+        # An explicit request does NOT buy an exemption from legality: it must still be a
+        # legal home for THIS access. Asking for rmem outside a VF, or L1 in an AIV
+        # program, is refused even though the caller named the space.
+        space = PHYSICAL_TO_SPACE.get(access.wants)
+        if space is None:
+            raise PlacementRefusal(f"{access.name}: {access.wants} has no semantic space")
+        if space == RMEM and not access.inside_vf:
             raise PlacementRefusal(
-                f"{access.name}: L1 is AIC-local and cannot hold an {access.domain} buffer"
+                f"{access.name}: {access.wants} is VF-private, and an explicit request does "
+                "not make it legal outside a VF"
             )
-        reverse = {physical: space for space, physical in SPACE_OF.items()}
-        return reverse.get(access.wants, access.wants)
+        if space == L1 and access.domain != "aic":
+            raise PlacementRefusal(
+                f"{access.name}: {access.wants} is AIC-local, and an explicit request does "
+                f"not make it legal in an {access.domain} program"
+            )
+        return space
     if access.role in (ROLE_PARAM, ROLE_RESULT):
         return GMEM
     if access.role == ROLE_AIC_OPERAND:
@@ -189,8 +211,13 @@ class PlacementResult:
         }
 
 
-def place(accesses) -> dict:
-    """Classify every access and enforce capacity per space; refuse what fits nothing."""
+def place(accesses, *, include_physical: bool = False) -> dict:
+    """Classify every access and enforce capacity; refuse what fits nothing.
+
+    Capacity is enforced BOTH per semantic space and per PHYSICAL space. smem and slab are
+    both ascend.ub, so enforcing the semantic spaces separately would let 200 KiB smem plus
+    200 KiB slab pass while overcommitting the same 256 KiB UB.
+    """
     results = {}
     for access in accesses:
         space = classify(access)
@@ -217,7 +244,31 @@ def place(accesses) -> dict:
             raise PlacementRefusal(
                 f"{result.space}: {result.bytes} bytes requested exceeds capacity bound {result.bound}"
             )
-    return {space: result.as_dict() for space, result in results.items()}
+    physical_totals: dict = {}
+    for space, result in results.items():
+        physical = space_semantics(space).physical
+        entry = physical_totals.setdefault(physical, {"bytes": 0, "spaces": []})
+        entry["bytes"] += result.bytes
+        entry["spaces"].append(space)
+    for physical, entry in physical_totals.items():
+        facts = _facts(physical)
+        if facts.category == REGISTER:
+            # Register "nominal" is ONE register's width, not an aggregate budget: using it
+            # as a physical bound is the same category error the rmem semantics fix. An
+            # aggregate register budget needs a register COUNT, which is unsourced.
+            bound = None
+        else:
+            bound = facts.usable_bytes if facts.usable_bytes is not None else facts.nominal_bytes
+        if bound is not None and entry["bytes"] > bound:
+            raise PlacementRefusal(
+                f"physical {physical}: {entry['bytes']} bytes across {sorted(entry['spaces'])} "
+                f"exceeds capacity bound {bound}; summing semantic spaces separately would "
+                "double-count the same physical memory"
+            )
+    spaces = {space: result.as_dict() for space, result in results.items()}
+    if include_physical:
+        return {"spaces": spaces, "physical": physical_totals}
+    return spaces
 
 
 def require_known_capacity(accesses) -> dict:

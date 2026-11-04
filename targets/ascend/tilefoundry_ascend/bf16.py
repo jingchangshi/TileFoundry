@@ -14,6 +14,7 @@ BF16 layout: 1 sign, 8 exponent (bias 127), 7 mantissa. Two BF16 lanes pack into
 from __future__ import annotations
 
 import math
+import struct
 from fractions import Fraction
 
 SIGN_SHIFT = 15
@@ -25,6 +26,10 @@ BIAS = 127
 SUBNORMAL_QUANTUM = Fraction(1, 1 << (126 + MANTISSA_BITS))
 LANES = 64
 TWO = Fraction(2)
+
+#: The credit THIS evidence supports. It is a CPU-side software quantizer reference; it is
+#: not proof of the native reduction tree, output layout or device behaviour.
+CREDIT = "CPU-only software quantizer; full P2 native-ISA claim NOT established"
 
 
 def _round_half_even(value: Fraction) -> int:
@@ -144,14 +149,68 @@ def lane_scale(a, scalar: float, mask, dest):
     return out
 
 
-# Reduction orders. The order is part of the CONTRACT: it changes the BF16 result.
-ORDER_LINEAR = "linear"              # acc = bf16(acc + lane[L]) for L = 0..n-1
-ORDER_PAIRWISE = "pairwise"          # halve: bf16(a+b) pairwise, then combine
-ORDER_EXACT = "exact-then-round"     # exact rational sum, rounded ONCE to BF16
+def _f32(value: float) -> float:
+    """Round to IEEE-754 binary32. v33 accumulates in FP32 after BF16->FP32 conversion."""
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+MERGE_BALANCED_4 = "((0+1)+(2+3))"
+MERGE_PAIR_2 = "(0+1)"
+
+
+def vcadd_v33(values, chains: int, merge: str) -> int:
+    """Reduction with v33 ACCUMULATION SEMANTICS: BF16 in, FP32 accumulate, BF16 out.
+
+    reference/kernel_v33.py (SHA c6c37fb7...) converts each UNPK_B16 lane to float32 and
+    accumulates with FP32 vmula chains; only the final scalar is stored as BF16. So the
+    per-step rounding here is to FP32, NOT to BF16. *chains* and *merge* are the PER-CASE
+    accumulator contract from the algorithm (rows=4 -> 4 chains, ((0+1)+(2+3)); rows<=2 ->
+    2 chains, (0+1)), not a universal ISA constant.
+
+    Chain c accumulates lanes c, c+chains, c+2*chains, ... in FP32; the chains are then
+    merged in the stated balanced tree, in FP32; the merged scalar is rounded to BF16.
+    The SIX-CALL baseline sequence is kept as the reduction sequence; this function does
+    not claim the native tree shape or output layout, which are UNSOURCED against the
+    current build (isa.NATIVE_BUILD). This is a SOFTWARE reference.
+    """
+    if chains not in (2, 4):
+        raise ValueError(f"v33 declares 2 or 4 accumulator chains per case, got {chains}")
+    if len(values) % chains:
+        raise ValueError(f"{len(values)} lanes do not divide into {chains} chains")
+    per_chain = len(values) // chains
+    accumulators = [0.0] * chains
+    for chain in range(chains):
+        for step in range(per_chain):
+            lane = _f32(decode(values[chain + step * chains]))
+            accumulators[chain] = _f32(accumulators[chain] + lane)
+    if chains == 4:
+        if merge != MERGE_BALANCED_4:
+            raise ValueError(f"four chains must merge {MERGE_BALANCED_4}, got {merge!r}")
+        merged = _f32(
+            _f32(accumulators[0] + accumulators[1]) + _f32(accumulators[2] + accumulators[3])
+        )
+    else:
+        if merge != MERGE_PAIR_2:
+            raise ValueError(f"two chains must merge {MERGE_PAIR_2}, got {merge!r}")
+        merged = _f32(accumulators[0] + accumulators[1])
+    return encode(merged)
+
+
+# RETRACTED numeric model (kept for the record and for a CONTRAST microtest, NOT used):
+# these orders round every step to BF16. That is NOT v33 accumulation semantics -- v33
+# accumulates in FP32 after the BF16 conversion -- so a per-step-BF16 reducer would make a
+# plausible evaluator disagree with the actual sequence. Use vcadd_v33 instead.
+ORDER_LINEAR = "RETRACTED:linear-per-step-bf16"
+ORDER_PAIRWISE = "RETRACTED:pairwise-per-step-bf16"
+ORDER_EXACT = "RETRACTED:exact-then-round"
 
 
 def vcadd(values, order: str) -> int:
-    """Reduce *values* (BF16 bit patterns) to one BF16 accumulator in a stated order."""
+    """RETRACTED per-step-BF16 reducer (contrast only). Use :func:`vcadd_v33`.
+
+    Kept so a microtest can show the difference from v33 FP32 accumulation; NOT v33
+    semantics and not used by any reference or report path.
+    """
     lanes = [decode(value) for value in values]
     if order == ORDER_LINEAR:
         accumulator = 0.0
@@ -174,7 +233,8 @@ def vcadd(values, order: str) -> int:
 
 
 __all__ = [
-    "LANES", "encode", "encode_fraction", "decode", "round_value", "pack_pair",
-    "unpack_pair", "lane_add", "lane_mul", "lane_scale", "vcadd",
+    "LANES", "CREDIT", "encode", "encode_fraction", "decode", "round_value", "pack_pair",
+    "unpack_pair", "lane_add", "lane_mul", "lane_scale", "vcadd", "vcadd_v33",
+    "MERGE_BALANCED_4", "MERGE_PAIR_2",
     "ORDER_LINEAR", "ORDER_PAIRWISE", "ORDER_EXACT",
 ]

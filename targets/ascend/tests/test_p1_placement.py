@@ -145,6 +145,63 @@ def check_transfer_legality() -> None:
     assert SPACE_FACTS["ascend.l2"].allocatable is False
 
 
+def check_physical_capacity_shared() -> None:
+    """smem and slab share UB: per-space bounds alone must not double-count it."""
+    try:
+        place([
+            AccessSpec("smem_tile", ROLE_STAGED_TILE, 200 * 1024),
+            AccessSpec("slab_ring", ROLE_VERSIONED_SLOT, 200 * 1024, versions=1),
+        ])
+    except PlacementRefusal as error:
+        assert "physical ascend.ub" in str(error), str(error)
+        assert "double-count" in str(error), str(error)
+    else:
+        raise AssertionError("smem+slab overcommitted UB without refusal")
+    # Individually under the shared bound: accepted, and the physical total is reported.
+    placed = place(
+        [
+            AccessSpec("smem_tile", ROLE_STAGED_TILE, 100 * 1024),
+            AccessSpec("slab_ring", ROLE_VERSIONED_SLOT, 100 * 1024, versions=1),
+        ],
+        include_physical=True,
+    )
+    assert placed["physical"]["ascend.ub"]["bytes"] == 200 * 1024, placed["physical"]
+    assert set(placed["physical"]["ascend.ub"]["spaces"]) == {SMEM, SLAB}
+
+
+def check_rmem_is_not_an_aggregate_budget() -> None:
+    """256 B is one register's WIDTH, not an aggregate rmem bound."""
+    semantics = space_semantics(RMEM)
+    assert semantics.nominal_bytes is None, "rmem must not state an aggregate nominal size"
+    assert semantics.register_width_bytes == 256, semantics.register_width_bytes
+    assert semantics.capacity_known is False
+    placed = place([AccessSpec("two_regs", ROLE_PRIVATE_TEMP, 512, inside_vf=True)])
+    assert RMEM in placed, placed
+    try:
+        require_known_capacity([AccessSpec("two_regs", ROLE_PRIVATE_TEMP, 512, inside_vf=True)])
+    except PlacementRefusal as error:
+        assert "UNSOURCED" in str(error), str(error)
+    else:
+        raise AssertionError("an unsourced rmem bound was claimed as known")
+
+
+def check_explicit_wants_do_not_bypass_legality() -> None:
+    """Naming a space explicitly does not make an illegal home legal."""
+    try:
+        classify(AccessSpec("forced_vreg", ROLE_STAGED_TILE, 8, inside_vf=False, wants="ascend.vreg"))
+    except PlacementRefusal as error:
+        assert "does not make it legal outside a VF" in str(error), str(error)
+    else:
+        raise AssertionError("explicit rmem request outside a VF was accepted")
+    try:
+        classify(AccessSpec("forced_l1", ROLE_STAGED_TILE, 8, domain="aiv", wants="ascend.l1"))
+    except PlacementRefusal as error:
+        assert "does not make it legal in an aiv program" in str(error), str(error)
+    else:
+        raise AssertionError("explicit L1 request in an aiv program was accepted")
+    assert classify(AccessSpec("ub", ROLE_STAGED_TILE, 8, wants="ascend.ub")) == SMEM
+
+
 CHECKS = [
     ("space_table_complete", check_space_table_complete),
     ("classification", check_classification),
@@ -152,6 +209,9 @@ CHECKS = [
     ("capacity", check_capacity),
     ("alias_semantics", check_alias_semantics),
     ("transfer_legality", check_transfer_legality),
+    ("physical_capacity_shared", check_physical_capacity_shared),
+    ("rmem_is_not_an_aggregate_budget", check_rmem_is_not_an_aggregate_budget),
+    ("explicit_wants_do_not_bypass_legality", check_explicit_wants_do_not_bypass_legality),
 ]
 
 

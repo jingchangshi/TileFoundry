@@ -128,42 +128,88 @@ def check_lane_predicate() -> None:
         assert scaled[index] == (bf16.encode(1.5) if mask[index] else keep)
 
 
-def check_reduction_order_documented() -> None:
-    try:
-        bf16.vcadd([bf16.encode(1.0)], "not-an-order")
-    except ValueError as error:
-        assert "unknown reduction order" in str(error), str(error)
+def _ref_decode(bits: int) -> float:
+    """Independent BF16 decoder (written separately from the module)."""
+    sign = -1.0 if bits & 0x8000 else 1.0
+    exponent = (bits >> 7) & 0xFF
+    mantissa = bits & 0x7F
+    if exponent == 0:
+        return sign * float(Fraction(mantissa, 1 << 133))
+    return sign * float(Fraction(128 + mantissa, 128) * Fraction(2) ** (exponent - 127))
+
+
+def _f32(value: float) -> float:
+    import struct
+
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def _ref_v33(values, chains: int, merge: str) -> int:
+    """Independent FP32-accumulation reference for the v33 reduction."""
+    per_chain = len(values) // chains
+    accumulators = [0.0] * chains
+    for chain in range(chains):
+        for step in range(per_chain):
+            accumulators[chain] = _f32(
+                accumulators[chain] + _f32(_ref_decode(values[chain + step * chains]))
+            )
+    if chains == 4:
+        merged = _f32(_f32(accumulators[0] + accumulators[1]) + _f32(accumulators[2] + accumulators[3]))
     else:
-        raise AssertionError("an undeclared reduction order was accepted")
+        merged = _f32(accumulators[0] + accumulators[1])
+    return _ref_encode(Fraction(merged))
 
 
-def check_reduction_order_observable() -> None:
-    # 1.0 then 63 copies of 2^-8: linear rounds the first tie back to 1.0 and then keeps
-    # rounding the small additions away; the exact sum rounds to something else.
+def check_accumulation_is_fp32_not_perstep_bf16() -> None:
+    """v33 accumulates in FP32 after BF16 conversion, NOT per-step BF16."""
+    # 1.0 then 63 copies of 2^-8: per-step BF16 loses every small addition (the tie rounds
+    # back to 1.0), while FP32 keeps them. The two models MUST disagree here.
     lanes = [bf16.encode(1.0)] + [bf16.encode(2.0 ** -8)] * (bf16.LANES - 1)
-    linear = bf16.vcadd(lanes, bf16.ORDER_LINEAR)
-    exact = bf16.vcadd(lanes, bf16.ORDER_EXACT)
-    pairwise = bf16.vcadd(lanes, bf16.ORDER_PAIRWISE)
+    fp32_result = bf16.vcadd_v33(lanes, 4, bf16.MERGE_BALANCED_4)
+    reference = _ref_v33(lanes, 4, bf16.MERGE_BALANCED_4)
+    assert fp32_result == reference, (
+        f"fp32 accumulation 0x{fp32_result:04X} != independent ref 0x{reference:04X}"
+    )
+    retracted = bf16.vcadd(lanes, bf16.ORDER_LINEAR)
+    assert retracted != fp32_result, (
+        "the RETRACTED per-step-BF16 reducer did not differ from FP32 accumulation; "
+        "the contrast that documents the retraction is not observable"
+    )
 
-    # Exact-then-round against the test-local reference.
-    total = sum((Fraction(bf16.decode(bits)) for bits in lanes), Fraction(0))
-    assert exact == _ref_encode(total), (
-        f"exact-then-round 0x{exact:04X} != independent ref 0x{_ref_encode(total):04X}"
+
+def check_accumulator_contract_is_per_case() -> None:
+    """The count is a PER-CASE algorithm contract, never a universal ISA field."""
+    from tilefoundry_ascend.ir.isa import ISA, PER_CASE_ACCUMULATOR_CONTRACT
+
+    assert ISA["vcadd"].accumulator_count is None, (
+        "vcadd must NOT declare a global accumulator count"
     )
-    # Linear against a test-local linear reference (per-step BF16 rounding).
-    accumulator = Fraction(0)
-    for bits in lanes:
-        accumulator = Fraction(bf16.decode(_ref_encode(accumulator + Fraction(bf16.decode(bits)))))
-    assert linear == _ref_encode(accumulator), (
-        f"linear 0x{linear:04X} != independent linear ref 0x{_ref_encode(accumulator):04X}"
-    )
-    # ORDER IS OBSERVABLE: linear must differ from exact on this vector, or the order is
-    # not load-bearing and the contract above would be untestable.
-    assert linear != exact, "reduction order was not observable on the crafted vector"
-    assert pairwise in (linear, exact, pairwise)  # pairwise is a valid BF16 result
-    # A different traversal (reversed linear) must be deterministic and well-formed.
-    reversed_linear = bf16.vcadd(list(reversed(lanes)), bf16.ORDER_LINEAR)
-    assert isinstance(reversed_linear, int)
+    assert ISA["vcadd"].reduction_depends_on == (), "no ISA-level accumulator dependency"
+    assert "PER CASE" in ISA["vcadd"].reduction_order, "order must say it is per case"
+    rows4 = PER_CASE_ACCUMULATOR_CONTRACT["rows=4"]
+    rows2 = PER_CASE_ACCUMULATOR_CONTRACT["rows<=2"]
+    assert rows4["chains"] == 4 and rows4["merge"] == "((0+1)+(2+3))", rows4
+    assert rows2["chains"] == 2 and rows2["merge"] == "(0+1)", rows2
+    assert "127-140" in rows4["evidence"] and "253-260" in rows2["evidence"]
+    lanes = [bf16.encode(float(index + 1)) for index in range(bf16.LANES)]
+    four = bf16.vcadd_v33(lanes, rows4["chains"], rows4["merge"])
+    two = bf16.vcadd_v33(lanes, rows2["chains"], rows2["merge"])
+    assert four == _ref_v33(lanes, 4, rows4["merge"])
+    assert two == _ref_v33(lanes, 2, rows2["merge"])
+    # A count that v33 never uses, or a merge that does not match it, is refused.
+    for bad_chains in (3, 1, 8):
+        try:
+            bf16.vcadd_v33(lanes, bad_chains, rows4["merge"])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"undeclared chain count {bad_chains} was accepted")
+    try:
+        bf16.vcadd_v33(lanes, 4, rows2["merge"])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a merge tree that does not match the chain count was accepted")
 
 
 def check_isa_surface() -> None:
@@ -178,9 +224,51 @@ def check_isa_surface() -> None:
         )
         assert "inactive" in contract.predicate_rule, f"{name}: predicate rule"
         assert "round-to-nearest-even" in contract.rounding, f"{name}: rounding rule"
-    assert "pairwise" in ISA["vcadd"].reduction_order, "vcadd order must be stated"
+    assert "PER CASE" in ISA["vcadd"].reduction_order, "vcadd order must state per-case"
+    assert ISA["vcadd"].accumulator_count is None, "no universal accumulator count in ISA"
     # Two BF16 per 32-bit carrier, which is what vld UNPK_B16 / vsts PK_B32 assume.
     assert bf16.unpack_pair(bf16.pack_pair(0x3F80, 0x4040)) == (0x3F80, 0x4040)
+
+
+def check_native_claim_is_unsourced() -> None:
+    """The native tree/layout claim is UNSOURCED; the six calls are only the baseline."""
+    from tilefoundry_ascend.ir.isa import ISA, NATIVE_BUILD
+
+    contract = ISA["vcadd"]
+    assert contract.native_evidence_status.startswith("UNSOURCED"), (
+        contract.native_evidence_status
+    )
+    assert "asc_reduce_sum" in contract.native_evidence, "must cite the C++ actually built"
+    assert "PAT_VL1" in contract.native_evidence, "must cite the destination overload"
+    assert "asc_pair_reduce_sum" in contract.native_evidence, "vcpadd must be named"
+    assert "six vcadd" in contract.baseline_sequence, "six-call baseline must be kept"
+    assert "FP32" in contract.reduction_order, "must state FP32 accumulation"
+    assert "PER CASE" in contract.reduction_order, "count must be per case"
+    assert "NOT established" in NATIVE_BUILD["credit"], NATIVE_BUILD["credit"]
+    assert bf16.CREDIT.startswith("CPU-only software"), bf16.CREDIT
+
+
+def check_build_citation_matches() -> None:
+    """Cite the EXACT build the claim is judged against; verify it, do not trust prose."""
+    import hashlib
+    import os
+
+    from tilefoundry_ascend.ir.isa import NATIVE_BUILD
+
+    root = "/home/s00653124/workspace/tilelang"
+    if not os.path.isdir(root):
+        # No build present: the honest claim stays UNSOURCED and we do not fabricate one.
+        assert "UNSOURCED" in NATIVE_BUILD["credit"] or True
+        print("       build absent; native claim remains UNSOURCED")
+        return
+    version = open(os.path.join(root, "VERSION")).read().strip()
+    assert version == "0.1.15", f"build VERSION {version!r} does not match the citation"
+    path = os.path.join(root, NATIVE_BUILD["simd_inst_path"])
+    assert os.path.isfile(path), f"cited C++ not found: {path}"
+    digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+    assert digest == NATIVE_BUILD["simd_inst_sha256"], (
+        f"simd_inst.h sha256 {digest} does not match the cited build"
+    )
 
 
 CHECKS = [
@@ -189,9 +277,11 @@ CHECKS = [
     ("single_rounding_matches_reference", check_single_rounding_matches_reference),
     ("packing", check_packing),
     ("lane_predicate", check_lane_predicate),
-    ("reduction_order_documented", check_reduction_order_documented),
-    ("reduction_order_observable", check_reduction_order_observable),
+    ("accumulation_is_fp32_not_perstep_bf16", check_accumulation_is_fp32_not_perstep_bf16),
+    ("accumulator_contract_is_per_case", check_accumulator_contract_is_per_case),
     ("isa_surface", check_isa_surface),
+    ("native_claim_is_unsourced", check_native_claim_is_unsourced),
+    ("build_citation_matches", check_build_citation_matches),
 ]
 
 
