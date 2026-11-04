@@ -15,14 +15,19 @@ selects instead of being an attribute nothing can verify.
 count and is never read as one: the AIV vector unit computes over 64 lanes, and
 the mask has one bit per lane.
 
-Replay with the approved container interpreter:
+Replay with the interpreter of record, INSIDE the container (never on the host):
 
     docker exec -u s00653124 tf-ascend950pr bash -c '\
-      export LD_LIBRARY_PATH=/opt/tf-venv/lib:$LD_LIBRARY_PATH; \
       export PYTHONPATH=<repo>/src:<repo>/targets/ascend; \
-      cd <repo> && /opt/tf-venv/bin/python \
+      cd <repo> && $HOME/.conda/envs/tilefoundry-npu/bin/python3.12 \
       -m tilefoundry.cli schedule finalize \
       examples/rmsnorm_950pr/vadd_chain.py:VaddChain <out.py>'
+
+The conda env is the env of record. ``/opt/tf-venv`` is retired and must not be
+quoted as evidence; a transcript from it is provisional by definition. The output
+path must not be under /tmp: the loader walks the containing directory, so a
+temporary directory of unrelated packages will fail the import for reasons that
+have nothing to do with this program.
 """
 from __future__ import annotations
 

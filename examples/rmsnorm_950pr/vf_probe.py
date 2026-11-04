@@ -2,13 +2,15 @@
 
 This is the smallest authored program that enters a declared execution mode
 through the public surface. It exists so the region can be replayed by anyone
-with the approved container interpreter, rather than living in a scratch file:
+with the interpreter of record, rather than living in a scratch file:
 
     docker exec -u s00653124 tf-ascend950pr bash -c '\
-      export LD_LIBRARY_PATH=/opt/tf-venv/lib:$LD_LIBRARY_PATH; \
       export PYTHONPATH=<repo>/src:<repo>/targets/ascend; \
-      cd <repo> && /opt/tf-venv/bin/python \
+      cd <repo> && $HOME/.conda/envs/tilefoundry-npu/bin/python3.12 \
       -m tilefoundry.cli analyze examples/rmsnorm_950pr/vf_probe.py:VfInsideMesh'
+
+``/opt/tf-venv`` is retired: a transcript from it is provisional and must not be
+quoted as evidence. Nothing here runs on the host.
 
 Reading the two entries:
 
