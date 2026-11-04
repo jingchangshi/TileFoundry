@@ -757,23 +757,41 @@ def verify_allocation_placement(value, modes: tuple, enclosing: frozenset = froz
         storage = getattr(type_, "storage", None)
         if storage is None:
             continue
-        for declared in declared_kinds():
-            if not declared.owns_storage(storage):
-                continue
-            if declared.name in modes or declared.name not in enclosing:
-                continue
-            holder = modes[-1] if modes else None
-            where = (
-                f"runs inside {holder!r}"
-                if holder is not None
-                else "runs outside every execution region"
-            )
-            raise VerifyError(
-                f"allocation of {storage.name.lower()} storage for "
-                f"{getattr(type_, 'shape', ())!s} {where}: {storage.name.lower()} is "
-                f"private to execution region {declared.name!r}, so it may only be "
-                "allocated inside that region"
-            )
+        # Which declarations treat this storage as theirs, and which of those the
+        # function actually enters. Ownership must be decided over BOTH sets: an
+        # allocation is legal as soon as ANY mode in force owns the storage, and is
+        # a violation only when a mode this function enters owns it while none of
+        # the modes in force does.
+        #
+        # Iterating the declarations and refusing on the first owner that is "in
+        # enclosing but not in modes" would refuse a legal allocation whenever two
+        # modes own the same storage: standing inside the first, the second is
+        # entered somewhere in the function and always looks violated. That shape
+        # cannot occur today -- exactly one declared kind claims register storage --
+        # but the rule should not depend on that remaining true, so it is written to
+        # be correct for any number of owners rather than for the one we happen to
+        # have.
+        owners = [declared for declared in declared_kinds() if declared.owns_storage(storage)]
+        if not owners:
+            continue
+        if any(declared.name in modes for declared in owners):
+            continue
+        entered = [declared for declared in owners if declared.name in enclosing]
+        if not entered:
+            continue  # private to a mode this function never enters: not this rule
+        holder = modes[-1] if modes else None
+        where = (
+            f"runs inside {holder!r}"
+            if holder is not None
+            else "runs outside every execution region"
+        )
+        names = ", ".join(repr(declared.name) for declared in entered)
+        raise VerifyError(
+            f"allocation of {storage.name.lower()} storage for "
+            f"{getattr(type_, 'shape', ())!s} {where}: {storage.name.lower()} is "
+            f"private to execution region {names}, so it may only be "
+            "allocated inside that region"
+        )
 
 def verify_private_parameters(fn, enclosing: frozenset) -> None:
     """Refuse an externally supplied value in storage a mode owns.
@@ -799,15 +817,26 @@ def verify_private_parameters(fn, enclosing: frozenset) -> None:
         storage = getattr(type_, "storage", None)
         if storage is None:
             continue
-        for declared in declared_kinds():
-            if not declared.owns_storage(storage) or declared.name not in enclosing:
-                continue
-            raise VerifyError(
-                f"PrimFunction {fn.name!r}: parameter {param.name!r} is "
-                f"{storage.name.lower()} storage, which is private to execution "
-                f"region {declared.name!r}; a private value is created inside its "
-                "region, so it cannot be supplied from outside one"
-            )
+        # Named over EVERY declaring mode the function enters, for the reason given
+        # on the allocation check: with more than one owner, reporting only the first
+        # found would name a mode that is not the one the reader was thinking of, and
+        # the message would be right for the wrong place. The rule is the same either
+        # way -- such a parameter has no possible producer -- so the parameter is
+        # refused once, with every owner named.
+        entered = [
+            declared
+            for declared in declared_kinds()
+            if declared.owns_storage(storage) and declared.name in enclosing
+        ]
+        if not entered:
+            continue
+        names = ", ".join(repr(declared.name) for declared in entered)
+        raise VerifyError(
+            f"PrimFunction {fn.name!r}: parameter {param.name!r} is "
+            f"{storage.name.lower()} storage, which is private to execution "
+            f"region {names}; a private value is created inside its "
+            "region, so it cannot be supplied from outside one"
+        )
 
 
 def verify_operand_lanes(stmt, modes: tuple) -> None:
