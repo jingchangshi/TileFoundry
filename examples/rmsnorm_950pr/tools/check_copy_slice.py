@@ -62,8 +62,8 @@ def main(artifact: str, entry: str) -> int:
     fn = m.entry_function()
     params = {q.name: q.type for q in fn.params}
     out["structural"]["params"] = sorted(params)
-    out["structural"]["in_gmem"] = str(getattr(params.get("x"), "storage", "")) == "2"
-    out["structural"]["out_gmem"] = str(getattr(params.get("out"), "storage", "")) == "2"
+    out["structural"]["in_gmem"] = int(getattr(params.get("x"), "storage", -1)) == 2
+    out["structural"]["out_gmem"] = int(getattr(params.get("out"), "storage", -1)) == 2
     found = {"meshes": [], "evaluates": []}
     _walk(fn.body, found)
     out["structural"]["mesh_names"] = [list(mesh.names) if hasattr(mesh, "names") else str(mesh) for mesh in found["meshes"]]
@@ -81,7 +81,7 @@ def main(artifact: str, entry: str) -> int:
                 storages.add(int(storage))
     out["structural"]["copy_operand_storages"] = sorted(storages)
     out["structural"]["has_smem_staging"] = 3 in storages  # StorageKind.SMEM
-    out["structural"]["has_aiv_mesh"] = any("aiv" in (mesh.names if hasattr(mesh, "names") else ()) for mesh in found["meshes"])
+    out["structural"]["has_aiv_mesh"] = any("aiv" in tuple(t.name for t in getattr(mesh, "topologies", ())) for mesh in found["meshes"])
 
     scratch = p.parent
 
