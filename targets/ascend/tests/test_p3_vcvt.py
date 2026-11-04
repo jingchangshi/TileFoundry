@@ -267,30 +267,23 @@ def check_carrier_into_arithmetic_tir():
 
 
 def check_carrier_into_element_register():
-    """A carrier store must state pack=PK_B32; a bare carrier store is refused by name.
+    """vsts is an element-register store: a carrier is not an f32 element register.
 
-    Vsts now admits a carrier source ONLY together with pack=PK_B32 (the reverse conversion
-    path). A carrier arriving without that pack is not an element-register store: it is
-    refused by the _VstsPack rule. Conversely a plain f32 store may not claim PK_B32.
+    This is the CONTRACT OF THE OPS IN THIS COMMIT (Vsts takes an f32 RMEM source, no
+    pack). The carrier source is refused by the operand/dtype rule that names Vsts and the
+    offending dtype. The reverse-conversion store (carrier + pack=PK_B32) is a later,
+    separate feature and is asserted in its own test, NOT here.
     """
     try:
-        check_call(Vsts(), (ty("bf16", "carrier"), ty("bf16", "smem")), AIV, frame=None)
+        check_call(Vsts(), (ty("bf16", "carrier"), ty("f32", "smem")), AIV, frame=None)
     except ScheduleRefusal as error:
         text = str(error)
-        if "T.ascend_vsts" not in text or "must state pack=PK_B32" not in text:
-            raise AssertionError(f"bare carrier->vsts refused by the wrong layer: {text}")
+        reasons = ("does not match f32", "src.dtype = dst.dtype")
+        if "T.ascend_vsts" not in text or not any(reason in text for reason in reasons):
+            raise AssertionError(f"carrier->vsts refused by the wrong layer: {text}")
         print("       " + text.strip().splitlines()[-1][:170])
     else:
-        raise AssertionError("a bare carrier store (no PK_B32) was ACCEPTED")
-    try:
-        check_call(Vsts(pack="PK_B32"), (ty("f32", "rmem"), ty("f32", "smem")), AIV, frame=None)
-    except ScheduleRefusal as error:
-        text = str(error)
-        if "T.ascend_vsts" not in text or "no pack" not in text:
-            raise AssertionError(f"f32 vsts with PK_B32 refused by the wrong layer: {text}")
-        print("       " + text.strip().splitlines()[-1][:170])
-    else:
-        raise AssertionError("an f32 store claiming PK_B32 was ACCEPTED")
+        raise AssertionError("carrier into vsts was ACCEPTED")
 
 
 def check_carrier_outside_region():
