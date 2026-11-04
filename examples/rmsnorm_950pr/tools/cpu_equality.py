@@ -152,6 +152,19 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--out", help="write the JSON report here (stdout carries it too)")
     parser.add_argument(
+        "--source",
+        help=(
+            "assert the case's source resolves to this path before running."
+            " A caller that names a source gets a refusal if the case it"
+            " selected is about a different program, rather than a verdict"
+            " about the wrong one."
+        ),
+    )
+    parser.add_argument(
+        "--entry",
+        help="assert the case's entry name matches, on the same grounds",
+    )
+    parser.add_argument(
         "--require-torch",
         action="store_true",
         help="treat a missing torch as ERROR rather than NOT_RUN",
@@ -159,6 +172,31 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     cases = args.case or sorted(CASES)
+
+    # A caller-supplied source/entry is a claim about WHICH program to check.
+    # If it disagrees with the selected case, refuse: running the case anyway
+    # would answer a question nobody asked, and silently checking a different
+    # artifact is worse than not checking one.
+    for name in cases:
+        spec = CASES[name]
+        if args.source is not None:
+            wanted = Path(args.source).resolve()
+            actual = (REPO_ROOT / spec["source"]).resolve()
+            if wanted != actual:
+                print(
+                    "cpu_equality: error: case %r is about %s, not the requested %s"
+                    % (name, actual, wanted),
+                    file=sys.stderr,
+                )
+                return ERROR
+        if args.entry is not None and spec["entry"] != args.entry:
+            print(
+                "cpu_equality: error: case %r has entry %r, not the requested %r"
+                % (name, spec["entry"], args.entry),
+                file=sys.stderr,
+            )
+            return ERROR
+
     report = {
         "tool": "cpu_equality",
         "generated_at": _now(),

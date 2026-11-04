@@ -39,6 +39,10 @@ _STATUS_EXIT = {"PASS": PASS, "FAIL": FAIL, "ERROR": ERROR, "NOT_RUN": NOT_RUN}
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TOOLS_DIR = Path(__file__).resolve().parent
 DEFAULT_PYTHON = "/home/s00653124/workspace/tfpy312/bin/python"
+
+# Set from --python in main(). Module-level so a check can be called on its own
+# for a self-test, which is only meaningful if it uses the same interpreter.
+PYTHON = os.environ.get("TF_PYTHON", DEFAULT_PYTHON)
 DEFAULT_WORKSPACE = REPO_ROOT.parent
 
 #: Written by a check into its scratch directory and then imported as a file,
@@ -228,7 +232,75 @@ def check_m2b_copy(scratch: Path) -> dict:
     return record
 
 
-CHECK_NAMES = ["import_dsl", "analyze", "m2b_copy"]
+def check_no_silent_fallback() -> dict:
+    """check_copy_slice.py refuses an unregistered source/entry instead of
+    reporting the default artifact's verdict.
+
+    This is a regression guard for a real defect: the tool used to resolve a
+    custom case and then forward the DEFAULT artifact anyway, so a caller who
+    named a source that was not registered still got exit 0 and a PASS about
+    copy_slice.py. A verdict about a program the caller never named is worse
+    than no verdict, so the refusal is now asserted rather than assumed.
+    """
+    tool = TOOLS_DIR / "check_copy_slice.py"
+    if not tool.is_file():
+        return {
+            "check": "no_silent_fallback",
+            "status": "NOT_RUN",
+            "reason": "tool absent: " + str(tool),
+        }
+
+    real = REPO_ROOT / "examples/rmsnorm_950pr/copy_slice.py"
+    cases = [
+        # (label, argv, expected non-zero because)
+        (
+            "absent_entry",
+            [str(real), "NotARealEntry"],
+            "the entry does not exist in the artifact",
+        ),
+        (
+            "absent_source",
+            [str(REPO_ROOT / "examples/rmsnorm_950pr/does_not_exist.py"), "CopySlice"],
+            "the source does not exist",
+        ),
+        (
+            "registered_source_wrong_entry",
+            [str(real), "CopySliceWrong"],
+            "the pair is not registered, though the source is",
+        ),
+    ]
+
+    results = {}
+    ok = True
+    for label, argv, why in cases:
+        record = run_command(
+            "fallback_" + label,
+            [PYTHON, str(tool)] + argv,
+            timeout=300.0,
+        )
+        refused = record.get("exit_code") != 0
+        # A refusal that passed the default artifact would still be a silent
+        # fallback, so the emitted report is read for the fallback marker too.
+        fell_back = "delegated_to_default_case" in (
+            record.get("stdout_tail") or ""
+        )
+        results[label] = {
+            "argv": argv,
+            "expectation": why,
+            "exit_code": record.get("exit_code"),
+            "refused": refused,
+            "fell_back_to_default": fell_back,
+        }
+        ok = ok and refused and not fell_back
+
+    return {
+        "check": "no_silent_fallback",
+        "cases": results,
+        "status": "PASS" if ok else "FAIL",
+        "exit_code": PASS if ok else FAIL,
+    }
+
+CHECK_NAMES = ["import_dsl", "analyze", "m2b_copy", "no_silent_fallback"]
 
 
 def main(argv=None) -> int:
@@ -276,6 +348,21 @@ def main(argv=None) -> int:
             report["checks"].append(check_analyze())
         if "m2b_copy" in wanted:
             report["checks"].append(check_m2b_copy(scratch_path))
+        if "no_silent_fallback" in wanted:
+            report["checks"].append(check_no_silent_fallback())
+
+    # A requested check that produced no record would otherwise vanish and the
+    # run would still report PASS on whatever checks remained. That is the same
+    # silent-substitution failure this harness exists to catch, so a missing
+    # record is an ERROR naming the check.
+    produced = {check.get("check") for check in report["checks"]}
+    missing = [name for name in wanted if name not in produced]
+    if missing:
+        report["status"] = "ERROR"
+        report["error"] = "no record produced for: " + ", ".join(missing)
+        report["exit_code"] = ERROR
+        print(json.dumps(report, indent=2))
+        return ERROR
 
     for check in report["checks"]:
         if "status" not in check:

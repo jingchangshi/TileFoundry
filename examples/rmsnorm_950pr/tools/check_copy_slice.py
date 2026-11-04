@@ -209,14 +209,19 @@ def _run(name: str, argv, timeout: float) -> dict:
     return record
 
 
-def delegate_equality() -> dict:
-    """CPU equality lives in tools/cpu_equality.py; this records its verdict."""
+def delegate_equality(case: str, artifact: Path) -> dict:
+    """CPU equality lives in tools/cpu_equality.py; this records its verdict.
+
+    The case name is passed through rather than hardcoded, so this reports the
+    verdict for the case the caller asked about. The artifact is named too,
+    so a case that resolved to a different source cannot be reported here.
+    """
     tool = TOOLS_DIR / "cpu_equality.py"
     if not tool.is_file():
         return {"check": "equality", "status": "NOT_RUN", "reason": "absent: " + str(tool)}
     record = _run(
         "equality",
-        [PYTHON, str(tool), "--case", "copy_slice"],
+        [PYTHON, str(tool), "--case", case, "--source", str(artifact)],
         timeout=600.0,
     )
     if record.get("status") == "NOT_RUN":
@@ -227,18 +232,29 @@ def delegate_equality() -> dict:
     return record
 
 
-def delegate_rejections() -> dict:
-    """Expected-rejection evidence lives in tools/verify_tir.py."""
+def delegate_rejections(artifact: Path, entry: str) -> dict:
+    """Expected-rejection evidence lives in tools/verify_tir.py.
+
+    The artifact and entry are passed through so the rejections are proven
+    against the program the caller named. They are read from that tool's own
+    report file rather than inferred from its exit code or a stdout tail.
+    """
     tool = TOOLS_DIR / "verify_tir.py"
     if not tool.is_file():
         return {"check": "rejections", "status": "NOT_RUN", "reason": "absent: " + str(tool)}
-    # verify_tir.py exits 1 on an authored artifact by design while the region
-    # gap is open, so its rejection evidence is read from its OWN report file
-    # rather than inferred from that exit code or from a truncated stdout tail.
     report_path = Path(tempfile.mkdtemp(prefix="rejections_")) / "verify_tir.json"
     record = _run(
         "rejections",
-        [PYTHON, str(tool), "--out", str(report_path)],
+        [
+            PYTHON,
+            str(tool),
+            "--source",
+            str(artifact),
+            "--entry",
+            entry,
+            "--out",
+            str(report_path),
+        ],
         timeout=600.0,
     )
     record["report_path"] = str(report_path)
@@ -259,22 +275,39 @@ def delegate_rejections() -> dict:
     return record
 
 
-def _resolve_case(artifact: Path):
-    """The name cpu_equality.py registers for this artifact, or None.
+def _display_path(source: str) -> str:
+    """A registered case source, shown repo-relative when it is inside the repo."""
+    resolved = (REPO_ROOT / source).resolve()
+    try:
+        return str(resolved.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(resolved)
 
-    One artifact, one case name. A source with no registered case has no
-    reference to compare against, so it cannot be checked by copying the
-    default case's verdict into it.
-    """
+
+def _cpu_equality_cases() -> dict:
     try:
         import cpu_equality  # noqa: PLC0415 -- sibling tool, imported lazily
     except ImportError:
         sys.path.insert(0, str(TOOLS_DIR))
         import cpu_equality  # noqa: PLC0415
-    for name, spec in cpu_equality.CASES.items():
-        if (REPO_ROOT / spec["source"]).resolve() == artifact:
-            return name
-    return None
+    return cpu_equality.CASES
+
+
+def _resolve_case(artifact: Path, entry: str):
+    """The (case name, spec) cpu_equality.py registers for this source+entry.
+
+    BOTH the source and the entry must match. Matching on the source alone
+    would let `copy_slice.py:SomeOtherFunction` be reported using the
+    registered case's verdict, which is a claim about a program the caller
+    never named. A miss returns (None, None) and the caller refuses.
+    """
+    for name, spec in _cpu_equality_cases().items():
+        if (REPO_ROOT / spec["source"]).resolve() != artifact:
+            continue
+        if spec["entry"] != entry:
+            continue
+        return name, spec
+    return None, None
 
 
 def main(argv=None) -> int:
@@ -296,55 +329,46 @@ def main(argv=None) -> int:
         print("check_copy_slice: error: no such artifact: " + str(artifact), file=sys.stderr)
         return ERROR
 
-    default = DEFAULT_ARTIFACT.resolve()
-    delegated_from = None
-    checked_case = _resolve_case(artifact)
-    if artifact != default:
-        # A custom source is never checked by a second, weaker path. It is
-        # resolved to the case name cpu_equality.py registers for it, and the
-        # check then runs against THAT case's defining artifact, so the
-        # verdict means exactly what the registered case means.
-        #
-        # Today the only registered case IS the default artifact, so a
-        # different file has no reference to compare against and is refused
-        # rather than checked against the wrong program's semantics. The
-        # re-entry below becomes reachable when a second case is registered.
-        delegated_from = str(artifact)
-        case = checked_case
-        if case is None:
-            report = {
-                "tool": "check_copy_slice",
-                "generated_at": _now(),
-                "artifact": str(artifact),
-                "status": "ERROR",
-                "exit_code": ERROR,
-                "error": (
-                    "no registered case covers " + str(artifact)
-                    + "; register it in cpu_equality.CASES rather than checking it out of band"
-                ),
-            }
-            print(json.dumps(report, indent=2))
-            return ERROR
-        forwarded = [str(DEFAULT_ARTIFACT), args.entry]
-        if args.skip_delegations:
-            forwarded.append("--skip-delegations")
+    # The caller names a source AND an entry, and the check runs against
+    # exactly that pair. There is no fallback: a pair that matches no
+    # registered case is refused before anything is executed, because the
+    # alternative -- substituting the default artifact -- would report a
+    # verdict about a program the caller never asked about.
+    case, spec = _resolve_case(artifact, args.entry)
+    if case is None:
+        # Report the registered pairs for the reader. A case may point outside
+        # the repo (a temporary fixture, for instance), so this must not assume
+        # every source is a repo-relative path.
+        registered = sorted(
+            "%s:%s" % (_display_path(s["source"]), s["entry"])
+            for s in _cpu_equality_cases().values()
+        )
+        report = {
+            "tool": "check_copy_slice",
+            "generated_at": _now(),
+            "requested": {"source": str(artifact), "entry": args.entry},
+            "registered": registered,
+            "status": "ERROR",
+            "exit_code": ERROR,
+            "error": (
+                "no registered case for %s:%s; the requested source and entry"
+                " must both match a cpu_equality.CASES entry. Registered: %s"
+            ) % (artifact, args.entry, ", ".join(registered) or "none"),
+        }
+        print(json.dumps(report, indent=2))
         if args.out:
-            forwarded.extend(["--out", args.out])
-        code = main(forwarded)
-        return code
+            Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        return ERROR
 
     report = {
         "tool": "check_copy_slice",
         "generated_at": _now(),
         "artifact": str(artifact),
         "entry": args.entry,
+        "checked_case": case,
         "python": PYTHON,
-        "checked_case": checked_case,
         "checks": {},
     }
-    if delegated_from is not None:
-        report["delegated_from"] = delegated_from
-        report["checks"]["delegated_to_default_case"] = True
 
     with tempfile.TemporaryDirectory(prefix="copy_slice_") as scratch:
         tir = Path(scratch) / "copy_resolved_tir.py"
@@ -413,10 +437,10 @@ def main(argv=None) -> int:
     )
 
     if not args.skip_delegations:
-        equality = delegate_equality()
+        equality = delegate_equality(case, artifact)
         report["equality"] = equality
         checks["cpu_equality"] = equality.get("status") == "PASS"
-        rejections = delegate_rejections()
+        rejections = delegate_rejections(artifact, args.entry)
         report["rejections"] = rejections
         checks["expected_rejections"] = rejections.get("status") == "PASS"
 
