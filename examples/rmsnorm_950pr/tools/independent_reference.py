@@ -159,13 +159,84 @@ def verdict_from_numeric(numeric, ref_by_key):
     }
 
 
+def _pattern_order(key):
+    order = ["zero", "ones", "random_s0", "random_s1", "random_s2", "alternating"]
+    return (order.index(key) if key in order else 99, key)
+
+
+def verify_tensors(tensors_dir):
+    """Direct elementwise compare of persisted device tensors against THIS reference.
+
+    Uses the ACTUAL inputs the device consumed (.x.npy/.w.npy), so it is independent of
+    any RNG-version question: the same arrays feed the numpy reference and were fed to the
+    kernel. For each <key>.device.npy we recompute the fp64 reference in numpy, bf16-round,
+    and apply the frozen atol+rtol rule elementwise. .golden.npy is cross-checked to prove
+    this reference equals the runner golden bit-for-bit.
+    """
+    import os
+    report = {"reference": "numpy float64 rmsnorm on persisted bf16 inputs", "eps": EPS,
+              "atol": ATOL, "rtol": RTOL, "cases": []}
+    for case_id, rows, d, loop_mode in CASES:
+        cdir = os.path.join(tensors_dir, case_id)
+        if not os.path.isdir(cdir):
+            report["cases"].append({"case_id": case_id, "status": "NO_DIR"})
+            continue
+        keys = sorted([n[:-len(".device.npy")] for n in os.listdir(cdir)
+                       if n.endswith(".device.npy")], key=_pattern_order)
+        per = []
+        case_abs = 0.0; case_rel = 0.0; case_mism = 0; case_n = 0
+        golden_mismatch_total = 0
+        for key in keys:
+            x = np.load(os.path.join(cdir, key + ".x.npy"))
+            w = np.load(os.path.join(cdir, key + ".w.npy"))
+            dev = np.load(os.path.join(cdir, key + ".device.npy"))
+            gpath = os.path.join(cdir, key + ".golden.npy")
+            gold = np.load(gpath) if os.path.isfile(gpath) else None
+            xd = x.astype(np.float64)
+            wd = w.astype(np.float64)
+            var = np.mean(xd * xd, axis=-1, keepdims=True)
+            rstd = 1.0 / np.sqrt(var + EPS)
+            exact = xd * rstd * wd[None, :]
+            ref_bf32 = bf16_from_f32(exact.astype(np.float32))
+            gbit = -1
+            if gold is not None:
+                gbit = int(np.count_nonzero(ref_bf32.view(np.uint32) != gold.view(np.uint32)))
+                golden_mismatch_total += gbit
+            diff = np.abs(dev - ref_bf32)
+            tol = ATOL + RTOL * np.abs(ref_bf32)
+            mism = int(np.count_nonzero(diff > tol))
+            max_abs = float(diff.max())
+            max_rel = float((diff / np.maximum(np.abs(ref_bf32), 1e-12)).max())
+            case_abs = max(case_abs, max_abs); case_rel = max(case_rel, max_rel)
+            case_mism += mism; case_n += 1
+            per.append({"pattern_key": key, "max_abs": max_abs, "max_rel": max_rel,
+                        "mismatch_count": mism, "ref_vs_golden_bitwise_mismatch": gbit,
+                        "n_elements": int(dev.size)})
+        report["cases"].append({
+            "case_id": case_id, "shape": [rows, d], "loop_mode": loop_mode,
+            "max_abs": case_abs, "max_rel": case_rel, "mismatch_count_total": case_mism,
+            "golden_bitwise_mismatch_total": golden_mismatch_total,
+            "verdict": "PASS" if (case_n > 0 and case_mism == 0) else "FAIL",
+            "per_pattern": per,
+        })
+    return report
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases-dir", default=None,
                     help="dir with <case_id>/numeric.json device results to judge")
+    ap.add_argument("--tensors-dir", default=None,
+                    help="dir with <case_id>/*.x.npy/.w.npy/.device.npy for a direct elementwise compare")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     import os
+    if args.tensors_dir:
+        trep = verify_tensors(args.tensors_dir)
+        if args.out:
+            with open(args.out, "w") as fh:
+                json.dump(trep, fh, indent=2)
+        print(json.dumps(trep, indent=2))
+        return
     report = {"reference": "numpy float64 rmsnorm on bf16 inputs -> bf16",
               "eps": EPS, "atol": ATOL, "rtol": RTOL,
               "pattern_sequence": [list(p) for p in PATTERNS], "cases": []}
