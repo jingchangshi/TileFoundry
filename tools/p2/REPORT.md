@@ -16,6 +16,12 @@ Fuzz: `fuzz.py` (boundary-biased 20k patterns, first-divergence report, roundtri
 - Zero, +0/-0 sign preservation, infinity, and the NaN CLASS.
 - f32 elementwise multiply and add: each rounded to binary32 (RNE) per IEEE-754.
 
+**REFERENCE_REDUCTION_ORDER is a documented CHOICE, not a fact.** It states what this
+reference models (2 accumulators, round-robin, f32 after every mul/add, left-to-right
+vcadd chain). No spec I can cite fixes that order; it is an assumption recorded so it can
+be challenged, and tooling/p2/cross_check_impl.py demonstrates below that a different
+accumulation precision yields different bits on the same inputs.
+
 ## NOT DETERMINED by the spec (the honest ceiling)
 
 1. **vcadd lane-reduction order.** The design says six vcadd calls; the order in which
@@ -52,3 +58,28 @@ with one legal reduction, not proof of the hardware order.
 microtests: ALL PASS (18 boundary cases + 4 self-checks).
 fuzz: 20,000 boundary-biased patterns, NO DIVERGENCE; roundtrip drift 0.
 (One real reference bug was found and fixed during this work: -0.0 lost its sign.)
+
+
+## Two-independent-paths cross-check (I1's target-side bf16.py vs this reference)
+
+tools/p2/cross_check_impl.py, read-only on the target-side module:
+  encode: 20,000 exact-f32 inputs (boundary exponents + random words) -> AGREE
+  decode: all 65,536 bf16 patterns compared as exact rationals -> AGREE
+  reduction: his ORDER_LINEAR vs an independent bf16-step fold -> AGREE
+  accumulator precision: bf16-step vs f32-step DOES differ on a crafted 64-lane vector
+    (all terms in [1,2)): bf16-step 0x42C5 vs f32-step 0x4318. Same inputs, different
+    bits. This is the CHOICE above made observable; it is NOT a defect on either side.
+
+## P2 CEILING (nothing downstream may silently assume these)
+
+1. vcadd lane-reduction order (tree vs sequential vs hardware hierarchy).
+2. ACCUMULATOR COUNT -- FLAGGED TO LEAD, touches the design baseline: the design says
+   four; kernel_v33's rows=4 path shows TWO (acc0, acc1). Unresolved.
+3. Fusion / wider intermediates (reference rounds f32 after every mul and add).
+4. rsqrt precision (vdiv(1, vsqrt) vs an approximate rsqrt instruction).
+5. Denormal FTZ/DAZ on device (reference is IEEE, no flush).
+6. bf16 pack rounding of y (PK_B32) -- assumed RNE.
+7. NaN payload (torch 0xFFFF vs canonical 0x7FC0); only the class is fixed.
+
+Consequence: numeric agreement pins only the determined parts; it is NOT proof of the
+hardware reduction order, and the accumulator count is an open design question.

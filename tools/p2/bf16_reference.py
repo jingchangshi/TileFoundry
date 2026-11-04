@@ -119,9 +119,13 @@ def bf16_from_f32_bits(bits: int) -> int:
 
 
 def f32_round(x: float) -> float:
-    """Round a Python float (double) to f32, RNE, via struct."""
+    """Round a Python float (double) to f32, RNE; overflow saturates to +/-inf."""
+    import math
     import struct
-    return struct.unpack("<f", struct.pack("<f", x))[0]
+    try:
+        return struct.unpack("<f", struct.pack("<f", x))[0]
+    except OverflowError:
+        return math.inf if x > 0 else -math.inf
 
 
 # Documented accumulation order used by the reference model.
