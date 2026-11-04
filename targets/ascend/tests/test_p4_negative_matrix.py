@@ -1,14 +1,19 @@
 """04-05/G-P4-7: single-defect negative matrix for the emission ledger -> Problem path.
 
-POSITIVE CONTROL runs first: the real lowering of aiv56_ragged.py:Own56R must pass every invariant.
-Each negative then introduces ONE defect into a fresh copy and must either change the Problem (digest)
-or be REFUSED by name. A negative that is silently accepted fails the matrix. The unknown/fallback
-pseudo-solve row is N/A for 04-05 (that is the shared solver, 04-06/04-08).
+Categories are NOT collapsed into PASS:
+  PASS    - the positive control (the real lowering passes every invariant)
+  REFUSED - a single defect is rejected by a NAMED refusal (LedgerError)
+  CHANGED - a defect in the LEDGER, re-run through the extractor, changes the Problem
+            (new/removed dependency or a changed distance/digest)
+  N/A     - out of 04-05 scope (the solver's unknown/fallback row, 04-06/04-08); NOT counted.
+
+A digest probe is pinned: with the digest hardwired to a constant, the offset-mutation probe must
+FAIL, proving the probe can fail.
 
 Exit codes: 0 PASS, 1 FAIL, 2 ERROR, 3 NOT_RUN.
 """
 from __future__ import annotations
-import dataclasses, os, sys
+import dataclasses, os, sys, types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path[:0] = [os.path.join(ROOT, "src"), os.path.join(ROOT, "targets", "ascend")]
@@ -27,75 +32,105 @@ def build():
     return ledger, build_problem(ledger)
 
 
-def refused(fn):
-    from tilefoundry_ascend.schedule.ledger import LedgerError
-    try:
-        fn()
-    except LedgerError:
-        return True
-    return False
-
-
 def main():
+    from tilefoundry_ascend.schedule import ledger as ledger_mod
     from tilefoundry_ascend.schedule.ledger import (
-        assert_no_default_zero, alias_report, coverage, require_concrete_offset, tasks_coverage,
-        validate_roots,
+        LedgerError, ProblemTask, alias_report, assert_no_default_zero, build_problem, coverage,
+        tasks_coverage, validate_roots,
     )
 
     ledger, problem = build()
-    checks = {}
-    # POSITIVE CONTROL
-    checks["positive_control_coverage"] = coverage(ledger, problem)["bidirectional"]
-    checks["positive_control_tasks"] = tasks_coverage(ledger, problem)["bidirectional"]
-    checks["positive_control_roots"] = refused(lambda: validate_roots(problem)) is False
-    checks["positive_control_alias"] = alias_report(problem)["conflicts"] == []
+    rows = []
+    def add(category, name, ok): rows.append((category, name, bool(ok)))
+    def refused(fn):
+        try:
+            fn()
+        except LedgerError:
+            return True
+        return False
 
-    # 1 UNKNOWN_ROOT
-    checks["neg_UNKNOWN_ROOT"] = refused(lambda: validate_roots(dataclasses.replace(
-        problem, accesses=[dataclasses.replace(problem.accesses[0], root="ghost")] + problem.accesses[1:])))
-    # 2 OFFSET_UNKNOWN -> 0
-    checks["neg_OFFSET_UNKNOWN_as_zero"] = refused(lambda: assert_no_default_zero(dataclasses.replace(
-        problem, accesses=[dataclasses.replace(a, byte_offset=0) if a.offset_status != "BYTES" else a for a in problem.accesses])))
-    # 3 alias bypass
-    checks["neg_ALIAS_ENTRY_BYPASSED"] = refused(lambda: alias_report(problem, entry=lambda *a: []))
-    # 4 delete store
+    # PASS: positive control
+    add("PASS", "positive_control_coverage", coverage(ledger, problem)["bidirectional"])
+    add("PASS", "positive_control_tasks", tasks_coverage(ledger, problem)["bidirectional"])
+    add("PASS", "positive_control_roots", not refused(lambda: validate_roots(problem)))
+    add("PASS", "positive_control_alias", alias_report(problem)["conflicts"] == [])
+
+    # REFUSED: named refusals
+    add("REFUSED", "neg_UNKNOWN_ROOT", refused(lambda: validate_roots(dataclasses.replace(
+        problem, accesses=[dataclasses.replace(problem.accesses[0], root="ghost")] + problem.accesses[1:]))))
+    add("REFUSED", "neg_OFFSET_UNKNOWN_as_zero", refused(lambda: assert_no_default_zero(dataclasses.replace(
+        problem, accesses=[dataclasses.replace(a, byte_offset=0) if a.offset_status != "BYTES" else a for a in problem.accesses]))))
+    add("REFUSED", "neg_ALIAS_ENTRY_BYPASSED", refused(lambda: alias_report(problem, entry=lambda *a: [])))
     writes = [i for i, e in enumerate(ledger.entries) if e.mode == "write"]
-    checks["neg_drop_store"] = refused(lambda: coverage(dataclasses.replace(ledger, entries=[e for i, e in enumerate(ledger.entries) if i != writes[-1]]), problem))
-    # 5 add copy
+    add("REFUSED", "neg_drop_store", refused(lambda: coverage(dataclasses.replace(
+        ledger, entries=[e for i, e in enumerate(ledger.entries) if i != writes[-1]]), problem)))
     extra = dataclasses.replace(ledger.entries[0], action_id=ledger.entries[0].action_id + ":extra")
-    checks["neg_add_copy"] = refused(lambda: coverage(dataclasses.replace(ledger, entries=ledger.entries + [extra]), problem))
-    # 6 wrong offset -> Problem digest changes
-    shifted = dataclasses.replace(ledger, entries=[dataclasses.replace(ledger.entries[0], byte_offset=4)] + ledger.entries[1:])
-    from tilefoundry_ascend.schedule.ledger import build_problem
-    checks["neg_change_offset_changes_problem"] = build_problem(shifted).problem_digest != problem.problem_digest
-    # 7 wrong distance -> dependency distance changes
-    checks["neg_change_distance_changes_problem"] = (
-        dataclasses.replace(problem, dependencies=[dict(d, distance=(d["distance"] + 1) % 2) for d in problem.dependencies]).dependencies
-        != problem.dependencies
-    )
-    # 8 change loop iteration -> Problem changes
-    iterated = dataclasses.replace(ledger, entries=[dataclasses.replace(ledger.entries[0], iteration_path="other")] + ledger.entries[1:])
-    checks["neg_change_iteration_changes_problem"] = build_problem(iterated).source_digest != problem.source_digest
-    # 9 tasks hardcoded -> TASK_STABLE_ID_MISMATCH
-    from tilefoundry_ascend.schedule.ledger import ProblemTask
-    fixed = dataclasses.replace(problem, tasks=[ProblemTask(stable_id="x_load", op="copy", pipe="mte2", resource="mte2", latency=None, issue_interval=None, loop="outside", action_ids=problem.tasks[0].action_ids) ] + problem.tasks[1:])
-    checks["neg_tasks_hardcoded"] = refused(lambda: tasks_coverage(ledger, fixed))
-    # 10 digest constant -> ledger mutation changes problem_digest
-    checks["neg_digest_not_constant"] = build_problem(shifted).problem_digest != problem.problem_digest
-    # 11 coverage missing item -> access dropped
-    checks["neg_coverage_missing"] = refused(lambda: coverage(ledger, dataclasses.replace(problem, accesses=problem.accesses[1:])))
-    # 12 unknown/fallback pseudo-solve: N/A for 04-05 (solver boundary); recorded, not silently skipped
-    checks["neg_pseudo_solve_N_A_04_05"] = True
+    add("REFUSED", "neg_add_copy", refused(lambda: coverage(dataclasses.replace(ledger, entries=ledger.entries + [extra]), problem)))
+    fixed = dataclasses.replace(problem, tasks=[ProblemTask(stable_id="x_load", op="copy", pipe="mte2", resource="mte2",
+                                                           latency=None, issue_interval=None, loop="outside",
+                                                           action_ids=problem.tasks[0].action_ids)] + problem.tasks[1:])
+    add("REFUSED", "neg_tasks_hardcoded", refused(lambda: tasks_coverage(ledger, fixed)))
+    add("REFUSED", "neg_coverage_missing", refused(lambda: coverage(ledger, dataclasses.replace(problem, accesses=problem.accesses[1:]))))
 
-    for key, value in checks.items():
-        # Each row prints its NAME and an explicit verdict: PASS for the positive control,
-        # REFUSED when the single defect was rejected by a named refusal.
-        verdict = ("PASS" if key.startswith("positive_control") else "REFUSED") if value else "FAIL"
-        print(f"{verdict:<9} {key}")
-    if not all(checks.values()):
-        print(f"{sum(not value for value in checks.values())}/{len(checks)} FAILED"); return 1
-    print(f"{len(checks)}/{len(checks)} checks passed")
-    return 0
+    # CHANGED: mutate the LEDGER and RE-RUN the extractor
+    writer = ledger.entries[writes[0]]
+    reader = dataclasses.replace(writer, mode="read", action_id=writer.action_id + ":reader",
+                                 iteration_path=writer.iteration_path + "/second", logical_iteration="second")
+    paired = dataclasses.replace(ledger, entries=ledger.entries + [reader])
+    paired_problem = build_problem(paired)
+    moved_reader = dataclasses.replace(reader, iteration_path=writer.iteration_path, logical_iteration=writer.logical_iteration)
+    same_problem = build_problem(dataclasses.replace(paired, entries=ledger.entries + [moved_reader]))
+    def dep_signature(p):
+        return {(d["producer"], d["consumer"], d["distance"], d["kind"]) for d in p.dependencies}
+    add("CHANGED", "changed_dependency_distance_rebuilt",
+        bool(paired_problem.dependencies) and dep_signature(paired_problem) != dep_signature(same_problem))
+    add("CHANGED", "changed_delete_dependency_rebuilt",
+        dep_signature(build_problem(dataclasses.replace(ledger, entries=[e for e in paired.entries if e.action_id != reader.action_id])))
+        != dep_signature(paired_problem))
+    first = ledger.entries[0]
+    add("CHANGED", "changed_root_digest",
+        build_problem(dataclasses.replace(ledger, entries=[dataclasses.replace(first, root="x2")] + ledger.entries[1:])).source_digest
+        != problem.source_digest)
+    symbolic = next((e for e in ledger.entries if e.source_offset == "symbolic"), ledger.entries[0])
+    symbolic_index = next(i for i, e in enumerate(ledger.entries) if e is symbolic)
+    shifted_ledger = dataclasses.replace(
+        ledger, entries=ledger.entries[:symbolic_index] + [dataclasses.replace(symbolic, source_offset="symbolic+1")] + ledger.entries[symbolic_index + 1:])
+    add("CHANGED", "changed_symbolic_offset_digest", build_problem(shifted_ledger).problem_digest != problem.problem_digest)
+    add("CHANGED", "changed_iteration_digest",
+        build_problem(dataclasses.replace(ledger, entries=[dataclasses.replace(first, iteration_path="other")] + ledger.entries[1:])).source_digest
+        != problem.source_digest)
+    attr_entry = next((e for e in ledger.entries if e.attrs), None)
+    if attr_entry is not None:
+        ai = next(i for i, e in enumerate(ledger.entries) if e is attr_entry)
+        wide = dataclasses.replace(attr_entry, attrs=attr_entry.attrs + (("elem_width", 32),))
+        add("CHANGED", "changed_attr_range_digest",
+            build_problem(dataclasses.replace(ledger, entries=ledger.entries[:ai] + [wide] + ledger.entries[ai + 1:])).problem_digest
+            != problem.problem_digest)
+    else:
+        add("CHANGED", "changed_attr_range_digest", False)
+
+    # PASS: digest probe can fail (hardwire the digest; the offset probe must go False)
+    original_hashlib = ledger_mod.hashlib
+    class _Const:
+        def hexdigest(self): return "0" * 64
+    try:
+        ledger_mod.hashlib = types.SimpleNamespace(sha256=lambda *a, **k: _Const())
+        stub_base = build_problem(ledger)
+        stub_shifted = build_problem(shifted_ledger)
+    finally:
+        ledger_mod.hashlib = original_hashlib
+    # Under a hardwired digest both builds must agree, i.e. the offset probe CAN fail.
+    add("PASS", "digest_probe_can_fail", stub_shifted.problem_digest == stub_base.problem_digest)
+
+    # N/A: solver row (04-06/04-08), excluded from the valid count
+    add("N/A", "pseudo_solve_solver_row", True)
+
+    valid = [row for row in rows if row[0] != "N/A"]
+    for category, name, ok in rows:
+        verdict = category if ok else "FAIL"
+        print(f"{verdict:<8} {name}")
+    print(f"valid={sum(ok for _, _, ok in valid)}/{len(valid)} N/A={sum(1 for c, _, _ in rows if c == 'N/A')}")
+    return 0 if all(ok for _, _, ok in valid) else 1
 
 
 if __name__ == "__main__":

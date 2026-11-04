@@ -37,7 +37,16 @@ def main():
     vcadd_tasks = sorted({e.instruction for e in entries if e.op == "Vcadd"})
     vsts_tasks = sorted({e.instruction for e in entries if e.op == "Vsts"})
     checks["six_vcadd_tasks_visible"] = len(vcadd_tasks) == 6
-    checks["reverse_vsts_tasks_visible"] = len(vsts_tasks) >= 64
+    # Vsts classification by op attribute, NOT by the total count: reverse carries PK_B32 and a
+    # carrier source; forward does not. Report the REAL split and fail if forward is mislabelled.
+    reverse = [e for e in entries if e.op == "Vsts" and ("pack", "PK_B32") in e.attrs]
+    forward = [e for e in entries if e.op == "Vsts" and ("pack", "PK_B32") not in e.attrs]
+    checks["vsts_reverse_pk_b32_split"] = len(reverse) == 64 and len(forward) == 64
+    checks["reverse_vsts_tasks_visible"] = len({e.instruction for e in reverse}) == 64
+    mislabelled = [dataclasses.replace(e, attrs=e.attrs + (("pack", "PK_B32"),))
+                   if (e.op == "Vsts" and ("pack", "PK_B32") not in e.attrs) else e for e in entries]
+    mis_reverse = [e for e in mislabelled if e.op == "Vsts" and ("pack", "PK_B32") in e.attrs]
+    checks["neg_forward_mislabelled_detected"] = len(mis_reverse) != 64
     checks["whole_vf_tasks_not_only_dma"] = any(e.op in ("Vcadd", "Vmula", "Vmuls", "Vadds", "Vsqrt", "Vdiv") for e in entries)
 
     # SSA alignment: every VF read root is written by some VF task in the same iteration scope.

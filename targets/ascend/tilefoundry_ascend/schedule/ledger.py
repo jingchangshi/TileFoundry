@@ -66,6 +66,7 @@ class LedgerEntry:
     byte_footprint: int
     byte_offset: Optional[int]      # None == OFFSET_UNKNOWN
     source_offset: str              # raw TIR slice starts (literal list or 'symbolic')
+    attrs: tuple                    # op attributes: (('pack', 'PK_B32'), ('direction', 'reverse'), ...)
     logical_iteration: str
     iteration_path: str
     iteration_extent: str
@@ -250,6 +251,11 @@ def extract_ledger(function) -> Ledger:
                     byte_footprint=_shape_bytes(type_),
                     byte_offset=offset_of(arg),
                     source_offset=source_offset_of(arg),
+                    attrs=tuple(
+                        (key, getattr(op, key))
+                        for key in ("pack", "direction", "part", "elem_width")
+                        if isinstance(getattr(op, key, None), (str, int, bool))
+                    ),
                     logical_iteration=(loops[-1][0] if loops else "outside"),
                     iteration_path="/".join(name for name, _ in loops) or "outside",
                     iteration_extent=(loops[-1][1] if loops else "1"),
@@ -272,6 +278,7 @@ class ProblemAccess:
     byte_footprint: int
     byte_offset: Optional[int]
     source_offset: str
+    attrs: tuple
     normalized_offset: Optional[int]
     offset_status: str  # "BYTES" | "OFFSET_UNKNOWN"
     logical_iteration: str
@@ -334,6 +341,7 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
             byte_footprint=entry.byte_footprint,
             byte_offset=entry.byte_offset,
             source_offset=entry.source_offset,
+            attrs=entry.attrs,
             normalized_offset=entry.byte_offset,
             offset_status="BYTES" if entry.byte_offset is not None else "OFFSET_UNKNOWN",
             logical_iteration=entry.logical_iteration,
@@ -398,7 +406,8 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
                 'action_id': entry.action_id, 'instruction': entry.instruction, 'op': entry.op,
                 'root': entry.root, 'root_kind': entry.root_kind, 'space': entry.space,
                 'mode': entry.mode, 'byte_footprint': entry.byte_footprint,
-                'byte_offset': entry.byte_offset, 'iteration_path': entry.iteration_path,
+                'byte_offset': entry.byte_offset, 'source_offset': entry.source_offset,
+                'attrs': list(entry.attrs), 'iteration_path': entry.iteration_path,
                 'iteration_extent': entry.iteration_extent,
             }
             for entry in ledger.entries
