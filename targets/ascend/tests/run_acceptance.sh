@@ -159,6 +159,7 @@ run rmsnorm_row      "$PY" "$REPO/targets/ascend/tests/test_rmsnorm_row.py"
 run rmsnorm_d4096    "$PY" "$REPO/targets/ascend/tests/test_rmsnorm_d.py" --tiles 64 --batch 2 --fixture rmsnorm_main.py
 run aiv56_ownership  "$PY" "$REPO/targets/ascend/tests/test_aiv56_ownership.py"
 run eps_runtime      "$PY" "$REPO/targets/ascend/tests/test_eps_runtime.py"
+run aiv56_tir        "$PY" "$REPO/targets/ascend/tests/test_aiv56_tir.py"
 
 # (4) The legacy paths that must not regress, so a green M3 cannot come from
 # breaking CUDA or the copy lowering.

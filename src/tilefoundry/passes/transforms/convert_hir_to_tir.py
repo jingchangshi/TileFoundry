@@ -1345,10 +1345,13 @@ class LoweringContext(TypeInferContext):
                 return lowered
             return self.builder.value(lowered, ctx=self)
         if isinstance(value, Call) and isinstance(value.target, MeshCoord):
+            # A coordinate used as a DIMENSION is a pure value: its TIR value is UMAT-typed so it
+            # is never treated as an rmem allocation outside a region. The shared HIR MeshCoord
+            # type is unchanged; only this dim-lowered TIR value is umat.
             return Call(
                 MeshCoord(mesh=value.target.mesh),
                 value.args,
-                type=value.type,
+                type=replace(value.type, storage=StorageKind.UMAT),
             )
         if isinstance(value, Call) and isinstance(value.target, HirBinary):
             dim_op = _DIM_BINARY.get(value.target.kind)
