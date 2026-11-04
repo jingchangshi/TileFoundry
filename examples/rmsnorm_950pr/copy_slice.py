@@ -13,7 +13,7 @@ N = 64
 @module(entry="copy1", target=Ascend950PRTarget(), topologies=(Topology("aiv", 1),))
 class CopySlice:
     @func
-    def copy1(x: Tensor[(N,), "f32"], y: Tensor[(N,), "f32"]) -> Tensor[(N,), "f32"]:
+    def copy1(x: Tensor[(N,), "f32"]) -> Tensor[(N,), "f32"]:
         with Mesh(("aiv",), layout=(1,), names=("core",)) as aiv:
             ub = tf.empty(Tensor[(N,), "f32", (N,), "smem"])
             staged = tf.schedule((x, ub), op=T.copy())
