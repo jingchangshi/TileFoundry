@@ -46,10 +46,23 @@ def _calls_inside_execution(function) -> set[int]:
         expr, seen = stack.pop()
         if expr is None:
             continue
-        nested = seen or isinstance(expr, ExecutionRegion)
-        if nested and isinstance(expr, Call):
+        if isinstance(expr, ExecutionRegion):
+            # LEXICAL classification, not data-dependency reachability.
+            #
+            # An ExecutionRegion args are the CAPTURED values and are evaluated in the
+            # enclosing scope; only body executes inside the mode. Walking the args as
+            # "inside" marked an outside producer inside merely because a VF body used
+            # its result, which then dropped that producer from the outside default set
+            # (the reported default list was missing gm_to_ub). A producer consumed by a
+            # VF body is still lexically outside and stays outside here.
+            for arg in expr.args:
+                stack.append((arg, seen))
+            stack.append((expr.body, True))
+            continue
+        if seen and isinstance(expr, Call):
             inside.add(id(expr))
-        stack.extend((child, nested) for child in expr_children(expr))
+        for child in expr_children(expr):
+            stack.append((child, seen))
     return inside
 
 def candidates(

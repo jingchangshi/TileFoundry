@@ -30,6 +30,7 @@ Exit codes: 0 PASS, 1 FAIL, 2 ERROR.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import tilefoundry_ascend  # noqa: F401  (registers SimdVF and the Ascend instructions)
 
@@ -42,7 +43,9 @@ from tilefoundry.ir.hir.sharding.reshard import Reshard
 from tilefoundry.ir.pattern import TensorPattern
 from tilefoundry.ir.tir.arith import Binary as TirBinary
 from tilefoundry.ir.tir.memory.copy import Copy
+from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.ir.types import DType, StorageKind, make_tensor_type
+from tilefoundry.schedule.candidates import candidates
 from tilefoundry.target import CpuTarget
 from tilefoundry.visitor_registry.candidates import (
     candidate_ops,
@@ -158,12 +161,45 @@ def check_ambiguity_refuses() -> None:
     assert "_AmbiguousA" in text and "_AmbiguousB" in text, f"ambiguity did not name both: {text}"
 
 
+def check_outside_producer_stays_outside() -> None:
+    """A producer whose result is CAPTURED into a VF body is still lexical OUTSIDE.
+
+    Regression for the exact GenVfCapture shape: a data-dependency walk of the region
+    captures marks the outside producer inside once the VF body uses its result, which
+    drops it from the outside default set. The producer is lexically outside, so
+    ascend_gm_to_ub must be the default on that row, and it must not be refused.
+    """
+    example = Path(__file__).resolve().parents[3] / "examples" / "rmsnorm_950pr" / "m5_vf_capture.py"
+    module = load_authored_ir(str(example))
+    data = candidates(module, module.entry_function())
+    defaults = {
+        candidate["id"]
+        for row in data["lines"]
+        for candidate in row["candidates"]
+        if candidate.get("default")
+    }
+    for expected in ("T.ascend_gm_to_ub", "T.ascend_vld", "T.ascend_vsts", "T.ascend_ub_to_gm"):
+        assert expected in defaults, f"{expected} missing from defaults: {sorted(defaults)}"
+    producer = [
+        row for row in data["lines"]
+        if any(candidate["id"] == "T.ascend_gm_to_ub" for candidate in row["candidates"])
+    ]
+    assert producer, "no row offered T.ascend_gm_to_ub"
+    assert any(
+        candidate["id"] == "T.ascend_gm_to_ub" and candidate.get("default")
+        for candidate in producer[0]["candidates"]
+    ), (
+        "outside producer default is wrong: "
+        + str([(c["id"], c.get("default")) for c in producer[0]["candidates"]])
+    )
+
 CHECKS = [
     ("global_registry_untouched", check_global_registry_untouched),
     ("ascend_outside_selection", check_ascend_outside_selection),
     ("ascend_inside_selection", check_ascend_inside_selection),
     ("inside_never_uses_an_outside_op", check_inside_never_uses_an_outside_op),
     ("ambiguity_refuses", check_ambiguity_refuses),
+    ("outside_producer_stays_outside", check_outside_producer_stays_outside),
 ]
 
 
