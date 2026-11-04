@@ -23,6 +23,14 @@ same predicate-producer layer.
 WHAT THE FIRST RUN MUST SHOW: the positive control ACCEPTED (or every negative passes
 for free), and BOTH negatives refused with the predicate-producer text. Exit codes:
 0 PASS, 1 FAIL, 2 ERROR.
+
+HARNESS STATUS -- a DOCUMENTED ADDITIONAL OBLIGATION, not part of the default run:
+these three cases are NOT wired into targets/ascend/tests/run_acceptance.sh, because that
+script is sha256-pinned into the current receipt and editing it would invalidate the pin.
+Until a future default-harness revision adds this file, they must be invoked directly
+(pytest is not installed in the conda env; use the __main__ runner below) and their
+result recorded separately. They are green today (3/3) and are an obligation precisely
+because nothing in the default path would catch a regression here yet.
 """
 from __future__ import annotations
 

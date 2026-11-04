@@ -287,10 +287,13 @@ ARTIFACT_REJECTIONS = {
 }
 
 #: Rejections the Lead listed for vf_vadd that the CURRENT pipeline does NOT enforce.
-#: Recorded so the gap is visible rather than papered over with a case that cannot
-#: fire. Dropping the pset and feeding the mask tensor straight to ascend_vadd is
-#: ACCEPTED today (finalize exit 0); there is no "mask has no producer" check.
-#: Empty now. The producerless-mask gap this once recorded is CLOSED upstream:
+#: Kept as the honest home for a gap that is NOT enforced, so one is never papered
+#: over with a case that cannot fire. It is EMPTY: the producerless-mask gap this
+#: block once recorded is CLOSED upstream, so nothing here claims a live gap. (An
+#: earlier revision read "ACCEPTED today ... no mask-has-no-producer check"; that
+#: wording was stale the moment the check landed and is removed rather than left
+#: above the closure note it contradicts.)
+#: The producerless-mask gap is CLOSED upstream:
 #: TileFoundry 0550703 added verify_predicate_producers (presence), and d13528f
 #: tightened it to DOMINANCE (the writing instruction must precede the reader).
 #: The dropped-pset case is asserted in ARTIFACT_REJECTIONS["vf_vadd.py"].
