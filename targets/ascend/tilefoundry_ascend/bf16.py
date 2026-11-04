@@ -140,10 +140,20 @@ def lane_mul(a, b, mask, dest):
 
 
 def lane_scale(a, scalar: float, mask, dest):
+    """dst[L] = bf16(a[L] * scalar) for active lanes; inactive lanes keep dest bits.
+
+    SCALAR PRECISION IS DECLARED, not implicit: the product is evaluated EXACTLY from the
+    bf16 lane and the exact binary value of *scalar* (Fraction(scalar)), then rounded ONCE
+    to BF16. Multiplying in binary64 first and rounding that product to BF16 is DOUBLE
+    rounding and can differ by one ulp (observed: lane 0x3F81 with scalar
+    0x1.02fa0be82fa0cp+0 would give 0x3F82 instead of the exact 0x3F83). The ABI does not
+    establish whether the device scalar is pre-rounded to f32/f16, so this reference does
+    not pretend it is: it evaluates the exact product of the values it is handed.
+    """
     out = []
     for index in range(LANES):
         if mask[index]:
-            out.append(encode(decode(a[index]) * scalar))
+            out.append(encode_fraction(Fraction(decode(a[index])) * Fraction(scalar)))
         else:
             out.append(dest[index])
     return out

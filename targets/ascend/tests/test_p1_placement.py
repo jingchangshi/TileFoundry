@@ -157,6 +157,16 @@ def check_physical_capacity_shared() -> None:
         assert "double-count" in str(error), str(error)
     else:
         raise AssertionError("smem+slab overcommitted UB without refusal")
+    # The replay case: 200 KiB smem + 40 KiB x 2 slab = 286720 B in the SAME 262144 B UB.
+    try:
+        place([
+            AccessSpec("smem", ROLE_STAGED_TILE, 200 * 1024),
+            AccessSpec("slab", ROLE_VERSIONED_SLOT, 40 * 1024, versions=2),
+        ])
+    except PlacementRefusal as error:
+        assert "286720" in str(error) and "262144" in str(error), str(error)
+    else:
+        raise AssertionError("200 KiB smem + 40 KiB x 2 slab overcommitted UB")
     # Individually under the shared bound: accepted, and the physical total is reported.
     placed = place(
         [
@@ -177,6 +187,12 @@ def check_rmem_is_not_an_aggregate_budget() -> None:
     assert semantics.capacity_known is False
     placed = place([AccessSpec("two_regs", ROLE_PRIVATE_TEMP, 512, inside_vf=True)])
     assert RMEM in placed, placed
+    # The replay case: two 256 B private registers is a LEGAL allocation, not 512 > 256.
+    two = place([
+        AccessSpec("v1", ROLE_PRIVATE_TEMP, 256, inside_vf=True),
+        AccessSpec("v2", ROLE_PRIVATE_TEMP, 256, inside_vf=True),
+    ])
+    assert two[RMEM]["bytes"] == 512 and two[RMEM]["bound"] is None, two
     try:
         require_known_capacity([AccessSpec("two_regs", ROLE_PRIVATE_TEMP, 512, inside_vf=True)])
     except PlacementRefusal as error:

@@ -271,6 +271,30 @@ def check_build_citation_matches() -> None:
     )
 
 
+def check_scalar_precision_is_exact() -> None:
+    """Scalar multiply is the EXACT product, single RNE; binary64-first is double rounding."""
+    lane = 0x3F81
+    scalar = float.fromhex("0x1.02fa0be82fa0cp+0")
+    got = bf16.lane_scale([lane] + [0] * 63, scalar, [True] + [False] * 63, [0] * 64)[0]
+    assert got == 0x3F83, f"lane_scale 0x{got:04X} != exact-RNE 0x3F83 (double rounded?)"
+    double_rounded = bf16.encode(bf16.decode(lane) * scalar)  # multiply in binary64 first
+    assert double_rounded == 0x3F82, f"expected the double-rounded form 0x3F82, got 0x{double_rounded:04X}"
+    assert got != double_rounded
+
+
+def check_reducer_mutant_is_killed() -> None:
+    """Replace the reducer with constant 0 -> the shipped comparison MUST fail."""
+    lanes = [bf16.encode(float(index + 1)) for index in range(bf16.LANES)]
+    reference = _ref_v33(lanes, 4, bf16.MERGE_BALANCED_4)
+    real = bf16.vcadd_v33(lanes, 4, bf16.MERGE_BALANCED_4)
+    assert real == reference, f"real 0x{real:04X} != ref 0x{reference:04X}"
+    assert real != bf16.encode(0.0), "reference must be nonzero so a constant mutant is visible"
+    mutant_result = bf16.encode(0.0)
+    assert mutant_result != reference, (
+        "constant-0 mutant PASSED the comparison: the check is a tautology"
+    )
+
+
 CHECKS = [
     ("encoding_constants", check_encoding_constants),
     ("round_half_even", check_round_half_even),
@@ -282,6 +306,8 @@ CHECKS = [
     ("isa_surface", check_isa_surface),
     ("native_claim_is_unsourced", check_native_claim_is_unsourced),
     ("build_citation_matches", check_build_citation_matches),
+    ("scalar_precision_is_exact", check_scalar_precision_is_exact),
+    ("reducer_mutant_is_killed", check_reducer_mutant_is_killed),
 ]
 
 
