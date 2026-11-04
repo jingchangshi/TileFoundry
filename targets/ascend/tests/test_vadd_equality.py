@@ -16,7 +16,11 @@ What is checked, in order:
    register, the UB buffer vld reads is the one the outside load filled, and the
    buffer ub_to_gm reads is the one vsts wrote. Ownership is asserted with it:
    every private value an instruction consumes was created in the same region
-   INSTANCE, which is what a name list cannot express;
+   INSTANCE, which is what a name list cannot express. These flow assertions run
+   TWICE: once over the IR as built, and once over the module reparsed from the
+   emitted text (the "reparsed_" checks). The reparsed pass is the one that counts,
+   because its operands are the objects the printer produced; a disagreement
+   between the two passes is the failure both are there to find;
 4. the emitted text reparses and verifies as a module, with the same structure;
 5. the evaluated result equals the torch reference exactly;
 6. a wrong reference does NOT equal it, and the result is input-dependent, so (5)
@@ -93,14 +97,16 @@ def _flow(prim):
     created in. A private value whose owner is not the instance that consumes it is
     a boundary defect even when the storage classes happen to line up.
 
-    CAVEAT, recorded rather than papered over: this asserts identity between the Var
-    objects recorded from the IR AS BUILT. If a later pass rewrites a binding (a
-    rename or a split), the recorded ids still refer to the built objects, so this
-    is a claim about the constructed IR rather than about the printed text. The
-    reload check below covers the printed form structurally. The STRONGER form --
-    running this same function over the reparsed module, so the flow is asserted on
-    what the printer produced -- is the version to count once the environment can
-    execute again; it is a small change and it strictly dominates this one.
+    CAVEAT, recorded rather than papered over: this function asserts identity between
+    the Var objects it finds in whatever module it is handed. Run over the IR AS
+    BUILT, that is a claim about the constructed IR: if a later pass rewrites a
+    binding (a rename or a split), the recorded ids still refer to the built
+    objects, and a printed program whose wiring differs would not be caught here.
+    Run over the REPARSED module -- which main() also does, under the "reparsed_"
+    names -- the operands are the objects the printer produced and the front end
+    re-read, so the same assertions become claims about the emitted text. The
+    reparsed pass is the one that counts; the built-IR pass is kept because a
+    disagreement between the two is itself the interesting failure.
     """
     from tilefoundry.ir.core import Var
     from tilefoundry.ir.tir.memory import AllocTensor, TensorView
@@ -280,7 +286,10 @@ def main() -> int:
     checks["no_orphan"] = not structure.get("orphan")
 
     # The typed flow. Names and counts above say the pieces are present; these say
-    # they are WIRED, which is a different claim.
+    # they are WIRED, which is a different claim. Run once on the built IR and once
+    # on the REPARSED one below; both must hold, and the reparsed pass is the one
+    # that counts, because it is the only one whose operands are the objects the
+    # printer produced rather than the objects the builder kept.
     flow = _flow(prim)
     checks.update(_chain_checks(flow))
 
@@ -297,11 +306,20 @@ def main() -> int:
         verify_module(reloaded)
         verify_prim_function(reloaded.entry_function())
         again = _structure(reloaded.entry_function())
+        reparsed_flow = _flow(reloaded.entry_function())
     checks["reload_structure"] = (
         again["mesh"] == structure["mesh"]
         and again["execution"] == structure["execution"]
         and sorted(again["inside"]) == sorted(structure["inside"])
         and sorted(again["outside"]) == sorted(structure["outside"])
+    )
+
+    # The flow, asserted on the REPARSED module. This is the stronger form: the
+    # operands here were produced by the printer and re-read by the front end, so a
+    # printed program whose wiring differs from the built one is caught, and the
+    # check no longer depends on the builder having kept its Var objects.
+    checks.update(
+        {f"reparsed_{name}": ok for name, ok in _chain_checks(reparsed_flow).items()}
     )
 
     torch.manual_seed(SEED)
