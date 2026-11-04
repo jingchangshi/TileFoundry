@@ -74,6 +74,8 @@ from tilefoundry.ir.types.dtype_view import DtypeViewError, DtypeViewSpec, valid
 from tilefoundry.ir.types.dim import (
     DimAdd,
     DimFloorDiv,
+    DimMax,
+    DimMin,
     DimMod,
     DimMul,
     DimSub,
@@ -124,6 +126,9 @@ _DIM_BINARY = {
     BinaryKind.MUL: DimMul,
     BinaryKind.FLOOR_DIV: DimFloorDiv,
     BinaryKind.MOD: DimMod,
+    # rank-0 pure-value minimum (03-24 ragged ownership): the ONLY added dim op. It lowers to a
+    # value-form dim call, never to the thread-level Where; maximum/select are NOT added.
+    BinaryKind.MIN: DimMin,
 }
 
 
@@ -1325,7 +1330,20 @@ class LoweringContext(TypeInferContext):
             known = values.get(id(value))
             if known is None:
                 raise LoweringError(f"dimension uses unbound value {value.name!r}")
-            return self.builder.value(known[1], ctx=self)
+            lowered = known[1]
+            # A NAMED 0-d pure-value arithmetic result that is used as a DIMENSION is already a
+            # value-form dim expression; inlining it here avoids materializing an rmem allocation
+            # outside the execution region. This branch is on the dim() path only: an ordinary
+            # value use still goes through builder.value and is materialized as before.
+            if isinstance(lowered, Constant) or (
+                isinstance(lowered, Call)
+                and isinstance(
+                    lowered.target,
+                    (DimAdd, DimSub, DimMul, DimFloorDiv, DimMod, DimMin, DimMax),
+                )
+            ):
+                return lowered
+            return self.builder.value(lowered, ctx=self)
         if isinstance(value, Call) and isinstance(value.target, MeshCoord):
             return Call(
                 MeshCoord(mesh=value.target.mesh),
