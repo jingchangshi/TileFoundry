@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""M6/P5 negative matrix: one pinned message per sync/layout rule, per-rule exit code.
+"""M6 negative matrix -- TRACE MODEL ONLY, NOT formal P5 TF TIR.
+
+SCOPE LIMIT (read before citing this): the operator sequence exercised here comes from
+the custom text emitted by lowering/materialize.py ("# Resolved TF TIR", def/for plus
+"mte2 ..." and "simdvf ..." comment lines), NOT from formal TF nodes produced by the
+public finalize path. The credit this matrix earns is therefore FINITE TRACE-MODEL
+credit. It is NOT evidence of P5 formal TIR, and must not be cited as such. Emitting real
+TF nodes through the normal finalize path is a separate, unscoped fix.
+
+Second limit: the layout rule inspects a NEW placement built from buffer sizes/alignment;
+it IGNORES the plan, so it does NOT check the addresses that will actually be placed and
+cannot catch hazards specific to the real placement.
+
+One pinned message per sync/layout rule, per-rule exit code.
 
 Each RULE owns ONE violating artifact and ONE pinned message substring. A rule PASSES
 (exit 0 for that rule) only if building its violating artifact makes the verifier emit an
@@ -111,6 +124,8 @@ def main():
     layout = verify_layout(problem, plan)
     parsed = parse_events(text)
     rules = build_rules(problem, plan, text, parsed)
+    print("SCOPE: trace model only (custom text, not formal P5 TF TIR); "
+          "layout checks a NEW placement, not the addresses actually placed.")
     print("baseline verify ok=%s events=%d ; layout ok=%s" % (base["ok"], base["events"], layout["ok"]))
     print("%-26s | %-3s | %s" % ("rule", "rc", "pinned message"))
     print("-" * 90)

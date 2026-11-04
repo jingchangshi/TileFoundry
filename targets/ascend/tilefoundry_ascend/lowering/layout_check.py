@@ -8,8 +8,10 @@ rejects POST-LAYOUT HAZARDS:
   * two distinct buffers whose physical byte ranges overlap in the same space,
   * a space footprint exceeding its usable/nominal capacity.
 
-This is a structural check over the resolved layout (problem.buffers + policy), run
-after solve and before trusting the emitted TIR. Every error is tagged with the stable
+LIMIT: this builds a NEW deterministic placement from buffer sizes/alignment/versions and
+IGNORES the plan. It therefore does NOT check the addresses that will actually be placed;
+it cannot catch a hazard specific to the real placement. It is a structural feasibility
+check, not verification of placed addresses. Every error is tagged with the stable
 rule name POST-LAYOUT-HAZARD so one pinned message owns the case.
 """
 from __future__ import annotations
