@@ -113,7 +113,9 @@ def _hardware_context(target: Target | None) -> dict[str, object]:
     except UnsupportedCapabilityError:
         return {}
     allowed = tuple(resolve_storage(level.name) for level in facts.explicit_levels)
-    return {"allowed_storage": (*allowed, StorageKind.UMAT)}
+    # CARRIER is a register class, not a memory level: it is admitted like UMAT is, and
+    # the execution mode (register_storages) decides where it may actually live.
+    return {"allowed_storage": (*allowed, StorageKind.UMAT, StorageKind.CARRIER)}
 
 
 def _resolve_mesh_topologies(

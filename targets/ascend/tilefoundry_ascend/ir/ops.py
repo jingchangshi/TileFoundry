@@ -74,6 +74,44 @@ _IN_PREG = TensorPattern(dtype=DType.bool, storage=StorageKind.RMEM)
 _IN_GMEM_LOAD = TensorPattern(dtype=OrPattern(DType.f32, DType.bf16), storage=StorageKind.GMEM)
 _IN_UB_LOAD = _operands_in(StorageKind.SMEM, *LOAD_DTYPES)
 _IN_VREG_LOAD = _operands_in(StorageKind.RMEM, *LOAD_DTYPES)
+_IN_UB_STAGE = _operands_in(StorageKind.SMEM, *LOAD_DTYPES)
+#: A vld destination is either an f32 element register (plain load) or the opaque carrier
+#: register class (UNPK_B16): a union of exact signatures, not a dtype wildcard.
+_IN_VREG_OR_CARRIER = OrPattern(
+    TensorPattern(dtype=DType.f32, storage=StorageKind.RMEM),
+    TensorPattern(dtype=DType.bf16, storage=StorageKind.CARRIER),
+)
+
+
+class _VldDist(Constraint):
+    """Tie dist to the exact load signature: UNPK_B16 <-> bf16 src / carrier dst.
+
+    The attribute reaches this rule through the constraint map (instruction.py), so the
+    rule really discriminates; it is not a comment. An f32 load states no dist; a bf16 load
+    must state UNPK_B16 and land in the carrier class.
+    """
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "field", "dtype")
+        object.__setattr__(self, "left", "src")
+        object.__setattr__(self, "right", "dst")
+
+    def holds(self, operands: dict) -> bool:
+        src, dst = operands.get("src"), operands.get("dst")
+        if src is None or dst is None:
+            return True
+        dist = operands.get("dist")
+        if getattr(src, "dtype", None) != getattr(dst, "dtype", None):
+            return False
+        if getattr(src, "dtype", None) == DType.bf16:
+            return dist == "UNPK_B16" and getattr(dst, "storage", None) is StorageKind.CARRIER
+        return dist is None and getattr(dst, "storage", None) is StorageKind.RMEM
+
+    def written(self) -> str:
+        return (
+            "bf16 loads state dist=UNPK_B16 and land in the carrier class; f32 loads state "
+            "no dist and land in an element register"
+        )
 
 
 class _VldDist(Constraint):
@@ -141,10 +179,15 @@ class Vld(Op):
     execution_mesh = _AIV
     execution_region = INSIDE
 
-    src = ParamDef(kind="input", effect=READ, pattern=_IN_UB)
-    dst = ParamDef(kind="input", effect=WRITE, pattern=_IN_VREG)
+    src = ParamDef(kind="input", effect=READ, pattern=_IN_UB_STAGE)
+    dst = ParamDef(kind="input", effect=WRITE, pattern=_IN_VREG_OR_CARRIER)
+    dist = ParamDef(kind="attribute", annotation=str, optional=True, default=None)
 
-    between = (SameConstraint("shape", "src", "dst"), SameConstraint("dtype", "src", "dst"))
+    #: Narrow transport capability: bf16 carriers are admitted for THIS instruction only.
+    #: Arithmetic signatures stay f32.
+    transport_dtypes = (DType.bf16,)
+
+    between = (SameConstraint("shape", "src", "dst"), _VldDist())
 
 
 @register_op(dialect="T", category="ascend", name="ascend_vsts")

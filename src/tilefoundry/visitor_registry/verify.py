@@ -933,6 +933,13 @@ def verify_operand_dtypes(op, declared, name: str) -> None:
             # check. The extent rule above already exempts it for the same reason;
             # the two must agree or the chain is unverifiable.
             continue
+        transport = tuple(
+            getattr(dtype, "name", None) for dtype in getattr(type(op), "transport_dtypes", ())
+        )
+        if transport and any(name_ in transport for name_ in names):
+            # Narrow transport/conversion capability declared per instruction: vld/vcvt/
+            # vsts carry bf16 carriers. Arithmetic instructions declare none and stay f32.
+            continue
         if any(name_ not in allowed for name_ in names):
             raise VerifyError(
                 f"{name}: operand {param.name!r} is declared as {names!r} but execution "
