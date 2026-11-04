@@ -14,10 +14,23 @@ asked of a PrimFunction. The verifier that does not apply is recorded
 NOT_APPLICABLE with that reason, which is a statement about the tool, not a
 pass.
 
-Expected-rejection cases mutate the artifact and state, per case, the error
-type it must raise and a substring of its message. A rejection for the wrong
-reason FAILs: it is not the evidence the case was written to collect, and an
-accepted bad program is a defect.
+Expected-rejection cases are declared PER ARTIFACT (see ARTIFACT_REJECTIONS),
+keyed by source basename and kind. Each artifact states its OWN applicable
+rejections; there is no blanket set, because a mutation that does not match its
+artifact changes nothing and "changed nothing" then reads as FAIL -- training
+people to ignore FAIL, the mirror image of a test that cannot fail.
+
+A case runs at one of two stages:
+    load      mutate, load the artifact, expect error_type + a message substring.
+    finalize  mutate, run schedule finalize, expect a non-zero exit + substring.
+              Required because element-width, lane-extent and storage-placement
+              rules are enforced during LOWERING, not at load. A load-only
+              mechanism silently skips them.
+
+An artifact with NO declared rejections is SKIPPED with a named reason and does
+NOT fail: absent evidence is not evidence of a defect. Cases the Lead proposed
+that the current pipeline does not enforce are listed in KNOWN_UNENFORCED so the
+gap is visible rather than papered over with a case that cannot fire.
 
 The verifier domains
     The two verifiers are declared over different node types:
@@ -36,11 +49,15 @@ The verifier domains
     failed authored artifacts because of it. That was wrong: the artifact was
     being asked a question stated about another node type.
 Exit codes
-    0  every in-protocol verifier passed, every expected rejection matched,
-       and the region gap is closed
-    1  a verifier, a rejection, or the region gap disagrees with what this
-       tool predicts
+    0  every in-protocol verifier passed, every DECLARED expected rejection
+       matched (or none were declared, so rejections are SKIPPED), and the
+       region gap is closed
+    1  a verifier, a declared rejection, or the region gap disagrees with what
+       this tool predicts
     2  ERROR: usage, or an artifact that could not be read
+
+    SKIPPED is not a failure: an artifact that declares no rejections passes on
+    its verifiers alone, and the report says so by name. This is the final form.
 """
 
 from __future__ import annotations
@@ -150,98 +167,151 @@ def verify_artifact(source: str, entry: str, record: dict) -> str:
     return kind
 
 
-#: One rejection set per artifact kind. Each case states the exact mutation,
-#: the error type it must raise, and a substring its message must carry; "why"
-#: is the argument for that pairing.
-EXPECTED_REJECTIONS = {
-    "hir": [
-        {
-            "name": "wrong_storage",
-            "why": (
-                "the storage vocabulary is closed at the IR type boundary; l2 is "
-                "not a StorageKind, so the surface form is refused while parsing, "
-                "before any type exists to verify."
-            ),
-            "replace": [("(N,), \"smem\"", "(N,), \"l2\"")],
-            "error_type": "ParseError",
-            "contains": "unknown storage",
-        },
-        {
-            "name": "wrong_layout",
-            "why": (
-                "a layout must cover exactly its logical extent; a (N // 2,) "
-                "layout over a (N,) tensor is well formed for the wrong tensor, "
-                "so the verifier must refuse it, not the parser."
-            ),
-            "replace": [
-                (
-                    "Tensor[(N,), \"f32\", (N,), \"smem\"]",
-                    "Tensor[(N,), \"f32\", (N // 2,), \"smem\"]",
-                )
-            ],
-            "error_type": "VerifyError",
-            "contains": "cross logical axes",
-        },
-        {
-            "name": "unknown_flag",
-            "why": (
-                "an instruction takes no options; naming one is an authoring "
-                "error the parser must catch off the call, not something that "
-                "can be silently ignored."
-            ),
-            "replace": [("op=T.copy()", "op=T.copy(bogus_flag=True)")],
-            "error_type": "ParseError",
-            "contains": "has no attribute",
-        },
-    ],
-    "tir": [
-        {
-            "name": "wrong_storage",
-            "why": (
-                "a finalized tensor view names its residency; l2 is not a "
-                "StorageKind, so the emitted TIR must not parse back."
-            ),
-            "replace": [("storage=\"smem\"", "storage=\"l2\"")],
-            "error_type": "ParseError",
-            "contains": "unknown storage",
-        },
-        {
-            "name": "wrong_layout",
-            "why": (
-                "the view physical layout must cover its shape; halving it "
-                "leaves a well-formed view of the wrong extent, which only a "
-                "verifier can catch."
-            ),
-            "replace": [("layout=(64,), shape=(64,)", "layout=(32,), shape=(64,)")],
-            "error_type": "VerifyError",
-            "contains": "cross logical axes",
-        },
-        {
-            "name": "unknown_flag",
-            "why": (
-                "T.copy takes no options in the emitted TIR either; naming one "
-                "must fail rather than be dropped."
-            ),
-            "replace": [("T.copy(x, ub)", "T.copy(x, ub, bogus_flag=True)")],
-            "error_type": "ParseError",
-            "contains": "has no attribute",
-        },
+#: Per-ARTIFACT expected-rejection sets, keyed by source basename and then by kind.
+#:
+#: Each artifact declares its OWN applicable rejections. There is deliberately no
+#: blanket set applied to every artifact: a mutation that does not match its
+#: artifact changes nothing, and "mutation changed nothing" then reads as FAIL. That
+#: trains people to ignore FAIL, which is the mirror image of a test that cannot
+#: fail. An artifact with no declared rejections is SKIPPED with a name, never FAIL.
+#:
+#: A case has a stage:
+#:   "load"      (default) mutate, load_authored_ir, expect error_type + contains.
+#:   "finalize"  mutate, run the CLI schedule finalize, expect a non-zero exit and
+#:               contains in the error. Needed because some rules -- element width,
+#:               lane extent, storage placement -- are enforced during LOWERING, not
+#:               at load. A load-only rejection mechanism silently skips them.
+#:
+#: Every "contains" below was OBSERVED from the real pipeline, not guessed.
+ARTIFACT_REJECTIONS = {
+    "copy_slice.py": {
+        "hir": [
+            {
+                "name": "wrong_storage",
+                "why": "the storage vocabulary is closed at the IR type boundary; l2 is "
+                       "not a StorageKind, so the surface form is refused while parsing.",
+                "replace": [('(N,), "smem"', '(N,), "l2"')],
+                "error_type": "ParseError",
+                "contains": "unknown storage",
+            },
+            {
+                "name": "wrong_layout",
+                "why": "a layout must cover exactly its logical extent; a (N // 2,) "
+                       "layout over a (N,) tensor is well formed for the wrong tensor.",
+                "replace": [('Tensor[(N,), "f32", (N,), "smem"]',
+                             'Tensor[(N,), "f32", (N // 2,), "smem"]')],
+                "error_type": "VerifyError",
+                "contains": "cross logical axes",
+            },
+            {
+                "name": "unknown_flag",
+                "why": "an instruction takes no options; naming one is an authoring "
+                       "error the parser must catch off the call.",
+                "replace": [("op=T.copy()", "op=T.copy(bogus_flag=True)")],
+                "error_type": "ParseError",
+                "contains": "has no attribute",
+            },
+        ],
+        "tir": [
+            {
+                "name": "wrong_storage",
+                "why": "a finalized tensor view names its residency; l2 is not a "
+                       "StorageKind, so the emitted TIR must not parse back.",
+                "replace": [('storage="smem"', 'storage="l2"')],
+                "error_type": "ParseError",
+                "contains": "unknown storage",
+            },
+            {
+                "name": "wrong_layout",
+                "why": "the view physical layout must cover its shape; halving it "
+                       "leaves a well-formed view of the wrong extent.",
+                "replace": [("layout=(64,), shape=(64,)", "layout=(32,), shape=(64,)")],
+                "error_type": "VerifyError",
+                "contains": "cross logical axes",
+            },
+            {
+                "name": "unknown_flag",
+                "why": "T.copy takes no options in the emitted TIR either.",
+                "replace": [("T.copy(x, ub)", "T.copy(x, ub, bogus_flag=True)")],
+                "error_type": "ParseError",
+                "contains": "has no attribute",
+            },
+        ],
+    },
+    "vf_vadd.py": {
+        "hir": [
+            {
+                "name": "lane_extent_64_to_32",
+                "why": "the mask is one bit per lane; a 32-lane mask over 64-lane data "
+                       "selects the wrong lanes, which only lowering can see.",
+                "stage": "finalize",
+                "replace": [('Tensor[(LANES,), "bool", (LANES,), "rmem"]',
+                             'Tensor[(LANES // 2,), "bool", (LANES // 2,), "rmem"]')],
+                "expect_nonzero_exit": True,
+                "contains": "mask covers (32,) lanes",
+            },
+            {
+                "name": "elem_width_32_to_17",
+                "why": "ascend_pset states the element width; 17 does not match the "
+                       "region's declared 32, so it addresses lanes the mode lacks.",
+                "stage": "finalize",
+                "replace": [("elem_width=32", "elem_width=17")],
+                "expect_nonzero_exit": True,
+                "contains": "states element width 17",
+            },
+            {
+                "name": "storage_smem_to_gmem",
+                "why": "ascend_gm_to_ub writes UB/smem; a gmem destination is the wrong "
+                       "residency for that transfer and lowering must refuse it.",
+                "stage": "finalize",
+                "replace": [('loaded = tf.empty(Tensor[(LANES,), "f32", (LANES,), "smem"])',
+                             'loaded = tf.empty(Tensor[(LANES,), "f32", (LANES,), "gmem"])')],
+                "expect_nonzero_exit": True,
+                "contains": "does not match smem",
+            },
+        ],
+    },
+}
+
+#: Rejections the Lead listed for vf_vadd that the CURRENT pipeline does NOT enforce.
+#: Recorded so the gap is visible rather than papered over with a case that cannot
+#: fire. Dropping the pset and feeding the mask tensor straight to ascend_vadd is
+#: ACCEPTED today (finalize exit 0); there is no "mask has no producer" check.
+KNOWN_UNENFORCED = {
+    "vf_vadd.py": [
+        {"proposal": "drop the pset so the mask has no producer",
+         "observed": "finalize exit 0 -- accepted; no producer check exists"},
     ],
 }
 
 
-def run_rejections(source_text: str, entry: str, kind: str, record: dict) -> bool:
-    """Every expected rejection raises the stated type carrying the stated text."""
+def run_rejections(source_text: str, source_path: str, entry: str, kind: str, record: dict) -> bool:
+    """Run this artifact's OWN declared rejections, per their stage.
+
+    Returns True when every declared rejection behaved as declared, OR when none are
+    declared (SKIPPED). Returns False only when a declared rejection disagrees.
+    """
+    import os as _os
+    import subprocess as _subprocess
+
     from tilefoundry.cli.source import load_authored_ir
     from tilefoundry.ir.core.errors import VerifyError
     from tilefoundry.parser.ast_pattern import ParseError
 
-    types = {"ParseError": ParseError, "VerifyError": VerifyError}
-    cases = EXPECTED_REJECTIONS.get(kind)
-    if cases is None:
-        record["expected_rejections"] = {"verdict": "NOT_RUN", "reason": "no set for " + kind}
+    basename = Path(source_path).name
+    entry_sets = ARTIFACT_REJECTIONS.get(basename)
+    cases = (entry_sets or {}).get(kind)
+    unenforced = KNOWN_UNENFORCED.get(basename, [])
+    if not cases:
+        record["expected_rejections"] = {
+            "verdict": "SKIPPED",
+            "reason": ("no declared rejections for artifact %r kind %r; a blanket set "
+                       "would be vacuous here, so this is SKIPPED, not FAIL" % (basename, kind)),
+            "known_unenforced": unenforced,
+        }
         return True
 
+    types = {"ParseError": ParseError, "VerifyError": VerifyError}
     results = []
     all_ok = True
     with tempfile.TemporaryDirectory(prefix="verify_tir_") as scratch:
@@ -249,7 +319,8 @@ def run_rejections(source_text: str, entry: str, kind: str, record: dict) -> boo
             mutated = source_text
             for old, new in case["replace"]:
                 mutated = mutated.replace(old, new)
-            outcome = {"name": case["name"], "why": case["why"]}
+            outcome = {"name": case["name"], "why": case["why"],
+                       "stage": case.get("stage", "load")}
             if mutated == source_text:
                 outcome.update(verdict="FAIL", error="mutation changed nothing")
                 results.append(outcome)
@@ -257,32 +328,59 @@ def run_rejections(source_text: str, entry: str, kind: str, record: dict) -> boo
                 continue
             path = Path(scratch) / (case["name"] + ".py")
             path.write_text(mutated, encoding="utf-8")
-            try:
-                load_authored_ir(str(path) + ":" + entry)
-            except Exception as exc:  # noqa: BLE001 -- the rejection is the point
-                expected = types[case["error_type"]]
-                type_matched = isinstance(exc, expected)
-                text_matched = case["contains"] in str(exc)
-                matched = type_matched and text_matched
+
+            if case.get("stage", "load") == "finalize":
+                out_tir = Path(scratch) / (case["name"] + "_out.py")
+                proc = _subprocess.run(
+                    [sys.executable, "-m", "tilefoundry.cli", "schedule", "finalize",
+                     str(path) + ":" + entry, str(out_tir)],
+                    capture_output=True, text=True, cwd=str(REPO_ROOT),
+                    env=dict(_os.environ),
+                )
+                blob = (proc.stderr or "") + (proc.stdout or "")
+                nonzero_ok = (proc.returncode != 0) if case.get("expect_nonzero_exit") else True
+                text_ok = case["contains"] in blob
                 outcome.update(
-                    expected_type=case["error_type"],
+                    expected_exit="nonzero" if case.get("expect_nonzero_exit") else "any",
+                    observed_exit=proc.returncode,
                     expected_contains=case["contains"],
-                    observed_type=type(exc).__name__,
-                    observed=str(exc)[:300],
-                    type_matched=type_matched,
-                    text_matched=text_matched,
-                    verdict="PASS" if matched else "FAIL",
+                    observed=blob.strip().splitlines()[-1][:300] if blob.strip() else "",
+                    exit_matched=nonzero_ok,
+                    text_matched=text_ok,
+                    verdict="PASS" if (nonzero_ok and text_ok) else "FAIL",
                 )
-                all_ok = all_ok and matched
+                all_ok = all_ok and nonzero_ok and text_ok
             else:
-                outcome.update(
-                    expected_type=case["error_type"],
-                    verdict="FAIL",
-                    error="artifact was accepted; the predicted rejection never fired",
-                )
-                all_ok = False
+                try:
+                    load_authored_ir(str(path) + ":" + entry)
+                except Exception as exc:  # noqa: BLE001 -- the rejection is the point
+                    expected = types[case["error_type"]]
+                    type_matched = isinstance(exc, expected)
+                    text_matched = case["contains"] in str(exc)
+                    matched = type_matched and text_matched
+                    outcome.update(
+                        expected_type=case["error_type"],
+                        expected_contains=case["contains"],
+                        observed_type=type(exc).__name__,
+                        observed=str(exc)[:300],
+                        type_matched=type_matched,
+                        text_matched=text_matched,
+                        verdict="PASS" if matched else "FAIL",
+                    )
+                    all_ok = all_ok and matched
+                else:
+                    outcome.update(
+                        expected_type=case["error_type"],
+                        verdict="FAIL",
+                        error="artifact was accepted; the predicted rejection never fired",
+                    )
+                    all_ok = False
             results.append(outcome)
-    record["expected_rejections"] = results
+    record["expected_rejections"] = {
+        "verdict": "PASS" if all_ok else "FAIL",
+        "cases": results,
+        "known_unenforced": unenforced,
+    }
     return all_ok
 
 
@@ -420,7 +518,7 @@ def main(argv=None) -> int:
         rejections_ok = True
         if kind and not args.skip_rejections:
             text = source.read_text(encoding="utf-8")
-            rejections_ok = run_rejections(text, args.entry, kind, record)
+            rejections_ok = run_rejections(text, str(source), args.entry, kind, record)
         domains = probe_verifier_domains(record)
     except Exception as exc:  # noqa: BLE001
         record["status"] = "ERROR"
