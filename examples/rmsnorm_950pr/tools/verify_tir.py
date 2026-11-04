@@ -19,21 +19,22 @@ type it must raise and a substring of its message. A rejection for the wrong
 reason FAILs: it is not the evidence the case was written to collect, and an
 accepted bad program is a defect.
 
-The region gap
-    verify_prim_function walks Statement nodes through verify_stmt_registry,
-    and no verify_stmt is registered for MeshRegion. An authored HIR body IS a
-    MeshRegion, so asking verify_prim_function of one raises instead of
-    verifying. That is a defect in the tracked core, not in the artifact, and
-    this tool reports it as the FAIL it is: an authored HIR artifact does not
-    pass every verifier today and its exit code is 1 until the core is fixed.
+The verifier domains
+    The two verifiers are declared over different node types:
 
-    Two pinned cases state the boundary, so the fix cannot land silently:
-      MeshRegion_diagnostic      must raise VerifyError with the exact text
-      MeshRegion_region_verifies must pass once the registry can walk it
-    Pre-fix the first holds and the second does not; post-fix the opposite.
-    The report names the epoch it observed, and only the post-fix epoch lets
-    an authored HIR artifact exit 0.
+        verify_prim_function(fn: PrimFunction, *, module_fns=...)   TIR
+        verify_function(fn: Function, *, module=...)                HIR
 
+    A PrimFunction and an HIR Function are different classes, and an HIR body
+    is an Expr tree with no Stmt sequence in it. Asking verify_prim_function of
+    an authored HIR Function is a domain error -- the wrong verifier for the
+    node -- not a defect in the verifier. Its resulting raise is pinned as an
+    expected consequence so the boundary is recorded rather than misread as a
+    gap in the tracked core, and the correct-domain TIR call must still pass.
+
+    An earlier revision of this tool reported that call as a core defect and
+    failed authored artifacts because of it. That was wrong: the artifact was
+    being asked a question stated about another node type.
 Exit codes
     0  every in-protocol verifier passed, every expected rejection matched,
        and the region gap is closed
@@ -65,10 +66,11 @@ DEFAULT_TIR = (
     "TileFoundry_Ascend950PR_AgentTeam/artifacts/run02/r1/copy_resolved_tir.py:CopySlice"
 )
 
-#: The pinned diagnostic. When the tracked core starts walking a MeshRegion
-#: body this text stops appearing, and MeshRegion_diagnostic is what notices.
-REGION_GAP_ERROR = "no verify_stmt registered for MeshRegion"
-REGION_GAP_TYPE = "VerifyError"
+#: What the wrong-domain call raises today. Pinned so the boundary is an
+#: expectation: if the two node types were ever conflated, this stops firing
+#: and the case below is what notices.
+WRONG_DOMAIN_ERROR = "no verify_stmt registered for MeshRegion"
+WRONG_DOMAIN_TYPE = "VerifyError"
 
 
 def _now() -> str:
@@ -295,25 +297,39 @@ def _ask_prim_function(path: Path, entry: str) -> dict:
         module = load_authored_ir(str(path) + ":" + entry)
     except Exception as exc:  # noqa: BLE001
         return {"verdict": "LOAD_FAILED", "error": str(exc)[:300]}
+    function = module.entry_function()
+    record = {"entry_type": type(function).__name__}
     try:
-        verify_prim_function(module.entry_function(), module_fns=module)
+        verify_prim_function(function, module_fns=module)
     except Exception as exc:  # noqa: BLE001 -- the raising IS the observation
-        return {
-            "verdict": "RAISES",
-            "error_type": type(exc).__name__,
-            "error": str(exc)[:300],
-        }
-    return {"verdict": "VERIFIES"}
+        record.update(
+            verdict="RAISES",
+            error_type=type(exc).__name__,
+            error=str(exc)[:300],
+        )
+        return record
+    record["verdict"] = "VERIFIES"
+    return record
 
 
-def probe_region_gap(record: dict) -> dict:
-    """Pin the region gap with cases that straddle the fix.
+def probe_verifier_domains(record: dict) -> dict:
+    """Check that each verifier is asked only of the node type it states.
 
-    Pre-fix: asking verify_prim_function of an authored HIR body raises the
-    pinned diagnostic; the finalized TIR of the same program verifies.
-    Post-fix: the authored body verifies too. Naming both cases means the
-    transition is observed rather than assumed, and a half-fix that changes the
-    message without making the walk work matches neither.
+    The two verifiers are declared over different node types:
+
+        verify_prim_function(fn: PrimFunction, *, module_fns=...)   -- TIR
+        verify_function(fn: Function, *, module=...)               -- HIR
+
+    A PrimFunction and an HIR Function are different classes, and every HIR
+    body is an Expr tree with no Stmt sequence in it. Asking
+    verify_prim_function of an authored HIR Function is therefore a DOMAIN
+    ERROR -- the wrong verifier for the node -- not a gap in the verifier.
+    What it raises is an artifact of the walk meeting an Expr where it
+    expects a Stmt, not a rule the artifact broke.
+
+    These cases pin that boundary, so the wrong-domain call is a recorded
+    expectation rather than a number someone reads as a defect. They also
+    keep the correct domains honest: the TIR path must still verify.
     """
     authored_source = REPO_ROOT / DEFAULT_SOURCE
     tir_source, _, tir_entry = DEFAULT_TIR.partition(":")
@@ -322,70 +338,58 @@ def probe_region_gap(record: dict) -> dict:
     authored = _ask_prim_function(authored_source, DEFAULT_ENTRY)
     resolved = _ask_prim_function(tir_path, tir_entry)
 
-    pre_fix = (
-        authored.get("verdict") == "RAISES"
-        and authored.get("error_type") == REGION_GAP_TYPE
-        and REGION_GAP_ERROR in authored.get("error", "")
+    wrong_domain_raises = (
+        authored.get("entry_type") == "Function"
+        and authored.get("verdict") == "RAISES"
+        and authored.get("error_type") == WRONG_DOMAIN_TYPE
+        and WRONG_DOMAIN_ERROR in authored.get("error", "")
     )
-    post_fix = authored.get("verdict") == "VERIFIES"
+    tir_verifies = resolved.get("verdict") == "VERIFIES"
 
     cases = {
-        "MeshRegion_diagnostic": {
+        "prim_function_of_hir_function_raises": {
             "observed": authored,
             "pinned": {
-                "error_type": REGION_GAP_TYPE,
-                "contains": REGION_GAP_ERROR,
+                "error_type": WRONG_DOMAIN_TYPE,
+                "contains": WRONG_DOMAIN_ERROR,
             },
-            "verdict": "PASS" if pre_fix else "FAIL",
+            "verdict": "PASS" if wrong_domain_raises else "FAIL",
+            "domain": "wrong -- verify_prim_function is declared over PrimFunction",
             "why": (
-                "the walk must raise the pinned diagnostic while the statement "
-                "registry cannot walk a MeshRegion body; a different error, or "
-                "no error, is a different situation than the one pinned."
+                "an authored HIR entry is a Function whose body is an Expr; "
+                "the PrimFunction walk meets an expression where it expects a "
+                "statement. The raise is the expected consequence of the wrong "
+                "domain, and a silent pass here would mean the two node types "
+                "had been conflated."
             ),
         },
-        "MeshRegion_region_verifies": {
-            "observed": authored,
-            "verdict": "PASS" if post_fix else "NOT_RUN",
-            "why": (
-                "once the registry walks a MeshRegion body this must verify; it "
-                "is NOT_RUN before the fix and cannot be mistaken for a pass."
-            ),
-        },
-        "finalized_tir_contrast": {
+        "prim_function_of_tir_primfunction_verifies": {
             "observed": resolved,
-            "verdict": "PASS" if resolved.get("verdict") == "VERIFIES" else "FAIL",
+            "verdict": "PASS" if tir_verifies else "FAIL",
+            "domain": "correct -- verify_prim_function over a PrimFunction",
             "why": (
-                "the same program finalized to a Sequential body does verify, "
-                "which is what isolates the gap to the region node rather than "
-                "to the program."
+                "the finalized TIR entry IS a PrimFunction with a Sequential "
+                "body, which is exactly what this verifier states. It must "
+                "pass; a failure here would be a real defect in the TIR path."
             ),
         },
     }
 
-    if pre_fix:
-        epoch = "GAP"
-    elif post_fix:
-        epoch = "CLOSED"
-    else:
-        epoch = "INCONCLUSIVE"
-    region = {
+    domains = {
         "statement": (
-            "verify_prim_function dispatches Statement nodes through "
-            "verify_stmt_registry, and none is registered for MeshRegion. An "
-            "authored HIR body IS a MeshRegion, so the walk raises instead of "
-            "verifying; a finalized TIR body is a Sequential of primitive "
-            "statements, which does verify."
+            "verify_prim_function is declared over PrimFunction; an authored "
+            "HIR entry is a Function over Expr nodes. Asking the TIR verifier "
+            "of an HIR function is a domain error, not a core defect, and the "
+            "error it raises is pinned above rather than read as one."
         ),
         "pinned_diagnostic": {
-            "error_type": REGION_GAP_TYPE,
-            "contains": REGION_GAP_ERROR,
+            "error_type": WRONG_DOMAIN_TYPE,
+            "contains": WRONG_DOMAIN_ERROR,
         },
-        "epoch": epoch,
         "cases": cases,
     }
-    record["region_gap"] = region
-    return region
-
+    record["verifier_domains"] = domains
+    return domains
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
@@ -417,7 +421,7 @@ def main(argv=None) -> int:
         if kind and not args.skip_rejections:
             text = source.read_text(encoding="utf-8")
             rejections_ok = run_rejections(text, args.entry, kind, record)
-        region = probe_region_gap(record)
+        domains = probe_verifier_domains(record)
     except Exception as exc:  # noqa: BLE001
         record["status"] = "ERROR"
         record["error"] = type(exc).__name__ + ": " + str(exc)[:500]
@@ -428,19 +432,13 @@ def main(argv=None) -> int:
     in_protocol = ["load_authored_ir", "verify_module"]
     in_protocol.append("verify_function" if kind == "hir" else "verify_prim_function")
     verifiers_ok = all(record[name]["verdict"] == "PASS" for name in in_protocol)
-    gap_cases = region["cases"]
-    gap_ok = (
-        gap_cases["MeshRegion_diagnostic"]["verdict"] == "PASS"
-        and gap_cases["finalized_tir_contrast"]["verdict"] == "PASS"
-    )
+    domain_cases = domains["cases"]
+    domains_ok = all(case["verdict"] == "PASS" for case in domain_cases.values())
 
-    # An authored HIR artifact does not pass every verifier today: the core
-    # cannot walk its region node. That stays FAIL with its cause named until
-    # the registry is fixed -- not a pass with a footnote.
-    blocked = kind == "hir" and region["epoch"] == "GAP"
-    if blocked:
-        status, exit_code = "FAIL", FAIL
-    elif verifiers_ok and rejections_ok and gap_ok and region["epoch"] != "INCONCLUSIVE":
+    # Every in-protocol verifier passed, so the artifact passes the verifiers
+    # that state its own node type. The wrong-domain call is a recorded
+    # expectation above, not a failure of this artifact.
+    if verifiers_ok and rejections_ok and domains_ok:
         status, exit_code = "PASS", PASS
     else:
         status, exit_code = "FAIL", FAIL
@@ -455,8 +453,13 @@ def main(argv=None) -> int:
             if record.get(name, {}).get("verdict") == "NOT_APPLICABLE"
         },
         "expected_rejections_ok": rejections_ok,
-        "region_gap_epoch": region["epoch"],
-        "blocked_by_region_gap": blocked,
+        "verifier_domains_ok": domains_ok,
+        "wrong_domain_calls_raise": domain_cases[
+            "prim_function_of_hir_function_raises"
+        ]["verdict"],
+        "tir_domain_call_verifies": domain_cases[
+            "prim_function_of_tir_primfunction_verifies"
+        ]["verdict"],
     }
     record["status"] = status
     record["exit_code"] = exit_code

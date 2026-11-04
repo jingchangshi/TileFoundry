@@ -2,8 +2,18 @@
 
 The authored program is executed by the HIR evaluator; the reference is written
 here, in torch, from the program's stated semantics. Both run on the same CPU
-inputs, and the comparison is exact: a copy must reproduce its input bit for
-bit, not merely approximately.
+inputs.
+
+What "exact" means here, precisely. The comparison is torch.equal, which is
+exact VALUE equality: two tensors are equal when they have the same shape,
+the same dtype, and every element compares equal. For float32 that is not
+the same claim as bitwise identity -- it does not distinguish +0.0 from
+-0.0, and it does not inspect NaN payloads (a NaN compares unequal to
+anything, including another NaN, so a program producing NaN FAILs here
+rather than passing quietly). Nothing in this tool claims a bit-level
+proof. What it establishes is that every element carries the same value as
+the reference, which for a copy is the whole semantic claim. No tolerance
+is ever applied, so an approximate match cannot pass as a copy.
 
 Nothing in this tool reaches a device. When torch is missing the case is
 reported NOT_RUN with its reason -- never PASS: an equality claim that was not
@@ -82,6 +92,7 @@ def run_case(name: str, torch) -> dict:
         "entry": spec["entry"],
         "function": spec["function"],
         "reference": spec["reference"],
+        "comparison": "torch.equal -- exact value, no tolerance (not a bitwise proof)",
         "reason": spec["reason"],
         "device": "cpu",
         "seed": SEED,
