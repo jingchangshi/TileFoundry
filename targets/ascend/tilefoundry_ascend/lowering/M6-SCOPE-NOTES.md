@@ -79,3 +79,22 @@ Both are asserted as matrix rows (DRAIN_TRAILING_GARBAGE, UNKNOWN_CHANNEL); matr
   verify_pipes, so the NORMAL materialize+verify path does not enforce it.
 - layout_check builds a fresh placement and ignores the plan, so it does not check the
   addresses actually placed.
+
+
+## 7. P5 formal path: the completion protocol is POST-LOWERING (structural limitation)
+
+The completion protocol (FlagSet / FlagWait / Drain) is introduced by a TARGET-SIDE pass
+registered at PassPoint.AFTER_LOWER (passes/completion.py, registered only for
+Ascend950PRTarget), driven by the resolved plan carried on Module.metadata. It is NOT
+derived from authored-HIR semantics.
+
+That is a real structural limitation, not a detail: the protocol is NOT provable from the
+source program's semantics -- only from the pass plus the plan. The authored HIR says
+nothing about flags; the flag nodes exist because the pass runs after ConvertHIRToTIR.
+
+Consequences:
+- A reader of the authored kernel cannot infer the protocol.
+- Removing the pass removes the protocol without any authoring error.
+- Any proof/claim about the protocol must cite the pass + plan, not the source.
+
+This is recorded so no later summary upgrades the claim to "derived from the program".
