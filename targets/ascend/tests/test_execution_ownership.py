@@ -62,46 +62,78 @@ def _function(params, *body) -> PrimFunction:
         params=tuple(params),
         body=MeshScope(
             AIV,
-            Var(name="aiv", type=_tensor((), "i64", "rmem")),
+            # The mesh-bound value, typed exactly as the working direct-TIR test
+            # (test_execution_scope_verify.py) types it, so a refusal here cannot be
+            # about the mesh binding rather than the case under test.
+            Var(name="aiv", type=_tensor(storage="smem")),
             Sequential(body=body),
         ),
         output_count=0,
     )
 
 
-def _refusal(function: PrimFunction) -> str:
-    """The refusal, with the LAYER that produced it recorded.
+#: Layers a refusal can come from. A negative is only evidence for a contract when
+#: the layer that refused is the layer that STATES it, so every case records which
+#: one fired instead of accepting the first exception as a pass.
+#:
+#:   "operand-pattern"  a declared operand Pattern refused the operand: the
+#:                      declaration itself contains the rule, enforced before any
+#:                      instruction is admitted.
+#:   "shape-pattern"    a shape/layout pattern or projection refused the extent:
+#:                      the extent is encoded in the pattern, so this layer carries
+#:                      the lane count.
+#:   "lane-rule"        verify_operand_lanes refused: the extent rule as a named
+#:                      verifier check.
+#:   "verifier"         some other registered rule refused (placement, ownership,
+#:                      instruction constraints).
+#:
+#: Anything else is a defect in the FIXTURE, not a pass: it is raised, never
+#: counted. That is what stops an unrelated refusal from standing in for the rule.
+LAYER_PATTERN = "operand-pattern"
+LAYER_SHAPE = "shape-pattern"
+LAYER_LANES = "lane-rule"
+LAYER_VERIFIER = "verifier"
+LAYERS: list = []
 
-    A negative is only evidence for a contract if the layer that refused is the
-    layer that states it. There are two such layers here, and they are not
-    interchangeable:
 
-      "pattern"   the operand Pattern on the instruction declaration refused the
-                  operand type, so the dtype/storage contract is enforced at the
-                  earliest possible point -- before any verifier runs;
-      "verifier"  a registered rule refused it (placement, ownership, lane extent,
-                  instruction-specific constraints).
+def _layer_of(text: str) -> str:
+    """A BEST-EFFORT label for the layer that refused, from its message.
 
-    Anything else -- a parse failure, an unrelated layout complaint, a missing
-    registration -- is a defect in the FIXTURE, not a pass, so it is raised rather
-    than counted. Recording the layer is what stops a wrong-layer refusal from
-    being reported as the rule under test.
+    This is a heuristic over the refusal text, and it is labelled as one because the
+    honest alternative -- having the verifier report which rule fired structurally --
+    is a change to the verifier, not to this fixture. It is deliberately shallow: it
+    separates "a pattern refused it" from "a named rule refused it" and, within the
+    patterns, whether the message talks about extent at all. It does NOT try to be
+    clever, because a clever classifier that guesses wrong would launder a
+    wrong-layer refusal into a pass -- which is exactly what this file exists to
+    prevent.
+
+    Every refusal prints its first line, so a reviewer sees what actually arrived
+    next to the label. If a label disagrees with the text on the first real run, the
+    case is re-pinned to the text by hand; the label never overrides the message.
     """
+    lowered = text.lower()
+    mentions_extent = "lane" in lowered or str(LANES) in text
+    if mentions_extent and "does not match" not in lowered:
+        return LAYER_LANES
+    if "does not match" in lowered and mentions_extent:
+        return LAYER_SHAPE
+    if "does not match" in lowered or "operand pattern" in lowered or "no variant" in lowered:
+        return LAYER_PATTERN
+    return LAYER_VERIFIER
+
+
+def _refusal(function: PrimFunction) -> str:
+    """The refusal text, with the layer that produced it appended to LAYERS."""
     try:
         verify_prim_function(function)
     except VerifyError as error:
         text = str(error)
-        layering = (
-            "pattern"
-            if ("does not match the" in text or "operand pattern" in text or "no variant" in text)
-            else "verifier"
-        )
-        LAYERS.append(layering)
+        LAYERS.append(_layer_of(text))
+        # Printed always, so the label is never the only thing on record.
+        print(f"       refused: {text.splitlines()[0][:150]}")
         return text
     raise AssertionError("expected a refusal; the program was accepted")
-
-
-LAYERS: list = []
 
 
 def check_positive_control_is_accepted() -> None:
@@ -199,22 +231,21 @@ def check_same_width_integer_is_refused() -> None:
     )
     before = len(LAYERS)
     message = _refusal(_function((), scope))
+    layer = LAYERS[before]
+
     # The dtype contract is stated in TWO places on purpose: the operand pattern on
     # the declaration, and the verifier rule that reads the actual operand type. A
-    # refusal from EITHER is the same contract enforced, and being refused by the
-    # pattern is the BETTER outcome -- it happens at the earliest layer, before any
-    # instruction is admitted. What must not happen is a refusal from neither, or a
-    # refusal that does not mention the element type at all.
-    assert LAYERS[before] in ("pattern", "verifier"), LAYERS[before]
+    # refusal from EITHER is the same contract enforced. Being refused by the
+    # PATTERN is the better outcome -- the declaration itself carries the rule, so it
+    # fires before any instruction is admitted -- so pattern is the expected layer
+    # here and the verifier rule is the backstop for operands arriving another way.
+    assert layer in (LAYER_PATTERN, LAYER_VERIFIER), (
+        f"refused by {layer!r}, which does not encode the element type: {message}"
+    )
     assert "i32" in message, message
-    if LAYERS[before] == "verifier":
+    if layer == LAYER_VERIFIER:
         assert "computes on" in message, message
-    else:
-        # The pattern refusal names the operand and the declared dtype set. The
-        # wording belongs to the matcher, so the assertion is on the substance: the
-        # message must name the element type, not merely "operand does not match".
-        assert "i32" in message or "dtype" in message.lower(), message
-    print(f"     layer={LAYERS[before]}")
+    print(f"     layer={layer}")
 
 
 def check_half_width_lane_extent_is_refused() -> None:
@@ -231,9 +262,26 @@ def check_half_width_lane_extent_is_refused() -> None:
     )
     before = len(LAYERS)
     message = _refusal(_function((), ub_stmt, scope))
-    assert LAYERS[before] in ("pattern", "verifier"), LAYERS[before]
-    assert "lanes" in message or "64" in message, message
-    print(f"     layer={LAYERS[before]}")
+    layer = LAYERS[before]
+
+    # The lane count is asserted on the layer that carries the extent, not merely on
+    # the exception. Two layers encode it: the shape/projection pattern (the extent
+    # is part of the declaration) and verify_operand_lanes (the named rule).
+    assert layer in (LAYER_SHAPE, LAYER_LANES), (
+        f"refused by {layer!r}, which does not encode the lane count: {message}"
+    )
+
+    # STRICT IS THE DEFAULT: the message is expected to name the declared count.
+    # It is relaxed to "says something about lanes" only for the two layers that
+    # actually carry the extent, because a correct refusal may describe the extent
+    # ("operand shape (32,) is not the 64 lanes ...") in a wording that does not
+    # spell the declaration number, and asserting the number would fail a CORRECT
+    # refusal. If the layer does not encode the extent, the relaxed form is not
+    # acceptable -- the assertion above has already failed the case by then.
+    assert "lanes" in message or str(LANES) in message, message
+    if str(LANES) not in message:
+        print(f"     relaxed: {layer} refused without spelling {LANES}; message says lanes")
+    print(f"     layer={layer}")
 
 
 CHECKS = (
@@ -260,6 +308,8 @@ def main() -> int:
         else:
             print(f"ok   {check.__name__}")
     print(f"{len(CHECKS) - failed}/{len(CHECKS)} ownership checks passed")
+    if LAYERS:
+        print("refusal layers seen:", LAYERS)
     return 0 if not failed else 1
 
 
