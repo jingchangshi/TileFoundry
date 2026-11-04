@@ -168,6 +168,16 @@ def classify(access: AccessSpec) -> str:
                 f"{access.name}: {access.wants} is AIC-local, and an explicit request does "
                 f"not make it legal in an {access.domain} program"
             )
+        # An explicit PHYSICAL space must not erase VERSIONED semantics: a versioned slot
+        # asked for as ascend.ub is still a slab ring (so place() multiplies by versions),
+        # and a versioned slot cannot be forced into a space that has no slab.
+        if access.role == ROLE_VERSIONED_SLOT or access.versions > 1:
+            if access.wants == "ascend.ub":
+                return SLAB
+            raise PlacementRefusal(
+                f"{access.name}: versioned slot requires UB/slab, but {access.wants} was "
+                "requested explicitly"
+            )
         return space
     if access.role in (ROLE_PARAM, ROLE_RESULT):
         return GMEM

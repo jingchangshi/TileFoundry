@@ -169,7 +169,13 @@ MERGE_PAIR_2 = "(0+1)"
 
 
 def vcadd_v33(values, chains: int, merge: str) -> int:
-    """Reduction with v33 ACCUMULATION SEMANTICS: BF16 in, FP32 accumulate, BF16 out.
+    """ABSTRACT SOFTWARE SUM: BF16 in, FP32 accumulate, BF16 out. NOT full RMSNorm.
+
+    Scope is deliberately narrow: this reduces 64 lane VALUES. It does NOT model v33's
+    strided chunk sequence of 64-lane vmula/square operations, its load/unpack of bf16
+    chunks, or any RMSNorm row structure. Calling it "RMSNorm semantics" would overclaim;
+    it is a reference for the SUM SHAPE only (per-case chain count, merge tree, FP32
+    accumulation position).
 
     reference/kernel_v33.py (SHA c6c37fb7...) converts each UNPK_B16 lane to float32 and
     accumulates with FP32 vmula chains; only the final scalar is stored as BF16. So the

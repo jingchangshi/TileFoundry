@@ -218,6 +218,21 @@ def check_explicit_wants_do_not_bypass_legality() -> None:
     assert classify(AccessSpec("ub", ROLE_STAGED_TILE, 8, wants="ascend.ub")) == SMEM
 
 
+def check_explicit_want_preserves_versions() -> None:
+    """An explicit UB want must not erase versioned semantics (slab multiplication)."""
+    from tilefoundry_ascend.placement import SLAB
+
+    try:
+        place([AccessSpec("ring", ROLE_VERSIONED_SLOT, 160 * 1024, versions=2, wants="ascend.ub")])
+    except PlacementRefusal as error:
+        assert "327680" in str(error) and "262144" in str(error), str(error)
+    else:
+        raise AssertionError("explicit UB want erased version multiplication (accepted 163840)")
+    assert classify(AccessSpec("ring2", ROLE_VERSIONED_SLOT, 8, versions=2, wants="ascend.ub")) == SLAB
+    placed = place([AccessSpec("tile", ROLE_STAGED_TILE, 1024, wants="ascend.ub")])
+    assert SMEM in placed, placed
+
+
 CHECKS = [
     ("space_table_complete", check_space_table_complete),
     ("classification", check_classification),
@@ -228,6 +243,7 @@ CHECKS = [
     ("physical_capacity_shared", check_physical_capacity_shared),
     ("rmem_is_not_an_aggregate_budget", check_rmem_is_not_an_aggregate_budget),
     ("explicit_wants_do_not_bypass_legality", check_explicit_wants_do_not_bypass_legality),
+    ("explicit_want_preserves_versions", check_explicit_want_preserves_versions),
 ]
 
 

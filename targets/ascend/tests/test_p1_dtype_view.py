@@ -88,6 +88,21 @@ def check_access_is_required() -> None:
     raise AssertionError("DtypeViewSpec accepted a view without an access kind")
 
 
+def check_escape_rule_keeps_negative() -> None:
+    """Marking the view invariant must NOT disable the escape rule for other values."""
+    from tilefoundry.ir.core import Var
+    from tilefoundry.ir.types import UnitType
+    from tilefoundry.passes.transforms.convert_hir_to_tir import escape_refusal
+
+    bound_var = Var("bound_inside", type=UnitType())
+    bound = {id(bound_var)}
+    # A genuinely region-escaped value is still refused.
+    assert escape_refusal(bound_var, bound, set(), "region mesh M") is not None
+    # Only the explicitly marked invariant class is accepted, and only when bound.
+    assert escape_refusal(bound_var, bound, {id(bound_var)}, "region mesh M") is None
+    assert escape_refusal(bound_var, set(), {id(bound_var)}, "region mesh M") is None
+
+
 CHECKS = [
     ("sound_alias", check_sound_alias),
     ("misaligned", check_misaligned),
@@ -98,6 +113,7 @@ CHECKS = [
     ("overlapping_read_same_dtype_allowed", check_overlapping_read_same_dtype_allowed),
     ("same_shape_widening_is_refused", check_same_shape_widening_is_refused),
     ("access_is_required", check_access_is_required),
+    ("escape_rule_keeps_negative", check_escape_rule_keeps_negative),
 ]
 
 

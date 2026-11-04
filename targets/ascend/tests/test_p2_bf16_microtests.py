@@ -178,7 +178,14 @@ def check_accumulation_is_fp32_not_perstep_bf16() -> None:
 
 
 def check_accumulator_contract_is_per_case() -> None:
-    """The count is a PER-CASE algorithm contract, never a universal ISA field."""
+    """STRUCTURAL check only: declared per-case count and merge consistency.
+
+    It does NOT claim numeric order discrimination: on exact sums a 2-chain and a 4-chain
+    computation can be bit-identical, so a mutant forcing 2 -> 4 could survive a purely
+    numeric assertion. What is established is the CONTRACT SHAPE: the count is declared per
+    case (rows=4 four chains balanced, rows<=2 two), no ISA field carries a global count,
+    and an undeclared count or a merge inconsistent with the count is refused.
+    """
     from tilefoundry_ascend.ir.isa import ISA, PER_CASE_ACCUMULATOR_CONTRACT
 
     assert ISA["vcadd"].accumulator_count is None, (

@@ -160,6 +160,17 @@ class TirBuilder:
     blocks: list[TirScope]
     loops: list = field(default_factory=list)
     stage_counters: dict = field(default_factory=dict)
+    # Values proven REGION-INVARIANT by construction, with the reason they are invariant.
+    # Only explicitly marked values are exempt from the escape check; this is a class, not
+    # a blanket allowance.
+    invariant: dict = field(default_factory=dict)
+
+    def mark_invariant(self, value, reason: str):
+        self.invariant[id(value)] = reason
+        return value
+
+    def is_invariant(self, value) -> bool:
+        return id(value) in self.invariant
 
     def add(self, stmt):
         self.blocks[-1].entries.append(stmt)
@@ -205,15 +216,16 @@ class TirBuilder:
                 self.loops.pop()
         if mesh is not None or loop is not None or execution is not None:
             pending = [region.result]
+            where = (
+                f"execution region {execution!r}"
+                if execution is not None
+                else f"region mesh {mesh or region.mesh!r}"
+            )
             while pending:
                 value = pending.pop()
-                if isinstance(value, Var) and id(value) in region.bound:
-                    where = (
-                        f"execution region {execution!r}"
-                        if execution is not None
-                        else f"region mesh {mesh or region.mesh!r}"
-                    )
-                    raise LoweringError(f"value {value.name!r} escapes {where}")
+                message = escape_refusal(value, region.bound, self.invariant, where)
+                if message is not None:
+                    raise LoweringError(message)
                 if isinstance(value, View):
                     pending.extend((value.base, *value.starts))
                 elif isinstance(value, Expr) and not isinstance(value, Var):
@@ -441,6 +453,17 @@ class Names:
                 actual_span is None or source_span is None or actual_span == source_span
             ):
                 ctx.authored_values[id(actual)] = source
+
+
+def escape_refusal(value, bound_ids, invariant_ids, where: str):
+    """The escape rule, factored out so the invariant class is testable on its own.
+
+    A value bound inside a region may not be the value the region yields UNLESS it was
+    explicitly marked region-invariant by construction. Returns a refusal message or None.
+    """
+    if isinstance(value, Var) and id(value) in bound_ids and id(value) not in invariant_ids:
+        return f"value {value.name!r} escapes {where}"
+    return None
 
 
 def _label(call: Expr) -> str:
@@ -1249,13 +1272,16 @@ class LoweringContext(TypeInferContext):
                     else desired.layout
                 )
                 type_ = replace(desired, layout=layout)
-                result = self.builder.bind(
-                    Var(self.names.fresh("gmem_view"), type=type_),
-                    Call(
-                        TensorView(layout=layout, shape=tuple(type_.shape)),
-                        (pointer,),
-                        type=type_,
+                result = self.builder.mark_invariant(
+                    self.builder.bind(
+                        Var(self.names.fresh("gmem_view"), type=type_),
+                        Call(
+                            TensorView(layout=layout, shape=tuple(type_.shape)),
+                            (pointer,),
+                            type=type_,
+                        ),
                     ),
+                    "gmem dtype alias over a device-global root; carries no per-mesh state",
                 )
             if desired.storage is StorageKind.SMEM and desired.dtype != result.type.dtype:
                 root = self.storage.answers[leaf].chain[-1]
