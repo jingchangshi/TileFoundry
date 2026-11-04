@@ -18,6 +18,7 @@ from tilefoundry.ir.core.metadata import diagnostic_location
 from tilefoundry.ir.core.module import Module, ModuleList, resolve_symbol
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
+from tilefoundry.ir.core.param_def import MemoryEffect
 from tilefoundry.ir.core.execution import (
     declared_kinds,
     execution_kind,
@@ -624,6 +625,15 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: t
         case ExecutionScope():
             _verify_execution_scope(stmt, ctx, scope, modes)
             _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders, (*modes, stmt.kind))
+            # AFTER the body, deliberately. The producer rule presumes a well-formed
+            # predicate: if the operand in the mask slot is the wrong TYPE (i32, say),
+            # that is an operand-type refusal and must remain the reported layer. Only
+            # a mask that is otherwise well formed -- a genuine bool register -- can be
+            # "unproduced". Running this before the walk made every unproduced mask
+            # preempt the dtype/lane rules and stole their negatives; deferring keeps
+            # each rule owning its own case and still catches the mask that is correct
+            # in every respect except that nothing wrote it.
+            verify_predicate_producers(stmt)
             return
         case Return():
             for _name, value in _iter_stmt_expr_fields(stmt):
@@ -931,6 +941,97 @@ def verify_operand_dtypes(op, declared, name: str) -> None:
                 "its width matches"
             )
 
+
+def verify_predicate_producers(scope_stmt) -> None:
+    """Refuse a predicate operand that no instruction in this region produced.
+
+    The predicated-chain contract is that the mask is a VALUE produced inside the
+    same region instance: pset writes the mask register, and vadd reads it. Nothing
+    else in the intermediate language ties the two together -- a mask is just a
+    bool register, so an allocated-but-never-written mask type-checks, matches the
+    operand pattern (bool in rmem), passes the lane rule (bool exempt) and passes
+    the dtype rule (bool is a mask, not an element). Dropping the pset therefore
+    left a program whose every operand is well formed and whose mask is a register
+    "no instruction ever wrote -- and it was ACCEPTED. That is the hole this closes:
+    a predicate a predicated instruction consumes must have a producing instruction
+    in the same region instance, or the predicated result is reading garbage that
+    the checker called fine.
+
+    Stated over the SCOPE body rather than over the whole function on purpose: "same
+    region instance" is exactly "same ExecutionScope", and a writer in a sibling or
+    enclosing scope does not make this instance's mask produced. Nesting is refused
+    separately (a non-nestable mode cannot be entered inside itself), so one scope
+    body is one instance.
+
+    A producer is an instruction (an Evaluate of a declared operation) that WRITES
+    the operand -- declared WRITE effect on that operand position -- not merely an
+    allocation that binds the name. This is deliberately about data flow, not about
+    which statement is textually earlier: an instruction that writes the register
+    anywhere in the instance satisfies it, because a register is written before it
+    is read in any schedule the hardware would run.
+    """
+    declared = execution_kind(scope_stmt.kind)
+    if declared is None:
+        return  # an undeclared kind is refused by the scope check; not this rule
+    body_stmts = tuple(_iter_all_stmts(scope_stmt.body))
+
+    def writes_of(stmt):
+        """(param, arg) pairs of *stmt* whose operand carries the WRITE effect."""
+        op = stmt.callable
+        try:
+            params = input_params(type(op))
+        except Exception:  # noqa: BLE001 -- a non-operation callable has no schema
+            return ()
+        pairs = []
+        for param, arg in zip(params, stmt.args):
+            effect = getattr(param, "effect", None)
+            if effect is not None and (effect & MemoryEffect.WRITE):
+                pairs.append((param, arg))
+        return tuple(pairs)
+
+    produced = set()
+    for stmt in body_stmts:
+        if isinstance(stmt, Evaluate):
+            for _param, arg in writes_of(stmt):
+                if isinstance(arg, Var):
+                    produced.add(id(arg))
+
+    for stmt in body_stmts:
+        if not isinstance(stmt, Evaluate):
+            continue
+        op = stmt.callable
+        requirement = region_requirement(op)
+        if requirement is None or requirement.placement != "inside":
+            continue
+        if requirement.kind != scope_stmt.kind:
+            continue
+        name = getattr(op, "name", type(op).__name__)
+        try:
+            params = input_params(type(op))
+        except Exception:  # noqa: BLE001
+            continue
+        for param, arg in zip(params, stmt.args):
+            pattern = getattr(param, "pattern", None)
+            storage = getattr(pattern, "storage", None)
+            if storage is None or not declared.owns_storage(storage):
+                continue
+            dtype = getattr(pattern, "dtype", None)
+            names = tuple(
+                getattr(option, "name", None)
+                for option in getattr(dtype, "patterns", (dtype,))
+            )
+            if names != ("bool",):
+                continue  # only predicate (mask) operands are the subject of this rule
+            produced_here = isinstance(arg, Var) and id(arg) in produced
+            if produced_here:
+                continue
+            operand = getattr(arg, "name", type(arg).__name__)
+            raise VerifyError(
+                f"{name}: predicate operand {operand!r} has no producing instruction "
+                f"in execution region {declared.name!r}; a mask must be written by an "
+                "instruction in the same region instance (pset), or a predicated "
+                "instruction is reading a register nothing produced"
+            )
 
 def verify_op_placement(op, modes: tuple, *, where: str = "execution region") -> None:
     """Check one operation is legal in the execution modes in force.
