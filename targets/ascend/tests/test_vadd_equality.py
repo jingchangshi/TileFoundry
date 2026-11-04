@@ -79,46 +79,73 @@ def _eval_vadd(torch, tensors):
     context = type("Eval", (), {"args": args, "op": Vadd(), "result_type": None})()
     return handler(context).data
 
+
+
 def _flow(prim):
     """The typed data flow, read off the IR: which VALUE each instruction consumes.
 
-    Names and counts are not a flow test. A chain can carry the right instructions
-    in the right scopes and still be wired backwards -- vadd reading a register no
-    vld filled, vsts writing a buffer the outside transfer never reads -- so the
-    claim to check is producer-to-consumer identity on the operand Vars themselves.
+    Names and counts are not a flow test. A chain can carry the right instructions in
+    the right scopes and still be wired backwards -- vadd reading a register no vld
+    filled, vsts writing a buffer the outside transfer never reads -- so the claim to
+    check is producer-to-consumer identity on the operands themselves.
 
-    Identity comes from the Var object, not its spelling: the ":n" / ":n_2"
-    suffixes are how the printer disambiguates distinct bindings, and two different
-    buffers can print with names suggesting a relationship they do not have. The
-    flow recorded here comes from the IR that was built; printer fidelity is
-    answered separately by the reload check.
+    There are TWO kinds of identity here and conflating them makes the check wrong:
 
-    Ownership is recorded alongside: which region instance each private value was
-    created in. A private value whose owner is not the instance that consumes it is
-    a boundary defect even when the storage classes happen to line up.
+    * PRIVATE values (registers) are allocated and their Var is the value. Two
+      occurrences are the same value exactly when they are the same Var object.
 
-    CAVEAT, recorded rather than papered over: this function asserts identity between
-    the Var objects it finds in whatever module it is handed. Run over the IR AS
-    BUILT, that is a claim about the constructed IR: if a later pass rewrites a
-    binding (a rename or a split), the recorded ids still refer to the built
-    objects, and a printed program whose wiring differs would not be caught here.
-    Run over the REPARSED module -- which main() also does, under the "reparsed_"
-    names -- the operands are the objects the printer produced and the front end
-    re-read, so the same assertions become claims about the emitted text. The
-    reparsed pass is the one that counts; the built-IR pass is kept because a
-    disagreement between the two is itself the interesting failure.
+    * SHARED-MEMORY values are not like that. The emitted TIR rebuilds a
+      ``tensor_view(0, ...)`` at every use site, so the outside load binds ``loaded``,
+      the load inside the region binds ``loaded_2``, and the store binds ``stored`` /
+      ``stored_2`` -- four distinct Var objects that name the SAME buffer. Comparing
+      Var identity for these would report the chain as broken when it is correct, or
+      (worse) pass a chain that touched two different buffers that happened to be
+      spelled similarly. They are identified by their ADDRESS instead: the byte
+      offset the view is built over, which is what the program actually means.
+
+    So identity is: Var object for register storage, view address for shared storage.
+    Getting this backwards is the most likely way for this file to lie, which is why
+    it is stated here rather than left to the reader of the walk below.
+
+    OWNERSHIP is separate from identity and applies to private values only: a
+    register value whose owning region instance is not the instance that consumes it
+    is a boundary defect even when the storage classes line up.
     """
-    from tilefoundry.ir.core import Var
+    from tilefoundry.ir.core import Constant, Var
     from tilefoundry.ir.tir.memory import AllocTensor, TensorView
     from tilefoundry.ir.tir.stmts import Evaluate, ExecutionScope, LetStmt, MeshScope, Sequential
 
     flow = {
-        "producer": {},
-        "owner": {},
-        "calls": [],
-        "names": {},
+        "producer": {},   # id(Var) -> what produced it
+        "owner": {},      # id(Var) -> region instance ordinal, or None when outside
+        "calls": [],      # (op name, storages, instance, operand identities)
+        "address": {},    # id(Var) -> byte offset, for shared-memory views
         "instances": 0,
+        "unresolved": [], # operand identities that could not be resolved
     }
+
+    def address_of(value):
+        """The byte offset a view is built over, or None if it is not a view of one."""
+        if not isinstance(value, Var):
+            return None
+        return flow["address"].get(id(value))
+
+    def identity(value):
+        """How to tell this operand apart from another. See the docstring."""
+        if not isinstance(value, Var):
+            return ("expr", id(value))
+        if id(value) in flow["address"]:
+            # a shared-memory view: same address means same buffer
+            return ("address", flow["address"][id(value)])
+        storage = getattr(getattr(value, "type", None), "storage", None)
+        name = getattr(storage, "name", "").lower()
+        if "rmem" in name or name == "umem":
+            return ("var", id(value))
+        # A non-view, non-register operand has no address to compare on; fall back
+        # to the Var and record it, so a chain of this shape is visible as such
+        # rather than silently compared by the wrong rule.
+        flow["unresolved"].append(value.name)
+        return ("var", id(value))
 
     def walk(stmt, instance):
         if isinstance(stmt, Sequential):
@@ -135,18 +162,15 @@ def _flow(prim):
         if isinstance(stmt, LetStmt):
             value = stmt.value
             target = getattr(value, "target", None)
-            flow["names"][stmt.var.name] = id(stmt.var)
             flow["owner"][id(stmt.var)] = instance
             if isinstance(target, AllocTensor):
                 flow["producer"][id(stmt.var)] = "alloc_tensor"
             elif isinstance(target, TensorView):
+                flow["producer"][id(stmt.var)] = "tensor_view"
                 base = value.args[0] if value.args else None
-                alias = (
-                    flow["producer"].get(id(base), "tensor_view")
-                    if isinstance(base, Var)
-                    else "tensor_view"
-                )
-                flow["producer"][id(stmt.var)] = alias
+                offset = getattr(base, "value", None) if isinstance(base, Constant) else None
+                if isinstance(offset, int):
+                    flow["address"][id(stmt.var)] = offset
             else:
                 flow["producer"][id(stmt.var)] = getattr(target, "name", "?")
             walk(value, instance)
@@ -154,10 +178,12 @@ def _flow(prim):
         if isinstance(stmt, Evaluate):
             flow["calls"].append(
                 (
-                    getattr(stmt.callable, "name", type(stmt.callable).__name__),
-                    tuple(getattr(getattr(arg, "type", None), "storage", None) for arg in stmt.args),
+                    type(stmt.callable).__name__,
+                    tuple(
+                        getattr(getattr(arg, "type", None), "storage", None) for arg in stmt.args
+                    ),
                     instance,
-                    tuple(id(arg) for arg in stmt.args if isinstance(arg, Var)),
+                    tuple(identity(arg) for arg in stmt.args),
                 )
             )
             for argument in stmt.args:
@@ -169,7 +195,6 @@ def _flow(prim):
 
     walk(prim.body, None)
     return flow
-
 
 def _chain_checks(flow):
     """The producer/consumer claims, each answered from the recorded flow."""
@@ -185,6 +210,10 @@ def _chain_checks(flow):
     checks["one_vsts"] = vsts is not None
     checks["one_pset"] = pset is not None
     checks["two_transfers"] = len(transfers) == 2
+    # A non-view, non-register operand compared by Var would be compared by the
+    # wrong rule; if that ever happens the flow is not resolvable and the check must
+    # not quietly pass on it.
+    checks["every_operand_resolvable"] = not flow["unresolved"]
     if not all(checks.values()):
         return checks
 
@@ -197,26 +226,29 @@ def _chain_checks(flow):
 
     # Operand order is declaration order:
     #   vld(src, dst)   vadd(a, b, mask, dst)   vsts(src, dst)   pset(dst)
+    # Register operands compare by Var object; the shared buffers compare by address,
+    # which is why the same buffer may appear as two different Vars and still match.
     loaded_ids = {entry[3][-1] for entry in vld if len(entry[3]) == 2}
     checks["vadd_reads_a_loaded_register"] = bool(loaded_ids & set(vadd[3][:2]))
     checks["vadd_mask_from_pset"] = pset[3][0] in vadd[3][2:3]
     checks["vsts_stores_the_register_vadd_wrote"] = vsts[3][0] in vadd[3][3:4]
 
-    # Ownership: every private value an instruction consumes was created HERE.
+    # Ownership applies to the private values only.
     own = flow["owner"]
     checks["vadd_operands_owned_here"] = all(own.get(operand) == instance for operand in vadd[3])
     checks["vld_destinations_owned_here"] = all(own.get(entry[3][-1]) == instance for entry in vld)
     checks["pset_destination_owned_here"] = own.get(pset[3][0]) == instance
 
-    # The UB buffer the outside transfer fills is the one the inside load reads;
-    # the buffer vsts writes is the one the outside transfer hands back.
+    # The buffer the outside load filled is the buffer the inside load reads, and the
+    # buffer vsts writes is the one the outside transfer hands back. Both are
+    # address comparisons: the emitted TIR rebuilds the view at every use site.
     gm_to_ub = next(entry for entry in transfers if entry[0] == "GmToUb")
     ub_to_gm = next(entry for entry in transfers if entry[0] == "UbToGm")
-    checks["vld_reads_the_buffer_gm_to_ub_filled"] = all(
-        entry[3][0] == gm_to_ub[3][-1] for entry in vld
-    )
+    filled = gm_to_ub[3][-1]
+    checks["vld_reads_the_buffer_gm_to_ub_filled"] = all(entry[3][0] == filled for entry in vld)
     checks["vsts_writes_the_buffer_ub_to_gm_reads"] = vsts[3][-1] == ub_to_gm[3][0]
     return checks
+
 
 def _structure(prim):
     """The scope layout the module must have, read off the IR itself."""
