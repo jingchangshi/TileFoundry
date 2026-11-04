@@ -943,37 +943,49 @@ def verify_operand_dtypes(op, declared, name: str) -> None:
 
 
 def verify_predicate_producers(scope_stmt) -> None:
-    """Refuse a predicate operand that no instruction in this region produced.
+    """Refuse a predicate operand whose producing instruction does not DOMINATE it.
 
-    The predicated-chain contract is that the mask is a VALUE produced inside the
-    same region instance: pset writes the mask register, and vadd reads it. Nothing
-    else in the intermediate language ties the two together -- a mask is just a
-    bool register, so an allocated-but-never-written mask type-checks, matches the
-    operand pattern (bool in rmem), passes the lane rule (bool exempt) and passes
-    the dtype rule (bool is a mask, not an element). Dropping the pset therefore
-    left a program whose every operand is well formed and whose mask is a register
-    "no instruction ever wrote -- and it was ACCEPTED. That is the hole this closes:
-    a predicate a predicated instruction consumes must have a producing instruction
-    in the same region instance, or the predicated result is reading garbage that
-    the checker called fine.
+    Two failures, one rule:
+      * a mask with NO producing instruction in the region (the pset was dropped), and
+      * a mask whose producing instruction comes AFTER the instruction that reads it
+        (the pset was placed after the vadd).
+    Both leave the predicated result reading the mask register as it stood before any
+    mask was written.
 
-    Stated over the SCOPE body rather than over the whole function on purpose: "same
-    region instance" is exactly "same ExecutionScope", and a writer in a sibling or
-    enclosing scope does not make this instance's mask produced. Nesting is refused
-    separately (a non-nestable mode cannot be entered inside itself), so one scope
-    body is one instance.
+    The second is why this cannot be a set-membership test over the whole scope. The
+    resolved TIR is a Sequential and execution order IS statement order, so "a writer
+    exists somewhere in this scope" does not mean the writer RAN before the reader. A
+    later writer is not legitimate for a mask: nothing in this IR carries a mask write
+    across a later read, there is no reordering pass, and no semantic basis for one --
+    pset writes a value register, not a deferred promise. The producer must PRECEDE the
+    consumer in the resolved statement order. This is dominance, not presence.
 
-    A producer is an instruction (an Evaluate of a declared operation) that WRITES
-    the operand -- declared WRITE effect on that operand position -- not merely an
-    allocation that binds the name. This is deliberately about data flow, not about
-    which statement is textually earlier: an instruction that writes the register
-    anywhere in the instance satisfies it, because a register is written before it
-    is read in any schedule the hardware would run.
+    A mask is just a bool register, so an allocated-but-never-written mask type-checks,
+    matches the bool-in-rmem operand pattern, passes the lane rule (bool exempt) and
+    the dtype rule (bool is a mask, not an element). Without this rule a dropped or
+    misordered pset is ACCEPTED and the predicated instruction reads garbage.
+
+    Same region instance means same ExecutionScope body: a writer in a sibling or
+    enclosing scope does not make this instance's mask produced, and nesting is refused
+    separately (a non-nestable mode cannot be entered inside itself).
+
+    A producer is an instruction (an Evaluate of a declared operation) with declared
+    WRITE effect on that operand position that appears EARLIER in the walk. An
+    allocation that merely binds the name is not a producer. Only predicate operands the
+    instruction READS are subjects: pset's own dst is WRITE and is not a read, so pset
+    is not asked to have produced the mask it produces.
+
+    Ordering under control flow is conservative: a write inside an If branch or a loop
+    body does not dominate statements after the construct (it may not have executed),
+    so it is not carried out of the construct. A write before the construct does
+    dominate inside it. Region bodies here are straight-line, so this is exact for the
+    programs this mode admits.
     """
     declared = execution_kind(scope_stmt.kind)
     if declared is None:
         return  # an undeclared kind is refused by the scope check; not this rule
-    body_stmts = tuple(_iter_all_stmts(scope_stmt.body))
+
+    produced = set()  # ids of Vars WRITTEN by a statement already passed in this chain
 
     def writes_of(stmt):
         """(param, arg) pairs of *stmt* whose operand carries the WRITE effect."""
@@ -989,50 +1001,79 @@ def verify_predicate_producers(scope_stmt) -> None:
                 pairs.append((param, arg))
         return tuple(pairs)
 
-    produced = set()
-    for stmt in body_stmts:
+    def is_predicate_read(param):
+        """True when *param* is a bool mask the instruction READS, not a write target."""
+        pattern = getattr(param, "pattern", None)
+        storage = getattr(pattern, "storage", None)
+        if storage is None or not declared.owns_storage(storage):
+            return False
+        dtype = getattr(pattern, "dtype", None)
+        names = tuple(
+            getattr(option, "name", None)
+            for option in getattr(dtype, "patterns", (dtype,))
+        )
+        if names != ("bool",):
+            return False
+        effect = getattr(param, "effect", None)
+        return effect is not None and bool(effect & MemoryEffect.READ)
+
+    def visit(stmt):
+        if isinstance(stmt, Sequential):
+            for child in stmt.body:
+                visit(child)
+            return
+        if isinstance(stmt, MeshScope):
+            visit(stmt.body)
+            return
         if isinstance(stmt, Evaluate):
+            op = stmt.callable
+            requirement = region_requirement(op)
+            try:
+                params = input_params(type(op))
+            except Exception:  # noqa: BLE001
+                params = ()
+            if (
+                requirement is not None
+                and requirement.placement == "inside"
+                and requirement.kind == scope_stmt.kind
+            ):
+                name = getattr(op, "name", type(op).__name__)
+                for param, arg in zip(params, stmt.args):
+                    if not is_predicate_read(param):
+                        continue
+                    if isinstance(arg, Var) and id(arg) in produced:
+                        continue
+                    operand = getattr(arg, "name", type(arg).__name__)
+                    raise VerifyError(
+                        f"{name}: predicate operand {operand!r} has no producing "
+                        f"instruction before it in execution region {declared.name!r}; "
+                        "a mask must be written by an instruction that precedes its use "
+                        "in the same region instance (pset before the predicated op), or "
+                        "the predicated instruction reads a register nothing produced"
+                    )
             for _param, arg in writes_of(stmt):
                 if isinstance(arg, Var):
                     produced.add(id(arg))
+            return
+        if isinstance(stmt, (For, While)):
+            saved = set(produced)
+            visit(stmt.body)
+            produced.clear()
+            produced.update(saved)
+            return
+        if isinstance(stmt, If):
+            saved = set(produced)
+            visit(stmt.then_body)
+            produced.clear()
+            produced.update(saved)
+            visit(stmt.else_body)
+            produced.clear()
+            produced.update(saved)
+            return
+        # LetStmt / anything else: an allocation binds a name, it does not produce a
+        # mask, so it has no ordering effect here.
 
-    for stmt in body_stmts:
-        if not isinstance(stmt, Evaluate):
-            continue
-        op = stmt.callable
-        requirement = region_requirement(op)
-        if requirement is None or requirement.placement != "inside":
-            continue
-        if requirement.kind != scope_stmt.kind:
-            continue
-        name = getattr(op, "name", type(op).__name__)
-        try:
-            params = input_params(type(op))
-        except Exception:  # noqa: BLE001
-            continue
-        for param, arg in zip(params, stmt.args):
-            pattern = getattr(param, "pattern", None)
-            storage = getattr(pattern, "storage", None)
-            if storage is None or not declared.owns_storage(storage):
-                continue
-            dtype = getattr(pattern, "dtype", None)
-            names = tuple(
-                getattr(option, "name", None)
-                for option in getattr(dtype, "patterns", (dtype,))
-            )
-            if names != ("bool",):
-                continue  # only predicate (mask) operands are the subject of this rule
-            produced_here = isinstance(arg, Var) and id(arg) in produced
-            if produced_here:
-                continue
-            operand = getattr(arg, "name", type(arg).__name__)
-            raise VerifyError(
-                f"{name}: predicate operand {operand!r} has no producing instruction "
-                f"in execution region {declared.name!r}; a mask must be written by an "
-                "instruction in the same region instance (pset), or a predicated "
-                "instruction is reading a register nothing produced"
-            )
-
+    visit(scope_stmt.body)
 def verify_op_placement(op, modes: tuple, *, where: str = "execution region") -> None:
     """Check one operation is legal in the execution modes in force.
 

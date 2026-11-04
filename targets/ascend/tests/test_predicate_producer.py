@@ -12,9 +12,17 @@ A refusal is only evidence for this contract when it comes from the layer that S
 it, so the negative asserts the predicate-producer message and records the layer name
 next to it rather than treating any exception as a pass.
 
+TWO NEGATIVES, because the rule is about ORDER, not just presence:
+  * mask_without_producer_is_refused -- no pset at all
+  * late_pset_is_refused            -- pset placed AFTER the vadd that reads the mask
+The second is the one a presence-only check misses: the resolved TIR is a Sequential,
+so a writer that runs later has not run when the reader reads. The producer must DOMINATE
+the consumer (precede it in statement order), and the swapped-order case must FAIL at the
+same predicate-producer layer.
+
 WHAT THE FIRST RUN MUST SHOW: the positive control ACCEPTED (or every negative passes
-for free), and the dropped-pset case refused with the predicate-producer text. Exit
-codes: 0 PASS, 1 FAIL, 2 ERROR.
+for free), and BOTH negatives refused with the predicate-producer text. Exit codes:
+0 PASS, 1 FAIL, 2 ERROR.
 """
 from __future__ import annotations
 
@@ -70,8 +78,13 @@ def _function(params, *body):
     )
 
 
-def _chain(with_pset: bool) -> PrimFunction:
-    """The predicated vadd, optionally WITHOUT the instruction that writes the mask."""
+def _chain(pset: str = "before") -> PrimFunction:
+    """The predicated vadd with the mask-writing pset placed:
+
+    "before" -- pset precedes vadd (the correct program)
+    "after"  -- pset FOLLOWS vadd (the swapped-order defect)
+    "none"   -- no pset at all (the dropped-producer defect)
+    """
     ub_stmt, ub = _bind("ub", _tensor(storage="smem"))
     left_stmt, left = _bind("left", _tensor())
     right_stmt, right = _bind("right", _tensor())
@@ -82,9 +95,12 @@ def _chain(with_pset: bool) -> PrimFunction:
         Evaluate(callable=Vld(), args=(ub, left)),
         Evaluate(callable=Vld(), args=(ub, right)),
     ]
-    if with_pset:
-        inner.append(Evaluate(callable=Pset(elem_width=32), args=(mask,)))
+    pset_stmt = Evaluate(callable=Pset(elem_width=32), args=(mask,))
+    if pset == "before":
+        inner.append(pset_stmt)
     inner.append(Evaluate(callable=Vadd(), args=(left, right, mask, acc)))
+    if pset == "after":
+        inner.append(pset_stmt)
     scope = ExecutionScope(kind=KIND, body=Sequential(body=tuple(inner)))
     return _function((), ub_stmt, scope)
 
@@ -97,25 +113,43 @@ def _refusal(fn) -> str:
     raise AssertionError("expected a refusal; the program was accepted")
 
 
+def _assert_predicate_producer_refusal(message, what):
+    if "no producing instruction" not in message:
+        raise AssertionError(f"{what}: refused, but not by the predicate-producer rule: {message}")
+    if "nothing produced" not in message:
+        raise AssertionError(f"{what}: predicate-producer rule fired without its full text: {message}")
+
+
 def check_positive_control_is_accepted() -> None:
-    """With pset present the chain is ACCEPTED. Without this the negative is free."""
-    verify_prim_function(_chain(with_pset=True))
+    """With pset BEFORE vadd the chain is ACCEPTED. Without this every negative is free."""
+    verify_prim_function(_chain(pset="before"))
 
 
 def check_mask_without_producer_is_refused() -> None:
     """Drop pset: the mask has no producer and the chain must be refused."""
-    message = _refusal(_chain(with_pset=False))
-    if "no producing instruction" not in message:
-        raise AssertionError(f"refused, but not by the predicate-producer rule: {message}")
-    if "reading a register nothing produced" not in message:
-        raise AssertionError(f"predicate-producer rule fired without its full text: {message}")
+    message = _refusal(_chain(pset="none"))
+    _assert_predicate_producer_refusal(message, "dropped pset")
     print("       refused:", message.splitlines()[0][:150])
     print("       layer=predicate-producer")
+
+
+def check_late_pset_is_refused() -> None:
+    """pset placed AFTER the vadd: the writer does not dominate the reader. Must FAIL.
+
+    A presence-only check passes this (a writer exists), which is exactly the hole the
+    architect found. The resolved TIR is a Sequential, so a later writer has not run
+    when vadd reads the mask.
+    """
+    message = _refusal(_chain(pset="after"))
+    _assert_predicate_producer_refusal(message, "late pset")
+    print("       refused:", message.splitlines()[0][:150])
+    print("       layer=predicate-producer (dominance)")
 
 
 CHECKS = [
     ("positive_control_is_accepted", check_positive_control_is_accepted),
     ("mask_without_producer_is_refused", check_mask_without_producer_is_refused),
+    ("late_pset_is_refused", check_late_pset_is_refused),
 ]
 
 
