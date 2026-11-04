@@ -272,7 +272,8 @@ ARTIFACT_REJECTIONS = {
             {
                 "name": "mask_without_producer",
                 "why": "a predicated op whose mask no instruction wrote is reading a "
-                       "register nothing produced; lowering must refuse it.",
+                       "register nothing produced; lowering enforces producer DOMINANCE "
+                       "(the writer must precede the reader), so this is refused.",
                 "stage": "finalize",
                 "replace": [
                     ("pred = tf.schedule((mask,), op=T.ascend_pset(elem_width=32))", ""),
@@ -289,11 +290,19 @@ ARTIFACT_REJECTIONS = {
 #: Recorded so the gap is visible rather than papered over with a case that cannot
 #: fire. Dropping the pset and feeding the mask tensor straight to ascend_vadd is
 #: ACCEPTED today (finalize exit 0); there is no "mask has no producer" check.
-#: Empty now: the producerless-mask gap this once recorded was CLOSED upstream in
-#: TileFoundry 0550703 (verify_predicate_producers), and is asserted as a real
-#: rejection in ARTIFACT_REJECTIONS["vf_vadd.py"]. Kept as a dict so a future
-#: unenforced proposal has a home -- but a case that DOES fire belongs in
-#: ARTIFACT_REJECTIONS, not here, or it becomes a lie.
+#: Empty now. The producerless-mask gap this once recorded is CLOSED upstream:
+#: TileFoundry 0550703 added verify_predicate_producers (presence), and d13528f
+#: tightened it to DOMINANCE (the writing instruction must precede the reader).
+#: The dropped-pset case is asserted in ARTIFACT_REJECTIONS["vf_vadd.py"].
+#:
+#: The ORDERING case -- a pset placed AFTER the vadd -- is deliberately NOT here.
+#: It is not authorable in the DSL: a source file is read top to bottom, so a vadd
+#: referencing 'pred' before the pset defines it fails with NameError, not with a
+#: dominance violation. That case is direct-TIR only and is covered by
+#: targets/ascend/tests/test_predicate_producer.py:late_pset_is_refused. A
+#: source-keyed registry cannot express it, and faking it would assert the wrong
+#: reason. Kept as a dict so a future genuinely-unenforced proposal has a home -- but
+#: anything that DOES fire belongs in ARTIFACT_REJECTIONS, not here, or it is a lie.
 KNOWN_UNENFORCED = {}
 
 
