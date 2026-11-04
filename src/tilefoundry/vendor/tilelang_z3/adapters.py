@@ -1,8 +1,13 @@
-"""TF and TileLang adapters over ONE physical pure-Z3 core (WBS 04-06).
+"""TF and TileLang adapters over ONE physical pure-Z3 core (WBS 04-06/04-07).
 
 Both adapters import the SAME module object (tilefoundry.vendor.tilelang_z3.core); there
 is no second solver implementation to drift. This is what "shared core" means here: not
 two similar files, and not merely a shared certificate format.
+
+04-07 adds the LOOP adapters: both TF and TL call the identical
+core.z3_schedule_loop_python function with the identical normalized FULL constraint
+set. The optional 04-08 return_status flag does not create a second solver; it only
+makes the core's own sat/fallback decision visible instead of hiding it in a tuple.
 """
 from __future__ import annotations
 
@@ -31,7 +36,35 @@ def tl_adapter(latencies, iis, resource_flags, data_deps, resource_deps,
     )
 
 
+def _loop_call(core_args: dict, *, return_status: bool = True):
+    """ONE physical call site for both loop adapters."""
+    args = dict(core_args)
+    args["return_status"] = return_status
+    return core.z3_schedule_loop_python(**args)
+
+
+def tf_loop_adapter(core_args: dict, *, return_status: bool = True):
+    """TF-side full-loop adapter: normalized inputs -> the SAME physical core."""
+    return _loop_call(core_args, return_status=return_status)
+
+
+def tl_loop_adapter(core_args: dict, *, return_status: bool = True):
+    """TileLang-side full-loop adapter: normalized inputs -> the SAME physical core."""
+    return _loop_call(core_args, return_status=return_status)
+
+
 def shared_core_sha256() -> str:
-    """Both adapters must report this SAME physical file hash."""
+    """Both straight-line adapters must report this SAME physical file hash."""
     assert tf_adapter.__module__ == tl_adapter.__module__ == __name__
     return core.core_source_sha256()
+
+
+def shared_loop_core_sha256() -> str:
+    """Both full-loop adapters must report this SAME physical file hash."""
+    assert tf_loop_adapter.__module__ == tl_loop_adapter.__module__ == __name__
+    assert tf_loop_adapter.__globals__["core"] is tl_loop_adapter.__globals__["core"]
+    return core.core_source_sha256()
+
+
+__all__ = ["tf_adapter", "tl_adapter", "tf_loop_adapter", "tl_loop_adapter",
+           "shared_core_sha256", "shared_loop_core_sha256"]

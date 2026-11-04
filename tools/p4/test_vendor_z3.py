@@ -104,6 +104,22 @@ def main() -> int:
     b = v.tl_adapter([4, 2, 3, 1], [1, 1, 1, 1], [2, 16, 16, 4],
                      [(0, 1, 0), (1, 2, 0), (2, 3, 0)], [(1, 2)])
     check(a == b, "TF adapter == TL adapter on a synthetic problem (%r)" % (a,))
+    loop_defs = []
+    for base in ("src", "tools"):
+        for f in (TF / base).rglob("*.py"):
+            try:
+                tree = ast.parse(f.read_text())
+            except Exception:
+                continue
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))                         and node.name == "z3_schedule_loop_python":
+                    loop_defs.append(str(f.relative_to(TF)))
+    check(loop_defs == ["src/tilefoundry/vendor/tilelang_z3/core.py"],
+          "exactly one z3_schedule_loop_python definition (AST; found %r)" % loop_defs)
+    check(v.tf_loop_adapter.__module__ == v.tl_loop_adapter.__module__,
+          "TF and TL LOOP adapters live in one module (shared, not duplicated)")
+    check(v.shared_loop_core_sha256() == core.core_source_sha256(),
+          "both LOOP adapters report the SAME physical core SHA")
 
     # 3. behavioural equivalence to upstream (separate process)
     # Load the upstream file BY PATH: importing the tilelang package fails in this CPU env

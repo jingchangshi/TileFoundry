@@ -223,7 +223,9 @@ def z3_schedule_loop_python(
     manual_schedule: bool = False,
     seed: int | None = 42,
     verbose: bool = False,
-) -> tuple[list[int], list[int], int]:
+    fixed_buffer_versions: list[int | None] | None = None,
+    return_status: bool = False,
+) -> tuple[list[int], list[int], int] | dict:
     """Schedule a loop body with modulo, stage, and storage constraints.
 
     Each start time is represented as ``k * II + r``. Directed dependencies
@@ -279,10 +281,19 @@ def z3_schedule_loop_python(
         Z3 random seed; ``None`` leaves the solver default unchanged.
     verbose : bool
         Print solver inputs, search progress, and the selected schedule.
+    fixed_buffer_versions : list[int | None] | None
+        WBS 04-07/08 EXTENSION (not in upstream): pin each ALREADY-FIXED physical
+        buffer version count to its Problem value. None leaves that buffer free
+        inside [1, num_stages]. This makes the fixed-version constraints part of
+        the SAME solver, not a post-hoc assertion.
+    return_status : bool
+        WBS 04-08 EXTENSION (not in upstream): when True, return a dict with
+        status in {sat, fallback}, all per-II check results, and the schedule.
+        The default return tuple is unchanged for upstream equivalence.
 
     Returns
     -------
-    tuple[list[int], list[int], int]
+    tuple[list[int], list[int], int] | dict
         start_times: Start time for each task
         buffer_versions: Number of versions for each buffer
         minimal_II: The minimal initiation interval found
@@ -339,6 +350,7 @@ def z3_schedule_loop_python(
     best_ii = ii_upper
     best_model = None
     best_start_vars = None
+    check_results: list[str] = []
 
     if verbose:
         print(f"[Python Z3 Loop] Binary search range: [{ii_lower}, {ii_upper})")
@@ -373,6 +385,16 @@ def z3_schedule_loop_python(
         for i in range(len(buffer_sizes)):
             solver.add(buffer_vars[i] >= 1)
             solver.add(buffer_vars[i] <= num_stages)
+        if fixed_buffer_versions is not None:
+            if len(fixed_buffer_versions) != len(buffer_sizes):
+                raise ValueError("fixed_buffer_versions must match buffer_sizes length")
+            for i, want in enumerate(fixed_buffer_versions):
+                if want is None:
+                    continue
+                if want < 1 or want > num_stages:
+                    raise ValueError("fixed buffer version %d for buffer %d outside [1, %d]"
+                                     % (want, i, num_stages))
+                solver.add(buffer_vars[i] == want)
         for group in memory_groups:
             cap = group[0]
             idxs = group[1:]
@@ -455,7 +477,13 @@ def z3_schedule_loop_python(
         # Check feasibility
         if verbose:
             print(f"[Python Z3 Loop] Checking feasibility for II = {ii_mid}...")
-        if solver.check() == z3.sat:
+        res = solver.check()
+        check_results.append(str(res))
+        if res == z3.unknown:
+            # WBS 04-08: an undecided solver must NOT be silently converted into
+            # an "infeasible" II and then into a fallback schedule.
+            raise RuntimeError("Z3 scheduling failed: solver returned unknown")
+        if res == z3.sat:
             if verbose:
                 print(f"[Python Z3 Loop] II = {ii_mid} is feasible")
             best_ii = ii_mid
@@ -472,6 +500,7 @@ def z3_schedule_loop_python(
             ii_lower = ii_mid + 1
 
     if best_model is None:
+        # Only a sequence of UNSAT results may reach the explicit serial fallback.
         if manual_schedule:
             raise RuntimeError(
                 "Manual schedule constraints are infeasible; check per-pipe source order, T.Stage values, dependencies, and resource usage"
@@ -717,6 +746,20 @@ def z3_schedule_loop_python(
         except Exception as e:
             print(f"[Python Z3 Loop] Warning: Failed to save schedule visualization: {e}")
 
+    if return_status:
+        # WBS 04-08: the four solver states must stay DISTINCT. "fallback" here is
+        # the core's own explicit serial schedule after every II candidate was UNSAT;
+        # it is NEVER reported as sat/solved.
+        state = "sat" if best_model is not None else "fallback"
+        return {
+            "status": state,
+            "start_times": start_times,
+            "buffer_versions": buffer_versions,
+            "minimal_II": best_ii,
+            "check_results": check_results,
+            "fallback_reason": None if state == "sat" else
+                "all tested II candidates were unsat; core returned its explicit serial schedule",
+        }
     return start_times, buffer_versions, best_ii
 
 
