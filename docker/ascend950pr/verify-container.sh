@@ -56,21 +56,75 @@ not_run() {
 
 # entry.sh creates and verifies the container account but does NOT drop to it:
 # the entrypoint keeps running as root and `docker exec` runs as root too unless
-# told otherwise. So a caller who forgets `-u` gets a root shell, and every
-# check below would then describe a root environment while looking identical.
-# Fail closed rather than report a pass from a context nobody intended.
-if [ "$(id -u)" -eq 0 ]; then
-    printf 'verify-container.sh: refusing to run as root.\n' >&2
-    printf '  entry.sh does not drop privileges, so this means `docker exec`\n' >&2
-    printf '  was invoked without -u. Re-run as the container account:\n' >&2
-    printf '    docker exec -u <user> <container> bash %s\n' "$0" >&2
-    exit 2
+# told otherwise.
+#
+# Two modes, and the platform decides which one is correct:
+#
+#   default (CPU)   runs as the ordinary container account, via `docker exec -u`.
+#                   This is the required mode for analyze / finalize / equality,
+#                   which never touch the device.
+#   --npu           runs as root. Running NPU cases MUST enter as root on this
+#                   platform; a non-root NPU attempt is not representative, so it
+#                   is not silently attempted either.
+#
+# Root WITHOUT --npu is an accident -- a forgotten `-u` -- and is refused: every
+# check below would otherwise describe a root environment while looking identical
+# to the intended one. --npu is never implied; it has to be asked for.
+MODE=cpu
+for arg in "$@"; do
+    case "$arg" in
+        --npu) MODE=npu ;;
+        -h|--help)
+            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+            printf '\nUsage: %s [--npu]   (run inside the container)\n' "$0"
+            exit 0 ;;
+        *) printf 'verify-container.sh: unknown argument: %s\n' "$arg" >&2; exit 2 ;;
+    esac
+done
+
+IS_ROOT=no
+[ "$(id -u)" -eq 0 ] && IS_ROOT=yes
+
+if [ "$MODE" = npu ]; then
+    if [ "$IS_ROOT" != yes ]; then
+        # Asked for device work but not entered as root. On this platform that
+        # attempt would fail or, worse, half-succeed and look like a result.
+        printf 'verify-container.sh: --npu requires running as root.\n' >&2
+        printf '  NPU cases on this platform must enter as root.\n' >&2
+        printf '  Re-run without -u:\n' >&2
+        printf '    docker exec <container> bash %s --npu\n' "$0" >&2
+        exit 2
+    fi
+    printf '================================================================\n'
+    printf ' NPU MODE -- RUNNING AS ROOT\n'
+    printf ' ================================================================\n'
+    printf ' Reason: on this platform the NPU runtime requires root to enter.\n'
+    printf ' A non-root NPU attempt is not representative, so this mode is\n'
+    printf ' entered deliberately, not by omission.\n'
+    printf ' Scope: device access only. This does not license driver or CANN\n'
+    printf ' changes, and it does not make the container a sandbox.\n'
+    printf ' Mode: npu; user: %s (uid %s)\n' "$(id -un)" "$(id -u)"
+    printf '================================================================\n'
+else
+    if [ "$IS_ROOT" = yes ]; then
+        printf 'verify-container.sh: refusing to run as root without --npu.\n' >&2
+        printf '  entry.sh does not drop privileges, so this means `docker exec`\n' >&2
+        printf '  was invoked without -u. CPU checks must run as the container\n' >&2
+        printf '  account; root is reserved for device work and must be asked for.\n' >&2
+        printf '  Re-run as the container account:\n' >&2
+        printf '    docker exec -u <user> <container> bash %s\n' "$0" >&2
+        printf '  Or, for an on-device case:\n' >&2
+        printf '    docker exec <container> bash %s --npu\n' "$0" >&2
+        exit 2
+    fi
 fi
 
 printf 'TileFoundry Ascend950PR container verification\n'
 printf 'host: %s\n' "$(hostname)"
 printf 'date: %s\n' "$(date -Is)"
+printf 'mode: %s\n' "$MODE"
 printf 'user: %s (uid %s)\n' "$(id -un)" "$(id -u)"
+
 
 # --- identity -------------------------------------------------------------
 hr; printf '[identity]\n'; id | sed 's/^/  /'; uname -a | sed 's/^/  /'
