@@ -15,6 +15,8 @@ from __future__ import annotations
 import tilefoundry_ascend  # noqa: F401  (registers the SimdVF surface)
 
 from tilefoundry.ir.core import Call, Var, VerifyError
+from tilefoundry.ir.core.kinds import BinaryKind
+from tilefoundry.ir.tir.arith import Binary
 from tilefoundry.ir.tir.memory import AllocTensor
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Evaluate, ExecutionScope, LetStmt, MeshScope, Sequential
@@ -63,6 +65,29 @@ def check_computed_callable_inside_mode_is_refused() -> None:
     assert "ascend.simdvf" in message, message
 
 
+def check_declared_operation_reaches_placement() -> None:
+    """A declared operation must be judged on its placement, not on being a callable.
+
+    This is the positive side of the classifier. A direct operation is the one
+    callable this walker can actually decide inside a mode, so it must pass the
+    callable test and be answered by verify_op_placement. If the classifier
+    refuses it first, no native inside-mode operation can ever run -- the
+    placement rule would be unreachable for exactly the operations it exists for.
+
+    The operation here declares no placement, so the expected verdict is the
+    placement refusal, and the assertion is on which refusal arrived.
+    """
+    function, held = _bound_function()
+    scope = ExecutionScope(
+        kind="ascend.simdvf",
+        body=Sequential(body=(Evaluate(callable=Binary(kind=BinaryKind.ADD), args=(held, held, held)),)),
+    )
+    function.body = Sequential(body=(*function.body.body, MeshScope(AIV, Var(name="aiv", type=_tensor()), Sequential(body=(scope,)))))
+    message = _refusal(function)
+    assert "callee verification that knows the mode" not in message, message
+    assert "declares no execution placement" in message, message
+
+
 def check_undeclared_kind_is_refused() -> None:
     """An unknown kind fails closed rather than being treated as unconstrained."""
     function, held = _bound_function()
@@ -89,6 +114,7 @@ def check_scope_outside_any_mesh_is_refused() -> None:
 
 def main() -> int:
     checks = (
+        check_declared_operation_reaches_placement,
         check_computed_callable_inside_mode_is_refused,
         check_undeclared_kind_is_refused,
         check_scope_outside_any_mesh_is_refused,

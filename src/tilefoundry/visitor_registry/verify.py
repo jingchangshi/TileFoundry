@@ -757,11 +757,17 @@ def verify_evaluate_callable(callable_value, modes: tuple) -> None:
     types, the dispatch handled five, and an instruction selected at runtime
     walked straight past the mode.
 
+    A declared operation is the one callable this walker *can* judge inside a
+    mode, and it is judged on its own terms by verify_op_placement immediately
+    afterwards. It must therefore pass through here untouched: refusing it would
+    replace a placement verdict with "not verified yet", which is a weaker
+    statement about a case that has a real answer.
+
     While no callee verification carries a mode stack, there is no honest answer
-    for any of these inside a mode, so all of them are refused rather than
-    admitted by the route they happen to arrive on.
+    for a callee inside a mode, so every non-operation callable is refused rather
+    than admitted by the route it happens to arrive on.
     """
-    if not modes:
+    if not modes or isinstance(callable_value, Op):
         return
     if isinstance(callable_value, Call):
         name = getattr(callable_value.target, "name", type(callable_value.target).__name__)
