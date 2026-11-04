@@ -58,9 +58,22 @@ snapshot() {
   return 0
 }
 
-LOCK=/home/s00653124/.tf_device0.lock
+# CANONICAL lock path (Lead ruling D4): the ONE lock shared by every team device job,
+# on the host and inside the container (container /home is the host /home). It is NOT
+# a per-user lock under $HOME: two teammates keeping two different locks is the same as
+# keeping none. Created once as root inside the container, mode 0666, so both the host
+# user and root-in-container can open it. One holder per run: this script acquires it
+# once and passes no nested acquisition down to run_case.py.
+LOCK=/home/.tf_device0.lock
+if [ ! -e "$LOCK" ]; then
+  echo "REFUSE: canonical device lock $LOCK is missing; create it (root, mode 0666) instead of"
+  echo "  silently falling back to a per-user lock."
+  exit 78
+fi
 exec 9>"$LOCK"
 flock -x 9
+# One holder only: children must NOT re-acquire the same lock (run_case.py checks this).
+export TF_DEVICE_LOCK_HELD=1
 echo "=== device-lock acquired $(date -Is) ==="
 
 # Preflight occupancy: must be readable + healthy before any case runs.
