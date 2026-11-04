@@ -21,15 +21,56 @@
 #   5. No line stops the script. Every check reports its own exit code and the next
 #      one still runs, so one failure does not silently truncate the evidence.
 set -u
-PY=$HOME/.conda/envs/tilefoundry-npu/bin/python3.12
+# THE INTERPRETER IS RESOLVED, NOT ASSUMED FROM $HOME.
+#
+# An earlier version of this script wrote $HOME/.conda/envs/.../bin/python3.12. That
+# is correct on the host and WRONG in the container, where docker exec reports
+# HOME=/root and the env lives under /home/s00653124. The failure mode is nasty: the
+# shell reports "not found" for a path that looks right, and it reads like the env is
+# missing rather than like the script guessed. So the env root is resolved explicitly
+# in priority order, and the path actually used is PRINTED before anything runs.
+ENV_ROOT=${TF_ENV_ROOT:-}
+if [ -z "$ENV_ROOT" ]; then
+  for candidate in \
+    /home/s00653124/.conda/envs/tilefoundry-npu \
+    "$HOME/.conda/envs/tilefoundry-npu"
+  do
+    if [ -x "$candidate/bin/python3.12" ]; then
+      ENV_ROOT=$candidate
+      break
+    fi
+  done
+fi
+if [ -z "$ENV_ROOT" ] || [ ! -x "$ENV_ROOT/bin/python3.12" ]; then
+  echo "FATAL: no interpreter of record found. HOME=$HOME" >&2
+  echo "       looked for /home/s00653124/.conda/envs/tilefoundry-npu and" >&2
+  echo "       $HOME/.conda/envs/tilefoundry-npu; set TF_ENV_ROOT to override." >&2
+  exit 2
+fi
+PY=$ENV_ROOT/bin/python3.12
+echo "env_root=$ENV_ROOT   (resolved, not assumed)"
 REPO=${REPO:-/home/s00653124/workspace/TileFoundry}
-export PYTHONPATH=$REPO/src:$REPO/targets/ascend
+export PYTHONPATH=$REPO/src:$REPO/targets/ascend:$REPO/targets/nvidia
 export PYTHONDONTWRITEBYTECODE=1
+# STOP TORCH AUTO-LOADING THE NPU BACKEND. This is a safety setting, not a
+# convenience, and without it the CPU tests cannot even import torch.
+#
+# This container has the torch_npu build installed, so `import torch` tries to load
+# the NPU backend extension automatically and raises RuntimeError when the device
+# stack is unavailable. Two consequences, both bad: the CPU-only equality tests
+# report NOT_RUN for a reason that has nothing to do with M3, and every one of them
+# walks onto the device path we have frozen.
+#
+# TORCH_DEVICE_BACKEND_AUTOLOAD=0 keeps torch on CPU and never loads torch_npu,
+# which is exactly the posture this run needs: CPU arithmetic, no device, and no
+# ambiguity about whether a device was touched. Measured in-container:
+# `torch 2.12.0+cpu / torch_npu loaded: False / cuda False`, exit 0.
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 
 echo "== interpreter (identity first) =="
 "$PY" -c "import sys; print('python', sys.version.split()[0], sys.executable)"
 echo "versions below are read from dist-info / installed layout, not from a host import"
-SITE=$HOME/.conda/envs/tilefoundry-npu/lib/python3.12/site-packages
+SITE=$ENV_ROOT/lib/python3.12/site-packages
 for pkg in torch z3_solver isl_python; do
   found=$(ls -d "$SITE"/${pkg}-*.dist-info 2>/dev/null | head -1)
   if [ -n "$found" ]; then
@@ -91,6 +132,20 @@ run copy_slice_equality "$PY" "$REPO/targets/ascend/tests/test_copy_slice_equali
 
 # (4) The legacy paths that must not regress, so a green M3 cannot come from
 # breaking CUDA or the copy lowering.
-run cuda_analyze       "$PY" "$REPO/targets/cuda/tests/test_copy_equality.py"
+# The CUDA regression is an ANALYZE of a real in-repo fixture, not a test file.
+#
+# An earlier version of this line pointed at targets/cuda/tests/test_copy_equality.py,
+# a path that has never existed in this repository -- there is no targets/cuda at all,
+# the NVIDIA target lives at targets/nvidia. The line therefore failed with ENOENT and
+# I had recorded that as a "legacy regression" without ever having run it. Naming a
+# file is not running it; that is exactly the sort of line that makes a green report
+# a lie, so the path is replaced with one that exists and the check is an analyze,
+# which is what the fixture supports.
+#
+# What it proves: a legacy CUDA program using RMEM with a thread/CTA mesh and NO
+# execution mode still analyzes. That is the case the M3 ownership rule could most
+# easily have broken -- RMEM is private only in a program that has a mode -- so this
+# is the regression that matters, not a generic smoke test.
+run cuda_rmem_analyze  "$PY" -m tilefoundry.cli analyze "$REPO/tests/nvidia/cuda/fixtures/placed/square_cuda.py:Model.main"
 
 echo "== done: read exit codes above, not this line =="

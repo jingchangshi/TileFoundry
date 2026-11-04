@@ -259,10 +259,33 @@ def _chain_checks(flow):
     checks["vsts_stores_the_register_vadd_wrote"] = vsts[3][0] in vadd[3][3:4]
 
     # Ownership applies to the private values only.
+    #
+    # `flow["owner"]` is keyed by id(Var), while the entries in `entry[3]` are
+    # IDENTITIES -- ("var", id) or ("address", offset). Reading the owner map with an
+    # identity was a real bug in this file: every lookup returned None, so all three
+    # ownership checks failed on a CORRECT chain the first time this ever ran. That
+    # is the failure mode this whole fixture is built to expose, and it got caught by
+    # running it -- which is why an assertion that has never executed is a claim, not
+    # a check.
+    #
+    # So the two are kept apart explicitly: a private value owns, and a shared view
+    # does not (ownership is not a property of a buffer, so requiring an owner for one
+    # would be asking the wrong question). A check that finds NOTHING to own is
+    # reported as a failure rather than passing vacuously, because "no private
+    # operand was examined" and "every private operand was owned" are not the same
+    # statement and must not print the same.
     own = flow["owner"]
-    checks["vadd_operands_owned_here"] = all(own.get(operand) == instance for operand in vadd[3])
-    checks["vld_destinations_owned_here"] = all(own.get(entry[3][-1]) == instance for entry in vld)
-    checks["pset_destination_owned_here"] = own.get(pset[3][0]) == instance
+
+    def owned(identities):
+        """True when every PRIVATE identity is owned by *instance*; None if none are."""
+        private = [identity_ for identity_ in identities if identity_[0] == "var"]
+        if not private:
+            return None
+        return all(own.get(identity_[1]) == instance for identity_ in private)
+
+    checks["vadd_operands_owned_here"] = owned(vadd[3]) is True
+    checks["vld_destinations_owned_here"] = owned([entry[3][-1] for entry in vld]) is True
+    checks["pset_destination_owned_here"] = owned([pset[3][0]]) is True
 
     # The buffer the outside load filled is the buffer the inside load reads, and the
     # buffer vsts writes is the one the outside transfer hands back. Both are
