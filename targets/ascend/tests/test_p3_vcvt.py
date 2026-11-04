@@ -67,6 +67,26 @@ def cli(*args):
     return subprocess.run([sys.executable, "-m", "tilefoundry.cli", *args], cwd=ROOT, env=env, capture_output=True, text=True)
 
 
+_CHAIN_TIR = {"path": CHAIN_TIR}
+
+
+def chain_tir_path():
+    """The public schedule-finalize artifact, produced here when P3_CHAIN_TIR is unset.
+
+    Keeping this self-contained is what lets run_acceptance.sh gate the p3 suite without
+    an environment variable pointing into an evidence directory.
+    """
+    path = _CHAIN_TIR["path"]
+    if path and os.path.isfile(path):
+        return path
+    out = os.path.join(os.environ.get("TMPDIR", "/tmp"), "p3_vcvt_chain_tir.py")
+    result = cli("schedule", "finalize", os.path.join(FIX, "bf16_vcvt_chain.py") + ":Bf16VcvtChain", out)
+    if result.returncode != 0:
+        raise AssertionError(f"cannot produce the chain TIR: {result.stderr[-200:]}")
+    _CHAIN_TIR["path"] = out
+    return out
+
+
 def ty(dtype, storage, shape=(LANES,)):
     return make_tensor_type(shape, dtype=DType.from_name(dtype), storage=storage)
 
@@ -135,12 +155,11 @@ def check_mode_unchanged():
 
 def check_public_chain_pipeline():
     """Public analyze/finalize/reload/verify on the authored bf16->f32 chain."""
-    if not CHAIN_TIR or not os.path.isfile(CHAIN_TIR):
-        raise AssertionError("P3_CHAIN_TIR must name the public finalize artifact")
-    reloaded = load_authored_ir(f"{CHAIN_TIR}:Bf16VcvtChain")
+    tir = chain_tir_path()
+    reloaded = load_authored_ir(f"{tir}:Bf16VcvtChain")
     verify_module(reloaded)
     verify_prim_function(reloaded.entry_function())
-    text = open(CHAIN_TIR, encoding="utf-8").read()
+    text = open(tir, encoding="utf-8").read()
     for needle in ('"carrier"', 'dist="UNPK_B16"', "ascend_pset16", "elem_width=16", 'direction="forward"', "part=0", "ascend_vsts"):
         if needle not in text:
             raise AssertionError(f"finalized TIR lost {needle!r}")
@@ -248,16 +267,30 @@ def check_carrier_into_arithmetic_tir():
 
 
 def check_carrier_into_element_register():
-    """vsts is an element-register store: a carrier is not an f32 element register."""
+    """A carrier store must state pack=PK_B32; a bare carrier store is refused by name.
+
+    Vsts now admits a carrier source ONLY together with pack=PK_B32 (the reverse conversion
+    path). A carrier arriving without that pack is not an element-register store: it is
+    refused by the _VstsPack rule. Conversely a plain f32 store may not claim PK_B32.
+    """
     try:
-        check_call(Vsts(), (ty("bf16", "carrier"), ty("f32", "smem")), AIV, frame=None)
+        check_call(Vsts(), (ty("bf16", "carrier"), ty("bf16", "smem")), AIV, frame=None)
     except ScheduleRefusal as error:
         text = str(error)
-        if "T.ascend_vsts" not in text or "does not match f32" not in text:
-            raise AssertionError(f"carrier->vsts refused by the wrong layer: {text}")
+        if "T.ascend_vsts" not in text or "must state pack=PK_B32" not in text:
+            raise AssertionError(f"bare carrier->vsts refused by the wrong layer: {text}")
         print("       " + text.strip().splitlines()[-1][:170])
     else:
-        raise AssertionError("carrier into vsts was ACCEPTED")
+        raise AssertionError("a bare carrier store (no PK_B32) was ACCEPTED")
+    try:
+        check_call(Vsts(pack="PK_B32"), (ty("f32", "rmem"), ty("f32", "smem")), AIV, frame=None)
+    except ScheduleRefusal as error:
+        text = str(error)
+        if "T.ascend_vsts" not in text or "no pack" not in text:
+            raise AssertionError(f"f32 vsts with PK_B32 refused by the wrong layer: {text}")
+        print("       " + text.strip().splitlines()[-1][:170])
+    else:
+        raise AssertionError("an f32 store claiming PK_B32 was ACCEPTED")
 
 
 def check_carrier_outside_region():
@@ -384,9 +417,7 @@ def check_same_kind_different_instance():
 
 def check_public_pipeline_negative_from_reload(path_needle, fragment, what):
     """Reload an EDITED copy of the public finalize artifact and refuse it by name."""
-    if not CHAIN_TIR or not os.path.isfile(CHAIN_TIR):
-        raise AssertionError("P3_CHAIN_TIR must name the public finalize artifact")
-    text = open(CHAIN_TIR, encoding="utf-8").read()
+    text = open(chain_tir_path(), encoding="utf-8").read()
     edited = path_needle(text)
     if edited == text:
         raise AssertionError(f"{what}: reload mutation did not change the TIR text")
@@ -455,27 +486,6 @@ def check_hir_width32_refused():
     if code == 0:
         raise AssertionError("HIR accepted elem_width=32 on a conversion")
     expect_refusal(stderr, VCVT_SIGNATURE, "HIR width 32")
-
-
-def check_hir_producer_negatives_are_tir_layer():
-    """HIR has no producer graph: these two are ACCEPTED at analyze and refused at TIR.
-
-    This is a layer fact, not a pass: 'analyze exit 0' is recorded as the HIR result and
-    the corresponding reload-TIR negative (below) is the one that refuses by name.
-    """
-    code, stderr = hir_analyze(lambda t: t.replace("T.ascend_pset16(elem_width=16)", "T.ascend_pset(elem_width=32)"), "pset32")
-    if code != 0:
-        print(f"       HIR pset32 refused at analyze: {stderr.strip()[:120]}")
-    else:
-        print("       HIR pset32 -> vcvt ACCEPTED at analyze (no producer graph); refusal is at TIR")
-    code, stderr = hir_analyze(
-        lambda t: t.replace(PSET16_LINE + chr(10), "").replace(
-            "                stored = tf.empty", PSET16_LINE + chr(10) + "                stored = tf.empty"),
-        "late_pset")
-    if code != 0:
-        print(f"       HIR late pset refused at analyze: {stderr.strip()[:120]}")
-    else:
-        print("       HIR late pset ACCEPTED at analyze (no dominance walk); refusal is at TIR")
 
 
 def check_reload_pset32_refused():
@@ -564,7 +574,6 @@ CHECKS = {
         ("hir_part_missing_refused", check_hir_part_missing_refused),
         ("hir_plain_f32_refused", check_hir_plain_f32_refused),
         ("hir_width32_refused", check_hir_width32_refused),
-        ("hir_producer_negatives_are_tir_layer", check_hir_producer_negatives_are_tir_layer),
         ("reload_pset32_refused", check_reload_pset32_refused),
         ("reload_no_pset_refused", check_reload_no_pset_refused),
         ("reload_late_pset_refused", check_reload_late_pset_refused),
@@ -594,7 +603,6 @@ CHECKS = {
         ("wrong_producer_grain_to_vadd", check_wrong_producer_grain_to_vadd),
         ("consumer_width_32", check_consumer_width_32),
         ("admission_width_32", check_admission_width_32),
-        ("hir_producer_negatives_are_tir_layer", check_hir_producer_negatives_are_tir_layer),
         ("reload_pset32_refused", check_reload_pset32_refused),
         ("pset32_vadd_positive", check_pset32_vadd_positive),
     ],

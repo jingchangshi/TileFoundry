@@ -141,8 +141,12 @@ def main() -> int:
     got2 = getattr(evaluate(authored, x2), "data", None).reshape(-1).view(torch.int32).tolist()
     checks["input_dependent"] = got2 != got_bits
     checks["second_input_also_exact"] = got2 == [reference_f32_bits(b) for b in bits2]
-    # The reference itself must be discriminating: a deliberately wrong reference differs.
-    checks["wrong_reference_differs"] = got_bits != [(b ^ 0xFFFFFFFF) for b in got_bits]
+    # A genuinely wrong reference (the bf16 bit PATTERN read as a small integer, i.e. no
+    # shift into the high half) must disagree with the real conversion. This is a real
+    # comparison: it can equal got only if the program returned those small integers.
+    checks["wrong_reference_no_shift_differs"] = got_bits != [
+        struct.unpack("<i", struct.pack("<f", float(b)))[0] for b in bits
+    ]
 
     # --- mask is load-bearing (drive the instruction evaluator directly) -----
     handler = schedule_eval_registry.lookup(Vcvt)

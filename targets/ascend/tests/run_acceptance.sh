@@ -52,6 +52,10 @@ echo "env_root=$ENV_ROOT   (resolved, not assumed)"
 REPO=${REPO:-/home/s00653124/workspace/TileFoundry}
 export PYTHONPATH=$REPO/src:$REPO/targets/ascend:$REPO/targets/nvidia
 export PYTHONDONTWRITEBYTECODE=1
+# A private scratch directory: the p3 children write a finalized TIR there, and the loader
+# walks the directory it is pointed at, so a shared /tmp full of unrelated files is not a
+# safe place for that artifact.
+export TMPDIR=$(mktemp -d)
 # STOP TORCH AUTO-LOADING THE NPU BACKEND. This is a safety setting, not a
 # convenience, and without it the CPU tests cannot even import torch.
 #
@@ -141,6 +145,14 @@ run vadd_equality      "$PY" "$REPO/targets/ascend/tests/test_vadd_equality.py"
 run pair_negatives     "$PY" "$REPO/targets/ascend/tests/test_execution_pair_negatives.py"
 run scope_verify       "$PY" "$REPO/targets/ascend/tests/test_execution_scope_verify.py"
 run copy_slice_equality "$PY" "$REPO/targets/ascend/tests/test_copy_slice_equality.py"
+
+# (3b) The P3 carrier/vcvt/conversion suite. These are SELF-CONTAINED (test_p3_vcvt
+# generates its chain with the public CLI when P3_CHAIN_TIR is unset), so they belong in
+# the aggregate gate: any failure here makes the script's exit nonzero, like every child.
+run p3_carrier       "$PY" "$REPO/targets/ascend/tests/test_p3_carrier.py"
+run p3_mask_closure  "$PY" "$REPO/targets/ascend/tests/test_p3_mask_closure.py"
+run p3_chain_numeric "$PY" "$REPO/targets/ascend/tests/test_p3_chain_numeric.py"
+run p3_vcvt          "$PY" "$REPO/targets/ascend/tests/test_p3_vcvt.py"
 
 # (4) The legacy paths that must not regress, so a green M3 cannot come from
 # breaking CUDA or the copy lowering.

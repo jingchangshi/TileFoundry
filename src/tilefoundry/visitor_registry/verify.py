@@ -999,8 +999,17 @@ def verify_predicate_producers(scope_stmt) -> None:
     Ordering under control flow is conservative: a write inside an If branch or a loop
     body does not dominate statements after the construct (it may not have executed),
     so it is not carried out of the construct. A write before the construct does
-    dominate inside it. Region bodies here are straight-line, so this is exact for the
-    programs this mode admits.
+    dominate inside it.
+
+    CONTROL-FLOW CLOBBER. Restoring the pre-construct producer must not RESURRECT a
+    granularity that the construct may have overwritten. If a mask Var is written
+    ANYWHERE inside an If/For/While body, then after the construct its granularity is
+    UNKNOWN (it may be the pre-construct width or a width the body wrote, depending on
+    whether the branch ran). A consumer that requires a specific width is then refused by
+    name instead of being checked against the stale pre-construct width. Example caught:
+    pset16(mask) then 'if True: pset32(mask)' then vcvt16(mask) was accepted because the
+    save/restore brought the 16-bit record back; now it is refused. Uses of a mask INSIDE
+    the same construct are still checked against the write that precedes them there.
     """
     declared = execution_kind(scope_stmt.kind)
     if declared is None:
@@ -1011,6 +1020,10 @@ def verify_predicate_producers(scope_stmt) -> None:
     # 'produced' through the Sequential/For/If walks below, so the granularity recorded
     # is always the LAST writer before the read (the same writer dominance uses).
     produced_mask = {}
+    # Ordered log of ids written so far, including inside control-flow bodies. A
+    # construct's "writes inside" are the entries after its entry mark; a set would lose
+    # that distinction because a Var written BEFORE the construct is already in it.
+    write_log = []
     two_widths = declared.mask_width_bits is not None and declared.conversion_mask_width_bits is not None
 
     def expected_width(op):
@@ -1030,6 +1043,14 @@ def verify_predicate_producers(scope_stmt) -> None:
         if expected is None:
             return
         producer_op, width = produced_mask.get(id(arg), (None, None))
+        if producer_op is None and width is None:
+            raise VerifyError(
+                f"{name}: predicate operand {operand!r} was written inside a control-flow "
+                "construct, so its mask granularity is UNKNOWN after that construct (the "
+                "branch or loop may have overwritten it); a consumer that requires a "
+                f"specific width is refused rather than checked against the stale "
+                f"pre-construct record. Region {declared.name!r}."
+            )
         producer_name = getattr(producer_op, "name", type(producer_op).__name__)
         declared_producer = getattr(type(producer_op), "mask_width_attribute", None) is not None
         if not declared_producer:
@@ -1118,29 +1139,42 @@ def verify_predicate_producers(scope_stmt) -> None:
                 if isinstance(arg, Var):
                     produced.add(id(arg))
                     produced_mask[id(arg)] = (op, declared_mask_width(op))
+                    write_log.append(id(arg))
             return
         if isinstance(stmt, (For, While)):
             saved = set(produced)
             saved_mask = dict(produced_mask)
+            mark = len(write_log)
             visit(stmt.body)
+            written_inside = set(write_log[mark:])
             produced.clear()
             produced.update(saved)
             produced_mask.clear()
             produced_mask.update(saved_mask)
+            # A loop body may run zero or more times, so any mask it overwrote has an
+            # UNKNOWN granularity afterwards: do not resurrect the pre-loop record.
+            for key in written_inside & produced:
+                produced_mask[key] = (None, None)
             return
         if isinstance(stmt, If):
             saved = set(produced)
             saved_mask = dict(produced_mask)
+            mark = len(write_log)
             visit(stmt.then_body)
             produced.clear()
             produced.update(saved)
             produced_mask.clear()
             produced_mask.update(saved_mask)
             visit(stmt.else_body)
+            written_inside = set(write_log[mark:])
             produced.clear()
             produced.update(saved)
             produced_mask.clear()
             produced_mask.update(saved_mask)
+            # Either branch may have run (or neither, for an if without else): any mask
+            # written in either branch has an UNKNOWN granularity afterwards.
+            for key in written_inside & produced:
+                produced_mask[key] = (None, None)
             return
         # LetStmt / anything else: an allocation binds a name, it does not produce a
         # mask, so it has no ordering effect here.
