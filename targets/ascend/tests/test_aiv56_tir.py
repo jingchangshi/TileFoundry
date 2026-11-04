@@ -12,7 +12,7 @@ from __future__ import annotations
 import os, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-FIX = os.path.join(ROOT, "examples", "rmsnorm_950pr", "aiv56_ragged.py")
+FIX = os.path.join(ROOT, "targets", "ascend", "tests", "fixtures", "rmsnorm", "aiv56_ragged.py")
 ENTRY = "Own56R"
 CORES, L, TILES, NBASE, REM = 56, 64, 2048, 36, 32
 D_BYTES = L * 2
