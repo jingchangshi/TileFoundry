@@ -16,8 +16,86 @@ from pathlib import Path
 BLOCKED_ENV = 75
 NOT_RUN = 3
 DEVICE_AUTH_ENV = "TF_DEVICE_AUTH"
+# ONE canonical host lock, the same file run_all_cases.sh holds (HANDOFF §4 / Lead D4).
+# run_all_cases.sh holds it once and exports TF_DEVICE_LOCK_HELD=1 to its children; this
+# script MUST NOT take a second lock in that case. A standalone invocation takes the SAME
+# lock, so there is exactly one holder on every path and never a second lock file.
+DEVICE_LOCK_PATH = "/home/.tf_device0.lock"
 FROZEN_PROTOCOL = ("/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam"
                    "/artifacts/run01/p0/precision_protocol.json")
+_LOCK_FH = None
+
+
+def _ensure_device_lock() -> None:
+    """Acquire the ONE canonical device lock, unless a parent already holds it.
+
+    Exactly one holder per run: if TF_DEVICE_LOCK_HELD=1 the parent (run_all_cases.sh)
+    holds the flock and this process must not re-acquire it (a second flock on the same
+    open file description from a child is the duplicate-lock bug we are removing).
+    """
+    global _LOCK_FH
+    if os.environ.get("TF_DEVICE_LOCK_HELD", "").strip() == "1":
+        print("device lock: already held by parent (TF_DEVICE_LOCK_HELD=1); not re-acquiring",
+              file=sys.stderr)
+        return
+    import fcntl
+    try:
+        fh = open(DEVICE_LOCK_PATH, "a+")
+    except OSError as exc:
+        print("BLOCKED_ENV: cannot open canonical device lock %s: %s" % (DEVICE_LOCK_PATH, exc),
+              file=sys.stderr)
+        raise SystemExit(BLOCKED_ENV)
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        print("\n".join([
+            "BLOCKED_ENV: another team measurement job holds %s." % DEVICE_LOCK_PATH,
+            "  Refusing to enter: a second concurrent device job must not run.",
+            "  This is a refusal, not a failed attempt; nothing was opened.",
+        ]), file=sys.stderr)
+        raise SystemExit(BLOCKED_ENV)
+    _LOCK_FH = fh
+    print("device lock: acquired %s for this process" % DEVICE_LOCK_PATH, file=sys.stderr)
+
+
+def _device_identity_errors(uid: int, visible: str | None, ffi_version: str | None,
+                            device_index: int) -> list[str]:
+    """Explicit, testable checks: root, ASCEND_RT_VISIBLE_DEVICES=0, device ffi 0.1.12.
+
+    CPU and device ffi must not be mixed: the device env is 0.1.12 (matching the
+    tilelang-built libtvm_ffi.so); 0.1.15.post2 is the CPU env and is REFUSED here.
+    """
+    errors = []
+    if uid != 0:
+        errors.append("device work must run as root, uid is %d" % uid)
+    if str(visible) != "0":
+        errors.append("ASCEND_RT_VISIBLE_DEVICES must be 0, got %r" % (visible,))
+    if device_index != 0:
+        errors.append("this backend is pinned to device 0, got --device %d" % device_index)
+    if ffi_version is None:
+        errors.append("apache-tvm-ffi version is unknown; device env must be 0.1.12")
+    elif not str(ffi_version).startswith("0.1.12"):
+        errors.append("apache-tvm-ffi must be 0.1.12 in the device env, got %r "
+                      "(0.1.15.post2 is the CPU env and must not be mixed)" % (ffi_version,))
+    return errors
+
+
+def _assert_device_identity(device_index: int) -> None:
+    try:
+        import importlib.metadata as _md
+        ffi = _md.version("apache-tvm-ffi")
+    except Exception:  # noqa: BLE001
+        ffi = None
+    errors = _device_identity_errors(os.geteuid(), os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+                                     ffi, device_index)
+    if errors:
+        print("BLOCKED_ENV: device identity/ffi preconditions failed:", file=sys.stderr)
+        for e in errors:
+            print("  - " + e, file=sys.stderr)
+        raise SystemExit(BLOCKED_ENV)
+    print("device identity OK: uid=0, ASCEND_RT_VISIBLE_DEVICES=0, apache-tvm-ffi=%s" % ffi,
+          file=sys.stderr)
 
 
 def device_authorised() -> bool:
@@ -81,6 +159,8 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
+    _ensure_device_lock()
+    _assert_device_identity(args.device)
     refuse_unless_authorised(args.device)
     protocol = load_frozen_protocol(args.protocol)
 
