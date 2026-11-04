@@ -27,7 +27,7 @@ from tilefoundry.ir.core import Op, OpCapability
 from tilefoundry.ir.core.execution import RegionRequirement
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
-from tilefoundry.ir.pattern import SameConstraint, TensorPattern, utils
+from tilefoundry.ir.pattern import OrPattern, SameConstraint, TensorPattern, utils
 from tilefoundry.ir.types import DType, StorageKind, UnitType
 from tilefoundry.utils.lazy import torch
 from tilefoundry.visitor_registry import register_typeinfer, register_verify_stmt
@@ -42,9 +42,29 @@ READ = MemoryEffect.READ
 WRITE = MemoryEffect.WRITE
 
 _AIV = utils.memory_execution_mesh()
+
+#: The dtypes these instructions compute on. The set is stated once, and the
+#: mode declaration states the element width it must agree with; a dtype that
+#: happens to be 32 bits wide but is not f32 is a different quantity, not an
+#: equally good substitute. Naming the set here is what makes "vadd is an f32
+#: add" a checked claim instead of a docstring.
+VECTOR_DTYPES: tuple[DType, ...] = (DType.f32,)
+
+
+def _operands_in(storage: StorageKind, *dtypes: DType) -> TensorPattern:
+    """A tensor in *storage* whose dtype is one of *dtypes*.
+
+    Parameterizing the operand pattern by dtype is the difference between a
+    rule the matcher enforces and a rule a verifier remembers to restate. An
+    i32 register is still 32 bits wide, so a width-only check would admit it;
+    stating the dtypes admits exactly the arithmetic the instruction performs.
+    """
+    return TensorPattern(dtype=OrPattern(*dtypes) if len(dtypes) > 1 else dtypes[0], storage=storage)
+
+
 _IN_GMEM = utils.tensor_in(StorageKind.GMEM)
-_IN_UB = utils.tensor_in(StorageKind.SMEM)
-_IN_VREG = utils.tensor_in(StorageKind.RMEM)
+_IN_UB = _operands_in(StorageKind.SMEM, *VECTOR_DTYPES)
+_IN_VREG = _operands_in(StorageKind.RMEM, *VECTOR_DTYPES)
 _IN_PREG = TensorPattern(dtype=DType.bool, storage=StorageKind.RMEM)
 
 INSIDE = RegionRequirement(kind=SIMD_VF_KIND, placement="inside")

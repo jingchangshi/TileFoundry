@@ -10,11 +10,18 @@ Scope: f32 lanes. pset(32) sets the element width of the predicate and is not a
 lane count; the compute domain is the declared 64 lanes of the AIV vector unit.
 Instructions that name a different element width address lanes this mode does
 not reduce to, so the width is stated here rather than inferred from a dtype.
+
+The lane count and the element type are contracts, not comments: an operand
+whose extent is not 64 lanes, or whose dtype is not f32, is not something this
+mode can issue. An i32 register is also 32 bits wide, which is exactly why the
+dtype set is stated separately from the width -- otherwise "the widths match"
+would admit arithmetic this unit does not perform.
 """
 
 from __future__ import annotations
 
 from tilefoundry.ir.core.execution import ExecutionKind, register_execution_kind
+from tilefoundry.ir.types import DType
 from tilefoundry.ir.types.storage import StorageKind
 
 SIMD_VF_KIND = "ascend.simdvf"
@@ -38,6 +45,8 @@ def _declare() -> ExecutionKind:
             # The vector and predicate registers are the mode private working set.
             register_storages=(StorageKind.RMEM,),
             mask_width_bits=SIMD_VF_ELEMENT_WIDTH_BITS,
+            lane_count=SIMD_VF_LANES,
+            element_dtypes=(DType.f32,),
             required_topologies=("aiv",),
             # One scheduling unit per region: a nested region would state a
             # second mode where the first is still in force.

@@ -66,15 +66,22 @@ class ExecutionKind:
     region: a value held there may not be captured, yielded, or read outside.
     mask_width_bits is the element width the region's instructions reduce
     their predicates to; an instruction that states a different width is
-    addressing lanes the region does not have. required_topologies names the
-    hardware levels the region must be entered under -- a region is not a
-    mesh, so it does not open one; it requires one.
+    addressing lanes the region does not have. lane_count is how many lanes
+    one issue of the region covers: the extent an instruction operand must
+    have, so a lane count is a checked contract rather than a comment.
+    element_dtypes are the element types the mode computes on, and each must
+    be exactly mask_width_bits wide: a same-width integer is a different
+    quantity, not an equally good operand.
+    required_topologies names the hardware levels the region must be entered
+    under -- a region is not a mesh, so it does not open one; it requires one.
     """
 
     name: str
     surface: str
     register_storages: tuple[StorageKind, ...] = ()
     mask_width_bits: int | None = None
+    lane_count: int | None = None
+    element_dtypes: tuple = ()
     required_topologies: tuple[str, ...] = ()
     nestable: bool = False
 
@@ -97,6 +104,25 @@ class ExecutionKind:
                 f"ExecutionKind {self.name!r}: mask_width_bits must be a positive int, "
                 f"got {width!r}"
             )
+        lanes = self.lane_count
+        if lanes is not None and (isinstance(lanes, bool) or not isinstance(lanes, int) or lanes < 1):
+            raise ValueError(
+                f"ExecutionKind {self.name!r}: lane_count must be a positive int, "
+                f"got {lanes!r}"
+            )
+        for dtype in self.element_dtypes:
+            if not hasattr(dtype, "bit_width") or not hasattr(dtype, "name"):
+                raise TypeError(
+                    f"ExecutionKind {self.name!r}: element_dtypes must be dtypes, "
+                    f"got {dtype!r}"
+                )
+            if self.mask_width_bits is not None and dtype.bit_width != self.mask_width_bits:
+                raise ValueError(
+                    f"ExecutionKind {self.name!r}: element dtype {dtype.name!r} is "
+                    f"{dtype.bit_width} bits wide but the mode declares a "
+                    f"{self.mask_width_bits}-bit element width; the mode would be "
+                    "stating two different element sizes"
+                )
         if any(not isinstance(level, str) or not level for level in self.required_topologies):
             raise ValueError(
                 f"ExecutionKind {self.name!r}: required_topologies must be non-empty names"

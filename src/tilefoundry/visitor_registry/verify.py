@@ -496,6 +496,7 @@ def verify_prim_function(
             ctx = VerifyContext(module=environment.module, function=fn,
                                 target=environment.target, topologies=environment.topologies)
 
+    verify_private_parameters(fn, _modes_used_by(fn))
     _walk_stmt(fn.body, ctx, scope, fn, module_context, _Binders(fn.params))
 
 
@@ -635,6 +636,12 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: t
             # instruction target skipped the scan entirely.
             for argument in stmt.args:
                 verify_expression_placement(argument, modes, where="ExecutionScope")
+                # An inline view or allocation written straight into an operand
+                # position is the same claim as one bound with LetStmt, so it is
+                # checked by the same rule rather than only where it is spelled
+                # with a name.
+                verify_allocation_placement(argument, modes, _modes_used_by(fn))
+            verify_operand_lanes(stmt, modes)
             verify_evaluate_callable(stmt.callable, modes)
             if isinstance(stmt.callable, Launch):
                 _verify_launch(stmt, fn, module_context, ctx)
@@ -768,6 +775,124 @@ def verify_allocation_placement(value, modes: tuple, enclosing: frozenset = froz
                 "allocated inside that region"
             )
 
+def verify_private_parameters(fn, enclosing: frozenset) -> None:
+    """Refuse an externally supplied value in storage a mode owns.
+
+    A register value exists because the region has a register file, so it cannot
+    also be handed in from outside: the caller has no register file to supply it
+    from. A parameter whose storage is private to a mode *this function enters*
+    therefore has no possible producer, which is why the rule is stated over the
+    modes the function enters rather than over every declared kind. In a program
+    with no mode, register storage is ordinary CUDA thread-local memory and the
+    rule does not apply -- the same reasoning as the allocation check above.
+
+    This is the fail-closed half of the capture rule. The allocation check refuses
+    making a private value outside the region; this refuses arriving with one, so
+    there is no shape of private value whose owner is unaccounted for: allocated
+    in the region, or handed in (refused here), or viewed inline (refused by the
+    same expression walk, since a view call carries its result type).
+    """
+    if not enclosing:
+        return
+    for param in fn.params:
+        type_ = getattr(param, "type", None)
+        storage = getattr(type_, "storage", None)
+        if storage is None:
+            continue
+        for declared in declared_kinds():
+            if not declared.owns_storage(storage) or declared.name not in enclosing:
+                continue
+            raise VerifyError(
+                f"PrimFunction {fn.name!r}: parameter {param.name!r} is "
+                f"{storage.name.lower()} storage, which is private to execution "
+                f"region {declared.name!r}; a private value is created inside its "
+                "region, so it cannot be supplied from outside one"
+            )
+
+
+def verify_operand_lanes(stmt, modes: tuple) -> None:
+    '''Refuse an instruction operand whose extent is not the declared lane count.
+
+    A lane count that only appears in a constant is documentation. The mode
+    states how many lanes one issue covers, and an instruction in that mode
+    operates on exactly that many: an operand of a different extent is a
+    quantity this mode cannot issue, whether it is shorter (a partial issue
+    nothing here describes) or longer (tiling this build has no rule for).
+    Stating the check makes the extent a contract; leaving it out would make a
+    64-lane add and a 32-lane add equally acceptable.
+
+    Only register operands are measured. Memory operands are tiles staged by the
+    transfers, whose extent rules belong to the instruction that moves them, and
+    the predicate is measured by the instruction that consumes it, so the mask
+    keeps one owner instead of two that could disagree.
+    '''
+    if not modes:
+        return
+    declared = execution_kind(modes[-1])
+    if declared is None or declared.lane_count is None:
+        return
+    for argument in stmt.args:
+        type_ = getattr(argument, "type", None)
+        storage = getattr(type_, "storage", None)
+        if storage is None or not declared.owns_storage(storage):
+            continue
+        name = getattr(stmt.callable, "name", type(stmt.callable).__name__)
+        dtype_name = getattr(getattr(type_, "dtype", None), "name", None)
+        if dtype_name == "bool":
+            # the predicate: owned by the instruction that consumes it
+            continue
+        allowed = tuple(getattr(dtype, "name", None) for dtype in declared.element_dtypes)
+        if allowed and dtype_name not in allowed:
+            raise VerifyError(
+                f"{name}: operand of type {dtype_name} in "
+                f"{storage.name.lower()} is not an element type execution region "
+                f"{declared.name!r} computes on ({allowed!r}); an i32 register is "
+                "also 32 bits wide, which is why agreeing widths is not the rule"
+            )
+        shape = tuple(getattr(type_, "shape", ()))
+        if len(shape) != 1 or shape[0] != declared.lane_count:
+            raise VerifyError(
+                f"{name}: operand of shape {shape} is not the "
+                f"{declared.lane_count} lanes execution region {declared.name!r} "
+                "declares; one issue covers exactly that many lanes, and this build "
+                "has no tiling rule that would make a different extent mean something"
+            )
+
+
+def verify_operand_dtypes(op, declared, name: str) -> None:
+    """Refuse an operand whose element type the mode does not compute on.
+
+    The width check above is necessary but not sufficient: i32 is also 32 bits
+    wide, so "the widths agree" admits a register holding integers to an add
+    that only performs floating-point arithmetic. The mode therefore states its
+    element types, and every register operand must be one of them. Rows are read
+    off the operation's own operand types rather than from a list of parameter
+    names, so an instruction added later is covered without editing this check.
+    """
+    allowed = tuple(getattr(dtype, "name", None) for dtype in declared.element_dtypes)
+    if not allowed:
+        return
+    for param in input_params(type(op)):
+        pattern = getattr(param, "pattern", None)
+        if getattr(pattern, "storage", None) is None:
+            continue
+        if not declared.owns_storage(pattern.storage):
+            continue
+        dtype = getattr(pattern, "dtype", None)
+        if dtype is None:
+            continue
+        names = tuple(
+            getattr(option, "name", None)
+            for option in getattr(dtype, "patterns", (dtype,))
+        )
+        if any(name_ not in allowed for name_ in names):
+            raise VerifyError(
+                f"{name}: operand {param.name!r} is declared as {names!r} but execution "
+                f"region {declared.name!r} computes on {allowed!r}; an element type the "
+                "mode does not perform arithmetic on cannot be issued there, even when "
+                "its width matches"
+            )
+
 
 def verify_op_placement(op, modes: tuple, *, where: str = "execution region") -> None:
     """Check one operation is legal in the execution modes in force.
@@ -814,6 +939,8 @@ def verify_op_placement(op, modes: tuple, *, where: str = "execution region") ->
                 "addressing a different element width is addressing lanes this mode "
                 "does not have"
             )
+    if declared is not None:
+        verify_operand_dtypes(op, declared, name)
 
 
 def verify_evaluate_callable(callable_value, modes: tuple) -> None:
