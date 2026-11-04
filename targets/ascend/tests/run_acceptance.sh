@@ -11,9 +11,13 @@
 #   3. The package versions used in the report were read from dist-info directory
 #      names and from the installed file layout, WITHOUT importing anything on the
 #      host. That is stated here so the report cannot be misread as a host run.
-#   4. The TF import and the device-stack import are SEPARATE, INDEPENDENT lines.
-#      A torch_npu/CANN problem must not be able to hide an M3 result, and an M3
-#      result must not be able to look like an NPU-capable run.
+#   4. THE DEVICE STACK IS NEVER TOUCHED. No torch_npu import, no CANN sourcing, no
+#      npu-smi, no /dev/davinci* open. A host-wide filesystem wedge was traced
+#      (correlation only) to a davinci0 open, and nothing in this module needs an
+#      NPU, so the rule is absolute rather than conditional. The script says in its
+#      own output that a green run is CPU-only evidence and not device evidence in
+#      either direction. The dist-info LISTING below is a directory read and imports
+#      nothing; it is reported only so the reader knows which packages exist.
 #   5. No line stops the script. Every check reports its own exit code and the next
 #      one still runs, so one failure does not silently truncate the evidence.
 set -u
@@ -26,7 +30,7 @@ echo "== interpreter (identity first) =="
 "$PY" -c "import sys; print('python', sys.version.split()[0], sys.executable)"
 echo "versions below are read from dist-info / installed layout, not from a host import"
 SITE=$HOME/.conda/envs/tilefoundry-npu/lib/python3.12/site-packages
-for pkg in torch torch_npu z3_solver isl_python; do
+for pkg in torch z3_solver isl_python; do
   found=$(ls -d "$SITE"/${pkg}-*.dist-info 2>/dev/null | head -1)
   if [ -n "$found" ]; then
     printf '  %-12s %s\n' "$pkg" "$(basename "$found" .dist-info)"
@@ -49,60 +53,28 @@ run() {
 # failure here is a TileFoundry-side problem and nothing else.
 run framework_import   "$PY" -c "import tilefoundry, tilefoundry_ascend; print('tilefoundry import ok')"
 
-# (2) The device stack. Independent of (1): this line is allowed to fail and that
-# must not be read as an M3 failure, because nothing in this module issues a device
-# kernel. This host keeps CANN under /data/pri rather than /usr/local, so the path is
-# an ordered candidate list and NOT a hardcoded guess: whichever one is sourced is
-# printed, and if NONE exists the line says so instead of claiming CANN is absent --
-# those are different statements.
-CANN_SET_ENV=""
-for candidate in \
-  "${CANN_HOME:-}/ascend-toolkit/set_env.sh" \
-  /data/pri/cann-9.2.0/ascend-toolkit/set_env.sh \
-  /usr/local/Ascend/ascend-toolkit/set_env.sh
-do
-  case "$candidate" in
-    /ascend-toolkit/*) continue ;;     # CANN_HOME unset expands to "": skip the empty prefix
-  esac
-  if [ -f "$candidate" ]; then
-    CANN_SET_ENV=$candidate
-    break
-  fi
-done
-
-if [ -n "$CANN_SET_ENV" ]; then
-  echo "CANN: sourcing $CANN_SET_ENV"
-  # shellcheck disable=SC1090
-  . "$CANN_SET_ENV" >/dev/null 2>&1 || echo "note: $CANN_SET_ENV returned nonzero (continuing)"
-else
-  echo "CANN: NO set_env.sh found in the candidate list. This does NOT mean CANN is"
-  echo "      absent from the machine; it means none of the candidates I know is"
-  echo "      present at this path. The device-stack line below is therefore expected"
-  echo "      to be unavailable for an environment reason, which is distinct from a"
-  echo "      TileFoundry reason and must not be read as an M3 result."
-fi
-run device_stack       "$PY" -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
-
-# Whether torch_npu was imported AT ALL, as its own line. A CPU-only pass of this
-# module must never be read as evidence about the NPU: nothing in M3 issues a device
-# kernel, so this line exists to stop that inference being made by accident.
-echo "--- device_stack_reached ---"
-"$PY" -c "
-import sys
-print('torch_npu in sys.modules:', 'torch_npu' in sys.modules)
-try:
-    import torch_npu
-except Exception as error:
-    print('torch_npu import:', type(error).__name__, error)
-    print('NPU EVIDENCE: NONE -- this run is CPU-only, so it says nothing about the NPU')
-else:
-    print('torch_npu import: ok')
-    print('NPU EVIDENCE: NONE -- the library is importable, but M3 issues no device')
-    print('              kernel, so this run is not device evidence in either direction.')
-    print('              Nothing here should be read as the NPU agreeing with anything.')
-"
-echo "exit=$?"
+# (2) NO DEVICE STACK. This line used to import torch_npu and probe CANN; it no
+# longer does, and the reason is a safety rule rather than a simplification.
+#
+# A host-wide filesystem wedge was traced (correlation, not proof) to a davinci0
+# open, and importing torch_npu or sourcing CANN puts this process on that path.
+# Nothing in this module needs an NPU: every check is CPU arithmetic plus IR
+# inspection. So the device stack is now ABSENT BY CONSTRUCTION rather than
+# attempted-and-reported, and no line here may: import torch_npu, run npu-smi, or
+# open /dev/davinci*.
+#
+# The consequence for the report has to be stated plainly: a green run of this
+# script is CPU-only evidence and says NOTHING about the NPU. It was already true;
+# now it is also impossible to misread, because there is no device line to mistake
+# for a device result.
+echo "--- device_stack: NOT TOUCHED BY DESIGN ---"
+echo "NPU EVIDENCE: NONE. This script does not import torch_npu, source CANN, or open"
+echo "              any /dev/davinci* node. Every line below is CPU arithmetic and IR"
+echo "              inspection. A green run here is not device evidence in either"
+echo "              direction and must not be reported as the NPU agreeing with"
+echo "              anything."
 echo
+
 
 # (3) The M3 checks. These run regardless of (2), and each carries its own code.
 run ownership          "$PY" "$REPO/targets/ascend/tests/test_execution_ownership.py"
