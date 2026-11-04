@@ -13,12 +13,14 @@ UNKNOWN_ROOT.
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
 from tilefoundry.ir.core import Call, Constant, Tuple, Var
+from ..ir.isa import contract as isa_contract
 from tilefoundry.ir.hir.schedule import ScheduleOp
 from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.tir.memory import Copy, Fill, PtrOf, TensorView
@@ -63,6 +65,7 @@ class LedgerEntry:
     mode: str
     byte_footprint: int
     byte_offset: Optional[int]      # None == OFFSET_UNKNOWN
+    source_offset: str              # raw TIR slice starts (literal list or 'symbolic')
     logical_iteration: str
     iteration_path: str
     iteration_extent: str
@@ -155,6 +158,12 @@ def extract_ledger(function) -> Ledger:
     views: dict = {}  # view var name -> (root name, root kind, literal starts, alloc path)
     defs: dict = {}   # var name -> defining value (for root resolution)
 
+    def source_offset_of(var) -> str:
+        name = getattr(var, "name", None)
+        if name in views and views[name][2]:
+            return ",".join(str(start) for start in views[name][2])
+        return "symbolic"
+
     def offset_of(var) -> Optional[int]:
         name = getattr(var, "name", None)
         if name not in views:
@@ -240,6 +249,7 @@ def extract_ledger(function) -> Ledger:
                     mode=mode,
                     byte_footprint=_shape_bytes(type_),
                     byte_offset=offset_of(arg),
+                    source_offset=source_offset_of(arg),
                     logical_iteration=(loops[-1][0] if loops else "outside"),
                     iteration_path="/".join(name for name, _ in loops) or "outside",
                     iteration_extent=(loops[-1][1] if loops else "1"),
@@ -261,18 +271,40 @@ class ProblemAccess:
     mode: str
     byte_footprint: int
     byte_offset: Optional[int]
-    offset_status: str  # "KNOWN" | "OFFSET_UNKNOWN"
+    source_offset: str
+    normalized_offset: Optional[int]
+    offset_status: str  # "BYTES" | "OFFSET_UNKNOWN"
     logical_iteration: str
     iteration_path: str
     iteration_extent: str
+
+
+
+
+@dataclass(frozen=True)
+class ProblemTask:
+    """One real instruction (whole VF task or DMA/copy) with ISA-sourced pipe/cost fields."""
+    stable_id: str
+    op: str
+    pipe: str
+    resource: str
+    latency: Optional[int]
+    issue_interval: Optional[int]
+    loop: str
+    action_ids: list
+    cost_model: str = "MODEL"
 
 
 @dataclass
 class NormalizedProblem:
     problem_id: str
     source_digest: str
+    ledger_sha: str
+    canonical_serialization_sha: str
+    problem_digest: str
     loop_domain: dict
     accesses: list
+    tasks: list
     buffers: list
     dependencies: list
     alias: dict
@@ -301,7 +333,9 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
             mode=entry.mode,
             byte_footprint=entry.byte_footprint,
             byte_offset=entry.byte_offset,
-            offset_status="KNOWN" if entry.byte_offset is not None else "OFFSET_UNKNOWN",
+            source_offset=entry.source_offset,
+            normalized_offset=entry.byte_offset,
+            offset_status="BYTES" if entry.byte_offset is not None else "OFFSET_UNKNOWN",
             logical_iteration=entry.logical_iteration,
             iteration_path=entry.iteration_path,
             iteration_extent=entry.iteration_extent,
@@ -332,18 +366,83 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
             dependencies.append(
                 {"producer": a.task, "consumer": b.task, "distance": distance, "kind": kind, "evidence": "same root+space, emission order"}
             )
-    digest = hashlib.sha256("|".join(entry.action_id for entry in ledger.entries).encode()).hexdigest()[:16]
-    return NormalizedProblem(
-        problem_id="ledger-" + digest,
-        source_digest=digest,
-        loop_domain={"iterations": sorted({entry.logical_iteration for entry in ledger.entries})},
+    # Tasks: one per REAL instruction, with pipe/latency/ii from the ISA contract (not hardcoded).
+    by_instruction = {}
+    for entry in ledger.entries:
+        by_instruction.setdefault(entry.instruction, []).append(entry)
+    tasks = []
+    for instruction, group in sorted(by_instruction.items()):
+        first = group[0]
+        try:
+            contract_ = isa_contract(first.op.lower())
+            pipe, latency, ii = contract_.resource, contract_.latency_model, contract_.ii_model
+        except KeyError:
+            pipe, latency, ii = 'NO_ISA_CONTRACT', None, None
+        tasks.append(
+            ProblemTask(
+                stable_id=instruction,
+                op=first.op,
+                pipe=pipe,
+                resource=pipe,
+                latency=latency,
+                issue_interval=ii,
+                loop=first.iteration_path,
+                action_ids=[entry.action_id for entry in group],
+            )
+        )
+    # source_digest is derived from the LEDGER CONTENT (not the case configuration), so any HIR
+    # change that changes an emitted action changes the digest.
+    payload = json.dumps(
+        [
+            {
+                'action_id': entry.action_id, 'instruction': entry.instruction, 'op': entry.op,
+                'root': entry.root, 'root_kind': entry.root_kind, 'space': entry.space,
+                'mode': entry.mode, 'byte_footprint': entry.byte_footprint,
+                'byte_offset': entry.byte_offset, 'iteration_path': entry.iteration_path,
+                'iteration_extent': entry.iteration_extent,
+            }
+            for entry in ledger.entries
+        ],
+        sort_keys=True,
+    )
+    canonical_serialization_sha = hashlib.sha256(payload.encode()).hexdigest()[:16]
+    ledger_sha = hashlib.sha256('|'.join(entry.action_id for entry in ledger.entries).encode()).hexdigest()[:16]
+    source_digest = canonical_serialization_sha
+    problem = NormalizedProblem(
+        problem_id='ledger-' + source_digest,
+        source_digest=source_digest,
+        ledger_sha=ledger_sha,
+        canonical_serialization_sha=canonical_serialization_sha,
+        problem_digest='',
+        loop_domain={'iterations': sorted({entry.logical_iteration for entry in ledger.entries})},
         accesses=accesses,
+        tasks=tasks,
         buffers=buffers,
         dependencies=dependencies,
         alias={},
     )
+    problem_digest_payload = problem.as_dict()
+    problem_digest_payload.pop('problem_digest', None)
+    problem.problem_digest = hashlib.sha256(
+        json.dumps(problem_digest_payload, sort_keys=True, default=str).encode()
+    ).hexdigest()[:16]
+    return problem
 
 
+
+
+
+
+def tasks_coverage(ledger: Ledger, problem: NormalizedProblem) -> dict:
+    """Every task action_id must exist in the ledger, and every ledger action in exactly one task."""
+    by_id = {entry.action_id: entry for entry in ledger.entries}
+    covered = [action for task in problem.tasks for action in task.action_ids]
+    if len(covered) != len(set(covered)) or set(covered) != set(by_id):
+        raise LedgerError(f'TASK_COVERAGE_MISMATCH: tasks cover {len(set(covered))} of {len(by_id)} actions')
+    for task in problem.tasks:
+        if task.stable_id not in {by_id[action].instruction for action in task.action_ids}:
+            raise LedgerError('TASK_STABLE_ID_MISMATCH: ' + task.stable_id)
+    return {'tasks': len(problem.tasks), 'actions': len(covered), 'bidirectional': True}
 
 
 def validate_roots(problem: NormalizedProblem) -> None:
@@ -356,7 +455,7 @@ def validate_roots(problem: NormalizedProblem) -> None:
 
 def require_concrete_offset(problem: NormalizedProblem) -> None:
     """OFFSET_UNKNOWN is REFUSED as 0: a consumer that needs a concrete byte offset must refuse."""
-    unknown = [access for access in problem.accesses if access.offset_status != "KNOWN"]
+    unknown = [access for access in problem.accesses if access.offset_status != "BYTES"]
     if unknown:
         raise LedgerError(
             f"OFFSET_UNKNOWN: {len(unknown)} access(es) have no concrete byte offset "
@@ -366,24 +465,26 @@ def require_concrete_offset(problem: NormalizedProblem) -> None:
 
 def assert_no_default_zero(problem: NormalizedProblem) -> None:
     """A constant-0 extractor must be killed: KNOWN offset 0 without a literal source is a defect."""
-    defaulted = [access for access in problem.accesses if access.byte_offset == 0 and access.offset_status != "KNOWN"]
+    defaulted = [access for access in problem.accesses if access.byte_offset == 0 and access.offset_status != "BYTES"]
     if defaulted:
         raise LedgerError(f"DEFAULTED_OFFSET: {len(defaulted)} access(es) carry 0 as an UNKNOWN offset")
 
 
 
 
-def alias_report(problem: NormalizedProblem) -> dict:
+def alias_report(problem: NormalizedProblem, entry=None) -> dict:
     """Alias decisions go through the ONE entry point alias_conflicts, per (root, generation).
 
     Only root_kind='real' views with a KNOWN byte offset participate. Synthetic allocations
     (root_kind='synthetic_alloc') and OFFSET_UNKNOWN accesses are excluded and counted, so the
     consumer can see exactly what was NOT checked.
     """
+    if entry is not None:
+        raise LedgerError('ALIAS_ENTRY_BYPASSED: only the canonical view_spec.alias_conflicts entry is allowed')
     repo = Path(__file__).resolve().parents[4]
     sys.path.insert(0, str(repo / 'tools' / 'p3'))
     from view_spec import OffsetView, alias_conflicts  # noqa: PLC0415
-    real = [a for a in problem.accesses if a.root_kind == 'real' and a.offset_status == 'KNOWN']
+    real = [a for a in problem.accesses if a.root_kind == 'real' and a.offset_status == 'BYTES']
     views = [
         OffsetView(
             name=a.task, root=a.root, generation=0, byte_offset=a.byte_offset,
