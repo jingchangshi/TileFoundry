@@ -20,9 +20,9 @@
 # which is the failure mode this script exists to prevent.
 set -uo pipefail
 
-CANN_ROOT="${CANN_ROOT:-/data/pri/cann-9.2.0}"
-VENV_PY="${VENV_PY:-/home/s00653124/workspace/tfpy312/bin/python}"
-REPO="${REPO:-/home/s00653124/workspace/TileFoundry}"
+CANN_ROOT="${CANN_ROOT:-${CANN_ROOT}}"
+VENV_PY="${VENV_PY:-${HOME}/workspace/tfpy312/bin/python}"
+REPO="${REPO:-${HOME}/workspace/TileFoundry}"
 
 failures=0
 runs=0

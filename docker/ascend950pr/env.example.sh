@@ -32,8 +32,8 @@ CONTAINER_NAME=tf-ascend950pr
 IMAGE=tilefoundry-ascend950pr-dev:24.04
 
 # --- paths ----------------------------------------------------------------
-HOST_REPO=/home/s00653124/workspace/TileFoundry
-HOST_CANN=/data/pri/cann-9.2.0
+HOST_REPO=${HOME}/workspace/TileFoundry
+HOST_CANN=${CANN_ROOT}
 
 # --- TWO interpreters, and they are not interchangeable --------------------
 #
@@ -50,9 +50,9 @@ HOST_CANN=/data/pri/cann-9.2.0
 # Requiring CANN to be sourced first is not incidental: without it torch_npu
 # fails to import with "libhccl.so: cannot open shared object file", which reads
 # like a broken environment rather than an unexported one. Verified both ways.
-HOST_VENV=/home/s00653124/workspace/tfpy312
-NPU_PYTHON=/data/miniconda3/envs/l00849257/bin/python
-NPU_ENV_DIR=/data/miniconda3/envs/l00849257
+HOST_VENV=${HOME}/workspace/tfpy312
+NPU_PYTHON=${CONDA_ROOT}/envs/l00849257/bin/python
+NPU_ENV_DIR=${CONDA_ROOT}/envs/l00849257
 
 # Whether NPU_PYTHON is mounted into the container. Device cases need it; CPU
 # cases do not, and leaving it out is the smaller surface.

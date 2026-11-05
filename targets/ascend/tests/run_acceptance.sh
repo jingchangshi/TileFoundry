@@ -25,14 +25,14 @@ set -u
 #
 # An earlier version of this script wrote $HOME/.conda/envs/.../bin/python3.12. That
 # is correct on the host and WRONG in the container, where docker exec reports
-# HOME=/root and the env lives under /home/s00653124. The failure mode is nasty: the
+# HOME=/root and the env lives under ${HOME}. The failure mode is nasty: the
 # shell reports "not found" for a path that looks right, and it reads like the env is
 # missing rather than like the script guessed. So the env root is resolved explicitly
 # in priority order, and the path actually used is PRINTED before anything runs.
 ENV_ROOT=${TF_ENV_ROOT:-}
 if [ -z "$ENV_ROOT" ]; then
   for candidate in \
-    /home/s00653124/.conda/envs/tilefoundry-npu \
+    ${HOME}/.conda/envs/tilefoundry-npu \
     "$HOME/.conda/envs/tilefoundry-npu"
   do
     if [ -x "$candidate/bin/python3.12" ]; then
@@ -43,13 +43,13 @@ if [ -z "$ENV_ROOT" ]; then
 fi
 if [ -z "$ENV_ROOT" ] || [ ! -x "$ENV_ROOT/bin/python3.12" ]; then
   echo "FATAL: no interpreter of record found. HOME=$HOME" >&2
-  echo "       looked for /home/s00653124/.conda/envs/tilefoundry-npu and" >&2
+  echo "       looked for ${HOME}/.conda/envs/tilefoundry-npu and" >&2
   echo "       $HOME/.conda/envs/tilefoundry-npu; set TF_ENV_ROOT to override." >&2
   exit 2
 fi
 PY=$ENV_ROOT/bin/python3.12
 echo "env_root=$ENV_ROOT   (resolved, not assumed)"
-REPO=${REPO:-/home/s00653124/workspace/TileFoundry}
+REPO=${REPO:-${HOME}/workspace/TileFoundry}
 export PYTHONPATH=$REPO/src:$REPO/targets/ascend:$REPO/targets/nvidia
 export PYTHONDONTWRITEBYTECODE=1
 # A private scratch directory: the p3 children write a finalized TIR there, and the loader

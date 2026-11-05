@@ -20,11 +20,11 @@
 #   2  the manifest could not be written at all
 set -uo pipefail
 
-HOST_REPO="${TF_REPO:-/home/s00653124/workspace/TileFoundry}"
-VENV="${TF_VENV:-/home/s00653124/workspace/tfpy312}"
-CANN_ROOT="${CANN_ROOT:-/data/pri/cann-9.2.0}"
+HOST_REPO="${TF_REPO:-${HOME}/workspace/TileFoundry}"
+VENV="${TF_VENV:-${HOME}/workspace/tfpy312}"
+CANN_ROOT="${CANN_ROOT:-${CANN_ROOT}}"
 CONTAINER="${TF_CONTAINER:-tf-ascend950pr}"
-OUT="${1:-/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/run02/p0/container/manifest.txt}"
+OUT="${1:-${HOME}/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/run02/p0/container/manifest.txt}"
 
 log() { printf 'manifest.sh: %s\n' "$*" >&2; }
 die() { log "$*"; exit 2; }
