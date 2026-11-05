@@ -12,7 +12,7 @@ validation. Architect 03-20 must rule on observed bits before any native credit.
 
 | field | value | how obtained |
 |---|---|---|
-| tilelang VERSION | \`0.1.15\` | \`/home/s00653124/workspace/tilelang/VERSION\` |
+| tilelang VERSION | \`0.1.15\` | \`<user>/workspace/tilelang/VERSION\` |
 | selected build id | \`0.1.15+cuda.git8e2d3c82\` | HANDOFF §5.7 (the build identity under test) |
 | git HEAD | \`8e2d3c823b0c3a01d2ce68d47dabfe98e35cc22b\` | \`git rev-parse HEAD\` in that tree |
 | \`simd_inst.h\` sha256 | \`979f4ff76eee82bf092addcc069b238e3084af890f11660498f00640a00f20a1\` | sha256sum, matches HANDOFF |
@@ -92,7 +92,7 @@ and keeps the UNSOURCED label.
 1. **ROOT** (\`os.geteuid()==0\`; device ops require root here).
 2. \`TF_DEVICE_AUTH=1\` for this invocation only; absence is a refusal, not a default.
 3. \`ASCEND_RT_VISIBLE_DEVICES=0\`, \`torch.npu.set_device(0)\`.
-4. **ONE team measurement job**: non-blocking \`flock\` on \`/home/.tf_device0.lock\`;
+4. **ONE team measurement job**: non-blocking \`flock\` on \`/home/.tf_device0.lock\`; <!-- no-machine-path: allow -->
    a second job is refused (\`DEVICE_LOCK_HELD\`). The parent holds the lock, children
    must NOT re-acquire (V09 note). No NPU reset by the probe.
 5. \`npu-smi info\` snapshot **BEFORE** and **AFTER**, both saved raw

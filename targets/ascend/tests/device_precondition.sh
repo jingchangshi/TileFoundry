@@ -10,7 +10,7 @@
 #
 # This gate itself never opens /dev/davinci*, never runs npu-smi, never imports torch_npu.
 # Sourcing it is safe. The ONE lock is NOT here: the single canonical holder is
-# /home/.tf_device0.lock, taken by run_all_cases.sh (or, for a standalone run, by
+# /home/.tf_device0.lock, taken by run_all_cases.sh (or, for a standalone run, by  # no-machine-path: allow
 # run_case.py). Do not add a second flock in this file.
 #
 # Required evidence:

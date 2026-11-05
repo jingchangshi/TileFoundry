@@ -2,7 +2,7 @@
 
 | field | value |
 |---|---|
-| upstream repository | /home/s00653124/workspace/tilelang (TileLang) |
+| upstream repository | <user>/workspace/tilelang (TileLang) |
 | upstream path | tilelang/ascend/transform/z3_scheduler.py |
 | upstream git HEAD | 8e2d3c823b0c3a01d2ce68d47dabfe98e35cc22b |
 | upstream file sha256 | baa797dbede33091a0fe9f0754ed62d5561c8e048724e9586c3d58a323946580 |

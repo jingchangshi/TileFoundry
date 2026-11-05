@@ -66,7 +66,7 @@ import bf16_reference as p2  # noqa: E402
 
 EPS = 1e-6
 CH = 64
-DEFAULT_PROTOCOL = Path("/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam"
+DEFAULT_PROTOCOL = Path("<user>/workspace/TileFoundry_Ascend950PR_AgentTeam"
                         "/artifacts/run01/p0/precision_protocol.json")
 DETERMINISTIC_PATTERNS = {"zero", "ones", "alternating"}
 BLOCK = 256

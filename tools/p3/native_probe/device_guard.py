@@ -6,14 +6,26 @@ enforced here rather than described in prose:
 
   * ROOT (device ops require root in this environment);
   * TF_DEVICE_AUTH=1 supplied for this invocation only, no default;
-  * ASCEND_RT_VISIBLE_DEVICES=0;
-  * ONE host flock /home/.tf_device0.lock, non-blocking: a second concurrent team
+  * ASCEND_RT_VISIBLE_DEVICES=<non-empty comma list from TF_DEVICE_ALLOW, default 0,1>;
+  * ONE host flock /home/.tf_device0.lock, non-blocking: a second concurrent team  # no-machine-path: allow
     measurement job must NOT enter (parent holds the lock; children do not re-acquire);
   * npu-smi snapshot BEFORE and AFTER, both saved as raw files;
   * every device-side subprocess has a BOUNDED timeout (no unbounded hang);
   * the selected build is verified by VERSION / git HEAD / file sha256 before ANY launch.
 
 STATUS: UNSOURCED / UNVALIDATED. Nothing here is a device observation.
+
+Long-term card-selection rule (user authorization): device 0 and device 1 are both allowed.
+ASCEND_RT_VISIBLE_DEVICES is a non-empty comma list; every id must be an integer in
+TF_DEVICE_ALLOW (default "0,1"). The runtime defaults to the first logical device, recorded
+as effective_device=visible_ids[0]. The default policy is "0,1" so the runtime can schedule;
+pass "1" (or another allowed list) explicitly when a single card is required. Record the
+selection reason and npu-smi snapshot with every window. Each run still requires root in the
+container, TF_DEVICE_AUTH=1, one non-blocking lock /home/.tf_device0.lock, before/after  # no-machine-path: allow
+npu-smi. If one card warmup hangs, try the other card once; if both hang, stop device work
+and report. Never reset the NPU, kill another process, change driver/CANN, use sudo, or run
+parallel probes. Single launch bound remains 150s with a 140s watchdog; timeouts stop that
+candidate.
 """
 from __future__ import annotations
 
@@ -24,7 +36,7 @@ import subprocess
 import time
 from pathlib import Path
 
-LOCK = Path("/home/.tf_device0.lock")
+LOCK = Path("/home/.tf_device0.lock")  # no-machine-path: allow
 PINNED = {
     "tilelang_version": "0.1.15",
     "tilelang_build": "0.1.15+cuda.git8e2d3c82",
@@ -67,6 +79,60 @@ def verify_build(tl_root: Path) -> dict:
     return got
 
 
+def _parse_ids(raw: str, label: str) -> list[int]:
+    parts = [p.strip() for p in raw.split(",")]
+    if not parts or any(p == "" for p in parts):
+        raise GuardError("DEVICE_ID_INVALID", "%s has an empty item: %r" % (label, raw))
+    out = []
+    for p in parts:
+        try:
+            out.append(int(p))
+        except ValueError:
+            raise GuardError("DEVICE_ID_INVALID",
+                             "%s item is not an integer: %r in %r" % (label, p, raw)) from None
+    if len(set(out)) != len(out):
+        raise GuardError("DEVICE_ID_DUPLICATE",
+                         "%s has duplicate ids: %r -> %r" % (label, raw, out))
+    return out
+
+
+def container_visible_device_ids(dev_root="/dev") -> list[int]:
+    """Actual davinciN nodes in this container; /dev/davinci_manager is not a device."""
+    ids = []
+    for p in Path(dev_root).glob("davinci*"):
+        suffix = p.name[len("davinci"):]
+        if suffix.isdigit():
+            ids.append(int(suffix))
+    return sorted(set(ids))
+
+
+def check_device_identity(environ=None, container_ids=None) -> dict:
+    """Fail closed: visible list is non-empty, unique, allowed, and container-present."""
+    env = os.environ if environ is None else environ
+    visible_raw = env.get("ASCEND_RT_VISIBLE_DEVICES", "0,1").strip()
+    if visible_raw == "":
+        raise GuardError("DEVICE_ID_MISSING", "ASCEND_RT_VISIBLE_DEVICES is empty")
+    allow_raw = env.get("TF_DEVICE_ALLOW", "0,1").strip() or "0,1"
+    allow_ids = _parse_ids(allow_raw, "TF_DEVICE_ALLOW")
+    visible_ids = _parse_ids(visible_raw, "ASCEND_RT_VISIBLE_DEVICES")
+    not_allowed = [i for i in visible_ids if i not in set(allow_ids)]
+    if not_allowed:
+        raise GuardError("DEVICE_ID_NOT_ALLOWED",
+                         "ASCEND_RT_VISIBLE_DEVICES=%r ids %r not in TF_DEVICE_ALLOW=%r"
+                         % (visible_raw, visible_ids, allow_raw))
+    if container_ids is None:
+        container_ids = container_visible_device_ids()
+    container_ids = sorted(set(int(i) for i in container_ids))
+    not_present = [i for i in visible_ids if i not in set(container_ids)]
+    if not_present:
+        raise GuardError("DEVICE_NOT_IN_CONTAINER",
+                         "ASCEND_RT_VISIBLE_DEVICES=%r ids %r not present in container ids %r"
+                         % (visible_raw, visible_ids, container_ids))
+    return {"visible_devices": visible_raw, "visible_ids": visible_ids,
+            "allow_set": allow_ids, "container_visible_ids": container_ids,
+            "effective_device": visible_ids[0]}
+
+
 class DeviceWindow:
     """Context manager: one lock, root/auth/device identity, before+after npu-smi."""
 
@@ -83,8 +149,8 @@ class DeviceWindow:
             raise GuardError("NOT_ROOT", "device microtests require root")
         if os.environ.get("TF_DEVICE_AUTH", "").strip() != "1":
             raise GuardError("DEVICE_AUTH_MISSING", "TF_DEVICE_AUTH=1 is required for this invocation")
-        if os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "").strip() != "0":
-            raise GuardError("DEVICE_ID_MISMATCH", "ASCEND_RT_VISIBLE_DEVICES must be 0")
+        ident = check_device_identity()
+        self.report.update(ident)
         self.out.mkdir(parents=True, exist_ok=True)
         if os.environ.get("TF_DEVICE_LOCK_HELD", "").strip() == "1":
             # ONE holder per run: the parent shell (run_all_cases.sh or the 03-20 wrapper)
@@ -146,12 +212,14 @@ def plan_text(probe: str, case: str, out: Path, timeout_s: int) -> dict:
     return {
         "probe": probe, "case": case, "status": "UNSOURCED / UNVALIDATED (DESIGN ONLY)",
         "executed_this_round": False,
-        "preconditions": ["root (euid 0)", "TF_DEVICE_AUTH=1", "ASCEND_RT_VISIBLE_DEVICES=0",
-                          "one non-blocking flock /home/.tf_device0.lock (V09 window)",
+        "preconditions": ["root (euid 0)", "TF_DEVICE_AUTH=1",
+                          "ASCEND_RT_VISIBLE_DEVICES non-empty list within TF_DEVICE_ALLOW (default 0,1)",
+                          "every requested id must exist as /dev/davinciN in the container",
+                          "one non-blocking flock /home/.tf_device0.lock (V09 window)",  # no-machine-path: allow
                           "npu-smi info before AND after saved to raw files",
                           "bounded timeout %ds on every device subprocess" % timeout_s,
                           "tilelang VERSION / git HEAD / simd_inst.h + simd.py sha256 verified"],
-        "command": ("TF_DEVICE_AUTH=1 ASCEND_RT_VISIBLE_DEVICES=0 "
+        "command": ("TF_DEVICE_AUTH=1 ASCEND_RT_VISIBLE_DEVICES=<e.g. 0,1> TF_DEVICE_ALLOW=0,1 "
                     "PYTHONDONTWRITEBYTECODE=1 python tools/p3/native_probe/%s "
                     "--case %s --out %s --execute --timeout %d"
                     % (probe, case, out, timeout_s)),

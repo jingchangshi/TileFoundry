@@ -235,7 +235,7 @@ def main() -> int:
                  " or 'evaluator' in k.split('.')[0]];"
                  "print('BAD='+','.join(sorted(bad)))") % (str(TWIN.parent), str(TWIN))
         env = dict(os.environ, PYTHONPATH=str(TF / "src") + os.pathsep + str(TF / "targets/ascend")
-                   + os.pathsep + "/home/s00653124/workspace/tilelang",
+                   + os.pathsep + "<user>/workspace/tilelang",
                    PYTHONDONTWRITEBYTECODE="1", TORCH_DEVICE_BACKEND_AUTOLOAD="0")
         p = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, env=env)
         bad = next((l[4:] for l in p.stdout.splitlines() if l.startswith("BAD=")), None)

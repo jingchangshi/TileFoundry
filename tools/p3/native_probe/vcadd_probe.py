@@ -17,7 +17,7 @@ Six-call variant: --six-calls uses EXACTLY six vcadd calls plus an EXPLICIT
 vdupv(POS_LOWEST); the broadcast is never baked into vcadd (HANDOFF §5.7).
 
 Device preconditions are enforced by device_guard.py: root, TF_DEVICE_AUTH=1,
-ASCEND_RT_VISIBLE_DEVICES=0, one non-blocking /home/.tf_device0.lock, npu-smi before+after,
+ASCEND_RT_VISIBLE_DEVICES=0, one non-blocking /home/.tf_device0.lock, npu-smi before+after,  # no-machine-path: allow
 bounded timeout, selected-build hash verification. --plan is CPU-only; --execute is
 required to touch a device and is NOT RUN in this round.
 """

@@ -8,7 +8,7 @@ Covers:
      TF_DEVICE_LOCK_HELD=1 -> no re-acquire (parent holder).
   C. device_precondition.sh: BUSY occupancy is ALLOWED; missing/empty occupancy,
      wrong device id, unreadable path are REFUSED (exit 78).
-  D. two real concurrent flock attempts on /home/.tf_device0.lock: the second is blocked.
+  D. two real concurrent flock attempts on /home/.tf_device0.lock: the second is blocked.  # no-machine-path: allow
 
 Run: python tools/p4/test_device_entry.py --out-dir <dir>   (exit 0 iff all pass)
 """
@@ -25,7 +25,7 @@ from pathlib import Path
 TF = Path(__file__).resolve().parents[2]
 RUN_CASE = TF / "examples/rmsnorm_950pr/tools/run_case.py"
 PRECOND = TF / "targets/ascend/tests/device_precondition.sh"
-LOCK = "/home/.tf_device0.lock"
+LOCK = "/home/.tf_device0.lock"  # no-machine-path: allow
 FAILS = 0
 COUNTS = {"positive": 0, "negative": 0, "concurrency": 0}
 

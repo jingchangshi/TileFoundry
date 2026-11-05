@@ -271,7 +271,7 @@ def check_build_citation_matches() -> None:
 
     from tilefoundry_ascend.ir.isa import NATIVE_BUILD
 
-    root = "/home/s00653124/workspace/tilelang"
+    root = "<user>/workspace/tilelang"
     if not os.path.isdir(root):
         # No build present: the honest claim stays UNSOURCED and we do not fabricate one.
         assert "UNSOURCED" in NATIVE_BUILD["credit"] or True

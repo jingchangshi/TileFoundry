@@ -24,7 +24,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 EXPECTED = HERE / "expected_bits.json"
-DEFAULT_TL = Path("/home/s00653124/workspace/tilelang")
+DEFAULT_TL = Path("<user>/workspace/tilelang")
 ZEROS = ["0x00000000"] * 64
 
 

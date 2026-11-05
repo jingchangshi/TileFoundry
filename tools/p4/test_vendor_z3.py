@@ -27,7 +27,7 @@ HERE = Path(__file__).resolve().parent
 TF = HERE.parents[1]
 SRC = TF / "src"
 VEND = SRC / "tilefoundry/vendor/tilelang_z3"
-UP = Path("/home/s00653124/workspace/tilelang/tilelang/ascend/transform/z3_scheduler.py")
+UP = Path("<user>/workspace/tilelang/tilelang/ascend/transform/z3_scheduler.py")
 FAILS = 0
 
 
