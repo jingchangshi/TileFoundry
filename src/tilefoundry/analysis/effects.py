@@ -15,14 +15,34 @@ So the effect-aware rule is a reachability rule with one explicit exclusion:
    only a consumed produced value keeps a loop. Counting operand writes as effects is
    exactly the "keep every store loop" over-retention this module forbids.
 
-This module states those facts as callable predicates so the retention decision is
-readable and testable instead of being an accident of how the body was assembled.
+RETENTION ASSUMPTION (explicit, D0 value-form SSA)
+-----------------------------------------------------
+This module ONLY implements value-form retention. It assumes every externally visible
+write is carried by a PRODUCED VALUE that is reachable from the function result. D0 does
+NOT model imperative mutation of an existing Var: an instruction that writes a GM operand
+is NOT treated as producing a new externally visible value. A program whose only external
+effect is such an unconsumed operand write cannot be represented, and
+assert_value_form_retention refuses it by name (DCE_VALUE_FORM_ASSUMPTION_VIOLATED) rather
+than silently dropping it or pretending it was carried. If D0 ever grows
+imperative-mutation semantics, this assumption must be revisited and this module widened
+deliberately.
+
+WIRING (production vs test-only), per function:
+  * reachable_loops                -- PRODUCTION: parser/pipeline_intents uses it to decide
+                                      which authored pipeline declarations survived.
+  * reachable_loop_ids, loop_is_retained -- helper/test-only (not on a production path).
+  * storage_of, is_external_storage, value_is_external -- test-only predicates.
+  * instruction_operand_writes     -- test-only; documents that an operand WRITE is not a
+                                      DCE root.
+  * classify_dropped_loop          -- test-only; classifies a dropped loop.
+  * assert_value_form_retention    -- PRODUCTION-callable guard (see assumption above).
 """
 
 from __future__ import annotations
 
 from tilefoundry.ir.core import Call
 from tilefoundry.ir.core.param_def import MemoryEffect
+from tilefoundry.ir.hir.pipeline import PipelineError
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.types import TensorType
 from tilefoundry.ir.types.storage import StorageKind
@@ -37,6 +57,7 @@ __all__ = [
     "reachable_loops",
     "loop_is_retained",
     "classify_dropped_loop",
+    "assert_value_form_retention",
 ]
 
 
@@ -52,7 +73,10 @@ def is_external_storage(storage: object) -> bool:
 
 
 def value_is_external(value: object) -> bool:
-    """Whether the value's own type is externally visible storage (GMEM)."""
+    """Whether the value's own type is externally visible storage (GMEM).
+
+    Wiring: TEST-ONLY predicate (used by DCE controls, not on a production path).
+    """
     return is_external_storage(storage_of(value))
 
 
@@ -62,6 +86,9 @@ def _op_schema(op: object):
 
 def instruction_operand_writes(call: object) -> tuple[tuple[int, StorageKind | None], ...]:
     """(arg index, storage) for every operand the instruction declares WRITE.
+
+    Wiring: TEST-ONLY; documents that an operand WRITE is NOT a DCE root.
+
 
     This is INSTRUCTION operand effect only. It is reported for diagnosis and is
     deliberately NOT consulted by loop_is_retained: an operand write to a register or
@@ -94,7 +121,11 @@ def reachable_loop_ids(function) -> frozenset[int]:
 
 
 def reachable_loops(function) -> tuple[LoopRegion, ...]:
-    """Every LoopRegion reachable from the function's returned value, in body order."""
+    """Every LoopRegion reachable from the function's returned value, in body order.
+
+    Wiring: PRODUCTION (parser/pipeline_intents uses this to decide which authored
+    pipeline declarations survived DCE).
+    """
     body = getattr(function, "body", None)
     if body is None:
         return ()
@@ -102,12 +133,18 @@ def reachable_loops(function) -> tuple[LoopRegion, ...]:
 
 
 def loop_is_retained(loop: LoopRegion, reachable_ids: frozenset[int]) -> bool:
-    """A loop is retained iff its produced value is reachable from the result."""
+    """A loop is retained iff its produced value is reachable from the result.
+
+    Wiring: TEST-ONLY helper.
+    """
     return id(loop) in reachable_ids
 
 
 def classify_dropped_loop(loop: LoopRegion) -> str:
     """How a NOT-reachable loop's disappearance must be read.
+
+    Wiring: TEST-ONLY classifier.
+
 
     * pipeline -- an authored pipeline declaration; its loss is refused by name
       (PIPELINE_DECLARATION_DROPPED_BY_DCE), never silently accepted.
@@ -116,3 +153,43 @@ def classify_dropped_loop(loop: LoopRegion) -> str:
     if getattr(loop, "pipeline", None) is not None:
         return "pipeline"
     return "private-dead"
+
+
+def assert_value_form_retention(function, candidate_loops=()) -> dict:
+    """Assert the value-form SSA retention assumption for dropped loops, or refuse by name.
+
+    D0 cannot express an unconsumed external (GMEM) operand WRITE as a new value. A dropped
+    loop (one not reachable from the result) whose body contains an instruction writing a
+    GMEM operand is therefore exactly the case the value-form model cannot represent: it is
+    refused with DCE_VALUE_FORM_ASSUMPTION_VIOLATED instead of being silently deleted. A
+    dropped loop that only writes private storages (SMEM/RMEM/CARRIER) is a private dead
+    value and is allowed to disappear.
+
+    Wiring: PRODUCTION-callable guard. Callers pass the LoopRegions they built (including
+    ones DCE may drop); pass no candidates when only the surviving body is available.
+    """
+    reachable = reachable_loop_ids(function)
+    inspected = 0
+    dropped = 0
+    for loop in candidate_loops:
+        if id(loop) in reachable:
+            continue
+        dropped += 1
+        for expr in collect_exprs(loop.body):
+            if not isinstance(expr, Call):
+                continue
+            for index, storage in instruction_operand_writes(expr):
+                inspected += 1
+                if is_external_storage(storage):
+                    raise PipelineError(
+                        "DCE_VALUE_FORM_ASSUMPTION_VIOLATED",
+                        "dropped loop writes a GMEM operand (arg %d of %r) whose produced "
+                        "value is not consumed; D0 value-form SSA cannot represent an "
+                        "unconsumed external write" % (index, type(expr.target).__name__),
+                    )
+    return {
+        "value_form": "ssa-reachability",
+        "candidates": len(tuple(candidate_loops)),
+        "dropped": dropped,
+        "operand_writes_inspected": inspected,
+    }
