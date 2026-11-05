@@ -189,3 +189,57 @@ def nominal_solve_result(core_result, r_problem):
                                  sat_scope="NOMINAL_MODEL_ONLY",
                                  postcheck="SOLVER_POSTCHECK_NOT_IMPLEMENTED",
                                  core_source_hash=getattr(core_result, "core_source_hash", ""))
+
+
+
+def build_c_plan_view(plan, problem, loop_domain):
+    """POC_GLUE: action-id-level plan view + real GM buffers/accesses for C coverage only.
+
+    R materialization uses the SMEM plan; this view is NOT used by R. It exposes each action
+    as its own task_id (so C's edge producer/consumer action ids resolve) and adds REAL GM
+    buffers/accesses (x,z,out) with symbolic per-iteration offsets derived from the loop.
+    """
+    import dataclasses
+    from tilefoundry_ascend.plan.resolved_plan import AccessPlan, BufferPlan, TaskPlan, V, Mul, C
+
+    tasks = []
+    for task in plan.tasks:
+        for action_id in task.action_ids:
+            tasks.append(dataclasses.replace(task, task_id=str(action_id), action_ids=(str(action_id),)))
+    buffers = list(plan.buffers)
+    accesses = []
+    for access in plan.accesses:
+        accesses.append(dataclasses.replace(access, task_id=str(access.action_id), action_id=str(access.action_id)))
+    # real GM buffers from L's problem
+    for buf in getattr(problem, "buffers", []) or []:
+        g = buf.get if isinstance(buf, dict) else lambda k, b=buf: getattr(b, k, None)
+        root = g("root")
+        if str(root).startswith("smem@"):
+            continue
+        buffers.append(BufferPlan(
+            source_decl=str(root), root=str(root), owner="row_pipeline",
+            space=str(g("space") or "GMEM"), dtype=str(g("dtype") or "f32"),
+            shape=tuple(g("shape") or (int(g("bytes_") or 0) // 4,)),
+            single_version_bytes=int(g("bytes_") or 0), alignment=64,
+            slot_count=1, slot_source="fixed"))
+    for index, access in enumerate(getattr(problem, "accesses", []) or []):
+        g = access.get if isinstance(access, dict) else lambda k, a=access: getattr(a, k, None)
+        root = g("root")
+        if str(root).startswith("smem@"):
+            continue
+        stride = 256
+        if g("byte_offset") is None:
+            offset = Mul(V("i"), C(stride))
+            fmt = "symbolic"
+        else:
+            offset = C(int(g("byte_offset")))
+            fmt = "literal"
+        accesses.append(AccessPlan(
+            access_id=str(g("task")) + "#gm%d" % index, action_id=str(g("task")),
+            task_id=str(g("task")), source_stmt=str(g("instruction")).split("/", 1)[1]
+            if "/" in str(g("instruction")) else str(g("instruction")),
+            buffer_root=str(root), logical_index=V("i"), execution_ordinal=V("k"),
+            slot=V("slot"), generation=V("k"), relative_byte_offset=offset,
+            guard=None, mode=str(g("mode")), byte_footprint=int(g("byte_footprint") or stride)))
+    return dataclasses.replace(plan, tasks=tuple(tasks), buffers=tuple(buffers), accesses=tuple(accesses))
+

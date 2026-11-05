@@ -114,15 +114,34 @@ def test_vertical_run():
                     run["steps"]["R"]["replay_rows"] = len(rows)
                     run["steps"]["R"]["replay_sample"] = rows[:2]
                     try:
-                        from tilefoundry_ascend.sync import derive_completion_obligations, verify_completion_coverage
-                        obligations = derive_completion_obligations(problem, plan, completion_capabilities={})
-                        coverage = verify_completion_coverage(problem, plan, rewritten,
-                                                              {"placements": (), "channels": ()}, {})
+                        from tilefoundry_ascend import sync as SY
+                        from poc_vertical_adapter import build_c_plan_view
+                        cplan = build_c_plan_view(plan, problem, r_problem["loop_domain"])
+                        roots = {str(b.root) for b in cplan.buffers}
+                        supported, excluded = [], {}
+                        for dep in problem.dependencies:
+                            root = dep.get("shared_root")
+                            if root in roots:
+                                supported.append(dep)
+                            else:
+                                excluded[dep.get("kind", "?")] = excluded.get(dep.get("kind", "?"), 0) + 1
+                        filtered = types.SimpleNamespace(dependencies=supported)
+                        caps = {"same_pipe_pipe_order": True, "cost_model": "MODEL"}
+                        obligations = SY.derive_completion_obligations(filtered, cplan, completion_capabilities=caps)
+                        channels, _discharges = SY.choose_completion_mechanisms(obligations, {}, caps)
+                        caps = {**caps, "flag_pool_size": 256}
+                        allocation = SY.allocate_completion_resources(channels, [], caps)
+                        injected = SY.inject_completion(rewritten, cplan, obligations, allocation, channels=channels)
+                        coverage = SY.verify_completion_coverage(problem, cplan, injected,
+                                                                  {"placements": (), "channels": channels}, {})
                         run["steps"]["C"] = {"status": getattr(coverage, "status", None),
                                              "code": getattr(coverage, "code", None),
-                                             "required": getattr(coverage, "required", None),
+                                             "required_full": len(expected["all"]),
+                                             "c_derived_required": getattr(coverage, "required", None),
                                              "covered": getattr(coverage, "covered", None),
-                                             "kind": "real"}
+                                             "excluded_by_kind": excluded,
+                                             "digest_C_injected": MAT.tir_digest(injected),
+                                             "kind": "real(FULL denominator with named exclusions)"}
                     except Exception as error:  # noqa: BLE001
                         run["steps"]["C"] = {"status": "NOT_RUN", "code": getattr(error, "code", type(error).__name__),
                                              "detail": str(error)[:140], "kind": "unknown"}
