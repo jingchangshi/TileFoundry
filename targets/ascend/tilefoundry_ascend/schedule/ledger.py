@@ -493,6 +493,20 @@ def _site_scope(ledger: Ledger, path: str) -> str:
     return best
 
 
+def _site_container(ledger: Ledger, path: str) -> str:
+    """The structural region a site lives in, even when it is not inside an ExecutionScope.
+
+    A main-domain consumer is emitted in the row loop OUTSIDE the scope that declared it, so
+    _site_scope is empty there and reporting "" would lose the binding's real location. The
+    container falls back to the longest enclosing structural prefix we can prove: the parent
+    path of the statement. This is a coordinate, not an assertion about meaning.
+    """
+    inside = _site_scope(ledger, path)
+    if inside:
+        return inside
+    return path.rsplit("/", 1)[0] if "/" in path else ""
+
+
 def _unique_endpoint(ledger: Ledger, root: str, mode: str, endpoint: str, key: str) -> LedgerEntry:
     """Exactly one SMEM action of this mode on this root, or a named refusal."""
     candidates = [
@@ -553,7 +567,7 @@ def _resolve_outer_endpoint(ledger: Ledger, sites: dict, record, field, scope: s
     if sibling:
         _check_site_type(key, "outer", str(field.get("outer_type") or ""), sibling[0])
         path = str(sibling[0].get("path", ""))
-        outer_scope = _site_scope(ledger, path)
+        outer_scope = _site_container(ledger, path)
         return (
             _unique_endpoint(ledger, "smem@" + path, "read", "outer", key),
             outer_scope,
