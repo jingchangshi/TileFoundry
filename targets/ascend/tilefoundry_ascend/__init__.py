@@ -10,4 +10,11 @@ surface and its Target.
 from tilefoundry_ascend import ir as _ir  # noqa: F401  (registers the surface)
 from tilefoundry_ascend.tf_target import Ascend950PRTarget  # noqa: F401
 
+# Importing the pass module is what REGISTERS the D0 entries against
+# Ascend950PRTarget. Registration is a decorator side effect, so without this import
+# the checkers exist but target_passes() never returns them and the public finalize
+# path would silently skip every D0 verification. Imported AFTER tf_target, because
+# the pass module imports the Target class from it.
+from tilefoundry_ascend.passes import pipeline as _pipeline  # noqa: F401
+
 __all__ = ["Ascend950PRTarget"]
