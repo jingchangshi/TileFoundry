@@ -27,7 +27,7 @@ DEVICE_AUTH_ENV = "TF_DEVICE_AUTH"
 # run_all_cases.sh holds it once and exports TF_DEVICE_LOCK_HELD=1 to its children; this
 # script MUST NOT take a second lock in that case. A standalone invocation takes the SAME
 # lock, so there is exactly one holder on every path and never a second lock file.
-DEVICE_LOCK_PATH = "/home/.tf_device0.lock"
+DEVICE_LOCK_PATH = "/home/.tf_device0.lock"  # no-machine-path: allow
 FROZEN_PROTOCOL = (f"{_WS_ROOT}/TileFoundry_Ascend950PR_AgentTeam"
                    "/artifacts/run01/p0/precision_protocol.json")
 _LOCK_FH = None

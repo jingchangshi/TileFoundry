@@ -98,7 +98,7 @@ snapshot() {
 # keeping none. Created once as root inside the container, mode 0666, so both the host
 # user and root-in-container can open it. One holder per run: this script acquires it
 # once and passes no nested acquisition down to run_case.py.
-LOCK=/home/.tf_device0.lock
+LOCK=/home/.tf_device0.lock  # no-machine-path: allow -- canonical team lock, fixed by contract
 if [ ! -e "$LOCK" ]; then
   echo "REFUSE: canonical device lock $LOCK is missing; create it (root, mode 0666) instead of"
   echo "  silently falling back to a per-user lock."

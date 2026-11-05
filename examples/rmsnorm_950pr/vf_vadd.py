@@ -21,14 +21,17 @@ conda env is the env of record; /opt/tf-venv is retired and is not evidence:
 
     docker exec -e PYTHONPATH=<repo>/src:<repo>/targets/ascend \
         -e TORCH_DEVICE_BACKEND_AUTOLOAD=0 tf-ascend950pr \
-        /home/s00653124/.conda/envs/tilefoundry-npu/bin/python3.12 \
+        "${TF_PY:?set TF_PY to the env-of-record interpreter}" \
         -m tilefoundry.cli schedule finalize \
         examples/rmsnorm_950pr/vf_vadd.py:VfVadd <out.py>
 
-The interpreter is named by ABSOLUTE path on purpose: under docker exec HOME is /root,
-so a $HOME-relative path resolves nowhere. The output path must not be under /tmp --
-the loader walks the output directory, and a scratch directory of unrelated packages
-fails the import for reasons unrelated to this program.
+The interpreter is passed in EXPLICITLY and is never inherited from the container:
+under docker exec the container HOME is /root, so a path resolved inside the container
+points nowhere. Resolve it on the HOST and name it (for example
+TF_PY="$HOME/.conda/envs/tilefoundry-npu/bin/python3.12"). No account path is written
+down here, because this file must not embed one machine home. The output path must
+not be under /tmp -- the loader walks the output directory, and a scratch directory of
+unrelated packages fails the import for reasons unrelated to this program.
 """
 from __future__ import annotations
 

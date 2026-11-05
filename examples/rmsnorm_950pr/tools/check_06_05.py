@@ -6,9 +6,11 @@ Modes:
   plan   (default) NO device, NO torch import, NO lock. Uses ARCHIVED run2 case products and
          the current .aibin for a rehearsal; "readback" is the archived device.npy and is
          labelled archived_not_fresh.
-  device requires ALL of: --device, euid 0, TF_DEVICE_AUTH=1, ASCEND_RT_VISIBLE_DEVICES=0,
+  device requires ALL of: euid 0, TF_DEVICE_AUTH=1, ASCEND_RT_VISIBLE_DEVICES as a
+         non-empty comma list within TF_DEVICE_ALLOW whose ids all exist in the container,
          a NEW empty --cases-dir, and the canonical lock acquired non-blocking. Any missing
          condition is a named REFUSE[DEVICE_GATE] exit 2 and nothing is launched.
+         A busy npu-smi process table is recorded, never refused or waited on.
 
 Verdict: mismatch_count==0 for every pattern; deterministic (zero/ones/alternating) bf16
 codewords exact; repeats/stability/reuse pass; nonfinite output fails; empty pattern set
@@ -31,13 +33,18 @@ import numpy as np
 HERE = Path(__file__).resolve()
 TF = HERE.parents[3]
 sys.path.insert(0, str(TF / "tools" / "p3"))
+sys.path.insert(0, str(TF / "tools" / "p3" / "native_probe"))
 sys.path.insert(0, str(TF / "examples/rmsnorm_950pr/tools"))
 import rmsnorm_oracle as oracle  # noqa: E402
+from device_guard import GuardError, check_device_identity  # noqa: E402
 import direct_diff as dd  # noqa: E402
 
 FROZEN = TF.parent / "TileFoundry_Ascend950PR_AgentTeam/artifacts/run01/p0/precision_protocol.json"
 E_ASCEND_AIV = 0x1029
-LOCK = Path("/home/.tf_device0.lock")
+# The CANONICAL team lock: the fixed path every agent on this host meets at. It is a
+# literal ON PURPOSE -- it is not a per-machine location to be derived, and deriving
+# it would let two processes disagree about where the lock is and both hold "the" one.
+LOCK = Path("/home/.tf_device0.lock")  # no-machine-path: allow
 
 
 def sha256_file(p: Path) -> str:
@@ -102,8 +109,10 @@ def env_check(env):
         bad.append("PYTHONPATH(TF src)")
     if not any(p.name == "ascend" and p.is_dir() for p in pp):
         bad.append("PYTHONPATH(TF targets/ascend)")
-    if env.get("ASCEND_RT_VISIBLE_DEVICES") != "0":
-        bad.append("ASCEND_RT_VISIBLE_DEVICES=0")
+    try:
+        check_device_identity(env)
+    except GuardError as exc:
+        bad.append("device identity %s" % exc.code)
     if env.get("TF_DEVICE_AUTH") != "1":
         bad.append("TF_DEVICE_AUTH=1")
     return bad
@@ -117,8 +126,6 @@ def device_gate(args, env):
         reasons.append("NOT_ROOT")
     if env.get("TF_DEVICE_AUTH") != "1":
         reasons.append("TF_DEVICE_AUTH!=1")
-    if env.get("ASCEND_RT_VISIBLE_DEVICES") != "0":
-        reasons.append("ASCEND_RT_VISIBLE_DEVICES!=0")
     cd = Path(args.cases_dir) if args.cases_dir else None
     if cd is None or not cd.is_dir():
         reasons.append("CASES_DIR_MISSING")
@@ -189,6 +196,7 @@ def main() -> int:
                 reasons = device_gate(args, env)
                 if reasons:
                     raise StageFail("DEVICE_GATE", ", ".join(reasons), 2)
+                check_device_identity(env)
                 lock_fh = open(LOCK, "a+")
                 try:
                     fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -215,12 +223,21 @@ def main() -> int:
                 (out / "launch_plan.json").write_text(json.dumps(plan, indent=2) + "\n")
                 phases.add("launch", "PLAN_ONLY", detail="assembled, not executed")
             else:
-                cmd = [sys.executable, args.run_case, "--case-id", args.case_id or "case",
+                # The case id must be the REAL case name: the independent FP64 oracle derives the
+                # per-case accumulator count from it, and a placeholder makes it refuse.
+                case_id = args.case_id or Path(args.case_dir).name
+                cmd = [sys.executable, args.run_case, "--case-id", case_id,
                        "--shape", str(shape[0]), str(shape[1]), "--rows",
                        str(int(tj.get("rows", 1))), "--loop-mode", str(tj.get("loop_mode", "dyn")),
                        "--stages", str(int(tj.get("num_stages", 2))), "--xversions", "2",
                        "--yversions", "1", "--device", "0", "--out", args.cases_dir]
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+                # The driver ALREADY holds the one canonical lock (taken in stage 2), so the child
+                # must not take it again: a second flock on the same file from a child blocks
+                # forever and every device run would fail with a false LOCK_HELD_BY_OTHER. The
+                # child's documented contract is TF_DEVICE_LOCK_HELD=1 = "a parent holds it".
+                child_env = dict(env, TF_DEVICE_LOCK_HELD="1")
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800,
+                                   env=child_env)
                 (out / "launch_stdout.txt").write_text(r.stdout)
                 if r.returncode != 0:
                     raise StageFail("DEVICE_LAUNCH_FAILED", r.stderr[-800:], 1)
