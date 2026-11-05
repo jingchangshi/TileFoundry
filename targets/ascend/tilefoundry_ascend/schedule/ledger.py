@@ -951,21 +951,11 @@ def _access_domain_key(access):
     )
 
 
-def derive_dependencies(accesses) -> list:
-    """RAW/WAR/WAW/REUSE from typed WINDOW intersection and loop DOMAIN, not names/order.
-
-    Two accesses relate only when their relative byte windows INTERSECT and they resolve to
-    the SAME root (alias lineage already folded into 'root'). The dependency KIND comes from
-    the two access modes, never from statement order. When either window is UNKNOWN the pair
-    is recorded with status UNKNOWN -- never silently treated as independent and never
-    defaulted to offset 0. Every edge carries both windows, both domains, and the kind used.
-    """
+def _derive_from_bucket(bucket) -> list:
     dependencies = []
-    for left in range(len(accesses)):
-        for right in range(left + 1, len(accesses)):
-            a, b = accesses[left], accesses[right]
-            if a.root != b.root or a.space != b.space:
-                continue
+    for left in range(len(bucket)):
+        for right in range(left + 1, len(bucket)):
+            a, b = bucket[left], bucket[right]
             if a.mode == "write" and b.mode == "read":
                 kind, producer, consumer = "RAW", a, b
             elif a.mode == "read" and b.mode == "write":
@@ -1000,6 +990,47 @@ def derive_dependencies(accesses) -> list:
                 }
             )
     return dependencies
+
+
+def derive_dependencies_with_stats(accesses) -> tuple:
+    """Bucketed dependency derivation plus the pair-count/timing complexity facts.
+
+    Accesses are first partitioned by (root, space); only pairs WITHIN a bucket are ever
+    compared, so the work is sum_k C(k,2) rather than the naive C(n,2). The returned stats
+    let a consumer see whether that prefilter actually shrank the candidate set.
+    """
+    import time  # noqa: PLC0415
+
+    started = time.perf_counter()
+    buckets: dict = {}
+    for access in accesses:
+        buckets.setdefault((access.root, access.space), []).append(access)
+    total = len(accesses) * (len(accesses) - 1) // 2
+    candidate = sum(len(group) * (len(group) - 1) // 2 for group in buckets.values())
+    dependencies = []
+    for group in buckets.values():
+        dependencies.extend(_derive_from_bucket(group))
+    stats = {
+        "accesses": len(accesses),
+        "buckets": len(buckets),
+        "pairs_total_naive": total,
+        "pairs_candidate_root_space": candidate,
+        "pair_reduction_factor": (round(total / candidate, 3) if candidate else None),
+        "elapsed_seconds": round(time.perf_counter() - started, 6),
+    }
+    return dependencies, stats
+
+
+def derive_dependencies(accesses) -> list:
+    """RAW/WAR/WAW/REUSE from typed WINDOW intersection and loop DOMAIN, not names/order.
+
+    Two accesses relate only when their relative byte windows INTERSECT and they resolve to
+    the SAME root (alias lineage already folded into 'root'). The dependency KIND comes from
+    the two access modes, never from statement order. When either window is UNKNOWN the pair
+    is recorded with status UNKNOWN -- never silently treated as independent and never
+    defaulted to offset 0. Every edge carries both windows, both domains, and the kind used.
+    """
+    return derive_dependencies_with_stats(accesses)[0]
 
 
 def _problem_policy(sources: "ProblemSources | None") -> dict:
@@ -1676,3 +1707,133 @@ def verify_l2_problem(function, ledger: Ledger, problem: NormalizedProblem) -> d
     if ledger.escape_records:
         report["escape"] = verify_escape_endpoints(ledger)
     return report
+
+
+
+S_PROBLEM_SCHEMA = "s-problem/1"
+WINDOW_COVERAGE_UNKNOWN_RATIO_LIMIT = 0.5
+
+
+def dependency_kind_status_counts(dependencies) -> dict:
+    """RAW/WAR/WAW/REUSE x PROVEN/UNKNOWN counts (status BYTES == PROVEN)."""
+    counts = {}
+    for kind in ("RAW", "WAR", "WAW", "REUSE"):
+        for status in ("PROVEN", "UNKNOWN"):
+            counts["%s_%s" % (kind, status)] = 0
+    for edge in dependencies:
+        kind = edge.get("kind")
+        status = "PROVEN" if edge.get("status") == "BYTES" else "UNKNOWN"
+        key = "%s_%s" % (kind, status)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def dependency_unknown_ratio(dependencies) -> float:
+    total = len(dependencies)
+    if total == 0:
+        return 0.0
+    unknown = sum(1 for edge in dependencies if edge.get("status") != "BYTES")
+    return round(unknown / total, 6)
+
+
+def s_hard_constraint_dependencies(problem: NormalizedProblem) -> list:
+    """Only PROVEN (status BYTES) edges are S hard constraints."""
+    return [edge for edge in problem.dependencies if edge.get("status") == "BYTES"]
+
+
+def s_unknown_dependencies(problem: NormalizedProblem) -> list:
+    """UNKNOWN edges: NOT constraints; S must surface them as unknown, never default 0."""
+    return [edge for edge in problem.dependencies if edge.get("status") != "BYTES"]
+
+
+def build_s_problem_document(problem: NormalizedProblem) -> dict:
+    """The independent S-facing problem document for one real-problem/1 instance.
+
+    Carries kind x status counts and unknown_ratio; proves UNKNOWN edges are NOT hard
+    constraints via s_contract; and reports a NAMED coverage gap (WINDOW_COVERAGE_LOW) when
+    too many edges are UNKNOWN, so S is not handed a huge mostly-unknown graph as if it were
+    solved input.
+    """
+    dependencies = list(problem.dependencies)
+    counts = dependency_kind_status_counts(dependencies)
+    ratio = dependency_unknown_ratio(dependencies)
+    hard = s_hard_constraint_dependencies(problem)
+    coverage_gaps = []
+    if dependencies and ratio > WINDOW_COVERAGE_UNKNOWN_RATIO_LIMIT:
+        coverage_gaps.append("WINDOW_COVERAGE_LOW")
+    return {
+        "schema": S_PROBLEM_SCHEMA,
+        "problem_schema": problem.schema,
+        "problem_digest": problem.problem_digest,
+        "ledger_sha": problem.ledger_sha,
+        "source_digest": problem.source_digest,
+        "problem": problem.as_dict(),
+        "dependencies": {
+            "counts": counts,
+            "total": len(dependencies),
+            "unknown": len(dependencies) - len(hard),
+            "proven": len(hard),
+            "unknown_ratio": ratio,
+        },
+        "s_contract": {
+            "unknown_not_a_hard_constraint": True,
+            "hard_constraint_statuses": ["BYTES"],
+            "note": "S may feed ONLY status=BYTES edges to z3. UNKNOWN edges are not "
+                    "constraints; they are reported as unknown and never defaulted to offset 0.",
+        },
+        "coverage_gaps": coverage_gaps,
+    }
+
+
+def serialize_s_problem(problem: NormalizedProblem) -> str:
+    """Deterministic canonical text of the S-facing document."""
+    return json.dumps(build_s_problem_document(problem), sort_keys=True, default=str)
+
+
+def write_s_problem(path, problem: NormalizedProblem) -> None:
+    Path(path).write_text(serialize_s_problem(problem) + "\n", encoding="utf-8")
+
+
+def read_s_problem(path) -> dict:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _digest_of_problem_dict(payload: dict) -> str:
+    import copy  # noqa: PLC0415
+
+    data = copy.deepcopy(payload)
+    data.pop("problem_digest", None)
+    for access_payload in data.get("accesses", []):
+        access_payload.pop("source_offset", None)
+    return hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def verify_s_problem_document(document: dict, *, problem: NormalizedProblem | None = None) -> dict:
+    """Verify a serialized S document: schema, self-consistent digest, S contract present."""
+    if document.get("schema") != S_PROBLEM_SCHEMA:
+        raise LedgerError(
+            "PROBLEM_SCHEMA_UNSUPPORTED: schema=%r, expected %r"
+            % (document.get("schema"), S_PROBLEM_SCHEMA)
+        )
+    payload = document.get("problem")
+    if not isinstance(payload, dict):
+        raise LedgerError("PROBLEM_DIGEST_MISMATCH: no problem payload to hash")
+    actual = _digest_of_problem_dict(payload)
+    if document.get("problem_digest") != actual:
+        raise LedgerError(
+            "PROBLEM_DIGEST_MISMATCH: document digest %r vs canonical payload %r"
+            % (document.get("problem_digest"), actual)
+        )
+    if problem is not None and actual != problem.problem_digest:
+        raise LedgerError(
+            "PROBLEM_DIGEST_MISMATCH: document %r != problem %r"
+            % (actual, problem.problem_digest)
+        )
+    contract = document.get("s_contract") or {}
+    if contract.get("unknown_not_a_hard_constraint") is not True:
+        raise LedgerError("S_CONTRACT_MISSING: unknown_not_a_hard_constraint is not True")
+    return {
+        "problem_digest": actual,
+        "coverage_gaps": list(document.get("coverage_gaps") or []),
+        "unknown_ratio": (document.get("dependencies") or {}).get("unknown_ratio", 0.0),
+    }
