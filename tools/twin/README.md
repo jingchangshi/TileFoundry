@@ -22,11 +22,13 @@ touched here and no compiler/TIR module is imported.**
 ## Run (CPU env; never let torch autoload the NPU backend)
 
 ```bash
-CPU=/home/s00653124/.conda/envs/tilefoundry-npu/bin/python   # numpy+torch, no pytest
+# Point CPU_PY at an interpreter that has numpy + torch and does NOT autoload the
+# NPU backend (this tree never imports the device stack). It does not need pytest.
+CPU_PY=${CPU_PY:?set CPU_PY to the CPU interpreter (numpy+torch, no pytest)}
 cd tools/twin
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 $CPU fixtures.py \
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$CPU_PY" fixtures.py \
     --evidence-dir ../../artifacts/run03/w40_twin        # adjust to the pack path
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 $CPU test_twin_io.py     # or: python -m pytest tools/twin
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 "$CPU_PY" test_twin_io.py  # or: python -m pytest tools/twin
 ```
 
 ## Positive controls (T0–T4)
