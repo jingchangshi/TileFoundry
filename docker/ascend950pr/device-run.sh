@@ -30,7 +30,7 @@ PROG="device-run.sh"
 # Host-shared and stable. The evidence directory is bind-mounted into the
 # container, so this path names the SAME inode from both sides -- which is the
 # entire point. Override consciously; changing it silently disables the lock.
-LOCK="${TF_DEVICE_LOCK:-/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/run02/p0/container/.device.lock}"
+LOCK="${TF_DEVICE_LOCK:-/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/run02/p0/container/.device.lock}"  # no-machine-path: allow
 # Evidence goes next to the lock by default: the lock already lives on the shared
 # mount, so its directory is the one path known to be identical on both sides.
 OUTDIR="${TF_DEVICE_OUTDIR:-$(dirname -- "$LOCK")}"
