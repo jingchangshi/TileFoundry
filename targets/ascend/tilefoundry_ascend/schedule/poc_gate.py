@@ -196,9 +196,11 @@ def verify_poc_gate(ledger, problem, expansion, *, hir_module, hir_function, tir
     if undis:
         raise LedgerError("POC_REQUIRED_COVERAGE_MISMATCH: undischarged %r" % undis[:3])
 
-    required_unknown = len(undis)
-    if required_unknown:
-        raise LedgerError("POC_REQUIRED_WINDOW_UNKNOWN: %d/%d" % (required_unknown, total))
+    # undis is empty here (the branch above raises POC_REQUIRED_COVERAGE_MISMATCH for any
+    # undischarged obligation), so required_unknown is 0 by construction. The authoritative
+    # POC_REQUIRED_WINDOW_UNKNOWN code is enforced by that earlier coverage check; this is not
+    # an independent reachable branch.
+    required_unknown = 0
 
     spaces = {a.task: a.space for a in problem.accesses}
     critical = [
