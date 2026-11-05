@@ -78,6 +78,9 @@ class LedgerEntry:
 
 ESCAPE_EDGE_SCHEMA = "escape-edge/2"
 
+#: Canonical schema tag for the normalized Problem handed to the solver/plan layers.
+REAL_PROBLEM_SCHEMA = "real-problem/1"
+
 
 @dataclass(frozen=True)
 class EscapeEdge:
@@ -111,6 +114,9 @@ class Ledger:
     # rebuild the expectation INDEPENDENTLY of the edges it is checking.
     escape_records: list = field(default_factory=list)
     declaration_sites: dict = field(default_factory=dict)
+    # Structural paths of the dataflow statements that emitted at least one action, in walk
+    # order. Lets statement<->action coverage be checked without re-walking the TIR twice.
+    statement_paths: list = field(default_factory=list)
 
     def by_id(self):
         return {entry.action_id: entry for entry in self.entries}
@@ -314,6 +320,9 @@ def extract_ledger(function, *, escape_records=None, declaration_sites=None) -> 
             effects = _ACTION_EFFECTS.get(name)
         if effects is None:
             return
+        stmt_path = "/".join(path)
+        if stmt_path not in ledger.statement_paths:
+            ledger.statement_paths.append(stmt_path)
         for operand, mode in effects:
             if operand >= len(stmt.args):
                 continue
@@ -417,6 +426,8 @@ class NormalizedProblem:
     dependencies: list
     alias: dict
     escape_edges: list = field(default_factory=list)
+    schema: str = REAL_PROBLEM_SCHEMA
+    policy: dict = field(default_factory=dict)
 
     def as_dict(self):
         return asdict(self)
@@ -756,8 +767,31 @@ def _edge_domain(scope: str) -> str:
     return "main" if "/for:" in scope else "weight"
 
 
+def _canonical_problem_payload(problem: "NormalizedProblem") -> dict:
+    """The exact dict a problem digest is taken over.
+
+    Excludes the digest itself (it cannot include itself) and the human-readable
+    source_offset string (structure is carried by offset_structure instead).
+    """
+    payload = problem.as_dict()
+    payload.pop("problem_digest", None)
+    for access_payload in payload.get("accesses", []):
+        access_payload.pop("source_offset", None)
+    return payload
+
+
+def canonical_problem_json(problem: "NormalizedProblem") -> str:
+    """Deterministic canonical serialization of a normalized problem."""
+    return json.dumps(_canonical_problem_payload(problem), sort_keys=True, default=str)
+
+
+def compute_problem_digest(problem: "NormalizedProblem") -> str:
+    """Stable digest over the canonical problem payload (16 hex chars)."""
+    return hashlib.sha256(canonical_problem_json(problem).encode()).hexdigest()[:16]
+
+
 def build_problem(ledger: Ledger) -> NormalizedProblem:
-    """ledger -> normalized Problem. Buffers come from the SAME ledger; no invented roots."""
+    """Ledger -> normalized Problem. Buffers come from the SAME ledger; no invented roots."""
     roots = {}
     for entry in ledger.entries:
         key = (entry.root, entry.space)
@@ -883,14 +917,17 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
         dependencies=dependencies,
         alias={},
         escape_edges=list(ledger.escape_edges),
+        schema=REAL_PROBLEM_SCHEMA,
+        # Budget/versions are a LOOP-level and per-owned-buffer declaration; L0 states them as
+        # explicitly UNWIRED rather than inventing numbers (L3 fills them from typed sources).
+        policy={
+            "status": "UNWIRED_L0",
+            "requested_budget": None,
+            "buffer_versions": {},
+            "predicate_manifest": None,
+        },
     )
-    problem_digest_payload = problem.as_dict()
-    problem_digest_payload.pop('problem_digest', None)
-    for access_payload in problem_digest_payload.get('accesses', []):
-        access_payload.pop('source_offset', None)  # human string, not part of the canonical input
-    problem.problem_digest = hashlib.sha256(
-        json.dumps(problem_digest_payload, sort_keys=True, default=str).encode()
-    ).hexdigest()[:16]
+    problem.problem_digest = compute_problem_digest(problem)
     return problem
 
 
@@ -1125,3 +1162,56 @@ def coverage(ledger: Ledger, problem: NormalizedProblem) -> dict:
     if missing or extra:
         raise LedgerError(f"COVERAGE_MISMATCH: missing={missing[:3]} extra={extra[:3]}")
     return {"entries": len(entry_ids), "accesses": len(access_ids), "bidirectional": True}
+
+
+def statement_coverage(ledger: Ledger) -> dict:
+    """Bidirectional statement<->action coverage.
+
+    Every dataflow statement that emitted an action must have one, and every action must
+    name a real statement. A statement side with no action, or an action with no statement,
+    is refused by name rather than silently dropped.
+    """
+    stmt_paths = set(ledger.statement_paths)
+    entry_paths = {entry.path for entry in ledger.entries}
+    if not stmt_paths:
+        # A ledger built before statement paths were recorded cannot be certified complete.
+        if entry_paths:
+            raise LedgerError(
+                "STATEMENT_COVERAGE_MISMATCH: ledger has %d actions but no recorded statement "
+                "paths, so statement<->action coverage cannot be proved" % len(entry_paths)
+            )
+        raise LedgerError("STATEMENT_COVERAGE_MISMATCH: no dataflow statement produced an action")
+    stmt_without_action = sorted(stmt_paths - entry_paths)
+    action_without_stmt = sorted(entry_paths - stmt_paths)
+    if stmt_without_action or action_without_stmt:
+        raise LedgerError(
+            "STATEMENT_COVERAGE_MISMATCH: stmt_without_action=%s action_without_stmt=%s"
+            % (stmt_without_action[:3], action_without_stmt[:3])
+        )
+    return {"statements": len(stmt_paths), "actions": len(entry_paths), "bidirectional": True}
+
+
+def verify_real_problem(problem: NormalizedProblem, ledger: Optional[Ledger] = None) -> dict:
+    """Verify a real-problem/1 instance before any consumer trusts it.
+
+    Refuses an unknown schema, a digest that does not match its own canonical payload
+    (a mutated field or a dropped policy changes it), and -- when the source ledger is
+    supplied -- the three bidirectional coverages. Names the failed side in every code.
+    """
+    if getattr(problem, "schema", None) != REAL_PROBLEM_SCHEMA:
+        raise LedgerError(
+            "PROBLEM_SCHEMA_UNSUPPORTED: schema=%r, expected %r"
+            % (getattr(problem, "schema", None), REAL_PROBLEM_SCHEMA)
+        )
+    actual = compute_problem_digest(problem)
+    if problem.problem_digest != actual:
+        raise LedgerError(
+            "PROBLEM_DIGEST_MISMATCH: stored problem_digest=%r but the canonical payload "
+            "hashes to %r" % (problem.problem_digest, actual)
+        )
+    report = {"schema": problem.schema, "problem_digest": problem.problem_digest}
+    if ledger is not None:
+        report["coverage"] = coverage(ledger, problem)
+        report["tasks"] = tasks_coverage(ledger, problem)
+        report["statements"] = statement_coverage(ledger)
+    return report
