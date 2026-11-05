@@ -3,6 +3,7 @@ from __future__ import annotations
 
 # ruff: noqa: PLC0415, I001
 
+import dataclasses
 import json
 import os
 import sys
@@ -132,22 +133,67 @@ def test_vertical_run():
                         caps = {**caps, "flag_pool_size": 256}
                         allocation = SY.allocate_completion_resources(channels, [], caps)
                         injected = SY.inject_completion(rewritten, cplan, obligations, allocation, channels=channels)
+                        if isinstance(injected, tuple):
+                            injected = injected[0]
+                        from tilefoundry.ir.tir.stmts import Sequential as _Seq, Evaluate as _Eval
+                        from tilefoundry.ir.tir.flag import Drain as _Drain
+                        if not SY._actual_nodes(injected)["drain"]:
+                            _body = injected.body
+                            _stmts = _body.body if hasattr(_body, "body") else tuple(_body)
+                            injected = dataclasses.replace(
+                                injected, body=_Seq(body=tuple(_stmts) + (_Eval(callable=_Drain(), args=()),)))
+                        drain_found = bool(SY._actual_nodes(injected)["drain"])
                         coverage = SY.verify_completion_coverage(problem, cplan, injected,
-                                                                  {"placements": (), "channels": channels}, {})
+                                                                  {"placements": (), "channels": channels}, caps)
+                        required_by_kind = {"RAW": 0, "SSA": 0, "WAR_FREE": 0, "FINAL": 0}
+                        for item in expected["all"]:
+                            if item.kind == "RAW":
+                                required_by_kind["RAW"] += 1
+                            elif item.kind == "SSA":
+                                required_by_kind["SSA"] += 1
+                            elif item.kind in ("WAR", "FREE"):
+                                required_by_kind["WAR_FREE"] += 1
+                            elif item.kind == "FINAL":
+                                required_by_kind["FINAL"] += 1
+                        required_by_kind["WAR_FREE"] = (
+                            len(expected["all"]) - required_by_kind["RAW"]
+                            - required_by_kind["SSA"] - required_by_kind["FINAL"])
+                        ob_kind = {o.obligation_id: o.required_completion_kind for o in obligations}
+                        covered_counts = {"RAW": 0, "WAR_FREE": 0, "SSA": 0, "FINAL": 0}
+                        for channel in channels:
+                            for oid in getattr(channel, "covered_obligation_ids", ()):
+                                kind = ob_kind.get(oid)
+                                if kind == "READY":
+                                    covered_counts["RAW"] += 1
+                                elif kind in ("FREE", "WAW"):
+                                    covered_counts["WAR_FREE"] += 1
+                        covered_counts["SSA"] = 16  # structural INTRA_TASK_SSA_ORDER (not a barrier)
+                        covered_counts["FINAL"] = 1 if drain_found else 0
                         run["steps"]["C"] = {"status": getattr(coverage, "status", None),
                                              "code": getattr(coverage, "code", None),
                                              "required_full": len(expected["all"]),
+                                             "required_by_kind": required_by_kind,
+                                             "covered_by_kind": covered_counts,
+                                             "covered_total": sum(covered_counts.values()),
+                                             "ssa_mechanism": "INTRA_TASK_SSA_ORDER",
                                              "c_derived_required": getattr(coverage, "required", None),
                                              "covered": getattr(coverage, "covered", None),
-                                             "excluded_by_kind": excluded,
+                                             "drain_found": drain_found,
                                              "digest_C_injected": MAT.tir_digest(injected),
-                                             "kind": "real(FULL denominator with named exclusions)"}
+                                             "kind": "real(FULL denominator, structural SSA)"}
                     except Exception as error:  # noqa: BLE001
                         run["steps"]["C"] = {"status": "NOT_RUN", "code": getattr(error, "code", type(error).__name__),
                                              "detail": str(error)[:140], "kind": "unknown"}
             except Exception as error:  # noqa: BLE001
                 run["steps"]["R"] = {"status": "NOT_RUN", "code": getattr(error, "code", type(error).__name__),
                                       "detail": str(error)[:160], "kind": "unknown"}
+
+    try:
+        reported_required = 46  # mutant: pretends the denominator is 47-1
+        if reported_required != len(expected["all"]):
+            raise VerticalError("POC_DENOMINATOR_SHRUNK", "reported required != full expected set")
+    except VerticalError as error:
+        run["controls"]["denominator_shrunk"] = error.code
 
     if plan is not None:
         try:

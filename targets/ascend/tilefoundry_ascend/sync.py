@@ -314,6 +314,10 @@ def _walk(stmt, path=()):
     elif isinstance(body, (list, tuple)):
         for index, child in enumerate(body):
             yield from _walk(child, path + ("s%d" % index,))
+    elif body is not None and not isinstance(body, (str, int)):
+        # MeshScope / ExecutionScope / For / While: descend so a nested Drain/Set/Wait is
+        # still found; the previous top-only walk missed nested scope nodes.
+        yield from _walk(body, path + (type(stmt).__name__,))
     for branch_name in ("then_body", "else_body"):
         branch = getattr(stmt, branch_name, None)
         if isinstance(branch, Sequential):
