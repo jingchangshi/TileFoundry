@@ -107,7 +107,25 @@ def test_vertical_run():
                 report = MAT.verify_plan_application(tir, plan, rewritten, matmap)
                 run["steps"]["R"] = {"status": "MATERIALIZED", "digest_before": matmap.original_digest,
                                      "digest_after": matmap.rewritten_digest,
-                                     "verify": report.get("status"), "kind": "real"}
+                                     "verify": report.get("status"), "verify_code": report.get("code"),
+                                     "verify_detail": report.get("detail"), "kind": "real"}
+                if report.get("status") == "PASS":
+                    rows = MAT.replay_plan_addresses(plan)
+                    run["steps"]["R"]["replay_rows"] = len(rows)
+                    run["steps"]["R"]["replay_sample"] = rows[:2]
+                    try:
+                        from tilefoundry_ascend.sync import derive_completion_obligations, verify_completion_coverage
+                        obligations = derive_completion_obligations(problem, plan, completion_capabilities={})
+                        coverage = verify_completion_coverage(problem, plan, rewritten,
+                                                              {"placements": (), "channels": ()}, {})
+                        run["steps"]["C"] = {"status": getattr(coverage, "status", None),
+                                             "code": getattr(coverage, "code", None),
+                                             "required": getattr(coverage, "required", None),
+                                             "covered": getattr(coverage, "covered", None),
+                                             "kind": "real"}
+                    except Exception as error:  # noqa: BLE001
+                        run["steps"]["C"] = {"status": "NOT_RUN", "code": getattr(error, "code", type(error).__name__),
+                                             "detail": str(error)[:140], "kind": "unknown"}
             except Exception as error:  # noqa: BLE001
                 run["steps"]["R"] = {"status": "NOT_RUN", "code": getattr(error, "code", type(error).__name__),
                                       "detail": str(error)[:160], "kind": "unknown"}

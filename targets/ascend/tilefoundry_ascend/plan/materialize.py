@@ -17,6 +17,7 @@ multi-version loops are refused with PLAN_MATERIALIZATION_UNSUPPORTED (R3).
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 from dataclasses import fields, is_dataclass
@@ -92,6 +93,36 @@ def index_statements(module) -> dict:
     return found
 
 
+def index_statements_ledger(module) -> dict:
+    """Path index that MATCHES the ledger's structural paths (Sequential sN, MeshScope,
+    ExecutionScope, for:<var>, If then/else), so R2 can find real instruction statements."""
+    from tilefoundry.ir.tir.stmts import ExecutionScope, MeshScope
+
+    found = {}
+
+    def walk(node, path):
+        if isinstance(node, Sequential):
+            for index, child in enumerate(node.body):
+                walk(child, path + ("s%d" % index,))
+            return
+        if isinstance(node, (MeshScope, ExecutionScope)):
+            walk(node.body, path + (type(node).__name__,))
+            return
+        if isinstance(node, For):
+            found["/".join(path)] = node
+            name = getattr(getattr(node, "induction_var", None), "name", "i")
+            walk(node.body, path + ("for:" + str(name),))
+            return
+        if isinstance(node, If):
+            walk(node.then_body, path + ("then",))
+            walk(node.else_body, path + ("else",))
+            return
+        found["/".join(path)] = node
+
+    walk(module.body, ())
+    return found
+
+
 def _first_for(module):
     for stmt in index_statements(module).values():
         if isinstance(stmt, For):
@@ -161,6 +192,11 @@ def materialize_plan(tir_module, plan: ResolvedPlan, *, sidecar_only=False,
                      skip_access_ids=()):
     """Apply the plan to the actual TIR. Returns (rewritten_module, MaterializationMap)."""
     map_entries = []
+    _peek = index_statements_ledger(tir_module)
+    _groups = {a.source_stmt for a in plan.accesses}
+    if any(isinstance(_peek.get(p), Evaluate) and type(_peek[p].callable).__name__ != "Copy"
+           for p in _groups):
+        return materialize_instruction_plan(tir_module, plan, sidecar_only=sidecar_only)
     if plan.state.application_status != STATE_SKELETON:
         raise PlanError("PLAN_ALREADY_APPLIED", "plan is not in SKELETON_NOT_APPLIED",
                         "application_status", STATE_SKELETON, plan.state.application_status)
@@ -314,6 +350,12 @@ def _expected_generation(plan, access_id, loop_k, start, step):
         return None
 
 
+def _combined_index(module) -> dict:
+    merged = dict(index_statements(module))
+    merged.update(index_statements_ledger(module))
+    return merged
+
+
 def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_module,
                             materialization: MaterializationMap) -> dict:
     """Independent walk of the REWRITTEN TIR: real change + full coverage + map fidelity."""
@@ -327,7 +369,7 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
         return report
     actual_has_drain = any(
         isinstance(stmt, Evaluate) and isinstance(stmt.callable, Drain)
-        for stmt in index_statements(rewritten_module).values())
+        for stmt in _combined_index(rewritten_module).values())
     if not actual_has_drain:
         report["code"] = "PLAN_DRAIN_MISSING"
         return report
@@ -344,15 +386,15 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
                                 "expected": trip, "actual": counts.get(access.access_id, 0)}
             return report
     # Every original effect statement that the plan covers must be GONE (not identity).
-    rewritten_ids = {id(stmt) for stmt in index_statements(rewritten_module).values()}
+    rewritten_ids = {id(stmt) for stmt in _combined_index(rewritten_module).values()}
     for path in {access.source_stmt for access in plan.accesses}:
-        original = index_statements(original_module).get(path)
+        original = _combined_index(original_module).get(path)
         if id(original) in rewritten_ids:
             report["code"] = "APPLICATION_COVERAGE_MISMATCH"
             report["detail"] = {"survived": path}
             return report
     # Map fidelity: recorded fingerprints must equal actual rewritten statements.
-    rewritten_stmts = list(index_statements(rewritten_module).values())
+    rewritten_stmts = list(_combined_index(rewritten_module).values())
     rewritten_fingerprints = {fingerprint(stmt) for stmt in rewritten_stmts}
     for entry in materialization.entries:
         if entry["new_fingerprint"] not in rewritten_fingerprints:
@@ -444,3 +486,118 @@ def replay_plan_addresses(plan: ResolvedPlan):
                 raise PlanError("PLAN_ADDRESS_OVERLAP", "live buffers overlap in arena",
                                 arena_id, "disjoint", [(root_a, base_a, end_a), (root_b, base_b)])
     return rows
+
+
+
+SUPPORTED_INSTRUCTION_OPS = ("Copy", "Fill", "GmToUb", "Vld", "Vsts")
+
+
+def _operand_index(access):
+    try:
+        return int(str(access.action_id).rsplit(":", 1)[1])
+    except (ValueError, IndexError):
+        raise PlanError("MATERIALIZATION_OPERAND_UNMAPPED", "access has no operand index",
+                        access.access_id, "action_id:operand", access.action_id)
+
+
+def _rebuild_eval(stmt, accesses, plan, env):
+    indices = {}
+    for access in accesses:
+        idx = _operand_index(access)
+        if idx in indices or idx >= len(stmt.args):
+            raise PlanError("APPLICATION_COVERAGE_MISMATCH", "operand map is ambiguous/out of range",
+                            getattr(stmt, "instruction", "?"), "unique operand indices", idx)
+        indices[idx] = access
+    new_args = list(stmt.args)
+    for idx, access in indices.items():
+        scoped = _access_env(access, plan, env, env["k"])
+        new_args[idx] = _view(access, plan, scoped)
+    return Evaluate(callable=stmt.callable, args=tuple(new_args))
+
+
+def _rewrite_node(node, loop_stmt, blocks):
+    from tilefoundry.ir.tir.stmts import ExecutionScope, MeshScope, While
+
+    if node is loop_stmt:
+        return Sequential(body=tuple(blocks))
+    if isinstance(node, Sequential):
+        return Sequential(body=tuple(_rewrite_node(c, loop_stmt, blocks) for c in node.body))
+    if isinstance(node, (MeshScope, ExecutionScope)):
+        return dataclasses.replace(node, body=_rewrite_node(node.body, loop_stmt, blocks))
+    if isinstance(node, If):
+        return dataclasses.replace(node, then_body=_rewrite_node(node.then_body, loop_stmt, blocks),
+                                   else_body=_rewrite_node(node.else_body, loop_stmt, blocks))
+    if isinstance(node, While):
+        return dataclasses.replace(node, body=_rewrite_node(node.body, loop_stmt, blocks))
+    return node
+
+
+def materialize_instruction_plan(tir_module, plan: ResolvedPlan, *, sidecar_only=False):
+    """R2 extension: materialize INSTRUCTION TIR (Copy/Fill/GmToUb/Vld/Vsts).
+
+    Generic per-operand view rewrite: each access maps to a real operand index (from its
+    action_id 'op:operand'); that operand's TensorView is replaced by a new view; other
+    operands are kept. An unsupported op kind is refused PLAN_MATERIALIZATION_UNSUPPORTED_OP.
+    """
+    statements = index_statements_ledger(tir_module)
+    groups = {}
+    for access in plan.accesses:
+        groups.setdefault(access.source_stmt, []).append(access)
+    for path in groups:
+        stmt = statements.get(path)
+        if not isinstance(stmt, Evaluate):
+            raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED", "source_stmt is not an Evaluate",
+                            path, "Evaluate", type(stmt).__name__)
+        kind = type(stmt.callable).__name__
+        if kind not in SUPPORTED_INSTRUCTION_OPS:
+            raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED_OP",
+                            "unsupported instruction op for R2 materialization", path,
+                            SUPPORTED_INSTRUCTION_OPS, kind)
+    loop_stmt = next((s for s in index_statements_ledger(tir_module).values() if isinstance(s, For)), None)
+    if loop_stmt is None:
+        raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED", "no loop to materialize", "tir", "For", None)
+    start = _static_int(loop_stmt.start)
+    stop = _static_int(loop_stmt.stop)
+    step = _static_int(loop_stmt.step)
+    if None in (start, stop, step):
+        raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED", "dynamic loop is R4", "loop", "static ints", None)
+    trip = loop_trip_count(plan.loop)
+
+    blocks = []
+    map_entries = []
+    for k in range(trip):
+        iteration = start + k * step
+        env = {"i": iteration, "k": k, "slot": 0}
+        for path, accesses in groups.items():
+            original = statements[path]
+            rewritten = None
+            for access in accesses:
+                scoped = _access_env(access, plan, env, k)
+                pass
+            # all accesses for this path at this k
+            rewritten = _rebuild_eval(original, accesses, plan, {"i": iteration, "k": k, "slot": 0})
+            blocks.append(rewritten)
+            for access in accesses:
+                map_entries.append({
+                    "access_id": access.access_id, "action_id": access.action_id,
+                    "task_id": access.task_id, "mode": access.mode, "k": k, "loop_k": k,
+                    "generation": int(access.execution_ordinal.evaluate({"i": iteration, "k": k})),
+                    "old_stmt": path, "old_fingerprint": fingerprint(original),
+                    "new_fingerprint": fingerprint(rewritten),
+                    "new_stmt": "unrolled:k%d:%s" % (k, access.access_id),
+                })
+    new_body = _rewrite_node(tir_module.body, loop_stmt, blocks)
+    new_body = Sequential(body=tuple(new_body.body) + (Evaluate(callable=Drain(), args=()),))
+    original_digest = tir_digest(tir_module)
+    if sidecar_only:
+        return tir_module, MaterializationMap(entries=tuple(map_entries), allocs=(), controls=(),
+                                              original_digest=original_digest,
+                                              rewritten_digest=original_digest)
+    rewritten = PrimFunction(name=tir_module.name, params=tir_module.params, body=new_body,
+                             output_count=tir_module.output_count, target=tir_module.target)
+    materialization = MaterializationMap(
+        entries=tuple(map_entries), allocs=(),
+        controls=tuple({"k": k, "kind": "guard"} for k in range(trip)),
+        original_digest=original_digest, rewritten_digest=tir_digest(rewritten))
+    return rewritten, materialization
+

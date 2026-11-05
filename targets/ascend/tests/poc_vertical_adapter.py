@@ -107,6 +107,13 @@ def project_problem(problem, tir_function, expansion_count, sources=None, obliga
         ids = task.get("action_ids") if isinstance(task, dict) else task.action_ids
         for action_id in ids:
             action_owner[str(action_id)] = tid
+    root_base = {}
+    for access in getattr(problem, "accesses", []) or []:
+        g = access.get if isinstance(access, dict) else lambda k, a=access: getattr(a, k, None)
+        root_i = g("root")
+        off_i = g("byte_offset")
+        if str(root_i).startswith("smem@") and off_i is not None:
+            root_base[root_i] = min(root_base.get(root_i, int(off_i)), int(off_i))
     accesses = []
     dropped_accesses = []
     obligation_ids = set(str(x) for x in (obligation_access_ids or ()))
@@ -128,8 +135,10 @@ def project_problem(problem, tir_function, expansion_count, sources=None, obliga
         accesses.append({
             "access_id": "%s#%d" % (get("task"), index),
             "task": action_owner.get(str(get("task")), get("task")), "action_id": get("task"),
-            "source_stmt": get("instruction"), "root": root, "space": "ascend.ub",
-            "mode": get("mode"), "relative_byte_offset": int(get("byte_offset")),
+            "source_stmt": str(get("instruction")).split("/", 1)[1] if "/" in str(get("instruction")) else get("instruction"),
+            "root": root, "space": "ascend.ub",
+            "mode": get("mode"),
+            "relative_byte_offset": int(get("byte_offset")) - root_base.get(root, 0),
             "byte_footprint": int(get("byte_footprint")), "logical_index": V("i"),
         })
     r_problem = {
