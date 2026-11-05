@@ -76,6 +76,9 @@ class LedgerEntry:
     path: str
 
 
+ESCAPE_EDGE_SCHEMA = "escape-edge/2"
+
+
 @dataclass(frozen=True)
 class EscapeEdge:
     """A NON-memory cross-region value binding (ExecutionScope output -> outer binding)."""
@@ -88,6 +91,14 @@ class EscapeEdge:
     outer_action_id: str
     iteration_path: str
     guard: tuple
+    domain: str = ""
+    ssa_group: Optional[int] = None
+    inner_type: str = ""
+    outer_type: str = ""
+    outer_scope: str = ""
+    outer_binding: str = ""
+    iteration_domains: tuple = ()
+    schema_version: str = ESCAPE_EDGE_SCHEMA
 
 
 @dataclass
@@ -96,6 +107,10 @@ class Ledger:
     entries: list = field(default_factory=list)
     escape_edges: list = field(default_factory=list)
     scope_paths: list = field(default_factory=list)
+    # The typed sources the edges are built from. Kept on the ledger so validate_escape_edges can
+    # rebuild the expectation INDEPENDENTLY of the edges it is checking.
+    escape_records: list = field(default_factory=list)
+    declaration_sites: dict = field(default_factory=dict)
 
     def by_id(self):
         return {entry.action_id: entry for entry in self.entries}
@@ -213,8 +228,13 @@ def _root_of(var, views: dict, defs: dict) -> tuple:
         return (str(key), "real")
 
 
-def extract_ledger(function, *, escape_records=None) -> Ledger:
-    """Walk the typed TIR and record every actual memory action with a stable id."""
+def extract_ledger(function, *, escape_records=None, declaration_sites=None) -> Ledger:
+    """Walk the typed TIR and record every actual memory action with a stable id.
+
+    Escape edges are OPT-IN: without Core escape site records (and the declaration sites that
+    anchor them to the final TIR) the ledger keeps escape_edges empty. It never guesses an
+    endpoint by name, offset, or emission order.
+    """
     ledger = Ledger(function=str(getattr(function, "name", "function")))
     views: dict = {}  # view var name -> (root name, root kind, start exprs, alloc path)
     defs: dict = {}   # var name -> defining value (for root resolution)
@@ -339,7 +359,9 @@ def extract_ledger(function, *, escape_records=None) -> Ledger:
     # OPT-IN: consume the Core escape site records (module.metadata['escape_records']). Without
     # records the ledger keeps escape_edges empty; it never guesses by name/order/offset.
     if escape_records is not None:
-        ledger.escape_edges = build_escape_edges(ledger, escape_records)
+        ledger.escape_records = list(escape_records)
+        ledger.declaration_sites = dict(declaration_sites or {})
+        ledger.escape_edges = build_escape_edges(ledger, escape_records, declaration_sites)
     return ledger
 
 
@@ -402,48 +424,6 @@ class NormalizedProblem:
 
 
 
-def _derive_escape_edges(ledger: Ledger, scopes: list) -> list:
-    """Derive NON-memory cross-region value-binding edges from the typed TIR order.
-
-    For every ExecutionScope: its SMEM writes (in order) are the region output fields; the SMEM
-    reads of fresh outer views after the scope (in order, same byte footprint and offset structure)
-    are the outer bindings. The k-th inner field maps to the k-th outer consumer; counts must match.
-    No Var name and no offset value is used to guess the mapping.
-    """
-    edges = []
-    entries = ledger.entries
-    for scope in scopes:
-        inside = [entry for entry in entries if entry.path == scope or entry.path.startswith(scope + "/")]
-        inner = [entry for entry in inside if entry.mode == "write" and entry.space == "SMEM"]
-        if not inner:
-            continue  # no output value -> no edge (not an empty placeholder)
-        last_index = max(index for index, entry in enumerate(entries) if entry in inside)
-        inner_roots = {entry.root for entry in inner}
-        outer = [
-            entry for entry in entries[last_index + 1:]
-            if entry.space == "SMEM" and entry.root not in inner_roots
-        ]
-        if len(outer) != len(inner):
-            raise LedgerError(
-                f"ESCAPE_FIELD_COVERAGE: scope {scope} has {len(inner)} output field(s) but {len(outer)} outer binding(s)"
-            )
-        for field_index, (inner_entry, outer_entry) in enumerate(zip(inner, outer)):
-            edges.append(
-                EscapeEdge(
-                    edge_kind="ESCAPE_VALUE_BINDING",
-                    field_path=f"out[{field_index}]",
-                    scope_path=scope,
-                    inner_root=inner_entry.root,
-                    inner_action_id=inner_entry.action_id,
-                    outer_root=outer_entry.root,
-                    outer_action_id=outer_entry.action_id,
-                    iteration_path=inner_entry.iteration_path,
-                    guard=inner_entry.guard,
-                )
-            )
-    return edges
-
-
 
 
 def _execution_scope_paths(function) -> list:
@@ -472,40 +452,269 @@ def _execution_scope_paths(function) -> list:
     return paths
 
 
-def build_escape_edges(ledger: Ledger, records: list) -> list:
-    """Ledger edges from the Core escape site records (opt-in; non-memory, not alias)."""
-    scope_paths = list(ledger.scope_paths)
+def _declaration_sites(raw) -> dict:
+    """Normalise metadata["escape_declaration_sites"] to {ssa_group: [site, ...]}."""
+    if not raw:
+        raise LedgerError(
+            "ESCAPE_ENDPOINT_NOT_FOUND: no escape_declaration_sites metadata; the Core records the"
+            " declarations but this TIR carries no structural anchor for them"
+        )
+    sites = {}
+    for group, entries in raw.items():
+        try:
+            key = int(group)
+        except (TypeError, ValueError):
+            continue
+        sites[key] = [dict(entry) for entry in entries]
+    return sites
+
+
+def _record_scope_path(ledger: Ledger, record) -> str:
+    """The record scope_path must name a real TIR ExecutionScope; resolve it through the ordinal."""
+    declared = str(record.get("scope_path", ""))
+    index = record.get("scope_ordinal")
+    if index is None:
+        try:
+            index = int(declared.split("[")[1].split("]")[0])
+        except (IndexError, ValueError):
+            raise LedgerError("ESCAPE_SCOPE_UNRESOLVED: record scope_path " + repr(declared) + " has no ordinal")
+    if index >= len(ledger.scope_paths):
+        raise LedgerError(f"ESCAPE_SCOPE_UNRESOLVED: scope ordinal {index} is outside {len(ledger.scope_paths)} scopes")
+    return ledger.scope_paths[index]
+
+
+def _site_scope(ledger: Ledger, path: str) -> str:
+    """The innermost ExecutionScope containing a structural path ("" when there is none)."""
+    best = ""
+    for scope in ledger.scope_paths:
+        if path == scope or path.startswith(scope + "/"):
+            if len(scope) > len(best):
+                best = scope
+    return best
+
+
+def _unique_endpoint(ledger: Ledger, root: str, mode: str, endpoint: str, key: str) -> LedgerEntry:
+    """Exactly one SMEM action of this mode on this root, or a named refusal."""
+    candidates = [
+        entry for entry in ledger.entries
+        if entry.root == root and entry.mode == mode and entry.space == "SMEM"
+    ]
+    if not candidates:
+        raise LedgerError(
+            f"ESCAPE_ENDPOINT_NOT_FOUND: {endpoint} endpoint of {key} has no SMEM {mode} on root {root!r}"
+        )
+    if len(candidates) > 1:
+        raise LedgerError(
+            f"ESCAPE_ENDPOINT_AMBIGUOUS: {endpoint} endpoint of {key} has {len(candidates)} SMEM {mode}s"
+            f" on root {root!r}"
+        )
+    return candidates[0]
+
+
+def _resolve_inner_endpoint(ledger: Ledger, sites: dict, record, field, scope: str) -> tuple:
+    """The producer: this field's ssa_group declared INSIDE its own record scope."""
+    key = scope + "/" + str(field.get("field_path", ""))
+    group = field.get("ssa_group")
+    if group is None:
+        raise LedgerError(f"ESCAPE_ENDPOINT_NOT_FOUND: {key} has no ssa_group; the binding is not typed")
+    candidates = [
+        site for site in sites.get(int(group), [])
+        if _site_scope(ledger, str(site.get("path", ""))) == scope
+    ]
+    if not candidates:
+        raise LedgerError(
+            f"ESCAPE_ENDPOINT_NOT_FOUND: {key} group {group} has no declaration site inside {scope!r}"
+        )
+    if len(candidates) > 1:
+        raise LedgerError(
+            f"ESCAPE_ENDPOINT_AMBIGUOUS: {key} group {group} has {len(candidates)} declaration sites"
+            f" inside {scope!r}"
+        )
+    site = candidates[0]
+    _check_site_type(key, "inner", str(field.get("inner_type", "")), site)
+    root = "smem@" + str(site.get("path", ""))
+    return _unique_endpoint(ledger, root, "write", "inner", key), str(site.get("path", ""))
+
+
+def _resolve_outer_endpoint(ledger: Ledger, sites: dict, record, field, scope: str) -> tuple:
+    """The consumer: the SAME ssa_group in another scope, else the aliased consumer the Core bound."""
+    key = scope + "/" + str(field.get("field_path", ""))
+    group = field.get("ssa_group")
+    if group is None:
+        raise LedgerError(f"ESCAPE_ENDPOINT_NOT_FOUND: {key} has no ssa_group; the binding is not typed")
+    sibling = [
+        site for site in sites.get(int(group), [])
+        if _site_scope(ledger, str(site.get("path", ""))) != scope
+    ]
+    if len(sibling) > 1:
+        raise LedgerError(
+            f"ESCAPE_ENDPOINT_AMBIGUOUS: {key} group {group} is declared in {len(sibling)} outer scopes"
+        )
+    if sibling:
+        _check_site_type(key, "outer", str(field.get("outer_type") or ""), sibling[0])
+        path = str(sibling[0].get("path", ""))
+        outer_scope = _site_scope(ledger, path)
+        return (
+            _unique_endpoint(ledger, "smem@" + path, "read", "outer", key),
+            outer_scope,
+            "outer_declaration",
+        )
+    if field.get("outer_declaration_ordinal") is not None or field.get("outer_consume_ordinal") is not None:
+        # The Core bound this field to a consumer through the real storage alias chain, but the
+        # consumer reads an ALIASED root (a fresh view of the same bytes), so no sibling
+        # declaration exists for this group. Refuse rather than guess: no order-based pairing.
+        raise LedgerError(
+            f"ESCAPE_ENDPOINT_AMBIGUOUS: {key} group {group} was bound by the Core to a consumer, but it"
+            " has no second declaration site to address that consumer structurally"
+        )
+    raise LedgerError(
+        f"ESCAPE_ENDPOINT_NOT_FOUND: {key} group {group} has no outer declaration and no consumer binding"
+    )
+
+def _type_footprint(text: str):
+    """(bytes, storage) parsed from a recorded TensorType string; (None, None) if unparsable.
+
+    The recorded type is a string, so it must be CROSS-CHECKED against the real ledger entry
+    rather than trusted: a forged dtype (f32 -> bf16) disagrees with the emitted footprint.
+    """
+    text = str(text)
+    try:
+        shape = text.split("shape=(")[1].split(")")[0]
+        elements = 1
+        for part in [piece.strip() for piece in shape.split(",") if piece.strip()]:
+            elements *= int(part)
+        bits = int(text.split("bit_width=")[1].split(",")[0])
+    except (IndexError, ValueError):
+        return None, None
+    storage = "SMEM" if "StorageKind.SMEM" in text else ("OTHER" if "StorageKind." in text else None)
+    return elements * bits // 8, storage
+
+
+def _check_site_type(key: str, endpoint: str, recorded: str, site) -> None:
+    """The record's type text must equal the type the declaration site actually emitted.
+
+    This is the typed binding check: the record CLAIMS a type, the site knows the type the TIR
+    really carries, and a forged dtype (f32 -> bf16) differs even when the byte count does not.
+    """
+    truth = str(site.get("type", ""))
+    if not recorded:
+        raise LedgerError(
+            "ESCAPE_TYPE_MISSING: " + key + " " + endpoint + " carries no recorded type"
+        )
+    if not truth:
+        raise LedgerError(
+            "ESCAPE_TYPE_UNPARSED: " + key + " " + endpoint + " declaration site carries no type"
+        )
+    if " ".join(recorded.split()) != " ".join(truth.split()):
+        raise LedgerError(
+            "ESCAPE_TYPE_MISMATCH: " + key + " " + endpoint + " records "
+            + repr(_short_type(recorded)) + " but the declaration site emitted "
+            + repr(_short_type(truth))
+        )
+
+
+def _short_type(text: str) -> str:
+    """A compact dtype+storage view of a TensorType string, for refusal messages."""
+    dtype = text.split("name='")[1].split("'")[0] if "name='" in text else "?"
+    storage = text.split("StorageKind.")[1].split(":")[0] if "StorageKind." in text else "?"
+    return dtype + "/" + storage
+
+
+def _check_endpoint_type(edge_label: str, endpoint: str, text: str, entry, field_type: str) -> None:
+    """A recorded type must agree with the REAL emitted action it is bound to."""
+    if not text:
+        raise LedgerError(
+            "ESCAPE_TYPE_MISSING: " + edge_label + " " + endpoint + " carries no recorded type"
+        )
+    footprint, storage = _type_footprint(text)
+    if footprint is None:
+        raise LedgerError(
+            "ESCAPE_TYPE_UNPARSED: " + edge_label + " " + endpoint + " type is " + repr(text[:60])
+        )
+    if storage != "SMEM":
+        raise LedgerError(
+            "ESCAPE_ENDPOINT_STORAGE: " + edge_label + " " + endpoint + " recorded type is "
+            + str(storage) + ", not SMEM"
+        )
+    if footprint != entry.byte_footprint:
+        raise LedgerError(
+            "ESCAPE_TYPE_FOOTPRINT: " + edge_label + " " + endpoint + " recorded type footprint "
+            + str(footprint) + " != emitted action footprint " + str(entry.byte_footprint)
+        )
+
+def build_escape_edges(ledger: Ledger, records: list, declaration_sites=None) -> list:
+    """Ledger edges built ONLY from the Core escape site records and their declaration sites.
+
+    Every endpoint is addressed by the typed binding the Core recorded, never by emission order:
+    a field names its producer through (record scope, ssa_group); the declaration sites turn that
+    group into structural TIR paths, and each path names exactly one SMEM root ("smem@<path>").
+    The outer endpoint is the SAME ssa_group declared in a DIFFERENT scope (the sibling-scope
+    weight-VF -> main-VF binding). The root must then carry exactly ONE SMEM write (producer) and
+    ONE SMEM read (consumer).
+
+    There is no zip of "every SMEM write in the scope" against "every SMEM read after it": a
+    record that cannot be addressed this way is refused by name instead of being paired by
+    position. That is what makes a forged ordinal/ssa_group/type change or refuse the result.
+    """
+    sites = _declaration_sites(declaration_sites)
     edges = []
+    seen_fields = set()
     for record in records:
-        index = record.get("scope_ordinal")
-        if index is None:
-            scope_path = str(record.get("scope_path", ""))
-            try:
-                index = int(scope_path.split("[")[1].split("]")[0])
-            except (IndexError, ValueError):
-                continue
-        if index >= len(scope_paths):
-            continue
-        scope = scope_paths[index]
-        inside = [e for e in ledger.entries if e.path == scope or e.path.startswith(scope + "/")]
-        inner = [e for e in inside if e.mode == "write" and e.space == "SMEM"]
-        fields = record.get("fields", [])
-        if len(inner) != len(fields):
-            continue
-        last = max((i for i, e in enumerate(ledger.entries) if e in inside), default=-1)
-        inner_roots = {e.root for e in inner}
-        outer = [e for e in ledger.entries[last + 1:] if e.space == "SMEM" and e.mode == "read" and e.root not in inner_roots]
-        if len(outer) < len(fields):
-            continue
-        for field, inner_entry, outer_entry in zip(fields, inner, outer):
-            digest = hashlib.sha256("|".join((scope, field.get("field_path", ""), inner_entry.root, outer_entry.root)).encode()).hexdigest()[:16]
+        scope = _record_scope_path(ledger, record)
+        for field in record.get("fields", []):
+            key = (scope, str(field.get("field_path", "")))
+            if key in seen_fields:
+                raise LedgerError(f"ESCAPE_FIELD_DUPLICATE: {key}")
+            seen_fields.add(key)
+            inner, inner_path = _resolve_inner_endpoint(ledger, sites, record, field, scope)
+            outer, outer_scope, outer_binding = _resolve_outer_endpoint(
+                ledger, sites, record, field, scope
+            )
+            label = key[0] + "/" + key[1]
+            _check_endpoint_type(label, "inner", str(field.get("inner_type", "")), inner, field.get("inner_type"))
+            _check_endpoint_type(
+                label, "outer", str(field.get("outer_type") or ""), outer, field.get("outer_type")
+            )
+            if inner.byte_footprint != outer.byte_footprint:
+                raise LedgerError(
+                    f"ESCAPE_TYPE_FOOTPRINT: {key[0]}/{key[1]} producer {inner.root!r} "
+                    f"footprint {inner.byte_footprint} != consumer {outer.root!r} "
+                    f"footprint {outer.byte_footprint}"
+                )
+            if outer.space != "SMEM" or inner.space != "SMEM":
+                raise LedgerError(
+                    f"ESCAPE_ENDPOINT_STORAGE: {key[0]}/{key[1]} endpoints must be SMEM, got "
+                    f"{inner.space!r} -> {outer.space!r}"
+                )
             edges.append(EscapeEdge(
-                edge_kind="ESCAPE_VALUE_BINDING", field_path=field.get("field_path", ""),
-                scope_path=scope, inner_root=inner_entry.root, inner_action_id=inner_entry.action_id,
-                outer_root=outer_entry.root, outer_action_id=outer_entry.action_id,
-                iteration_path=inner_entry.iteration_path, guard=inner_entry.guard,
+                edge_kind="ESCAPE_VALUE_BINDING",
+                field_path=key[1],
+                scope_path=scope,
+                inner_root=inner.root,
+                inner_action_id=inner.action_id,
+                outer_root=outer.root,
+                outer_action_id=outer.action_id,
+                iteration_path=inner.iteration_path,
+                guard=inner.guard,
+                domain=_edge_domain(scope),
+                ssa_group=int(field["ssa_group"]) if field.get("ssa_group") is not None else None,
+                inner_type=str(field.get("inner_type", "")),
+                outer_type=str(field.get("outer_type") or ""),
+                outer_scope=outer_scope or "",
+                outer_binding=outer_binding,
+                iteration_domains=inner.iteration_domains,
             ))
     return edges
+
+
+def _edge_domain(scope: str) -> str:
+    """Coarse domain label taken from the scope's own structural path (never asserted by a case).
+
+    The main VF scope is nested in the cooperative row loop (".../for:<var>/..."); the weight VF
+    scopes are not. The label is derived from that prefix fact, so a scope cannot claim a domain
+    it does not structurally have.
+    """
+    return "main" if "/for:" in scope else "weight"
 
 
 def build_problem(ledger: Ledger) -> NormalizedProblem:
@@ -673,26 +882,122 @@ def validate_roots(problem: NormalizedProblem) -> None:
 
 
 def validate_escape_edges(ledger: Ledger) -> dict:
-    """Each scope output field has exactly one ESCAPE_VALUE_BINDING edge; fake edges are refused."""
+    """Verify the edges against an expectation rebuilt INDEPENDENTLY from the Core records.
+
+    The expectation is never derived from the edges under test: it is rebuilt from
+    ledger.escape_records + ledger.declaration_sites (the typed sources), so deleting an edge,
+    deleting a whole scope, or keeping only one domain cannot pass by shrinking the expectation
+    with it. complete=True additionally requires BOTH the weight and the main domain to be
+    present, because a ledger that lost one of them has not covered the escape relation.
+
+    Every endpoint is re-checked against the real ledger: the action id must exist, its root,
+    space and mode must match the edge, and the producer iteration path and guard must match.
+    """
     edges = list(ledger.escape_edges)
     if any(edge.edge_kind != "ESCAPE_VALUE_BINDING" for edge in edges):
         raise LedgerError("ESCAPE_EDGE_KIND: only ESCAPE_VALUE_BINDING is allowed")
-    by_scope = {}
-    for edge in edges:
-        by_scope.setdefault(edge.scope_path, []).append(edge)
-    fields = {}
+    if not edges:
+        raise LedgerError("ESCAPE_EDGE_MISSING: no ESCAPE_VALUE_BINDING edge at all")
+    expected = build_escape_edges(ledger, ledger.escape_records, ledger.declaration_sites)
+    expected_keys = {(edge.scope_path, edge.field_path) for edge in expected}
+    actual_keys = set()
     for edge in edges:
         key = (edge.scope_path, edge.field_path)
-        if key in fields:
-            raise LedgerError(f"ESCAPE_FIELD_DUPLICATE: {key}")
-        fields[key] = edge
-    # re-derive the expected edges and require an exact match (a fake/wrong-region edge fails)
-    expected = _derive_escape_edges(ledger, sorted(by_scope))
-    expected_keys = {(edge.scope_path, edge.field_path, edge.inner_root, edge.outer_root) for edge in expected}
-    actual_keys = {(edge.scope_path, edge.field_path, edge.inner_root, edge.outer_root) for edge in edges}
-    if expected_keys != actual_keys:
-        raise LedgerError(f"ESCAPE_EDGE_MISMATCH: expected {len(expected_keys)} edges, got {len(actual_keys)}")
-    return {"edges": len(edges), "scopes": len(by_scope), "complete": True}
+        if key in actual_keys:
+            raise LedgerError("ESCAPE_FIELD_DUPLICATE: " + repr(key))
+        actual_keys.add(key)
+    missing = sorted(expected_keys - actual_keys)
+    if missing:
+        raise LedgerError(
+            "ESCAPE_EDGE_MISSING: " + str(len(missing)) + " expected field(s) have no edge, e.g. " + repr(missing[0])
+        )
+    extra = sorted(actual_keys - expected_keys)
+    if extra:
+        raise LedgerError(
+            "ESCAPE_EDGE_UNEXPECTED: " + str(len(extra)) + " edge(s) have no typed field, e.g. " + repr(extra[0])
+        )
+    # A field permutation inside ONE scope keeps every (scope, field_path) key present, so the key
+    # set alone cannot catch it: the expectation is a MAP from the typed field to its endpoints,
+    # and every edge must match the endpoints its own field implies.
+    by_key = {(edge.scope_path, edge.field_path): edge for edge in expected}
+    by_id = ledger.by_id()
+    for edge in edges:
+        label = edge.scope_path + "/" + edge.field_path
+        wanted = by_key[(edge.scope_path, edge.field_path)]
+        for attribute in ("inner_root", "outer_root", "ssa_group", "domain", "outer_scope"):
+            if getattr(edge, attribute) != getattr(wanted, attribute):
+                raise LedgerError(
+                    "ESCAPE_EDGE_MISMATCH: " + label + " has " + attribute + "="
+                    + repr(getattr(edge, attribute)) + ", typed records give "
+                    + repr(getattr(wanted, attribute))
+                )
+        for endpoint, action, root in (
+            ("inner", edge.inner_action_id, edge.inner_root),
+            ("outer", edge.outer_action_id, edge.outer_root),
+        ):
+            entry = by_id.get(action)
+            if entry is None:
+                raise LedgerError(
+                    "ESCAPE_ENDPOINT_NOT_FOUND: " + label + " " + endpoint + " action "
+                    + repr(action) + " is not in the ledger"
+                )
+            if entry.root != root:
+                raise LedgerError(
+                    "ESCAPE_EDGE_MISMATCH: " + label + " " + endpoint + " action "
+                    + repr(action) + " is rooted at " + repr(entry.root) + ", edge says " + repr(root)
+                )
+            if entry.space != "SMEM":
+                raise LedgerError(
+                    "ESCAPE_ENDPOINT_STORAGE: " + label + " " + endpoint + " action "
+                    + repr(action) + " is in " + repr(entry.space) + ", not SMEM"
+                )
+        producer = by_id[edge.inner_action_id]
+        if edge.iteration_path != producer.iteration_path:
+            raise LedgerError(
+                "ESCAPE_EDGE_MISMATCH: " + label + " iteration_path " + repr(edge.iteration_path)
+                + " is not the producer iteration path " + repr(producer.iteration_path)
+            )
+        if tuple(edge.guard) != tuple(producer.guard):
+            raise LedgerError(
+                "ESCAPE_EDGE_MISMATCH: " + label + " guard is not the producer guard"
+            )
+    domains = sorted({edge.domain for edge in edges})
+    for required in ("weight", "main"):
+        if required not in domains:
+            raise LedgerError(
+                "ESCAPE_DOMAIN_UNCOVERED: complete=True requires the " + repr(required)
+                + " domain, got " + repr(domains)
+            )
+    scopes = {edge.scope_path for edge in edges}
+    return {
+        "schema": ESCAPE_EDGE_SCHEMA,
+        "edges": len(edges),
+        "scopes": len(scopes),
+        "domains": domains,
+        "dropped_types": _dropped_types(ledger.escape_records),
+        "complete": True,
+    }
+
+
+def _dropped_types(records: list) -> dict:
+    """Audit the dropped declarations by REAL dtype and storage.
+
+    The Core drops SMEM allocations with no outer binding. Measured on the RMSNorm kernel this is
+    128 BF16 SMEM temporaries (one per weight scope plus 64 in the main VF), NOT the f32 VF
+    scratch views: those are kept as fields. The dtype is read off the recorded type, so the
+    audit reports what was dropped instead of repeating an assumption.
+    """
+    counts = {}
+    for record in records:
+        for dropped in record.get("dropped_fields", []):
+            text = str(dropped.get("inner_type", ""))
+            if "FloatDType(name='" in text:
+                dtype = text.split("FloatDType(name='")[1].split("'")[0]
+            else:
+                dtype = "unknown"
+            key = dtype + " " + ("SMEM" if "StorageKind.SMEM" in text else "OTHER")
+            counts[key] = counts.get(key, 0) + 1
+    return counts
 
 
 

@@ -386,6 +386,9 @@ class TirBuilder:
             result = self.bind(Var(stem, type=expression.type), expression)
             if getattr(value, "ssa", None) is not None:
                 ctx.var_ssa[id(result)] = value.ssa
+                # RECORD-ONLY: remember the exact TIR value that carries this declaration, so the
+                # final TIR walk can name its statement by structure. No stmt/type/schedule change.
+                ctx._note_escape_declaration_view(ctx.escape_ssa_ref.get(value.ssa), expression)
             scope.views[id(value)] = (value, result)
         return scope.views[id(value)][1]
 
@@ -1230,6 +1233,12 @@ class LoweringContext(TypeInferContext):
     escape_duplicates: list = field(default_factory=list)
     escape_ssa_ref: dict = field(default_factory=dict)
     declare_counter: int = 0
+    # RECORD-ONLY: ssa_group -> the fresh-view Call the declaration actually produced. The
+    # declaration ordinal is assigned while the view is DERIVED, but the TIR LetStmt is emitted
+    # later (or never, for a duplicate declare), so the ordinal alone cannot address a TIR
+    # statement. This map lets the final TIR be walked once and turned into stable structural
+    # paths per ssa_group, without any ordinal->walk-order assumption.
+    escape_declaration_views: dict = field(default_factory=dict)
 
 
     def _alias_base(self, expr):
@@ -1264,6 +1273,19 @@ class LoweringContext(TypeInferContext):
         field["outer_consume_ordinal"] = self.consume_counter
         field["outer_type"] = str(type_)
         field["outer_source"] = "consume_alias"
+
+    def _note_escape_declaration_view(self, group, view):
+        """RECORD-ONLY: remember every TIR value that carries an ssa_group.
+
+        One ssa_group can be declared more than once (the same SSA re-declared in a sibling
+        scope is the weight-VF -> main-VF binding), so this keeps ALL sites and never assumes a
+        single one.
+        """
+        if group is None:
+            return
+        views = self.escape_declaration_views.setdefault(group, [])
+        if all(existing is not view for existing in views):
+            views.append(view)
 
     def _note_escape_declare(self, ssa, type_, source="unknown"):
         """Single-point record from StoragePlan.view (fresh SMEM view) with an SSA key."""
@@ -1481,6 +1503,19 @@ class Lowering(ValuationVisitor[Expr | View]):
     context: TypeInferContext
     authored: Function
     callees: dict[int, Lowering] = field(default_factory=dict)
+
+    def lowered_functions(self):
+        """Every TIR function this lowering produced, entry first, then its callees."""
+        seen, order, pending = set(), [], [self]
+        while pending:
+            lowering = pending.pop(0)
+            if id(lowering) in seen:
+                continue
+            seen.add(id(lowering))
+            if getattr(lowering, "lowered", None) is not None:
+                order.append(lowering.lowered)
+            pending.extend(lowering.callees.values())
+        return order
 
     def visit(self, expr, ctx=None, *, dimension=False):
         if ctx is None:
@@ -2003,6 +2038,46 @@ class Lowering(ValuationVisitor[Expr | View]):
         return written
 
 
+def _escape_declaration_sites(lowered) -> dict:
+    """Stable structural paths of the TIR statements that carry each escape declaration.
+
+    RECORD-ONLY: this walks the FINAL TIR and reports where each recorded fresh view was
+    emitted. The path grammar is the one the ledger already uses for action ids ("s<index>"
+    for Sequential children, "for:<var>" for loops, "MeshScope"/"ExecutionScope" for the
+    region wrappers), so a site is a pure structural coordinate: no object id, no memory
+    address, and no dependence on dict/set iteration order.
+    """
+    views = lowered.context.escape_declaration_views
+    wanted = {id(view): group for group, group_views in views.items() for view in group_views}
+    sites: dict = {}
+
+    def walk(stmt, path, function) -> None:
+        if isinstance(stmt, Sequential):
+            for index, child in enumerate(stmt.body):
+                walk(child, path + ("s" + str(index),), function)
+            return
+        if isinstance(stmt, For):
+            walk(stmt.body, path + ("for:" + str(getattr(stmt.induction_var, "name", "i")),), function)
+            return
+        if isinstance(stmt, (MeshScope, ExecutionScope)):
+            walk(stmt.body, path + (type(stmt).__name__,), function)
+            return
+        if isinstance(stmt, LetStmt):
+            group = wanted.get(id(stmt.value))
+            if group is not None:
+                sites.setdefault(group, []).append({
+                    "path": "/".join(path),
+                    "function": str(getattr(function, "name", "")),
+                    "statement": "LetStmt",
+                    "var": str(getattr(stmt.var, "name", "")),
+                    "type": str(getattr(stmt.var, "type", "")),
+                })
+
+    for function in lowered.lowered_functions():
+        walk(getattr(function, "body", None), (), function)
+    return sites
+
+
 @dataclass
 class ConvertHIRToTIR(ModulePass):
     """Replace one selected HIR entry with its scheduled TIR function."""
@@ -2050,6 +2125,10 @@ class ConvertHIRToTIR(ModulePass):
             record["dropped_fields"] = dropped_fields
             record["dropped_non_escape"] = len(dropped_fields)
         result.module.metadata["escape_records"] = records
+        # RECORD-ONLY: where the final TIR actually emitted each recorded declaration. The
+        # ledger consumes this to address endpoints structurally; nothing here is a statement,
+        # a schedule decision, or a semantic value.
+        result.module.metadata["escape_declaration_sites"] = _escape_declaration_sites(lowering)
         result.module.metadata["duplicate_declares"] = lowering.context.duplicate_declares
         result.module.metadata["escape_duplicates"] = lowering.context.escape_duplicates
         result.module.metadata["unresolved_alias_chains"] = lowering.context.unresolved_alias_chains
