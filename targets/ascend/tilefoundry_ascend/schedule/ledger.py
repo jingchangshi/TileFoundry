@@ -72,6 +72,7 @@ class LedgerEntry:
     logical_iteration: str
     iteration_path: str
     iteration_extent: str
+    iteration_domains: tuple        # ((loop_name, extent_str), ...) for every enclosing loop
     path: str
 
 
@@ -308,6 +309,7 @@ def extract_ledger(function) -> Ledger:
                     logical_iteration=(loops[-1][0] if loops else "outside"),
                     iteration_path="/".join(name for name, _ in loops) or "outside",
                     iteration_extent=(loops[-1][1] if loops else "1"),
+                    iteration_domains=tuple((name, str(extent)) for name, extent in loops),
                     path="/".join(path),
                 )
             )
@@ -335,6 +337,7 @@ class ProblemAccess:
     logical_iteration: str
     iteration_path: str
     iteration_extent: str
+    iteration_domains: tuple
 
 
 
@@ -400,6 +403,7 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
             logical_iteration=entry.logical_iteration,
             iteration_path=entry.iteration_path,
             iteration_extent=entry.iteration_extent,
+            iteration_domains=entry.iteration_domains,
         )
         for entry in ledger.entries
     ]
@@ -462,14 +466,27 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
                 'byte_offset': entry.byte_offset,
                 'attrs': list(entry.attrs), 'offset_structure': entry.offset_structure,
                 'guard': entry.guard, 'iteration_path': entry.iteration_path,
-                'iteration_extent': entry.iteration_extent,
+                'iteration_extent': entry.iteration_extent, 'iteration_domains': entry.iteration_domains,
             }
             for entry in ledger.entries
         ],
         sort_keys=True,
     )
     canonical_serialization_sha = hashlib.sha256(payload.encode()).hexdigest()[:16]
-    ledger_sha = hashlib.sha256('|'.join(entry.action_id for entry in ledger.entries).encode()).hexdigest()[:16]
+    ledger_identity = json.dumps(
+        [
+            {
+                'action_id': entry.action_id, 'op': entry.op, 'root': entry.root,
+                'mode': entry.mode, 'iteration_path': entry.iteration_path,
+                'iteration_extent': str(entry.iteration_extent),
+                'offset_structure': entry.offset_structure, 'guard': entry.guard,
+            }
+            for entry in ledger.entries
+        ],
+        sort_keys=True,
+        default=str,
+    )
+    ledger_sha = hashlib.sha256(ledger_identity.encode()).hexdigest()[:16]
     source_digest = canonical_serialization_sha
     problem = NormalizedProblem(
         problem_id='ledger-' + source_digest,
