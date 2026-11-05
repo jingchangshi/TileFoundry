@@ -800,6 +800,105 @@ def whole_vf_tasks(ledger: Ledger) -> list:
     return tasks
 
 
+PROBLEM_SOURCES_SCHEMA = "problem-sources/1"
+
+
+@dataclass(frozen=True)
+class ProblemSources:
+    """The two INDEPENDENT typed sources a real Problem's policy is wired from.
+
+    budgets come ONLY from PipelineSpec.num_stages (a loop-level stage budget).
+    buffer_versions come ONLY from Empty.buffers (a per-buffer version count).
+    They are different dimensions and are never copied from one another.
+    """
+
+    schema: str
+    budgets: dict
+    buffer_versions: dict
+
+
+def capture_problem_sources(hir_module) -> "ProblemSources":
+    """Read budget and buffer versions from the AUTHORED typed HIR, each from its own source."""
+    from tilefoundry.analysis.pipeline_reader import (  # noqa: PLC0415
+        collect_buffer_versions,
+        collect_pipeline_declarations,
+    )
+
+    specs = collect_pipeline_declarations(hir_module)
+    budgets = {key: spec.num_stages for key, spec in specs.items()}
+    versions = collect_buffer_versions(hir_module)
+    return ProblemSources(PROBLEM_SOURCES_SCHEMA, budgets, versions)
+
+
+def validate_problem_sources(sources: "ProblemSources") -> dict:
+    """Refuse a forged/typed-invalid source: a non-int budget or a version above the budget."""
+    if getattr(sources, "schema", None) != PROBLEM_SOURCES_SCHEMA:
+        raise LedgerError(
+            "PROBLEM_SOURCE_SCHEMA_UNSUPPORTED: schema=%r" % (getattr(sources, "schema", None),)
+        )
+    for key, budget in sources.budgets.items():
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise LedgerError(
+                "PIPELINE_BUDGET_SOURCE_MISMATCH: loop %r budget=%r is not a positive int from "
+                "PipelineSpec.num_stages" % (key, budget)
+            )
+    for key, versions in sources.buffer_versions.items():
+        if isinstance(versions, bool) or not isinstance(versions, int) or versions < 1:
+            raise LedgerError(
+                "BUFFER_VERSION_DECLARATION_INVALID: buffer %r versions=%r is not a positive int "
+                "from Empty.buffers" % (key, versions)
+            )
+    distinct_budgets = set(sources.budgets.values())
+    if len(distinct_budgets) == 1:
+        (budget,) = tuple(distinct_budgets)
+        for key, versions in sources.buffer_versions.items():
+            if versions > budget:
+                raise LedgerError(
+                    "BUFFER_VERSION_EXCEEDS_PIPELINE_BUDGET: buffer %r declares %d versions but "
+                    "the loop stage budget is %d" % (key, versions, budget)
+                )
+    return {"budgets": dict(sources.budgets), "buffer_versions": dict(sources.buffer_versions)}
+
+
+def verify_policy_sources(expected: "ProblemSources", problem: "NormalizedProblem") -> dict:
+    """Compare the Problem's policy with sources captured from the authored HIR.
+
+    Never trusts the policy's own numbers: an authored constant punched in as a budget, or a
+    version count copied from the budget instead of Empty.buffers, changes one side and is
+    refused by name. The predicate sub-field must STAY UNKNOWN while P is unwired.
+
+    'expected' is captured by capture_problem_sources(HIR) BEFORE lowering mutates the module;
+    it is the independent typed side, not a copy of the policy being checked.
+    """
+    validate_problem_sources(expected)
+    policy = problem.policy or {}
+    if policy.get("status") != "WIRED":
+        raise LedgerError("PROBLEM_POLICY_MISSING: policy.status is %r, not WIRED" % (policy.get("status"),))
+    if policy.get("requested_budget") != expected.budgets:
+        raise LedgerError(
+            "PIPELINE_BUDGET_SOURCE_MISMATCH: policy budget %r vs PipelineSpec %r"
+            % (policy.get("requested_budget"), expected.budgets)
+        )
+    if policy.get("buffer_versions") != expected.buffer_versions:
+        raise LedgerError(
+            "BUFFER_VERSION_DECLARATION_CHANGED: policy versions %r vs Empty.buffers %r"
+            % (policy.get("buffer_versions"), expected.buffer_versions)
+        )
+    predicate = policy.get("predicate") or {}
+    if predicate.get("status") != "UNKNOWN":
+        raise LedgerError(
+            "PREDICATE_STATUS_INVALID: predicate status %r while P output is not wired; it must "
+            "stay UNKNOWN" % (predicate.get("status"),)
+        )
+    return {
+        "budgets": dict(expected.budgets),
+        "buffer_versions": dict(expected.buffer_versions),
+        "independent": (
+            not (set(expected.budgets.values()) == set(expected.buffer_versions.values()) == {None})
+        ),
+    }
+
+
 def _canonical_problem_payload(problem: "NormalizedProblem") -> dict:
     """The exact dict a problem digest is taken over.
 
@@ -823,8 +922,43 @@ def compute_problem_digest(problem: "NormalizedProblem") -> str:
     return hashlib.sha256(canonical_problem_json(problem).encode()).hexdigest()[:16]
 
 
-def build_problem(ledger: Ledger) -> NormalizedProblem:
-    """Ledger -> normalized Problem. Buffers come from the SAME ledger; no invented roots."""
+def _problem_policy(sources: "ProblemSources | None") -> dict:
+    """The policy dict, honestly UNWIRED or wired from two independent typed sources.
+
+    The predicate sub-field is UNKNOWN in both cases: P's actual predicate is not materialised,
+    so wiring budget/versions must not accidentally claim predicate coverage too.
+    """
+    predicate = {
+        "status": "UNKNOWN",
+        "required_active": None,
+        "actual_active": None,
+        "reason": "P actual predicate not materialised",
+    }
+    if sources is None:
+        return {
+            "status": "UNWIRED_L0",
+            "requested_budget": None,
+            "buffer_versions": {},
+            "predicate_manifest": None,
+            "predicate": predicate,
+        }
+    validate_problem_sources(sources)
+    return {
+        "status": "WIRED",
+        "requested_budget": dict(sources.budgets),
+        "buffer_versions": dict(sources.buffer_versions),
+        "predicate_manifest": None,
+        "predicate": predicate,
+    }
+
+
+def build_problem(ledger: Ledger, sources: "ProblemSources | None" = None) -> NormalizedProblem:
+    """Ledger -> normalized Problem. Buffers come from the SAME ledger; no invented roots.
+
+    When typed *sources* are supplied, the policy budget and buffer versions are wired from
+    their two INDEPENDENT sources (PipelineSpec.num_stages and Empty.buffers); otherwise the
+    policy stays honestly UNWIRED.
+    """
     roots = {}
     for entry in ledger.entries:
         key = (entry.root, entry.space)
@@ -951,22 +1085,7 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
         alias={},
         escape_edges=list(ledger.escape_edges),
         schema=REAL_PROBLEM_SCHEMA,
-        # Budget/versions are a LOOP-level and per-owned-buffer declaration; L0 states them as
-        # explicitly UNWIRED rather than inventing numbers (L3 fills them from typed sources).
-        policy={
-            "status": "UNWIRED_L0",
-            "requested_budget": None,
-            "buffer_versions": {},
-            "predicate_manifest": None,
-            # Predicate wiring is NOT derived from the real TIR yet (P actual predicate not
-            # materialised). State UNKNOWN with no numbers -- never 0, never required==actual.
-            "predicate": {
-                "status": "UNKNOWN",
-                "required_active": None,
-                "actual_active": None,
-                "reason": "P actual predicate not materialised",
-            },
-        },
+        policy=_problem_policy(sources),
         vf_tasks=whole_vf_tasks(ledger),
     )
     problem.problem_digest = compute_problem_digest(problem)
