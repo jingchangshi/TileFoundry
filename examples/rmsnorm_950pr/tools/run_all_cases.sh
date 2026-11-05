@@ -18,17 +18,51 @@ if [ "${TF_DEVICE_AUTH:-}" != "1" ]; then
   exit 75
 fi
 
-source /data/pri/cann-9.2.0/ascend-toolkit/set_env.sh >/dev/null 2>&1
+source "${CANN_ROOT:?CANN_ROOT must be set}/ascend-toolkit/set_env.sh" >/dev/null 2>&1
 export ASCEND_RT_VISIBLE_DEVICES=0
 unset TORCH_DEVICE_BACKEND_AUTOLOAD || true
 export PYTHONUNBUFFERED=1
-REPO=/home/s00653124/workspace/TileFoundry
-TL=/home/s00653124/workspace/tilelang
-export PYTHONPATH="$TL:$REPO/src:$REPO/targets/ascend:$REPO/examples/rmsnorm_950pr"
-export LD_LIBRARY_PATH="$TL/build/lib:${LD_LIBRARY_PATH:-}"
-export TILELANG_CACHE_DIR=/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/run02/tl_cache
-# Dedicated DEVICE env (apache-tvm-ffi 0.1.12); the CPU toolchain keeps its own env.
-PY=/home/s00653124/.conda/envs/tilefoundry-npu-dev/bin/python
+REPO="${HOME}/workspace/TileFoundry"
+AG_ADAPTER="${REPO%/TileFoundry}/AgentGates/agent_gates/adapters/tilefoundry-npu/scripts/env_context.py"
+
+# --- tilelang comes from the INSTALLED WHEEL in the shared prefix, NEVER a source
+# checkout. With .../workspace/tilelang first on PYTHONPATH the device run imports the
+# checkout, and then the prefix passing its four layers says nothing about what ran on
+# the card. Resolution order is explicit and has NO source-tree fallback:
+#   1. TILELANG_ROOT -- an ENVIRONMENT root that owns an installed wheel,
+#   2. the adapter env context SHARED_PREFIX (one source of truth with configure.py),
+#   3. refuse by name: TILELANG_ROOT_UNSET.
+adapter_prefix() {
+  [ -f "$AG_ADAPTER" ] || return 0
+  local helper
+  helper="$(command -v python3 || true)"
+  [ -n "$helper" ] || return 0
+  "$helper" - "$AG_ADAPTER" <<'PY' 2>/dev/null || true
+import runpy, sys
+print(str(runpy.run_path(sys.argv[1]).get("SHARED_PREFIX") or ""))
+PY
+}
+TL="${TILELANG_ROOT:-}"
+if [ -z "$TL" ]; then TL="$(adapter_prefix)"; fi
+if [ -z "$TL" ]; then
+  echo "REFUSE: TILELANG_ROOT_UNSET -- neither TILELANG_ROOT nor the adapter env context"
+  echo "  ($AG_ADAPTER) names the prefix that owns the installed tilelang wheel."
+  echo "  Falling back to a source checkout would measure code nobody deploys."
+  exit 78
+fi
+export TILELANG_ROOT="$TL"
+# NOTE: $TL is deliberately NOT on PYTHONPATH -- the wheel is imported from the
+# prefix site-packages, and that is the artefact the four-layer check verified.
+export PYTHONPATH="$REPO/src:$REPO/targets/ascend:$REPO/examples/rmsnorm_950pr"
+export TILELANG_CACHE_DIR="${HOME}/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/run02/tl_cache"
+# The DEVICE interpreter is the one that OWNS the wheel. The old conda env has no
+# tilelang at all, so its device env only ever worked because the source tree was on
+# PYTHONPATH -- the exact decoupling this change removes. Override with TFNU_PYTHON.
+PY="${TFNU_PYTHON:-$TL/bin/python}"
+if [ ! -x "$PY" ]; then
+  echo "REFUSE: no interpreter at $PY (the wheel prefix has none; set TFNU_PYTHON)"
+  exit 78
+fi
 
 CASES_DIR="${1:?usage: run_all_cases.sh CASES_DIR (must not already exist)}"
 if [ -e "$CASES_DIR" ]; then

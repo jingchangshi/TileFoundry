@@ -271,7 +271,13 @@ def check_build_citation_matches() -> None:
 
     from tilefoundry_ascend.ir.isa import NATIVE_BUILD
 
-    root = "<user>/workspace/tilelang"
+    # The build root comes from the ENVIRONMENT. The literal "<user>/..." placeholder
+    # made this check a silent no-op on every machine; unset is a NAMED skip with its
+    # reason (never a fabricated build, never a FAIL for a missing env var).
+    root = (os.environ.get("TILELANG_ROOT") or "").strip()
+    if not root:
+        print("       SKIP: TILELANG_ROOT_UNSET -- build citation not verified")
+        return
     if not os.path.isdir(root):
         # No build present: the honest claim stays UNSOURCED and we do not fabricate one.
         assert "UNSOURCED" in NATIVE_BUILD["credit"] or True

@@ -24,7 +24,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 EXPECTED = HERE / "expected_bits.json"
-DEFAULT_TL = Path("<user>/workspace/tilelang")
+#: tilelang root from the ENVIRONMENT. The literal "<user>/..." placeholder pointed
+#: every probe at a nonexistent tree and made --execute fail for the wrong reason.
+#: Unset means NO default: --execute refuses by name (TILELANG_ROOT_UNSET).
+DEFAULT_TL = (Path(os.environ["TILELANG_ROOT"])
+              if (os.environ.get("TILELANG_ROOT") or "").strip() else None)
 ZEROS = ["0x00000000"] * 64
 
 
@@ -294,7 +298,9 @@ def run_probe(probe_name: str, kind: str, default_case: str, build_kernel,
     ap.add_argument("--launch-watchdog", type=int, default=60,
                     help="host-side watchdog seconds around launch+synchronize; on expiry "
                          "record the phase and os._exit(124) WITHOUT killing the device or resetting")
-    ap.add_argument("--tilelang-root", default=str(DEFAULT_TL))
+    ap.add_argument("--tilelang-root", default=(str(DEFAULT_TL) if DEFAULT_TL else None),
+                    help="tilelang root whose build the probe compiles against; defaults to "
+                         "$TILELANG_ROOT and refuses (TILELANG_ROOT_UNSET) when that is unset")
     args = ap.parse_args()
     case = load_case(args.case)
     if case["kind"] != kind:
@@ -305,6 +311,10 @@ def run_probe(probe_name: str, kind: str, default_case: str, build_kernel,
         print(json.dumps(plan_text(probe_name + ".py", args.case, args.out, args.timeout),
                          indent=2))
         return 0
+    if not args.tilelang_root:
+        print("REFUSED: TILELANG_ROOT_UNSET -- pass --tilelang-root or set TILELANG_ROOT; "
+              "guessing a tree would compile code nobody deploys", file=sys.stderr)
+        return 2
     try:
         build = verify_build(Path(args.tilelang_root))
     except GuardError as exc:

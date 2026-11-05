@@ -40,7 +40,21 @@ from tilefoundry_ascend.memory import SPACE_FACTS  # noqa: E402
 from tilefoundry_ascend.schedule.program import CaseConfig, build_program  # noqa: E402
 from tilefoundry_ascend.schedule.problem import Task, extract_problem  # noqa: E402
 
-UPSTREAM = Path("<user>/workspace/tilelang/tilelang/ascend/transform/z3_scheduler.py")
+#: Upstream tilelang scheduler, resolved from the ENVIRONMENT. The literal
+#: "<user>/..." placeholder made every comparison UNRUN; a missing root is now a
+#: NAMED skip (TILELANG_ROOT_UNSET) carrying its reason, never a silent pass.
+UPSTREAM_RELATIVE = "tilelang/ascend/transform/z3_scheduler.py"
+
+
+def resolve_upstream() -> Path | None:
+    root = (os.environ.get("TILELANG_ROOT") or "").strip()
+    if not root:
+        return None
+    candidate = Path(root) / UPSTREAM_RELATIVE
+    return candidate if candidate.is_file() else None
+
+
+UPSTREAM = resolve_upstream()
 SEED = 42
 MODEL_VERSION = "ascend-pipe-model-v2-040708"
 PIPE_FLAGS = {"mte2": 2, "vector": 16, "mte3": 4}
@@ -481,6 +495,13 @@ def upstream_stage0_equivalence(norm: dict) -> dict:
     args["seed"] = SEED
     args["verbose"] = False
     vendor = core.z3_schedule_loop_python(**args)
+    if UPSTREAM is None:
+        # Absent upstream is UNRUN with a reason, not a pass and not a failure.
+        return {"vendor_default_path": [list(vendor[0]), list(vendor[1]), int(vendor[2])],
+                "upstream_path": None, "status": "SKIP",
+                "skip_reason": "TILELANG_ROOT_UNSET",
+                "skip_detail": "set TILELANG_ROOT to a tilelang root containing %s"
+                               % UPSTREAM_RELATIVE}
     code = (
         "import importlib.util,json;"
         "spec=importlib.util.spec_from_file_location('upz3', %r);"

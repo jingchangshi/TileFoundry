@@ -234,13 +234,22 @@ def main() -> int:
                  "bad=[k for k in sys.modules if k.split('.')[0] in ('tilefoundry','kernel_v33')"
                  " or 'evaluator' in k.split('.')[0]];"
                  "print('BAD='+','.join(sorted(bad)))") % (str(TWIN.parent), str(TWIN))
-        env = dict(os.environ, PYTHONPATH=str(TF / "src") + os.pathsep + str(TF / "targets/ascend")
-                   + os.pathsep + "<user>/workspace/tilelang",
+        # The tilelang root comes from the ENVIRONMENT. The literal "<user>/..." was a
+        # placeholder that put a nonexistent path on PYTHONPATH and made the probe look
+        # configured while resolving nothing.
+        tl_root = (os.environ.get("TILELANG_ROOT") or "").strip()
+        import_path = [str(TF / "src"), str(TF / "targets/ascend")]
+        if tl_root:
+            import_path.append(tl_root)
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join(import_path),
                    PYTHONDONTWRITEBYTECODE="1", TORCH_DEVICE_BACKEND_AUTOLOAD="0")
         p = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, env=env)
         bad = next((l[4:] for l in p.stdout.splitlines() if l.startswith("BAD=")), None)
         report["import_probe"] = {"returncode": p.returncode, "bad": bad,
+                                  "tilelang_root": tl_root or None,
                                   "stdout": p.stdout.strip(), "stderr_tail": p.stderr.strip()[-400:]}
+        if not tl_root:
+            report["import_probe"]["skip_reason"] = "TILELANG_ROOT_UNSET"
     Path(args.out).write_text(json.dumps(report, indent=2) + chr(10))
     fails = [c["case_id"] for c in report["cases"] if not c["pass"]]
     killed = all(n["killed"] for n in report["negatives"])

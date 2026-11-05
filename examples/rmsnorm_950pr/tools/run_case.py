@@ -11,7 +11,14 @@ Exit codes (propagated to the caller, NOT swallowed):
 """
 from __future__ import annotations
 import argparse, hashlib, importlib.util, json, os, statistics, sys, traceback
+import os
 from pathlib import Path
+
+# Machine-independent root: from TF_WORKSPACE_ROOT, defaulting to ~/workspace.
+# A literal home path makes the file unusable elsewhere; a placeholder would
+# make it unusable HERE, so it is derived.
+_WS_ROOT = os.environ.get("TF_WORKSPACE_ROOT") or str(Path.home() / "workspace")
+
 
 BLOCKED_ENV = 75
 NOT_RUN = 3
@@ -21,9 +28,73 @@ DEVICE_AUTH_ENV = "TF_DEVICE_AUTH"
 # script MUST NOT take a second lock in that case. A standalone invocation takes the SAME
 # lock, so there is exactly one holder on every path and never a second lock file.
 DEVICE_LOCK_PATH = "/home/.tf_device0.lock"
-FROZEN_PROTOCOL = ("/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam"
+FROZEN_PROTOCOL = (f"{_WS_ROOT}/TileFoundry_Ascend950PR_AgentTeam"
                    "/artifacts/run01/p0/precision_protocol.json")
 _LOCK_FH = None
+
+
+# --- tilelang provenance ----------------------------------------------------
+# The device run must import the INSTALLED WHEEL from the shared prefix. There is
+# deliberately NO source-tree fallback: with workspace/tilelang first on PYTHONPATH
+# this script imports the checkout, and then the prefix passing its four layers says
+# nothing about what actually ran on the card.
+TILELANG_ROOT_ENV = "TILELANG_ROOT"
+_ADAPTER_ENV_CONTEXT = (f"{_WS_ROOT}/AgentGates/agent_gates/adapters/tilefoundry-npu"
+                        "/scripts/env_context.py")
+
+
+def expected_tilelang_prefix() -> str:
+    """Where the deployed tilelang wheel must live. Refuses; never guesses.
+
+    Order: TILELANG_ROOT, then the adapter env context (the same SHARED_PREFIX
+    configure.py provisions), then a NAMED refusal TILELANG_ROOT_UNSET.
+    """
+    root = (os.environ.get(TILELANG_ROOT_ENV) or "").strip()
+    if root:
+        return root
+    ctx = Path(_ADAPTER_ENV_CONTEXT)
+    if ctx.is_file():
+        import runpy
+        try:
+            prefix = runpy.run_path(str(ctx)).get("SHARED_PREFIX")
+        except Exception as exc:  # noqa: BLE001
+            print("BLOCKED_ENV: adapter env context %s is unusable: %s" % (ctx, exc),
+                  file=sys.stderr)
+        else:
+            if prefix:
+                return str(prefix)
+    print("\n".join([
+        "BLOCKED_ENV: TILELANG_ROOT_UNSET",
+        "  Neither %s nor the adapter env context" % TILELANG_ROOT_ENV,
+        "  (%s) names the prefix that owns the" % _ADAPTER_ENV_CONTEXT,
+        "  installed tilelang wheel. Falling back to a source checkout would measure",
+        "  code nobody deploys, so this refuses rather than guesses.",
+        "  Set %s=<venv root, e.g. .../envs/tfnpu-v1>." % TILELANG_ROOT_ENV,
+    ]), file=sys.stderr)
+    raise SystemExit(BLOCKED_ENV)
+
+
+def assert_tilelang_from_prefix(module) -> dict:
+    """The imported tilelang must be the wheel under <prefix>/lib/*/site-packages."""
+    prefix = expected_tilelang_prefix()
+    real_prefix = os.path.realpath(prefix)
+    resolved = os.path.realpath(getattr(module, "__file__", "") or "")
+    under_lib = resolved.startswith(os.path.join(real_prefix, "lib") + os.sep)
+    in_site = (os.sep + "site-packages" + os.sep) in resolved
+    if not (under_lib and in_site):
+        looks_like_checkout = os.path.isfile(
+            os.path.join(os.path.dirname(os.path.dirname(resolved)), "VERSION"))
+        print("\n".join([
+            "BLOCKED_ENV: TILELANG_NOT_FROM_PREFIX",
+            "  tilelang resolved to %r," % resolved,
+            "  which is NOT under %r." % os.path.join(real_prefix, "lib"),
+            "  %s" % ("That path is a SOURCE CHECKOUT, not an installed wheel."
+                     if looks_like_checkout else "Expected a wheel install."),
+            "  Refusing to measure: the device run must import what the prefix verified.",
+        ]), file=sys.stderr)
+        raise SystemExit(BLOCKED_ENV)
+    return {"expected_prefix": real_prefix, "tilelang_file": resolved,
+            "version": getattr(module, "__version__", None)}
 
 
 def _ensure_device_lock() -> None:
@@ -59,9 +130,12 @@ def _ensure_device_lock() -> None:
     print("device lock: acquired %s for this process" % DEVICE_LOCK_PATH, file=sys.stderr)
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools" / "p3" / "native_probe"))
+
+
 def _device_identity_errors(uid: int, visible: str | None, ffi_version: str | None,
                             device_index: int) -> list[str]:
-    """Explicit, testable checks: root, ASCEND_RT_VISIBLE_DEVICES=0, device ffi 0.1.12.
+    """Explicit, testable checks: root, visible list, device ffi 0.1.12.
 
     CPU and device ffi must not be mixed: the device env is 0.1.12 (matching the
     tilelang-built libtvm_ffi.so); 0.1.15.post2 is the CPU env and is REFUSED here.
@@ -69,10 +143,16 @@ def _device_identity_errors(uid: int, visible: str | None, ffi_version: str | No
     errors = []
     if uid != 0:
         errors.append("device work must run as root, uid is %d" % uid)
-    if str(visible) != "0":
-        errors.append("ASCEND_RT_VISIBLE_DEVICES must be 0, got %r" % (visible,))
-    if device_index != 0:
-        errors.append("this backend is pinned to device 0, got --device %d" % device_index)
+    try:
+        from device_guard import check_device_identity
+        env = dict(os.environ)
+        env["ASCEND_RT_VISIBLE_DEVICES"] = str(visible)
+        ident = check_device_identity(env)
+        if not 0 <= device_index < len(ident["visible_ids"]):
+            errors.append("logical --device %d is outside visible list %r"
+                          % (device_index, ident["visible_ids"]))
+    except Exception as exc:  # noqa: BLE001
+        errors.append("device identity refused: %s" % exc)
     if ffi_version is None:
         errors.append("apache-tvm-ffi version is unknown; device env must be 0.1.12")
     elif not str(ffi_version).startswith("0.1.12"):
@@ -94,8 +174,8 @@ def _assert_device_identity(device_index: int) -> None:
         for e in errors:
             print("  - " + e, file=sys.stderr)
         raise SystemExit(BLOCKED_ENV)
-    print("device identity OK: uid=0, ASCEND_RT_VISIBLE_DEVICES=0, apache-tvm-ffi=%s" % ffi,
-          file=sys.stderr)
+    print("device identity OK: uid=0, ASCEND_RT_VISIBLE_DEVICES=%r, apache-tvm-ffi=%s"
+          % (os.environ.get("ASCEND_RT_VISIBLE_DEVICES"), ffi), file=sys.stderr)
 
 
 def device_authorised() -> bool:
@@ -155,7 +235,7 @@ def main() -> int:
     ap.add_argument("--protocol", default=FROZEN_PROTOCOL,
                     help="FROZEN precision protocol (status must be FROZEN)")
     ap.add_argument("--baseline-kernel",
-                    default="/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/reference/kernel_v33.py")
+                    default=f"{_WS_ROOT}/TileFoundry_Ascend950PR_AgentTeam/reference/kernel_v33.py")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -165,12 +245,16 @@ def main() -> int:
     protocol = load_frozen_protocol(args.protocol)
 
     import torch, torch_npu, tilelang
+    # Gate BEFORE touching the card: provenance of the imported tilelang.
+    tilelang_provenance = assert_tilelang_from_prefix(tilelang)
+    print("tilelang provenance OK: %s (%s)" % (tilelang_provenance["tilelang_file"],
+                                               tilelang_provenance["version"]), file=sys.stderr)
     try:
         tilelang.disable_cache()
     except Exception:
         pass
     torch.npu.set_device(args.device)
-    sys.path.insert(0, "/home/s00653124/workspace/TileFoundry/examples/rmsnorm_950pr")
+    sys.path.insert(0, f"{_WS_ROOT}/TileFoundry/examples/rmsnorm_950pr")
     from runtime_model import RuntimeModel, check_case, paired_benchmark
     from kernels.twin_rmsnorm import TwinConfig
 
@@ -196,6 +280,7 @@ def main() -> int:
         "torch_npu": getattr(torch_npu, "__version__", None),
         "tilelang": getattr(tilelang, "__version__", None),
         "tilelang_file": getattr(tilelang, "__file__", None),
+        "tilelang_provenance": tilelang_provenance,
         "tvm_ffi": tvm_ffi_ver,
         "cann": os.environ.get("ASCEND_HOME_PATH"),
         "python": sys.version.split()[0], "python_exe": sys.executable,
