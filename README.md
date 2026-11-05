@@ -110,3 +110,10 @@ with three more beside it. The specifications are meant to be argued with:
 ## License
 
 This project is licensed under the [MIT License](https://github.com/tile-ai/TileFoundry/blob/main/LICENSE).
+
+## Solver-bridge tests (S)
+
+The S bridge imports the ONE shared Z3 core, so its tests need an interpreter with z3;
+a pytest venv without z3 **skips** them by name. See
+[`targets/ascend/tilefoundry_ascend/solver/README.md`](targets/ascend/tilefoundry_ascend/solver/README.md)
+for the interpreter matrix and `tools/run_solver_tests.sh`.

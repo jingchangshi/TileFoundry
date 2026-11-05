@@ -18,6 +18,20 @@ sys.path.insert(0, str(REPO / "targets" / "ascend"))
 
 from tilefoundry_ascend.solver import bridge as B
 
+try:  # z3 is required by the shared core; no-z3 interpreters must SKIP, not fail.
+    import z3 as _z3
+    _Z3_AVAILABLE = True
+except ImportError:
+    _z3 = None
+    _Z3_AVAILABLE = False
+
+SOLVER_TESTS_NEED_Z3 = "SOLVER_TESTS_NEED_Z3_INTERPRETER: run tools/run_solver_tests.sh with a z3 interpreter"
+try:  # pytest: skip the whole module instead of reporting an AssertionError
+    import pytest as _pytest
+    pytestmark = _pytest.mark.skipif(not _Z3_AVAILABLE, reason=SOLVER_TESTS_NEED_Z3)
+except ImportError:  # plain direct runner; handled in __main__ below
+    _pytest = None
+
 PROBLEM = {
     "problem_digest": "sha256:" + "1" * 64,
     "source_digest": "sha256:" + "2" * 64,
@@ -197,6 +211,10 @@ def test_bridge_has_no_second_solver_and_no_caseconfig_rebuild():
 
 
 if __name__ == "__main__":
+    if not _Z3_AVAILABLE:
+        print("SKIP", SOLVER_TESTS_NEED_Z3)
+        raise SystemExit(0)
+    print("z3", _z3.get_version_string())
     failed = 0
     for _name, _fn in sorted(globals().items()):
         if _name.startswith("test_") and callable(_fn):
