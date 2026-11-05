@@ -280,7 +280,9 @@ def check_build_citation_matches() -> None:
         return
     if not os.path.isdir(root):
         # No build present: the honest claim stays UNSOURCED and we do not fabricate one.
-        assert "UNSOURCED" in NATIVE_BUILD["credit"] or True
+        credit = NATIVE_BUILD["credit"]
+        assert "NOT established" in credit, credit
+        assert "ESTABLISHED" not in credit, credit
         print("       build absent; native claim remains UNSOURCED")
         return
     version = open(os.path.join(root, "VERSION")).read().strip()
