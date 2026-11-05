@@ -530,15 +530,31 @@ def test_bad_h1_the_after_checkers_are_registered_at_after_lower():
     """
     d0 = _d0()
     from tilefoundry.passes.pass_manager import PassPoint, _TARGET_PASSES
-    registered = {pass_type.__name__
-                  for (_target, point), pass_types in _TARGET_PASSES.items()
-                  if point is PassPoint.AFTER_LOWER
-                  for pass_type in pass_types}
+    from tilefoundry_ascend.tf_target import Ascend950PRTarget
+
+    # Registered FOR THE ASCEND TARGET, not merely registered somewhere.
+    # target_passes() looks up _TARGET_PASSES[(type(target), point)] using the
+    # targets actually present in the module, so a checker registered against a
+    # DIFFERENT target never runs on Ascend. A scan that only asked "is this name
+    # registered at AFTER_LOWER anywhere" would pass in exactly that case, which is
+    # the "never called yet reads as wired" hole this case exists to close. Verified
+    # both ways: wrong-target registration passes a name-only scan and fails this one.
+    wired = {pass_type.__name__
+             for pass_type in _TARGET_PASSES.get(
+                 (Ascend950PRTarget, PassPoint.AFTER_LOWER), ())}
+    elsewhere = sorted(
+        "%s@%s" % (pass_type.__name__, point.value)
+        for (target, point), pass_types in _TARGET_PASSES.items()
+        for pass_type in pass_types
+        if pass_type.__name__ in ("VerifyPredicateCoverage", "VerifyPipelinePreservation")
+    )
     for name in ("VerifyPredicateCoverage", "VerifyPipelinePreservation"):
-        assert name in registered, (
-            "%s is not registered at AFTER_LOWER (registered AFTER passes: %s), so "
-            "the public finalize path never runs it and a broken lowering would pass"
-            % (name, sorted(registered) or "none")
+        assert name in wired, (
+            "%s is not registered for the Ascend target at AFTER_LOWER, so the "
+            "public finalize path never runs it on an Ascend module and a broken "
+            "lowering would pass. Registered for Ascend/AFTER_LOWER: %s. Same class "
+            "registered anywhere: %s."
+            % (name, sorted(wired) or "none", elsewhere or "nowhere")
         )
 
 
