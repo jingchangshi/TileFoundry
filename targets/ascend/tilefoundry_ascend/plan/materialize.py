@@ -363,13 +363,16 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
               "expected_applications": 0, "allocations_applied": 0,
               "controls_applied": 0, "original_digest": materialization.original_digest,
               "rewritten_digest": materialization.rewritten_digest}
+    # ONE local index per module for this verification pass (no repeated full-tree walks).
+    original_index = _combined_index(original_module)
+    rewritten_index = _combined_index(rewritten_module)
     if (rewritten_module is None or rewritten_module is original_module
             or materialization.rewritten_digest == materialization.original_digest):
         report["code"] = "PLAN_NOT_APPLIED"
         return report
     actual_has_drain = any(
         isinstance(stmt, Evaluate) and isinstance(stmt.callable, Drain)
-        for stmt in _combined_index(rewritten_module).values())
+        for stmt in rewritten_index.values())
     if not actual_has_drain:
         report["code"] = "PLAN_DRAIN_MISSING"
         return report
@@ -389,15 +392,15 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
     # IDENTICAL original object, its operand/address was not applied -> coverage mismatch.
     # (Reads that already satisfy the layout are allowed to be preserved; this is NOT the old
     # "every covered node must disappear" proxy.)
-    rewritten_ids = {id(stmt) for stmt in _combined_index(rewritten_module).values()}
+    rewritten_ids = {id(stmt) for stmt in rewritten_index.values()}
     for path in {access.source_stmt for access in plan.accesses if access.mode == "write"}:
-        original = _combined_index(original_module).get(path)
+        original = original_index.get(path)
         if id(original) in rewritten_ids:
             report["code"] = "APPLICATION_COVERAGE_MISMATCH"
             report["detail"] = {"unrewritten_write": path}
             return report
     # Map fidelity: recorded fingerprints must equal actual rewritten statements.
-    rewritten_stmts = list(_combined_index(rewritten_module).values())
+    rewritten_stmts = list(rewritten_index.values())
     rewritten_fingerprints = {fingerprint(stmt) for stmt in rewritten_stmts}
     for entry in materialization.entries:
         if entry["new_fingerprint"] not in rewritten_fingerprints:
@@ -417,8 +420,7 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
     # Allocation sizes are INFORMATIONAL: a buffer whose layout already matches must not be
     # forced to change. Only an alloc that claims to be applied but is absent from the rewritten
     # module is a real map error.
-    rewritten_allocs = {fingerprint(s) for s in index_statements(rewritten_module).values()
-                        if isinstance(s, LetStmt)}
+    rewritten_allocs = {fingerprint(s) for s in rewritten_index.values() if isinstance(s, LetStmt)}
     for alloc in materialization.allocs:
         if alloc["new_fingerprint"] not in rewritten_allocs:
             report["code"] = "MATERIALIZATION_MAP_MISMATCH"
