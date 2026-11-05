@@ -54,7 +54,9 @@ def _built():
         escape_records=module.metadata.get("escape_records"),
         declaration_sites=module.metadata.get("escape_declaration_sites"),
     )
-    return function, ledger, build_problem(ledger)
+    return function, ledger, build_problem(
+        ledger, predicate_metadata=module.metadata.get("d0.predicate_provenance")
+    )
 
 
 def _dead_function():
@@ -97,9 +99,14 @@ def test_positive_l2_shape():
     assert report["final_gm"]["outputs"] == ["out"], report
     assert report["final_gm"]["final_gm_writes"] >= 1
     assert report["vf_tasks"]["vf_tasks"] >= 1
-    assert report["predicate"]["status"] == "UNKNOWN"
+    # task-77: P now materialises an actual predicate, so L re-derives required independently
+    # and the predicate is WIRED with independent-and-equal provenance (was UNKNOWN before).
+    assert report["predicate"]["status"] == "WIRED", report
+    assert report["predicate"]["independent"] is True and report["predicate"]["equal"] is True, report
     predicate = problem.policy["predicate"]
-    assert predicate["required_active"] is None and predicate["actual_active"] is None
+    assert predicate["required_provenance"]["kind"] == "bounds"
+    assert predicate["actual_provenance"]["kind"] == "materialised"
+    assert predicate["required_provenance"]["ref"] != predicate["actual_provenance"]["ref"]
 
 
 @_test

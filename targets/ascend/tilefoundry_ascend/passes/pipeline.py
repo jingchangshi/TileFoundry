@@ -949,3 +949,52 @@ class VerifyTirPartSelection(ModulePass):
             _walk_tir_statements(getattr(function, "body", None), visit)
         return module
 
+
+
+
+PREDICATE_PROVENANCE_KEY = "d0.predicate_provenance"
+
+
+@register_pass(Ascend950PRTarget, PassPoint.AFTER_LOWER)
+class RecordPredicateProvenance(ModulePass):
+    """AFTER: record ONLY the materialised actual predicate provenance.
+
+    required is deliberately NOT recorded here -- L re-derives required independently from
+    its own ledger facts. A missing pset/mask node writes nothing, so the predicate stays
+    UNKNOWN (never a fabricated WIRED).
+    """
+
+    name = "d0.record_predicate_provenance"
+
+    def run(self, module):
+        from tilefoundry.ir.tir.stmts import Evaluate  # noqa: PLC0415
+
+        actual = None
+        counter = 0
+
+        def lanes_of(stmt):
+            dst = stmt.args[-1] if stmt.args else None
+            shape = getattr(getattr(dst, "type", None), "shape", ()) or ()
+            count = 1
+            for dim in shape:
+                count *= int(dim)
+            return count
+
+        def visit(stmt):
+            nonlocal actual, counter
+            if not isinstance(stmt, Evaluate):
+                return
+            op = getattr(stmt, "callable", None)
+            if type(op).__name__ not in ("Pset", "Pset16"):
+                return
+            ref = "%s:pset[%d]" % (getattr(stmt, "instruction", "tir"), counter)
+            counter += 1
+            if actual is None:
+                actual = {"kind": "materialised", "ref": ref, "active": list(range(lanes_of(stmt)))}
+
+        for function in getattr(module, "functions", ()) or ():
+            _walk_tir_statements(getattr(function, "body", None), visit)
+        if actual is not None:
+            module.metadata[PREDICATE_PROVENANCE_KEY] = {"actual": actual}
+        return module
+

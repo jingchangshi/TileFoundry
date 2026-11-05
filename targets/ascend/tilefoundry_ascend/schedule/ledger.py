@@ -1080,11 +1080,42 @@ def derive_dependencies(accesses) -> list:
     return derive_dependencies_with_stats(accesses)[0]
 
 
-def _problem_policy(sources: "ProblemSources | None") -> dict:
-    """The policy dict, honestly UNWIRED or wired from two independent typed sources.
+def _l_required_facts(ledger):
+    """L independently re-derives the REQUIRED predicate set from its own ledger facts.
 
-    The predicate sub-field is UNKNOWN in both cases: P's actual predicate is not materialised,
-    so wiring budget/versions must not accidentally claim predicate coverage too.
+    required is never read from P metadata: it comes from offset_structure/iteration_domains
+    (loop domain + typed tile footprint). The ref is an L-owned stable id.
+    """
+    import hashlib  # noqa: PLC0415
+
+    loop_name = "outside"
+    lane_count = 0
+    elem_bytes = 4
+    windows = []
+    for entry in ledger.entries:
+        if entry.iteration_domains:
+            loop_name = entry.iteration_domains[0][0]
+        windows.append((entry.space, entry.root, entry.byte_footprint))
+        if entry.space == "GMEM":
+            for part in entry.offset_structure:
+                if part[0] == "call" and part[1] == "DimMul":
+                    consts = [arg[1] for arg in part[2] if arg[0] == "const"]
+                    if consts and int(consts[0]) > 0 and entry.byte_footprint:
+                        elem_bytes = max(1, entry.byte_footprint // int(consts[0]))
+        if entry.space == "SMEM" and entry.mode == "write":
+            lane_count = max(lane_count, entry.byte_footprint // elem_bytes)
+    digest = hashlib.sha256(repr(sorted(windows)).encode()).hexdigest()[:12]
+    ref = "L:bounds:%s:%d:%s" % (loop_name, lane_count, digest)
+    return frozenset(range(lane_count)), {"kind": "bounds", "ref": ref}
+
+
+def _problem_policy(sources: "ProblemSources | None", ledger=None, predicate_metadata=None) -> dict:
+    """The policy dict, honestly UNWIRED or wired from independent typed sources.
+
+    predicate stays UNKNOWN unless P recorded a MATERIALISED actual (provenance only). When
+    it did, required is re-derived HERE from L's own ledger facts (provenance.kind='bounds'),
+    actual comes from the materialised TIR (provenance.kind='materialised'); if the two refs
+    coincide, verify_predicate_wiring refuses it as PREDICATE_SELF_CERTIFIED.
     """
     predicate = {
         "status": "UNKNOWN",
@@ -1094,6 +1125,17 @@ def _problem_policy(sources: "ProblemSources | None") -> dict:
         "actual_provenance": None,
         "reason": "P actual predicate not materialised",
     }
+    actual_meta = (predicate_metadata or {}).get("actual") if isinstance(predicate_metadata, dict) else None
+    if actual_meta and ledger is not None:
+        required, required_provenance = _l_required_facts(ledger)
+        predicate = {
+            "status": "WIRED",
+            "required_active": required,
+            "actual_active": frozenset(actual_meta.get("active", ())),
+            "required_provenance": required_provenance,
+            "actual_provenance": {"kind": "materialised", "ref": actual_meta.get("ref")},
+            "reason": "L re-derived required; P materialised actual",
+        }
     if sources is None:
         return {
             "status": "UNWIRED_L0",
@@ -1112,12 +1154,13 @@ def _problem_policy(sources: "ProblemSources | None") -> dict:
     }
 
 
-def build_problem(ledger: Ledger, sources: "ProblemSources | None" = None) -> NormalizedProblem:
+def build_problem(ledger: Ledger, sources: "ProblemSources | None" = None, predicate_metadata=None) -> NormalizedProblem:
     """Ledger -> normalized Problem. Buffers come from the SAME ledger; no invented roots.
 
     When typed *sources* are supplied, the policy budget and buffer versions are wired from
     their two INDEPENDENT sources (PipelineSpec.num_stages and Empty.buffers); otherwise the
-    policy stays honestly UNWIRED.
+    policy stays honestly UNWIRED. predicate_metadata carries ONLY P's materialised actual
+    provenance; required is always re-derived from this ledger.
     """
     def canonical_root(entry):
         return ledger.root_alias.get(entry.root, entry.root)
@@ -1231,7 +1274,7 @@ def build_problem(ledger: Ledger, sources: "ProblemSources | None" = None) -> No
         alias={},
         escape_edges=list(ledger.escape_edges),
         schema=REAL_PROBLEM_SCHEMA,
-        policy=_problem_policy(sources),
+        policy=_problem_policy(sources, ledger=ledger, predicate_metadata=predicate_metadata),
         vf_tasks=whole_vf_tasks(ledger),
     )
     problem.problem_digest = compute_problem_digest(problem)
