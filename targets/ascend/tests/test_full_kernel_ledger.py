@@ -41,7 +41,8 @@ def main():
     # carrier source; forward does not. Report the REAL split and fail if forward is mislabelled.
     reverse = [e for e in entries if e.op == "Vsts" and ("pack", "PK_B32") in e.attrs]
     forward = [e for e in entries if e.op == "Vsts" and ("pack", "PK_B32") not in e.attrs]
-    checks["vsts_reverse_pk_b32_split"] = len(reverse) == 64 and len(forward) == 64
+    # Per-instruction split (each Vsts has a read-acc and a write-smem access entry).
+    checks["vsts_reverse_pk_b32_split"] = len({e.instruction for e in reverse}) == 64 and len({e.instruction for e in forward}) == 64
     checks["reverse_vsts_tasks_visible"] = len({e.instruction for e in reverse}) == 64
     mislabelled = [dataclasses.replace(e, attrs=e.attrs + (("pack", "PK_B32"),))
                    if (e.op == "Vsts" and ("pack", "PK_B32") not in e.attrs) else e for e in entries]

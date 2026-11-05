@@ -117,6 +117,10 @@ class Ledger:
     # Structural paths of the dataflow statements that emitted at least one action, in walk
     # order. Lets statement<->action coverage be checked without re-walking the TIR twice.
     statement_paths: list = field(default_factory=list)
+    # Scope-local synthetic root -> stable ALLOCATION root (source binding identity). Escape
+    # anchors keep using the local path on LedgerEntry.root; the Problem/dependency layer uses
+    # the canonical root so the SAME buffer is not split per Mesh/ExecutionScope.
+    root_alias: dict = field(default_factory=dict)
 
     def by_id(self):
         return {entry.action_id: entry for entry in self.entries}
@@ -234,6 +238,27 @@ def _root_of(var, views: dict, defs: dict) -> tuple:
         return (str(key), "real")
 
 
+def _allocation_site(value, views: dict):
+    """The stable ALLOCATION site of a view/ptr chain, independent of the accessing scope.
+
+    Walks TensorView/PtrOf/Slice down to the Var that a view was first built from and returns
+    that Var's recorded allocation path. A fresh allocation (its chain bottoms out at a
+    non-var pointer) has no inherited site, so the caller uses its own declaration path.
+    """
+    if isinstance(value, Slice):
+        return _allocation_site(value.base, views)
+    if isinstance(value, Call):
+        if isinstance(value.target, (TensorView, PtrOf, Slice)) and value.args:
+            found = _allocation_site(value.args[0], views)
+            if found:
+                return found
+        return None
+    name = getattr(value, "name", None)
+    if name is not None and name in views:
+        return views[name][3] or None
+    return None
+
+
 def extract_ledger(function, *, escape_records=None, declaration_sites=None) -> Ledger:
     """Walk the typed TIR and record every actual memory action with a stable id.
 
@@ -244,6 +269,11 @@ def extract_ledger(function, *, escape_records=None, declaration_sites=None) -> 
     ledger = Ledger(function=str(getattr(function, "name", "function")))
     views: dict = {}  # view var name -> (root name, root kind, start exprs, alloc path)
     defs: dict = {}   # var name -> defining value (for root resolution)
+    # Source-declaration identity -> backing allocation site. TIR re-declares a view of an
+    # existing synthetic buffer inside a new scope from a bare Constant pointer (no structural
+    # link back), so the authored binding NAME is the stable source identity that unifies the
+    # same buffer across Mesh/ExecutionScope while keeping distinct buffers distinct.
+    synthetic_by_name: dict = {}
     scopes: list = []  # ExecutionScope paths in walk order
 
     def starts_of(var) -> tuple:
@@ -289,8 +319,25 @@ def extract_ledger(function, *, escape_records=None, declaration_sites=None) -> 
             value = stmt.value
             defs[str(getattr(stmt.var, "name", ""))] = value
             if isinstance(value, Call) and isinstance(value.target, (TensorView, PtrOf)):
-                root, kind = _root_of(value.args[0] if value.args else value, views, defs)
-                views[str(getattr(stmt.var, "name", ""))] = (root, kind, _slice_exprs(value), "/".join(path))
+                base = value.args[0] if value.args else value
+                root, kind = _root_of(base, views, defs)
+                # ROOT IDENTITY comes from the backing ALLOCATION, not the accessing scope: a
+                # re-view of an existing synthetic buffer inside a Mesh/ExecutionScope must
+                # inherit the original allocation's site, otherwise the same buffer would get
+                # a different root per scope and a real RAW edge would be missed.
+                view_name = str(getattr(stmt.var, "name", ""))
+                if kind == "synthetic_alloc":
+                    local_path = _allocation_site(base, views) or "/".join(path)
+                    canonical = synthetic_by_name.get(view_name)
+                    if canonical is None:
+                        canonical = local_path
+                        synthetic_by_name[view_name] = canonical
+                    if local_path != canonical:
+                        ledger.root_alias["smem@" + local_path] = "smem@" + canonical
+                    alloc_path = local_path  # the entry/escape root stays scope-local
+                else:
+                    alloc_path = "/".join(path)
+                views[view_name] = (root, kind, _slice_exprs(value), alloc_path)
             return
         if not isinstance(stmt, Evaluate):
             return
@@ -331,8 +378,8 @@ def extract_ledger(function, *, escape_records=None, declaration_sites=None) -> 
             type_ = getattr(arg, "type", None)
             space = str(getattr(getattr(type_, "storage", None), "name", "?"))
             if root_kind == "synthetic_alloc":
-                name = getattr(arg, "name", None)
-                alloc_path = views[name][3] if name in views else "/".join(path)
+                var_name = getattr(arg, "name", None)
+                alloc_path = views[var_name][3] if var_name in views else "/".join(path)
                 root = "smem@" + alloc_path
             elif root in ("None", "anon", "0"):
                 raise LedgerError("VIEW_CHAIN_UNRESOLVED: action " + "/".join(path) + " has no real allocation root")
@@ -1072,9 +1119,12 @@ def build_problem(ledger: Ledger, sources: "ProblemSources | None" = None) -> No
     their two INDEPENDENT sources (PipelineSpec.num_stages and Empty.buffers); otherwise the
     policy stays honestly UNWIRED.
     """
+    def canonical_root(entry):
+        return ledger.root_alias.get(entry.root, entry.root)
+
     roots = {}
     for entry in ledger.entries:
-        key = (entry.root, entry.space)
+        key = (canonical_root(entry), entry.space)
         roots[key] = max(roots.get(key, 0), entry.byte_footprint)
     buffers = [
         {"root": root, "root_kind": ("synthetic_alloc" if root.startswith("smem@") else "real"), "space": space, "bytes_": size, "owner_loop": "outside", "versions": 1, "fixed": True}
@@ -1084,7 +1134,7 @@ def build_problem(ledger: Ledger, sources: "ProblemSources | None" = None) -> No
         ProblemAccess(
             task=entry.action_id,
             instruction=entry.instruction,
-            root=entry.root,
+            root=canonical_root(entry),
             root_kind=entry.root_kind,
             space=entry.space,
             mode=entry.mode,
