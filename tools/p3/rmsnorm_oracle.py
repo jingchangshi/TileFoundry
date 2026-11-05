@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import json
 import math
 import sys
@@ -66,8 +67,14 @@ import bf16_reference as p2  # noqa: E402
 
 EPS = 1e-6
 CH = 64
-DEFAULT_PROTOCOL = Path("<user>/workspace/TileFoundry_Ascend950PR_AgentTeam"
-                        "/artifacts/run01/p0/precision_protocol.json")
+# The protocol lives in the RUN TREE, resolved from the environment. The literal
+# "<user>/..." placeholder made this default unusable on every machine, and because
+# it silently pointed at nothing the only symptom was a refusal far from the cause.
+# TF_WORKSPACE_ROOT is the same knob run_case.py uses; the home default keeps this
+# usable out of the box WITHOUT ever inventing a path that is not there.
+_WS_ROOT = (os.environ.get("TF_WORKSPACE_ROOT") or "").strip() or str(Path.home() / "workspace")
+DEFAULT_PROTOCOL = (Path(_WS_ROOT) / "TileFoundry_Ascend950PR_AgentTeam"
+                    / "artifacts" / "run01" / "p0" / "precision_protocol.json")
 DETERMINISTIC_PATTERNS = {"zero", "ones", "alternating"}
 BLOCK = 256
 
@@ -481,8 +488,12 @@ def main() -> int:
     ap.add_argument("--run-dir", action="append", default=[],
                     help="runner case directory with tensors.json + <key>.{x,w,golden,device}.npy")
     ap.add_argument("--out", help="directory for MANIFEST.json")
-    ap.add_argument("--protocol", default=str(DEFAULT_PROTOCOL))
+    ap.add_argument("--protocol", default=str(DEFAULT_PROTOCOL),
+                    help="FROZEN protocol file; defaults to "
+                         "$TF_WORKSPACE_ROOT/TileFoundry_Ascend950PR_AgentTeam/artifacts/"
+                         "run01/p0/precision_protocol.json")
     ap.add_argument("--self-check", action="store_true")
+
     ap.add_argument("--scalar-demo", action="store_true")
     args = ap.parse_args()
 
