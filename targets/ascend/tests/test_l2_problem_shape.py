@@ -136,7 +136,14 @@ def test_bad_predicate_self_certification_is_refused():
         problem,
         policy={
             **problem.policy,
-            "predicate": {"status": "WIRED", "required_active": frozenset(range(6)), "actual_active": frozenset(range(6))},
+            "predicate": {
+                "status": "WIRED",
+                "required_active": frozenset(range(6)),
+                "actual_active": frozenset(range(6)),
+                # SAME provenance source: required was read back from actual -> still refused.
+                "required_provenance": {"kind": "tir", "ref": "actual-active"},
+                "actual_provenance": {"kind": "tir", "ref": "actual-active"},
+            },
         },
     )
     assert _refusal(lambda: verify_predicate_wiring(forged)) == "PREDICATE_SELF_CERTIFIED"

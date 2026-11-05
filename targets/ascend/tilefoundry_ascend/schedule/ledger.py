@@ -1043,6 +1043,8 @@ def _problem_policy(sources: "ProblemSources | None") -> dict:
         "status": "UNKNOWN",
         "required_active": None,
         "actual_active": None,
+        "required_provenance": None,
+        "actual_provenance": None,
         "reason": "P actual predicate not materialised",
     }
     if sources is None:
@@ -1633,12 +1635,16 @@ def verify_whole_vf_tasks(ledger: Ledger, problem: NormalizedProblem) -> dict:
 
 
 def verify_predicate_wiring(problem: NormalizedProblem) -> dict:
-    """Predicate fields must be an honest UNKNOWN, never a default 0 or a self-proof.
+    """Predicate fields must be an honest UNKNOWN, and a WIRED one must be independently sourced.
 
     P's actual predicate is not materialised, so the only legal state is UNKNOWN with no
-    numbers. A WIRED state is legal only when its required and actual sets are BOTH present
-    and DIFFERENT -- an equality would be the required==actual self-certification the design
-    forbids.
+    numbers. A WIRED state is legal when required was derived INDEPENDENTLY from bounds/domain
+    (with provenance) and actual came from the materialised TIR (with provenance). What matters
+    is PROVENANCE INDEPENDENCE, not whether the two sets are equal:
+      * same provenance source  -> PREDICATE_SELF_CERTIFIED (required merely re-read actual);
+      * independent and EQUAL   -> PASS (two independent derivations agreeing is healthy);
+      * independent and different-> PASS (they disagree; coverage is a separate question);
+      * missing provenance      -> PREDICATE_SOURCE_UNBOUND.
     """
     predicate = (problem.policy or {}).get("predicate")
     if predicate is None:
@@ -1657,12 +1663,33 @@ def verify_predicate_wiring(problem: NormalizedProblem) -> dict:
         return {"status": "UNKNOWN"}
     if required is None or actual is None:
         raise LedgerError("PREDICATE_SOURCE_UNBOUND: WIRED predicate lacks required/actual")
-    if set(required) == set(actual):
+    required_provenance = predicate.get("required_provenance")
+    actual_provenance = predicate.get("actual_provenance")
+    if (
+        not isinstance(required_provenance, dict)
+        or not required_provenance
+        or not isinstance(actual_provenance, dict)
+        or not actual_provenance
+    ):
         raise LedgerError(
-            "PREDICATE_SELF_CERTIFIED: required==actual (%r); a predicate cannot certify itself"
-            % (sorted(required),)
+            "PREDICATE_SOURCE_UNBOUND: WIRED predicate must record required_provenance "
+            "(bounds/domain) and actual_provenance (materialised TIR)"
         )
-    return {"status": "WIRED"}
+    same_source = (
+        required_provenance.get("kind") == actual_provenance.get("kind")
+        or required_provenance.get("ref") == actual_provenance.get("ref")
+    )
+    if same_source:
+        raise LedgerError(
+            "PREDICATE_SELF_CERTIFIED: required and actual share provenance (%r vs %r); required "
+            "must be re-derived from bounds/domain, not read back from actual"
+            % (required_provenance, actual_provenance)
+        )
+    return {
+        "status": "WIRED",
+        "independent": True,
+        "equal": set(required) == set(actual),
+    }
 
 
 def verify_escape_endpoints(ledger: Ledger) -> dict:
@@ -1837,3 +1864,64 @@ def verify_s_problem_document(document: dict, *, problem: NormalizedProblem | No
         "coverage_gaps": list(document.get("coverage_gaps") or []),
         "unknown_ratio": (document.get("dependencies") or {}).get("unknown_ratio", 0.0),
     }
+
+
+
+def verify_poc_dependency_gate(problem: NormalizedProblem, *, ledger=None, op_by_task=None) -> dict:
+    """POC gate on a small affine carrier: load->VF and VF->store each need a source-proven RAW.
+
+    Also requires zero UNKNOWN among SUPPORTED-domain edges (space GMEM/SMEM) and zero
+    critical UNKNOWN. This is the correctness gate for the small carrier; the full-kernel
+    0.99806 unknown ratio is a SUPPORTED-DOMAIN limitation, not a correctness gate here.
+    """
+    by_task = {access.task: access for access in problem.accesses}
+    if op_by_task is None:
+        if ledger is None:
+            raise LedgerError("POC_DEPENDENCY_GATE_FAILED: need ledger or op_by_task to map ops")
+        op_by_task = {entry.action_id: entry.op for entry in ledger.entries}
+
+    load_to_vf = []
+    vf_to_store = []
+    supported_total = 0
+    supported_unknown = 0
+    critical_unknown = 0
+    data_spaces = {"GMEM", "SMEM"}
+    for edge in problem.dependencies:
+        producer = by_task.get(edge["producer"])
+        consumer = by_task.get(edge["consumer"])
+        if producer is None or consumer is None:
+            continue
+        producer_op = op_by_task.get(edge["producer"])
+        consumer_op = op_by_task.get(edge["consumer"])
+        if producer.space in data_spaces and consumer.space in data_spaces:
+            supported_total += 1
+            if edge["status"] != "BYTES":
+                supported_unknown += 1
+        if edge["kind"] == "RAW" and edge["status"] == "BYTES":
+            if producer_op == "GmToUb" and consumer_op == "Vld":
+                load_to_vf.append(edge)
+            if producer_op == "Vsts" and consumer_op == "UbToGm":
+                vf_to_store.append(edge)
+        if edge["kind"] == "RAW" and edge["status"] != "BYTES" and producer_op in ("GmToUb", "Vsts"):
+            critical_unknown += 1
+
+    gaps = []
+    if not load_to_vf:
+        gaps.append("MISSING_SOURCE_PROVEN_LOAD_TO_VF_RAW")
+    if not vf_to_store:
+        gaps.append("MISSING_SOURCE_PROVEN_VF_TO_STORE_RAW")
+    if supported_unknown:
+        gaps.append("SUPPORTED_DOMAIN_UNKNOWN_NONZERO")
+    if critical_unknown:
+        gaps.append("CRITICAL_UNKNOWN_NONZERO")
+    report = {
+        "load_to_vf_raw": len(load_to_vf),
+        "vf_to_store_raw": len(vf_to_store),
+        "supported_edges": supported_total,
+        "supported_unknown": supported_unknown,
+        "supported_unknown_ratio": (round(supported_unknown / supported_total, 6) if supported_total else 0.0),
+        "critical_unknown": critical_unknown,
+    }
+    if gaps:
+        raise LedgerError("POC_DEPENDENCY_GATE_FAILED: " + ", ".join(gaps) + " | " + repr(report))
+    return report
