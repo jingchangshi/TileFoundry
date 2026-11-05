@@ -139,3 +139,10 @@ The ABI preflight (`tools/abi_preflight.py`, invoked by `tools/run_solver_tests.
 allows only `envs/tfnpu-v2` and fails by
 `ABI_PREFLIGHT_INTERPRETER` / `ABI_PREFLIGHT_VERSION` / `ABI_PREFLIGHT_SHA`. See
 [`envs/ENVIRONMENT.md`](../envs/ENVIRONMENT.md).
+
+**Clean archive:** `src/tilefoundry/__init__.py` (and the CLI summary/version) falls
+back to `0.0.0+unknown` when the untracked `src/tilefoundry.egg-info` is absent, so a
+`git archive` checkout can collect and run tests without installed package metadata.
+If a release needs real metadata, generate it offline with the local wheels via
+`python -m pip install -e . --no-index --find-links envs/wheels` (do not rely on the
+working tree's egg-info).

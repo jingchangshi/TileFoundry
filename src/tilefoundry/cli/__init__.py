@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import sys
-from importlib.metadata import metadata, version
+from importlib.metadata import PackageNotFoundError, metadata
 from typing import Sequence
+
+from tilefoundry import __version__ as _tf_version
 
 from tilefoundry.analysis import AnalysisError
 from tilefoundry.cli.analyze import ANALYSES, EVIDENCE, run_authored_analysis
@@ -59,9 +61,13 @@ def _project_summary() -> str:
     """The packaged one-line description of the project.
 
     Read from installed metadata rather than restated here, so there is one copy
-    of the sentence and no second one to drift.
+    of the sentence and no second one to drift. A clean archive has no egg-info;
+    use a stable local fallback rather than failing collection.
     """
-    return metadata("tilefoundry")["Summary"].rstrip(".")
+    try:
+        return metadata("tilefoundry")["Summary"].rstrip(".")
+    except PackageNotFoundError:
+        return "TileFoundry"
 
 
 def _add_source_argument(parser: argparse.ArgumentParser) -> None:
@@ -86,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"tilefoundry {version('tilefoundry')}",
+        version=f"tilefoundry {_tf_version}",
         help="print the installed version and exit",
     )
     commands = parser.add_subparsers(dest="command", title="Common commands", metavar="<command>")

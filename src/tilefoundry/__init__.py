@@ -7,11 +7,15 @@ authoritative on physical layout.
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 
 # ruff: noqa: I001 -- curated re-export order; alphabetical sort breaks staged imports.
 
-__version__ = _distribution_version("tilefoundry")
+try:
+    __version__ = _distribution_version("tilefoundry")
+except PackageNotFoundError:  # clean archive: no installed egg-info, still importable
+    __version__ = "0.0.0+unknown"
 
 
 from tilefoundry.ir.core import (
