@@ -1,0 +1,255 @@
+"""X0-X2 codegen boundary/runtime contract (CPU only).
+
+Design: architect_x_codegen_runtime_module_design_v1.md (frozen). X does NOT create
+a new compiler and does NOT touch the device. It defines:
+  * LOGICAL_TL_RECOMPILE vs RESOLVED_PLAN_PRESERVING;
+  * a Plan-preserve request is refused if TL re-schedules/overwrites the Plan;
+  * four identities source map / ABI / CCE / binary are separate, with UNOBSERVED
+    allowed only for non-execution CPU generation;
+  * compile/bind/invoke are explicitly CODEGEN_CONTRACT_UNIMPLEMENTED until X3/X4.
+
+Only R/C VERIFIED inputs may reach X. emit_for_codegen is the sole plan boundary.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+class CodegenError(RuntimeError):
+    def __init__(self, code, message, source_id="", expected=None, actual=None, phase="codegen"):
+        self.code = code
+        self.phase = phase
+        self.source_id = source_id
+        self.expected = expected
+        self.actual = actual
+        super().__init__("%s: %s (source=%r expected=%r actual=%r)"
+                         % (code, message, source_id, expected, actual))
+
+    def as_dict(self):
+        return {"code": self.code, "phase": self.phase, "source_id": self.source_id,
+                "expected": self.expected, "actual": self.actual}
+
+
+def _get(obj, name, default=None):
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _digest(value) -> str:
+    return hashlib.sha256(json.dumps({"value": value}, sort_keys=True, default=str).encode()).hexdigest()
+
+
+LOGICAL_TL_RECOMPILE = "LOGICAL_TL_RECOMPILE"
+RESOLVED_PLAN_PRESERVING = "RESOLVED_PLAN_PRESERVING"
+MODES = (LOGICAL_TL_RECOMPILE, RESOLVED_PLAN_PRESERVING)
+
+
+@dataclass(frozen=True)
+class SourceIdentity:
+    source_kind: str
+    tir_digest: str
+    source_map: dict
+    adapter_version: str
+    source_hash: Optional[str] = None
+    handwritten_twin: bool = False
+
+
+@dataclass(frozen=True)
+class KernelABI:
+    args: tuple
+    output_index: int
+    eps_f32_bits: Optional[int]
+    grid: dict = field(default_factory=dict)
+
+    def validate(self):
+        if not isinstance(self.args, (tuple, list)) or not self.args:
+            raise CodegenError("X_ABI_MISMATCH", "ABI must contain ordered args",
+                               "args", "nonempty tuple", self.args)
+        names = [str(_get(arg, "name", "")) for arg in self.args]
+        if any(not name for name in names) or len(set(names)) != len(names):
+            raise CodegenError("X_ABI_MISMATCH", "ABI arg names must be unique/nonempty",
+                               "args", names, names)
+        if not (0 <= int(self.output_index) < len(self.args)):
+            raise CodegenError("X_ABI_MISMATCH", "output_index out of range",
+                               "output_index", (0, len(self.args) - 1), self.output_index)
+        output = self.args[int(self.output_index)]
+        if str(_get(output, "kind")) not in ("out", "inout"):
+            raise CodegenError("X_ABI_MISMATCH", "output arg must be out/inout",
+                               "output_index", "out/inout", _get(output, "kind"))
+        for arg in self.args:
+            nbytes = _get(arg, "nbytes")
+            if nbytes is None or int(nbytes) <= 0:
+                raise CodegenError("X_ABI_MISMATCH", "arg nbytes must be explicit",
+                                   str(_get(arg, "name")), ">0", nbytes)
+        return True
+
+
+@dataclass(frozen=True)
+class AdapterRequest:
+    schema: str
+    run_id: str
+    case_id: str
+    workload_id: str
+    mode: str
+    tf_source_ref: dict
+    tf_hir_ref: dict
+    tir_ref: dict
+    problem_ref: dict
+    plan_ref: dict
+    c_ref: dict
+    env_ref: dict
+    input_ref: dict
+    source_identity: SourceIdentity
+    abi: KernelABI
+    plan_preserved: bool
+
+
+@dataclass(frozen=True)
+class TLModule:
+    source: Optional[str]
+    module: Optional[str]
+    source_map: dict
+    plan_preserved: bool
+    plan_claims: dict
+    source_status: str = "SOURCE_MAPPED"
+
+
+@dataclass(frozen=True)
+class CompiledArtifactBundle:
+    cce: dict
+    binary: dict
+    load: dict
+    source_map: dict
+    status: str = "COMPILED_UNOBSERVED"
+
+
+def validate_adapter_request(tir, plan, C_report, env_ref, mode, *, source_map=None,
+                             abi=None, run_ref=None) -> AdapterRequest:
+    if mode not in MODES:
+        raise CodegenError("X_MODE_INVALID", "unknown codegen mode", "mode", MODES, mode)
+    state = _get(plan, "state", {})
+    if str(_get(state, "application_status")) != "APPLIED":
+        raise CodegenError("X_PLAN_NOT_READY", "R plan is not APPLIED",
+                           "application_status", "APPLIED", _get(state, "application_status"))
+    if str(_get(C_report, "status", "")).upper() != "VERIFIED":
+        raise CodegenError("COMPLETION_NOT_VERIFIED", "C completion is not VERIFIED",
+                           "C", "VERIFIED", _get(C_report, "status"))
+    required = int(_get(C_report, "required", 0) or 0)
+    covered = int(_get(C_report, "covered", 0) or 0)
+    if required <= 0 or covered != required:
+        raise CodegenError("COMPLETION_NOT_VERIFIED", "C coverage is incomplete",
+                           "C", "required==covered>0", [required, covered])
+    if not tir or not plan or not env_ref:
+        raise CodegenError("X_SOURCE_IDENTITY_MISMATCH", "tir/plan/env identity missing",
+                           "request", "nonempty tir/plan/env", [tir, plan, env_ref])
+    source_map = source_map or {}
+    if not source_map:
+        raise CodegenError("X_SOURCE_COVERAGE_MISMATCH", "no TL source map supplied",
+                           "source_map", "nonempty map", None)
+    if abi is None:
+        raise CodegenError("X_ABI_MISMATCH", "no KernelABI supplied", "abi", "KernelABI", None)
+    if isinstance(abi, dict):
+        abi = KernelABI(tuple(abi.get("args", ())), int(abi.get("output_index", -1)),
+                        abi.get("eps_f32_bits"), abi.get("grid", {}))
+    abi.validate()
+    run_ref = run_ref or {}
+    identity = SourceIdentity(str(run_ref.get("source_kind", "TF_TYPED_TIR")),
+                              str(run_ref.get("tir_digest", _digest(tir))),
+                              dict(source_map), str(run_ref.get("adapter_version", "x0-x2")),
+                              run_ref.get("source_hash"))
+    return AdapterRequest(
+        schema="x-runtime/1", run_id=str(run_ref.get("run_id", "x-run")),
+        case_id=str(run_ref.get("case_id", "case")), workload_id=str(run_ref.get("workload_id", "vadd")),
+        mode=mode, tf_source_ref=dict(run_ref.get("tf_source_ref", {})),
+        tf_hir_ref=dict(run_ref.get("tf_hir_ref", {})), tir_ref=dict(run_ref.get("tir_ref", {})),
+        problem_ref=dict(run_ref.get("problem_ref", {})), plan_ref=dict(run_ref.get("plan_ref", {})),
+        c_ref=dict(run_ref.get("c_ref", {})), env_ref=dict(env_ref),
+        input_ref=dict(run_ref.get("input_ref", {})), source_identity=identity, abi=abi,
+        plan_preserved=bool(run_ref.get("plan_preserved", mode == RESOLVED_PLAN_PRESERVING)))
+
+
+def lower_to_tilelang(request: AdapterRequest, actual_tir, source_maps) -> TLModule:
+    if not actual_tir or not source_maps:
+        raise CodegenError("X_SOURCE_COVERAGE_MISMATCH", "actual TIR/source map missing",
+                           "lower", "nonempty TIR+map", [actual_tir, source_maps])
+    statements = source_maps.get("statements", {}) or {}
+    if not statements:
+        raise CodegenError("X_SOURCE_COVERAGE_MISMATCH", "no effect statement mapped",
+                           "source_map.statements", "nonempty", source_maps)
+    plan_preserved = bool(source_maps.get("plan_preserved", False))
+    if request.mode == RESOLVED_PLAN_PRESERVING and not plan_preserved:
+        raise CodegenError("X_PLAN_PRESERVATION_MISMATCH",
+                           "TL would reschedule/overwrite the Plan but preserve was requested",
+                           "mode", "plan_preserved=true", plan_preserved)
+    return TLModule(source=None, module=None, source_map=dict(source_maps),
+                    plan_preserved=plan_preserved, plan_claims=dict(source_maps.get("plan_claims", {})),
+                    source_status="SOURCE_MAPPED")
+
+
+def verify_adapter_correspondence(request: AdapterRequest, tl_module: TLModule,
+                                  source_map, abi, *, claim_pass=False) -> dict:
+    source_map = source_map or {}
+    statements = source_map.get("statements", {}) or {}
+    if not statements:
+        raise CodegenError("X_SOURCE_COVERAGE_MISMATCH", "source map has no statements",
+                           "source_map", "nonempty", source_map)
+    if request.mode == RESOLVED_PLAN_PRESERVING and not tl_module.plan_preserved:
+        raise CodegenError("X_PLAN_PRESERVATION_MISMATCH",
+                           "TL module does not preserve the resolved Plan",
+                           "plan_preserved", True, tl_module.plan_preserved)
+    abi.validate()
+    cce = source_map.get("cce") or {}
+    binary = source_map.get("binary") or {}
+    load = source_map.get("load") or {}
+    missing = [name for name, value in (("cce", cce), ("binary", binary), ("load", load))
+               if not value or str(_get(value, "status", "")).upper() == "UNOBSERVED"]
+    if claim_pass and missing:
+        raise CodegenError("X_ARTIFACT_IDENTITY_MISSING",
+                           "PASS claimed without observed CCE/binary/load identity",
+                           "artifacts", "OBSERVED cce/binary/load", missing)
+    return {"status": "SOURCE_MAPPED", "source_map": True, "abi": True,
+            "plan_preserved": bool(tl_module.plan_preserved),
+            "identities": {"source": "MAPPED", "cce": str(_get(cce, "status", "UNOBSERVED")),
+                           "binary": str(_get(binary, "status", "UNOBSERVED")),
+                           "load": str(_get(load, "status", "UNOBSERVED"))},
+            "missing_execution_identities": missing, "claim_pass": bool(claim_pass)}
+
+
+def compile_tilelang(module, abi, env_context, compile_policy):
+    raise CodegenError("CODEGEN_CONTRACT_UNIMPLEMENTED",
+                       "real TL compile is X3; no CCE/binary emitted in X0-X2",
+                       "compile_tilelang", "implemented X3 compile", None)
+
+
+def bind_kernel(bundle, abi, actual_inputs, selected_device):
+    raise CodegenError("CODEGEN_CONTRACT_UNIMPLEMENTED",
+                       "bind is X4; no device binding in X0-X2",
+                       "bind_kernel", "implemented X4 bind", None)
+
+
+def invoke_kernel(bound_kernel, run_context):
+    raise CodegenError("CODEGEN_CONTRACT_UNIMPLEMENTED",
+                       "invoke is X4; no device launch in X0-X2",
+                       "invoke_kernel", "implemented X4 invoke", None)
+
+
+def synchronize_and_readback(handles, run_context):
+    raise CodegenError("CODEGEN_CONTRACT_UNIMPLEMENTED",
+                       "sync/readback is X4; no device in X0-X2",
+                       "synchronize_and_readback", "implemented X4 readback", None)
+
+
+def emit_for_codegen(plan, codegen_binding=None):
+    from ..plan.resolved_plan import emit_for_codegen as _plan_emit
+    return _plan_emit(plan, codegen_binding)
+
+
+__all__ = ["CodegenError", "SourceIdentity", "KernelABI", "AdapterRequest", "TLModule",
+           "CompiledArtifactBundle", "LOGICAL_TL_RECOMPILE", "RESOLVED_PLAN_PRESERVING",
+           "validate_adapter_request", "lower_to_tilelang", "verify_adapter_correspondence",
+           "compile_tilelang", "bind_kernel", "invoke_kernel", "synchronize_and_readback",
+           "emit_for_codegen"]
