@@ -87,6 +87,10 @@ class KernelABI:
             raise CodegenError("X_ABI_MISMATCH", "output arg must be out/inout",
                                "output_index", "out/inout", _get(output, "kind"))
         for arg in self.args:
+            dtype = str(_get(arg, "dtype", "")).lower()
+            if dtype not in ("f32", "float32", "bf16", "bfloat16"):
+                raise CodegenError("X_ABI_MISMATCH", "arg dtype must be explicit and supported",
+                                   str(_get(arg, "name")), "f32/float32/bf16/bfloat16", dtype)
             nbytes = _get(arg, "nbytes")
             if nbytes is None or int(nbytes) <= 0:
                 raise CodegenError("X_ABI_MISMATCH", "arg nbytes must be explicit",
@@ -214,7 +218,9 @@ def verify_adapter_correspondence(request: AdapterRequest, tl_module: TLModule,
         raise CodegenError("X_PLAN_PRESERVATION_MISMATCH",
                            "TL module does not preserve the resolved Plan",
                            "plan_preserved", True, tl_module.plan_preserved)
-    abi.validate()
+    if not isinstance(abi, KernelABI):
+        raise CodegenError("X_ABI_MISMATCH", "runtime ABI must be typed at the bind boundary",
+                           "abi", "KernelABI", type(abi).__name__)
     chain = None
     if identity_chain is not None:
         chain = validate_h4_identity_chain(identity_chain, claim_path=claim_path,

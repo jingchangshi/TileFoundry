@@ -146,6 +146,15 @@ def test_d02_plan_impersonating_logical_claim_is_refused():
         source_map=source_map(), abi=abi(), run_ref={"plan_ref": {"ref": "plan"}}))
 
 
+def test_d06_abi_dict_boundary_and_dtype_negative():
+    bad = abi()
+    bad["args"][0]["dtype"] = "int8"
+    expect_code("X_ABI_MISMATCH", lambda: X.validate_adapter_request(
+        object(), None, None, {"env": "v2"}, X.LOGICAL_TL_RECOMPILE,
+        source_map=source_map(), abi=bad))
+    expect_code("X_ABI_MISMATCH", lambda: X.KernelABI(abi()["args"], 9, None).validate())
+
+
 if __name__ == "__main__":
     failed = 0
     for _name, _fn in sorted(globals().items()):
