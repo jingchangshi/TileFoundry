@@ -280,6 +280,18 @@ def test_r2_stale_map_is_materialization_map_mismatch():
     assert report["code"] == "MATERIALIZATION_MAP_MISMATCH", report
 
 
+def test_r2_already_matching_alloc_is_not_forced_to_change():
+    # Legit fixed/no-op: an allocation already satisfying the layout must NOT be required to
+    # change. Verifying with an empty allocs record still PASSES (no proxy "every alloc new").
+    plan = build_ready()
+    original = make_tir_fixture()
+    rewritten, materialization = MAT.materialize_plan(original, plan)
+    report = MAT.verify_plan_application(
+        original, plan, rewritten, dataclasses.replace(materialization, allocs=()))
+    assert report["status"] == "PASS", report
+    assert report["allocations_applied"] == 0
+
+
 def test_r2_non_serial_or_multiversion_is_refused():
     plan = build_ready()
     serial_single = plan

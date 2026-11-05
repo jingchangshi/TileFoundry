@@ -385,13 +385,16 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
             report["detail"] = {"access_id": access.access_id,
                                 "expected": trip, "actual": counts.get(access.access_id, 0)}
             return report
-    # Every original effect statement that the plan covers must be GONE (not identity).
+    # Real missing-pointer mutation: if a WRITE statement the plan must rewrite is still the
+    # IDENTICAL original object, its operand/address was not applied -> coverage mismatch.
+    # (Reads that already satisfy the layout are allowed to be preserved; this is NOT the old
+    # "every covered node must disappear" proxy.)
     rewritten_ids = {id(stmt) for stmt in _combined_index(rewritten_module).values()}
-    for path in {access.source_stmt for access in plan.accesses}:
+    for path in {access.source_stmt for access in plan.accesses if access.mode == "write"}:
         original = _combined_index(original_module).get(path)
         if id(original) in rewritten_ids:
             report["code"] = "APPLICATION_COVERAGE_MISMATCH"
-            report["detail"] = {"survived": path}
+            report["detail"] = {"unrewritten_write": path}
             return report
     # Map fidelity: recorded fingerprints must equal actual rewritten statements.
     rewritten_stmts = list(_combined_index(rewritten_module).values())
@@ -411,18 +414,15 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
                                 "generation": entry["generation"],
                                 "expected": expected_generation, "loop_k": loop_k}
             return report
-    original_allocs = [s for s in index_statements(original_module).values()
-                       if isinstance(s, LetStmt)]
+    # Allocation sizes are INFORMATIONAL: a buffer whose layout already matches must not be
+    # forced to change. Only an alloc that claims to be applied but is absent from the rewritten
+    # module is a real map error.
     rewritten_allocs = {fingerprint(s) for s in index_statements(rewritten_module).values()
                         if isinstance(s, LetStmt)}
     for alloc in materialization.allocs:
         if alloc["new_fingerprint"] not in rewritten_allocs:
             report["code"] = "MATERIALIZATION_MAP_MISMATCH"
             report["detail"] = {"alloc": alloc}
-            return report
-        if alloc["new_fingerprint"] == alloc["old_fingerprint"]:
-            report["code"] = "PLAN_NOT_APPLIED"
-            report["detail"] = {"alloc": alloc["root"]}
             return report
         report["allocations_applied"] += 1
     report["applied_accesses"] = sum(counts.get(a.access_id, 0) for a in writes)
