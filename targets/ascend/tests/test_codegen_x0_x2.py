@@ -71,10 +71,10 @@ def test_x0_modes_and_verified_inputs_are_explicit():
     expect_code("X_MODE_INVALID", lambda: X.validate_adapter_request(
         object(), applied_plan(), verified_c(), {"env": "v2"}, "UNKNOWN"))
     expect_code("X_PLAN_NOT_READY", lambda: X.validate_adapter_request(
-        object(), R4.build_stage(), verified_c(), {"env": "v2"}, X.LOGICAL_TL_RECOMPILE))
+        object(), R4.build_stage(), verified_c(), {"env": "v2"}, X.RESOLVED_PLAN_PRESERVING))
     expect_code("COMPLETION_NOT_VERIFIED", lambda: X.validate_adapter_request(
         object(), applied_plan(), C.CoverageReport("FAILED", "x", 1, 1, 0, ("ob",), 0),
-        {"env": "v2"}, X.LOGICAL_TL_RECOMPILE))
+        {"env": "v2"}, X.RESOLVED_PLAN_PRESERVING))
 
 
 def test_x1_source_map_and_abi_are_required():
@@ -124,6 +124,26 @@ def test_x_emit_boundary_requires_r5_verified_and_stays_unimplemented():
     expect_code("COMPLETION_NOT_VERIFIED", lambda: X.emit_for_codegen(plan))
     attached = RP.attach_completion(plan, verified_c())
     expect_code("CODEGEN_CONTRACT_UNIMPLEMENTED", lambda: X.emit_for_codegen(attached))
+
+
+def test_d02_logical_without_r_c_is_allowed():
+    request = X.validate_adapter_request(object(), None, None, {"env": "v2"},
+                                          X.LOGICAL_TL_RECOMPILE,
+                                          source_map=source_map(), abi=abi())
+    assert request.mode == X.LOGICAL_TL_RECOMPILE
+    assert request.plan_preserved is False
+
+
+def test_d02_resolved_without_r_c_is_refused():
+    expect_code("X_PLAN_NOT_READY", lambda: X.validate_adapter_request(
+        object(), None, None, {"env": "v2"}, X.RESOLVED_PLAN_PRESERVING,
+        source_map=source_map(), abi=abi()))
+
+
+def test_d02_plan_impersonating_logical_claim_is_refused():
+    expect_code("X_LOGICAL_PLAN_CLAIM_FORBIDDEN", lambda: X.validate_adapter_request(
+        object(), None, None, {"env": "v2"}, X.LOGICAL_TL_RECOMPILE,
+        source_map=source_map(), abi=abi(), run_ref={"plan_ref": {"ref": "plan"}}))
 
 
 if __name__ == "__main__":

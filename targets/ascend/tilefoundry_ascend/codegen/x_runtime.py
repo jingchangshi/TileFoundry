@@ -137,21 +137,28 @@ def validate_adapter_request(tir, plan, C_report, env_ref, mode, *, source_map=N
                              abi=None, run_ref=None) -> AdapterRequest:
     if mode not in MODES:
         raise CodegenError("X_MODE_INVALID", "unknown codegen mode", "mode", MODES, mode)
-    state = _get(plan, "state", {})
-    if str(_get(state, "application_status")) != "APPLIED":
-        raise CodegenError("X_PLAN_NOT_READY", "R plan is not APPLIED",
-                           "application_status", "APPLIED", _get(state, "application_status"))
-    if str(_get(C_report, "status", "")).upper() != "VERIFIED":
-        raise CodegenError("COMPLETION_NOT_VERIFIED", "C completion is not VERIFIED",
-                           "C", "VERIFIED", _get(C_report, "status"))
-    required = int(_get(C_report, "required", 0) or 0)
-    covered = int(_get(C_report, "covered", 0) or 0)
-    if required <= 0 or covered != required:
-        raise CodegenError("COMPLETION_NOT_VERIFIED", "C coverage is incomplete",
-                           "C", "required==covered>0", [required, covered])
-    if not tir or not plan or not env_ref:
-        raise CodegenError("X_SOURCE_IDENTITY_MISMATCH", "tir/plan/env identity missing",
-                           "request", "nonempty tir/plan/env", [tir, plan, env_ref])
+    run_ref = run_ref or {}
+    if mode == RESOLVED_PLAN_PRESERVING:
+        state = _get(plan, "state", {}) if plan is not None else {}
+        if str(_get(state, "application_status")) != "APPLIED":
+            raise CodegenError("X_PLAN_NOT_READY", "R plan is not APPLIED",
+                               "application_status", "APPLIED", _get(state, "application_status"))
+        if str(_get(C_report, "status", "")).upper() != "VERIFIED":
+            raise CodegenError("COMPLETION_NOT_VERIFIED", "C completion is not VERIFIED",
+                               "C", "VERIFIED", _get(C_report, "status"))
+        required = int(_get(C_report, "required", 0) or 0)
+        covered = int(_get(C_report, "covered", 0) or 0)
+        if required <= 0 or covered != required:
+            raise CodegenError("COMPLETION_NOT_VERIFIED", "C coverage is incomplete",
+                               "C", "required==covered>0", [required, covered])
+    else:
+        if run_ref.get("claim_plan") or run_ref.get("plan_ref"):
+            raise CodegenError("X_LOGICAL_PLAN_CLAIM_FORBIDDEN",
+                               "LOGICAL_TL_RECOMPILE cannot claim a resolved Plan",
+                               "mode", "logical TL recompile evidence only", run_ref)
+    if not tir or not env_ref:
+        raise CodegenError("X_SOURCE_IDENTITY_MISMATCH", "tir/env identity missing",
+                           "request", "nonempty tir/env", [tir, env_ref])
     source_map = source_map or {}
     if not source_map:
         raise CodegenError("X_SOURCE_COVERAGE_MISMATCH", "no TL source map supplied",
@@ -162,7 +169,6 @@ def validate_adapter_request(tir, plan, C_report, env_ref, mode, *, source_map=N
         abi = KernelABI(tuple(abi.get("args", ())), int(abi.get("output_index", -1)),
                         abi.get("eps_f32_bits"), abi.get("grid", {}))
     abi.validate()
-    run_ref = run_ref or {}
     identity = SourceIdentity(str(run_ref.get("source_kind", "TF_TYPED_TIR")),
                               str(run_ref.get("tir_digest", _digest(tir))),
                               dict(source_map), str(run_ref.get("adapter_version", "x0-x2")),
