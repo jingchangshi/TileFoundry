@@ -76,10 +76,26 @@ class LedgerEntry:
     path: str
 
 
+@dataclass(frozen=True)
+class EscapeEdge:
+    """A NON-memory cross-region value binding (ExecutionScope output -> outer binding)."""
+    edge_kind: str
+    field_path: str
+    scope_path: str
+    inner_root: str
+    inner_action_id: str
+    outer_root: str
+    outer_action_id: str
+    iteration_path: str
+    guard: tuple
+
+
 @dataclass
 class Ledger:
     function: str
     entries: list = field(default_factory=list)
+    escape_edges: list = field(default_factory=list)
+    scope_paths: list = field(default_factory=list)
 
     def by_id(self):
         return {entry.action_id: entry for entry in self.entries}
@@ -197,11 +213,12 @@ def _root_of(var, views: dict, defs: dict) -> tuple:
         return (str(key), "real")
 
 
-def extract_ledger(function) -> Ledger:
+def extract_ledger(function, *, escape_records=None) -> Ledger:
     """Walk the typed TIR and record every actual memory action with a stable id."""
     ledger = Ledger(function=str(getattr(function, "name", "function")))
     views: dict = {}  # view var name -> (root name, root kind, start exprs, alloc path)
     defs: dict = {}   # var name -> defining value (for root resolution)
+    scopes: list = []  # ExecutionScope paths in walk order
 
     def starts_of(var) -> tuple:
         name = getattr(var, "name", None)
@@ -232,6 +249,9 @@ def extract_ledger(function) -> Ledger:
             walk(stmt.body, path + (f"for:{name}",), loops + ((name, extent),), guards)
             return
         if isinstance(stmt, (MeshScope, ExecutionScope)):
+            scope_path = "/".join(path + (type(stmt).__name__,))
+            if isinstance(stmt, ExecutionScope):
+                scopes.append(scope_path)
             walk(stmt.body, path + (type(stmt).__name__,), loops, guards)
             return
         if isinstance(stmt, If):
@@ -315,6 +335,11 @@ def extract_ledger(function) -> Ledger:
             )
 
     walk(function.body, (), (), ())
+    ledger.scope_paths = _execution_scope_paths(function)
+    # OPT-IN: consume the Core escape site records (module.metadata['escape_records']). Without
+    # records the ledger keeps escape_edges empty; it never guesses by name/order/offset.
+    if escape_records is not None:
+        ledger.escape_edges = build_escape_edges(ledger, escape_records)
     return ledger
 
 
@@ -369,9 +394,118 @@ class NormalizedProblem:
     buffers: list
     dependencies: list
     alias: dict
+    escape_edges: list = field(default_factory=list)
 
     def as_dict(self):
         return asdict(self)
+
+
+
+
+def _derive_escape_edges(ledger: Ledger, scopes: list) -> list:
+    """Derive NON-memory cross-region value-binding edges from the typed TIR order.
+
+    For every ExecutionScope: its SMEM writes (in order) are the region output fields; the SMEM
+    reads of fresh outer views after the scope (in order, same byte footprint and offset structure)
+    are the outer bindings. The k-th inner field maps to the k-th outer consumer; counts must match.
+    No Var name and no offset value is used to guess the mapping.
+    """
+    edges = []
+    entries = ledger.entries
+    for scope in scopes:
+        inside = [entry for entry in entries if entry.path == scope or entry.path.startswith(scope + "/")]
+        inner = [entry for entry in inside if entry.mode == "write" and entry.space == "SMEM"]
+        if not inner:
+            continue  # no output value -> no edge (not an empty placeholder)
+        last_index = max(index for index, entry in enumerate(entries) if entry in inside)
+        inner_roots = {entry.root for entry in inner}
+        outer = [
+            entry for entry in entries[last_index + 1:]
+            if entry.space == "SMEM" and entry.root not in inner_roots
+        ]
+        if len(outer) != len(inner):
+            raise LedgerError(
+                f"ESCAPE_FIELD_COVERAGE: scope {scope} has {len(inner)} output field(s) but {len(outer)} outer binding(s)"
+            )
+        for field_index, (inner_entry, outer_entry) in enumerate(zip(inner, outer)):
+            edges.append(
+                EscapeEdge(
+                    edge_kind="ESCAPE_VALUE_BINDING",
+                    field_path=f"out[{field_index}]",
+                    scope_path=scope,
+                    inner_root=inner_entry.root,
+                    inner_action_id=inner_entry.action_id,
+                    outer_root=outer_entry.root,
+                    outer_action_id=outer_entry.action_id,
+                    iteration_path=inner_entry.iteration_path,
+                    guard=inner_entry.guard,
+                )
+            )
+    return edges
+
+
+
+
+def _execution_scope_paths(function) -> list:
+    """TIR ExecutionScope paths in walk order (matches Core escape_records ordinals)."""
+    paths = []
+    def walk(stmt, path):
+        if isinstance(stmt, Sequential):
+            for index, child in enumerate(stmt.body):
+                walk(child, path + (f"s{index}",))
+            return
+        if isinstance(stmt, For):
+            walk(stmt.body, path + (f"for:{getattr(stmt.induction_var, 'name', 'i')}",))
+            return
+        if isinstance(stmt, MeshScope):
+            walk(stmt.body, path + ("MeshScope",))
+            return
+        if isinstance(stmt, ExecutionScope):
+            paths.append("/".join(path + ("ExecutionScope",)))
+            walk(stmt.body, path + ("ExecutionScope",))
+            return
+        if isinstance(stmt, If):
+            walk(stmt.then_body, path + ("then",))
+            walk(stmt.else_body, path + ("else",))
+            return
+    walk(function.body, ())
+    return paths
+
+
+def build_escape_edges(ledger: Ledger, records: list) -> list:
+    """Ledger edges from the Core escape site records (opt-in; non-memory, not alias)."""
+    scope_paths = list(ledger.scope_paths)
+    edges = []
+    for record in records:
+        index = record.get("scope_ordinal")
+        if index is None:
+            scope_path = str(record.get("scope_path", ""))
+            try:
+                index = int(scope_path.split("[")[1].split("]")[0])
+            except (IndexError, ValueError):
+                continue
+        if index >= len(scope_paths):
+            continue
+        scope = scope_paths[index]
+        inside = [e for e in ledger.entries if e.path == scope or e.path.startswith(scope + "/")]
+        inner = [e for e in inside if e.mode == "write" and e.space == "SMEM"]
+        fields = record.get("fields", [])
+        if len(inner) != len(fields):
+            continue
+        last = max((i for i, e in enumerate(ledger.entries) if e in inside), default=-1)
+        inner_roots = {e.root for e in inner}
+        outer = [e for e in ledger.entries[last + 1:] if e.space == "SMEM" and e.mode == "read" and e.root not in inner_roots]
+        if len(outer) < len(fields):
+            continue
+        for field, inner_entry, outer_entry in zip(fields, inner, outer):
+            digest = hashlib.sha256("|".join((scope, field.get("field_path", ""), inner_entry.root, outer_entry.root)).encode()).hexdigest()[:16]
+            edges.append(EscapeEdge(
+                edge_kind="ESCAPE_VALUE_BINDING", field_path=field.get("field_path", ""),
+                scope_path=scope, inner_root=inner_entry.root, inner_action_id=inner_entry.action_id,
+                outer_root=outer_entry.root, outer_action_id=outer_entry.action_id,
+                iteration_path=inner_entry.iteration_path, guard=inner_entry.guard,
+            ))
+    return edges
 
 
 def build_problem(ledger: Ledger) -> NormalizedProblem:
@@ -500,6 +634,7 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
         buffers=buffers,
         dependencies=dependencies,
         alias={},
+        escape_edges=list(ledger.escape_edges),
     )
     problem_digest_payload = problem.as_dict()
     problem_digest_payload.pop('problem_digest', None)
@@ -533,6 +668,57 @@ def validate_roots(problem: NormalizedProblem) -> None:
     for access in problem.accesses:
         if (access.root, access.space) not in roots:
             raise LedgerError(f'UNKNOWN_ROOT: access root {access.root!r} in {access.space} has no BufferDecl')
+
+
+
+
+def validate_escape_edges(ledger: Ledger) -> dict:
+    """Each scope output field has exactly one ESCAPE_VALUE_BINDING edge; fake edges are refused."""
+    edges = list(ledger.escape_edges)
+    if any(edge.edge_kind != "ESCAPE_VALUE_BINDING" for edge in edges):
+        raise LedgerError("ESCAPE_EDGE_KIND: only ESCAPE_VALUE_BINDING is allowed")
+    by_scope = {}
+    for edge in edges:
+        by_scope.setdefault(edge.scope_path, []).append(edge)
+    fields = {}
+    for edge in edges:
+        key = (edge.scope_path, edge.field_path)
+        if key in fields:
+            raise LedgerError(f"ESCAPE_FIELD_DUPLICATE: {key}")
+        fields[key] = edge
+    # re-derive the expected edges and require an exact match (a fake/wrong-region edge fails)
+    expected = _derive_escape_edges(ledger, sorted(by_scope))
+    expected_keys = {(edge.scope_path, edge.field_path, edge.inner_root, edge.outer_root) for edge in expected}
+    actual_keys = {(edge.scope_path, edge.field_path, edge.inner_root, edge.outer_root) for edge in edges}
+    if expected_keys != actual_keys:
+        raise LedgerError(f"ESCAPE_EDGE_MISMATCH: expected {len(expected_keys)} edges, got {len(actual_keys)}")
+    return {"edges": len(edges), "scopes": len(by_scope), "complete": True}
+
+
+
+
+def validate_escape_audit(records: list, duplicates: list) -> dict:
+    """Audit the escape records: dropped real edges and duplicate different fields are refused."""
+    for record in records:
+        for dropped in record.get("dropped_fields", []):
+            if dropped.get("had_outer_binding"):
+                raise LedgerError(f"ESCAPE_DROPPED_REAL_EDGE: {dropped.get('declaration_ordinal')}")
+    group_fields = {}
+    for record in records:
+        for field in record.get("fields", []):
+            group = field.get("ssa_group")
+            group_fields[group] = group_fields.get(group, 0) + 1
+        for dropped in record.get("dropped_fields", []):
+            group = dropped.get("ssa_group")
+            group_fields[group] = group_fields.get(group, 0) + 1
+    for group, count in group_fields.items():
+        if count > 1:
+            raise LedgerError(f"ESCAPE_DUPLICATE_DIFFERENT_FIELD: group {group} has {count} fields")
+    seen = {event.get("ssa_group") for event in duplicates}
+    orphans = sorted(group for group in seen if group_fields.get(group, 0) == 0)
+    if orphans:
+        raise LedgerError(f"ESCAPE_DUPLICATE_ORPHAN: {orphans[:3]}")
+    return {"records": len(records), "duplicates": len(duplicates), "groups": len(group_fields)}
 
 
 def require_concrete_offset(problem: NormalizedProblem) -> None:

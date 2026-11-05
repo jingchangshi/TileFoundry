@@ -146,6 +146,7 @@ class View:
     type: TensorType
     stem: str = "tile"
     whole_tensor: bool = False
+    ssa: int | None = None  # in-run HIR SSA identity for escape pairing (never serialized)
 
 
 @dataclass
@@ -305,9 +306,12 @@ class TirBuilder:
                 )
                 view = View(scratch, (i64_const(0),), (elements,), storage_type, stem)
                 return view
-            fields = tuple(ctx.storage.view(offset, None, storage_type) for offset in offsets)
+            fields = tuple(
+                ctx.storage.view(offset, None, storage_type, ssa=id(expr), source="declare") for offset in offsets
+            )
             if len(fields) == 1:
-                view = View(fields[0].args[0], (), tuple(storage_type.shape), storage_type, stem)
+                view = View(fields[0].args[0], (), tuple(storage_type.shape), storage_type, stem,
+                            ssa=id(expr))
                 return view
             stages = Var(
                 ctx.names.fresh(f"{stem}_stages"),
@@ -380,6 +384,8 @@ class TirBuilder:
                 else ctx.names.fresh(value.stem)
             )
             result = self.bind(Var(stem, type=expression.type), expression)
+            if getattr(value, "ssa", None) is not None:
+                ctx.var_ssa[id(result)] = value.ssa
             scope.views[id(value)] = (value, result)
         return scope.views[id(value)][1]
 
@@ -500,6 +506,11 @@ class StoragePlan:
     function: Function
     context: ValuationContext | None = None
     mesh: Mesh | None = None
+    lowering: object | None = None
+    debug_views: dict = field(default_factory=dict)
+
+    def _debug_view(self, key: str) -> None:
+        self.debug_views[key] = self.debug_views.get(key, 0) + 1
 
     @cached_property
     def regions(self):
@@ -828,11 +839,13 @@ class StoragePlan:
 
     def hir_view(self, call, operands, values):
         """Keep the view authored by this HIR operation, including identity views."""
+        self._debug_view("hir_view")
         region = self.regions[id(call)]
         alias = buffer_alias(call, region, relations_of(call, region))
         if alias is None:
             raise LoweringError(self.answers[SSAValue(call)].refusal)
-        return self.view(operands[aliased_operand(call)], alias.relation, call.type, values=values)
+        viewed = self.view(operands[aliased_operand(call)], alias.relation, call.type, values=values, ssa=id(call), source="hir_view")
+        return replace(viewed, ssa=id(call)) if isinstance(viewed, View) else viewed
 
     def source(self, leaf, memo):
         """Read a storage binding; HIR evaluation remains exclusively in Visit."""
@@ -861,6 +874,7 @@ class StoragePlan:
         sizes=None,
         stem="tile",
         whole_tensor=False,
+        ssa=None,
     ):
         """Choose an existing operand or the window required at its use."""
         held = value.type
@@ -889,13 +903,13 @@ class StoragePlan:
             ):
                 return value
             starts, sizes = tuple(i64_const(0) for _ in held.shape), tuple(held.shape)
-        return View(value, starts, sizes, desired, stem, whole_tensor)
+        return View(value, starts, sizes, desired, stem, whole_tensor, ssa=ssa)
 
     def materialization(self, view, base, loops):
         """Describe one physical TIR view without adding any statements."""
         desired = view.type
         if isinstance(base, Constant) and isinstance(base.type, PointerType):
-            return self.view(base.value, None, desired)
+            return self.view(base.value, None, desired, ssa=view.ssa, source="materialization")
         held = base.type
         if len(view.starts) != len(held.shape):
             raise LoweringError(
@@ -949,8 +963,12 @@ class StoragePlan:
             layout = replace(type_.layout, layout=layout)
         return starts, replace(desired, layout=layout, storage=target.type.storage)
 
-    def view(self, target, address, desired, *, values=None):
+    def view(self, target, address, desired, *, values=None, ssa=None, source="unknown"):
         """Derive an exact physical view; a proved composition carries its origin."""
+        is_fresh = isinstance(target, int)
+        self._debug_view("fresh_view" if is_fresh else "derived_view")
+        if is_fresh and ssa is not None and desired.storage is StorageKind.SMEM and self.lowering is not None:
+            self.lowering._note_escape_declare(ssa, desired, source)
         if isinstance(target, int):
             pointer = Constant(target, type=PointerType(desired.dtype, desired.storage))
             return Call(
@@ -1201,6 +1219,91 @@ class LoweringContext(TypeInferContext):
     parameters: dict = field(default_factory=dict)
     authored_values: dict = field(default_factory=dict)
     executions: list = field(default_factory=list)
+    escape_records: list = field(default_factory=list)
+    execution_records: list = field(default_factory=list)
+    escape_by_ssa: dict = field(default_factory=dict)
+    escape_seen: set = field(default_factory=set)
+    duplicate_declares: int = 0
+    var_ssa: dict = field(default_factory=dict)
+    consume_counter: int = 0
+    unresolved_alias_chains: int = 0
+    escape_duplicates: list = field(default_factory=list)
+    escape_ssa_ref: dict = field(default_factory=dict)
+    declare_counter: int = 0
+
+
+    def _alias_base(self, expr):
+        """Follow the real storage alias chain to the declared buffer SSA (None if unresolved)."""
+        current = expr
+        seen = set()
+        while True:
+            key = id(current)
+            if key in seen:
+                return None
+            seen.add(key)
+            answer = self.storage.answers.get(SSAValue(current, 0))
+            if answer is None:
+                return current
+            partner = answer.partner
+            if isinstance(partner, SSAValue):
+                current = partner.expr
+                continue
+            return current
+
+    def _note_escape_consume(self, expr, type_):
+        """Path B: consumer HIR SSA -> alias chain -> base buffer SSA -> bind the producer field."""
+        base = self._alias_base(expr)
+        if base is None or id(base) not in self.escape_by_ssa:
+            self.unresolved_alias_chains += 1
+            return
+        fields = self.escape_by_ssa[id(base)]
+        field = fields[-1]
+        if field.get("outer_declaration_ordinal") is not None or field.get("outer_consume_ordinal") is not None:
+            return
+        self.consume_counter += 1
+        field["outer_consume_ordinal"] = self.consume_counter
+        field["outer_type"] = str(type_)
+        field["outer_source"] = "consume_alias"
+
+    def _note_escape_declare(self, ssa, type_, source="unknown"):
+        """Single-point record from StoragePlan.view (fresh SMEM view) with an SSA key."""
+        if getattr(type_, "storage", None) is not StorageKind.SMEM:
+            return
+        level = len(self.execution_records)
+        key = (ssa, level)
+        group = self.escape_ssa_ref.setdefault(ssa, len(self.escape_ssa_ref))
+        if key in self.escape_seen:
+            # The same SSA at the same scope level must NOT create a second record. Repeats are
+            # counted as ESCAPE_DUPLICATE_DECLARE for audit; the first record wins.
+            self.duplicate_declares += 1
+            self.escape_duplicates.append({"ssa_group": group, "layer": level,
+                                           "source": source, "event": len(self.escape_duplicates)})
+            return
+        self.escape_seen.add(key)
+        self.declare_counter += 1
+        ordinal = self.declare_counter
+        current_scope = self.execution_records[-1]["scope_path"] if self.execution_records else None
+        # Bind the SAME SSA declared in a DIFFERENT scope (sibling scope consumer) as the outer
+        # binding of the existing field; this is the weight-VF -> main-VF case.
+        for field in reversed(self.escape_by_ssa.get(ssa, [])):
+            if field["outer_declaration_ordinal"] is None and field.get("_scope") != current_scope:
+                field["outer_declaration_ordinal"] = ordinal
+                field["outer_type"] = str(type_)
+                return
+        if self.execution_records:
+            record = self.execution_records[-1]
+            field = {"field_path": f"out[{len(record['fields'])}]",
+                     "declaration_ordinal": ordinal, "inner_type": str(type_),
+                     "outer_declaration_ordinal": None, "outer_consume_ordinal": None,
+                     "outer_type": None, "_scope": current_scope, "_ssa_group": group}
+            record["fields"].append(field)
+            self.escape_by_ssa.setdefault(ssa, []).append(field)  # in-run pairing only
+            return
+        fields = self.escape_by_ssa.get(ssa)
+        if fields:
+            field = fields[-1]
+            field["outer_declaration_ordinal"] = ordinal
+            field["outer_type"] = str(type_)
 
     def value(self, leaf):
         result = self.memo[id(leaf.expr)][1]
@@ -1428,6 +1531,7 @@ class Lowering(ValuationVisitor[Expr | View]):
             issues=IssuePlan(),
         )
         ctx = self.context
+        ctx.storage.lowering = ctx
         ctx.memo = self._memo
         if ctx.function.body is not None and self.authored.body is not None:
             ctx.authored_values[id(ctx.function.body)] = self.authored.body
@@ -1480,6 +1584,8 @@ class Lowering(ValuationVisitor[Expr | View]):
             scope.result = result
         return result
 
+
+
     def visit_ExecutionRegion(self, region: ExecutionRegion, ctx):
         """Lower a mode region to a TIR ExecutionScope around its body.
 
@@ -1489,12 +1595,19 @@ class Lowering(ValuationVisitor[Expr | View]):
         produced IR rather than a promise about the body.
         """
         ctx.executions.append(region.kind)
+        record = {"scope_path": f"execution_scope[{len(ctx.escape_records)}]/{region.kind}",
+                  "kind": region.kind, "fields": []}
+        ctx.execution_records.append(record)
         try:
             with ctx.builder.region(execution=region.kind, owner=region) as scope:
                 result = self.visit(region.body, self.on_region_start(region, ctx))
                 scope.result = result
         finally:
+            ctx.execution_records.pop()
             ctx.executions.pop()
+            # Always recorded: 'fields=[]' (a scope with no SMEM output) is auditable and
+            # must not be confused with 'scope not recorded'.
+            ctx.escape_records.append(record)
         return result
 
     def visit_LoopRegion(self, loop: LoopRegion, ctx) -> Expr:
@@ -1629,7 +1742,7 @@ class Lowering(ValuationVisitor[Expr | View]):
         for value, param in zip((*args, *scratch, destination), params, strict=True):
             passed.append(
                 ctx.builder.value(
-                    ctx.storage.operand(value, param.type, whole_tensor=True, stem="argument"),
+                    ctx.storage.operand(value, param.type, whole_tensor=True, stem="argument", ssa=ctx.var_ssa.get(id(value))),
                     ctx=ctx,
                 )
                 if isinstance(param.type, TensorType)
@@ -1692,11 +1805,13 @@ class Lowering(ValuationVisitor[Expr | View]):
         supplied = params if isinstance(call.target, ScheduleOp) else reads
         for index, (param, operand) in enumerate(zip(supplied, call.args, strict=True)):
             value = written if operand is destination_operand else operands[index]
+            if operand is not destination_operand and isinstance(getattr(value, "type", None), TensorType):
+                ctx._note_escape_consume(operand, value.type)
             if (
                 not isinstance(call.target, ScheduleOp)
                 and operand.type != types[params.index(param)]
             ):
-                value = ctx.storage.operand(value, types[params.index(param)], whole_tensor=True)
+                value = ctx.storage.operand(value, types[params.index(param)], whole_tensor=True, ssa=ctx.var_ssa.get(id(value)))
             if (
                 isinstance(value.type, TensorType)
                 and value.type.shape == ()
@@ -1745,7 +1860,7 @@ class Lowering(ValuationVisitor[Expr | View]):
                     desired = types[params.index(param)]
                     issued.append(
                         ctx.builder.value(
-                            ctx.storage.operand(value, desired, stem=f"{role}_view"), ctx=ctx
+                            ctx.storage.operand(value, desired, stem=f"{role}_view", ssa=ctx.var_ssa.get(id(value))), ctx=ctx
                         )
                     )
                 attributes = {
@@ -1772,7 +1887,7 @@ class Lowering(ValuationVisitor[Expr | View]):
         locals_ = []
         unit_coordinates = {}
         for (role, value), type_, rest in zip(issued_operands, types, plan.rests, strict=True):
-            base = ctx.builder.value(ctx.storage.operand(value, type_, whole_tensor=True), ctx=ctx)
+            base = ctx.builder.value(ctx.storage.operand(value, type_, whole_tensor=True, ssa=ctx.var_ssa.get(id(value))), ctx=ctx)
             binding_mesh = rest.mesh if isinstance(rest, ShardLayout) else frame
             _frame, dropped = _participant_frame(binding_mesh, required)
             source = shard_layout_of(base.type.layout)
@@ -1913,6 +2028,32 @@ class ConvertHIRToTIR(ModulePass):
             lowered,
         )
         lowering.lowered = lowering.run()
+        records = lowering.context.escape_records
+        # Only fields bound to an outer view are ESCAPE records; an SMEM allocation with no outer
+        # binding is a non-escape temporary and is counted, not recorded as an escape field.
+        for record in records:
+            kept = []
+            dropped_fields = []
+            for field in record["fields"]:
+                if field["outer_declaration_ordinal"] is None and field.get("outer_consume_ordinal") is None:
+                    dropped_fields.append({"scope_path": record["scope_path"],
+                                           "declaration_ordinal": field["declaration_ordinal"],
+                                           "ssa_group": field.get("_ssa_group"),
+                                           "inner_type": field["inner_type"],
+                                           "had_outer_binding": False})
+                else:
+                    field["field_path"] = f"out[{len(kept)}]"
+                    field["ssa_group"] = field.pop("_ssa_group", None)
+                    field.pop("_scope", None)
+                    kept.append(field)
+            record["fields"] = kept
+            record["dropped_fields"] = dropped_fields
+            record["dropped_non_escape"] = len(dropped_fields)
+        result.module.metadata["escape_records"] = records
+        result.module.metadata["duplicate_declares"] = lowering.context.duplicate_declares
+        result.module.metadata["escape_duplicates"] = lowering.context.escape_duplicates
+        result.module.metadata["unresolved_alias_chains"] = lowering.context.unresolved_alias_chains
+        result.module.metadata["view_debug"] = dict(lowering.context.storage.debug_views)
         lowered[id(result.function)] = lowering
         modules = set()
 
