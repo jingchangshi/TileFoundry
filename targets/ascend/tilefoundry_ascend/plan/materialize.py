@@ -144,8 +144,11 @@ def _view(access, plan, env):
     relative = int(access.relative_byte_offset.evaluate(env))
     start = int(buffer.base_offset_bytes) + slot * int(buffer.version_stride_bytes) + relative
     shape = tuple(buffer.shape)
+    from tilefoundry.ir.types import DType  # noqa: PLC0415
+
     storage = StorageKind.SMEM if buffer.space in ("ascend.ub", "smem", "ub") else StorageKind.GMEM
-    tensor_type = make_tensor_type(shape, dtype=buffer.dtype, storage=storage)
+    dtype = getattr(DType, str(buffer.dtype), buffer.dtype)
+    tensor_type = make_tensor_type(shape, dtype=dtype, storage=storage)
     pointer_type = PointerType(tensor_type.dtype, tensor_type.storage)
     address = Constant(type=pointer_type, value=start)
     return Call(type=tensor_type,
@@ -357,7 +360,7 @@ def _combined_index(module) -> dict:
 
 
 def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_module,
-                            materialization: MaterializationMap) -> dict:
+                            materialization: MaterializationMap, *, require_drain=True) -> dict:
     """Independent walk of the REWRITTEN TIR: real change + full coverage + map fidelity."""
     report = {"status": "FAIL", "code": None, "applied_accesses": 0,
               "expected_applications": 0, "allocations_applied": 0,
@@ -370,12 +373,13 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
             or materialization.rewritten_digest == materialization.original_digest):
         report["code"] = "PLAN_NOT_APPLIED"
         return report
-    actual_has_drain = any(
-        isinstance(stmt, Evaluate) and isinstance(stmt.callable, Drain)
-        for stmt in rewritten_index.values())
-    if not actual_has_drain:
-        report["code"] = "PLAN_DRAIN_MISSING"
-        return report
+    if require_drain:
+        actual_has_drain = any(
+            isinstance(stmt, Evaluate) and isinstance(stmt.callable, Drain)
+            for stmt in rewritten_index.values())
+        if not actual_has_drain:
+            report["code"] = "PLAN_DRAIN_MISSING"
+            return report
     writes = [a for a in plan.accesses if a.mode == "write"]
     trip = loop_trip_count(plan.loop)
     report["expected_applications"] = len(writes) * trip
@@ -602,4 +606,141 @@ def materialize_instruction_plan(tir_module, plan: ResolvedPlan, *, sidecar_only
         controls=tuple({"k": k, "kind": "guard"} for k in range(trip)),
         original_digest=original_digest, rewritten_digest=tir_digest(rewritten))
     return rewritten, materialization
+
+
+
+
+def verify_typed_tir(module) -> dict:
+    """Explicit typed structural check of a rewritten TIR; refuse by name on failure."""
+    from tilefoundry.visitor_registry.verify import verify_prim_function
+    try:
+        verify_prim_function(module, module_fns={})
+    except Exception as error:  # noqa: BLE001
+        raise PlanError("PLAN_TYPED_VERIFY_FAILED", str(error)[:240],
+                        "rewritten_tir", "valid typed PrimFunction", type(error).__name__)
+    return {"valid": True}
+
+
+def _rw_subst_expr(expr, mapping):
+    from tilefoundry.ir.core import Var, Call
+    if isinstance(expr, Var):
+        return mapping.get(expr.name, expr)
+    if isinstance(expr, Call):
+        return dataclasses.replace(expr, args=tuple(_rw_subst_expr(a, mapping) for a in expr.args))
+    return expr
+
+
+def _rw_rewrite_body(node, path, groups, statements, plan, env, rename=None, fps=None):
+    """One unrolled loop-body copy: KEEP every LetStmt binding, give each copy fresh Vars and
+    substitute uses inside that copy. Only grouped Evaluate operands are replaced by new views."""
+    from tilefoundry.ir.tir.stmts import ExecutionScope, MeshScope, While
+    from tilefoundry.ir.core import Var
+
+    rename = {} if rename is None else rename
+    if isinstance(node, Sequential):
+        local = dict(rename)
+        out = []
+        for index, child in enumerate(node.body):
+            key = "/".join(path + ("s%d" % index,))
+            if key in groups:
+                stmt = _rebuild_eval(statements[key], groups[key], plan, env)
+                stmt = dataclasses.replace(stmt, args=tuple(_rw_subst_expr(a, local) for a in stmt.args))
+                if fps is not None:
+                    fps[key] = fingerprint(stmt)
+                out.append(stmt)
+            elif isinstance(child, LetStmt):
+                fresh = Var(name="%s__k%d" % (child.var.name, env["k"]), type=child.var.type)
+                out.append(LetStmt(var=fresh, value=_rw_subst_expr(child.value, local)))
+                local[child.var.name] = fresh
+            elif isinstance(child, Evaluate):
+                out.append(dataclasses.replace(child, args=tuple(_rw_subst_expr(a, local) for a in child.args)))
+            else:
+                out.append(_rw_rewrite_body(child, path + ("s%d" % index,), groups, statements, plan, env, local, fps))
+        return Sequential(body=tuple(out))
+    if isinstance(node, (MeshScope, ExecutionScope)):
+        return dataclasses.replace(node, body=_rw_rewrite_body(node.body, path + (type(node).__name__,), groups, statements, plan, env, dict(rename), fps))
+    if isinstance(node, If):
+        return dataclasses.replace(node, then_body=_rw_rewrite_body(node.then_body, path + ("then",), groups, statements, plan, env, dict(rename), fps),
+                                   else_body=_rw_rewrite_body(node.else_body, path + ("else",), groups, statements, plan, env, dict(rename), fps))
+    if isinstance(node, While):
+        return dataclasses.replace(node, body=_rw_rewrite_body(node.body, path + ("while",), groups, statements, plan, env, dict(rename), fps))
+    return node
+
+
+def _rw_replace_loop(node, loop_stmt, blocks):
+    from tilefoundry.ir.tir.stmts import ExecutionScope, MeshScope, While
+    if node is loop_stmt:
+        # Keep the For induction binding/scope; the body holds the static k copies. Executing
+        # the outer For exactly once keeps the unrolled semantics finite and typed-legal.
+        one = Constant(type=loop_stmt.stop.type, value=1)
+        return dataclasses.replace(node, stop=one, body=Sequential(body=tuple(blocks)))
+    if isinstance(node, Sequential):
+        return Sequential(body=tuple(_rw_replace_loop(c, loop_stmt, blocks) for c in node.body))
+    if isinstance(node, (MeshScope, ExecutionScope)):
+        return dataclasses.replace(node, body=_rw_replace_loop(node.body, loop_stmt, blocks))
+    if isinstance(node, If):
+        return dataclasses.replace(node, then_body=_rw_replace_loop(node.then_body, loop_stmt, blocks),
+                                   else_body=_rw_replace_loop(node.else_body, loop_stmt, blocks))
+    if isinstance(node, While):
+        return dataclasses.replace(node, body=_rw_replace_loop(node.body, loop_stmt, blocks))
+    return node
+
+
+def materialize_instruction_plan_v2(tir_module, plan: ResolvedPlan, *, sidecar_only=False):
+    """Scope-preserving instruction-TIR materializer (task-86)."""
+    statements = index_statements_ledger(tir_module)
+    groups = {}
+    for access in plan.accesses:
+        groups.setdefault(access.source_stmt, []).append(access)
+    for path in groups:
+        stmt = statements.get(path)
+        if not isinstance(stmt, Evaluate):
+            raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED", "source_stmt is not an Evaluate",
+                            path, "Evaluate", type(stmt).__name__)
+        kind = type(stmt.callable).__name__
+        if kind not in SUPPORTED_INSTRUCTION_OPS:
+            raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED_OP", "unsupported instruction op",
+                            path, SUPPORTED_INSTRUCTION_OPS, kind)
+    loop_stmt = next((s for s in statements.values() if isinstance(s, For)), None)
+    if loop_stmt is None:
+        raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED", "no loop to materialize", "tir", "For", None)
+    start = _static_int(loop_stmt.start); stop = _static_int(loop_stmt.stop); step = _static_int(loop_stmt.step)
+    if None in (start, stop, step):
+        raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED", "dynamic loop is R4", "loop", "static ints", None)
+    trip = loop_trip_count(plan.loop)
+    loop_path = next((p for p, s in statements.items() if s is loop_stmt), None)
+    prefix = tuple(loop_path.split("/")) + ("for:" + str(getattr(loop_stmt.induction_var, "name", "i")),)
+    blocks, map_entries = [], []
+    for k in range(trip):
+        iteration = start + k * step
+        env = {"i": iteration, "k": k, "slot": 0}
+        fps = {}
+        blocks.append(_rw_rewrite_body(loop_stmt.body, prefix, groups, statements, plan, env, None, fps))
+        for path, accesses in groups.items():
+            original = statements[path]
+            for access in accesses:
+                map_entries.append({
+                    "access_id": access.access_id, "action_id": access.action_id,
+                    "task_id": access.task_id, "mode": access.mode, "k": k, "loop_k": k,
+                    "generation": int(access.execution_ordinal.evaluate({"i": iteration, "k": k})),
+                    "old_stmt": path, "old_fingerprint": fingerprint(original),
+                    "new_fingerprint": fps.get(path, fingerprint(_rebuild_eval(original, accesses, plan, env))),
+                    "new_stmt": "unrolled:k%d:%s" % (k, access.access_id),
+                })
+    new_body = _rw_replace_loop(tir_module.body, loop_stmt, blocks)
+    original_digest = tir_digest(tir_module)
+    if sidecar_only:
+        return tir_module, MaterializationMap(entries=tuple(map_entries), allocs=(), controls=(),
+                                              original_digest=original_digest, rewritten_digest=original_digest)
+    rewritten = PrimFunction(name=tir_module.name, params=tir_module.params, body=new_body,
+                             output_count=tir_module.output_count, target=tir_module.target)
+    verify_typed_tir(rewritten)
+    materialization = MaterializationMap(
+        entries=tuple(map_entries), allocs=(),
+        controls=tuple({"k": k, "kind": "guard"} for k in range(trip)),
+        original_digest=original_digest, rewritten_digest=tir_digest(rewritten))
+    return rewritten, materialization
+
+
+materialize_instruction_plan = materialize_instruction_plan_v2
 

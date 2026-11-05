@@ -39,6 +39,73 @@ def _l():
     return sources, tir, problem, expansion, expected, build_s_problem_document(problem)
 
 
+def _remove_first_stmt(node, predicate):
+    """Return a cloned TIR with the first matching statement removed (real-node mutation)."""
+    import dataclasses
+    from tilefoundry.ir.tir.stmts import ExecutionScope, For, If, MeshScope, Sequential
+    if predicate(node):
+        return None, True
+    if isinstance(node, Sequential):
+        body = []
+        removed = False
+        for child in node.body:
+            if removed:
+                body.append(child)
+                continue
+            new_child, hit = _remove_first_stmt(child, predicate)
+            if hit:
+                removed = True
+                if new_child is not None:
+                    body.append(new_child)
+                continue
+            body.append(new_child if new_child is not None else child)
+        return dataclasses.replace(node, body=tuple(body)), removed
+    if isinstance(node, (MeshScope, ExecutionScope, For)):
+        new_body, removed = _remove_first_stmt(node.body, predicate)
+        return dataclasses.replace(node, body=new_body), removed
+    if isinstance(node, If):
+        then_body, removed = _remove_first_stmt(node.then_body, predicate)
+        if removed:
+            return dataclasses.replace(node, then_body=then_body), True
+        else_body, removed = _remove_first_stmt(node.else_body, predicate)
+        return dataclasses.replace(node, else_body=else_body), removed
+    return node, False
+
+
+def _drain_into_if_false(fn):
+    """Move the real Drain into an unreachable If(False) branch."""
+    import dataclasses
+    from tilefoundry.ir.core import Constant
+    from tilefoundry.ir.tir.flag import Drain
+    from tilefoundry.ir.tir.stmts import Evaluate, If, Sequential
+    from tilefoundry.ir.types import make_tensor_type
+    drain_callable = None
+    from tilefoundry_ascend.sync import _actual_nodes
+    for _path, node in _actual_nodes(fn)["drain"]:
+        drain_callable = node
+        break
+    if drain_callable is None:
+        raise AssertionError("no real Drain to mutate")
+    predicate = lambda node: isinstance(node, Evaluate) and isinstance(node.callable, Drain)
+    stripped_body = fn.body
+    while True:
+        stripped_body, removed = _remove_first_stmt(stripped_body, predicate)
+        if not removed:
+            break
+    cond = Constant(type=make_tensor_type((), dtype="bool", storage="umat"), value=False)
+    unreachable = If(cond=cond,
+                     then_body=Sequential(body=(Evaluate(callable=drain_callable, args=()),)),
+                     else_body=Sequential(body=()))
+    return dataclasses.replace(fn, body=Sequential(body=tuple(stripped_body.body) + (unreachable,)))
+
+
+def _mutate_first_wait(fn, attribute, value):
+    from tilefoundry_ascend.sync import _actual_nodes
+    wait = _actual_nodes(fn)["wait"][0][1]
+    setattr(wait, attribute, value)
+    return fn
+
+
 def test_vertical_run():
     from tilefoundry_ascend.solver.g10 import classify_poc_result, consume_poc_expected
     from tilefoundry_ascend.solver import bridge as B
@@ -105,7 +172,12 @@ def test_vertical_run():
                 plan = RP.resolve_buffer_layout(plan, facts)
                 run["steps"]["R"] = {"status": "PLAN_LAYOUT_RESOLVED", "kind": "real(adapter view)"}
                 rewritten, matmap = MAT.materialize_plan(tir, plan)
-                report = MAT.verify_plan_application(tir, plan, rewritten, matmap)
+                from tilefoundry.visitor_registry.verify import verify_prim_function
+                # Typed validity of R's own rewritten TIR is an independent assertion.
+                # If this fails, the failure belongs to R materialize, not C injection.
+                assert verify_prim_function(rewritten) is None, "R_REWRITTEN_TYPED_INVALID"
+                run["controls"]["r_rewritten_typed"] = "PASS"
+                report = MAT.verify_plan_application(tir, plan, rewritten, matmap, require_drain=False)
                 run["steps"]["R"] = {"status": "MATERIALIZED", "digest_before": matmap.original_digest,
                                      "digest_after": matmap.rewritten_digest,
                                      "verify": report.get("status"), "verify_code": report.get("code"),
@@ -130,8 +202,8 @@ def test_vertical_run():
                         injected, placement = SY.inject_completion_anchored(
                             rewritten, None, actionable, allocation, channels=channels, ledger=ledger,
                             materialization=matmap)
-                        from tilefoundry.visitor_registry.verify import verify_prim_function
-                        verify_prim_function(injected)
+                        assert verify_prim_function(injected) is None, "C_INJECTED_TYPED_INVALID"
+                        run["controls"]["c_injected_typed"] = "PASS"
                         coverage = SY.verify_completion_coverage_from_ledger(
                             ledger, expansion, problem=problem, actual_tir=injected,
                             placement_map=placement, capabilities=caps, expected=expected)
@@ -150,6 +222,59 @@ def test_vertical_run():
                                              "edge_table": list(getattr(coverage, "edge_table", ())),
                                              "digest_C_injected": MAT.tir_digest(injected),
                                              "kind": "real(FULL denominator, anchored reuse, structural SSA/FINAL)"}
+                        def fresh_injected():
+                            return SY.inject_completion_anchored(
+                                rewritten, None, actionable, allocation, channels=channels,
+                                ledger=ledger, materialization=matmap)
+
+                        def first_wait(fn):
+                            return SY._actual_nodes(fn)["wait"][0][1]
+
+                        def mut_flag_id(fn):
+                            wait = first_wait(fn)
+                            wait.flag_id = int(wait.flag_id) + 100
+                            return fn
+
+                        def mut_epoch(fn):
+                            wait = first_wait(fn)
+                            wait.generation = int(wait.generation) + 100
+                            return fn
+
+                        def mut_flag(fn):
+                            wait = first_wait(fn)
+                            wait.channel_name = "FORGED_CHANNEL"
+                            return fn
+
+                        def mut_missing_wait(fn):
+                            from tilefoundry.ir.tir.flag import FlagWait
+                            from tilefoundry.ir.tir.stmts import Evaluate
+                            mutant, removed = _remove_first_stmt(
+                                fn, lambda node: isinstance(node, Evaluate)
+                                and isinstance(node.callable, FlagWait))
+                            assert removed, "real Wait node was not removed"
+                            return mutant
+
+                        mutation_controls = {}
+                        for name, mutator in (
+                            ("flag_id_plus_100", mut_flag_id),
+                            ("drain_in_if_false", _drain_into_if_false),
+                            ("wrong_epoch", mut_epoch),
+                            ("wrong_flag", mut_flag),
+                            ("missing_wait", mut_missing_wait),
+                        ):
+                            mutant, mutant_placement = fresh_injected()
+                            mutant = mutator(mutant)
+                            mutant_report = SY.verify_completion_coverage_from_ledger(
+                                ledger, expansion, problem=problem, actual_tir=mutant,
+                                placement_map=mutant_placement, capabilities=caps, expected=expected)
+                            mutation_controls[name] = {
+                                "status": mutant_report.status,
+                                "code": mutant_report.code,
+                                "covered": mutant_report.covered,
+                            }
+                            assert mutant_report.status != "VERIFIED", (
+                                name, mutant_report.as_dict())
+                        run["steps"]["C"]["mutation_controls"] = mutation_controls
 
                     except Exception as error:  # noqa: BLE001
                         import traceback as _tb
@@ -243,6 +368,15 @@ def test_vertical_run():
     run["physical_feasibility"] = "UNPROVEN"
     run["device_ready_blocked_by"] = "SOLVER_POSTCHECK_NOT_IMPLEMENTED"
     run["device_ready"] = False  # S3 source postcheck not implemented -> never device-ready
+    if run["controls"].get("r_rewritten_typed") != "PASS":
+        run["steps"]["C"] = {"status": "NOT_VERIFIED", "code": "R_REWRITTEN_TYPED_INVALID",
+                             "detail": "R materialize output failed verify_prim_function",
+                             "kind": "blocked_by_R"}
+    elif (run["controls"].get("c_injected_typed") != "PASS"
+          and run["steps"].get("C", {}).get("status") != "NOT_VERIFIED"):
+        run["steps"]["C"] = {"status": "NOT_VERIFIED", "code": "C_INJECTED_TYPED_INVALID",
+                             "detail": "C injected actual TIR failed verify_prim_function",
+                             "kind": "blocked_by_C"}
     print(json.dumps(run, indent=1, default=str)[:6000])
     assert run["steps"]["L"]["obligations"] == 47
     assert run["steps"]["S"]["sat_scope"] == "NOMINAL_MODEL_ONLY"
@@ -257,6 +391,13 @@ def test_vertical_run():
     _out.parent.mkdir(parents=True, exist_ok=True)
     _out.write_text(json.dumps(run, indent=1, default=str))
     print("WROTE", _out)
+    # These two typed assertions pin the attribution: R must emit a typed-valid
+    # TIR and C injection must keep it typed-valid. A failure here is never hidden
+    # behind a C NOT_VERIFIED report or a PASS from R's own address verifier.
+    assert run["controls"].get("r_rewritten_typed") == "PASS", (
+        "R_REWRITTEN_TYPED_INVALID: R materialize output failed verify_prim_function")
+    assert run["controls"].get("c_injected_typed") == "PASS", (
+        "C_INJECTED_TYPED_INVALID: C injected actual TIR failed verify_prim_function")
 
 
 def main() -> int:
