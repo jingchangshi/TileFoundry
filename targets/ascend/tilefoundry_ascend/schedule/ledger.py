@@ -922,6 +922,86 @@ def compute_problem_digest(problem: "NormalizedProblem") -> str:
     return hashlib.sha256(canonical_problem_json(problem).encode()).hexdigest()[:16]
 
 
+def _access_window(access):
+    """(start, end) relative BYTES of an access, or None when the offset is UNKNOWN."""
+    if getattr(access, "byte_offset", None) is None:
+        return None
+    start = int(access.byte_offset)
+    return (start, start + int(access.byte_footprint))
+
+
+def _windows_intersect(left, right) -> bool:
+    (a0, a1), (b0, b1) = left, right
+    return a0 < b1 and b0 < a1
+
+
+def _access_domains(access):
+    return tuple(getattr(access, "iteration_domains", ()) or ())
+
+
+def _access_domain_key(access):
+    """The loop-domain identity of an access: nested loop domains + its logical iteration label.
+
+    Definition/labels come from the typed iteration metadata, never from statement order.
+    """
+    return (
+        tuple(getattr(access, "iteration_domains", ()) or ()),
+        str(getattr(access, "logical_iteration", "")),
+        str(getattr(access, "iteration_path", "")),
+    )
+
+
+def derive_dependencies(accesses) -> list:
+    """RAW/WAR/WAW/REUSE from typed WINDOW intersection and loop DOMAIN, not names/order.
+
+    Two accesses relate only when their relative byte windows INTERSECT and they resolve to
+    the SAME root (alias lineage already folded into 'root'). The dependency KIND comes from
+    the two access modes, never from statement order. When either window is UNKNOWN the pair
+    is recorded with status UNKNOWN -- never silently treated as independent and never
+    defaulted to offset 0. Every edge carries both windows, both domains, and the kind used.
+    """
+    dependencies = []
+    for left in range(len(accesses)):
+        for right in range(left + 1, len(accesses)):
+            a, b = accesses[left], accesses[right]
+            if a.root != b.root or a.space != b.space:
+                continue
+            if a.mode == "write" and b.mode == "read":
+                kind, producer, consumer = "RAW", a, b
+            elif a.mode == "read" and b.mode == "write":
+                kind, producer, consumer = "RAW", b, a
+            elif a.mode == "write" and b.mode == "write":
+                kind, producer, consumer = "WAW", a, b
+            elif a.mode == "read" and b.mode == "read":
+                kind, producer, consumer = "REUSE", a, b
+            else:
+                continue
+            a_window, b_window = _access_window(a), _access_window(b)
+            if a_window is None or b_window is None:
+                status = "UNKNOWN"
+            elif not _windows_intersect(a_window, b_window):
+                continue  # disjoint byte windows => no dependency, whatever the names say
+            else:
+                status = "BYTES"
+            same_domain = _access_domain_key(a) == _access_domain_key(b)
+            dependencies.append(
+                {
+                    "producer": producer.task,
+                    "consumer": consumer.task,
+                    "distance": 0 if same_domain else 1,
+                    "kind": kind,
+                    "status": status,
+                    "shared_root": a.root,
+                    "producer_window": a_window,
+                    "consumer_window": b_window,
+                    "producer_domains": _access_domains(producer),
+                    "consumer_domains": _access_domains(consumer),
+                    "evidence": "window intersect on same root; kind from mode; distance from iteration domain",
+                }
+            )
+    return dependencies
+
+
 def _problem_policy(sources: "ProblemSources | None") -> dict:
     """The policy dict, honestly UNWIRED or wired from two independent typed sources.
 
@@ -995,25 +1075,8 @@ def build_problem(ledger: Ledger, sources: "ProblemSources | None" = None) -> No
     for access in accesses:
         if (access.root, access.space) not in buffer_roots:
             raise LedgerError(f"UNKNOWN_ROOT: access root {access.root!r} in {access.space} has no BufferDecl")
-    # Dependencies: same-root RAW/WAW/WAR, ordered by the action order, distance from iterations.
-    dependencies = []
-    for later in range(len(accesses)):
-        for earlier in range(later):
-            a, b = accesses[earlier], accesses[later]
-            if a.root != b.root or a.space != b.space:
-                continue
-            if a.mode == "read" and b.mode == "write":
-                kind = "WAR"
-            elif a.mode == "write" and b.mode == "read":
-                kind = "RAW"
-            elif a.mode == "write" and b.mode == "write":
-                kind = "WAW"
-            else:
-                continue
-            distance = 0 if a.logical_iteration == b.logical_iteration else 1
-            dependencies.append(
-                {"producer": a.task, "consumer": b.task, "distance": distance, "kind": kind, "evidence": "same root+space, emission order"}
-            )
+    # Dependencies: derived from typed byte-window intersection + loop domain (not names/order).
+    dependencies = derive_dependencies(accesses)
     # Tasks: one per REAL instruction, with pipe/latency/ii from the ISA contract (not hardcoded).
     by_instruction = {}
     for entry in ledger.entries:
