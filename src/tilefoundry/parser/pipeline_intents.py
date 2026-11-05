@@ -139,16 +139,13 @@ def _reachable_pipeline_loops(function) -> dict[tuple[int, int], object]:
     that was constructed and then dropped is NOT here, which is exactly what
     makes a lost declaration visible.
     """
-    from tilefoundry.ir.hir.loop_region import LoopRegion  # noqa: PLC0415
-    from tilefoundry.ir.visitor import collect_exprs  # noqa: PLC0415
+    from tilefoundry.analysis.effects import reachable_loops  # noqa: PLC0415
 
-    body = getattr(function, "body", None)
-    if body is None:
-        return {}
+    # "Reachable from the returned value" is the effect-aware DCE root set: the same
+    # predicate analysis.effects uses to decide retention. Sharing it keeps the two
+    # answers (which loops survived, which loops are roots) from drifting apart.
     found: dict[tuple[int, int], object] = {}
-    for expr in collect_exprs(body):
-        if not isinstance(expr, LoopRegion):
-            continue
+    for expr in reachable_loops(function):
         spec = getattr(expr, "pipeline", None)
         if spec is None:
             continue
