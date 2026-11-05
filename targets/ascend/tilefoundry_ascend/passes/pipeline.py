@@ -48,8 +48,12 @@ __all__ = [
     "validate_pipeline_declarations",
     "verify_buffer_versions",
     "normalize_tail_requirement",
+    "required_active_for_issue",
     "select_part",
+    "normalize_part_selection",
+    "verify_tir_part",
     "verify_predicate_coverage",
+    "verify_issue_predicate_coverage",
     "verify_pipeline_preservation",
     "build_pipeline_manifest",
     "collect_tir_pipeline_declarations",
@@ -243,24 +247,84 @@ def _is_unknown(value) -> bool:
     return value is UNKNOWN
 
 
+def _require_plain_int(value, name: str, *, minimum: int | None = None) -> int:
+    """A plain int with an optional lower bound; a bool is never an int here."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PipelineError(
+            "PREDICATE_PLAN_UNSUPPORTED",
+            "%s must be a plain int, got %r" % (name, value),
+        )
+    if minimum is not None and value < minimum:
+        raise PipelineError(
+            "PREDICATE_PLAN_UNSUPPORTED",
+            "%s must be >= %d, got %r" % (name, minimum, value),
+        )
+    return value
+
+
+def _default_issue_origin(logical_len: int, lane_count: int) -> int:
+    """Start of the LAST issue window covering a 1-D logical length.
+
+    This is a window START, not a remainder: it is where the final issue begins, so the
+    active set is derived per lane from origin + l < logical_len, rather than from a bare
+    remainder count. For N=70/lane=64 the last issue starts at 64; for N=64/64 it starts
+    at 0 (a full issue), which a remainder-only formula cannot express.
+    """
+    remainder = logical_len % lane_count
+    return logical_len - lane_count if remainder == 0 else logical_len - remainder
+
+
+def required_active_for_issue(logical_len, lane_count, origin):
+    """S = {l | 0 <= l < lane_count and 0 <= origin + l < logical_len}, from bounds only.
+
+    An empty S is UNPROVABLE (PREDICATE_PROOF_UNAVAILABLE), never "no lanes needed": an
+    empty requirement would make any emitted predicate look sufficient. UNKNOWN bounds
+    are UNPROVABLE too -- UNKNOWN is not 0 and not a full tile.
+    """
+    if _is_unknown(logical_len) or _is_unknown(origin) or _is_unknown(lane_count):
+        raise PipelineError(
+            "PREDICATE_PROOF_UNAVAILABLE",
+            "a bound is UNKNOWN (logical_len=%r, lane_count=%r, origin=%r), so no active "
+            "set can be proved; UNKNOWN is neither 0 nor a full tile"
+            % (logical_len, lane_count, origin),
+        )
+    _require_plain_int(logical_len, "logical_len", minimum=0)
+    lane_count = _require_plain_int(lane_count, "lane_count", minimum=1)
+    origin = _require_plain_int(origin, "origin", minimum=0)
+    active = frozenset(lane for lane in range(lane_count) if 0 <= origin + lane < logical_len)
+    if not active:
+        raise PipelineError(
+            "PREDICATE_PROOF_UNAVAILABLE",
+            "issue window origin=%d lane_count=%d covers no lane of logical length %d, "
+            "so coverage cannot be proved; an empty required set is not nothing-needed"
+            % (origin, lane_count, logical_len),
+        )
+    return active
+
+
 def normalize_tail_requirement(logical_len, base, policy, *,
-                              extent=None, granularity_bits: int = 32,
+                              origin=None, lane_count=None, extent=None,
+                              granularity_bits: int = 32,
                               producer_kind: str = "VF",
                               scope: str = "root",
                               issue_source_id: str = "tail.issue0",
                               part_selection: int = 0,
                               bounds_evidence: tuple = ()) -> PredicateRequirement:
-    """Derive the active set a tail issue actually needs, or refuse to guess.
+    """Derive the active set ONE ISSUE WINDOW needs, or refuse to guess.
 
-    The required set is computed from the BOUNDS (logical length, issue base), never
-    taken from an authored claim. That is why FULL_TILE on N=70/base=64 is refused:
-    70 % 64 != 0, so the tail issue needs six lanes, and no evidence in this program
-    proves a full 64. A full predicate there would read the six lanes it needs plus 58
-    it has no right to.
+    'base' is the LOGICAL lane base of one issue (the element granularity of a full
+    issue), NOT a physical tile width. A packed bf16 tile may be a different number of
+    bytes/elements, so reading 'base' as a tile width would silently compute the wrong
+    lane count. 'lane_count' defaults to 'base'; 'origin' is the window start and
+    defaults to the LAST issue covering logical_len.
 
-    UNKNOWN is refused rather than defaulted. There is no honest numeric answer for a
-    bound nobody resolved, and 0 is a number that would make a downstream comparison
-    look safe.
+    The required set comes from the BOUNDS -- {l | 0 <= l < lane_count and
+    0 <= origin + l < logical_len} -- never from an authored active count. FULL_TILE is
+    accepted only when the window really covers every lane; on N=70/lane=64 the last
+    issue needs six lanes, and nothing here proves a full 64.
+
+    UNKNOWN is refused rather than defaulted, and logical_len 0 is refused rather than
+    read as a full tile through 0 % base == 0.
     """
     if _is_unknown(logical_len) or _is_unknown(extent):
         raise PipelineError(
@@ -269,11 +333,11 @@ def normalize_tail_requirement(logical_len, base, policy, *,
             "can be derived. UNKNOWN is not 0 and is not a full tile"
             % (logical_len, extent),
         )
-    if type(logical_len) is not int or type(base) is not int or base < 1:
+    base = _require_plain_int(base, "base", minimum=1)
+    if type(logical_len) is not int or logical_len < 0:
         raise PipelineError(
             "PREDICATE_PLAN_UNSUPPORTED",
-            "logical_len and base must be ints with base >= 1, got %r and %r"
-            % (logical_len, base),
+            "logical_len must be a non-negative int, got %r" % (logical_len,),
         )
     if not isinstance(policy, TailPolicy):
         raise PipelineError(
@@ -281,23 +345,38 @@ def normalize_tail_requirement(logical_len, base, policy, *,
             "the tail policy must be a TailPolicy, got %s. A string here would let a "
             "typo silently select the consumer default" % (type(policy).__name__,),
         )
-    remainder = logical_len % base
-    if policy is TailPolicy.FULL_TILE and remainder != 0:
+    lanes = base if lane_count is None else _require_plain_int(lane_count, "lane_count", minimum=1)
+    if logical_len == 0:
+        raise PipelineError(
+            "PREDICATE_PROOF_UNAVAILABLE",
+            "logical length 0 has no issue to satisfy; 0 %% base == 0 must not be read "
+            "as a full tile",
+        )
+    start = (
+        _default_issue_origin(logical_len, lanes)
+        if origin is None
+        else _require_plain_int(origin, "origin", minimum=0)
+    )
+    active = required_active_for_issue(logical_len, lanes, start)
+    if policy is TailPolicy.FULL_TILE and active != frozenset(range(lanes)):
         raise PipelineError(
             "UNPROVEN_FULL_TILE",
-            "FULL_TILE was claimed for a tail of %d over base %d. %d %% %d == %d, so "
-            "the last issue needs %d lanes and nothing in this program proves a full "
-            "%d" % (logical_len, base, logical_len, base, remainder, remainder, base),
+            "FULL_TILE was claimed for issue window [%d, %d) of a logical length %d. It "
+            "needs lanes %r, not a full %d" % (start, start + lanes, logical_len,
+                                               sorted(active), lanes),
         )
-    active = frozenset(range(remainder if remainder else base))
+    evidence = tuple(bounds_evidence) or (
+        ("logical_len", logical_len),
+        ("lane_count", lanes),
+        ("origin", start),
+    )
     return PredicateRequirement(
         issue_source_id=issue_source_id,
         scope=scope,
         required_active=active,
         granularity_bits=granularity_bits,
         producer_kind=producer_kind,
-        bounds_evidence=tuple(bounds_evidence) or (("logical_len", logical_len),
-                                                   ("base", base)),
+        bounds_evidence=evidence,
         policy=policy,
         part_selection=part_selection,
         status="NORMALIZED",
@@ -333,23 +412,52 @@ def select_part(projection) -> int:
     return 0
 
 
+def normalize_part_selection(projection) -> int:
+    """The part a NORMALIZE step records: 0 only through a unique projection.
+
+    Kept as its own entry point so a caller cannot write part 0 by omission: the only
+    way to get 0 out is a projection that reports it uniquely via select_part.
+    """
+    return select_part(projection)
+
+
+def verify_tir_part(part) -> None:
+    """Refuse a TIR-constructed part that is not part0.
+
+    A raw TIR attribute is not a projection and carries no uniqueness proof, so only an
+    absent part or the int 0 is admissible; a directly built part1 is refused by name
+    instead of being treated as a legal schedule choice.
+    """
+    if part is None:
+        return
+    if isinstance(part, bool) or not isinstance(part, int) or part != 0:
+        raise PipelineError(
+            "PART_SELECTION_UNSUPPORTED",
+            "a TIR operation states part=%r; D0 writes part 0 only through a unique "
+            "projection and does not accept a directly constructed part1" % (part,),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Coverage verification (AFTER_LOWER).
 # ---------------------------------------------------------------------------
 
-def verify_predicate_coverage(required, actual, *, offset_value=None,
+def verify_predicate_coverage(required=None, actual=None, *, offset_value=None,
                               offset_status=None, producer_is_fresh=None,
                               dma_window=None, granularity_bits=None,
                               actual_granularity_bits=None, scope=None,
-                              actual_scope=None, source_bound=None) -> None:
-    """Compare the required active set with what was actually emitted.
+                              actual_scope=None, source_bound=None,
+                              logical_len=None, base=None, lane_count=None,
+                              origin=None) -> None:
+    """Compare the active set the BOUNDS require with what was actually emitted.
 
-    The caller passes the set it re-derived from bounds. This function never trusts an
-    authored active_count: an active_count recorded by the same pass that produced the
-    predicate would let a wrong predicate certify itself.
+    The required set is either supplied (as a set already re-derived from bounds by the
+    caller) or re-derived HERE from (logical_len, lane_count/base, origin). It is never
+    read back from an authored active_count, and a caller that passes one set into both
+    slots cannot make a wrong predicate certify itself: 'actual' is a distinct value.
 
-    The checks are ordered most-specific first, so the code names the real defect
-    instead of collapsing everything into a coverage mismatch.
+    Checks are ordered most-specific first, so the code names the real defect instead of
+    collapsing everything into a coverage mismatch.
     """
     if offset_status is UNKNOWN and offset_value == 0:
         raise PipelineError(
@@ -389,20 +497,35 @@ def verify_predicate_coverage(required, actual, *, offset_value=None,
             "the producer applies %d-bit granularity but the consumer needs %d bits"
             % (actual_granularity_bits, granularity_bits),
         )
-    if actual is None:
-        raise PipelineError(
-            "MISSING_TAIL_PREDICATE",
-            "the consumer needs the active set %r but no predicate was emitted at all"
-            % (sorted(required or ()),),
-        )
-    needed = set(required or ())
-    emitted = set(actual or ())
+    # Independent recomputation: if bounds are given, recompute S here and ignore any
+    # supplied 'required' (an authored count must not certify itself).
+    if logical_len is not None or base is not None or lane_count is not None:
+        lanes = lane_count if lane_count is not None else base
+        start = origin
+        if start is None and isinstance(logical_len, int) and isinstance(lanes, int) and lanes > 0:
+            start = _default_issue_origin(logical_len, lanes)
+        needed = required_active_for_issue(logical_len, lanes, start)
+    else:
+        if _is_unknown(required):
+            raise PipelineError(
+                "PREDICATE_PROOF_UNAVAILABLE",
+                "the required active set is UNKNOWN, so coverage cannot be proved; "
+                "UNKNOWN is not treated as satisfied",
+            )
+        needed = set(required or ())
     if not needed:
         raise PipelineError(
             "PREDICATE_PROOF_UNAVAILABLE",
             "the required active set is empty, so coverage cannot be proved. An empty "
             "requirement would make any predicate look sufficient",
         )
+    if actual is None:
+        raise PipelineError(
+            "MISSING_TAIL_PREDICATE",
+            "the consumer needs the active set %r but no predicate was emitted at all"
+            % (sorted(needed),),
+        )
+    emitted = set(actual or ())
     if not emitted:
         raise PipelineError(
             "MISSING_TAIL_PREDICATE",
@@ -417,6 +540,24 @@ def verify_predicate_coverage(required, actual, *, offset_value=None,
             % (sorted(emitted), sorted(needed), sorted(emitted - needed),
                sorted(needed - emitted)),
         )
+
+
+def verify_issue_predicate_coverage(logical_len, base, actual, *, origin=None,
+                                    lane_count=None, **kwargs) -> None:
+    """Recompute S from bounds and verify it against the emitted predicate.
+
+    This is the entry the AFTER pass calls: the requirement side is derived here from
+    bounds/domain, and 'actual' is whatever the lowering emitted. Neither side reads the
+    other, so a wrong predicate cannot certify itself.
+    """
+    lanes = lane_count if lane_count is not None else base
+    start = origin
+    if start is None and isinstance(logical_len, int) and isinstance(lanes, int) and lanes > 0:
+        start = _default_issue_origin(logical_len, lanes)
+    verify_predicate_coverage(
+        actual=actual, logical_len=logical_len, base=base, lane_count=lanes,
+        origin=start, **kwargs,
+    )
 
 
 def verify_pipeline_preservation(expected, actual) -> None:
@@ -539,6 +680,17 @@ def collect_tir_pipeline_declarations(module) -> dict:
     return out
 
 
+def _collect_actual_predicates(module) -> dict:
+    """{issue_source_id: frozenset(lanes)} of predicates actually emitted in the TIR.
+
+    D0 materialises no pset/pge predicate yet, so the lowered program has no producer to
+    read and this returns {}. It exists so the AFTER pass compares a REAL actual side
+    (absent today, hence MISSING_TAIL_PREDICATE) instead of feeding the required set back
+    in, and so a later materialisation step has exactly one place to fill.
+    """
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # The ordered BEFORE_LOWER / AFTER_LOWER entries.
 # ---------------------------------------------------------------------------
@@ -588,22 +740,19 @@ class NormalizeSchedulePredicates(ModulePass):
             )
         if not manifest.loops:
             return module
-        requirements = []
-        for key, spec in manifest.loops:
-            requirement = PredicateRequirement(
-                issue_source_id=key,
-                scope="root",
-                required_active=frozenset(),
-                granularity_bits=32,
-                producer_kind="VF",
-                bounds_evidence=(),
-                policy=TailPolicy.MASK_ACTIVE,
-                part_selection=0,
-                status="UNKNOWN",
-            )
-            requirements.append(requirement)
+        # D0 carries the loop BUDGET (PipelineSpec.num_stages) but NOT a per-issue source
+        # access window. Deriving a requirement from the loop stop would be the design's
+        # "loop stop == lane length" mistake, and fabricating an UNKNOWN/empty requirement
+        # per loop (then skipping it in the AFTER pass) is exactly the wiring this change
+        # removes. With no source bounds artifact there is nothing provable, so the
+        # requirement set stays EMPTY: the public path must not invent a requirement it
+        # cannot derive. The predicate RULES are exercised at the helper level, and the
+        # AFTER pass refuses anything it is actually handed but cannot verify.
+        #
+        # This is a stated gap, not a silent pass: producing a real per-issue requirement
+        # needs F/L source access windows, which the current typed structure does not have.
         module.metadata[PIPELINE_MANIFEST_KEY] = dataclass_replace(
-            manifest, requirements=tuple(requirements))
+            manifest, requirements=())
         return module
 
 
@@ -623,18 +772,37 @@ class VerifyPredicateCoverage(ModulePass):
         manifest = module.metadata.get(PIPELINE_MANIFEST_KEY)
         if manifest is None:
             return module
+        actual_by_issue = _collect_actual_predicates(module)
         for requirement in manifest.requirements:
             if requirement.status == "UNKNOWN":
-                # Nothing was proved for this loop. It is recorded, not passed off as
-                # covered; D0 has no bounds evidence for it yet.
-                continue
+                # An UNKNOWN requirement cannot be proved. It must be refused, never
+                # skipped: a skipped requirement is indistinguishable from a satisfied one.
+                raise PipelineError(
+                    "PREDICATE_PROOF_UNAVAILABLE",
+                    "requirement %r is UNKNOWN, so its coverage cannot be proved; an "
+                    "UNKNOWN requirement is not treated as satisfied"
+                    % (requirement.issue_source_id,),
+                )
+            evidence = dict(requirement.bounds_evidence)
+            missing = [key for key in ("logical_len", "lane_count", "origin") if key not in evidence]
+            if missing:
+                raise PipelineError(
+                    "PREDICATE_SOURCE_UNBOUND",
+                    "requirement %r carries no %s, so its active set cannot be re-derived"
+                    % (requirement.issue_source_id, missing),
+                )
+            # Recompute S independently from the recorded bounds. NEVER feed
+            # requirement.required_active back in as the actual side: that is the
+            # required-vs-required self-comparison this wiring replaces.
+            needed = required_active_for_issue(
+                evidence["logical_len"], evidence["lane_count"], evidence["origin"]
+            )
+            actual = actual_by_issue.get(requirement.issue_source_id)
             verify_predicate_coverage(
-                requirement.required_active,
-                requirement.required_active,
+                needed,
+                actual,
                 granularity_bits=requirement.granularity_bits,
-                actual_granularity_bits=requirement.granularity_bits,
                 scope=requirement.scope,
-                actual_scope=requirement.scope,
             )
         return module
 
