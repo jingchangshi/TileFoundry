@@ -428,6 +428,9 @@ class NormalizedProblem:
     escape_edges: list = field(default_factory=list)
     schema: str = REAL_PROBLEM_SCHEMA
     policy: dict = field(default_factory=dict)
+    # One entry per ExecutionScope (whole-VF task): the scope path and ALL action ids it owns,
+    # so an internal vld/vadd/vsts chain is visible as ONE schedulable task, not split per op.
+    vf_tasks: list = field(default_factory=list)
 
     def as_dict(self):
         return asdict(self)
@@ -767,6 +770,36 @@ def _edge_domain(scope: str) -> str:
     return "main" if "/for:" in scope else "weight"
 
 
+#: Instructions that run in the vector execution mode; a whole-VF task owns all of them in
+#: one ExecutionScope so the internal vld/add/store chain stays one schedulable unit.
+VF_INSTRUCTIONS = frozenset({
+    "Vld", "Vsts", "Vcvt", "Vmula", "Vadd", "Vmul", "Vdiv", "Vadds", "Vmuls",
+    "Vsqrt", "Vdup", "Vdupv", "Pset", "Pset16", "Vcadd",
+})
+
+
+def whole_vf_tasks(ledger: Ledger) -> list:
+    """One task per ExecutionScope: {scope, action_ids, instructions}.
+
+    Every action whose structural path lives inside the scope belongs to that ONE task, so an
+    internal register chain is not mis-reported as several independent cross-VF tasks. Derived
+    from the real ledger paths, not from a template.
+    """
+    tasks = []
+    for scope in ledger.scope_paths:
+        inner = [entry for entry in ledger.entries if entry.path == scope or entry.path.startswith(scope + "/")]
+        if not inner:
+            continue
+        tasks.append(
+            {
+                "scope": scope,
+                "action_ids": [entry.action_id for entry in inner],
+                "instructions": sorted({entry.instruction for entry in inner}),
+            }
+        )
+    return tasks
+
+
 def _canonical_problem_payload(problem: "NormalizedProblem") -> dict:
     """The exact dict a problem digest is taken over.
 
@@ -925,7 +958,16 @@ def build_problem(ledger: Ledger) -> NormalizedProblem:
             "requested_budget": None,
             "buffer_versions": {},
             "predicate_manifest": None,
+            # Predicate wiring is NOT derived from the real TIR yet (P actual predicate not
+            # materialised). State UNKNOWN with no numbers -- never 0, never required==actual.
+            "predicate": {
+                "status": "UNKNOWN",
+                "required_active": None,
+                "actual_active": None,
+                "reason": "P actual predicate not materialised",
+            },
         },
+        vf_tasks=whole_vf_tasks(ledger),
     )
     problem.problem_digest = compute_problem_digest(problem)
     return problem
@@ -1322,4 +1364,133 @@ def verify_real_problem(problem: NormalizedProblem, ledger: Optional[Ledger] = N
             if function is not None
             else statement_coverage(ledger)
         )
+    return report
+
+
+def _output_roots(function) -> set:
+    """Names of the trailing output parameters (the GM return chain endpoints)."""
+    count = getattr(function, "output_count", 0) or 0
+    params = tuple(getattr(function, "params", ()))
+    if count <= 0 or count > len(params):
+        return set()
+    return {str(getattr(param, "name", "")) for param in params[-count:]}
+
+
+def verify_final_gm_return_chain(function, ledger: Ledger) -> dict:
+    """The returned GM output must be written by a real action.
+
+    A program whose final GM store was dropped (the loop turns out to compute a private
+    value) has no write to an output root, so it is refused by name rather than accepted
+    as a valid kernel with an empty output.
+    """
+    outputs = _output_roots(function)
+    if not outputs:
+        raise LedgerError("FINAL_GM_RETURN_MISSING: the function declares no output parameter")
+    final_writes = [
+        entry
+        for entry in ledger.entries
+        if entry.mode == "write" and entry.space == "GMEM" and entry.root in outputs
+    ]
+    if not final_writes:
+        raise LedgerError(
+            "FINAL_GM_RETURN_MISSING: no write to an output GM root %s; the returned value "
+            "has no producing store" % (sorted(outputs),)
+        )
+    return {"outputs": sorted(outputs), "final_gm_writes": len(final_writes)}
+
+
+def verify_whole_vf_tasks(ledger: Ledger, problem: NormalizedProblem) -> dict:
+    """Each ExecutionScope must appear as exactly ONE whole-VF task over all its actions."""
+    expected = {task["scope"]: set(task["action_ids"]) for task in whole_vf_tasks(ledger)}
+    actual = {task["scope"]: set(task["action_ids"]) for task in problem.vf_tasks}
+    if set(expected) != set(actual):
+        raise LedgerError(
+            "VF_TASK_COVERAGE_MISMATCH: scopes expected=%s actual=%s"
+            % (sorted(expected), sorted(actual))
+        )
+    for scope, ids in expected.items():
+        if actual[scope] != ids:
+            extra = sorted(actual[scope] - ids)
+            missing = sorted(ids - actual[scope])
+            raise LedgerError(
+                "VF_TASK_COVERAGE_MISMATCH: scope %r action_ids differ (extra=%s missing=%s)"
+                % (scope, extra[:3], missing[:3])
+            )
+    return {"vf_tasks": len(expected), "scopes": sorted(expected)}
+
+
+def verify_predicate_wiring(problem: NormalizedProblem) -> dict:
+    """Predicate fields must be an honest UNKNOWN, never a default 0 or a self-proof.
+
+    P's actual predicate is not materialised, so the only legal state is UNKNOWN with no
+    numbers. A WIRED state is legal only when its required and actual sets are BOTH present
+    and DIFFERENT -- an equality would be the required==actual self-certification the design
+    forbids.
+    """
+    predicate = (problem.policy or {}).get("predicate")
+    if predicate is None:
+        raise LedgerError("PREDICATE_FIELD_MISSING: policy.predicate is absent")
+    status = predicate.get("status")
+    if status not in ("UNKNOWN", "WIRED"):
+        raise LedgerError("PREDICATE_STATUS_INVALID: status=%r" % (status,))
+    required = predicate.get("required_active")
+    actual = predicate.get("actual_active")
+    if status == "UNKNOWN":
+        if required is not None or actual is not None:
+            raise LedgerError(
+                "DEFAULTED_UNKNOWN_VALUE: UNKNOWN predicate carries required=%r actual=%r; "
+                "UNKNOWN must not be turned into a number" % (required, actual)
+            )
+        return {"status": "UNKNOWN"}
+    if required is None or actual is None:
+        raise LedgerError("PREDICATE_SOURCE_UNBOUND: WIRED predicate lacks required/actual")
+    if set(required) == set(actual):
+        raise LedgerError(
+            "PREDICATE_SELF_CERTIFIED: required==actual (%r); a predicate cannot certify itself"
+            % (sorted(required),)
+        )
+    return {"status": "WIRED"}
+
+
+def verify_escape_endpoints(ledger: Ledger) -> dict:
+    """Escape edges must match the typed records; a wrong endpoint is ESCAPE_EDGE_MISMATCH.
+
+    The expectation is rebuilt from the typed records (never from the edges under test).
+    This does not require both weight and main domains (a single-domain carrier is valid);
+    it only requires that every edge equals the edge its typed records imply.
+    """
+    if not ledger.escape_records:
+        raise LedgerError("ESCAPE_EDGE_MISSING: no typed escape records to check against")
+    expected = build_escape_edges(ledger, ledger.escape_records, ledger.declaration_sites)
+    if not ledger.escape_edges:
+        raise LedgerError("ESCAPE_EDGE_MISSING: the ledger carries no escape edge")
+    if len(expected) != len(ledger.escape_edges):
+        raise LedgerError(
+            "ESCAPE_EDGE_MISMATCH: typed records imply %d edge(s), ledger has %d"
+            % (len(expected), len(ledger.escape_edges))
+        )
+    def _key(edge):
+        return (edge.scope_path, edge.field_path, edge.inner_action_id)
+    expected_sorted = sorted(expected, key=_key)
+    actual_sorted = sorted(ledger.escape_edges, key=_key)
+    for want, got in zip(expected_sorted, actual_sorted):
+        if want != got:
+            raise LedgerError(
+                "ESCAPE_EDGE_MISMATCH: field %r/%r differs between typed records and ledger"
+                % (got.scope_path, got.field_path)
+            )
+    return {"escape_edges": len(ledger.escape_edges), "complete": True}
+
+
+def verify_l2_problem(function, ledger: Ledger, problem: NormalizedProblem) -> dict:
+    """L2 shape: roots/windows, whole-VF task, final GM return chain, predicate UNKNOWN, escape."""
+    validate_roots(problem)
+    assert_no_default_zero(problem)
+    report = {
+        "final_gm": verify_final_gm_return_chain(function, ledger),
+        "vf_tasks": verify_whole_vf_tasks(ledger, problem),
+        "predicate": verify_predicate_wiring(problem),
+    }
+    if ledger.escape_records:
+        report["escape"] = verify_escape_endpoints(ledger)
     return report
