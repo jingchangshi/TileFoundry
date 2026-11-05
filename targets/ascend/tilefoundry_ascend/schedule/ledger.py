@@ -1191,7 +1191,109 @@ def statement_coverage(ledger: Ledger) -> dict:
     return {"statements": len(stmt_paths), "actions": len(entry_paths), "bidirectional": True}
 
 
-def verify_real_problem(problem: NormalizedProblem, ledger: Optional[Ledger] = None) -> dict:
+def _resolve_effect_op(callable_, defs):
+    """Resolve a TIR Evaluate callable through Var/Call/ScheduleOp indirection."""
+    seen = set()
+    op = callable_
+    while True:
+        if isinstance(op, Var):
+            key = getattr(op, "name", None)
+            if key in seen or key not in defs:
+                break
+            seen.add(key)
+            op = defs[key]
+            continue
+        if isinstance(op, Call):
+            op = op.target
+            continue
+        if isinstance(op, ScheduleOp):
+            op = op.op
+            continue
+        break
+    return op
+
+
+def _iter_effect_statement_paths(function) -> list:
+    """Independently enumerate TIR dataflow statements: (path, status, op).
+
+    status is "action" for a memory-effect statement this ledger knows how to extract,
+    and "unsupported" for a memory-effect op it does NOT map -- the latter is refused by
+    name, never silently skipped. Pure arithmetic/structural Evaluate nodes state no
+    operand memory effect and are not dataflow statements.
+    """
+    defs = {}
+    out = []
+
+    def walk(stmt, path):
+        if isinstance(stmt, Sequential):
+            for index, child in enumerate(stmt.body):
+                walk(child, path + ("s%d" % index,))
+            return
+        if isinstance(stmt, For):
+            walk(stmt.body, path + ("for:%s" % getattr(stmt.induction_var, "name", "i"),))
+            return
+        if isinstance(stmt, (MeshScope, ExecutionScope)):
+            walk(stmt.body, path + (type(stmt).__name__,))
+            return
+        if isinstance(stmt, If):
+            walk(stmt.then_body, path + ("then",))
+            walk(stmt.else_body, path + ("else",))
+            return
+        if isinstance(stmt, LetStmt):
+            defs[str(getattr(stmt.var, "name", ""))] = stmt.value
+            return
+        if not isinstance(stmt, Evaluate):
+            return
+        op = _resolve_effect_op(stmt.callable, defs)
+        if isinstance(op, Copy):
+            name = "copy"
+        elif isinstance(op, Fill):
+            name = "fill"
+        else:
+            name = type(op).__name__
+        if isinstance(op, (Copy, Fill)) or name in _ACTION_EFFECTS:
+            out.append(("/".join(path), "action", name))
+            return
+        schema = getattr(type(op), "_op_schema", None)
+        params = getattr(schema, "signature", ()) or ()
+        has_effect = any(
+            getattr(param, "kind", None) == "input" and getattr(param, "effect", None) is not None
+            for param in params
+        )
+        if has_effect:
+            out.append(("/".join(path), "unsupported", name))
+
+    walk(function.body, ())
+    return out
+
+
+def verify_statement_coverage(function, ledger: Ledger) -> dict:
+    """Independently prove every dataflow statement has an action and vice versa.
+
+    The expectation is re-derived from the TIR by a walker that does NOT reuse the
+    extraction's recorded paths, so a statement the extractor silently skipped shows up as
+    stmt_without_action; a memory-effect op the extractor cannot classify is refused as
+    UNSUPPORTED_EFFECT_OP rather than ignored.
+    """
+    rows = _iter_effect_statement_paths(function)
+    unsupported = [(path, name) for path, status, name in rows if status == "unsupported"]
+    if unsupported:
+        raise LedgerError("UNSUPPORTED_EFFECT_OP: %s" % (unsupported[:3],))
+    expected = {path for path, status, _name in rows if status == "action"}
+    actual = {entry.path for entry in ledger.entries}
+    if not expected:
+        raise LedgerError("STATEMENT_COVERAGE_MISMATCH: no dataflow statement was found")
+    stmt_without_action = sorted(expected - actual)
+    action_without_stmt = sorted(actual - expected)
+    if stmt_without_action or action_without_stmt:
+        raise LedgerError(
+            "STATEMENT_COVERAGE_MISMATCH: stmt_without_action=%s action_without_stmt=%s"
+            % (stmt_without_action[:3], action_without_stmt[:3])
+        )
+    return {"statements": len(expected), "actions": len(actual), "bidirectional": True}
+
+
+def verify_real_problem(problem: NormalizedProblem, ledger: Optional[Ledger] = None, function=None) -> dict:
     """Verify a real-problem/1 instance before any consumer trusts it.
 
     Refuses an unknown schema, a digest that does not match its own canonical payload
@@ -1213,5 +1315,11 @@ def verify_real_problem(problem: NormalizedProblem, ledger: Optional[Ledger] = N
     if ledger is not None:
         report["coverage"] = coverage(ledger, problem)
         report["tasks"] = tasks_coverage(ledger, problem)
-        report["statements"] = statement_coverage(ledger)
+        # When the TIR is supplied, re-derive the statement expectation independently of
+        # the extraction's recorded paths; otherwise fall back to the recorded paths.
+        report["statements"] = (
+            verify_statement_coverage(function, ledger)
+            if function is not None
+            else statement_coverage(ledger)
+        )
     return report
