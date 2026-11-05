@@ -142,6 +142,7 @@ def project_problem(problem, tir_function, expansion_count, sources=None, obliga
             "byte_footprint": int(get("byte_footprint")), "logical_index": V("i"),
         })
     r_problem = {
+        "schema": "real-problem/1",
         "problem_digest": problem.problem_digest, "source_digest": problem.source_digest,
         "ledger_sha": problem.ledger_sha, "loop_id": loop_id, "loop_domain": loop_domain,
         "requested_num_stages": budget, "stage_depth": 1, "ii": 1, "latency": 1,

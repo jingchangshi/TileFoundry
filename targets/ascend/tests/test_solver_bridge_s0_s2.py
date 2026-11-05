@@ -33,6 +33,7 @@ except ImportError:  # plain direct runner; handled in __main__ below
     _pytest = None
 
 PROBLEM = {
+    "schema": "real-problem/1",
     "problem_digest": "sha256:" + "1" * 64,
     "source_digest": "sha256:" + "2" * 64,
     "ledger_sha": "sha256:" + "3" * 64,
@@ -247,6 +248,19 @@ def test_d01_fixed_version_mutation_still_fails():
     bad = dataclasses.replace(request, core_args=args)
     expect_code("FIXED_VERSION_MISMATCH",
                 lambda: B.verify_request_coverage(problem, bad))
+
+
+def test_d07_legacy_problem_schema_is_named_reject():
+    for mutation in (
+        lambda p: p.pop("schema"),
+        lambda p: p.__setitem__("schema", "real-problem/0"),
+        lambda p: (p.pop("problem_digest"), p.__setitem__("problem_id", "old")),
+        lambda p: p.pop("ledger_sha"),
+    ):
+        problem = json.loads(json.dumps(PROBLEM))
+        mutation(problem)
+        expect_code("SOLVER_PROBLEM_SCHEMA_UNSUPPORTED",
+                    lambda p=problem: B.lower_problem_to_request(p, MODEL, OPTIONS))
 
 
 if __name__ == "__main__":

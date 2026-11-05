@@ -26,6 +26,7 @@ from tilefoundry.vendor.tilelang_z3 import adapters as shared_adapters
 
 SCHEMA_REQUEST = "solver-request/1"
 SCHEMA_RESULT = "solver-result/1"
+PROBLEM_SCHEMA = "real-problem/1"
 CORE_SOURCE_HASH = "tilelang_z3/core.py"
 
 SAT, UNSAT, UNKNOWN, FALLBACK = "SAT", "UNSAT", "UNKNOWN", "FALLBACK"
@@ -149,14 +150,21 @@ def lower_problem_to_request(problem, model_facts, solve_options) -> SolveReques
     """
     model_facts = model_facts or {}
     solve_options = solve_options or {}
-    problem_digest = str(_get(problem, "problem_digest") or _get(problem, "problem_id") or "")
+    schema = _get(problem, "schema", None)
+    if str(schema) != PROBLEM_SCHEMA:
+        raise SolverError("SOLVER_PROBLEM_SCHEMA_UNSUPPORTED",
+                          "only canonical real-problem/1 input is accepted; legacy shapes are retired",
+                          "schema", PROBLEM_SCHEMA, schema, phase="lower")
+    problem_digest = str(_get(problem, "problem_digest") or "")
     source_digest = str(_get(problem, "source_digest") or "")
-    ledger_digest = str(_get(problem, "ledger_sha") or _get(problem, "ledger_digest") or "")
-    loop_id = str(_get(problem, "loop_id", "main_compute"))
-    if not problem_digest or not source_digest:
-        raise SolverError("SOLVER_RESULT_SOURCE_MISMATCH", "problem lacks stable digests",
-                          "problem", "problem_digest/source_digest",
-                          [problem_digest, source_digest], phase="lower")
+    ledger_digest = str(_get(problem, "ledger_sha") or "")
+    loop_id = _get(problem, "loop_id", None)
+    if not problem_digest or not source_digest or not ledger_digest or loop_id is None:
+        raise SolverError("SOLVER_PROBLEM_SCHEMA_UNSUPPORTED",
+                          "canonical problem must carry problem_digest/source_digest/ledger_sha/loop_id",
+                          "problem", "real-problem/1 stable fields",
+                          [problem_digest, source_digest, ledger_digest, loop_id], phase="lower")
+    loop_id = str(loop_id)
 
     tasks_in = list(_get(problem, "tasks", []) or [])
     if not tasks_in:
