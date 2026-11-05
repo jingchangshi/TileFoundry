@@ -165,6 +165,10 @@ run full_kernel_ledger "$PY" "$REPO/targets/ascend/tests/test_full_kernel_ledger
 run ledger_tasks_digest "$PY" "$REPO/targets/ascend/tests/test_ledger_tasks_digest.py"
 run p4_negative_matrix "$PY" "$REPO/targets/ascend/tests/test_p4_negative_matrix.py"
 run p4_hir_offset_digest "$PY" "$REPO/targets/ascend/tests/test_p4_hir_offset_digest.py"
+# D0 surface: the four decisive bad controls and the predicate refusal codes. It was
+# written red-first (22 named failures) and is now green, so it belongs here: left out
+# of this explicit list, a later regression in the pipeline rules would be silent.
+run d0_pipeline_controls "$PY" "$REPO/targets/ascend/tests/test_d0_pipeline_controls.py"
 
 # (4) The legacy paths that must not regress, so a green M3 cannot come from
 # breaking CUDA or the copy lowering.
