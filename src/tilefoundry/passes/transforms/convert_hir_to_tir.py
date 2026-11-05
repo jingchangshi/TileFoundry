@@ -1239,6 +1239,9 @@ class LoweringContext(TypeInferContext):
     # statement. This map lets the final TIR be walked once and turned into stable structural
     # paths per ssa_group, without any ordinal->walk-order assumption.
     escape_declaration_views: dict = field(default_factory=dict)
+    # RECORD-ONLY: ssa_group -> the declaration ordinals this group's sites actually emitted.
+    escape_declaration_ordinals: dict = field(default_factory=dict)
+    _pending_escape_ordinal: int | None = None
 
 
     def _alias_base(self, expr):
@@ -1274,18 +1277,35 @@ class LoweringContext(TypeInferContext):
         field["outer_type"] = str(type_)
         field["outer_source"] = "consume_alias"
 
-    def _note_escape_declaration_view(self, group, view):
-        """RECORD-ONLY: remember every TIR value that carries an ssa_group.
+    def _note_escape_ordinal(self, group, ordinal) -> None:
+        """RECORD-ONLY: remember which declaration ordinals this ssa_group actually handed out.
+
+        This is the Core's own assignment, kept next to the declaration sites rather than read
+        back out of the field dict, so a forged ordinal in the records can be compared against it.
+        """
+        known = self.escape_declaration_ordinals.setdefault(group, [])
+        if int(ordinal) not in known:
+            known.append(int(ordinal))
+
+    def _note_escape_declaration_view(self, group, view, ordinal=None):
+        """RECORD-ONLY: remember every TIR value that carries an ssa_group and its ordinal.
 
         One ssa_group can be declared more than once (the same SSA re-declared in a sibling
         scope is the weight-VF -> main-VF binding), so this keeps ALL sites and never assumes a
-        single one.
+        single one. The ordinal is carried so a forged ordinal can be detected: the site knows
+        which declaration ordinal it actually emitted.
         """
         if group is None:
             return
         views = self.escape_declaration_views.setdefault(group, [])
         if all(existing is not view for existing in views):
             views.append(view)
+        if ordinal is None:
+            ordinal = getattr(self, "_pending_escape_ordinal", None)
+        if ordinal is not None:
+            pending = self.escape_declaration_ordinals.setdefault(group, [])
+            if int(ordinal) not in pending:
+                pending.append(int(ordinal))
 
     def _note_escape_declare(self, ssa, type_, source="unknown"):
         """Single-point record from StoragePlan.view (fresh SMEM view) with an SSA key."""
@@ -1311,7 +1331,9 @@ class LoweringContext(TypeInferContext):
             if field["outer_declaration_ordinal"] is None and field.get("_scope") != current_scope:
                 field["outer_declaration_ordinal"] = ordinal
                 field["outer_type"] = str(type_)
+                self._note_escape_ordinal(group, ordinal)
                 return
+        self._note_escape_ordinal(group, ordinal)
         if self.execution_records:
             record = self.execution_records[-1]
             field = {"field_path": f"out[{len(record['fields'])}]",
@@ -2075,6 +2097,11 @@ def _escape_declaration_sites(lowered) -> dict:
 
     for function in lowered.lowered_functions():
         walk(getattr(function, "body", None), (), function)
+    ordinals = lowered.context.escape_declaration_ordinals
+    for group, entries in sites.items():
+        known = [int(value) for value in ordinals.get(group, [])]
+        for entry in entries:
+            entry["ordinals"] = known
     return sites
 
 

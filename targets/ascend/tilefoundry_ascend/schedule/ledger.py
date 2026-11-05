@@ -545,6 +545,7 @@ def _resolve_inner_endpoint(ledger: Ledger, sites: dict, record, field, scope: s
             f" inside {scope!r}"
         )
     site = candidates[0]
+    _check_site_ordinal(key, "inner", field, site)
     _check_site_type(key, "inner", str(field.get("inner_type", "")), site)
     root = "smem@" + str(site.get("path", ""))
     return _unique_endpoint(ledger, root, "write", "inner", key), str(site.get("path", ""))
@@ -565,6 +566,7 @@ def _resolve_outer_endpoint(ledger: Ledger, sites: dict, record, field, scope: s
             f"ESCAPE_ENDPOINT_AMBIGUOUS: {key} group {group} is declared in {len(sibling)} outer scopes"
         )
     if sibling:
+        _check_site_ordinal(key, "outer", field, sibling[0])
         _check_site_type(key, "outer", str(field.get("outer_type") or ""), sibling[0])
         path = str(sibling[0].get("path", ""))
         outer_scope = _site_container(ledger, path)
@@ -602,6 +604,29 @@ def _type_footprint(text: str):
         return None, None
     storage = "SMEM" if "StorageKind.SMEM" in text else ("OTHER" if "StorageKind." in text else None)
     return elements * bits // 8, storage
+
+
+def _check_site_ordinal(key: str, endpoint: str, field, site) -> None:
+    """The record's declaration ordinal must be one the site really emitted.
+
+    The ordinal is the Core's own name for a declaration. The site records which ordinals it
+    actually produced, so a forged ordinal (a value no site ever emitted) is refused here instead
+    of being silently ignored -- which is what let the old order-based builder reproduce the same
+    128 edges from corrupted records.
+    """
+    ordinal = field.get("declaration_ordinal") if endpoint == "inner" else field.get("outer_declaration_ordinal")
+    if ordinal is None:
+        return
+    known = [int(value) for value in site.get("ordinals", [])]
+    if not known:
+        raise LedgerError(
+            "ESCAPE_ORDINAL_UNANCHORED: " + key + " " + endpoint + " site records no declaration ordinal"
+        )
+    if int(ordinal) not in known:
+        raise LedgerError(
+            "ESCAPE_ORDINAL_MISMATCH: " + key + " " + endpoint + " records declaration ordinal "
+            + str(ordinal) + " but the site emitted " + repr(known)
+        )
 
 
 def _check_site_type(key: str, endpoint: str, recorded: str, site) -> None:

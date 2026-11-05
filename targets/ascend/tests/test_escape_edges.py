@@ -151,6 +151,22 @@ def main():
         ledger_with(anc=None)
     ))
 
+    def forged_ordinals():
+        """The decisive premise test: corrupt EVERY ordinal the records name.
+
+        Before the anchor existed this reproduced the same 128 edges, which is exactly the defect
+        the audit named. The site now knows which ordinals it emitted, so this must refuse.
+        """
+        bad = copy.deepcopy(records)
+        for record in bad:
+            for field in record["fields"]:
+                field["declaration_ordinal"] = 999999
+                if field.get("outer_declaration_ordinal") is not None:
+                    field["outer_declaration_ordinal"] = 999998
+        validate_escape_edges(ledger_with(rec=bad))
+
+    refusal("neg_forged_ordinals_refused", forged_ordinals)
+
     def forged_group():
         bad = copy.deepcopy(records)
         highest = max(field["ssa_group"] for record in bad for field in record["fields"])
