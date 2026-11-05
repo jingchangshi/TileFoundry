@@ -6,17 +6,17 @@
 # canonical run below proves the shared core is exercised and prints its version.
 #
 # Usage:
-#   SOLVER_PY=/path/to/tfnpu-v2/bin/python tools/run_solver_tests.sh
-#   SOLVER_PY=/path/to/tfnpu-dev/bin/python tools/run_solver_tests.sh
+#   SOLVER_PY=/path/to/envs/tfnpu-v2/bin/python tools/run_solver_tests.sh
+# A one-off temporary overlay may be derived from v2 with:
+#   python -m venv --system-site-packages /tmp/tfnpu-overlay && .../pip install pytest
 set -euo pipefail
-: "${SOLVER_PY:?set SOLVER_PY to a Python interpreter with z3 (for example tfnpu-v2/bin/python)}"
+: "${SOLVER_PY:?set SOLVER_PY to envs/tfnpu-v2/bin/python (the only formal env)}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENVS_ROOT="${ENVS_ROOT:-$(cd "${ROOT}/.." && pwd)/envs}"
 export PYTHONPATH="${ROOT}/src:${ROOT}/targets/ascend${PYTHONPATH:+:${PYTHONPATH}}"
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
-# ABI preflight: only tfnpu-v2 (judgment) or tfnpu-dev (same ABI + pytest) may run.
-# A wrong interpreter dies by name (ABI_PREFLIGHT_INTERPRETER/VERSION/SHA).
-"${SOLVER_PY}" "${ENVS_ROOT}/tfnpu-dev/abi_preflight.py"
+# ABI preflight: only envs/tfnpu-v2 may run tests. A wrong interpreter
+# dies by name (ABI_PREFLIGHT_INTERPRETER/VERSION/SHA).
+"${SOLVER_PY}" "${ROOT}/tools/abi_preflight.py"
 "${SOLVER_PY}" - <<'PY'
 import sys
 try:

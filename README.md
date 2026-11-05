@@ -118,18 +118,24 @@ a pytest venv without z3 **skips** them by name. See
 [`targets/ascend/tilefoundry_ascend/solver/README.md`](targets/ascend/tilefoundry_ascend/solver/README.md)
 for the interpreter matrix and `tools/run_solver_tests.sh`.
 
-## Environment matrix (task-78)
+## Environment matrix (task-78 cleanup)
 
-**`envs/tfnpu-v2` is the only judgment environment** (backend/TileLang/Z3/device
-conclusions). `envs/tfnpu-dev` is a thin test overlay with the SAME tilelang/z3/tvm_ffi
-bytes plus pytest; `.conda/envs/tilefoundry-npu` (z3 5.3.3) and `.venv-explorer`
-are **scratch/reference only** and must never be used for judgment. See
-[`envs/ENVIRONMENT.md`](../envs/ENVIRONMENT.md) and
-[`envs/tfnpu-dev/ENVIRONMENT.md`](../envs/tfnpu-dev/ENVIRONMENT.md). The ABI preflight
-(`envs/tfnpu-dev/abi_preflight.py`, invoked by `tools/run_solver_tests.sh`) fails by
-name on a wrong interpreter or a mismatched tilelang/tvm_ffi/z3 triple.
+**`envs/tfnpu-v2` is the ONLY formal environment** for backend, TileLang, Z3,
+device and test judgments. The removed/deprecated `envs/tfnpu-dev`, `envs/tfnpu-v1` and
+`.venv-explorer` are not kept in the workspace. `.conda/envs/tilefoundry-npu` is the adapter's
+conventional `.conda/envs/` location, but it is currently invalid/legacy and paused:
+**do not delete, modify or repair it**; the user will restore the formal layout after all
+TileFoundry tasks. It is not used by tests or `run_acceptance.sh`.
 
-**sitecustomize caveat:** `sitecustomize.py` prepends the tfnpu-v2
-site-packages. If tfnpu-v2 ever gains pytest, it would shadow tfnpu-dev's pinned
-pytest. Keep tfnpu-v2 free of test tooling (the rule), or make sitecustomize
-explicitly preserve the dev pytest path.
+For a temporary need, derive a one-off overlay and delete it:
+
+```bash
+envs/tfnpu-v2/bin/python -m venv --system-site-packages /tmp/tfnpu-oneoff
+/tmp/tfnpu-oneoff/bin/python -m pip install --no-index --find-links envs/wheels pytest
+# use it, then: rm -rf /tmp/tfnpu-oneoff
+```
+
+The ABI preflight (`tools/abi_preflight.py`, invoked by `tools/run_solver_tests.sh`)
+allows only `envs/tfnpu-v2` and fails by
+`ABI_PREFLIGHT_INTERPRETER` / `ABI_PREFLIGHT_VERSION` / `ABI_PREFLIGHT_SHA`. See
+[`envs/ENVIRONMENT.md`](../envs/ENVIRONMENT.md).

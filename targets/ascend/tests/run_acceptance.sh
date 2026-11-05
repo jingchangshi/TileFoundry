@@ -5,9 +5,10 @@
 #
 #   1. The interpreter identity is printed FIRST, so every line below is
 #      attributable to a named interpreter rather than to "python".
-#   2. Nothing uses /opt/tf-venv and nothing runs on the host. PY is the durable
-#      conda env and the script is meant to be run INSIDE a container that has this
-#      HOME mounted. Running it on the host proves nothing about M3.
+#   2. Nothing uses /opt/tf-venv and nothing runs on the host. PY is the formal
+#      envs/tfnpu-v2 interpreter and the script is meant to be run INSIDE a
+#      container that has this HOME mounted. Running it on the host proves nothing
+#      about M3.
 #   3. The package versions used in the report were read from dist-info directory
 #      names and from the installed file layout, WITHOUT importing anything on the
 #      host. That is stated here so the report cannot be misread as a host run.
@@ -23,28 +24,27 @@
 set -u
 # THE INTERPRETER IS RESOLVED, NOT ASSUMED FROM $HOME.
 #
-# An earlier version of this script wrote $HOME/.conda/envs/.../bin/python3.12. That
-# is correct on the host and WRONG in the container, where docker exec reports
-# HOME=/root and the env lives under ${HOME}. The failure mode is nasty: the
-# shell reports "not found" for a path that looks right, and it reads like the env is
-# missing rather than like the script guessed. So the env root is resolved explicitly
-# in priority order, and the path actually used is PRINTED before anything runs.
+# The old conda path is deprecated and no longer used: that early environment was made
+# invalid by earlier operations and the user will rebuild the formal layout after all
+# TileFoundry tasks. Do not delete, modify or repair .conda/envs/*. This script resolves
+# the formal envs/tfnpu-v2 interpreter (or TF_ENV_ROOT) and prints it before
+# anything runs; running from the wrong interpreter is refused, not guessed around.
+# The ONLY formal interpreter is envs/tfnpu-v2; there is no conda fallback.
+# .conda/envs/tilefoundry-npu is the adapter's conventional .conda/envs/ location but is
+# currently invalid/legacy and paused -- do not delete/modify/repair it; the user will
+# restore the formal layout after all TileFoundry tasks.
+WORKSPACE="${TF_WORKSPACE:-${HOME}/workspace}"
 ENV_ROOT=${TF_ENV_ROOT:-}
 if [ -z "$ENV_ROOT" ]; then
-  for candidate in \
-    ${HOME}/.conda/envs/tilefoundry-npu \
-    "$HOME/.conda/envs/tilefoundry-npu"
-  do
-    if [ -x "$candidate/bin/python3.12" ]; then
-      ENV_ROOT=$candidate
-      break
-    fi
-  done
+  candidate="${WORKSPACE}/envs/tfnpu-v2"
+  if [ -x "$candidate/bin/python3.12" ]; then
+    ENV_ROOT=$candidate
+  fi
 fi
 if [ -z "$ENV_ROOT" ] || [ ! -x "$ENV_ROOT/bin/python3.12" ]; then
-  echo "FATAL: no interpreter of record found. HOME=$HOME" >&2
-  echo "       looked for ${HOME}/.conda/envs/tilefoundry-npu and" >&2
-  echo "       $HOME/.conda/envs/tilefoundry-npu; set TF_ENV_ROOT to override." >&2
+  echo "FATAL: no interpreter of record found. HOME=$HOME WORKSPACE=$WORKSPACE" >&2
+  echo "       expected ${WORKSPACE}/envs/tfnpu-v2/bin/python3.12;" >&2
+  echo "       set TF_ENV_ROOT to override." >&2
   exit 2
 fi
 PY=$ENV_ROOT/bin/python3.12
