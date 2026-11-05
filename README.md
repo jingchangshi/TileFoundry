@@ -117,3 +117,14 @@ The S bridge imports the ONE shared Z3 core, so its tests need an interpreter wi
 a pytest venv without z3 **skips** them by name. See
 [`targets/ascend/tilefoundry_ascend/solver/README.md`](targets/ascend/tilefoundry_ascend/solver/README.md)
 for the interpreter matrix and `tools/run_solver_tests.sh`.
+
+## Environment matrix (task-78)
+
+**`envs/tfnpu-v2` is the only judgment environment** (backend/TileLang/Z3/device
+conclusions). `envs/tfnpu-dev` is a thin test overlay with the SAME tilelang/z3/tvm_ffi
+bytes plus pytest; `.conda/envs/tilefoundry-npu` (z3 5.3.3) and `.venv-explorer`
+are **scratch/reference only** and must never be used for judgment. See
+[`envs/ENVIRONMENT.md`](../envs/ENVIRONMENT.md) and
+[`envs/tfnpu-dev/ENVIRONMENT.md`](../envs/tfnpu-dev/ENVIRONMENT.md). The ABI preflight
+(`envs/tfnpu-dev/abi_preflight.py`, invoked by `tools/run_solver_tests.sh`) fails by
+name on a wrong interpreter or a mismatched tilelang/tvm_ffi/z3 triple.
