@@ -116,112 +116,23 @@ def test_vertical_run():
                     run["steps"]["R"]["replay_sample"] = rows[:2]
                     try:
                         from tilefoundry_ascend import sync as SY
-                        from poc_vertical_adapter import build_c_plan_view
-                        cplan = build_c_plan_view(plan, problem, r_problem["loop_domain"])
-                        roots = {str(b.root) for b in cplan.buffers}
-                        supported, excluded = [], {}
-                        for dep in problem.dependencies:
-                            root = dep.get("shared_root")
-                            if root in roots:
-                                supported.append(dep)
-                            else:
-                                excluded[dep.get("kind", "?")] = excluded.get(dep.get("kind", "?"), 0) + 1
-                        filtered = types.SimpleNamespace(dependencies=supported)
-                        caps = {"same_pipe_pipe_order": True, "cost_model": "MODEL"}
-                        obligations = SY.derive_completion_obligations(filtered, cplan, completion_capabilities=caps)
-                        channels, _discharges = SY.choose_completion_mechanisms(obligations, {}, caps)
-                        caps = {**caps, "flag_pool_size": 256}
+                        from tilefoundry_ascend.schedule.ledger import extract_ledger
+                        ledger = extract_ledger(tir)
+                        reuse = SY.derive_reuse_obligations_from_ledger(ledger, expansion)
+                        obligations = SY.derive_completion_obligations_from_ledger(
+                            ledger, expansion, problem=problem, expected=expected)
+                        caps = {"supported_pairs": [["vector", "DMA"], ["DMA", "vector"]],
+                                "same_pipe_pipe_order": False, "flag_pool_size": 256,
+                                "cost_model": "MODEL"}
+                        channels, _discharges = SY.choose_completion_mechanisms(reuse, {}, caps)
                         allocation = SY.allocate_completion_resources(channels, [], caps)
-                        injected = SY.inject_completion(rewritten, cplan, obligations, allocation, channels=channels)
-                        if isinstance(injected, tuple):
-                            injected = injected[0]
-                        from tilefoundry.ir.tir.stmts import Sequential as _Seq, Evaluate as _Eval
-                        from tilefoundry.ir.tir.flag import Drain as _Drain
-                        if not SY._actual_nodes(injected)["drain"]:
-                            _body = injected.body
-                            _stmts = _body.body if hasattr(_body, "body") else tuple(_body)
-                            injected = dataclasses.replace(
-                                injected, body=_Seq(body=tuple(_stmts) + (_Eval(callable=_Drain(), args=()),)))
-                        drain_found = bool(SY._actual_nodes(injected)["drain"])
-                        coverage = SY.verify_completion_coverage(problem, cplan, injected,
-                                                                  {"placements": (), "channels": channels}, caps)
-                        required_by_kind = {"RAW": 0, "SSA": 0, "WAR_FREE": 0, "FINAL": 0}
-                        for item in expected["all"]:
-                            if item.kind == "RAW":
-                                required_by_kind["RAW"] += 1
-                            elif item.kind == "SSA":
-                                required_by_kind["SSA"] += 1
-                            elif item.kind in ("WAR", "FREE"):
-                                required_by_kind["WAR_FREE"] += 1
-                            elif item.kind == "FINAL":
-                                required_by_kind["FINAL"] += 1
-                        required_by_kind["WAR_FREE"] = (
-                            len(expected["all"]) - required_by_kind["RAW"]
-                            - required_by_kind["SSA"] - required_by_kind["FINAL"])
-                        ob_kind = {o.obligation_id: o.required_completion_kind for o in obligations}
-                        covered_counts = {"RAW": 0, "WAR_FREE": 0, "SSA": 0, "FINAL": 0}
-                        for channel in channels:
-                            for oid in getattr(channel, "covered_obligation_ids", ()):
-                                kind = ob_kind.get(oid)
-                                if kind == "READY":
-                                    covered_counts["RAW"] += 1
-                                elif kind in ("FREE", "WAW"):
-                                    covered_counts["WAR_FREE"] += 1
-                        covered_counts["SSA"] = 16  # structural INTRA_TASK_SSA_ORDER (not a barrier)
-                        covered_counts["FINAL"] = 1 if drain_found else 0
-                        # RAW: expand covered static family edges over i0..3 (poc_expansion facts)
-                        ob_by_id = {o.obligation_id: o for o in obligations}
-                        covered_ids = set()
-                        for channel in channels:
-                            covered_ids.update(getattr(channel, "covered_obligation_ids", ()))
-                        families = set()
-                        for oid in covered_ids:
-                            o = ob_by_id.get(oid)
-                            if o is None or o.required_completion_kind != "READY":
-                                continue
-                            if "/s2" in str(o.producer_action):
-                                families.add("X-in")
-                            elif "/s5" in str(o.producer_action):
-                                families.add("Z-in")
-                            elif "/s9" in str(o.consumer_action) or "/s11" in str(o.producer_action):
-                                families.add("Y-out")
-                        raw_evidence = []
-                        for fam in sorted(families):
-                            for inst in expansion.instances:
-                                raw_evidence.append({"family": fam, "i": inst["i"],
-                                                     "mechanism": "FLAG_RAW_INSTANCE(window)"})
-                        covered_counts["RAW"] = 4 * len(families)
-                        op_by_action = {}
-                        for task in problem.tasks:
-                            g = task.get if isinstance(task, dict) else lambda k, t=task: getattr(t, k, None)
-                            for aid in (g("action_ids") or []):
-                                op_by_action[str(aid)] = str(g("op") or "?")
-                        pipe_of = {"GmToUb": "DMA", "copy": "DMA", "Vld": "vector", "Vsts": "vector"}
-                        root_pipes = {}
-                        for acc in cplan.accesses:
-                            pipe = pipe_of.get(op_by_action.get(str(acc.action_id), "?"), "?")
-                            root_pipes.setdefault(str(acc.buffer_root), set()).add(pipe)
-                        war_evidence = []
-                        covered_war = 0
-                        for root, pipes in sorted(root_pipes.items()):
-                            if not str(root).startswith("smem@"):
-                                continue  # WAR/FREE obligations are on the 3 SMEM reuse roots only
-                            if pipes <= {"vector"}:
-                                mechanism, cross = "SAME_PIPE_ORDER", False
-                            elif pipes <= {"DMA"}:
-                                mechanism, cross = "SAME_PIPE_ORDER", False
-                            else:
-                                mechanism, cross = "FLAG_CHANNEL_REQUIRED", True
-                            for i in range(3):
-                                for k in ("WAR", "FREE"):
-                                    war_evidence.append({"root": root, "transition": "i%d->i%d" % (i, i + 1),
-                                                         "kind": k, "mechanism": mechanism,
-                                                         "pipe_of_producer": sorted(pipes),
-                                                         "cross_pipe": cross,
-                                                         "evidence": "accesses to this root span pipes %s" % sorted(pipes)})
-                                    if not cross:
-                                        covered_war += 1
-                        covered_counts["WAR_FREE"] = covered_war
+                        injected, placement = SY.inject_completion_anchored(
+                            tir, None, reuse, allocation, channels=channels, ledger=ledger)
+                        coverage = SY.verify_completion_coverage_from_ledger(
+                            ledger, expansion, problem=problem, actual_tir=injected,
+                            placement_map=placement, capabilities=caps, expected=expected)
+                        required_by_kind = dict(getattr(coverage, "required_by_kind", {}))
+                        covered_counts = dict(getattr(coverage, "covered_by_kind", {}))
                         run["steps"]["C"] = {"status": getattr(coverage, "status", None),
                                              "code": getattr(coverage, "code", None),
                                              "required_full": len(expected["all"]),
@@ -231,11 +142,11 @@ def test_vertical_run():
                                              "ssa_mechanism": "INTRA_TASK_SSA_ORDER",
                                              "c_derived_required": getattr(coverage, "required", None),
                                              "covered": getattr(coverage, "covered", None),
-                                             "drain_found": drain_found,
-                                             "raw_instance_evidence": raw_evidence,
-                                             "war_free_mechanisms": war_evidence,
+                                             "drain_found": bool(SY._actual_nodes(injected)["drain"]),
+                                             "edge_table": list(getattr(coverage, "edge_table", ())),
                                              "digest_C_injected": MAT.tir_digest(injected),
-                                             "kind": "real(FULL denominator, structural SSA + same-pipe WAR/FREE)"}
+                                             "kind": "real(FULL denominator, anchored reuse, structural SSA/FINAL)"}
+
                     except Exception as error:  # noqa: BLE001
                         run["steps"]["C"] = {"status": "NOT_RUN", "code": getattr(error, "code", type(error).__name__),
                                              "detail": str(error)[:140], "kind": "unknown"}
@@ -308,7 +219,20 @@ def test_vertical_run():
     excluded_empty = not c_step.get("excluded_by_kind")
     r_pass = run["steps"].get("R", {}).get("verify") == "PASS"
     s_ok = run["steps"].get("S", {}).get("state") == "SAT" and poc_in.supported_required_unknown == 0
-    run["chain_consistent"] = bool(excluded_empty and r_pass and s_ok)
+    c_ok = c_step.get("status") == "VERIFIED" and covered_total == 47
+    run["chain_consistent"] = bool(excluded_empty and r_pass and s_ok and c_ok)
+    run["digests"] = {
+        "problem": problem.problem_digest,
+        "r_before": run["steps"].get("R", {}).get("digest_before"),
+        "r_after": run["steps"].get("R", {}).get("digest_after"),
+        "c_actual": c_step.get("digest_C_injected"),
+    }
+    run["field_classification"] = {
+        "real": ["problem_digest", "L facts", "R plan/actual TIR", "C actual FlagSet/FlagWait"],
+        "projected": ["loop_domain", "requested_num_stages", "stage_depth", "task latency/ii/stage"],
+        "model": ["capacity/size/latency/ii model quantities"],
+        "unknown": ["S3 source postcheck", "physical feasibility", "device execution"],
+    }
     run["sat_scope"] = "NOMINAL_MODEL_ONLY"
     run["physical_feasibility"] = "UNPROVEN"
     run["device_ready_blocked_by"] = "SOLVER_POSTCHECK_NOT_IMPLEMENTED"
