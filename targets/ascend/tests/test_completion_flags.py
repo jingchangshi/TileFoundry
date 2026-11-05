@@ -21,7 +21,8 @@ def setup():
                                                            expected=expected)
     caps = {"supported_pairs": [["vector", "DMA"], ["DMA", "vector"]],
             "same_pipe_pipe_order": False, "flag_pool_size": 64}
-    channels, _ = C.choose_completion_mechanisms(reuse, {}, caps)
+    actionable = tuple(o for o in required if o.kind in ("RAW", "WAR", "FREE"))
+    channels, _ = C.choose_completion_mechanisms(actionable, {}, caps)
     allocation = C.allocate_completion_resources(channels, {}, caps)
     return tir, ledger, problem, expansion, expected, reuse, required, caps, channels, allocation
 
@@ -35,10 +36,11 @@ def test_reuse_is_18_and_requires_both_actions():
 
 def test_anchored_injection_covers_47():
     tir, ledger, problem, expansion, expected, reuse, required, caps, channels, allocation = setup()
-    actual, placement = C.inject_completion_anchored(tir, None, reuse, allocation,
+    actionable = tuple(o for o in required if o.kind in ("RAW", "WAR", "FREE"))
+    actual, placement = C.inject_completion_anchored(tir, None, actionable, allocation,
                                                      channels=channels, ledger=ledger)
     nodes = C._actual_nodes(actual)
-    assert len(nodes["set"]) == 18 and len(nodes["wait"]) == 18 and len(nodes["drain"]) == 1
+    assert len(nodes["set"]) == 30 and len(nodes["wait"]) == 30 and len(nodes["drain"]) == 1
     report = C.verify_completion_coverage_from_ledger(
         ledger, expansion, problem=problem, actual_tir=actual, placement_map=placement,
         capabilities=caps, expected=expected)
@@ -50,8 +52,9 @@ def test_anchored_injection_covers_47():
 
 def test_missing_wait_is_not_counted():
     tir, ledger, problem, expansion, expected, reuse, required, caps, channels, allocation = setup()
+    actionable = tuple(o for o in required if o.kind in ("RAW", "WAR", "FREE"))
     actual, placement = C.inject_completion_anchored(
-        tir, None, reuse, allocation, channels=channels, ledger=ledger,
+        tir, None, actionable, allocation, channels=channels, ledger=ledger,
         drop_wait_ids=(reuse[0].obligation_id,))
     report = C.verify_completion_coverage_from_ledger(
         ledger, expansion, problem=problem, actual_tir=actual, placement_map=placement,

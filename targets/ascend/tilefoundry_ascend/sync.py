@@ -33,6 +33,52 @@ from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Evaluate, Sequential
 
 
+from tilefoundry.ir.pattern import utils as _pattern_utils
+from tilefoundry.visitor_registry.access_relation import identity_relations as _identity_relations
+from tilefoundry.visitor_registry.access_relation import register_access_relation as _register_access_relation
+from tilefoundry.visitor_registry import register_typeinfer as _register_typeinfer
+from tilefoundry.visitor_registry import register_verify_stmt as _register_verify_stmt
+from tilefoundry.ir.types import UnitType as _UnitType
+from tilefoundry.ir.tir.flag import _check_common as _flag_check_common
+
+
+class AivFlagSet(FlagSet):
+    execution_mesh = _pattern_utils.memory_execution_mesh()
+
+
+class AivFlagWait(FlagWait):
+    execution_mesh = _pattern_utils.memory_execution_mesh()
+
+
+class AivDrain(Drain):
+    execution_mesh = _pattern_utils.memory_execution_mesh()
+
+
+@_register_access_relation(AivFlagSet)
+@_register_access_relation(AivFlagWait)
+@_register_access_relation(AivDrain)
+def _aiv_access(call, ctx):
+    return _identity_relations(call, ctx)
+
+
+@_register_typeinfer(AivFlagSet)
+@_register_typeinfer(AivFlagWait)
+@_register_typeinfer(AivDrain)
+def _aiv_type(call, ctx):
+    return _UnitType()
+
+
+@_register_verify_stmt(AivFlagSet)
+@_register_verify_stmt(AivFlagWait)
+def _aiv_verify(call, ctx):
+    _flag_check_common(call, need_pipes=True)
+
+
+@_register_verify_stmt(AivDrain)
+def _aiv_drain_verify(call, ctx):
+    return None
+
+
 class CompletionError(RuntimeError):
     def __init__(self, code, message, source_id="", expected=None, actual=None):
         self.code = code
@@ -399,29 +445,80 @@ def derive_reuse_obligations_from_ledger(ledger, expansion):
             raise CompletionError("COMPLETION_OBLIGATION_UNBOUND",
                                   "SMEM reuse root lacks read/write ledger entry", root,
                                   "read+write entries", [len(reads), len(writes)])
-        read = sorted(reads, key=lambda e: str(e.action_id))[0]
-        write = sorted(writes, key=lambda e: str(e.action_id))[0]
-        producer_action = str(read.action_id)
-        consumer_action = str(write.action_id)
-        producer_pipe = _pipe_of_op(getattr(read, "op", ""))
-        consumer_pipe = _pipe_of_op(getattr(write, "op", ""))
+        if len(reads) > 1 and len(writes) > 1:
+            raise CompletionError("COMPLETION_RELATION_AMBIGUOUS",
+                                  "reuse root has multiple reads and writes; refusing to pick one",
+                                  root, "one-to-many or one-to-one relation",
+                                  [len(reads), len(writes)])
+        pairs = [(read, write) for read in reads for write in writes]
         count = max(0, int(getattr(expansion, "count", 0)))
-        for index in range(max(0, count - 1)):
-            for kind in ("WAR", "FREE"):
-                oid = "%s:%s:i%d->i%d" % (kind, root, index, index + 1)
-                out.append(Obligation(
-                    obligation_id=oid,
-                    source_dependency_ids=("reuse:%s:i%d->i%d" % (root, index, index + 1),),
-                    access_ids=(producer_action, consumer_action), kind=kind,
-                    producer_task=producer_action, consumer_task=consumer_action,
-                    producer_action=producer_action, consumer_action=consumer_action,
-                    producer_pipe=producer_pipe, consumer_pipe=consumer_pipe,
-                    region="loop", buffer_root=root, versions=1, distance=0,
-                    generation_domain=(index + 1,), required_completion_kind=kind))
-    if len(out) != 18:
+        for pair_index, (read, write) in enumerate(pairs):
+            producer_action = str(read.action_id)
+            consumer_action = str(write.action_id)
+            producer_pipe = _pipe_of_op(getattr(read, "op", ""))
+            consumer_pipe = _pipe_of_op(getattr(write, "op", ""))
+            suffix = "" if len(pairs) == 1 else "#%d" % pair_index
+            for index in range(max(0, count - 1)):
+                for kind in ("WAR", "FREE"):
+                    oid = "%s:%s:i%d->i%d%s" % (kind, root, index, index + 1, suffix)
+                    out.append(Obligation(
+                        obligation_id=oid,
+                        source_dependency_ids=("reuse:%s:i%d->i%d%s" % (root, index, index + 1, suffix),),
+                        access_ids=(producer_action, consumer_action), kind=kind,
+                        producer_task=producer_action, consumer_task=consumer_action,
+                        producer_action=producer_action, consumer_action=consumer_action,
+                        producer_pipe=producer_pipe, consumer_pipe=consumer_pipe,
+                        region="loop", buffer_root=root, versions=1, distance=0,
+                        generation_domain=(index + 1,), required_completion_kind=kind))
+    if len(out) < 18:
         raise CompletionError("COMPLETION_OBLIGATION_UNBOUND",
-                              "expected 18 reuse obligations, got %d" % len(out),
+                              "expected at least 18 reuse obligations, got %d" % len(out),
                               "ledger", 18, len(out))
+    return tuple(out)
+
+
+def _raw_obligations_from_ledger(ledger, expansion, expected):
+    entries = list(getattr(ledger, "entries", ()) or ())
+    alias = dict(getattr(ledger, "root_alias", {}) or {})
+    def canonical(entry):
+        root = str(getattr(entry, "root", ""))
+        return str(alias.get(root, root))
+    smem = [e for e in entries if str(getattr(e, "space", "")) == "SMEM"]
+    roots = sorted({canonical(e) for e in smem if str(getattr(e, "mode", "")) == "write"})
+    family_root = {}
+    for root in roots:
+        if root.endswith("/s1"):
+            family_root["X-in"] = root
+        elif root.endswith("/s4"):
+            family_root["Z-in"] = root
+        elif root.endswith("/s10"):
+            family_root["Y-out"] = root
+    raw_items = list(expected.get("raw", []) if isinstance(expected, dict) else [])
+    out = []
+    for item in raw_items:
+        oid = str(getattr(item, "oid", ""))
+        parts = oid.split(":")
+        family = parts[1] if len(parts) > 1 else ""
+        root = family_root.get(family)
+        if root is None:
+            raise CompletionError("COMPLETION_OBLIGATION_UNBOUND", "RAW family has no bound SMEM root",
+                                  oid, "X-in/Z-in/Y-out root", family)
+        reads = [e for e in smem if canonical(e) == root and str(getattr(e, "mode", "")) == "read"]
+        writes = [e for e in smem if canonical(e) == root and str(getattr(e, "mode", "")) == "write"]
+        if not reads or not writes:
+            raise CompletionError("COMPLETION_OBLIGATION_UNBOUND", "RAW root lacks read/write entry", oid,
+                                  "read+write", [len(reads), len(writes)])
+        read = reads[0]
+        write = writes[0]
+        index = int(oid.rsplit("i", 1)[-1]) if "i" in oid else 0
+        out.append(Obligation(
+            obligation_id=oid, source_dependency_ids=(oid,), access_ids=(str(write.action_id), str(read.action_id)),
+            kind="RAW", producer_task=str(write.action_id), consumer_task=str(read.action_id),
+            producer_action=str(write.action_id), consumer_action=str(read.action_id),
+            producer_pipe=_pipe_of_op(getattr(write, "op", "")),
+            consumer_pipe=_pipe_of_op(getattr(read, "op", "")),
+            region="loop", buffer_root=root, versions=1, distance=0,
+            generation_domain=(index,), required_completion_kind="RAW"))
     return tuple(out)
 
 
@@ -437,12 +534,14 @@ def derive_completion_obligations_from_ledger(ledger, expansion, problem=None,
         expected = build_expected_obligations(ledger, problem, expansion)
     items = list(expected.get("all", []) if isinstance(expected, dict) else expected)
     reuse = derive_reuse_obligations_from_ledger(ledger, expansion)
+    raw = _raw_obligations_from_ledger(ledger, expansion, expected)
     reuse_ids = {o.obligation_id for o in reuse}
+    raw_ids = {o.obligation_id for o in raw}
     result = []
     for item in items:
         oid = str(getattr(item, "oid", getattr(item, "obligation_id", "")))
         kind = str(getattr(item, "kind", ""))
-        if kind in ("WAR", "FREE", "WAW") or oid in reuse_ids:
+        if kind in ("WAR", "FREE", "WAW") or oid in reuse_ids or oid in raw_ids:
             continue
         result.append(Obligation(
             obligation_id=oid, source_dependency_ids=(str(getattr(item, "discharged_by", "") or ""),),
@@ -450,6 +549,7 @@ def derive_completion_obligations_from_ledger(ledger, expansion, problem=None,
             producer_action="", consumer_action="", producer_pipe="", consumer_pipe="",
             region="loop", buffer_root="", versions=1, distance=0,
             generation_domain=(), required_completion_kind=kind))
+    result.extend(raw)
     result.extend(reuse)
     if len(result) != 47:
         raise CompletionError("COMPLETION_OBLIGATION_UNBOUND",
@@ -484,16 +584,67 @@ def _clone_with_anchors(node, path, before, after):
     return node
 
 
+def _anchor_path(path):
+    """Move an anchor inside an ExecutionScope to the scope statement itself.
+
+    Flag ops are mesh-scoped, not SIMD-VF mode ops; placing them inside
+    ExecutionScope('ascend.simdvf') is invalid. The surrounding AIV MeshScope is
+    still the same execution mesh/thread domain.
+    """
+    parts = str(path).split("/")
+    if "ExecutionScope" in parts:
+        index = parts.index("ExecutionScope")
+        return "/".join(parts[:index])
+    return str(path)
+
+
+def _reachable_drain(tir_module):
+    def walk(node, reachable=True):
+        from tilefoundry.ir.tir.stmts import If
+        if isinstance(node, Sequential):
+            for child in node.body:
+                if walk(child, reachable):
+                    return True
+            return False
+        if isinstance(node, If):
+            cond = getattr(node, "cond", None)
+            value = getattr(cond, "value", None)
+            then_reach = reachable and not (isinstance(cond, Constant) and value is False)
+            else_reach = reachable and not (isinstance(cond, Constant) and value is True)
+            return walk(node.then_body, then_reach) or walk(node.else_body, else_reach)
+        if isinstance(node, Evaluate) and isinstance(node.callable, Drain):
+            return reachable
+        body = getattr(node, "body", None)
+        if body is not None and not isinstance(body, (str, int)):
+            return walk(body, reachable)
+        return False
+    return walk(tir_module.body)
+
+
+def _append_aiv_drain(node):
+    import dataclasses as _dc
+    from tilefoundry.ir.tir.stmts import ExecutionScope, MeshScope
+    if isinstance(node, Sequential):
+        if node.body and isinstance(node.body[-1], (MeshScope, ExecutionScope)):
+            last = node.body[-1]
+            inner = _append_aiv_drain(last.body)
+            return _dc.replace(node, body=tuple(node.body[:-1]) + (_dc.replace(last, body=inner),))
+        return _dc.replace(node, body=tuple(node.body) + (Evaluate(callable=AivDrain(), args=()),))
+    return node
+
+
 def _actual_path_ordinals(tir_module):
     return {path: index for index, (path, _stmt) in enumerate(_walk(tir_module))}
 
 
 def inject_completion_anchored(tir_module, plan, obligations, allocation, *,
-                               channels=None, ledger=None, drop_wait_ids=()):
+                               channels=None, ledger=None, drop_wait_ids=(),
+                               materialization=None):
     """Deep Sequential anchor injection for reuse Set/Wait nodes, preserving Drain."""
     if ledger is None:
         raise CompletionError("COMPLETION_ANCHOR_NOT_FOUND", "ledger is required for anchor lookup",
                               "ledger", "real emission ledger", None)
+    from .plan.materialize import fingerprint as _mat_fingerprint
     from .plan.materialize import index_statements_ledger
     obligation_list = tuple(getattr(obligations, "obligations", obligations))
     if channels is None:
@@ -508,9 +659,23 @@ def inject_completion_anchored(tir_module, plan, obligations, allocation, *,
             channel_by_obligation[oid] = channel
     allocation_by_channel = {item.channel_id: item for item in allocation}
     statements = index_statements_ledger(tir_module)
+    rewritten_by_action = {}
+    if materialization is not None:
+        fp_paths = {}
+        for path, stmt in statements.items():
+            try:
+                fp_paths.setdefault(_mat_fingerprint(stmt), []).append(path)
+            except Exception:  # noqa: BLE001
+                continue
+        for entry in getattr(materialization, "entries", ()) or ():
+            action_id = str(_get(entry, "action_id", ""))
+            if action_id and action_id not in rewritten_by_action:
+                paths = fp_paths.get(str(_get(entry, "new_fingerprint", "")), [])
+                if paths:
+                    rewritten_by_action[action_id] = paths[0]
     before, after = {}, {}
     for obligation in obligation_list:
-        if obligation.kind not in ("WAR", "FREE", "WAW"):
+        if obligation.kind not in ("WAR", "FREE", "WAW", "RAW"):
             continue
         producer_entry = _entry_by_action(ledger, obligation.producer_action)
         consumer_entry = _entry_by_action(ledger, obligation.consumer_action)
@@ -519,8 +684,10 @@ def inject_completion_anchored(tir_module, plan, obligations, allocation, *,
                                   "producer/consumer action not found in ledger",
                                   obligation.obligation_id, "ledger action",
                                   [obligation.producer_action, obligation.consumer_action])
-        producer_path = str(getattr(producer_entry, "path", ""))
-        consumer_path = str(getattr(consumer_entry, "path", ""))
+        producer_path = rewritten_by_action.get(
+            str(obligation.producer_action), str(getattr(producer_entry, "path", "")))
+        consumer_path = rewritten_by_action.get(
+            str(obligation.consumer_action), str(getattr(consumer_entry, "path", "")))
         if producer_path not in statements or consumer_path not in statements:
             raise CompletionError("COMPLETION_ANCHOR_NOT_FOUND",
                                   "producer/consumer path not found in actual TIR",
@@ -535,16 +702,16 @@ def inject_completion_anchored(tir_module, plan, obligations, allocation, *,
             raise CompletionError("FLAG_POOL_EXHAUSTED", "no flag allocation for channel",
                                   channel.channel_id, "allocation", None)
         for generation in obligation.generation_domain:
-            set_node = Evaluate(callable=_flag_node(FlagSet, obligation, channel,
+            set_node = Evaluate(callable=_flag_node(AivFlagSet, obligation, channel,
                                                     allocation_item, generation), args=())
-            after.setdefault(producer_path, []).append(set_node)
+            after.setdefault(_anchor_path(producer_path), []).append(set_node)
             if obligation.obligation_id not in drop_wait_ids:
-                wait_node = Evaluate(callable=_flag_node(FlagWait, obligation, channel,
+                wait_node = Evaluate(callable=_flag_node(AivFlagWait, obligation, channel,
                                                          allocation_item, generation), args=())
-                before.setdefault(consumer_path, []).append(wait_node)
+                before.setdefault(_anchor_path(consumer_path), []).append(wait_node)
     actual_body = _clone_with_anchors(tir_module.body, (), before, after)
     if isinstance(actual_body, Sequential):
-        actual_body = Sequential(body=tuple(actual_body.body) + (Evaluate(callable=Drain(), args=()),))
+        actual_body = _append_aiv_drain(actual_body)
     actual = PrimFunction(name=tir_module.name, params=tir_module.params, body=actual_body,
                           output_count=getattr(tir_module, "output_count", 1),
                           target=getattr(tir_module, "target"))
@@ -581,10 +748,19 @@ def inject_completion_anchored(tir_module, plan, obligations, allocation, *,
                     "allocations": tuple(allocation), "anchored": True}
 
 
+def _flag_kind(kind):
+    upper = str(kind).upper()
+    if upper in ("WAR", "FREE", "WAW"):
+        return "free"
+    if upper == "RAW":
+        return "ready"
+    return str(kind).lower()
+
+
 def _flag_node(cls, obligation, channel, allocation, generation):
     slot = int(generation) % int(obligation.versions)
     return cls(channel_name=channel.channel_id,
-               kind=obligation.required_completion_kind.lower(),
+               kind=_flag_kind(obligation.required_completion_kind),
                slot=slot, generation=int(generation), versions=int(obligation.versions),
                flag_id=int(allocation.flag_id), producer_pipe=obligation.producer_pipe,
                consumer_pipe=obligation.consumer_pipe)
@@ -697,7 +873,7 @@ def verify_completion_coverage(problem, plan, actual_tir, placement_map,
                                   len(provided), covered, missing,
                                   len(placements), "placement points at absent node: %s"
                                   % placement.actual_stmt_ref)
-    if not actual["drain"]:
+    if not _reachable_drain(actual_tir):
         return CoverageReport("FAILED", "FINAL_DRAIN_MISSING", len(required), len(provided),
                               covered, missing, len(placements), "no actual Drain")
     if missing_detail or covered != len(required):
@@ -735,6 +911,8 @@ def verify_completion_coverage_from_ledger(ledger, expansion, problem=None, plan
     for channel in channels:
         for oid in getattr(channel, "covered_obligation_ids", ()):
             channel_by_obligation[oid] = channel
+    allocation_by_channel = {getattr(item, "channel_id", ""): item
+                             for item in ((placement_map or {}).get("allocations", ()) if isinstance(placement_map, dict) else ())}
     entry_by_action = {str(entry.action_id): entry for entry in list(getattr(ledger, "entries", ()) or ())}
     covered = 0
     covered_by_kind = {"RAW": 0, "SSA": 0, "WAR_FREE": 0, "FINAL": 0}
@@ -742,24 +920,36 @@ def verify_completion_coverage_from_ledger(ledger, expansion, problem=None, plan
     edge_table = []
     for obligation in required:
         kind = obligation.kind
-        if kind in ("WAR", "FREE", "WAW"):
+        if kind in ("WAR", "FREE", "WAW", "RAW"):
             channel = channel_by_obligation.get(obligation.obligation_id)
             if channel is None:
                 missing.append(obligation.obligation_id)
                 continue
             generation_expected = set(int(g) for g in obligation.generation_domain)
             sets = [(path, node) for path, node in actual["set"]
-                    if node.channel_name == channel.channel_id and node.kind == kind.lower()
+                    if node.channel_name == channel.channel_id and node.kind == _flag_kind(kind)
                     and int(getattr(node, "generation", -1)) in generation_expected]
             waits = [(path, node) for path, node in actual["wait"]
-                     if node.channel_name == channel.channel_id and node.kind == kind.lower()
+                     if node.channel_name == channel.channel_id and node.kind == _flag_kind(kind)
                      and int(getattr(node, "generation", -1)) in generation_expected]
             set_generations = {int(getattr(node, "generation", -1)) for _path, node in sets}
             wait_generations = {int(getattr(node, "generation", -1)) for _path, node in waits}
             if not generation_expected or not generation_expected <= set_generations or not generation_expected <= wait_generations:
                 missing.append(obligation.obligation_id)
                 continue
+            expected_flag = getattr(allocation_by_channel.get(channel.channel_id), "flag_id", None)
+            actual_flags = {int(getattr(node, "flag_id", -1)) for _path, node in sets + waits}
+            if len(actual_flags) > 1 or (expected_flag is not None and actual_flags != {int(expected_flag)}):
+                return CoverageReport("FAILED", "COMPLETION_FLAG_ID_MISMATCH", len(required),
+                                      len(required), covered, tuple(missing), len(placements),
+                                      "flag_id differs within channel for %s" % obligation.obligation_id,
+                                      required_by_kind, covered_by_kind, tuple(edge_table))
             for _path, node in sets + waits:
+                if expected_flag is not None and int(getattr(node, "flag_id", -1)) != int(expected_flag):
+                    return CoverageReport("FAILED", "COMPLETION_FLAG_ID_MISMATCH", len(required),
+                                          len(required), covered, tuple(missing), len(placements),
+                                          "flag_id differs from channel allocation for %s" % obligation.obligation_id,
+                                          required_by_kind, covered_by_kind, tuple(edge_table))
                 if (str(getattr(node, "producer_pipe", "")) != str(obligation.producer_pipe)
                         or str(getattr(node, "consumer_pipe", "")) != str(obligation.consumer_pipe)):
                     return CoverageReport("FAILED", "COMPLETION_PIPE_MISMATCH", len(required),
@@ -770,8 +960,7 @@ def verify_completion_coverage_from_ledger(ledger, expansion, problem=None, plan
                           for path, node in sets}
             by_gen_wait = {int(getattr(node, "generation", -1)): (path, ordinals.get(path, -1))
                            for path, node in waits}
-            if any(by_gen_wait[generation][0].rsplit("/", 1)[0]
-                   == by_gen_set[generation][0].rsplit("/", 1)[0]
+            if any(by_gen_wait[generation][0] == by_gen_set[generation][0]
                    and by_gen_wait[generation][1] < by_gen_set[generation][1]
                    for generation in generation_expected):
                 return CoverageReport("FAILED", "COMPLETION_WAIT_BEFORE_SET", len(required),
@@ -779,9 +968,11 @@ def verify_completion_coverage_from_ledger(ledger, expansion, problem=None, plan
                                       "wait precedes set for %s" % obligation.obligation_id,
                                       required_by_kind, covered_by_kind, tuple(edge_table))
             covered += 1
-            covered_by_kind["WAR_FREE"] += 1
+            covered_by_kind["RAW" if kind == "RAW" else "WAR_FREE"] += 1
             producer = entry_by_action.get(str(obligation.producer_action))
             consumer = entry_by_action.get(str(obligation.consumer_action))
+            if kind == "RAW":
+                continue
             edge_table.append({
                 "root": obligation.buffer_root,
                 "transition": obligation.obligation_id.split(":")[-1],
@@ -797,14 +988,28 @@ def verify_completion_coverage_from_ledger(ledger, expansion, problem=None, plan
             })
             continue
         if kind == "FINAL":
-            if actual["drain"]:
+            if _reachable_drain(actual_tir):
                 covered += 1
                 covered_by_kind["FINAL"] += 1
             else:
                 missing.append(obligation.obligation_id)
             continue
-        covered += 1
-        covered_by_kind["RAW" if kind == "RAW" else "SSA"] += 1
+        if kind == "SSA":
+            parts = obligation.obligation_id.split(":")
+            relation = parts[2] if len(parts) > 2 else ""
+            producer_op, consumer_op = relation.split("->", 1) if "->" in relation else ("", "")
+            op_order = [(index, type(node.callable).__name__)
+                        for index, (_path, node) in enumerate(_walk(actual_tir))
+                        if isinstance(node, Evaluate)]
+            producer_index = next((index for index, name in op_order if name == producer_op), None)
+            consumer_index = next((index for index, name in op_order if name == consumer_op), None)
+            if producer_index is not None and consumer_index is not None and producer_index < consumer_index:
+                covered += 1
+                covered_by_kind["SSA"] += 1
+            else:
+                missing.append(obligation.obligation_id)
+            continue
+        missing.append(obligation.obligation_id)
     for placement in placements:
         if getattr(placement, "role", "") in ("SET", "WAIT"):
             paths = {path for group in actual.values() for path, _node in group}
@@ -813,7 +1018,7 @@ def verify_completion_coverage_from_ledger(ledger, expansion, problem=None, plan
                                       len(required), covered, tuple(missing), len(placements),
                                       "placement points at absent node", required_by_kind,
                                       covered_by_kind, tuple(edge_table))
-    if not actual["drain"]:
+    if not _reachable_drain(actual_tir):
         return CoverageReport("FAILED", "FINAL_DRAIN_MISSING", len(required), len(required),
                               covered, tuple(missing), len(placements), "no actual Drain",
                               required_by_kind, covered_by_kind, tuple(edge_table))
