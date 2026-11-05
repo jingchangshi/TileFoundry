@@ -191,17 +191,37 @@ def test_vertical_run():
                                 raw_evidence.append({"family": fam, "i": inst["i"],
                                                      "mechanism": "FLAG_RAW_INSTANCE(window)"})
                         covered_counts["RAW"] = 4 * len(families)
-                        op_order = []
-                        for path, node in SY._walk(injected):
-                            if isinstance(node, _Eval):
-                                op_order.append(type(node.callable).__name__)
-                            if len(op_order) >= 12:
-                                break
-                        war_evidence = [{"root_index": r, "transition": "i%d->i%d" % (i, i + 1),
-                                         "kind": k, "mechanism": "SAME_PIPE_ORDER",
-                                         "evidence": op_order[:8]}
-                                        for r in range(3) for i in range(3) for k in ("WAR", "FREE")]
-                        covered_counts["WAR_FREE"] = min(18, len(war_evidence))
+                        op_by_action = {}
+                        for task in problem.tasks:
+                            g = task.get if isinstance(task, dict) else lambda k, t=task: getattr(t, k, None)
+                            for aid in (g("action_ids") or []):
+                                op_by_action[str(aid)] = str(g("op") or "?")
+                        pipe_of = {"GmToUb": "DMA", "copy": "DMA", "Vld": "vector", "Vsts": "vector"}
+                        root_pipes = {}
+                        for acc in cplan.accesses:
+                            pipe = pipe_of.get(op_by_action.get(str(acc.action_id), "?"), "?")
+                            root_pipes.setdefault(str(acc.buffer_root), set()).add(pipe)
+                        war_evidence = []
+                        covered_war = 0
+                        for root, pipes in sorted(root_pipes.items()):
+                            if not str(root).startswith("smem@"):
+                                continue  # WAR/FREE obligations are on the 3 SMEM reuse roots only
+                            if pipes <= {"vector"}:
+                                mechanism, cross = "SAME_PIPE_ORDER", False
+                            elif pipes <= {"DMA"}:
+                                mechanism, cross = "SAME_PIPE_ORDER", False
+                            else:
+                                mechanism, cross = "FLAG_CHANNEL_REQUIRED", True
+                            for i in range(3):
+                                for k in ("WAR", "FREE"):
+                                    war_evidence.append({"root": root, "transition": "i%d->i%d" % (i, i + 1),
+                                                         "kind": k, "mechanism": mechanism,
+                                                         "pipe_of_producer": sorted(pipes),
+                                                         "cross_pipe": cross,
+                                                         "evidence": "accesses to this root span pipes %s" % sorted(pipes)})
+                                    if not cross:
+                                        covered_war += 1
+                        covered_counts["WAR_FREE"] = covered_war
                         run["steps"]["C"] = {"status": getattr(coverage, "status", None),
                                              "code": getattr(coverage, "code", None),
                                              "required_full": len(expected["all"]),
@@ -246,9 +266,8 @@ def test_vertical_run():
         try:
             from tilefoundry_ascend.plan.materialize import index_statements_ledger as _idx
             _p = _idx(tir)
-            _bad = dataclasses.replace(plan, accesses=(
-                dataclasses.replace(plan.accesses[0], action_id=str(plan.accesses[0].action_id) + "x9"),
-            ) + tuple(plan.accesses[1:]))
+            # duplicate the same operand access in its group -> two accesses claim one operand
+            _bad = dataclasses.replace(plan, accesses=tuple(plan.accesses) + (plan.accesses[0],))
             MAT.materialize_plan(tir, _bad)
             run["controls"]["wrong_operand"] = "UNEXPECTED_PASS"
         except Exception as error:  # noqa: BLE001
@@ -265,7 +284,16 @@ def test_vertical_run():
             run["controls"]["unsupported_op"] = "UNEXPECTED_PASS"
         except Exception as error:  # noqa: BLE001
             run["controls"]["unsupported_op"] = getattr(error, "code", type(error).__name__)
-        run["controls"]["drain_phase"] = "NOT_RUN(no overlapping-domain plan constructed)"
+        try:
+            _badloop = dataclasses.replace(
+                plan.loop,
+                prologue_domain={"start": 0, "stop": 2, "step": 1},
+                steady_domain={"start": 1, "stop": 4, "step": 1},
+                drain_domain={"start": 4, "stop": 4, "step": 1})
+            RP.validate_phase_domains(_badloop)
+            run["controls"]["drain_phase"] = "UNEXPECTED_PASS"
+        except Exception as error:  # noqa: BLE001
+            run["controls"]["drain_phase"] = getattr(error, "code", type(error).__name__)
 
     gm_task = next((a.task for a in problem.accesses if not str(a.root).startswith("smem@")), None)
     if gm_task is not None:
@@ -280,7 +308,11 @@ def test_vertical_run():
     excluded_empty = not c_step.get("excluded_by_kind")
     r_pass = run["steps"].get("R", {}).get("verify") == "PASS"
     s_ok = run["steps"].get("S", {}).get("state") == "SAT" and poc_in.supported_required_unknown == 0
-    run["device_ready"] = bool(covered_total == 47 and excluded_empty and r_pass and s_ok)
+    run["chain_consistent"] = bool(excluded_empty and r_pass and s_ok)
+    run["sat_scope"] = "NOMINAL_MODEL_ONLY"
+    run["physical_feasibility"] = "UNPROVEN"
+    run["device_ready_blocked_by"] = "SOLVER_POSTCHECK_NOT_IMPLEMENTED"
+    run["device_ready"] = False  # S3 source postcheck not implemented -> never device-ready
     print(json.dumps(run, indent=1, default=str)[:6000])
     assert run["steps"]["L"]["obligations"] == 47
     assert run["steps"]["S"]["sat_scope"] == "NOMINAL_MODEL_ONLY"
@@ -289,7 +321,12 @@ def test_vertical_run():
     assert run["controls"]["fallback_not_sat"] == "FALLBACK"
     assert run["controls"]["filter_obligation_access"] == "POC_ADAPTER_UNSUPPORTED_ACCESS"
     print("CONTROLS_ONLY " + json.dumps(run["controls"], default=str))
-    assert run["device_ready"] is True, run["steps"].get("C")
+    assert run["device_ready"] is False and run["chain_consistent"] is True
+    import pathlib as _pl
+    _out = _pl.Path(os.path.dirname(ROOT)) / "TileFoundry_Ascend950PR_AgentTeam/artifacts/run03/w40_vertical/single_run.json"
+    _out.parent.mkdir(parents=True, exist_ok=True)
+    _out.write_text(json.dumps(run, indent=1, default=str))
+    print("WROTE", _out)
 
 
 def main() -> int:
