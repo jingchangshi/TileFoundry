@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from probe_base import run_probe  # noqa: E402
 
 
-def build_kernel(T):
+def build_kernel_widening(T):
+    """bf16 -> f32. UNPK_B16 belongs to VLD and is transport, NOT a cast."""
     @T.prim_func
     def main(IN: T.Tensor((64,), "bfloat16"),
              PREFILL: T.Tensor((64,), "float32"),
@@ -41,6 +42,63 @@ def build_kernel(T):
                 T.simd.vsts(dst[0], r, mask16)
             T.copy(dst[:], OUT[:])
     return main
+
+
+def build_kernel_narrowing(T):
+    """f32 -> bf16. This direction had NO kernel at all before.
+
+    The harness sent every vcvt case to the widening kernel, so a narrowing case
+    could not have run even with its tensors built correctly: the signature is the
+    other way round. vld uses dist="NORM" because the source is plain f32 and
+    UNPK_B16 is a bf16-lane transport, not a numeric cast.
+
+    part=0 (PART_EVEN) is explicit. Measured on device 1 with 64 distinct inputs,
+    input lane i lands at output slot 2*i and the odd slots keep the prefill, i.e.
+    one 16-bit result per 32-bit destination word. That is observed, not assumed.
+
+    KNOWN OPEN GAP: the mask is a hardcoded full pset(16). A case that declares a
+    PARTIAL mask (vcvt_inactive_lane_preservation declares lanes 0..31) is therefore
+    NOT exercised: every lane is written and the prefill is overwritten. That case
+    establishes nothing about MODE_MERGING vs MODE_ZEROING and must not be cited as
+    inactive-lane evidence until the mask is plumbed in from the case data.
+    """
+    @T.prim_func
+    def main(IN: T.Tensor((64,), "float32"),
+             PREFILL: T.Tensor((64,), "bfloat16"),
+             AUX: T.Tensor((64,), "float32"),
+             OUT: T.Tensor((64,), "bfloat16")):
+        with T.Kernel(1) as core:
+            src = T.alloc_shared((64,), "float32")
+            dst = T.alloc_shared((64,), "bfloat16")
+            T.copy(IN[:], src[:])
+            T.copy(PREFILL[:], dst[:])
+            with T.SimdVF():
+                mask16 = T.simd.pset(16)        # 16 bit = min(src, target)
+                carrier = T.simd.vld(src[0], dist="NORM")   # plain f32 transport
+                # <<< THE SINGLE INSTRUCTION UNDER TEST (part=0, ROUND_R)
+                r = T.simd.vcvt(carrier, "bfloat16", mask16, part=0, round="ROUND_R")
+                T.simd.vsts(dst[0], r, mask16)
+            T.copy(dst[:], OUT[:])
+    return main
+
+
+def build_kernel(T, case=None):
+    """Choose the kernel by the case DECLARED direction, never by probe identity.
+
+    Before this existed there was ONE kernel - widening - and every vcvt case was
+    compiled through it. A narrowing case could not run even with correct tensors,
+    because the tensor signature itself was the other way round.
+    """
+    if case is None:
+        return build_kernel_widening(T)
+    return (build_kernel_widening(T) if case.get("source_dtype") == "bfloat16"
+            else build_kernel_narrowing(T))
+
+
+#: Cases whose `mask` field is NOT plumbed into the kernel. Their partial-mask
+#: claims are UNEXERCISED and must not be cited as evidence. An explicit list so a
+#: future test can fail loudly instead of trusting the case name.
+MASK_NOT_PLUMBED = ("vcvt_inactive_lane_preservation",)
 
 
 if __name__ == "__main__":

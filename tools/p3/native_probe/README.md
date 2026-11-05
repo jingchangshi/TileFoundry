@@ -44,7 +44,7 @@ and an explicit \`vdupv(POS_LOWEST)\`; a broadcast is never baked into \`vcadd\`
 | file | role |
 |---|---|
 | \`vectors.py\` | CPU-only predictor; 14 cases, full 64-lane input bits; \`--emit expected_bits.json\` was run ONCE on CPU this round (design artifact, labelled prediction) |
-| \`expected_bits.json\` | full 64-lane input bits / dst prefill / mask + predicted outputs for each HYPOTHESIS; sha256 \`64ec545a6797674eae12af2cf6ad3d68b7411e350869da807099d8acc0aa7d57\` |
+| \`expected_bits.json\` | full 64-lane input bits / dst prefill / mask + predicted outputs for each HYPOTHESIS; sha256 \`e3427b129b85b56e4ec2c6a365b5556628be8246a17b1f7524ac60581c371a76\` (pinned by \`test_case_data.py::test_expected_bits_sha_matches_readme\`) |
 | \`device_guard.py\` | root / auth / device0 / single flock / npu-smi before+after / bounded timeout / selected-build hash verification |
 | \`probe_base.py\` | 3-input + out kernel ABI, full-lane readback, model comparison, \`--plan\` vs \`--execute\` |
 | \`vcadd_probe.py\`, \`vcvt_probe.py\`, \`vmula_probe.py\` | ONE instruction under test per kernel (transport vld/vsts/copy excluded); vcadd also has \`--six-calls\` (six \`vcadd\` + explicit \`vdupv(POS_LOWEST)\`) |

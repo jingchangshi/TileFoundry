@@ -202,6 +202,7 @@ def build_cases() -> dict:
     for i in range(LANES):
         carrier.append(bf16_cases.get(i, 0x0000))
     c = {"name": "vcvt_bf16_to_f32_part0", "kind": "vcvt",
+         "source_dtype": "bfloat16", "dest_dtype": "float32",
          "input_bf16_bits": ["0x%04X" % b for b in carrier],
          "carrier_packing": "two bf16 per 32-bit word; UNPK_B16 is a VLD dist, NOT a numeric cast",
          "part": 0, "mask_granularity_bits": 16,
@@ -211,21 +212,75 @@ def build_cases() -> dict:
                        "part1_widen": ["0x%08X" % bits(bf16_to_f32(b)) for b in carrier[::2] + carrier[1::2]],
                        "note": "part=1 is a DIFFERENT lane mapping and is NOT the TF path; "
                                "a wrong part must be refused by name (HANDOFF §5.4/§5.5)."},
+         # RULED observation from the device-1 run (2026-11-05), kept in the artifact
+         # so it survives context loss. It is NEITHER a pass NOR a protocol failure.
+         "native_observations": {
+             "nan_payload_not_preserved": {
+                 "lane": 5,
+                 "source_bf16_bits": "0x7FC0",
+                 "model_predicted": "0x7FC00000",
+                 "device_observed": "0x7FFFFFFF",
+                 "statement": "bf16 NaN payload is not preserved: the device produces "
+                              "an all-ones quiet NaN (0x7FFFFFFF) rather than keeping "
+                              "the payload (0x7FC00000).",
+                 "counts_as_pass": False,
+                 "counts_as_protocol_failure": False,
+                 "ruling": "recorded as a native OBSERVATION FACT by architect/Lead "
+                           "ruling 2026-11-05; tightening it into a hard rule requires "
+                           "an ARCHITECT ruling and must not be self-judged as a failure",
+                 "scope": "this case and this instruction only: vcvt bf16->f32, ROUND_R, "
+                          "part=0, 16-bit mask; not generalisable to any other "
+                          "instruction or direction",
+                 "measured_on": "device 1, 2026-11-05",
+             },
+         },
          "status": "UNSOURCED / UNVALIDATED (model prediction, NOT device observation)"}
     cases.append(c)
     tie_vals = [0x3F802000, 0x3F806000, 0x3F80A000, 0x3F80E000,  # around bf16 ties
                 0x00400000, 0x00800000, 0x00000001, 0x80000001]
+    # NARROWING. dest_dtype is bfloat16, so predictions are 16-bit codewords in
+    # DESTINATION-SLOT space, not the contiguous 16-bit packing of the sources.
+    # Layout MEASURED on device 1 (2026-11-05, 64 distinct f32 inputs): source lane
+    # i lands at destination slot 2*i and odd slots keep the prefill, because part=0
+    # (PART_EVEN) writes one 16-bit result per 32-bit destination word. Source lanes
+    # 32..63 therefore have no slot in a 64-slot bf16 destination; that is recorded,
+    # not silently truncated.
+    rne_src = [f32_to_bf16_rne(from_bits(b)) for b in (tie_vals * 8)]
+    even_slot = ["0x0000"] * LANES
+    for i in range(LANES // 2):
+        even_slot[2 * i] = "0x%04X" % rne_src[i]
     c2 = {"name": "vcvt_f32_to_bf16_rne_ftz", "kind": "vcvt",
+          "source_dtype": "float32", "dest_dtype": "bfloat16",
           "input_bits": ["0x%08X" % b for b in (tie_vals * 8)],
           "mask_granularity_bits": 16, "round": "ROUND_R", "part": 0,
-          "predicted": {"rne_bf16": ["0x%04X" % f32_to_bf16_rne(from_bits(b)) for b in (tie_vals * 8)],
+          "layout": {
+              "rule": "destination slot 2*i receives the conversion of source lane i",
+              "odd_slots": "keep the prefill; part=0 does not write them",
+              "source_lanes_32_to_63": "no destination slot in a 64-slot bf16 window",
+              "basis": "OBSERVED on device 1 2026-11-05 with 64 distinct f32 inputs; "
+                       "NOT inferred from the instruction name or the case name"},
+          # Only 0x00400000 is a DECISIVE FTZ probe: it is an f32 subnormal that
+          # converts to a non-zero bf16 (0x0040) unless it is flushed. 0x00000001 is
+          # NOT usable as an FTZ probe - it is 2^-149, below the smallest bf16
+          # subnormal (2^-133), so it rounds to 0x0000 under plain RNE whether or not
+          # FTZ is active. Declaring it as evidence would prove nothing.
+          "subnormal_probe": [
+              {"src_lane": 4, "src_f32_bits": "0x00400000", "dst_slot": 8,
+               "if_flushed": "0x0000", "if_not_flushed": "0x0040"},
+          ],
+          "predicted": {"rne_bf16_even_slots": even_slot,
+                        "rne_bf16_contiguous_reference": [
+                            "0x%04X" % b for b in rne_src],
+                        "odd_slots_rule": "preserved prefill, not written by part=0",
                         "ftz_daz_if_flushed": "subnormal f32 inputs (0x00400000, 0x00000001) "
                                               "become bf16 0x0000 instead of the RNE subnormal/normal",
-                        "note": "ROUND_R ties-to-even at the bf16 mantissa boundary; "
-                                "FTZ/DAZ is a device property to be OBSERVED, not assumed."},
+                        "note": "ROUND_R ties-to-even at the bf16 mantissa boundary. "
+                                "FTZ/DAZ is a device property to be OBSERVED, never assumed: "
+                                "the case NAME says ftz and is not evidence."},
           "status": "UNSOURCED / UNVALIDATED (model prediction, NOT device observation)"}
     cases.append(c2)
     c3 = {"name": "vcvt_inactive_lane_preservation", "kind": "vcvt",
+          "source_dtype": "bfloat16", "dest_dtype": "float32",
           "input_bf16_bits": ["0x%04X" % b for b in carrier],
           "mask": mask_vector(list(range(0, 32))), "mask_granularity_bits": 16,
           "dst_prefill_bits": ["0x%08X" % ((0x40400000 + i) & 0xFFFFFFFF) for i in range(LANES)],

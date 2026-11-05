@@ -1712,6 +1712,8 @@
   {
    "name": "vcvt_bf16_to_f32_part0",
    "kind": "vcvt",
+   "source_dtype": "bfloat16",
+   "dest_dtype": "float32",
    "input_bf16_bits": [
     "0x3F80",
     "0x3F81",
@@ -2048,11 +2050,27 @@
     ],
     "note": "part=1 is a DIFFERENT lane mapping and is NOT the TF path; a wrong part must be refused by name (HANDOFF \u00a75.4/\u00a75.5)."
    },
+   "native_observations": {
+    "nan_payload_not_preserved": {
+     "lane": 5,
+     "source_bf16_bits": "0x7FC0",
+     "model_predicted": "0x7FC00000",
+     "device_observed": "0x7FFFFFFF",
+     "statement": "bf16 NaN payload is not preserved: the device produces an all-ones quiet NaN (0x7FFFFFFF) rather than keeping the payload (0x7FC00000).",
+     "counts_as_pass": false,
+     "counts_as_protocol_failure": false,
+     "ruling": "recorded as a native OBSERVATION FACT by architect/Lead ruling 2026-11-05; tightening it into a hard rule requires an ARCHITECT ruling and must not be self-judged as a failure",
+     "scope": "this case and this instruction only: vcvt bf16->f32, ROUND_R, part=0, 16-bit mask; not generalisable to any other instruction or direction",
+     "measured_on": "device 1, 2026-11-05"
+    }
+   },
    "status": "UNSOURCED / UNVALIDATED (model prediction, NOT device observation)"
   },
   {
    "name": "vcvt_f32_to_bf16_rne_ftz",
    "kind": "vcvt",
+   "source_dtype": "float32",
+   "dest_dtype": "bfloat16",
    "input_bits": [
     "0x3F802000",
     "0x3F806000",
@@ -2122,8 +2140,89 @@
    "mask_granularity_bits": 16,
    "round": "ROUND_R",
    "part": 0,
+   "layout": {
+    "rule": "destination slot 2*i receives the conversion of source lane i",
+    "odd_slots": "keep the prefill; part=0 does not write them",
+    "source_lanes_32_to_63": "no destination slot in a 64-slot bf16 window",
+    "basis": "OBSERVED on device 1 2026-11-05 with 64 distinct f32 inputs; NOT inferred from the instruction name or the case name"
+   },
+   "subnormal_probe": [
+    {
+     "src_lane": 4,
+     "src_f32_bits": "0x00400000",
+     "dst_slot": 8,
+     "if_flushed": "0x0000",
+     "if_not_flushed": "0x0040"
+    }
+   ],
    "predicted": {
-    "rne_bf16": [
+    "rne_bf16_even_slots": [
+     "0x3F80",
+     "0x0000",
+     "0x3F80",
+     "0x0000",
+     "0x3F81",
+     "0x0000",
+     "0x3F81",
+     "0x0000",
+     "0x0040",
+     "0x0000",
+     "0x0080",
+     "0x0000",
+     "0x0000",
+     "0x0000",
+     "0x8000",
+     "0x0000",
+     "0x3F80",
+     "0x0000",
+     "0x3F80",
+     "0x0000",
+     "0x3F81",
+     "0x0000",
+     "0x3F81",
+     "0x0000",
+     "0x0040",
+     "0x0000",
+     "0x0080",
+     "0x0000",
+     "0x0000",
+     "0x0000",
+     "0x8000",
+     "0x0000",
+     "0x3F80",
+     "0x0000",
+     "0x3F80",
+     "0x0000",
+     "0x3F81",
+     "0x0000",
+     "0x3F81",
+     "0x0000",
+     "0x0040",
+     "0x0000",
+     "0x0080",
+     "0x0000",
+     "0x0000",
+     "0x0000",
+     "0x8000",
+     "0x0000",
+     "0x3F80",
+     "0x0000",
+     "0x3F80",
+     "0x0000",
+     "0x3F81",
+     "0x0000",
+     "0x3F81",
+     "0x0000",
+     "0x0040",
+     "0x0000",
+     "0x0080",
+     "0x0000",
+     "0x0000",
+     "0x0000",
+     "0x8000",
+     "0x0000"
+    ],
+    "rne_bf16_contiguous_reference": [
      "0x3F80",
      "0x3F80",
      "0x3F81",
@@ -2189,14 +2288,17 @@
      "0x0000",
      "0x8000"
     ],
+    "odd_slots_rule": "preserved prefill, not written by part=0",
     "ftz_daz_if_flushed": "subnormal f32 inputs (0x00400000, 0x00000001) become bf16 0x0000 instead of the RNE subnormal/normal",
-    "note": "ROUND_R ties-to-even at the bf16 mantissa boundary; FTZ/DAZ is a device property to be OBSERVED, not assumed."
+    "note": "ROUND_R ties-to-even at the bf16 mantissa boundary. FTZ/DAZ is a device property to be OBSERVED, never assumed: the case NAME says ftz and is not evidence."
    },
    "status": "UNSOURCED / UNVALIDATED (model prediction, NOT device observation)"
   },
   {
    "name": "vcvt_inactive_lane_preservation",
    "kind": "vcvt",
+   "source_dtype": "bfloat16",
+   "dest_dtype": "float32",
    "input_bf16_bits": [
     "0x3F80",
     "0x3F81",
