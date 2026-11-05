@@ -9,6 +9,9 @@ a new compiler and does NOT touch the device. It defines:
   * compile/bind/invoke are explicitly CODEGEN_CONTRACT_UNIMPLEMENTED until X3/X4.
 
 Only R/C VERIFIED inputs may reach X. emit_for_codegen is the sole plan boundary.
+X3 consumes the H4 identity chain for TL_ASCEND_C_SOURCE_PATH: source+CCE+load must be
+OBSERVED with hashes and binary must be explicitly UNOBSERVED_BY_BUILD; a fabricated
+binary OBSERVED or a generic UNOBSERVED is refused.
 """
 from __future__ import annotations
 
@@ -46,6 +49,9 @@ def _digest(value) -> str:
 LOGICAL_TL_RECOMPILE = "LOGICAL_TL_RECOMPILE"
 RESOLVED_PLAN_PRESERVING = "RESOLVED_PLAN_PRESERVING"
 MODES = (LOGICAL_TL_RECOMPILE, RESOLVED_PLAN_PRESERVING)
+TL_ASCEND_C_SOURCE_PATH = "TL_ASCEND_C_SOURCE_PATH"
+BINARY_UNOBSERVED_BY_BUILD = "UNOBSERVED_BY_BUILD"
+IDENTITY_KEYS = ("source", "cce", "binary", "load")
 
 
 @dataclass(frozen=True)
@@ -191,7 +197,8 @@ def lower_to_tilelang(request: AdapterRequest, actual_tir, source_maps) -> TLMod
 
 
 def verify_adapter_correspondence(request: AdapterRequest, tl_module: TLModule,
-                                  source_map, abi, *, claim_pass=False) -> dict:
+                                  source_map, abi, *, claim_pass=False,
+                                  identity_chain=None, claim_path=TL_ASCEND_C_SOURCE_PATH) -> dict:
     source_map = source_map or {}
     statements = source_map.get("statements", {}) or {}
     if not statements:
@@ -202,9 +209,17 @@ def verify_adapter_correspondence(request: AdapterRequest, tl_module: TLModule,
                            "TL module does not preserve the resolved Plan",
                            "plan_preserved", True, tl_module.plan_preserved)
     abi.validate()
-    cce = source_map.get("cce") or {}
-    binary = source_map.get("binary") or {}
-    load = source_map.get("load") or {}
+    chain = None
+    if identity_chain is not None:
+        chain = validate_h4_identity_chain(identity_chain, claim_path=claim_path,
+                                           claim_pass=claim_pass)
+        cce = {"status": chain["identities"]["cce"]["status"]}
+        binary = {"status": chain["identities"]["binary"]["status"]}
+        load = {"status": chain["identities"]["load"]["status"]}
+    else:
+        cce = source_map.get("cce") or {}
+        binary = source_map.get("binary") or {}
+        load = source_map.get("load") or {}
     missing = [name for name, value in (("cce", cce), ("binary", binary), ("load", load))
                if not value or str(_get(value, "status", "")).upper() == "UNOBSERVED"]
     if claim_pass and missing:
@@ -216,8 +231,74 @@ def verify_adapter_correspondence(request: AdapterRequest, tl_module: TLModule,
             "identities": {"source": "MAPPED", "cce": str(_get(cce, "status", "UNOBSERVED")),
                            "binary": str(_get(binary, "status", "UNOBSERVED")),
                            "load": str(_get(load, "status", "UNOBSERVED"))},
-            "missing_execution_identities": missing, "claim_pass": bool(claim_pass)}
+            "missing_execution_identities": missing, "claim_pass": bool(claim_pass),
+            "identity_chain": chain}
 
+
+TL_ASCEND_C_SOURCE_PATH = "TL_ASCEND_C_SOURCE_PATH"
+BINARY_UNOBSERVED_BY_BUILD = "UNOBSERVED_BY_BUILD"
+IDENTITY_KEYS = ("source", "cce", "binary", "load")
+
+
+def _identity_status(value):
+    if not isinstance(value, dict):
+        return "MISSING", None, ""
+    status = str(value.get("status", "MISSING")).upper()
+    sha = value.get("sha256")
+    reason = str(value.get("reason") or "")
+    if status == "OBSERVED" and not sha:
+        return "OBSERVED_WITHOUT_HASH", sha, reason
+    return status, sha, reason
+
+
+def normalize_h4_identity_chain(identities):
+    identities = dict(identities or {})
+    normalized = {}
+    for key in IDENTITY_KEYS:
+        source = identities.get(key)
+        status, sha, reason = _identity_status(source)
+        if key == "binary" and status in ("UNOBSERVED", "UNOBSERVED_BY_BUILD"):
+            lowered = reason.lower()
+            if status == "UNOBSERVED_BY_BUILD" or ("artifact" in lowered and
+                                                    ("none" in lowered or "not expose" in lowered)):
+                status = BINARY_UNOBSERVED_BY_BUILD
+            else:
+                status = "UNOBSERVED_UNNAMED"
+        normalized[key] = {"status": status, "sha256": sha, "reason": reason}
+    return normalized
+
+
+def validate_h4_identity_chain(identities, *, claim_path=TL_ASCEND_C_SOURCE_PATH,
+                               claim_pass=False):
+    if claim_path != TL_ASCEND_C_SOURCE_PATH:
+        raise CodegenError("X_CLAIM_PATH_UNSUPPORTED", "unknown identity claim path",
+                           "claim_path", TL_ASCEND_C_SOURCE_PATH, claim_path)
+    chain = normalize_h4_identity_chain(identities)
+    missing = [key for key in ("source", "cce", "load")
+               if chain[key]["status"] != "OBSERVED" or not chain[key]["sha256"]]
+    binary = chain["binary"]
+    if claim_pass:
+        if missing:
+            raise CodegenError("X_ARTIFACT_IDENTITY_MISSING",
+                               "claim requires observed source/CCE/load identities",
+                               "identity_chain", "OBSERVED source/cce/load", missing)
+        if binary["status"] == "OBSERVED":
+            raise CodegenError("X_BINARY_IDENTITY_UNEXPECTED",
+                               "binary OBSERVED is not valid for this TL build; do not fabricate binary hash",
+                               "binary", BINARY_UNOBSERVED_BY_BUILD, "OBSERVED")
+        if binary["status"] != BINARY_UNOBSERVED_BY_BUILD:
+            raise CodegenError("X_BINARY_IDENTITY_UNNAMED",
+                               "binary must be explicitly UNOBSERVED_BY_BUILD with reason",
+                               "binary", BINARY_UNOBSERVED_BY_BUILD, binary)
+    ready = bool(not missing and binary["status"] == BINARY_UNOBSERVED_BY_BUILD)
+    return {"schema": "x-identity-chain/1", "claim_path": claim_path,
+            "status": "IDENTITY_CHAIN_READY" if ready else "IDENTITY_CHAIN_PARTIAL",
+            "identities": chain, "missing_required": missing,
+            "binary_status": binary["status"], "claim_pass": bool(claim_pass)}
+
+
+def identities_from_h4_result(result):
+    return dict((result or {}).get("identities") or (result or {}).get("artifacts") or {})
 
 def compile_tilelang(module, abi, env_context, compile_policy):
     raise CodegenError("CODEGEN_CONTRACT_UNIMPLEMENTED",
@@ -252,4 +333,6 @@ __all__ = ["CodegenError", "SourceIdentity", "KernelABI", "AdapterRequest", "TLM
            "CompiledArtifactBundle", "LOGICAL_TL_RECOMPILE", "RESOLVED_PLAN_PRESERVING",
            "validate_adapter_request", "lower_to_tilelang", "verify_adapter_correspondence",
            "compile_tilelang", "bind_kernel", "invoke_kernel", "synchronize_and_readback",
-           "emit_for_codegen"]
+           "emit_for_codegen", "TL_ASCEND_C_SOURCE_PATH", "BINARY_UNOBSERVED_BY_BUILD",
+           "IDENTITY_KEYS", "normalize_h4_identity_chain", "validate_h4_identity_chain",
+           "identities_from_h4_result"]
