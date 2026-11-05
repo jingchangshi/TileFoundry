@@ -494,8 +494,22 @@ def collect_tir_pipeline_declarations(module) -> dict:
     this walks the statement tree instead. Keys are positions in document order, the
     same shape the authored reader produces, because a key based on id() would differ
     between two views of one program and could never match.
+
+    Every statement that HOLDS a body must be descended through by its REAL field:
+    `Sequential.body`, `For.body`, `MeshScope.body`, `ExecutionScope.body`, and both
+    arms of an `If`. A lowered pipelined loop sits inside a MeshScope and usually an
+    ExecutionScope, so a reader that only knew the top-level container found nothing
+    and its verdict was an empty actual -- the false PIPELINE_DECLARATION_LOST this
+    function exists to avoid.
     """
-    from tilefoundry.ir.tir.stmts import For, If, Sequential  # noqa: PLC0415
+    from tilefoundry.ir.tir.stmts import (  # noqa: PLC0415
+        ExecutionScope,
+        For,
+        If,
+        MeshScope,
+        Sequential,
+        While,
+    )
 
     found: list = []
 
@@ -506,11 +520,13 @@ def collect_tir_pipeline_declarations(module) -> dict:
         elif isinstance(node, For):
             found.append(node)
             walk(node.body)
-        elif isinstance(node, (If,)):
-            walk(getattr(node, "then_body", None))
-            walk(getattr(node, "else_body", None))
-        elif isinstance(node, Sequential):
-            walk(getattr(node, "stmts", ()) or ())
+        elif isinstance(node, While):
+            walk(node.body)
+        elif isinstance(node, If):
+            walk(node.then_body)
+            walk(node.else_body)
+        elif isinstance(node, (Sequential, MeshScope, ExecutionScope)):
+            walk(node.body)
 
     for item in getattr(module, "functions", ()) or ():
         walk(getattr(item, "body", None))
