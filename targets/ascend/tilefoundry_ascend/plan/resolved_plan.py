@@ -398,13 +398,16 @@ def build_resolved_plan(problem, solve_result, source_manifests) -> ResolvedPlan
     """
     status = _solve_status(solve_result)
     if status != SAT_POSTCHECKED:
-        raise PlanError("PLAN_REQUIRES_SAT", "plan needs a post-checked SAT solve",
-                        "solve_result", SAT_POSTCHECKED, status)
+        raise PlanError("PLAN_REQUIRES_SAT", "need post-checked SAT", "solve_result",
+                        SAT_POSTCHECKED, status)
     source_manifests = source_manifests or {}
+    # Each source manifest here is a SCHEMA/CAPABILITY reference (a non-empty descriptor/digest),
+    # NOT proof that the source has finished. In particular C's completion stays PENDING; R must
+    # not block itself waiting for a final C VERIFIED result (that would be circular).
     for key in ("L", "S", "C", "F", "P"):
         if not source_manifests.get(key):
-            raise PlanError("PLAN_SOURCE_MISMATCH", "missing source manifest: " + key,
-                            key, "digest", None)
+            raise PlanError("PLAN_SOURCE_MISMATCH", "missing source ref: " + key,
+                            key, "descriptor", None)
 
     tasks_in = list(_get(problem, "tasks", []))
     accesses_in = list(_get(problem, "accesses", []))
