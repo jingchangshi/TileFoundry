@@ -145,4 +145,7 @@ back to `0.0.0+unknown` when the untracked `src/tilefoundry.egg-info` is absent,
 `git archive` checkout can collect and run tests without installed package metadata.
 If a release needs real metadata, generate it offline with the local wheels via
 `python -m pip install -e . --no-index --find-links envs/wheels` (do not rely on the
-working tree's egg-info).
+working tree's egg-info). The fallback also sets
+`__version_source__ = "fallback-uninstalled"`; features that require an authoritative
+version MUST call `tilefoundry.require_version()` (or check the flag), which fails by
+name `VERSION_SOURCE_FALLBACK` instead of treating `0.0.0+unknown` as real.

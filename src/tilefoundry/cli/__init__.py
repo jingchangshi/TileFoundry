@@ -8,6 +8,7 @@ from importlib.metadata import PackageNotFoundError, metadata
 from typing import Sequence
 
 from tilefoundry import __version__ as _tf_version
+from tilefoundry import __version_source__ as _tf_version_source
 
 from tilefoundry.analysis import AnalysisError
 from tilefoundry.cli.analyze import ANALYSES, EVIDENCE, run_authored_analysis
@@ -92,7 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--version",
         action="version",
-        version=f"tilefoundry {_tf_version}",
+        version=f"tilefoundry {_tf_version}" + (
+            " (fallback-uninstalled)" if _tf_version_source != "installed" else ""),
         help="print the installed version and exit",
     )
     commands = parser.add_subparsers(dest="command", title="Common commands", metavar="<command>")

@@ -14,8 +14,22 @@ from importlib.metadata import version as _distribution_version
 
 try:
     __version__ = _distribution_version("tilefoundry")
+    __version_source__ = "installed"
 except PackageNotFoundError:  # clean archive: no installed egg-info, still importable
     __version__ = "0.0.0+unknown"
+    __version_source__ = "fallback-uninstalled"
+
+
+def require_version() -> str:
+    """Return the distribution version only when it is authoritative.
+
+    A fallback version is deliberately NOT a normal version: features that gate on
+    version compatibility must call this (or check __version_source__) and fail by
+    name instead of accepting 0.0.0+unknown.
+    """
+    if __version_source__ != "installed":
+        raise RuntimeError("VERSION_SOURCE_FALLBACK: tilefoundry distribution metadata is not installed")
+    return __version__
 
 
 from tilefoundry.ir.core import (
@@ -97,6 +111,8 @@ def view(root, *, port: int = 0, open_browser: bool = True) -> int:
 
 __all__ = [
     "__version__",
+    "__version_source__",
+    "require_version",
     "Expr",
     "Var",
     "Constant",
