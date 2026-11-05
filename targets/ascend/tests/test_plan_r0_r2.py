@@ -283,8 +283,9 @@ def test_r2_stale_map_is_materialization_map_mismatch():
 def test_r2_non_serial_or_multiversion_is_refused():
     plan = build_ready()
     serial_single = plan
+    # R3 owns V2; R2's guard still refuses >2 versions and any non-SERIAL mode.
     multi = dataclasses.replace(plan, buffers=(
-        dataclasses.replace(plan.buffers[0], slot_count=2),))
+        dataclasses.replace(plan.buffers[0], slot_count=3),))
     expect_code("PLAN_MATERIALIZATION_UNSUPPORTED",
                 lambda: MAT.materialize_plan(make_tir_fixture(), multi))
     dynamic = dataclasses.replace(plan, loop=dataclasses.replace(

@@ -122,6 +122,14 @@ def _view(access, plan, env):
                 args=(address,))
 
 
+def _access_env(access, plan, env, k):
+    """The per-buffer slot for execution ordinal k: slot(k) = k % V."""
+    buffer = next(b for b in plan.buffers if b.root == access.buffer_root)
+    scoped = dict(env)
+    scoped["slot"] = int(k) % int(buffer.slot_count)
+    return scoped
+
+
 def _bool_type():
     return make_tensor_type((), dtype="bool", storage="umat")
 
@@ -137,10 +145,12 @@ def materialize_plan(tir_module, plan: ResolvedPlan, *, sidecar_only=False,
         raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED", "R2 supports SERIAL only",
                         "application_mode", "SERIAL", plan.loop.application_mode)
     for buffer in plan.buffers:
-        if int(buffer.slot_count) != 1:
+        # R3 supports static V1 or V2 (the latter is the ring case: slot=k%V).
+        # More than two versions, or any dynamic loop, remains explicitly unsupported.
+        if int(buffer.slot_count) not in (1, 2):
             raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED",
-                            "R2 fixes a single version; multi-version is R3",
-                            buffer.root, 1, buffer.slot_count)
+                            "R3 supports static V1/V2 only; >2 versions is later",
+                            buffer.root, [1, 2], buffer.slot_count)
         if buffer.version_stride_bytes is None or buffer.base_offset_bytes is None:
             raise PlanError("PLAN_LAYOUT_UNRESOLVED", "resolve_buffer_layout was not run",
                             buffer.root, "resolved layout", None)
@@ -210,7 +220,9 @@ def materialize_plan(tir_module, plan: ResolvedPlan, *, sidecar_only=False,
                         raise PlanError("APPLICATION_COVERAGE_MISMATCH",
                                         "one access per operand is required", path,
                                         len(original.args), len(accesses))
-                    new_args = tuple(_view(access, plan, env) for access in accesses)
+                    new_args = tuple(
+                        _view(access, plan, _access_env(access, plan, env, k))
+                        for access in accesses)
                     rewritten = Evaluate(callable=Copy(), args=new_args)
                     body.append(If(cond=Constant(type=_bool_type(), value=bool(0 <= k < trip)),
                                    then_body=Sequential(body=(rewritten,)),
@@ -325,19 +337,42 @@ def replay_plan_addresses(plan: ResolvedPlan):
     """
     from .resolved_plan import address_range
     trip = loop_trip_count(plan.loop)
+    max_versions = max((int(buffer.slot_count) for buffer in plan.buffers), default=1)
+    if trip < max_versions + 1:
+        raise PlanError("PLAN_REPLAY_INCOMPLETE",
+                        "fewer than V+1 iterations cannot prove a ring reused a slot",
+                        "loop", max_versions + 1, trip)
     start, step = int(plan.loop.domain["start"]), int(plan.loop.domain["step"])
     rows = []
     for k in range(trip):
         iteration = start + k * step
-        env = {"i": iteration, "k": k, "slot": k - (k // 1) * 1}  # V=1 => slot 0
-        env["slot"] = 0
         for access in plan.accesses:
+            buffer = next(b for b in plan.buffers if b.root == access.buffer_root)
+            env = {"i": iteration, "k": k, "slot": k % int(buffer.slot_count)}
             generation = int(access.generation.evaluate(env))
             if generation != k:
                 raise PlanError("GENERATION_MAPPING_INVALID",
                                 "generation token is not execution ordinal k",
                                 access.access_id, k, generation)
+            slot = int(access.slot.evaluate(env))
+            if slot != k % int(buffer.slot_count):
+                raise PlanError("GENERATION_MAPPING_INVALID",
+                                "slot is not k%V for this access",
+                                access.access_id, k % int(buffer.slot_count), slot)
             begin, end = address_range(plan, access, env)
-            rows.append({"access_id": access.access_id, "k": k,
-                         "generation": generation, "start": begin, "end": end})
+            rows.append({"access_id": access.access_id, "buffer": access.buffer_root,
+                         "k": k, "generation": generation, "slot": slot,
+                         "start": begin, "end": end})
+    # Different live buffers in one arena must not overlap (all versions included).
+    arenas = {}
+    for buffer in plan.buffers:
+        arenas.setdefault(buffer.arena_id, []).append(
+            (int(buffer.base_offset_bytes),
+             int(buffer.base_offset_bytes) + int(buffer.allocation_bytes), buffer.root))
+    for arena_id, ranges in arenas.items():
+        ranges.sort()
+        for (base_a, end_a, root_a), (base_b, _end_b, root_b) in zip(ranges, ranges[1:]):
+            if base_b < end_a and root_a != root_b:
+                raise PlanError("PLAN_ADDRESS_OVERLAP", "live buffers overlap in arena",
+                                arena_id, "disjoint", [(root_a, base_a, end_a), (root_b, base_b)])
     return rows

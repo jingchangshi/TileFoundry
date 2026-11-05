@@ -571,6 +571,14 @@ def address_range(plan: ResolvedPlan, access: AccessPlan, env: dict):
                         access.access_id, "typed expression", OFFSET_UNKNOWN)
     relative = access.relative_byte_offset.evaluate(env)
     slot = access.slot.evaluate(env)
+    if not 0 <= int(slot) < int(buffer.slot_count):
+        raise PlanError("PLAN_ADDRESS_RANGE_INVALID", "slot outside [0,V)",
+                        access.access_id, (0, int(buffer.slot_count) - 1), slot)
+    generation = access.generation.evaluate(env)
+    if "k" in env and int(generation) != int(env["k"]):
+        raise PlanError("GENERATION_MAPPING_INVALID",
+                        "generation token is not the full execution ordinal",
+                        access.access_id, int(env["k"]), generation)
     start = (buffer.base_offset_bytes + slot * buffer.version_stride_bytes + relative)
     end = start + access.byte_footprint
     if start < buffer.base_offset_bytes or end > buffer.base_offset_bytes + buffer.allocation_bytes:
