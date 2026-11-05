@@ -25,6 +25,7 @@ from tilefoundry.ir.core import Call, Constant, Var
 from tilefoundry.ir.tir.memory import AllocTensor
 from tilefoundry.ir.tir.memory.tensor_view import TensorView
 from tilefoundry.ir.tir.memory.copy import Copy
+from tilefoundry.ir.tir.flag import Drain
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Evaluate, For, If, LetStmt, Sequential
 from tilefoundry.ir.types import Layout, PointerType, make_tensor_type
@@ -123,11 +124,33 @@ def _view(access, plan, env):
 
 
 def _access_env(access, plan, env, k):
-    """The per-buffer slot for execution ordinal k: slot(k) = k % V."""
+    """Evaluate the access's OWN ordinal, then derive slot(k)=k%V.
+
+    A stage-shifted producer/consumer must use the AccessPlan ordinal expression,
+    not the materializer's current loop iteration i/k.
+    """
     buffer = next(b for b in plan.buffers if b.root == access.buffer_root)
     scoped = dict(env)
-    scoped["slot"] = int(k) % int(buffer.slot_count)
+    ordinal = getattr(access, "execution_ordinal", None)
+    if ordinal is None:
+        raise PlanError("PLAN_STAGE_MAPPING_INVALID", "access has no ordinal expression",
+                        access.access_id, "typed ordinal", None)
+    try:
+        access_k = int(ordinal.evaluate({**scoped, "k": int(k), "i": env.get("i", int(k))}))
+    except PlanError:
+        raise PlanError("PLAN_STAGE_MAPPING_INVALID", "access ordinal cannot be evaluated",
+                        access.access_id, "evaluable PExpr", ordinal)
+    scoped["k"] = access_k
+    scoped["slot"] = access_k % int(buffer.slot_count)
     return scoped
+
+
+def _phase_of(loop, iteration):
+    for name in ("prologue", "steady", "drain"):
+        domain = getattr(loop, name + "_domain", None) or {}
+        if domain.get("start", 0) <= iteration < domain.get("stop", 0):
+            return name
+    return "steady"
 
 
 def _bool_type():
@@ -205,40 +228,51 @@ def materialize_plan(tir_module, plan: ResolvedPlan, *, sidecar_only=False,
                 body.append(new_stmt)
                 continue
         if stmt is loop_stmt:
+            phase_blocks = {"prologue": [], "steady": [], "drain": []}
             for k in range(trip):
                 iteration = start + k * step
                 env = {"i": iteration, "k": k, "slot": 0}
                 generation_token(plan.loop, iteration, supplied=k)
-                body.append(If(cond=Constant(type=_bool_type(), value=True),
-                               then_body=Sequential(body=()), else_body=Sequential(body=())))
+                phase = _phase_of(plan.loop, iteration)
                 for path, accesses in groups.items():
                     original = originals[path]
                     if any(a.access_id in skip_access_ids for a in accesses):
-                        body.append(original)       # deliberately un-applied
+                        phase_blocks[phase].append(original)  # deliberately un-applied
                         continue
                     if len(accesses) != len(original.args):
                         raise PlanError("APPLICATION_COVERAGE_MISMATCH",
                                         "one access per operand is required", path,
                                         len(original.args), len(accesses))
-                    new_args = tuple(
-                        _view(access, plan, _access_env(access, plan, env, k))
-                        for access in accesses)
+                    scoped = [_access_env(access, plan, env, k) for access in accesses]
+                    new_args = tuple(_view(access, plan, scoped[index])
+                                     for index, access in enumerate(accesses))
                     rewritten = Evaluate(callable=Copy(), args=new_args)
-                    body.append(If(cond=Constant(type=_bool_type(), value=bool(0 <= k < trip)),
-                                   then_body=Sequential(body=(rewritten,)),
-                                   else_body=Sequential(body=())))
-                    for access in accesses:
+                    phase_blocks[phase].append(If(
+                        cond=Constant(type=_bool_type(), value=bool(0 <= k < trip)),
+                        then_body=Sequential(body=(rewritten,)),
+                        else_body=Sequential(body=())))
+                    for access, access_env in zip(accesses, scoped):
+                        access_k = int(access_env["k"])
                         map_entries.append({
                             "access_id": access.access_id,
                             "action_id": access.action_id,
                             "task_id": access.task_id,
-                            "mode": access.mode, "k": k, "generation": k,
+                            "mode": access.mode, "k": k, "loop_k": k,
+                            "generation": access_k,
                             "old_stmt": path,
                             "old_fingerprint": fingerprint(original),
                             "new_fingerprint": fingerprint(rewritten),
                             "new_stmt": "unrolled:k%d:%s" % (k, access.access_id)})
+            for phase_name in ("prologue", "steady", "drain"):
+                if phase_blocks[phase_name]:
+                    body.append(If(cond=Constant(type=_bool_type(), value=True),
+                                   then_body=Sequential(body=tuple(phase_blocks[phase_name])),
+                                   else_body=Sequential(body=())))
             continue
         body.append(stmt)
+
+    # R4 terminal drain: an actual Drain node is part of the materialized TIR.
+    body.append(Evaluate(callable=Drain(), args=()))
 
     original_digest = tir_digest(tir_module)
     if sidecar_only:
@@ -265,6 +299,21 @@ def apply_plan(plan: ResolvedPlan, materialization: MaterializationMap) -> Resol
                            "materialization": materialization})
 
 
+def _expected_generation(plan, access_id, loop_k, start, step):
+    access = next((a for a in plan.accesses if a.access_id == access_id), None)
+    if access is None:
+        return None
+    ordinal = getattr(access, "execution_ordinal", None)
+    if ordinal is None:
+        return None
+    iteration = start + int(loop_k) * step
+    try:
+        return int(ordinal.evaluate({"i": iteration, "k": int(loop_k),
+                                     "slot": int(loop_k) % 1024}))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_module,
                             materialization: MaterializationMap) -> dict:
     """Independent walk of the REWRITTEN TIR: real change + full coverage + map fidelity."""
@@ -275,6 +324,12 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
     if (rewritten_module is None or rewritten_module is original_module
             or materialization.rewritten_digest == materialization.original_digest):
         report["code"] = "PLAN_NOT_APPLIED"
+        return report
+    actual_has_drain = any(
+        isinstance(stmt, Evaluate) and isinstance(stmt.callable, Drain)
+        for stmt in index_statements(rewritten_module).values())
+    if not actual_has_drain:
+        report["code"] = "PLAN_DRAIN_MISSING"
         return report
     writes = [a for a in plan.accesses if a.mode == "write"]
     trip = loop_trip_count(plan.loop)
@@ -304,10 +359,15 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
             report["code"] = "MATERIALIZATION_MAP_MISMATCH"
             report["detail"] = {"access_id": entry["access_id"], "k": entry["k"]}
             return report
-        if entry["generation"] != entry["k"]:
+        loop_k = entry.get("loop_k", entry["k"])
+        expected_generation = _expected_generation(plan, entry["access_id"], loop_k,
+                                                   int(plan.loop.domain["start"]),
+                                                   int(plan.loop.domain["step"]))
+        if expected_generation is None or int(entry["generation"]) != expected_generation:
             report["code"] = "GENERATION_MAPPING_INVALID"
             report["detail"] = {"access_id": entry["access_id"],
-                                "generation": entry["generation"], "k": entry["k"]}
+                                "generation": entry["generation"],
+                                "expected": expected_generation, "loop_k": loop_k}
             return report
     original_allocs = [s for s in index_statements(original_module).values()
                        if isinstance(s, LetStmt)]
@@ -349,19 +409,27 @@ def replay_plan_addresses(plan: ResolvedPlan):
         for access in plan.accesses:
             buffer = next(b for b in plan.buffers if b.root == access.buffer_root)
             env = {"i": iteration, "k": k, "slot": k % int(buffer.slot_count)}
+            ordinal = getattr(access, "execution_ordinal", None)
+            if ordinal is None:
+                raise PlanError("PLAN_STAGE_MAPPING_INVALID", "access has no ordinal expression",
+                                access.access_id, "typed ordinal", None)
+            access_k = int(ordinal.evaluate(env))
+            env["k"] = access_k
+            env["slot"] = access_k % int(buffer.slot_count)
             generation = int(access.generation.evaluate(env))
-            if generation != k:
+            if generation != access_k:
                 raise PlanError("GENERATION_MAPPING_INVALID",
-                                "generation token is not execution ordinal k",
-                                access.access_id, k, generation)
+                                "generation token is not the access execution ordinal",
+                                access.access_id, access_k, generation)
             slot = int(access.slot.evaluate(env))
-            if slot != k % int(buffer.slot_count):
+            if slot != access_k % int(buffer.slot_count):
                 raise PlanError("GENERATION_MAPPING_INVALID",
                                 "slot is not k%V for this access",
-                                access.access_id, k % int(buffer.slot_count), slot)
+                                access.access_id, access_k % int(buffer.slot_count), slot)
             begin, end = address_range(plan, access, env)
             rows.append({"access_id": access.access_id, "buffer": access.buffer_root,
-                         "k": k, "generation": generation, "slot": slot,
+                         "k": k, "loop_k": k, "execution_ordinal": access_k,
+                         "generation": generation, "slot": slot,
                          "start": begin, "end": end})
     # Different live buffers in one arena must not overlap (all versions included).
     arenas = {}

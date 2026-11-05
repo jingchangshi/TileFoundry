@@ -159,11 +159,13 @@ class LoopPlan:
     ii: dict                     # {"value": int, "unit": "MODEL cycles"}
     latency: dict
     execution_ordinal_def: str   # "k=(i-start)/step"
-    prologue_domain: list
-    steady_domain: list
-    drain_domain: list
+    prologue_domain: dict        # explicit start/stop/step (empty when no prologue)
+    steady_domain: dict          # explicit start/stop/step
+    drain_domain: dict           # explicit start/stop/step (empty when no drain)
     application_mode: str = "SERIAL"
     static: bool = True
+    stage_shift: int = 0         # stage shift applied to producer/consumer accesses
+    stage_depth: int = 1
 
 
 @dataclass(frozen=True)
@@ -330,6 +332,63 @@ def _solve_status(solve_result) -> str:
     return str(_get(solve_result, "status", "unknown"))
 
 
+def _empty_domain(start, step):
+    return {"start": int(start), "stop": int(start), "step": int(step)}
+
+
+def phase_domains(domain, stage_depth):
+    """Explicit prologue/steady/drain for a static loop.
+
+    All three ranges lie inside the original loop domain and are disjoint:
+      prologue = first (depth-1) iterations
+      steady   = middle until the last (depth-1) iterations
+      drain    = last (depth-1) iterations
+    For stage_depth=1 the whole loop is steady and prologue/drain are empty.
+    """
+    start, stop, step = int(domain["start"]), int(domain["stop"]), int(domain["step"])
+    depth = max(1, int(stage_depth))
+    shift = depth - 1
+    if start >= stop:
+        empty = _empty_domain(start, step)
+        return {"prologue": empty, "steady": empty, "drain": empty}
+    pro_end = min(stop, start + shift * step)
+    drain_start = max(pro_end, stop - shift * step)
+    return {
+        "prologue": {"start": start, "stop": pro_end, "step": step},
+        "steady": {"start": pro_end, "stop": drain_start, "step": step},
+        "drain": {"start": drain_start, "stop": stop, "step": step},
+    }
+
+
+def validate_phase_domains(loop: "LoopPlan") -> dict:
+    """Reject overlapping/out-of-bounds prologue/steady/drain domains."""
+    domains = {"prologue": loop.prologue_domain, "steady": loop.steady_domain,
+               "drain": loop.drain_domain}
+    for name, domain in domains.items():
+        for key in ("start", "stop", "step"):
+            if not isinstance(domain.get(key), int):
+                raise PlanError("PLAN_PHASE_DOMAIN_INVALID", "%s.%s must be int" % (name, key),
+                                loop.source_loop_id, "int", domain.get(key))
+        if domain["step"] <= 0 or domain["stop"] < domain["start"]:
+            raise PlanError("PLAN_PHASE_DOMAIN_INVALID", "%s domain is invalid" % name,
+                            loop.source_loop_id, "start<=stop, step>0", domain)
+        if domain["start"] < loop.domain["start"] or domain["stop"] > loop.domain["stop"]:
+            raise PlanError("PLAN_PHASE_DOMAIN_INVALID", "%s leaves loop domain" % name,
+                            loop.source_loop_id, loop.domain, domain)
+    ordered = [("prologue", domains["prologue"]), ("steady", domains["steady"]),
+               ("drain", domains["drain"])]
+    for (name_a, a), (name_b, b) in zip(ordered, ordered[1:]):
+        if a["stop"] > b["start"]:
+            raise PlanError("PLAN_PHASE_DOMAIN_OVERLAP", "phase domains overlap",
+                            loop.source_loop_id, "%s.stop<=%s.start" % (name_a, name_b),
+                            [a, b])
+    if loop.stage_shift != max(0, int(loop.stage_depth) - 1):
+        raise PlanError("PLAN_STAGE_SHIFT_INVALID", "stage_shift must be stage_depth-1",
+                        loop.source_loop_id, int(loop.stage_depth) - 1, loop.stage_shift)
+    return {"valid": True, "prologue": loop.prologue_domain,
+            "steady": loop.steady_domain, "drain": loop.drain_domain}
+
+
 def build_resolved_plan(problem, solve_result, source_manifests) -> ResolvedPlan:
     """R0/R1: build the plan from L's Problem + a REAL post-checked SAT result.
 
@@ -398,6 +457,11 @@ def build_resolved_plan(problem, solve_result, source_manifests) -> ResolvedPlan
                             "loop_domain", "int start/stop/step", loop_domain)
     domain = {k: int(loop_domain[k]) for k in ("start", "stop", "step")}
     trip = max(0, (domain["stop"] - domain["start"] + domain["step"] - 1) // domain["step"])
+    stage_depth = int(_get(problem, "stage_depth", 1) or 1)
+    if stage_depth < 1:
+        raise PlanError("PLAN_STAGE_SHIFT_INVALID", "stage_depth must be >= 1",
+                        "stage_depth", ">=1", stage_depth)
+    phases = phase_domains(domain, stage_depth)
     loop = LoopPlan(
         source_loop_id=str(_get(problem, "loop_id", "row_pipeline")),
         domain=domain,
@@ -406,7 +470,9 @@ def build_resolved_plan(problem, solve_result, source_manifests) -> ResolvedPlan
         ii={"value": int(_get(problem, "ii", 1) or 1), "unit": MODEL + " cycles"},
         latency={"value": int(_get(problem, "latency", 1) or 1), "unit": MODEL + " cycles"},
         execution_ordinal_def="k=(i-start)/step",
-        prologue_domain=[], steady_domain=list(range(trip)), drain_domain=[])
+        prologue_domain=phases["prologue"], steady_domain=phases["steady"],
+        drain_domain=phases["drain"], stage_shift=stage_depth - 1, stage_depth=stage_depth)
+    validate_phase_domains(loop)
 
     buffers = []
     for buffer in buffers_in:
@@ -447,12 +513,18 @@ def build_resolved_plan(problem, solve_result, source_manifests) -> ResolvedPlan
         elif not isinstance(offset, PExpr):
             raise PlanError("PLAN_ADDRESS_EXPR_INVALID", "offset must be PExpr/OFFSET_UNKNOWN",
                             access_id, "PExpr", type(offset).__name__)
+        ordinal = _get(access, "execution_ordinal", None)
+        if ordinal is None:
+            shift = int(_get(access, "stage_shift", 0) or 0)
+            ordinal = V("k") if shift == 0 else Add(V("i"), C(-shift))
+        # Stage-shifted accesses carry their own ordinal expression; it is evaluated
+        # per access, never replaced by the materializer's current loop i.
         accesses.append(AccessPlan(
             access_id=access_id, action_id=action_id, task_id=task_id,
             source_stmt=str(_get(access, "source_stmt")),
             buffer_root=str(_get(access, "root")),
             logical_index=_get(access, "logical_index", V("i")),
-            execution_ordinal=V("k"), slot=V("slot"),
+            execution_ordinal=ordinal, slot=V("slot"),
             generation=V("k"),
             relative_byte_offset=offset,
             guard=_get(access, "guard"), mode=str(_get(access, "mode", "read")),
@@ -546,18 +618,51 @@ def resolve_buffer_layout(plan: ResolvedPlan, allocation_facts) -> ResolvedPlan:
 
 
 def attach_completion(plan: ResolvedPlan, verified_C_plan) -> ResolvedPlan:
-    """R5 hook: only accept a C-verified completion plan; keep PENDING otherwise."""
-    verified = bool(_get(verified_C_plan, "verified", False))
-    digest = _get(verified_C_plan, "digest")
-    if not verified or not digest:
-        raise PlanError("COMPLETION_NOT_VERIFIED", "C completion plan is not verified",
-                        "C", "verified digest", verified_C_plan)
+    """R5: attach a REAL C verify_completion_coverage result.
+
+    The C report must be VERIFIED and must cover every source-derived obligation; a
+    local metadata flag or an empty report is not a completion proof. C derives its
+    obligations from the real L/R dependency edges; R does not manufacture them.
+    """
+    if verified_C_plan is None:
+        raise PlanError("COMPLETION_NOT_VERIFIED", "no C verification result supplied",
+                        "C", "VERIFIED CoverageReport", None)
+    status = str(_get(verified_C_plan, "status", "") or "").upper()
+    required = int(_get(verified_C_plan, "required", 0) or 0)
+    covered = int(_get(verified_C_plan, "covered", 0) or 0)
+    missing = tuple(_get(verified_C_plan, "missing_obligation_ids", ()) or ())
+    if status != "VERIFIED" or required <= 0 or covered != required or missing:
+        raise PlanError("COMPLETION_NOT_VERIFIED",
+                        "C completion coverage is not VERIFIED/complete",
+                        "C", {"status": "VERIFIED", "required": covered,
+                              "missing": 0}, verified_C_plan)
+    digest = _get(verified_C_plan, "result_digest", _get(verified_C_plan, "digest", None))
+    if not digest:
+        digest = _digest({"status": status, "required": required, "covered": covered})
     syncs = tuple(SyncRef(s.obligation, s.channel, s.event, COMPLETION_VERIFIED)
                   for s in plan.syncs)
     return ResolvedPlan(**{**plan.__dict__, "syncs": syncs,
                            "state": PlanState(plan.state.planning_status,
                                               plan.state.application_status,
-                                              COMPLETION_VERIFIED)})
+                                              COMPLETION_VERIFIED),
+                           "units": {**plan.units, "completion_digest": str(digest)}})
+
+
+def emit_for_codegen(plan: ResolvedPlan, codegen_binding=None) -> dict:
+    """The ONLY X boundary. It refuses until C is VERIFIED and X exists.
+
+    There is no silent success and no fabricated source/CCE/binary/load artifact.
+    """
+    if plan.state.completion_status != COMPLETION_VERIFIED:
+        raise PlanError("COMPLETION_NOT_VERIFIED",
+                        "X codegen requires a C-VERIFIED completion plan",
+                        "completion_status", COMPLETION_VERIFIED,
+                        plan.state.completion_status)
+    # X is not implemented yet. Even a caller-supplied binding is not accepted as proof:
+    # this R module never invents source/CCE/binary/load artifacts.
+    raise PlanError("CODEGEN_CONTRACT_UNIMPLEMENTED",
+                    "X codegen contract is not implemented; no source/binary emitted",
+                    "emit_for_codegen", "real X codegen implementation", codegen_binding)
 
 
 def address_range(plan: ResolvedPlan, access: AccessPlan, env: dict):

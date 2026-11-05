@@ -299,7 +299,9 @@ def test_r5_completion_hook_refuses_unverified_C():
     plan = build_ready()
     expect_code("COMPLETION_NOT_VERIFIED",
                 lambda: RP.attach_completion(plan, {"verified": False, "digest": None}))
-    done = RP.attach_completion(plan, {"verified": True, "digest": "sha256:" + "f" * 64})
+    done = RP.attach_completion(plan, {"status": "VERIFIED", "required": 1,
+                                       "covered": 1, "missing_obligation_ids": (),
+                                       "digest": "sha256:" + "f" * 64})
     assert done.state.completion_status == RP.COMPLETION_VERIFIED
     assert all(s.status == RP.COMPLETION_VERIFIED for s in done.syncs)
 
