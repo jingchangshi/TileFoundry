@@ -128,3 +128,8 @@ are **scratch/reference only** and must never be used for judgment. See
 [`envs/tfnpu-dev/ENVIRONMENT.md`](../envs/tfnpu-dev/ENVIRONMENT.md). The ABI preflight
 (`envs/tfnpu-dev/abi_preflight.py`, invoked by `tools/run_solver_tests.sh`) fails by
 name on a wrong interpreter or a mismatched tilelang/tvm_ffi/z3 triple.
+
+**sitecustomize caveat:** `sitecustomize.py` prepends the tfnpu-v2
+site-packages. If tfnpu-v2 ever gains pytest, it would shadow tfnpu-dev's pinned
+pytest. Keep tfnpu-v2 free of test tooling (the rule), or make sitecustomize
+explicitly preserve the dev pytest path.
