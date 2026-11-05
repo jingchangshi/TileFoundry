@@ -695,6 +695,35 @@ def _collect_actual_predicates(module) -> dict:
 # The ordered BEFORE_LOWER / AFTER_LOWER entries.
 # ---------------------------------------------------------------------------
 
+def _verify_hir_part_attributes(module) -> None:
+    """Refuse an authored HIR part that is not 0 (a directly constructed part1).
+
+    Runs in the FIRST BEFORE_LOWER pass so the refusal is PART_SELECTION_UNSUPPORTED instead
+    of a later generic verifier error: a directly built part1 must be named by the P chain.
+    """
+    from tilefoundry.ir.core import Call  # noqa: PLC0415
+
+    def visit(node):
+        if node is None:
+            return
+        if isinstance(node, (tuple, list)):
+            for child in node:
+                visit(child)
+            return
+        if isinstance(node, Call):
+            op = getattr(node.target, "op", None)
+            if op is not None:
+                verify_tir_part(getattr(op, "part", None))
+            for arg in node.args:
+                visit(arg)
+            return
+        for attr in ("body", "then_body", "else_body", "yield_values", "args", "elements"):
+            visit(getattr(node, attr, None))
+
+    for function in getattr(module, "functions", ()) or ():
+        visit(getattr(function, "body", None))
+
+
 @register_pass(Ascend950PRTarget, PassPoint.BEFORE_LOWER)
 class ValidatePipelineDeclarations(ModulePass):
     """BEFORE 1/2: validate authored declarations and capture the manifest.
@@ -707,6 +736,7 @@ class ValidatePipelineDeclarations(ModulePass):
     name = "d0.validate_pipeline_declarations"
 
     def run(self, module):
+        _verify_hir_part_attributes(module)
         manifest = build_pipeline_manifest(module)
         for key, spec in manifest.loops:
             versions = {decl.buffer_key: decl.versions
@@ -843,3 +873,79 @@ def dataclass_replace(instance, **changes):
     """Local import wrapper so the module does not pull dataclasses into __all__."""
     from dataclasses import replace as _replace
     return _replace(instance, **changes)
+
+
+
+# ---------------------------------------------------------------------------
+# task-77: part-selection wiring (BEFORE normalize, AFTER TIR verify).
+# ---------------------------------------------------------------------------
+
+PART_PROJECTION_KEY = "ascend.part_projection"
+PART_SELECTION_KEY = "ascend.part_selection"
+PART_SELECTION_STATUS_KEY = "ascend.part_selection_status"
+
+
+@register_pass(Ascend950PRTarget, PassPoint.BEFORE_LOWER)
+class NormalizePartSelection(ModulePass):
+    """BEFORE: record the part ONLY through a unique transport projection.
+
+    No projection artifact means NO part is recorded (status NO_PROJECTION) -- never a
+    default of 0, which would be a guess about the transport path.
+    """
+
+    name = "d0.normalize_part_selection"
+
+    def run(self, module):
+        projection = module.metadata.get(PART_PROJECTION_KEY)
+        if projection is None:
+            module.metadata[PART_SELECTION_STATUS_KEY] = "NO_PROJECTION"
+            return module
+        module.metadata[PART_SELECTION_KEY] = normalize_part_selection(projection)
+        module.metadata[PART_SELECTION_STATUS_KEY] = "NORMALIZED"
+        return module
+
+
+def _walk_tir_statements(node, visit):
+    from tilefoundry.ir.tir.stmts import (  # noqa: PLC0415
+        ExecutionScope,
+        For,
+        If,
+        MeshScope,
+        Sequential,
+        While,
+    )
+
+    if isinstance(node, (list, tuple)):
+        for item in node:
+            _walk_tir_statements(item, visit)
+    elif isinstance(node, For):
+        visit(node)
+        _walk_tir_statements(node.body, visit)
+    elif isinstance(node, While):
+        _walk_tir_statements(node.body, visit)
+    elif isinstance(node, If):
+        _walk_tir_statements(node.then_body, visit)
+        _walk_tir_statements(node.else_body, visit)
+    elif isinstance(node, (Sequential, MeshScope, ExecutionScope)):
+        _walk_tir_statements(node.body, visit)
+    else:
+        visit(node)
+
+
+@register_pass(Ascend950PRTarget, PassPoint.AFTER_LOWER)
+class VerifyTirPartSelection(ModulePass):
+    """AFTER: a directly constructed TIR part (e.g. part=1) is refused by name."""
+
+    name = "d0.verify_tir_part_selection"
+
+    def run(self, module):
+        from tilefoundry.ir.tir.stmts import Evaluate  # noqa: PLC0415
+
+        def visit(stmt):
+            if isinstance(stmt, Evaluate):
+                verify_tir_part(getattr(stmt.callable, "part", None))
+
+        for function in getattr(module, "functions", ()) or ():
+            _walk_tir_statements(getattr(function, "body", None), visit)
+        return module
+
