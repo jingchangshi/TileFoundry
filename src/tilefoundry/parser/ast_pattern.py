@@ -873,6 +873,7 @@ class LoopFrame:
     phi_vars: tuple[object, ...]
     params: tuple[object, ...]
     args: tuple[object, ...]
+    pipeline: object | None = None
 
 
 @dataclass(frozen=True)

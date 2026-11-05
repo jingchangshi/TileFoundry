@@ -11,9 +11,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from typing import TYPE_CHECKING
+
 from tilefoundry.ir.core import Expr, Var
 from tilefoundry.ir.tir.stmt import Stmt
 from tilefoundry.ir.types.mesh import Mesh
+
+if TYPE_CHECKING:  # the HIR package auto-imports, so a runtime import here cycles
+    from tilefoundry.ir.hir.pipeline import PipelineSpec
 
 
 @dataclass(unsafe_hash=True)
@@ -42,11 +47,22 @@ class LetStmt(Stmt):
 
 @dataclass(unsafe_hash=True)
 class For(Stmt):
+    """A counted loop.
+
+    pipeline is a CORE, target-neutral optional field recording that the loop was
+    AUTHORED as pipelined. A D0 for still runs serially: the field is carried, not
+    consumed, and it must never be read as "a solver produced a schedule". Keeping
+    it on the statement (rather than as debug sidecar metadata) means a TIR
+    roundtrip rebuilds it explicitly instead of losing it and reinstating a
+    default.
+    """
+
     induction_var: Var
     start: Expr
     stop: Expr
     step: Expr
     body: Sequential
+    pipeline: PipelineSpec | None = None
 
 
 @dataclass(unsafe_hash=True)

@@ -241,7 +241,13 @@ class TirBuilder:
         elif execution is not None:
             self.add(ExecutionScope(execution, self.build(region)))
         elif loop is not None:
-            self.add(For(*loop, self.build(region)))
+            # The authored pipeline intent is CARRIED onto the TIR For as a typed
+            # field, so a TIR roundtrip rebuilds it instead of losing it to a
+            # default. It is not consumed here: a D0 for still runs serially, and
+            # reading this as "a schedule exists" would be a false claim.
+            self.add(
+                For(*loop, self.build(region), pipeline=getattr(owner, "pipeline", None))
+            )
 
     def declare(self, leaf, *, ctx, values, desired=None):
         """Declare one allocation root in its owning scope."""

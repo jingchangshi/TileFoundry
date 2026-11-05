@@ -268,6 +268,22 @@ class TirPrinter(PythonPrinter, StmtVisitor[list[str]], ExprVisitor[str]):
         each CTA its own tiles -- and which scope binds that mesh is what the
         print context holds, so the bounds are rendered through it.
         """
+        pipeline = getattr(stmt, "pipeline", None)
+        if pipeline is not None:
+            # A TIR roundtrip must rebuild the declaration explicitly. Printing a
+            # plain range() here would drop the authored intent and the reparsed
+            # program would silently differ from the one that was lowered.
+            annotations = '{"enable_offset": %s}' % (
+                "True" if pipeline.enable_offset else "False"
+            )
+            loop = "tf.pipelined(%s, num_stages=%d, annotations=%s)" % (
+                self.visit(stmt.stop, self.context),
+                pipeline.num_stages,
+                annotations,
+            )
+            lines = [f"{self.indent}for {self.visit(stmt.induction_var)} in {loop}:"]
+            lines.extend(self._body(stmt.body))
+            return lines
         bounds = ", ".join(
             self.visit(bound, self.context) for bound in (stmt.start, stmt.stop, stmt.step)
         )

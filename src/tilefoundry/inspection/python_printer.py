@@ -958,7 +958,14 @@ def _emit_def(
         extent = printer.visit(region.extent, ctx)
         step = printer.visit(region.step, ctx)
         start = printer.visit(region.start, ctx)
-        if id(region.induction_var) in _tile_window_steps:
+        pipeline = getattr(region, "pipeline", None)
+        if pipeline is not None:
+            # A pipelined loop is recognised FIRST and printed as itself. Falling
+            # through to range()/tf.tile() would erase the declaration on a
+            # print->parse roundtrip, so the intent would silently disappear from
+            # anything that round-trips through source.
+            loop = _pipeline_loop_surface(pipeline, extent)
+        elif id(region.induction_var) in _tile_window_steps:
             loop = (
                 f"tf.tile({extent}, {step})"
                 if region.start == 0
@@ -1220,6 +1227,21 @@ def hir_function_to_python(
 ) -> str:
     """Convert a HIR Function to canonical Python DSL source."""
     return HirPrinter().print(fn, options=options)
+
+
+def _pipeline_loop_surface(pipeline, extent: str) -> str:
+    """Render the canonical tf.pipelined surface for a typed spec.
+
+    enable_offset is printed EXPLICITLY even when False, and num_stages is always
+    present: a roundtrip must reproduce the declaration rather than rely on the
+    defaults of whatever version of the parser happens to read the text.
+    """
+    annotations = '{"enable_offset": %s}' % ("True" if pipeline.enable_offset else "False")
+    return "tf.pipelined(%s, num_stages=%d, annotations=%s)" % (
+        extent,
+        pipeline.num_stages,
+        annotations,
+    )
 
 
 def as_script(
