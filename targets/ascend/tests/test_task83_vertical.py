@@ -246,13 +246,14 @@ def test_vertical_run():
                             return fn
 
                         def mut_missing_wait(fn):
+                            import dataclasses as _dc
                             from tilefoundry.ir.tir.flag import FlagWait
                             from tilefoundry.ir.tir.stmts import Evaluate
-                            mutant, removed = _remove_first_stmt(
-                                fn, lambda node: isinstance(node, Evaluate)
+                            new_body, removed = _remove_first_stmt(
+                                fn.body, lambda node: isinstance(node, Evaluate)
                                 and isinstance(node.callable, FlagWait))
                             assert removed, "real Wait node was not removed"
-                            return mutant
+                            return _dc.replace(fn, body=new_body)
 
                         mutation_controls = {}
                         for name, mutator in (
