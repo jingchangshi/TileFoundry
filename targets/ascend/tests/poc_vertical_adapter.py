@@ -71,7 +71,7 @@ def derive_loop_domain(tir_function, expansion_count):
             "projected": True, "source": "TIR For start/stop/step (verified AP, count=%d)" % len(values)}
 
 
-def project_problem(problem, tir_function, expansion_count, sources=None):
+def project_problem(problem, tir_function, expansion_count, sources=None, obligation_access_ids=None):
     """Return (r_problem, projected_fields). All values derived or explicitly MODEL/NOMINAL."""
     loop_domain = derive_loop_domain(tir_function, expansion_count)
     tasks_in = list(getattr(problem, "tasks", []) or [])
@@ -90,10 +90,12 @@ def project_problem(problem, tir_function, expansion_count, sources=None):
             "latency": 1, "issue_interval": 1, "stage": 0, "cost_model": "MODEL",
         })
     buffers = []
+    dropped_buffers = []
     for buf in getattr(problem, "buffers", []) or []:
         get = buf.get if isinstance(buf, dict) else lambda k, b=buf: getattr(b, k, None)
         root = get("root")
         if not str(root).startswith("smem@"):
+            dropped_buffers.append({"root": root, "reason": "not a synthetic SMEM allocation"})
             continue
         buffers.append({"root": root, "source_decl": root, "owner": loop_id,
                         "space": "ascend.ub", "dtype": "f32", "shape": [int(get("bytes_") or 0) // 4],
@@ -106,12 +108,22 @@ def project_problem(problem, tir_function, expansion_count, sources=None):
         for action_id in ids:
             action_owner[str(action_id)] = tid
     accesses = []
+    dropped_accesses = []
+    obligation_ids = set(str(x) for x in (obligation_access_ids or ()))
     for index, access in enumerate(getattr(problem, "accesses", []) or []):
         get = access.get if isinstance(access, dict) else lambda k, a=access: getattr(a, k, None)
         root = get("root")
         if not str(root).startswith("smem@"):
+            dropped_accesses.append({"task": get("task"), "reason": "non-SMEM (GM/register) access"})
+            if str(get("task")) in obligation_ids:
+                raise VerticalError("POC_ADAPTER_UNSUPPORTED_ACCESS",
+                                    "obligation access %r would be filtered out" % (get("task"),))
             continue
         if get("byte_offset") is None:
+            dropped_accesses.append({"task": get("task"), "reason": "unknown byte_offset"})
+            if str(get("task")) in obligation_ids:
+                raise VerticalError("POC_ADAPTER_UNSUPPORTED_ACCESS",
+                                    "obligation access %r has unknown offset" % (get("task"),))
             continue
         accesses.append({
             "access_id": "%s#%d" % (get("task"), index),
@@ -138,7 +150,10 @@ def project_problem(problem, tir_function, expansion_count, sources=None):
         "access_relative_offset": {"source": "ProblemAccess.byte_offset (typed window)", "projected": True},
         "access_logical_index": {"source": "PExpr V('i')", "projected": True},
         "buffers_filtered": {"note": "only synthetic SMEM roots with known byte_offset are planned",
-                             "projected": True},
+                             "projected": True, "count": len(dropped_buffers),
+                             "dropped": dropped_buffers[:8]},
+        "accesses_filtered": {"count": len(dropped_accesses), "dropped": dropped_accesses[:8],
+                              "projected": True},
     }
     return r_problem, projected
 
@@ -159,6 +174,9 @@ def nominal_solve_result(core_result, r_problem):
         start = (entry.get("start_time") or {}).get("value", 0) if isinstance(entry, dict) else 0
         schedule[tid] = {"stage": 0, "order": order, "start_time": int(start), "iteration_shift": 0,
                          "cost_model": "MODEL"}
-    return types.SimpleNamespace(status="SAT_POSTCHECKED", schedule=schedule,
+    # NOT SAT_POSTCHECKED: S3 source postcheck is unimplemented. This is a NOMINAL_SAT view
+    # for the R adapter only; the S result itself is state=SAT / sat_scope=NOMINAL_MODEL_ONLY.
+    return types.SimpleNamespace(status="NOMINAL_SAT", schedule=schedule,
                                  sat_scope="NOMINAL_MODEL_ONLY",
+                                 postcheck="SOLVER_POSTCHECK_NOT_IMPLEMENTED",
                                  core_source_hash=getattr(core_result, "core_source_hash", ""))

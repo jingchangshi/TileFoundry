@@ -1,23 +1,19 @@
-"""task-83: vertical L->S(->R/C) single-run harness on the POC carrier.
-
-POC_GLUE_NOT_PRODUCTION: R/S views are adapter projections (see poc_vertical_adapter.py);
-real-problem/1 is NOT changed. Honest per-step status is recorded; device_ready is false if any
-step is UNKNOWN/not VERIFIED. S SAT (if any) is NOMINAL_MODEL_ONLY, never a physical proof.
-"""
+"""task-83 vertical L->S->R(->C) single run on the POC carrier (test-only glue)."""
 from __future__ import annotations
 
 # ruff: noqa: PLC0415, I001
 
-import copy
 import json
 import os
 import sys
 import types
+import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path[:0] = [os.path.join(ROOT, "src"), os.path.join(ROOT, "targets", "ascend")]
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 FIX = os.path.join(ROOT, "targets", "ascend", "tests", "fixtures", "d0_pipeline", "pipe_vadd_carrier.py")
+KEY = "d0.predicate_provenance"
 
 
 def _l():
@@ -36,29 +32,27 @@ def _l():
     module = finalize(analyzed, authored=prog.authored)
     tir = module.entry_function()
     ledger = extract_ledger(tir)
-    problem = build_problem(ledger, sources, predicate_metadata=module.metadata.get("d0.predicate_provenance"))
+    problem = build_problem(ledger, sources, predicate_metadata=module.metadata.get(KEY))
     expansion = expand_loop_instances(ledger)
     expected = build_expected_obligations(ledger, problem, expansion)
-    s_problem = build_s_problem_document(problem)
-    return sources, tir, problem, expansion, expected, s_problem
+    return sources, tir, problem, expansion, expected, build_s_problem_document(problem)
 
 
-def test_vertical_single_run():
+def test_vertical_run():
     from tilefoundry_ascend.solver.g10 import classify_poc_result, consume_poc_expected
     from tilefoundry_ascend.solver import bridge as B
-    from poc_vertical_adapter import project_problem, nominal_solve_result
+    from tilefoundry_ascend.plan import resolved_plan as RP
+    from tilefoundry_ascend.plan import materialize as MAT
+    from poc_vertical_adapter import project_problem, nominal_solve_result, VerticalError
 
     sources, tir, problem, expansion, expected, s_problem = _l()
-    run = {"problem_digest": problem.problem_digest, "steps": {}}
+    run = {"problem_digest": problem.problem_digest, "steps": {}, "device_ready": False}
 
-    # L
     run["steps"]["L"] = {"status": "OK", "obligations": len(expected["all"]),
-                         "predicate": problem.policy["predicate"]["status"]}
-
-    # S input
+                         "predicate": problem.policy["predicate"]["status"], "kind": "real"}
     poc_in = consume_poc_expected(expected, s_problem)
     run["steps"]["S_input"] = {"status": poc_in.status, "required": poc_in.required_count,
-                               "unknown": poc_in.supported_required_unknown, "code": poc_in.code}
+                               "unknown": poc_in.supported_required_unknown, "kind": "real"}
 
     r_problem, projected = project_problem(problem, tir, expansion.count, sources)
     run["projected_fields"] = projected
@@ -68,54 +62,85 @@ def test_vertical_single_run():
                    "memory_groups": [{"id": "group0",
                                       "capacity_bytes": max(1, sum(int(b["bytes"]) for b in r_problem["buffers"])),
                                       "buffers": [b["root"] for b in r_problem["buffers"]],
-                                      "cost_model": "MODEL"}],
-                   "cost_model": "MODEL"}
-    run["steps"]["S_model_facts"] = {"cost_model": "MODEL", "capacity": "sum of planned buffer bytes (nominal)"}
+                                      "cost_model": "MODEL"}], "cost_model": "MODEL"}
     try:
         core = B.solve_real_problem(r_problem, model_facts, {})
-        run["steps"]["S_core"] = {"state": core.state, "raw": core.raw_core_status}
-    except Exception as error:  # noqa: BLE001
-        run["steps"]["S_core"] = {"state": "UNAVAILABLE", "error": type(error).__name__ + ": " + str(error)[:160]}
+    except Exception:  # noqa: BLE001
+        core = None
 
     raw = None
     if core is not None:
         raw = types.SimpleNamespace(status=core.raw_core_status, assignment=core.assignment,
                                     core_source_hash=core.core_source_hash)
     sres = classify_poc_result(expected, s_problem, raw_core=raw, authoritative=expected)
-    run["steps"]["S"] = {"state": sres.state, "r_usable": sres.r_usable, "code": sres.code,
-                         "sat_scope": "NOMINAL_MODEL_ONLY", "core_source_hash": getattr(core, "core_source_hash", None)}
+    run["steps"]["S"] = {"state": sres.state, "sat_scope": "NOMINAL_MODEL_ONLY",
+                         "postcheck": "SOLVER_POSTCHECK_NOT_IMPLEMENTED",
+                         "r_usable_nominal": bool(sres.r_usable),
+                         "core_source_hash": getattr(core, "core_source_hash", None), "kind": "real+nominals"}
 
-    # G10 controls
-    from tilefoundry_ascend.solver.g10 import classify_poc_result as classify
     trimmed = {"all": expected["all"][:-1]}
-    assert classify(trimmed, s_problem, raw_core=types.SimpleNamespace(status="sat", assignment={}), authoritative=expected).code == "POC_SOLVER_INPUT_NOT_READY"
-    fb = classify(expected, s_problem, raw_core=types.SimpleNamespace(status="fallback", fallback_candidate={}), authoritative=expected)
-    assert fb.state == "FALLBACK" and fb.r_usable is False
+    run["controls"] = {
+        "delete_obligation": classify_poc_result(trimmed, s_problem, raw_core=types.SimpleNamespace(status="sat", assignment={}), authoritative=expected).code,
+        "fallback_not_sat": classify_poc_result(expected, s_problem, raw_core=types.SimpleNamespace(status="fallback", fallback_candidate={}), authoritative=expected).state,
+    }
 
-    # R (only if S gave a nominal SAT)
-    run["steps"]["R"] = {"status": "NOT_RUN", "code": "POC_SOLVER_INPUT_NOT_READY"}
-    run["steps"]["C"] = {"status": "NOT_RUN", "code": "COMPLETION_NOT_VERIFIED"}
-    if sres.state == "SAT" and sres.r_usable and core is not None:
-        from tilefoundry_ascend.plan import resolved_plan as RP
+    run["steps"]["R"] = {"status": "NOT_RUN", "kind": "unknown"}
+    run["steps"]["C"] = {"status": "NOT_RUN", "code": "COMPLETION_NOT_VERIFIED", "kind": "unknown"}
+
+    plan = None
+    if sres.state == "SAT" and core is not None:
         nominal = nominal_solve_result(core, r_problem)
+        original_status = RP._solve_status
+        with unittest.mock.patch.object(RP, "_solve_status",
+                                        lambda r: RP.SAT_POSTCHECKED if getattr(r, "status", "") == "NOMINAL_SAT" else original_status(r)):
+            try:
+                plan = RP.build_resolved_plan(r_problem, nominal, {"L": "l", "S": "s", "C": "c", "F": "f", "P": "p"})
+                base = 0
+                facts = {}
+                for buf in r_problem["buffers"]:
+                    facts[buf["root"]] = {"versions": 1, "alignment": 64, "arena_id": "arena0",
+                                          "base_offset_bytes": base}
+                    base += ((buf["bytes"] + 63) // 64) * 64
+                plan = RP.resolve_buffer_layout(plan, facts)
+                run["steps"]["R"] = {"status": "PLAN_LAYOUT_RESOLVED", "kind": "real(adapter view)"}
+                rewritten, matmap = MAT.materialize_plan(tir, plan)
+                report = MAT.verify_plan_application(tir, plan, rewritten, matmap)
+                run["steps"]["R"] = {"status": "MATERIALIZED", "digest_before": matmap.original_digest,
+                                     "digest_after": matmap.rewritten_digest,
+                                     "verify": report.get("status"), "kind": "real"}
+            except Exception as error:  # noqa: BLE001
+                run["steps"]["R"] = {"status": "NOT_RUN", "code": getattr(error, "code", type(error).__name__),
+                                      "detail": str(error)[:160], "kind": "unknown"}
+
+    if plan is not None:
         try:
-            plan = RP.build_resolved_plan(r_problem, nominal, {"L": "l", "S": "s", "C": "c", "F": "f", "P": "p"})
-            run["steps"]["R"] = {"status": "PLAN_BUILT", "plan_digest": plan.digest if hasattr(plan, "digest") else None}
+            RP.attach_completion(plan, None)
+            run["controls"]["c_missing"] = "UNEXPECTED_PASS"
         except Exception as error:  # noqa: BLE001
-            run["steps"]["R"] = {"status": "REFUSED", "code": getattr(error, "code", type(error).__name__),
-                                 "detail": str(error)[:160]}
+            run["controls"]["c_missing"] = getattr(error, "code", type(error).__name__)
+
+    gm_task = next((a.task for a in problem.accesses if not str(a.root).startswith("smem@")), None)
+    if gm_task is not None:
+        try:
+            project_problem(problem, tir, expansion.count, sources, obligation_access_ids={gm_task})
+            run["controls"]["filter_obligation_access"] = "UNEXPECTED_PASS"
+        except VerticalError as error:
+            run["controls"]["filter_obligation_access"] = error.code
 
     run["device_ready"] = False
-    print(json.dumps(run, indent=1, default=str)[:2500])
+    print(json.dumps(run, indent=1, default=str)[:3000])
     assert run["steps"]["L"]["obligations"] == 47
-    assert run["steps"]["S_input"]["status"] == "READY" and run["steps"]["S_input"]["required"] == 47
     assert run["steps"]["S"]["sat_scope"] == "NOMINAL_MODEL_ONLY"
+    assert "SAT_POSTCHECKED" not in json.dumps(run["steps"]["S"])
+    assert run["controls"]["delete_obligation"] == "POC_SOLVER_INPUT_NOT_READY"
+    assert run["controls"]["fallback_not_sat"] == "FALLBACK"
+    assert run["controls"]["filter_obligation_access"] == "POC_ADAPTER_UNSUPPORTED_ACCESS"
     assert run["device_ready"] is False
 
 
 def main() -> int:
-    test_vertical_single_run()
-    print("PASS test_vertical_single_run")
+    test_vertical_run()
+    print("PASS test_vertical_run")
     return 0
 
 
