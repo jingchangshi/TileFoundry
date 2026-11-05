@@ -44,6 +44,48 @@ case("authorisation must be exactly 1", 75, True, False)
 # Authorised -> proceeds (no exception).
 case("explicit authorisation proceeds", 0, True, True)
 
+# --- device selection: the list decides, nothing is hardcoded -----------------
+# A one-card visible list must REFUSE a request for its second entry. Falling back to
+# entry 0 would silently measure a different card than the one asked for, which is the
+# failure this rule exists to prevent.
+
+
+def case_device_selection():
+    global failures
+    import importlib
+    import run_case
+    importlib.reload(run_case)
+    saved = {k: run_case.os.environ.get(k) for k in ("ASCEND_RT_VISIBLE_DEVICES", "TF_DEVICE_ALLOW")}
+    run_case.os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "1"   # ONE card, id 1
+    run_case.os.environ["TF_DEVICE_ALLOW"] = "0,1"
+    try:
+        sel = run_case.resolve_device_selection(None)
+        ok_default = (sel["visible_list"] == [1] and sel["logical_index"] == 0
+                      and sel["physical_device_id"] == 1)
+        print(("  PASS  " if ok_default else "  FAIL  ") +
+              "default selects entry 0 of the list (%r)" % (sel,))
+        if not ok_default:
+            failures += 1
+        try:
+            run_case.resolve_device_selection(1)
+            code = 0
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+        ok = code == 75
+        print(("  PASS  " if ok else "  FAIL  ") +
+              "index 1 of a 1-entry list is refused as BLOCKED_ENV (exit %s, expected 75)" % code)
+        if not ok:
+            failures += 1
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                run_case.os.environ.pop(k, None)
+            else:
+                run_case.os.environ[k] = v
+
+
+case_device_selection()
+
 # --- static ordering check -------------------------------------------------
 # A behavioural test cannot see this. If the guard were moved below the import, a
 # unit test that calls the guard directly would still return 75, while the real

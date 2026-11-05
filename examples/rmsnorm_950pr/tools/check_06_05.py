@@ -211,6 +211,11 @@ def main() -> int:
             phases.add("binary", "REFUSED" if exc.exit_code == 2 else "FAIL", exc.code, exc.msg)
             raise
 
+        # The card is resolved from the granted list, never assumed; the plan records
+        # which entry the child will use so a PLAN and an EXECUTE say the same thing.
+        from device_guard import check_device_identity  # noqa: PLC0415
+        planned_selection = check_device_identity(dict(env))
+
         # stage 3: launch (PLAN only assembles) / device runs run_case
         try:
             if args.mode == "plan":
@@ -218,7 +223,8 @@ def main() -> int:
                         "aibin_sha256": sha256_file(Path(args.aibin)),
                         "case_id": args.case_id or Path(args.case_dir).name,
                         "shape": list(shape), "patterns": [e["key"] for e in entries],
-                        "device": 0, "lock": str(LOCK), "stream": "torch.npu.current_stream()",
+                        "device_selection": planned_selection,
+                        "lock": str(LOCK), "stream": "torch.npu.current_stream()",
                         "readback_source": "archived device.npy (NOT a fresh launch)"}
                 (out / "launch_plan.json").write_text(json.dumps(plan, indent=2) + "\n")
                 phases.add("launch", "PLAN_ONLY", detail="assembled, not executed")
@@ -230,7 +236,10 @@ def main() -> int:
                        "--shape", str(shape[0]), str(shape[1]), "--rows",
                        str(int(tj.get("rows", 1))), "--loop-mode", str(tj.get("loop_mode", "dyn")),
                        "--stages", str(int(tj.get("num_stages", 2))), "--xversions", "2",
-                       "--yversions", "1", "--device", "0", "--out", args.cases_dir]
+                       "--yversions", "1", "--out", args.cases_dir]
+                # NO --device: the child resolves a LOGICAL index inside the granted
+                # ASCEND_RT_VISIBLE_DEVICES list and records the reason. Pinning "0" here
+                # would silently override the operator's list.
                 # The driver ALREADY holds the one canonical lock (taken in stage 2), so the child
                 # must not take it again: a second flock on the same file from a child blocks
                 # forever and every device run would fail with a false LOCK_HELD_BY_OTHER. The

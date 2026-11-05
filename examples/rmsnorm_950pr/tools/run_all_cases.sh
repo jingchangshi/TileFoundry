@@ -1,5 +1,5 @@
 #!/bin/bash
-# Serial four-case Twin device run on device 0.
+# Serial four-case Twin device run on the GRANTED visible list (no fixed card).
 #
 # GOVERNANCE (do not weaken):
 #  * Authorization is EXTERNAL. This script NEVER sets TF_DEVICE_AUTH; if it is not
@@ -19,7 +19,18 @@ if [ "${TF_DEVICE_AUTH:-}" != "1" ]; then
 fi
 
 source "${CANN_ROOT:?CANN_ROOT must be set}/ascend-toolkit/set_env.sh" >/dev/null 2>&1
-export ASCEND_RT_VISIBLE_DEVICES=0
+# The VISIBLE LIST is the only device selector; no card number is baked in anywhere.
+# An operator grants an ordered list (ASCEND_RT_VISIBLE_DEVICES, or the adapter --device-ids
+# which exports it) and run_case resolves a LOGICAL index inside that list. A script that
+# pinned "0" would quietly measure whatever card happened to be first.
+: "${ASCEND_RT_VISIBLE_DEVICES:=${DEVICE_ID:-}}"
+if [ -z "${ASCEND_RT_VISIBLE_DEVICES}" ]; then
+  echo "REFUSE: DEVICE_IDS_UNSET -- set ASCEND_RT_VISIBLE_DEVICES to the ordered visible list"
+  echo "  (for example 0,1) or DEVICE_ID from the adapter env. This script does not choose a card."
+  exit 78
+fi
+export ASCEND_RT_VISIBLE_DEVICES
+echo "visible devices: ${ASCEND_RT_VISIBLE_DEVICES}"
 unset TORCH_DEVICE_BACKEND_AUTOLOAD || true
 export PYTHONUNBUFFERED=1
 REPO="${HOME}/workspace/TileFoundry"

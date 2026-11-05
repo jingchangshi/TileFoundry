@@ -27,7 +27,12 @@ DEVICE_AUTH_ENV = "TF_DEVICE_AUTH"
 # run_all_cases.sh holds it once and exports TF_DEVICE_LOCK_HELD=1 to its children; this
 # script MUST NOT take a second lock in that case. A standalone invocation takes the SAME
 # lock, so there is exactly one holder on every path and never a second lock file.
-DEVICE_LOCK_PATH = "/home/.tf_device0.lock"  # no-machine-path: allow
+#
+# It is the TEAM lock, not a "device 0" lock: the FILE NAME is history (it was created
+# when the team ran one fixed card) and is kept so the file everyone already meets at
+# stays the file. Nothing about the name restricts which card may run -- the card comes
+# from the ordered visible list, see resolve_device_selection().
+TEAM_LOCK_PATH = "/home/.tf_device0.lock"  # no-machine-path: allow
 FROZEN_PROTOCOL = (f"{_WS_ROOT}/TileFoundry_Ascend950PR_AgentTeam"
                    "/artifacts/run01/p0/precision_protocol.json")
 _LOCK_FH = None
@@ -97,8 +102,8 @@ def assert_tilelang_from_prefix(module) -> dict:
             "version": getattr(module, "__version__", None)}
 
 
-def _ensure_device_lock() -> None:
-    """Acquire the ONE canonical device lock, unless a parent already holds it.
+def _ensure_team_lock() -> None:
+    """Acquire the ONE canonical TEAM lock, unless a parent already holds it.
 
     Exactly one holder per run: if TF_DEVICE_LOCK_HELD=1 the parent (run_all_cases.sh)
     holds the flock and this process must not re-acquire it (a second flock on the same
@@ -111,9 +116,9 @@ def _ensure_device_lock() -> None:
         return
     import fcntl
     try:
-        fh = open(DEVICE_LOCK_PATH, "a+")
+        fh = open(TEAM_LOCK_PATH, "a+")
     except OSError as exc:
-        print("BLOCKED_ENV: cannot open canonical device lock %s: %s" % (DEVICE_LOCK_PATH, exc),
+        print("BLOCKED_ENV: cannot open the team lock %s: %s" % (TEAM_LOCK_PATH, exc),
               file=sys.stderr)
         raise SystemExit(BLOCKED_ENV)
     try:
@@ -121,20 +126,67 @@ def _ensure_device_lock() -> None:
     except BlockingIOError:
         fh.close()
         print("\n".join([
-            "BLOCKED_ENV: another team measurement job holds %s." % DEVICE_LOCK_PATH,
+            "BLOCKED_ENV: another team measurement job holds %s." % TEAM_LOCK_PATH,
             "  Refusing to enter: a second concurrent device job must not run.",
             "  This is a refusal, not a failed attempt; nothing was opened.",
         ]), file=sys.stderr)
         raise SystemExit(BLOCKED_ENV)
     _LOCK_FH = fh
-    print("device lock: acquired %s for this process" % DEVICE_LOCK_PATH, file=sys.stderr)
+    print("team lock: acquired %s for this process" % TEAM_LOCK_PATH, file=sys.stderr)
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "tools" / "p3" / "native_probe"))
 
 
+def resolve_device_selection(requested: "int | None") -> dict:
+    """Resolve a LOGICAL index inside the ordered visible list -- never assume a card.
+
+    The ordered ASCEND_RT_VISIBLE_DEVICES list is the ONLY selector. Entry i of that
+    list is the physical card a logical index i addresses. Two consequences, both
+    deliberate:
+      * no card number is baked in anywhere, so the same code runs on whatever list
+        the operator granted;
+      * a request outside the list is a NAMED refusal. Falling back to entry 0 would
+        silently measure a different card than the one asked for -- the failure this
+        function exists to prevent.
+    """
+    from device_guard import GuardError, check_device_identity
+    try:
+        ident = check_device_identity(dict(os.environ))
+    except GuardError as exc:
+        print("BLOCKED_ENV: %s" % exc, file=sys.stderr)
+        raise SystemExit(BLOCKED_ENV)
+    visible = list(ident["visible_ids"])
+    if requested is None:
+        logical = 0
+        reason = "first entry of the ordered visible list (no --device given)"
+    else:
+        if not 0 <= requested < len(visible):
+            print("\n".join([
+                "BLOCKED_ENV: DEVICE_INDEX_NOT_VISIBLE",
+                "  --device %d is outside the ordered visible list %r." % (requested, visible),
+                "  A logical index addresses entry N of that list; a %d-entry list has no"
+                "  entry %d. Refusing: substituting entry 0 would measure a different card."
+                % (len(visible), requested),
+                "  Widen ASCEND_RT_VISIBLE_DEVICES (or the adapter --device-ids) instead.",
+            ]), file=sys.stderr)
+            raise SystemExit(BLOCKED_ENV)
+        logical = requested
+        reason = "explicit --device argument"
+    selection = {
+        "visible_env": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+        "visible_list": visible,
+        "logical_index": logical,
+        "physical_device_id": visible[logical],
+        "selection_reason": reason,
+    }
+    print("device selection: visible=%r logical=%d physical=%d (%s)"
+          % (visible, logical, selection["physical_device_id"], reason), file=sys.stderr)
+    return selection
+
+
 def _device_identity_errors(uid: int, visible: str | None, ffi_version: str | None,
-                            device_index: int) -> list[str]:
+                            selection: dict) -> list[str]:
     """Explicit, testable checks: root, visible list, device ffi 0.1.12.
 
     CPU and device ffi must not be mixed: the device env is 0.1.12 (matching the
@@ -148,9 +200,10 @@ def _device_identity_errors(uid: int, visible: str | None, ffi_version: str | No
         env = dict(os.environ)
         env["ASCEND_RT_VISIBLE_DEVICES"] = str(visible)
         ident = check_device_identity(env)
-        if not 0 <= device_index < len(ident["visible_ids"]):
-            errors.append("logical --device %d is outside visible list %r"
-                          % (device_index, ident["visible_ids"]))
+        logical = selection.get("logical_index")
+        if not isinstance(logical, int) or not 0 <= logical < len(ident["visible_ids"]):
+            errors.append("logical index %r is outside visible list %r"
+                          % (logical, ident["visible_ids"]))
     except Exception as exc:  # noqa: BLE001
         errors.append("device identity refused: %s" % exc)
     if ffi_version is None:
@@ -161,21 +214,22 @@ def _device_identity_errors(uid: int, visible: str | None, ffi_version: str | No
     return errors
 
 
-def _assert_device_identity(device_index: int) -> None:
+def _assert_device_identity(selection: dict) -> None:
     try:
         import importlib.metadata as _md
         ffi = _md.version("apache-tvm-ffi")
     except Exception:  # noqa: BLE001
         ffi = None
     errors = _device_identity_errors(os.geteuid(), os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
-                                     ffi, device_index)
+                                     ffi, selection)
     if errors:
         print("BLOCKED_ENV: device identity/ffi preconditions failed:", file=sys.stderr)
         for e in errors:
             print("  - " + e, file=sys.stderr)
         raise SystemExit(BLOCKED_ENV)
-    print("device identity OK: uid=0, ASCEND_RT_VISIBLE_DEVICES=%r, apache-tvm-ffi=%s"
-          % (os.environ.get("ASCEND_RT_VISIBLE_DEVICES"), ffi), file=sys.stderr)
+    print("device identity OK: uid=0, visible=%r, logical=%d, physical=%d, apache-tvm-ffi=%s"
+          % (selection["visible_list"], selection["logical_index"],
+             selection["physical_device_id"], ffi), file=sys.stderr)
 
 
 def device_authorised() -> bool:
@@ -229,7 +283,10 @@ def main() -> int:
     ap.add_argument("--stages", type=int, required=True)
     ap.add_argument("--xversions", type=int, required=True)
     ap.add_argument("--yversions", type=int, required=True)
-    ap.add_argument("--device", type=int, default=0)
+    ap.add_argument("--device", type=int, default=None,
+                    help="LOGICAL index into the ordered ASCEND_RT_VISIBLE_DEVICES list; "
+                         "default: its first entry (no card number is assumed). An index "
+                         "outside the list is refused by name (DEVICE_INDEX_NOT_VISIBLE).")
     ap.add_argument("--windows", type=int, default=20)
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--protocol", default=FROZEN_PROTOCOL,
@@ -239,9 +296,11 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    _ensure_device_lock()
-    _assert_device_identity(args.device)
-    refuse_unless_authorised(args.device)
+    _ensure_team_lock()
+    # The card is chosen from the ordered visible list, never from a constant.
+    selection = resolve_device_selection(args.device)
+    _assert_device_identity(selection)
+    refuse_unless_authorised(selection["logical_index"])
     protocol = load_frozen_protocol(args.protocol)
 
     import torch, torch_npu, tilelang
@@ -253,7 +312,7 @@ def main() -> int:
         tilelang.disable_cache()
     except Exception:
         pass
-    torch.npu.set_device(args.device)
+    torch.npu.set_device(selection["logical_index"])
     sys.path.insert(0, f"{_WS_ROOT}/TileFoundry/examples/rmsnorm_950pr")
     from runtime_model import RuntimeModel, check_case, paired_benchmark
     from kernels.twin_rmsnorm import TwinConfig
@@ -265,7 +324,7 @@ def main() -> int:
     model.ensure()
     src = model.kernel_source()
     (out / "kernel_source.txt").write_text(src)
-    devname = torch.npu.get_device_name(args.device)
+    devname = torch.npu.get_device_name(selection["logical_index"])
 
     try:
         import importlib.metadata as _md
@@ -274,8 +333,12 @@ def main() -> int:
         tvm_ffi_ver = None
 
     protocol_text = Path(args.protocol).read_text()
+    # The TRIPLE that makes a run reproducible: which list was granted, which logical
+    # index was used inside it, and which physical card that entry named.
+    selection = dict(selection, device_name=devname)
     device_info = {
-        "device_index": args.device, "device_name": devname,
+        "device_index": selection["logical_index"], "device_name": devname,
+        "device_selection": selection,
         "torch": torch.__version__,
         "torch_npu": getattr(torch_npu, "__version__", None),
         "tilelang": getattr(tilelang, "__version__", None),
@@ -292,7 +355,7 @@ def main() -> int:
     }
     (out / "device_info.json").write_text(json.dumps(device_info, indent=2))
 
-    numeric = check_case(model, torch, args.device, protocol, save_dir=str(out))
+    numeric = check_case(model, torch, selection["logical_index"], protocol, save_dir=str(out))
     (out / "numeric.json").write_text(json.dumps(numeric, indent=2))
     (out / "patterns_report.json").write_text(json.dumps(numeric["patterns"], indent=2))
 
@@ -304,7 +367,7 @@ def main() -> int:
     def baseline_run(x, w, eps):
         return base.run(x, w, eps)
 
-    bench = paired_benchmark(model, baseline_run, torch, args.device,
+    bench = paired_benchmark(model, baseline_run, torch, selection["logical_index"],
                              windows=args.windows, iters=args.iters)
     (out / "paired_benchmark.json").write_text(json.dumps(bench, indent=2))
 
