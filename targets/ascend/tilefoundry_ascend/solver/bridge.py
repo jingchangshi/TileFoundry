@@ -408,9 +408,14 @@ def verify_request_coverage(problem, request: SolveRequest) -> dict:
             raise SolverError("SOLVER_INDEX_MAP_MISMATCH", "buffer reverse map disagrees",
                               root, root, request.index_buffer_map.get(index), phase="coverage")
 
-    expected_fixed = []
+    expected_fixed = [None] * len(request.buffer_index_map)
     for buffer in list(_get(problem, "buffers", []) or []):
-        expected_fixed.append(int(_get(buffer, "versions")) if _get(buffer, "fixed", False) else None)
+        root = str(_get(buffer, "root"))
+        if root not in request.buffer_index_map:
+            raise SolverError("SOLVER_INDEX_MAP_MISMATCH", "buffer missing from request map",
+                              root, sorted(request.buffer_index_map), root, phase="coverage")
+        index = request.buffer_index_map[root]
+        expected_fixed[index] = int(_get(buffer, "versions")) if _get(buffer, "fixed", False) else None
     if expected_fixed != request.core_args["fixed_buffer_versions"]:
         raise SolverError("FIXED_VERSION_MISMATCH", "fixed buffer versions changed in the request",
                           "fixed_buffer_versions", expected_fixed,

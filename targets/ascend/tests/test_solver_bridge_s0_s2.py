@@ -210,6 +210,45 @@ def test_bridge_has_no_second_solver_and_no_caseconfig_rebuild():
     assert "tf_loop_adapter" in source
 
 
+def _two_buffer_problem(buffer_order):
+    problem = json.loads(json.dumps(PROBLEM))
+    problem["schema"] = "real-problem/1"
+    problem["buffers"] = [
+        {"root": "a2", "space": "ascend.ub", "bytes": 64, "versions": 2, "fixed": True},
+        {"root": "z1", "space": "ascend.ub", "bytes": 64, "versions": 1, "fixed": True},
+    ]
+    problem["buffers"] = [problem["buffers"][i] for i in buffer_order]
+    problem["memory_groups"] = [{"id": "ub0", "capacity_bytes": 1024,
+                                 "buffers": ["a2", "z1"]}]
+    return problem
+
+
+def _two_buffer_model():
+    model = dict(MODEL)
+    model["memory_groups"] = [{"id": "ub0", "capacity_bytes": 1024,
+                               "buffers": ["a2", "z1"]}]
+    return model
+
+
+def test_d01_buffer_permutation_uses_root_index_map():
+    first = _two_buffer_problem([0, 1])
+    second = _two_buffer_problem([1, 0])
+    for problem in (first, second):
+        request = B.lower_problem_to_request(problem, _two_buffer_model(), OPTIONS)
+        assert request.core_args["fixed_buffer_versions"] == [2, 1], request.core_args
+        assert B.verify_request_coverage(problem, request)["complete"] is True
+
+
+def test_d01_fixed_version_mutation_still_fails():
+    problem = _two_buffer_problem([0, 1])
+    request = B.lower_problem_to_request(problem, _two_buffer_model(), OPTIONS)
+    args = dict(request.core_args)
+    args["fixed_buffer_versions"] = [3, 1]
+    bad = dataclasses.replace(request, core_args=args)
+    expect_code("FIXED_VERSION_MISMATCH",
+                lambda: B.verify_request_coverage(problem, bad))
+
+
 if __name__ == "__main__":
     if not _Z3_AVAILABLE:
         print("SKIP", SOLVER_TESTS_NEED_Z3)
