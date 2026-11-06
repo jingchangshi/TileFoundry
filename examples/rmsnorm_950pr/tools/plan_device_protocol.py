@@ -126,7 +126,7 @@ def aggregate(windows: dict) -> dict:
     return out
 
 
-def build_case(archived: Path, out_case: Path, protocol: dict, *, busy_policy="record") -> dict:
+def build_case(archived: Path, out_case: Path, protocol: dict) -> dict:
     """Create the unique case dir layout and run the PLAN validations."""
     if out_case.exists() and any(out_case.iterdir()):
         raise Refuse("CASE_DIR_NOT_NEW", "%s exists and is not empty" % out_case)
@@ -176,9 +176,6 @@ def build_case(archived: Path, out_case: Path, protocol: dict, *, busy_policy="r
             s = parse_smi(p.read_text())
             if s["health_ok"] is not True:
                 raise Refuse("DEVICE_HEALTH", "%s health not OK" % tag)
-            if s["busy"] and busy_policy == "refuse":
-                raise Refuse("BUSY_MISJUDGED",
-                             "busy device was treated as a failure; busy must be recorded")
             phase("smi_%s" % tag, "PASS", detail="busy=%s process_rows=%d (recorded)" %
                   (s["busy"], s["process_rows"]))
         # timing completeness
@@ -199,7 +196,7 @@ def build_case(archived: Path, out_case: Path, protocol: dict, *, busy_policy="r
         phase("numeric", "PASS", detail="repeats/stability/reuse pass")
         phases["status"] = "PASS"
         (out_case / "phases.json").write_text(json.dumps(phases, indent=2) + "\n")
-        return {"case": out_case.name, "status": "PASS", "busy_policy": busy_policy,
+        return {"case": out_case.name, "status": "PASS",
                 "windows": got, "aggregate": agg, "phases": phases}
     except Refuse as exc:
         phase("verdict", "REFUSED", exc.code, exc.msg)
@@ -209,7 +206,7 @@ def build_case(archived: Path, out_case: Path, protocol: dict, *, busy_policy="r
                 "detail": exc.msg, "phases": phases}
 
 
-def validate_case(case_dir: Path, protocol: dict, *, busy_policy="record") -> dict:
+def validate_case(case_dir: Path, protocol: dict) -> dict:
     """Validate an EXISTING case dir (used by PLAN mutation tests)."""
     phases = {"stages": {}, "status": None}
 
@@ -230,9 +227,7 @@ def validate_case(case_dir: Path, protocol: dict, *, busy_policy="record") -> di
             busy[tag] = s["busy"]
             if s["health_ok"] is not True:
                 raise Refuse("DEVICE_HEALTH", "%s health not OK" % tag)
-            if s["busy"] and busy_policy == "refuse":
-                raise Refuse("BUSY_MISJUDGED", "busy must be recorded, not refused")
-            phase("smi_%s" % tag, "PASS", detail="busy=%s" % s["busy"])
+            phase("smi_%s" % tag, "PASS", detail="busy=%s (recorded)" % s["busy"])
         wpath = case_dir / "timing/windows.json"
         win = json.loads(wpath.read_text())
         if len(win.get("windows") or []) != win.get("expected_window_count"):
@@ -261,7 +256,6 @@ def main() -> int:
     ap.add_argument("--archived-root", default=None)
     ap.add_argument("--out-root", default=None)
     ap.add_argument("--protocol", default=str(FROZEN))
-    ap.add_argument("--busy-policy", choices=["record", "refuse"], default="record")
     ap.add_argument("--cases", nargs="*", default=None)
     ap.add_argument("--case", default=None, help="single archived case dir (mutation mode)")
     ap.add_argument("--validate-only", action="store_true",
@@ -271,14 +265,14 @@ def main() -> int:
     out_root = Path(args.out_root) if args.out_root else None
     if args.validate_only:
         case_dir = Path(args.case) if args.case else out_root
-        res = validate_case(case_dir, protocol, busy_policy=args.busy_policy)
+        res = validate_case(case_dir, protocol)
         print(json.dumps(res, indent=2))
         return 0 if res["status"] == "PASS" else 2
     if args.case:
         archived = Path(args.case)
         out_case = out_root / archived.name
         try:
-            res = build_case(archived, out_case, protocol, busy_policy=args.busy_policy)
+            res = build_case(archived, out_case, protocol)
         except Refuse as exc:
             print(json.dumps({"case": out_case.name, "status": "REFUSED", "code": exc.code,
                               "detail": exc.msg}, indent=2))
@@ -288,8 +282,7 @@ def main() -> int:
     names = args.cases or sorted(p.name for p in Path(args.archived_root).iterdir() if p.is_dir())
     results = []
     for n in names:
-        res = build_case(Path(args.archived_root) / n, out_root / n, protocol,
-                         busy_policy=args.busy_policy)
+        res = build_case(Path(args.archived_root) / n, out_root / n, protocol)
         results.append({"case": n, "status": res["status"], "code": res.get("code")})
     (out_root / "PREP_REPORT.json").write_text(json.dumps({"mode": "plan_rehearsal",
                                                           "results": results}, indent=2) + "\n")

@@ -10,12 +10,18 @@ import sys
 import tempfile
 from pathlib import Path
 
+# Machine-independent root: from TF_WORKSPACE_ROOT, defaulting to ~/workspace.
+# A literal home path makes the file unusable elsewhere; a placeholder would
+# make it unusable HERE, so it is derived.
+_WS_ROOT = os.environ.get("TF_WORKSPACE_ROOT") or str(Path.home() / "workspace")
+
+
 import numpy as np
 
 TF = Path(__file__).resolve().parents[3]
-ARCH = Path("/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/run02/device/archive/cases_audited_20261104T202316/decode_dyn")
-AIBIN = Path("/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/run03/w15/06-04/run/decode_dyn.cce.aibin")
-ENV_OK = Path("/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/run03/w16/06-05/fixtures/env_ok.json")
+ARCH = Path(f"{_WS_ROOT}/TileFoundry_Ascend950PR_AgentTeam/artifacts/run02/device/archive/cases_audited_20261104T202316/decode_dyn")
+AIBIN = Path(f"{_WS_ROOT}/TileFoundry_Ascend950PR_AgentTeam/artifacts/run03/w15/06-04/run/decode_dyn.cce.aibin")
+ENV_OK = Path(f"{_WS_ROOT}/TileFoundry_Ascend950PR_AgentTeam/artifacts/run03/w16/06-05/fixtures/env_ok.json")
 DRIVER = TF / "examples/rmsnorm_950pr/tools/check_06_05.py"
 PY = sys.executable
 ROOT = Path(tempfile.mkdtemp(prefix="check0605_"))

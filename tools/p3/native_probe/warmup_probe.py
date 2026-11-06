@@ -20,7 +20,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from device_guard import DeviceWindow, GuardError, verify_build  # noqa: E402
+from device_guard import DeviceWindow, GuardError, check_device_identity, verify_build  # noqa: E402
 from probe_base import DEFAULT_TL, observed_bits, to_f32_tensor  # noqa: E402
 
 
@@ -49,9 +49,12 @@ def main() -> int:
         return 0
     try:
         build = verify_build(Path(args.tilelang_root))
+        ident = check_device_identity()
     except GuardError as exc:
         print("REFUSED", exc, file=sys.stderr)
         return 2
+    outdir = Path(args.out); outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "device_identity.json").write_text(json.dumps(ident, indent=2))
     import tilelang
     import tilelang.ascend.language as T
     import torch
@@ -61,7 +64,6 @@ def main() -> int:
         tilelang.disable_cache()
     except Exception:  # noqa: BLE001
         pass
-    outdir = Path(args.out); outdir.mkdir(parents=True, exist_ok=True)
     phases, t0 = {}, time.monotonic()
 
     def mark(name):

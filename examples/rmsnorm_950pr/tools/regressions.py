@@ -33,12 +33,18 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Machine-independent root: from TF_WORKSPACE_ROOT, defaulting to ~/workspace.
+# A literal home path makes the file unusable elsewhere; a placeholder would
+# make it unusable HERE, so it is derived.
+_WS_ROOT = os.environ.get("TF_WORKSPACE_ROOT") or str(Path.home() / "workspace")
+
+
 PASS, FAIL, ERROR, NOT_RUN = 0, 1, 2, 3
 _STATUS_EXIT = {"PASS": PASS, "FAIL": FAIL, "ERROR": ERROR, "NOT_RUN": NOT_RUN}
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TOOLS_DIR = Path(__file__).resolve().parent
-DEFAULT_PYTHON = "/home/s00653124/workspace/tfpy312/bin/python"
+DEFAULT_PYTHON = f"{_WS_ROOT}/tfpy312/bin/python"
 
 # Set from --python in main(). Module-level so a check can be called on its own
 # for a self-test, which is only meaningful if it uses the same interpreter.
