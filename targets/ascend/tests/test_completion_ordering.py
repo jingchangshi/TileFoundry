@@ -690,3 +690,157 @@ def test_nodes_in_reachable_branches_are_not_wrongly_dropped():
     assert runtime_mutant is not None
     assert len(C._actual_nodes(runtime_mutant)["wait"]) == baseline_wait_count
     assert _verify(runtime_mutant, _retarget_placement(placement, runtime_mutant, wait)).status == "VERIFIED"
+
+
+# --------------------------------------------------------------------------------------
+# LOOP reachability: a body that provably never runs is not coverage either.
+#
+# The previous round taught reachability about If but not about loops, so _walk descended
+# into every While/For body unconditionally. Measured before the fix: a real Wait inside a
+# typed-VALID While(False) still counted (waits 30 -> 30) and C still reported VERIFIED
+# 47/47. Same family as the If(False) gap: the predicate existed, one statement KIND was
+# simply not routed through it.
+# --------------------------------------------------------------------------------------
+
+def _int_const(value):
+    from tilefoundry.ir.core import Constant
+    from tilefoundry.ir.types import make_tensor_type
+    return Constant(value=value, type=make_tensor_type((), dtype="i32", storage="umat"))
+
+
+def _bool_const(value):
+    from tilefoundry.ir.core import Constant
+    from tilefoundry.ir.types import make_tensor_type
+    return Constant(value=value, type=make_tensor_type((), dtype="i1", storage="umat"))
+
+
+def _wrap_in_loop(stmt, kind, **bounds):
+    """Wrap one statement in a While/For so its body reachability is exercised for real."""
+    from tilefoundry.ir.core import Var
+    from tilefoundry.ir.types import make_tensor_type
+    from tilefoundry.ir.tir.stmts import For, While
+
+    sequence = Sequential(body=(stmt,))
+    if kind == "while":
+        return Sequential(body=(While(cond=bounds["cond"], body=sequence),))
+    return Sequential(body=(For(
+        induction_var=Var(name="i", type=make_tensor_type((), dtype="i32", storage="umat")),
+        start=_int_const(bounds["start"]), stop=_int_const(bounds["stop"]),
+        step=_int_const(bounds["step"]), body=sequence),))
+
+
+def _replace_with(stmt_root, target_callable, wrap):
+    mutant = _replace_statement(stmt_root, target_callable, wrap)
+    assert mutant is not None, "target statement not found"
+    return mutant
+
+
+def test_wait_in_while_false_is_not_counted():
+    """A real Wait whose only enclosing loop is While(False) can never execute."""
+    actual, placement = _inject()
+    _path, wait = C._actual_nodes(actual)["wait"][0]
+    mutant = _replace_with(actual, wait, lambda s: _wrap_in_loop(s, "while", cond=_bool_const(False)))
+
+    assert all(node is not wait for _p, node in C._actual_nodes(mutant)["wait"])
+    report = _verify(mutant, _retarget_placement(placement, mutant, wait))
+    assert report.status == "FAILED", report.as_dict()
+    assert report.code in ("COMPLETION_UNREACHABLE_NODE", "COMPLETION_NOT_VERIFIED"), report.as_dict()
+
+
+def test_set_in_while_false_is_not_counted():
+    """The Set mirror image: fixing only Wait would leave the same false positive."""
+    actual, placement = _inject()
+    _path, target = C._actual_nodes(actual)["set"][0]
+    mutant = _replace_with(actual, target, lambda s: _wrap_in_loop(s, "while", cond=_bool_const(False)))
+
+    assert all(node is not target for _p, node in C._actual_nodes(mutant)["set"])
+    report = _verify(mutant, _retarget_placement(placement, mutant, target))
+    assert report.status == "FAILED", report.as_dict()
+
+
+def test_wait_in_zero_trip_for_is_not_counted():
+    """For(0, 0, 1) has an empty constant range, so the body never runs."""
+    actual, placement = _inject()
+    _path, wait = C._actual_nodes(actual)["wait"][0]
+    mutant = _replace_with(actual, wait,
+                           lambda s: _wrap_in_loop(s, "for", start=0, stop=0, step=1))
+    assert all(node is not wait for _p, node in C._actual_nodes(mutant)["wait"])
+
+
+def test_drain_in_while_false_still_reports_final_drain_missing():
+    """Drain's pre-existing refusal must survive the loop-reachability change."""
+    actual, placement = _inject()
+    _path, drain = C._actual_nodes(actual)["drain"][0]
+    mutant = _replace_with(actual, drain, lambda s: _wrap_in_loop(s, "while", cond=_bool_const(False)))
+
+    assert C._reachable_drain(mutant) is False
+    report = _verify(mutant, placement)
+    assert report.status == "FAILED", report.as_dict()
+    assert report.code == "FINAL_DRAIN_MISSING", report.as_dict()
+
+
+def test_for_trip_count_semantics_negative_step_and_empty_ranges():
+    """The trip-count rule, including the boundary cases the fix must not get wrong.
+
+    A loop that runs is reachable; only a PROVABLY empty constant range is dead. Applying
+    "step == 1 only" logic would have wrongly killed descending loops, and "start >= stop is
+    empty" would have killed every negative-step loop.
+    """
+    actual, _placement = _inject()
+    _path, wait = C._actual_nodes(actual)["wait"][0]
+    baseline_wait_count = len(C._actual_nodes(actual)["wait"])
+
+    def counted(**bounds):
+        mutant = _replace_with(actual, wait, lambda s: _wrap_in_loop(s, "for", **bounds))
+        return any(node is wait for _p, node in C._actual_nodes(mutant)["wait"])
+
+    # REACHABLE: these loops run at least once.
+    assert counted(start=0, stop=4, step=1) is True
+    assert counted(start=4, stop=0, step=-1) is True      # descending loop
+    assert counted(start=0, stop=1, step=1) is True       # single iteration
+    assert counted(start=0, stop=10, step=3) is True      # 4 iterations
+    # DEAD: provably empty constant ranges.
+    assert counted(start=0, stop=0, step=1) is False      # empty
+    assert counted(start=5, stop=2, step=1) is False      # start beyond stop, ascending
+    assert counted(start=2, stop=5, step=-1) is False     # start before stop, descending
+    assert counted(start=0, stop=4, step=0) is False      # non-progressing
+
+
+def test_while_and_for_live_bodies_are_not_wrongly_dropped():
+    """POSITIVE control: While(True), a run-time condition, and a run-time For stay reachable.
+
+    A run-time bound is not statically decidable, so it must never be assumed zero -- doing
+    so would silently discard real synchronisation.
+    """
+    from tilefoundry.ir.core import Constant, Var
+    from tilefoundry.ir.types import make_tensor_type
+    from tilefoundry.ir.tir.stmts import For, While
+
+    actual, placement = _inject()
+    _path, wait = C._actual_nodes(actual)["wait"][0]
+
+    def still_counts(wrap):
+        mutant = _replace_with(actual, wait, wrap)
+        assert any(node is wait for _p, node in C._actual_nodes(mutant)["wait"])
+        return mutant
+
+    while_true = still_counts(lambda s: _wrap_in_loop(s, "while", cond=_bool_const(True)))
+    assert _verify(while_true, _retarget_placement(placement, while_true, wait)).status == "VERIFIED"
+
+    runtime_while = still_counts(
+        lambda s: Sequential(body=(While(
+            cond=Var(name="rt", type=make_tensor_type((), dtype="i1", storage="umat")),
+            body=Sequential(body=(s,))),)))
+    assert _verify(runtime_while,
+                   _retarget_placement(placement, runtime_while, wait)).status == "VERIFIED"
+
+    # A run-time trip count cannot be shown to be zero, so the body stays reachable.
+    int_type = make_tensor_type((), dtype="i32", storage="umat")
+    runtime_for = still_counts(lambda s: Sequential(body=(For(
+        induction_var=Var(name="i", type=int_type),
+        start=Constant(value=0, type=int_type),
+        stop=Var(name="runtime_stop", type=int_type),
+        step=Constant(value=1, type=int_type),
+        body=Sequential(body=(s,))),)))
+    assert _verify(runtime_for,
+                   _retarget_placement(placement, runtime_for, wait)).status == "VERIFIED"

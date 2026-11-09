@@ -387,26 +387,83 @@ def _branch_reachability(cond, reachable):
     return reachable, reachable
 
 
+def _loop_body_reachability(stmt, reachable):
+    """Can this loop's BODY execute at least once?
+
+    A loop that provably runs zero times executes nothing inside it, so a Set/Wait/Drain
+    sealed there is not coverage any more than one inside If(False). Previously the walk
+    descended into every While/For body unconditionally: reachability was taught about If
+    but not about loops, so ``While(False)`` and ``For(0, 0, 1)`` still counted.
+
+      While(False)            -> body dead.  While(True) or a RUN-TIME condition -> body live
+                                 (a run-time condition is not statically decidable).
+      For(start, stop, step)  -> body dead only when all three are CONSTANTS and the
+                                 iteration count is <= 0. The count is computed for the
+                                 real sign semantics, not just step == 1:
+                                   step > 0 : count = ceil((stop - start) / step)
+                                   step < 0 : count = ceil((start - stop) / -step)
+                                   step == 0: treated as dead (a zero-step counted loop
+                                              cannot make progress)
+                                 Any non-constant bound leaves the body REACHABLE: an
+                                 unprovable trip count must not be assumed zero.
+    """
+    from tilefoundry.ir.tir.stmts import For, While  # noqa: PLC0415
+
+    if not reachable:
+        return False
+    if isinstance(stmt, While):
+        cond = getattr(stmt, "cond", None)
+        if isinstance(cond, Constant) and getattr(cond, "value", None) is False:
+            return False
+        return True
+    if isinstance(stmt, For):
+        start = getattr(stmt, "start", None)
+        stop = getattr(stmt, "stop", None)
+        step = getattr(stmt, "step", None)
+        values = []
+        for bound in (start, stop, step):
+            if isinstance(bound, Constant) and isinstance(getattr(bound, "value", None), int):
+                values.append(int(bound.value))
+            else:
+                return True  # a run-time bound: trip count unknown, so the body can run
+        start_value, stop_value, step_value = values
+        if step_value == 0:
+            return False
+        if step_value > 0:
+            span = stop_value - start_value
+            step_magnitude = step_value
+        else:
+            span = start_value - stop_value
+            step_magnitude = -step_value
+        if span <= 0:
+            return False
+        return -(-span // step_magnitude) > 0  # ceil division; a positive span always runs
+    return reachable
+
+
 def _walk(stmt, path=(), reachable=True):
     """Walk the TIR, yielding (path, statement, reachable).
 
     ``reachable`` is the single source of truth for whether a statement can execute. Set,
     Wait and Drain all read it, so no op class can drift into having its own private notion
     of reachability -- that split is exactly what let an If(False)-sealed Wait count as
-    coverage while Drain alone was checked.
+    coverage while Drain alone was checked. Loops are handled by the same predicate, so
+    While(False) and a zero-trip For cannot re-introduce the gap for a different statement
+    kind.
     """
     yield "/".join(path), stmt, reachable
+    loop_body_reachable = _loop_body_reachability(stmt, reachable)
     body = getattr(stmt, "body", None)
     if isinstance(body, Sequential):
         for index, child in enumerate(body.body):
-            yield from _walk(child, path + ("s%d" % index,), reachable)
+            yield from _walk(child, path + ("s%d" % index,), loop_body_reachable)
     elif isinstance(body, (list, tuple)):
         for index, child in enumerate(body):
-            yield from _walk(child, path + ("s%d" % index,), reachable)
+            yield from _walk(child, path + ("s%d" % index,), loop_body_reachable)
     elif body is not None and not isinstance(body, (str, int)):
         # MeshScope / ExecutionScope / For / While: descend so a nested Drain/Set/Wait is
         # still found; the previous top-only walk missed nested scope nodes.
-        yield from _walk(body, path + (type(stmt).__name__,), reachable)
+        yield from _walk(body, path + (type(stmt).__name__,), loop_body_reachable)
     ifs = None
     if hasattr(stmt, "then_body") or hasattr(stmt, "else_body"):
         ifs = _branch_reachability(getattr(stmt, "cond", None), reachable)
