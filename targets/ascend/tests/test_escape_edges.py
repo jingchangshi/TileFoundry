@@ -333,31 +333,45 @@ def main():
         accepted is True for accepted, _code in field_results.values())
 
     # ------------------------------------------------------------------------------------
-    # A/B COVERAGE CLASSIFICATION (machine-readable, and FALSIFIABLE).
+    # A/B/C COVERAGE CLASSIFICATION (machine-readable, and FALSIFIABLE).
     #
-    # Every EscapeEdge payload field is now refused when forged (proved above). That is NOT
-    # the same as every field being grounded in the typed records, and the difference must be
+    # Every EscapeEdge payload field is refused when forged (proved above). That is NOT the
+    # same as every field being grounded in the typed records, and the difference must be
     # visible in the test product rather than only in a report.
     #
-    #   A ("record_grounded")     - the value has a record-side source, so forging the RECORD
-    #                               is itself refused while building the edges. The guarantee
-    #                               is: "the record is honest, and the edge agrees with it".
-    #   B ("ir_derived_only")     - the value has NO record-side source; it is computed from
-    #                               the real TIR/ledger (scope paths, emitted entries,
-    #                               declaration sites) or is a fixed schema constant. Forging
-    #                               the record is a NO-OP here, so the only guarantee is
-    #                               "the edge agrees with the real IR". It is NOT a
-    #                               record-honesty guarantee, because no record field exists
-    #                               to be honest or dishonest about.
+    #   A ("payload_refused")   - forging the EDGE payload is refused. This is true of all 17
+    #                             fields and is all that the field-level negatives above prove.
+    #   B ("ir_derived_only")   - the value has NO record-side source; it is computed from the
+    #                             real TIR/ledger or is a schema constant, so forging any record
+    #                             field is a measured NO-OP. Guarantee: "the edge agrees with
+    #                             the real IR". This is NOT record honesty.
+    #   C ("record_subfield_unchecked")
+    #                           - the record DOES carry a sub-field that feeds (or claims to
+    #                           feed) this edge field, but forging that sub-field ALONE is
+    #                           ACCEPTED. These are real, measured gaps in record grounding.
     #
-    # B is not a defect and must not be described as one, but it must also never be reported
-    # as "record-side validated". The record-side probe below re-derives the classification
-    # from live behaviour, so a later change that gives a B field a record source turns this
-    # check RED and forces the classification to be updated.
+    # The correction that produced class C: an earlier revision of this test called the whole
+    # of A "record_grounded", which was too strong. Measured, one sub-field at a time, over
+    # every field of every record:
+    #
+    #   field_path             -> appended a unique suffix : refused 0 / accepted 128
+    #   outer_source           -> "FORGED"                  : refused 0 / accepted 64
+    #   outer_consume_ordinal  -> 999                       : refused 0 / accepted 64
+    #   declaration_ordinal    -> 999                       : refused 128 / accepted 0
+    #   outer_declaration_ord. -> 999                       : refused 64 / accepted 0
+    #   ssa_group              -> 999                       : refused 128 / accepted 0
+    #   inner_type             -> bf16->f32                 : refused 64 / accepted 0
+    #   outer_type             -> bf16->f32                 : refused 64 / accepted 0
+    #
+    # So only 5 of the 8 record sub-fields are actually enforced. ``outer_source`` is never
+    # read by ledger.py at all; ``outer_consume_ordinal`` is read (line ~639) only as a
+    # presence flag to decide whether to REFUSE an ambiguous binding, so its VALUE is never
+    # compared; ``field_path`` is used to address the endpoint but a unique forged name simply
+    # resolves to nothing and is reported as ESCAPE_EDGE_MISSING against the EXPECTATION, not
+    # as a record inconsistency.
     # ------------------------------------------------------------------------------------
     RECORD_GROUNDED_FIELDS = {
-        # edge field -> the record field whose forgery is refused while building
-        "field_path": "field_path",
+        # edge field -> the record sub-field whose forgery IS refused
         "ssa_group": "ssa_group",
         "inner_type": "inner_type",
         "outer_type": "outer_type",
@@ -366,6 +380,23 @@ def main():
         "inner_action_id": "ssa_group",     # endpoint resolved through the same site
         "outer_action_id": "ssa_group",
         "scope_path": "scope_path",         # record scope ordinal -> real ExecutionScope
+        # The edge field is refused when forged, but its record sub-field is NOT enforced --
+        # see class C. Listed here so the EDGE-field partition stays exact; the sub-field gap
+        # is reported separately rather than hidden by omitting the field.
+        "field_path": "field_path (weakly: forged name is caught only as a missing expectation)",
+    }
+    #: Record sub-fields that exist, feed an edge field, and are NOT enforced when forged
+    #: alone. Named explicitly so the gap cannot be mistaken for coverage.
+    UNCHECKED_RECORD_SUBFIELDS = {
+        "field_path": ("edge field field_path",
+                       "a unique forged name resolves to nothing and is caught only as a "
+                       "MISSING expectation entry, never as a record inconsistency"),
+        "outer_source": ("edge field outer_binding",
+                         "ledger.py never reads this key at build time; measured accepted 64/64"),
+        "outer_consume_ordinal": ("outer endpoint binding",
+                                  "read only as a presence flag (decides whether to refuse an "
+                                  "ambiguous binding); its VALUE is never compared, measured "
+                                  "accepted 64/64"),
     }
     IR_DERIVED_ONLY_FIELDS = {
         "edge_kind": "fixed by build_escape_edges() for every edge; not a record value",
@@ -379,8 +410,8 @@ def main():
     }
     declared_fields = {f.name for f in dataclasses.fields(baseline.escape_edges[0])}
 
-    # (1) The two classes must PARTITION the declared fields: no field unclassified, no field
-    # in both, and nothing invented that the dataclass does not have.
+    # (1) The classes must PARTITION the declared fields: nothing unclassified, nothing in
+    # both, nothing invented. A newly added EscapeEdge field fails this until classified.
     classified = set(RECORD_GROUNDED_FIELDS) | set(IR_DERIVED_ONLY_FIELDS)
     checks["field_classification_partitions_all_fields"] = (
         classified == declared_fields
@@ -388,15 +419,19 @@ def main():
     )
     unclassified = sorted(declared_fields - classified)
     if unclassified:
-        print("UNCLASSIFIED EscapeEdge fields (add them to A or B): " + repr(unclassified))
+        print("UNCLASSIFIED EscapeEdge fields (add them to A, B or C): " + repr(unclassified))
 
     # (2) B-class fields are reported, by name, with their guarantee strength spelled out.
-    print("field coverage classification (A=record_grounded, B=ir_derived_only):")
+    print("field coverage classification (A=payload_refused, B=ir_derived_only, "
+          "C=record_subfield_unchecked):")
     for name in sorted(RECORD_GROUNDED_FIELDS):
-        print("  A %-18s record_source=%s" % (name, RECORD_GROUNDED_FIELDS[name]))
+        print("  A %-18s record_source=%s (forgery refused)" % (name, RECORD_GROUNDED_FIELDS[name]))
     for name in sorted(IR_DERIVED_ONLY_FIELDS):
-        print("  B %-18s guarantee='edge agrees with the real IR' (no record-side source): %s"
+        print("  B %-18s guarantee='edge agrees with the real IR', NOT record honesty: %s"
               % (name, IR_DERIVED_ONLY_FIELDS[name]))
+    for name in sorted(UNCHECKED_RECORD_SUBFIELDS):
+        target, why = UNCHECKED_RECORD_SUBFIELDS[name]
+        print("  C record.%-22s feeds %-24s NOT ENFORCED: %s" % (name, target, why))
     checks["record_side_uncheckable_fields_reported"] = (
         set(IR_DERIVED_ONLY_FIELDS) == {
             "edge_kind", "iteration_path", "guard", "iteration_domains",
@@ -404,11 +439,74 @@ def main():
         }
         and all(isinstance(reason, str) and reason for reason in IR_DERIVED_ONLY_FIELDS.values())
     )
+    checks["unchecked_record_subfields_are_named"] = (
+        set(UNCHECKED_RECORD_SUBFIELDS) == {
+            "field_path", "outer_source", "outer_consume_ordinal",
+        }
+        and all(isinstance(v, tuple) and len(v) == 2 for v in UNCHECKED_RECORD_SUBFIELDS.values())
+    )
 
-    # (3) FALSIFIABILITY: re-derive the classification from live behaviour. For every B field
-    # that COULD plausibly acquire a record source, forge the record fields and require the
-    # build to be a no-op that leaves that edge field untouched. If someone later wires a
-    # record field into it, the edge field will change and this goes RED.
+    # (3) FALSIFIABILITY: re-derive the classification from live behaviour. For every record
+    # sub-field, forge it on ITS OWN and require the measured accept/refuse to match the class
+    # it was assigned to. A sub-field silently promoted to enforced, or silently un-enforced,
+    # turns this RED.
+    def measure_record_subfield(name):
+        """(refused, accepted) when this ONE record sub-field is forged across all records."""
+        refused = accepted = 0
+        for record_index in range(len(records)):
+            for field_index in range(len(records[record_index].get("fields", ()))):
+                forged = copy.deepcopy(records)
+                target = forged[record_index]["fields"][field_index]
+                if name not in target:
+                    continue
+                original_value = target[name]
+                if name in ("declaration_ordinal", "outer_declaration_ordinal",
+                            "outer_consume_ordinal", "ssa_group"):
+                    if original_value is None:
+                        continue
+                    target[name] = 999999
+                elif name in ("inner_type", "outer_type"):
+                    if "bf16" not in str(original_value or ""):
+                        continue
+                    target[name] = str(original_value).replace("bf16", "f32")
+                else:
+                    target[name] = str(original_value) + "_FORGED_UNIQUE"
+                if target[name] == original_value:
+                    continue
+                try:
+                    probe_ledger = ledger_with(rec=forged)
+                    validate_escape_edges(probe_ledger)
+                except (LedgerError, ValueError, TypeError, KeyError):
+                    refused += 1
+                else:
+                    accepted += 1
+        return refused, accepted
+
+    ENFORCED_RECORD_SUBFIELDS = {
+        "declaration_ordinal", "outer_declaration_ordinal", "ssa_group",
+        "inner_type", "outer_type", "scope_path",
+    }
+    subfield_drift = {}
+    for name in sorted(ENFORCED_RECORD_SUBFIELDS | set(UNCHECKED_RECORD_SUBFIELDS)):
+        refused, accepted = measure_record_subfield(name)
+        if name == "scope_path":
+            # Handled at record level, not per field: see the record-level probe below.
+            continue
+        should_be_enforced = name in ENFORCED_RECORD_SUBFIELDS
+        is_enforced = refused > 0 and accepted == 0
+        is_unenforced = accepted > 0
+        if should_be_enforced and not is_enforced:
+            subfield_drift[name] = ("claimed enforced but measured %d refused / %d accepted"
+                                    % (refused, accepted))
+        if not should_be_enforced and not is_unenforced:
+            subfield_drift[name] = ("claimed unenforced but measured %d refused / %d accepted "
+                                    "-- promote it to enforced" % (refused, accepted))
+    checks["record_subfield_classes_match_measurement"] = not subfield_drift
+    if subfield_drift:
+        print("record sub-field classification drift: " + repr(subfield_drift))
+
+    # (4) B-class fields must still not be reachable from any record sub-field: wiring one in
+    # must force the classification to be updated rather than silently gaining a guarantee.
     def record_is_still_a_no_op_for_class_b():
         """True while no B-class field is reachable from a record field."""
         # Only SCALAR record fields are forged: replacing a container ("fields", "dropped_fields")
@@ -460,8 +558,8 @@ def main():
     if drift:
         print("B-class field reached a record source; reclassify it as A: " + repr(drift[:5]))
 
-    # (4) The report the test prints must agree with the live classification: every A field
-    # must be one the forged-record probe actually refused, so the label is not aspirational.
+    # (5) The A labels must be exactly the fields the forged-record probe actually refused, so
+    # the label is measured rather than aspirational.
     refused_at_build = {
         "field_path", "ssa_group", "inner_type", "outer_type", "scope_path",
     }
@@ -469,7 +567,6 @@ def main():
         set(RECORD_GROUNDED_FIELDS) - refused_at_build  # roots/actions inherit ssa_group
         == {"inner_root", "outer_root", "inner_action_id", "outer_action_id"}
     )
-
 
     for key, value in checks.items():
         print(("ok   " if value else "FAIL ") + key)
