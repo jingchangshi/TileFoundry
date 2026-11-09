@@ -502,3 +502,66 @@ def test_r4_loop_body_can_execute_matches_direct_measurement():
         induction_var=Var(name="i", type=int_type), start=k(0),
         stop=Var(name="n", type=int_type), step=k(1),
         body=Sequential(body=()))) is True
+
+
+def _seal_behind_return(module, predicate):
+    """Put a Return BEFORE every statement matching `predicate`, in ONE pass by identity.
+
+    Same rationale as _wrap_in_dead_if: several statements share a fingerprint, and a
+    repeated pass would re-wrap its own output. All matches are sealed in one traversal.
+    """
+    from tilefoundry.ir.tir.stmts import Return
+
+    sealed_ids = set()
+
+    def seal(item):
+        sealed_ids.add(id(item))
+        return Sequential(body=(Return(), item))
+
+    def rewrite(node):
+        if not dataclasses.is_dataclass(node):
+            return None
+        for field in dataclasses.fields(node):
+            value = getattr(node, field.name, None)
+            if isinstance(value, Sequential):
+                children = []
+                for child in value.body:
+                    if predicate(child):
+                        children.append(seal(child))
+                    else:
+                        replaced = rewrite(child)
+                        children.append(child if replaced is None else replaced)
+                setattr(node, field.name, Sequential(body=tuple(children)))
+            elif dataclasses.is_dataclass(value):
+                rewrite(value)
+        return node
+
+    rewrite(module)
+    return module, len(sealed_ids)
+
+
+def test_r4_rewritten_write_after_return_is_not_an_applied_write():
+    """A rewritten WRITE sealed behind a Return never executes, so it is not applied.
+
+    Fourth form of the reachability family: R used to keep counting it, exactly as C kept
+    counting a Drain sealed the same way.
+    """
+    plan = build_stage()
+    original = R3.make_tir_fixture()
+    rewritten, materialization = MAT.materialize_plan(original, plan)
+    baseline = MAT.verify_plan_application(original, plan, rewritten, materialization)
+    assert baseline["status"] == "PASS", baseline
+    assert baseline["applied_accesses"] == baseline["expected_applications"], baseline
+
+    recorded = {entry["new_fingerprint"] for entry in materialization.entries}
+    target = next(stmt for stmt in MAT.index_statements_ledger(rewritten).values()
+                  if MAT.fingerprint(stmt) in recorded and isinstance(stmt, Evaluate))
+
+    def _match(item):
+        return isinstance(item, Evaluate) and MAT.fingerprint(item) == MAT.fingerprint(target)
+
+    mutant, sealed = _seal_behind_return(rewritten, _match)
+    assert sealed > 0, "no recorded statement was sealed"
+    report = MAT.verify_plan_application(original, plan, mutant, materialization)
+    assert report["status"] == "FAIL", report
+    assert report["code"] == "PLAN_WRITE_UNREACHABLE", report

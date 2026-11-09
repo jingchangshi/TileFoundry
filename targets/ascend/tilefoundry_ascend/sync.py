@@ -441,6 +441,22 @@ def _loop_body_reachability(stmt, reachable):
     return reachable
 
 
+def _terminated(children, index) -> bool:
+    """Is ``children[index]`` unreachable because an earlier sibling always returns?
+
+    A ``Return`` in a ``Sequential`` ends that block: statements after it are dead code
+    that still sits in the AST. Only a DIRECT earlier Return counts; a Return nested in an
+    If arm does not necessarily terminate the block (it may be the untaken arm), so this is
+    deliberately conservative -- it never marks a live statement dead.
+    """
+    from tilefoundry.ir.tir.stmts import Return  # noqa: PLC0415
+
+    for earlier in children[:index]:
+        if isinstance(earlier, Return):
+            return True
+    return False
+
+
 def _walk(stmt, path=(), reachable=True):
     """Walk the TIR, yielding (path, statement, reachable).
 
@@ -456,10 +472,17 @@ def _walk(stmt, path=(), reachable=True):
     body = getattr(stmt, "body", None)
     if isinstance(body, Sequential):
         for index, child in enumerate(body.body):
-            yield from _walk(child, path + ("s%d" % index,), loop_body_reachable)
+            # A Return terminates its enclosing Sequential: every later sibling is
+            # unreachable even though it is structurally present. This is the FOURTH
+            # form of the "static presence != execution reachability" family (after If
+            # arms, While(False), and zero-trip For). A Drain sealed behind a Return
+            # still satisfied the FINAL obligation until this check existed.
+            yield from _walk(child, path + ("s%d" % index,),
+                             loop_body_reachable and not _terminated(body.body, index))
     elif isinstance(body, (list, tuple)):
         for index, child in enumerate(body):
-            yield from _walk(child, path + ("s%d" % index,), loop_body_reachable)
+            yield from _walk(child, path + ("s%d" % index,),
+                             loop_body_reachable and not _terminated(body, index))
     elif body is not None and not isinstance(body, (str, int)):
         # MeshScope / ExecutionScope / For / While: descend so a nested Drain/Set/Wait is
         # still found; the previous top-only walk missed nested scope nodes.

@@ -43,8 +43,8 @@ for entry in (REPO / "src", REPO / "targets" / "ascend", REPO / "targets" / "asc
 from tilefoundry.ir.core import Constant, Var
 from tilefoundry.ir.tir.stmts import For, While
 from tilefoundry.ir.types import make_tensor_type
-from tilefoundry_ascend.plan.materialize import _loop_body_can_execute
-from tilefoundry_ascend.sync import _loop_body_reachability
+from tilefoundry_ascend.plan.materialize import _loop_body_can_execute, index_statements_ledger
+from tilefoundry_ascend.sync import _loop_body_reachability, _walk as _c_walk
 
 _U32 = make_tensor_type((), dtype="int32", storage="umat")
 _BOOL = make_tensor_type((), dtype="bool", storage="umat")
@@ -148,3 +148,60 @@ def test_parity_guard_is_falsifiable():
         "the sweep domain contains no shape where a constant-True predicate would differ, "
         "so the parity test would not be able to detect drift"
     )
+
+
+def _r_index(module, *, reachable_only):
+    return index_statements_ledger(module, reachable_only=reachable_only)
+
+
+def test_return_termination_parity():
+    """A block terminable by Return must be read the same way by C and R.
+
+    The fourth form of the family. C exposes the rule through ``_walk`` (the ``reachable``
+    flag on each yielded statement) and R through ``index_statements_ledger(reachable_only=True)``.
+    Both must agree that statements after a Return in the same Sequential are dead.
+
+    Asserted as AGREEMENT, not as a hard-coded expectation, for the same reason as the loop
+    sweeps: a legitimate rule change applied to both sides stays green, while either side
+    drifting alone goes red.
+    """
+    from tilefoundry.ir.tir.stmts import Evaluate, Return, Sequential
+    from tilefoundry_ascend.sync import AivDrain
+
+    def _drain():
+        return Evaluate(callable=AivDrain(), args=())
+
+    # A body shaped [Return, <drain>]: the drain is dead code behind the Return.
+    body = Sequential(body=(Return(), _drain()))
+
+    class _Module:
+        def __init__(self, body):
+            self.body = body
+
+    module = _Module(body)
+
+    # C side: the drain's reachable flag must be False.
+    c_flags = [flag for _path, stmt, flag in _c_walk(module)
+               if isinstance(stmt, Evaluate) and isinstance(stmt.callable, AivDrain)]
+    assert c_flags, "C's _walk did not see the Drain at all"
+    c_says_reachable = any(c_flags)
+
+    # R side: with reachable_only=True the Drain must not be indexed.
+    r_index_all = _r_index(module, reachable_only=False)
+    r_index_live = _r_index(module, reachable_only=True)
+    # The Return itself is a reachable statement and IS indexed; what must vanish is the
+    # Drain behind it. Count DRAIN-bearing entries specifically, not "any entry": the block
+    # legitimately contains the Return.
+    def _is_drain_entry(stmt):
+        return isinstance(stmt, Evaluate) and isinstance(stmt.callable, AivDrain)
+
+    r_sees_it_at_all = any(_is_drain_entry(v) for v in r_index_all.values())
+    r_says_reachable = any(_is_drain_entry(v) for v in r_index_live.values())
+
+    assert c_says_reachable == r_says_reachable, (
+        "C and R disagree about a statement sealed behind a Return: "
+        "C says reachable=%s, R (reachable_only) indexed %d entries"
+        % (c_says_reachable, len(r_index_live))
+    )
+    assert not c_says_reachable, "a statement after a Return must be dead on both sides"
+    assert r_sees_it_at_all, "sanity: the statement really is present in the tree"

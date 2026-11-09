@@ -844,3 +844,60 @@ def test_while_and_for_live_bodies_are_not_wrongly_dropped():
         body=Sequential(body=(s,))),)))
     assert _verify(runtime_for,
                    _retarget_placement(placement, runtime_for, wait)).status == "VERIFIED"
+
+
+def _seal_behind_return(stmt_root, target_callable):
+    """Put a Return immediately BEFORE the target in its own Sequential: the target is dead code.
+
+    Fourth form of the "static presence != execution reachability" family: the statement is
+    still in the AST, but nothing after a Return in the same block executes. A Drain sealed
+    this way used to satisfy the FINAL obligation.
+
+    Implementation note: the target sits inside an ``Evaluate`` node, so it is never a direct
+    child of a ``Sequential`` body. We therefore WRAP the target in a small Sequential
+    (``[target]``) and then prefix that Sequential with a ``Return`` -- the block is then
+    ``[Return, target]``, which is exactly the dead-code shape, and the path stays faithful.
+    """
+    from tilefoundry.ir.tir.stmts import Return
+
+    def wrap(stmt):
+        return Sequential(body=(Return(), stmt))
+
+    mutant = _replace_statement(stmt_root, target_callable, wrap)
+    assert mutant is not None, "target statement not found"
+    return mutant
+
+
+def test_drain_after_return_is_not_final_coverage():
+    """A Drain sealed behind a Return never runs, so the FINAL obligation is unsatisfied.
+
+    This is the check that actually caught the fourth form: the Drain was still counted as
+    present and C reported VERIFIED 47/47 while the statement could never execute.
+    """
+    actual, _placement = _inject()
+    _path, drain = C._actual_nodes(actual)["drain"][0]
+    assert len(C._actual_nodes(actual)["drain"]) == 1, "baseline must have exactly one Drain"
+
+    mutant = _seal_behind_return(actual, drain)
+
+    assert all(node is not drain for _p, node in C._actual_nodes(mutant)["drain"]), \
+        "the Drain is still counted even though a Return precedes it in the same block"
+
+    # And the verdict must fail, with the FINAL obligation reported missing. This is the
+    # exact defect: VERIFIED 47/47 was returned while the Drain could never execute.
+    report = _verify(mutant, _placement)
+    assert report.status == "FAILED", report.as_dict()
+    assert report.code in ("FINAL_DRAIN_MISSING", "COMPLETION_UNREACHABLE_NODE",
+                           "COMPLETION_NOT_VERIFIED"), report.as_dict()
+
+
+
+def test_wait_after_return_is_not_counted():
+    """The Wait mirror image: the same block-termination rule must apply to every op class."""
+    actual, placement = _inject()
+    _path, wait = C._actual_nodes(actual)["wait"][0]
+    mutant = _seal_behind_return(actual, wait)
+
+    assert all(node is not wait for _p, node in C._actual_nodes(mutant)["wait"])
+    report = _verify(mutant, _retarget_placement(placement, mutant, wait))
+    assert report.status == "FAILED", report.as_dict()

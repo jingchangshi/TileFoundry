@@ -28,7 +28,7 @@ from tilefoundry.ir.tir.memory.tensor_view import TensorView
 from tilefoundry.ir.tir.memory.copy import Copy
 from tilefoundry.ir.tir.flag import Drain
 from tilefoundry.ir.tir.prim_function import PrimFunction
-from tilefoundry.ir.tir.stmts import Evaluate, For, If, LetStmt, Sequential, While
+from tilefoundry.ir.tir.stmts import Evaluate, For, If, LetStmt, Return, Sequential, While
 from tilefoundry.ir.types import Layout, PointerType, make_tensor_type
 from tilefoundry.ir.types.storage import StorageKind
 
@@ -126,6 +126,18 @@ def _loop_body_can_execute(node) -> bool:
     return -(-span // magnitude) > 0
 
 
+def _terminated_by_return(children, index) -> bool:
+    """Are the statements from ``index`` on dead because an earlier sibling returns?
+
+    Conservative: only a DIRECT earlier Return counts. A Return inside an If arm does not
+    necessarily terminate the block, so it must not mark live statements dead.
+    """
+    for earlier in children[:index]:
+        if isinstance(earlier, Return):
+            return True
+    return False
+
+
 def index_statements_ledger(module, *, reachable_only=False) -> dict:
     """Path index that MATCHES the ledger's structural paths (Sequential sN, MeshScope,
     ExecutionScope, for:<var>, If then/else), so R2 can find real instruction statements.
@@ -143,7 +155,11 @@ def index_statements_ledger(module, *, reachable_only=False) -> dict:
     def walk(node, path, reachable=True):
         if isinstance(node, Sequential):
             for index, child in enumerate(node.body):
-                walk(child, path + ("s%d" % index,), reachable)
+                # Statements after a Return in the same Sequential never execute. Same
+                # fourth-form rule as C's _walk; kept in step via the parity test so one
+                # side cannot drift.
+                child_reachable = reachable and not _terminated_by_return(node.body, index)
+                walk(child, path + ("s%d" % index,), child_reachable)
             return
         if isinstance(node, (MeshScope, ExecutionScope)):
             walk(node.body, path + (type(node).__name__,), reachable)
