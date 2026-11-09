@@ -289,7 +289,69 @@ def test_typed_legal_set_wait_swap_is_refused_by_name():
 
 def _paths_of(tir, target_node):
     """Paths of one statement object, in the SAME scheme _actual_nodes() uses."""
-    return [path for path, node in C._walk(tir) if node is target_node]
+    return [path for path, node, _reachable in C._walk(tir) if node is target_node]
+
+
+def _replace_statement(root, target_callable, wrap):
+    """Wrap the one Evaluate statement whose CALLABLE is `target_callable`.
+
+    _actual_nodes() yields (path, callable) pairs -- not the Evaluate statement -- so
+    matching on object identity of the callable and rebuilding the enclosing Evaluate is
+    required. The TIR root is a PrimFunction and nodes nest through Sequential/MeshScope/
+    ExecutionScope/For/If alike, so this descends EVERY dataclass field: a Sequential-only
+    walk silently misses most nodes and the "mutant" then passes by not existing.
+    """
+    def matches(item):
+        return isinstance(item, Evaluate) and item.callable is target_callable
+
+    def rebuild(node):
+        if matches(node):
+            return wrap(node)
+        if not _dc.is_dataclass(node):
+            return None
+        for field in _dc.fields(node):
+            value = getattr(node, field.name, None)
+            if isinstance(value, (list, tuple)):
+                for index, item in enumerate(value):
+                    replaced = rebuild(item)
+                    if replaced is not None:
+                        body = list(value)
+                        body[index] = replaced
+                        return _dc.replace(node, **{field.name: tuple(body)})
+            elif _dc.is_dataclass(value):
+                replaced = rebuild(value)
+                if replaced is not None:
+                    return _dc.replace(node, **{field.name: replaced})
+        return None
+
+    return rebuild(root)
+
+
+def _retarget_placement(placement, mutant, callable_node):
+    """Point ONE SET/WAIT placement at the node's NEW path inside the mutant.
+
+    Kills the confound that would otherwise make every reachability control pass for the
+    wrong reason: wrapping a statement in an If MOVES it, so a stale placement map refuses
+    with COMPLETION_MAP_MISMATCH before reachability is ever consulted. Retargeting means
+    the node is present in the tree, the map is consistent, and the ONLY thing that can
+    refuse the mutant is that the node is unreachable.
+    """
+    paths = [path for path, node, _reachable in C._walk(mutant)
+             if isinstance(node, Evaluate) and node.callable is callable_node]
+    assert len(paths) == 1, ("expected exactly one occurrence", paths)
+    new_path = paths[0]
+    # The ROLE must match too: a channel's SET and WAIT share (channel_id, generation), so
+    # ignoring the role rewrites the wrong one of the pair and the map is inconsistent
+    # again (COMPLETION_MAP_MISMATCH) for a reason unrelated to reachability.
+    role = "WAIT" if isinstance(callable_node, FlagWait) else "SET"
+    items = []
+    for item in placement["placements"]:
+        if (item.role == role and int(item.generation) == int(callable_node.generation)
+                and item.channel_id == callable_node.channel_name):
+            items.append(_dc.replace(item, actual_stmt_ref=new_path))
+        else:
+            items.append(item)
+    return dict(placement, placements=items)
 
 
 # --------------------------------------------------------------------------------------
@@ -505,3 +567,126 @@ def test_raw_branch_refuses_multi_read_multi_write_and_expands_one_to_many():
         assert error.code == "COMPLETION_RELATION_AMBIGUOUS", error.code
     else:
         raise AssertionError("multi-read/multi-write RAW root was silently paired")
+
+
+# --------------------------------------------------------------------------------------
+# REACHABILITY controls: a Set/Wait/Drain sealed inside a statically dead branch is not
+# evidence of coverage.
+#
+# The defect these pin down: reachability was implemented only for Drain (_reachable_drain
+# carried private constant-condition logic), while _actual_nodes()/_walk() recursed into
+# BOTH arms of every If unconditionally. So wrapping a real Wait in If(False) still counted
+# it, and C still reported VERIFIED 47/47. One op class knew about dead code and two did
+# not -- the same "one criterion, two traversals" split as the path-scheme defect.
+# --------------------------------------------------------------------------------------
+
+def _if_wrapper(dead_branch, cond):
+    """Return wrap(stmt) -> Sequential wrapping stmt in an If with the named dead branch."""
+    from tilefoundry.ir.tir.stmts import If
+
+    def wrap(stmt):
+        body = Sequential(body=(stmt,))
+        empty = Sequential(body=())
+        node = (If(cond=cond, then_body=body, else_body=empty) if dead_branch == "then"
+                else If(cond=cond, then_body=empty, else_body=body))
+        return Sequential(body=(node,))
+    return wrap
+
+
+def _seal(node_list_root, target, dead_branch="then", constant=False):
+    """Mutate the tree so `target` sits in a statically dead branch."""
+    from tilefoundry.ir.core import Constant
+    from tilefoundry.ir.types import make_tensor_type
+
+    cond = Constant(value=constant, type=make_tensor_type((), dtype="i1", storage="umat"))
+    mutant = _replace_statement(node_list_root, target, _if_wrapper(dead_branch, cond))
+    assert mutant is not None, "could not place the target statement in an If"
+    return mutant
+
+
+def test_wait_sealed_in_if_false_is_not_counted():
+    """A real Wait wrapped in If(False) must stop counting, so coverage no longer reaches 47."""
+    actual, placement = _inject()
+    _path, wait = C._actual_nodes(actual)["wait"][0]
+    mutant = _seal(actual, wait, "then", constant=False)
+
+    # Gone from the reachable set, not merely re-ordered.
+    assert all(node is not wait for _p, node in C._actual_nodes(mutant)["wait"])
+    # The node still EXISTS in the tree and the map is consistent, so the only possible
+    # cause of refusal is unreachability (not a stale placement reference).
+    report = _verify(mutant, _retarget_placement(placement, mutant, wait))
+    assert report.status == "FAILED", report.as_dict()
+    # Named refusal: the node is PRESENT but cannot execute, which is distinct from absent.
+    assert report.code == "COMPLETION_UNREACHABLE_NODE", report.as_dict()
+    assert report.covered == 46, report.as_dict()
+
+
+def test_set_sealed_in_if_false_is_not_counted():
+    """The same for Set: fixing Wait alone would leave the mirror-image false positive."""
+    actual, placement = _inject()
+    _path, target = C._actual_nodes(actual)["set"][0]
+    mutant = _seal(actual, target, "then", constant=False)
+
+    assert all(node is not target for _p, node in C._actual_nodes(mutant)["set"])
+    report = _verify(mutant, _retarget_placement(placement, mutant, target))
+    assert report.status == "FAILED", report.as_dict()
+    assert report.code == "COMPLETION_UNREACHABLE_NODE", report.as_dict()
+    assert report.covered == 46, report.as_dict()
+
+
+def test_node_in_dead_else_of_if_true_is_not_counted():
+    """If(True) kills the ELSE arm; that direction must be handled too."""
+    actual, placement = _inject()
+    _path, wait = C._actual_nodes(actual)["wait"][0]
+    mutant = _seal(actual, wait, "else", constant=True)
+    assert all(node is not wait for _p, node in C._actual_nodes(mutant)["wait"])
+    assert _verify(mutant, _retarget_placement(placement, mutant, wait)).status == "FAILED"
+
+
+def test_drain_sealed_in_if_false_still_reports_final_drain_missing():
+    """Drain's pre-existing refusal must not regress while Set/Wait gain reachability."""
+    actual, placement = _inject()
+    _path, drain = C._actual_nodes(actual)["drain"][0]
+    mutant = _seal(actual, drain, "then", constant=False)
+
+    assert C._reachable_drain(mutant) is False
+    report = _verify(mutant, placement)
+    assert report.status == "FAILED", report.as_dict()
+    assert report.code == "FINAL_DRAIN_MISSING", report.as_dict()
+
+
+def test_nodes_in_reachable_branches_are_not_wrongly_dropped():
+    """POSITIVE control: If(True).then and a run-time If must keep their nodes reachable.
+
+    Without this, "drop everything inside any If" would pass every negative above while
+    silently discarding real synchronisation.
+    """
+    from tilefoundry.ir.core import Constant, Var
+    from tilefoundry.ir.tir.stmts import If
+    from tilefoundry.ir.types import make_tensor_type
+
+    actual, placement = _inject()
+    _path, wait = C._actual_nodes(actual)["wait"][0]
+    baseline_wait_count = len(C._actual_nodes(actual)["wait"])
+    cond_type = make_tensor_type((), dtype="i1", storage="umat")
+
+    def _reachable_wrap(cond):
+        def wrap(stmt):
+            return Sequential(body=(If(cond=cond,
+                                        then_body=Sequential(body=(stmt,)),
+                                        else_body=Sequential(body=())),))
+        return wrap
+
+    # If(True).then -> reachable, must still count, and must still verify.
+    true_mutant = _replace_statement(
+        actual, wait, _reachable_wrap(Constant(value=True, type=cond_type)))
+    assert true_mutant is not None
+    assert len(C._actual_nodes(true_mutant)["wait"]) == baseline_wait_count
+    assert _verify(true_mutant, _retarget_placement(placement, true_mutant, wait)).status == "VERIFIED"
+
+    # A run-time condition decides nothing statically -> BOTH arms stay reachable.
+    runtime_mutant = _replace_statement(
+        actual, wait, _reachable_wrap(Var(name="runtime_flag", type=cond_type)))
+    assert runtime_mutant is not None
+    assert len(C._actual_nodes(runtime_mutant)["wait"]) == baseline_wait_count
+    assert _verify(runtime_mutant, _retarget_placement(placement, runtime_mutant, wait)).status == "VERIFIED"

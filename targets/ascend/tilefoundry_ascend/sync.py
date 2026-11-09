@@ -26,6 +26,9 @@ Named refusals:
   COMPLETION_ANCHOR_AMBIGUOUS         one action maps to more than one real statement, so the
                                       anchor is not uniquely determined (refuse, never pick [0])
   COMPLETION_RELATION_AMBIGUOUS       a reuse/RAW root has several reads AND several writes
+  COMPLETION_UNREACHABLE_NODE         a Set/Wait exists in the tree but sits in a statically
+                                      dead branch (If(False).then, If(True).else), so it can
+                                      never execute and is not coverage
   FINAL_DRAIN_MISSING
 """
 from __future__ import annotations
@@ -367,29 +370,63 @@ def allocate_completion_resources(channels, lifetime_relations, capabilities) ->
     return tuple(allocations)
 
 
-def _walk(stmt, path=()):
-    yield "/".join(path), stmt
+def _branch_reachability(cond, reachable):
+    """(then_reachable, else_reachable) for an If under an already-decided reachability.
+
+    A constant condition statically kills one arm: If(False) cannot run its then body and
+    If(True) cannot run its else body. A RUN-TIME (non-constant) condition decides nothing,
+    so BOTH arms stay reachable --- the branch that actually executes is not knowable
+    statically, and treating it as dead would silently drop real synchronisation.
+    """
+    if isinstance(cond, Constant):
+        value = getattr(cond, "value", None)
+        if value is False:
+            return False, reachable
+        if value is True:
+            return reachable, False
+    return reachable, reachable
+
+
+def _walk(stmt, path=(), reachable=True):
+    """Walk the TIR, yielding (path, statement, reachable).
+
+    ``reachable`` is the single source of truth for whether a statement can execute. Set,
+    Wait and Drain all read it, so no op class can drift into having its own private notion
+    of reachability -- that split is exactly what let an If(False)-sealed Wait count as
+    coverage while Drain alone was checked.
+    """
+    yield "/".join(path), stmt, reachable
     body = getattr(stmt, "body", None)
     if isinstance(body, Sequential):
         for index, child in enumerate(body.body):
-            yield from _walk(child, path + ("s%d" % index,))
+            yield from _walk(child, path + ("s%d" % index,), reachable)
     elif isinstance(body, (list, tuple)):
         for index, child in enumerate(body):
-            yield from _walk(child, path + ("s%d" % index,))
+            yield from _walk(child, path + ("s%d" % index,), reachable)
     elif body is not None and not isinstance(body, (str, int)):
         # MeshScope / ExecutionScope / For / While: descend so a nested Drain/Set/Wait is
         # still found; the previous top-only walk missed nested scope nodes.
-        yield from _walk(body, path + (type(stmt).__name__,))
-    for branch_name in ("then_body", "else_body"):
+        yield from _walk(body, path + (type(stmt).__name__,), reachable)
+    ifs = None
+    if hasattr(stmt, "then_body") or hasattr(stmt, "else_body"):
+        ifs = _branch_reachability(getattr(stmt, "cond", None), reachable)
+    for index, branch_name in enumerate(("then_body", "else_body")):
         branch = getattr(stmt, branch_name, None)
         if isinstance(branch, Sequential):
-            yield from _walk(branch, path + (branch_name,))
+            branch_reachable = reachable if ifs is None else ifs[index]
+            yield from _walk(branch, path + (branch_name,), branch_reachable)
 
 
 def _actual_nodes(tir_module) -> tuple:
+    """The REAL Set/Wait/Drain statements, UNREACHABLE ones excluded.
+
+    Reachability is filtered here, at collection, so every consumer (coverage, ordering,
+    flag-id cross-checks, the vertical test) sees the same set. Filtering only in the
+    comparator would let a new caller re-introduce the same defect.
+    """
     nodes = {"set": [], "wait": [], "drain": []}
-    for path, stmt in _walk(tir_module):
-        if not isinstance(stmt, Evaluate):
+    for path, stmt, reachable in _walk(tir_module):
+        if not reachable or not isinstance(stmt, Evaluate):
             continue
         target = stmt.callable
         if isinstance(target, FlagSet):
@@ -676,26 +713,17 @@ def _anchor_path(path):
 
 
 def _reachable_drain(tir_module):
-    def walk(node, reachable=True):
-        from tilefoundry.ir.tir.stmts import If
-        if isinstance(node, Sequential):
-            for child in node.body:
-                if walk(child, reachable):
-                    return True
-            return False
-        if isinstance(node, If):
-            cond = getattr(node, "cond", None)
-            value = getattr(cond, "value", None)
-            then_reach = reachable and not (isinstance(cond, Constant) and value is False)
-            else_reach = reachable and not (isinstance(cond, Constant) and value is True)
-            return walk(node.then_body, then_reach) or walk(node.else_body, else_reach)
-        if isinstance(node, Evaluate) and isinstance(node.callable, Drain):
-            return reachable
-        body = getattr(node, "body", None)
-        if body is not None and not isinstance(body, (str, int)):
-            return walk(body, reachable)
-        return False
-    return walk(tir_module.body)
+    """Is there a Drain that can actually execute?
+
+    Built on the SAME _walk() reachability used for Set/Wait, so the three op classes can no
+    longer disagree about what "reachable" means. Previously this function carried its own
+    private constant-condition logic while Set/Wait had none, and an If(False)-sealed Wait
+    still counted as coverage while Drain alone was refused.
+    """
+    for _path, stmt, reachable in _walk(tir_module):
+        if reachable and isinstance(stmt, Evaluate) and isinstance(stmt.callable, Drain):
+            return True
+    return False
 
 
 def _append_aiv_drain(node):
@@ -711,7 +739,7 @@ def _append_aiv_drain(node):
 
 
 def _actual_path_ordinals(tir_module):
-    return {path: index for index, (path, _stmt) in enumerate(_walk(tir_module))}
+    return {path: index for index, (path, _stmt, _reach) in enumerate(_walk(tir_module))}
 
 
 def _walk_ordered(stmt, path=(), in_loop=False):
@@ -1017,8 +1045,18 @@ def verify_completion_coverage(problem, plan, actual_tir, placement_map,
         covered += 1
     # A placement map entry must point at a real node; metadata alone is rejected.
     actual_paths = {path for group in actual.values() for path, _node in group}
+    # A node that EXISTS in the tree but cannot execute is a different fact from a node that
+    # is absent: the map is then consistent, and the refusal must name unreachability instead
+    # of blaming the map. Without this, sealing a real Set/Wait in If(False) reports a
+    # confusing COMPLETION_MAP_MISMATCH and hides the reachability defect.
+    unreachable_paths = {path for path, _node, reachable in _walk(actual_tir) if not reachable}
     for placement in placements:
         if placement.role in ("SET", "WAIT") and placement.actual_stmt_ref not in actual_paths:
+            if placement.actual_stmt_ref in unreachable_paths:
+                return CoverageReport("FAILED", "COMPLETION_UNREACHABLE_NODE", len(required),
+                                      len(provided), covered, missing, len(placements),
+                                      "placement points at an UNREACHABLE node: %s"
+                                      % placement.actual_stmt_ref)
             return CoverageReport("FAILED", "COMPLETION_MAP_MISMATCH", len(required),
                                   len(provided), covered, missing,
                                   len(placements), "placement points at absent node: %s"
@@ -1202,8 +1240,8 @@ def verify_completion_coverage_from_ledger(ledger, expansion, problem=None, plan
             relation = parts[2] if len(parts) > 2 else ""
             producer_op, consumer_op = relation.split("->", 1) if "->" in relation else ("", "")
             op_order = [(index, type(node.callable).__name__)
-                        for index, (_path, node) in enumerate(_walk(actual_tir))
-                        if isinstance(node, Evaluate)]
+                        for index, (_path, node, reachable) in enumerate(_walk(actual_tir))
+                        if reachable and isinstance(node, Evaluate)]
             producer_index = next((index for index, name in op_order if name == producer_op), None)
             consumer_index = next((index for index, name in op_order if name == consumer_op), None)
             if producer_index is not None and consumer_index is not None and producer_index < consumer_index:
@@ -1213,10 +1251,19 @@ def verify_completion_coverage_from_ledger(ledger, expansion, problem=None, plan
                 missing.append(obligation.obligation_id)
             continue
         missing.append(obligation.obligation_id)
+    # A node present but statically unreachable is NOT the same fact as an absent node: the
+    # map is consistent, and blaming the map would hide the reachability defect.
+    unreachable_paths = {path for path, _node, reachable in _walk(actual_tir) if not reachable}
     for placement in placements:
         if getattr(placement, "role", "") in ("SET", "WAIT"):
             paths = {path for group in actual.values() for path, _node in group}
             if placement.actual_stmt_ref not in paths:
+                if placement.actual_stmt_ref in unreachable_paths:
+                    return CoverageReport("FAILED", "COMPLETION_UNREACHABLE_NODE", len(required),
+                                          len(required), covered, tuple(missing), len(placements),
+                                          "placement points at an UNREACHABLE node: %s"
+                                          % placement.actual_stmt_ref, required_by_kind,
+                                          covered_by_kind, tuple(edge_table))
                 return CoverageReport("FAILED", "COMPLETION_MAP_MISMATCH", len(required),
                                       len(required), covered, tuple(missing), len(placements),
                                       "placement points at absent node", required_by_kind,
