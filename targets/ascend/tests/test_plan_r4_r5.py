@@ -147,3 +147,164 @@ if __name__ == "__main__":
                 failed += 1
                 print("FAIL", _name, type(exc).__name__, exc)
     raise SystemExit(1 if failed else 0)
+
+
+# --------------------------------------------------------------------------------------
+# REACHABILITY controls: a rewritten WRITE that sits in a statically dead branch is not an
+# applied write.
+#
+# The defect these pin down: index_statements_ledger() walked If(False).then AND
+# If(True).else unconditionally, and verify_plan_application() judged "applied" purely by
+# `new_fingerprint in rewritten_fingerprints`. So a REAL rewritten write wrapped in If(False)
+# still verified PASS with applied_accesses unchanged at 12. Same family as C's Set/Wait
+# reachability: one predicate, granted to Drain but withheld from Set/Wait, and here to
+# nothing at all.
+# --------------------------------------------------------------------------------------
+
+def _wrap_in_dead_if(module, predicate, branch="then", constant=False):
+    """Wrap EVERY statement matching `predicate` in a statically dead If arm.
+
+    All matches are wrapped in ONE pass, keyed by object identity. Two reasons:
+      * the fixture contains DUPLICATE statements with identical fingerprints (measured: the
+        chosen write's fingerprint occurs 3x), so wrapping only the first leaves another copy
+        reachable and the control passes for the wrong reason;
+      * a repeated pass would re-wrap its own output forever (the original statement is still
+        inside the wrapper, so it keeps matching).
+    """
+    from tilefoundry.ir.core import Constant
+    from tilefoundry.ir.tir.stmts import If
+    from tilefoundry.ir.types import make_tensor_type
+
+    cond_type = make_tensor_type((), dtype="i1", storage="umat")
+    cond = Constant(value=constant, type=cond_type)
+    sealed_ids = set()
+
+    def wrap_once(item):
+        body = Sequential(body=(item,))
+        empty = Sequential(body=())
+        inner = (If(cond=cond, then_body=body, else_body=empty) if branch == "then"
+                 else If(cond=cond, then_body=empty, else_body=body))
+        sealed_ids.add(id(item))
+        return Sequential(body=(inner,))
+
+    def rewrite(node):
+        if not dataclasses.is_dataclass(node):
+            return None
+        for field in dataclasses.fields(node):
+            value = getattr(node, field.name, None)
+            if isinstance(value, (list, tuple)):
+                changed = False
+                body = list(value)
+                for index, item in enumerate(body):
+                    if predicate(item) and id(item) not in sealed_ids:
+                        body[index] = wrap_once(item)
+                        changed = True
+                        continue
+                    found = rewrite(item)
+                    if found is not None:
+                        body[index] = found
+                        changed = True
+                if changed:
+                    return dataclasses.replace(node, **{field.name: tuple(body)})
+            elif dataclasses.is_dataclass(value):
+                if predicate(value) and id(value) not in sealed_ids:
+                    return dataclasses.replace(node, **{field.name: wrap_once(value)})
+                found = rewrite(value)
+                if found is not None:
+                    return dataclasses.replace(node, **{field.name: found})
+        return None
+
+    mutant = rewrite(module)
+    assert mutant is not None, "could not place the statement in an If"
+    assert sealed_ids, "predicate matched nothing"
+    return mutant, len(sealed_ids)
+
+
+def test_r4_rewritten_write_in_dead_branch_is_refused_by_name():
+    """A real rewritten WRITE sealed in If(False) must be refused, not counted as applied."""
+    plan = build_stage()
+    original = R3.make_tir_fixture()
+    rewritten, materialization = MAT.materialize_plan(original, plan)
+    baseline = MAT.verify_plan_application(original, plan, rewritten, materialization)
+    assert baseline["status"] == "PASS", baseline
+    # Baseline is asserted against the real count for THIS fixture (10 writes x 1 trip).
+    # The 12/12 figure belongs to the vertical flow's kernel, not this fixture: hardcoding 12
+    # here would make the control fail for a reason unrelated to reachability.
+    assert baseline["applied_accesses"] == baseline["expected_applications"], baseline
+    assert baseline["applied_accesses"] > 0, baseline
+
+    # Choose a write the map actually recorded, so the mutation moves a REAL application.
+    recorded = {entry["new_fingerprint"] for entry in materialization.entries}
+    target_path, target = None, None
+    for path, stmt in MAT.index_statements_ledger(rewritten).items():
+        if MAT.fingerprint(stmt) in recorded and isinstance(stmt, Evaluate):
+            target_path, target = path, stmt
+            break
+    assert target is not None, "no recorded statement found in the rewritten tree"
+
+    def _match(item):
+        return isinstance(item, Evaluate) and MAT.fingerprint(item) == MAT.fingerprint(target)
+
+    mutant, _count = _wrap_in_dead_if(rewritten, _match, "then", constant=False)
+    report = MAT.verify_plan_application(original, plan, mutant, materialization)
+    assert report["status"] == "FAIL", report
+    assert report["code"] == "PLAN_WRITE_UNREACHABLE", report
+    assert report["applied_accesses"] == 0, report
+
+
+def test_r4_rewritten_write_in_dead_else_of_if_true_is_refused():
+    """If(True) kills the ELSE arm; that direction must be refused too."""
+    plan = build_stage()
+    original = R3.make_tir_fixture()
+    rewritten, materialization = MAT.materialize_plan(original, plan)
+    recorded = {entry["new_fingerprint"] for entry in materialization.entries}
+    target = next(stmt for stmt in MAT.index_statements_ledger(rewritten).values()
+                  if MAT.fingerprint(stmt) in recorded and isinstance(stmt, Evaluate))
+
+    def _match(item):
+        return isinstance(item, Evaluate) and MAT.fingerprint(item) == MAT.fingerprint(target)
+
+    mutant, _count = _wrap_in_dead_if(rewritten, _match, "else", constant=True)
+    report = MAT.verify_plan_application(original, plan, mutant, materialization)
+    assert report["status"] == "FAIL", report
+    assert report["code"] == "PLAN_WRITE_UNREACHABLE", report
+
+
+def test_r4_reachable_if_branches_are_not_wrongly_dropped():
+    """POSITIVE control: If(True).then and a run-time If must keep their statements counted.
+
+    Without this, "ignore everything inside any If" would satisfy both negatives above while
+    silently discarding real applications.
+    """
+    from tilefoundry.ir.core import Constant, Var
+    from tilefoundry.ir.types import make_tensor_type
+
+    plan = build_stage()
+    original = R3.make_tir_fixture()
+    rewritten, materialization = MAT.materialize_plan(original, plan)
+    recorded = {entry["new_fingerprint"] for entry in materialization.entries}
+    target = next(stmt for stmt in MAT.index_statements_ledger(rewritten).values()
+                  if MAT.fingerprint(stmt) in recorded and isinstance(stmt, Evaluate))
+    cond_type = make_tensor_type((), dtype="i1", storage="umat")
+
+    def _match(item):
+        return isinstance(item, Evaluate) and MAT.fingerprint(item) == MAT.fingerprint(target)
+
+    # If(True) -> the then arm executes, so the write still counts and R still PASSes.
+    live, _ = _wrap_in_dead_if(rewritten, _match, "then", constant=True)
+    report = MAT.verify_plan_application(original, plan, live, materialization)
+    assert report["status"] == "PASS", report
+    baseline_applied = MAT.verify_plan_application(
+        original, plan, rewritten, materialization)["applied_accesses"]
+    assert report["applied_accesses"] == baseline_applied, report
+
+    # A run-time condition decides nothing statically -> both arms reachable -> still PASS.
+    from tilefoundry.ir.tir.stmts import If
+    runtime = dataclasses.replace(
+        rewritten,
+        body=Sequential(body=(If(cond=Var(name="runtime_flag", type=cond_type),
+                                  then_body=rewritten.body,
+                                  else_body=Sequential(body=())),)))
+    report2 = MAT.verify_plan_application(original, plan, runtime, materialization)
+    assert report2["status"] == "PASS", report2
+    assert report2["applied_accesses"] == baseline_applied, report2

@@ -93,31 +93,50 @@ def index_statements(module) -> dict:
     return found
 
 
-def index_statements_ledger(module) -> dict:
+def index_statements_ledger(module, *, reachable_only=False) -> dict:
     """Path index that MATCHES the ledger's structural paths (Sequential sN, MeshScope,
-    ExecutionScope, for:<var>, If then/else), so R2 can find real instruction statements."""
+    ExecutionScope, for:<var>, If then/else), so R2 can find real instruction statements.
+
+    ``reachable_only`` excludes statements sealed inside a statically dead branch. Without
+    it, If(False).then and If(True).else were walked unconditionally, so a real rewritten
+    WRITE moved into a dead branch still counted as applied and verify_plan_application
+    still reported PASS with applied_accesses unchanged. Same defect class as C's Set/Wait
+    reachability: a predicate granted to some consumers and silently withheld from others.
+    """
     from tilefoundry.ir.tir.stmts import ExecutionScope, MeshScope
 
     found = {}
 
-    def walk(node, path):
+    def walk(node, path, reachable=True):
         if isinstance(node, Sequential):
             for index, child in enumerate(node.body):
-                walk(child, path + ("s%d" % index,))
+                walk(child, path + ("s%d" % index,), reachable)
             return
         if isinstance(node, (MeshScope, ExecutionScope)):
-            walk(node.body, path + (type(node).__name__,))
+            walk(node.body, path + (type(node).__name__,), reachable)
             return
         if isinstance(node, For):
-            found["/".join(path)] = node
+            if reachable or not reachable_only:
+                found["/".join(path)] = node
             name = getattr(getattr(node, "induction_var", None), "name", "i")
-            walk(node.body, path + ("for:" + str(name),))
+            walk(node.body, path + ("for:" + str(name),), reachable)
             return
         if isinstance(node, If):
-            walk(node.then_body, path + ("then",))
-            walk(node.else_body, path + ("else",))
+            if reachable_only:
+                cond = getattr(node, "cond", None)
+                value = getattr(cond, "value", None)
+                # A constant condition statically kills one arm. A RUNTIME condition decides
+                # nothing, so both arms stay reachable -- the taken branch is not knowable
+                # statically and dropping it would discard real applications.
+                then_reachable = reachable and not (isinstance(cond, Constant) and value is False)
+                else_reachable = reachable and not (isinstance(cond, Constant) and value is True)
+            else:
+                then_reachable = else_reachable = reachable
+            walk(node.then_body, path + ("then",), then_reachable)
+            walk(node.else_body, path + ("else",), else_reachable)
             return
-        found["/".join(path)] = node
+        if reachable or not reachable_only:
+            found["/".join(path)] = node
 
     walk(module.body, ())
     return found
@@ -369,6 +388,13 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
     # ONE local index per module for this verification pass (no repeated full-tree walks).
     original_index = _combined_index(original_module)
     rewritten_index = _combined_index(rewritten_module)
+    # The reachable-only views are what "the plan was applied" must be judged on: a rewritten
+    # WRITE sealed in a dead branch executes never, so its presence in the rewritten tree is
+    # not evidence of application. Keeping a separate full index preserves the map-fidelity
+    # checks (a fingerprint may legitimately live anywhere) while coverage uses only reachable
+    # statements.
+    rewritten_reachable = index_statements_ledger(rewritten_module, reachable_only=True)
+    rewritten_reachable_ids = {id(stmt) for stmt in rewritten_reachable.values()}
     if (rewritten_module is None or rewritten_module is original_module
             or materialization.rewritten_digest == materialization.original_digest):
         report["code"] = "PLAN_NOT_APPLIED"
@@ -376,6 +402,7 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
     if require_drain:
         actual_has_drain = any(
             isinstance(stmt, Evaluate) and isinstance(stmt.callable, Drain)
+            and id(stmt) in rewritten_reachable_ids
             for stmt in rewritten_index.values())
         if not actual_has_drain:
             report["code"] = "PLAN_DRAIN_MISSING"
@@ -402,6 +429,19 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
         if id(original) in rewritten_ids:
             report["code"] = "APPLICATION_COVERAGE_MISMATCH"
             report["detail"] = {"unrewritten_write": path}
+            return report
+    # A rewritten WRITE that exists but cannot execute is NOT an applied write. Fingerprints
+    # are compared against the REACHABLE set only, so sealing a rewritten write in a dead
+    # branch is refused instead of passing on map fidelity alone.
+    reachable_fingerprints = {fingerprint(stmt) for stmt in rewritten_reachable.values()}
+    for entry in materialization.entries:
+        if entry["new_fingerprint"] in reachable_fingerprints:
+            continue
+        if entry["new_fingerprint"] in {fingerprint(stmt) for stmt in rewritten_index.values()}:
+            report["code"] = "PLAN_WRITE_UNREACHABLE"
+            report["detail"] = {"access_id": entry["access_id"], "k": entry["k"],
+                                "reason": "rewritten statement is present but in a statically "
+                                          "dead branch, so it never executes"}
             return report
     # Map fidelity: recorded fingerprints must equal actual rewritten statements.
     rewritten_stmts = list(rewritten_index.values())
