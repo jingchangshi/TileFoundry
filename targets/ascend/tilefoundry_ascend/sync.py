@@ -18,19 +18,28 @@ Named refusals:
   COMPLETION_GENERATION_MISMATCH      slot/min(tile) used as generation
   COMPLETION_NOT_VERIFIED             actual Set/Wait/Drain missing or map forged
   COMPLETION_MAP_MISMATCH             map points at nodes not present in actual TIR
+  COMPLETION_WAIT_BEFORE_SET          a same-iteration (distance 0) Wait is ordered before its Set
+  COMPLETION_DUPLICATE_FLAG_NODE      more than one Set or Wait for one (channel, kind, generation)
+  COMPLETION_DISTANCE_NOT_PRESERVED   a cross-iteration edge was materialised as same-iteration
+  COMPLETION_STARTUP_UNSATISFIED      a cross-iteration Wait has no Set that executes before it
+                                      (no prologue cover), so the first iteration would block
+  COMPLETION_ANCHOR_AMBIGUOUS         one action maps to more than one real statement, so the
+                                      anchor is not uniquely determined (refuse, never pick [0])
+  COMPLETION_RELATION_AMBIGUOUS       a reuse/RAW root has several reads AND several writes
   FINAL_DRAIN_MISSING
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 from tilefoundry.ir.core import Call, Constant, Var
 from tilefoundry.ir.tir.flag import Drain, FlagSet, FlagWait
 from tilefoundry.ir.tir.prim_function import PrimFunction
-from tilefoundry.ir.tir.stmts import Evaluate, Sequential
+from tilefoundry.ir.tir.stmts import Evaluate, ExecutionScope, For, If, MeshScope, Sequential, While
 
 
 from tilefoundry.ir.pattern import utils as _pattern_utils
@@ -401,19 +410,71 @@ def _pipe_of_op(op):
     return "vector"
 
 
-def _entry_by_action(ledger, action_id):
+def _entries_by_action(ledger, action_id):
+    """Every ledger entry that names this action; >1 means the anchor is ambiguous."""
     wanted = str(action_id)
-    for entry in list(getattr(ledger, "entries", ()) or ()):
-        if str(getattr(entry, "action_id", "")) == wanted:
-            return entry
-    # Vsts action ids in the ledger already carry :operand; keep an exact fallback
-    # only for an explicitly provided operand suffix that names the same action.
-    if ":" in wanted:
-        base = wanted.rsplit(":", 1)[0]
-        for entry in list(getattr(ledger, "entries", ()) or ()):
-            if str(getattr(entry, "action_id", "")).rsplit(":", 1)[0] == base:
-                return entry
-    return None
+    exact = [entry for entry in list(getattr(ledger, "entries", ()) or ())
+             if str(getattr(entry, "action_id", "")) == wanted]
+    if exact:
+        return exact
+    base = wanted.rsplit(":", 1)[0]
+    return [entry for entry in list(getattr(ledger, "entries", ()) or ())
+            if str(getattr(entry, "action_id", "")).rsplit(":", 1)[0] == base]
+
+
+def _anchor_walk(node, path=()):
+    """Yield (anchor_path, stmt) using the SAME naming _clone_with_anchors consumes.
+
+    Lift/ledger statement paths spell scopes out ("s0/MeshScope/s0/for:i/s2") while
+    _walk() collapses Sequential bodies, so the two are NOT interchangeable. Anchor
+    positions must be ordered in the anchor scheme or every lookup silently misses.
+    """
+    if isinstance(node, Sequential):
+        for index, child in enumerate(node.body):
+            yield from _anchor_walk(child, path + ("s%d" % index,))
+        return
+    yield "/".join(path), node
+    if isinstance(node, (MeshScope, ExecutionScope)):
+        yield from _anchor_walk(node.body, path + (type(node).__name__,))
+    elif isinstance(node, For):
+        name = getattr(getattr(node, "induction_var", None), "name", "i")
+        yield from _anchor_walk(node.body, path + ("for:" + str(name),))
+    elif isinstance(node, If):
+        yield from _anchor_walk(node.then_body, path + ("then",))
+        yield from _anchor_walk(node.else_body, path + ("else",))
+    else:
+        body = getattr(node, "body", None)
+        if isinstance(body, Sequential):
+            yield from _anchor_walk(body, path + (type(node).__name__,))
+
+
+def _anchor_ordinals(tir_module):
+    """path -> real tree ordinal, in the anchor/ledger path scheme."""
+    return {path: index for index, (path, _stmt) in enumerate(_anchor_walk(tir_module.body))}
+
+
+def _instance_anchor(paths, generation, instance_index, obligation_id, role):
+    """Anchor one generation at ITS OWN carrier instance, never at paths[0].
+
+    The POC carrier is UNROLLED: one action body appears once per iteration, so an action
+    with N real instances is N distinct statements and generation g must use instance g
+    (the producer uses g - distance). Collapsing to paths[0] put every generation on the
+    same statement, which no ordering check can then tell apart from a correct placement.
+
+    A genuinely loop-nested carrier has exactly ONE instance and the loop supplies the
+    iterations; the checker refuses that shape by name unless a prologue covers startup.
+    """
+    ordered = list(paths)
+    if not ordered:
+        return None
+    if len(ordered) == 1:
+        return ordered[0]
+    if instance_index < 0 or instance_index >= len(ordered):
+        raise CompletionError("COMPLETION_ANCHOR_NOT_FOUND",
+                              "%s has no instance for generation %d (index %d of %d)"
+                              % (role, generation, instance_index, len(ordered)),
+                              obligation_id, len(ordered), instance_index)
+    return ordered[instance_index]
 
 
 def derive_reuse_obligations_from_ledger(ledger, expansion):
@@ -508,17 +569,26 @@ def _raw_obligations_from_ledger(ledger, expansion, expected):
         if not reads or not writes:
             raise CompletionError("COMPLETION_OBLIGATION_UNBOUND", "RAW root lacks read/write entry", oid,
                                   "read+write", [len(reads), len(writes)])
-        read = reads[0]
-        write = writes[0]
+        # Same strictness as the reuse branch: never silently pick reads[0]/writes[0]. Several
+        # reads AND several writes leave the producer->consumer relation undetermined; one-to-many
+        # and many-to-one are expanded pair by pair so every real relation is its own obligation.
+        if len(reads) > 1 and len(writes) > 1:
+            raise CompletionError("COMPLETION_RELATION_AMBIGUOUS",
+                                  "RAW root has multiple reads and writes; refusing to pick one",
+                                  oid, "one-to-many or one-to-one relation",
+                                  [len(reads), len(writes)])
+        pairs = [(write, read) for write in writes for read in reads]
         index = int(oid.rsplit("i", 1)[-1]) if "i" in oid else 0
-        out.append(Obligation(
-            obligation_id=oid, source_dependency_ids=(oid,), access_ids=(str(write.action_id), str(read.action_id)),
-            kind="RAW", producer_task=str(write.action_id), consumer_task=str(read.action_id),
-            producer_action=str(write.action_id), consumer_action=str(read.action_id),
-            producer_pipe=_pipe_of_op(getattr(write, "op", "")),
-            consumer_pipe=_pipe_of_op(getattr(read, "op", "")),
-            region="loop", buffer_root=root, versions=1, distance=0,
-            generation_domain=(index,), required_completion_kind="RAW"))
+        for pair_index, (write, read) in enumerate(pairs):
+            suffix = "" if len(pairs) == 1 else "#%d" % pair_index
+            out.append(Obligation(
+                obligation_id=oid + suffix, source_dependency_ids=(oid,), access_ids=(str(write.action_id), str(read.action_id)),
+                kind="RAW", producer_task=str(write.action_id), consumer_task=str(read.action_id),
+                producer_action=str(write.action_id), consumer_action=str(read.action_id),
+                producer_pipe=_pipe_of_op(getattr(write, "op", "")),
+                consumer_pipe=_pipe_of_op(getattr(read, "op", "")),
+                region="loop", buffer_root=root, versions=1, distance=0,
+                generation_domain=(index,), required_completion_kind="RAW"))
     return tuple(out)
 
 
@@ -536,7 +606,9 @@ def derive_completion_obligations_from_ledger(ledger, expansion, problem=None,
     reuse = derive_reuse_obligations_from_ledger(ledger, expansion)
     raw = _raw_obligations_from_ledger(ledger, expansion, expected)
     reuse_ids = {o.obligation_id for o in reuse}
-    raw_ids = {o.obligation_id for o in raw}
+    # An expanded RAW root yields oid#k records; the base oid is still the expected item that
+    # must not be counted twice, and #k suffixes must not shrink the denominator.
+    raw_ids = {o.obligation_id.split("#", 1)[0] for o in raw}
     result = []
     for item in items:
         oid = str(getattr(item, "oid", getattr(item, "obligation_id", "")))
@@ -551,10 +623,15 @@ def derive_completion_obligations_from_ledger(ledger, expansion, problem=None,
             generation_domain=(), required_completion_kind=kind))
     result.extend(raw)
     result.extend(reuse)
-    if len(result) != 47:
+    # The denominator is the count of DISTINCT source obligations (47). Pair expansion of an
+    # ambiguous one-to-many root adds records for the same source obligation, so it is allowed
+    # to raise the record count but never to change the 47-item source denominator.
+    source_ids = {o.obligation_id.split("#", 1)[0] for o in result}
+    if len(source_ids) != 47 or len(result) < 47:
         raise CompletionError("COMPLETION_OBLIGATION_UNBOUND",
-                              "expected 47 required obligations, got %d" % len(result),
-                              "expected", 47, len(result))
+                              "expected 47 required obligations, got %d distinct/%d records"
+                              % (len(source_ids), len(result)),
+                              "expected", 47, [len(source_ids), len(result)])
     return tuple(result)
 
 
@@ -637,6 +714,57 @@ def _actual_path_ordinals(tir_module):
     return {path: index for index, (path, _stmt) in enumerate(_walk(tir_module))}
 
 
+def _walk_ordered(stmt, path=(), in_loop=False):
+    """_walk() plus "is this statement inside a loop body?" and real tree order.
+
+    The completion checker needs the ACTUAL traversal ordinal of each Set/Wait and
+    whether it runs per loop iteration, because "later in the tree" and "later in
+    execution" only agree inside one loop body sweep.
+    """
+    yield "/".join(path), stmt, in_loop
+    body = getattr(stmt, "body", None)
+    inside = in_loop or isinstance(stmt, (For, While))
+    if isinstance(body, Sequential):
+        for index, child in enumerate(body.body):
+            yield from _walk_ordered(child, path + ("s%d" % index,), inside)
+    elif isinstance(body, (list, tuple)):
+        for index, child in enumerate(body):
+            yield from _walk_ordered(child, path + ("s%d" % index,), inside)
+    elif body is not None and not isinstance(body, (str, int)):
+        yield from _walk_ordered(body, path + (type(stmt).__name__,), inside)
+    for branch_name in ("then_body", "else_body"):
+        branch = getattr(stmt, branch_name, None)
+        if isinstance(branch, Sequential):
+            yield from _walk_ordered(branch, path + (branch_name,), in_loop)
+
+
+def _ordering_context(tir_module):
+    """path -> (ordinal, in_loop) over the real tree; no per-generation merging."""
+    ordinals, in_loop = {}, {}
+    for index, (path, _stmt, inside) in enumerate(_walk_ordered(tir_module)):
+        ordinals[path] = index
+        in_loop[path] = inside
+    return ordinals, in_loop
+
+
+def _iteration_offset(obligation):
+    """How many loop iterations separate the producer from the consumer of an edge.
+
+    A reuse edge names it in the id (``...:i0->i1``) and its consumer generation is that
+    later iteration; a RAW instance lives inside one iteration. Offset 0 means "both ends
+    are in the same body sweep", so tree order IS execution order and a Wait before its
+    Set is a real deadlock. Offset >= 1 means the loop itself supplies ordering, but only
+    from the second iteration on: the first sweep still needs an earlier Set (a pre-loop
+    prologue) or it blocks.
+    """
+    match = re.search(r":i(\d+)->i(\d+)(?:#\d+)?$", str(getattr(obligation, "obligation_id", "")))
+    if match:
+        return max(0, int(match.group(2)) - int(match.group(1)))
+    if str(getattr(obligation, "kind", "")).upper() in ("WAR", "FREE", "WAW", "REUSE"):
+        return 1
+    return 0
+
+
 def inject_completion_anchored(tir_module, plan, obligations, allocation, *,
                                channels=None, ledger=None, drop_wait_ids=(),
                                materialization=None):
@@ -659,7 +787,8 @@ def inject_completion_anchored(tir_module, plan, obligations, allocation, *,
             channel_by_obligation[oid] = channel
     allocation_by_channel = {item.channel_id: item for item in allocation}
     statements = index_statements_ledger(tir_module)
-    rewritten_by_action = {}
+    ordinals = _anchor_ordinals(tir_module)
+    rewritten_paths_by_action = {}
     if materialization is not None:
         fp_paths = {}
         for path, stmt in statements.items():
@@ -669,30 +798,41 @@ def inject_completion_anchored(tir_module, plan, obligations, allocation, *,
                 continue
         for entry in getattr(materialization, "entries", ()) or ():
             action_id = str(_get(entry, "action_id", ""))
-            if action_id and action_id not in rewritten_by_action:
-                paths = fp_paths.get(str(_get(entry, "new_fingerprint", "")), [])
-                if paths:
-                    rewritten_by_action[action_id] = paths[0]
+            if not action_id:
+                continue
+            for path in fp_paths.get(str(_get(entry, "new_fingerprint", "")), []):
+                rewritten_paths_by_action.setdefault(action_id, set()).add(path)
     before, after = {}, {}
     for obligation in obligation_list:
         if obligation.kind not in ("WAR", "FREE", "WAW", "RAW"):
             continue
-        producer_entry = _entry_by_action(ledger, obligation.producer_action)
-        consumer_entry = _entry_by_action(ledger, obligation.consumer_action)
-        if producer_entry is None or consumer_entry is None:
+        producer_entries = _entries_by_action(ledger, obligation.producer_action)
+        consumer_entries = _entries_by_action(ledger, obligation.consumer_action)
+        if not producer_entries or not consumer_entries:
             raise CompletionError("COMPLETION_ANCHOR_NOT_FOUND",
                                   "producer/consumer action not found in ledger",
                                   obligation.obligation_id, "ledger action",
                                   [obligation.producer_action, obligation.consumer_action])
-        producer_path = rewritten_by_action.get(
-            str(obligation.producer_action), str(getattr(producer_entry, "path", "")))
-        consumer_path = rewritten_by_action.get(
-            str(obligation.consumer_action), str(getattr(consumer_entry, "path", "")))
-        if producer_path not in statements or consumer_path not in statements:
+
+        def _instances(action, entries):
+            """The real statements this action emits, in real tree order (per iteration)."""
+            paths = rewritten_paths_by_action.get(str(action))
+            if paths is None:
+                paths = {str(getattr(entry, "path", "")) for entry in entries}
+            return sorted(paths, key=lambda path: ordinals.get(path, 1 << 30))
+
+        producer_instances = _instances(obligation.producer_action, producer_entries)
+        consumer_instances = _instances(obligation.consumer_action, consumer_entries)
+        if not producer_instances or not consumer_instances:
             raise CompletionError("COMPLETION_ANCHOR_NOT_FOUND",
                                   "producer/consumer path not found in actual TIR",
                                   obligation.obligation_id, "Evaluate path",
-                                  [producer_path, consumer_path])
+                                  [producer_instances, consumer_instances])
+        for path in producer_instances + consumer_instances:
+            if path not in statements:
+                raise CompletionError("COMPLETION_ANCHOR_NOT_FOUND",
+                                      "producer/consumer path not found in actual TIR",
+                                      obligation.obligation_id, "Evaluate path", path)
         channel = channel_by_obligation.get(obligation.obligation_id)
         if channel is None:
             raise CompletionError("COMPLETION_MAP_MISMATCH", "no channel for obligation",
@@ -701,7 +841,17 @@ def inject_completion_anchored(tir_module, plan, obligations, allocation, *,
         if allocation_item is None:
             raise CompletionError("FLAG_POOL_EXHAUSTED", "no flag allocation for channel",
                                   channel.channel_id, "allocation", None)
-        for generation in obligation.generation_domain:
+        # Each generation is its own flag epoch AND its own carrier instance. The POC carrier
+        # is unrolled (one real statement per iteration), so generation g is anchored at
+        # instance g - distance of the producer and instance g of the consumer. Anchoring all
+        # generations at [0] would place an i0->i1 Set and Wait inside the SAME iteration,
+        # which is exactly the collapsed-ordering defect this pass must not reintroduce.
+        distance = _iteration_offset(obligation)
+        for generation in sorted(int(g) for g in obligation.generation_domain):
+            producer_path = _instance_anchor(producer_instances, generation, generation - distance,
+                                             obligation.obligation_id, "producer")
+            consumer_path = _instance_anchor(consumer_instances, generation, generation,
+                                             obligation.obligation_id, "consumer")
             set_node = Evaluate(callable=_flag_node(AivFlagSet, obligation, channel,
                                                     allocation_item, generation), args=())
             after.setdefault(_anchor_path(producer_path), []).append(set_node)
@@ -904,7 +1054,7 @@ def verify_completion_coverage_from_ledger(ledger, expansion, problem=None, plan
         else:
             required_by_kind["WAR_FREE"] += 1
     actual = _actual_nodes(actual_tir)
-    ordinals = _actual_path_ordinals(actual_tir)
+    ordinals, looped = _ordering_context(actual_tir)
     placements = tuple((placement_map or {}).get("placements", ())) if isinstance(placement_map, dict) else ()
     channels = tuple((placement_map or {}).get("channels", ())) if isinstance(placement_map, dict) else ()
     channel_by_obligation = {}
@@ -918,6 +1068,11 @@ def verify_completion_coverage_from_ledger(ledger, expansion, problem=None, plan
     covered_by_kind = {"RAW": 0, "SSA": 0, "WAR_FREE": 0, "FINAL": 0}
     missing = []
     edge_table = []
+    # Ordering refusals are COLLECTED, not returned immediately. A node that exists but is
+    # ordered wrongly is still a present node, so a missing node (COMPLETION_NOT_VERIFIED)
+    # must outrank it; returning early let one withheld Wait hide behind an unrelated
+    # ordering refusal and report the wrong code.
+    ordering_failures = []
     for obligation in required:
         kind = obligation.kind
         if kind in ("WAR", "FREE", "WAW", "RAW"):
@@ -956,19 +1111,67 @@ def verify_completion_coverage_from_ledger(ledger, expansion, problem=None, plan
                                           len(required), covered, tuple(missing), len(placements),
                                           "flag pipe differs from source edge for %s" % obligation.obligation_id,
                                           required_by_kind, covered_by_kind, tuple(edge_table))
-            by_gen_set = {int(getattr(node, "generation", -1)): (path, ordinals.get(path, -1))
-                          for path, node in sets}
-            by_gen_wait = {int(getattr(node, "generation", -1)): (path, ordinals.get(path, -1))
-                           for path, node in waits}
-            if any(by_gen_wait[generation][0] == by_gen_set[generation][0]
-                   and by_gen_wait[generation][1] < by_gen_set[generation][1]
-                   for generation in generation_expected):
-                return CoverageReport("FAILED", "COMPLETION_WAIT_BEFORE_SET", len(required),
-                                      len(required), covered, tuple(missing), len(placements),
-                                      "wait precedes set for %s" % obligation.obligation_id,
-                                      required_by_kind, covered_by_kind, tuple(edge_table))
+            by_gen_set = {}
+            for path, node in sets:
+                by_gen_set.setdefault(int(getattr(node, "generation", -1)), []).append(path)
+            by_gen_wait = {}
+            for path, node in waits:
+                by_gen_wait.setdefault(int(getattr(node, "generation", -1)), []).append(path)
+            # More than one Set (or Wait) for one (channel, kind, generation) is not a
+            # harmless duplicate: the flag protocol has exactly one setter and one waiter
+            # per generation, so the extra node is either a forged cover or a stale copy.
+            duplicate_problem = None
+            for generation in sorted(generation_expected):
+                if len(by_gen_set.get(generation, ())) != 1:
+                    duplicate_problem = ("generation %d has %d Set nodes for %s"
+                                         % (generation, len(by_gen_set.get(generation, ())),
+                                            obligation.obligation_id))
+                    break
+                if len(by_gen_wait.get(generation, ())) != 1:
+                    duplicate_problem = ("generation %d has %d Wait nodes for %s"
+                                         % (generation, len(by_gen_wait.get(generation, ())),
+                                            obligation.obligation_id))
+                    break
+            offset = _iteration_offset(obligation)
+            set_ordinal = min(ordinals.get(path, -1) for path, _node in sets)
+            wait_ordinal = max(ordinals.get(path, -1) for path, _node in waits)
+            set_in_loop = any(looped.get(path, False) for path, _node in sets)
+            wait_in_loop = any(looped.get(path, False) for path, _node in waits)
             covered += 1
             covered_by_kind["RAW" if kind == "RAW" else "WAR_FREE"] += 1
+            if duplicate_problem is not None:
+                ordering_failures.append(CoverageReport(
+                    "FAILED", "COMPLETION_DUPLICATE_FLAG_NODE", len(required), len(required),
+                    covered, tuple(missing), len(placements), duplicate_problem,
+                    required_by_kind, covered_by_kind, tuple(edge_table)))
+            elif offset == 0:
+                # Same iteration: tree order IS execution order inside one body sweep.
+                if wait_ordinal < set_ordinal:
+                    ordering_failures.append(CoverageReport(
+                        "FAILED", "COMPLETION_WAIT_BEFORE_SET", len(required), len(required),
+                        covered, tuple(missing), len(placements),
+                        "wait@%d precedes set@%d for %s"
+                        % (wait_ordinal, set_ordinal, obligation.obligation_id),
+                        required_by_kind, covered_by_kind, tuple(edge_table)))
+            elif not set_in_loop and not wait_in_loop:
+                # Cross-iteration edge: the loop supplies the ordering only from the second
+                # sweep on. The first sweep of a ring consumer waits on a generation its
+                # producer has not reached yet, so some Set must run before it in the tree
+                # (an unrolled prologue). Without that the pipeline deadlocks at i=start.
+                ordering_failures.append(CoverageReport(
+                    "FAILED", "COMPLETION_DISTANCE_NOT_PRESERVED", len(required), len(required),
+                    covered, tuple(missing), len(placements),
+                    "cross-iteration edge %s is fully unrolled inside one sweep; the distance "
+                    "is not materialised" % obligation.obligation_id,
+                    required_by_kind, covered_by_kind, tuple(edge_table)))
+            elif wait_in_loop and wait_ordinal < set_ordinal:
+                ordering_failures.append(CoverageReport(
+                    "FAILED", "COMPLETION_STARTUP_UNSATISFIED", len(required), len(required),
+                    covered, tuple(missing), len(placements),
+                    "cross-iteration Wait@%d in the same sweep as Set@%d has no earlier Set to "
+                    "cover iteration start for %s"
+                    % (wait_ordinal, set_ordinal, obligation.obligation_id),
+                    required_by_kind, covered_by_kind, tuple(edge_table)))
             producer = entry_by_action.get(str(obligation.producer_action))
             consumer = entry_by_action.get(str(obligation.consumer_action))
             if kind == "RAW":
@@ -1027,6 +1230,15 @@ def verify_completion_coverage_from_ledger(ledger, expansion, problem=None, plan
                               covered, tuple(missing), len(placements),
                               "missing/undischarged: %r" % missing[:8], required_by_kind,
                               covered_by_kind, tuple(edge_table))
+    if ordering_failures:
+        # Every node exists, but at least one edge is materialised in an order that either
+        # cannot complete (Wait before Set) or cannot start (no prologue cover).
+        first = ordering_failures[0]
+        return CoverageReport("FAILED", first.code, first.required, first.provided,
+                              first.covered, first.missing_obligation_ids, first.placements,
+                              "%d ordering defect(s); first: %s"
+                              % (len(ordering_failures), first.detail),
+                              first.required_by_kind, first.covered_by_kind, first.edge_table)
     return CoverageReport("VERIFIED", None, len(required), len(required), covered, (),
                           len(placements), "47/47 anchored coverage", required_by_kind,
                           covered_by_kind, tuple(edge_table))

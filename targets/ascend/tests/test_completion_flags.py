@@ -13,8 +13,53 @@ from tilefoundry_ascend.schedule.ledger import extract_ledger
 import test_task83_vertical as T
 
 
+def _materialised_carrier(tir, problem, sources):
+    """The carrier the REAL C flow injects into: R's materialised, unrolled pipeline.
+
+    Injecting into the un-lowered For body is not the flow under test. That body has ONE
+    statement per action and no per-iteration instances, so a generation-1 Wait cannot be
+    placed after a generation-0 Set without a prologue the static POC does not emit; C now
+    refuses that shape by name (COMPLETION_STARTUP_UNSATISFIED, see
+    test_completion_ordering.py) instead of counting it as coverage.
+    """
+    import unittest.mock as _mock
+    from poc_vertical_adapter import nominal_solve_result, project_problem
+    from tilefoundry_ascend.plan import materialize as MAT
+    from tilefoundry_ascend.plan import resolved_plan as RP
+    from tilefoundry_ascend.solver import bridge as B
+
+    r_problem, _ = project_problem(problem, tir, 4, sources)
+    model_facts = {
+        "model_id": "m", "model_version": "v1",
+        "memory_groups": [{
+            "id": "g0",
+            "capacity_bytes": max(1, sum(int(b["bytes"]) for b in r_problem["buffers"])),
+            "buffers": [b["root"] for b in r_problem["buffers"]],
+            "cost_model": "MODEL",
+        }],
+        "cost_model": "MODEL",
+    }
+    core = B.solve_real_problem(r_problem, model_facts, {})
+    nominal = nominal_solve_result(core, r_problem)
+    original = RP._solve_status
+    with _mock.patch.object(
+        RP, "_solve_status",
+        lambda r: RP.SAT_POSTCHECKED if getattr(r, "status", "") == "NOMINAL_SAT" else original(r),
+    ):
+        plan = RP.build_resolved_plan(r_problem, nominal,
+                                      {"L": "l", "S": "s", "C": "c", "F": "f", "P": "p"})
+        base, facts = 0, {}
+        for buf in r_problem["buffers"]:
+            facts[buf["root"]] = {"versions": 1, "alignment": 64, "arena_id": "arena0",
+                                  "base_offset_bytes": base}
+            base += ((buf["bytes"] + 63) // 64) * 64
+        plan = RP.resolve_buffer_layout(plan, facts)
+    rewritten, matmap = MAT.materialize_plan(tir, plan)
+    return rewritten, matmap
+
+
 def setup():
-    _sources, tir, problem, expansion, expected, _sp = T._l()
+    sources, tir, problem, expansion, expected, _sp = T._l()
     ledger = extract_ledger(tir)
     reuse = C.derive_reuse_obligations_from_ledger(ledger, expansion)
     required = C.derive_completion_obligations_from_ledger(ledger, expansion, problem=problem,
@@ -24,21 +69,25 @@ def setup():
     actionable = tuple(o for o in required if o.kind in ("RAW", "WAR", "FREE"))
     channels, _ = C.choose_completion_mechanisms(actionable, {}, caps)
     allocation = C.allocate_completion_resources(channels, {}, caps)
-    return tir, ledger, problem, expansion, expected, reuse, required, caps, channels, allocation
+    rewritten, matmap = _materialised_carrier(tir, problem, sources)
+    return (rewritten, ledger, problem, expansion, expected, reuse, required, caps, channels,
+            allocation, matmap)
 
 
 def test_reuse_is_18_and_requires_both_actions():
-    *_, reuse, required, _caps, _channels, _allocation = setup()
+    *_, reuse, required, _caps, _channels, _allocation, _matmap = setup()
     assert len(reuse) == 18
     assert len(required) == 47
     assert {o.kind for o in reuse} == {"WAR", "FREE"}
 
 
 def test_anchored_injection_covers_47():
-    tir, ledger, problem, expansion, expected, reuse, required, caps, channels, allocation = setup()
+    (tir, ledger, problem, expansion, expected, reuse, required, caps, channels, allocation,
+     matmap) = setup()
     actionable = tuple(o for o in required if o.kind in ("RAW", "WAR", "FREE"))
     actual, placement = C.inject_completion_anchored(tir, None, actionable, allocation,
-                                                     channels=channels, ledger=ledger)
+                                                     channels=channels, ledger=ledger,
+                                                     materialization=matmap)
     nodes = C._actual_nodes(actual)
     assert len(nodes["set"]) == 30 and len(nodes["wait"]) == 30 and len(nodes["drain"]) == 1
     report = C.verify_completion_coverage_from_ledger(
@@ -51,11 +100,12 @@ def test_anchored_injection_covers_47():
 
 
 def test_missing_wait_is_not_counted():
-    tir, ledger, problem, expansion, expected, reuse, required, caps, channels, allocation = setup()
+    (tir, ledger, problem, expansion, expected, reuse, required, caps, channels, allocation,
+     matmap) = setup()
     actionable = tuple(o for o in required if o.kind in ("RAW", "WAR", "FREE"))
     actual, placement = C.inject_completion_anchored(
         tir, None, actionable, allocation, channels=channels, ledger=ledger,
-        drop_wait_ids=(reuse[0].obligation_id,))
+        materialization=matmap, drop_wait_ids=(reuse[0].obligation_id,))
     report = C.verify_completion_coverage_from_ledger(
         ledger, expansion, problem=problem, actual_tir=actual, placement_map=placement,
         capabilities=caps, expected=expected)
@@ -83,11 +133,13 @@ def _single_actual(reuse, channel, allocation, *, reverse=False, wrong_pipe=Fals
 
 def test_anchor_missing_is_named_not_counted():
     import dataclasses
-    tir, ledger, problem, expansion, expected, reuse, required, caps, channels, allocation = setup()
+    (tir, ledger, problem, expansion, expected, reuse, required, caps, channels, allocation,
+     matmap) = setup()
     bad = dataclasses.replace(reuse[0], producer_action="missing-action")
     try:
         C.inject_completion_anchored(tir, None, (bad,), allocation,
-                                     channels=channels, ledger=ledger)
+                                     channels=channels, ledger=ledger,
+                                     materialization=matmap)
     except Exception as error:  # noqa: BLE001
         assert getattr(error, "code", None) == "COMPLETION_ANCHOR_NOT_FOUND", error
     else:
@@ -95,7 +147,7 @@ def test_anchor_missing_is_named_not_counted():
 
 
 def test_cross_pipe_same_order_lie_is_named():
-    *_, reuse, _required, _caps, _channels, _allocation = setup()
+    *_, reuse, _required, _caps, _channels, _allocation, _matmap = setup()
     try:
         C.choose_completion_mechanisms(reuse, {}, {"supported_pairs": [["vector", "DMA"]],
                                                    "same_pipe_pipe_order": True})
@@ -106,7 +158,7 @@ def test_cross_pipe_same_order_lie_is_named():
 
 
 def test_pool_exhausted_is_named():
-    *_, reuse, _required, caps, channels, _allocation = setup()
+    *_, reuse, _required, caps, channels, _allocation, _matmap = setup()
     try:
         C.allocate_completion_resources(channels, {}, {"flag_pool_size": 5})
     except Exception as error:  # noqa: BLE001
