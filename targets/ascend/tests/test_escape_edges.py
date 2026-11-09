@@ -186,6 +186,153 @@ def main():
 
     refusal("neg_forged_inner_type_refused", forged_type)
 
+    # ------------------------------------------------------------------------------------
+    # FIELD-LEVEL payload negatives: one per EscapeEdge field, each a plausible-but-wrong
+    # value (never an obviously malformed one), each required to be refused BY NAME.
+    #
+    # Every case mutates ONLY the edge payload after extract_ledger() has produced a valid
+    # ledger, so the validator cannot be rescued by rebuilding from the typed records: the
+    # expectation it compares against is rebuilt independently from escape_records +
+    # declaration_sites inside validate_escape_edges().
+    # ------------------------------------------------------------------------------------
+    def field_negatives():
+        """Return {field: (accepted, code)} by mutating one payload field at a time."""
+        results = {}
+
+        def probe(name, mutate):
+            led = ledger_with()
+            try:
+                mutate(led)
+            except Exception as error:  # noqa: BLE001 - an unbuildable mutant is a test defect
+                results[name] = ("MUTANT-UNBUILDABLE", type(error).__name__)
+                return
+            try:
+                validate_escape_edges(led)
+            except LedgerError as error:
+                results[name] = (False, str(error).split(":", 1)[0])
+            except Exception as error:  # noqa: BLE001
+                results[name] = ("NON-NAMED", type(error).__name__)
+            else:
+                results[name] = (True, None)
+
+        def pick(led, predicate):
+            for index, edge in enumerate(led.escape_edges):
+                if predicate(edge):
+                    return index, edge
+            raise LookupError("no edge matches")
+
+        def set_field(index, led, **changes):
+            led.escape_edges[index] = dataclasses.replace(led.escape_edges[index], **changes)
+
+        def another(pool, current):
+            return next(value for value in pool if value != current)
+
+        # --- roots: swap in another LEGAL SMEM root (a value that exists, but not this edge's)
+        probe("inner_root", lambda led: set_field(0, led, inner_root=next(
+            edge.inner_root for edge in led.escape_edges
+            if edge.inner_root != led.escape_edges[0].inner_root)))
+        probe("outer_root", lambda led: set_field(0, led, outer_root=next(
+            edge.outer_root for edge in led.escape_edges
+            if edge.outer_root != led.escape_edges[0].outer_root)))
+        probe("inner_outer_root_swapped", lambda led: set_field(
+            0, led, inner_root=led.escape_edges[0].outer_root,
+            outer_root=led.escape_edges[0].inner_root))
+
+        # --- action ids: another action that REALLY exists in the ledger (wrong binding)
+        probe("inner_action_id", lambda led: set_field(0, led, inner_action_id=another(
+            [edge.inner_action_id for edge in led.escape_edges], led.escape_edges[0].inner_action_id)))
+        probe("outer_action_id", lambda led: set_field(0, led, outer_action_id=another(
+            [edge.outer_action_id for edge in led.escape_edges], led.escape_edges[0].outer_action_id)))
+        probe("inner_outer_action_swapped", lambda led: set_field(
+            0, led, inner_action_id=led.escape_edges[0].outer_action_id,
+            outer_action_id=led.escape_edges[0].inner_action_id))
+
+        # --- recorded types: bf16 -> f32 keeps the byte footprint identical, so only a real
+        # dtype check can refuse it (this is the decisive one for "type is just a label").
+        # The mutation must actually CHANGE the text: the carrier has both bf16 and f32 edges,
+        # and rewriting an already-f32 edge would be a no-op that proves nothing.
+        def retype(led, attribute):
+            index, edge = pick(led, lambda e: "bf16" in str(getattr(e, attribute)))
+            set_field(index, led, **{attribute: str(getattr(edge, attribute)).replace("bf16", "f32")})
+
+        probe("inner_type", lambda led: retype(led, "inner_type"))
+        probe("outer_type", lambda led: retype(led, "outer_type"))
+
+        # --- naming: which outer scope/binding the value binds to
+        probe("outer_binding", lambda led: set_field(0, led, outer_binding="FORGED_BINDING"))
+        probe("outer_scope", lambda led: set_field(0, led, outer_scope=next(
+            edge.outer_scope for edge in led.escape_edges
+            if edge.outer_scope != led.escape_edges[0].outer_scope)))
+
+        # --- loop structure an edge claims to live in
+        probe("iteration_path", lambda led: set_field(0, led, iteration_path="wrong_loop"))
+        probe("iteration_domains_emptied", lambda led: set_field(
+            pick(led, lambda edge: edge.iteration_domains)[0], led, iteration_domains=()))
+        probe("iteration_domains_wrong", lambda led: set_field(
+            pick(led, lambda edge: edge.iteration_domains)[0], led,
+            iteration_domains=(("zzz", "1"),)))
+        probe("iteration_domains_extra", lambda led: set_field(
+            pick(led, lambda edge: edge.iteration_domains)[0], led,
+            iteration_domains=tuple(pick(led, lambda edge: edge.iteration_domains)[1].iteration_domains)
+            + (("extra", "2"),)))
+
+        # --- guard: the real producers here are UNGUARDED, so ADDING a guard is the forgery
+        probe("guard_added", lambda led: set_field(
+            0, led, guard=(("then", ("Constant", False)),)))
+
+        # --- identity of the binding itself
+        probe("ssa_group", lambda led: set_field(0, led, ssa_group=another(
+            [edge.ssa_group for edge in led.escape_edges], led.escape_edges[0].ssa_group)))
+        probe("domain", lambda led: set_field(
+            0, led, domain=("main" if led.escape_edges[0].domain == "weight" else "weight")))
+        probe("edge_kind", lambda led: set_field(0, led, edge_kind="ESCAPE_ORDINARY"))
+        probe("schema_version", lambda led: set_field(0, led, schema_version="escape-edge/1"))
+        probe("field_path", lambda led: set_field(0, led, field_path="FORGED.field"))
+        probe("scope_path", lambda led: set_field(0, led, scope_path="FORGED_SCOPE"))
+        return results
+
+    field_results = field_negatives()
+
+    #: Fields that must be refused with the generic payload-mismatch code (their value differs
+    #: from the independently rebuilt expectation) rather than a structural code.
+    _MISMATCH_FIELDS = (
+        "inner_root", "outer_root", "inner_outer_root_swapped",
+        "inner_action_id", "outer_action_id", "inner_outer_action_swapped",
+        "inner_type", "outer_type", "outer_binding", "outer_scope",
+        "iteration_path", "iteration_domains_emptied", "iteration_domains_wrong",
+        "iteration_domains_extra", "guard_added", "ssa_group", "domain", "schema_version",
+    )
+    _CODE_BY_FIELD = {
+        "edge_kind": "ESCAPE_EDGE_KIND",
+        "field_path": "ESCAPE_EDGE_MISSING",
+        "scope_path": "ESCAPE_EDGE_MISSING",
+    }
+    for field in _MISMATCH_FIELDS:
+        accepted, code = field_results[field]
+        checks["neg_field_" + field] = (accepted is False) and code == "ESCAPE_EDGE_MISMATCH"
+    for field, expected_code in _CODE_BY_FIELD.items():
+        accepted, code = field_results[field]
+        checks["neg_field_" + field] = (accepted is False) and code == expected_code
+
+    # COMPLETENESS: every declared EscapeEdge field must appear in at least one negative, and
+    # every negative must be NAMED. A field with no negative is an uncovered field, not a pass.
+    covered_fields = set()
+    for field in _MISMATCH_FIELDS:
+        covered_fields.add(field.split("_swapped")[0].split("_emptied")[0]
+                           .split("_wrong")[0].split("_extra")[0].split("_added")[0])
+    covered_fields |= set(_CODE_BY_FIELD)
+    declared_fields = {f.name for f in dataclasses.fields(baseline.escape_edges[0])}
+    unchecked = sorted(declared_fields - covered_fields)
+    checks["every_escape_edge_field_has_a_negative"] = not unchecked
+    if unchecked:
+        print("UNCHECKED EscapeEdge fields: " + repr(unchecked))
+    checks["every_field_negative_is_named"] = all(
+        code is not None and code != "NON-NAMED" and not str(code).startswith("MUTANT")
+        for accepted, code in field_results.values())
+    checks["no_field_negative_was_accepted"] = not any(
+        accepted is True for accepted, _code in field_results.values())
+
+
     for key, value in checks.items():
         print(("ok   " if value else "FAIL ") + key)
     print(

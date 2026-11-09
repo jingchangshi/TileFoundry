@@ -1350,7 +1350,23 @@ def validate_escape_edges(ledger: Ledger) -> dict:
     for edge in edges:
         label = edge.scope_path + "/" + edge.field_path
         wanted = by_key[(edge.scope_path, edge.field_path)]
-        for attribute in ("inner_root", "outer_root", "ssa_group", "domain", "outer_scope"):
+        # EVERY payload field is compared against the independently rebuilt expectation, not just
+        # the roots. Two of these carry the actual evidence of the binding and were previously
+        # unchecked, so a forged value survived validation:
+        #   inner_type/outer_type - the recorded dtype is what makes the binding well-typed; a
+        #     bf16->f32 forgery must not pass just because the byte footprint is unchanged.
+        #   outer_binding         - it names WHICH outer declaration the value binds to; a forged
+        #     name silently re-points the edge.
+        #   iteration_domains     - the loop dimensions the endpoints live in; emptying it erases
+        #     the loop structure the edge claims.
+        #   schema_version        - an edge that is not the schema this validator understands must
+        #     be refused instead of being read with the current rules.
+        for attribute in (
+            "inner_root", "outer_root", "inner_action_id", "outer_action_id",
+            "ssa_group", "domain", "outer_scope", "outer_binding",
+            "inner_type", "outer_type", "iteration_path", "guard", "iteration_domains",
+            "edge_kind", "schema_version",
+        ):
             if getattr(edge, attribute) != getattr(wanted, attribute):
                 raise LedgerError(
                     "ESCAPE_EDGE_MISMATCH: " + label + " has " + attribute + "="
