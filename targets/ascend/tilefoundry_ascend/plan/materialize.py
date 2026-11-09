@@ -28,7 +28,7 @@ from tilefoundry.ir.tir.memory.tensor_view import TensorView
 from tilefoundry.ir.tir.memory.copy import Copy
 from tilefoundry.ir.tir.flag import Drain
 from tilefoundry.ir.tir.prim_function import PrimFunction
-from tilefoundry.ir.tir.stmts import Evaluate, For, If, LetStmt, Sequential
+from tilefoundry.ir.tir.stmts import Evaluate, For, If, LetStmt, Sequential, While
 from tilefoundry.ir.types import Layout, PointerType, make_tensor_type
 from tilefoundry.ir.types.storage import StorageKind
 
@@ -93,6 +93,39 @@ def index_statements(module) -> dict:
     return found
 
 
+def _loop_body_can_execute(node) -> bool:
+    """Can this loop's body run at least once?
+
+    Only a PROVABLY empty loop is dead; anything unprovable is left reachable. Assuming a
+    loop runs zero times when its trip count is merely unknown would discard real applied
+    writes, which is the opposite failure and just as wrong.
+
+      While(False)              -> False. While(True)/runtime condition -> True.
+      For with a runtime bound  -> True (unprovable).
+      For, all bounds constant  -> the true trip count, for BOTH step signs:
+                                     step > 0 : ceil((stop - start) / step)
+                                     step < 0 : ceil((start - stop) / -step)
+                                     step == 0 or span <= 0 : 0
+    """
+    if isinstance(node, While):
+        cond = getattr(node, "cond", None)
+        return not (isinstance(cond, Constant) and getattr(cond, "value", None) is False)
+    values = []
+    for bound in (getattr(node, "start", None), getattr(node, "stop", None),
+                  getattr(node, "step", None)):
+        if isinstance(bound, Constant) and isinstance(getattr(bound, "value", None), int):
+            values.append(int(bound.value))
+        else:
+            return True
+    start, stop, step = values
+    if step == 0:
+        return False
+    span, magnitude = (stop - start, step) if step > 0 else (start - stop, -step)
+    if span <= 0:
+        return False
+    return -(-span // magnitude) > 0
+
+
 def index_statements_ledger(module, *, reachable_only=False) -> dict:
     """Path index that MATCHES the ledger's structural paths (Sequential sN, MeshScope,
     ExecutionScope, for:<var>, If then/else), so R2 can find real instruction statements.
@@ -115,11 +148,19 @@ def index_statements_ledger(module, *, reachable_only=False) -> dict:
         if isinstance(node, (MeshScope, ExecutionScope)):
             walk(node.body, path + (type(node).__name__,), reachable)
             return
-        if isinstance(node, For):
+        if isinstance(node, (For, While)):
             if reachable or not reachable_only:
                 found["/".join(path)] = node
-            name = getattr(getattr(node, "induction_var", None), "name", "i")
-            walk(node.body, path + ("for:" + str(name),), reachable)
+            # A loop that provably runs zero times executes nothing inside it, so a WRITE
+            # sealed in its body is not an applied write. The census formerly descended into
+            # every loop body unconditionally: reachability was taught about If but withheld
+            # from loops, which is the same defect class one statement kind over.
+            body_reachable = reachable and _loop_body_can_execute(node)
+            if isinstance(node, While):
+                walk(node.body, path + ("while",), body_reachable)
+            else:
+                name = getattr(getattr(node, "induction_var", None), "name", "i")
+                walk(node.body, path + ("for:" + str(name),), body_reachable)
             return
         if isinstance(node, If):
             if reachable_only:
@@ -432,7 +473,8 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
             return report
     # A rewritten WRITE that exists but cannot execute is NOT an applied write. Fingerprints
     # are compared against the REACHABLE set only, so sealing a rewritten write in a dead
-    # branch is refused instead of passing on map fidelity alone.
+    # branch -- or inside a loop whose body provably never runs (While(False), zero-trip For)
+    # -- is refused instead of passing on map fidelity alone.
     reachable_fingerprints = {fingerprint(stmt) for stmt in rewritten_reachable.values()}
     for entry in materialization.entries:
         if entry["new_fingerprint"] in reachable_fingerprints:
@@ -440,8 +482,9 @@ def verify_plan_application(original_module, plan: ResolvedPlan, rewritten_modul
         if entry["new_fingerprint"] in {fingerprint(stmt) for stmt in rewritten_index.values()}:
             report["code"] = "PLAN_WRITE_UNREACHABLE"
             report["detail"] = {"access_id": entry["access_id"], "k": entry["k"],
-                                "reason": "rewritten statement is present but in a statically "
-                                          "dead branch, so it never executes"}
+                                "reason": "rewritten statement is present but statically "
+                                          "unreachable (dead branch arm, While(False), or a "
+                                          "zero-trip counted loop), so it never executes"}
             return report
     # Map fidelity: recorded fingerprints must equal actual rewritten statements.
     rewritten_stmts = list(rewritten_index.values())

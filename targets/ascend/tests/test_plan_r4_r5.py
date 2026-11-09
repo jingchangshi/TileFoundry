@@ -308,3 +308,197 @@ def test_r4_reachable_if_branches_are_not_wrongly_dropped():
     report2 = MAT.verify_plan_application(original, plan, runtime, materialization)
     assert report2["status"] == "PASS", report2
     assert report2["applied_accesses"] == baseline_applied, report2
+
+
+# --------------------------------------------------------------------------------------
+# LOOP reachability for R: a write inside a loop that provably never runs is not applied.
+#
+# Same family as the If(False) repair above, one statement kind over: the census learned
+# about If arms but still descended into every loop body unconditionally. The architect
+# reported (and I reproduced) that a GmToUb write moved into a zero-trip For still PASSes
+# with applied 12 after the digest is backfilled; While(False) refused, but under the
+# inaccurate MATERIALIZATION_MAP_MISMATCH.
+# --------------------------------------------------------------------------------------
+
+def _wrap_in_loop(module, predicate, kind, **bounds):
+    """Move every statement matching `predicate` into a loop, in ONE identity-keyed pass.
+
+    Keyed by id() so a statement is wrapped exactly once: the fixture contains duplicate
+    statements with identical fingerprints, and a second pass would re-wrap its own output.
+    """
+    from tilefoundry.ir.core import Constant, Var
+    from tilefoundry.ir.tir.stmts import For, While
+    from tilefoundry.ir.types import make_tensor_type
+
+    def int_const(value):
+        return Constant(value=value, type=make_tensor_type((), dtype="i32", storage="umat"))
+
+    sealed_ids = set()
+
+    def wrap_once(item):
+        sequence = Sequential(body=(item,))
+        if kind == "while":
+            cond = Constant(value=bounds["cond"],
+                            type=make_tensor_type((), dtype="i1", storage="umat"))
+            loop = While(cond=cond, body=sequence)
+        else:
+            loop = For(induction_var=Var(name="i", type=make_tensor_type((), dtype="i32",
+                                                                       storage="umat")),
+                       start=int_const(bounds["start"]), stop=int_const(bounds["stop"]),
+                       step=int_const(bounds["step"]), body=sequence)
+        sealed_ids.add(id(item))
+        return Sequential(body=(loop,))
+
+    def rewrite(node):
+        if not dataclasses.is_dataclass(node):
+            return None
+        for field in dataclasses.fields(node):
+            value = getattr(node, field.name, None)
+            if isinstance(value, (list, tuple)):
+                changed = False
+                body = list(value)
+                for index, item in enumerate(body):
+                    if predicate(item) and id(item) not in sealed_ids:
+                        body[index] = wrap_once(item)
+                        changed = True
+                        continue
+                    found = rewrite(item)
+                    if found is not None:
+                        body[index] = found
+                        changed = True
+                if changed:
+                    return dataclasses.replace(node, **{field.name: tuple(body)})
+            elif dataclasses.is_dataclass(value):
+                if predicate(value) and id(value) not in sealed_ids:
+                    return dataclasses.replace(node, **{field.name: wrap_once(value)})
+                found = rewrite(value)
+                if found is not None:
+                    return dataclasses.replace(node, **{field.name: found})
+        return None
+
+    mutant = rewrite(module)
+    assert mutant is not None, "could not place the statement in a loop"
+    assert sealed_ids, "predicate matched nothing"
+    return mutant, len(sealed_ids)
+
+
+def _r4_loop_case(kind, **bounds):
+    """Shared setup: move a recorded write into a loop and verify the result."""
+    plan = build_stage()
+    original = R3.make_tir_fixture()
+    rewritten, materialization = MAT.materialize_plan(original, plan)
+    baseline = MAT.verify_plan_application(original, plan, rewritten, materialization)
+    assert baseline["status"] == "PASS", baseline
+    baseline_applied = baseline["applied_accesses"]
+    assert baseline_applied > 0, baseline
+
+    recorded = {entry["new_fingerprint"] for entry in materialization.entries}
+    target = None
+    for _path, stmt in MAT.index_statements_ledger(rewritten).items():
+        if MAT.fingerprint(stmt) in recorded and isinstance(stmt, Evaluate):
+            target = stmt
+            break
+    assert target is not None, "no recorded statement found in the rewritten tree"
+
+    def _match(item):
+        return isinstance(item, Evaluate) and MAT.fingerprint(item) == MAT.fingerprint(target)
+
+    mutant, count = _wrap_in_loop(rewritten, _match, kind, **bounds)
+    assert count == 3, "expected the 3 duplicate copies to be sealed, got %d" % count
+    return plan, original, materialization, mutant, baseline_applied
+
+
+def test_r4_rewritten_write_in_while_false_is_refused_by_name():
+    """While(False) must refuse with the SAME named code as a dead If arm."""
+    plan, original, materialization, mutant, baseline_applied = _r4_loop_case("while", cond=False)
+    report = MAT.verify_plan_application(original, plan, mutant, materialization)
+    assert report["status"] == "FAIL", report
+    assert report["code"] == "PLAN_WRITE_UNREACHABLE", report
+    assert report["applied_accesses"] == 0, report
+    assert baseline_applied > 0
+
+
+def test_r4_rewritten_write_in_zero_trip_for_is_refused_by_name():
+    """The form the If-only repair missed: a write in a zero-trip counted loop."""
+    plan, original, materialization, mutant, baseline_applied = _r4_loop_case(
+        "for", start=0, stop=0, step=1)
+    report = MAT.verify_plan_application(original, plan, mutant, materialization)
+    assert report["status"] == "FAIL", report
+    # Named code, not the vague MATERIALIZATION_MAP_MISMATCH the architect observed.
+    assert report["code"] == "PLAN_WRITE_UNREACHABLE", report
+    assert report["applied_accesses"] == 0, report
+    assert baseline_applied > 0
+
+
+def test_r4_rewritten_write_in_reachable_loops_is_not_wrongly_dropped():
+    """POSITIVE control: While(True) and a running For must still count the write.
+
+    An unprovable trip count must never be assumed zero -- doing so would discard real
+    applied writes, the opposite failure and just as wrong.
+    """
+    plan = build_stage()
+    original = R3.make_tir_fixture()
+    rewritten, materialization = MAT.materialize_plan(original, plan)
+    baseline = MAT.verify_plan_application(original, plan, rewritten, materialization)
+    assert baseline["status"] == "PASS", baseline
+    baseline_applied = baseline["applied_accesses"]
+
+    recorded = {entry["new_fingerprint"] for entry in materialization.entries}
+    target = None
+    for _path, stmt in MAT.index_statements_ledger(rewritten).items():
+        if MAT.fingerprint(stmt) in recorded and isinstance(stmt, Evaluate):
+            target = stmt
+            break
+    assert target is not None
+
+    def _match(item):
+        return isinstance(item, Evaluate) and MAT.fingerprint(item) == MAT.fingerprint(target)
+
+    for kind, bounds in (
+        ("while", {"cond": True}),          # While(True): body always runs
+        ("for", {"start": 0, "stop": 4, "step": 1}),   # ascending, runs
+        ("for", {"start": 4, "stop": 0, "step": -1}),  # descending, runs
+        ("for", {"start": 0, "stop": 1, "step": 1}),   # single iteration
+    ):
+        mutant, _count = _wrap_in_loop(rewritten, _match, kind, **bounds)
+        report = MAT.verify_plan_application(original, plan, mutant, materialization)
+        assert report["status"] == "PASS", (kind, bounds, report)
+        assert report["applied_accesses"] == baseline_applied, (kind, bounds, report)
+
+
+def test_r4_loop_body_can_execute_matches_direct_measurement():
+    """The loop predicate itself, on the boundary cases a naive rule gets wrong."""
+    from tilefoundry.ir.core import Constant, Var
+    from tilefoundry.ir.tir.stmts import For, While
+    from tilefoundry.ir.types import make_tensor_type
+
+    int_type = make_tensor_type((), dtype="i32", storage="umat")
+    bool_type = make_tensor_type((), dtype="i1", storage="umat")
+
+    def k(value):
+        return Constant(value=value, type=int_type)
+
+    def alloy(start, stop, step):
+        return For(induction_var=Var(name="i", type=int_type), start=k(start), stop=k(stop),
+                   step=k(step), body=Sequential(body=()))
+
+    assert MAT._loop_body_can_execute(While(
+        cond=Constant(value=False, type=bool_type), body=Sequential(body=()))) is False
+    assert MAT._loop_body_can_execute(While(
+        cond=Constant(value=True, type=bool_type), body=Sequential(body=()))) is True
+    assert MAT._loop_body_can_execute(While(
+        cond=Var(name="rt", type=bool_type), body=Sequential(body=()))) is True
+
+    assert MAT._loop_body_can_execute(alloy(0, 4, 1)) is True
+    assert MAT._loop_body_can_execute(alloy(4, 0, -1)) is True     # descending runs
+    assert MAT._loop_body_can_execute(alloy(0, 1, 1)) is True      # one iteration
+    assert MAT._loop_body_can_execute(alloy(0, 0, 1)) is False     # empty
+    assert MAT._loop_body_can_execute(alloy(5, 2, 1)) is False     # empty ascending
+    assert MAT._loop_body_can_execute(alloy(2, 5, -1)) is False    # empty descending
+    assert MAT._loop_body_can_execute(alloy(0, 4, 0)) is False     # non-progressing
+
+    # A run-time bound cannot be shown empty, so the body stays reachable.
+    assert MAT._loop_body_can_execute(For(
+        induction_var=Var(name="i", type=int_type), start=k(0),
+        stop=Var(name="n", type=int_type), step=k(1),
+        body=Sequential(body=()))) is True
