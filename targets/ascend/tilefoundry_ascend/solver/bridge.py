@@ -190,6 +190,48 @@ def _is_loop_task(task, loop_id):
     return loop in (None, "", loop_id, "main_compute", "row_pipeline")
 
 
+#: Relation kinds that carry a buffer-version encoding instead of a logical distance.
+REUSE_KINDS = frozenset({"reuse", "buffer_reuse"})
+
+
+def encode_dependency_distance(distance, kind, buffer_root, buffer_index):
+    """The ONE reuse/version distance encoding shared by lowering and postcheck.
+
+    A reuse relation that names a buffer encodes the buffer-version relationship as a
+    negative value ``-buffer_index(root) - 1`` rather than a logical iteration distance.
+    Lowering and the S3 postcheck previously decided WHEN to apply that encoding with
+    different guards:
+
+      lower:      kind in REUSE_KINDS and buffer_root           -> always encode
+      postcheck:  distance < 0 and kind in REUSE_KINDS and buffer -> encode
+
+    So a source dependency that already says ``kind="reuse", buffer=<root>, distance=0``
+    was encoded as ``-index-1`` by lowering and left as ``0`` by the postcheck. The two
+    would then disagree bit-for-bit on the same source, which is a silent mismatch: it
+    either mis-refuses a legal schedule or hides a real one.
+
+    The rule below is the UNION-safe reading: an explicit reuse relation naming a buffer
+    defines the encoding unconditionally, and a negative distance is only ever legitimate
+    for exactly that case. Both callers now share this single definition, so they cannot
+    drift again.
+
+    Returns ``(encoded_distance, encoded?)``. Raises ValueError when a negative distance is
+    claimed by a relation that is not an explicit buffer reuse.
+    """
+    is_reuse_with_buffer = str(kind).lower() in REUSE_KINDS and buffer_root is not None
+    if is_reuse_with_buffer:
+        root = str(buffer_root)
+        if root not in buffer_index:
+            raise ValueError("reuse names unknown buffer: %r" % (root,))
+        return -int(buffer_index[root]) - 1, True
+    if int(distance) < 0:
+        raise ValueError(
+            "a negative distance is only a buffer-version encoding, but kind=%r buffer=%r"
+            % (kind, buffer_root)
+        )
+    return int(distance), False
+
+
 def lower_problem_to_request(problem, model_facts, solve_options) -> SolveRequest:
     """S1/S2: a real Problem -> the shared core's normalized argument set.
 
@@ -272,19 +314,23 @@ def lower_problem_to_request(problem, model_facts, solve_options) -> SolveReques
         distance = int(_get(dep, "distance", 0))
         kind = str(_get(dep, "kind", "RAW"))
         buffer_root = _get(dep, "buffer")
-        if distance < 0 and not (kind.lower() in ("reuse", "buffer_reuse") and buffer_root):
+        # The encoding rule lives in ONE place (encode_dependency_distance) so lowering and
+        # the S3 postcheck cannot disagree about when a reuse relation becomes a negative
+        # buffer-version encoding.
+        if (str(kind).lower() in REUSE_KINDS and buffer_root is not None
+                and str(buffer_root) not in buffer_index_map):
+            raise SolverError("SOLVER_INDEX_MAP_MISMATCH", "reuse names unknown buffer",
+                              str(buffer_root), list(buffer_index_map), buffer_root, phase="lower")
+        if distance < 0 and not (str(kind).lower() in REUSE_KINDS and buffer_root is not None):
             raise SolverError("SOLVER_INDEX_MAP_MISMATCH",
                               "a negative distance is only a buffer-version encoding",
                               "dep[%d]" % position, "explicit reuse + buffer", distance,
                               phase="lower")
-        if kind.lower() in ("reuse", "buffer_reuse") and buffer_root:
-            if str(buffer_root) not in buffer_index_map:
-                raise SolverError("SOLVER_INDEX_MAP_MISMATCH", "reuse names unknown buffer",
-                                  str(buffer_root), list(buffer_index_map), buffer_root, phase="lower")
-            encoded = -buffer_index_map[str(buffer_root)] - 1
+        distance, encoded_reuse = encode_dependency_distance(
+            distance, kind, buffer_root, buffer_index_map)
+        if encoded_reuse:
             trace_add("data_dep", str(_get(dep, "source_id", "dep%d" % position)),
                       "data_deps.distance", (producer, consumer), "buffer version encoding")
-            distance = encoded
         else:
             trace_add("data_dep", str(_get(dep, "source_id", "dep%d" % position)),
                       "data_deps.distance", (producer, consumer), "logical distance")
@@ -700,17 +746,22 @@ def _derive_source_expectation(problem, request) -> dict:
         distance = int(_get(dep, "distance", 0))
         kind = str(_get(dep, "kind", "RAW")).lower()
         buffer_root = _get(dep, "buffer", None)
-        if distance < 0:
-            if not (kind in ("reuse", "buffer_reuse") and buffer_root):
-                raise SolverError(POSTCHECK_SOURCE_MISMATCH,
-                                  "a negative distance is only a buffer-version encoding",
-                                  source_id, "explicit reuse + buffer", distance,
-                                  phase="postcheck")
-            if str(buffer_root) not in buffer_index:
-                raise SolverError(POSTCHECK_SOURCE_MISMATCH,
-                                  "reuse names an unknown buffer", source_id,
-                                  roots, buffer_root, phase="postcheck")
-            distance = -buffer_index[str(buffer_root)] - 1
+        # Re-encoded here from the SOURCE relation, independently of what lowering did -- but
+        # using the SAME rule as lowering (encode_dependency_distance). Previously this branch
+        # was guarded by `distance < 0`, while lowering encoded unconditionally for an explicit
+        # reuse + buffer. A source dep with kind=reuse, buffer=<root>, distance=0 was therefore
+        # encoded as -index-1 by lowering and left as 0 here: the postcheck rejected its own
+        # lowering (DEPENDENCY_VIOLATED), a self-inconsistency rather than a model defect.
+        if str(buffer_root) not in buffer_index and str(kind) in REUSE_KINDS and buffer_root is not None:
+            raise SolverError(POSTCHECK_SOURCE_MISMATCH,
+                              "reuse names an unknown buffer", source_id,
+                              roots, buffer_root, phase="postcheck")
+        if distance < 0 and not (kind in REUSE_KINDS and buffer_root is not None):
+            raise SolverError(POSTCHECK_SOURCE_MISMATCH,
+                              "a negative distance is only a buffer-version encoding",
+                              source_id, "explicit reuse + buffer", distance,
+                              phase="postcheck")
+        distance, _encoded = encode_dependency_distance(distance, kind, buffer_root, buffer_index)
         latency = _get(dep, "latency", None)
         latency = int(latency) if latency is not None else latencies[producer]
         data_deps.append((producer, consumer, distance, latency, source_id))
