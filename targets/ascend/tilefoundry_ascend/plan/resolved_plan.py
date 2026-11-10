@@ -699,3 +699,24 @@ def address_range(plan: ResolvedPlan, access: AccessPlan, env: dict):
 
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
+
+
+# ------------------------------------------------------------ structured L (/2)
+# D6: the structured layer is an increment on THIS authority, not a parallel framework.
+# The tree and the single-region lift live in `unit_tree` and are re-exported here so that
+# consumers keep importing one place. §5 step 1 stops at structure + one-region lift; the
+# /2 plan, hierarchical S and structured R/C are later steps.
+from .unit_tree import (  # noqa: E402  (deliberate: keeps one public import surface)
+    KIND_DMA as UNIT_KIND_DMA,
+    KIND_IF as UNIT_KIND_IF,
+    KIND_LOOP as UNIT_KIND_LOOP,
+    KIND_VF as UNIT_KIND_VF,
+    SCHEMA as UNIT_TREE_SCHEMA,
+    RegionLift,
+    RegionTaskBinding,
+    Unit,
+    UnitTree,
+    UnitTreeError,
+    build_unit_tree,
+    lift_region,
+)
