@@ -73,12 +73,17 @@ class UnitTreeError(RuntimeError):
 # --------------------------------------------------------------------------- records
 @dataclass(frozen=True)
 class Unit:
-    """One node of the structure. A control unit has children; a leaf has actions."""
+    """One node of the structure. A control unit has children; a leaf has actions.
+
+    There is deliberately NO parent pointer: a unit's owning region is found through
+    `UnitTree.regions` (`Region.direct_child_ids`), which is the single source of the child
+    lists (D3). A parent field would be a second, always-derivable copy of that relation,
+    and an unused one invites wrong assumptions.
+    """
 
     unit_id: str
     kind: str
     source_order: int
-    parent_id: Optional[str]
     leaf_action_ids: tuple = ()
     child_ids: tuple = ()
     loop_var: Optional[str] = None
@@ -278,7 +283,7 @@ class _Builder:
                                    direct_child_ids=tuple(child_ids), loop_var=var,
                                    loop_domain=domain)
         return self._add(Unit(unit_id=uid, kind=KIND_LOOP, source_order=self._take_order(),
-                              parent_id=None, child_ids=tuple(child_ids), loop_var=var,
+                              child_ids=tuple(child_ids), loop_var=var,
                               loop_domain=domain, tir_node="For",
                               ledger_path=_join(own_path)))
 
@@ -295,7 +300,7 @@ class _Builder:
                 direct_child_ids=tuple(kid))
             child_ids.extend(kid)
         return self._add(Unit(unit_id=uid, kind=KIND_IF, source_order=self._take_order(),
-                              parent_id=None, child_ids=tuple(child_ids), tir_node="If",
+                              child_ids=tuple(child_ids), tir_node="If",
                               ledger_path=_join(own_path)))
 
     def _vf_leaf(self, stmt, own_path):
@@ -310,7 +315,7 @@ class _Builder:
         for aid in action_ids:
             self.action_to_unit[aid] = uid
         return self._add(Unit(unit_id=uid, kind=KIND_VF, source_order=self._take_order(),
-                              parent_id=None, leaf_action_ids=action_ids,
+                              leaf_action_ids=action_ids,
                               scope_path=scope, tir_node="ExecutionScope",
                               ledger_path=_join(own_path)))
 
@@ -326,7 +331,7 @@ class _Builder:
         for aid in action_ids:
             self.action_to_unit[aid] = uid
         return self._add(Unit(unit_id=uid, kind=KIND_DMA, source_order=self._take_order(),
-                              parent_id=None, leaf_action_ids=action_ids,
+                              leaf_action_ids=action_ids,
                               tir_node="Evaluate", ledger_path=path))
 
     # -- checks ------------------------------------------------------------
@@ -363,14 +368,25 @@ def _uid(own_path, kind):
 
 
 def _describe_mesh(stmt):
-    """Mesh participants, read from the node itself rather than from a name in the path."""
+    """Mesh participants, read from the node itself rather than from a name in the path.
+
+    The core count is recorded explicitly: later AssignCore / C work needs the participant
+    fan-out, and re-deriving it from a topology name would be guessing.
+    """
     mesh = getattr(stmt, "mesh", None)
     if mesh is None:
         return None
-    topo = getattr(mesh, "topologies", None)
+    topo = list(getattr(mesh, "topologies", None) or ())
     names = getattr(mesh, "names", None)
-    return {"topologies": [getattr(t, "name", None) for t in topo] if topo else None,
-            "names": list(names) if names else None}
+    layout = getattr(mesh, "layout", None)
+    shape = getattr(layout, "shape", None) if layout is not None else None
+    return {
+        "topologies": [{"name": getattr(t, "name", None),
+                        "size": getattr(t, "size", None)} for t in topo] or None,
+        "names": list(names) if names else None,
+        "layout_shape": [list(s) if isinstance(s, tuple) else s for s in shape]
+        if shape else None,
+    }
 
 
 def _whole_vf_tasks(ledger):
@@ -415,9 +431,19 @@ class RegionTaskBinding:
 class RegionLift:
     """A single region projected from the flat Problem, still carrying source identity.
 
-    `optimisation_variable_count` is the number of DISTINCT leaf units the region schedules
-    (vadd: 4, not the 8 instruction tasks). `source_task_count` is unchanged, so no source
-    obligation is lost and none is invented.
+    TWO DIFFERENT SETS, do not confuse them:
+
+    * `unit_ids` / `optimised_variable_ids` — the region's DIRECT CHILD UNITS, i.e. what a
+      local solve of this region actually schedules. vadd's loop body: 4 (LoadX, LoadZ,
+      WholeVF, StoreY). This is the small n.
+    * `task_bindings` — a WHOLE-TREE binding: every flat Problem task, mapped to the leaf
+      unit that owns its actions. It is NOT the region's task list, and it is not limited to
+      this region. decode_dyn has 978 bindings regardless of which region you lift.
+
+    That asymmetry is deliberate. The bindings exist so no source obligation is lost while
+    the region's variable set shrinks (D2/D7), and so later steps can project edges by
+    looking up a task's owning unit. A reader who mistakes `task_bindings` for the region's
+    workload would badly underestimate what step 2 has to project.
     """
 
     schema: str
@@ -461,7 +487,6 @@ def lift_region(tree: UnitTree, problem, region_id) -> RegionLift:
                             region_id, "an existing region", None)
     tasks_in = list(getattr(problem, "tasks", ()) or ())
     accesses_in = list(getattr(problem, "accesses", ()) or ())
-    child_units = set(region.direct_child_ids)
 
     bindings = []
     for task in tasks_in:

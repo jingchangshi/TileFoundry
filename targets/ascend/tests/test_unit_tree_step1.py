@@ -11,6 +11,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 HERE = Path(__file__).resolve()
 REPO = HERE.parents[3]
 sys.path.insert(0, str(REPO / "src"))
@@ -240,10 +242,197 @@ def test_lift_refuses_an_unknown_region():
         raise AssertionError("an unknown region must be refused, not silently accepted")
 
 
+def test_mesh_participants_are_recorded_not_dropped():
+    """Mesh is transparent as a UNIT, but its participants must not be lost.
+
+    AssignCore and C need the core fan-out; dropping it while collapsing MeshScope into the
+    root region would be a silent information loss.
+    """
+    tree, _, _ = _decode()
+    scopes = tree.mesh.get("scopes")
+    assert scopes, "the MeshScope must be recorded in UnitTree.mesh"
+    topologies = scopes[0]["display"]["topologies"]
+    assert [t["name"] for t in topologies] == ["aiv"]
+    assert topologies[0]["size"] == 56, "the AIV core count must survive"
+    assert scopes[0]["display"]["names"] == ["core"]
+
+
+@pytest.mark.skip(reason=(
+    "UNEXERCISED PATH: the If/Branch handling in unit_tree._if() has never run against a "
+    "real fixture. All five fixtures used here finalize to TIR with zero If nodes "
+    "(measured: vadd=0, decode_dyn=0, prefill_dyn=0, decode_recompute=0, "
+    "prefill_recompute=0), so the branch code is present but unproven. If you change _if(), "
+    "this test cannot tell you whether you broke it. Build a fixture that finalizes to a "
+    "real If (or reach the branch through an existing RMSNorm path) before claiming If "
+    "support."))
+def test_if_branch_is_unexercised():
+    """Deliberately skipped: records that If support is NOT verified, not that it works.
+
+    The five fixtures measured here contain no If node after finalize, so nothing has ever
+    entered `_if()`. This is a marker, not a green light.
+    """
+    raise AssertionError("unreachable: the marker test must stay skipped")
+
+
+def test_all_fixtures_really_have_no_if_node():
+    """The premise behind the skip above, asserted rather than assumed.
+
+    If a future fixture change introduces an If, this test goes red and the skip reason
+    becomes false -- which is exactly what should happen.
+    """
+    for name, fixture in (("vadd", VADD), ("decode_dyn", DECODE), ("prefill_dyn", PREFILL)):
+        _, function, _ = _load(fixture)
+        assert _count_nodes(function.body).get("If", 0) == 0, (
+            "%s now finalizes with an If node; the If path is no longer unexercised and "
+            "test_if_branch_is_unexercised must be replaced with a real test" % name)
+
+
+def _count_nodes(stmt, counts=None):
+    """Every TIR node reachable from `stmt`, by type name."""
+    counts = {} if counts is None else counts
+    counts[type(stmt).__name__] = counts.get(type(stmt).__name__, 0) + 1
+    for attr in ("body", "then_body", "else_body"):
+        value = getattr(stmt, attr, None)
+        if value is None:
+            continue
+        for child in (value if isinstance(value, (list, tuple)) else [value]):
+            _count_nodes(child, counts)
+    return counts
+
+
+# ------------------------------------------- pinned constants (anti-drift)
+# These are MEASURED values, not `len(problem.tasks)` comparisons. A relative comparison
+# passes even when a fixture change moves both sides together; a literal reds immediately.
+DECODE_ENTRIES = 2476
+DECODE_TASKS = 978
+DECODE_ACCESSES = 2476
+DECODE_DEPENDENCIES = 32207
+
+
+def test_decode_inventory_constants_are_pinned():
+    """Anti-drift: 978 tasks / 2476 entries / 32207 deps must not move silently."""
+    _, ledger, problem = _decode()
+    assert len(ledger.entries) == DECODE_ENTRIES
+    assert len(problem.tasks) == DECODE_TASKS
+    assert len(problem.accesses) == DECODE_ACCESSES
+    assert len(problem.dependencies) == DECODE_DEPENDENCIES
+
+
+def test_decode_row_body_splits_into_64_loadx_and_64_storey():
+    """Whole-VF shrinking must NOT merge the 64 independent DMA leaves.
+
+    If someone ever collapses the row-body loads or stores into one unit to make n look
+    small, this goes red. That is the "secretly merge to hit a number" guard.
+    """
+    tree, ledger, _ = _decode()
+    entries = {e.action_id: e for e in ledger.entries}
+    loop = tree.loop_units()[0]
+    body = tree.region_children(loop.unit_id)
+    dma = [u for u in body if u.kind == KIND_DMA]
+    assert len(dma) == 128
+
+    loads = stores = 0
+    for unit in dma:
+        ops = {entries[aid].op for aid in unit.leaf_action_ids}
+        if ops == {"GmToUb"}:
+            loads += 1
+        elif ops == {"copy"}:
+            stores += 1
+        else:
+            raise AssertionError("unexpected row-body DMA leaf ops: %s" % sorted(ops))
+    assert (loads, stores) == (64, 64), (loads, stores)
+
+
+# ------------------------------------------------- cross-region edges (step-2 guard)
+CROSS_REGION_EDGES = 64
+
+
+def test_decode_cross_region_edges_are_exactly_64_raw_weight_to_main_vf():
+    """The W live-out hand-off: 64 root weight-VF leaves -> the row-layer MainVF, all RAW.
+
+    WHY THIS EXISTS NOW
+    -------------------
+    Step 2 projects edges per D4 ("only edges through the interface"). The tempting
+    filter -- keep edges whose BOTH endpoints are in this region -- silently drops exactly
+    these 64. C would then still say VERIFIED while W was never synchronised: the same
+    class of false positive as the flag_id one. vadd has ZERO cross-region edges, so
+    decode_dyn is the only fixture that can catch it.
+    """
+    tree, _, problem = _decode()
+
+    def region_of(unit_id):
+        for region_id, region in tree.regions.items():
+            if unit_id in region.direct_child_ids:
+                return region_id
+        return None
+
+    cross = []
+    for dep in problem.dependencies:
+        producer = tree.action_to_unit.get(dep["producer"])
+        consumer = tree.action_to_unit.get(dep["consumer"])
+        if producer is None or consumer is None:
+            continue
+        if region_of(producer) != region_of(consumer):
+            cross.append(dep)
+
+    assert len(cross) == CROSS_REGION_EDGES, (
+        "expected %d cross-region edges, got %d; if an edge projection drops these, "
+        "W is unsynchronised and C can still pass" % (CROSS_REGION_EDGES, len(cross)))
+    assert {dep["kind"] for dep in cross} == {"RAW"}, {dep["kind"] for dep in cross}
+
+    loop = tree.loop_units()[0]
+    main_vf = [u for u in tree.region_children(loop.unit_id) if u.kind == KIND_VF]
+    assert len(main_vf) == 1
+    main_vf_id = main_vf[0].unit_id
+
+    for dep in cross:
+        consumer = tree.action_to_unit[dep["consumer"]]
+        producer = tree.action_to_unit[dep["producer"]]
+        assert consumer == main_vf_id, "every cross-region edge must land on the MainVF"
+        assert region_of(producer) == "root"
+        assert tree.unit(producer).kind == KIND_VF, "producers are the 64 weight VFs"
+
+
+def test_vadd_has_no_cross_region_edges():
+    """Why decode, not vadd, is the regression fixture: vadd cannot show this class at all."""
+    tree, _, problem = _vadd()
+
+    def region_of(unit_id):
+        for region_id, region in tree.regions.items():
+            if unit_id in region.direct_child_ids:
+                return region_id
+        return None
+
+    cross = [dep for dep in problem.dependencies
+             if tree.action_to_unit.get(dep["producer"]) is not None
+             and tree.action_to_unit.get(dep["consumer"]) is not None
+             and region_of(tree.action_to_unit[dep["producer"]])
+             != region_of(tree.action_to_unit[dep["consumer"]])]
+    assert cross == [], "vadd is expected to have no cross-region edges"
+
+
+def test_task_bindings_cover_the_whole_tree_not_just_one_region():
+    """Guard the docstring claim: lift's bindings are whole-tree, not the region's tasks."""
+    tree, _, problem = _decode()
+    loop = tree.loop_units()[0]
+    row = lift_region(tree, problem, loop.unit_id)
+    root = lift_region(tree, problem, "root")
+    assert len(row.task_bindings) == DECODE_TASKS
+    assert len(root.task_bindings) == DECODE_TASKS
+    assert len(row.optimised_variable_ids) == 129   # the region's small n
+    assert len(row.task_bindings) != len(row.optimised_variable_ids)
+
+
 def main():
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     failures = []
+    skipped = []
     for test in tests:
+        marker = getattr(test, "pytestmark", None) or getattr(test, "__pytestmark__", None)
+        if marker and any(getattr(m, "name", "") == "skip" for m in _as_list(marker)):
+            skipped.append(test.__name__)
+            print("skip %s" % test.__name__)
+            continue
         try:
             test()
         except Exception as exc:  # noqa: BLE001 - report and continue
@@ -251,8 +440,13 @@ def main():
             print("FAIL %s: %s" % (test.__name__, exc))
         else:
             print("ok   %s" % test.__name__)
-    print("\n%d passed, %d failed" % (len(tests) - len(failures), len(failures)))
+    print("\n%d passed, %d skipped, %d failed"
+          % (len(tests) - len(failures) - len(skipped), len(skipped), len(failures)))
     return 1 if failures else 0
+
+
+def _as_list(value):
+    return value if isinstance(value, (list, tuple)) else [value]
 
 
 if __name__ == "__main__":
