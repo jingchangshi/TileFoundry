@@ -14,26 +14,37 @@ from __future__ import annotations
 from . import core
 
 
-def tf_adapter(latencies, iis, resource_flags, data_deps, resource_deps,
-               owner_exclusion_deps=None, pipe_order_deps=None):
-    """TF-side adapter: accepts plain Python lists, calls the shared core."""
+def _straight_call(latencies, iis, resource_flags, data_deps, resource_deps,
+                   owner_exclusion_deps, pipe_order_deps, solve_timeout_ms):
+    """ONE physical call site for both straight-line adapters.
+
+    Keeping the two adapters on one call site is what makes "shared core" checkable: if
+    this were duplicated, TF and TL could drift into different argument handling while
+    still claiming to share the file.
+    """
     return core.z3_schedule_python(
         list(latencies), list(iis), list(resource_flags),
         [tuple(x) for x in data_deps], [tuple(x) for x in resource_deps],
         owner_exclusion_deps=[tuple(x) for x in (owner_exclusion_deps or [])] or None,
         pipe_order_deps=[tuple(x) for x in (pipe_order_deps or [])] or None,
+        solve_timeout_ms=solve_timeout_ms,
     )
+
+
+def tf_adapter(latencies, iis, resource_flags, data_deps, resource_deps,
+               owner_exclusion_deps=None, pipe_order_deps=None,
+               solve_timeout_ms=None):
+    """TF-side adapter: accepts plain Python lists, calls the shared core."""
+    return _straight_call(latencies, iis, resource_flags, data_deps, resource_deps,
+                          owner_exclusion_deps, pipe_order_deps, solve_timeout_ms)
 
 
 def tl_adapter(latencies, iis, resource_flags, data_deps, resource_deps,
-               owner_exclusion_deps=None, pipe_order_deps=None):
+               owner_exclusion_deps=None, pipe_order_deps=None,
+               solve_timeout_ms=None):
     """TileLang-side adapter: same physical core, same argument surface."""
-    return core.z3_schedule_python(
-        list(latencies), list(iis), list(resource_flags),
-        [tuple(x) for x in data_deps], [tuple(x) for x in resource_deps],
-        owner_exclusion_deps=[tuple(x) for x in (owner_exclusion_deps or [])] or None,
-        pipe_order_deps=[tuple(x) for x in (pipe_order_deps or [])] or None,
-    )
+    return _straight_call(latencies, iis, resource_flags, data_deps, resource_deps,
+                          owner_exclusion_deps, pipe_order_deps, solve_timeout_ms)
 
 
 def _loop_call(core_args: dict, *, return_status: bool = True):

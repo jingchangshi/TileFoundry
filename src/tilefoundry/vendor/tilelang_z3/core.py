@@ -51,6 +51,7 @@ def z3_schedule_python(
     owner_exclusion_deps: list[tuple[int, int, int, int]] | None = None,
     pipe_order_deps: list[tuple[int, int]] | None = None,
     verbose: bool = False,
+    solve_timeout_ms: int | None = None,
 ) -> tuple[list[int], list[int]]:
     """Schedule a straight-line task list.
 
@@ -112,6 +113,11 @@ def z3_schedule_python(
     # Create Z3 solver
     solver = z3.Optimize(ctx=ctx)
     solver.set("rlimit", 1000000)
+    # Bounded solve (Path B). rlimit counts resources, not seconds, so without this a
+    # pathological input can run effectively forever. This is the STRAIGHT-LINE path; the
+    # loop path takes the same knob. Left unbounded when the caller passes None.
+    if solve_timeout_ms is not None:
+        solver.set("timeout", int(solve_timeout_ms))
 
     # Create start time variables
     start_vars = [z3.Int(f"start_{i}", ctx) for i in range(n)]
@@ -170,7 +176,8 @@ def z3_schedule_python(
     # Check satisfiability
     if verbose:
         print("[Python Z3] Checking satisfiability...")
-    if solver.check() == z3.sat:
+    verdict = solver.check()
+    if verdict == z3.sat:
         model = solver.model()
 
         # Extract start times
@@ -198,8 +205,11 @@ def z3_schedule_python(
                 )
 
         return start_times, task_indices
-    else:
-        raise RuntimeError("Z3 scheduling failed: solver returned unsat")
+    if verdict == z3.unknown:
+        # An undecided Optimize solve is NOT "unsat"; reporting it as such would fabricate
+        # a refutation. This distinction matters because a timed-out solve lands here.
+        raise RuntimeError("Z3 scheduling failed: solver returned unknown")
+    raise RuntimeError("Z3 scheduling failed: solver returned unsat")
 
 
 # FFI-exposed function that matches C++ interface
@@ -225,6 +235,8 @@ def z3_schedule_loop_python(
     verbose: bool = False,
     fixed_buffer_versions: list[int | None] | None = None,
     return_status: bool = False,
+    solve_timeout_ms: int | None = None,
+    allow_fallback_on_unknown: bool = False,
 ) -> tuple[list[int], list[int], int] | dict:
     """Schedule a loop body with modulo, stage, and storage constraints.
 
@@ -351,6 +363,9 @@ def z3_schedule_loop_python(
     best_model = None
     best_start_vars = None
     check_results: list[str] = []
+    # Which II check was undecided, if any. Keeps "we ran out of decision budget"
+    # distinguishable from "we proved every candidate infeasible".
+    unknown_at_ii: int | None = None
 
     if verbose:
         print(f"[Python Z3 Loop] Binary search range: [{ii_lower}, {ii_upper})")
@@ -365,6 +380,12 @@ def z3_schedule_loop_python(
         if seed is not None:
             solver.set("random_seed", seed)
         solver.set("rlimit", 1000000)
+        # A wall-clock timeout on EVERY II check. rlimit alone is resource-counted and
+        # has no relation to elapsed time, so a single pathological check could run for
+        # tens of minutes (measured: n=768 needs 949 s). With a timeout the solver
+        # returns unknown instead of running away, and the caller decides what that means.
+        if solve_timeout_ms is not None:
+            solver.set("timeout", int(solve_timeout_ms))
 
         k_vars = [z3.Int(f"k_{i}", ctx) for i in range(n)]
         r_vars = [z3.Int(f"r_{i}", ctx) for i in range(n)]
@@ -480,9 +501,15 @@ def z3_schedule_loop_python(
         res = solver.check()
         check_results.append(str(res))
         if res == z3.unknown:
-            # WBS 04-08: an undecided solver must NOT be silently converted into
-            # an "infeasible" II and then into a fallback schedule.
-            raise RuntimeError("Z3 scheduling failed: solver returned unknown")
+            # WBS 04-08: an undecided solver must NOT be SILENTLY converted into an
+            # "infeasible" II and hence into a fallback schedule. That rule is kept.
+            # What this flag adds is a NON-SILENT conversion: the caller must opt in by
+            # passing allow_fallback_on_unknown=True, and the returned status is
+            # "unknown" (NOT "sat" and NOT "fallback"), so the degradation is labelled.
+            if not allow_fallback_on_unknown:
+                raise RuntimeError("Z3 scheduling failed: solver returned unknown")
+            unknown_at_ii = ii_mid
+            break
         if res == z3.sat:
             if verbose:
                 print(f"[Python Z3 Loop] II = {ii_mid} is feasible")
@@ -500,7 +527,15 @@ def z3_schedule_loop_python(
             ii_lower = ii_mid + 1
 
     if best_model is None:
-        # Only a sequence of UNSAT results may reach the explicit serial fallback.
+        # Reaching here means no II candidate produced a model. Two very different
+        # situations land here, and they must not be reported as the same thing:
+        #   * every candidate was UNSAT  -> the search really was exhausted;
+        #   * some candidate was UNKNOWN -> the solver ran out of budget and we simply
+        #     do not know. This is NOT a proof of infeasibility.
+        # Reaching the serial fallback no longer implies every candidate was UNSAT: with
+        # allow_fallback_on_unknown an undecided check also lands here. The returned
+        # status distinguishes the two (see the return_status block at the end of this
+        # function); the schedule below is the same serial answer either way.
         if manual_schedule:
             raise RuntimeError(
                 "Manual schedule constraints are infeasible; check per-pipe source order, T.Stage values, dependencies, and resource usage"
@@ -747,18 +782,35 @@ def z3_schedule_loop_python(
             print(f"[Python Z3 Loop] Warning: Failed to save schedule visualization: {e}")
 
     if return_status:
-        # WBS 04-08: the four solver states must stay DISTINCT. "fallback" here is
-        # the core's own explicit serial schedule after every II candidate was UNSAT;
-        # it is NEVER reported as sat/solved.
-        state = "sat" if best_model is not None else "fallback"
+        # WBS 04-08: the four solver states must stay DISTINCT.
+        #   sat      -- a real model was found and its II is the minimal feasible one
+        #   fallback -- every candidate was UNSAT; the serial schedule is a PROVEN
+        #               non-pipelined answer
+        #   unknown  -- the solver ran out of budget at some II. We do NOT know whether
+        #               that II was feasible, so this is NOT a proof and MUST NOT be
+        #               reported as fallback (which would claim exhaustion).
+        if best_model is not None:
+            state = "sat"
+            reason = None
+        elif unknown_at_ii is not None:
+            state = "unknown"
+            reason = ("solver returned unknown at II=%d (timeout/rlimit budget); "
+                      "later candidates were not all decided, so feasibility is NOT refuted"
+                      % unknown_at_ii)
+        else:
+            state = "fallback"
+            reason = "all tested II candidates were unsat; core returned its explicit serial schedule"
         return {
             "status": state,
             "start_times": start_times,
             "buffer_versions": buffer_versions,
             "minimal_II": best_ii,
             "check_results": check_results,
-            "fallback_reason": None if state == "sat" else
-                "all tested II candidates were unsat; core returned its explicit serial schedule",
+            "fallback_reason": reason,
+            "unknown_at_ii": unknown_at_ii,
+            # An unknown result never exhausts the search space, so it must never be
+            # promoted to UNSAT downstream.
+            "search_scope_complete": state in ("sat", "fallback"),
         }
     return start_times, buffer_versions, best_ii
 

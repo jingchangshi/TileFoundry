@@ -197,8 +197,12 @@ def test_shared_encoder_refuses_inconsistent_input():
 # The default path must not drift.
 # --------------------------------------------------------------------------------------
 
-def test_default_path_result_digest_is_unchanged():
-    """The published default-path digest must not move: this repair changes no baseline."""
+def test_default_path_behaviour_is_unchanged():
+    """The default path must behave exactly as at 0d69b8f (semantic fingerprint).
+
+    See the comment on S3.S02_SEMANTIC_FINGERPRINT_BEFORE_S3: Path B edited core.py, so
+    the raw digest (which folds in core_source_hash) moved by construction; the semantic
+    output did not.
+    """
     result = B.solve_real_problem(S3.S02_PROBLEM, S3.S02_MODEL, S3.S02_OPTIONS)
-    assert result.result_digest == S3.S02_RESULT_DIGEST_BEFORE_S3, (
-        result.result_digest, S3.S02_RESULT_DIGEST_BEFORE_S3)
+    S3._assert_semantic_fingerprint(result)

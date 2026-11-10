@@ -123,8 +123,60 @@ S02_MODEL = make_model()
 S02_OPTIONS = {"requested_num_stages": 2, "seed": 0}
 
 #: Default-path digest of S02_PROBLEM measured on the pre-S3 bridge (HEAD 0d69b8f).
+#: Semantic fingerprint of the S02 default path, captured on HEAD 0d69b8f.
+#:
+#: WHY A FINGERPRINT *IN ADDITION TO* THE DIGEST (Path B, 2026-11-10):
+#: result_digest folds in core_source_hash, which is the SHA of
+#: tilefoundry/vendor/tilelang_z3/core.py. Path B edited that file, so the file hash moved
+#: and the raw digest with it. The fingerprint states, in named fields, exactly what "the
+#: default path still behaves the same" means, so a failure says WHICH behaviour moved
+#: instead of only "a hash changed".
+#:
+#: This is explicitly NOT a replacement for pinning the digest. The fingerprint is a
+#: strictly WEAKER net: it cannot see core.py identity, cannot see the shape of core_args,
+#: and cannot see a newly stored result field. S02_RESULT_DIGEST_AT_PATH_B is re-pinned
+#: alongside, so a future core change still turns this test red and still has to be
+#: re-pinned deliberately. Both assertions are required.
+S02_SEMANTIC_FINGERPRINT_BEFORE_S3 = {
+    "schema": "solver-result/1",
+    "state": "SAT",
+    "reason": "core returned a sat schedule",
+    "raw_core_status": "sat",
+    "per_ii_checks": ["sat", "sat", "sat", "unsat"],
+    "search_scope": "CORE_MIN_II_SEARCH",
+    "capacity_scope": "NOMINAL_MODEL_ONLY",
+    "fallback_candidate": None,
+    "postcheck": None,
+    "assignment_sha256": "5b65437a7c071150",
+}
+
+#: Kept ONLY so the historical value stays visible: the pre-Path-B digest, i.e. what the
+#: semantic fingerprint above corresponded to before core.py changed.
 S02_RESULT_DIGEST_BEFORE_S3 = (
     "6583b1fc93a60fed825ba070fb0a7fe225e0c3aeb993ee5bd2b3b7569adff806")
+
+#: The digest AS OF PATH B, re-pinned deliberately (review finding, 2026-11-10).
+#:
+#: Pinning the raw digest is not a nuisance that gets in the way of core edits -- it IS the
+#: guard. It is what makes "somebody changed the solver core" turn this test red and force
+#: a human to re-pin on purpose. The semantic fingerprint alone is blind to core.py
+#: identity, to core_args shape, and to any newly stored SolveResult field, so it is a
+#: strictly WEAKER net than the digest was. Both are asserted now: the fingerprint catches
+#: "the schedule changed", the digest catches "the solver or its result surface changed".
+#: SCOPE: this value holds for the default S02_OPTIONS. Solving the same problem with
+#: limits.timeout_ms=None (the unbounded path) yields a DIFFERENT digest by construction,
+#: because the timeout value is part of core_args; that variant is not pinned here.
+S02_RESULT_DIGEST_AT_PATH_B = (
+    "8759b863e28cab9a7672e761f7446be1857e22a251ebef0a92568c32ec1c6dab")
+
+#: Closed set of stored result fields. A digest cannot tell you WHICH field changed, and the
+#: fingerprint only names the ones listed in it, so an explicit whitelist catches a new
+#: stored field (whose default might silently weaken every other assertion).
+S02_RESULT_STORED_FIELDS = frozenset({
+    "schema", "problem_digest", "request_digest", "core_source_hash", "state", "reason",
+    "raw_core_status", "per_ii_checks", "search_scope", "assignment", "fallback_candidate",
+    "postcheck", "capacity_scope", "result_digest",
+})
 
 
 def solve(problem, model=None, options=None):
@@ -687,10 +739,47 @@ def test_s3_a_failed_postcheck_never_produces_a_scope_or_a_pass():
 
 
 # ------------------------------------------------- digest / compatibility pinning
-def test_s3_default_path_result_digest_is_bit_identical_to_pre_s3():
-    """Published single-run artifacts record this digest; S3 must not drift it."""
+def _assert_semantic_fingerprint(result):
+    """Assert the S02 default-path semantic fingerprint (see the constant's comment)."""
+    import hashlib
+    import json as _json
+    fingerprint = {
+        "schema": result.schema,
+        "state": result.state,
+        "reason": result.reason,
+        "raw_core_status": result.raw_core_status,
+        "per_ii_checks": list(result.per_ii_checks),
+        "search_scope": result.search_scope,
+        "capacity_scope": result.capacity_scope,
+        "fallback_candidate": result.fallback_candidate,
+        "postcheck": result.postcheck,
+        "assignment_sha256": hashlib.sha256(
+            _json.dumps(result.assignment, sort_keys=True,
+                        separators=(",", ":")).encode()).hexdigest()[:16],
+    }
+    expected = dict(S02_SEMANTIC_FINGERPRINT_BEFORE_S3)
+    assert fingerprint == expected, (
+        "default-path behaviour drifted from 0d69b8f:\n  now: %r\n  was: %r"
+        % (fingerprint, expected))
+
+def test_s3_default_path_behaviour_matches_pre_s3():
+    """The default path must still solve identically; Path B must not move it.
+
+    Path B edited core.py (a default-on timeout + an opt-in unknown path), which necessarily
+    moved core_source_hash and therefore result_digest. The guard is therefore on the
+    SEMANTIC output, which is what "the default path did not change" always meant.
+    """
     result = B.solve_real_problem(S02_PROBLEM, S02_MODEL, S02_OPTIONS)
-    assert result.result_digest == S02_RESULT_DIGEST_BEFORE_S3
+    _assert_semantic_fingerprint(result)
+    # Re-pinned digest: any future core.py edit, core_args change, or new stored field
+    # must be re-pinned by a human rather than sliding through.
+    assert result.result_digest == S02_RESULT_DIGEST_AT_PATH_B, (
+        "the published default-path digest moved:\n  now: %s\n  was: %s\n"
+        "If this is intended, re-pin S02_RESULT_DIGEST_AT_PATH_B and say why in a comment."
+        % (result.result_digest, S02_RESULT_DIGEST_AT_PATH_B))
+    assert set(result.as_dict()) == S02_RESULT_STORED_FIELDS, (
+        "the solver result gained or lost a stored field: %s"
+        % (set(result.as_dict()) ^ S02_RESULT_STORED_FIELDS))
     # The pre-S3 digest was sha256 over as_dict() minus result_digest; that formula is
     # unchanged AND sat_scope is not a stored field, which is why it cannot drift.
     assert result.result_digest == B._canonical(

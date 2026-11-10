@@ -232,6 +232,37 @@ def encode_dependency_distance(distance, kind, buffer_root, buffer_index):
     return int(distance), False
 
 
+#: Default wall-clock budget for ONE II feasibility check, in milliseconds.
+#:
+#: Chosen from the measured scaling curve (all-same-pipe synthetic loop body, CPU):
+#:     n=16 -> 0.4 s   n=128 -> 19.7 s   n=384 -> 224 s
+#:     n=256 -> 90 s   n=512 -> 410 s    n=768 -> 949 s    n=978 -> >1500 s (killed)
+#: 60 s leaves every real case (which solve in well under a second at their actual n)
+#: completely unaffected, while cutting the pathological tail short instead of hanging.
+#: Overridable per solve via solve_options["limits"]["timeout_ms"]; None disables it.
+DEFAULT_SOLVE_TIMEOUT_MS = 60_000
+
+
+def _timeout_ms(solve_options) -> int | None:
+    """Resolve the per-check z3 timeout in milliseconds.
+
+    The default is ON. A timeout that only applies when the caller remembers to ask for
+    it would not actually bound anything -- the uncontrolled case is precisely the one
+    nobody opted into. Passing solve_options["limits"]["timeout_ms"] = None disables it
+    explicitly, which keeps the pre-Path-B unbounded behaviour reachable for anyone who
+    needs to reproduce an old measurement.
+
+    Note: this value enters core_args and therefore request_digest. That is fine and
+    expected -- the digest guard pins the SEMANTIC default-path output (see
+    test_solver_bridge_s3.S02_SEMANTIC_FINGERPRINT_BEFORE_S3), not the shape of core_args.
+    """
+    limits = (solve_options or {}).get("limits")
+    if isinstance(limits, dict) and "timeout_ms" in limits:
+        value = limits["timeout_ms"]
+        return None if value is None else int(value)
+    return DEFAULT_SOLVE_TIMEOUT_MS
+
+
 def lower_problem_to_request(problem, model_facts, solve_options) -> SolveRequest:
     """S1/S2: a real Problem -> the shared core's normalized argument set.
 
@@ -429,6 +460,19 @@ def lower_problem_to_request(problem, model_facts, solve_options) -> SolveReques
         "fixed_buffer_versions": fixed_versions,
         "return_status": True,
     }
+    # Path B knobs. request_digest folds in core_args, so ANY key added here moves the
+    # published result_digest. That is accepted deliberately for solve_timeout_ms: the
+    # timeout is ON by default (a bound that only applies when asked for would not bound
+    # the case nobody asked about), and hiding the value from the digest would make the
+    # result silent about how long the solve was allowed to run. The move is not a
+    # regression, it is a recorded change: the default-path digest is re-pinned in
+    # test_solver_bridge_s3.S02_RESULT_DIGEST_AT_PATH_B, so this cannot happen unnoticed.
+    # allow_fallback_on_unknown stays opt-in and absent by default.
+    _timeout = _timeout_ms(solve_options)
+    if _timeout is not None:
+        core_args["solve_timeout_ms"] = _timeout
+    if bool((solve_options or {}).get("allow_fallback_on_unknown", False)):
+        core_args["allow_fallback_on_unknown"] = True
     core_hash = shared_adapters.shared_loop_core_sha256()
     units = {"latency": "MODEL cycles", "ii": "MODEL cycles",
              "buffer_sizes": "bytes", "memory_groups": "bytes",
@@ -533,7 +577,32 @@ def invoke_shared_core(request: SolveRequest) -> dict:
                           "request was not built for the current shared core",
                           "core_source_hash", request.core_source_hash, actual_hash,
                           phase="invoke")
-    raw = shared_adapters.tf_loop_adapter(dict(request.core_args), return_status=True)
+    # Path B, second layer of defence. The core now returns a labelled "unknown" instead
+    # of raising when allow_fallback_on_unknown is set, but an exception can still escape
+    # from an unexpected place (an internal assert, a z3 API change, a memory error). The
+    # TL loop scheduler has no catch at all and a raised exception there tears down the
+    # whole pass; this call site must not repeat that. A failure is converted into an
+    # explicit UNKNOWN carrying the reason, never into a silent success.
+    try:
+        raw = shared_adapters.tf_loop_adapter(dict(request.core_args), return_status=True)
+    except (TypeError, AttributeError, KeyError, IndexError):
+        # A CONTRACT error (wrong argument surface, missing attribute, renamed key) is not a
+        # solver verdict. Swallowing it into UNKNOWN would make a programming mistake look
+        # like "the solver ran out of budget" -- indistinguishable at the state level, and
+        # it would silently disable the solve. Re-raise so the bug is visible.
+        raise
+    except Exception as exc:  # noqa: BLE001 - a genuine solver failure is a solver fact
+        raw = {
+            "status": "unknown",
+            "reason": "core raised %s: %s" % (type(exc).__name__, exc),
+            "fallback_reason": "core raised %s: %s" % (type(exc).__name__, exc),
+            "start_times": [],
+            "buffer_versions": [],
+            "minimal_II": None,
+            "check_results": [],
+            "search_scope_complete": False,
+            "core_exception": "%s: %s" % (type(exc).__name__, exc),
+        }
     return {"raw": raw, "core_source_hash": actual_hash}
 
 
@@ -563,9 +632,17 @@ def classify_core_result(request: SolveRequest, raw, claimed_state=None) -> Solv
         if status == "unsat" and complete:
             state, reason = UNSAT, "finite search domain exhausted; all candidates unsat"
         else:
-            state, reason = UNKNOWN, str(raw.get("reason") or "core did not prove unsat")
+            state, reason = UNKNOWN, str(raw.get("fallback_reason") or raw.get("reason")
+                                         or "core did not prove unsat")
         assignment = {}
-        fallback_candidate = None
+        # An UNKNOWN result still carries the core's sequential schedule, and that
+        # schedule is a legitimate CANDIDATE -- but it is a candidate produced without a
+        # feasibility proof, so it is offered as a fallback candidate while the state
+        # stays UNKNOWN. It is never promoted to SAT or labelled FALLBACK.
+        fallback_candidate = (
+            {key: raw.get(key) for key in
+             ("start_times", "buffer_versions", "minimal_II", "check_results")}
+            if status == "unknown" and raw.get("start_times") else None)
     else:
         state, reason = UNKNOWN, "unrecognized raw core status: %s" % status
         assignment = {}
@@ -584,6 +661,29 @@ def classify_core_result(request: SolveRequest, raw, claimed_state=None) -> Solv
         assignment=assignment, fallback_candidate=fallback_candidate, postcheck=None,
         capacity_scope="NOMINAL_MODEL_ONLY")
     return SolveResult(**{**result.__dict__, "result_digest": _result_digest(result)})
+
+
+# ---------------------------------------------------------------------------------------
+# KNOWN ISSUES accepted at Path B, recorded here ON PURPOSE.
+#
+# This block lives in bridge.py rather than in the vendor core because core.py's SHA is
+# folded into core_source_hash -> request_digest -> result_digest: editing a single comment
+# byte there invalidates the published digest pin. Recorded facts must not cost a re-pin.
+#
+# 1. UNKNOWN is reported through a field named `fallback_reason`.
+#    The core returns its "unknown" explanation in `fallback_reason` (the key predates
+#    Path B and the other three states). The explanation TEXT is correct and says the
+#    feasibility was not refuted; only the KEY name is misleading. Not renamed because a
+#    rename moves the result digest again and ripples into any downstream consumer keyed on
+#    that name. `state` is the authoritative discriminator: it is UNKNOWN, never FALLBACK.
+#
+# 2. `fallback_candidate["minimal_II"]` is ambiguous for an UNKNOWN result.
+#    The value is the core's serial II (= sum of latencies), produced WITHOUT a feasibility
+#    proof. Reading it as "the minimal feasible II" would be wrong. Callers must gate on
+#    `state == SAT` before treating an II as proven. No production consumer reads the
+#    candidate today (the g10 path discards it for UNKNOWN), so this is a latent hazard
+#    rather than an active bug.
+# ---------------------------------------------------------------------------------------
 
 
 def _result_digest(result) -> str:
