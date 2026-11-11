@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
 from tilefoundry.ir.core import Call, Constant, Tuple, Var
-from ..ir.isa import contract as isa_contract
+from ..ir.isa import ISA, contract as isa_contract
 from tilefoundry.ir.hir.schedule import ScheduleOp
 from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.tir.memory import Copy, Fill, PtrOf, TensorView
@@ -1154,6 +1155,30 @@ def _problem_policy(sources: "ProblemSources | None", ledger=None, predicate_met
     }
 
 
+def isa_key(op_name: str) -> str:
+    """The ISA table key for a TIR op name, or the lowercased name when none matches.
+
+    TIR op classes are CamelCase (``GmToUb``, ``UbToGm``) while the ISA table is
+    snake_case (``gm_to_ub``, ``ub_to_gm``), so a bare ``.lower()`` turns ``GmToUb`` into
+    the nonexistent ``gmtoub``. That miss is SILENT -- the caller gets NO_ISA_CONTRACT
+    with ``latency=None`` -- and it hit exactly the two DMA ops, which are the most
+    expensive ones in a pipelined loop (MTE2/MTE3, latency 64, II 8). A schedule solved
+    against a missing load latency is not a schedule of this program.
+
+    Resolved by TRYING the declared spelling first, so an op whose real key is not the
+    snake_case form still finds its contract; only a genuine absence reaches
+    NO_ISA_CONTRACT, where it is visible as an unknown rather than a zero.
+    """
+    key = str(op_name)
+    if key in ISA:
+        return key
+    lowered = key.lower()
+    if lowered in ISA:
+        return lowered
+    snake = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key).lower()
+    return snake if snake in ISA else lowered
+
+
 def build_problem(ledger: Ledger, sources: "ProblemSources | None" = None, predicate_metadata=None) -> NormalizedProblem:
     """Ledger -> normalized Problem. Buffers come from the SAME ledger; no invented roots.
 
@@ -1211,7 +1236,7 @@ def build_problem(ledger: Ledger, sources: "ProblemSources | None" = None, predi
     for instruction, group in sorted(by_instruction.items()):
         first = group[0]
         try:
-            contract_ = isa_contract(first.op.lower())
+            contract_ = isa_contract(isa_key(first.op))
             pipe, latency, ii = contract_.resource, contract_.latency_model, contract_.ii_model
         except KeyError:
             pipe, latency, ii = 'NO_ISA_CONTRACT', None, None

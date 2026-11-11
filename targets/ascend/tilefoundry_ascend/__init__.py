@@ -17,4 +17,11 @@ from tilefoundry_ascend.tf_target import Ascend950PRTarget  # noqa: F401
 # the pass module imports the Target class from it.
 from tilefoundry_ascend.passes import pipeline as _pipeline  # noqa: F401
 
+# P3-04/G33: the P3 chain (ledger -> problem -> solve -> resolve -> layout ->
+# materialize -> pipeline) and the P4 export gate are registered the same way. Same
+# reason: without this import target_passes() never returns them, so the public
+# finalize() path would lower a program with NO analysis, NO solve and NO plan behind
+# it, and could not tell that its final artifact is not runnable.
+from tilefoundry_ascend.passes import p3_chain as _p3_chain  # noqa: F401
+
 __all__ = ["Ascend950PRTarget"]
