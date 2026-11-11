@@ -48,7 +48,15 @@ def _built():
     prog = checked_program(FIX + ":PipeVaddCarrier", None, command="l2-problem-shape")
     analyzed = analyze(prog.module, prog.entry, analysis=("memory",))
     module = finalize(analyzed, authored=prog.authored)
-    function = module.entry_function()
+    # THE CLEAN SERIAL LOOP -- what entry_function() used to be.
+    # Since P4-03, entry_function() is the finished artifact: unrolled and carrying completion.
+    # A ledger built from it describes one statement per INSTANCE and sees FlagSet/FlagWait
+    # Evaluate nodes that have no ledger action, which build_problem correctly refuses with
+    # DMA_STATEMENT_WITHOUT_ACTION. pre_completion_tir is the program BEFORE completion
+    # emission; pre_materialize_tir is already too late, it carries the 31 injected flags.
+    from tilefoundry_ascend.passes.p3_chain import pre_completion_tir
+
+    function = pre_completion_tir(module)
     ledger = extract_ledger(
         function,
         escape_records=module.metadata.get("escape_records"),

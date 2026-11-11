@@ -30,7 +30,15 @@ def _l():
     sources = capture_problem_sources(prog.module)
     analyzed = analyze(prog.module, prog.entry, analysis=("memory",))
     module = finalize(analyzed, authored=prog.authored)
-    tir = module.entry_function()
+    # THE SERIAL LOOP, BY NAME. entry_function() is now the finished, unrolled,
+    # completion-carrying artifact -- the runnable one -- so a ledger built from it yields one
+    # entry per INSTANCE (68 instead of 17) and an expansion of 1 group instead of 4. Both
+    # readings are correct; they describe DIFFERENT programs. The L/S/C stages downstream reason
+    # about the serial loop, so this fixture asks for it explicitly rather than taking whatever
+    # the module happens to expose.
+    from tilefoundry_ascend.passes.p3_chain import pre_materialize_tir
+
+    tir = pre_materialize_tir(module)
     ledger = extract_ledger(tir)
     problem = build_problem(ledger, sources, predicate_metadata=module.metadata.get(KEY))
     expansion = expand_loop_instances(ledger)

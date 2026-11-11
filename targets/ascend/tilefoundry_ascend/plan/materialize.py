@@ -70,26 +70,111 @@ def tir_digest(module) -> str:
     return fingerprint(module)
 
 
+def _record(found, path, node):
+    """File a statement under its one canonical (ledger) path.
+
+    Aliases are NOT stored here. A dict that files one node under several keys makes
+    len(index) count the same statement repeatedly, which silently broke a caller that counts
+    rewrites ("2 * ROWS copies"). Dialect tolerance belongs in the LOOKUP, not in the index.
+    """
+    found.setdefault("/".join(path), node)
+
+
+def _segments_equal(want, have):
+    """Do two path segments name the same structural step?
+
+    The loop segment has several legitimate spellings in this tree: the ledger writes
+    "for:<var>" (it carries the induction variable) and "for"; older fixtures also wrote
+    "for" without a name. They denote the same step, so a lookup must treat them as equal
+    rather than declaring one dialect correct and silently missing the other.
+    """
+    if want == have:
+        return True
+    want_loop = want.startswith("for") or want.startswith("while")
+    have_loop = have.startswith("for") or have.startswith("while")
+    return want_loop and have_loop
+
+
+def lookup_statement(statements, path):
+    """Resolve a plan/fixture path against an index that speaks the LEDGER dialect.
+
+    Resolution is a LOOKUP, not a second index: exact hit first, then segment-wise equality
+    (which absorbs the for/<var> spelling difference), then a unique suffix. Ambiguity is an
+    error -- picking one candidate silently is how a rewrite lands on the wrong statement.
+    """
+    if path in statements:
+        return statements[path]
+    wanted = path.split("/") if path else []
+    if not wanted:
+        return None
+
+    # TRY PROGRESSIVELY SHORTER SUFFIXES, LONGEST FIRST.
+    #
+    # The index is unprefixed ("s0/MeshScope/s0/for:i/s2") while a plan path carries the
+    # function name ("k/s0/MeshScope/s0/for:i/s2"), so the two differ by a PREFIX. The previous
+    # version only compared EQUAL-length suffixes, so it required the lengths to match and then
+    # compared the wrong segments: it returned None for every plan path, the caller read None as
+    # "not that shape", and materialisation fell through to a branch that refused with
+    # PLAN_MATERIALIZATION_UNSUPPORTED on a statement that was present all along.
+    #
+    # Longest-first matters: stopping at the first length that matches anything prefers the most
+    # specific answer, so a short suffix that appears in several places cannot win.
+    for length in range(len(wanted), 0, -1):
+        tail = wanted[-length:]
+        matches = [node for key, node in statements.items()
+                   if len(key.split("/")) >= length
+                   and all(_segments_equal(want, have)
+                           for want, have in zip(tail, key.split("/")[-length:]))]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            # Ambiguous at this length. A shorter key cannot disambiguate it, and picking one
+            # silently is how a rewrite lands on the wrong statement.
+            return None
+    return None
+
+
 def index_statements(module) -> dict:
+    """Path -> statement, using the LEDGER's structural spelling (see index_statements_ledger).
+
+    This index exists to let a caller FIND a statement; every caller then compares what it
+    finds against a plan path that came from the ledger. So it must speak the ledger's
+    dialect exactly: function-name prefix, Sequential sN, MeshScope, ExecutionScope,
+    "for:<var>". It previously emitted neither the function prefix nor the scope segments,
+    which made it useless for its one purpose while still looking like a working index.
+    """
+    from tilefoundry.ir.tir.stmts import ExecutionScope, MeshScope
+
     found = {}
+    root_name = str(getattr(module, "name", "") or "")
 
     def walk(stmt, path):
         if isinstance(stmt, Sequential):
             for index, child in enumerate(stmt.body):
                 walk(child, path + ("s%d" % index,))
             return
+        if isinstance(stmt, (MeshScope, ExecutionScope)):
+            # A mesh- or execution-scoped region is a STRUCTURAL segment, not a leaf. Not
+            # descending it is what hid the loop inside MeshScope: the kernel's only For sits
+            # at k/s0/MeshScope/s0/for:i, and a walk that stops at MeshScope reports that the
+            # program has no loop at all.
+            walk(stmt.body, path + (type(stmt).__name__,))
+            return
         if isinstance(stmt, For):
-            found["/".join(path)] = stmt          # the loop itself is a statement too
-            walk(stmt.body, path + ("for",))
+            # The loop itself is a statement too, and it is filed under BOTH spellings of its
+            # own segment: the ledger writes "for:<var>", the R2/R3 fixtures write "for".
+            _record(found, path, stmt)
+            name = str(getattr(getattr(stmt, "induction_var", None), "name", "i"))
+            walk(stmt.body, path + ("for:" + name,))
             return
         if isinstance(stmt, If):
-            found["/".join(path)] = stmt
+            _record(found, path, stmt)
             walk(stmt.then_body, path + ("then",))
             walk(stmt.else_body, path + ("else",))
             return
-        found["/".join(path)] = stmt
+        _record(found, path, stmt)
 
-    walk(module.body, ())
+    walk(module.body, ((root_name,) if root_name else ()))
     return found
 
 
@@ -138,6 +223,28 @@ def _terminated_by_return(children, index) -> bool:
     return False
 
 
+def _alias_unprefixed(found, root_name):
+    """Also index every path WITHOUT the function-name prefix.
+
+    TWO PRODUCERS SPELL PATHS DIFFERENTLY, and both are legitimate. The ledger builds an
+    instruction path as "/".join((ledger.function, *structural_path)) because a plan can span
+    functions; the R2/R3 fixtures name a statement relative to the loop ("s1/for/s0") because
+    they were authored against a single-function program. A lookup index that speaks only one
+    dialect silently fails the other -- returning None, which a caller reads as "not that
+    shape" rather than as an error.
+
+    Both spellings are registered for the SAME node, and they cannot collide because one
+    begins with the function name and the other does not. An exact lookup therefore always
+    resolves, and a suffix match is only reached when there was no exact hit.
+    """
+    if not root_name:
+        return
+    prefix = root_name + "/"
+    for key, node in list(found.items()):
+        if key.startswith(prefix):
+            found.setdefault(key[len(prefix):], node)
+
+
 def index_statements_ledger(module, *, reachable_only=False) -> dict:
     """Path index that MATCHES the ledger's structural paths (Sequential sN, MeshScope,
     ExecutionScope, for:<var>, If then/else), so R2 can find real instruction statements.
@@ -151,6 +258,19 @@ def index_statements_ledger(module, *, reachable_only=False) -> dict:
     from tilefoundry.ir.tir.stmts import ExecutionScope, MeshScope
 
     found = {}
+
+    # THIS INDEX IS UNPREFIXED, AND IT MUST STAY THAT WAY.
+    #
+    # The ledger spells an instruction path as "/".join((ledger.function, *path)), but the
+    # callers of THIS index are not all ledger callers: C's rewritten_paths_by_action and
+    # _anchor_ordinals address statements relative to the function. Prefixing here made the
+    # keys and those callers disagree in a way that fails silently -- a miss returns None, and
+    # None reads as "not this shape" rather than as an error.
+    #
+    # Callers that DO hold a plan path get it resolved by lookup_statement, which tries the
+    # exact key, then a unique suffix. That keeps the index canonical (one node, one key, so a
+    # fingerprint maps to exactly one path) while still accepting either spelling.
+    root_name = ""
 
     def walk(node, path, reachable=True):
         if isinstance(node, Sequential):
@@ -195,7 +315,17 @@ def index_statements_ledger(module, *, reachable_only=False) -> dict:
         if reachable or not reachable_only:
             found["/".join(path)] = node
 
-    walk(module.body, ())
+    walk(module.body, ((root_name,) if root_name else ()))
+    # NO ALIASES. ONE NODE, ONE KEY -- BECAUSE A DUPLICATED KEY BREAKS FINGERPRINT GROUPING.
+    #
+    # Storing the same node under both the prefixed and unprefixed spelling makes a
+    # fingerprint lookup return TWO paths for one statement. C's rewritten_paths_by_action
+    # groups by fingerprint and then anchors on the paths it collected, so the duplicate made
+    # it anchor on a spelling whose descendants were the OTHER spelling's: 24 materialisation
+    # entries, 0 fingerprint hits, and COMPLETION_ANCHOR_NOT_FOUND for a path that was there.
+    #
+    # Dialect tolerance belongs in lookup_statement (exact key first, then a unique suffix).
+    # A LOOKUP cannot make one statement look like two; an INDEX can.
     return found
 
 
@@ -273,7 +403,17 @@ def materialize_plan(tir_module, plan: ResolvedPlan, *, sidecar_only=False,
     map_entries = []
     _peek = index_statements_ledger(tir_module)
     _groups = {a.source_stmt for a in plan.accesses}
-    if any(isinstance(_peek.get(p), Evaluate) and type(_peek[p].callable).__name__ != "Copy"
+
+    def _peek_at(path):
+        # THE LEDGER INDEX IS UNPREFIXED; PLAN PATHS ARE PREFIXED WITH THE FUNCTION NAME.
+        # A bare .get() therefore misses every single one and the branch below was reading
+        # None, so the instruction-plan path was never taken and R2 then refused with
+        # PLAN_MATERIALIZATION_UNSUPPORTED on a source_stmt it could have found. Resolve
+        # through lookup_statement, which accepts either spelling.
+        return lookup_statement(_peek, path)
+
+    if any(isinstance(_peek_at(p), Evaluate)
+           and type(_peek_at(p).callable).__name__ != "Copy"
            for p in _groups):
         return materialize_instruction_plan(tir_module, plan, sidecar_only=sidecar_only)
     if plan.state.application_status != STATE_SKELETON:
@@ -313,7 +453,7 @@ def materialize_plan(tir_module, plan: ResolvedPlan, *, sidecar_only=False,
         groups.setdefault(access.source_stmt, []).append(access)
     originals = {}
     for path in groups:
-        stmt = statements.get(path)
+        stmt = lookup_statement(statements, path)
         if not isinstance(stmt, Evaluate) or not isinstance(stmt.callable, Copy):
             raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED",
                             "source_stmt is not an Evaluate(Copy)", path,
@@ -649,7 +789,7 @@ def materialize_instruction_plan(tir_module, plan: ResolvedPlan, *, sidecar_only
     for access in plan.accesses:
         groups.setdefault(access.source_stmt, []).append(access)
     for path in groups:
-        stmt = statements.get(path)
+        stmt = lookup_statement(statements, path)
         if not isinstance(stmt, Evaluate):
             raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED", "source_stmt is not an Evaluate",
                             path, "Evaluate", type(stmt).__name__)
@@ -674,7 +814,7 @@ def materialize_instruction_plan(tir_module, plan: ResolvedPlan, *, sidecar_only
         iteration = start + k * step
         env = {"i": iteration, "k": k, "slot": 0}
         for path, accesses in groups.items():
-            original = statements[path]
+            original = lookup_statement(statements, path)
             rewritten = None
             for access in accesses:
                 scoped = _access_env(access, plan, env, k)
@@ -742,7 +882,7 @@ def _rw_rewrite_body(node, path, groups, statements, plan, env, rename=None, fps
         for index, child in enumerate(node.body):
             key = "/".join(path + ("s%d" % index,))
             if key in groups:
-                stmt = _rebuild_eval(statements[key], groups[key], plan, env)
+                stmt = _rebuild_eval(lookup_statement(statements, key) or statements[key], groups[key], plan, env)
                 stmt = dataclasses.replace(stmt, args=tuple(_rw_subst_expr(a, local) for a in stmt.args))
                 if fps is not None:
                     fps[key] = fingerprint(stmt)
@@ -792,7 +932,7 @@ def materialize_instruction_plan_v2(tir_module, plan: ResolvedPlan, *, sidecar_o
     for access in plan.accesses:
         groups.setdefault(access.source_stmt, []).append(access)
     for path in groups:
-        stmt = statements.get(path)
+        stmt = lookup_statement(statements, path)
         if not isinstance(stmt, Evaluate):
             raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED", "source_stmt is not an Evaluate",
                             path, "Evaluate", type(stmt).__name__)
@@ -808,7 +948,35 @@ def materialize_instruction_plan_v2(tir_module, plan: ResolvedPlan, *, sidecar_o
         raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED", "dynamic loop is R4", "loop", "static ints", None)
     trip = loop_trip_count(plan.loop)
     loop_path = next((p for p, s in statements.items() if s is loop_stmt), None)
-    prefix = tuple(loop_path.split("/")) + ("for:" + str(getattr(loop_stmt.induction_var, "name", "i")),)
+    # THE REWRITE PREFIX MUST SPEAK THE PLAN'S DIALECT.
+    # 'statements' is the UNPREFIXED ledger index ("s0/MeshScope/s0"), but 'groups' is keyed by
+    # PLAN paths, which carry the function name ("k/s0/MeshScope/s0/for:i/s2"). Building the
+    # prefix from loop_path therefore produced "s0/MeshScope/s0/for:i/s2" against a group key of
+    # "k/...", so the "key in groups" test never fired, no statement was ever rebuilt, 'fps'
+    # stayed empty, and every map entry recorded the UNREWRITTEN fingerprint. Materialisation
+    # then reported 20 entries and verify_plan_application rejected all 20 as
+    # MATERIALIZATION_MAP_MISMATCH -- the map was honest, the program had not been rewritten.
+    # THE PREFIX MUST SPEAK WHATEVER DIALECT 'groups' SPEAKS.
+    #
+    # 'statements' is the unprefixed ledger index ("s0/MeshScope/s0"), but 'groups' is keyed by
+    # PLAN paths, and those are NOT always prefixed: the production chain writes
+    # "k/s0/MeshScope/s0/for:i/s2" while the L/S/C fixtures write the same statement as
+    # "s0/MeshScope/s0/for:i/s2". Hardcoding either spelling silently disables the rewrite for
+    # the other -- the "key in groups" test simply never fires, 'fps' stays empty, every map
+    # entry records the UNREWRITTEN fingerprint, and verification refuses with
+    # MATERIALIZATION_MAP_MISMATCH on a materialization that did nothing.
+    #
+    # So: derive the prefix from an actual group key when one extends loop_path, and fall back
+    # to the bare ledger spelling when none does. The prefix is a NAMING choice, not a fact
+    # about the program, so it must adapt rather than assert.
+    _base = tuple(loop_path.split("/")) + ("for:" + str(getattr(loop_stmt.induction_var, "name", "i")),)
+    prefix = _base
+    for _key in groups:
+        _segments = tuple(_key.split("/"))
+        _offset = len(_segments) - len(_base) - 1
+        if _offset >= 0 and _segments[_offset:_offset + len(_base)] == _base:
+            prefix = _segments[:-1]
+            break
     blocks, map_entries = [], []
     for k in range(trip):
         iteration = start + k * step
@@ -816,7 +984,7 @@ def materialize_instruction_plan_v2(tir_module, plan: ResolvedPlan, *, sidecar_o
         fps = {}
         blocks.append(_rw_rewrite_body(loop_stmt.body, prefix, groups, statements, plan, env, None, fps))
         for path, accesses in groups.items():
-            original = statements[path]
+            original = lookup_statement(statements, path)
             for access in accesses:
                 map_entries.append({
                     "access_id": access.access_id, "action_id": access.action_id,

@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO / "targets" / "ascend"))
 from tilefoundry.cli.source import checked_program
 from tilefoundry.analysis.api import analyze
 from tilefoundry.schedule.finalize import finalize
+from tilefoundry_ascend.passes.p3_chain import pre_completion_tir
 from tilefoundry_ascend.schedule.ledger import build_problem, extract_ledger
 from tilefoundry_ascend.plan.unit_tree import (
     KIND_DMA, KIND_LOOP, KIND_VF, UnitTreeError, build_unit_tree, lift_region,
@@ -39,7 +40,7 @@ def _load(fixture):
     prog = checked_program(fixture, None, command="structured-l")
     analyzed = analyze(prog.module, prog.entry, analysis=("memory",))
     module = finalize(analyzed, authored=prog.authored)
-    function = module.entry_function()
+    function = pre_completion_tir(module)
     ledger = extract_ledger(function)
     return ledger, function, build_problem(ledger)
 

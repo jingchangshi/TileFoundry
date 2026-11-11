@@ -52,9 +52,13 @@ def _plan(module):
 
 def _build(module, plan=None):
     from tilefoundry_ascend import completion as CP
+    from tilefoundry_ascend.passes.p3_chain import pre_completion_tir
 
     plan = plan if plan is not None else _plan(module)
-    return CP.build_completion_plan(plan, module.entry_function())
+    # Derive completion against the program BEFORE completion emission / unrolling. The
+    # module's entry_function() is now the finished, unrolled, completion-carrying artifact,
+    # so injecting into it would emit every flag a second time.
+    return CP.build_completion_plan(plan, pre_completion_tir(module))
 
 
 def _trip(plan, trip):
@@ -410,7 +414,15 @@ def _mutate(module, mutate):
     assert cp.verified, (cp.code, cp.report.detail)
     records = mutate(list(cp.trace.records))
     mutated_trace = dataclasses.replace(cp.trace, records=tuple(records))
-    emitted, bound = emit_trace_tir(module.entry_function(), mutated_trace,
+    # EMIT INTO THE PRE-COMPLETION PROGRAM, NOT INTO entry_function().
+    # entry_function() is now the FINISHED artifact: unrolled AND already carrying the 30
+    # completion statements this trace describes. Re-emitting the mutated trace into it stacked a
+    # second copy on top, and verification then refused with COMPLETION_OBLIGATION_UNSUPPORTED
+    # ("31 more statements than the verified program requires") -- the right refusal for the
+    # wrong reason, which would have hidden whatever the mutation was meant to expose.
+    from tilefoundry_ascend.passes.p3_chain import pre_completion_tir
+
+    emitted, bound = emit_trace_tir(pre_completion_tir(module), mutated_trace,
                                     events=cp.events)
     candidate = dataclasses.replace(cp, trace=bound)
     return verify_completion(plan, candidate, actual_tir=emitted)
@@ -759,11 +771,23 @@ def test_the_chain_records_a_verified_completion_and_the_gate_still_needs_storag
     completion = module.metadata.get("ascend.p3_completion")
     assert completion is not None and completion.verified
 
-    gate = module.metadata.get(EXPORT_GATE_KEY) or {}
+    # ASK THE GATE, do not read a key that may never have been written. finalize() runs the
+    # chain but does not install EXPORT_GATE_KEY, so reading the metadata returned {} and the
+    # "ready is False" assertion below passed for the trivial reason that nothing was there --
+    # a check over an empty dict is not a check. require_export_ready computes it from the
+    # record actually stored on the module.
+    from tilefoundry_ascend.passes.p3_chain import require_export_ready
+
+    gate = require_export_ready(module, chain, raising=False)
     gaps = [gap for gap in gate.get("gaps", []) if gap[0] == "completion"]
     assert not gaps, "a verified completion must not be named as a completion gap: %r" % (gaps,)
-    assert gate.get("ready") is False, (
-        "storage placement is still P4-02, so the gate must still refuse")
+    # THE GATE IS NOW READY, AND THAT IS THE CORRECT OUTCOME.
+    # At G40 the storage placement was still P4-02 and the scheduled TIR did not exist, so this
+    # asserted a refusal. G41 attached a verified placement and G42 emits and verifies the
+    # scheduled program, so "not ready" would now assert that two completed stages did not
+    # happen. The load-bearing clause is the one above it: a VERIFIED completion must not be
+    # reported as a completion gap.
+    assert gate.get("ready") is True, gate.get("gaps")
 
 
 def test_completion_plan_survives_json_serialisation():

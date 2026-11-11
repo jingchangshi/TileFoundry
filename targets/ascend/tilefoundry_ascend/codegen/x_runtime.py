@@ -64,12 +64,79 @@ class SourceIdentity:
     handwritten_twin: bool = False
 
 
+# THE FLOAT DTYPES A KERNEL ARGUMENT MAY DECLARE, keyed by every spelling a caller uses.
+#
+# This list is deliberately a REGISTRY rather than an inline condition. G42 requires the ABI to
+# support FP16/BF16 without an RMSNorm-shaped assumption, and the previous version hardcoded an
+# f32/bf16 pair because the only caller was an RMSNorm kernel. A registry keeps the supported
+# set explicit and makes adding a dtype a one-line change instead of a hunt through conditions.
+FLOAT_ARG_BYTES = {
+    "f16": 2, "float16": 2, "half": 2, "fp16": 2,
+    "bf16": 2, "bfloat16": 2,
+    "f32": 4, "float32": 4, "float": 4, "fp32": 4,
+    "f64": 8, "float64": 8, "double": 8, "fp64": 8,
+}
+
+# Scalar arguments carry a value, not a buffer, so they have no byte size of their own.
+#
+# FLOAT SCALARS ARE INCLUDED ON PURPOSE. An epsilon, a scale, a normalisation reciprocal -- the
+# most common runtime scalar in this target is a float, and leaving them out would have made the
+# "general ABI" reject exactly the RMSNorm-shaped kernel it was meant to stop special-casing.
+SCALAR_ARG_DTYPES = {
+    "i8", "int8", "u8", "uint8", "i16", "int16", "u16", "uint16",
+    "i32", "int32", "u32", "uint32", "i64", "int64", "u64", "uint64",
+    "bool", "index",
+} | set(FLOAT_ARG_BYTES)
+
+SCALAR_ARG_KINDS = ("scalar", "runtime", "value")
+
+
+def arg_is_scalar(arg):
+    """Is this ABI argument a scalar? SCALARS ARE NOT BUFFERS AND MUST NOT BE SIZED AS ONE."""
+    kind = str(_get(arg, "kind", "")).lower()
+    if kind in SCALAR_ARG_KINDS:
+        return True
+    if kind in ("in", "out", "inout"):
+        return False
+    # An argument that declares no byte size but does declare a scalar dtype is a scalar. The
+    # old validator called that an error, which forced every caller to invent a buffer size for
+    # a value that has none -- the RMSNorm-specific assumption this removes.
+    return str(_get(arg, "dtype", "")).lower() in SCALAR_ARG_DTYPES
+
+
 @dataclass(frozen=True)
 class KernelABI:
+    """The kernel's calling convention, GENERAL rather than shaped around one kernel.
+
+    What was RMSNorm-specific here, and why each one blocked a legitimate kernel:
+
+      * a SINGLE 'output_index' -- a kernel with two outputs (scores and log-sum-exp, a
+        normalisation's mean and variance) could not be described at all. Outputs are now the
+        set of args whose kind is out/inout, and 'output_index' survives only as a convenience
+        for the overwhelmingly common single-output case.
+      * 'eps_f32_bits' as a required positional field -- an epsilon is RMSNorm's parameter, not
+        the ABI's. Runtime scalars are ordinary args of kind 'scalar', passed positionally.
+      * an f32/bf16-only dtype whitelist -- FP16 is a first-class Ascend dtype. Dtypes now come
+        from a registry, and the check is "is it a dtype we can size", not "is it this kernel's".
+      * 'nbytes > 0 required for every arg' -- a runtime scalar has no byte size. Requiring one
+        meant a scalar could not be expressed without pretending it was a buffer.
+    """
+
     args: tuple
-    output_index: int
-    eps_f32_bits: Optional[int]
+    output_index: int = -1
+    eps_f32_bits: Optional[int] = None
     grid: dict = field(default_factory=dict)
+
+    def buffer_args(self):
+        return tuple(arg for arg in self.args if not arg_is_scalar(arg))
+
+    def scalar_args(self):
+        return tuple(arg for arg in self.args if arg_is_scalar(arg))
+
+    def outputs(self):
+        """Every out/inout argument, in declaration order. Not just one."""
+        return tuple(arg for arg in self.args
+                     if str(_get(arg, "kind", "")).lower() in ("out", "inout"))
 
     def validate(self):
         if not isinstance(self.args, (tuple, list)) or not self.args:
@@ -79,22 +146,54 @@ class KernelABI:
         if any(not name for name in names) or len(set(names)) != len(names):
             raise CodegenError("X_ABI_MISMATCH", "ABI arg names must be unique/nonempty",
                                "args", names, names)
-        if not (0 <= int(self.output_index) < len(self.args)):
-            raise CodegenError("X_ABI_MISMATCH", "output_index out of range",
-                               "output_index", (0, len(self.args) - 1), self.output_index)
-        output = self.args[int(self.output_index)]
-        if str(_get(output, "kind")) not in ("out", "inout"):
-            raise CodegenError("X_ABI_MISMATCH", "output arg must be out/inout",
-                               "output_index", "out/inout", _get(output, "kind"))
+
+        outputs = self.outputs()
+        if not outputs:
+            raise CodegenError("X_ABI_MISMATCH",
+                               "ABI declares no out/inout arg; a kernel must produce something",
+                               "args", "at least one out/inout", names)
+        if self.output_index >= 0:
+            # The index is OPTIONAL (a multi-output kernel has no single primary), but when it is
+            # given it must still name a real output rather than an input.
+            if not (0 <= int(self.output_index) < len(self.args)):
+                raise CodegenError("X_ABI_MISMATCH", "output_index out of range",
+                                   "output_index", (0, len(self.args) - 1), self.output_index)
+            chosen = self.args[int(self.output_index)]
+            if str(_get(chosen, "kind")).lower() not in ("out", "inout"):
+                raise CodegenError("X_ABI_MISMATCH", "output arg must be out/inout",
+                                   "output_index", "out/inout", _get(chosen, "kind"))
+
         for arg in self.args:
+            name = str(_get(arg, "name"))
             dtype = str(_get(arg, "dtype", "")).lower()
-            if dtype not in ("f32", "float32", "bf16", "bfloat16"):
-                raise CodegenError("X_ABI_MISMATCH", "arg dtype must be explicit and supported",
-                                   str(_get(arg, "name")), "f32/float32/bf16/bfloat16", dtype)
+            if not dtype:
+                raise CodegenError("X_ABI_MISMATCH", "arg dtype must be explicit",
+                                   name, "an explicit dtype", dtype)
+            if arg_is_scalar(arg):
+                if dtype not in SCALAR_ARG_DTYPES:
+                    raise CodegenError(
+                        "X_ABI_MISMATCH",
+                        "a scalar arg declares a non-scalar dtype %r; a scalar carries a value,"
+                        " not a buffer element" % dtype, name, sorted(SCALAR_ARG_DTYPES), dtype)
+                # A scalar's byte size is DERIVED from its dtype; it is not supplied, and asking
+                # for one was the RMSNorm-shaped assumption this ABI removes.
+                continue
+            if dtype not in FLOAT_ARG_BYTES:
+                raise CodegenError(
+                    "X_ABI_MISMATCH", "arg dtype must be a float dtype this target can size",
+                    name, sorted(FLOAT_ARG_BYTES), dtype)
             nbytes = _get(arg, "nbytes")
             if nbytes is None or int(nbytes) <= 0:
-                raise CodegenError("X_ABI_MISMATCH", "arg nbytes must be explicit",
-                                   str(_get(arg, "name")), ">0", nbytes)
+                raise CodegenError("X_ABI_MISMATCH", "buffer arg nbytes must be explicit",
+                                   name, ">0", nbytes)
+            expected = FLOAT_ARG_BYTES[dtype]
+            count = _get(arg, "count")
+            if count is not None and int(nbytes) != int(count) * expected:
+                raise CodegenError(
+                    "X_ABI_MISMATCH",
+                    "arg declares %s bytes for %s element(s) of %s, which is %s bytes"
+                    % (nbytes, count, dtype, int(count) * expected),
+                    name, int(count) * expected, nbytes)
         return True
 
 
@@ -342,6 +441,7 @@ def emit_for_codegen(plan, codegen_binding=None):
 
 
 __all__ = ["CodegenError", "SourceIdentity", "KernelABI", "AdapterRequest", "TLModule",
+           "FLOAT_ARG_BYTES", "SCALAR_ARG_DTYPES", "arg_is_scalar",
            "CompiledArtifactBundle", "LOGICAL_TL_RECOMPILE", "RESOLVED_PLAN_PRESERVING",
            "validate_adapter_request", "lower_to_tilelang", "verify_adapter_correspondence",
            "compile_tilelang", "bind_kernel", "invoke_kernel", "synchronize_and_readback",

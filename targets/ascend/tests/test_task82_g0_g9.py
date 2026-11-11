@@ -27,7 +27,13 @@ def _built():
     hir_function = hir_module.entry_function()
     analyzed = analyze(prog.module, prog.entry, analysis=("memory",))
     module = finalize(analyzed, authored=prog.authored)
-    tir_function = module.entry_function()
+    # The CLEAN serial loop, for the same reason as test_l2_problem_shape: entry_function()
+    # is now unrolled and completion-carrying, and its injected FlagSet/FlagWait statements
+    # have no ledger action. hir_function above is deliberately LEFT as-is -- it comes from
+    # the pre-finalize HIR module and is not the same program.
+    from tilefoundry_ascend.passes.p3_chain import pre_completion_tir
+
+    tir_function = pre_completion_tir(module)
     ledger = extract_ledger(tir_function)
     problem = build_problem(ledger)
     expansion = expand_loop_instances(ledger)

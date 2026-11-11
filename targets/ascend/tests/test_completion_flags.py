@@ -75,6 +75,11 @@ def setup():
             allocation, matmap)
 
 
+def ctx_rewritten():
+    """The injected carrier BEFORE injection: already completion-bearing since P4-03."""
+    return setup()[0]
+
+
 def test_reuse_is_18_and_requires_both_actions():
     *_, reuse, required, _caps, _channels, _allocation, _matmap = setup()
     assert len(reuse) == 18
@@ -90,7 +95,15 @@ def test_anchored_injection_covers_47():
                                                      channels=channels, ledger=ledger,
                                                      materialization=matmap)
     nodes = C._actual_nodes(actual)
-    assert len(nodes["set"]) == 30 and len(nodes["wait"]) == 30 and len(nodes["drain"]) == 1
+    # THE CARRIER ALREADY CARRIES ITS COMPLETION BLOCK. Since P4-03 the injected program is
+    # R3's materialised program WITH completion emitted into it (16 Sets, 14 Waits, 1 Drain),
+    # and inject_completion_anchored adds the 30/30 the obligations require on top. Asserting
+    # the bare 30/30 therefore asserts something false about a correct program; what matters is
+    # that the required edges were ADDED and there is still exactly one region exit.
+    base = C._actual_nodes(ctx_rewritten())
+    assert len(nodes["set"]) == len(base["set"]) + 30
+    assert len(nodes["wait"]) == len(base["wait"]) + 30
+    assert len(nodes["drain"]) == 1
     report = C.verify_completion_coverage_from_ledger(
         ledger, expansion, problem=problem, actual_tir=actual, placement_map=placement,
         capabilities=caps, expected=expected)

@@ -86,6 +86,7 @@ from .schedule import CompletionTrace, TraceRecord, build_completion_trace
 from .emit import emit_trace_tir, read_trace_from_tir
 from .verify import CompletionReport, verify_completion
 from .plan import (
+    reemit_into_unrolled,
     COMPLETION_PLAN_KEY,
     CompletionPlan,
     attach_completion_plan,

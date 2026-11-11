@@ -97,6 +97,20 @@ class Ascend950PRTarget(Target):
             return facts_result(self, facts_type, self._memory())
         return super().get_facts(facts_type, query)
 
+    def completion_ops(self) -> dict:
+        """The completion ops this target admits, bound to its own execution mesh.
+
+        The core FlagSet/FlagWait/Drain declare thread_execution_mesh(); an Ascend kernel runs
+        in an ("aiv",) mesh, so the standard verifier rejects the core ops with "does not
+        match Mesh(('thread',)...)". The Aiv* subclasses already exist in sync.py for exactly
+        this reason -- this hook is what makes the completion emitter USE them instead of the
+        core classes. Imported lazily: sync.py imports the op registries, and this module is
+        imported while the target itself is being defined.
+        """
+        from .sync import AivDrain, AivFlagSet, AivFlagWait
+
+        return {"set": AivFlagSet, "wait": AivFlagWait, "drain": AivDrain}
+
     def torch_device_type(self) -> str:
         return "npu"
 

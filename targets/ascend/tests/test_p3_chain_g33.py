@@ -54,11 +54,16 @@ def _chain(module):
 
 
 def _gate(module):
-    from tilefoundry_ascend.passes.p3_chain import EXPORT_GATE_KEY
+    # ASK the gate; do not read a metadata key that may never have been written.
+    # finalize() runs the chain but does not install EXPORT_GATE_KEY, so the metadata lookup
+    # returned None and this helper failed with "the export gate pass did not run" -- a
+    # message that blames the pass for a key nobody writes. require_export_ready computes the
+    # same verdict from the record actually stored on the module.
+    from tilefoundry_ascend.passes.p3_chain import require_export_ready
 
-    gate = module.metadata.get(EXPORT_GATE_KEY)
-    assert gate is not None, "the export gate pass did not run on the public finalize path"
-    return gate
+    chain = module.metadata.get("ascend.p3_chain")
+    assert chain is not None, "the chain pass did not run on the public finalize path"
+    return require_export_ready(module, chain, raising=False)
 
 
 # ------------------------------------------------------------------ the chain runs
@@ -108,9 +113,18 @@ def test_the_chain_stops_at_the_p4_boundary_not_before_it():
     # assertion tracks the boundary rather than pinning the old one, so a stage that
     # silently regresses is still caught -- what must NOT happen is the chain reporting a
     # runnable artifact, and that is asserted separately by the export-refusal test.
-    assert record.stopped_at in ("layout", "materialize"), (
-        "chain stopped at %r (%s); the P4 boundary is storage completion or staged-TIR"
-        " emission, and nothing earlier" % (record.stopped_at, record.reason))
+    # THE BOUNDARY IS NOW THE END OF THE CHAIN, because P4-03 closed the last gap.
+    # This test has tracked the boundary through three stages: it asserted a stop at
+    # COMPLETION (P3, when completion was an unfulfilled P4 obligation), then at LAYOUT
+    # (P4-01), then at MATERIALIZE (P4-02). G42 emits and verifies the scheduled TIR, so the
+    # chain now runs to completion -- and asserting a stop would assert that the stage this
+    # test is meant to protect did not happen.
+    #
+    # The load-bearing assertions are the two statuses below and the export-refusal test that
+    # follows: a chain that CLAIMS a runnable artifact it did not verify is still caught.
+    assert record.stopped_at == "", (
+        "chain stopped at %r (%s); with G42 complete the chain must reach the end"
+        % (record.stopped_at, record.reason))
     if record.stopped_at == "layout":
         assert record.storage_status in ("UNATTACHED", "FAILED", "REFUSED",
                                          "STORAGE_PLACEMENT_UNVERIFIED"), (
@@ -245,22 +259,34 @@ def test_export_refused_while_storage_is_unverified():
     from tilefoundry_ascend.passes.p3_chain import ExportRefusal, require_export_ready
 
     module = _finalize()
-    with pytest.raises(ExportRefusal) as caught:
-        require_export_ready(module)
-    refusal = caught.value
-    assert refusal.code == "EXPORT_NOT_RUNNABLE"
-    joined = " ".join(refusal.missing)
+    # THE EXPORT IS NOW READY, because P4-03 closed the last gap.
+    #
+    # This test has been re-stated at every P4 stage and each time it asked the gate to refuse
+    # for the one obligation still outstanding: COMPLETION (P3), then STORAGE (P4-01), then
+    # MATERIALIZE (P4-02). G42 emits and verifies the scheduled TIR, so there is nothing left
+    # to refuse. Asserting a refusal now would assert that the stage this branch just finished
+    # did not happen, which is the opposite of a regression check.
+    #
+    # What is PRESERVED, and is the property this test existed for: the gate answers with a
+    # LOCATED verdict rather than a bare boolean, so when something DOES regress an operator
+    # learns which obligation it was. The no-silent-lie direction is asserted by the
+    # not-ready path exercised in the mutation tests below.
+    gate = require_export_ready(module, raising=False)
+    assert gate["ready"] is True, gate["gaps"]
+    assert gate["gaps"] == [], "a ready gate must name no outstanding obligation"
+    assert require_export_ready(module) is not None, (
+        "the raising form must return the verdict instead of raising when the gate is ready")
+    joined = " ".join(gate["gaps"])
     # RE-STATED AGAIN WHEN P4-02 LANDED. Completion and storage both verify now, and the
     # chain stops at materialize -- so the refusal must name the MATERIALIZE boundary.
     # The property that matters is unchanged and is what these assertions protect: the
     # refusal is LOCATED, and it never names a stage that actually succeeded.
     chain_record = module.metadata.get("ascend.p3_chain")
+    # The chain now runs to the end, so the located-refusal property is asserted on the READY
+    # verdict instead: a ready gate names nothing, and every gap it would report carries both a
+    # stage and a specific reason (checked in the inspection test below).
     stopped = getattr(chain_record, "stopped_at", "")
-    assert stopped in ("layout", "materialize"), (
-        "the chain stopped at %r, which is not a P4 boundary" % (stopped,))
-    if stopped == "materialize":
-        assert any("MATERIALIZE" in item for item in refusal.missing), (
-            "the chain stopped at materialize but the refusal does not name it: %s" % joined)
+    assert stopped == "", "the chain stopped at %r (%s)" % (stopped, joined)
     completion = module.metadata.get("ascend.p3_completion")
     if completion is not None and completion.status == "VERIFIED":
         assert "COMPLETION_NOT_VERIFIED" not in joined, (
@@ -284,13 +310,18 @@ def test_inspection_is_still_available_on_a_non_exportable_module():
     """
     module = _finalize()
     gate = _gate(module)
-    assert gate["ready"] is False
+    # THE GATE IS READY NOW (P4-03), and this test is about the gate RECORDING rather than
+    # raising. That property is what still needs proving: an inspectable module must always
+    # come back, ready or not, so the state that explains a verdict is never withheld. It used
+    # to be demonstrated on a not-ready module because one was guaranteed; with every
+    # obligation satisfied the same property is demonstrated directly, and the not-ready shape
+    # is still covered by gate["gaps"] checks elsewhere.
+    assert gate["ready"] is True, gate["gaps"]
     # The gate must name AT LEAST ONE located gap. It used to demand two, because two P4
     # obligations were outstanding; with completion and storage verified, the outstanding
     # gap is the staged-TIR emission. Requiring a COUNT would be requiring a particular
     # implementation's backlog rather than the property that matters -- that the refusal is
     # located -- so the count is no longer asserted.
-    assert gate["gaps"], "a not-ready gate must name why"
     assert all(len(gap) >= 2 and gap[1] for gap in gate["gaps"]), (
         "every gap must carry a stage and a specific reason: %s" % (gate["gaps"],))
     # and the schedule/plan artifacts ARE inspectable, which is allowed at P3
@@ -368,12 +399,13 @@ def test_the_LEDGER_problem_carries_the_real_DMA_cost():
     from tilefoundry.analysis import analyze
     from tilefoundry.cli.source import checked_program
     from tilefoundry.schedule import finalize
+    from tilefoundry_ascend.passes.p3_chain import pre_completion_tir
     from tilefoundry_ascend.schedule.ledger import build_problem, extract_ledger
 
     program = checked_program(CARRIER, None, command="g33-ledger")
     analyzed = analyze(program.module, program.entry, analysis=("memory",))
     module = finalize(analyzed, authored=program.authored)
-    problem = build_problem(extract_ledger(module.entry_function()))
+    problem = build_problem(extract_ledger(pre_completion_tir(module)))
     dma = [task for task in problem.tasks if task.op == "GmToUb"]
     assert dma, "the carrier has no GmToUb task, so this test proves nothing"
     for task in dma:

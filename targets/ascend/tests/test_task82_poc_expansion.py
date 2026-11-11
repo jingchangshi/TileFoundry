@@ -23,12 +23,13 @@ def _built():
     from tilefoundry.cli.source import checked_program
     from tilefoundry.analysis.api import analyze
     from tilefoundry.schedule.finalize import finalize
+    from tilefoundry_ascend.passes.p3_chain import pre_completion_tir
     from tilefoundry_ascend.schedule.ledger import build_problem, extract_ledger
 
     prog = checked_program(FIX + ":PipeVaddCarrier", None, command="task82-expand")
     analyzed = analyze(prog.module, prog.entry, analysis=("memory",))
     module = finalize(analyzed, authored=prog.authored)
-    ledger = extract_ledger(module.entry_function())
+    ledger = extract_ledger(pre_completion_tir(module))
     return ledger, build_problem(ledger)
 
 

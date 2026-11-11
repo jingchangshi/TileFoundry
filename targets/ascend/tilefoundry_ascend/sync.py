@@ -807,13 +807,26 @@ def _reachable_drain(tir_module):
 
 
 def _append_aiv_drain(node):
+    """Append the region-exit Drain, UNLESS the program already ends with one.
+
+    THE "UNLESS" IS THE WHOLE POINT. The injected carrier is R3's materialised, unrolled
+    program, and since P4-03 that program ALREADY carries its completion block, Drain included
+    -- the completion plan is emitted into it before C runs. Appending unconditionally therefore
+    produced TWO Drains (at s0/s31 and s0/s32), and every "the Drain was sealed away" control
+    then sealed the first one, found the second still reachable, and failed against a program
+    that was correct. A region has ONE exit; the emitter must agree with the rest of the chain
+    about where it is.
+    """
     import dataclasses as _dc
     from tilefoundry.ir.tir.stmts import ExecutionScope, MeshScope
+
     if isinstance(node, Sequential):
         if node.body and isinstance(node.body[-1], (MeshScope, ExecutionScope)):
             last = node.body[-1]
             inner = _append_aiv_drain(last.body)
             return _dc.replace(node, body=tuple(node.body[:-1]) + (_dc.replace(last, body=inner),))
+        if node.body and isinstance(getattr(node.body[-1], "callable", None), Drain):
+            return node
         return _dc.replace(node, body=tuple(node.body) + (Evaluate(callable=AivDrain(), args=()),))
     return node
 

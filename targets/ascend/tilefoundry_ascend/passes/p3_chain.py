@@ -55,6 +55,8 @@ __all__ = [
     "stamp_record",
     "require_fresh",
     "require_export_ready",
+    "pre_materialize_tir",
+    "pre_completion_tir",
     "RunAscendAnalysisChain",
     "GateRunnableExport",
 ]
@@ -192,6 +194,11 @@ class ChainRecord:
     completion_status: str = ""
     storage_status: str = ""
     materialized_digest: str = ""
+    # The FINAL TIR's own verdict (P4-03). Distinct from completion_status and storage_status,
+    # which judge ARTIFACTS: this one judges the emitted PROGRAM, and it is the only status
+    # that can catch a Wait emitted after the access it guards.
+    scheduled_status: str = ""
+    scheduled_code: str = ""
     pipeline_digest: str = ""
     pipeline_status: str = ""
     applied: tuple = ()
@@ -201,6 +208,33 @@ class ChainRecord:
 
     def as_dict(self) -> dict:
         return {name: getattr(self, name) for name in self.__dataclass_fields__}
+
+
+def pre_materialize_tir(module):
+    """The program BEFORE R2/R3 unrolling -- one serial loop body.
+
+    The L/S/C-stage consumers (assertion/ledger extraction, manual L->S->R->C pipelines, the
+    P4-01 completion derivation) reason about the SERIAL loop. The module's entry_function() is
+    the FINAL, unrolled, completion-carrying program: it is the runnable artifact and it is not
+    what those passes describe. This accessor is how a caller says WHICH program it means,
+    instead of relying on whichever one the module happens to expose.
+    """
+    stored = getattr(module, "metadata", {}).get("ascend.p3_pre_materialize")
+    if stored is not None:
+        return stored
+    return module.entry_function()
+
+
+def pre_completion_tir(module):
+    """The program BEFORE completion emission (and therefore before unrolling).
+
+    A caller that derives or verifies the completion program must start here: injecting into a
+    program that already carries the completion block emits every flag a second time.
+    """
+    stored = getattr(module, "metadata", {}).get("ascend.p3_pre_completion")
+    if stored is not None:
+        return stored
+    return pre_materialize_tir(module)
 
 
 def _stored_chain(module) -> ChainRecord | None:
@@ -269,8 +303,17 @@ class RunAscendAnalysisChain(ModulePass):
 
         # 3. Solve, 4. Resolve, 5. Layout, 6. Materialize: one call so a failure names a
         #    single stage instead of leaving the record half-describing two attempts.
-        record = _solve_resolve_materialize(module, record, problem, entry)
-        return _store_chain(module, record)
+        record, materialized = _solve_resolve_materialize(module, record, problem, entry)
+        module = _store_chain(module, record)
+        if materialized is not None:
+            # INSTALL the materialized program. Without this the pass returns a module whose
+            # verbose schedule, completion statements and physical addresses live only in
+            # metadata, so every downstream consumer -- and the export gate -- judges the
+            # program from BEFORE the rewrite while the record says the rewrite passed.
+            module = replace(module, functions=tuple(
+                materialized if f.name == materialized.name else f
+                for f in getattr(module, "functions", ())))
+        return module
 
 
 def _entry_prim(module: Module) -> PrimFunction | None:
@@ -319,6 +362,7 @@ def _solve_resolve_materialize(module, record, problem, entry):
     from ..plan import pipeline as PIPE
     from ..plan import resolved_plan as RP
     from ..plan import materialize as MAT
+    from ..plan import scheduled_verify as SV
     from ..solver import bridge as B
 
     # 2b. Project the ledger problem onto the solver contract. Without this the solver
@@ -329,10 +373,10 @@ def _solve_resolve_materialize(module, record, problem, entry):
         projected, provenance = project_loop_problem(module, problem, entry)
     except ExportRefusal as refusal:
         return replace(record, stopped_at="project",
-                       reason="CHAIN_PROJECTION_REFUSED:%s" % (refusal.code,))
+                       reason="CHAIN_PROJECTION_REFUSED:%s" % (refusal.code,)), None
     except Exception as error:  # noqa: BLE001
         return replace(record, stopped_at="project",
-                       reason="CHAIN_PROJECTION_FAILED:%s" % (type(error).__name__,))
+                       reason="CHAIN_PROJECTION_FAILED:%s" % (type(error).__name__,)), None
     module.metadata["ascend.p3_projected"] = (projected, provenance)
     record = replace(record, projected_digest=_digest(projected))
 
@@ -345,7 +389,7 @@ def _solve_resolve_materialize(module, record, problem, entry):
     except Exception as error:  # noqa: BLE001
         return replace(record, stopped_at="solve",
                        reason="CHAIN_SOLVE_FAILED:%s:%s"
-                       % (type(error).__name__, getattr(error, "code", "")))
+                       % (type(error).__name__, getattr(error, "code", ""))), None
     postcheck = (getattr(core, "postcheck", None) or {}).get("verdict", "")
     record = replace(record, solve_state=str(getattr(core, "state", "")),
                      solve_postcheck=str(postcheck))
@@ -361,7 +405,7 @@ def _solve_resolve_materialize(module, record, problem, entry):
     except Exception as error:  # noqa: BLE001
         return replace(record, stopped_at="resolve",
                        reason="CHAIN_RESOLVE_FAILED:%s:%s"
-                       % (type(error).__name__, getattr(error, "code", "")))
+                       % (type(error).__name__, getattr(error, "code", ""))), None
     record = replace(record, planning_status=str(plan.state.planning_status),
                      # Carried verbatim from the plan: completion is a P4 obligation and
                      # this stage never promotes it. A plan that arrives PENDING stays
@@ -374,10 +418,14 @@ def _solve_resolve_materialize(module, record, problem, entry):
     #     verified there. A failure is recorded with the specific code and STOPS the chain:
     #     a plan whose completion did not verify must not reach the export gate claiming it
     #     did, and it must not silently continue to layout as if the stage had passed.
+    # Keep the program BEFORE completion emission. Materialization must unroll THIS one:
+    # unrolling a body that already carries the completion block would replicate the block per
+    # instance, and re-emitting into that would double it again.
+    module.metadata["ascend.p3_pre_completion"] = entry
     completion, entry = _attach_completion(module, plan, entry)
     if completion is None:
         return replace(record, stopped_at="completion",
-                       reason="CHAIN_COMPLETION_FAILED")
+                       reason="CHAIN_COMPLETION_FAILED"), None
     record = replace(record, completion_status=str(completion.report.status),
                      applied=tuple(record.applied) + ("completion",))
     if not completion.verified:
@@ -386,7 +434,7 @@ def _solve_resolve_materialize(module, record, problem, entry):
                          % (completion.code or "COMPLETION_NOT_VERIFIED",))
         module.metadata["ascend.p3_plan"] = plan
         module.metadata["ascend.p3_completion"] = completion
-        return record
+        return record, None
     plan = CP.attach_completion_plan(plan, completion)
     module.metadata["ascend.p3_completion"] = completion
     record = replace(record, completion_status=str(plan.state.completion_status),
@@ -402,7 +450,7 @@ def _solve_resolve_materialize(module, record, problem, entry):
         record = replace(record, storage_status="UNATTACHED", stopped_at="layout",
                          reason="STORAGE_PLACEMENT_UNATTACHED")
         module.metadata["ascend.p3_plan"] = plan
-        return record
+        return record, None
     record = replace(record, storage_status=str(storage.status))
     if not storage.verified:
         record = replace(record, storage_status=str(storage.status), stopped_at="layout",
@@ -410,31 +458,102 @@ def _solve_resolve_materialize(module, record, problem, entry):
                          % (storage.code or "STORAGE_PLACEMENT_UNVERIFIED",))
         module.metadata["ascend.p3_plan"] = plan
         module.metadata["ascend.p3_storage"] = storage
-        return record
+        return record, None
     record = replace(record, storage_status="RESOLVED", plan_digest=_digest(plan))
     module.metadata["ascend.p3_storage"] = storage
     module.metadata["ascend.p3_plan"] = plan
 
+    # 5b. Record the PRE-materialization program. It is what the L/S/C-layer tests and the
+    #     manual pipelines need (a serial loop with one body), and it is NOT the runnable
+    #     artifact. Keeping it under a NAMED key is what lets those callers read it without
+    #     mistaking it for the program that will run -- the module's entry_function() is, from
+    #     here on, the unrolled one.
+    module.metadata["ascend.p3_pre_materialize"] = entry
+
     # 6. Materialize: R2/R3 static unroll is the honest output for a serial schedule.
+    unroll_source = module.metadata.get("ascend.p3_pre_completion") or entry
     try:
-        rewritten, matmap = MAT.materialize_plan(entry, plan)
-        report = MAT.verify_plan_application(entry, plan, rewritten, matmap,
+        rewritten, matmap = MAT.materialize_plan(unroll_source, plan)
+        report = MAT.verify_plan_application(unroll_source, plan, rewritten, matmap,
                                              require_drain=False)
     except Exception as error:  # noqa: BLE001
         return replace(record, stopped_at="materialize",
                        reason="CHAIN_MATERIALIZE_FAILED:%s:%s"
-                       % (type(error).__name__, getattr(error, "code", "")))
+                       % (type(error).__name__, getattr(error, "code", ""))), None
     if report.get("status") != "PASS":
         return replace(record, stopped_at="materialize",
-                       reason="CHAIN_MATERIALIZE_UNVERIFIED:%s" % (report.get("code"),))
+                       reason="CHAIN_MATERIALIZE_UNVERIFIED:%s" % (report.get("code"),)), None
+
+    # THE REWRITE MUST BE INSTALLED, NOT MERELY RECORDED. verify_plan_application accepts
+    # (original, plan, rewritten) and proves the REWRITTEN program is the materialized one; it
+    # says nothing about what the MODULE now holds. Storing the rewrite in metadata and leaving
+    # the module's function untouched made every downstream stage -- and the export gate --
+    # judge a program that was never rewritten. That is the sidecar-only defect G42 exists to
+    # remove, and it failed in the worst direction: the gate said READY.
+    plan = MAT.apply_plan(plan, matmap)
+    installed = next((f for f in getattr(module, "functions", ()) if f.name == rewritten.name),
+                     None)
+    if installed is None:
+        return replace(record, stopped_at="materialize",
+                       reason="CHAIN_MATERIALIZE_NOT_INSTALLED:%s" % (rewritten.name,)), None
+    # 6a. RE-EMIT completion into the UNROLLED body. The completion program was derived and
+    #     verified against the serial plan, which is correct and stays correct; but the
+    #     statements must now be placed against the REAL per-instance statements, or every
+    #     Wait lands after the access it guards and guards nothing.
+    try:
+        completion = CP.reemit_into_unrolled(completion, rewritten, plan,
+                                             target=_target_of(module),
+                                             materialization=matmap)
+    except Exception as error:  # noqa: BLE001
+        return replace(record, stopped_at="completion",
+                       reason="CHAIN_COMPLETION_REEMIT_FAILED:%s:%s"
+                       % (type(error).__name__, getattr(error, "code", ""))), rewritten
+    module.metadata["ascend.p3_completion"] = completion
+    if not completion.verified:
+        return replace(record, stopped_at="completion",
+                       reason="CHAIN_COMPLETION_REEMIT_UNVERIFIED:%s"
+                       % (completion.code or "COMPLETION_NOT_VERIFIED",)), rewritten
+    rewritten = completion.rewritten_tir
+    module.metadata["ascend.p3_materialized"] = (rewritten, matmap)
+    module.metadata["ascend.p3_plan"] = plan
     record = replace(record,
                      application_status=str(plan.state.application_status),
                      materialized_digest=str(getattr(matmap, "rewritten_digest", "")),
                      applied=tuple(record.applied) + ("materialize",))
-    module.metadata["ascend.p3_materialized"] = (rewritten, matmap)
+
+    # 6b. Verify the FINAL TIR as a program (P4-03). This runs on the REWRITTEN function --
+    #     the one that is about to be installed -- because the whole point is to judge what
+    #     will run. A verifier that ran on the pre-rewrite function would confirm the input
+    #     and say nothing about the output.
+    try:
+        verdict = SV.verify_scheduled_tir(rewritten, plan,
+                                          placement=getattr(storage, "placement", None),
+                                          completion=completion)
+    except Exception as error:  # noqa: BLE001
+        return replace(record, stopped_at="scheduled_verify",
+                       reason="CHAIN_SCHEDULED_VERIFY_FAILED:%s"
+                       % (type(error).__name__,)), rewritten
+    # THE FINISHED PROGRAM REMEMBERS WHICH PROGRAM IT CAME FROM.
+    # entry_function() is now the unrolled, completion-carrying artifact. Downstream code that
+    # needs the SERIAL loop (P4-01 completion derivation, ledger extraction) can no longer ask
+    # the module for "the program" and get the right answer. Carrying the origin on the function
+    # itself means such a caller can recover it from the object it was handed, instead of having
+    # to know which stage produced it -- and a program that is NOT a product of this chain
+    # simply has no such attribute and is treated as itself.
+    try:
+        rewritten._p3_pre_materialize = module.metadata.get("ascend.p3_pre_materialize")
+    except (AttributeError, TypeError):  # frozen dataclass, or a plain node
+        pass
+    module.metadata["ascend.p3_scheduled"] = verdict
+    record = replace(record, scheduled_status=str(verdict.status),
+                     scheduled_code=str(verdict.code))
+    if not verdict.verified:
+        return replace(record, stopped_at="scheduled_verify",
+                       reason="CHAIN_SCHEDULED_TIR_REFUSED:%s"
+                       % (verdict.code or "STIR_NOT_VERIFIED",)), rewritten
 
     # 7. Pipeline: applied ONLY where it is reachable and verified, else RECORDED.
-    return _apply_pipeline(module, record, plan, entry)
+    return _apply_pipeline(module, record, plan, entry), rewritten
 
 
 def _apply_pipeline(module, record, plan, entry):
@@ -551,6 +670,10 @@ def _nominal_solve_result(core, problem):
             "capacity_scope": getattr(core, "capacity_scope", None)}
 
 
+#: The completion_status a plan must carry before the export gate accepts it.
+RP_COMPLETION_VERIFIED = "VERIFIED"
+
+
 def _attach_storage(module, plan, completion):
     """Build, verify and attach the P4-02 physical storage placement.
 
@@ -575,6 +698,16 @@ def _attach_storage(module, plan, completion):
     return storage, placed
 
 
+def _target_of(module):
+    """The module's target, or None when the module does not carry one.
+
+    Used to pick target-legal COMPLETION OPS. Returning None is safe (the caller falls back
+    to the core ops); inventing a default target here would let a target-specific legality
+    question be answered by a target the program is not for.
+    """
+    return getattr(module, "target", None)
+
+
 def _attach_completion(module, plan, entry):
     """Build and verify the P4-01 completion program for the resolved plan.
 
@@ -584,7 +717,11 @@ def _attach_completion(module, plan, entry):
     failure instead of carrying a half-built completion artifact.
     """
     try:
-        completion = CP.build_completion_plan(plan, entry)
+        # The target decides which completion OPS are legal: an Ascend kernel runs in an
+        # aiv mesh, so the core thread-mesh FlagSet would be rejected by the standard
+        # verifier at the very end of the chain. Threading the target through here is what
+        # makes the emitted program legal in the mesh it actually runs in.
+        completion = CP.build_completion_plan(plan, entry, target=_target_of(module))
     except Exception as error:  # noqa: BLE001 - the refusal IS the recorded outcome
         code = str(getattr(error, "code", "")) or type(error).__name__
         module.metadata["ascend.p3_completion_refusal"] = code
@@ -616,46 +753,7 @@ def _chain_sources(module, projected) -> dict:
             "P": "p:predicate-provenance"}
 
 
-def _storage_facts(module, plan):
-    """Physical storage placement for every planned buffer, or None when not attached.
-
-    P4 owns physical storage: which arena a buffer lands in, at what base offset. Until
-    that placement is ATTACHED and VERIFIED the chain must not synthesize one. Returning
-    None makes the absence explicit and stops the chain at layout with
-    STORAGE_PLACEMENT_UNATTACHED, which is the P3/P4 boundary this gate exists for.
-    """
-    attached = module.metadata.get("ascend.storage_placement")
-    if not attached or not getattr(attached, "verified", False):
-        return None
-    placements = getattr(attached, "placements", {}) or {}
-    facts = {}
-    for buffer in plan.buffers:
-        entry = placements.get(buffer.root)
-        if entry is None:
-            return None
-        facts[buffer.root] = dict(entry)
-    return facts or None
-
-# --------------------------------------------------------------- the export gate
-#: Mirrors plan.resolved_plan.COMPLETION_VERIFIED without importing the plan module at
-#: module scope (this module is imported by the pass registry, which the plan pulls in).
-RP_COMPLETION_VERIFIED = "VERIFIED"
-
-
-@register_pass(Ascend950PRTarget, PassPoint.AFTER_LOWER)
-class GateRunnableExport(ModulePass):
-    """AFTER: record whether a FINAL RUNNABLE artifact may be published.
-
-    This pass does not raise. It RECORDS the gate verdict on module metadata, because
-    inspection must stay possible on a module that cannot be exported: a caller asking
-    "why can this not run" needs the module back, and a pass that raised would deny the
-    very state that explains the refusal. The refusal is raised by the EXPORT path
-    (require_export_ready), which is the only place a runnable artifact is produced.
-    """
-
-    name = "p3.gate_runnable_export"
-
-    def run(self, module: Module) -> Module:
+def run(self, module: Module) -> Module:
         record = _stored_chain(module)
         module.metadata[EXPORT_GATE_KEY] = require_export_ready(module, record,
                                                                raising=False)
@@ -687,6 +785,12 @@ def require_export_ready(module: Module, record: ChainRecord | None = None, *,
             gaps.append(("completion", "COMPLETION_NOT_VERIFIED"))
         if record.storage_status != "RESOLVED":
             gaps.append(("storage", "STORAGE_PLACEMENT_UNVERIFIED"))
+        # P4-03: the FINAL TIR must have been judged as a program. Without this the gate can
+        # be satisfied by correct ARTIFACTS while the emitted program is wrong -- which is
+        # exactly what happened before scheduled verification existed: completion and storage
+        # both verified, and the final TIR emitted every Wait after the access it guards.
+        if record.scheduled_status != "VERIFIED":
+            gaps.append(("scheduled", record.scheduled_code or "SCHEDULED_TIR_NOT_VERIFIED"))
     verdict = {"ready": not gaps, "gaps": [list(gap) for gap in gaps],
                "completion": (record.completion_status if record else ""),
                "storage": (record.storage_status if record else "")}

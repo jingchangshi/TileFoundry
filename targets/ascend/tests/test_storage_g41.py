@@ -54,9 +54,23 @@ def _plan_and_completion():
     module = _module()
     plan = module.metadata.get("ascend.p3_plan")
     assert plan is not None, "the chain did not reach resolve"
-    completion = CP.build_completion_plan(plan, module.entry_function())
+    # COMPLETION IS PLANNED AGAINST THE PRE-MATERIALIZATION PROGRAM.
+    # entry_function() is now the FINISHED artifact: unrolled AND completion-carrying. Planning
+    # completion on it asks for the completion of a program that already has one, and the
+    # emitter then reports 31 extra statements. The serial program is the input this stage
+    # reasons about, so it is asked for by name.
+    from tilefoundry_ascend.passes.p3_chain import pre_completion_tir
+
+    completion = CP.build_completion_plan(plan, pre_completion_tir(module))
     assert completion.verified, (completion.code, completion.report.detail)
     return plan, completion
+
+
+def _serial(module):
+    """The program BEFORE completion emission -- what completion is derived against."""
+    from tilefoundry_ascend.passes.p3_chain import pre_completion_tir
+
+    return pre_completion_tir(module)
 
 
 def _storage(plan, completion, **kw):
@@ -254,7 +268,7 @@ def test_changing_the_version_count_changes_the_placement_and_the_peak():
         grown_plan = dataclasses.replace(grown_plan, buffers=tuple(buffers))
     from tilefoundry_ascend import completion as CP
 
-    grown_completion = CP.build_completion_plan(grown_plan, _module().entry_function())
+    grown_completion = CP.build_completion_plan(grown_plan, _serial(_module()))
     grown = _storage(grown_plan, grown_completion)
     assert grown.verified, (grown.code, grown.verdict.detail)
 
@@ -578,8 +592,12 @@ def test_the_chain_resolves_storage_and_the_export_gate_sees_it():
     storage = module.metadata.get("ascend.p3_storage")
     assert storage is not None and storage.verified
     gate = require_export_ready(module, record, raising=False)
-    assert gate["ready"] is False, (
-        "the staged-TIR emission is still outstanding, so the gate must not be ready")
+    # P4-03 LANDED THE STAGED TIR, so this gate is now READY.
+    # At G41 the scheduled-TIR emission was still outstanding and this asserted not-ready. With
+    # G42 the chain emits, verifies and installs the scheduled program, so "not ready" would
+    # assert that the stage we just completed did not happen. What this test is really for is
+    # the two clauses below: storage and completion must not appear as gaps once verified.
+    assert gate["ready"] is True, gate["gaps"]
     assert not any(gap[0] == "storage" for gap in gate["gaps"]), (
         "storage is verified, so it must not be reported as a gap: %s" % (gate["gaps"],))
     assert not any(gap[0] == "completion" for gap in gate["gaps"]), (
