@@ -1,6 +1,6 @@
 {
   "gate": "G43",
-  "status": "BLOCKED_ENV",
+  "status": "CORRECTED -- SUPERSEDED_BY_DEVICE_EVIDENCE",
   "recorded_at": "2026-11-11T21:52:32.800Z",
   "claim": "A single-logical-kernel MixedKernel cannot be compiled on this host, so no device evidence for G43 exists yet. Nothing below is a device observation of TF-generated code.",
   "what_works": {
@@ -50,5 +50,32 @@
     "head": "f9a902d (P4-03/G42)",
     "working_tree": "clean",
     "note": "No G43 code written yet; nothing partial to revert."
-  }
+  },
+  "what_was_implemented_structurally": {
+    "why": "P4-04 scope decided with the Lead: build everything that CAN be verified without device execution, and mark every device-dependent item BLOCKED. This proves the TF/TileLang/Ascend contract integration before the toolchain is fixed.",
+    "modules": {
+      "targets/ascend/tilefoundry_ascend/mixed/model.py": "Structural MixedKernel contract: single-kernel identity by construction, both-domain participation, no-GM-intermediate route check, L0C transfer issuer/owner and no-conversion check, cross-core edge requirement, and MixedEvidence which separates `structural` from `device` so a structural pass cannot be read as a gate pass.",
+      "targets/ascend/tilefoundry_ascend/mixed/twin.py": "Explicit TileLang twin for a MixedKernel (both domains as literal scopes, every handoff as a set/wait pair, auto_schedule=False emitted unconditionally), a text parser that reads the twin back, and check_conformance comparing spec against parsed twin."
+    },
+    "tests": {
+      "targets/ascend/tests/test_mixed_kernel_g43.py": "18 tests. Every contract clause has a test that VIOLATES it and asserts the named refusal.",
+      "targets/ascend/tests/test_mixed_twin_g43.py": "15 tests. Includes auto_schedule absence, second launch scope, missing domain, dropped sync, set-without-wait, GM intermediate."
+    },
+    "key_boundary": "test_structural_success_is_not_a_gate_pass asserts MixedEvidence.is_gate_pass() is False even when structural==VERIFIED, because G43 demands DEVICE evidence. ConformanceReport.compiled stays False with the reason attached.",
+    "still_blocked": "Everything requiring execution: FP16 numerics, BF16 numerics, KV trip=1/2/below-pipeline-depth, tail rows, all-invalid padding rows, dual-AIV runtime behaviour, resource measurement, and TileLang actually accepting the twin."
+  },
+  "status_after_structural_work": {
+    "structural": "VERIFIED (33 tests, CPU only)",
+    "device": "BLOCKED_ENV",
+    "gate": "BLOCKED_ENV -- NOT a pass"
+  },
+  "correction_notice": {
+    "this_file_is_retained_deliberately": "This record is KEPT, not deleted. It documents a real error: the BLOCKED_ENV verdict was generalised from one CANN tree to the whole host. Deleting it would let the same mistake be made again, and would hide that a gate was once reported blocked for the wrong reason.",
+    "the_error": "The toolchain check inspected /usr/local/Ascend/ascend-toolkit (CANN 9.1.0) and, finding the asc_pack_* / asc_*_mode symbols absent there, concluded the host could not compile TileLang 0.1.15 at all.",
+    "what_remains_true": "CANN 9.1.0 at that path genuinely lacks asc_pack_to_high, asc_pack_to_low, asc_storealign_pack_quarter, asc_set_l0c_copy_nz_para, asc_set_gm2l1_nz_para, asc_load_l2_cache_mode, asc_dual_dst_mode, asc_unit_flag_mode, asc_quant_mode and asc_relu_pre_mode. That observation was correct.",
+    "what_was_false": "The generalisation. A matching CANN 9.3.0 is installed at /data/pri/9.3.0-weekly/cann-9.3.0 and compiles TileLang 0.1.15 cleanly.",
+    "how_it_was_caught": "The Team Lead reported a working canary at that path; I reproduced it myself (examples/ascend/example_vecadd.py, both simt and simd: 'correctness passed'), then the flash_attention core (rel err 0.0012), before deleting or rewriting anything.",
+    "superseded_by": "evidence/G43_DEVICE_EVIDENCE.json -- 17/17 device cases on Ascend950PR, FP16 and BF16."
+  },
+  "method_lesson": "A negative result about ONE installation path is not a result about the machine. The filesystem should have been searched for other CANN installs before a gate was reported blocked."
 }

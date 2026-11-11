@@ -1,0 +1,247 @@
+{
+  "gate": "G43",
+  "task": "P4-04",
+  "status": "VERIFIED",
+  "deliverable": "Single-logical-launch MixedKernel (QK -> mask/softmax -> P pack -> UB->L1 -> PV -> normalise) executed on Ascend950PR with correct numerics for FP16 and BF16.",
+  "device": {
+    "arch": "Ascend950PR",
+    "profile_id": "ascend950pr_9579",
+    "device_id": 0,
+    "toolchain": "CANN 9.3.0 (/data/pri/9.3.0-weekly/cann-9.3.0)",
+    "execution_path": "docker exec s00653124-bska, flock -n /home/.tf_device0.lock, ASCEND_RT_VISIBLE_DEVICES=0",
+    "tilelang": "0.1.15"
+  },
+  "correction_of_earlier_verdict": {
+    "prior_claim": "G43 was recorded BLOCKED_ENV because TileLang 0.1.15 appeared unable to compile against the host toolchain.",
+    "what_was_wrong": "The check was run against /usr/local/Ascend/ascend-toolkit (CANN 9.1.0) only. That tree genuinely lacks asc_pack_to_high, asc_pack_to_low, asc_storealign_pack_quarter, asc_set_l0c_copy_nz_para, asc_set_gm2l1_nz_para, and the asc_*_mode types, which is a true property of 9.1.0.",
+    "what_is_true": "A matching CANN 9.3.0 is installed at /data/pri/9.3.0-weekly/cann-9.3.0 and compiles TileLang 0.1.15 cleanly. Verified by reproducing examples/ascend/example_vecadd.py (both simt and simd report 'correctness passed') and then the flash_attention core (rel err 0.0012).",
+    "lesson": "The blocker was generalised from one CANN tree to 'the host' without searching the filesystem for other installs. The blocker file is retained under evidence/ as the record of that error, not deleted."
+  },
+  "implementation_mapping_to_verified_core": {
+    "base": "examples/ascend/flash_attention/core.py (verified numerically on this silicon before any modification)",
+    "vendored_to": "targets/ascend/tilefoundry_ascend/mixed/fa_core.py",
+    "correspondence": "1:1 macro sequence inside ONE T.Kernel: qk -> softmax -> pack_p -> pv -> accumulate_output -> finalize. The mixed kernel IS that sequence; it is not a lookalike.",
+    "extensions_beyond_base": [
+      "in_dtype parameter: the base hardcodes dtype='bfloat16'. FP16 support required parameterising dtype plus the 5 S.vcvt calls and 2 T.reinterpret calls that named bf16 explicitly. That is the entire FP16 extension.",
+      "kv_mask parameter: an additive bias buffer added to the scaled scores BEFORE the row max, so padded KV columns contribute exactly 0 to exp and to l.",
+      "all-invalid-row guards (two, both required, see nan_guards below)."
+    ],
+    "discarded_intermediate": "An earlier hand-rolled SIMD softmax compiled and ran but produced NaN. It is discarded as evidence; its numeric path is reused nowhere. The structural contract checker from that phase was kept because it is independent of numerics."
+  },
+  "nan_guards": {
+    "why_two_are_needed": "Both were found by RUNNING the all-invalid case, not by review.",
+    "guard_1_softmax": "Clamp the row max to a finite floor (-1e30). Without it an all-masked row gives exp(-inf - -inf) = exp(NaN) = NaN.",
+    "guard_2_normalise": "Divide by (l + 1e-30) instead of l. Clamping the max alone still leaves the final normalisation as 0/0 = NaN. For a valid row l is order 1 so 1e-30 cannot move the quotient; for an all-invalid row the numerator is already 0, so 0/(0+eps) = 0 exactly. Verified: max_abs exactly 0.000e+00."
+  },
+  "measured_results": [
+    {
+      "label": "BF16 in / FP32 out",
+      "in_dtype": "bfloat16",
+      "out_dtype": "float32",
+      "q": 128,
+      "kv": 128,
+      "trip": 1,
+      "max_abs": 0.0009341239929199219,
+      "rel": 0.001274543418730128,
+      "nan": false,
+      "ok": true
+    },
+    {
+      "label": "FP16 in / FP32 out",
+      "in_dtype": "float16",
+      "out_dtype": "float32",
+      "q": 128,
+      "kv": 128,
+      "trip": 1,
+      "max_abs": 0.00010496377944946289,
+      "rel": 0.00014301061794961105,
+      "nan": false,
+      "ok": true
+    },
+    {
+      "label": "BF16 in / BF16 out",
+      "in_dtype": "bfloat16",
+      "out_dtype": "bfloat16",
+      "q": 128,
+      "kv": 128,
+      "trip": 1,
+      "max_abs": 0.0019338130950927734,
+      "rel": 0.002638545602174596,
+      "nan": false,
+      "ok": true
+    },
+    {
+      "label": "FP16 in / FP16 out",
+      "in_dtype": "float16",
+      "out_dtype": "float16",
+      "q": 128,
+      "kv": 128,
+      "trip": 1,
+      "max_abs": 0.00028508901596069336,
+      "rel": 0.00038842690837762045,
+      "nan": false,
+      "ok": true
+    },
+    {
+      "label": "BF16 trip=1 kv=128",
+      "in_dtype": "bfloat16",
+      "out_dtype": "float32",
+      "q": 128,
+      "kv": 128,
+      "trip": 1,
+      "max_abs": 0.0009341239929199219,
+      "rel": 0.001274543418730128,
+      "nan": false,
+      "ok": true
+    },
+    {
+      "label": "BF16 trip=2 kv=256",
+      "in_dtype": "bfloat16",
+      "out_dtype": "float32",
+      "q": 128,
+      "kv": 256,
+      "trip": 2,
+      "max_abs": 0.0006285831332206726,
+      "rel": 0.0014356892816274858,
+      "nan": false,
+      "ok": true
+    },
+    {
+      "label": "BF16 trip=3 kv=384",
+      "in_dtype": "bfloat16",
+      "out_dtype": "float32",
+      "q": 128,
+      "kv": 384,
+      "trip": 3,
+      "max_abs": 0.0005184933543205261,
+      "rel": 0.0016317352015303528,
+      "nan": false,
+      "ok": true
+    },
+    {
+      "label": "BF16 trip=4 kv=512",
+      "in_dtype": "bfloat16",
+      "out_dtype": "float32",
+      "q": 128,
+      "kv": 512,
+      "trip": 4,
+      "max_abs": 0.0004474073648452759,
+      "rel": 0.001435996179604502,
+      "nan": false,
+      "ok": true
+    },
+    {
+      "label": "FP16 trip=1 kv=128",
+      "in_dtype": "float16",
+      "out_dtype": "float32",
+      "q": 128,
+      "kv": 128,
+      "trip": 1,
+      "max_abs": 0.00010496377944946289,
+      "rel": 0.00014301061794961105,
+      "nan": false,
+      "ok": true
+    },
+    {
+      "label": "FP16 trip=2 kv=256",
+      "in_dtype": "float16",
+      "out_dtype": "float32",
+      "q": 128,
+      "kv": 256,
+      "trip": 2,
+      "max_abs": 0.00007357820868492126,
+      "rel": 0.00016777000225131697,
+      "nan": false,
+      "ok": true
+    },
+    {
+      "label": "FP16 trip=3 kv=384",
+      "in_dtype": "float16",
+      "out_dtype": "float32",
+      "q": 128,
+      "kv": 384,
+      "trip": 3,
+      "max_abs": 0.0000645071268081665,
+      "rel": 0.00020256810878876064,
+      "nan": false,
+      "ok": true
+    },
+    {
+      "label": "FP16 trip=4 kv=512",
+      "in_dtype": "float16",
+      "out_dtype": "float32",
+      "q": 128,
+      "kv": 512,
+      "trip": 4,
+      "max_abs": 0.00005332566797733307,
+      "rel": 0.00017094294922820653,
+      "nan": false,
+      "ok": true
+    },
+    {
+      "label": "BF16 tail: 64/128 KV valid",
+      "in_dtype": "bfloat16",
+      "q": 128,
+      "kv": 128,
+      "valid_kv": 64,
+      "nan": false,
+      "rel": 0.001379899938251253,
+      "ok": true
+    },
+    {
+      "label": "FP16 tail: 64/128 KV valid",
+      "in_dtype": "float16",
+      "q": 128,
+      "kv": 128,
+      "valid_kv": 64,
+      "nan": false,
+      "rel": 0.00014824158054208694,
+      "ok": true
+    },
+    {
+      "label": "BF16 tail: 1/128 KV valid",
+      "in_dtype": "bfloat16",
+      "q": 128,
+      "kv": 128,
+      "valid_kv": 1,
+      "nan": false,
+      "rel": 0,
+      "ok": true
+    },
+    {
+      "label": "BF16 all-invalid padding",
+      "in_dtype": "bfloat16",
+      "q": 128,
+      "kv": 128,
+      "all_invalid": true,
+      "nan": false,
+      "all_zero": true,
+      "ok": true
+    },
+    {
+      "label": "FP16 all-invalid padding",
+      "in_dtype": "float16",
+      "q": 128,
+      "kv": 128,
+      "all_invalid": true,
+      "nan": false,
+      "all_zero": true,
+      "ok": true
+    }
+  ],
+  "summary": {
+    "total": 17,
+    "passed": 17
+  },
+  "pinned_constraints": [
+    "head_dim == 128 (pre-existing SIMD packing limit of the base kernel, not introduced here).",
+    "BC == 128 == 2*VL; padding must be uniform across KV blocks because the Bias buffer ABI is (BC,), not (kv_len,). A per-position mask would need a different ABI and is NOT claimed.",
+    "Pinned shape is recorded in MixedKernelSpec.metadata next to the device claim so the two cannot drift apart."
+  ],
+  "not_claimed": [
+    "Cycle timing or performance figures.",
+    "Physical sufficiency of flag placement: cross-core synchronisation here is COMPILER-DERIVED from the dual_copy dataflow, not hand-emitted. No claim is made that any particular flag id is set.",
+    "Generality beyond head_dim == 128 and block-aligned padding.",
+    "Formal proof over all inputs: correctness is demonstrated by numerical comparison against torch SDPA on the listed cases."
+  ]
+}
