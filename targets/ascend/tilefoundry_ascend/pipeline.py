@@ -41,15 +41,35 @@ def compile_case(case_dict: dict, steps: int | None = None):
                    negative_tests={}, all_negative_rejected=False, plan_digest=None)
         return out
     text, events, hdr = materialize_tir(problem, plan, st)
-    ver = verify(problem, text)
+    ver = verify(problem, text, plan)
     lay = verify_layout(problem, plan)
     parsed = parse_events(text)
+    # The negative probes are named after the ROLE they break, and the role is resolved to the
+    # derived channel the plan actually produced. A literal channel name here would mutate a
+    # channel that no longer exists, and a mutation that changes nothing is a negative test that
+    # cannot fail -- the worst possible kind.
+    from .lowering.materialize import channel_names
+    roles = channel_names(plan)
     neg = {}
-    for name, mut in (("drop_y_ready_wait", lambda e: mutate_drop_wait(e, "y_ready")),
-                      ("drop_x_ready_wait", lambda e: mutate_drop_wait(e, "x_ready")),
-                      ("early_x_free", lambda e: mutate_early_free(e)),
-                      ("wrong_x_slot", lambda e: mutate_wrong_slot(e))):
-        r = verify_text_events(problem, mut(parsed))
+    for name, mut in (
+            ("drop_y_ready_wait",
+             lambda e: mutate_drop_wait(e, roles["y_ready"])),
+            ("drop_x_ready_wait",
+             lambda e: mutate_drop_wait(e, roles["x_ready"])),
+            ("early_x_free",
+             lambda e: mutate_early_free(e, free_channel=roles["x_free"],
+                                         ready_channel=roles["x_ready"])),
+            ("wrong_x_slot",
+             lambda e: mutate_wrong_slot(e, versions=problem.policy["x_versions"]))):
+        # A mutation that cannot change the program must not be reported as "rejected": that
+        # would make all_negative_rejected true on the strength of a no-op. It is recorded as
+        # NOT_APPLICABLE with the reason, and the caller sees the gap.
+        try:
+            mutated = mut(parsed)
+        except ValueError as error:
+            neg[name] = {"rejected": False, "not_applicable": str(error), "errors": []}
+            continue
+        r = verify_text_events(problem, mutated, plan)
         neg[name] = {"rejected": not r["ok"], "errors": r["errors"][:4]}
     out.update(tir_text=text, tir_header=hdr, verify=ver, layout=lay, negative_tests=neg,
                all_negative_rejected=all(v["rejected"] for v in neg.values()),

@@ -91,9 +91,16 @@ def test_chain_reaches_a_real_plan():
 def test_the_chain_stops_at_the_p4_boundary_not_before_it():
     """The chain must get as far as storage, because that is the REAL boundary today.
 
-    It stops at layout with STORAGE_PLACEMENT_UNATTACHED: completion and physical storage
-    are P4 obligations and this stage must not fabricate either. If P4 lands, this test
-    fails on purpose so the boundary gets re-stated instead of quietly sliding.
+    RE-STATED WHEN P4-01 LANDED. This test used to assert completion_status == "PENDING",
+    because completion was a P4 obligation that P3 had to refuse to fabricate. P4-01/G40 now
+    derives and verifies completion for real, so the boundary has MOVED: completion is
+    VERIFIED and storage placement is what remains UNATTACHED. The test is re-stated rather
+    than deleted, and it still asserts the thing that matters -- the chain stops at layout and
+    does not silently claim a runnable artifact -- so a later slide is still caught.
+
+    What is NOT claimed here: that completion being VERIFIED means the program is runnable.
+    Storage, and the device evidence for P4-02/P4-03, are still outstanding; the test below
+    pins that the export is refused for BOTH remaining reasons.
     """
     record = _chain(_finalize())
     assert record.stopped_at == "layout", (
@@ -101,7 +108,11 @@ def test_the_chain_stops_at_the_p4_boundary_not_before_it():
         " this asserts 'layout'" % (record.stopped_at, record.reason))
     assert record.reason == "STORAGE_PLACEMENT_UNATTACHED"
     assert record.storage_status == "UNATTACHED"
-    assert record.completion_status == "PENDING"
+    # P4-01 is real: completion is derived AND verified, not merely assumed.
+    assert record.completion_status == "VERIFIED", (
+        "completion_status is %r (%s); P4-01 must derive, verify and attach a real completion"
+        " plan, and a regression to PENDING/UNVERIFIED means the stage stopped working"
+        % (record.completion_status, record.reason))
 
 
 # --------------------------------------------------------------- policy re-analysis
@@ -203,11 +214,19 @@ def test_the_ir_identity_is_content_derived_not_object_derived():
 
 
 # --------------------------------------------------------------- the export gate
-def test_export_refused_while_completion_and_storage_are_unverified():
-    """A final runnable artifact must be refused, naming BOTH missing P4 obligations.
+def test_export_refused_while_storage_is_unverified():
+    """A final runnable artifact is still refused, and the refusal names what is missing.
 
-    Naming both matters: they are fixed by different work. A single "not ready" verdict
-    would let an operator fix one, re-run, and be refused again with no new information.
+    RE-STATED WHEN P4-01 LANDED. This test used to require BOTH "COMPLETION_NOT_VERIFIED" and
+    "STORAGE_PLACEMENT_UNVERIFIED" in the refusal. P4-01 now verifies completion for real, so
+    completion is no longer a gap -- and demanding its absence would make the gate lie in the
+    other direction. What is preserved is the property that mattered: the refusal is LOCATED
+    (it names each outstanding obligation separately), so an operator fixing one and re-running
+    gets new information rather than the same undifferentiated "not ready".
+
+    The assertion is therefore split: storage must still be named, and completion must NOT be
+    named as unverified while its status is VERIFIED -- if completion regresses, this test goes
+    green on storage and the second assertion is what reports the regression.
     """
     from tilefoundry_ascend.passes.p3_chain import ExportRefusal, require_export_ready
 
@@ -217,8 +236,15 @@ def test_export_refused_while_completion_and_storage_are_unverified():
     refusal = caught.value
     assert refusal.code == "EXPORT_NOT_RUNNABLE"
     joined = " ".join(refusal.missing)
-    assert "COMPLETION_NOT_VERIFIED" in joined
-    assert "STORAGE_PLACEMENT_UNVERIFIED" in joined
+    assert "STORAGE_PLACEMENT_UNVERIFIED" in joined, (
+        "storage placement is still UNATTACHED, so the refusal must name it: %s" % joined)
+    completion = module.metadata.get("ascend.p3_completion")
+    if completion is not None and completion.status == "VERIFIED":
+        assert "COMPLETION_NOT_VERIFIED" not in joined, (
+            "completion is VERIFIED but the refusal still reports it unverified: %s" % joined)
+    else:
+        assert "COMPLETION_NOT_VERIFIED" in joined, (
+            "completion is not verified yet the refusal does not name it: %s" % joined)
 
 
 def test_inspection_is_still_available_on_a_non_exportable_module():

@@ -25,8 +25,48 @@ def _slot(t, V):
     return t % V
 
 
+def channel_names(plan) -> dict:
+    """Map the DEMO's ring roles onto the channels the plan actually derived.
+
+    WHY THIS IS NOT A HARDCODED LIST ANY MORE. This module emits a three-task demo program
+    (x_load -> main_vf -> y_store) as text TIR, and it used to spell the six channel names
+    literally: x_ready, x_free, y_ready, y_free. Those names were RMSNorm's, and after the
+    obligation derivation became a function of the program (schedule/sync.py) they no longer
+    exist -- so a literal lookup would either crash or, worse, emit a program naming channels
+    the allocator never assigned.
+
+    The roles are looked up by what they ORDER instead: which task produces, which consumes,
+    which event kind. A role with no derived channel is a refusal naming the missing edge,
+    never a silently invented name.
+    """
+    by_pair = {}
+    for obligation in plan.get("obligations") or ():
+        key = (obligation.get("producer"), obligation.get("consumer"),
+               "free" if "free" in str(obligation.get("channel", "")) else "ready")
+        by_pair.setdefault(key, str(obligation.get("channel")))
+
+    roles = {
+        "x_ready": ("x_load", "main_vf", "ready"),
+        "x_free": ("main_vf", "x_load", "free"),
+        "y_ready": ("main_vf", "y_store", "ready"),
+        "y_free": ("y_store", "main_vf", "free"),
+    }
+    names = {}
+    missing = []
+    for role, key in roles.items():
+        channel = by_pair.get(key)
+        if channel is None:
+            missing.append("%s (needs a %s edge %s->%s)" % (role, key[2], key[0], key[1]))
+            continue
+        names[role] = channel
+    if missing:
+        raise KeyError("the plan derived no channel for: " + "; ".join(missing))
+    return names
+
+
 def iter_events(problem, plan, steps: int):
     Vx = problem.policy["x_versions"]; Vy = problem.policy["y_versions"]
+    names = channel_names(plan)
     st = plan["stages"]
     sl, sv, so = st["x_load"], st["main_vf"], st["y_store"]
     S = problem.policy["requested_num_stages"]
@@ -44,24 +84,24 @@ def iter_events(problem, plan, steps: int):
         if 0 <= t < steps:
             add("GUARD", "x_load", _slot(t, Vx), t, "x_load", t)
             if t >= Vx:
-                add("WAIT", "x_free", _slot(t, Vx), t, "x_load", t)
+                add("WAIT", names["x_free"], _slot(t, Vx), t, "x_load", t)
             add("MTE2", "x_load", _slot(t, Vx), t, "x_load", t)
-            add("SET", "x_ready", _slot(t, Vx), t, "x_load", t)
+            add("SET", names["x_ready"], _slot(t, Vx), t, "x_load", t)
         # main_vf at stage sv
         t = q - sv
         if 0 <= t < steps:
-            add("WAIT", "x_ready", _slot(t, Vx), t, "main_vf", t)
+            add("WAIT", names["x_ready"], _slot(t, Vx), t, "main_vf", t)
             if t >= Vy:
-                add("WAIT", "y_free", _slot(t, Vy), t, "main_vf", t)
+                add("WAIT", names["y_free"], _slot(t, Vy), t, "main_vf", t)
             add("VECTOR", "main_vf", _slot(t, Vy), t, "main_vf", t)
-            add("SET", "x_free", _slot(t, Vx), t, "main_vf", t)
-            add("SET", "y_ready", _slot(t, Vy), t, "main_vf", t)
+            add("SET", names["x_free"], _slot(t, Vx), t, "main_vf", t)
+            add("SET", names["y_ready"], _slot(t, Vy), t, "main_vf", t)
         # y_store at stage so
         t = q - so
         if 0 <= t < steps:
-            add("WAIT", "y_ready", _slot(t, Vy), t, "y_store", t)
+            add("WAIT", names["y_ready"], _slot(t, Vy), t, "y_store", t)
             add("MTE3", "y_store", _slot(t, Vy), t, "y_store", t)
-            add("SET", "y_free", _slot(t, Vy), t, "y_store", t)
+            add("SET", names["y_free"], _slot(t, Vy), t, "y_store", t)
     add("DRAIN", "drain", 0, total_q, "drain", steps)
     return ev
 
@@ -104,4 +144,4 @@ def materialize_tir(problem, plan, steps: int):
     return text, ev, hdr
 
 
-__all__ = ["Event", "iter_events", "materialize_tir"]
+__all__ = ["Event", "channel_names", "iter_events", "materialize_tir"]

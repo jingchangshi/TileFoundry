@@ -69,7 +69,28 @@ def parse_flags(text: str):
     return out
 
 
-def verify(problem, text: str):
+def _channel_names_of(problem, plan):
+    """The channel names the PLAN derived, or None when the plan carries no obligations.
+
+    Imported lazily from the emitter so there is exactly ONE mapping from ring roles to
+    derived channels: if the emitter's answer were recomputed differently here, the verifier
+    and the emitter could disagree while both looked self-consistent.
+    """
+    from .materialize import channel_names
+
+    try:
+        return channel_names(plan)
+    except KeyError:
+        return None
+
+
+def verify(problem, text: str, plan=None):
+    """Re-parse and re-check the printed TIR.
+
+    'plan' is optional so the signature stays compatible, but when supplied the derived channel
+    names and pipe pairs come from IT. Without a plan the verifier cannot know which channels
+    the program was supposed to have, and it says so rather than falling back to a literal list.
+    """
     Vx = problem.policy["x_versions"]; Vy = problem.policy["y_versions"]
     ev = parse_events(text)
     errors = []
@@ -102,24 +123,47 @@ def verify(problem, text: str):
         if (d["set"] and d["wait"] and d["set"] != d["wait"]) or len(d["set"]) > 1 or len(d["wait"]) > 1:
             errors.append("[M6-FLAG-MISMATCH] channel %s set %s wait %s"
                           % (ch, sorted(d["set"]), sorted(d["wait"])))
-    # M6-UNKNOWN-CHANNEL: a WAIT/SET on a channel outside the known sync set is rejected.
-    _KNOWN_CHANNELS = {"x_ready", "x_free", "y_ready", "y_free", "w_ready", "w_conv"}
+    # M6-UNKNOWN-CHANNEL: a WAIT/SET on a channel the PLAN never derived is rejected.
+    # The known set is read from the plan's own obligations, so a program that invents a
+    # channel -- or an emitter still using the old RMSNorm names -- is caught by name.
+    names = _channel_names_of(problem, plan)
+    known = set(names.values()) if names else set()
+    for obligation in plan.get("obligations") or ():
+        if obligation.get("channel"):
+            known.add(str(obligation["channel"]))
     for e in ev:
-        if e.kind in ("WAIT", "SET") and e.channel not in _KNOWN_CHANNELS:
+        if e.kind in ("WAIT", "SET") and e.channel not in known:
             errors.append("[M6-UNKNOWN-CHANNEL] unknown sync channel: " + e.channel)
-    # [M6-MISSING-X-FREE-WAIT]
-    xload_mtes = [e for e in ev if e.kind == "MTE2" and e.t >= Vx]
-    n_xfree_wait = sum(1 for e in ev if e.kind == "WAIT" and e.channel == "x_free")
-    if n_xfree_wait < len(xload_mtes):
-        errors.append("[M6-MISSING-X-FREE-WAIT] %d x_free wait(s) for %d x_load write(s) needing one"
-                      % (n_xfree_wait, len(xload_mtes)))
-    # ---- per-slot state machine (unchanged semantics) ----
+    # The ring a channel/op belongs to is identified by WHAT IT ORDERS, looked up from the plan
+    # rather than by literal channel names: the names are derived now (see
+    # lowering/materialize.channel_names), so a literal comparison would silently stop matching.
+    names = _channel_names_of(problem, plan)
+    x_channels = {names["x_ready"], names["x_free"]} if names else set()
+    y_channels = {names["y_ready"], names["y_free"]} if names else set()
+
+    # [M6-MISSING-X-FREE-WAIT] -- only when the plan actually HAS an x_free edge. A program
+    # whose derivation produced no free edge (a write-only root, or a single-generation region)
+    # has nothing to free, and demanding the wait would be a rule about a channel that does not
+    # exist. The check is on the DERIVED channel, so dropping a derived wait still fails.
+    x_ready_channel = names["x_ready"] if names else None
+    x_free_channel = names["x_free"] if names else None
+    y_ready_channel = names["y_ready"] if names else None
+    y_free_channel = names["y_free"] if names else None
+    if x_free_channel is not None:
+        xload_mtes = [e for e in ev if e.kind == "MTE2" and e.t >= Vx]
+        n_xfree_wait = sum(1 for e in ev
+                           if e.kind == "WAIT" and e.channel == x_free_channel)
+        if n_xfree_wait < len(xload_mtes):
+            errors.append("[M6-MISSING-X-FREE-WAIT] %d x_free wait(s) for %d x_load write(s)"
+                          " needing one" % (n_xfree_wait, len(xload_mtes)))
+    # ---- per-slot state machine ----
     xstate = {i: "free" for i in range(Vx)}
     ystate = {i: "free" for i in range(Vy)}
+
     def _ver_for(e):
-        if e.channel in ("x_free", "x_ready") or e.kind == "MTE2":
+        if e.channel in x_channels or e.kind == "MTE2":
             return Vx
-        if e.channel in ("y_free", "y_ready") or e.kind in ("MTE3", "VECTOR"):
+        if e.channel in y_channels or e.kind in ("MTE3", "VECTOR"):
             return Vy
         return None
     for e in ev:
@@ -129,7 +173,7 @@ def verify(problem, text: str):
                 errors.append(f"t={e.t}: {e.kind}/{e.channel} gen {e.gen} != logical iteration t")
             if e.slot != (e.gen % V):
                 errors.append(f"t={e.t}: {e.kind}/{e.channel} slot {e.slot} != gen%{V} ({e.gen % V}); tile-index used as generation?")
-        if e.kind == "WAIT" and e.channel == "x_free":
+        if e.kind == "WAIT" and e.channel == x_free_channel:
             if xstate.get(e.slot) != "free":
                 errors.append(f"t={e.t}: wait x_free on slot {e.slot} in state {xstate.get(e.slot)}")
         elif e.kind == "MTE2":
@@ -137,22 +181,22 @@ def verify(problem, text: str):
                 errors.append(f"t={e.t}: mte2 writes x slot {e.slot} not free ({xstate.get(e.slot)})")
             else:
                 xstate[e.slot] = "x_written"
-        elif e.kind == "SET" and e.channel == "x_ready":
+        elif e.kind == "SET" and e.channel == x_ready_channel:
             if xstate.get(e.slot) != "x_written":
                 errors.append(f"t={e.t}: set x_ready slot {e.slot} in state {xstate.get(e.slot)}")
             else:
                 xstate[e.slot] = "x_ready"
-        elif e.kind == "WAIT" and e.channel == "x_ready":
+        elif e.kind == "WAIT" and e.channel == x_ready_channel:
             if xstate.get(e.slot) != "x_ready":
                 errors.append(f"t={e.t}: wait x_ready slot {e.slot} in state {xstate.get(e.slot)}")
             else:
                 xstate[e.slot] = "x_reading"
-        elif e.kind == "SET" and e.channel == "x_free":
+        elif e.kind == "SET" and e.channel == x_free_channel:
             if xstate.get(e.slot) != "x_reading":
                 errors.append(f"t={e.t}: set x_free slot {e.slot} in state {xstate.get(e.slot)} (early free?)")
             else:
                 xstate[e.slot] = "free"
-        elif e.kind == "WAIT" and e.channel == "y_free":
+        elif e.kind == "WAIT" and e.channel == y_free_channel:
             if ystate.get(e.slot) != "free":
                 errors.append(f"t={e.t}: wait y_free slot {e.slot} in state {ystate.get(e.slot)}")
         elif e.kind == "VECTOR":
@@ -160,12 +204,12 @@ def verify(problem, text: str):
                 errors.append(f"t={e.t}: main_vf writes y slot {e.slot} not free ({ystate.get(e.slot)})")
             else:
                 ystate[e.slot] = "y_written"
-        elif e.kind == "SET" and e.channel == "y_ready":
+        elif e.kind == "SET" and e.channel == y_ready_channel:
             if ystate.get(e.slot) != "y_written":
                 errors.append(f"t={e.t}: set y_ready slot {e.slot} in state {ystate.get(e.slot)}")
             else:
                 ystate[e.slot] = "y_ready"
-        elif e.kind == "WAIT" and e.channel == "y_ready":
+        elif e.kind == "WAIT" and e.channel == y_ready_channel:
             if ystate.get(e.slot) != "y_ready":
                 errors.append(f"t={e.t}: wait y_ready slot {e.slot} in state {ystate.get(e.slot)}")
             else:
@@ -173,7 +217,7 @@ def verify(problem, text: str):
         elif e.kind == "MTE3":
             if ystate.get(e.slot) != "y_reading":
                 errors.append(f"t={e.t}: mte3 reads y slot {e.slot} in state {ystate.get(e.slot)}")
-        elif e.kind == "SET" and e.channel == "y_free":
+        elif e.kind == "SET" and e.channel == y_free_channel:
             if ystate.get(e.slot) != "y_reading":
                 errors.append(f"t={e.t}: set y_free slot {e.slot} in state {ystate.get(e.slot)}")
             else:
@@ -201,14 +245,22 @@ def mutate_drop_wait(events, channel, occurrence=0):
     return out
 
 
-def mutate_early_free(events, occurrence=0):
-    """Swap a SET x_free to just before the matching VF read (x_ready wait)."""
+def mutate_early_free(events, occurrence=0, free_channel=None, ready_channel=None):
+    """Swap a FREE set to just before the read that consumes it -- an EARLY FREE.
+
+    The channel names default to the legacy RMSNorm spellings so existing callers keep working,
+    but a caller holding a DERIVED plan should pass the real names: mutating a channel that the
+    program no longer contains produces an unchanged program, and an unchanged program passes,
+    which is a negative test that cannot fail.
+    """
+    free_channel = free_channel or "x_free"
+    ready_channel = ready_channel or "x_ready"
     ev = _clone(events)
     for i, e in enumerate(ev):
-        if e.kind == "SET" and e.channel == "x_free":
+        if e.kind == "SET" and e.channel == free_channel:
             if occurrence == 0:
                 j = i
-                while j > 0 and not (ev[j].kind == "WAIT" and ev[j].channel == "x_ready"):
+                while j > 0 and not (ev[j].kind == "WAIT" and ev[j].channel == ready_channel):
                     j -= 1
                 block = ev.pop(i)
                 ev.insert(j, block)
@@ -217,18 +269,37 @@ def mutate_early_free(events, occurrence=0):
     return ev
 
 
-def mutate_wrong_slot(events, occurrence=0):
-    ev = _clone(events); seen = 0
+def mutate_wrong_slot(events, occurrence=0, versions=None):
+    """Shift one MTE2's slot to a DIFFERENT slot -- the tile-index-as-generation defect.
+
+    WHY versions IS NOW A PARAMETER. This used to pick the ring width from the largest slot it
+    happened to observe. On a program with a SINGLE logical iteration every slot is 0, so the
+    width came out as 1 and the shift was '0 -> 0': the mutation changed nothing, the verifier
+    passed, and the negative test silently reported success while proving nothing. The width
+    must be the ring's declared version count, and a mutation that cannot change the slot is
+    reported as a refusal to mutate rather than returned as an unchanged program.
+    """
+    ev = _clone(events)
+    width = int(versions) if versions else 0
+    if width <= 0:
+        observed = [x.slot for x in ev if x.kind == "MTE2"]
+        width = (max(observed) + 1) if observed else 0
+    if width <= 1:
+        raise ValueError(
+            "cannot mutate a wrong slot: the program has a single slot, so any slot change"
+            " would be indistinguishable from the correct program; pass the ring's version"
+            " count to exercise this defect on a multi-version ring")
+    seen = 0
     for e in ev:
         if e.kind == "MTE2":
             if seen == occurrence:
-                e.slot = (e.slot + 1) % max(1, (max([x.slot for x in ev if x.kind == 'MTE2']) or 0) + 1)
+                e.slot = (e.slot + 1) % width
                 return ev
             seen += 1
     return ev
 
 
-def verify_text_events(problem, events):
+def verify_text_events(problem, events, plan=None):
     """Re-print mutated events to text and verify (keeps the text-extraction path).
 
     Emits consistent per-channel flag ids and a trailing drain, so a mutation is
@@ -252,41 +323,57 @@ def verify_text_events(problem, events):
         elif e.kind == "VECTOR":
             lines.append("    simdvf %s slot=%d t=%d" % (e.task, e.slot, e.t))
     lines.append("  drain()")
-    return verify(problem, chr(10).join(lines))
+    return verify(problem, chr(10).join(lines), plan)
 
 
-#: The only legal pipe pair for each logical channel. A Set/Wait edge that does not
-#: cross exactly this producer->consumer pipe pair is a pipe mismatch.
-_EXPECTED_PIPES = {
-    "x_ready": ("mte2", "vector"),
-    "x_free": ("vector", "mte2"),
-    "y_ready": ("vector", "mte3"),
-    "y_free": ("mte3", "vector"),
-    "w_ready": ("mte2", "vector"),
-    "w_conv": ("vector", "vector"),
-}
 _KNOWN_PIPES = {"mte2", "mte3", "vector", "scalar", "fix"}
 
 
+def expected_pipes(plan) -> dict:
+    """channel -> the (producer pipe, consumer pipe) the PLAN derived for it.
+
+    WHY THIS IS DERIVED. This table used to be a literal dict keyed on the six RMSNorm channel
+    names (x_ready, x_free, ...). Those names are now derived from the program, so a literal
+    table stops matching the moment the program changes -- and a check that no longer matches
+    its input does not fail loudly, it silently passes. The expected pair is therefore read
+    from the same obligations the allocator used, which is the only set of pairs that can be
+    wrong in the same way the plan is wrong.
+    """
+    pairs = {}
+    for obligation in plan.get("obligations") or ():
+        channel = str(obligation.get("channel") or "")
+        if channel:
+            pairs[channel] = (str(obligation.get("producer_pipe") or ""),
+                              str(obligation.get("consumer_pipe") or ""))
+    return pairs
+
+
 def verify_pipes(plan) -> dict:
-    """[M6-PIPE-MISMATCH]: every sync action must cross the legal producer->consumer pipe.
+    """[M6-PIPE-MISMATCH]: every sync action must cross the pipe pair the plan derived.
 
     Pipes are a plan-level property (the TIR text does not encode them), so this checks
-    plan['sync_actions'] against the canonical channel->pipe table. Unknown pipes and
-    same-pipe (no cross-engine) edges are also rejected.
+    plan['sync_actions'] against the derived channel->pipe map. Unknown pipes and same-pipe
+    (no cross-engine) edges are also rejected.
     """
     errors = []
+    table = expected_pipes(plan)
     for a in plan.get("sync_actions", []):
         ch = a.get("channel"); pp = a.get("producer_pipe"); cp = a.get("consumer_pipe")
         if pp not in _KNOWN_PIPES or cp not in _KNOWN_PIPES:
             errors.append("[M6-PIPE-MISMATCH] channel %s unknown pipe %s->%s" % (ch, pp, cp))
             continue
-        exp = _EXPECTED_PIPES.get(ch)
-        if exp is not None and (pp, cp) != exp:
+        exp = table.get(ch)
+        if exp is None:
+            # A sync action on a channel the plan never derived has no legal pipe pair at all.
+            errors.append("[M6-PIPE-MISMATCH] channel %s is not in the plan's derived"
+                          " obligations, so it has no legal pipe pair" % (ch,))
+            continue
+        if exp[0] and exp[1] and (pp, cp) != exp:
             errors.append("[M6-PIPE-MISMATCH] channel %s pipe %s->%s != expected %s->%s"
                           % (ch, pp, cp, exp[0], exp[1]))
-        if pp == cp and ch not in ("w_conv",):
-            errors.append("[M6-PIPE-MISMATCH] channel %s set/wait on the same pipe %s (no cross-engine edge)" % (ch, pp))
+        if pp == cp and exp[0] != exp[1]:
+            errors.append("[M6-PIPE-MISMATCH] channel %s set/wait on the same pipe %s (its"
+                          " derived edge does not cross engines)" % (ch, pp))
     return {"ok": not errors, "errors": errors, "rule": "M6-PIPE-MISMATCH"}
 
 

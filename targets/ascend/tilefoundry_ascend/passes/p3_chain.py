@@ -39,6 +39,7 @@ from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.passes.pass_base import ModulePass
 from tilefoundry.passes.pass_manager import PassPoint, register_pass
 
+from .. import completion as CP
 from ..memory import SPACE_FACTS
 from ..tf_target import Ascend950PRTarget
 
@@ -367,6 +368,29 @@ def _solve_resolve_materialize(module, record, problem, entry):
                      completion_status=str(plan.state.completion_status),
                      plan_digest=_digest(plan))
 
+    # 4b. Completion (P4-01). The obligations are derived from THIS plan's real accesses,
+    #     allocated into the target's real event namespaces, emitted into the ACTUAL TIR and
+    #     verified there. A failure is recorded with the specific code and STOPS the chain:
+    #     a plan whose completion did not verify must not reach the export gate claiming it
+    #     did, and it must not silently continue to layout as if the stage had passed.
+    completion, entry = _attach_completion(module, plan, entry)
+    if completion is None:
+        return replace(record, stopped_at="completion",
+                       reason="CHAIN_COMPLETION_FAILED")
+    record = replace(record, completion_status=str(completion.report.status),
+                     applied=tuple(record.applied) + ("completion",))
+    if not completion.verified:
+        record = replace(record, stopped_at="completion",
+                         reason="CHAIN_COMPLETION_UNVERIFIED:%s"
+                         % (completion.code or "COMPLETION_NOT_VERIFIED",))
+        module.metadata["ascend.p3_plan"] = plan
+        module.metadata["ascend.p3_completion"] = completion
+        return record
+    plan = CP.attach_completion_plan(plan, completion)
+    module.metadata["ascend.p3_completion"] = completion
+    record = replace(record, completion_status=str(plan.state.completion_status),
+                     plan_digest=_digest(plan))
+
     # 5. Layout. Physical storage placement is a P4 obligation: until it is attached the
     #    chain records storage_status=UNATTACHED and STOPS. It does not invent offsets,
     #    because a fabricated arena layout is indistinguishable from a verified one.
@@ -521,6 +545,25 @@ def _nominal_solve_result(core, problem):
             "capacity_scope": getattr(core, "capacity_scope", None)}
 
 
+def _attach_completion(module, plan, entry):
+    """Build and verify the P4-01 completion program for the resolved plan.
+
+    Returns (completion_plan_or_None, entry). The entry is returned because the completion
+    statements are injected into it: the caller continues with the program that will actually
+    run, not with the one before injection. A refusal returns None so the chain names the
+    failure instead of carrying a half-built completion artifact.
+    """
+    try:
+        completion = CP.build_completion_plan(plan, entry)
+    except Exception as error:  # noqa: BLE001 - the refusal IS the recorded outcome
+        code = str(getattr(error, "code", "")) or type(error).__name__
+        module.metadata["ascend.p3_completion_refusal"] = code
+        return None, entry
+    if completion.rewritten_tir is not None:
+        entry = completion.rewritten_tir
+    return completion, entry
+
+
 def _chain_sources(module, projected) -> dict:
     """The five source descriptors the plan builder requires, each REAL where it exists.
 
@@ -533,10 +576,12 @@ def _chain_sources(module, projected) -> dict:
     chain = _stored_chain(module) or ChainRecord()
     return {"L": str(projected.get("ledger_sha") or chain.ledger_sha or "L:absent"),
             "S": str(projected.get("problem_digest") or chain.problem_digest or "S:absent"),
-            # C is deliberately NOT a fabricated proof: the completion plan is not built
-            # at this stage, and pretending otherwise would let a plan cite verified
-            # completion that does not exist.
-            "C": "c:completion-pending",
+            # C names the completion artifact this run actually produced. While P4-01 has not
+            # run yet the descriptor says so ("pending"); it is never a fabricated proof of
+            # verified completion, because the descriptor names what exists, not what is
+            # wanted.
+            "C": ("c:completion-%s" % (chain.completion_status.lower(),)
+                  if chain.completion_status else "c:completion-pending"),
             "F": "f:pipeline-manifest",
             "P": "p:predicate-provenance"}
 
