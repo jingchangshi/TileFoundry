@@ -1,0 +1,54 @@
+{
+  "gate": "G43",
+  "status": "BLOCKED_ENV",
+  "recorded_at": "2026-11-11T21:52:32.800Z",
+  "claim": "A single-logical-kernel MixedKernel cannot be compiled on this host, so no device evidence for G43 exists yet. Nothing below is a device observation of TF-generated code.",
+  "what_works": {
+    "npu_hardware": "npu-smi 25.7.rc1 reports 3x Ascend950PR, all Health=OK (NPU 0/1/2).",
+    "torch_npu": "torch_npu 2.12.0 imports and executes after sourcing /usr/local/Ascend/ascend-toolkit/set_env.sh; torch.npu.device_count()==3; a real (64,64) matmul on device returned non-zero. Note: importing torch_npu without CANN env vars raises 'libhccl.so: cannot open shared object file'; the fix is sourcing set_env.sh, NOT a broken install.",
+    "bisheng": "present at /usr/local/Ascend/cann-9.1.0/tools/bisheng_compiler/bin/bisheng (clang 15.0.5), not on PATH by default."
+  },
+  "what_is_blocked": {
+    "finding": "TileLang 0.1.15 (installed build 0.1.15+cpu.git0e687c17, source HEAD 0e687c17) does not compile against the only CANN on this host, CANN 9.1.0.",
+    "reproduced_with": [
+      "examples/ascend/example_vecadd.py  (documented simplest example, SIMT vector add) -- fails",
+      "examples/ascend/flash_attention/core.py (flash_attention_fwd, q_len=kv_len=128, D=128) -- fails"
+    ],
+    "so_the_failure_is_not_my_kernel_and_not_MixedKernel_specific": true,
+    "undef_identifiers": [
+      "asc_pack_to_high (simd_inst.h:790)",
+      "asc_pack_to_low (simd_inst.h:792)",
+      "asc_storealign_pack_quarter (simd_inst.h:1035)",
+      "asc_set_gm2l1_nz_para, asc_set_l0c_copy_nz_para",
+      "types: asc_load_l2_cache_mode, asc_dual_dst_mode, asc_unit_flag_mode, asc_quant_mode, asc_relu_pre_mode"
+    ],
+    "verification_that_it_is_a_real_gap_and_not_a_missing_include": [
+      "The identifiers exist ONLY as deprecation-message TEXT inside a vendor OPP tree: opp/vendors/custom_transformer/.../reg_compute/reg_vector.h mentions 'asc_pack_to_high' only in [[deprecated]] notes recommending it over asc_pack_v2.",
+      "grep over CANN's own tikcpp framework (/usr/local/Ascend/cann-9.1.0/x86_64-linux/tikcpp/) finds ZERO occurrences -- so no include path can supply them.",
+      "A further independent mismatch: CANN's asc_aicore_printf_impl.h errors 'call to deleted constructor of __cce_scalar::__cce_builtin_block_idx_t', which is a CANN-internal-vs-TileLang codegen disagreement, not a missing symbol."
+    ],
+    "exact_command": "/usr/local/Ascend/cann-9.1.0/tools/bisheng_compiler/bin/bisheng -O2 -fPIC -std=c++20 -mllvm -cce-aicore-dcpreload-args=false --npu-arch=dav-3510 -I<tilelang>/src --cce-aicore-only tl_kernel.asc -o tl_kernel.rel.o"
+  },
+  "why_this_cannot_be_patched_around_honestly": [
+    "Adding -I to the vendor OPP tree only relocates deprecation MESSAGES; tikcpp has no definition, so it would fail differently rather than work.",
+    "Writing local shims for asc_pack_to_high/Low/storealign_pack_quarter would mean inventing hardware semantics for instructions I cannot verify, then reporting numerics produced by my own stub as TileLang codegen. That is fabricated evidence.",
+    "Downgrading/upgrading CANN or installing a driver is forbidden by AGENTS.md, and this session cannot use sudo."
+  ],
+  "what_did_NOT_happen": [
+    "No TF-generated MixedKernel was compiled.",
+    "No device execution of any TF/TileLang kernel.",
+    "No FP16/BF16 numerics, no trip=1/2/short counts, no dual-AIV evidence, no single-logical-launch evidence.",
+    "No claim is made that the G42 twin is accepted by TileLang; that remains UNVERIFIED from G42 and is now known to be unreachable on this host for the same reason."
+  ],
+  "unblocking_actions_for_the_operator": [
+    "Install a CANN release whose tikcpp defines asc_pack_to_high / asc_pack_to_low / asc_storealign_pack_quarter / the asc_*_mode types that TileLang 0.1.15 targets, and re-run examples/ascend/example_vecadd.py first as the canary (it must print 'vecadd (simt): correctness passed').",
+    "Or install a TileLang build matched to CANN 9.1.0 and confirm the same canary.",
+    "Either way the canary is the gate for starting G43 device work: if vecadd cannot run, no MixedKernel measurement on this host means anything."
+  ],
+  "repo_state": {
+    "branch": "feat/p3-02-resolve-schedule",
+    "head": "f9a902d (P4-03/G42)",
+    "working_tree": "clean",
+    "note": "No G43 code written yet; nothing partial to revert."
+  }
+}
