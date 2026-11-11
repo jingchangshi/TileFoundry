@@ -292,6 +292,11 @@ class ResolvedPlan:
     unsupported: tuple
     units: dict
     materialization: MaterializationMap = field(default_factory=MaterializationMap)
+    # Replan requests the resolve layer RECORDED (spec 2.5). They are carried so a
+    # consumer can see them instead of inferring silence, but build_resolved_plan only
+    # produces a plan with a non-empty tuple when the caller explicitly asked for a
+    # diagnostic view; the executable path refuses instead (see the refusal above).
+    resolution_diagnostics: tuple = ()
 
     def to_dict(self):
         return _jsonable({
@@ -975,7 +980,8 @@ def _resolve_dict_keys(value):
 
 def build_resolved_plan(problem, solve_result, source_manifests, *,
                         require_source_postcheck=True, capacities=None,
-                        enable_offset=None) -> ResolvedPlan:
+                        enable_offset=None, allow_replan_diagnostics=False
+                        ) -> ResolvedPlan:
     """R0/R1: build the plan from L's Problem + a REAL post-checked SAT result.
 
     Refuses a fallback/unknown solve (PLAN_REQUIRES_SAT) and any task/access/action id
@@ -1026,6 +1032,22 @@ def build_resolved_plan(problem, solve_result, source_manifests, *,
         problem, solve_result, tasks_in, buffers_in,
         require_source_postcheck=require_source_postcheck,
         capacities=capacities, enable_offset=enable_offset)
+    # A recorded replan request is NOT a usable schedule. resolve_assignment keeps
+    # parsing faithfully (spec 2.5 wants the violation RECORDED, not folded away), but a
+    # formal EXECUTABLE plan must not carry it onward: carrying it here is exactly how a
+    # cross-stage schedule under enable_offset=False would reach P3-03 materialization
+    # and be pipelined as if it were legal. Refuse by name; the caller that only wants a
+    # diagnostic view opts in explicitly.
+    replan = [row for row in resolution.diagnostics if row.get("needs_replan")]
+    if replan and not allow_replan_diagnostics:
+        first = replan[0]
+        raise PlanError(
+            "PLAN_RESOLVE_OFFSET_WINDOW_VIOLATED" if first.get("kind")
+            == "OFFSET_WINDOW_VIOLATED" else "PLAN_RESOLVE_REPLAN_REQUIRED",
+            "the solver assignment violates a hard constraint, so the formal plan must"
+            " not be built from it: " + str(first.get("detail", first.get("kind"))),
+            str(first.get("task_id") or first.get("root") or "resolution"),
+            "no needs_replan diagnostic", first, needs_replan=True)
     placed_rows = {row.task_id: row for row in resolution.tasks}
 
     tasks = []
@@ -1158,7 +1180,10 @@ def build_resolved_plan(problem, solve_result, source_manifests, *,
         unsupported=(), units={"byte_offset": "bytes", "byte_footprint": "bytes",
                                "version_stride_bytes": "bytes",
                                "latency": MODEL + " cycles", "ii": MODEL + " cycles",
-                               "start_time": MODEL + " cycles"})
+                               "start_time": MODEL + " cycles"},
+        # Carried, not dropped: only reachable when the caller explicitly opted into a
+        # diagnostic build, because the executable path refuses above.
+        resolution_diagnostics=tuple(resolution.diagnostics))
     digest = _digest(temp.to_dict())
     return ResolvedPlan(
         identity=PlanIdentity(**{**identity.__dict__, "plan_digest": digest}),
