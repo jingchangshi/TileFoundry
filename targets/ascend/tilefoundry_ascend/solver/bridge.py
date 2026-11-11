@@ -29,14 +29,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 from tilefoundry.vendor.tilelang_z3 import adapters as shared_adapters
 
+from .budget import BudgetExhausted, SolveBudget
+
 SCHEMA_REQUEST = "solver-request/1"
 SCHEMA_RESULT = "solver-result/1"
 SCHEMA_POSTCHECK = "solver-postcheck/1"
+SCHEMA_FALLBACK_CHECK = "solver-fallback-check/1"
 PROBLEM_SCHEMA = "real-problem/1"
 CORE_SOURCE_HASH = "tilelang_z3/core.py"
 
@@ -68,6 +72,13 @@ POSTCHECK_VERDICT_PASS = "POSTCHECK_PASS"
 #: pipe/resource names used by the Problem -> the core's resource bitmask.
 RESOURCE_BITS = {"mte1": 1, "mte2": 2, "mte3": 4, "cube": 8,
                  "vector": 16, "fixpipe": 32, "scalar": 64}
+
+#: ``task["stage"]`` is a HARD author constraint only when the source says its stage is
+#: author-fixed. Anything else (an absent stage, a cost-model projection, a nominal 0) is
+#: a fill that must not be allowed to pin the solver's k. The names are matched
+#: case-insensitively against ProblemTask["stage_source"].
+AUTHORED_STAGE_SOURCES = frozenset({"AUTHOR", "AUTHORED", "AUTHORED_STAGE",
+                                    "SOURCE_AUTHORED", "TUNABLE_STAGE"})
 
 
 class SolverError(RuntimeError):
@@ -263,11 +274,51 @@ def _timeout_ms(solve_options) -> int | None:
     return DEFAULT_SOLVE_TIMEOUT_MS
 
 
-def lower_problem_to_request(problem, model_facts, solve_options) -> SolveRequest:
+#: How many z3 feasibility checks one minimum-II binary search can perform. The core
+#: halves [ii_lower, ii_upper) per iteration, so this is the realistic upper bound of the
+#: search's log2 width. ``SolveBudget.per_check_ms`` divides the remaining TOTAL budget
+#: by it, which is what makes the per-check timeout a consequence of the total rather
+#: than an independent full grant repeated at every layer.
+_II_SEARCH_CHECKS = 16
+
+
+def _solve_total_ms(solve_options) -> int | None:
+    """Resolve the TOTAL budget for one solve tree, or None for the legacy path.
+
+    None means "no total budget": the historical behaviour, where only the per-check
+    timeout bounds anything. It stays the default so the published default-path
+    result_digest is untouched. A caller opts into a real total by passing
+    solve_options["limits"]["total_timeout_ms"].
+    """
+    limits = (solve_options or {}).get("limits")
+    if isinstance(limits, dict) and limits.get("total_timeout_ms") is not None:
+        value = limits["total_timeout_ms"]
+        if type(value) is not int or value <= 0:
+            raise SolverError("SOLVER_BUDGET_INVALID",
+                              "total_timeout_ms must be a positive integer of milliseconds",
+                              "solve_options.limits.total_timeout_ms", "> 0 int", value,
+                              phase="lower")
+        return int(value)
+    return None
+
+
+def lower_problem_to_request(problem, model_facts, solve_options, *, budget=None,
+                             diagnostics=None) -> SolveRequest:
     """S1/S2: a real Problem -> the shared core's normalized argument set.
 
     Every required constraint gets a trace entry; a constraint the core cannot
     express is named UNSUPPORTED, never silently dropped or defaulted to 0/1.
+
+    ``budget`` is the shared SolveBudget for the enclosing solve tree. Passing it turns
+    the per-check timeout into a share of the remaining total; omitting it preserves the
+    historical independent-per-check bound.
+
+    ``diagnostics`` is a caller-supplied dict that is FILLED with what this lowering
+    decided but did not encode. It is an out-parameter, not a request field, because
+    every field of SolveRequest folds into request_digest: putting a diagnostic there
+    would move the published default-path digest for a decision that changes no
+    constraint. Keys: "ignored_nominal_stages", "no_offset_stage_policy",
+    "manual_stage_mode", "force_single_stage".
     """
     model_facts = model_facts or {}
     solve_options = solve_options or {}
@@ -316,7 +367,15 @@ def lower_problem_to_request(problem, model_facts, solve_options) -> SolveReques
     def trace_add(kind, source_id, core_field, core_index, note=""):
         trace.append(ConstraintTrace(kind, source_id, core_field, core_index, "CONSUMED", note))
 
-    latencies, iis, resource_flags, stage_order = [], [], [], []
+    latencies, iis, resource_flags = [], [], []
+    # The AUTHORED stage of each task, in task_index_map order. A stage the author wrote is
+    # a hard constraint; it must reach the core as a manual stage or be refused, never be
+    # dropped. ``authored_stages`` is None only when NO task declares a stage at all.
+    authored_stages = []
+    stage_declared = []
+    # Nominal "stage" fills that are NOT author constraints. Recorded so they are visibly
+    # ignored rather than silently dropped; empty for a source that declares real stages.
+    ignored_nominal_stages = []
     for task in loop_tasks:
         tid = _task_id(task)
         resource = str(_get(task, "resource") or _get(task, "pipe") or "").lower()
@@ -326,9 +385,46 @@ def lower_problem_to_request(problem, model_facts, solve_options) -> SolveReques
         latencies.append(int(_get(task, "latency")))
         iis.append(int(_get(task, "issue_interval")))
         resource_flags.append(int(_get(task, "resource_flags", RESOURCE_BITS[resource])))
-        stage_order.append(int(_get(task, "stage", 0)))
+        # A stage is AUTHORED only when the source says so. The canonical ProblemTask has
+        # no stage field at all, so a bare "stage" key is a NOMINAL projection (see
+        # poc_vertical_adapter: "real-problem/1 has no latency/ii/stage; nominal 1/1/0").
+        # Treating a nominal fill as a hard author constraint would pin k for every task
+        # and silently widen II. Nominal fills are therefore IGNORED but RECORDED, which
+        # is the opposite of the previous silent drop.
+        raw_stage = _get(task, "stage", None)
+        stage_source = str(_get(task, "stage_source", "") or "").upper()
+        # Author-fixed only when the source says so AND a stage value is actually present.
+        # "AUTHORED but no stage" is an incomplete declaration, never a silent stage 0.
+        is_authored = stage_source in AUTHORED_STAGE_SOURCES and raw_stage is not None
+        if raw_stage is not None and not is_authored:
+            ignored_nominal_stages.append({"task_id": tid, "stage": raw_stage,
+                                           "stage_source": stage_source or "UNSPECIFIED",
+                                           "action": "IGNORED_AS_NOMINAL"})
+        if not is_authored:
+            authored_stages.append(0)
+            stage_declared.append(False)
+        else:
+            if type(raw_stage) is not int or raw_stage < 0:
+                raise SolverError("SOLVER_STAGE_INVALID",
+                                  "an authored stage must be a non-negative integer",
+                                  tid, ">= 0 int", raw_stage, phase="lower")
+            authored_stages.append(int(raw_stage))
+            stage_declared.append(True)
+            trace_add("authored_stage", tid, "manual_stages", task_index_map[tid],
+                      "author-fixed stage")
         trace_add("task", tid, "latencies/iis/resource_flags",
                   task_index_map[tid], "task row")
+    manual_stage_mode = any(stage_declared)
+    if manual_stage_mode and not all(stage_declared):
+        # A PARTIAL author stage set is ambiguous: the core's manual mode pins EVERY task's
+        # k, so an undeclared sibling would silently become stage 0. Refuse instead of
+        # inventing the missing half of the schedule.
+        missing = [task_index_map[_task_id(task)] for task, declared
+                   in zip(loop_tasks, stage_declared) if not declared]
+        raise SolverError("SOLVER_STAGE_INCOMPLETE",
+                          "every task needs an authored stage when any task declares one",
+                          "tasks[%d]" % missing[0], "stage on every task or none",
+                          missing, phase="lower")
 
     # Dependencies: normal distance is the LOGICAL iteration distance. A negative
     # distance is only the core's buffer-version encoding (-buffer_index-1) and is
@@ -444,6 +540,31 @@ def lower_problem_to_request(problem, model_facts, solve_options) -> SolveReques
                           "requested_num_stages", ">=1", num_stages, phase="lower")
     enable_offset = bool(solve_options.get("enable_offset",
                                            _get(problem, "enable_offset", False)))
+    # P3-01 / spec 2.5: with offset DISABLED the published contract is "every stage is 0
+    # and every start lies in one II window". The core's enable_offset=False only enforces
+    # the single-window half; forcing k=0 is manual mode with all-zero stages. That is a
+    # real capability with a real cost (it can widen II), so it is an explicit opt-in
+    # rather than a silent change to the default path:
+    #   * "auto"       - historical default; the single-window constraint only.
+    #   * "single_stage" - additionally pin k=0 for every task.
+    # An author-declared stage set is ALWAYS honoured as manual mode, independent of this.
+    enforce_no_offset_single_stage = solve_options.get(
+        "enforce_no_offset_single_stage",
+        _get(problem, "enforce_no_offset_single_stage", False))
+    if type(enforce_no_offset_single_stage) is not bool:
+        raise SolverError("SOLVER_OFFSET_POLICY_INVALID",
+                          "enforce_no_offset_single_stage must be a bool",
+                          "enforce_no_offset_single_stage", "bool",
+                          enforce_no_offset_single_stage, phase="lower")
+    if enable_offset and enforce_no_offset_single_stage:
+        raise SolverError("SOLVER_OFFSET_POLICY_INVALID",
+                          "enforce_no_offset_single_stage contradicts enable_offset=True",
+                          "enforce_no_offset_single_stage", "False when offset is enabled",
+                          enforce_no_offset_single_stage, phase="lower")
+    force_single_stage = (enforce_no_offset_single_stage and not manual_stage_mode)
+    manual_schedule = manual_stage_mode or force_single_stage
+    manual_stages = list(authored_stages) if manual_stage_mode else (
+        [0] * len(loop_tasks) if force_single_stage else None)
     seed = int(solve_options.get("seed", 42))
     core_args = {
         "num_stages": int(num_stages),
@@ -455,7 +576,7 @@ def lower_problem_to_request(problem, model_facts, solve_options) -> SolveReques
         "stage_order_deps": stage_order_deps or [],
         "recalculate_buffer_versions": True,
         "enable_offset": enable_offset,
-        "manual_stages": None, "manual_schedule": False,
+        "manual_stages": manual_stages, "manual_schedule": manual_schedule,
         "seed": seed, "verbose": False,
         "fixed_buffer_versions": fixed_versions,
         "return_status": True,
@@ -468,7 +589,17 @@ def lower_problem_to_request(problem, model_facts, solve_options) -> SolveReques
     # regression, it is a recorded change: the default-path digest is re-pinned in
     # test_solver_bridge_s3.S02_RESULT_DIGEST_AT_PATH_B, so this cannot happen unnoticed.
     # allow_fallback_on_unknown stays opt-in and absent by default.
+    #
+    # P3-01: when the caller declares a TOTAL budget, the per-check timeout becomes a
+    # derived share of what is actually left instead of an independent full grant. The
+    # default (no total) keeps _timeout_ms unchanged, so the pinned digest does not move.
     _timeout = _timeout_ms(solve_options)
+    if budget is not None and not isinstance(budget, SolveBudget):
+        raise SolverError("SOLVER_BUDGET_INVALID",
+                          "budget must be a SolveBudget or None",
+                          "budget", "SolveBudget", type(budget).__name__, phase="lower")
+    if budget is not None:
+        _timeout = budget.per_check_ms(_timeout or 0, _II_SEARCH_CHECKS) or None
     if _timeout is not None:
         core_args["solve_timeout_ms"] = _timeout
     if bool((solve_options or {}).get("allow_fallback_on_unknown", False)):
@@ -490,6 +621,15 @@ def lower_problem_to_request(problem, model_facts, solve_options) -> SolveReques
         unsupported=tuple(unsupported), unknown=tuple(unknown))
     digest = _canonical({key: value for key, value in request.as_dict().items()
                          if key != "request_digest"})
+    if diagnostics is not None:
+        diagnostics.update({
+            "ignored_nominal_stages": [dict(entry) for entry in ignored_nominal_stages],
+            "enforce_no_offset_single_stage": bool(enforce_no_offset_single_stage),
+            "manual_stage_mode": bool(manual_stage_mode),
+            "force_single_stage": bool(force_single_stage),
+            "manual_stages": None if manual_stages is None else list(manual_stages),
+            "enable_offset": bool(enable_offset),
+        })
     return SolveRequest(**{**request.__dict__, "request_digest": digest})
 
 
@@ -719,7 +859,9 @@ def _assignment(request: SolveRequest, raw):
 
 
 def solve_real_problem(problem, model_facts, solve_options,
-                       require_source_postcheck: bool = False) -> SolveResult:
+                       require_source_postcheck: bool = False, *, budget=None,
+                       diagnostics=None, fallback_checks=None,
+                       require_verified_fallback: bool = False) -> SolveResult:
     """Lower -> one shared core -> classify; optionally gate on the S3 postcheck.
 
     ``require_source_postcheck=False`` is the historical path: byte-identical
@@ -728,11 +870,54 @@ def solve_real_problem(problem, model_facts, solve_options,
     ``require_source_postcheck=True`` demands an independently postchecked SAT. A
     non-SAT state is a named refusal (never a PASS) and a failing postcheck raises,
     so no caller can receive a result that merely *looks* postchecked.
+
+    P3-01 additions, all out-of-band so no published digest moves:
+
+    ``budget``
+        The shared SolveBudget. Its deadline is consumed by this solve and by anything
+        nested inside it; a spent deadline is UNKNOWN (BudgetExhausted), never UNSAT.
+    ``diagnostics``
+        Out-parameter filled by lowering with the decisions it did NOT encode
+        (nominal stages ignored, offset policy, manual-stage mode).
+    ``fallback_checks``
+        Out-parameter filled with the ``solver-fallback-check/1`` report for a
+        FALLBACK/UNKNOWN candidate, re-verified against every source hard constraint.
+    ``require_verified_fallback``
+        Refuse (SOLVER_FALLBACK_UNVERIFIED) when a candidate is REFUTED, instead of
+        handing back a schedule that violates the constraints it was supposed to meet.
     """
-    request = lower_problem_to_request(problem, model_facts, solve_options)
+    if budget is None:
+        # An explicitly declared total becomes a real deadline object. When it is absent the
+        # historical per-check-only path is preserved (and the published digest with it).
+        resolved_total = _solve_total_ms(solve_options)
+        if resolved_total is not None:
+            budget = SolveBudget(resolved_total)
+    request = lower_problem_to_request(problem, model_facts, solve_options, budget=budget,
+                                       diagnostics=diagnostics)
     verify_request_coverage(problem, request)
+    if budget is not None and budget.exhausted:
+        # A spent deadline is UNKNOWN, never UNSAT: the search did not conclude anything.
+        raise BudgetExhausted(budget.elapsed_ms(), budget.total_ms)
     invoked = invoke_shared_core(request)
     result = classify_core_result(request, invoked["raw"])
+    if budget is not None:
+        budget.record("solve", budget.total_ms, budget.elapsed_ms(), result.state)
+    # P3-01: a fallback/UNKNOWN candidate is only usable once the ORIGINAL hard
+    # constraints have been re-checked on it. The verification result is attached as an
+    # out-of-band report (not a SolveResult field) so the published result_digest does not
+    # move; the state itself is never promoted either way.
+    if result.state in (UNKNOWN, FALLBACK) and result.fallback_candidate is not None:
+        report = verify_fallback_candidate(problem, request, result.fallback_candidate)
+        if fallback_checks is not None:
+            fallback_checks.update(report)
+        if report["verdict"] != "VERIFIED" and require_verified_fallback:
+            raise SolverError("SOLVER_FALLBACK_UNVERIFIED",
+                              "fallback candidate violates the source hard constraints;"
+                              " it must not be used as an executable schedule",
+                              report.get("source_id") or "fallback_candidate",
+                              "candidate satisfying every hard constraint",
+                              {"code": report.get("code"), "detail": report.get("detail")},
+                              phase="fallback")
     if not require_source_postcheck:
         return result
     if result.state != SAT:
@@ -1370,6 +1555,88 @@ def verify_solution(problem, request, result) -> dict:
     }
     report["postcheck_digest"] = _canonical(
         {key: value for key, value in report.items() if key != "postcheck_digest"})
+    return report
+
+
+def verify_fallback_candidate(problem, request, candidate) -> dict:
+    """Re-check a fallback/UNKNOWN candidate against the SAME independent source rules.
+
+    P3-01 / spec 2.5: "fallback 允许另外构建保守候选，但应重新验证原来的全部硬约束.
+    不得改掉作者 stage 或固定 buffer 数量来让 fallback 通过." A bare pass-through of
+    the core's serial schedule is NOT that verification: nobody ever checks that the
+    candidate satisfies the dependencies, the resource windows, the fixed versions or
+    the author's stages.
+
+    The expected obligations come from ``_derive_source_expectation``, i.e. the Problem
+    source fields, never from the request trace. The candidate is wrapped as a synthetic
+    SAT-shaped assignment and pushed through the SAME ``_check_*`` functions the SAT
+    postcheck uses, so a fallback cannot be judged by a weaker rule set.
+
+    Returns a ``solver-fallback-check/1`` report with verdict VERIFIED or REFUTED. This
+    NEVER promotes the result's state, and a REFUTED candidate carries the named code of
+    the first violated constraint. A candidate that the source cannot even be compared
+    against (wrong shape, non-integer values) is REFUTED, not silently accepted.
+    """
+    base = {"schema": SCHEMA_FALLBACK_CHECK, "problem_digest":
+            str(_get(request, "problem_digest", "") or "")}
+    if not isinstance(candidate, dict) or not candidate.get("start_times"):
+        return dict(base, verdict="REFUTED", code="FALLBACK_CANDIDATE_MISSING",
+                    detail="no candidate schedule to verify")
+    starts_raw = list(candidate.get("start_times") or [])
+    versions_raw = list(candidate.get("buffer_versions") or [])
+    ii_raw = candidate.get("minimal_II")
+    expected = _derive_source_expectation(problem, request)
+    if len(starts_raw) != len(expected["task_ids"]):
+        return dict(base, verdict="REFUTED", code="FALLBACK_CANDIDATE_INCOMPLETE",
+                    detail="candidate start_times length %d != %d tasks"
+                    % (len(starts_raw), len(expected["task_ids"])))
+    if len(versions_raw) != len(expected["buffer_roots"]):
+        return dict(base, verdict="REFUTED", code="FALLBACK_CANDIDATE_INCOMPLETE",
+                    detail="candidate buffer_versions length %d != %d buffers"
+                    % (len(versions_raw), len(expected["buffer_roots"])))
+    # Build the SAT-shaped assignment the shared checks consume. sorted() matches the
+    # order _derive_source_expectation holds task_ids/buffer_roots in.
+    tasks = {tid: {"start_time": {"value": value, "unit": "MODEL cycles"}}
+             for tid, value in zip(sorted(expected["task_ids"]), starts_raw)}
+    buffers = {root: value for root, value
+               in zip(expected["buffer_roots"], versions_raw)}
+    assignment = {"tasks": tasks, "buffers": buffers,
+                  "ii": {"value": ii_raw, "unit": "MODEL cycles"}}
+    counters = {"tasks": len(expected["task_ids"]), "buffers": len(expected["buffer_roots"]),
+                "starts": 0, "ii": 0, "buffer_versions": 0, "data_deps": 0,
+                "resource_deps": 0, "owner_exclusion_deps": 0, "pipe_order_deps": 0,
+                "stage_order_deps": 0, "fixed_versions": 0, "memory_groups": 0,
+                "offset_groups": 0}
+    try:
+        tasks_table, buffers_table, ii_record = _assignment_tables(assignment)
+        if set(tasks_table) != set(expected["task_ids"]):
+            raise SolverError(POSTCHECK_ASSIGNMENT_INCOMPLETE,
+                              "candidate task set is not the Problem loop task set",
+                              "candidate.tasks", expected["task_ids"], sorted(tasks_table),
+                              phase="postcheck")
+        ii = _check_ii(ii_record, expected, counters)
+        starts, versions = _check_value_ranges(tasks_table, buffers_table, expected, counters)
+        _check_fixed_versions(versions, expected, counters)
+        _check_data_deps(starts, versions, ii, expected, counters)
+        _check_resource_deps(starts, ii, expected, counters)
+        _check_owner_deps(starts, ii, expected, counters)
+        _check_pipe_order(starts, ii, expected, counters)
+        _check_stage_order(starts, ii, expected, counters)
+        _check_capacity(versions, expected, counters)
+        _check_offset_window(starts, ii, expected, counters)
+    except SolverError as error:
+        # A refuted candidate is a RESULT, not an exception: the caller keeps its
+        # UNKNOWN/FALLBACK state and learns exactly which hard constraint failed.
+        return dict(base, verdict="REFUTED", code=error.code, detail=str(error),
+                    source_id=error.source_id, expected=error.expected,
+                    actual=error.actual, checked=counters)
+    report = dict(base, verdict="VERIFIED", code=None, detail="all source hard constraints hold",
+                  ii=ii, checked=counters,
+                  source_authority="problem-source-fields", trace_used=False,
+                  limits={"physical_feasibility": "UNPROVEN", "capacity": "MODEL",
+                          "state_promoted": False, "units": "MODEL cycles"})
+    report["fallback_check_digest"] = _canonical(
+        {key: value for key, value in report.items() if key != "fallback_check_digest"})
     return report
 
 
