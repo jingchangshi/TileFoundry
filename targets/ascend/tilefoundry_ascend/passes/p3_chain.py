@@ -40,6 +40,7 @@ from tilefoundry.passes.pass_base import ModulePass
 from tilefoundry.passes.pass_manager import PassPoint, register_pass
 
 from .. import completion as CP
+from .. import storage as ST
 from ..memory import SPACE_FACTS
 from ..tf_target import Ascend950PRTarget
 
@@ -391,22 +392,27 @@ def _solve_resolve_materialize(module, record, problem, entry):
     record = replace(record, completion_status=str(plan.state.completion_status),
                      plan_digest=_digest(plan))
 
-    # 5. Layout. Physical storage placement is a P4 obligation: until it is attached the
-    #    chain records storage_status=UNATTACHED and STOPS. It does not invent offsets,
-    #    because a fabricated arena layout is indistinguishable from a verified one.
-    facts = _storage_facts(module, plan)
-    if facts is None:
+    # 5. Layout (P4-02). The placement is computed from the resolved versions, the real
+    #    layout of each space, and the ASYNCHRONOUS COMPLETION intervals of P4-01 -- not from
+    #    instruction issue order, which cannot see that an issued store is still reading. A
+    #    placement that does not verify STOPS the chain: carrying unverified offsets is worse
+    #    than carrying none, because downstream nothing refuses an address that looks valid.
+    storage, plan = _attach_storage(module, plan, completion)
+    if storage is None:
         record = replace(record, storage_status="UNATTACHED", stopped_at="layout",
                          reason="STORAGE_PLACEMENT_UNATTACHED")
         module.metadata["ascend.p3_plan"] = plan
         return record
-    try:
-        plan = RP.resolve_buffer_layout(plan, facts)
-    except Exception as error:  # noqa: BLE001
-        return replace(record, storage_status="REFUSED", stopped_at="layout",
-                       reason="CHAIN_LAYOUT_FAILED:%s:%s"
-                       % (type(error).__name__, getattr(error, "code", "")))
+    record = replace(record, storage_status=str(storage.status))
+    if not storage.verified:
+        record = replace(record, storage_status=str(storage.status), stopped_at="layout",
+                         reason="CHAIN_LAYOUT_UNVERIFIED:%s"
+                         % (storage.code or "STORAGE_PLACEMENT_UNVERIFIED",))
+        module.metadata["ascend.p3_plan"] = plan
+        module.metadata["ascend.p3_storage"] = storage
+        return record
     record = replace(record, storage_status="RESOLVED", plan_digest=_digest(plan))
+    module.metadata["ascend.p3_storage"] = storage
     module.metadata["ascend.p3_plan"] = plan
 
     # 6. Materialize: R2/R3 static unroll is the honest output for a serial schedule.
@@ -543,6 +549,30 @@ def _nominal_solve_result(core, problem):
             # than acquire an invented one.
             "sat_scope": getattr(core, "sat_scope", None),
             "capacity_scope": getattr(core, "capacity_scope", None)}
+
+
+def _attach_storage(module, plan, completion):
+    """Build, verify and attach the P4-02 physical storage placement.
+
+    Returns (storage_plan_or_None, plan). A placement that refuses returns its record so the
+    chain names the specific reason, and the plan is returned UNCHANGED so no caller can
+    mistake unverified offsets for placed ones.
+    """
+    try:
+        storage = ST.build_storage_plan(plan, completion)
+    except Exception as error:  # noqa: BLE001 - the refusal IS the recorded outcome
+        module.metadata["ascend.p3_storage_refusal"] = (
+            str(getattr(error, "code", "")) or type(error).__name__)
+        return None, plan
+    if not storage.verified:
+        return storage, plan
+    try:
+        placed = ST.attach_storage_plan(plan, storage)
+    except Exception as error:  # noqa: BLE001
+        module.metadata["ascend.p3_storage_refusal"] = (
+            str(getattr(error, "code", "")) or type(error).__name__)
+        return None, plan
+    return storage, placed
 
 
 def _attach_completion(module, plan, entry):

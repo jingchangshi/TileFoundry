@@ -103,16 +103,30 @@ def test_the_chain_stops_at_the_p4_boundary_not_before_it():
     pins that the export is refused for BOTH remaining reasons.
     """
     record = _chain(_finalize())
-    assert record.stopped_at == "layout", (
-        "chain stopped at %r (%s); it reached P4's storage boundary before P3-04 only if"
-        " this asserts 'layout'" % (record.stopped_at, record.reason))
-    assert record.reason == "STORAGE_PLACEMENT_UNATTACHED"
-    assert record.storage_status == "UNATTACHED"
+    # The boundary moved again when P4-02 landed: storage is now RESOLVED and the chain
+    # reaches MATERIALIZE, where the staged-TIR emission is still P4-03's work. The
+    # assertion tracks the boundary rather than pinning the old one, so a stage that
+    # silently regresses is still caught -- what must NOT happen is the chain reporting a
+    # runnable artifact, and that is asserted separately by the export-refusal test.
+    assert record.stopped_at in ("layout", "materialize"), (
+        "chain stopped at %r (%s); the P4 boundary is storage completion or staged-TIR"
+        " emission, and nothing earlier" % (record.stopped_at, record.reason))
+    if record.stopped_at == "layout":
+        assert record.storage_status in ("UNATTACHED", "FAILED", "REFUSED",
+                                         "STORAGE_PLACEMENT_UNVERIFIED"), (
+            "stopped at layout with storage_status %r, which does not explain the stop"
+            % (record.storage_status,))
+        assert "STORAGE" in record.reason, (
+            "a stop at layout must be a storage reason, got %r" % (record.reason,))
     # P4-01 is real: completion is derived AND verified, not merely assumed.
     assert record.completion_status == "VERIFIED", (
         "completion_status is %r (%s); P4-01 must derive, verify and attach a real completion"
         " plan, and a regression to PENDING/UNVERIFIED means the stage stopped working"
         % (record.completion_status, record.reason))
+    # P4-02 is real too: physical placement is computed, verified and attached.
+    assert record.storage_status == "RESOLVED", (
+        "storage_status is %r (%s); P4-02 must compute and verify a real placement"
+        % (record.storage_status, record.reason))
 
 
 # --------------------------------------------------------------- policy re-analysis
@@ -236,8 +250,17 @@ def test_export_refused_while_storage_is_unverified():
     refusal = caught.value
     assert refusal.code == "EXPORT_NOT_RUNNABLE"
     joined = " ".join(refusal.missing)
-    assert "STORAGE_PLACEMENT_UNVERIFIED" in joined, (
-        "storage placement is still UNATTACHED, so the refusal must name it: %s" % joined)
+    # RE-STATED AGAIN WHEN P4-02 LANDED. Completion and storage both verify now, and the
+    # chain stops at materialize -- so the refusal must name the MATERIALIZE boundary.
+    # The property that matters is unchanged and is what these assertions protect: the
+    # refusal is LOCATED, and it never names a stage that actually succeeded.
+    chain_record = module.metadata.get("ascend.p3_chain")
+    stopped = getattr(chain_record, "stopped_at", "")
+    assert stopped in ("layout", "materialize"), (
+        "the chain stopped at %r, which is not a P4 boundary" % (stopped,))
+    if stopped == "materialize":
+        assert any("MATERIALIZE" in item for item in refusal.missing), (
+            "the chain stopped at materialize but the refusal does not name it: %s" % joined)
     completion = module.metadata.get("ascend.p3_completion")
     if completion is not None and completion.status == "VERIFIED":
         assert "COMPLETION_NOT_VERIFIED" not in joined, (
@@ -245,6 +268,13 @@ def test_export_refused_while_storage_is_unverified():
     else:
         assert "COMPLETION_NOT_VERIFIED" in joined, (
             "completion is not verified yet the refusal does not name it: %s" % joined)
+    storage = module.metadata.get("ascend.p3_storage")
+    if storage is not None and storage.verified:
+        assert "STORAGE_PLACEMENT_UNVERIFIED" not in joined, (
+            "storage is VERIFIED but the refusal still reports it unverified: %s" % joined)
+    else:
+        assert "STORAGE_PLACEMENT_UNVERIFIED" in joined, (
+            "storage is not verified yet the refusal does not name it: %s" % joined)
 
 
 def test_inspection_is_still_available_on_a_non_exportable_module():
@@ -255,7 +285,14 @@ def test_inspection_is_still_available_on_a_non_exportable_module():
     module = _finalize()
     gate = _gate(module)
     assert gate["ready"] is False
-    assert len(gate["gaps"]) >= 2
+    # The gate must name AT LEAST ONE located gap. It used to demand two, because two P4
+    # obligations were outstanding; with completion and storage verified, the outstanding
+    # gap is the staged-TIR emission. Requiring a COUNT would be requiring a particular
+    # implementation's backlog rather than the property that matters -- that the refusal is
+    # located -- so the count is no longer asserted.
+    assert gate["gaps"], "a not-ready gate must name why"
+    assert all(len(gap) >= 2 and gap[1] for gap in gate["gaps"]), (
+        "every gap must carry a stage and a specific reason: %s" % (gate["gaps"],))
     # and the schedule/plan artifacts ARE inspectable, which is allowed at P3
     assert _chain(module).plan_digest
     assert module.metadata.get("ascend.p3_projected") is not None
