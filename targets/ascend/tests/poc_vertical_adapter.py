@@ -169,27 +169,38 @@ def project_problem(problem, tir_function, expansion_count, sources=None, obliga
 
 
 def nominal_solve_result(core_result, r_problem):
-    """Adapter: expose the REAL core assignment as R's SAT_POSTCHECKED view, NOMINAL only.
+    """Pass the REAL core result through to R, unchanged, with a test-facing ``status``.
 
-    This is NOT a physical proof and NOT an S3 source postcheck (S3 is unimplemented).
-    Returns a SimpleNamespace with status='SAT_POSTCHECKED', sat_scope='NOMINAL_MODEL_ONLY'.
+    P3-02 removed R's dependence on a fabricated ``schedule`` dict: ``resolve_assignment`
+    reads ``assignment.tasks[*].start_time``, ``assignment.ii`` and ``assignment.buffers``.
+    This adapter therefore forwards the solver's own result object and only adds the
+    ``status`` attribute the plan builder's ``_solve_status`` looks at, so a test still
+    declares which planning state it intends to exercise.
+
+    It no longer CONSTRUCTS a schedule. A view that pretends stage=0/order=index for every
+    task was exactly the "依赖测试伪造的 schedule 字段" defect spec 2.6 names.
+
+    ``sat_scope`` is forwarded VERBATIM with NO fallback. It used to default to
+    "NOMINAL_MODEL_ONLY", so a result carrying no scope at all still reported one -- and
+    that stale default mislabelled the now-REAL SAT_SOURCE_POSTCHECKED solve. A missing
+    scope must stay None so the absence is visible instead of invented.
+
+    ``status`` is informational only: the plan builder derives the planning state from
+    ``state``/``postcheck``, so a label here cannot promote a result.
     """
     import types
 
-    assignment = getattr(core_result, "assignment", {}) or {}
-    tasks = assignment.get("tasks", {}) if isinstance(assignment, dict) else {}
-    schedule = {}
-    for order, tid in enumerate(assignment.get("order", list(tasks)) if isinstance(assignment, dict) else list(tasks)):
-        entry = tasks.get(tid, {}) if isinstance(tasks, dict) else {}
-        start = (entry.get("start_time") or {}).get("value", 0) if isinstance(entry, dict) else 0
-        schedule[tid] = {"stage": 0, "order": order, "start_time": int(start), "iteration_shift": 0,
-                         "cost_model": "MODEL"}
-    # NOT SAT_POSTCHECKED: S3 source postcheck is unimplemented. This is a NOMINAL_SAT view
-    # for the R adapter only; the S result itself is state=SAT / sat_scope=NOMINAL_MODEL_ONLY.
-    return types.SimpleNamespace(status="NOMINAL_SAT", schedule=schedule,
-                                 sat_scope="NOMINAL_MODEL_ONLY",
-                                 postcheck="SOLVER_POSTCHECK_NOT_IMPLEMENTED",
-                                 core_source_hash=getattr(core_result, "core_source_hash", ""))
+    return types.SimpleNamespace(
+        status="NOMINAL_SAT",
+        state=getattr(core_result, "state", None),
+        assignment=getattr(core_result, "assignment", None),
+        postcheck=getattr(core_result, "postcheck", None),
+        reason=getattr(core_result, "reason", ""),
+        problem_digest=getattr(core_result, "problem_digest", ""),
+        result_digest=getattr(core_result, "result_digest", ""),
+        sat_scope=getattr(core_result, "sat_scope", None),
+        capacity_scope=getattr(core_result, "capacity_scope", None),
+        core_source_hash=getattr(core_result, "core_source_hash", ""))
 
 
 

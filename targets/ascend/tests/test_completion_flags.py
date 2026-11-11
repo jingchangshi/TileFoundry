@@ -22,7 +22,6 @@ def _materialised_carrier(tir, problem, sources):
     refuses that shape by name (COMPLETION_STARTUP_UNSATISFIED, see
     test_completion_ordering.py) instead of counting it as coverage.
     """
-    import unittest.mock as _mock
     from poc_vertical_adapter import nominal_solve_result, project_problem
     from tilefoundry_ascend.plan import materialize as MAT
     from tilefoundry_ascend.plan import resolved_plan as RP
@@ -39,21 +38,23 @@ def _materialised_carrier(tir, problem, sources):
         }],
         "cost_model": "MODEL",
     }
-    core = B.solve_real_problem(r_problem, model_facts, {})
+    # P3-02: run the REAL source postcheck and let the plan builder consume the REAL
+    # assignment. The _solve_status patch that used to stand in for this is gone: it
+    # labelled a fabricated schedule as SAT_POSTCHECKED, so this test exercised completion
+    # behaviour for a plan the production path could never actually build.
+    core = B.solve_real_problem(r_problem, model_facts, {}, require_source_postcheck=True)
+    assert core.state == "SAT", core.state
+    assert (core.postcheck or {}).get("verdict") == "POSTCHECK_PASS", core.postcheck
     nominal = nominal_solve_result(core, r_problem)
-    original = RP._solve_status
-    with _mock.patch.object(
-        RP, "_solve_status",
-        lambda r: RP.SAT_POSTCHECKED if getattr(r, "status", "") == "NOMINAL_SAT" else original(r),
-    ):
-        plan = RP.build_resolved_plan(r_problem, nominal,
-                                      {"L": "l", "S": "s", "C": "c", "F": "f", "P": "p"})
-        base, facts = 0, {}
-        for buf in r_problem["buffers"]:
-            facts[buf["root"]] = {"versions": 1, "alignment": 64, "arena_id": "arena0",
-                                  "base_offset_bytes": base}
-            base += ((buf["bytes"] + 63) // 64) * 64
-        plan = RP.resolve_buffer_layout(plan, facts)
+    plan = RP.build_resolved_plan(r_problem, nominal,
+                                  {"L": "l", "S": "s", "C": "c", "F": "f", "P": "p"},
+                                  require_source_postcheck=True)
+    base, facts = 0, {}
+    for buf in r_problem["buffers"]:
+        facts[buf["root"]] = {"versions": 1, "alignment": 64, "arena_id": "arena0",
+                              "base_offset_bytes": base}
+        base += ((buf["bytes"] + 63) // 64) * 64
+    plan = RP.resolve_buffer_layout(plan, facts)
     rewritten, matmap = MAT.materialize_plan(tir, plan)
     return rewritten, matmap
 

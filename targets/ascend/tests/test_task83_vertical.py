@@ -8,7 +8,6 @@ import json
 import os
 import sys
 import types
-import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path[:0] = [os.path.join(ROOT, "src"), os.path.join(ROOT, "targets", "ascend")]
@@ -132,7 +131,10 @@ def test_vertical_run():
                                       "buffers": [b["root"] for b in r_problem["buffers"]],
                                       "cost_model": "MODEL"}], "cost_model": "MODEL"}
     try:
-        core = B.solve_real_problem(r_problem, model_facts, {})
+        # P3-02: the REAL source postcheck, so the plan below is built from a genuine
+        # SAT_POSTCHECKED result instead of a patched status label.
+        core = B.solve_real_problem(r_problem, model_facts, {},
+                                    require_source_postcheck=True)
     except Exception:  # noqa: BLE001
         core = None
 
@@ -141,10 +143,23 @@ def test_vertical_run():
         raw = types.SimpleNamespace(status=core.raw_core_status, assignment=core.assignment,
                                     core_source_hash=core.core_source_hash)
     sres = classify_poc_result(expected, s_problem, raw_core=raw, authoritative=expected)
-    run["steps"]["S"] = {"state": sres.state, "sat_scope": "NOMINAL_MODEL_ONLY",
-                         "postcheck": "SOLVER_POSTCHECK_NOT_IMPLEMENTED",
-                         "r_usable_nominal": bool(sres.r_usable),
-                         "core_source_hash": getattr(core, "core_source_hash", None), "kind": "real+nominals"}
+    # P3-01/P3-02 replaced the placeholder below with the REAL source postcheck.
+    # The old record said sat_scope=NOMINAL_MODEL_ONLY / postcheck=NOT_IMPLEMENTED, which
+    # is no longer true: solve_real_problem(require_source_postcheck=True) independently
+    # re-checks the schedule against every Problem hard constraint and reports
+    # SAT_SOURCE_POSTCHECKED / POSTCHECK_PASS. The limits that DO remain open are kept
+    # explicit: physical feasibility and capacity stay MODEL-only, and nothing here proves
+    # device execution.
+    _postcheck = getattr(core, "postcheck", None) or {}
+    run["steps"]["S"] = {
+        "state": sres.state,
+        "sat_scope": getattr(core, "sat_scope", None),
+        "postcheck": _postcheck.get("verdict"),
+        "postcheck_limits": _postcheck.get("limits"),
+        "capacity_scope": getattr(core, "capacity_scope", None),
+        "physical_feasibility": (_postcheck.get("limits") or {}).get("physical_feasibility"),
+        "r_usable_nominal": bool(sres.r_usable),
+        "core_source_hash": getattr(core, "core_source_hash", None), "kind": "real+nominals"}
 
     trimmed = {"all": expected["all"][:-1]}
     run["controls"] = {
@@ -158,133 +173,134 @@ def test_vertical_run():
     plan = None
     if sres.state == "SAT" and core is not None:
         nominal = nominal_solve_result(core, r_problem)
-        original_status = RP._solve_status
-        with unittest.mock.patch.object(RP, "_solve_status",
-                                        lambda r: RP.SAT_POSTCHECKED if getattr(r, "status", "") == "NOMINAL_SAT" else original_status(r)):
-            try:
-                plan = RP.build_resolved_plan(r_problem, nominal, {"L": "l", "S": "s", "C": "c", "F": "f", "P": "p"})
-                base = 0
-                facts = {}
-                for buf in r_problem["buffers"]:
-                    facts[buf["root"]] = {"versions": 1, "alignment": 64, "arena_id": "arena0",
-                                          "base_offset_bytes": base}
-                    base += ((buf["bytes"] + 63) // 64) * 64
-                plan = RP.resolve_buffer_layout(plan, facts)
-                run["steps"]["R"] = {"status": "PLAN_LAYOUT_RESOLVED", "kind": "real(adapter view)"}
-                rewritten, matmap = MAT.materialize_plan(tir, plan)
-                from tilefoundry.visitor_registry.verify import verify_prim_function
-                # Typed validity of R's own rewritten TIR is an independent assertion.
-                # If this fails, the failure belongs to R materialize, not C injection.
-                assert verify_prim_function(rewritten) is None, "R_REWRITTEN_TYPED_INVALID"
-                run["controls"]["r_rewritten_typed"] = "PASS"
-                report = MAT.verify_plan_application(tir, plan, rewritten, matmap, require_drain=False)
-                run["steps"]["R"] = {"status": "MATERIALIZED", "digest_before": matmap.original_digest,
-                                     "digest_after": matmap.rewritten_digest,
-                                     "verify": report.get("status"), "verify_code": report.get("code"),
-                                     "verify_detail": report.get("detail"), "kind": "real"}
-                if report.get("status") == "PASS":
-                    rows = MAT.replay_plan_addresses(plan)
-                    run["steps"]["R"]["replay_rows"] = len(rows)
-                    run["steps"]["R"]["replay_sample"] = rows[:2]
-                    try:
-                        from tilefoundry_ascend import sync as SY
-                        from tilefoundry_ascend.schedule.ledger import extract_ledger
-                        ledger = extract_ledger(tir)
-                        reuse = SY.derive_reuse_obligations_from_ledger(ledger, expansion)
-                        obligations = SY.derive_completion_obligations_from_ledger(
-                            ledger, expansion, problem=problem, expected=expected)
-                        caps = {"supported_pairs": [["vector", "DMA"], ["DMA", "vector"]],
-                                "same_pipe_pipe_order": False, "flag_pool_size": 256,
-                                "cost_model": "MODEL"}
-                        actionable = tuple(o for o in obligations if o.kind in ("RAW", "WAR", "FREE"))
-                        channels, _discharges = SY.choose_completion_mechanisms(actionable, {}, caps)
-                        allocation = SY.allocate_completion_resources(channels, [], caps)
-                        injected, placement = SY.inject_completion_anchored(
-                            rewritten, None, actionable, allocation, channels=channels, ledger=ledger,
-                            materialization=matmap)
-                        assert verify_prim_function(injected) is None, "C_INJECTED_TYPED_INVALID"
-                        run["controls"]["c_injected_typed"] = "PASS"
-                        coverage = SY.verify_completion_coverage_from_ledger(
-                            ledger, expansion, problem=problem, actual_tir=injected,
-                            placement_map=placement, capabilities=caps, expected=expected)
-                        required_by_kind = dict(getattr(coverage, "required_by_kind", {}))
-                        covered_counts = dict(getattr(coverage, "covered_by_kind", {}))
-                        run["steps"]["C"] = {"status": getattr(coverage, "status", None),
-                                             "code": getattr(coverage, "code", None),
-                                             "required_full": len(expected["all"]),
-                                             "required_by_kind": required_by_kind,
-                                             "covered_by_kind": covered_counts,
-                                             "covered_total": sum(covered_counts.values()),
-                                             "ssa_mechanism": "INTRA_TASK_SSA_ORDER",
-                                             "c_derived_required": getattr(coverage, "required", None),
-                                             "covered": getattr(coverage, "covered", None),
-                                             "drain_found": bool(SY._actual_nodes(injected)["drain"]),
-                                             "edge_table": list(getattr(coverage, "edge_table", ())),
-                                             "digest_C_injected": MAT.tir_digest(injected),
-                                             "kind": "real(FULL denominator, anchored reuse, structural SSA/FINAL)"}
-                        def fresh_injected():
-                            return SY.inject_completion_anchored(
-                                rewritten, None, actionable, allocation, channels=channels,
-                                ledger=ledger, materialization=matmap)
+        # P3-02: no status patch. The builder verifies the REAL source postcheck, so a
+        # fabricated schedule can no longer masquerade as SAT_POSTCHECKED here.
+        try:
+            plan = RP.build_resolved_plan(
+                r_problem, nominal, {"L": "l", "S": "s", "C": "c", "F": "f", "P": "p"},
+                require_source_postcheck=True)
+            base = 0
+            facts = {}
+            for buf in r_problem["buffers"]:
+                facts[buf["root"]] = {"versions": 1, "alignment": 64, "arena_id": "arena0",
+                                      "base_offset_bytes": base}
+                base += ((buf["bytes"] + 63) // 64) * 64
+            plan = RP.resolve_buffer_layout(plan, facts)
+            run["steps"]["R"] = {"status": "PLAN_LAYOUT_RESOLVED", "kind": "real(adapter view)"}
+            rewritten, matmap = MAT.materialize_plan(tir, plan)
+            from tilefoundry.visitor_registry.verify import verify_prim_function
+            # Typed validity of R's own rewritten TIR is an independent assertion.
+            # If this fails, the failure belongs to R materialize, not C injection.
+            assert verify_prim_function(rewritten) is None, "R_REWRITTEN_TYPED_INVALID"
+            run["controls"]["r_rewritten_typed"] = "PASS"
+            report = MAT.verify_plan_application(tir, plan, rewritten, matmap, require_drain=False)
+            run["steps"]["R"] = {"status": "MATERIALIZED", "digest_before": matmap.original_digest,
+                                 "digest_after": matmap.rewritten_digest,
+                                 "verify": report.get("status"), "verify_code": report.get("code"),
+                                 "verify_detail": report.get("detail"), "kind": "real"}
+            if report.get("status") == "PASS":
+                rows = MAT.replay_plan_addresses(plan)
+                run["steps"]["R"]["replay_rows"] = len(rows)
+                run["steps"]["R"]["replay_sample"] = rows[:2]
+                try:
+                    from tilefoundry_ascend import sync as SY
+                    from tilefoundry_ascend.schedule.ledger import extract_ledger
+                    ledger = extract_ledger(tir)
+                    reuse = SY.derive_reuse_obligations_from_ledger(ledger, expansion)
+                    obligations = SY.derive_completion_obligations_from_ledger(
+                        ledger, expansion, problem=problem, expected=expected)
+                    caps = {"supported_pairs": [["vector", "DMA"], ["DMA", "vector"]],
+                            "same_pipe_pipe_order": False, "flag_pool_size": 256,
+                            "cost_model": "MODEL"}
+                    actionable = tuple(o for o in obligations if o.kind in ("RAW", "WAR", "FREE"))
+                    channels, _discharges = SY.choose_completion_mechanisms(actionable, {}, caps)
+                    allocation = SY.allocate_completion_resources(channels, [], caps)
+                    injected, placement = SY.inject_completion_anchored(
+                        rewritten, None, actionable, allocation, channels=channels, ledger=ledger,
+                        materialization=matmap)
+                    assert verify_prim_function(injected) is None, "C_INJECTED_TYPED_INVALID"
+                    run["controls"]["c_injected_typed"] = "PASS"
+                    coverage = SY.verify_completion_coverage_from_ledger(
+                        ledger, expansion, problem=problem, actual_tir=injected,
+                        placement_map=placement, capabilities=caps, expected=expected)
+                    required_by_kind = dict(getattr(coverage, "required_by_kind", {}))
+                    covered_counts = dict(getattr(coverage, "covered_by_kind", {}))
+                    run["steps"]["C"] = {"status": getattr(coverage, "status", None),
+                                         "code": getattr(coverage, "code", None),
+                                         "required_full": len(expected["all"]),
+                                         "required_by_kind": required_by_kind,
+                                         "covered_by_kind": covered_counts,
+                                         "covered_total": sum(covered_counts.values()),
+                                         "ssa_mechanism": "INTRA_TASK_SSA_ORDER",
+                                         "c_derived_required": getattr(coverage, "required", None),
+                                         "covered": getattr(coverage, "covered", None),
+                                         "drain_found": bool(SY._actual_nodes(injected)["drain"]),
+                                         "edge_table": list(getattr(coverage, "edge_table", ())),
+                                         "digest_C_injected": MAT.tir_digest(injected),
+                                         "kind": "real(FULL denominator, anchored reuse, structural SSA/FINAL)"}
+                    def fresh_injected():
+                        return SY.inject_completion_anchored(
+                            rewritten, None, actionable, allocation, channels=channels,
+                            ledger=ledger, materialization=matmap)
 
-                        def first_wait(fn):
-                            return SY._actual_nodes(fn)["wait"][0][1]
+                    def first_wait(fn):
+                        return SY._actual_nodes(fn)["wait"][0][1]
 
-                        def mut_flag_id(fn):
-                            wait = first_wait(fn)
-                            wait.flag_id = int(wait.flag_id) + 100
-                            return fn
+                    def mut_flag_id(fn):
+                        wait = first_wait(fn)
+                        wait.flag_id = int(wait.flag_id) + 100
+                        return fn
 
-                        def mut_epoch(fn):
-                            wait = first_wait(fn)
-                            wait.generation = int(wait.generation) + 100
-                            return fn
+                    def mut_epoch(fn):
+                        wait = first_wait(fn)
+                        wait.generation = int(wait.generation) + 100
+                        return fn
 
-                        def mut_flag(fn):
-                            wait = first_wait(fn)
-                            wait.channel_name = "FORGED_CHANNEL"
-                            return fn
+                    def mut_flag(fn):
+                        wait = first_wait(fn)
+                        wait.channel_name = "FORGED_CHANNEL"
+                        return fn
 
-                        def mut_missing_wait(fn):
-                            import dataclasses as _dc
-                            from tilefoundry.ir.tir.flag import FlagWait
-                            from tilefoundry.ir.tir.stmts import Evaluate
-                            new_body, removed = _remove_first_stmt(
-                                fn.body, lambda node: isinstance(node, Evaluate)
-                                and isinstance(node.callable, FlagWait))
-                            assert removed, "real Wait node was not removed"
-                            return _dc.replace(fn, body=new_body)
+                    def mut_missing_wait(fn):
+                        import dataclasses as _dc
+                        from tilefoundry.ir.tir.flag import FlagWait
+                        from tilefoundry.ir.tir.stmts import Evaluate
+                        new_body, removed = _remove_first_stmt(
+                            fn.body, lambda node: isinstance(node, Evaluate)
+                            and isinstance(node.callable, FlagWait))
+                        assert removed, "real Wait node was not removed"
+                        return _dc.replace(fn, body=new_body)
 
-                        mutation_controls = {}
-                        for name, mutator in (
-                            ("flag_id_plus_100", mut_flag_id),
-                            ("drain_in_if_false", _drain_into_if_false),
-                            ("wrong_epoch", mut_epoch),
-                            ("wrong_flag", mut_flag),
-                            ("missing_wait", mut_missing_wait),
-                        ):
-                            mutant, mutant_placement = fresh_injected()
-                            mutant = mutator(mutant)
-                            mutant_report = SY.verify_completion_coverage_from_ledger(
-                                ledger, expansion, problem=problem, actual_tir=mutant,
-                                placement_map=mutant_placement, capabilities=caps, expected=expected)
-                            mutation_controls[name] = {
-                                "status": mutant_report.status,
-                                "code": mutant_report.code,
-                                "covered": mutant_report.covered,
-                            }
-                            assert mutant_report.status != "VERIFIED", (
-                                name, mutant_report.as_dict())
-                        run["steps"]["C"]["mutation_controls"] = mutation_controls
+                    mutation_controls = {}
+                    for name, mutator in (
+                        ("flag_id_plus_100", mut_flag_id),
+                        ("drain_in_if_false", _drain_into_if_false),
+                        ("wrong_epoch", mut_epoch),
+                        ("wrong_flag", mut_flag),
+                        ("missing_wait", mut_missing_wait),
+                    ):
+                        mutant, mutant_placement = fresh_injected()
+                        mutant = mutator(mutant)
+                        mutant_report = SY.verify_completion_coverage_from_ledger(
+                            ledger, expansion, problem=problem, actual_tir=mutant,
+                            placement_map=mutant_placement, capabilities=caps, expected=expected)
+                        mutation_controls[name] = {
+                            "status": mutant_report.status,
+                            "code": mutant_report.code,
+                            "covered": mutant_report.covered,
+                        }
+                        assert mutant_report.status != "VERIFIED", (
+                            name, mutant_report.as_dict())
+                    run["steps"]["C"]["mutation_controls"] = mutation_controls
 
-                    except Exception as error:  # noqa: BLE001
-                        import traceback as _tb
-                        run["steps"]["C"] = {"status": "NOT_VERIFIED", "code": getattr(error, "code", type(error).__name__),
-                                             "detail": str(error)[:140],
-                                             "traceback": _tb.format_exc()[-5000:], "kind": "unknown"}
-            except Exception as error:  # noqa: BLE001
-                run["steps"]["R"] = {"status": "NOT_RUN", "code": getattr(error, "code", type(error).__name__),
-                                      "detail": str(error)[:160], "kind": "unknown"}
+                except Exception as error:  # noqa: BLE001
+                    import traceback as _tb
+                    run["steps"]["C"] = {"status": "NOT_VERIFIED", "code": getattr(error, "code", type(error).__name__),
+                                         "detail": str(error)[:140],
+                                         "traceback": _tb.format_exc()[-5000:], "kind": "unknown"}
+        except Exception as error:  # noqa: BLE001
+            run["steps"]["R"] = {"status": "NOT_RUN", "code": getattr(error, "code", type(error).__name__),
+                                  "detail": str(error)[:160], "kind": "unknown"}
 
     try:
         reported_required = 46  # mutant: pretends the denominator is 47-1
@@ -363,12 +379,18 @@ def test_vertical_run():
         "real": ["problem_digest", "L facts", "R plan/actual TIR", "C actual FlagSet/FlagWait"],
         "projected": ["loop_domain", "requested_num_stages", "stage_depth", "task latency/ii/stage"],
         "model": ["capacity/size/latency/ii model quantities"],
-        "unknown": ["S3 source postcheck", "physical feasibility", "device execution"],
+        # The source postcheck is REAL now, so it is no longer an unknown. What remains
+        # unknown is physical feasibility, device execution, and the capacity proof.
+        "unknown": ["physical feasibility", "device execution", "asynchronous capacity proof"],
     }
-    run["sat_scope"] = "NOMINAL_MODEL_ONLY"
+    run["sat_scope"] = getattr(core, "sat_scope", None)
+    run["capacity_scope"] = getattr(core, "capacity_scope", None)
     run["physical_feasibility"] = "UNPROVEN"
-    run["device_ready_blocked_by"] = "SOLVER_POSTCHECK_NOT_IMPLEMENTED"
-    run["device_ready"] = False  # S3 source postcheck not implemented -> never device-ready
+    # Device readiness is still blocked, but NOT by a missing postcheck any more: the
+    # model-level checks pass while physical feasibility stays unproven and no device run
+    # has happened. Naming the real blocker keeps this from reading as "almost ready".
+    run["device_ready_blocked_by"] = "PHYSICAL_FEASIBILITY_UNPROVEN_AND_NO_DEVICE_RUN"
+    run["device_ready"] = False
     if run["controls"].get("r_rewritten_typed") != "PASS":
         run["steps"]["C"] = {"status": "NOT_VERIFIED", "code": "R_REWRITTEN_TYPED_INVALID",
                              "detail": "R materialize output failed verify_prim_function",
@@ -380,8 +402,14 @@ def test_vertical_run():
                              "kind": "blocked_by_C"}
     print(json.dumps(run, indent=1, default=str)[:6000])
     assert run["steps"]["L"]["obligations"] == 47
-    assert run["steps"]["S"]["sat_scope"] == "NOMINAL_MODEL_ONLY"
-    assert "SAT_POSTCHECKED" not in json.dumps(run["steps"]["S"])
+    # The S step must now report the REAL postcheck, not a placeholder. Asserting the
+    # positive fact is stronger than asserting the absence of a label: it fails if the
+    # postcheck is ever silently dropped again.
+    assert run["steps"]["S"]["sat_scope"] == "SAT_SOURCE_POSTCHECKED", run["steps"]["S"]
+    assert run["steps"]["S"]["postcheck"] == "POSTCHECK_PASS", run["steps"]["S"]
+    assert run["steps"]["S"]["physical_feasibility"] == "UNPROVEN", run["steps"]["S"]
+    # Capacity stays model-only: a passing source postcheck is NOT a physical capacity proof.
+    assert run["steps"]["S"]["capacity_scope"] == "NOMINAL_MODEL_ONLY", run["steps"]["S"]
     assert run["controls"]["delete_obligation"] == "POC_SOLVER_INPUT_NOT_READY"
     assert run["controls"]["fallback_not_sat"] == "FALLBACK"
     assert run["controls"]["filter_obligation_access"] == "POC_ADAPTER_UNSUPPORTED_ACCESS"

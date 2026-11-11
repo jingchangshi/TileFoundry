@@ -24,8 +24,11 @@ from tilefoundry.ir.tir.stmts import Evaluate, For, If, LetStmt, Sequential
 from tilefoundry.ir.types import Layout, PointerType, make_tensor_type
 from tilefoundry.ir.types.storage import StorageKind
 
+sys.path.insert(0, str(HERE.parent))
+
 from tilefoundry_ascend.plan import materialize as MAT
 from tilefoundry_ascend.plan import resolved_plan as RP
+import solve_fixture
 
 ROWS, D = 4, 8
 HALF_BYTES = D * 4            # 32 bytes: one half of the arena
@@ -91,11 +94,23 @@ def make_problem():
     }
 
 
-def make_solve(status=RP.SAT_POSTCHECKED, schedule=None):
-    return {"status": status, "core_digest": "sha256:" + "4" * 64,
-            "result_digest": "sha256:" + "5" * 64,
-            "schedule": schedule if schedule is not None else {
-                "main_vf": {"stage": 0, "order": 0, "start_time": 0, "iteration_shift": 0}}}
+def make_solve(status=RP.SAT_POSTCHECKED, schedule=None, problem=None):
+    """A REAL solve-result/1 shape (no fabricated "schedule" key).
+
+    ``status`` keeps its old meaning as the PLANNING state a test wants to exercise:
+    "fallback"/"unknown" become a non-SAT state; SAT_POSTCHECKED becomes a postchecked SAT.
+    """
+    placed = schedule if schedule is not None else {
+        "main_vf": {"stage": 0, "order": 0, "start_time": 0, "iteration_shift": 0}}
+    target = problem if problem is not None else make_problem()
+    if status != RP.SAT_POSTCHECKED:
+        state = {"fallback": "FALLBACK", "unknown": "UNKNOWN",
+                 "unsat": "UNSAT"}.get(str(status).lower(), "UNKNOWN")
+        return solve_fixture.solve_result(placed, problem_digest=target["problem_digest"],
+                                          ii=target.get("ii", 1), state=state)
+    return solve_fixture.solve_result(
+        placed, problem_digest=target["problem_digest"], ii=target.get("ii", 1),
+        buffers=solve_fixture.fixed_buffer_versions(target))
 
 
 SOURCES = {"L": "sha256:" + "a" * 64, "S": "sha256:" + "b" * 64,
@@ -148,7 +163,11 @@ def test_r1_fallback_or_unknown_solve_is_refused():
 
 
 def test_r1_missing_or_foreign_ids_are_source_mismatch():
-    expect_code("PLAN_SOURCE_MISMATCH",
+    # P3-02: an assignment that does not cover the source by name is refused by the
+    # resolver's specific code, which names the missing id. The plan builder no longer
+    # compares against a fabricated "schedule" dict, so the generic PLAN_SOURCE_MISMATCH
+    # is reserved for the source-manifest problem (asserted below).
+    expect_code("PLAN_RESOLVE_COVERAGE_MISMATCH",
                 lambda: RP.build_resolved_plan(make_problem(), make_solve(schedule={}),
                                                SOURCES))
     problem = make_problem()

@@ -23,8 +23,11 @@ from tilefoundry.ir.tir.stmts import Evaluate, For, LetStmt, Sequential
 from tilefoundry.ir.types import Layout, PointerType, make_tensor_type
 from tilefoundry.ir.types.storage import StorageKind
 
+sys.path.insert(0, str(HERE.parent))
+
 from tilefoundry_ascend.plan import materialize as MAT
 from tilefoundry_ascend.plan import resolved_plan as RP
+import solve_fixture
 
 ROWS, D = 5, 8
 HALF_BYTES = D * 4
@@ -91,11 +94,14 @@ def make_problem(rows=ROWS):
     }
 
 
-def make_solve(rows=ROWS):
-    return {"status": RP.SAT_POSTCHECKED, "core_digest": "sha256:" + "d" * 64,
-            "result_digest": "sha256:" + "e" * 64,
-            "schedule": {"main_vf": {"stage": 0, "order": 0, "start_time": 0,
-                                     "iteration_shift": 0}}}
+def make_solve(rows=ROWS, schedule=None, problem=None):
+    """A REAL solve-result/1 shape; the plan builder no longer reads a "schedule"."""
+    placed = schedule if schedule is not None else {
+        "main_vf": {"stage": 0, "order": 0, "start_time": 0, "iteration_shift": 0}}
+    target = problem if problem is not None else make_problem(rows)
+    return solve_fixture.solve_result(
+        placed, problem_digest=target["problem_digest"], ii=target.get("ii", 1),
+        buffers=solve_fixture.fixed_buffer_versions(target))
 
 
 def build_ready(rows=ROWS, facts=None):

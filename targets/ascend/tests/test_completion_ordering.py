@@ -49,8 +49,6 @@ def _build():
     """Run the real L->S->R chain and return everything C needs. Cached per session."""
     if _CACHE:
         return _CACHE
-    import unittest.mock as _mock
-
     import test_task83_vertical as T
     from poc_vertical_adapter import nominal_solve_result, project_problem
     from tilefoundry_ascend.plan import materialize as MAT
@@ -70,21 +68,23 @@ def _build():
         }],
         "cost_model": "MODEL",
     }
-    core = B.solve_real_problem(r_problem, model_facts, {})
+    # P3-02: the REAL source postcheck, then the REAL assignment. Same reasoning as
+    # test_completion_flags: patching _solve_status let a fabricated schedule pass as
+    # SAT_POSTCHECKED, so the ordering assertions below ran on a non-production plan.
+    core = B.solve_real_problem(r_problem, model_facts, {}, require_source_postcheck=True)
+    assert core.state == "SAT", core.state
+    assert (core.postcheck or {}).get("verdict") == "POSTCHECK_PASS", core.postcheck
     nominal = nominal_solve_result(core, r_problem)
-    original_status = RP._solve_status
-    with _mock.patch.object(
-        RP, "_solve_status",
-        lambda r: RP.SAT_POSTCHECKED if getattr(r, "status", "") == "NOMINAL_SAT" else original_status(r),
-    ):
-        plan = RP.build_resolved_plan(r_problem, nominal, {"L": "l", "S": "s", "C": "c", "F": "f", "P": "p"})
-        base = 0
-        facts = {}
-        for buf in r_problem["buffers"]:
-            facts[buf["root"]] = {"versions": 1, "alignment": 64, "arena_id": "arena0",
-                                  "base_offset_bytes": base}
-            base += ((buf["bytes"] + 63) // 64) * 64
-        plan = RP.resolve_buffer_layout(plan, facts)
+    plan = RP.build_resolved_plan(r_problem, nominal,
+                                  {"L": "l", "S": "s", "C": "c", "F": "f", "P": "p"},
+                                  require_source_postcheck=True)
+    base = 0
+    facts = {}
+    for buf in r_problem["buffers"]:
+        facts[buf["root"]] = {"versions": 1, "alignment": 64, "arena_id": "arena0",
+                              "base_offset_bytes": base}
+        base += ((buf["bytes"] + 63) // 64) * 64
+    plan = RP.resolve_buffer_layout(plan, facts)
     rewritten, matmap = MAT.materialize_plan(tir, plan)
     ledger = extract_ledger(tir)
     required = C.derive_completion_obligations_from_ledger(

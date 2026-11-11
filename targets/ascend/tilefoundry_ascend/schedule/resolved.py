@@ -1,12 +1,32 @@
-"""05-01 ResolvedPlan schema + 05-02 provenance skeleton (P5 start, UNCREDITED).
+"""LEGACY DIAGNOSTIC / PROVENANCE HELPER -- NOT an authoritative ResolvedPlan.
 
-ResolvedPlan is a PLANNING object: it carries the Normalized Problem's stable ids and hashes plus the
-resolved stage/version/generation fields. It never invents values: when the Problem has no
-num_stages/versions (N/A_NOT_IN_PROBLEM), ResolvedPlan keeps N/A; a fallback solver result is never
-promoted to solved.
+STATUS: legacy, kept only for the 05-01/05-02 provenance diagnostics. It used to be the
+shape R was to grow into, and it still builds a small ``ResolvedPlan`` dataclass of its
+own. That name is now AMBIGUOUS and must not be used as the scheduling authority.
 
-Provenance: every memory TIR statement maps to its ledger action_ids and the Problem task, so the
-resolved TIR skeleton can be audited statement by statement.
+R-06 / G31 item 10 -- ONE authoritative plan type:
+    tilefoundry_ascend.plan.resolved_plan.ResolvedPlan
+is the SINGLE per-kernel ResolvedPlan for this target. It carries the real solver
+assignment (stage/phase/order/start_time/iteration_shift), the resolved version counts
+with their source, typed byte offsets, the loop/phase domains and the plan identity
+digests. Any scheduling, materialization, code generation or verification decision must
+be taken from THAT object (``build_resolved_plan`` in plan/resolved_plan.py), never from
+the diagnostic object below.
+
+What this module still legitimately provides, and only that:
+  * ``build_provenance`` -- TIR statement -> Problem task -> ledger action_ids coverage,
+    used to audit a materialized skeleton statement by statement;
+  * ``assert_resolved_plan`` -- the 05-01 "N/A stays N/A / fallback is never solved"
+    status assertions for that diagnostic view.
+
+What this module must NOT be used for:
+  * deciding stages, versions, generations or offsets (they come from the real
+    assignment via plan/resolved_plan.py);
+  * reporting a solved/pipelined kernel. Its fields are N/A by construction and there is
+    no resolution behind them.
+
+The classes below deliberately keep their historical names so the diagnostic tests and
+callers keep working; treat every one of them as diagnostic-only.
 """
 from __future__ import annotations
 
@@ -20,6 +40,12 @@ from tilefoundry.ir.tir.stmts import Evaluate, ExecutionScope, For, If, LetStmt,
 NA = "N/A_NOT_IN_PROBLEM"
 MODEL = "MODEL"
 OFFSET_UNKNOWN = "OFFSET_UNKNOWN"
+
+#: Machine-readable provenance/authority label for every object this module produces.
+#: G31 item 10: the authoritative per-kernel ResolvedPlan lives in
+#: ``tilefoundry_ascend.plan.resolved_plan``; this module is a diagnostic view only.
+PLAN_AUTHORITY = "LEGACY_DIAGNOSTIC_ONLY"
+PLAN_AUTHORITY_MODULE = "tilefoundry_ascend.plan.resolved_plan"
 
 
 @dataclass(frozen=True)
@@ -49,6 +75,15 @@ class ResolvedAccess:
 
 @dataclass(frozen=True)
 class ResolvedPlan:
+    """LEGACY DIAGNOSTIC VIEW -- not the scheduling authority (see module docstring).
+
+    For the per-kernel plan R/S/X consume use
+    ``tilefoundry_ascend.plan.resolved_plan.ResolvedPlan``. This record exists so the
+    05-01 schema/provenance diagnostics keep their stable shape; its stage/version/
+    generation fields are ``N/A_NOT_IN_PROBLEM`` by construction because it has no
+    solver assignment behind it.
+    """
+
     problem_digest: str
     source_digest: str
     ledger_sha: str
@@ -62,13 +97,24 @@ class ResolvedPlan:
     unsupported: list
     units: dict
     provenance_digest: str = ""
+    #: Always ``PLAN_AUTHORITY``: a machine-readable reminder that this record is a
+    #: diagnostic view, and that the authoritative plan is
+    #: ``tilefoundry_ascend.plan.resolved_plan.ResolvedPlan`` (G31 item 10).
+    plan_authority: str = PLAN_AUTHORITY
 
     def as_dict(self):
         return asdict(self)
 
 
 def build_resolved_plan(problem, solver_result=None) -> ResolvedPlan:
-    """Problem -> ResolvedPlan. N/A stays N/A; fallback never becomes solved."""
+    """LEGACY DIAGNOSTIC: Problem -> diagnostic outline. N/A stays N/A.
+
+    This is NOT the ResolveSchedule product. It performs no resolution: it copies the
+    Problem's ids and marks every resolved field N/A. ``solver_result`` is only consulted
+    for its coarse ``status`` string so that a fallback stays labelled a fallback.
+    Use ``tilefoundry_ascend.plan.resolved_plan.build_resolved_plan`` for the single
+    authoritative per-kernel plan (G31 item 10).
+    """
     status = "PLANNING_ONLY_NO_SOLVER"
     if solver_result is not None:
         result_status = str(getattr(solver_result, "status", "unknown"))
@@ -102,6 +148,7 @@ def build_resolved_plan(problem, solver_result=None) -> ResolvedPlan:
         for access in problem.accesses
     ]
     unsupported = [
+        "plan_authority: " + PLAN_AUTHORITY + " (see " + PLAN_AUTHORITY_MODULE + ")",
         "num_stages: " + NA,
         "x_versions: " + NA,
         "y_versions: " + NA,
