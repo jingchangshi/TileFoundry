@@ -39,8 +39,6 @@ buffers, not a measurement of what TileLang allocated.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
@@ -85,11 +83,6 @@ class FilterError(RuntimeError):
     def as_dict(self):
         return {"code": self.code, "message": self.message, "subject": self.subject,
                 "expected": self.expected, "actual": self.actual}
-
-
-def _digest(payload) -> str:
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"),
-                                     default=str).encode()).hexdigest()[:16]
 
 
 def _align_up(value: int, alignment: int) -> int:

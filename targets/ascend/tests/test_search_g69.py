@@ -630,3 +630,62 @@ def test_the_g69_record_reports_a_real_end_to_end_filter_and_timing_pass():
     assert data["cache_invalidation_tests"]["result"] == "PASS"
     assert data["rejection_tests"]["result"] == "PASS"
     assert data["noise_tests"]["result"] == "PASS"
+
+def test_the_g69_record_does_not_claim_a_device_number_it_did_not_take():
+    """The most expensive mistake this gate can make is a plausible-looking device latency.
+
+    Every timing in the record must carry its source, and a record that marks the device path
+    BLOCKED_ENV must not also publish device medians.
+    """
+    here = Path(__file__).resolve().parents[1]
+    data = json.loads((here / "evidence" / "G69_SEARCH_HARNESS.json").read_text())
+    device = data["device_timing"]
+    assert device["status"] in ("VERIFIED", "BLOCKED_ENV")
+    if device["status"] == "BLOCKED_ENV":
+        assert device["reason"], "a blocked device window must say what blocked it"
+        assert device["what_is_NOT_claimed"]
+    sources = data["end_to_end_run"]["measurement_sources"]
+    assert set(sources) == {MEASUREMENT_SOURCE_SIMULATED}, (
+        "this record was produced by the simulated clock and must say so")
+    for case in data["end_to_end_run"]["per_case"]:
+        assert case["timing_is_simulated"] is True
+        # The label must be on the FIELD, not only in a nearby sentence: a reader who grabs the
+        # number alone has to see that it did not come from the device.
+        assert "winner_median_us" not in case, (
+            "an unqualified latency field is a device claim; the simulated number must be named "
+            "as illustrative")
+        if case["winner"] is not None:
+            assert case["winner_median_us_illustrative_only"] is not None
+        assert case["rule"], "each case must publish the ranking rule that produced its winner"
+    # The gate's own honesty list has to be present and non-empty, because a gate record that
+    # lists nothing it did not prove is claiming everything.
+    assert len(data["not_claimed"]) >= 4
+    assert any("device" in line.lower() for line in data["not_claimed"])
+
+
+def test_the_record_covers_the_exclusive_access_protocol_and_the_sync_scope():
+    here = Path(__file__).resolve().parents[1]
+    data = json.loads((here / "evidence" / "G69_SEARCH_HARNESS.json").read_text())
+    method = data["measurement_method"]
+    for key in ("timer", "scope", "warmup_calls", "timing_calls_per_batch",
+                "confirmation_batches", "statistics", "compile_time", "device_exclusivity"):
+        assert key in method, "%s is a G69 timing-scope requirement" % key
+    assert "flock" in method["device_exclusivity"]
+    assert "excluded" in method["scope"] or "only" in method["scope"]
+    # Compile time must be a separate field, never folded into the kernel time.
+    assert "separately" in method["compile_time"]
+
+
+def test_the_representative_set_is_selected_by_computed_coverage_not_by_hand():
+    here = Path(__file__).resolve().parents[1]
+    data = json.loads((here / "evidence" / "G69_SEARCH_HARNESS.json").read_text())
+    selection = data["representative_selection"]
+    assert "set cover" in selection["method"]
+    for operator in ("attention_residual", "mla"):
+        block = selection[operator]
+        assert block["count"] >= 8
+        assert block["labels_covered"], "the covered labels must be published"
+        assert len(block["case_ids"]) == block["count"]
+    # Every representative must carry the labels that justified its selection.
+    for shape in data["representative_shapes"]:
+        assert shape["labels"]
