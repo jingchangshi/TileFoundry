@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+from tilefoundry.evaluator.registry import register_eval
+from tilefoundry.evaluator.value import TensorValue, to_torch_dtype
+from tilefoundry.ir.core import Op
+from tilefoundry.ir.core.param_def import ParamDef
+from tilefoundry.ir.core.register import register_op
+from tilefoundry.ir.pattern import is_ranked_tensor
+from tilefoundry.ir.types import DType, TensorType
+from tilefoundry.ir.types.shard_layout import shard_layout_of
+from tilefoundry.visitor_registry import register_typeinfer
+from tilefoundry.visitor_registry.access_relation import (
+    identity_relations,
+    register_access_relation,
+    relations_of,
+)
+from tilefoundry.visitor_registry.shard_propagate import derive_output_shard_layout
+
+
+@register_op(dialect='tf', category='tensor')
+class Cast(Op):
+    x = ParamDef(kind="input", pattern=is_ranked_tensor())
+    dtype = ParamDef(kind="attribute", annotation=DType)
+
+
+register_access_relation(Cast)(identity_relations)
+
+
+@register_typeinfer(Cast)
+def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
+    x_ty = ctx.type_of(call.args[0])
+    new_layout = x_ty.layout
+    if shard_layout_of(x_ty.layout) is not None:
+        relation = relations_of(call, ctx)
+        derived = derive_output_shard_layout(
+            (x_ty,), relation, x_ty.shape, ctx=ctx, storage=x_ty.storage
+        )
+        if derived is not None:
+            new_layout = derived
+    return TensorType(
+        shape=x_ty.shape, dtype=call.target.dtype, layout=new_layout, storage=x_ty.storage
+    )
+
+
+@register_eval(Cast)
+def _eval_cast(ctx):
+
+    out = ctx.args[0].data.to(to_torch_dtype(ctx.op.dtype))
+    return TensorValue(data=out, type=ctx.result_type)

@@ -1,0 +1,3 @@
+RUN_ID=20261112T202505+0800-task113
+VAL=/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/native_v3/mainline_validation/run-20261112T202505+0800-task113
+CLEAN_WT=/home/s00653124/workspace/TileFoundry_task113_cpu_baseline_20261112T202505+0800-task113

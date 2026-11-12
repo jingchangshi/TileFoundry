@@ -1,0 +1,170 @@
+"""TileFoundry top-level package.
+
+Re-exports the stable public API from `tilefoundry.ir.*` for convenience.
+[code-organization §1](docs/spec/code-organization.md#1-directory-skeleton) is
+authoritative on physical layout.
+"""
+
+from __future__ import annotations
+
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _distribution_version
+
+# ruff: noqa: I001 -- curated re-export order; alphabetical sort breaks staged imports.
+
+try:
+    __version__ = _distribution_version("tilefoundry")
+    __version_source__ = "installed"
+except PackageNotFoundError:  # clean archive: no installed egg-info, still importable
+    __version__ = "0.0.0+unknown"
+    __version_source__ = "fallback-uninstalled"
+
+
+def require_version() -> str:
+    """Return the distribution version only when it is authoritative.
+
+    A fallback version is deliberately NOT a normal version: features that gate on
+    version compatibility must call this (or check __version_source__) and fail by
+    name instead of accepting 0.0.0+unknown.
+    """
+    if __version_source__ != "installed":
+        raise RuntimeError("VERSION_SOURCE_FALLBACK: tilefoundry distribution metadata is not installed")
+    return __version__
+
+
+from tilefoundry.ir.core import (
+    DispatchRegistry,
+    Call,
+    Constant,
+    Expr,
+    Op,
+    ParameterInfo,
+    TypeInferContext,
+    Var,
+    VerifyError,
+    cost_evaluator_registry,
+    register_cost_evaluator,
+    register_typeinfer,
+    register_verify_stmt,
+    typeinfer_registry,
+    verify_stmt_registry,
+)
+
+
+from tilefoundry.ir.pattern import RangePattern, Pattern
+from tilefoundry.ir.types import DType, TensorType, TupleType, Type
+from tilefoundry.ir.types.dim import DimVar
+from tilefoundry.ir.types import (
+    B,
+    Broadcast,
+    ComposedLayout,
+    Dynamic,
+    IntTuple,
+    Layout,
+    LayoutBase,
+    Mesh,
+    P,
+    Partial,
+    S,
+    ShardAttr,
+    ShardLayout,
+    Split,
+    Swizzle,
+    Topology,
+)
+
+
+from tilefoundry.ir.tir.stmt import Stmt
+
+
+from tilefoundry.ir.types import _register_dim_typeinfer
+
+
+from tilefoundry.ir import hir as _hir  # noqa: F401
+from tilefoundry.ir import tir as _tir  # noqa: F401
+
+
+from tilefoundry.visitor_registry import op_cost as _op_cost  # noqa: F401
+
+
+from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
+
+
+from tilefoundry.script import func, intrinsic, prim_func
+from tilefoundry.module import module
+
+
+from tilefoundry.compile import build, compile, jit, normalize_to_module, CompilerOptions
+from tilefoundry.inspection.viewer import Viewer as _Viewer
+
+
+_register_dim_typeinfer()
+
+
+def view(root, *, port: int = 0, open_browser: bool = True) -> int:
+    """Start the interactive HIR viewer for *root* (Function or Module).
+
+    Thin wrapper around ``tilefoundry.inspection.viewer.Viewer(root).serve``.
+    """
+    return _Viewer(root).serve(port=port, open_browser=open_browser)
+
+
+__all__ = [
+    "__version__",
+    "__version_source__",
+    "require_version",
+    "Expr",
+    "Var",
+    "Constant",
+    "Call",
+    "Stmt",
+    "TupleGetItem",
+    "Op",
+    "ParameterInfo",
+    "DispatchRegistry",
+    "typeinfer_registry",
+    "verify_stmt_registry",
+    "cost_evaluator_registry",
+    "register_typeinfer",
+    "register_verify_stmt",
+    "register_cost_evaluator",
+    "TypeInferContext",
+    "VerifyError",
+    "DType",
+    "TensorType",
+    "TupleType",
+    "Type",
+    "Pattern",
+    "RangePattern",
+    "DimVar",
+    "IntTuple",
+    "LayoutBase",
+    "Layout",
+    "Swizzle",
+    "ComposedLayout",
+    "Topology",
+    "Mesh",
+    "ShardAttr",
+    "Split",
+    "Partial",
+    "Broadcast",
+    "Dynamic",
+    "ShardLayout",
+    "S",
+    "P",
+    "B",
+    "func",
+    "prim_func",
+    "intrinsic",
+    "module",
+    "build",
+    "compile",
+    "jit",
+    "normalize_to_module",
+    "CompilerOptions",
+    "view",
+]
+
+from tilefoundry.target.base import load_targets  # noqa: E402
+
+load_targets()

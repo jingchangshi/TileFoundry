@@ -1,0 +1,2552 @@
+{
+  "task": "task-112 / ORIG-40",
+  "created_at_utc": "2026-11-12T12:35:07.747Z",
+  "scope": "read-only identity, package verification, CPU tests, and connected preflight-only; no candidate import, no contract main, no kernel, no numerical 40 run",
+  "package_root": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3",
+  "package_identity": {
+    "fixture_files": 18,
+    "original_cases": 40,
+    "tasks": 34,
+    "gates": 8,
+    "package_manifest_files": 82,
+    "package_manifest_checked": true
+  },
+  "verify_package": {
+    "before": {
+      "status": "PASS",
+      "scope": "package integrity, AST syntax, fixture identity, task DAG; no NPU",
+      "fixture_files": 18,
+      "original_cases": 40,
+      "tasks": 34,
+      "gates": 8,
+      "python_files_syntax_checked": 30,
+      "package_manifest_checked": true
+    },
+    "after": {
+      "status": "PASS",
+      "scope": "package integrity, AST syntax, fixture identity, task DAG; no NPU",
+      "fixture_files": 18,
+      "original_cases": 40,
+      "tasks": 34,
+      "gates": 8,
+      "python_files_syntax_checked": 30,
+      "package_manifest_checked": true
+    },
+    "before_after_identical": true
+  },
+  "command_results": [
+    {
+      "name": "verify_package_before",
+      "exit_code": 0,
+      "log": "artifacts/native_v3/mainline_validation/verify_package.log",
+      "report": "artifacts/native_v3/mainline_validation/verify_package.json",
+      "cwd": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3",
+      "command": "PYTHONDONTWRITEBYTECODE=1 /home/s00653124/workspace/envs/tfnpu-v2/bin/python tools/verify_package.py --output /home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/native_v3/mainline_validation/verify_package.json"
+    },
+    {
+      "name": "framework_tests_35",
+      "exit_code": 0,
+      "log": "artifacts/native_v3/mainline_validation/framework_tests.log",
+      "cwd": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3",
+      "command": "PYTHONDONTWRITEBYTECODE=1 /home/s00653124/workspace/envs/tfnpu-v2/bin/python -m unittest discover -s tests -v"
+    },
+    {
+      "name": "reference_tests_20",
+      "exit_code": 0,
+      "log": "artifacts/native_v3/mainline_validation/reference_tests.log",
+      "cwd": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3",
+      "command": "PYTHONDONTWRITEBYTECODE=1 /home/s00653124/workspace/envs/tfnpu-v2/bin/python -m unittest discover -s reference_core -p 'test_*.py' -v"
+    },
+    {
+      "name": "run_contract_help",
+      "exit_code": 0,
+      "log": "artifacts/native_v3/mainline_validation/run_contract_help.log",
+      "cwd": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3",
+      "command": "PYTHONDONTWRITEBYTECODE=1 /home/s00653124/workspace/envs/tfnpu-v2/bin/python tools/run_contract.py --help"
+    },
+    {
+      "name": "preflight_attention_residual",
+      "exit_code": 0,
+      "log": "artifacts/native_v3/mainline_validation/preflight_attention_residual.log",
+      "report": "artifacts/native_v3/mainline_validation/preflight_attention_residual.json",
+      "cwd": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3",
+      "command": "source /data/pri/cann-9.2.0/ascend-toolkit/set_env.sh && PYTHONPATH=/home/s00653124/workspace/BiShengKernelAgent/skills/common/ascend-npu-run-eval/scripts TORCH_DEVICE_BACKEND_AUTOLOAD=0 PYTHONDONTWRITEBYTECODE=1 flock -w 600 /home/.tf_device0.lock /home/s00653124/workspace/envs/tfnpu-v2/bin/python tools/run_contract.py --case attention_residual --operator-file /home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3/implementation/__init__.py --preflight-only --cache-dir off --report /home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/native_v3/mainline_validation/preflight_attention_residual.json --log /home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/native_v3/mainline_validation/preflight_attention_residual.log"
+    },
+    {
+      "name": "preflight_mla",
+      "exit_code": 0,
+      "log": "artifacts/native_v3/mainline_validation/preflight_mla.log",
+      "report": "artifacts/native_v3/mainline_validation/preflight_mla.json",
+      "cwd": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3",
+      "command": "source /data/pri/cann-9.2.0/ascend-toolkit/set_env.sh && PYTHONPATH=/home/s00653124/workspace/BiShengKernelAgent/skills/common/ascend-npu-run-eval/scripts TORCH_DEVICE_BACKEND_AUTOLOAD=0 PYTHONDONTWRITEBYTECODE=1 flock -w 600 /home/.tf_device0.lock /home/s00653124/workspace/envs/tfnpu-v2/bin/python tools/run_contract.py --case mla --operator-file /home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3/implementation/__init__.py --preflight-only --cache-dir off --report /home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/native_v3/mainline_validation/preflight_mla.json --log /home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/native_v3/mainline_validation/preflight_mla.log"
+    },
+    {
+      "name": "verify_package_after",
+      "exit_code": 0,
+      "log": "artifacts/native_v3/mainline_validation/verify_package_after.log",
+      "report": "artifacts/native_v3/mainline_validation/verify_package_after.json",
+      "cwd": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3",
+      "command": "PYTHONDONTWRITEBYTECODE=1 /home/s00653124/workspace/envs/tfnpu-v2/bin/python tools/verify_package.py --output /home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/native_v3/mainline_validation/verify_package_after.json"
+    }
+  ],
+  "cpu_test_results": {
+    "framework": "35 passed",
+    "reference": "20 passed"
+  },
+  "original_40": {
+    "status": "NOT_RUN",
+    "labels": [
+      "level4/attention_residual_1",
+      "level4/attention_residual_2",
+      "level4/attention_residual_3",
+      "level4/attention_residual_4",
+      "level4/attention_residual_5",
+      "level4/attention_residual_6",
+      "level4/attention_residual_7",
+      "level4/attention_residual_8",
+      "level4/attention_residual_9",
+      "level4/attention_residual_10",
+      "level4/attention_residual_11",
+      "level4/attention_residual_12",
+      "level4/attention_residual_13",
+      "level4/attention_residual_14",
+      "level4/attention_residual_15",
+      "level4/attention_residual_16",
+      "level4/attention_residual_17",
+      "level4/attention_residual_18",
+      "level4/attention_residual_19",
+      "level4/attention_residual_20",
+      "level4/mla_1",
+      "level4/mla_2",
+      "level4/mla_3",
+      "level4/mla_4",
+      "level4/mla_5",
+      "level4/mla_6",
+      "level4/mla_7",
+      "level4/mla_8",
+      "level4/mla_9",
+      "level4/mla_10",
+      "level4/mla_11",
+      "level4/mla_12",
+      "level4/mla_13",
+      "level4/mla_14",
+      "level4/mla_15",
+      "level4/mla_16",
+      "level4/mla_17",
+      "level4/mla_18",
+      "level4/mla_19",
+      "level4/mla_20"
+    ],
+    "total": 40,
+    "by_case": {
+      "attention_residual": 20,
+      "mla": 20
+    },
+    "label_sets_match": {
+      "ar_case_matrix_vs_preflight": true,
+      "mla_case_matrix_vs_preflight": true
+    }
+  },
+  "preflight": {
+    "attention_residual": {
+      "run_id": "d44d0d786db64f77aaed3acb490297ce",
+      "status": "PREFLIGHT_ONLY",
+      "preflight_status": "PASS",
+      "numerical_status": "NOT_RUN",
+      "candidate_imported": false,
+      "contract_main_invoked": false,
+      "kernel_execution_requested": false,
+      "main_returned_normally": false,
+      "device_synchronize_succeeded": false,
+      "cache_dir": "off",
+      "expected_ids": [
+        "level4/attention_residual_1",
+        "level4/attention_residual_2",
+        "level4/attention_residual_3",
+        "level4/attention_residual_4",
+        "level4/attention_residual_5",
+        "level4/attention_residual_6",
+        "level4/attention_residual_7",
+        "level4/attention_residual_8",
+        "level4/attention_residual_9",
+        "level4/attention_residual_10",
+        "level4/attention_residual_11",
+        "level4/attention_residual_12",
+        "level4/attention_residual_13",
+        "level4/attention_residual_14",
+        "level4/attention_residual_15",
+        "level4/attention_residual_16",
+        "level4/attention_residual_17",
+        "level4/attention_residual_18",
+        "level4/attention_residual_19",
+        "level4/attention_residual_20"
+      ],
+      "executed_unique_expected": 0,
+      "result_record_count": 0,
+      "passed": 0,
+      "device": {
+        "requested": null,
+        "selected": "npu:0",
+        "visible_device_count": 3,
+        "name": "Ascend950PR_9579",
+        "properties": "_NPUDeviceProperties(name='Ascend950PR_9579', total_memory=125977MB, cube_core_num=28, vector_core_num=56, uuid=0008d80a-d200-0000-0000-00e70e940000, L2_cache_size=128MB)"
+      },
+      "comparator": {
+        "entrypoint": "npu_compare.compare_case_result",
+        "accuracy_mode": "cann-bench",
+        "implementation": {
+          "path": "/home/s00653124/workspace/BiShengKernelAgent/skills/common/ascend-npu-run-eval/scripts/npu_compare.py",
+          "exists": true,
+          "sha256": "ef2506bba60a3126196f433d97a02455c96e7be9c6c689b0a7ff400b97af5211",
+          "bytes": 9041
+        },
+        "threshold_policy": "Original helper/proto and installed comparator, unchanged.",
+        "effective_thresholds": "Not inferred by this runner; pin and audit the comparator in P0."
+      },
+      "source_files_changed_during_run": [],
+      "exit_code": 0
+    },
+    "mla": {
+      "run_id": "ba328d3967674ae4a6bd18e6bacbe97f",
+      "status": "PREFLIGHT_ONLY",
+      "preflight_status": "PASS",
+      "numerical_status": "NOT_RUN",
+      "candidate_imported": false,
+      "contract_main_invoked": false,
+      "kernel_execution_requested": false,
+      "main_returned_normally": false,
+      "device_synchronize_succeeded": false,
+      "cache_dir": "off",
+      "expected_ids": [
+        "level4/mla_1",
+        "level4/mla_2",
+        "level4/mla_3",
+        "level4/mla_4",
+        "level4/mla_5",
+        "level4/mla_6",
+        "level4/mla_7",
+        "level4/mla_8",
+        "level4/mla_9",
+        "level4/mla_10",
+        "level4/mla_11",
+        "level4/mla_12",
+        "level4/mla_13",
+        "level4/mla_14",
+        "level4/mla_15",
+        "level4/mla_16",
+        "level4/mla_17",
+        "level4/mla_18",
+        "level4/mla_19",
+        "level4/mla_20"
+      ],
+      "executed_unique_expected": 0,
+      "result_record_count": 0,
+      "passed": 0,
+      "device": {
+        "requested": null,
+        "selected": "npu:0",
+        "visible_device_count": 3,
+        "name": "Ascend950PR_9579",
+        "properties": "_NPUDeviceProperties(name='Ascend950PR_9579', total_memory=125977MB, cube_core_num=28, vector_core_num=56, uuid=0008d80a-d200-0000-0000-00e70e940000, L2_cache_size=128MB)"
+      },
+      "comparator": {
+        "entrypoint": "npu_compare.compare_case_result",
+        "accuracy_mode": "cann-bench",
+        "implementation": {
+          "path": "/home/s00653124/workspace/BiShengKernelAgent/skills/common/ascend-npu-run-eval/scripts/npu_compare.py",
+          "exists": true,
+          "sha256": "ef2506bba60a3126196f433d97a02455c96e7be9c6c689b0a7ff400b97af5211",
+          "bytes": 9041
+        },
+        "threshold_policy": "Original helper/proto and installed comparator, unchanged.",
+        "effective_thresholds": "Not inferred by this runner; pin and audit the comparator in P0."
+      },
+      "source_files_changed_during_run": [],
+      "exit_code": 0
+    }
+  },
+  "comparator": {
+    "entrypoint": "npu_compare.compare_case_result",
+    "accuracy_mode": "cann-bench",
+    "path": "/home/s00653124/workspace/BiShengKernelAgent/skills/common/ascend-npu-run-eval/scripts/npu_compare.py",
+    "repo_head": "5496ef6e342da64386e0dfb4f0d8b91eb3712b2f",
+    "repo_branch": "feat/tla-gemm",
+    "repo_status": "clean",
+    "threshold_source": "/home/s00653124/workspace/BiShengKernelAgent/skills/common/ascend-npu-run-eval/scripts/cann_bench_compare.py:82-132",
+    "threshold_policy": "installed comparator table unchanged; helper/proto precision_thresholds empty; no allclose inferred; no override",
+    "hashes": {
+      "npu_compare.py": "ef2506bba60a3126196f433d97a02455c96e7be9c6c689b0a7ff400b97af5211",
+      "cann_bench_compare.py": "e347b92141572e7c987e39296806a6483c63663e729917f50113c357e82cf3fc",
+      "dtype_close_compare.py": "ab2cdf48fe5702c13bef3c021b2f62d5f1d5e855b9097cae5f34f5fa1f6cd37e",
+      "npu_compare_common.py": "59a22dad8ea8769cbe742720c2fb5c4b1be539abccc4a72cf22468333a7b5305",
+      "npu_contract_compare.py": "63e6d934c850feb9e9a8104c3ffd6398e5f865e871fabcea8922b12dab699dc3"
+    }
+  },
+  "identity_hashes": {
+    "tools/run_contract.py": "cff4e08b0f4f0b3bb3c5325a473af5d554b684a12b04afe611bd1b3d1d9d807e",
+    "tools/verify_package.py": "0d554dc153980e1feed4de0a2faaf87919c7b23c21d40fff5002796da5f16484",
+    "cases/case_matrix.json": "d57785b1db4205e2f11a0c1641eed7cddbd0b6530d81655a558dcdf556be4ef8",
+    "cases/CONTRACT.md": "3fb9f41454e36ae9f462a7c3e69ec3028aa4b602fed0687951e9df5165ceda92",
+    "fixtures/source_manifest.json": "2548c4670c4883584965df4b5c9dcad819e9c16873fd689ac43379b69506636d",
+    "PACKAGE_MANIFEST.json": "d029589a67558bf0a989f5a151f6dddd29b5a8a9f1ce71cacb62bca16e56a530",
+    "implementation/__init__.py": "159f7088440c23acdd09f9741e8f89fb581f66bd35d997bd2f40acf2c1a930b2"
+  },
+  "fixture_manifest": [
+    {
+      "path": "fixtures/attention_residual/golden.py",
+      "archive_path": "attention_residual/golden.py",
+      "sha256": "cf90b8476c4fabbc5be348baf48b44c0ce63ff44798f5479100232762217795a",
+      "bytes": 2473
+    },
+    {
+      "path": "fixtures/attention_residual/desc.md",
+      "archive_path": "attention_residual/desc.md",
+      "sha256": "5eb025defbff0498d7f41f23e967080eae022dbb8adffd969aaf35c6a61c1c25",
+      "bytes": 6455
+    },
+    {
+      "path": "fixtures/attention_residual/proto.yaml",
+      "archive_path": "attention_residual/proto.yaml",
+      "sha256": "2d85e237072501be7205cf85c82739d4b1be17a37c74fe80acf1f857db19aa73",
+      "bytes": 2631
+    },
+    {
+      "path": "fixtures/attention_residual/cases.yaml",
+      "archive_path": "attention_residual/cases.yaml",
+      "sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "bytes": 8284
+    },
+    {
+      "path": "fixtures/attention_residual/cases.csv",
+      "archive_path": "attention_residual/cases.csv",
+      "sha256": "eddae5a97b9d08986f76899bbfe88dfdac501b5481ebff50bfd40fbaae5d5b8a",
+      "bytes": 4868
+    },
+    {
+      "path": "fixtures/attention_residual/test_attention_residual.py",
+      "archive_path": "attention_residual/test_attention_residual.py",
+      "sha256": "c50fcf953ffe613f743dc4c34b5f715676cca6f491b0d37bff8946959d429559",
+      "bytes": 571
+    },
+    {
+      "path": "fixtures/attention_residual/bench_attention_residual.py",
+      "archive_path": "attention_residual/bench_attention_residual.py",
+      "sha256": "5a02e2c40d41a364eac1b5b6cac811cdebf65dd1412e59a08652b9bfb891e6c8",
+      "bytes": 613
+    },
+    {
+      "path": "fixtures/attention_residual/LICENSE",
+      "archive_path": "attention_residual/LICENSE",
+      "sha256": "cb282ac2b66d7d6734c3fb354db792b28cf23ab29fbc16d5cfd8bd542bedeb1e",
+      "bytes": 5278
+    },
+    {
+      "path": "fixtures/mla/golden.py",
+      "archive_path": "mla/golden.py",
+      "sha256": "3996ec1a4bcf142db4f311dd72510d0420269691e1efccbd72a00e53a2bc8cdc",
+      "bytes": 5939
+    },
+    {
+      "path": "fixtures/mla/desc.md",
+      "archive_path": "mla/desc.md",
+      "sha256": "433b8eaff3231700cb2fe0ecbba8cc91cb2ae65902517d1a4aa66daf48d10362",
+      "bytes": 13322
+    },
+    {
+      "path": "fixtures/mla/proto.yaml",
+      "archive_path": "mla/proto.yaml",
+      "sha256": "70cd11633ebad052058cc33606f4fa4e004fc1e9b2a9251a73f28a697a1910f4",
+      "bytes": 3520
+    },
+    {
+      "path": "fixtures/mla/cases.yaml",
+      "archive_path": "mla/cases.yaml",
+      "sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "bytes": 10983
+    },
+    {
+      "path": "fixtures/mla/cases.csv",
+      "archive_path": "mla/cases.csv",
+      "sha256": "85648d43619c1a38c5730231baa20308dc5166c76d3cbbb8fe0f53ab7d2045a8",
+      "bytes": 7542
+    },
+    {
+      "path": "fixtures/mla/test_mla.py",
+      "archive_path": "mla/test_mla.py",
+      "sha256": "f12622752c0d3f6d2232b4fa10aef332b1b1dc8e7f708e15b4794d480408d981",
+      "bytes": 526
+    },
+    {
+      "path": "fixtures/mla/bench_mla.py",
+      "archive_path": "mla/bench_mla.py",
+      "sha256": "f2f25892640692960d6fcc0b587735319a262c161910a3f66551a9afe6efa431",
+      "bytes": 523
+    },
+    {
+      "path": "fixtures/mla/LICENSE",
+      "archive_path": "mla/LICENSE",
+      "sha256": "cb282ac2b66d7d6734c3fb354db792b28cf23ab29fbc16d5cfd8bd542bedeb1e",
+      "bytes": 5278
+    },
+    {
+      "path": "fixtures/cannbench_contract.py",
+      "archive_paths": [
+        "attention_residual/optimization/20261110-run01/work/cannbench_contract.py",
+        "mla/optimization/20261110-run01/work/cannbench_contract.py"
+      ],
+      "sha256": "026f51a94b6a6046f3096fcaa363f77e325e7f246c6e584a65a44e80de457400",
+      "bytes": 52173
+    },
+    {
+      "path": "fixtures/CANN_CONTRACT_LICENSE",
+      "archive_paths": [
+        "attention_residual/optimization/20261110-run01/work/CANN_CONTRACT_LICENSE",
+        "mla/optimization/20261110-run01/work/CANN_CONTRACT_LICENSE"
+      ],
+      "sha256": "cb282ac2b66d7d6734c3fb354db792b28cf23ab29fbc16d5cfd8bd542bedeb1e",
+      "bytes": 5278
+    }
+  ],
+  "case_matrix_rows": [
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_1",
+      "case_id": 1,
+      "task_id": "level4/attention_residual",
+      "seed": 1474891499,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          4,
+          1,
+          128,
+          2048
+        ],
+        [
+          1,
+          128,
+          2048
+        ],
+        [
+          2048
+        ],
+        [
+          2048
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 0.000001
+      },
+      "note_original": "[P:default-small] warm probe",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_2",
+      "case_id": 2,
+      "task_id": "level4/attention_residual",
+      "seed": 745556439,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          2,
+          1,
+          1,
+          4096
+        ],
+        [
+          1,
+          1,
+          4096
+        ],
+        [
+          4096
+        ],
+        [
+          4096
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 0.000001
+      },
+      "note_original": "[B:T1-decode-Nmin] single-token decode, minimum stack",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_3",
+      "case_id": 3,
+      "task_id": "level4/attention_residual",
+      "seed": 1466990822,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          6,
+          2,
+          256,
+          2048
+        ],
+        [
+          2,
+          256,
+          2048
+        ],
+        [
+          2048
+        ],
+        [
+          2048
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "alpha": 0.2,
+        "epsilon": 0.000001
+      },
+      "note_original": "[D:fp16-S] fp16 small",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_4",
+      "case_id": 4,
+      "task_id": "level4/attention_residual",
+      "seed": 174300161,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          3,
+          1,
+          333,
+          2047
+        ],
+        [
+          1,
+          333,
+          2047
+        ],
+        [
+          2047
+        ],
+        [
+          2047
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 0.000001
+      },
+      "note_original": "[B:non-aligned] N3/T333/D2047",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_5",
+      "case_id": 5,
+      "task_id": "level4/attention_residual",
+      "seed": 1166651234,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          8,
+          1,
+          512,
+          1024
+        ],
+        [
+          1,
+          512,
+          1024
+        ],
+        [
+          1024
+        ],
+        [
+          1024
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.95,
+        "epsilon": 0.000001
+      },
+      "note_original": "[B:alpha-max] aggregation-dominated blend",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_6",
+      "case_id": 6,
+      "task_id": "level4/attention_residual",
+      "seed": 1917756235,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          8,
+          2,
+          1024,
+          2048
+        ],
+        [
+          2,
+          1024,
+          2048
+        ],
+        [
+          2048
+        ],
+        [
+          2048
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.35,
+        "epsilon": 0.000001
+      },
+      "note_original": "[M:7B-block8] mid prefill",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_7",
+      "case_id": 7,
+      "task_id": "level4/attention_residual",
+      "seed": 1546319123,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          4,
+          4,
+          512,
+          4096
+        ],
+        [
+          4,
+          512,
+          4096
+        ],
+        [
+          4096
+        ],
+        [
+          4096
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 0.000001
+      },
+      "note_original": "[M:7B-batch4]",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_8",
+      "case_id": 8,
+      "task_id": "level4/attention_residual",
+      "seed": 972998724,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          16,
+          1,
+          512,
+          4096
+        ],
+        [
+          1,
+          512,
+          4096
+        ],
+        [
+          4096
+        ],
+        [
+          4096
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 0.000001
+      },
+      "note_original": "[M:deep-stack16]",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_9",
+      "case_id": 9,
+      "task_id": "level4/attention_residual",
+      "seed": 1498121861,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          4,
+          1,
+          4096,
+          2560
+        ],
+        [
+          1,
+          4096,
+          2560
+        ],
+        [
+          2560
+        ],
+        [
+          2560
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 0.000001
+      },
+      "note_original": "[D:fp16-M] long-seq fp16",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_10",
+      "case_id": 10,
+      "task_id": "level4/attention_residual",
+      "seed": 1196037518,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          12,
+          2,
+          512,
+          3584
+        ],
+        [
+          2,
+          512,
+          3584
+        ],
+        [
+          3584
+        ],
+        [
+          3584
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.65,
+        "epsilon": 0.000001
+      },
+      "note_original": "[M:8B-block12]",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_11",
+      "case_id": 11,
+      "task_id": "level4/attention_residual",
+      "seed": 99796731,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          6,
+          1,
+          2048,
+          4096
+        ],
+        [
+          1,
+          2048,
+          4096
+        ],
+        [
+          4096
+        ],
+        [
+          4096
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 0.000001
+      },
+      "note_original": "[M:7B-seq2k]",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_12",
+      "case_id": 12,
+      "task_id": "level4/attention_residual",
+      "seed": 1674213678,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          8,
+          8,
+          256,
+          2048
+        ],
+        [
+          8,
+          256,
+          2048
+        ],
+        [
+          2048
+        ],
+        [
+          2048
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.05,
+        "epsilon": 0.000001
+      },
+      "note_original": "[B:alpha-min] residual-dominated blend",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_13",
+      "case_id": 13,
+      "task_id": "level4/attention_residual",
+      "seed": 622278726,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          4,
+          2,
+          1024,
+          5120
+        ],
+        [
+          2,
+          1024,
+          5120
+        ],
+        [
+          5120
+        ],
+        [
+          5120
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 1e-8
+      },
+      "note_original": "[B:eps-min]",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_14",
+      "case_id": 14,
+      "task_id": "level4/attention_residual",
+      "seed": 1634482190,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          8,
+          1,
+          2048,
+          1000
+        ],
+        [
+          1,
+          2048,
+          1000
+        ],
+        [
+          1000
+        ],
+        [
+          1000
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 0.001
+      },
+      "note_original": "[B:eps-max+non-aligned-D1000]",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_15",
+      "case_id": 15,
+      "task_id": "level4/attention_residual",
+      "seed": 1676476532,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          24,
+          1,
+          256,
+          4096
+        ],
+        [
+          1,
+          256,
+          4096
+        ],
+        [
+          4096
+        ],
+        [
+          4096
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 0.000001
+      },
+      "note_original": "[G:deep-stack24]",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_16",
+      "case_id": 16,
+      "task_id": "level4/attention_residual",
+      "seed": 1722815757,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          8,
+          4,
+          2048,
+          4096
+        ],
+        [
+          4,
+          2048,
+          4096
+        ],
+        [
+          4096
+        ],
+        [
+          4096
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 0.000001
+      },
+      "note_original": "[M:op-max] stack at 2^28 cap",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_17",
+      "case_id": 17,
+      "task_id": "level4/attention_residual",
+      "seed": 987619029,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          16,
+          1,
+          4096,
+          4096
+        ],
+        [
+          1,
+          4096,
+          4096
+        ],
+        [
+          4096
+        ],
+        [
+          4096
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 0.000001
+      },
+      "note_original": "[D:fp16-op-max] deep variant at cap",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_18",
+      "case_id": 18,
+      "task_id": "level4/attention_residual",
+      "seed": 1443277225,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          4,
+          8,
+          512,
+          7168
+        ],
+        [
+          8,
+          512,
+          7168
+        ],
+        [
+          7168
+        ],
+        [
+          7168
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.25,
+        "epsilon": 0.000001
+      },
+      "note_original": "[M:DSv3-width] D=7168",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_19",
+      "case_id": 19,
+      "task_id": "level4/attention_residual",
+      "seed": 605202302,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          8,
+          1,
+          8192,
+          2560
+        ],
+        [
+          1,
+          8192,
+          2560
+        ],
+        [
+          2560
+        ],
+        [
+          2560
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 0.000001
+      },
+      "note_original": "[M:long-seq-8k]",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "attention_residual",
+      "label": "level4/attention_residual_20",
+      "case_id": 20,
+      "task_id": "level4/attention_residual",
+      "seed": 711900270,
+      "input_names": [
+        "v_stack",
+        "x",
+        "w",
+        "gamma"
+      ],
+      "input_shapes": [
+        [
+          32,
+          1,
+          1024,
+          2048
+        ],
+        [
+          1,
+          1024,
+          2048
+        ],
+        [
+          2048
+        ],
+        [
+          2048
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "alpha": 0.5,
+        "epsilon": 0.000001
+      },
+      "note_original": "[G:deep-stack32]",
+      "source_sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_1",
+      "case_id": 1,
+      "task_id": "level4/mla",
+      "seed": 1046154938,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          2,
+          128,
+          128,
+          512
+        ],
+        [
+          2,
+          128,
+          128,
+          64
+        ],
+        [
+          2,
+          128,
+          1,
+          512
+        ],
+        [
+          2,
+          128,
+          1,
+          64
+        ],
+        [
+          2,
+          128,
+          1,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": true
+      },
+      "note_original": "M-float16-BSND-B2S128Nq128Nkv1-dnope512drope64-prefill-causal | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_2",
+      "case_id": 2,
+      "task_id": "level4/mla",
+      "seed": 1466203925,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          4,
+          256,
+          128,
+          512
+        ],
+        [
+          4,
+          256,
+          128,
+          64
+        ],
+        [
+          4,
+          256,
+          1,
+          512
+        ],
+        [
+          4,
+          256,
+          1,
+          64
+        ],
+        [
+          4,
+          256,
+          1,
+          512
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": true
+      },
+      "note_original": "L-bfloat16-BSND-B4S256Nq128Nkv1-dnope512drope64-prefill-causal | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_3",
+      "case_id": 3,
+      "task_id": "level4/mla",
+      "seed": 1481725773,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          2,
+          128,
+          64,
+          448
+        ],
+        [
+          2,
+          128,
+          64,
+          64
+        ],
+        [
+          2,
+          128,
+          1,
+          448
+        ],
+        [
+          2,
+          128,
+          1,
+          64
+        ],
+        [
+          2,
+          128,
+          1,
+          448
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": true
+      },
+      "note_original": "M-bfloat16-BSND-B2S128Nq64Nkv1-dnope448drope64-causal",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_4",
+      "case_id": 4,
+      "task_id": "level4/mla",
+      "seed": 625327224,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          2,
+          256,
+          128,
+          512
+        ],
+        [
+          2,
+          256,
+          128,
+          64
+        ],
+        [
+          2,
+          128,
+          1,
+          512
+        ],
+        [
+          2,
+          128,
+          1,
+          64
+        ],
+        [
+          2,
+          128,
+          1,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": false
+      },
+      "note_original": "M-float16-BSND-B2Sq256Skv128Nq128-dnope512-cross | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_5",
+      "case_id": 5,
+      "task_id": "level4/mla",
+      "seed": 1524641592,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          2,
+          256,
+          128,
+          512
+        ],
+        [
+          2,
+          256,
+          128,
+          64
+        ],
+        [
+          2,
+          256,
+          1,
+          512
+        ],
+        [
+          2,
+          256,
+          1,
+          64
+        ],
+        [
+          2,
+          256,
+          1,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": true
+      },
+      "note_original": "L-float16-BSND-B2S256Nq128-dnope512-long-prefill-causal | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_6",
+      "case_id": 6,
+      "task_id": "level4/mla",
+      "seed": 1771309450,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          2,
+          256,
+          128,
+          448
+        ],
+        [
+          2,
+          256,
+          128,
+          64
+        ],
+        [
+          2,
+          256,
+          1,
+          448
+        ],
+        [
+          2,
+          256,
+          1,
+          64
+        ],
+        [
+          2,
+          256,
+          1,
+          448
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": false
+      },
+      "note_original": "L-float16-BSND-B2S256Nq128-dnope448-long-prefill",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_7",
+      "case_id": 7,
+      "task_id": "level4/mla",
+      "seed": 1475820401,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          1,
+          1,
+          128,
+          512
+        ],
+        [
+          1,
+          1,
+          128,
+          64
+        ],
+        [
+          1,
+          2048,
+          1,
+          512
+        ],
+        [
+          1,
+          2048,
+          1,
+          64
+        ],
+        [
+          1,
+          2048,
+          1,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": false
+      },
+      "note_original": "S-float16-BSND-B1S1Skv2048Nq128-decode-single-batch | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_8",
+      "case_id": 8,
+      "task_id": "level4/mla",
+      "seed": 1124036600,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          16,
+          1,
+          128,
+          512
+        ],
+        [
+          16,
+          1,
+          128,
+          64
+        ],
+        [
+          16,
+          2048,
+          1,
+          512
+        ],
+        [
+          16,
+          2048,
+          1,
+          64
+        ],
+        [
+          16,
+          2048,
+          1,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": false
+      },
+      "note_original": "M-float16-BSND-B16S1Skv2048Nq128-decode | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_9",
+      "case_id": 9,
+      "task_id": "level4/mla",
+      "seed": 253874537,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          32,
+          1,
+          128,
+          512
+        ],
+        [
+          32,
+          1,
+          128,
+          64
+        ],
+        [
+          32,
+          2048,
+          1,
+          512
+        ],
+        [
+          32,
+          2048,
+          1,
+          64
+        ],
+        [
+          32,
+          2048,
+          1,
+          512
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": false
+      },
+      "note_original": "L-bfloat16-BSND-B32S1Skv2048Nq128-decode | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_10",
+      "case_id": 10,
+      "task_id": "level4/mla",
+      "seed": 1151581541,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          60,
+          1,
+          128,
+          512
+        ],
+        [
+          60,
+          1,
+          128,
+          64
+        ],
+        [
+          60,
+          2048,
+          1,
+          512
+        ],
+        [
+          60,
+          2048,
+          1,
+          64
+        ],
+        [
+          60,
+          2048,
+          1,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": false
+      },
+      "note_original": "L-float16-BSND-B60S1Skv2048Nq128-dnope512-decode-large-batch | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_11",
+      "case_id": 11,
+      "task_id": "level4/mla",
+      "seed": 1138739301,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          128,
+          1,
+          128,
+          512
+        ],
+        [
+          128,
+          1,
+          128,
+          64
+        ],
+        [
+          128,
+          1024,
+          1,
+          512
+        ],
+        [
+          128,
+          1024,
+          1,
+          64
+        ],
+        [
+          128,
+          1024,
+          1,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": false
+      },
+      "note_original": "L-float16-BSND-B128S1Skv4096Nq128-dnope512-decode-large-batch | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_12",
+      "case_id": 12,
+      "task_id": "level4/mla",
+      "seed": 785373728,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          60,
+          1,
+          64,
+          512
+        ],
+        [
+          60,
+          1,
+          64,
+          64
+        ],
+        [
+          60,
+          2048,
+          1,
+          512
+        ],
+        [
+          60,
+          2048,
+          1,
+          64
+        ],
+        [
+          60,
+          2048,
+          1,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": false
+      },
+      "note_original": "L-float16-BSND-B60S1Skv2048Nq64-dnope512-decode-large-batch | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_13",
+      "case_id": 13,
+      "task_id": "level4/mla",
+      "seed": 1101264333,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          2,
+          128,
+          128,
+          512
+        ],
+        [
+          2,
+          128,
+          128,
+          64
+        ],
+        [
+          2,
+          1,
+          128,
+          512
+        ],
+        [
+          2,
+          1,
+          128,
+          64
+        ],
+        [
+          2,
+          1,
+          128,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BNSD",
+        "is_causal": true
+      },
+      "note_original": "M-float16-BNSD-B2Nq128S128-dnope512drope64-prefill-causal | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_14",
+      "case_id": 14,
+      "task_id": "level4/mla",
+      "seed": 1554677888,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          2,
+          128,
+          128,
+          448
+        ],
+        [
+          2,
+          128,
+          128,
+          64
+        ],
+        [
+          2,
+          1,
+          128,
+          448
+        ],
+        [
+          2,
+          1,
+          128,
+          64
+        ],
+        [
+          2,
+          1,
+          128,
+          448
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BNSD",
+        "is_causal": true
+      },
+      "note_original": "M-float16-BNSD-B2Nq128S128-dnope448drope64-prefill-causal",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_15",
+      "case_id": 15,
+      "task_id": "level4/mla",
+      "seed": 471422046,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          2,
+          32,
+          64,
+          512
+        ],
+        [
+          2,
+          32,
+          64,
+          64
+        ],
+        [
+          2,
+          1,
+          512,
+          512
+        ],
+        [
+          2,
+          1,
+          512,
+          64
+        ],
+        [
+          2,
+          1,
+          512,
+          512
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BNSD",
+        "is_causal": true
+      },
+      "note_original": "[R:bounded-resource] dtype=bfloat16/bfloat16/bfloat16/bfloat16/bfloat16; shapes=2x32x64x512/2x32x64x64/2x1x512x512/2x1x512x64/2x1x512x512; inputLayout=BNSD,is_causal=True",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_16",
+      "case_id": 16,
+      "task_id": "level4/mla",
+      "seed": 571191437,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          60,
+          128,
+          1,
+          512
+        ],
+        [
+          60,
+          128,
+          1,
+          64
+        ],
+        [
+          60,
+          1,
+          2048,
+          512
+        ],
+        [
+          60,
+          1,
+          2048,
+          64
+        ],
+        [
+          60,
+          1,
+          2048,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BNSD",
+        "is_causal": false
+      },
+      "note_original": "L-float16-BNSD-B60Nq128S1Skv2048-decode-large-batch | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_17",
+      "case_id": 17,
+      "task_id": "level4/mla",
+      "seed": 1407169922,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          16,
+          2,
+          128,
+          512
+        ],
+        [
+          16,
+          2,
+          128,
+          64
+        ],
+        [
+          16,
+          2048,
+          1,
+          512
+        ],
+        [
+          16,
+          2048,
+          1,
+          64
+        ],
+        [
+          16,
+          2048,
+          1,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": true
+      },
+      "note_original": "L-float16-BSND-B16Sq2Skv2048Nq128-dnope512-MTP-causal | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_18",
+      "case_id": 18,
+      "task_id": "level4/mla",
+      "seed": 1153905209,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          4,
+          2,
+          32,
+          512
+        ],
+        [
+          4,
+          2,
+          32,
+          64
+        ],
+        [
+          4,
+          512,
+          1,
+          512
+        ],
+        [
+          4,
+          512,
+          1,
+          64
+        ],
+        [
+          4,
+          512,
+          1,
+          512
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": true
+      },
+      "note_original": "[R:bounded-resource] dtype=bfloat16/bfloat16/bfloat16/bfloat16/bfloat16; shapes=4x2x32x512/4x2x32x64/4x512x1x512/4x512x1x64/4x512x1x512; inputLayout=BSND,is_causal=True",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_19",
+      "case_id": 19,
+      "task_id": "level4/mla",
+      "seed": 203201392,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          16,
+          128,
+          2,
+          512
+        ],
+        [
+          16,
+          128,
+          2,
+          64
+        ],
+        [
+          16,
+          1,
+          2048,
+          512
+        ],
+        [
+          16,
+          1,
+          2048,
+          64
+        ],
+        [
+          16,
+          1,
+          2048,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BNSD",
+        "is_causal": false
+      },
+      "note_original": "L-float16-BNSD-B16Nq128Sq2Skv2048-dnope512-MTP | baseline_kernels: FusedInferAttentionScore×1",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    },
+    {
+      "case": "mla",
+      "label": "level4/mla_20",
+      "case_id": 20,
+      "task_id": "level4/mla",
+      "seed": 1898406220,
+      "input_names": [
+        "q_nope",
+        "q_rope",
+        "k_nope",
+        "k_rope",
+        "v"
+      ],
+      "input_shapes": [
+        [
+          1,
+          256,
+          128,
+          512
+        ],
+        [
+          1,
+          256,
+          128,
+          64
+        ],
+        [
+          1,
+          256,
+          1,
+          512
+        ],
+        [
+          1,
+          256,
+          1,
+          64
+        ],
+        [
+          1,
+          256,
+          1,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 1,
+        "scaleValue": -1,
+        "inputLayout": "BSND",
+        "is_causal": true
+      },
+      "note_original": "M-float16-B1-S256-去重替换 [R:replaced vr-only dup of c1]",
+      "source_sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "execution_status": "NOT_RUN"
+    }
+  ]
+}

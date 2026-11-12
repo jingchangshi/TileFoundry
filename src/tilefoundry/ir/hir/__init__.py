@@ -1,0 +1,20 @@
+from __future__ import annotations
+
+import importlib
+import pkgutil
+
+from .execution_region import ExecutionRegion
+from .function import Function
+from .loop_region import LoopRegion
+from .mesh_region import MeshRegion
+
+
+def _auto_import(pkg_name: str) -> None:
+    pkg = importlib.import_module(pkg_name)
+    for _, modname, _ in pkgutil.walk_packages(pkg.__path__, pkg_name + "."):
+        importlib.import_module(modname)
+
+
+_auto_import("tilefoundry.ir.hir")
+
+__all__ = ["ExecutionRegion", "Function", "LoopRegion", "MeshRegion"]

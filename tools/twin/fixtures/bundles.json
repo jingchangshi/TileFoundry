@@ -1,0 +1,333 @@
+{
+ "bundles": {
+  "T-FIX-RMS-ROW-001": {
+   "case_id": "rmsnorm_row_zero_s0",
+   "eps": {
+    "bits": 897988541,
+    "dtype": "f32",
+    "hex": "0x358637bd",
+    "nominal": 1e-06
+   },
+   "input_id": "T-FIX-RMS-ROW-001",
+   "kind": "ActualInputBundle",
+   "pattern": "zero",
+   "run_id": "w40-twin-fixtures",
+   "schema": "twin-io/1",
+   "seed": 0,
+   "source_manifest_digest": "frozen-bf16-rmsnorm-frozen-v1",
+   "storage_dir": "rmsnorm_row_zero_s0",
+   "tensors": [
+    {
+     "byte_order": "little",
+     "dtype": "bfloat16",
+     "logical_strides": [
+      256,
+      1
+     ],
+     "name": "x",
+     "nbytes": 512,
+     "sha256": "076a27c79e5ace2a3d47f9dd2e83e4ff6ea8872b3c2218f66c92b89b55f36560",
+     "shape": [
+      1,
+      256
+     ],
+     "storage_path": "x.bf16.bin"
+    },
+    {
+     "byte_order": "little",
+     "dtype": "bfloat16",
+     "logical_strides": [
+      1
+     ],
+     "name": "w",
+     "nbytes": 512,
+     "sha256": "8e6b548203bfc0860b22f197dbde1c838d15e2654555143cb6dfa88e0e2bcac2",
+     "shape": [
+      256
+     ],
+     "storage_path": "w.bf16.bin"
+    }
+   ]
+  },
+  "T-FIX-RMS-ROW-002": {
+   "case_id": "rmsnorm_row_ones_s0",
+   "eps": {
+    "bits": 897988541,
+    "dtype": "f32",
+    "hex": "0x358637bd",
+    "nominal": 1e-06
+   },
+   "input_id": "T-FIX-RMS-ROW-002",
+   "kind": "ActualInputBundle",
+   "pattern": "ones",
+   "run_id": "w40-twin-fixtures",
+   "schema": "twin-io/1",
+   "seed": 0,
+   "source_manifest_digest": "frozen-bf16-rmsnorm-frozen-v1",
+   "storage_dir": "rmsnorm_row_ones_s0",
+   "tensors": [
+    {
+     "byte_order": "little",
+     "dtype": "bfloat16",
+     "logical_strides": [
+      256,
+      1
+     ],
+     "name": "x",
+     "nbytes": 512,
+     "sha256": "8e6b548203bfc0860b22f197dbde1c838d15e2654555143cb6dfa88e0e2bcac2",
+     "shape": [
+      1,
+      256
+     ],
+     "storage_path": "x.bf16.bin"
+    },
+    {
+     "byte_order": "little",
+     "dtype": "bfloat16",
+     "logical_strides": [
+      1
+     ],
+     "name": "w",
+     "nbytes": 512,
+     "sha256": "f45aba292678f064073957c47a1f0074978cfc4784589ca90bfa385701f0544b",
+     "shape": [
+      256
+     ],
+     "storage_path": "w.bf16.bin"
+    }
+   ]
+  },
+  "T-FIX-RMS-ROW-003": {
+   "case_id": "rmsnorm_row_random_s0",
+   "eps": {
+    "bits": 897988541,
+    "dtype": "f32",
+    "hex": "0x358637bd",
+    "nominal": 1e-06
+   },
+   "input_id": "T-FIX-RMS-ROW-003",
+   "kind": "ActualInputBundle",
+   "pattern": "random",
+   "run_id": "w40-twin-fixtures",
+   "schema": "twin-io/1",
+   "seed": 0,
+   "source_manifest_digest": "frozen-bf16-rmsnorm-frozen-v1",
+   "storage_dir": "rmsnorm_row_random_s0",
+   "tensors": [
+    {
+     "byte_order": "little",
+     "dtype": "bfloat16",
+     "logical_strides": [
+      256,
+      1
+     ],
+     "name": "x",
+     "nbytes": 512,
+     "sha256": "99504a84a689fd8390065b197e0a9310516f82c07b57fbee45e2d6720ac556c5",
+     "shape": [
+      1,
+      256
+     ],
+     "storage_path": "x.bf16.bin"
+    },
+    {
+     "byte_order": "little",
+     "dtype": "bfloat16",
+     "logical_strides": [
+      1
+     ],
+     "name": "w",
+     "nbytes": 512,
+     "sha256": "9d1ae438a55ea5a6d95c533a0cbaff6ff7cdfc586ba12a2b1f1b31b71b45c7a2",
+     "shape": [
+      256
+     ],
+     "storage_path": "w.bf16.bin"
+    }
+   ]
+  },
+  "T-FIX-RMS-ROW-004": {
+   "case_id": "rmsnorm_row_random_s1",
+   "eps": {
+    "bits": 897988541,
+    "dtype": "f32",
+    "hex": "0x358637bd",
+    "nominal": 1e-06
+   },
+   "input_id": "T-FIX-RMS-ROW-004",
+   "kind": "ActualInputBundle",
+   "pattern": "random",
+   "run_id": "w40-twin-fixtures",
+   "schema": "twin-io/1",
+   "seed": 1,
+   "source_manifest_digest": "frozen-bf16-rmsnorm-frozen-v1",
+   "storage_dir": "rmsnorm_row_random_s1",
+   "tensors": [
+    {
+     "byte_order": "little",
+     "dtype": "bfloat16",
+     "logical_strides": [
+      256,
+      1
+     ],
+     "name": "x",
+     "nbytes": 512,
+     "sha256": "915e9cbae7e98f4d9a4967afbe4d08650edafcd48fa025d03d609a83e035895a",
+     "shape": [
+      1,
+      256
+     ],
+     "storage_path": "x.bf16.bin"
+    },
+    {
+     "byte_order": "little",
+     "dtype": "bfloat16",
+     "logical_strides": [
+      1
+     ],
+     "name": "w",
+     "nbytes": 512,
+     "sha256": "b76e68e4eabe929042c8fc49138e64f3c4b459252b606af0275b9111720672f7",
+     "shape": [
+      256
+     ],
+     "storage_path": "w.bf16.bin"
+    }
+   ]
+  },
+  "T-FIX-RMS-ROW-005": {
+   "case_id": "rmsnorm_row_random_s2",
+   "eps": {
+    "bits": 897988541,
+    "dtype": "f32",
+    "hex": "0x358637bd",
+    "nominal": 1e-06
+   },
+   "input_id": "T-FIX-RMS-ROW-005",
+   "kind": "ActualInputBundle",
+   "pattern": "random",
+   "run_id": "w40-twin-fixtures",
+   "schema": "twin-io/1",
+   "seed": 2,
+   "source_manifest_digest": "frozen-bf16-rmsnorm-frozen-v1",
+   "storage_dir": "rmsnorm_row_random_s2",
+   "tensors": [
+    {
+     "byte_order": "little",
+     "dtype": "bfloat16",
+     "logical_strides": [
+      256,
+      1
+     ],
+     "name": "x",
+     "nbytes": 512,
+     "sha256": "e8b31b96608fb722fbcbe04450d9f1ca34b6281ded5b39d54efe2beed9b73356",
+     "shape": [
+      1,
+      256
+     ],
+     "storage_path": "x.bf16.bin"
+    },
+    {
+     "byte_order": "little",
+     "dtype": "bfloat16",
+     "logical_strides": [
+      1
+     ],
+     "name": "w",
+     "nbytes": 512,
+     "sha256": "d598dd45df8e966e720665896a2bdff70527f7fea09dfcc13380c4cf70ca6fcf",
+     "shape": [
+      256
+     ],
+     "storage_path": "w.bf16.bin"
+    }
+   ]
+  },
+  "T-FIX-RMS-ROW-006": {
+   "case_id": "rmsnorm_row_alternating_s0",
+   "eps": {
+    "bits": 897988541,
+    "dtype": "f32",
+    "hex": "0x358637bd",
+    "nominal": 1e-06
+   },
+   "input_id": "T-FIX-RMS-ROW-006",
+   "kind": "ActualInputBundle",
+   "pattern": "alternating",
+   "run_id": "w40-twin-fixtures",
+   "schema": "twin-io/1",
+   "seed": 0,
+   "source_manifest_digest": "frozen-bf16-rmsnorm-frozen-v1",
+   "storage_dir": "rmsnorm_row_alternating_s0",
+   "tensors": [
+    {
+     "byte_order": "little",
+     "dtype": "bfloat16",
+     "logical_strides": [
+      256,
+      1
+     ],
+     "name": "x",
+     "nbytes": 512,
+     "sha256": "7968096c627b8f68259719d3887d915673a6d6612d96ce0835410867a22e586e",
+     "shape": [
+      1,
+      256
+     ],
+     "storage_path": "x.bf16.bin"
+    },
+    {
+     "byte_order": "little",
+     "dtype": "bfloat16",
+     "logical_strides": [
+      1
+     ],
+     "name": "w",
+     "nbytes": 512,
+     "sha256": "3a03ac228fc325cb58ef534b6b4c1cd74ea56fc0124e63699b00fcc928ac720d",
+     "shape": [
+      256
+     ],
+     "storage_path": "w.bf16.bin"
+    }
+   ]
+  },
+  "T-FIX-VADD-001": {
+   "case_id": "vadd_one_64",
+   "eps": {
+    "bits": 897988541,
+    "dtype": "f32",
+    "hex": "0x358637bd",
+    "nominal": 1e-06
+   },
+   "input_id": "T-FIX-VADD-001",
+   "kind": "ActualInputBundle",
+   "pattern": "deterministic_arange_plus_half",
+   "run_id": "w40-twin-fixtures",
+   "schema": "twin-io/1",
+   "seed": null,
+   "source_manifest_digest": "frozen-bf16-rmsnorm-frozen-v1",
+   "storage_dir": "vadd_one_64",
+   "tensors": [
+    {
+     "byte_order": "little",
+     "dtype": "float32",
+     "logical_strides": [
+      1
+     ],
+     "name": "x",
+     "nbytes": 256,
+     "sha256": "b2ab7e275230beb0b4674ae769c6826b2e208bf4e14297197231be335b15ca32",
+     "shape": [
+      64
+     ],
+     "storage_path": "x.f32.bin"
+    }
+   ]
+  }
+ },
+ "kind": "BundleSet",
+ "schema": "twin-io/1"
+}

@@ -1,0 +1,57 @@
+"""HIR ``full_like(x, value)`` callable Op.
+
+Allocate a tensor with the same type (shape / dtype / layout / storage) as ``x``,
+filled with a constant scalar ``value``. Shape is taken from ``x`` so a dynamic
+(``DimVar``) extent needs no shape literal — this is how the DSL seeds loop-carry
+initial values (e.g. ``-inf`` for an online-softmax running max).
+"""
+
+from __future__ import annotations
+
+from tilefoundry.evaluator.registry import register_eval
+from tilefoundry.evaluator.value import TensorValue, to_torch_dtype
+from tilefoundry.ir.core import Op
+from tilefoundry.ir.core.param_def import ParamDef
+from tilefoundry.ir.core.register import register_op
+from tilefoundry.ir.pattern import is_ranked_tensor
+from tilefoundry.ir.types import TensorType
+from tilefoundry.utils.lazy import torch
+from tilefoundry.visitor_registry import register_typeinfer
+from tilefoundry.visitor_registry.access_relation import (
+    AccessRelation,
+    identity_access,
+    iterating,
+    register_access_relation,
+    unread_access,
+)
+
+
+@register_op(name="full_like", dialect='tf', category='tensor')
+class FullLike(Op):
+    """Allocate a tensor shaped/typed like ``x``, filled with constant ``value``."""
+
+    x = ParamDef(kind="input", pattern=is_ranked_tensor())
+    value = ParamDef(kind="attribute", annotation=float)
+
+
+@register_typeinfer(FullLike)
+def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
+    return ctx.type_of(call.args[0])
+
+
+@register_eval(FullLike)
+def _eval_full_like(ctx):
+    x = ctx.args[0].data
+    data = torch.full_like(x, float(ctx.op.value), dtype=to_torch_dtype(ctx.result_type.dtype))
+    return TensorValue(data=data, type=ctx.result_type)
+
+
+@register_access_relation(FullLike)
+def _full_like_access(call: "Call", ctx) -> tuple[AccessRelation, ...]:
+    """The template's Type is read and none of its elements; every result element is written."""
+    shape = tuple(ctx.type_of(call.args[0]).shape)
+    rank = len(shape)
+    return iterating(
+        shape,
+        (unread_access(rank, rank), identity_access(rank)),
+    )

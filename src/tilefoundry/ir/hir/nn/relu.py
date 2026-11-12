@@ -1,0 +1,38 @@
+from __future__ import annotations
+
+from tilefoundry.evaluator.registry import register_eval
+from tilefoundry.evaluator.value import TensorValue
+from tilefoundry.ir.core import Op
+from tilefoundry.ir.core.param_def import ParamDef
+from tilefoundry.ir.core.register import register_op
+from tilefoundry.ir.hir._shard_checks import reject_partials
+from tilefoundry.ir.pattern import is_ranked_tensor
+from tilefoundry.ir.types import TensorType
+from tilefoundry.utils.lazy import torch
+from tilefoundry.visitor_registry import register_typeinfer
+from tilefoundry.visitor_registry.access_relation import (
+    identity_relations,
+    register_access_relation,
+)
+
+_COMMUTES_WITH = frozenset({"max", "min"})
+
+
+@register_op(dialect='tf', category='nn')
+class ReLU(Op):
+    x = ParamDef(kind="input", pattern=is_ranked_tensor())
+
+
+@register_typeinfer(ReLU)
+def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
+    x_ty = ctx.type_of(call.args[0])
+    reject_partials(ctx, call, "x", x_ty.layout, commutes_with=_COMMUTES_WITH)
+    return x_ty
+
+
+@register_eval(ReLU)
+def _eval_relu(ctx):
+    return TensorValue(data=torch.relu(ctx.args[0].data), type=ctx.result_type)
+
+
+register_access_relation(ReLU)(identity_relations)

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tilefoundry HIR viewer</title>
+<style>
+  :root {
+    --paper: #fdfaf2; --bg: #eef4ec; --ink: #151a16;
+    --muted: #3a4640; --hair: #c8d2c6;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--ink);
+    display: grid; grid-template-rows: auto 1fr; height: 100vh;
+  }
+  header {
+    padding: 10px 20px; background: var(--paper);
+    border-bottom: 1px solid var(--hair);
+    display: flex; align-items: baseline; gap: 16px;
+  }
+  header h1 { margin: 0; font-size: 15px; }
+  header #search {
+    font: inherit; font-size: 12px; padding: 4px 8px;
+    border: 1px solid var(--hair); border-radius: 4px; background: #fff;
+    width: 220px; color: var(--ink);
+  }
+  header #hlmode {
+    font: inherit; font-size: 12px; padding: 4px 6px;
+    border: 1px solid var(--hair); border-radius: 4px; background: #fff; color: var(--ink);
+  }
+  header #status { font-size: 12px; color: var(--muted); margin-left: auto; }
+  header #status.err { color: #9e3b2f; font-weight: 600; }
+  #main { display: grid; grid-template-columns: 1fr 320px; min-height: 0; }
+  #graph { overflow: hidden; }
+  #graph svg { display: block; width: 100%; height: 100%; }
+  #detail {
+    border-left: 1px solid var(--hair); background: var(--paper);
+    padding: 14px 16px; overflow: auto; font-size: 13px;
+  }
+  #detail h2 { margin: 0 0 10px; font-size: 13px; color: var(--ink); word-break: break-all; }
+  #detail h3 { margin: 14px 0 4px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: .05em; color: var(--muted); }
+  #detail .empty { color: var(--muted); font-style: italic; }
+  #detail table.kv { width: 100%; border-collapse: collapse; }
+  #detail table.kv td { padding: 3px 6px; vertical-align: top;
+    border-bottom: 1px solid var(--hair); }
+  #detail td.k { color: var(--muted); white-space: nowrap; width: 1%; padding-right: 12px; }
+  #detail td.v { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; }
+  /* highlight: dim unrelated; upstream edges blue, downstream edges amber */
+  #graph.dimmed g.node, #graph.dimmed g.edge { opacity: 0.12; }
+  #graph.dimmed g.hl-on { opacity: 1; }
+  #graph g.edge.hl-up path { stroke: #2b6cb0 !important; stroke-width: 2px !important; }
+  #graph g.edge.hl-up polygon { fill: #2b6cb0 !important; stroke: #2b6cb0 !important; }
+  #graph g.edge.hl-down path { stroke: #b9601f !important; stroke-width: 2px !important; }
+  #graph g.edge.hl-down polygon { fill: #b9601f !important; stroke: #b9601f !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tilefoundry HIR viewer</h1>
+  <input id="search" type="search" placeholder="search nodes (id / label)…" autocomplete="off">
+  <select id="hlmode" title="click-highlight direction">
+    <option value="bidirectional">Bidirectional</option>
+    <option value="single">Single</option>
+    <option value="upstream">Upstream</option>
+    <option value="downstream">Downstream</option>
+  </select>
+  <span id="status">loading…</span>
+</header>
+<div id="main">
+  <div id="graph"></div>
+  <div id="detail"><p class="empty">Click a node to inspect it.</p></div>
+</div>
+
+<script src="/static/d3.min.js"></script>
+<script src="/static/graphviz.umd.js"></script>
+<script src="/static/viewer.js"></script>
+</body>
+</html>

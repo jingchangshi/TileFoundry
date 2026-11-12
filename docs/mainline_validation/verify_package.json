@@ -1,0 +1,10 @@
+{
+  "status": "PASS",
+  "scope": "package integrity, AST syntax, fixture identity, task DAG; no NPU",
+  "fixture_files": 18,
+  "original_cases": 40,
+  "tasks": 34,
+  "gates": 8,
+  "python_files_syntax_checked": 30,
+  "package_manifest_checked": true
+}

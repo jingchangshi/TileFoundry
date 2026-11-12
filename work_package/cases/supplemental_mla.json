@@ -1,0 +1,241 @@
+{
+  "schema_version": "tf-ascend.supplemental-mla.v3",
+  "scope": "supplemental diagnostics only; never substitutes for or changes the original 20 MLA cases",
+  "comparison": "Use original golden and original comparator/threshold semantics",
+  "single_logical_launch_required": true,
+  "count": 4,
+  "cases": [
+    {
+      "case_id": "gqa_bsnd_kv_tail",
+      "key": "supplemental/mla_gqa_bsnd_kv_tail",
+      "input_shapes": [
+        [
+          1,
+          3,
+          64,
+          448
+        ],
+        [
+          1,
+          3,
+          64,
+          64
+        ],
+        [
+          1,
+          129,
+          2,
+          448
+        ],
+        [
+          1,
+          129,
+          2,
+          64
+        ],
+        [
+          1,
+          129,
+          2,
+          448
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "numKVHeads": 2,
+        "scaleValue": -1.0,
+        "inputLayout": "BSND",
+        "is_causal": true
+      },
+      "value_range": [
+        -1,
+        1
+      ],
+      "seed": 1784311774,
+      "canonicalization": "Use original mla.golden.get_input: V=K_nope.clone(); value equivalence, no pointer-alias assumption.",
+      "purpose": "Nkv=2; G32; D448; right-aligned causal; real KV tail; padded row path.",
+      "status": "SPECIFIED_NOT_RUN"
+    },
+    {
+      "case_id": "gqa_bnsd_scale",
+      "key": "supplemental/mla_gqa_bnsd_scale",
+      "input_shapes": [
+        [
+          1,
+          128,
+          5,
+          512
+        ],
+        [
+          1,
+          128,
+          5,
+          64
+        ],
+        [
+          1,
+          4,
+          257,
+          512
+        ],
+        [
+          1,
+          4,
+          257,
+          64
+        ],
+        [
+          1,
+          4,
+          257,
+          512
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 4,
+        "scaleValue": 0.125,
+        "inputLayout": "BNSD",
+        "is_causal": true
+      },
+      "value_range": [
+        -1,
+        1
+      ],
+      "seed": 729276263,
+      "canonicalization": "Use original mla.golden.get_input: V=K_nope.clone(); value equivalence, no pointer-alias assumption.",
+      "purpose": "Nkv=4; BNSD; positive scale; real KV tail; different real i within a row tile.",
+      "status": "SPECIFIED_NOT_RUN"
+    },
+    {
+      "case_id": "gqa_decode_shard448",
+      "key": "supplemental/mla_gqa_decode_shard448",
+      "input_shapes": [
+        [
+          1,
+          1,
+          128,
+          448
+        ],
+        [
+          1,
+          1,
+          128,
+          64
+        ],
+        [
+          1,
+          128,
+          4,
+          448
+        ],
+        [
+          1,
+          128,
+          4,
+          64
+        ],
+        [
+          1,
+          128,
+          4,
+          448
+        ]
+      ],
+      "dtypes": [
+        "float16",
+        "float16",
+        "float16",
+        "float16",
+        "float16"
+      ],
+      "attrs": {
+        "numKVHeads": 4,
+        "scaleValue": -1.0,
+        "inputLayout": "BSND",
+        "is_causal": false
+      },
+      "value_range": [
+        -1,
+        1
+      ],
+      "seed": 382376617,
+      "canonicalization": "Use original mla.golden.get_input: V=K_nope.clone(); value equivalence, no pointer-alias assumption.",
+      "purpose": "GQA decode; BD_shard=128 must cover D448 with a 64-column last shard; compare shard=1 and sharded plans.",
+      "status": "SPECIFIED_NOT_RUN"
+    },
+    {
+      "case_id": "gqa_query_tail",
+      "key": "supplemental/mla_gqa_query_tail",
+      "input_shapes": [
+        [
+          1,
+          40,
+          3,
+          512
+        ],
+        [
+          1,
+          40,
+          3,
+          64
+        ],
+        [
+          1,
+          2,
+          129,
+          512
+        ],
+        [
+          1,
+          2,
+          129,
+          64
+        ],
+        [
+          1,
+          2,
+          129,
+          512
+        ]
+      ],
+      "dtypes": [
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16",
+        "bfloat16"
+      ],
+      "attrs": {
+        "numKVHeads": 2,
+        "scaleValue": 0.05,
+        "inputLayout": "BNSD",
+        "is_causal": false
+      },
+      "value_range": [
+        -1,
+        1
+      ],
+      "seed": 1061690248,
+      "canonicalization": "Use original mla.golden.get_input: V=K_nope.clone(); value equivalence, no pointer-alias assumption.",
+      "purpose": "G20; query rows do not divide BQ32/64; Nkv=2; positive scale and guarded dummy rows.",
+      "status": "SPECIFIED_NOT_RUN"
+    }
+  ],
+  "phase_contract": {
+    "P4_T21": "Run all four shapes with unsharded canonical kernels; verify GQA, scale, layout and tails.",
+    "P5_T24": "Additionally compare unsharded and sharded plans for gqa_decode_shard448; verify its final 64 columns."
+  }
+}

@@ -1,0 +1,120 @@
+[build-system]
+requires = ["setuptools>=68", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tilefoundry"
+dynamic = ["version", "optional-dependencies"]
+description = "A tile-based, agentic platform for automatic high-performance program generation across hardware."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "tile-ai" }]
+dependencies = [
+    "isl-python>=0.1.10",
+    "jinja2>=3.0",
+    "apache-tvm-ffi",
+    "torch>=2.7",  # DType.f8e8m0 -> torch.float8_e8m0fnu, added in torch 2.7
+    "graphviz>=0.20",
+    "transformers>=5.13,<5.15",
+    "ortools>=9.15",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/tile-ai/TileFoundry"
+Repository = "https://github.com/tile-ai/TileFoundry"
+
+[project.scripts]
+tilefoundry = "tilefoundry.cli:main"
+
+[tool.coverage.run]
+branch = false
+core = "sysmon"
+source = ["src", "targets"]
+
+[tool.coverage.report]
+skip_empty = true
+
+[tool.setuptools_scm]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tilefoundry", "tilefoundry.*"]
+
+[tool.setuptools.package-data]
+"tilefoundry.runtime" = ["include/tilefoundry/runtime/cpu/*.h"]
+"tilefoundry" = ["orchestrator/*/*.py"]
+"tilefoundry.codegen" = ["templates/cmake/*.j2"]
+"tilefoundry.codegen.cpu.templates" = ["*.j2"]
+
+[tool.setuptools.data-files]
+"share/tilefoundry/spec" = ["docs/spec/*.md"]
+# Tutorial pages have distinct filenames, so one destination is sufficient.
+"share/tilefoundry/tutorial" = ["docs/tutorial/*.md"]
+[tool.pytest.ini_options]
+# Parallel is how this suite is run, on CI (`-n 4`) and locally: conftest's
+# DumpScope isolates per xdist worker and the compile workdir is pid-keyed. No
+# addopts default, because the worker count is a property of the machine — the CI
+# workflow states its own.
+markers = [
+    "no_dump: opt out of the autouse DumpScope for tests that emit excessive dump output",
+]
+
+[tool.ruff]
+src = [".", "src", "targets/*"]
+# Snapshot examples, shipped model sources, and recorded parser and printer output are
+# evidence; formatting them changes that evidence.
+extend-exclude = [
+    "examples",
+    # Ruff's * also matches /, so keep the harness directory exact.
+    "tests/nvidia/cuda/models",
+    "tests/core/models/decode_oracle.py",
+    "tests/core/models/dense_decode.py",
+    "targets/*/tilefoundry_*/*/models",
+    "src/tilefoundry/orchestrator",
+    "tests/parser/golden",
+    "tests/*/*/fixtures/schedule/tir",
+]
+force-exclude = true
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+# Selected rule families:
+#   E, W  pycodestyle (PEP 8 errors / warnings)
+#   F     pyflakes    (unused / undefined / shadowed)
+#   I     isort       (import order)
+# Plus targeted rules from pylint and flake8-tidy-imports:
+#   PLC0415  import-outside-top-level
+#   TID251   banned-api
+select = ["E", "F", "W", "I", "D2", "D3", "D4", "PLC0415", "TID251"]
+
+# Ignored rules:
+#   E501  line-too-long — long strings / compact code stay on one line.
+#   F821  undefined-name — quoted forward-ref annotations like
+#         ``def _(call: "Call", ctx: "TypeInferContext")`` use
+#         Python-language forward-refs to break import cycles without
+#         ``TYPE_CHECKING`` shims.
+#   E741  ambiguous-variable-name — single-letter variables (``l`` /
+#         ``r`` / ``a``) are allowed.
+ignore = ["E501", "F821", "E741"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"typing.TYPE_CHECKING".msg = "Use quoted forward references; TYPE_CHECKING shims are not used in TileFoundry."
+"typing_extensions.TYPE_CHECKING".msg = "Use quoted forward references; TYPE_CHECKING shims are not used in TileFoundry."
+
+[tool.ruff.lint.per-file-ignores]
+# DSL tests use `from tilefoundry.dsl import *` as part of the
+# authoring-surface ergonomics. Internal implementation code in
+# `src/` uses explicit imports except for the curated DSL re-exports.
+"tests/**/*.py" = ["F403", "F405"]
+"src/tilefoundry/dsl/__init__.py" = ["F403"]
+[tool.ruff.lint.pydocstyle]
+convention = "google"

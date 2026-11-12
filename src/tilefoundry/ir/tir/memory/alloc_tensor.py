@@ -1,0 +1,45 @@
+"""TIR-owned Expr Op: `tir.memory.AllocTensor`.
+
+Introduces a storage root. Must be anchored by
+a ``LetStmt`` to get positional identity (Expr DAG sharing would otherwise
+merge distinct allocations).
+
+The single attribute is the resulting ``TensorType`` (shape, dtype, layout,
+storage). ``typeinfer`` returns it verbatim.
+"""
+
+from __future__ import annotations
+
+from tilefoundry.ir.core import Op
+from tilefoundry.ir.core.execution import register_structural
+from tilefoundry.ir.core.param_def import ParamDef
+from tilefoundry.ir.core.register import register_op
+from tilefoundry.ir.types import TensorType
+from tilefoundry.visitor_registry import register_typeinfer
+
+
+@register_op(name="alloc_tensor", dialect='T', category='memory')
+class AllocTensor(Op):
+    """Allocate a tensor; the result type is carried on ``tensor_type``.
+
+    Value form — the result ``Var`` MUST be anchored by ``LetStmt.value``.
+    """
+
+    tensor_type = ParamDef(kind="attribute", annotation=TensorType)
+
+
+@register_typeinfer(AllocTensor)
+def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
+    return call.target.tensor_type
+
+
+# An allocation states where a value lives, not what runs on an engine, so
+# "inside a mode" does not describe it. Registering it as structural keeps the
+# placement rule about instructions instead of forcing allocations to declare a
+# vector mode to exist at all.
+#
+# Which storage an allocation may introduce *inside* a mode is a separate
+# question (a private register may not be hoisted out, and a global buffer has no
+# business appearing mid-mode); that is provenance, and it is checked as
+# provenance rather than by pretending an allocation is an instruction.
+register_structural(AllocTensor)

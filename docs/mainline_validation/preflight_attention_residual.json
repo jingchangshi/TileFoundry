@@ -1,0 +1,266 @@
+{
+  "schema_version": "tf-ascend.contract-run.v1",
+  "run_id": "d44d0d786db64f77aaed3acb490297ce",
+  "started_at_utc": "2026-11-12T12:28:57.000761+00:00",
+  "case": "attention_residual",
+  "operator_callable": "attention_residual",
+  "mode": "preflight_only",
+  "status": "PREFLIGHT_ONLY",
+  "numerical_status": "NOT_RUN",
+  "preflight_status": "PASS",
+  "kernel_execution_requested": false,
+  "candidate_imported": false,
+  "contract_main_invoked": false,
+  "main_returned_normally": false,
+  "device_synchronize_succeeded": false,
+  "interpreter": {
+    "executable": {
+      "path": "/home/s00653124/.conda/envs/tilefoundry-npu-dev/bin/python3.12",
+      "exists": true,
+      "sha256": "5284c11c3222f11ceb1767effcb74b044f99c89d763d8242c2115540279b5913",
+      "bytes": 31904040
+    },
+    "version": "3.12.16 (main, Oct 26 2026, 11:37:43) [GCC 15.3.0]",
+    "platform": "Linux-6.8.0-147-generic-x86_64-with-glibc2.39",
+    "machine": "x86_64"
+  },
+  "command": [
+    "/home/s00653124/workspace/envs/tfnpu-v2/bin/python",
+    "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3/tools/run_contract.py",
+    "--case",
+    "attention_residual",
+    "--operator-file",
+    "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3/implementation/__init__.py",
+    "--preflight-only",
+    "--cache-dir",
+    "off",
+    "--report",
+    "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/native_v3/mainline_validation/preflight_attention_residual.json",
+    "--log",
+    "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/native_v3/mainline_validation/preflight_attention_residual.log"
+  ],
+  "cache_dir": "off",
+  "log_path": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/native_v3/mainline_validation/preflight_attention_residual.log",
+  "report_path": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/native_v3/mainline_validation/preflight_attention_residual.json",
+  "schedule_conformance": "NOT_EVALUATED",
+  "performance": "NOT_MEASURED",
+  "files": {
+    "operator": {
+      "path": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3/implementation/__init__.py",
+      "exists": true,
+      "sha256": "159f7088440c23acdd09f9741e8f89fb581f66bd35d997bd2f40acf2c1a930b2",
+      "bytes": 232
+    },
+    "test": {
+      "path": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3/fixtures/attention_residual/test_attention_residual.py",
+      "exists": true,
+      "sha256": "c50fcf953ffe613f743dc4c34b5f715676cca6f491b0d37bff8946959d429559",
+      "bytes": 571
+    },
+    "golden": {
+      "path": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3/fixtures/attention_residual/golden.py",
+      "exists": true,
+      "sha256": "cf90b8476c4fabbc5be348baf48b44c0ce63ff44798f5479100232762217795a",
+      "bytes": 2473
+    },
+    "cases": {
+      "path": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3/fixtures/attention_residual/cases.yaml",
+      "exists": true,
+      "sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "bytes": 8284
+    },
+    "proto": {
+      "path": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3/fixtures/attention_residual/proto.yaml",
+      "exists": true,
+      "sha256": "2d85e237072501be7205cf85c82739d4b1be17a37c74fe80acf1f857db19aa73",
+      "bytes": 2631
+    },
+    "helper": {
+      "path": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3/fixtures/cannbench_contract.py",
+      "exists": true,
+      "sha256": "026f51a94b6a6046f3096fcaa363f77e325e7f246c6e584a65a44e80de457400",
+      "bytes": 52173
+    },
+    "cases_csv": {
+      "path": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3/fixtures/attention_residual/cases.csv",
+      "exists": true,
+      "sha256": "eddae5a97b9d08986f76899bbfe88dfdac501b5481ebff50bfd40fbaae5d5b8a",
+      "bytes": 4868
+    }
+  },
+  "package_versions": {
+    "torch": "2.12.0+cpu",
+    "torch-npu": "2.12.0",
+    "tilelang": "0.1.15+cpu.git0e687c17",
+    "triton": null,
+    "z3-solver": "4.15.4.0",
+    "apache-tvm": null,
+    "PyYAML": "6.0.3"
+  },
+  "modules": {
+    "torch": {
+      "name": "torch",
+      "version": "2.12.0+cpu",
+      "file": {
+        "path": "/home/s00653124/workspace/envs/tfnpu-v2/lib/python3.12/site-packages/torch/__init__.py",
+        "exists": true,
+        "sha256": "d9dfff4b75d46e4c75572200a3466b70231d05b0318e38ac1bd121789165fb49",
+        "bytes": 109312
+      }
+    },
+    "torch_npu": {
+      "name": "torch_npu",
+      "version": "2.12.0",
+      "file": {
+        "path": "/home/s00653124/workspace/envs/tfnpu-v2/lib/python3.12/site-packages/torch_npu/__init__.py",
+        "exists": true,
+        "sha256": "582f1b2d2748c7b8f929472c34a4361e494bc498f8266dae2bd2531bef0a3455",
+        "bytes": 2407
+      }
+    },
+    "npu_compare": {
+      "name": "npu_compare",
+      "version": "unknown",
+      "file": {
+        "path": "/home/s00653124/workspace/BiShengKernelAgent/skills/common/ascend-npu-run-eval/scripts/npu_compare.py",
+        "exists": true,
+        "sha256": "ef2506bba60a3126196f433d97a02455c96e7be9c6c689b0a7ff400b97af5211",
+        "bytes": 9041
+      }
+    },
+    "cannbench_contract": {
+      "name": "cannbench_contract",
+      "version": "unknown",
+      "file": {
+        "path": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3/fixtures/cannbench_contract.py",
+        "exists": true,
+        "sha256": "026f51a94b6a6046f3096fcaa363f77e325e7f246c6e584a65a44e80de457400",
+        "bytes": 52173
+      }
+    },
+    "test": {
+      "name": "_tf_contract_test_attention_residual_d44d0d786db64f77aaed3acb490297ce",
+      "version": "unknown",
+      "file": {
+        "path": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/20261112/tf_ascend950pr_native_v3/fixtures/attention_residual/test_attention_residual.py",
+        "exists": true,
+        "sha256": "c50fcf953ffe613f743dc4c34b5f715676cca6f491b0d37bff8946959d429559",
+        "bytes": 571
+      }
+    }
+  },
+  "comparator": {
+    "entrypoint": "npu_compare.compare_case_result",
+    "accuracy_mode": "cann-bench",
+    "implementation": {
+      "path": "/home/s00653124/workspace/BiShengKernelAgent/skills/common/ascend-npu-run-eval/scripts/npu_compare.py",
+      "exists": true,
+      "sha256": "ef2506bba60a3126196f433d97a02455c96e7be9c6c689b0a7ff400b97af5211",
+      "bytes": 9041
+    },
+    "threshold_policy": "Original helper/proto and installed comparator, unchanged.",
+    "effective_thresholds": "Not inferred by this runner; pin and audit the comparator in P0."
+  },
+  "expected_case_ids": [
+    "level4/attention_residual_1",
+    "level4/attention_residual_2",
+    "level4/attention_residual_3",
+    "level4/attention_residual_4",
+    "level4/attention_residual_5",
+    "level4/attention_residual_6",
+    "level4/attention_residual_7",
+    "level4/attention_residual_8",
+    "level4/attention_residual_9",
+    "level4/attention_residual_10",
+    "level4/attention_residual_11",
+    "level4/attention_residual_12",
+    "level4/attention_residual_13",
+    "level4/attention_residual_14",
+    "level4/attention_residual_15",
+    "level4/attention_residual_16",
+    "level4/attention_residual_17",
+    "level4/attention_residual_18",
+    "level4/attention_residual_19",
+    "level4/attention_residual_20"
+  ],
+  "device": {
+    "requested": null,
+    "selected": "npu:0",
+    "visible_device_count": 3,
+    "name": "Ascend950PR_9579",
+    "properties": "_NPUDeviceProperties(name='Ascend950PR_9579', total_memory=125977MB, cube_core_num=28, vector_core_num=56, uuid=0008d80a-d200-0000-0000-00e70e940000, L2_cache_size=128MB)"
+  },
+  "results": {
+    "expected": 20,
+    "expected_ids": [
+      "level4/attention_residual_1",
+      "level4/attention_residual_2",
+      "level4/attention_residual_3",
+      "level4/attention_residual_4",
+      "level4/attention_residual_5",
+      "level4/attention_residual_6",
+      "level4/attention_residual_7",
+      "level4/attention_residual_8",
+      "level4/attention_residual_9",
+      "level4/attention_residual_10",
+      "level4/attention_residual_11",
+      "level4/attention_residual_12",
+      "level4/attention_residual_13",
+      "level4/attention_residual_14",
+      "level4/attention_residual_15",
+      "level4/attention_residual_16",
+      "level4/attention_residual_17",
+      "level4/attention_residual_18",
+      "level4/attention_residual_19",
+      "level4/attention_residual_20"
+    ],
+    "executed_unique_expected": 0,
+    "result_record_count": 0,
+    "passed": 0,
+    "failed": 0,
+    "passed_ids": [],
+    "failed_ids": [],
+    "missing_ids": [
+      "level4/attention_residual_1",
+      "level4/attention_residual_10",
+      "level4/attention_residual_11",
+      "level4/attention_residual_12",
+      "level4/attention_residual_13",
+      "level4/attention_residual_14",
+      "level4/attention_residual_15",
+      "level4/attention_residual_16",
+      "level4/attention_residual_17",
+      "level4/attention_residual_18",
+      "level4/attention_residual_19",
+      "level4/attention_residual_2",
+      "level4/attention_residual_20",
+      "level4/attention_residual_3",
+      "level4/attention_residual_4",
+      "level4/attention_residual_5",
+      "level4/attention_residual_6",
+      "level4/attention_residual_7",
+      "level4/attention_residual_8",
+      "level4/attention_residual_9"
+    ],
+    "duplicate_ids": [],
+    "unknown_ids": [],
+    "malformed_records": [],
+    "all_expected_passed": false,
+    "records": []
+  },
+  "capture": {
+    "method": "posix_fd_tee_stdout_and_stderr",
+    "complete": true,
+    "errors": []
+  },
+  "finished_at_utc": "2026-11-12T12:29:13.503904+00:00",
+  "elapsed_seconds": 16.503463625000222,
+  "exit_code": 0,
+  "source_files_changed_during_run": [],
+  "log": {
+    "path": "/home/s00653124/workspace/TileFoundry_Ascend950PR_AgentTeam/artifacts/native_v3/mainline_validation/preflight_attention_residual.log",
+    "exists": true,
+    "sha256": "4f0a9907793980f9e6f759ee3c4503682a4a4bd1b482ce0d5cb8a09a7648e984",
+    "bytes": 1415
+  }
+}

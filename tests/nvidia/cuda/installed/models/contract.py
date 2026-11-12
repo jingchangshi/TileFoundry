@@ -1,0 +1,440 @@
+"""What one corpus case asks of the shipped source, one command per question.
+
+A factory binds the common analysis workflows to each model. Model-specific
+parity and numerical checks remain in the model smoke files.
+
+Every helper here runs exactly one command and judges exactly its result. The
+machine is never passed in -- the copied ``model.py`` declares its own target and
+its own topology levels, and the command reads them back out of the source. There
+is no argument for a test to inject them by, which is the property being kept: a
+level that stops being declared has nowhere to come from and the command fails.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import tempfile
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
+
+import pytest
+import torch
+from safetensors.torch import save_file
+
+from tests.core.models.decode_oracle import one_ulp_at
+from tests.nvidia.cuda.models.corpus import ModelCase
+from tests.nvidia.cuda.models.registry import cases_of
+from tilefoundry.runtime import PREDICATES, DictResource, check
+
+LOGICAL_FAMILIES = ("compute-cost", "memory", "roofline")
+FAMILIES = (*LOGICAL_FAMILIES, "performance")
+
+
+def model_cases(model: str) -> tuple[ModelCase, ...]:
+    """Every case the named model states, in the order it states them.
+
+    Read at import so each case is its own parametrized test: a model whose second
+    case fails still gives a verdict on its third.
+    """
+    return cases_of(model)
+
+
+def static(source: Path, case: ModelCase, selector: str) -> str:
+    """The ``path:selector`` the command is given, from the non-empty segments.
+
+    The case names a definition directly and selects one of its functions.
+    """
+    reached = ".".join((case.prototype.name, selector))
+    return f"{source / 'model.py'}:{reached}"
+
+
+def dim_args(dims: Mapping[str, int] | None) -> list[str]:
+    """The extents a function left open, as the command takes them."""
+    return [f"--dim={name}={extent}" for name, extent in (dims or {}).items()]
+
+
+def _run_with_report(tf, arguments: Sequence[object], *, suffix: str):
+    """Run a command whose report lives outside the installed command's stdout."""
+    with tempfile.NamedTemporaryFile(suffix=suffix) as report_file:
+        done = tf(*arguments, report_file.name)
+        report_text = ""
+        if done.returncode == 0:
+            assert done.stdout == ""
+            report_file.seek(0)
+            report_text = report_file.read().decode()
+        return done, report_text
+
+
+def analysed(
+    tf,
+    source: Path,
+    case: ModelCase,
+    selector: str,
+    family: str,
+    dims: Mapping[str, int] | None = None,
+    *,
+    json_output: bool = False,
+):
+    """One ``analyze`` command for one family, held to succeeding."""
+    arguments = [
+        "analyze",
+        static(source, case, selector),
+        f"--{family}",
+        *dim_args(dims),
+    ]
+    if json_output:
+        arguments.append("--json")
+    done, report_text = _run_with_report(tf, arguments, suffix=".json" if json_output else ".py")
+    assert done.returncode == 0, done.stderr
+    return report_text
+
+
+def reported(
+    tf,
+    source: Path,
+    case: ModelCase,
+    selector: str,
+    families: tuple[str, ...],
+    dims: Mapping[str, int] | None = None,
+) -> dict:
+    """The JSON report several families write about one function."""
+    done, report_text = _run_with_report(
+        tf,
+        [
+            "analyze",
+            static(source, case, selector),
+            *(f"--{family}" for family in families),
+            *dim_args(dims),
+            "--json",
+        ],
+        suffix=".json",
+    )
+    assert done.returncode == 0, done.stderr
+    return json.loads(report_text)
+
+
+def _compute_cost_evidence(report: dict) -> str | None:
+    """What `compute-cost` must have counted: flops, bucketed by dtype."""
+    flops = report["functions"][0]["totals"]["flops"]
+    if not flops or not any(count > 0 for count in flops.values()):
+        return f"reported no flops at all ({flops!r})"
+    return None
+
+
+def _memory_evidence(report: dict) -> str | None:
+    """What `memory` must have measured: bytes moved, lifetimes, and addresses.
+
+    The bytes are the family's own record rather than a field of its footprint:
+    what a program moves and what it must hold at once are two answers, reported
+    as two.
+    """
+    record = report["functions"][0]["function_records"]["memory"]
+    solver_status = record.get("solver_status")
+    if solver_status not in ("optimal", "feasible"):
+        return f"solver status is {solver_status!r}"
+    gmem = report["functions"][0]["totals"]["traffic"]["gmem"]
+    if not gmem.get("read", 0) > 0:
+        return f"reported no gmem read ({gmem!r})"
+    if not record["lifetimes"]:
+        return "reported no binding lifetimes"
+    return None
+
+
+def _roofline_evidence(report: dict) -> str | None:
+    """What `roofline` must have decided: which side bounds, and the time it implies."""
+    record = report["functions"][0]["function_records"]["roofline"]
+    if record["bound_by"] not in ("compute", "memory", "balanced"):
+        return f"bound_by is {record['bound_by']!r}, no rated resource"
+    if not record["ideal_ns"] > 0:
+        return f"ideal_ns is {record['ideal_ns']!r}"
+    return None
+
+
+def _performance_evidence(report: dict) -> str | None:
+    """What `performance` must have laid out and scaled by physical capacity."""
+    record = report["functions"][0]["function_records"]["performance"]
+    envelope = record["timeline"]
+    if envelope["start_ns"] != 0 or not envelope["end_ns"] > 0:
+        return f"predicted interval is {envelope!r}"
+    wave = record["wave"]
+    waves = -(-wave[0] // wave[1]) if wave[1] else 0
+    if not waves > 0:
+        return f"wave is {wave!r}"
+    if envelope["end_ns"] % waves:
+        return f"end_ns {envelope['end_ns']!r} is not {waves!r} equal waves"
+    return None
+
+
+_EVIDENCE = {
+    "compute-cost": _compute_cost_evidence,
+    "memory": _memory_evidence,
+    "roofline": _roofline_evidence,
+    "performance": _performance_evidence,
+}
+
+
+def analysed_every_family(
+    tf, source: Path, case: ModelCase, selector: str, dims: Mapping[str, int] | None = None
+) -> dict:
+    """Judge every family, for every selected function.
+
+    Every family is asked of every program. Whether a program is placed no
+    longer narrows the question: where the work runs is a fact the program
+    states, not one read back off the layout its results happen to carry, so
+    performance no longer refuses a program for lacking an execution domain.
+    """
+    selected = [item for item in case.analyze if item.selector == selector]
+    assert len(selected) == 1, f"{case.id}: analysis selector {selector!r} is not unique"
+    families = FAMILIES
+    report = reported(tf, source, case, selector, families, dims)
+    assert report["executed"] == list(families), (
+        f"asked for {list(families)}, the command ran {report['executed']}"
+    )
+    failed = {
+        family: complaint
+        for family in families
+        if (evidence := _EVIDENCE[family])
+        if (complaint := evidence(report)) is not None
+    }
+    assert not failed, f"{selector} at {dict(dims or {})}: " + "; ".join(
+        f"{family} {complaint}" for family, complaint in sorted(failed.items())
+    )
+    return report
+
+
+def lifetimes(
+    tf, source: Path, case: ModelCase, selector: str, dims: Mapping[str, int]
+) -> dict[str, int]:
+    """What the memory analysis says each binding of one function costs."""
+    report = reported(tf, source, case, selector, ("memory",), dims)
+    return {
+        item["binding"]: item["bytes"]
+        for item in report["functions"][0]["function_records"]["memory"]["lifetimes"]
+    }
+
+
+def traffic_read(tf, source: Path, case: ModelCase, selector: str, dims: Mapping[str, int]) -> int:
+    """How many bytes the memory analysis says one function reads from gmem."""
+    report = reported(tf, source, case, selector, ("memory",), dims)
+    return report["functions"][0]["totals"]["traffic"]["gmem"]["read"]
+
+
+def one_rounding(want) -> tuple[str, dict[str, float]]:
+    """One representable step at *want*'s own scale, for a single primitive boundary."""
+    return "allclose", {"atol": one_ulp_at(want), "rtol": 0.0}
+
+
+def three_roundings(want) -> tuple[str, dict[str, float]]:
+    """Three, for a whole fused Function against the component it reproduces.
+
+    One uniform contract for every model here, not per-model or depth-scaled: the
+    Function rounds at each boundary it fuses.
+    """
+    return "allclose", {"atol": 3 * one_ulp_at(want), "rtol": 0.0}
+
+
+def exactly() -> tuple[str, dict[str, float]]:
+    """No tolerance. A gather or a copy reassociates nothing."""
+    return "equal", {}
+
+
+def split_by_declaration(case: ModelCase, selector: str, args: Sequence):
+    """One positional argument list, split the way the command takes it.
+
+    An in-process call may hand every parameter over positionally, weights and all.
+    ``check`` does not: ``--inputs files:...`` names the non-const parameters in
+    declared order and the rest arrive as a checkpoint. Split here from the declaration itself, so
+    a parameter that changes kind moves sides on its own.
+    """
+    _module, function = case.resolve(case.build(), selector)
+    activations, weights = [], {}
+    for parameter, value in zip(function.params, args, strict=True):
+        if getattr(parameter, "is_const", False):
+            weights[parameter.name] = value
+        else:
+            activations.append(value)
+    return activations, weights
+
+
+def nested_constants(loaded, prefix: str = "") -> dict:
+    """Every weight a loaded Module holds, its children's included.
+
+    A Module names only its own; a checkpoint has to carry the children's too, keyed
+    by the path they are reached through, or the child is loaded with nothing.
+    """
+    found = {f"{prefix}{name}": loaded.resource.load(name) for name in loaded.module.weights}
+    for key, child in loaded.children.items():
+        if isinstance(child, tuple):
+            for index, instance in enumerate(child):
+                found.update(nested_constants(instance, f"{prefix}{key}.{index}."))
+        else:
+            found.update(nested_constants(child, f"{prefix}{key}."))
+    return found
+
+
+def _tensor_key(tensor: torch.Tensor) -> str:
+    """Hash one tensor's stated form and logical bytes, independent of its argument slot."""
+    plain = tensor.detach().cpu()
+    digest = hashlib.blake2b(digest_size=16)
+    fields = (
+        str(plain.dtype).encode(),
+        json.dumps(tuple(plain.shape), separators=(",", ":")).encode(),
+        json.dumps(tuple(plain.stride()), separators=(",", ":")).encode(),
+        str(plain.storage_offset()).encode(),
+    )
+    for field in fields:
+        digest.update(len(field).to_bytes(8, "little"))
+        digest.update(field)
+    content = plain.contiguous().view(torch.uint8).numpy().reshape(-1)
+    digest.update(memoryview(content))
+    return digest.hexdigest()
+
+
+def _publish(path: Path, write: Callable[[Path], None]) -> Path:
+    """Publish one cache object atomically; another xdist worker may win the race."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return path
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        write(temporary)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            pass
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
+
+
+def _materialize_tensor(tensor: torch.Tensor, cache: Path) -> Path:
+    """Write a tensor once per test run and return its content-addressed path."""
+    path = cache / "tensors" / f"{_tensor_key(tensor)}.pt"
+    return _publish(path, lambda temporary: torch.save(tensor, temporary))
+
+
+def _materialize_weights(weights: Mapping[str, torch.Tensor], cache: Path) -> Path:
+    """Write one named checkpoint once per test run and return its directory."""
+    prepared = {name: value.contiguous() for name, value in weights.items()}
+    digest = hashlib.blake2b(digest_size=16)
+    for name, tensor in sorted(prepared.items()):
+        encoded_name = name.encode()
+        digest.update(len(encoded_name).to_bytes(8, "little"))
+        digest.update(encoded_name)
+        digest.update(bytes.fromhex(_tensor_key(tensor)))
+    room = cache / "checkpoints" / digest.hexdigest()
+    path = room / "model.safetensors"
+    _publish(path, lambda temporary: save_file(prepared, str(temporary)))
+    return room
+
+
+def compared(
+    tf,
+    cache: Path,
+    source: Path,
+    case: ModelCase,
+    selector: str,
+    *,
+    activations: Sequence,
+    weights: Mapping[str, object],
+    expected: Sequence,
+    held: Sequence[tuple[str, Mapping[str, float]]],
+    dims: Mapping[str, int] | None = None,
+    _refuse: bool = False,
+):
+    """Compare shipped HIR through the CLI, or host orchestration in this test.
+
+    Artifacts are content-addressed inside the run-scoped *cache*, so a stale
+    artifact cannot hide disagreement and repeated comparisons do not rewrite it.
+    Weights travel as a checkpoint because ``check`` accepts non-const parameters
+    only through ``--inputs files:...``. An empty selector names host orchestration;
+    this test invokes it explicitly and applies the same public comparison layer.
+    """
+    if not selector:
+        if _refuse:
+            raise ValueError("an orchestration comparison cannot request a CLI refusal")
+        module = case.build()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        def move(value):
+            if isinstance(value, torch.Tensor):
+                return value.to(device)
+            if isinstance(value, (tuple, list)):
+                return type(value)(move(item) for item in value)
+            return value
+
+        loaded = module.load(
+            DictResource({name: value.to(device) for name, value in weights.items()})
+        )
+        got = loaded.forward(*(move(value) for value in activations))
+        want = move(expected[0] if len(expected) == 1 else tuple(expected))
+        expect = {
+            ("output" if len(expected) == 1 else f"output[{position}]"): (
+                PREDICATES[predicate](**bounds),
+            )
+            for position, (predicate, bounds) in enumerate(held)
+        }
+        report = check(lambda *_args: got, lambda *_args: want, tuple(activations), expect=expect)
+        assert report.passed, report
+        return report
+
+    argv = ["check", static(source, case, selector)]
+    input_paths = [str(_materialize_tensor(tensor, cache)) for tensor in activations]
+    argv += ["--inputs", f"files:{','.join(input_paths)}"]
+
+    if weights:
+        checkpoint = {name: value for name, value in weights.items()}
+        argv += ["--weights", f"ckpt:{_materialize_weights(checkpoint, cache)}"]
+    else:
+        argv += ["--weights", "random"]
+    argv += dim_args(dims)
+    for tensor in expected:
+        path = _materialize_tensor(tensor, cache)
+        argv += ["--expected", str(path)]
+    for position, (predicate, bounds) in enumerate(held):
+        out = "output" if len(expected) == 1 else f"output[{position}]"
+        argv += ["--out", out, "--fn", predicate]
+        for bound, value in bounds.items():
+            argv += [f"--{bound}", repr(value)]
+
+    done = tf(*argv)
+    if not _refuse:
+        assert done.returncode == 0, done.stdout + done.stderr
+    return done
+
+
+def disagreed(tf, cache: Path, source: Path, case: ModelCase, selector: str, **asked):
+    """The same command, held to reporting FAIL.
+
+    Perturbed runs must make parity refuse. They use the same bound as the passing
+    run: a tighter bound can reject unperturbed output and falsely validate the
+    perturbation. This previously hid five cases, including an identity cache
+    permutation.
+    """
+    done = compared(tf, cache, source, case, selector, _refuse=True, **asked)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "FAIL" in done.stdout, done.stdout
+    return done
+
+
+def analysis_tests(model: str):
+    """Bind the selected functions and largest contexts to one model's shipped source."""
+    cases = model_cases(model)
+    analysed = [
+        pytest.param(case, selected, id=selected.id) for case in cases for selected in case.analyze
+    ]
+    sized = [pytest.param(case, item, id=item.id) for case in cases for item in case.sized]
+
+    @pytest.mark.parametrize(("case", "selected"), analysed)
+    def test_model_analysis(tf, shipped_source, case, selected):
+        analysed_every_family(tf, shipped_source(model), case, selected.selector, selected.dims)
+
+    @pytest.mark.parametrize(("case", "sized"), sized)
+    def test_model_ceiling(tf, shipped_source, case, sized):
+        analysed_every_family(tf, shipped_source(model), case, sized.selector, sized.ceiling)
+
+    return test_model_analysis, test_model_ceiling

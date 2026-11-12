@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/tile-ai/TileFoundry/docs/policies/policy.schema.json",
+  "title": "tilefoundry project policy index",
+  "description": "Path-scoped policy index. Each entry maps a glob of related files to a set of cross-cutting acceptance criteria, plus indices (refs-only) into existing project documentation for rules and knowledge sections. Rule and knowledge text MUST live in the referenced documentation; this index never inlines content.",
+  "type": "object",
+  "required": ["version", "policies"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "policies": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/policy_entry"}
+    }
+  },
+  "$defs": {
+    "policy_entry": {
+      "type": "object",
+      "required": ["id", "name", "description", "when"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "Stable lowercase identifier used in marker comments (policy_ac / policy_rules / policy_knowledge)."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "description": "One-line summary surfaced in generated preflight indices."
+        },
+        "when": {
+          "type": "object",
+          "required": ["path_glob"],
+          "additionalProperties": false,
+          "properties": {
+            "path_glob": {
+              "type": "array",
+              "minItems": 1,
+              "items": {"type": "string", "minLength": 1},
+              "description": "OR semantics: the entry applies when any path in scope matches any glob."
+            }
+          }
+        },
+        "ac": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1},
+          "description": "Plain-text acceptance criteria. These are the verifiable statements injected into matching milestone Acceptance Criteria; AC text lives here because it IS the contract, not a copy of one."
+        },
+        "rules": {"$ref": "#/$defs/refs_by_role"},
+        "knowledge": {"$ref": "#/$defs/refs_by_role"}
+      },
+      "anyOf": [
+        {"required": ["ac"]},
+        {"required": ["rules"]},
+        {"required": ["knowledge"]}
+      ]
+    },
+    "refs_by_role": {
+      "type": "object",
+      "description": "Role-keyed lists of section references. Rule and knowledge text lives in the referenced documents; this object only ever carries indices.",
+      "additionalProperties": false,
+      "properties": {
+        "implementer": {"$ref": "#/$defs/ref_list"},
+        "reviewer": {"$ref": "#/$defs/ref_list"}
+      },
+      "anyOf": [
+        {"required": ["implementer"]},
+        {"required": ["reviewer"]}
+      ]
+    },
+    "ref_list": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/section_ref"}
+    },
+    "section_ref": {
+      "type": "object",
+      "required": ["path", "section"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^docs/.+\\.md$",
+          "description": "Repo-relative path to an existing documentation file."
+        },
+        "section": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Heading text of an existing section in the referenced file. The finalizer resolves it by scanning for `## <section>` / `### <section>` / ... lines."
+        }
+      }
+    }
+  }
+}

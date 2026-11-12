@@ -1,0 +1,90 @@
+"""External CUDA documents can analyse a copied shipped model."""
+
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+
+
+def _v100_qwen(tf, tmp_path: Path) -> Path:
+    located = tf("models", "qwen3_1_7b", "--source")
+    assert located.returncode == 0, located.stderr
+    source = Path(located.stdout.splitlines()[0])
+    assert source.is_absolute()
+    copied = tmp_path / "qwen3_1_7b_v100"
+    shutil.copytree(source, copied)
+    shutil.copytree(Path(__file__).parent / "hw", copied / "hw")
+
+    model = copied / "model.py"
+    model.write_text(
+        model.read_text(encoding="utf-8")
+        .replace(
+            "from tilefoundry_nvidia import CudaTarget",
+            "from pathlib import Path\nfrom tilefoundry_nvidia import CudaTarget",
+        )
+        .replace(
+            'CudaTarget("nvidia.h200_sxm")',
+            "CudaTarget(\n"
+            '    Path(__file__).parent / "hw" / "vendor_v100_sxm2_32gb.toml",\n'
+            '    Path(__file__).parent / "hw" / "vendor_sm70.toml",\n'
+            ")",
+        ),
+        encoding="utf-8",
+    )
+    config = copied / "config.json"
+    configured = json.loads(config.read_text(encoding="utf-8"))
+    configured["torch_dtype"] = "float16"
+    config.write_text(json.dumps(configured), encoding="utf-8")
+    return model
+
+
+def test_external_v100_documents_analyse_a_copied_installed_model(tf, tmp_path) -> None:
+    model = _v100_qwen(tf, tmp_path)
+    done = tf(
+        "analyze",
+        f"{model}:Qwen3_1_7B_DecoderLayer.placed_mlp",
+        str(tmp_path / "report.json"),
+        "--compute-cost",
+        "--memory",
+        "--roofline",
+        "--performance",
+        "--json",
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == ""
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+
+    assert report["target"] == "vendor.v100_sxm2_32gb"
+    assert report["executed"] == ["compute-cost", "memory", "roofline", "performance"]
+    assert report["functions"][0]['totals']["flops"]["f16"] > 0
+    assert report["functions"][0]['function_records']["roofline"]["ideal_ns"] > 0
+    gmem = next(
+        item
+        for item in report["functions"][0]['function_records']["memory"]["peaks"]
+        if item["memory_level"] == "gmem"
+    )
+    assert gmem["peak_bytes"] < 32_000_000_000
+    record = report["functions"][0]['function_records']["performance"]
+    waves = -(-record["wave"][0] // record["wave"][1])
+    assert waves == 2
+    assert report["functions"][0]['function_records']["memory"]["solver_status"] in (
+        "optimal",
+        "feasible",
+    )
+    call_records = [
+        call["performance"]["timeline"] for call in report["functions"][0]['calls'] if "performance" in call
+    ]
+    assert call_records
+    assert all(set(call) == {"start_ns", "end_ns", "trips", "stride_ns"} for call in call_records)
+    assert all(call["end_ns"] > call["start_ns"] for call in call_records)
+    per_wave_end = max(
+        call["end_ns"] + (call["trips"] - 1) * call["stride_ns"] for call in call_records
+    )
+    per_wave_end = max(per_wave_end, report["functions"][0]['function_records']["roofline"]["ideal_ns"])
+    assert record["timeline"] == {
+        "start_ns": 0,
+        "end_ns": waves * per_wave_end,
+        "trips": 1,
+        "stride_ns": 0,
+    }

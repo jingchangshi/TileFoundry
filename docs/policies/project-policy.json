@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "policies": [
+    {
+      "id": "milestone_review",
+      "name": "Milestone review",
+      "description": "Touched tests retain only meaningful contract coverage after each milestone.",
+      "when": {
+        "path_glob": [
+          "**"
+        ]
+      },
+      "ac": [
+        "Touched tests MUST be reviewed for redundancy: remove ones superseded by the retained workflow, and do not add source-shape or hypothetical-refactor guards unless that form is a public contract."
+      ],
+      "rules": {
+        "implementer": [
+          {
+            "path": "docs/develop.md",
+            "section": "Tests"
+          }
+        ],
+        "reviewer": [
+          {
+            "path": "docs/develop.md",
+            "section": "Tests"
+          }
+        ]
+      }
+    },
+    {
+      "id": "spec_impact",
+      "name": "Spec impact",
+      "description": "Every source milestone names the specifications it changes among its Related Files, so the public-contract surface is declared once.",
+      "when": {
+        "path_glob": [
+          "src/**",
+          "include/**"
+        ]
+      },
+      "ac": [
+        "A milestone that changes a public contract MUST list the owning `docs/spec/*.md` path in its `#### Related Files`; one that changes none lists no spec path."
+      ],
+      "rules": {
+        "implementer": [
+          {
+            "path": "docs/develop.md",
+            "section": "Spec impact"
+          }
+        ],
+        "reviewer": [
+          {
+            "path": "docs/develop.md",
+            "section": "Spec impact"
+          }
+        ]
+      }
+    },
+    {
+      "id": "test_discipline",
+      "name": "Test discipline",
+      "description": "A test is committed only when it earns its place; how a milestone is accepted is settled with the author, not chosen during implementation.",
+      "when": {
+        "path_glob": [
+          "tests/**"
+        ]
+      },
+      "guidance": [
+        "Tests are evidence. One is committed only when it is",
+        "  necessary    -- no existing workflow reaches the behaviour",
+        "  reusable     -- more than this one change will depend on it",
+        "  fragile      -- a plausible future change breaks it",
+        "  non-trivial  -- what it asserts cannot be read off a signature",
+        "A negative case is committed only for an invalid input reachable from outside;",
+        "a hypothetical rewrite is not a plausible future change.",
+        "Anything else is run once and not committed.",
+        "",
+        "`##### Accepted by` states which of the two answers this milestone takes:",
+        "  - nothing new; name the existing suites that must still pass unchanged",
+        "  - the test that earns its place; say which bar it clears and what breaks it"
+      ]
+    }
+  ]
+}

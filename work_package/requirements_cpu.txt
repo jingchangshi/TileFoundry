@@ -1,0 +1,3 @@
+# Standalone reference/framework checks only, not a CANN/TileFoundry environment.
+z3-solver==5.4.1.0
+numpy==2.3.5

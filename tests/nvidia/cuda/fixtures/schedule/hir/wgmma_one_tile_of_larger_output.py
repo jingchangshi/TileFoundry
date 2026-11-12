@@ -1,0 +1,83 @@
+"""One tile written into a larger output: the seeded zeros is not dead.
+
+The M/N loops intentionally cover only one tile, so the ``tf.zeros`` the author
+seeded it with remains live outside that window. Here there is no outer
+loop, so every element of the output outside that 64x32 window is what the zeros
+says it is -- and if the zeros is dropped, that part of the output is whatever
+the caller happened to leave in it, which is a different program from the one
+that was written.
+"""
+
+from tilefoundry.dsl import *
+from tilefoundry_nvidia import CudaTarget
+
+M = 64
+N = 32
+K = 32
+BK = 16
+STAGES = 2
+OUT_M = 128
+OUT_N = 64
+
+
+@module(
+    entry="gemm",
+    target=CudaTarget("nvidia.h200_sxm"),
+    topologies=(Topology("cta", 1), Topology("thread", 256)),
+)
+class WGMMA_ONE_TILE_OF_LARGER_OUTPUT:
+    @func
+    def gemm(
+        a: Tensor[(M, K), "bf16"],
+        b: Tensor[(K, N), "bf16"],
+    ) -> Tensor[(OUT_M, OUT_N), "bf16"]:
+        with Mesh(("cta",), layout=(1,), names=("block",)) as _cta:
+            with Mesh(
+                ("thread",), layout=(2, 128),
+                names=("role", "participant"),
+            ) as threads:
+                wgmma = T.cuda.sm90.Wgmma(
+                    n=32, dtype="bf16", form=T.cuda.sm90.Form.SS, a_major=T.cuda.sm90.Major.K)
+
+                out = tf.zeros(Tensor[(OUT_M, OUT_N), "bf16"])
+
+                with Mesh(threads[1, :], layout=(4, 8, 4), names=("warp", "lane8", "lane4")) as _compute:
+                    acc = tf.zeros(Tensor[(M, N), "f32", ((4 @ _compute.warp, 2, 8 @ _compute.lane8, 4, 4 @ _compute.lane4, 2,), (16, 8, 1, 512, 128, 64)), "rmem"])
+
+                for k in tf.tile(K, BK):
+                    with threads[0, :32] as _loader:
+                        lhs_ring = tf.empty(
+                            Tensor[
+                                (64, 16), "bf16",
+                                Layout(((8, 8), (2, 8)), ((128, 8), (64, 1))),
+                                "smem",
+                            ],
+                            buffers=STAGES,
+                        )
+                        lhs = tf.schedule(
+                            (a[:, k], lhs_ring),
+                            op=T.copy_async_tensor(),
+                        )
+                        rhs_ring = tf.empty(
+                            Tensor[
+                                (16, 32), "bf16",
+                                Layout(((2, 8), (4, 8)), ((64, 8), (128, 1))),
+                                "smem",
+                            ],
+                            buffers=STAGES,
+                        )
+                        rhs = tf.schedule(
+                            (b[k, :], rhs_ring),
+                            op=T.copy_async_tensor(),
+                        )
+
+                    with Mesh(threads[1, :], layout=(4, 8, 4), names=("warp", "lane8", "lane4")) as _compute:
+                        acc = tf.schedule(
+                            (acc, lhs, rhs),
+                            op=T.tiled_mma(atom=wgmma),
+                        )
+
+                with Mesh(threads[1, :], layout=(4, 8, 4), names=("warp", "lane8", "lane4")) as _compute:
+                    tile_out = tf.cast(acc, dtype="bf16")
+                    result = tf.insert_slice(out, tile_out, (0, 0))
+                return result

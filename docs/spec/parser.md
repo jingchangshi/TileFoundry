@@ -1,0 +1,490 @@
+# TileFoundry Spec - Parser
+
+The Parser accepts authored Python functions and produces HIR or TIR through one typed API.
+
+## 1. Public API
+
+Authored DSL source imports its authoring surface with `from tilefoundry.dsl import *`.
+`Tensor[...]` is parser annotation syntax, not the IR `TensorType` carrier.
+
+`@module` executes its Python class body and finalizes the collected Function declarations,
+child Modules, and ordinary methods. Module authoring is two-phase: class execution records
+Function, specialization, and converter declarations; finalization attaches all child Modules
+and puts them in parser scope before parsing Functions in source order. `@func` produces an HIR
+Function; `@prim_func` produces TIR ([tir §1.3](./tir.md#13-primfunction)).
+Explicit PrimFunction targets survive deferred parsing.
+`specialize` and `converter` register variants and weight converters on an existing HIR Function.
+
+```python
+def parse_function(
+    fn: FunctionType, context: FuncParserContext
+) -> hir.Function | tir.PrimFunction: ...
+```
+
+### 1.1 HIR Return Contracts
+
+An ordinary HIR function and a specialization variant MAY omit `-> return-type`;
+an ordinary function then records its inferred `body.type` as `Function.return_type`.
+When either declares an annotation, the parser MUST require
+`types_compatible(annotation, body.type)`. This is directional compatibility,
+not a parser-only equality relation: an annotation with `layout=None` leaves
+layout unconstrained according to the shared type rule.
+
+A `pass` HIR function is a dispatch prototype and MUST declare `-> return-type`.
+That annotation is its `Function.return_type` and callable return type. Every
+variant body MUST be compatible with that base return type; its own IR return
+type remains the exact base type so all variants share one dispatch signature.
+
+`Tensor[...]` without a storage slot constructs `storage=GMEM`, including in a
+return annotation. It is not an unspecified-storage spelling. Consequently an
+SMEM body under `-> Tensor[...]` must explicitly return a GMEM result; the
+parser reports both the annotation and inferred body type, with the authored
+function location, when they are incompatible. `tuple[...]` annotations are
+accepted and apply this same compatibility rule recursively to every field.
+
+### 1.2 Source Span Metadata
+
+Every parser-authored `Call` reachable from a Function body carries `SourceSpanMetadata` for
+the AST expression that constructed it. A parent match fills only Calls without a span, so it
+cannot replace a more precise child span. Traversal follows `Call` operands and IR `Tuple`
+values, but does not assign source identity to shared lexical `Var` values. Source spans use
+physical source-file coordinates with a one-based start column.
+
+### 1.3 Tuple Binding Metadata
+
+For `a, b = producer(...)`, detached `TupleGetItem` values with scalar inputs `0` and `1`
+carry the respective target Name spans (`a` and `b`) and matching `BindingMetadata`; later
+reads do not replace that identity. A multi-carry loop's derived projections carry the `for`
+statement span and their carry binding name.
+
+### 1.4 Context and Diagnostics
+
+`FuncParserContext` carries the dialect, Function role, closure, topology scope, target, and
+optional base/key for one parse. Call types inferred while parsing use that target's rules
+([visitor-registry §4](./visitor-registry.md#4-instance-1--typeinfer)), so in a Module that
+declares its Target a type the parser records is the type the built Module later infers. A
+pending Module supplies its declared Target to the parser's current call frame.
+`FunctionRole` is `ROOT`, `VARIANT`, or `CONVERTER`.
+`ParseError` is the single authored-source diagnostic type and includes source location and
+recursive parse situation. These are the only public parser symbols.
+
+Instance authoring and call contracts follow
+[core-ir §1.3](./core-ir.md#13-modulelist) and [§2.1](./core-ir.md#21-call).
+Numeric subscripts become Constant expressions; static index checks run only
+in type inference. Call construction MUST NOT project an indexed slot's return
+type before validation. Retained TIR calls produce unit-valued statements
+checked in the enclosing Module context.
+
+### 1.5 Mesh declarations and region captures
+
+Mesh declarations are values. `Mesh(...)` constructs the compile-time domain
+object used by layout sugar and by a `MeshRegion`; it is not itself a runtime
+expression in the HIR value graph. A `with Mesh(...)` statement uses that value
+to delimit an execution domain and does not describe the placement of its
+result. An `as name` binding is lexical: it is available inside the `with`
+body and expires when the statement ends. When a body changes a name visible
+before the `with`, or binds a new name in its live-out (the conservative set of
+names read after it), each escaping name is rebound to the enclosing `MeshRegion`
+result (a tuple region with `TupleGetItem` projections when several names escape);
+unchanged captures and new names used
+only inside the body remain local to the scope. Names read inside either a
+MeshRegion or LoopRegion but bound outside it are captured as `args`, with a
+fresh `params` binding used by the body. LoopRegion places
+carry slots first and excludes its own induction and carry names from captures.
+Capture is performed one region boundary at a time, so nested regions pass a
+value through each door.
+
+In an authored HIR function that opens a mesh, every authored runtime Call
+runs inside a mesh scope. This includes operation and function calls, operator
+expressions, tensor slices, and explicit tuple subscripts, even for UMAT scalar
+results. An unscoped Call raises `ParseError` at its source expression and directs
+the author to move it inside `with Mesh(...)`. Function parameters, Python
+constants, compile-time mesh declarations, and parser-generated result projections
+do not require an execution scope. A function-level `mesh=` covers the whole body.
+HIR functions that open no mesh remain logical programs; TIR is unaffected by
+this restriction.
+
+A function call inside a mesh supplies that execution scope to its callee.
+The callee may omit its own mesh or declare a region that composes with the
+call-site scope ([hir §1.1](./hir.md#11-function)). The parser checks authored
+call sites lexically; it does not exempt an unscoped function call because its
+callee contains a mesh. Authors may place the orchestration calls inside a
+mesh and keep each helper's operations in the inherited or explicitly declared
+scope.
+
+When a captured name denotes a tile window `slice(iv, iv + step, 1)`, the parser
+captures the induction Expr and reconstructs the window with its new parameter.
+Tile windows support `window ± c` (translate start/stop), `window * c`, and `c * window`
+(scale start, stop, and stride, preserving the element count). Division,
+floor division, remainder, and operations between two windows MUST raise
+`ParseError`; a Python slice MUST NOT enter the HIR expression graph.
+Non-window index arithmetic MUST reject `/` with a diagnostic directing the
+author to integer division `//`, rather than returning a float.
+
+A loop body holds `with Mesh(...)` statements, and the loop carries what one
+binds. A `with` exports changed names visible on entry, including loop carry
+parameters, and new names read by following statements. Bindings produced by
+nested loops or mesh scopes follow the same rule. A TIR loop
+bound that is not a literal is read as the dimension arithmetic the loop was
+lowered from, so a bound naming a mesh coordinate reads back as it was printed.
+
+## 2. Syntax and Rules
+
+`T` and `tf` each expose a `Dialect` instance through their module hooks.
+Lookup MUST consult one tree keyed by `(dialect, namespace, name)`: a record
+at the current path returns its operation builder or exported type; a deeper
+path returns the next `Dialect`; otherwise lookup MUST raise `AttributeError`.
+`dir()` and `__all__` MUST list only the current layer's records and immediate
+child namespaces.
+
+`register_op` MUST receive explicit `dialect` and `category`; `namespace=""`
+places the operation at the root. Category organizes documentation, not lookup.
+`register_type(dialect=..., namespace=...)` MUST expose a type in the same tree
+without creating an `OpSchema` or attaching `_op_schema`. Aliases occupy a
+single record like operations. A duplicate path MUST raise `ValueError` naming
+the existing owner; a record MUST NOT occupy a namespace prefix, in either
+registration order. Missing required decorator arguments MUST raise `TypeError`.
+
+Negative integer and floating-point literals are single `Constant` values.
+Negating a name or a runtime expression constructs a `Unary(NEG)` Call.
+
+Tuple subscripting lowers `stages[index]` to `TupleGetItem(stages, index)`.
+Literal negative indices are normalized against the tuple arity before lowering.
+A non-literal scalar index is accepted only when type inference can establish one
+common field type for every possible result.
+
+### 2.1 Syntax
+
+<!-- parser-grammar:start -->
+```ebnf
+; root: function
+; literal: Python ast.Constant syntax, e.g. 1, "bf16", or None
+; name: Python variable name; primary: name/attribute base for calls and subscripts
+; expression: Python syntax composed from literals, names, primaries, and operators
+; runtime-expression: expression lowered to a TileFoundry IR Expr
+mesh-axis             ::= identifier
+                          | identifier '.' identifier
+dim-expr              ::= integer-literal
+                          | identifier
+                          | primary '.' identifier
+                          | dim-expr ('+' | '-' | '*' | '//' | '%') dim-expr
+                          | (identifier | primary '.' identifier) '(' (dim-expr (',' dim-expr)*)?
+                            ')'
+layout-dims           ::= '(' ((expression '@' ('(' mesh-axis (',' mesh-axis)* ')' | mesh-axis) |
+                          dim-expr) (',' (expression '@' ('(' mesh-axis (',' mesh-axis)* ')' |
+                          mesh-axis) | dim-expr))*)? ')'
+layout-strides        ::= '(' (dim-expr (',' dim-expr)*)? ')'
+placed-layout         ::= '(' layout-dims ',' layout-strides ')'
+                          | layout-dims
+plain-layout          ::= '(' (dim-expr (',' dim-expr)*)? ')'
+literal               ::= None
+                          | Ellipsis
+                          | boolean-literal
+                          | integer-literal
+                          | float-literal
+                          | complex-literal
+                          | string-literal
+                          | bytes-literal
+primary               ::= identifier
+                          | expression '.' identifier
+sequence              ::= '(' (expression (',' expression)*)? ')'
+                          | '[' (expression (',' expression)*)? ']'
+                          | '{' (expression (',' expression)*)? '}'
+dict                  ::= '{' (expression ':' expression (',' expression ':' expression)*)? '}'
+binary-operation      ::= expression ('+' | '-' | '*' | '/' | '//' | '%' | '**') expression
+unary-operation       ::= ('+' | '-' | 'not') expression
+call                  ::= expression '(' ((expression | keyword-name '=' expression) (','
+                          (expression | keyword-name '=' expression))*)? ')'
+slice                 ::= (expression)? ':' (expression)? (':' expression)?
+subscript             ::= expression '[' expression ']'
+expression            ::= literal
+                          | primary
+                          | sequence
+                          | dict
+                          | binary-operation
+                          | unary-operation
+                          | call
+                          | slice
+                          | subscript
+composed-layout       ::= (placed-layout | plain-layout | expression) '+' dim-expr
+                          | ((placed-layout | plain-layout | expression) '+' dim-expr |
+                            placed-layout | plain-layout | expression) '|' expression
+placement-operand     ::= '(' layout-dims ',' layout-strides ')'
+                          | layout-dims
+value-states          ::= '{' 'B' '(' ')' '}'
+                          | '{' mesh-axis '@' 'P' '(' string-literal ')' (',' mesh-axis '@' 'P' '('
+                            string-literal ')')* '}'
+stated-layout         ::= (composed-layout | placement-operand | expression) '@' value-states
+shape                 ::= '(' (dim-expr (',' dim-expr)*)? ')'
+                          | identifier
+                          | primary '.' identifier
+tensor-shape-layout   ::= stated-layout
+                          | placed-layout
+                          | shape
+dtype                 ::= string-literal
+                          | primary
+layout                ::= None
+                          | primary
+                          | call
+                          | stated-layout
+                          | placed-layout
+                          | plain-layout
+                          | composed-layout
+storage               ::= string-literal
+                          | primary
+tensor-optional-slot  ::= layout
+                          | storage
+tensor                ::= tensor-head '[' '(' (tensor-shape-layout ',' dtype | shape ',' dtype ','
+                          tensor-optional-slot | tensor-shape-layout ',' dtype ','
+                          tensor-optional-slot | shape ',' dtype ',' tensor-optional-slot ','
+                          tensor-optional-slot) ')' ']'
+tuple-type            ::= 'tuple' '[' '(' type-annotation (',' type-annotation)* ')' ']'
+                          | 'tuple' '[' type-annotation ']'
+scalar-type           ::= primary
+                          | call
+type-annotation       ::= tensor
+                          | tuple-type
+                          | scalar-type
+signature             ::= (name ':' type-annotation (',' name ':' type-annotation)*)?
+return-type           ::= type-annotation
+if                    ::= if cond-node block (block)?
+while                 ::= while cond-node block
+loop-iterator         ::= 'tf' '.' 'tile' '(' (expression ',' expression | expression ',' expression
+                            ',' expression) ')'
+                          | 'range' '(' (expression | expression ',' expression | expression ','
+                            expression ',' expression) ')'
+loop-carry-statement  ::= expression '=' expression
+                          | 'for' name 'in' expression ':' loop-carry
+                          | statement
+loop-carry            ::= (loop-carry-statement (newline loop-carry-statement)*)?
+loop-header           ::= 'for' identifier 'in' loop-iterator ':' loop-carry
+loop-body             ::= (statement (newline statement)*)?
+for                   ::= 'for' name 'in' expression ':' (block | loop-body)
+mesh-context          ::= ('Mesh' | primary '.' 'Mesh') '(' (expression | ('layout' | 'names') '='
+                            expression) (',' (expression | ('layout' | 'names') '=' expression))*
+                            ')'
+                          | expression
+with                  ::= 'with' mesh-context ('as' identifier)? ':' block
+slice-endpoint-binary ::= index-endpoint dim-op index-endpoint
+mesh-coordinate       ::= identifier '.' string-literal
+index-endpoint        ::= literal
+                          | primary
+                          | slice-endpoint-binary
+                          | mesh-coordinate
+                          | runtime-expression
+                          | expression
+ceildiv-expression    ::= ceildiv '(' index-endpoint ',' index-endpoint ')'
+variadic-inputs       ::= '[' (runtime-expression (',' runtime-expression)*)? ']'
+                          | '(' (runtime-expression (',' runtime-expression)*)? ')'
+                          | listcomp
+                          | generatorexp
+                          | expression
+op-value              ::= primary '(' ((expression | keyword-name '=' expression) (',' (expression |
+                          keyword-name '=' expression))*)? ')'
+op-call               ::= (primary | expression '[' expression ']') '(' ((expression | keyword-name
+                          '=' expression) (',' (expression | keyword-name '=' expression))*)? ')'
+launch                ::= callee '(' ')'
+index-slice           ::= (index-endpoint)? ':' (index-endpoint)? (':' index-endpoint)?
+subscript-index       ::= '(' ((index-slice | index-endpoint) (',' (index-slice |
+                            index-endpoint))*)? ')'
+                          | index-slice
+                          | index-endpoint
+subscript-expression  ::= runtime-expression '[' subscript-index ']'
+matmul-expression     ::= runtime-expression '@' runtime-expression
+binary-expression     ::= runtime-expression ('+' | '-' | '*' | '/' | '//' | '%') runtime-expression
+                          | runtime-expression ('==' | '!=' | '<' | '<=' | '>' | '>=')
+                            runtime-expression
+                          | runtime-expression ('and' | 'or') runtime-expression
+constant              ::= boolean-literal
+                          | integer-literal
+                          | float-literal
+                          | '-' numeric-literal
+unary-expression      ::= unary-op runtime-expression
+name                  ::= identifier
+tuple-expression      ::= '(' (runtime-expression (',' runtime-expression)*)? ')'
+runtime-expression    ::= ceildiv-expression
+                          | op-call
+                          | launch
+                          | subscript-expression
+                          | matmul-expression
+                          | binary-expression
+                          | constant
+                          | unary-expression
+                          | mesh-coordinate
+                          | name
+                          | tuple-expression
+                          | tensor
+                          | primary '.' identifier
+tuple-assignment      ::= '(' identifier (',' identifier)* ')' '=' runtime-expression
+where-annotation      ::= 'where' '(' ')'
+statement             ::= if
+                          | while
+                          | for
+                          | with
+                          | tuple-assignment
+                          | identifier '=' (runtime-expression | expression)
+                          | identifier ':' (where-annotation | type-annotation) ('='
+                            (runtime-expression | expression))?
+                          | 'return' (runtime-expression)?
+                          | runtime-expression
+                          | 'pass'
+block                 ::= (statement (newline statement)*)?
+function              ::= 'def' name '(' signature ')' ('->' return-type)? ':' block
+```
+<!-- parser-grammar:end -->
+
+### 2.2 Rules
+
+<!-- parser-constraints:start -->
+| Owner | Situation | Rule | Statement | Source |
+| --- | --- | --- | --- | --- |
+| binary_expression, matmul_expression, op_call, unary_expression | expression, slice_endpoint, subscript_index, variadic_input | AuthoredCallScopeRule | An authored HIR call must run inside a mesh if its function opens one. | src/tilefoundry/parser/pattern_nodes.py |
+| binary_expression, matmul_expression, op_call, unary_expression | expression, slice_endpoint, subscript_index, variadic_input | CallBindingRule | A call must bind its arguments into a Call tuple. | src/tilefoundry/parser/pattern_nodes.py |
+| binary_expression, matmul_expression, op_call, unary_expression | expression, slice_endpoint, subscript_index, variadic_input | CallTypeInferenceRule | A call's result type must be inferred from its binding. | src/tilefoundry/parser/pattern_nodes.py |
+| call | call_attribute, expression, layout, mesh_layout, slice_endpoint, static_item, static_key, static_layout, static_mesh, static_operand, static_owner, static_slice, subscript_index, type_constructor | InlineMeshCallRule | Inside an open mesh scope, Mesh constructors open a with header unless used as a ShardLayout mesh value. | src/tilefoundry/parser/pattern_nodes.py |
+| call | call_attribute, expression, layout, mesh_layout, slice_endpoint, static_item, static_key, static_layout, static_mesh, static_operand, static_owner, static_slice, subscript_index, type_constructor | StaticCallConstructionRule | A static call has a callable target and constructs a valid Python value. | src/tilefoundry/parser/pattern_nodes.py |
+| composed_layout | call_attribute, layout, tensor_optional_slot | ComposedLayoutConstructionRule | A checked composition constructs its inner, offset, and outer layout. | src/tilefoundry/parser/pattern_nodes.py |
+| composed_layout | call_attribute, layout, tensor_optional_slot | ComposedLayoutInnerRule | A composed layout's inner is a Swizzle or LayoutBase. | src/tilefoundry/parser/pattern_nodes.py |
+| composed_layout | call_attribute, layout, tensor_optional_slot | ComposedLayoutOffsetRule | A composed layout has one offset before its inner layout; compound offsets are parenthesized. | src/tilefoundry/parser/pattern_nodes.py |
+| composed_layout | call_attribute, layout, tensor_optional_slot | ComposedLayoutOuterRule | A composed layout's outer is a plain Layout without mesh placement. | src/tilefoundry/parser/pattern_nodes.py |
+| dim_expr | call_attribute, dim_expr, layout, layout_extent, layout_offset, mesh_layout, tensor_dim_expr, tensor_optional_slot, tensor_shape | ShapeDimRule | A shape dimension must be an integer, DimVar, or expression. | src/tilefoundry/parser/ast_pattern.py |
+| dtype | call_attribute, tensor_dtype | CanonicalDTypeRule | A dtype must resolve to a canonical DType. | src/tilefoundry/parser/ast_pattern.py |
+| function | function | FunctionDialectRule | A function kind and constructed value must agree with the active dialect. | src/tilefoundry/parser/pattern_nodes.py |
+| function | function | FunctionRegistrationRule | A validated function must be registered exactly once in its owning scope. | src/tilefoundry/parser/pattern_nodes.py |
+| function | function | FunctionReturnCompatibilityRule | A HIR body with a return annotation must satisfy that annotation; a dispatch prototype must declare one, and each variant body must satisfy the prototype return contract. | src/tilefoundry/parser/pattern_nodes.py |
+| function | function | FunctionRoleValidationRule | A root, variant, or converter must satisfy its role before registration. | src/tilefoundry/parser/pattern_nodes.py |
+| function | function | FunctionSignatureRule | A function must construct an ordered parameter tuple. | src/tilefoundry/parser/pattern_nodes.py |
+| if, while | loop_statement, statement | TirOnlyStatementRule | A TIR-only statement must appear in a prim_func. | src/tilefoundry/parser/pattern_nodes.py |
+| index_slice | subscript_index | TileWindowSliceBoundRule | A tile window cannot be used as a slice bound. | src/tilefoundry/parser/pattern_nodes.py |
+| layout, plain_layout | call_attribute, mesh_layout, tensor_optional_slot | LayoutPositionRule | A layout must be legal for its parser position. | src/tilefoundry/parser/ast_pattern.py |
+| layout, plain_layout | call_attribute, mesh_layout, tensor_optional_slot | LayoutShapeRule | A layout must have a valid non-boolean shape. | src/tilefoundry/parser/ast_pattern.py |
+| loop_header | loop_header | TileIteratorQualificationRule | A tiled loop uses tf.tile rather than a bare tile call. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_axis | call_attribute, layout, mesh_layout, tensor_optional_slot, tensor_shape | BareMeshAxisRule | A bare Mesh placement names a one-axis mesh. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_axis | call_attribute, layout, mesh_layout, tensor_optional_slot, tensor_shape | MeshAxisBindingRule | A placement axis resolves to a lexical Mesh binding. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_axis | call_attribute, layout, mesh_layout, tensor_optional_slot, tensor_shape | MeshAxisNameRule | A named placement axis exists in its lexical Mesh. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | mesh_context | SelectionBindingRule | A mesh selection names a lexical Mesh binding or its constant slice. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | mesh_context | SelectionConstructionRule | A checked selection constructs a Mesh with its topology and offset, enters its execution scope, and defines its lexical binding. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | mesh_context | SelectionCoverRule | A mesh selection layout covers each selection-local index exactly once. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | mesh_context | SelectionLayoutFormRule | A mesh selection layout is a shape tuple or a shape/stride tuple pair. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | mesh_context | SelectionLevelRule | A mesh selection names exactly one topology level. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | mesh_context | SelectionSizeRule | A mesh selection layout has positive static extents, static strides, matching shape/stride and name ranks, and the same size as its selection. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | mesh_context | SelectionStrideRule | Each new mesh selection axis maps to one fixed physical stride. | src/tilefoundry/parser/pattern_nodes.py |
+| module | module_finalization | ModuleFinalizationRule | A module declaration must contain valid unique members and a resolvable entry. | src/tilefoundry/parser/ast_pattern.py |
+| module | module_function | ModuleFunctionRegistrationRule | A validated module function must be recorded in declaration order. | src/tilefoundry/parser/ast_pattern.py |
+| module | module_function | ModuleFunctionValidationRule | A module function must satisfy its root, variant, or converter role before mutation. | src/tilefoundry/parser/ast_pattern.py |
+| op_call | expression, slice_endpoint, subscript_index, variadic_input | CallVariadicInputFormRule | A variadic call must use one explicit list, tuple, or supported static list comprehension. | src/tilefoundry/parser/pattern_nodes.py |
+| op_value | call_attribute | OpValueAttributeRule | Each op-value keyword names an attribute of its resolved op schema. | src/tilefoundry/parser/pattern_nodes.py |
+| op_value | call_attribute | OpValueConstructionRule | An op value constructs valid attributes using its resolved schema. | src/tilefoundry/parser/pattern_nodes.py |
+| op_value | call_attribute | OpValueKeywordOnlyRule | An op value takes only keyword attributes. | src/tilefoundry/parser/pattern_nodes.py |
+| op_value | call_attribute | OpValueUniqueKeywordRule | An op-value keyword is supplied at most once. | src/tilefoundry/parser/pattern_nodes.py |
+| placed_layout, stated_layout | call_attribute, mesh_layout, tensor_optional_slot, tensor_shape | LayoutStrideRankRule | A stated stride tuple must have the rank of the layout it addresses. | src/tilefoundry/parser/pattern_nodes.py |
+| placed_layout, stated_layout | call_attribute, mesh_layout, tensor_optional_slot, tensor_shape | MeshAxisBoundOnceRule | A placement binds each mesh axis at most once. | src/tilefoundry/parser/pattern_nodes.py |
+| placed_layout, stated_layout | call_attribute, mesh_layout, tensor_optional_slot, tensor_shape | PlacementAnswerRule | Placement sugar states both the shape as written and the layout it implies. | src/tilefoundry/parser/pattern_nodes.py |
+| placed_layout, stated_layout | call_attribute, mesh_layout, tensor_optional_slot, tensor_shape | PlacementConstructionRule | A placement must construct a valid shard layout. Without splits, partials or stated strides, it uses row-major strides; Broadcast states do not affect this default. A composed operand is retained directly without canonical split decomposition. | src/tilefoundry/parser/pattern_nodes.py |
+| placed_layout, stated_layout | call_attribute, mesh_layout, tensor_optional_slot, tensor_shape | PlacementLevelRule | A placement's meshes cannot name the same topology level. | src/tilefoundry/parser/pattern_nodes.py |
+| placed_layout, stated_layout | call_attribute, mesh_layout, tensor_optional_slot, tensor_shape | PlacementMeshResolutionRule | A placement's mesh must be a lexical mesh binding. | src/tilefoundry/parser/pattern_nodes.py |
+| placed_layout, stated_layout | call_attribute, mesh_layout, tensor_optional_slot, tensor_shape | PlacementScopeRule | A placement requires and covers the current mesh scope, or the function mesh in a signature; each referenced axis must map uniquely to an axis of that scope. Unstated axes are Broadcast. | src/tilefoundry/parser/pattern_nodes.py |
+| reference | annotation, call_attribute, expression, slice_endpoint, subscript_index, tensor_dtype, tensor_optional_slot, type_annotation, variadic_input | LexicalMeshReferenceRule | Inside an open mesh scope, an external Mesh or mesh-bearing ShardLayout cannot stand in for a lexical Mesh binding. | src/tilefoundry/parser/ast_pattern.py |
+| shape | tensor_shape | ShapeTupleRule | A shape must construct a tuple of dimensions. | src/tilefoundry/parser/ast_pattern.py |
+| stated_layout | call_attribute, tensor_optional_slot, tensor_shape | StatedLayoutOperandRule | States attach to placement dimensions, a plain Layout, or a ComposedLayout whose outer is a plain Layout. | src/tilefoundry/parser/pattern_nodes.py |
+| storage | call_attribute, tensor_optional_slot | StorageValueRule | Storage must resolve to a StorageKind. | src/tilefoundry/parser/ast_pattern.py |
+| tensor | annotation, call_attribute, expression, slice_endpoint, subscript_index, type_annotation, variadic_input | TensorLayoutStorageRule | A tensor type must contain compatible layout and storage values. | src/tilefoundry/parser/ast_pattern.py |
+| tensor | annotation, call_attribute, expression, slice_endpoint, subscript_index, type_annotation, variadic_input | TensorPositionRule | A tensor type's storage must be legal for its dialect and position. | src/tilefoundry/parser/ast_pattern.py |
+| value_states | call_attribute, tensor_optional_slot, tensor_shape | ValueStatesFormRule | Layout states are either a single B() or one or more axis @ P(nonempty string) entries; empty states, axis @ B(), and mixing B() with other entries are rejected. | src/tilefoundry/parser/pattern_nodes.py |
+| where_annotation | annotation | WhereTopologyStatesRule | Where layout states constrain named topologies with topology @ B() or topology @ P(nonempty string); they do not bind lexical mesh axes. | src/tilefoundry/parser/pattern_nodes.py |
+<!-- parser-constraints:end -->
+
+A `mesh-axis` used by placement sugar MUST resolve to a mesh binding in the
+current lexical scope. A module or closure name that resolves to a `Mesh` does
+not become a placement binding. Such an external value remains valid as the
+context expression of `with ... as ...` outside an open mesh scope, or as the
+value supplied to `@func(mesh=...)`; the resulting lexical binding is the name
+placement sugar may use.
+
+## 3. Implementation Overview
+
+| Component | Responsibility |
+| --- | --- |
+| Parser API and Context | Receives authored Functions and carries dialect, role, scope, and recursion inputs. |
+| Executable Pattern Graph | Composes concrete AST elements into the Function root pattern. |
+| Match and Construction | Matches recursively into `AstMatch`, then constructs owner values on return. |
+| Ordered Rules | Validates and normalizes each owner value after construction. |
+| Module Build | Lets Python execute the class body, collects declarations, resolves child Modules first, then parses Functions in source order and finalizes the Module. |
+| Pattern Visitor | Traverses the same graph to render this section's generated grammar and constraints. |
+| Refusal | Carries the reason from the pattern that claimed a node and then refused it, so a report names a cause rather than the absence of a match. |
+
+```mermaid
+classDiagram
+    ParserAPI --> FuncParserContext
+    ParserAPI --> FunctionPattern
+    AstPattern <|.. Element
+    Element o-- AstPattern
+    Element o-- AstRule
+    AstPattern --> AstMatch
+    AstPattern --> MatchFailure
+    MatchFailure <|.. PatternFailure
+    MatchFailure <|.. ChoiceFailure
+    ChoiceFailure o-- MatchFailure : causes
+    ParseError <.. MatchFailure
+    PatternVisitor ..> AstPattern
+    ParserAPI ..> ModuleBuild
+```
+
+```mermaid
+flowchart TD
+    API["parse_function(fn, context)"] --> AST["Extract FunctionDef AST"]
+    AST --> ROOT["FunctionPattern.match"]
+    ROOT --> TREE["AstMatch tree"]
+    TREE --> BACKWARD["construct children, then apply Rules"]
+    BACKWARD --> FUNCTION["HIR Function / TIR PrimFunction"]
+    FUNCTION --> MODULE{"Module authoring context?"}
+    MODULE -->|yes| FINALIZE["defer declaration"]
+    FINALIZE --> CHILDREN["attach child Modules and bind module scope"]
+    CHILDREN --> ORDERED["parse roots in source order; then variants/converters"]
+    ORDERED --> BUILT["construct final Module and verify"]
+    BUILT --> RETURN
+    MODULE -->|no| RETURN["return standalone result"]
+```
+
+```mermaid
+flowchart TD
+    TRY["alternative.match(node)"] --> OUT{"outcome"}
+    OUT -->|"AstMatch"| WIN["choice accepts it; pending refusals are discarded"]
+    OUT -->|"MatchFailure"| CLAIM["claimed the node and refused: reason recorded"]
+    OUT -->|"None"| PASS["did not recognize the node: nothing recorded"]
+    PASS --> NEXT["try the next alternative"]
+    CLAIM --> NEXT
+    NEXT --> DONE{"any refusal recorded?"}
+    DONE -->|no| SILENT["return None: no alternative recognized this node"]
+    DONE -->|yes| COLLECT["ChoiceFailure over the claimants"]
+    COLLECT --> UP["travels up unchanged; combinators add no wrapping"]
+    UP --> RENDER["render(): a sole claimant is the whole report"]
+    RENDER --> RAISE["ParseError with source location"]
+    SILENT --> RAISE
+```
+
+A pattern MUST establish that a node is its own before it refuses with a reason. That claim is
+what makes the reason trustworthy: it says no remaining alternative can accept this node, so
+the refusal is the author's mistake and not another pattern's turn. A callee resolving to an op
+schema is such a claim, and a wrong argument count after it is an error. A callee that does not
+resolve is not a claim: it may be a bare name or a foreign namespace that another alternative
+owns, so the pattern returns `None` and says nothing. Reasons are never reconstructed from the
+AST after the fact; an inspection outside the refusing pattern cannot see which step it failed
+at, and becomes a second, divergent copy of that knowledge.
+
+Being last in one choice is not a claim either, because that choice may itself be an
+alternative in another. `parse_node` is the single place where no alternative remains, so it
+is the only place that MAY describe a node from its shape rather than from a pattern's
+statement, and it does so only when the shape says something worth reading.
+
+`None` and a `MatchFailure` differ only for a choice; every other combinator returns either one
+unchanged, so a refusal keeps the identity and the wording of the pattern that produced it all
+the way to `parse_node`. Nothing is wrapped, filtered, or re-described on the way up. A
+`ChoiceFailure` records only the alternatives that claimed the node, which is normally one, and
+it renders as that sole claimant. Two claimants mean two patterns claim overlapping shapes; the
+report states both rather than choosing between them, because the ambiguity is in the grammar
+and not in the report.
+
+Pattern combinators serve both runtime matching and Spec traversal. `AstMatch` separates syntax
+matching from object construction, while each Rule reads the recursive context after its owner
+value exists. Module class control flow remains Python execution; no Module AST grammar exists.

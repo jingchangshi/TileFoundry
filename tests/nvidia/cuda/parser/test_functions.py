@@ -1,0 +1,104 @@
+"""Parser ownership of function-only docstring semantics."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+from tests.core._corpus import Case, case, check_case, special
+from tilefoundry.cli.source import load_authored_ir
+from tilefoundry.dsl import *
+from tilefoundry.parser import ParseError
+
+FIXTURES = Path(__file__).parents[1] / "fixtures"
+PARSER = FIXTURES / "parser"
+DIAGNOSTICS = FIXTURES / "diagnostics"
+
+
+class FunctionCase(Case):
+    """A function checked by the types its annotations give."""
+
+
+@case
+class ReturnAnnotationChecksLayout(FunctionCase):
+    path: Path = PARSER / "reshard_return_annotation.py"
+
+    def guard(self, state, problems):
+        fn = state.entry_function()
+        assert fn.return_type == fn.body.type
+        assert fn.return_type.storage is StorageKind.GMEM
+        assert fn.return_type.layout is not None
+
+
+@case
+class TuplePrototypeContract(FunctionCase):
+    path: Path = PARSER / "tuple_dispatch_prototype.py"
+
+    def guard(self, state, problems):
+        prototype = state.entry_function()
+        assert isinstance(prototype.return_type, TupleType)
+        assert prototype.return_type == prototype.variants[0].return_type
+        assert prototype.type.return_type == prototype.return_type
+
+
+CASES = special(FunctionCase)
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.id)
+def test_function_case(case: FunctionCase) -> None:
+    check_case(case)
+
+
+def test_return_mismatch_reports_both_types() -> None:
+    with pytest.raises(ParseError) as raised:
+        load_authored_ir(str(DIAGNOSTICS / "parser_return_annotation_storage_mismatch.py"))
+
+    message = str(raised.value)
+    assert "return annotation is not compatible with the inferred body type" in message
+    assert "annotation TensorType" in message
+    assert "body TensorType" in message
+    assert "StorageKind.SMEM" in message
+    assert "StorageKind.GMEM" in message
+    assert "(role 'func')" in message
+    assert (
+        "tests/nvidia/cuda/fixtures/diagnostics/parser_return_annotation_storage_mismatch.py:"
+        in message
+    )
+
+
+def test_prototype_requires_return_annotation() -> None:
+    with pytest.raises(ParseError, match="prototype requires a return annotation"):
+        load_authored_ir(str(DIAGNOSTICS / "parser_dispatch_prototype_without_return.py"))
+
+
+def test_variant_rejects_return_mismatch() -> None:
+    with pytest.raises(ParseError, match="variant body type .*dispatch return contract"):
+        load_authored_ir(str(DIAGNOSTICS / "parser_dispatch_variant_return_mismatch.py"))
+
+
+def test_storage_absent_from_target_refused() -> None:
+    refusal = re.escape(
+        "storage tmem is not allowed by hardware context ('gmem', 'smem', 'rmem', 'umat')"
+    )
+    with pytest.raises(ParseError, match=refusal):
+        load_authored_ir(str(DIAGNOSTICS / "parser_param_storage_not_on_target.py"))
+
+    with pytest.raises(ParseError, match=refusal):
+        load_authored_ir(str(DIAGNOSTICS / "parser_body_storage_not_on_target.py"))
+
+
+def test_storage_on_target_accepted() -> None:
+    fine = load_authored_ir(str(PARSER / "smem_param_h200.py"))
+
+    assert fine.entry_function().params[0].annotation.storage is StorageKind.SMEM
+
+    blackwell = load_authored_ir(str(PARSER / "tmem_param_b200.py"))
+
+    assert blackwell.entry_function().params[0].annotation.storage is StorageKind.TMEM
+
+
+def test_with_body_docstring_rejected() -> None:
+    with pytest.raises(ParseError):
+        load_authored_ir(str(DIAGNOSTICS / "parser_with_body_docstring.py"))

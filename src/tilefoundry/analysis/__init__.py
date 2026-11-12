@@ -1,0 +1,69 @@
+"""Direct public Analysis fact contract."""
+
+from __future__ import annotations
+
+# ruff: noqa: I001 -- curated public import order.
+
+from .errors import AnalysisError
+from .precision import AnalysisPrecision
+from .facts import (
+    ExplicitMemoryLevelFacts,
+    ImplicitMemoryLevelFacts,
+    MemoryHierarchyFacts,
+    MemoryLevelRelation,
+    MemoryRelationKind,
+    PerformanceServiceFacts,
+    ThroughputFacts,
+)
+from .metadata import (
+    MemoryMetadata,
+    ComputeCostMetadata,
+    Footprint,
+    MemoryLevelPeak,
+    PerformanceMetadata,
+    PerformanceSummaryMetadata,
+    RegionMemoryMetadata,
+    ReuseWindow,
+    RooflineMetadata,
+    Traffic,
+    Breakdown,
+    Spread,
+    TimelineMetadata,
+    TrafficBytes,
+    ValueLifetime,
+)
+from .registry import Analyzer
+from .api import AnalysisResult, analyze
+from .check import check_program
+
+
+__all__ = [
+    "Analyzer",
+    "AnalysisError",
+    "AnalysisPrecision",
+    "AnalysisResult",
+    "MemoryMetadata",
+    "ComputeCostMetadata",
+    "ExplicitMemoryLevelFacts",
+    "ImplicitMemoryLevelFacts",
+    "Footprint",
+    "MemoryHierarchyFacts",
+    "MemoryLevelPeak",
+    "MemoryLevelRelation",
+    "RegionMemoryMetadata",
+    "ReuseWindow",
+    "MemoryRelationKind",
+    "PerformanceServiceFacts",
+    "PerformanceMetadata",
+    "PerformanceSummaryMetadata",
+    "RooflineMetadata",
+    "Traffic",
+    "Breakdown",
+    "Spread",
+    "ThroughputFacts",
+    "TimelineMetadata",
+    "TrafficBytes",
+    "ValueLifetime",
+    "analyze",
+    "check_program",
+]

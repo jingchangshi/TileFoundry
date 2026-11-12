@@ -1,0 +1,266 @@
+"""Declarative CUDA MMA atoms and operand patterns."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+
+from tilefoundry.ir.core.inspection import Printable, PrinterBase
+from tilefoundry.ir.core.param_def import ParamDef
+from tilefoundry.ir.core.register import register_type
+from tilefoundry.ir.pattern import (
+    ComposedLayoutPattern,
+    LayoutPattern,
+    MeshPattern,
+    Pattern,
+    ShardLayoutPattern,
+    StarPattern,
+    SwitchPattern,
+    TensorPattern,
+    WildcardPattern,
+    matched,
+)
+from tilefoundry.ir.pattern import (
+    predicates as P,
+)
+from tilefoundry.ir.pattern.utils import declared_shape, selected_pattern
+from tilefoundry.ir.types import ComposedLayout, DType, Layout, Mesh, ShardLayout, TensorType
+from tilefoundry.ir.types.layout_algebra import coalesce
+from tilefoundry.ir.types.mesh import levels, starts
+from tilefoundry.ir.types.storage import StorageKind
+
+_MISS = object()
+
+
+def execution_mesh_pattern(execution_mesh: Mesh, *, groups=False) -> MeshPattern:
+    """Any aligned run matching an instruction's execution mesh."""
+    (topology,) = execution_mesh.topologies
+    per_mode = (P.Forward(per_mode=True), P.Injective(per_mode=True))
+    outer = LayoutPattern.from_layout(execution_mesh.layout, predicates=per_mode)
+    if groups:
+        outer = LayoutPattern(
+            ((StarPattern(WildcardPattern("g")), *outer.shape[0]),),
+            ((StarPattern(WildcardPattern("gs")), *outer.strides[0]),),
+        )
+    layout = ComposedLayoutPattern(
+        inner=None,
+        offset=WildcardPattern("p0"),
+        outer=outer,
+        predicates=(WildcardPattern("p0") % topology.size == 0,)
+        + ((P.Forward(), P.Injective()) if groups else ()),
+    )
+    return MeshPattern((topology.name,), layout)
+
+
+def rmem_fragment(shape: tuple, dtype: DType, held: ShardLayout) -> TensorPattern:
+    """A warp MMA operand held in registers as *held* lays it out over its mesh."""
+    return TensorPattern(
+        shape=shape,
+        dtype=dtype,
+        storage=StorageKind.RMEM,
+        layout=ShardLayoutPattern(
+            layout=LayoutPattern.from_layout(held.layout),
+            attrs=held.attrs,
+            mesh=execution_mesh_pattern(held.mesh),
+        ),
+    )
+
+
+class MmaAtom(Printable):
+    """One instruction declaration; an instance binds its authored parameters."""
+
+    namespace: str
+    execution_mesh: Mesh
+    capability: str
+    resource: str
+    C: object
+    A: object
+    B: object
+
+    roles = ("C", "A", "B")
+    parameters: tuple[ParamDef, ...] = ()
+    reference_name: str = ""
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        cls.parameters = tuple(value for value in vars(cls).values() if isinstance(value, ParamDef))
+        cls.reference_name = f"{cls.namespace}.{cls.__name__}"
+        register_type(dialect="T", namespace=cls.namespace.removeprefix("T."))(cls)
+
+    def __init__(self, *, mesh: Mesh | None = None, **bindings):
+        unknown = set(bindings) - {param.name for param in self.parameters}
+        if unknown:
+            raise ValueError(
+                f"{self.reference_name} takes no parameter {', '.join(sorted(unknown))}"
+            )
+        held = {}
+        for param in self.parameters:
+            value = bindings[param.name] if param.name in bindings else self._implied(param, held)
+            if param.annotation is DType and isinstance(value, str):
+                value = DType.from_name(value)
+            if matched(param.pattern, value, held) is None:
+                shown = value.name if isinstance(value, DType) else repr(value)
+                raise ValueError(
+                    f"{self.reference_name}: {param.name}={shown} is not one "
+                    f"it takes{self._where(held)}; it takes {param.name} "
+                    f"{param.pattern!r}"
+                )
+            held[param.name] = value
+        self.bindings = held
+        self.mesh = mesh
+
+    @classmethod
+    def _implied(cls, param: ParamDef, held: dict):
+        pattern = param.pattern
+        while isinstance(pattern, SwitchPattern) and pattern.param in held:
+            pattern = dict(pattern.branches).get(held[pattern.param], _MISS)
+            if pattern is _MISS:
+                break
+        if pattern is not _MISS and not isinstance(pattern, Pattern):
+            return pattern
+        if param.has_default:
+            return param.default
+        raise ValueError(f"{cls.reference_name} needs {param.name}")
+
+    @staticmethod
+    def _where(held: dict) -> str:
+        return "" if not held else f" where {held!r}"
+
+    def role(self, role: str):
+        return getattr(type(self), role)
+
+    def match_view(self, param_name: str, type_: TensorType) -> TensorType:
+        """Return a temporary pattern view; projection and emission keep the original type."""
+        return type_
+
+    def operand_shapes(self) -> tuple[tuple[int, ...], ...]:
+        """Return the declared C, A, and B shapes for one atom issue."""
+        shapes = tuple(
+            declared_shape(selected_pattern(self.role(role), self.bindings), self.bindings)
+            for role in self.roles
+        )
+        if any(shape is None for shape in shapes):
+            raise ValueError(f"{self.reference_name} does not declare fixed operand shapes")
+        return shapes
+
+    @property
+    def required_execution_mesh(self) -> Mesh:
+        return self.execution_mesh
+
+    @classmethod
+    def execution_mesh_pattern(cls, *, groups=False) -> MeshPattern:
+        return execution_mesh_pattern(cls.execution_mesh, groups=groups)
+
+    def on(self, mesh: Mesh) -> MmaAtom:
+        return type(self)(mesh=mesh, **self.bindings)
+
+    def print(self, printer: PrinterBase, ctx=None) -> str:
+        """This atom as importable DSL source, written with *printer*.
+
+        The atom states its own name, every binding in parameter order and an
+        Enum's ``namespace`` spelling; every other value, the mesh included, is
+        printed by *printer* in the same import context.
+        """
+        stated = [
+            f"{name}={self._printed_value(value, printer, ctx)}"
+            for name, value in self.bindings.items()
+        ]
+        if self.mesh is not None:
+            stated.append(f"mesh={printer.print(self.mesh, ctx)}")
+        return f"{self.reference_name}({', '.join(stated)})"
+
+    def _printed_value(self, value, printer: PrinterBase, ctx) -> str:
+        if isinstance(value, Enum):
+            return f"{self.namespace}.{type(value).__name__}.{value.name}"
+        return printer.print(value, ctx)
+
+    def __eq__(self, other):
+        return (
+            type(other) is type(self)
+            and other.bindings == self.bindings
+            and other.mesh == self.mesh
+        )
+
+    def __hash__(self):
+        return hash((type(self), tuple(self.bindings.items()), self.mesh))
+
+    def __repr__(self):
+        stated = [f"{name}={self._repr_value(value)}" for name, value in self.bindings.items()]
+        if self.mesh is not None:
+            stated.append(f"mesh={self.mesh!r}")
+        return f"{self.reference_name}({', '.join(stated)})"
+
+    def _repr_value(self, value) -> str:
+        if isinstance(value, Enum):
+            return f"{self.namespace}.{type(value).__name__}.{value.name}"
+        if isinstance(value, DType):
+            return repr(value.name)
+        return repr(value)
+
+
+@dataclass(frozen=True, init=False)
+class AtomPattern(Pattern):
+    """An instance of any declared atom class."""
+
+    declarations: tuple[type[MmaAtom], ...]
+
+    def __init__(self, *declarations):
+        object.__setattr__(self, "declarations", tuple(declarations))
+        object.__setattr__(self, "predicates", ())
+
+
+@dataclass(frozen=True)
+class FromAtom(Pattern):
+    """An operand pattern read from one role of the call's atom."""
+
+    role: str
+
+    def __post_init__(self):
+        if self.role not in ("A", "B", "C"):
+            raise ValueError("an MMA operand reads role A, B or C of its atom")
+
+    def read_on(self, op):
+        declaration = op.atom if isinstance(op.atom, type) else type(op.atom)
+        return getattr(declaration, self.role)
+
+
+def _reversed_modes(modes):
+    if isinstance(modes, tuple):
+        return tuple(_reversed_modes(mode) for mode in reversed(modes))
+    return modes
+
+
+def _reverse(layout: Layout) -> Layout:
+    return Layout(
+        _reversed_modes(tuple(layout.shape)),
+        _reversed_modes(tuple(layout.strides)),
+    )
+
+
+def physical_frames_match(left: Mesh, right: Mesh) -> bool:
+    """Compare affine offsets and ordered participant lanes."""
+    if left.topologies != right.topologies:
+        return False
+
+    def frame(mesh):
+        if isinstance(mesh.layout, ComposedLayout) and mesh.layout.inner is not None:
+            return None
+
+        try:
+            arranged = levels(mesh)
+        except (IndexError, TypeError, ValueError):
+            return None
+        return starts(mesh), tuple(coalesce(_reverse(layout)) for layout in arranged)
+
+    a, b = frame(left), frame(right)
+    return a is not None and b is not None and a == b
+
+
+__all__ = [
+    "AtomPattern",
+    "FromAtom",
+    "MmaAtom",
+    "physical_frames_match",
+    "execution_mesh_pattern",
+    "rmem_fragment",
+]

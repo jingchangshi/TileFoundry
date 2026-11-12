@@ -1,0 +1,32 @@
+"""What the wheel put on disk, and where the commands find it."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+MODELS = (
+    "deepseek_v4_flash",
+    "gemma2_2b",
+    "kimi_linear_48b_a3b",
+    "minicpm3_4b",
+    "qwen2_5_1_5b",
+    "qwen3_1_7b",
+    "qwen3_5_35b_a3b",
+)
+
+
+def test_each_model_ships_its_source_and_its_config(shipped) -> None:
+    """`model.py` alone is not a model: it reads the config beside it."""
+    models = Path(shipped["models"])
+    assert (models / "catalog.json").is_file()
+    for name in MODELS:
+        assert (models / name / "model.py").is_file(), name
+        assert (models / name / "config.json").is_file(), name
+
+
+def test_model_directories_exclude_orchestrator_sources(shipped) -> None:
+    models = Path(shipped["models"])
+    for name in MODELS:
+        source = models / name
+        assert not (source / "generation.py").is_file(), name
+        assert not (source / "run.py").is_file(), name

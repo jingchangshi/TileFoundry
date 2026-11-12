@@ -1,0 +1,127 @@
+[spec]
+schema = "tilefoundry.amx.device/v2"
+kind = "device"
+id = "apple.m2_pro"
+
+[compatibility]
+architectures = ["apple.amx"]
+
+[facts.identity.name]
+value = "apple_m2_pro"
+unit = "name"
+origin = "measured"
+source = "sysctl(8)"
+conditions = "sysctl machdep.cpu.brand_string reports Apple M2 Pro on the host"
+
+[facts.compute.amx_unit_count]
+value = 2
+unit = "count"
+origin = "estimated"
+source = "AMX f32 GEMM thread-scaling measurement on the host"
+conditions = "read off measured thread scaling of the same GEMM: 504.9, 767.8, 967.5 and 1108.3 GFLOP/s at 1, 2, 4 and 8 threads, saturating at 2.2 times one thread; Apple publishes no AMX unit count"
+
+[facts.compute.performance_core_count]
+value = 8
+unit = "count"
+origin = "measured"
+source = "sysctl(8)"
+conditions = "sysctl hw.perflevel0.physicalcpu"
+
+[facts.compute.efficiency_core_count]
+value = 4
+unit = "count"
+origin = "measured"
+source = "sysctl(8)"
+conditions = "sysctl hw.perflevel1.physicalcpu"
+
+[facts.memory.l1d.per_performance_core]
+value = 131072
+unit = "byte"
+origin = "measured"
+source = "sysctl(8)"
+conditions = "128 KiB from sysctl hw.perflevel0.l1dcachesize; the unqualified hw.l1dcachesize reports the efficiency core's 64 KiB instead"
+
+[facts.memory.l1d.per_efficiency_core]
+value = 65536
+unit = "byte"
+origin = "measured"
+source = "sysctl(8)"
+conditions = "64 KiB from sysctl hw.perflevel1.l1dcachesize"
+
+[facts.memory.l2.per_performance_cluster]
+value = 16777216
+unit = "byte"
+origin = "measured"
+source = "sysctl(8)"
+conditions = "16 MiB from sysctl hw.perflevel0.l2cachesize; shared by the performance cluster, not private to a core"
+
+[facts.memory.l2.per_efficiency_cluster]
+value = 4194304
+unit = "byte"
+origin = "measured"
+source = "sysctl(8)"
+conditions = "4 MiB from sysctl hw.perflevel1.l2cachesize; the unqualified hw.l2cachesize reports this efficiency value instead"
+
+[facts.memory.cache_line]
+value = 128
+unit = "byte"
+origin = "measured"
+source = "sysctl(8)"
+conditions = "sysctl hw.cachelinesize"
+
+[facts.memory.unified.capacity]
+value = 34359738368
+unit = "byte"
+origin = "measured"
+source = "sysctl(8)"
+conditions = "32 GiB from sysctl hw.memsize"
+
+[facts.memory.unified.owner]
+value = "target"
+unit = "name"
+origin = "derived"
+source = "sysctl(8)"
+conditions = "the unified-memory capacity is one pool shared by all execution units of this single-device target"
+
+[facts.memory.unified.bandwidth]
+value = 200000000000
+unit = "byte/s"
+origin = "vendor"
+source = "Apple M2 Pro product specification"
+conditions = "published 200 GB/s peak, decimal; not measured on this host"
+
+[facts.throughput.amx.f32]
+value = 504900000000
+unit = "flop/s"
+origin = "measured"
+source = "AMX f32 GEMM benchmark on the host"
+conditions = "504.9 GFLOP/s for one AMX unit; M=N=K=512 f32 GEMM with Z-resident accumulation, single thread, warmed, best of five rounds"
+
+[facts.throughput.neon.f32]
+value = 107700000000
+unit = "flop/s"
+origin = "measured"
+source = "NEON f32 GEMM benchmark on the host"
+conditions = "107.7 GFLOP/s for one performance core, single thread; M=N=K=512 f32 GEMM under a 4x16 micro-kernel, panels pre-packed so the figure is the atom issue rate and not a packing cost, warmed, best of five rounds; result exact against Accelerate cblas_sgemm"
+
+[facts.geometry.neon_f32_outer_product]
+value = "4x4"
+unit = "element"
+origin = "derived"
+source = "Arm A64 instruction set, FMLA (by element)"
+conditions = "four FMLA vD.4s, vN.4s, vM.s[i] over four accumulator registers are the smallest whole f32 outer product NEON issues"
+
+
+[facts.performance.amx.f16]
+value = 504869155110
+unit = "flop/s"
+origin = "estimated"
+source = "throughput.amx.f32 in this document; https://github.com/corsix/amx/issues/6#issuecomment-1477016531"
+conditions = "M2 Pro nominal FP16-input/FP32-accumulator service estimate, anchored to this host's measured 504.9 GFLOP/s AMX F32 GEMM rate. The reference reports near-equal full-Z rates for mixed FP16 (one 4096-byte accumulator, 1636.8 GFLOP/s) and FP32 (four accumulators totaling 4096 bytes, 1636.9 GFLOP/s). Apply only that ratio: floor(504900000000 * 16368 / 16369). This is not a new M2 Pro FP16 measurement or a transfer of another chip's absolute throughput. Cluster sharing is applied by the Facts projection."
+
+[facts.performance.host.lane_events]
+value = 53850000000
+unit = "op/s"
+origin = "estimated"
+source = "throughput.neon.f32 in this document; https://github.com/corsix/amx/issues/7#issuecomment-1475996279"
+conditions = "M2 Pro optimistic CPU service model, not measured integer or transcendental throughput. Divide this host's measured 107.7 GFLOP/s NEON F32 FMA rate by two FLOPs per lane FMA: 53.85 billion lane events/s per performance core. Assign one lane event per integer, predicate, select, local-move or special-function result. The reference explains NEON lane/FMA counting, not these services' throughput. Polynomial expansion, instruction mix and Torch overhead are outside this nominal model."

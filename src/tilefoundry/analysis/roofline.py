@@ -1,0 +1,185 @@
+"""How long the requested work must take, at best.
+
+This family adds no measurement of its own. It reads the work the compute-cost
+records state and divides it by the rates the target publishes, so a change here
+can only ever be a change in how the two are combined -- never a second, subtly
+different count of the same flops.
+"""
+
+from __future__ import annotations
+
+from tilefoundry.ir.core import Call, Expr, describe_expr, get_metadata
+from tilefoundry.ir.core import attach_metadata as attach
+from tilefoundry.ir.hir.function import Function
+from tilefoundry.ir.types import DType
+from tilefoundry.visitor_registry.valuation import ValuationVisitor
+
+from .compute_cost import inflight_bytes
+from .errors import AnalysisError
+from .facts import ThroughputFacts
+from .metadata import (
+    ComputeCostMetadata,
+    MemoryMetadata,
+    RegionMemoryMetadata,
+    RooflineMetadata,
+)
+from .visitor import AnalyzeContext
+
+SELECTOR = "roofline"
+
+
+_NO_BOUND = 0
+
+
+def _totals(held) -> tuple[tuple[str, int], ...]:
+    """One typed work category's whole-program counts."""
+    return tuple((name, spread.total) for name, spread in held.kinds)
+
+
+def _compute_ns(flops: tuple[tuple[str, int], ...], facts: ThroughputFacts) -> int:
+    """Time the flops need, summed over the dtypes that have a rate.
+
+    A dtype the target publishes no rate for contributes nothing. That
+    under-reports the bound, which is the safe direction for a lower bound:
+    claiming time the hardware never promised would be worse.
+    """
+    total = 0
+    for name, value in flops:
+        if not value:
+            continue
+        dtype = getattr(DType, name, None)
+        if dtype is None:
+            raise AnalysisError(f"roofline: unknown compute dtype {name!r}")
+        rate = facts.peak_for(dtype)
+        if rate is None:
+            continue
+        total += -(-(value * 1_000_000_000) // rate)
+    return total
+
+
+def _memory_ns(crossed: int, facts: ThroughputFacts) -> int:
+    """Time the bytes at the target's bandwidth level need."""
+    if facts.memory_bandwidth_bytes_per_second is None or not crossed:
+        return _NO_BOUND
+    return -(-(crossed * 1_000_000_000) // facts.memory_bandwidth_bytes_per_second)
+
+
+def _bound(compute_ns: int, memory_ns: int, *, has_work: bool) -> RooflineMetadata:
+    """Combine the two sides into one bound and name the one that set it.
+
+    A nanosecond is owed by what this could have priced: work of a rated kind
+    whose own rate is missing reports at least one, because reporting zero for
+    it would read as free. Bytes at a level with no published bandwidth owe
+    nothing -- no rate was ever stated for them, so no floor follows.
+    """
+    ideal = max(compute_ns, memory_ns)
+    if not ideal:
+        ideal = 1 if has_work else 0
+    if not ideal:
+        bound_by = "none"
+    elif compute_ns and compute_ns == memory_ns:
+        bound_by = "balanced"
+    elif memory_ns > compute_ns:
+        bound_by = "memory"
+    elif compute_ns:
+        bound_by = "compute"
+    else:
+        bound_by = "unrated"
+    return RooflineMetadata(
+        compute_ns=compute_ns,
+        memory_ns=memory_ns,
+        ideal_ns=ideal,
+        bound_by=bound_by,
+    )
+
+
+def _cost_bound(
+    cost: ComputeCostMetadata,
+    moved: MemoryMetadata | RegionMemoryMetadata,
+    facts: ThroughputFacts,
+) -> RooflineMetadata:
+    """Bound one occurrence from the work it does and the bytes it moves.
+
+    Whole-program work against the rates of the units the program runs: the
+    flops the target publishes a peak for, and the footprint's bytes at the
+    level it publishes a bandwidth for, reads and writes as one count. Typed
+    service has no whole-device rate to divide by and so does not enter a bound,
+    and neither do bytes at a level with no published bandwidth: what asks for a
+    nanosecond is what this could have priced, so a dtype whose rate is missing
+    still owes one and a level nobody rated does not.
+    """
+    reached = moved.traffic.storage.of(facts.bandwidth_level)
+    crossed = 0 if reached is None else reached.total.total_bytes
+    unique = None if moved.footprint is None else moved.footprint.bytes_at(facts.bandwidth_level)
+    crossed = crossed if unique is None else unique[1]
+    return _bound(
+        _compute_ns(_totals(cost.flops), facts),
+        _memory_ns(crossed, facts),
+        has_work=bool(any(value for _name, value in _totals(cost.flops)) or crossed),
+    )
+
+
+class RooflineVisitor(ValuationVisitor[None]):
+    """Attach one bound per Call in expression order.
+
+    Each Call is priced for the bytes it keeps in flight; the Function, for the
+    most any of its own Calls keeps, which keeps its bound a lower bound. A call
+    into another definition is not an access: that definition prices its own.
+    """
+
+    def __init__(self, query) -> None:
+        super().__init__()
+        self.query, self.inflight = query, 0
+
+    def facts(self, ctx: AnalyzeContext, inflight: int | None) -> ThroughputFacts:
+        query = None if self.query is None else (*self.query, inflight)
+        return ctx.target.get_facts(ThroughputFacts, query)
+
+    def default_visit_leaf(
+        self, expr: Expr, _operands: tuple[None, ...], ctx: AnalyzeContext
+    ) -> None:
+        if not isinstance(expr, Call):
+            return
+        cost = get_metadata(expr, ComputeCostMetadata)
+        if cost is None:
+            raise AnalysisError(
+                f"{describe_expr(expr)}: roofline needs the compute-cost record "
+                "this call was never given"
+            )
+        moved = get_metadata(expr, MemoryMetadata)
+        if moved is None:
+            raise AnalysisError(
+                f"{describe_expr(expr)}: roofline needs the traffic record the "
+                "memory family states for every call it measures"
+            )
+        level = ctx.target.get_facts(ThroughputFacts).bandwidth_level
+        callee = ctx._callee_context(expr) is not None
+        inflight = None if callee else inflight_bytes(expr, ctx.scope, ctx.target, level)
+        self.inflight = max(self.inflight, inflight or 0)
+        attach(expr, _cost_bound(cost, moved, self.facts(ctx, inflight)))
+
+
+def analyze_roofline(
+    function: Function,
+    context: AnalyzeContext,
+) -> None:
+    """Attach a bound to every Call and the normalized Function."""
+    unit = context.topology_level
+    visitor = RooflineVisitor(None if unit is None else (unit, context.scope.active_positions(unit)))
+    visitor.visit(function.body, context)
+    total = get_metadata(function, ComputeCostMetadata)
+    if total is None:
+        raise AnalysisError(
+            f"function {function.name!r}: roofline needs the compute-cost root "
+            "record this function was never given"
+        )
+    moved = get_metadata(function, RegionMemoryMetadata)
+    if moved is None:
+        raise AnalysisError(
+            f"function {function.name!r}: roofline needs the traffic root record "
+            "the memory family states for every function it measures"
+        )
+    attach(function, _cost_bound(total, moved, visitor.facts(context, visitor.inflight)))
+
+
+__all__ = ["SELECTOR", "analyze_roofline"]

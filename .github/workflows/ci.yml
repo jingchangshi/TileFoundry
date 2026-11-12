@@ -1,0 +1,159 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  id-token: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ci:
+    runs-on: [self-hosted, tilefoundry]
+    container: tilefoundry-ci-runner:local
+    env:
+      UV_CACHE_DIR: /__w/uv-cache
+      UV_NO_PROGRESS: "1"
+      TILEFOUNDRY_CACHE_DIR: /__w/tf-cache
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keep pull requests from writing the shared caches
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "CCACHE_READONLY=1" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/torch_extensions"
+          if [ -d "$TILEFOUNDRY_CACHE_DIR/torch_extensions" ]; then
+            cp -a "$TILEFOUNDRY_CACHE_DIR/torch_extensions/." "$RUNNER_TEMP/torch_extensions/"
+          fi
+          echo "TORCH_EXTENSIONS_DIR=$RUNNER_TEMP/torch_extensions" >> "$GITHUB_ENV"
+      - name: Prepare the project environment
+        run: |
+          mkdir -p test_results
+          uv venv --clear --no-project --python /usr/local/bin/python3.12 .venv
+          uv pip compile --quiet --extra test --extra dev --generate-hashes \
+            --python .venv/bin/python pyproject.toml \
+            -o test_results/requirements.txt
+          uv pip compile --quiet --generate-hashes \
+            --python .venv/bin/python pyproject.toml \
+            -o test_results/requirements-runtime.txt
+          uv pip sync --python .venv/bin/python \
+            --require-hashes test_results/requirements.txt
+          editable=(--editable .)
+          for project in targets/*/; do editable+=(--editable "$project"); done
+          uv pip install --python .venv/bin/python \
+            --no-deps --no-build-isolation "${editable[@]}"
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$PWD/.venv/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+      - name: Run pre-commit
+        run: pre-commit run --all-files
+      - name: Link CUTLASS headers
+        run: |
+          mkdir -p third_party/cutlass
+          ln -sfnT /opt/cutlass/include third_party/cutlass/include
+      - name: Run tests
+        env:
+          COVERAGE_FILE: test_results/.coverage
+          CCACHE_STATSLOG: ${{ runner.temp }}/ccache-stats.log
+        run: |
+          pytest tests/ -n 8 \
+            --cov \
+            --cov-report=xml:test_results/coverage-source.xml --cov-report=
+      - name: Report compile cache use
+        if: always()
+        env:
+          CCACHE_STATSLOG: ${{ runner.temp }}/ccache-stats.log
+        run: ccache --dir "$TILEFOUNDRY_CACHE_DIR/ccache" --show-log-stats
+      - name: Build the distributions
+        run: |
+          for project in . targets/*/; do
+            uv build --out-dir "$RUNNER_TEMP/wheel" "$project"
+          done
+      - name: Install the wheel into a clean environment
+        run: |
+          uv venv --clear --no-project --python /usr/local/bin/python3.12 .wheel-venv
+          uv pip sync --python .wheel-venv/bin/python \
+            --require-hashes test_results/requirements-runtime.txt
+          uv pip install --python .wheel-venv/bin/python \
+            --no-deps "$RUNNER_TEMP"/wheel/tilefoundry*.whl
+      - name: Verify the installed surface
+        run: |
+          export LD_LIBRARY_PATH="$PWD/.wheel-venv/lib:$LD_LIBRARY_PATH"
+          uv pip install --python .wheel-venv/bin/python --no-deps \
+            --constraint test_results/requirements.txt coverage pytest-cov
+          package_sources=("$PWD/src/tilefoundry" "$PWD"/targets/*/tilefoundry_*)
+          {
+            cat <<EOF
+          [run]
+          branch = False
+          core = sysmon
+          parallel = True
+          source =
+          EOF
+            for package in "${package_sources[@]}"; do
+              if [[ -f "$package/__init__.py" ]]; then
+                printf '    %s\n' "${package##*/}"
+              fi
+            done
+            cat <<EOF
+          data_file = $PWD/test_results/.coverage-installed
+
+          [paths]
+          EOF
+            for package in "${package_sources[@]}"; do
+              if [[ -f "$package/__init__.py" ]]; then
+                printf '%s =\n    %s\n    %s/lib/*/site-packages/%s\n' \
+                  "${package##*/}" "$package" "$PWD/.wheel-venv" "${package##*/}"
+              fi
+            done
+          } > test_results/coveragerc-installed
+          COVERAGE_PROCESS_START="$PWD/test_results/coveragerc-installed" \
+            TF_SMOKE_VENV="$PWD/.wheel-venv" \
+            pytest tests/core/installed tests/*/*/installed -o python_files='smoke_*.py' -q -n 8
+          coverage combine --rcfile=test_results/coveragerc-installed
+          coverage xml --rcfile=test_results/coveragerc-installed \
+            -o test_results/coverage-installed.xml
+      - name: Decode the published checkpoint with the shipped source
+        run: |
+          export LD_LIBRARY_PATH="$PWD/.wheel-venv/lib:$LD_LIBRARY_PATH"
+          .wheel-venv/bin/python tests/nvidia/cuda/installed/qwen3_1_7b_l3.py \
+            --venv "$PWD/.wheel-venv" \
+            --work "$RUNNER_TEMP/l3"
+      - name: Publish the coverage report
+        if: always()
+        run: |
+          if [ -f test_results/.coverage ]; then
+            coverage html -d test_results/htmlcov \
+              --data-file=test_results/.coverage
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: test_results/
+          if-no-files-found: ignore
+      - uses: codecov/codecov-action@v5
+        if: always() && !github.event.pull_request.head.repo.fork && hashFiles('test_results/coverage-source.xml') != ''
+        with:
+          use_oidc: true
+          files: test_results/coverage-source.xml
+          flags: source
+          disable_search: true
+      - uses: codecov/codecov-action@v5
+        if: always() && !github.event.pull_request.head.repo.fork && hashFiles('test_results/coverage-installed.xml') != ''
+        with:
+          use_oidc: true
+          files: test_results/coverage-installed.xml
+          flags: installed
+          disable_search: true
