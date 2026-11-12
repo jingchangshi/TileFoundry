@@ -1,10 +1,15 @@
 # TileFoundry Ascend 950PR — clean handoff
 
 ## Source
-- Source worktree: /home/s00653124/workspace/TileFoundry_native_mainline
-- Source commit: 964ebb034f34ecbda312b2ef319320f7fdec26e9
+- Source snapshot: commit 964ebb034f34ecbda312b2ef319320f7fdec26e9; the old source worktree was removed after handoff.
 - This directory is a standalone snapshot with a new git history; it has no old TileFoundry branch or worktree history.
 - Generated from the commit above; old compatibility/defensive/historical archive directories are excluded.
+
+## Cleanup performed
+- Removed old TileFoundry worktrees including native_v3, native_mainline, main_review, p3_02, task71/80/85/92 validation, task113 baseline and /tmp worktrees.
+- Deleted old feature branches: feat/ascend950pr-native-mainline, feat/ascend950pr-native-mainline-local, feat/ascend950pr-native-v3, feat/p3-02-resolve-schedule, feat/tf-ascend950pr.
+- The original TileFoundry repository now retains only its main branch; do not use it as the new workspace.
+- New work should start in this handoff directory (branch main, tag handoff-20261112).
 
 ## Current status
 - Cleanup state: fail-closed export/install gate verified by independent reviewer and challenger probes.
