@@ -242,10 +242,80 @@ PER_CASE_ACCUMULATOR_CONTRACT = {
 }
 
 
+#: --------------------------------------------------------- event-domain contracts
+#:
+#: The TF-side completion ops are declared in src/tilefoundry/ir/tir/flag.py:
+#: FlagSet ("T.flag_set"), FlagWait ("T.flag_wait") and Drain ("T.drain"), whose
+#: parameters are ALL attributes (channel_name/kind/slot/generation/versions/
+#: flag_id/producer_pipe/consumer_pipe); Drain carries none. pipe_barrier and
+#: threadfence have NO TF op in this tree - only the TileLang language surface
+#: exposes them (ascend_pipe_barrier/ascend_threadfence), so their rows are
+#: declared here as the contract the emitter must satisfy, and step 2 of the
+#: event slice decides whether they are reachable at all.
+#:
+#: They carry NO data operands, so an event contract's resource is the EVENT
+#: NAMESPACE, named by obligation kind exactly as the target declares its pools
+#: (completion/model.py: EventPool(core_domain, kind, pipe_pair, banks)). The
+#: HARD per-pipe-pair flags are declared separately in hard_event_pools with
+#: bank_status=UNRESOLVED, so they are NOT used as a capacity here.
+#:
+#: latency_model/ii_model are deliberately None. The target declares no event
+#: cost model; a None is a refusal in plan/delays.py, never a silent 0 or 1,
+#: and none of these rows is a performance claim.
+_EVENT_ROWS = (
+    ("flag_set", "event_ready", "issue+state_complete",
+     "publish one slot's data generation (READY) or one maximal last reader (FREE)"),
+    ("flag_wait", "event_ready", "issue+data_ready",
+     "consume one declared handoff before reading or before overwriting"),
+    ("pipe_barrier", "event_state", "issue+state_complete",
+     "order the rest of one pipe inside this instance (TF op MISSING)"),
+    ("threadfence", "event_state", "issue+state_complete",
+     "order writes for visibility across pipes (TF op MISSING)"),
+    ("drain", "event_exit", "issue+state_complete",
+     "region exit: nothing may remain outstanding past this point"),
+)
+
+for _name, _resource, _completion, _domain in _EVENT_ROWS:
+    ISA[_name] = _c(
+        name=_name, category="sync", operands=(),
+        compute_domain=_domain, elem_width_bits=None, required_region="outside",
+        core_affinity="aiv", resource=_resource, completion=_completion,
+        result="event",
+        semantics="completion signalling only; no data operand, no performance "
+                  "figure; channel/slot/generation are attributes the completion "
+                  "plan resolves from the same ResolvedPlan",
+    )
+
+#: The event-domain names, so a consumer can tell an event contract from a data
+#: contract without re-reading the table.
+EVENT_CONTRACT_NAMES = tuple(row[0] for row in _EVENT_ROWS)
+
+
 def contract(name: str) -> InstructionContract:
     if name not in ISA:
         raise KeyError(f"no instruction contract {name!r}")
     return ISA[name]
+
+
+def event_contract_of(op) -> InstructionContract:
+    """The event-domain contract of a REAL sync Op instance or class.
+
+    The data-side helper isa_contract_of() keys on the ascend_* instruction
+    names; a sync op's registered schema name is flag_set/flag_wait/drain, so
+    it would KeyError there. This is the matching accessor for the event rows:
+    the schema name is looked up, and only a SYNC-category op is accepted - a
+    data instruction with an event-shaped name is refused rather than merged.
+    """
+    schema = getattr(op, "_op_schema", None) or getattr(type(op), "_op_schema", None)
+    name = getattr(schema, "name", "") if schema is not None else ""
+    category = getattr(schema, "category", "") if schema is not None else ""
+    if not name:
+        raise KeyError("op carries no registered schema name, so no event contract "
+                       "can be stated for it")
+    if category != "sync":
+        raise KeyError("instruction %r is category %r; only a sync op carries an "
+                       "event contract" % (name, category))
+    return contract(name)
 
 
 def reduction_order_for_contract(instruction: InstructionContract) -> str:

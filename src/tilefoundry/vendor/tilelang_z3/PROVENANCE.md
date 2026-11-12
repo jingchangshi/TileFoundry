@@ -50,3 +50,29 @@ fallback distinct, core.py adds these opt-in changes:
 These extensions are CPU planning-only. They do not claim device, P5, performance or
 native credit. Architect 04-10's PASS was bound to 2e938af; this extension is a new
 commit and must be reviewed on its own evidence.
+
+
+## Provenance event 2 (2026-11-12, native mainline): the vendored slice was replaced
+
+The mainline no longer carries the upstream `z3_scheduler.py` line slice described in
+the table above. `core.py` was rewritten as the contract-level constraint core for the
+frozen native mainline: stage/phase/II time model, data/state edges, slot reuse with
+(authored) Fixed or Auto version domains, resource ring occupancy, per-owner capacity,
+emission order, and an independent integer postcheck that does not reuse the Z3
+constraint objects.
+
+What this means for the rules above:
+
+- Rule 1 still holds: one core, both projections (`adapters.tf_adapter`/`tl_adapter`).
+- Rule 2 changes: there is no upstream body left to re-extract, so the upstream sha256
+  rows above describe the *historical* vendoring, not the current file. A future return
+  to the upstream slice would be a new provenance event, recorded here.
+- Rule 3 still holds: importing this package imports no torch/torch_npu/tilelang/tvm_ffi.
+
+Current content identity (compute with `core.core_source_sha256()`): the value at the
+time of this record is `ea900772` (16 hex prefix); refresh it here whenever core.py
+changes shape, and never as a silent edit.
+
+The 04-07/08 extension notes below are kept for history: the fixed-buffer-version
+equality requirement they describe is met by the new core's `Buffer.fixed` constraint.
+

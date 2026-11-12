@@ -93,7 +93,12 @@ _ATTRS = dict(
 class FlagSet(Op):
     """Producer SETs a completion flag for a buffer slot at a generation."""
 
-    execution_mesh = utils.thread_execution_mesh()
+    # The execution domain is the TARGET's, resolved from its own
+    # MemoryExecutionFacts. thread_execution_mesh() hard-coded the topology name
+    # "thread", the one place this module broke the target-agnostic contract its
+    # own docstring states; on Ascend that made every event op fail the kernel
+    # frame's aiv mesh with a declaration error rather than a program error.
+    execution_mesh = utils.memory_execution_mesh()
 
     channel_name = _ATTRS["channel_name"]
     kind = _ATTRS["kind"]
@@ -109,7 +114,7 @@ class FlagSet(Op):
 class FlagWait(Op):
     """Consumer WAITs for a completion flag on a buffer slot at a generation."""
 
-    execution_mesh = utils.thread_execution_mesh()
+    execution_mesh = utils.memory_execution_mesh()
 
     channel_name = _ATTRS["channel_name"]
     kind = _ATTRS["kind"]
@@ -125,7 +130,7 @@ class FlagWait(Op):
 class Drain(Op):
     """Final completion barrier: nothing may be outstanding past this point."""
 
-    execution_mesh = utils.thread_execution_mesh()
+    execution_mesh = utils.memory_execution_mesh()
 
 
 @register_access_relation(FlagSet)

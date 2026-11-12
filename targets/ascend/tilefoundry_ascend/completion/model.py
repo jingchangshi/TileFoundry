@@ -476,6 +476,29 @@ class TargetEventFacts:
                 "hard_event_pools": [pool.as_dict() for pool in self.hard_event_pools]}
 
 
+def declared_core(facts, core, where):
+    """The EXACT core-domain spelling the target declares, or a named refusal.
+
+    Hard-event pools are keyed by the target's own core-domain strings. Asking
+    for one with a hand-cased token (.upper()/.lower() at a call site) is how a
+    capacity check quietly stops checking: if a declared domain were spelled
+    differently, the lookup returns None and a caller that reads None as "no
+    limit" would emit flag ids the hardware does not have. So every pool lookup
+    resolves through the declarations, and an unresolvable core is refused by
+    name with the declared spellings shown.
+    """
+    wanted = str(core)
+    for domain in facts.core_domains:
+        if str(domain).lower() == wanted.lower():
+            return str(domain)
+    raise CompletionError(
+        "COMPLETION_TARGET_UNKNOWN",
+        "no core domain %r is declared by the target (%s), so its event pool cannot "
+        "be resolved at %s" % (wanted, [str(d) for d in facts.core_domains], where),
+        expected=[str(d) for d in facts.core_domains],
+        actual=wanted)
+
+
 #: The declared 950PR event surface.
 #:
 #: The capacities are a DECLARED BOUND from this round's target record, not a measurement of
@@ -558,7 +581,8 @@ __all__ = [
     "KIND_CROSS", "OBLIGATION_KINDS", "CompletionError", "digest", "UseInterval", "Use",
     "Obligation", "EventPool", "EventNamespace", "TargetEventFacts",
     "HardEventPoolFacts", "PhysicalEventNamespace",
-    "PIPE_FACTS", "is_async_pipe", "core_for_pipe", "same_pipe_fifo_order",
+    "PIPE_FACTS", "declared_core", "is_async_pipe", "core_for_pipe",
+    "same_pipe_fifo_order",
     "ASCEND_EVENT_FACTS", "event_facts_for", "physical_event_namespace_for",
     "STATUS_REFERENCE_IMPLEMENTATION", "STATUS_DEVICE_VALIDATED", "STATUS_UNRESOLVED",
 ]
