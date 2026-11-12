@@ -1,11 +1,13 @@
 """Bounded subprocesses for compiler/search workers; never fork a live NPU runtime."""
 from dataclasses import dataclass
+import json
 import math
 import os
 from pathlib import Path
 import signal
 import subprocess
 import time
+import uuid
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,52 @@ class ProcessResult:
         if self.returncode:
             return "COMPILE_FAILED" if self.stage == "compile" else "RUN_ERROR"
         return "OK"
+
+
+@dataclass(frozen=True)
+class WorkerCommand:
+    """An exec worker, never a Python callback or a fork of the caller runtime.
+
+    The worker writes a fresh JSON object to result_path. Check stages return
+    {"failure": null|string}; profile returns samples_us, discarded_warmups,
+    measurement_source and (for device samples) a nonempty sync_note. Commands
+    share artifacts via explicit paths in argv, not live Python/NPU objects.
+    Every result must echo run_id, stage and identity_key supplied through the
+    TF_SEARCH_RUN_ID/STAGE/IDENTITY_KEY environment; TF_SEARCH_RESULT_PATH is the
+    absolute output path. No implicit compile cache is used by this protocol.
+    Logs and JSON results must use different paths. The caller owns device locks.
+    """
+    argv: tuple
+    log_path: str
+    result_path: str
+    cwd: str = None
+    env: dict = None
+
+    def execute(self, *, stage, timeout_s, deadline, settings):
+        path = Path(self.result_path)
+        if path.resolve() == Path(self.log_path).resolve():
+            raise ValueError("worker log and result paths must differ")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.unlink(missing_ok=True)  # Never accept a previous invocation's receipt.
+        env = dict(os.environ if self.env is None else self.env)
+        env.update(settings)
+        run_id = uuid.uuid4().hex
+        env["TF_SEARCH_RUN_ID"] = run_id
+        env["TF_SEARCH_STAGE"] = stage
+        env["TF_SEARCH_RESULT_PATH"] = str(path.resolve())
+        result = run_process(self.argv, stage=stage, timeout_s=timeout_s,
+                             log_path=self.log_path, deadline=deadline,
+                             cwd=self.cwd, env=env)
+        if result.status != "OK":
+            return result, None
+        with path.open() as stream:
+            payload = json.load(stream)
+        if not isinstance(payload, dict):
+            raise ValueError("worker result must be a JSON object")
+        if (payload.get("run_id") != run_id or payload.get("stage") != stage
+                or payload.get("identity_key") != settings["TF_SEARCH_IDENTITY_KEY"]):
+            raise ValueError("worker receipt does not match this invocation and identity")
+        return result, payload
 
 
 class Deadline:
@@ -47,8 +95,8 @@ def run_process(command, *, stage, timeout_s, log_path, deadline=None, cwd=None,
     flock for device workers; a suspected device hang must stop the search. A caller
     must never use this helper to signal an existing/unrelated process.
     """
-    if stage not in ("compile", "candidate", "oracle"):
-        raise ValueError("stage must be compile, candidate or oracle")
+    if stage not in ("compile", "candidate", "oracle", "numeric", "launch", "profile"):
+        raise ValueError("unknown worker stage")
     if not command or isinstance(command, (str, bytes)):
         raise ValueError("command must be a nonempty argv sequence")
     if not math.isfinite(timeout_s) or timeout_s <= 0:

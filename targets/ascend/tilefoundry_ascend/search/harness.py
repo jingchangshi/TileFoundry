@@ -36,11 +36,16 @@ import os
 import platform
 import statistics
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
 from . import filter as flt
 from . import generator as gen
+from .process import Deadline, WorkerCommand
+
+
+_case_deadline = ContextVar("search_case_deadline", default=None)
 
 # ------------------------------------------------------------------ statuses
 
@@ -505,7 +510,9 @@ def pruned_result(judgement, *, operator: str = "") -> CandidateResult:
 
 @dataclass(frozen=True)
 class CandidateRun:
-    """What a candidate has to prove before it may be timed, as one injectable contract.
+    """CPU simulated callback contract; device execution requires WorkerCandidateRun.
+
+    Callbacks cannot be forcibly interrupted and are intended only for bounded CPU tests.
 
     The order is spec 08 section 8.4's order and is not negotiable: compile (with a total
     deadline), final legality, the ORIGINAL numeric comparator, the single-launch contract, and
@@ -528,6 +535,86 @@ class CandidateRun:
                                    name, "a callable", getattr(self, name, None))
 
 
+@dataclass(frozen=True)
+class WorkerCandidateRun:
+    """Four enforced argv stages; profile owns warmup and synchronized sampling.
+
+    TF_SEARCH_WARMUP_CALLS, TF_SEARCH_TIMING_CALLS_PER_BATCH and
+    TF_SEARCH_CONFIRMATION_BATCHES tell the profile worker the required counts.
+    Device workers must be launched by a caller holding the device lock.
+    """
+    compile: WorkerCommand
+    numeric: WorkerCommand
+    launch: WorkerCommand
+    profile: WorkerCommand
+    measurement_source: str = MEASUREMENT_SOURCE_DEVICE
+
+    def check(self):
+        for name in ("compile", "numeric", "launch", "profile"):
+            if not isinstance(getattr(self, name), WorkerCommand):
+                raise HarnessError("RUN_CONTRACT_INCOMPLETE", "an argv worker is required", name)
+        if self.measurement_source not in (MEASUREMENT_SOURCE_DEVICE, MEASUREMENT_SOURCE_SIMULATED):
+            raise HarnessError("RUN_BAD_SOURCE", "unknown measurement source")
+
+
+def _run_worker_candidate(contract, base, budget, limit, deadline):
+    compile_seconds = 0.0
+    base = dict(base, measurement_source=contract.measurement_source)
+    settings = {"TF_SEARCH_" + name.upper(): str(getattr(budget, name)) for name in
+                ("warmup_calls", "timing_calls_per_batch", "confirmation_batches")}
+    settings["TF_SEARCH_IDENTITY_KEY"] = base["identity_key"]
+    payload = {}
+    for stage in ("compile", "numeric", "launch", "profile"):
+        timeout_status = COMPILE_TIMEOUT if stage == "compile" else RUN_TIMEOUT
+        error_status = COMPILE_FAILED if stage == "compile" else RUN_ERROR
+        started = time.monotonic()
+        try:
+            if deadline.remaining() <= 0:
+                return CandidateResult(status=timeout_status, compile_seconds=compile_seconds,
+                                       reason="SHARED_DEADLINE_EXCEEDED", detail=stage, **base)
+            result, payload = getattr(contract, stage).execute(
+                stage=stage, timeout_s=limit if stage == "compile" else budget.case_search_deadline_s,
+                deadline=deadline, settings=settings)
+            if stage == "compile":
+                compile_seconds = result.elapsed_seconds
+            if result.status != OK:
+                return CandidateResult(status=result.status, compile_seconds=compile_seconds,
+                                       reason="WORKER_" + result.status,
+                                       detail=stage + ": " + result.log_path, **base)
+            if deadline.remaining() <= 0:
+                return CandidateResult(status=timeout_status, compile_seconds=compile_seconds,
+                                       reason="SHARED_DEADLINE_EXCEEDED", detail=stage, **base)
+            if stage != "profile":
+                failure = payload["failure"]
+                if failure is not None and not isinstance(failure, str):
+                    raise ValueError("failure must be null or a string")
+                if failure is not None:
+                    status = {"compile": COMPILE_FAILED, "numeric": NUMERIC_FAILED,
+                              "launch": LAUNCH_CONTRACT_VIOLATED}[stage]
+                    return CandidateResult(status=status, compile_seconds=compile_seconds,
+                                           reason=stage.upper() + "_REJECTED", detail=failure, **base)
+            else:
+                if payload["measurement_source"] != contract.measurement_source:
+                    raise ValueError("worker measurement source mismatch")
+                if (contract.measurement_source == MEASUREMENT_SOURCE_DEVICE
+                        and not str(payload.get("sync_note", "")).strip()):
+                    raise ValueError("device worker must describe synchronized calibrated timing")
+                if payload["discarded_warmups"] != budget.warmup_calls:
+                    raise ValueError("worker warmup count mismatch")
+                if len(payload["samples_us"]) != (budget.timing_calls_per_batch *
+                                                  budget.confirmation_batches):
+                    raise ValueError("worker sample count mismatch")
+                stats = compute_stats(payload["samples_us"], discarded_warmups=budget.warmup_calls)
+        except Exception as exc:
+            if stage == "compile":
+                compile_seconds = time.monotonic() - started
+            return CandidateResult(status=error_status, compile_seconds=compile_seconds,
+                                   reason="WORKER_PROTOCOL_ERROR", detail=stage + ": " + str(exc),
+                                   **base)
+    return CandidateResult(status=OK, compile_seconds=compile_seconds, stats=stats,
+                           **base)
+
+
 def _timed(callable_):
     """Return (value, seconds) for one call, used only for COMPILE time, never for the kernel."""
     start = time.perf_counter()
@@ -536,7 +623,8 @@ def _timed(callable_):
 
 
 def run_candidate(contract: CandidateRun, identity: CacheIdentity, *, budget: Budget = P0_BUDGET,
-                  timer=None, deadline_s: Optional[float] = None) -> CandidateResult:
+                  timer=None, deadline_s: Optional[float] = None,
+                  deadline: Optional[Deadline] = None) -> CandidateResult:
     """Compile, verify, check the launch contract, then time one candidate.
 
     A failure at any stage short-circuits: a candidate that failed the original comparator is
@@ -550,6 +638,23 @@ def run_candidate(contract: CandidateRun, identity: CacheIdentity, *, budget: Bu
                 family=identity.precision_policy, origin="", identity_key=identity.key(),
                 lower_bound_only=True)
 
+    # The implicit case deadline preserves existing two-argument run_one callbacks.
+    # Explicit deadlines can only tighten the case budget, never replace it.
+    inherited = _case_deadline.get()
+    active = Deadline(budget.case_search_deadline_s)
+    for shared in (inherited, deadline):
+        if shared is not None:
+            active.expires = min(active.expires, time.monotonic() + shared.remaining())
+    if isinstance(contract, WorkerCandidateRun):
+        return _run_worker_candidate(contract, dict(base, plan_digest=identity.plan_digest),
+                                     budget, limit, active)
+    if not isinstance(timer, SimulatedClock) or timer.source != MEASUREMENT_SOURCE_SIMULATED:
+        return CandidateResult(status=RUN_ERROR, reason="ENFORCED_WORKER_REQUIRED",
+                               detail="device execution requires WorkerCandidateRun argv stages",
+                               measurement_source=getattr(timer, "source", "UNKNOWN"), **base)
+    # Legacy callbacks are CPU simulation only, with cooperative stage checks.
+    if active.remaining() <= 0:
+        return CandidateResult(status=COMPILE_TIMEOUT, reason="SHARED_DEADLINE_EXCEEDED", **base)
     compiled, compile_seconds = _timed(contract.compile)
     if compile_seconds > limit:
         return CandidateResult(status=COMPILE_TIMEOUT, compile_seconds=compile_seconds,
@@ -734,12 +839,15 @@ def search_case(*, case_label: str, operator: str, seeds: Sequence, advanced: Se
                            "max_candidates", ">= 1", budget.max_candidates)
     results = []
     seen = set()
-    expires = time.monotonic() + budget.deadline_s
+    deadline = Deadline(budget.deadline_s)
     deadline_exhausted = False
+    device_stopped = False
 
     def admit(candidate, origin_label):
-        nonlocal deadline_exhausted
-        if time.monotonic() >= expires:
+        nonlocal deadline_exhausted, device_stopped
+        if device_stopped:
+            return False
+        if deadline.remaining() <= 0:
             deadline_exhausted = True
             return False
         key = candidate.key()
@@ -752,8 +860,18 @@ def search_case(*, case_label: str, operator: str, seeds: Sequence, advanced: Se
         if not judgement.feasible:
             results.append(pruned_result(judgement, operator=operator))
             return True
-        result = run_one(candidate, judgement)
+        if deadline.remaining() <= 0:
+            deadline_exhausted = True
+            return False
+        token = _case_deadline.set(deadline)
+        try:
+            result = run_one(candidate, judgement)
+        finally:
+            _case_deadline.reset(token)
         results.append(result)
+        if (result.measurement_source == MEASUREMENT_SOURCE_DEVICE
+                and result.status in (COMPILE_TIMEOUT, RUN_TIMEOUT)):
+            device_stopped = True
         return True
 
     spent_seeds = 0
@@ -771,7 +889,7 @@ def search_case(*, case_label: str, operator: str, seeds: Sequence, advanced: Se
 
     rounds = 1
     stop_reason = ""
-    if make_neighbours is not None:
+    if make_neighbours is not None and not device_stopped and deadline.remaining() > 0:
         incumbents = top_k(results, search_budget.top_k_for_refinement)
         if incumbents:
             by_key = {c.key(): c for c in list(seeds) + list(advanced)}
@@ -796,7 +914,9 @@ def search_case(*, case_label: str, operator: str, seeds: Sequence, advanced: Se
     if len(results) >= budget.max_candidates:
         stop_reason += ("; stopped at the per-case candidate cap of %d"
                         % budget.max_candidates)
-    if deadline_exhausted or time.monotonic() >= expires:
+    if device_stopped:
+        stop_reason += "; stopped after device worker timeout; device health review required"
+    if deadline_exhausted or deadline.remaining() <= 0:
         stop_reason += "; stopped at the per-case wall deadline"
     ranking = rank(results, budget=search_budget)
     return SearchRound(case_label=case_label, operator=operator, budget=budget,
@@ -837,6 +957,6 @@ __all__ = [
     "HarnessError", "Budget", "CaseBudget", "P0_BUDGET", "CacheIdentity", "source_digest",
     "plan_digest", "toolchain_identity", "Stats", "compute_stats", "SimulatedClock",
     "DeviceTimer", "DeviceTimerUnavailable", "CandidateResult", "pruned_result", "CandidateRun",
-    "run_candidate", "Ranking", "rank", "confirmation_required", "SearchRound", "top_k",
+    "WorkerCandidateRun", "WorkerCommand", "run_candidate", "Ranking", "rank", "confirmation_required", "SearchRound", "top_k",
     "expand_neighbourhood", "search_case", "summarise_rounds",
 ]
