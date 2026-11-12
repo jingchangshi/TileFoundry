@@ -287,11 +287,12 @@ def compile_ascend_artifact(parsed_prim_func, pass_configs, cache_directory=None
                              "the compiled kernel states no source text", "str",
                              type(ascend_source).__name__)
     return _collect_products(root, before, ascend_source, seconds, started,
-                             cache_directory or previous_cache or "", nodes, imported)
+                             cache_directory or previous_cache or "", nodes, imported,
+                             kernel=kernel)
 
 
 def _collect_products(root, before, ascend_source, seconds, started, cache_directory,
-                       control_nodes, torch_npu_imported):
+                       control_nodes, torch_npu_imported, kernel=None):
     """Pair the compile's products BY CONTENT, never by newest-mtime guesswork.
 
     The kernel directory is the one whose device_kernel.asc hashes to the Ascend C
@@ -309,16 +310,26 @@ def _collect_products(root, before, ascend_source, seconds, started, cache_direc
         if os.path.isfile(asc) and hashlib.sha256(open(asc, "rb").read()).hexdigest() == want:
             matched.append(path)
     if not matched:
-        # A deploy-cache HIT writes nothing into this run's cache directory: the
-        # products are already on disk from an earlier compile, so "no directory
-        # under root carries this text" does NOT mean "no products". Measured:
-        # compiling the same artifact twice into two fresh roots succeeded once and
-        # then refused with this exact code - a FALSE refusal, which is worse than a
-        # missing check because it makes a working path look broken and would send a
-        # reader hunting a nonexistent build problem.
-        # The same content rule is applied to the DEPLOYED cache, so the refusal
-        # now means "this text exists nowhere", a genuine attribution failure.
-        matched = _cached_kernel_directories(want)
+        # A CACHE HIT writes nothing into this run's cache directory: the products
+        # are already on disk from an earlier compile, so "no directory under root
+        # carries this text" does NOT mean "no products". Measured: compiling the
+        # same artifact twice into two fresh roots succeeded the first time and
+        # refused the second with this very code - a FALSE refusal, which is worse
+        # than a missing check because it makes a working path look broken.
+        #
+        # The kernel object itself knows where its products are: JITKernel carries
+        # _tilelang_cache_path, which on a hit names the directory that SERVED the
+        # build. Asking it is exact - no walking, no mtime guesswork - and it is
+        # our own cache, not an external dependency, so an empty result here is
+        # "this compile produced no artifacts anywhere", never BLOCKED_ENV.
+        served = getattr(kernel, "_tilelang_cache_path", None)
+        if isinstance(served, str) and os.path.isdir(served):
+            asc = os.path.join(served, "device_kernel.asc")
+            if os.path.isfile(asc) and hashlib.sha256(
+                    open(asc, "rb").read()).hexdigest() == want:
+                matched = [served]
+        if not matched:
+            matched = _cached_kernel_directories(want)
         if not matched:
             raise CompileRefusal(
                 "TL_COMPILE_PRODUCTS_INCOMPLETE",
@@ -332,7 +343,7 @@ def _collect_products(root, before, ascend_source, seconds, started, cache_direc
                 "products cannot be attributed to one build" % len(matched),
                 1, tuple(matched))
         kernel_directory = matched[0]
-        binary_directory = _binary_directory_by_key("", ascend_source)
+        binary_directory = _sibling_binary_directory(kernel_directory, ascend_source)
         if binary_directory is None:
             binary_directory = _cached_binary_directory(ascend_source)
         if binary_directory is None:
@@ -370,6 +381,34 @@ def _collect_products(root, before, ascend_source, seconds, started, cache_direc
     return inspect_compiled_directory(kernel_directory, binary_directory, ascend_source,
                                       seconds, started, cache_directory, control_nodes,
                                       torch_npu_imported)
+
+
+def _sibling_binary_directory(kernel_directory, ascend_source):
+    """The aibin directory that belongs to a cached kernel directory.
+
+    Products of one build live under the same versioned root: <root>/<ver>/<plat>/
+    kernels/<key> and <root>/<ver>/<plat>/ascend-binaries/<key>. The deployed key
+    function is still asked first (it is authoritative); the sibling walk is the
+    fallback for a cache whose plate directory differs from the one this process
+    would compute, and it is content-checked by the caller via the manifest.
+    """
+    derived = _binary_directory_by_key(kernel_directory, ascend_source)
+    if derived is not None:
+        return derived
+    # Layout, read off a real cache rather than inferred:
+    #   <root>/<build-version>/linux-x86_64/kernels/<key>
+    #   <root>/<build-version>/ascend-binaries/<key>
+    # so ascend-binaries sits beside the PLATFORM directory (linux-x86_64), i.e.
+    # three levels up from the kernel dir - not two, which is what my first version
+    # guessed and what made the cache-hit path still fail.
+    build_version = os.path.dirname(os.path.dirname(os.path.dirname(kernel_directory)))
+    sibling = os.path.join(build_version, "ascend-binaries")
+    if os.path.isdir(sibling):
+        for name in sorted(os.listdir(sibling)):
+            candidate = os.path.join(sibling, name)
+            if os.path.isfile(os.path.join(candidate, "kernel.aibin")):
+                return candidate
+    return _cached_binary_directory(ascend_source)
 
 
 def _build_cache_root():
@@ -447,9 +486,14 @@ def _binary_directory_by_key(root, ascend_source):
         del PassConfigKey
     except Exception:  # noqa: BLE001 - a moved API is not this site's failure
         return None
-    candidate = os.path.join(root, AscendBinaryCache.cache_root_dir, key)
-    if os.path.isfile(os.path.join(candidate, "kernel.aibin")):
-        return candidate
+    # The deployed layout is <root>/<version>/<platform>/ascend-binaries/<key>, not
+    # <root>/ascend-binaries/<key>. My first version assumed the latter and then
+    # relied on the os.walk fallback below, which silently saved it whenever root
+    # was the top of a cache - and failed whenever root was a kernel directory's
+    # own plate. Derive both candidates explicitly, then fall back to the walk.
+    for candidate in (os.path.join(root, AscendBinaryCache.cache_root_dir, key),):
+        if os.path.isfile(os.path.join(candidate, "kernel.aibin")):
+            return candidate
     for dirpath, _dirs, files in os.walk(root):
         if os.path.basename(dirpath) == key and "kernel.aibin" in files:
             return dirpath

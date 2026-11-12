@@ -184,3 +184,19 @@ architect 三项判定：① 主线未跑偏，但 **S0 收口标准被低估**�
 - 驳回 (b)（在 kernel frame 内再包 thread MeshScope）：会给 Ascend kernel 引入它没有的执行语义，并污染 emit/ABI 的 mesh 结构（后续要靠它核对 loop/grid frame）——为绕开声明错误而改程序形状，正是审计点名的"用绕过代替修复"。
 - 授权边界：只许改那三行 + 一条断言（三者 declared_execution_mesh(cls, Ascend950PRTarget()).topologies == ('aiv',)，且任一 target 得自己 facts 的层级）；flag.py 的 _check_common 校验逻辑不在本次裁定内。
 - 附带确认：WP2 自查两处（sync 语句不计入调度单元计数；_Compare 先剥离 sync 再比对、收集后供集合核对）方向正确，必须留成回归——事件是"计划附加"而非源克隆。
+
+## R26 本地检查点提交（用户批准）
+- 提交 e7f0ca8 "ascend: S0 native mainline through ResolvedPlan, completion, storage, emit/read"（**本地，未 push**），父提交 f341e47。
+- 内容：93 个文件、+27481/−560。范围严格限定 src/tilefoundry、targets/ascend、docs/handoff。
+- **刻意排除**：docs/mainline_validation/HANDOFF_E_ORIG_IDENTITY_ACCEPTANCE.md 与 docs/mainline_validation/run-20261112T210101+0800-task136/ —— 属已停止的并行会话产物，不由本会话提交，保持工作树原样（git status 仍显示为 untracked，2 项）。
+- 提交前实测：223 passed / 0 failed（提交后并行落盘已到 232 passed）。
+- 提交信息里写明了已建立的真实性质（delay 三态、88 字段 fail-safe 绑定、EXIT 义务独立推导、receipt 不读自报字段、gate 分层、16-bit provenance 交叉核对、离线可产 kernel.aibin）与**仍闭锁项**（install/export fail-closed、minimal_aiv 需 carried 证明、rmem 事实未声明、原 40 例 BLOCKED_DEPENDENCY），便于后续会话直接接手而不高估进度。
+
+## R27 G3 登记物独立复核（Lead 亲跑）
+- docs/handoff/COMPARATOR_THRESHOLD_REGISTRY.json（44 cases，draft=true）：
+  - 两个 sha256 与磁盘实际文件**逐字节相等**（threshold_table e347b921…、comparator ef2506bb…）。
+  - 用独立 BinOp 折叠（Constant / USub / Pow / Div）重算 44 个 case 的 source_forms → values：**0 处不一致**；dtype 分布 bfloat16 24 + float16 20，恰等于 AR bf16×17+fp16×3 / MLA fp16×15+bf16×5 / supplemental bf16×2+fp16×2 之和。
+  - line_range 正确记为 [82,132]，:133 单列为 cann_bench_fallback（此前 82-133 会把 fallback 行算进表体）；fp8_e5m2 末两档按常量 1.0 登记而非 2 的 0 次方。
+  - claims_not_made / unknowns 明写：本登记物**不认证 G3 闭合**、不声称任何原例数值通过；并保留两条 UNKNOWN（S4/S5 实际导入的是否同一份 npu_compare 未证；比较器无 __version__，只能钉 commit+sha256）。
+- 方法更正（flex-1-g1 实测，已转校验器作者）：**ast.literal_eval 读不了幂表达式**（连单个 2 的 -10 次方都抛 ValueError(malformed node / ast.BinOp)），必须 BinOp-aware 折叠。这是 registry 同时存 source_forms 与 values 两份的实际理由。
+- G3 状态：登记物就绪但**未闭合** —— 仍缺 task-52 的只读校验器正例（草案校验通过）与设备侧运行时 __file__ 与 sha256 捕获。

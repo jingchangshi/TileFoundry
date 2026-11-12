@@ -1,0 +1,1490 @@
+{
+  "schema_version": "tf-ascend.comparator-registry.v1",
+  "draft": true,
+  "registered_at_utc": "2026-11-12T23:37:28Z",
+  "operator": [
+    "attention_residual",
+    "mla"
+  ],
+  "purpose": "G3 registration artifact only: records WHICH comparator and WHICH threshold entry each case would be judged by. It does not prove that any case passed, and no numerical result is claimed here.",
+  "claims_not_made": [
+    "no case has execution_status other than NOT_RUN in the authoritative index",
+    "this registry does not certify G3 closure (that needs the read-only validator's positive run, task-52)",
+    "no threshold was chosen, edited, rounded or normalised here",
+    "no allclose substitute was introduced (CONTRACT.md:44 forbids it)"
+  ],
+  "comparator": {
+    "module_path": "/home/s00653124/workspace/BiShengKernelAgent/skills/common/ascend-npu-run-eval/scripts/npu_compare.py",
+    "sha256": "ef2506bba60a3126196f433d97a02455c96e7be9c6c689b0a7ff400b97af5211",
+    "repo_head": "5496ef6e342da64386e0dfb4f0d8b91eb3712b2f",
+    "repo_head_observation": "git rev-parse HEAD of BiShengKernelAgent at registration time; git status --porcelain empty",
+    "dispatch_sites": {
+      "imports_cann_bench": "npu_compare.py:8",
+      "accuracy_mode_branch": "npu_compare.py:37-45",
+      "dtype_close_path": "npu_compare.py:7,44-45"
+    },
+    "version_attribute": null,
+    "version_note": "the comparator scripts expose no __version__; identity is commit + sha256 only"
+  },
+  "threshold_table": {
+    "path": "/home/s00653124/workspace/BiShengKernelAgent/skills/common/ascend-npu-run-eval/scripts/cann_bench_compare.py",
+    "sha256": "e347b92141572e7c987e39296806a6483c63663e729917f50113c357e82cf3fc",
+    "line_range": [
+      82,
+      132
+    ],
+    "cann_bench_fallback": {
+      "line": 133,
+      "dtype": "float32",
+      "source": "_FALLBACK_THRESHOLDS = CANN_BENCH_THRESHOLDS[\"float32\"]"
+    },
+    "field_order": [
+      "threshold",
+      "small_value_threshold",
+      "small_value_error",
+      "cancel_boundary",
+      "cancel_zero_threshold"
+    ],
+    "dtype_entries": {
+      "float16": {
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "bfloat16": {
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "float32": {
+        "source_forms": [
+          "2 ** -13",
+          "2 ** -14",
+          "2 ** -30",
+          "2 ** -8",
+          "2 ** -8"
+        ],
+        "values": [
+          0.0001220703125,
+          6.103515625e-05,
+          9.313225746154785e-10,
+          0.00390625,
+          0.00390625
+        ]
+      },
+      "float64": {
+        "source_forms": [
+          "2 ** -13",
+          "2 ** -14",
+          "2 ** -30",
+          "2 ** -8",
+          "2 ** -8"
+        ],
+        "values": [
+          0.0001220703125,
+          6.103515625e-05,
+          9.313225746154785e-10,
+          0.00390625,
+          0.00390625
+        ]
+      },
+      "hifloat32": {
+        "source_forms": [
+          "2 ** -11",
+          "2 ** -12",
+          "2 ** -28",
+          "2 ** -8",
+          "2 ** -8"
+        ],
+        "values": [
+          0.00048828125,
+          0.000244140625,
+          3.725290298461914e-09,
+          0.00390625,
+          0.00390625
+        ]
+      },
+      "float8_e4m3": {
+        "source_forms": [
+          "2 ** -3",
+          "2 ** -4",
+          "2 ** -6",
+          "2 ** -1",
+          "2 ** -1"
+        ],
+        "values": [
+          0.125,
+          0.0625,
+          0.015625,
+          0.5,
+          0.5
+        ]
+      },
+      "float8_e5m2": {
+        "source_forms": [
+          "2 ** -2",
+          "2 ** -3",
+          "2 ** -5",
+          "1.0",
+          "1.0"
+        ],
+        "values": [
+          0.25,
+          0.125,
+          0.03125,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    "selection_rule": "cann_bench_compare.py:785 _thresholds_for_dtype(output_dtype); output_dtype derives from ACTUAL dtype (:548), and golden is cast to actual.dtype (:787)",
+    "pass_rule": "cann_bench_compare.py:843-845 mere < threshold and mare < 10.0 * threshold; small/cancel regions carry independent pass bits",
+    "integer_and_bool_paths": "cann_bench_compare.py:712-741 (integer abs tolerance), :756-770 (bool/integer exact) - the empty precision_thresholds only affects these branches"
+  },
+  "tree_anchor": {
+    "path": "work_package/fixtures/cannbench_contract.py",
+    "sha256": "026f51a94b6a6046f3096fcaa363f77e325e7f246c6e584a65a44e80de457400",
+    "lines": [
+      934,
+      983,
+      1006,
+      1008
+    ],
+    "line_contents": {
+      "934": "precision_thresholds=proto.get('precision_thresholds', {}))",
+      "983": "from npu_compare import compare_case_result",
+      "1006": "inputs=tensors, accuracy_mode='cann-bench',",
+      "1008": "extra={'precision_thresholds': self.info.precision_thresholds or {}})"
+    },
+    "manifest_cross_check": "work_package/PACKAGE_MANIFEST.json:175 carries the same sha256",
+    "contract_lines": {
+      "cases/CONTRACT.md:44": "no self-made thresholds; missing comparator means formal acceptance BLOCKED",
+      "cases/CONTRACT.md:18": "candidate must return the original dtype"
+    }
+  },
+  "dtype_distribution": {
+    "attention_residual": {
+      "bfloat16": 17,
+      "float16": 3
+    },
+    "mla": {
+      "float16": 15,
+      "bfloat16": 5
+    },
+    "supplemental_mla": {
+      "bfloat16": 2,
+      "float16": 2
+    },
+    "authoritative_total": 40,
+    "execution_status": "40/40 NOT_RUN, zero tolerance fields"
+  },
+  "cases": [
+    {
+      "case_id": "attention_residual/1",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/2",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/3",
+      "operator": "attention_residual",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/4",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/5",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/6",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/7",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/8",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/9",
+      "operator": "attention_residual",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/10",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/11",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/12",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/13",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/14",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/15",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/16",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/17",
+      "operator": "attention_residual",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/18",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/19",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "attention_residual/20",
+      "operator": "attention_residual",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 4 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/1",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/2",
+      "operator": "mla",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/3",
+      "operator": "mla",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/4",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/5",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/6",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/7",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/8",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/9",
+      "operator": "mla",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/10",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/11",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/12",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/13",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/14",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/15",
+      "operator": "mla",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/16",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/17",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/18",
+      "operator": "mla",
+      "dtype": "bfloat16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == bfloat16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/19",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla/20",
+      "operator": "mla",
+      "dtype": "float16",
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "case_matrix.json authoritative index: all 5 input dtypes == float16; execution_status=NOT_RUN; no precision_thresholds key in proto.yaml, so the entry is CANN_BENCH_THRESHOLDS via _thresholds_for_dtype(output_dtype)"
+    },
+    {
+      "case_id": "mla_supplemental/gqa_bsnd_kv_tail",
+      "operator": "mla",
+      "dtype": "bfloat16",
+      "supplemental": true,
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "supplemental_mla.json: single-valued dtypes == bfloat16; extension coverage only, not one of the authoritative 40"
+    },
+    {
+      "case_id": "mla_supplemental/gqa_bnsd_scale",
+      "operator": "mla",
+      "dtype": "float16",
+      "supplemental": true,
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "supplemental_mla.json: single-valued dtypes == float16; extension coverage only, not one of the authoritative 40"
+    },
+    {
+      "case_id": "mla_supplemental/gqa_decode_shard448",
+      "operator": "mla",
+      "dtype": "float16",
+      "supplemental": true,
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -10",
+          "2 ** -11",
+          "2 ** -16",
+          "2 ** -5",
+          "2 ** -5"
+        ],
+        "values": [
+          0.0009765625,
+          0.00048828125,
+          1.52587890625e-05,
+          0.03125,
+          0.03125
+        ]
+      },
+      "registration_basis": "supplemental_mla.json: single-valued dtypes == float16; extension coverage only, not one of the authoritative 40"
+    },
+    {
+      "case_id": "mla_supplemental/gqa_query_tail",
+      "operator": "mla",
+      "dtype": "bfloat16",
+      "supplemental": true,
+      "threshold_entry": {
+        "order": [
+          "threshold",
+          "small_value_threshold",
+          "small_value_error",
+          "cancel_boundary",
+          "cancel_zero_threshold"
+        ],
+        "source_forms": [
+          "2 ** -7",
+          "2 ** -8",
+          "2 ** -16",
+          "2 ** -3",
+          "2 ** -3"
+        ],
+        "values": [
+          0.0078125,
+          0.00390625,
+          1.52587890625e-05,
+          0.125,
+          0.125
+        ]
+      },
+      "registration_basis": "supplemental_mla.json: single-valued dtypes == bfloat16; extension coverage only, not one of the authoritative 40"
+    }
+  ],
+  "unknowns": [
+    "Whether the npu_compare actually imported in the S4/S5 run environment is THIS SAME FILE is not yet proven: the recorded sha256 is of the on-disk scripts under BiShengKernelAgent, while the harness only does 'from npu_compare import ...' by bare module name (cannbench_contract.py:983). PYTHONPATH in the device window decides which copy loads. Closing this needs the run-time module __file__/sha256 captured in the P0 record.",
+    "The comparator has no __version__ attribute (checked: none of its scripts export one), so identity is pinned by BiShengKernelAgent commit + per-file sha256 only; if that repo moves or the file is edited, every threshold_entry in this registry must be re-folded, not trusted."
+  ],
+  "non_normalisation_note": "float8_e5m2 cancel_boundary/cancel_zero_threshold are recorded AS WRITTEN: source_form '1.0', value 1.0. They are float literals, not 2**-n; consumers must not assume every field is a power of two."
+}

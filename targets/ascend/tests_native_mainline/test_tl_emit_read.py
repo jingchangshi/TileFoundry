@@ -425,6 +425,47 @@ if mode == "jit":
                 if "reg" in name or "spill" in name or "resource" in name)}))
     raise SystemExit(0)
 
+if mode == "same":
+    # Two compiles of ONE artifact into two DIFFERENT empty cache directories. The
+    # second is served from the build cache, which is exactly the path that used to
+    # produce a false TL_COMPILE_PRODUCTS_INCOMPLETE: a hit writes nothing into the
+    # directory it was given, and that emptiness was read as "no products".
+    import os as _os2
+    import tempfile as _tempfile2
+
+    results = []
+    for _attempt in range(2):
+        directory = _tempfile2.mkdtemp()
+        try:
+            fresh = compile_ascend_artifact(parsed, configs,
+                                            cache_directory=directory)
+        except CompileRefusal as refusal:
+            results.append({"raised": refusal.code, "detail": refusal.detail[:300]})
+            break
+        if isinstance(fresh, BlockedToolchain):
+            results.append({"blocked": fresh.code, "searched": list(fresh.searched)})
+            break
+        products = all(
+            _os2.path.isfile(_os2.path.join(fresh.kernel_directory, name))
+            for name in ("manifest.json", "device_kernel.asc"))
+        results.append({"compiled": True,
+                        "semantic_identity": fresh.semantic_identity,
+                        "ascend_source_sha256": fresh.ascend_source_sha256,
+                        "products_present": products})
+    payload = {"attempts": results}
+    if len(results) == 2 and all(entry.get("compiled") for entry in results):
+        payload["compiled"] = True
+        payload["cache_hit_compiled"] = True
+        payload["cache_hit_same_semantics"] = (
+            results[0]["semantic_identity"] == results[1]["semantic_identity"])
+        payload["cache_hit_products_present"] = all(
+            entry["products_present"] for entry in results)
+    elif results and results[0].get("blocked"):
+        payload["blocked"] = results[0]["blocked"]
+        payload["searched"] = results[0]["searched"]
+    print("RESULT" + json.dumps(payload))
+    raise SystemExit(0)
+
 try:
     facts = compile_ascend_artifact(parsed, configs, cache_directory=cache)
 except CompileRefusal as refusal:
@@ -1539,3 +1580,32 @@ def test_gate_recomputes_instead_of_reading_stored_identity_fields():
         dict(artifacts, completion=replace(completion, sites=completion.sites[:-1])),
         "completion", "plan")]
     assert "COMPLETION_CONTENT_CHANGED" in codes, codes
+
+def test_a_cache_hit_is_not_a_missing_product():
+    """Compiling the same artifact twice IN ONE PROCESS must succeed twice.
+
+    A deploy-cache HIT writes nothing into the caller-supplied cache directory,
+    because the products already exist from the earlier build. The first version of
+    _collect_products read that emptiness as evidence ("no directory under root has
+    this text") and refused with TL_COMPILE_PRODUCTS_INCOMPLETE - a FALSE refusal,
+    which is worse than a missing check: it makes a working path look broken and
+    sends the next reader hunting a build problem that does not exist. It is the
+    same shape as three earlier bugs (default 0 / empty set as none / consistency
+    as obligation): one probe returning empty was treated as a conclusion.
+
+    This runs in a child process like the rest of the compile-site tests, because
+    the value being tested is the SECOND compile sharing a cache with the first.
+    With no toolchain the required outcome is the named BLOCKED_ENV, asserted -
+    never a skip.
+    """
+    outcome = _site_run("same")
+    if outcome.get("blocked"):
+        assert outcome["blocked"] == "TL_BISHENG_NOT_DISCOVERABLE", outcome
+        assert outcome["searched"], "the refusal must say what was searched"
+        return
+    # Two compiles of one artifact, the second served from cache.
+    assert outcome.get("compiled") is True, outcome
+    assert outcome.get("cache_hit_compiled") is True, (
+        "a cache hit must not be reported as missing products", outcome)
+    assert outcome.get("cache_hit_same_semantics") is True, outcome
+    assert outcome.get("cache_hit_products_present") is True, outcome

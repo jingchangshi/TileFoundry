@@ -505,6 +505,36 @@ def _views_by_root(function) -> dict:
     return found
 
 
+
+
+def _placed_slots(candidate_entry, storage) -> list:
+    """Buffers whose candidate window carries the plan's version stride.
+
+    A placed slot is visible in the program: the view's addressing matches the
+    placement's base offset, and the buffer's stride is the plan's. Reading it
+    from the candidate - rather than believing a flag - is what makes the two
+    checks above able to FAIL as well as pass.
+    """
+    if storage is None:
+        return []
+    views = _views_by_root(candidate_entry)
+    found = []
+    for entry in getattr(storage, "entries", ()) or ():
+        name = str(getattr(getattr(entry, "root", None), "name", ""))
+        view = views.get(name)
+        if view is None:
+            continue
+        try:
+            offset, payload = _window_of(view)
+        except SymbolicApplyError:
+            continue
+        if offset != int(getattr(entry, "base_offset_bytes", 0)):
+            continue
+        if int(getattr(entry, "version_stride_bytes", 0)) < payload:
+            continue
+        found.append(name)
+    return found
+
 def _storage_disagreements(candidate_entry, original_entry, storage) -> list:
     """Where the plan's placement and the candidate's own windows disagree."""
     notes = []
@@ -718,8 +748,8 @@ def verify_actual_program(original, rewritten, plan, completion, storage, *, sou
 
     if storage is None:
         checks.append(("storage", _CHECK_GAP,
-                       "no storage plan supplied; the candidate's windows are not "
-                       "checked against a placement"))
+                       "the candidate carries no injected versioned slot/view: no "
+                       "storage plan was supplied, so its windows state no placement"))
     else:
         # The placement is checked against the CANDIDATE's actual windows rather
         # than asserted. For the S0 programs the plan's answers coincide with the
@@ -739,9 +769,19 @@ def verify_actual_program(original, rewritten, plan, completion, storage, *, sou
         checks.append(("storage", _CHECK_OK,
                        "%d placed buffer(s) agree with the candidate's windows"
                        % (len(getattr(storage, "entries", ()) or ()),)))
-    checks.append(("slot_generation", _CHECK_OK,
-                   "every plan buffer states a positive resolved version count and "
-                   "the candidate's windows carry the plan's stride"))
+    # Conditional, never unconditional: the gap exists only when the candidate
+    # really carries no placed slot. Writing GAP here regardless of the input is
+    # how a verdict becomes permanently unverifiable - a refusal that cannot
+    # flip is not fail-closed, it is a dead end (R7, third recurrence).
+    placed = tuple(_placed_slots(candidate_entry, storage))
+    if not placed:
+        checks.append(("slot_generation", _CHECK_GAP,
+                       "the candidate addresses no placed slot: no buffer's window "
+                       "carries a version stride from the plan"))
+    else:
+        checks.append(("slot_generation", _CHECK_OK,
+                       "%d buffer window(s) carry the plan's slot/generation stride"
+                       % (len(placed),)))
 
     source_map_identity = getattr(source_map, "candidate_identity", None)
     if source_map is not None and source_map_identity != _identity(candidate_entry):

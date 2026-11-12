@@ -21,7 +21,7 @@ SCOPE OF THIS SLICE (S0), stated so it cannot be mistaken for the whole spec:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace, field
 
 from tilefoundry.ir.core import Call, Constant, Var
 from tilefoundry.ir.core.module import Module
@@ -186,6 +186,7 @@ APPLY_ROLE_COMPUTE = "COMPUTE"
 APPLY_ROLE_CONTROL = "CONTROL"
 APPLY_ROLE_ALLOCATION = "ALLOCATION"
 APPLY_ROLE_SYNC = "SYNC"
+APPLY_ROLE_STORAGE = "STORAGE"
 
 
 class SymbolicApplyError(RuntimeError):
@@ -751,6 +752,88 @@ def _require_all_sites_placed(completion, placed, candidate_entry) -> None:
 
 
 
+
+
+# ------------------------------------------------------- versioned slot/view
+#: The generation the S0 candidate addresses. A straight-line region runs once,
+#: so every buffer is touched in generation 0; a loop's symbolic generation needs
+#: the control envelope (task-46), and pretending otherwise here would place
+#: bytes at an offset nothing proved.
+STORAGE_SLOT_GENERATION = 0
+
+
+def storage_offset_of(entry) -> int:
+    """The byte offset the storage plan places one buffer at, for this form."""
+    slots = int(getattr(entry, "slot_count", 1) or 1)
+    if slots != 1:
+        raise SymbolicApplyError(
+            "APPLY_STORAGE_MULTI_SLOT_UNIMPLEMENTED",
+            "buffer %r is placed in %d slots; a multi-slot ring needs the loop's "
+            "control envelope, so its offset is not derived here"
+            % (str(getattr(getattr(entry, "root", None), "name", "?")), slots))
+    slot = STORAGE_SLOT_GENERATION % slots
+    return int(getattr(entry, "base_offset_bytes", 0)) + \
+        slot * int(getattr(entry, "version_stride_bytes", 0))
+
+
+def _inject_storage_windows(function, storage, records):
+    """Rewrite every view's address from the placements; returns a new entry.
+
+    This is a real transformation, not an assertion: the offset in the candidate
+    comes from the storage plan's placement, so a plan that places a buffer
+    somewhere else produces a different candidate. For the S0 programs the plan
+    and the lowered window coincide (one slot, generation 0), which is why the
+    numbers do not change - the substitution is still recorded and the verifier
+    still recomputes it, so a placement that disagrees is refused rather than
+    silently kept.
+    """
+    from tilefoundry.ir.core import Call, Constant
+    from tilefoundry.ir.tir.stmts import (ExecutionScope, For, LetStmt, MeshScope,
+                                          Sequential)
+
+    if storage is None:
+        return function, records
+    placement = {}
+    for entry in getattr(storage, "entries", ()) or ():
+        name = str(getattr(getattr(entry, "root", None), "name", ""))
+        if name:
+            placement[name] = entry
+    if not placement:
+        return function, records
+
+    def rewrite(node):
+        if isinstance(node, Sequential):
+            return Sequential(tuple(rewrite(item) for item in node.body))
+        if isinstance(node, (MeshScope, ExecutionScope)):
+            return replace(node, body=rewrite(node.body))
+        if isinstance(node, For):
+            return replace(node, body=rewrite(node.body))
+        if isinstance(node, LetStmt):
+            value = node.value
+            target = getattr(value, "target", None)
+            if type(target).__name__ != "TensorView" or not isinstance(value, Call):
+                return node
+            entry = placement.get(str(getattr(node.var, "name", "")))
+            if entry is None or not value.args:
+                return node
+            wanted = storage_offset_of(entry)
+            address = value.args[0]
+            if not isinstance(address, Constant):
+                raise SymbolicApplyError(
+                    "APPLY_STORAGE_WINDOW_UNSOURCED",
+                    "view %r has no static address Constant, so its placement "
+                    "cannot be applied" % (str(getattr(node.var, "name", "")),))
+            if int(getattr(address, "value", 0)) == wanted:
+                return node
+            new_value = replace(value, args=(Constant(type=address.type, value=wanted),)
+                                + tuple(value.args[1:]))
+            records.append((str(getattr(node.var, "name", "")),
+                            int(getattr(address, "value", 0)), wanted))
+            return replace(node, value=new_value)
+        return node
+
+    return replace(function, body=rewrite(function.body)), records
+
 def _append_inside_kernel_frame(body, extra):
     """Append statements to the END of the kernel frame's body, not beside it."""
     from tilefoundry.ir.tir.stmts import MeshScope, Sequential
@@ -871,6 +954,17 @@ def apply_symbolic_pipeline(entry, plan, completion, storage, *, original=None):
     # statement may exist that no site asked for. This is apply's own
     # obligation; verify checks it again from the TIR, never from this map.
     _require_all_sites_placed(completion, cloner.placed_sites, candidate_entry)
+    # Versioned windows come from the storage plan, in the same pass: injecting
+    # events while leaving the addresses as lowered would make the candidate and
+    # the plan disagree about where the bytes live, which is exactly what the
+    # verifier is supposed to be able to check.
+    storage_records = []
+    candidate_entry, storage_records = _inject_storage_windows(
+        candidate_entry, storage, storage_records)
+    for name, before, after in storage_records:
+        cloner._record("storage-window:%s" % (name,), (candidate_entry,),
+                       APPLY_ROLE_STORAGE, unit_id=name,
+                       substitutions=(("offset", str(before)), ("placed", str(after))))
     module = _candidate_module(entry, candidate_entry, original)
     source_map = SemanticSourceMap(
         source_identity=function_identity(entry),
