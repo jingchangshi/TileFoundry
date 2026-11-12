@@ -1295,7 +1295,10 @@ def emit_for_codegen(plan: ResolvedPlan, codegen_binding=None) -> dict:
                         "X codegen requires a C-VERIFIED completion plan",
                         "completion_status", COMPLETION_VERIFIED,
                         plan.state.completion_status)
-    # X is not implemented yet. Even a caller-supplied binding is not accepted as proof:
+    from ..codegen.native_aiv import NativeAIVBinding
+    if isinstance(codegen_binding, NativeAIVBinding):
+        return codegen_binding.emit(plan)
+    # Other X paths remain unimplemented. A generic caller-supplied binding is not proof:
     # this R module never invents source/CCE/binary/load artifacts.
     raise PlanError("CODEGEN_CONTRACT_UNIMPLEMENTED",
                     "X codegen contract is not implemented; no source/binary emitted",

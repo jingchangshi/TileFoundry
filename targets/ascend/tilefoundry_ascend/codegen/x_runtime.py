@@ -412,6 +412,24 @@ def identities_from_h4_result(result):
     return dict((result or {}).get("identities") or (result or {}).get("artifacts") or {})
 
 def compile_tilelang(module, abi, env_context, compile_policy):
+    from .native_aiv import NativeAIVArtifact
+    if isinstance(module, NativeAIVArtifact):
+        import importlib.util
+        from pathlib import Path
+        import tilelang
+        if hashlib.sha256(module.source.encode()).hexdigest() != module.source_sha256:
+            raise CodegenError("X_SOURCE_IDENTITY_MISMATCH", "native source digest changed")
+        if abi != module.abi or compile_policy != {"tl.enable_auto_schedule": False}:
+            raise CodegenError("X_PLAN_PRESERVATION_MISMATCH",
+                               "native ABI and explicit compile policy must match the artifact")
+        path = Path(env_context["source_path"])
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(module.source)
+        spec = importlib.util.spec_from_file_location("native_aiv_" + module.source_sha256, path)
+        loaded = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(loaded)
+        return tilelang.compile(loaded.main, target="ascend", out_idx=None,
+                                pass_configs=compile_policy)
     raise CodegenError("CODEGEN_CONTRACT_UNIMPLEMENTED",
                        "real TL compile is X3; no CCE/binary emitted in X0-X2",
                        "compile_tilelang", "implemented X3 compile", None)
