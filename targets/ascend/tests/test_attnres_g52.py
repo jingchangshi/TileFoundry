@@ -155,14 +155,24 @@ def test_the_g52_record_covers_all_three_families_and_both_modes():
         assert r["passed"] == r["total"] == 20
 
 
-def test_the_g52_record_states_the_open_niter_issue():
-    """An open defect must be recorded where a reader of the gate will see it."""
+def test_the_g52_record_preserves_the_superseded_investigation():
+    """The niter>1 issue is RESOLVED under G51, but the investigation record must survive.
+
+    Erasing the rejected hypotheses would hide how the wrong narrowing arose, and the wrong
+    narrowing is the instructive part: G52 concluded the fault was 'a second reducer in one VF
+    region', which was a SYMPTOM. The record keeps that conclusion AND the correction next to it.
+    """
     here = Path(__file__).resolve().parents[1]
     data = json.loads((here / "evidence" / "G52_DEVICE_EVIDENCE.json").read_text())
     issue = data["niter_gt_1_investigation"]
-    assert issue["status"].startswith("OPEN")
+    assert "RESOLVED" in issue["status"]
+    # the original work is retained, not overwritten
     assert len(issue["hypotheses_tested_and_REJECTED"]) >= 5
     assert "second reducer" in issue["established_by_bisection"].lower()
+    # and the correction says what the real cause was
+    conclusion = issue["corrected_conclusion"].lower()
+    assert "residen" in conclusion       # resident gamma/w staging
+    assert "symptom" in conclusion
 
 
 def test_the_g52_record_does_not_claim_performance():

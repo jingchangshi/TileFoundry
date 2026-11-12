@@ -49,7 +49,16 @@
       "id": "PERSISTENT_LOOP_STATE_CARRY",
       "symptom": "with niter==1 every case exactly correct; with niter>1 EVERY iteration after the first wrong, deterministically at the same rows, only row 0 surviving",
       "cause": "carrying m/l/acc across outer persistent-loop iterations is not correct in this emission",
-      "fix": "outer persistent loop removed: grid = M, one token group per program. Correctness is claimed ONLY for the configuration that was measured. The persistent g+=P schedule the spec describes is NOT claimed as met and remains open for G51."
+      "fix": "establish gamma/w residency INSIDE the token-group iteration (p503_persist / kernel_persist); verified niter=2,3,4 at P=64/56/32/43 and 20/20 official cases at P=32",
+      "status": "CORRECTED -- ROOT CAUSE FOUND UNDER G51",
+      "original_diagnosis": "carrying m/l/acc across outer persistent-loop iterations is not correct in this emission",
+      "corrected_diagnosis": "the m/l/acc state carry was ALWAYS correct. What goes stale is the RESIDENT gamma/w staging filled before the persistent loop: a shared (UB) buffer written before a T.Pipelined loop does not hold its contents in later iterations. Re-establishing residency INSIDE the iteration fixes it, and the persistent g += P schedule then passes 20/20 official cases.",
+      "how_established": [
+        "two reducers over the SAME quantity in one region PASS -> the second reducer was never the cause",
+        "second reducer reading g_ub FAILS, reading w_ub PASSES -> g_ub is the FIRST buffer written before the loop, so the LEADING residency region is what goes stale",
+        "g_ub staged into a fragment before reducing STILL FAILS -> it is g_ub's VALUE, not how it is read",
+        "residency re-established every iteration PASSES; residency kept with versions pinned to 1 FAILS -> it is loop-carried residency, not buffer versioning"
+      ]
     },
     {
       "id": "NON_POWER_OF_TWO_D",
@@ -100,5 +109,6 @@
     "V-prefetch depth 1/2/3 and FREE(V) last-consumer placement: G51 (task-12).",
     "Formal proof over all inputs; correctness is demonstrated by the 20 official cases plus the listed edge tests.",
     "CN block-state m_b/l_b/u_b reductions and cross-block merge for CN>1 on device: G52."
-  ]
+  ],
+  "superseded_notes": "The 'PERSISTENT g += P is not claimed' statement below was true when written and is SUPERSEDED by G51: the persistent schedule is now implemented and verified. Kept here so the correction trail is visible."
 }

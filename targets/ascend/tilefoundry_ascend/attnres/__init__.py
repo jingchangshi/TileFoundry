@@ -66,6 +66,21 @@ from .kernel_cn import (
     merge_algebra,
     n_blocks,
 )
+from .lifetime import (
+    FINITE_FLOOR,
+    FREE_V,
+    LifetimeEvent,
+    PrefetchPlan,
+    REQUIRED_ORDER,
+    Violation,
+    check_d_tail,
+    check_invalid_row,
+    check_lifetime,
+    check_prefetch,
+    group_prefetch_target,
+    nan_demonstration,
+    online_softmax_step,
+)
 from .resources import (
     FEASIBLE,
     INFEASIBLE,
@@ -91,6 +106,19 @@ from .twin import (
 
 __all__ = [
     "ABI",
+    "FINITE_FLOOR",
+    "FREE_V",
+    "LifetimeEvent",
+    "PrefetchPlan",
+    "REQUIRED_ORDER",
+    "Violation",
+    "check_d_tail",
+    "check_invalid_row",
+    "check_lifetime",
+    "check_prefetch",
+    "group_prefetch_target",
+    "nan_demonstration",
+    "online_softmax_step",
     "AIV",
     "AttnResABI",
     "Candidate",
