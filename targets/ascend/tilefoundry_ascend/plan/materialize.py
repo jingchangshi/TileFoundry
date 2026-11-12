@@ -862,6 +862,10 @@ def verify_typed_tir(module) -> dict:
 
 def _rw_subst_expr(expr, mapping):
     from tilefoundry.ir.core import Var, Call
+    from tilefoundry.ir.core.expr import Tuple as TupleExpr
+    if isinstance(expr, TupleExpr):
+        return dataclasses.replace(expr, elements=tuple(_rw_subst_expr(a, mapping)
+                                                       for a in expr.elements))
     if isinstance(expr, Var):
         return mapping.get(expr.name, expr)
     if isinstance(expr, Call):
@@ -899,11 +903,17 @@ def _rw_rewrite_body(node, path, groups, statements, plan, env, rename=None, fps
     if isinstance(node, (MeshScope, ExecutionScope)):
         return dataclasses.replace(node, body=_rw_rewrite_body(node.body, path + (type(node).__name__,), groups, statements, plan, env, dict(rename), fps))
     if isinstance(node, If):
-        return dataclasses.replace(node, then_body=_rw_rewrite_body(node.then_body, path + ("then",), groups, statements, plan, env, dict(rename), fps),
+        return dataclasses.replace(node, cond=_rw_subst_expr(node.cond, rename),
+                                   then_body=_rw_rewrite_body(node.then_body, path + ("then",), groups, statements, plan, env, dict(rename), fps),
                                    else_body=_rw_rewrite_body(node.else_body, path + ("else",), groups, statements, plan, env, dict(rename), fps))
+    if isinstance(node, For):
+        raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED",
+                        "nested For requires binder-aware substitution", "nested_for")
     if isinstance(node, While):
-        return dataclasses.replace(node, body=_rw_rewrite_body(node.body, path + ("while",), groups, statements, plan, env, dict(rename), fps))
-    return node
+        return dataclasses.replace(node, cond=_rw_subst_expr(node.cond, rename),
+                                   body=_rw_rewrite_body(node.body, path + ("while",), groups, statements, plan, env, dict(rename), fps))
+    raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED",
+                    "unsupported statement in static instruction loop", type(node).__name__)
 
 
 def _rw_replace_loop(node, loop_stmt, blocks):
@@ -912,7 +922,10 @@ def _rw_replace_loop(node, loop_stmt, blocks):
         # Keep the For induction binding/scope; the body holds the static k copies. Executing
         # the outer For exactly once keeps the unrolled semantics finite and typed-legal.
         one = Constant(type=loop_stmt.stop.type, value=1)
-        return dataclasses.replace(node, stop=one, body=Sequential(body=tuple(blocks)))
+        zero = Constant(type=loop_stmt.start.type, value=0)
+        unit = Constant(type=loop_stmt.step.type, value=1)
+        return dataclasses.replace(node, start=zero, stop=one, step=unit,
+                                   body=Sequential(body=tuple(blocks)))
     if isinstance(node, Sequential):
         return Sequential(body=tuple(_rw_replace_loop(c, loop_stmt, blocks) for c in node.body))
     if isinstance(node, (MeshScope, ExecutionScope)):
@@ -982,7 +995,9 @@ def materialize_instruction_plan_v2(tir_module, plan: ResolvedPlan, *, sidecar_o
         iteration = start + k * step
         env = {"i": iteration, "k": k, "slot": 0}
         fps = {}
-        blocks.append(_rw_rewrite_body(loop_stmt.body, prefix, groups, statements, plan, env, None, fps))
+        induction = {loop_stmt.induction_var.name:
+                     Constant(type=loop_stmt.induction_var.type, value=iteration)}
+        blocks.append(_rw_rewrite_body(loop_stmt.body, prefix, groups, statements, plan, env, induction, fps))
         for path, accesses in groups.items():
             original = lookup_statement(statements, path)
             for access in accesses:
