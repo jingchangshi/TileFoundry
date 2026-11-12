@@ -1,0 +1,692 @@
+{
+  "gate": "G61",
+  "task": "P6-02",
+  "title": "MLA L0C deferred rescale with a unified conditional drain at the scale boundary",
+  "status": "PARTIAL",
+  "route_verdict": "FEASIBLE_IN_MODEL",
+  "verdict_scope": "CPU protocol/algebra model only. No real deferred MixedKernel or native TF effects/completion integration is implemented. The historical model results below are not G61 device proof; current G61 remains PARTIAL even though later CANN92 static arithmetic micro-cases run successfully.",
+  "review_status": "INCOMPLETE_MODEL_ONLY",
+  "historical_device_note": "The device_measurement reason below is a historical run note, not the current environment diagnosis. CANN92 host runtime is now usable, but deferred backend remains unimplemented.",
+  "modules": {
+    "rescale": "targets/ascend/tilefoundry_ascend/mla/rescale.py",
+    "tests": "targets/ascend/tests/test_mla_g61.py",
+    "driver": "mla-tl-run/g61_deferred.py"
+  },
+  "route": {
+    "states": {
+      "AIV": [
+        "anchor a",
+        "denominator l",
+        "drained prefix U_ub"
+      ],
+      "AIC": [
+        "pending U_l0c at the current anchor"
+      ]
+    },
+    "invariant": "U_total = U_ub + U_l0c at the SAME normalisation scale",
+    "boundary_order": [
+      "every old-anchor PV completes: ALL output columns and BOTH hi/lo components",
+      "drain pending L0C into UB",
+      "U_ub = (U_ub + pending) * exp(a_old - a_new); factor is 1 for a held anchor",
+      "l = l * factor",
+      "clear pending L0C",
+      "retire every boundary metadata consumer",
+      "activate the next epoch; only NOW may new-anchor PV accumulate"
+    ],
+    "group_predicate": "two AIVs publish local decisions into DISJOINT SS byte slots (32 B aligned, 3 KiB model limit); the AIC reads both and ORs them into one group decision",
+    "ss_capacity_bytes": 3072
+  },
+  "theta_comparison": [
+    {
+      "p_dtype": "float16",
+      "block_c": 8,
+      "theta": 0.0,
+      "exp_theta_bound": 1.0,
+      "theta_legal_bound": 9.703572,
+      "drains": 2,
+      "max_anchor_span": 0.0,
+      "max_abs_error_vs_dense": 1.224500924872085e-05,
+      "invariants_ok": true,
+      "precision": "p_single"
+    },
+    {
+      "p_dtype": "float16",
+      "block_c": 8,
+      "theta": 9.703572,
+      "exp_theta_bound": 16375.997915,
+      "theta_legal_bound": 9.703572,
+      "drains": 0,
+      "max_anchor_span": 1.506978,
+      "max_abs_error_vs_dense": 3.8153262920573305e-05,
+      "invariants_ok": true,
+      "precision": "p_single"
+    },
+    {
+      "p_dtype": "bfloat16",
+      "block_c": 8,
+      "theta": 0.0,
+      "exp_theta_bound": 1.0,
+      "theta_legal_bound": 83.177662,
+      "drains": 2,
+      "max_anchor_span": 0.0,
+      "max_abs_error_vs_dense": 1.224500924872085e-05,
+      "invariants_ok": true,
+      "precision": "p_single"
+    },
+    {
+      "p_dtype": "bfloat16",
+      "block_c": 8,
+      "theta": 12.0,
+      "exp_theta_bound": 162754.791419,
+      "theta_legal_bound": 83.177662,
+      "drains": 0,
+      "max_anchor_span": 1.506978,
+      "max_abs_error_vs_dense": 3.8153262920573305e-05,
+      "invariants_ok": true,
+      "precision": "p_single"
+    }
+  ],
+  "theta_sweep": {
+    "rows": [
+      {
+        "p_dtype": "float16",
+        "theta": 0.0,
+        "drains": 2,
+        "max_anchor_span": 0.0,
+        "max_abs_error_vs_dense": 1.224500924872085e-05,
+        "invariants_ok": true
+      },
+      {
+        "p_dtype": "float16",
+        "theta": 0.5,
+        "drains": 1,
+        "max_anchor_span": 0.464747,
+        "max_abs_error_vs_dense": 2.322374748743583e-05,
+        "invariants_ok": true
+      },
+      {
+        "p_dtype": "float16",
+        "theta": 1.0,
+        "drains": 1,
+        "max_anchor_span": 0.757218,
+        "max_abs_error_vs_dense": 3.815326292055943e-05,
+        "invariants_ok": true
+      },
+      {
+        "p_dtype": "float16",
+        "theta": 2.0,
+        "drains": 0,
+        "max_anchor_span": 1.506978,
+        "max_abs_error_vs_dense": 3.8153262920573305e-05,
+        "invariants_ok": true
+      },
+      {
+        "p_dtype": "float16",
+        "theta": 4.0,
+        "drains": 0,
+        "max_anchor_span": 1.506978,
+        "max_abs_error_vs_dense": 3.8153262920573305e-05,
+        "invariants_ok": true
+      },
+      {
+        "p_dtype": "float16",
+        "theta": 8.0,
+        "drains": 0,
+        "max_anchor_span": 1.506978,
+        "max_abs_error_vs_dense": 3.8153262920573305e-05,
+        "invariants_ok": true
+      },
+      {
+        "p_dtype": "bfloat16",
+        "theta": 0.0,
+        "drains": 2,
+        "max_anchor_span": 0.0,
+        "max_abs_error_vs_dense": 1.224500924872085e-05,
+        "invariants_ok": true
+      },
+      {
+        "p_dtype": "bfloat16",
+        "theta": 0.5,
+        "drains": 1,
+        "max_anchor_span": 0.464747,
+        "max_abs_error_vs_dense": 2.322374748743583e-05,
+        "invariants_ok": true
+      },
+      {
+        "p_dtype": "bfloat16",
+        "theta": 1.0,
+        "drains": 1,
+        "max_anchor_span": 0.757218,
+        "max_abs_error_vs_dense": 3.815326292055943e-05,
+        "invariants_ok": true
+      },
+      {
+        "p_dtype": "bfloat16",
+        "theta": 2.0,
+        "drains": 0,
+        "max_anchor_span": 1.506978,
+        "max_abs_error_vs_dense": 3.8153262920573305e-05,
+        "invariants_ok": true
+      },
+      {
+        "p_dtype": "bfloat16",
+        "theta": 4.0,
+        "drains": 0,
+        "max_anchor_span": 1.506978,
+        "max_abs_error_vs_dense": 3.8153262920573305e-05,
+        "invariants_ok": true
+      },
+      {
+        "p_dtype": "bfloat16",
+        "theta": 8.0,
+        "drains": 0,
+        "max_anchor_span": 1.506978,
+        "max_abs_error_vs_dense": 3.8153262920573305e-05,
+        "invariants_ok": true
+      }
+    ],
+    "monotonicity_violations": [],
+    "monotonic": true
+  },
+  "theta_derivation": {
+    "rule": "theta_legal = max(0, min(log(dtype_max / P_HEADROOM), log(F32_MAX / (P_HEADROOM * block_c * |V|max))))",
+    "p_headroom": 4.0,
+    "practical_cap": 12.0,
+    "not_copied_from_reference": true,
+    "why_not_6": "the reference source's constant 6 is not a bound for any particular P dtype; for float16 the legal bound is about 9.70 at block_c=128, and for bfloat16 about 80.4. Copying 6 would be legal for one and arbitrary for the other",
+    "values": {
+      "float16_block_c_128": 9.703572,
+      "bfloat16_block_c_128": 80.405073,
+      "float16_search_bound": 9.703572
+    }
+  },
+  "precision_and_shard": {
+    "p_single": {
+      "max_abs_error_vs_dense": 2.532403581437248e-05,
+      "invariants_ok": true
+    },
+    "p_hi_lo": {
+      "max_abs_error_vs_dense": 1.779462563411549e-09,
+      "invariants_ok": true
+    },
+    "hi_lo_recovers_precision": true,
+    "output_shard": {
+      "columns_slice": [
+        2,
+        5
+      ],
+      "width": 3,
+      "max_abs_error_vs_dense_shard": 2.4171298079217474e-05,
+      "invariants_ok": true,
+      "note": "the shard computes only its own columns and no merge happens between programs, which is G62's contract reached through this route"
+    }
+  },
+  "edge_cases": {
+    "doc_two_block_example": {
+      "output": 1.0,
+      "expected": 1.0,
+      "drains": 1,
+      "note": "scores 0 and 10 with V=1; a late old-anchor PV would give 1.9999 instead of 1.0"
+    },
+    "constant_max": {
+      "drains": 0,
+      "max_anchor_span": 0.0,
+      "invariants_ok": true,
+      "note": "a constant maximum must not trigger repeated drains"
+    },
+    "frequent_growth": {
+      "drains": 7,
+      "invariants_ok": true,
+      "note": "monotonically rising maxima: the worst case for drains"
+    },
+    "short_loop_single_block": {
+      "drains": 0,
+      "max_abs_error_vs_dense": 0.0,
+      "invariants_ok": true
+    },
+    "tail_all_masked_row": {
+      "masked_row_output": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "all_finite": true,
+      "invariants_ok": true,
+      "note": "an all-masked row reports zeros, not inf-inf"
+    },
+    "split_aiv_decision": {
+      "aiv0_true_aiv1_false": true,
+      "aiv0_false_aiv1_false": false,
+      "note": "the group decision is the OR of the two published local decisions; a one-sided read would give whichever AIV the AIC happened to read",
+      "ss_layout": {
+        "publishers": [
+          "aiv0",
+          "aiv1"
+        ],
+        "aic_reads": [
+          "aiv0",
+          "aiv1"
+        ],
+        "slots": [
+          {
+            "publisher": "aiv0",
+            "offset": 0,
+            "length": 32
+          },
+          {
+            "publisher": "aiv1",
+            "offset": 32,
+            "length": 32
+          }
+        ],
+        "disjoint": true,
+        "problems": [],
+        "bytes_used": 64,
+        "ss_capacity_bytes": 3072
+      }
+    }
+  },
+  "final_flush": {
+    "flush_events": 1,
+    "pending_cleared": true,
+    "invariants_ok": true,
+    "note": "the route's final flush is the last boundary; a kernel that returns with pending still in L0C would omit that mass from U_total/l"
+  },
+  "invariants": {
+    "shape_ok": true,
+    "finite_ok": true,
+    "pending_cleared_after_drain": true,
+    "ok": true,
+    "showcase": {
+      "rows": 2,
+      "columns": 4,
+      "shape_ok": true,
+      "finite_ok": true,
+      "pending_cleared_after_drain": true,
+      "phase": "idle",
+      "epoch": 1,
+      "completed": 28,
+      "expected": 28,
+      "retired": [],
+      "consumers": [
+        "aic",
+        "aiv0",
+        "aiv1"
+      ],
+      "ok": true
+    }
+  },
+  "showcase_boundary_sequence": {
+    "config": {
+      "block_c": 8,
+      "theta": 1.0,
+      "p_dtype": "float16",
+      "precision": "p_single"
+    },
+    "theta_1_drains": 1,
+    "theta_0_drains": 2,
+    "theta_reduces_drains": true,
+    "max_abs_error_vs_dense": 3.815326292055943e-05,
+    "history": [
+      {
+        "event": "boundary_published",
+        "epoch": 0,
+        "next": 1,
+        "predicate": true,
+        "factors": [
+          0.35266699775944027,
+          1.0
+        ],
+        "local_decisions": {
+          "aiv0": true,
+          "aiv1": true
+        }
+      },
+      {
+        "event": "drained",
+        "epoch": 0,
+        "predicate": true,
+        "factors": [
+          0.35266699775944027,
+          1.0
+        ]
+      },
+      {
+        "event": "activated",
+        "from": 0,
+        "to": 1
+      },
+      {
+        "event": "flush",
+        "epoch": 1
+      }
+    ],
+    "theta_0_history": [
+      {
+        "event": "boundary_published",
+        "epoch": 0,
+        "next": 1,
+        "predicate": true,
+        "factors": [
+          0.35266699775944027,
+          0.46896931341226694
+        ],
+        "local_decisions": {
+          "aiv0": true,
+          "aiv1": true
+        }
+      },
+      {
+        "event": "drained",
+        "epoch": 0,
+        "predicate": true,
+        "factors": [
+          0.35266699775944027,
+          0.46896931341226694
+        ]
+      },
+      {
+        "event": "activated",
+        "from": 0,
+        "to": 1
+      },
+      {
+        "event": "boundary_published",
+        "epoch": 1,
+        "next": 2,
+        "predicate": true,
+        "factors": [
+          0.6282940503109625,
+          1.0
+        ],
+        "local_decisions": {
+          "aiv0": true,
+          "aiv1": true
+        }
+      },
+      {
+        "event": "drained",
+        "epoch": 1,
+        "predicate": true,
+        "factors": [
+          0.6282940503109625,
+          1.0
+        ]
+      },
+      {
+        "event": "activated",
+        "from": 1,
+        "to": 2
+      },
+      {
+        "event": "flush",
+        "epoch": 2
+      }
+    ]
+  },
+  "conditional_guards": {
+    "predicate_key": "group_need_rescale@mla_epoch",
+    "pairs": [
+      {
+        "channel": "ss_aiv0_decision",
+        "kind": "deferred_ss_publish",
+        "setter": "cond",
+        "waiter": "cond",
+        "waiter_implies_setter": true,
+        "reason": "both sides use the SAME predicate",
+        "sides_agree": true,
+        "agree_reason": "both sides use the SAME predicate",
+        "ok": true
+      },
+      {
+        "channel": "ss_aiv1_decision",
+        "kind": "deferred_ss_publish",
+        "setter": "cond",
+        "waiter": "cond",
+        "waiter_implies_setter": true,
+        "reason": "both sides use the SAME predicate",
+        "sides_agree": true,
+        "agree_reason": "both sides use the SAME predicate",
+        "ok": true
+      },
+      {
+        "channel": "ss_aic_group_read",
+        "kind": "deferred_group_read",
+        "setter": "cond",
+        "waiter": "cond",
+        "waiter_implies_setter": true,
+        "reason": "both sides use the SAME predicate",
+        "sides_agree": true,
+        "agree_reason": "both sides use the SAME predicate",
+        "ok": true
+      },
+      {
+        "channel": "l0c_drain_clear",
+        "kind": "deferred_drain",
+        "setter": "cond",
+        "waiter": "cond",
+        "waiter_implies_setter": true,
+        "reason": "both sides use the SAME predicate",
+        "sides_agree": true,
+        "agree_reason": "both sides use the SAME predicate",
+        "ok": true
+      },
+      {
+        "channel": "factor_publish",
+        "kind": "deferred_factor",
+        "setter": "cond",
+        "waiter": "cond",
+        "waiter_implies_setter": true,
+        "reason": "both sides use the SAME predicate",
+        "sides_agree": true,
+        "agree_reason": "both sides use the SAME predicate",
+        "ok": true
+      }
+    ],
+    "problems": [],
+    "all_agree": true,
+    "note": "every deferred channel is CONDITIONAL on one published predicate; a conditional Set with an unconditional Wait, and two different predicates on the two sides, are both refused"
+  },
+  "completion_obligations": [
+    {
+      "name": "pv_all_columns_all_components_complete_e0",
+      "producer": "pv_0",
+      "consumers": [
+        "drain_0"
+      ],
+      "kind": "completion",
+      "why": "every old-anchor PV must finish before the drain, for every output column and both hi/lo components; a stale P buffer does not imply this, because the P slot is legally free while the PV it produced is still in flight"
+    },
+    {
+      "name": "ss_decision_publish_both_aivs_e0",
+      "producer": "aiv_decision_0",
+      "consumers": [
+        "aic_group_read_0"
+      ],
+      "kind": "state",
+      "why": "each AIV writes disjoint SS bytes and the AIC reads both; the AIC's group OR is the only decision, so a one-sided read would be a silent disagreement"
+    },
+    {
+      "name": "group_predicate_visible_to_aic_e0",
+      "producer": "ss_slot_0",
+      "consumers": [
+        "l0c_drain_0"
+      ],
+      "kind": "state",
+      "why": "the conditional drain and clear are guarded by the published predicate; SS is a scalar channel and carries no data-path completion of its own, so the read must be an explicit effect"
+    },
+    {
+      "name": "factor_survives_all_boundary_consumers_e0",
+      "producer": "factor_0",
+      "consumers": [
+        "prefix_rescale_0",
+        "denominator_rescale_0"
+      ],
+      "kind": "version",
+      "why": "the per-row factors must stay live until the last consumer of the boundary finishes; overwriting them with the next boundary's values rescales at the wrong epoch"
+    },
+    {
+      "name": "l0c_clear_visible_before_new_anchor_pv_e0",
+      "producer": "l0c_clear_0",
+      "consumers": [
+        "pv_new_anchor_1"
+      ],
+      "kind": "completion",
+      "why": "the new anchor's PV may only accumulate after the clear: L0C is clear/accumulate mode, so an unclear residue would be added into the new-scale accumulator"
+    },
+    {
+      "name": "pending_has_no_reader_until_drain_e0",
+      "producer": "l0c_pending_0",
+      "consumers": [
+        "drain_0"
+      ],
+      "kind": "version",
+      "why": "the canonical route's per-tile contribution transfer must NOT read L0C while the route is deferred; that transfer is exactly the cost this route removes"
+    },
+    {
+      "name": "pv_component_hi_complete_e0",
+      "producer": "pv_hi_0",
+      "consumers": [
+        "drain_0"
+      ],
+      "kind": "completion",
+      "why": "the hi and lo probability components are separate producers, so both must be in the completion set; folding them into one producer would let a drain proceed with half the contribution"
+    },
+    {
+      "name": "pv_component_lo_complete_e0",
+      "producer": "pv_lo_0",
+      "consumers": [
+        "drain_0"
+      ],
+      "kind": "completion",
+      "why": "the hi and lo probability components are separate producers, so both must be in the completion set; folding them into one producer would let a drain proceed with half the contribution"
+    }
+  ],
+  "fault_injection": {
+    "faults": [
+      {
+        "fault": "late_old_anchor_pv",
+        "refused": true,
+        "code": "RESCALE_STALE_EPOCH",
+        "why": "a PV contribution addressed epoch 0 while epoch 1 is live: an old-scale write after activation would be added at the wrong scale",
+        "effect_if_accepted": "the score-0 contribution would be added at the anchor-10 scale, so the output for the two-block example is near 2 instead of 1"
+      },
+      {
+        "fault": "premature_factor_overwrite",
+        "refused": true,
+        "code": "RESCALE_BOUNDARY_TWICE",
+        "why": "a boundary payload may not be overwritten before its consumers retire: the previous predicate and factors are still live",
+        "effect_if_accepted": "the live factors would be replaced by the next boundary's, rescaling the prefix at the wrong epoch"
+      },
+      {
+        "fault": "drain_before_all_pv",
+        "refused": true,
+        "code": "RESCALE_DRAIN_BEFORE_ALL_PV",
+        "why": "every old-anchor PV must complete before the drain, including every output column and both hi/lo components; 4 producer(s) are outstanding, so draining now would rescale a prefix that is missing their contribution and then add it at the wrong scale",
+        "effect_if_accepted": "block 1's contribution would be rescaled from the wrong anchor and then added at the new scale"
+      },
+      {
+        "fault": "drain_before_hi_lo_complete",
+        "refused": true,
+        "code": "RESCALE_DRAIN_BEFORE_ALL_PV",
+        "why": "every old-anchor PV must complete before the drain, including every output column and both hi/lo components; 4 producer(s) are outstanding, so draining now would rescale a prefix that is missing their contribution and then add it at the wrong scale",
+        "effect_if_accepted": "the lo component of the probability operand would be lost, so the result would be the hi-only answer"
+      },
+      {
+        "fault": "premature_consumer_retirement",
+        "refused": true,
+        "code": "RESCALE_PREMATURE_RETIREMENT",
+        "why": "a metadata consumer may only retire after the drain it depends on",
+        "effect_if_accepted": "the AIC could read a factor that was already retired and recycled for another channel"
+      },
+      {
+        "fault": "activate_before_retirement",
+        "refused": true,
+        "code": "RESCALE_ACTIVATE_BEFORE_CONSUMERS_RETIRED",
+        "why": "the predicate and factor payload must stay live until EVERY consumer's real final use completes; ['aiv0', 'aiv1'] still hold it, and activating now would overwrite the factors those consumers are still reading",
+        "effect_if_accepted": "the two AIVs would still be reading factors that the next epoch had already overwritten"
+      },
+      {
+        "fault": "overlapping_ss_slots",
+        "refused": true,
+        "code": "RESCALE_SS_SLOTS_OVERLAP",
+        "why": "byte 0 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 1 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 2 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 3 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 4 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 5 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 6 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 7 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 8 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 9 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 10 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 11 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 12 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 13 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 14 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 15 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 16 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 17 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 18 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 19 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 20 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 21 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 22 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 23 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 24 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 25 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 26 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 27 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 28 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 29 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 30 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not; byte 31 is written by both aiv0 and aiv1: the group decision would be whichever AIV wrote last, which is silent whenever the two agree and wrong exactly when they do not",
+        "effect_if_accepted": "the group decision becomes whichever AIV wrote last, which is wrong exactly when the two disagree"
+      },
+      {
+        "fault": "one_sided_group_read",
+        "refused": true,
+        "code": "RESCALE_AIC_MUST_READ_BOTH",
+        "why": "the AIC must read BOTH published decisions and take the group decision itself; reading one side is how a disagreement becomes silent",
+        "effect_if_accepted": "an AIV that needs a rescale would be outvoted by the one whose slot the AIC happens to read"
+      },
+      {
+        "fault": "predicate_anchors_mismatch",
+        "refused": true,
+        "code": "RESCALE_PREDICATE_DISAGREES_WITH_ANCHORS",
+        "why": "the group predicate says False but the anchors moved; a False predicate with a moved anchor would skip the drain and mix scales",
+        "effect_if_accepted": "the drain would be skipped while the accumulator scale changed, mixing two scales in one L0C accumulator"
+      },
+      {
+        "fault": "anchor_regression",
+        "refused": true,
+        "code": "RESCALE_ANCHOR_REGRESSION",
+        "why": "an anchor may only grow or hold; a decreasing anchor would rescale the prefix UP and overflow",
+        "effect_if_accepted": "exp(a_old - a_new) > 1 would rescale the drained prefix UP and can overflow the output"
+      },
+      {
+        "fault": "denominator_from_quantised_p",
+        "refused": true,
+        "code": "RESCALE_QUANTISED_DENOMINATOR_DIFFERS",
+        "why": "summing the rounded operand changes l by 0.00175207 on a 32-element block, which silently redefines the denominator",
+        "effect_if_accepted": "the normalisation would use the quantised weights, changing the numerical path the case doc fixes in P0"
+      }
+    ],
+    "all_refused": true,
+    "refused_count": 11,
+    "total": 11,
+    "coverage_of_gate_named_faults": {
+      "late_old_anchor_pv_after_rescale": {
+        "fault": "late_old_anchor_pv",
+        "refused": true,
+        "code": "RESCALE_STALE_EPOCH",
+        "why": "a PV contribution addressed epoch 0 while epoch 1 is live: an old-scale write after activation would be added at the wrong scale",
+        "effect_if_accepted": "the score-0 contribution would be added at the anchor-10 scale, so the output for the two-block example is near 2 instead of 1"
+      },
+      "premature_factor_overwrite": {
+        "fault": "premature_factor_overwrite",
+        "refused": true,
+        "code": "RESCALE_BOUNDARY_TWICE",
+        "why": "a boundary payload may not be overwritten before its consumers retire: the previous predicate and factors are still live",
+        "effect_if_accepted": "the live factors would be replaced by the next boundary's, rescaling the prefix at the wrong epoch"
+      },
+      "mismatched_conditional_guards": {
+        "fault": "mismatched_set_wait",
+        "refused": false,
+        "code": "guards must agree on one predicate",
+        "detail": []
+      }
+    }
+  },
+  "device_measurement": {
+    "status": "BLOCKED_ENV",
+    "reason": "The NPU measurement window is held by another teammate for this pass: npu-smi 25.7.rc1 shows a resident python process (pid 2862599, 868 MB) on NPU 0, and the package rule is one NPU measurement job at a time. A second measurement would corrupt both sets of numbers.",
+    "what_would_complete_it": [
+      "an exclusive device window under flock /home/.tf_device0.lock",
+      "the deferred route compiled as a real MixedKernel with the SS publish/read and the conditional L0C clear/accumulate expressed as IR effects",
+      "the same 20 official MLA cases run through the original comparator",
+      "median kernel time per case for canonical vs deferred at theta=0 and a positive theta, with warmup, repeats and the device exclusivity rule"
+    ],
+    "what_is_implemented_instead": "the protocol object, its invariants, the SS byte-disjointness check, the conditional guard pairs, the completion obligations, and eleven fault injections that are all refused with distinct codes"
+  },
+  "not_claimed": [
+    "No device Set/Wait completion is proven. The reference model this generalises says the same, and spec 03 says the device must establish the order through the target's own completion mechanism.",
+    "No device latency, no kernel time, and no device correctness for this route.",
+    "Python float arithmetic over small matrices is reference arithmetic, not FP16/BF16 emulation; the _cast rounding is a declared device for the hi/lo split only.",
+    "No claim that the deferred route is FASTER than canonical. That comparison requires the device window and belongs to the P7 search.",
+    "The theta comparison establishes the algebra and the drain counts, not a numerical error budget for a real kernel."
+  ],
+  "next_gate": {
+    "G70": "the search must include the deferred route as a real candidate with a real device measurement; it is not an optional entry that can be dropped once the canonical route passes"
+  }
+}

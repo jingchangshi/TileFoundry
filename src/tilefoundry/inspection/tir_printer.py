@@ -7,6 +7,7 @@ from tilefoundry.inspection.printer_base import PythonPrinter
 from tilefoundry.ir.core import Call, Constant, Op, Tuple, Var
 from tilefoundry.ir.core.kinds import BinaryKind
 from tilefoundry.ir.core.module import Module, ModuleList
+from tilefoundry.ir.core.execution import execution_kind
 from tilefoundry.ir.core.param_def import collect_param_defs
 from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.ir.hir.tensor.slice import Slice
@@ -16,6 +17,7 @@ from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.shape import ShapeOf
 from tilefoundry.ir.tir.stmts import (
     Evaluate,
+    ExecutionScope,
     For,
     LetStmt,
     MeshScope,
@@ -242,6 +244,23 @@ class TirPrinter(PythonPrinter, StmtVisitor[list[str]], ExprVisitor[str]):
         self.context.pop_mesh()
         return lines
 
+    def visit_ExecutionScope(self, stmt, ctx=None):
+        """An execution mode, printed as the with-block that enters it.
+
+        The kind is a registry name (``ascend.simdvf``) while the surface is one
+        identifier, so the printed line is resolved back through the declaration
+        rather than by splitting the name: a mode whose surface and name disagree
+        would otherwise print something that cannot reparse.
+        """
+        declared = execution_kind(stmt.kind)
+        if declared is None:
+            raise ValueError(
+                f"cannot print ExecutionScope {stmt.kind!r}: no declaration states it"
+            )
+        lines = [f"{self.indent}with T.{declared.surface}():"]
+        lines.extend(self._body(stmt.body))
+        return lines
+
     def visit_For(self, stmt, ctx=None):
         """A loop, its bounds read through the scopes the loop stands in.
 
@@ -249,6 +268,22 @@ class TirPrinter(PythonPrinter, StmtVisitor[list[str]], ExprVisitor[str]):
         each CTA its own tiles -- and which scope binds that mesh is what the
         print context holds, so the bounds are rendered through it.
         """
+        pipeline = getattr(stmt, "pipeline", None)
+        if pipeline is not None:
+            # A TIR roundtrip must rebuild the declaration explicitly. Printing a
+            # plain range() here would drop the authored intent and the reparsed
+            # program would silently differ from the one that was lowered.
+            annotations = '{"enable_offset": %s}' % (
+                "True" if pipeline.enable_offset else "False"
+            )
+            loop = "tf.pipelined(%s, num_stages=%d, annotations=%s)" % (
+                self.visit(stmt.stop, self.context),
+                pipeline.num_stages,
+                annotations,
+            )
+            lines = [f"{self.indent}for {self.visit(stmt.induction_var)} in {loop}:"]
+            lines.extend(self._body(stmt.body))
+            return lines
         bounds = ", ".join(
             self.visit(bound, self.context) for bound in (stmt.start, stmt.stop, stmt.step)
         )

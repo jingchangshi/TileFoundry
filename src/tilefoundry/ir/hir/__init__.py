@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import pkgutil
 
+from .execution_region import ExecutionRegion
 from .function import Function
 from .loop_region import LoopRegion
 from .mesh_region import MeshRegion
@@ -16,4 +17,4 @@ def _auto_import(pkg_name: str) -> None:
 
 _auto_import("tilefoundry.ir.hir")
 
-__all__ = ["Function", "LoopRegion", "MeshRegion"]
+__all__ = ["ExecutionRegion", "Function", "LoopRegion", "MeshRegion"]

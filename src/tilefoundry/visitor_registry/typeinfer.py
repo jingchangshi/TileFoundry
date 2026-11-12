@@ -13,6 +13,7 @@ from tilefoundry.ir.core.metadata import (
 from tilefoundry.ir.core.module import ModuleList
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.isl_interop import dim_range
@@ -254,7 +255,7 @@ class TypeInferVisitor(ValuationVisitor[Type]):
         return TupleType(fields=operands)
 
     def _region_memo(
-        self, region: LoopRegion | MeshRegion, ctx: TypeInferContext
+        self, region: LoopRegion | MeshRegion | ExecutionRegion, ctx: TypeInferContext
     ) -> dict[int, tuple[Expr, Type]]:
         """Infer arguments and bind each region parameter to its argument's type.
 
@@ -345,6 +346,28 @@ class TypeInferVisitor(ValuationVisitor[Type]):
         produced, and what one unit costs is cost's question.
         """
         memo = self._region_memo(expr, ctx)
+        inner = TypeInferVisitor(
+            memo=memo,
+            owns_body=self._owns_body,
+            ranges=self._ranges,
+        )
+        return inner.visit(expr.body, replace(ctx.enter_region(expr), memo=memo))
+
+    def visit_ExecutionRegion(self, expr: ExecutionRegion, ctx: TypeInferContext) -> Type:
+        """Type an execution region as its body, after checking it is enterable.
+
+        The mode is not a fact about the shape of the result, so the region has
+        the type its body has. What the mode does decide -- that its declaration
+        exists, that the topology it requires is in force, that its captures are
+        not register-private -- is checked here rather than left to the body walk,
+        because a region whose boundary is wrong has no meaning whatever its body
+        computes.
+        """
+        from .verify import verify_region_isolated, verify_execution_boundary  # noqa: PLC0415
+
+        memo = self._region_memo(expr, ctx)
+        verify_region_isolated(expr, ctx)
+        verify_execution_boundary(expr, ctx)
         inner = TypeInferVisitor(
             memo=memo,
             owns_body=self._owns_body,

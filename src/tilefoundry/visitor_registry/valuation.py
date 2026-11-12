@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tilefoundry.ir.core import Call, Expr
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.visitor import ExprVisitor
@@ -48,7 +49,7 @@ class ValuationVisitor[T](ExprVisitor[T]):
         return result
 
     def visit_operands(self, expr, ctx):
-        if not isinstance(expr, (LoopRegion, MeshRegion)):
+        if not isinstance(expr, (LoopRegion, MeshRegion, ExecutionRegion)):
             if isinstance(expr, Call) and ctx is not None and ctx.call_site is expr:
                 ctx = ctx.caller_context or ctx
             return super().visit_operands(expr, ctx)

@@ -7,6 +7,7 @@ or a ``ShardLayout`` (→ shard tensor view, no allocation).
 from __future__ import annotations
 
 from tilefoundry.ir.core import Call, Constant, Op
+from tilefoundry.ir.core.execution import register_structural
 from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.types import DType, PointerType, StorageKind, TensorType
@@ -30,6 +31,13 @@ class TensorView(Op):
     storage = ParamDef(kind="attribute", annotation=StorageKind, optional=True, default=None)
     layout = ParamDef(kind="attribute", annotation=LayoutBase)
     shape = ParamDef(kind="attribute", annotation=tuple, default=None)
+
+
+# A view states how a value is addressed, not what computes it: it is admissible
+# wherever its base is, and the base carries the placement question. Registering
+# it as structural is what stops operand views from having to masquerade as
+# vector instructions to survive inside a mode.
+register_structural(TensorView)
 
 
 @register_typeinfer(TensorView)

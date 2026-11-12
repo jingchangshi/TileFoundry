@@ -1,0 +1,25 @@
+/home/s00653124/workspace/envs/tfnpu-v2/lib/python3.12/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /data/pri/cann-9.2.0/cann-9.2.0-beta.2 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/home/s00653124/workspace/envs/tfnpu-v2/lib/python3.12/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /data/pri/cann-9.2.0/cann-9.2.0-beta.2/x86_64-linux/ascend_ops_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/home/s00653124/workspace/envs/tfnpu-v2/lib/python3.12/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /data/pri/cann-9.2.0/cann-9.2.0-beta.2 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/home/s00653124/workspace/envs/tfnpu-v2/lib/python3.12/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /data/pri/cann-9.2.0/cann-9.2.0-beta.2/x86_64-linux/ascend_ops_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+Fatal Python error: Segmentation fault
+
+Current thread 0x00007214ee4d1740 (most recent call first):
+  File "/home/s00653124/workspace/envs/tfnpu-v2/lib/python3.12/site-packages/ortools/sat/python/cp_model.py", line 1771 in solve
+  File "/home/s00653124/workspace/TileFoundry_p3_02/src/tilefoundry/analysis/allocation.py", line 1300 in solve_allocation
+  File "/home/s00653124/workspace/TileFoundry_p3_02/src/tilefoundry/analysis/memory.py", line 713 in _place
+  File "/home/s00653124/workspace/TileFoundry_p3_02/src/tilefoundry/analysis/memory.py", line 629 in analyze_memory
+  File "/home/s00653124/workspace/TileFoundry_p3_02/src/tilefoundry/analysis/api.py", line 205 in analyze
+  File "targets/ascend/tests/native_aiv_device.py", line 49 in main
+  File "targets/ascend/tests/native_aiv_device.py", line 98 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 98 in _run_module_code
+  File "<frozen runpy>", line 287 in run_path
+  File "<stdin>", line 18 in <module>
+
+Extension modules: numpy._core._multiarray_umath, numpy.linalg._umath_linalg, torch._C, torch._C._dynamo.autograd_compiler, torch._C._dynamo.eval_frame, torch._C._dynamo.guards, torch._C._dynamo.utils, torch._C._fft, torch._C._linalg, torch._C._nested, torch._C._nn, torch._C._sparse, torch._C._special, torch_npu._C, numpy.random._common, numpy.random.bit_generator, numpy.random._bounded_integers, numpy.random._pcg64, numpy.random._generator, numpy.random._mt19937, numpy.random._philox, numpy.random._sfc64, numpy.random.mtrand, markupsafe._speedups, yaml._yaml, _cyutility, pandas._libs._cyutility, pandas._libs.tslibs.ccalendar, pandas._libs.tslibs.np_datetime, pandas._libs.tslibs.dtypes, pandas._libs.tslibs.base, pandas._libs.tslibs.nattype, pandas._libs.tslibs.timezones, pandas._libs.properties, pandas._libs.tslibs.fields, pandas._libs.tslibs.timedeltas, pandas._libs.tslibs.tzconversion, pandas._libs.tslibs.timestamps, pandas._libs.tslibs.offsets, pandas._libs.tslibs.strptime, pandas._libs.tslibs.parsing, pandas._libs.tslibs.conversion, pandas._libs.tslibs.period, pandas._libs.tslibs.vectorized, pandas._libs.ops_dispatch, pandas._libs.missing, pandas._libs.hashtable, pandas._libs.algos, pandas._libs.interval, pandas._libs.lib, pandas._libs.ops, pandas._libs.groupby, pandas._libs.hashing, pandas._libs.arrays, pandas._libs.tslib, pandas._libs.sparse, pandas._libs.internals, pandas._libs.index, pandas._libs.writers, pandas._libs.join, pandas._libs.indexing, pandas._libs.window.aggregations, pandas._libs.window.indexers, pandas._libs.reshape, pandas._libs._ujson, pandas._libs.parsers, pandas._libs.testing (total: 67)
+timeout: the monitored command dumped core

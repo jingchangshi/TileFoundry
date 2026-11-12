@@ -10,6 +10,7 @@ from .launch import Launch
 from .prim_function import PrimFunction
 from .shape import ShapeOf
 from .stmts import (
+    ExecutionScope,
     For,
     If,
     LetStmt,
@@ -36,6 +37,7 @@ __all__ = [
     "While",
     "If",
     "MeshScope",
+    "ExecutionScope",
     "Return",
     "Sequential",
     "LetStmt",

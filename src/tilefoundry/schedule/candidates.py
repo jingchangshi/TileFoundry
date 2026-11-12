@@ -11,7 +11,8 @@ from tilefoundry.ir.core.metadata import SourceSpanMetadata
 from tilefoundry.ir.hir.schedule import ScheduleRefusal, match_instruction
 from tilefoundry.ir.types import StorageKind, TensorType
 from tilefoundry.ir.types.dim import is_dim_op_call
-from tilefoundry.ir.visitor import collect_exprs
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
+from tilefoundry.ir.visitor import collect_exprs, expr_children
 from tilefoundry.schedule._reporting import capability_families
 from tilefoundry.target import Target
 from tilefoundry.visitor_registry.access_relation import access_relation_registry
@@ -19,7 +20,9 @@ from tilefoundry.visitor_registry.buffer_alias import aliased_operand
 from tilefoundry.visitor_registry.candidates import (
     candidate_operands,
     candidate_ops,
+    select_instruction,
     sole_candidate,
+    target_candidate_ops,
 )
 from tilefoundry.visitor_registry.contexts import TypeInferContext, ValuationContext
 from tilefoundry.visitor_registry.valuation import ValuationVisitor
@@ -34,6 +37,40 @@ def _instructions(target: Target) -> tuple[tuple[type, OpCapability], ...]:
         for capability in capabilities
     )
 
+
+def _execution_context(function) -> dict[int, str]:
+    """Call id -> the ACTIVE execution kind where that call lexically executes.
+
+    Classification is by LEXICAL definition/evaluation context, not by recursive
+    data-dependency reachability:
+
+    * an ExecutionRegion ARGS are the captured values and are evaluated in the
+      ENCLOSING context; a producer whose result a VF body captures is still lexically
+      outside and must NOT be reported as inside (that mistake dropped gm_to_ub from the
+      outside default set);
+    * only the region BODY executes in the region kind, and that kind is the ACTIVE kind
+      for everything reachable through it until an inner region changes it.
+
+    Returning the kind (not just a boolean) is what lets the report resolve placement
+    with the same active-kind rule the lowering uses; a call absent from the map is
+    outside every execution region.
+    """
+    active: dict[int, str] = {}
+    stack: list[tuple[object, str | None]] = [(function.body, None)]
+    while stack:
+        expr, kind = stack.pop()
+        if expr is None:
+            continue
+        if isinstance(expr, ExecutionRegion):
+            for arg in expr.args:
+                stack.append((arg, kind))
+            stack.append((expr.body, expr.kind))
+            continue
+        if kind is not None and isinstance(expr, Call):
+            active[id(expr)] = kind
+        for child in expr_children(expr):
+            stack.append((child, kind))
+    return active
 
 def candidates(
     module, entry, *, source: str | None = None
@@ -54,6 +91,9 @@ def candidates(
                 ),
             )
         )
+    execution_context: dict[int, str] = {}
+    for frame in frames:
+        execution_context.update(_execution_context(frame.function))
     declared = _instructions(target)
     type_printer = PythonPrinter()
     pattern_printer = PatternPrinter()
@@ -66,7 +106,12 @@ def candidates(
             or not isinstance(call.type, TensorType)
         ):
             continue
-        instructions = candidate_ops(type(call.target))
+        # Global carriers plus the ones THIS target scopes to the same HIR op. The
+        # scoped ones are what let a generic, unscheduled op be reported/selected for
+        # Ascend without changing the global list a CUDA program sees.
+        instructions = candidate_ops(type(call.target)) + target_candidate_ops(
+            target, type(call.target)
+        )
         if not instructions or aliased_operand(call) is not None:
             continue
         if call.type.storage is StorageKind.UMAT and call.type.shape == ():
@@ -76,12 +121,21 @@ def candidates(
         frame, mesh = context, context.current_mesh
         level = None if mesh is None else mesh.topologies[-1].name
         usable, refused = [], []
+        try:
+            active_kind = execution_context.get(id(call))
+            default_op = sole_candidate(
+                call, target=target, inside=active_kind is not None, active_kind=active_kind
+            )
+        except ScheduleRefusal:
+            # The target scopes candidates but none fits this call; report no default
+            # rather than inventing one. The lowering path raises the same refusal.
+            default_op = None
         for op_type, capability in declared:
             if op_type not in instructions:
                 continue
             identifier = op_identifier(capability.declaration or op_type)
             try:
-                attributes, types = candidate_operands(call, op_type)
+                attributes, types = candidate_operands(call, op_type, target=target)
                 if capability.attribute is not None:
                     attributes[capability.attribute] = capability.declaration
                 instances = match_instruction(op_type, attributes, types, mesh, frame=frame)
@@ -94,7 +148,7 @@ def candidates(
                 "id": identifier,
                 **pattern_printer.match_data(tuple(match.path for match in instances)),
             }
-            if sole_candidate(call) is not None:
+            if default_op is not None and type(default_op) is op_type:
                 candidate["default"] = True
             usable.append(candidate)
         parameters = [

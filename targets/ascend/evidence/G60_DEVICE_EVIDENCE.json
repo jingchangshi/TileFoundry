@@ -1,0 +1,69 @@
+{
+  "gate": "G60",
+  "task": "P6-01",
+  "status": "VERIFIED",
+  "deliverable": "Canonical online fused MLA as a SINGLE MixedKernel launch: QK with nope-panel accumulation and rope added once, right-aligned causal mask, GQA head mapping, online softmax in FP32, P conversion/pack, PV, normalize and output conversion. No full scores or P materialised in GM. Verified on Ascend950PR against all 20 official cases with the original comparator.",
+  "official_20_case_sweep": {
+    "source": "fixtures/mla/cases.yaml",
+    "passed": 20,
+    "total": 20,
+    "comparator": "cannbench_contract.Harness + npu_compare.compare_case_result, ORIGINAL thresholds, warm fp64 oracle cache",
+    "log": "mla-tl-run/g60_zc20.log",
+    "shape_coverage": "BSND and BNSD; D_nope 512 and 448; D_rope 64; float16 and bfloat16; causal and non-causal; prefill, cross (S>Skv, non-causal), long prefill, decode (S=1, Skv 2048/4096), MTP (S=2), large batch up to B=128.",
+    "single_launch": true,
+    "no_full_scores_in_gm": true
+  },
+  "layout_addressing": {
+    "zero_copy": true,
+    "mechanism": "as_strided pure-metadata views; the kernel is compiled against concrete strides and both layouts address the same bytes",
+    "spec_clause": "cases/mla.md 1: the host selects an implementation, validates metadata, allocates the output and launches only; no host concatenation, no whole-tensor transpose, no host softmax or matmul. Contiguous BSND/BNSD is reached directly by address mapping.",
+    "why_not_a_transpose": "a host .transpose().contiguous() would be a data movement and is forbidden; and it would not even be needed, since both layouts are the same bytes",
+    "layout_is_a_compile_time_specialization": true,
+    "cache_key_includes_layout": true
+  },
+  "semantics": {
+    "rope_added_once": "score = scale * (dot(q_nope,k_nope) + dot(q_rope,k_rope)); the rope GEMM is one additional clear_accum=False accumulation after the nope panels",
+    "causal": "j <= i + (Skv - S), RIGHT-ALIGNED, applied as a vector compare against the block base offset",
+    "gqa": "hkv = hq // G, reached by stride so the group axis costs no copy",
+    "scale": "scaleValue <= 0 means 1/sqrt(D_qk) with D_qk = D_nope + D_rope, NOT D_v",
+    "v_contract": "v == k_nope is a VALUE contract; the kernel reads the k_nope tile and makes no assumption about pointer aliasing",
+    "all_masked_rows": "the golden zeroes a fully-masked row; the kernel's final normalize uses the running denominator, and a zero denominator is guarded"
+  },
+  "defects_found_and_fixed": [
+    {
+      "id": "PANEL_WIDTH_HARDWIRED",
+      "symptom": "D_nope=448 computed from only 384 columns",
+      "why_dangerous": "silent: no error and no NaN, just a different operator; 448 is official cases 3, 6, 14",
+      "fix": "panels derived from D with an explicit divisibility check"
+    },
+    {
+      "id": "FUTURE_ANNOTATIONS",
+      "symptom": "NameError: name batch is not defined",
+      "cause": "from __future__ import annotations stringifies prim_func annotations and TileLang resolves them with get_type_hints() in the closure scope",
+      "fix": "removed, with a comment so a linter does not restore it"
+    },
+    {
+      "id": "RANK_MISMATCH",
+      "symptom": "ABI asserted an impossible stride (expected 65536, got 51)",
+      "cause": "declared rank-5 StridedTensors but passed rank-4 tensors, so the ABI read past the end of the runtime stride array; every BSND case passed by coincidence because rank-4 BSND strides equal the leading four of the rank-5 view",
+      "fix": "always pass the 5-D view"
+    },
+    {
+      "id": "LAYOUT_MISSING_FROM_CACHE_KEY",
+      "symptom": "a BNSD call reused a BSND-compiled kernel",
+      "why_dangerous": "the strides are a compile-time specialization; a compatible-looking stride set would have read the right number of elements from the WRONG POSITIONS",
+      "fix": "layout is part of the key"
+    }
+  ],
+  "my_own_test_bugs_recorded": [
+    "the first three device runs reported failure because MY harness passed an independent random v while both kernels use k_nope as V. The fixture get_input() replaces v with a copy of k_nope for exactly this reason. Proven, not assumed: running the WORKING reference through my own harness reproduced my kernel exact numbers.",
+    "before that, two CPU algebra harnesses reported 20/20 failures -- one measuring fp16/bf16 storage rounding, one whose round-trip was a no-op. Only comparing an fp64 golden against an fp64 recomputation made the sides comparable; then all 20 agreed to ~3e-8.",
+    "I also corrupted kernel.py with a bad string slice (it grew to 792 lines with duplicated content) and caught it only because the syntax check failed before commit."
+  ],
+  "not_claimed": [
+    "No performance claim: no cycle timings, no bandwidth figure, no comparison against any baseline kernel. This gate is numerical correctness and single-launch structure only.",
+    "A fully-masked row is checked by rule and by the golden zeroing convention, not executed as a dedicated device case.",
+    "Physical synchronisation equivalence is not proven: the pipeline stages and buffer versions are what the compiler emitted, not an argument about hardware event ordering.",
+    "The BNSD path shares one compiled kernel per shape; it is not separately timed."
+  ]
+}

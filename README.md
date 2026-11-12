@@ -110,3 +110,42 @@ with three more beside it. The specifications are meant to be argued with:
 ## License
 
 This project is licensed under the [MIT License](https://github.com/tile-ai/TileFoundry/blob/main/LICENSE).
+
+## Solver-bridge tests (S)
+
+The S bridge imports the ONE shared Z3 core, so its tests need an interpreter with z3;
+a pytest venv without z3 **skips** them by name. See
+[`targets/ascend/tilefoundry_ascend/solver/README.md`](targets/ascend/tilefoundry_ascend/solver/README.md)
+for the interpreter matrix and `tools/run_solver_tests.sh`.
+
+## Environment matrix (task-78 cleanup)
+
+**`envs/tfnpu-v2` is the ONLY formal environment** for backend, TileLang, Z3,
+device and test judgments. The removed/deprecated `envs/tfnpu-dev`, `envs/tfnpu-v1` and
+`.venv-explorer` are not kept in the workspace. `.conda/envs/tilefoundry-npu` is the adapter's
+conventional `.conda/envs/` location, but it is currently invalid/legacy and paused:
+**do not delete, modify or repair it**; the user will restore the formal layout after all
+TileFoundry tasks. It is not used by tests or `run_acceptance.sh`.
+
+For a temporary need, derive a one-off overlay and delete it:
+
+```bash
+envs/tfnpu-v2/bin/python -m venv --system-site-packages /tmp/tfnpu-oneoff
+/tmp/tfnpu-oneoff/bin/python -m pip install --no-index --find-links envs/wheels pytest
+# use it, then: rm -rf /tmp/tfnpu-oneoff
+```
+
+The ABI preflight (`tools/abi_preflight.py`, invoked by `tools/run_solver_tests.sh`)
+allows only `envs/tfnpu-v2` and fails by
+`ABI_PREFLIGHT_INTERPRETER` / `ABI_PREFLIGHT_VERSION` / `ABI_PREFLIGHT_SHA`. See
+[`envs/ENVIRONMENT.md`](../envs/ENVIRONMENT.md).
+
+**Clean archive:** `src/tilefoundry/__init__.py` (and the CLI summary/version) falls
+back to `0.0.0+unknown` when the untracked `src/tilefoundry.egg-info` is absent, so a
+`git archive` checkout can collect and run tests without installed package metadata.
+If a release needs real metadata, generate it offline with the local wheels via
+`python -m pip install -e . --no-index --find-links envs/wheels` (do not rely on the
+working tree's egg-info). The fallback also sets
+`__version_source__ = "fallback-uninstalled"`; features that require an authoritative
+version MUST call `tilefoundry.require_version()` (or check the flag), which fails by
+name `VERSION_SOURCE_FALLBACK` instead of treating `0.0.0+unknown` as real.

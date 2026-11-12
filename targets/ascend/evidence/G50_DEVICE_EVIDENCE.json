@@ -1,0 +1,114 @@
+{
+  "gate": "G50",
+  "task": "P5-01",
+  "status": "VERIFIED",
+  "deliverable": "Single-logical-launch attention_residual (RMSNorm along D -> pseudo-query score along D -> depth softmax along N -> weighted sum over ORIGINAL V -> alpha residual blend) executed on Ascend950PR, passing all 20 official cases through the original comparator.",
+  "device": {
+    "arch": "Ascend950PR",
+    "device_id": 0,
+    "toolchain": "CANN 9.3.0 (/data/pri/9.3.0-weekly/cann-9.3.0)",
+    "tilelang": "0.1.15",
+    "execution_path": "docker exec s00653124-bska, flock -n /home/.tf_device0.lock, ASCEND_RT_VISIBLE_DEVICES=0",
+    "comparator": "cannbench_contract.Harness.compare -> npu_compare.compare_case_result, accuracy_mode='cann-bench'"
+  },
+  "official_cases": {
+    "source": "fixtures/attention_residual/cases.yaml",
+    "passed": 20,
+    "total": 20,
+    "thresholds": "ORIGINAL thresholds from proto.yaml precision_thresholds; NOT edited",
+    "log": "mla-tl-run/p501_all20.log",
+    "result": "all 20 report 'matched across 1 output leaf/leaves'"
+  },
+  "implementation": {
+    "shape": "ONE T.Kernel launch. No second kernel, no GM intermediate score/probability array.",
+    "task_graph": [
+      "LOAD_X(g) MTE2",
+      "LOAD_V(u) MTE2",
+      "BLOCK_COMPUTE(u) VECTOR",
+      "FINALIZE(g) VECTOR",
+      "STORE_Y(g) MTE3"
+    ],
+    "score_path": "literal_fp32: k = v/rms*gamma, s = sum_d(k*w)/sqrt(D), matching the golden's arithmetic order",
+    "state": {
+      "m": "float32",
+      "l": "float32",
+      "acc": "float32",
+      "score": "float32"
+    },
+    "aggregation": "reads the ORIGINAL v_ub, never the RMS-normalised key",
+    "persistent_residency": "w and gamma are read once per AIV and reused across every token group"
+  },
+  "four_defects_found_by_running": [
+    {
+      "id": "VF_LOCAL_FRAGMENTS",
+      "symptom": "compile error 'pointer arguments to simt_vf functions must reside in __gm__ or __ubuf__'",
+      "cause": "fragment buffers were live across separate SimtVF regions",
+      "fix": "all cross-region state moved to shared (UB); only per-region temporaries remain fragments"
+    },
+    {
+      "id": "PERSISTENT_LOOP_STATE_CARRY",
+      "symptom": "with niter==1 every case exactly correct; with niter>1 EVERY iteration after the first wrong, deterministically at the same rows, only row 0 surviving",
+      "cause": "carrying m/l/acc across outer persistent-loop iterations is not correct in this emission",
+      "fix": "establish gamma/w residency INSIDE the token-group iteration (p503_persist / kernel_persist); verified niter=2,3,4 at P=64/56/32/43 and 20/20 official cases at P=32",
+      "status": "CORRECTED -- ROOT CAUSE FOUND UNDER G51",
+      "original_diagnosis": "carrying m/l/acc across outer persistent-loop iterations is not correct in this emission",
+      "corrected_diagnosis": "the m/l/acc state carry was ALWAYS correct. What goes stale is the RESIDENT gamma/w staging filled before the persistent loop: a shared (UB) buffer written before a T.Pipelined loop does not hold its contents in later iterations. Re-establishing residency INSIDE the iteration fixes it, and the persistent g += P schedule then passes 20/20 official cases.",
+      "how_established": [
+        "two reducers over the SAME quantity in one region PASS -> the second reducer was never the cause",
+        "second reducer reading g_ub FAILS, reading w_ub PASSES -> g_ub is the FIRST buffer written before the loop, so the LEADING residency region is what goes stale",
+        "g_ub staged into a fragment before reducing STILL FAILS -> it is g_ub's VALUE, not how it is read",
+        "residency re-established every iteration PASSES; residency kept with versions pinned to 1 FAILS -> it is loop-carried residency, not buffer versioning"
+      ]
+    },
+    {
+      "id": "NON_POWER_OF_TWO_D",
+      "symptom": "D=2047 and D=1000 fail 'no available layout found'",
+      "cause": "layout inference refuses a shared buffer whose extent is not a power of two",
+      "fix": "UB padded to next_power_of_2(D); every producer writes only i<D and every reduction masks i<D"
+    },
+    {
+      "id": "DMA_SIZE_EQUALITY",
+      "symptom": "D=5120 and D=7168 fail 'CanProveEqual(src_total, dst_total)'",
+      "cause": "copies moved D elements into a PD-element buffer",
+      "fix": "region copies touch exactly D elements of the padded buffer (the verified RMSNorm example's own pattern)"
+    }
+  ],
+  "edge_tests": {
+    "driver": "mla-tl-run/p501_edge.py",
+    "result": "18/18 OK",
+    "cases": [
+      "alpha bound 0.05 / 0.5 / 0.95",
+      "epsilon bound 1e-8 / 1e-6 / 1e-3",
+      "N=2 (domain minimum)",
+      "M=1 decode at D=512 and D=4096",
+      "D tails 2047, 1000, 257, 100, 64",
+      "float16 at D=512 and D=1000",
+      "all-zero V (uniform softmax, agg==0)"
+    ]
+  },
+  "twin": {
+    "emitted_from": "targets/ascend/tilefoundry_ascend/attnres/twin.py",
+    "device_result": "compiled and executed; maxabs 9.77e-04 vs the FP32 reference on bf16 N=4 M=32 D=512",
+    "conformance": "MATCHED for both literal_fp32 and factored_gw",
+    "clauses": [
+      "one launch scope",
+      "RMS and score reductions along D with sqrt(D) temperature",
+      "weighted sum consumes ORIGINAL v",
+      "state declared float32",
+      "RMS denominator is the real D",
+      "store writes exactly the real D",
+      "(1-alpha)*x + alpha*agg blend",
+      "score path matches the declared mode",
+      "no hand-written cross-core flags"
+    ]
+  },
+  "not_claimed": [
+    "The persistent-group schedule (g += P, grid over 56 AIVs). Correctness was measured only with grid = M, one group per program. Persistent grouping is G51 work and is explicitly NOT claimed here.",
+    "Performance: no cycle timing, no bandwidth figure, no claim that this is the fastest of the three families.",
+    "The three-family comparison and the factored_gw vs literal_fp32 numerical comparison: those are G52 (task-11). This gate implements and verifies the online family with literal_fp32; factored_gw is emitted by the same module and structurally checked, but its device numerics are NOT claimed by this record.",
+    "V-prefetch depth 1/2/3 and FREE(V) last-consumer placement: G51 (task-12).",
+    "Formal proof over all inputs; correctness is demonstrated by the 20 official cases plus the listed edge tests.",
+    "CN block-state m_b/l_b/u_b reductions and cross-block merge for CN>1 on device: G52."
+  ],
+  "superseded_notes": "The 'PERSISTENT g += P is not claimed' statement below was true when written and is SUPERSEDED by G51: the persistent schedule is now implemented and verified. Kept here so the correction trail is visible."
+}

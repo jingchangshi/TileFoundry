@@ -14,6 +14,7 @@ from .ast_pattern import (
     MatchContext,
     parse_node,
 )
+from .pipeline_intents import register_pipeline_intents, verify_pipeline_intents
 
 
 class FuncParserVisitor:
@@ -54,7 +55,13 @@ def _extract_function_def(fn: FunctionType) -> tuple[ast.FunctionDef, str]:
 
 
 def parse_function(fn: FunctionType, context: FuncParserContext) -> Any:
-    """Parse one authored Python function using its typed parser context."""
+    """Parse one authored Python function using its typed parser context.
+
+    A `tf.pipelined` declaration is captured from the AST BEFORE the body is
+    walked, so dead-code elimination cannot remove the only record of it, then
+    checked against the typed HIR that actually survived. The expected set is
+    authored, never rebuilt from the surviving program.
+    """
     node, source_filename = _extract_function_def(fn)
     context = dataclasses.replace(
         context,
@@ -62,7 +69,15 @@ def parse_function(fn: FunctionType, context: FuncParserContext) -> Any:
             source_filename if context.source_filename == "<string>" else context.source_filename
         ),
     )
-    return FuncParserVisitor(context).visit_function(node)
+    intents = register_pipeline_intents(
+        node,
+        function_name=context.binding_name or fn.__name__,
+        dialect=context.dialect,
+    )
+    parsed = FuncParserVisitor(context).visit_function(node)
+    if context.dialect == "hir":
+        verify_pipeline_intents(intents, parsed)
+    return parsed
 
 
 __all__ = [

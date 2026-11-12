@@ -1,0 +1,16 @@
+SPLIT before_torch_import
+SPLIT imported 2.12.0+cpu 2.12.0 0.1.15+cpu.git0e687c17
+SPLIT before_compile
+SPLIT after_compile
+SPLIT before_set_device
+SPLIT after_set_device
+SPLIT before_alloc product
+SPLIT before_launch product
+SPLIT before_sync product
+SPLIT after_sync product
+SPLIT_RESULT {"case": "product", "passed": true, "max_abs_error": 0.0}
+SPLIT before_alloc square
+SPLIT before_launch square
+SPLIT before_sync square
+SPLIT after_sync square
+SPLIT_RESULT {"case": "square", "passed": true, "max_abs_error": 0.0}

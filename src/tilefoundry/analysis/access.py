@@ -9,6 +9,7 @@ import isl
 
 from tilefoundry.ir.core import Call, Constant, Expr, SSAValue, Tuple, Var
 from tilefoundry.ir.hir.loop_region import LoopRegion
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.schedule import ScheduleOp, instruction_schema
 from tilefoundry.ir.hir.sharding.local import Local
@@ -37,7 +38,7 @@ def forwarded_leaves(expr, ctx):
         values = expr.elements
     elif isinstance(expr, LoopRegion):
         values = expr.params[: len(expr.yield_values)] or (expr.body,)
-    elif isinstance(expr, MeshRegion):
+    elif isinstance(expr, (MeshRegion, ExecutionRegion)):
         values = (expr.body,)
     elif isinstance(expr, Var) and (argument := ctx.capture_root(expr)) is not expr:
         values = (argument,)

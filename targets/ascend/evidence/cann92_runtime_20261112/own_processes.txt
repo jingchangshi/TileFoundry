@@ -1,0 +1,80 @@
+    PID     ELAPSED COMMAND
+   6206  2-14:29:54 /usr/lib/systemd/systemd --user
+   6207  2-14:29:54 (sd-pam)
+   6237  2-14:29:54 /home/s00653124/.local/bin/mihomo -d /home/s00653124/.config/mihomo
+  13190  2-14:29:40 /usr/bin/dbus-daemon --session --address=systemd: --nofork --nopidfile --systemd-activation --syslog-only
+ 171637  2-14:11:36 tmux
+ 172084  2-14:11:35 -/bin/bash
+ 172122  2-14:11:35 -/bin/bash
+ 172188  2-14:11:35 -/bin/bash
+ 172279  2-14:11:35 -/bin/bash
+ 172359  2-14:11:35 -/bin/bash
+ 172445  2-14:11:35 -/bin/bash
+ 172604  2-14:11:35 -/bin/bash
+ 172686  2-14:11:35 -/bin/bash
+ 172821  2-14:11:35 -/bin/bash
+ 172999  2-14:11:35 -/bin/bash
+ 173060  2-14:11:35 -/bin/bash
+ 173227  2-14:11:35 -/bin/bash
+ 173381  2-14:11:35 -/bin/bash
+ 173521  2-14:11:35 -/bin/bash
+ 173613  2-14:11:35 -/bin/bash
+ 173648  2-14:11:35 -/bin/bash
+ 173742  2-14:11:35 -/bin/bash
+ 173883  2-14:11:35 -/bin/bash
+ 173971  2-14:11:35 -/bin/bash
+ 174461  2-14:11:34 top
+ 174512  2-14:11:34 nvim .git/info/exclude
+ 174528  2-14:11:34 nvim --embed .git/info/exclude
+ 174967  2-14:11:34 nvim /home/s00653124/.dsh/profiles/web/cordis.patch.yml
+ 174968  2-14:11:34 nvim --embed /home/s00653124/.dsh/profiles/web/cordis.patch.yml
+ 289531  2-03:00:11 nvim artifacts/run03/w40_vertical/ir_dump/03_tir_function.py
+ 289532  2-03:00:11 nvim --embed artifacts/run03/w40_vertical/ir_dump/03_tir_function.py
+ 315747  2-13:50:59 -bash
+ 463236  2-02:47:15 /bin/bash
+ 464314  2-02:47:12 yazi
+ 584974  2-13:13:14 -bash
+ 717386  2-12:56:37 /usr/bin/gpg-agent --supervised
+ 975016  2-12:20:14 python3 /home/s00653124/SoftwareProfiles/utils/user_usage.py --sort cpu -i 60 --top 10
+ 975017  2-12:20:14 tee user_usage.log
+1081393    20:45:52 nvim config/bundle-ai-compiler/cordis.patch.yml
+1081397    20:45:52 nvim --embed config/bundle-ai-compiler/cordis.patch.yml
+1102847    13:08:36 bash -c while [ ! -f team-ready ]; do sleep 0.01; done
+1123471    13:07:25 bash -c while [ ! -f team-ready ]; do sleep 0.01; done
+1158235    13:05:53 bash -c while [ ! -f team-ready ]; do sleep 0.01; done
+1189033       04:07 nvim agent_gates/adapters/tilefoundry-npu/env.sh
+1189035       04:07 nvim --embed agent_gates/adapters/tilefoundry-npu/env.sh
+1217904    13:04:01 bash -c while [ ! -f team-ready ]; do sleep 0.01; done
+1269058    13:02:52 bash -c while [ ! -f team-ready ]; do sleep 0.01; done
+1304696  1-01:12:02 yazi
+1368710       00:00 /home/s00653124/Softwares/node/bin/node --max-old-space-size=512 --input-type=module --eval const {openInheritedControlChannel}=await import("file:///home/s00653124/workspace/deepseek-harness/packages/subprocess/subprocess/src/control.ts");const {runNodeMain}=await import("file:///home/s00653124/workspace/deepseek-harness/packages/ptc-runtime/ptc-runtime-node/src/process.ts");await runNodeMain(openInheritedControlChannel(),134217728,process);
+1368818       00:00 bash -c ps -u "$USER" -o pid,etime,args > targets/ascend/evidence/cann92_runtime_20261112/own_processes.txt; git rev-parse HEAD > targets/ascend/evidence/cann92_runtime_20261112/source_head.txt
+1368925       00:00 ps -u s00653124 -o pid,etime,args
+1808565    19:54:59 sshd: s00653124@pts/141
+1808624    19:54:59 -bash
+1832099    19:53:19 tmux attach -t 0
+1841940    19:52:31 sshd: s00653124
+1992073    19:44:39 sshd: s00653124@notty
+1992077    19:44:39 sshd: s00653124@notty
+1992078    19:44:39 sshd: s00653124@notty
+1992153    19:44:39 /usr/lib/openssh/sftp-server
+1992154    19:44:39 /usr/lib/openssh/sftp-server
+1992158    19:44:39 /usr/lib/openssh/sftp-server
+2033746    02:24:49 node /home/s00653124/.local/bin/pnpm dsh web --port 13063
+2034419    02:24:48 node /home/s00653124/.local/share/pnpm/store/v11/links/@/pnpm/11.28.5/6592fb7f9a1a3846c4a2e1a097da75aec72b7fa17006120f55a16de6ca9cb10b/bin/../node_modules/pnpm/bin/pnpm.mjs dsh web --port 13063
+2034896    02:24:48 sh -c trap 'if [ "$?" -eq 130 ]; then trap - INT; kill -s INT $$; fi; trap "trap - INT; kill -s INT $$" INT' INT; node --import tsx/esm apps/cli/src/bin.ts web --port 13063
+2034899    02:24:48 node --import tsx/esm apps/cli/src/bin.ts web --port 13063
+2034900    02:24:48 sh -c trap '' INT TERM HUP groups=' ' while read -r line; do   group=${line#?}   case $line in     +*) groups="$groups$group " ;;     -*)       case $groups in         *" $group "*) groups="${groups%% "$group" *} ${groups#* "$group" }" ;;       esac       ;;   esac done for group in $groups; do kill -9 -"$group"; done
+2037095    02:24:47 /home/s00653124/workspace/deepseek-harness/node_modules/.pnpm/@esbuild+linux-x64@0.28.1/node_modules/@esbuild/linux-x64/bin/esbuild --service=0.28.1 --ping
+2039071    02:24:46 /home/s00653124/workspace/AgentGates/.venv/bin/python -s -m agent_gates.mcp_server
+2039074    02:24:46 /home/s00653124/workspace/AgentGates/.venv/bin/python -s -m agent_gates.mcp_server
+2981849    23:18:08 -bash
+3236252    18:53:53 nvim
+3236253    18:53:53 nvim --embed
+3236601    18:53:52 /usr/bin/sh -c fzf --bind 'f4:toggle-preview,shift-down:preview-page-down,alt-shift-down:preview-down,ctrl-b:half-page-up,ctrl-a:beginning-of-line,shift-up:preview-page-up,ctrl-u:unix-line-discard,ctrl-f:half-page-down,ctrl-z:abort,ctrl-e:end-of-line,f3:toggle-preview-wrap,alt-G:last,alt-g:first,alt-a:toggle-all,alt-shift-up:preview-up' --bind 'alt-Q:execute-silent:'\''/home/s00653124/Softwares/nvim/bin/nvim'\'' -u NONE -l '\''/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua'\'' 1 nil {+} {q} {n}' --bind 'alt-q:execute-silent:'\''/home/s00653124/Softwares/nvim/bin/nvim'\'' -u NONE -l '\''/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua'\'' 2 nil {+} {q} {n}' --bind 'ctrl-s:execute-silent:'\''/home/s00653124/Softwares/nvim/bin/nvim'\'' -u NONE -l '\''/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua'\'' 6 nil {+} {q} {n}' --bind 'ctrl-t:execute-silent:'\''/home/s00653124/Softwares/nvim/bin/nvim'\'' -u NONE -l '\''/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua'\'' 7 nil {+} {q} {n}' --bind 'esc:execute-silent:'\''/home/s00653124/Softwares/nvim/bin/nvim'\'' -u NONE -l '\''/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua'\'' 3 nil {+} {q} {n}' --bind 'ctrl-v:execute-silent:'\''/home/s00653124/Softwares/nvim/bin/nvim'\'' -u NONE -l '\''/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua'\'' 5 nil {+} {q} {n}' --bind 'enter:execute-silent:'\''/home/s00653124/Softwares/nvim/bin/nvim'\'' -u NONE -l '\''/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua'\'' 4 nil {+} {q} {n}' --bind 'alt-h:print(alt-h)+accept,alt-i:print(alt-i)+accept,ctrl-q:print(ctrl-q)+accept,ctrl-c:print(ctrl-c)+accept,ctrl-g:print(ctrl-g)+accept,alt-f:print(alt-f)+accept' --preview-window 'nohidden:right:0' --border 'none' --preview ''\''/home/s00653124/Softwares/nvim/bin/nvim'\'' -u NONE -l '\''/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua'\'' 8 nil {} {q} {n}' --print-query --border-label '?[38;2;235;219;178m?[48;2;40;40;40m Grep ?[0m ?[48;2;60;56;54m h ?[0m' --header ':: <?[38;2;255;235;205mctrl-g?[0m> to ?[38;2;255;64;64mFuzzy Search?[0m' --disabled --color 'hl+:-1:reverse,hl:-1:reverse,query:#ff82ab' --prompt 'Rg❯ ' --layout 'reverse' --ansi --highlight-line --multi --height '100%' --query '' --info 'inline-right' --bind='change:+reload:'\''/home/s00653124/Softwares/nvim/bin/nvim'\'' -u NONE -l '\''/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/spawn.lua'\'' '\''return [==[ZG8gbG9jYWwgXyA9IHtnbG9iX3NlcGFyYXRvciA9ICIlcyUtJS0iLCBnbG9iX2ZsYWcgPSAiLS1pZ2xvYiIsIGcgPSB7X0VPTCA9ICJcbiIsIF9memZfbHVhX3NlcnZlciA9ICIvcnVuL3VzZXIvMTA3MS9memYtbHVhLjE3OTQzOTA2NTkuMzIzNjI1My4xIn0sIGNvbG9yX2ljb25zID0gdHJ1ZSwgcmdfZ2xvYiA9IDEsIGZpbGVfaWNvbnMgPSAxLCBnaXRfaWNvbnMgPSBmYWxzZSwgZm5fcHJlcHJvY2VzcyA9ICJyZXR1cm4gcmVxdWlyZShcImZ6Zi1sdWEubWFrZV9lbnRyeVwiKS5wcmVwcm9jZXNzIiwgZm5fdHJhbnNmb3JtID0gInJldHVybiByZXF1aXJlKFwiZnpmLWx1YS5tYWtlX2VudHJ5XCIpLmZpbGUiLCBpc19saXZlID0gdHJ1ZSwgY29udGVudHMgPSAoKGxvYWRzdHJpbmcgb3IgbG9hZCkoIlwyN0xKXDJcOE5AL2hvbWUvczAwNjUzMTI0Ly5sb2NhbC9zaGFyZS9udmltL2xhenkvZnpmLWx1YS9sdWEvZnpmLWx1YS9wcm92aWRlcnMvZ3JlcC5sdWFKXDBcMlw2XDBcM1wwXDZcMTWvXDFcMDAyNlwyXDBcMDAwOVwyXDFcMDAyOVwyXDJcMlwxOFw0XDBcMFwxOFw1XDFcMERcMlwzXDBcbmxncmVwXDE1bWFrZV9lbnRyeVwxMUZ6Zkx1YVwxXDFcMVwxXDFcMXNcMFwwXDdvXDBcMFw3XDBcMCIsJ0BzZXJpYWxpemVkJykpfTsgcmV0dXJuIF87IGVuZA==]==]'\'' {q} 2>&1 || true' --bind='start:+reload:'\''/home/s00653124/Softwares/nvim/bin/nvim'\'' -u NONE -l '\''/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/spawn.lua'\'' '\''return [==[ZG8gbG9jYWwgXyA9IHtnbG9iX3NlcGFyYXRvciA9ICIlcyUtJS0iLCBnbG9iX2ZsYWcgPSAiLS1pZ2xvYiIsIGcgPSB7X0VPTCA9ICJcbiIsIF9memZfbHVhX3NlcnZlciA9ICIvcnVuL3VzZXIvMTA3MS9memYtbHVhLjE3OTQzOTA2NTkuMzIzNjI1My4xIn0sIGNvbG9yX2ljb25zID0gdHJ1ZSwgcmdfZ2xvYiA9IDEsIGZpbGVfaWNvbnMgPSAxLCBnaXRfaWNvbnMgPSBmYWxzZSwgZm5fcHJlcHJvY2VzcyA9ICJyZXR1cm4gcmVxdWlyZShcImZ6Zi1sdWEubWFrZV9lbnRyeVwiKS5wcmVwcm9jZXNzIiwgZm5fdHJhbnNmb3JtID0gInJldHVybiByZXF1aXJlKFwiZnpmLWx1YS5tYWtlX2VudHJ5XCIpLmZpbGUiLCBpc19saXZlID0gdHJ1ZSwgY29udGVudHMgPSAoKGxvYWRzdHJpbmcgb3IgbG9hZCkoIlwyN0xKXDJcOE5AL2hvbWUvczAwNjUzMTI0Ly5sb2NhbC9zaGFyZS9udmltL2xhenkvZnpmLWx1YS9sdWEvZnpmLWx1YS9wcm92aWRlcnMvZ3JlcC5sdWFKXDBcMlw2XDBcM1wwXDZcMTWvXDFcMDAyNlwyXDBcMDAwOVwyXDFcMDAyOVwyXDJcMlwxOFw0XDBcMFwxOFw1XDFcMERcMlwzXDBcbmxncmVwXDE1bWFrZV9lbnRyeVwxMUZ6Zkx1YVwxXDFcMVwxXDFcMXNcMFwwXDdvXDBcMFw3XDBcMCIsJ0BzZXJpYWxpemVkJykpfTsgcmV0dXJuIF87IGVuZA==]==]'\'' {q} 2>&1 || true' --bind='zero:+execute-silent(mkdir '\''/tmp/nvim.s00653124/gjNGMm/1'\'' && '\''/home/s00653124/Softwares/nvim/bin/nvim'\'' -u NONE -l '\''/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua'\'' 9 nil )' --bind='resize:+transform:'\''/home/s00653124/Softwares/nvim/bin/nvim'\'' -u NONE -l '\''/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua'\'' 10 nil $FZF_PREVIEW_LINES' > '/tmp/nvim.s00653124/gjNGMm/2'
+3236602    18:53:52 fzf --bind f4:toggle-preview,shift-down:preview-page-down,alt-shift-down:preview-down,ctrl-b:half-page-up,ctrl-a:beginning-of-line,shift-up:preview-page-up,ctrl-u:unix-line-discard,ctrl-f:half-page-down,ctrl-z:abort,ctrl-e:end-of-line,f3:toggle-preview-wrap,alt-G:last,alt-g:first,alt-a:toggle-all,alt-shift-up:preview-up --bind alt-Q:execute-silent:'/home/s00653124/Softwares/nvim/bin/nvim' -u NONE -l '/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua' 1 nil {+} {q} {n} --bind alt-q:execute-silent:'/home/s00653124/Softwares/nvim/bin/nvim' -u NONE -l '/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua' 2 nil {+} {q} {n} --bind ctrl-s:execute-silent:'/home/s00653124/Softwares/nvim/bin/nvim' -u NONE -l '/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua' 6 nil {+} {q} {n} --bind ctrl-t:execute-silent:'/home/s00653124/Softwares/nvim/bin/nvim' -u NONE -l '/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua' 7 nil {+} {q} {n} --bind esc:execute-silent:'/home/s00653124/Softwares/nvim/bin/nvim' -u NONE -l '/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua' 3 nil {+} {q} {n} --bind ctrl-v:execute-silent:'/home/s00653124/Softwares/nvim/bin/nvim' -u NONE -l '/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua' 5 nil {+} {q} {n} --bind enter:execute-silent:'/home/s00653124/Softwares/nvim/bin/nvim' -u NONE -l '/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua' 4 nil {+} {q} {n} --bind alt-h:print(alt-h)+accept,alt-i:print(alt-i)+accept,ctrl-q:print(ctrl-q)+accept,ctrl-c:print(ctrl-c)+accept,ctrl-g:print(ctrl-g)+accept,alt-f:print(alt-f)+accept --preview-window nohidden:right:0 --border none --preview '/home/s00653124/Softwares/nvim/bin/nvim' -u NONE -l '/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua' 8 nil {} {q} {n} --print-query --border-label ?[38;2;235;219;178m?[48;2;40;40;40m Grep ?[0m ?[48;2;60;56;54m h ?[0m --header :: <?[38;2;255;235;205mctrl-g?[0m> to ?[38;2;255;64;64mFuzzy Search?[0m --disabled --color hl+:-1:reverse,hl:-1:reverse,query:#ff82ab --prompt Rg❯  --layout reverse --ansi --highlight-line --multi --height 100% --query  --info inline-right --bind=change:+reload:'/home/s00653124/Softwares/nvim/bin/nvim' -u NONE -l '/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/spawn.lua' 'return [==[ZG8gbG9jYWwgXyA9IHtnbG9iX3NlcGFyYXRvciA9ICIlcyUtJS0iLCBnbG9iX2ZsYWcgPSAiLS1pZ2xvYiIsIGcgPSB7X0VPTCA9ICJcbiIsIF9memZfbHVhX3NlcnZlciA9ICIvcnVuL3VzZXIvMTA3MS9memYtbHVhLjE3OTQzOTA2NTkuMzIzNjI1My4xIn0sIGNvbG9yX2ljb25zID0gdHJ1ZSwgcmdfZ2xvYiA9IDEsIGZpbGVfaWNvbnMgPSAxLCBnaXRfaWNvbnMgPSBmYWxzZSwgZm5fcHJlcHJvY2VzcyA9ICJyZXR1cm4gcmVxdWlyZShcImZ6Zi1sdWEubWFrZV9lbnRyeVwiKS5wcmVwcm9jZXNzIiwgZm5fdHJhbnNmb3JtID0gInJldHVybiByZXF1aXJlKFwiZnpmLWx1YS5tYWtlX2VudHJ5XCIpLmZpbGUiLCBpc19saXZlID0gdHJ1ZSwgY29udGVudHMgPSAoKGxvYWRzdHJpbmcgb3IgbG9hZCkoIlwyN0xKXDJcOE5AL2hvbWUvczAwNjUzMTI0Ly5sb2NhbC9zaGFyZS9udmltL2xhenkvZnpmLWx1YS9sdWEvZnpmLWx1YS9wcm92aWRlcnMvZ3JlcC5sdWFKXDBcMlw2XDBcM1wwXDZcMTWvXDFcMDAyNlwyXDBcMDAwOVwyXDFcMDAyOVwyXDJcMlwxOFw0XDBcMFwxOFw1XDFcMERcMlwzXDBcbmxncmVwXDE1bWFrZV9lbnRyeVwxMUZ6Zkx1YVwxXDFcMVwxXDFcMXNcMFwwXDdvXDBcMFw3XDBcMCIsJ0BzZXJpYWxpemVkJykpfTsgcmV0dXJuIF87IGVuZA==]==]' {q} 2>&1 || true --bind=start:+reload:'/home/s00653124/Softwares/nvim/bin/nvim' -u NONE -l '/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/spawn.lua' 'return [==[ZG8gbG9jYWwgXyA9IHtnbG9iX3NlcGFyYXRvciA9ICIlcyUtJS0iLCBnbG9iX2ZsYWcgPSAiLS1pZ2xvYiIsIGcgPSB7X0VPTCA9ICJcbiIsIF9memZfbHVhX3NlcnZlciA9ICIvcnVuL3VzZXIvMTA3MS9memYtbHVhLjE3OTQzOTA2NTkuMzIzNjI1My4xIn0sIGNvbG9yX2ljb25zID0gdHJ1ZSwgcmdfZ2xvYiA9IDEsIGZpbGVfaWNvbnMgPSAxLCBnaXRfaWNvbnMgPSBmYWxzZSwgZm5fcHJlcHJvY2VzcyA9ICJyZXR1cm4gcmVxdWlyZShcImZ6Zi1sdWEubWFrZV9lbnRyeVwiKS5wcmVwcm9jZXNzIiwgZm5fdHJhbnNmb3JtID0gInJldHVybiByZXF1aXJlKFwiZnpmLWx1YS5tYWtlX2VudHJ5XCIpLmZpbGUiLCBpc19saXZlID0gdHJ1ZSwgY29udGVudHMgPSAoKGxvYWRzdHJpbmcgb3IgbG9hZCkoIlwyN0xKXDJcOE5AL2hvbWUvczAwNjUzMTI0Ly5sb2NhbC9zaGFyZS9udmltL2xhenkvZnpmLWx1YS9sdWEvZnpmLWx1YS9wcm92aWRlcnMvZ3JlcC5sdWFKXDBcMlw2XDBcM1wwXDZcMTWvXDFcMDAyNlwyXDBcMDAwOVwyXDFcMDAyOVwyXDJcMlwxOFw0XDBcMFwxOFw1XDFcMERcMlwzXDBcbmxncmVwXDE1bWFrZV9lbnRyeVwxMUZ6Zkx1YVwxXDFcMVwxXDFcMXNcMFwwXDdvXDBcMFw3XDBcMCIsJ0BzZXJpYWxpemVkJykpfTsgcmV0dXJuIF87IGVuZA==]==]' {q} 2>&1 || true --bind=zero:+execute-silent(mkdir '/tmp/nvim.s00653124/gjNGMm/1' && '/home/s00653124/Softwares/nvim/bin/nvim' -u NONE -l '/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua' 9 nil ) --bind=resize:+transform:'/home/s00653124/Softwares/nvim/bin/nvim' -u NONE -l '/home/s00653124/.local/share/nvim/lazy/fzf-lua/lua/fzf-lua/rpc.lua' 10 nil $FZF_PREVIEW_LINES
+3239505    18:53:46 clangd --background-index=false --clang-tidy=false --log=error --completion-style=detailed --header-insertion=iwyu
+3868757  1-03:16:23 nvim sync.py
+3868758  1-03:16:23 nvim --embed sync.py
+3968585  2-03:39:46 nvim agent_gates/adapters/bska-npu/env.sh
+3968586  2-03:39:46 nvim --embed agent_gates/adapters/bska-npu/env.sh

@@ -1,0 +1,41 @@
+{
+  "scope": "AR RMS product primitive: 2 inputs, 4x64 f32; not complete AR/MLA or performance gates",
+  "compile_status": "PASS",
+  "device_status": "NOT_RUN",
+  "device_failure_stage": "torch.npu.set_device(0) before TF import/compile/launch",
+  "device_initialization_status": "BLOCKED_ENV",
+  "error_codes": [
+    "507033",
+    "E39006"
+  ],
+  "auto_schedule": false,
+  "pass_configs": {
+    "tl.enable_auto_schedule": false
+  },
+  "author_sha256": "c20fcc28bd1411a91651df52b243f71a8f254e4724a3ef2f723836c9959f2082",
+  "plan_digest": "sha256:7a902cca133d051a41a9180b9244de1ef5aeef0ecbb4d8377b690243cb5716ec",
+  "tir_digest": "936c5b3ca6eb44f1a5d3466220446a429024a00c6acf7c98cd0f0de358913da3",
+  "tl_sha256": "022e44a121c84bcc864f99b7483f56508471506662420bf488f8210109f1a5e9",
+  "cce_sha256": "97169f6eef0a98bd426c8d6455406dc2cc065a00874ede2149f15f37b1ab8fe5",
+  "cce_bytes": 6872,
+  "compile_job": "bash-4c89b117b7bc49b8",
+  "compile_exit_code": 0,
+  "device_job": "bash-42292cd687dc4d78",
+  "device_exit_code": 1,
+  "cpu_validation": "Lead independent native+materialization+G33+G42: 52 passed in 8.59s; implementer native faults 8 passed in2.13s",
+  "environment": {
+    "python": "../envs/tfnpu-v2/bin/python",
+    "cann_source": "/data/pri/9.3.0-weekly/cann-9.3.0/set_env.sh",
+    "device_lock": "/home/.tf_device0.lock",
+    "device": 0
+  },
+  "limitations": [
+    "No NPU kernel launch occurred; numerical correctness against device not established",
+    "No performance or single-launch trace acceptance",
+    "Static serial single-version backend only; no symbolic pipeline or generic lexical binder support",
+    "Only native arithmetic vadd/vmul transport micro-case supported; masks full f32 only",
+    "bind/invoke/readback public generic runtime paths remain explicitly unimplemented",
+    "Logs are transcribed extracts; full native output in session tool records"
+  ],
+  "next": "Existing user authorization covers normal locked device execution; no new user confirmation is required. Continue once the environment is ready and Lead resumes this task. Diagnose initialization failure read-only first; never reset a suspected hung device."
+}

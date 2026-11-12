@@ -1,0 +1,51 @@
+[ERROR] DRV(202413,python):2026-11-12-12:22:36.081.072 [hdc_file_common.c:787][ascend][curpid:202413,202413][drv][hdc][validate_file]Open file error. (file="/data/pri/9.3.0-weekly/cann-9.3.0/opp/built-in/op_impl/aicpu/kernel/aicpu_hccl.tar.gz"; strerror="Permission denied")
+[ERROR] DRV(202413,python):2026-11-12-12:22:36.081.076 [hdc_file_common.c:893][ascend][curpid:202413,202413][drv][hdc][send_file_in_session]Calling validate_file error.
+[ERROR] TDT(202413,python):2026-11-12-12:22:36.081.190 [package_sender.cpp:54][SendAICPUPackageSimple][tid:202413] [TsdClient][deviceId=0] drvHdcSendFile file[/data/pri/9.3.0-weekly/cann-9.3.0/opp/built-in/op_impl/aicpu/kernel/aicpu_hccl.tar.gz] to [/home/HwHiAiUser/hdcd/device0/aicpu/202413_aicpu_hccl.tar.gz] failed ret = 53
+[ERROR] TDT(202413,python):2026-11-12-12:22:36.081.320 [package_sender.cpp:319][CompareAndSendCommonSinkPkg][tid:202413] send common sink package to device failed
+[ERROR] TDT(202413,python):2026-11-12-12:22:36.081.322 [package_loader.cpp:496][LoadSinglePackageToDevice][tid:202413] compare and send package to device failed package:aicpu_hccl.tar.gz
+[ERROR] TDT(202413,python):2026-11-12-12:22:36.081.327 [tsd_process_controller.cpp:104][LoadPackagesToDevice][tid:202413] Load package to device by config failed
+[ERROR] TDT(202413,python):2026-11-12-12:22:36.081.329 [tsd_process_controller.cpp:69][OpenProcess][tid:202413] Load packages to device failed.
+[ERROR] TDT(202413,python):2026-11-12-12:22:36.081.331 [tsd_client.cpp:28][TsdOpen][tid:202413] TsdOpen failed, deviceId[0].
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:36.081.346 [runtime.cc:2238]202413 PrintfTsdError:TsdOpen failed. devId=0, tdt error=1.
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:36.081.363 [runtime.cc:3229]202413 DeviceRetain:Start AI CPU executor failed, retCode=0x7020009, devId=0.
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:38.051.163 [runtime.cc:3282]202413 DeviceRetain:Check param failed, dev can not be NULL!
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:38.051.219 [runtime.cc:2826]202413 PrimaryContextRetain:Primary context retain failed, devId=0, ts_id=0, retCode=0x7010006
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:38.051.222 [api_impl.cc:2819]202413 SetDevice:context is NULL!
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:38.051.226 [api_error.cc:3287]202413 SetDevice:Set device failed, device_id=0, the current input soc version is null.
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:38.051.246 [api_c_device.cc:69]202413 rtSetDevice:ErrCode=507033, desc=[device retain error], InnerCode=0x7010006
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:38.051.250 [error_message_manage.cc:76]202413 FuncErrorReason:rtSetDevice execution failed, reason=device retain error
+[ERROR] DRV(202413,python):2026-11-12-12:22:38.325.987 [hdc_file_common.c:787][ascend][curpid:202413,202413][drv][hdc][validate_file]Open file error. (file="/data/pri/9.3.0-weekly/cann-9.3.0/opp/built-in/op_impl/aicpu/kernel/aicpu_hccl.tar.gz"; strerror="Permission denied")
+[ERROR] DRV(202413,python):2026-11-12-12:22:38.325.992 [hdc_file_common.c:893][ascend][curpid:202413,202413][drv][hdc][send_file_in_session]Calling validate_file error.
+[ERROR] TDT(202413,python):2026-11-12-12:22:38.326.288 [package_sender.cpp:54][SendAICPUPackageSimple][tid:202413] [TsdClient][deviceId=0] drvHdcSendFile file[/data/pri/9.3.0-weekly/cann-9.3.0/opp/built-in/op_impl/aicpu/kernel/aicpu_hccl.tar.gz] to [/home/HwHiAiUser/hdcd/device0/aicpu/202413_aicpu_hccl.tar.gz] failed ret = 53
+[ERROR] TDT(202413,python):2026-11-12-12:22:38.326.330 [package_sender.cpp:319][CompareAndSendCommonSinkPkg][tid:202413] send common sink package to device failed
+[ERROR] TDT(202413,python):2026-11-12-12:22:38.326.332 [package_loader.cpp:496][LoadSinglePackageToDevice][tid:202413] compare and send package to device failed package:aicpu_hccl.tar.gz
+[ERROR] TDT(202413,python):2026-11-12-12:22:38.326.341 [tsd_process_controller.cpp:104][LoadPackagesToDevice][tid:202413] Load package to device by config failed
+[ERROR] TDT(202413,python):2026-11-12-12:22:38.326.343 [tsd_process_controller.cpp:69][OpenProcess][tid:202413] Load packages to device failed.
+[ERROR] TDT(202413,python):2026-11-12-12:22:38.326.345 [tsd_client.cpp:28][TsdOpen][tid:202413] TsdOpen failed, deviceId[0].
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:38.326.361 [runtime.cc:2238]202413 PrintfTsdError:TsdOpen failed. devId=0, tdt error=1.
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:38.326.375 [runtime.cc:3229]202413 DeviceRetain:Start AI CPU executor failed, retCode=0x7020009, devId=0.
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:41.053.818 [runtime.cc:3282]202413 DeviceRetain:Check param failed, dev can not be NULL!
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:41.053.868 [runtime.cc:2826]202413 PrimaryContextRetain:Primary context retain failed, devId=0, ts_id=0, retCode=0x7010006
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:41.053.871 [api_impl.cc:2819]202413 SetDevice:context is NULL!
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:41.053.883 [context_manage.cc:111]202413 ReportContextValidationError:Context validation failed. Reason: No valid context is bound to the current thread. Call aclrtSetDevice or aclrtSetCurrentContext to bind a valid context to the current thread before calling this API. ErrorCode=EE1018.
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:41.053.956 [api_impl_standard_soc.cc:859]202413 GetDevMsg:Failed to GetDeviceErrMsg, retCode=0x7070001.
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:41.053.960 [api_error.cc:4887]202413 GetDevMsg:GetDeviceMsg failed, getMsgType=GET_DEV_ERROR_MSG(0).
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:41.053.981 [api_c_device.cc:378]202413 rtGetDevMsg:ErrCode=107002, desc=[the context is a null pointer], InnerCode=0x7070001
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:41.053.985 [error_message_manage.cc:53]202413 FuncErrorReason:rtGetDevMsg execution failed, the context is a null pointer.
+[ERROR] DRV(202413,python):2026-11-12-12:22:41.347.565 [hdc_file_common.c:787][ascend][curpid:202413,202413][drv][hdc][validate_file]Open file error. (file="/data/pri/9.3.0-weekly/cann-9.3.0/opp/built-in/op_impl/aicpu/kernel/aicpu_hccl.tar.gz"; strerror="Permission denied")
+[ERROR] DRV(202413,python):2026-11-12-12:22:41.347.573 [hdc_file_common.c:893][ascend][curpid:202413,202413][drv][hdc][send_file_in_session]Calling validate_file error.
+[ERROR] TDT(202413,python):2026-11-12-12:22:41.349.552 [package_sender.cpp:54][SendAICPUPackageSimple][tid:202413] [TsdClient][deviceId=0] drvHdcSendFile file[/data/pri/9.3.0-weekly/cann-9.3.0/opp/built-in/op_impl/aicpu/kernel/aicpu_hccl.tar.gz] to [/home/HwHiAiUser/hdcd/device0/aicpu/202413_aicpu_hccl.tar.gz] failed ret = 53
+[ERROR] TDT(202413,python):2026-11-12-12:22:41.349.597 [package_sender.cpp:319][CompareAndSendCommonSinkPkg][tid:202413] send common sink package to device failed
+[ERROR] TDT(202413,python):2026-11-12-12:22:41.349.600 [package_loader.cpp:496][LoadSinglePackageToDevice][tid:202413] compare and send package to device failed package:aicpu_hccl.tar.gz
+[ERROR] TDT(202413,python):2026-11-12-12:22:41.349.605 [tsd_process_controller.cpp:104][LoadPackagesToDevice][tid:202413] Load package to device by config failed
+[ERROR] TDT(202413,python):2026-11-12-12:22:41.349.607 [tsd_process_controller.cpp:69][OpenProcess][tid:202413] Load packages to device failed.
+[ERROR] TDT(202413,python):2026-11-12-12:22:41.349.609 [tsd_client.cpp:28][TsdOpen][tid:202413] TsdOpen failed, deviceId[0].
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:41.349.627 [runtime.cc:2238]202413 PrintfTsdError:TsdOpen failed. devId=0, tdt error=1.
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:41.349.640 [runtime.cc:3229]202413 DeviceRetain:Start AI CPU executor failed, retCode=0x7020009, devId=0.
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:44.055.931 [runtime.cc:3282]202413 DeviceRetain:Check param failed, dev can not be NULL!
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:44.055.979 [runtime.cc:2826]202413 PrimaryContextRetain:Primary context retain failed, devId=0, ts_id=0, retCode=0x7010006
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:44.055.983 [api_impl.cc:2819]202413 SetDevice:context is NULL!
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:44.056.006 [context_manage.cc:111]202413 ReportContextValidationError:Context validation failed. Reason: No valid context is bound to the current thread. Call aclrtSetDevice or aclrtSetCurrentContext to bind a valid context to the current thread before calling this API. ErrorCode=EE1018.
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:44.056.038 [api_impl.cc:4997]202413 GetFaultEvent:Current Context is null, drv devId[0].
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:44.056.056 [api_c.cc:2409]202413 rtGetFaultEvent:ErrCode=107002, desc=[the context is a null pointer], InnerCode=0x7070001
+[ERROR] RUNTIME(202413,python):2026-11-12-12:22:44.056.061 [error_message_manage.cc:53]202413 FuncErrorReason:rtGetFaultEvent execution failed, the context is a null pointer.

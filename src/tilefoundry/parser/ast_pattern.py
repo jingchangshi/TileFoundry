@@ -38,6 +38,7 @@ from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.math.unary import Unary
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.sharding.local import Local
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
@@ -55,6 +56,7 @@ from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.shape import ShapeOf
 from tilefoundry.ir.tir.stmts import (
     Evaluate,
+    ExecutionScope,
     For,
     If,
     LetStmt,
@@ -111,7 +113,9 @@ def _hardware_context(target: Target | None) -> dict[str, object]:
     except UnsupportedCapabilityError:
         return {}
     allowed = tuple(resolve_storage(level.name) for level in facts.explicit_levels)
-    return {"allowed_storage": (*allowed, StorageKind.UMAT)}
+    # CARRIER is a register class, not a memory level: it is admitted like UMAT is, and
+    # the execution mode (register_storages) decides where it may actually live.
+    return {"allowed_storage": (*allowed, StorageKind.UMAT, StorageKind.CARRIER)}
 
 
 def _resolve_mesh_topologies(
@@ -273,7 +277,9 @@ runtime = SimpleNamespace(
     Local=Local,
     LetStmt=LetStmt,
     MeshScope=MeshScope,
+    ExecutionScope=ExecutionScope,
     MeshRegion=MeshRegion,
+    ExecutionRegion=ExecutionRegion,
     If=If,
     While=While,
     MeshCoord=MeshCoord,
@@ -852,6 +858,7 @@ class ParserState:
     mesh_coordinates: dict[tuple[int, int], object] = field(default_factory=dict)
     opened_mesh: bool = False
     unscoped_call: ast.AST | None = None
+    execution_stack: list[object] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -866,6 +873,7 @@ class LoopFrame:
     phi_vars: tuple[object, ...]
     params: tuple[object, ...]
     args: tuple[object, ...]
+    pipeline: object | None = None
 
 
 @dataclass(frozen=True)

@@ -7,6 +7,7 @@ from enum import Enum
 from itertools import accumulate
 from math import prod
 
+from tilefoundry.ir.core.param_def import collect_param_defs
 from tilefoundry.ir.core import (
     Call,
     Constant,
@@ -591,6 +592,12 @@ def check_call(op, operands, mesh, *, frame, repeat=None, order=None, projection
         if pattern is not None and not matcher.match(pattern, match_type):
             raise _pattern_refusal(matcher, op, param.name)
     named = dict(zip((p.name for p in params), tiles.tiles, strict=True))
+    # Attribute values are operands of the RULE, not of the tile projection: pass them into
+    # the constraint map so a between rule can discriminate on them (e.g. vld's dist).
+    # Without this, a rule that names an attribute silently sees None and cannot enforce it.
+    for declared_param in collect_param_defs(type(op)):
+        if declared_param.kind == "attribute":
+            named.setdefault(declared_param.name, getattr(op, declared_param.name, None))
     for rule in between_rules(type(op)):
         if not rule.holds(named):
             raise ScheduleRefusal(rule.refused(named), path=matcher.bindings, op=op)

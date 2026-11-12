@@ -12,11 +12,19 @@ from typing import Iterable
 
 from tilefoundry.inspection.tir_printer import TirPrinter
 from tilefoundry.ir.core import Expr, Op, Var, VerifyError
+from tilefoundry.ir.core.execution import declared_mask_width, is_structural
 from tilefoundry.ir.core.expr import Call, Constant
 from tilefoundry.ir.core.metadata import diagnostic_location
 from tilefoundry.ir.core.module import Module, ModuleList, resolve_symbol
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
+from tilefoundry.ir.core.param_def import MemoryEffect
+from tilefoundry.ir.core.execution import (
+    declared_kinds,
+    execution_kind,
+    region_requirement,
+)
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
 from tilefoundry.ir.hir.specialize import canonical_specialization_signature
@@ -28,6 +36,7 @@ from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.shape import ShapeOf
 from tilefoundry.ir.tir.stmt import Stmt
 from tilefoundry.ir.tir.stmts import (
+    ExecutionScope,
     Evaluate,
     For,
     If,
@@ -38,7 +47,7 @@ from tilefoundry.ir.tir.stmts import (
     While,
 )
 from tilefoundry.ir.tir.symbol_ref import SymbolRef
-from tilefoundry.ir.types import DType, TensorType, UnitType
+from tilefoundry.ir.types import DType, StorageKind, TensorType, UnitType
 from tilefoundry.ir.types.callable_type import callable_type_for_prim_function
 from tilefoundry.ir.types.dim import (
     DimAdd,
@@ -87,6 +96,110 @@ def verify_region_isolated(region: LoopRegion | MeshRegion, ctx=None) -> None:
     if ctx is not None:
         ctx.error(region, message)
     raise VerifyError(f"{type(region).__name__}: {message}")
+
+
+
+
+def execution_kind_declaration(kind: str):
+    """The declaration named *kind*, or a precise refusal when none declares it.
+
+    A region that names no declared mode has no boundary to check, so an unknown
+    kind is refused rather than treated as an unconstrained region. The same is
+    true of a declaration that states no mask width: a mode whose instructions
+    cannot be bounded cannot be checked, and passing it would be a silent
+    admission of every width.
+    """
+    declared = execution_kind(kind)
+    if declared is None:
+        raise VerifyError(
+            f"execution region names undeclared kind {kind!r}; declared kinds are "
+            f"{tuple(item.name for item in declared_kinds())!r}"
+        )
+    return declared
+
+
+def current_execution_kinds(ctx) -> tuple:
+    """The execution modes in force at *ctx*, innermost first."""
+    if ctx is None:
+        return ()
+    held = [
+        ctx_.owner.declaration()
+        for ctx_ in ctx.ancestors()
+        if isinstance(ctx_.owner, ExecutionRegion)
+    ]
+    return tuple(held)
+
+
+def _mesh_topology_names(mesh) -> tuple[str, ...]:
+    """The level names of *mesh*, or an empty tuple when it states none."""
+    if mesh is None:
+        return ()
+    return tuple(
+        str(getattr(topology, "name", topology)) for topology in getattr(mesh, "topologies", ())
+    )
+
+
+def verify_execution_boundary(region, ctx) -> None:
+    """Check one execution region states a mode that may be entered here.
+
+    Everything here is about the boundary; the body is the body walker s
+    question. Four refusals, each of which would otherwise be a silent yes:
+
+    - a kind nothing declares, which has no rules to hold the region to;
+    - a declaration with no mask width, whose instructions cannot be bounded;
+    - a declaration with no required topology, which names no domain at all;
+    - an enclosing mode that is not nestable, which for the parser and for
+      this check alike means no execution region may be entered inside it.
+
+    The domain itself is read off the mesh *in force at the region*, never off
+    the module declaration: a module that declares an AIV level says what the
+    program may use, not that every region in it runs there. A region with no
+    mesh in force therefore states a mode with nowhere to run and is refused,
+    which is also why a module declaring no topologies cannot slip through as
+    an empty set that trivially contains the requirement.
+    """
+    if ctx is None:
+        raise VerifyError(
+            "ExecutionRegion: this boundary cannot be checked without a lexical "
+            "context; the kind, the domain in force and the enclosing modes are all "
+            "properties of where the region sits. Verify it from a walk that has one."
+        )
+    declared = execution_kind_declaration(region.kind)
+    if declared.mask_width_bits is None:
+        ctx.error(
+            region,
+            f"execution region {declared.name!r} declares no mask width; "
+            "a mode whose element width is unstated cannot bound its instructions",
+        )
+    if not declared.required_topologies:
+        ctx.error(
+            region,
+            f"execution region {declared.name!r} declares no required topology; "
+            "a mode with no domain is not a mode this program can be checked against",
+        )
+    for outer in current_execution_kinds(ctx):
+        if not outer.nestable:
+            ctx.error(
+                region,
+                f"execution region {declared.name!r} is entered inside "
+                f"{outer.name!r}, which is not nestable; no execution region may be "
+                "opened inside it",
+            )
+    in_force = _mesh_topology_names(getattr(ctx, "current_mesh", None))
+    if not in_force:
+        ctx.error(
+            region,
+            f"execution region {declared.name!r} requires topology "
+            f"{declared.required_topologies!r} but no mesh is in force at the region; "
+            "a mode needs a domain to run in, not only a declaration",
+        )
+    for topology in declared.required_topologies:
+        if topology not in in_force:
+            ctx.error(
+                region,
+                f"execution region {declared.name!r} requires topology {topology!r}, "
+                f"which the mesh in force does not have; it has {in_force!r}",
+            )
 
 
 def verify_value_layouts(expr):
@@ -384,6 +497,7 @@ def verify_prim_function(
             ctx = VerifyContext(module=environment.module, function=fn,
                                 target=environment.target, topologies=environment.topologies)
 
+    verify_private_parameters(fn, _modes_used_by(fn))
     _walk_stmt(fn.body, ctx, scope, fn, module_context, _Binders(fn.params))
 
 
@@ -442,7 +556,7 @@ class _Binders:
             self.visible.remove(id(var))
 
 
-def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders):
+def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: tuple = ()):
     for _, value in _iter_stmt_expr_fields(stmt):
         if isinstance(value, Expr):
             verify_value_layouts(value)
@@ -450,11 +564,13 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders):
         case Sequential():
             with ExitStack() as bound:
                 for s in stmt.body:
-                    _walk_stmt(s, ctx, scope, fn, module_context, binders)
+                    _walk_stmt(s, ctx, scope, fn, module_context, binders, modes)
                     if isinstance(s, LetStmt):
                         bound.enter_context(binders.bind(s.var, s))
             return
         case LetStmt():
+            verify_expression_placement(stmt.value, modes, where="ExecutionScope")
+            verify_allocation_placement(stmt.value, modes, _modes_used_by(fn))
             binders.uses(stmt.value, stmt)
             value_ty = ctx.type_of(stmt.value)
             if stmt.var.type != value_ty:
@@ -487,24 +603,37 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders):
             ):
                 raise VerifyError("For.induction_var must be rank-0 integer")
             with binders.bind(stmt.induction_var, stmt):
-                _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders)
+                _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders, modes)
             return
         case While():
             binders.uses(stmt.cond, stmt)
             _check_rank0_bool(ctx, stmt, stmt.cond)
-            _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders)
+            _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders, modes)
             return
         case If():
             binders.uses(stmt.cond, stmt)
             _check_rank0_bool(ctx, stmt, stmt.cond)
-            _walk_stmt(stmt.then_body, ctx, scope, fn, module_context, binders)
-            _walk_stmt(stmt.else_body, ctx, scope, fn, module_context, binders)
+            _walk_stmt(stmt.then_body, ctx, scope, fn, module_context, binders, modes)
+            _walk_stmt(stmt.else_body, ctx, scope, fn, module_context, binders, modes)
             return
         case MeshScope():
             scope.append(stmt.mesh)
             with binders.bind(stmt.binding, stmt):
-                _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders)
+                _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders, modes)
             scope.pop()
+            return
+        case ExecutionScope():
+            _verify_execution_scope(stmt, ctx, scope, modes)
+            _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders, (*modes, stmt.kind))
+            # AFTER the body, deliberately. The producer rule presumes a well-formed
+            # predicate: if the operand in the mask slot is the wrong TYPE (i32, say),
+            # that is an operand-type refusal and must remain the reported layer. Only
+            # a mask that is otherwise well formed -- a genuine bool register -- can be
+            # "unproduced". Running this before the walk made every unproduced mask
+            # preempt the dtype/lane rules and stole their negatives; deferring keeps
+            # each rule owning its own case and still catches the mask that is correct
+            # in every respect except that nothing wrote it.
+            verify_predicate_producers(stmt)
             return
         case Return():
             for _name, value in _iter_stmt_expr_fields(stmt):
@@ -512,6 +641,18 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders):
             return
         case Evaluate():
             binders.uses((stmt.callable, stmt.args), stmt)
+            # Every operand is scanned under the modes in force, whichever route
+            # the callable itself takes. Doing this per-route meant a computed
+            # instruction target skipped the scan entirely.
+            for argument in stmt.args:
+                verify_expression_placement(argument, modes, where="ExecutionScope")
+                # An inline view or allocation written straight into an operand
+                # position is the same claim as one bound with LetStmt, so it is
+                # checked by the same rule rather than only where it is spelled
+                # with a name.
+                verify_allocation_placement(argument, modes, _modes_used_by(fn))
+            verify_operand_lanes(stmt, modes)
+            verify_evaluate_callable(stmt.callable, modes)
             if isinstance(stmt.callable, Launch):
                 _verify_launch(stmt, fn, module_context, ctx)
             elif isinstance(stmt.callable, SymbolRef):
@@ -520,6 +661,7 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders):
                 _verify_retained_call(stmt, fn, module_context, ctx)
             else:
                 op = stmt.callable
+                verify_op_placement(op, modes, where="ExecutionScope")
                 ctx.mesh_scope = tuple(scope)
                 ctx.current_mesh = None
                 for mesh in scope:
@@ -544,6 +686,651 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders):
         binders.uses(field_val, stmt)
         _reject_nested_alloc_tensor(field_val, at_letstmt_value=False)
         _check_embedded_sharding(field_val, scope, fn)
+
+
+def _call_like(value) -> bool:
+    """Whether *value* reaches a callable other than a direct declared operation."""
+    return isinstance(value, (SymbolRef, PrimFunction, ModuleList, Launch)) or (
+        isinstance(value, Call) and not isinstance(value.target, Op)
+    )
+
+
+def verify_expression_placement(value, modes: tuple, *, where: str) -> None:
+    """Check every operation reachable from one expression under the modes in force.
+
+    Placement is a property of the whole statement, not only of the operation a
+    statement happens to evaluate. An operation can appear in a LetStmt value, in
+    a call argument, in a tensor view chain or behind a retained callee, and each
+    of those positions is an equally good hiding place for something the mode
+    does not admit. The whole expression is walked so that "inside the with-block"
+    means the same thing as "checked".
+
+    A callable that is not a direct operation is refused inside a mode while
+    callee verification is not mode-aware: a callee is verified where it is
+    defined, which says nothing about the mode at the call site, so admitting it
+    here would be a loophole rather than a check.
+    """
+    if not modes:
+        for reachable in collect_exprs(value) if isinstance(value, Expr) else ():
+            if isinstance(reachable, Call):
+                verify_op_placement(reachable.target, modes, where=where)
+        return
+    for reachable in collect_exprs(value) if isinstance(value, Expr) else ():
+        if not isinstance(reachable, Call):
+            continue
+        target = reachable.target
+        if is_structural(target):
+            continue
+        if _call_like(target):
+            raise VerifyError(
+                f"call to {getattr(target, 'name', type(target).__name__)!r} inside "
+                f"{where} {modes[-1]!r}: a call inside an execution region needs "
+                "callee verification that knows the mode, which this build does not "
+                "have yet; inline the computation instead"
+            )
+        verify_op_placement(target, modes, where=where)
+
+
+def _modes_used_by(fn) -> frozenset:
+    """Every execution mode this function enters, anywhere in its body."""
+    return frozenset(
+        stmt.kind for stmt in _iter_all_stmts(fn.body) if isinstance(stmt, ExecutionScope)
+    )
+
+
+def verify_allocation_placement(value, modes: tuple, enclosing: frozenset = frozenset()) -> None:
+    """Refuse a region-private allocation made outside the region that owns it.
+
+    A register value is private to its mode: it exists because the mode has a
+    register file, and it has no meaning in an issue stream that is not the vector
+    one. So an allocation of register storage *outside* the mode is not a
+    near-miss to be repaired later -- it is a buffer that should not exist, and a
+    later pass that hoists one "for reuse" would be manufacturing exactly the
+    value this rule forbids.
+
+    Checked at the allocation rather than at its uses because the allocation is
+    where the lifetime is decided. A use outside the region is then impossible
+    without also crossing the binding scope, which the binder check already
+    refuses.
+
+    The rule is stated relative to the modes *this function* enters, not to every
+    kind any loaded target declares. Register storage is not globally private: it
+    is private to a mode, and a program with no mode has none. Keying off the
+    registry instead would make one target program unverifiable because another
+    target happened to be imported into the same process, which is a property of
+    the process rather than of the program.
+    """
+    for reachable in collect_exprs(value) if isinstance(value, Expr) else ():
+        if not isinstance(reachable, Call):
+            continue
+        type_ = getattr(reachable, "type", None)
+        storage = getattr(type_, "storage", None)
+        if storage is None:
+            continue
+        # Which declarations treat this storage as theirs, and which of those the
+        # function actually enters. Ownership must be decided over BOTH sets: an
+        # allocation is legal as soon as ANY mode in force owns the storage, and is
+        # a violation only when a mode this function enters owns it while none of
+        # the modes in force does.
+        #
+        # Iterating the declarations and refusing on the first owner that is "in
+        # enclosing but not in modes" would refuse a legal allocation whenever two
+        # modes own the same storage: standing inside the first, the second is
+        # entered somewhere in the function and always looks violated. That shape
+        # cannot occur today -- exactly one declared kind claims register storage --
+        # but the rule should not depend on that remaining true, so it is written to
+        # be correct for any number of owners rather than for the one we happen to
+        # have.
+        owners = [declared for declared in declared_kinds() if declared.owns_storage(storage)]
+        if not owners:
+            continue
+        if any(declared.name in modes for declared in owners):
+            continue
+        entered = [declared for declared in owners if declared.name in enclosing]
+        if not entered:
+            continue  # private to a mode this function never enters: not this rule
+        holder = modes[-1] if modes else None
+        where = (
+            f"runs inside {holder!r}"
+            if holder is not None
+            else "runs outside every execution region"
+        )
+        names = ", ".join(repr(declared.name) for declared in entered)
+        raise VerifyError(
+            f"allocation of {storage.name.lower()} storage for "
+            f"{getattr(type_, 'shape', ())!s} {where}: {storage.name.lower()} is "
+            f"private to execution region {names}, so it may only be "
+            "allocated inside that region"
+        )
+
+def verify_private_parameters(fn, enclosing: frozenset) -> None:
+    """Refuse an externally supplied value in storage a mode owns.
+
+    A register value exists because the region has a register file, so it cannot
+    also be handed in from outside: the caller has no register file to supply it
+    from. A parameter whose storage is private to a mode *this function enters*
+    therefore has no possible producer, which is why the rule is stated over the
+    modes the function enters rather than over every declared kind. In a program
+    with no mode, register storage is ordinary CUDA thread-local memory and the
+    rule does not apply -- the same reasoning as the allocation check above.
+
+    This is the fail-closed half of the capture rule. The allocation check refuses
+    making a private value outside the region; this refuses arriving with one, so
+    there is no shape of private value whose owner is unaccounted for: allocated
+    in the region, or handed in (refused here), or viewed inline (refused by the
+    same expression walk, since a view call carries its result type).
+    """
+    if not enclosing:
+        return
+    for param in fn.params:
+        type_ = getattr(param, "type", None)
+        storage = getattr(type_, "storage", None)
+        if storage is None:
+            continue
+        # Named over EVERY declaring mode the function enters, for the reason given
+        # on the allocation check: with more than one owner, reporting only the first
+        # found would name a mode that is not the one the reader was thinking of, and
+        # the message would be right for the wrong place. The rule is the same either
+        # way -- such a parameter has no possible producer -- so the parameter is
+        # refused once, with every owner named.
+        entered = [
+            declared
+            for declared in declared_kinds()
+            if declared.owns_storage(storage) and declared.name in enclosing
+        ]
+        if not entered:
+            continue
+        names = ", ".join(repr(declared.name) for declared in entered)
+        raise VerifyError(
+            f"PrimFunction {fn.name!r}: parameter {param.name!r} is "
+            f"{storage.name.lower()} storage, which is private to execution "
+            f"region {names}; a private value is created inside its "
+            "region, so it cannot be supplied from outside one"
+        )
+
+
+def verify_operand_lanes(stmt, modes: tuple) -> None:
+    '''Refuse an instruction operand whose extent is not the declared lane count.
+
+    A lane count that only appears in a constant is documentation. The mode
+    states how many lanes one issue covers, and an instruction in that mode
+    operates on exactly that many: an operand of a different extent is a
+    quantity this mode cannot issue, whether it is shorter (a partial issue
+    nothing here describes) or longer (tiling this build has no rule for).
+    Stating the check makes the extent a contract; leaving it out would make a
+    64-lane add and a 32-lane add equally acceptable.
+
+    Only register operands are measured. Memory operands are tiles staged by the
+    transfers, whose extent rules belong to the instruction that moves them, and
+    the predicate is measured by the instruction that consumes it, so the mask
+    keeps one owner instead of two that could disagree.
+    '''
+    if not modes:
+        return
+    declared = execution_kind(modes[-1])
+    if declared is None or declared.lane_count is None:
+        return
+    for argument in stmt.args:
+        type_ = getattr(argument, "type", None)
+        storage = getattr(type_, "storage", None)
+        if storage is None or not declared.owns_storage(storage):
+            continue
+        name = getattr(stmt.callable, "name", type(stmt.callable).__name__)
+        dtype_name = getattr(getattr(type_, "dtype", None), "name", None)
+        if dtype_name == "bool":
+            # the predicate: owned by the instruction that consumes it
+            continue
+        if storage is StorageKind.CARRIER:
+            # The carrier register class is BF16 TRANSPORT/CONVERSION, not a compute
+            # register. It is exempt from the compute-dtype rule exactly as the predicate
+            # is, and stays fully checked for lane extent below. This ADDS a capability; it
+            # does not disable the check for compute registers.
+            pass
+        allowed = tuple(getattr(dtype, "name", None) for dtype in declared.element_dtypes) if storage is not StorageKind.CARRIER else ()
+        if allowed and dtype_name not in allowed:
+            raise VerifyError(
+                f"{name}: operand of type {dtype_name} in "
+                f"{storage.name.lower()} is not an element type execution region "
+                f"{declared.name!r} computes on ({allowed!r}); an i32 register is "
+                "also 32 bits wide, which is why agreeing widths is not the rule"
+            )
+        shape = tuple(getattr(type_, "shape", ()))
+        if len(shape) != 1 or shape[0] != declared.lane_count:
+            raise VerifyError(
+                f"{name}: operand of shape {shape} is not the "
+                f"{declared.lane_count} lanes execution region {declared.name!r} "
+                "declares; one issue covers exactly that many lanes, and this build "
+                "has no tiling rule that would make a different extent mean something"
+            )
+
+
+def verify_operand_dtypes(op, declared, name: str) -> None:
+    """Refuse an operand whose element type the mode does not compute on.
+
+    The width check above is necessary but not sufficient: i32 is also 32 bits
+    wide, so "the widths agree" admits a register holding integers to an add
+    that only performs floating-point arithmetic. The mode therefore states its
+    element types, and every register operand must be one of them. Rows are read
+    off the operation's own operand types rather than from a list of parameter
+    names, so an instruction added later is covered without editing this check.
+    """
+    allowed = tuple(getattr(dtype, "name", None) for dtype in declared.element_dtypes)
+    if not allowed:
+        return
+    for param in input_params(type(op)):
+        pattern = getattr(param, "pattern", None)
+        if getattr(pattern, "storage", None) is None:
+            continue
+        if not declared.owns_storage(pattern.storage):
+            continue
+        dtype = getattr(pattern, "dtype", None)
+        if dtype is None:
+            continue
+        names = tuple(
+            getattr(option, "name", None)
+            for option in getattr(dtype, "patterns", (dtype,))
+        )
+        if names == ("bool",):
+            # The predicate register is a mask, not an element: it is one bit per
+            # lane and no arithmetic is performed on it, so the element-type rule
+            # does not apply to it. Without this exemption every instruction that
+            # WRITES the predicate -- pset -- would be refused by a rule about
+            # elements, which is the positive part of the chain failing its own
+            # check. The extent rule above already exempts it for the same reason;
+            # the two must agree or the chain is unverifiable.
+            continue
+        if getattr(pattern, "storage", None) is StorageKind.CARRIER:
+            # Same capability split at the pattern level: a carrier operand is transport/
+            # conversion, not a compute element. Every other operand is still checked, so
+            # bf16 in an element register stays refused.
+            continue
+        if any(name_ not in allowed for name_ in names):
+            raise VerifyError(
+                f"{name}: operand {param.name!r} is declared as {names!r} but execution "
+                f"region {declared.name!r} computes on {allowed!r}; an element type the "
+                "mode does not perform arithmetic on cannot be issued there, even when "
+                "its width matches"
+            )
+
+
+def verify_predicate_producers(scope_stmt) -> None:
+    """Refuse a predicate operand whose producing instruction does not DOMINATE it.
+
+    Two failures, one rule:
+      * a mask with NO producing instruction in the region (the pset was dropped), and
+      * a mask whose producing instruction comes AFTER the instruction that reads it
+        (the pset was placed after the vadd).
+    Both leave the predicated result reading the mask register as it stood before any
+    mask was written.
+
+    The second is why this cannot be a set-membership test over the whole scope. The
+    resolved TIR is a Sequential and execution order IS statement order, so "a writer
+    exists somewhere in this scope" does not mean the writer RAN before the reader. A
+    later writer is not legitimate for a mask: nothing in this IR carries a mask write
+    across a later read, there is no reordering pass, and no semantic basis for one --
+    pset writes a value register, not a deferred promise. The producer must PRECEDE the
+    consumer in the resolved statement order. This is dominance, not presence.
+
+    A mask is just a bool register, so an allocated-but-never-written mask type-checks,
+    matches the bool-in-rmem operand pattern, passes the lane rule (bool exempt) and
+    the dtype rule (bool is a mask, not an element). Without this rule a dropped or
+    misordered pset is ACCEPTED and the predicated instruction reads garbage.
+
+    Same region instance means same ExecutionScope body: a writer in a sibling or
+    enclosing scope does not make this instance's mask produced, and nesting is refused
+    separately (a non-nestable mode cannot be entered inside itself).
+
+    A producer is an instruction (an Evaluate of a declared operation) with declared
+    WRITE effect on that operand position that appears EARLIER in the walk. An
+    allocation that merely binds the name is not a producer. Only predicate operands the
+    instruction READS are subjects: pset's own dst is WRITE and is not a read, so pset
+    is not asked to have produced the mask it produces.
+
+    GRANULARITY is the second half of the producer check. In a mode that declares TWO
+    independently checked mask widths (arithmetic 32, conversion 16 -- see
+    verify_op_placement), "a mask was written" is not enough: the writer must have
+    DECLARED the width it produced, and that width must match the class of the reader.
+    A bool tensor's shape says nothing about the physical PREG encoding, so shape is
+    never used here. The mode declares both widths, so this rule is FAIL-CLOSED inside
+    it: a producer with no declared width, or a producer that is not a declared mask
+    producer at all, is refused by name rather than skipped. Modes that do not declare
+    two widths keep the original behaviour (the check simply does not apply).
+
+    Ordering under control flow is conservative: a write inside an If branch or a loop
+    body does not dominate statements after the construct (it may not have executed),
+    so it is not carried out of the construct. A write before the construct does
+    dominate inside it.
+
+    CONTROL-FLOW CLOBBER. Restoring the pre-construct producer must not RESURRECT a
+    granularity that the construct may have overwritten. If a mask Var is written
+    ANYWHERE inside an If/For/While body, then after the construct its granularity is
+    UNKNOWN (it may be the pre-construct width or a width the body wrote, depending on
+    whether the branch ran). A consumer that requires a specific width is then refused by
+    name instead of being checked against the stale pre-construct width. Example caught:
+    pset16(mask) then 'if True: pset32(mask)' then vcvt16(mask) was accepted because the
+    save/restore brought the 16-bit record back; now it is refused. Uses of a mask INSIDE
+    the same construct are still checked against the write that precedes them there.
+    """
+    declared = execution_kind(scope_stmt.kind)
+    if declared is None:
+        return  # an undeclared kind is refused by the scope check; not this rule
+
+    produced = set()  # ids of Vars WRITTEN by a statement already passed in this chain
+    # id(Var) -> (producer op, declared mask width or None). Kept in lockstep with
+    # 'produced' through the Sequential/For/If walks below, so the granularity recorded
+    # is always the LAST writer before the read (the same writer dominance uses).
+    produced_mask = {}
+    # Ordered log of ids written so far, including inside control-flow bodies. A
+    # construct's "writes inside" are the entries after its entry mark; a set would lose
+    # that distinction because a Var written BEFORE the construct is already in it.
+    write_log = []
+    two_widths = declared.mask_width_bits is not None and declared.conversion_mask_width_bits is not None
+
+    def expected_width(op):
+        """The width a reader's declared mask class needs, or None when not applicable."""
+        if not two_widths:
+            return None, None
+        mask_class = getattr(type(op), "mask_class", "arithmetic")
+        if mask_class == "conversion":
+            return declared.conversion_mask_width_bits, "conversion"
+        if mask_class == "arithmetic":
+            return declared.mask_width_bits, "arithmetic"
+        return None, None
+
+    def require_granularity(op, arg, name, operand):
+        """Fail closed: the mask's producer must have declared the reader's width."""
+        expected, mask_class = expected_width(op)
+        if expected is None:
+            return
+        producer_op, width = produced_mask.get(id(arg), (None, None))
+        if producer_op is None and width is None:
+            raise VerifyError(
+                f"{name}: predicate operand {operand!r} was written inside a control-flow "
+                "construct, so its mask granularity is UNKNOWN after that construct (the "
+                "branch or loop may have overwritten it); a consumer that requires a "
+                f"specific width is refused rather than checked against the stale "
+                f"pre-construct record. Region {declared.name!r}."
+            )
+        producer_name = getattr(producer_op, "name", type(producer_op).__name__)
+        declared_producer = getattr(type(producer_op), "mask_width_attribute", None) is not None
+        if not declared_producer:
+            raise VerifyError(
+                f"{name}: predicate operand {operand!r} was written by {producer_name!r}, "
+                "which is not a declared mask producer; in execution region "
+                f"{declared.name!r} a mask must be produced by a pset that states its "
+                "element width, otherwise its granularity is unknown and the predicate "
+                "encoding cannot be checked"
+            )
+        if width is None or width != expected:
+            raise VerifyError(
+                f"{name}: predicate operand {operand!r} is produced by {producer_name!r} "
+                f"at {width!r}-bit mask granularity, but a {mask_class} instruction in "
+                f"execution region {declared.name!r} requires a {expected}-bit mask "
+                "produced by a pset of the same granularity in this region instance; a "
+                "bool tensor's shape does not encode the predicate granularity"
+            )
+
+    def writes_of(stmt):
+        """(param, arg) pairs of *stmt* whose operand carries the WRITE effect."""
+        op = stmt.callable
+        try:
+            params = input_params(type(op))
+        except Exception:  # noqa: BLE001 -- a non-operation callable has no schema
+            return ()
+        pairs = []
+        for param, arg in zip(params, stmt.args):
+            effect = getattr(param, "effect", None)
+            if effect is not None and (effect & MemoryEffect.WRITE):
+                pairs.append((param, arg))
+        return tuple(pairs)
+
+    def is_predicate_read(param):
+        """True when *param* is a bool mask the instruction READS, not a write target."""
+        pattern = getattr(param, "pattern", None)
+        storage = getattr(pattern, "storage", None)
+        if storage is None or not declared.owns_storage(storage):
+            return False
+        dtype = getattr(pattern, "dtype", None)
+        names = tuple(
+            getattr(option, "name", None)
+            for option in getattr(dtype, "patterns", (dtype,))
+        )
+        if names != ("bool",):
+            return False
+        effect = getattr(param, "effect", None)
+        return effect is not None and bool(effect & MemoryEffect.READ)
+
+    def visit(stmt):
+        if isinstance(stmt, Sequential):
+            for child in stmt.body:
+                visit(child)
+            return
+        if isinstance(stmt, MeshScope):
+            visit(stmt.body)
+            return
+        if isinstance(stmt, Evaluate):
+            op = stmt.callable
+            requirement = region_requirement(op)
+            try:
+                params = input_params(type(op))
+            except Exception:  # noqa: BLE001
+                params = ()
+            if (
+                requirement is not None
+                and requirement.placement == "inside"
+                and requirement.kind == scope_stmt.kind
+            ):
+                name = getattr(op, "name", type(op).__name__)
+                for param, arg in zip(params, stmt.args):
+                    if not is_predicate_read(param):
+                        continue
+                    if isinstance(arg, Var) and id(arg) in produced:
+                        require_granularity(op, arg, name, arg.name)
+                        continue
+                    operand = getattr(arg, "name", type(arg).__name__)
+                    raise VerifyError(
+                        f"{name}: predicate operand {operand!r} has no producing "
+                        f"instruction before it in execution region {declared.name!r}; "
+                        "a mask must be written by an instruction that precedes its use "
+                        "in the same region instance (pset before the predicated op), or "
+                        "the predicated instruction reads a register nothing produced"
+                    )
+            for _param, arg in writes_of(stmt):
+                if isinstance(arg, Var):
+                    produced.add(id(arg))
+                    produced_mask[id(arg)] = (op, declared_mask_width(op))
+                    write_log.append(id(arg))
+            return
+        if isinstance(stmt, (For, While)):
+            saved = set(produced)
+            saved_mask = dict(produced_mask)
+            mark = len(write_log)
+            visit(stmt.body)
+            written_inside = set(write_log[mark:])
+            produced.clear()
+            produced.update(saved)
+            produced_mask.clear()
+            produced_mask.update(saved_mask)
+            # A loop body may run zero or more times, so any mask it overwrote has an
+            # UNKNOWN granularity afterwards: do not resurrect the pre-loop record.
+            for key in written_inside & produced:
+                produced_mask[key] = (None, None)
+            return
+        if isinstance(stmt, If):
+            saved = set(produced)
+            saved_mask = dict(produced_mask)
+            mark = len(write_log)
+            visit(stmt.then_body)
+            produced.clear()
+            produced.update(saved)
+            produced_mask.clear()
+            produced_mask.update(saved_mask)
+            visit(stmt.else_body)
+            written_inside = set(write_log[mark:])
+            produced.clear()
+            produced.update(saved)
+            produced_mask.clear()
+            produced_mask.update(saved_mask)
+            # Either branch may have run (or neither, for an if without else): any mask
+            # written in either branch has an UNKNOWN granularity afterwards.
+            for key in written_inside & produced:
+                produced_mask[key] = (None, None)
+            return
+        # LetStmt / anything else: an allocation binds a name, it does not produce a
+        # mask, so it has no ordering effect here.
+
+    visit(scope_stmt.body)
+def verify_op_placement(op, modes: tuple, *, where: str = "execution region") -> None:
+    """Check one operation is legal in the execution modes in force.
+
+    A mode is not a hint. Every operation states its placement, and an
+    operation that states none may not run inside a mode: the alternative --
+    treating "no declaration" as "allowed anywhere" -- is exactly how a legacy
+    CUDA-thread binary becomes a vector instruction because it happened to be
+    written inside the with-block. Outside a mode the same rule refuses an
+    operation that says it belongs inside one, so the declaration is enforced
+    in both directions rather than only where it is convenient.
+    """
+    requirement = region_requirement(op)
+    name = getattr(op, "name", type(op).__name__)
+    if not modes:
+        if requirement is not None and requirement.placement == "inside":
+            raise VerifyError(
+                f"{name}: this operation declares it belongs inside execution region "
+                f"{requirement.kind!r}, but no execution region is in force at it"
+            )
+        return
+    if requirement is None:
+        raise VerifyError(
+            f"{name}: this operation declares no execution placement and may not run "
+            f"inside {where} {modes[-1]!r}; a mode admits only operations written for it"
+        )
+    if requirement.placement == "outside":
+        raise VerifyError(
+            f"{name}: this operation declares it belongs outside an execution region "
+            f"but runs inside {where} {modes[-1]!r}"
+        )
+    if requirement.kind != modes[-1]:
+        raise VerifyError(
+            f"{name}: this operation belongs inside execution region "
+            f"{requirement.kind!r} but runs inside {modes[-1]!r}"
+        )
+    declared = execution_kind(requirement.kind)
+    width = declared_mask_width(op)
+    if width is not None and declared is not None:
+        # ONE mode identity, TWO independently checked widths: an ARITHMETIC instruction is
+        # bound to mask_width_bits, a CONVERSION instruction to conversion_mask_width_bits.
+        # Neither check may be satisfied by defaulting.
+        mask_class = getattr(type(op), "mask_class", "arithmetic")
+        if mask_class not in ("arithmetic", "conversion"):
+            raise VerifyError(
+                f"{name}: mask_class {mask_class!r} is not 'arithmetic' or 'conversion'"
+            )
+        expected = (
+            declared.mask_width_bits
+            if mask_class == "arithmetic"
+            else declared.conversion_mask_width_bits
+        )
+        if expected is None:
+            raise VerifyError(
+                f"{name}: a {mask_class} instruction needs execution region "
+                f"{declared.name!r} to declare a {mask_class} mask width, and it does not"
+            )
+        if width != expected:
+            raise VerifyError(
+                f"{name}: states element width {width} but execution region "
+                f"{declared.name!r} declares {expected} for {mask_class} instructions; an "
+                "operation addressing a different element width is addressing lanes this "
+                "mode does not have"
+            )
+    if declared is not None:
+        verify_operand_dtypes(op, declared, name)
+
+
+def verify_evaluate_callable(callable_value, modes: tuple) -> None:
+    """Check the callable slot of one Evaluate under the modes in force.
+
+    A computed instance target is a ``Call`` here, and it reaches the retained
+    route -- the same route as a direct reference to a PrimFunction. Listing the
+    rejection set by the shapes an author might write rather than by the routes
+    the walker actually takes is what left ``Call`` out: the guard named four
+    types, the dispatch handled five, and an instruction selected at runtime
+    walked straight past the mode.
+
+    A declared operation is the one callable this walker *can* judge inside a
+    mode, and it is judged on its own terms by verify_op_placement immediately
+    afterwards. It must therefore pass through here untouched: refusing it would
+    replace a placement verdict with "not verified yet", which is a weaker
+    statement about a case that has a real answer.
+
+    While no callee verification carries a mode stack, there is no honest answer
+    for a callee inside a mode, so every non-operation callable is refused rather
+    than admitted by the route it happens to arrive on.
+    """
+    if not modes or isinstance(callable_value, Op):
+        return
+    if isinstance(callable_value, Call):
+        name = getattr(callable_value.target, "name", type(callable_value.target).__name__)
+    else:
+        name = getattr(callable_value, "name", type(callable_value).__name__)
+    raise VerifyError(
+        f"call to {name!r} inside ExecutionScope {modes[-1]!r}: a call inside an "
+        "execution region needs callee verification that knows the mode, which this "
+        "build does not have yet; inline the computation instead"
+    )
+
+
+def _verify_execution_scope(stmt, ctx, scope, modes: tuple) -> None:
+    """Check a TIR mode scope states a mode this point in the program allows.
+
+    The same four boundary questions the HIR region answers, asked of the TIR
+    node, because a lowered scope is a second entry point into the same claims
+    and a check that only ran before lowering is not a check on the program that
+    is shipped. The TIR scope carries its kind as a string and opens no
+    participants, so the mesh is read off the lexical scopes already open.
+    """
+    declared = execution_kind(stmt.kind)
+    if declared is None:
+        raise VerifyError(
+            f"ExecutionScope names undeclared kind {stmt.kind!r}; declared kinds are "
+            f"{tuple(item.name for item in declared_kinds())!r}"
+        )
+    if declared.mask_width_bits is None:
+        raise VerifyError(
+            f"ExecutionScope {declared.name!r} declares no mask width; a mode whose "
+            "element width is unstated cannot bound its instructions"
+        )
+    if not declared.required_topologies:
+        raise VerifyError(
+            f"ExecutionScope {declared.name!r} declares no required topology; "
+            "a mode with no domain cannot be checked against this program"
+        )
+    for outer in modes:
+        outer_declared = execution_kind(outer)
+        if outer_declared is None:
+            raise VerifyError(f"ExecutionScope encloses undeclared kind {outer!r}")
+        if not outer_declared.nestable:
+            raise VerifyError(
+                f"ExecutionScope {declared.name!r} is nested inside {outer_declared.name!r}, "
+                "which is not nestable; no execution scope may be opened inside it"
+            )
+    in_force = tuple(
+        str(getattr(level, "name", level))
+        for mesh in scope
+        for level in getattr(mesh, "topologies", ())
+    )
+    if not in_force:
+        raise VerifyError(
+            f"ExecutionScope {declared.name!r} requires topology "
+            f"{declared.required_topologies!r} but no MeshScope encloses it; "
+            "a mode needs a domain to run in, not only a declaration"
+        )
+    for topology in declared.required_topologies:
+        if topology not in in_force:
+            raise VerifyError(
+                f"ExecutionScope {declared.name!r} requires topology {topology!r}, "
+                f"which the enclosing MeshScope does not have; it has {in_force!r}"
+            )
 
 
 def _iter_stmt_expr_fields(stmt):
@@ -739,7 +1526,11 @@ def _retained_callee(target, frame):
     inner = None if frame is None else frame._callee_context(Call(target, (), type=UnitType()))
     callee = inner.function if inner is not None else target
     if not isinstance(callee, PrimFunction):
-        raise VerifyError(f"TIR instance entry {callee.name!r} is not a PrimFunction")
+        # The label has to survive the failure it reports: a computed instance
+        # target resolves to whatever the projection returns, so reading `.name`
+        # off it unconditionally turned this diagnostic into an AttributeError.
+        label = getattr(callee, "name", None) or type(callee).__name__
+        raise VerifyError(f"TIR instance entry {label!r} is not a PrimFunction")
     return callee, inner
 
 
@@ -924,7 +1715,7 @@ def _iter_all_stmts(body):
         yield s
         if isinstance(s, Sequential):
             stack.extend(s.body)
-        elif isinstance(s, (For, While, MeshScope)):
+        elif isinstance(s, (For, While, MeshScope, ExecutionScope)):
             stack.append(s.body)
         elif isinstance(s, If):
             stack.append(s.then_body)

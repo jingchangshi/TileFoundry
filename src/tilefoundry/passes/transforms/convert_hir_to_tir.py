@@ -33,6 +33,7 @@ from tilefoundry.ir.core.expr import SSAValue
 from tilefoundry.ir.core.kinds import BinaryKind
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.core.param_def import MemoryEffect
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.math.binary import Binary as HirBinary
@@ -46,7 +47,14 @@ from tilefoundry.ir.isl_interop import isl_to_dim, layout_to_isl_map
 from tilefoundry.ir.tir.arith import Binary as TirBinary
 from tilefoundry.ir.tir.memory import AllocTensor, Copy, Fill, PtrOf, TensorView
 from tilefoundry.ir.tir.prim_function import PrimFunction
-from tilefoundry.ir.tir.stmts import Evaluate, For, LetStmt, MeshScope, Sequential
+from tilefoundry.ir.tir.stmts import (
+    Evaluate,
+    ExecutionScope,
+    For,
+    LetStmt,
+    MeshScope,
+    Sequential,
+)
 from tilefoundry.ir.types import (
     Broadcast,
     ComposedLayout,
@@ -62,9 +70,12 @@ from tilefoundry.ir.types import (
     TensorType,
     TupleType,
 )
+from tilefoundry.ir.types.dtype_view import DtypeViewError, DtypeViewSpec, validate_view
 from tilefoundry.ir.types.dim import (
     DimAdd,
     DimFloorDiv,
+    DimMax,
+    DimMin,
     DimMod,
     DimMul,
     DimSub,
@@ -99,6 +110,7 @@ from tilefoundry.visitor_registry.buffer_alias import aliased_operand
 from tilefoundry.visitor_registry.candidates import (
     candidate_operands,
     candidate_ops,
+    select_instruction,
     sole_candidate,
 )
 from tilefoundry.visitor_registry.contexts import TypeInferContext, ValuationContext
@@ -114,6 +126,9 @@ _DIM_BINARY = {
     BinaryKind.MUL: DimMul,
     BinaryKind.FLOOR_DIV: DimFloorDiv,
     BinaryKind.MOD: DimMod,
+    # rank-0 pure-value minimum (03-24 ragged ownership): the ONLY added dim op. It lowers to a
+    # value-form dim call, never to the thread-level Where; maximum/select are NOT added.
+    BinaryKind.MIN: DimMin,
 }
 
 
@@ -131,6 +146,7 @@ class View:
     type: TensorType
     stem: str = "tile"
     whole_tensor: bool = False
+    ssa: int | None = None  # in-run HIR SSA identity for escape pairing (never serialized)
 
 
 @dataclass
@@ -150,6 +166,17 @@ class TirBuilder:
     blocks: list[TirScope]
     loops: list = field(default_factory=list)
     stage_counters: dict = field(default_factory=dict)
+    # Values proven REGION-INVARIANT by construction, with the reason they are invariant.
+    # Only explicitly marked values are exempt from the escape check; this is a class, not
+    # a blanket allowance.
+    invariant: dict = field(default_factory=dict)
+
+    def mark_invariant(self, value, reason: str):
+        self.invariant[id(value)] = reason
+        return value
+
+    def is_invariant(self, value) -> bool:
+        return id(value) in self.invariant
 
     def add(self, stmt):
         self.blocks[-1].entries.append(stmt)
@@ -166,12 +193,12 @@ class TirBuilder:
         ))
 
     @contextmanager
-    def region(self, *, owner=None, mesh=None, binding=None, loop=None):
+    def region(self, *, owner=None, mesh=None, binding=None, loop=None, execution=None):
         if mesh is not None and owner is None:
             current = self.blocks[-1].mesh
             if current is not None and current == mesh:
                 mesh = None
-        if mesh is not None or loop is not None:
+        if mesh is not None or loop is not None or execution is not None:
             region = TirScope(mesh if mesh is not None else self.blocks[-1].mesh, owner)
             if binding is not None:
                 region.bound[id(binding)] = binding
@@ -193,22 +220,34 @@ class TirBuilder:
             self.blocks.pop()
             if loop is not None:
                 self.loops.pop()
-        if mesh is not None or loop is not None:
+        if mesh is not None or loop is not None or execution is not None:
             pending = [region.result]
+            where = (
+                f"execution region {execution!r}"
+                if execution is not None
+                else f"region mesh {mesh or region.mesh!r}"
+            )
             while pending:
                 value = pending.pop()
-                if isinstance(value, Var) and id(value) in region.bound:
-                    raise LoweringError(
-                        f"value {value.name!r} escapes region mesh {mesh or region.mesh!r}"
-                    )
+                message = escape_refusal(value, region.bound, self.invariant, where)
+                if message is not None:
+                    raise LoweringError(message)
                 if isinstance(value, View):
                     pending.extend((value.base, *value.starts))
                 elif isinstance(value, Expr) and not isinstance(value, Var):
                     pending.extend(expr_children(value))
         if mesh is not None:
             self.add(MeshScope(mesh, binding, self.build(region)))
+        elif execution is not None:
+            self.add(ExecutionScope(execution, self.build(region)))
         elif loop is not None:
-            self.add(For(*loop, self.build(region)))
+            # The authored pipeline intent is CARRIED onto the TIR For as a typed
+            # field, so a TIR roundtrip rebuilds it instead of losing it to a
+            # default. It is not consumed here: a D0 for still runs serially, and
+            # reading this as "a schedule exists" would be a false claim.
+            self.add(
+                For(*loop, self.build(region), pipeline=getattr(owner, "pipeline", None))
+            )
 
     def declare(self, leaf, *, ctx, values, desired=None):
         """Declare one allocation root in its owning scope."""
@@ -229,7 +268,11 @@ class TirBuilder:
                 expr.name if isinstance(expr, Var) else "value",
                 ctx.authored_values.get(id(expr)),
             )
-            if type_.storage is StorageKind.RMEM:
+            # A mode-private register class (RMEM element registers and CARRIER
+            # transport windows) is allocated as a register, not as an addressable
+            # smem/gmem buffer. A carrier has no byte address and must not be charged
+            # to the UB budget; it exists only inside the region that owns it.
+            if type_.storage in (StorageKind.RMEM, StorageKind.CARRIER):
                 storage_type = type_
                 var = Var(stem, type=storage_type)
                 ctx.builder.bind(
@@ -269,9 +312,12 @@ class TirBuilder:
                 )
                 view = View(scratch, (i64_const(0),), (elements,), storage_type, stem)
                 return view
-            fields = tuple(ctx.storage.view(offset, None, storage_type) for offset in offsets)
+            fields = tuple(
+                ctx.storage.view(offset, None, storage_type, ssa=id(expr), source="declare") for offset in offsets
+            )
             if len(fields) == 1:
-                view = View(fields[0].args[0], (), tuple(storage_type.shape), storage_type, stem)
+                view = View(fields[0].args[0], (), tuple(storage_type.shape), storage_type, stem,
+                            ssa=id(expr))
                 return view
             stages = Var(
                 ctx.names.fresh(f"{stem}_stages"),
@@ -344,6 +390,11 @@ class TirBuilder:
                 else ctx.names.fresh(value.stem)
             )
             result = self.bind(Var(stem, type=expression.type), expression)
+            if getattr(value, "ssa", None) is not None:
+                ctx.var_ssa[id(result)] = value.ssa
+                # RECORD-ONLY: remember the exact TIR value that carries this declaration, so the
+                # final TIR walk can name its statement by structure. No stmt/type/schedule change.
+                ctx._note_escape_declaration_view(ctx.escape_ssa_ref.get(value.ssa), expression)
             scope.views[id(value)] = (value, result)
         return scope.views[id(value)][1]
 
@@ -428,6 +479,17 @@ class Names:
                 ctx.authored_values[id(actual)] = source
 
 
+def escape_refusal(value, bound_ids, invariant_ids, where: str):
+    """The escape rule, factored out so the invariant class is testable on its own.
+
+    A value bound inside a region may not be the value the region yields UNLESS it was
+    explicitly marked region-invariant by construction. Returns a refusal message or None.
+    """
+    if isinstance(value, Var) and id(value) in bound_ids and id(value) not in invariant_ids:
+        return f"value {value.name!r} escapes {where}"
+    return None
+
+
 def _label(call: Expr) -> str:
     if isinstance(call, Var):
         return call.name
@@ -453,6 +515,11 @@ class StoragePlan:
     function: Function
     context: ValuationContext | None = None
     mesh: Mesh | None = None
+    lowering: object | None = None
+    debug_views: dict = field(default_factory=dict)
+
+    def _debug_view(self, key: str) -> None:
+        self.debug_views[key] = self.debug_views.get(key, 0) + 1
 
     @cached_property
     def regions(self):
@@ -781,11 +848,13 @@ class StoragePlan:
 
     def hir_view(self, call, operands, values):
         """Keep the view authored by this HIR operation, including identity views."""
+        self._debug_view("hir_view")
         region = self.regions[id(call)]
         alias = buffer_alias(call, region, relations_of(call, region))
         if alias is None:
             raise LoweringError(self.answers[SSAValue(call)].refusal)
-        return self.view(operands[aliased_operand(call)], alias.relation, call.type, values=values)
+        viewed = self.view(operands[aliased_operand(call)], alias.relation, call.type, values=values, ssa=id(call), source="hir_view")
+        return replace(viewed, ssa=id(call)) if isinstance(viewed, View) else viewed
 
     def source(self, leaf, memo):
         """Read a storage binding; HIR evaluation remains exclusively in Visit."""
@@ -814,6 +883,7 @@ class StoragePlan:
         sizes=None,
         stem="tile",
         whole_tensor=False,
+        ssa=None,
     ):
         """Choose an existing operand or the window required at its use."""
         held = value.type
@@ -842,13 +912,13 @@ class StoragePlan:
             ):
                 return value
             starts, sizes = tuple(i64_const(0) for _ in held.shape), tuple(held.shape)
-        return View(value, starts, sizes, desired, stem, whole_tensor)
+        return View(value, starts, sizes, desired, stem, whole_tensor, ssa=ssa)
 
     def materialization(self, view, base, loops):
         """Describe one physical TIR view without adding any statements."""
         desired = view.type
         if isinstance(base, Constant) and isinstance(base.type, PointerType):
-            return self.view(base.value, None, desired)
+            return self.view(base.value, None, desired, ssa=view.ssa, source="materialization")
         held = base.type
         if len(view.starts) != len(held.shape):
             raise LoweringError(
@@ -902,8 +972,12 @@ class StoragePlan:
             layout = replace(type_.layout, layout=layout)
         return starts, replace(desired, layout=layout, storage=target.type.storage)
 
-    def view(self, target, address, desired, *, values=None):
+    def view(self, target, address, desired, *, values=None, ssa=None, source="unknown"):
         """Derive an exact physical view; a proved composition carries its origin."""
+        is_fresh = isinstance(target, int)
+        self._debug_view("fresh_view" if is_fresh else "derived_view")
+        if is_fresh and ssa is not None and desired.storage is StorageKind.SMEM and self.lowering is not None:
+            self.lowering._note_escape_declare(ssa, desired, source)
         if isinstance(target, int):
             pointer = Constant(target, type=PointerType(desired.dtype, desired.storage))
             return Call(
@@ -1053,9 +1127,25 @@ class StoragePlan:
 class IssuePlan:
     """Instruction selection and one shared geometric projection, without admission."""
 
-    def op(self, call):
+    def op(self, call, ctx=None):
         if isinstance(call.target, ScheduleOp):
             return call.target.op
+        target = None if ctx is None else getattr(ctx, "target", None)
+        inside = ctx is not None and bool(getattr(ctx, "executions", ()))
+        active_kind = ctx.executions[-1] if ctx is not None and inside else None
+        if target is not None:
+            # Target-aware selection lives in the candidates registry, not here: the same
+            # rule must be what the reporting path shows. A target that declares no
+            # scoped candidates for this op returns None and falls through to the global
+            # single-candidate query below, which is exactly today's behaviour for CUDA.
+            try:
+                selected = select_instruction(
+                    call, target=target, inside=inside, active_kind=active_kind
+                )
+            except ScheduleRefusal as error:
+                raise LoweringError(str(error)) from error
+            if selected is not None:
+                return selected
         candidates = candidate_ops(type(call.target))
         if not candidates:
             raise LoweringError(
@@ -1137,6 +1227,133 @@ class LoweringContext(TypeInferContext):
     allocations: dict = field(default_factory=dict)
     parameters: dict = field(default_factory=dict)
     authored_values: dict = field(default_factory=dict)
+    executions: list = field(default_factory=list)
+    escape_records: list = field(default_factory=list)
+    execution_records: list = field(default_factory=list)
+    escape_by_ssa: dict = field(default_factory=dict)
+    escape_seen: set = field(default_factory=set)
+    duplicate_declares: int = 0
+    var_ssa: dict = field(default_factory=dict)
+    consume_counter: int = 0
+    unresolved_alias_chains: int = 0
+    escape_duplicates: list = field(default_factory=list)
+    escape_ssa_ref: dict = field(default_factory=dict)
+    declare_counter: int = 0
+    # RECORD-ONLY: ssa_group -> the fresh-view Call the declaration actually produced. The
+    # declaration ordinal is assigned while the view is DERIVED, but the TIR LetStmt is emitted
+    # later (or never, for a duplicate declare), so the ordinal alone cannot address a TIR
+    # statement. This map lets the final TIR be walked once and turned into stable structural
+    # paths per ssa_group, without any ordinal->walk-order assumption.
+    escape_declaration_views: dict = field(default_factory=dict)
+    # RECORD-ONLY: ssa_group -> the declaration ordinals this group's sites actually emitted.
+    escape_declaration_ordinals: dict = field(default_factory=dict)
+    _pending_escape_ordinal: int | None = None
+
+
+    def _alias_base(self, expr):
+        """Follow the real storage alias chain to the declared buffer SSA (None if unresolved)."""
+        current = expr
+        seen = set()
+        while True:
+            key = id(current)
+            if key in seen:
+                return None
+            seen.add(key)
+            answer = self.storage.answers.get(SSAValue(current, 0))
+            if answer is None:
+                return current
+            partner = answer.partner
+            if isinstance(partner, SSAValue):
+                current = partner.expr
+                continue
+            return current
+
+    def _note_escape_consume(self, expr, type_):
+        """Path B: consumer HIR SSA -> alias chain -> base buffer SSA -> bind the producer field."""
+        base = self._alias_base(expr)
+        if base is None or id(base) not in self.escape_by_ssa:
+            self.unresolved_alias_chains += 1
+            return
+        fields = self.escape_by_ssa[id(base)]
+        field = fields[-1]
+        if field.get("outer_declaration_ordinal") is not None or field.get("outer_consume_ordinal") is not None:
+            return
+        self.consume_counter += 1
+        field["outer_consume_ordinal"] = self.consume_counter
+        field["outer_type"] = str(type_)
+        field["outer_source"] = "consume_alias"
+
+    def _note_escape_ordinal(self, group, ordinal) -> None:
+        """RECORD-ONLY: remember which declaration ordinals this ssa_group actually handed out.
+
+        This is the Core's own assignment, kept next to the declaration sites rather than read
+        back out of the field dict, so a forged ordinal in the records can be compared against it.
+        """
+        known = self.escape_declaration_ordinals.setdefault(group, [])
+        if int(ordinal) not in known:
+            known.append(int(ordinal))
+
+    def _note_escape_declaration_view(self, group, view, ordinal=None):
+        """RECORD-ONLY: remember every TIR value that carries an ssa_group and its ordinal.
+
+        One ssa_group can be declared more than once (the same SSA re-declared in a sibling
+        scope is the weight-VF -> main-VF binding), so this keeps ALL sites and never assumes a
+        single one. The ordinal is carried so a forged ordinal can be detected: the site knows
+        which declaration ordinal it actually emitted.
+        """
+        if group is None:
+            return
+        views = self.escape_declaration_views.setdefault(group, [])
+        if all(existing is not view for existing in views):
+            views.append(view)
+        if ordinal is None:
+            ordinal = getattr(self, "_pending_escape_ordinal", None)
+        if ordinal is not None:
+            pending = self.escape_declaration_ordinals.setdefault(group, [])
+            if int(ordinal) not in pending:
+                pending.append(int(ordinal))
+
+    def _note_escape_declare(self, ssa, type_, source="unknown"):
+        """Single-point record from StoragePlan.view (fresh SMEM view) with an SSA key."""
+        if getattr(type_, "storage", None) is not StorageKind.SMEM:
+            return
+        level = len(self.execution_records)
+        key = (ssa, level)
+        group = self.escape_ssa_ref.setdefault(ssa, len(self.escape_ssa_ref))
+        if key in self.escape_seen:
+            # The same SSA at the same scope level must NOT create a second record. Repeats are
+            # counted as ESCAPE_DUPLICATE_DECLARE for audit; the first record wins.
+            self.duplicate_declares += 1
+            self.escape_duplicates.append({"ssa_group": group, "layer": level,
+                                           "source": source, "event": len(self.escape_duplicates)})
+            return
+        self.escape_seen.add(key)
+        self.declare_counter += 1
+        ordinal = self.declare_counter
+        current_scope = self.execution_records[-1]["scope_path"] if self.execution_records else None
+        # Bind the SAME SSA declared in a DIFFERENT scope (sibling scope consumer) as the outer
+        # binding of the existing field; this is the weight-VF -> main-VF case.
+        for field in reversed(self.escape_by_ssa.get(ssa, [])):
+            if field["outer_declaration_ordinal"] is None and field.get("_scope") != current_scope:
+                field["outer_declaration_ordinal"] = ordinal
+                field["outer_type"] = str(type_)
+                self._note_escape_ordinal(group, ordinal)
+                return
+        self._note_escape_ordinal(group, ordinal)
+        if self.execution_records:
+            record = self.execution_records[-1]
+            field = {"field_path": f"out[{len(record['fields'])}]",
+                     "declaration_ordinal": ordinal, "inner_type": str(type_),
+                     "outer_declaration_ordinal": None, "outer_consume_ordinal": None,
+                     "outer_type": None, "_scope": current_scope, "_ssa_group": group}
+            record["fields"].append(field)
+            self.escape_by_ssa.setdefault(ssa, []).append(field)  # in-run pairing only
+            return
+        fields = self.escape_by_ssa.get(ssa)
+        if fields:
+            field = fields[-1]
+            field["outer_declaration_ordinal"] = ordinal
+            field["outer_type"] = str(type_)
 
     def value(self, leaf):
         result = self.memo[id(leaf.expr)][1]
@@ -1173,7 +1390,61 @@ class LoweringContext(TypeInferContext):
                     result = self.builder.declare(source, ctx=self, values=values)
                     self.allocations[source] = result
             if desired.storage is StorageKind.GMEM and desired.dtype != result.type.dtype:
-                raise LoweringError("gmem cross-dtype reuse has no offset-view representation")
+                # A GMEM root read at another element size is an EXPLICIT aliasing view:
+                # element size, BYTE offset, extent, alignment and the aliased root are
+                # stated, and an unsound view is refused by name. It is never a silent copy
+                # and never a fabricated in-place conversion.
+                element_bytes = desired.dtype.bit_width // 8
+                root_element_bytes = result.type.dtype.bit_width // 8
+                root_dims = tuple(result.type.shape)
+                view_dims = tuple(desired.shape)
+                if not all(isinstance(dim, int) for dim in (*root_dims, *view_dims)):
+                    raise LoweringError(
+                        f"{_label(expr)}: gmem dtype view needs static extents, got root "
+                        f"{root_dims} and view {view_dims}"
+                    )
+                root_bytes = root_element_bytes * prod(root_dims)
+                spec = DtypeViewSpec(
+                    root=str(id(result.base) if isinstance(result, View) else id(result)),
+                    dtype=str(desired.dtype),
+                    element_bytes=element_bytes,
+                    byte_offset=0,
+                    extent=prod(view_dims),
+                    alignment=element_bytes,
+                    root_bytes=root_bytes,
+                    access="read",
+                )
+                try:
+                    validate_view(spec)
+                except DtypeViewError as error:
+                    raise LoweringError(
+                        f"{_label(expr)}: gmem dtype view refused ({error}); the same logical "
+                        "extent at a wider element size does not fit the root's bytes, so this "
+                        "needs a conversion into a new buffer, not an alias"
+                    ) from error
+                base = result.base if isinstance(result, View) else result
+                pointer_type = PointerType(desired.dtype, desired.storage)
+                pointer = self.builder.bind(
+                    Var(self.names.fresh("gmem_view_pointer"), type=pointer_type),
+                    Call(PtrOf(), (base,), type=pointer_type),
+                )
+                layout = (
+                    desired.layout.layout
+                    if isinstance(desired.layout, ShardLayout)
+                    else desired.layout
+                )
+                type_ = replace(desired, layout=layout)
+                result = self.builder.mark_invariant(
+                    self.builder.bind(
+                        Var(self.names.fresh("gmem_view"), type=type_),
+                        Call(
+                            TensorView(layout=layout, shape=tuple(type_.shape)),
+                            (pointer,),
+                            type=type_,
+                        ),
+                    ),
+                    "gmem dtype alias over a device-global root; carries no per-mesh state",
+                )
             if desired.storage is StorageKind.SMEM and desired.dtype != result.type.dtype:
                 root = self.storage.answers[leaf].chain[-1]
                 result = self.builder.declare(root, ctx=self, values=values, desired=desired)
@@ -1212,12 +1483,28 @@ class LoweringContext(TypeInferContext):
             known = values.get(id(value))
             if known is None:
                 raise LoweringError(f"dimension uses unbound value {value.name!r}")
-            return self.builder.value(known[1], ctx=self)
+            lowered = known[1]
+            # A NAMED 0-d pure-value arithmetic result that is used as a DIMENSION is already a
+            # value-form dim expression; inlining it here avoids materializing an rmem allocation
+            # outside the execution region. This branch is on the dim() path only: an ordinary
+            # value use still goes through builder.value and is materialized as before.
+            if isinstance(lowered, Constant) or (
+                isinstance(lowered, Call)
+                and isinstance(
+                    lowered.target,
+                    (DimAdd, DimSub, DimMul, DimFloorDiv, DimMod, DimMin, DimMax),
+                )
+            ):
+                return lowered
+            return self.builder.value(lowered, ctx=self)
         if isinstance(value, Call) and isinstance(value.target, MeshCoord):
+            # A coordinate used as a DIMENSION is a pure value: its TIR value is UMAT-typed so it
+            # is never treated as an rmem allocation outside a region. The shared HIR MeshCoord
+            # type is unchanged; only this dim-lowered TIR value is umat.
             return Call(
                 MeshCoord(mesh=value.target.mesh),
                 value.args,
-                type=value.type,
+                type=replace(value.type, storage=StorageKind.UMAT),
             )
         if isinstance(value, Call) and isinstance(value.target, HirBinary):
             dim_op = _DIM_BINARY.get(value.target.kind)
@@ -1245,10 +1532,23 @@ class Lowering(ValuationVisitor[Expr | View]):
     authored: Function
     callees: dict[int, Lowering] = field(default_factory=dict)
 
+    def lowered_functions(self):
+        """Every TIR function this lowering produced, entry first, then its callees."""
+        seen, order, pending = set(), [], [self]
+        while pending:
+            lowering = pending.pop(0)
+            if id(lowering) in seen:
+                continue
+            seen.add(id(lowering))
+            if getattr(lowering, "lowered", None) is not None:
+                order.append(lowering.lowered)
+            pending.extend(lowering.callees.values())
+        return order
+
     def visit(self, expr, ctx=None, *, dimension=False):
         if ctx is None:
             ctx = self.locations.get(id(expr), self.context)
-            if isinstance(expr, (MeshRegion, LoopRegion)):
+            if isinstance(expr, (MeshRegion, LoopRegion, ExecutionRegion)):
                 ctx = ctx.parent
         if dimension:
             if isinstance(expr, Expr):
@@ -1273,7 +1573,7 @@ class Lowering(ValuationVisitor[Expr | View]):
             elements = tuple(self.visit(element, ctx=ctx) for element in expr.elements)
             result = Tuple(elements, type=TupleType(tuple(element.type for element in elements)))
         else:
-            if isinstance(expr, (LoopRegion, MeshRegion)) and id(expr) not in self._memo:
+            if isinstance(expr, (LoopRegion, MeshRegion, ExecutionRegion)) and id(expr) not in self._memo:
                 values = tuple(self.visit(arg, ctx=ctx) for arg in expr.args)
                 for index, (param, value) in enumerate(zip(expr.params, values, strict=True)):
                     if not isinstance(expr, LoopRegion) or index >= len(expr.yield_values):
@@ -1294,6 +1594,7 @@ class Lowering(ValuationVisitor[Expr | View]):
             issues=IssuePlan(),
         )
         ctx = self.context
+        ctx.storage.lowering = ctx
         ctx.memo = self._memo
         if ctx.function.body is not None and self.authored.body is not None:
             ctx.authored_values[id(ctx.function.body)] = self.authored.body
@@ -1344,6 +1645,32 @@ class Lowering(ValuationVisitor[Expr | View]):
         with ctx.builder.region(mesh=mesh, binding=binding, owner=region) as scope:
             result = self.visit(region.body, self.on_region_start(region, ctx))
             scope.result = result
+        return result
+
+
+
+    def visit_ExecutionRegion(self, region: ExecutionRegion, ctx):
+        """Lower a mode region to a TIR ExecutionScope around its body.
+
+        The scope states the mode; it opens no participants, so the mesh in
+        force is the one the region was entered under. The region has exactly one
+        result, which is what makes register non-escape a property of the
+        produced IR rather than a promise about the body.
+        """
+        ctx.executions.append(region.kind)
+        record = {"scope_path": f"execution_scope[{len(ctx.escape_records)}]/{region.kind}",
+                  "kind": region.kind, "fields": []}
+        ctx.execution_records.append(record)
+        try:
+            with ctx.builder.region(execution=region.kind, owner=region) as scope:
+                result = self.visit(region.body, self.on_region_start(region, ctx))
+                scope.result = result
+        finally:
+            ctx.execution_records.pop()
+            ctx.executions.pop()
+            # Always recorded: 'fields=[]' (a scope with no SMEM output) is auditable and
+            # must not be confused with 'scope not recorded'.
+            ctx.escape_records.append(record)
         return result
 
     def visit_LoopRegion(self, loop: LoopRegion, ctx) -> Expr:
@@ -1440,7 +1767,7 @@ class Lowering(ValuationVisitor[Expr | View]):
             )
         if name == "InsertSlice":
             return self.visit_InsertSlice(call, operands, ctx)
-        op = ctx.issues.op(call)
+        op = ctx.issues.op(call, ctx=ctx)
         return getattr(self, f"visit_{type(op).__name__}", self.instruction)(
             call, op, operands, ctx
         )
@@ -1478,7 +1805,7 @@ class Lowering(ValuationVisitor[Expr | View]):
         for value, param in zip((*args, *scratch, destination), params, strict=True):
             passed.append(
                 ctx.builder.value(
-                    ctx.storage.operand(value, param.type, whole_tensor=True, stem="argument"),
+                    ctx.storage.operand(value, param.type, whole_tensor=True, stem="argument", ssa=ctx.var_ssa.get(id(value))),
                     ctx=ctx,
                 )
                 if isinstance(param.type, TensorType)
@@ -1541,11 +1868,13 @@ class Lowering(ValuationVisitor[Expr | View]):
         supplied = params if isinstance(call.target, ScheduleOp) else reads
         for index, (param, operand) in enumerate(zip(supplied, call.args, strict=True)):
             value = written if operand is destination_operand else operands[index]
+            if operand is not destination_operand and isinstance(getattr(value, "type", None), TensorType):
+                ctx._note_escape_consume(operand, value.type)
             if (
                 not isinstance(call.target, ScheduleOp)
                 and operand.type != types[params.index(param)]
             ):
-                value = ctx.storage.operand(value, types[params.index(param)], whole_tensor=True)
+                value = ctx.storage.operand(value, types[params.index(param)], whole_tensor=True, ssa=ctx.var_ssa.get(id(value)))
             if (
                 isinstance(value.type, TensorType)
                 and value.type.shape == ()
@@ -1594,7 +1923,7 @@ class Lowering(ValuationVisitor[Expr | View]):
                     desired = types[params.index(param)]
                     issued.append(
                         ctx.builder.value(
-                            ctx.storage.operand(value, desired, stem=f"{role}_view"), ctx=ctx
+                            ctx.storage.operand(value, desired, stem=f"{role}_view", ssa=ctx.var_ssa.get(id(value))), ctx=ctx
                         )
                     )
                 attributes = {
@@ -1621,7 +1950,7 @@ class Lowering(ValuationVisitor[Expr | View]):
         locals_ = []
         unit_coordinates = {}
         for (role, value), type_, rest in zip(issued_operands, types, plan.rests, strict=True):
-            base = ctx.builder.value(ctx.storage.operand(value, type_, whole_tensor=True), ctx=ctx)
+            base = ctx.builder.value(ctx.storage.operand(value, type_, whole_tensor=True, ssa=ctx.var_ssa.get(id(value))), ctx=ctx)
             binding_mesh = rest.mesh if isinstance(rest, ShardLayout) else frame
             _frame, dropped = _participant_frame(binding_mesh, required)
             source = shard_layout_of(base.type.layout)
@@ -1737,6 +2066,51 @@ class Lowering(ValuationVisitor[Expr | View]):
         return written
 
 
+def _escape_declaration_sites(lowered) -> dict:
+    """Stable structural paths of the TIR statements that carry each escape declaration.
+
+    RECORD-ONLY: this walks the FINAL TIR and reports where each recorded fresh view was
+    emitted. The path grammar is the one the ledger already uses for action ids ("s<index>"
+    for Sequential children, "for:<var>" for loops, "MeshScope"/"ExecutionScope" for the
+    region wrappers), so a site is a pure structural coordinate: no object id, no memory
+    address, and no dependence on dict/set iteration order.
+    """
+    views = lowered.context.escape_declaration_views
+    wanted = {id(view): group for group, group_views in views.items() for view in group_views}
+    sites: dict = {}
+
+    def walk(stmt, path, function) -> None:
+        if isinstance(stmt, Sequential):
+            for index, child in enumerate(stmt.body):
+                walk(child, path + ("s" + str(index),), function)
+            return
+        if isinstance(stmt, For):
+            walk(stmt.body, path + ("for:" + str(getattr(stmt.induction_var, "name", "i")),), function)
+            return
+        if isinstance(stmt, (MeshScope, ExecutionScope)):
+            walk(stmt.body, path + (type(stmt).__name__,), function)
+            return
+        if isinstance(stmt, LetStmt):
+            group = wanted.get(id(stmt.value))
+            if group is not None:
+                sites.setdefault(group, []).append({
+                    "path": "/".join(path),
+                    "function": str(getattr(function, "name", "")),
+                    "statement": "LetStmt",
+                    "var": str(getattr(stmt.var, "name", "")),
+                    "type": str(getattr(stmt.var, "type", "")),
+                })
+
+    for function in lowered.lowered_functions():
+        walk(getattr(function, "body", None), (), function)
+    ordinals = lowered.context.escape_declaration_ordinals
+    for group, entries in sites.items():
+        known = [int(value) for value in ordinals.get(group, [])]
+        for entry in entries:
+            entry["ordinals"] = known
+    return sites
+
+
 @dataclass
 class ConvertHIRToTIR(ModulePass):
     """Replace one selected HIR entry with its scheduled TIR function."""
@@ -1762,6 +2136,36 @@ class ConvertHIRToTIR(ModulePass):
             lowered,
         )
         lowering.lowered = lowering.run()
+        records = lowering.context.escape_records
+        # Only fields bound to an outer view are ESCAPE records; an SMEM allocation with no outer
+        # binding is a non-escape temporary and is counted, not recorded as an escape field.
+        for record in records:
+            kept = []
+            dropped_fields = []
+            for field in record["fields"]:
+                if field["outer_declaration_ordinal"] is None and field.get("outer_consume_ordinal") is None:
+                    dropped_fields.append({"scope_path": record["scope_path"],
+                                           "declaration_ordinal": field["declaration_ordinal"],
+                                           "ssa_group": field.get("_ssa_group"),
+                                           "inner_type": field["inner_type"],
+                                           "had_outer_binding": False})
+                else:
+                    field["field_path"] = f"out[{len(kept)}]"
+                    field["ssa_group"] = field.pop("_ssa_group", None)
+                    field.pop("_scope", None)
+                    kept.append(field)
+            record["fields"] = kept
+            record["dropped_fields"] = dropped_fields
+            record["dropped_non_escape"] = len(dropped_fields)
+        result.module.metadata["escape_records"] = records
+        # RECORD-ONLY: where the final TIR actually emitted each recorded declaration. The
+        # ledger consumes this to address endpoints structurally; nothing here is a statement,
+        # a schedule decision, or a semantic value.
+        result.module.metadata["escape_declaration_sites"] = _escape_declaration_sites(lowering)
+        result.module.metadata["duplicate_declares"] = lowering.context.duplicate_declares
+        result.module.metadata["escape_duplicates"] = lowering.context.escape_duplicates
+        result.module.metadata["unresolved_alias_chains"] = lowering.context.unresolved_alias_chains
+        result.module.metadata["view_debug"] = dict(lowering.context.storage.debug_views)
         lowered[id(result.function)] = lowering
         modules = set()
 

@@ -14,6 +14,7 @@ from dataclasses import replace
 from typing import Any, Callable
 
 from tilefoundry.ir.core import Call, Constant, Expr, Tuple, Var
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.tir.prim_function import PrimFunction
@@ -21,6 +22,7 @@ from tilefoundry.ir.tir.shape import ShapeOf
 from tilefoundry.ir.tir.stmt import Stmt
 from tilefoundry.ir.tir.stmts import (
     Evaluate,
+    ExecutionScope,
     For,
     If,
     LetStmt,
@@ -67,7 +69,7 @@ def expr_children(expr: Expr) -> tuple[Expr, ...]:
             return ()
         case Call(target=target, args=args):
             return (target, *args) if isinstance(target, Call) else args
-        case MeshRegion(args=args, body=body):
+        case MeshRegion(args=args, body=body) | ExecutionRegion(args=args, body=body):
             return (*args, body)
         case LoopRegion(args=args, body=body, yield_values=yield_values):
             return (*args, body, *yield_values)
@@ -93,7 +95,7 @@ def _rebuild_expr(expr: Expr, new_children: tuple[Expr, ...]) -> Expr:
             return replace(expr, target=new_children[0], args=new_children[1:])
         case Call():
             return replace(expr, args=new_children)
-        case MeshRegion(args=args):
+        case MeshRegion(args=args) | ExecutionRegion(args=args):
             n_args = len(args)
             return replace(expr, args=new_children[:n_args], body=new_children[n_args])
         case LoopRegion(args=args):
@@ -133,6 +135,7 @@ def _stmt_children(stmt: Stmt) -> tuple[Stmt, ...]:
             | For(body=body)
             | While(body=body)
             | MeshScope(body=body)
+            | ExecutionScope(body=body)
         ):
             return (body,)
         case If(then_body=then_body, else_body=else_body):
@@ -148,7 +151,7 @@ def _rebuild_stmt_children(stmt: Stmt, new_children: tuple[Stmt, ...]) -> Stmt:
     match stmt:
         case Sequential():
             return replace(stmt, body=new_children)
-        case PrimFunction() | For() | While() | MeshScope():
+        case PrimFunction() | For() | While() | MeshScope() | ExecutionScope():
             (body,) = new_children
             assert isinstance(body, Sequential)
             return replace(stmt, body=body)

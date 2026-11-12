@@ -30,6 +30,7 @@ from tilefoundry.ir.core import (
     attach_metadata,
     get_metadata,
 )
+from tilefoundry.ir.core.execution import execution_kind_of
 from tilefoundry.ir.core.param_def import variadic_item_annotation
 from tilefoundry.ir.hir.nn.matmul import MatMul
 from tilefoundry.ir.pattern import _mangle_variant_name
@@ -4379,6 +4380,21 @@ def _scoped_region(mesh, body, params=(), args=()):
     )
 
 
+def _scoped_execution_region(kind, body, params=(), args=()):
+    """Build a type-transparent HIR execution region.
+
+    The region types as its body does: which execution mode ran the work is not
+    a fact about the shape of what came out of it.
+    """
+    return runtime.ExecutionRegion(
+        kind=kind.name,
+        params=tuple(params),
+        args=tuple(args),
+        body=body,
+        type=body.type,
+    )
+
+
 def _region_captures(node, context, excluded=frozenset()):
     """Capture outer expression bindings for one region boundary."""
 
@@ -4480,7 +4496,7 @@ def _bind_region_results(context, region, names, node):
         context.lexical_scope.define(name, projection)
 
 
-def _rebind_through_region(context, mesh, names, frame, node, params=(), args=()):
+def _rebind_through_region(context, build, names, frame, node, params=(), args=()):
     """Point escaped names at a region result, whether or not it has a body value.
 
     A region's computed values are named, and those names are how code after it
@@ -4491,15 +4507,117 @@ def _rebind_through_region(context, mesh, names, frame, node, params=(), args=()
     """
     values = [(name, frame[name]) for name in names]
     if len(values) == 1:
-        scoped = _scoped_region(mesh, values[0][1], params, args)
+        scoped = build(values[0][1], params, args)
         _bind_region_results(context, scoped, [values[0][0]], node)
         return values[0][0]
     tuple_type = runtime.TupleType(fields=tuple(value.type for _name, value in values))
     tuple_body = runtime.IrTuple(type=tuple_type, elements=tuple(value for _name, value in values))
-    scoped = _scoped_region(mesh, tuple_body, params, args)
+    scoped = build(tuple_body, params, args)
     _bind_region_results(context, scoped, [name for name, _value in values], node)
     return values[0][0]
 
+
+def _execution_surface_kind(func_node, context):
+    """The execution kind a with-statement context call names, or None.
+
+    Resolved, not spelled: the callee is evaluated to the object it denotes and
+    that object is asked for its declaration. A foreign qualifier therefore
+    cannot borrow the surface name -- an attribute that merely ends in the same
+    word is a different object, and an unresolvable one is no mode at all --
+    while an alias that denotes the same marker is accepted, because identity
+    is what a declaration is.
+    """
+    try:
+        resolved = _resolve_reference(func_node, context)
+    except ParseError:
+        return None
+    return execution_kind_of(resolved)
+
+
+def _with_execution_kind(context_expr, context):
+    """The execution kind a with-statement context expression names, or None.
+
+    A context expression that is not a bare, argument-free call of a declared
+    surface denotes no mode, so the Mesh reading gets its chance and the
+    statement fails there when it is neither.
+    """
+    if not isinstance(context_expr, ast.Call) or context_expr.args or context_expr.keywords:
+        return None
+    return _execution_surface_kind(context_expr.func, context)
+
+
+class ExecutionContextPattern(ElementPattern):
+    """The context expression of a with-statement naming one execution mode.
+
+    A surface marker is a declaration, not an operation: the callee is resolved to
+    the object it denotes, and that object is asked for its declaration. So
+    T.SimdVF, an alias denoting it and a re-import of it all state the same mode,
+    while an attribute that merely spells the word on some other owner does not.
+    It is deliberately not a Mesh pattern -- entering a mode does not open
+    participants, and a mesh with no extent has no meaning.
+    """
+
+    element_name = "execution_context"
+    syntax = LazyPattern(
+        lambda: BindPattern(
+            AstNodePattern(
+                ast.Call,
+                FieldPattern(
+                    "func",
+                    ChoicePattern(AstNodePattern(ast.Name), AstNodePattern(ast.Attribute)),
+                ),
+                FieldPattern("args", SequencePattern()),
+                FieldPattern("keywords", SequencePattern()),
+            ),
+            ExecutionContextPattern.enter,
+        )
+    )
+
+    @staticmethod
+    def enter(
+        node: object, context: MatchContext, matched: AstMatch[Any]
+    ) -> AstMatch[Any] | MatchFailure | None:
+        assert isinstance(node, ast.Call)
+        kind = _execution_surface_kind(node.func, context)
+        if kind is None:
+            return None
+        return dataclasses.replace(
+            matched,
+            pattern_id="execution.context",
+            branch_id="execution_context",
+            captures={**matched.captures, "kind": kind},
+        )
+
+    @staticmethod
+    def construct(match, children, context):
+        return match.captures["kind"]
+
+    RULES: ClassVar[tuple[AstRule[Any], ...]] = ()
+
+
+def _enter_execution_scope(context, kind, *, matched, node):
+    """Record the execution mode a with-statement puts in force for its body.
+
+    The mode is tracked on the parse state so a nested with-statement can be
+    refused while the body is still being built, and so the frame it adds is
+    popped by the same statement that pushed it.
+    """
+    if context.function is None:
+        raise ParseError.from_node(
+            node, context, "an execution region requires function context"
+        )
+    state = context.function.state
+    enclosing = state.execution_stack[-1] if state.execution_stack else None
+    if enclosing is not None and not enclosing.nestable:
+        raise ParseError.from_node(
+            node,
+            context,
+            f"{kind.surface} cannot be entered inside {enclosing.surface}: "
+            f"execution region {enclosing.name!r} is not nestable",
+        )
+    state.execution_stack.append(kind)
+    context.lexical_scope.push_frame()
+    context.lexical_scope.define(_TYPE_INFER_CONTEXT, _parser_infer_context(context))
 
 class WithPattern(ElementPattern):
     element_name = "with"
@@ -4512,14 +4630,20 @@ class WithPattern(ElementPattern):
                     SequencePattern(
                         AstNodePattern(
                             ast.withitem,
-                            FieldPattern("optional_vars", AstNodePattern(ast.Name)),
+                            FieldPattern(
+                                "optional_vars",
+                                OptionalPattern(AstNodePattern(ast.Name)),
+                            ),
                             FieldPattern(
                                 "context_expr",
                                 ChildPattern(
-                                    "mesh",
-                                    MeshContextPattern(),
-                                    "mesh_context",
-                                    "mesh",
+                                    "context_expr",
+                                    ChoicePattern(
+                                        MeshContextPattern(),
+                                        ExecutionContextPattern(),
+                                    ),
+                                    "with_context",
+                                    "with_context",
                                 ),
                             ),
                         )
@@ -4544,55 +4668,90 @@ class WithPattern(ElementPattern):
     def enter(node: object, context: MatchContext, matched: AstMatch[Any]) -> AstMatch[Any] | None:
         assert isinstance(node, ast.With)
         item = node.items[0]
-        assert isinstance(item.optional_vars, ast.Name)
-        binding = item.optional_vars.id
+        binding = item.optional_vars.id if isinstance(item.optional_vars, ast.Name) else None
+        kind = _with_execution_kind(item.context_expr, context)
+        if kind is not None and context.function is not None:
+            if binding is not None:
+                raise ParseError.from_node(
+                    node,
+                    context,
+                    f"{kind.surface} opens an execution region, not a scope of participants; "
+                    f"it binds no name, so drop the {binding!r} target",
+                )
+        if kind is None and binding is None:
+            raise ParseError.from_node(
+                node,
+                context,
+                f"{ast.unparse(item.context_expr)!r} opens neither a Mesh scope nor a "
+                "declared execution region; a Mesh scope also requires a binding name",
+            )
         params, args = _region_captures(node, context)
+        if kind is not None:
+            _enter_execution_scope(context, kind, matched=matched, node=node)
+        children = [
+            AstChild(
+                "execution" if kind is not None else "mesh",
+                ExecutionContextPattern() if kind is not None else MeshContextPattern(),
+                item.context_expr,
+                "execution_context" if kind is not None else "mesh_context",
+                "execution_context" if kind is not None else "mesh",
+                values={} if kind is not None else {"mesh_binding": binding},
+            ),
+            AstChild(
+                "body",
+                BlockPattern(),
+                _body_as_ast_module(node.body),
+                "block",
+                "with_body",
+                lexical_bindings=(
+                    _region_capture_bindings(params, context)
+                    if context.function.dialect == "hir"
+                    else None
+                ),
+                values={
+                    "loop_captures": (
+                        *context.values.get("loop_captures", ()), *zip(params, args)
+                    )
+                },
+            ),
+        ]
         return dataclasses.replace(
             matched,
-            pattern_id="statement.with_mesh",
-            branch_id="with_mesh",
+            pattern_id="statement.with_execution" if kind is not None else "statement.with_mesh",
+            branch_id="with_execution" if kind is not None else "with_mesh",
             captures={
                 **matched.captures,
                 "binding": binding,
+                "kind": kind,
                 "region_params": params,
                 "region_args": args,
             },
-            children=(
-                AstChild(
-                    "mesh",
-                    MeshContextPattern(),
-                    item.context_expr,
-                    "mesh_context",
-                    "mesh",
-                    values={"mesh_binding": binding},
-                ),
-                AstChild(
-                    "body",
-                    BlockPattern(),
-                    _body_as_ast_module(node.body),
-                    "block",
-                    "with_body",
-                    lexical_bindings=(
-                        _region_capture_bindings(params, context)
-                        if context.function.dialect == "hir"
-                        else None
-                    ),
-                    values={
-                        "loop_captures": (
-                            *context.values.get("loop_captures", ()), *zip(params, args)
-                        )
-                    },
-                ),
-            ),
+            children=tuple(children),
         )
 
     @staticmethod
     def construct(match, children, context):
         if context.function is None:
             raise ParseError.from_node(match.node, context, "`with` requires function context")
-        mesh = children["mesh"]
+        kind = match.captures.get("kind")
         frame = context.lexical_scope.pop_frame()
-        frame.pop(match.captures["binding"], None)
+        binding = match.captures.get("binding")
+        if binding is not None:
+            frame.pop(binding, None)
+        if kind is not None:
+            if not context.function.state.execution_stack:
+                raise ParseError.from_node(match.node, context, "Execution stack is unbalanced")
+            active_kind = context.function.state.execution_stack.pop()
+            if active_kind is not kind:
+                raise ParseError.from_node(match.node, context, "Execution stack is unbalanced")
+            if context.function.dialect != "hir":
+                # The same surface, read back as the statement it lowers to. A
+                # TIR function has no yield and no region captures: it is a
+                # straight-line body in which the mode is a lexical scope, so the
+                # printed form reloads as the scope rather than as a region.
+                return runtime.ExecutionScope(kind=kind.name, body=children["body"])
+            return WithPattern._construct_execution(match, children, context, kind, frame)
+        mesh = children["mesh"]
         if not context.function.state.mesh_stack:
             raise ParseError.from_node(match.node, context, "Mesh stack is unbalanced")
         active_mesh = context.function.state.mesh_stack.pop()
@@ -4601,31 +4760,75 @@ class WithPattern(ElementPattern):
         if context.function.dialect == "hir":
             body = children["body"]
             params = match.captures.get("region_params", ())
-            entry = {param.name: param for param in params}
-            live = context.live_out[match.node]
-            escaping = tuple(
-                name
-                for name, value in frame.items()
-                if isinstance(value, runtime.Expr)
-                and value is not entry.get(name)
-                and (context.lexical_scope.lookup(name) is not None or name in live)
-            )
             args = match.captures.get("region_args", ())
-            rebound = None
-            if escaping:
-                rebound = _rebind_through_region(
-                    context, mesh, escaping, frame, match.node, params, args
-                )
+            escaping, rebound = WithPattern._rebind_escapes(
+                context, match, frame, params, args, lambda body, p, a: _scoped_region(mesh, body, p, a)
+            )
             if body is not None and (
                 rebound is None or isinstance(match.node.body[-1], ast.Return)
             ):
                 return _scoped_region(mesh, body, params, args)
             return None if rebound is None else context.lexical_scope.lookup(rebound)
-        binding = runtime.Var(
+        binding_var = runtime.Var(
             type=runtime.TensorType.scalar(runtime.DType.i64, storage=runtime.StorageKind.RMEM),
-            name=match.captures["binding"],
+            name=binding,
         )
-        return runtime.MeshScope(mesh=mesh, binding=binding, body=children["body"])
+        return runtime.MeshScope(mesh=mesh, binding=binding_var, body=children["body"])
+
+    @staticmethod
+    def _rebind_escapes(context, match, frame, params, args, build):
+        """Rebind the names this region rebinds outside it, if any escape."""
+        entry = {param.name: param for param in params}
+        live = context.live_out[match.node]
+        escaping = tuple(
+            name
+            for name, value in frame.items()
+            if isinstance(value, runtime.Expr)
+            and value is not entry.get(name)
+            and (context.lexical_scope.lookup(name) is not None or name in live)
+        )
+        if not escaping:
+            return escaping, None
+        return escaping, _rebind_through_region(
+            context, build, escaping, frame, match.node, params, args
+        )
+
+    @staticmethod
+    def _construct_execution(match, children, context, kind, frame):
+        """Build the execution region this with-statement opened.
+
+        The body leaves through one value, so a mode that computes something
+        has exactly one way out and register-private values cannot ride along.
+        """
+        if context.function.dialect != "hir":
+            raise ParseError.from_node(
+                match.node,
+                context,
+                f"{kind.surface} opens an authored execution region; it has no TIR spelling here",
+            )
+        params = match.captures.get("region_params", ())
+        args = match.captures.get("region_args", ())
+        body = children["body"]
+        escaping, rebound = WithPattern._rebind_escapes(
+            context,
+            match,
+            frame,
+            params,
+            args,
+            lambda value, p, a: _scoped_execution_region(kind, value, p, a),
+        )
+        if body is not None and (rebound is None or isinstance(match.node.body[-1], ast.Return)):
+            return _scoped_execution_region(kind, body, params, args)
+        if rebound is None:
+            if body is not None:
+                return _scoped_execution_region(kind, body, params, args)
+            raise ParseError.from_node(
+                match.node,
+                context,
+                f"{kind.surface} region computes nothing to leave it; "
+                "give the region a returning body",
+            )
+        return context.lexical_scope.lookup(rebound)
 
     RULES: ClassVar[tuple[AstRule[Any], ...]] = ()
 
@@ -4857,6 +5060,14 @@ class TileIteratorQualificationRule:
         return value
 
 
+def _pipelined_iterator_callee():
+    return AstNodePattern(
+        ast.Attribute,
+        FieldPattern("value", AstNodePattern(ast.Name, FieldPattern("id", LiteralPattern("tf")))),
+        FieldPattern("attr", LiteralPattern("pipelined")),
+    )
+
+
 def _loop_iterator_kind(call: ast.Call) -> str | None:
     """Recognize the iterator surface shared by syntax and diagnostics."""
     callee = call.func
@@ -4864,6 +5075,10 @@ def _loop_iterator_kind(call: ast.Call) -> str | None:
         return "bare_tile" if callee.id == "tile" else "range"
     if _tile_iterator_callee().match(callee, None) is not None:
         return "tile"
+    # D0: a pipelined loop is expressed as tf.pipelined(stop, num_stages=...).
+    # Bare 'pipelined' is NOT accepted, matching how tf.tile is the only spelling.
+    if _pipelined_iterator_callee().match(callee, None) is not None:
+        return "pipelined"
     return None
 
 
@@ -4890,6 +5105,18 @@ class LoopIteratorPattern(ElementPattern):
                     ),
                 ),
                 pattern_id="loop.iterator.tile",
+            ),
+            BranchPattern(
+                "pipelined",
+                AstNodePattern(
+                    ast.Call,
+                    FieldPattern("func", _pipelined_iterator_callee()),
+                    FieldPattern(
+                        "args",
+                        SequencePattern(AstNodePattern(ast.expr)),
+                    ),
+                ),
+                pattern_id="loop.iterator.pipelined",
             ),
             BranchPattern(
                 "range",
@@ -4930,8 +5157,63 @@ def _reads_program_value(node: ast.AST, context: MatchContext) -> bool:
     )
 
 
+#: The only keywords tf.pipelined accepts at D0. Anything else is named, never
+#: quietly ignored: an annotation the author believes in and the compiler drops is
+#: worse than a refusal.
+_PIPELINE_KEYWORDS = frozenset({"num_stages", "annotations"})
+
+
+def _pipeline_spec_from_keywords(call: ast.Call):
+    """Build a PipelineSpec from the authored keywords, or refuse by name.
+
+    Every value must be a LITERAL. D0 has no way to carry "resolve the stage count
+    later" without pretending a solver already ran, so a symbolic or computed
+    expression is a refusal rather than a deferred unknown.
+    """
+    from tilefoundry.ir.hir.pipeline import PipelineError, PipelineSpec  # noqa: PLC0415
+
+    values = {}
+    for keyword in call.keywords:
+        if keyword.arg is None:
+            raise PipelineError(
+                "PIPELINE_ANNOTATION_UNSUPPORTED",
+                "tf.pipelined does not accept **kwargs",
+            )
+        if keyword.arg not in _PIPELINE_KEYWORDS:
+            raise PipelineError(
+                "PIPELINE_ANNOTATION_UNSUPPORTED",
+                "unsupported tf.pipelined keyword %r; D0 accepts %s"
+                % (keyword.arg, tuple(sorted(_PIPELINE_KEYWORDS))),
+            )
+        try:
+            values[keyword.arg] = ast.literal_eval(keyword.value)
+        except (ValueError, SyntaxError):
+            code = (
+                "PIPELINE_NUM_STAGES_INVALID"
+                if keyword.arg == "num_stages"
+                else "PIPELINE_ANNOTATION_UNSUPPORTED"
+            )
+            raise PipelineError(
+                code,
+                "tf.pipelined(%s=...) must be a literal; a dynamic expression is "
+                "not a D0 declaration" % (keyword.arg,),
+            ) from None
+    if "num_stages" not in values:
+        raise PipelineError(
+            "PIPELINE_NUM_STAGES_INVALID",
+            "tf.pipelined requires num_stages=<int>",
+        )
+    return PipelineSpec.from_surface(
+        values["num_stages"],
+        values.get("annotations"),
+        origin=(call.lineno, call.col_offset),
+    )
+
+
 def _iterator_arity_failure(kind: str, count: int, node: ast.Call) -> PatternFailure | None:
     """Describe an invalid tile/range arity, if this call has one."""
+    if kind == "pipelined":
+        return None  # validated in enter(), which names the reason
     if count in ({2, 3} if kind == "tile" else {1, 2, 3}):
         return None
     if kind == "tile" and count == 1:
@@ -4987,13 +5269,15 @@ class LoopHeaderPattern(ElementPattern):
                 checked = rule.apply(None, node=node.iter, context=context)
                 if isinstance(checked, MatchFailure):
                     return checked
-            if kind not in {"tile", "range"}:
+            if kind not in {"tile", "range", "pipelined"}:
                 return PatternFailure(
                     "loop_header",
                     node.iter.func,
                     "loop iterator must be tf.tile(...) or range(...)",
                 )
-            if node.iter.keywords:
+            # tf.pipelined is the ONE iterator that takes keywords (num_stages,
+            # annotations); tile/range stay positional-only at the IR level.
+            if node.iter.keywords and kind != "pipelined":
                 return PatternFailure(
                     "loop_header",
                     node.iter,
@@ -5012,7 +5296,7 @@ class LoopHeaderPattern(ElementPattern):
         assert isinstance(node.iter, ast.Call)
         kind = _loop_iterator_kind(node.iter)
         count = len(node.iter.args)
-        if node.iter.keywords:
+        if node.iter.keywords and kind != "pipelined":
             return PatternFailure(
                 "loop_header",
                 node.iter,
@@ -5020,7 +5304,22 @@ class LoopHeaderPattern(ElementPattern):
             )
         if failure := _iterator_arity_failure(kind, count, node.iter):
             return failure
-        if kind == "tile" and count == 2:
+        pipeline = None
+        if kind == "pipelined":
+            # tf.pipelined(stop, ...) -> start 0, step 1. The single positional
+            # argument is the EXCLUSIVE stop; it also becomes extent, which stays
+            # the one authority for the loop bound.
+            if count != 1:
+                return PatternFailure(
+                    "loop_header",
+                    node.iter,
+                    "tf.pipelined takes exactly one positional argument, the "
+                    "exclusive stop; got %d" % (count,),
+                )
+            pipeline = _pipeline_spec_from_keywords(node.iter)
+            fields = ("extent",)
+            defaults = {"start": 0, "step": 1}
+        elif kind == "tile" and count == 2:
             fields = ("extent", "step")
             defaults = {"start": 0}
         elif kind == "tile":
@@ -5063,6 +5362,7 @@ class LoopHeaderPattern(ElementPattern):
                 "target": node.target.id,
                 "fields": fields,
                 "defaults": defaults,
+                "pipeline": pipeline,
             },
             children=tuple(children),
         )
@@ -5090,7 +5390,7 @@ class LoopHeaderPattern(ElementPattern):
                 _TYPE_INFER_CONTEXT,
                 dataclasses.replace(inference, loops=(*inference.loops, (iv, *bounds))),
             )
-            return (iv, *bounds)
+            return (iv, *bounds, match.captures.get("pipeline"))
         if context.function is None or context.function.dialect != "hir":
             raise ParseError.from_node(match.node, context, "HIR loop header in a non-HIR context")
         values = dict(match.captures["defaults"])
@@ -5148,6 +5448,7 @@ class LoopHeaderPattern(ElementPattern):
             phi_vars=phi_vars,
             params=(*phi_vars, *params),
             args=(*carry_inits, *args),
+            pipeline=match.captures.get("pipeline"),
         )
 
     BIND_RULES = (TileIteratorQualificationRule(),)
@@ -5206,6 +5507,16 @@ class LoopBodyPattern(ElementPattern):
     RULES: ClassVar[tuple[AstRule[Any], ...]] = ()
 
 
+def _pipeline_form_supported(frame) -> bool:
+    """Whether D0 can represent this loop shape as pipelined.
+
+    Single level, start 0, step 1. Anything else is a named refusal rather than a
+    silently weakened declaration: a pipelined loop whose bounds were quietly
+    reinterpreted would carry an intent nobody authored.
+    """
+    return frame.start == 0 and frame.step == 1
+
+
 class ForPattern(ElementPattern):
     element_name = "for"
     syntax = LazyPattern(
@@ -5250,8 +5561,8 @@ class ForPattern(ElementPattern):
         body = children["body"]
         if context.function is not None and context.function.dialect == "tir":
             context.lexical_scope.pop_frame()
-            induction_var, start, stop, step = frame
-            return runtime.For(induction_var, start, stop, step, body)
+            induction_var, start, stop, step, pipeline = frame
+            return runtime.For(induction_var, start, stop, step, body, pipeline=pipeline)
         yield_values = tuple(context.lexical_scope.lookup(name) for name in frame.carry_names)
         context.lexical_scope.pop_frame()
         if frame.carry_names:
@@ -5262,6 +5573,15 @@ class ForPattern(ElementPattern):
             )
         else:
             result_type = body.type
+        pipeline = getattr(frame, "pipeline", None)
+        if pipeline is not None and not _pipeline_form_supported(frame):
+            from tilefoundry.ir.hir.pipeline import PipelineError  # noqa: PLC0415
+
+            raise PipelineError(
+                "PIPELINE_FORM_UNSUPPORTED",
+                "D0 supports single-level pipelined loops with start 0 and step 1; "
+                "got start=%r step=%r" % (frame.start, frame.step),
+            )
         grid = runtime.LoopRegion(
             type=result_type,
             induction_var=frame.induction_var,
@@ -5272,6 +5592,7 @@ class ForPattern(ElementPattern):
             start=frame.start,
             extent=frame.extent,
             step=frame.step,
+            pipeline=pipeline,
         )
         _bind_region_results(context, grid, frame.carry_names, match.node)
         return grid

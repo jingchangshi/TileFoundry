@@ -1,0 +1,15 @@
+python /home/s00653124/.conda/envs/tilefoundry-npu/bin/python 3.12.16 (main, Oct 26 2026, 11:37:43) [GCC 15.3.0]
+before_import torch
+import_ok torch 2.12.0+cpu /home/s00653124/.conda/envs/tilefoundry-npu/lib/python3.12/site-packages/torch/__init__.py
+before_import torch_npu
+/home/s00653124/.conda/envs/tilefoundry-npu/lib/python3.12/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /data/pri/cann-9.2.0/cann-9.2.0-beta.2 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/home/s00653124/.conda/envs/tilefoundry-npu/lib/python3.12/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /data/pri/cann-9.2.0/cann-9.2.0-beta.2/x86_64-linux/ascend_ops_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/home/s00653124/.conda/envs/tilefoundry-npu/lib/python3.12/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /data/pri/cann-9.2.0/cann-9.2.0-beta.2 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/home/s00653124/.conda/envs/tilefoundry-npu/lib/python3.12/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /data/pri/cann-9.2.0/cann-9.2.0-beta.2/x86_64-linux/ascend_ops_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+import_ok torch_npu 2.12.0 /home/s00653124/.conda/envs/tilefoundry-npu/lib/python3.12/site-packages/torch_npu/__init__.py
+before_import tilelang
+import_fail tilelang ModuleNotFoundError("No module named 'tilelang'")

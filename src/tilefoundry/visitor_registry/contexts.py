@@ -55,12 +55,17 @@ class ValuationContext:
 
     def enter_region(self, region):
         """Enter a region after its arguments have been visited outside it."""
+        from tilefoundry.ir.hir.execution_region import ExecutionRegion  # noqa: PLC0415
         from tilefoundry.ir.hir.loop_region import LoopRegion  # noqa: PLC0415
 
         inner = self.with_captures(region.captures())
         if isinstance(region, LoopRegion):
             loop = (region.induction_var, region.start, region.extent, region.step)
             return replace(inner, loops=(*self.loops, loop), owner=region, parent=self)
+        if isinstance(region, ExecutionRegion):
+            # A mode changes what the work may do, not who runs it: the mesh in
+            # force is the one the region was entered under.
+            return replace(inner, owner=region, parent=self)
         mesh = make_mesh(self.current_mesh, region.mesh) if self.current_mesh else region.mesh
         return replace(inner, current_mesh=mesh, owner=region, parent=self)
 

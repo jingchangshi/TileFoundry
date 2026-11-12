@@ -37,6 +37,7 @@ from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.math.unary import Unary
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.specialize import (
     canonical_specialization_signature,
@@ -143,9 +144,9 @@ class HirPrinter(PythonPrinter):
                 self.reference(carry, ctx) for carry in expr.params[: len(expr.yield_values)]
             )
             return carried[0] if len(carried) == 1 else "(" + ", ".join(carried) + ")"
-        if isinstance(projection, MeshRegion):
+        if isinstance(projection, (MeshRegion, ExecutionRegion)):
             return self.reference(projection.body.elements[_projection_index(expr)], ctx)
-        if isinstance(expr, MeshRegion):
+        if isinstance(expr, (MeshRegion, ExecutionRegion)):
             return self.reference(expr.body, ctx)
         return self._names.get(id(expr)) or binding_name(expr) or self.visit(expr, ctx)
 
@@ -286,7 +287,7 @@ def _comments(expr: Expr, options: PythonPrintOptions, printer: PythonPrinter, c
     the boundary between those two languages.
     """
     comments: list[str] = []
-    if options.show_types and not isinstance(expr, (LoopRegion, MeshRegion)):
+    if options.show_types and not isinstance(expr, (LoopRegion, MeshRegion, ExecutionRegion)):
         comments.append(_compact_type(expr.type, printer, ctx))
     for metadata_type in options.comment_metadata_types:
         metadata = get_metadata(expr, metadata_type)
@@ -529,7 +530,7 @@ def iter_exprs(root: Expr | None, seen: set[int] | None = None) -> Iterator[Expr
     yield root
 
 
-def _region_projection(expr: Expr) -> LoopRegion | MeshRegion | None:
+def _region_projection(expr: Expr) -> LoopRegion | MeshRegion | ExecutionRegion | None:
     """Return the region projected by a constant-index ``TupleGetItem``."""
     if not (
         isinstance(expr, Call)
@@ -542,7 +543,7 @@ def _region_projection(expr: Expr) -> LoopRegion | MeshRegion | None:
     region = expr.args[0]
     if isinstance(region, LoopRegion):
         return region
-    if isinstance(region, MeshRegion) and isinstance(region.body, Tuple):
+    if isinstance(region, (MeshRegion, ExecutionRegion)) and isinstance(region.body, Tuple):
         return region
     return None
 
@@ -603,7 +604,7 @@ def _emit_def(
     _order: list[Expr] = list(iter_exprs(fn.body, _seen))
     for p in fn.params:
         _order.extend(iter_exprs(p, _seen))
-    region_types = (LoopRegion, MeshRegion)
+    region_types = (LoopRegion, MeshRegion, ExecutionRegion)
     for scope in tuple(expr for expr in _order if isinstance(expr, region_types)):
         for param in scope.params:
             _order.extend(iter_exprs(param, _seen))
@@ -670,6 +671,7 @@ def _emit_def(
 
     _grid_internal_ids: set[int] = set()
     _mesh_region_internal_ids: set[int] = set()
+    _execution_region_internal_ids: set[int] = set()
     _nested_grid_ids: set[int] = set()
     for expr in _order:
         if not isinstance(expr, LoopRegion):
@@ -731,6 +733,10 @@ def _emit_def(
     for expr in _order:
         if isinstance(expr, MeshRegion):
             for _ in iter_exprs(expr.body, _mesh_region_internal_ids):
+                pass
+        elif isinstance(expr, ExecutionRegion):
+            # The body belongs inside the region's with-block, not beside it.
+            for _ in iter_exprs(expr.body, _execution_region_internal_ids):
                 pass
 
     def _moved_window(start, size, stride):
@@ -912,6 +918,9 @@ def _emit_def(
         if isinstance(expr, MeshRegion):
             _emit_mesh_region(expr, level)
             return
+        if isinstance(expr, ExecutionRegion):
+            _emit_execution_region(expr, level)
+            return
         if isinstance(expr, Call):
             projection = _region_projection(expr)
             if isinstance(projection, LoopRegion):
@@ -920,6 +929,10 @@ def _emit_def(
                 return
             if isinstance(projection, MeshRegion):
                 _emit_mesh_region(projection, level)
+                printed.add(key)
+                return
+            if isinstance(projection, ExecutionRegion):
+                _emit_execution_region(projection, level)
                 printed.add(key)
                 return
             for arg in expr.args:
@@ -945,7 +958,14 @@ def _emit_def(
         extent = printer.visit(region.extent, ctx)
         step = printer.visit(region.step, ctx)
         start = printer.visit(region.start, ctx)
-        if id(region.induction_var) in _tile_window_steps:
+        pipeline = getattr(region, "pipeline", None)
+        if pipeline is not None:
+            # A pipelined loop is recognised FIRST and printed as itself. Falling
+            # through to range()/tf.tile() would erase the declaration on a
+            # print->parse roundtrip, so the intent would silently disappear from
+            # anything that round-trips through source.
+            loop = _pipeline_loop_surface(pipeline, extent)
+        elif id(region.induction_var) in _tile_window_steps:
             loop = (
                 f"tf.tile({extent}, {step})"
                 if region.start == 0
@@ -971,6 +991,22 @@ def _emit_def(
         for carry, value in zip(region.params[: len(region.yield_values)], region.yield_values):
             lines.append(f"{inner}{_names[id(carry)]} = {printer.reference(value)}")
 
+    def _emit_execution_region(region: ExecutionRegion, level: str, *, terminal: bool = False) -> None:
+        key = id(region)
+        if key in printed:
+            return
+        for arg in region.args:
+            _emit_expr(arg, level)
+        declared = region.declaration()
+        surface = declared.surface if declared is not None else region.kind
+        lines.append(
+            f"{level}with T.{surface}():{_comments(region, options, printer, ctx)}"
+        )
+        printed.add(key)
+        inner = level + "    "
+        _emit_expr(region.body, inner)
+        if terminal:
+            lines.append(f"{inner}return {printer.reference(region.body, ctx)}")
     def _emit_mesh_region(region: MeshRegion, level: str, *, terminal: bool = False) -> None:
         key = id(region)
         if key in printed:
@@ -1007,6 +1043,7 @@ def _emit_def(
             or id(expr) in _instance_targets
             or id(expr) in _grid_internal_ids
             or id(expr) in _mesh_region_internal_ids
+            or id(expr) in _execution_region_internal_ids
         ):
             continue
         if id(expr) in _inlined_start_ids:
@@ -1017,6 +1054,9 @@ def _emit_def(
             continue
         if isinstance(expr, MeshRegion):
             _emit_mesh_region(expr, indent, terminal=expr is fn.body)
+            continue
+        if isinstance(expr, ExecutionRegion):
+            _emit_execution_region(expr, indent, terminal=expr is fn.body)
             continue
         if _region_projection(expr) is not None:
             printed.add(id(expr))
@@ -1048,7 +1088,7 @@ def _emit_def(
                 lines.append(line)
             printed.add(id(expr))
 
-    if not isinstance(fn.body, MeshRegion):
+    if not isinstance(fn.body, (MeshRegion, ExecutionRegion)):
         if isinstance(fn.body, Tuple):
             lines.append(f"{indent}return {printer.tuple_reference(fn.body.elements, ctx)}")
         elif isinstance(fn.body, LoopRegion):
@@ -1187,6 +1227,21 @@ def hir_function_to_python(
 ) -> str:
     """Convert a HIR Function to canonical Python DSL source."""
     return HirPrinter().print(fn, options=options)
+
+
+def _pipeline_loop_surface(pipeline, extent: str) -> str:
+    """Render the canonical tf.pipelined surface for a typed spec.
+
+    enable_offset is printed EXPLICITLY even when False, and num_stages is always
+    present: a roundtrip must reproduce the declaration rather than rely on the
+    defaults of whatever version of the parser happens to read the text.
+    """
+    annotations = '{"enable_offset": %s}' % ("True" if pipeline.enable_offset else "False")
+    return "tf.pipelined(%s, num_stages=%d, annotations=%s)" % (
+        extent,
+        pipeline.num_stages,
+        annotations,
+    )
 
 
 def as_script(
