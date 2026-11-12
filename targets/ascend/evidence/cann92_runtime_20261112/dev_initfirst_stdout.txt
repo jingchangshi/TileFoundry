@@ -1,0 +1,11 @@
+ORDER_PROBE before_torch 1433406
+ORDER_PROBE before_set_device
+ORDER_PROBE after_set_device
+ORDER_PROBE ROUNDTRIP_PASS
+ORDER_PROBE before_runpy_native
+PHASE before_import_torch
+PHASE after_import_torch
+PHASE after_import_torch_npu
+PHASE before_set_device
+PHASE after_set_device
+PHASE before_finalize

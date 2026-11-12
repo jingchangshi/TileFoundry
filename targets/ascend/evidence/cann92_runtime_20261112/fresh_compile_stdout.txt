@@ -1,0 +1,4 @@
+FRESH92 before_compile cache_disabled=1
+2026-11-12 12:48:55  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:137): TileLang begins to compile kernel `main` with `out_idx=None`
+2026-11-12 12:48:57  [TileLang:tilelang.jit.kernel:INFO] (kernel.py:145): TileLang completes to compile kernel `main`
+FRESH92 COMPILE_PASS 6872 97169f6eef0a98bd426c8d6455406dc2cc065a00874ede2149f15f37b1ab8fe5

@@ -1,0 +1,6 @@
+{
+  "tir_digest": "936c5b3ca6eb44f1a5d3466220446a429024a00c6acf7c98cd0f0de358913da3",
+  "plan_digest": "sha256:7a902cca133d051a41a9180b9244de1ef5aeef0ecbb4d8377b690243cb5716ec",
+  "tl_sha256": "022e44a121c84bcc864f99b7483f56508471506662420bf488f8210109f1a5e9",
+  "torch_npu_imported": false
+}

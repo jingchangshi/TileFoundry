@@ -1,0 +1,22 @@
+{
+  "status": "PASS",
+  "scope": "same-source static micro-case runtime only; not full scheme or repaired single-process wrapper",
+  "cases": [
+    {
+      "case": "product",
+      "passed": true,
+      "max_abs_error": 0.0
+    },
+    {
+      "case": "square",
+      "passed": true,
+      "max_abs_error": 0.0
+    }
+  ],
+  "tl_sha256": "022e44a121c84bcc864f99b7483f56508471506662420bf488f8210109f1a5e9",
+  "cce_sha256": "97169f6eef0a98bd426c8d6455406dc2cc065a00874ede2149f15f37b1ab8fe5",
+  "pass_configs": {
+    "tl.enable_auto_schedule": false
+  },
+  "TF_ORtools_imported": false
+}

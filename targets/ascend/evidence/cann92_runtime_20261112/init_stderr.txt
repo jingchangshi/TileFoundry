@@ -1,0 +1,8 @@
+/home/s00653124/.conda/envs/tilefoundry-npu/lib/python3.12/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /data/pri/cann-9.2.0/cann-9.2.0-beta.2 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/home/s00653124/.conda/envs/tilefoundry-npu/lib/python3.12/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /data/pri/cann-9.2.0/cann-9.2.0-beta.2/x86_64-linux/ascend_ops_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/home/s00653124/.conda/envs/tilefoundry-npu/lib/python3.12/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /data/pri/cann-9.2.0/cann-9.2.0-beta.2 owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
+/home/s00653124/.conda/envs/tilefoundry-npu/lib/python3.12/site-packages/torch_npu/utils/collect_env.py:58: UserWarning: Warning: The /data/pri/cann-9.2.0/cann-9.2.0-beta.2/x86_64-linux/ascend_ops_install.info owner does not match the current owner.
+  warnings.warn(f"Warning: The {path} owner does not match the current owner.")
