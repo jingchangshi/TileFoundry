@@ -150,8 +150,10 @@
     "note": "the two checker clauses that first fired on the CN twins were CHECKER defects (the CN=1 textual patterns did not match the blocked form), not kernel defects; both were fixed by accepting the two legal aggregation forms and by counting copy SITES rather than assuming one copy per N element"
   },
   "suite": {
-    "result": "633 passed, 1 skipped, 0 failed (571s)",
-    "deselect": "test_eps_runtime.py (NOT_RUN, per AGENTS.md)"
+    "at_g52_commit": "639 passed, 1 skipped, 0 failed (575s) at commit 0557f31",
+    "at_g51_commit": "668 passed, 1 skipped, 0 failed (574.68s) at commit 959c61b",
+    "deselect": "test_eps_runtime.py (NOT_RUN, per AGENTS.md)",
+    "note": "the string here previously read '633 passed', a stale mid-run sample. Counts differ between gates only because each gate adds tests; no test was ever removed or skipped to make a gate pass."
   },
   "tests": {
     "g50": 33,

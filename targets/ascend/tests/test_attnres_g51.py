@@ -291,3 +291,59 @@ def test_the_g51_record_states_that_the_defect_was_root_caused():
     assert "residency" in rc["cause"].lower()
     assert rc["status"] == "RESOLVED"
     assert len(rc["discriminating_experiments"]) >= 4
+# ---------------------------------------------------------------- persistent schedule
+
+def test_the_persistent_group_index_matches_the_prefetch_target():
+    """kernel_persist.group_index and lifetime.group_prefetch_target must agree, or the schedule
+    computes one group while the prefetch fetches another."""
+    from tilefoundry_ascend.attnres.kernel_persist import group_index, next_group
+
+    for programs in (1, 2, 32, 43, 56, 64):
+        for pid in range(min(programs, 8)):
+            for it in range(4):
+                g = group_index(pid, it, programs)
+                assert g == pid + it * programs
+                # group_prefetch_target is keyword-only by design, so the two are compared
+                # on value rather than by sharing a call signature.
+                assert next_group(pid, it, programs) == group_prefetch_target(
+                    group=g, programs=programs)
+
+
+def test_the_persistent_group_index_refuses_negative_inputs():
+    """A negative pid or iteration would silently wrap to a group in a different program."""
+    from tilefoundry_ascend.attnres.kernel_persist import group_index
+
+    for pid, it in ((-1, 0), (0, -1)):
+        try:
+            group_index(pid, it, 32)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for pid=%d it=%d" % (pid, it))
+
+
+def test_persistent_groups_covers_the_whole_grid_without_gaps_or_overlap():
+    """Every token group must be visited exactly once; a gap is a wrong answer and an overlap is
+    redundant work that the persistent schedule claims not to do."""
+    from tilefoundry_ascend.attnres.kernel_persist import group_index, persistent_groups
+
+    for tokens, programs in ((128, 32), (112, 56), (129, 43), (7, 3)):
+        seen = []
+        for it in range(persistent_groups(tokens, programs)):
+            for pid in range(programs):
+                g = group_index(pid, it, programs)
+                if g < tokens:
+                    seen.append(g)
+        assert sorted(seen) == list(range(tokens)), (tokens, programs)
+
+
+def test_the_residency_placement_is_recorded_inside_the_iteration():
+    """The fix for the niter>1 defect must be stated where a reviewer will read it, because
+    moving the residency back outside the loop for efficiency reintroduces the defect."""
+    from tilefoundry_ascend.attnres.kernel_persist import residency_placement
+
+    placement = residency_placement()
+    assert "INSIDE" in placement["gamma"]
+    assert "INSIDE" in placement["w"]
+    assert "stale" in placement["reason"]
+    assert "never the defect" in placement["state_m_l_acc"]

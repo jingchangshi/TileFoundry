@@ -1,0 +1,1719 @@
+{
+  "gate": "G69",
+  "task": "P7-01",
+  "status": "VERIFIED",
+  "deliverable": "Target-aware candidate generator, static legality/resource filter and device-benchmark harness implemented under targets/ascend/tilefoundry_ascend/search/ and exercised end-to-end on representative shapes selected by computed coverage over the real 40-case matrix.",
+  "modules": {
+    "generator": "targets/ascend/tilefoundry_ascend/search/generator.py",
+    "filter": "targets/ascend/tilefoundry_ascend/search/filter.py",
+    "harness": "targets/ascend/tilefoundry_ascend/search/harness.py",
+    "tests": "targets/ascend/tests/test_search_g69.py",
+    "driver": "mla-tl-run/g69_search.py"
+  },
+  "budget": {
+    "max_candidates_per_case": 40,
+    "seed_candidates_max": 12,
+    "neighbor_candidates_max": 20,
+    "advanced_candidates_max": 8,
+    "top_k_for_refinement": 3,
+    "solver_timeout_ms": 10000,
+    "candidate_compile_deadline_s": 120,
+    "case_search_deadline_s": 1800,
+    "warmup_calls": 10,
+    "timing_calls_per_batch": 50,
+    "confirmation_batches": 3,
+    "tie_noise_fraction": 0.02
+  },
+  "budget_source": "P0 config: max_candidates_per_case=40, seed=12/neighbour=20/advanced=8, warmup=10, 50 calls/batch, 3 confirmation batches (spec 08 section 8.3). The cap is PER CASE, not per operator.",
+  "representative_selection": {
+    "method": "greedy set cover over computed coverage labels (dtype, layout, causal, D/n family wall, KV length, workload class, alpha extreme, GQA, non-aligned D), ties broken by case id for determinism",
+    "attention_residual": {
+      "count": 8,
+      "labels_covered": [
+        "aligned-D",
+        "alpha-max",
+        "alpha-mid",
+        "alpha-min",
+        "dtype:bfloat16",
+        "dtype:float16",
+        "family-wall:resident_fits",
+        "n:n2",
+        "n:n24-32",
+        "n:n3-6",
+        "n:n8-16",
+        "nonaligned-D",
+        "workload:decode",
+        "workload:large",
+        "workload:small"
+      ],
+      "case_ids": [
+        1,
+        9,
+        2,
+        5,
+        12,
+        15,
+        3,
+        4
+      ]
+    },
+    "mla": {
+      "count": 8,
+      "labels_covered": [
+        "causal:False",
+        "causal:True",
+        "d_nope:448",
+        "d_nope:512",
+        "dtype:bfloat16",
+        "dtype:float16",
+        "gqa:g-single",
+        "kvlen:kv-long",
+        "kvlen:kv-short",
+        "layout:BNSD",
+        "layout:BSND",
+        "workload:decode",
+        "workload:prefill"
+      ],
+      "case_ids": [
+        1,
+        9,
+        14,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    }
+  },
+  "domain_refusals": [],
+  "representative_shapes": [
+    {
+      "operator": "attention_residual",
+      "case_id": 1,
+      "shape": {
+        "n": 4,
+        "batch": 1,
+        "tokens": 128,
+        "d": 2048,
+        "tokens_total": 128,
+        "dtype": "bfloat16",
+        "alpha": 0.5,
+        "epsilon": 1e-06
+      },
+      "dtype": "bfloat16",
+      "layout": "BSND",
+      "labels": [
+        "aligned-D",
+        "alpha-mid",
+        "dtype:bfloat16",
+        "family-wall:resident_fits",
+        "n:n3-6",
+        "workload:small"
+      ],
+      "note": "[P:default-small] warm probe",
+      "filter": {
+        "total": 12,
+        "feasible": 12,
+        "infeasible": 0,
+        "pruned_fraction": 0.0,
+        "rejections_by_code": {},
+        "rejections_by_space": {},
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 12,
+            "infeasible": 0
+          }
+        },
+        "by_family": {
+          "online": {
+            "total": 8,
+            "feasible": 8
+          },
+          "blocked_online": {
+            "total": 2,
+            "feasible": 2
+          },
+          "resident_n": {
+            "total": 2,
+            "feasible": 2
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "attention_residual",
+      "case_id": 9,
+      "shape": {
+        "n": 4,
+        "batch": 1,
+        "tokens": 4096,
+        "d": 2560,
+        "tokens_total": 4096,
+        "dtype": "float16",
+        "alpha": 0.5,
+        "epsilon": 1e-06
+      },
+      "dtype": "float16",
+      "layout": "BSND",
+      "labels": [
+        "alpha-mid",
+        "dtype:float16",
+        "family-wall:resident_fits",
+        "n:n3-6",
+        "nonaligned-D",
+        "workload:large"
+      ],
+      "note": "[D:fp16-M] long-seq fp16",
+      "filter": {
+        "total": 12,
+        "feasible": 12,
+        "infeasible": 0,
+        "pruned_fraction": 0.0,
+        "rejections_by_code": {},
+        "rejections_by_space": {},
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 12,
+            "infeasible": 0
+          }
+        },
+        "by_family": {
+          "online": {
+            "total": 8,
+            "feasible": 8
+          },
+          "blocked_online": {
+            "total": 2,
+            "feasible": 2
+          },
+          "resident_n": {
+            "total": 2,
+            "feasible": 2
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "attention_residual",
+      "case_id": 2,
+      "shape": {
+        "n": 2,
+        "batch": 1,
+        "tokens": 1,
+        "d": 4096,
+        "tokens_total": 1,
+        "dtype": "bfloat16",
+        "alpha": 0.5,
+        "epsilon": 1e-06
+      },
+      "dtype": "bfloat16",
+      "layout": "BSND",
+      "labels": [
+        "aligned-D",
+        "alpha-mid",
+        "dtype:bfloat16",
+        "family-wall:resident_fits",
+        "n:n2",
+        "workload:decode"
+      ],
+      "note": "[B:T1-decode-Nmin] single-token decode, minimum stack",
+      "filter": {
+        "total": 11,
+        "feasible": 11,
+        "infeasible": 0,
+        "pruned_fraction": 0.0,
+        "rejections_by_code": {},
+        "rejections_by_space": {},
+        "by_origin": {
+          "seed": {
+            "total": 11,
+            "feasible": 11,
+            "infeasible": 0
+          }
+        },
+        "by_family": {
+          "online": {
+            "total": 9,
+            "feasible": 9
+          },
+          "resident_n": {
+            "total": 2,
+            "feasible": 2
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "attention_residual",
+      "case_id": 5,
+      "shape": {
+        "n": 8,
+        "batch": 1,
+        "tokens": 512,
+        "d": 1024,
+        "tokens_total": 512,
+        "dtype": "bfloat16",
+        "alpha": 0.95,
+        "epsilon": 1e-06
+      },
+      "dtype": "bfloat16",
+      "layout": "BSND",
+      "labels": [
+        "aligned-D",
+        "alpha-max",
+        "dtype:bfloat16",
+        "family-wall:resident_fits",
+        "n:n8-16",
+        "workload:small"
+      ],
+      "note": "[B:alpha-max] aggregation-dominated blend",
+      "filter": {
+        "total": 12,
+        "feasible": 12,
+        "infeasible": 0,
+        "pruned_fraction": 0.0,
+        "rejections_by_code": {},
+        "rejections_by_space": {},
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 12,
+            "infeasible": 0
+          }
+        },
+        "by_family": {
+          "online": {
+            "total": 8,
+            "feasible": 8
+          },
+          "blocked_online": {
+            "total": 2,
+            "feasible": 2
+          },
+          "resident_n": {
+            "total": 2,
+            "feasible": 2
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "attention_residual",
+      "case_id": 12,
+      "shape": {
+        "n": 8,
+        "batch": 8,
+        "tokens": 256,
+        "d": 2048,
+        "tokens_total": 2048,
+        "dtype": "bfloat16",
+        "alpha": 0.05,
+        "epsilon": 1e-06
+      },
+      "dtype": "bfloat16",
+      "layout": "BSND",
+      "labels": [
+        "aligned-D",
+        "alpha-min",
+        "dtype:bfloat16",
+        "family-wall:resident_fits",
+        "n:n8-16",
+        "workload:large"
+      ],
+      "note": "[B:alpha-min] residual-dominated blend",
+      "filter": {
+        "total": 12,
+        "feasible": 12,
+        "infeasible": 0,
+        "pruned_fraction": 0.0,
+        "rejections_by_code": {},
+        "rejections_by_space": {},
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 12,
+            "infeasible": 0
+          }
+        },
+        "by_family": {
+          "online": {
+            "total": 8,
+            "feasible": 8
+          },
+          "blocked_online": {
+            "total": 2,
+            "feasible": 2
+          },
+          "resident_n": {
+            "total": 2,
+            "feasible": 2
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "attention_residual",
+      "case_id": 15,
+      "shape": {
+        "n": 24,
+        "batch": 1,
+        "tokens": 256,
+        "d": 4096,
+        "tokens_total": 256,
+        "dtype": "bfloat16",
+        "alpha": 0.5,
+        "epsilon": 1e-06
+      },
+      "dtype": "bfloat16",
+      "layout": "BSND",
+      "labels": [
+        "aligned-D",
+        "alpha-mid",
+        "dtype:bfloat16",
+        "family-wall:resident_fits",
+        "n:n24-32",
+        "workload:small"
+      ],
+      "note": "[G:deep-stack24]",
+      "filter": {
+        "total": 12,
+        "feasible": 10,
+        "infeasible": 2,
+        "pruned_fraction": 0.16666666666666666,
+        "rejections_by_code": {
+          "RES_UB_OVERFLOW": 2
+        },
+        "rejections_by_space": {
+          "ub": 2
+        },
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 10,
+            "infeasible": 2
+          }
+        },
+        "by_family": {
+          "online": {
+            "total": 8,
+            "feasible": 8
+          },
+          "blocked_online": {
+            "total": 2,
+            "feasible": 2
+          },
+          "resident_n": {
+            "total": 2,
+            "feasible": 0
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "attention_residual",
+      "case_id": 3,
+      "shape": {
+        "n": 6,
+        "batch": 2,
+        "tokens": 256,
+        "d": 2048,
+        "tokens_total": 512,
+        "dtype": "float16",
+        "alpha": 0.2,
+        "epsilon": 1e-06
+      },
+      "dtype": "float16",
+      "layout": "BSND",
+      "labels": [
+        "aligned-D",
+        "alpha-mid",
+        "dtype:float16",
+        "family-wall:resident_fits",
+        "n:n3-6",
+        "workload:small"
+      ],
+      "note": "[D:fp16-S] fp16 small",
+      "filter": {
+        "total": 12,
+        "feasible": 12,
+        "infeasible": 0,
+        "pruned_fraction": 0.0,
+        "rejections_by_code": {},
+        "rejections_by_space": {},
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 12,
+            "infeasible": 0
+          }
+        },
+        "by_family": {
+          "online": {
+            "total": 8,
+            "feasible": 8
+          },
+          "blocked_online": {
+            "total": 2,
+            "feasible": 2
+          },
+          "resident_n": {
+            "total": 2,
+            "feasible": 2
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "attention_residual",
+      "case_id": 4,
+      "shape": {
+        "n": 3,
+        "batch": 1,
+        "tokens": 333,
+        "d": 2047,
+        "tokens_total": 333,
+        "dtype": "bfloat16",
+        "alpha": 0.5,
+        "epsilon": 1e-06
+      },
+      "dtype": "bfloat16",
+      "layout": "BSND",
+      "labels": [
+        "alpha-mid",
+        "dtype:bfloat16",
+        "family-wall:resident_fits",
+        "n:n3-6",
+        "nonaligned-D",
+        "workload:small"
+      ],
+      "note": "[B:non-aligned] N3/T333/D2047",
+      "filter": {
+        "total": 12,
+        "feasible": 12,
+        "infeasible": 0,
+        "pruned_fraction": 0.0,
+        "rejections_by_code": {},
+        "rejections_by_space": {},
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 12,
+            "infeasible": 0
+          }
+        },
+        "by_family": {
+          "online": {
+            "total": 8,
+            "feasible": 8
+          },
+          "blocked_online": {
+            "total": 2,
+            "feasible": 2
+          },
+          "resident_n": {
+            "total": 2,
+            "feasible": 2
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "mla",
+      "case_id": 1,
+      "shape": {
+        "batch": 2,
+        "seq_q": 128,
+        "heads_q": 128,
+        "seq_kv": 128,
+        "heads_kv": 1,
+        "d_nope": 512,
+        "d_rope": 64,
+        "dtype": "float16",
+        "layout": "BSND",
+        "causal": true
+      },
+      "dtype": "float16",
+      "layout": "BSND",
+      "labels": [
+        "causal:True",
+        "d_nope:512",
+        "dtype:float16",
+        "gqa:g-single",
+        "kvlen:kv-short",
+        "layout:BSND",
+        "workload:prefill"
+      ],
+      "note": "M-float16-BSND-B2S128Nq128Nkv1-dnope512drope64-prefill-causal | baseline_kernels: FusedInferAttentionScore\u00d71",
+      "filter": {
+        "total": 20,
+        "feasible": 13,
+        "infeasible": 7,
+        "pruned_fraction": 0.35,
+        "rejections_by_code": {
+          "RES_L0B_OVERFLOW": 1,
+          "LEGAL_BC_NOT_IMPLEMENTED": 1,
+          "RES_L1_OVERFLOW": 2,
+          "LEGAL_THETA_EXCEEDS_OPERAND_BOUND": 3
+        },
+        "rejections_by_space": {
+          "l0b": 1,
+          "schedule": 1,
+          "l1": 2,
+          "numerics": 3
+        },
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 9,
+            "infeasible": 3
+          },
+          "advanced": {
+            "total": 8,
+            "feasible": 4,
+            "infeasible": 4
+          }
+        },
+        "by_family": {
+          "mla_canonical": {
+            "total": 10,
+            "feasible": 6
+          },
+          "mla_deferred": {
+            "total": 5,
+            "feasible": 3
+          },
+          "mla_output_shard": {
+            "total": 5,
+            "feasible": 4
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "mla",
+      "case_id": 9,
+      "shape": {
+        "batch": 32,
+        "seq_q": 1,
+        "heads_q": 128,
+        "seq_kv": 2048,
+        "heads_kv": 1,
+        "d_nope": 512,
+        "d_rope": 64,
+        "dtype": "bfloat16",
+        "layout": "BSND",
+        "causal": false
+      },
+      "dtype": "bfloat16",
+      "layout": "BSND",
+      "labels": [
+        "causal:False",
+        "d_nope:512",
+        "dtype:bfloat16",
+        "gqa:g-single",
+        "kvlen:kv-long",
+        "layout:BSND",
+        "workload:decode"
+      ],
+      "note": "L-bfloat16-BSND-B32S1Skv2048Nq128-decode | baseline_kernels: FusedInferAttentionScore\u00d71",
+      "filter": {
+        "total": 20,
+        "feasible": 16,
+        "infeasible": 4,
+        "pruned_fraction": 0.2,
+        "rejections_by_code": {
+          "RES_L0B_OVERFLOW": 1,
+          "LEGAL_BC_NOT_IMPLEMENTED": 1,
+          "RES_L1_OVERFLOW": 2
+        },
+        "rejections_by_space": {
+          "l0b": 1,
+          "schedule": 1,
+          "l1": 2
+        },
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 9,
+            "infeasible": 3
+          },
+          "advanced": {
+            "total": 8,
+            "feasible": 7,
+            "infeasible": 1
+          }
+        },
+        "by_family": {
+          "mla_canonical": {
+            "total": 10,
+            "feasible": 6
+          },
+          "mla_deferred": {
+            "total": 5,
+            "feasible": 5
+          },
+          "mla_output_shard": {
+            "total": 5,
+            "feasible": 5
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "mla",
+      "case_id": 14,
+      "shape": {
+        "batch": 2,
+        "seq_q": 128,
+        "heads_q": 128,
+        "seq_kv": 128,
+        "heads_kv": 1,
+        "d_nope": 448,
+        "d_rope": 64,
+        "dtype": "float16",
+        "layout": "BNSD",
+        "causal": true
+      },
+      "dtype": "float16",
+      "layout": "BNSD",
+      "labels": [
+        "causal:True",
+        "d_nope:448",
+        "dtype:float16",
+        "gqa:g-single",
+        "kvlen:kv-short",
+        "layout:BNSD",
+        "workload:prefill"
+      ],
+      "note": "M-float16-BNSD-B2Nq128S128-dnope448drope64-prefill-causal",
+      "filter": {
+        "total": 20,
+        "feasible": 11,
+        "infeasible": 9,
+        "pruned_fraction": 0.45,
+        "rejections_by_code": {
+          "LEGAL_BC_NOT_IMPLEMENTED": 1,
+          "RES_L1_OVERFLOW": 3,
+          "LEGAL_THETA_EXCEEDS_OPERAND_BOUND": 3,
+          "LEGAL_SHARD_WIDTH_NOT_PANEL": 3
+        },
+        "rejections_by_space": {
+          "schedule": 4,
+          "l1": 3,
+          "numerics": 3
+        },
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 9,
+            "infeasible": 3
+          },
+          "advanced": {
+            "total": 8,
+            "feasible": 2,
+            "infeasible": 6
+          }
+        },
+        "by_family": {
+          "mla_canonical": {
+            "total": 11,
+            "feasible": 8
+          },
+          "mla_deferred": {
+            "total": 6,
+            "feasible": 3
+          },
+          "mla_output_shard": {
+            "total": 3,
+            "feasible": 0
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "mla",
+      "case_id": 2,
+      "shape": {
+        "batch": 4,
+        "seq_q": 256,
+        "heads_q": 128,
+        "seq_kv": 256,
+        "heads_kv": 1,
+        "d_nope": 512,
+        "d_rope": 64,
+        "dtype": "bfloat16",
+        "layout": "BSND",
+        "causal": true
+      },
+      "dtype": "bfloat16",
+      "layout": "BSND",
+      "labels": [
+        "causal:True",
+        "d_nope:512",
+        "dtype:bfloat16",
+        "gqa:g-single",
+        "kvlen:kv-short",
+        "layout:BSND",
+        "workload:prefill"
+      ],
+      "note": "L-bfloat16-BSND-B4S256Nq128Nkv1-dnope512drope64-prefill-causal | baseline_kernels: FusedInferAttentionScore\u00d71",
+      "filter": {
+        "total": 20,
+        "feasible": 16,
+        "infeasible": 4,
+        "pruned_fraction": 0.2,
+        "rejections_by_code": {
+          "RES_L0B_OVERFLOW": 1,
+          "LEGAL_BC_NOT_IMPLEMENTED": 1,
+          "RES_L1_OVERFLOW": 2
+        },
+        "rejections_by_space": {
+          "l0b": 1,
+          "schedule": 1,
+          "l1": 2
+        },
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 9,
+            "infeasible": 3
+          },
+          "advanced": {
+            "total": 8,
+            "feasible": 7,
+            "infeasible": 1
+          }
+        },
+        "by_family": {
+          "mla_canonical": {
+            "total": 10,
+            "feasible": 6
+          },
+          "mla_deferred": {
+            "total": 5,
+            "feasible": 5
+          },
+          "mla_output_shard": {
+            "total": 5,
+            "feasible": 5
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "mla",
+      "case_id": 3,
+      "shape": {
+        "batch": 2,
+        "seq_q": 128,
+        "heads_q": 64,
+        "seq_kv": 128,
+        "heads_kv": 1,
+        "d_nope": 448,
+        "d_rope": 64,
+        "dtype": "bfloat16",
+        "layout": "BSND",
+        "causal": true
+      },
+      "dtype": "bfloat16",
+      "layout": "BSND",
+      "labels": [
+        "causal:True",
+        "d_nope:448",
+        "dtype:bfloat16",
+        "gqa:g-single",
+        "kvlen:kv-short",
+        "layout:BSND",
+        "workload:prefill"
+      ],
+      "note": "M-bfloat16-BSND-B2S128Nq64Nkv1-dnope448drope64-causal",
+      "filter": {
+        "total": 20,
+        "feasible": 13,
+        "infeasible": 7,
+        "pruned_fraction": 0.35,
+        "rejections_by_code": {
+          "LEGAL_BC_NOT_IMPLEMENTED": 1,
+          "RES_L1_OVERFLOW": 3,
+          "LEGAL_SHARD_WIDTH_NOT_PANEL": 3
+        },
+        "rejections_by_space": {
+          "schedule": 4,
+          "l1": 3
+        },
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 9,
+            "infeasible": 3
+          },
+          "advanced": {
+            "total": 8,
+            "feasible": 4,
+            "infeasible": 4
+          }
+        },
+        "by_family": {
+          "mla_canonical": {
+            "total": 11,
+            "feasible": 8
+          },
+          "mla_deferred": {
+            "total": 6,
+            "feasible": 5
+          },
+          "mla_output_shard": {
+            "total": 3,
+            "feasible": 0
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "mla",
+      "case_id": 4,
+      "shape": {
+        "batch": 2,
+        "seq_q": 256,
+        "heads_q": 128,
+        "seq_kv": 128,
+        "heads_kv": 1,
+        "d_nope": 512,
+        "d_rope": 64,
+        "dtype": "float16",
+        "layout": "BSND",
+        "causal": false
+      },
+      "dtype": "float16",
+      "layout": "BSND",
+      "labels": [
+        "causal:False",
+        "d_nope:512",
+        "dtype:float16",
+        "gqa:g-single",
+        "kvlen:kv-short",
+        "layout:BSND",
+        "workload:prefill"
+      ],
+      "note": "M-float16-BSND-B2Sq256Skv128Nq128-dnope512-cross | baseline_kernels: FusedInferAttentionScore\u00d71",
+      "filter": {
+        "total": 20,
+        "feasible": 13,
+        "infeasible": 7,
+        "pruned_fraction": 0.35,
+        "rejections_by_code": {
+          "RES_L0B_OVERFLOW": 1,
+          "LEGAL_BC_NOT_IMPLEMENTED": 1,
+          "RES_L1_OVERFLOW": 2,
+          "LEGAL_THETA_EXCEEDS_OPERAND_BOUND": 3
+        },
+        "rejections_by_space": {
+          "l0b": 1,
+          "schedule": 1,
+          "l1": 2,
+          "numerics": 3
+        },
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 9,
+            "infeasible": 3
+          },
+          "advanced": {
+            "total": 8,
+            "feasible": 4,
+            "infeasible": 4
+          }
+        },
+        "by_family": {
+          "mla_canonical": {
+            "total": 10,
+            "feasible": 6
+          },
+          "mla_deferred": {
+            "total": 5,
+            "feasible": 3
+          },
+          "mla_output_shard": {
+            "total": 5,
+            "feasible": 4
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "mla",
+      "case_id": 5,
+      "shape": {
+        "batch": 2,
+        "seq_q": 256,
+        "heads_q": 128,
+        "seq_kv": 256,
+        "heads_kv": 1,
+        "d_nope": 512,
+        "d_rope": 64,
+        "dtype": "float16",
+        "layout": "BSND",
+        "causal": true
+      },
+      "dtype": "float16",
+      "layout": "BSND",
+      "labels": [
+        "causal:True",
+        "d_nope:512",
+        "dtype:float16",
+        "gqa:g-single",
+        "kvlen:kv-short",
+        "layout:BSND",
+        "workload:prefill"
+      ],
+      "note": "L-float16-BSND-B2S256Nq128-dnope512-long-prefill-causal | baseline_kernels: FusedInferAttentionScore\u00d71",
+      "filter": {
+        "total": 20,
+        "feasible": 13,
+        "infeasible": 7,
+        "pruned_fraction": 0.35,
+        "rejections_by_code": {
+          "RES_L0B_OVERFLOW": 1,
+          "LEGAL_BC_NOT_IMPLEMENTED": 1,
+          "RES_L1_OVERFLOW": 2,
+          "LEGAL_THETA_EXCEEDS_OPERAND_BOUND": 3
+        },
+        "rejections_by_space": {
+          "l0b": 1,
+          "schedule": 1,
+          "l1": 2,
+          "numerics": 3
+        },
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 9,
+            "infeasible": 3
+          },
+          "advanced": {
+            "total": 8,
+            "feasible": 4,
+            "infeasible": 4
+          }
+        },
+        "by_family": {
+          "mla_canonical": {
+            "total": 10,
+            "feasible": 6
+          },
+          "mla_deferred": {
+            "total": 5,
+            "feasible": 3
+          },
+          "mla_output_shard": {
+            "total": 5,
+            "feasible": 4
+          }
+        },
+        "measured": 0
+      }
+    },
+    {
+      "operator": "mla",
+      "case_id": 6,
+      "shape": {
+        "batch": 2,
+        "seq_q": 256,
+        "heads_q": 128,
+        "seq_kv": 256,
+        "heads_kv": 1,
+        "d_nope": 448,
+        "d_rope": 64,
+        "dtype": "float16",
+        "layout": "BSND",
+        "causal": false
+      },
+      "dtype": "float16",
+      "layout": "BSND",
+      "labels": [
+        "causal:False",
+        "d_nope:448",
+        "dtype:float16",
+        "gqa:g-single",
+        "kvlen:kv-short",
+        "layout:BSND",
+        "workload:prefill"
+      ],
+      "note": "L-float16-BSND-B2S256Nq128-dnope448-long-prefill",
+      "filter": {
+        "total": 20,
+        "feasible": 11,
+        "infeasible": 9,
+        "pruned_fraction": 0.45,
+        "rejections_by_code": {
+          "LEGAL_BC_NOT_IMPLEMENTED": 1,
+          "RES_L1_OVERFLOW": 3,
+          "LEGAL_THETA_EXCEEDS_OPERAND_BOUND": 3,
+          "LEGAL_SHARD_WIDTH_NOT_PANEL": 3
+        },
+        "rejections_by_space": {
+          "schedule": 4,
+          "l1": 3,
+          "numerics": 3
+        },
+        "by_origin": {
+          "seed": {
+            "total": 12,
+            "feasible": 9,
+            "infeasible": 3
+          },
+          "advanced": {
+            "total": 8,
+            "feasible": 2,
+            "infeasible": 6
+          }
+        },
+        "by_family": {
+          "mla_canonical": {
+            "total": 11,
+            "feasible": 8
+          },
+          "mla_deferred": {
+            "total": 6,
+            "feasible": 3
+          },
+          "mla_output_shard": {
+            "total": 3,
+            "feasible": 0
+          }
+        },
+        "measured": 0
+      }
+    }
+  ],
+  "end_to_end_run": {
+    "candidate_measurement_points": 437,
+    "verified_candidates": 344,
+    "rejected_candidates": 93,
+    "cases_with_winner": 16,
+    "cases": 16,
+    "by_status": {
+      "OK": 344,
+      "PRUNED_STATIC": 93
+    },
+    "rejections_by_code": {
+      "RES_UB_OVERFLOW": 2,
+      "RES_L0B_OVERFLOW": 15,
+      "LEGAL_BC_NOT_IMPLEMENTED": 24,
+      "RES_L1_OVERFLOW": 16,
+      "LEGAL_THETA_EXCEEDS_OPERAND_BOUND": 15,
+      "LEGAL_BQ_BELOW_SCORE_ROWS": 8,
+      "LEGAL_SHARD_WIDTH_NOT_PANEL": 7,
+      "LEGAL_PANEL_NOT_TILING_D_NOPE": 6
+    },
+    "by_family": {
+      "online": {
+        "total": 122,
+        "timed": 122
+      },
+      "blocked_online": {
+        "total": 44,
+        "timed": 44
+      },
+      "resident_n": {
+        "total": 16,
+        "timed": 14
+      },
+      "mla_canonical": {
+        "total": 189,
+        "timed": 123
+      },
+      "mla_deferred": {
+        "total": 32,
+        "timed": 19
+      },
+      "mla_output_shard": {
+        "total": 34,
+        "timed": 22
+      }
+    },
+    "measurement_sources": [
+      "SIMULATED_CLOCK"
+    ],
+    "per_case": [
+      {
+        "case": "attention_residual_1",
+        "operator": "attention_residual",
+        "rounds": 2,
+        "candidates": 23,
+        "timed": 23,
+        "rejected": 0,
+        "budget": {
+          "max_candidates": 32,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 0,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 11 one-factor neighbours",
+        "winner": "82d7695581ed932f",
+        "winner_median_us": 64.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 23,
+          "timed": 23,
+          "rejected": 0,
+          "by_status": {
+            "OK": 23
+          }
+        }
+      },
+      {
+        "case": "attention_residual_9",
+        "operator": "attention_residual",
+        "rounds": 2,
+        "candidates": 23,
+        "timed": 23,
+        "rejected": 0,
+        "budget": {
+          "max_candidates": 32,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 0,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 11 one-factor neighbours",
+        "winner": "da9b6ac8734a1faf",
+        "winner_median_us": 64.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 23,
+          "timed": 23,
+          "rejected": 0,
+          "by_status": {
+            "OK": 23
+          }
+        }
+      },
+      {
+        "case": "attention_residual_2",
+        "operator": "attention_residual",
+        "rounds": 2,
+        "candidates": 21,
+        "timed": 21,
+        "rejected": 0,
+        "budget": {
+          "max_candidates": 31,
+          "seeds": 11,
+          "neighbours": 20,
+          "advanced": 0,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 10 one-factor neighbours",
+        "winner": "10b6eb538ffb2590",
+        "winner_median_us": 64.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 21,
+          "timed": 21,
+          "rejected": 0,
+          "by_status": {
+            "OK": 21
+          }
+        }
+      },
+      {
+        "case": "attention_residual_5",
+        "operator": "attention_residual",
+        "rounds": 2,
+        "candidates": 23,
+        "timed": 23,
+        "rejected": 0,
+        "budget": {
+          "max_candidates": 32,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 0,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 11 one-factor neighbours",
+        "winner": "130f828c2862011f",
+        "winner_median_us": 64.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 23,
+          "timed": 23,
+          "rejected": 0,
+          "by_status": {
+            "OK": 23
+          }
+        }
+      },
+      {
+        "case": "attention_residual_12",
+        "operator": "attention_residual",
+        "rounds": 2,
+        "candidates": 23,
+        "timed": 23,
+        "rejected": 0,
+        "budget": {
+          "max_candidates": 32,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 0,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 11 one-factor neighbours",
+        "winner": "bd8805ebbbd8e72b",
+        "winner_median_us": 64.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 23,
+          "timed": 23,
+          "rejected": 0,
+          "by_status": {
+            "OK": 23
+          }
+        }
+      },
+      {
+        "case": "attention_residual_15",
+        "operator": "attention_residual",
+        "rounds": 2,
+        "candidates": 23,
+        "timed": 21,
+        "rejected": 2,
+        "budget": {
+          "max_candidates": 32,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 0,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 11 one-factor neighbours",
+        "winner": "60437905de8f6ad4",
+        "winner_median_us": 64.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 23,
+          "timed": 21,
+          "rejected": 2,
+          "by_status": {
+            "OK": 21,
+            "PRUNED_STATIC": 2
+          }
+        }
+      },
+      {
+        "case": "attention_residual_3",
+        "operator": "attention_residual",
+        "rounds": 2,
+        "candidates": 23,
+        "timed": 23,
+        "rejected": 0,
+        "budget": {
+          "max_candidates": 32,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 0,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 11 one-factor neighbours",
+        "winner": "4726600f55bc2e92",
+        "winner_median_us": 64.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 23,
+          "timed": 23,
+          "rejected": 0,
+          "by_status": {
+            "OK": 23
+          }
+        }
+      },
+      {
+        "case": "attention_residual_4",
+        "operator": "attention_residual",
+        "rounds": 2,
+        "candidates": 23,
+        "timed": 23,
+        "rejected": 0,
+        "budget": {
+          "max_candidates": 32,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 0,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 11 one-factor neighbours",
+        "winner": "f8fb11d004483fbd",
+        "winner_median_us": 64.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 23,
+          "timed": 23,
+          "rejected": 0,
+          "by_status": {
+            "OK": 23
+          }
+        }
+      },
+      {
+        "case": "mla_1",
+        "operator": "mla",
+        "rounds": 2,
+        "candidates": 33,
+        "timed": 21,
+        "rejected": 12,
+        "budget": {
+          "max_candidates": 40,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 8,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 16 one-factor neighbours",
+        "winner": "1faa21c1d6865542",
+        "winner_median_us": 105.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 33,
+          "timed": 21,
+          "rejected": 12,
+          "by_status": {
+            "OK": 21,
+            "PRUNED_STATIC": 12
+          }
+        }
+      },
+      {
+        "case": "mla_9",
+        "operator": "mla",
+        "rounds": 2,
+        "candidates": 32,
+        "timed": 23,
+        "rejected": 9,
+        "budget": {
+          "max_candidates": 40,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 8,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 16 one-factor neighbours",
+        "winner": "1faa21c1d6865542",
+        "winner_median_us": 105.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 32,
+          "timed": 23,
+          "rejected": 9,
+          "by_status": {
+            "OK": 23,
+            "PRUNED_STATIC": 9
+          }
+        }
+      },
+      {
+        "case": "mla_14",
+        "operator": "mla",
+        "rounds": 2,
+        "candidates": 31,
+        "timed": 18,
+        "rejected": 13,
+        "budget": {
+          "max_candidates": 40,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 8,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 14 one-factor neighbours",
+        "winner": "db6d5af8c0e0fb7d",
+        "winner_median_us": 105.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 31,
+          "timed": 18,
+          "rejected": 13,
+          "by_status": {
+            "OK": 18,
+            "PRUNED_STATIC": 13
+          }
+        }
+      },
+      {
+        "case": "mla_2",
+        "operator": "mla",
+        "rounds": 2,
+        "candidates": 32,
+        "timed": 23,
+        "rejected": 9,
+        "budget": {
+          "max_candidates": 40,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 8,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 16 one-factor neighbours",
+        "winner": "1faa21c1d6865542",
+        "winner_median_us": 105.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 32,
+          "timed": 23,
+          "rejected": 9,
+          "by_status": {
+            "OK": 23,
+            "PRUNED_STATIC": 9
+          }
+        }
+      },
+      {
+        "case": "mla_3",
+        "operator": "mla",
+        "rounds": 2,
+        "candidates": 30,
+        "timed": 19,
+        "rejected": 11,
+        "budget": {
+          "max_candidates": 40,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 8,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 14 one-factor neighbours",
+        "winner": "db6d5af8c0e0fb7d",
+        "winner_median_us": 105.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 30,
+          "timed": 19,
+          "rejected": 11,
+          "by_status": {
+            "OK": 19,
+            "PRUNED_STATIC": 11
+          }
+        }
+      },
+      {
+        "case": "mla_4",
+        "operator": "mla",
+        "rounds": 2,
+        "candidates": 33,
+        "timed": 21,
+        "rejected": 12,
+        "budget": {
+          "max_candidates": 40,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 8,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 16 one-factor neighbours",
+        "winner": "1faa21c1d6865542",
+        "winner_median_us": 105.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 33,
+          "timed": 21,
+          "rejected": 12,
+          "by_status": {
+            "OK": 21,
+            "PRUNED_STATIC": 12
+          }
+        }
+      },
+      {
+        "case": "mla_5",
+        "operator": "mla",
+        "rounds": 2,
+        "candidates": 33,
+        "timed": 21,
+        "rejected": 12,
+        "budget": {
+          "max_candidates": 40,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 8,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 16 one-factor neighbours",
+        "winner": "1faa21c1d6865542",
+        "winner_median_us": 105.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 33,
+          "timed": 21,
+          "rejected": 12,
+          "by_status": {
+            "OK": 21,
+            "PRUNED_STATIC": 12
+          }
+        }
+      },
+      {
+        "case": "mla_6",
+        "operator": "mla",
+        "rounds": 2,
+        "candidates": 31,
+        "timed": 18,
+        "rejected": 13,
+        "budget": {
+          "max_candidates": 40,
+          "seeds": 12,
+          "neighbours": 20,
+          "advanced": 8,
+          "deadline_s": 1800,
+          "source": "P0 budget: 12 seed + 20 neighbour + 8 advanced per case (spec 8.3), applied per CASE and not per operator"
+        },
+        "stop_reason": "neighbourhood of the top 3 seeded candidates expanded by 14 one-factor neighbours",
+        "winner": "db6d5af8c0e0fb7d",
+        "winner_median_us": 105.0,
+        "winner_compile_seconds": 0.0,
+        "counts": {
+          "total": 31,
+          "timed": 18,
+          "rejected": 13,
+          "by_status": {
+            "OK": 18,
+            "PRUNED_STATIC": 13
+          }
+        }
+      }
+    ]
+  },
+  "cache_identity": {
+    "ingredients": [
+      "operator",
+      "target_profile",
+      "toolchain",
+      "source_digest",
+      "plan_digest",
+      "dtype",
+      "layout",
+      "shape_digest",
+      "precision_policy",
+      "candidate_key"
+    ],
+    "note": "the source digest is read from the actual search module files, so a kernel or filter change invalidates every cached timing"
+  },
+  "cache_invalidation_tests": {
+    "base_key": "5edb5184762b533f",
+    "changes_on": {
+      "source_digest": true,
+      "target_profile": true,
+      "toolchain": true,
+      "dtype": true,
+      "layout": true,
+      "shape_digest": true,
+      "precision_policy": true,
+      "plan_digest": true,
+      "candidate_key": true
+    },
+    "incomplete_identity_refused": true,
+    "result": "PASS"
+  },
+  "rejection_tests": {
+    "probes": {
+      "panel_not_tiling_448": {
+        "feasible": false,
+        "codes": [
+          "LEGAL_PANEL_NOT_TILING_D_NOPE"
+        ]
+      },
+      "bc_64_not_implemented": {
+        "feasible": false,
+        "codes": [
+          "LEGAL_BC_NOT_IMPLEMENTED"
+        ]
+      },
+      "bq_below_score_rows": {
+        "feasible": false,
+        "codes": [
+          "LEGAL_BQ_BELOW_SCORE_ROWS"
+        ]
+      },
+      "shard_width_448": {
+        "feasible": false,
+        "codes": [
+          "LEGAL_PANEL_NOT_TILING_D_NOPE",
+          "LEGAL_SHARD_WIDTH_NOT_PANEL"
+        ]
+      }
+    },
+    "starved_event_codes": [
+      "RES_EVENT_AIV_FREE_EXHAUSTED",
+      "RES_EVENT_AIV_READY_EXHAUSTED"
+    ],
+    "result": "PASS"
+  },
+  "noise_tests": {
+    "tie_detected": true,
+    "clear_gap_not_tied": true,
+    "winner": "a",
+    "tied_with_winner": [
+      "b"
+    ],
+    "rule": "ranked by median kernel time over raw samples; a candidate within 2.0% of the fastest is a tie and is broken by resource footprint",
+    "result": "PASS"
+  },
+  "warmup_tests": {
+    "timed_samples": 150,
+    "discarded": 10,
+    "total_invocations": 160,
+    "median_us": 100.0,
+    "spread_us": 0.0,
+    "result": "PASS"
+  },
+  "measurement_method": {
+    "timer": "injectable; the harness accepts a calibrated device sample callable and REFUSES to time an asynchronous launch with a wall clock (DeviceTimerUnavailable)",
+    "scope": "candidate kernel call only; input preparation and the reference are excluded",
+    "warmup_calls": 10,
+    "timing_calls_per_batch": 50,
+    "confirmation_batches": 3,
+    "statistics": "median, p10, p90, spread, relative spread over RETAINED raw samples",
+    "compile_time": "reported separately from kernel time in every record",
+    "device_exclusivity": "device runs use flock -n /home/.tf_device0.lock, one measurement job at a time"
+  },
+  "not_claimed": [
+    "No device timing was taken for this gate. Every timing in this record comes from the harness's injected simulated clock and carries measurement_source=SIMULATED_CLOCK.",
+    "A FEASIBLE candidate is not a measured candidate; feasibility is permission to compile.",
+    "Resource figures are the author's declared buffers and are lower bounds; the final lowering may add scratch, so every judgement is marked lower_bound_only.",
+    "This gate does not select a dispatch: G70 must run the actual device search.",
+    "No global-optimality claim: only 'fastest measured within the recorded budget'."
+  ],
+  "next_gate": {
+    "G70": "run the same driver with DeviceTimer(sample=<calibrated npu timer>) on the device under the flock, one case at a time, and record real medians"
+  }
+}
