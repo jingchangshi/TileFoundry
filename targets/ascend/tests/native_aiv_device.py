@@ -5,14 +5,15 @@ import json
 from pathlib import Path
 import sys
 
-import torch
-import torch_npu
+import faulthandler
+faulthandler.enable()
 
-from tilefoundry.analysis import analyze
-from tilefoundry.cli.source import checked_program
-from tilefoundry.schedule import finalize
-from tilefoundry_ascend.codegen.native_aiv import NativeAIVBinding
-from tilefoundry_ascend.codegen.x_runtime import emit_for_codegen, compile_tilelang
+_STAGE = "startup"
+
+def phase(name):
+    global _STAGE
+    _STAGE = name
+    print("PHASE", name, flush=True)
 
 
 def main():
@@ -20,17 +21,38 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("output", type=Path)
     parser.add_argument("--compile-only", action="store_true")
+    parser.add_argument("--imports-only", action="store_true")
     args = parser.parse_args()
     output = args.output
     output.mkdir(parents=True, exist_ok=True)
+    phase("before_import_torch")
+    import torch
+    phase("after_import_torch")
+    import torch_npu
+    phase("after_import_torch_npu")
+    if args.imports_only:
+        import tilelang
+        print("VERSIONS", torch.__version__, torch_npu.__version__, tilelang.__version__, flush=True)
+        return
+    from tilefoundry.analysis import analyze
+    from tilefoundry.cli.source import checked_program
+    from tilefoundry.schedule import finalize
+    from tilefoundry_ascend.codegen.native_aiv import NativeAIVBinding
+    from tilefoundry_ascend.codegen.x_runtime import emit_for_codegen, compile_tilelang
     if not args.compile_only:
+        phase("before_set_device")
         torch.npu.set_device(0)
+        phase("after_set_device")
     source = root / "tilefoundry_ascend/attnres/native_square.py"
+    phase("before_finalize")
     p = checked_program(str(source), None, command="native-aiv-device")
     m = finalize(analyze(p.module, p.entry, analysis=("memory",)), authored=p.authored)
     a = emit_for_codegen(m.metadata["ascend.p3_plan"], NativeAIVBinding(m))
+    phase("after_finalize")
     policy = {"tl.enable_auto_schedule": False}
+    phase("before_compile")
     kernel = compile_tilelang(a, a.abi, {"source_path": str(output / "native_square_tl.py")}, policy)
+    phase("after_compile")
     if args.compile_only:
         cce = kernel.get_kernel_source()
         (output / "native_square.cce").write_text(cce)
@@ -40,10 +62,16 @@ def main():
     z = (torch.arange(256, dtype=torch.float32).remainder(17) - 7) / 8
     rows = []
     for name, right in (("product", z), ("square", x)):
+        phase("before_alloc_" + name)
         xn, zn = x.npu(), right.npu()
         out = torch.empty_like(xn)
+        phase("after_alloc_" + name)
+        phase("before_launch_" + name)
         kernel(xn, zn, out)
+        phase("after_launch_" + name)
+        phase("before_sync_" + name)
         torch.npu.synchronize()
+        phase("after_sync_" + name)
         actual = out.cpu()
         expected = x * right
         ok = bool(torch.equal(actual, expected))
@@ -66,4 +94,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print("FAIL_STAGE", _STAGE, type(exc).__name__, str(exc), flush=True)
+        raise

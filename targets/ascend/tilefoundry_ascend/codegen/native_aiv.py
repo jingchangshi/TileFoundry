@@ -79,6 +79,17 @@ class NativeAIVBinding:
             refuse("first native backend supports exactly four static iterations")
         if any(b.slot_count != 1 for b in plan.buffers):
             refuse("first native backend supports single-version serial storage")
+        # Source operation coverage is an execution census, not a sidecar hash:
+        # every original effect/arithmetic operation must occur once per instance.
+        from ..plan.materialize import index_statements_ledger
+        from tilefoundry.ir.tir.flag import FlagSet, FlagWait, Drain
+        def operations(fn):
+            return [type(n.callable).__name__
+                    for n in index_statements_ledger(fn).values()
+                    if type(n).__name__ == "Evaluate"
+                    and not isinstance(n.callable, (FlagSet, FlagWait, Drain))]
+        if operations(function) != operations(original) * 4:
+            refuse("actual operations do not cover the native source exactly once per instance")
         emitter = _Emitter(function)
         source = emitter.emit()
         args = tuple({"name": p.name, "kind": "out" if i == 2 else "in",
@@ -99,10 +110,12 @@ class _Emitter:
         self.ub_extent = 0
         self.vf = False
         self.counter = 0
-        if len(function.params) != 3:
+        if len(function.params) != 3 or function.output_count != 1:
             refuse("expected two input buffers and one output")
         for p in function.params:
-            if tuple(p.type.shape) != (256,) or getattr(p.type.dtype, "name", None) != "f32":
+            if (tuple(p.type.shape) != (256,) or getattr(p.type.dtype, "name", None) != "f32"
+                    or p.type.storage != StorageKind.GMEM
+                    or tuple(p.type.layout.strides) != (1,)):
                 refuse("only contiguous 256-element f32 parameters are supported")
             self.bindings[p.name] = Address(p.name, 0, 256, StorageKind.GMEM)
 
@@ -203,6 +216,12 @@ class _Emitter:
             if (src.storage, dst.storage) not in ((StorageKind.GMEM, StorageKind.SMEM),
                                                   (StorageKind.SMEM, StorageKind.GMEM)):
                 refuse("unsupported DMA storage pair")
+            inputs = {p.name for p in self.function.params[:2]}
+            output = self.function.params[2].name
+            if src.storage == StorageKind.GMEM and src.base not in inputs:
+                refuse("GM load must read an ABI input")
+            if dst.storage == StorageKind.GMEM and dst.base != output:
+                refuse("GM store must write the sole ABI output")
             self.line("T.copy(%s, %s)" % (src.region(), dst.region()))
             pass
         elif kind in ("AivFlagSet", "AivFlagWait"):
