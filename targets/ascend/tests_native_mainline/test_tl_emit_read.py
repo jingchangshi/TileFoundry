@@ -425,7 +425,7 @@ if mode == "jit":
                 if "reg" in name or "spill" in name or "resource" in name)}))
     raise SystemExit(0)
 
-if mode == "same":
+if mode == "cachetwice":
     # Two compiles of ONE artifact into two DIFFERENT empty cache directories. The
     # second is served from the build cache, which is exactly the path that used to
     # produce a false TL_COMPILE_PRODUCTS_INCOMPLETE: a hit writes nothing into the
@@ -1598,7 +1598,7 @@ def test_a_cache_hit_is_not_a_missing_product():
     With no toolchain the required outcome is the named BLOCKED_ENV, asserted -
     never a skip.
     """
-    outcome = _site_run("same")
+    outcome = _site_run("cachetwice")
     if outcome.get("blocked"):
         assert outcome["blocked"] == "TL_BISHENG_NOT_DISCOVERABLE", outcome
         assert outcome["searched"], "the refusal must say what was searched"

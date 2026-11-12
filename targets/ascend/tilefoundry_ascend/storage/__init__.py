@@ -72,7 +72,7 @@ __all__ = [
     "StorageError",
     "StorageLowering",
     "StoragePlan",
-    "StorageVerification",
+    "RegisterOccupancy", "StorageVerification",
     "UNKNOWN_CAPACITY",
     "place_resolved_versions",
     "require_storage_verified",
@@ -144,12 +144,49 @@ class ScratchAllocation:
 
 
 @dataclass(frozen=True)
+class RegisterOccupancy:
+    """What the LOWERING reports about register use for one execution domain.
+
+    The reporting half of the register-budget gate. Every field is something the
+    lowering knows from the candidate it produced, and nothing here is inferred:
+    a value that was not measured stays None so the gate can tell "not reported"
+    apart from "reported as zero", which are very different claims.
+
+    residency distinguishes registers that live only inside one task (no cross-domain
+    pressure) from ones held ACROSS a domain boundary, which consume the budget of
+    both domains and are the shape most likely to be wrong.
+    """
+
+    domain: str
+    register_class: str
+    count: Optional[int] = None
+    dtype: str = ""
+    lane_count: Optional[int] = None
+    cross_domain_residency: bool = False
+    spill_path: Optional[str] = None
+    source: str = ""
+
+    def is_reported(self) -> bool:
+        """A report counts only when a non-negative count AND its provenance exist."""
+        return (isinstance(self.count, int) and not isinstance(self.count, bool)
+                and self.count >= 0 and bool(self.source))
+
+    def as_dict(self) -> dict:
+        return {"domain": self.domain, "register_class": self.register_class,
+                "count": self.count, "dtype": self.dtype,
+                "lane_count": self.lane_count,
+                "cross_domain_residency": self.cross_domain_residency,
+                "spill_path": self.spill_path, "source": self.source}
+
+
+@dataclass(frozen=True)
 class StorageLowering:
     """The lowering-side facts this stage consumes (scratch, optional unit tree)."""
 
     scratch_allocations: tuple = ()
     unit_tree: object | None = None
     plan_iteration: int = 0
+    register_occupancy: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -281,6 +318,14 @@ def _target_memory(target):
         ) from None
 
 
+#: The register-budget gate's code family. Kept separate from UNKNOWN_CAPACITY on
+#: purpose: "no byte capacity" and "no register budget" are different facts with
+#: different remedies, and collapsing them would hide which one is missing.
+STORAGE_REGISTER_UNSOURCED = "STORAGE_REGISTER_UNSOURCED"
+STORAGE_REGISTER_OVER_BUDGET = "STORAGE_REGISTER_OVER_BUDGET"
+STORAGE_REGISTER_SIZE_NOT_BYTES = "STORAGE_REGISTER_SIZE_NOT_BYTES"
+
+
 def _level(target, space: str):
     memory = _target_memory(target)
     level = memory.explicit(str(space))
@@ -366,7 +411,92 @@ def _plan_buffers(plan):
     return tuple(ordered)
 
 
+
+#: Spaces that are COUNTED, not sized. A vreg's 256 B is the width of ONE register;
+#: treating it as a capacity would either invent a register count (bytes/width) or
+#: compare a byte peak against a width. Neither is a fact, so these spaces go
+#: through the register-budget gate below instead of the byte-capacity one.
+_REGISTER_SPACES = frozenset({"rmem", "carrier", "preg"})
+
+#: Target space name -> register class used by memory.REGISTER_BUDGETS.
+_REGISTER_CLASS = {"rmem": "vreg", "carrier": "carrier", "preg": "preg"}
+
+
+def _register_gaps(target, space: str, lowering) -> list:
+    """Facts-side and report-side register checks; empty means the gate passes.
+
+    THREE ANSWERS, never two:
+      - either side UNSOURCED/unreported  -> STORAGE_REGISTER_UNSOURCED, naming which
+        side is missing and why. A missing fact is not a zero, and it is not
+        "unlimited" either: it is the honest statement that this build cannot judge.
+      - both sides stated and demand > budget -> STORAGE_REGISTER_OVER_BUDGET.
+      - both sides stated and demand <= budget -> no gap, and the check deliberately
+        does NOT fall back to byte capacity (see _capacity_fact below).
+
+    The two sides are checked BEFORE any comparison, because comparing a number
+    against a number that does not exist is how "no budget" silently becomes
+    "fits".
+    """
+    from ..memory import register_budget
+
+    register_class = _REGISTER_CLASS.get(str(space), str(space))
+    reports = tuple(getattr(lowering, "register_occupancy", ()) or ())
+    gaps = []
+    # Group the lowering's reports for this register class, by domain. A report for
+    # another class is not evidence about this one.
+    by_domain = {}
+    for report in reports:
+        if str(getattr(report, "register_class", "")) != register_class:
+            continue
+        by_domain.setdefault(str(getattr(report, "domain", "")), []).append(report)
+    if not by_domain:
+        gaps.append((STORAGE_REGISTER_UNSOURCED,
+                     "the lowering reported no %r occupancy at all, so register demand "
+                     "for space %r is unmeasured" % (register_class, space),
+                     "space=%s class=%s" % (space, register_class)))
+        return gaps
+    for domain, domain_reports in sorted(by_domain.items()):
+        budget = register_budget(domain, register_class)
+        if not budget.is_sourced():
+            gaps.append((STORAGE_REGISTER_UNSOURCED,
+                         "the target states no %r register budget for domain %r: %s"
+                         % (register_class, domain, budget.reason or "no reason given"),
+                         "domain=%s class=%s" % (domain, register_class)))
+            continue
+        unreported = [report for report in domain_reports if not report.is_reported()]
+        if unreported:
+            gaps.append((STORAGE_REGISTER_UNSOURCED,
+                         "the lowering reported no count for domain %r class %r, so "
+                         "demand cannot be compared with the declared budget %d"
+                         % (domain, register_class, budget.value),
+                         "domain=%s class=%s" % (domain, register_class)))
+            continue
+        # Cross-domain residency is charged to BOTH domains, so the same registers are
+        # counted on each side they occupy - the conservative direction.
+        demand = sum(int(report.count) for report in domain_reports)
+        if demand > int(budget.value):
+            gaps.append((STORAGE_REGISTER_OVER_BUDGET,
+                         "register demand exceeds the declared budget for domain %r "
+                         "class %r" % (domain, register_class),
+                         "domain=%s class=%s demand=%d budget=%d"
+                         % (domain, register_class, demand, int(budget.value))))
+        for report in domain_reports:
+            if report.count and report.spill_path is None and report.cross_domain_residency:
+                # No spill path means residency cannot be relieved; the demand is
+                # charged in full rather than assuming an escape route that does not
+                # exist.
+                continue
+    return gaps
+
 def _capacity_fact(target, space: str, *, gmem_exempt: bool):
+    if str(space) in _REGISTER_SPACES:
+        raise StorageError(
+            STORAGE_REGISTER_SIZE_NOT_BYTES,
+            "space %r is a COUNTED register resource, not a byte capacity: its "
+            "nominal width describes one register, not a budget. It passes the "
+            "register-budget gate (facts + lowering report), never this one"
+            % (space,),
+            str(space))
     level = _level(target, space)
     capacity = level.capacity_bytes
     if capacity is None:

@@ -200,3 +200,17 @@ architect 三项判定：① 主线未跑偏，但 **S0 收口标准被低估**�
   - claims_not_made / unknowns 明写：本登记物**不认证 G3 闭合**、不声称任何原例数值通过；并保留两条 UNKNOWN（S4/S5 实际导入的是否同一份 npu_compare 未证；比较器无 __version__，只能钉 commit+sha256）。
 - 方法更正（flex-1-g1 实测，已转校验器作者）：**ast.literal_eval 读不了幂表达式**（连单个 2 的 -10 次方都抛 ValueError(malformed node / ast.BinOp)），必须 BinOp-aware 折叠。这是 registry 同时存 source_forms 与 values 两份的实际理由。
 - G3 状态：登记物就绪但**未闭合** —— 仍缺 task-52 的只读校验器正例（草案校验通过）与设备侧运行时 __file__ 与 sha256 捕获。
+
+## R28 关键路径收敛：gate 只差一条腿（Lead 亲测）
+我独立调用 compile_mainline 量了三个 fixture（不是采信报告），结果与 WP1 交付逐字相符：
+  copy_only      applied=(analyze,resolve,completion,storage)  stopped=apply     TL_NO_VECTOR_REGION
+  independent_ub applied=(analyze,resolve,completion)          stopped=storage   UNKNOWN_CAPACITY (rmem)
+  minimal_aiv    applied=(analyze,)                            stopped=resolve   PLAN_DEPENDENCE_PROOF_UNAVAILABLE
+结论：**分层 gate 不是分布式死路** —— copy_only 上 plan/completion/storage 三层已由真实对象判空，只剩 emitter 的'无向量区即拒'。三个 fixture 合起来构成一个闭合三角：能发射⇒有向量区⇒需 rmem 寄存器⇒storage 因 rmem 容量 UNSOURCED 而拒。因此 ready=True 只差 **rmem 事实**这一条腿（另两条腿：carried 证明、事件注入已分别由 task-46/task-54 承担，后者已完成）。
+由此调整关键路径：task-50（WP3 寄存器预算闸门）升为唯一关键路径，交 flex-4-g3（他刚证明三角并要求过 ready=True 断言）；implementer-g1 回手 task-46 carried。
+
+## R29 方法账新增（本轮由实现者自曝，Lead 收录）
+1) **第二次猜测仍然是猜测，第三次也是**：同一轮内 TILELANG_CACHE_DIR 猜两次（模块常量→EnvVar 类属性，真身是 tilelang.env 实例属性）、binary 布局、sibling 层级、三角不变量三次全错。凡'整张表的普遍规则'必须先枚举真实表再断言；最后成立的三角版本是**两个程序对照量出来的相关性**，不是推导出来的。
+2) **瞬时快照 ≠ 持续状态**（第二次实例）：flex-1-g1 据 find 0 命中判 task-56 未完成，而 DRAFT.md 与他的 find 在同一分钟落盘（mtime 07:41:10）。新纪律：缺失类断言必须附观察时刻，下结论前复查 mtime/HEAD。Lead 本轮也犯过同款（05:49 把落盘竞态夸成整队冻结）。
+3) **聚合相等会掩盖写法差异**：1.0 与 2**0 折叠同值，只比数值会放过被改写的表 ⇒ 校验器必须同时比对**源写法**（ast.unparse 归一后逐字段）。这条来自 task-52 实现者自测打红。
+4) **命名错误的层比漏报更坏**：compile_mainline 的 REFUSED 记录原先不写 entry_identity，导致 gate 报 (entry, ENTRY_IDENTITY_MISMATCH) 而真实缺口在别处；已修为 refused 记录也写真实 entry identity，并加'没有幽灵 entry 缺口'断言。

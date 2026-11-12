@@ -100,3 +100,13 @@ PYTHONDONTWRITEBYTECODE=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
 PYTHONDONTWRITEBYTECODE=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
   /home/s00653124/workspace/envs/tfnpu-v2/bin/python /tmp/tf_fac/probe_tl_pk.py
 ```
+
+## H. task-56 后续只读复核（lead 指派）：vector_model 是否真按 (instruction, dist) 建模？**答案：尚未——但这是潜伏缺陷，不是现行错误。**
+
+基线：vector_model.py mtime 03:22、emit.py 06:15:52、tl_reader.py 06:5x（HEAD 仍 f341e47）。
+
+- vector_model 的 lane/extent 只按 **dtype** 派生（2048//element_bits），模块内没有任何 dist 概念；它记录的实测表也全是 NORM 情形（float32→64/64、bfloat16→128/128）。
+- 部署侧真实规则是 **(instruction, dist)** 的函数：vld simd.py:393-404（BRC_ 特例、E2B_→8、BLK→32、UNPK4_B8→lanes//4、US_/UNPK_→lanes//2、DS_→lanes*2）、vsts :472-477（ONEPT_→1、PK_→lanes//2、PK4_→lanes//4）。我 §E 实测的 `vsts(..., dist="PK_B32") → extent 64`（而默认 NORM_B32 同一 UB 是 128）正是该函数的一个样本；§C 的 `vld(UNPK_B16) → extent 64`（≠ 表里 NORM 的 128）是另一个。
+- **为什么现在还没炸**：双侧同源。expected 侧 _vld_operands/_vsts_operands（tl_reader.py:229-230/:242-245）与 observed 侧都经同一 vector_model 派生；f32 没有 dist 变体，所以 emit 不写 dist、reader 双侧一致是**结构成立**的。
+- **何时会咬 WP5**：bf16 e2e 一接入 vcvt，作者链必然要 `vld(dist="UNPK_B16")`；若 renderer 省略 dist，部署默认 NORM 会把 bf16 UB 读成 bfloat16x128（跳过 unpack），语义错且 extent 也错（128 vs 64）。届时 (a) emit 的 expected lanes/extent 与 (b) reader 双侧硬编码的 ("literal","NORM")/("literal","NORM_B32")（:230/:245）都会与 observed 真值分叉。当前 emit 对 dist/pack 属性**静默丢弃**（渲染只发 T.simd.vld(buf[0]) 与三参 vsts），且 :792 的 TL_ATTRIBUTE_UNDECLARED 只反向拦"未声明属性"，不拦"声明了但没消费"。
+- 建议（给 task-51 实现者，一句话）：把 vector_model 的接口从 per-dtype 升级为 **(instruction, dist)→(vector_dtype, extent)**，dist 从 lowered Op 属性读取并映射到部署规则表；同时加一条"属性必须被消费否则具名拒绝"的守卫，防 UNPK_B16/PK_B32 被无声吞掉。**别把 §C 的"vld(UNPK_B16) 返回 bfloat16x128"记成"f32"**——那是 vcvt 之后才出现的类型。

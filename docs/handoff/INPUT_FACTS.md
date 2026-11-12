@@ -32,3 +32,11 @@
 npu_compare 包外位置；20261112/ 目录内除 tf_ascend950pr_native_v3 外的其他交付物；source_manifest 引用的 attention_residual.tar/mla.tar 原档位置；evidence/ 内容正确性（只验 sha256 身份，未复跑 reproduce）。
 
 复核：清单逐项 sha256sum；work_package 根跑 tools/verify_package.py；导入清点与 pytest collection 命令同上；全部只读。
+
+## 7. Addendum（task-52/56 轮，lead 要求留档）— 两条自我更正与一条方法错误
+
+- **更正 1（会咬 task-52 校验器）**：我先前给 implementer 的摘要写「校验器可用 ast.literal_eval 读 CANN_BENCH_THRESHOLDS」——**实测不成立**：literal_eval 对单个 `2 ** -10` 即抛 `ValueError: malformed node ... ast.BinOp`，对整表同样失败。正确做法 = **BinOp-aware 折叠**（left 常量 2、op=Pow、right 一元负号 → `2.0**exp`），非 pow2 分支取 `ast.Constant`；已实测对切片 [82,132] 可用。该坑已由 lead 转给 task-52，explorer-g1 已写进 DRAFT.md §3 并作为 JSON 存 source_forms+values 双份的理由。
+- **更正 2**：`threshold_table.line_range` 应为 **[82, 132]**（82 是表开括号行，132 是闭合 `}` 行）；:133 属 `_FALLBACK_THRESHOLDS = CANN_BENCH_THRESHOLDS["float32"]`，不应并入表体。我先前提的 82-133 含 fallback 行。附带事实：`float8_e5m2` 末两档是 float 常量 `1.0`（非 `2**-n`），登记与校验均不得归一化。
+- **方法错误（lead 纠正）**：07:41 我据 `find` 0 命中断言 COMPARATOR_REGISTRY_DRAFT.md 不存在并推出「task-56 不能判完成」；该文件实际 mtime=**07:41:10**，与我的观察落在同一分钟——结论建立在**落盘之前的瞬时快照**上。教训：**瞬时快照 ≠ 持续状态**；**第二次猜测仍是猜测**（把同一条命令再跑一遍而不重新核对 mtime/HEAD/时钟边界，只是重读同一个过期快照，不构成复核）。此后凡「缺失/不存在」类断言必须附观察时刻，下结论前复查 mtime 与 HEAD 是否已前进。本轮已按此执行：addendum 前重查得 HEAD=b6d8848（registry 已入 883117e、DRAFT.md 已入 b6d8848），两文件 sha256 与字节数（b25dd485…/44239B；073bc999…/5141B/58 行）与我对 a/b/c 复核时一致，explorer-g1 报告的数字与我的独立复算吻合。
+- a/b/c 复核结论不受上述影响，且复核未把 registry 的 values 当真值（独立重折叠后逐位比对）：44/44 条 source_forms+values 与磁盘表一致、dtype 分布 AR bf16×17+fp16×3 / MLA fp16×15+bf16×5 / suppl 2+2 与源对撞无一例外、全文 PASS/通过/VERIFIED/certified 命中 0（唯一 passed 在否定句）。
+- 归属纪律：task-56 两文件均为 owner explorer-g1 落地与收尾（板上 completed rev3）；我只读复核、不判他完成、未改其文件。task-52 因 required_role=implementer 我从未认领（TEAM_ROLE_MISMATCH 即停），交付的是事实包 + 上述更正。

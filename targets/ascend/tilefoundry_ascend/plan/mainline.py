@@ -282,12 +282,21 @@ def compile_mainline(module, authored=None, *, target=None):
 
 
 def _refused_record(module, stages, stopped_at, error):
-    """One REFUSED record naming the stage that stopped the transaction."""
+    """One REFUSED record naming the stage that stopped the transaction.
+
+    entry_identity is recorded even when a LATER stage refuses, because the entry
+    the transaction ran against is a fact about this run, not about how far it got.
+    Leaving it empty made the export gate report ("entry", "ENTRY_IDENTITY_MISMATCH")
+    for a program whose entry was never in question - a gap that named the wrong
+    layer, which is exactly the kind of misleading entry this gate exists to avoid.
+    """
     from ..passes.p3_chain import ChainRecord, ir_identity
 
     code = getattr(error, "code", None) or type(error).__name__
+    entry = module.entry_function() if hasattr(module, "entry_function") else None
     return ChainRecord(
         ir_identity=ir_identity(module),
+        entry_identity=function_identity(entry) if entry is not None else "",
         pipeline_status="REFUSED",
         applied=tuple(stages),
         stopped_at=stopped_at,

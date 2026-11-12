@@ -114,6 +114,97 @@ def space_facts_table() -> dict:
     return dict(SPACE_FACTS)
 
 
+# --------------------------------------------------------------------- registers
+# Register spaces are counted, not sized. A vector register is 256 B WIDE, but how
+# many registers an AIV has is a separate fact that this build does NOT state, and
+# the two must never be conflated: dividing a nominal byte figure by a register
+# width would invent a count, and that is exactly the "requirement backfilled as a
+# capacity" the storage gate exists to refuse.
+#
+# Not to be confused with MemorySpaceFacts.nominal_bytes above, which is a per-value
+# WIDTH (256 B for one vreg); a budget needs a COUNT of registers per execution
+# domain, which is a different fact with a different provenance.
+STATUS_REGISTER_UNSOURCED = "UNSOURCED"
+
+
+@dataclass(frozen=True)
+class RegisterBudgetFacts:
+    """How many registers one execution domain can use, and where that came from.
+
+    value/source/status are deliberately separate. status UNSOURCED with value None
+    means "this build does not state a budget"; a caller must treat that as a
+    refusal, never as "unlimited". A number without a source is not a fact either,
+    so status must be DEVICE_VALIDATED or REFERENCE_IMPLEMENTATION for the value to
+    count, and the reason string names what is missing either way.
+    """
+
+    domain: str
+    register_class: str
+    value: Optional[int]
+    source: str = ""
+    status: str = STATUS_REGISTER_UNSOURCED
+    reason: str = ""
+
+    def is_sourced(self) -> bool:
+        """A budget counts only when a positive count AND its provenance exist."""
+        return (isinstance(self.value, int) and not isinstance(self.value, bool)
+                and self.value > 0
+                and self.status in (STATUS_DEVICE_VALIDATED,
+                                    STATUS_REFERENCE_IMPLEMENTATION)
+                and bool(self.source))
+
+    def as_dict(self) -> dict:
+        return {"domain": self.domain, "register_class": self.register_class,
+                "value": self.value, "source": self.source,
+                "status": self.status, "reason": self.reason}
+
+
+#: Declared register budgets, keyed by (domain, register_class).
+#:
+#: EVERY entry here is UNSOURCED today, and that is the measured truth rather than a
+#: placeholder: the target's space_facts record states a vreg WIDTH (256 B) and no
+#: per-domain register COUNT, and the deployed build's own resource report is
+#: queried by codegen (n_regs / n_spills), not by this facts surface. Writing a
+#: plausible number here would let the storage gate PASS on a number nobody sourced,
+#: which is worse than refusing - so the refusal stands until a real fact arrives.
+REGISTER_BUDGETS = {
+    ("aiv", "vreg"): RegisterBudgetFacts(
+        "aiv", "vreg", None,
+        reason="the target states a 256 B register WIDTH, not how many vector "
+               "registers one AIV has; a width is not a budget"),
+    ("aiv", "preg"): RegisterBudgetFacts(
+        "aiv", "preg", None,
+        reason="no predicate-register count is stated by this build"),
+    ("aiv", "carrier"): RegisterBudgetFacts(
+        "aiv", "carrier", None,
+        reason="carrier is a bf16 transport register class whose aggregate count is "
+               "UNSOURCED, exactly as for vreg"),
+    ("aic", "vreg"): RegisterBudgetFacts(
+        "aic", "vreg", None,
+        reason="no AIC register count is stated by this build"),
+}
+
+
+def register_budget(domain: str, register_class: str) -> RegisterBudgetFacts:
+    """The declared budget for one (domain, register class), never a default.
+
+    An unknown pair returns an UNSOURCED record rather than raising, so a caller
+    reports a named gap with a reason instead of crashing on a lookup.
+    """
+    found = REGISTER_BUDGETS.get((str(domain), str(register_class)))
+    if found is not None:
+        return found
+    return RegisterBudgetFacts(
+        str(domain), str(register_class), None,
+        reason="this build declares no register budget for domain %r class %r"
+               % (domain, register_class))
+
+
+def register_budgets_table() -> dict:
+    return dict(REGISTER_BUDGETS)
+
+
+
 # ---- Transfer legality (3510 data paths; S17-S19) ----
 # (src, dst) -> (issuer_pipe, legal, note)
 TRANSFERS = {
@@ -179,6 +270,8 @@ def assert_transfer_legal(src: str, dst: str) -> None:
 __all__ = [
     "GLOBAL", "LOCAL", "REGISTER", "AUX", "IMPLICIT_CACHE", "UNMATERIALIZED",
     "MemorySpaceFacts", "MemorySpaceRef", "SPACE_FACTS", "space_facts_table",
+    "RegisterBudgetFacts", "REGISTER_BUDGETS", "register_budget",
+    "register_budgets_table", "STATUS_REGISTER_UNSOURCED",
     "TransferContract", "transfer_contract", "transfer_table", "assert_transfer_legal",
     "STATUS_REFERENCE_IMPLEMENTATION", "STATUS_DEVICE_VALIDATED", "STATUS_UNRESOLVED",
 ]
