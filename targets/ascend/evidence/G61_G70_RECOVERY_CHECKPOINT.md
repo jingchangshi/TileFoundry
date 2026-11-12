@@ -70,3 +70,11 @@ This section supersedes the earlier implementation status only for the restricte
 - Own existing container read-only inspection shows /dev/davinci0,/dev/davinci1,/dev/davinci_manager,/dev/hisi_hdc mappings and shared /home,/data; no container execution or NPU initialization was attempted. Host npu-smi remains healthy but other-user jobs remain resident.
 
 Next authorized round: read-only diagnose existing device environment/init failure; resume locked micro-case product/square numerical verification when valid; then fix remaining native limited-domain constraints and extend full AR/MLA. Do not restart device launch before Lead continuation. Original six handed-off dirty files remain preserved and uncommitted.
+
+## Device environment handoff after resumed round (2026-11-12)
+
+User is helping repair environment. No further initialization/kernel probes are to start before feedback. Head native refinement f61b2f6; 13 native CPU tests pass. Host507033/E39006 now traced to unreadable root-only CANN aicpu_hccl.tar.gz. Existing own root container reads it and TSD opens successfully, but the single authorized micro-case run exited139 without kernel output. Exact Python crash phase unknown; report FAIL_ENV/unknown-stage, not a kernel hang. New phase-aware runner and imports-only mode committed; imports-only passed, no set_device.
+
+Evidence: native_aiv_device_20261112/HANDOFF.md, original host debug plog, original copied own container plog, raw stdout/stderr and import logs. Jobs bash-71c09b42b7a94098(exit139), bash-c0758e6dac854a47(exit0) collected; no running job/owned container worker. Future user command must use container-inner timeout with host flock. No reset/sudo/other-process signal or package permission change. Lead has exact nonexecuted init and product/square commands.
+
+Write ownership changed: second implementer owns search/harness.py,search/process.py and new CPU worker-deadline tests; this implementer must not edit/stage those files. Original six dirty + user review directory remain preserved. Full fingerprint/Counter actual Evaluate coverage requested by reviewer is deferred to next round; current census is only type/order/count plus existing grouped operand map validation.

@@ -1,0 +1,4 @@
+PHASE before_import_torch
+PHASE after_import_torch
+PHASE after_import_torch_npu
+VERSIONS 2.12.0+cpu 2.12.0 0.1.15+cpu.git0e687c17
