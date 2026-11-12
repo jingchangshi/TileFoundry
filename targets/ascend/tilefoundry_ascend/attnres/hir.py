@@ -166,9 +166,14 @@ def build_scheduled_hir(spec: AttentionResidualSpec) -> ScheduledHIR:
     for g in range(spec.groups()):
         tasks.append(Task(LOAD_X, "group", g, TASK_PIPE[LOAD_X], TASK_STAGE[LOAD_X]))
         for u in range(spec.n_blocks()):
-            tasks.append(Task(LOAD_V, "block", u, TASK_PIPE[LOAD_V], TASK_STAGE[LOAD_V]))
-            tasks.append(Task(BLOCK_COMPUTE, "block", u, TASK_PIPE[BLOCK_COMPUTE],
-                              TASK_STAGE[BLOCK_COMPUTE]))
+            # One LOAD_V / BLOCK_COMPUTE pair PER V BLOCK, not per CN group: each member of the
+            # block is loaded and scored individually, and the block merge happens once the
+            # group's members are complete. Modelling one task per CN group would hide the
+            # second V read the blocked form actually performs.
+            for _member in range(min(spec.block_n, spec.n - u * spec.block_n)):
+                tasks.append(Task(LOAD_V, "block", u, TASK_PIPE[LOAD_V], TASK_STAGE[LOAD_V]))
+                tasks.append(Task(BLOCK_COMPUTE, "block", u, TASK_PIPE[BLOCK_COMPUTE],
+                                  TASK_STAGE[BLOCK_COMPUTE]))
         tasks.append(Task(FINALIZE, "group", g, TASK_PIPE[FINALIZE], TASK_STAGE[FINALIZE]))
         tasks.append(Task(STORE_Y, "group", g, TASK_PIPE[STORE_Y], TASK_STAGE[STORE_Y]))
         ordinal += 1
@@ -212,6 +217,13 @@ def build_scheduled_hir(spec: AttentionResidualSpec) -> ScheduledHIR:
             "literal_fp32_is_primary": spec.score_mode == LITERAL_FP32,
             "factored_gw_differs_in_float": spec.score_mode == FACTORED_GW,
             "v_last_consumer": BLOCK_COMPUTE,
+            "block_n": spec.block_n,
+            "n_blocks": spec.n_blocks(),
+            "state_updates": spec.state_updates(),
+            "block_state": ("none (CN=1, the running state IS the block state)"
+                            if spec.block_n == 1 else
+                            "m_b/l_b/u_b per block, merged into m/l/acc after each block"),
+            "v_reads_per_element": 2,
             "stage_is_search_start": True,
             "state_dtype": spec.state.as_dict(),
         },

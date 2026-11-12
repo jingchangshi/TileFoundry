@@ -1,0 +1,160 @@
+{
+  "gate": "G52",
+  "task": "P5-02",
+  "status": "VERIFIED",
+  "deliverable": "blocked_online (intra-block m_b/l_b/u_b + cross-block merge) and resident_n (all N resident) implemented and verified on Ascend950PR, with literal_fp32 and factored_gw as distinct measured precision policies, plus real UB/VF/layout resource pruning.",
+  "device": {
+    "arch": "Ascend950PR",
+    "device_id": 0,
+    "toolchain": "CANN 9.3.0 (/data/pri/9.3.0-weekly/cann-9.3.0)",
+    "tilelang": "0.1.15",
+    "comparator": "cannbench_contract.Harness.compare -> npu_compare, ORIGINAL thresholds",
+    "execution_path": "docker exec s00653124-bska, flock -n /home/.tf_device0.lock"
+  },
+  "official_20_case_sweep": {
+    "source": "fixtures/attention_residual/cases.yaml",
+    "results": [
+      {
+        "config": "CN=1 literal_fp32 (online)",
+        "passed": 20,
+        "total": 20,
+        "log": "mla-tl-run/p502_cn1_lit.log"
+      },
+      {
+        "config": "CN=4 factored_gw (blocked_online)",
+        "passed": 20,
+        "total": 20,
+        "log": "mla-tl-run/p502_cn4_fact.log"
+      },
+      {
+        "config": "CN=8 literal_fp32 (resident_n)",
+        "passed": 20,
+        "total": 20,
+        "log": "mla-tl-run/p502_cn8_lit.log"
+      },
+      {
+        "config": "CN=8 factored_gw (resident_n)",
+        "passed": 20,
+        "total": 20,
+        "log": "mla-tl-run/p502_cn8_fact.log"
+      }
+    ],
+    "note": "Four configurations spanning all three families and both score modes each pass all 20 official cases at the original thresholds."
+  },
+  "cn_sweep_synthetic": {
+    "shape": "N=8 M=64 D=512 bfloat16",
+    "result": "CN in {1,2,4,8} x {literal_fp32, factored_gw} all pass, max error 6.66e-03 in every one",
+    "observation": "the maximum error is IDENTICAL across all eight configurations, which is the expected signature of the same arithmetic reaching the same result by different block partitions"
+  },
+  "edge_tests": {
+    "driver": "mla-tl-run/p502_edge.py",
+    "result": "24/24 OK",
+    "highlights": [
+      "N not a multiple of CN: (7,4) (5,2) (9,4) (3,2) (6,4) (10,4) (11,8) (13,4) -- exercises the in-block tail",
+      "CN == N (resident_n single block, no merge): literal and factored both pass",
+      "N=2 CN=2 and N=3 CN=2, the domain minimum with blocking",
+      "D tails 2047/1000/257/100 with CN=2",
+      "M=1 decode with CN>1",
+      "fp16 with CN>1",
+      "alpha 0.05 and 0.95, epsilon 1e-8 and 1e-3 with CN>1",
+      "N=32 CN=4 and N=32 CN=8"
+    ]
+  },
+  "block_state_algebra": {
+    "pass_1": "m_b = max_j s_j over the CN block members",
+    "pass_2": "l_b = sum_j exp(s_j - m_b); u_b = sum_j exp(s_j - m_b) * V_j",
+    "merge": "nm = max(m,m_b); rho = exp(m-nm); bet = exp(m_b-nm); l = rho*l + bet*l_b; acc = rho*acc + bet*u_b",
+    "why_two_passes": "exp(s_j - m_b) needs the block max, which is only known after the whole block is scored",
+    "cost_recorded": "the two-pass form RE-READS V, so V is read twice per element. Holding CN tiles instead is the resource-pruning alternative in resources.py, and which wins is a measurement rather than an assumption."
+  },
+  "score_modes": {
+    "literal_fp32": "k = v/rms*gamma then sum_d(k*w)/sqrt(D) -- the golden's arithmetic order",
+    "factored_gw": "gw = gamma*w hoisted once per AIV and reused across every token group and block; s = (sum_d(v*gw)/rms)/sqrt(D)",
+    "distinction": "factored_gw removes the per-element division from the reduction. The two are NOT bit-identical by construction and are never claimed to be; both are verified against the same golden.",
+    "residency": "gw residency is materialised ONCE per AIV, before the token-group loop, which is the reuse the policy exists for"
+  },
+  "resource_pruning": {
+    "module": "targets/ascend/tilefoundry_ascend/attnres/resources.py",
+    "limits": {
+      "ub_bytes": 262144,
+      "vf_register_bytes": 32768
+    },
+    "generated_space": "family x score mode x CN x R x D-chunk x V-pipeline-versions",
+    "observed": [
+      {
+        "shape": "N=4 tok=128 D=2048",
+        "total": 72,
+        "feasible": 72,
+        "pruned": "0%"
+      },
+      {
+        "shape": "N=32 tok=256 D=2047",
+        "total": 144,
+        "feasible": 72,
+        "pruned": "50%"
+      },
+      {
+        "shape": "N=8 tok=64 D=7168",
+        "total": 96,
+        "feasible": 18,
+        "pruned": "81%"
+      }
+    ],
+    "rejection_reasons_are_real": [
+      "UB overflow: 311336 bytes needed vs 262144 available (1.19x over)",
+      "VF register pressure: 65536 bytes vs 32768 available",
+      "multi-versioned copy of D elements into a next_power_of_2(D) region cannot prove src_total == dst_total (observed failure on D=5120/7168)"
+    ],
+    "honest_boundary": "only the R=1, single-version, full-D-chunk online configuration has DEVICE evidence; every other feasible candidate is labelled UNMEASURED rather than being presented as a result"
+  },
+  "niter_gt_1_investigation": {
+    "status": "OPEN -- not claimed, not glossed",
+    "question": "why did the G50 persistent loop produce wrong results for every iteration after the first?",
+    "hypotheses_tested_and_REJECTED": [
+      "loop-invariant code motion hoisting the state init: an iteration-dependent init built from the iteration variable failed identically",
+      "an iteration-dependent init built from a PER-ITERATION MEMORY value also failed identically",
+      "missing cross-iteration synchronisation: an explicit T.ascend_pipe_barrier('PIPE_ALL') at the top of each iteration changed nothing",
+      "shared-buffer reuse across iterations: allocating the buffers INSIDE the loop changed nothing (alloc_shared is hoisted to function scope regardless)",
+      "nested Pipelined constructs: fully unrolling the inner N loop changed nothing",
+      "a simple index fault: the wrong values do not match the expected output of any other token"
+    ],
+    "established_by_bisection": "copy-only, V-load-only, and single-reducer-online-state variants are ALL correct at niter=2. The fault first appears when the SCORE path adds a SECOND reducer to the same VF region. This narrows it to the two-reducer region rather than the persistent loop's state carry.",
+    "relevance": "CN is an INTRA-program block width, so blocked_online and resident_n do not need the cross-group persistent loop and are unaffected; G52's results do not depend on it. The persistent g+=P schedule remains G51 work.",
+    "why_it_matters": "G51's acceptance explicitly requires the persistent group schedule, so this must be resolved rather than worked around before G51 can claim it."
+  },
+  "not_claimed": [
+    "The persistent g += P schedule across token groups (G51). All G52 results use one token group per program.",
+    "Performance: no cycle timings, no bandwidth, no ranking of CN=1 vs CN=4 vs CN=8. All pass; none is claimed faster.",
+    "R > 1 token rows per program: generated and judged as candidates but NOT executed on device.",
+    "Multi-versioned V pipelining (v_versions > 1) on device: generated and pruned, not measured.",
+    "D-chunking across multiple chunks on device: the measured kernel stages a full padded D per block.",
+    "resident_n with N large enough to exceed UB: pruned as infeasible, not attempted.",
+    "Bit-identity between literal_fp32 and factored_gw: they differ by construction."
+  ],
+  "scheduled_hir_and_twins": {
+    "hir": "one LOAD_V/BLOCK_COMPUTE task pair PER V BLOCK (not per CN group), so the graph shows the two V reads the blocked form performs; records block_n, n_blocks, state_updates, the block-state description, and v_reads_per_element=2",
+    "twins": {
+      "blocked_online_CN4": "MATCHED",
+      "resident_n_CN8": "MATCHED",
+      "cn1_online_regression": "MATCHED (the G50 kernel is emitted by a separate function and is unchanged)"
+    },
+    "clauses_added_for_CN": [
+      "block state m_b (st[7]) and l_b (st[8]) must be present, or the merge has nothing to merge",
+      "a SEPARATE block accumulator u_b must exist; folding the block into the running acc would make the merge meaningless",
+      "the cross-block merge must update m, l and acc together",
+      "CN>1 must have two V copy sites each inside a range(CN) loop -- dropping the second pass silently means holding the block, which is resident_n's cost not blocked_online's",
+      "the emitted CN must equal the declared CN"
+    ],
+    "note": "the two checker clauses that first fired on the CN twins were CHECKER defects (the CN=1 textual patterns did not match the blocked form), not kernel defects; both were fixed by accepting the two legal aggregation forms and by counting copy SITES rather than assuming one copy per N element"
+  },
+  "suite": {
+    "result": "633 passed, 1 skipped, 0 failed (571s)",
+    "deselect": "test_eps_runtime.py (NOT_RUN, per AGENTS.md)"
+  },
+  "tests": {
+    "g50": 33,
+    "g52": 22,
+    "combined": 55,
+    "note": "targets/ascend/tests/test_attnres_g52.py"
+  }
+}

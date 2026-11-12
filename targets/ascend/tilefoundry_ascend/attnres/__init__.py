@@ -52,6 +52,32 @@ from .hir import (
     build_scheduled_hir,
     check_scheduled_hir,
 )
+from .kernel import (
+    ABI,
+    AttnResABI,
+    KernelConfig,
+    kernel_config,
+    next_power_of_two,
+)
+from .kernel_cn import (
+    MEASURED_CN,
+    check_config,
+    kernel_summary,
+    merge_algebra,
+    n_blocks,
+)
+from .resources import (
+    FEASIBLE,
+    INFEASIBLE,
+    MEASURED,
+    UNMEASURED,
+    Candidate,
+    ResourceUse,
+    generate_candidates,
+    judge,
+    measure_resources,
+    summarise,
+)
 from .twin import (
     AUTO_SCHEDULE_FLAG,
     AttnResTwin,
@@ -64,7 +90,27 @@ from .twin import (
 )
 
 __all__ = [
+    "ABI",
     "AIV",
+    "AttnResABI",
+    "Candidate",
+    "FEASIBLE",
+    "INFEASIBLE",
+    "KernelConfig",
+    "MEASURED",
+    "MEASURED_CN",
+    "ResourceUse",
+    "UNMEASURED",
+    "check_config",
+    "generate_candidates",
+    "judge",
+    "kernel_config",
+    "kernel_summary",
+    "measure_resources",
+    "merge_algebra",
+    "n_blocks",
+    "next_power_of_two",
+    "summarise",
     "AUTO_SCHEDULE_FLAG",
     "AttentionEvidence",
     "AttentionResidualError",

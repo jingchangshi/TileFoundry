@@ -321,16 +321,31 @@ def check_attnres_conformance(spec: AttentionResidualSpec,
     # -- clause 3: the aggregation reads the ORIGINAL V, not the normalised key ---------
     # This is the substitution most likely to slip in unnoticed: using k instead of v keeps
     # the shapes and even the ballpark magnitude, and is simply the wrong operator.
-    if "acc_ub[i] = st[3] * acc_ub[i] + st[4] * af[i]" not in src:
+    # The weighted sum takes one of two legal forms. Both weight the ORIGINAL V; they differ
+    # only in whether the block contribution lands in the running accumulator directly (CN=1)
+    # or in the block accumulator u_b that is merged afterwards (CN>1).
+    online_form = "acc_ub[i] = st[3] * acc_ub[i] + st[4] * af[i]"
+    blocked_form = "u_ub[i] = u_ub[i] + st[9] * ua[i]"
+    if online_form in src:
+        aggregation = "online"
+    elif blocked_form in src:
+        aggregation = "blocked"
+    else:
+        aggregation = None
+    source_reader = ('af[i] = T.if_then_else(i < D, T.cast(v_ub[i], "float32"' in src
+                     or 'ua[i] = T.if_then_else(i < D, T.cast(v_ub[i], "float32"' in src)
+    if aggregation is None:
         failures.append(
-            "TWIN_WRONG_AGGREGATION: the weighted sum is not the emitted acc update; the "
-            "aggregation must weight the ORIGINAL V")
-    elif 'af[i] = T.if_then_else(i < D, T.cast(v_ub[i], "float32")' not in src:
+            "TWIN_WRONG_AGGREGATION: the weighted sum is neither the CN=1 acc update nor the "
+            "blocked u_b accumulation; the aggregation must weight the ORIGINAL V")
+    elif not source_reader:
         failures.append(
             "TWIN_AGGREGATION_NOT_ORIGINAL_V: the accumulator reads something other than the "
             "loaded original V, which would make this a different operator")
     else:
-        findings.append("the weighted sum consumes the ORIGINAL v_ub, not the normalised key")
+        findings.append(
+            "the weighted sum (%s form) consumes the ORIGINAL v_ub, not the normalised key"
+            % aggregation)
 
     # -- clause 4: the running state is FP32 --------------------------------------------
     for name in ("acc_ub", "st"):
@@ -403,6 +418,280 @@ def check_attnres_conformance(spec: AttentionResidualSpec,
     return ConformanceReport(
         kernel=spec.metadata.get("kernel", "attention_residual"),
         status=status,
+        findings=tuple(findings),
+        failures=tuple(failures),
+    )
+
+# ------------------------------------------------------------------ CN>1 families (G52)
+
+def build_attnres_twin_cn(spec: AttentionResidualSpec, *,
+                          function_name: str = "mixed_kernel") -> str:
+    """Emit the BLOCKED / RESIDENT kernel for spec, with the block-state two-pass form.
+
+    Emitted separately from the CN=1 twin on purpose: the CN=1 kernel has device evidence and is
+    the one G50 measured, so it must not be perturbed by a generalisation. This function is the
+    general one, and check_attnres_conformance_cn holds it to the block-state contract.
+    """
+    if spec.family not in FAMILIES:
+        raise AttentionResidualError(
+            "TWIN_UNKNOWN_FAMILY", "unknown family", "family", FAMILIES, spec.family)
+    if spec.launches != 1:
+        raise AttentionResidualError(
+            "TWIN_MULTIPLE_LAUNCHES", "exactly one logical launch is required", "launches", 1,
+            spec.launches)
+    cn = spec.block_n
+    nblk = spec.n_blocks()
+
+    add = []
+    a = add.append
+    a("# EXPLICIT attention_residual block-state kernel -- one logical launch.")
+    a("#")
+    a("# family = %s, CN = %d, so %d running-state update(s) per token group over N=%d."
+        % (spec.family, cn, nblk, spec.n))
+    a("# Each CN group is walked TWICE: pass 1 finds the block max m_b, pass 2 forms")
+    a("# l_b = sum_j exp(s_j - m_b) and u_b = sum_j exp(s_j - m_b) * V_j, and only then is the")
+    a("# block merged into the running state. The second pass RE-READS V; that cost is real and")
+    a("# is recorded rather than hidden.")
+    a("#")
+    a("# score_mode = %s" % spec.score_mode)
+    a("")
+    a("import math")
+    a("import tilelang")
+    a("import tilelang.ascend.language as T")
+    a("")
+    a("THREADS = 128")
+    a("")
+    a("")
+    a("def %s(N, M, D, P, dtype=%r, CN=%d):" % (function_name, spec.dtype, cn))
+    a("    PD = tilelang.next_power_of_2(D)")
+    a("    NB = (N + CN - 1) // CN")
+    a("    sqrt_d = math.sqrt(D)")
+    a("")
+    a("    @T.prim_func")
+    a("    def main(%s):" % _params(spec))
+    a("        with T.Kernel(P) as pid:")
+    a("            v_ub = T.alloc_shared((PD,), dtype)")
+    a("            x_ub = T.alloc_shared((PD,), dtype)")
+    a("            y_ub = T.alloc_shared((PD,), dtype)")
+    a("            acc_ub = T.alloc_shared((PD,), \"float32\")   # running u")
+    a("            u_ub = T.alloc_shared((PD,), \"float32\")     # block u_b")
+    a("            g_ub = T.alloc_shared((PD,), \"float32\")")
+    a("            w_ub = T.alloc_shared((PD,), \"float32\")")
+    a("            gw_ub = T.alloc_shared((PD,), \"float32\")   # factored_gw residency")
+    a("            st = T.alloc_shared((10,), \"float32\")  # 0 m 1 l 2 s 3 rho 4 bet 7 m_b 8 l_b 9 p")
+    a("            # persistent gamma/w residency, once per AIV")
+    a("            with T.SimtVF(threads=THREADS):")
+    a("                gf = T.alloc_fragment((PD,), \"float32\")")
+    a("                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                    gf[i] = T.if_then_else(i < D, T.cast(Gt[i], \"float32\"), T.float32(0))")
+    a("                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                    g_ub[i] = gf[i]")
+    a("            with T.SimtVF(threads=THREADS):")
+    a("                wf = T.alloc_fragment((PD,), \"float32\")")
+    a("                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                    wf[i] = T.if_then_else(i < D, T.cast(Wt[i], \"float32\"), T.float32(0))")
+    a("                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                    w_ub[i] = wf[i]")
+    a("            # factored_gw: gw = gamma*w materialised ONCE and reused by every group/block")
+    a("            with T.SimtVF(threads=THREADS):")
+    a("                gwf = T.alloc_fragment((PD,), \"float32\")")
+    a("                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                    gwf[i] = T.if_then_else(i < D, g_ub[i] * w_ub[i], T.float32(0))")
+    a("                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                    gw_ub[i] = gwf[i]")
+    a("            m = pid")
+    a("            if m < M:")
+    a("                T.copy(X[m * D:m * D + D], x_ub[0:D])")
+    a("                with T.SimtVF(threads=THREADS):")
+    a("                    for i in T.Parallel(1):")
+    a("                        st[0] = T.float32(-1e30)")
+    a("                    for i in T.Parallel(1):")
+    a("                        st[1] = T.float32(0)")
+    a("                    zf = T.alloc_fragment((PD,), \"float32\")")
+    a("                    for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                        zf[i] = T.float32(0)")
+    a("                    for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                        acc_ub[i] = zf[i]")
+    a("                for u in T.Pipelined(NB, num_stages=1):")
+    a("                    # ---- pass 1: block max m_b")
+    a("                    with T.SimtVF(threads=THREADS):")
+    a("                        for i in T.Parallel(1):")
+    a("                            st[7] = T.float32(-1e30)")
+    a("                    for j in range(CN):")
+    a("                        n = u * CN + j")
+    a("                        if n < N:")
+    a("                            T.copy(V[(n * M + m) * D:(n * M + m) * D + D], v_ub[0:D])")
+    a("                            with T.SimtVF(threads=THREADS):")
+    a("                                # RMS along D and the score along D, FP32, real-D denominator")
+    a("                                vf = T.alloc_fragment((PD,), \"float32\")")
+    a("                                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                                    vf[i] = T.if_then_else(i < D, T.cast(v_ub[i], \"float32\"), T.float32(0))")
+    a("                                sq = T.alloc_reducer((1,), \"float32\", op=\"sum\")")
+    a("                                T.reducer_init(sq)")
+    a("                                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                                    if i < D:")
+    a("                                        T.reducer_update(sq[0], vf[i] * vf[i])")
+    a("                                qs = T.alloc_fragment((1,), \"float32\")")
+    a("                                T.finalize_reducer(sq, qs)")
+    a("                                rms = T.alloc_fragment((1,), \"float32\")")
+    a("                                for i in T.Parallel(1):")
+    a("                                    rms[0] = T.sqrt(qs[0] / T.float32(D) + eps)")
+    a("                                dt = T.alloc_reducer((1,), \"float32\", op=\"sum\")")
+    a("                                T.reducer_init(dt)")
+    a("                                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                                    if i < D:")
+    a("                                        T.reducer_update(dt[0], (vf[i] / rms[0]) * g_ub[i] * w_ub[i])")
+    a("                                ds = T.alloc_fragment((1,), \"float32\")")
+    a("                                T.finalize_reducer(dt, ds)")
+    a("                                for i in T.Parallel(1):")
+    a("                                    st[2] = ds[0] / T.float32(sqrt_d)")
+    a("                                for i in T.Parallel(1):")
+    a("                                    st[7] = T.max(st[7], st[2])")
+    a("                    # ---- pass 2: block l_b and u_b at the exact m_b")
+    a("                    with T.SimtVF(threads=THREADS):")
+    a("                        for i in T.Parallel(1):")
+    a("                            st[8] = T.float32(0)")
+    a("                        uf = T.alloc_fragment((PD,), \"float32\")")
+    a("                        for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                            uf[i] = T.float32(0)")
+    a("                        for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                            u_ub[i] = uf[i]")
+    a("                    for j in range(CN):")
+    a("                        n = u * CN + j")
+    a("                        if n < N:")
+    a("                            T.copy(V[(n * M + m) * D:(n * M + m) * D + D], v_ub[0:D])")
+    a("                            with T.SimtVF(threads=THREADS):")
+    a("                                # RMS along D and the score along D, FP32, real-D denominator")
+    a("                                vf = T.alloc_fragment((PD,), \"float32\")")
+    a("                                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                                    vf[i] = T.if_then_else(i < D, T.cast(v_ub[i], \"float32\"), T.float32(0))")
+    a("                                sq = T.alloc_reducer((1,), \"float32\", op=\"sum\")")
+    a("                                T.reducer_init(sq)")
+    a("                                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                                    if i < D:")
+    a("                                        T.reducer_update(sq[0], vf[i] * vf[i])")
+    a("                                qs = T.alloc_fragment((1,), \"float32\")")
+    a("                                T.finalize_reducer(sq, qs)")
+    a("                                rms = T.alloc_fragment((1,), \"float32\")")
+    a("                                for i in T.Parallel(1):")
+    a("                                    rms[0] = T.sqrt(qs[0] / T.float32(D) + eps)")
+    a("                                dt = T.alloc_reducer((1,), \"float32\", op=\"sum\")")
+    a("                                T.reducer_init(dt)")
+    a("                                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                                    if i < D:")
+    a("                                        T.reducer_update(dt[0], (vf[i] / rms[0]) * g_ub[i] * w_ub[i])")
+    a("                                ds = T.alloc_fragment((1,), \"float32\")")
+    a("                                T.finalize_reducer(dt, ds)")
+    a("                                for i in T.Parallel(1):")
+    a("                                    st[2] = ds[0] / T.float32(sqrt_d)")
+    a("                                for i in T.Parallel(1):")
+    a("                                    st[9] = T.exp(st[2] - st[7])")
+    a("                                for i in T.Parallel(1):")
+    a("                                    st[8] = st[8] + st[9]")
+    a("                                ua = T.alloc_fragment((PD,), \"float32\")")
+    a("                                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                                    ua[i] = T.if_then_else(i < D, T.cast(v_ub[i], \"float32\"), T.float32(0))")
+    a("                                for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                                    if i < D:")
+    a("                                        u_ub[i] = u_ub[i] + st[9] * ua[i]")
+    a("                    # ---- cross-block merge")
+    a("                    #   nm = max(m, m_b); rho = exp(m-nm); bet = exp(m_b-nm)")
+    a("                    with T.SimtVF(threads=THREADS):")
+    a("                        nm = T.alloc_fragment((1,), \"float32\")")
+    a("                        rho = T.alloc_fragment((1,), \"float32\")")
+    a("                        bet = T.alloc_fragment((1,), \"float32\")")
+    a("                        for i in T.Parallel(1):")
+    a("                            nm[0] = T.max(st[0], st[7])")
+    a("                        for i in T.Parallel(1):")
+    a("                            rho[0] = T.exp(st[0] - nm[0])")
+    a("                        for i in T.Parallel(1):")
+    a("                            bet[0] = T.exp(st[7] - nm[0])")
+    a("                        for i in T.Parallel(1):")
+    a("                            st[1] = rho[0] * st[1] + bet[0] * st[8]")
+    a("                        for i in T.Parallel(1):")
+    a("                            st[0] = nm[0]")
+    a("                        for i in T.Parallel(1):")
+    a("                            st[3] = rho[0]")
+    a("                        for i in T.Parallel(1):")
+    a("                            st[4] = bet[0]")
+    a("                    with T.SimtVF(threads=THREADS):")
+    a("                        for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                            if i < D:")
+    a("                                acc_ub[i] = st[3] * acc_ub[i] + st[4] * u_ub[i]")
+    a("                with T.SimtVF(threads=THREADS):")
+    a("                    for i in T.Parallel(1):")
+    a("                        st[5] = T.float32(1) / st[1]")
+    a("                    for i in T.Parallel(1):")
+    a("                        st[6] = T.float32(1) - alpha")
+    a("                    yf = T.alloc_fragment((PD,), \"float32\")")
+    a("                    for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                        yf[i] = T.if_then_else(i < D, st[6] * T.cast(x_ub[i], \"float32\") + alpha * acc_ub[i] * st[5], T.float32(0))")
+    a("                    for i in T.Parallel(PD, coalesced_width=T.int32(1)):")
+    a("                        y_ub[i] = T.cast(yf[i], dtype)")
+    a("                T.copy(y_ub[0:D], Y[m * D:m * D + D])")
+    a("    return main")
+    a("")
+    return "\n".join(add)
+
+
+def check_attnres_conformance_cn(spec: AttentionResidualSpec, twin) -> ConformanceReport:
+    """Hold a block-state kernel to the CN contract, in addition to the base clauses."""
+    if not isinstance(twin, AttnResTwin):
+        twin = parse_attnres_twin(twin)
+    base = check_attnres_conformance(spec, twin)
+    findings = list(base.findings)
+    failures = list(base.failures)
+    src = twin.source
+    cn = spec.block_n
+
+    # The blocked form MUST declare the block state; without it the merge is undefined.
+    for name, label in (("st[7]", "block max m_b"), ("st[8]", "block sum l_b")):
+        if name not in src:
+            failures.append(
+                "TWIN_MISSING_BLOCK_STATE: %s (%s) is not present, so the cross-block merge "
+                "has nothing to merge" % (label, name))
+    if "u_ub" not in src:
+        failures.append(
+            "TWIN_MISSING_BLOCK_STATE: no separate block accumulator u_b, so the block "
+            "contribution would be folded into the running acc and the merge would be wrong")
+    else:
+        findings.append("block state m_b/l_b/u_b is present and separate from the running state")
+
+    # The merge coefficients must be the block-vs-running pair, not the block-vs-block pair.
+    if "st[0] = nm[0]" not in src:
+        failures.append(
+            "TWIN_MISSING_MERGE: the running max is not updated, so the merge is incomplete")
+    else:
+        findings.append("cross-block merge updates m, l and acc together")
+
+    # A CN>1 kernel that never re-reads V is not the blocked form -- it would have to hold the
+    # whole block, which is resident_n's cost, not blocked_online's.
+    # The emitted source uses a Python "for j in range(CN)" loop that unrolls at trace time, so
+    # there are exactly TWO V copy SITES regardless of CN. What must be true is that there are
+    # two (one per pass) AND each is inside a range(CN) loop, i.e. it covers the whole block.
+    copy_sites = src.count("T.copy(V[")
+    cn_loops = src.count("for j in range(CN):")
+    if cn > 1 and (copy_sites < 2 or cn_loops < 2):
+        failures.append(
+            "TWIN_MISSING_SECOND_PASS: CN=%d needs two V reads per element (pass 1 for the "
+            "block max, pass 2 for l_b/u_b), each inside a range(CN) loop; found %d copy "
+            "site(s) and %d range(CN) loop(s)" % (cn, copy_sites, cn_loops))
+    elif cn > 1:
+        findings.append(
+            "the block is walked twice (%d V copy sites inside %d range(CN) loops), so V is "
+            "re-read as the two-pass form requires" % (copy_sites, cn_loops))
+
+    # The declared family must match the CN the kernel is emitted with.
+    if ("CN=%d" % cn) not in src:
+        failures.append(
+            "TWIN_CN_MISMATCH: the emitted kernel does not carry the declared CN=%d" % cn)
+    else:
+        findings.append("emitted CN matches the declared CN=%d (%d state update(s))"
+                        % (cn, spec.state_updates()))
+
+    return ConformanceReport(
+        kernel=spec.metadata.get("kernel", "attention_residual"),
+        status=FAILED if failures else MATCHED,
         findings=tuple(findings),
         failures=tuple(failures),
     )
