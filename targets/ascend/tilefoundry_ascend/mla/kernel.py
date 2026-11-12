@@ -115,8 +115,19 @@ def _strides_bsnd(seq_q, heads_q, kv_heads, d, group):
 
 def build_mla_kernel(*, batch: int, seq_q: int, seq_kv: int, heads_q: int, heads_kv: int,
                      d_nope: int, d_rope: int, layout: str, dtype: str, scale: float,
-                     is_causal: bool, block_m: int, cores: int):
-    """Build the prim_func. Separated from compile so it can be inspected without a device."""
+                     is_causal: bool, block_m: int, cores: int,
+                     shard_count: int = 1):
+    """Build the prim_func. Separated from compile so it can be inspected without a device.
+
+    COLUMN SHARDING (P6-03/G62). shard_lo/shard_hi restrict this program to an output-column
+    range, and shard_count multiplies the job grid. Each program still computes the FULL softmax
+    -- it repeats QK and softmax -- and writes only its own columns, so there is no cross-program
+    merge and no GM probability matrix. With the defaults (0, D, 1) the kernel is exactly the
+    unsharded canonical variant.
+    """
+    if shard_count < 1:
+        raise MLAError("MLA_BAD_SHARD_COUNT", "shard_count must be >= 1", "shard_count",
+                       ">= 1", shard_count)
     spec = build_mla(batch=batch, seq_q=seq_q, seq_kv=seq_kv, heads_q=heads_q,
                      heads_kv=heads_kv, d_nope=d_nope, d_rope=d_rope, layout=layout,
                      dtype=dtype, is_causal=is_causal)
@@ -126,6 +137,24 @@ def build_mla_kernel(*, batch: int, seq_q: int, seq_kv: int, heads_q: int, heads
 
     D, R = d_nope, d_rope
     BK, DV = panels(d_nope)
+    # The PV path walks output columns in panels, so a shard width must be a whole number of them.
+    # 448 is 7 panels of 64 but NOT 3 of 128 (149.67), so a 128-wide shard over a 448 model is
+    # refused rather than silently padded or truncated -- a padded column would be written by
+    # nobody and a truncated one would be written by nobody either, and both look like a working
+    # kernel that returns wrong numbers in a few columns.
+    # EVERY SHARD GETS THE SAME NUMBER OF PV PANELS. The shard index varies at RUNTIME inside the
+    # job loop (that is what makes this one launch instead of one launch per shard), so the shard
+    # width has to be a compile-time constant and the per-shard panel count must be equal. An
+    # uneven split would need per-shard loop bounds computed at runtime, which is exactly the kind
+    # of dynamic control flow this pipeline cannot carry.
+    panels_total = D // DV
+    if panels_total % shard_count:
+        raise MLAError("MLA_BAD_SHARD_WIDTH",
+                       "shard count must divide the PV panel count so every shard owns an equal "
+                       "number of panels", "shard_count", "divisor of %d" % panels_total,
+                       shard_count)
+    PANELS_PER_SHARD = panels_total // shard_count
+    DO = PANELS_PER_SHARD * DV
     # The panels must tile D exactly. Checked because the failure mode is silent: a short
     # tiling computes fewer columns and returns a plausible wrong number.
     if D % BK or D % DV:
@@ -136,7 +165,9 @@ def build_mla_kernel(*, batch: int, seq_q: int, seq_kv: int, heads_q: int, heads
     bsnd = layout == BSND
     BM = block_m
     GROUPS_PER_POS = group // BM
-    jobs = batch * heads_kv * seq_q * GROUPS_PER_POS
+    # The column-shard axis is the LEAST-significant job axis, so the shards of one row tile land
+    # on adjacent programs and reach the same K tiles at roughly the same time.
+    jobs = batch * heads_kv * seq_q * GROUPS_PER_POS * shard_count
     cores = max(1, min(cores, jobs))
 
     # Row-major strides of the four-dimensional public tensors, re-viewed as
@@ -169,18 +200,26 @@ def build_mla_kernel(*, batch: int, seq_q: int, seq_kv: int, heads_q: int, heads
             su = T.alloc_shared((HALF, BN), "float32")
             pu = T.alloc_shared((HALF, BN), dtype)
             tmp = T.alloc_shared((HALF, DV), "float32")
-            out = T.alloc_shared((HALF, D), "float32")
-            out16 = T.alloc_shared((HALF, D), dtype)
+            # Sized to THIS shard, not to D: a shard owns DO columns and never touches the rest.
+            out = T.alloc_shared((HALF, DO), "float32")
+            out16 = T.alloc_shared((HALF, DO), dtype)
             m = T.alloc_shared((64,), "float32")
             l = T.alloc_shared((64,), "float32")
             alpha = T.alloc_shared((64,), "float32")
             T.annotate_buffer_versions({k: 2, kr: 2, out: 1, m: 1, l: 1, alpha: 1})
 
             for job in T.serial(bx, jobs, cores):
-                hm = (job % GROUPS_PER_POS) * BM
-                sq = (job // GROUPS_PER_POS) % seq_q
-                h = (job // GROUPS_PER_POS // seq_q) % heads_kv
-                bb = job // GROUPS_PER_POS // seq_q // heads_kv
+                # The column-shard axis is the LEAST-significant job axis, so the shards of one
+                # row tile land on adjacent programs and reach the same K tiles at roughly the
+                # same time instead of reading them from opposite ends of the grid.
+                sh = job % shard_count if shard_count > 1 else 0
+                rest = job // shard_count if shard_count > 1 else job
+                hm = (rest % GROUPS_PER_POS) * BM
+                sq = (rest // GROUPS_PER_POS) % seq_q
+                h = (rest // GROUPS_PER_POS // seq_q) % heads_kv
+                bb = rest // GROUPS_PER_POS // seq_q // heads_kv
+                # This program's output columns, derived from the runtime shard index.
+                col0 = sh * DO
                 T.copy(QN[bb, h, sq, hm:hm + BM, 0:D], q)
                 T.copy(QR[bb, h, sq, hm:hm + BM, 0:R], qr)
                 with T.SimdVF():
@@ -190,7 +229,7 @@ def build_mla_kernel(*, batch: int, seq_q: int, seq_kv: int, heads_q: int, heads
                     S.vsts(m[0], neg, mask)
                     S.vsts(l[0], zero, mask)
                     for i in range(HALF):
-                        for j in range(D // 64):
+                        for j in range(DO // 64):
                             S.vsts(out[i, j * 64], zero, mask)
                 for t in T.Pipelined(seq_kv // BN, num_stages=2,
                                      annotations={"enable_offset": True}):
@@ -256,11 +295,15 @@ def build_mla_kernel(*, batch: int, seq_q: int, seq_kv: int, heads_q: int, heads
                                 full3 = S.pset(32, "PAT_ALL")
                                 for i in range(HALF):
                                     a3 = S.vld(alpha[i], "BRC_B32")
-                                    for j in range(D // 64):
+                                    for j in range(DO // 64):
                                         S.vsts(out[i, j * 64],
                                                S.vmul(S.vld(out[i, j * 64]), a3, full3),
                                                full3)
-                            for dc in T.serial(D // DV):
+                            # ONLY THIS SHARD'S PANELS. The loop still reads the full K tile
+                            # through the QK above, which is the duplicated work sharding pays
+                            # for; PV itself is partitioned, not repeated.
+                            for dp in T.serial(PANELS_PER_SHARD):
+                                dc = col0 // DV + dp
                                 T.copy(p, pa)
                                 T.copy(k[0:BN, dc * DV:(dc + 1) * DV], vb, transpose=True)
                                 T.gemm(pa, vb, pv, transpose_B=True, clear_accum=True)
@@ -269,8 +312,8 @@ def build_mla_kernel(*, batch: int, seq_q: int, seq_kv: int, heads_q: int, heads
                                     full4 = S.pset(32, "PAT_ALL")
                                     for i in range(HALF):
                                         for j in range(DV // 64):
-                                            S.vsts(out[i, dc * DV + j * 64],
-                                                   S.vadd(S.vld(out[i, dc * DV + j * 64]),
+                                            S.vsts(out[i, dp * DV + j * 64],
+                                                   S.vadd(S.vld(out[i, dp * DV + j * 64]),
                                                           S.vld(tmp[i, j * 64]), full4),
                                                    full4)
                 with T.SimdVF():
@@ -280,11 +323,13 @@ def build_mla_kernel(*, batch: int, seq_q: int, seq_kv: int, heads_q: int, heads
                     for i in range(HALF):
                         denom = S.vld(l[i], "BRC_B32")
                         inv = S.vdiv(ones, denom, full5)
-                        for j in range(D // 64):
+                        for j in range(DO // 64):
                             value = S.vmul(S.vld(out[i, j * 64]), inv, full5)
                             S.vsts(out16[i, j * 64], S.vcvt(value, dtype, narrow5),
                                    narrow5, "PK_B32")
-                T.dual_copy(out16, OUT[bb, h, sq, hm:hm + BM, 0:D])
+                # Only the shard's columns are written. Ranges from different programs are
+                # disjoint and cover [0, D), so the output is complete without any merge.
+                T.dual_copy(out16, OUT[bb, h, sq, hm:hm + BM, col0:col0 + DO])
 
     return main, spec, cores, jobs
 
@@ -306,7 +351,7 @@ def _k_strides(seq_kv, kv_heads, d, bsnd):
 
 
 def mla(q_nope, q_rope, k_nope, k_rope, v, numKVHeads=1, scaleValue=-1.0,
-        inputLayout=BSND, is_causal=False):
+        inputLayout=BSND, is_causal=False, columnShards=1):
     """The public MLA entry point, matching the golden signature.
 
     `v` is accepted for ABI compatibility and deliberately NOT read: the operator value contract
@@ -316,6 +361,12 @@ def mla(q_nope, q_rope, k_nope, k_rope, v, numKVHeads=1, scaleValue=-1.0,
     if inputLayout not in (BSND, "BNSD"):
         raise MLAError("MLA_BAD_LAYOUT", "layout must be BSND or BNSD", "inputLayout",
                        (BSND, "BNSD"), inputLayout)
+    # Validated here rather than only inside the builder so a caller gets the reason before any
+    # compile is attempted. Sharding repeats QK and softmax per shard, so it is an occupancy
+    # trade, not a free win -- the default 1 keeps the canonical variant.
+    if columnShards < 1:
+        raise MLAError("MLA_BAD_SHARD_COUNT", "columnShards must be >= 1", "columnShards",
+                       ">= 1", columnShards)
     for name, tensor in (("q_nope", q_nope), ("q_rope", q_rope),
                          ("k_nope", k_nope), ("k_rope", k_rope)):
         if not tensor.is_contiguous():
@@ -348,12 +399,13 @@ def mla(q_nope, q_rope, k_nope, k_rope, v, numKVHeads=1, scaleValue=-1.0,
     # from the wrong addresses. The error was loud only by luck; a stride set that happened to be
     # compatible would have produced a plausible wrong answer.
     key = (batch, seq_q, seq_kv, heads_q, numKVHeads, d_nope, d_rope, dtype,
-           bool(is_causal), block_m, cores, round(spec.scale, 12), bsnd)
+           bool(is_causal), block_m, cores, round(spec.scale, 12), bsnd, columnShards)
     if key not in _COMPILED:
         func, _, _, _ = build_mla_kernel(
             batch=batch, seq_q=seq_q, seq_kv=seq_kv, heads_q=heads_q, heads_kv=numKVHeads,
             d_nope=d_nope, d_rope=d_rope, layout=inputLayout, dtype=dtype,
-            scale=spec.scale, is_causal=bool(is_causal), block_m=block_m, cores=cores)
+            scale=spec.scale, is_causal=bool(is_causal), block_m=block_m, cores=cores,
+            shard_count=columnShards)
         _COMPILED[key] = tilelang.compile(func, target="ascend", out_idx=None)
 
     out = torch.empty_like(q_nope)

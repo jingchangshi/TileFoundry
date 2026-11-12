@@ -1,0 +1,84 @@
+{
+  "gate": "G63",
+  "task": "P6-04",
+  "status": "VERIFIED",
+  "deliverable": "MLA closure beyond the official 20 cases: Nkv>1 GQA (which NONE of the official cases exercise), explicit scale, KV tail, causal last-partial-tile, short-KV single-block, and column sharding on GQA and decode. Plus the 20-case result carried from G60/G62.",
+  "official_20_case_sweep": {
+    "passed": 20,
+    "total": 20,
+    "comparator": "original cannbench_contract.Harness + npu_compare.compare_case_result, original thresholds, warm fp64 oracle cache",
+    "re_run_after_sharding": true
+  },
+  "coverage_gap_found_in_the_official_set": {
+    "statement": "The official 20 cases use ONLY Nkv=1, with G in {32, 64, 128}. Computed from fixtures/mla/cases.yaml, not assumed.",
+    "consequence": "GQA with more than one KV head is completely untested by the official set, so a kernel could pass 20/20 and still mis-map heads the moment Nkv > 1. That is why the GQA cases below exist."
+  },
+  "extended_cases": {
+    "reference_agreement": "every extended case is BIT-IDENTICAL to the working reference (ref=0.00e+00) and within the original golden threshold",
+    "gqa_nkv_gt_1": [
+      {
+        "case": "Nkv=2 G=32 prefill causal",
+        "ref": 0,
+        "golden": 0.00578,
+        "verdict": "PASS"
+      },
+      {
+        "case": "Nkv=4 G=32 prefill causal",
+        "ref": 0,
+        "golden": 0.00592,
+        "verdict": "PASS"
+      },
+      {
+        "case": "Nkv=4 G=32 BNSD causal",
+        "ref": 0,
+        "golden": 0.00529,
+        "verdict": "PASS"
+      },
+      {
+        "case": "Nkv=2 G=32 non-causal",
+        "ref": 0,
+        "golden": 0.00407,
+        "verdict": "PASS"
+      },
+      {
+        "case": "Nkv=8 G=32 decode S=1 Skv=2048",
+        "ref": 0,
+        "golden": 0.00352,
+        "verdict": "PASS"
+      },
+      {
+        "case": "Nkv=4 G=32 D_nope=448 causal",
+        "ref": 0,
+        "golden": 0.00524,
+        "verdict": "PASS"
+      }
+    ],
+    "explicit_scale": "scaleValue 0.125 / 0.0625 / 1.0 / 0.042 all PASS; the official set only ever uses -1, so an explicit scale was untested",
+    "kv_tail": "Skv 128/256/384/640/896 all PASS, including a single KV block",
+    "causal_tail": "S=1 Skv=4096, S=2 Skv=2048, S=3 Skv=640, S=33 Skv=384, S=32 Skv=128 all PASS",
+    "sharding_on_gqa_and_decode": "columnShards 2 and 4 give BIT-IDENTICAL output to unsharded on Nkv=4 GQA and on S=1 Skv=2048 decode"
+  },
+  "domain_limits_stated_as_errors": {
+    "seq_kv_multiple_of_128": "the KV loop advances one 128-position block per pipelined iteration; this is a real limit of the implemented SIMD packing path, not a tunable",
+    "group_at_least_32": "the query tile is 32 or 64 rows, so G=16 is refused with MLA_BAD_TILE rather than tiled illegally",
+    "d_rope_equals_64": "the rope GEMM is one 64-wide panel",
+    "d_nope_multiple_of_64": "the nope GEMM accumulates in 64-wide panels",
+    "note": "Each is refused LOUDLY. The alternative -- silently tiling an unsupported shape -- would return plausible wrong numbers."
+  },
+  "v_equals_k_nope_is_a_value_contract": {
+    "statement": "The kernel reads the K_nope tile and uses it as V. No assumption is made about pointer aliasing, and the v argument is deliberately not read.",
+    "why_it_is_safe": "V_j == K_nope_j is the operator value contract, and K_nope is already resident when PV runs, so re-reading it would double GM traffic for no gain.",
+    "lifetime": "the K_nope slot is not released until the final PV completes"
+  },
+  "my_own_test_bugs_recorded": [
+    "Six GQA cases first reported failure with MLA_KV_NOT_MULTIPLE_OF_128. Cause: MY test passed Skv=64, which is not a multiple of 128. The kernel was right to refuse it and the error message named the reason; I had written inputs outside the stated domain.",
+    "An earlier GQA batch failed with MLA_BAD_TILE because I chose G=16, below the 32-row query tile. Also my input, also correctly refused.",
+    "Both classes were fixed by computing the legal domain from cases.yaml and the kernel own checks rather than inventing shapes."
+  ],
+  "not_claimed": [
+    "No performance claim. No cycle timings, no comparison against any baseline.",
+    "The extended cases do NOT substitute for the official 20; they complement it.",
+    "Uneven column-shard widths are unsupported by design and not assessed.",
+    "Numerical agreement is not a formal proof over all inputs, and no physical synchronisation equivalence is asserted."
+  ]
+}
