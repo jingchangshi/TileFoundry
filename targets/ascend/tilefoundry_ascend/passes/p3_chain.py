@@ -7,8 +7,6 @@ and ABI conformance path exists, export is explicitly NOT_IMPLEMENTED.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass, replace
 
 from tilefoundry.ir.core.module import Module
@@ -17,6 +15,7 @@ from tilefoundry.passes.pass_base import ModulePass
 from tilefoundry.passes.pass_manager import PassPoint, register_pass
 
 from ..codegen import PASS_CONFIGS, NativeArtifact
+from ..plan.identity import function_identity, module_identity
 from ..plan.mainline import MainlineNotImplemented, SINGLE_TRANSACTION, compile_mainline
 from ..tf_target import Ascend950PRTarget
 
@@ -47,34 +46,21 @@ class ExportRefusal(RuntimeError):
         super().__init__("%s: %s" % (code, detail))
 
 
-def _describe(node):
-    if node is None or isinstance(node, (bool, int, float, str)):
-        return node
-    if isinstance(node, (list, tuple)):
-        return [_describe(item) for item in node]
-    fields = getattr(node, "__dataclass_fields__", None)
-    if fields:
-        return {"kind": type(node).__name__,
-                **{name: _describe(getattr(node, name, None)) for name in fields}}
-    return {"kind": type(node).__name__, "name": getattr(node, "name", None)}
-
-
 def _function_identity(function) -> str:
-    payload = {
-        "name": getattr(function, "name", None),
-        "params": _describe(getattr(function, "params", ())),
-        "body": _describe(getattr(function, "body", None)),
-        "output_count": getattr(function, "output_count", None),
-        "target": _describe(getattr(function, "target", None)),
-    }
-    text = json.dumps(payload, sort_keys=True, default=str)
-    return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+    """Identity of the ACTUAL function, including non-dataclass Op attributes.
+
+    A name/kind digest is not an identity: a Vadds(value=1.0) and a
+    Vadds(value=7.0) would collide, as would Vcvt(part=0)/Vcvt(part=1). The
+    program content lives in each Op's published attribute parameters and in the
+    binder its Var references resolve to, both of which the shared identity walk
+    reads (see plan/identity.py).
+    """
+    return function_identity(function)
 
 
 def ir_identity(module: Module) -> str:
-    payload = [_function_identity(function) for function in getattr(module, "functions", ()) or ()]
-    text = json.dumps(payload, sort_keys=True)
-    return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+    """Identity over every actual function of the module."""
+    return module_identity(module)
 
 
 def _entry_prim(module: Module):
