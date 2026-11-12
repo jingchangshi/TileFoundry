@@ -301,9 +301,12 @@ def build_mla_module(spec: MLASpec) -> Module:
     ))
     mesh = Mesh((Topology("aiv", 1),), Layout((1,)), ("core",))
     scoped = MeshScope(mesh, Var("core", type=mesh), body)
+    # ABI ORDER. output_count counts TRAILING parameters, so out must be LAST. The old
+    # (.., v, out, job_count, kv_blocks) order made the callable contract treat kv_blocks
+    # as the output tensor and out as an input.
     function = PrimFunction(
         "mla",
-        (q_nope, q_rope, k_nope, k_rope, v, out, job_count, kv_blocks),
+        (q_nope, q_rope, k_nope, k_rope, v, job_count, kv_blocks, out),
         Sequential((scoped,)),
         output_count=1,
         target=target,

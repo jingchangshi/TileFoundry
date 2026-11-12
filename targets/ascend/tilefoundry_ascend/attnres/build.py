@@ -240,9 +240,13 @@ def build_attnres_module(spec: AttnResSpec) -> Module:
     ))
     mesh = Mesh((Topology("aiv", 1),), Layout((1,)), ("core",))
     scoped = MeshScope(mesh, Var("core", type=mesh), body)
+    # ABI ORDER. PrimFunction.output_count counts TRAILING parameters, so the output
+    # y must be the LAST parameter. Keeping (x, v, y, m_extent, n_extent) would have made
+    # the callable contract read y as an input and N_extent as the output: the caller would
+    # pass a scalar where a GM tensor is expected and the store target would be a scalar.
     function = PrimFunction(
         "attention_residual",
-        (x, v, y, m_extent, n_extent),
+        (x, v, m_extent, n_extent, y),
         Sequential((scoped,)),
         output_count=1,
         target=target,
