@@ -199,7 +199,7 @@ def program_facts(function) -> ProgramFacts:
 
 
 def verify_scheduled_tir(module, plan, *, placement=None, completion=None,
-                         require_drain=True) -> ScheduledVerdict:
+                         require_drain=True, original_tir=None) -> ScheduledVerdict:
     """Judge the FINAL TIR against target facts and the plan's DECLARED structure."""
     diagnostics = []
 
@@ -311,7 +311,7 @@ def verify_scheduled_tir(module, plan, *, placement=None, completion=None,
     # 5. Addresses: when a placement is supplied, the access views in the final TIR must point
     #    where the placement says for the instance they belong to.
     if placement is not None:
-        address_report = _verify_addresses(function, plan, placement)
+        address_report = _verify_addresses(function, plan, placement, original_tir=original_tir)
         if address_report is not None:
             address_report.facts = facts
             return address_report
@@ -498,7 +498,7 @@ def _verify_order(facts):
     return None
 
 
-def _verify_addresses(function, plan, placement):
+def _verify_addresses(function, plan, placement, *, original_tir=None):
     """Each access view in the FINAL TIR must point at an address the placement allotted it.
 
     The plan carries a base offset per buffer, and the TIR carries the byte offset actually
@@ -552,6 +552,50 @@ def _verify_addresses(function, plan, placement):
             STATUS_FAILED, CODE_ADDRESS_WRONG,
             "the final TIR contains no addressed access views, so no address could be checked",
             expected="at least one addressed access", actual=checked)
+    # Materialized bindings are source Var names plus the explicit instance suffix.
+    # Recover expectations from actual source operands and the authoritative access
+    # placement, rather than accepting mutually consistent but uniformly wrong Lets.
+    expected_bindings = {}
+    original = original_tir if original_tir is not None else getattr(function, "_p3_pre_materialize", None)
+    if original is not None:
+        from .materialize import index_statements_ledger, lookup_statement, _operand_index, _view, _access_env
+        from tilefoundry.ir.core import Var
+        from tilefoundry.ir.types.storage import StorageKind
+        statements = index_statements_ledger(original)
+        domain = plan.loop.domain
+        for k, i in enumerate(range(domain["start"], domain["stop"], domain["step"])):
+            env = {"i": i, "k": k, "slot": 0}
+            for access in plan.accesses:
+                statement = lookup_statement(statements, access.source_stmt)
+                if statement is None:
+                    continue
+                operand = statement.args[_operand_index(access)]
+                if isinstance(operand, Var) and operand.type.storage == StorageKind.SMEM:
+                    view = _view(access, plan, _access_env(access, plan, env, k))
+                    expected_bindings["%s__k%d" % (operand.name, k)] = view.args[0].value
+    let_offsets = {}
+    def visit(node):
+        if type(node).__name__ == "LetStmt" and getattr(getattr(node.var, "type", None), "storage", None) is not None and node.var.type.storage.name == "SMEM":
+            value = getattr(node, "value", None)
+            args = getattr(value, "args", ())
+            if args and isinstance(args[0], Constant) and isinstance(args[0].value, int):
+                name = node.var.name
+                previous = let_offsets.get(name)
+                if previous is not None and previous != args[0].value:
+                    let_offsets[name] = "CONFLICT"
+                else:
+                    let_offsets[name] = args[0].value
+    _walk(function, visit)
+    for name, expected in expected_bindings.items():
+        if name not in let_offsets or let_offsets[name] != expected:
+            return ScheduledVerdict(
+                STATUS_FAILED, CODE_ADDRESS_WRONG,
+                "materialized SMEM binding disagrees with its planned operand address",
+                expected=expected, actual=let_offsets.get(name))
+    if "CONFLICT" in let_offsets.values():
+        return ScheduledVerdict(
+            STATUS_FAILED, CODE_ADDRESS_WRONG,
+            "a logical SMEM binding resolves to conflicting physical offsets")
     return None
 
 

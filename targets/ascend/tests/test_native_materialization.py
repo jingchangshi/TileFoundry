@@ -45,6 +45,25 @@ def test_each_materialized_instance_uses_its_own_gm_input_slice():
     assert input_offsets(native_module()) == [0, 64, 128, 192]
 
 
+def test_output_copy_and_all_store_bindings_use_the_planned_result():
+    from tilefoundry_ascend.plan.scheduled_verify import verify_scheduled_tir
+    module = native_module()
+    plan = module.metadata["ascend.p3_plan"]
+    assert any("/copy:0" in a.action_id and a.mode == "read" for a in plan.accesses)
+    stores = [n for n in index_statements_ledger(module.entry_function()).values()
+              if type(n).__name__ == "LetStmt" and n.var.name.startswith("stored__")]
+    assert stores and all(n.value.args[0].value == 512 for n in stores)
+    for store in stores:
+        store.value = replace(store.value, args=(replace(store.value.args[0], value=0),))
+    verdict = verify_scheduled_tir(
+        module.entry_function(), plan,
+        placement=module.metadata["ascend.p3_storage"].placement,
+        completion=module.metadata["ascend.p3_completion"],
+        original_tir=module.metadata["ascend.p3_pre_completion"])
+    assert verdict.status == "FAILED"
+    assert verdict.code == "STIR_ADDRESS_WRONG"
+
+
 def test_guard_substitution_and_nested_control_refusal():
     from tilefoundry.ir.core import Constant
     from tilefoundry.ir.tir.stmts import If, While, Sequential

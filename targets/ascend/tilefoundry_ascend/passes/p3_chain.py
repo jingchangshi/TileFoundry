@@ -1092,7 +1092,7 @@ def _transfer_contract(problem, task, isa_key_fn, ISA):
         if ((READ_EFFECT, want_src) in spaces and (WRITE_EFFECT, want_dst) in spaces
                 and contract.latency_model is not None
                 and contract.ii_model is not None
-                and contract.resource == transfer.resource):
+                and contract.resource == transfer.resource.split(".")[-1]):
             return contract
     return None
 

@@ -893,7 +893,9 @@ def _rw_rewrite_body(node, path, groups, statements, plan, env, rename=None, fps
                 out.append(stmt)
             elif isinstance(child, LetStmt):
                 fresh = Var(name="%s__k%d" % (child.var.name, env["k"]), type=child.var.type)
-                out.append(LetStmt(var=fresh, value=_rw_subst_expr(child.value, local)))
+                physical = env.get("physical_bindings", {}).get(child.var.name)
+                value = physical if physical is not None else _rw_subst_expr(child.value, local)
+                out.append(LetStmt(var=fresh, value=value))
                 local[child.var.name] = fresh
             elif isinstance(child, Evaluate):
                 out.append(dataclasses.replace(child, args=tuple(_rw_subst_expr(a, local) for a in child.args)))
@@ -995,6 +997,19 @@ def materialize_instruction_plan_v2(tir_module, plan: ResolvedPlan, *, sidecar_o
         iteration = start + k * step
         env = {"i": iteration, "k": k, "slot": 0}
         fps = {}
+        physical = {}
+        for path, accesses in groups.items():
+            original_stmt = lookup_statement(statements, path)
+            for access in accesses:
+                operand = original_stmt.args[_operand_index(access)]
+                if isinstance(operand, Var) and operand.type.storage == StorageKind.SMEM:
+                    view = _view(access, plan, _access_env(access, plan, env, k))
+                    previous = physical.get(operand.name)
+                    if previous is not None and fingerprint(previous) != fingerprint(view):
+                        raise PlanError("PLAN_MATERIALIZATION_UNSUPPORTED",
+                                        "one binding maps to conflicting physical views", operand.name)
+                    physical[operand.name] = view
+        env["physical_bindings"] = physical
         induction = {loop_stmt.induction_var.name:
                      Constant(type=loop_stmt.induction_var.type, value=iteration)}
         blocks.append(_rw_rewrite_body(loop_stmt.body, prefix, groups, statements, plan, env, induction, fps))
