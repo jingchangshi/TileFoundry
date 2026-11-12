@@ -109,17 +109,25 @@ class Budget:
     tie_noise_fraction: float = 0.02
 
     def __post_init__(self):
+        for name in ("seed_candidates_max", "neighbor_candidates_max", "advanced_candidates_max"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise HarnessError("BUDGET_BAD_COUNT", "%s must be a nonnegative integer" % name)
+        for name in ("solver_timeout_ms", "candidate_compile_deadline_s", "case_search_deadline_s"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0:
+                raise HarnessError("BUDGET_BAD_DEADLINE", "%s must be finite and positive" % name)
         if self.max_candidates_per_case < 1:
             raise HarnessError("BUDGET_BAD_TOTAL", "the per-case cap must be positive",
                                "max_candidates_per_case", ">= 1", self.max_candidates_per_case)
-        if self.seed_candidates_max + self.neighbor_candidates_max > \
-                self.max_candidates_per_case:
+        if (self.seed_candidates_max + self.neighbor_candidates_max +
+                self.advanced_candidates_max) > self.max_candidates_per_case:
             raise HarnessError(
-                "BUDGET_SEED_PLUS_NEIGHBOR_OVER_CAP",
-                "seeds plus neighbours may not exceed the per-case cap; the cap is a budget, not "
-                "a suggestion", "seeds+neighbors",
-                "<= %d" % self.max_candidates_per_case,
-                self.seed_candidates_max + self.neighbor_candidates_max)
+                "BUDGET_ORIGINS_OVER_CAP",
+                "seeds plus neighbours plus advanced may not exceed the per-case cap",
+                "seeds+neighbors+advanced", "<= %d" % self.max_candidates_per_case,
+                self.seed_candidates_max + self.neighbor_candidates_max +
+                self.advanced_candidates_max)
         if self.advanced_candidates_max > self.max_candidates_per_case:
             raise HarnessError("BUDGET_ADVANCED_OVER_CAP",
                                "advanced candidates may not exceed the per-case cap",
@@ -726,8 +734,14 @@ def search_case(*, case_label: str, operator: str, seeds: Sequence, advanced: Se
                            "max_candidates", ">= 1", budget.max_candidates)
     results = []
     seen = set()
+    expires = time.monotonic() + budget.deadline_s
+    deadline_exhausted = False
 
     def admit(candidate, origin_label):
+        nonlocal deadline_exhausted
+        if time.monotonic() >= expires:
+            deadline_exhausted = True
+            return False
         key = candidate.key()
         if key in seen:
             return False
@@ -782,6 +796,8 @@ def search_case(*, case_label: str, operator: str, seeds: Sequence, advanced: Se
     if len(results) >= budget.max_candidates:
         stop_reason += ("; stopped at the per-case candidate cap of %d"
                         % budget.max_candidates)
+    if deadline_exhausted or time.monotonic() >= expires:
+        stop_reason += "; stopped at the per-case wall deadline"
     ranking = rank(results, budget=search_budget)
     return SearchRound(case_label=case_label, operator=operator, budget=budget,
                        results=tuple(results), ranking=ranking, rounds=rounds,
