@@ -37,5 +37,5 @@
     "bind/invoke/readback public generic runtime paths remain explicitly unimplemented",
     "Logs are transcribed extracts; full native output in session tool records"
   ],
-  "next": "Diagnose own historical device container mappings read-only, then explicitly authorized locked device run once environment is available."
+  "next": "Existing user authorization covers normal locked device execution; no new user confirmation is required. Continue once the environment is ready and Lead resumes this task. Diagnose initialization failure read-only first; never reset a suspected hung device."
 }
