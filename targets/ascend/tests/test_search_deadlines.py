@@ -1,4 +1,6 @@
 """Real worker deadlines, independent of NPU timing evidence."""
+import os
+from pathlib import Path
 import sys
 import time
 
@@ -37,6 +39,27 @@ def test_worker_timeout_interrupts_instead_of_waiting_for_return(tmp_path):
     assert result.timed_out
     assert result.elapsed_seconds < 3
     assert (tmp_path / "timeout.log").read_text() == "started\n"
+
+
+def test_timeout_kills_child_even_when_group_leader_exits_on_term(tmp_path):
+    child_pid = tmp_path / "child.pid"
+    child_code = ("import os,signal,time; from pathlib import Path; "
+                  "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                  "Path(%r).write_text(str(os.getpid())); time.sleep(30)" % str(child_pid))
+    parent_code = ("import subprocess,sys,time; "
+                   "subprocess.Popen([sys.executable, '-c', %r]); time.sleep(30)" % child_code)
+    result = run_process([sys.executable, "-c", parent_code], stage="compile",
+                         timeout_s=0.5, log_path=tmp_path / "child.log")
+    assert result.timed_out
+    pid = int(child_pid.read_text())
+    # An orphan may remain as a zombie until init reaps it, but cannot execute.
+    state_file = Path("/proc/%d/stat" % pid)
+    for _ in range(100):
+        if not state_file.exists() or state_file.read_text().split()[2] == "Z":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("compiler child survived the worker deadline")
 
 
 def test_worker_failure_retains_native_log(tmp_path):

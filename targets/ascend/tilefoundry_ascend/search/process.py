@@ -76,6 +76,10 @@ def run_process(command, *, stage, timeout_s, log_path, deadline=None, cwd=None,
             try:
                 process.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
+                pass
+            finally:
+                # The leader may have exited while a compiler child ignored TERM.
+                # Kill the owned group even when wait() already reaped the leader.
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
