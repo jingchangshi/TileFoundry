@@ -236,3 +236,25 @@ explorer-g1 自曝并经 Lead 核源文件确认：supplemental 4 条在 registr
 裁定 **升 v2**：cases[] 新增 `source_key`（逐字拷贝源文件 key，40 条也加）、`source_case_id`、`source_file`。这样校验器**不需要任何改名规则**，可直接断言 source_key/source_case_id 集合与源文件相等。保留 v1 的 sha256 与 mtime 一行作为历史（883117e），draft 仍 true、时间戳标注 v2。
 裁定理由（属方法账）：把登记物缺陷转嫁给校验器，等于让一条不可验证的私有改名规则成为中间层——它错时要么安静放行要么误杀，而它已经误杀过一次（4/4 假红）。这是同一错误形状的第 N 次出现：**自造值 + 下游规则**。
 另一条采纳：**同一契约的不同实现，漏检结论不能跨实现搬运**（一位探索者报『删一条 case 全绿』，另一实现已被分布检查偶然抓住）。但『偶然抓住』仍要补显式断言，使失败信息指向真因。
+
+## R33 Lead 撤回一条裁定：纯搬运 kernel 是真实程序形状（register budget 正例改道）
+起因：flex-4-g3 诚实报告 task-50 拿不到'可用寄存器数量'的真实数字，并指出真来源可能是编译期 JITKernel.n_regs。我核实并作出两处更正：
+1) **编译期资源采集在此 build 的 ascend 上不存在**：tilelang/jit/kernel.py:264 `capture_hip_resource_usage = is_hip_target(target)` —— 只有 HIP 目标接资源采集。故 AIBIN_PROBE 的 n_regs/n_spills=None 不是暂缺，而是该 build 不提供。
+2) **我撤回'不许写纯 copy 渲染路径'的裁定**。当时理由是'不能为绕开 rmem 制造不真实的程序形状'，这是错的：DMA-only kernel（GM→UB→GM）本来就是合法的 Ascend 程序，copy_only 的 TL_NO_VECTOR_REGION 是**发射面缺口**而非事实缺口。故改为要求实现纯搬运支持，且文档措辞必须是'emitter 支持无向量区的纯搬运程序'、不得写成'为绕开 rmem 而加'。
+处置：
+- **task-50 按现状收尾**：闸门 + 双向事实面 + 负例（STORAGE_REGISTER_UNSOURCED / OVER_BUDGET / 双侧齐备才放行）为终态；'可用数量无真实来源'是**事实**而非待办，须在 memory.REGISTER_BUDGETS 注释写明并标注所有寄存器域 UNSOURCED，避免后人以为漏做。
+- 寄存器预算**不追求正例**（无来源即无正例），report 侧（lowering 按生命周期报占用）保留但标注'单侧可测、另侧 UNSOURCED ⇒ 仍拒'。
+- 正例改道：first ready=True 应来自 **纯搬运 kernel**（不依赖寄存器预算事实）。
+
+## R34 方法账第 9 条（由实现者九次同形错误归纳，Lead 采纳）
+**凡'某侧沉默'，先问它该不该说话，再判定是缺项还是通过。**
+今日九次同形错误：把对象当成它的字符串（`str(OwnerKey)` 匹配不上任何预算键）、把宽度当成数量（256B vreg 宽度 ≠ 每域可用数量）、把『这一侧没说话』当成『没有要求』（程序不使用的域被报缺、预算缺失被当通过）。修法都不是再猜一次，而是读真实对象/枚举真实表。
+
+## R35 v2 落法定稿 + Lead 指令更正（会误杀 44 条）
+我先前指示 v2 的 `source_key` 存 `case_matrix.json` 的 `key` 字段 —— **错误**，实测会误杀全部 44 条：源条目字段是 `case=attention_residual / case_id=1 / key=level4/attention_residual_1`，而 registry 40 条 id 是 `attention_residual/1`（= `<case>/<case_id>` 拼接，**不等于** `key`）。这条更正由 flex-1-g1 交叉核实触发。
+定稿（附加式 C 组，不改现有 case_id）：
+- 新增 `source_key`（逐字拷贝源 `key`：40 条形如 `level4/attention_residual_1`、4 条形如 `supplemental/mla_gqa_bsnd_kv_tail`）、`source_case_id`（源 `case_id` 原文）、`source_file`。
+- 契约只有一条：`source_key` 等于源字段原文；其形态（`level4/` vs `supplemental/mla_`）**不构成语义**，不许再出现统一规则或第三种自造记法。
+- 校验器同批落盘：删掉 suffix 映射与 `prefix == "mla_supplemental"` 断言（flex-1-g1 实测该断言会对『把 case_id 改成源字面』误杀），改为 source_key/source_case_id 集合逐字相等 + dtype 逐条相等 + 一条反向断言（case_id 是 registry 记录 id，但 source_key 必须被源字段支撑）。
+- 保留 v1 sha256/mtime 一行作历史，draft 仍 true，时间戳标 v2。
+方法教训（新增）：**把缺陷转嫁给下游规则后，修正上游反而先红** —— suffix 映射规则存在时，把 case_id 改成源字面会先撞规则；这使'修复'看起来像'破坏'。私有改名规则不仅有误杀风险，还会**阻止上游被修**。

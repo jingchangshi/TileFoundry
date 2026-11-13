@@ -51,3 +51,9 @@ npu_compare 包外位置；20261112/ 目录内除 tf_ascend950pr_native_v3 外�
 6. **key 形态分支**：实测恰有 2 种合法形态——40 条 `{case_id,dtype,operator,registration_basis,threshold_entry}`、4 条多 `supplemental:true`；统一断言字段集合会把完好件判红。
 
 比对一律走**数值折叠**（BinOp-aware：left 常量 2、op=Pow、right 一元负号；非 pow2 走 ast.Constant，`float8_e5m2` 末两档=1.0 原值），禁止字面串比对——我自己 v1/v2 两版校验器都因 `ast.unparse` 产出 `2**(-7)` vs registry 存的 `2 ** -7` 把完好件判成全红，第三版才基线绿（同属"第二次猜测仍是猜测"）。全程只读：registry `b25dd485…`、表 `e347b921…`、npu_compare `ef2506bb…` 三处 sha256 每轮复算与登记值逐字节一致；篡改实验只在内存副本上进行（见 /tmp，已清）。
+第 5 条（改名规则）的根因更正与 v1→v2 修复路径（lead 定夺升版，本节按他要求留修复路径而非抹掉错误）：
+- 实测该记法两边都不是源文件写法：`supplemental_mla.json` 的字段是 `case_id="gqa_bsnd_kv_tail"` 与 `key="supplemental/mla_gqa_bsnd_kv_tail"`，registry 写的是 `mla_supplemental/gqa_bsnd_kv_tail` ⇒ **曾有一版自造记法，已由 v2 加 `source_key`（原样存源字段）消除**，校验器随之删掉整条改名规则。根因不是"外部写法差异"，而是登记物生成器自拼前缀（登记物已知缺陷，DRAFT §6b）。
+- 一手新事实（比 lead 与我先前说的都多一层）：权威 40 条同样存在第三种写法——源 `case_matrix.json` 自带 `key="level4/attention_residual_1"`，registry 用 `<case>/<case_id>`。两者是同一行的两种合法表述；v2 用 `source_key` 钉住哪一个，必须与校验器读哪一个**同批定义**，否则误杀面从 4 条扩到 44 条。
+- **v2 落地顺序的硬约束（拿真校验器实测，非推断）**：把 4 条 supplemental 的 `case_id` 直接改成源字面 `supplemental/mla_<s>`，现网校验器会在 `test_comparator_registry.py:452` 的 `prefix != "mla_supplemental"` 处抛 **BLOCKED_DEPENDENCY 误杀**（实测 B 组）；而 `case_id` 不动、只**增** `source_key/source_case_id/source_file` 三字段，现网校验器照常 PASS（实测 C 组）。⇒ **v2 的 JSON 与校验器改动必须同批落盘**，否则登记物越修越红。
+- 复算状态（截至本节撰写时刻）：registry 仍为 v1、sha256 `b25dd485…`、mtime 07:37:28.990 **未变**（我全程未写它）；a/b/c 三项对 v1 复算依旧全绿（52 passed，0.10s，只读）。**v2 落盘后需按新 JSON 重新独立复算**，届时本节追加 v1→v2 差异条目。
+- 方法账补记：lead 采纳的"同一契约的不同实现，漏检结论不能搬运"在本轮同样成立——我对 v1 校验器测出的"0 红漏检/2 红抓住"只对**那一版实现**有效，校验器一改（比如换成 suffix 比对），我先前搬过去的数字就得重测。

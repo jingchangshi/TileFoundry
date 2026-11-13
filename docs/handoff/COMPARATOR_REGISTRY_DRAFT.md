@@ -1,6 +1,6 @@
 # COMPARATOR_REGISTRY_DRAFT — G3 登记物说明（task-56）
 
-配套 docs/handoff/COMPARATOR_THRESHOLD_REGISTRY.json（44239B、44 条 = 40 权威 + 4 supplemental、draft=true、registered_at_utc=2026-11-12T23:37:28Z）；生成器 /tmp/tf_fac/gen_registry.py 可复跑。**本登记物不证明任何原例数值通过。**
+配套 docs/handoff/COMPARATOR_THRESHOLD_REGISTRY.json —— **v2**（51489B、sha `8d1e9262…`、schema `tf-ascend.comparator-registry.v2`、draft=true、44 条 = 40 权威 + 4 supplemental）。v1（44239B、sha `b25dd485…`、mtime 07:37:28.990、commit `883117e`）记在 JSON 的 `registry_history.v1` 里可查。生成器 /tmp/tf_fac/gen_registry_v2.py、增量性证明 /tmp/tf_fac/verify_v2_additive.py 均可复跑。**本登记物不证明任何原例数值通过。**
 
 ## 1. 为什么这样登记
 
@@ -30,9 +30,9 @@
 1. **BinOp-aware 折叠**：`2 ** -10` 是 ast.BinOp，`ast.literal_eval` 抛 `malformed node`。规则 left=2 / op=Pow / right=一元负号。
 2. **比数值不比字面写法**：`ast.unparse` 出 `2**(-7)` 而 registry 存 `2 ** -7`，按字符串比会把**完好** registry 判成 44/220 全红（连续两版检查器因此皆错，第三版基线绿才配下结论）。
 3. **必须从表文件独立重推导**：协调篡改（fp16 `2**-10→2**-9`，source_forms 与 values 同步改、内部仍自洽）实测单向自洽 **0 红＝漏检**、重推导 **2 红＝抓住**。只读 JSON 等于没校验。
-4. **count / id-set 必须绑外部文件**：丢一条 case（44→43）时上述两类检查**全绿**。权威 40 条：registry `case_id == "<case>/<case_id>"`，与重读 case_matrix.json 的集合**直接相等**（本次复算 True）。supplemental 4 条**字面不等**，必须按显式规则映射：源文件 `case_id=gqa_bsnd_kv_tail`、`key="supplemental/mla_gqa_bsnd_kv_tail"`，而 registry 记的是 `mla_supplemental/gqa_bsnd_kv_tail` → guard 要么比裸 suffix，要么实现 `supplemental/mla_\<s\> → mla_supplemental/\<s\>` 这条**登记在案的改名**；否则 4/4 全判红。与 §3.2 同型：不许用直觉比字面。（JSON 内 `authoritative_total=40` 只是自我声明，不可替代外部比对。）
+4. **count / id-set 必须绑外部文件，且绑对字段**：丢一条 case（44→43）时上述两类检查**全绿**。v2 的机械绑法（**无需任何改名规则**）：`{source_key} ==` 重读两个源文件所得 44 个 `key` 的集合（44 个互异、逐字节相等，复算 True）；`{source_case_id}` **只能按 operator 分组或按多重集比** —— 实测权威 40 条的源值是 **int 1..20、每个 operator 重复一次**（不是 lead v2 规格里写的 "1…40" 字符串），全表 distinct 只有 24，故全局集合相等虽然可满足但**几乎不证明什么**；全局断言必须用 source_key，不是 source_case_id。（JSON 内 `authoritative_total=40` 只是自我声明，不可替代外部比对。）
 5. **字段齐全要显式 guard 且 shape-aware**：删任一字段是裸 `KeyError`（折叠检查不会顺带发现）。本 registry 有**两种合法 shape**（40 条无 `supplemental`、4 条多 `supplemental: true`），统一断言字段集合会把完好件判红。必检顶层 9 键 + 每条 case 5 键 + `threshold_entry{order,source_forms,values}` 且 order 为五字段顺序。
-6b. **登记物已知缺陷（不静默）**：上述 `mla_supplemental/\<s\>` 是本人生成器的自造记法，**源文件两个字段都不长这样**。已随 sha `b25dd485…` 冻结、flex-1 已按它复算，故本轮不改 JSON；正解是 v2 给 4 条 supplemental 加 `source_key`（原样存 `supplemental/mla_\<s\>`），使校验器无需改名规则。是否升 v2 由 lead 定；在那之前 §3.4 的映射规则是唯一可执行口径。
+6b. **登记物缺陷——已由 v2 `source_key` 消除**（保留一行历史）：v1 曾把 supplemental 记成 `mla_supplemental/\<s\>`，那是我生成器的自造记法、不对应源文件任何字段（源为 `case_id=\<s\>` + `key=supplemental/mla_\<s\>`）。v2 每条同时存 `source_file/source_key/source_case_id`（逐字节拷贝）并保留 `case_id` 作为 registry 本地标识；`registry_history.v1` 记下旧 sha/commit。→ 校验器不再有不可验证的私有改名层。
 7. **身份 guard**：三 sha256 复算 + `line_range` 仍锚住表体 + `repo_head` 等于 BiShengKernelAgent 当前 HEAD；表若移动则重推导整体失败，而非静默沿用旧值。
 
 ## 4. 两条 UNKNOWN（不可省）
@@ -43,14 +43,14 @@
 ## 5. 显式声明
 
 - 本文与 JSON 都只是**登记物**：说明「每个 case 将按哪一档、哪条判定式被评判」，**不证明**任何 case 数值通过；40/40 权威例 execution_status 仍 NOT_RUN，supplemental 仅扩展覆盖。
-- **G3 未由本任务闭合**：闭合还需 task-52 的只读校验器（正例 + §3 六条 guard 各自的负例，其中 §3.4 的 supplemental 映射须按 6b 的改名规则）。**task-52 全绿也不等于原 40 例可跑**——正向链仍卡在指令面/发射面（task-51/55），dist-pack 静默丢弃属 G1/G2 风险面、不改动本表任何数值。
+- **G3 未由本任务闭合**：闭合还需 task-52 的只读校验器（正例 + §3 六条 guard 各自的负例）。**v2 后 §3.4 不再需要改名规则**；仍按 v1 suffix 口径写的校验器要改成比 `source_key`，否则会把完好 v2 判红（同 §3.2 型错误）。**task-52 全绿也不等于原 40 例可跑**——正向链仍卡在指令面/发射面（task-51/55），dist-pack 静默丢弃属 G1/G2 风险面、不改动本表任何数值。
 - 禁止项照抄合同：不改比较器、不改 proto、不自造 allclose（CONTRACT.md:44）；候选须返回原 dtype（CONTRACT.md:18）。
 
 ## 6. 本次自检输出（仅**内部**一致性；外部绑定见 §3.3/§3.4）
 
 ```text
-44239 bytes, 44 case entries | entries_consistent True mismatched [] | top_fields_present True missing []
+v2: 51489 bytes, 44 entries | C1 source_key set==sources True(44) | C2 per-operator case_id sets True | C4 dtype per source row True | C6 shapes 2(40x8,4x9) | fields added only [source_file,source_key,source_case_id], removed none
 comparator_sha ef2506bb… / table_sha e347b921… / anchor_sha 026f51a9… 复算 True | case_count 44 = 40 权威 + 4 supplemental
 e5m2 raw preserved [2 ** -2, 2 ** -3, 2 ** -5, 1.0, 1.0]
 ```
-注：以上是我生成器做的 JSON-vs-当场重折叠自检，抓不住 §3.4 的丢条目与 §3.3 的协调篡改；不要把本节当成 G3 闭合证据。
+另证 additive-only：与 `git show 883117e` 的 v1 逐条比，44 条 dtype+threshold_entry+registration_basis **byte-equal**、case_id 集合不变、无字段删除。注：以上均为**内部/绑定**自检，抓不住 §3.3 的协调篡改与 §3.4 的丢条目，不要把本节当成 G3 闭合证据。
