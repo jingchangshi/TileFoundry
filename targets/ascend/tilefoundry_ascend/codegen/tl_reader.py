@@ -64,6 +64,10 @@ OP_SURFACE = {
     # obligation by obligation; see event_correspondence().
     "tl.ascend_set_flag": "event.set_flag",
     "tl.ascend_wait_flag": "event.wait_flag",
+    # The DECLARED reference lowering for a region-exit drain. Registered so the
+    # reader compares what was emitted instead of filing it under "unsupported", and
+    # so the comparison is between two machine facts rather than against silence.
+    "tl.ascend_pipe_barrier": "event.pipe_barrier",
 }
 
 #: Surface tokens for the two event instructions, so a caller can name them
@@ -213,6 +217,13 @@ class ConformanceVerdict:
     observed_facts: TlFacts | None
     refinement_manifest: object
     refusals: tuple
+    #: Layers whose lowering is DECLARED rather than proven, carried OUTSIDE the
+    #: gaps on purpose. A gap means a required layer was never observed and caps the
+    #: verdict at INCOMPLETE; this means the layer WAS emitted, from a reference
+    #: mapping whose semantics are unproven. Both must be visible, but conflating
+    #: them would either block a reachable positive forever (treated as a gap) or
+    #: hide the uncertainty (dropped entirely). The gate passes this through.
+    recorded_unproven: tuple = ()
 
     @property
     def verified(self) -> bool:
@@ -480,6 +491,12 @@ def expected_facts(emitted) -> TlFacts:
             operands = _vsts_operands(
                 statement.writes[0], statement.reads[0], statement.reads[1],
                 lanes_of(statement.writes[0]), vec_of(statement.reads[0]))
+            result, result_dtype = "", ""
+        elif surface == "event.pipe_barrier":
+            # One literal argument, the barrier domain. Read from the same attributes
+            # the emitter wrote, so the comparison is between two machine facts.
+            values = dict(statement.attributes)
+            operands = (("literal", str(values.get("barrier", ""))),)
             result, result_dtype = "", ""
         elif surface in EVENT_SURFACES:
             # Both flag calls take exactly (hard_event_string, flag_id), so the
@@ -785,6 +802,16 @@ def read_actual_tl(artifact, parsed_prim_func, refinement_manifest=None):
         status = "INCOMPLETE"
     else:
         status = "VERIFIED"
+    # Reference-mapped statements in THIS artifact, carried outside gaps: the layer
+    # WAS emitted, so it is not a gap, but its semantics are unproven and that must
+    # not vanish. Deduplicated by surface - three drains are one unproven lowering.
+    recorded = {}
+    for statement in getattr(getattr(artifact, "emitted", None), "body", None) \
+            and artifact.emitted.body.statements() or ():
+        record = getattr(statement, "reference_mapping", None)
+        if record:
+            recorded.setdefault(str(statement.surface), dict(record))
+    recorded_unproven = tuple(sorted(recorded.items()))
     return ConformanceVerdict(
         status=status,
         observation_points=tuple(points),
@@ -807,4 +834,5 @@ def read_actual_tl(artifact, parsed_prim_func, refinement_manifest=None):
         observed_facts=observed,
         refinement_manifest=refinement_manifest,
         refusals=tuple(refusals),
+        recorded_unproven=recorded_unproven,
     )

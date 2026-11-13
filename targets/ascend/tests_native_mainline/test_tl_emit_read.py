@@ -343,12 +343,62 @@ def test_unsupported_instruction_is_a_named_refusal_not_a_dropped_statement():
     assert "vmul" in detail
 
 
-def test_emit_and_read_never_touch_a_device_or_a_binary():
+def _opened_compute_nodes():
+    """Which COMPUTE device nodes this process has open, read from /proc/self/fd.
+
+    R11's rule, and the distinction is measured rather than assumed: importing
+    tilelang with CANN sourced passively opens /dev/davinci_manager and
+    /dev/hisi_hdc. Those are CONTROL nodes opened by the runtime's own
+    initialisation - nothing of ours asks for the accelerator. A COMPUTE node
+    (/dev/davinci<digits>) is the one that would mean we took the device.
+    """
+    opened = set()
+    fd_directory = "/proc/self/fd"
+    try:
+        names = _os.listdir(fd_directory)
+    except OSError:  # not Linux, or a restricted /proc
+        return opened
+    for name in names:
+        try:
+            target = _os.readlink(_os.path.join(fd_directory, name))
+        except OSError:
+            continue
+        if _re.match(r"^/dev/davinci\d+$", target):
+            opened.add(target)
+    return opened
+
+
+def test_emit_and_read_never_take_a_compute_device():
+    """Emit + parse + read must never take the accelerator - in EITHER environment.
+
+    RESTATED under R11. This test used to assert "torch_npu" not in sys.modules,
+    which is true only in a BARE environment: with CANN's set_env.sh sourced,
+    importing tilelang passively loads torch_npu - an environment fact, not an
+    action of ours - so the old assertion was green in one environment and red in
+    the other while guarding nothing extra either way. What actually matters is:
+      (1) no COMPUTE node (/dev/davinci<digits>) is opened - control nodes are
+          recorded, not refused, because the runtime opens them on import;
+      (2) torch_npu appearing in sys.modules is RECORDED with the environment that
+          produced it, so the fact stays visible without being an assertion;
+      (3) no kernel is launched and no device tensor exists - unaffected by env.
+    """
     import sys
 
+    before = _opened_compute_nodes()
     _artifact(INDEPENDENT_UB)
     _artifact(MINIMAL_AIV)
-    assert "torch_npu" not in sys.modules
+    after = _opened_compute_nodes()
+    newly_opened = sorted(after - before)
+    assert newly_opened == [], (
+        "emitting/reading opened a COMPUTE device node: %s (control nodes are "
+        "allowed by R11; /dev/davinci<digits> is the accelerator)" % (newly_opened,))
+
+    # Recorded, never asserted: it is the environment talking, not this code.
+    sourced = bool(_os.environ.get("ASCEND_HOME_PATH"))
+    torch_npu_loaded = "torch_npu" in sys.modules
+    assert isinstance(torch_npu_loaded, bool)  # the fact is available either way
+    _ = (sourced, torch_npu_loaded)            # deliberately not a pass condition
+
     # The frozen two-key contract is what the compile site must consume.
     assert PASS_CONFIGS == (("tl.enable_auto_schedule", False),
                             ("tl.disable_shared_memory_reuse", True))
@@ -357,6 +407,9 @@ def test_emit_and_read_never_touch_a_device_or_a_binary():
     assert artifact.plan_identity == ""          # no plan wired: recorded, not invented
     assert artifact.completion_identity == ""
     assert artifact.storage_identity == ""
+    # No launch: the artifact states no compiled binary unless a caller asked.
+    assert getattr(artifact, "compiled", None) is None
+    assert not hasattr(artifact, "npu_tensor")
 
 
 # ===================================================================== task-41
@@ -895,20 +948,36 @@ def test_unsourced_lane_model_caps_the_verdict_at_incomplete():
     assert "TL_LANE_MODEL_UNSOURCED" not in [g[0] for g in restored.gaps], restored.gaps
 
 
-def test_copy_only_is_outside_the_vector_support_domain_by_name():
-    """Reporting the support domain honestly: a pure copy is refused, not emitted.
+def test_a_dma_only_program_is_emittable_and_is_not_a_degenerate_kernel():
+    """A GM->UB->GM kernel is a REAL Ascend program shape, so it is emitted.
 
-    copy_only declares GM->UB->GM with no vector instruction, and this emitter
-    states no TileLang form for a program with no vector region. It must be
-    refused by name rather than emitted as a degenerate kernel - and it must NOT
-    appear in any list of certified programs.
+    This test used to assert the opposite: that copy_only is refused with
+    TL_NO_VECTOR_REGION because "this emitter states no TileLang form for a program
+    with no vector region". That was a limitation of the EMITTER, not a property of
+    the program - a transport kernel is legitimate Ascend C - so the limitation was
+    removed rather than documented (lead ruling). The support rule is now "the
+    program must move data": a vector instruction OR a copy. Nothing weaker.
+
+    The second half still matters: the kernel must be a REAL one. A refusal that
+    accepted an empty body would be just as wrong in the other direction, so this
+    asserts the emitted program actually contains the two copies it declares.
     """
     from tilefoundry_ascend.codegen.emit import supported_domain
 
-    _module, entry = _lowered(COPY_ONLY)
-    ok, code, detail = supported_domain(entry)
-    assert ok is False, code
-    assert code == "TL_NO_VECTOR_REGION", (code, detail)
+    module, entry = _lowered(COPY_ONLY)
+    # supported_domain returns (True, emitted) or (False, code, detail) - a
+    # variable-arity tuple, so unpack defensively rather than assuming three.
+    verdict = supported_domain(entry)
+    assert verdict[0] is True, verdict[1:]
+
+    artifact = emit_supported_tl(module, None, None, None, entry.target)
+    surfaces = [statement.surface for statement in artifact.emitted.body.statements()]
+    # Exactly the two transfers the program declares, and no vector instruction.
+    assert surfaces.count("copy") == 2, surfaces
+    assert not any(surface.startswith("simd.") for surface in surfaces), surfaces
+    # The rendered source is a real kernel: a prim_func with both copies in it.
+    assert "def copy(" in artifact.source
+    assert artifact.source.count("T.copy(") == 2, artifact.source
 
 
 def test_new_model_field_participates_in_identity_by_default():
@@ -1326,24 +1395,34 @@ def test_symbolic_generation_is_refused_not_expanded():
     assert slot.value.code == "TL_EVENT_SLOT_INCONSISTENT", slot.value.code
 
 
-def test_drain_and_cross_core_are_named_gaps_not_substitutes():
-    """Three absences, three codes, none silently filled.
+def test_drain_uses_a_declared_reference_mapping_and_cross_core_still_refuses():
+    """Drain is EMITTED as a declared reference lowering; cross-core still refuses.
 
-      drain                - the deployed TL face states no drain intrinsic
-                             (ascend/language/sync.py exports set_flag/wait_flag/
-                             pipe_barrier/threadfence/buffer ops, nothing that
-                             retires a region's outstanding work), so a drain
-                             obligation has nothing to be emitted as.
-      pipe_barrier / fence - no TileFoundry op exists for either, and neither one
-                             orders what a flag orders, so neither may substitute
-                             for the missing drain.
-      cross-core hand-off  - the target declares the cross-core bank/mode facts
-                             UNRESOLVED, so no flag id can be proven to fit and
-                             the pair is refused instead of guessed.
+    PRECONDITION CHANGED BY LEAD RULING. This test used to assert that a drain is
+    refused with TL_EVENT_SURFACE_MISSING, because the deployed TL face states no
+    ascend_drain. That is still true about the face - but refusing made a real
+    program unemittable over an unproven SEMANTIC rather than a missing capability,
+    so drain now lowers through a declared reference mapping to the closest declared
+    AIV primitive (a PIPE_ALL pipe barrier) and records what stays unproven.
+
+    The CROSS-CORE half is unchanged and still refuses: the target declares those
+    bank/mode facts UNRESOLVED, so no flag id can be proven to fit.
+
+    Three things are asserted about the drain, and all three matter:
+      (1) it emits, and the emitted surface reads back;
+      (2) the artifact carries the explicit uncertainty record - the shape is a
+          {drain_lowering, proven, needs} mapping, like the delay table's
+          ModelConflict, so "unproven" is data rather than a comment;
+      (3) that record is NOT a gap and NOT a refusal: a verdict with an unproven
+          layer can still be VERIFIED, which is what makes a positive reachable
+          while keeping the uncertainty visible.
     """
-    from tilefoundry.ir.tir.flag import Drain
-    from tilefoundry.ir.tir.stmts import Evaluate, MeshScope, Sequential
     from dataclasses import replace as _replace
+
+    from tilefoundry.ir.tir.flag import Drain, FlagSet
+    from tilefoundry.ir.tir.stmts import Evaluate, MeshScope, Sequential
+
+    from tilefoundry_ascend.codegen.emit import DRAIN_REFERENCE_MAPPING, TL_SURFACE
 
     _module, entry = _lowered(MINIMAL_AIV)
 
@@ -1356,20 +1435,35 @@ def test_drain_and_cross_core_are_named_gaps_not_substitutes():
             return node
         return _replace(entry, body=put(entry.body))
 
-    def code_for(statement):
-        try:
-            _Emitter(wrapped(statement)).build()
-        except EmitRefusal as refusal:
-            return refusal.code
-        raise AssertionError("expected a named refusal, got an emitted kernel")
+    # (1) The surface is registered and the drain really emits through it.
+    assert TL_SURFACE["drain"] == "event.pipe_barrier", TL_SURFACE.get("drain")
+    emitted = _Emitter(wrapped(Evaluate(callable=Drain(), args=()))).build()
+    drained = [statement for statement in emitted.body.statements()
+               if statement.surface == "event.pipe_barrier"]
+    assert len(drained) == 1, [s.surface for s in emitted.body.statements()]
+    assert "T.ascend_pipe_barrier('PIPE_ALL')" in emitted.source, emitted.source[-400:]
 
-    assert code_for(Evaluate(callable=Drain(), args=())) == "TL_EVENT_SURFACE_MISSING"
+    # (2) The uncertainty record travels ON the statement, with the declared shape.
+    record = drained[0].reference_mapping
+    assert record["status"] == "REFERENCE_IMPLEMENTATION", record.get("status")
+    uncertainty = record["uncertainty"]
+    assert uncertainty["drain_lowering"] == "PIPE_ALL pipe barrier"
+    assert uncertainty["proven"] is False
+    assert uncertainty["needs"], "an unproven layer must say what evidence it needs"
+    assert "device evidence" in uncertainty["needs"]
+    #     A status of REFERENCE with a proven=true claim would be self-contradictory;
+    #     the mapping is the single source, so assert they agree.
+    assert DRAIN_REFERENCE_MAPPING["uncertainty"]["proven"] is uncertainty["proven"]
+
+    # (3) Cross-core still refuses, by name, and is not a reference mapping.
     cross = dict(channel_name="ub:tile", kind="ready", slot=0, generation=0,
                  versions=1, flag_id=0, producer_pipe="mte2", consumer_pipe="cube")
-    from tilefoundry.ir.tir.flag import FlagSet
-
-    assert code_for(Evaluate(callable=FlagSet(**cross), args=())) == \
-        "TL_EVENT_CROSS_CORE_UNSUPPORTED"
+    try:
+        _Emitter(wrapped(Evaluate(callable=FlagSet(**cross), args=()))).build()
+    except EmitRefusal as refusal:
+        assert refusal.code == "TL_EVENT_CROSS_CORE_UNSUPPORTED", refusal.code
+    else:
+        raise AssertionError("a cross-core hand-off must not be emitted")
 
 
 def test_event_pool_lookup_refuses_an_undeclared_core():
@@ -1609,3 +1703,48 @@ def test_a_cache_hit_is_not_a_missing_product():
         "a cache hit must not be reported as missing products", outcome)
     assert outcome.get("cache_hit_same_semantics") is True, outcome
     assert outcome.get("cache_hit_products_present") is True, outcome
+
+def test_a_reference_record_cannot_claim_both_proven_and_awaiting_evidence():
+    """The self-contradiction that would launder REFERENCE into DEVICE_VALIDATED.
+
+    A reference record says exactly one of two things: the lowering is proven, or it
+    is not and here is the evidence still needed. Saying BOTH - proven true while
+    still listing what to obtain - is incoherent, and it is precisely how a reference
+    mapping could be quietly upgraded by whoever edits it next. So the pair is
+    validated as a pair, and the refusal is named rather than ignored.
+
+    Three shapes are refused; the honest REFERENCE record is the control and must
+    still pass, otherwise this test would only prove the guard rejects everything.
+    """
+    from tilefoundry_ascend.codegen.emit import (DRAIN_REFERENCE_MAPPING, EmitRefusal,
+                                                 validate_reference_mapping)
+
+    # Control: the shipped record is coherent.
+    validate_reference_mapping(DRAIN_REFERENCE_MAPPING, where="drain")
+    assert DRAIN_REFERENCE_MAPPING["uncertainty"]["proven"] is False
+    assert DRAIN_REFERENCE_MAPPING["uncertainty"]["needs"]
+
+    def refused(record):
+        try:
+            validate_reference_mapping(record, where="drain")
+        except EmitRefusal as refusal:
+            return refusal.code
+        raise AssertionError("a contradictory record was accepted: %r" % (record,))
+
+    # (1) claims proven while still needing evidence - the laundering shape.
+    laundered = {
+        "status": "REFERENCE_IMPLEMENTATION",
+        "uncertainty": {"drain_lowering": "PIPE_ALL pipe barrier", "proven": True,
+                        "needs": "device evidence that PipeBarrier retires ops"},
+    }
+    assert refused(laundered) == "TL_REFERENCE_RECORD_CONTRADICTORY"
+
+    # (2) claims DEVICE_VALIDATED without marking the semantics proven.
+    assert refused({"status": "DEVICE_VALIDATED",
+                    "uncertainty": {"proven": False, "needs": ""}}) \
+        == "TL_REFERENCE_RECORD_CONTRADICTORY"
+
+    # (3) the honest upgrade is ACCEPTED: proven, no outstanding need, validated.
+    validate_reference_mapping({"status": "DEVICE_VALIDATED",
+                                "uncertainty": {"proven": True, "needs": ""}},
+                               where="drain")

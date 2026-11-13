@@ -81,19 +81,105 @@ TL_SURFACE = {
     # T.ascend_set_flag / T.ascend_wait_flag (tilelang/ascend/language/sync.py:28-71).
     "flag_set": "event.set_flag",
     "flag_wait": "event.wait_flag",
+    # Region-exit drain, lowered through a DECLARED REFERENCE mapping rather than an
+    # absent intrinsic: no ascend_drain exists on the AIV path, so the closest
+    # declared primitive is a PIPE_ALL pipe barrier. Its retirement SEMANTICS are
+    # unproven and that fact travels with the artifact (DRAIN_REFERENCE_MAPPING).
+    "drain": "event.pipe_barrier",
 }
 
-#: Event names whose TL face does NOT exist, and which must therefore be refused
-#: by name instead of being silently dropped or substituted:
-#:   drain        - no ascend_drain in the deployed TL surface (verified against
-#:                  ascend/language/sync.py's __all__), so a region-exit drain has
-#:                  no instruction to emit.
-#:   pipe_barrier / threadfence - the lead's ruling: these have NO TileFoundry op
-#:                  at all (only DSL-language functions), so they are not even
-#:                  candidates; substituting one for a cross-pipe ordering
-#:                  requirement would be claiming a sync we cannot emit.
-EVENT_TL_SURFACE_MISSING = frozenset({"drain"})
+#: Surfaces whose lowering is DECLARED rather than proven, by surface name.
+REFERENCE_SURFACES = {"event.pipe_barrier": "drain"}
+
+#: Event names whose TL face does NOT exist on the AIV path, and which must be
+#: refused by name rather than silently dropped or substituted:
+#:   pipe_barrier / threadfence - no TileFoundry op exists for either (only
+#:                  DSL-language functions), so a program that STATES one has nothing
+#:                  to map. This is different from drain below: drain is a real TF op
+#:                  whose TL lowering we DECLARE.
+#:
+#: DRAIN IS NO LONGER IN THIS SET. It has a declared reference mapping
+#: (DRAIN_REFERENCE_MAPPING) that records what is unproven instead of refusing the
+#: whole program. The earlier blanket ban on barriers-for-drains was narrowed to
+#: exactly this one place by lead ruling, because the reasoning differs: that ban
+#: existed to stop us substituting a barrier for a MISSING TF op; here the TF op
+#: exists and we are choosing its TL lowering.
+EVENT_TL_SURFACE_MISSING = frozenset()
 EVENT_TF_OP_MISSING = frozenset({"pipe_barrier", "threadfence"})
+
+
+#: The DRAIN -> TileLang lowering, DECLARED rather than proven.
+#:
+#: What a drain must do: retire the async operations still outstanding when a region
+#: exits, so a GMEM boundary write with no in-region reader becomes visible to its
+#: consumer. What the deployed TL surface offers (measured against
+#: ascend/language/sync.py's __all__): pipe_barrier / set_flag / wait_flag /
+#: sync_inter_arrive / sync_inter_wait / threadfence / cross_core_set_flag /
+#: cross_core_wait_flag / get_buf / rls_buf. There is no ascend_drain, and
+#: ascend_threadfence is declared in simt_api/device_sync_functions.h - the SIMT
+#: surface, not the AIV path this emitter targets.
+#:
+#: The closest DECLARED AIV primitive is the per-pipe barrier family
+#: (basic_api/kernel_tpipe.h: PipeBarrier<PIPE_MTE2/PIPE_MTE3/PIPE_V>), reachable from
+#: TL as ascend_pipe_barrier("PIPE_ALL").
+#:
+#: WHAT STAYS UNPROVEN is the SEMANTICS: that PipeBarrier<PIPE_ALL> at region exit
+#: really retires outstanding async stores on 950PR. Every emitted drain carries this
+#: record into the artifact, the reader reports it outside its gaps, and the gate
+#: passes it through - so anyone reading the gate sees that this layer is
+#: REFERENCE-ONLY and what would upgrade it.
+DRAIN_REFERENCE_MAPPING = {
+    "op": "drain",
+    "tl_surface": "pipe_barrier",
+    "argument": "PIPE_ALL",
+    "status": "REFERENCE_IMPLEMENTATION",
+    "uncertainty": {
+        "drain_lowering": "PIPE_ALL pipe barrier",
+        "proven": False,
+        "needs": "device evidence that PipeBarrier<PIPE_ALL> retires outstanding "
+                 "async ops at region exit",
+        "upgrade": "if device evidence arrives, or the deployed package ships "
+                   "ascend_drain, raise status to DEVICE_VALIDATED and empty this "
+                   "record - REFERENCE_IMPLEMENTATION is NOT the terminal state",
+    },
+}
+
+
+def validate_reference_mapping(record, *, where="") -> None:
+    """Refuse a reference record that contradicts itself.
+
+    A record claims one of two things: the lowering's semantics are PROVEN (status
+    DEVICE_VALIDATED), or they are NOT (status REFERENCE_IMPLEMENTATION, with the
+    evidence it still needs). Saying BOTH - "proven: true" while still listing what
+    evidence is required - is incoherent, and it is exactly how a REFERENCE mapping
+    would get laundered into DEVICE_VALIDATED without anyone proving anything. So the
+    pair is checked as a pair, and a contradiction is refused by name rather than
+    passing as "more information".
+
+    Called wherever a reference record is consumed, so the check cannot be skipped by
+    a caller that only reads the uncertainty dict.
+    """
+    uncertainty = (record or {}).get("uncertainty") or {}
+    proven = uncertainty.get("proven")
+    needs = uncertainty.get("needs")
+    status = (record or {}).get("status")
+    if proven is True and needs:
+        raise EmitRefusal(
+            "TL_REFERENCE_RECORD_CONTRADICTORY",
+            "the reference record %s claims the lowering is PROVEN while still listing "
+            "the evidence it needs (%r): a record cannot be both verified and awaiting "
+            "verification" % (where or "for this surface", str(needs)[:120]),
+            status, proven)
+    if status == "DEVICE_VALIDATED" and proven is not True:
+        raise EmitRefusal(
+            "TL_REFERENCE_RECORD_CONTRADICTORY",
+            "the reference record %s claims DEVICE_VALIDATED without marking the "
+            "semantics proven" % (where or "for this surface",), status, proven)
+    if proven is False and status == "DEVICE_VALIDATED":
+        raise EmitRefusal(
+            "TL_REFERENCE_RECORD_CONTRADICTORY",
+            "the reference record %s states DEVICE_VALIDATED while recording the "
+            "lowering as unproven" % (where or "for this surface",), status, proven)
 
 #: hard-event token per canonical pipe, copied from the deployed build's own
 #: GetResourcePipeName (tilelang/src/ascend/transform/ascend_pipe.h:75-91):
@@ -207,6 +293,11 @@ class TlStatement:
     #: GetResourcePipeName's table, so the reader can compare the flag that will be
     #: emitted without comparing any prose.
     hard_event: str = ""
+    #: Non-empty when this statement's TileLang lowering is DECLARED rather than
+    #: proven. It carries the whole reference record (surface, argument, status and
+    #: the explicit uncertainty), so an unproven layer travels with the artifact
+    #: instead of being inferable only from source code.
+    reference_mapping: dict = field(default_factory=dict)
 
     @property
     def names(self) -> tuple:
@@ -396,6 +487,36 @@ class _Emitter:
         too - from the same cited model, never from the tile's element count.
         """
         self.register_dtypes[name] = dtype
+
+
+    def _drain_statement(self, surface: str, stmt) -> TlStatement:
+        """One region-exit drain, emitted as the declared PIPE_ALL pipe barrier.
+
+        A drain takes NO attributes (tilefoundry/ir/tir/flag.py: Drain is declared
+        with no attribute parameters), so unlike a flag it states nothing about a
+        slot or a generation - what it states is only WHERE it appears, which is the
+        region exit the completion template already fixed.
+
+        This is emitted, not refused, because refusing it made a real program
+        unemittable over an UNPROVEN SEMANTIC rather than a missing capability. The
+        semantic is not papered over: DRAIN_REFERENCE_MAPPING carries status
+        REFERENCE_IMPLEMENTATION plus an explicit {proven: false, needs: ...} record,
+        and this statement is tagged with that surface so the reader and the gate can
+        surface it as a recorded-unproven layer rather than as a silent pass.
+        """
+        validate_reference_mapping(DRAIN_REFERENCE_MAPPING, where="drain")
+        return TlStatement(
+            surface=surface,
+            instruction="drain",
+            result="",
+            reads=(),
+            writes=(),
+            attributes=(("barrier", DRAIN_REFERENCE_MAPPING["argument"]),),
+            constants=(),
+            source_order=self._take_order(),
+            in_vector_region=False,
+            reference_mapping=dict(DRAIN_REFERENCE_MAPPING),
+        )
 
     def _event_statement(self, surface: str, contract, stmt: Evaluate) -> TlStatement:
         """One flag set/wait, emitted exactly as the real Op states it.
@@ -754,6 +875,8 @@ class _Emitter:
             raise EmitRefusal("TL_NO_SURFACE",
                               "instruction %r has no TileLang surface in this slice"
                               % (contract.name,), stmt)
+        if surface == "event.pipe_barrier":
+            return self._drain_statement(surface, stmt)
         if surface.startswith("event."):
             return self._event_statement(surface, contract, stmt)
         required = contract.required_region
@@ -1135,7 +1258,20 @@ class _Emitter:
         # dynamic shared buffer to be owned.
         body: list[tuple[int, str]] = []
         self._render_members(emitted.body.members, 1, body)
-        pass  # PROBE: vector check disabled
+        # A DMA-only kernel is a REAL Ascend program shape: GM -> UB -> GM is a
+        # legitimate transport kernel, and refusing to render it was a limitation of
+        # this emitter rather than a property of the program. So the rule is no
+        # longer "must contain a vector instruction"; it is "must contain at least
+        # one DATA-MOVING instruction", which is what an empty or half-rendered
+        # kernel would lack. The refusal keeps its name for callers that already
+        # match on it, but its condition now describes the real requirement.
+        surfaces = [statement.surface for statement in emitted.body.statements()]
+        if not any(surface.startswith("simd.") or surface == "copy"
+                   for surface in surfaces):
+            raise EmitRefusal("TL_NO_VECTOR_REGION",
+                              "the emitted program states neither a vector instruction "
+                              "nor a data-movement copy, so it describes no work: %s"
+                              % (surfaces,), None)
         for depth, text in body:
             lines.append("    " * depth + text)
         lines.append("")
@@ -1188,6 +1324,13 @@ class _Emitter:
         if surface == "simd.vsts":
             return "T.simd.vsts(%s[0], %s, %s)" % (statement.writes[0], statement.reads[0],
                                                    statement.reads[-1])
+        if surface == "event.pipe_barrier":
+            # A DECLARED reference lowering: no ascend_drain exists on the AIV path,
+            # so the region-exit drain becomes a PIPE_ALL pipe barrier. The argument
+            # is a literal from DRAIN_REFERENCE_MAPPING, and the record that its
+            # retirement semantics are unproven is carried on the statement.
+            return "T.ascend_pipe_barrier(%r)" % (
+                DRAIN_REFERENCE_MAPPING["argument"],)
         if surface in ("event.set_flag", "event.wait_flag"):
             # One statement in, one statement out: the event count is decided by how
             # many site obligations the plan states, never by a trip count, so this

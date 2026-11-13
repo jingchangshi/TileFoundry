@@ -65,7 +65,7 @@ def verify_actual_program(original, rewritten, plan, completion, storage, *, sou
     return _verify(original, rewritten, plan, completion, storage, source_map=source_map)
 
 
-def install_entry(module, rewritten_entry, *, conformance=None):
+def install_entry(module, rewritten_entry, *, conformance=None, tl_artifact=None):
     """Install the VERIFIED candidate entry; any failure keeps the original module.
 
     conformance must be the NativeVerdict produced by verify_actual_program: it
@@ -182,10 +182,77 @@ def install_entry(module, rewritten_entry, *, conformance=None):
         raise PlanError("INSTALL_SOURCE_IDENTITY_MISMATCH",
                         "the module being installed into is not the frozen source the "
                         "verifier proved")
-    # Native TIR verification alone cannot authorize publication.  The actual TL
-    # reader and its conformance verdict do not yet exist in this tree.
-    raise PlanError("INSTALL_TL_CONFORMANCE_NOT_IMPLEMENTED",
-                    "actual TL conformance must be verified before installation")
+    # Native TIR verification alone cannot authorize publication, but neither may
+    # this stage refuse unconditionally: a permanent refusal is indistinguishable
+    # from every other one, so it cannot be satisfied, narrowed, or verified - the
+    # same defect this tree has now removed four times (R7). The TL layer is still
+    # REQUIRED; it is simply judged from real objects instead of declared absent.
+    #
+    # Four conditions, each named separately so a caller learns WHICH one is short
+    # instead of getting one blanket code:
+    #   (i)   the verifier receipt, already required above;
+    #   (ii)  a TL conformance verdict the READER recomputed to VERIFIED;
+    #   (iii) compiled ABI agreement, when a binary was produced;
+    #   (iv)  candidate object identity, checked above by object identity.
+    # The artifact comes in as an ARGUMENT: NativeVerdict (plan/verify.py) does not
+    # carry one, and adding a field there is outside this stage's write scope. A
+    # caller that actually emitted and read a TL program passes the REAL artifact it
+    # verified, so the layer is judged from that object rather than from a claim.
+    conformance_artifact = tl_artifact if tl_artifact is not None else getattr(
+        conformance, "tl_artifact", None)
+    if conformance_artifact is None:
+        raise PlanError(
+            "INSTALL_CANDIDATE_UNVERIFIED",
+            "the verifier receipt carries no TL artifact, so the TL layer cannot be "
+            "judged for this candidate")
+    from ..codegen.tl_reader import read_actual_tl
+
+    parsed = getattr(conformance_artifact, "parsed_prim_func", None)
+    if parsed is None:
+        raise PlanError("INSTALL_CANDIDATE_UNVERIFIED",
+                        "the TL artifact carries no parsed PrimFunc to read")
+    # The artifact must describe THIS candidate. The reader checks that the identity
+    # is non-empty and that the SOURCE TEXT matches its own digests, but it cannot
+    # know which TIR the artifact was supposed to come from - measured: replacing
+    # tir_identity with a fabricated value still reads VERIFIED, because nothing
+    # downstream compares it with the entry. Comparing it here is what makes the
+    # artifact-to-candidate binding real rather than assumed.
+    expected_tir = function_identity(rewritten_entry)
+    if getattr(conformance_artifact, "tir_identity", "") != expected_tir:
+        raise PlanError(
+            "ARTIFACT_TIR_IDENTITY_MISMATCH",
+            "the TL artifact was emitted from a different TIR than this candidate: "
+            "the artifact states %r while the candidate hashes to %r"
+            % (getattr(conformance_artifact, "tir_identity", ""), expected_tir))
+    verdict = read_actual_tl(conformance_artifact, parsed)
+    # The reader owns its code names; this stage reuses them rather than renaming a
+    # failure that belongs to the emission.
+    for code, _expected, _actual in verdict.refusals:
+        raise PlanError(code,
+                        "the TL reader refused this candidate; a refused emission "
+                        "never authorizes installation")
+    for code, _expected, _actual in verdict.gaps:
+        raise PlanError(code,
+                        "a required layer was never observed for this candidate")
+    if verdict.status != "VERIFIED":
+        raise PlanError("INSTALL_CANDIDATE_UNVERIFIED",
+                        "the recomputed TL verdict is %s, not VERIFIED"
+                        % (verdict.status,))
+    # ABI, only when this artifact went through the compile site. With no binary the
+    # layer is absent rather than passing, and the export gate reports that
+    # separately - so it is not asserted here.
+    compiled = getattr(conformance_artifact, "compiled", None)
+    if compiled is not None:
+        from ..codegen.ascend_binary import CompileRefusal, check_compiled_abi
+
+        parameter_count = len(tuple(getattr(rewritten_entry, "params", ()) or ()))
+        output_count = int(getattr(rewritten_entry, "output_count", 0) or 0)
+        try:
+            check_compiled_abi(compiled, parameter_count, output_count)
+        except CompileRefusal as refusal:
+            raise PlanError(refusal.code,
+                            "the compiled binary disagrees with the ABI this candidate "
+                            "declares: %s" % (refusal.detail,)) from refusal
     positions = [index for index, function in enumerate(functions) if function is original_entry]
     if len(positions) != 1:
         raise PlanError(
@@ -278,7 +345,117 @@ def compile_mainline(module, authored=None, *, target=None):
             module, stages, "completion",
             PlanError("MAINLINE_COMPLETION_UNVERIFIED",
                       "the completion carries no verification receipt"))
-    return _applied_record(module, entry, stages, plan, completion, storage)
+
+    # ---- apply / verify -------------------------------------------------------
+    # These were MISSING, and their absence is why the production entry could never
+    # report ready=True while a hand-assembled test could: the transaction stopped
+    # after storage, so applied never equalled SINGLE_TRANSACTION. The stages below
+    # are the real ones, in the frozen order - nothing here is a placeholder.
+    from .mainline import apply_symbolic_pipeline as _apply
+    from .mainline import verify_actual_program as _verify
+
+    try:
+        candidate, source_map = _apply(entry, plan, completion, storage)
+        stages.append("apply")
+    except Exception as error:  # noqa: BLE001
+        return _refused_record(module, stages, "apply", error)
+    candidate_module = candidate if isinstance(candidate, Module) else None
+    if candidate_module is None:
+        return _refused_record(
+            module, stages, "apply",
+            PlanError("MAINLINE_CANDIDATE_NOT_MODULE",
+                      "apply_symbolic_pipeline returned %s, not a candidate Module"
+                      % (type(candidate).__name__,)))
+    try:
+        verdict = _verify(module, candidate_module, plan, completion, storage,
+                          source_map=source_map)
+        stages.append("verify")
+    except Exception as error:  # noqa: BLE001
+        return _refused_record(module, stages, "verify", error)
+    if getattr(verdict, "status", "") != "VERIFIED":
+        return _refused_record(
+            module, stages, "verify",
+            PlanError(getattr(verdict, "code", "") or "MAINLINE_VERIFY_REFUSED",
+                      str(getattr(verdict, "detail", ""))[:300]))
+
+    # ---- emit / compile -------------------------------------------------------
+    # Emit from the CANDIDATE: the artifact must describe the TIR that will be
+    # installed, and the candidate is a distinct object from the source entry.
+    from ..codegen import compile_supported_artifact, emit_supported_tl
+
+    try:
+        artifact = emit_supported_tl(candidate_module, plan, completion, storage,
+                                     candidate_module.entry_function().target)
+    except Exception as error:  # noqa: BLE001
+        return _refused_record(module, stages, "apply", error)
+    try:
+        artifact = compile_supported_artifact(artifact)
+    except Exception as error:  # noqa: BLE001 - the compile site states why
+        # A blocked toolchain is not a stage failure of the transaction: the source
+        # layer succeeded, and the gate reports the binary layer separately. Record
+        # what ran and let the gate name the binary gap.
+        record = _refused_record(module, stages, "verify", error)
+        _attach_artifacts(module, plan, completion, storage, artifact, record)
+        return record
+
+    # ---- install --------------------------------------------------------------
+    try:
+        installed = install_entry(module, candidate_module.entry_function(),
+                                  conformance=verdict, tl_artifact=artifact)
+        stages.append("install")
+    except Exception as error:  # noqa: BLE001
+        record = _refused_record(module, stages, "install", error)
+        _attach_artifacts(module, plan, completion, storage, artifact, record)
+        return record
+
+    # The record describes the CALLER module, because that is what the gate is asked
+    # about: install_entry returns a NEW Module and leaves the source untouched, so
+    # taking identity from the installed one made ir_identity and entry_identity
+    # disagree with the module under judgement (measured: STALE_IR_IDENTITY plus
+    # ENTRY_IDENTITY_MISMATCH). The candidate entry is recorded separately - it is
+    # the object the artifact binds to.
+    record = _applied_record(module, module.entry_function(), stages, plan,
+                             completion, storage, artifact=artifact,
+                             candidate_entry=installed.entry_function())
+    # 'export' is the gate's own judgement, made after this record exists; it is
+    # recorded by require_export_ready rather than claimed here.
+    # install_entry returns a NEW Module whose metadata is a COPY, so writing only to
+    # the installed object leaves the CALLER module with none of this evidence -
+    # measured: the gate then reported every stage unevidenced because the caller
+    # metadata was empty. The artifacts go to BOTH, so the two agree.
+    _attach_artifacts(installed, plan, completion, storage, artifact, record)
+    _attach_artifacts(module, plan, completion, storage, artifact, record)
+    return record
+
+
+def _attach_artifacts(module, plan, completion, storage, artifact, record):
+    """Put the real artifacts where the export gate reads them.
+
+    ONE place, so a stage that stops early still leaves the evidence it DID produce -
+    which is what lets the gate name the layer that is missing instead of reporting
+    every layer absent at once.
+    """
+    from ..passes.gate_layers import CANDIDATE_ENTRY_KEY
+    from ..passes.p3_chain import (CHAIN_KEY, COMPLETION_KEY, PLAN_KEY, STORAGE_KEY,
+                                   TL_ARTIFACT_KEY)
+
+    # The candidate ENTRY object, so the gate can bind the artifact to the program
+    # that will actually run - an identity string would be another self-report.
+    entry = None
+    try:
+        entry = module.entry_function()
+    except Exception:  # noqa: BLE001 - an unidentifiable module is the gate's gap
+        entry = None
+    # The CANDIDATE entry is written by _applied_record (or by the install stage).
+    # Writing the SOURCE entry here would point the artifact binding at the wrong
+    # object and make a correct artifact look misattributed.
+    if CANDIDATE_ENTRY_KEY not in module.metadata and entry is not None:
+        module.metadata[CANDIDATE_ENTRY_KEY] = entry
+    module.metadata[PLAN_KEY] = plan
+    module.metadata[COMPLETION_KEY] = completion
+    module.metadata[STORAGE_KEY] = storage
+    module.metadata[TL_ARTIFACT_KEY] = artifact
+    module.metadata[CHAIN_KEY] = record
 
 
 def _refused_record(module, stages, stopped_at, error):
@@ -304,51 +481,23 @@ def _refused_record(module, stages, stopped_at, error):
     )
 
 
-def _applied_record(module, entry, stages, plan, completion, storage):
-    """APPLIED, with every artifact attached so the gate can re-derive its own view.
+def _applied_record(module, entry, stages, plan, completion, storage, *, artifact,
+                    candidate_entry=None):
+    """APPLIED, recording the stages that REALLY ran, in frozen order.
 
-    The artifacts go into module.metadata under the keys the export gate reads, in
-    ONE place: the gate never trusts the record's identity strings when it can
-    recompute them, but it needs the OBJECTS to recompute from.
+    The artifact is passed in rather than produced here: by the time this runs, apply,
+    verify, compile and install have happened in _run_transaction, and re-emitting
+    would produce a second, possibly different artifact. The applied tuple is the
+    stages actually completed - never SINGLE_TRANSACTION by assumption, which is the
+    self-report the export gate must not (and no longer does) trust:
+    gate_layers.chain_gaps re-derives completion from the artifacts instead.
     """
-    from ..codegen import compile_supported_artifact, emit_supported_tl
-    from ..passes.p3_chain import (CHAIN_KEY, COMPLETION_KEY, PLAN_KEY,
-                                   STORAGE_KEY, TL_ARTIFACT_KEY, ChainRecord,
-                                   ir_identity)
+    from ..passes.gate_layers import CANDIDATE_ENTRY_KEY
+    from ..passes.p3_chain import ChainRecord, ir_identity
 
-    target = entry.target
-    try:
-        artifact = emit_supported_tl(module, plan, completion, storage, target)
-        stages = tuple(stages) + ("apply",)
-    except Exception as error:  # noqa: BLE001
-        return _refused_record(module, stages, "apply", error)
-    try:
-        artifact = compile_supported_artifact(artifact)
-        stages = stages + ("verify",)
-    except Exception as error:  # noqa: BLE001 - the compile site states why
-        # The artifact is still real and still worth attaching: the gate reports
-        # the binary layer separately, and a missing compile must not erase the
-        # evidence that emit/parse succeeded.
-        record = ChainRecord(
-            ir_identity=ir_identity(module),
-            entry_identity=function_identity(entry),
-            plan_identity=plan.plan_identity,
-            completion_identity=completion.identity,
-            storage_identity=storage.identity,
-            tl_identity=artifact.tl_identity,
-            pipeline_status="REFUSED",
-            applied=stages,
-            stopped_at="verify",
-            reason=getattr(error, "code", None) or type(error).__name__,
-        )
-        module.metadata[PLAN_KEY] = plan
-        module.metadata[COMPLETION_KEY] = completion
-        module.metadata[STORAGE_KEY] = storage
-        module.metadata[TL_ARTIFACT_KEY] = artifact
-        module.metadata[CHAIN_KEY] = record
-        return record
-
-    record = ChainRecord(
+    if candidate_entry is not None:
+        module.metadata[CANDIDATE_ENTRY_KEY] = candidate_entry
+    return ChainRecord(
         ir_identity=ir_identity(module),
         entry_identity=function_identity(entry),
         plan_identity=plan.plan_identity,
@@ -356,13 +505,7 @@ def _applied_record(module, entry, stages, plan, completion, storage):
         storage_identity=storage.identity,
         tl_identity=artifact.tl_identity,
         pipeline_status="APPLIED",
-        applied=stages,
+        applied=tuple(stages),
         stopped_at="",
         reason="",
     )
-    module.metadata[PLAN_KEY] = plan
-    module.metadata[COMPLETION_KEY] = completion
-    module.metadata[STORAGE_KEY] = storage
-    module.metadata[TL_ARTIFACT_KEY] = artifact
-    module.metadata[CHAIN_KEY] = record
-    return record

@@ -549,6 +549,15 @@ def _carried_roots(entry, region) -> dict:
     the loop body is a fresh object each time, so its reads and writes are same-
     generation by construction. This is measured from the real TIR positions, not
     assumed from the buffer name or its domain.
+
+    READ THIS BEFORE CHANGING THE DISTANCE RULE. A carried pair's two accesses
+    carry the SAME generation symbol (both are the loop's induction Var), so any
+    implementation that tests "same generation" FIRST answers distance 0 and the
+    carried relation disappears. A distance-0 self edge says t >= t + latency,
+    which is unsatisfiable for any positive latency, so the symptom is not a
+    silently weak plan but UNSAT_WITHIN_DECLARED_II_BOUNDS from the solver -
+    measured while landing this, after the same-symbol check was tried first.
+    Hence the order in _generation_distance: carried, then same generation.
     """
     from tilefoundry.ir.tir.stmts import (ExecutionScope, For, LetStmt, MeshScope,
                                           Sequential)
@@ -630,8 +639,13 @@ def _generation_distance(left, right, *, carried: bool = False,
     now the fallback for the cases the facts do not pin down, which is what
     lets a carried relation be stated instead of merely forbidden.
     """
-    if _same_generation(left, right):
-        return 0
+    # CARRIED FIRST. A carried pair's two accesses carry the SAME generation
+    # symbol (both are the loop's own induction Var), so testing sameness first
+    # would answer 0 and hide the relation the pair actually states: iteration
+    # k+1's read is served by iteration k's write. Measured the hard way - the
+    # same-symbol check ran first and every carried edge came out distance 0,
+    # which the solver then reported as UNSAT because a distance-0 self edge
+    # says t >= t + latency.
     if carried:
         step = 1 if loop_step is None else int(loop_step)
         if step != 1:
@@ -642,6 +656,8 @@ def _generation_distance(left, right, *, carried: bool = False,
                 "distance this slice derives"
                 % (left.access_id, right.access_id, step))
         return 1
+    if _same_generation(left, right):
+        return 0
     raise ProblemError(
         "PROBLEM_DEPENDENCE_DISTANCE_UNSUPPORTED",
         "access %s (generation %r) and access %s (generation %r) are not the same "

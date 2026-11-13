@@ -157,7 +157,21 @@ def test_effects_and_accesses_come_from_real_param_defs():
             assert all(effect_id.startswith("effect:") for effect_id in edge.effect_ids)
     kinds = [(edge.kind, edge.producer, edge.consumer)
              for region in problem.regions for edge in region.edges]
-    assert kinds == [("RAW", "unit:0", "unit:3"), ("RAW", "unit:1", "unit:2")]
+    # The loop region states THREE edges, not one: the intra-iteration producer
+    # ->consumer pair, and the CARRIED self edge (unit:2 -> unit:2) that says
+    # iteration k+1's read of the loop-carried slice is served by iteration k's
+    # write. That pair used to be dropped silently because both accesses belong
+    # to the same task; a distance-0 self edge would be unsatisfiable, so it is
+    # stated at distance 1 and that is asserted here, not just its presence.
+    assert kinds == [("RAW", "unit:0", "unit:3"),
+                     ("RAW", "unit:1", "unit:2"),
+                     ("RAW", "unit:2", "unit:2")]
+    carried = [edge for region in problem.regions for edge in region.edges
+               if edge.producer == edge.consumer]
+    assert len(carried) == 1, carried
+    assert int(carried[0].distance) == 1, "a carried pair is one iteration apart"
+    assert carried[0].delay_fact.state != "PROVEN_ZERO", \
+        "a carried edge can never be in the proven-zero family"
 
 
 def test_problem_has_the_complete_finite_sets_and_stage_order():

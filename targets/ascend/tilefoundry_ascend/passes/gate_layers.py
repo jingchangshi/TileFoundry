@@ -25,11 +25,14 @@ instead of a blanket "not implemented".
 from __future__ import annotations
 
 __all__ = ["install_gaps", "tl_conformance_gaps", "binary_gaps", "abi_gaps",
-           "event_gaps", "plan_gaps", "completion_gaps"]
+           "event_gaps", "plan_gaps", "completion_gaps", "recorded_unproven",
+           "chain_gaps", "stage_report", "TRANSACTION_STAGES",
+           "CANDIDATE_ENTRY_KEY"]
 
 #: Sync op class names the candidate may carry, from tilefoundry/ir/tir/flag.py
 #: and the Ascend subclasses in tilefoundry_ascend/sync.py.
-_EVENT_OP_NAMES = frozenset({"FlagSet", "FlagWait", "AivFlagSet", "AivFlagWait"})
+_EVENT_OP_NAMES = frozenset({"FlagSet", "FlagWait", "AivFlagSet", "AivFlagWait",
+                             "Drain", "AivDrain"})
 
 
 def _receipt_for_entry(entry):
@@ -61,6 +64,118 @@ def _receipt_for_entry(entry):
             return receipt
     return None
 
+
+
+#: The frozen transaction stages, in order. Kept here as the JUDGE's copy: the gate
+#: must not learn what "complete" means from the record it is judging.
+TRANSACTION_STAGES = ("freeze", "analyze", "solve", "resolve", "completion",
+                      "storage", "apply", "verify", "install", "export")
+
+
+def chain_gaps(metadata, record):
+    """Which transaction stages are evidenced by ARTIFACTS, not by the record.
+
+    THE FIELD THE RECORD CARRIES IS NOT EVIDENCE. Measured: a hand-made ChainRecord
+    with pipeline_status=APPLIED and applied=SINGLE_TRANSACTION, with NOTHING run,
+    produced ZERO chain gaps - the gate believed the self-report. That is the
+    R21/R22 shape again (a stored field treated as authority), and it is the fourth
+    time it has appeared in this tree.
+
+    So this function never reads record.applied. It asks instead: is the artifact each
+    stage would produce actually present, and do the artifacts bind to each other?
+
+        analyze/solve/resolve -> a real ResolvedPlan in metadata
+        completion            -> a real CompletionPlan whose plan_identity is that plan
+        storage               -> a real StoragePlan bound to the same plan+completion
+        apply/verify          -> a TL artifact whose tir_identity is the installed or
+                                 candidate entry the receipt proved
+        install               -> a verifier receipt, plus a candidate entry that
+                                 metadata or the module actually carries
+        export                -> this gate, judged after the record exists
+
+    A record that claims more than the artifacts show is refused; a record that claims
+    less still cannot make artifacts disappear, so the two directions are independent.
+    """
+    # Imported lazily from p3_chain (which imports this module), so the metadata KEY
+    # contract has one definition and cannot drift between the writer and the judge.
+    from .p3_chain import (COMPLETION_KEY, PLAN_KEY, STORAGE_KEY, TL_ARTIFACT_KEY)
+
+    from ..completion import CompletionPlan
+    from ..plan.resolved import ResolvedPlan
+    from ..storage import StoragePlan
+
+    gaps = []
+    plan = metadata.get(PLAN_KEY)
+    completion = metadata.get(COMPLETION_KEY)
+    storage = metadata.get(STORAGE_KEY)
+    artifact = metadata.get(TL_ARTIFACT_KEY)
+
+    if not isinstance(plan, ResolvedPlan):
+        gaps.append(("chain", "PLAN_STAGE_UNEVIDENCED"))
+    if not isinstance(completion, CompletionPlan):
+        gaps.append(("chain", "COMPLETION_STAGE_UNEVIDENCED"))
+    elif isinstance(plan, ResolvedPlan) and completion.plan_identity != plan.plan_identity:
+        gaps.append(("chain", "COMPLETION_NOT_BOUND_TO_PLAN"))
+    if not isinstance(storage, StoragePlan):
+        gaps.append(("chain", "STORAGE_STAGE_UNEVIDENCED"))
+    elif isinstance(plan, ResolvedPlan) and storage.plan_identity != plan.plan_identity:
+        gaps.append(("chain", "STORAGE_NOT_BOUND_TO_PLAN"))
+    if artifact is None:
+        gaps.append(("chain", "APPLY_STAGE_UNEVIDENCED"))
+    else:
+        entry = _installed_entry(metadata)
+        if entry is not None:
+            from ..plan.identity import function_identity
+
+            try:
+                want = function_identity(entry)
+            except Exception:  # noqa: BLE001 - an unidentifiable entry is the gap
+                want = ""
+            if want and getattr(artifact, "tir_identity", "") != want:
+                gaps.append(("chain", "ARTIFACT_NOT_BOUND_TO_ENTRY"))
+    # install: a verifier receipt for the entry the module now carries.
+    receipt = _receipt_for_entry(_installed_entry(metadata))
+    if receipt is None:
+        gaps.append(("chain", "INSTALL_STAGE_UNEVIDENCED"))
+    return gaps
+
+
+#: Where the transaction records the candidate entry object it installed. A key of
+#: this gate's own, because the artifact can only be bound to an ENTRY and an entry
+#: is an object, not an identity string.
+CANDIDATE_ENTRY_KEY = "ascend.native_mainline_candidate_entry"
+
+
+def _installed_entry(metadata):
+    """The candidate entry this metadata describes, if one is recorded."""
+    return metadata.get(CANDIDATE_ENTRY_KEY)
+
+
+def stage_report(metadata, record):
+    """The stages artifacts evidence, for reporting beside the gate's decision.
+
+    Deliberately separate from chain_gaps: this is informational (a reader can see
+    how far the real chain got), while chain_gaps is the judgement. Also states any
+    stage the RECORD claims but the artifacts do not evidence, so an inflated record
+    is visible rather than merely refuted.
+    """
+    from .p3_chain import COMPLETION_KEY, PLAN_KEY, STORAGE_KEY, TL_ARTIFACT_KEY
+
+    evidenced = [stage for stage in TRANSACTION_STAGES if stage in ("freeze",)]
+    if metadata.get(PLAN_KEY) is not None:
+        evidenced += ["analyze", "solve", "resolve"]
+    if metadata.get(COMPLETION_KEY) is not None:
+        evidenced.append("completion")
+    if metadata.get(STORAGE_KEY) is not None:
+        evidenced.append("storage")
+    if metadata.get(TL_ARTIFACT_KEY) is not None:
+        evidenced += ["apply", "verify"]
+    if _receipt_for_entry(_installed_entry(metadata)) is not None:
+        evidenced.append("install")
+    claimed = tuple(getattr(record, "applied", ()) or ())
+    unevidenced = [stage for stage in claimed if stage not in evidenced]
+    return {"evidenced": evidenced, "claimed_but_unevidenced": unevidenced,
+            "record_claims_complete": claimed == TRANSACTION_STAGES}
 
 def install_gaps(entry):
     """(i) the installed candidate came from a verifier-issued receipt."""
@@ -145,6 +260,30 @@ def tl_conformance_gaps(artifact, entry):
     if verdict.status != "VERIFIED" and not gaps:
         gaps.append(("tl", "TL_CONFORMANCE_%s" % verdict.status))
     return gaps
+
+
+def recorded_unproven(artifact, entry):
+    """Layers emitted from a DECLARED reference mapping, passed through verbatim.
+
+    NOT a gap and NOT a refusal, on purpose. A gap caps the verdict at INCOMPLETE
+    because a required layer was never observed; here the layer WAS emitted, from a
+    mapping whose semantics are unproven. Treating it as a gap would keep a reachable
+    positive permanently closed; dropping it would hide the uncertainty. So the gate
+    reports it alongside ready/gaps, and anyone reading the gate sees both that the
+    program is authorized AND that one lowering in it is reference-only.
+
+    Read from the artifact's own emitted statements, so it describes what was emitted
+    rather than what a caller says about it.
+    """
+    if artifact is None:
+        return ()
+    found = {}
+    for statement in getattr(getattr(artifact, "emitted", None), "body", None) \
+            and artifact.emitted.body.statements() or ():
+        record = getattr(statement, "reference_mapping", None)
+        if record:
+            found.setdefault(str(statement.surface), dict(record))
+    return tuple(sorted(found.items()))
 
 
 def binary_gaps(artifact):
@@ -301,6 +440,11 @@ def event_gaps(candidate_entry, completion):
     if candidate_entry is None or completion is None:
         return []
     present = _collect_event_ops(candidate_entry)
+    # A DRAIN is a sync statement too. Counting only flags meant a program whose
+    # obligations are all EXIT drains - which is exactly a DMA-only kernel - reported
+    # "no sync statement present" while carrying real drains, so a correct candidate
+    # was refused. The obligation side already counts sites and channels of every
+    # reason, so the statement side must count every sync op, not flags alone.
     owed = len(getattr(completion, "sites", ())) + len(getattr(completion, "channels", ()))
     if owed and not present:
         return [("event", "TL_EVENT_LOWERING_UNOBSERVED")]

@@ -421,37 +421,113 @@ def _authoritative_ids() -> list:
     return ["%s/%s" % (row["case"], row["case_id"]) for row in rows]
 
 
+#: The source files the registry may name, as PATHS THE VALIDATOR READS. A
+#: source_file the registry states but this map does not know is refused: an
+#: annotation the validator ignores would be a decorative field.
+SOURCE_FILES = {
+    "work_package/cases/case_matrix.json": CASE_MATRIX,
+    "work_package/cases/supplemental_mla.json": SUPPLEMENTAL,
+}
+
+
 def _source_indices() -> dict:
-    """The source files as per-case facts: key, case id, operator and dtype.
+    """Every case the source files declare, grouped BY THE FILE THEY NAME.
 
-    v2 copies these verbatim, so binding is plain equality with the sources and
-    no rename rule exists anywhere. The earlier suffix binding was a transition
-    state for a notation the v1 artifact had invented; keeping it would preserve
-    that defect as a rule.
+    The registry states source_file per case, and this function reads exactly
+    that file: the annotation is bound rather than trusted, so naming a file the
+    case did not come from is a refusal, not a cosmetic difference. A validator
+    that read fixed paths instead would leave the field decorative.
 
-    source_case_id is NOT a global anchor: the 40 authoritative cases reuse ints
-    1..20 once per operator (24 distinct values serve all 44 entries), so a
-    global set comparison is satisfiable while proving almost nothing. The case
-    is bound PER OPERATOR as (case, case_id), which is unique, plus the key set,
-    which is globally unique.
+    The supplemental source declares NO case/operator field (measured: its cases
+    carry case_id/dtypes/key/purpose/status and no case), so operator is sourced
+    only for the authoritative matrix; the supplemental cases are bound on key,
+    case_id and dtypes, which is what that file actually states.
     """
-    matrix = json.loads(CASE_MATRIX.read_text())
-    rows = matrix["cases"] if isinstance(matrix, dict) else matrix
-    supplemental = json.loads(SUPPLEMENTAL.read_text())
-    extra = (supplemental["cases"] if isinstance(supplemental, dict)
-             else supplemental)
     by_key = {}
-    for row in rows:
-        by_key[str(row["key"])] = {"operator": str(row["case"]),
-                                   "case_id": row["case_id"],
-                                   "dtypes": tuple(str(item) for item in
-                                                   row.get("dtypes") or ())}
-    for row in extra:
-        by_key[str(row["key"])] = {"operator": "supplemental_mla",
-                                   "case_id": row.get("case_id"),
-                                   "dtypes": tuple(str(item) for item in
-                                                   row.get("dtypes") or ())}
+    for name, path in SOURCE_FILES.items():
+        if not path.is_file():
+            raise Blocked(BLOCKED, "the source file named by the registry is "
+                                   "missing" % (), str(path))
+        data = json.loads(path.read_text())
+        rows = data["cases"] if isinstance(data, dict) else data
+        for row in rows:
+            by_key[str(row["key"])] = {
+                "source_file": name,
+                "operator": str(row["case"]) if row.get("case") is not None else None,
+                "case_id": row.get("case_id"),
+                "dtypes": tuple(str(item) for item in row.get("dtypes") or ()),
+            }
     return by_key
+
+def _bind_case_ids(ids, cases) -> None:
+    """Bind every case to the source index, field by field, verbatim.
+
+    Four questions, four assertions:
+      * the KEY SET is the unique global anchor (44 distinct keys);
+      * REVERSE: a source_key no source states does not exist, so a fabricated
+        key is refused rather than ignored;
+      * per case, (operator, source_case_id) is the source (case, case_id) and the
+        dtype is one the source case carries - compared PER CASE, never as a
+        global set, because the authoritative ids repeat across operators;
+      * case_id stays registry-local (its own contract) but must be present and
+        unique, and each case supplemental marker must agree with its operator.
+    """
+    source = _source_indices()
+    expected_keys = set(source)
+    by_key = {str(case.get("source_key", "")) for case in cases}
+    if by_key != expected_keys:
+        raise Blocked(BLOCKED, "the registered source keys are not the source "
+                               "files keys: missing=%s extra=%s"
+                      % (sorted(expected_keys - by_key),
+                         sorted(by_key - expected_keys)), "case set")
+    if len(by_key) != len(cases):
+        raise Blocked(BLOCKED, "two cases share one source key", "case set")
+    unsupported = [case.get("case_id") for case in cases
+                   if str(case.get("source_key", "")) not in expected_keys]
+    if unsupported:
+        raise Blocked(BLOCKED, "case(s) %s carry a source_key no source file "
+                               "states" % (unsupported,), "case set")
+    for case in cases:
+        record = source.get(str(case.get("source_key", "")))
+        if record is None:
+            continue
+        stated_file = str(case.get("source_file", ""))
+        if stated_file not in SOURCE_FILES:
+            raise Blocked(BLOCKED, "case %r names source_file %r, which this "
+                                   "validator does not read"
+                          % (case.get("case_id"), stated_file), "case set")
+        if stated_file != record["source_file"]:
+            raise Blocked(BLOCKED, "case %r states source_file %r but its "
+                                   "source_key is declared by %r"
+                          % (case.get("case_id"), stated_file,
+                             record["source_file"]), "case set")
+        if record["operator"] is not None and \
+                str(case.get("operator")) != record["operator"]:
+            raise Blocked(BLOCKED, "case %r states operator %r while the source "
+                                   "case is %r"
+                          % (case.get("case_id"), case.get("operator"),
+                             record["operator"]), "case set")
+        if str(case.get("source_case_id")) != str(record["case_id"]):
+            raise Blocked(BLOCKED, "case %r states source_case_id %r while the "
+                                   "source case is %r"
+                          % (case.get("case_id"), case.get("source_case_id"),
+                             record["case_id"]), "case set")
+        if record["dtypes"] and str(case.get("dtype")) not in record["dtypes"]:
+            raise Blocked(BLOCKED, "case %r states dtype %r, which the source case "
+                                   "does not carry"
+                          % (case.get("case_id"), case.get("dtype")), "case set")
+    local = [str(case.get("case_id", "")) for case in cases]
+    if any(not value for value in local) or len(set(local)) != len(local):
+        raise Blocked(BLOCKED, "a case_id is empty or repeated", "case set")
+    for case in cases:
+        has_marker = "supplemental" in case
+        is_supplemental = str(case.get("source_file", "")).endswith(
+            "supplemental_mla.json")
+        if has_marker != is_supplemental:
+            raise Blocked(BLOCKED, "case %r states supplemental=%r, which does not "
+                                   "match its operator"
+                          % (case.get("case_id"), case.get("supplemental")),
+                          "case set")
 
 def _require_case_set(registry: dict) -> None:
     """The case SET is what the registry claims it enumerated.
@@ -499,48 +575,7 @@ def _require_case_set(registry: dict) -> None:
         raise Blocked(BLOCKED, "the registry holds %d supplementary case(s), not "
                                "the declared %d"
                       % (supplementary_count, expected_supplementary), "case set")
-    # Bind to the EXTERNAL indices: a count inside the same JSON cannot certify
-    # the JSON. The authoritative ids must be exactly the matrix ids, and the
-    # supplemental ids are bound on the SUFFIX both sides agree on (the prefix
-    # the registry writes is a known defect recorded in the draft, not something
-    # a validator may silently rename into agreement).
-    external = _authoritative_ids()
-    authoritative_ids = [case_id for case_id in ids
-                         if "supplemental" not in case_id]
-    if sorted(authoritative_ids) != sorted(external):
-        missing = sorted(set(external) - set(authoritative_ids))
-        extra = sorted(set(authoritative_ids) - set(external))
-        raise Blocked(BLOCKED, "the authoritative case ids are not the case "
-                               "matrix's: missing=%s extra=%s" % (missing, extra),
-                      "case set")
-    suffixes = _supplemental_suffixes()
-    registry_supplemental = [case_id.rpartition("/")[2]
-                             for case_id in ids
-                             if "supplemental" in case_id]
-    for case_id in ids:
-        if "supplemental" not in case_id:
-            continue
-        prefix = case_id.rpartition("/")[0]
-        if prefix != "mla_supplemental":
-            raise Blocked(BLOCKED, "supplemental id %r does not use the registered "
-                                   "prefix" % (case_id,), "case set")
-    if sorted(registry_supplemental) != sorted(suffixes):
-        raise Blocked(BLOCKED, "the supplemental case ids are not the source file's "
-                               "case ids: missing=%s extra=%s"
-                      % (sorted(set(suffixes) - set(registry_supplemental)),
-                         sorted(set(registry_supplemental) - set(suffixes))),
-                      "case set")
-    # The two key SHAPES are both legal: the 40 authoritative cases carry no
-    # supplemental key, the 4 do. Asserting one uniform field set would call the
-    # complete artifact wrong.
-    for case in cases:
-        has_marker = "supplemental" in case
-        is_supplemental = "supplemental" in str(case.get("case_id", ""))
-        if has_marker != is_supplemental:
-            raise Blocked(BLOCKED, "case %r states supplemental=%r, which does not "
-                                   "match its id" % (case.get("case_id"),
-                                                     case.get("supplemental")),
-                          "case set")
+
 
 def _require_distribution(registry: dict) -> None:
     """The cases must be the distribution the registry declares.
@@ -763,6 +798,7 @@ def test_a_case_whose_dtype_has_no_table_entry_is_blocked():
     """A dtype the TABLE carries is still wrong if this case is not that dtype."""
     case = json.loads(json.dumps(_load()["cases"][0]))
     case["dtype"] = "float8_e5m2"
+    case["source_key"] = _load()["cases"][0]["source_key"]
     case["threshold_entry"] = {
         "order": list(FIELDS),
         "source_forms": ["2 ** -2", "2 ** -3", "2 ** -5", "1.0", "1.0"],
@@ -773,7 +809,11 @@ def test_a_case_whose_dtype_has_no_table_entry_is_blocked():
     with pytest.raises(Blocked) as caught:
         validate(registry)
     assert caught.value.code == BLOCKED
-    assert "distribution" in (caught.value.detail + " " + caught.value.where)
+    # a case cannot borrow another case's dtype: the source case states its own,
+    # so the refusal comes from the per-case binding before any distribution
+    # arithmetic, which is the more precise place for it.
+    assert ("dtype" in caught.value.detail
+            or "distribution" in caught.value.detail), caught.value.detail
 
 
 def test_a_missing_field_is_blocked():
@@ -849,12 +889,13 @@ def test_a_tree_anchor_line_that_no_longer_reads_as_registered_is_blocked():
 def test_deleting_one_case_is_named_as_a_case_set_failure():
     """43 of 44 must fail for the RIGHT reason, not as a dtype-count side effect."""
     registry = _load()
-    registry["cases"] = registry["cases"][:-1]
+    dropped = registry["cases"].pop()
     with pytest.raises(Blocked) as caught:
         validate(registry)
     assert caught.value.code == BLOCKED
     assert "case set" in caught.value.where, caught.value
-    assert "case" in caught.value.detail
+    # the missing SOURCE KEY is named, which is the anchor a deletion breaks
+    assert dropped["source_key"] in caught.value.detail, caught.value.detail
 
 
 def test_a_dropped_authoritative_case_is_named_as_a_case_set_failure():
@@ -865,44 +906,32 @@ def test_a_dropped_authoritative_case_is_named_as_a_case_set_failure():
         validate(registry)
     assert caught.value.code == BLOCKED
     assert "case set" in caught.value.where, caught.value
-    assert dropped["case_id"] in caught.value.detail, caught.value.detail
+    # the message names the SOURCE key that vanished, which is the global anchor
+    assert dropped["source_key"] in caught.value.detail, caught.value.detail
 
 
 def test_dropping_a_supplemental_case_is_named_as_a_case_set_failure():
     registry = _load()
     # drop exactly ONE supplemental case; the other three stay
+    dropped = None
     for index, case in enumerate(registry["cases"]):
-        if "supplemental" in case["case_id"]:
-            del registry["cases"][index]
+        if "supplemental" in str(case.get("source_file", "")):
+            dropped = registry["cases"].pop(index)
             break
+    assert dropped is not None
     with pytest.raises(Blocked) as caught:
         validate(registry)
     assert caught.value.code == BLOCKED
     assert "case set" in caught.value.where, caught.value
+    assert dropped["source_key"] in caught.value.detail, caught.value.detail
 
 
-def test_the_supplemental_binding_uses_the_source_case_ids():
-    """The registry prefix is not either source spelling; binding is on suffix.
-
-    The registrant wrote mla_supplemental/<suffix> while the file carries
-    case_id=<suffix> and key=supplemental/mla_<suffix>. A validator that
-    demanded literal equality would call the complete artifact wrong, and one
-    that invented a corrected spelling would hide the recorded defect; the
-    suffix is the part both sides actually state.
-    """
-    registry = _load()
-    suffixes = sorted(case["case_id"].rpartition("/")[2]
-                      for case in registry["cases"]
-                      if "supplemental" in case["case_id"])
-    assert suffixes == sorted(_supplemental_suffixes())
-    assert len(suffixes) == 4
-
-
-def test_a_renamed_supplemental_suffix_is_blocked():
+def test_a_renamed_source_key_is_blocked():
+    """The source key is the anchor: a case cannot carry one no source states."""
     registry = _load()
     for case in registry["cases"]:
-        if "supplemental" in case["case_id"]:
-            case["case_id"] = "mla_supplemental/not_a_source_case"
+        if "supplemental" in str(case.get("source_file", "")):
+            case["source_key"] = "supplemental/mla_not_a_source_case"
             break
     with pytest.raises(Blocked) as caught:
         validate(registry)
@@ -926,3 +955,50 @@ def test_both_key_shapes_are_accepted_and_a_mismatched_marker_is_blocked():
         validate(broken)
     assert caught.value.code == BLOCKED
     assert "case set" in caught.value.where
+
+
+def test_a_case_naming_a_file_its_key_did_not_come_from_is_blocked():
+    """source_file is bound, not decorative: the validator reads that path."""
+    registry = _load()
+    target = next(case for case in registry["cases"]
+                  if case["source_file"].endswith("case_matrix.json"))
+    target["source_file"] = "work_package/cases/supplemental_mla.json"
+    with pytest.raises(Blocked) as caught:
+        validate(registry)
+    assert caught.value.code == BLOCKED
+    assert "case set" in caught.value.where
+
+
+def test_a_case_naming_an_unknown_source_file_is_blocked():
+    registry = _load()
+    registry["cases"][1]["source_file"] = "/tmp/not_a_source_index.json"
+    with pytest.raises(Blocked) as caught:
+        validate(registry)
+    assert caught.value.code == BLOCKED
+    assert "case set" in caught.value.where
+
+
+def test_dropping_an_authoritative_case_leaves_the_source_case_id_set_intact():
+    """WHY source_key is the only global anchor, measured rather than argued.
+
+    The authoritative case ids repeat across operators, so a deleted case leaves
+    the source_case_id multiset satisfiable while the source_key set is not. That
+    is the executable reason the global binding uses the key.
+    """
+    registry = _load()
+    dropped = None
+    for index, case in enumerate(registry["cases"]):
+        if case["source_file"].endswith("case_matrix.json"):
+            dropped = registry["cases"].pop(index)
+            break
+    assert dropped is not None
+    source = _source_indices()
+    remaining_ids = sorted(str(case["source_case_id"]) for case in registry["cases"])
+    expected_ids = sorted(str(record["case_id"]) for record in source.values())
+    assert remaining_ids != expected_ids, (
+        "the id multiset must not cover the loss; if it did, the id would be a "
+        "global anchor and the key would not be needed")
+    with pytest.raises(Blocked) as caught:
+        validate(registry)
+    assert caught.value.code == BLOCKED
+    assert dropped["source_key"] in caught.value.detail

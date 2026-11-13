@@ -361,7 +361,14 @@ def _collect_products(root, before, ascend_source, seconds, started, cache_direc
                              "products cannot be attributed to one build" % len(matched),
                              1, tuple(matched))
     kernel_directory = matched[0]
-    binary_directory = _binary_directory_by_key(root, ascend_source)
+    # Ask the SIBLING of the directory that actually served this kernel first: the
+    # binary of one build lives beside its kernel dir under the same versioned root,
+    # and that is exact. Only then fall back to the key function against the whole
+    # root, which cannot succeed when root is the default cache and the entry lives
+    # under <root>/<version>/<plate>/.
+    binary_directory = _sibling_binary_directory(kernel_directory, ascend_source)
+    if binary_directory is None:
+        binary_directory = _binary_directory_by_key(root, ascend_source)
     if binary_directory is None:
         fresh = [path for path in _directories_holding(root, "kernel.aibin")
                  if path not in before]
@@ -586,9 +593,20 @@ def inspect_compiled_directory(kernel_directory, binary_directory, ascend_source
 def check_compiled_abi(facts, parameter_count, output_count):
     """Cross-check the binary's own ABI against the artifact's declared one.
 
-    The device kernel takes one pointer per callable parameter - inputs and
-    outputs alike - so __CCE_KernelArgSize must be exactly
-    parameter_count * 8. This is the ABI proof read_actual_tl does not make.
+    MEASURED CORRECTION. This used to require
+    __CCE_KernelArgSize == parameter_count * 8, on the theory that the kernel takes
+    one pointer per parameter. That theory is FALSIFIED by the deployed compiler:
+    compiling copy_only (2 parameters) and independent_ub (3 parameters) BOTH report
+    __CCE_KernelArgSize = 24. The section is therefore not parameter_count * 8 - the
+    toolchain reserves argument space independently of how many pointers this
+    program passes (a fixed reservation, or hidden workspace/tiling slots).
+
+    What remains true and checkable: the value must be a positive multiple of the
+    device pointer size, and it must be large enough to hold the declared
+    parameters. A kernel whose argument area is SMALLER than its own parameters
+    could not be called at all, so that direction is still a real mismatch; equality
+    is not, and asserting it refused every DMA-only kernel for a reason that was
+    never about that kernel.
     """
     if output_count > parameter_count:
         raise CompileRefusal("COMPILED_ABI_MISMATCH",
@@ -598,11 +616,20 @@ def check_compiled_abi(facts, parameter_count, output_count):
         raise CompileRefusal("COMPILED_ABI_UNOBSERVED",
                              "the binary states no %s value" % (ARG_SIZE_SECTION,),
                              parameter_count * DEVICE_POINTER_BYTES, None)
-    expected = parameter_count * DEVICE_POINTER_BYTES
-    if facts.argument_size != expected:
+    minimum = parameter_count * DEVICE_POINTER_BYTES
+    if facts.argument_size < minimum:
+        # Directional, because a smaller area than the parameters it must hold is
+        # impossible; a larger one is the toolchain's own reservation and is not this
+        # artifact's claim to make.
         raise CompileRefusal("COMPILED_ABI_MISMATCH",
-                             "the binary's kernel argument size does not match the ABI the "
-                             "artifact declares", expected, facts.argument_size)
+                             "the binary's kernel argument area (%d B) cannot hold the %d "
+                             "parameter(s) the artifact declares (%d B)"
+                             % (facts.argument_size, parameter_count, minimum),
+                             minimum, facts.argument_size)
+    if facts.argument_size % DEVICE_POINTER_BYTES != 0:
+        raise CompileRefusal("COMPILED_ABI_MISMATCH",
+                             "the kernel argument area is not a whole number of device "
+                             "pointers", DEVICE_POINTER_BYTES, facts.argument_size)
 
 
 def _unpack(fmt, raw, offset):

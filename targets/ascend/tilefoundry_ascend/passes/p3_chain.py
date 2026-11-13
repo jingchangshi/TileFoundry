@@ -204,8 +204,13 @@ def require_export_ready(module: Module, record: ChainRecord | None = None, *, r
             gaps.extend(_native_artifact_gaps(metadata, entry, record))
         if record.pipeline_status != "APPLIED":
             gaps.append(("chain", record.reason or "MAINLINE_NOT_APPLIED"))
-        if record.applied != SINGLE_TRANSACTION:
-            gaps.append(("chain", "TRANSACTION_INCOMPLETE"))
+        # THE RECORD DOES NOT GET TO SAY IT IS COMPLETE. Measured: a hand-made
+        # ChainRecord claiming applied=SINGLE_TRANSACTION with NOTHING run produced
+        # zero chain gaps, because this line used to compare record.applied against
+        # the constant - a stored field judging itself. That is the R21/R22 shape a
+        # fourth time. Completion is now derived from the artifacts: which stages
+        # left real, mutually-bound objects behind (gate_layers.chain_gaps).
+        gaps.extend(gate_layers.chain_gaps(metadata, record))
         if record.stopped_at:
             gaps.append(("chain", "CHAIN_STOPPED_AT_%s" % record.stopped_at.upper()))
     # Layered checks, replacing the earlier unconditional
@@ -231,13 +236,34 @@ def require_export_ready(module: Module, record: ChainRecord | None = None, *, r
     completion = metadata.get(COMPLETION_KEY)
     gaps.extend(gate_layers.plan_gaps(metadata, record, PLAN_KEY))
     gaps.extend(gate_layers.completion_gaps(metadata, COMPLETION_KEY, PLAN_KEY))
-    gaps.extend(gate_layers.install_gaps(entry))
-    gaps.extend(gate_layers.tl_conformance_gaps(artifact, entry))
+    # The program the ARTIFACT describes is the CANDIDATE the transaction installed, not
+    # the source entry still sitting in the caller's module. Comparing against the
+    # source entry made a correct artifact look misattributed (measured:
+    # ARTIFACT_TIR_IDENTITY_MISMATCH on a chain where every stage really ran). The
+    # candidate entry object is recorded by the transaction; when it is absent, fall
+    # back to the module's entry so an unrecorded case still gets a real comparison.
+    candidate_entry = metadata.get(gate_layers.CANDIDATE_ENTRY_KEY) or entry
+    gaps.extend(gate_layers.install_gaps(candidate_entry))
+    gaps.extend(gate_layers.tl_conformance_gaps(artifact, candidate_entry))
     gaps.extend(gate_layers.binary_gaps(artifact))
     gaps.extend(gate_layers.abi_gaps(artifact, entry))
-    gaps.extend(gate_layers.event_gaps(entry, completion))
+    # Count sync statements on the CANDIDATE, not the source entry: the
+    # candidate is what apply produced and what will run, and it carries the
+    # injected flags and drains. Judging the source entry reported "no sync" for
+    # a program full of them (measured on the DMA-only positive chain).
+    gaps.extend(gate_layers.event_gaps(candidate_entry, completion))
+    # Layers emitted from a DECLARED reference mapping travel beside ready/gaps, not
+    # inside them: they are neither a missing layer nor a refusal, and folding them
+    # into either would hide them or close the positive forever. A reader of this
+    # gate therefore always sees what in the program is reference-only.
+    unproven = gate_layers.recorded_unproven(artifact, entry)
     verdict = {"ready": not gaps, "gaps": [list(gap) for gap in gaps],
-               "pipeline": getattr(record, "pipeline_status", "") if record else ""}
+               "pipeline": getattr(record, "pipeline_status", "") if record else "",
+               "recorded_unproven": [[surface, dict(payload)]
+                                     for surface, payload in unproven],
+               # What the ARTIFACTS evidence, and anything the record claims that they
+               # do not. Reported, never used as a decision: chain_gaps decides.
+               "stages": gate_layers.stage_report(metadata, record)}
     if gaps and raising:
         first = gaps[0]
         raise ExportRefusal(
