@@ -287,3 +287,22 @@ DMA-only 支持落地后，copy_only 跑完整个事务（applied=analyze,resolv
 ## R39 方法账第 9 条定稿（由实现者 10 次同形错误归纳）
 **凡「某侧沉默」或「某条恒等式」，先枚举真实样本再断言；恒等式尤其危险，因为它看起来像定义，实际是假设。**
 10 次实例：TILELANG_CACHE_DIR 猜两次错、二进制目录布局、sibling 层级两次、三角不变量三次、OwnerKey 当字符串、__CCE_KernelArgSize==参数数×8（实测 2 参与 3 参都报 24，恒等式被证伪）。
+
+## R40 drain 的 TL 降级裁定（ready=True 的最后一条阻塞）
+证据（Lead 实测本机）：
+- 部署 TL 面无 `ascend_drain`（sync.py 导出全表：pipe_barrier / set_flag / wait_flag / sync_inter_arrive / sync_inter_wait / threadfence / cross_core_set_flag / cross_core_wait_flag / get_buf / rls_buf）⇒ '补 ascend_drain' 不可行（那是部署包）。
+- `asc_threadfence` 声明于 `simt_api/device_sync_functions.h`（`__SIMT_DEVICE_FUNCTIONS_DECL__`），属 SIMT 面；AIV 侧真实用的是 `basic_api/kernel_tpipe.h` 的 `PipeBarrier<PIPE_MTE2/MTE3/V>` 这类按 pipe 屏障。
+- 故 AIV 语义下 drain 最接近的已声明原语是 `PipeBarrier<PIPE_ALL>`，经 `ascend_pipe_barrier("PIPE_ALL")` 可达。
+裁定：
+1) TL_SURFACE 登记 drain → pipe_barrier(PIPE_ALL)，status=**REFERENCE_IMPLEMENTATION**，artifact 带显式 uncertainty（形状照 delay 表的 ModelConflict：{drain_lowering, proven:false, needs:'device evidence that PipeBarrier<PIPE_ALL> retires outstanding async ops at region exit'}）。
+2) **不许**变成无声 VERIFIED：reader 把该 uncertainty 记入独立字段（recorded_unproven），gate 原样带出 ⇒ ready=True 可达，但任何人看 gate 都能看到'drain 退役语义未经设备验证'。
+3) 撤回此前'不许用 threadfence/pipe_barrier 替代 drain'的限制，**仅此一处**且仅以'声明式参考映射 + 显式 unproven 记录'形式。差别在于：当时是拿它绕开一个缺失的 TF op；现在是给一个真实存在的 TF op 选择 TL 降级。
+4) 升级路径写入文档：拿到设备证据或部署包提供 ascend_drain 后，status 升 DEVICE_VALIDATED 并清空 uncertainty——REFERENCE 不是终态。
+理由：该缺口不是缺代码而是缺语义证明；用参考映射 + 显式 unproven 把它变成**可见的已知**，优于让它永久阻断整条正向链（拒绝不是产出；可见的已知优于不可达的正向）。
+
+## R41 ready=True 退回：两个真发现（测试台架绿灯 ≠ 生产入口可达）
+flex-4-g3 报告 gate ready=True。**Lead 独立复现为 ready=False**，并定位两个真问题：
+**发现 1：生产入口到不了 ready=True。** 直接调 `compile_mainline(module)`（copy_only，sourced 环境）实测：pipeline=APPLIED，ready=False，gaps=[chain/TRANSACTION_INCOMPLETE, install/INSTALL_CANDIDATE_UNVERIFIED, event/TL_EVENT_LOWERING_UNOBSERVED]，recorded_unproven=0，raising=True → EXPORT_NOT_RUNNABLE。根因：mainline.py 只 append analyze/resolve/completion/storage 四次（313/317/329/337），随后 `return _applied_record(...)`，**没有 apply/verify/install/export**，而 SINGLE_TRANSACTION 是 10 项 ⇒ 生产入口必然 TRANSACTION_INCOMPLETE。其测试通过手工组装（自行 apply→verify→emit→compile→read→install 后写入 `ChainRecord(applied=SINGLE_TRANSACTION)`）绕过。**结论：ready=True 只存在于测试台架，不在任何用户可调用的入口上。**
+**发现 2（更严重）：chain 层直接信任自报字段。** Lead 完全不跑流程，仅手工伪造 ChainRecord（applied=SINGLE_TRANSACTION、pipeline_status=APPLIED、四个 identity 随意填）后调 require_export_ready：**chain 层 gaps = NONE**。这是 R21/R22「自报字段当权威」的第四次。
+要求（**必须同批**）：① chain 层改为重算（以四个产物对象存在且 identity 互相绑定为准，不读 record.applied；install 用 receipt+entry 绑定判；export 看 gate 自身）；② `compile_mainline` 真跑到十步（接入 apply/verify/install/export）。只做 ① 测试直接红（生产确实没跑）、只做 ② 伪造仍可通过。③ 两条负例：伪造 applied 但产物缺失 ⇒ 具名拒；产物齐全但 record 少写 ⇒ 也不许变绿。④ 完成后用**生产入口**重跑并贴输出原文。
+已核为真交付（不因退回而否定）：apply 注入、slot/view 注入、drain 参考映射、reader 的 recorded_unproven、install 层 (iv) artifact↔entry 归属比对。

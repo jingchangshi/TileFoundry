@@ -132,6 +132,67 @@ install receipt。
 未闭合（不写成已做）：(a) storage 层仍是 stored-vs-record，`verify_storage_current` 是重算入口但需 plan/
 target/completion，未接；(b) `plan_gaps` 的 `stored` bytes 为空时跳过比较（手搓 plan 无锚），此时只靠 digest
 与 bounds 来源判定；(c) 本表只在 minimal_aiv/independent_ub 上实测。
+## 2c. 已知限制：reader 不证明 artifact 归属（必须由安装层比对）
+
+实测：`read_actual_tl` 只看 `tir_identity` **非空**、只把 `source_identity`/`tl_identity` 与
+**源码文本**摘要对比。它**从不**把 `tir_identity` 与某个 entry 的 `function_identity` 比对。
+因此把 artifact 的 `tir_identity` 伪造成 `sha256:cccc…`，reader 返回的 `(status, refusals, gaps)`
+与诚实版**完全相同**。
+
+这不是 reader 的缺陷，是职责边界：reader 回答"这段 TL 源码与这份 parse/artifact 自洽吗"，它手上
+没有、也不该有"本次要安装的是哪个候选"这个上下文。归属必须由**消费方**判定，即
+`plan/mainline.py` 的 (iv)：`artifact.tir_identity == function_identity(候选 entry)`，
+不符则 `ARTIFACT_TIR_IDENTITY_MISMATCH`。
+
+若下一个人以为 reader 已经证明了归属，就会把 (iv) 当成冗余删掉，于是"artifact 属于哪个候选"
+重新变成假设。回归：`test_s0_gate_positive::test_install_judges_the_tl_layer_instead_of_refusing_forever`
+里断言了 reader 对诚实/伪造两版 verdict 三元组**相同**，正是为了让这个边界可执行地可见。
+## 2d. 已知限制：`__CCE_KernelArgSize` 的检查是方向性的，且它不传导到 plan/completion/storage 身份
+
+登记日期 2026-11-13（implementer-g1，只读核查，未改 `codegen/`、`passes/`、`mainline.py`）。
+起因：lead 要求核实 flex-4-g3 把 `__CCE_KernelArgSize == 参数数×8` 改成方向性检查之后，
+这个字段是怎么进身份的，以及“内核签名变了但 artifact 身份不变”是否可能。
+
+**实测事实 1：等号不成立，方向性检查是对的。** 部署编译器下 copy_only（2 参数）与
+independent_ub（3 参数）**都**报 `__CCE_KernelArgSize = 24`。所以该段不是 `参数数×8`；
+当前 `codegen/ascend_binary.py:593 check_compiled_abi` 保留两条真实可查性质：
+参数区必须容纳自身声明的参数（`argument_size >= 参数数×8`）、且必须是设备指针宽度的整数倍。
+
+**实测事实 2：方向性检查放过一类错，这是已知代价。** 一个本该 32 B 的参数区被写成 24 B，
+只要该 kernel 声明的参数不超过 3 个，就同时满足“≥ 参数数×8”和“8 的倍数”，检查通过。
+这不是实现疏漏，而是 `24` 这个值被证实与参数数无关之后，**在现有观测能力下无法再收紧**：
+真值由工具链自行保留（固定预留或隐藏 workspace/tiling 槽），artifact 侧没有可比对的独立事实。
+因此不得把它写回等号，也不得据此声称 ABI 已核对完整。
+
+**实测事实 3：该字段确实进身份，但只进二进制层的身份。**
+`CompiledArtifactFacts.semantic_identity`（`codegen/ascend_binary.py:152`）的 payload 含
+`argument_size`。用两份仅 `argument_size` 不同（24 vs 32）的相同 facts 直接实测：
+`semantic_identity` **变化**（`sha256:217897ed…` vs `sha256:67f7e9e6…`），`build_identity` **不变**。
+所以在这个类内部，“参数区大小变了 ⇒ 程序身份变了”是成立的。
+
+**实测事实 4（真正的缺口）：没有任何上层身份引用 `semantic_identity`。**
+全仓 grep：`semantic_identity` 的引用只出现在 `codegen/ascend_binary.py` 自身与
+`tests_native_mainline/test_tl_emit_read.py`，**零**生产消费方。向上链路是：
+`passes/p3_chain.py:85 _artifact_identity` 只读 `identity`/`source_identity`/`tl_identity`；
+`gate_layers.binary_gaps` 只判 `artifact.compiled` 是否为 None（即“编过没有”），不比对 ABI 数值；
+`gate_layers.abi_gaps`（`:293`）只比 `output_count` 与参数 **名称**，不读 `argument_size`；
+`install_gaps` 只比 receipt 的 `plan_identity`；`tl_reader` 的 `tl_identity` 与 `compiled_facts` 并列但**不参与**其摘要。
+
+**因此结论：`argument_size` 变化 ⇒ 二进制层语义身份变化 ⇒ 但该身份不被任何上层比对，
+故“内核签名（参数区）变了而 plan/completion/storage/tl 身份不变”在**当前链路下是可能的**。
+`check_compiled_abi` 是**拒绝性检查**（在编译点拦明显不可能的参数区），不是**身份绑定**。
+
+**为什么现在不修**：把 `argument_size` 提升进上层身份，等价于要求 plan/completion/storage 的身份
+包含编译期事实，而这三层在 `compile_mainline` 到达之前就已冻结其身份（生产入口在 storage 后即返回）。
+正确形态是让 install 层在 receipt 里绑定“本次编译的 `semantic_identity`”，即 gate 侧重算而非传播，
+属 flex-4-g3 写域（`passes/`+`mainline.py`），本代理不越界改。
+
+**登记口径（谁都不许当成已闭合）**：
+1. 不得声称“ABI 已完整核对”：目前只有方向性下界与对齐两项性质，加 `output_count`、参数名。
+2. 不得声称“artifact 身份覆盖内核签名”：`argument_size` 未进入任何被比对的身份。
+3. 若要闭合，验收条件是可复现的：把同一份源码的 `argument_size` 从 X 改成 Y（同一合法范围）后，
+   **必须**有一层的身份或 receipt 改变，并有一项测试在改前绿、改后红。在满足该条件前，
+   此限制保持在册。
 ## 3. 可按序实施的 MAIN-A / MAIN-B 切分
 
 ### 3.1 唯一写者和当前路径
