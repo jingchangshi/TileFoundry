@@ -39,4 +39,15 @@ npu_compare 包外位置；20261112/ 目录内除 tf_ascend950pr_native_v3 外�
 - **更正 2**：`threshold_table.line_range` 应为 **[82, 132]**（82 是表开括号行，132 是闭合 `}` 行）；:133 属 `_FALLBACK_THRESHOLDS = CANN_BENCH_THRESHOLDS["float32"]`，不应并入表体。我先前提的 82-133 含 fallback 行。附带事实：`float8_e5m2` 末两档是 float 常量 `1.0`（非 `2**-n`），登记与校验均不得归一化。
 - **方法错误（lead 纠正）**：07:41 我据 `find` 0 命中断言 COMPARATOR_REGISTRY_DRAFT.md 不存在并推出「task-56 不能判完成」；该文件实际 mtime=**07:41:10**，与我的观察落在同一分钟——结论建立在**落盘之前的瞬时快照**上。教训：**瞬时快照 ≠ 持续状态**；**第二次猜测仍是猜测**（把同一条命令再跑一遍而不重新核对 mtime/HEAD/时钟边界，只是重读同一个过期快照，不构成复核）。此后凡「缺失/不存在」类断言必须附观察时刻，下结论前复查 mtime 与 HEAD 是否已前进。本轮已按此执行：addendum 前重查得 HEAD=b6d8848（registry 已入 883117e、DRAFT.md 已入 b6d8848），两文件 sha256 与字节数（b25dd485…/44239B；073bc999…/5141B/58 行）与我对 a/b/c 复核时一致，explorer-g1 报告的数字与我的独立复算吻合。
 - a/b/c 复核结论不受上述影响，且复核未把 registry 的 values 当真值（独立重折叠后逐位比对）：44/44 条 source_forms+values 与磁盘表一致、dtype 分布 AR bf16×17+fp16×3 / MLA fp16×15+bf16×5 / suppl 2+2 与源对撞无一例外、全文 PASS/通过/VERIFIED/certified 命中 0（唯一 passed 在否定句）。
-- 归属纪律：task-56 两文件均为 owner explorer-g1 落地与收尾（板上 completed rev3）；我只读复核、不判他完成、未改其文件。task-52 因 required_role=implementer 我从未认领（TEAM_ROLE_MISMATCH 即停），交付的是事实包 + 上述更正。
+- 归属纪律：task-56 两文件均为 owner explorer-g1 落地与收尾（板上 completed rev3）；我只读复核、不判他完成、未改其文件。task-52 因 required_role=implementer 我从未认领（TEAM_ROLE_MISMATCH 即停），交付的是事实包 + 上述更正与本轮六条 guard。
+
+## 8. task-52 校验器的六条 guard（本轮实测累积，均已发 lead 与 explorer-g1）
+
+1. **双向独立重推导**：从阈值表文件重新折叠再与 JSON 比对，禁止只读 JSON 的 values。实测：协调篡改（forms+values 同改、JSON 内部自洽）下自洽性检查 0 红漏检，重推导检查 2 红抓住。
+2. **case count**：断言 40 权威 + 4 supplemental = 44。实测：删到 43 条时两类折叠检查**全绿**。
+3. **字段齐全性**：必须显式 guard。实测：删任一 values 字段直接 KeyError，不会被数值检查顺带发现。
+4. **外部 id 绑定**：case_id 集合须与 work_package/cases/case_matrix.json + supplemental_mla.json 重读比对；JSON 内 `authoritative_total:40` 只是自我声明，不可当锚（实测两侧 40 条集合相等）。
+5. **supplemental 改名规则（本轮新发现）**：registry 用 `mla_supplemental/<suffix>`、源文件用 `supplemental/mla_<suffix>`；不实现该映射则绑外部集合时 4/4 假红。
+6. **key 形态分支**：实测恰有 2 种合法形态——40 条 `{case_id,dtype,operator,registration_basis,threshold_entry}`、4 条多 `supplemental:true`；统一断言字段集合会把完好件判红。
+
+比对一律走**数值折叠**（BinOp-aware：left 常量 2、op=Pow、right 一元负号；非 pow2 走 ast.Constant，`float8_e5m2` 末两档=1.0 原值），禁止字面串比对——我自己 v1/v2 两版校验器都因 `ast.unparse` 产出 `2**(-7)` vs registry 存的 `2 ** -7` 把完好件判成全红，第三版才基线绿（同属"第二次猜测仍是猜测"）。全程只读：registry `b25dd485…`、表 `e347b921…`、npu_compare `ef2506bb…` 三处 sha256 每轮复算与登记值逐字节一致；篡改实验只在内存副本上进行（见 /tmp，已清）。

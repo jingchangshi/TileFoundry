@@ -1,7 +1,7 @@
 {
-  "schema_version": "tf-ascend.comparator-registry.v1",
+  "schema_version": "tf-ascend.comparator-registry.v2",
   "draft": true,
-  "registered_at_utc": "2026-11-12T23:37:28Z",
+  "registered_at_utc": "2026-11-12T23:59:54Z",
   "operator": [
     "attention_residual",
     "mla"
@@ -205,6 +205,9 @@
       "case_id": "attention_residual/1",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_1",
+      "source_case_id": 1,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -234,6 +237,9 @@
       "case_id": "attention_residual/2",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_2",
+      "source_case_id": 2,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -263,6 +269,9 @@
       "case_id": "attention_residual/3",
       "operator": "attention_residual",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_3",
+      "source_case_id": 3,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -292,6 +301,9 @@
       "case_id": "attention_residual/4",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_4",
+      "source_case_id": 4,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -321,6 +333,9 @@
       "case_id": "attention_residual/5",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_5",
+      "source_case_id": 5,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -350,6 +365,9 @@
       "case_id": "attention_residual/6",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_6",
+      "source_case_id": 6,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -379,6 +397,9 @@
       "case_id": "attention_residual/7",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_7",
+      "source_case_id": 7,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -408,6 +429,9 @@
       "case_id": "attention_residual/8",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_8",
+      "source_case_id": 8,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -437,6 +461,9 @@
       "case_id": "attention_residual/9",
       "operator": "attention_residual",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_9",
+      "source_case_id": 9,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -466,6 +493,9 @@
       "case_id": "attention_residual/10",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_10",
+      "source_case_id": 10,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -495,6 +525,9 @@
       "case_id": "attention_residual/11",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_11",
+      "source_case_id": 11,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -524,6 +557,9 @@
       "case_id": "attention_residual/12",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_12",
+      "source_case_id": 12,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -553,6 +589,9 @@
       "case_id": "attention_residual/13",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_13",
+      "source_case_id": 13,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -582,6 +621,9 @@
       "case_id": "attention_residual/14",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_14",
+      "source_case_id": 14,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -611,6 +653,9 @@
       "case_id": "attention_residual/15",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_15",
+      "source_case_id": 15,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -640,6 +685,9 @@
       "case_id": "attention_residual/16",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_16",
+      "source_case_id": 16,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -669,6 +717,9 @@
       "case_id": "attention_residual/17",
       "operator": "attention_residual",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_17",
+      "source_case_id": 17,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -698,6 +749,9 @@
       "case_id": "attention_residual/18",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_18",
+      "source_case_id": 18,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -727,6 +781,9 @@
       "case_id": "attention_residual/19",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_19",
+      "source_case_id": 19,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -756,6 +813,9 @@
       "case_id": "attention_residual/20",
       "operator": "attention_residual",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/attention_residual_20",
+      "source_case_id": 20,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -785,6 +845,9 @@
       "case_id": "mla/1",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_1",
+      "source_case_id": 1,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -814,6 +877,9 @@
       "case_id": "mla/2",
       "operator": "mla",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_2",
+      "source_case_id": 2,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -843,6 +909,9 @@
       "case_id": "mla/3",
       "operator": "mla",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_3",
+      "source_case_id": 3,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -872,6 +941,9 @@
       "case_id": "mla/4",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_4",
+      "source_case_id": 4,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -901,6 +973,9 @@
       "case_id": "mla/5",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_5",
+      "source_case_id": 5,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -930,6 +1005,9 @@
       "case_id": "mla/6",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_6",
+      "source_case_id": 6,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -959,6 +1037,9 @@
       "case_id": "mla/7",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_7",
+      "source_case_id": 7,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -988,6 +1069,9 @@
       "case_id": "mla/8",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_8",
+      "source_case_id": 8,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -1017,6 +1101,9 @@
       "case_id": "mla/9",
       "operator": "mla",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_9",
+      "source_case_id": 9,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -1046,6 +1133,9 @@
       "case_id": "mla/10",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_10",
+      "source_case_id": 10,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -1075,6 +1165,9 @@
       "case_id": "mla/11",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_11",
+      "source_case_id": 11,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -1104,6 +1197,9 @@
       "case_id": "mla/12",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_12",
+      "source_case_id": 12,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -1133,6 +1229,9 @@
       "case_id": "mla/13",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_13",
+      "source_case_id": 13,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -1162,6 +1261,9 @@
       "case_id": "mla/14",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_14",
+      "source_case_id": 14,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -1191,6 +1293,9 @@
       "case_id": "mla/15",
       "operator": "mla",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_15",
+      "source_case_id": 15,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -1220,6 +1325,9 @@
       "case_id": "mla/16",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_16",
+      "source_case_id": 16,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -1249,6 +1357,9 @@
       "case_id": "mla/17",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_17",
+      "source_case_id": 17,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -1278,6 +1389,9 @@
       "case_id": "mla/18",
       "operator": "mla",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_18",
+      "source_case_id": 18,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -1307,6 +1421,9 @@
       "case_id": "mla/19",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_19",
+      "source_case_id": 19,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -1336,6 +1453,9 @@
       "case_id": "mla/20",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/case_matrix.json",
+      "source_key": "level4/mla_20",
+      "source_case_id": 20,
       "threshold_entry": {
         "order": [
           "threshold",
@@ -1365,6 +1485,9 @@
       "case_id": "mla_supplemental/gqa_bsnd_kv_tail",
       "operator": "mla",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/supplemental_mla.json",
+      "source_key": "supplemental/mla_gqa_bsnd_kv_tail",
+      "source_case_id": "gqa_bsnd_kv_tail",
       "supplemental": true,
       "threshold_entry": {
         "order": [
@@ -1395,6 +1518,9 @@
       "case_id": "mla_supplemental/gqa_bnsd_scale",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/supplemental_mla.json",
+      "source_key": "supplemental/mla_gqa_bnsd_scale",
+      "source_case_id": "gqa_bnsd_scale",
       "supplemental": true,
       "threshold_entry": {
         "order": [
@@ -1425,6 +1551,9 @@
       "case_id": "mla_supplemental/gqa_decode_shard448",
       "operator": "mla",
       "dtype": "float16",
+      "source_file": "work_package/cases/supplemental_mla.json",
+      "source_key": "supplemental/mla_gqa_decode_shard448",
+      "source_case_id": "gqa_decode_shard448",
       "supplemental": true,
       "threshold_entry": {
         "order": [
@@ -1455,6 +1584,9 @@
       "case_id": "mla_supplemental/gqa_query_tail",
       "operator": "mla",
       "dtype": "bfloat16",
+      "source_file": "work_package/cases/supplemental_mla.json",
+      "source_key": "supplemental/mla_gqa_query_tail",
+      "source_case_id": "gqa_query_tail",
       "supplemental": true,
       "threshold_entry": {
         "order": [
@@ -1486,5 +1618,25 @@
     "Whether the npu_compare actually imported in the S4/S5 run environment is THIS SAME FILE is not yet proven: the recorded sha256 is of the on-disk scripts under BiShengKernelAgent, while the harness only does 'from npu_compare import ...' by bare module name (cannbench_contract.py:983). PYTHONPATH in the device window decides which copy loads. Closing this needs the run-time module __file__/sha256 captured in the P0 record.",
     "The comparator has no __version__ attribute (checked: none of its scripts export one), so identity is pinned by BiShengKernelAgent commit + per-file sha256 only; if that repo moves or the file is edited, every threshold_entry in this registry must be re-folded, not trusted."
   ],
-  "non_normalisation_note": "float8_e5m2 cancel_boundary/cancel_zero_threshold are recorded AS WRITTEN: source_form '1.0', value 1.0. They are float literals, not 2**-n; consumers must not assume every field is a power of two."
+  "non_normalisation_note": "float8_e5m2 cancel_boundary/cancel_zero_threshold are recorded AS WRITTEN: source_form '1.0', value 1.0. They are float literals, not 2**-n; consumers must not assume every field is a power of two.",
+  "registry_history": {
+    "v1": {
+      "sha256": "b25dd485f640987bcfa3f50a4d08a71a3cbb0de733d268f26332a11cc2c407ce",
+      "schema_version": "tf-ascend.comparator-registry.v1",
+      "mtime_local": "2026-11-13 07:37:28.990890143 +0800",
+      "committed_at": "883117e",
+      "defect": "supplemental case_id used mla_supplemental/<suffix>, which matches NEITHER source field (case_id=<suffix>, key=supplemental/mla_<suffix>); v2 removes the need for any rename rule by storing source_key verbatim.",
+      "v1_case_ids_preserved": true
+    },
+    "v2": {
+      "change": "added source_file/source_key/source_case_id verbatim from the source files; case_id kept as the registry-local identifier",
+      "authoritative_total": 40,
+      "supplemental_total": 4
+    }
+  },
+  "binding_rules": {
+    "source_key": "byte-for-byte copy of the key field in the named source_file; validator asserts the set equality against a fresh read of those files (no rename rule)",
+    "source_case_id": "verbatim value: int for the 40 authoritative cases (1..20 per operator), str for supplemental; NOT unique across the whole registry (only 20 distinct ints serve 40 entries) so it may only be compared per-operator or as a multiset, never as a global set",
+    "case_id": "registry-local identifier, deliberately not a source field"
+  }
 }

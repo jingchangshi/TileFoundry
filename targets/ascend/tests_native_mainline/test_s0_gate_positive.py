@@ -12,7 +12,7 @@ MEASURED CEILING (this machine, CANN 9.2.0, no device, torch_npu never imported)
     copy_only       analyze, resolve, completion, storage ALL PASS
                     stops at apply   -> TL_NO_VECTOR_REGION
     independent_ub  analyze, resolve, completion ALL PASS
-                    stops at storage -> UNKNOWN_CAPACITY (space "rmem")
+                    stops at storage -> STORAGE_REGISTER_UNSOURCED (space "rmem")
     minimal_aiv     stops at resolve -> PLAN_DEPENDENCE_PROOF_UNAVAILABLE
 
 No fixture reaches ready=True, and the reason is ONE closed triangle rather than
@@ -24,9 +24,12 @@ four unrelated bugs:
   2. Every vector instruction in the ISA declares its operands in space "vreg"
      (ir/isa.py: vld/pset/vadd/vmul/vcvt), so "has a vector region" implies
      "requires an rmem buffer".
-  3. storage/__init__.py:375 refuses UNKNOWN_CAPACITY when the target states no
-     capacity for a space, and tf_target.py declares rmem capacity as None -
-     the aggregate register-file budget is genuinely UNSOURCED.
+  3. rmem is a COUNTED resource, so it goes through the register-budget gate rather
+     than the byte-capacity one: memory.REGISTER_BUDGETS declares no per-domain
+     register COUNT (only a 256 B per-register WIDTH, which is a different fact), so
+     the gate refuses with STORAGE_REGISTER_UNSOURCED. WP3 introduced that code and
+     with it the ability to PASS, once both sides are stated - which is why the
+     blocker is now a named fact gap rather than a permanent refusal.
 
 Therefore: no vector region => not emittable; vector region => rmem => storage
 refuses. The chain cannot clear both gates with the facts the target has today.
@@ -112,7 +115,11 @@ def test_every_real_fixture_reaches_a_named_stage_and_reports_it():
     expected = {
         COPY_ONLY: ("apply", "TL_NO_VECTOR_REGION",
                     ("analyze", "resolve", "completion", "storage")),
-        INDEPENDENT_UB: ("storage", "UNKNOWN_CAPACITY",
+        # STORAGE_REGISTER_UNSOURCED, not UNKNOWN_CAPACITY: WP3 split the two facts.
+        # The program places rmem registers, and what is missing is a declared
+        # per-domain register COUNT - not an address-space byte capacity. The newer
+        # code names that side; the old one only said "no capacity".
+        INDEPENDENT_UB: ("storage", "STORAGE_REGISTER_UNSOURCED",
                          ("analyze", "resolve", "completion")),
         MINIMAL_AIV: ("resolve", "PLAN_DEPENDENCE_PROOF_UNAVAILABLE", ("analyze",)),
     }
@@ -261,7 +268,7 @@ def test_the_gate_reports_the_whole_layered_refusal_for_a_real_module():
     assert len(codes) == len(set(codes)), "one code under two layers: %s" % (codes,)
 
     # The chain refusal is named at the stage where it happened.
-    assert ("chain", "UNKNOWN_CAPACITY") in rows, rows
+    assert ("chain", "STORAGE_REGISTER_UNSOURCED") in rows, rows
     assert ("chain", "CHAIN_STOPPED_AT_STORAGE") in rows, rows
     # Every artifact layer appears, because nothing was written past storage.
     for layer in ("plan", "completion", "storage", "tl", "binary", "install"):

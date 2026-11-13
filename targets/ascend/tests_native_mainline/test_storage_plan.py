@@ -141,13 +141,23 @@ def test_requirement_above_ub_capacity_is_refused_not_clipped():
     assert "not clipped" in caught.value.detail
 
 
-def test_space_without_a_capacity_fact_is_unknown_capacity():
+def test_a_register_space_is_refused_by_the_register_gate_not_by_byte_capacity():
+    """A counted register space gets the MORE PRECISE refusal, not the old one.
+
+    This used to assert UNKNOWN_CAPACITY, which said "the address space has no
+    capacity". For rmem/carrier that was the wrong layer: the resource is a COUNT
+    of registers, and what is missing is a declared per-domain register budget. The
+    code is now STORAGE_REGISTER_UNSOURCED, which names the side that is unsourced.
+    Asserting the exact code (not "any StorageError") is the point: the newer code is
+    strictly more informative and this test exists to keep that distinction.
+    """
     for space in ("rmem", "carrier"):
         buffer = _plan((_buffer("buffer:0", _var("reg", storage=space), 1),))
         with pytest.raises(StorageError) as caught:
             place_resolved_versions(buffer, None, Ascend950PRTarget(), None)
-        assert caught.value.code == "UNKNOWN_CAPACITY"
-        assert space in caught.value.subject
+        assert caught.value.code == "STORAGE_REGISTER_UNSOURCED", (
+            space, caught.value.code)
+        assert space in str(caught.value), str(caught.value)[:200]
 
 
 def test_tampered_placement_is_detected():
@@ -330,12 +340,14 @@ def test_real_inputs_verify_storage_and_tampering_still_refuses():
     assert storage.verified is False
 
 
-def test_a_real_register_plan_still_refuses_unknown_capacity():
-    """The iron rule survives a verified completion: no capacity, no placement.
+def test_a_real_register_plan_still_refuses_an_undeclared_register_budget():
+    """The iron rule survives a verified completion: no budget, no placement.
 
-    independent_ub solves and completes (its buffers include RMEM registers),
-    but the target states no capacity for that space. Placement must refuse
-    rather than backfill, even now that completion is real.
+    independent_ub solves and completes (its buffers include RMEM registers), but
+    the target declares no per-domain register COUNT and the lowering reports no
+    occupancy. Placement must refuse rather than backfill, even now that completion
+    is real - and it must refuse in the REGISTER vocabulary, because the missing
+    fact is a register budget, not an address-space capacity.
     """
     from tilefoundry_ascend.completion import (build_symbolic_completion,
                                                verify_completion)
@@ -349,6 +361,6 @@ def test_a_real_register_plan_still_refuses_unknown_capacity():
     assert "rmem" in spaces, spaces
     with pytest.raises(StorageError) as caught:
         place_resolved_versions(plan, completion, target, StorageLowering())
-    assert caught.value.code == "UNKNOWN_CAPACITY"
-    assert "rmem" in caught.value.subject
+    assert caught.value.code == "STORAGE_REGISTER_UNSOURCED", caught.value.code
+    assert "rmem" in str(caught.value), str(caught.value)[:200]
 

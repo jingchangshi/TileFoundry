@@ -161,6 +161,104 @@ class Verdict:
     checked: tuple = ()
 
 
+#: Every top-level field the artifact must carry, with why it is not optional.
+REQUIRED_KEYS = {
+    "schema_version": "a consumer must be able to tell which format it reads",
+    "draft": "the artifact must say it is a draft, never imply closure",
+    "registered_at_utc": "a registration without a time cannot be audited",
+    "operator": "the operators the cases belong to",
+    "purpose": "what the artifact is for, and what it is not",
+    "claims_not_made": "the explicit negatives",
+    "unknowns": "the honest list of what is NOT established",
+    "comparator": "which comparator, by path and digest",
+    "threshold_table": "which table, by path, digest and line range",
+    "cases": "the cases themselves",
+    "dtype_distribution": "the measured distribution the cases must match",
+    "tree_anchor": "the in-repository evidence",
+    "non_normalisation_note": "why the 1.0 entries are recorded as written",
+}
+
+#: Phrases an honesty section must still carry, so it cannot be hollowed out.
+REQUIRED_NEGATIONS = ("no case", "not certify", "no threshold", "no allclose")
+
+
+def _require_required_keys(registry: dict) -> None:
+    """Every declared top-level field must be present, and none may be empty."""
+    missing = sorted(key for key in REQUIRED_KEYS if key not in registry)
+    if missing:
+        raise Blocked(BLOCKED, "the registry is missing required top-level "
+                               "field(s) %s" % (missing,), "top level")
+    empty = sorted(key for key in REQUIRED_KEYS
+                   if registry[key] in (None, "", [], {}))
+    if empty:
+        raise Blocked(BLOCKED, "the registry states required field(s) %s as empty"
+                      % (empty,), "top level")
+
+
+def _require_honesty_sections(registry: dict) -> None:
+    """The negatives must be present AND still say what they said.
+
+    An empty list, or a list reworded into vague noise, would satisfy "the key
+    exists" while dropping the only statement of what this artifact does not
+    prove. Each required negation is checked as a substring of the joined text,
+    and unknowns must name at least one substantive thing that is not
+    established.
+    """
+    claims = registry["claims_not_made"]
+    if not isinstance(claims, list) or not claims:
+        raise Blocked(BLOCKED, "claims_not_made is not a non-empty list", "honesty")
+    joined = " ".join(str(item) for item in claims).lower()
+    absent = [phrase for phrase in REQUIRED_NEGATIONS if phrase not in joined]
+    if absent:
+        raise Blocked(BLOCKED, "claims_not_made no longer states %s" % (absent,),
+                      "honesty")
+    unknowns = registry["unknowns"]
+    if not isinstance(unknowns, list) or not unknowns:
+        raise Blocked(BLOCKED, "unknowns is not a non-empty list: the registry "
+                               "must keep stating what it does not establish",
+                      "honesty")
+    if not any(len(str(item)) > 40 for item in unknowns):
+        raise Blocked(BLOCKED, "unknowns holds no substantive item", "honesty")
+
+
+def _require_tree_anchor(registry: dict) -> None:
+    """The in-repository anchor must be present and must match the tree.
+
+    This is the only evidence INSIDE this repository that the registered
+    comparator is the one the harness imports; losing it while staying VALID
+    would leave the artifact citing nothing local.
+    """
+    anchor = registry["tree_anchor"]
+    if not isinstance(anchor, dict):
+        raise Blocked(BLOCKED, "tree_anchor is not a mapping", "anchor")
+    for key in ("path", "sha256", "lines", "contract_lines"):
+        if key not in anchor:
+            raise Blocked(BLOCKED, "tree_anchor states no %s" % (key,), "anchor")
+    path = Path(anchor["path"])
+    if not path.is_absolute():
+        path = REPO / path
+    if not path.is_file():
+        raise Blocked(BLOCKED, "the anchored contract file is missing", str(path))
+    actual = _digest(path)
+    if actual != anchor["sha256"]:
+        raise Blocked(BLOCKED, "the anchored contract file digest is not the "
+                               "registered one",
+                      "%s != %s" % (actual, anchor["sha256"]))
+    lines = anchor["lines"]
+    if not isinstance(lines, list) or not lines:
+        raise Blocked(BLOCKED, "tree_anchor states no line list", "anchor")
+    text = path.read_text().splitlines()
+    for number in lines:
+        if not isinstance(number, int) or not 1 <= number <= len(text):
+            raise Blocked(BLOCKED, "tree_anchor line %r is outside the file"
+                          % (number,), str(path))
+    contents = anchor.get("line_contents") or {}
+    for key, expected in contents.items():
+        number = int(key)
+        if str(expected).strip() not in text[number - 1]:
+            raise Blocked(BLOCKED, "line %d no longer reads %r" % (number, expected),
+                          str(path))
+
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -189,6 +287,14 @@ def validate(registry: dict, *, comparator: Path = COMPARATOR,
              table: Path = THRESHOLD_TABLE) -> Verdict:
     """Re-derive every claim the registry makes; VALID or BLOCKED_DEPENDENCY."""
     checked = []
+    # The SHAPE of the artifact is checked before any value: a registry that no
+    # longer carries its honesty section or its in-repository anchor would pass a
+    # value-only validation while having lost the two things it exists to record.
+    # Shape runs FIRST on purpose - finding a missing field after the numeric
+    # folds would mean the folds were doing the shape's job.
+    _require_required_keys(registry)
+    _require_honesty_sections(registry)
+    _require_tree_anchor(registry)
     for path, claim, label in ((comparator, registry["comparator"]["sha256"],
                                 "comparator"),
                                (table, registry["threshold_table"]["sha256"],
@@ -286,12 +392,170 @@ def validate(registry: dict, *, comparator: Path = COMPARATOR,
         if case.get("registration_basis") in (None, ""):
             raise Blocked(BLOCKED, "case %r states no registration basis"
                           % (case.get("case_id"),))
+    _require_case_set(registry)
     _require_distribution(registry)
     _require_no_pass_claim(registry)
     checked.append(("cases", len(registry["cases"])))
     return Verdict("VALID", "the registry reproduces the deployed comparator and "
                             "threshold table", tuple(checked))
 
+
+#: The external indices the case set must be bound to. The registry cannot
+#: certify its own completeness: authoritative_total is a claim inside the same
+#: file that would have to be trusted, so the ids are compared with the case
+#: matrix and the supplemental list on disk.
+CASE_MATRIX = REPO / "work_package" / "cases" / "case_matrix.json"
+SUPPLEMENTAL = REPO / "work_package" / "cases" / "supplemental_mla.json"
+
+
+def _authoritative_ids() -> list:
+    """case_matrix ids as the registry spells them: case/case_id."""
+    data = json.loads(CASE_MATRIX.read_text())
+    rows = data["cases"] if isinstance(data, dict) else data
+    return ["%s/%s" % (row["case"], row["case_id"]) for row in rows]
+
+
+def _supplemental_suffixes() -> list:
+    """The supplemental suffixes, taken from the source file own case_id.
+
+    The registry spells these mla_supplemental/<suffix>, which is NOT either
+    source spelling (the file has case_id=gqa_bsnd_kv_tail and
+    key=supplemental/mla_gqa_bsnd_kv_tail). That notation is the registrant own
+    and is recorded in COMPARATOR_REGISTRY_DRAFT.md as a KNOWN DEFECT of the
+    artifact (a v2 would carry source_key verbatim). A validator that invented
+    a "correct" spelling would launder the defect, so the binding is done on the
+    SUFFIX - the part both sides genuinely agree on - and the prefix is checked
+    only for shape.
+    """
+    data = json.loads(SUPPLEMENTAL.read_text())
+    rows = data["cases"] if isinstance(data, dict) else data
+    return [str(row.get("case_id", "")) for row in rows]
+
+
+def _bind_case_ids(ids, cases) -> None:
+    """Compare the case id set with the external indices on disk."""
+    external = _authoritative_ids()
+    authoritative_ids = [case_id for case_id in ids
+                         if "supplemental" not in case_id]
+    if sorted(authoritative_ids) != sorted(external):
+        missing = sorted(set(external) - set(authoritative_ids))
+        extra = sorted(set(authoritative_ids) - set(external))
+        raise Blocked(BLOCKED, "the authoritative case ids are not the case "
+                               "matrix set: missing=%s extra=%s"
+                      % (missing, extra), "case set")
+    suffixes = _supplemental_suffixes()
+    registry_supplemental = []
+    for case_id in ids:
+        if "supplemental" not in case_id:
+            continue
+        prefix, _, suffix = case_id.rpartition("/")
+        if prefix != "mla_supplemental":
+            raise Blocked(BLOCKED, "supplemental id %r does not use the registered "
+                                   "prefix" % (case_id,), "case set")
+        registry_supplemental.append(suffix)
+    if sorted(registry_supplemental) != sorted(suffixes):
+        raise Blocked(BLOCKED, "the supplemental case ids are not the source file "
+                               "case ids: missing=%s extra=%s"
+                      % (sorted(set(suffixes) - set(registry_supplemental)),
+                         sorted(set(registry_supplemental) - set(suffixes))),
+                      "case set")
+    for case in cases:
+        has_marker = "supplemental" in case
+        is_supplemental = "supplemental" in str(case.get("case_id", ""))
+        if has_marker != is_supplemental:
+            raise Blocked(BLOCKED, "case %r states supplemental=%r, which does "
+                                   "not match its id"
+                          % (case.get("case_id"), case.get("supplemental")),
+                          "case set")
+
+def _require_case_set(registry: dict) -> None:
+    """The case SET is what the registry claims it enumerated.
+
+    Deleting one case was previously caught only as a side effect of the
+    distribution arithmetic, which made the failure message point at a dtype
+    count instead of at the missing case. This states the real invariant: every
+    case has a unique id, and the authoritative and supplementary counts are the
+    declared ones, so a deletion is reported as a deletion.
+    """
+    cases = registry["cases"]
+    if not isinstance(cases, list) or not cases:
+        raise Blocked(BLOCKED, "the registry states no cases", "case set")
+    ids = [str(case.get("case_id", "")) for case in cases]
+    if any(not case_id for case_id in ids):
+        raise Blocked(BLOCKED, "a case states no case_id", "case set")
+    duplicates = sorted({case_id for case_id in ids if ids.count(case_id) > 1})
+    if duplicates:
+        raise Blocked(BLOCKED, "the registry repeats case id(s) %s" % (duplicates,),
+                      "case set")
+    declared = registry.get("dtype_distribution") or {}
+    total = declared.get("authoritative_total")
+    # The id SET is compared with the external indices FIRST: a deletion must be
+    # reported as "this id is missing", not as an arithmetic side effect of a
+    # count the same file supplies (and so cannot certify itself).
+    _bind_case_ids(ids, cases)
+    authoritative = 0
+    supplementary_count = 0
+    for case in cases:
+        if str(case.get("supplemental", "") or "").strip() or \
+                "supplemental" in str(case.get("operator", "")) or \
+                "supplemental" in str(case.get("case_id", "")):
+            supplementary_count += 1
+        else:
+            authoritative += 1
+    if total is not None and authoritative != int(total):
+        raise Blocked(BLOCKED, "the registry holds %d authoritative case(s), not "
+                               "the declared %d: a case is missing or extra"
+                      % (authoritative, int(total)), "case set")
+    expected_supplementary = sum(
+        int(count) for operator, per_dtype in declared.items()
+        if operator.startswith("supplemental") and isinstance(per_dtype, dict)
+        for count in per_dtype.values())
+    if expected_supplementary and supplementary_count != expected_supplementary:
+        raise Blocked(BLOCKED, "the registry holds %d supplementary case(s), not "
+                               "the declared %d"
+                      % (supplementary_count, expected_supplementary), "case set")
+    # Bind to the EXTERNAL indices: a count inside the same JSON cannot certify
+    # the JSON. The authoritative ids must be exactly the matrix ids, and the
+    # supplemental ids are bound on the SUFFIX both sides agree on (the prefix
+    # the registry writes is a known defect recorded in the draft, not something
+    # a validator may silently rename into agreement).
+    external = _authoritative_ids()
+    authoritative_ids = [case_id for case_id in ids
+                         if "supplemental" not in case_id]
+    if sorted(authoritative_ids) != sorted(external):
+        missing = sorted(set(external) - set(authoritative_ids))
+        extra = sorted(set(authoritative_ids) - set(external))
+        raise Blocked(BLOCKED, "the authoritative case ids are not the case "
+                               "matrix's: missing=%s extra=%s" % (missing, extra),
+                      "case set")
+    suffixes = _supplemental_suffixes()
+    registry_supplemental = [case_id.rpartition("/")[2]
+                             for case_id in ids
+                             if "supplemental" in case_id]
+    for case_id in ids:
+        if "supplemental" not in case_id:
+            continue
+        prefix = case_id.rpartition("/")[0]
+        if prefix != "mla_supplemental":
+            raise Blocked(BLOCKED, "supplemental id %r does not use the registered "
+                                   "prefix" % (case_id,), "case set")
+    if sorted(registry_supplemental) != sorted(suffixes):
+        raise Blocked(BLOCKED, "the supplemental case ids are not the source file's "
+                               "case ids: missing=%s extra=%s"
+                      % (sorted(set(suffixes) - set(registry_supplemental)),
+                         sorted(set(registry_supplemental) - set(suffixes))),
+                      "case set")
+    # The two key SHAPES are both legal: the 40 authoritative cases carry no
+    # supplemental key, the 4 do. Asserting one uniform field set would call the
+    # complete artifact wrong.
+    for case in cases:
+        has_marker = "supplemental" in case
+        is_supplemental = "supplemental" in str(case.get("case_id", ""))
+        if has_marker != is_supplemental:
+            raise Blocked(BLOCKED, "case %r states supplemental=%r, which does not "
+                                   "match its id" % (case.get("case_id"),
+                                                     case.get("supplemental")),
+                          "case set")
 
 def _require_distribution(registry: dict) -> None:
     """The cases must be the distribution the registry declares.
@@ -546,3 +810,131 @@ def test_the_validator_never_writes_the_registry():
     with pytest.raises(Blocked):
         validate(_variant(**{"comparator.sha256": "0" * 64}))
     assert REGISTRY.read_bytes() == before
+
+
+@pytest.mark.parametrize("field", sorted(REQUIRED_KEYS))
+def test_deleting_any_required_top_level_field_is_blocked(field):
+    """Shape is a claim: a registry missing a field is not a weaker registry.
+
+    Seven of these used to stay VALID when deleted - among them unknowns (the
+    only statement of what is NOT established) and tree_anchor (the only
+    in-repository evidence), which is why shape is checked before any value.
+    """
+    with pytest.raises(Blocked) as caught:
+        validate(_variant(**{field: _DELETE}))
+    assert caught.value.code == BLOCKED
+    assert field in (caught.value.detail + " " + caught.value.where), caught.value
+
+
+def test_an_emptied_honesty_section_is_blocked():
+    """The negatives cannot be hollowed out while the key still exists."""
+    for change in ({"claims_not_made": []},
+                   {"claims_not_made": ["we are careful"]},
+                   {"unknowns": []},
+                   {"unknowns": ["nothing"]}):
+        with pytest.raises(Blocked) as caught:
+            validate(_variant(**change))
+        assert caught.value.code == BLOCKED
+        # An EMPTY section is caught by the shape guard; a section that still has
+        # entries but lost its negations is caught by the honesty guard. Both are
+        # refusals of the same claim, so either layer may be the one that fires.
+        assert ("honesty" in caught.value.where
+                or "top level" in caught.value.where), caught.value
+
+
+def test_a_tree_anchor_that_no_longer_matches_the_file_is_blocked():
+    """The in-repository anchor is measured, not believed."""
+    with pytest.raises(Blocked) as caught:
+        validate(_variant(**{"tree_anchor.sha256": "0" * 64}))
+    assert caught.value.code == BLOCKED
+    assert "anchor" in caught.value.where or "anchored" in caught.value.detail
+
+
+def test_a_tree_anchor_line_that_no_longer_reads_as_registered_is_blocked():
+    poisoned = dict(_load()["tree_anchor"]["line_contents"])
+    poisoned["983"] = "from some_other_module import compare_case_result"
+    with pytest.raises(Blocked) as caught:
+        validate(_variant(**{"tree_anchor.line_contents": poisoned}))
+    assert caught.value.code == BLOCKED
+
+
+def test_deleting_one_case_is_named_as_a_case_set_failure():
+    """43 of 44 must fail for the RIGHT reason, not as a dtype-count side effect."""
+    registry = _load()
+    registry["cases"] = registry["cases"][:-1]
+    with pytest.raises(Blocked) as caught:
+        validate(registry)
+    assert caught.value.code == BLOCKED
+    assert "case set" in caught.value.where, caught.value
+    assert "case" in caught.value.detail
+
+
+def test_a_dropped_authoritative_case_is_named_as_a_case_set_failure():
+    """The ids are bound to case_matrix, so a deletion names the missing id."""
+    registry = _load()
+    dropped = registry["cases"].pop(0)
+    with pytest.raises(Blocked) as caught:
+        validate(registry)
+    assert caught.value.code == BLOCKED
+    assert "case set" in caught.value.where, caught.value
+    assert dropped["case_id"] in caught.value.detail, caught.value.detail
+
+
+def test_dropping_a_supplemental_case_is_named_as_a_case_set_failure():
+    registry = _load()
+    # drop exactly ONE supplemental case; the other three stay
+    for index, case in enumerate(registry["cases"]):
+        if "supplemental" in case["case_id"]:
+            del registry["cases"][index]
+            break
+    with pytest.raises(Blocked) as caught:
+        validate(registry)
+    assert caught.value.code == BLOCKED
+    assert "case set" in caught.value.where, caught.value
+
+
+def test_the_supplemental_binding_uses_the_source_case_ids():
+    """The registry prefix is not either source spelling; binding is on suffix.
+
+    The registrant wrote mla_supplemental/<suffix> while the file carries
+    case_id=<suffix> and key=supplemental/mla_<suffix>. A validator that
+    demanded literal equality would call the complete artifact wrong, and one
+    that invented a corrected spelling would hide the recorded defect; the
+    suffix is the part both sides actually state.
+    """
+    registry = _load()
+    suffixes = sorted(case["case_id"].rpartition("/")[2]
+                      for case in registry["cases"]
+                      if "supplemental" in case["case_id"])
+    assert suffixes == sorted(_supplemental_suffixes())
+    assert len(suffixes) == 4
+
+
+def test_a_renamed_supplemental_suffix_is_blocked():
+    registry = _load()
+    for case in registry["cases"]:
+        if "supplemental" in case["case_id"]:
+            case["case_id"] = "mla_supplemental/not_a_source_case"
+            break
+    with pytest.raises(Blocked) as caught:
+        validate(registry)
+    assert caught.value.code == BLOCKED
+    assert "case set" in caught.value.where
+
+
+def test_both_key_shapes_are_accepted_and_a_mismatched_marker_is_blocked():
+    """40 cases carry no supplemental key and 4 do; one uniform set is wrong."""
+    registry = _load()
+    without = [case for case in registry["cases"] if "supplemental" not in case]
+    with_marker = [case for case in registry["cases"] if "supplemental" in case]
+    assert len(without) == 40 and len(with_marker) == 4
+    # a supplemental case that loses its marker now disagrees with its own id
+    broken = _load()
+    for case in broken["cases"]:
+        if "supplemental" in case["case_id"]:
+            case.pop("supplemental")
+            break
+    with pytest.raises(Blocked) as caught:
+        validate(broken)
+    assert caught.value.code == BLOCKED
+    assert "case set" in caught.value.where

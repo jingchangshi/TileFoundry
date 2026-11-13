@@ -422,7 +422,36 @@ _REGISTER_SPACES = frozenset({"rmem", "carrier", "preg"})
 _REGISTER_CLASS = {"rmem": "vreg", "carrier": "carrier", "preg": "preg"}
 
 
-def _register_gaps(target, space: str, lowering) -> list:
+
+
+def _placed_owners(spaces) -> frozenset:
+    """The core kinds this placement actually uses ("aiv"/"aic"/"device")."""
+    owners = set()
+    for key in spaces:
+        # key.owner is an OwnerKey DATACLASS, not a string: str() on it yields
+        # "ownerkey(program_group=none, core_kind='aiv', sid=none)", which matched no
+        # budget entry and made every domain look unplaced. Read the field.
+        owner = getattr(key, "owner", None)
+        kind = getattr(owner, "core_kind", None)
+        if kind is None:
+            kind = owner if isinstance(owner, str) else ""
+        if kind:
+            owners.add(str(kind).lower())
+    return frozenset(owners)
+
+def _declared_budget_pairs():
+    """(domain, register_class, owner) triples the target declares, sourced or not.
+
+    owner is carried so a caller can restrict the check to the execution domains a
+    given placement actually uses; without it the gate reports budgets for cores the
+    program never runs on, which is a gap nobody can close.
+    """
+    from ..memory import REGISTER_BUDGETS
+
+    return tuple((domain, register_class, domain)
+                 for (domain, register_class) in REGISTER_BUDGETS)
+
+def _register_gaps(target, space: str, lowering, placed_owners=()) -> list:
     """Facts-side and report-side register checks; empty means the gate passes.
 
     THREE ANSWERS, never two:
@@ -449,11 +478,36 @@ def _register_gaps(target, space: str, lowering) -> list:
         if str(getattr(report, "register_class", "")) != register_class:
             continue
         by_domain.setdefault(str(getattr(report, "domain", "")), []).append(report)
+    # A report for a domain this placement does not use cannot discharge or
+    # aggravate anything here, so restrict the whole check to the placed owners.
+    if placed_owners:
+        by_domain = {domain: items for domain, items in by_domain.items()
+                     if domain in placed_owners}
     if not by_domain:
-        gaps.append((STORAGE_REGISTER_UNSOURCED,
-                     "the lowering reported no %r occupancy at all, so register demand "
-                     "for space %r is unmeasured" % (register_class, space),
-                     "space=%s class=%s" % (space, register_class)))
+        # No report for this class at all. Whether that is acceptable depends on the
+        # FACT side: if the target declares no budget either, both sides are equally
+        # silent and the answer is still UNSOURCED - never "nothing to check".
+        # Only domains this PLACEMENT actually uses. A register class declared for a
+        # core the program does not run on is not this program's business: reporting
+        # aic for an AIV-only kernel would be a gap that no code could ever close.
+        declared = sorted(domain for (domain, name, owner) in _declared_budget_pairs()
+                          if name == register_class and owner in placed_owners)
+        if not declared:
+            gaps.append((STORAGE_REGISTER_UNSOURCED,
+                         "neither side reports anything about %r: the lowering gave no "
+                         "occupancy for space %r and the target declares no budget for "
+                         "that register class either" % (register_class, space),
+                         "space=%s class=%s" % (space, register_class)))
+            return gaps
+        # A budget exists but nothing was reported against it - that is a missing
+        # REPORT, and it must not be mistaken for zero demand.
+        for domain in declared:
+            gaps.append((STORAGE_REGISTER_UNSOURCED,
+                         "space %r needs a %r occupancy report for domain %r and the "
+                         "lowering gave none, so demand cannot be compared with its "
+                         "declared budget" % (space, register_class, domain),
+                         "space=%s domain=%s class=%s"
+                         % (space, domain, register_class)))
         return gaps
     for domain, domain_reports in sorted(by_domain.items()):
         budget = register_budget(domain, register_class)
@@ -855,7 +909,26 @@ def place_resolved_versions(plan, completion, target, lowering):
 
     capacities = []
     peak_bytes = []
+    register_gaps = []
     for key, peak in spaces.items():
+        if str(key.space) in _REGISTER_SPACES:
+            # COUNTED resource: the byte figure placed above is only an offset inside
+            # the register file, never a budget. The gate is facts-vs-report below,
+            # and Capacity.usable_bytes stays 0 here because this space states no
+            # byte capacity - writing the peak in would turn a requirement back into
+            # a "capacity" through the record, which is the exact mistake the iron
+            # rule forbids.
+            register_gaps.extend(_register_gaps(
+                target, key.space, lowering, _placed_owners(spaces)))
+            capacities.append(Capacity(
+                storage_key=key,
+                buffers=tuple(buffers_by_key.get(key, ())),
+                usable_bytes=0,
+                reserved_bytes=0,
+                source="register-budget gate (counted, not sized): %s" % (key.space,),
+            ))
+            peak_bytes.append((key, peak))
+            continue
         capacity = _capacity_fact(target, key.space, gmem_exempt=False)
         if peak > capacity:
             raise StorageError(
@@ -871,6 +944,15 @@ def place_resolved_versions(plan, completion, target, lowering):
             source="target.memory_hierarchy.%s.capacity_bytes" % (key.space,),
         ))
         peak_bytes.append((key, peak))
+    if register_gaps:
+        # One named refusal carrying every gap: a caller must be able to see that
+        # BOTH sides were missing rather than only the first one found.
+        code = register_gaps[0][0]
+        raise StorageError(
+            code,
+            "%d register-budget gap(s): %s"
+            % (len(register_gaps), "; ".join("%s (%s)" % (m, w) for _c, m, w in register_gaps)),
+            "; ".join(code for code, _m, _w in register_gaps))
 
     target_identity = _target_identity(plan, target)
     completion_identity = str(getattr(completion, "identity", "") or "") if completion else ""
@@ -1048,6 +1130,36 @@ def verify_storage_current(plan, storage, target, *, completion=None, lowering=N
         raise StorageError("STORAGE_CAPACITY_MISMATCH",
                            "the attached peaks do not cover the placed spaces")
     for key, peak in spaces.items():
+        if str(key.space) in _REGISTER_SPACES:
+            # Same counted-not-sized rule as placement, applied on the VERIFY path:
+            # the facts and the lowering report must still agree, and Capacity
+            # carries 0 byte capacity because this space states none. Skipping it
+            # here would let a tampered plan verify against the placement gate it
+            # never went through.
+            gaps = _register_gaps(target, key.space, lowering, _placed_owners(spaces))
+            if gaps:
+                raise StorageError(
+                    gaps[0][0],
+                    "%d register-budget gap(s): %s"
+                    % (len(gaps), "; ".join("%s (%s)" % (m, w)
+                                            for _c, m, w in gaps)),
+                    "; ".join(code for code, _m, _w in gaps))
+            stored = attached_capacities[_key_text(key)]
+            if stored.usable_bytes != 0:
+                raise StorageError(
+                    "STORAGE_CAPACITY_MISMATCH",
+                    "a counted register space must carry no byte capacity; the "
+                    "attached record claims one, which would turn a requirement back "
+                    "into a capacity", _key_text(key))
+            if stored.buffers != tuple(buffers_by_key.get(key, ())):
+                raise StorageError("STORAGE_CAPACITY_MISMATCH",
+                                   "the attached per-space buffer list disagrees with "
+                                   "the plan", _key_text(key))
+            if attached_peaks[_key_text(key)] != peak:
+                raise StorageError("STORAGE_CAPACITY_MISMATCH",
+                                   "the attached peak disagrees with the recomputed one",
+                                   _key_text(key))
+            continue
         capacity = _capacity_fact(target, key.space, gmem_exempt=False)
         if peak > capacity:
             raise StorageError("STORAGE_CAPACITY_EXCEEDED",

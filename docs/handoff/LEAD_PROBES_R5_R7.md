@@ -214,3 +214,25 @@ architect 三项判定：① 主线未跑偏，但 **S0 收口标准被低估**�
 2) **瞬时快照 ≠ 持续状态**（第二次实例）：flex-1-g1 据 find 0 命中判 task-56 未完成，而 DRAFT.md 与他的 find 在同一分钟落盘（mtime 07:41:10）。新纪律：缺失类断言必须附观察时刻，下结论前复查 mtime/HEAD。Lead 本轮也犯过同款（05:49 把落盘竞态夸成整队冻结）。
 3) **聚合相等会掩盖写法差异**：1.0 与 2**0 折叠同值，只比数值会放过被改写的表 ⇒ 校验器必须同时比对**源写法**（ast.unparse 归一后逐字段）。这条来自 task-52 实现者自测打红。
 4) **命名错误的层比漏报更坏**：compile_mainline 的 REFUSED 记录原先不写 entry_identity，导致 gate 报 (entry, ENTRY_IDENTITY_MISMATCH) 而真实缺口在别处；已修为 refused 记录也写真实 entry identity，并加'没有幽灵 entry 缺口'断言。
+
+## R30 task-52 校验器独立攻击（Lead 亲测，两个盲区一真一假）
+- **真盲区**：逐个 pop 顶层字段再 validate（/tmp/test_blind2.py），7 个字段删除后**仍返回 VALID**：schema_version / registered_at_utc / operator / purpose / tree_anchor / unknowns / non_normalisation_note。其中两个非形式问题：删 unknowns ⇒ 登记物可不声明"它证不了什么"（G3 唯一诚实出口消失）；删 tree_anchor ⇒ 唯一的仓内证据（cannbench_contract.py sha256 与 :983/:1006/:1008/:934）可消失而校验仍绿。
+- **假盲区（已被覆盖）**：删一条 case 至 43/44 **已被** BLOCKED_DEPENDENCY 抓住（理由是 'the distribution declares 2 supplemental_mla/bfloat16 case(s'）。但它是被分布检查**偶然**抓住，不是被 case 数/集合显式抓住 ⇒ 要求补显式断言，使失败信息指向真因，避免未来改动依赖副作用。
+- 教训：flex-1-g1 的'自洽检查 0 红 / 双向重推导 2 红'在**他那个检查器**上成立，在同一契约的另一个实现上不成立（分布检查兜住了）。跨实现比较攻击面时，结论不能跨实现搬运。
+
+## R31 task-52 guard 清单（三位探索者独立实测 + Lead 攻击，共 8 条）
+1) 双向独立重推导：只做 JSON 内部自洽的检查器，对源写法与数值同步篡改的协调攻击 0 红漏检；从磁盘表重推导则 2 红抓住。
+2) case 数显式断言（40 权威 + 4 supplemental = 44），id 集合必须绑外部文件（case_matrix.json / supplemental_mla.json），不能靠 JSON 内 authoritative_total（自我声明）。
+3) 字段齐全性显式 guard：删字段当前是裸 KeyError；Lead 实测 **7 个顶层字段删除后仍返回 VALID**（schema_version/registered_at_utc/operator/purpose/tree_anchor/unknowns/non_normalisation_note），其中 unknowns（G3 唯一诚实出口）与 tree_anchor（唯一仓内证据）消失仍绿，属实质缺陷。
+4) 比对必须走数值折叠、禁止字面串比对：ast.unparse 产出 2**(-7) 而 registry 存 2 ** -7，字符串比会把完好件判 44/220 全红（flex-1-g1 连错两版才改用折叠）。
+5) 1.0 与 2 的 0 次方折叠同值，必须同时比对源写法，否则被改写的表可过关。
+6) key 形态分支：40 条无 supplemental 键、4 条有 supplemental:true，统一断言会把完好件判红。
+7) supplemental id 改名规则：registry 用 mla_supplemental/<suffix>，源文件用 supplemental/mla_<suffix>，不实现映射则 4/4 假红。
+8) 身份 guard：comparator / threshold_table / tree_anchor 三 sha256 + line_range + repo_head 全部复算。
+跨实现教训：同一契约的三个独立实现，漏检结论不能互相搬运（一位报'删一条 case 全绿'，另一实现已被分布检查偶然抓住）；但'偶然抓住'仍要补显式断言，使失败信息指向真因。
+
+## R32 task-56 登记物自造记法（Lead 裁定升 v2）
+explorer-g1 自曝并经 Lead 核源文件确认：supplemental 4 条在 registry 里写成 `mla_supplemental/<suffix>`，而源文件 supplemental_mla.json 的真实字段是 `case_id: gqa_bsnd_kv_tail` + `key: supplemental/mla_gqa_bsnd_kv_tail` —— **源文件两个字段都不是该记法**，是生成器把 `supplemental/` 与 `mla_` 重拼出来的自造值。权威 40 条无此问题（`<case>/<case_id>` 与源直接相等）。
+裁定 **升 v2**：cases[] 新增 `source_key`（逐字拷贝源文件 key，40 条也加）、`source_case_id`、`source_file`。这样校验器**不需要任何改名规则**，可直接断言 source_key/source_case_id 集合与源文件相等。保留 v1 的 sha256 与 mtime 一行作为历史（883117e），draft 仍 true、时间戳标注 v2。
+裁定理由（属方法账）：把登记物缺陷转嫁给校验器，等于让一条不可验证的私有改名规则成为中间层——它错时要么安静放行要么误杀，而它已经误杀过一次（4/4 假红）。这是同一错误形状的第 N 次出现：**自造值 + 下游规则**。
+另一条采纳：**同一契约的不同实现，漏检结论不能跨实现搬运**（一位探索者报『删一条 case 全绿』，另一实现已被分布检查偶然抓住）。但『偶然抓住』仍要补显式断言，使失败信息指向真因。
