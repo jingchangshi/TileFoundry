@@ -1,5 +1,7 @@
 # Ascend 950PR Adaptation and SimdVF Optimization Report
 
+> For the full three-layer target architecture, core design decisions, and MLA end-to-end compilation walkthrough, see [ascend950pr_architecture_and_e2e.md](./ascend950pr_architecture_and_e2e.md).
+
 ## 1. Architecture Summary
 
 This adaptation completes the migration of the Ascend 950PR `attention_residual` and `mla` operator stacks from functional `SimtVF` execution to high-performance `SimdVF` vector/cube execution across all three layers:
