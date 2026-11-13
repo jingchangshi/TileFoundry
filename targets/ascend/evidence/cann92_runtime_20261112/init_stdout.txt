@@ -1,7 +1,0 @@
-PHASE before_import 1319631 /home/s00653124/.conda/envs/tilefoundry-npu/bin/python
-PHASE before_set_device
-PHASE after_set_device
-PHASE before_alloc
-PHASE before_sync
-PHASE before_readback
-ROUNDTRIP_PASS [0.0, 1.0, -2.0, 3.5]

@@ -1230,18 +1230,20 @@ def hir_function_to_python(
 
 
 def _pipeline_loop_surface(pipeline, extent: str) -> str:
-    """Render the canonical tf.pipelined surface for a typed spec.
-
-    enable_offset is printed EXPLICITLY even when False, and num_stages is always
-    present: a roundtrip must reproduce the declaration rather than rely on the
-    defaults of whatever version of the parser happens to read the text.
-    """
-    annotations = '{"enable_offset": %s}' % ("True" if pipeline.enable_offset else "False")
-    return "tf.pipelined(%s, num_stages=%d, annotations=%s)" % (
-        extent,
-        pipeline.num_stages,
-        annotations,
-    )
+    """Render the one canonical tf.pipelined surface for a typed spec."""
+    parts = ["max_stage=%d" % pipeline.max_stage,
+             "max_buffer_versions=%d" % pipeline.max_buffer_versions,
+             "enable_offset=%s" % ("True" if pipeline.enable_offset else "False")]
+    if pipeline.fixed_ii is not None:
+        parts.append("fixed_ii=%d" % pipeline.fixed_ii)
+    if pipeline.task_intents:
+        rows = tuple((item.task_id, item.anchor, item.stage, tuple(item.issue_after),
+                      item.cost_override) for item in pipeline.task_intents)
+        parts.append("task_intents=%r" % (rows,))
+    if pipeline.buffer_schedules:
+        rows = tuple((item.root,) + tuple(item.versions) for item in pipeline.buffer_schedules)
+        parts.append("buffer_schedules=%r" % (rows,))
+    return "tf.pipelined(%s, %s)" % (extent, ", ".join(parts))
 
 
 def as_script(

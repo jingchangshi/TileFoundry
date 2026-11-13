@@ -1,7 +1,0 @@
-uid=1071(s00653124) gid=1071(s00653124) groups=1071(s00653124),100(users),998(docker),1001(HwHiAiUser)
-/data/pri/cann-9.2.0/cann-9.2.0-beta.2/set_env.sh
-/home/s00653124/.conda/envs/tilefoundry-npu/bin/python3.12
-/home/s00653124/.conda/envs/tilefoundry-npu-dev/bin/python3.12
-/data/pri/cann-9.2.0/cann-9.2.0-beta.2
-/data/pri/cann-9.2.0/cann-9.2.0-beta.2/opp
-/data/pri/cann-9.2.0/cann-9.2.0-beta.2/lib64:/data/pri/cann-9.2.0/cann-9.2.0-beta.2/lib64/plugin/opskernel:/data/pri/cann-9.2.0/cann-9.2.0-beta.2/lib64/plugin/nnengine:/data/pri/cann-9.2.0/cann-9.2.0-beta.2/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/x86_64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver

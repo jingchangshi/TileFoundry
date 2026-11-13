@@ -1,6 +1,0 @@
-PHASE before_import_torch
-PHASE after_import_torch
-PHASE after_import_torch_npu
-PHASE before_set_device
-PHASE after_set_device
-PHASE before_finalize

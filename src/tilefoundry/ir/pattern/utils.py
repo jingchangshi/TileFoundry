@@ -29,7 +29,7 @@ from .pattern import (
     WildcardPattern,
 )
 
-MOVED_STORAGES = (StorageKind.GMEM, StorageKind.SMEM, StorageKind.RMEM)
+MOVED_STORAGES = (StorageKind.GMEM, StorageKind.SMEM, StorageKind.RMEM, StorageKind.TMEM)
 
 
 def tensor_in(

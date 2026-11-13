@@ -1,829 +1,487 @@
-"""Vendored PURE Z3 scheduling core from TileLang (Ascend backend).
+"""Fixed-interval modulo scheduling: the single constraint path.
 
-PROVENANCE: see PROVENANCE.md in this directory. This module is a MECHANICAL slice of
-tilelang/ascend/transform/z3_scheduler.py @ git 8e2d3c823b0c3a01d2ce68d47dabfe98e35cc22b
-(sha256 baa797dbede33091a0fe9f0754ed62d5561c8e048724e9586c3d58a323946580), with ONLY
-these removals/changes:
-  * removed "import tvm_ffi" (FFI side effect) and the two @tvm_ffi.register_global_func
-    decorators plus the two FFI conversion wrappers z3_schedule_ffi / z3_schedule_loop_ffi;
-  * kept the two ALGORITHM functions and their helper _convert_int_tuples VERBATIM.
-Importing this module imports only the standard library and z3; it must NOT import
-torch/torch_npu/tilelang/tvm_ffi. See tools/p4/test_vendor_z3.py for the probe.
+One core; the Tensor-Foundry and TileLang adapters only project into it. An authored
+stage is a constant, an authored Fixed(V) is an equality, and the model value is
+exported unchanged.
+
+    t_u = II * stage_u + phase_u,  0 <= phase_u < II
+    t_dst + distance * II >= t_src + latency
+    t_next_writer + (V + delta) * II >= t_last_reader + read_latency
+    delta_slot = ((t_v + offset_v) - (t_u + offset_u)) mod II
+    q_u <= delta_slot AND q_v <= II - delta_slot
+    sum(V_b * slot_bytes_b) <= usable_bytes   per (space, owner)
+
+The resource condition is a conjunction: two cyclic intervals on one capacity-1
+resource must not overlap, so each has to fit ahead of the other. A disjunction
+would accept II=1 with two unit tasks, which is an overlapping schedule.
 """
 from __future__ import annotations
 
-import json
-import os
-import threading
-import time
-from pathlib import Path
+from dataclasses import dataclass
 
-# Global lock to serialize Z3 calls - Z3 is not thread-safe
-_z3_lock = threading.Lock()
+SAT = "SAT"
+UNSAT = "UNSAT"
+UNKNOWN = "UNKNOWN"
 
-try:
-    import z3
-
-    Z3_AVAILABLE = True
-except ImportError:  # pragma: no cover
-    Z3_AVAILABLE = False
-
-def _convert_int_tuples(values, arity: int) -> list[tuple[int, ...]]:
-    if values is None:
-        return []
-    result = []
-    for value in values:
-        if not hasattr(value, "__len__") or len(value) != arity:
-            actual_arity = len(value) if hasattr(value, "__len__") else "non-sequence"
-            raise ValueError(f"Expected {arity} integers per tuple, got {actual_arity}")
-        result.append(tuple(int(value[i]) for i in range(arity)))
-    return result
+__all__ = [
+    "Assignment", "Buffer", "Capacity", "Edge", "Problem", "Resource", "Reuse",
+    "SAT", "SolverError", "Task", "UNKNOWN", "UNSAT", "lower_bound_ii", "solve",
+    "verify_assignment",
+]
 
 
+class SolverError(ValueError):
+    """A malformed problem or assignment, with a stable named code."""
+
+    def __init__(self, code, detail):
+        self.code = code
+        self.detail = detail
+        super().__init__("%s: %s" % (code, detail))
 
 
-def z3_schedule_python(
-    latencies: list[int],
-    iis: list[int],
-    resource_flags: list[int],
-    data_deps: list[tuple[int, int, int]],
-    resource_deps: list[tuple[int, int]],
-    owner_exclusion_deps: list[tuple[int, int, int, int]] | None = None,
-    pipe_order_deps: list[tuple[int, int]] | None = None,
-    verbose: bool = False,
-    solve_timeout_ms: int | None = None,
-) -> tuple[list[int], list[int]]:
-    """Schedule a straight-line task list.
+@dataclass(frozen=True)
+class Task:
+    """One task with resource uses (owner, core, pipe, duration, offset).
 
-    Parameters
-    ----------
-    latencies : list[int]
-        Execution latency of each task in cycles.
-    iis : list[int]
-        Initiation interval of each task in cycles.
-    resource_flags : list[int]
-        Resource pipe mask for each task (bitmask of ResourcePipe values):
-        MTE1=1, MTE2=2, MTE3=4, Cube=8, Vector=16, Fixpipe=32, Scalar=64.
-    data_deps : list[tuple[int, int, int]]
-        Directed ``(i, j, latency)`` constraints requiring task ``j`` to start
-        at least ``latency`` cycles after task ``i``.
-    resource_deps : list[tuple[int, int]]
-        Unordered task pairs that cannot issue concurrently on one resource.
-    owner_exclusion_deps : list[tuple[int, int, int, int]] | None
-        Undirected shared-storage owner conflicts ``(i, j, latency_i_j,
-        latency_j_i)``. Either owner may run first, but their conflicting
-        storage lifetimes cannot overlap.
-    pipe_order_deps : list[tuple[int, int]] | None
-        Source-ordered task pairs that share a hardware pipe.
-    verbose : bool
-        Print solver inputs and the selected schedule.
-
-    Returns
-    -------
-    tuple[list[int], list[int]]
-        start_times: Start time for each task
-        sorted_indices: Task indices sorted by start time
+    Four-element uses specify offset zero and are normalized on construction.
     """
-    n = len(latencies)
 
-    # For small number of tasks, return trivial schedule
-    if n < 1:
-        raise RuntimeError("Z3 scheduling failed: n too small")
-    if pipe_order_deps is None:
-        pipe_order_deps = []
-    if owner_exclusion_deps is None:
-        owner_exclusion_deps = []
+    name: str
+    resources: tuple = ()
+    latency: int = 1
+    stage: int | None = None
 
-    if verbose:
-        print(f"[Python Z3] Starting scheduling for {n} tasks")
-        print(f"[Python Z3] Latencies: {latencies}")
-        print(f"[Python Z3] IIs: {iis}")
-        print(f"[Python Z3] Resource flags: {resource_flags}")
-        print(f"[Python Z3] Data dependencies: {data_deps}")
-        print(f"[Python Z3] Resource dependencies: {resource_deps}")
-        print(f"[Python Z3] Owner exclusions: {owner_exclusion_deps}")
-
-    assert Z3_AVAILABLE, "z3-solver package is required but not installed"
-
-    # Use a private Z3 context so this solve is isolated from global-context
-    # state accumulated by other solves in the same process (see the loop
-    # scheduler for why this is required for deterministic results).
-    ctx = z3.Context()
-
-    # Create Z3 solver
-    solver = z3.Optimize(ctx=ctx)
-    solver.set("rlimit", 1000000)
-    # Bounded solve (Path B). rlimit counts resources, not seconds, so without this a
-    # pathological input can run effectively forever. This is the STRAIGHT-LINE path; the
-    # loop path takes the same knob. Left unbounded when the caller passes None.
-    if solve_timeout_ms is not None:
-        solver.set("timeout", int(solve_timeout_ms))
-
-    # Create start time variables
-    start_vars = [z3.Int(f"start_{i}", ctx) for i in range(n)]
-
-    # Add constraints: start times must be non-negative
-    for var in start_vars:
-        solver.add(var >= 0)
-
-    # Add data dependency constraints
-    # For each data dependency (i, j, latency), task j must start after task i starts + latency
-    for i, j, latency in data_deps:
-        solver.add(start_vars[j] >= start_vars[i] + latency)
-        if verbose:
-            print(f"[Python Z3] Data dependency: task {j} >= task {i} + {latency}")
-
-    # Add resource dependency constraints
-    # For tasks i and j that use same resource, they cannot execute simultaneously
-    # We create ordering variable O_i,j (True means i before j, False means j before i)
-    for i, j in resource_deps:
-        if i < j:  # Only consider each pair once
-            ii_i = iis[i]
-            ii_j = iis[j]
-
-            # Create ordering variable
-            o_ij = z3.Bool(f"O_{i}_{j}", ctx)
-
-            # If o_ij is True (i before j), then start_j >= start_i + ii_i
-            solver.add(z3.Implies(o_ij, start_vars[j] >= start_vars[i] + ii_i))
-
-            # If o_ij is False (j before i), then start_i >= start_j + ii_j
-            solver.add(z3.Implies(z3.Not(o_ij), start_vars[i] >= start_vars[j] + ii_j))
-
-            if verbose:
-                print(f"[Python Z3] Resource dependency between {i} and {j}: ii_i={ii_i}, ii_j={ii_j}")
-
-    for i, j, latency_i_j, latency_j_i in owner_exclusion_deps:
-        i_before_j = z3.Bool(f"Owner_{i}_{j}", ctx)
-        solver.add(z3.Implies(i_before_j, start_vars[j] - start_vars[i] >= latency_i_j))
-        solver.add(z3.Implies(z3.Not(i_before_j), start_vars[i] - start_vars[j] >= latency_j_i))
-        if verbose:
-            print(f"[Python Z3] Owner exclusion between {i} and {j}: latency_i_j={latency_i_j}, latency_j_i={latency_j_i}")
-
-    for previous, current in pipe_order_deps:
-        solver.add(start_vars[previous] <= start_vars[current])
-
-    # Objective: minimize maximum completion time (makespan)
-    makespan = z3.Int("makespan", ctx)
-    for i in range(n):
-        latency_i = latencies[i]
-        solver.add(makespan >= start_vars[i] + latency_i)
-    solver.add(makespan >= 0)
-
-    # Minimize makespan
-    solver.minimize(makespan)
-
-    # Check satisfiability
-    if verbose:
-        print("[Python Z3] Checking satisfiability...")
-    verdict = solver.check()
-    if verdict == z3.sat:
-        model = solver.model()
-
-        # Extract start times
-        start_times = []
-        for i in range(n):
-            start_time = model.eval(start_vars[i]).as_long()
-            start_times.append(start_time)
-
-        # Get makespan
-        makespan_val = model.eval(makespan).as_long()
-
-        # Sort tasks by start time (and by index as tie-breaker)
-        task_indices = list(range(n))
-        task_indices.sort(key=lambda idx: (start_times[idx], idx))
-
-        if verbose:
-            print(f"[Python Z3] Scheduling completed. Makespan = {makespan_val}")
-        for i in range(n):
-            idx = task_indices[i]
-            if verbose:
-                print(
-                    f"[Python Z3]   Task {idx}: start_time={start_times[idx]}, "
-                    f"latency={latencies[idx]}, II={iis[idx]}, "
-                    f"resource_flags={resource_flags[idx]:07b}"
-                )
-
-        return start_times, task_indices
-    if verdict == z3.unknown:
-        # An undecided Optimize solve is NOT "unsat"; reporting it as such would fabricate
-        # a refutation. This distinction matters because a timed-out solve lands here.
-        raise RuntimeError("Z3 scheduling failed: solver returned unknown")
-    raise RuntimeError("Z3 scheduling failed: solver returned unsat")
+    def __post_init__(self):
+        if not isinstance(self.name, str) or not self.name:
+            raise SolverError("TASK_NAME", "a task needs a non-empty name")
+        if not isinstance(self.latency, int) or self.latency < 0:
+            raise SolverError("TASK_LATENCY", "latency must be a non-negative int")
+        if self.stage is not None and (not isinstance(self.stage, int) or self.stage < 0):
+            raise SolverError("TASK_STAGE", "an authored stage must be a non-negative int")
+        normalized = []
+        for use in self.resources:
+            if len(use) not in (4, 5):
+                raise SolverError("TASK_RESOURCE", "a resource use is (owner, core, pipe, duration[, offset])")
+            duration = use[3]
+            offset = use[4] if len(use) == 5 else 0
+            if type(duration) is not int or duration < 1:
+                raise SolverError("TASK_QUANTITY", "duration must be a positive int")
+            if type(offset) is not int or offset < 0:
+                raise SolverError("TASK_RESOURCE_OFFSET", "offset must be a non-negative int")
+            normalized.append((*use[:4], offset))
+        object.__setattr__(self, "resources", tuple(normalized))
 
 
-# FFI-exposed function that matches C++ interface
+@dataclass(frozen=True)
+class Edge:
+    src: str
+    dst: str
+    distance: int = 0
+    latency: int = 1
+
+    def __post_init__(self):
+        if not isinstance(self.distance, int) or self.distance < 0:
+            raise SolverError("EDGE_DISTANCE", "distance must be a non-negative int")
+        if not isinstance(self.latency, int) or self.latency < 0:
+            raise SolverError("EDGE_LATENCY", "latency must be a non-negative int")
 
 
-def z3_schedule_loop_python(
-    num_stages: int,
-    latencies: list[int],
-    iis: list[int],
-    resource_flags: list[int],
-    data_deps: list[tuple[int, int, int, int]],  # (i, j, distance, latency)
-    resource_deps: list[tuple[int, int]],
-    owner_exclusion_deps: list[tuple[int, int, int, int]] | None,
-    pipe_order_deps: list[tuple[int, int]] | None,
-    buffer_sizes: list[int],
-    memory_groups: list[list[int]],  # [[capacity, idx0, idx1, ...], ...]
-    stage_order_deps: list[tuple[int, int]] | None = None,  # (u, w): k_u <= k_w
-    recalculate_buffer_versions: bool = True,
-    enable_offset: bool = False,
-    manual_stages: list[int] | None = None,
-    manual_schedule: bool = False,
-    seed: int | None = 42,
-    verbose: bool = False,
-    fixed_buffer_versions: list[int | None] | None = None,
-    return_status: bool = False,
-    solve_timeout_ms: int | None = None,
-    allow_fallback_on_unknown: bool = False,
-) -> tuple[list[int], list[int], int] | dict:
-    """Schedule a loop body with modulo, stage, and storage constraints.
+@dataclass(frozen=True)
+class Buffer:
+    name: str
+    slot_bytes: int
+    space: str = ""
+    owner: str = ""
+    fixed: int | None = None
+    auto_min: int | None = None
+    auto_max: int | None = None
 
-    Each start time is represented as ``k * II + r``. Directed dependencies
-    constrain absolute start times, while resource and owner exclusions choose
-    a non-overlapping modulo order. The solver finds the minimum feasible II by
-    binary search.
+    def __post_init__(self):
+        if not isinstance(self.slot_bytes, int) or self.slot_bytes < 0:
+            raise SolverError("BUFFER_BYTES", "slot_bytes must be a non-negative int")
+        if self.fixed is not None:
+            if not isinstance(self.fixed, int) or self.fixed < 1:
+                raise SolverError("BUFFER_FIXED", "a fixed version count must be a positive int")
+            if self.auto_min is not None or self.auto_max is not None:
+                raise SolverError("BUFFER_DOMAIN", "a buffer is Fixed or Auto, never both")
+            return
+        low = 1 if self.auto_min is None else self.auto_min
+        high = low if self.auto_max is None else self.auto_max
+        if not isinstance(low, int) or not isinstance(high, int) or low < 1 or high < low:
+            raise SolverError("BUFFER_AUTO", "an auto domain needs 1 <= min <= max")
 
-    Parameters
-    ----------
-    num_stages : int
-        Maximum number of physical versions available to automatic buffers.
-    latencies : list[int]
-        Execution latency of each task in cycles.
-    iis : list[int]
-        Initiation interval of each task in cycles.
-    resource_flags : list[int]
-        Resource pipe mask for each task (bitmask of ResourcePipe values):
-        MTE1=1, MTE2=2, MTE3=4, Cube=8, Vector=16, Fixpipe=32, Scalar=64.
-    data_deps : list[tuple[int, int, int, int]]
-        Directed ``(i, j, distance, latency)`` constraints. Negative distances
-        encode automatic buffer-version variables.
-    resource_deps : list[tuple[int, int]]
-        Unordered task pairs that cannot issue concurrently on one resource.
-    owner_exclusion_deps : list[tuple[int, int, int, int]] | None
-        Undirected shared-storage owner conflicts ``(i, j, latency_i_j,
-        latency_j_i)``. The chosen modulo order also constrains the reverse
-        wraparound hand-off.
-    pipe_order_deps : list[tuple[int, int]] | None
-        Source-ordered task pairs sharing a hardware pipe.
-    buffer_sizes : list[int]
-        Bytes occupied by one version of each automatic buffer.
-    memory_groups : list[list[int]]
-        Capacity followed by member buffer indices for each memory scope.
-    stage_order_deps : list[tuple[int, int]] | None
-        Stage-order constraints (u, w) requiring k_u <= k_w (same or earlier
-        iteration-stage).
-    recalculate_buffer_versions : bool
-        Recompute the minimum version counts from the selected schedule.
-    enable_offset : bool
-        When False, constrain each resource so that, among the tasks using that
-        resource (pipe bit in resource_flags), max(start_time) - min(start_time) < II.
-        This keeps all tasks on a resource within a single II window (no offsetting
-        a resource's tasks across pipeline stages). When True, no such
-        constraint is added. Defaults to False (constraint applied).
-    manual_stages : list[int] | None
-        Frontend stages for tasks in source order. Used only when
-        ``manual_schedule`` is True; omitted entries are not allowed.
-    manual_schedule : bool
-        Preserve source issue order independently on every hardware pipe and
-        constrain every task's Z3 stage to the corresponding
-        ``manual_stages`` entry.
-    seed : int | None
-        Z3 random seed; ``None`` leaves the solver default unchanged.
-    verbose : bool
-        Print solver inputs, search progress, and the selected schedule.
-    fixed_buffer_versions : list[int | None] | None
-        WBS 04-07/08 EXTENSION (not in upstream): pin each ALREADY-FIXED physical
-        buffer version count to its Problem value. None leaves that buffer free
-        inside [1, num_stages]. This makes the fixed-version constraints part of
-        the SAME solver, not a post-hoc assertion.
-    return_status : bool
-        WBS 04-08 EXTENSION (not in upstream): when True, return a dict with
-        status in {sat, fallback}, all per-II check results, and the schedule.
-        The default return tuple is unchanged for upstream equivalence.
 
-    Returns
-    -------
-    tuple[list[int], list[int], int] | dict
-        start_times: Start time for each task
-        buffer_versions: Number of versions for each buffer
-        minimal_II: The minimal initiation interval found
+@dataclass(frozen=True)
+class Reuse:
+    buffer: str
+    last_reader: str
+    next_writer: str
+    delta: int = 0
+    read_latency: int = 1
+
+
+@dataclass(frozen=True)
+class Resource:
+    owner: str
+    core: str
+    pipe: str
+    capacity: int = 1
+
+    def __post_init__(self):
+        if self.capacity != 1:
+            raise SolverError(
+                "RESOURCE_CAPACITY_UNSUPPORTED",
+                "this core models capacity 1 per (owner, core, pipe); a multi-slot "
+                "resource must be registered as distinct provable resources",
+            )
+
+
+@dataclass(frozen=True)
+class Capacity:
+    space: str
+    owner: str
+    bytes: int
+
+
+@dataclass(frozen=True)
+class Problem:
+    tasks: tuple
+    edges: tuple = ()
+    buffers: tuple = ()
+    reuses: tuple = ()
+    resources: tuple = ()
+    capacities: tuple = ()
+    max_stage: int = 0
+    manual: bool = False
+    issue_after: tuple = ()
+
+
+@dataclass(frozen=True)
+class Assignment:
+    ii: int
+    starts: dict
+    stages: dict
+    phases: dict
+    versions: dict
+    issue_order: tuple
+    detail: str = ""
+
+
+def _task_map(problem):
+    by_name = {}
+    for task in problem.tasks:
+        if task.name in by_name:
+            raise SolverError("TASK_DUPLICATE", "two tasks share the name %r" % (task.name,))
+        by_name[task.name] = task
+    for edge in problem.edges:
+        for endpoint in (edge.src, edge.dst):
+            if endpoint not in by_name:
+                raise SolverError("EDGE_ENDPOINT", "edge names an unknown task %r" % (endpoint,))
+    for reuse in problem.reuses:
+        for endpoint in (reuse.last_reader, reuse.next_writer):
+            if endpoint not in by_name:
+                raise SolverError("REUSE_ENDPOINT", "reuse names an unknown task %r" % (endpoint,))
+    for pair in problem.issue_after:
+        for endpoint in pair:
+            if endpoint not in by_name:
+                raise SolverError("ISSUE_ENDPOINT", "issue_after names an unknown task %r" % (endpoint,))
+    return by_name
+
+
+def _buffer_map(problem):
+    by_name = {buffer.name: buffer for buffer in problem.buffers}
+    for reuse in problem.reuses:
+        if reuse.buffer not in by_name:
+            raise SolverError("REUSE_BUFFER", "reuse names an unknown buffer %r" % (reuse.buffer,))
+    return by_name
+
+
+def lower_bound_ii(problem):
+    """A necessary lower bound on II: it narrows the search and never decides it."""
+    bound = 1
+    per_resource = {}
+    for task in problem.tasks:
+        for owner, core, pipe, quantity, offset in task.resources:
+            key = (owner, core, pipe)
+            per_resource[key] = per_resource.get(key, 0) + quantity
+    if per_resource:
+        bound = max(bound, max(per_resource.values()))
+    for edge in problem.edges:
+        if edge.src != edge.dst or edge.distance == 0:
+            # A zero-distance self edge is t >= t + latency: trivially true for
+            # latency 0 and infeasible otherwise (decided in solve, not by a bound).
+            continue
+        bound = max(bound, -(-edge.latency // edge.distance))
+    return bound
+
+
+def _issue_order(problem, phases, by_name):
+    """Phase order first, then the same-phase linear extension.
+
+    The physical emission order is the phase; only tasks sharing a phase are
+    ordered by the author's issue edges and by same-pipe source order. Sorting
+    the whole task list topologically would let a later-phase task claim an
+    earlier issue slot.
     """
-    n = len(latencies)
+    edges = [(a, b) for a, b in problem.issue_after]
+    groups = {}
+    for task in problem.tasks:
+        groups.setdefault(phases[task.name], []).append(task.name)
+    for names in groups.values():
+        by_pipe = {}
+        for name in names:
+            task = by_name[name]
+            for owner, core, pipe, _quantity, _offset in task.resources:
+                by_pipe.setdefault((owner, core, pipe), []).append(name)
+        for names_in_pipe in by_pipe.values():
+            for earlier, later in zip(names_in_pipe, names_in_pipe[1:]):
+                edges.append((earlier, later))
+    order = []
+    for phase in sorted(groups):
+        names = groups[phase]
+        adjacency = {name: [] for name in names}
+        indegree = {name: 0 for name in names}
+        seen = set()
+        for earlier, later in edges:
+            if earlier == later or earlier not in indegree or later not in indegree:
+                continue
+            if (earlier, later) in seen:
+                continue
+            seen.add((earlier, later))
+            adjacency[earlier].append(later)
+            indegree[later] += 1
+        ready = sorted(name for name, degree in indegree.items() if degree == 0)
+        placed = 0
+        while ready:
+            name = ready.pop(0)
+            order.append(name)
+            placed += 1
+            for later in sorted(adjacency[name]):
+                indegree[later] -= 1
+                if indegree[later] == 0:
+                    ready.append(later)
+            ready.sort()
+        if placed != len(names):
+            return None
+    return tuple(order) if len(order) == len(problem.tasks) else None
 
-    # For small number of tasks, return trivial schedule
-    if n < 1:
-        raise RuntimeError("Z3 loop scheduling failed: n too small")
 
-    if stage_order_deps is None:
-        stage_order_deps = []
-    if pipe_order_deps is None:
-        pipe_order_deps = []
-    if owner_exclusion_deps is None:
-        owner_exclusion_deps = []
-    if manual_stages is None:
-        manual_stages = [0] * n
-    if manual_schedule:
-        if len(manual_stages) != n:
-            raise ValueError(f"Manual schedule has {len(manual_stages)} stages for {n} tasks")
-        if any(stage < 0 for stage in manual_stages):
-            raise ValueError(f"Manual schedule stages must be non-negative: {manual_stages}")
-        if not enable_offset and any(stage != 0 for stage in manual_stages):
-            raise ValueError("Non-zero manual stages require enable_offset=True")
+def solve(problem, ii, timeout_ms=None):
+    """Decide one fixed II. Returns (status, Assignment | None, detail)."""
+    if not isinstance(ii, int) or ii < 1:
+        raise SolverError("SOLVER_II", "II must be a positive int")
+    by_name = _task_map(problem)
+    _buffer_map(problem)
+    for edge in problem.edges:
+        if edge.src == edge.dst and edge.distance == 0 and edge.latency > 0:
+            return UNSAT, None, "SELF_EDGE_INFEASIBLE: %r needs latency %d with no distance" % (
+                edge.src, edge.latency)
+    if not problem.manual:
+        for task in problem.tasks:
+            if task.stage not in (None, 0):
+                return UNSAT, None, "NO_OFFSET_AUTHORED_STAGE: %r has stage %r" % (task.name, task.stage)
+    if not problem.tasks:
+        return SAT, Assignment(ii=ii, starts={}, stages={}, phases={}, versions={},
+                               issue_order=(), detail="EMPTY_PROBLEM"), "EMPTY_PROBLEM"
+    try:
+        import z3
+    except ImportError:
+        return UNKNOWN, None, "Z3_UNAVAILABLE"
+    solver = z3.Solver()
+    if timeout_ms is not None:
+        solver.set("timeout", max(1, int(timeout_ms)))
+    stage, phase = {}, {}
+    for task in problem.tasks:
+        stage[task.name] = z3.Int("stage_%s" % task.name)
+        phase[task.name] = z3.Int("phase_%s" % task.name)
+        solver.add(phase[task.name] >= 0, phase[task.name] < ii)
+        if task.stage is not None and task.stage > problem.max_stage:
+            return UNSAT, None, "AUTHORED_STAGE_EXCEEDS_MAX: %r" % (task.name,)
+        if not problem.manual:
+            solver.add(stage[task.name] == 0)
+        elif task.stage is not None:
+            solver.add(stage[task.name] == task.stage)
+        else:
+            # A manual list pins unannotated siblings to stage 0: they are not
+            # free to drift because some sibling declared a stage.
+            solver.add(stage[task.name] == 0)
 
-    if verbose:
-        print(f"[Python Z3 Loop] Starting scheduling for {n} tasks")
-        print(f"[Python Z3 Loop] Latencies: {latencies}")
-        print(f"[Python Z3 Loop] IIs: {iis}")
-        print(f"[Python Z3 Loop] Resource flags: {resource_flags}")
-        print(f"[Python Z3 Loop] Data dependencies with distances: {data_deps}")
-        print(f"[Python Z3 Loop] Resource dependencies: {resource_deps}")
-        print(f"[Python Z3 Loop] Owner exclusions: {owner_exclusion_deps}")
-        print(f"[Python Z3 Loop] Stage-order dependencies: {stage_order_deps}")
-        print(f"[Python Z3 Loop] Pipe-order dependencies: {pipe_order_deps}")
-        print(f"[Python Z3 Loop] Manual schedule: {manual_schedule}, stages: {manual_stages}")
-        print(f"[Python Z3 Loop] Buffer sizes: {buffer_sizes} within groups {memory_groups}")
+    def start(name):
+        return ii * stage[name] + phase[name]
 
-    assert Z3_AVAILABLE, "z3-solver package is required but not installed"
+    for edge in problem.edges:
+        solver.add(start(edge.dst) + edge.distance * ii >= start(edge.src) + edge.latency)
+    version = {}
+    for buffer in problem.buffers:
+        version[buffer.name] = z3.Int("version_%s" % buffer.name)
+        if buffer.fixed is not None:
+            solver.add(version[buffer.name] == buffer.fixed)
+        else:
+            low = 1 if buffer.auto_min is None else buffer.auto_min
+            high = low if buffer.auto_max is None else buffer.auto_max
+            solver.add(version[buffer.name] >= low, version[buffer.name] <= high)
+    for reuse in problem.reuses:
+        offset = version[reuse.buffer] + reuse.delta
+        solver.add(offset >= 1)
+        solver.add(start(reuse.next_writer) + offset * ii >= start(reuse.last_reader) + reuse.read_latency)
+    per_resource = {}
+    for task in problem.tasks:
+        for owner, core, pipe, quantity, offset in task.resources:
+            if quantity > ii:
+                return UNSAT, None, "TASK_EXCEEDS_INTERVAL: %r reserves %d > II=%d" % (
+                    task.name, quantity, ii)
+            per_resource.setdefault((owner, core, pipe), []).append((task.name, quantity, offset))
+    for uses in per_resource.values():
+        for index, (first_name, first_quantity, first_offset) in enumerate(uses):
+            for second_name, second_quantity, second_offset in uses[index + 1:]:
+                delta = ((start(second_name) + second_offset)
+                         - (start(first_name) + first_offset)) % ii
+                solver.add(first_quantity <= delta)
+                solver.add(second_quantity <= ii - delta)
+    for earlier, later in problem.issue_after:
+        # Emission order is physical: within one cycle the earlier-issued task may
+        # not sit at a later phase. Same-phase ties are settled by the linear
+        # extension recorded in issue_order.
+        solver.add(phase[earlier] <= phase[later])
+    # Capacity constraints exist only for a space that publishes a usable size.
+    # A space without a fact is unconstrained here and must stay UNRESOLVED in the
+    # storage plan; treating it as infinite would be the backfill this core refuses.
+    for capacity in problem.capacities:
+        terms = [version[buffer.name] * buffer.slot_bytes for buffer in problem.buffers
+                 if buffer.space == capacity.space and buffer.owner == capacity.owner]
+        if terms:
+            solver.add(sum(terms) <= capacity.bytes)
+    result = solver.check()
+    if result == z3.unsat:
+        return UNSAT, None, "UNSAT_FOR_II"
+    if result != z3.sat:
+        return UNKNOWN, None, "SOLVER_UNKNOWN_OR_TIMEOUT"
+    model = solver.model()
+    stages = {task.name: model.eval(stage[task.name], model_completion=True).as_long()
+              for task in problem.tasks}
+    phases = {task.name: model.eval(phase[task.name], model_completion=True).as_long()
+              for task in problem.tasks}
+    versions = {buffer.name: model.eval(version[buffer.name], model_completion=True).as_long()
+                for buffer in problem.buffers}
+    starts = {name: ii * stages[name] + phases[name] for name in stages}
+    order = _issue_order(problem, phases, by_name)
+    if order is None:
+        return UNSAT, None, "ISSUE_ORDER_CYCLE"
+    return SAT, Assignment(ii=ii, starts=starts, stages=stages, phases=phases,
+                           versions=versions, issue_order=order, detail="SAT"), "SAT"
 
-    # Use a private Z3 context so this solve is isolated from any global-context
-    # state accumulated by other solves in the same process. Sharing the global
-    # context makes repeated identical solves return different (equally valid)
-    # models run-to-run; a fresh context per call keeps the result deterministic.
-    ctx = z3.Context()
 
-    # Binary search for minimal II
-    # Lower bound: 1 cycle
-    # A sequential schedule must cover both dependency latency and the issue
-    # intervals of tasks sharing a resource.
-    ii_lower = max(iis)
-    ii_upper = max(sum(latencies), sum(iis)) + 1
-    best_ii = ii_upper
-    best_model = None
-    best_start_vars = None
-    check_results: list[str] = []
-    # Which II check was undecided, if any. Keeps "we ran out of decision budget"
-    # distinguishable from "we proved every candidate infeasible".
-    unknown_at_ii: int | None = None
-
-    if verbose:
-        print(f"[Python Z3 Loop] Binary search range: [{ii_lower}, {ii_upper})")
-
-    while ii_lower < ii_upper:
-        ii_mid = (ii_lower + ii_upper) // 2
-        if verbose:
-            print(f"[Python Z3 Loop] Testing II = {ii_mid}")
-
-        # Create solver for feasibility check
-        solver = z3.Solver(ctx=ctx)
-        if seed is not None:
-            solver.set("random_seed", seed)
-        solver.set("rlimit", 1000000)
-        # A wall-clock timeout on EVERY II check. rlimit alone is resource-counted and
-        # has no relation to elapsed time, so a single pathological check could run for
-        # tens of minutes (measured: n=768 needs 949 s). With a timeout the solver
-        # returns unknown instead of running away, and the caller decides what that means.
-        if solve_timeout_ms is not None:
-            solver.set("timeout", int(solve_timeout_ms))
-
-        k_vars = [z3.Int(f"k_{i}", ctx) for i in range(n)]
-        r_vars = [z3.Int(f"r_{i}", ctx) for i in range(n)]
-        start_vars = [k_vars[i] * ii_mid + r_vars[i] for i in range(n)]
-
-        for i in range(n):
-            solver.add(k_vars[i] >= 0)
-            solver.add(r_vars[i] >= 0)
-            solver.add(r_vars[i] < ii_mid)
-
-        if manual_schedule:
-            for i, stage in enumerate(manual_stages):
-                solver.add(k_vars[i] == stage)
-        for previous, current in pipe_order_deps:
-            solver.add(r_vars[previous] <= r_vars[current])
-
-        buffer_vars = [z3.Int(f"buf_{i}", ctx) for i in range(len(buffer_sizes))]
-        for i in range(len(buffer_sizes)):
-            solver.add(buffer_vars[i] >= 1)
-            solver.add(buffer_vars[i] <= num_stages)
-        if fixed_buffer_versions is not None:
-            if len(fixed_buffer_versions) != len(buffer_sizes):
-                raise ValueError("fixed_buffer_versions must match buffer_sizes length")
-            for i, want in enumerate(fixed_buffer_versions):
-                if want is None:
+def verify_assignment(problem, assignment):
+    """Independent integer postcheck: recompute every constraint without z3."""
+    by_name = _task_map(problem)
+    _buffer_map(problem)
+    problems = []
+    ii = assignment.ii
+    known_buffers = {buffer.name for buffer in problem.buffers}
+    for label, mapping in (("STARTS", assignment.starts), ("STAGES", assignment.stages),
+                           ("PHASES", assignment.phases)):
+        for key in mapping:
+            if key not in by_name:
+                problems.append("FOREIGN_TASK_%s %r" % (label, key))
+    for key in assignment.versions:
+        if key not in known_buffers:
+            problems.append("FOREIGN_BUFFER_VERSION %r" % (key,))
+    for name, task in by_name.items():
+        if name not in assignment.stages or name not in assignment.phases:
+            problems.append("MISSING_TASK %r" % (name,))
+            continue
+        level = assignment.stages[name]
+        phase = assignment.phases[name]
+        if level < 0 or level > problem.max_stage:
+            problems.append("STAGE_OUT_OF_RANGE %r=%d" % (name, level))
+        if not 0 <= phase < ii:
+            problems.append("PHASE_OUT_OF_RANGE %r=%d" % (name, phase))
+        if assignment.starts.get(name) != ii * level + phase:
+            problems.append("START_FORMULA %r" % (name,))
+        if task.stage is not None and level != task.stage:
+            problems.append("AUTHORED_STAGE_CHANGED %r=%d authored=%d" % (name, level, task.stage))
+        if not problem.manual and level != 0:
+            problems.append("NO_OFFSET_STAGE %r=%d" % (name, level))
+        if problem.manual and task.stage is None and level != 0:
+            problems.append("MANUAL_DEFAULT_STAGE %r=%d" % (name, level))
+        for use in task.resources:
+            if use[3] > ii:
+                problems.append("TASK_EXCEEDS_INTERVAL %r reserves %d > II=%d" % (name, use[3], ii))
+    for edge in problem.edges:
+        if assignment.starts.get(edge.dst, 0) + edge.distance * ii < assignment.starts.get(edge.src, 0) + edge.latency:
+            problems.append("EDGE_VIOLATED %s->%s" % (edge.src, edge.dst))
+    for reuse in problem.reuses:
+        versions = assignment.versions.get(reuse.buffer)
+        if versions is None:
+            problems.append("MISSING_BUFFER %r" % (reuse.buffer,))
+            continue
+        if versions + reuse.delta < 1:
+            problems.append("VERSION_DELTA %r" % (reuse.buffer,))
+        if (assignment.starts.get(reuse.next_writer, 0) + (versions + reuse.delta) * ii
+                < assignment.starts.get(reuse.last_reader, 0) + reuse.read_latency):
+            problems.append("REUSE_VIOLATED %r" % (reuse.buffer,))
+    for buffer in problem.buffers:
+        versions = assignment.versions.get(buffer.name)
+        if versions is None:
+            problems.append("MISSING_VERSIONS %r" % (buffer.name,))
+            continue
+        if buffer.fixed is not None and versions != buffer.fixed:
+            problems.append("FIXED_VERSIONS_CHANGED %r=%d authored=%d" % (buffer.name, versions, buffer.fixed))
+        low = 1 if buffer.auto_min is None else buffer.auto_min
+        high = low if buffer.auto_max is None else buffer.auto_max
+        if buffer.fixed is None and not low <= versions <= high:
+            problems.append("AUTO_VERSIONS_OUT_OF_DOMAIN %r=%d" % (buffer.name, versions))
+    per_resource = {}
+    for task in problem.tasks:
+        for owner, core, pipe, quantity, offset in task.resources:
+            per_resource.setdefault((owner, core, pipe), []).append((task.name, quantity, offset))
+    for uses in per_resource.values():
+        for index, (first_name, first_quantity, first_offset) in enumerate(uses):
+            for second_name, second_quantity, second_offset in uses[index + 1:]:
+                if first_name not in assignment.starts or second_name not in assignment.starts:
                     continue
-                if want < 1 or want > num_stages:
-                    raise ValueError("fixed buffer version %d for buffer %d outside [1, %d]"
-                                     % (want, i, num_stages))
-                solver.add(buffer_vars[i] == want)
-        for group in memory_groups:
-            cap = group[0]
-            idxs = group[1:]
-            if idxs:
-                solver.add(z3.Sum([buffer_vars[i] * buffer_sizes[i] for i in idxs]) <= cap)
-
-        # Add data dependency constraints with distance
-        for u, v, distance, latency in data_deps:
-            if distance >= 0:
-                if verbose:
-                    print(f"[Python Z3 Loop] Data dependency: task {v} - task {u} >= {latency} - {ii_mid}*{distance}")
-                solver.add(start_vars[v] - start_vars[u] >= latency - ii_mid * distance)
-            else:
-                buffer_var_id = -distance - 1  # Convert to 0-based index
-                if verbose:
-                    print(
-                        f"[Python Z3 Loop] Data dependency with negative distance: task {v} - task {u} >= {latency} - {ii_mid}*buf_{buffer_var_id}"
-                    )
-                solver.add(start_vars[v] - start_vars[u] >= latency - ii_mid * buffer_vars[buffer_var_id])
-
-        # Add resource dependency constraints
-        # For tasks i and j that use same resource, they cannot execute simultaneously
-        # We create ordering variable O_i,j (True means i before j, False means j before i)
-        for i, j in resource_deps:
-            if i < j:  # Only consider each pair once
-                ii_i = iis[i]
-                ii_j = iis[j]
-
-                # Create ordering variable
-                o_ij = z3.Bool(f"O_{i}_{j}", ctx)
-
-                solver.add(z3.Implies(o_ij, r_vars[j] - r_vars[i] >= ii_i))
-                solver.add(z3.Implies(o_ij, r_vars[i] - r_vars[j] + ii_mid >= ii_j))
-                solver.add(z3.Implies(z3.Not(o_ij), r_vars[i] - r_vars[j] >= ii_j))
-                solver.add(z3.Implies(z3.Not(o_ij), r_vars[j] - r_vars[i] + ii_mid >= ii_i))
-
-                if verbose:
-                    print(f"[Python Z3 Loop] Resource dependency between {i} and {j}: ii_i={ii_i}, ii_j={ii_j}")
-
-        # A physical storage ring shared by two disjoint owners is a cyclic
-        # resource. Choose one modulo order and protect both the
-        # forward hand-off and the wrap-around hand-off. Pipeline stage
-        # offsets deliberately do not participate: owners exchange the same
-        # physical slot at their issue phases, not at their logical stages.
-        for i, j, latency_i_j, latency_j_i in owner_exclusion_deps:
-            i_before_j = z3.Bool(f"Owner_{i}_{j}", ctx)
-            solver.add(z3.Implies(i_before_j, r_vars[j] - r_vars[i] >= latency_i_j))
-            solver.add(z3.Implies(i_before_j, r_vars[i] - r_vars[j] + ii_mid >= latency_j_i))
-            solver.add(z3.Implies(z3.Not(i_before_j), r_vars[i] - r_vars[j] >= latency_j_i))
-            solver.add(z3.Implies(z3.Not(i_before_j), r_vars[j] - r_vars[i] + ii_mid >= latency_i_j))
-            if verbose:
-                print(f"[Python Z3 Loop] Owner exclusion between {i} and {j}: latency_i_j={latency_i_j}, latency_j_i={latency_j_i}")
-
-        # Add stage-order constraints for copied Let variables.
-        # (u, w) requires k_u <= k_w: any unit u that reads a Let-defined var
-        # must not be scheduled into a later iteration-stage than w, a unit that
-        # writes the buffer the Let reads. This keeps the cloned Let (prepended
-        # to the loop body in u's stage) reading the pre-write buffer value.
-        for u, w in stage_order_deps:
-            solver.add(k_vars[u] <= k_vars[w])
-            if verbose:
-                print(f"[Python Z3 Loop] Stage-order constraint: k_{u} <= k_{w}")
-
-        # Optional offset constraint: when disabled, every task using a given
-        # resource (pipe bit) must fit within a single II window, i.e.
-        # max(start) - min(start) < II among that resource's tasks. For a set,
-        # max - min < II is equivalent to |start_a - start_b| < II for all pairs.
-        if not enable_offset:
-            pipe_bits = [1, 2, 4, 8, 16, 32, 64]  # MTE1, MTE2, MTE3, Cube, Vector, Fixpipe, Scalar
-            for bit in pipe_bits:
-                group = [i for i in range(n) if resource_flags[i] & bit]
-                for a in range(len(group)):
-                    for b in range(a + 1, len(group)):
-                        ia, ib = group[a], group[b]
-                        solver.add(start_vars[ia] - start_vars[ib] < ii_mid)
-                        solver.add(start_vars[ib] - start_vars[ia] < ii_mid)
-                if verbose and len(group) > 1:
-                    print(f"[Python Z3 Loop] Offset disabled: resource bit {bit} tasks {group} span < {ii_mid}")
-
-        # Check feasibility
-        if verbose:
-            print(f"[Python Z3 Loop] Checking feasibility for II = {ii_mid}...")
-        res = solver.check()
-        check_results.append(str(res))
-        if res == z3.unknown:
-            # WBS 04-08: an undecided solver must NOT be SILENTLY converted into an
-            # "infeasible" II and hence into a fallback schedule. That rule is kept.
-            # What this flag adds is a NON-SILENT conversion: the caller must opt in by
-            # passing allow_fallback_on_unknown=True, and the returned status is
-            # "unknown" (NOT "sat" and NOT "fallback"), so the degradation is labelled.
-            if not allow_fallback_on_unknown:
-                raise RuntimeError("Z3 scheduling failed: solver returned unknown")
-            unknown_at_ii = ii_mid
-            break
-        if res == z3.sat:
-            if verbose:
-                print(f"[Python Z3 Loop] II = {ii_mid} is feasible")
-            best_ii = ii_mid
-            best_model = solver.model()
-            best_start_vars = start_vars
-            best_k_vars = k_vars
-            best_buffer_vars = buffer_vars
-            # Try smaller II
-            ii_upper = ii_mid
-        else:
-            if verbose:
-                print(f"[Python Z3 Loop] II = {ii_mid} is infeasible")
-            # Need larger II
-            ii_lower = ii_mid + 1
-
-    if best_model is None:
-        # Reaching here means no II candidate produced a model. Two very different
-        # situations land here, and they must not be reported as the same thing:
-        #   * every candidate was UNSAT  -> the search really was exhausted;
-        #   * some candidate was UNKNOWN -> the solver ran out of budget and we simply
-        #     do not know. This is NOT a proof of infeasibility.
-        # Reaching the serial fallback no longer implies every candidate was UNSAT: with
-        # allow_fallback_on_unknown an undecided check also lands here. The returned
-        # status distinguishes the two (see the return_status block at the end of this
-        # function); the schedule below is the same serial answer either way.
-        if manual_schedule:
-            raise RuntimeError(
-                "Manual schedule constraints are infeasible; check per-pipe source order, T.Stage values, dependencies, and resource usage"
-            )
-        # No feasible II found. Fall back to a trivial sequential (non-pipelined)
-        # schedule: each task starts right after the previous one finishes, in
-        # index order. II = sum(latencies) makes successive loop iterations
-        # non-overlapping. best_ii is clamped to >= 1 to avoid downstream
-        # division by zero.
-        if verbose:
-            print("[Python Z3 Loop] No feasible II found; falling back to sequential schedule")
-        start_times = [0] * n
-        for i in range(1, n):
-            start_times[i] = start_times[i - 1] + latencies[i - 1]
-        best_ii = max(sum(latencies), 1)
-        buffer_versions = [1] * len(buffer_sizes)
+                delta = ((assignment.starts[second_name] + second_offset)
+                         - (assignment.starts[first_name] + first_offset)) % ii
+                if not (first_quantity <= delta and second_quantity <= ii - delta):
+                    problems.append("RESOURCE_OVERLAP %s/%s" % (first_name, second_name))
+    for capacity in problem.capacities:
+        total = sum(assignment.versions.get(buffer.name, 0) * buffer.slot_bytes
+                    for buffer in problem.buffers
+                    if buffer.space == capacity.space and buffer.owner == capacity.owner)
+        if total > capacity.bytes:
+            problems.append("CAPACITY_EXCEEDED %s/%s" % (capacity.space, capacity.owner))
+    order = tuple(assignment.issue_order)
+    if sorted(order) != sorted(by_name):
+        problems.append("ISSUE_ORDER_NOT_A_PERMUTATION")
     else:
-        if verbose:
-            print(f"[Python Z3 Loop] Minimal feasible II = {best_ii}")
-
-        # Extract start times from best model. Normalize by the smallest k so the
-        # earliest iteration starts at 0.
-        start_times = []
-        k_vars = [best_model.eval(best_k_vars[i]).as_long() for i in range(n)]
-        offset = min(k_vars)
-        for i in range(n):
-            start_time = best_model.eval(best_start_vars[i]).as_long() - offset * best_ii
-            start_times.append(start_time)
-
-        # Extract buffer versions from best model
-        if recalculate_buffer_versions:
-            # if recalculation is true, we recalculate based on the schedule and dependencies
-            buffer_versions = len(buffer_sizes) * [1]
-            for u, v, distance, latency in data_deps:
-                if distance < 0:
-                    buffer_var_id = -distance - 1
-                    from math import ceil
-
-                    buffer_versions[buffer_var_id] = max(
-                        buffer_versions[buffer_var_id], ceil((latency + start_times[u] - start_times[v]) / best_ii)
-                    )
-        else:
-            buffer_versions = []
-            for i in range(len(buffer_sizes)):
-                buffer_var = best_model.eval(best_buffer_vars[i]).as_long()
-                buffer_versions.append(buffer_var)
-
-    # Sort tasks by start time (and by index as tie-breaker)
-    task_indices = list(range(n))
-    task_indices.sort(key=lambda idx: (start_times[idx], idx))
-
-    if verbose:
-        print(f"[Python Z3 Loop] Scheduling completed. Minimal II = {best_ii}.")
-    for i in range(n):
-        idx = task_indices[i]
-        if verbose:
-            print(
-                f"[Python Z3 Loop]   Task {idx}: start_time={start_times[idx]}, "
-                f"latency={latencies[idx]}, II={iis[idx]}, "
-                f"resource_flags={resource_flags[idx]:07b}"
-            )
-    if verbose:
-        for i in range(len(buffer_sizes)):
-            print(f"[Python Z3 Loop]   Buffer {i}: size={buffer_sizes[i]}, num_versions={buffer_versions[i]}")
-
-    # Save schedule visualization when verbose is True
-    if verbose:
-        try:
-            # Find the next available schedule number
-            schedule_num = _find_next_schedule_number()
-            schedule_dir = Path(f"debug/schedule_{schedule_num:03d}")
-            schedule_dir.mkdir(parents=True, exist_ok=True)
-
-            # Save schedule information
-            schedule_info = {
-                "num_stages": num_stages,
-                "num_tasks": n,
-                "minimal_II": best_ii,
-                "latencies": latencies,
-                "iis": iis,
-                "resource_flags": resource_flags,
-                "data_dependencies": data_deps,
-                "resource_dependencies": resource_deps,
-                "owner_exclusions": owner_exclusion_deps,
-                "manual_schedule": manual_schedule,
-                "manual_stages": manual_stages,
-                "start_times": start_times,
-                "sorted_indices": task_indices,
-                "timestamp": time.time(),
-            }
-            if seed is not None:
-                schedule_info["random_seed"] = seed
-
-            # Save as JSON
-            info_file = schedule_dir / "schedule_info.json"
-            with open(info_file, "w") as f:
-                json.dump(schedule_info, f, indent=2)
-
-            # Directly generate matplotlib visualization (PNG and PDF)
-            try:
-                import matplotlib.pyplot as plt
-                import matplotlib.patches as patches
-                import colorsys
-                from matplotlib.patches import Patch
-
-                fig, ax = plt.subplots(figsize=(16, 10))
-                # Set background color to light gray
-                fig.patch.set_facecolor("#f0f0f0")
-                ax.set_facecolor("#888888")
-
-                # Create color map for resources (pipe mask values)
-                def _get_pipe_color(mask):
-                    if mask & 8:  # Cube
-                        return "gold"
-                    if mask & 16:  # Vector
-                        return "green"
-                    if mask & 2:  # MTE2 (GM->UB)
-                        return "red"
-                    if mask & 4:  # MTE3 (UB->GM)
-                        return "orange"
-                    if mask & 1:  # MTE1
-                        return "cyan"
-                    if mask & 32:  # Fixpipe
-                        return "pink"
-                    return "blue"
-
-                # Plot each task as a horizontal bar with two phases
-                for i in range(n):
-                    color = _get_pipe_color(resource_flags[i])
-                    start = start_times[i]
-                    latency = latencies[i]
-                    ii = iis[i]
-
-                    # Calculate ii boundary
-                    ii_boundary = start + ii if start + ii < start + latency else start + latency
-
-                    # Plot [start, start+ii] phase with darker color
-                    phase1_width = ii_boundary - start
-                    if phase1_width > 0:
-                        # Darken the color for initial phase
-                        rgb = plt.cm.colors.to_rgb(color)
-                        hls = colorsys.rgb_to_hls(*rgb)
-                        darker_color = colorsys.hls_to_rgb(hls[0], max(0, hls[1] * 0.7), hls[2])
-
-                        rect1 = patches.Rectangle(
-                            (start, i - 0.4),  # (x, y)
-                            phase1_width,
-                            0.8,  # width, height
-                            linewidth=1,
-                            edgecolor="black",
-                            facecolor=darker_color,
-                            alpha=0.9,
-                            hatch="//",
-                            label="Initial Phase [start, start+II]" if i == 0 else "",
-                        )
-                        ax.add_patch(rect1)
-
-                    # Plot [start+ii, end] phase with original color
-                    phase2_width = (start + latency) - ii_boundary
-                    if phase2_width > 0:
-                        rect2 = patches.Rectangle(
-                            (ii_boundary, i - 0.4),  # (x, y)
-                            phase2_width,
-                            0.8,  # width, height
-                            linewidth=1,
-                            edgecolor="black",
-                            facecolor=color,
-                            alpha=0.7,
-                            label="Remaining Phase [start+II, end]" if i == 0 else "",
-                        )
-                        ax.add_patch(rect2)
-
-                    # Add task label (black text for better visibility)
-                    ax.text(
-                        start + latency / 2,
-                        i,
-                        f"T{i}\nII={ii}",
-                        ha="center",
-                        va="center",
-                        fontsize=8,
-                        color="white",
-                        fontweight="bold",
-                    )
-
-                    # Add vertical line at ii boundary
-                    if phase1_width > 0 and phase2_width > 0:
-                        ax.axvline(x=ii_boundary, color="white", linestyle="-", alpha=0.8, linewidth=1)
-
-                # Set limits and labels
-                max_time = max(start_times[i] + latencies[i] for i in range(n))
-                min_time = min(start_times[i] for i in range(n))
-                ax.set_xlim(min_time - 5, max_time + 5)
-                ax.set_ylim(-1, n)
-                ax.set_xlabel("Time (cycles)")
-                ax.set_ylabel("Task Index")
-                ax.set_title(f"Z3 Schedule Timeline (Minimal II={best_ii})")
-                ax.grid(True, alpha=0.3)
-
-                # Add legend for resource types and phases (outside the plot)
-                legend_elements = [
-                    Patch(facecolor="gold", edgecolor="black", label="Cube (M)"),
-                    Patch(facecolor="green", edgecolor="black", label="Vector (V)"),
-                    Patch(facecolor="red", edgecolor="black", label="MTE2 (GM->)"),
-                    Patch(facecolor="orange", edgecolor="black", label="MTE3 (->GM)"),
-                    Patch(facecolor="cyan", edgecolor="black", label="MTE1 (L1->L0)"),
-                    Patch(facecolor="pink", edgecolor="black", label="Fixpipe"),
-                    Patch(facecolor="blue", edgecolor="black", label="Other"),
-                    Patch(facecolor="darkgreen", edgecolor="black", hatch="//", alpha=0.9, label="Initial Phase [start, start+II]"),
-                    Patch(facecolor="green", edgecolor="black", alpha=0.7, label="Remaining Phase [start+II, end]"),
-                ]
-                # Place legend outside the plot on the right side
-                ax.legend(
-                    handles=legend_elements,
-                    loc="center left",
-                    bbox_to_anchor=(1.02, 0.5),
-                    fontsize=9,
-                    frameon=True,
-                    framealpha=0.9,
-                    facecolor="white",
-                )
-
-                # Add vertical lines for each 10 time units
-                for t in range(0, max_time + 10, 10):
-                    ax.axvline(x=t, color="gray", linestyle="--", alpha=0.3, linewidth=0.5)
-
-                # Save PNG and PDF files
-                png_file = schedule_dir / "schedule_timeline.png"
-                pdf_file = schedule_dir / "schedule_timeline.pdf"
-                plt.savefig(png_file, dpi=150, bbox_inches="tight")
-                plt.savefig(pdf_file, bbox_inches="tight")
-                plt.close(fig)  # Close the figure to free memory
-
-                print(f"[Python Z3 Loop] Schedule visualization saved as PNG: {png_file}")
-                print(f"[Python Z3 Loop] Schedule visualization saved as PDF: {pdf_file}")
-
-            except ImportError as e:
-                print(f"[Python Z3 Loop] Warning: matplotlib not available, skipping visualization: {e}")
-            except Exception as e:
-                print(f"[Python Z3 Loop] Warning: Failed to generate visualization: {e}")
-
-            print(f"[Python Z3 Loop] Schedule visualization saved to {schedule_dir}/ (text, JSON, PNG, PDF)")
-
-        except Exception as e:
-            print(f"[Python Z3 Loop] Warning: Failed to save schedule visualization: {e}")
-
-    if return_status:
-        # WBS 04-08: the four solver states must stay DISTINCT.
-        #   sat      -- a real model was found and its II is the minimal feasible one
-        #   fallback -- every candidate was UNSAT; the serial schedule is a PROVEN
-        #               non-pipelined answer
-        #   unknown  -- the solver ran out of budget at some II. We do NOT know whether
-        #               that II was feasible, so this is NOT a proof and MUST NOT be
-        #               reported as fallback (which would claim exhaustion).
-        if best_model is not None:
-            state = "sat"
-            reason = None
-        elif unknown_at_ii is not None:
-            state = "unknown"
-            reason = ("solver returned unknown at II=%d (timeout/rlimit budget); "
-                      "later candidates were not all decided, so feasibility is NOT refuted"
-                      % unknown_at_ii)
-        else:
-            state = "fallback"
-            reason = "all tested II candidates were unsat; core returned its explicit serial schedule"
-        return {
-            "status": state,
-            "start_times": start_times,
-            "buffer_versions": buffer_versions,
-            "minimal_II": best_ii,
-            "check_results": check_results,
-            "fallback_reason": reason,
-            "unknown_at_ii": unknown_at_ii,
-            # An unknown result never exhausts the search space, so it must never be
-            # promoted to UNSAT downstream.
-            "search_scope_complete": state in ("sat", "fallback"),
-        }
-    return start_times, buffer_versions, best_ii
-
-
-# FFI-exposed function for loop scheduling
-
-
-__all__ = ["z3_schedule_python", "z3_schedule_loop_python", "Z3_AVAILABLE",
-           "core_source_sha256"]
+        previous_phase = None
+        for name in order:
+            phase = assignment.phases.get(name, 0)
+            if previous_phase is not None and phase < previous_phase:
+                problems.append("ISSUE_ORDER_PHASE %r" % (name,))
+            previous_phase = phase
+        position = {name: index for index, name in enumerate(order)}
+        for earlier, later in problem.issue_after:
+            if assignment.phases.get(earlier, 0) > assignment.phases.get(later, 0):
+                problems.append("ISSUE_ORDER_BEFORE %s->%s" % (earlier, later))
+            if assignment.phases.get(earlier) == assignment.phases.get(later) and position[earlier] > position[later]:
+                problems.append("ISSUE_ORDER_VIOLATED %s->%s" % (earlier, later))
+    return problems
 
 
 def core_source_sha256() -> str:
-    """SHA of THIS physical core file; both TF and TileLang adapters must report it."""
+    """Content identity of this core, for provenance without a second digest."""
     import hashlib
     from pathlib import Path
-    return hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+
+    return "sha256:" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def _z3_available() -> bool:
+    from importlib.util import find_spec
+
+    return find_spec("z3") is not None
+
+
+Z3_AVAILABLE = _z3_available()
+

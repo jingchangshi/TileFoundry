@@ -273,14 +273,19 @@ class TirPrinter(PythonPrinter, StmtVisitor[list[str]], ExprVisitor[str]):
             # A TIR roundtrip must rebuild the declaration explicitly. Printing a
             # plain range() here would drop the authored intent and the reparsed
             # program would silently differ from the one that was lowered.
-            annotations = '{"enable_offset": %s}' % (
-                "True" if pipeline.enable_offset else "False"
-            )
-            loop = "tf.pipelined(%s, num_stages=%d, annotations=%s)" % (
-                self.visit(stmt.stop, self.context),
-                pipeline.num_stages,
-                annotations,
-            )
+            parts = ["max_stage=%d" % pipeline.max_stage,
+                     "max_buffer_versions=%d" % pipeline.max_buffer_versions,
+                     "enable_offset=%s" % ("True" if pipeline.enable_offset else "False")]
+            if pipeline.fixed_ii is not None:
+                parts.append("fixed_ii=%d" % pipeline.fixed_ii)
+            if pipeline.task_intents:
+                rows = tuple((item.task_id, item.anchor, item.stage, tuple(item.issue_after),
+                              item.cost_override) for item in pipeline.task_intents)
+                parts.append("task_intents=%r" % (rows,))
+            if pipeline.buffer_schedules:
+                rows = tuple((item.root,) + tuple(item.versions) for item in pipeline.buffer_schedules)
+                parts.append("buffer_schedules=%r" % (rows,))
+            loop = "tf.pipelined(%s, %s)" % (self.visit(stmt.stop, self.context), ", ".join(parts))
             lines = [f"{self.indent}for {self.visit(stmt.induction_var)} in {loop}:"]
             lines.extend(self._body(stmt.body))
             return lines

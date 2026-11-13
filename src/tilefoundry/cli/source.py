@@ -38,12 +38,20 @@ def checked_program(
     """Load the authored HIR, bind its dims, and check it."""
     bound = bind_dims(dims)
     module = load_authored_ir(source)
+    from tilefoundry.ir.hir.pipeline import (  # noqa: PLC0415
+        normalize_pipeline_references,
+        rebind_cloned_pipeline_references,
+    )
+    normalize_pipeline_references(module)
     authored = module.entry_function()
     _require_bound_dims(module, authored, bound, command=command)
     try:
         checked, entry = check_program(module, authored, topology_level=topology_level, dims=bound)
     except SpecializationError as error:
         raise ValueError(f"{command}: {error}") from None
+    # check_program/specialize returns CLONED functions. Rebind the copied typed object
+    # refs to the clone's own children/buffers before any consumer reads Program.entry.
+    rebind_cloned_pipeline_references(checked)
     return Program(authored, checked, entry)
 
 

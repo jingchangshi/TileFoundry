@@ -5075,8 +5075,8 @@ def _loop_iterator_kind(call: ast.Call) -> str | None:
         return "bare_tile" if callee.id == "tile" else "range"
     if _tile_iterator_callee().match(callee, None) is not None:
         return "tile"
-    # D0: a pipelined loop is expressed as tf.pipelined(stop, num_stages=...).
-    # Bare 'pipelined' is NOT accepted, matching how tf.tile is the only spelling.
+    # The pipeline iterator is expressed only as tf.pipelined(stop, ...).
+    # Bare 'pipelined' is not accepted, matching how tf.tile is the only spelling.
     if _pipelined_iterator_callee().match(callee, None) is not None:
         return "pipelined"
     return None
@@ -5160,7 +5160,8 @@ def _reads_program_value(node: ast.AST, context: MatchContext) -> bool:
 #: The only keywords tf.pipelined accepts at D0. Anything else is named, never
 #: quietly ignored: an annotation the author believes in and the compiler drops is
 #: worse than a refusal.
-_PIPELINE_KEYWORDS = frozenset({"num_stages", "annotations"})
+_PIPELINE_KEYWORDS = frozenset({"max_stage", "fixed_ii", "max_buffer_versions",
+                              "task_intents", "buffer_schedules", "enable_offset"})
 
 
 def _pipeline_spec_from_keywords(call: ast.Call):
@@ -5170,43 +5171,79 @@ def _pipeline_spec_from_keywords(call: ast.Call):
     later" without pretending a solver already ran, so a symbolic or computed
     expression is a refusal rather than a deferred unknown.
     """
-    from tilefoundry.ir.hir.pipeline import PipelineError, PipelineSpec  # noqa: PLC0415
+    from tilefoundry.ir.hir.pipeline import (  # noqa: PLC0415
+        BufferSchedule, PipelineError, PipelineSpec, TaskIntent,
+    )
+
+    def task_intents_from_literal(value):
+        if not isinstance(value, tuple):
+            raise PipelineError("TASK_INTENT_INVALID", "task_intents must be a literal tuple")
+        rows = []
+        for item in value:
+            if isinstance(item, dict):
+                rows.append(TaskIntent(task_id=item["id"], anchor=item["anchor"],
+                                       stage=item.get("stage"), issue_after=tuple(item.get("issue_after", ())),
+                                       cost_override=item.get("cost_override")))
+            elif isinstance(item, tuple) and 2 <= len(item) <= 5:
+                rows.append(TaskIntent(task_id=item[0], anchor=item[1],
+                                       stage=item[2] if len(item) > 2 else None,
+                                       issue_after=tuple(item[3]) if len(item) > 3 else (),
+                                       cost_override=item[4] if len(item) > 4 else None))
+            else:
+                raise PipelineError("TASK_INTENT_INVALID", "task intent literal must be a tuple or dict")
+        return tuple(rows)
+
+    def buffer_schedules_from_literal(value):
+        if not isinstance(value, tuple):
+            raise PipelineError("BUFFER_SCHEDULE_INVALID", "buffer_schedules must be a literal tuple")
+        rows = []
+        for item in value:
+            if isinstance(item, dict):
+                rows.append(BufferSchedule(root=item["root"], versions=tuple(item["versions"])))
+            elif isinstance(item, tuple) and len(item) >= 2:
+                rows.append(BufferSchedule(root=item[0], versions=tuple(item[1:])))
+            else:
+                raise PipelineError(BUFFER_SCHEDULE_INVALID, "buffer schedule literal must be a tuple or dict")
+        return tuple(rows)
 
     values = {}
     for keyword in call.keywords:
         if keyword.arg is None:
-            raise PipelineError(
-                "PIPELINE_ANNOTATION_UNSUPPORTED",
-                "tf.pipelined does not accept **kwargs",
-            )
+            raise PipelineError("PIPELINE_ANNOTATION_UNSUPPORTED", "tf.pipelined does not accept **kwargs")
         if keyword.arg not in _PIPELINE_KEYWORDS:
             raise PipelineError(
                 "PIPELINE_ANNOTATION_UNSUPPORTED",
-                "unsupported tf.pipelined keyword %r; D0 accepts %s"
+                "unsupported tf.pipelined keyword %r; accepts %s"
                 % (keyword.arg, tuple(sorted(_PIPELINE_KEYWORDS))),
             )
         try:
             values[keyword.arg] = ast.literal_eval(keyword.value)
         except (ValueError, SyntaxError):
             code = (
-                "PIPELINE_NUM_STAGES_INVALID"
-                if keyword.arg == "num_stages"
+                "PIPELINE_FIELD_INVALID" if keyword.arg in {"max_stage", "fixed_ii", "max_buffer_versions"}
                 else "PIPELINE_ANNOTATION_UNSUPPORTED"
             )
             raise PipelineError(
                 code,
-                "tf.pipelined(%s=...) must be a literal; a dynamic expression is "
-                "not a D0 declaration" % (keyword.arg,),
+                "tf.pipelined(%s=...) must be a literal; a dynamic expression is not a declaration"
+                % (keyword.arg,),
             ) from None
-    if "num_stages" not in values:
+    if "max_stage" not in values or "max_buffer_versions" not in values:
         raise PipelineError(
-            "PIPELINE_NUM_STAGES_INVALID",
-            "tf.pipelined requires num_stages=<int>",
+            "PIPELINE_FIELD_REQUIRED",
+            "tf.pipelined requires max_stage and max_buffer_versions",
         )
+    enable_offset = values.get("enable_offset", False)
+    if not isinstance(enable_offset, bool):
+        raise PipelineError("PIPELINE_ENABLE_OFFSET_INVALID", "enable_offset must be a bool")
     return PipelineSpec.from_surface(
-        values["num_stages"],
-        values.get("annotations"),
+        max_stage=values.get("max_stage"),
+        max_buffer_versions=values.get("max_buffer_versions"),
+        fixed_ii=values.get("fixed_ii"),
+        enable_offset=enable_offset,
         origin=(call.lineno, call.col_offset),
+        task_intents=task_intents_from_literal(values.get("task_intents", ())),
+        buffer_schedules=buffer_schedules_from_literal(values.get("buffer_schedules", ())),
     )
 
 
@@ -5275,7 +5312,7 @@ class LoopHeaderPattern(ElementPattern):
                     node.iter.func,
                     "loop iterator must be tf.tile(...) or range(...)",
                 )
-            # tf.pipelined is the ONE iterator that takes keywords (num_stages,
+            # tf.pipelined is the ONE iterator that takes keywords (max_stage,
             # annotations); tile/range stay positional-only at the IR level.
             if node.iter.keywords and kind != "pipelined":
                 return PatternFailure(

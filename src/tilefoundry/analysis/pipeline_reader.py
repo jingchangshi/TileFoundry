@@ -1,9 +1,4 @@
-"""Read typed pipeline and buffer-version declarations off a HIR module.
-
-Kept separate from the checks so the reader can be reused by the finalize passes
-without dragging the refusal policy along.
-"""
-
+"""Read the one typed pipeline schema off a HIR module."""
 from __future__ import annotations
 
 from typing import Any
@@ -12,7 +7,6 @@ __all__ = ["collect_buffer_versions", "collect_pipeline_declarations"]
 
 
 def _loops(module) -> list:
-    """Every LoopRegion in the module, in a stable document order."""
     from tilefoundry.ir.hir.loop_region import LoopRegion  # noqa: PLC0415
     from tilefoundry.ir.visitor import collect_exprs  # noqa: PLC0415
 
@@ -26,17 +20,11 @@ def _loops(module) -> list:
 
 
 def _loop_key(loop, index: int) -> str:
-    """A stable identity for a loop within one program image.
-
-    Position in document order plus the induction variable name. Deliberately NOT
-    id(): identity would differ between two parsed copies of identical source, so
-    a comparison of two views of the same program could never match.
-    """
-    return "loop[%d]:%s" % (index, getattr(loop.induction_var, "name", "?"))
+    return "loop[%d]:%s" % (index, getattr(getattr(loop, "induction_var", None), "name", "?"))
 
 
 def collect_pipeline_declarations(module) -> dict[str, Any]:
-    """{loop_key: PipelineSpec} for loops that actually declare a pipeline."""
+    """{loop_key: PipelineSpec} for loops that declare a native pipeline."""
     out: dict[str, Any] = {}
     for index, loop in enumerate(_loops(module)):
         spec = getattr(loop, "pipeline", None)
@@ -46,28 +34,21 @@ def collect_pipeline_declarations(module) -> dict[str, Any]:
 
 
 def collect_buffer_versions(module) -> dict[str, int]:
-    """{buffer_key: versions} read from the authored Empty.buffers declarations.
+    """{loop_key:buffer_root: declared_version_upper_bound} from typed schedules.
 
-    The declaration lives on the allocation, not in the pipeline spec: the budget
-    is a loop-level statement, the version count is a buffer-level one.
+    The key is loop-qualified so two loops with a same-named buffer cannot
+    overwrite each other. Fixed(n) reports n; Auto(min,max) reports max. No
+    Empty.buffers side channel and no fallback from max_stage.
     """
-    from tilefoundry.ir.core import Call  # noqa: PLC0415
-    from tilefoundry.ir.visitor import collect_exprs  # noqa: PLC0415
-
     out: dict[str, int] = {}
-    for item in getattr(module, "functions", ()) or ():
-        body = getattr(item, "body", None)
-        if body is None:
+    for index, loop in enumerate(_loops(module)):
+        spec = getattr(loop, "pipeline", None)
+        if spec is None:
             continue
-        for index, expr in enumerate(collect_exprs(body)):
-            if not isinstance(expr, Call):
-                continue
-            # Identify the op by its CLASS, not by a name attribute: Empty carries
-            # no .name, and matching prose would silently find nothing.
-            op = getattr(expr, "target", None)
-            if type(op).__name__ != "Empty":
-                continue
-            buffers = getattr(op, "buffers", 1)
-            name = getattr(expr, "name", None) or "empty"
-            out["empty[%d]:%s" % (index, name)] = buffers
+        prefix = _loop_key(loop, index)
+        for schedule in getattr(spec, "buffer_schedules", ()):
+            versions = schedule.versions
+            out["%s:%s" % (prefix, schedule.root)] = (
+                versions[1] if versions[0] == "fixed" else versions[2]
+            )
     return out

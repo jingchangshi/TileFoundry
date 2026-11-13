@@ -1,0 +1,133 @@
+[spec]
+schema = "tilefoundry.ascend.device/v2"
+kind = "device"
+id = "ascend.950pr"
+
+[compatibility]
+architectures = ["ascend.davinci_950"]
+
+[facts.identity.name]
+value = "ascend_950pr"
+unit = "name"
+origin = "measured"
+source = "npu-smi info and Ascend runtime device properties"
+conditions = "Ascend 950PR NPU card queried on host device 0"
+
+[facts.compute.block_count]
+value = 28
+unit = "count"
+origin = "measured"
+source = "torch.npu device property / npu-smi core count"
+conditions = "28 coupled AIC/AIV logical blocks available on one Ascend 950PR die"
+
+[facts.compute.aic_count]
+value = 28
+unit = "count"
+origin = "measured"
+source = "CANN runtime AIC core query on Ascend 950PR"
+conditions = "1 AIC core per logical block across 28 blocks"
+
+[facts.compute.aiv_count]
+value = 56
+unit = "count"
+origin = "measured"
+source = "CANN runtime AIV core query on Ascend 950PR"
+conditions = "2 AIV cores per logical block across 28 blocks"
+
+[facts.memory.hbm.capacity]
+value = 137438953472
+unit = "byte"
+origin = "measured"
+source = "npu-smi memory report on Ascend 950PR"
+conditions = "128 GiB HBM pool shared across all blocks of this device"
+
+[facts.memory.hbm.owner]
+value = "target"
+unit = "name"
+origin = "vendor"
+source = "Ascend 950PR device memory model"
+conditions = "Device-global HBM memory is shared across all blocks"
+
+[facts.memory.hbm.bandwidth]
+value = 1600000000000
+unit = "byte/s"
+origin = "estimated"
+source = "Ascend 950PR HBM nominal aggregate bandwidth estimate"
+conditions = "Nominal roofline global memory bandwidth for analytical modeling only"
+
+[facts.memory.l1.per_aic]
+value = 524288
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 hardware platform specification"
+conditions = "512 KiB L1 buffer per AIC core"
+
+[facts.memory.l0a.per_aic]
+value = 65536
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 hardware platform specification"
+conditions = "64 KiB L0A buffer per AIC core"
+
+[facts.memory.l0b.per_aic]
+value = 65536
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 hardware platform specification"
+conditions = "64 KiB L0B buffer per AIC core"
+
+[facts.memory.l0c.per_aic]
+value = 262144
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 hardware platform specification"
+conditions = "256 KiB L0C accumulator buffer per AIC core"
+
+[facts.memory.ub.nominal_per_aiv]
+value = 262144
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 hardware platform specification"
+conditions = "256 KiB hardware Unified Buffer per AIV core"
+
+[facts.memory.ub.usable_per_aiv]
+value = 221184
+unit = "byte"
+origin = "vendor"
+source = "TileLang Ascend dav-3510 SIMT/runtime usable UB budget"
+conditions = "216 KiB usable UB after reserving runtime/SIMT scratch state"
+
+[facts.memory.rmem.per_lane]
+value = 256
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 vector lane register model"
+conditions = "Logical register budget per vector lane inside a vector execution scope"
+
+[facts.throughput.aic.f16]
+value = 400000000000000
+unit = "flop/s"
+origin = "estimated"
+source = "Ascend 950PR nominal aggregate Cube fp16/bf16 compute estimate"
+conditions = "Nominal roofline peak for analytical performance comparison"
+
+[facts.throughput.aic.bf16]
+value = 400000000000000
+unit = "flop/s"
+origin = "estimated"
+source = "Ascend 950PR nominal aggregate Cube bf16 compute estimate"
+conditions = "Nominal roofline peak for analytical performance comparison"
+
+[facts.throughput.aiv.f32]
+value = 32000000000000
+unit = "flop/s"
+origin = "estimated"
+source = "Ascend 950PR nominal aggregate AIV fp32 vector compute estimate"
+conditions = "Nominal roofline peak across 56 AIV cores"
+
+[facts.performance.aiv.lane_events]
+value = 16000000000000
+unit = "op/s"
+origin = "estimated"
+source = "Ascend 950PR nominal AIV service-op throughput model"
+conditions = "Derived service rate for non-FLOP vector/scalar/select operations"

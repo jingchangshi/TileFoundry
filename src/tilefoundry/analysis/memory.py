@@ -678,7 +678,7 @@ def _resident_peaks(model, windows, offsets, facts, sizes, *, interval=None):
                 ):
                     size = sizes[value] if window.persistent else window.bytes
                     live[value] = max(live.get(value, 0), size)
-            if name not in ("gmem", "smem"):
+            if name not in ("gmem", "smem", "tmem"):
                 return sum(live.values())
             end = amount = 0
             for start, stop in sorted(
@@ -709,7 +709,7 @@ def _place(model, facts, topologies):
         else MemoryOptions()
     )
     offsets, high_water = {}, {}
-    for name in ("gmem", "smem"):
+    for name in ("gmem", "smem", "tmem"):
         solved = solve_allocation(
             get_metadata(model.context.function, AllocationSummaryMetadata),
             model.context,

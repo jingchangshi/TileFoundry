@@ -75,8 +75,8 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
             pointer = PointerType(DType.from_name(op.dtype), storage)
         except (TypeError, ValueError) as error:
             ctx.error(call, str(error))
-        if pointer.storage is not StorageKind.SMEM:
-            ctx.error(call, "integer tensor_view address requires storage='smem'")
+        if pointer.storage not in (StorageKind.SMEM, StorageKind.TMEM):
+            ctx.error(call, "integer tensor_view address requires storage='smem' or 'tmem'")
         address.type = pointer
     elif op.dtype is not None or op.storage is not None:
         try:

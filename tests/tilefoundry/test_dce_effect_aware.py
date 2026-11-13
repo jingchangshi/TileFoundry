@@ -1,14 +1,4 @@
-"""Effect-aware DCE: retained vs deleted loops, stated and pinned.
-
-D0 HIR is value-form SSA, so "externally visible write" and "reachable from the
-returned value" are the same fact. These controls pin the three rules:
-
-  * a loop whose produced value no one consumes (private SMEM dead) is DELETED;
-  * the same loop consumed by an insert_slice back to GM / returned is RETAINED;
-  * an instruction's WRITE operand is NOT an HIR mutation of the old Var, so it is
-    not a DCE root on its own;
-  * F0's intent check still refuses a deleted loop that declared a pipeline.
-"""
+"""Effect-aware DCE: retained vs deleted loops, stated and pinned."""
 
 from __future__ import annotations
 
@@ -18,8 +8,6 @@ import tempfile
 from tilefoundry.analysis.effects import (
     classify_dropped_loop,
     instruction_operand_writes,
-    reachable_loop_ids,
-    reachable_loops,
     storage_of,
     value_is_external,
 )
@@ -40,13 +28,18 @@ SMEM = 'Tensor[(64,), "f32", (64,), "smem"]'
 
 
 def _load(body_lines):
-    rows = [HEADER, '@module(entry="k", target=CpuTarget())', "class M:", "    @func",
-            '    def k(x: Tensor[(64,), "f32"]) -> Tensor[(64,), "f32"]:']
+    rows = [
+        HEADER,
+        '@module(entry="k", target=CpuTarget())',
+        "class M:",
+        "    @func",
+        '    def k(x: Tensor[(64,), "f32"]) -> Tensor[(64,), "f32"]:',
+    ]
     rows.extend("        " + line for line in body_lines)
     directory = pathlib.Path(tempfile.mkdtemp(prefix="tf_dce_"))
     path = directory / "prog.py"
-    path.write_text("\n".join(rows) + "\n")
-    return load_authored_ir("%s:M" % path)
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return load_authored_ir(f"{path}:M")
 
 
 def _loops(module):
@@ -55,12 +48,11 @@ def _loops(module):
 
 
 def test_private_smem_only_loop_is_deleted():
-    """No consumer of the produced SMEM value -> the loop is dead and drops out."""
     module = _load(
         [
-            "acc = tf.empty(%s)" % SMEM,
+            f"acc = tf.empty({SMEM})",
             "for i in range(4):",
-            "    back = tf.empty(%s)" % SMEM,
+            f"    back = tf.empty({SMEM})",
             "    acc = tf.insert_slice(acc, back, (0,))",
             "return x",
         ]
@@ -69,12 +61,11 @@ def test_private_smem_only_loop_is_deleted():
 
 
 def test_smem_result_consumed_into_gm_is_retained():
-    """The same loop, whose SMEM result feeds a returned GM value, is retained."""
     module = _load(
         [
-            "acc = tf.empty(%s)" % SMEM,
+            f"acc = tf.empty({SMEM})",
             "for i in range(4):",
-            "    back = tf.empty(%s)" % SMEM,
+            f"    back = tf.empty({SMEM})",
             "    acc = tf.insert_slice(acc, back, (0,))",
             "return tf.insert_slice(x, acc, (0,))",
         ]
@@ -108,9 +99,9 @@ def test_unconsumed_computed_value_is_deleted():
 
 def test_pipeline_loop_deleted_still_refused_by_intent_check():
     module_path_body = [
-        "acc = tf.empty(%s)" % SMEM,
-        "for i in tf.pipelined(4, num_stages=2):",
-        "    back = tf.empty(%s)" % SMEM,
+        f"acc = tf.empty({SMEM})",
+        "for i in tf.pipelined(4, max_stage=2, max_buffer_versions=2):",
+        f"    back = tf.empty({SMEM})",
         "    acc = tf.insert_slice(acc, back, (0,))",
         "return x",
     ]
@@ -125,18 +116,15 @@ def test_pipeline_loop_deleted_still_refused_by_intent_check():
 def test_pipeline_loop_consumed_is_retained():
     module = _load(
         [
-            "acc = tf.empty(%s)" % SMEM,
-            "for i in tf.pipelined(4, num_stages=2):",
-            "    back = tf.empty(%s)" % SMEM,
+            f"acc = tf.empty({SMEM})",
+            "for i in tf.pipelined(4, max_stage=2, max_buffer_versions=2):",
+            f"    back = tf.empty({SMEM})",
             "    acc = tf.insert_slice(acc, back, (0,))",
             "return tf.insert_slice(x, acc, (0,))",
         ]
     )
     loops = _loops(module)
     assert len(loops) == 1 and loops[0].pipeline is not None
-
-
-# --- rule 3: instruction operand WRITE is not a DCE root ----------------------
 
 
 class _WriteParam:
@@ -154,7 +142,6 @@ def test_instruction_operand_write_is_reported_but_is_not_a_root():
     call = Call(target=_WriteOp(), args=(Var(name="dst", type=gmem),), type=smem)
     writes = instruction_operand_writes(call)
     assert writes == ((0, None),) or writes[0][0] == 0, writes
-    # Report it, but do NOT let it make the produced value external: the result is SMEM.
     assert storage_of(call) is smem.storage
     assert value_is_external(call) is False
 
@@ -182,6 +169,6 @@ def test_dropped_loop_classification():
         yield_values=(),
         extent=Constant(4, type=index),
         step=Constant(1, type=index),
-        pipeline=PipelineSpec(num_stages=2),
+        pipeline=PipelineSpec(max_stage=2, max_buffer_versions=2),
     )
     assert classify_dropped_loop(pipelined) == "pipeline"

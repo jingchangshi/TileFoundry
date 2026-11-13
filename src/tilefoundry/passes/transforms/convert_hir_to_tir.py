@@ -165,6 +165,7 @@ class TirBuilder:
 
     blocks: list[TirScope]
     loops: list = field(default_factory=list)
+    loop_nodes: dict = field(default_factory=dict)
     stage_counters: dict = field(default_factory=dict)
     # Values proven REGION-INVARIANT by construction, with the reason they are invariant.
     # Only explicitly marked values are exempt from the escape check; this is a class, not
@@ -245,9 +246,10 @@ class TirBuilder:
             # field, so a TIR roundtrip rebuilds it instead of losing it to a
             # default. It is not consumed here: a D0 for still runs serially, and
             # reading this as "a schedule exists" would be a false claim.
-            self.add(
-                For(*loop, self.build(region), pipeline=getattr(owner, "pipeline", None))
-            )
+            for_stmt = For(*loop, self.build(region), pipeline=getattr(owner, "pipeline", None))
+            self.add(for_stmt)
+            if owner is not None:
+                self.loop_nodes[id(owner)] = for_stmt
 
     def declare(self, leaf, *, ctx, values, desired=None):
         """Declare one allocation root in its owning scope."""
@@ -279,7 +281,7 @@ class TirBuilder:
                     var, Call(AllocTensor(tensor_type=storage_type), (), type=storage_type)
                 )
                 return var
-            if storage_type.storage not in (StorageKind.SMEM, StorageKind.GMEM):
+            if storage_type.storage not in (StorageKind.SMEM, StorageKind.TMEM, StorageKind.GMEM):
                 raise LoweringError(
                     f"{_label(expr)} has addressable result in unsupported storage {storage_type.storage}"
                 )
@@ -1445,7 +1447,7 @@ class LoweringContext(TypeInferContext):
                     ),
                     "gmem dtype alias over a device-global root; carries no per-mesh state",
                 )
-            if desired.storage is StorageKind.SMEM and desired.dtype != result.type.dtype:
+            if desired.storage in (StorageKind.SMEM, StorageKind.TMEM) and desired.dtype != result.type.dtype:
                 root = self.storage.answers[leaf].chain[-1]
                 result = self.builder.declare(root, ctx=self, values=values, desired=desired)
             for window in windows:
@@ -2181,7 +2183,127 @@ class ConvertHIRToTIR(ModulePass):
             )
 
         lower_module(result.module)
+        summaries = _region_binding_summaries(self.authored, result.module.entry_function(), lowering)
+        result.module.metadata["region_bindings"] = summaries
+        try:
+            object.__setattr__(result.module.entry_function(), "_region_bindings", summaries)
+        except (AttributeError, TypeError):
+            pass
         return result.module
+
+
+def _hir_loops(node, out):
+    from tilefoundry.ir.hir.loop_region import LoopRegion
+    if isinstance(node, LoopRegion):
+        out.append(node)
+    fields = getattr(node, "__dataclass_fields__", None)
+    if fields:
+        for name in fields:
+            if name in ("type", "metadata", "origin"):
+                continue
+            value = getattr(node, name, None)
+            if isinstance(value, tuple):
+                for item in value:
+                    _hir_loops(item, out)
+            elif hasattr(value, "__dataclass_fields__"):
+                _hir_loops(value, out)
+    return out
+
+
+def _tir_loops(stmt, out):
+    from tilefoundry.ir.tir.stmts import For, Sequential
+    if isinstance(stmt, For):
+        out.append(stmt)
+    if isinstance(stmt, Sequential):
+        for child in stmt.body:
+            _tir_loops(child, out)
+        return out
+    body = getattr(stmt, "body", None)
+    if body is not None:
+        _tir_loops(body, out)
+    for name in ("then_body", "else_body"):
+        branch = getattr(stmt, name, None)
+        if branch is not None:
+            _tir_loops(branch, out)
+    return out
+
+
+def _region_binding_summaries(authored_function, lowered_function, lowering=None):
+    """P1 source binding summary bound by object identity, never by names or loop order."""
+    if lowering is None:
+        raise LoweringError("region binding requires the active Lowering context")
+    source_loops = [value[0] for value in getattr(lowering, "_memo", {}).values()
+                    if type(value[0]).__name__ == "LoopRegion"]
+    # Deduplicate while preserving visit order.
+    seen_loops = set()
+    source_loops = [loop for loop in source_loops
+                    if not (id(loop) in seen_loops or seen_loops.add(id(loop)))]
+    loop_nodes = getattr(getattr(lowering, "context", None), "builder", None)
+    loop_nodes = getattr(loop_nodes, "loop_nodes", None)
+    if not isinstance(loop_nodes, dict):
+        raise LoweringError("region binding has no builder loop identity map")
+    summaries = []
+    for source in source_loops:
+        actual = loop_nodes.get(id(source))
+        if actual is None:
+            raise LoweringError("REGION_BINDING_UNRESOLVED: source loop has no actual For")
+        defs = []
+        allocs = []
+        body_stmts = getattr(getattr(actual, "body", None), "body", ()) or ()
+        for child in body_stmts:
+            if type(child).__name__ == "LetStmt":
+                defs.append(child.var)
+                if type(getattr(child.value, "target", None)).__name__ == "AllocTensor":
+                    allocs.append(child.var)
+        memo = getattr(lowering, "_memo", {})
+
+        def actual_of(expr):
+            pair = memo.get(id(expr))
+            return None if pair is None else pair[1]
+
+        carried_count = len(source.yield_values)
+        carried_params = tuple(source.params[:carried_count])
+        carried_actual = tuple(actual_of(p) for p in carried_params)
+        yields_actual = tuple(actual_of(v) for v in source.yield_values)
+        if any(item is None for item in carried_actual + yields_actual):
+            raise LoweringError("REGION_BINDING_UNRESOLVED: carried/yield binder has no actual def")
+        summaries.append({
+            "source_region": source,
+            "carried_params": carried_params,
+            "carried_initials": tuple(source.args[:carried_count]),
+            "carried_actual_defs": carried_actual,
+            "yields_actual": yields_actual,
+            "actual_defs": tuple(defs),
+            "actual_allocations": tuple(allocs),
+            "induction_var": source.induction_var,
+            "params": tuple(source.params),
+            "args": tuple(source.args),
+            "yield_values": tuple(source.yield_values),
+            "start": source.start,
+            "extent": source.extent,
+            "step": source.step,
+            "body": source.body,
+            "carries": source.carries(),
+            "captures": source.captures(),
+            "actual_loop": actual,
+            "actual_induction_var": actual.induction_var,
+            "actual_bounds": (actual.start, actual.stop, actual.step),
+        })
+    return tuple(summaries)
+
+
+def rebind_region_bindings(bindings, final_function):
+    """Carry source binder summaries onto the final entry's actual loop objects."""
+    actuals = _tir_loops(final_function.body, [])
+    if len(actuals) != len(bindings):
+        raise LoweringError("REGION_BINDING_COUNT_MISMATCH: final entry has %d loop(s), summary %d"
+                            % (len(actuals), len(bindings)))
+    out = []
+    for binding, actual in zip(bindings, actuals, strict=True):
+        out.append({**binding, "actual_loop": actual,
+                    "actual_induction_var": actual.induction_var,
+                    "actual_bounds": (actual.start, actual.stop, actual.step)})
+    return tuple(out)
 
 
 __all__ = ["ConvertHIRToTIR", "LoweringError"]
