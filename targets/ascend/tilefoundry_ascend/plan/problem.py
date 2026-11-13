@@ -541,6 +541,64 @@ def _grid_instances(entry) -> int:
         ) from None
 
 
+def _carried_roots(entry, region) -> dict:
+    """root Var id -> where it was bound, for the roots that outlive one iteration.
+
+    A root bound OUTSIDE the region loop is the same storage in every iteration:
+    the value written at k is what iteration k+1 reads. A root allocated INSIDE
+    the loop body is a fresh object each time, so its reads and writes are same-
+    generation by construction. This is measured from the real TIR positions, not
+    assumed from the buffer name or its domain.
+    """
+    from tilefoundry.ir.tir.stmts import (ExecutionScope, For, LetStmt, MeshScope,
+                                          Sequential)
+
+    loop = getattr(region, "node_ref", None)
+    if not isinstance(loop, For):
+        return {}
+    bound_inside = set()
+    bound_outside = {}
+
+    def walk(node, inside: bool):
+        if isinstance(node, Sequential):
+            for item in node.body:
+                walk(item, inside)
+            return
+        if isinstance(node, (MeshScope, ExecutionScope)):
+            walk(node.body, inside)
+            return
+        if isinstance(node, For):
+            walk(node.body, inside or node is loop)
+            return
+        if isinstance(node, LetStmt):
+            if inside:
+                bound_inside.add(id(node.var))
+            else:
+                bound_outside[id(node.var)] = node
+            return
+
+    walk(entry.body, False)
+    return {"inside": bound_inside, "outside": bound_outside, "loop": loop}
+
+
+def _loop_step(loop) -> int:
+    """The loop step, or a named refusal: a distance needs a step of exactly 1."""
+    from tilefoundry.ir.types.utils import static_dim_value
+
+    step = static_dim_value(getattr(loop, "step", None))
+    if step is None:
+        raise ProblemError(
+            "PROBLEM_DEPENDENCE_DISTANCE_UNSUPPORTED",
+            "the region loop states no static step, so no generation distance "
+            "can be derived from it")
+    if int(step) != 1:
+        raise ProblemError(
+            "PROBLEM_DEPENDENCE_DISTANCE_UNSUPPORTED",
+            "the region loop steps by %d, so a carried relation reaches another "
+            "iteration by more than one generation and this slice derives no such "
+            "distance" % (int(step),))
+    return int(step)
+
 def _same_generation(left, right) -> bool:
     """Two accesses are the same generation only when provably identical."""
     from tilefoundry.ir.core import Constant, Var
@@ -555,24 +613,43 @@ def _same_generation(left, right) -> bool:
     return False
 
 
-def _generation_distance(left: AccessFact, right: AccessFact) -> int:
+def _generation_distance(left, right, *, carried: bool = False,
+                         loop_step: int | None = None) -> int:
     """The ordinal difference between a producer and a consumer generation.
 
-    Today only distance 0 is derivable from the facts the unit tree records. A
-    carried relation (k -> k+1) needs the region's yield/carry identity, which
-    this slice does not have, so it is refused by name rather than filled in.
+    Three cases are derivable, and everything else is refused by name:
+      * the same generation (the same constant, or literally the same
+        induction Var) is distance 0;
+      * a CARRIED root bound outside the loop, read in one iteration after the
+        write of the previous one, is distance 1 - the loop step must be
+        exactly 1 for that to mean what it says;
+      * anything else (k vs k+2, a different Var, another region) has no
+        derivation here and is refused rather than filled in.
+
+    This REPLACES the earlier unconditional refusal for loops; the refusal is
+    now the fallback for the cases the facts do not pin down, which is what
+    lets a carried relation be stated instead of merely forbidden.
     """
     if _same_generation(left, right):
         return 0
+    if carried:
+        step = 1 if loop_step is None else int(loop_step)
+        if step != 1:
+            raise ProblemError(
+                "PROBLEM_DEPENDENCE_DISTANCE_UNSUPPORTED",
+                "access %s and access %s are one iteration apart on a loop whose "
+                "step is %d, so the generation delta is not the single-step "
+                "distance this slice derives"
+                % (left.access_id, right.access_id, step))
+        return 1
     raise ProblemError(
         "PROBLEM_DEPENDENCE_DISTANCE_UNSUPPORTED",
         "access %s (generation %r) and access %s (generation %r) are not the same "
-        "generation, and this slice derives no carried distance; refusing instead "
-        "of recording distance 0"
+        "generation, and are not a carried pair of a root bound outside the loop; "
+        "refusing instead of recording distance 0"
         % (left.access_id, getattr(left.generation, "value", left.generation),
            right.access_id, getattr(right.generation, "value", right.generation)),
     )
-
 
 def _access_key(task_order: dict, access: AccessFact) -> tuple:
     """Program order of one access. An unknown task is refused, never ordered at 0.
@@ -593,7 +670,9 @@ def _access_key(task_order: dict, access: AccessFact) -> tuple:
 
 
 def _dependences(accesses: tuple, effects: tuple, task_order: dict, *,
-                 straight_line: bool, grid_instances: int) -> tuple:
+                 straight_line: bool, grid_instances: int,
+                 loop_step: int | None = None,
+                 carried_roots: frozenset | set = frozenset()) -> tuple:
     """RAW/WAR/WAW from real accesses; a read/read pair carries no data edge.
 
     The delay is never a literal 0 here: it comes from plan/delays.py, which
@@ -608,7 +687,19 @@ def _dependences(accesses: tuple, effects: tuple, task_order: dict, *,
     edge_index = {}
     for left in accesses:
         for right in accesses:
-            if left.task_id == right.task_id or left.root_ref is not right.root_ref:
+            if left.root_ref is not right.root_ref:
+                continue
+            # A root bound OUTSIDE the loop is the same storage every iteration:
+            # the write at k is what iteration k+1 reads, and a read and a write
+            # of that root in ONE task is exactly how such a cycle appears in the
+            # program. Skipping the same-task pair silently dropped it - no edge
+            # and no refusal - so the solver never saw the constraint and could
+            # return an II smaller than the loop body needs. Same-generation
+            # pairs still come from program order; this only admits the carried
+            # pair that order cannot express.
+            same_task = left.task_id == right.task_id
+            carried_pair = same_task and id(left.root_ref) in carried_roots
+            if same_task and not carried_pair:
                 continue
             left_write = left.mode in _WRITE_MODES
             right_write = right.mode in _WRITE_MODES
@@ -620,14 +711,32 @@ def _dependences(accesses: tuple, effects: tuple, task_order: dict, *,
                 kind = "WAR"
             else:
                 continue
-            if _access_key(task_order, left) > _access_key(task_order, right):
+            if not carried_pair and _access_key(task_order, left) > _access_key(task_order, right):
                 continue
-            # The distance is DERIVED, never assumed: two accesses agree on a
-            # generation only when their generation values are provably the same
-            # instance (the same constant, or literally the same induction Var).
-            # Anything else (k vs k+1, a carry, another region) is refused here by
-            # name instead of being recorded as distance 0.
-            distance = _generation_distance(left, right)
+            # A carried pair is ONE iteration apart BY DEFINITION of the shape:
+            # the same task reads the root and later writes it, so iteration
+            # k+1's read is served by iteration k's write. Its distance is 1, not
+            # 0 - a distance-0 self edge says t >= t + latency and is unsatisfiable
+            # for any positive latency, which is how this was caught: the solver
+            # returned UNSAT instead of a plan.
+            if carried_pair:
+                if kind != "RAW":
+                    # only write-then-read crosses the iteration boundary; the
+                    # other directions stay same-generation facts
+                    continue
+                if _access_key(task_order, right) > _access_key(task_order, left):
+                    # the read comes after the write within one iteration: that is
+                    # an ordinary same-generation edge, not a carried one
+                    continue
+                distance = _generation_distance(left, right, carried=True,
+                                                loop_step=loop_step)
+            else:
+                # Derived, never assumed: two accesses agree on a generation only
+                # when their generation values are provably the same instance (the
+                # same constant, or literally the same induction Var). Anything
+                # else is refused by name instead of recorded as distance 0.
+                distance = _generation_distance(left, right,
+                                                loop_step=loop_step)
             key = (left.task_id, right.task_id, kind)
             pair_effects = {effect_of[left.access_id].effect_id,
                             effect_of[right.access_id].effect_id}
@@ -653,7 +762,10 @@ def _dependences(accesses: tuple, effects: tuple, task_order: dict, *,
                 # Both owners travel with the edge: same core KIND is not the
                 # same instance, and only a shared instance can be ordered.
                 producer_owner=left.owner, consumer_owner=right.owner,
-                grid_instances=grid_instances, distance=0)
+                # The real distance travels with the edge: a carried pair is not
+                # a zero-latency fact, and claiming one would let the proven-zero
+                # predicate certify an ordering across iterations.
+                grid_instances=grid_instances, distance=distance)
             edge_index[key] = len(edges)
             edges.append(Dependence(
                 producer=left.task_id, consumer=right.task_id,
@@ -1051,6 +1163,11 @@ def analyze_native_problem(units: UnitTree, effects=None, alias=None, target=Non
                 source="tilefoundry_ascend.tf_target.UB_BYTES",
                 status=REFERENCE,
             ))
+        # Facts the carried derivation needs: where each root was bound
+        # relative to this region's loop, and the loop's own step.
+        carried = _carried_roots(units.entry_ref, region)
+        carried_inside = set(carried.get("inside", ())) if carried else set()
+        loop_step = _loop_step(carried["loop"]) if carried else None
         problems.append(RegionProblem(
             region_ref=region,
             tasks=task_tuple,
@@ -1065,7 +1182,13 @@ def analyze_native_problem(units: UnitTree, effects=None, alias=None, target=Non
             # resolve through the registered model instead of a literal 0.
             edges=_dependences(accesses, effects, task_order,
                                straight_line=region.induction_var_ref is None,
-                               grid_instances=grid_instances),
+                               grid_instances=grid_instances,
+                               # The loop's own step and the roots that outlive
+                               # one iteration, both read from the real TIR: a
+                               # carried relation is DERIVED from these or
+                               # refused by name, never assumed.
+                               loop_step=loop_step,
+                               carried_roots=carried_inside),
             reuse=_reuse(buffers, accesses, effects, task_order),
             capacities=tuple(capacities),
             issue_after=_same_pipe_pairs(task_tuple, consecutive=True),

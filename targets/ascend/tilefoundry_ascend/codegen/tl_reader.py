@@ -401,6 +401,19 @@ def read_tl_facts(prim_func) -> TlFacts:
 
 
 # ----------------------------------------------------------- the TIR-side view
+
+def _emitted_has_simdvf(emitted) -> bool:
+    """Whether this emitted program renders a T.SimdVF() scope."""
+    def walk(member) -> bool:
+        if str(getattr(member, "kind", "")) == "simdvf":
+            return True
+        for child in getattr(member, "members", ()) or ():
+            if walk(child):
+                return True
+        return False
+
+    return walk(getattr(emitted, "body", None))
+
 def expected_facts(emitted) -> TlFacts:
     """What the REAL lowered TIR says the parsed TL program must look like.
 
@@ -514,10 +527,17 @@ def expected_facts(emitted) -> TlFacts:
                 walk_loops(member, inside_grid)
 
     walk_loops(emitted.body, False)
-    blocks = (TlBlock(name="root", annotations=(), alloc_buffers=()),
-              TlBlock(name="tilelang_root", annotations=(), alloc_buffers=shared),
-              TlBlock(name="SIMD_VF", annotations=(("tl.vf_source_index", "0"),),
-                      alloc_buffers=()))
+    blocks_list = [TlBlock(name="root", annotations=(), alloc_buffers=()),
+                   TlBlock(name="tilelang_root", annotations=(), alloc_buffers=shared)]
+    # SIMD_VF is expected ONLY when the emitted program actually opens one. A
+    # DMA-only kernel (gm_to_ub + ub_to_gm, no vector region) renders no
+    # T.SimdVF(), so demanding the block made such a program unreadable - the
+    # expectation was describing one emitter shape, not the parsed program.
+    if _emitted_has_simdvf(emitted):
+        blocks_list.append(
+            TlBlock(name="SIMD_VF", annotations=(("tl.vf_source_index", "0"),),
+                    alloc_buffers=()))
+    blocks = tuple(blocks_list)
     return TlFacts(
         symbol=emitted.entry,
         params=params,

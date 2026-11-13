@@ -1,6 +1,6 @@
 # COMPARATOR_REGISTRY_DRAFT — G3 登记物说明（task-56）
 
-配套 docs/handoff/COMPARATOR_THRESHOLD_REGISTRY.json —— **v2**（51489B、sha `8d1e9262…`、schema `tf-ascend.comparator-registry.v2`、draft=true、44 条 = 40 权威 + 4 supplemental）。v1（44239B、sha `b25dd485…`、mtime 07:37:28.990、commit `883117e`）记在 JSON 的 `registry_history.v1` 里可查。生成器 /tmp/tf_fac/gen_registry_v2.py、增量性证明 /tmp/tf_fac/verify_v2_additive.py 均可复跑。**本登记物不证明任何原例数值通过。**
+配套 docs/handoff/COMPARATOR_THRESHOLD_REGISTRY.json —— **v2 定稿**（sha `4a77755eb039adf9…`、schema `…registry.v2`、draft=true、44 条 = 40 权威 + 4 supplemental、stamp 2026-11-12T23:59:54Z）。**绑定只认这个 sha**：v1 `b25dd485…`（44239B、mtime 07:37:28.990、commit `883117e`）与中途 `8d1e9262…` 都是历史，都记在 `registry_history`（v1 含缺陷一行，未抹）。**本登记物不证明任何原例数值通过。**
 
 ## 1. 为什么这样登记
 
@@ -30,7 +30,7 @@
 1. **BinOp-aware 折叠**：`2 ** -10` 是 ast.BinOp，`ast.literal_eval` 抛 `malformed node`。规则 left=2 / op=Pow / right=一元负号。
 2. **比数值不比字面写法**：`ast.unparse` 出 `2**(-7)` 而 registry 存 `2 ** -7`，按字符串比会把**完好** registry 判成 44/220 全红（连续两版检查器因此皆错，第三版基线绿才配下结论）。
 3. **必须从表文件独立重推导**：协调篡改（fp16 `2**-10→2**-9`，source_forms 与 values 同步改、内部仍自洽）实测单向自洽 **0 红＝漏检**、重推导 **2 红＝抓住**。只读 JSON 等于没校验。
-4. **count / id-set 必须绑外部文件，且绑对字段**：丢一条 case（44→43）时上述两类检查**全绿**。v2 的机械绑法（**无需任何改名规则**）：`{source_key} ==` 重读两个源文件所得 44 个 `key` 的集合（44 个互异、逐字节相等，复算 True）；`{source_case_id}` **只能按 operator 分组或按多重集比** —— 实测权威 40 条的源值是 **int 1..20、每个 operator 重复一次**（不是 lead v2 规格里写的 "1…40" 字符串），全表 distinct 只有 24，故全局集合相等虽然可满足但**几乎不证明什么**；全局断言必须用 source_key，不是 source_case_id。（JSON 内 `authoritative_total=40` 只是自我声明，不可替代外部比对。）
+4. **count / id-set 必须绑外部文件，且绑对字段**：丢一条 case（44→43）时上述两类检查**全绿**。v2 的机械绑法（**无需任何改名规则**）：`{source_key} ==` 重读两个源文件所得 44 个 `key` 的集合（44 个互异、逐字节相等，复算 True）；`{source_case_id}` **只能按 operator 分组或按多重集比** —— 实测权威 40 条的源值是 **int 1..20、每个 operator 重复一次**（不是 lead v2 规格里写的 "1…40" 字符串），全表 distinct 只有 24，故全局集合相等虽然可满足但**几乎不证明什么**；全局断言必须用 source_key，不是 source_case_id。（JSON 内 `authoritative_total=40` 只是自我声明，不可替代外部比对。）registry 本地 `case_id`（= `<case>/<case_id>` 拼接）是**派生标识、不是源字段**，不得拿去与源字段比；`source_key` 唯一契约是等于源 `key` 原文，前缀形态（`level4/` vs `supplemental/mla_`）**无语义、不许断言、不许统一、不许再造第三种记法**（`binding_rules.source_key` 已写明）。→ **给 task-52**：v2 定稿后请删掉 suffix 映射与 `prefix=="mla_supplemental"` 断言，改断言 `{source_key}==` 源 key 集合（我实测：这两条在 v2 上仍会通过，但一旦 case_id 改成源字面就会误杀，且它们本身已是 lead 禁止的私有规则）。
 5. **字段齐全要显式 guard 且 shape-aware**：删任一字段是裸 `KeyError`（折叠检查不会顺带发现）。本 registry 有**两种合法 shape**（40 条无 `supplemental`、4 条多 `supplemental: true`），统一断言字段集合会把完好件判红。必检顶层 9 键 + 每条 case 5 键 + `threshold_entry{order,source_forms,values}` 且 order 为五字段顺序。
 6b. **登记物缺陷——已由 v2 `source_key` 消除**（保留一行历史）：v1 曾把 supplemental 记成 `mla_supplemental/\<s\>`，那是我生成器的自造记法、不对应源文件任何字段（源为 `case_id=\<s\>` + `key=supplemental/mla_\<s\>`）。v2 每条同时存 `source_file/source_key/source_case_id`（逐字节拷贝）并保留 `case_id` 作为 registry 本地标识；`registry_history.v1` 记下旧 sha/commit。→ 校验器不再有不可验证的私有改名层。
 7. **身份 guard**：三 sha256 复算 + `line_range` 仍锚住表体 + `repo_head` 等于 BiShengKernelAgent 当前 HEAD；表若移动则重推导整体失败，而非静默沿用旧值。

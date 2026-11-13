@@ -161,12 +161,21 @@ class RegisterBudgetFacts:
 
 #: Declared register budgets, keyed by (domain, register_class).
 #:
-#: EVERY entry here is UNSOURCED today, and that is the measured truth rather than a
-#: placeholder: the target's space_facts record states a vreg WIDTH (256 B) and no
-#: per-domain register COUNT, and the deployed build's own resource report is
-#: queried by codegen (n_regs / n_spills), not by this facts surface. Writing a
-#: plausible number here would let the storage gate PASS on a number nobody sourced,
-#: which is worse than refusing - so the refusal stands until a real fact arrives.
+#: THIS IS A FACT-REGISTRATION SLOT, NOT AN UNFINISHED TODO. Every entry is UNSOURCED
+#: because the current build has NO Ascend source for a per-domain register COUNT:
+#:   - the target states a vreg WIDTH (256 B per register), which is a different
+#:     fact and must never be divided into a count;
+#:   - the deployed TileLang build resource capture is HIP-only
+#:     (tilelang/jit/kernel.py:264, capture_hip_resource_usage = is_hip_target), so
+#:     n_regs/n_spills are not merely absent on Ascend - they are not provided.
+#: Writing a plausible number here would let the storage gate PASS on a number
+#: nobody sourced, which is worse than refusing. The register-budget gate therefore
+#: stays closed by FACT, and a positive register example is explicitly out of scope
+#: until a device or documentation source exists.
+#:
+#: The lowering-side report (storage.RegisterOccupancy) IS measurable and is kept: it
+#: is the half that can be filled in today. One side measurable plus one side
+#: UNSOURCED still refuses - that is the gate working, not a gap in the gate.
 REGISTER_BUDGETS = {
     ("aiv", "vreg"): RegisterBudgetFacts(
         "aiv", "vreg", None,

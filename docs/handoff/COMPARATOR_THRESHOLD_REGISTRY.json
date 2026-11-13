@@ -1631,11 +1631,14 @@
     "v2": {
       "change": "added source_file/source_key/source_case_id verbatim from the source files; case_id kept as the registry-local identifier",
       "authoritative_total": 40,
-      "supplemental_total": 4
+      "supplemental_total": 4,
+      "pre_publication_sha256": "8d1e92623cf48407c15c5999b339cfe1155695f4cdc355bec21991b417b86ca6",
+      "pre_publication_note": "single in-place revision before publication: added the binding_rules.source_key contract line (lead v2 item 3); no case entry touched",
+      "published": true
     }
   },
   "binding_rules": {
-    "source_key": "byte-for-byte copy of the key field in the named source_file; validator asserts the set equality against a fresh read of those files (no rename rule)",
+    "source_key": "byte-for-byte copy of the source file's own 'key' field (40 authoritative look like level4/<operator>_<n>, 4 supplemental look like supplemental/mla_<suffix>). ITS ONLY CONTRACT IS EQUALITY WITH THE SOURCE FIELD; the prefix shape carries NO semantics and must never be asserted, normalised, unified, or replaced by a third invented notation. The registry-local case_id is a separate identifier and is deliberately NOT a source field.",
     "source_case_id": "verbatim value: int for the 40 authoritative cases (1..20 per operator), str for supplemental; NOT unique across the whole registry (only 20 distinct ints serve 40 entries) so it may only be compared per-operator or as a multiset, never as a global set",
     "case_id": "registry-local identifier, deliberately not a source field"
   }

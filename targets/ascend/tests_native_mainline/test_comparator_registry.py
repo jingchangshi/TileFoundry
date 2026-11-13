@@ -56,6 +56,10 @@ EXPECTED = {
 }
 
 BLOCKED = "BLOCKED_DEPENDENCY"
+#: The artifact version this file validates. A different version is a different
+#: contract, and guessing at its fields is how a validator certifies a shape it
+#: was never written for.
+EXPECTED_SCHEMA = "tf-ascend.comparator-registry.v2"
 
 
 class Blocked(RuntimeError):
@@ -176,6 +180,8 @@ REQUIRED_KEYS = {
     "dtype_distribution": "the measured distribution the cases must match",
     "tree_anchor": "the in-repository evidence",
     "non_normalisation_note": "why the 1.0 entries are recorded as written",
+    "registry_history": "the superseded artifacts and their digests",
+    "binding_rules": "the stated contract for case_id/source_key/source_case_id",
 }
 
 #: Phrases an honesty section must still carry, so it cannot be hollowed out.
@@ -415,58 +421,37 @@ def _authoritative_ids() -> list:
     return ["%s/%s" % (row["case"], row["case_id"]) for row in rows]
 
 
-def _supplemental_suffixes() -> list:
-    """The supplemental suffixes, taken from the source file own case_id.
+def _source_indices() -> dict:
+    """The source files as per-case facts: key, case id, operator and dtype.
 
-    The registry spells these mla_supplemental/<suffix>, which is NOT either
-    source spelling (the file has case_id=gqa_bsnd_kv_tail and
-    key=supplemental/mla_gqa_bsnd_kv_tail). That notation is the registrant own
-    and is recorded in COMPARATOR_REGISTRY_DRAFT.md as a KNOWN DEFECT of the
-    artifact (a v2 would carry source_key verbatim). A validator that invented
-    a "correct" spelling would launder the defect, so the binding is done on the
-    SUFFIX - the part both sides genuinely agree on - and the prefix is checked
-    only for shape.
+    v2 copies these verbatim, so binding is plain equality with the sources and
+    no rename rule exists anywhere. The earlier suffix binding was a transition
+    state for a notation the v1 artifact had invented; keeping it would preserve
+    that defect as a rule.
+
+    source_case_id is NOT a global anchor: the 40 authoritative cases reuse ints
+    1..20 once per operator (24 distinct values serve all 44 entries), so a
+    global set comparison is satisfiable while proving almost nothing. The case
+    is bound PER OPERATOR as (case, case_id), which is unique, plus the key set,
+    which is globally unique.
     """
-    data = json.loads(SUPPLEMENTAL.read_text())
-    rows = data["cases"] if isinstance(data, dict) else data
-    return [str(row.get("case_id", "")) for row in rows]
-
-
-def _bind_case_ids(ids, cases) -> None:
-    """Compare the case id set with the external indices on disk."""
-    external = _authoritative_ids()
-    authoritative_ids = [case_id for case_id in ids
-                         if "supplemental" not in case_id]
-    if sorted(authoritative_ids) != sorted(external):
-        missing = sorted(set(external) - set(authoritative_ids))
-        extra = sorted(set(authoritative_ids) - set(external))
-        raise Blocked(BLOCKED, "the authoritative case ids are not the case "
-                               "matrix set: missing=%s extra=%s"
-                      % (missing, extra), "case set")
-    suffixes = _supplemental_suffixes()
-    registry_supplemental = []
-    for case_id in ids:
-        if "supplemental" not in case_id:
-            continue
-        prefix, _, suffix = case_id.rpartition("/")
-        if prefix != "mla_supplemental":
-            raise Blocked(BLOCKED, "supplemental id %r does not use the registered "
-                                   "prefix" % (case_id,), "case set")
-        registry_supplemental.append(suffix)
-    if sorted(registry_supplemental) != sorted(suffixes):
-        raise Blocked(BLOCKED, "the supplemental case ids are not the source file "
-                               "case ids: missing=%s extra=%s"
-                      % (sorted(set(suffixes) - set(registry_supplemental)),
-                         sorted(set(registry_supplemental) - set(suffixes))),
-                      "case set")
-    for case in cases:
-        has_marker = "supplemental" in case
-        is_supplemental = "supplemental" in str(case.get("case_id", ""))
-        if has_marker != is_supplemental:
-            raise Blocked(BLOCKED, "case %r states supplemental=%r, which does "
-                                   "not match its id"
-                          % (case.get("case_id"), case.get("supplemental")),
-                          "case set")
+    matrix = json.loads(CASE_MATRIX.read_text())
+    rows = matrix["cases"] if isinstance(matrix, dict) else matrix
+    supplemental = json.loads(SUPPLEMENTAL.read_text())
+    extra = (supplemental["cases"] if isinstance(supplemental, dict)
+             else supplemental)
+    by_key = {}
+    for row in rows:
+        by_key[str(row["key"])] = {"operator": str(row["case"]),
+                                   "case_id": row["case_id"],
+                                   "dtypes": tuple(str(item) for item in
+                                                   row.get("dtypes") or ())}
+    for row in extra:
+        by_key[str(row["key"])] = {"operator": "supplemental_mla",
+                                   "case_id": row.get("case_id"),
+                                   "dtypes": tuple(str(item) for item in
+                                                   row.get("dtypes") or ())}
+    return by_key
 
 def _require_case_set(registry: dict) -> None:
     """The case SET is what the registry claims it enumerated.
@@ -609,6 +594,9 @@ def _require_no_pass_claim(registry: dict) -> None:
             raise Blocked(BLOCKED, "case %r claims execution_status %r; the registry "
                                    "may not assert a result"
                           % (case.get("case_id"), status))
+    if str(registry.get("schema_version", "")) != EXPECTED_SCHEMA:
+        raise Blocked(BLOCKED, "the registry states schema %r, not %r"
+                      % (registry.get("schema_version"), EXPECTED_SCHEMA))
     if registry.get("draft") is not True:
         raise Blocked(BLOCKED, "the registry is not marked DRAFT")
     claims = registry.get("claims_not_made")

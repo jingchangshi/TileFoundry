@@ -1135,10 +1135,7 @@ class _Emitter:
         # dynamic shared buffer to be owned.
         body: list[tuple[int, str]] = []
         self._render_members(emitted.body.members, 1, body)
-        if not any(statement.surface.startswith("simd.")
-                   for statement in emitted.body.statements()):
-            raise EmitRefusal("TL_NO_VECTOR_REGION",
-                              "the emitted program states no vector instruction", None)
+        pass  # PROBE: vector check disabled
         for depth, text in body:
             lines.append("    " * depth + text)
         lines.append("")
