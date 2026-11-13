@@ -281,7 +281,7 @@ class TirBuilder:
                     var, Call(AllocTensor(tensor_type=storage_type), (), type=storage_type)
                 )
                 return var
-            if storage_type.storage not in (StorageKind.SMEM, StorageKind.GMEM):
+            if storage_type.storage not in (StorageKind.SMEM, StorageKind.TMEM, StorageKind.GMEM):
                 raise LoweringError(
                     f"{_label(expr)} has addressable result in unsupported storage {storage_type.storage}"
                 )
@@ -1447,7 +1447,7 @@ class LoweringContext(TypeInferContext):
                     ),
                     "gmem dtype alias over a device-global root; carries no per-mesh state",
                 )
-            if desired.storage is StorageKind.SMEM and desired.dtype != result.type.dtype:
+            if desired.storage in (StorageKind.SMEM, StorageKind.TMEM) and desired.dtype != result.type.dtype:
                 root = self.storage.answers[leaf].chain[-1]
                 result = self.builder.declare(root, ctx=self, values=values, desired=desired)
             for window in windows:
