@@ -1,6 +1,4 @@
-"""TileLang Ascend950PR kernel implementation for AttentionResidual."""
-
-from __future__ import annotations
+"""TileLang Ascend950PR SimdVF kernel implementation for AttentionResidual."""
 
 import math
 
@@ -8,29 +6,30 @@ import tilelang
 import tilelang.ascend.language as T
 import torch
 
-_KERNEL_CACHE: dict[tuple[int, int, int, str, str], object] = {}
+_KERNEL_CACHE: dict[tuple[int, int, str, str], object] = {}
 
 
 def _build_attention_residual_prim_func(
     n_depth: int,
-    m_rows: int,
     d_dim: int,
     tl_dtype: str,
     schedule_mode: str,
 ):
-    num_cores = min(m_rows, 56)
-    base_rows = m_rows // num_cores
-    rem_rows = m_rows % num_cores
-    tile_d = tilelang.next_power_of_2(d_dim)
-    n_pow2 = max(64, tilelang.next_power_of_2(n_depth))
-    threads = min(256 if schedule_mode == "tuned" else 128, tile_d)
+    num_cores = 56
+    full_chunks = d_dim // 64
+    rem = d_dim % 64
+    d_alloc = ((d_dim + 63) // 64) * 64
     num_stages = 2 if (schedule_mode == "tuned" and n_depth >= 2) else 1
+    pipe_ann = {"enable_offset": True} if schedule_mode == "tuned" else None
     inv_sqrt_d = 1.0 / math.sqrt(d_dim)
     inv_d = 1.0 / float(d_dim)
 
+    m_rows = T.dynamic("m_rows")
+    v_rows = T.dynamic("v_rows")
+
     @T.prim_func
     def main(
-        V: T.Tensor((n_depth * m_rows, d_dim), tl_dtype),
+        V: T.Tensor((v_rows, d_dim), tl_dtype),
         X: T.Tensor((m_rows, d_dim), tl_dtype),
         W: T.Tensor((d_dim,), tl_dtype),
         G: T.Tensor((d_dim,), tl_dtype),
@@ -39,138 +38,263 @@ def _build_attention_residual_prim_func(
         eps_val: T.float32,
     ):
         with T.Kernel(num_cores) as cid:
-            w_ub = T.alloc_shared((d_dim,), tl_dtype)
-            g_ub = T.alloc_shared((d_dim,), tl_dtype)
-            v_ub = T.alloc_shared((d_dim,), tl_dtype)
-            x_ub = T.alloc_shared((d_dim,), tl_dtype)
-            acc_ub = T.alloc_shared((d_dim,), "float32")
-            scores_ub = T.alloc_shared((n_pow2,), "float32")
-            probs_ub = T.alloc_shared((n_pow2,), "float32")
+            w_ub = T.alloc_shared((d_alloc,), tl_dtype)
+            g_ub = T.alloc_shared((d_alloc,), tl_dtype)
+            kw_ub = T.alloc_shared((d_alloc,), "float32")
+            v_ub = T.alloc_shared((d_alloc,), tl_dtype)
+            x_ub = T.alloc_shared((d_alloc,), tl_dtype)
+            acc_ub = T.alloc_shared((d_alloc,), "float32")
+            m_ub = T.alloc_shared((8,), "float32")
+            l_ub = T.alloc_shared((8,), "float32")
             T.annotate_buffer_versions(
                 {
                     v_ub: num_stages,
                     acc_ub: 1,
-                    scores_ub: 1,
-                    probs_ub: 1,
+                    m_ub: 1,
+                    l_ub: 1,
+                    kw_ub: 1,
                     w_ub: 1,
                     g_ub: 1,
                     x_ub: 1,
                 }
             )
+            base_rows = m_rows // num_cores
+            rem_rows = m_rows % num_cores
             m_start = cid * base_rows + T.min(cid, rem_rows)
             m_count = base_rows + T.if_then_else(cid < rem_rows, 1, 0)
-            for local_m in T.serial(m_count):
+            if m_count > 0:
                 T.copy(W[:d_dim], w_ub[:d_dim])
                 T.copy(G[:d_dim], g_ub[:d_dim])
-                m = m_start + local_m
-                for n in T.Pipelined(n_depth, num_stages=num_stages):
-                    row_off = n * m_rows + m
-                    T.copy(V[row_off, :d_dim], v_ub[:d_dim])
-                    with T.SimtVF(threads=threads):
-                        v_frag = T.alloc_fragment((tile_d,), "float32")
-                        for i in T.Parallel(tile_d, coalesced_width=T.int32(1)):
-                            v_frag[i] = T.if_then_else(
-                                i < d_dim,
-                                T.cast(v_ub[i], "float32"),
-                                T.float32(0.0),
+                with T.SimdVF():
+                    m32 = T.simd.pset(32, "PAT_ALL")
+                    m16 = T.simd.pset(16, "PAT_ALL")
+                    for c in T.serial(full_chunks):
+                        off = c * 64
+                        wf = T.simd.vcvt(
+                            T.simd.vld(w_ub[off], dist="US_B16"),
+                            "float32",
+                            mask=m16,
+                            part=0,
+                        )
+                        gf = T.simd.vcvt(
+                            T.simd.vld(g_ub[off], dist="US_B16"),
+                            "float32",
+                            mask=m16,
+                            part=0,
+                        )
+                        kwf = T.simd.vmul(wf, gf, mask=m32)
+                        T.simd.vsts(kw_ub[off], kwf, mask=m32, dist="NORM_B32")
+                    if rem > 0:
+                        off = full_chunks * 64
+                        m16_tail_x2 = T.simd.update_mask(rem * 2, width=16)
+                        wf_t = T.simd.vcvt(
+                            T.simd.vld(w_ub[off], dist="US_B16"),
+                            "float32",
+                            mask=m16_tail_x2,
+                            part=0,
+                        )
+                        gf_t = T.simd.vcvt(
+                            T.simd.vld(g_ub[off], dist="US_B16"),
+                            "float32",
+                            mask=m16_tail_x2,
+                            part=0,
+                        )
+                        kwf_t = T.simd.vmul(wf_t, gf_t, mask=m32)
+                        T.simd.vsts(kw_ub[off], kwf_t, mask=m32, dist="NORM_B32")
+
+                for local_m in T.serial(m_count):
+                    m = m_start + local_m
+                    with T.SimdVF():
+                        m32 = T.simd.pset(32, "PAT_ALL")
+                        v_init_m = T.simd.vdup(T.float32(-1.0e30), "float32", mask=m32)
+                        v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
+                        T.simd.vsts(m_ub[0], v_init_m, mask=m32, dist="ONEPT_B32")
+                        T.simd.vsts(l_ub[0], v_zero, mask=m32, dist="ONEPT_B32")
+                        for c in T.serial(full_chunks):
+                            T.simd.vsts(acc_ub[c * 64], v_zero, mask=m32, dist="NORM_B32")
+                        if rem > 0:
+                            T.simd.vsts(
+                                acc_ub[full_chunks * 64], v_zero, mask=m32, dist="NORM_B32"
                             )
-                        sum_sq = T.alloc_reducer((1,), "float32", op="sum")
-                        T.reducer_init(sum_sq)
-                        for i in T.Parallel(tile_d, coalesced_width=T.int32(1)):
-                            if i < d_dim:
-                                T.reducer_update(sum_sq[0], v_frag[i] * v_frag[i])
-                        sum_sq_res = T.alloc_fragment((1,), "float32")
-                        T.finalize_reducer(sum_sq, sum_sq_res)
-                        dot_acc = T.alloc_reducer((1,), "float32", op="sum")
-                        T.reducer_init(dot_acc)
-                        rstd_val = T.rsqrt(sum_sq_res[0] * T.float32(inv_d) + eps_val)
-                        for i in T.Parallel(tile_d, coalesced_width=T.int32(1)):
-                            if i < d_dim:
-                                prod_val = (
-                                    v_frag[i]
-                                    * rstd_val
-                                    * T.cast(w_ub[i], "float32")
-                                    * T.cast(g_ub[i], "float32")
+
+                    for n in T.Pipelined(n_depth, num_stages=num_stages, annotations=pipe_ann):
+                        row_off = n * m_rows + m
+                        T.copy(V[row_off, :d_dim], v_ub[:d_dim])
+                        with T.SimdVF():
+                            m32 = T.simd.pset(32, "PAT_ALL")
+                            m16 = T.simd.pset(16, "PAT_ALL")
+                            v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
+                            v_one = T.simd.vdup(T.float32(1.0), "float32", mask=m32)
+                            sq_acc = T.simd.alloc_local((1,), "float32")
+                            dot_acc = T.simd.alloc_local((1,), "float32")
+                            sq_acc[0] = v_zero
+                            dot_acc[0] = v_zero
+                            for c in T.serial(full_chunks):
+                                off = c * 64
+                                vf = T.simd.vcvt(
+                                    T.simd.vld(v_ub[off], dist="US_B16"),
+                                    "float32",
+                                    mask=m16,
+                                    part=0,
                                 )
-                                T.reducer_update(dot_acc[0], prod_val)
-                        dot_res = T.alloc_fragment((1,), "float32")
-                        T.finalize_reducer(dot_acc, dot_res)
-                        for r in T.Parallel(1):
-                            scores_ub[n + r] = dot_res[r] * T.float32(inv_sqrt_d)
+                                kwf = T.simd.vld(kw_ub[off], dist="NORM_B32")
+                                T.simd.vmula(sq_acc[0], vf, vf, mask=m32)
+                                T.simd.vmula(dot_acc[0], vf, kwf, mask=m32)
+                            if rem > 0:
+                                off = full_chunks * 64
+                                m32_tail = T.simd.update_mask(rem, width=32)
+                                m16_tail_x2 = T.simd.update_mask(rem * 2, width=16)
+                                vf_t = T.simd.vcvt(
+                                    T.simd.vld(v_ub[off], dist="US_B16"),
+                                    "float32",
+                                    mask=m16_tail_x2,
+                                    part=0,
+                                )
+                                kwf_t = T.simd.vld(kw_ub[off], dist="NORM_B32")
+                                T.simd.vmula(
+                                    sq_acc[0],
+                                    vf_t,
+                                    vf_t,
+                                    mask=m32_tail,
+                                    mode="MODE_MERGING",
+                                )
+                                T.simd.vmula(
+                                    dot_acc[0],
+                                    vf_t,
+                                    kwf_t,
+                                    mask=m32_tail,
+                                    mode="MODE_MERGING",
+                                )
 
-                with T.SimtVF(threads=64):
-                    s_frag = T.alloc_fragment((n_pow2,), "float32")
-                    for k in T.Parallel(n_pow2, coalesced_width=T.int32(1)):
-                        s_frag[k] = T.if_then_else(
-                            k < n_depth,
-                            scores_ub[k],
-                            T.float32(-1e38),
-                        )
-                    s_max_red = T.alloc_reducer((1,), "float32", op="max")
-                    T.reducer_init(s_max_red)
-                    for k in T.Parallel(n_pow2, coalesced_width=T.int32(1)):
-                        if k < n_depth:
-                            T.reducer_update(s_max_red[0], s_frag[k])
-                    s_max_res = T.alloc_fragment((1,), "float32")
-                    T.finalize_reducer(s_max_red, s_max_res)
-                    e_frag = T.alloc_fragment((n_pow2,), "float32")
-                    for k in T.Parallel(n_pow2, coalesced_width=T.int32(1)):
-                        e_frag[k] = T.if_then_else(
-                            k < n_depth,
-                            T.exp(s_frag[k] - s_max_res[0]),
-                            T.float32(0.0),
-                        )
-                    s_sum_red = T.alloc_reducer((1,), "float32", op="sum")
-                    T.reducer_init(s_sum_red)
-                    for k in T.Parallel(n_pow2, coalesced_width=T.int32(1)):
-                        if k < n_depth:
-                            T.reducer_update(s_sum_red[0], e_frag[k])
-                    s_sum_res = T.alloc_fragment((1,), "float32")
-                    T.finalize_reducer(s_sum_red, s_sum_res)
-                    for k in T.Parallel(n_pow2, coalesced_width=T.int32(1)):
-                        if k < n_depth:
-                            probs_ub[k] = e_frag[k] / s_sum_res[0]
+                            sum_sq = T.simd.vdupv(
+                                T.simd.vcadd(sq_acc[0], mask=m32), mask=m32, pos="POS_LOWEST"
+                            )
+                            raw_dot = T.simd.vdupv(
+                                T.simd.vcadd(dot_acc[0], mask=m32), mask=m32, pos="POS_LOWEST"
+                            )
+                            mean_sq = T.simd.vmuls(sum_sq, T.float32(inv_d), mask=m32)
+                            mean_eps = T.simd.vadds(mean_sq, eps_val, mask=m32)
+                            rstd = T.simd.vdiv(v_one, T.simd.vsqrt(mean_eps, mask=m32), mask=m32)
+                            s_vec = T.simd.vmuls(
+                                T.simd.vmul(raw_dot, rstd, mask=m32),
+                                T.float32(inv_sqrt_d),
+                                mask=m32,
+                            )
 
-                with T.SimtVF(threads=threads):
-                    for i in T.Parallel(tile_d, coalesced_width=T.int32(1)):
-                        if i < d_dim:
-                            acc_ub[i] = T.float32(0.0)
+                            m_old = T.simd.vld(m_ub[0], dist="BRC_B32")
+                            l_old = T.simd.vld(l_ub[0], dist="BRC_B32")
+                            m_new = T.simd.vmax(m_old, s_vec, mask=m32)
+                            alpha_v = T.simd.vexp(
+                                T.simd.vsub(m_old, m_new, mask=m32), mask=m32
+                            )
+                            p_v = T.simd.vexp(
+                                T.simd.vsub(s_vec, m_new, mask=m32), mask=m32
+                            )
+                            l_new = T.simd.vadd(
+                                T.simd.vmul(l_old, alpha_v, mask=m32), p_v, mask=m32
+                            )
+                            T.simd.vsts(m_ub[0], m_new, mask=m32, dist="ONEPT_B32")
+                            T.simd.vsts(l_ub[0], l_new, mask=m32, dist="ONEPT_B32")
 
-                for n in T.Pipelined(n_depth, num_stages=num_stages):
-                    row_off = n * m_rows + m
-                    T.copy(V[row_off, :d_dim], v_ub[:d_dim])
-                    with T.SimtVF(threads=threads):
-                        p_val = probs_ub[n]
-                        for i in T.Parallel(tile_d, coalesced_width=T.int32(1)):
-                            if i < d_dim:
-                                acc_ub[i] = acc_ub[i] + T.cast(v_ub[i], "float32") * p_val
+                            for c in T.serial(full_chunks):
+                                off = c * 64
+                                vf = T.simd.vcvt(
+                                    T.simd.vld(v_ub[off], dist="US_B16"),
+                                    "float32",
+                                    mask=m16,
+                                    part=0,
+                                )
+                                acc_old = T.simd.vld(acc_ub[off], dist="NORM_B32")
+                                acc_new = T.simd.vadd(
+                                    T.simd.vmul(acc_old, alpha_v, mask=m32),
+                                    T.simd.vmul(vf, p_v, mask=m32),
+                                    mask=m32,
+                                )
+                                T.simd.vsts(acc_ub[off], acc_new, mask=m32, dist="NORM_B32")
+                            if rem > 0:
+                                off = full_chunks * 64
+                                m32_tail = T.simd.update_mask(rem, width=32)
+                                m16_tail_x2 = T.simd.update_mask(rem * 2, width=16)
+                                vf_t = T.simd.vcvt(
+                                    T.simd.vld(v_ub[off], dist="US_B16"),
+                                    "float32",
+                                    mask=m16_tail_x2,
+                                    part=0,
+                                )
+                                acc_old_t = T.simd.vld(acc_ub[off], dist="NORM_B32")
+                                acc_new_t = T.simd.vadd(
+                                    T.simd.vmul(acc_old_t, alpha_v, mask=m32_tail),
+                                    T.simd.vmul(vf_t, p_v, mask=m32_tail),
+                                    mask=m32_tail,
+                                )
+                                T.simd.vsts(
+                                    acc_ub[off], acc_new_t, mask=m32_tail, dist="NORM_B32"
+                                )
 
-                T.copy(X[m, :d_dim], x_ub[:d_dim])
-                with T.SimtVF(threads=threads):
-                    for i in T.Parallel(tile_d, coalesced_width=T.int32(1)):
-                        if i < d_dim:
-                            blended = (
-                                T.float32(1.0) - alpha_val
-                            ) * T.cast(x_ub[i], "float32") + alpha_val * acc_ub[i]
-                            x_ub[i] = T.cast(blended, tl_dtype)
-                T.copy(x_ub[:d_dim], Y[m, :d_dim])
-                T.ascend_pipe_barrier("PIPE_ALL")
+                    T.copy(X[m, :d_dim], x_ub[:d_dim])
+                    with T.SimdVF():
+                        m32 = T.simd.pset(32, "PAT_ALL")
+                        m16 = T.simd.pset(16, "PAT_ALL")
+                        v_one = T.simd.vdup(T.float32(1.0), "float32", mask=m32)
+                        l_tot = T.simd.vld(l_ub[0], dist="BRC_B32")
+                        inv_l = T.simd.vdiv(v_one, l_tot, mask=m32)
+                        scale_agg = T.simd.vmuls(inv_l, alpha_val, mask=m32)
+                        one_minus_alpha = T.float32(1.0) - alpha_val
+                        for c in T.serial(full_chunks):
+                            off = c * 64
+                            xf = T.simd.vcvt(
+                                T.simd.vld(x_ub[off], dist="US_B16"),
+                                "float32",
+                                mask=m16,
+                                part=0,
+                            )
+                            accf = T.simd.vld(acc_ub[off], dist="NORM_B32")
+                            yf = T.simd.vadd(
+                                T.simd.vmuls(xf, one_minus_alpha, mask=m32),
+                                T.simd.vmul(accf, scale_agg, mask=m32),
+                                mask=m32,
+                            )
+                            y16 = T.simd.vcvt(yf, tl_dtype, mask=m16, part=0)
+                            T.simd.vsts(
+                                x_ub[off], y16, mask=m32, dist="PK_B32", extent=64
+                            )
+                        if rem > 0:
+                            off = full_chunks * 64
+                            m32_tail = T.simd.update_mask(rem, width=32)
+                            m16_tail_x2 = T.simd.update_mask(rem * 2, width=16)
+                            xf_t = T.simd.vcvt(
+                                T.simd.vld(x_ub[off], dist="US_B16"),
+                                "float32",
+                                mask=m16_tail_x2,
+                                part=0,
+                            )
+                            accf_t = T.simd.vld(acc_ub[off], dist="NORM_B32")
+                            yf_t = T.simd.vadd(
+                                T.simd.vmuls(xf_t, one_minus_alpha, mask=m32_tail),
+                                T.simd.vmul(accf_t, scale_agg, mask=m32_tail),
+                                mask=m32_tail,
+                            )
+                            y16_t = T.simd.vcvt(yf_t, tl_dtype, mask=m16_tail_x2, part=0)
+                            T.simd.vsts(
+                                x_ub[off], y16_t, mask=m32_tail, dist="PK_B32", extent=64
+                            )
+                    T.copy(x_ub[:d_dim], Y[m, :d_dim])
+                    T.ascend_pipe_barrier("PIPE_ALL")
 
     return main
 
 
 def _get_kernel(
     n_depth: int,
-    m_rows: int,
     d_dim: int,
     tl_dtype: str,
     schedule_mode: str,
 ):
-    key = (n_depth, m_rows, d_dim, tl_dtype, schedule_mode)
+    key = (n_depth, d_dim, tl_dtype, schedule_mode)
     compiled = _KERNEL_CACHE.get(key)
     if compiled is None:
         prog = _build_attention_residual_prim_func(
-            n_depth, m_rows, d_dim, tl_dtype, schedule_mode
+            n_depth, d_dim, tl_dtype, schedule_mode
         )
         compiled = tilelang.compile(prog, target="ascend", out_idx=[4])
         _KERNEL_CACHE[key] = compiled
@@ -187,7 +311,7 @@ def attention_residual(
     *,
     schedule_mode: str = "tuned",
 ) -> torch.Tensor:
-    """Compute AttentionResidual on Ascend950PR NPU using a compiled TileLang kernel."""
+    """Compute AttentionResidual on Ascend950PR NPU using a compiled SimdVF kernel."""
     if schedule_mode not in ("baseline", "tuned"):
         raise ValueError(f"unsupported schedule_mode {schedule_mode!r}")
     if v_stack.dtype not in (torch.bfloat16, torch.float16):
@@ -201,7 +325,7 @@ def attention_residual(
     w_flat = w.contiguous().view(d_dim)
     g_flat = gamma.contiguous().view(d_dim)
 
-    kernel = _get_kernel(n_depth, m_rows, d_dim, tl_dtype, schedule_mode)
+    kernel = _get_kernel(n_depth, d_dim, tl_dtype, schedule_mode)
     y_flat = kernel(v_flat, x_flat, w_flat, g_flat, float(alpha), float(epsilon))
     return y_flat.view(b_dim, t_dim, d_dim)
 
