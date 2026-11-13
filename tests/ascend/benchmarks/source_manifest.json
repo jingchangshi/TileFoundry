@@ -1,0 +1,133 @@
+{
+  "schema_version": "tf-ascend.fixture-sources.v2",
+  "path_base": "package_root",
+  "copy_policy": "byte_identical",
+  "source_execution_status": "NOT_RUN",
+  "files": [
+    {
+      "path": "fixtures/attention_residual/golden.py",
+      "archive_path": "attention_residual/golden.py",
+      "sha256": "cf90b8476c4fabbc5be348baf48b44c0ce63ff44798f5479100232762217795a",
+      "bytes": 2473
+    },
+    {
+      "path": "fixtures/attention_residual/desc.md",
+      "archive_path": "attention_residual/desc.md",
+      "sha256": "5eb025defbff0498d7f41f23e967080eae022dbb8adffd969aaf35c6a61c1c25",
+      "bytes": 6455
+    },
+    {
+      "path": "fixtures/attention_residual/proto.yaml",
+      "archive_path": "attention_residual/proto.yaml",
+      "sha256": "2d85e237072501be7205cf85c82739d4b1be17a37c74fe80acf1f857db19aa73",
+      "bytes": 2631
+    },
+    {
+      "path": "fixtures/attention_residual/cases.yaml",
+      "archive_path": "attention_residual/cases.yaml",
+      "sha256": "d6d35f240ab979fce0f7e8ae35c27ab1fd6bb00213d0bcbd65e9ce28dcc16792",
+      "bytes": 8284
+    },
+    {
+      "path": "fixtures/attention_residual/cases.csv",
+      "archive_path": "attention_residual/cases.csv",
+      "sha256": "eddae5a97b9d08986f76899bbfe88dfdac501b5481ebff50bfd40fbaae5d5b8a",
+      "bytes": 4868
+    },
+    {
+      "path": "fixtures/attention_residual/test_attention_residual.py",
+      "archive_path": "attention_residual/test_attention_residual.py",
+      "sha256": "c50fcf953ffe613f743dc4c34b5f715676cca6f491b0d37bff8946959d429559",
+      "bytes": 571
+    },
+    {
+      "path": "fixtures/attention_residual/bench_attention_residual.py",
+      "archive_path": "attention_residual/bench_attention_residual.py",
+      "sha256": "5a02e2c40d41a364eac1b5b6cac811cdebf65dd1412e59a08652b9bfb891e6c8",
+      "bytes": 613
+    },
+    {
+      "path": "fixtures/attention_residual/LICENSE",
+      "archive_path": "attention_residual/LICENSE",
+      "sha256": "cb282ac2b66d7d6734c3fb354db792b28cf23ab29fbc16d5cfd8bd542bedeb1e",
+      "bytes": 5278
+    },
+    {
+      "path": "fixtures/mla/golden.py",
+      "archive_path": "mla/golden.py",
+      "sha256": "3996ec1a4bcf142db4f311dd72510d0420269691e1efccbd72a00e53a2bc8cdc",
+      "bytes": 5939
+    },
+    {
+      "path": "fixtures/mla/desc.md",
+      "archive_path": "mla/desc.md",
+      "sha256": "433b8eaff3231700cb2fe0ecbba8cc91cb2ae65902517d1a4aa66daf48d10362",
+      "bytes": 13322
+    },
+    {
+      "path": "fixtures/mla/proto.yaml",
+      "archive_path": "mla/proto.yaml",
+      "sha256": "70cd11633ebad052058cc33606f4fa4e004fc1e9b2a9251a73f28a697a1910f4",
+      "bytes": 3520
+    },
+    {
+      "path": "fixtures/mla/cases.yaml",
+      "archive_path": "mla/cases.yaml",
+      "sha256": "57e742e5f14680996c348cdfcb462852e64750066b4d4f4c852c4403dfbdf46d",
+      "bytes": 10983
+    },
+    {
+      "path": "fixtures/mla/cases.csv",
+      "archive_path": "mla/cases.csv",
+      "sha256": "85648d43619c1a38c5730231baa20308dc5166c76d3cbbb8fe0f53ab7d2045a8",
+      "bytes": 7542
+    },
+    {
+      "path": "fixtures/mla/test_mla.py",
+      "archive_path": "mla/test_mla.py",
+      "sha256": "f12622752c0d3f6d2232b4fa10aef332b1b1dc8e7f708e15b4794d480408d981",
+      "bytes": 526
+    },
+    {
+      "path": "fixtures/mla/bench_mla.py",
+      "archive_path": "mla/bench_mla.py",
+      "sha256": "f2f25892640692960d6fcc0b587735319a262c161910a3f66551a9afe6efa431",
+      "bytes": 523
+    },
+    {
+      "path": "fixtures/mla/LICENSE",
+      "archive_path": "mla/LICENSE",
+      "sha256": "cb282ac2b66d7d6734c3fb354db792b28cf23ab29fbc16d5cfd8bd542bedeb1e",
+      "bytes": 5278
+    },
+    {
+      "path": "fixtures/cannbench_contract.py",
+      "archive_paths": [
+        "attention_residual/optimization/20261110-run01/work/cannbench_contract.py",
+        "mla/optimization/20261110-run01/work/cannbench_contract.py"
+      ],
+      "sha256": "026f51a94b6a6046f3096fcaa363f77e325e7f246c6e584a65a44e80de457400",
+      "bytes": 52173
+    },
+    {
+      "path": "fixtures/CANN_CONTRACT_LICENSE",
+      "archive_paths": [
+        "attention_residual/optimization/20261110-run01/work/CANN_CONTRACT_LICENSE",
+        "mla/optimization/20261110-run01/work/CANN_CONTRACT_LICENSE"
+      ],
+      "sha256": "cb282ac2b66d7d6734c3fb354db792b28cf23ab29fbc16d5cfd8bd542bedeb1e",
+      "bytes": 5278
+    }
+  ],
+  "source_policy": "golden/tests/inputs and unchanged harness only; optimization candidates are not performance authority",
+  "archives": [
+    {
+      "path": "attention_residual.tar",
+      "sha256": "f9c09b2a3b579e3e34ac4da6b06417dc4716c06da79beb5159963e447fc6815f"
+    },
+    {
+      "path": "mla.tar",
+      "sha256": "74fde5fa7ef71168a003deaa40f696960b72d01700b274d07cdeff6bff16d089"
+    }
+  ]
+}
