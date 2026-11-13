@@ -132,3 +132,19 @@ def test_ascend_schedule_cli_and_finalize_workflow():
 
     assert (AR_DIR / "tir" / "attention_residual.py").is_file()
     assert (MLA_DIR / "tir" / "mla.py").is_file()
+
+
+def test_zero_simtvf_in_scheduled_tir_and_kernels():
+    """Verify both Ascend 950PR operators use SimdVF (zero SimtVF) across layers 2-3."""
+    checked_paths = (
+        AR_DIR / "scheduled.py",
+        AR_DIR / "tir" / "attention_residual.py",
+        AR_DIR / "kernels.py",
+        MLA_DIR / "scheduled.py",
+        MLA_DIR / "tir" / "mla.py",
+        MLA_DIR / "kernels.py",
+    )
+    for path in checked_paths:
+        text = path.read_text(encoding="utf-8")
+        assert "SimtVF" not in text and "simtvf" not in text, f"Unexpected SimtVF in {path}"
+        assert "SimdVF" in text or "simdvf" in text, f"Expected SimdVF in {path}"

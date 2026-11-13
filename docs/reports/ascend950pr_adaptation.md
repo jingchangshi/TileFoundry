@@ -1,72 +1,80 @@
-# Ascend 950PR TileFoundry & TileLang Operator Adaptation Report
+# Ascend 950PR Adaptation and SimdVF Optimization Report
 
-## 1. Architecture & Target Separation
+## 1. Architecture Summary
 
-The Ascend 950PR (`ascend.950pr`, `ascend.davinci_950` / `dav-3510`) adaptation keeps target infrastructure strictly separated from operator implementations:
+This adaptation completes the migration of the Ascend 950PR `attention_residual` and `mla` operator stacks from functional `SimtVF` execution to high-performance `SimdVF` vector/cube execution across all three layers:
 
-- **Target Plugin (`targets/ascend/`)**: Provides `AscendTarget("ascend.950pr")` and hardware capability definitions in `targets/ascend/tilefoundry_ascend/ascend/target/hardware/ascend_950pr.toml` (`block_count = 28`, `aic_count = 28`, `aiv_count = 56`, `128 GiB` HBM, `512 KiB` L1 per AIC, `64 KiB` L0A/L0B per AIC, `256 KiB` L0C per AIC, `256 KiB` nominal / `216 KiB` usable UB per AIV).
-- **Trunk & CLI Support (`src/`)**: Adds `StorageKind.TMEM` support in the core IR and registers Ascend target resolution and lowered workflows via `tilefoundry.cli`.
-- **Operator Workspaces (`examples/ascend950pr_ops/`)**:
-  - `examples/ascend950pr_ops/attention_residual/`: Authored HIR (`model.py`), scheduled HIR (`scheduled.py`), lowered TIR (`tir/`), and native TileLang Ascend Vector kernel (`kernels.py`).
-  - `examples/ascend950pr_ops/mla/`: Authored HIR (`model.py`), scheduled HIR (`scheduled.py`), lowered TIR (`tir/`), and native TileLang Ascend MIX kernel (`kernels.py`).
+1. **Layer 1: Target Execution Kind & Loop-Carried Z3 Pipeline Solver**
+   - `targets/ascend/tilefoundry_ascend/ascend/ir/execution.py`: Added `SIMDVF_KIND` / `SimdVF` alongside `SIMTVF_KIND` / `SimtVF` to represent 2-AIV SIMD vector execution.
+   - `targets/ascend/tilefoundry_ascend/ascend/ir/tir/instructions.py`: Bound Ascend TIR vector instructions to `ascend.simdvf`.
+   - `targets/ascend/tilefoundry_ascend/ascend/schedule/pipeline_solver.py`: Extended the Z3 pipeline solver with `SIMDVF_KIND` support, loop-carried `distance=1` dependency extraction, `fixed=1` accumulator buffer pinning, byte/FLOP cycle cost estimation, and 2-AIV UB footprint splitting.
+   - Fixed loop-collection handling for `StmtVisitor.visit_For` and added unit tests in `tests/ascend/ir/test_instructions_and_candidates.py` and `tests/ascend/passes/test_pipeline_solver.py`.
 
-## 2. Hardware Adaptation & Correctness Engineering
+2. **Layer 2: Single-Pass Online Softmax HIR & Lowered TIR**
+   - `examples/ascend950pr_ops/attention_residual/scheduled.py`: Migrated to `T.SimdVF()`, `Mesh(("aiv",), (2,), names=("v",))`, and a single-pass online softmax formulation (`m_ub`, `l_ub`, `acc_ub`), eliminating intermediate `scores_gm` / `probs_gm` global memory round-trips and the second reduction pass. In the lowered `forward:n` pipeline, `acc_ub`, `m_ub`, and `l_ub` are pinned to `1` while `v_ub` uses version `2`.
+   - `examples/ascend950pr_ops/mla/scheduled.py`: Migrated to `T.SimdVF()`, `Mesh(("aiv",), (2,), names=("v",))`, and a single-loop Online FlashMLA Mix pipeline without `scores_gm`, pinning `o_acc_ub`, `m_ub`, and `l_ub` to `1` across `forward:kt`.
+   - Regenerated `examples/ascend950pr_ops/attention_residual/tir/attention_residual.py` and `examples/ascend950pr_ops/mla/tir/mla.py` via `finalize()` + `as_script()` with zero `SimtVF` / `simtvf` references.
 
-### 2.1 AttentionResidual (`examples/ascend950pr_ops/attention_residual/kernels.py`)
+3. **Layer 3: Production TileLang NPU Kernels (`kernels.py`)**
+   - `examples/ascend950pr_ops/attention_residual/kernels.py`: Single-pass `T.SimdVF()` + `T.simd.*` vectorization across 56 cores with per-core `kw_ub`, `T.dynamic("m_rows")` / `T.dynamic("v_rows")` shape reuse, `enable_offset=True` in `tuned` mode, and masked `rem * 2` (`b16`) / `MODE_MERGING` `vmula` tail handling (`D=2047`, `D=1000`).
+   - `examples/ascend950pr_ops/mla/kernels.py`: Pure `T.SimdVF()` + `T.simd.*` (zero `SimtVF`), DMA `Q` / `Out` transfers, `T.dynamic` (`b_dim`, `q_total_rows`, `s_kv`), causal block pruning, adaptive `bm=64` tile selection when `schedule_mode == "tuned" and q_rows >= 64 and (b_dim * n_kv * m_tiles_64) >= 14`, and `enable_offset=True` with on-chip scratch buffers (`p_l1`, `S_ub`, `P_ub`, `O_tmp0_ub`, `O_tmp1_ub`) pinned to `1` so HBM-to-L1 KV buffers (`k_nope_l1`, `k_rope_l1`, `v0_l1`, `v1_l1`) multi-buffer cleanly.
 
-- Pure Vector `T.Kernel` scaled across up to `56` AIV cores (`num_cores = min(m_rows, 56)` matching `aiv_count = 56`).
-- Uses `SimtVF` to perform FP32 RMSNorm + depthwise softmax reduction and weighted residual aggregation, with configurable `schedule_mode` (`"baseline"` vs `"tuned"`).
+## 2. Verification Summary
 
-### 2.2 Multi-Head Latent Attention (`examples/ascend950pr_ops/mla/kernels.py`)
+- **Ascend Target / IR / Passes Unit Tests**:
+  `pytest tests/ascend/target tests/ascend/ir tests/ascend/passes -v` -> **25 passed** (1.97s).
+- **HIR-to-TIR Operator Workflow & Zero-SimtVF Gate**:
+  `pytest tests/ascend/operators/test_hir_tir_workflow.py -v` -> **4 passed** (5.34s), including `test_zero_simtvf_in_scheduled_tir_and_kernels`.
+- **Full NPU Acceptance Suite (NPU 0)**:
+  `pytest tests/ascend/benchmarks/test_npu_acceptance.py -v` -> **5 passed** (465.58s, 0 skipped, 0 failed):
+  - `test_attention_residual_cannbench_cases`
+  - `test_attention_residual_baseline_vs_tuned_parity`
+  - `test_mla_cannbench_cases`
+  - `test_mla_supplemental_cases`
+  - `test_dynamic_shape_kernel_cache_reuse`
+- **CPU Suite**:
+  `pytest tests/ascend/target tests/ascend/ir tests/ascend/passes tests/ascend/operators tests/core tests/tilefoundry tests/apple -k "not test_repository_clean"` -> **819 passed, 1 deselected** (22.74s). Note: without `-k "not test_repository_clean"`, `tests/core/scripts/test_machine_paths_lint.py::test_repository_clean` fails (`819 passed, 1 failed`, 23.77s) due to pre-existing unmodified `DEFAULT_ROOT` in `tests/ascend/benchmarks/cannbench_contract.py`.
+- **Modified File Lints**:
+  `scripts/comment_hygiene_lint.py`, `scripts/forward_references_lint.py`, `scripts/english_only_lint.py`, and `scripts/no_machine_paths_lint.py` all exited with code 0 (0 violations).
 
-- **MIX Execution Grid**: `T.MixedKernel(num_cores, sids=2)` mapping `28` AIC cores (`num_cores = min(total_m_tiles, 28)`) paired with 2 AIV sub-blocks (`bm = 32`, `rows_per_sid = 16`, `bn = 64`), supporting arbitrary GQA group ratios (`N_q / N_kv`), tail query/KV dimensions, and both `BSND` and `BNSD` layouts in a single logical kernel launch.
-- **Unified 4D KV DMA**: `K_nope`, `K_rope`, and `V` use 4D slice `T.copy` into L1 (`nd2nz` for keys, `dn2nz` via `transpose=True` for values), leveraging hardware out-of-bounds zero fill on tail KV blocks without scalar fallback loops.
-- **Per-Row Softmax `SimtVF(threads=64)`**: TileLang's `AscendAllReduce` uses a 64-thread scratch layout at fixed row offset `0`. Executing softmax inside `SimtVF(threads=64)` with `for r in T.serial(rows_per_sid):` matches the 64-thread reducer contract and eliminates cross-row UB clobber across rows `1..3 mod 4`.
-- **`d_nope <= 256` Split `P @ V` Tiling**: For `d_nope = 448` or `512`, splitting `V` and `P @ V` along columns into `d0 = min(d_nope, 256)` and `d1 = d_nope - d0` ensures every `P @ V` `ascend_gemm_l1` call uses a single L0 sub-K step (`SUB_K = 1`, event `0`), preventing the next KV iteration's `Q_nope @ K_nope^T` (`sk = 0` on event `0`) from overwriting `L0A` slots still held by `PIPE_M` for `sk = 1`.
-- **Tuned Schedule (`schedule_mode="tuned"`)**: Enables 2-stage KV pipelining (`num_stages = 2` when `max_kv_blocks >= 2`) and causal block-bound pruning (`use_causal_bound = True`).
+## 3. Kernel Cache Reuse & Wall-Clock Benchmarks (NPU 0)
 
-## 3. Numerical & Regression Verification Summary
+With `T.dynamic` symbolic dimensions enabled in `tuned` mode:
+- **Attention Residual**: `_KERNEL_CACHE` compiled **19** kernels across **20** cannbench cases.
+- **MLA**: `_KERNEL_CACHE` compiled **13** kernels across **20** cannbench cases.
 
-All NPU acceptance checks ran on host NPU 0 (`ASCEND_RT_VISIBLE_DEVICES=0`) using `tests/ascend/benchmarks/test_npu_acceptance.py`:
+### 3.1 Attention Residual (`baseline` vs `tuned`, vs Prior `SimtVF` `tuned`)
 
-| Suite | Coverage | Mode(s) | Result |
-| :--- | :--- | :--- | :--- |
-| AttentionResidual CANNBench | 20 / 20 cases | `tuned` | Passed (`Harness.compare`) |
-| AttentionResidual Baseline Parity | Cases 1, 16, 20 | `baseline` | Passed (`1` kernel launch) |
-| MLA CANNBench | 20 / 20 cases | `tuned` | Passed (`Harness.compare`) |
-| MLA Supplemental GQA/Tail/Layout/Scale | 4 / 4 cases | `tuned`, `baseline` | Passed (`1` kernel launch each) |
+| Case | Shape `[B, N, M, D]` (bf16) | Prior SimtVF Tuned (ms) | SimdVF Baseline Med (ms) | SimdVF Tuned Med (ms) | Tuned Mean (ms) | Speedup vs Baseline | Speedup vs SimtVF | Bandwidth (GB/s) |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Case 1 | `[4, 1, 128, 2048]` | 0.0246 | 0.0208 | 0.0208 | 0.0216 | 1.00x | 1.18x | 151.4 |
+| Case 7 | `[4, 4, 512, 4096]` | 0.3143 | 0.1464 | 0.0987 | 0.0993 | 1.48x | 3.18x | 1020.3 |
+| Case 16 | `[8, 4, 2048, 4096]` | 2.1674 | 1.0418 | 0.6605 | 0.6606 | 1.58x | 3.28x | 1016.0 |
+| Case 18 | `[4, 8, 512, 7168]` | 0.9418 | 0.3765 | 0.2823 | 0.2832 | 1.33x | 3.34x | 1248.2 |
+| Case 20 | `[32, 1, 1024, 2048]` | 0.6742 | 0.4126 | 0.2262 | 0.2264 | 1.82x | 2.98x | 630.4 |
 
-Full suite run of `tests/ascend/benchmarks/test_npu_acceptance.py`: **4 passed in 458.24s** (`0` failures, `0` skips); post-editable-install NPU 0 parity smoke run (`-k baseline_vs_tuned_parity`): **1 passed in 31.04s**.
+### 3.2 MLA (`baseline` vs `tuned`, vs Prior `SimtVF` `tuned`)
 
-CPU compiler/IR/CLI/lint verification (no CANN runtime loaded, `TORCH_DEVICE_BACKEND_AUTOLOAD=0`):
+| Case | Config | Prior SimtVF Tuned (ms) | SimdVF Baseline Med (ms) | SimdVF Tuned Med (ms) | Tuned Mean (ms) | Speedup vs Baseline | Speedup vs SimtVF | Throughput / BW |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| `level4/mla_1` | `q=[2,128,128,512] k=[2,128,1,512]` BSND/causal/fp16 | 1.1652 | 0.2974 | 0.2775 | 0.2779 | 1.07x | 4.20x | 16.58 TFLOPS, 259.0 GB/s |
+| `level4/mla_2` | `q=[4,256,128,512] k=[4,256,1,512]` BSND/causal/bf16 | 8.6504 | 1.6134 | 1.3459 | 1.3467 | 1.20x | 6.43x | 27.23 TFLOPS, 213.6 GB/s |
+| `level4/mla_8` | `q=[16,1,128,512] k=[16,2048,1,512]` BSND/non-causal/fp16 | 0.9865 | 0.1805 | 0.1519 | 0.1527 | 1.19x | 6.49x | 60.09 TFLOPS, 498.8 GB/s |
+| `level4/mla_11` | `q=[128,1,128,512] k=[128,1024,1,512]` BSND/non-causal/fp16 | 3.3410 | 0.6459 | 0.4302 | 0.4299 | 1.50x | 7.77x | 84.87 TFLOPS, 745.9 GB/s |
+| `level4/mla_13` | `q=[2,128,128,512] k=[2,1,128,512]` BNSD/causal/fp16 | 0.9697 | 0.5430 | 0.4515 | 0.4523 | 1.20x | 2.15x | 10.19 TFLOPS, 159.1 GB/s |
+| `level4/mla_15` | `q=[2,32,64,512] k=[2,1,512,512]` BNSD/causal/bf16 | 0.4846 | 0.1899 | 0.2227 | 0.2238 | 0.85x | 2.18x | 19.23 TFLOPS, 50.0 GB/s |
+| `supp/kv_tail` | `q=[1,3,64,448] k=[1,129,2,448]` BSND/causal/bf16 | 0.0565 | 0.0170 | 0.0248 | 0.0259 | 0.69x | 2.28x | 1.90 TFLOPS, 34.8 GB/s |
+| `supp/decode448` | `q=[1,1,128,448] k=[1,128,4,448]` BSND/non-causal/fp16 | 0.0401 | 0.0268 | 0.0249 | 0.0259 | 1.07x | 1.61x | 1.26 TFLOPS, 49.3 GB/s |
 
-- `tests/ascend` (excluding `test_npu_acceptance.py`), `tests/core`, `tests/tilefoundry`, and `tests/apple`: **817 passed in 18.96s** (`0` failures, `0` skips).
-- `tests/nvidia` (excluding `tests/nvidia/cuda/integration/models`): **690 passed, 43 skipped, 18 failed** (`17` failures require a local CUDA GPU; `1` failure is a pre-existing upstream `'carrier'` storage diagnostic regex mismatch in `tests/nvidia/cuda/parser/test_functions.py`).
-- Repository lints (`comment_hygiene_lint.py`, `forward_references_lint.py`, `english_only_lint.py`, `no_machine_paths_lint.py`) on all new/modified files: **0 violations**.
+*Note*: On small/short-tail shapes (`level4/mla_15` and `supplemental/mla_gqa_bsnd_kv_tail`), `enable_offset=True` overhead slightly exceeds multi-buffering gains over `baseline`, while still achieving >2.1x speedup over the prior `SimtVF` implementation.
 
-## 4. Measured NPU 0 Performance (`baseline` vs `tuned`)
+## 4. `msprof` Hardware Profiling (Tuned `SimdVF`)
 
-Measured on host NPU 0 using `torch.npu.Event(enable_timing=True)` with `warmup = 5` and `repeats = 20`.
-
-### 4.1 AttentionResidual
-
-| Case | Shapes | Dtype | Baseline Median (ms) | Tuned Median (ms) | Baseline Mean (ms) | Tuned Mean (ms) | Speedup (Median) |
-| :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| `level4/attention_residual_1` | `[4, 1, 128, 2048]` | `bfloat16` | 0.0354 | 0.0246 | 0.0373 | 0.0252 | 1.44x |
-| `level4/attention_residual_7` | `[4, 4, 512, 4096]` | `bfloat16` | 0.5585 | 0.3143 | 0.5594 | 0.3144 | 1.78x |
-| `level4/attention_residual_16` | `[8, 4, 2048, 4096]` | `bfloat16` | 4.0389 | 2.1674 | 4.0398 | 2.1681 | 1.86x |
-| `level4/attention_residual_18` | `[4, 8, 512, 7168]` | `bfloat16` | 1.6894 | 0.9418 | 1.6898 | 0.9415 | 1.79x |
-| `level4/attention_residual_20` | `[32, 1, 1024, 2048]` | `bfloat16` | 1.2847 | 0.6742 | 1.2860 | 0.6743 | 1.91x |
-
-### 4.2 MLA (CANNBench & Supplemental Cases)
-
-| Case | Q_nope Shape | K_nope Shape | Layout / Causal / Dtype | Baseline Median (ms) | Tuned Median (ms) | Baseline Mean (ms) | Tuned Mean (ms) | Speedup (Median) |
-| :--- | :--- | :--- | :--- | ---: | ---: | ---: | ---: | ---: |
-| `level4/mla_1` | `[2, 128, 128, 512]` | `[2, 128, 1, 512]` | `BSND` / causal / `float16` | 1.1520 | 1.1652 | 1.1530 | 1.1683 | 0.99x |
-| `level4/mla_2` | `[4, 256, 128, 512]` | `[4, 256, 1, 512]` | `BSND` / causal / `bfloat16` | 8.7589 | 8.6504 | 8.7590 | 8.6503 | 1.01x |
-| `level4/mla_8` | `[16, 1, 128, 512]` | `[16, 2048, 1, 512]` | `BSND` / non-causal / `float16` | 0.9883 | 0.9865 | 0.9898 | 0.9863 | 1.00x |
-| `level4/mla_11` | `[128, 1, 128, 512]` | `[128, 1024, 1, 512]` | `BSND` / non-causal / `float16` | 3.3388 | 3.3410 | 3.3390 | 3.3411 | 1.00x |
-| `level4/mla_13` | `[2, 128, 128, 512]` | `[2, 1, 128, 512]` | `BNSD` / causal / `float16` | 1.1687 | 0.9697 | 1.1692 | 0.9702 | 1.21x |
-| `level4/mla_15` | `[2, 32, 64, 512]` | `[2, 1, 512, 512]` | `BNSD` / causal / `bfloat16` | 0.4839 | 0.4846 | 0.4845 | 0.4845 | 1.00x |
-| `supplemental/mla_gqa_bsnd_kv_tail` | `[1, 3, 64, 448]` | `[1, 129, 2, 448]` | `BSND` / causal / `bfloat16` | 0.0565 | 0.0565 | 0.0566 | 0.0562 | 1.00x |
-| `supplemental/mla_gqa_decode_shard448` | `[1, 1, 128, 448]` | `[1, 128, 4, 448]` | `BSND` / non-causal / `float16` | 0.0402 | 0.0401 | 0.0403 | 0.0397 | 1.00x |
+| Operator / Case | Kernel Duration | AIC Metrics | AIV Metrics | Cycles |
+| :--- | ---: | :--- | :--- | :--- |
+| AR Case 16 (`[8,4,2048,4096]`) | 660.3 us | N/A | `aiv_vec=67.1%`, `aiv_mte2=75.4%`, `aiv_mte3=4.1%` | `aiv_cycles=60154366` |
+| AR Case 20 (`[32,1,1024,2048]`) | 219.0 us | N/A | `aiv_vec=63.8%`, `aiv_mte2=89.5%`, `aiv_mte3=1.5%` | `aiv_cycles=19239980` |
+| MLA `level4/mla_1` | 284.8 us | `mad=9.3%`, `aic_mte2=13.0%`, `aic_mte1=7.4%`, `aic_fix=4.9%` | `aiv_vec=20.6%`, `aiv_mte2=24.5%`, `aiv_mte3=39.8%` | `aic=11260057`, `aiv=23097959` |
+| MLA `level4/mla_8` | 147.3 us | `mad=38.7%`, `aic_mte2=67.2%`, `aic_mte1=33.3%`, `aic_fix=19.9%` | `aiv_vec=41.4%`, `aiv_mte2=5.6%`, `aiv_mte3=9.1%` | `aic=3608408`, `aiv=7796230` |
+| MLA `level4/mla_11` | 429.5 us | `mad=31.6%`, `aic_mte2=57.8%`, `aic_mte1=27.3%`, `aic_fix=16.2%` | `aiv_vec=37.6%`, `aiv_mte2=8.5%`, `aiv_mte3=14.2%` | `aic=17655659`, `aiv=35884788` |
+| MLA `level4/mla_13` | 447.6 us | `mad=5.6%`, `aic_mte2=6.7%`, `aic_mte1=4.5%`, `aic_fix=2.9%` | `aiv_vec=52.5%`, `aiv_mte2=14.8%`, `aiv_mte3=24.0%` | `aic=18940429`, `aiv=38466686` |
