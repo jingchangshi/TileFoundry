@@ -26,7 +26,7 @@ from tilefoundry.visitor_registry.access_relation import access_relation_registr
 from tilefoundry.visitor_registry.candidates import select_instruction, sole_candidate
 from tilefoundry.visitor_registry.verify import VerifyError, verify_prim_function
 from tilefoundry_ascend import AscendTarget
-from tilefoundry_ascend.ascend.ir.execution import SIMTVF_KIND, SimtVF
+from tilefoundry_ascend.ascend.ir.execution import SIMDVF_KIND, SIMTVF_KIND, SimdVF, SimtVF
 from tilefoundry_ascend.ascend.ir.tir.instructions import (
     ASCEND_OP_SPECS,
     AscendGmToL1,
@@ -62,15 +62,21 @@ def _lower(mod):
     return finalize(analyzed, authored=authored)
 
 
-def test_simtvf_execution_kind_registration():
+def test_simdvf_and_simtvf_execution_kind_registration():
+    assert SIMDVF_KIND.name == "ascend.simdvf"
+    assert SIMDVF_KIND.surface == "SimdVF"
+    assert SIMDVF_KIND.required_topologies == ("aiv",)
+    assert SIMDVF_KIND.mask_width_bits == 32
+    assert SIMDVF_KIND.conversion_mask_width_bits == 16
+    assert SIMDVF_KIND.lane_count is None
+    assert SIMDVF_KIND.register_storages == (StorageKind.RMEM, StorageKind.CARRIER)
+    assert SIMDVF_KIND.element_dtypes == (DType.f32,)
+    assert SimdVF.execution_kind == SIMDVF_KIND
+    assert execution_kind_for_surface("SimdVF", dialect="T") == SIMDVF_KIND
+    assert SIMDVF_KIND in declared_kinds()
+
     assert SIMTVF_KIND.name == "ascend.simtvf"
     assert SIMTVF_KIND.surface == "SimtVF"
-    assert SIMTVF_KIND.required_topologies == ("aiv",)
-    assert SIMTVF_KIND.mask_width_bits == 32
-    assert SIMTVF_KIND.conversion_mask_width_bits == 16
-    assert SIMTVF_KIND.lane_count is None
-    assert SIMTVF_KIND.register_storages == (StorageKind.RMEM, StorageKind.CARRIER)
-    assert SIMTVF_KIND.element_dtypes == (DType.f32,)
     assert SimtVF.execution_kind == SIMTVF_KIND
     assert execution_kind_for_surface("SimtVF", dialect="T") == SIMTVF_KIND
     assert SIMTVF_KIND in declared_kinds()
@@ -110,18 +116,18 @@ def test_target_scoped_candidates_and_global_isolation():
 
     ur_call = Call(Reshard(), (Var("x", type=smem),), type=rmem_f16)
     selected_ur = select_instruction(
-        ur_call, target=target, inside=True, active_kind="ascend.simtvf"
+        ur_call, target=target, inside=True, active_kind="ascend.simdvf"
     )
     assert type(selected_ur) is AscendUbToReg
     ru_call = Call(Reshard(), (Var("x", type=rmem_f16),), type=smem)
     selected_ru = select_instruction(
-        ru_call, target=target, inside=True, active_kind="ascend.simtvf"
+        ru_call, target=target, inside=True, active_kind="ascend.simdvf"
     )
     assert type(selected_ru) is AscendRegToUb
 
     cast_call = Call(Cast(dtype=DType.f32), (Var("x", type=rmem_f16),), type=rmem_f32)
     selected_cast = select_instruction(
-        cast_call, target=target, inside=True, active_kind="ascend.simtvf"
+        cast_call, target=target, inside=True, active_kind="ascend.simdvf"
     )
     assert type(selected_cast) is AscendVcast
 
@@ -164,7 +170,7 @@ class M:
         with Mesh(("aiv",), (1,), names=("v",)) as _v:
             x_ub = tf.schedule((x, tf.empty(Tensor[(8, 16), "f16", "smem"])), op=T.ascend_gm_to_ub())
             w_ub = tf.schedule((w, tf.empty(Tensor[(8, 16), "f16", "smem"])), op=T.ascend_gm_to_ub())
-            with T.SimtVF():
+            with T.SimdVF():
                 xr = tf.schedule((x_ub, tf.empty(Tensor[(8, 16), "f16", "rmem"])), op=T.ascend_ub_to_reg())
                 wr = tf.schedule((w_ub, tf.empty(Tensor[(8, 16), "f16", "rmem"])), op=T.ascend_ub_to_reg())
                 xf = tf.schedule((xr, tf.empty(Tensor[(8, 16), "f32", "rmem"])), op=T.ascend_vcast(dtype="f32"))
@@ -211,7 +217,7 @@ class M:
     @func
     def k(x: Tensor[(8, 16), "f32"]) -> Tensor[(8, 16), "f32"]:
         with Mesh(("aiv",), (1,), names=("v",)) as _v:
-            with T.SimtVF():
+            with T.SimdVF():
                 x_ub = tf.schedule((x, tf.empty(Tensor[(8, 16), "f32", "smem"])), op=T.ascend_gm_to_ub())
             return tf.schedule((x_ub, tf.empty(Tensor[(8, 16), "f32", "gmem"])), op=T.ascend_ub_to_gm())
 """
@@ -225,7 +231,7 @@ class M:
     def k(x: Tensor[(8, 16), "f32"]) -> Tensor[(8, 16), "f32"]:
         with Mesh(("aic",), (1,), names=("c",)) as _c:
             x_ub = tf.schedule((x, tf.empty(Tensor[(8, 16), "f32", "smem"])), op=T.ascend_gm_to_ub())
-            with T.SimtVF():
+            with T.SimdVF():
                 xr = tf.schedule((x_ub, tf.empty(Tensor[(8, 16), "f32", "rmem"])), op=T.ascend_ub_to_reg())
                 y_ub = tf.schedule((xr, tf.empty(Tensor[(8, 16), "f32", "smem"])), op=T.ascend_reg_to_ub())
             return tf.schedule((y_ub, tf.empty(Tensor[(8, 16), "f32", "gmem"])), op=T.ascend_ub_to_gm())
@@ -240,7 +246,7 @@ class M:
     def k(x: Tensor[(8, 16), "f32"]) -> Tensor[(8, 16), "f32"]:
         with Mesh(("aiv",), (1,), names=("v",)) as _v:
             x_ub = tf.schedule((x, tf.empty(Tensor[(8, 16), "f32", "smem"])), op=T.ascend_gm_to_ub())
-            with T.SimtVF():
+            with T.SimdVF():
                 xr = tf.schedule((x_ub, tf.empty(Tensor[(8, 16), "f32", "rmem"])), op=T.ascend_ub_to_reg())
                 xr
             y_ub = tf.schedule((xr, tf.empty(Tensor[(8, 16), "f32", "smem"])), op=T.ascend_reg_to_ub())
@@ -258,7 +264,7 @@ class M:
     def k(x: Tensor[(8, 16), "f16"]) -> Tensor[(8, 16), "f16"]:
         with Mesh(("aiv",), (1,), names=("v",)) as _v:
             x_ub = tf.reshard(x, layout=(8, 16), storage="smem")
-            with T.SimtVF():
+            with T.SimdVF():
                 xr = tf.reshard(x_ub, layout=(8, 16), storage="rmem")
                 xf = tf.cast(xr, dtype="f32")
                 xh = tf.cast(xf, dtype="f16")

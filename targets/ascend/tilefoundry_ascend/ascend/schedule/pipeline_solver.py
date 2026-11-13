@@ -20,6 +20,8 @@ from tilefoundry.ir.tir.stmts import (
     While,
 )
 from tilefoundry.ir.types import StorageKind, TensorType, TupleType
+from tilefoundry.ir.types.layout import size as layout_size
+from tilefoundry.ir.types.mesh import levels as mesh_levels
 from tilefoundry.ir.types.utils import static_dim_value
 from tilefoundry.vendor.tilelang_z3 import (
     SAT,
@@ -36,7 +38,7 @@ from tilefoundry.vendor.tilelang_z3 import (
     tf_adapter,
     verify_assignment,
 )
-from tilefoundry_ascend.ascend.ir.execution import SIMTVF_KIND
+from tilefoundry_ascend.ascend.ir.execution import SIMDVF_KIND, SIMTVF_KIND
 from tilefoundry_ascend.ascend.ir.tir.instructions import (
     AscendDualCopy,
     AscendGmToL1,
@@ -73,7 +75,13 @@ def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def _tensor_byte_size(tensor_type: TensorType, space: str, facts: AscendSpaceFacts) -> int:
+def _tensor_byte_size(
+    tensor_type: TensorType,
+    space: str,
+    facts: AscendSpaceFacts,
+    *,
+    aiv_factor: int = 1,
+) -> int:
     total = 1
     for dim in tensor_type.shape:
         extent = static_dim_value(dim)
@@ -84,6 +92,8 @@ def _tensor_byte_size(tensor_type: TensorType, space: str, facts: AscendSpaceFac
             )
         total *= extent
     raw_bytes = (total * tensor_type.dtype.bit_width + 7) // 8
+    if space == "UB" and aiv_factor > 1:
+        raw_bytes = (raw_bytes + aiv_factor - 1) // aiv_factor
     align = {
         "UB": facts.ub_align_bytes,
         "L1": facts.l1_align_bytes,
@@ -92,6 +102,70 @@ def _tensor_byte_size(tensor_type: TensorType, space: str, facts: AscendSpaceFac
         "L0C": facts.l0c_align_bytes,
     }[space]
     return _align_up(raw_bytes, align)
+
+
+def _static_tensor_elems(tensor_type: TensorType | None) -> int:
+    if tensor_type is None:
+        return 0
+    total = 1
+    for dim in tensor_type.shape:
+        extent = static_dim_value(dim)
+        if extent is None or extent < 1:
+            return 0
+        total *= extent
+    return total
+
+
+def _static_tensor_bytes(tensor_type: TensorType | None) -> int:
+    elems = _static_tensor_elems(tensor_type)
+    if elems <= 0 or tensor_type is None:
+        return 0
+    return (elems * tensor_type.dtype.bit_width + 7) // 8
+
+
+def _estimate_task_latency(item: _LoopTaskItem) -> int:
+    """Estimate normalized hardware cycle quanta (1..8) from DMA bytes, MMAD FLOPs, or VF ops."""
+    if item.label in ("simdvf", "simtvf"):
+        total_elems = 0
+        for _op, args in item.calls:
+            op_elems = max(
+                (_static_tensor_elems(arg.type) for arg in args if isinstance(arg.type, TensorType)),
+                default=0,
+            )
+            total_elems += op_elems
+        return min(max(1, (total_elems + 4095) // 4096), 8)
+
+    total_quanta = 0
+    for op, args in item.calls:
+        arg_types = [arg.type if isinstance(arg.type, TensorType) else None for arg in args]
+        if isinstance(op, AscendMmad) and len(arg_types) >= 3:
+            lhs, rhs = arg_types[1], arg_types[2]
+            if lhs is not None and rhs is not None and len(lhs.shape) >= 2 and len(rhs.shape) >= 2:
+                m = static_dim_value(lhs.shape[-2] if op.a_layout == "MK" else lhs.shape[-1])
+                k = static_dim_value(lhs.shape[-1] if op.a_layout == "MK" else lhs.shape[-2])
+                n = static_dim_value(rhs.shape[-2] if op.b_layout == "NK" else rhs.shape[-1])
+                if m and k and n:
+                    flops = 2 * m * n * k
+                    total_quanta += max(1, (flops + 65535) // 65536)
+                    continue
+        if isinstance(
+            op,
+            (
+                AscendGmToUb,
+                AscendUbToGm,
+                AscendGmToL1,
+                AscendL1ToL0A,
+                AscendL1ToL0B,
+                AscendL0cToGm,
+                AscendDualCopy,
+            ),
+        ):
+            xfer_bytes = max((_static_tensor_bytes(t) for t in arg_types), default=0)
+            total_quanta += max(1, (xfer_bytes + 16383) // 16384)
+            continue
+        elems = max((_static_tensor_elems(t) for t in arg_types), default=0)
+        total_quanta += max(1, (elems + 4095) // 4096)
+    return min(max(1, total_quanta), 8)
 
 
 def _op_resources(op: Op, arg_types: tuple[TensorType | None, ...]) -> tuple[tuple, ...]:
@@ -226,13 +300,14 @@ def _collect_stmts(stmt: Stmt | None, env: dict[int, Expr], out: list[_LoopTaskI
     if isinstance(stmt, LetStmt):
         env[id(stmt.var)] = stmt.value
         return
-    if isinstance(stmt, ExecutionScope) and stmt.kind == SIMTVF_KIND.name:
+    if isinstance(stmt, ExecutionScope) and stmt.kind in (SIMDVF_KIND.name, SIMTVF_KIND.name):
         inner: list[tuple[Op, tuple[Expr, ...]]] = []
         _collect_raw_calls(stmt.body, env, inner)
         if inner:
+            vf_label = "simdvf" if stmt.kind == SIMDVF_KIND.name else "simtvf"
             out.append(
                 _LoopTaskItem(
-                    label="simtvf",
+                    label=vf_label,
                     resources=(("aiv", "aiv0", "vector", 1),),
                     calls=tuple(inner),
                 )
@@ -270,12 +345,15 @@ def _collect_alloc_aliases(
     stmt: Stmt | None,
     aliases: dict[int, tuple[str, TensorType]],
     env: dict[int, Expr],
+    *,
+    skip_stmt: Stmt | None = None,
+    names_out: set[str] | None = None,
 ) -> None:
-    if stmt is None:
+    if stmt is None or stmt is skip_stmt:
         return
     if isinstance(stmt, Sequential):
         for child in stmt.body:
-            _collect_alloc_aliases(child, aliases, env)
+            _collect_alloc_aliases(child, aliases, env, skip_stmt=skip_stmt, names_out=names_out)
         return
     if isinstance(stmt, LetStmt):
         env[id(stmt.var)] = stmt.value
@@ -284,18 +362,107 @@ def _collect_alloc_aliases(
             StorageKind.TMEM,
         ):
             aliases[id(stmt.var)] = (stmt.var.name, stmt.var.type)
+            if names_out is not None:
+                names_out.add(stmt.var.name)
         elif isinstance(stmt.var.type, TupleType):
             if stmt.var.type.fields and all(
                 isinstance(f, TensorType) for f in stmt.var.type.fields
             ):
                 aliases[id(stmt.var)] = (stmt.var.name, stmt.var.type.fields[0])
+                if names_out is not None:
+                    names_out.add(stmt.var.name)
         return
     if isinstance(stmt, (MeshScope, ExecutionScope, For, While)):
-        _collect_alloc_aliases(stmt.body, aliases, env)
+        _collect_alloc_aliases(stmt.body, aliases, env, skip_stmt=skip_stmt, names_out=names_out)
         return
     if isinstance(stmt, If):
-        _collect_alloc_aliases(stmt.then_body, aliases, env)
-        _collect_alloc_aliases(stmt.else_body, aliases, env)
+        _collect_alloc_aliases(stmt.then_body, aliases, env, skip_stmt=skip_stmt, names_out=names_out)
+        _collect_alloc_aliases(stmt.else_body, aliases, env, skip_stmt=skip_stmt, names_out=names_out)
+
+
+def _mesh_aiv_extent(mesh) -> int:
+    for topo, arr in zip(mesh.topologies, mesh_levels(mesh)):
+        name = getattr(topo, "name", topo)
+        if name == "aiv":
+            ext = layout_size(arr)
+            if isinstance(ext, int) and ext > 1:
+                return ext
+    return 1
+
+
+def _max_aiv_in_stmt(stmt: Stmt | None) -> int:
+    if stmt is None:
+        return 1
+    if isinstance(stmt, Sequential):
+        return max((_max_aiv_in_stmt(c) for c in stmt.body), default=1)
+    if isinstance(stmt, MeshScope):
+        return max(_mesh_aiv_extent(stmt.mesh), _max_aiv_in_stmt(stmt.body))
+    if isinstance(stmt, (ExecutionScope, For, While)):
+        return _max_aiv_in_stmt(stmt.body)
+    if isinstance(stmt, If):
+        return max(_max_aiv_in_stmt(stmt.then_body), _max_aiv_in_stmt(stmt.else_body))
+    return 1
+
+
+def _active_aiv_factor(fn_stmt: Stmt | None, loop: For) -> int:
+    """Return the active AIV split factor enclosing or inside ``loop``."""
+    factor = 1
+
+    def _walk(stmt: Stmt | None, cur_aiv: int) -> bool:
+        nonlocal factor
+        if stmt is None:
+            return False
+        if stmt is loop:
+            factor = max(factor, cur_aiv, _max_aiv_in_stmt(loop.body))
+            return True
+        if isinstance(stmt, Sequential):
+            return any(_walk(child, cur_aiv) for child in stmt.body)
+        if isinstance(stmt, MeshScope):
+            mesh_aiv = _mesh_aiv_extent(stmt.mesh)
+            next_aiv = mesh_aiv if mesh_aiv > 1 else cur_aiv
+            return _walk(stmt.body, next_aiv)
+        if isinstance(stmt, (ExecutionScope, For, While)):
+            return _walk(stmt.body, cur_aiv)
+        if isinstance(stmt, If):
+            return _walk(stmt.then_body, cur_aiv) or _walk(stmt.else_body, cur_aiv)
+        return False
+
+    if fn_stmt is not None and _walk(fn_stmt, 1):
+        return factor
+    return _max_aiv_in_stmt(loop.body)
+
+
+def _recurrence_cycle_pairs(names: list[str], edges: list[Edge]) -> set[tuple[str, str]]:
+    """Return ``(u, v)`` pairs sharing a loop-carried recurrence cycle."""
+    fwd: dict[str, set[str]] = {n: set() for n in names}
+    rev: dict[str, set[str]] = {n: set() for n in names}
+    for e in edges:
+        if e.distance == 0:
+            fwd.setdefault(e.src, set()).add(e.dst)
+            rev.setdefault(e.dst, set()).add(e.src)
+
+    def _reach(start: str, adj: dict[str, set[str]]) -> set[str]:
+        seen = {start}
+        stack = [start]
+        while stack:
+            cur = stack.pop()
+            for nxt in adj.get(cur, ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    stack.append(nxt)
+        return seen
+
+    same_cycle: set[tuple[str, str]] = set()
+    for e in edges:
+        if e.distance < 1:
+            continue
+        from_dst = _reach(e.dst, fwd)
+        to_src = _reach(e.src, rev)
+        cycle_nodes = from_dst & to_src
+        for u in cycle_nodes:
+            for v in cycle_nodes:
+                same_cycle.add((u, v))
+    return same_cycle
 
 
 def _assign_dag_stages(
@@ -310,11 +477,13 @@ def _assign_dag_stages(
         stages[name] = authored if authored is not None else 0
     if any(stage is not None for stage in authored_stages.values()):
         return stages
+    cycle_pairs = _recurrence_cycle_pairs(names, edges)
     for _ in names:
         updated = False
         for edge in edges:
             if edge.distance == 0:
-                candidate = min(max_stage, stages[edge.src] + 1)
+                step = 0 if (edge.src, edge.dst) in cycle_pairs else 1
+                candidate = min(max_stage, stages[edge.src] + step)
                 if candidate > stages[edge.dst]:
                     stages[edge.dst] = candidate
                     updated = True
@@ -364,10 +533,12 @@ def extract_tir_loop_problem(
     facts = resolved_target.get_facts(AscendSpaceFacts)
 
     aliases: dict[int, tuple[str, TensorType]] = {}
+    outer_buffers: set[str] = set()
     env: dict[int, Expr] = {}
     if fn_stmt is not None:
-        _collect_alloc_aliases(fn_stmt, aliases, env)
+        _collect_alloc_aliases(fn_stmt, aliases, env, skip_stmt=loop, names_out=outer_buffers)
     _collect_alloc_aliases(loop.body, aliases, env)
+    aiv_factor = _active_aiv_factor(fn_stmt, loop)
 
     task_items: list[_LoopTaskItem] = []
     _collect_stmts(loop.body, env, task_items)
@@ -381,6 +552,8 @@ def extract_tir_loop_problem(
     last_writer: dict[str, str] = {}
     readers_since_write: dict[str, list[str]] = {}
     all_readers: dict[str, list[str]] = {}
+    first_readers_before_write: dict[str, list[str]] = {}
+    task_latency_by_name: dict[str, int] = {}
     task_names: list[str] = []
     task_specs: list[tuple[str, tuple, int, int | None]] = []
     edges: list[Edge] = []
@@ -392,8 +565,13 @@ def extract_tir_loop_problem(
         t_name = f"t{idx}_{item.label}"
         intent = authored_by_anchor.get(idx) or authored_by_id.get(t_name)
         res_uses = item.resources
-        latency = intent.cost_override if (intent and intent.cost_override is not None) else 1
+        latency = (
+            intent.cost_override
+            if (intent and intent.cost_override is not None)
+            else _estimate_task_latency(item)
+        )
         authored_stage = intent.stage if intent else None
+        task_latency_by_name[t_name] = latency
         task_names.append(t_name)
         task_specs.append((t_name, res_uses, latency, authored_stage))
 
@@ -429,17 +607,23 @@ def extract_tir_loop_problem(
                 is_read = bool(param.effect and (param.effect & MemoryEffect.READ))
                 is_write = bool(param.effect and (param.effect & MemoryEffect.WRITE))
 
-                if is_read and buf_name in last_writer:
-                    writer = last_writer[buf_name]
-                    if writer != t_name:
-                        e_key = (writer, t_name, 0, latency)
-                        if e_key not in edge_keys:
-                            edge_keys.add(e_key)
-                            edges.append(
-                                Edge(src=writer, dst=t_name, distance=0, latency=latency)
-                            )
-                        all_readers.setdefault(buf_name, []).append(t_name)
-                        readers_since_write.setdefault(buf_name, []).append(t_name)
+                if is_read:
+                    if buf_name in last_writer:
+                        writer = last_writer[buf_name]
+                        if writer != t_name:
+                            w_lat = task_latency_by_name[writer]
+                            e_key = (writer, t_name, 0, w_lat)
+                            if e_key not in edge_keys:
+                                edge_keys.add(e_key)
+                                edges.append(
+                                    Edge(src=writer, dst=t_name, distance=0, latency=w_lat)
+                                )
+                            all_readers.setdefault(buf_name, []).append(t_name)
+                            readers_since_write.setdefault(buf_name, []).append(t_name)
+                    elif buf_name in outer_buffers:
+                        first_readers = first_readers_before_write.setdefault(buf_name, [])
+                        if t_name not in first_readers:
+                            first_readers.append(t_name)
 
                 if is_write:
                     if buf_name in last_writer:
@@ -461,7 +645,17 @@ def extract_tir_loop_problem(
                         readers_since_write[buf_name] = []
                     last_writer[buf_name] = t_name
 
+    loop_carried_buffers: set[str] = set()
     for buf_name, writer in last_writer.items():
+        if buf_name in first_readers_before_write:
+            loop_carried_buffers.add(buf_name)
+            w_lat = task_latency_by_name[writer]
+            for r_name in first_readers_before_write[buf_name]:
+                e_key = (writer, r_name, 1, w_lat)
+                if e_key not in edge_keys:
+                    edge_keys.add(e_key)
+                    edges.append(Edge(src=writer, dst=r_name, distance=1, latency=w_lat))
+            continue
         for r_name in all_readers.get(buf_name, ()):
             if r_name != writer:
                 r_key = (buf_name, r_name, writer)
@@ -508,7 +702,7 @@ def extract_tir_loop_problem(
         else:
             space = _infer_tmem_space(buffer_roles.get(buf_name, set()))
         owner = (sched.owner if sched is not None and sched.owner else _space_owner(space))
-        slot_bytes = _tensor_byte_size(buf_type, space, facts)
+        slot_bytes = _tensor_byte_size(buf_type, space, facts, aiv_factor=aiv_factor)
         if sched is not None:
             if sched.versions[0] == "fixed":
                 buffers.append(
@@ -534,6 +728,16 @@ def extract_tir_loop_problem(
                         auto_max=max(lo, hi),
                     )
                 )
+        elif buf_name in loop_carried_buffers:
+            buffers.append(
+                Buffer(
+                    name=buf_name,
+                    slot_bytes=slot_bytes,
+                    space=space,
+                    owner=owner,
+                    fixed=1,
+                )
+            )
         elif manual and spec.max_buffer_versions > 1 and buf_name in reused_buffers:
             buffers.append(
                 Buffer(
@@ -588,7 +792,7 @@ def solve_ascend_pipeline(
     problem: Problem,
     *,
     fixed_ii: int | None = None,
-    max_ii: int = 16,
+    max_ii: int = 64,
     timeout_ms: int = 1000,
 ) -> AscendPipelineResult:
     """Solve for the minimum feasible initiation interval II and verify the model."""
@@ -601,7 +805,8 @@ def solve_ascend_pipeline(
             )
         candidates = (fixed_ii,)
     else:
-        upper = lb + max_ii
+        seq_lat = sum(t.latency for t in problem.tasks) + 4
+        upper = max(lb + max_ii, seq_lat)
         candidates = range(lb, upper + 1)
 
     last_detail = "UNSAT"

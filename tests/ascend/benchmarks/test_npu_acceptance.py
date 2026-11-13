@@ -140,3 +140,69 @@ def test_mla_supplemental_cases() -> None:
             )
             passed, details = harness.compare(case, actual, oracle, tensors, native_fn)
             assert passed, f"{case.get_case_id_str()} ({mode}): {details}"
+
+
+def test_dynamic_shape_kernel_cache_reuse() -> None:
+    """Verify T.dynamic parameterization reuses compiled kernels across dynamic shapes."""
+    _require_npu_env()
+    from tests.ascend.benchmarks.attention_residual.golden import (
+        attention_residual as ar_golden,
+    )
+    from tests.ascend.benchmarks.mla.golden import mla as mla_golden
+
+    torch.manual_seed(0)
+    ar_kernels._KERNEL_CACHE.clear()
+    n_depth, d_dim = 4, 256
+    w = torch.randn(d_dim, dtype=torch.bfloat16)
+    gamma = torch.rand(d_dim, dtype=torch.bfloat16) + 0.5
+    for b_dim, t_dim in ((1, 16), (2, 32)):
+        v_stack = torch.randn(n_depth, b_dim, t_dim, d_dim, dtype=torch.bfloat16)
+        x = torch.randn(b_dim, t_dim, d_dim, dtype=torch.bfloat16)
+        ref = ar_golden(v_stack, x, w, gamma, alpha=0.5, epsilon=1e-6)
+        actual = _call_single_kernel(
+            ar_kernels,
+            attention_residual,
+            v_stack=v_stack.npu(),
+            x=x.npu(),
+            w=w.npu(),
+            gamma=gamma.npu(),
+            alpha=0.5,
+            epsilon=1e-6,
+        )
+        torch.testing.assert_close(actual.cpu().float(), ref.float(), rtol=2e-2, atol=2e-2)
+    assert len(ar_kernels._KERNEL_CACHE) == 1
+
+    mla_kernels._KERNEL_CACHE.clear()
+    n_q, n_kv, d_nope, d_rope = 16, 1, 512, 64
+    for b_dim, s_dim, s_kv in ((2, 64, 128), (4, 128, 256)):
+        qn = torch.randn(b_dim, s_dim, n_q, d_nope, dtype=torch.bfloat16)
+        qr = torch.randn(b_dim, s_dim, n_q, d_rope, dtype=torch.bfloat16)
+        kn = torch.randn(b_dim, s_kv, n_kv, d_nope, dtype=torch.bfloat16)
+        kr = torch.randn(b_dim, s_kv, n_kv, d_rope, dtype=torch.bfloat16)
+        v = kn.clone()
+        ref = mla_golden(
+            qn,
+            qr,
+            kn,
+            kr,
+            v,
+            numKVHeads=n_kv,
+            scaleValue=-1.0,
+            inputLayout="BSND",
+            is_causal=True,
+        )
+        actual = _call_single_kernel(
+            mla_kernels,
+            mla,
+            q_nope=qn.npu(),
+            q_rope=qr.npu(),
+            k_nope=kn.npu(),
+            k_rope=kr.npu(),
+            v=v.npu(),
+            numKVHeads=n_kv,
+            scaleValue=-1.0,
+            inputLayout="BSND",
+            is_causal=True,
+        )
+        torch.testing.assert_close(actual.cpu().float(), ref.float(), rtol=2e-2, atol=2e-2)
+    assert len(mla_kernels._KERNEL_CACHE) == 1
