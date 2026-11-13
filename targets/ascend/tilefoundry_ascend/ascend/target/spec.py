@@ -92,16 +92,24 @@ def build_ascend_950pr(document: HardwareDocument) -> Ascend950PR:
         l0b_bytes_per_aic=reader.integer("memory.l0b.per_aic", unit="byte"),
         l0c_bytes_per_aic=reader.integer("memory.l0c.per_aic", unit="byte"),
         ub_nominal_bytes_per_aiv=reader.integer("memory.ub.nominal_per_aiv", unit="byte"),
+        ub_simdvf_usable_bytes_per_aiv=reader.integer(
+            "memory.ub.simdvf_usable_per_aiv", unit="byte"
+        ),
         ub_usable_bytes_per_aiv=reader.integer("memory.ub.usable_per_aiv", unit="byte"),
         rmem_bytes_per_lane=reader.integer("memory.rmem.per_lane", unit="byte"),
         _unit_flops=unit_flops,
         aiv_lane_events_per_second=reader.integer("performance.aiv.lane_events", unit="op/s"),
     )
     reader.close()
-    if device.ub_usable_bytes_per_aiv > device.ub_nominal_bytes_per_aiv:
+    if device.ub_simdvf_usable_bytes_per_aiv > device.ub_nominal_bytes_per_aiv:
         raise SchemaValidationError(
-            f"{document.id}: usable UB ({device.ub_usable_bytes_per_aiv}) cannot exceed "
-            f"nominal UB ({device.ub_nominal_bytes_per_aiv})"
+            f"{document.id}: SimdVF usable UB ({device.ub_simdvf_usable_bytes_per_aiv}) cannot "
+            f"exceed nominal UB ({device.ub_nominal_bytes_per_aiv})"
+        )
+    if device.ub_usable_bytes_per_aiv > device.ub_simdvf_usable_bytes_per_aiv:
+        raise SchemaValidationError(
+            f"{document.id}: SimtVF usable UB ({device.ub_usable_bytes_per_aiv}) cannot exceed "
+            f"SimdVF usable UB ({device.ub_simdvf_usable_bytes_per_aiv})"
         )
     return device
 

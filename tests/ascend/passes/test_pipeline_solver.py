@@ -47,6 +47,7 @@ def _collect_pipelined_loops(fn) -> list[For]:
 HEADER = (
     "from __future__ import annotations\n\n"
     "from tilefoundry.dsl import *\n"
+    "from tilefoundry.ir.core.kinds import BinaryKind\n"
     "from tilefoundry_ascend import AscendTarget\n"
     "TOPOS = (Topology('block', 1), Topology('aic', 1), "
     "Topology('aiv', 2), Topology('lane', 64))\n"
@@ -455,3 +456,59 @@ class M:
     assert ub_bufs and all(b.slot_bytes == 76800 for b in ub_bufs)
     dma_in = next(t for t in problem.tasks if "gm_to_ub" in t.name)
     assert dma_in.latency == 8
+
+
+def test_mode_aware_ub_budget_simdvf_vs_simtvf_and_unreserved(tmp_path: pathlib.Path):
+    """Verify pure SimdVF (248/256 KiB) admits 240 KiB schedules that SimtVF rejects."""
+    pure_simdvf_240k = """
+@module(entry="pure_simdvf", target=AscendTarget("ascend.950pr"), topologies=TOPOS)
+class M:
+    @func
+    def pure_simdvf(x: Tensor[(4, 64, 320), "f32"]) -> Tensor[(4, 64, 320), "f32"]:
+        with Mesh(("aiv",), (1,), names=("v",)) as _v:
+            out = tf.empty(Tensor[(4, 64, 320), "f32", "gmem"])
+            for k in tf.pipelined(4, max_stage=2, max_buffer_versions=2, enable_offset=True):
+                xt = tf.reshape(x[k, :, :], new_shape=(64, 320))
+                x_ub = tf.schedule((xt, tf.empty(Tensor[(64, 320), "f32", "smem"])), op=T.ascend_gm_to_ub())
+                with T.SimdVF():
+                    xr = tf.schedule((x_ub, tf.empty(Tensor[(64, 320), "f32", "rmem"])), op=T.ascend_ub_to_reg())
+                    y_ub = tf.schedule((xr, tf.empty(Tensor[(64, 320), "f32", "smem"])), op=T.ascend_reg_to_ub())
+                row_gm = tf.schedule((y_ub, tf.empty(Tensor[(64, 320), "f32", "gmem"])), op=T.ascend_ub_to_gm())
+                out = tf.insert_slice(out, tf.reshape(row_gm, new_shape=(1, 64, 320)), (k, 0, 0))
+            return out
+"""
+    p1 = tmp_path / "pure_simdvf.py"
+    p1.write_text(HEADER + "\n" + pure_simdvf_240k, encoding="utf-8")
+    mod1 = load_authored_ir(f"{p1}:M")
+    c_mod1, c_fn1 = check_program(mod1, mod1.entry_function())
+    low1 = finalize(analyze(c_mod1, c_fn1, analysis="memory"), authored=mod1.entry_function())
+    fn1 = low1.entry_function()
+    prob1, _ = extract_tir_loop_problem(_collect_pipelined_loops(fn1)[0], fn_stmt=fn1.body)
+    assert {(c.space, c.owner): c.bytes for c in prob1.capacities}[("UB", "aiv")] == 248 * 1024
+    versions1 = list(low1.metadata["ascend.pipelines"]["pure_simdvf:k"]["versions"].values())
+    assert versions1 == [1, 2]
+
+    import dataclasses
+    from tilefoundry.ir.tir.stmts import ExecutionScope, Sequential
+
+    def _with_simtvf(node):
+        if isinstance(node, ExecutionScope):
+            return dataclasses.replace(node, kind="ascend.simtvf", body=_with_simtvf(node.body))
+        if isinstance(node, Sequential):
+            return dataclasses.replace(node, body=tuple(_with_simtvf(s) for s in node.body))
+        if dataclasses.is_dataclass(node) and hasattr(node, "body"):
+            return dataclasses.replace(node, body=_with_simtvf(node.body))
+        return node
+
+    loop1 = _collect_pipelined_loops(fn1)[0]
+    simtvf_loop = _with_simtvf(loop1)
+    simtvf_fn_body = _with_simtvf(fn1.body)
+    prob2, _ = extract_tir_loop_problem(simtvf_loop, fn_stmt=simtvf_fn_body)
+    assert {(c.space, c.owner): c.bytes for c in prob2.capacities}[("UB", "aiv")] == 216 * 1024
+    with pytest.raises(PipelineError, match="ASCEND_PIPELINE_UNSAT"):
+        solve_ascend_pipeline(prob2)
+
+    prob_unres, _ = extract_tir_loop_problem(
+        _collect_pipelined_loops(fn1)[0], fn_stmt=fn1.body, unreserved_ubuf=True
+    )
+    assert {(c.space, c.owner): c.bytes for c in prob_unres.capacities}[("UB", "aiv")] == 256 * 1024

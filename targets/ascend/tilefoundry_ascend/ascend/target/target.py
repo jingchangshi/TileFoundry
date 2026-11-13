@@ -166,8 +166,8 @@ class AscendTarget(Target):
             throughput,
         )
 
-        if facts_type is AscendSpaceFacts and query is None:
-            return facts_result(self, facts_type, ascend_space_facts(self))
+        if facts_type is AscendSpaceFacts:
+            return facts_result(self, facts_type, ascend_space_facts(self, query))
         if facts_type is MemoryHierarchyFacts:
             return facts_result(self, facts_type, memory_hierarchy(self, query))
         if facts_type is PerformanceServiceFacts:

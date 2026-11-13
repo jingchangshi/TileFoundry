@@ -24,6 +24,7 @@ class Ascend950PR(Device):
     l0b_bytes_per_aic: int
     l0c_bytes_per_aic: int
     ub_nominal_bytes_per_aiv: int
+    ub_simdvf_usable_bytes_per_aiv: int
     ub_usable_bytes_per_aiv: int
     rmem_bytes_per_lane: int
     _unit_flops: tuple[tuple[str, tuple[tuple[DType, int], ...]], ...]

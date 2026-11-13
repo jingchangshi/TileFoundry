@@ -6,7 +6,7 @@ import pytest
 
 from tilefoundry.ir.types import Topology
 from tilefoundry.target import TopologyFacts, TopologyLevelFacts, UnsupportedCapabilityError
-from tilefoundry_ascend import AscendTarget
+from tilefoundry_ascend import PURE_SIMDVF_UBUF_FLAGS, AscendTarget
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts
 
 
@@ -33,9 +33,22 @@ def test_ascend_target_reports_and_validates_its_topology_levels():
 
 
 def test_ascend_space_facts_expose_exact_950pr_capacities():
-    spaces = AscendTarget().get_facts(AscendSpaceFacts)
+    target = AscendTarget()
+    spaces = target.get_facts(AscendSpaceFacts)
     assert spaces.ub_nominal_bytes == 256 * 1024
     assert spaces.ub_usable_bytes == 216 * 1024
+    assert spaces.ub_simtvf_usable_bytes == 216 * 1024
+    assert spaces.ub_simdvf_usable_bytes == 248 * 1024
+    assert spaces.ub_limit_bytes("simtvf") == 216 * 1024
+    assert spaces.ub_limit_bytes("simdvf") == 248 * 1024
+    assert spaces.ub_limit_bytes("simdvf", unreserved_ubuf=True) == 256 * 1024
+    assert target.get_facts(AscendSpaceFacts, "simdvf").ub_usable_bytes == 248 * 1024
+    assert target.get_facts(AscendSpaceFacts, "simdvf_unreserved").ub_usable_bytes == 256 * 1024
+    assert target.get_facts(AscendSpaceFacts, "simtvf").ub_usable_bytes == 216 * 1024
+    assert PURE_SIMDVF_UBUF_FLAGS == (
+        "--cce-disable-vf-stack-reserved-ubuf",
+        "--cce-disable-asc-reserved-ubuf",
+    )
     assert spaces.l1_bytes == 512 * 1024
     assert spaces.l0a_bytes == 64 * 1024
     assert spaces.l0b_bytes == 64 * 1024

@@ -12,9 +12,15 @@ from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.evaluator import evaluate
 from tilefoundry.ir.core import Call, Var, supported_op_capabilities
 from tilefoundry.ir.core.execution import declared_kinds, execution_kind_for_surface
+from tilefoundry.ir.core.kinds import BinaryKind, ReduceKind, UnaryKind
+from tilefoundry.ir.hir.math.binary import Binary as HirBinary
+from tilefoundry.ir.hir.math.clamp import Clamp as HirClamp
+from tilefoundry.ir.hir.math.unary import Unary as HirUnary
 from tilefoundry.ir.hir.nn.matmul import MatMul
 from tilefoundry.ir.hir.sharding.reshard import Reshard
 from tilefoundry.ir.hir.tensor.cast import Cast
+from tilefoundry.ir.hir.tensor.reduce import Reduce as HirReduce
+from tilefoundry.ir.hir.tensor.where import Where as HirWhere
 from tilefoundry.ir.types import DType, Layout, StorageKind, TensorType
 from tilefoundry.passes.transforms.convert_hir_to_tir import LoweringError
 from tilefoundry.schedule.candidates import candidates as report_candidates
@@ -29,6 +35,8 @@ from tilefoundry_ascend import AscendTarget
 from tilefoundry_ascend.ascend.ir.execution import SIMDVF_KIND, SIMTVF_KIND, SimdVF, SimtVF
 from tilefoundry_ascend.ascend.ir.tir.instructions import (
     ASCEND_OP_SPECS,
+    AscendDualCopyL0cToUb,
+    AscendDualCopyUbToL1,
     AscendGmToL1,
     AscendGmToUb,
     AscendL0cToGm,
@@ -36,7 +44,12 @@ from tilefoundry_ascend.ascend.ir.tir.instructions import (
     AscendRegToUb,
     AscendUbToGm,
     AscendUbToReg,
+    AscendVbinary,
     AscendVcast,
+    AscendVclamp,
+    AscendVreduce,
+    AscendVunary,
+    AscendVwhere,
 )
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts
 
@@ -85,7 +98,7 @@ def test_simdvf_and_simtvf_execution_kind_registration():
 def test_ascend_ops_registered_with_target_and_semantics():
     target = AscendTarget("ascend.950pr")
     supported = {op_cls for op_cls, _ in supported_op_capabilities(target)}
-    assert len(ASCEND_OP_SPECS) == 20
+    assert len(ASCEND_OP_SPECS) == 50
     for spec in ASCEND_OP_SPECS:
         assert spec.op_cls in supported
         assert typeinfer_registry.lookup(spec.op_cls) is not None
@@ -113,6 +126,10 @@ def test_target_scoped_candidates_and_global_isolation():
     assert type(select_instruction(gl_call, target=target, inside=False)) is AscendGmToL1
     lg_call = Call(Reshard(), (Var("x", type=tmem),), type=gm)
     assert type(select_instruction(lg_call, target=target, inside=False)) is AscendL0cToGm
+    lu_call = Call(Reshard(), (Var("x", type=tmem),), type=smem)
+    assert type(select_instruction(lu_call, target=target, inside=False)) is AscendDualCopyL0cToUb
+    ul_call = Call(Reshard(), (Var("x", type=smem),), type=tmem)
+    assert type(select_instruction(ul_call, target=target, inside=False)) is AscendDualCopyUbToL1
 
     ur_call = Call(Reshard(), (Var("x", type=smem),), type=rmem_f16)
     selected_ur = select_instruction(
@@ -133,6 +150,38 @@ def test_target_scoped_candidates_and_global_isolation():
 
     mm_call = Call(MatMul(), (Var("a", type=tmem), Var("b", type=tmem)), type=tmem)
     assert type(select_instruction(mm_call, target=target, inside=False)) is AscendMmad
+
+    for bkind in (BinaryKind.ADD, BinaryKind.SUB, BinaryKind.MUL, BinaryKind.DIV, BinaryKind.MAX, BinaryKind.LT):
+        b_out = TensorType(shape, DType.bool if bkind is BinaryKind.LT else DType.f32, layout, StorageKind.RMEM)
+        b_call = Call(
+            HirBinary(kind=bkind),
+            (Var("a", type=rmem_f32), Var("b", type=rmem_f32)),
+            type=b_out,
+        )
+        sel = select_instruction(b_call, target=target, inside=True, active_kind="ascend.simdvf")
+        assert type(sel) is AscendVbinary and sel.kind is bkind
+
+    u_call = Call(HirUnary(kind=UnaryKind.EXP), (Var("a", type=rmem_f32),), type=rmem_f32)
+    assert type(select_instruction(u_call, target=target, inside=True, active_kind="ascend.simdvf")) is AscendVunary
+    r_call = Call(
+        HirReduce(axes=(-1,), keepdim=True, kind=ReduceKind.SUM),
+        (Var("a", type=rmem_f32),),
+        type=TensorType((16, 1), DType.f32, Layout((16, 1)), StorageKind.RMEM),
+    )
+    assert type(select_instruction(r_call, target=target, inside=True, active_kind="ascend.simdvf")) is AscendVreduce
+    rmem_bool = TensorType(shape, DType.bool, layout, StorageKind.RMEM)
+    w_call = Call(
+        HirWhere(),
+        (Var("c", type=rmem_bool), Var("a", type=rmem_f32), Var("b", type=rmem_f32)),
+        type=rmem_f32,
+    )
+    assert type(select_instruction(w_call, target=target, inside=True, active_kind="ascend.simdvf")) is AscendVwhere
+    cl_call = Call(
+        HirClamp(min_val=-1.0, max_val=1.0),
+        (Var("a", type=rmem_f32),),
+        type=rmem_f32,
+    )
+    assert type(select_instruction(cl_call, target=target, inside=True, active_kind="ascend.simdvf")) is AscendVclamp
 
 
 def test_cube_flow_eval_analyze_finalize_and_verify(tmp_path: pathlib.Path):
@@ -293,3 +342,204 @@ class M:
     assert "T.ascend_ub_to_reg" in defaults
     assert "T.ascend_reg_to_ub" in defaults
     assert "T.ascend_vcast" in defaults
+
+    usable_ids = {
+        candidate["id"]
+        for line in cand_data["lines"]
+        for candidate in line["candidates"]
+    }
+    assert "T.ascend_gm_to_ub_pad" in usable_ids
+    assert "T.ascend_ub_to_gm_atomic" in usable_ids
+    assert "T.ascend_vld_dist" in usable_ids
+    assert "T.ascend_vsts_dist" in usable_ids
+
+
+def test_unified_hir_lowering_inside_simdvf_without_schedule(tmp_path: pathlib.Path):
+    """Verify standard HIR math/reduce/where/clamp ops lower automatically inside SimdVF."""
+    body = """
+@module(entry="k", target=AscendTarget("ascend.950pr"), topologies=TOPOS)
+class M:
+    @func
+    def k(x: Tensor[(8, 16), "f32"], y: Tensor[(8, 16), "f32"]) -> Tensor[(8, 16), "f32"]:
+        with Mesh(("aiv",), (1,), names=("v",)) as _v:
+            x_ub = tf.reshard(x, layout=(8, 16), storage="smem")
+            y_ub = tf.reshard(y, layout=(8, 16), storage="smem")
+            two_ub = tf.full_like(y_ub, 2.0)
+            with T.SimdVF():
+                xr = tf.reshard(x_ub, layout=(8, 16), storage="rmem")
+                yr = tf.reshard(y_ub, layout=(8, 16), storage="rmem")
+                two_r = tf.reshard(two_ub, layout=(8, 16), storage="rmem")
+                diff = xr - yr
+                clamped = tf.clamp(diff + yr * two_r, min_val=-4.0, max_val=4.0)
+                ex = tf.exp(clamped)
+                row_sum = tf.reduce(ex, axes=(-1,), keepdim=True, kind=ReduceKind.SUM)
+                normed = ex / row_sum
+                mask = xr < yr
+                out_r = tf.where(mask, normed, clamped)
+                out_ub = tf.reshard(out_r, layout=(8, 16), storage="smem")
+            return tf.reshard(out_ub, layout=(8, 16), storage="gmem")
+"""
+    mod = _load_module(tmp_path, body, "unified_hir.py")
+    x = torch.randn(8, 16, dtype=torch.float32)
+    y = torch.randn(8, 16, dtype=torch.float32)
+    out = evaluate(mod.entry_function(), x, y).data
+    clamped_ref = torch.clamp((x - y) + y * 2.0, min=-4.0, max=4.0)
+    ex_ref = torch.exp(clamped_ref)
+    normed_ref = ex_ref / ex_ref.sum(dim=-1, keepdim=True)
+    ref = torch.where(x < y, normed_ref, clamped_ref)
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+    lowered = _lower(mod)
+    verify_prim_function(lowered.entry_function())
+
+
+def test_predicate_scalar_vector_and_granularity_enforcement(tmp_path: pathlib.Path):
+    """Verify predicate, scalar-vector, lane-index, FMA ops and 32-bit predicate checks."""
+    valid_body = """
+@module(entry="k", target=AscendTarget("ascend.950pr"), topologies=TOPOS)
+class M:
+    @func
+    def k(x: Tensor[(4, 16), "f32"]) -> Tensor[(4, 16), "f32"]:
+        with Mesh(("aiv",), (1,), names=("v",)) as _v:
+            x_ub = tf.schedule((x, tf.empty(Tensor[(4, 16), "f32", "smem"])), op=T.ascend_gm_to_ub())
+            with T.SimdVF():
+                xr = tf.schedule((x_ub, tf.empty(Tensor[(4, 16), "f32", "rmem"])), op=T.ascend_ub_to_reg())
+                bias = tf.schedule((tf.empty(Tensor[(4, 16), "f32", "rmem"]),), op=T.ascend_vdup(value=1.0))
+                idx = tf.schedule((tf.empty(Tensor[(4, 16), "f32", "rmem"]),), op=T.ascend_vci(start=0, order="INC_ORDER"))
+                acc = tf.schedule((bias, xr, idx), op=T.ascend_vmula())
+                scaled = tf.schedule((acc, tf.empty(Tensor[(4, 16), "f32", "rmem"])), op=T.ascend_vmuls(scalar=0.5))
+                shifted = tf.schedule((scaled, tf.empty(Tensor[(4, 16), "f32", "rmem"])), op=T.ascend_vadds(scalar=2.0))
+                tail_mask = tf.schedule((tf.empty(Tensor[(4, 16), "bool", "rmem"]),), op=T.ascend_update_mask(count=8, elem_width=32))
+                cmp_mask = tf.schedule((xr, tf.empty(Tensor[(4, 16), "bool", "rmem"])), op=T.ascend_vcmps(scalar=0.0, cmp_op="gt", elem_width=32))
+                comb = tf.schedule((tail_mask, cmp_mask, tf.empty(Tensor[(4, 16), "bool", "rmem"])), op=T.ascend_pand(elem_width=32))
+                sel = tf.schedule((comb, shifted, bias, tf.empty(Tensor[(4, 16), "f32", "rmem"])), op=T.ascend_vsel())
+                out_ub = tf.schedule((sel, tf.empty(Tensor[(4, 16), "f32", "smem"])), op=T.ascend_reg_to_ub())
+            return tf.schedule((out_ub, tf.empty(Tensor[(4, 16), "f32", "gmem"])), op=T.ascend_ub_to_gm())
+"""
+    mod = _load_module(tmp_path, valid_body, "pred_valid.py")
+    x = torch.randn(4, 16, dtype=torch.float32)
+    out = evaluate(mod.entry_function(), x).data
+    idx_ref = torch.arange(16, dtype=torch.float32).unsqueeze(0).expand(4, 16)
+    shifted_ref = (1.0 + x * idx_ref) * 0.5 + 2.0
+    tail_ref = (torch.arange(16) < 8).unsqueeze(0).expand(4, 16)
+    comb_ref = tail_ref & (x > 0.0)
+    ref = torch.where(comb_ref, shifted_ref, torch.ones_like(x))
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+    lowered = _lower(mod)
+    verify_prim_function(lowered.entry_function())
+
+    bad_width = """
+@module(entry="k", target=AscendTarget("ascend.950pr"), topologies=TOPOS)
+class M:
+    @func
+    def k(x: Tensor[(4, 16), "f32"]) -> Tensor[(4, 16), "f32"]:
+        with Mesh(("aiv",), (1,), names=("v",)) as _v:
+            x_ub = tf.schedule((x, tf.empty(Tensor[(4, 16), "f32", "smem"])), op=T.ascend_gm_to_ub())
+            with T.SimdVF():
+                xr = tf.schedule((x_ub, tf.empty(Tensor[(4, 16), "f32", "rmem"])), op=T.ascend_ub_to_reg())
+                m16 = tf.schedule((tf.empty(Tensor[(4, 16), "bool", "rmem"]),), op=T.ascend_pset(elem_width=16, pat="PAT_ALL"))
+                sel = tf.schedule((m16, xr, xr, tf.empty(Tensor[(4, 16), "f32", "rmem"])), op=T.ascend_vsel())
+                out_ub = tf.schedule((sel, tf.empty(Tensor[(4, 16), "f32", "smem"])), op=T.ascend_reg_to_ub())
+            return tf.schedule((out_ub, tf.empty(Tensor[(4, 16), "f32", "gmem"])), op=T.ascend_ub_to_gm())
+"""
+    with pytest.raises(VerifyError, match="element width 16"):
+        _lower(_load_module(tmp_path, bad_width, "pred_bad.py"))
+
+
+def test_reshard_four_extension_categories_eval_and_verify(tmp_path: pathlib.Path):
+    """Verify dual_copy, layout/pad DMA, SimdVF dist, and atomic writeback Reshard ops."""
+    body = """
+@module(entry="k", target=AscendTarget("ascend.950pr"), topologies=TOPOS)
+class M:
+    @func
+    def k(
+        x: Tensor[(8, 12), "f32"],
+        w: Tensor[(8, 16), "f32"],
+        acc_gm: Tensor[(8, 16), "f32"],
+    ) -> Tensor[(8, 16), "f32"]:
+        with Mesh(("aiv",), (1,), names=("v",)) as _v:
+            x_pad = tf.schedule(
+                (x, tf.empty(Tensor[(8, 16), "f32", "smem"])),
+                op=T.ascend_gm_to_ub_pad(pad_value=2.0),
+            )
+            w_l1 = tf.schedule(
+                (w, tf.empty(Tensor[(8, 16), "f32", "tmem"])),
+                op=T.ascend_gm_to_l1_nz(nz_mode="nd2nz", transpose=False),
+            )
+            w_ub = tf.schedule(
+                (w_l1, tf.empty(Tensor[(8, 16), "f32", "smem"])),
+                op=T.ascend_dual_copy_l0c_to_ub(split_mode="m_split"),
+            )
+            with T.SimdVF():
+                xr = tf.schedule(
+                    (x_pad, tf.empty(Tensor[(8, 16), "f32", "rmem"])),
+                    op=T.ascend_vld_dist(dist="NORM_B32"),
+                )
+                wr = tf.schedule(
+                    (w_ub, tf.empty(Tensor[(8, 16), "f32", "rmem"])),
+                    op=T.ascend_vld_dist(dist="NORM_B32"),
+                )
+                one_ub = tf.schedule(
+                    (xr, tf.empty(Tensor[(8, 1), "f32", "smem"])),
+                    op=T.ascend_vsts_dist(dist="ONEPT_B32"),
+                )
+                one_brc = tf.schedule(
+                    (one_ub, tf.empty(Tensor[(8, 16), "f32", "rmem"])),
+                    op=T.ascend_vld_dist(dist="BRC_B32"),
+                )
+                y_r = (xr + wr) + one_brc
+                y_ub = tf.schedule(
+                    (y_r, tf.empty(Tensor[(8, 16), "f32", "smem"])),
+                    op=T.ascend_vsts_dist(dist="NORM_B32"),
+                )
+            y_l1 = tf.schedule(
+                (y_ub, tf.empty(Tensor[(8, 16), "f32", "tmem"])),
+                op=T.ascend_dual_copy_ub_to_l1(nd2nz=True),
+            )
+            y_round = tf.schedule(
+                (y_l1, tf.empty(Tensor[(8, 16), "f32", "smem"])),
+                op=T.ascend_dual_copy_l0c_to_ub(split_mode="m_split"),
+            )
+            return tf.schedule(
+                (y_round, acc_gm),
+                op=T.ascend_ub_to_gm_atomic(atomic_op="add"),
+            )
+"""
+    mod = _load_module(tmp_path, body, "reshard_ext.py")
+    x = torch.randn(8, 12, dtype=torch.float32)
+    w = torch.randn(8, 16, dtype=torch.float32)
+    acc = torch.randn(8, 16, dtype=torch.float32)
+    out = evaluate(mod.entry_function(), x, w, acc).data
+    x_padded = torch.full((8, 16), 2.0, dtype=torch.float32)
+    x_padded[:, :12] = x
+    ref = acc + x_padded + w + x_padded[:, :1].expand(8, 16)
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+    lowered = _lower(mod)
+    verify_prim_function(lowered.entry_function())
+
+    transpose_and_l0c_atomic = """
+@module(entry="k", target=AscendTarget("ascend.950pr"), topologies=TOPOS)
+class M:
+    @func
+    def k(
+        k_gm: Tensor[(8, 16), "f32"],
+        acc_f16: Tensor[(16, 8), "f16"],
+    ) -> Tensor[(16, 8), "f16"]:
+        with Mesh(("aic",), (1,), names=("c",)) as _c:
+            k_t = tf.schedule(
+                (k_gm, tf.empty(Tensor[(16, 8), "f32", "tmem"])),
+                op=T.ascend_gm_to_l1_nz(nz_mode="dn2nz", transpose=True),
+            )
+            return tf.schedule(
+                (k_t, acc_f16),
+                op=T.ascend_l0c_to_gm_atomic(atomic_op="add"),
+            )
+"""
+    mod2 = _load_module(tmp_path, transpose_and_l0c_atomic, "reshard_l0c_atomic.py")
+    k_gm = torch.randn(8, 16, dtype=torch.float32)
+    acc_f16 = torch.randn(16, 8, dtype=torch.float16)
+    out2 = evaluate(mod2.entry_function(), k_gm, acc_f16).data
+    ref2 = acc_f16 + k_gm.transpose(0, 1).to(torch.float16)
+    torch.testing.assert_close(out2, ref2, rtol=1e-3, atol=1e-3)
+    lowered2 = _lower(mod2)
+    verify_prim_function(lowered2.entry_function())

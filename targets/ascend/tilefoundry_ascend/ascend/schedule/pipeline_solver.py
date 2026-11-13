@@ -41,13 +41,19 @@ from tilefoundry.vendor.tilelang_z3 import (
 from tilefoundry_ascend.ascend.ir.execution import SIMDVF_KIND, SIMTVF_KIND
 from tilefoundry_ascend.ascend.ir.tir.instructions import (
     AscendDualCopy,
+    AscendDualCopyL0cToUb,
+    AscendDualCopyUbToL1,
     AscendGmToL1,
+    AscendGmToL1Nz,
     AscendGmToUb,
+    AscendGmToUbPad,
     AscendL0cToGm,
+    AscendL0cToGmAtomic,
     AscendL1ToL0A,
     AscendL1ToL0B,
     AscendMmad,
     AscendUbToGm,
+    AscendUbToGmAtomic,
 )
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
@@ -152,12 +158,18 @@ def _estimate_task_latency(item: _LoopTaskItem) -> int:
             op,
             (
                 AscendGmToUb,
+                AscendGmToUbPad,
                 AscendUbToGm,
+                AscendUbToGmAtomic,
                 AscendGmToL1,
+                AscendGmToL1Nz,
                 AscendL1ToL0A,
                 AscendL1ToL0B,
                 AscendL0cToGm,
+                AscendL0cToGmAtomic,
                 AscendDualCopy,
+                AscendDualCopyL0cToUb,
+                AscendDualCopyUbToL1,
             ),
         ):
             xfer_bytes = max((_static_tensor_bytes(t) for t in arg_types), default=0)
@@ -214,14 +226,40 @@ def _space_owner(space: str) -> str:
     return "aiv" if space == "UB" else "aic"
 
 
-def _capacities_from_facts(facts: AscendSpaceFacts) -> tuple[Capacity, ...]:
+def _capacities_from_facts(
+    facts: AscendSpaceFacts,
+    *,
+    has_simtvf: bool = False,
+    unreserved_ubuf: bool = False,
+) -> tuple[Capacity, ...]:
+    if has_simtvf:
+        ub_bytes = facts.ub_limit_bytes("simtvf")
+    else:
+        ub_bytes = facts.ub_limit_bytes("simdvf", unreserved_ubuf=unreserved_ubuf)
     return (
-        Capacity("UB", "aiv", facts.ub_usable_bytes),
+        Capacity("UB", "aiv", ub_bytes),
         Capacity("L1", "aic", facts.l1_bytes),
         Capacity("L0A", "aic", facts.l0a_bytes),
         Capacity("L0B", "aic", facts.l0b_bytes),
         Capacity("L0C", "aic", facts.l0c_bytes),
     )
+
+
+def _contains_simtvf(stmt: Stmt | None) -> bool:
+    """Return True if ``stmt`` contains an ``ascend.simtvf`` execution scope."""
+    if stmt is None:
+        return False
+    if isinstance(stmt, ExecutionScope):
+        if getattr(stmt.kind, "name", stmt.kind) == SIMTVF_KIND.name:
+            return True
+        return _contains_simtvf(stmt.body)
+    if isinstance(stmt, Sequential):
+        return any(_contains_simtvf(child) for child in stmt.body)
+    if isinstance(stmt, (MeshScope, For, While)):
+        return _contains_simtvf(stmt.body)
+    if isinstance(stmt, If):
+        return _contains_simtvf(stmt.then_body) or _contains_simtvf(stmt.else_body)
+    return False
 
 
 def _resources_for_tasks(tasks: list[Task]) -> tuple[Resource, ...]:
@@ -523,6 +561,7 @@ def extract_tir_loop_problem(
     *,
     target: AscendTarget | None = None,
     fn_stmt: Stmt | None = None,
+    unreserved_ubuf: bool = False,
 ) -> tuple[Problem, dict[str, int]]:
     """Build a Z3 pipeline Problem and initial stage map from a TIR For loop."""
     spec = loop.pipeline
@@ -600,7 +639,10 @@ def extract_tir_loop_problem(
                         roles.add("l0b")
                     elif param.name == "acc":
                         roles.add("l0c")
-                elif isinstance(op, (AscendL0cToGm, AscendDualCopy)) and param.name == "src":
+                elif isinstance(
+                    op,
+                    (AscendL0cToGm, AscendL0cToGmAtomic, AscendDualCopy, AscendDualCopyL0cToUb),
+                ) and param.name == "src":
                     if buf_type.storage is StorageKind.TMEM:
                         roles.add("l0c")
 
@@ -768,6 +810,8 @@ def extract_tir_loop_problem(
             ):
                 issue_after.append((after_id, intent.task_id))
 
+    has_simtvf = _contains_simtvf(fn_stmt if fn_stmt is not None else loop.body)
+    unreserved = unreserved_ubuf or spec.origin == "simdvf_unreserved"
     problem = tf_adapter(
         {
             "tasks": tuple(tasks),
@@ -775,7 +819,11 @@ def extract_tir_loop_problem(
             "buffers": tuple(buffers),
             "reuses": tuple(reuses),
             "resources": _resources_for_tasks(tasks),
-            "capacities": _capacities_from_facts(facts),
+            "capacities": _capacities_from_facts(
+                facts,
+                has_simtvf=has_simtvf,
+                unreserved_ubuf=unreserved,
+            ),
             "max_stage": max_stage,
             "manual": manual,
             "issue_after": tuple(issue_after),

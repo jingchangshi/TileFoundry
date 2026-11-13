@@ -88,14 +88,21 @@ value = 262144
 unit = "byte"
 origin = "vendor"
 source = "CANN dav-3510 hardware platform specification"
-conditions = "256 KiB hardware Unified Buffer per AIV core"
+conditions = "256 KiB hardware Unified Buffer per AIV core (reachable in spill-free pure SimdVF with --cce-disable-vf-stack-reserved-ubuf and --cce-disable-asc-reserved-ubuf)"
+
+[facts.memory.ub.simdvf_usable_per_aiv]
+value = 253952
+unit = "byte"
+origin = "measured"
+source = "Ascend 950PR dav-3510 UB layout and TileLang GetSharedMemoryLimit (!HasSimtVF)"
+conditions = "248 KiB default usable UB for pure SimdVF kernels (256 KiB - 6 KiB BISHENG_VF_STACK - 2 KiB ASC_UB_RESERVE, zero SIMT Data Cache carveout)"
 
 [facts.memory.ub.usable_per_aiv]
 value = 221184
 unit = "byte"
 origin = "vendor"
 source = "TileLang Ascend dav-3510 SIMT/runtime usable UB budget"
-conditions = "216 KiB usable UB after reserving runtime/SIMT scratch state"
+conditions = "216 KiB usable UB when SimtVF carves out 32 KiB minimum SIMT Data Cache alongside stack and runtime reserves"
 
 [facts.memory.rmem.per_lane]
 value = 256

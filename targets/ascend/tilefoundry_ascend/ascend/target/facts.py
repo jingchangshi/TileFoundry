@@ -6,12 +6,20 @@ from dataclasses import dataclass
 
 from tilefoundry.analysis.facts import (
     ExplicitMemoryLevelFacts,
+    ImplicitMemoryLevelFacts,
     MemoryHierarchyFacts,
+    MemoryLevelRelation,
+    MemoryRelationKind,
     PerformanceServiceFacts,
     ThroughputFacts,
 )
 from tilefoundry.ir.types import DType
 from tilefoundry.target.base import UnsupportedCapabilityError
+
+PURE_SIMDVF_UBUF_FLAGS: tuple[str, str] = (
+    "--cce-disable-vf-stack-reserved-ubuf",
+    "--cce-disable-asc-reserved-ubuf",
+)
 
 
 @dataclass(frozen=True)
@@ -20,6 +28,8 @@ class AscendSpaceFacts:
 
     ub_nominal_bytes: int
     ub_usable_bytes: int
+    ub_simdvf_usable_bytes: int
+    ub_simtvf_usable_bytes: int
     l1_bytes: int
     l0a_bytes: int
     l0b_bytes: int
@@ -29,6 +39,16 @@ class AscendSpaceFacts:
     l0a_align_bytes: int
     l0b_align_bytes: int
     l0c_align_bytes: int
+
+    def ub_limit_bytes(self, mode: str = "simdvf", *, unreserved_ubuf: bool = False) -> int:
+        """Return mode-specific UB budget in bytes for SimdVF vs SimtVF execution."""
+        if mode in ("simtvf", "ascend.simtvf", "mixed"):
+            return self.ub_simtvf_usable_bytes
+        if mode == "simdvf_unreserved":
+            return self.ub_nominal_bytes
+        if mode in ("simdvf", "ascend.simdvf"):
+            return self.ub_nominal_bytes if unreserved_ubuf else self.ub_simdvf_usable_bytes
+        raise ValueError(f"unsupported Ascend UB mode: {mode!r}")
 
     def limit_bytes(self, space: str) -> int | None:
         """Return capacity limit in bytes for an Ascend scratchpad space."""
@@ -41,13 +61,29 @@ class AscendSpaceFacts:
         }.get(space)
 
 
-def ascend_space_facts(target) -> AscendSpaceFacts:
+def _select_ub_bytes(target, query: object = None, *, default_simdvf: bool = False) -> int:
+    dev = target.device
+    if query is None:
+        return dev.ub_simdvf_usable_bytes_per_aiv if default_simdvf else dev.ub_usable_bytes_per_aiv
+    mode = str(query)
+    if mode in ("simtvf", "ascend.simtvf", "mixed"):
+        return dev.ub_usable_bytes_per_aiv
+    if mode in ("simdvf", "ascend.simdvf"):
+        return dev.ub_simdvf_usable_bytes_per_aiv
+    if mode == "simdvf_unreserved":
+        return dev.ub_nominal_bytes_per_aiv
+    raise UnsupportedCapabilityError(f"ascend: unsupported UB query {query!r}")
+
+
+def ascend_space_facts(target, query: object = None) -> AscendSpaceFacts:
     """Project per-core on-chip space limits and alignment constraints."""
     arch = target.architecture
     dev = target.device
     return AscendSpaceFacts(
         ub_nominal_bytes=dev.ub_nominal_bytes_per_aiv,
-        ub_usable_bytes=dev.ub_usable_bytes_per_aiv,
+        ub_usable_bytes=_select_ub_bytes(target, query, default_simdvf=False),
+        ub_simdvf_usable_bytes=dev.ub_simdvf_usable_bytes_per_aiv,
+        ub_simtvf_usable_bytes=dev.ub_usable_bytes_per_aiv,
         l1_bytes=dev.l1_bytes_per_aic,
         l0a_bytes=dev.l0a_bytes_per_aic,
         l0b_bytes=dev.l0b_bytes_per_aic,
@@ -61,10 +97,10 @@ def ascend_space_facts(target) -> AscendSpaceFacts:
 
 
 def memory_hierarchy(target, query: object = None) -> MemoryHierarchyFacts:
-    """Return the explicit Ascend memory levels owned by target/aic/aiv/lane."""
-    del query
+    """Return explicit/implicit Ascend memory levels and UB/SIMT-DCache sharing edge."""
     arch = target.architecture
     dev = target.device
+    smem_capacity = _select_ub_bytes(target, query, default_simdvf=True)
     tmem_bytes = (
         dev.l1_bytes_per_aic
         + dev.l0a_bytes_per_aic
@@ -93,7 +129,7 @@ def memory_hierarchy(target, query: object = None) -> MemoryHierarchyFacts:
             ),
             ExplicitMemoryLevelFacts(
                 name="smem",
-                capacity_bytes=dev.ub_usable_bytes_per_aiv,
+                capacity_bytes=smem_capacity,
                 scope="aiv",
                 owner=arch.smem_owner,
             ),
@@ -104,8 +140,26 @@ def memory_hierarchy(target, query: object = None) -> MemoryHierarchyFacts:
                 owner=arch.rmem_owner,
             ),
         ),
-        implicit_levels=(),
-        relations=(),
+        implicit_levels=(
+            ImplicitMemoryLevelFacts(
+                name="simt_dcache",
+                capacity_bytes=None,
+                scope="aiv",
+            ),
+        ),
+        relations=(
+            MemoryLevelRelation(
+                kind=MemoryRelationKind.CACHES,
+                near="simt_dcache",
+                far="gmem",
+            ),
+            MemoryLevelRelation(
+                kind=MemoryRelationKind.SHARES_CAPACITY_WITH,
+                near="simt_dcache",
+                far="smem",
+                shared_capacity_bytes=dev.ub_nominal_bytes_per_aiv,
+            ),
+        ),
     )
 
 
@@ -176,6 +230,7 @@ def performance_service(target, query: object = None) -> PerformanceServiceFacts
 
 
 __all__ = [
+    "PURE_SIMDVF_UBUF_FLAGS",
     "AscendSpaceFacts",
     "ascend_space_facts",
     "memory_hierarchy",
