@@ -1,0 +1,116 @@
+[spec]
+schema = "tilefoundry.ascend.architecture/v2"
+kind = "architecture"
+id = "ascend.davinci_950"
+
+[facts.identity.name]
+value = "dav_3510"
+unit = "name"
+origin = "vendor"
+source = "CANN dav-3510 (DaVinci 950) compiler target specification"
+conditions = "Architecture triple name recognized by bisheng and tilelang Ascend backends"
+
+[facts.capabilities]
+value = ["ascend.dma", "ascend.mmad", "ascend.vector", "ascend.dual_copy"]
+unit = "name"
+origin = "vendor"
+source = "CANN dav-3510 ISA family capabilities"
+conditions = "Instruction families selectable by Ascend target scheduling and lowering"
+
+[facts.instruction.compute_dtypes]
+value = ["f16", "bf16", "f32"]
+unit = "name"
+origin = "vendor"
+source = "CANN dav-3510 Cube and Vector instruction reference"
+conditions = "Cube accepts f16/bf16 inputs into f32 accumulator; Vector operates on f16/bf16/f32"
+
+[facts.compute.aic_per_block]
+value = 1
+unit = "count"
+origin = "vendor"
+source = "Ascend DaVinci coupled AIC/AIV block organization"
+conditions = "Each logical execution block pairs 1 AI Cube core with 2 AI Vector cores"
+
+[facts.compute.aiv_per_block]
+value = 2
+unit = "count"
+origin = "vendor"
+source = "Ascend DaVinci coupled AIC/AIV block organization"
+conditions = "Two AIV cores per block share cross-core communication with one AIC core"
+
+[facts.compute.vector_lanes_f32]
+value = 64
+unit = "count"
+origin = "vendor"
+source = "CANN dav-3510 256-byte vector register file"
+conditions = "256 B vector unit width yields 64 fp32 lanes per SIMD vector issue"
+
+[facts.compute.max_simt_threads_per_aiv]
+value = 1024
+unit = "count"
+origin = "vendor"
+source = "Ascend 950PR SIMT execution mode documentation"
+conditions = "Upper bound on SIMT virtual threads inside a single AIV T.SimtVF scope"
+
+[facts.memory.ub.align_bytes]
+value = 32
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 Unified Buffer hardware constraint"
+conditions = "32-byte alignment required for UB vector slices and MTE transfers"
+
+[facts.memory.l1.align_bytes]
+value = 32
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 L1 scratchpad hardware constraint"
+conditions = "32-byte transfer granularity between GM/UB and L1"
+
+[facts.memory.l0a.align_bytes]
+value = 512
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 Cube L0A fractal buffer constraint"
+conditions = "16x16 fractal matrix alignment for L1 to L0A load"
+
+[facts.memory.l0b.align_bytes]
+value = 512
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 Cube L0B fractal buffer constraint"
+conditions = "16x16 fractal matrix alignment for L1 to L0B load"
+
+[facts.memory.l0c.align_bytes]
+value = 512
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 Cube L0C accumulator buffer constraint"
+conditions = "16x16 fp32 fractal accumulator alignment for MMAD and Fixpipe"
+
+[facts.memory.tmem.owner]
+value = "aic"
+unit = "name"
+origin = "vendor"
+source = "CANN dav-3510 on-chip matrix hierarchy"
+conditions = "L1, L0A, L0B, and L0C matrix buffers belong to one AIC unit"
+
+[facts.memory.smem.owner]
+value = "aiv"
+unit = "name"
+origin = "vendor"
+source = "CANN dav-3510 Unified Buffer ownership"
+conditions = "Unified Buffer belongs privately to each AIV core"
+
+[facts.memory.rmem.owner]
+value = "lane"
+unit = "name"
+origin = "vendor"
+source = "CANN dav-3510 vector lane register ownership"
+conditions = "Per-lane scalar and vector registers belong to one vector lane"
+
+[facts.geometry.cube_mmad_atom]
+value = "16x16x16"
+unit = "element"
+origin = "vendor"
+source = "CANN dav-3510 Cube MMAD fractal geometry"
+conditions = "16x16x16 f16/bf16 matrix multiply-accumulate per fractal atom"
