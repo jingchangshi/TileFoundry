@@ -1,24 +1,22 @@
-# TileFoundry Ascend targets
+# TileFoundry Ascend Target 插件
 
-`tilefoundry-ascend` provides the `ascend` target (including Ascend 950PR /
-DaVinci 950 architecture and device models, Ascend TIR instructions, and
-Z3 modulo pipeline verification passes) for TileFoundry.
+`tilefoundry-ascend` 为 TileFoundry 提供 `ascend` 目标后端支持，涵盖 Ascend 950PR / DaVinci 950 架构与设备建模、Ascend TIR 指令集以及基于 Z3 的 Modulo 流水线求解与验证 Pass。
 
-## Installation
+## 安装方式
 
 ```sh
 python -m pip install -e . -e targets/ascend
 ```
 
-## Package Layout
+## 包结构说明
 
-- `tilefoundry_ascend.ascend.target`: Document-backed `DaVinci950` architecture (`dav_3510`), `Ascend950PR` device model, `AscendTarget`, and hardware fact projections (`TopologyFacts`, `MemoryHierarchyFacts`, `AscendSpaceFacts`, `ThroughputFacts`, `PerformanceServiceFacts`).
-- `tilefoundry_ascend.ascend.ir`: `SimdVF` and `SimtVF` execution mode declarations plus 20 registered `T.ascend_*` TIR operations with type inference, ISL access relations, CPU schedule evaluation, and statement verifiers.
-- `tilefoundry_ascend.ascend.visitor_registry`: Target-scoped HIR-to-TIR candidate bindings for `MatMul`, `Cast`, and `Reshard`.
-- `tilefoundry_ascend.ascend.schedule`: Z3 modulo pipeline constraint projection and solver (`pipeline_solver.py`) modeling loop-carried dependencies, 2-AIV UB splitting, and hardware cycle quanta.
-- `tilefoundry_ascend.ascend.passes`: `ValidateAscendPipelines` (`BEFORE_LOWER`) and `ResolveAscendPipelines` (`AFTER_LOWER`) module passes.
+- `tilefoundry_ascend.ascend.target`：文档驱动的 `DaVinci950`（`dav_3510`）架构模型、`Ascend950PR` 设备模型、`AscendTarget` 组合目标及硬件 Facts 投影（`TopologyFacts`、`MemoryHierarchyFacts`、`AscendSpaceFacts`、`ThroughputFacts`、`PerformanceServiceFacts`）。
+- `tilefoundry_ascend.ascend.ir`：`SimdVF` 与 `SimtVF` 执行模式声明，以及 20 条内置 `typeinfer`、ISL `access_relation`、CPU 模拟求值和语句校验的 `T.ascend_*` TIR 指令。
+- `tilefoundry_ascend.ascend.visitor_registry`：面向 `MatMul`、`Cast` 与 `Reshard` 的目标感知 HIR->TIR 候选指令绑定。
+- `tilefoundry_ascend.ascend.schedule`：Z3 Modulo 流水线约束投影与求解器（`pipeline_solver.py`），支持循环携带依赖抽取、双 AIV UB 切分与硬件周期延迟估算。
+- `tilefoundry_ascend.ascend.passes`：面向 `AscendTarget` 的 `ValidateAscendPipelines`（`BEFORE_LOWER`）与 `ResolveAscendPipelines`（`AFTER_LOWER`）模块 Pass。
 
-## Documentation
+## 相关文档
 
-- [Ascend 950PR Architecture and MLA E2E Guide](../../docs/reports/ascend950pr_architecture_and_e2e.md)
-- [Ascend 950PR SimdVF Optimization Report](../../docs/reports/ascend950pr_adaptation.md)
+- [Ascend 950PR 总体架构与 MLA 端到端流程指南](../../docs/reports/ascend950pr_architecture_and_e2e.md)
+- [Ascend 950PR 适配与 SimdVF 性能优化报告](../../docs/reports/ascend950pr_adaptation.md)

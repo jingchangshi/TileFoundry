@@ -1,53 +1,53 @@
-# Ascend 950PR Adaptation and SimdVF Optimization Report
+# Ascend 950PR 适配与 SimdVF 性能优化报告
 
-> For the full three-layer target architecture, core design decisions, and MLA end-to-end compilation walkthrough, see [ascend950pr_architecture_and_e2e.md](./ascend950pr_architecture_and_e2e.md).
+> 关于三层目标架构、核心设计决策及 MLA 端到端（E2E）编译流程的完整说明，请参阅 [ascend950pr_architecture_and_e2e.md](./ascend950pr_architecture_and_e2e.md)。
 
-## 1. Architecture Summary
+## 1. 架构演进摘要
 
-This adaptation completes the migration of the Ascend 950PR `attention_residual` and `mla` operator stacks from functional `SimtVF` execution to high-performance `SimdVF` vector/cube execution across all three layers:
+本次改造完成了 Ascend 950PR 上 `attention_residual` 与 `mla` 算子栈从功能正确的 `SimtVF` 向高性能 `SimdVF` Vector/Cube 协同执行的三层全链路迁移：
 
-1. **Layer 1: Target Execution Kind & Loop-Carried Z3 Pipeline Solver**
-   - `targets/ascend/tilefoundry_ascend/ascend/ir/execution.py`: Added `SIMDVF_KIND` / `SimdVF` alongside `SIMTVF_KIND` / `SimtVF` to represent 2-AIV SIMD vector execution.
-   - `targets/ascend/tilefoundry_ascend/ascend/ir/tir/instructions.py`: Bound Ascend TIR vector instructions to `ascend.simdvf`.
-   - `targets/ascend/tilefoundry_ascend/ascend/schedule/pipeline_solver.py`: Extended the Z3 pipeline solver with `SIMDVF_KIND` support, loop-carried `distance=1` dependency extraction, `fixed=1` accumulator buffer pinning, byte/FLOP cycle cost estimation, and 2-AIV UB footprint splitting.
-   - Fixed loop-collection handling for `StmtVisitor.visit_For` and added unit tests in `tests/ascend/ir/test_instructions_and_candidates.py` and `tests/ascend/passes/test_pipeline_solver.py`.
+1. **Layer 1：目标执行模式与跨迭代 Z3 流水求解器**
+   - `targets/ascend/tilefoundry_ascend/ascend/ir/execution.py`：在 `SIMTVF_KIND` / `SimtVF` 之外新增 `SIMDVF_KIND` / `SimdVF`，建模双 AIV SIMD 向量执行模式。
+   - `targets/ascend/tilefoundry_ascend/ascend/ir/tir/instructions.py`：将 Ascend TIR 向量指令绑定至 `ascend.simdvf`。
+   - `targets/ascend/tilefoundry_ascend/ascend/schedule/pipeline_solver.py`：扩展 Z3 流水求解器以支持 `SIMDVF_KIND`、循环携带 `distance=1` 依赖抽取、`fixed=1` 累加缓冲锁定、字节/FLOP 周期估算以及双 AIV UB 占用折半计算。
+   - 修复 `StmtVisitor.visit_For` 的循环收集处理逻辑，并在 `tests/ascend/ir/test_instructions_and_candidates.py` 与 `tests/ascend/passes/test_pipeline_solver.py` 补充单元测试。
 
-2. **Layer 2: Single-Pass Online Softmax HIR & Lowered TIR**
-   - `examples/ascend950pr_ops/attention_residual/scheduled.py`: Migrated to `T.SimdVF()`, `Mesh(("aiv",), (2,), names=("v",))`, and a single-pass online softmax formulation (`m_ub`, `l_ub`, `acc_ub`), eliminating intermediate `scores_gm` / `probs_gm` global memory round-trips and the second reduction pass. In the lowered `forward:n` pipeline, `acc_ub`, `m_ub`, and `l_ub` are pinned to `1` while `v_ub` uses version `2`.
-   - `examples/ascend950pr_ops/mla/scheduled.py`: Migrated to `T.SimdVF()`, `Mesh(("aiv",), (2,), names=("v",))`, and a single-loop Online FlashMLA Mix pipeline without `scores_gm`, pinning `o_acc_ub`, `m_ub`, and `l_ub` to `1` across `forward:kt`.
-   - Regenerated `examples/ascend950pr_ops/attention_residual/tir/attention_residual.py` and `examples/ascend950pr_ops/mla/tir/mla.py` via `finalize()` + `as_script()` with zero `SimtVF` / `simtvf` references.
+2. **Layer 2：单遍 Online Softmax HIR 与 Lowered TIR**
+   - `examples/ascend950pr_ops/attention_residual/scheduled.py`：迁移至 `T.SimdVF()`、`Mesh(("aiv",), (2,), names=("v",))` 与单遍 online softmax（`m_ub`、`l_ub`、`acc_ub`），消除中间 `scores_gm` / `probs_gm` 全局内存往返及第二轮归约循环。下沉后的 `forward:n` 流水线将 `acc_ub`、`m_ub`、`l_ub` 锁定为版本 `1`，`v_ub` 分配为版本 `2`。
+   - `examples/ascend950pr_ops/mla/scheduled.py`：迁移至 `T.SimdVF()`、`Mesh(("aiv",), (2,), names=("v",))` 与无 `scores_gm` 的单循环 Online FlashMLA Mix 流水线，`forward:kt` 中 `o_acc_ub`、`m_ub`、`l_ub` 均锁定为版本 `1`。
+   - 通过 `finalize()` + `as_script()` 重新生成 `examples/ascend950pr_ops/attention_residual/tir/attention_residual.py` 与 `examples/ascend950pr_ops/mla/tir/mla.py`，全面消除 `SimtVF` / `simtvf`。
 
-3. **Layer 3: Production TileLang NPU Kernels (`kernels.py`)**
-   - `examples/ascend950pr_ops/attention_residual/kernels.py`: Single-pass `T.SimdVF()` + `T.simd.*` vectorization across 56 cores with per-core `kw_ub`, `T.dynamic("m_rows")` / `T.dynamic("v_rows")` shape reuse, `enable_offset=True` in `tuned` mode, and masked `rem * 2` (`b16`) / `MODE_MERGING` `vmula` tail handling (`D=2047`, `D=1000`).
-   - `examples/ascend950pr_ops/mla/kernels.py`: Pure `T.SimdVF()` + `T.simd.*` (zero `SimtVF`), DMA `Q` / `Out` transfers, `T.dynamic` (`b_dim`, `q_total_rows`, `s_kv`), causal block pruning, adaptive `bm=64` tile selection when `schedule_mode == "tuned" and q_rows >= 64 and (b_dim * n_kv * m_tiles_64) >= 14`, and `enable_offset=True` with on-chip scratch buffers (`p_l1`, `S_ub`, `P_ub`, `O_tmp0_ub`, `O_tmp1_ub`) pinned to `1` so HBM-to-L1 KV buffers (`k_nope_l1`, `k_rope_l1`, `v0_l1`, `v1_l1`) multi-buffer cleanly.
+3. **Layer 3：生产级 TileLang NPU 内核（`kernels.py`）**
+   - `examples/ascend950pr_ops/attention_residual/kernels.py`：56 核并行单遍 `T.SimdVF()` + `T.simd.*` 向量化，支持单核驻留 `kw_ub`、`T.dynamic("m_rows")` / `T.dynamic("v_rows")` 缓存复用、`tuned` 模式启用 `enable_offset=True`，以及针对非对齐尾块的 `rem * 2`（`b16`）与 `MODE_MERGING` `vmula` 处理（覆盖 `D=2047`、`D=1000`）。
+   - `examples/ascend950pr_ops/mla/kernels.py`：纯 `T.SimdVF()` + `T.simd.*`（零 `SimtVF`），DMA 搬运 `Q` / `Out`，采用 `T.dynamic`（`b_dim`、`q_total_rows`、`s_kv`）、因果块剪枝、在 `schedule_mode == "tuned" and q_rows >= 64 and (b_dim * n_kv * m_tiles_64) >= 14` 时自适应启用 `bm=64`，并在 `enable_offset=True` 下将片上暂存缓冲（`p_l1`、`S_ub`、`P_ub`、`O_tmp0_ub`、`O_tmp1_ub`）版本锁定为 `1`，确保 HBM-to-L1 的 KV 缓冲（`k_nope_l1`、`k_rope_l1`、`v0_l1`、`v1_l1`）稳定多缓冲。
 
-## 2. Verification Summary
+## 2. 验证结果汇总
 
-- **Ascend Target / IR / Passes Unit Tests**:
-  `pytest tests/ascend/target tests/ascend/ir tests/ascend/passes -v` -> **25 passed** (1.97s).
-- **HIR-to-TIR Operator Workflow & Zero-SimtVF Gate**:
-  `pytest tests/ascend/operators/test_hir_tir_workflow.py -v` -> **4 passed** (5.34s), including `test_zero_simtvf_in_scheduled_tir_and_kernels`.
-- **Full NPU Acceptance Suite (NPU 0)**:
-  `pytest tests/ascend/benchmarks/test_npu_acceptance.py -v` -> **5 passed** (465.58s, 0 skipped, 0 failed):
+- **Ascend Target / IR / Passes 单元测试**：
+  `pytest tests/ascend/target tests/ascend/ir tests/ascend/passes -v` -> **25 passed**（1.97s）。
+- **HIR->TIR 工作流与零 `SimtVF` 门禁测试**：
+  `pytest tests/ascend/operators/test_hir_tir_workflow.py -v` -> **4 passed**（5.34s），包含 `test_zero_simtvf_in_scheduled_tir_and_kernels`。
+- **NPU 0 全量验收测试集**：
+  `pytest tests/ascend/benchmarks/test_npu_acceptance.py -v` -> **5 passed**（465.58s，0 跳过、0 失败）：
   - `test_attention_residual_cannbench_cases`
   - `test_attention_residual_baseline_vs_tuned_parity`
   - `test_mla_cannbench_cases`
   - `test_mla_supplemental_cases`
   - `test_dynamic_shape_kernel_cache_reuse`
-- **CPU Suite**:
-  `pytest tests/ascend/target tests/ascend/ir tests/ascend/passes tests/ascend/operators tests/core tests/tilefoundry tests/apple -k "not test_repository_clean"` -> **819 passed, 1 deselected** (22.74s). Note: without `-k "not test_repository_clean"`, `tests/core/scripts/test_machine_paths_lint.py::test_repository_clean` fails (`819 passed, 1 failed`, 23.77s) due to pre-existing unmodified `DEFAULT_ROOT` in `tests/ascend/benchmarks/cannbench_contract.py`.
-- **Modified File Lints**:
-  `scripts/comment_hygiene_lint.py`, `scripts/forward_references_lint.py`, `scripts/english_only_lint.py`, and `scripts/no_machine_paths_lint.py` all exited with code 0 (0 violations).
+- **CPU 测试集**：
+  `pytest tests/ascend/target tests/ascend/ir tests/ascend/passes tests/ascend/operators tests/core tests/tilefoundry tests/apple -k "not test_repository_clean"` -> **819 passed, 1 deselected**（22.74s）。注：若不加 `-k "not test_repository_clean"`，仅 `tests/core/scripts/test_machine_paths_lint.py::test_repository_clean` 因原封未动的 `tests/ascend/benchmarks/cannbench_contract.py` 中预存 `DEFAULT_ROOT` 而失败（`819 passed, 1 failed`，23.77s）。
+- **代码文件静态检查**：
+  `scripts/comment_hygiene_lint.py`、`scripts/forward_references_lint.py`、`scripts/english_only_lint.py` 与 `scripts/no_machine_paths_lint.py` 对全部 13 个代码/测试修改文件检查均返回 `0`（0 违规）。
 
-## 3. Kernel Cache Reuse & Wall-Clock Benchmarks (NPU 0)
+## 3. 内核缓存复用与实测时延对比（NPU 0）
 
-With `T.dynamic` symbolic dimensions enabled in `tuned` mode:
-- **Attention Residual**: `_KERNEL_CACHE` compiled **19** kernels across **20** cannbench cases.
-- **MLA**: `_KERNEL_CACHE` compiled **13** kernels across **20** cannbench cases.
+在 `tuned` 模式下启用 `T.dynamic` 符号维度后：
+- **Attention Residual**：20 个 cannbench 用例下 `_KERNEL_CACHE` 累计编译 **19** 个内核。
+- **MLA**：20 个 cannbench 用例下 `_KERNEL_CACHE` 累计编译 **13** 个内核。
 
-### 3.1 Attention Residual (`baseline` vs `tuned`, vs Prior `SimtVF` `tuned`)
+### 3.1 Attention Residual（`baseline` vs `tuned`，对比原 `SimtVF` `tuned`）
 
-| Case | Shape `[B, N, M, D]` (bf16) | Prior SimtVF Tuned (ms) | SimdVF Baseline Med (ms) | SimdVF Tuned Med (ms) | Tuned Mean (ms) | Speedup vs Baseline | Speedup vs SimtVF | Bandwidth (GB/s) |
+| 用例 | Shape `[B, N, M, D]` (bf16) | 原 SimtVF Tuned (ms) | SimdVF Baseline 中位 (ms) | SimdVF Tuned 中位 (ms) | Tuned 均值 (ms) | 相对 Baseline 加速 | 相对 SimtVF 加速 | 有效带宽 (GB/s) |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | Case 1 | `[4, 1, 128, 2048]` | 0.0246 | 0.0208 | 0.0208 | 0.0216 | 1.00x | 1.18x | 151.4 |
 | Case 7 | `[4, 4, 512, 4096]` | 0.3143 | 0.1464 | 0.0987 | 0.0993 | 1.48x | 3.18x | 1020.3 |
@@ -55,9 +55,9 @@ With `T.dynamic` symbolic dimensions enabled in `tuned` mode:
 | Case 18 | `[4, 8, 512, 7168]` | 0.9418 | 0.3765 | 0.2823 | 0.2832 | 1.33x | 3.34x | 1248.2 |
 | Case 20 | `[32, 1, 1024, 2048]` | 0.6742 | 0.4126 | 0.2262 | 0.2264 | 1.82x | 2.98x | 630.4 |
 
-### 3.2 MLA (`baseline` vs `tuned`, vs Prior `SimtVF` `tuned`)
+### 3.2 MLA（`baseline` vs `tuned`，对比原 `SimtVF` `tuned`）
 
-| Case | Config | Prior SimtVF Tuned (ms) | SimdVF Baseline Med (ms) | SimdVF Tuned Med (ms) | Tuned Mean (ms) | Speedup vs Baseline | Speedup vs SimtVF | Throughput / BW |
+| 用例 | 配置规格 | 原 SimtVF Tuned (ms) | SimdVF Baseline 中位 (ms) | SimdVF Tuned 中位 (ms) | Tuned 均值 (ms) | 相对 Baseline 加速 | 相对 SimtVF 加速 | 算力 / 带宽 |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
 | `level4/mla_1` | `q=[2,128,128,512] k=[2,128,1,512]` BSND/causal/fp16 | 1.1652 | 0.2974 | 0.2775 | 0.2779 | 1.07x | 4.20x | 16.58 TFLOPS, 259.0 GB/s |
 | `level4/mla_2` | `q=[4,256,128,512] k=[4,256,1,512]` BSND/causal/bf16 | 8.6504 | 1.6134 | 1.3459 | 1.3467 | 1.20x | 6.43x | 27.23 TFLOPS, 213.6 GB/s |
@@ -68,11 +68,11 @@ With `T.dynamic` symbolic dimensions enabled in `tuned` mode:
 | `supp/kv_tail` | `q=[1,3,64,448] k=[1,129,2,448]` BSND/causal/bf16 | 0.0565 | 0.0170 | 0.0248 | 0.0259 | 0.69x | 2.28x | 1.90 TFLOPS, 34.8 GB/s |
 | `supp/decode448` | `q=[1,1,128,448] k=[1,128,4,448]` BSND/non-causal/fp16 | 0.0401 | 0.0268 | 0.0249 | 0.0259 | 1.07x | 1.61x | 1.26 TFLOPS, 49.3 GB/s |
 
-*Note*: On small/short-tail shapes (`level4/mla_15` and `supplemental/mla_gqa_bsnd_kv_tail`), `enable_offset=True` overhead slightly exceeds multi-buffering gains over `baseline`, while still achieving >2.1x speedup over the prior `SimtVF` implementation.
+*注*：在 `level4/mla_15` 与 `supplemental/mla_gqa_bsnd_kv_tail` 等小规模/短尾用例上，`enable_offset=True` 的流水线同步开销略高于多缓冲收益（相对 `baseline`），但相较原 `SimtVF` 实现仍保持 2.1x 以上显著加速。
 
-## 4. `msprof` Hardware Profiling (Tuned `SimdVF`)
+## 4. `msprof` 硬件性能画像（Tuned `SimdVF`）
 
-| Operator / Case | Kernel Duration | AIC Metrics | AIV Metrics | Cycles |
+| 算子 / 用例 | 内核耗时 | AIC 指标 | AIV 指标 | 周期数 (Cycles) |
 | :--- | ---: | :--- | :--- | :--- |
 | AR Case 16 (`[8,4,2048,4096]`) | 660.3 us | N/A | `aiv_vec=67.1%`, `aiv_mte2=75.4%`, `aiv_mte3=4.1%` | `aiv_cycles=60154366` |
 | AR Case 20 (`[32,1,1024,2048]`) | 219.0 us | N/A | `aiv_vec=63.8%`, `aiv_mte2=89.5%`, `aiv_mte3=1.5%` | `aiv_cycles=19239980` |
