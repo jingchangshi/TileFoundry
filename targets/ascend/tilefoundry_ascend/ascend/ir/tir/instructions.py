@@ -70,8 +70,8 @@ _DUAL_DST = TensorPattern(
     )
 )
 
-_OUTSIDE_VF = RegionRequirement("ascend.simtvf", "outside")
-_INSIDE_VF = RegionRequirement("ascend.simtvf", "inside")
+_OUTSIDE_VF = RegionRequirement("ascend.simdvf", "outside")
+_INSIDE_VF = RegionRequirement("ascend.simdvf", "inside")
 
 _SAME_SHAPE_DTYPE = (
     SameConstraint("shape", "src", "dst"),
@@ -291,7 +291,7 @@ class AscendDualCopy(Op):
 @register_copy_semantics
 @register_op(dialect="T", category="ascend", name="ascend_ub_to_reg")
 class AscendUbToReg(Op):
-    """Load a vector tile from AIV UB into vector registers inside SimtVF."""
+    """Load a vector tile from AIV UB into vector registers inside SimdVF."""
 
     capability = OpCapability("ascend.vector")
     resource = "vector_engine"
@@ -305,7 +305,7 @@ class AscendUbToReg(Op):
 @register_copy_semantics
 @register_op(dialect="T", category="ascend", name="ascend_reg_to_ub")
 class AscendRegToUb(Op):
-    """Store a vector register tile back to AIV UB inside SimtVF."""
+    """Store a vector register tile back to AIV UB inside SimdVF."""
 
     capability = OpCapability("ascend.vector")
     resource = "vector_engine"
@@ -382,35 +382,35 @@ class _VectorBinaryBase(Op):
 
 @register_op(dialect="T", category="ascend", name="ascend_vadd")
 class AscendVadd(_VectorBinaryBase):
-    """AIV vector addition inside SimtVF."""
+    """AIV vector addition inside SimdVF."""
 
     capability = OpCapability("ascend.vector")
 
 
 @register_op(dialect="T", category="ascend", name="ascend_vsub")
 class AscendVsub(_VectorBinaryBase):
-    """AIV vector subtraction inside SimtVF."""
+    """AIV vector subtraction inside SimdVF."""
 
     capability = OpCapability("ascend.vector")
 
 
 @register_op(dialect="T", category="ascend", name="ascend_vmul")
 class AscendVmul(_VectorBinaryBase):
-    """AIV vector multiplication inside SimtVF."""
+    """AIV vector multiplication inside SimdVF."""
 
     capability = OpCapability("ascend.vector")
 
 
 @register_op(dialect="T", category="ascend", name="ascend_vdiv")
 class AscendVdiv(_VectorBinaryBase):
-    """AIV vector division inside SimtVF."""
+    """AIV vector division inside SimdVF."""
 
     capability = OpCapability("ascend.vector")
 
 
 @register_op(dialect="T", category="ascend", name="ascend_vmax")
 class AscendVmax(_VectorBinaryBase):
-    """AIV vector elementwise maximum inside SimtVF."""
+    """AIV vector elementwise maximum inside SimdVF."""
 
     capability = OpCapability("ascend.vector")
 
@@ -437,14 +437,14 @@ class _VectorUnaryBase(Op):
 
 @register_op(dialect="T", category="ascend", name="ascend_vexp")
 class AscendVexp(_VectorUnaryBase):
-    """AIV vector exponential inside SimtVF."""
+    """AIV vector exponential inside SimdVF."""
 
     capability = OpCapability("ascend.vector")
 
 
 @register_op(dialect="T", category="ascend", name="ascend_vrsqrt")
 class AscendVrsqrt(_VectorUnaryBase):
-    """AIV vector reciprocal square root inside SimtVF."""
+    """AIV vector reciprocal square root inside SimdVF."""
 
     capability = OpCapability("ascend.vector")
 
@@ -455,7 +455,7 @@ _register_unary_semantics(AscendVrsqrt, torch.rsqrt)
 
 @register_op(dialect="T", category="ascend", name="ascend_vcast")
 class AscendVcast(Op):
-    """AIV vector register dtype conversion inside SimtVF."""
+    """AIV vector register dtype conversion inside SimdVF."""
 
     capability = OpCapability("ascend.vector")
     resource = "vector_engine"
@@ -498,7 +498,7 @@ def _verify_vcast(call: Call, ctx) -> None:
 
 
 class _VectorReduceBase(Op):
-    """Shared structure for AIV vector reductions inside SimtVF."""
+    """Shared structure for AIV vector reductions inside SimdVF."""
 
     capability = OpCapability("ascend.vector")
     resource = "vector_engine"
@@ -513,14 +513,14 @@ class _VectorReduceBase(Op):
 
 @register_op(dialect="T", category="ascend", name="ascend_vreduce_sum")
 class AscendVreduceSum(_VectorReduceBase):
-    """AIV vector sum reduction inside SimtVF."""
+    """AIV vector sum reduction inside SimdVF."""
 
     capability = OpCapability("ascend.vector")
 
 
 @register_op(dialect="T", category="ascend", name="ascend_vreduce_max")
 class AscendVreduceMax(_VectorReduceBase):
-    """AIV vector max reduction inside SimtVF."""
+    """AIV vector max reduction inside SimdVF."""
 
     capability = OpCapability("ascend.vector")
 

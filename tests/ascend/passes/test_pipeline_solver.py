@@ -22,11 +22,27 @@ from tilefoundry.vendor.tilelang_z3 import (
     verify_assignment,
 )
 from tilefoundry_ascend.ascend.schedule import (
+    extract_tir_loop_problem,
     solve_ascend_pipeline,
     validate_pipeline_spec,
 )
 from tilefoundry_ascend.ascend.schedule.pipeline_solver import build_resolved_spec
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
+from tilefoundry.ir.tir.stmts import For
+from tilefoundry.ir.visitor import StmtVisitor, walk_prim_function
+
+
+def _collect_pipelined_loops(fn) -> list[For]:
+    loops: list[For] = []
+
+    class _Visitor(StmtVisitor):
+        def visit_For(self, stmt: For) -> None:
+            if stmt.pipeline is not None:
+                loops.append(stmt)
+            self.generic_visit(stmt)
+
+    walk_prim_function(_Visitor(), fn)
+    return loops
 
 HEADER = (
     "from __future__ import annotations\n\n"
@@ -332,7 +348,7 @@ class M:
             for k in tf.pipelined(4, max_stage=2, max_buffer_versions=2, enable_offset=True):
                 a_ub = tf.schedule((a[k, :], tf.empty(Tensor[(64,), "f32", "smem"])), op=T.ascend_gm_to_ub())
                 b_ub = tf.schedule((b[k, :], tf.empty(Tensor[(64,), "f32", "smem"])), op=T.ascend_gm_to_ub())
-                with T.SimtVF():
+                with T.SimdVF():
                     ar = tf.schedule((a_ub, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_ub_to_reg())
                     br = tf.schedule((b_ub, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_ub_to_reg())
                     cr = tf.schedule((ar, br, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_vadd())
@@ -357,3 +373,85 @@ class M:
     printed = as_script(lowered)
     assert "tf.pipelined(" in printed
     assert f"fixed_ii={record['ii']}" in printed
+    assert any(edge_task.startswith("t") and "simdvf" in edge_task for edge_task in record["stages"])
+
+
+def test_loop_carried_accumulator_emits_distance_one_and_pins_version(tmp_path: pathlib.Path):
+    body = """
+@module(entry="accum_loop", target=AscendTarget("ascend.950pr"), topologies=TOPOS)
+class M:
+    @func
+    def accum_loop(v: Tensor[(4, 64, 128), "f32"]) -> Tensor[(64, 128), "f32"]:
+        with Mesh(("aiv",), (1,), names=("v",)) as _v:
+            acc_ub = tf.zeros(Tensor[(64, 128), "f32", "smem"])
+            for k in tf.pipelined(4, max_stage=2, max_buffer_versions=2, enable_offset=True):
+                v_tile = tf.reshape(v[k, :, :], new_shape=(64, 128))
+                v_ub = tf.schedule((v_tile, tf.empty(Tensor[(64, 128), "f32", "smem"])), op=T.ascend_gm_to_ub())
+                with T.SimdVF():
+                    vr = tf.schedule((v_ub, tf.empty(Tensor[(64, 128), "f32", "rmem"])), op=T.ascend_ub_to_reg())
+                    ar = tf.schedule((acc_ub, tf.empty(Tensor[(64, 128), "f32", "rmem"])), op=T.ascend_ub_to_reg())
+                    sr = tf.schedule((ar, vr, tf.empty(Tensor[(64, 128), "f32", "rmem"])), op=T.ascend_vadd())
+                    acc_ub = tf.schedule((sr, tf.empty(Tensor[(64, 128), "f32", "smem"])), op=T.ascend_reg_to_ub())
+            return tf.schedule((acc_ub, tf.empty(Tensor[(64, 128), "f32", "gmem"])), op=T.ascend_ub_to_gm())
+"""
+    path = tmp_path / "accum_loop.py"
+    path.write_text(HEADER + "\n" + body, encoding="utf-8")
+    mod = load_authored_ir(f"{path}:M")
+    authored = mod.entry_function()
+    checked_mod, checked_fn = check_program(mod, authored)
+    analyzed = analyze(checked_mod, checked_fn, analysis="memory")
+    lowered = finalize(analyzed, authored=authored)
+
+    fn = lowered.entry_function()
+    loops = _collect_pipelined_loops(fn)
+    assert len(loops) == 1
+    problem, _ = extract_tir_loop_problem(loops[0], fn_stmt=fn.body)
+    d1_edges = [e for e in problem.edges if e.distance == 1]
+    assert d1_edges, "expected loop-carried distance=1 edge on acc_ub"
+    simdvf_task = next(t for t in problem.tasks if "simdvf" in t.name)
+    assert simdvf_task.latency > 1
+    assert any(e.src == simdvf_task.name and e.dst == simdvf_task.name and e.latency == simdvf_task.latency for e in d1_edges)
+
+    pipelines = lowered.metadata["ascend.pipelines"]
+    rec = pipelines["accum_loop:k"]
+    assert rec["ii"] >= simdvf_task.latency
+    assert rec["versions"]["acc_ub"] == 1
+    scratch_versions = [v for k, v in rec["versions"].items() if k != "acc_ub"]
+    assert any(v == 2 for v in scratch_versions)
+
+
+def test_aiv2_mesh_splits_ub_footprint_and_cost_model_scales(tmp_path: pathlib.Path):
+    """Verify 2-AIV mesh splits UB footprint (153600 B / 2 = 76800 B) and scales latency."""
+    body = """
+@module(entry="aiv2_add", target=AscendTarget("ascend.950pr"), topologies=TOPOS)
+class M:
+    @func
+    def aiv2_add(x: Tensor[(4, 128, 300), "f32"]) -> Tensor[(4, 128, 300), "f32"]:
+        with Mesh(("aiv",), (2,), names=("v",)) as _v:
+            out = tf.empty(Tensor[(4, 128, 300), "f32", "gmem"])
+            for k in tf.pipelined(4, max_stage=2, max_buffer_versions=2, enable_offset=True):
+                xt = tf.reshape(x[k, :, :], new_shape=(128, 300))
+                x_ub = tf.schedule((xt, tf.empty(Tensor[(128, 300), "f32", "smem"])), op=T.ascend_gm_to_ub())
+                with T.SimdVF():
+                    xr = tf.schedule((x_ub, tf.empty(Tensor[(128, 300), "f32", "rmem"])), op=T.ascend_ub_to_reg())
+                    yr = tf.schedule((xr, xr, tf.empty(Tensor[(128, 300), "f32", "rmem"])), op=T.ascend_vadd())
+                    y_ub = tf.schedule((yr, tf.empty(Tensor[(128, 300), "f32", "smem"])), op=T.ascend_reg_to_ub())
+                row_gm = tf.schedule((y_ub, tf.empty(Tensor[(128, 300), "f32", "gmem"])), op=T.ascend_ub_to_gm())
+                out = tf.insert_slice(out, tf.reshape(row_gm, new_shape=(1, 128, 300)), (k, 0, 0))
+            return out
+"""
+    path = tmp_path / "aiv2_add.py"
+    path.write_text(HEADER + "\n" + body, encoding="utf-8")
+    mod = load_authored_ir(f"{path}:M")
+    authored = mod.entry_function()
+    checked_mod, checked_fn = check_program(mod, authored)
+    analyzed = analyze(checked_mod, checked_fn, analysis="memory")
+    lowered = finalize(analyzed, authored=authored)
+
+    fn = lowered.entry_function()
+    loops = _collect_pipelined_loops(fn)
+    problem, _ = extract_tir_loop_problem(loops[0], fn_stmt=fn.body)
+    ub_bufs = [b for b in problem.buffers if b.space == "UB"]
+    assert ub_bufs and all(b.slot_bytes == 76800 for b in ub_bufs)
+    dma_in = next(t for t in problem.tasks if "gm_to_ub" in t.name)
+    assert dma_in.latency == 8
