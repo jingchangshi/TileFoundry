@@ -258,3 +258,32 @@ explorer-g1 自曝并经 Lead 核源文件确认：supplemental 4 条在 registr
 - 校验器同批落盘：删掉 suffix 映射与 `prefix == "mla_supplemental"` 断言（flex-1-g1 实测该断言会对『把 case_id 改成源字面』误杀），改为 source_key/source_case_id 集合逐字相等 + dtype 逐条相等 + 一条反向断言（case_id 是 registry 记录 id，但 source_key 必须被源字段支撑）。
 - 保留 v1 sha256/mtime 一行作历史，draft 仍 true，时间戳标 v2。
 方法教训（新增）：**把缺陷转嫁给下游规则后，修正上游反而先红** —— suffix 映射规则存在时，把 case_id 改成源字面会先撞规则；这使'修复'看起来像'破坏'。私有改名规则不仅有误杀风险，还会**阻止上游被修**。
+
+## R36 v2 独立复算通过 + 校验器一处装饰性字段
+flex-1-g1 独立复算（不采信自述、不写 registry）：registry sha 4a77755e… / 52065B / schema v2 / 44 条 / draft=true，复算期间 mtime 未变。结论：
+- 折叠：从 cann_bench_compare.py 独立 BinOp-aware 重推导，44 条×5 字段×两侧 = **440 检查 0 不符**；dtype_entries 7 行相等；float8_e5m2 末两档仍是字面 1.0（未归一化）。
+- 分布：AR bf16×17+fp16×3 / MLA fp16×15+bf16×5 / suppl bf16×2+fp16×2 = 44。
+- 无通过声明：PASS/通过/数值通过/VERIFIED/certified/DEVICE_VALIDATED 命中全 0；唯一 passed 在否定句。
+- source_key 44 条**全局互异**且逐字等于源 key（40 条 == case_matrix key 集合、4 条 == supplemental key 集合，按各自 source_file 对号 0 例外）；source_case_id 仅 24 distinct（40 int 1..20 重复 + 4 str）⇒ **全局集合断言必错**，per-operator 唯一性成立。
+- v1 历史经 `git show 883117e` 实际字节 sha256 = b25dd485…，与 registry_history 记录相等；v2 的 44 个 case_id 与 v1 逐位相同（未重写历史 id）。
+**残留（真缺陷，已派修）**：篡改 `source_file` 仍返回 VALID —— validate() 只用它做分类，真正读盘走模块级硬编码常量（:413-414），该字段目前是装饰性的。修法二选一：(a) 按每行 source_file 分组读盘；(b) 在 binding_rules 明写其为注记并由校验器断言与固定常量一致。要求不留被忽略的字段（'被忽略'必须变成'被核验'）。
+方法观察：flex-1-g1 期间三次撞上半落盘状态（调用未定义函数、sha 连变 4 次），他没有在抖动期下结论，而是等 20s 内 sha 不变才跑正式套件 —— 这是'瞬时快照 ≠ 持续状态'那条纪律第一次被**主动**执行而不是事后追认。
+
+## R37 环境事实更正：sourced CANN 下 import tilelang 会带入 torch_npu（但不碰计算节点）
+此前多处结论写的是「未 import torch_npu」，**该结论只在 bare 环境下成立**。实测（source /data/pri/cann-9.2.0/ascend-toolkit/set_env.sh 后）：
+- `import tilelang` 会**连带加载 torch_npu**（sys.modules 中存在）；bare 环境不加载。
+- 因此在 test_tl_emit_read 里断言 `'torch_npu' not in sys.modules` 是**环境相关**断言：sourced 下必红，bare 下绿。
+- 关键实测（/tmp/probe_fd.py，sourced 下跑完整链到 compile 成功，compiled=True）：对 /proc/self/fd 做 readlink 集合差，被打开的只有 `['/dev/davinci_manager', '/dev/hisi_hdc']` —— **没有** `/dev/davinci<digits>` 计算节点。
+结论与 R11 已定规则一致：控制节点由 import tilelang 被动打开 ⇒ 只记录；计算节点 ⇒ 拒绝。故该测试应改为断计算节点未打开（AIBIN_PROBE 的 fd 取证法），torch_npu 出现只记录并注明环境，另保留「无 kernel launch / 无 npu 张量操作」这类与环境无关的断言。
+另一个数字事实（sourced）：全量 299 passed / 1 failed（仅上述环境相关断言）；bare 下 300 passed。
+
+## R38 gate 只剩三条，且都是无条件拒绝的残余
+DMA-only 支持落地后，copy_only 跑完整个事务（applied=analyze,resolve,completion,storage,apply,verify；reader VERIFIED），gate 缺项从 10 条降到 **3 条**：
+- chain:TRANSACTION_INCOMPLETE（同批事务尚未收全）；
+- event:TL_EVENT_LOWERING_UNOBSERVED（需 apply 注入事件后由 reader 观察）；
+- install:INSTALL_CANDIDATE_UNVERIFIED（来自 `plan/mainline.py:187` 的**无条件** INSTALL_TL_CONFORMANCE_NOT_IMPLEMENTED，属 R7 形状第四处）。
+裁定：临时授权 flex-4-g3 只改 `plan/mainline.py` 一个文件，把该处改成逐层条件判定（receipt / VERIFIED verdict / ABI / 候选对象同一性，缺哪层点名哪层），**不得删掉 TL conformance 这一层**，只把它从「永不满足」变成「可被真实对象满足」。
+
+## R39 方法账第 9 条定稿（由实现者 10 次同形错误归纳）
+**凡「某侧沉默」或「某条恒等式」，先枚举真实样本再断言；恒等式尤其危险，因为它看起来像定义，实际是假设。**
+10 次实例：TILELANG_CACHE_DIR 猜两次错、二进制目录布局、sibling 层级两次、三角不变量三次、OwnerKey 当字符串、__CCE_KernelArgSize==参数数×8（实测 2 参与 3 参都报 24，恒等式被证伪）。
