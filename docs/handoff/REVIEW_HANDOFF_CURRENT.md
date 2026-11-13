@@ -28,6 +28,8 @@
 - `install_entry` 返回新的 Module；`compile_mainline` 仅返回 record，`passes/p3_chain.py:284-306` 返回原 module。候选是否最终成为下游执行的 entry 尚未闭合。
 - storage gate 在 `passes/p3_chain.py:110-140` 仍将产物存储的 identity 与 record 存储的 identity 比较，尚未独立调用 storage 内容重算；不要将二者相等视为内容未变。
 - native verify 的 receipt 证明其候选验证关系，不等同于“该候选已经 install 到实际下游 module”的 install receipt；当前 gate 从 verifier 登记表查候选 entry，是否足以证明实际安装待审。
+- Reviewer 捕获并复现：`require_export_ready(Module(name="handoff_empty", functions=()), raising=False)` 抛出 `UnboundLocalError`；`p3_chain` 中 `entry` 未赋值。该路径待修复并复验，本交接未自行重跑此复现。
+- 正常测试环境缺少 bisheng 时，`test_s0_gate_positive.py` 的 positive 测试在断言具名工具链阻塞后直接 `return`，不会执行 ready=True 的后续断言；测试显示通过不能作为正向链已经跑通的证据。
 
 ## 已有内容与未完成工作
 
