@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from tilefoundry.ir.core import Call, Expr, Op, Var
@@ -55,7 +56,92 @@ from tilefoundry_ascend.ascend.ir.tir.instructions import (
     AscendUbToGm,
     AscendUbToGmAtomic,
 )
-from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
+from tilefoundry_ascend.ascend.passes.physical_ledger import (
+    ObjectivePhysicalLedger,
+    ScopeWaterline,
+    build_objective_physical_ledger,
+    build_scope_waterline,
+)
+from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget, NodeResourceMask
+
+_CORE_ALIASES: dict[str, str] = {
+    "aic": "aic",
+    "aic0": "aic",
+    "aiv": "aiv0",
+    "aiv0": "aiv0",
+    "aiv1": "aiv1",
+}
+
+_PIPE_TO_LEDGER: dict[str, str] = {
+    "MTE1": "PIPE_MTE1",
+    "MTE2": "PIPE_MTE2",
+    "MTE3": "PIPE_MTE3",
+    "CUBE": "PIPE_M",
+    "M": "PIPE_M",
+    "VECTOR": "PIPE_V",
+    "V": "PIPE_V",
+    "FIXPIPE": "PIPE_FIX",
+    "FIX": "PIPE_FIX",
+    "SCALAR": "PIPE_S",
+    "S": "PIPE_S",
+}
+
+
+def format_pipe_key(core: str, pipe: str) -> str:
+    """Return canonical ledger pipe identifier such as 'AIC.PIPE_M' or 'AIV0.PIPE_V'."""
+    norm_core = _CORE_ALIASES.get(core.strip().lower(), core.strip().lower()).upper()
+    norm_pipe = pipe.strip().upper()
+    if norm_pipe.startswith("PIPE_"):
+        norm_pipe = norm_pipe[5:]
+    ledger_pipe = _PIPE_TO_LEDGER.get(norm_pipe, f"PIPE_{norm_pipe}")
+    return f"{norm_core}.{ledger_pipe}"
+
+
+def task_resource_mask(task_or_resources: Task | Sequence[tuple]) -> NodeResourceMask:
+    """Build a 24-bit NodeResourceMask from a Task or solver resource tuple sequence."""
+    resources = (
+        task_or_resources.resources
+        if isinstance(task_or_resources, Task)
+        else task_or_resources
+    )
+    mask = NodeResourceMask(0)
+    for use in resources:
+        core_raw = str(use[1]).strip().lower()
+        pipe_raw = str(use[2]).strip()
+        norm_core = _CORE_ALIASES.get(core_raw, core_raw)
+        mask = mask | NodeResourceMask.for_core(norm_core, pipe_raw)
+    return mask
+
+
+def masks_conflict(lhs: NodeResourceMask, rhs: NodeResourceMask) -> bool:
+    """Return whether two 24-bit core/pipe resource masks overlap."""
+    return (lhs.bits & rhs.bits) != 0
+
+
+def bitwise_conflict_pairs(tasks: Sequence[Task]) -> tuple[tuple[int, int], ...]:
+    """Return sorted index pairs (i, j) whose 24-bit resource masks overlap."""
+    masks = [task_resource_mask(task) for task in tasks]
+    pairs: list[tuple[int, int]] = []
+    for i, m_i in enumerate(masks):
+        for j in range(i + 1, len(masks)):
+            if m_i.conflicts_with(masks[j]):
+                pairs.append((i, j))
+    return tuple(pairs)
+
+
+def pipe_cycles_from_problem(
+    problem: Problem,
+    assignment: Assignment | None = None,
+) -> dict[str, int]:
+    """Accumulate per-pipe cycle budgets from a Problem's 24-bit task masks."""
+    cycles: dict[str, int] = {}
+    for task in problem.tasks:
+        mask = task_resource_mask(task)
+        dur = max(1, int(task.latency))
+        for core_key, pipe_name in mask.to_core_pipe_pairs():
+            key = format_pipe_key(core_key, pipe_name)
+            cycles[key] = cycles.get(key, 0) + dur
+    return dict(sorted(cycles.items()))
 
 
 @dataclass(frozen=True)
@@ -66,6 +152,11 @@ class AscendPipelineResult:
     assignment: Assignment
     task_stages: dict[str, int]
     buffer_versions: dict[str, int]
+
+    @property
+    def task_masks(self) -> dict[str, NodeResourceMask]:
+        """Return the 24-bit NodeResourceMask per task name."""
+        return {task.name: task_resource_mask(task) for task in self.problem.tasks}
 
 
 @dataclass(frozen=True)
@@ -180,36 +271,53 @@ def _estimate_task_latency(item: _LoopTaskItem) -> int:
     return min(max(1, total_quanta), 8)
 
 
-def _op_resources(op: Op, arg_types: tuple[TensorType | None, ...]) -> tuple[tuple, ...]:
+def _op_resource_mask(
+    op: Op,
+    arg_types: tuple[TensorType | None, ...],
+    *,
+    aiv_core: str = "aiv0",
+) -> NodeResourceMask:
+    """Project an Ascend TIR Op onto a 24-bit AIV1|AIC|AIV0 NodeResourceMask."""
     resource = getattr(op, "resource", None)
     if resource == "mte2_engine":
         dst = arg_types[-1] if arg_types else None
         if dst is not None and dst.storage is StorageKind.TMEM:
-            return (("aic", "aic0", "mte2", 1),)
-        return (("aiv", "aiv0", "mte2", 1),)
+            return NodeResourceMask.for_aic("MTE2")
+        return NodeResourceMask.for_core(aiv_core, "MTE2")
     if resource == "mte3_engine":
-        return (("aiv", "aiv0", "mte3", 1),)
+        return NodeResourceMask.for_core(aiv_core, "MTE3")
     if resource == "mte1_engine":
-        return (("aic", "aic0", "mte1", 1),)
+        return NodeResourceMask.for_aic("MTE1")
     if resource == "cube_engine":
-        return (("aic", "aic0", "cube", 1),)
+        return NodeResourceMask.for_aic("CUBE")
     if resource == "fixpipe_engine":
-        return (("aic", "aic0", "fixpipe", 1),)
+        return NodeResourceMask.for_aic("FIXPIPE")
     if resource == "dual_copy_engine":
-        return (("aic", "aic0", "fixpipe", 1), ("aiv", "aiv0", "mte2", 1))
+        if isinstance(op, AscendDualCopyUbToL1):
+            return NodeResourceMask.for_aic("MTE1") | NodeResourceMask.for_dual_aiv("MTE3")
+        return NodeResourceMask.for_aic("FIXPIPE") | NodeResourceMask.for_dual_aiv("MTE2")
     if resource == "vector_engine":
-        return (("aiv", "aiv0", "vector", 1),)
+        return NodeResourceMask.for_core(aiv_core, "VECTOR")
     if len(arg_types) >= 2 and all(ty is not None for ty in arg_types[:2]):
         src_s, dst_s = arg_types[0].storage, arg_types[1].storage
         if src_s is StorageKind.GMEM and dst_s is StorageKind.SMEM:
-            return (("aiv", "aiv0", "mte2", 1),)
+            return NodeResourceMask.for_core(aiv_core, "MTE2")
         if src_s is StorageKind.SMEM and dst_s is StorageKind.GMEM:
-            return (("aiv", "aiv0", "mte3", 1),)
+            return NodeResourceMask.for_core(aiv_core, "MTE3")
         if src_s is StorageKind.GMEM and dst_s is StorageKind.TMEM:
-            return (("aic", "aic0", "mte2", 1),)
+            return NodeResourceMask.for_aic("MTE2")
         if src_s is StorageKind.TMEM and dst_s is StorageKind.GMEM:
-            return (("aic", "aic0", "fixpipe", 1),)
-    return (("aiv", "aiv0", "vector", 1),)
+            return NodeResourceMask.for_aic("FIXPIPE")
+    return NodeResourceMask.for_core(aiv_core, "VECTOR")
+
+
+def _op_resources(
+    op: Op,
+    arg_types: tuple[TensorType | None, ...],
+    *,
+    aiv_core: str = "aiv0",
+) -> tuple[tuple, ...]:
+    return _op_resource_mask(op, arg_types, aiv_core=aiv_core).to_solver_resources(1, 0)
 
 
 def _infer_tmem_space(roles: set[str]) -> str:
@@ -328,12 +436,27 @@ def _collect_raw_calls(
             out.append((stmt.callable, stmt.args))
 
 
-def _collect_stmts(stmt: Stmt | None, env: dict[int, Expr], out: list[_LoopTaskItem]) -> None:
+def _scope_aiv_override(kind: object, current: str) -> str:
+    name = getattr(kind, "name", kind)
+    if name in ("ascend.aiv0", "aiv0"):
+        return "aiv0"
+    if name in ("ascend.aiv1", "aiv1"):
+        return "aiv1"
+    return current
+
+
+def _collect_stmts(
+    stmt: Stmt | None,
+    env: dict[int, Expr],
+    out: list[_LoopTaskItem],
+    *,
+    aiv_core: str = "aiv0",
+) -> None:
     if stmt is None:
         return
     if isinstance(stmt, Sequential):
         for child in stmt.body:
-            _collect_stmts(child, env, out)
+            _collect_stmts(child, env, out, aiv_core=aiv_core)
         return
     if isinstance(stmt, LetStmt):
         env[id(stmt.var)] = stmt.value
@@ -343,23 +466,28 @@ def _collect_stmts(stmt: Stmt | None, env: dict[int, Expr], out: list[_LoopTaskI
         _collect_raw_calls(stmt.body, env, inner)
         if inner:
             vf_label = "simdvf" if stmt.kind == SIMDVF_KIND.name else "simtvf"
+            vf_mask = NodeResourceMask.for_core(aiv_core, "VECTOR")
             out.append(
                 _LoopTaskItem(
                     label=vf_label,
-                    resources=(("aiv", "aiv0", "vector", 1),),
+                    resources=vf_mask.to_solver_resources(1, 0),
                     calls=tuple(inner),
                 )
             )
         return
-    if isinstance(stmt, (MeshScope, ExecutionScope)):
-        _collect_stmts(stmt.body, env, out)
+    if isinstance(stmt, ExecutionScope):
+        next_core = _scope_aiv_override(stmt.kind, aiv_core)
+        _collect_stmts(stmt.body, env, out, aiv_core=next_core)
+        return
+    if isinstance(stmt, MeshScope):
+        _collect_stmts(stmt.body, env, out, aiv_core=aiv_core)
         return
     if isinstance(stmt, If):
-        _collect_stmts(stmt.then_body, env, out)
-        _collect_stmts(stmt.else_body, env, out)
+        _collect_stmts(stmt.then_body, env, out, aiv_core=aiv_core)
+        _collect_stmts(stmt.else_body, env, out, aiv_core=aiv_core)
         return
     if isinstance(stmt, (For, While)):
-        _collect_stmts(stmt.body, env, out)
+        _collect_stmts(stmt.body, env, out, aiv_core=aiv_core)
         return
     if isinstance(stmt, Evaluate):
         if isinstance(stmt.callable, Op):
@@ -369,7 +497,7 @@ def _collect_stmts(stmt: Stmt | None, env: dict[int, Expr], out: list[_LoopTaskI
             arg_types = tuple(
                 arg.type if isinstance(arg.type, TensorType) else None for arg in stmt.args
             )
-            res_uses = _op_resources(op, arg_types)
+            res_uses = _op_resources(op, arg_types, aiv_core=aiv_core)
             out.append(
                 _LoopTaskItem(
                     label=op_label,
@@ -836,6 +964,24 @@ def authored_stages_set(names: list[str]) -> set[str]:
     return set(names)
 
 
+def _verify_bitwise_mask_schedule(problem: Problem, assignment: Assignment) -> list[str]:
+    """Verify no two tasks with overlapping 24-bit resource masks share a modulo slot."""
+    problems: list[str] = []
+    ii = assignment.ii
+    if ii < 1:
+        return [f"INVALID_II {ii}"]
+    for i, j in bitwise_conflict_pairs(problem.tasks):
+        t_i = problem.tasks[i]
+        t_j = problem.tasks[j]
+        s_i = assignment.starts.get(t_i.name)
+        s_j = assignment.starts.get(t_j.name)
+        if s_i is None or s_j is None:
+            continue
+        if (s_i - s_j) % ii == 0:
+            problems.append(f"BITWISE_MASK_OVERLAP {t_i.name}/{t_j.name} at II={ii}")
+    return problems
+
+
 def solve_ascend_pipeline(
     problem: Problem,
     *,
@@ -864,6 +1010,7 @@ def solve_ascend_pipeline(
         last_detail = detail
         if status == SAT and assignment is not None:
             problems = verify_assignment(problem, assignment)
+            problems.extend(_verify_bitwise_mask_schedule(problem, assignment))
             if problems:
                 raise PipelineError(
                     "ASCEND_PIPELINE_VERIFY_FAILED",
@@ -885,6 +1032,53 @@ def solve_ascend_pipeline(
         "ASCEND_PIPELINE_UNSAT",
         f"no feasible Ascend modulo schedule found ({last_detail})",
     )
+
+
+def solve_loop_with_ledger(
+    loop: For,
+    *,
+    target: AscendTarget | None = None,
+    fn_stmt: Stmt | None = None,
+    fixed_ii: int | None = None,
+    unreserved_ubuf: bool = False,
+) -> tuple[AscendPipelineResult, ObjectivePhysicalLedger]:
+    """Solve a static TIR loop via Mode A Z3 and project an ObjectivePhysicalLedger."""
+    resolved_target = target or AscendTarget("ascend.950pr")
+    problem, _stages = extract_tir_loop_problem(
+        loop,
+        target=resolved_target,
+        fn_stmt=fn_stmt,
+        unreserved_ubuf=unreserved_ubuf,
+    )
+    result = solve_ascend_pipeline(problem, fixed_ii=fixed_ii)
+    cap_map = {(c.space, c.owner): c.bytes for c in problem.capacities}
+    waterlines: dict[str, ScopeWaterline] = {}
+    spaces = sorted({b.space for b in problem.buffers if b.space})
+    for space in spaces:
+        bufs = [b for b in problem.buffers if b.space == space]
+        owner = bufs[0].owner
+        cap_bytes = cap_map.get((space, owner), 0)
+        explicit_bufs = {
+            b.name: b.slot_bytes * result.buffer_versions.get(b.name, 1) for b in bufs
+        }
+        waterlines[space] = build_scope_waterline(
+            scope=space,
+            capacity_bytes=cap_bytes,
+            explicit_buffers=explicit_bufs,
+            implicit_buffers={},
+        )
+    pipe_cycles = pipe_cycles_from_problem(problem, result.assignment)
+    ledger = build_objective_physical_ledger(
+        analysis_mode="exact_modulo_z3",
+        is_legal=True,
+        steady_state_ii=result.assignment.ii,
+        pipe_cycles=pipe_cycles,
+        waterlines=waterlines,
+        mte2_inflight_per_aiv=0,
+        unaligned_dma_padding_bytes=0,
+        opaque_dynamic_regions=(),
+    )
+    return result, ledger
 
 
 def build_resolved_spec(spec: PipelineSpec, result: AscendPipelineResult) -> PipelineSpec:
@@ -930,8 +1124,14 @@ def build_resolved_spec(spec: PipelineSpec, result: AscendPipelineResult) -> Pip
 
 __all__ = [
     "AscendPipelineResult",
+    "bitwise_conflict_pairs",
     "build_resolved_spec",
     "extract_tir_loop_problem",
+    "format_pipe_key",
+    "masks_conflict",
+    "pipe_cycles_from_problem",
     "solve_ascend_pipeline",
+    "solve_loop_with_ledger",
+    "task_resource_mask",
     "validate_pipeline_spec",
 ]

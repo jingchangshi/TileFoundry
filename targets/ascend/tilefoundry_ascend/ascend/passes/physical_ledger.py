@@ -1,0 +1,150 @@
+"""Objective physical ledger exports for Ascend schedule and envelope inspection."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import json
+
+
+@dataclass(frozen=True)
+class ScopeWaterline:
+    """Memory capacity and compiler-bloat accounting for one on-chip scope."""
+
+    scope: str
+    capacity_bytes: int
+    explicit_bytes: int
+    implicit_bloat_bytes: int
+    peak_allocated_bytes: int
+    overflow_bytes: int
+    explicit_buffers: dict[str, int]
+    implicit_buffers: dict[str, int]
+    degraded_single_buffers: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable dictionary representation."""
+        return {
+            "scope": self.scope,
+            "capacity_bytes": self.capacity_bytes,
+            "explicit_bytes": self.explicit_bytes,
+            "implicit_bloat_bytes": self.implicit_bloat_bytes,
+            "peak_allocated_bytes": self.peak_allocated_bytes,
+            "overflow_bytes": self.overflow_bytes,
+            "explicit_buffers": dict(self.explicit_buffers),
+            "implicit_buffers": dict(self.implicit_buffers),
+            "degraded_single_buffers": list(self.degraded_single_buffers),
+        }
+
+
+@dataclass(frozen=True)
+class ObjectivePhysicalLedger:
+    """Rule-blind hardware utilization, waterline, and legality telemetry."""
+
+    analysis_mode: str
+    is_legal: bool
+    steady_state_ii: int | None
+    pipe_cycles: dict[str, int]
+    dominant_pipe: str
+    waterlines: dict[str, ScopeWaterline]
+    mte2_inflight_per_aiv: int
+    unaligned_dma_padding_bytes: int
+    opaque_dynamic_regions: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.analysis_mode not in ("exact_modulo_z3", "readonly_envelope"):
+            raise ValueError(
+                f"analysis_mode must be 'exact_modulo_z3' or 'readonly_envelope', "
+                f"got {self.analysis_mode!r}"
+            )
+
+    @property
+    def max_overflow_bytes(self) -> int:
+        """Return the maximum byte overflow across all tracked memory scopes."""
+        return max((wl.overflow_bytes for wl in self.waterlines.values()), default=0)
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable dictionary representation."""
+        payload = asdict(self)
+        payload["waterlines"] = {
+            scope: wl.to_dict() for scope, wl in self.waterlines.items()
+        }
+        payload["opaque_dynamic_regions"] = list(self.opaque_dynamic_regions)
+        return payload
+
+    def to_json(self, *, indent: int | None = 2) -> str:
+        """Serialize the physical ledger into formatted JSON text."""
+        return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
+
+
+def compute_dominant_pipe(pipe_cycles: dict[str, int]) -> str:
+    """Return the pipe key with the highest cycle count, or 'NONE' if empty."""
+    positive = {k: v for k, v in pipe_cycles.items() if v > 0}
+    if not positive:
+        return "NONE"
+    return max(positive.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def build_scope_waterline(
+    *,
+    scope: str,
+    capacity_bytes: int,
+    explicit_buffers: dict[str, int],
+    implicit_buffers: dict[str, int],
+    peak_allocated_bytes: int | None = None,
+    degraded_single_buffers: tuple[str, ...] = (),
+) -> ScopeWaterline:
+    """Build a ScopeWaterline from explicit, implicit, and peak allocation maps."""
+    explicit_total = sum(explicit_buffers.values())
+    implicit_total = sum(implicit_buffers.values())
+    peak = (
+        peak_allocated_bytes
+        if peak_allocated_bytes is not None
+        else explicit_total + implicit_total
+    )
+    overflow = max(0, peak - capacity_bytes) if capacity_bytes > 0 else 0
+    return ScopeWaterline(
+        scope=scope,
+        capacity_bytes=capacity_bytes,
+        explicit_bytes=explicit_total,
+        implicit_bloat_bytes=implicit_total,
+        peak_allocated_bytes=peak,
+        overflow_bytes=overflow,
+        explicit_buffers=dict(explicit_buffers),
+        implicit_buffers=dict(implicit_buffers),
+        degraded_single_buffers=tuple(degraded_single_buffers),
+    )
+
+
+def build_objective_physical_ledger(
+    *,
+    analysis_mode: str,
+    is_legal: bool,
+    steady_state_ii: int | None,
+    pipe_cycles: dict[str, int],
+    waterlines: dict[str, ScopeWaterline],
+    mte2_inflight_per_aiv: int = 0,
+    unaligned_dma_padding_bytes: int = 0,
+    opaque_dynamic_regions: tuple[str, ...] = (),
+) -> ObjectivePhysicalLedger:
+    """Assemble an ObjectivePhysicalLedger and derive the dominant pipe."""
+    cleaned_pipes = dict(sorted(pipe_cycles.items()))
+    overflow_free = all(wl.overflow_bytes == 0 for wl in waterlines.values())
+    return ObjectivePhysicalLedger(
+        analysis_mode=analysis_mode,
+        is_legal=bool(is_legal and overflow_free),
+        steady_state_ii=steady_state_ii,
+        pipe_cycles=cleaned_pipes,
+        dominant_pipe=compute_dominant_pipe(cleaned_pipes),
+        waterlines=dict(waterlines),
+        mte2_inflight_per_aiv=int(mte2_inflight_per_aiv),
+        unaligned_dma_padding_bytes=int(unaligned_dma_padding_bytes),
+        opaque_dynamic_regions=tuple(opaque_dynamic_regions),
+    )
+
+
+__all__ = [
+    "ObjectivePhysicalLedger",
+    "ScopeWaterline",
+    "build_objective_physical_ledger",
+    "build_scope_waterline",
+    "compute_dominant_pipe",
+]
