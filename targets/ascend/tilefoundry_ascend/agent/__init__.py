@@ -14,6 +14,18 @@ from tilefoundry_ascend.agent.kb import (
     save_rules_yaml,
     validate_rule_predicate,
 )
+from tilefoundry_ascend.agent.orchestrator import (
+    AgyCliLLMBackend,
+    BeamCandidate,
+    GateFunnel,
+    GenerationRequest,
+    MockLLMBackend,
+    PortfolioRunner,
+    StaticDynamicResidual,
+    TileConfigCandidate,
+    TwoLaneBeamSearch,
+    prescreen_tile_configs,
+)
 from tilefoundry_ascend.agent.router import (
     RouteDecision,
     StructuralFeatures,
@@ -22,16 +34,26 @@ from tilefoundry_ascend.agent.router import (
 )
 
 __all__ = [
+    "AgyCliLLMBackend",
     "AscendCausalRule",
     "BayesianRuleTracker",
+    "BeamCandidate",
+    "GateFunnel",
+    "GenerationRequest",
+    "MockLLMBackend",
+    "PortfolioRunner",
     "RouteDecision",
     "RulePosterior",
+    "StaticDynamicResidual",
     "StructuralFeatures",
+    "TileConfigCandidate",
+    "TwoLaneBeamSearch",
     "UnsafePredicateError",
     "build_predicate_context",
     "default_seed_rules_path",
     "extract_structural_features",
     "load_seed_rules",
+    "prescreen_tile_configs",
     "route_execution_track",
     "safe_eval_predicate",
     "save_rules_yaml",

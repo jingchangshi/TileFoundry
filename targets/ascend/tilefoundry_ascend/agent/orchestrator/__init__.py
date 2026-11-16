@@ -1,0 +1,77 @@
+"""Dual-loop agy orchestrator, tile-size prescreener, gate funnel, and two-lane beam."""
+
+from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    FunnelEvaluation,
+    GateFunnel,
+    StageAResult,
+    StageBResult,
+    StageCResult,
+    run_stage_a_static,
+    run_stage_b_compile,
+    run_stage_c_agent_gates,
+)
+from tilefoundry_ascend.agent.orchestrator.llm_client import (
+    CREATIVE_RESPONSE_SCHEMA,
+    AgyCliLLMBackend,
+    GenerationRequest,
+    KernelLLMBackend,
+    MockLLMBackend,
+    create_llm_backend_from_env,
+    extract_creative_payload,
+    extract_python_dsl,
+)
+from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
+    PortfolioRoundReport,
+    PortfolioRunner,
+    WorkerSpec,
+    build_creative_request,
+    build_exploit_request,
+    build_syntax_repair_request,
+)
+from tilefoundry_ascend.agent.orchestrator.residual_beam import (
+    BeamCandidate,
+    StaticDynamicResidual,
+    TwoLaneBeamSearch,
+    compute_static_dynamic_residual,
+    extract_structural_signature,
+)
+from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
+    PrescreenScore,
+    TileConfigCandidate,
+    evaluate_tile_candidate,
+    prescreen_tile_configs,
+)
+
+__all__ = [
+    "AgyCliLLMBackend",
+    "BeamCandidate",
+    "CREATIVE_RESPONSE_SCHEMA",
+    "FunnelEvaluation",
+    "GateFunnel",
+    "GenerationRequest",
+    "KernelLLMBackend",
+    "MockLLMBackend",
+    "PortfolioRoundReport",
+    "PortfolioRunner",
+    "PrescreenScore",
+    "StageAResult",
+    "StageBResult",
+    "StageCResult",
+    "StaticDynamicResidual",
+    "TileConfigCandidate",
+    "TwoLaneBeamSearch",
+    "WorkerSpec",
+    "build_creative_request",
+    "build_exploit_request",
+    "build_syntax_repair_request",
+    "compute_static_dynamic_residual",
+    "create_llm_backend_from_env",
+    "evaluate_tile_candidate",
+    "extract_creative_payload",
+    "extract_python_dsl",
+    "extract_structural_signature",
+    "prescreen_tile_configs",
+    "run_stage_a_static",
+    "run_stage_b_compile",
+    "run_stage_c_agent_gates",
+]
