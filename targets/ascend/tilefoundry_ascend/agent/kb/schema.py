@@ -1,0 +1,444 @@
+"""Six-tuple AscendCausalRule schema and safe AST inequality evaluator."""
+
+from __future__ import annotations
+
+import ast
+from collections.abc import Mapping
+from dataclasses import dataclass
+import operator
+from pathlib import Path
+import yaml
+
+from tilefoundry_ascend.agent.router.capability_gate import StructuralFeatures
+from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
+
+_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+}
+
+_CMP_OPS = {
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
+    ast.In: lambda a, b: a in b,
+    ast.NotIn: lambda a, b: a not in b,
+}
+
+_SAFE_FUNCS = {
+    "abs": abs,
+    "max": max,
+    "min": min,
+}
+
+_ALLOWED_AST_NODES = (
+    ast.Expression,
+    ast.BoolOp,
+    ast.And,
+    ast.Or,
+    ast.UnaryOp,
+    ast.Not,
+    ast.USub,
+    ast.UAdd,
+    ast.BinOp,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.Compare,
+    ast.Eq,
+    ast.NotEq,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+    ast.In,
+    ast.NotIn,
+    ast.Constant,
+    ast.Name,
+    ast.Attribute,
+    ast.Load,
+    ast.Tuple,
+    ast.List,
+    ast.Call,
+)
+
+
+class UnsafePredicateError(ValueError):
+    """Raised when a causal rule predicate uses disallowed syntax or symbols."""
+
+
+def _flatten_attribute(node: ast.AST) -> str | None:
+    parts: list[str] = []
+    cur: ast.AST = node
+    while isinstance(cur, ast.Attribute):
+        if cur.attr.startswith("_"):
+            raise UnsafePredicateError(f"private attribute access forbidden: {cur.attr!r}")
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        if cur.id.startswith("_"):
+            raise UnsafePredicateError(f"private name access forbidden: {cur.id!r}")
+        parts.append(cur.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+def validate_rule_predicate(expr: str) -> ast.Expression:
+    """Parse and validate a predicate string against the safe AST whitelist."""
+    if not isinstance(expr, str) or not expr.strip():
+        raise UnsafePredicateError("predicate must be a non-empty string")
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as exc:
+        raise UnsafePredicateError(f"invalid predicate syntax {expr!r}: {exc}") from exc
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED_AST_NODES):
+            raise UnsafePredicateError(
+                f"disallowed AST node {type(node).__name__} in predicate {expr!r}"
+            )
+        if isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in _SAFE_FUNCS:
+                raise UnsafePredicateError(f"only {sorted(_SAFE_FUNCS)} calls are permitted")
+            if node.keywords:
+                raise UnsafePredicateError("keyword arguments are not allowed in predicate calls")
+        if isinstance(node, ast.Attribute):
+            if _flatten_attribute(node) is None:
+                raise UnsafePredicateError("attribute chains must root at an identifier")
+        if isinstance(node, ast.Constant) and not isinstance(
+            node.value, (int, float, str, bool, type(None))
+        ):
+            raise UnsafePredicateError(f"unsupported constant {node.value!r}")
+    return tree
+
+
+def _eval_node(node: ast.AST, env: Mapping[str, object]) -> object:
+    if isinstance(node, ast.Expression):
+        return _eval_node(node.body, env)
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id not in env:
+            raise KeyError(f"unknown predicate variable {node.id!r}")
+        return env[node.id]
+    if isinstance(node, ast.Attribute):
+        dotted = _flatten_attribute(node)
+        if dotted is None:
+            raise UnsafePredicateError("invalid attribute root")
+        if dotted in env:
+            return env[dotted]
+        parts = dotted.split(".")
+        cur: object = env
+        for idx, part in enumerate(parts):
+            if isinstance(cur, Mapping) and part in cur:
+                cur = cur[part]
+                continue
+            rem = ".".join(parts[idx:])
+            if isinstance(cur, Mapping) and rem in cur:
+                return cur[rem]
+            raise KeyError(f"unknown predicate attribute {dotted!r}")
+        return cur
+    if isinstance(node, ast.Tuple):
+        return tuple(_eval_node(el, env) for el in node.elts)
+    if isinstance(node, ast.List):
+        return [_eval_node(el, env) for el in node.elts]
+    if isinstance(node, ast.UnaryOp):
+        val = _eval_node(node.operand, env)
+        if isinstance(node.op, ast.Not):
+            return not bool(val)
+        if isinstance(node.op, ast.USub):
+            return -float(val) if isinstance(val, float) else -int(val)
+        return val
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            for val in node.values:
+                if not bool(_eval_node(val, env)):
+                    return False
+            return True
+        for val in node.values:
+            if bool(_eval_node(val, env)):
+                return True
+        return False
+    if isinstance(node, ast.BinOp):
+        lhs = _eval_node(node.left, env)
+        rhs = _eval_node(node.right, env)
+        return _BIN_OPS[type(node.op)](lhs, rhs)
+    if isinstance(node, ast.Compare):
+        left = _eval_node(node.left, env)
+        for op, comp in zip(node.ops, node.comparators):
+            right = _eval_node(comp, env)
+            if not _CMP_OPS[type(op)](left, right):
+                return False
+            left = right
+        return True
+    if isinstance(node, ast.Call):
+        fn = _SAFE_FUNCS[node.func.id]
+        args = [_eval_node(arg, env) for arg in node.args]
+        return fn(*args)
+    raise UnsafePredicateError(f"unsupported AST node {type(node).__name__}")
+
+
+def safe_eval_predicate(expr: str, env: Mapping[str, object]) -> bool:
+    """Safely evaluate a causal rule guard, precondition, or postcondition."""
+    tree = validate_rule_predicate(expr)
+    return bool(_eval_node(tree, env))
+
+
+@dataclass(frozen=True)
+class AscendCausalRule:
+    """Six-tuple causal optimization rule grounded in physical hardware telemetry."""
+
+    rule_id: str
+    regime_guard: str
+    precondition: str
+    transform_template: str
+    expected_postcondition: str
+    source_provenance: str
+    alpha_prior: float = 2.0
+    beta_prior: float = 1.0
+    rationale: str = ""
+    priority: int = 100
+
+    def __post_init__(self) -> None:
+        if not self.rule_id or not self.transform_template.strip():
+            raise ValueError("rule_id and transform_template must be non-empty")
+        validate_rule_predicate(self.regime_guard)
+        validate_rule_predicate(self.precondition)
+        validate_rule_predicate(self.expected_postcondition)
+
+    def as_six_tuple(self) -> tuple[str, str, str, str, str, str]:
+        """Return canonical 6-tuple fields."""
+        return (
+            self.rule_id,
+            self.regime_guard,
+            self.precondition,
+            self.transform_template,
+            self.expected_postcondition,
+            self.source_provenance,
+        )
+
+    def matches(self, context: Mapping[str, object]) -> bool:
+        """Return whether both regime_guard and precondition hold in context."""
+        return safe_eval_predicate(self.regime_guard, context) and safe_eval_predicate(
+            self.precondition, context
+        )
+
+    def postcondition_realized(self, context: Mapping[str, object]) -> bool:
+        """Return whether expected_postcondition holds in post-edit context."""
+        return safe_eval_predicate(self.expected_postcondition, context)
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize rule into a YAML/JSON-compatible mapping."""
+        return {
+            "rule_id": self.rule_id,
+            "regime_guard": self.regime_guard,
+            "precondition": self.precondition,
+            "transform_template": self.transform_template,
+            "expected_postcondition": self.expected_postcondition,
+            "source_provenance": self.source_provenance,
+            "alpha_prior": self.alpha_prior,
+            "beta_prior": self.beta_prior,
+            "rationale": self.rationale,
+            "priority": self.priority,
+        }
+
+
+_DEFAULT_PIPE_KEYS = (
+    "AIC.PIPE_M",
+    "AIC.PIPE_FIX",
+    "AIC.PIPE_MTE1",
+    "AIC.PIPE_MTE2",
+    "AIC.PIPE_MTE3",
+    "AIC.PIPE_S",
+    "AIV0.PIPE_V",
+    "AIV0.PIPE_MTE1",
+    "AIV0.PIPE_MTE2",
+    "AIV0.PIPE_MTE3",
+    "AIV0.PIPE_S",
+    "AIV1.PIPE_V",
+    "AIV1.PIPE_MTE1",
+    "AIV1.PIPE_MTE2",
+    "AIV1.PIPE_MTE3",
+    "AIV1.PIPE_S",
+)
+
+_DEFAULT_SCOPES = ("UB", "L1", "L0A", "L0B", "L0C", "SSBUF")
+
+
+def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
+    ns: dict[str, object] = {key: 0 for key in _DEFAULT_PIPE_KEYS}
+    for key, val in ledger.pipe_cycles.items():
+        ns[key] = int(val)
+    ns["PIPE_M"] = int(ns["AIC.PIPE_M"])
+    ns["PIPE_FIX"] = int(ns["AIC.PIPE_FIX"])
+    ns["PIPE_V"] = max(int(ns["AIV0.PIPE_V"]), int(ns["AIV1.PIPE_V"]))
+    ns["PIPE_MTE2"] = max(
+        int(ns["AIC.PIPE_MTE2"]),
+        int(ns["AIV0.PIPE_MTE2"]),
+        int(ns["AIV1.PIPE_MTE2"]),
+    )
+    ns["PIPE_MTE3"] = max(int(ns["AIV0.PIPE_MTE3"]), int(ns["AIV1.PIPE_MTE3"]))
+    ns["is_legal"] = ledger.is_legal
+    ns["analysis_mode"] = ledger.analysis_mode
+    ns["steady_state_ii"] = ledger.steady_state_ii if ledger.steady_state_ii is not None else 0
+    ns["dominant_pipe"] = ledger.dominant_pipe
+    ns["mte2_inflight_per_aiv"] = ledger.mte2_inflight_per_aiv
+    ns["unaligned_dma_padding_bytes"] = ledger.unaligned_dma_padding_bytes
+    ns["max_overflow_bytes"] = ledger.max_overflow_bytes
+    ns["has_opaque_regions"] = bool(ledger.opaque_dynamic_regions)
+
+    total_bloat = 0
+    degraded_total = 0
+    any_overflow = 0
+    for scope in _DEFAULT_SCOPES:
+        wl = ledger.waterlines.get(scope)
+        if wl is None:
+            ns[scope] = {
+                "capacity_bytes": 0,
+                "explicit_bytes": 0,
+                "implicit_bloat_bytes": 0,
+                "peak_allocated_bytes": 0,
+                "overflow_bytes": 0,
+                "degraded_count": 0,
+            }
+        else:
+            total_bloat += wl.implicit_bloat_bytes
+            degraded_total += len(wl.degraded_single_buffers)
+            any_overflow = max(any_overflow, wl.overflow_bytes)
+            ns[scope] = {
+                "capacity_bytes": wl.capacity_bytes,
+                "explicit_bytes": wl.explicit_bytes,
+                "implicit_bloat_bytes": wl.implicit_bloat_bytes,
+                "peak_allocated_bytes": wl.peak_allocated_bytes,
+                "overflow_bytes": wl.overflow_bytes,
+                "degraded_count": len(wl.degraded_single_buffers),
+            }
+    ns["implicit_bloat_bytes"] = total_bloat
+    ns["degraded_buffer_count"] = degraded_total
+    ns["any_overflow_bytes"] = any_overflow
+    return ns
+
+
+def build_predicate_context(
+    ledger: ObjectivePhysicalLedger,
+    *,
+    features: StructuralFeatures | None = None,
+    residual: Mapping[str, object] | object | None = None,
+    prev_ledger: ObjectivePhysicalLedger | None = None,
+    extra: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Assemble a flat and dotted-path dictionary for safe rule predicate evaluation."""
+    ctx = _ledger_to_namespace(ledger)
+    if features is not None:
+        ctx.update(features.to_dict())
+    else:
+        ctx.update(
+            {
+                "phi_1": True,
+                "phi_2": 0.0,
+                "phi_3": "none",
+                "phi_4": False,
+                "phi_5": "none",
+                "phi_6": False,
+                "phi_7": 0,
+                "phi_8": 0.0,
+                "static_affine_bounds": True,
+                "cube_to_vector_ratio": 0.0,
+                "quant_granularity": "none",
+                "indirect_sparse_gather": False,
+                "cross_iter_recurrence": "none",
+                "dynamic_cross_core_handoff": False,
+                "inner_contiguous_bytes": 0,
+                "persistent_wave_occupancy": 0.0,
+            }
+        )
+
+    res_defaults = {
+        "measured_latency_us": 0.0,
+        "predicted_bottleneck_util": 0.0,
+        "measured_aic_mac_ratio": 0.0,
+        "measured_aiv_vec_ratio": 0.0,
+        "measured_mte2_wait_ratio": 0.0,
+        "measured_sync_stall_ratio": 0.0,
+        "unexplained_gap_ratio": 0.0,
+    }
+    if residual is not None:
+        for key in res_defaults:
+            if isinstance(residual, Mapping) and key in residual:
+                res_defaults[key] = float(residual[key])
+            elif hasattr(residual, key):
+                res_defaults[key] = float(getattr(residual, key))
+    ctx.update(res_defaults)
+
+    if prev_ledger is not None:
+        ctx["prev"] = _ledger_to_namespace(prev_ledger)
+    else:
+        ctx["prev"] = dict(ctx)
+
+    if extra:
+        ctx.update(extra)
+    return ctx
+
+
+def default_seed_rules_path() -> Path:
+    """Return path to the bundled pure-English causal seed rule library."""
+    return Path(__file__).resolve().with_name("seed_rules.yaml")
+
+
+def load_seed_rules(path: str | Path | None = None) -> tuple[AscendCausalRule, ...]:
+    """Load and validate AscendCausalRule entries from YAML."""
+    target_path = Path(path) if path is not None else default_seed_rules_path()
+    raw = yaml.safe_load(target_path.read_text(encoding="utf-8"))
+    if isinstance(raw, Mapping) and "rules" in raw:
+        items = raw["rules"]
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        raise ValueError(f"invalid rules YAML root in {target_path}")
+    rules: list[AscendCausalRule] = []
+    for entry in items:
+        rules.append(
+            AscendCausalRule(
+                rule_id=str(entry["rule_id"]),
+                regime_guard=str(entry["regime_guard"]),
+                precondition=str(entry["precondition"]),
+                transform_template=str(entry["transform_template"]),
+                expected_postcondition=str(entry["expected_postcondition"]),
+                source_provenance=str(entry["source_provenance"]),
+                alpha_prior=float(entry.get("alpha_prior", 2.0)),
+                beta_prior=float(entry.get("beta_prior", 1.0)),
+                rationale=str(entry.get("rationale", "")),
+                priority=int(entry.get("priority", 100)),
+            )
+        )
+    return tuple(rules)
+
+
+def save_rules_yaml(rules: tuple[AscendCausalRule, ...] | list[AscendCausalRule], path: str | Path) -> None:
+    """Persist AscendCausalRule entries to YAML cleanly in sorted order."""
+    payload = {"rules": [rule.to_dict() for rule in rules]}
+    Path(path).write_text(
+        yaml.safe_dump(payload, sort_keys=False, allow_unicode=False),
+        encoding="utf-8",
+    )
+
+
+__all__ = [
+    "AscendCausalRule",
+    "UnsafePredicateError",
+    "build_predicate_context",
+    "default_seed_rules_path",
+    "load_seed_rules",
+    "safe_eval_predicate",
+    "save_rules_yaml",
+    "validate_rule_predicate",
+]

@@ -1,0 +1,167 @@
+rules:
+  - rule_id: R01_DUAL_COPY_1C2V_SPLIT
+    regime_guard: "phi_2 > 0.0 or AIV0.PIPE_V > 0"
+    precondition: "AIV0.PIPE_V > 0 and AIV1.PIPE_V == 0 and (dominant_pipe == 'AIV0.PIPE_V' or AIV0.PIPE_V > AIC.PIPE_M)"
+    transform_template: |
+      Partition the dominant output-row tile extent evenly across the two paired vector cores
+      (half_rows = row_tile // 2) via T.dual_copy on the AIC->AIV L0C->UB writeout and/or
+      UB->L1 feed so AIV0 and AIV1 execute symmetric vector stages concurrently.
+    expected_postcondition: "AIV1.PIPE_V > 0 and AIV0.PIPE_V <= prev.AIV0.PIPE_V"
+    source_provenance: "ref:tilelang"
+    alpha_prior: 3.0
+    beta_prior: 1.0
+    priority: 10
+    rationale: "Coupled 1-AIC-to-2-AIV execution doubles effective vector throughput when both AIV sub-cores share the row work."
+
+  - rule_id: R02_ONCHIP_L0C_TO_UB_DIRECT
+    regime_guard: "phi_2 > 0.0"
+    precondition: "AIC.PIPE_FIX > 0 and AIV0.PIPE_MTE2 > 0 and (UB.implicit_bloat_bytes > 0 or steady_state_ii > 1 or measured_mte2_wait_ratio > 0.2)"
+    transform_template: |
+      Eliminate global-memory intermediate roundtrips between matrix accumulation and vector
+      post-processing by routing direct on-chip L0C->UB via T.dual_copy(l0c, ub, unit_flag_ctrl=3)
+      and UB->L1 feedback via on-chip buffers; never emit deprecated L1->GM stores.
+    expected_postcondition: "AIV0.PIPE_MTE2 <= prev.AIV0.PIPE_MTE2 and is_legal"
+    source_provenance: "ref:asc_devkit"
+    alpha_prior: 3.0
+    beta_prior: 1.0
+    priority: 15
+    rationale: "3510 hardware supports native L0C->UB and UB->L1 on-chip pipes without draining through global HBM."
+
+  - rule_id: R03_ACCUM_SPAN_FIXPIPE_RELIEF
+    regime_guard: "phi_2 > 0.0"
+    precondition: "AIC.PIPE_FIX > 1.15 * AIC.PIPE_M and AIC.PIPE_M > 0"
+    transform_template: |
+      Enlarge the inner reduction-K accumulation span per FixPipe drain or fuse epilogue scale
+      before FixPipe writeout (<= 128 B/cycle ceiling) so L0C accumulation amortizes FixPipe cost
+      while staying within L0C and L1 capacity limits.
+    expected_postcondition: "AIC.PIPE_FIX <= 1.15 * AIC.PIPE_M or AIC.PIPE_M > prev.AIC.PIPE_M"
+    source_provenance: "ref:ops_transformer"
+    alpha_prior: 2.5
+    beta_prior: 1.0
+    priority: 20
+    rationale: "Increasing K steps between L0C drains raises cube compute per FixPipe byte emitted."
+
+  - rule_id: R04_MTE2_SPARSE_GATHER_COALESCE
+    regime_guard: "phi_4 or unaligned_dma_padding_bytes > 0 or mte2_inflight_per_aiv > 0"
+    precondition: "mte2_inflight_per_aiv > 16 or unaligned_dma_padding_bytes > 0"
+    transform_template: |
+      Coalesce fragmented indirect or strided DMA loads into 32B-aligned contiguous block transfers
+      or vector T.simd.vgather2 table lookups in UB so per-AIV outstanding MTE2 issue depth stays
+      at or below the 16-entry hardware MTE2 queue depth with zero sub-32B padding waste.
+    expected_postcondition: "mte2_inflight_per_aiv <= 16 and unaligned_dma_padding_bytes <= prev.unaligned_dma_padding_bytes"
+    source_provenance: "ref:ops_transformer"
+    alpha_prior: 3.0
+    beta_prior: 1.0
+    priority: 12
+    rationale: "Fragmented MTE2 sub-loads saturate the 16-entry issue queue and waste bus transactions."
+
+  - rule_id: R05_SSBUF_RING_METADATA_HANDOFF
+    regime_guard: "phi_4 or phi_6 or not phi_1"
+    precondition: "measured_sync_stall_ratio > 0.15 or (phi_6 and has_opaque_regions)"
+    transform_template: |
+      Move small cross-core descriptors, offsets, and rescale scalars into 8B-aligned 3 KiB SSBUF
+      (T.alloc_ss with explicit zero-initialization of dirty initial slots and multi-version clocks)
+      while keeping bulk tensor payloads inside on-chip L1/UB RingBuffers rather than GM workspace.
+    expected_postcondition: "SSBUF.explicit_bytes <= 3072 and measured_sync_stall_ratio <= prev.measured_sync_stall_ratio"
+    source_provenance: "ref:cannbot_dsl"
+    alpha_prior: 2.5
+    beta_prior: 1.0
+    priority: 18
+    rationale: "SSBUF provides low-latency (~8-cycle) shared scalar storage across 1 AIC + 2 AIV without GM roundtrips."
+
+  - rule_id: R06_ONLINE_SOFTMAX_SKIP_SCALE
+    regime_guard: "phi_5 == 'associative_online_rescale'"
+    precondition: "PIPE_V > PIPE_M and PIPE_V > 0"
+    transform_template: |
+      Defer output accumulator normalization to the final epilogue and guard intermediate output
+      rescaling with a log-space max-shift threshold so identity-scale chunks skip redundant
+      vector multiply-add passes over the accumulator tile.
+    expected_postcondition: "PIPE_V < prev.PIPE_V"
+    source_provenance: "ref:ops_transformer"
+    alpha_prior: 2.5
+    beta_prior: 1.0
+    priority: 22
+    rationale: "Guarded skip-scale cuts vector multiply pressure on online reduction pipelines."
+
+  - rule_id: R07_IMPLICIT_BLOAT_HEADROOM_TRIM
+    regime_guard: "implicit_bloat_bytes > 0 or any_overflow_bytes > 0 or degraded_buffer_count > 0"
+    precondition: "UB.overflow_bytes > 0 or L1.overflow_bytes > 0 or degraded_buffer_count > 0"
+    transform_template: |
+      Trim the active tile blocking factor by one clean divisor step to reserve exact headroom for
+      compiler-inserted implicit bloat (nd2nz scratch and fractal rounding) so multi-buffer
+      versioning stays active (>= 2 versions) without single-buffering degradation or overflow.
+    expected_postcondition: "UB.overflow_bytes == 0 and L1.overflow_bytes == 0 and degraded_buffer_count == 0"
+    source_provenance: "ref:tilelang"
+    alpha_prior: 3.5
+    beta_prior: 1.0
+    priority: 5
+    rationale: "Single-buffered degradation or scratchpad overflow destroys pipeline overlap far more than slightly smaller tiles."
+
+  - rule_id: R08_PERSISTENT_SWIZZLE_L2_LOCALITY
+    regime_guard: "phi_8 >= 1.0 or persistent_wave_occupancy > 0.75"
+    precondition: "predicted_bottleneck_util > 0.75 and (unexplained_gap_ratio > 0.25 or measured_mte2_wait_ratio > 0.25)"
+    transform_template: |
+      Wrap block dispatch in T.Persistent with 2D diagonal/group swizzling across active AIC groups
+      (swizzle_window bounded by active block count) so co-scheduled tiles share resident operands
+      in L2 cache and suppress cold MTE2 stalls.
+    expected_postcondition: "measured_mte2_wait_ratio < prev.measured_mte2_wait_ratio or unexplained_gap_ratio < prev.unexplained_gap_ratio"
+    source_provenance: "ref:ops_transformer"
+    alpha_prior: 2.5
+    beta_prior: 1.0
+    priority: 25
+    rationale: "Persistent 2D swizzling exploits spatial reuse across the shared L2 cache on multi-wave problems."
+
+  - rule_id: R09_MIXED_QUANT_DEQUANT_STAGE_OVERLAP
+    regime_guard: "phi_3 in ('per_token_or_block', 'mixed_fp8_fp4')"
+    precondition: "phi_2 > 0.0 and PIPE_V > 0.85 * AIC.PIPE_M"
+    transform_template: |
+      Stage low-bit unpack and per-block scale-factor multiply inside AIV UB one pipeline stage ahead
+      of Cube consumption and stream dequantized BF16/FP16 fragments into an L1 RingBuffer via
+      UB->L1 direct transfer so AIV dequant overlaps concurrently with AIC MMAD.
+    expected_postcondition: "steady_state_ii <= prev.steady_state_ii or PIPE_V <= prev.PIPE_V"
+    source_provenance: "ref:cannbot_dsl"
+    alpha_prior: 2.5
+    beta_prior: 1.0
+    priority: 20
+    rationale: "Overlapping AIV vector dequantization ahead of Cube MMAD hides mixed-precision unpacking latency."
+
+  - rule_id: R10_BACKWARD_SYNC_CV_PINGPONG
+    regime_guard: "phi_2 > 0.0 and (phi_6 or has_opaque_regions or not phi_1)"
+    precondition: "steady_state_ii > 1 or measured_sync_stall_ratio > 0.12"
+    transform_template: |
+      Decouple AIC producer and dual-AIV consumer execution using dual-slot ping-pong parity
+      (slot = iter_idx % 2) across L0C/L1/SSBUF buffers with paired forward and backward
+      cross-core flags under bounded counter budgets (counter delta <= 15).
+    expected_postcondition: "steady_state_ii <= prev.steady_state_ii and measured_sync_stall_ratio <= prev.measured_sync_stall_ratio"
+    source_provenance: "ref:cannbot_dsl"
+    alpha_prior: 2.5
+    beta_prior: 1.0
+    priority: 24
+    rationale: "Ping-pong parity flags allow one core side to compute iteration t+1 while the peer consumes iteration t."
+
+  - rule_id: R11_L2_NZ_PAD_BANK_CONFLICT_AVOID
+    regime_guard: "phi_2 > 0.0 and phi_7 >= 32"
+    precondition: "unexplained_gap_ratio > 0.2 and (phi_7 % 32 == 0)"
+    transform_template: |
+      Pad internal N1 fractal major stride or stagger per-subcore UB bank offsets on 2D NZ scratchpads
+      to eliminate shared-SRAM bank conflicts during SIMD vector loads and stores.
+    expected_postcondition: "unexplained_gap_ratio < prev.unexplained_gap_ratio or UB.overflow_bytes == 0"
+    source_provenance: "ref:cannbot_dsl"
+    alpha_prior: 2.0
+    beta_prior: 1.0
+    priority: 30
+    rationale: "Adding a minimal fractal stride pad breaks power-of-two bank aliasing on L1/UB NZ reads."
+
+  - rule_id: R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION
+    regime_guard: "phi_2 > 0.0 and AIC.PIPE_M > 0 and AIC.PIPE_FIX > 0"
+    precondition: "steady_state_ii > 1 or measured_sync_stall_ratio > 0.15"
+    transform_template: |
+      Enable hardware unit_flag handoff between T.gemm(unit_flag_ctrl=2/3) and its downstream
+      FixPipe writeout T.dual_copy(..., unit_flag_ctrl=3) to replace coarse PIPE_M->PIPE_FIX
+      barrier waits with fine-grained fractal completion signaling.
+    expected_postcondition: "steady_state_ii <= prev.steady_state_ii and is_legal"
+    source_provenance: "ref:tilelang"
+    alpha_prior: 2.5
+    beta_prior: 1.0
+    priority: 26
+    rationale: "Hardware unit_flag handoffs eliminate full-tile FixPipe barrier bubbles between MMAD and drain."
