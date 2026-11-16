@@ -17,6 +17,8 @@ from tilefoundry_ascend.agent.kb import (
 from tilefoundry_ascend.agent.orchestrator import (
     AgyCliLLMBackend,
     BeamCandidate,
+    EvolutionRoundRecord,
+    EvolutionTrajectory,
     GateFunnel,
     GenerationRequest,
     MockLLMBackend,
@@ -25,6 +27,7 @@ from tilefoundry_ascend.agent.orchestrator import (
     TileConfigCandidate,
     TwoLaneBeamSearch,
     prescreen_tile_configs,
+    run_e2e_evolution,
 )
 from tilefoundry_ascend.agent.router import (
     RouteDecision,
@@ -38,6 +41,8 @@ __all__ = [
     "AscendCausalRule",
     "BayesianRuleTracker",
     "BeamCandidate",
+    "EvolutionRoundRecord",
+    "EvolutionTrajectory",
     "GateFunnel",
     "GenerationRequest",
     "MockLLMBackend",
@@ -55,6 +60,7 @@ __all__ = [
     "load_seed_rules",
     "prescreen_tile_configs",
     "route_execution_track",
+    "run_e2e_evolution",
     "safe_eval_predicate",
     "save_rules_yaml",
     "validate_rule_predicate",

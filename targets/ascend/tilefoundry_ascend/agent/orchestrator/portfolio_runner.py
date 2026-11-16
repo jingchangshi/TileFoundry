@@ -189,14 +189,19 @@ class PortfolioRunner:
         factory_name: str | None,
         factory_kwargs: dict[str, object] | None,
     ) -> tuple[BeamCandidate | None, bool, tuple[str, str, str] | None]:
-        raw_reply = await self._backend.generate(spec.request)
-        if spec.worker_kind == "creative_explore":
-            creative = extract_creative_payload(raw_reply)
-            dsl_source = creative["dsl_source"]
-            hypothesis = creative["physical_hypothesis"]
-        else:
-            dsl_source = extract_python_dsl(raw_reply)
-            hypothesis = spec.rule.rule_id if spec.rule is not None else ""
+        try:
+            raw_reply = await self._backend.generate(spec.request)
+            if spec.worker_kind == "creative_explore":
+                creative = extract_creative_payload(raw_reply)
+                dsl_source = creative["dsl_source"]
+                hypothesis = creative["physical_hypothesis"]
+            else:
+                dsl_source = extract_python_dsl(raw_reply)
+                hypothesis = spec.rule.rule_id if spec.rule is not None else ""
+        except Exception as exc:
+            if spec.rule is not None:
+                self._tracker.record_outcome(spec.rule.rule_id, postcondition_realized=False)
+            return None, False, (spec.worker_id, "llm_generate", str(exc)[-400:])
 
         repaired = False
         evaluation: FunnelEvaluation = self._funnel.evaluate(

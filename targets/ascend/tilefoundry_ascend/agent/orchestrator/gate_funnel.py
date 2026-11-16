@@ -91,6 +91,12 @@ def _resolve_prim_func_from_dsl(
     """Load DSL source via a temporary module so @T.prim_func sees file lines cleanly."""
     import ast
     import importlib.util
+
+    try:
+        import tilelang
+    except ImportError:
+        tilelang = None
+    _ = tilelang
     from tvm import IRModule, tirx
 
     ast.parse(dsl_source)

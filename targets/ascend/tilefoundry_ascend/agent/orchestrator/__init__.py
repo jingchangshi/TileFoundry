@@ -1,5 +1,13 @@
 """Dual-loop agy orchestrator, tile-size prescreener, gate funnel, and two-lane beam."""
 
+from tilefoundry_ascend.agent.orchestrator.e2e_evolution import (
+    EvolutionRoundRecord,
+    EvolutionTrajectory,
+    WorkerStepRecord,
+    build_hir_seed_request,
+    run_e2e_evolution,
+    synthesize_initial_dsl,
+)
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     FunnelEvaluation,
     GateFunnel,
@@ -46,6 +54,8 @@ __all__ = [
     "AgyCliLLMBackend",
     "BeamCandidate",
     "CREATIVE_RESPONSE_SCHEMA",
+    "EvolutionRoundRecord",
+    "EvolutionTrajectory",
     "FunnelEvaluation",
     "GateFunnel",
     "GenerationRequest",
@@ -61,8 +71,10 @@ __all__ = [
     "TileConfigCandidate",
     "TwoLaneBeamSearch",
     "WorkerSpec",
+    "WorkerStepRecord",
     "build_creative_request",
     "build_exploit_request",
+    "build_hir_seed_request",
     "build_syntax_repair_request",
     "compute_static_dynamic_residual",
     "create_llm_backend_from_env",
@@ -71,7 +83,9 @@ __all__ = [
     "extract_python_dsl",
     "extract_structural_signature",
     "prescreen_tile_configs",
+    "run_e2e_evolution",
     "run_stage_a_static",
     "run_stage_b_compile",
     "run_stage_c_agent_gates",
+    "synthesize_initial_dsl",
 ]
