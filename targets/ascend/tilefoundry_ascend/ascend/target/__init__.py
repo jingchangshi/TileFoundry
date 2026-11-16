@@ -3,6 +3,7 @@
 from tilefoundry_ascend.ascend.target.architecture import DaVinci950
 from tilefoundry_ascend.ascend.target.device import Ascend950PR
 from tilefoundry_ascend.ascend.target.facts import PURE_SIMDVF_UBUF_FLAGS, AscendSpaceFacts
+from tilefoundry_ascend.ascend.target.spec import NodeResourceMask
 from tilefoundry_ascend.ascend.target.target import AscendTarget
 
 __all__ = [
@@ -11,4 +12,5 @@ __all__ = [
     "AscendSpaceFacts",
     "AscendTarget",
     "DaVinci950",
+    "NodeResourceMask",
 ]

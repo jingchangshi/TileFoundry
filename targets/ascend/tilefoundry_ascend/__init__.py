@@ -5,6 +5,13 @@ from tilefoundry_ascend.ascend import (
     Ascend950PR,
     AscendTarget,
     DaVinci950,
+    NodeResourceMask,
 )
 
-__all__ = ["PURE_SIMDVF_UBUF_FLAGS", "Ascend950PR", "AscendTarget", "DaVinci950"]
+__all__ = [
+    "PURE_SIMDVF_UBUF_FLAGS",
+    "Ascend950PR",
+    "AscendTarget",
+    "DaVinci950",
+    "NodeResourceMask",
+]

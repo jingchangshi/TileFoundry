@@ -29,6 +29,8 @@ class Ascend950PR(Device):
     rmem_bytes_per_lane: int
     _unit_flops: tuple[tuple[str, tuple[tuple[DType, int], ...]], ...]
     aiv_lane_events_per_second: int
+    ssbuf_bytes_per_block: int
+    ssbuf_latency_cycles: int
 
     @property
     def unit_flops_per_second(self) -> dict[str, dict[DType, int]]:

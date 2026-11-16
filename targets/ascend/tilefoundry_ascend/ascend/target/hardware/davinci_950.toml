@@ -114,3 +114,55 @@ unit = "element"
 origin = "vendor"
 source = "CANN dav-3510 Cube MMAD fractal geometry"
 conditions = "16x16x16 f16/bf16 matrix multiply-accumulate per fractal atom"
+
+[facts.memory.ssbuf.align_bytes]
+value = 8
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 SSBuffer scalar alignment specification"
+conditions = "8-byte (64-bit) / 4-byte (32-bit) scalar alignment for PIPE_S accesses"
+
+[facts.memory.ssbuf.owner]
+value = "block"
+unit = "name"
+origin = "vendor"
+source = "CANN dav-3510 Mixed Core Group (1 AIC + 2 AIV) specification"
+conditions = "SSBuffer scalar SRAM is shared across one coupled block (1 AIC + 2 AIV)"
+
+[facts.datapath.valid_dma_paths]
+value = [
+  "GM->L1",
+  "GM->UB",
+  "UB->GM",
+  "L1->L0A",
+  "L1->L0B",
+  "L0C->GM",
+  "L0C->L1",
+  "L0C->UB",
+  "UB->L1",
+]
+unit = "name"
+origin = "vendor"
+source = "CANN dav-3510 Ascend 3510 architecture datapath migration guide"
+conditions = "Legal DMA transfer paths on dav-3510 including direct L0C->UB and UB->L1"
+
+[facts.datapath.forbidden_dma_paths]
+value = ["L1->GM", "GM->L0A", "GM->L0B"]
+unit = "name"
+origin = "vendor"
+source = "CANN dav-3510 Ascend 3510 architecture datapath migration guide"
+conditions = "Direct L1->GM store and GM->L0A/L0B bypass loads do not exist on dav-3510"
+
+[facts.microarch.max_mte2_inflight_per_aiv]
+value = 16
+unit = "count"
+origin = "vendor"
+source = "CANN dav-3510 NPU architecture micro-architectural specification"
+conditions = "Maximum concurrent inflight MTE2 read requests in the MTE2 issue queue"
+
+[facts.microarch.fixpipe_bytes_per_cycle]
+value = 128
+unit = "byte/cycle"
+origin = "vendor"
+source = "CANN dav-3510 FixPipe bandwidth specification"
+conditions = "Peak FixPipe L0C->UB/L1/GM transfer throughput in bytes per cycle"

@@ -7,6 +7,7 @@ from tilefoundry_ascend.ascend.target import (
     AscendSpaceFacts,
     AscendTarget,
     DaVinci950,
+    NodeResourceMask,
 )
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "AscendSpaceFacts",
     "AscendTarget",
     "DaVinci950",
+    "NodeResourceMask",
     "ir",
     "passes",
     "schedule",

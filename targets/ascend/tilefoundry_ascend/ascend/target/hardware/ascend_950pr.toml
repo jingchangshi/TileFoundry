@@ -49,11 +49,11 @@ source = "Ascend 950PR device memory model"
 conditions = "Device-global HBM memory is shared across all blocks"
 
 [facts.memory.hbm.bandwidth]
-value = 1600000000000
+value = 1633108573296
 unit = "byte/s"
-origin = "estimated"
-source = "Ascend 950PR HBM nominal aggregate bandwidth estimate"
-conditions = "Nominal roofline global memory bandwidth for analytical modeling only"
+origin = "measured"
+source = "Ascend 950PR NPU calibration micro-probe (probe_hbm_bw, 56 AIV double-buffered streaming)"
+conditions = "Measured sustainable aggregate HBM streaming bandwidth on target device (1633.11 GB/s, aiv_mte2=0.988)"
 
 [facts.memory.l1.per_aic]
 value = 524288
@@ -138,3 +138,17 @@ unit = "op/s"
 origin = "estimated"
 source = "Ascend 950PR nominal AIV service-op throughput model"
 conditions = "Derived service rate for non-FLOP vector/scalar/select operations"
+
+[facts.memory.ssbuf.per_block]
+value = 3072
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 MixCore GetSsbufBaseAddr and TileLang ssbuf specification"
+conditions = "3 KiB SSBuffer capacity per coupled block (dirty initial state; explicit init required)"
+
+[facts.memory.ssbuf.latency_cycles]
+value = 8
+unit = "cycle"
+origin = "vendor"
+source = "CANN dav-3510 SSBuffer cross-core scalar handoff specification"
+conditions = "Nominal SSBuffer PIPE_S uncached cross-core handoff latency (~8 cycles)"

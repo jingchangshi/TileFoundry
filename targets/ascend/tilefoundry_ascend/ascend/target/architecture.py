@@ -28,10 +28,23 @@ class DaVinci950(Architecture):
     smem_owner: str
     rmem_owner: str
     cube_mmad_atom: str
+    ssbuf_align_bytes: int
+    ssbuf_owner: str
+    valid_dma_paths: tuple[str, ...]
+    forbidden_dma_paths: tuple[str, ...]
+    max_mte2_inflight_per_aiv: int
+    fixpipe_bytes_per_cycle: int
 
     def supports_compute_dtype(self, dtype: DType) -> bool:
         """Return whether DaVinci 950 supports compute on ``dtype``."""
         return dtype in self.supported_compute_dtypes
+
+    def is_dma_path_legal(self, src: str, dst: str) -> bool:
+        """Return whether direct DMA between ``src`` and ``dst`` exists on 3510."""
+        path = f"{src.strip().upper()}->{dst.strip().upper()}"
+        if path in self.forbidden_dma_paths:
+            return False
+        return path in self.valid_dma_paths
 
     def topology_limit(self, name: str) -> int:
         """Return the structural limit for an Ascend topology level."""

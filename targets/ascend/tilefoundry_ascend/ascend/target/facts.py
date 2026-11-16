@@ -39,6 +39,14 @@ class AscendSpaceFacts:
     l0a_align_bytes: int
     l0b_align_bytes: int
     l0c_align_bytes: int
+    ssbuf_bytes: int
+    ssbuf_align_bytes: int
+    ssbuf_latency_cycles: int
+    ssbuf_owner: str
+    max_mte2_inflight_per_aiv: int
+    fixpipe_bytes_per_cycle: int
+    valid_dma_paths: tuple[str, ...]
+    forbidden_dma_paths: tuple[str, ...]
 
     def ub_limit_bytes(self, mode: str = "simdvf", *, unreserved_ubuf: bool = False) -> int:
         """Return mode-specific UB budget in bytes for SimdVF vs SimtVF execution."""
@@ -58,7 +66,15 @@ class AscendSpaceFacts:
             "L0A": self.l0a_bytes,
             "L0B": self.l0b_bytes,
             "L0C": self.l0c_bytes,
+            "SSBUF": self.ssbuf_bytes,
         }.get(space)
+
+    def is_dma_path_legal(self, src: str, dst: str) -> bool:
+        """Return whether direct DMA between ``src`` and ``dst`` exists on 3510."""
+        path = f"{src.strip().upper()}->{dst.strip().upper()}"
+        if path in self.forbidden_dma_paths:
+            return False
+        return path in self.valid_dma_paths
 
 
 def _select_ub_bytes(target, query: object = None, *, default_simdvf: bool = False) -> int:
@@ -93,6 +109,14 @@ def ascend_space_facts(target, query: object = None) -> AscendSpaceFacts:
         l0a_align_bytes=arch.l0a_align_bytes,
         l0b_align_bytes=arch.l0b_align_bytes,
         l0c_align_bytes=arch.l0c_align_bytes,
+        ssbuf_bytes=dev.ssbuf_bytes_per_block,
+        ssbuf_align_bytes=arch.ssbuf_align_bytes,
+        ssbuf_latency_cycles=dev.ssbuf_latency_cycles,
+        ssbuf_owner=arch.ssbuf_owner,
+        max_mte2_inflight_per_aiv=arch.max_mte2_inflight_per_aiv,
+        fixpipe_bytes_per_cycle=arch.fixpipe_bytes_per_cycle,
+        valid_dma_paths=arch.valid_dma_paths,
+        forbidden_dma_paths=arch.forbidden_dma_paths,
     )
 
 

@@ -45,6 +45,7 @@ def test_architecture_and_device_evidence_preserve_ownership() -> None:
             "memory.tmem.owner": "aic",
             "memory.smem.owner": "aiv",
             "memory.rmem.owner": "lane",
+            "memory.ssbuf.owner": "block",
         },
         "ascend.950pr": {"memory.hbm.owner": "target"},
     }
