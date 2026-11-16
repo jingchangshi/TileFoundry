@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from tilefoundry_ascend.agent.flywheel import (
+    FlywheelDistillationReport,
+    FlywheelDistiller,
+)
 from tilefoundry_ascend.agent.kb import (
     AscendCausalRule,
     BayesianRuleTracker,
@@ -43,6 +47,8 @@ __all__ = [
     "BeamCandidate",
     "EvolutionRoundRecord",
     "EvolutionTrajectory",
+    "FlywheelDistillationReport",
+    "FlywheelDistiller",
     "GateFunnel",
     "GenerationRequest",
     "MockLLMBackend",
