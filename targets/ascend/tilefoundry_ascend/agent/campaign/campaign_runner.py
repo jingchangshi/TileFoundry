@@ -22,6 +22,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     PerfTargetSpec,
     RegimeTargetSpec,
     append_dynamic_anchor,
+    build_anchor_var_bindings,
     default_source_root,
     get_default_anchors,
     get_default_perf_target,
@@ -806,8 +807,11 @@ class PerfTargetCampaignRunner:
         module_source: str,
         regime_spec: RegimeTargetSpec,
     ) -> StageAResult:
+        anchor_dims = (
+            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+        )
         try:
-            resolved = resolve_regime_config(module_source, regime_spec)
+            resolved = resolve_regime_config(module_source, regime_spec, dims=anchor_dims)
         except Exception as exc:
             return StageAResult(
                 passed=False,
@@ -815,6 +819,10 @@ class PerfTargetCampaignRunner:
                 ledger=None,
                 error_message=f"stage_a_config_resolve_error: {type(exc).__name__}: {exc}",
             )
+        var_bindings = build_anchor_var_bindings(
+            anchor_dims,
+            kwargs=resolved.builder_kwargs,
+        )
         return run_stage_a_static(
             module_source,
             factory_name=resolved.builder_name,
@@ -822,6 +830,7 @@ class PerfTargetCampaignRunner:
             pass_configs=resolved.pass_configs or None,
             compile_flags=resolved.compile_flags or None,
             target=self._target,
+            var_bindings=var_bindings or None,
             enable_track_router=self._enable_track_router,
         )
 
@@ -1307,8 +1316,35 @@ class PerfTargetCampaignRunner:
             ranked_rules,
             self._beam.exploited_signatures,
         )
+        anchor_dims = (
+            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+        )
+        prescreen_kwargs: dict[str, object] = dict(regime_spec.sample_builder_kwargs)
+        prescreen_factory = func_name
+        prescreen_pc: dict[str, object] = {}
+        prescreen_cf: tuple[str, ...] = ()
+        try:
+            resolved_cfg = resolve_regime_config(
+                incumbent_source,
+                regime_spec,
+                dims=anchor_dims,
+            )
+            prescreen_kwargs.update(resolved_cfg.builder_kwargs)
+            prescreen_factory = resolved_cfg.builder_name
+            prescreen_pc = dict(resolved_cfg.pass_configs)
+            prescreen_cf = resolved_cfg.compile_flags
+        except Exception:
+            pass
+        var_bindings = build_anchor_var_bindings(anchor_dims, kwargs=prescreen_kwargs)
         prescreen_summary = build_prescreen_summary_from_kwargs(
-            regime_spec.sample_builder_kwargs
+            prescreen_kwargs,
+            dsl_source=incumbent_source,
+            factory_name=prescreen_factory,
+            var_bindings=var_bindings or None,
+            config_selector_name=regime_spec.config_selector_fn or None,
+            dims=anchor_dims,
+            pass_configs=prescreen_pc or None,
+            compile_flags=prescreen_cf or None,
         )
         deficit = max(0, self._config.k_rule_workers - len(ranked_rules))
         total_creative = 1 + deficit

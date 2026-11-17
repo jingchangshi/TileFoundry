@@ -25,12 +25,16 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
 )
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     TileConfigCandidate,
+    count_dsl_gemm_calls,
+    evaluate_tile_candidate,
     format_prescreen_summary,
     generate_aligned_neighborhood,
+    prescreen_live_ir_neighborhood,
     prescreen_tile_configs,
 )
 from tilefoundry_ascend.agent.orchestrator.twin_bridge import format_hir_tir_navigation_section
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirTirNavigationPacket
+from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
 CREATIVE_FOCUS_HINTS: tuple[str, ...] = (
     "memory_hierarchy_and_tiling",
@@ -173,17 +177,29 @@ def summarize_excluded_mechanisms(
     return tuple(mechanisms)
 
 
-def build_prescreen_summary_from_kwargs(kwargs: Mapping[str, object] | None) -> str:
-    """Build tile prescreen summary when tile dimensions appear in builder kwargs."""
+def build_prescreen_summary_from_kwargs(
+    kwargs: Mapping[str, object] | None,
+    *,
+    dsl_source: str | None = None,
+    factory_name: str | None = None,
+    var_bindings: Mapping[str, int] | None = None,
+    config_selector_name: str | None = None,
+    dims: Mapping[str, object] | None = None,
+    pass_configs: Mapping[str, object] | None = None,
+    compile_flags: Sequence[str] | str | None = None,
+) -> str:
+    """Build live-IR or analytical dual-accumulator tile prescreen summary."""
     if not kwargs:
         return ""
     lowered = {str(k).lower(): v for k, v in kwargs.items()}
+    lowered_dims = {str(k).lower(): v for k, v in (dims or {}).items()}
 
     def _pick_pos_int(keys: tuple[str, ...]) -> int | None:
-        for key in keys:
-            val = lowered.get(key)
-            if isinstance(val, int) and not isinstance(val, bool) and val > 0:
-                return val
+        for source_map in (lowered, lowered_dims):
+            for key in keys:
+                val = source_map.get(key)
+                if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+                    return val
         return None
 
     bm_val = _pick_pos_int(("bm", "tile_m"))
@@ -194,18 +210,68 @@ def build_prescreen_summary_from_kwargs(kwargs: Mapping[str, object] | None) -> 
     stages_val = _pick_pos_int(("stages", "num_stages")) or 2
     dtype_str = str(lowered.get("tl_dtype", lowered.get("dtype", "bfloat16"))).lower()
     dtype_bytes = 4 if ("float32" in dtype_str or dtype_str == "f32") else 2
+    d_out_val = _pick_pos_int(("d_out", "d_nope", "d_v")) or 0
+    gemm_count = count_dsl_gemm_calls(dsl_source) if dsl_source else 0
+    dual_acc = bool(gemm_count >= 2 or d_out_val > 0)
+
     center = TileConfigCandidate(
         bm=bm_val or 64,
         bn=bn_val or 64,
         bk=bk_val or 64,
         stages=stages_val,
         dtype_bytes=dtype_bytes,
+        d_out=d_out_val,
+        dual_accumulator=dual_acc,
     )
-    neighbors = generate_aligned_neighborhood(center)
-    scores = prescreen_tile_configs(neighbors, top_k=4)
-    if not scores:
+
+    if dsl_source and factory_name:
+        try:
+            live_summary = prescreen_live_ir_neighborhood(
+                dsl_source,
+                factory_name=factory_name,
+                center=center,
+                base_kwargs=kwargs,
+                var_bindings=var_bindings,
+                config_selector_name=config_selector_name,
+                pass_configs=pass_configs,
+                compile_flags=compile_flags,
+                dims=dims,
+            )
+            if live_summary:
+                return live_summary
+        except Exception:
+            pass
+
+    facts = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
+    center_score = evaluate_tile_candidate(center, facts)
+    pool = list(generate_aligned_neighborhood(center))
+    if not center_score.is_feasible and center.bm >= 64:
+        step = 16 * max(1, center.aiv_split)
+        half_bm = ((center.bm // 2) // step) * step
+        if half_bm >= 16 and half_bm != center.bm:
+            for bn_cand in dict.fromkeys((center.bn, max(16, center.bn // 2))):
+                if bn_cand % 16 == 0:
+                    pool.append(
+                        TileConfigCandidate(
+                            bm=half_bm,
+                            bn=bn_cand,
+                            bk=center.bk,
+                            stages=center.stages,
+                            dtype_bytes=center.dtype_bytes,
+                            accum_bytes=center.accum_bytes,
+                            aiv_split=center.aiv_split,
+                            d_out=center.d_out,
+                            dual_accumulator=center.dual_accumulator,
+                        )
+                    )
+
+    feasible = prescreen_tile_configs(pool, top_k=4)
+    display_scores = list(feasible)
+    if not center_score.is_feasible:
+        display_scores.append(center_score)
+    if not display_scores:
         return ""
-    return format_prescreen_summary(scores)
+    return format_prescreen_summary(display_scores)
 
 
 @dataclass(frozen=True)
@@ -397,7 +463,11 @@ class PortfolioRunner:
         parent: BeamCandidate,
         round_idx: int,
         *,
+        factory_name: str | None = None,
         factory_kwargs: Mapping[str, object] | None = None,
+        var_bindings: Mapping[str, int] | None = None,
+        config_selector_name: str | None = None,
+        dims: Mapping[str, object] | None = None,
         navigation_context: str = "",
         ideal_roofline_us: float = 0.0,
         nav_packet: HirTirNavigationPacket | None = None,
@@ -437,7 +507,14 @@ class PortfolioRunner:
             matched_rules,
             self._beam.exploited_signatures,
         )
-        prescreen_summary = build_prescreen_summary_from_kwargs(factory_kwargs)
+        prescreen_summary = build_prescreen_summary_from_kwargs(
+            factory_kwargs,
+            dsl_source=parent.dsl_source,
+            factory_name=factory_name,
+            var_bindings=var_bindings,
+            config_selector_name=config_selector_name,
+            dims=dims,
+        )
         deficit = max(0, self._k_rules - len(matched_rules))
         total_creative = 1 + deficit
         for c_idx in range(total_creative):
@@ -473,6 +550,9 @@ class PortfolioRunner:
         round_idx: int,
         factory_name: str | None,
         factory_kwargs: dict[str, object] | None,
+        var_bindings: Mapping[str, int] | None = None,
+        config_selector_name: str | None = None,
+        dims: Mapping[str, object] | None = None,
     ) -> tuple[BeamCandidate | None, bool, tuple[str, str, str] | None]:
         try:
             raw_reply = await self._backend.generate(spec.request)
@@ -497,6 +577,9 @@ class PortfolioRunner:
             dsl_source,
             factory_name=factory_name,
             factory_kwargs=factory_kwargs,
+            config_selector_name=config_selector_name,
+            dims=dims,
+            var_bindings=var_bindings,
         )
         if not evaluation.passed and evaluation.failed_stage in ("stage_a", "stage_b"):
             for _ in range(self._max_repairs):
@@ -518,6 +601,9 @@ class PortfolioRunner:
                     dsl_source,
                     factory_name=factory_name,
                     factory_kwargs=factory_kwargs,
+                    config_selector_name=config_selector_name,
+                    dims=dims,
+                    var_bindings=var_bindings,
                 )
                 if evaluation.passed:
                     break
@@ -613,6 +699,9 @@ class PortfolioRunner:
         round_idx: int = 1,
         factory_name: str | None = None,
         factory_kwargs: dict[str, object] | None = None,
+        var_bindings: Mapping[str, int] | None = None,
+        config_selector_name: str | None = None,
+        dims: Mapping[str, object] | None = None,
         navigation_context: str = "",
         ideal_roofline_us: float = 0.0,
         nav_packet: HirTirNavigationPacket | None = None,
@@ -621,7 +710,11 @@ class PortfolioRunner:
         specs = self.plan_workers(
             parent,
             round_idx,
+            factory_name=factory_name,
             factory_kwargs=factory_kwargs,
+            var_bindings=var_bindings,
+            config_selector_name=config_selector_name,
+            dims=dims,
             navigation_context=navigation_context,
             ideal_roofline_us=ideal_roofline_us,
             nav_packet=nav_packet,
@@ -632,6 +725,9 @@ class PortfolioRunner:
                 round_idx=round_idx,
                 factory_name=factory_name,
                 factory_kwargs=factory_kwargs,
+                var_bindings=var_bindings,
+                config_selector_name=config_selector_name,
+                dims=dims,
             )
             for spec in specs
         ]

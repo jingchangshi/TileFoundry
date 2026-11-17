@@ -279,6 +279,7 @@ def run_stage_a_static(
     compile_flags: Sequence[str] | str | None = None,
     config_selector_name: str | None = None,
     dims: Mapping[str, object] | None = None,
+    var_bindings: Mapping[str, int] | None = None,
     enable_track_router: bool = False,
 ) -> StageAResult:
     """Run millisecond Stage A AST, Two-Snapshot IR Diff, and optional track routing."""
@@ -302,6 +303,7 @@ def run_stage_a_static(
             target=target,
             pass_configs=merged_pc or None,
             compile_flags=merged_cf or None,
+            var_bindings=var_bindings,
         )
     except Exception as exc:
         return StageAResult(
@@ -652,6 +654,7 @@ class GateFunnel:
         pass_configs: dict[str, object] | None = None,
         compile_flags: Sequence[str] | str | None = None,
         dims: Mapping[str, object] | None = None,
+        var_bindings: Mapping[str, int] | None = None,
     ) -> FunnelEvaluation:
         """Run Stage A, Stage B, and Stage C sequentially with early rejection."""
         stage_a = run_stage_a_static(
@@ -663,6 +666,7 @@ class GateFunnel:
             compile_flags=compile_flags,
             config_selector_name=config_selector_name,
             dims=dims,
+            var_bindings=var_bindings,
             enable_track_router=self._enable_track_router,
         )
         if not stage_a.passed or stage_a.ledger is None:
@@ -734,6 +738,11 @@ def prescreen_dsl_tile_kwargs(
     factory_name: str,
     candidate_kwargs_list: Sequence[Mapping[str, object]],
     target: AscendTarget | None = None,
+    var_bindings: Mapping[str, int] | None = None,
+    config_selector_name: str | None = None,
+    pass_configs: dict[str, object] | None = None,
+    compile_flags: Sequence[str] | str | None = None,
+    dims: Mapping[str, object] | None = None,
 ) -> tuple[dict[str, object], StageAResult]:
     """Run Stage A across tile kwargs and pick the lowest-cost legal configuration."""
     if not candidate_kwargs_list:
@@ -747,6 +756,11 @@ def prescreen_dsl_tile_kwargs(
             factory_name=factory_name,
             factory_kwargs=kwargs,
             target=target,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+            config_selector_name=config_selector_name,
+            dims=dims,
+            var_bindings=var_bindings,
         )
         ledger = res.ledger
         if not res.passed or ledger is None:

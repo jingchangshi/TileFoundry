@@ -507,5 +507,72 @@ def test_fp1_physical_ledger_from_dict_roundtrip() -> None:
         mte2_inflight_per_aiv=18,
         unaligned_dma_padding_bytes=64,
         opaque_dynamic_regions=("while_loop", "dynamic_for:k"),
+        grid_is_symbolic=True,
     )
     assert ObjectivePhysicalLedger.from_dict(ro_ledger.to_dict()) == ro_ledger
+
+
+def test_symbolic_grid_var_bindings_and_r13_guard(tmp_path: pathlib.Path) -> None:
+    """Verify symbolic grid resolution via var_bindings and R13 guard on unbound grids."""
+    import importlib.util
+    from tilefoundry_ascend.agent.kb import build_predicate_context, load_seed_rules
+
+    src = """
+import tilelang.ascend.language as T
+
+def make_dyn_vec():
+    m_rows = T.dynamic("m_rows")
+    @T.prim_func
+    def main(
+        X: T.Tensor((m_rows, 64), "float32"),
+        Y: T.Tensor((m_rows, 64), "float32"),
+    ):
+        n_blk = T.ceildiv(m_rows, 64)
+        with T.Kernel(n_blk) as bx:
+            ub = T.alloc_shared((64, 64), "float32")
+            T.copy(X[bx * 64 : bx * 64 + 64, 0:64], ub)
+            T.copy(ub, Y[bx * 64 : bx * 64 + 64, 0:64])
+    return main
+
+def make_dyn_q_head():
+    q_total_rows = T.dynamic("q_total_rows")
+    @T.prim_func
+    def main(
+        Q: T.Tensor((q_total_rows, 64), "float32"),
+        Out: T.Tensor((q_total_rows, 64), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(q_total_rows, 64)) as bx:
+            ub = T.alloc_shared((64, 64), "float32")
+            T.copy(Q[bx * 64 : bx * 64 + 64, 0:64], ub)
+            T.copy(ub, Out[bx * 64 : bx * 64 + 64, 0:64])
+    return main
+"""
+    mod_path = tmp_path / "dyn_grid_kernels.py"
+    mod_path.write_text(src, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("_tf_dyn_grid_test", str(mod_path))
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    r13 = next(r for r in load_seed_rules() if r.rule_id == "R13_SPLIT_KV_WAVE_RECOVERY")
+
+    vec_fn = mod.make_dyn_vec()
+    bound_high = inspect_tilelang_primfunc(vec_fn, var_bindings={"m_rows": 4096})
+    assert bound_high.ledger.grid_blocks == 64
+    assert bound_high.ledger.grid_is_symbolic is False
+    assert bound_high.ledger.wave_occupancy > 1.0
+    assert r13.matches(build_predicate_context(bound_high.ledger)) is False
+
+    unbound = inspect_tilelang_primfunc(vec_fn, var_bindings=None)
+    assert unbound.ledger.grid_is_symbolic is True
+    assert unbound.ledger.wave_occupancy == 1.0
+    assert unbound.ledger.grid_blocks == 56
+    assert r13.matches(build_predicate_context(unbound.ledger)) is False
+    assert ObjectivePhysicalLedger.from_dict(unbound.ledger.to_dict()) == unbound.ledger
+
+    q_fn = mod.make_dyn_q_head()
+    bound_low = inspect_tilelang_primfunc(q_fn, var_bindings={"q_total_rows": 1 * 1 * 128})
+    assert bound_low.ledger.grid_blocks == 2
+    assert bound_low.ledger.grid_is_symbolic is False
+    assert 0.0 < bound_low.ledger.wave_occupancy < 0.5
+    assert r13.matches(build_predicate_context(bound_low.ledger)) is True

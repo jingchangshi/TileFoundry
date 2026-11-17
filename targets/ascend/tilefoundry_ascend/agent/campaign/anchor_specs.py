@@ -96,6 +96,7 @@ class RegimeTargetSpec:
     sample_builder_kwargs: dict[str, object]
     description: str = ""
     representative_hir_dims: dict[str, int] = field(default_factory=dict)
+    representative_anchor_dims: dict[str, int] = field(default_factory=dict)
     config_selector_fn: str = ""
     editable_symbols: tuple[str, ...] = ()
     allowed_helper_prefix: str = ""
@@ -110,6 +111,9 @@ class RegimeTargetSpec:
             "representative_hir_dims": {
                 str(k): int(v) for k, v in self.representative_hir_dims.items()
             },
+            "representative_anchor_dims": {
+                str(k): int(v) for k, v in self.representative_anchor_dims.items()
+            },
             "config_selector_fn": self.config_selector_fn,
             "editable_symbols": list(self.editable_symbols),
             "allowed_helper_prefix": self.allowed_helper_prefix,
@@ -120,6 +124,7 @@ class RegimeTargetSpec:
         """Reconstruct RegimeTargetSpec from a JSON mapping."""
         raw_kwargs = payload.get("sample_builder_kwargs") or {}
         raw_dims = payload.get("representative_hir_dims") or {}
+        raw_anchor_dims = payload.get("representative_anchor_dims") or {}
         return cls(
             regime_tag=str(payload["regime_tag"]),
             builder_candidates=tuple(str(x) for x in payload.get("builder_candidates", ())),
@@ -128,6 +133,11 @@ class RegimeTargetSpec:
             representative_hir_dims=(
                 {str(k): int(v) for k, v in raw_dims.items()}
                 if isinstance(raw_dims, Mapping)
+                else {}
+            ),
+            representative_anchor_dims=(
+                {str(k): int(v) for k, v in raw_anchor_dims.items()}
+                if isinstance(raw_anchor_dims, Mapping)
                 else {}
             ),
             config_selector_fn=str(payload.get("config_selector_fn", "")),
@@ -211,6 +221,7 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
             },
             description="Small-row decode regime (m_rows < 28) needing depth/width core sharding.",
             representative_hir_dims={"N": 2, "B": 1, "S": 1, "D": 4096},
+            representative_anchor_dims={"N": 2, "B": 1, "S": 1, "D": 4096},
             config_selector_fn="_select_ar_small_decode_config",
             editable_symbols=(
                 "_select_ar_small_decode_config",
@@ -236,6 +247,7 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "buffering."
             ),
             representative_hir_dims={"N": 8, "B": 1, "S": 4, "D": 1000},
+            representative_anchor_dims={"N": 8, "B": 1, "S": 16, "D": 1000},
             config_selector_fn="_select_ar_unaligned_config",
             editable_symbols=(
                 "_select_ar_unaligned_config",
@@ -258,6 +270,7 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
             },
             description="Aligned prefill regime with 56-core multi-row SimdVF pipelining.",
             representative_hir_dims={"N": 8, "B": 1, "S": 6, "D": 512},
+            representative_anchor_dims={"N": 8, "B": 1, "S": 4096, "D": 4096},
             config_selector_fn="_select_ar_aligned_config",
             editable_symbols=(
                 "_select_ar_aligned_config",
@@ -300,6 +313,15 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "D_nope": 512,
                 "D_rope": 64,
             },
+            representative_anchor_dims={
+                "B": 1,
+                "S": 1,
+                "S_kv": 2048,
+                "N_q": 128,
+                "N_kv": 1,
+                "D_nope": 512,
+                "D_rope": 64,
+            },
             config_selector_fn="_select_mla_decode_config",
             editable_symbols=(
                 "_select_mla_decode_config",
@@ -336,6 +358,15 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "D_nope": 128,
                 "D_rope": 64,
             },
+            representative_anchor_dims={
+                "B": 1,
+                "S": 512,
+                "S_kv": 512,
+                "N_q": 128,
+                "N_kv": 1,
+                "D_nope": 512,
+                "D_rope": 64,
+            },
             config_selector_fn="_select_mla_bnsd_config",
             editable_symbols=(
                 "_select_mla_bnsd_config",
@@ -369,6 +400,15 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "N_q": 8,
                 "N_kv": 1,
                 "D_nope": 128,
+                "D_rope": 64,
+            },
+            representative_anchor_dims={
+                "B": 1,
+                "S": 512,
+                "S_kv": 512,
+                "N_q": 128,
+                "N_kv": 1,
+                "D_nope": 512,
                 "D_rope": 64,
             },
             config_selector_fn="_select_mla_prefill_config",
@@ -591,6 +631,69 @@ def compute_case_eq3_score(ref_perf_us: float, cand_us: float, t_hw_us: float) -
     return max(0.0, (baseline - t_hw_us) / denom)
 
 
+_ANCHOR_DIM_ALIASES: dict[str, str] = {
+    "N": "n_depth",
+    "B": "b_dim",
+    "S": "s_dim",
+    "S_q": "s_dim",
+    "S_kv": "s_kv",
+    "D": "d_dim",
+    "N_q": "n_q",
+    "N_kv": "n_kv",
+    "D_nope": "d_nope",
+    "D_rope": "d_rope",
+}
+
+
+def build_anchor_var_bindings(
+    dims: Mapping[str, object] | None,
+    *,
+    kwargs: Mapping[str, object] | None = None,
+) -> dict[str, int]:
+    """Build rule-blind symbolic integer bindings from anchor dims and builder kwargs."""
+    out: dict[str, int] = {}
+    if kwargs:
+        for key, raw_val in kwargs.items():
+            if isinstance(raw_val, int) and not isinstance(raw_val, bool):
+                out[str(key)] = int(raw_val)
+
+    explicit_dim_keys: set[str] = set()
+    if dims:
+        for key, raw_val in dims.items():
+            if isinstance(raw_val, int) and not isinstance(raw_val, bool):
+                key_str = str(key)
+                iv = int(raw_val)
+                out[key_str] = iv
+                explicit_dim_keys.add(key_str)
+                alias = _ANCHOR_DIM_ALIASES.get(key_str)
+                if alias:
+                    out[alias] = iv
+                    explicit_dim_keys.add(alias)
+
+    b_val = out.get("B", out.get("b_dim"))
+    s_val = out.get("S", out.get("S_q", out.get("s_dim")))
+    nq_val = out.get("N_q", out.get("n_q"))
+    n_val = out.get("N", out.get("n_depth"))
+
+    if b_val is not None and s_val is not None and "m_rows" not in explicit_dim_keys:
+        out["m_rows"] = int(b_val) * int(s_val)
+    if (
+        b_val is not None
+        and s_val is not None
+        and nq_val is not None
+        and "q_total_rows" not in explicit_dim_keys
+    ):
+        out["q_total_rows"] = int(b_val) * int(s_val) * int(nq_val)
+    if (
+        n_val is not None
+        and b_val is not None
+        and s_val is not None
+        and "v_rows" not in explicit_dim_keys
+    ):
+        out["v_rows"] = int(n_val) * int(b_val) * int(s_val)
+    return out
+
+
 __all__ = [
     "ATTENTION_RESIDUAL_ANCHORS",
     "AnchorCaseSpec",
@@ -603,6 +706,7 @@ __all__ = [
     "RegimeSpec",
     "RegimeTargetSpec",
     "append_dynamic_anchor",
+    "build_anchor_var_bindings",
     "compute_case_eq3_score",
     "default_source_root",
     "get_default_anchors",

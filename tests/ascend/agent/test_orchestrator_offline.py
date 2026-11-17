@@ -33,9 +33,13 @@ from tilefoundry_ascend.agent.orchestrator import (
 )
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     TILELANG_ASCEND_PRIMITIVE_MENU,
+    build_prescreen_summary_from_kwargs,
 )
+from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import evaluate_tile_candidate
+from tilefoundry_ascend.agent.campaign.anchor_specs import build_anchor_var_bindings
 from tilefoundry_ascend.agent.kb import load_seed_rules
 from tilefoundry_ascend.ascend.passes import build_objective_physical_ledger, build_scope_waterline
+from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
 _SEED_DSL = """
 import tilelang.ascend.language as T
@@ -671,3 +675,106 @@ def test_stage_a_track_router_disabled_by_default_and_primitive_menu(monkeypatch
     assert "### EXECUTION TRACK" not in cre_req.user_prompt
     assert "### TILELANG ASCEND PRIMITIVE REFERENCE" in cre_req.user_prompt
     assert TILELANG_ASCEND_PRIMITIVE_MENU in cre_req.user_prompt
+
+
+def test_dual_accumulator_analytical_and_live_ir_prescreen() -> None:
+    """Verify dual-accumulator L0C overflow rejection and live-IR prescreen dry-run."""
+    facts = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
+    bad_cand = TileConfigCandidate(
+        bm=128,
+        bn=64,
+        bk=64,
+        stages=2,
+        d_out=512,
+        dual_accumulator=True,
+    )
+    bad_score = evaluate_tile_candidate(bad_cand, facts)
+    assert bad_score.is_feasible is False
+    assert bad_score.l0c_bytes == 294912
+    assert bad_score.rejection_reason == "L0C_overflow:294912>262144"
+
+    good_cand = TileConfigCandidate(
+        bm=64,
+        bn=64,
+        bk=64,
+        stages=2,
+        d_out=512,
+        dual_accumulator=True,
+    )
+    good_score = evaluate_tile_candidate(good_cand, facts)
+    assert good_score.is_feasible is True
+    assert good_score.l0c_bytes == 147456
+    assert good_score.ub_bytes_per_aiv == 131072
+
+    fixed_bn_dual_dsl = """
+import tilelang.ascend.language as T
+
+def make_fixed_bn(bm: int = 128, d_nope: int = 512):
+    @T.prim_func
+    def main(A: T.Tensor((128, 64), "float16"), B: T.Tensor((64, 64), "float16")):
+        with T.Kernel(1):
+            a_l1 = T.alloc_l1((bm, 64), "float16")
+            b_l1 = T.alloc_l1((64, 64), "float16")
+            s_l0c = T.alloc_l0c((bm, 64), "float32")
+            o_l0c = T.alloc_l0c((bm, d_nope), "float32")
+            T.gemm(a_l1, b_l1, s_l0c, transpose_B=True, clear_accum=True)
+            T.gemm(a_l1, b_l1, o_l0c, transpose_B=True, clear_accum=True)
+    return main
+"""
+    analytical_summary = build_prescreen_summary_from_kwargs(
+        {"bm": 128, "bn": 64, "bk": 64, "d_nope": 512},
+        dsl_source=fixed_bn_dual_dsl,
+        factory_name="make_fixed_bn",
+    )
+    assert "REJECT(L0C_overflow:294912>262144)" in analytical_summary
+    assert "| OK |" in analytical_summary
+    assert "bm=128, bn=64, bk=64, stages=2, aiv_split=2, d_out=512 | OK" not in analytical_summary
+
+    analytical_ok_summary = build_prescreen_summary_from_kwargs(
+        {"bm": 64, "bn": 64, "bk": 64, "d_nope": 512},
+        dsl_source=fixed_bn_dual_dsl,
+        factory_name="make_fixed_bn",
+    )
+    assert "bm=64," in analytical_ok_summary
+    assert "| OK |" in analytical_ok_summary
+
+    live_dual_dsl = """
+import tilelang.ascend.language as T
+
+def make_dual(bm: int = 128, bn: int = 64, bk: int = 64, num_stages: int = 2):
+    m_rows = T.dynamic("m_rows")
+    @T.prim_func
+    def main(
+        X: T.Tensor((m_rows, 512), "float16"),
+        W: T.Tensor((512, 512), "float16"),
+        Y: T.Tensor((m_rows, 512), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(m_rows, bm)) as bx:
+            x_l1 = T.alloc_l1((bm, bk), "float16")
+            w_l1 = T.alloc_l1((bn, bk), "float16")
+            s_l0c = T.alloc_l0c((bm, bn), "float32")
+            o_l0c = T.alloc_l0c((bm, 512), "float32")
+            for kt in T.Pipelined(2, num_stages=num_stages):
+                T.copy(X[bx * bm : bx * bm + bm, kt * bk : (kt + 1) * bk], x_l1)
+                T.copy(W[0:bn, kt * bk : (kt + 1) * bk], w_l1)
+                T.gemm(x_l1, w_l1, s_l0c, transpose_B=True, clear_accum=kt == 0)
+            T.copy(s_l0c, Y[bx * bm : bx * bm + bm, 0:bn])
+            T.copy(o_l0c, Y[bx * bm : bx * bm + bm, 0:512])
+    return main
+"""
+    bindings = build_anchor_var_bindings(
+        {"B": 1, "S": 512, "D_nope": 512},
+        kwargs={"bm": 128, "bn": 64, "bk": 64},
+    )
+    assert bindings["m_rows"] == 512
+    assert bindings["d_nope"] == 512
+    live_summary = build_prescreen_summary_from_kwargs(
+        {"bm": 128, "bn": 64, "bk": 64, "num_stages": 2, "d_nope": 512},
+        dsl_source=live_dual_dsl,
+        factory_name="make_dual",
+        var_bindings=bindings,
+    )
+    assert "Live-IR Tile Prescreen Summary:" in live_summary
+    assert "REJECT(L0C_overflow:294912>262144)" in live_summary
+    assert "bm=64, bn=64" in live_summary
+    assert "| OK |" in live_summary

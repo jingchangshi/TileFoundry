@@ -389,6 +389,7 @@ def run_l0_static_precheck(
     pass_configs: dict[str, object] | None = None,
     compile_flags: Sequence[str] | str | None = None,
     dims: Mapping[str, object] | None = None,
+    var_bindings: Mapping[str, int] | None = None,
 ) -> StageAResult:
     """Run Tier L0 static AST, ledger, and router inspection on Host CPU."""
     return run_stage_a_static(
@@ -399,6 +400,7 @@ def run_l0_static_precheck(
         compile_flags=compile_flags,
         config_selector_name=config_selector_name,
         dims=dims,
+        var_bindings=var_bindings,
     )
 
 

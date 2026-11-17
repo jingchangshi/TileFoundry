@@ -77,6 +77,7 @@ class ObjectivePhysicalLedger:
     has_online_rescale_loop: bool = False
     in_loop_ub_reload_stores: int = 0
     uses_unreserved_ubuf: bool = False
+    grid_is_symbolic: bool = False
 
     def __post_init__(self) -> None:
         if self.analysis_mode not in ("exact_modulo_z3", "readonly_envelope"):
@@ -136,6 +137,7 @@ class ObjectivePhysicalLedger:
             has_online_rescale_loop=bool(payload.get("has_online_rescale_loop", False)),
             in_loop_ub_reload_stores=int(payload.get("in_loop_ub_reload_stores", 0)),
             uses_unreserved_ubuf=bool(payload.get("uses_unreserved_ubuf", False)),
+            grid_is_symbolic=bool(payload.get("grid_is_symbolic", False)),
         )
 
 
@@ -198,6 +200,7 @@ def build_objective_physical_ledger(
     has_online_rescale_loop: bool = False,
     in_loop_ub_reload_stores: int = 0,
     uses_unreserved_ubuf: bool = False,
+    grid_is_symbolic: bool = False,
 ) -> ObjectivePhysicalLedger:
     """Assemble an ObjectivePhysicalLedger and derive the dominant pipe."""
     cleaned_pipes = dict(sorted(pipe_cycles.items()))
@@ -222,6 +225,7 @@ def build_objective_physical_ledger(
         has_online_rescale_loop=bool(has_online_rescale_loop),
         in_loop_ub_reload_stores=int(in_loop_ub_reload_stores),
         uses_unreserved_ubuf=bool(uses_unreserved_ubuf),
+        grid_is_symbolic=bool(grid_is_symbolic),
     )
 
 

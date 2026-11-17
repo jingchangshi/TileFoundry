@@ -168,7 +168,7 @@ rules:
 
   - rule_id: R13_SPLIT_KV_WAVE_RECOVERY
     regime_guard: "is_legal and (PIPE_M > 0 or PIPE_V > 0 or PIPE_MTE2 > 0)"
-    precondition: "0.0 < wave_occupancy < 0.5"
+    precondition: "(not grid_is_symbolic) and 0.0 < wave_occupancy < 0.5"
     transform_template: |
       Split the outer reduction or key-value sequence dimension across multiple grid blocks and
       paired vector sub-cores with a partial-state merge epilogue (or T.set_atomic reduction) so

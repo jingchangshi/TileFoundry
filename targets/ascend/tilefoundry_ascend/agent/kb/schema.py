@@ -318,6 +318,7 @@ def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
     )
     ns["wave_occupancy"] = float(ledger.wave_occupancy)
     ns["grid_blocks"] = int(ledger.grid_blocks)
+    ns["grid_is_symbolic"] = bool(ledger.grid_is_symbolic)
     ns["gm_roundtrip_bytes"] = int(ledger.gm_roundtrip_bytes)
     ns["dominant_contig_bytes"] = int(ledger.dominant_contig_bytes)
     ns["effective_cube_m"] = int(ledger.effective_cube_m)
