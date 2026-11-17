@@ -9,7 +9,7 @@ flowchart TD
     L1["Layer 1: Target Hardware Modeling, 50 TIR Instructions, and Z3 Scheduler Plugin\n(targets/ascend/tilefoundry_ascend/ascend/)"]
     HW["target/hardware/{davinci_950,ascend_950pr}.toml + target/{architecture,device,spec,facts,target}.py\nFact Projection + 216/248/256 KiB Three-Tier UB Model + PURE_SIMDVF_UBUF_FLAGS"]
     IR["ir/execution.py (SimdVF/SimtVF) + ir/tir/instructions.py (50 T.ascend_* ops)\nvisitor_registry/candidates.py (Unified HIR Mapping + 16 Reshard Candidates)"]
-    PASS["passes/pipeline.py (ValidateAscendPipelines, ResolveAscendPipelines)\npasses/physical_ledger.py + schedule/{pipeline_solver,envelope_inspector}.py"]
+    PASS["passes/pipeline.py (ValidateAscendPipelines, ResolveAscendPipelines)\npasses/{physical_ledger,hir_tir_bridge}.py + schedule/{pipeline_solver,envelope_inspector}.py"]
 
     L2["Layer 2: Authored HIR -> Scheduled Mix HIR -> Lowered TIR\n(examples/ascend950pr_ops/<op>/)"]
     MODEL["model.py: Pure Tensor Math Semantics -> evaluate() CPU Alignment"]
@@ -27,7 +27,7 @@ flowchart TD
     MODEL --> SCHED
     SCHED -->|"BEFORE_LOWER -> Lowering -> AFTER_LOWER"| TIR
     PASS -.->|"Dual-Mode Z3 & Envelope Analysis"| TIR
-    L2 --> L3
+    L2 -->|"HirTirNavigationPacket + @runtime_module Twin"| L3
     L3 --> TLK
     TLK --> NPU
 ```
@@ -138,20 +138,21 @@ flowchart TD
 
 ## 5. Autonomous Causal Evolution and 5-Tier Campaign Architecture
 
-Beyond static lowering, `targets/ascend/tilefoundry_ascend/agent/` closes the loop from L0 HIR pre-routing to verified knowledge distillation while preserving strict compiler rule-blindness (`targets/ascend/tilefoundry_ascend/ascend/` never imports `tilefoundry_ascend.agent` or operator names):
+Beyond static lowering, `targets/ascend/tilefoundry_ascend/agent/` closes the loop from Layer 2 HIR/TIR navigation to verified knowledge distillation while preserving strict compiler rule-blindness (`targets/ascend/tilefoundry_ascend/ascend/` never imports `tilefoundry_ascend.agent` or operator names):
 
 ```mermaid
 flowchart TD
-    HIR["Authored HIR / Schedule Input"]
-    CAP["L0 Pre-Routing (capability_gate.py)\nextract_structural_features() + route_execution_track() + Optional TIR Blueprint (as_script)"]
-    SEED["Tier-0 Seed Synthesis (e2e_evolution.py)\nbuild_hir_seed_request() -> @T.prim_func DSL Seed"]
+    HIR["Authored HIR (model.py) + Scheduled HIR (scheduled.py)\n+ RegimeTargetSpec.representative_hir_dims (anchor_specs.py)"]
+    BRIDGE["HIR->TIR Bridge (ascend/passes/hir_tir_bridge.py)\ncheck_program -> analyze -> finalize (24-bit Z3) -> as_script\nHirTirNavigationPacket: HirRooflineSummary + legal ops + tir_ledger"]
+    TWIN["TileLang Twin Bridge (agent/orchestrator/twin_bridge.py)\nbuild_tilelang_runtime_twin (@runtime_module) + verify_twin_cpu_reference (vs evaluate)\nformat_hir_tir_navigation_section + TIR vs TileLang Ledger Delta"]
+    SEED["Tier-0 Seed Synthesis (e2e_evolution.py)\nbuild_hir_seed_request() -> @T.prim_func DSL Seed (track='unconstrained')"]
 
-    PRESCREEN["Neighborhood Prescreen (tilesize_prescreen.py)\nDeterministic tile_kwargs pruning -> Static prescreen summary"]
-    STAGEA["Dual-Mode Stage A & Physical Ledger\nMode A: 24-bit Z3 solver (pipeline_solver.py) for T.Pipelined II\nMode B: Two-Snapshot IR Diff (envelope_inspector.py -> physical_ledger.py)"]
+    PRESCREEN["Neighborhood Prescreen & Unconstrained Menu\ntilesize_prescreen.py + full TILELANG_ASCEND_PRIMITIVE_MENU\n(enable_track_router=False by default; capability_gate.py dormant for unit tests)"]
+    STAGEA["Dual-Mode Stage A & Enriched Physical Ledger\nMode A: 24-bit Z3 solver (pipeline_solver.py) for T.Pipelined II\nMode B: Two-Snapshot IR Diff (envelope_inspector.py -> physical_ledger.py, 10 white-box metrics)"]
 
-    KB["BayesianRuleTracker (agent/kb/)\nTrue rule.matches(ctx) using parent.features + parent.residual"]
-    EXPLOIT["Rule-Exploit Workers (up to K)\nMatched rules only; no active_rules padding;\nTransport errors exempt from negative KB trials"]
-    EXPLORE["Rule-Blind Creative Workers (1 + unfilled slots)\nOrthogonal focus hints + NEGATIVE CONSTRAINTS + prescreen summary;\nZero R01..R12 rule IDs or YAML leakage"]
+    KB["BayesianRuleTracker (agent/kb/seed_rules.yaml: R01-R17)\nPure ledger + StaticDynamicResidual predicates via build_predicate_context()\n(Zero phi_1..phi_8 dependencies)"]
+    EXPLOIT["Rule-Exploit Workers (up to K)\nMatched rules only; no active_rules padding;\nTIR vs Current Ledger Delta + Transport errors exempt from negative KB trials"]
+    EXPLORE["Rule-Blind Creative Workers (1 + unfilled slots)\nOrthogonal focus hints + NEGATIVE CONSTRAINTS + prescreen + nav delta;\nZero R01..R17 rule IDs or YAML leakage"]
 
     L0["Tier L0: Dual-Mode Stage A + Prescreen Gate"]
     L1["Tier L1: Compile & Smoke Check"]
@@ -160,9 +161,11 @@ flowchart TD
     L4["Tier L4: Official AgentGates CANNBench Gate"]
 
     BEAM["TwoLaneBeamSearch (residual_beam.py)\nExploited + Stepping-Stone Lanes + mark_parent_selected + Checkpoint beam_state"]
-    FLY["Fail-Closed Flywheel (ablation_distiller.py)\nSingle-variable AST chunking -> 7-class parameterized micro-probes (30-50 lines)\nstmt_rewrite -> None (never admitted); Hardware gate >= 1.08x + wait-ratio check"]
+    FLY["Fail-Closed Flywheel (ablation_distiller.py)\nSingle-variable AST chunking -> 7-class parameterized micro-probes (30-50 lines)\nstmt_rewrite -> None; Hardware gate >= 1.08x + wait-ratio check; Ledger-only predicates"]
 
-    HIR --> CAP --> SEED --> PRESCREEN --> STAGEA
+    HIR --> BRIDGE --> TWIN --> SEED --> PRESCREEN --> STAGEA
+    TWIN -.->|"Per-regime nav_packet + ledger delta"| EXPLOIT
+    TWIN -.->|"Per-regime nav_packet + ledger delta"| EXPLORE
     STAGEA --> KB
     KB -->|"rule.matches(ctx) == True"| EXPLOIT
     KB -->|"Unfilled slots convert cleanly"| EXPLORE
@@ -179,21 +182,32 @@ flowchart TD
     FLY -->|"Pure-English 6-tuple rules only"| KB
 ```
 
-### 5.1 L0 HIR Pre-Routing & Dual-Mode Stage A Accounting
+### 5.1 Layer 2 -> Layer 3 HIR/TIR Navigation, Twin Bridge & Dual-Mode Stage A
 
-- **L0 Pre-Routing (`capability_gate.py` & `e2e_evolution.py`)**: `_inspect_hir_for_seed()` inspects CPU-loadable HIR modules with `extract_structural_features` and `route_execution_track`, and exports lowered native TIR blueprints (`analyze` -> `finalize` -> `as_script`) when concrete, seeding Tier-0 `@T.prim_func` generation directly on the routed execution track (`T.MixedKernel` / `SimdVF`).
-- **Dual-Mode Stage A (`envelope_inspector.py`, `physical_ledger.py`, `gate_funnel.py`)**:
-  - **Mode A (Static `T.Pipelined` Modulo Solver)**: Runs 24-bit Z3 scheduling (`pipeline_solver.py`) for explicit `T.Pipelined` stages to resolve steady-state initiation interval (`steady_state_ii`) and buffer versions.
-  - **Mode B (Two-Snapshot IR Diff Envelope Inspector)**: Captures `BEFORE_LOWER` and `AFTER_LOWER` lowered snapshots in `envelope_inspector.py` to quantify real on-chip waterlines, implicit compiler bloat (`peak_allocated_bytes - explicit_bytes`), and `degraded_single_buffers` without rule injection or kernel-specific heuristics, aggregated through `build_objective_physical_ledger()`.
+- **Layer 2 -> Layer 3 `HirTirNavigationPacket` Bridge (`ascend/passes/hir_tir_bridge.py`)**: `compile_hir_navigation_packet()` ingests `Authored HIR (model.py)`, optional `Scheduled HIR (scheduled.py)`, and `anchor_dims` (from `RegimeTargetSpec.representative_hir_dims` in `agent/campaign/anchor_specs.py`), executes `check_program` -> `analyze` -> `finalize` (24-bit Z3 pipeline solver) -> `verify_prim_function` -> `as_script`, and emits a `HirTirNavigationPacket` containing:
+  - `HirRooflineSummary` (`compute_flops`, `min_gm_bytes`, `arithmetic_intensity`, `compute_floor_us`, `memory_floor_us`, `ideal_roofline_us`, `dominant_bound`),
+  - Legal `HirCandidateOpEntry` mappings from `report_candidates()`,
+  - Lowered `tir_script` (`as_script` TIR blueprint) and `z3_pipeline_summary`,
+  - `tir_ledger` (`ObjectivePhysicalLedger` via `inspect_tir_envelope()`), providing the Layer 2 reference target for Tier-0 seed synthesis (`e2e_evolution.py`), inner/outer loop prompts (`portfolio_runner.py`, `e2e_evolution.py`), and auto-discovered per-regime campaigns (`PerfTargetCampaignRunner._compile_regime_nav_packets()` in `campaign_runner.py`).
+- **`@runtime_module` TileLang Twin Bridge (`agent/orchestrator/twin_bridge.py`)**:
+  - `build_tilelang_runtime_twin()` wraps a candidate TileLang kernel runner in a `@runtime_module` class matching the authored HIR module's `@runtime_func` signature and coercing outputs to CPU tensors.
+  - `verify_twin_cpu_reference()` generates deterministic seeded CPU inputs and verifies the `@runtime_module` twin directly against HIR CPU `evaluate()`.
+  - `format_hir_tir_navigation_section()` formats the analytical roofline, legal TIR candidates, lowered TIR blueprint, and the **TIR Blueprint vs Current TileLang Ledger Delta** (`steady_state_ii`, `dominant_pipe`, `ub_peak_bytes`, `gm_roundtrip_bytes`) whenever `current_tl_ledger` and `packet.tir_ledger` are both available.
+- **Unconstrained Track Default (`enable_track_router=False`)**: The 8-dimensional track router (`agent/router/capability_gate.py`) is disabled by default (`enable_track_router=False`) across `gate_funnel.py`, `portfolio_runner.py`, `e2e_evolution.py`, and `campaign_runner.py`, keeping `capability_gate.py` dormant for standalone unit tests only. Evolution and campaign candidates operate on `track="unconstrained"` with unrestricted access to the full `TILELANG_ASCEND_PRIMITIVE_MENU`.
+- **Dual-Mode Stage A & Enriched Physical Ledger (`envelope_inspector.py`, `physical_ledger.py`, `gate_funnel.py`)**:
+  - **Mode A (Static `T.Pipelined` Modulo Solver)**: Runs 24-bit Z3 scheduling (`pipeline_solver.py`) for explicit `T.Pipelined` stages to resolve `steady_state_ii` and buffer versions.
+  - **Mode B (Two-Snapshot IR Diff Envelope Inspector)**: Captures `BEFORE_LOWER` and `AFTER_LOWER` lowered snapshots in `envelope_inspector.py` to quantify real on-chip waterlines, implicit compiler bloat (`peak_allocated_bytes - explicit_bytes`), and `degraded_single_buffers`.
+  - **10 Enriched White-Box Metrics**: `ObjectivePhysicalLedger` (`build_objective_physical_ledger()`) tracks `grid_blocks`, `wave_occupancy`, `gm_roundtrip_bytes`, `dominant_contig_bytes`, `effective_cube_m`, `has_indirect_gather`, `has_lowbit_quant`, `has_online_rescale_loop`, `in_loop_ub_reload_stores`, and `uses_unreserved_ubuf`.
 - **Tile-Size Neighborhood Prescreening (`tilesize_prescreen.py`)**: Evaluates candidate `tile_kwargs` grids against static memory limits inside `agent/orchestrator/` before dispatching workers, passing legal neighborhoods and cliff warnings into worker prompts.
 
-### 5.2 Portfolio Worker Allocation, Rule-Blind Constraints & 5-Tier Campaign
+### 5.2 Ledger-Driven Causal Rules, Portfolio Allocation & 5-Tier Campaign
 
-- **Unbiased Slot Allocation (`portfolio_runner.py`, `campaign_runner.py`)**: `plan_workers()` populates `features` and `prev` residual telemetry in `build_predicate_context`, dispatches `rule_exploit` workers strictly for matched rules (`rule.matches(ctx)`), and converts unfilled rule slots into orthogonal `creative_explore` workers with dedicated `CREATIVE_FOCUS_HINTS`. LLM transport/watchdog failures (`503`, timeouts, sandbox tool aborts) never trigger `record_outcome(..., postcondition_realized=False)`.
-- **Rule-Blind Negative Constraints**: Creative workers receive generic `NEGATIVE CONSTRAINTS` mechanism summaries and prescreen reports without any `R01..R12` rule identifiers or YAML snippets.
-- **5-Tier Campaign Pyramid (`agent/campaign/campaign_runner.py`)**: Candidates advance strictly through `L0 (Stage A Z3/Envelope & Prescreen) -> L1 (Compile & Smoke) -> L2 (Surrogate Anchor Batch scoring Eq. 3 + roofline_eta residual) -> L3 (Full Contract Verification with atomic state rollback) -> L4 (Official AgentGates CANNBench)`. `TwoLaneBeamSearch` persists `"beam_state"` (exploited + stepping-stone lanes and selection decay counts via `mark_parent_selected`) inside atomic checkpoints for lossless `--resume`.
+- **17 Pure Ledger-Driven Causal Rules (`agent/kb/seed_rules.yaml`, `R01`-`R17`)**: `R01_DUAL_COPY_1C2V_SPLIT` through `R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK` evaluate `regime_guard`, `precondition`, and `expected_postcondition` strictly over enriched `ObjectivePhysicalLedger` fields and `StaticDynamicResidual` telemetry via `build_predicate_context()` (`agent/kb/schema.py`). All `phi_1..phi_8` feature predicates are removed from `seed_rules.yaml` and from `ablation_distiller.py` generated predicates.
+- **Unbiased Slot Allocation (`portfolio_runner.py`, `campaign_runner.py`)**: Workers evaluate `rule.matches(ctx)` against the current ledger and residual, dispatch `rule_exploit` workers strictly for matched rules, and convert unfilled rule slots into orthogonal `creative_explore` workers with dedicated `CREATIVE_FOCUS_HINTS` and `HirTirNavigationPacket` ledger deltas. LLM transport/watchdog failures (`503`, timeouts, sandbox tool aborts) never trigger `record_outcome(..., postcondition_realized=False)`.
+- **Rule-Blind Negative Constraints**: Creative workers receive generic `NEGATIVE CONSTRAINTS` mechanism summaries and prescreen reports without any `R01..R17` rule identifiers or YAML snippets.
+- **5-Tier Auto-Discovered Campaign Pyramid (`agent/campaign/campaign_runner.py`)**: `PerfTargetCampaignRunner` automatically discovers sibling `model.py` and `scheduled.py` HIR files alongside the target kernel module, compiles per-regime `HirTirNavigationPacket` guidance using `RegimeTargetSpec.representative_hir_dims`, and advances candidates through `L0 (Stage A Z3/Envelope & Prescreen) -> L1 (Compile & Smoke) -> L2 (Surrogate Anchor Batch scoring Eq. 3 + roofline_eta residual) -> L3 (Full Contract Verification with atomic state rollback) -> L4 (Official AgentGates CANNBench)`. `TwoLaneBeamSearch` persists `"beam_state"` (exploited + stepping-stone lanes and selection decay counts via `mark_parent_selected`) inside atomic checkpoints for lossless `--resume`.
 
 ### 5.3 Fail-Closed Counterfactual Micro-Probe Flywheel
 
-- **7 Parameterized Mechanism Classes (`ablation_distiller.py`)**: `_classify_edit` and `_extract_probe_params` decompose winning AST chunks (`core_parallelism`, `coalesced_copy`, `pipeline_versions`, `ssbuf_handoff`, `barrier_prune`, `dual_copy_1c2v`, `pad_alignment`) and synthesize standalone 25-50 line isolated `(baseline_probe_source, optimized_probe_source)` pairs with concrete AST-derived dimensions, core counts, stage depths, and dtypes.
-- **Fail-Closed Hardware Gate**: Unmapped arbitrary edits (`stmt_rewrite`) return `synthesize_micro_probe(chunk) -> None` and are rejected as `unverifiable_edit_kind:stmt_rewrite` with zero KB writes. Mapped probes must achieve numerical accuracy, `>= 1.08x` default hardware speedup, and non-regressing `msprof_detail` MTE2 wait ratios (`aiv_mte2`, `aiv_vec`, `aic_fixpipe`) before pure-English 6-tuple `AscendCausalRule` admission into `BayesianRuleTracker`.
+- **7 Parameterized Mechanism Classes (`ablation_distiller.py`)**: `_classify_edit` and `_extract_probe_params` decompose winning AST chunks (`core_parallelism`, `coalesced_copy`, `pipeline_versions`, `ssbuf_handoff`, `barrier_prune`, `dual_copy_1c2v`, `pad_alignment`) and synthesize standalone 30-50 line isolated `(baseline_probe_source, optimized_probe_source)` pairs with concrete AST-derived dimensions, core counts, stage depths, and dtypes.
+- **Fail-Closed Hardware Gate & Ledger-Only Rule Distillation**: Unmapped arbitrary edits (`stmt_rewrite`) return `synthesize_micro_probe(chunk) -> None` and are rejected as `unverifiable_edit_kind:stmt_rewrite` with zero KB writes. Mapped probes must achieve numerical accuracy, `>= 1.08x` default hardware speedup, and non-regressing `msprof_detail` MTE2 wait ratios (`aiv_mte2`, `aiv_vec`, `aic_fixpipe`) before `distill_causal_rule()` admits pure-English 6-tuple `AscendCausalRule` entries (with ledger-only `ObjectivePhysicalLedger` + `StaticDynamicResidual` predicates) into `BayesianRuleTracker`.
