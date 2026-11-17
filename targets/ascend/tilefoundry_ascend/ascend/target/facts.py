@@ -47,6 +47,8 @@ class AscendSpaceFacts:
     fixpipe_bytes_per_cycle: int
     valid_dma_paths: tuple[str, ...]
     forbidden_dma_paths: tuple[str, ...]
+    num_aic_cores: int = 28
+    num_aiv_cores: int = 56
 
     def ub_limit_bytes(self, mode: str = "simdvf", *, unreserved_ubuf: bool = False) -> int:
         """Return mode-specific UB budget in bytes for SimdVF vs SimtVF execution."""
@@ -117,6 +119,8 @@ def ascend_space_facts(target, query: object = None) -> AscendSpaceFacts:
         fixpipe_bytes_per_cycle=arch.fixpipe_bytes_per_cycle,
         valid_dma_paths=arch.valid_dma_paths,
         forbidden_dma_paths=arch.forbidden_dma_paths,
+        num_aic_cores=dev.aic_count,
+        num_aiv_cores=dev.aiv_count,
     )
 
 

@@ -5,12 +5,17 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 import math
+import re
 
-from tilefoundry.ir.core import Call, Op
+from tilefoundry.ir.core import Call, Constant, Expr, Op, Var
+from tilefoundry.ir.core.kinds import UnaryKind
+from tilefoundry.ir.core.param_def import MemoryEffect, collect_param_defs
 from tilefoundry.ir.hir.pipeline import BufferSchedule, PipelineError, PipelineSpec
-from tilefoundry.ir.tir.memory import AllocTensor
+from tilefoundry.ir.hir.tensor.slice import Slice
+from tilefoundry.ir.tir.memory import AllocTensor, Copy, Fill, PtrOf, TensorView
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import (
+    Evaluate,
     ExecutionScope,
     For,
     If,
@@ -21,6 +26,8 @@ from tilefoundry.ir.tir.stmts import (
     While,
 )
 from tilefoundry.ir.types import StorageKind, TensorType
+from tilefoundry.ir.types.mesh import levels as mesh_levels
+from tilefoundry.ir.types.mesh import size as mesh_size
 from tilefoundry.ir.types.utils import static_dim_value
 from tilefoundry.vendor.tilelang_z3 import (
     Buffer,
@@ -44,8 +51,14 @@ from tilefoundry_ascend.ascend.ir.tir.instructions import (
     AscendL1ToL0A,
     AscendL1ToL0B,
     AscendMmad,
+    AscendRegToUb,
     AscendUbToGm,
     AscendUbToGmAtomic,
+    AscendUbToReg,
+    AscendVexp,
+    AscendVldDist,
+    AscendVstsDist,
+    AscendVunary,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
@@ -128,6 +141,465 @@ def _buffer_bytes(shape: tuple[int, ...] | None, dtype_obj: object, DataTypeCls)
         return 0
     elem_bytes = _dtype_bytes(dtype_obj, DataTypeCls)
     return int(math.ceil(math.prod(shape) * elem_bytes))
+
+
+def _is_lowbit_dtype_name(dtype_str: str) -> bool:
+    """Return whether a dtype name denotes an 8-bit or 4-bit quantized format."""
+    base = re.sub(r"x\d+$", "", dtype_str.strip().lower())
+    return base in (
+        "int8",
+        "uint8",
+        "i8",
+        "u8",
+        "int4",
+        "uint4",
+        "i4",
+        "u4",
+    ) or base.startswith(("fp8", "float8", "f8", "fp4", "float4", "f4"))
+
+
+def _compute_wave_occupancy(
+    grid_blocks: int,
+    spaces: AscendSpaceFacts,
+    pipe_cycles: dict[str, int],
+    aiv_split_factor: int,
+) -> float:
+    """Compute grid wave occupancy against the active AIC or AIV core pool."""
+    uses_aic = pipe_cycles.get("AIC.PIPE_M", 0) > 0 or aiv_split_factor >= 2
+    core_pool = spaces.num_aic_cores if uses_aic else spaces.num_aiv_cores
+    return round(grid_blocks / float(max(1, core_pool)), 4)
+
+
+def _select_dominant_contig_bytes(
+    candidates: Sequence[tuple[int | None, int, int, int, int]],
+) -> int:
+    """Return trailing contiguous dimension bytes of the largest non-scalar tensor."""
+    non_scalars = [item for item in candidates if item[0] is None or item[0] != 1]
+    if not non_scalars:
+        return 0
+    payloads = [item for item in non_scalars if item[1] > 1]
+    pool = payloads if payloads else non_scalars
+    best = max(pool, key=lambda item: (item[2], item[3], item[4]))
+    return best[4]
+
+
+def _attrs_contain_flag(attrs: object, flag: str) -> bool:
+    """Recursively check whether TVM/TIR attrs contain *flag*."""
+    if attrs is None:
+        return False
+    if isinstance(attrs, str):
+        return flag in attrs
+    if hasattr(attrs, "items"):
+        return any(_attrs_contain_flag(v, flag) for _k, v in attrs.items())
+    if isinstance(attrs, (tuple, list)) or (
+        hasattr(attrs, "__iter__") and not isinstance(attrs, (bytes, bytearray))
+    ):
+        try:
+            return any(_attrs_contain_flag(item, flag) for item in attrs)
+        except TypeError:
+            return flag in str(attrs)
+    return flag in str(attrs)
+
+
+def _is_tilelang_exp_op(op_name: str) -> bool:
+    lower = op_name.lower()
+    return "vexp" in lower or "exp2" in lower or lower == "exp" or lower.endswith(".exp")
+
+
+def _collect_tilelang_expr_rw(
+    expr,
+    *,
+    tirx,
+) -> tuple[list[tuple[str, str, str]], bool, list[str], list[str]]:
+    """Collect ordered buffer accesses, exp flags, and UB vld/vsts buffer names."""
+    events: list[tuple[str, str, str]] = []
+    has_exp = [False]
+    ub_loads: list[str] = []
+    ub_stores: list[str] = []
+
+    def _visit_indices(indices) -> None:
+        for idx in indices:
+            sub_ev, sub_exp, sub_ul, sub_us = _collect_tilelang_expr_rw(idx, tirx=tirx)
+            events.extend(sub_ev)
+            if sub_exp:
+                has_exp[0] = True
+            ub_loads.extend(sub_ul)
+            ub_stores.extend(sub_us)
+
+    def _record_ub_access(arg, *, is_store: bool) -> None:
+        sub_ev, sub_exp, sub_ul, sub_us = _collect_tilelang_expr_rw(arg, tirx=tirx)
+        events.extend(sub_ev)
+        if sub_exp:
+            has_exp[0] = True
+        ub_loads.extend(sub_ul)
+        ub_stores.extend(sub_us)
+        for buf_name, scope, _rw in sub_ev:
+            if scope == "UB":
+                if is_store:
+                    ub_stores.append(buf_name)
+                else:
+                    ub_loads.append(buf_name)
+
+    def _pre(node):
+        if isinstance(node, tirx.Call):
+            op_name = str(getattr(node.op, "name", node.op)).lower()
+            if _is_tilelang_exp_op(op_name):
+                has_exp[0] = True
+            if "vld" in op_name and node.args:
+                _record_ub_access(node.args[0], is_store=False)
+                for rest in node.args[1:]:
+                    sub_ev, sub_exp, sub_ul, sub_us = _collect_tilelang_expr_rw(rest, tirx=tirx)
+                    events.extend(sub_ev)
+                    if sub_exp:
+                        has_exp[0] = True
+                    ub_loads.extend(sub_ul)
+                    ub_stores.extend(sub_us)
+                return False
+            if "vsts" in op_name and node.args:
+                _record_ub_access(node.args[0], is_store=True)
+                for rest in node.args[1:]:
+                    sub_ev, sub_exp, sub_ul, sub_us = _collect_tilelang_expr_rw(rest, tirx=tirx)
+                    events.extend(sub_ev)
+                    if sub_exp:
+                        has_exp[0] = True
+                    ub_loads.extend(sub_ul)
+                    ub_stores.extend(sub_us)
+                return False
+            if (
+                "region" in op_name
+                and len(node.args) >= 2
+                and isinstance(node.args[0], tirx.BufferLoad)
+            ):
+                bl = node.args[0]
+                _visit_indices(bl.indices)
+                scope = _map_tilelang_scope(bl.buffer.scope())
+                rw = _static_tirx_int(node.args[1]) or 1
+                if scope is not None:
+                    if rw & 1:
+                        events.append((bl.buffer.name, scope, "read"))
+                    if rw & 2:
+                        events.append((bl.buffer.name, scope, "write"))
+                return False
+            if (
+                "access_ptr" in op_name
+                and len(node.args) >= 3
+                and isinstance(node.args[0], tirx.BufferLoad)
+            ):
+                bl = node.args[0]
+                _visit_indices(bl.indices)
+                scope = _map_tilelang_scope(bl.buffer.scope())
+                rw = _static_tirx_int(node.args[2]) or 1
+                if scope is not None:
+                    if rw & 1:
+                        events.append((bl.buffer.name, scope, "read"))
+                    if rw & 2:
+                        events.append((bl.buffer.name, scope, "write"))
+                return False
+            if "copy" in op_name and len(node.args) >= 2:
+                for arg, default_rw in ((node.args[0], "read"), (node.args[1], "write")):
+                    if isinstance(arg, tirx.BufferRegion):
+                        scope = _map_tilelang_scope(arg.buffer.scope())
+                        if scope is not None:
+                            events.append((arg.buffer.name, scope, default_rw))
+                    elif isinstance(arg, tirx.BufferLoad):
+                        _visit_indices(arg.indices)
+                        scope = _map_tilelang_scope(arg.buffer.scope())
+                        if scope is not None:
+                            events.append((arg.buffer.name, scope, default_rw))
+                    else:
+                        sub_ev, sub_exp, sub_ul, sub_us = _collect_tilelang_expr_rw(
+                            arg, tirx=tirx
+                        )
+                        events.extend(sub_ev)
+                        if sub_exp:
+                            has_exp[0] = True
+                        ub_loads.extend(sub_ul)
+                        ub_stores.extend(sub_us)
+                return False
+        elif isinstance(node, tirx.BufferLoad):
+            _visit_indices(node.indices)
+            scope = _map_tilelang_scope(node.buffer.scope())
+            if scope is not None:
+                events.append((node.buffer.name, scope, "read"))
+                if scope == "UB":
+                    ub_loads.append(node.buffer.name)
+            return False
+        elif isinstance(node, tirx.BufferRegion):
+            scope = _map_tilelang_scope(node.buffer.scope())
+            if scope is not None:
+                events.append((node.buffer.name, scope, "read"))
+            return False
+        return True
+
+    tirx.stmt_functor.pre_order_visit(expr, _pre)
+    return events, has_exp[0], ub_loads, ub_stores
+
+
+def _collect_tilelang_stmt_events(
+    stmt,
+    *,
+    tirx,
+) -> tuple[list[tuple[str, str, str]], bool, set[str], set[str]]:
+    """Collect ordered accesses, exp presence, and UB loads/stores across a TIR statement."""
+    events: list[tuple[str, str, str]] = []
+    has_exp = [False]
+    ub_loads: set[str] = set()
+    ub_stores: set[str] = set()
+
+    def _absorb_expr(expr) -> None:
+        if expr is None:
+            return
+        sub_ev, sub_exp, sub_ul, sub_us = _collect_tilelang_expr_rw(expr, tirx=tirx)
+        events.extend(sub_ev)
+        if sub_exp:
+            has_exp[0] = True
+        ub_loads.update(sub_ul)
+        ub_stores.update(sub_us)
+
+    def _walk(node) -> None:
+        if node is None:
+            return
+        if isinstance(node, tirx.SeqStmt):
+            for child in node.seq:
+                _walk(child)
+            return
+        if isinstance(node, tirx.Bind):
+            _absorb_expr(node.value)
+            if hasattr(node, "body"):
+                _walk(node.body)
+            return
+        if isinstance(node, (tirx.AllocBuffer, tirx.DeclBuffer)):
+            if hasattr(node, "body"):
+                _walk(node.body)
+            return
+        if isinstance(node, (tirx.SBlockRealize,)):
+            _walk(node.block)
+            return
+        if isinstance(node, (tirx.SBlock, tirx.AttrStmt)):
+            _walk(node.body)
+            return
+        if isinstance(node, (tirx.For, tirx.While)):
+            if isinstance(node, tirx.While):
+                _absorb_expr(node.condition)
+            _walk(node.body)
+            return
+        if isinstance(node, tirx.IfThenElse):
+            _absorb_expr(node.condition)
+            _walk(node.then_case)
+            if node.else_case is not None:
+                _walk(node.else_case)
+            return
+        if isinstance(node, tirx.BufferStore):
+            _absorb_expr(node.value)
+            for idx in node.indices:
+                _absorb_expr(idx)
+            scope = _map_tilelang_scope(node.buffer.scope())
+            if scope is not None:
+                events.append((node.buffer.name, scope, "write"))
+                if scope == "UB":
+                    ub_stores.add(node.buffer.name)
+            return
+        if isinstance(node, tirx.Evaluate):
+            _absorb_expr(node.value)
+
+    _walk(stmt)
+    return events, has_exp[0], ub_loads, ub_stores
+
+
+def _has_loop_carried_accumulator(
+    events: Sequence[tuple[str, object, str]],
+    local_keys: set[str],
+) -> bool:
+    """Return True if any non-local buffer is read before write and written in *events*."""
+    written_so_far: set[str] = set()
+    read_before_write: set[str] = set()
+    written_in_loop: set[str] = set()
+    for buf_key, _scope, rw in events:
+        if buf_key in local_keys:
+            continue
+        if rw == "read":
+            if buf_key not in written_so_far:
+                read_before_write.add(buf_key)
+        elif rw == "write":
+            written_so_far.add(buf_key)
+            written_in_loop.add(buf_key)
+    return bool(read_before_write & written_in_loop)
+
+
+@dataclass(frozen=True)
+class _TelemetryFeatures:
+    grid_blocks: int
+    gm_roundtrip_bytes: int
+    dominant_contig_bytes: int
+    effective_cube_m: int
+    has_indirect_gather: bool
+    has_lowbit_quant: bool
+    has_online_rescale_loop: bool
+    in_loop_ub_reload_stores: int
+    uses_unreserved_ubuf: bool
+
+
+def _collect_tilelang_telemetry(
+    entry_fn,
+    mod_in,
+    *,
+    tirx,
+    DataTypeCls,
+    pipe_cycles: dict[str, int],
+    unreserved_ubuf: bool,
+) -> _TelemetryFeatures:
+    """Extract NP1 structural, quantization, and layout telemetry from a TVM PrimFunc."""
+    flag = "--cce-disable-vf-stack-reserved-ubuf"
+    effective_unreserved = bool(
+        unreserved_ubuf
+        or _attrs_contain_flag(getattr(entry_fn, "attrs", None), flag)
+        or _attrs_contain_flag(getattr(mod_in, "attrs", None), flag)
+    )
+
+    block_dims: dict[str, int] = {}
+    has_lowbit_buf = [False]
+    has_indirect_gather = [False]
+    cube_m_values: list[int] = []
+    gm_static_bytes: dict[str, int] = {}
+    gm_scalar_names: set[str] = set()
+    contig_candidates: list[tuple[int | None, int, int, int, int]] = []
+    seen_gm_keys: set[str] = set()
+
+    def _register_buffer(buf) -> None:
+        dtype_str = str(buf.dtype)
+        if _is_lowbit_dtype_name(dtype_str):
+            has_lowbit_buf[0] = True
+        scope = _map_tilelang_scope(buf.scope())
+        if scope != "GM":
+            return
+        key = buf.name
+        if key in seen_gm_keys:
+            return
+        seen_gm_keys.add(key)
+        static_shape = _static_shape_ints(buf.shape)
+        elem_bytes = _dtype_bytes(buf.dtype, DataTypeCls)
+        if static_shape is not None:
+            nbytes = _buffer_bytes(static_shape, buf.dtype, DataTypeCls)
+            gm_static_bytes[key] = nbytes
+            total_elems = math.prod(static_shape) if static_shape else 0
+            if total_elems == 1:
+                gm_scalar_names.add(key)
+            if static_shape and static_shape[-1] >= 1:
+                last_dim = static_shape[-1]
+                contig = int(math.ceil(last_dim * elem_bytes))
+                contig_candidates.append((total_elems, last_dim, 0, nbytes, contig))
+        else:
+            gm_static_bytes[key] = 0
+            if len(buf.shape) > 0:
+                last_dim = _static_tirx_int(buf.shape[-1])
+                if last_dim is not None and last_dim >= 1:
+                    dyn_cnt = sum(1 for d in buf.shape if _static_tirx_int(d) is None)
+                    static_dims = [
+                        val for d in buf.shape if (val := _static_tirx_int(d)) is not None
+                    ]
+                    static_prod = (
+                        int(math.ceil(math.prod(static_dims) * elem_bytes))
+                        if static_dims
+                        else 0
+                    )
+                    contig = int(math.ceil(last_dim * elem_bytes))
+                    contig_candidates.append((None, last_dim, dyn_cnt, static_prod, contig))
+
+    for param in getattr(entry_fn, "params", ()):
+        buf = entry_fn.buffer_map.get(param) if hasattr(entry_fn, "buffer_map") else None
+        if buf is not None:
+            _register_buffer(buf)
+
+    loops: list[tuple[object, bool, bool]] = []
+
+    def _visit_all(node) -> None:
+        if isinstance(node, tirx.SBlock):
+            for buf in node.alloc_buffers:
+                _register_buffer(buf)
+        elif isinstance(node, (tirx.AllocBuffer, tirx.DeclBuffer)):
+            _register_buffer(node.buffer)
+        elif isinstance(node, tirx.BufferLoad):
+            if any(_contains_buffer_load(idx, tirx) for idx in node.indices):
+                has_indirect_gather[0] = True
+        elif isinstance(node, tirx.AttrStmt) and "thread_extent" in str(node.attr_key).lower():
+            tag = str(getattr(node.node, "thread_tag", "")).lower()
+            if "blockidx" in tag:
+                val = _static_tirx_int(node.value)
+                if val is not None and val > 0:
+                    block_dims[tag] = val
+        elif isinstance(node, tirx.For):
+            tb = getattr(node, "thread_binding", None)
+            if tb is not None:
+                tag = str(getattr(tb, "thread_tag", "")).lower()
+                if "blockidx" in tag:
+                    val = _static_tirx_int(node.extent)
+                    if val is not None and val > 0:
+                        block_dims[tag] = val
+            else:
+                trip = _static_tirx_int(node.extent)
+                qualifies = trip is None or trip > 1
+                loops.append((node.body, True, qualifies))
+        elif isinstance(node, tirx.While):
+            loops.append((node.body, False, False))
+        elif isinstance(node, tirx.Call):
+            op_name = str(getattr(node.op, "name", node.op)).lower()
+            if ("gemm" in op_name or "mmad" in op_name) and len(node.args) >= 3:
+                m_val = _static_tirx_int(node.args[5]) if len(node.args) > 5 else None
+                if m_val is None:
+                    _s, _t, _i = _region_bytes(node.args[0], tirx, DataTypeCls)
+                    if isinstance(node.args[0], tirx.Call) and len(node.args[0].args) >= 4:
+                        ext = _static_shape_ints(node.args[0].args[2:])
+                        if ext and len(ext) >= 2:
+                            trans_a = _static_tirx_int(node.args[3]) if len(node.args) > 3 else 0
+                            m_val = ext[-1] if trans_a else ext[-2]
+                if m_val is not None and m_val > 0:
+                    cube_m_values.append(m_val)
+
+    tirx.stmt_functor.post_order_visit(entry_fn.body, _visit_all)
+
+    grid_blocks = math.prod(block_dims.values()) if block_dims else 1
+    dominant_contig_bytes = _select_dominant_contig_bytes(contig_candidates)
+    effective_cube_m = min(cube_m_values) if cube_m_values else 0
+    has_lowbit_quant = bool(has_lowbit_buf[0] and pipe_cycles.get("AIC.PIPE_M", 0) > 0)
+
+    all_events, _exp, _ul, _us = _collect_tilelang_stmt_events(entry_fn.body, tirx=tirx)
+    gm_reads = {name for name, scope, rw in all_events if scope == "GM" and rw == "read"}
+    gm_writes = {name for name, scope, rw in all_events if scope == "GM" and rw == "write"}
+
+    gm_loop_scalars: set[str] = set()
+    has_online_rescale = False
+    ub_reload_store_bufs: set[str] = set()
+
+    for loop_body, is_for, qualifies_trip in loops:
+        local_bufs = _collect_local_buf_names(loop_body, tirx=tirx)
+        loop_events, loop_has_exp, loop_ub_loads, loop_ub_stores = _collect_tilelang_stmt_events(
+            loop_body, tirx=tirx
+        )
+        for buf_name, scope, _rw in loop_events:
+            if scope == "GM" and buf_name in gm_scalar_names:
+                gm_loop_scalars.add(buf_name)
+
+        if is_for and qualifies_trip:
+            ub_reload_store_bufs.update(loop_ub_loads & loop_ub_stores)
+
+        if loop_has_exp and not has_online_rescale:
+            if _has_loop_carried_accumulator(loop_events, local_bufs):
+                has_online_rescale = True
+
+    gm_roundtrip_names = (gm_reads & gm_writes) | gm_loop_scalars
+    gm_roundtrip_bytes = sum(gm_static_bytes.get(name, 0) for name in gm_roundtrip_names)
+
+    return _TelemetryFeatures(
+        grid_blocks=grid_blocks,
+        gm_roundtrip_bytes=gm_roundtrip_bytes,
+        dominant_contig_bytes=dominant_contig_bytes,
+        effective_cube_m=effective_cube_m,
+        has_indirect_gather=has_indirect_gather[0],
+        has_lowbit_quant=has_lowbit_quant,
+        has_online_rescale_loop=has_online_rescale,
+        in_loop_ub_reload_stores=len(ub_reload_store_bufs),
+        uses_unreserved_ubuf=effective_unreserved,
+    )
 
 
 def _scope_capacities(
@@ -1434,10 +1906,19 @@ def inspect_tilelang_primfunc(
         DataTypeCls=TLDataType,
         aiv_split_factor=effective_aiv_split,
     )
+    telemetry = _collect_tilelang_telemetry(
+        entry_fn,
+        mod_in,
+        tirx=tirx,
+        DataTypeCls=TLDataType,
+        pipe_cycles=pipe_cycles,
+        unreserved_ubuf=unreserved_ubuf,
+    )
+    effective_unreserved = telemetry.uses_unreserved_ubuf
     capacities = _scope_capacities(
         spaces,
         has_simtvf=has_simtvf,
-        unreserved_ubuf=unreserved_ubuf,
+        unreserved_ubuf=effective_unreserved,
     )
 
     observed: list[str] = []
@@ -1519,10 +2000,13 @@ def inspect_tilelang_primfunc(
             DataTypeCls=TLDataType,
             aiv_split_factor=effective_aiv_split,
             has_simtvf=has_simtvf,
-            unreserved_ubuf=unreserved_ubuf,
+            unreserved_ubuf=effective_unreserved,
             degraded_names=degraded,
         )
     analysis_mode = "exact_modulo_z3" if solved_ii is not None else "readonly_envelope"
+    wave_occ = _compute_wave_occupancy(
+        telemetry.grid_blocks, spaces, pipe_cycles, effective_aiv_split
+    )
 
     ledger = build_objective_physical_ledger(
         analysis_mode=analysis_mode,
@@ -1533,6 +2017,16 @@ def inspect_tilelang_primfunc(
         mte2_inflight_per_aiv=mte2_inflight,
         unaligned_dma_padding_bytes=pad_bytes,
         opaque_dynamic_regions=opaque,
+        grid_blocks=telemetry.grid_blocks,
+        wave_occupancy=wave_occ,
+        gm_roundtrip_bytes=telemetry.gm_roundtrip_bytes,
+        dominant_contig_bytes=telemetry.dominant_contig_bytes,
+        effective_cube_m=telemetry.effective_cube_m,
+        has_indirect_gather=telemetry.has_indirect_gather,
+        has_lowbit_quant=telemetry.has_lowbit_quant,
+        has_online_rescale_loop=telemetry.has_online_rescale_loop,
+        in_loop_ub_reload_stores=telemetry.in_loop_ub_reload_stores,
+        uses_unreserved_ubuf=effective_unreserved,
     )
     return EnvelopeInspectionResult(
         ledger=ledger,
@@ -1579,6 +2073,322 @@ def _tir_for_static_trip_count(stmt: For) -> int | None:
     if start_v is None or stop_v is None or step_v is None or step_v <= 0:
         return None
     return max(0, (stop_v - start_v + step_v - 1) // step_v)
+
+
+def _resolve_tir_buffer_key(
+    expr: Expr,
+    env: dict[int, Expr],
+) -> tuple[str | None, StorageKind | None]:
+    """Resolve a TileFoundry TIR expression to its canonical buffer key and storage."""
+    seen: set[int] = set()
+    cur: object = expr
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, Var):
+            if id(cur) in env:
+                nxt = env[id(cur)]
+                if isinstance(nxt, Call) and isinstance(nxt.target, AllocTensor):
+                    storage = cur.type.storage if isinstance(cur.type, TensorType) else None
+                    return cur.name, storage
+                cur = nxt
+                continue
+            if isinstance(cur.type, TensorType):
+                return cur.name, cur.type.storage
+            return None, None
+        if isinstance(cur, Call):
+            if isinstance(cur.target, TensorView) and cur.args:
+                arg0 = cur.args[0]
+                if isinstance(arg0, Constant) and isinstance(arg0.value, int):
+                    storage = (
+                        cur.type.storage if isinstance(cur.type, TensorType) else StorageKind.SMEM
+                    )
+                    return f"{storage.name}@{arg0.value}", storage
+                if isinstance(arg0, (Var, Call)):
+                    cur = arg0
+                    continue
+            if isinstance(cur.target, (PtrOf, Slice)) and cur.args:
+                if isinstance(cur.args[0], (Var, Call)):
+                    cur = cur.args[0]
+                    continue
+            if isinstance(cur.target, AllocTensor) and isinstance(cur.type, TensorType):
+                return f"alloc_{id(cur)}", cur.type.storage
+            if isinstance(cur.type, TensorType):
+                return f"buf_{id(cur)}", cur.type.storage
+            return None, None
+        return None, None
+    return None, None
+
+
+def _collect_tir_stmt_events(
+    stmt: Stmt | None,
+    env: dict[int, Expr],
+) -> tuple[
+    list[tuple[str, StorageKind | None, str]],
+    bool,
+    set[str],
+    set[str],
+    set[str],
+]:
+    """Collect ordered accesses, exp presence, UB loads/stores, and local alloc keys."""
+    events: list[tuple[str, StorageKind | None, str]] = []
+    has_exp = [False]
+    ub_loads: set[str] = set()
+    ub_stores: set[str] = set()
+    local_allocs: set[str] = set()
+
+    def _walk(node: Stmt | None) -> None:
+        if node is None:
+            return
+        if isinstance(node, Sequential):
+            for child in node.body:
+                _walk(child)
+            return
+        if isinstance(node, LetStmt):
+            env[id(node.var)] = node.value
+            if isinstance(node.value, Call) and isinstance(node.value.target, AllocTensor):
+                local_allocs.add(node.var.name)
+            return
+        if isinstance(node, (MeshScope, ExecutionScope, For, While)):
+            _walk(node.body)
+            return
+        if isinstance(node, If):
+            _walk(node.then_body)
+            _walk(node.else_body)
+            return
+        if isinstance(node, Evaluate) and isinstance(node.callable, Op):
+            op = node.callable
+            if isinstance(op, AscendVexp) or (
+                isinstance(op, AscendVunary) and op.kind in (UnaryKind.EXP, UnaryKind.EXP2)
+            ):
+                has_exp[0] = True
+            if isinstance(op, Fill):
+                if node.args:
+                    key, st = _resolve_tir_buffer_key(node.args[0], env)
+                    if key is not None:
+                        events.append((key, st, "write"))
+                return
+            if isinstance(op, (AscendUbToReg, AscendVldDist)) and len(node.args) >= 2:
+                src_key, src_st = _resolve_tir_buffer_key(node.args[0], env)
+                dst_key, dst_st = _resolve_tir_buffer_key(node.args[1], env)
+                if src_key is not None:
+                    events.append((src_key, src_st, "read"))
+                    if src_st is StorageKind.SMEM:
+                        ub_loads.add(src_key)
+                if dst_key is not None:
+                    events.append((dst_key, dst_st, "write"))
+                return
+            if isinstance(op, (AscendRegToUb, AscendVstsDist)) and len(node.args) >= 2:
+                src_key, src_st = _resolve_tir_buffer_key(node.args[0], env)
+                dst_key, dst_st = _resolve_tir_buffer_key(node.args[1], env)
+                if src_key is not None:
+                    events.append((src_key, src_st, "read"))
+                if dst_key is not None:
+                    events.append((dst_key, dst_st, "write"))
+                    if dst_st is StorageKind.SMEM:
+                        ub_stores.add(dst_key)
+                return
+            if isinstance(op, Copy) and len(node.args) >= 2:
+                src_key, src_st = _resolve_tir_buffer_key(node.args[0], env)
+                dst_key, dst_st = _resolve_tir_buffer_key(node.args[1], env)
+                if src_key is not None:
+                    events.append((src_key, src_st, "read"))
+                if dst_key is not None:
+                    events.append((dst_key, dst_st, "write"))
+                if src_st is StorageKind.SMEM and dst_st is StorageKind.RMEM and src_key is not None:
+                    ub_loads.add(src_key)
+                if src_st is StorageKind.RMEM and dst_st is StorageKind.SMEM and dst_key is not None:
+                    ub_stores.add(dst_key)
+                return
+            input_defs = [p for p in collect_param_defs(type(op)) if p.kind == "input"]
+            for pdef, arg in zip(input_defs, node.args):
+                key, st = _resolve_tir_buffer_key(arg, env)
+                if key is None:
+                    continue
+                if pdef.effect & MemoryEffect.READ:
+                    events.append((key, st, "read"))
+                if pdef.effect & MemoryEffect.WRITE:
+                    events.append((key, st, "write"))
+
+    _walk(stmt)
+    return events, has_exp[0], ub_loads, ub_stores, local_allocs
+
+
+def _collect_tir_telemetry(
+    fn_or_stmt: PrimFunction | Stmt,
+    *,
+    pipe_cycles: dict[str, int],
+    unreserved_ubuf: bool,
+) -> tuple[_TelemetryFeatures, int]:
+    """Extract NP1 telemetry and AIV split factor from a TileFoundry TIR PrimFunction."""
+    body = fn_or_stmt.body if isinstance(fn_or_stmt, PrimFunction) else fn_or_stmt
+    flag = "--cce-disable-vf-stack-reserved-ubuf"
+    meta = getattr(fn_or_stmt, "metadata", ()) if isinstance(fn_or_stmt, PrimFunction) else ()
+    effective_unreserved = bool(
+        unreserved_ubuf or any(flag in str(item) for item in meta)
+    )
+
+    has_lowbit_buf = [False]
+    has_indirect_gather = [False]
+    cube_m_values: list[int] = []
+    gm_static_bytes: dict[str, int] = {}
+    gm_scalar_names: set[str] = set()
+    contig_candidates: list[tuple[int | None, int, int, int, int]] = []
+    scratch_candidates: list[tuple[int | None, int, int, int, int]] = []
+    aiv_split = [2 if any(k.startswith("AIV1.") for k in pipe_cycles) else 1]
+    max_grid_blocks = [1]
+
+    def _register_tensor(name: str, ttype: TensorType) -> None:
+        if _is_lowbit_dtype_name(ttype.dtype.name):
+            has_lowbit_buf[0] = True
+        if ttype.storage is not StorageKind.GMEM:
+            return
+        shape = ttype.shape
+        elem_bytes = ttype.dtype.bit_width / 8.0
+        static_dims = [static_dim_value(d) for d in shape]
+        dyn_cnt = sum(1 for d in static_dims if d is None)
+        if dyn_cnt == 0:
+            nbytes, _inner = _tir_tensor_bytes(ttype)
+            gm_static_bytes[name] = max(gm_static_bytes.get(name, 0), nbytes)
+            total_elems = math.prod(d for d in static_dims if d is not None) if shape else 0
+            if total_elems == 1:
+                gm_scalar_names.add(name)
+        else:
+            gm_static_bytes.setdefault(name, 0)
+            total_elems = None
+        if shape:
+            last_dim = static_dim_value(shape[-1])
+            if last_dim is not None and last_dim >= 1:
+                static_prod = int(
+                    math.ceil(
+                        math.prod(d for d in static_dims if d is not None) * elem_bytes
+                    )
+                )
+                contig = int(math.ceil(last_dim * elem_bytes))
+                entry = (total_elems, last_dim, dyn_cnt, static_prod, contig)
+                is_compiler_scratch = len(shape) == 1 and (
+                    name == "scratch" or name.startswith("scratch_")
+                )
+                if is_compiler_scratch:
+                    scratch_candidates.append(entry)
+                else:
+                    contig_candidates.append(entry)
+
+    if isinstance(fn_or_stmt, PrimFunction):
+        for param in fn_or_stmt.params:
+            if isinstance(param.type, TensorType):
+                _register_tensor(param.name, param.type)
+
+    loops: list[tuple[Stmt, dict[int, Expr], bool, bool]] = []
+    env: dict[int, Expr] = {}
+
+    def _walk(node: Stmt | None, *, active_block_product: int = 1) -> None:
+        if node is None:
+            return
+        if isinstance(node, Sequential):
+            for child in node.body:
+                _walk(child, active_block_product=active_block_product)
+            return
+        if isinstance(node, LetStmt):
+            env[id(node.var)] = node.value
+            if isinstance(node.var.type, TensorType):
+                _register_tensor(node.var.name, node.var.type)
+            return
+        if isinstance(node, MeshScope):
+            next_block = active_block_product
+            held_levels = mesh_levels(node.mesh)
+            for idx, top in enumerate(node.mesh.topologies):
+                top_name = getattr(top, "name", top)
+                ext = None
+                if idx < len(held_levels):
+                    ext = static_dim_value(mesh_size(held_levels[idx]))
+                if ext is None and hasattr(top, "size"):
+                    ext = static_dim_value(top.size)
+                if top_name == "block" and ext is not None and ext > 0:
+                    next_block *= ext
+                    max_grid_blocks[0] = max(max_grid_blocks[0], next_block)
+                elif top_name == "aiv" and ext is not None and ext >= 2:
+                    aiv_split[0] = max(aiv_split[0], ext)
+            _walk(node.body, active_block_product=next_block)
+            return
+        if isinstance(node, ExecutionScope):
+            _walk(node.body, active_block_product=active_block_product)
+            return
+        if isinstance(node, For):
+            trip = _tir_for_static_trip_count(node)
+            qualifies = trip is None or trip > 1
+            loops.append((node.body, dict(env), True, qualifies))
+            _walk(node.body, active_block_product=active_block_product)
+            return
+        if isinstance(node, While):
+            loops.append((node.body, dict(env), False, False))
+            _walk(node.body, active_block_product=active_block_product)
+            return
+        if isinstance(node, If):
+            _walk(node.then_body, active_block_product=active_block_product)
+            _walk(node.else_body, active_block_product=active_block_product)
+            return
+        if isinstance(node, Evaluate) and isinstance(node.callable, Op):
+            op = node.callable
+            if type(op)._op_schema.name == "index_select":
+                has_indirect_gather[0] = True
+            if isinstance(op, AscendMmad) and len(node.args) >= 2:
+                acc_ty = node.args[0].type
+                lhs_ty = node.args[1].type
+                m_val = None
+                if isinstance(acc_ty, TensorType) and len(acc_ty.shape) >= 2:
+                    m_val = static_dim_value(acc_ty.shape[-2])
+                elif isinstance(lhs_ty, TensorType) and len(lhs_ty.shape) >= 2:
+                    idx = -2 if op.a_layout == "MK" else -1
+                    m_val = static_dim_value(lhs_ty.shape[idx])
+                if m_val is not None and m_val > 0:
+                    cube_m_values.append(m_val)
+
+    _walk(body)
+
+    full_env: dict[int, Expr] = {}
+    all_events, _exp, _ul, _us, _la = _collect_tir_stmt_events(body, full_env)
+    gm_reads = {k for k, st, rw in all_events if st is StorageKind.GMEM and rw == "read"}
+    gm_writes = {k for k, st, rw in all_events if st is StorageKind.GMEM and rw == "write"}
+
+    gm_loop_scalars: set[str] = set()
+    has_online_rescale = False
+    ub_reload_store_bufs: set[str] = set()
+
+    for loop_body, loop_env, is_for, qualifies_trip in loops:
+        (
+            loop_events,
+            loop_has_exp,
+            loop_ub_loads,
+            loop_ub_stores,
+            local_allocs,
+        ) = _collect_tir_stmt_events(loop_body, loop_env)
+        for buf_key, st, _rw in loop_events:
+            if st is StorageKind.GMEM and buf_key in gm_scalar_names:
+                gm_loop_scalars.add(buf_key)
+        if is_for and qualifies_trip:
+            ub_reload_store_bufs.update(loop_ub_loads & loop_ub_stores)
+        if loop_has_exp and not has_online_rescale:
+            if _has_loop_carried_accumulator(loop_events, local_allocs):
+                has_online_rescale = True
+
+    gm_roundtrip_names = (gm_reads & gm_writes) | gm_loop_scalars
+    gm_roundtrip_bytes = sum(gm_static_bytes.get(name, 0) for name in gm_roundtrip_names)
+    active_contig_pool = contig_candidates if contig_candidates else scratch_candidates
+
+    return (
+        _TelemetryFeatures(
+            grid_blocks=max_grid_blocks[0],
+            gm_roundtrip_bytes=gm_roundtrip_bytes,
+            dominant_contig_bytes=_select_dominant_contig_bytes(active_contig_pool),
+            effective_cube_m=min(cube_m_values) if cube_m_values else 0,
+            has_indirect_gather=has_indirect_gather[0],
+            has_lowbit_quant=bool(has_lowbit_buf[0] and pipe_cycles.get("AIC.PIPE_M", 0) > 0),
+            has_online_rescale_loop=has_online_rescale,
+            in_loop_ub_reload_stores=len(ub_reload_store_bufs),
+            uses_unreserved_ubuf=effective_unreserved,
+        ),
+        aiv_split[0],
+    )
 
 
 def inspect_tir_envelope(
@@ -1687,7 +2497,15 @@ def inspect_tir_envelope(
         return _op_resources(op, arg_types)
 
     _walk(body)
-    caps = _scope_capacities(spaces, has_simtvf=has_simtvf[0], unreserved_ubuf=unreserved_ubuf)
+    telemetry, tir_aiv_split = _collect_tir_telemetry(
+        fn_or_stmt,
+        pipe_cycles=pipe_cycles,
+        unreserved_ubuf=unreserved_ubuf,
+    )
+    effective_unreserved = telemetry.uses_unreserved_ubuf
+    caps = _scope_capacities(
+        spaces, has_simtvf=has_simtvf[0], unreserved_ubuf=effective_unreserved
+    )
     waterlines = {
         scope: build_scope_waterline(
             scope=scope,
@@ -1702,6 +2520,9 @@ def inspect_tir_envelope(
         for scope, bufs in sorted(explicit_by_scope.items())
         for name, nbytes in sorted(bufs.items())
     )
+    wave_occ = _compute_wave_occupancy(
+        telemetry.grid_blocks, spaces, pipe_cycles, tir_aiv_split
+    )
     ledger = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
         is_legal=not illegal_dma[0],
@@ -1711,6 +2532,16 @@ def inspect_tir_envelope(
         mte2_inflight_per_aiv=max_mte2[0],
         unaligned_dma_padding_bytes=pad_bytes[0],
         opaque_dynamic_regions=tuple(opaque),
+        grid_blocks=telemetry.grid_blocks,
+        wave_occupancy=wave_occ,
+        gm_roundtrip_bytes=telemetry.gm_roundtrip_bytes,
+        dominant_contig_bytes=telemetry.dominant_contig_bytes,
+        effective_cube_m=telemetry.effective_cube_m,
+        has_indirect_gather=telemetry.has_indirect_gather,
+        has_lowbit_quant=telemetry.has_lowbit_quant,
+        has_online_rescale_loop=telemetry.has_online_rescale_loop,
+        in_loop_ub_reload_stores=telemetry.in_loop_ub_reload_stores,
+        uses_unreserved_ubuf=effective_unreserved,
     )
     return EnvelopeInspectionResult(
         ledger=ledger,

@@ -67,6 +67,16 @@ class ObjectivePhysicalLedger:
     mte2_inflight_per_aiv: int
     unaligned_dma_padding_bytes: int
     opaque_dynamic_regions: tuple[str, ...] = ()
+    grid_blocks: int = 1
+    wave_occupancy: float = 0.0
+    gm_roundtrip_bytes: int = 0
+    dominant_contig_bytes: int = 0
+    effective_cube_m: int = 0
+    has_indirect_gather: bool = False
+    has_lowbit_quant: bool = False
+    has_online_rescale_loop: bool = False
+    in_loop_ub_reload_stores: int = 0
+    uses_unreserved_ubuf: bool = False
 
     def __post_init__(self) -> None:
         if self.analysis_mode not in ("exact_modulo_z3", "readonly_envelope"):
@@ -116,6 +126,16 @@ class ObjectivePhysicalLedger:
             mte2_inflight_per_aiv=int(payload.get("mte2_inflight_per_aiv", 0)),
             unaligned_dma_padding_bytes=int(payload.get("unaligned_dma_padding_bytes", 0)),
             opaque_dynamic_regions=tuple(str(item) for item in raw_opaque),
+            grid_blocks=int(payload.get("grid_blocks", 1)),
+            wave_occupancy=float(payload.get("wave_occupancy", 0.0)),
+            gm_roundtrip_bytes=int(payload.get("gm_roundtrip_bytes", 0)),
+            dominant_contig_bytes=int(payload.get("dominant_contig_bytes", 0)),
+            effective_cube_m=int(payload.get("effective_cube_m", 0)),
+            has_indirect_gather=bool(payload.get("has_indirect_gather", False)),
+            has_lowbit_quant=bool(payload.get("has_lowbit_quant", False)),
+            has_online_rescale_loop=bool(payload.get("has_online_rescale_loop", False)),
+            in_loop_ub_reload_stores=int(payload.get("in_loop_ub_reload_stores", 0)),
+            uses_unreserved_ubuf=bool(payload.get("uses_unreserved_ubuf", False)),
         )
 
 
@@ -168,6 +188,16 @@ def build_objective_physical_ledger(
     mte2_inflight_per_aiv: int = 0,
     unaligned_dma_padding_bytes: int = 0,
     opaque_dynamic_regions: tuple[str, ...] = (),
+    grid_blocks: int = 1,
+    wave_occupancy: float = 0.0,
+    gm_roundtrip_bytes: int = 0,
+    dominant_contig_bytes: int = 0,
+    effective_cube_m: int = 0,
+    has_indirect_gather: bool = False,
+    has_lowbit_quant: bool = False,
+    has_online_rescale_loop: bool = False,
+    in_loop_ub_reload_stores: int = 0,
+    uses_unreserved_ubuf: bool = False,
 ) -> ObjectivePhysicalLedger:
     """Assemble an ObjectivePhysicalLedger and derive the dominant pipe."""
     cleaned_pipes = dict(sorted(pipe_cycles.items()))
@@ -182,6 +212,16 @@ def build_objective_physical_ledger(
         mte2_inflight_per_aiv=int(mte2_inflight_per_aiv),
         unaligned_dma_padding_bytes=int(unaligned_dma_padding_bytes),
         opaque_dynamic_regions=tuple(opaque_dynamic_regions),
+        grid_blocks=int(grid_blocks),
+        wave_occupancy=float(wave_occupancy),
+        gm_roundtrip_bytes=int(gm_roundtrip_bytes),
+        dominant_contig_bytes=int(dominant_contig_bytes),
+        effective_cube_m=int(effective_cube_m),
+        has_indirect_gather=bool(has_indirect_gather),
+        has_lowbit_quant=bool(has_lowbit_quant),
+        has_online_rescale_loop=bool(has_online_rescale_loop),
+        in_loop_ub_reload_stores=int(in_loop_ub_reload_stores),
+        uses_unreserved_ubuf=bool(uses_unreserved_ubuf),
     )
 
 
