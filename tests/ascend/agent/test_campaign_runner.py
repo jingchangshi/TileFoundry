@@ -701,10 +701,240 @@ def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
     )
     asyncio.run(runner2.run(resume=True))
     assert any("T.alloc_ss" in c.structural_signature for c in runner2._beam.stepping_stone_beam)
-    assert ("T.alloc_ss", "track:developer") in runner2._beam.exploited_signatures or (
-        "T.alloc_ss",
-    ) in runner2._beam.exploited_signatures
+    assert (
+        ("T.MixedKernel", "T.alloc_ss") in runner2._beam.exploited_signatures
+        or ("T.MixedKernel", "T.alloc_ss", "track:developer") in runner2._beam.exploited_signatures
+    )
     assert any("T.alloc_ss" in c.user_prompt for c in fail_backend.calls)
     assert any("### TILE PRESCREEN GUIDANCE" in c.user_prompt for c in fail_backend.calls)
     for rid, stats in fail_tracker.posteriors.items():
         assert stats.trials == prior_trials[rid]
+
+
+def test_np4_default_regime_specs_hir_dims_and_navigation_packets() -> None:
+    """Verify default regime representative_hir_dims compile into valid HIR/TIR packets."""
+    from tilefoundry_ascend.agent.campaign import get_default_regime_specs
+    from tilefoundry_ascend.ascend.passes.hir_tir_bridge import compile_hir_navigation_packet
+    from tilefoundry_ascend.ascend.target import AscendTarget
+
+    repo_root = Path(__file__).resolve().parents[3]
+    target = AscendTarget("ascend.950pr")
+
+    for op_name in ("attention_residual", "mla"):
+        op_dir = repo_root / "examples" / "ascend950pr_ops" / op_name
+        model_src = (op_dir / "model.py").read_text(encoding="utf-8")
+        sched_src = (op_dir / "scheduled.py").read_text(encoding="utf-8")
+        specs = get_default_regime_specs(op_name)
+        assert len(specs) == 3
+        for spec in specs:
+            assert spec.representative_hir_dims
+            roundtrip = RegimeTargetSpec.from_dict(spec.to_dict())
+            assert roundtrip.representative_hir_dims == spec.representative_hir_dims
+            pkt = compile_hir_navigation_packet(
+                model_src,
+                scheduled_hir_source=sched_src,
+                anchor_dims=spec.representative_hir_dims,
+                target=target,
+            )
+            assert pkt.roofline.ideal_roofline_us > 0.0
+            assert pkt.tir_script is not None
+            assert pkt.tir_ledger is not None
+            assert pkt.tir_ledger.is_legal is True
+            assert pkt.lowering_diagnostics == ()
+
+
+def test_np4_campaign_autodiscovery_nav_injection_router_off_and_17_rules(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify sibling HIR/TIR autodiscovery, zero capability_gate calls, and R01-R17."""
+    import tilefoundry_ascend.agent.router.capability_gate as cap_gate
+    from tilefoundry_ascend.agent.kb import build_predicate_context
+    from tilefoundry_ascend.agent.orchestrator import compute_static_dynamic_residual
+    from tilefoundry_ascend.ascend.passes import build_scope_waterline
+
+    router_calls: list[str] = []
+
+    def _forbid_extract(*_args, **_kwargs):
+        router_calls.append("extract")
+        raise AssertionError("extract_structural_features must not be called")
+
+    def _forbid_route(*_args, **_kwargs):
+        router_calls.append("route")
+        raise AssertionError("route_execution_track must not be called")
+
+    monkeypatch.setattr(cap_gate, "extract_structural_features", _forbid_extract)
+    monkeypatch.setattr(cap_gate, "route_execution_track", _forbid_route)
+
+    repo_root = Path(__file__).resolve().parents[3]
+    ar_dir = repo_root / "examples" / "ascend950pr_ops" / "attention_residual"
+    (tmp_path / "model.py").write_text(
+        (ar_dir / "model.py").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (tmp_path / "scheduled.py").write_text(
+        (ar_dir / "scheduled.py").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+
+    anchors = (AnchorCaseSpec("level4/attention_residual", 2, "small_decode", 10.0, 2.0),)
+    regimes = (
+        RegimeTargetSpec(
+            "small_decode",
+            ("_build_regime_a",),
+            {},
+            description="Compact decode regime.",
+            representative_hir_dims={"N": 2, "B": 1, "S": 1, "D": 64},
+        ),
+    )
+
+    disjoint_ssbuf_dsl = """
+def _build_regime_a(tile_m=2):
+    @T.prim_func
+    def main(X: T.Tensor((128, 128), "bfloat16"), Y: T.Tensor((128, 128), "bfloat16")):
+        with T.MixedKernel(1, sids=2) as (_, sid):
+            ss = T.alloc_ss((2,), "uint32")
+            a_ub = T.alloc_shared((64, 128), "bfloat16")
+            ss[sid] = T.Cast("uint32", 0)
+            T.copy(X[sid * 64 : (sid + 1) * 64, 0:128], a_ub)
+            T.copy(a_ub, Y[sid * 64 : (sid + 1) * 64, 0:128])
+    return main
+"""
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [_IMPROVED_REGIME_A] * 4,
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Novel SSBUF path",
+                        "target_local_metric": "sync_stall",
+                        "dsl_source": disjoint_ssbuf_dsl,
+                    }
+                )
+            ]
+            * 4,
+        }
+    )
+
+    def _l2_eval(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            lat = 15.0 if "T.alloc_ss" in src else 12.0
+            out[cid] = _make_surrogate_result(
+                cid, "attention_residual", tuple(active_anchors), {2: lat}
+            )
+        return out
+
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="attention_residual", max_rounds=2),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_eval,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        checkpoint_path=tmp_path / "ckpt_np4.json",
+    )
+
+    assert runner._authored_hir_path == (tmp_path / "model.py").resolve()
+    assert runner._scheduled_hir_path == (tmp_path / "scheduled.py").resolve()
+    assert "small_decode" in runner._regime_nav_packets
+
+    active_by_id = {rule.rule_id: rule for rule in runner._tracker.active_rules()}
+    assert len(active_by_id) == 17
+    expected_new_rules = (
+        "R13_SPLIT_KV_WAVE_RECOVERY",
+        "R14_GQA_HEAD_M_FOLDING",
+        "R15_ASYMMETRIC_1C2V_STAGE_FISSION",
+        "R16_PADDED_PITCH_TAIL_MASKING",
+        "R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK",
+    )
+    for rid in expected_new_rules:
+        assert rid in active_by_id
+
+    led_r13 = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=64,
+        pipe_cycles={"AIV0.PIPE_V": 64},
+        waterlines={},
+        grid_blocks=4,
+        wave_occupancy=4.0 / 56.0,
+    )
+    assert active_by_id["R13_SPLIT_KV_WAVE_RECOVERY"].matches(
+        build_predicate_context(
+            led_r13,
+            features=None,
+            residual=compute_static_dynamic_residual(led_r13, {"dur_us": 10.0}),
+        )
+    )
+
+    led_r14 = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=64,
+        pipe_cycles={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 32},
+        waterlines={},
+        effective_cube_m=4,
+    )
+    assert active_by_id["R14_GQA_HEAD_M_FOLDING"].matches(
+        build_predicate_context(
+            led_r14,
+            features=None,
+            residual=compute_static_dynamic_residual(led_r14, {"dur_us": 10.0}),
+        )
+    )
+
+    ub_wl = build_scope_waterline(
+        scope="UB",
+        capacity_bytes=196608,
+        explicit_buffers={"buf": 180224},
+        implicit_buffers={},
+    )
+    led_r15_r17 = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=64,
+        pipe_cycles={"AIC.PIPE_M": 32, "AIV0.PIPE_V": 64, "AIV1.PIPE_V": 64},
+        waterlines={"UB": ub_wl},
+        unaligned_dma_padding_bytes=32,
+        in_loop_ub_reload_stores=2,
+        uses_unreserved_ubuf=False,
+    )
+    ctx_r15_r17 = build_predicate_context(
+        led_r15_r17,
+        features=None,
+        residual=compute_static_dynamic_residual(led_r15_r17, {"dur_us": 10.0}),
+    )
+    assert active_by_id["R15_ASYMMETRIC_1C2V_STAGE_FISSION"].matches(ctx_r15_r17)
+    assert active_by_id["R16_PADDED_PITCH_TAIL_MASKING"].matches(ctx_r15_r17)
+    assert active_by_id["R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK"].matches(ctx_r15_r17)
+
+    report = asyncio.run(runner.run(resume=False))
+    assert report.total_rounds == 2
+    assert router_calls == []
+    assert backend.calls
+
+    roles_seen = {req.role for req in backend.calls}
+    assert "exploit_rule" in roles_seen
+    assert "explore_creative" in roles_seen
+    worker_reqs = [
+        req for req in backend.calls if req.role in ("exploit_rule", "explore_creative")
+    ]
+    assert worker_reqs
+    for req in worker_reqs:
+        assert "HIR ANALYTICAL ROOFLINE" in req.user_prompt
+        assert "LOWERED ASCEND TIR BLUEPRINT" in req.user_prompt
+        assert "TIR BLUEPRINT VS CURRENT TILELANG LEDGER DELTA" in req.user_prompt
+        assert "### TILELANG ASCEND PRIMITIVE REFERENCE" in req.user_prompt
+        assert "### EXECUTION TRACK" not in req.user_prompt
+        assert "### TARGET TRACK" not in req.user_prompt
+
+    assert runner._beam.exploit_beam
+    assert all(c.track == "unconstrained" for c in runner._beam.exploit_beam)
+    assert all(c.features is None for c in runner._beam.exploit_beam)

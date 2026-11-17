@@ -72,6 +72,36 @@ class RegimeTargetSpec:
     builder_candidates: tuple[str, ...]
     sample_builder_kwargs: dict[str, object]
     description: str = ""
+    representative_hir_dims: dict[str, int] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize regime target specification to a JSON-compatible dictionary."""
+        return {
+            "regime_tag": self.regime_tag,
+            "builder_candidates": list(self.builder_candidates),
+            "sample_builder_kwargs": dict(self.sample_builder_kwargs),
+            "description": self.description,
+            "representative_hir_dims": {
+                str(k): int(v) for k, v in self.representative_hir_dims.items()
+            },
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> RegimeTargetSpec:
+        """Reconstruct RegimeTargetSpec from a JSON mapping."""
+        raw_kwargs = payload.get("sample_builder_kwargs") or {}
+        raw_dims = payload.get("representative_hir_dims") or {}
+        return cls(
+            regime_tag=str(payload["regime_tag"]),
+            builder_candidates=tuple(str(x) for x in payload.get("builder_candidates", ())),
+            sample_builder_kwargs=dict(raw_kwargs) if isinstance(raw_kwargs, Mapping) else {},
+            description=str(payload.get("description", "")),
+            representative_hir_dims=(
+                {str(k): int(v) for k, v in raw_dims.items()}
+                if isinstance(raw_dims, Mapping)
+                else {}
+            ),
+        )
 
 
 OPERATOR_METADATA: dict[str, tuple[str, str, str]] = {
@@ -141,6 +171,7 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "schedule_mode": "tuned",
             },
             description="Small-row decode regime (m_rows < 28) needing depth/width core sharding.",
+            representative_hir_dims={"N": 2, "B": 1, "S": 1, "D": 4096},
         ),
         RegimeTargetSpec(
             regime_tag="unaligned_d",
@@ -156,6 +187,7 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "schedule_mode": "tuned",
             },
             description="Non-64-aligned D tail regime enabling padded UB row pitch and multi-row buffering.",
+            representative_hir_dims={"N": 8, "B": 1, "S": 4, "D": 1000},
         ),
         RegimeTargetSpec(
             regime_tag="aligned_prefill",
@@ -171,6 +203,7 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "schedule_mode": "tuned",
             },
             description="Aligned prefill regime with 56-core multi-row SimdVF pipelining.",
+            representative_hir_dims={"N": 8, "B": 1, "S": 6, "D": 512},
         ),
     ),
     "mla": (
@@ -193,6 +226,15 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "schedule_mode": "tuned",
             },
             description="Decode and small-Sq regime targeting Split-KV FlashDecoding across 28 MixCores.",
+            representative_hir_dims={
+                "B": 1,
+                "S": 1,
+                "S_kv": 64,
+                "N_q": 16,
+                "N_kv": 1,
+                "D_nope": 512,
+                "D_rope": 64,
+            },
         ),
         RegimeTargetSpec(
             regime_tag="bnsd_gather",
@@ -213,6 +255,15 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "schedule_mode": "tuned",
             },
             description="Non-aligned BNSD Q staging regime replacing scalar row copies.",
+            representative_hir_dims={
+                "B": 1,
+                "S": 2,
+                "S_kv": 32,
+                "N_q": 16,
+                "N_kv": 1,
+                "D_nope": 128,
+                "D_rope": 64,
+            },
         ),
         RegimeTargetSpec(
             regime_tag="prefill_compute",
@@ -233,6 +284,15 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "schedule_mode": "tuned",
             },
             description="Prefill and large-batch compute/pipeline overlap regime.",
+            representative_hir_dims={
+                "B": 1,
+                "S": 8,
+                "S_kv": 32,
+                "N_q": 8,
+                "N_kv": 1,
+                "D_nope": 128,
+                "D_rope": 64,
+            },
         ),
     ),
 }

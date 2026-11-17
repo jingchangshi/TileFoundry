@@ -29,7 +29,6 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     L3AcceptanceResult,
     L4CannbenchResult,
     run_l0_l1_round_filter,
-    run_l0_static_precheck,
     run_l1_compile_check,
     run_l3_full_contract_via_agent_gates,
     run_l4_official_cannbench_via_agent_gates,
@@ -42,7 +41,11 @@ from tilefoundry_ascend.agent.kb.schema import (
     build_predicate_context,
     load_seed_rules,
 )
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult, StageBResult
+from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    StageAResult,
+    StageBResult,
+    run_stage_a_static,
+)
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     CREATIVE_RESPONSE_SCHEMA,
     GenerationRequest,
@@ -53,6 +56,7 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
 )
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     CREATIVE_FOCUS_HINTS,
+    TILELANG_ASCEND_PRIMITIVE_MENU,
     build_prescreen_summary_from_kwargs,
     summarize_excluded_mechanisms,
 )
@@ -62,10 +66,16 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     compute_static_dynamic_residual,
     extract_structural_signature,
 )
+from tilefoundry_ascend.agent.orchestrator.twin_bridge import format_hir_tir_navigation_section
+from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
+    HirTirNavigationPacket,
+    compile_hir_navigation_packet,
+)
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
     build_objective_physical_ledger,
 )
+from tilefoundry_ascend.ascend.target import AscendTarget
 
 
 @dataclass(frozen=True)
@@ -344,6 +354,10 @@ class PerfTargetCampaignRunner:
         source_root: str | Path | None = None,
         env_file: str | Path | None = None,
         cannbench_repo: str | Path | None = None,
+        authored_hir_path: str | Path | None = None,
+        scheduled_hir_path: str | Path | None = None,
+        enable_track_router: bool = False,
+        target: AscendTarget | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
@@ -377,22 +391,76 @@ class PerfTargetCampaignRunner:
         self._l4_cannbench_runner = l4_cannbench_runner
         self._checkpoint_path = Path(checkpoint_path).resolve() if checkpoint_path else None
         self._campaign_kb_path = Path(campaign_kb_path).resolve() if campaign_kb_path else None
+        self._enable_track_router = bool(enable_track_router)
+        self._target = target or AscendTarget("ascend.950pr")
         self._clock = clock
+
+        if authored_hir_path is not None:
+            self._authored_hir_path: Path | None = Path(authored_hir_path).resolve()
+        else:
+            sibling_model = self._target_module_path.parent / "model.py"
+            self._authored_hir_path = sibling_model.resolve() if sibling_model.is_file() else None
+
+        if scheduled_hir_path is not None:
+            self._scheduled_hir_path: Path | None = Path(scheduled_hir_path).resolve()
+        else:
+            sibling_sched = self._target_module_path.parent / "scheduled.py"
+            self._scheduled_hir_path = sibling_sched.resolve() if sibling_sched.is_file() else None
+
+        self._regime_nav_packets: dict[str, HirTirNavigationPacket] = (
+            self._compile_regime_nav_packets()
+        )
+
+    def _compile_regime_nav_packets(self) -> dict[str, HirTirNavigationPacket]:
+        if self._authored_hir_path is None or not self._authored_hir_path.is_file():
+            return {}
+        try:
+            authored_hir_source = self._authored_hir_path.read_text(encoding="utf-8")
+        except OSError:
+            return {}
+        scheduled_hir_source: str | None = None
+        if self._scheduled_hir_path is not None and self._scheduled_hir_path.is_file():
+            try:
+                scheduled_hir_source = self._scheduled_hir_path.read_text(encoding="utf-8")
+            except OSError:
+                scheduled_hir_source = None
+
+        packets: dict[str, HirTirNavigationPacket] = {}
+        for regime_spec in self._regime_specs:
+            try:
+                packets[regime_spec.regime_tag] = compile_hir_navigation_packet(
+                    authored_hir_source,
+                    scheduled_hir_source=scheduled_hir_source,
+                    anchor_dims=regime_spec.representative_hir_dims,
+                    target=self._target,
+                )
+            except Exception:
+                continue
+        return packets
 
     def _get_backend(self) -> KernelLLMBackend:
         if self._backend is None:
             self._backend = create_llm_backend_from_env()
         return self._backend
 
+    def _default_l0_checker(
+        self,
+        module_source: str,
+        regime_spec: RegimeTargetSpec,
+    ) -> StageAResult:
+        func_name, _ = extract_regime_snippet(module_source, regime_spec)
+        return run_stage_a_static(
+            module_source,
+            factory_name=func_name,
+            factory_kwargs=regime_spec.sample_builder_kwargs,
+            target=self._target,
+            enable_track_router=self._enable_track_router,
+        )
+
     def _run_l0(self, module_source: str, regime_spec: RegimeTargetSpec) -> StageAResult:
         if self._l0_checker is not None:
             return self._l0_checker(module_source, regime_spec)
-        func_name, _ = extract_regime_snippet(module_source, regime_spec)
-        return run_l0_static_precheck(
-            module_source,
-            builder_name=func_name,
-            builder_kwargs=regime_spec.sample_builder_kwargs,
-        )
+        return self._default_l0_checker(module_source, regime_spec)
 
     def _run_l1(self, module_source: str, regime_spec: RegimeTargetSpec) -> StageBResult:
         if self._l1_compiler is not None:
@@ -504,6 +572,9 @@ class PerfTargetCampaignRunner:
         regime_spec: RegimeTargetSpec,
         rule: AscendCausalRule,
         best_result: CandidateSurrogateResult,
+        nav_packet: HirTirNavigationPacket | None = None,
+        parent_ledger: ObjectivePhysicalLedger | None = None,
+        track: str = "unconstrained",
     ) -> GenerationRequest:
         sys_prompt = (
             "You are an Ascend 950PR TileLang DSL performance engineer. Apply the selected causal "
@@ -511,8 +582,24 @@ class PerfTargetCampaignRunner:
             "numerical semantics and dynamic shape compatibility. Output ONLY Python code defining "
             f"'{func_name}'."
         )
+        if not self._enable_track_router or track in ("", "unconstrained"):
+            track_section = (
+                f"### TILELANG ASCEND PRIMITIVE REFERENCE\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"
+            )
+        else:
+            track_section = f"### TARGET TRACK\n{track}\n\n"
+        if nav_packet is not None:
+            nav_text = format_hir_tir_navigation_section(
+                nav_packet,
+                current_tl_ledger=parent_ledger,
+            )
+            nav_section = f"{nav_text}\n\n"
+        else:
+            nav_section = ""
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
+            f"{track_section}"
+            f"{nav_section}"
             f"### SELECTED CAUSAL RULE\n"
             f"Rule ID: {rule.rule_id}\n"
             f"Precondition: {rule.precondition}\n"
@@ -541,6 +628,9 @@ class PerfTargetCampaignRunner:
         excluded_mechanisms: Sequence[str] = (),
         focus_hint: str = "",
         prescreen_summary: str = "",
+        nav_packet: HirTirNavigationPacket | None = None,
+        parent_ledger: ObjectivePhysicalLedger | None = None,
+        track: str = "unconstrained",
     ) -> GenerationRequest:
         sys_prompt = (
             "You are an Ascend 950PR (dav-3510) systems architect. Propose an architectural "
@@ -559,6 +649,20 @@ class PerfTargetCampaignRunner:
             "Propose a structurally orthogonal transformation that does NOT duplicate the "
             "mechanisms listed above.\n\n"
         )
+        if not self._enable_track_router or track in ("", "unconstrained"):
+            track_section = (
+                f"### TILELANG ASCEND PRIMITIVE REFERENCE\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"
+            )
+        else:
+            track_section = f"### EXECUTION TRACK\n{track}\n\n"
+        if nav_packet is not None:
+            nav_text = format_hir_tir_navigation_section(
+                nav_packet,
+                current_tl_ledger=parent_ledger,
+            )
+            nav_section = f"{nav_text}\n\n"
+        else:
+            nav_section = ""
         focus_section = f"### ARCHITECTURAL FOCUS HINT\n{focus_hint}\n\n" if focus_hint else ""
         prescreen_section = (
             f"### TILE PRESCREEN GUIDANCE\n{prescreen_summary}\n\n"
@@ -567,6 +671,8 @@ class PerfTargetCampaignRunner:
         )
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
+            f"{track_section}"
+            f"{nav_section}"
             f"{focus_section}"
             f"{neg_section}"
             f"{prescreen_section}"
@@ -718,6 +824,8 @@ class PerfTargetCampaignRunner:
         escalated = stagnation_rounds >= self._config.stagnation_escalate_rounds
         parent_lane = "exploit"
         parent_snippet = default_snippet
+        stone_ledger: ObjectivePhysicalLedger | None = None
+        stone_track: str | None = None
         creative_effort = "high"
         if escalated:
             creative_effort = "xhigh"
@@ -728,6 +836,8 @@ class PerfTargetCampaignRunner:
                     patch_regime_into_module(incumbent_source, func_name, stone.dsl_source)
                     parent_snippet = stone.dsl_source
                     parent_lane = "stepping_stone"
+                    stone_ledger = stone.ledger
+                    stone_track = stone.track
                 except Exception:
                     parent_lane = "stepping_stone"
             else:
@@ -735,10 +845,38 @@ class PerfTargetCampaignRunner:
 
         base_stage_a = self._run_l0(incumbent_source, regime_spec)
         base_ledger = base_stage_a.ledger if base_stage_a.ledger is not None else _fallback_ledger()
-        ctx = build_predicate_context(base_ledger, features=base_stage_a.features)
+        parent_ledger = stone_ledger if stone_ledger is not None else base_ledger
+        if self._enable_track_router:
+            parent_track = (
+                stone_track
+                if stone_track is not None
+                else (
+                    base_stage_a.route.track
+                    if base_stage_a.route is not None
+                    else "unconstrained"
+                )
+            )
+            parent_features = base_stage_a.features
+        else:
+            parent_track = "unconstrained"
+            parent_features = None
+
+        parent_residual = compute_static_dynamic_residual(
+            parent_ledger,
+            {
+                "dur_us": best_result.mean_latency_us(),
+                "roofline_eta": best_result.avg_roofline_eta,
+            },
+        )
+        ctx = build_predicate_context(
+            parent_ledger,
+            features=parent_features,
+            residual=parent_residual,
+        )
         ranked_rules = list(
             self._tracker.rank_applicable_rules(ctx, top_k=self._config.k_rule_workers)
         )
+        nav_packet = self._regime_nav_packets.get(regime_spec.regime_tag)
 
         worker_specs: list[tuple[str, str, AscendCausalRule | None, GenerationRequest]] = []
         for idx, rule in enumerate(ranked_rules[: self._config.k_rule_workers]):
@@ -753,6 +891,9 @@ class PerfTargetCampaignRunner:
                         regime_spec=regime_spec,
                         rule=rule,
                         best_result=best_result,
+                        nav_packet=nav_packet,
+                        parent_ledger=parent_ledger,
+                        track=parent_track,
                     ),
                 )
             )
@@ -786,6 +927,9 @@ class PerfTargetCampaignRunner:
                         excluded_mechanisms=excluded,
                         focus_hint=hint,
                         prescreen_summary=prescreen_summary,
+                        nav_packet=nav_packet,
+                        parent_ledger=parent_ledger,
+                        track=parent_track,
                     ),
                 )
             )
@@ -873,8 +1017,8 @@ class PerfTargetCampaignRunner:
             )
             track = (
                 chk.stage_a.route.track
-                if chk.stage_a and chk.stage_a.route is not None
-                else "simt_vf"
+                if self._enable_track_router and chk.stage_a and chk.stage_a.route is not None
+                else "unconstrained"
             )
             lat_us = res.mean_latency_us()
             beam_updates.append(
@@ -896,7 +1040,11 @@ class PerfTargetCampaignRunner:
                         chk.snippet_source, track=track
                     ),
                     parent_id=f"round_{round_idx - 1}",
-                    features=chk.stage_a.features if chk.stage_a else None,
+                    features=(
+                        chk.stage_a.features
+                        if (self._enable_track_router and chk.stage_a)
+                        else None
+                    ),
                 )
             )
             if rule is not None:
