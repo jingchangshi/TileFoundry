@@ -22,7 +22,11 @@ from tilefoundry_ascend.agent.orchestrator import (
 from tilefoundry_ascend.agent.orchestrator import (
     StreamWatchdogConfig as OrchestratorStreamWatchdogConfig,
 )
-from tilefoundry_ascend.agent.orchestrator.llm_client import _normalize_agy_common_args
+from tilefoundry_ascend.agent.orchestrator.llm_client import (
+    _AgyLogTailer,
+    _normalize_agy_common_args,
+    extract_creative_payload,
+)
 
 _FAKE_AGY_BODY = """
 import json
@@ -628,3 +632,27 @@ def test_runaway_sandbox_tool_calls_aborted(
     monkeypatch.setenv("TF_FAKE_AGY_SCENARIO", "bounded_tools_ok")
     reply = asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
     assert reply == "bounded_tools_succeeded"
+
+
+def test_json_schema_sse_in_flight_defers_idle_to_ceiling_and_fenced_json_extracts(
+    tmp_path: Path,
+) -> None:
+    """Verify fenced creative JSON extraction and SSE in-flight log detection."""
+    fenced = (
+        "```json\n"
+        '{"physical_hypothesis": "h", "target_local_metric": "m", "dsl_source": "x = 1"}\n'
+        "```"
+    )
+    parsed = extract_creative_payload(fenced)
+    assert parsed["physical_hypothesis"] == "h"
+    assert parsed["target_local_metric"] == "m"
+    assert parsed["dsl_source"] == "x = 1"
+
+    log_path = tmp_path / "worker.log"
+    log_path.write_text("I1117 20:00:00 URL: https://x/v1:streamGenerateContent?alt=sse\n", encoding="utf-8")
+    tailer = _AgyLogTailer(log_path)
+    assert tailer.poll() == []
+    assert tailer.sse_in_flight is True
+    assert tailer.poll() == []
+    assert tailer.sse_in_flight is True
+

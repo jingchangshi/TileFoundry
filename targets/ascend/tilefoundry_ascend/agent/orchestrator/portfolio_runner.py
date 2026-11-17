@@ -430,7 +430,9 @@ def build_syntax_repair_request(dsl_source: str, error_message: str) -> Generati
     sys_prompt = (
         "You are a TileLang Ascend compiler repair engineer. Fix the syntax, API, or "
         "memory-capacity failure reported below without altering tensor semantics. "
-        "Output ONLY corrected Python code."
+        "Output ONLY corrected Python code. Preserve existing top-level symbol names; "
+        "any new top-level helper MUST reuse the exact regime prefix shown in "
+        "BROKEN KERNEL DSL (do NOT add unprefixed top-level functions)."
     )
     user_prompt = (
         f"### COMPILER / GATE DIAGNOSTIC\n{error_message}\n\n"

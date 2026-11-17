@@ -61,7 +61,6 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     run_stage_a_static,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
-    CREATIVE_RESPONSE_SCHEMA,
     GenerationRequest,
     KernelLLMBackend,
     create_llm_backend_from_env,
@@ -1328,8 +1327,10 @@ class PerfTargetCampaignRunner:
             "You are an Ascend 950PR (dav-3510) systems architect. Propose an architectural "
             f"optimization grounded in Roofline limits (56 AIV / 28 MixCore blocks, 3 KiB SSBUF, "
             "L0C->UB direct path, UB->L1 direct path, 64-elem UB alignment, Split-KV parallelism). "
-            f"Preserve exact numerical semantics, signatures, and {slice_desc}. Return JSON "
-            "matching the schema."
+            f"Preserve exact numerical semantics, signatures, and {slice_desc}. Return ONLY a "
+            'raw JSON object with exact keys "physical_hypothesis" (string), '
+            '"target_local_metric" (string), and "dsl_source" (Python code string for this '
+            "regime slice only; no prose outside JSON)."
         )
         if excluded_mechanisms:
             constraint_lines = "\n".join(f"- {item}" for item in excluded_mechanisms)
@@ -1384,7 +1385,7 @@ class PerfTargetCampaignRunner:
             role="explore_creative",
             system_prompt=sys_prompt,
             user_prompt=user_prompt,
-            json_schema=CREATIVE_RESPONSE_SCHEMA,
+            json_schema=None,
             effort=effort,
         )
 

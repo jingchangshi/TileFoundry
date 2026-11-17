@@ -24,6 +24,7 @@ RE_STREAM_IDLE_LOG = re.compile(
     r"(?:run\.go:\d+\]\s*Run:\s*attempt\s+\d+\s+failed.*stream idle timeout|stream idle timeout)",
     re.IGNORECASE,
 )
+RE_SSE_DISPATCH = re.compile(r"streamGenerateContent\?alt=sse", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -97,6 +98,12 @@ def extract_python_dsl(raw_response: str) -> str:
 def extract_creative_payload(raw_response: str) -> dict[str, str]:
     """Parse structured JSON response or markdown fallback from creative explore worker."""
     stripped = raw_response.strip()
+    if not stripped.startswith("{") and "```" in stripped:
+        for fence_match in re.finditer(r"```[a-zA-Z0-9_-]*\s*\n(.*?)```", stripped, re.DOTALL):
+            inner = fence_match.group(1).strip()
+            if inner.startswith("{"):
+                stripped = inner
+                break
     if stripped.startswith("{"):
         try:
             obj = json.loads(stripped)
@@ -180,6 +187,7 @@ class _AgyLogTailer:
         self.count_503 = 0
         self.count_idle_timeout = 0
         self.saw_progress = False
+        self.sse_in_flight = False
 
     def poll(self) -> list[str]:
         """Read newly written log lines and return matched error event tags."""
@@ -220,6 +228,8 @@ class _AgyLogTailer:
                 is_err_line = True
             if not is_err_line:
                 self.saw_progress = True
+            if RE_SSE_DISPATCH.search(line):
+                self.sse_in_flight = True
         return events
 
 
@@ -655,11 +665,16 @@ class AgyCliLLMBackend:
                                 ),
                                 retriable=True,
                             )
-                        if (now - last_activity_ts) > cfg.idle_stall_timeout_sec:
+                        effective_idle_sec = (
+                            max(cfg.idle_stall_timeout_sec, cfg.active_ceiling_timeout_sec)
+                            if (req.json_schema is not None and tailer.sse_in_flight)
+                            else cfg.idle_stall_timeout_sec
+                        )
+                        if (now - last_activity_ts) > effective_idle_sec:
                             await _terminate_process_group(proc)
                             raise _AttemptFailure(
                                 TimeoutError(
-                                    f"agy idle_stall_timeout ({cfg.idle_stall_timeout_sec}s) "
+                                    f"agy idle_stall_timeout ({effective_idle_sec}s) "
                                     f"exceeded (role={req.role}, model={model_id})"
                                 ),
                                 retriable=True,
