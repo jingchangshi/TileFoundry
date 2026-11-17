@@ -1,5 +1,6 @@
 """TileLang Ascend950PR SimdVF kernel implementation for AttentionResidual."""
 
+import contextlib
 import math
 
 import tilelang
@@ -9,6 +10,18 @@ import torch
 from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
 
 _KERNEL_CACHE: dict[tuple[object, ...], object] = {}
+
+
+def _ascend_target_ctx():
+    try:
+        from tilelang import tvm
+        from tilelang.backend.module import create_backend_context
+
+        if tvm.target.Target.current(allow_none=True) is None:
+            return create_backend_context("ascend").target
+    except Exception:
+        pass
+    return contextlib.nullcontext()
 
 
 def _build_attention_residual_prim_func(
@@ -492,7 +505,8 @@ def _get_kernel(
     )
     compiled = _KERNEL_CACHE.get(key)
     if compiled is None:
-        prog = resolved_builder(n_depth, d_dim, tl_dtype, tile_m, schedule_mode)
+        with _ascend_target_ctx():
+            prog = resolved_builder(n_depth, d_dim, tl_dtype, tile_m, schedule_mode)
         flags_arg = list(flags_tuple) if flags_tuple else None
         compiled = tilelang.compile(
             prog,

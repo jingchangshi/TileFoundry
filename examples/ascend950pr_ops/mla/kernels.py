@@ -1,5 +1,6 @@
 """TileLang Ascend950PR MIX SimdVF kernel implementation for Multi-Head Latent Attention."""
 
+import contextlib
 import math
 
 import tilelang
@@ -9,6 +10,18 @@ import torch
 from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
 
 _KERNEL_CACHE: dict[tuple[object, ...], object] = {}
+
+
+def _ascend_target_ctx():
+    try:
+        from tilelang import tvm
+        from tilelang.backend.module import create_backend_context
+
+        if tvm.target.Target.current(allow_none=True) is None:
+            return create_backend_context("ascend").target
+    except Exception:
+        pass
+    return contextlib.nullcontext()
 
 
 def _build_mla_prim_func(
@@ -1343,33 +1356,34 @@ def _get_kernel(
     )
     compiled = _KERNEL_CACHE.get(key)
     if compiled is None:
-        if resolved_builder is _build_mla_split_kv_decode_func:
-            prog = resolved_builder(
-                n_q,
-                n_kv,
-                d_nope,
-                d_rope,
-                tl_dtype,
-                input_layout,
-                is_causal,
-                bm,
-                aligned_group_q,
-                splits,
-                schedule_mode,
-            )
-        else:
-            prog = resolved_builder(
-                n_q,
-                n_kv,
-                d_nope,
-                d_rope,
-                tl_dtype,
-                input_layout,
-                is_causal,
-                bm,
-                aligned_group_q,
-                schedule_mode,
-            )
+        with _ascend_target_ctx():
+            if resolved_builder is _build_mla_split_kv_decode_func:
+                prog = resolved_builder(
+                    n_q,
+                    n_kv,
+                    d_nope,
+                    d_rope,
+                    tl_dtype,
+                    input_layout,
+                    is_causal,
+                    bm,
+                    aligned_group_q,
+                    splits,
+                    schedule_mode,
+                )
+            else:
+                prog = resolved_builder(
+                    n_q,
+                    n_kv,
+                    d_nope,
+                    d_rope,
+                    tl_dtype,
+                    input_layout,
+                    is_causal,
+                    bm,
+                    aligned_group_q,
+                    schedule_mode,
+                )
         flags_arg = list(flags_tuple) if flags_tuple else None
         compiled = tilelang.compile(
             prog,
@@ -1403,9 +1417,10 @@ def _get_combine_kernel(
     )
     compiled = _KERNEL_CACHE.get(key)
     if compiled is None:
-        prog = _build_mla_split_kv_combine_func(
-            d_nope=d_nope, tl_dtype=tl_dtype, num_kv_splits=splits
-        )
+        with _ascend_target_ctx():
+            prog = _build_mla_split_kv_combine_func(
+                d_nope=d_nope, tl_dtype=tl_dtype, num_kv_splits=splits
+            )
         flags_arg = list(flags_tuple) if flags_tuple else None
         compiled = tilelang.compile(
             prog,

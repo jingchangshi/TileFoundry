@@ -853,3 +853,26 @@ def _build_mla_prefill_func(bm=64):
     assert "bm=128, bn=64" in mla_summary
     assert "REJECT(L0C_overflow:294912>262144)" in mla_summary
 
+
+def test_stage_a_binds_ascend_target_context_for_t_fill() -> None:
+    from tilelang import tvm
+
+    assert tvm.target.Target.current(allow_none=True) is None
+    t_fill_dsl = """
+import tilelang.ascend.language as T
+
+def make_fill_kernel():
+    @T.prim_func
+    def main(X: T.Tensor((64,), "float32"), Y: T.Tensor((64,), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((64,), "float32")
+            with T.SimdVF():
+                T.fill(a_ub, 0.0)
+            T.copy(a_ub, Y[0:64])
+    return main
+"""
+    res = run_stage_a_static(t_fill_dsl, factory_name="make_fill_kernel")
+    assert res.passed, res.error_message
+    assert res.ledger is not None
+
+

@@ -302,6 +302,21 @@ def main():
         )
         return 0
 
+    if scenario == "sse_thinking_then_ok":
+        log_path = Path(args["log_file"])
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write("I1117 20:00:00.100 http_helpers.go:709] URL: https://x/v1internal:streamGenerateContent?alt=sse\\n")
+            fh.flush()
+        time.sleep(0.65)
+        _emit(
+            {
+                "event": "result",
+                "result": {"status": "SUCCESS", "response": "sse_thinking_succeeded"},
+            }
+        )
+        return 0
+
     raise ValueError(f"unknown scenario: {scenario}")
 
 
@@ -655,4 +670,29 @@ def test_json_schema_sse_in_flight_defers_idle_to_ceiling_and_fenced_json_extrac
     assert tailer.sse_in_flight is True
     assert tailer.poll() == []
     assert tailer.sse_in_flight is True
+
+
+def test_sse_thinking_defers_idle_timeout_without_json_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify SSE in-flight log defers idle stall to ceiling when json_schema is None."""
+    bin_path, state_dir = _write_fake_agy(tmp_path)
+    monkeypatch.setenv("TF_FAKE_AGY_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("TF_FAKE_AGY_SCENARIO", "sse_thinking_then_ok")
+
+    backend = AgyCliLLMBackend(
+        bin_path=str(bin_path),
+        watchdog=StreamWatchdogConfig(
+            startup_timeout_sec=1.0,
+            idle_stall_timeout_sec=0.25,
+            active_ceiling_timeout_sec=3.0,
+            max_retries=0,
+        ),
+    )
+    reply = asyncio.run(
+        backend.generate(GenerationRequest("explore_creative", "sys", "usr", json_schema=None))
+    )
+    assert reply == "sse_thinking_succeeded"
+
 

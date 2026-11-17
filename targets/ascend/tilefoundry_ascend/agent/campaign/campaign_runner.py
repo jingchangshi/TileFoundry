@@ -247,7 +247,14 @@ def _atomic_write_text(path: Path, content: str) -> None:
 
 
 _FORBIDDEN_SLICE_SYMBOLS: frozenset[str] = frozenset(
-    {"attention_residual", "mla", "_get_kernel", "_KERNEL_CACHE"}
+    {
+        "attention_residual",
+        "mla",
+        "_get_kernel",
+        "_get_combine_kernel",
+        "_ascend_target_ctx",
+        "_KERNEL_CACHE",
+    }
 )
 
 _HIR_DIM_ALIASES: dict[str, str] = {

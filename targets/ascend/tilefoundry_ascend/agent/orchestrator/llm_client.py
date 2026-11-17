@@ -654,7 +654,7 @@ class AgyCliLLMBackend:
                                     f"agy active_ceiling_timeout ({cfg.active_ceiling_timeout_sec}s) "
                                     f"exceeded (role={req.role}, model={model_id})"
                                 ),
-                                retriable=False,
+                                retriable=True,
                             )
                         if not got_init and (now - start_ts) > cfg.startup_timeout_sec:
                             await _terminate_process_group(proc)
@@ -667,7 +667,7 @@ class AgyCliLLMBackend:
                             )
                         effective_idle_sec = (
                             max(cfg.idle_stall_timeout_sec, cfg.active_ceiling_timeout_sec)
-                            if (req.json_schema is not None and tailer.sse_in_flight)
+                            if tailer.sse_in_flight
                             else cfg.idle_stall_timeout_sec
                         )
                         if (now - last_activity_ts) > effective_idle_sec:

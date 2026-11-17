@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+import contextlib
 from dataclasses import dataclass
 import json
 import os
@@ -161,6 +162,18 @@ def _split_selector_output(
     return builder_overrides, pc, cf
 
 
+def _ascend_target_context():
+    try:
+        from tilelang import tvm
+        from tilelang.backend.module import create_backend_context
+
+        if tvm.target.Target.current(allow_none=True) is None:
+            return create_backend_context("ascend").target
+    except Exception:
+        pass
+    return contextlib.nullcontext()
+
+
 def _resolve_prim_func_and_configs_from_dsl(
     dsl_source: str,
     *,
@@ -192,38 +205,39 @@ def _resolve_prim_func_and_configs_from_dsl(
         if spec is None or spec.loader is None:
             raise RuntimeError("failed to create module spec for candidate DSL")
         mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        with _ascend_target_context():
+            spec.loader.exec_module(mod)
 
-        if config_selector_name and hasattr(mod, config_selector_name):
-            selector_obj = getattr(mod, config_selector_name)
-            if callable(selector_obj):
-                sel_args = _filter_kwargs_for_callable(selector_obj, effective_kwargs)
-                sel_raw = selector_obj(**sel_args)
-                if isinstance(sel_raw, Mapping):
-                    overrides, sel_pass_configs, sel_compile_flags = _split_selector_output(
-                        sel_raw
-                    )
-                    effective_kwargs.update(overrides)
+            if config_selector_name and hasattr(mod, config_selector_name):
+                selector_obj = getattr(mod, config_selector_name)
+                if callable(selector_obj):
+                    sel_args = _filter_kwargs_for_callable(selector_obj, effective_kwargs)
+                    sel_raw = selector_obj(**sel_args)
+                    if isinstance(sel_raw, Mapping):
+                        overrides, sel_pass_configs, sel_compile_flags = _split_selector_output(
+                            sel_raw
+                        )
+                        effective_kwargs.update(overrides)
 
-        if factory_name and hasattr(mod, factory_name):
-            target_obj = getattr(mod, factory_name)
-            if callable(target_obj):
-                call_kw = _filter_kwargs_for_callable(target_obj, effective_kwargs)
-                return target_obj(**call_kw), sel_pass_configs, sel_compile_flags
-            return target_obj, sel_pass_configs, sel_compile_flags
+            if factory_name and hasattr(mod, factory_name):
+                target_obj = getattr(mod, factory_name)
+                if callable(target_obj):
+                    call_kw = _filter_kwargs_for_callable(target_obj, effective_kwargs)
+                    return target_obj(**call_kw), sel_pass_configs, sel_compile_flags
+                return target_obj, sel_pass_configs, sel_compile_flags
 
-        for val in vars(mod).values():
-            if isinstance(val, (tirx.PrimFunc, IRModule)):
-                return val, sel_pass_configs, sel_compile_flags
+            for val in vars(mod).values():
+                if isinstance(val, (tirx.PrimFunc, IRModule)):
+                    return val, sel_pass_configs, sel_compile_flags
 
-        for name, val in vars(mod).items():
-            if (
-                not name.startswith("_")
-                and callable(val)
-                and getattr(val, "__module__", None) == mod.__name__
-            ):
-                call_kw = _filter_kwargs_for_callable(val, effective_kwargs)
-                return val(**call_kw), sel_pass_configs, sel_compile_flags
+            for name, val in vars(mod).items():
+                if (
+                    not name.startswith("_")
+                    and callable(val)
+                    and getattr(val, "__module__", None) == mod.__name__
+                ):
+                    call_kw = _filter_kwargs_for_callable(val, effective_kwargs)
+                    return val(**call_kw), sel_pass_configs, sel_compile_flags
     raise ValueError("DSL source defined no callable factory or PrimFunc")
 
 
@@ -387,13 +401,17 @@ def build_stage_b_driver_source(
         }
     )
     return (
-        "import importlib.util, inspect, json, tilelang\n"
+        "import contextlib, importlib.util, inspect, json, tilelang\n"
         "from tilelang import tvm\n"
+        "from tilelang.backend.module import create_backend_context\n"
         "from tvm import tirx, IRModule\n"
+        "def _ascend_ctx():\n"
+        "    if tvm.target.Target.current(allow_none=True) is None:\n"
+        "        return create_backend_context('ascend').target\n"
+        "    return contextlib.nullcontext()\n"
         f"_cfg = json.loads({payload!r})\n"
         "_spec = importlib.util.spec_from_file_location('_tf_stage_b', _cfg['cand_path'])\n"
         "_mod = importlib.util.module_from_spec(_spec)\n"
-        "_spec.loader.exec_module(_mod)\n"
         "def _filt(obj, kw):\n"
         "    sig = inspect.signature(obj)\n"
         "    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):\n"
@@ -407,38 +425,41 @@ def build_stage_b_driver_source(
         "    return [str(getattr(x, 'value', x)).strip() for x in raw if str(x).strip()]\n"
         "_kw = dict(_cfg['factory_kwargs'])\n"
         "_sel_pc, _sel_cf = {}, []\n"
-        "_sname = _cfg['config_selector_name']\n"
-        "if _sname and callable(getattr(_mod, _sname, None)):\n"
-        "    _sfn = getattr(_mod, _sname)\n"
-        "    _sout = _sfn(**_filt(_sfn, _kw))\n"
-        "    if isinstance(_sout, dict):\n"
-        "        _raw_pc = _sout.get('pass_configs')\n"
-        "        if isinstance(_raw_pc, dict):\n"
-        "            for _k, _v in _raw_pc.items():\n"
-        "                if _k == 'tl.device_compile_flags':\n"
-        "                    _sel_cf.extend(_norm_flags(_v))\n"
-        "                else:\n"
-        "                    _sel_pc[str(_k)] = _v\n"
-        "        elif _raw_pc is not None:\n"
-        "            _sel_cf.extend(_norm_flags(_raw_pc))\n"
-        "        _sel_cf.extend(_norm_flags(_sout.get('compile_flags')))\n"
-        "        for _k, _v in _sout.items():\n"
-        "            if _k not in ('pass_configs', 'compile_flags'):\n"
-        "                _kw[_k] = _v\n"
-        "_fname = _cfg['factory_name']\n"
         "_fn = None\n"
-        "if _fname and hasattr(_mod, _fname):\n"
-        "    _obj = getattr(_mod, _fname)\n"
-        "    _fn = _obj(**_filt(_obj, _kw)) if callable(_obj) else _obj\n"
-        "if _fn is None:\n"
-        "    for _v in vars(_mod).values():\n"
-        "        if isinstance(_v, (tirx.PrimFunc, IRModule)):\n"
-        "            _fn = _v; break\n"
-        "if _fn is None:\n"
-        "    for _k, _v in vars(_mod).items():\n"
-        "        if (not _k.startswith('_') and callable(_v)\n"
-        "                and getattr(_v, '__module__', None) == _mod.__name__):\n"
-        "            _fn = _v(**_filt(_v, _kw)); break\n"
+        "with _ascend_ctx():\n"
+        "    _spec.loader.exec_module(_mod)\n"
+        "    _sname = _cfg['config_selector_name']\n"
+        "    if _sname and callable(getattr(_mod, _sname, None)):\n"
+        "        _sfn = getattr(_mod, _sname)\n"
+        "        _sout = _sfn(**_filt(_sfn, _kw))\n"
+        "        if isinstance(_sout, dict):\n"
+        "            _raw_pc = _sout.get('pass_configs')\n"
+        "            if isinstance(_raw_pc, dict):\n"
+        "                for _k, _v in _raw_pc.items():\n"
+        "                    if _k == 'tl.device_compile_flags':\n"
+        "                        _sel_cf.extend(_norm_flags(_v))\n"
+        "                    else:\n"
+        "                        _sel_pc[str(_k)] = _v\n"
+        "            elif _raw_pc is not None:\n"
+        "                _sel_cf.extend(_norm_flags(_raw_pc))\n"
+        "            _sel_cf.extend(_norm_flags(_sout.get('compile_flags')))\n"
+        "            for _k, _v in _sout.items():\n"
+        "                if _k not in ('pass_configs', 'compile_flags'):\n"
+        "                    _kw[_k] = _v\n"
+        "    _fname = _cfg['factory_name']\n"
+        "    if _fname and hasattr(_mod, _fname):\n"
+        "        _obj = getattr(_mod, _fname)\n"
+        "        _fn = _obj(**_filt(_obj, _kw)) if callable(_obj) else _obj\n"
+        "    if _fn is None:\n"
+        "        for _v in vars(_mod).values():\n"
+        "            if isinstance(_v, (tirx.PrimFunc, IRModule)):\n"
+        "                _fn = _v; break\n"
+        "    if _fn is None:\n"
+        "        for _k, _v in vars(_mod).items():\n"
+        "            if (not _k.startswith('_') and callable(_v)\n"
+        "                    and getattr(_v, '__module__', None) == _mod.__name__):\n"
+        "                _fn = _v(**_filt(_v, _kw)); break\n"
+        "assert _fn is not None\n"
         "_merged_pc, _merged_cf = {}, []\n"
         "def _absorb_flags(items):\n"
         "    for _f in items:\n"
