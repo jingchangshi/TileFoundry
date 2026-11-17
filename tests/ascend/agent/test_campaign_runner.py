@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 
 from tilefoundry_ascend.agent import (
@@ -31,7 +32,10 @@ from tilefoundry_ascend.agent.campaign import (
     compute_case_eq3_score,
     extract_regime_snippet,
     patch_regime_into_module,
+    surrogate_cannbench,
 )
+from tilefoundry_ascend.agent.campaign.anchor_specs import DEFAULT_REGIME_SPECS
+from tilefoundry_ascend.agent.campaign.campaign_runner import _extract_regime_abi_context
 from tilefoundry_ascend.agent.orchestrator import StageAResult, StageBResult
 from tilefoundry_ascend.agent.router import extract_structural_features, route_execution_track
 from tilefoundry_ascend.ascend.passes import build_objective_physical_ledger
@@ -2246,3 +2250,75 @@ def test_prewarm_surrogate_tilelang_cache_pure_cpu_without_harness_prepare(
         {"kind": "mla_combine", "splits": 4},
     ]
     assert mla_entries[1]["out_idx"] == [2]
+
+
+def test_run_agent_gates_cmd_retries_transient_blocked_env(monkeypatch) -> None:
+    responses = [
+        subprocess.CompletedProcess(
+            args=["agent-gates"],
+            returncode=1,
+            stdout=json.dumps({"status": "BLOCKED_ENV", "runId": "r1"}),
+            stderr="npu-smi info -m timed out",
+        ),
+        subprocess.CompletedProcess(
+            args=["agent-gates"],
+            returncode=1,
+            stdout=json.dumps({"status": "BLOCKED_ENV", "runId": "r2"}),
+            stderr="",
+        ),
+        subprocess.CompletedProcess(
+            args=["agent-gates"],
+            returncode=0,
+            stdout=json.dumps({"status": "PASS", "runId": "r3", "receiptPath": "/tmp/r3.json"}),
+            stderr="",
+        ),
+    ]
+    calls: list[list[str]] = []
+    sleeps: list[float] = []
+
+    def fake_run(cmd, **kwargs):
+        _ = kwargs
+        calls.append(list(cmd))
+        return responses.pop(0)
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", fake_run)
+    proc, parsed = surrogate_cannbench._run_agent_gates_cmd(
+        ["agent-gates", "run"],
+        cwd=".",
+        env={"PATH": "/usr/bin"},
+        timeout_sec=60,
+        max_attempts=4,
+        backoff_sec=2.0,
+        sleep_fn=sleeps.append,
+    )
+    assert proc.returncode == 0
+    assert parsed["status"] == "PASS"
+    assert parsed["runId"] == "r3"
+    assert len(calls) == 3
+    assert sleeps == [2.0, 4.0]
+
+
+def test_extract_regime_abi_context_covers_ar_and_mla_signatures() -> None:
+    root = Path(__file__).resolve().parents[3]
+    ar_src = (
+        root / "examples" / "ascend950pr_ops" / "attention_residual" / "kernels.py"
+    ).read_text(encoding="utf-8")
+    ar_spec = next(
+        s for s in DEFAULT_REGIME_SPECS["attention_residual"] if s.regime_tag == "small_decode"
+    )
+    ar_abi = _extract_regime_abi_context(ar_src, ar_spec)
+    assert "IMMUTABLE HOST / PRIMFUNC ABI CONTRACT" in ar_abi
+    assert "def _build_attention_residual_prim_func(" in ar_abi
+    assert "@T.prim_func\ndef main(" in ar_abi
+    assert "V: T.Tensor((v_rows, d_dim), tl_dtype)" in ar_abi
+    assert "alpha_val: T.float32" in ar_abi
+
+    mla_src = (root / "examples" / "ascend950pr_ops" / "mla" / "kernels.py").read_text(
+        encoding="utf-8"
+    )
+    mla_spec = next(s for s in DEFAULT_REGIME_SPECS["mla"] if s.regime_tag == "split_kv_decode")
+    mla_abi = _extract_regime_abi_context(mla_src, mla_spec)
+    assert "def _build_mla_prim_func(" in mla_abi
+    assert "Q_nope: T.Tensor((q_total_rows, d_nope), tl_dtype)" in mla_abi
+    assert "scale_val: T.float32" in mla_abi
+

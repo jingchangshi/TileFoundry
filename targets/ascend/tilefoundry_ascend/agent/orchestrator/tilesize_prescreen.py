@@ -259,6 +259,7 @@ def _bounded_live_ir_variants(
     tune_k: bool,
     tune_stages: bool,
     max_variants: int,
+    pure_vector_row_tile: bool = False,
 ) -> list[TileConfigCandidate]:
     variants: list[TileConfigCandidate] = [center]
     seen: set[tuple[int, int, int, int]] = {(center.bm, center.bn, center.bk, center.stages)}
@@ -270,6 +271,32 @@ def _bounded_live_ir_variants(
         if key not in seen:
             seen.add(key)
             variants.append(cand)
+
+    if pure_vector_row_tile:
+        bm_vals = (center.bm, *[m for m in (1, 2, 4, 6, 8) if m != center.bm])
+        stage_vals = (
+            (center.stages, *[s for s in (1, 2, 3) if tune_stages and s != center.stages])
+            if tune_stages
+            else (center.stages,)
+        )
+        for st in stage_vals:
+            for bm_cand in bm_vals:
+                _add(
+                    TileConfigCandidate(
+                        bm=bm_cand,
+                        bn=center.bn,
+                        bk=center.bk,
+                        stages=st,
+                        dtype_bytes=center.dtype_bytes,
+                        accum_bytes=center.accum_bytes,
+                        aiv_split=center.aiv_split,
+                        d_out=center.d_out,
+                        dual_accumulator=center.dual_accumulator,
+                    )
+                )
+                if len(variants) >= max_variants:
+                    return variants
+        return variants
 
     if tune_m and center.bm >= 64:
         step = 16 * max(1, center.aiv_split)
@@ -288,6 +315,20 @@ def _bounded_live_ir_variants(
                     dual_accumulator=center.dual_accumulator,
                 )
             )
+    if tune_m and center.bm in (32, 64):
+        _add(
+            TileConfigCandidate(
+                bm=center.bm * 2,
+                bn=center.bn,
+                bk=center.bk,
+                stages=center.stages,
+                dtype_bytes=center.dtype_bytes,
+                accum_bytes=center.accum_bytes,
+                aiv_split=center.aiv_split,
+                d_out=center.d_out,
+                dual_accumulator=center.dual_accumulator,
+            )
+        )
 
     neighbors = generate_aligned_neighborhood(center)
     ordered = sorted(
@@ -371,8 +412,13 @@ def prescreen_live_ir_neighborhood(
     params, has_varkw = inspect_builder_tile_params(dsl_source, factory_name)
     tune_m = has_varkw or "bm" in params or "tile_m" in params
     tune_n = has_varkw or "bn" in params or "tile_n" in params
-    if not (tune_m and tune_n):
+    tune_k = has_varkw or "bk" in params or "tile_k" in params
+    tune_stages = has_varkw or "stages" in params or "num_stages" in params
+    if not (tune_m or tune_n or tune_k or tune_stages):
         return ""
+    pure_vector_row_tile = (
+        count_dsl_gemm_calls(dsl_source) == 0 and "tile_m" in params and "bm" not in params
+    )
 
     from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
         _merge_pass_configs_and_flags,
@@ -400,8 +446,6 @@ def prescreen_live_ir_neighborhood(
         compile_flags,
     )
 
-    tune_k = has_varkw or "bk" in params or "tile_k" in params
-    tune_stages = has_varkw or "stages" in params or "num_stages" in params
     variants = _bounded_live_ir_variants(
         center,
         tune_m=tune_m,
@@ -409,6 +453,7 @@ def prescreen_live_ir_neighborhood(
         tune_k=tune_k,
         tune_stages=tune_stages,
         max_variants=max(1, min(8, int(max_variants))),
+        pure_vector_row_tile=pure_vector_row_tile,
     )
 
     records: list[tuple[bool, tuple[float, int, int], TileConfigCandidate, str, dict[str, int], int, int | None]] = []
@@ -510,17 +555,27 @@ def prescreen_live_ir_neighborhood(
 
     lines = ["Live-IR Tile Prescreen Summary:"]
     for rank_idx, (_ok, _rk, cand, status, sbytes, deg_cnt, ii_val) in enumerate(ordered, start=1):
-        wl_parts = [
-            f"{scope.lower()}={sbytes.get(scope, 0)}B"
-            for scope in ("L1", "L0A", "L0B", "L0C", "UB", "SSBUF")
-        ]
         extra = f", ii={ii_val}" if ii_val is not None else ""
         if deg_cnt > 0:
             extra += f", degraded={deg_cnt}"
-        lines.append(
-            f"  {rank_idx}. bm={cand.bm}, bn={cand.bn}, bk={cand.bk}, stages={cand.stages} "
-            f"| {status} | {', '.join(wl_parts)}{extra}"
-        )
+        if pure_vector_row_tile:
+            wl_parts = [
+                f"{scope.lower()}={sbytes.get(scope, 0)}B"
+                for scope in ("UB", "SSBUF")
+            ]
+            lines.append(
+                f"  {rank_idx}. tile_m={cand.bm}, stages={cand.stages} "
+                f"| {status} | {', '.join(wl_parts)}{extra}"
+            )
+        else:
+            wl_parts = [
+                f"{scope.lower()}={sbytes.get(scope, 0)}B"
+                for scope in ("L1", "L0A", "L0B", "L0C", "UB", "SSBUF")
+            ]
+            lines.append(
+                f"  {rank_idx}. bm={cand.bm}, bn={cand.bn}, bk={cand.bk}, stages={cand.stages} "
+                f"| {status} | {', '.join(wl_parts)}{extra}"
+            )
     return "\n".join(lines)
 
 

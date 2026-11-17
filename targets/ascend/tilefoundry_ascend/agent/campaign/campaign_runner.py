@@ -13,6 +13,7 @@ import logging
 import os
 import sys
 import tempfile
+import textwrap
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -502,6 +503,97 @@ def extract_regime_snippet(
         )
     start, end = _func_line_span(node)
     return node.name, "".join(lines[start - 1 : end]).rstrip() + "\n"
+
+
+def _is_prim_func_decorator(dec: ast.expr) -> bool:
+    if isinstance(dec, ast.Name):
+        return dec.id == "prim_func"
+    if isinstance(dec, ast.Attribute):
+        return dec.attr == "prim_func"
+    if isinstance(dec, ast.Call):
+        return _is_prim_func_decorator(dec.func)
+    return False
+
+
+def _extract_func_signature_header(lines: Sequence[str], node: ast.FunctionDef) -> str:
+    if node.body and node.body[0].lineno > node.lineno:
+        end_idx = node.body[0].lineno - 1
+        raw = "".join(lines[node.lineno - 1 : end_idx]).rstrip()
+    else:
+        raw = "".join(lines[node.lineno - 1 : node.lineno]).split(":", 1)[0].rstrip() + ":"
+    return textwrap.dedent(raw).strip()
+
+
+def _extract_regime_abi_context(module_source: str, regime_spec: RegimeTargetSpec) -> str:
+    """Extract immutable helper builder and @T.prim_func ABI signatures referenced by slice."""
+    try:
+        tree = ast.parse(module_source)
+    except SyntaxError:
+        return ""
+    lines = module_source.splitlines(keepends=True)
+    top_funcs = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    editable_set = set(regime_spec.editable_symbols)
+    prefix = regime_spec.allowed_helper_prefix
+    seed_names = [
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and (
+            node.name in editable_set
+            or (prefix and node.name.startswith(prefix))
+            or node.name in regime_spec.builder_candidates
+        )
+    ]
+    if not seed_names:
+        return ""
+
+    visited: set[str] = set()
+    ordered_helper_funcs: list[ast.FunctionDef] = []
+    prim_func_sigs: list[str] = []
+    seen_prim_sigs: set[str] = set()
+    queue = list(seed_names)
+    while queue:
+        fname = queue.pop(0)
+        if fname in visited:
+            continue
+        visited.add(fname)
+        fnode = top_funcs.get(fname)
+        if fnode is None:
+            continue
+        is_slice_symbol = fname in editable_set or bool(prefix and fname.startswith(prefix))
+        if not is_slice_symbol:
+            ordered_helper_funcs.append(fnode)
+        for sub in ast.walk(fnode):
+            if isinstance(sub, ast.FunctionDef) and sub is not fnode:
+                if any(_is_prim_func_decorator(dec) for dec in sub.decorator_list):
+                    sig = "@T.prim_func\n" + _extract_func_signature_header(lines, sub)
+                    if sig not in seen_prim_sigs:
+                        seen_prim_sigs.add(sig)
+                        prim_func_sigs.append(sig)
+            elif isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
+                callee = sub.func.id
+                if callee in top_funcs and callee not in visited:
+                    queue.append(callee)
+
+    blocks: list[str] = []
+    for hnode in ordered_helper_funcs:
+        blocks.append(_extract_func_signature_header(lines, hnode))
+    blocks.extend(prim_func_sigs)
+    if not blocks:
+        return ""
+    sigs_text = "\n\n".join(blocks)
+    return (
+        "### IMMUTABLE HOST / PRIMFUNC ABI CONTRACT\n"
+        f"```python\n{sigs_text}\n```\n"
+        "Any custom @T.prim_func returned for this slice MUST keep the exact tensor/scalar "
+        "parameter order, ranks, and dtypes above expected by _get_kernel (do NOT substitute "
+        "the HIR forward(...) parameter list, and do NOT import tilelang.language as T or use "
+        "T.Scope).\n\n"
+    )
 
 
 def _patch_single_func_into_module(
@@ -1163,6 +1255,7 @@ class PerfTargetCampaignRunner:
         parent_ledger: ObjectivePhysicalLedger | None = None,
         parent_residual: StaticDynamicResidual | None = None,
         track: str = "unconstrained",
+        incumbent_source: str = "",
     ) -> GenerationRequest:
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
         sys_prompt = (
@@ -1185,6 +1278,11 @@ class PerfTargetCampaignRunner:
         else:
             nav_section = ""
         msprof_section = self._format_msprof_section(parent_residual)
+        abi_section = (
+            _extract_regime_abi_context(incumbent_source, regime_spec)
+            if incumbent_source
+            else ""
+        )
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
             f"{track_section}"
@@ -1197,6 +1295,7 @@ class PerfTargetCampaignRunner:
             f"{msprof_section}"
             f"### SURROGATE ANCHOR TELEMETRY\n"
             f"{_format_anchor_telemetry(best_result, regime_spec.regime_tag)}\n\n"
+            f"{abi_section}"
             f"### TARGET FUNCTION SNIPPET\n```python\n{snippet_source}\n```\n"
         )
         return GenerationRequest(
@@ -1222,6 +1321,7 @@ class PerfTargetCampaignRunner:
         parent_ledger: ObjectivePhysicalLedger | None = None,
         parent_residual: StaticDynamicResidual | None = None,
         track: str = "unconstrained",
+        incumbent_source: str = "",
     ) -> GenerationRequest:
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
         sys_prompt = (
@@ -1262,6 +1362,11 @@ class PerfTargetCampaignRunner:
             else ""
         )
         msprof_section = self._format_msprof_section(parent_residual)
+        abi_section = (
+            _extract_regime_abi_context(incumbent_source, regime_spec)
+            if incumbent_source
+            else ""
+        )
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
             f"{track_section}"
@@ -1272,6 +1377,7 @@ class PerfTargetCampaignRunner:
             f"{msprof_section}"
             f"### SURROGATE ANCHOR TELEMETRY\n"
             f"{_format_anchor_telemetry(best_result, regime_spec.regime_tag)}\n\n"
+            f"{abi_section}"
             f"### TARGET FUNCTION SNIPPET\n```python\n{snippet_source}\n```\n"
         )
         return GenerationRequest(
@@ -1533,6 +1639,7 @@ class PerfTargetCampaignRunner:
                         parent_ledger=parent_ledger,
                         parent_residual=parent_residual,
                         track=parent_track,
+                        incumbent_source=incumbent_source,
                     ),
                 )
             )
@@ -1601,6 +1708,7 @@ class PerfTargetCampaignRunner:
                         parent_ledger=parent_ledger,
                         parent_residual=parent_residual,
                         track=parent_track,
+                        incumbent_source=incumbent_source,
                     ),
                 )
             )
@@ -1680,7 +1788,17 @@ class PerfTargetCampaignRunner:
                     cand_file = Path(tmp_dir) / f"{chk.candidate_id}.py"
                     cand_file.write_text(chk.patched_module_source, encoding="utf-8")
                     cand_paths.append((chk.candidate_id, cand_file))
-                l2_results = self._run_l2_batch(cand_paths, active_anchors)
+                try:
+                    l2_results = self._run_l2_batch(cand_paths, active_anchors)
+                except Exception as exc:
+                    logger.warning(
+                        "Round %d L2 batch failed after retries: %s",
+                        round_idx,
+                        exc,
+                    )
+                    l2_results = {}
+                    for chk in passed_checks:
+                        failed_entries.append((chk.candidate_id, "l2_error", str(exc)[:200]))
 
         beam_updates: list[BeamCandidate] = []
         passing_candidates: list[tuple[L0L1CandidateCheck, CandidateSurrogateResult]] = []

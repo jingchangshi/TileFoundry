@@ -179,9 +179,11 @@ class _AgyLogTailer:
         self._partial = ""
         self.count_503 = 0
         self.count_idle_timeout = 0
+        self.saw_progress = False
 
     def poll(self) -> list[str]:
         """Read newly written log lines and return matched error event tags."""
+        self.saw_progress = False
         if not self.path.exists():
             return []
         try:
@@ -207,12 +209,17 @@ class _AgyLogTailer:
             line = raw_line.strip()
             if not line:
                 continue
+            is_err_line = False
             if RE_503_CAPACITY.search(line):
                 self.count_503 += 1
                 events.append("503_no_capacity")
+                is_err_line = True
             if RE_STREAM_IDLE_LOG.search(line):
                 self.count_idle_timeout += 1
                 events.append("stream_idle_timeout")
+                is_err_line = True
+            if not is_err_line:
+                self.saw_progress = True
         return events
 
 
@@ -613,6 +620,8 @@ class AgyCliLLMBackend:
                                 stderr_lines.append(cleaned)
 
                     log_events = tailer.poll()
+                    if tailer.saw_progress and not log_events:
+                        last_activity_ts = time.monotonic()
                     if "stream_idle_timeout" in log_events:
                         await _terminate_process_group(proc)
                         raise _AttemptFailure(
@@ -682,8 +691,10 @@ class AgyCliLLMBackend:
     ) -> str:
         """Execute agy in an empty sandbox with streaming liveness watchdog and retries."""
         full_prompt = (
-            "[STATELESS GENERATION CONTRACT: Do NOT read/write files or run shell/MCP tools. "
-            "Respond strictly based on the prompt below.]\n\n"
+            "[STATELESS GENERATION CONTRACT: Do NOT invoke ANY tool calls "
+            "(forbid run_command, view_file, list_dir, grep_search, write_to_file, "
+            "and invoke_subagent). Answer directly in a single turn using ONLY the "
+            "prompt context below.]\n\n"
             f"### SYSTEM INSTRUCTIONS\n{req.system_prompt}\n\n"
             f"### USER INPUT\n{req.user_prompt}\n"
         )

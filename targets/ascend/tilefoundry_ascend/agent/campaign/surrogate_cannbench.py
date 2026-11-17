@@ -44,6 +44,11 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
 )
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import build_syntax_repair_request
 
+logger = logging.getLogger(__name__)
+
+DEFAULT_AGENT_GATES_MAX_ATTEMPTS = 4
+DEFAULT_AGENT_GATES_BACKOFF_SEC = 3.0
+
 
 @dataclass(frozen=True)
 class AnchorEvalMetrics:
@@ -1115,6 +1120,58 @@ def _parse_agent_gates_json(stdout: str) -> dict[str, object]:
         return {}
 
 
+def _is_transient_blocked_env(
+    proc: subprocess.CompletedProcess[str],
+    parsed: Mapping[str, object],
+) -> bool:
+    if proc.returncode == 0:
+        return False
+    if parsed.get("status") == "BLOCKED_ENV":
+        return True
+    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    return "npu-smi" in combined
+
+
+def _run_agent_gates_cmd(
+    cmd: Sequence[str],
+    *,
+    cwd: str,
+    env: Mapping[str, str],
+    timeout_sec: int,
+    max_attempts: int = DEFAULT_AGENT_GATES_MAX_ATTEMPTS,
+    backoff_sec: float = DEFAULT_AGENT_GATES_BACKOFF_SEC,
+    sleep_fn: Callable[[float], None] = time.sleep,
+) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+    attempts = max(1, int(max_attempts))
+    cmd_list = [str(part) for part in cmd]
+    env_dict = dict(env)
+    last_proc: subprocess.CompletedProcess[str] | None = None
+    last_parsed: dict[str, object] = {}
+    for attempt in range(1, attempts + 1):
+        last_proc = subprocess.run(
+            cmd_list,
+            text=True,
+            capture_output=True,
+            cwd=cwd,
+            env=env_dict,
+            timeout=timeout_sec,
+        )
+        last_parsed = _parse_agent_gates_json(last_proc.stdout)
+        if not (_is_transient_blocked_env(last_proc, last_parsed) and attempt < attempts):
+            return last_proc, last_parsed
+        delay = min(15.0, max(0.0, float(backoff_sec)) * (2 ** (attempt - 1)))
+        logger.warning(
+            "AgentGates transient BLOCKED_ENV (attempt %d/%d); retrying in %.1fs",
+            attempt,
+            attempts,
+            delay,
+        )
+        if delay > 0.0:
+            sleep_fn(delay)
+    assert last_proc is not None
+    return last_proc, last_parsed
+
+
 def run_multi_operator_surrogate_batch_via_agent_gates(
     batches: Sequence[tuple[str, Sequence[tuple[str, str | Path]], Sequence[AnchorCaseSpec]]],
     *,
@@ -1217,15 +1274,12 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
                 "CANNBENCH_CACHE_DIR": str(cache_dir),
             }
         )
-        proc = subprocess.run(
+        proc, parsed = _run_agent_gates_cmd(
             cmd,
-            text=True,
-            capture_output=True,
             cwd=str(root),
             env=sub_env,
-            timeout=timeout_sec,
+            timeout_sec=timeout_sec,
         )
-        parsed = _parse_agent_gates_json(proc.stdout)
         run_id = str(parsed.get("runId", ""))
         receipt_path = str(parsed.get("receiptPath", ""))
         held_sec = 0.0
@@ -1414,13 +1468,11 @@ def collect_bottleneck_msprof_via_agent_gates(
                 "CANNBENCH_CACHE_DIR": str(cache_dir),
             }
         )
-        proc = subprocess.run(
+        proc, _parsed = _run_agent_gates_cmd(
             cmd,
-            text=True,
-            capture_output=True,
             cwd=str(root),
             env=sub_env,
-            timeout=timeout_sec,
+            timeout_sec=timeout_sec,
         )
         if not response_path.is_file():
             detail = (proc.stderr or proc.stdout or "msprof request missing response").strip()[
@@ -1506,15 +1558,12 @@ def run_l3_full_contract_via_agent_gates(
                 "TF_SURROGATE_SHIM_DIR": str(shim_dir),
             }
         )
-        proc = subprocess.run(
+        proc, parsed = _run_agent_gates_cmd(
             cmd,
-            text=True,
-            capture_output=True,
             cwd=str(root),
             env=sub_env,
             timeout=timeout_sec,
         )
-    parsed = _parse_agent_gates_json(proc.stdout)
     ok = proc.returncode == 0 and parsed.get("status") == "PASS"
     err = "" if ok else (proc.stderr or proc.stdout or "L3 contract failed")[-1000:]
     return L3AcceptanceResult(
@@ -1566,16 +1615,13 @@ def run_l4_official_cannbench_via_agent_gates(
             "tilefoundry-npu-cannbench",
             "--json",
         ]
-        proc = subprocess.run(
+        proc, parsed = _run_agent_gates_cmd(
             cmd,
-            text=True,
-            capture_output=True,
             cwd=str(root),
             env=_clean_agent_gates_subprocess_env({}),
-            timeout=timeout_sec,
+            timeout_sec=timeout_sec,
         )
 
-    parsed = _parse_agent_gates_json(proc.stdout)
     ok = proc.returncode == 0 and parsed.get("status") == "PASS"
     run_id = str(parsed.get("runId", ""))
     receipt_path = str(parsed.get("receiptPath", ""))

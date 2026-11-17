@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from pathlib import Path
 
 from tilefoundry_ascend.agent import (
     AgyCliLLMBackend,
@@ -778,3 +779,77 @@ def make_dual(bm: int = 128, bn: int = 64, bk: int = 64, num_stages: int = 2):
     assert "REJECT(L0C_overflow:294912>262144)" in live_summary
     assert "bm=64, bn=64" in live_summary
     assert "| OK |" in live_summary
+
+
+def test_primitive_menu_avoids_t_scope_and_prescreen_handles_ar_and_mla_1d() -> None:
+    assert "T.Scope(" not in TILELANG_ASCEND_PRIMITIVE_MENU
+    assert "do NOT import tilelang.language as T" in TILELANG_ASCEND_PRIMITIVE_MENU
+
+    empty_vec_fallback = build_prescreen_summary_from_kwargs(
+        {"tile_m": 1, "n_depth": 2, "d_dim": 4096},
+        dsl_source="",
+        factory_name="",
+    )
+    assert empty_vec_fallback == ""
+
+    root = Path(__file__).resolve().parents[3]
+    ar_src = (
+        root / "examples" / "ascend950pr_ops" / "attention_residual" / "kernels.py"
+    ).read_text(encoding="utf-8")
+    ar_bindings = build_anchor_var_bindings(
+        {"N": 2, "B": 1, "S": 1, "D": 4096},
+        kwargs={"n_depth": 2, "d_dim": 4096, "tile_m": 1},
+    )
+    ar_summary = build_prescreen_summary_from_kwargs(
+        {
+            "n_depth": 2,
+            "d_dim": 4096,
+            "tl_dtype": "bfloat16",
+            "tile_m": 1,
+            "schedule_mode": "tuned",
+        },
+        dsl_source=ar_src,
+        factory_name="_build_ar_small_decode_func",
+        var_bindings=ar_bindings,
+        config_selector_name="_select_ar_small_decode_config",
+        dims={"N": 2, "B": 1, "S": 1, "D": 4096},
+    )
+    assert "Live-IR Tile Prescreen Summary:" in ar_summary
+    assert "tile_m=1" in ar_summary
+    assert "unaligned_mmad_16x16x16_atom" not in ar_summary
+
+    mla_1d_dsl = """
+import tilelang.ascend.language as T
+
+def _build_mla_prefill_func(bm=64):
+    bn = 64
+    @T.prim_func
+    def main(
+        Q: T.Tensor((128, 512), "float16"),
+        K: T.Tensor((128, 512), "float16"),
+        Y: T.Tensor((128, 512), "float32"),
+    ):
+        with T.Kernel(2):
+            q_l1 = T.alloc_l1((bm, 64), "float16")
+            k_l1 = T.alloc_l1((bn, 64), "float16")
+            s_l0c = T.alloc_l0c((bm, bn), "float32")
+            o_l0c = T.alloc_l0c((bm, 512), "float32")
+            for kt in T.Pipelined(2, num_stages=2):
+                T.copy(Q[0:bm, 0:64], q_l1)
+                T.copy(K[0:bn, 0:64], k_l1)
+                T.gemm(q_l1, k_l1, s_l0c, transpose_B=True, clear_accum=kt == 0)
+            T.copy(s_l0c, Y[0:bm, 0:bn])
+            T.copy(o_l0c, Y[0:bm, 0:512])
+    return main
+"""
+    mla_summary = build_prescreen_summary_from_kwargs(
+        {"bm": 64, "d_nope": 512, "tl_dtype": "float16"},
+        dsl_source=mla_1d_dsl,
+        factory_name="_build_mla_prefill_func",
+    )
+    assert "Live-IR Tile Prescreen Summary:" in mla_summary
+    assert "bm=32, bn=64" in mla_summary
+    assert "bm=64, bn=64" in mla_summary
+    assert "bm=128, bn=64" in mla_summary
+    assert "REJECT(L0C_overflow:294912>262144)" in mla_summary
+

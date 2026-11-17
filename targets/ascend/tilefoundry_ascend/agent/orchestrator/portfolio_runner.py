@@ -49,7 +49,15 @@ TILELANG_ASCEND_PRIMITIVE_MENU: str = "\n".join(
         "- T.Pipelined(count, num_stages=...): multi-buffered loop pipelining",
         "- T.SimdVF(): native SIMD vector-function mode (256 KiB UB with PURE_SIMDVF_UBUF_FLAGS)",
         "- T.SimtVF(threads=128): SIMT vector-function mode for irregular/scalar-tail loops",
-        "- T.Scope('C') / T.Scope('V'): explicit AIC Cube and AIV Vector core regions",
+        (
+            "- Module pre-imports tilelang, tilelang.ascend.language as T, torch, "
+            "PURE_SIMDVF_UBUF_FLAGS (do NOT import tilelang.language as T or call T.Scope)"
+        ),
+        (
+            "- Inside T.MixedKernel(28, sids=2) as (bx, sid), AIC Cube ops (T.gemm, "
+            "L1/L0C T.copy) and AIV Vector blocks (with T.SimdVF(): ...) coexist directly "
+            "without T.Scope"
+        ),
         "- T.gemm(a, b, c, ...): Cube MMAD on L1/L0A/L0B -> L0C",
         "- T.copy(src, dst) / T.dual_copy(src, dst, ...): GM/L1/L0C/UB DMA and 1C2V split copy",
         "- T.alloc_l1 / T.alloc_l0a / T.alloc_l0b / T.alloc_l0c: AIC hierarchical SRAM buffers",
@@ -241,6 +249,9 @@ def build_prescreen_summary_from_kwargs(
                 return live_summary
         except Exception:
             pass
+
+    if gemm_count == 0 and d_out_val == 0:
+        return ""
 
     facts = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
     center_score = evaluate_tile_candidate(center, facts)
