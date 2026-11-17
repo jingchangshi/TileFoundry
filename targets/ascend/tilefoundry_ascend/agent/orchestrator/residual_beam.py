@@ -35,9 +35,10 @@ class StaticDynamicResidual:
     measured_mte2_wait_ratio: float
     measured_sync_stall_ratio: float
     unexplained_gap_ratio: float
+    pseudo_double_buffer_serialized: bool = False
 
-    def to_dict(self) -> dict[str, float]:
-        """Return float dictionary representation."""
+    def to_dict(self) -> dict[str, float | bool]:
+        """Return float and flag dictionary representation."""
         return {
             "measured_latency_us": self.measured_latency_us,
             "predicted_bottleneck_util": self.predicted_bottleneck_util,
@@ -46,6 +47,7 @@ class StaticDynamicResidual:
             "measured_mte2_wait_ratio": self.measured_mte2_wait_ratio,
             "measured_sync_stall_ratio": self.measured_sync_stall_ratio,
             "unexplained_gap_ratio": self.unexplained_gap_ratio,
+            "pseudo_double_buffer_serialized": self.pseudo_double_buffer_serialized,
         }
 
     @classmethod
@@ -59,6 +61,9 @@ class StaticDynamicResidual:
             measured_mte2_wait_ratio=float(payload.get("measured_mte2_wait_ratio", 0.0)),
             measured_sync_stall_ratio=float(payload.get("measured_sync_stall_ratio", 0.0)),
             unexplained_gap_ratio=float(payload.get("unexplained_gap_ratio", 0.0)),
+            pseudo_double_buffer_serialized=bool(
+                payload.get("pseudo_double_buffer_serialized", False)
+            ),
         )
 
 
@@ -106,6 +111,14 @@ def compute_static_dynamic_residual(
     else:
         unexplained = min(1.0, sync_stall * 0.5)
 
+    steady_ii = getattr(ledger, "steady_state_ii", None)
+    ii_looks_pipelined = steady_ii is None or int(steady_ii) <= 2
+    pseudo_serialized = bool(
+        getattr(ledger, "uses_dynamic_offset_pipelining", False)
+        and ii_looks_pipelined
+        and (mte2_wait >= 0.32 or unexplained >= 0.25 or sync_stall >= 0.20)
+    )
+
     return StaticDynamicResidual(
         measured_latency_us=measured_us,
         predicted_bottleneck_util=round(predicted_util, 6),
@@ -114,6 +127,7 @@ def compute_static_dynamic_residual(
         measured_mte2_wait_ratio=mte2_wait,
         measured_sync_stall_ratio=sync_stall,
         unexplained_gap_ratio=round(unexplained, 6),
+        pseudo_double_buffer_serialized=pseudo_serialized,
     )
 
 

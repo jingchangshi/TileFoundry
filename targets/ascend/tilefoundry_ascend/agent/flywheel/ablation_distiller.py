@@ -118,6 +118,8 @@ _SUPPORTED_PROBE_KINDS = (
     "barrier_prune",
     "dual_copy_1c2v",
     "pad_alignment",
+    "static_pingpong_unroll",
+    "loop_fission_sfu",
 )
 
 
@@ -219,6 +221,11 @@ def _classify_edit(before_src: str, after_src: str) -> str:
     ):
         return "dual_copy_1c2v"
     if (
+        ("T.Pipelined" in before_src and "T.Pipelined" not in after_src)
+        or ("enable_offset" in before_src and "enable_offset" not in after_src)
+    ):
+        return "static_pingpong_unroll"
+    if (
         "gm_to_ub_pad" in combined
         or "pad_value" in combined
         or ("alloc_shared" in before_src and "alloc_shared" in after_src and before_src != after_src)
@@ -228,6 +235,19 @@ def _classify_edit(before_src: str, after_src: str) -> str:
         return "barrier_prune"
     if "num_stages" in combined or "annotate_buffer_versions" in combined:
         return "pipeline_versions"
+    if (
+        ("vcadd" in combined or "vexp" in combined or "vsqrt" in combined)
+        and (
+            after_src.count("for ") > before_src.count("for ")
+            or ("vcadd" in before_src and "vcadd" not in after_src)
+            or (
+                before_src.count("for ") >= 1
+                and after_src.count("for ") >= 1
+                and len(after_src.strip().splitlines()) < len(before_src.strip().splitlines())
+            )
+        )
+    ):
+        return "loop_fission_sfu"
     if (
         "T.Kernel" in combined
         or "T.MixedKernel" in combined
@@ -355,6 +375,12 @@ def _extract_stmt_list_deltas(
 ) -> None:
     base_tags = [_node_tag(s) for s in base_list]
     win_tags = [_node_tag(s) for s in win_list]
+    base_blk_txt = "\n".join(_node_key(s) for s in base_list)
+    block_has_sfu = any(tok in base_blk_txt for tok in ("vcadd", "vexp", "vsqrt"))
+    block_fission_loops = block_has_sfu and (
+        sum(isinstance(s, ast.For) for s in win_list)
+        > sum(isinstance(s, ast.For) for s in base_list)
+    )
     matcher = difflib.SequenceMatcher(a=base_tags, b=win_tags, autojunk=False)
 
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
@@ -512,6 +538,31 @@ def _extract_stmt_list_deltas(
                                 ablated_dsl=dsl,
                             )
                         )
+            for j in range(j1 + common, j2):
+                w_stmt = win_list[j]
+                w_txt = _node_key(w_stmt)
+                ins_idx = min(i2 + (j - (j1 + common)), len(base_list))
+                cur_path = parent_path + (ins_idx,)
+                patched = copy.deepcopy(base_tree)
+                if _set_stmt_by_path(patched, cur_path, w_stmt):
+                    dsl = _render_patched(patched)
+                    if dsl not in seen_dsls:
+                        seen_dsls.add(dsl)
+                        kind = (
+                            "loop_fission_sfu"
+                            if (block_fission_loops and isinstance(w_stmt, ast.For))
+                            else _classify_edit("", w_txt)
+                        )
+                        chunks.append(
+                            AstEditChunk(
+                                chunk_id=f"edit_{len(chunks)}",
+                                edit_kind=kind,
+                                target_path=f"{path_label}/replace_ins_{j}",
+                                before_src="",
+                                after_src=w_txt,
+                                ablated_dsl=dsl,
+                            )
+                        )
         elif tag == "delete":
             for idx in range(i1, i2):
                 b_stmt = base_list[idx]
@@ -542,10 +593,15 @@ def _extract_stmt_list_deltas(
                     dsl = _render_patched(patched)
                     if dsl not in seen_dsls:
                         seen_dsls.add(dsl)
+                        kind = (
+                            "loop_fission_sfu"
+                            if (block_fission_loops and isinstance(w_stmt, ast.For))
+                            else _classify_edit("", w_txt)
+                        )
                         chunks.append(
                             AstEditChunk(
                                 chunk_id=f"edit_{len(chunks)}",
-                                edit_kind=_classify_edit("", w_txt),
+                                edit_kind=kind,
                                 target_path=f"{path_label}/insert_{i1}_{j}",
                                 before_src="",
                                 after_src=w_txt,
@@ -1068,6 +1124,149 @@ def make_flywheel_probe():
 """
         return base, opt, (mix_cores * steps * rows, 128), dtype
 
+    if probe_kind == "static_pingpong_unroll":
+        steps = 16
+        base = f"""import tilelang.ascend.language as T
+
+def make_flywheel_probe():
+    tile = {tile}
+    steps = {steps}
+    cores = {mix_cores}
+    total = cores * steps * tile
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((total,), "float32"),
+        B: T.Tensor((total,), "float32"),
+        C: T.Tensor((total,), "float32"),
+    ):
+        with T.Kernel(cores) as bx:
+            a_ub = T.alloc_shared((tile,), "float32")
+            b_ub = T.alloc_shared((tile,), "float32")
+            c_ub = T.alloc_shared((tile,), "float32")
+            T.annotate_buffer_versions({{a_ub: 2, b_ub: 2, c_ub: 2}})
+            for s in T.Pipelined(steps, num_stages=2, annotations={{"enable_offset": True}}):
+                off = (s * cores + bx) * tile
+                T.copy(A[off : off + tile], a_ub)
+                T.copy(B[off : off + tile], b_ub)
+                with T.SimdVF():
+                    mask = T.simd.pset(32)
+                    for i in range(tile // 64):
+                        va = T.simd.vld(a_ub[i * 64])
+                        vb = T.simd.vld(b_ub[i * 64])
+                        T.simd.vsts(c_ub[i * 64], T.simd.vadd(va, vb, mask), mask)
+                T.copy(c_ub, C[off : off + tile])
+    return main
+"""
+        opt = f"""import tilelang.ascend.language as T
+
+def make_flywheel_probe():
+    tile = {tile}
+    pairs = {steps // 2}
+    cores = {mix_cores}
+    total = cores * pairs * 2 * tile
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((total,), "float32"),
+        B: T.Tensor((total,), "float32"),
+        C: T.Tensor((total,), "float32"),
+    ):
+        with T.Kernel(cores) as bx:
+            a0 = T.alloc_shared((tile,), "float32")
+            a1 = T.alloc_shared((tile,), "float32")
+            b0 = T.alloc_shared((tile,), "float32")
+            b1 = T.alloc_shared((tile,), "float32")
+            c0 = T.alloc_shared((tile,), "float32")
+            c1 = T.alloc_shared((tile,), "float32")
+            for s in T.serial(pairs):
+                off0 = (s * 2 * cores + bx) * tile
+                off1 = ((s * 2 + 1) * cores + bx) * tile
+                T.copy(A[off0 : off0 + tile], a0)
+                T.copy(B[off0 : off0 + tile], b0)
+                T.copy(A[off1 : off1 + tile], a1)
+                T.copy(B[off1 : off1 + tile], b1)
+                with T.SimdVF():
+                    mask = T.simd.pset(32)
+                    for i in range(tile // 64):
+                        T.simd.vsts(c0[i * 64], T.simd.vadd(T.simd.vld(a0[i * 64]), T.simd.vld(b0[i * 64]), mask), mask)
+                        T.simd.vsts(c1[i * 64], T.simd.vadd(T.simd.vld(a1[i * 64]), T.simd.vld(b1[i * 64]), mask), mask)
+                T.copy(c0, C[off0 : off0 + tile])
+                T.copy(c1, C[off1 : off1 + tile])
+    return main
+"""
+        return base, opt, (mix_cores * steps * tile,), "float32"
+
+    if probe_kind == "loop_fission_sfu":
+        base = f"""import tilelang.ascend.language as T
+
+def make_flywheel_probe():
+    cores = {mix_cores}
+    rows = 4
+    cols = 64
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor((cores * rows, cols), "float32"),
+        Out: T.Tensor((cores, cols), "float32"),
+        WOut: T.Tensor((cores * rows, 1), "float32"),
+    ):
+        with T.Kernel(cores) as bx:
+            q_ub = T.alloc_shared((1, cols), "float32")
+            acc_ub = T.alloc_shared((rows, cols), "float32")
+            w_ub = T.alloc_shared((rows, 1), "float32")
+            for s in T.serial(rows):
+                T.copy(Q[bx * rows + s : bx * rows + s + 1, :], q_ub)
+                with T.SimdVF():
+                    m32 = T.simd.pset(32, "PAT_ALL")
+                    qv = T.simd.vld(q_ub[0, 0])
+                    sv = T.simd.vdupv(T.simd.vcadd(qv, mask=m32), mask=m32, pos="POS_LOWEST")
+                    ev = T.simd.vexp(sv, mask=m32)
+                    T.simd.vsts(w_ub[s, 0], ev, mask=m32, dist="ONEPT_B32")
+                    av = T.simd.vld(acc_ub[s, 0])
+                    T.simd.vsts(acc_ub[s, 0], T.simd.vadd(av, qv, mask=m32), mask=m32)
+            T.copy(acc_ub[0:1, :], Out[bx : bx + 1, :])
+            T.copy(w_ub, WOut[bx * rows : bx * rows + rows, :])
+    return main
+"""
+        opt = f"""import tilelang.ascend.language as T
+
+def make_flywheel_probe():
+    cores = {mix_cores}
+    rows = 4
+    cols = 64
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor((cores * rows, cols), "float32"),
+        Out: T.Tensor((cores, cols), "float32"),
+        WOut: T.Tensor((cores * rows, 1), "float32"),
+    ):
+        with T.Kernel(cores) as bx:
+            q_ub = T.alloc_shared((1, cols), "float32")
+            acc_ub = T.alloc_shared((rows, cols), "float32")
+            exb = T.alloc_shared((rows, 1), "float32")
+            for s in T.serial(rows):
+                T.copy(Q[bx * rows + s : bx * rows + s + 1, :], q_ub)
+                with T.SimdVF():
+                    m32 = T.simd.pset(32, "PAT_ALL")
+                    qv = T.simd.vld(q_ub[0, 0])
+                    sv = T.simd.vdupv(T.simd.vcadd(qv, mask=m32), mask=m32, pos="POS_LOWEST")
+                    ev = T.simd.vexp(sv, mask=m32)
+                    T.simd.vsts(exb[s, 0], ev, mask=m32, dist="ONEPT_B32")
+            for s2 in T.serial(rows):
+                T.copy(Q[bx * rows + s2 : bx * rows + s2 + 1, :], q_ub)
+                with T.SimdVF():
+                    m32 = T.simd.pset(32, "PAT_ALL")
+                    qv = T.simd.vld(q_ub[0, 0])
+                    av = T.simd.vld(acc_ub[s2, 0])
+                    T.simd.vsts(acc_ub[s2, 0], T.simd.vadd(av, qv, mask=m32), mask=m32)
+            T.copy(acc_ub[0:1, :], Out[bx : bx + 1, :])
+            T.copy(exb, WOut[bx * rows : bx * rows + rows, :])
+    return main
+"""
+        return base, opt, (mix_cores * 4, 64), "float32"
+
     return None
 
 
@@ -1260,6 +1459,16 @@ def _generalize_template_text(chunk: AstEditChunk) -> str:
             "Pad inner buffer trailing dimensions to 32-byte and 512-byte bank-aligned strides "
             "so DMA bursts avoid unaligned tail transactions and bank conflict stalls."
         )
+    if chunk.edit_kind == "static_pingpong_unroll":
+        return (
+            "Replace dynamic-offset T.Pipelined loops with 2x-unrolled static ping-pong buffers "
+            "(buf_a, buf_b) and explicit prologue prefetch to eliminate pointer-alias serialization."
+        )
+    if chunk.edit_kind == "loop_fission_sfu":
+        return (
+            "Split coupled scalar reduction and SFU evaluation into Pass 1 before streaming wide "
+            "vector accumulation in Pass 2 so long SFU chains no longer serialize wide datapaths."
+        )
     return (
         "Replace sequential or over-synchronized inner statements with non-blocking "
         "pipelined vector and DMA execution while preserving static UB headroom."
@@ -1305,6 +1514,18 @@ def _rule_predicates_for_kind(
             "is_legal and dominant_contig_bytes >= 16",
             "unaligned_dma_padding_bytes > 0 or PIPE_MTE2 > 0 or PIPE_V > 0",
             "unaligned_dma_padding_bytes <= prev.unaligned_dma_padding_bytes and any_overflow_bytes == 0",
+        )
+    if chunk.edit_kind == "static_pingpong_unroll":
+        return (
+            "is_legal and (uses_dynamic_offset_pipelining or pseudo_double_buffer_serialized)",
+            "pseudo_double_buffer_serialized or measured_mte2_wait_ratio >= 0.32",
+            "not uses_dynamic_offset_pipelining and any_overflow_bytes == 0",
+        )
+    if chunk.edit_kind == "loop_fission_sfu":
+        return (
+            "is_legal and PIPE_M == 0 and has_coupled_reduce_sfu_accum",
+            "has_coupled_reduce_sfu_accum or measured_aiv_vec_ratio >= 0.35",
+            "not has_coupled_reduce_sfu_accum and any_overflow_bytes == 0",
         )
     dom = ledger.dominant_pipe if ledger is not None else "AIV0.PIPE_V"
     _ = dom

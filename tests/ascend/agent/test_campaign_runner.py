@@ -865,13 +865,16 @@ def _build_regime_a(tile_m=2):
     assert "small_decode" in runner._regime_nav_packets
 
     active_by_id = {rule.rule_id: rule for rule in runner._tracker.active_rules()}
-    assert len(active_by_id) == 17
+    assert len(active_by_id) == 20
     expected_new_rules = (
         "R13_SPLIT_KV_WAVE_RECOVERY",
         "R14_GQA_HEAD_M_FOLDING",
         "R15_ASYMMETRIC_1C2V_STAGE_FISSION",
         "R16_PADDED_PITCH_TAIL_MASKING",
         "R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK",
+        "R18_WAVE_QUANTIZED_BURST_TILING",
+        "R19_STATIC_PINGPONG_UNROLL_NO_ALIAS",
+        "R20_LOOP_FISSION_REDUCE_SFU_HIDING",
     )
     for rid in expected_new_rules:
         assert rid in active_by_id

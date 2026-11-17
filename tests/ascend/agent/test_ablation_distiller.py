@@ -435,3 +435,50 @@ def test_hardware_gate_enforces_108x_and_wait_ratio_non_regression(tmp_path: Pat
     validate_rule_predicate(admitted_outcome.rule.precondition)
     validate_rule_predicate(admitted_outcome.rule.expected_postcondition)
 
+
+def test_up2_static_pingpong_and_loop_fission_probes() -> None:
+    """Verify UP2 static_pingpong_unroll and loop_fission_sfu probes synthesize and pass Stage A."""
+    cases = [
+        (
+            "static_pingpong_unroll",
+            _wrap_prim_func(
+                "for i in T.Pipelined(4, num_stages=2):\n"
+                "    T.copy(A[bx, 0:128], B[bx, 0:128])"
+            ),
+            _wrap_prim_func(
+                "for i in T.serial(2):\n"
+                "    T.copy(A[bx, 0:128], B[bx, 0:128])"
+            ),
+        ),
+        (
+            "loop_fission_sfu",
+            _wrap_prim_func(
+                "for s in T.serial(4):\n"
+                "    acc_v = T.simd.vcadd(q_v)\n"
+                "    B[bx, s] = acc_v"
+            ),
+            _wrap_prim_func(
+                "for s1 in T.serial(4):\n"
+                "    acc_v = T.simd.vcadd(q_v)\n"
+                "for s2 in T.serial(4):\n"
+                "    B[bx, s2] = A[bx, s2]"
+            ),
+        ),
+    ]
+    seen: set[str] = set()
+    for kind, base_src, opt_src in cases:
+        chunks = decompose_ast_ablations(base_src, opt_src)
+        matching = [c for c in chunks if c.edit_kind == kind]
+        assert matching, f"expected {kind}, got {[c.edit_kind for c in chunks]}"
+        seen.add(kind)
+        probe = synthesize_micro_probe(matching[0])
+        assert probe is not None
+        assert probe.probe_kind == kind
+        assert 25 <= probe.line_count_baseline <= 50
+        assert 25 <= probe.line_count_optimized <= 50
+        sa_base = run_stage_a_static(probe.baseline_probe_source, factory_name=probe.factory_name)
+        sa_opt = run_stage_a_static(probe.optimized_probe_source, factory_name=probe.factory_name)
+        assert sa_base.passed, f"{kind} baseline failed Stage A: {sa_base.error_message}"
+        assert sa_opt.passed, f"{kind} optimized failed Stage A: {sa_opt.error_message}"
+    assert seen == {"static_pingpong_unroll", "loop_fission_sfu"}
+

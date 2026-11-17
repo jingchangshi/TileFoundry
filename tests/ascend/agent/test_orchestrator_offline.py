@@ -915,4 +915,71 @@ def test_envelope_inspector_binds_target_context_and_repair_menu():
     assert "is_npu" in req.user_prompt
 
 
+def test_up2_pseudo_double_buffer_residual_and_wave_burst_prescreen() -> None:
+    """Verify pseudo-double-buffer serialization detector and wave*burst prescreen ranking."""
+    from tilefoundry_ascend.agent.orchestrator.residual_beam import compute_static_dynamic_residual
+    from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
+        TileConfigCandidate,
+        prescreen_live_ir_neighborhood,
+    )
+    from tilefoundry_ascend.ascend.passes.physical_ledger import build_objective_physical_ledger
+
+    dyn_ledger = build_objective_physical_ledger(
+        analysis_mode="exact_modulo_z3",
+        is_legal=True,
+        steady_state_ii=1,
+        pipe_cycles={"AIV0.PIPE_V": 40, "AIV0.PIPE_MTE2": 48},
+        waterlines={},
+        uses_dynamic_offset_pipelining=True,
+    )
+    bad_res = compute_static_dynamic_residual(
+        dyn_ledger,
+        {"dur_us": 50.0, "aiv_vec": 0.25, "aiv_mte2": 0.41},
+    )
+    assert bad_res.pseudo_double_buffer_serialized is True
+    assert bad_res.to_dict()["pseudo_double_buffer_serialized"] is True
+
+    static_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 40, "AIV0.PIPE_MTE2": 32},
+        waterlines={},
+        uses_dynamic_offset_pipelining=False,
+    )
+    good_res = compute_static_dynamic_residual(
+        static_ledger,
+        {"dur_us": 30.0, "aiv_vec": 0.50, "aiv_mte2": 0.20},
+    )
+    assert good_res.pseudo_double_buffer_serialized is False
+
+    vec_dsl = (
+        "import tilelang.ascend.language as T\n\n"
+        "def make_vec_kernel(tile_m: int = 8):\n"
+        "    m_rows = T.dynamic('m_rows')\n"
+        "    @T.prim_func\n"
+        "    def main(\n"
+        "        X: T.Tensor((m_rows, 256), 'float16'),\n"
+        "        Y: T.Tensor((m_rows, 256), 'float16'),\n"
+        "    ):\n"
+        "        with T.Kernel(56) as bx:\n"
+        "            buf = T.alloc_shared((tile_m, 256), 'float16')\n"
+        "            T.copy(X[bx * tile_m : (bx + 1) * tile_m, :], buf)\n"
+        "            T.copy(buf, Y[bx * tile_m : (bx + 1) * tile_m, :])\n"
+        "    return main\n"
+    )
+    summary = prescreen_live_ir_neighborhood(
+        vec_dsl,
+        factory_name="make_vec_kernel",
+        center=TileConfigCandidate(bm=16, bn=64, bk=64, stages=1),
+        var_bindings={"m_rows": 1792},
+        max_variants=6,
+    )
+    assert "dma_burst_eff=" in summary
+    assert "est_waves=" in summary
+    assert "wave_burst_score=" in summary
+    rank_1_line = next(line for line in summary.splitlines() if line.strip().startswith("1."))
+    assert "tile_m=32" in rank_1_line
+
+
 

@@ -6,8 +6,10 @@ import ast
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import product
+import math
 
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
+from tilefoundry_ascend.ascend.target.facts import ascend_space_facts
 
 
 def _align512(nbytes: int) -> int:
@@ -273,7 +275,8 @@ def _bounded_live_ir_variants(
             variants.append(cand)
 
     if pure_vector_row_tile:
-        bm_vals = (center.bm, *[m for m in (1, 2, 4, 6, 8) if m != center.bm])
+        pool = (2, 4, 6, 8, 16, 1, 32) if center.bm <= 4 else (8, 16, 24, 32, 4, 12, 2, 1)
+        bm_vals = (center.bm, *[m for m in pool if m != center.bm])
         stage_vals = (
             (center.stages, *[s for s in (1, 2, 3) if tune_stages and s != center.stages])
             if tune_stages
@@ -456,7 +459,41 @@ def prescreen_live_ir_neighborhood(
         pure_vector_row_tile=pure_vector_row_tile,
     )
 
-    records: list[tuple[bool, tuple[float, int, int], TileConfigCandidate, str, dict[str, int], int, int | None]] = []
+    total_rows = 0
+    for src in (var_bindings, dims):
+        if isinstance(src, Mapping):
+            raw_m = src.get("m_rows")
+            if isinstance(raw_m, int) and not isinstance(raw_m, bool) and raw_m > 0:
+                total_rows = int(raw_m)
+                break
+            b_val = src.get("B", src.get("b_dim"))
+            s_val = src.get("S", src.get("s_dim", src.get("S_q")))
+            if (
+                isinstance(b_val, int)
+                and isinstance(s_val, int)
+                and not isinstance(b_val, bool)
+                and not isinstance(s_val, bool)
+                and b_val > 0
+                and s_val > 0
+            ):
+                total_rows = int(b_val) * int(s_val)
+                break
+    num_aiv_cores = max(1, int(ascend_space_facts(target or AscendTarget()).num_aiv_cores))
+
+    records: list[
+        tuple[
+            bool,
+            tuple[float, ...],
+            TileConfigCandidate,
+            str,
+            dict[str, int],
+            int,
+            int | None,
+            float,
+            int,
+            float,
+        ]
+    ] = []
     any_ledger = False
     for idx, cand in enumerate(variants):
         cand_kwargs = _apply_tile_candidate_to_kwargs(
@@ -531,15 +568,39 @@ def prescreen_live_ir_neighborhood(
             ledger.dominant_pipe,
             max((v for v in ledger.pipe_cycles.values() if v > 0), default=0),
         )
+        min_dma = int(getattr(ledger, "min_gm_dma_bytes", 0))
+        raw_eff = float(getattr(ledger, "dma_burst_efficiency_ratio", 1.0))
+        if 0 < min_dma < 4096:
+            raw_eff = raw_eff * max(0.15, float(min_dma) / 4096.0)
+        burst_eff = max(raw_eff, 0.05)
+        est_waves = (
+            math.ceil(math.ceil(total_rows / cand.bm) / float(num_aiv_cores))
+            if (pure_vector_row_tile and total_rows > 0 and cand.bm > 0)
+            else 0
+        )
+        wave_burst_score = (
+            (float(est_waves) * float(cand.bm)) / burst_eff
+            if est_waves > 0
+            else (1.0 / burst_eff if pure_vector_row_tile else 0.0)
+        )
+        if pure_vector_row_tile and est_waves > 0:
+            sort_key: tuple[float, ...] = (wave_burst_score, ii_rank, float(dom_cycles), float(idx))
+        elif pure_vector_row_tile:
+            sort_key = (ii_rank, -burst_eff, float(dom_cycles), float(idx))
+        else:
+            sort_key = (ii_rank, float(dom_cycles), float(idx))
         records.append(
             (
                 is_ok,
-                (ii_rank, dom_cycles, idx),
+                sort_key,
                 cand,
                 status,
                 scope_bytes,
                 len(degraded),
                 ledger.steady_state_ii,
+                burst_eff,
+                est_waves,
+                wave_burst_score,
             )
         )
 
@@ -554,7 +615,18 @@ def prescreen_live_ir_neighborhood(
         return ""
 
     lines = ["Live-IR Tile Prescreen Summary:"]
-    for rank_idx, (_ok, _rk, cand, status, sbytes, deg_cnt, ii_val) in enumerate(ordered, start=1):
+    for rank_idx, (
+        _ok,
+        _rk,
+        cand,
+        status,
+        sbytes,
+        deg_cnt,
+        ii_val,
+        burst_eff,
+        est_waves,
+        wave_burst_score,
+    ) in enumerate(ordered, start=1):
         extra = f", ii={ii_val}" if ii_val is not None else ""
         if deg_cnt > 0:
             extra += f", degraded={deg_cnt}"
@@ -563,9 +635,12 @@ def prescreen_live_ir_neighborhood(
                 f"{scope.lower()}={sbytes.get(scope, 0)}B"
                 for scope in ("UB", "SSBUF")
             ]
+            vec_extra = f", dma_burst_eff={burst_eff:.3f}"
+            if est_waves > 0:
+                vec_extra += f", est_waves={est_waves}, wave_burst_score={wave_burst_score:.2f}"
             lines.append(
                 f"  {rank_idx}. tile_m={cand.bm}, stages={cand.stages} "
-                f"| {status} | {', '.join(wl_parts)}{extra}"
+                f"| {status} | {', '.join(wl_parts)}{extra}{vec_extra}"
             )
         else:
             wl_parts = [

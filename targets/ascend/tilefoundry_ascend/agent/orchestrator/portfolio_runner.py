@@ -75,6 +75,21 @@ TILELANG_ASCEND_PRIMITIVE_MENU: str = "\n".join(
             "- PURE_SIMDVF_UBUF_FLAGS: unlock 256 KiB UB via _select_*_config()"
             "[\"pass_configs\"]/\"compile_flags\" or PrimFunc.attrs"
         ),
+        (
+            "- Segmented GM DMA burst efficiency: <16 KiB bursts lose HBM bandwidth "
+            "(~936 GB/s at 4 KiB vs ~1.64 TB/s at 32 KiB); size pure-vector row tiles "
+            "to minimize waves * tile_rows / effective_burst_bw and clamp tail start "
+            "min(t * TT, M - TT) when writes are idempotent"
+        ),
+        (
+            "- Static ping-pong double buffering (buf_a/buf_b 2x unroll + cross-tile "
+            "head prefetch + barrier pruning): avoids enable_offset dynamic indexing "
+            "pointer-alias serialization in backend codegen"
+        ),
+        (
+            "- Two-pass loop fission: split vcadd/vsqrt/vexp score pass into compact UB "
+            "weights from pure wide vfma accumulation pass to hide SFU latency chains"
+        ),
     )
 )
 
@@ -129,6 +144,15 @@ _RULE_CONCEPT_DESCRIPTIONS: dict[str, str] = {
     ),
     "R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK": (
         "Register-resident loop accumulation and full 256 KiB UB unlock"
+    ),
+    "R18_WAVE_QUANTIZED_BURST_TILING": (
+        "Wave-quantized pure-vector tiling co-selected with HBM DMA burst curve"
+    ),
+    "R19_STATIC_PINGPONG_UNROLL_NO_ALIAS": (
+        "Static 2x ping-pong buffer unrolling and prefetch to avoid dynamic-offset aliasing"
+    ),
+    "R20_LOOP_FISSION_REDUCE_SFU_HIDING": (
+        "Two-pass loop fission separating reduce/SFU chains from wide vfma accumulation"
     ),
 }
 

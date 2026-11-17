@@ -272,7 +272,7 @@ _DEFAULT_PIPE_KEYS = (
 
 _DEFAULT_SCOPES = ("UB", "L1", "L0A", "L0B", "L0C", "SSBUF")
 
-_RESIDUAL_DEFAULTS: dict[str, float] = {
+_RESIDUAL_DEFAULTS: dict[str, float | bool] = {
     "measured_latency_us": 0.0,
     "predicted_bottleneck_util": 0.0,
     "measured_aic_mac_ratio": 0.0,
@@ -280,6 +280,7 @@ _RESIDUAL_DEFAULTS: dict[str, float] = {
     "measured_mte2_wait_ratio": 0.0,
     "measured_sync_stall_ratio": 0.0,
     "unexplained_gap_ratio": 0.0,
+    "pseudo_double_buffer_serialized": False,
 }
 
 
@@ -327,6 +328,11 @@ def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
     ns["has_online_rescale_loop"] = bool(ledger.has_online_rescale_loop)
     ns["in_loop_ub_reload_stores"] = int(ledger.in_loop_ub_reload_stores)
     ns["uses_unreserved_ubuf"] = bool(ledger.uses_unreserved_ubuf)
+    ns["min_gm_dma_bytes"] = int(ledger.min_gm_dma_bytes)
+    ns["dma_burst_efficiency_ratio"] = float(ledger.dma_burst_efficiency_ratio)
+    ns["uses_dynamic_offset_pipelining"] = bool(ledger.uses_dynamic_offset_pipelining)
+    ns["has_unlimit_memory_attr"] = bool(ledger.has_unlimit_memory_attr)
+    ns["has_coupled_reduce_sfu_accum"] = bool(ledger.has_coupled_reduce_sfu_accum)
     ns["has_simtvf"] = any(
         "simt_vf" in region.lower() or "simtvf" in region.lower()
         for region in ledger.opaque_dynamic_regions
@@ -386,13 +392,18 @@ def build_predicate_context(
         elif isinstance(features, Mapping):
             ctx.update(features)
 
-    res_defaults = dict(_RESIDUAL_DEFAULTS)
+    res_defaults: dict[str, float | bool] = dict(_RESIDUAL_DEFAULTS)
     if residual is not None:
-        for key in res_defaults:
+        for key, default_val in _RESIDUAL_DEFAULTS.items():
             if isinstance(residual, Mapping) and key in residual:
-                res_defaults[key] = float(residual[key])
+                raw_val = residual[key]
             elif hasattr(residual, key):
-                res_defaults[key] = float(getattr(residual, key))
+                raw_val = getattr(residual, key)
+            else:
+                continue
+            res_defaults[key] = (
+                bool(raw_val) if isinstance(default_val, bool) else float(raw_val)
+            )
     ctx.update(res_defaults)
 
     if prev_ledger is not None:

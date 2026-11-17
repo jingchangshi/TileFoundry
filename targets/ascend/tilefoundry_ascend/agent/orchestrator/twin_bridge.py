@@ -476,6 +476,19 @@ def format_hir_tir_navigation_section(
                 )
             if not all_scopes:
                 delta_lines.append("- scope_utilization: none")
+        if (
+            current_tl_ledger.min_gm_dma_bytes > 0
+            or current_tl_ledger.uses_dynamic_offset_pipelining
+            or current_tl_ledger.has_unlimit_memory_attr
+            or current_tl_ledger.has_coupled_reduce_sfu_accum
+        ):
+            delta_lines.append(
+                f"- microarch_flags: min_gm_dma_bytes={current_tl_ledger.min_gm_dma_bytes}, "
+                f"dma_burst_eff={current_tl_ledger.dma_burst_efficiency_ratio:.3f}, "
+                f"dyn_offset_pipe={current_tl_ledger.uses_dynamic_offset_pipelining}, "
+                f"unlimit_mem={current_tl_ledger.has_unlimit_memory_attr}, "
+                f"coupled_reduce_sfu={current_tl_ledger.has_coupled_reduce_sfu_accum}"
+            )
         sections.append("\n".join(delta_lines))
 
     return "\n\n".join(sections)

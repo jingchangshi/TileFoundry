@@ -131,9 +131,9 @@ def test_seed_rules_yaml_completeness_and_sanitization() -> None:
     assert not re.search(r"\bmla\b", yaml_text.lower())
 
     rules = load_seed_rules()
-    assert len(rules) == 17
+    assert len(rules) == 20
     ids = {rule.rule_id for rule in rules}
-    for idx in range(1, 18):
+    for idx in range(1, 21):
         prefix = f"R{idx:02d}_"
         assert any(rid.startswith(prefix) for rid in ids)
     for rule in rules:
@@ -640,6 +640,89 @@ def test_all_17_seed_rules_fire_with_features_none() -> None:
             ),
             _res(42.0),
             _res(22.0),
+        ),
+        (
+            "R18_WAVE_QUANTIZED_BURST_TILING",
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 40, "AIV0.PIPE_MTE2": 64},
+                waterlines={"UB": ub_half},
+                wave_occupancy=0.45,
+                dma_burst_efficiency_ratio=0.57,
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 40, "AIV0.PIPE_MTE2": 32},
+                waterlines={"UB": ub_half},
+                wave_occupancy=0.90,
+                dma_burst_efficiency_ratio=0.96,
+            ),
+            _res(40.0),
+            _res(25.0),
+        ),
+        (
+            "R19_STATIC_PINGPONG_UNROLL_NO_ALIAS",
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=1,
+                pipe_cycles={"AIV0.PIPE_V": 40, "AIV0.PIPE_MTE2": 48},
+                waterlines={"UB": ub_half},
+                uses_dynamic_offset_pipelining=True,
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 40, "AIV0.PIPE_MTE2": 32},
+                waterlines={"UB": ub_half},
+                uses_dynamic_offset_pipelining=False,
+            ),
+            StaticDynamicResidual(
+                measured_latency_us=42.0,
+                predicted_bottleneck_util=0.85,
+                measured_aic_mac_ratio=0.0,
+                measured_aiv_vec_ratio=0.25,
+                measured_mte2_wait_ratio=0.42,
+                measured_sync_stall_ratio=0.10,
+                unexplained_gap_ratio=0.30,
+                pseudo_double_buffer_serialized=True,
+            ),
+            StaticDynamicResidual(
+                measured_latency_us=26.0,
+                predicted_bottleneck_util=0.85,
+                measured_aic_mac_ratio=0.0,
+                measured_aiv_vec_ratio=0.45,
+                measured_mte2_wait_ratio=0.20,
+                measured_sync_stall_ratio=0.05,
+                unexplained_gap_ratio=0.10,
+                pseudo_double_buffer_serialized=False,
+            ),
+        ),
+        (
+            "R20_LOOP_FISSION_REDUCE_SFU_HIDING",
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 96, "AIV0.PIPE_MTE2": 32},
+                waterlines={"UB": ub_half},
+                has_coupled_reduce_sfu_accum=True,
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 64, "AIV0.PIPE_MTE2": 32},
+                waterlines={"UB": ub_half},
+                has_coupled_reduce_sfu_accum=False,
+            ),
+            _res(38.0),
+            _res(24.0),
         ),
     ]
 
