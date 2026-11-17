@@ -131,9 +131,9 @@ def test_seed_rules_yaml_completeness_and_sanitization() -> None:
     assert not re.search(r"\bmla\b", yaml_text.lower())
 
     rules = load_seed_rules()
-    assert len(rules) == 20
+    assert len(rules) == 21
     ids = {rule.rule_id for rule in rules}
-    for idx in range(1, 21):
+    for idx in range(1, 22):
         prefix = f"R{idx:02d}_"
         assert any(rid.startswith(prefix) for rid in ids)
     for rule in rules:
@@ -721,8 +721,41 @@ def test_all_17_seed_rules_fire_with_features_none() -> None:
                 waterlines={"UB": ub_half},
                 has_coupled_reduce_sfu_accum=False,
             ),
-            _res(38.0),
+            StaticDynamicResidual(
+                measured_latency_us=38.0,
+                predicted_bottleneck_util=0.90,
+                measured_aic_mac_ratio=0.0,
+                measured_aiv_vec_ratio=0.55,
+                measured_mte2_wait_ratio=0.10,
+                measured_sync_stall_ratio=0.05,
+                unexplained_gap_ratio=0.10,
+            ),
             _res(24.0),
+        ),
+        (
+            "R21_SUBROW_DEPTH_OR_WIDTH_CORE_SHARDING",
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 64, "AIV0.PIPE_MTE2": 64},
+                waterlines={"UB": ub_half},
+                grid_blocks=1,
+                active_grid_blocks=1,
+                wave_occupancy=1.0 / 56.0,
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 64, "AIV0.PIPE_MTE2": 64},
+                waterlines={"UB": ub_half},
+                grid_blocks=56,
+                active_grid_blocks=56,
+                wave_occupancy=1.0,
+            ),
+            _res(32.0),
+            _res(12.0),
         ),
     ]
 

@@ -1506,8 +1506,8 @@ def _rule_predicates_for_kind(
     if chunk.edit_kind == "barrier_prune":
         return (
             "is_legal and not has_dynamic_control",
-            "measured_sync_stall_ratio > 0.05 or PIPE_V > 0",
-            "measured_sync_stall_ratio <= prev.measured_sync_stall_ratio and any_overflow_bytes == 0",
+            "in_loop_pipe_all_barriers > 0 or measured_sync_stall_ratio > 0.05 or PIPE_V > 0",
+            "in_loop_pipe_all_barriers <= prev.in_loop_pipe_all_barriers and any_overflow_bytes == 0",
         )
     if chunk.edit_kind == "pad_alignment":
         return (

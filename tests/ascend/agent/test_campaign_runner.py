@@ -865,7 +865,7 @@ def _build_regime_a(tile_m=2):
     assert "small_decode" in runner._regime_nav_packets
 
     active_by_id = {rule.rule_id: rule for rule in runner._tracker.active_rules()}
-    assert len(active_by_id) == 20
+    assert len(active_by_id) == 21
     expected_new_rules = (
         "R13_SPLIT_KV_WAVE_RECOVERY",
         "R14_GQA_HEAD_M_FOLDING",
@@ -875,6 +875,7 @@ def _build_regime_a(tile_m=2):
         "R18_WAVE_QUANTIZED_BURST_TILING",
         "R19_STATIC_PINGPONG_UNROLL_NO_ALIAS",
         "R20_LOOP_FISSION_REDUCE_SFU_HIDING",
+        "R21_SUBROW_DEPTH_OR_WIDTH_CORE_SHARDING",
     )
     for rid in expected_new_rules:
         assert rid in active_by_id
@@ -2160,6 +2161,7 @@ def test_prewarm_surrogate_tilelang_cache_pure_cpu_without_harness_prepare(
     ref_cache_dir = tmp_path / "ref_cache"
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "")
     monkeypatch.setenv("TILEFOUNDRY_NPU_TILELANG_SOURCE", str(tl_stub_dir))
+    monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
     monkeypatch.delenv("TILEFOUNDRY_NPU_CANN_SETUP", raising=False)
     monkeypatch.delenv("TILEFOUNDRY_NPU_PYTHON", raising=False)
 
@@ -2784,6 +2786,7 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
     ref_cache = tmp_path / "ref_cache_wp2"
     monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "")
     monkeypatch.setenv("TILEFOUNDRY_NPU_TILELANG_SOURCE", str(tl_stub_dir))
+    monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
     monkeypatch.delenv("TILEFOUNDRY_NPU_CANN_SETUP", raising=False)
     monkeypatch.delenv("TILEFOUNDRY_NPU_PYTHON", raising=False)
 
@@ -2929,6 +2932,128 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
     rep_reg = asyncio.run(runner_reg.run())
     assert rep_reg.promoted_rounds == ()
     assert l3_calls[0] == 1
+
+
+def test_wp_final3_persistent_wave_occupancy_weighted_burst_pipe_all_and_r21() -> None:
+    """Verify persistent active wave occupancy, byte-weighted burst, PIPE_ALL, and R21."""
+    import tilelang.ascend.language as T
+    from tilefoundry_ascend.agent.campaign import build_anchor_var_bindings
+    from tilefoundry_ascend.agent.kb import build_predicate_context, load_seed_rules
+    from tilefoundry_ascend.agent.orchestrator import (
+        compute_static_dynamic_residual,
+        run_stage_a_static,
+    )
+    from tilefoundry_ascend.ascend.passes import ObjectivePhysicalLedger
+    from tilefoundry_ascend.ascend.schedule import inspect_tilelang_primfunc
+
+    rules = {r.rule_id: r for r in load_seed_rules()}
+    assert len(rules) == 21
+    root = Path(__file__).resolve().parents[3]
+
+    ar_src = (
+        root / "examples" / "ascend950pr_ops" / "attention_residual" / "kernels.py"
+    ).read_text(encoding="utf-8")
+    ar_dims = {"N": 2, "B": 1, "S": 1, "D": 256}
+    ar_vb = build_anchor_var_bindings(ar_dims, kwargs={"n_depth": 2, "d_dim": 256})
+    ar_res = run_stage_a_static(
+        ar_src,
+        factory_name="_build_ar_small_decode_func",
+        factory_kwargs={"n_depth": 2, "d_dim": 256, "tl_dtype": "bfloat16", "tile_m": 1},
+        config_selector_name="_select_ar_small_decode_config",
+        dims=ar_dims,
+        var_bindings=ar_vb,
+    )
+    assert ar_res.passed and ar_res.ledger is not None
+    assert ar_res.ledger.grid_blocks == 1
+    assert ar_res.ledger.active_grid_blocks == 1
+    assert ar_res.ledger.wave_occupancy < 0.05
+    assert ar_res.ledger.in_loop_pipe_all_barriers >= 1
+
+    ar_rt = ObjectivePhysicalLedger.from_dict(ar_res.ledger.to_dict())
+    assert ar_rt.active_grid_blocks == 1
+    assert ar_rt.in_loop_pipe_all_barriers == ar_res.ledger.in_loop_pipe_all_barriers
+
+    ctx_ar = build_predicate_context(
+        ar_res.ledger,
+        residual=compute_static_dynamic_residual(ar_res.ledger, {"dur_us": 10.0}),
+    )
+    assert ctx_ar["in_loop_pipe_all_barriers"] >= 1
+    assert rules["R21_SUBROW_DEPTH_OR_WIDTH_CORE_SHARDING"].matches(ctx_ar) is True
+    assert rules["R18_WAVE_QUANTIZED_BURST_TILING"].matches(ctx_ar) is False
+    assert rules["R19_STATIC_PINGPONG_UNROLL_NO_ALIAS"].matches(ctx_ar) is True
+
+    mla_src = (root / "examples" / "ascend950pr_ops" / "mla" / "kernels.py").read_text(
+        encoding="utf-8"
+    )
+    mla_dims = {"B": 1, "S": 1, "S_kv": 4096, "N_q": 128, "N_kv": 1, "D_nope": 512, "D_rope": 64}
+    mla_vb = build_anchor_var_bindings(mla_dims, kwargs={"n_q": 128, "n_kv": 1})
+    mla_s1 = run_stage_a_static(
+        mla_src,
+        factory_name="_build_mla_split_kv_decode_func",
+        factory_kwargs={"n_q": 128, "n_kv": 1, "d_nope": 512, "d_rope": 64, "tl_dtype": "float16", "input_layout": "BSND", "is_causal": False, "bm": 64, "aligned_group_q": True, "num_kv_splits": 1},
+        config_selector_name="_select_mla_decode_config",
+        dims=mla_dims,
+        var_bindings=mla_vb,
+    )
+    assert mla_s1.passed and mla_s1.ledger is not None
+    assert mla_s1.ledger.wave_occupancy < 0.15
+    ctx_s1 = build_predicate_context(
+        mla_s1.ledger,
+        residual=compute_static_dynamic_residual(mla_s1.ledger, {"dur_us": 20.0}),
+    )
+    assert rules["R13_SPLIT_KV_WAVE_RECOVERY"].matches(ctx_s1) is True
+
+    mla_s8 = run_stage_a_static(
+        mla_src.replace('"num_kv_splits": 1,', '"num_kv_splits": 8,', 1),
+        factory_name="_build_mla_split_kv_decode_func",
+        factory_kwargs={"n_q": 128, "n_kv": 1, "d_nope": 512, "d_rope": 64, "tl_dtype": "float16", "input_layout": "BSND", "is_causal": False, "bm": 64, "aligned_group_q": True, "num_kv_splits": 8},
+        config_selector_name="_select_mla_decode_config",
+        dims=mla_dims,
+        var_bindings=mla_vb,
+    )
+    assert mla_s8.passed and mla_s8.ledger is not None
+    assert mla_s8.ledger.wave_occupancy >= 0.50
+
+    @T.prim_func
+    def weighted_dma_pipe_all(
+        K_main: T.Tensor((4, 64, 512), "float16"),
+        K_rope: T.Tensor((4, 64, 64), "float16"),
+        Out: T.Tensor((4, 64, 512), "float16"),
+    ):
+        with T.Kernel(4) as cid:
+            ub_main = T.alloc_shared((64, 512), "float16")
+            ub_rope = T.alloc_shared((64, 64), "float16")
+            for k in T.serial(4):
+                T.copy(K_main[k, :, :], ub_main)
+                T.copy(K_rope[k, :, :], ub_rope)
+                T.ascend_pipe_barrier("PIPE_ALL")
+            T.copy(ub_main, Out[cid, :, :])
+
+    @T.prim_func
+    def weighted_dma_no_barrier(
+        K_main: T.Tensor((4, 64, 512), "float16"),
+        K_rope: T.Tensor((4, 64, 64), "float16"),
+        Out: T.Tensor((4, 64, 512), "float16"),
+    ):
+        with T.Kernel(4) as cid:
+            ub_main = T.alloc_shared((64, 512), "float16")
+            ub_rope = T.alloc_shared((64, 64), "float16")
+            for k in T.serial(4):
+                T.copy(K_main[k, :, :], ub_main)
+                T.copy(K_rope[k, :, :], ub_rope)
+            T.copy(ub_main, Out[cid, :, :])
+
+    res_with_bar = inspect_tilelang_primfunc(weighted_dma_pipe_all)
+    res_no_bar = inspect_tilelang_primfunc(weighted_dma_no_barrier)
+    assert res_with_bar.ledger.dma_burst_efficiency_ratio > 0.92
+    assert res_with_bar.ledger.in_loop_pipe_all_barriers == 1
+    assert res_no_bar.ledger.in_loop_pipe_all_barriers == 0
+
+    ctx_bar = build_predicate_context(res_with_bar.ledger)
+    assert rules["R19_STATIC_PINGPONG_UNROLL_NO_ALIAS"].matches(ctx_bar) is True
+    ctx_post_bar = build_predicate_context(res_no_bar.ledger, prev_ledger=res_with_bar.ledger)
+    assert rules["R19_STATIC_PINGPONG_UNROLL_NO_ALIAS"].postcondition_realized(ctx_post_bar) is True
+
 
 
 

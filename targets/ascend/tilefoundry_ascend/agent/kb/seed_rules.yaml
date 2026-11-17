@@ -240,7 +240,7 @@ rules:
 
   - rule_id: R18_WAVE_QUANTIZED_BURST_TILING
     regime_guard: "is_legal and PIPE_M == 0 and PIPE_V > 0 and PIPE_MTE2 > 0"
-    precondition: "dma_burst_efficiency_ratio < 0.85 or (not grid_is_symbolic and wave_occupancy < 0.85)"
+    precondition: "(not grid_is_symbolic) and (grid_blocks >= 2 or wave_occupancy >= 0.25) and (dma_burst_efficiency_ratio < 0.85 or wave_occupancy < 0.85)"
     transform_template: |
       Select pure-vector row tile_rows to minimize (waves * tile_rows) / effective_burst_bw(tile_bytes):
       avoid small (< 16 KiB) GM DMA burst payloads that suffer segmented HBM bandwidth penalty
@@ -252,23 +252,23 @@ rules:
     source_provenance: "ref:asc_devkit"
     alpha_prior: 2.5
     beta_prior: 1.0
-    priority: 18
+    priority: 14
     rationale: "Joint wave quantization and GM burst-curve co-selection maximizes sustained AIV DMA throughput."
 
   - rule_id: R19_STATIC_PINGPONG_UNROLL_NO_ALIAS
-    regime_guard: "is_legal and (uses_dynamic_offset_pipelining or pseudo_double_buffer_serialized)"
-    precondition: "pseudo_double_buffer_serialized or measured_mte2_wait_ratio >= 0.32 or measured_sync_stall_ratio >= 0.20"
+    regime_guard: "is_legal and (uses_dynamic_offset_pipelining or pseudo_double_buffer_serialized or in_loop_pipe_all_barriers > 0)"
+    precondition: "pseudo_double_buffer_serialized or in_loop_pipe_all_barriers > 0 or measured_mte2_wait_ratio >= 0.32 or measured_sync_stall_ratio >= 0.20"
     transform_template: |
       Replace T.Pipelined(..., annotations={"enable_offset": True}) dynamic modulo buffer
       indexing with explicit static ping-pong double buffers (buf_a, buf_b) inside a 2x-unrolled
       T.serial loop, issue next-tile prologue DMA prefetch across block boundaries before tail
       writeback completes, and prune redundant end-of-tile PIPE_ALL barriers so backend codegen
       avoids pointer-alias serialization.
-    expected_postcondition: "not uses_dynamic_offset_pipelining or measured_mte2_wait_ratio < prev.measured_mte2_wait_ratio or measured_latency_us < prev.measured_latency_us"
+    expected_postcondition: "not uses_dynamic_offset_pipelining or in_loop_pipe_all_barriers < prev.in_loop_pipe_all_barriers or measured_mte2_wait_ratio < prev.measured_mte2_wait_ratio or measured_latency_us < prev.measured_latency_us"
     source_provenance: "ref:asc_devkit"
     alpha_prior: 2.5
     beta_prior: 1.0
-    priority: 19
+    priority: 15
     rationale: "Explicit static ping-pong unrolling removes dynamic-offset pointer aliasing and serial DMA waits."
 
   - rule_id: R20_LOOP_FISSION_REDUCE_SFU_HIDING
@@ -285,3 +285,19 @@ rules:
     beta_prior: 1.0
     priority: 17
     rationale: "Fissioning reduce/SFU from wide vector accumulation hides long SFU latency chains."
+
+  - rule_id: R21_SUBROW_DEPTH_OR_WIDTH_CORE_SHARDING
+    regime_guard: "is_legal and PIPE_M == 0 and PIPE_V > 0 and (not grid_is_symbolic)"
+    precondition: "0.0 < wave_occupancy < 0.35"
+    transform_template: |
+      When total output rows cannot saturate the 56 AIV core pool, partition either the outer
+      reduction depth or 64-element-aligned hidden feature slices D across all 56 AIV cores:
+      either replicate compact row-reduction stats per D-shard across cores or merge partial
+      scalar reductions in UB/workspace before streaming disjoint 64-element-aligned output
+      chunks in parallel across the full 56-core pool.
+    expected_postcondition: "wave_occupancy > prev.wave_occupancy or grid_blocks > prev.grid_blocks or measured_latency_us < prev.measured_latency_us"
+    source_provenance: "ref:asc_devkit"
+    alpha_prior: 2.5
+    beta_prior: 1.0
+    priority: 19
+    rationale: "Sharding sub-row width or depth recovers full 56-AIV parallelism on small-batch vector kernels."

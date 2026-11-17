@@ -83,6 +83,8 @@ class ObjectivePhysicalLedger:
     uses_dynamic_offset_pipelining: bool = False
     has_unlimit_memory_attr: bool = False
     has_coupled_reduce_sfu_accum: bool = False
+    active_grid_blocks: int = 0
+    in_loop_pipe_all_barriers: int = 0
 
     def __post_init__(self) -> None:
         if self.analysis_mode not in ("exact_modulo_z3", "readonly_envelope"):
@@ -150,6 +152,10 @@ class ObjectivePhysicalLedger:
             ),
             has_unlimit_memory_attr=bool(payload.get("has_unlimit_memory_attr", False)),
             has_coupled_reduce_sfu_accum=bool(payload.get("has_coupled_reduce_sfu_accum", False)),
+            active_grid_blocks=int(
+                payload.get("active_grid_blocks", payload.get("grid_blocks", 1))
+            ),
+            in_loop_pipe_all_barriers=int(payload.get("in_loop_pipe_all_barriers", 0)),
         )
 
 
@@ -218,10 +224,15 @@ def build_objective_physical_ledger(
     uses_dynamic_offset_pipelining: bool = False,
     has_unlimit_memory_attr: bool = False,
     has_coupled_reduce_sfu_accum: bool = False,
+    active_grid_blocks: int | None = None,
+    in_loop_pipe_all_barriers: int = 0,
 ) -> ObjectivePhysicalLedger:
     """Assemble an ObjectivePhysicalLedger and derive the dominant pipe."""
     cleaned_pipes = dict(sorted(pipe_cycles.items()))
     overflow_free = all(wl.overflow_bytes == 0 for wl in waterlines.values())
+    resolved_active = (
+        max(0, int(grid_blocks)) if active_grid_blocks is None else int(active_grid_blocks)
+    )
     return ObjectivePhysicalLedger(
         analysis_mode=analysis_mode,
         is_legal=bool(is_legal and overflow_free),
@@ -248,6 +259,8 @@ def build_objective_physical_ledger(
         uses_dynamic_offset_pipelining=bool(uses_dynamic_offset_pipelining),
         has_unlimit_memory_attr=bool(has_unlimit_memory_attr),
         has_coupled_reduce_sfu_accum=bool(has_coupled_reduce_sfu_accum),
+        active_grid_blocks=resolved_active,
+        in_loop_pipe_all_barriers=int(in_loop_pipe_all_barriers),
     )
 
 

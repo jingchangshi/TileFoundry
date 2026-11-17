@@ -154,6 +154,9 @@ _RULE_CONCEPT_DESCRIPTIONS: dict[str, str] = {
     "R20_LOOP_FISSION_REDUCE_SFU_HIDING": (
         "Two-pass loop fission separating reduce/SFU chains from wide vfma accumulation"
     ),
+    "R21_SUBROW_DEPTH_OR_WIDTH_CORE_SHARDING": (
+        "Sub-row reduction depth or 64-element hidden-width core sharding across 56 AIVs"
+    ),
 }
 
 _SIGNATURE_DESCRIPTIONS: dict[str, str] = {

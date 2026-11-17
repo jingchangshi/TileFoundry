@@ -446,6 +446,8 @@ class _TelemetryFeatures:
     uses_dynamic_offset_pipelining: bool = False
     has_unlimit_memory_attr: bool = False
     has_coupled_reduce_sfu_accum: bool = False
+    active_grid_blocks: int = 0
+    in_loop_pipe_all_barriers: int = 0
 
 
 def _collect_tirx_expr_vars(expr, *, tirx) -> list[object]:
@@ -472,18 +474,7 @@ def _free_tirx_vars(expr, *, tirx) -> list[object]:
     return _collect_tirx_expr_vars(expr, tirx=tirx)
 
 
-def _resolve_symbolic_grid_extent(
-    expr,
-    let_env: Mapping[object, object],
-    var_bindings: Mapping[str, int] | None,
-    *,
-    tirx,
-    tvm_mod: object | None,
-) -> tuple[int | None, bool]:
-    static_val = _static_tirx_int(expr)
-    if static_val is not None:
-        return static_val, False
-
+def _substitute_let_env(expr, let_env: Mapping[object, object], *, tirx):
     cur_expr = expr
     for _ in range(16):
         if not let_env:
@@ -496,36 +487,136 @@ def _resolve_symbolic_grid_extent(
         if hasattr(next_expr, "same_as") and next_expr.same_as(cur_expr):
             break
         cur_expr = next_expr
+    return cur_expr
 
-    if var_bindings:
-        lower_counts: dict[str, list[int]] = {}
-        for raw_key, raw_val in var_bindings.items():
-            if isinstance(raw_val, int) and not isinstance(raw_val, bool):
-                lower_counts.setdefault(str(raw_key).lower(), []).append(int(raw_val))
 
-        free_vars = _free_tirx_vars(cur_expr, tirx=tirx)
-        vmap: dict[object, object] = {}
-        for fv in free_vars:
-            exact_name = str(getattr(fv, "name", "") or "")
-            hint_name = str(getattr(fv, "name_hint", "") or "")
-            bound: int | None = None
+def _build_free_var_int_map(
+    expr,
+    var_bindings: Mapping[str, int] | None,
+    var_obj_bindings: Sequence[tuple[object, int]] = (),
+    *,
+    tirx,
+    exclude_var: object | None = None,
+) -> dict[object, object]:
+    vmap: dict[object, object] = {}
+    if not var_bindings and not var_obj_bindings:
+        return vmap
+    lower_counts: dict[str, list[int]] = {}
+    for raw_key, raw_val in (var_bindings or {}).items():
+        if isinstance(raw_val, int) and not isinstance(raw_val, bool):
+            lower_counts.setdefault(str(raw_key).lower(), []).append(int(raw_val))
+
+    for fv in _free_tirx_vars(expr, tirx=tirx):
+        if exclude_var is not None:
+            if (hasattr(fv, "same_as") and fv.same_as(exclude_var)) or fv is exclude_var:
+                continue
+        bound: int | None = None
+        for v_obj, v_val in var_obj_bindings:
+            if (hasattr(fv, "same_as") and fv.same_as(v_obj)) or fv is v_obj:
+                bound = int(v_val)
+                break
+        exact_name = str(getattr(fv, "name", "") or "")
+        hint_name = str(getattr(fv, "name_hint", "") or "")
+        if bound is None and var_bindings:
             for cand_name in (exact_name, hint_name):
                 if cand_name and cand_name in var_bindings:
                     raw_val = var_bindings[cand_name]
                     if isinstance(raw_val, int) and not isinstance(raw_val, bool):
                         bound = int(raw_val)
                         break
-            if bound is None:
-                lookup = (exact_name or hint_name).lower()
-                if lookup:
-                    matches = lower_counts.get(lookup, [])
-                    if len(matches) == 1:
-                        bound = matches[0]
-            if bound is not None:
-                dtype_str = str(getattr(fv, "dtype", "int32") or "int32")
-                vmap[fv] = tirx.IntImm(dtype_str, bound)
-        if vmap:
-            cur_expr = tirx.stmt_functor.substitute(cur_expr, vmap)
+        if bound is None:
+            lookup = (exact_name or hint_name).lower()
+            if lookup:
+                matches = lower_counts.get(lookup, [])
+                if len(matches) == 1:
+                    bound = matches[0]
+        if bound is not None:
+            dtype_str = str(getattr(fv, "dtype", "int32") or "int32")
+            vmap[fv] = tirx.IntImm(dtype_str, bound)
+    return vmap
+
+
+def _augment_var_bindings_from_buffers(
+    entry_fn,
+    var_bindings: Mapping[str, int] | None,
+    *,
+    tirx,
+) -> tuple[dict[str, int], list[tuple[object, int]]]:
+    if not var_bindings:
+        return {}, []
+    eff: dict[str, int] = {
+        str(k): int(v)
+        for k, v in var_bindings.items()
+        if isinstance(v, int) and not isinstance(v, bool)
+    }
+    lower_eff = {k.lower(): v for k, v in eff.items()}
+    obj_bindings: list[tuple[object, int]] = []
+    seen_ids: set[int] = set()
+
+    def _is_already_bound(var) -> bool:
+        exact_name = str(getattr(var, "name", "") or "")
+        hint_name = str(getattr(var, "name_hint", "") or "")
+        for cname in (exact_name, hint_name):
+            if cname and (cname in eff or cname.lower() in lower_eff):
+                return True
+        return False
+
+    def _bind_var(var, val: int) -> None:
+        if _is_already_bound(var):
+            return
+        if id(var) not in seen_ids:
+            seen_ids.add(id(var))
+            obj_bindings.append((var, int(val)))
+        hint = str(getattr(var, "name_hint", "") or getattr(var, "name", "") or "")
+        if hint and hint not in eff:
+            eff[hint] = int(val)
+
+    buffer_map = getattr(entry_fn, "buffer_map", None) or {}
+    for param in getattr(entry_fn, "params", ()):
+        buf = buffer_map.get(param)
+        if buf is None:
+            continue
+        shape = list(getattr(buf, "shape", ()))
+        if len(shape) == 2:
+            d0, d1 = shape
+            if isinstance(d0, tirx.Var) and _static_tirx_int(d1) is not None:
+                row_val = lower_eff.get("q_total_rows", lower_eff.get("m_rows"))
+                if row_val is not None:
+                    _bind_var(d0, row_val)
+        elif len(shape) == 4:
+            d0, d1, d2, _d3 = shape
+            if isinstance(d0, tirx.Var) and "b_dim" in lower_eff:
+                _bind_var(d0, lower_eff["b_dim"])
+            if "s_kv" in lower_eff:
+                if isinstance(d1, tirx.Var) and _static_tirx_int(d2) is not None:
+                    _bind_var(d1, lower_eff["s_kv"])
+                elif isinstance(d2, tirx.Var) and _static_tirx_int(d1) is not None:
+                    _bind_var(d2, lower_eff["s_kv"])
+    return eff, obj_bindings
+
+
+def _resolve_symbolic_grid_extent(
+    expr,
+    let_env: Mapping[object, object],
+    var_bindings: Mapping[str, int] | None,
+    *,
+    tirx,
+    tvm_mod: object | None,
+    var_obj_bindings: Sequence[tuple[object, int]] = (),
+) -> tuple[int | None, bool]:
+    static_val = _static_tirx_int(expr)
+    if static_val is not None:
+        return static_val, False
+
+    cur_expr = _substitute_let_env(expr, let_env, tirx=tirx)
+    vmap = _build_free_var_int_map(
+        cur_expr,
+        var_bindings,
+        var_obj_bindings,
+        tirx=tirx,
+    )
+    if vmap:
+        cur_expr = tirx.stmt_functor.substitute(cur_expr, vmap)
 
     if tvm_mod is not None and hasattr(tvm_mod, "arith") and hasattr(tvm_mod.arith, "Analyzer"):
         try:
@@ -539,12 +630,201 @@ def _resolve_symbolic_grid_extent(
     return None, True
 
 
+def _resolve_persistent_active_blocks(
+    body,
+    static_grid: int,
+    var_bindings: Mapping[str, int] | None,
+    var_obj_bindings: Sequence[tuple[object, int]],
+    *,
+    tirx,
+    tvm_mod: object | None,
+) -> tuple[int, int] | None:
+    if static_grid <= 0 or static_grid > 512 or (not var_bindings and not var_obj_bindings):
+        return None
+    let_stmt_cls = getattr(tirx, "LetStmt", None)
+    bind_cls = getattr(tirx, "Bind", None)
+    alloc_cls = getattr(tirx, "Allocate", None)
+
+    def _same_var(a, b) -> bool:
+        return bool((hasattr(a, "same_as") and a.same_as(b)) or a is b)
+
+    def _find_blockidx_scope(node, env: dict[object, object]):
+        if node is None:
+            return None
+        if isinstance(node, tirx.For):
+            tb = getattr(node, "thread_binding", None)
+            if tb is not None and "blockidx" in str(getattr(tb, "thread_tag", "")).lower():
+                return node.loop_var, node.body, dict(env)
+            return _find_blockidx_scope(node.body, env)
+        if isinstance(node, tirx.AttrStmt):
+            if "thread_extent" in str(node.attr_key).lower():
+                tag = str(getattr(node.node, "thread_tag", "")).lower()
+                if "blockidx" in tag and getattr(node.node, "var", None) is not None:
+                    return node.node.var, node.body, dict(env)
+            return _find_blockidx_scope(node.body, env)
+        if isinstance(node, tirx.SeqStmt):
+            seq_env = dict(env)
+            for child in node.seq:
+                if bind_cls is not None and isinstance(child, bind_cls):
+                    seq_env[child.var] = _substitute_let_env(child.value, seq_env, tirx=tirx)
+                    if hasattr(child, "body"):
+                        found = _find_blockidx_scope(child.body, dict(seq_env))
+                        if found is not None:
+                            return found
+                else:
+                    found = _find_blockidx_scope(child, seq_env)
+                    if found is not None:
+                        return found
+            return None
+        if let_stmt_cls is not None and isinstance(node, let_stmt_cls):
+            next_env = dict(env)
+            next_env[node.var] = _substitute_let_env(node.value, env, tirx=tirx)
+            return _find_blockidx_scope(node.body, next_env)
+        if bind_cls is not None and isinstance(node, bind_cls):
+            next_env = dict(env)
+            next_env[node.var] = _substitute_let_env(node.value, env, tirx=tirx)
+            if hasattr(node, "body"):
+                return _find_blockidx_scope(node.body, next_env)
+            return None
+        if isinstance(node, tirx.SBlockRealize):
+            return _find_blockidx_scope(node.block, env)
+        if isinstance(node, tirx.SBlock):
+            return _find_blockidx_scope(node.body, env)
+        if isinstance(node, (tirx.AllocBuffer, tirx.DeclBuffer)) or (
+            alloc_cls is not None and isinstance(node, alloc_cls)
+        ):
+            return _find_blockidx_scope(node.body, env) if hasattr(node, "body") else None
+        return None
+
+    scope = _find_blockidx_scope(body, {})
+    if scope is None:
+        return None
+    block_var, inner_body, init_env = scope
+    work_items: list[tuple[str, object]] = []
+
+    def _depends_on_block_var(expr) -> bool:
+        return any(_same_var(v, block_var) for v in _free_tirx_vars(expr, tirx=tirx))
+
+    def _collect_dispatch(node, env: dict[object, object]) -> None:
+        if node is None:
+            return
+        if isinstance(node, tirx.SeqStmt):
+            seq_env = dict(env)
+            for child in node.seq:
+                if bind_cls is not None and isinstance(child, bind_cls):
+                    seq_env[child.var] = _substitute_let_env(child.value, seq_env, tirx=tirx)
+                    if hasattr(child, "body"):
+                        _collect_dispatch(child.body, dict(seq_env))
+                else:
+                    _collect_dispatch(child, seq_env)
+            return
+        if let_stmt_cls is not None and isinstance(node, let_stmt_cls):
+            next_env = dict(env)
+            next_env[node.var] = _substitute_let_env(node.value, env, tirx=tirx)
+            _collect_dispatch(node.body, next_env)
+            return
+        if bind_cls is not None and isinstance(node, bind_cls):
+            next_env = dict(env)
+            next_env[node.var] = _substitute_let_env(node.value, env, tirx=tirx)
+            if hasattr(node, "body"):
+                _collect_dispatch(node.body, next_env)
+            return
+        if isinstance(node, tirx.IfThenElse):
+            cond_sub = _substitute_let_env(node.condition, env, tirx=tirx)
+            if _depends_on_block_var(cond_sub) and node.else_case is None:
+                work_items.append(("guard", cond_sub))
+                return
+            _collect_dispatch(node.then_case, env)
+            if node.else_case is not None:
+                _collect_dispatch(node.else_case, env)
+            return
+        if isinstance(node, tirx.For):
+            if getattr(node, "thread_binding", None) is not None:
+                _collect_dispatch(node.body, env)
+                return
+            ext_sub = _substitute_let_env(node.extent, env, tirx=tirx)
+            if _depends_on_block_var(ext_sub):
+                work_items.append(("loop", ext_sub))
+                return
+            _collect_dispatch(node.body, env)
+            return
+        if isinstance(node, tirx.AttrStmt):
+            _collect_dispatch(node.body, env)
+            return
+        if isinstance(node, tirx.SBlockRealize):
+            _collect_dispatch(node.block, env)
+            return
+        if isinstance(node, tirx.SBlock):
+            _collect_dispatch(node.body, env)
+            return
+        if isinstance(node, (tirx.AllocBuffer, tirx.DeclBuffer)) or (
+            alloc_cls is not None and isinstance(node, alloc_cls)
+        ):
+            if hasattr(node, "body"):
+                _collect_dispatch(node.body, env)
+
+    _collect_dispatch(inner_body, init_env)
+    if not work_items:
+        return None
+
+    bound_items: list[tuple[str, object]] = []
+    for kind, item_expr in work_items:
+        vmap = _build_free_var_int_map(
+            item_expr,
+            var_bindings,
+            var_obj_bindings,
+            tirx=tirx,
+            exclude_var=block_var,
+        )
+        sub_expr = tirx.stmt_functor.substitute(item_expr, vmap) if vmap else item_expr
+        rem_vars = [
+            v for v in _free_tirx_vars(sub_expr, tirx=tirx) if not _same_var(v, block_var)
+        ]
+        if rem_vars:
+            return None
+        bound_items.append((kind, sub_expr))
+
+    if tvm_mod is None or not hasattr(tvm_mod, "arith") or not hasattr(tvm_mod.arith, "Analyzer"):
+        return None
+    analyzer = tvm_mod.arith.Analyzer()
+    bx_dtype = str(getattr(block_var, "dtype", "int32") or "int32")
+    active_blocks = 0
+    total_work_units = 0
+    for bx in range(static_grid):
+        bx_imm = tirx.IntImm(bx_dtype, bx)
+        bx_guard = False
+        bx_loops = 0
+        for kind, sub_expr in bound_items:
+            try:
+                sim = analyzer.simplify(
+                    tirx.stmt_functor.substitute(sub_expr, {block_var: bx_imm})
+                )
+            except Exception:
+                return None
+            val = _static_tirx_int(sim)
+            if val is None and isinstance(sim, tirx.IntImm):
+                val = int(sim.value)
+            if val is None:
+                return None
+            if kind == "guard":
+                if val > 0:
+                    bx_guard = True
+            else:
+                if val > 0:
+                    bx_loops += int(val)
+        if bx_guard or bx_loops > 0:
+            active_blocks += 1
+            total_work_units += bx_loops if bx_loops > 0 else 1
+    return active_blocks, max(active_blocks, total_work_units)
+
+
 def _inspect_tilelang_block_dims(
     body,
     var_bindings: Mapping[str, int] | None,
     *,
     tirx,
     tvm_mod: object | None,
+    var_obj_bindings: Sequence[tuple[object, int]] = (),
 ) -> tuple[dict[str, int], bool]:
     block_dims: dict[str, int] = {}
     any_symbolic = [False]
@@ -559,6 +839,7 @@ def _inspect_tilelang_block_dims(
             var_bindings,
             tirx=tirx,
             tvm_mod=tvm_mod,
+            var_obj_bindings=var_obj_bindings,
         )
         if is_sym:
             any_symbolic[0] = True
@@ -760,11 +1041,17 @@ def _collect_tilelang_telemetry(
 
     tirx.stmt_functor.post_order_visit(entry_fn.body, _visit_all)
 
-    resolved_dims, any_symbolic_grid = _inspect_tilelang_block_dims(
-        entry_fn.body,
+    eff_bindings, var_obj_bindings = _augment_var_bindings_from_buffers(
+        entry_fn,
         var_bindings,
         tirx=tirx,
+    )
+    resolved_dims, any_symbolic_grid = _inspect_tilelang_block_dims(
+        entry_fn.body,
+        eff_bindings or var_bindings,
+        tirx=tirx,
         tvm_mod=tvm_mod,
+        var_obj_bindings=var_obj_bindings,
     )
     block_dims.update(resolved_dims)
     uses_aic = pipe_cycles.get("AIC.PIPE_M", 0) > 0 or aiv_split_factor >= 2
@@ -775,9 +1062,23 @@ def _collect_tilelang_telemetry(
     if any_symbolic_grid:
         grid_is_symbolic = True
         grid_blocks = max(1, core_pool)
+        active_grid_blocks = grid_blocks
     else:
         grid_is_symbolic = False
         grid_blocks = math.prod(block_dims.values()) if block_dims else 1
+        active_grid_blocks = grid_blocks
+        resolved_persistent = _resolve_persistent_active_blocks(
+            entry_fn.body,
+            grid_blocks,
+            eff_bindings,
+            var_obj_bindings,
+            tirx=tirx,
+            tvm_mod=tvm_mod,
+        )
+        if resolved_persistent is not None:
+            active_blks, eff_work_blks = resolved_persistent
+            active_grid_blocks = active_blks
+            grid_blocks = eff_work_blks
     dominant_contig_bytes = _select_dominant_contig_bytes(contig_candidates)
     effective_cube_m = min(cube_m_values) if cube_m_values else 0
     has_lowbit_quant = bool(has_lowbit_buf[0] and pipe_cycles.get("AIC.PIPE_M", 0) > 0)
@@ -813,13 +1114,18 @@ def _collect_tilelang_telemetry(
         tirx=tirx,
         DataTypeCls=DataTypeCls,
     )
-    dma_pool = gm_dma_loop if gm_dma_loop else gm_dma_all
+    dma_pool = [b for b in (gm_dma_loop if gm_dma_loop else gm_dma_all) if b > 0]
     min_gm_dma_bytes = min(dma_pool) if dma_pool else 0
-    dma_burst_eff = (
-        spaces.dma_burst_efficiency(min_gm_dma_bytes)
-        if (spaces is not None and min_gm_dma_bytes > 0)
-        else 1.0
-    )
+    if spaces is not None and dma_pool:
+        total_dma_bytes = float(sum(dma_pool))
+        weighted_inv_eff = sum(
+            float(b) / max(1e-6, float(spaces.dma_burst_efficiency(int(b))))
+            for b in dma_pool
+        )
+        dma_burst_eff = round(min(1.0, total_dma_bytes / max(1e-6, weighted_inv_eff)), 4)
+    else:
+        dma_burst_eff = 1.0
+    in_loop_pipe_all = _count_in_loop_pipe_all_barriers(entry_fn.body, tirx=tirx)
     wide_ub_names = {name for name, nbytes in ub_static_bytes.items() if nbytes >= 1024}
     coupled_reduce_sfu = _detect_coupled_reduce_sfu_accum(
         entry_fn.body,
@@ -843,6 +1149,8 @@ def _collect_tilelang_telemetry(
         uses_dynamic_offset_pipelining=has_dyn_offset_pipe[0],
         has_unlimit_memory_attr=has_unlimit_mem[0],
         has_coupled_reduce_sfu_accum=coupled_reduce_sfu,
+        active_grid_blocks=active_grid_blocks,
+        in_loop_pipe_all_barriers=in_loop_pipe_all,
     )
 
 
@@ -1262,6 +1570,55 @@ def _collect_gm_dma_payloads(
 
     _walk(stmt, in_loop=False)
     return loop_sizes, all_sizes
+
+
+def _count_in_loop_pipe_all_barriers(stmt, *, tirx) -> int:
+    """Count pipe_barrier('PIPE_ALL') calls inside multi-trip or symbolic loops."""
+    count = [0]
+    let_stmt_cls = getattr(tirx, "LetStmt", None)
+
+    def _walk(node, *, in_loop: bool) -> None:
+        if node is None:
+            return
+        if isinstance(node, tirx.SeqStmt):
+            for child in node.seq:
+                _walk(child, in_loop=in_loop)
+            return
+        if isinstance(node, tirx.For):
+            tb = getattr(node, "thread_binding", None)
+            trip = _static_tirx_int(node.extent) if tb is None else None
+            sub_loop = in_loop or (tb is None and (trip is None or trip > 1))
+            _walk(node.body, in_loop=sub_loop)
+            return
+        if isinstance(node, tirx.While):
+            _walk(node.body, in_loop=True)
+            return
+        if isinstance(node, tirx.IfThenElse):
+            _walk(node.then_case, in_loop=in_loop)
+            if node.else_case is not None:
+                _walk(node.else_case, in_loop=in_loop)
+            return
+        if isinstance(node, tirx.SBlockRealize):
+            _walk(node.block, in_loop=in_loop)
+            return
+        if let_stmt_cls is not None and isinstance(node, let_stmt_cls):
+            _walk(node.body, in_loop=in_loop)
+            return
+        if isinstance(node, (tirx.SBlock, tirx.AttrStmt, tirx.Bind, tirx.AllocBuffer, tirx.DeclBuffer)):
+            if hasattr(node, "body"):
+                _walk(node.body, in_loop=in_loop)
+            return
+        if isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call):
+            op_name = str(getattr(node.value.op, "name", node.value.op)).lower()
+            if "pipe_barrier" in op_name and in_loop:
+                for arg in node.value.args:
+                    val = getattr(arg, "value", arg)
+                    if "pipe_all" in str(val).lower():
+                        count[0] += 1
+                        break
+
+    _walk(stmt, in_loop=False)
+    return count[0]
 
 
 def _is_reduce_or_sfu_call(op_name: str) -> bool:
@@ -2591,6 +2948,8 @@ def inspect_tilelang_primfunc(
         uses_dynamic_offset_pipelining=telemetry.uses_dynamic_offset_pipelining,
         has_unlimit_memory_attr=telemetry.has_unlimit_memory_attr,
         has_coupled_reduce_sfu_accum=telemetry.has_coupled_reduce_sfu_accum,
+        active_grid_blocks=telemetry.active_grid_blocks,
+        in_loop_pipe_all_barriers=telemetry.in_loop_pipe_all_barriers,
     )
     return EnvelopeInspectionResult(
         ledger=ledger,
