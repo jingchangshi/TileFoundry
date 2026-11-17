@@ -1223,3 +1223,298 @@ def test_campaign_runner_cli_arg_parser() -> None:
     defaults = parser.parse_args(["--operator", "attention_residual"])
     assert defaults.disable_early_goal_stop is False
     assert defaults.min_surrogate_gain == 0.25
+
+
+def test_scoped_multi_symbol_regime_slice_extract_and_patch(tmp_path: Path) -> None:
+    """Verify multi-symbol extraction, patching, helper lifecycle, and guardrails."""
+    import pytest
+    from tilefoundry_ascend.agent.campaign import (
+        RegimeSpec,
+        get_default_regime_specs,
+        patch_regime_into_module,
+    )
+
+    assert RegimeSpec is RegimeTargetSpec
+    repo_root = Path(__file__).resolve().parents[3]
+    mla_src = (repo_root / "examples" / "ascend950pr_ops" / "mla" / "kernels.py").read_text(
+        encoding="utf-8"
+    )
+    mla_specs = {spec.regime_tag: spec for spec in get_default_regime_specs("mla")}
+    ar_specs = {
+        spec.regime_tag: spec for spec in get_default_regime_specs("attention_residual")
+    }
+    assert len(mla_specs) == 3 and len(ar_specs) == 3
+    for spec in (*ar_specs.values(), *mla_specs.values()):
+        assert spec.config_selector_fn
+        assert spec.editable_symbols
+        assert spec.allowed_helper_prefix
+        assert RegimeTargetSpec.from_dict(spec.to_dict()) == spec
+
+    split_spec = mla_specs["split_kv_decode"]
+    fname, snippet = extract_regime_snippet(mla_src, split_spec)
+    assert fname == "_build_mla_split_kv_decode_func"
+    assert "def _select_mla_decode_config(" in snippet
+    assert "def _build_mla_split_kv_decode_func(" in snippet
+    assert "def _build_mla_split_kv_combine_func(" in snippet
+    assert "_select_mla_bnsd_config" not in snippet
+    assert "_build_mla_prefill_func" not in snippet
+    assert "def mla(" not in snippet
+
+    helper_src = "def _mla_decode_helper(x: int) -> int:\n    return x + 1\n\n"
+    updated_snippet = (
+        helper_src
+        + snippet.replace('"num_kv_splits": 1,', '"num_kv_splits": 4,', 1)
+    )
+    patched = patch_regime_into_module(mla_src, split_spec, updated_snippet)
+    assert "def _mla_decode_helper(" in patched
+    assert '"num_kv_splits": 4,' in patched
+    _, re_extracted = extract_regime_snippet(patched, split_spec)
+    assert "def _mla_decode_helper(" in re_extracted
+
+    cleaned = patch_regime_into_module(patched, split_spec, snippet)
+    assert "def _mla_decode_helper(" not in cleaned
+
+    with pytest.raises(ValueError, match="missing required regime symbol"):
+        patch_regime_into_module(
+            mla_src,
+            split_spec,
+            snippet.split("def _build_mla_split_kv_combine_func")[0],
+        )
+
+    with pytest.raises(ValueError, match="Unauthorized top-level symbol"):
+        patch_regime_into_module(
+            mla_src,
+            split_spec,
+            snippet + "\ndef _bad_helper():\n    return 1\n",
+        )
+
+    with pytest.raises(ValueError, match="protected symbol"):
+        patch_regime_into_module(
+            mla_src,
+            split_spec,
+            snippet + "\ndef mla(*args, **kwargs):\n    return None\n",
+        )
+
+    with pytest.raises(ValueError, match="protected symbol"):
+        patch_regime_into_module(
+            mla_src,
+            split_spec,
+            snippet + "\n_KERNEL_CACHE = {}\n",
+        )
+
+    with pytest.raises(ValueError, match="protected symbol"):
+        patch_regime_into_module(
+            mla_src,
+            split_spec,
+            snippet + "\ndef _select_mla_bnsd_config():\n    return {}\n",
+        )
+
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="mla", max_rounds=1),
+        target_module_path=tmp_path / "mla_kernels.py",
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=lambda cands, anc: {
+            cid: _make_surrogate_result(cid, "mla", tuple(anc), {1: 10.0, 6: 20.0, 7: 4.0, 11: 90.0, 13: 20.0})
+            for cid, _ in cands
+        },
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+    )
+    baseline = _make_surrogate_result(
+        "base",
+        "mla",
+        get_default_anchors("mla"),
+        {1: 60.0, 6: 200.0, 7: 4.5, 11: 150.0, 13: 60.0},
+    )
+    rule = runner._tracker.active_rules()[0]
+    exp_req = runner._build_exploit_regime_request(
+        snippet_source=snippet,
+        func_name=fname,
+        regime_spec=split_spec,
+        rule=rule,
+        best_result=baseline,
+    )
+    cre_req = runner._build_creative_regime_request(
+        snippet_source=snippet,
+        func_name=fname,
+        regime_spec=split_spec,
+        best_result=baseline,
+        effort="high",
+    )
+    for req in (exp_req, cre_req):
+        assert "_select_mla_decode_config" in req.system_prompt
+        assert "_build_mla_split_kv_combine_func" in req.system_prompt
+        assert "_mla_decode_*" in req.system_prompt
+
+
+def test_config_selector_pass_configs_and_kernel_cache_plumbing(monkeypatch) -> None:
+    """Verify _select_*_config, PrimFunc.attrs, Stage A 256 KiB UB, and _KERNEL_CACHE."""
+    import tilelang
+    from tilefoundry_ascend.agent.campaign import resolve_regime_config
+    from tilefoundry_ascend.agent.orchestrator import run_stage_a_static
+    from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
+
+    sample_mod = '''
+import tilelang.ascend.language as T
+from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
+
+def _select_ar_small_decode_config(d_dim=64, tl_dtype="float16", schedule_mode="tuned"):
+    return {
+        "tile_m": 1,
+        "pass_configs": {},
+        "compile_flags": [],
+    }
+
+def _build_ar_small_decode_func(d_dim=64, tl_dtype="float16", tile_m=1):
+    @T.prim_func
+    def main(X: T.Tensor((16, d_dim), tl_dtype), Y: T.Tensor((16, d_dim), tl_dtype)):
+        with T.Kernel(1) as cid:
+            ub = T.alloc_shared((tile_m, d_dim), tl_dtype)
+            T.copy(X[0:tile_m, 0:d_dim], ub)
+            with T.SimdVF():
+                m32 = T.simd.pset(32, "PAT_ALL")
+                v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
+                _ = v_zero
+            T.copy(ub, Y[0:tile_m, 0:d_dim])
+    return main
+'''
+    spec = RegimeTargetSpec(
+        regime_tag="small_decode",
+        builder_candidates=("_build_ar_small_decode_func",),
+        sample_builder_kwargs={"d_dim": 64, "tl_dtype": "float16", "tile_m": 99},
+        config_selector_fn="_select_ar_small_decode_config",
+        editable_symbols=("_select_ar_small_decode_config", "_build_ar_small_decode_func"),
+        allowed_helper_prefix="_ar_small_decode_",
+    )
+    res_no_flags = resolve_regime_config(sample_mod, spec)
+    assert res_no_flags.builder_kwargs["tile_m"] == 1
+    st_no_flags = run_stage_a_static(
+        sample_mod,
+        factory_name=res_no_flags.builder_name,
+        factory_kwargs=res_no_flags.builder_kwargs,
+        pass_configs=res_no_flags.pass_configs or None,
+        compile_flags=res_no_flags.compile_flags or None,
+    )
+    assert st_no_flags.passed and st_no_flags.ledger is not None
+    assert st_no_flags.ledger.uses_unreserved_ubuf is False
+    assert st_no_flags.ledger.waterlines["UB"].capacity_bytes == 248 * 1024
+
+    mod_unlocked = sample_mod.replace(
+        '"tile_m": 1,\n        "pass_configs": {},\n        "compile_flags": [],',
+        '"tile_m": 4,\n        "pass_configs": {"tl.enable_auto_schedule": False},\n'
+        '        "compile_flags": list(PURE_SIMDVF_UBUF_FLAGS),',
+    )
+    res_unlocked = resolve_regime_config(mod_unlocked, spec)
+    assert res_unlocked.builder_kwargs["tile_m"] == 4
+    assert res_unlocked.compile_flags == PURE_SIMDVF_UBUF_FLAGS
+    st_unlocked = run_stage_a_static(
+        mod_unlocked,
+        factory_name=res_unlocked.builder_name,
+        factory_kwargs=res_unlocked.builder_kwargs,
+        pass_configs=res_unlocked.pass_configs or None,
+        compile_flags=res_unlocked.compile_flags or None,
+    )
+    assert st_unlocked.passed and st_unlocked.ledger is not None
+    assert st_unlocked.ledger.uses_unreserved_ubuf is True
+    assert st_unlocked.ledger.waterlines["UB"].capacity_bytes == 262144
+    assert (
+        st_unlocked.ledger.waterlines["UB"].peak_allocated_bytes
+        > st_no_flags.ledger.waterlines["UB"].peak_allocated_bytes
+    )
+
+    mod_attr = sample_mod.replace(
+        "    return main",
+        '    return main.with_attr("tilelang_compile_flags", list(PURE_SIMDVF_UBUF_FLAGS))',
+    )
+    st_attr = run_stage_a_static(
+        mod_attr,
+        factory_name="_build_ar_small_decode_func",
+        factory_kwargs={"d_dim": 64, "tl_dtype": "float16"},
+        config_selector_name="_select_ar_small_decode_config",
+    )
+    assert st_attr.passed and st_attr.ledger is not None
+    assert st_attr.ledger.uses_unreserved_ubuf is True
+    assert st_attr.ledger.waterlines["UB"].capacity_bytes == 262144
+
+    from examples.ascend950pr_ops.attention_residual import kernels as ar_kernels
+    from examples.ascend950pr_ops.mla import kernels as mla_kernels
+
+    compile_calls: list[tuple[object, object]] = []
+
+    def _fake_compile(prog, **kwargs):
+        compile_calls.append((kwargs.get("pass_configs"), kwargs.get("compile_flags")))
+        return object()
+
+    monkeypatch.setattr(tilelang, "compile", _fake_compile)
+    ar_kernels._KERNEL_CACHE.clear()
+    k1 = ar_kernels._get_kernel(
+        2, 256, "bfloat16", 1, "tuned", pass_configs={"k": 1}, compile_flags=["--flag-a"]
+    )
+    k2 = ar_kernels._get_kernel(
+        2, 256, "bfloat16", 1, "tuned", pass_configs={"k": 1}, compile_flags=["--flag-a"]
+    )
+    k3 = ar_kernels._get_kernel(
+        2, 256, "bfloat16", 1, "tuned", pass_configs={"k": 2}, compile_flags=["--flag-a"]
+    )
+    k4 = ar_kernels._get_kernel(
+        2, 256, "bfloat16", 1, "tuned", pass_configs={"k": 1}, compile_flags=["--flag-b"]
+    )
+    assert k1 is k2
+    assert k1 is not k3 and k1 is not k4
+    assert len(ar_kernels._KERNEL_CACHE) == 3
+
+    mla_kernels._KERNEL_CACHE.clear()
+    mk1 = mla_kernels._get_kernel(
+        128, 1, 512, 64, "float16", "BSND", False, 64, True, "tuned",
+        pass_configs={"a": 1}, compile_flags=PURE_SIMDVF_UBUF_FLAGS,
+    )
+    mk2 = mla_kernels._get_kernel(
+        128, 1, 512, 64, "float16", "BSND", False, 64, True, "tuned",
+        pass_configs={"a": 2}, compile_flags=PURE_SIMDVF_UBUF_FLAGS,
+    )
+    assert mk1 is not mk2
+    assert len(mla_kernels._KERNEL_CACHE) == 2
+    assert len(compile_calls) == 5
+
+
+def test_all_six_production_regimes_extract_resolve_and_pass_stage_a() -> None:
+    """Verify all 6 DEFAULT_REGIME_SPECS extract, resolve, and pass Stage A cleanly."""
+    from examples.ascend950pr_ops.mla import kernels as mla_kernels
+    from tilefoundry_ascend.agent.campaign import get_default_regime_specs, resolve_regime_config
+    from tilefoundry_ascend.agent.orchestrator import run_stage_a_static
+    from tilefoundry_ascend.ascend.schedule import inspect_tilelang_primfunc
+    from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
+
+    repo_root = Path(__file__).resolve().parents[3]
+    module_paths = {
+        "attention_residual": (
+            repo_root / "examples" / "ascend950pr_ops" / "attention_residual" / "kernels.py"
+        ),
+        "mla": repo_root / "examples" / "ascend950pr_ops" / "mla" / "kernels.py",
+    }
+    for op_name, path in module_paths.items():
+        source = path.read_text(encoding="utf-8")
+        for spec in get_default_regime_specs(op_name):
+            fname, snippet = extract_regime_snippet(source, spec)
+            assert fname in spec.builder_candidates
+            for sym in spec.editable_symbols:
+                assert sym in snippet
+            resolved = resolve_regime_config(source, spec)
+            stage_a = run_stage_a_static(
+                source,
+                factory_name=resolved.builder_name,
+                factory_kwargs=resolved.builder_kwargs,
+                pass_configs=resolved.pass_configs or None,
+                compile_flags=resolved.compile_flags or None,
+            )
+            assert stage_a.passed, f"{op_name}/{spec.regime_tag}: {stage_a.error_message}"
+            assert stage_a.ledger is not None and stage_a.ledger.is_legal
+            assert stage_a.ledger.uses_unreserved_ubuf is True
+            assert stage_a.ledger.waterlines["UB"].capacity_bytes == 262144
+
+    decode_fn = mla_kernels._build_mla_split_kv_decode_func(num_kv_splits=4)
+    combine_fn = mla_kernels._build_mla_split_kv_combine_func(num_kv_splits=4)
+    for fn in (decode_fn, combine_fn):
+        res = inspect_tilelang_primfunc(fn, compile_flags=list(PURE_SIMDVF_UBUF_FLAGS))
+        assert res.ledger.is_legal, res.lowering_error
+        assert res.ledger.uses_unreserved_ubuf is True

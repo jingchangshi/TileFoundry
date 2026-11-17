@@ -51,7 +51,10 @@ TILELANG_ASCEND_PRIMITIVE_MENU: str = "\n".join(
         "- T.alloc_l1 / T.alloc_l0a / T.alloc_l0b / T.alloc_l0c: AIC hierarchical SRAM buffers",
         "- T.alloc_shared(...) / T.alloc_ss(...): AIV Unified Buffer (UB) and 3 KiB shared SSBUF",
         "- T.set_atomic(...): atomic reduction/accumulation mode on GM outputs",
-        "- PURE_SIMDVF_UBUF_FLAGS: pass config unlocking full 256 KiB UB on pure T.SimdVF()",
+        (
+            "- PURE_SIMDVF_UBUF_FLAGS: unlock 256 KiB UB via _select_*_config()"
+            "[\"pass_configs\"]/\"compile_flags\" or PrimFunc.attrs"
+        ),
     )
 )
 

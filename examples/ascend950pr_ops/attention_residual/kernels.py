@@ -8,7 +8,7 @@ import torch
 
 from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
 
-_KERNEL_CACHE: dict[tuple[int, int, str, int, str], object] = {}
+_KERNEL_CACHE: dict[tuple[object, ...], object] = {}
 
 
 def _build_attention_residual_prim_func(
@@ -361,21 +361,146 @@ def _choose_ar_tile_m(d_dim: int, schedule_mode: str) -> int:
     return max(1, min(8, max_rows))
 
 
+def _ar_default_flags(schedule_mode: str) -> list[str]:
+    return list(PURE_SIMDVF_UBUF_FLAGS) if schedule_mode == "tuned" else []
+
+
+def _select_ar_small_decode_config(
+    n_depth: int = 2,
+    d_dim: int = 4096,
+    tl_dtype: str = "bfloat16",
+    schedule_mode: str = "tuned",
+    m_rows: int = 1,
+) -> dict[str, object]:
+    _ = (n_depth, d_dim, tl_dtype, m_rows)
+    return {
+        "tile_m": 1,
+        "pass_configs": {},
+        "compile_flags": _ar_default_flags(schedule_mode),
+    }
+
+
+def _build_ar_small_decode_func(
+    n_depth: int = 2,
+    d_dim: int = 4096,
+    tl_dtype: str = "bfloat16",
+    tile_m: int = 1,
+    schedule_mode: str = "tuned",
+):
+    return _build_attention_residual_prim_func(
+        n_depth, d_dim, tl_dtype, tile_m, schedule_mode
+    )
+
+
+def _select_ar_unaligned_config(
+    n_depth: int = 8,
+    d_dim: int = 1000,
+    tl_dtype: str = "bfloat16",
+    schedule_mode: str = "tuned",
+    m_rows: int = 4,
+) -> dict[str, object]:
+    _ = (n_depth, d_dim, tl_dtype, m_rows)
+    return {
+        "tile_m": 1,
+        "pass_configs": {},
+        "compile_flags": _ar_default_flags(schedule_mode),
+    }
+
+
+def _build_ar_unaligned_func(
+    n_depth: int = 8,
+    d_dim: int = 1000,
+    tl_dtype: str = "bfloat16",
+    tile_m: int = 1,
+    schedule_mode: str = "tuned",
+):
+    return _build_attention_residual_prim_func(
+        n_depth, d_dim, tl_dtype, tile_m, schedule_mode
+    )
+
+
+def _select_ar_aligned_config(
+    n_depth: int = 8,
+    d_dim: int = 4096,
+    tl_dtype: str = "bfloat16",
+    schedule_mode: str = "tuned",
+    m_rows: int = 2048,
+) -> dict[str, object]:
+    _ = (n_depth, tl_dtype, m_rows)
+    return {
+        "tile_m": _choose_ar_tile_m(d_dim, schedule_mode),
+        "pass_configs": {},
+        "compile_flags": _ar_default_flags(schedule_mode),
+    }
+
+
+def _build_ar_aligned_func(
+    n_depth: int = 8,
+    d_dim: int = 4096,
+    tl_dtype: str = "bfloat16",
+    tile_m: int = 6,
+    schedule_mode: str = "tuned",
+):
+    return _build_attention_residual_prim_func(
+        n_depth, d_dim, tl_dtype, tile_m, schedule_mode
+    )
+
+
+def _freeze_attr_value(val: object) -> object:
+    if isinstance(val, dict):
+        return tuple((str(k), _freeze_attr_value(v)) for k, v in sorted(val.items()))
+    if isinstance(val, (list, tuple)):
+        return tuple(_freeze_attr_value(x) for x in val)
+    return val
+
+
+def _normalize_pass_configs_key(pass_configs: dict[str, object] | None) -> tuple[tuple[str, object], ...]:
+    if not pass_configs:
+        return ()
+    return tuple(
+        (str(k), _freeze_attr_value(v))
+        for k, v in sorted(pass_configs.items(), key=lambda item: str(item[0]))
+    )
+
+
 def _get_kernel(
     n_depth: int,
     d_dim: int,
     tl_dtype: str,
     tile_m: int,
     schedule_mode: str,
+    *,
+    builder_fn=None,
+    pass_configs: dict[str, object] | None = None,
+    compile_flags: list[str] | tuple[str, ...] | None = None,
 ):
-    key = (n_depth, d_dim, tl_dtype, int(tile_m), schedule_mode)
+    resolved_builder = builder_fn or _build_attention_residual_prim_func
+    pc_dict = dict(pass_configs or {})
+    if compile_flags is None:
+        flags_tuple = tuple(PURE_SIMDVF_UBUF_FLAGS) if schedule_mode == "tuned" else ()
+    else:
+        flags_tuple = tuple(str(f) for f in compile_flags)
+    key = (
+        resolved_builder.__name__,
+        n_depth,
+        d_dim,
+        tl_dtype,
+        int(tile_m),
+        schedule_mode,
+        _normalize_pass_configs_key(pc_dict),
+        flags_tuple,
+    )
     compiled = _KERNEL_CACHE.get(key)
     if compiled is None:
-        prog = _build_attention_residual_prim_func(
-            n_depth, d_dim, tl_dtype, tile_m, schedule_mode
+        prog = resolved_builder(n_depth, d_dim, tl_dtype, tile_m, schedule_mode)
+        flags_arg = list(flags_tuple) if flags_tuple else None
+        compiled = tilelang.compile(
+            prog,
+            target="ascend",
+            out_idx=[4],
+            pass_configs=pc_dict or None,
+            compile_flags=flags_arg,
         )
-        flags = list(PURE_SIMDVF_UBUF_FLAGS) if schedule_mode == "tuned" else None
-        compiled = tilelang.compile(prog, target="ascend", out_idx=[4], compile_flags=flags)
         _KERNEL_CACHE[key] = compiled
     return compiled
 
@@ -404,8 +529,27 @@ def attention_residual(
     w_flat = w.contiguous().view(d_dim)
     g_flat = gamma.contiguous().view(d_dim)
 
-    tile_m = _choose_ar_tile_m(d_dim, schedule_mode)
-    kernel = _get_kernel(n_depth, d_dim, tl_dtype, tile_m, schedule_mode)
+    if (d_dim % 64) != 0:
+        selector_fn, builder_fn = _select_ar_unaligned_config, _build_ar_unaligned_func
+    elif m_rows < 16:
+        selector_fn, builder_fn = _select_ar_small_decode_config, _build_ar_small_decode_func
+    else:
+        selector_fn, builder_fn = _select_ar_aligned_config, _build_ar_aligned_func
+
+    cfg = selector_fn(n_depth, d_dim, tl_dtype, schedule_mode, m_rows=m_rows)
+    tile_m = int(cfg["tile_m"])
+    pass_configs = dict(cfg.get("pass_configs") or {})
+    compile_flags = tuple(str(f) for f in (cfg.get("compile_flags") or ()))
+    kernel = _get_kernel(
+        n_depth,
+        d_dim,
+        tl_dtype,
+        tile_m,
+        schedule_mode,
+        builder_fn=builder_fn,
+        pass_configs=pass_configs,
+        compile_flags=compile_flags,
+    )
     y_flat = kernel(v_flat, x_flat, w_flat, g_flat, float(alpha), float(epsilon))
     return y_flat.view(b_dim, t_dim, d_dim)
 

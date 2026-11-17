@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import importlib.util
+import inspect
 import json
 import os
 import sys
@@ -15,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
+    DEFAULT_REGIME_SPECS,
     AnchorCaseSpec,
     PerfTargetSpec,
     RegimeTargetSpec,
@@ -230,6 +233,187 @@ def _atomic_write_text(path: Path, content: str) -> None:
             tmp_path.unlink(missing_ok=True)
 
 
+_FORBIDDEN_SLICE_SYMBOLS: frozenset[str] = frozenset(
+    {"attention_residual", "mla", "_get_kernel", "_KERNEL_CACHE"}
+)
+
+_HIR_DIM_ALIASES: dict[str, str] = {
+    "N": "n_depth",
+    "B": "b_dim",
+    "S": "s_dim",
+    "S_kv": "s_kv",
+    "D": "d_dim",
+    "N_q": "n_q",
+    "N_kv": "n_kv",
+    "D_nope": "d_nope",
+    "D_rope": "d_rope",
+}
+
+
+@dataclass(frozen=True)
+class ResolvedRegimeConfig:
+    """Resolved builder, tile hyperparameters, and pass/compile flags for a regime."""
+
+    builder_name: str
+    builder_kwargs: dict[str, object]
+    pass_configs: dict[str, object]
+    compile_flags: tuple[str, ...]
+    selector_name: str = ""
+
+
+def _filter_callable_kwargs(fn: object, kwargs: Mapping[str, object]) -> dict[str, object]:
+    sig = inspect.signature(fn)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+
+def _norm_flag_seq(raw: object) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        text = raw.strip()
+        return text.split() if text else []
+    if isinstance(raw, (tuple, list)) or (
+        hasattr(raw, "__iter__") and not isinstance(raw, (bytes, bytearray, Mapping))
+    ):
+        out: list[str] = []
+        for item in raw:
+            val = str(getattr(item, "value", item)).strip()
+            if val and val not in out:
+                out.append(val)
+        return out
+    text = str(raw).strip()
+    return [text] if text else []
+
+
+def resolve_regime_config(
+    module_source_or_path: str | Path,
+    regime_spec: RegimeTargetSpec,
+    dims: Mapping[str, object] | None = None,
+) -> ResolvedRegimeConfig:
+    """Invoke regime config_selector_fn dynamically to resolve builder kwargs and flags."""
+    if isinstance(module_source_or_path, Path):
+        mod_path = module_source_or_path.resolve()
+        src_text = mod_path.read_text(encoding="utf-8")
+        is_existing_file = True
+    else:
+        raw_str = str(module_source_or_path)
+        is_existing_file = "\n" not in raw_str and Path(raw_str).is_file()
+        if is_existing_file:
+            mod_path = Path(raw_str).resolve()
+            src_text = mod_path.read_text(encoding="utf-8")
+        else:
+            mod_path = None
+            src_text = raw_str
+
+    def _load_and_resolve(file_path: Path) -> ResolvedRegimeConfig:
+        spec = importlib.util.spec_from_file_location("_tf_resolve_cfg", str(file_path))
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Failed to load module spec from {file_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        context: dict[str, object] = dict(regime_spec.sample_builder_kwargs)
+        for h_key, h_val in regime_spec.representative_hir_dims.items():
+            mapped = _HIR_DIM_ALIASES.get(str(h_key), str(h_key))
+            if mapped not in context:
+                context[mapped] = h_val
+        if dims:
+            for d_key, d_val in dims.items():
+                mapped = _HIR_DIM_ALIASES.get(str(d_key), str(d_key))
+                context[mapped] = d_val
+
+        pass_configs: dict[str, object] = {}
+        compile_flags: list[str] = []
+        selector_name = regime_spec.config_selector_fn
+        if selector_name and callable(getattr(mod, selector_name, None)):
+            selector_fn = getattr(mod, selector_name)
+            sel_args = _filter_callable_kwargs(selector_fn, context)
+            sel_out = selector_fn(**sel_args)
+            if isinstance(sel_out, Mapping):
+                raw_pc = sel_out.get("pass_configs")
+                if isinstance(raw_pc, Mapping):
+                    for k, v in raw_pc.items():
+                        if str(k) == "tl.device_compile_flags":
+                            for fl in _norm_flag_seq(v):
+                                if fl not in compile_flags:
+                                    compile_flags.append(fl)
+                        else:
+                            pass_configs[str(k)] = v
+                elif raw_pc is not None:
+                    for fl in _norm_flag_seq(raw_pc):
+                        if fl not in compile_flags:
+                            compile_flags.append(fl)
+                for fl in _norm_flag_seq(sel_out.get("compile_flags")):
+                    if fl not in compile_flags:
+                        compile_flags.append(fl)
+                for k, v in sel_out.items():
+                    if k not in ("pass_configs", "compile_flags"):
+                        context[str(k)] = v
+
+        builder_name = ""
+        for cand in regime_spec.builder_candidates:
+            if callable(getattr(mod, cand, None)):
+                builder_name = cand
+                break
+        if not builder_name:
+            for cand in regime_spec.editable_symbols:
+                if cand != selector_name and callable(getattr(mod, cand, None)):
+                    builder_name = cand
+                    break
+        if not builder_name:
+            raise ValueError(
+                f"No builder callable matching {regime_spec.builder_candidates} in module."
+            )
+        builder_fn = getattr(mod, builder_name)
+        builder_kwargs = _filter_callable_kwargs(builder_fn, context)
+        return ResolvedRegimeConfig(
+            builder_name=builder_name,
+            builder_kwargs=builder_kwargs,
+            pass_configs=pass_configs,
+            compile_flags=tuple(compile_flags),
+            selector_name=selector_name,
+        )
+
+    if mod_path is not None and is_existing_file:
+        return _load_and_resolve(mod_path)
+    with tempfile.TemporaryDirectory(prefix="tf_resolve_cfg_") as tmp_dir:
+        tmp_file = Path(tmp_dir) / "module_src.py"
+        tmp_file.write_text(src_text, encoding="utf-8")
+        return _load_and_resolve(tmp_file)
+
+
+@dataclass(frozen=True)
+class _TopLevelSymbol:
+    name: str
+    kind: str
+    start: int
+    end: int
+
+
+def _stmt_line_span(node: ast.stmt) -> tuple[int, int]:
+    decs = getattr(node, "decorator_list", ())
+    start = min((dec.lineno for dec in decs), default=node.lineno)
+    end = node.end_lineno or node.lineno
+    return start, end
+
+
+def _collect_top_level_symbols(tree: ast.Module) -> list[_TopLevelSymbol]:
+    items: list[_TopLevelSymbol] = []
+    for node in tree.body:
+        start, end = _stmt_line_span(node)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            items.append(_TopLevelSymbol(node.name, "func", start, end))
+        elif isinstance(node, ast.Assign):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                items.append(_TopLevelSymbol(node.targets[0].id, "assign", start, end))
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                items.append(_TopLevelSymbol(node.target.id, "assign", start, end))
+    return items
+
+
 def _find_top_level_func(tree: ast.Module, names: Sequence[str]) -> ast.FunctionDef | None:
     by_name = {
         node.name: node
@@ -248,29 +432,70 @@ def _func_line_span(node: ast.FunctionDef) -> tuple[int, int]:
     return start, end
 
 
+def _other_regime_forbidden_symbols(regime_spec: RegimeTargetSpec) -> set[str]:
+    forbidden: set[str] = set(_FORBIDDEN_SLICE_SYMBOLS)
+    own_editable = set(regime_spec.editable_symbols)
+    for specs in DEFAULT_REGIME_SPECS.values():
+        for spec in specs:
+            if spec.regime_tag == regime_spec.regime_tag:
+                continue
+            for sym in spec.editable_symbols:
+                if sym not in own_editable:
+                    forbidden.add(sym)
+            if spec.config_selector_fn and spec.config_selector_fn not in own_editable:
+                forbidden.add(spec.config_selector_fn)
+    return forbidden
+
+
 def extract_regime_snippet(
     module_source: str,
     regime_spec: RegimeTargetSpec,
 ) -> tuple[str, str]:
-    """Extract target regime sub-builder function source from a production module."""
+    """Extract target regime multi-symbol slice (selector, builders, helpers) cleanly."""
     tree = ast.parse(module_source)
+    lines = module_source.splitlines(keepends=True)
+
+    if regime_spec.editable_symbols:
+        symbols = _collect_top_level_symbols(tree)
+        editable_set = set(regime_spec.editable_symbols)
+        prefix = regime_spec.allowed_helper_prefix
+        matched = [
+            sym
+            for sym in symbols
+            if sym.name in editable_set or (prefix and sym.name.startswith(prefix))
+        ]
+        if matched:
+            func_names = {sym.name for sym in matched if sym.kind == "func"}
+            primary = ""
+            for cand in regime_spec.builder_candidates:
+                if cand in func_names:
+                    primary = cand
+                    break
+            if not primary:
+                primary = next(
+                    (sym.name for sym in matched if sym.kind == "func"),
+                    matched[0].name,
+                )
+            blocks = [
+                "".join(lines[sym.start - 1 : sym.end]).rstrip()
+                for sym in matched
+            ]
+            return primary, "\n\n".join(blocks).rstrip() + "\n"
+
     node = _find_top_level_func(tree, regime_spec.builder_candidates)
     if node is None:
         raise ValueError(
             f"No builder function matching {regime_spec.builder_candidates} found in module."
         )
-    lines = module_source.splitlines(keepends=True)
     start, end = _func_line_span(node)
     return node.name, "".join(lines[start - 1 : end]).rstrip() + "\n"
 
 
-def patch_regime_into_module(
+def _patch_single_func_into_module(
     module_source: str,
     func_name: str,
-    candidate_raw_source: str,
+    candidate_dsl: str,
 ) -> str:
-    """Splice validated candidate function func_name into module_source cleanly."""
-    candidate_dsl = extract_python_dsl(candidate_raw_source)
     cand_tree = ast.parse(candidate_dsl)
     cand_node = _find_top_level_func(cand_tree, (func_name,))
     if cand_node is None:
@@ -289,6 +514,124 @@ def patch_regime_into_module(
     o_start, o_end = _func_line_span(orig_node)
     orig_lines = module_source.splitlines(keepends=True)
     patched = "".join([*orig_lines[: o_start - 1], replacement, *orig_lines[o_end:]])
+    ast.parse(patched)
+    return patched
+
+
+def patch_regime_into_module(
+    module_source: str,
+    regime_or_func: RegimeTargetSpec | str,
+    candidate_raw_source: str,
+) -> str:
+    """Splice validated single-function or multi-symbol regime slice into module_source."""
+    candidate_dsl = extract_python_dsl(candidate_raw_source)
+    if isinstance(regime_or_func, str):
+        return _patch_single_func_into_module(module_source, regime_or_func, candidate_dsl)
+
+    regime_spec = regime_or_func
+    orig_tree = ast.parse(module_source)
+    if not regime_spec.editable_symbols:
+        orig_node = _find_top_level_func(orig_tree, regime_spec.builder_candidates)
+        if orig_node is None:
+            raise ValueError(
+                f"Original module missing builder in {regime_spec.builder_candidates}."
+            )
+        return _patch_single_func_into_module(module_source, orig_node.name, candidate_dsl)
+
+    orig_symbols = _collect_top_level_symbols(orig_tree)
+    orig_by_name = {sym.name: sym for sym in orig_symbols}
+    editable_set = set(regime_spec.editable_symbols)
+    prefix = regime_spec.allowed_helper_prefix
+
+    required_symbols = [sym for sym in regime_spec.editable_symbols if sym in orig_by_name]
+    if not required_symbols:
+        orig_node = _find_top_level_func(orig_tree, regime_spec.builder_candidates)
+        if orig_node is None:
+            raise ValueError(
+                f"Original module missing regime symbols {regime_spec.editable_symbols}."
+            )
+        return _patch_single_func_into_module(module_source, orig_node.name, candidate_dsl)
+
+    cand_tree = ast.parse(candidate_dsl)
+    cand_symbols: list[_TopLevelSymbol] = []
+    seen_cand: set[str] = set()
+    forbidden = _other_regime_forbidden_symbols(regime_spec)
+
+    for node in cand_tree.body:
+        start, end = _stmt_line_span(node)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name, kind = node.name, "func"
+        elif isinstance(node, ast.Assign):
+            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                raise ValueError("Candidate assignment must target a single variable name.")
+            name, kind = node.targets[0].id, "assign"
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, kind = node.target.id, "assign"
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        elif (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            continue
+        else:
+            raise ValueError(
+                f"Candidate snippet contains unsupported top-level {type(node).__name__}."
+            )
+
+        if name in seen_cand:
+            raise ValueError(f"Candidate snippet defines duplicate symbol {name!r}.")
+        seen_cand.add(name)
+
+        if name in forbidden:
+            raise ValueError(f"Candidate cannot define or modify protected symbol {name!r}.")
+        if name not in editable_set:
+            if not prefix or not name.startswith(prefix):
+                raise ValueError(
+                    f"Unauthorized top-level symbol {name!r}; expected {editable_set} "
+                    f"or prefix {prefix!r}."
+                )
+        cand_symbols.append(_TopLevelSymbol(name, kind, start, end))
+
+    cand_by_name = {sym.name: sym for sym in cand_symbols}
+    missing = [name for name in required_symbols if name not in cand_by_name]
+    if missing:
+        raise ValueError(f"Candidate snippet missing required regime symbol(s): {missing}.")
+
+    cand_lines = candidate_dsl.splitlines(keepends=True)
+    cand_slices = {
+        sym.name: "".join(cand_lines[sym.start - 1 : sym.end]).rstrip() + "\n"
+        for sym in cand_symbols
+    }
+
+    orig_regime_items = [
+        sym
+        for sym in orig_symbols
+        if sym.name in editable_set or (prefix and sym.name.startswith(prefix))
+    ]
+    new_helpers = [
+        sym
+        for sym in cand_symbols
+        if sym.name not in editable_set and sym.name not in orig_by_name
+    ]
+    insert_line_idx = orig_regime_items[0].start - 1
+
+    orig_lines = module_source.splitlines(keepends=True)
+    for item in reversed(orig_regime_items):
+        if item.name in cand_slices:
+            orig_lines[item.start - 1 : item.end] = [cand_slices[item.name]]
+        else:
+            del_end = item.end
+            while del_end < len(orig_lines) and orig_lines[del_end].strip() == "":
+                del_end += 1
+            del orig_lines[item.start - 1 : del_end]
+
+    if new_helpers:
+        helper_block = "".join(cand_slices[h.name] + "\n" for h in new_helpers)
+        orig_lines[insert_line_idx:insert_line_idx] = [helper_block]
+
+    patched = "".join(orig_lines)
     ast.parse(patched)
     return patched
 
@@ -463,11 +806,21 @@ class PerfTargetCampaignRunner:
         module_source: str,
         regime_spec: RegimeTargetSpec,
     ) -> StageAResult:
-        func_name, _ = extract_regime_snippet(module_source, regime_spec)
+        try:
+            resolved = resolve_regime_config(module_source, regime_spec)
+        except Exception as exc:
+            return StageAResult(
+                passed=False,
+                prim_func=None,
+                ledger=None,
+                error_message=f"stage_a_config_resolve_error: {type(exc).__name__}: {exc}",
+            )
         return run_stage_a_static(
             module_source,
-            factory_name=func_name,
-            factory_kwargs=regime_spec.sample_builder_kwargs,
+            factory_name=resolved.builder_name,
+            factory_kwargs=resolved.builder_kwargs,
+            pass_configs=resolved.pass_configs or None,
+            compile_flags=resolved.compile_flags or None,
             target=self._target,
             enable_track_router=self._enable_track_router,
         )
@@ -480,11 +833,20 @@ class PerfTargetCampaignRunner:
     def _run_l1(self, module_source: str, regime_spec: RegimeTargetSpec) -> StageBResult:
         if self._l1_compiler is not None:
             return self._l1_compiler(module_source, regime_spec)
-        func_name, _ = extract_regime_snippet(module_source, regime_spec)
+        try:
+            resolved = resolve_regime_config(module_source, regime_spec)
+        except Exception as exc:
+            return StageBResult(
+                passed=False,
+                error_message=f"l1_config_resolve_error: {type(exc).__name__}: {exc}",
+            )
         return run_l1_compile_check(
             module_source,
-            builder_name=func_name,
-            builder_kwargs=regime_spec.sample_builder_kwargs,
+            builder_name=resolved.builder_name,
+            builder_kwargs=resolved.builder_kwargs,
+            config_selector_name=regime_spec.config_selector_fn or None,
+            pass_configs=resolved.pass_configs or None,
+            compile_flags=resolved.compile_flags or None,
             source_root=self._source_root,
             env_file=self._env_file,
         )
@@ -592,6 +954,21 @@ class PerfTargetCampaignRunner:
         )
         return candidates[0]
 
+    @staticmethod
+    def _slice_contract_instruction(func_name: str, regime_spec: RegimeTargetSpec) -> str:
+        if not regime_spec.editable_symbols:
+            return f"function '{func_name}'"
+        syms = ", ".join(regime_spec.editable_symbols)
+        helper_note = (
+            f" plus optional '{regime_spec.allowed_helper_prefix}*' helpers"
+            if regime_spec.allowed_helper_prefix
+            else ""
+        )
+        return (
+            f"ALL required slice symbols ({syms}){helper_note}; do NOT define or modify "
+            "public entrypoints or symbols from other regimes"
+        )
+
     def _build_exploit_regime_request(
         self,
         *,
@@ -604,11 +981,11 @@ class PerfTargetCampaignRunner:
         parent_ledger: ObjectivePhysicalLedger | None = None,
         track: str = "unconstrained",
     ) -> GenerationRequest:
+        slice_desc = self._slice_contract_instruction(func_name, regime_spec)
         sys_prompt = (
             "You are an Ascend 950PR TileLang DSL performance engineer. Apply the selected causal "
-            f"optimization rule cleanly inside function '{func_name}' while preserving exact "
-            "numerical semantics and dynamic shape compatibility. Output ONLY Python code defining "
-            f"'{func_name}'."
+            f"optimization rule cleanly while preserving exact numerical semantics, dynamic shape "
+            f"compatibility, and {slice_desc}. Output ONLY Python code for this regime slice."
         )
         if not self._enable_track_router or track in ("", "unconstrained"):
             track_section = (
@@ -660,12 +1037,13 @@ class PerfTargetCampaignRunner:
         parent_ledger: ObjectivePhysicalLedger | None = None,
         track: str = "unconstrained",
     ) -> GenerationRequest:
+        slice_desc = self._slice_contract_instruction(func_name, regime_spec)
         sys_prompt = (
             "You are an Ascend 950PR (dav-3510) systems architect. Propose an architectural "
-            f"optimization for function '{func_name}' grounded in Roofline limits (56 AIV / 28 "
-            "MixCore blocks, 3 KiB SSBUF, L0C->UB direct path, UB->L1 direct path, 64-elem UB "
-            "alignment, Split-KV parallelism). Preserve exact numerical semantics and function "
-            "signature. Return JSON matching the schema."
+            f"optimization grounded in Roofline limits (56 AIV / 28 MixCore blocks, 3 KiB SSBUF, "
+            "L0C->UB direct path, UB->L1 direct path, 64-elem UB alignment, Split-KV parallelism). "
+            f"Preserve exact numerical semantics, signatures, and {slice_desc}. Return JSON "
+            "matching the schema."
         )
         if excluded_mechanisms:
             constraint_lines = "\n".join(f"- {item}" for item in excluded_mechanisms)
@@ -861,7 +1239,7 @@ class PerfTargetCampaignRunner:
                 stone = self._beam.stepping_stone_beam[0]
                 self._beam.mark_parent_selected(stone)
                 try:
-                    patch_regime_into_module(incumbent_source, func_name, stone.dsl_source)
+                    patch_regime_into_module(incumbent_source, regime_spec, stone.dsl_source)
                     parent_snippet = stone.dsl_source
                     parent_lane = "stepping_stone"
                     stone_ledger = stone.ledger
@@ -1003,7 +1381,7 @@ class PerfTargetCampaignRunner:
             l0_l1_checks = await run_l0_l1_round_filter(
                 raw_candidates,
                 patch_fn=lambda snip: patch_regime_into_module(
-                    incumbent_source, func_name, snip
+                    incumbent_source, regime_spec, snip
                 ),
                 l0_checker=lambda mod_src: self._run_l0(mod_src, regime_spec),
                 l1_compiler=lambda mod_src: self._run_l1(mod_src, regime_spec),
@@ -1485,10 +1863,12 @@ __all__ = [
     "CampaignReport",
     "CampaignRoundRecord",
     "PerfTargetCampaignRunner",
+    "ResolvedRegimeConfig",
     "build_arg_parser",
     "extract_regime_snippet",
     "main",
     "patch_regime_into_module",
+    "resolve_regime_config",
 ]
 
 

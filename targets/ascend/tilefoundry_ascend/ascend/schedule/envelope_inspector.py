@@ -1860,11 +1860,93 @@ def _try_solve_tilelang_pipelined_ii(
     return max(solved_iis) if solved_iis else None
 
 
+def _to_python_attr_value(val: object) -> object:
+    if isinstance(val, (bool, int, float, str)):
+        return val
+    if hasattr(val, "value") and isinstance(getattr(val, "value"), (bool, int, float, str)):
+        return getattr(val, "value")
+    if hasattr(val, "items"):
+        return {str(k): _to_python_attr_value(v) for k, v in val.items()}
+    if isinstance(val, (tuple, list)) or (
+        hasattr(val, "__iter__") and not isinstance(val, (bytes, bytearray))
+    ):
+        try:
+            return [_to_python_attr_value(item) for item in val]
+        except TypeError:
+            return str(val)
+    return str(val)
+
+
+def _normalize_compile_flags(raw_flags: object) -> list[str]:
+    if raw_flags is None:
+        return []
+    if isinstance(raw_flags, str):
+        text = raw_flags.strip()
+        return text.split() if text else []
+    if isinstance(raw_flags, (tuple, list)) or (
+        hasattr(raw_flags, "__iter__") and not isinstance(raw_flags, (bytes, bytearray))
+    ):
+        out: list[str] = []
+        for item in raw_flags:
+            item_str = str(_to_python_attr_value(item)).strip()
+            if item_str:
+                out.append(item_str)
+        return out
+    text = str(raw_flags).strip()
+    return [text] if text else []
+
+
+def _extract_primfunc_pass_configs_and_flags(
+    entry_fn,
+    mod_in,
+    *,
+    pass_configs: dict[str, object] | None = None,
+    compile_flags: Sequence[str] | str | None = None,
+) -> tuple[dict[str, object], list[str]]:
+    cfg: dict[str, object] = {}
+    flags: list[str] = []
+
+    def _append_flags(items: Sequence[str]) -> None:
+        for item in items:
+            if item and item not in flags:
+                flags.append(item)
+
+    for owner in (mod_in, entry_fn):
+        attrs = getattr(owner, "attrs", None)
+        if not attrs or not hasattr(attrs, "items"):
+            continue
+        for pc_key in ("tl.pass_configs", "tilelang_pass_configs"):
+            if pc_key in attrs:
+                raw_pc = _to_python_attr_value(attrs[pc_key])
+                if isinstance(raw_pc, dict):
+                    for k, v in raw_pc.items():
+                        if k == "tl.device_compile_flags":
+                            _append_flags(_normalize_compile_flags(v))
+                        else:
+                            cfg[str(k)] = v
+        for cf_key in ("tir.cce_flags", "tilelang_compile_flags"):
+            if cf_key in attrs:
+                _append_flags(_normalize_compile_flags(attrs[cf_key]))
+
+    if pass_configs:
+        for k, v in pass_configs.items():
+            if str(k) == "tl.device_compile_flags":
+                _append_flags(_normalize_compile_flags(v))
+            else:
+                cfg[str(k)] = v
+
+    _append_flags(_normalize_compile_flags(compile_flags))
+    if flags:
+        cfg["tl.device_compile_flags"] = list(flags)
+    return cfg, flags
+
+
 def inspect_tilelang_primfunc(
     prim_func,
     *,
     target: AscendTarget | None = None,
     pass_configs: dict[str, object] | None = None,
+    compile_flags: Sequence[str] | str | None = None,
     aiv_split_factor: int | None = None,
     unreserved_ubuf: bool = False,
 ) -> EnvelopeInspectionResult:
@@ -1890,6 +1972,19 @@ def inspect_tilelang_primfunc(
         sym = str(entry_fn.attrs.get("global_symbol", "main")) if entry_fn.attrs else "main"
         mod_in = tvm.IRModule({sym: entry_fn})
 
+    cfg, merged_flags = _extract_primfunc_pass_configs_and_flags(
+        entry_fn,
+        mod_in,
+        pass_configs=pass_configs,
+        compile_flags=compile_flags,
+    )
+    ubuf_flag = "--cce-disable-vf-stack-reserved-ubuf"
+    unreserved_hint = bool(
+        unreserved_ubuf
+        or any(ubuf_flag in f for f in merged_flags)
+        or _attrs_contain_flag(cfg, ubuf_flag)
+    )
+
     effective_aiv_split = (
         aiv_split_factor
         if aiv_split_factor is not None
@@ -1912,7 +2007,7 @@ def inspect_tilelang_primfunc(
         tirx=tirx,
         DataTypeCls=TLDataType,
         pipe_cycles=pipe_cycles,
-        unreserved_ubuf=unreserved_ubuf,
+        unreserved_ubuf=unreserved_hint,
     )
     effective_unreserved = telemetry.uses_unreserved_ubuf
     capacities = _scope_capacities(
@@ -1943,7 +2038,6 @@ def inspect_tilelang_primfunc(
     lowering_error: str | None = None
     device_mod = None
     ctx = create_backend_context("ascend", None, "auto")
-    cfg = dict(pass_configs or {})
     try:
         with tvm.transform.PassContext(config=cfg, instruments=[_SnapshotCapture()]):
             _host_mod, device_mod, _params, _tgt, _htgt = lower_to_host_device_ir(mod_in, ctx)

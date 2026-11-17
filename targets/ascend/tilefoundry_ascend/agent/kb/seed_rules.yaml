@@ -227,8 +227,10 @@ rules:
     precondition: "in_loop_ub_reload_stores > 0 or (not has_simtvf and not uses_unreserved_ubuf and ub_utilization_ratio >= 0.88)"
     transform_template: |
       Hoist repeated in-loop UB accumulator reloads and stores into register-resident scalars or
-      vectors across reduction steps, and enable PURE_SIMDVF_UBUF_FLAGS on pure SIMD vector
-      kernels without SIMT fallback to unlock the full 256 KiB UB budget.
+      vectors across reduction steps, and enable PURE_SIMDVF_UBUF_FLAGS via
+      _select_*_config()["pass_configs"] / ["compile_flags"] or PrimFunc.attrs
+      (tilelang_pass_configs / tilelang_compile_flags) on pure SIMD vector kernels without SIMT
+      fallback to unlock the full 256 KiB UB budget.
     expected_postcondition: "in_loop_ub_reload_stores < prev.in_loop_ub_reload_stores or UB.capacity_bytes >= 262144 or measured_latency_us < prev.measured_latency_us"
     source_provenance: "ref:tilelang"
     alpha_prior: 2.5

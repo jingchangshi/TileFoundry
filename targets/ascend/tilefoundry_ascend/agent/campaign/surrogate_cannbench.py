@@ -30,6 +30,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
+    build_stage_b_driver_source,
     run_stage_a_static,
     run_stage_b_compile,
 )
@@ -384,12 +385,20 @@ def run_l0_static_precheck(
     *,
     builder_name: str,
     builder_kwargs: Mapping[str, object],
+    config_selector_name: str | None = None,
+    pass_configs: dict[str, object] | None = None,
+    compile_flags: Sequence[str] | str | None = None,
+    dims: Mapping[str, object] | None = None,
 ) -> StageAResult:
     """Run Tier L0 static AST, ledger, and router inspection on Host CPU."""
     return run_stage_a_static(
         module_source,
         factory_name=builder_name,
         factory_kwargs=builder_kwargs,
+        pass_configs=pass_configs,
+        compile_flags=compile_flags,
+        config_selector_name=config_selector_name,
+        dims=dims,
     )
 
 
@@ -409,6 +418,10 @@ def run_l1_compile_check(
     *,
     builder_name: str,
     builder_kwargs: Mapping[str, object],
+    config_selector_name: str | None = None,
+    pass_configs: Mapping[str, object] | None = None,
+    compile_flags: Sequence[str] | str | None = None,
+    dims: Mapping[str, object] | None = None,
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     timeout_sec: int = 120,
@@ -435,6 +448,10 @@ def run_l1_compile_check(
             module_source,
             factory_name=builder_name,
             factory_kwargs=builder_kwargs,
+            config_selector_name=config_selector_name,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+            dims=dims,
             python_bin=python_bin,
             timeout_sec=timeout_sec,
         )
@@ -453,20 +470,22 @@ def run_l1_compile_check(
     run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
     run_env.setdefault("USE_CUDA", "0")
 
-    kwargs_json = json.dumps(dict(builder_kwargs))
     with tempfile.TemporaryDirectory(prefix="tf_l1_compile_") as tmp_dir:
         tmp = Path(tmp_dir)
         cand_path = tmp / "candidate_dsl.py"
         cand_path.write_text(module_source, encoding="utf-8")
         driver_path = tmp / "compile_driver.py"
         driver_path.write_text(
-            "import importlib.util, json, tilelang\n"
-            f"spec = importlib.util.spec_from_file_location('_tf_l1', {str(cand_path)!r})\n"
-            "mod = importlib.util.module_from_spec(spec)\n"
-            "spec.loader.exec_module(mod)\n"
-            f"fn = getattr(mod, {builder_name!r})(**json.loads({kwargs_json!r}))\n"
-            "art = tilelang.lower(fn, target='ascend', enable_device_compile=True)\n"
-            "assert art.kernel_source\n",
+            build_stage_b_driver_source(
+                cand_path,
+                factory_name=builder_name,
+                factory_kwargs=builder_kwargs,
+                config_selector_name=config_selector_name,
+                pass_configs=pass_configs,
+                compile_flags=compile_flags,
+                dims=dims,
+                enable_device_compile=True,
+            ),
             encoding="utf-8",
         )
         if cann_setup and Path(cann_setup).is_file() and shutil.which("bisheng") is None:

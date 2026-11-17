@@ -76,13 +76,100 @@ class FunnelEvaluation:
     error_message: str = ""
 
 
-def _resolve_prim_func_from_dsl(
+_HIR_TO_BUILDER_DIM_MAP: dict[str, str] = {
+    "N": "n_depth",
+    "B": "b_dim",
+    "S": "s_dim",
+    "S_kv": "s_kv",
+    "D": "d_dim",
+    "N_q": "n_q",
+    "N_kv": "n_kv",
+    "D_nope": "d_nope",
+    "D_rope": "d_rope",
+}
+
+
+def _normalize_flag_list(raw_flags: object) -> list[str]:
+    if raw_flags is None:
+        return []
+    if isinstance(raw_flags, str):
+        text = raw_flags.strip()
+        return text.split() if text else []
+    if isinstance(raw_flags, (tuple, list)) or (
+        hasattr(raw_flags, "__iter__") and not isinstance(raw_flags, (bytes, bytearray, Mapping))
+    ):
+        out: list[str] = []
+        for item in raw_flags:
+            val = str(getattr(item, "value", item)).strip()
+            if val and val not in out:
+                out.append(val)
+        return out
+    text = str(raw_flags).strip()
+    return [text] if text else []
+
+
+def _filter_kwargs_for_callable(fn: object, kwargs: Mapping[str, object]) -> dict[str, object]:
+    import inspect
+
+    sig = inspect.signature(fn)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return dict(kwargs)
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+
+def _merge_dims_into_kwargs(
+    base_kwargs: Mapping[str, object] | None,
+    dims: Mapping[str, object] | None,
+) -> dict[str, object]:
+    merged = dict(base_kwargs or {})
+    if not dims:
+        return merged
+    for key, val in dims.items():
+        mapped = _HIR_TO_BUILDER_DIM_MAP.get(str(key), str(key))
+        merged[mapped] = val
+    return merged
+
+
+def _split_selector_output(
+    sel_out: Mapping[str, object],
+) -> tuple[dict[str, object], dict[str, object], list[str]]:
+    pc: dict[str, object] = {}
+    cf: list[str] = []
+    builder_overrides: dict[str, object] = {}
+
+    raw_pc = sel_out.get("pass_configs")
+    if isinstance(raw_pc, Mapping):
+        for k, v in raw_pc.items():
+            if str(k) == "tl.device_compile_flags":
+                for flag in _normalize_flag_list(v):
+                    if flag not in cf:
+                        cf.append(flag)
+            else:
+                pc[str(k)] = v
+    elif raw_pc is not None:
+        for flag in _normalize_flag_list(raw_pc):
+            if flag not in cf:
+                cf.append(flag)
+
+    for flag in _normalize_flag_list(sel_out.get("compile_flags")):
+        if flag not in cf:
+            cf.append(flag)
+
+    for k, v in sel_out.items():
+        if k not in ("pass_configs", "compile_flags"):
+            builder_overrides[str(k)] = v
+    return builder_overrides, pc, cf
+
+
+def _resolve_prim_func_and_configs_from_dsl(
     dsl_source: str,
     *,
     factory_name: str | None = None,
     factory_kwargs: Mapping[str, object] | None = None,
-):
-    """Load DSL source via a temporary module so @T.prim_func sees file lines cleanly."""
+    config_selector_name: str | None = None,
+    dims: Mapping[str, object] | None = None,
+) -> tuple[object, dict[str, object], list[str]]:
+    """Load DSL source via a temp module, invoke selector if present, and build PrimFunc."""
     import ast
     import importlib.util
 
@@ -94,6 +181,10 @@ def _resolve_prim_func_from_dsl(
     from tvm import IRModule, tirx
 
     ast.parse(dsl_source)
+    sel_pass_configs: dict[str, object] = {}
+    sel_compile_flags: list[str] = []
+    effective_kwargs = _merge_dims_into_kwargs(factory_kwargs, dims)
+
     with tempfile.TemporaryDirectory(prefix="tf_stage_a_") as tmp_dir:
         mod_path = Path(tmp_dir) / "candidate_dsl.py"
         mod_path.write_text(dsl_source, encoding="utf-8")
@@ -103,20 +194,79 @@ def _resolve_prim_func_from_dsl(
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
 
+        if config_selector_name and hasattr(mod, config_selector_name):
+            selector_obj = getattr(mod, config_selector_name)
+            if callable(selector_obj):
+                sel_args = _filter_kwargs_for_callable(selector_obj, effective_kwargs)
+                sel_raw = selector_obj(**sel_args)
+                if isinstance(sel_raw, Mapping):
+                    overrides, sel_pass_configs, sel_compile_flags = _split_selector_output(
+                        sel_raw
+                    )
+                    effective_kwargs.update(overrides)
+
         if factory_name and hasattr(mod, factory_name):
             target_obj = getattr(mod, factory_name)
             if callable(target_obj):
-                return target_obj(**dict(factory_kwargs or {}))
-            return target_obj
+                call_kw = _filter_kwargs_for_callable(target_obj, effective_kwargs)
+                return target_obj(**call_kw), sel_pass_configs, sel_compile_flags
+            return target_obj, sel_pass_configs, sel_compile_flags
 
         for val in vars(mod).values():
             if isinstance(val, (tirx.PrimFunc, IRModule)):
-                return val
+                return val, sel_pass_configs, sel_compile_flags
 
         for name, val in vars(mod).items():
-            if not name.startswith("_") and callable(val) and getattr(val, "__module__", None) == mod.__name__:
-                return val(**dict(factory_kwargs or {}))
+            if (
+                not name.startswith("_")
+                and callable(val)
+                and getattr(val, "__module__", None) == mod.__name__
+            ):
+                call_kw = _filter_kwargs_for_callable(val, effective_kwargs)
+                return val(**call_kw), sel_pass_configs, sel_compile_flags
     raise ValueError("DSL source defined no callable factory or PrimFunc")
+
+
+def _resolve_prim_func_from_dsl(
+    dsl_source: str,
+    *,
+    factory_name: str | None = None,
+    factory_kwargs: Mapping[str, object] | None = None,
+):
+    """Load DSL source via a temporary module so @T.prim_func sees file lines cleanly."""
+    prim_func, _pc, _cf = _resolve_prim_func_and_configs_from_dsl(
+        dsl_source,
+        factory_name=factory_name,
+        factory_kwargs=factory_kwargs,
+    )
+    return prim_func
+
+
+def _merge_pass_configs_and_flags(
+    sel_pc: Mapping[str, object] | None,
+    sel_cf: Sequence[str] | str | None,
+    ext_pc: Mapping[str, object] | None,
+    ext_cf: Sequence[str] | str | None,
+) -> tuple[dict[str, object], list[str]]:
+    merged_pc: dict[str, object] = {}
+    merged_cf: list[str] = []
+
+    def _absorb(pc_map: Mapping[str, object] | None, cf_seq: Sequence[str] | str | None) -> None:
+        if pc_map:
+            for k, v in pc_map.items():
+                if str(k) == "tl.device_compile_flags":
+                    for flag in _normalize_flag_list(v):
+                        if flag not in merged_cf:
+                            merged_cf.append(flag)
+                else:
+                    merged_pc[str(k)] = v
+        for flag in _normalize_flag_list(cf_seq):
+            if flag not in merged_cf:
+                merged_cf.append(flag)
+
+    _absorb(sel_pc, sel_cf)
+    _absorb(ext_pc, ext_cf)
+    return merged_pc, merged_cf
 
 
 def run_stage_a_static(
@@ -126,20 +276,32 @@ def run_stage_a_static(
     factory_kwargs: Mapping[str, object] | None = None,
     target: AscendTarget | None = None,
     pass_configs: dict[str, object] | None = None,
+    compile_flags: Sequence[str] | str | None = None,
+    config_selector_name: str | None = None,
+    dims: Mapping[str, object] | None = None,
     enable_track_router: bool = False,
 ) -> StageAResult:
     """Run millisecond Stage A AST, Two-Snapshot IR Diff, and optional track routing."""
     t0 = time.monotonic()
     try:
-        prim_func = _resolve_prim_func_from_dsl(
+        prim_func, sel_pc, sel_cf = _resolve_prim_func_and_configs_from_dsl(
             dsl_source,
             factory_name=factory_name,
             factory_kwargs=factory_kwargs,
+            config_selector_name=config_selector_name,
+            dims=dims,
+        )
+        merged_pc, merged_cf = _merge_pass_configs_and_flags(
+            sel_pc,
+            sel_cf,
+            pass_configs,
+            compile_flags,
         )
         inspection: EnvelopeInspectionResult = inspect_tilelang_primfunc(
             prim_func,
             target=target,
-            pass_configs=pass_configs,
+            pass_configs=merged_pc or None,
+            compile_flags=merged_cf or None,
         )
     except Exception as exc:
         return StageAResult(
@@ -197,11 +359,125 @@ def _resolve_conda_python(explicit_python: str | None = None) -> str:
     return sys.executable
 
 
+def build_stage_b_driver_source(
+    cand_path: str | Path,
+    *,
+    factory_name: str | None = None,
+    factory_kwargs: Mapping[str, object] | None = None,
+    config_selector_name: str | None = None,
+    pass_configs: Mapping[str, object] | None = None,
+    compile_flags: Sequence[str] | str | None = None,
+    dims: Mapping[str, object] | None = None,
+    enable_device_compile: bool = True,
+) -> str:
+    """Build standalone Python driver lowering and device-compiling a candidate DSL file."""
+    eff_kwargs = _merge_dims_into_kwargs(factory_kwargs, dims)
+    ext_pc, ext_cf = _merge_pass_configs_and_flags(None, None, pass_configs, compile_flags)
+    payload = json.dumps(
+        {
+            "cand_path": str(cand_path),
+            "factory_name": factory_name,
+            "factory_kwargs": eff_kwargs,
+            "config_selector_name": config_selector_name,
+            "pass_configs": ext_pc,
+            "compile_flags": ext_cf,
+            "enable_device_compile": bool(enable_device_compile),
+        }
+    )
+    return (
+        "import importlib.util, inspect, json, tilelang\n"
+        "from tilelang import tvm\n"
+        "from tvm import tirx, IRModule\n"
+        f"_cfg = json.loads({payload!r})\n"
+        "_spec = importlib.util.spec_from_file_location('_tf_stage_b', _cfg['cand_path'])\n"
+        "_mod = importlib.util.module_from_spec(_spec)\n"
+        "_spec.loader.exec_module(_mod)\n"
+        "def _filt(obj, kw):\n"
+        "    sig = inspect.signature(obj)\n"
+        "    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):\n"
+        "        return dict(kw)\n"
+        "    return {k: v for k, v in kw.items() if k in sig.parameters}\n"
+        "def _norm_flags(raw):\n"
+        "    if raw is None:\n"
+        "        return []\n"
+        "    if isinstance(raw, str):\n"
+        "        return raw.split()\n"
+        "    return [str(getattr(x, 'value', x)).strip() for x in raw if str(x).strip()]\n"
+        "_kw = dict(_cfg['factory_kwargs'])\n"
+        "_sel_pc, _sel_cf = {}, []\n"
+        "_sname = _cfg['config_selector_name']\n"
+        "if _sname and callable(getattr(_mod, _sname, None)):\n"
+        "    _sfn = getattr(_mod, _sname)\n"
+        "    _sout = _sfn(**_filt(_sfn, _kw))\n"
+        "    if isinstance(_sout, dict):\n"
+        "        _raw_pc = _sout.get('pass_configs')\n"
+        "        if isinstance(_raw_pc, dict):\n"
+        "            for _k, _v in _raw_pc.items():\n"
+        "                if _k == 'tl.device_compile_flags':\n"
+        "                    _sel_cf.extend(_norm_flags(_v))\n"
+        "                else:\n"
+        "                    _sel_pc[str(_k)] = _v\n"
+        "        elif _raw_pc is not None:\n"
+        "            _sel_cf.extend(_norm_flags(_raw_pc))\n"
+        "        _sel_cf.extend(_norm_flags(_sout.get('compile_flags')))\n"
+        "        for _k, _v in _sout.items():\n"
+        "            if _k not in ('pass_configs', 'compile_flags'):\n"
+        "                _kw[_k] = _v\n"
+        "_fname = _cfg['factory_name']\n"
+        "_fn = None\n"
+        "if _fname and hasattr(_mod, _fname):\n"
+        "    _obj = getattr(_mod, _fname)\n"
+        "    _fn = _obj(**_filt(_obj, _kw)) if callable(_obj) else _obj\n"
+        "if _fn is None:\n"
+        "    for _v in vars(_mod).values():\n"
+        "        if isinstance(_v, (tirx.PrimFunc, IRModule)):\n"
+        "            _fn = _v; break\n"
+        "if _fn is None:\n"
+        "    for _k, _v in vars(_mod).items():\n"
+        "        if (not _k.startswith('_') and callable(_v)\n"
+        "                and getattr(_v, '__module__', None) == _mod.__name__):\n"
+        "            _fn = _v(**_filt(_v, _kw)); break\n"
+        "_merged_pc, _merged_cf = {}, []\n"
+        "def _absorb_flags(items):\n"
+        "    for _f in items:\n"
+        "        if _f and _f not in _merged_cf:\n"
+        "            _merged_cf.append(_f)\n"
+        "_attrs = getattr(_fn, 'attrs', None)\n"
+        "if _attrs and hasattr(_attrs, 'items'):\n"
+        "    for _pk in ('tl.pass_configs', 'tilelang_pass_configs'):\n"
+        "        if _pk in _attrs and hasattr(_attrs[_pk], 'items'):\n"
+        "            for _ak, _av in _attrs[_pk].items():\n"
+        "                _val = getattr(_av, 'value', _av)\n"
+        "                if str(_ak) == 'tl.device_compile_flags':\n"
+        "                    _absorb_flags(_norm_flags(_val))\n"
+        "                else:\n"
+        "                    _merged_pc[str(_ak)] = _val\n"
+        "    for _ck in ('tir.cce_flags', 'tilelang_compile_flags'):\n"
+        "        if _ck in _attrs:\n"
+        "            _absorb_flags(_norm_flags(_attrs[_ck]))\n"
+        "_merged_pc.update(_sel_pc)\n"
+        "_absorb_flags(_sel_cf)\n"
+        "_merged_pc.update(_cfg['pass_configs'])\n"
+        "_absorb_flags(_cfg['compile_flags'])\n"
+        "if _merged_cf:\n"
+        "    _merged_pc['tl.device_compile_flags'] = list(_merged_cf)\n"
+        "with tvm.transform.PassContext(config=_merged_pc):\n"
+        "    _art = tilelang.lower(\n"
+        "        _fn, target='ascend', enable_device_compile=_cfg['enable_device_compile']\n"
+        "    )\n"
+        "assert _art.kernel_source\n"
+    )
+
+
 def run_stage_b_compile(
     dsl_source: str,
     *,
     factory_name: str | None = None,
     factory_kwargs: Mapping[str, object] | None = None,
+    config_selector_name: str | None = None,
+    pass_configs: Mapping[str, object] | None = None,
+    compile_flags: Sequence[str] | str | None = None,
+    dims: Mapping[str, object] | None = None,
     python_bin: str | None = None,
     timeout_sec: int = 120,
     enable_device_compile: bool = True,
@@ -209,32 +485,21 @@ def run_stage_b_compile(
     """Verify full TileLang + bisheng device compilation in an isolated subprocess."""
     t0 = time.monotonic()
     py_exe = _resolve_conda_python(python_bin)
-    kwargs_json = json.dumps(dict(factory_kwargs or {}))
     env = dict(os.environ)
     env["TILELANG_DISABLE_CACHE"] = "1"
     env.setdefault("USE_CUDA", "0")
     with tempfile.TemporaryDirectory(prefix="tf_stage_b_") as tmp_dir:
         cand_path = Path(tmp_dir) / "candidate_dsl.py"
         cand_path.write_text(dsl_source, encoding="utf-8")
-        driver = (
-            "import importlib.util, json, tilelang\n"
-            "from tvm import tirx, IRModule\n"
-            f"spec = importlib.util.spec_from_file_location('_tf_stage_b', {str(cand_path)!r})\n"
-            "mod = importlib.util.module_from_spec(spec)\n"
-            "spec.loader.exec_module(mod)\n"
-            f"fname = {factory_name!r}\n"
-            f"kw = json.loads({kwargs_json!r})\n"
-            "fn = getattr(mod, fname)(**kw) if fname and callable(getattr(mod, fname, None)) else None\n"
-            "if fn is None:\n"
-            "    for v in vars(mod).values():\n"
-            "        if isinstance(v, (tirx.PrimFunc, IRModule)):\n"
-            "            fn = v; break\n"
-            "if fn is None:\n"
-            "    for k, v in vars(mod).items():\n"
-            "        if not k.startswith('_') and callable(v) and getattr(v, '__module__', None) == mod.__name__:\n"
-            "            fn = v(**kw); break\n"
-            f"art = tilelang.lower(fn, target='ascend', enable_device_compile={enable_device_compile!r})\n"
-            "assert art.kernel_source\n"
+        driver = build_stage_b_driver_source(
+            cand_path,
+            factory_name=factory_name,
+            factory_kwargs=factory_kwargs,
+            config_selector_name=config_selector_name,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+            dims=dims,
+            enable_device_compile=enable_device_compile,
         )
         try:
             proc = subprocess.run(
@@ -383,6 +648,10 @@ class GateFunnel:
         *,
         factory_name: str | None = None,
         factory_kwargs: Mapping[str, object] | None = None,
+        config_selector_name: str | None = None,
+        pass_configs: dict[str, object] | None = None,
+        compile_flags: Sequence[str] | str | None = None,
+        dims: Mapping[str, object] | None = None,
     ) -> FunnelEvaluation:
         """Run Stage A, Stage B, and Stage C sequentially with early rejection."""
         stage_a = run_stage_a_static(
@@ -390,6 +659,10 @@ class GateFunnel:
             factory_name=factory_name,
             factory_kwargs=factory_kwargs,
             target=self._target,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+            config_selector_name=config_selector_name,
+            dims=dims,
             enable_track_router=self._enable_track_router,
         )
         if not stage_a.passed or stage_a.ledger is None:
@@ -409,6 +682,10 @@ class GateFunnel:
                 dsl_source,
                 factory_name=factory_name,
                 factory_kwargs=factory_kwargs,
+                config_selector_name=config_selector_name,
+                pass_configs=pass_configs,
+                compile_flags=compile_flags,
+                dims=dims,
             )
         if not stage_b.passed:
             return FunnelEvaluation(
@@ -526,6 +803,7 @@ __all__ = [
     "StageAResult",
     "StageBResult",
     "StageCResult",
+    "build_stage_b_driver_source",
     "ledger_to_json",
     "prescreen_dsl_tile_kwargs",
     "run_stage_a_static",

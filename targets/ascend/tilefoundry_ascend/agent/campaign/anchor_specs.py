@@ -96,6 +96,9 @@ class RegimeTargetSpec:
     sample_builder_kwargs: dict[str, object]
     description: str = ""
     representative_hir_dims: dict[str, int] = field(default_factory=dict)
+    config_selector_fn: str = ""
+    editable_symbols: tuple[str, ...] = ()
+    allowed_helper_prefix: str = ""
 
     def to_dict(self) -> dict[str, object]:
         """Serialize regime target specification to a JSON-compatible dictionary."""
@@ -107,6 +110,9 @@ class RegimeTargetSpec:
             "representative_hir_dims": {
                 str(k): int(v) for k, v in self.representative_hir_dims.items()
             },
+            "config_selector_fn": self.config_selector_fn,
+            "editable_symbols": list(self.editable_symbols),
+            "allowed_helper_prefix": self.allowed_helper_prefix,
         }
 
     @classmethod
@@ -124,7 +130,13 @@ class RegimeTargetSpec:
                 if isinstance(raw_dims, Mapping)
                 else {}
             ),
+            config_selector_fn=str(payload.get("config_selector_fn", "")),
+            editable_symbols=tuple(str(x) for x in payload.get("editable_symbols", ())),
+            allowed_helper_prefix=str(payload.get("allowed_helper_prefix", "")),
         )
+
+
+RegimeSpec = RegimeTargetSpec
 
 
 OPERATOR_METADATA: dict[str, tuple[str, str, str]] = {
@@ -199,6 +211,12 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
             },
             description="Small-row decode regime (m_rows < 28) needing depth/width core sharding.",
             representative_hir_dims={"N": 2, "B": 1, "S": 1, "D": 4096},
+            config_selector_fn="_select_ar_small_decode_config",
+            editable_symbols=(
+                "_select_ar_small_decode_config",
+                "_build_ar_small_decode_func",
+            ),
+            allowed_helper_prefix="_ar_small_decode_",
         ),
         RegimeTargetSpec(
             regime_tag="unaligned_d",
@@ -213,8 +231,17 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "tile_m": 1,
                 "schedule_mode": "tuned",
             },
-            description="Non-64-aligned D tail regime enabling padded UB row pitch and multi-row buffering.",
+            description=(
+                "Non-64-aligned D tail regime enabling padded UB row pitch and multi-row "
+                "buffering."
+            ),
             representative_hir_dims={"N": 8, "B": 1, "S": 4, "D": 1000},
+            config_selector_fn="_select_ar_unaligned_config",
+            editable_symbols=(
+                "_select_ar_unaligned_config",
+                "_build_ar_unaligned_func",
+            ),
+            allowed_helper_prefix="_ar_unaligned_",
         ),
         RegimeTargetSpec(
             regime_tag="aligned_prefill",
@@ -231,6 +258,12 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
             },
             description="Aligned prefill regime with 56-core multi-row SimdVF pipelining.",
             representative_hir_dims={"N": 8, "B": 1, "S": 6, "D": 512},
+            config_selector_fn="_select_ar_aligned_config",
+            editable_symbols=(
+                "_select_ar_aligned_config",
+                "_build_ar_aligned_func",
+            ),
+            allowed_helper_prefix="_ar_aligned_",
         ),
     ),
     "mla": (
@@ -241,6 +274,9 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "_build_mla_prim_func",
             ),
             sample_builder_kwargs={
+                "b_dim": 1,
+                "s_dim": 1,
+                "s_kv": 2048,
                 "n_q": 128,
                 "n_kv": 1,
                 "d_nope": 512,
@@ -252,7 +288,9 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "aligned_group_q": True,
                 "schedule_mode": "tuned",
             },
-            description="Decode and small-Sq regime targeting Split-KV FlashDecoding across 28 MixCores.",
+            description=(
+                "Decode and small-Sq regime targeting Split-KV FlashDecoding across 28 MixCores."
+            ),
             representative_hir_dims={
                 "B": 1,
                 "S": 1,
@@ -262,6 +300,13 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "D_nope": 512,
                 "D_rope": 64,
             },
+            config_selector_fn="_select_mla_decode_config",
+            editable_symbols=(
+                "_select_mla_decode_config",
+                "_build_mla_split_kv_decode_func",
+                "_build_mla_split_kv_combine_func",
+            ),
+            allowed_helper_prefix="_mla_decode_",
         ),
         RegimeTargetSpec(
             regime_tag="bnsd_gather",
@@ -291,6 +336,12 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "D_nope": 128,
                 "D_rope": 64,
             },
+            config_selector_fn="_select_mla_bnsd_config",
+            editable_symbols=(
+                "_select_mla_bnsd_config",
+                "_build_mla_bnsd_gather_func",
+            ),
+            allowed_helper_prefix="_mla_bnsd_",
         ),
         RegimeTargetSpec(
             regime_tag="prefill_compute",
@@ -320,6 +371,12 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "D_nope": 128,
                 "D_rope": 64,
             },
+            config_selector_fn="_select_mla_prefill_config",
+            editable_symbols=(
+                "_select_mla_prefill_config",
+                "_build_mla_prefill_func",
+            ),
+            allowed_helper_prefix="_mla_prefill_",
         ),
     ),
 }
@@ -543,6 +600,7 @@ __all__ = [
     "MLA_ANCHORS",
     "OPERATOR_METADATA",
     "PerfTargetSpec",
+    "RegimeSpec",
     "RegimeTargetSpec",
     "append_dynamic_anchor",
     "compute_case_eq3_score",
