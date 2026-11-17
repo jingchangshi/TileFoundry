@@ -10,6 +10,7 @@ from tilefoundry_ascend.agent import (
     AnchorCaseSpec,
     BayesianRuleTracker,
     CampaignConfig,
+    CampaignRoundRecord,
     CandidateSurrogateResult,
     FlywheelDistiller,
     GateFunnel,
@@ -26,6 +27,7 @@ from tilefoundry_ascend.agent import (
 from tilefoundry_ascend.agent.campaign import (
     aggregate_surrogate_result,
     build_anchor_metrics,
+    build_arg_parser,
     compute_case_eq3_score,
     extract_regime_snippet,
     patch_regime_into_module,
@@ -163,10 +165,19 @@ def test_anchor_registry_dynamic_append_and_eq3_scoring(tmp_path: Path) -> None:
 
     ar_target = get_default_perf_target("attention_residual")
     mla_target = get_default_perf_target("mla")
-    assert ar_target.target_avg_speedup == 1.95
-    assert ar_target.target_roofline_eta == 0.78
-    assert mla_target.target_avg_speedup == 0.95
+    assert ar_target.target_avg_speedup == 2.85
+    assert ar_target.target_min_case_speedup == 1.60
+    assert ar_target.target_roofline_eta == 0.90
+    assert ar_target.target_surrogate_score == 97.5
+    assert ar_target.min_optimization_rounds == 3
+    assert mla_target.target_avg_speedup == 2.50
+    assert mla_target.target_min_case_speedup == 1.35
+    assert mla_target.target_roofline_eta == 0.85
+    assert mla_target.target_surrogate_score == 92.0
+    assert mla_target.min_optimization_rounds == 3
     assert mla_target.per_anchor_max_us == {7: 8.0, 13: 95.0}
+    assert PerfTargetSpec.from_dict(ar_target.to_dict()) == ar_target
+    assert PerfTargetSpec.from_dict(mla_target.to_dict()) == mla_target
 
     eq3_ar2 = compute_case_eq3_score(1.5, 2.87, 0.5)
     assert abs(eq3_ar2 - 0.2967359) < 1e-5
@@ -255,7 +266,9 @@ def test_campaign_early_stop_on_goal_met_and_roofline_saturated(tmp_path: Path) 
     runner = PerfTargetCampaignRunner(
         config=CampaignConfig(operator_name="attention_residual", max_rounds=6),
         target_module_path=target_path,
-        perf_target=PerfTargetSpec("attention_residual", 2.0, 1.5, 0.95),
+        perf_target=PerfTargetSpec(
+            "attention_residual", 2.0, 1.5, 0.88, min_optimization_rounds=1
+        ),
         anchors=anchors,
         regime_specs=regimes,
         llm_backend=backend,
@@ -308,7 +321,9 @@ def test_campaign_early_stop_on_goal_met_and_roofline_saturated(tmp_path: Path) 
     runner_sat = PerfTargetCampaignRunner(
         config=CampaignConfig(operator_name="attention_residual", max_rounds=6),
         target_module_path=target_sat,
-        perf_target=PerfTargetSpec("attention_residual", 5.0, 4.0, 0.78),
+        perf_target=PerfTargetSpec(
+            "attention_residual", 5.0, 4.0, 0.78, min_optimization_rounds=1
+        ),
         anchors=anchors,
         regime_specs=regimes,
         llm_backend=backend_sat,
@@ -938,3 +953,273 @@ def _build_regime_a(tile_m=2):
     assert runner._beam.exploit_beam
     assert all(c.track == "unconstrained" for c in runner._beam.exploit_beam)
     assert all(c.features is None for c in runner._beam.exploit_beam)
+
+
+def test_no_round0_premature_stop_and_disable_early_goal_stop(tmp_path: Path) -> None:
+    """Verify baseline meeting target never stops at Round 0 and disable flag runs max_rounds."""
+    anchors = (
+        AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 4.0),
+        AnchorCaseSpec("level4/attention_residual", 4, "regime_b", 20.0, 8.0),
+    )
+    regimes = (
+        RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),
+        RegimeTargetSpec("regime_b", ("_build_regime_b",), {}),
+    )
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+
+    def _l2_already_fast(cands, active_anchors):
+        return {
+            cid: _make_surrogate_result(
+                cid, "attention_residual", tuple(active_anchors), {2: 4.1, 4: 8.2}
+            )
+            for cid, _mod_path in cands
+        }
+
+    strong_target = PerfTargetSpec(
+        "attention_residual",
+        2.0,
+        1.5,
+        0.90,
+        target_surrogate_score=95.0,
+        min_optimization_rounds=3,
+    )
+    baseline_res = _l2_already_fast([("base", target_path)], anchors)["base"]
+    assert baseline_res.meets_perf_target(strong_target) is True
+    assert baseline_res.is_roofline_saturated(strong_target) is True
+
+    backend_min_rounds = MockLLMBackend(
+        responses={
+            "exploit_rule": [_IMPROVED_REGIME_A, _IMPROVED_REGIME_B] * 4,
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Keep optimizing",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": _IMPROVED_REGIME_A,
+                    }
+                )
+            ]
+            * 6,
+        }
+    )
+    runner_min_rounds = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="attention_residual", max_rounds=5),
+        target_module_path=target_path,
+        perf_target=strong_target,
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend_min_rounds,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_already_fast,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        checkpoint_path=tmp_path / "ckpt_min_rounds.json",
+    )
+    rep_min = asyncio.run(runner_min_rounds.run())
+    assert rep_min.total_rounds == 3
+    assert rep_min.stop_reason == "goal_met"
+
+    target_full = tmp_path / "kernels_full.py"
+    target_full.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    backend_full = MockLLMBackend(
+        responses={
+            "exploit_rule": [_IMPROVED_REGIME_A, _IMPROVED_REGIME_B] * 6,
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Run full max_rounds",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": _IMPROVED_REGIME_A,
+                    }
+                )
+            ]
+            * 8,
+        }
+    )
+    runner_full = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=4,
+            disable_early_goal_stop=True,
+        ),
+        target_module_path=target_full,
+        perf_target=strong_target,
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend_full,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_already_fast,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        checkpoint_path=tmp_path / "ckpt_full.json",
+    )
+    rep_full = asyncio.run(runner_full.run())
+    assert rep_full.total_rounds == 4
+    assert rep_full.stop_reason == "budget_exhausted"
+
+
+def test_surrogate_dual_criterion_tail_guard_and_meets_perf_target(tmp_path: Path) -> None:
+    """Verify 4-metric target check, tail guard rejection, and dual-criterion L3 promotion."""
+    anchors = (
+        AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 2.0),
+        AnchorCaseSpec("level4/attention_residual", 4, "regime_b", 1000.0, 200.0),
+    )
+    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),)
+
+    strict_spec = PerfTargetSpec(
+        "attention_residual",
+        target_avg_speedup=1.5,
+        target_min_case_speedup=1.2,
+        target_roofline_eta=0.5,
+        target_surrogate_score=80.0,
+        per_anchor_max_us={4: 700.0},
+    )
+    low_score = _make_surrogate_result("low_score", "attention_residual", anchors, {2: 4.0, 4: 650.0})
+    assert low_score.avg_speedup > 1.5
+    assert low_score.min_case_speedup > 1.2
+    assert low_score.avg_roofline_eta < 0.5 or low_score.surrogate_score < 80.0
+    assert low_score.meets_perf_target(strict_spec) is False
+
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+
+    small_inflate_dsl = _IMPROVED_REGIME_A
+    bottleneck_fix_dsl = _SSBUF_REGIME_A
+
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [
+                small_inflate_dsl,
+                small_inflate_dsl,
+                bottleneck_fix_dsl,
+                bottleneck_fix_dsl,
+            ],
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Inflate small anchor only",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": small_inflate_dsl,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Fix large bottleneck anchor",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": bottleneck_fix_dsl,
+                    }
+                ),
+            ],
+        }
+    )
+
+    def _l2_eval(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            if "T.alloc_ss" in src:
+                lats = {2: 10.0, 4: 500.0}
+            elif "T.Kernel(2)" in src:
+                lats = {2: 2.0, 4: 1050.0}
+            else:
+                lats = {2: 10.0, 4: 1000.0}
+            out[cid] = _make_surrogate_result(
+                cid, "attention_residual", tuple(active_anchors), lats
+            )
+        return out
+
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=2,
+            k_rule_workers=0,
+            min_surrogate_gain=0.25,
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec(
+            "attention_residual", 5.0, 5.0, 0.95, target_surrogate_score=99.0
+        ),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_eval,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        checkpoint_path=tmp_path / "ckpt_dual.json",
+    )
+    report = asyncio.run(runner.run())
+    assert report.promoted_rounds == (2,)
+    assert report.rounds[0].promoted is False
+    assert report.rounds[1].promoted is True
+    assert report.rounds[1].best_so_far_surrogate_score > report.baseline_result.surrogate_score
+    assert "T.alloc_ss" in target_path.read_text(encoding="utf-8")
+
+    restored_rec = CampaignRoundRecord.from_dict(
+        {
+            "round_idx": 1,
+            "regime_tag": "regime_a",
+            "builder_name": "_build_regime_a",
+            "parent_lane": "exploit",
+            "creative_effort": "high",
+            "l0_l1_passed_ids": ["c0"],
+            "l0_l1_failed": [],
+            "best_round_speedup": 1.1,
+            "best_so_far_speedup": 1.1,
+            "promoted": False,
+            "rolled_back_l3": False,
+            "stagnation_rounds_after": 1,
+        }
+    )
+    assert restored_rec.best_round_surrogate_score == 0.0
+    assert restored_rec.best_so_far_surrogate_score == 0.0
+
+
+def test_campaign_runner_cli_arg_parser() -> None:
+    """Verify campaign_runner CLI parser supports disable flag and campaign options."""
+    parser = build_arg_parser()
+    parsed = parser.parse_args(
+        [
+            "--operator",
+            "mla",
+            "--max-rounds",
+            "6",
+            "--max-wall-clock-min",
+            "45",
+            "--device-id",
+            "2",
+            "--disable-early-goal-stop",
+            "--min-surrogate-gain",
+            "0.5",
+            "--checkpoint",
+            "ckpt.json",
+            "--report-json",
+            "report.json",
+            "--run-final-l4",
+            "--resume",
+            "--k-rule-workers",
+            "3",
+            "--source-root",
+            ".",
+            "--env-file",
+            "env.sh",
+        ]
+    )
+    assert parsed.operator == "mla"
+    assert parsed.max_rounds == 6
+    assert parsed.max_wall_clock_min == 45.0
+    assert parsed.device_id == "2"
+    assert parsed.disable_early_goal_stop is True
+    assert parsed.min_surrogate_gain == 0.5
+    assert parsed.checkpoint == "ckpt.json"
+    assert parsed.report_json == "report.json"
+    assert parsed.run_final_l4 is True
+    assert parsed.resume is True
+    assert parsed.k_rule_workers == 3
+    assert parsed.source_root == "."
+    assert parsed.env_file == "env.sh"
+
+    defaults = parser.parse_args(["--operator", "attention_residual"])
+    assert defaults.disable_early_goal_stop is False
+    assert defaults.min_surrogate_gain == 0.25

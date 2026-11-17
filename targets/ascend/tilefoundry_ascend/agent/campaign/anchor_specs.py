@@ -52,6 +52,8 @@ class PerfTargetSpec:
     target_min_case_speedup: float
     target_roofline_eta: float
     per_anchor_max_us: dict[int, float] = field(default_factory=dict)
+    target_surrogate_score: float = 90.0
+    min_optimization_rounds: int = 3
 
     def to_dict(self) -> dict[str, object]:
         """Serialize target thresholds to a JSON-compatible dictionary."""
@@ -60,8 +62,29 @@ class PerfTargetSpec:
             "target_avg_speedup": self.target_avg_speedup,
             "target_min_case_speedup": self.target_min_case_speedup,
             "target_roofline_eta": self.target_roofline_eta,
+            "target_surrogate_score": self.target_surrogate_score,
+            "min_optimization_rounds": self.min_optimization_rounds,
             "per_anchor_max_us": {str(k): v for k, v in sorted(self.per_anchor_max_us.items())},
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> PerfTargetSpec:
+        """Reconstruct PerfTargetSpec from a JSON mapping."""
+        raw_max = payload.get("per_anchor_max_us") or {}
+        per_anchor = (
+            {int(k): float(v) for k, v in raw_max.items()}
+            if isinstance(raw_max, Mapping)
+            else {}
+        )
+        return cls(
+            operator_name=str(payload["operator_name"]),
+            target_avg_speedup=float(payload["target_avg_speedup"]),
+            target_min_case_speedup=float(payload["target_min_case_speedup"]),
+            target_roofline_eta=float(payload["target_roofline_eta"]),
+            per_anchor_max_us=per_anchor,
+            target_surrogate_score=float(payload.get("target_surrogate_score", 90.0)),
+            min_optimization_rounds=int(payload.get("min_optimization_rounds", 3)),
+        )
 
 
 @dataclass(frozen=True)
@@ -141,16 +164,20 @@ DEFAULT_ANCHORS: dict[str, tuple[AnchorCaseSpec, ...]] = {
 DEFAULT_PERF_TARGETS: dict[str, PerfTargetSpec] = {
     "attention_residual": PerfTargetSpec(
         operator_name="attention_residual",
-        target_avg_speedup=1.95,
-        target_min_case_speedup=0.90,
-        target_roofline_eta=0.78,
+        target_avg_speedup=2.85,
+        target_min_case_speedup=1.60,
+        target_roofline_eta=0.90,
+        target_surrogate_score=97.5,
+        min_optimization_rounds=3,
         per_anchor_max_us={},
     ),
     "mla": PerfTargetSpec(
         operator_name="mla",
-        target_avg_speedup=0.95,
-        target_min_case_speedup=0.45,
-        target_roofline_eta=0.45,
+        target_avg_speedup=2.50,
+        target_min_case_speedup=1.35,
+        target_roofline_eta=0.85,
+        target_surrogate_score=92.0,
+        min_optimization_rounds=3,
         per_anchor_max_us={7: 8.0, 13: 95.0},
     ),
 }

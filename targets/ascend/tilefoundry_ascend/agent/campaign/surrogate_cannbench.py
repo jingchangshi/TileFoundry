@@ -109,12 +109,16 @@ class CandidateSurrogateResult:
         return sum(max(0.0, 1.0 - a.roofline_eta) for a in matched) / len(matched)
 
     def meets_perf_target(self, spec: PerfTargetSpec) -> bool:
-        """Return True iff all accuracy, speedup, and per-anchor latency limits pass."""
+        """Return True iff accuracy, score, speedup, eta, and latency limits pass."""
         if not self.all_passed or not self.anchors:
+            return False
+        if self.surrogate_score < spec.target_surrogate_score:
             return False
         if self.avg_speedup < spec.target_avg_speedup:
             return False
         if self.min_case_speedup < spec.target_min_case_speedup:
+            return False
+        if self.avg_roofline_eta < spec.target_roofline_eta:
             return False
         by_case = {a.case_num: a for a in self.anchors}
         for case_num, max_us in spec.per_anchor_max_us.items():

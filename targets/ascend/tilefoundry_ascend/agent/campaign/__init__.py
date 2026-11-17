@@ -24,7 +24,9 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignReport,
     CampaignRoundRecord,
     PerfTargetCampaignRunner,
+    build_arg_parser,
     extract_regime_snippet,
+    main,
     patch_regime_into_module,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
@@ -68,6 +70,7 @@ __all__ = [
     "aggregate_surrogate_result",
     "append_dynamic_anchor",
     "build_anchor_metrics",
+    "build_arg_parser",
     "compute_case_eq3_score",
     "ensure_npu_compare_shim_dir",
     "extract_regime_snippet",
@@ -75,6 +78,7 @@ __all__ = [
     "get_default_perf_target",
     "get_default_regime_specs",
     "load_anchor_harness_and_cases",
+    "main",
     "patch_regime_into_module",
     "prewarm_anchor_reference_cache",
     "prewarm_surrogate_tilelang_cache",

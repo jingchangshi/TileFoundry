@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 import ast
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -42,6 +44,7 @@ from tilefoundry_ascend.agent.kb.schema import (
     load_seed_rules,
 )
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    GateFunnel,
     StageAResult,
     StageBResult,
     run_stage_a_static,
@@ -88,9 +91,11 @@ class CampaignConfig:
     k_rule_workers: int = 2
     max_syntax_repairs: int = 1
     min_l2_gain_for_l3: float = 0.015
+    min_surrogate_gain: float = 0.25
     min_flywheel_gain: float = 0.03
     stagnation_escalate_rounds: int = 2
     stagnation_freeze_rounds: int = 4
+    disable_early_goal_stop: bool = False
     run_final_l4: bool = False
     l4_regression_ratio: float = 0.95
     device_id: str = "1"
@@ -115,6 +120,8 @@ class CampaignRoundRecord:
     rolled_back_l3: bool
     stagnation_rounds_after: int
     admitted_rule_ids: tuple[str, ...] = ()
+    best_round_surrogate_score: float = 0.0
+    best_so_far_surrogate_score: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         """Serialize CampaignRoundRecord into a JSON-compatible dictionary."""
@@ -128,6 +135,8 @@ class CampaignRoundRecord:
             "l0_l1_failed": [list(item) for item in self.l0_l1_failed],
             "best_round_speedup": round(self.best_round_speedup, 6),
             "best_so_far_speedup": round(self.best_so_far_speedup, 6),
+            "best_round_surrogate_score": round(self.best_round_surrogate_score, 6),
+            "best_so_far_surrogate_score": round(self.best_so_far_surrogate_score, 6),
             "promoted": self.promoted,
             "rolled_back_l3": self.rolled_back_l3,
             "stagnation_rounds_after": self.stagnation_rounds_after,
@@ -157,6 +166,8 @@ class CampaignRoundRecord:
             rolled_back_l3=bool(payload["rolled_back_l3"]),
             stagnation_rounds_after=int(payload["stagnation_rounds_after"]),
             admitted_rule_ids=tuple(str(x) for x in payload.get("admitted_rule_ids", ())),
+            best_round_surrogate_score=float(payload.get("best_round_surrogate_score", 0.0)),
+            best_so_far_surrogate_score=float(payload.get("best_so_far_surrogate_score", 0.0)),
         )
 
 
@@ -280,6 +291,10 @@ def patch_regime_into_module(
     patched = "".join([*orig_lines[: o_start - 1], replacement, *orig_lines[o_end:]])
     ast.parse(patched)
     return patched
+
+
+def _surrogate_rank_key(res: CandidateSurrogateResult) -> tuple[float, float, float]:
+    return (res.surrogate_score, res.min_case_speedup, res.avg_speedup)
 
 
 def _fallback_ledger() -> ObjectivePhysicalLedger:
@@ -537,12 +552,19 @@ class PerfTargetCampaignRunner:
                 return False
         return True
 
+    def _allow_early_stop(self, rounds_completed: int) -> bool:
+        if self._config.disable_early_goal_stop:
+            return False
+        return rounds_completed > 0 and rounds_completed >= self._perf_target.min_optimization_rounds
+
     def _select_active_regime(
         self,
         current_regime: str | None,
         frozen_regimes: set[str],
         best_result: CandidateSurrogateResult,
         active_anchors: Sequence[AnchorCaseSpec],
+        *,
+        allow_satisfied_fallback: bool = False,
     ) -> RegimeTargetSpec | None:
         by_tag = {r.regime_tag: r for r in self._regime_specs}
         if current_regime and current_regime not in frozen_regimes and current_regime in by_tag:
@@ -556,6 +578,12 @@ class PerfTargetCampaignRunner:
             if spec.regime_tag not in frozen_regimes
             and not self._is_regime_satisfied(spec, best_result, active_anchors)
         ]
+        if not candidates and allow_satisfied_fallback:
+            if current_regime and current_regime not in frozen_regimes and current_regime in by_tag:
+                return by_tag[current_regime]
+            candidates = [
+                spec for spec in self._regime_specs if spec.regime_tag not in frozen_regimes
+            ]
         if not candidates:
             return None
         candidates.sort(
@@ -1048,15 +1076,18 @@ class PerfTargetCampaignRunner:
                 )
             )
             if rule is not None:
-                speed_gain = (
-                    (res.avg_speedup - best_result.avg_speedup) / max(best_result.avg_speedup, 1e-6)
+                surrogate_gain = (
+                    (res.surrogate_score - best_result.surrogate_score)
                     if res.all_passed
                     else 0.0
                 )
+                realized = res.all_passed and _surrogate_rank_key(res) > _surrogate_rank_key(
+                    best_result
+                )
                 self._tracker.record_outcome(
                     rule.rule_id,
-                    postcondition_realized=res.all_passed and speed_gain > 0.0,
-                    speed_gain=max(0.0, speed_gain),
+                    postcondition_realized=realized,
+                    speed_gain=max(0.0, surrogate_gain),
                 )
             if res.all_passed:
                 passing_candidates.append((chk, res))
@@ -1064,6 +1095,7 @@ class PerfTargetCampaignRunner:
         self._beam.update(beam_updates)
 
         best_round_speedup = best_result.avg_speedup
+        best_round_surrogate_score = best_result.surrogate_score
         promoted = False
         rolled_back_l3 = False
         new_incumbent = incumbent_source
@@ -1073,14 +1105,21 @@ class PerfTargetCampaignRunner:
         if passing_candidates:
             top_chk, top_res = max(
                 passing_candidates,
-                key=lambda item: (item[1].avg_speedup, item[1].surrogate_score),
+                key=lambda item: _surrogate_rank_key(item[1]),
             )
             best_round_speedup = top_res.avg_speedup
+            best_round_surrogate_score = top_res.surrogate_score
+            surrogate_gain = top_res.surrogate_score - best_result.surrogate_score
             rel_gain = (
                 (top_res.avg_speedup - best_result.avg_speedup)
                 / max(best_result.avg_speedup, 1e-6)
             )
-            if rel_gain >= self._config.min_l2_gain_for_l3:
+            tail_guard_ok = top_res.min_case_speedup >= 0.97 * best_result.min_case_speedup
+            dual_criterion_ok = surrogate_gain >= self._config.min_surrogate_gain or (
+                top_res.min_case_speedup >= 1.03 * best_result.min_case_speedup
+                and top_res.surrogate_score >= best_result.surrogate_score - 1e-6
+            )
+            if tail_guard_ok and dual_criterion_ok:
                 _atomic_write_text(self._target_module_path, top_chk.patched_module_source)
                 l3_res = self._run_l3_contract(self._target_module_path)
                 if l3_res.passed:
@@ -1127,6 +1166,8 @@ class PerfTargetCampaignRunner:
             rolled_back_l3=rolled_back_l3,
             stagnation_rounds_after=stagnation_after,
             admitted_rule_ids=tuple(round_admitted),
+            best_round_surrogate_score=best_round_surrogate_score,
+            best_so_far_surrogate_score=new_best.surrogate_score,
         )
         return (
             record,
@@ -1187,10 +1228,11 @@ class PerfTargetCampaignRunner:
             )
 
         stop_reason = ""
-        if best_result.meets_perf_target(self._perf_target):
-            stop_reason = "goal_met"
-        elif best_result.is_roofline_saturated(self._perf_target):
-            stop_reason = "roofline_saturated"
+        if self._allow_early_stop(len(rounds)):
+            if best_result.meets_perf_target(self._perf_target):
+                stop_reason = "goal_met"
+            elif best_result.is_roofline_saturated(self._perf_target):
+                stop_reason = "roofline_saturated"
 
         start_round = (rounds[-1].round_idx + 1) if rounds else 1
         budget_sec = self._config.max_wall_clock_min * 60.0
@@ -1212,6 +1254,7 @@ class PerfTargetCampaignRunner:
                 frozen_regimes,
                 best_result,
                 active_anchors,
+                allow_satisfied_fallback=not self._allow_early_stop(len(rounds)),
             )
             if active_regime is None:
                 stop_reason = "all_regimes_converged"
@@ -1243,16 +1286,21 @@ class PerfTargetCampaignRunner:
             if escalated:
                 escalated_rounds.append(round_idx)
 
-            if best_result.meets_perf_target(self._perf_target):
+            early_stop_allowed = self._allow_early_stop(len(rounds))
+            if early_stop_allowed and best_result.meets_perf_target(self._perf_target):
                 stop_reason = "goal_met"
-            elif best_result.is_roofline_saturated(self._perf_target):
+            elif early_stop_allowed and best_result.is_roofline_saturated(self._perf_target):
                 stop_reason = "roofline_saturated"
             elif stagnation_rounds >= self._config.stagnation_freeze_rounds:
                 frozen_regimes.add(active_regime.regime_tag)
                 stagnation_rounds = 0
                 current_regime = None
                 next_reg = self._select_active_regime(
-                    None, frozen_regimes, best_result, active_anchors
+                    None,
+                    frozen_regimes,
+                    best_result,
+                    active_anchors,
+                    allow_satisfied_fallback=not early_stop_allowed,
                 )
                 if next_reg is None:
                     stop_reason = "all_regimes_converged"
@@ -1362,11 +1410,87 @@ class PerfTargetCampaignRunner:
         )
 
 
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Construct CLI parser for PerfTargetCampaignRunner."""
+    parser = argparse.ArgumentParser(
+        prog="tilefoundry-ascend-campaign-runner",
+        description="Run unattended performance optimization campaigns.",
+    )
+    parser.add_argument(
+        "--operator",
+        required=True,
+        choices=("attention_residual", "mla"),
+        help="Target production operator to optimize.",
+    )
+    parser.add_argument("--max-rounds", type=int, default=12)
+    parser.add_argument("--max-wall-clock-min", type=float, default=180.0)
+    parser.add_argument("--device-id", default="1", help="Authorized NPU device ID.")
+    parser.add_argument(
+        "--disable-early-goal-stop",
+        action="store_true",
+        help="Continue optimizing through max-rounds even after target thresholds pass.",
+    )
+    parser.add_argument(
+        "--min-surrogate-gain",
+        type=float,
+        default=0.25,
+        help="Minimum surrogate_score gain on [0, 100] scale required for L3 promotion.",
+    )
+    parser.add_argument("--checkpoint", default=None, help="Atomic checkpoint JSON path.")
+    parser.add_argument("--report-json", default=None, help="Optional final report JSON path.")
+    parser.add_argument("--run-final-l4", action="store_true", help="Run final official L4 gate.")
+    parser.add_argument("--resume", action="store_true", help="Resume from existing checkpoint.")
+    parser.add_argument("--k-rule-workers", type=int, default=2)
+    parser.add_argument("--source-root", default=None, help="TileFoundry workspace root.")
+    parser.add_argument("--env-file", default=None, help="Path to tilefoundry-npu env.sh.")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Execute PerfTargetCampaignRunner from CLI arguments and emit JSON summary."""
+    args = build_arg_parser().parse_args(list(argv) if argv is not None else None)
+    cfg = CampaignConfig(
+        operator_name=args.operator,
+        max_rounds=args.max_rounds,
+        max_wall_clock_min=args.max_wall_clock_min,
+        k_rule_workers=args.k_rule_workers,
+        min_surrogate_gain=args.min_surrogate_gain,
+        disable_early_goal_stop=bool(args.disable_early_goal_stop),
+        run_final_l4=bool(args.run_final_l4),
+        device_id=str(args.device_id),
+    )
+    tracker = BayesianRuleTracker.from_seed_yaml()
+    flywheel = FlywheelDistiller(
+        funnel=GateFunnel(skip_stage_b=True),
+        tracker=tracker,
+    )
+    runner = PerfTargetCampaignRunner(
+        config=cfg,
+        tracker=tracker,
+        flywheel_distiller=flywheel,
+        checkpoint_path=args.checkpoint,
+        source_root=args.source_root,
+        env_file=args.env_file,
+    )
+    report = asyncio.run(runner.run(resume=bool(args.resume)))
+    rendered = json.dumps(report.to_dict(), indent=2)
+    if args.report_json:
+        _atomic_write_text(Path(args.report_json), rendered + "\n")
+    print(rendered)
+    return 0
+
+
 __all__ = [
     "CampaignConfig",
     "CampaignReport",
     "CampaignRoundRecord",
     "PerfTargetCampaignRunner",
+    "build_arg_parser",
     "extract_regime_snippet",
+    "main",
     "patch_regime_into_module",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
