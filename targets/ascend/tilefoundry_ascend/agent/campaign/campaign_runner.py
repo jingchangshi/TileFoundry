@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import hashlib
 import importlib.util
 import inspect
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -28,12 +30,16 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     get_default_perf_target,
     get_default_regime_specs,
     get_operator_module_relpath,
+    lookup_case_dims,
+    resolve_regime_for_case,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     CandidateSurrogateResult,
     L0L1CandidateCheck,
     L3AcceptanceResult,
     L4CannbenchResult,
+    bottleneck_anchor_for_regime,
+    collect_bottleneck_msprof_via_agent_gates,
     run_l0_l1_round_filter,
     run_l1_compile_check,
     run_l3_full_contract_via_agent_gates,
@@ -69,6 +75,7 @@ from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
 )
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate,
+    StaticDynamicResidual,
     TwoLaneBeamSearch,
     compute_static_dynamic_residual,
     extract_structural_signature,
@@ -83,6 +90,8 @@ from tilefoundry_ascend.ascend.passes.physical_ledger import (
     build_objective_physical_ledger,
 )
 from tilefoundry_ascend.ascend.target import AscendTarget
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -126,6 +135,7 @@ class CampaignRoundRecord:
     admitted_rule_ids: tuple[str, ...] = ()
     best_round_surrogate_score: float = 0.0
     best_so_far_surrogate_score: float = 0.0
+    pruned_rule_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """Serialize CampaignRoundRecord into a JSON-compatible dictionary."""
@@ -145,6 +155,7 @@ class CampaignRoundRecord:
             "rolled_back_l3": self.rolled_back_l3,
             "stagnation_rounds_after": self.stagnation_rounds_after,
             "admitted_rule_ids": list(self.admitted_rule_ids),
+            "pruned_rule_ids": list(self.pruned_rule_ids),
         }
 
     @classmethod
@@ -172,6 +183,7 @@ class CampaignRoundRecord:
             admitted_rule_ids=tuple(str(x) for x in payload.get("admitted_rule_ids", ())),
             best_round_surrogate_score=float(payload.get("best_round_surrogate_score", 0.0)),
             best_so_far_surrogate_score=float(payload.get("best_so_far_surrogate_score", 0.0)),
+            pruned_rule_ids=tuple(str(x) for x in payload.get("pruned_rule_ids", ())),
         )
 
 
@@ -708,6 +720,11 @@ class PerfTargetCampaignRunner:
         | None = None,
         l3_contract_runner: Callable[[Path], L3AcceptanceResult] | None = None,
         l4_cannbench_runner: Callable[[Path], L4CannbenchResult] | None = None,
+        msprof_collector: Callable[
+            [str, str, Sequence[AnchorCaseSpec]],
+            Mapping[str, Mapping[str, float]],
+        ]
+        | None = None,
         checkpoint_path: str | Path | None = None,
         campaign_kb_path: str | Path | None = None,
         source_root: str | Path | None = None,
@@ -741,13 +758,51 @@ class PerfTargetCampaignRunner:
         self._cannbench_repo = Path(cannbench_repo).resolve() if cannbench_repo is not None else None
         self._backend = llm_backend
         self._tracker = tracker or BayesianRuleTracker.from_seed_yaml()
-        self._beam = beam or TwoLaneBeamSearch()
+        base_ew = beam.exploit_width if beam is not None else 2
+        base_sw = beam.stepping_stone_width if beam is not None else 2
+        self._beam_widths = (base_ew, base_sw)
+        self._beams: dict[str, TwoLaneBeamSearch] = {}
+        for idx, rspec in enumerate(self._regime_specs):
+            if idx == 0 and beam is not None:
+                self._beams[rspec.regime_tag] = beam
+            else:
+                self._beams[rspec.regime_tag] = TwoLaneBeamSearch(
+                    exploit_width=base_ew,
+                    stepping_stone_width=base_sw,
+                )
+        self._active_regime_tag: str | None = (
+            self._regime_specs[0].regime_tag if self._regime_specs else None
+        )
+        self._fallback_beam = (
+            beam
+            if (beam is not None and not self._regime_specs)
+            else TwoLaneBeamSearch(exploit_width=base_ew, stepping_stone_width=base_sw)
+        )
         self._flywheel = flywheel_distiller
         self._l0_checker = l0_checker
         self._l1_compiler = l1_compiler
         self._l2_batch_evaluator = l2_batch_evaluator
         self._l3_contract_runner = l3_contract_runner
         self._l4_cannbench_runner = l4_cannbench_runner
+        if msprof_collector is not None:
+            self._msprof_collector: (
+                Callable[[str, str, Sequence[AnchorCaseSpec]], Mapping[str, Mapping[str, float]]]
+                | None
+            ) = msprof_collector
+        elif l2_batch_evaluator is None:
+            self._msprof_collector = (
+                lambda op_name, cand_path, anc_seq: collect_bottleneck_msprof_via_agent_gates(
+                    op_name,
+                    cand_path,
+                    anc_seq,
+                    source_root=self._source_root,
+                    env_file=self._env_file,
+                    device_id=self._config.device_id,
+                )
+            )
+        else:
+            self._msprof_collector = None
+        self._msprof_cache: dict[tuple[str, str], dict[str, float]] = {}
         self._checkpoint_path = Path(checkpoint_path).resolve() if checkpoint_path else None
         self._campaign_kb_path = Path(campaign_kb_path).resolve() if campaign_kb_path else None
         self._enable_track_router = bool(enable_track_router)
@@ -769,6 +824,99 @@ class PerfTargetCampaignRunner:
         self._regime_nav_packets: dict[str, HirTirNavigationPacket] = (
             self._compile_regime_nav_packets()
         )
+
+    @property
+    def _beam(self) -> TwoLaneBeamSearch:
+        if self._active_regime_tag and self._active_regime_tag in self._beams:
+            return self._beams[self._active_regime_tag]
+        if self._beams:
+            return next(iter(self._beams.values()))
+        return self._fallback_beam
+
+    def beam_for_regime(self, regime_tag: str) -> TwoLaneBeamSearch:
+        """Return the isolated TwoLaneBeamSearch instance for regime_tag."""
+        if regime_tag not in self._beams:
+            ew, sw = self._beam_widths
+            self._beams[regime_tag] = TwoLaneBeamSearch(
+                exploit_width=ew,
+                stepping_stone_width=sw,
+            )
+        return self._beams[regime_tag]
+
+    @staticmethod
+    def _source_sha256(source: str) -> str:
+        return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+    def _derive_paradigm(self, ledger: ObjectivePhysicalLedger | None) -> str:
+        if ledger is not None and (
+            ledger.pipe_cycles.get("AIC.PIPE_M", 0) > 0
+            or ledger.pipe_cycles.get("AIC.CUBE", 0) > 0
+        ):
+            return "cv_coupled"
+        if self._config.operator_name == "mla":
+            return "cv_coupled"
+        return "pure_vector"
+
+    def _collect_msprof_for_regimes(
+        self,
+        source: str,
+        result: CandidateSurrogateResult,
+        active_anchors: Sequence[AnchorCaseSpec],
+        target_regimes: Sequence[RegimeTargetSpec],
+    ) -> None:
+        if self._msprof_collector is None:
+            return
+        sha = self._source_sha256(source)
+        by_case_and_tag = {(int(a.case_num), a.regime_tag): a for a in active_anchors}
+        by_case = {int(a.case_num): a for a in active_anchors}
+        anchors_to_collect: list[AnchorCaseSpec] = []
+        for rspec in target_regimes:
+            if (sha, rspec.regime_tag) in self._msprof_cache:
+                continue
+            bn = bottleneck_anchor_for_regime(result, rspec.regime_tag)
+            if bn is None:
+                continue
+            spec = by_case_and_tag.get((int(bn.case_num), rspec.regime_tag)) or by_case.get(
+                int(bn.case_num)
+            )
+            if spec is None:
+                continue
+            if spec.regime_tag != rspec.regime_tag:
+                spec = AnchorCaseSpec(
+                    spec.task,
+                    spec.case_num,
+                    rspec.regime_tag,
+                    spec.ref_perf_us,
+                    spec.t_hw_us,
+                )
+            anchors_to_collect.append(spec)
+        if not anchors_to_collect:
+            return
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="tf_msprof_cand_") as tmp_dir:
+                cand_path = Path(tmp_dir) / "candidate.py"
+                cand_path.write_text(source, encoding="utf-8")
+                collected = self._msprof_collector(
+                    self._config.operator_name,
+                    str(cand_path),
+                    anchors_to_collect,
+                )
+        except Exception as exc:
+            logger.warning("On-demand msprof collection failed: %s", exc)
+            return
+
+        if isinstance(collected, Mapping):
+            for tag, raw_metrics in collected.items():
+                if not isinstance(raw_metrics, Mapping):
+                    continue
+                clean = {
+                    str(k): float(v)
+                    for k, v in raw_metrics.items()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                }
+                if clean:
+                    self._msprof_cache[(sha, str(tag))] = clean
 
     def _compile_regime_nav_packets(self) -> dict[str, HirTirNavigationPacket]:
         if self._authored_hir_path is None or not self._authored_hir_path.is_file():
@@ -793,7 +941,12 @@ class PerfTargetCampaignRunner:
                     anchor_dims=regime_spec.representative_hir_dims,
                     target=self._target,
                 )
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "Failed to compile HIR navigation packet for regime %s: %s",
+                    regime_spec.regime_tag,
+                    exc,
+                )
                 continue
         return packets
 
@@ -978,6 +1131,26 @@ class PerfTargetCampaignRunner:
             "public entrypoints or symbols from other regimes"
         )
 
+    @staticmethod
+    def _format_msprof_section(residual: StaticDynamicResidual | None) -> str:
+        if residual is None:
+            return ""
+        if (
+            residual.measured_aic_mac_ratio <= 0.0
+            and residual.measured_aiv_vec_ratio <= 0.0
+            and residual.measured_mte2_wait_ratio <= 0.0
+            and residual.measured_sync_stall_ratio <= 0.0
+        ):
+            return ""
+        return (
+            "### HARDWARE MSPROF TELEMETRY\n"
+            f"aic_mac_ratio: {residual.measured_aic_mac_ratio:.4f}\n"
+            f"aiv_vec_ratio: {residual.measured_aiv_vec_ratio:.4f}\n"
+            f"mte2_wait_ratio: {residual.measured_mte2_wait_ratio:.4f}\n"
+            f"sync_stall_ratio: {residual.measured_sync_stall_ratio:.4f}\n"
+            f"unexplained_gap_ratio: {residual.unexplained_gap_ratio:.4f}\n\n"
+        )
+
     def _build_exploit_regime_request(
         self,
         *,
@@ -988,6 +1161,7 @@ class PerfTargetCampaignRunner:
         best_result: CandidateSurrogateResult,
         nav_packet: HirTirNavigationPacket | None = None,
         parent_ledger: ObjectivePhysicalLedger | None = None,
+        parent_residual: StaticDynamicResidual | None = None,
         track: str = "unconstrained",
     ) -> GenerationRequest:
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
@@ -1010,6 +1184,7 @@ class PerfTargetCampaignRunner:
             nav_section = f"{nav_text}\n\n"
         else:
             nav_section = ""
+        msprof_section = self._format_msprof_section(parent_residual)
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
             f"{track_section}"
@@ -1019,6 +1194,7 @@ class PerfTargetCampaignRunner:
             f"Precondition: {rule.precondition}\n"
             f"Transform Template:\n{rule.transform_template.strip()}\n"
             f"Expected Postcondition: {rule.expected_postcondition}\n\n"
+            f"{msprof_section}"
             f"### SURROGATE ANCHOR TELEMETRY\n"
             f"{_format_anchor_telemetry(best_result, regime_spec.regime_tag)}\n\n"
             f"### TARGET FUNCTION SNIPPET\n```python\n{snippet_source}\n```\n"
@@ -1044,6 +1220,7 @@ class PerfTargetCampaignRunner:
         prescreen_summary: str = "",
         nav_packet: HirTirNavigationPacket | None = None,
         parent_ledger: ObjectivePhysicalLedger | None = None,
+        parent_residual: StaticDynamicResidual | None = None,
         track: str = "unconstrained",
     ) -> GenerationRequest:
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
@@ -1084,6 +1261,7 @@ class PerfTargetCampaignRunner:
             if prescreen_summary
             else ""
         )
+        msprof_section = self._format_msprof_section(parent_residual)
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
             f"{track_section}"
@@ -1091,6 +1269,7 @@ class PerfTargetCampaignRunner:
             f"{focus_section}"
             f"{neg_section}"
             f"{prescreen_section}"
+            f"{msprof_section}"
             f"### SURROGATE ANCHOR TELEMETRY\n"
             f"{_format_anchor_telemetry(best_result, regime_spec.regime_tag)}\n\n"
             f"### TARGET FUNCTION SNIPPET\n```python\n{snippet_source}\n```\n"
@@ -1154,6 +1333,11 @@ class PerfTargetCampaignRunner:
             "admitted_rule_ids": list(admitted_rule_ids),
             "tracker_state": self._tracker.to_dict(),
             "beam_state": self._beam.to_dict(),
+            "beam_states": {tag: b.to_dict() for tag, b in sorted(self._beams.items())},
+            "msprof_cache": {
+                f"{sha}:{tag}": dict(metrics)
+                for (sha, tag), metrics in sorted(self._msprof_cache.items())
+            },
             "stop_reason": stop_reason,
             "l4_result": l4_result.to_dict() if l4_result else None,
         }
@@ -1186,19 +1370,32 @@ class PerfTargetCampaignRunner:
             for rule in load_seed_rules(self._campaign_kb_path):
                 self._tracker.admit_rule(rule)
         if isinstance(payload.get("tracker_state"), Mapping):
-            saved_posteriors = payload["tracker_state"].get("posteriors", {})
-            if isinstance(saved_posteriors, Mapping):
-                tmp_path = self._checkpoint_path.with_suffix(".tracker.tmp")
-                tmp_path.write_text(
-                    json.dumps({"posteriors": saved_posteriors}),
-                    encoding="utf-8",
-                )
-                try:
-                    self._tracker.load_posteriors_json(tmp_path)
-                finally:
-                    tmp_path.unlink(missing_ok=True)
-        if isinstance(payload.get("beam_state"), Mapping):
-            self._beam = TwoLaneBeamSearch.from_dict(payload["beam_state"])
+            self._tracker.load_posteriors_dict(payload["tracker_state"])
+        current_regime = payload.get("current_regime")
+        if current_regime and str(current_regime) in self._beams:
+            self._active_regime_tag = str(current_regime)
+        if isinstance(payload.get("beam_states"), Mapping):
+            for tag, raw_beam in payload["beam_states"].items():
+                if isinstance(raw_beam, Mapping):
+                    self._beams[str(tag)] = TwoLaneBeamSearch.from_dict(raw_beam)
+        elif isinstance(payload.get("beam_state"), Mapping):
+            target_tag = self._active_regime_tag or (
+                self._regime_specs[0].regime_tag if self._regime_specs else "default"
+            )
+            self._beams[target_tag] = TwoLaneBeamSearch.from_dict(payload["beam_state"])
+        self._msprof_cache = {}
+        raw_msprof_cache = payload.get("msprof_cache")
+        if isinstance(raw_msprof_cache, Mapping):
+            for raw_key, raw_metrics in raw_msprof_cache.items():
+                key_str = str(raw_key)
+                if ":" not in key_str or not isinstance(raw_metrics, Mapping):
+                    continue
+                sha, tag = key_str.split(":", 1)
+                self._msprof_cache[(sha, tag)] = {
+                    str(k): float(v)
+                    for k, v in raw_metrics.items()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                }
         return (
             incumbent_source,
             CandidateSurrogateResult.from_dict(payload["baseline_result"]),
@@ -1234,6 +1431,8 @@ class PerfTargetCampaignRunner:
         bool,
     ]:
         backend = self._get_backend()
+        self._active_regime_tag = regime_spec.regime_tag
+        regime_beam = self.beam_for_regime(regime_spec.regime_tag)
         func_name, default_snippet = extract_regime_snippet(incumbent_source, regime_spec)
 
         escalated = stagnation_rounds >= self._config.stagnation_escalate_rounds
@@ -1244,16 +1443,21 @@ class PerfTargetCampaignRunner:
         creative_effort = "high"
         if escalated:
             creative_effort = "xhigh"
-            if self._beam.stepping_stone_beam:
-                stone = self._beam.stepping_stone_beam[0]
-                self._beam.mark_parent_selected(stone)
+            if regime_beam.stepping_stone_beam:
+                stone = regime_beam.stepping_stone_beam[0]
+                regime_beam.mark_parent_selected(stone)
                 try:
                     patch_regime_into_module(incumbent_source, regime_spec, stone.dsl_source)
                     parent_snippet = stone.dsl_source
                     parent_lane = "stepping_stone"
                     stone_ledger = stone.ledger
                     stone_track = stone.track
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to patch stepping-stone slice for regime %s: %s",
+                        regime_spec.regime_tag,
+                        exc,
+                    )
                     parent_lane = "stepping_stone"
             else:
                 parent_lane = "stepping_stone"
@@ -1276,20 +1480,39 @@ class PerfTargetCampaignRunner:
             parent_track = "unconstrained"
             parent_features = None
 
-        parent_residual = compute_static_dynamic_residual(
-            parent_ledger,
-            {
-                "dur_us": best_result.mean_latency_us(),
-                "roofline_eta": best_result.avg_roofline_eta,
-            },
-        )
+        regime_best = best_result.for_regime(regime_spec.regime_tag)
+        local_best = regime_best if regime_best.anchors else best_result
+        paradigm = self._derive_paradigm(parent_ledger)
+        if stagnation_rounds >= 1:
+            self._collect_msprof_for_regimes(
+                incumbent_source,
+                best_result,
+                active_anchors,
+                [regime_spec],
+            )
+        incumbent_sha = self._source_sha256(incumbent_source)
+        telemetry_payload: dict[str, object] = {
+            "dur_us": local_best.mean_latency_us(),
+            "roofline_eta": local_best.avg_roofline_eta,
+        }
+        cached_msprof = self._msprof_cache.get((incumbent_sha, regime_spec.regime_tag))
+        if cached_msprof:
+            for k, v in cached_msprof.items():
+                if k == "dur_us" and float(v) <= 0.0:
+                    continue
+                telemetry_payload[k] = v
+        parent_residual = compute_static_dynamic_residual(parent_ledger, telemetry_payload)
         ctx = build_predicate_context(
             parent_ledger,
             features=parent_features,
             residual=parent_residual,
         )
         ranked_rules = list(
-            self._tracker.rank_applicable_rules(ctx, top_k=self._config.k_rule_workers)
+            self._tracker.rank_applicable_rules(
+                ctx,
+                top_k=self._config.k_rule_workers,
+                paradigm=paradigm,
+            )
         )
         nav_packet = self._regime_nav_packets.get(regime_spec.regime_tag)
 
@@ -1305,16 +1528,17 @@ class PerfTargetCampaignRunner:
                         func_name=func_name,
                         regime_spec=regime_spec,
                         rule=rule,
-                        best_result=best_result,
+                        best_result=local_best,
                         nav_packet=nav_packet,
                         parent_ledger=parent_ledger,
+                        parent_residual=parent_residual,
                         track=parent_track,
                     ),
                 )
             )
         excluded = summarize_excluded_mechanisms(
             ranked_rules,
-            self._beam.exploited_signatures,
+            regime_beam.exploited_signatures,
         )
         anchor_dims = (
             regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
@@ -1333,8 +1557,12 @@ class PerfTargetCampaignRunner:
             prescreen_factory = resolved_cfg.builder_name
             prescreen_pc = dict(resolved_cfg.pass_configs)
             prescreen_cf = resolved_cfg.compile_flags
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Failed to resolve prescreen config for regime %s: %s",
+                regime_spec.regime_tag,
+                exc,
+            )
         var_bindings = build_anchor_var_bindings(anchor_dims, kwargs=prescreen_kwargs)
         prescreen_summary = build_prescreen_summary_from_kwargs(
             prescreen_kwargs,
@@ -1364,13 +1592,14 @@ class PerfTargetCampaignRunner:
                         snippet_source=parent_snippet,
                         func_name=func_name,
                         regime_spec=regime_spec,
-                        best_result=best_result,
+                        best_result=local_best,
                         effort=creative_effort,
                         excluded_mechanisms=excluded,
                         focus_hint=hint,
                         prescreen_summary=prescreen_summary,
                         nav_packet=nav_packet,
                         parent_ledger=parent_ledger,
+                        parent_residual=parent_residual,
                         track=parent_track,
                     ),
                 )
@@ -1408,7 +1637,11 @@ class PerfTargetCampaignRunner:
                 stage_tag = "llm_transport" if is_transport_error else "llm_generate"
                 failed_entries.append((wid, stage_tag, err[:200]))
                 if rule is not None and not is_transport_error:
-                    self._tracker.record_outcome(rule.rule_id, postcondition_realized=False)
+                    self._tracker.record_outcome(
+                        rule.rule_id,
+                        postcondition_realized=False,
+                        paradigm=paradigm,
+                    )
             else:
                 raw_candidates.append((wid, snippet))
 
@@ -1433,7 +1666,11 @@ class PerfTargetCampaignRunner:
                 )
                 _wkind, rule = meta_by_id[chk.candidate_id]
                 if rule is not None:
-                    self._tracker.record_outcome(rule.rule_id, postcondition_realized=False)
+                    self._tracker.record_outcome(
+                        rule.rule_id,
+                        postcondition_realized=False,
+                        paradigm=paradigm,
+                    )
 
         l2_results: dict[str, CandidateSurrogateResult] = {}
         if passed_checks:
@@ -1462,7 +1699,14 @@ class PerfTargetCampaignRunner:
                 if self._enable_track_router and chk.stage_a and chk.stage_a.route is not None
                 else "unconstrained"
             )
-            lat_us = res.mean_latency_us()
+            cand_local_res = res.for_regime(regime_spec.regime_tag)
+            local_res = cand_local_res if cand_local_res.anchors else res
+            lat_us = local_res.mean_latency_us()
+            obj_score = (
+                cand_local_res.surrogate_score
+                if cand_local_res.anchors
+                else res.surrogate_score
+            )
             beam_updates.append(
                 BeamCandidate(
                     candidate_id=chk.candidate_id,
@@ -1474,10 +1718,10 @@ class PerfTargetCampaignRunner:
                     ledger=ledger,
                     residual=compute_static_dynamic_residual(
                         ledger,
-                        {"dur_us": lat_us, "roofline_eta": res.avg_roofline_eta},
+                        {"dur_us": lat_us, "roofline_eta": local_res.avg_roofline_eta},
                     ),
                     latency_us=lat_us,
-                    accuracy_passed=res.all_passed,
+                    accuracy_passed=local_res.all_passed,
                     structural_signature=extract_structural_signature(
                         chk.snippet_source, track=track
                     ),
@@ -1487,26 +1731,38 @@ class PerfTargetCampaignRunner:
                         if (self._enable_track_router and chk.stage_a)
                         else None
                     ),
+                    objective_score=obj_score,
                 )
             )
             if rule is not None:
-                surrogate_gain = (
-                    (res.surrogate_score - best_result.surrogate_score)
-                    if res.all_passed
-                    else 0.0
-                )
-                realized = res.all_passed and _surrogate_rank_key(res) > _surrogate_rank_key(
-                    best_result
-                )
+                if cand_local_res.anchors and regime_best.anchors:
+                    surrogate_gain = (
+                        (cand_local_res.surrogate_score - regime_best.surrogate_score)
+                        if res.all_passed
+                        else 0.0
+                    )
+                    realized = res.all_passed and (
+                        _surrogate_rank_key(cand_local_res) > _surrogate_rank_key(regime_best)
+                    )
+                else:
+                    surrogate_gain = (
+                        (res.surrogate_score - best_result.surrogate_score)
+                        if res.all_passed
+                        else 0.0
+                    )
+                    realized = res.all_passed and (
+                        _surrogate_rank_key(res) > _surrogate_rank_key(best_result)
+                    )
                 self._tracker.record_outcome(
                     rule.rule_id,
                     postcondition_realized=realized,
                     speed_gain=max(0.0, surrogate_gain),
+                    paradigm=paradigm,
                 )
             if res.all_passed:
                 passing_candidates.append((chk, res))
 
-        self._beam.update(beam_updates)
+        regime_beam.update(beam_updates)
 
         best_round_speedup = best_result.avg_speedup
         best_round_surrogate_score = best_result.surrogate_score
@@ -1541,6 +1797,12 @@ class PerfTargetCampaignRunner:
                     new_incumbent = top_chk.patched_module_source
                     new_best = top_res
                     stagnation_after = 0
+                    self._collect_msprof_for_regimes(
+                        new_incumbent,
+                        new_best,
+                        active_anchors,
+                        [regime_spec],
+                    )
                     if rel_gain >= self._config.min_flywheel_gain and self._flywheel is not None:
                         try:
                             distill_rep = self._flywheel.distill_from_pair(
@@ -1555,8 +1817,12 @@ class PerfTargetCampaignRunner:
                             )
                             round_admitted.extend(distill_rep.admitted_rule_ids)
                             admitted_rule_ids.extend(distill_rep.admitted_rule_ids)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.warning(
+                                "Flywheel distillation failed for regime %s: %s",
+                                regime_spec.regime_tag,
+                                exc,
+                            )
                 else:
                     _atomic_write_text(self._target_module_path, incumbent_source)
                     rolled_back_l3 = True
@@ -1565,6 +1831,10 @@ class PerfTargetCampaignRunner:
                 stagnation_after = stagnation_rounds + 1
         else:
             stagnation_after = stagnation_rounds + 1
+
+        pruned_rules = self._tracker.prune_underperforming(paradigm=paradigm)
+        if pruned_rules:
+            logger.debug("Pruned rules for paradigm %s: %s", paradigm, pruned_rules)
 
         record = CampaignRoundRecord(
             round_idx=round_idx,
@@ -1582,6 +1852,7 @@ class PerfTargetCampaignRunner:
             admitted_rule_ids=tuple(round_admitted),
             best_round_surrogate_score=best_round_surrogate_score,
             best_so_far_surrogate_score=new_best.surrogate_score,
+            pruned_rule_ids=pruned_rules,
         )
         return (
             record,
@@ -1615,6 +1886,12 @@ class PerfTargetCampaignRunner:
             incumbent_source = self._target_module_path.read_text(encoding="utf-8")
             active_anchors = list(self._initial_anchors)
             baseline_result = self._evaluate_single_baseline(incumbent_source, active_anchors)
+            self._collect_msprof_for_regimes(
+                incumbent_source,
+                baseline_result,
+                active_anchors,
+                self._regime_specs,
+            )
             best_result = baseline_result
             frozen_regimes = set()
             current_regime = None
@@ -1751,18 +2028,43 @@ class PerfTargetCampaignRunner:
                 if cnum not in anchor_nums and sp < self._config.l4_regression_ratio
             )
             if regressed_nums:
+                resolved_by_cnum: dict[int, RegimeTargetSpec] = {}
                 for cnum in regressed_nums:
+                    resolved = self._regime_specs[0]
+                    try:
+                        dims = lookup_case_dims(
+                            self._config.operator_name,
+                            cnum,
+                            cannbench_repo=self._cannbench_repo,
+                            env_file=self._env_file,
+                        )
+                        resolved = resolve_regime_for_case(
+                            self._config.operator_name,
+                            dims,
+                            self._regime_specs,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to resolve regime for regressed case %s: %s",
+                            cnum,
+                            exc,
+                        )
+                    resolved_by_cnum[cnum] = resolved
                     active_anchors = list(
                         append_dynamic_anchor(
                             active_anchors,
                             operator_name=self._config.operator_name,
                             case_num=cnum,
-                            regime_tag="tail_regression",
+                            regime_tag=resolved.regime_tag,
                             cannbench_repo=self._cannbench_repo,
                             env_file=self._env_file,
                         )
                     )
-                catch_regime = self._regime_specs[0]
+                worst_cnum = min(
+                    regressed_nums,
+                    key=lambda c: (l4_result.per_case_speedups.get(c, float("inf")), c),
+                )
+                catch_regime = resolved_by_cnum[worst_cnum]
                 catch_idx = (rounds[-1].round_idx + 1) if rounds else 1
                 (
                     rec,

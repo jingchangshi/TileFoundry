@@ -70,6 +70,7 @@ class BayesianRuleTracker:
 
     rules: dict[str, AscendCausalRule] = field(default_factory=dict)
     posteriors: dict[str, RulePosterior] = field(default_factory=dict)
+    paradigm_posteriors: dict[str, dict[str, RulePosterior]] = field(default_factory=dict)
 
     @classmethod
     def from_rules(cls, rules: Iterable[AscendCausalRule]) -> BayesianRuleTracker:
@@ -83,6 +84,39 @@ class BayesianRuleTracker:
     def from_seed_yaml(cls, path: str | Path | None = None) -> BayesianRuleTracker:
         """Load seed rules YAML and initialize Bayesian priors."""
         return cls.from_rules(load_seed_rules(path))
+
+    @staticmethod
+    def _normalize_paradigm(paradigm: str) -> str:
+        text = str(paradigm).strip()
+        return text or "default"
+
+    @staticmethod
+    def _apply_outcome(
+        state: RulePosterior,
+        *,
+        postcondition_realized: bool,
+        speed_gain: float,
+    ) -> None:
+        if postcondition_realized:
+            state.alpha += 1.0
+            state.successes += 1
+            if speed_gain > 0.0:
+                state.cumulative_speedup += float(speed_gain)
+        else:
+            state.beta += 1.0
+            state.failures += 1
+
+    def _ensure_paradigm_posterior(self, paradigm: str, rule_id: str) -> RulePosterior:
+        bucket = self._normalize_paradigm(paradigm)
+        bucket_map = self.paradigm_posteriors.setdefault(bucket, {})
+        if rule_id not in bucket_map:
+            rule = self.rules[rule_id]
+            bucket_map[rule_id] = RulePosterior(
+                rule_id=rule_id,
+                alpha=rule.alpha_prior,
+                beta=rule.beta_prior,
+            )
+        return bucket_map[rule_id]
 
     def admit_rule(self, rule: AscendCausalRule) -> None:
         """Register or replace a rule while preserving existing statistics if active."""
@@ -100,19 +134,25 @@ class BayesianRuleTracker:
         *,
         postcondition_realized: bool,
         speed_gain: float = 0.0,
+        paradigm: str | None = None,
     ) -> RulePosterior:
         """Update Beta posterior after evaluating a candidate kernel transform."""
         if rule_id not in self.rules:
             raise KeyError(f"unknown causal rule {rule_id!r}")
         state = self.posteriors[rule_id]
-        if postcondition_realized:
-            state.alpha += 1.0
-            state.successes += 1
-            if speed_gain > 0.0:
-                state.cumulative_speedup += float(speed_gain)
-        else:
-            state.beta += 1.0
-            state.failures += 1
+        self._apply_outcome(
+            state,
+            postcondition_realized=postcondition_realized,
+            speed_gain=speed_gain,
+        )
+        if paradigm is not None:
+            p_state = self._ensure_paradigm_posterior(paradigm, rule_id)
+            self._apply_outcome(
+                p_state,
+                postcondition_realized=postcondition_realized,
+                speed_gain=speed_gain,
+            )
+            return p_state
         return state
 
     def prune_underperforming(
@@ -120,27 +160,54 @@ class BayesianRuleTracker:
         *,
         min_trials: int = 5,
         prune_threshold: float = 0.25,
+        paradigm: str | None = None,
     ) -> tuple[str, ...]:
         """Mark rules with persistently low posterior realization rate as pruned."""
         newly_pruned: list[str] = []
-        for rule_id, state in sorted(self.posteriors.items()):
+        if paradigm is None:
+            target_map = self.posteriors
+        else:
+            bucket = self._normalize_paradigm(paradigm)
+            target_map = self.paradigm_posteriors.get(bucket, {})
+        for rule_id, state in sorted(target_map.items()):
             if not state.pruned and state.trials >= min_trials:
                 if state.expected_rate < prune_threshold:
                     state.pruned = True
                     newly_pruned.append(rule_id)
         return tuple(newly_pruned)
 
-    def unprune(self, rule_id: str) -> None:
-        """Re-enable a previously pruned rule."""
-        if rule_id in self.posteriors:
-            self.posteriors[rule_id].pruned = False
+    def unprune(self, rule_id: str, *, paradigm: str | None = None) -> None:
+        """Re-enable a previously pruned rule globally or within one paradigm."""
+        if paradigm is None:
+            if rule_id in self.posteriors:
+                self.posteriors[rule_id].pruned = False
+            for bucket_map in self.paradigm_posteriors.values():
+                if rule_id in bucket_map:
+                    bucket_map[rule_id].pruned = False
+            return
+        bucket = self._normalize_paradigm(paradigm)
+        bucket_map = self.paradigm_posteriors.get(bucket, {})
+        if rule_id in bucket_map:
+            bucket_map[rule_id].pruned = False
 
-    def active_rules(self) -> tuple[AscendCausalRule, ...]:
+    def is_pruned(self, rule_id: str, *, paradigm: str | None = None) -> bool:
+        """Return whether rule_id is pruned globally or in the specified paradigm."""
+        global_state = self.posteriors.get(rule_id)
+        if global_state is not None and global_state.pruned:
+            return True
+        if paradigm is not None:
+            bucket = self._normalize_paradigm(paradigm)
+            p_state = self.paradigm_posteriors.get(bucket, {}).get(rule_id)
+            if p_state is not None and p_state.pruned:
+                return True
+        return False
+
+    def active_rules(self, *, paradigm: str | None = None) -> tuple[AscendCausalRule, ...]:
         """Return all non-pruned rules sorted deterministically."""
         return tuple(
             rule
             for rule_id, rule in sorted(self.rules.items())
-            if not self.posteriors[rule_id].pruned
+            if not self.is_pruned(rule_id, paradigm=paradigm)
         )
 
     def rank_applicable_rules(
@@ -148,13 +215,28 @@ class BayesianRuleTracker:
         context: Mapping[str, object],
         *,
         top_k: int | None = None,
+        paradigm: str | None = None,
     ) -> tuple[AscendCausalRule, ...]:
         """Filter matching non-pruned rules and rank by posterior rate and priority."""
+        bucket_map = (
+            self.paradigm_posteriors.get(self._normalize_paradigm(paradigm), {})
+            if paradigm is not None
+            else None
+        )
         candidates: list[tuple[tuple[float, float, int, str], AscendCausalRule]] = []
-        for rule in self.active_rules():
+        for rule in self.active_rules(paradigm=paradigm):
             if not rule.matches(context):
                 continue
-            state = self.posteriors[rule.rule_id]
+            if bucket_map is not None:
+                state = bucket_map.get(rule.rule_id)
+                if state is None:
+                    state = RulePosterior(
+                        rule_id=rule.rule_id,
+                        alpha=rule.alpha_prior,
+                        beta=rule.beta_prior,
+                    )
+            else:
+                state = self.posteriors[rule.rule_id]
             score_key = (
                 round(state.expected_rate, 6),
                 round(state.mean_speedup, 6),
@@ -170,11 +252,19 @@ class BayesianRuleTracker:
 
     def to_dict(self) -> dict[str, object]:
         """Serialize tracker posteriors and rule IDs into JSON-safe dict."""
-        return {
+        payload: dict[str, object] = {
             "posteriors": {
                 rid: state.to_dict() for rid, state in sorted(self.posteriors.items())
             }
         }
+        if self.paradigm_posteriors:
+            payload["paradigm_posteriors"] = {
+                paradigm: {
+                    rid: state.to_dict() for rid, state in sorted(states.items())
+                }
+                for paradigm, states in sorted(self.paradigm_posteriors.items())
+            }
+        return payload
 
     def save_json(self, path: str | Path) -> None:
         """Write tracker posteriors to disk as JSON."""
@@ -183,13 +273,29 @@ class BayesianRuleTracker:
             encoding="utf-8",
         )
 
+    def load_posteriors_dict(self, payload: Mapping[str, object]) -> None:
+        """Restore global and paradigm-bucketed posteriors from a serialized mapping."""
+        saved = payload.get("posteriors", {})
+        if isinstance(saved, Mapping):
+            for rid, raw in saved.items():
+                if rid in self.rules and isinstance(raw, Mapping):
+                    self.posteriors[rid] = RulePosterior.from_dict(raw)
+        saved_paradigms = payload.get("paradigm_posteriors", {})
+        if isinstance(saved_paradigms, Mapping):
+            for paradigm, states in saved_paradigms.items():
+                if not isinstance(states, Mapping):
+                    continue
+                bucket = self._normalize_paradigm(str(paradigm))
+                bucket_map = self.paradigm_posteriors.setdefault(bucket, {})
+                for rid, raw in states.items():
+                    if rid in self.rules and isinstance(raw, Mapping):
+                        bucket_map[rid] = RulePosterior.from_dict(raw)
+
     def load_posteriors_json(self, path: str | Path) -> None:
         """Restore tracked posteriors from disk for matching rule IDs."""
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        saved = payload.get("posteriors", {})
-        for rid, raw in saved.items():
-            if rid in self.rules:
-                self.posteriors[rid] = RulePosterior.from_dict(raw)
+        if isinstance(payload, Mapping):
+            self.load_posteriors_dict(payload)
 
 
 __all__ = ["BayesianRuleTracker", "RulePosterior"]

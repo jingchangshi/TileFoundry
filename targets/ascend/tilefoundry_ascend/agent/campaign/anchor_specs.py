@@ -10,6 +10,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import yaml
+
 
 @dataclass(frozen=True)
 class AnchorCaseSpec:
@@ -583,6 +585,122 @@ def lookup_case_metadata(
     return float(entry["baseline_perf_us"]), float(entry["t_hw_us"])
 
 
+def lookup_case_dims(
+    operator_name: str,
+    case_num: int,
+    *,
+    cannbench_repo: str | Path | None = None,
+    env_file: str | Path | None = None,
+) -> dict[str, object]:
+    """Extract tensor dimensions and dispatch attributes from operators/<task>/cases.yaml."""
+    repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
+    task = get_operator_task(operator_name)
+    cases_path = repo / "operators" / task / "cases.yaml"
+    if not cases_path.is_file():
+        raise FileNotFoundError(f"cases.yaml not found at {cases_path}")
+    parsed = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
+    cases_list = parsed.get("cases") or []
+    target_id = int(case_num)
+    entry: Mapping[str, object] | None = None
+    for row in cases_list:
+        if isinstance(row, Mapping) and int(row.get("case_id", -1)) == target_id:
+            entry = row
+            break
+    if entry is None:
+        raise KeyError(f"case_num={target_id} missing in {cases_path}")
+
+    raw_shapes = entry.get("input_shape") or []
+    shapes = (
+        [raw_shapes]
+        if raw_shapes and not isinstance(raw_shapes[0], (list, tuple))
+        else list(raw_shapes)
+    )
+    attrs = entry.get("attrs") or {}
+    dims: dict[str, object] = {}
+    if isinstance(attrs, Mapping):
+        for k, v in attrs.items():
+            dims[str(k)] = v
+
+    if operator_name == "attention_residual":
+        v_shape = shapes[0] if shapes else ()
+        if len(v_shape) >= 4:
+            dims["N"] = int(v_shape[0])
+            dims["B"] = int(v_shape[1])
+            dims["S"] = int(v_shape[2])
+            dims["D"] = int(v_shape[3])
+        return dims
+
+    if operator_name == "mla":
+        layout = str(dims.get("inputLayout", "BSND")).upper()
+        dims["inputLayout"] = layout
+        q_nope = shapes[0] if len(shapes) > 0 else ()
+        q_rope = shapes[1] if len(shapes) > 1 else ()
+        k_nope = shapes[2] if len(shapes) > 2 else ()
+        if len(q_nope) >= 4:
+            if layout == "BNSD":
+                dims["B"] = int(q_nope[0])
+                dims["N_q"] = int(q_nope[1])
+                dims["S"] = int(q_nope[2])
+                dims["D_nope"] = int(q_nope[3])
+            else:
+                dims["B"] = int(q_nope[0])
+                dims["S"] = int(q_nope[1])
+                dims["N_q"] = int(q_nope[2])
+                dims["D_nope"] = int(q_nope[3])
+        if len(k_nope) >= 4:
+            if layout == "BNSD":
+                dims["N_kv"] = int(k_nope[1])
+                dims["S_kv"] = int(k_nope[2])
+            else:
+                dims["S_kv"] = int(k_nope[1])
+                dims["N_kv"] = int(k_nope[2])
+        elif "numKVHeads" in dims:
+            dims["N_kv"] = int(dims["numKVHeads"])
+        if q_rope:
+            dims["D_rope"] = int(q_rope[-1])
+        dims["is_causal"] = bool(dims.get("is_causal", False))
+        return dims
+
+    return dims
+
+
+def resolve_regime_for_case(
+    operator_name: str,
+    case_dims: Mapping[str, object],
+    regime_specs: Sequence[RegimeTargetSpec],
+) -> RegimeTargetSpec:
+    """Resolve the active dispatch regime matching Host kernel routing for case_dims."""
+    if not regime_specs:
+        raise ValueError("regime_specs must not be empty")
+    target_tag = ""
+    if operator_name == "attention_residual":
+        d_dim = int(case_dims.get("D", case_dims.get("d_dim", 0)))
+        b_dim = int(case_dims.get("B", case_dims.get("b_dim", 1)))
+        s_dim = int(case_dims.get("S", case_dims.get("s_dim", case_dims.get("S_q", 1))))
+        if d_dim % 64 != 0:
+            target_tag = "unaligned_d"
+        elif b_dim * s_dim < 16:
+            target_tag = "small_decode"
+        else:
+            target_tag = "aligned_prefill"
+    elif operator_name == "mla":
+        layout = str(
+            case_dims.get("inputLayout", case_dims.get("input_layout", "BSND"))
+        ).upper()
+        s_dim = int(case_dims.get("S", case_dims.get("s_dim", case_dims.get("S_q", 1))))
+        if layout == "BNSD":
+            target_tag = "bnsd_gather"
+        elif s_dim <= 2:
+            target_tag = "split_kv_decode"
+        else:
+            target_tag = "prefill_compute"
+
+    for spec in regime_specs:
+        if spec.regime_tag == target_tag:
+            return spec
+    return regime_specs[0]
+
+
 def append_dynamic_anchor(
     anchors: Sequence[AnchorCaseSpec],
     *,
@@ -717,7 +835,9 @@ __all__ = [
     "get_operator_task",
     "load_anchor_harness_and_cases",
     "load_cannbench_contract_module",
+    "lookup_case_dims",
     "lookup_case_metadata",
     "parse_simple_env_file",
     "resolve_cannbench_repo",
+    "resolve_regime_for_case",
 ]

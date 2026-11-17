@@ -109,6 +109,28 @@ class CandidateSurrogateResult:
             return max(0.0, 1.0 - self.avg_roofline_eta)
         return sum(max(0.0, 1.0 - a.roofline_eta) for a in matched) / len(matched)
 
+    def for_regime(self, regime_tag: str) -> CandidateSurrogateResult:
+        """Return CandidateSurrogateResult filtered strictly to anchors of regime_tag."""
+        matched = tuple(a for a in self.anchors if a.regime_tag == regime_tag)
+        if not matched:
+            return CandidateSurrogateResult(
+                candidate_id=self.candidate_id,
+                operator_name=self.operator_name,
+                all_passed=False,
+                avg_speedup=0.0,
+                min_case_speedup=0.0,
+                avg_roofline_eta=0.0,
+                surrogate_score=0.0,
+                anchors=(),
+                error_message=self.error_message,
+            )
+        return aggregate_surrogate_result(
+            self.candidate_id,
+            self.operator_name,
+            matched,
+            error_message=self.error_message,
+        )
+
     def meets_perf_target(self, spec: PerfTargetSpec) -> bool:
         """Return True iff accuracy, score, speedup, eta, and latency limits pass."""
         if not self.all_passed or not self.anchors:
@@ -1051,6 +1073,172 @@ def run_surrogate_batch_via_agent_gates(
     return by_op.get(operator_name, {}), run_id, receipt_path
 
 
+def bottleneck_anchor_for_regime(
+    result: CandidateSurrogateResult,
+    regime_tag: str,
+) -> AnchorEvalMetrics | None:
+    """Return the lowest-Eq.3-score evaluated anchor matching regime_tag."""
+    matched = [a for a in result.anchors if a.regime_tag == regime_tag]
+    if not matched:
+        return None
+    return min(matched, key=lambda a: (a.eq3_score, -a.cand_us, a.case_num))
+
+
+def collect_bottleneck_msprof_via_agent_gates(
+    operator_name: str,
+    candidate_path: str | Path,
+    anchors_by_regime: Sequence[AnchorCaseSpec] | Mapping[str, AnchorCaseSpec],
+    *,
+    source_root: str | Path | None = None,
+    env_file: str | Path | None = None,
+    device_id: str = "1",
+    warmup: int = 1,
+    repeat: int = 3,
+    timeout_sec: int = 300,
+) -> dict[str, dict[str, float]]:
+    """Collect msprof_detail telemetry for bottleneck anchors inside an AgentGates lease."""
+    if isinstance(anchors_by_regime, Mapping):
+        regime_items = [(str(tag), spec) for tag, spec in anchors_by_regime.items()]
+    else:
+        regime_items = [(spec.regime_tag, spec) for spec in anchors_by_regime]
+    if not regime_items:
+        return {}
+
+    unique_case_nums: list[int] = []
+    seen_cases: set[int] = set()
+    for _tag, spec in regime_items:
+        cnum = int(spec.case_num)
+        if cnum not in seen_cases:
+            seen_cases.add(cnum)
+            unique_case_nums.append(cnum)
+
+    root = Path(source_root).resolve() if source_root is not None else default_source_root()
+    resolved_env = _resolve_env_file_path(env_file)
+    ag_bin = _resolve_agent_gates_bin(root)
+    env_vals = parse_simple_env_file(resolved_env)
+    cann_repo = resolve_cannbench_repo(
+        cannbench_repo=env_vals.get("TILEFOUNDRY_NPU_CANNBENCH_REPO"),
+        env_file=resolved_env,
+    )
+    cache_dir = _default_surrogate_cache_dir()
+    tl_cache_dir = _default_surrogate_tl_cache_dir()
+    cand_resolved = Path(candidate_path).resolve()
+
+    unique_specs = [
+        next(spec for _t, spec in regime_items if int(spec.case_num) == cnum)
+        for cnum in unique_case_nums
+    ]
+    prewarm_anchor_reference_cache(
+        operator_name,
+        unique_specs,
+        cannbench_repo=cann_repo,
+        env_file=resolved_env,
+        cache_dir=cache_dir,
+        source_root=root,
+    )
+    prewarm_surrogate_tilelang_cache(
+        operator_name,
+        [("bottleneck_probe", cand_resolved)],
+        unique_specs,
+        cannbench_repo=cann_repo,
+        env_file=resolved_env,
+        cache_dir=cache_dir,
+        tl_cache_dir=tl_cache_dir,
+        source_root=root,
+    )
+
+    with tempfile.TemporaryDirectory(prefix="tf_msprof_gate_") as tmp_dir:
+        tmp = Path(tmp_dir)
+        request_path = tmp / "msprof_request.json"
+        response_path = tmp / "msprof_response.json"
+        tmp_env = _write_temp_env_file(
+            resolved_env,
+            tmp / "env.sh",
+            {
+                "TILEFOUNDRY_NPU_CPU_TESTS": "tests/ascend/agent/test_llm_watchdog.py",
+                "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/agent/test_surrogate_batch_npu.py",
+            },
+        )
+        payload = {
+            "source_root": str(root),
+            "cannbench_repo": str(cann_repo),
+            "tilelang_cache_dir": str(tl_cache_dir),
+            "warmup": int(warmup),
+            "repeat": int(repeat),
+            "require_all_passed": False,
+            "collect_msprof_detail": True,
+            "response_path": str(response_path),
+            "batches": [],
+            "msprof_targets": [
+                {
+                    "operator_name": operator_name,
+                    "candidate_id": "bottleneck_probe",
+                    "module_path": str(cand_resolved),
+                    "case_num": cnum,
+                    "warmup": int(warmup),
+                    "repeat": int(repeat),
+                }
+                for cnum in unique_case_nums
+            ],
+        }
+        request_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        cmd = [
+            ag_bin,
+            "run",
+            "--adapter",
+            "tilefoundry-npu",
+            "--source",
+            str(root),
+            "--env-file",
+            str(tmp_env),
+            "--device-id",
+            str(device_id),
+            "--gate",
+            "tilefoundry-npu-device",
+            "--json",
+        ]
+        sub_env = _clean_agent_gates_subprocess_env(
+            {
+                "TF_SURROGATE_BATCH_REQUEST": str(request_path),
+                "TF_SURROGATE_TL_CACHE_DIR": str(tl_cache_dir),
+                "CANNBENCH_CACHE_DIR": str(cache_dir),
+            }
+        )
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            capture_output=True,
+            cwd=str(root),
+            env=sub_env,
+            timeout=timeout_sec,
+        )
+        if not response_path.is_file():
+            detail = (proc.stderr or proc.stdout or "msprof request missing response").strip()[
+                -1000:
+            ]
+            raise RuntimeError(
+                f"AgentGates msprof collection failed (rc={proc.returncode}): {detail}"
+            )
+        raw_resp = json.loads(response_path.read_text(encoding="utf-8"))
+
+    by_case = (
+        raw_resp.get("msprof_telemetry", {})
+        .get(operator_name, {})
+        .get("bottleneck_probe", {})
+    )
+    out: dict[str, dict[str, float]] = {}
+    for tag, spec in regime_items:
+        raw_metrics = by_case.get(str(int(spec.case_num)))
+        if isinstance(raw_metrics, Mapping) and "error" not in raw_metrics:
+            out[tag] = {
+                str(k): float(v)
+                for k, v in raw_metrics.items()
+                if isinstance(v, (int, float)) and not isinstance(v, bool)
+            }
+    return out
+
+
 def run_l3_full_contract_via_agent_gates(
     *,
     source_root: str | Path | None = None,
@@ -1236,7 +1424,9 @@ __all__ = [
     "L3AcceptanceResult",
     "L4CannbenchResult",
     "aggregate_surrogate_result",
+    "bottleneck_anchor_for_regime",
     "build_anchor_metrics",
+    "collect_bottleneck_msprof_via_agent_gates",
     "ensure_npu_compare_shim_dir",
     "prewarm_anchor_reference_cache",
     "prewarm_surrogate_tilelang_cache",

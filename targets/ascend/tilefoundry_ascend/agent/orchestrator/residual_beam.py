@@ -146,6 +146,7 @@ class BeamCandidate:
     hypothesis: str = ""
     parent_id: str | None = None
     features: StructuralFeatures | None = None
+    objective_score: float | None = None
 
     def __post_init__(self) -> None:
         if not self.track:
@@ -168,6 +169,7 @@ class BeamCandidate:
             "hypothesis": self.hypothesis,
             "parent_id": self.parent_id,
             "features": self.features.to_dict() if self.features is not None else None,
+            "objective_score": self.objective_score,
         }
 
     @classmethod
@@ -195,6 +197,7 @@ class BeamCandidate:
         raw_rule = payload.get("rule_id")
         raw_parent = payload.get("parent_id")
         raw_sig = payload.get("structural_signature") or ()
+        raw_obj = payload.get("objective_score")
         return cls(
             candidate_id=str(payload["candidate_id"]),
             round_idx=int(payload["round_idx"]),
@@ -210,6 +213,7 @@ class BeamCandidate:
             hypothesis=str(payload.get("hypothesis", "")),
             parent_id=str(raw_parent) if raw_parent is not None else None,
             features=features,
+            objective_score=float(raw_obj) if raw_obj is not None else None,
         )
 
 
@@ -243,7 +247,20 @@ class TwoLaneBeamSearch:
         exploit_pool = {c.candidate_id: c for c in self.exploit_beam}
         for cand in valid:
             exploit_pool[cand.candidate_id] = cand
-        sorted_exploit = sorted(exploit_pool.values(), key=lambda c: (c.latency_us, c.candidate_id))
+        use_objective = any(c.objective_score is not None for c in exploit_pool.values())
+        sorted_exploit = sorted(
+            exploit_pool.values(),
+            key=lambda c: (
+                (
+                    0 if c.objective_score is not None else 1,
+                    -(c.objective_score if c.objective_score is not None else 0.0),
+                    c.latency_us,
+                    c.candidate_id,
+                )
+                if use_objective
+                else (c.latency_us, c.candidate_id)
+            ),
+        )
         self.exploit_beam = sorted_exploit[: self.exploit_width]
         exploit_ids = {c.candidate_id for c in self.exploit_beam}
         for c in self.exploit_beam:

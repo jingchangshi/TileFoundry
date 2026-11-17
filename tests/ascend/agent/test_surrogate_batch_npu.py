@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import gc
 import importlib
 import importlib.util
@@ -117,6 +118,76 @@ def _measure_npu_latency_us(fn_call, *, warmup: int, repeat: int) -> float:
         return float(statistics.median(samples_ms)) * 1000.0
 
 
+def _extract_msprof_metrics(prof: object) -> dict[str, float | int]:
+    aic_mad = float(getattr(prof, "aic_mad", 0.0))
+    aic_scalar = float(getattr(prof, "aic_scalar", 0.0))
+    aic_mte1 = float(getattr(prof, "aic_mte1", 0.0))
+    aic_mte2 = float(getattr(prof, "aic_mte2", 0.0))
+    aic_mte3 = float(getattr(prof, "aic_mte3", 0.0))
+    aic_fixpipe = float(getattr(prof, "aic_fixpipe", 0.0))
+    aic_total_cycles = int(getattr(prof, "aic_total_cycles", 0))
+
+    aiv_vec = float(getattr(prof, "aiv_vec", 0.0))
+    aiv_scalar = float(getattr(prof, "aiv_scalar", 0.0))
+    aiv_mte2 = float(getattr(prof, "aiv_mte2", 0.0))
+    aiv_mte3 = float(getattr(prof, "aiv_mte3", 0.0))
+    aiv_total_cycles = int(getattr(prof, "aiv_total_cycles", 0))
+
+    raw_dur_us = getattr(prof, "dur_us", None)
+    if raw_dur_us is None:
+        dur_us = float(getattr(prof, "dur_ns", 0.0)) / 1000.0
+    else:
+        dur_us = float(raw_dur_us)
+
+    explicit_sync = getattr(prof, "sync_stall_ratio", None)
+    if explicit_sync is not None:
+        sync_stall_ratio = float(explicit_sync)
+    else:
+        idle_fractions: list[float] = []
+        if aic_total_cycles > 0:
+            aic_sum = aic_mad + aic_scalar + aic_mte1 + aic_mte2 + aic_mte3 + aic_fixpipe
+            idle_fractions.append(max(0.0, 1.0 - min(1.0, aic_sum)))
+        if aiv_total_cycles > 0:
+            aiv_sum = aiv_vec + aiv_scalar + aiv_mte2 + aiv_mte3
+            idle_fractions.append(max(0.0, 1.0 - min(1.0, aiv_sum)))
+        sync_stall_ratio = sum(idle_fractions) / len(idle_fractions) if idle_fractions else 0.0
+
+    return {
+        "aic_mac_ratio": aic_mad,
+        "aiv_vec_ratio": aiv_vec,
+        "mte2_wait_ratio": max(aiv_mte2, aic_mte2),
+        "sync_stall_ratio": sync_stall_ratio,
+        "aic_mad": aic_mad,
+        "aic_fixpipe": aic_fixpipe,
+        "aiv_vec": aiv_vec,
+        "aiv_mte2": aiv_mte2,
+        "aic_mte2": aic_mte2,
+        "aic_total_cycles": aic_total_cycles,
+        "aiv_total_cycles": aiv_total_cycles,
+        "dur_us": dur_us,
+    }
+
+
+def _measure_msprof_detail_metrics(
+    fn_call,
+    *,
+    warmup: int = 1,
+    repeat: int = 3,
+) -> dict[str, object]:
+    try:
+        profiler = importlib.import_module("tilelang.profiler")
+        prof = profiler.do_bench(
+            fn_call,
+            _n_warmup=max(1, int(warmup)),
+            _n_repeat=max(1, int(repeat)),
+            backend="msprof_detail",
+            device=torch.device("npu:0"),
+        )
+        return dict(_extract_msprof_metrics(prof))
+    except Exception as exc:
+        return {"error": f"msprof_detail_failed: {type(exc).__name__}: {exc}"[:300]}
+
+
 def _default_batch_request(source_root: Path, cannbench_repo: Path) -> dict[str, object]:
     batches = []
     for op_name in ("attention_residual", "mla"):
@@ -149,11 +220,22 @@ def _evaluate_operator_batch(
     cannbench_repo: Path,
     warmup: int,
     repeat: int,
+    collect_msprof_detail: bool = False,
+    msprof_out: dict[str, dict[str, dict[str, object]]] | None = None,
 ) -> dict[str, CandidateSurrogateResult]:
     op_name = str(batch["operator_name"])
     entrypoint = str(batch.get("entrypoint") or get_operator_entrypoint(op_name))
     anchors = [AnchorCaseSpec.from_dict(item) for item in batch["anchors"]]
     candidates = list(batch["candidates"])
+    raw_msprof_cases = batch.get("msprof_case_nums")
+    if raw_msprof_cases is not None:
+        msprof_case_set = {int(c) for c in raw_msprof_cases}
+    elif collect_msprof_detail:
+        msprof_case_set = {int(a.case_num) for a in anchors}
+    else:
+        msprof_case_set = set()
+    msprof_warmup = int(batch.get("msprof_warmup", 1))
+    msprof_repeat = int(batch.get("msprof_repeat", 3))
 
     contract_mod = load_cannbench_contract_module(source_root=source_root)
     harness, cases = load_anchor_harness_and_cases(
@@ -219,6 +301,14 @@ def _evaluate_operator_batch(
                             error_message=err_msg,
                         )
                     )
+                    if passed and msprof_out is not None and int(spec.case_num) in msprof_case_set:
+                        msprof_out.setdefault(cid, {})[str(int(spec.case_num))] = (
+                            _measure_msprof_detail_metrics(
+                                lambda f=fn, p=params: f(**p),
+                                warmup=msprof_warmup,
+                                repeat=msprof_repeat,
+                            )
+                        )
                 except Exception as exc:
                     per_cand_metrics[cid].append(
                         build_anchor_metrics(
@@ -245,6 +335,83 @@ def _evaluate_operator_batch(
         cid: aggregate_surrogate_result(cid, op_name, per_cand_metrics[cid])
         for cid, _fn, _mod in loaded_cands
     }
+
+
+def _collect_msprof_targets(
+    targets: list[Mapping[str, object]],
+    *,
+    source_root: Path,
+    cannbench_repo: Path,
+) -> dict[str, dict[str, dict[str, dict[str, object]]]]:
+    by_op: dict[str, list[Mapping[str, object]]] = {}
+    for row in targets:
+        if isinstance(row, Mapping):
+            op_name = str(row["operator_name"])
+            by_op.setdefault(op_name, []).append(row)
+
+    telemetry_out: dict[str, dict[str, dict[str, dict[str, object]]]] = {}
+    contract_mod = load_cannbench_contract_module(source_root=source_root)
+    for op_name, rows in by_op.items():
+        entrypoint = get_operator_entrypoint(op_name)
+        case_nums = sorted({int(r["case_num"]) for r in rows})
+        specs = [AnchorCaseSpec("", cnum, "", 1.0, 1.0) for cnum in case_nums]
+        harness, cases = load_anchor_harness_and_cases(
+            op_name,
+            specs,
+            cannbench_repo=cannbench_repo,
+            source_root=source_root,
+        )
+        case_by_num = {int(c.case_num): c for c in cases}
+
+        loaded_mods: dict[tuple[str, str], tuple[object, object]] = {}
+        for idx, row in enumerate(rows):
+            cid = str(row["candidate_id"])
+            mod_path = str(Path(str(row["module_path"])).resolve())
+            key = (cid, mod_path)
+            if key not in loaded_mods:
+                ep = str(row.get("entrypoint") or entrypoint)
+                tag = f"msprof_{op_name}_{idx}_{int(time.monotonic_ns())}"
+                loaded_mods[key] = _load_candidate_entrypoint(Path(mod_path), ep, tag)
+
+        with contract_mod.ReferenceCache(harness) as cache:
+            for row in rows:
+                cid = str(row["candidate_id"])
+                mod_path = str(Path(str(row["module_path"])).resolve())
+                cnum = int(row["case_num"])
+                fn, _mod_obj = loaded_mods[(cid, mod_path)]
+                case = case_by_num[cnum]
+
+                def _prep(c=case, h=harness):
+                    ts = h.prepare(c)
+                    return {"inputs": ts, "oracle": h.reference_output(c, ts)}
+
+                bundle = cache.get(case, "oracle", _prep)
+                tensors = bundle["inputs"]
+                npu_tensors = None
+                params = None
+                try:
+                    npu_tensors = contract_mod.map_tensors(tensors, lambda x: x.npu())
+                    params = harness.params(case, npu_tensors)
+                    metrics = _measure_msprof_detail_metrics(
+                        lambda f=fn, p=params: f(**p),
+                        warmup=int(row.get("warmup", 1)),
+                        repeat=int(row.get("repeat", 3)),
+                    )
+                except Exception as exc:
+                    metrics = {"error": f"msprof_target_failed: {type(exc).__name__}: {exc}"[:300]}
+                finally:
+                    params = None
+                    npu_tensors = None
+                    torch.npu.empty_cache()
+                telemetry_out.setdefault(op_name, {}).setdefault(cid, {})[str(cnum)] = metrics
+
+        for _fn, mod_obj in loaded_mods.values():
+            cache_obj = getattr(mod_obj, "_KERNEL_CACHE", None)
+            if isinstance(cache_obj, dict):
+                cache_obj.clear()
+        gc.collect()
+        torch.npu.empty_cache()
+    return telemetry_out
 
 
 def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
@@ -323,23 +490,44 @@ def test_surrogate_anchor_batch_npu() -> None:
         warmup = int(req.get("warmup", 3))
         repeat = int(req.get("repeat", 5))
         require_all_passed = bool(req.get("require_all_passed", False))
+        collect_msprof_detail = bool(req.get("collect_msprof_detail", False))
         resp_path_raw = str(req.get("response_path", "")).strip()
 
         results_by_op: dict[str, dict[str, dict[str, object]]] = {}
         parsed_by_op: dict[str, dict[str, CandidateSurrogateResult]] = {}
-        for batch in req["batches"]:
+        msprof_telemetry: dict[str, dict[str, dict[str, dict[str, object]]]] = {}
+        for batch in req.get("batches", ()):
+            op_msprof: dict[str, dict[str, dict[str, object]]] = {}
             op_res = _evaluate_operator_batch(
                 batch,
                 source_root=source_root,
                 cannbench_repo=cann_repo,
                 warmup=warmup,
                 repeat=repeat,
+                collect_msprof_detail=collect_msprof_detail,
+                msprof_out=op_msprof,
             )
             op_name = str(batch["operator_name"])
             parsed_by_op[op_name] = op_res
             results_by_op[op_name] = {cid: res.to_dict() for cid, res in op_res.items()}
+            if op_msprof:
+                msprof_telemetry[op_name] = op_msprof
 
-        summary_payload = {"operators": results_by_op}
+        raw_msprof_targets = req.get("msprof_targets") or []
+        if raw_msprof_targets:
+            target_tel = _collect_msprof_targets(
+                list(raw_msprof_targets),
+                source_root=source_root,
+                cannbench_repo=cann_repo,
+            )
+            for op_name, cands_map in target_tel.items():
+                op_bucket = msprof_telemetry.setdefault(op_name, {})
+                for cid, cases_map in cands_map.items():
+                    op_bucket.setdefault(cid, {}).update(cases_map)
+
+        summary_payload: dict[str, object] = {"operators": results_by_op}
+        if msprof_telemetry or collect_msprof_detail or raw_msprof_targets:
+            summary_payload["msprof_telemetry"] = msprof_telemetry
         if resp_path_raw:
             _atomic_write_json(Path(resp_path_raw), summary_payload)
         print(json.dumps(summary_payload, sort_keys=True), flush=True)

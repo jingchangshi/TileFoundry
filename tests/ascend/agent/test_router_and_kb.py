@@ -708,3 +708,60 @@ def test_bayesian_rule_tracker_ranking_pruning_and_roundtrip(tmp_path: Path) -> 
     assert restored.posteriors["R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION"].mean_speedup == pytest.approx(
         0.25
     )
+
+
+def test_bayesian_tracker_paradigm_bucketed_pruning_and_isolation(tmp_path: Path) -> None:
+    """Verify paradigm-scoped pruning isolates pure_vector failures from cv_coupled."""
+    tracker = BayesianRuleTracker.from_seed_yaml()
+    vec_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 80, "AIV0.PIPE_MTE2": 100},
+        waterlines={},
+    )
+    cube_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIC.PIPE_M": 40, "AIV0.PIPE_V": 80},
+        waterlines={},
+    )
+    vec_ctx = build_predicate_context(vec_ledger)
+    cube_ctx = build_predicate_context(cube_ledger)
+
+    rule_id = "R01_DUAL_COPY_1C2V_SPLIT"
+    for _ in range(10):
+        tracker.record_outcome(rule_id, postcondition_realized=False, paradigm="pure_vector")
+    tracker.record_outcome(
+        rule_id,
+        postcondition_realized=True,
+        speed_gain=0.4,
+        paradigm="cv_coupled",
+    )
+
+    pruned_vec = tracker.prune_underperforming(
+        min_trials=5, prune_threshold=0.25, paradigm="pure_vector"
+    )
+    assert rule_id in pruned_vec
+    assert tracker.is_pruned(rule_id, paradigm="pure_vector") is True
+    assert tracker.is_pruned(rule_id, paradigm="cv_coupled") is False
+    assert tracker.is_pruned(rule_id) is False
+
+    vec_ids = [r.rule_id for r in tracker.rank_applicable_rules(vec_ctx, paradigm="pure_vector")]
+    cube_ids = [r.rule_id for r in tracker.rank_applicable_rules(cube_ctx, paradigm="cv_coupled")]
+    assert rule_id not in vec_ids
+    assert rule_id in cube_ids
+
+    ckpt_file = tmp_path / "paradigm_tracker.json"
+    tracker.save_json(ckpt_file)
+    restored = BayesianRuleTracker.from_seed_yaml()
+    restored.load_posteriors_json(ckpt_file)
+    assert restored.is_pruned(rule_id, paradigm="pure_vector") is True
+    assert restored.is_pruned(rule_id, paradigm="cv_coupled") is False
+    assert rule_id not in [
+        r.rule_id for r in restored.rank_applicable_rules(vec_ctx, paradigm="pure_vector")
+    ]
+    assert rule_id in [
+        r.rule_id for r in restored.rank_applicable_rules(cube_ctx, paradigm="cv_coupled")
+    ]

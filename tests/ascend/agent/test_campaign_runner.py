@@ -1518,3 +1518,515 @@ def test_all_six_production_regimes_extract_resolve_and_pass_stage_a() -> None:
         res = inspect_tilelang_primfunc(fn, compile_flags=list(PURE_SIMDVF_UBUF_FLAGS))
         assert res.ledger.is_legal, res.lowering_error
         assert res.ledger.uses_unreserved_ubuf is True
+
+
+def test_per_regime_beam_isolation_objective_ranking_and_checkpoint(tmp_path: Path) -> None:
+    """Verify isolated per-regime beams, objective_score ranking, and beam_states roundtrip."""
+    from tilefoundry_ascend.agent.orchestrator import (
+        BeamCandidate,
+        TwoLaneBeamSearch,
+        compute_static_dynamic_residual,
+    )
+
+    ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=100,
+        pipe_cycles={"AIV0.PIPE_V": 100},
+        waterlines={},
+    )
+    res = compute_static_dynamic_residual(ledger, {"dur_us": 10.0, "roofline_eta": 0.5})
+
+    beam = TwoLaneBeamSearch(exploit_width=1, stepping_stone_width=1)
+    c_low_obj = BeamCandidate(
+        candidate_id="low_obj_fast",
+        round_idx=1,
+        worker_kind="rule_exploit",
+        rule_id=None,
+        dsl_source=_IMPROVED_REGIME_A,
+        track="unconstrained",
+        ledger=ledger,
+        residual=res,
+        latency_us=5.0,
+        accuracy_passed=True,
+        objective_score=70.0,
+    )
+    c_high_obj = BeamCandidate(
+        candidate_id="high_obj_best",
+        round_idx=1,
+        worker_kind="rule_exploit",
+        rule_id=None,
+        dsl_source=_SSBUF_REGIME_A,
+        track="unconstrained",
+        ledger=ledger,
+        residual=res,
+        latency_us=8.0,
+        accuracy_passed=True,
+        objective_score=95.0,
+    )
+    beam.update([c_low_obj, c_high_obj])
+    assert [c.candidate_id for c in beam.exploit_beam] == ["high_obj_best"]
+    beam_rt = TwoLaneBeamSearch.from_dict(beam.to_dict())
+    assert beam_rt.exploit_beam[0].objective_score == 95.0
+
+    anchors = (
+        AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 2.0),
+        AnchorCaseSpec("level4/attention_residual", 4, "regime_b", 20.0, 6.0),
+    )
+    regimes = (
+        RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),
+        RegimeTargetSpec("regime_b", ("_build_regime_b",), {}),
+    )
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    ckpt_path = tmp_path / "ckpt_multi_beam.json"
+
+    creative_a = json.dumps(
+        {
+            "physical_hypothesis": "SSBUF on regime A",
+            "target_local_metric": "sync_stall",
+            "dsl_source": _SSBUF_REGIME_A,
+        }
+    )
+    creative_b = json.dumps(
+        {
+            "physical_hypothesis": "Kernel(2) on regime B",
+            "target_local_metric": "aiv_vec",
+            "dsl_source": _IMPROVED_REGIME_B,
+        }
+    )
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [_IMPROVED_REGIME_A] * 8 + [_IMPROVED_REGIME_B] * 8,
+            "explore_creative": [creative_a] * 4 + [creative_b] * 4,
+        }
+    )
+
+    def _l2_eval(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            lat_a = 15.0 if "T.alloc_ss" in src else 12.0
+            lat_b = 24.0
+            out[cid] = _make_surrogate_result(
+                cid, "attention_residual", tuple(active_anchors), {2: lat_a, 4: lat_b}
+            )
+        return out
+
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=8,
+            stagnation_escalate_rounds=2,
+            stagnation_freeze_rounds=4,
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        beam=TwoLaneBeamSearch(exploit_width=1, stepping_stone_width=1),
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_eval,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        checkpoint_path=ckpt_path,
+    )
+    asyncio.run(runner.run(resume=False))
+
+    beam_a = runner.beam_for_regime("regime_a")
+    beam_b = runner.beam_for_regime("regime_b")
+    assert beam_a is not beam_b
+    assert any("T.alloc_ss" in c.dsl_source for c in beam_a.stepping_stone_beam)
+    assert all("T.alloc_ss" not in c.dsl_source for c in beam_b.exploit_beam)
+    assert all("T.alloc_ss" not in c.dsl_source for c in beam_b.stepping_stone_beam)
+
+    ckpt_data = json.loads(ckpt_path.read_text(encoding="utf-8"))
+    assert "beam_states" in ckpt_data
+    assert set(ckpt_data["beam_states"]) == {"regime_a", "regime_b"}
+
+    resumed = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="attention_residual", max_rounds=8),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_eval,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        checkpoint_path=ckpt_path,
+    )
+    resumed._restore_from_checkpoint()
+    assert any("T.alloc_ss" in c.dsl_source for c in resumed.beam_for_regime("regime_a").stepping_stone_beam)
+    assert all(
+        "T.alloc_ss" not in c.dsl_source
+        for c in resumed.beam_for_regime("regime_b").stepping_stone_beam
+    )
+
+
+def test_campaign_paradigm_pruning_and_cross_paradigm_isolation(tmp_path: Path) -> None:
+    """Verify round-end paradigm-scoped pruning never blocks rules in other paradigms."""
+    anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 2.0),)
+    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),)
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+
+    tracker = BayesianRuleTracker.from_seed_yaml()
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [_IMPROVED_REGIME_A] * 24,
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "No gain probe",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": _IMPROVED_REGIME_A,
+                    }
+                )
+            ]
+            * 12,
+        }
+    )
+
+    def _l2_flat(cands, active_anchors):
+        return {
+            cid: _make_surrogate_result(
+                cid, "attention_residual", tuple(active_anchors), {2: 12.0}
+            )
+            for cid, _p in cands
+        }
+
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=10,
+            k_rule_workers=2,
+            stagnation_freeze_rounds=12,
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        tracker=tracker,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_flat,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        checkpoint_path=tmp_path / "ckpt_prune.json",
+    )
+    report = asyncio.run(runner.run(resume=False))
+    pruned_any = [rid for r in report.rounds for rid in r.pruned_rule_ids]
+    assert pruned_any
+    assert "pure_vector" in tracker.paradigm_posteriors
+    for rid in pruned_any:
+        assert tracker.is_pruned(rid, paradigm="pure_vector") is True
+        assert tracker.is_pruned(rid, paradigm="cv_coupled") is False
+        assert tracker.is_pruned(rid) is False
+
+
+def test_resolve_regime_for_case_and_dynamic_l4_regression_routing(tmp_path: Path) -> None:
+    """Verify lookup_case_dims, resolve_regime_for_case, and L4 routing to non-zero regime."""
+    import yaml
+    from tilefoundry_ascend.agent.campaign import (
+        get_default_regime_specs,
+        lookup_case_dims,
+        resolve_regime_for_case,
+    )
+
+    ar_specs = get_default_regime_specs("attention_residual")
+    mla_specs = get_default_regime_specs("mla")
+    assert resolve_regime_for_case("attention_residual", {"B": 1, "S": 1, "D": 4096}, ar_specs).regime_tag == "small_decode"
+    assert resolve_regime_for_case("attention_residual", {"B": 1, "S": 333, "D": 2047}, ar_specs).regime_tag == "unaligned_d"
+    assert resolve_regime_for_case("attention_residual", {"B": 2, "S": 64, "D": 4096}, ar_specs).regime_tag == "aligned_prefill"
+    assert resolve_regime_for_case("mla", {"inputLayout": "BNSD", "S": 128}, mla_specs).regime_tag == "bnsd_gather"
+    assert resolve_regime_for_case("mla", {"inputLayout": "BSND", "S": 2}, mla_specs).regime_tag == "split_kv_decode"
+    assert resolve_regime_for_case("mla", {"inputLayout": "BSND", "S": 128}, mla_specs).regime_tag == "prefill_compute"
+
+    repo = _setup_mock_cann_repo(tmp_path)
+    ar_dir = repo / "operators" / "level4" / "attention_residual"
+    ar_dir.mkdir(parents=True, exist_ok=True)
+    cases_payload = {
+        "cases": [
+            {
+                "case_id": 5,
+                "input_shape": [[8, 1, 512, 1024], [1, 512, 1024], [1024], [1024]],
+                "attrs": {"alpha": 0.95, "epsilon": 1e-6},
+            },
+            {
+                "case_id": 9,
+                "input_shape": [[4, 1, 4096, 2560], [1, 4096, 2560], [2560], [2560]],
+                "attrs": {"alpha": 0.5, "epsilon": 1e-6},
+            },
+        ]
+    }
+    (ar_dir / "cases.yaml").write_text(yaml.safe_dump(cases_payload), encoding="utf-8")
+    dims_5 = lookup_case_dims("attention_residual", 5, cannbench_repo=repo)
+    assert dims_5["N"] == 8 and dims_5["B"] == 1 and dims_5["S"] == 512 and dims_5["D"] == 1024
+
+    mla_dir = repo / "operators" / "level4" / "mla"
+    mla_dir.mkdir(parents=True, exist_ok=True)
+    mla_cases = {
+        "cases": [
+            {
+                "case_id": 14,
+                "input_shape": [
+                    [2, 128, 128, 448],
+                    [2, 128, 128, 64],
+                    [2, 1, 512, 448],
+                    [2, 1, 512, 64],
+                    [2, 1, 512, 448],
+                ],
+                "attrs": {"numKVHeads": 1, "inputLayout": "BNSD", "is_causal": True},
+            }
+        ]
+    }
+    (mla_dir / "cases.yaml").write_text(yaml.safe_dump(mla_cases), encoding="utf-8")
+    dims_14 = lookup_case_dims("mla", 14, cannbench_repo=repo)
+    assert dims_14["B"] == 2 and dims_14["N_q"] == 128 and dims_14["S"] == 128
+    assert dims_14["D_nope"] == 448 and dims_14["D_rope"] == 64
+    assert dims_14["S_kv"] == 512 and dims_14["N_kv"] == 1 and dims_14["inputLayout"] == "BNSD"
+
+    regimes = (
+        RegimeTargetSpec("small_decode", ("_build_regime_a",), {}),
+        RegimeTargetSpec("aligned_prefill", ("_build_regime_b",), {}),
+    )
+    anchors = (AnchorCaseSpec("level4/attention_residual", 2, "small_decode", 10.0, 2.0),)
+    target_path = tmp_path / "kernels_l4.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [_IMPROVED_REGIME_B] * 4,
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Fix aligned prefill tail",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": _IMPROVED_REGIME_B,
+                    }
+                )
+            ]
+            * 2,
+        }
+    )
+
+    def _l2_eval(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            lat_map = {}
+            for a in active_anchors:
+                if a.case_num == 5:
+                    lat_map[5] = 8.0 if "def _build_regime_b(tile_m=4)" in src else 22.0
+                else:
+                    lat_map[a.case_num] = 5.0
+            out[cid] = _make_surrogate_result(
+                cid, "attention_residual", tuple(active_anchors), lat_map
+            )
+        return out
+
+    l4_calls = [0]
+
+    def _l4_runner(_p: Path) -> L4CannbenchResult:
+        l4_calls[0] += 1
+        if l4_calls[0] == 1:
+            return L4CannbenchResult(
+                passed=True,
+                avg_speedup=1.4,
+                score=82.0,
+                per_case_speedups={2: 2.0, 5: 0.75},
+                per_case_elapsed_us={2: 5.0, 5: 22.8},
+            )
+        return L4CannbenchResult(
+            passed=True,
+            avg_speedup=2.1,
+            score=91.0,
+            per_case_speedups={2: 2.0, 5: 2.1},
+            per_case_elapsed_us={2: 5.0, 5: 8.1},
+        )
+
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=0,
+            run_final_l4=True,
+            l4_regression_ratio=0.95,
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_eval,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        l4_cannbench_runner=_l4_runner,
+        checkpoint_path=tmp_path / "ckpt_l4_route.json",
+        cannbench_repo=repo,
+    )
+    rep = asyncio.run(runner.run(resume=False))
+    assert rep.total_rounds == 1
+    assert rep.rounds[0].regime_tag == "aligned_prefill"
+    assert rep.rounds[0].builder_name == "_build_regime_b"
+    assert rep.active_anchors[-1].case_num == 5
+    assert rep.active_anchors[-1].regime_tag == "aligned_prefill"
+    assert "def _build_regime_b(tile_m=4)" in target_path.read_text(encoding="utf-8")
+
+
+def test_for_regime_and_msprof_collector_caching_wakes_r05_and_r11(tmp_path: Path) -> None:
+    """Verify strict for_regime filtering and msprof caching feeding R05/R11 and prompts."""
+    from tilefoundry_ascend.agent.campaign import bottleneck_anchor_for_regime
+    from tilefoundry_ascend.ascend.passes import build_scope_waterline
+
+    anchors = (
+        AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 2.0),
+        AnchorCaseSpec("level4/attention_residual", 4, "regime_a", 20.0, 4.0),
+        AnchorCaseSpec("level4/attention_residual", 16, "regime_b", 100.0, 20.0),
+    )
+    mixed = _make_surrogate_result(
+        "mixed", "attention_residual", anchors, {2: 4.0, 4: 18.0, 16: 25.0}
+    )
+    reg_a = mixed.for_regime("regime_a")
+    assert [a.case_num for a in reg_a.anchors] == [2, 4]
+    assert reg_a.avg_speedup != mixed.avg_speedup
+    bn_a = bottleneck_anchor_for_regime(mixed, "regime_a")
+    assert bn_a is not None and bn_a.case_num == 4
+    empty_res = mixed.for_regime("nonexistent")
+    assert empty_res.anchors == () and empty_res.surrogate_score == 0.0
+
+    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),)
+    target_path = tmp_path / "kernels_msprof.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    ckpt_path = tmp_path / "ckpt_msprof.json"
+
+    ub_half = build_scope_waterline(
+        scope="UB",
+        capacity_bytes=262144,
+        explicit_buffers={"a": 131072},
+        implicit_buffers={},
+    )
+    r05_r11_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 64, "AIV1.PIPE_V": 64},
+        waterlines={"UB": ub_half},
+        dominant_contig_bytes=512,
+        has_online_rescale_loop=True,
+    )
+
+    def _l0_r05_r11(_src: str, _reg: RegimeTargetSpec) -> StageAResult:
+        return StageAResult(passed=True, prim_func=None, ledger=r05_r11_ledger)
+
+    from tilefoundry_ascend.agent.kb import build_predicate_context
+    from tilefoundry_ascend.agent.orchestrator import compute_static_dynamic_residual
+
+    no_msprof_ctx = build_predicate_context(
+        r05_r11_ledger,
+        residual=compute_static_dynamic_residual(
+            r05_r11_ledger, {"dur_us": 18.0, "roofline_eta": 0.2}
+        ),
+    )
+    probe_tracker = BayesianRuleTracker.from_seed_yaml()
+    no_msprof_ids = {r.rule_id for r in probe_tracker.rank_applicable_rules(no_msprof_ctx)}
+    assert "R05_SSBUF_RING_METADATA_HANDOFF" not in no_msprof_ids
+    assert "R11_L2_NZ_PAD_BANK_CONFLICT_AVOID" not in no_msprof_ids
+
+    msprof_calls: list[list[int]] = []
+
+    def _mock_msprof_collector(op_name, cand_path, target_anchors):
+        assert op_name == "attention_residual"
+        assert Path(cand_path).is_file()
+        msprof_calls.append([int(a.case_num) for a in target_anchors])
+        return {
+            "regime_a": {
+                "aic_mac_ratio": 0.0,
+                "aiv_vec_ratio": 0.20,
+                "mte2_wait_ratio": 0.30,
+                "sync_stall_ratio": 0.60,
+                "dur_us": 18.0,
+            }
+        }
+
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [_IMPROVED_REGIME_A] * 6,
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Fix sync stall and bank conflict",
+                        "target_local_metric": "sync_stall_ratio",
+                        "dsl_source": _IMPROVED_REGIME_A,
+                    }
+                )
+            ]
+            * 4,
+        }
+    )
+
+    def _l2_eval(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            lat2 = 2.5 if "T.Kernel(2)" in src else 4.0
+            lat4 = 6.0 if "T.Kernel(2)" in src else 18.0
+            out[cid] = _make_surrogate_result(
+                cid,
+                "attention_residual",
+                tuple(active_anchors),
+                {2: lat2, 4: lat4, 16: 25.0},
+            )
+        return out
+
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=2,
+            k_rule_workers=3,
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 5.0, 3.0, 0.95),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        l0_checker=_l0_r05_r11,
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_eval,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        msprof_collector=_mock_msprof_collector,
+        checkpoint_path=ckpt_path,
+    )
+    asyncio.run(runner.run(resume=False))
+
+    assert len(msprof_calls) == 2
+    assert msprof_calls[0] == [4]
+    assert msprof_calls[1] == [4]
+
+    rule_ids_prompted = [
+        req.user_prompt for req in backend.calls if req.role == "exploit_rule"
+    ]
+    assert any("R05_SSBUF_RING_METADATA_HANDOFF" in p for p in rule_ids_prompted)
+    assert any("R11_L2_NZ_PAD_BANK_CONFLICT_AVOID" in p for p in rule_ids_prompted)
+    assert any("### HARDWARE MSPROF TELEMETRY" in req.user_prompt for req in backend.calls)
+
+    ckpt_data = json.loads(ckpt_path.read_text(encoding="utf-8"))
+    assert "msprof_cache" in ckpt_data and len(ckpt_data["msprof_cache"]) == 2
+    runner_resumed = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="attention_residual", max_rounds=2),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 5.0, 3.0, 0.95),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        l0_checker=_l0_r05_r11,
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_eval,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        msprof_collector=_mock_msprof_collector,
+        checkpoint_path=ckpt_path,
+    )
+    runner_resumed._restore_from_checkpoint()
+    assert len(runner_resumed._msprof_cache) == 2
