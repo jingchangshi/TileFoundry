@@ -110,12 +110,23 @@ class MicroProbeSpec:
         }
 
 
+_SUPPORTED_PROBE_KINDS = (
+    "core_parallelism",
+    "coalesced_copy",
+    "pipeline_versions",
+    "ssbuf_handoff",
+    "barrier_prune",
+    "dual_copy_1c2v",
+    "pad_alignment",
+)
+
+
 @dataclass(frozen=True)
 class DistilledRuleOutcome:
     """Verification and KB admission outcome for one winning AST mechanism."""
 
     chunk_id: str
-    probe: MicroProbeSpec
+    probe: MicroProbeSpec | None
     hardware_verified: bool
     probe_metrics: dict[str, float]
     rule: AscendCausalRule | None
@@ -126,7 +137,7 @@ class DistilledRuleOutcome:
         """Serialize distilled rule verification and admission record."""
         return {
             "chunk_id": self.chunk_id,
-            "probe": self.probe.to_dict(),
+            "probe": self.probe.to_dict() if self.probe is not None else None,
             "hardware_verified": self.hardware_verified,
             "probe_metrics": dict(self.probe_metrics),
             "rule_id": self.rule.rule_id if self.rule else None,
@@ -201,17 +212,84 @@ def _node_tag(node: ast.AST) -> str:
 
 def _classify_edit(before_src: str, after_src: str) -> str:
     combined = f"{before_src} {after_src}"
-    if "num_stages" in combined or "annotate_buffer_versions" in combined:
-        return "pipeline_versions"
     if "alloc_ss" in combined or "SSBUF" in combined:
         return "ssbuf_handoff"
-    if "T.Kernel" in combined or "T.MixedKernel" in combined or "num_cores" in combined or "num_blocks" in combined:
-        return "core_parallelism"
-    if "T.copy" in combined or "T.dual_copy" in combined:
-        return "coalesced_copy"
-    if "ascend_pipe_barrier" in combined:
+    if "T.dual_copy" in combined or (
+        "T.MixedKernel" in after_src and "T.Kernel" in before_src
+    ):
+        return "dual_copy_1c2v"
+    if (
+        "gm_to_ub_pad" in combined
+        or "pad_value" in combined
+        or ("alloc_shared" in before_src and "alloc_shared" in after_src and before_src != after_src)
+    ):
+        return "pad_alignment"
+    if "ascend_pipe_barrier" in combined or "unit_flag_ctrl" in combined:
         return "barrier_prune"
+    if "num_stages" in combined or "annotate_buffer_versions" in combined:
+        return "pipeline_versions"
+    if (
+        "T.Kernel" in combined
+        or "T.MixedKernel" in combined
+        or "num_cores" in combined
+        or "num_blocks" in combined
+    ):
+        return "core_parallelism"
+    if "T.copy" in combined:
+        return "coalesced_copy"
     return "stmt_rewrite"
+
+
+def _extract_probe_params(chunk: AstEditChunk) -> dict[str, object]:
+    """Extract and clamp concrete tile, core, stage, and dtype parameters from AST."""
+    cores = 28
+    stages = 2
+    tile_elems = 2048
+    dtype = "float32"
+
+    for candidate_src in (chunk.after_src, chunk.ablated_dsl):
+        if not candidate_src.strip():
+            continue
+        try:
+            tree = ast.parse(candidate_src)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                attr = node.func.attr
+                if attr in ("Kernel", "MixedKernel") and node.args:
+                    arg0 = node.args[0]
+                    if isinstance(arg0, ast.Constant) and isinstance(arg0.value, int):
+                        cores = max(2, min(56, int(arg0.value)))
+                elif attr == "Pipelined":
+                    for kw in node.keywords:
+                        if kw.arg == "num_stages" and isinstance(kw.value, ast.Constant):
+                            if isinstance(kw.value.value, int):
+                                stages = max(2, min(3, int(kw.value.value)))
+                elif attr in ("alloc_shared", "alloc_l1") and node.args:
+                    shape_arg = node.args[0]
+                    if isinstance(shape_arg, (ast.Tuple, ast.List)):
+                        ints = [
+                            int(elt.value)
+                            for elt in shape_arg.elts
+                            if isinstance(elt, ast.Constant) and isinstance(elt.value, int)
+                        ]
+                        if len(ints) == len(shape_arg.elts) and ints:
+                            prod = 1
+                            for dim_val in ints:
+                                prod *= max(1, dim_val)
+                            aligned = ((prod + 127) // 128) * 128
+                            tile_elems = max(512, min(4096, aligned))
+                    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                        dt_val = str(node.args[1].value)
+                        if dt_val in ("float32", "float16", "bfloat16"):
+                            dtype = dt_val
+    return {
+        "cores": cores,
+        "stages": stages,
+        "tile_elems": tile_elems,
+        "dtype": dtype,
+    }
 
 
 def _set_stmt_by_path(tree: ast.Module, path: tuple[int, ...], new_stmt: ast.stmt | None) -> bool:
@@ -506,13 +584,23 @@ def decompose_ast_ablations(baseline_dsl: str, winner_dsl: str) -> tuple[AstEdit
     return tuple(chunks)
 
 
-def _probe_templates_for_kind(probe_kind: str) -> tuple[str, str, tuple[int, ...], str]:
+def _probe_templates_for_kind(
+    probe_kind: str,
+    params: Mapping[str, object] | None = None,
+) -> tuple[str, str, tuple[int, ...], str] | None:
+    cfg = dict(params or {})
+    cores = max(2, min(56, int(cfg.get("cores", 28))))
+    mix_cores = max(2, min(28, cores))
+    stages = max(2, min(3, int(cfg.get("stages", 2))))
+    tile = max(512, min(4096, ((int(cfg.get("tile_elems", 2048)) + 127) // 128) * 128))
+    dtype = str(cfg.get("dtype", "float32"))
+
     if probe_kind == "core_parallelism":
-        base = """import tilelang.ascend.language as T
+        base = f"""import tilelang.ascend.language as T
 
 def make_flywheel_probe():
-    tile = 2048
-    steps = 56
+    tile = {tile}
+    steps = {cores}
     total = tile * steps
 
     @T.prim_func
@@ -525,7 +613,7 @@ def make_flywheel_probe():
             a_ub = T.alloc_shared((tile,), "float32")
             b_ub = T.alloc_shared((tile,), "float32")
             c_ub = T.alloc_shared((tile,), "float32")
-            T.annotate_buffer_versions({a_ub: 1, b_ub: 1, c_ub: 1})
+            T.annotate_buffer_versions({{a_ub: 1, b_ub: 1, c_ub: 1}})
             for s in T.Pipelined(steps, num_stages=1):
                 off = s * tile + bx * 0
                 T.copy(A[off : off + tile], a_ub)
@@ -540,11 +628,11 @@ def make_flywheel_probe():
                 T.ascend_pipe_barrier("PIPE_ALL")
     return main
 """
-        opt = """import tilelang.ascend.language as T
+        opt = f"""import tilelang.ascend.language as T
 
 def make_flywheel_probe():
-    tile = 2048
-    cores = 56
+    tile = {tile}
+    cores = {cores}
     total = tile * cores
 
     @T.prim_func
@@ -557,7 +645,7 @@ def make_flywheel_probe():
             a_ub = T.alloc_shared((tile,), "float32")
             b_ub = T.alloc_shared((tile,), "float32")
             c_ub = T.alloc_shared((tile,), "float32")
-            T.annotate_buffer_versions({a_ub: 1, b_ub: 1, c_ub: 1})
+            T.annotate_buffer_versions({{a_ub: 1, b_ub: 1, c_ub: 1}})
             off = bx * tile
             T.copy(A[off : off + tile], a_ub)
             T.copy(B[off : off + tile], b_ub)
@@ -570,15 +658,17 @@ def make_flywheel_probe():
             T.copy(c_ub, C[off : off + tile])
     return main
 """
-        return base, opt, (2048 * 56,), "float32"
+        return base, opt, (tile * cores,), dtype
 
     if probe_kind == "coalesced_copy":
-        base = """import tilelang.ascend.language as T
+        rows = 16
+        cols = 128
+        base = f"""import tilelang.ascend.language as T
 
 def make_flywheel_probe():
-    cores = 28
-    rows = 16
-    cols = 128
+    cores = {mix_cores}
+    rows = {rows}
+    cols = {cols}
 
     @T.prim_func
     def main(
@@ -605,12 +695,12 @@ def make_flywheel_probe():
                 T.copy(c_ub[r, 0:cols], C[base_r + r, 0:cols])
     return main
 """
-        opt = """import tilelang.ascend.language as T
+        opt = f"""import tilelang.ascend.language as T
 
 def make_flywheel_probe():
-    cores = 28
-    rows = 16
-    cols = 128
+    cores = {mix_cores}
+    rows = {rows}
+    cols = {cols}
 
     @T.prim_func
     def main(
@@ -635,14 +725,16 @@ def make_flywheel_probe():
             T.copy(c_ub, C[base_r : base_r + rows, 0:cols])
     return main
 """
-        return base, opt, (28 * 16, 128), "float32"
+        return base, opt, (mix_cores * rows, cols), dtype
 
-    base = """import tilelang.ascend.language as T
+    if probe_kind == "pipeline_versions":
+        steps = 16
+        base = f"""import tilelang.ascend.language as T
 
 def make_flywheel_probe():
-    tile = 2048
-    steps = 16
-    cores = 28
+    tile = {tile}
+    steps = {steps}
+    cores = {mix_cores}
     total = cores * steps * tile
 
     @T.prim_func
@@ -655,7 +747,7 @@ def make_flywheel_probe():
             a_ub = T.alloc_shared((tile,), "float32")
             b_ub = T.alloc_shared((tile,), "float32")
             c_ub = T.alloc_shared((tile,), "float32")
-            T.annotate_buffer_versions({a_ub: 1, b_ub: 1, c_ub: 1})
+            T.annotate_buffer_versions({{a_ub: 1, b_ub: 1, c_ub: 1}})
             for s in T.Pipelined(steps, num_stages=1):
                 off = (s * cores + bx) * tile
                 T.copy(A[off : off + tile], a_ub)
@@ -670,12 +762,12 @@ def make_flywheel_probe():
                 T.ascend_pipe_barrier("PIPE_ALL")
     return main
 """
-    opt = """import tilelang.ascend.language as T
+        opt = f"""import tilelang.ascend.language as T
 
 def make_flywheel_probe():
-    tile = 2048
-    steps = 16
-    cores = 28
+    tile = {tile}
+    steps = {steps}
+    cores = {mix_cores}
     total = cores * steps * tile
 
     @T.prim_func
@@ -688,8 +780,8 @@ def make_flywheel_probe():
             a_ub = T.alloc_shared((tile,), "float32")
             b_ub = T.alloc_shared((tile,), "float32")
             c_ub = T.alloc_shared((tile,), "float32")
-            T.annotate_buffer_versions({a_ub: 2, b_ub: 2, c_ub: 2})
-            for s in T.Pipelined(steps, num_stages=2):
+            T.annotate_buffer_versions({{a_ub: {stages}, b_ub: {stages}, c_ub: {stages}}})
+            for s in T.Pipelined(steps, num_stages={stages}):
                 off = (s * cores + bx) * tile
                 T.copy(A[off : off + tile], a_ub)
                 T.copy(B[off : off + tile], b_ub)
@@ -702,17 +794,297 @@ def make_flywheel_probe():
                 T.copy(c_ub, C[off : off + tile])
     return main
 """
-    return base, opt, (28 * 16 * 2048,), "float32"
+        return base, opt, (mix_cores * steps * tile,), dtype
+
+    if probe_kind == "ssbuf_handoff":
+        rounds = 64
+        base = f"""import tilelang.ascend.language as T
+
+def make_flywheel_probe():
+    rounds = {rounds}
+    tile = 16
+
+    @T.prim_func
+    def main(
+        seed: T.Tensor((tile, tile), "float16"),
+        scratch: T.Tensor((rounds, 2), "uint32"),
+        out: T.Tensor((rounds, 1), "uint64"),
+    ):
+        with T.MixedKernel(1) as (_, sid):
+            cube = T.alloc_l1((tile, tile), "float16")
+            tmp_ub = T.alloc_shared((1,), "uint32")
+            T.copy(seed, cube)
+            for i in T.Pipelined(
+                rounds,
+                num_stages=1,
+            ):
+                with T.Stage(0):
+                    val = T.Cast("uint32", (i + 1) * (100 + sid))
+                    tmp_ub[0] = val
+                    T.copy(tmp_ub, scratch[i, sid : sid + 1])
+                with T.Stage(0):
+                    lo = T.Cast("uint64", scratch[i, 0])
+                    hi = T.Cast("uint64", scratch[i, 1]) << 32
+                    out[i, 0] = lo | hi
+                    T.ascend_pipe_barrier("PIPE_ALL")
+    return main
+"""
+        opt = f"""import tilelang.ascend.language as T
+
+def make_flywheel_probe():
+    rounds = {rounds}
+    tile = 16
+
+    @T.prim_func
+    def main(
+        seed: T.Tensor((tile, tile), "float16"),
+        out: T.Tensor((rounds, 1), "uint64"),
+    ):
+        with T.MixedKernel(1) as (_, sid):
+            words = T.alloc_ss((2,), "uint32")
+            packed = T.view(words, shape=(1,), dtype="uint64")
+            T.annotate_buffer_versions({{words: (3, "auto")}})
+            cube = T.alloc_l1((tile, tile), "float16")
+            T.copy(seed, cube)
+            for i in T.Pipelined(
+                rounds,
+                num_stages=3,
+                annotations={{"enable_offset": True}},
+            ):
+                with T.Stage(0):
+                    words[sid] = T.Cast(
+                        "uint32",
+                        (i + 1) * (100 + sid),
+                    )
+                with T.Stage(2):
+                    out[i, 0] = packed[0]
+    return main
+"""
+        return base, opt, (rounds, 1), "uint64"
+
+    if probe_kind == "barrier_prune":
+        steps = 16
+        base = f"""import tilelang.ascend.language as T
+
+def make_flywheel_probe():
+    tile = {tile}
+    steps = {steps}
+    cores = {mix_cores}
+    total = cores * steps * tile
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((total,), "float32"),
+        B: T.Tensor((total,), "float32"),
+        C: T.Tensor((total,), "float32"),
+    ):
+        with T.Kernel(cores) as bx:
+            a_ub = T.alloc_shared((tile,), "float32")
+            b_ub = T.alloc_shared((tile,), "float32")
+            c_ub = T.alloc_shared((tile,), "float32")
+            T.annotate_buffer_versions({{a_ub: {stages}, b_ub: {stages}, c_ub: {stages}}})
+            for s in T.Pipelined(steps, num_stages={stages}):
+                off = (s * cores + bx) * tile
+                T.copy(A[off : off + tile], a_ub)
+                T.copy(B[off : off + tile], b_ub)
+                T.ascend_pipe_barrier("PIPE_ALL")
+                with T.SimdVF():
+                    mask = T.simd.pset(32)
+                    for i in range(tile // 64):
+                        va = T.simd.vld(a_ub[i * 64])
+                        vb = T.simd.vld(b_ub[i * 64])
+                        T.simd.vsts(c_ub[i * 64], T.simd.vadd(va, vb, mask), mask)
+                T.ascend_pipe_barrier("PIPE_ALL")
+                T.copy(c_ub, C[off : off + tile])
+                T.ascend_pipe_barrier("PIPE_ALL")
+    return main
+"""
+        opt = f"""import tilelang.ascend.language as T
+
+def make_flywheel_probe():
+    tile = {tile}
+    steps = {steps}
+    cores = {mix_cores}
+    total = cores * steps * tile
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((total,), "float32"),
+        B: T.Tensor((total,), "float32"),
+        C: T.Tensor((total,), "float32"),
+    ):
+        with T.Kernel(cores) as bx:
+            a_ub = T.alloc_shared((tile,), "float32")
+            b_ub = T.alloc_shared((tile,), "float32")
+            c_ub = T.alloc_shared((tile,), "float32")
+            T.annotate_buffer_versions({{a_ub: {stages}, b_ub: {stages}, c_ub: {stages}}})
+            for s in T.Pipelined(steps, num_stages={stages}):
+                off = (s * cores + bx) * tile
+                T.copy(A[off : off + tile], a_ub)
+                T.copy(B[off : off + tile], b_ub)
+                with T.SimdVF():
+                    mask = T.simd.pset(32)
+                    for i in range(tile // 64):
+                        va = T.simd.vld(a_ub[i * 64])
+                        vb = T.simd.vld(b_ub[i * 64])
+                        T.simd.vsts(c_ub[i * 64], T.simd.vadd(va, vb, mask), mask)
+                T.copy(c_ub, C[off : off + tile])
+    return main
+"""
+        return base, opt, (mix_cores * steps * tile,), dtype
+
+    if probe_kind == "dual_copy_1c2v":
+        rows = 16
+        half_rows = 8
+        cols = 128
+        base = f"""import tilelang.ascend.language as T
+
+def make_flywheel_probe():
+    cores = {mix_cores}
+    rows = {rows}
+    cols = {cols}
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((cores * rows, cols), "float32"),
+        B: T.Tensor((cores * rows, cols), "float32"),
+        C: T.Tensor((cores * rows, cols), "float32"),
+    ):
+        with T.Kernel(cores) as bx:
+            a_ub = T.alloc_shared((rows, cols), "float32")
+            b_ub = T.alloc_shared((rows, cols), "float32")
+            c_ub = T.alloc_shared((rows, cols), "float32")
+            base_r = bx * rows
+            T.copy(A[base_r : base_r + rows, 0:cols], a_ub)
+            T.copy(B[base_r : base_r + rows, 0:cols], b_ub)
+            with T.SimdVF():
+                mask = T.simd.pset(32)
+                for r in T.serial(rows):
+                    for k in range(cols // 64):
+                        va = T.simd.vld(a_ub[r, k * 64])
+                        vb = T.simd.vld(b_ub[r, k * 64])
+                        T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)
+            T.copy(c_ub, C[base_r : base_r + rows, 0:cols])
+    return main
+"""
+        opt = f"""import tilelang.ascend.language as T
+
+def make_flywheel_probe():
+    cores = {mix_cores}
+    rows = {rows}
+    half_rows = {half_rows}
+    cols = {cols}
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((cores * rows, cols), "float32"),
+        B: T.Tensor((cores * rows, cols), "float32"),
+        C: T.Tensor((cores * rows, cols), "float32"),
+    ):
+        with T.MixedKernel(cores) as (bx, sid):
+            a_ub = T.alloc_shared((half_rows, cols), "float32")
+            b_ub = T.alloc_shared((half_rows, cols), "float32")
+            c_ub = T.alloc_shared((half_rows, cols), "float32")
+            row_off = bx * rows + sid * half_rows
+            T.copy(A[row_off : row_off + half_rows, 0:cols], a_ub)
+            T.copy(B[row_off : row_off + half_rows, 0:cols], b_ub)
+            with T.SimdVF():
+                mask = T.simd.pset(32)
+                for r in T.serial(half_rows):
+                    for k in range(cols // 64):
+                        va = T.simd.vld(a_ub[r, k * 64])
+                        vb = T.simd.vld(b_ub[r, k * 64])
+                        T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)
+            T.copy(c_ub, C[row_off : row_off + half_rows, 0:cols])
+    return main
+"""
+        return base, opt, (mix_cores * rows, cols), dtype
+
+    if probe_kind == "pad_alignment":
+        rows = 8
+        steps = 4
+        base = f"""import tilelang.ascend.language as T
+
+def make_flywheel_probe():
+    cores = {mix_cores}
+    rows = {rows}
+    cols = 70
+    steps = {steps}
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((cores * steps * rows, cols), "float32"),
+        B: T.Tensor((cores * steps * rows, cols), "float32"),
+        C: T.Tensor((cores * steps * rows, cols), "float32"),
+    ):
+        with T.Kernel(cores) as bx:
+            a_ub = T.alloc_shared((rows, cols), "float32")
+            b_ub = T.alloc_shared((rows, cols), "float32")
+            c_ub = T.alloc_shared((rows, cols), "float32")
+            for s in T.serial(steps):
+                r0 = (bx * steps + s) * rows
+                T.copy(A[r0 : r0 + rows, 0:cols], a_ub)
+                T.copy(B[r0 : r0 + rows, 0:cols], b_ub)
+                with T.SimdVF():
+                    mask = T.simd.pset(32)
+                    for r in T.serial(rows):
+                        va = T.simd.vld(a_ub[r, 0])
+                        vb = T.simd.vld(b_ub[r, 0])
+                        T.simd.vsts(c_ub[r, 0], T.simd.vadd(va, vb, mask), mask)
+                T.copy(c_ub, C[r0 : r0 + rows, 0:cols])
+    return main
+"""
+        opt = f"""import tilelang.ascend.language as T
+
+def make_flywheel_probe():
+    cores = {mix_cores}
+    rows = {rows}
+    cols = 128
+    steps = {steps}
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((cores * steps * rows, cols), "float32"),
+        B: T.Tensor((cores * steps * rows, cols), "float32"),
+        C: T.Tensor((cores * steps * rows, cols), "float32"),
+    ):
+        with T.Kernel(cores) as bx:
+            a_ub = T.alloc_shared((rows, cols), "float32")
+            b_ub = T.alloc_shared((rows, cols), "float32")
+            c_ub = T.alloc_shared((rows, cols), "float32")
+            for s in T.Pipelined(steps, num_stages={stages}):
+                r0 = (bx * steps + s) * rows
+                T.copy(A[r0 : r0 + rows, 0:cols], a_ub)
+                T.copy(B[r0 : r0 + rows, 0:cols], b_ub)
+                with T.SimdVF():
+                    mask = T.simd.pset(32)
+                    for r in T.serial(rows):
+                        for k in range(2):
+                            va = T.simd.vld(a_ub[r, k * 64])
+                            vb = T.simd.vld(b_ub[r, k * 64])
+                            T.simd.vsts(c_ub[r, k * 64], T.simd.vadd(va, vb, mask), mask)
+                T.copy(c_ub, C[r0 : r0 + rows, 0:cols])
+    return main
+"""
+        return base, opt, (mix_cores * steps * rows, 128), dtype
+
+    return None
 
 
 def synthesize_micro_probe(
     chunk: AstEditChunk,
     *,
     probe_id: str | None = None,
-) -> MicroProbeSpec:
-    """Synthesize a standalone 30-50 line Ascend 950 micro-probe isolating one AST mechanism."""
+) -> MicroProbeSpec | None:
+    """Synthesize a standalone 30-50 line micro-probe, or None for unmapped edits."""
+    if chunk.edit_kind not in _SUPPORTED_PROBE_KINDS:
+        return None
+    params = _extract_probe_params(chunk)
+    rendered = _probe_templates_for_kind(chunk.edit_kind, params)
+    if rendered is None:
+        return None
+    base_src, opt_src, shape, dtype = rendered
     pid = probe_id or f"probe_{chunk.edit_kind}_{chunk.chunk_id}"
-    base_src, opt_src, shape, dtype = _probe_templates_for_kind(chunk.edit_kind)
     return MicroProbeSpec(
         probe_id=pid,
         probe_kind=chunk.edit_kind,
@@ -730,16 +1102,33 @@ def verify_micro_probe_hardware(
     spec: MicroProbeSpec,
     *,
     probe_runner: Callable[[MicroProbeSpec], Mapping[str, float]] | None = None,
-    min_speedup: float = 1.05,
+    min_speedup: float = 1.08,
 ) -> tuple[bool, dict[str, float]]:
-    """Verify synthesized micro-probe correctness and latency gain on Ascend 950 NPU."""
+    """Verify synthesized micro-probe correctness, speedup, and pipe wait ratios on NPU."""
     if probe_runner is not None:
         raw = dict(probe_runner(spec))
         b_us = float(raw.get("baseline_dur_us", 0.0))
         o_us = float(raw.get("optimized_dur_us", 0.0))
         speedup = float(raw.get("speedup", (b_us / o_us) if b_us > 0.0 and o_us > 0.0 else 0.0))
         raw["speedup"] = speedup
-        passed = bool(raw.get("numerical_ok", True)) and b_us > 0.0 and o_us > 0.0 and speedup >= min_speedup
+        wait_ok = True
+        if "baseline_mte2_wait_ratio" in raw and "optimized_mte2_wait_ratio" in raw:
+            base_w = float(raw["baseline_mte2_wait_ratio"])
+            opt_w = float(raw["optimized_mte2_wait_ratio"])
+            if opt_w > max(base_w * 1.05, base_w + 0.05):
+                wait_ok = False
+        if "baseline_aiv_mte2" in raw and "optimized_aiv_mte2" in raw:
+            base_m = float(raw["baseline_aiv_mte2"])
+            opt_m = float(raw["optimized_aiv_mte2"])
+            if base_m > 0.0 and opt_m > max(base_m * 1.15, base_m + 0.05):
+                wait_ok = False
+        passed = (
+            bool(raw.get("numerical_ok", True))
+            and b_us > 0.0
+            and o_us > 0.0
+            and speedup >= min_speedup
+            and wait_ok
+        )
         return passed, raw
 
     import importlib.util
@@ -751,7 +1140,7 @@ def verify_micro_probe_hardware(
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         raise RuntimeError("Ascend NPU device is required for live micro-probe verification.")
 
-    def _compile_and_time(src: str, tag: str) -> tuple[float, torch.Tensor]:
+    def _compile_and_time(src: str, tag: str, kind: str) -> tuple[float, dict[str, float]]:
         with tempfile.TemporaryDirectory(prefix=f"tf_probe_{tag}_") as tmp_dir:
             mod_file = Path(tmp_dir) / "probe_mod.py"
             mod_file.write_text(src, encoding="utf-8")
@@ -763,24 +1152,76 @@ def verify_micro_probe_hardware(
             kernel = tilelang.compile(prim_func, target="ascend", out_idx=-1)
 
         torch.manual_seed(42)
-        a = torch.randn(spec.tensor_shape, dtype=torch.float32, device="npu")
-        b = torch.randn(spec.tensor_shape, dtype=torch.float32, device="npu")
-        out = kernel(a, b)
-        torch.npu.synchronize()
-        torch.testing.assert_close(out.cpu(), (a + b).cpu(), atol=1e-4, rtol=1e-4)
-        prof = do_bench(lambda: kernel(a, b), backend="msprof_detail", _n_warmup=3, _n_repeat=6)
-        return float(prof.dur_us), out.cpu()
+        if kind == "ssbuf_handoff":
+            rounds = spec.tensor_shape[0]
+            seed = torch.zeros((16, 16), dtype=torch.float16, device="npu")
+            expected = torch.tensor(
+                [[(i + 1) * 100 + (((i + 1) * 101) << 32)] for i in range(rounds)],
+                dtype=torch.uint64,
+            )
+            if tag == "base":
+                scratch = torch.zeros((rounds, 2), dtype=torch.uint32, device="npu")
+                out = kernel(seed, scratch)
+                torch.npu.synchronize()
+                torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+                prof = do_bench(
+                    lambda: kernel(seed, scratch),
+                    backend="msprof_detail",
+                    _n_warmup=3,
+                    _n_repeat=6,
+                )
+            else:
+                out = kernel(seed)
+                torch.npu.synchronize()
+                torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+                prof = do_bench(
+                    lambda: kernel(seed),
+                    backend="msprof_detail",
+                    _n_warmup=3,
+                    _n_repeat=6,
+                )
+        else:
+            run_shape = spec.tensor_shape
+            if kind == "pad_alignment" and tag == "base":
+                run_shape = (spec.tensor_shape[0], 70)
+            a = torch.randn(run_shape, dtype=torch.float32, device="npu")
+            b = torch.randn(run_shape, dtype=torch.float32, device="npu")
+            out = kernel(a, b)
+            torch.npu.synchronize()
+            torch.testing.assert_close(out.cpu(), (a + b).cpu(), atol=1e-4, rtol=1e-4)
+            prof = do_bench(
+                lambda: kernel(a, b),
+                backend="msprof_detail",
+                _n_warmup=3,
+                _n_repeat=6,
+            )
+        ratios = {
+            "aiv_mte2": float(getattr(prof, "aiv_mte2", 0.0)),
+            "aiv_vec": float(getattr(prof, "aiv_vec", 0.0)),
+            "aic_fixpipe": float(getattr(prof, "aic_fixpipe", 0.0)),
+        }
+        return float(prof.dur_us), ratios
 
-    b_us, _ = _compile_and_time(spec.baseline_probe_source, "base")
-    o_us, _ = _compile_and_time(spec.optimized_probe_source, "opt")
+    b_us, b_ratios = _compile_and_time(spec.baseline_probe_source, "base", spec.probe_kind)
+    o_us, o_ratios = _compile_and_time(spec.optimized_probe_source, "opt", spec.probe_kind)
     speedup = (b_us / o_us) if o_us > 0.0 else 0.0
+    wait_non_regression = True
+    if b_ratios["aiv_mte2"] > 0.0 and o_ratios["aiv_mte2"] > max(
+        b_ratios["aiv_mte2"] * 1.15, b_ratios["aiv_mte2"] + 0.05
+    ):
+        wait_non_regression = False
     metrics = {
         "baseline_dur_us": round(b_us, 6),
         "optimized_dur_us": round(o_us, 6),
         "speedup": round(speedup, 6),
         "numerical_ok": 1.0,
+        "aiv_mte2": round(o_ratios["aiv_mte2"], 6),
+        "aiv_vec": round(o_ratios["aiv_vec"], 6),
+        "aic_fixpipe": round(o_ratios["aic_fixpipe"], 6),
+        "baseline_aiv_mte2": round(b_ratios["aiv_mte2"], 6),
+        "optimized_aiv_mte2": round(o_ratios["aiv_mte2"], 6),
     }
-    return speedup >= min_speedup, metrics
+    return (speedup >= min_speedup and wait_non_regression), metrics
 
 
 def _generalize_template_text(chunk: AstEditChunk) -> str:
@@ -803,6 +1244,21 @@ def _generalize_template_text(chunk: AstEditChunk) -> str:
         return (
             "Replace global memory scalar barriers with 8B-aligned SSBUF T.alloc_ss slots "
             "and explicit dirty-SRAM uint32 zero initialization before steady-state handoff."
+        )
+    if chunk.edit_kind == "dual_copy_1c2v":
+        return (
+            "Partition shared DMA workloads across independent dual-vector worker slices "
+            "with 1C2V swizzle scheduling to double concurrent MTE2 and vector throughput."
+        )
+    if chunk.edit_kind == "barrier_prune":
+        return (
+            "Eliminate redundant T.sync_all and T.set_flag barriers inside steady-state loops, "
+            "retaining only the minimal cross-pipe synchronization required by dependencies."
+        )
+    if chunk.edit_kind == "pad_alignment":
+        return (
+            "Pad inner buffer trailing dimensions to 32-byte and 512-byte bank-aligned strides "
+            "so DMA bursts avoid unaligned tail transactions and bank conflict stalls."
         )
     return (
         "Replace sequential or over-synchronized inner statements with non-blocking "
@@ -831,6 +1287,24 @@ def _rule_predicates_for_kind(
             "dynamic_cross_core_handoff or cube_to_vector_ratio >= 0.0",
             "unexplained_gap_ratio >= 0.15 or measured_sync_stall_ratio > 0.05",
             "measured_sync_stall_ratio <= prev.measured_sync_stall_ratio",
+        )
+    if chunk.edit_kind == "dual_copy_1c2v":
+        return (
+            "cube_to_vector_ratio > 0.0 or static_affine_bounds",
+            "PIPE_MTE2 > 0 or PIPE_V > 0 or measured_mte2_wait_ratio > 0.1",
+            "any_overflow_bytes == 0 and measured_latency_us <= prev.measured_latency_us",
+        )
+    if chunk.edit_kind == "barrier_prune":
+        return (
+            "static_affine_bounds",
+            "measured_sync_stall_ratio > 0.05 or PIPE_V > 0",
+            "measured_sync_stall_ratio <= prev.measured_sync_stall_ratio and any_overflow_bytes == 0",
+        )
+    if chunk.edit_kind == "pad_alignment":
+        return (
+            "inner_contiguous_bytes >= 16",
+            "unaligned_dma_padding_bytes > 0 or PIPE_MTE2 > 0 or PIPE_V > 0",
+            "unaligned_dma_padding_bytes <= prev.unaligned_dma_padding_bytes and any_overflow_bytes == 0",
         )
     dom = ledger.dominant_pipe if ledger is not None else "AIV0.PIPE_V"
     _ = dom
@@ -897,7 +1371,7 @@ class FlywheelDistiller:
         tracker: BayesianRuleTracker,
         probe_runner: Callable[[MicroProbeSpec], Mapping[str, float]] | None = None,
         min_edit_gain: float = 0.03,
-        min_probe_speedup: float = 1.05,
+        min_probe_speedup: float = 1.08,
     ) -> None:
         self._funnel = funnel
         self._tracker = tracker
@@ -974,6 +1448,19 @@ class FlywheelDistiller:
                 continue
             seen_kinds.add(meas.chunk.edit_kind)
             probe = synthesize_micro_probe(meas.chunk)
+            if probe is None:
+                outcomes.append(
+                    DistilledRuleOutcome(
+                        chunk_id=meas.chunk.chunk_id,
+                        probe=None,
+                        hardware_verified=False,
+                        probe_metrics={},
+                        rule=None,
+                        admitted=False,
+                        rejection_reason=f"unverifiable_edit_kind:{meas.chunk.edit_kind}",
+                    )
+                )
+                continue
             ok, metrics = verify_micro_probe_hardware(
                 probe,
                 probe_runner=self._probe_runner,
@@ -988,7 +1475,7 @@ class FlywheelDistiller:
                         probe_metrics=metrics,
                         rule=None,
                         admitted=False,
-                        rejection_reason="micro_probe_speedup_below_threshold",
+                        rejection_reason="micro_probe_below_threshold_or_wait_regression",
                     )
                 )
                 continue
