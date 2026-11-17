@@ -387,6 +387,111 @@ def _ar_default_flags(schedule_mode: str) -> list[str]:
     return list(PURE_SIMDVF_UBUF_FLAGS) if schedule_mode == "tuned" else []
 
 
+@T.macro
+def _ar_small_decode_init_row(m_ub, l_ub, acc_ub, slot, full_chunks):
+    m32 = T.simd.pset(32, "PAT_ALL")
+    v_init_m = T.simd.vdup(T.float32(-1.0e30), "float32", mask=m32)
+    v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
+    T.simd.vsts(m_ub[slot, 0], v_init_m, mask=m32, dist="ONEPT_B32")
+    T.simd.vsts(l_ub[slot, 0], v_zero, mask=m32, dist="ONEPT_B32")
+    for c in T.serial(full_chunks):
+        T.simd.vsts(acc_ub[slot, c * 64], v_zero, mask=m32, dist="NORM_B32")
+
+
+@T.macro
+def _ar_small_decode_step_row(
+    v_ub, kw_ub, m_ub, l_ub, acc_ub, eps_val, inv_d, inv_sqrt_d, slot, full_chunks
+):
+    m32 = T.simd.pset(32, "PAT_ALL")
+    m16 = T.simd.pset(16, "PAT_ALL")
+    v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
+    v_one = T.simd.vdup(T.float32(1.0), "float32", mask=m32)
+    sq_acc = T.simd.alloc_local((1,), "float32")
+    dot_acc = T.simd.alloc_local((1,), "float32")
+    sq_acc[0] = v_zero
+    dot_acc[0] = v_zero
+    for c in T.serial(full_chunks):
+        off = c * 64
+        vf = T.simd.vcvt(
+            T.simd.vld(v_ub[slot, off], dist="US_B16"),
+            "float32",
+            mask=m16,
+            part=0,
+        )
+        kwf = T.simd.vld(kw_ub[off], dist="NORM_B32")
+        T.simd.vmula(sq_acc[0], vf, vf, mask=m32)
+        T.simd.vmula(dot_acc[0], vf, kwf, mask=m32)
+
+    sum_sq = T.simd.vdupv(
+        T.simd.vcadd(sq_acc[0], mask=m32), mask=m32, pos="POS_LOWEST"
+    )
+    raw_dot = T.simd.vdupv(
+        T.simd.vcadd(dot_acc[0], mask=m32), mask=m32, pos="POS_LOWEST"
+    )
+    mean_sq = T.simd.vmuls(sum_sq, T.float32(inv_d), mask=m32)
+    mean_eps = T.simd.vadds(mean_sq, eps_val, mask=m32)
+    rstd = T.simd.vdiv(v_one, T.simd.vsqrt(mean_eps, mask=m32), mask=m32)
+    s_vec = T.simd.vmuls(
+        T.simd.vmul(raw_dot, rstd, mask=m32),
+        T.float32(inv_sqrt_d),
+        mask=m32,
+    )
+
+    m_old = T.simd.vld(m_ub[slot, 0], dist="BRC_B32")
+    l_old = T.simd.vld(l_ub[slot, 0], dist="BRC_B32")
+    m_new = T.simd.vmax(m_old, s_vec, mask=m32)
+    alpha_v = T.simd.vexp(T.simd.vsub(m_old, m_new, mask=m32), mask=m32)
+    p_v = T.simd.vexp(T.simd.vsub(s_vec, m_new, mask=m32), mask=m32)
+    l_new = T.simd.vadd(T.simd.vmul(l_old, alpha_v, mask=m32), p_v, mask=m32)
+    T.simd.vsts(m_ub[slot, 0], m_new, mask=m32, dist="ONEPT_B32")
+    T.simd.vsts(l_ub[slot, 0], l_new, mask=m32, dist="ONEPT_B32")
+
+    for c in T.serial(full_chunks):
+        off = c * 64
+        vf = T.simd.vcvt(
+            T.simd.vld(v_ub[slot, off], dist="US_B16"),
+            "float32",
+            mask=m16,
+            part=0,
+        )
+        acc_old = T.simd.vld(acc_ub[slot, off], dist="NORM_B32")
+        acc_new = T.simd.vadd(
+            T.simd.vmul(acc_old, alpha_v, mask=m32),
+            T.simd.vmul(vf, p_v, mask=m32),
+            mask=m32,
+        )
+        T.simd.vsts(acc_ub[slot, off], acc_new, mask=m32, dist="NORM_B32")
+
+
+@T.macro
+def _ar_small_decode_blend_row(
+    x_ub, acc_ub, l_ub, alpha_val, tl_dtype, slot, full_chunks
+):
+    m32 = T.simd.pset(32, "PAT_ALL")
+    m16 = T.simd.pset(16, "PAT_ALL")
+    v_one = T.simd.vdup(T.float32(1.0), "float32", mask=m32)
+    l_tot = T.simd.vld(l_ub[slot, 0], dist="BRC_B32")
+    inv_l = T.simd.vdiv(v_one, l_tot, mask=m32)
+    scale_agg = T.simd.vmuls(inv_l, alpha_val, mask=m32)
+    one_minus_alpha = T.float32(1.0) - alpha_val
+    for c in T.serial(full_chunks):
+        off = c * 64
+        xf = T.simd.vcvt(
+            T.simd.vld(x_ub[slot, off], dist="US_B16"),
+            "float32",
+            mask=m16,
+            part=0,
+        )
+        accf = T.simd.vld(acc_ub[slot, off], dist="NORM_B32")
+        yf = T.simd.vadd(
+            T.simd.vmuls(xf, one_minus_alpha, mask=m32),
+            T.simd.vmul(accf, scale_agg, mask=m32),
+            mask=m32,
+        )
+        y16 = T.simd.vcvt(yf, tl_dtype, mask=m16, part=0)
+        T.simd.vsts(x_ub[slot, off], y16, mask=m32, dist="PK_B32", extent=64)
+
+
 def _select_ar_small_decode_config(
     n_depth: int = 2,
     d_dim: int = 4096,
@@ -408,10 +513,388 @@ def _build_ar_small_decode_func(
     tl_dtype: str = "bfloat16",
     tile_m: int = 1,
     schedule_mode: str = "tuned",
+    **_extra_kwargs,
 ):
-    return _build_attention_residual_prim_func(
-        n_depth, d_dim, tl_dtype, tile_m, schedule_mode
+    if (d_dim % 64) != 0:
+        raise ValueError(f"small_decode regime requires d_dim % 64 == 0, got {d_dim}")
+    num_cores = 56
+    full_chunks = d_dim // 64
+    rows = max(1, int(tile_m))
+    num_stages = 2 if (schedule_mode == "tuned" and n_depth >= 2) else 1
+    pipe_ann = {"enable_offset": True} if schedule_mode == "tuned" else None
+    inv_sqrt_d = 1.0 / math.sqrt(d_dim)
+    inv_d = 1.0 / float(d_dim)
+
+    m_rows = T.dynamic("m_rows")
+    v_rows = T.dynamic("v_rows")
+
+    @T.prim_func
+    def main(
+        V: T.Tensor((v_rows, d_dim), tl_dtype),
+        X: T.Tensor((m_rows, d_dim), tl_dtype),
+        W: T.Tensor((d_dim,), tl_dtype),
+        G: T.Tensor((d_dim,), tl_dtype),
+        Y: T.Tensor((m_rows, d_dim), tl_dtype),
+        alpha_val: T.float32,
+        eps_val: T.float32,
+    ):
+        with T.Kernel(num_cores) as cid:
+            w_ub = T.alloc_shared((d_dim,), tl_dtype)
+            g_ub = T.alloc_shared((d_dim,), tl_dtype)
+            kw_ub = T.alloc_shared((d_dim,), "float32")
+            v_ub = T.alloc_shared((rows, d_dim), tl_dtype)
+            x_ub = T.alloc_shared((rows, d_dim), tl_dtype)
+            acc_ub = T.alloc_shared((rows, d_dim), "float32")
+            m_ub = T.alloc_shared((rows, 8), "float32")
+            l_ub = T.alloc_shared((rows, 8), "float32")
+            if rows > 1:
+                v_tail_ub = T.alloc_shared((1, d_dim), tl_dtype)
+                T.annotate_buffer_versions(
+                    {
+                        v_ub: num_stages,
+                        v_tail_ub: num_stages,
+                        acc_ub: 1,
+                        m_ub: 1,
+                        l_ub: 1,
+                        kw_ub: 1,
+                        w_ub: 1,
+                        g_ub: 1,
+                        x_ub: 1,
+                    }
+                )
+                T.annotate_unlimit_memory("shared")
+            else:
+                T.annotate_buffer_versions(
+                    {
+                        v_ub: num_stages,
+                        acc_ub: 1,
+                        m_ub: 1,
+                        l_ub: 1,
+                        kw_ub: 1,
+                        w_ub: 1,
+                        g_ub: 1,
+                        x_ub: 1,
+                    }
+                )
+
+            base_rows = m_rows // num_cores
+            rem_rows = m_rows % num_cores
+            m_start = cid * base_rows + T.min(cid, rem_rows)
+            m_count = base_rows + T.if_then_else(cid < rem_rows, 1, 0)
+            if m_count > 0:
+                T.copy(W[:d_dim], w_ub[:d_dim])
+                T.copy(G[:d_dim], g_ub[:d_dim])
+                with T.SimdVF():
+                    m32 = T.simd.pset(32, "PAT_ALL")
+                    m16 = T.simd.pset(16, "PAT_ALL")
+                    for c in T.serial(full_chunks):
+                        off = c * 64
+                        wf = T.simd.vcvt(
+                            T.simd.vld(w_ub[off], dist="US_B16"),
+                            "float32",
+                            mask=m16,
+                            part=0,
+                        )
+                        gf = T.simd.vcvt(
+                            T.simd.vld(g_ub[off], dist="US_B16"),
+                            "float32",
+                            mask=m16,
+                            part=0,
+                        )
+                        kwf = T.simd.vmul(wf, gf, mask=m32)
+                        T.simd.vsts(kw_ub[off], kwf, mask=m32, dist="NORM_B32")
+
+                if rows > 1:
+                    full_blocks = m_count // rows
+                    for mb in T.serial(full_blocks):
+                        m0 = m_start + mb * rows
+                        with T.SimdVF():
+                            for tm in T.serial(rows):
+                                _ar_small_decode_init_row(
+                                    m_ub, l_ub, acc_ub, tm, full_chunks
+                                )
+                        for n in T.Pipelined(
+                            n_depth, num_stages=num_stages, annotations=pipe_ann
+                        ):
+                            T.copy(
+                                V[n * m_rows + m0 : n * m_rows + m0 + rows, :d_dim],
+                                v_ub[:, :d_dim],
+                            )
+                            with T.SimdVF():
+                                for tm in T.serial(rows):
+                                    _ar_small_decode_step_row(
+                                        v_ub,
+                                        kw_ub,
+                                        m_ub,
+                                        l_ub,
+                                        acc_ub,
+                                        eps_val,
+                                        inv_d,
+                                        inv_sqrt_d,
+                                        tm,
+                                        full_chunks,
+                                    )
+                        T.copy(X[m0 : m0 + rows, :d_dim], x_ub[:, :d_dim])
+                        with T.SimdVF():
+                            for tm in T.serial(rows):
+                                _ar_small_decode_blend_row(
+                                    x_ub,
+                                    acc_ub,
+                                    l_ub,
+                                    alpha_val,
+                                    tl_dtype,
+                                    tm,
+                                    full_chunks,
+                                )
+                        T.copy(x_ub[:, :d_dim], Y[m0 : m0 + rows, :d_dim])
+                        T.ascend_pipe_barrier("PIPE_ALL")
+
+                    tail_rows = m_count % rows
+                    tail_start = m_start + full_blocks * rows
+                    for rr in T.serial(tail_rows):
+                        m = tail_start + rr
+                        with T.SimdVF():
+                            _ar_small_decode_init_row(
+                                m_ub, l_ub, acc_ub, 0, full_chunks
+                            )
+                        for n in T.Pipelined(
+                            n_depth, num_stages=num_stages, annotations=pipe_ann
+                        ):
+                            row_off = n * m_rows + m
+                            T.copy(V[row_off, :d_dim], v_tail_ub[0, :d_dim])
+                            with T.SimdVF():
+                                _ar_small_decode_step_row(
+                                    v_tail_ub,
+                                    kw_ub,
+                                    m_ub,
+                                    l_ub,
+                                    acc_ub,
+                                    eps_val,
+                                    inv_d,
+                                    inv_sqrt_d,
+                                    0,
+                                    full_chunks,
+                                )
+                        T.copy(X[m, :d_dim], x_ub[0, :d_dim])
+                        with T.SimdVF():
+                            _ar_small_decode_blend_row(
+                                x_ub,
+                                acc_ub,
+                                l_ub,
+                                alpha_val,
+                                tl_dtype,
+                                0,
+                                full_chunks,
+                            )
+                        T.copy(x_ub[0, :d_dim], Y[m, :d_dim])
+                        T.ascend_pipe_barrier("PIPE_ALL")
+                else:
+                    for local_m in T.serial(m_count):
+                        m = m_start + local_m
+                        with T.SimdVF():
+                            _ar_small_decode_init_row(
+                                m_ub, l_ub, acc_ub, 0, full_chunks
+                            )
+                        for n in T.Pipelined(
+                            n_depth, num_stages=num_stages, annotations=pipe_ann
+                        ):
+                            row_off = n * m_rows + m
+                            T.copy(V[row_off, :d_dim], v_ub[0, :d_dim])
+                            with T.SimdVF():
+                                _ar_small_decode_step_row(
+                                    v_ub,
+                                    kw_ub,
+                                    m_ub,
+                                    l_ub,
+                                    acc_ub,
+                                    eps_val,
+                                    inv_d,
+                                    inv_sqrt_d,
+                                    0,
+                                    full_chunks,
+                                )
+                        T.copy(X[m, :d_dim], x_ub[0, :d_dim])
+                        with T.SimdVF():
+                            _ar_small_decode_blend_row(
+                                x_ub,
+                                acc_ub,
+                                l_ub,
+                                alpha_val,
+                                tl_dtype,
+                                0,
+                                full_chunks,
+                            )
+                        T.copy(x_ub[0, :d_dim], Y[m, :d_dim])
+                        T.ascend_pipe_barrier("PIPE_ALL")
+
+    return main
+
+
+@T.macro
+def _ar_unaligned_init_row(m_ub, l_ub, acc_ub, slot, full_chunks, rem):
+    m32 = T.simd.pset(32, "PAT_ALL")
+    v_init_m = T.simd.vdup(T.float32(-1.0e30), "float32", mask=m32)
+    v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
+    T.simd.vsts(m_ub[slot, 0], v_init_m, mask=m32, dist="ONEPT_B32")
+    T.simd.vsts(l_ub[slot, 0], v_zero, mask=m32, dist="ONEPT_B32")
+    for c in T.serial(full_chunks):
+        T.simd.vsts(acc_ub[slot, c * 64], v_zero, mask=m32, dist="NORM_B32")
+    if rem > 0:
+        T.simd.vsts(
+            acc_ub[slot, full_chunks * 64], v_zero, mask=m32, dist="NORM_B32"
+        )
+
+
+@T.macro
+def _ar_unaligned_step_row(
+    v_ub, kw_ub, m_ub, l_ub, acc_ub, eps_val, inv_d, inv_sqrt_d, slot, full_chunks, rem
+):
+    m32 = T.simd.pset(32, "PAT_ALL")
+    m16 = T.simd.pset(16, "PAT_ALL")
+    v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
+    v_one = T.simd.vdup(T.float32(1.0), "float32", mask=m32)
+    sq_acc = T.simd.alloc_local((1,), "float32")
+    dot_acc = T.simd.alloc_local((1,), "float32")
+    sq_acc[0] = v_zero
+    dot_acc[0] = v_zero
+    for c in T.serial(full_chunks):
+        off = c * 64
+        vf = T.simd.vcvt(
+            T.simd.vld(v_ub[slot, off], dist="US_B16"),
+            "float32",
+            mask=m16,
+            part=0,
+        )
+        kwf = T.simd.vld(kw_ub[off], dist="NORM_B32")
+        T.simd.vmula(sq_acc[0], vf, vf, mask=m32)
+        T.simd.vmula(dot_acc[0], vf, kwf, mask=m32)
+    if rem > 0:
+        off = full_chunks * 64
+        m32_tail = T.simd.update_mask(rem, width=32)
+        m16_tail_x2 = T.simd.update_mask(rem * 2, width=16)
+        vf_t = T.simd.vcvt(
+            T.simd.vld(v_ub[slot, off], dist="US_B16"),
+            "float32",
+            mask=m16_tail_x2,
+            part=0,
+        )
+        kwf_t = T.simd.vld(kw_ub[off], dist="NORM_B32")
+        T.simd.vmula(
+            sq_acc[0], vf_t, vf_t, mask=m32_tail, mode="MODE_MERGING"
+        )
+        T.simd.vmula(
+            dot_acc[0], vf_t, kwf_t, mask=m32_tail, mode="MODE_MERGING"
+        )
+
+    sum_sq = T.simd.vdupv(
+        T.simd.vcadd(sq_acc[0], mask=m32), mask=m32, pos="POS_LOWEST"
     )
+    raw_dot = T.simd.vdupv(
+        T.simd.vcadd(dot_acc[0], mask=m32), mask=m32, pos="POS_LOWEST"
+    )
+    mean_sq = T.simd.vmuls(sum_sq, T.float32(inv_d), mask=m32)
+    mean_eps = T.simd.vadds(mean_sq, eps_val, mask=m32)
+    rstd = T.simd.vdiv(v_one, T.simd.vsqrt(mean_eps, mask=m32), mask=m32)
+    s_vec = T.simd.vmuls(
+        T.simd.vmul(raw_dot, rstd, mask=m32),
+        T.float32(inv_sqrt_d),
+        mask=m32,
+    )
+
+    m_old = T.simd.vld(m_ub[slot, 0], dist="BRC_B32")
+    l_old = T.simd.vld(l_ub[slot, 0], dist="BRC_B32")
+    m_new = T.simd.vmax(m_old, s_vec, mask=m32)
+    alpha_v = T.simd.vexp(T.simd.vsub(m_old, m_new, mask=m32), mask=m32)
+    p_v = T.simd.vexp(T.simd.vsub(s_vec, m_new, mask=m32), mask=m32)
+    l_new = T.simd.vadd(T.simd.vmul(l_old, alpha_v, mask=m32), p_v, mask=m32)
+    T.simd.vsts(m_ub[slot, 0], m_new, mask=m32, dist="ONEPT_B32")
+    T.simd.vsts(l_ub[slot, 0], l_new, mask=m32, dist="ONEPT_B32")
+
+    for c in T.serial(full_chunks):
+        off = c * 64
+        vf = T.simd.vcvt(
+            T.simd.vld(v_ub[slot, off], dist="US_B16"),
+            "float32",
+            mask=m16,
+            part=0,
+        )
+        acc_old = T.simd.vld(acc_ub[slot, off], dist="NORM_B32")
+        acc_new = T.simd.vadd(
+            T.simd.vmul(acc_old, alpha_v, mask=m32),
+            T.simd.vmul(vf, p_v, mask=m32),
+            mask=m32,
+        )
+        T.simd.vsts(acc_ub[slot, off], acc_new, mask=m32, dist="NORM_B32")
+    if rem > 0:
+        off = full_chunks * 64
+        m32_tail = T.simd.update_mask(rem, width=32)
+        m16_tail_x2 = T.simd.update_mask(rem * 2, width=16)
+        vf_t = T.simd.vcvt(
+            T.simd.vld(v_ub[slot, off], dist="US_B16"),
+            "float32",
+            mask=m16_tail_x2,
+            part=0,
+        )
+        acc_old_t = T.simd.vld(acc_ub[slot, off], dist="NORM_B32")
+        acc_new_t = T.simd.vadd(
+            T.simd.vmul(acc_old_t, alpha_v, mask=m32_tail),
+            T.simd.vmul(vf_t, p_v, mask=m32_tail),
+            mask=m32_tail,
+        )
+        T.simd.vsts(
+            acc_ub[slot, off], acc_new_t, mask=m32_tail, dist="NORM_B32"
+        )
+
+
+@T.macro
+def _ar_unaligned_blend_row(
+    x_ub, acc_ub, l_ub, alpha_val, tl_dtype, slot, full_chunks, rem
+):
+    m32 = T.simd.pset(32, "PAT_ALL")
+    m16 = T.simd.pset(16, "PAT_ALL")
+    v_one = T.simd.vdup(T.float32(1.0), "float32", mask=m32)
+    l_tot = T.simd.vld(l_ub[slot, 0], dist="BRC_B32")
+    inv_l = T.simd.vdiv(v_one, l_tot, mask=m32)
+    scale_agg = T.simd.vmuls(inv_l, alpha_val, mask=m32)
+    one_minus_alpha = T.float32(1.0) - alpha_val
+    for c in T.serial(full_chunks):
+        off = c * 64
+        xf = T.simd.vcvt(
+            T.simd.vld(x_ub[slot, off], dist="US_B16"),
+            "float32",
+            mask=m16,
+            part=0,
+        )
+        accf = T.simd.vld(acc_ub[slot, off], dist="NORM_B32")
+        yf = T.simd.vadd(
+            T.simd.vmuls(xf, one_minus_alpha, mask=m32),
+            T.simd.vmul(accf, scale_agg, mask=m32),
+            mask=m32,
+        )
+        y16 = T.simd.vcvt(yf, tl_dtype, mask=m16, part=0)
+        T.simd.vsts(
+            x_ub[slot, off], y16, mask=m32, dist="PK_B32", extent=64
+        )
+    if rem > 0:
+        off = full_chunks * 64
+        m32_tail = T.simd.update_mask(rem, width=32)
+        m16_tail_x2 = T.simd.update_mask(rem * 2, width=16)
+        xf_t = T.simd.vcvt(
+            T.simd.vld(x_ub[slot, off], dist="US_B16"),
+            "float32",
+            mask=m16_tail_x2,
+            part=0,
+        )
+        accf_t = T.simd.vld(acc_ub[slot, off], dist="NORM_B32")
+        yf_t = T.simd.vadd(
+            T.simd.vmuls(xf_t, one_minus_alpha, mask=m32_tail),
+            T.simd.vmul(accf_t, scale_agg, mask=m32_tail),
+            mask=m32_tail,
+        )
+        y16_t = T.simd.vcvt(yf_t, tl_dtype, mask=m16_tail_x2, part=0)
+        T.simd.vsts(
+            x_ub[slot, off], y16_t, mask=m32_tail, dist="PK_B32", extent=64
+        )
 
 
 def _select_ar_unaligned_config(
@@ -435,10 +918,349 @@ def _build_ar_unaligned_func(
     tl_dtype: str = "bfloat16",
     tile_m: int = 1,
     schedule_mode: str = "tuned",
+    **_extra_kwargs,
 ):
-    return _build_attention_residual_prim_func(
-        n_depth, d_dim, tl_dtype, tile_m, schedule_mode
+    num_cores = 56
+    full_chunks = d_dim // 64
+    rem = d_dim % 64
+    d_alloc = ((d_dim + 63) // 64) * 64
+    rows = max(1, int(tile_m))
+    num_stages = 2 if (schedule_mode == "tuned" and n_depth >= 2) else 1
+    pipe_ann = {"enable_offset": True} if schedule_mode == "tuned" else None
+    inv_sqrt_d = 1.0 / math.sqrt(d_dim)
+    inv_d = 1.0 / float(d_dim)
+
+    m_rows = T.dynamic("m_rows")
+    v_rows = T.dynamic("v_rows")
+
+    @T.prim_func
+    def main(
+        V: T.Tensor((v_rows, d_dim), tl_dtype),
+        X: T.Tensor((m_rows, d_dim), tl_dtype),
+        W: T.Tensor((d_dim,), tl_dtype),
+        G: T.Tensor((d_dim,), tl_dtype),
+        Y: T.Tensor((m_rows, d_dim), tl_dtype),
+        alpha_val: T.float32,
+        eps_val: T.float32,
+    ):
+        with T.Kernel(num_cores) as cid:
+            w_ub = T.alloc_shared((d_alloc,), tl_dtype)
+            g_ub = T.alloc_shared((d_alloc,), tl_dtype)
+            kw_ub = T.alloc_shared((d_alloc,), "float32")
+            v_ub = T.alloc_shared((rows, d_alloc), tl_dtype)
+            x_ub = T.alloc_shared((rows, d_alloc), tl_dtype)
+            acc_ub = T.alloc_shared((rows, d_alloc), "float32")
+            m_ub = T.alloc_shared((rows, 8), "float32")
+            l_ub = T.alloc_shared((rows, 8), "float32")
+            if rows > 1:
+                v_tail_ub = T.alloc_shared((1, d_alloc), tl_dtype)
+                T.annotate_buffer_versions(
+                    {
+                        v_ub: num_stages,
+                        v_tail_ub: num_stages,
+                        acc_ub: 1,
+                        m_ub: 1,
+                        l_ub: 1,
+                        kw_ub: 1,
+                        w_ub: 1,
+                        g_ub: 1,
+                        x_ub: 1,
+                    }
+                )
+                T.annotate_unlimit_memory("shared")
+            else:
+                T.annotate_buffer_versions(
+                    {
+                        v_ub: num_stages,
+                        acc_ub: 1,
+                        m_ub: 1,
+                        l_ub: 1,
+                        kw_ub: 1,
+                        w_ub: 1,
+                        g_ub: 1,
+                        x_ub: 1,
+                    }
+                )
+
+            base_rows = m_rows // num_cores
+            rem_rows = m_rows % num_cores
+            m_start = cid * base_rows + T.min(cid, rem_rows)
+            m_count = base_rows + T.if_then_else(cid < rem_rows, 1, 0)
+            if m_count > 0:
+                T.copy(W[:d_dim], w_ub[:d_dim])
+                T.copy(G[:d_dim], g_ub[:d_dim])
+                with T.SimdVF():
+                    m32 = T.simd.pset(32, "PAT_ALL")
+                    m16 = T.simd.pset(16, "PAT_ALL")
+                    for c in T.serial(full_chunks):
+                        off = c * 64
+                        wf = T.simd.vcvt(
+                            T.simd.vld(w_ub[off], dist="US_B16"),
+                            "float32",
+                            mask=m16,
+                            part=0,
+                        )
+                        gf = T.simd.vcvt(
+                            T.simd.vld(g_ub[off], dist="US_B16"),
+                            "float32",
+                            mask=m16,
+                            part=0,
+                        )
+                        kwf = T.simd.vmul(wf, gf, mask=m32)
+                        T.simd.vsts(kw_ub[off], kwf, mask=m32, dist="NORM_B32")
+                    if rem > 0:
+                        off = full_chunks * 64
+                        m16_tail_x2 = T.simd.update_mask(rem * 2, width=16)
+                        wf_t = T.simd.vcvt(
+                            T.simd.vld(w_ub[off], dist="US_B16"),
+                            "float32",
+                            mask=m16_tail_x2,
+                            part=0,
+                        )
+                        gf_t = T.simd.vcvt(
+                            T.simd.vld(g_ub[off], dist="US_B16"),
+                            "float32",
+                            mask=m16_tail_x2,
+                            part=0,
+                        )
+                        kwf_t = T.simd.vmul(wf_t, gf_t, mask=m32)
+                        T.simd.vsts(kw_ub[off], kwf_t, mask=m32, dist="NORM_B32")
+
+                if rows > 1:
+                    full_blocks = m_count // rows
+                    for mb in T.serial(full_blocks):
+                        m0 = m_start + mb * rows
+                        with T.SimdVF():
+                            for tm in T.serial(rows):
+                                _ar_unaligned_init_row(
+                                    m_ub, l_ub, acc_ub, tm, full_chunks, rem
+                                )
+                        for n in T.Pipelined(
+                            n_depth, num_stages=num_stages, annotations=pipe_ann
+                        ):
+                            T.copy(
+                                V[n * m_rows + m0 : n * m_rows + m0 + rows, :d_dim],
+                                v_ub[:, :d_dim],
+                            )
+                            with T.SimdVF():
+                                for tm in T.serial(rows):
+                                    _ar_unaligned_step_row(
+                                        v_ub,
+                                        kw_ub,
+                                        m_ub,
+                                        l_ub,
+                                        acc_ub,
+                                        eps_val,
+                                        inv_d,
+                                        inv_sqrt_d,
+                                        tm,
+                                        full_chunks,
+                                        rem,
+                                    )
+                        T.copy(X[m0 : m0 + rows, :d_dim], x_ub[:, :d_dim])
+                        with T.SimdVF():
+                            for tm in T.serial(rows):
+                                _ar_unaligned_blend_row(
+                                    x_ub,
+                                    acc_ub,
+                                    l_ub,
+                                    alpha_val,
+                                    tl_dtype,
+                                    tm,
+                                    full_chunks,
+                                    rem,
+                                )
+                        T.copy(x_ub[:, :d_dim], Y[m0 : m0 + rows, :d_dim])
+                        T.ascend_pipe_barrier("PIPE_ALL")
+
+                    tail_rows = m_count % rows
+                    tail_start = m_start + full_blocks * rows
+                    for rr in T.serial(tail_rows):
+                        m = tail_start + rr
+                        with T.SimdVF():
+                            _ar_unaligned_init_row(
+                                m_ub, l_ub, acc_ub, 0, full_chunks, rem
+                            )
+                        for n in T.Pipelined(
+                            n_depth, num_stages=num_stages, annotations=pipe_ann
+                        ):
+                            row_off = n * m_rows + m
+                            T.copy(V[row_off, :d_dim], v_tail_ub[0, :d_dim])
+                            with T.SimdVF():
+                                _ar_unaligned_step_row(
+                                    v_tail_ub,
+                                    kw_ub,
+                                    m_ub,
+                                    l_ub,
+                                    acc_ub,
+                                    eps_val,
+                                    inv_d,
+                                    inv_sqrt_d,
+                                    0,
+                                    full_chunks,
+                                    rem,
+                                )
+                        T.copy(X[m, :d_dim], x_ub[0, :d_dim])
+                        with T.SimdVF():
+                            _ar_unaligned_blend_row(
+                                x_ub,
+                                acc_ub,
+                                l_ub,
+                                alpha_val,
+                                tl_dtype,
+                                0,
+                                full_chunks,
+                                rem,
+                            )
+                        T.copy(x_ub[0, :d_dim], Y[m, :d_dim])
+                        T.ascend_pipe_barrier("PIPE_ALL")
+                else:
+                    for local_m in T.serial(m_count):
+                        m = m_start + local_m
+                        with T.SimdVF():
+                            _ar_unaligned_init_row(
+                                m_ub, l_ub, acc_ub, 0, full_chunks, rem
+                            )
+                        for n in T.Pipelined(
+                            n_depth, num_stages=num_stages, annotations=pipe_ann
+                        ):
+                            row_off = n * m_rows + m
+                            T.copy(V[row_off, :d_dim], v_ub[0, :d_dim])
+                            with T.SimdVF():
+                                _ar_unaligned_step_row(
+                                    v_ub,
+                                    kw_ub,
+                                    m_ub,
+                                    l_ub,
+                                    acc_ub,
+                                    eps_val,
+                                    inv_d,
+                                    inv_sqrt_d,
+                                    0,
+                                    full_chunks,
+                                    rem,
+                                )
+                        T.copy(X[m, :d_dim], x_ub[0, :d_dim])
+                        with T.SimdVF():
+                            _ar_unaligned_blend_row(
+                                x_ub,
+                                acc_ub,
+                                l_ub,
+                                alpha_val,
+                                tl_dtype,
+                                0,
+                                full_chunks,
+                                rem,
+                            )
+                        T.copy(x_ub[0, :d_dim], Y[m, :d_dim])
+                        T.ascend_pipe_barrier("PIPE_ALL")
+
+    return main
+
+
+@T.macro
+def _ar_aligned_init_row(m_ub, l_ub, acc_ub, slot, full_chunks):
+    m32 = T.simd.pset(32, "PAT_ALL")
+    v_init_m = T.simd.vdup(T.float32(-1.0e30), "float32", mask=m32)
+    v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
+    T.simd.vsts(m_ub[slot, 0], v_init_m, mask=m32, dist="ONEPT_B32")
+    T.simd.vsts(l_ub[slot, 0], v_zero, mask=m32, dist="ONEPT_B32")
+    for c in T.serial(full_chunks):
+        T.simd.vsts(acc_ub[slot, c * 64], v_zero, mask=m32, dist="NORM_B32")
+
+
+@T.macro
+def _ar_aligned_step_row(
+    v_ub, kw_ub, m_ub, l_ub, acc_ub, eps_val, inv_d, inv_sqrt_d, slot, full_chunks
+):
+    m32 = T.simd.pset(32, "PAT_ALL")
+    m16 = T.simd.pset(16, "PAT_ALL")
+    v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
+    v_one = T.simd.vdup(T.float32(1.0), "float32", mask=m32)
+    sq_acc = T.simd.alloc_local((1,), "float32")
+    dot_acc = T.simd.alloc_local((1,), "float32")
+    sq_acc[0] = v_zero
+    dot_acc[0] = v_zero
+    for c in T.serial(full_chunks):
+        off = c * 64
+        vf = T.simd.vcvt(
+            T.simd.vld(v_ub[slot, off], dist="US_B16"),
+            "float32",
+            mask=m16,
+            part=0,
+        )
+        kwf = T.simd.vld(kw_ub[off], dist="NORM_B32")
+        T.simd.vmula(sq_acc[0], vf, vf, mask=m32)
+        T.simd.vmula(dot_acc[0], vf, kwf, mask=m32)
+
+    sum_sq = T.simd.vdupv(
+        T.simd.vcadd(sq_acc[0], mask=m32), mask=m32, pos="POS_LOWEST"
     )
+    raw_dot = T.simd.vdupv(
+        T.simd.vcadd(dot_acc[0], mask=m32), mask=m32, pos="POS_LOWEST"
+    )
+    mean_sq = T.simd.vmuls(sum_sq, T.float32(inv_d), mask=m32)
+    mean_eps = T.simd.vadds(mean_sq, eps_val, mask=m32)
+    rstd = T.simd.vdiv(v_one, T.simd.vsqrt(mean_eps, mask=m32), mask=m32)
+    s_vec = T.simd.vmuls(
+        T.simd.vmul(raw_dot, rstd, mask=m32),
+        T.float32(inv_sqrt_d),
+        mask=m32,
+    )
+
+    m_old = T.simd.vld(m_ub[slot, 0], dist="BRC_B32")
+    l_old = T.simd.vld(l_ub[slot, 0], dist="BRC_B32")
+    m_new = T.simd.vmax(m_old, s_vec, mask=m32)
+    alpha_v = T.simd.vexp(T.simd.vsub(m_old, m_new, mask=m32), mask=m32)
+    p_v = T.simd.vexp(T.simd.vsub(s_vec, m_new, mask=m32), mask=m32)
+    l_new = T.simd.vadd(T.simd.vmul(l_old, alpha_v, mask=m32), p_v, mask=m32)
+    T.simd.vsts(m_ub[slot, 0], m_new, mask=m32, dist="ONEPT_B32")
+    T.simd.vsts(l_ub[slot, 0], l_new, mask=m32, dist="ONEPT_B32")
+
+    for c in T.serial(full_chunks):
+        off = c * 64
+        vf = T.simd.vcvt(
+            T.simd.vld(v_ub[slot, off], dist="US_B16"),
+            "float32",
+            mask=m16,
+            part=0,
+        )
+        acc_old = T.simd.vld(acc_ub[slot, off], dist="NORM_B32")
+        acc_new = T.simd.vadd(
+            T.simd.vmul(acc_old, alpha_v, mask=m32),
+            T.simd.vmul(vf, p_v, mask=m32),
+            mask=m32,
+        )
+        T.simd.vsts(acc_ub[slot, off], acc_new, mask=m32, dist="NORM_B32")
+
+
+@T.macro
+def _ar_aligned_blend_row(
+    x_ub, acc_ub, l_ub, alpha_val, tl_dtype, slot, full_chunks
+):
+    m32 = T.simd.pset(32, "PAT_ALL")
+    m16 = T.simd.pset(16, "PAT_ALL")
+    v_one = T.simd.vdup(T.float32(1.0), "float32", mask=m32)
+    l_tot = T.simd.vld(l_ub[slot, 0], dist="BRC_B32")
+    inv_l = T.simd.vdiv(v_one, l_tot, mask=m32)
+    scale_agg = T.simd.vmuls(inv_l, alpha_val, mask=m32)
+    one_minus_alpha = T.float32(1.0) - alpha_val
+    for c in T.serial(full_chunks):
+        off = c * 64
+        xf = T.simd.vcvt(
+            T.simd.vld(x_ub[slot, off], dist="US_B16"),
+            "float32",
+            mask=m16,
+            part=0,
+        )
+        accf = T.simd.vld(acc_ub[slot, off], dist="NORM_B32")
+        yf = T.simd.vadd(
+            T.simd.vmuls(xf, one_minus_alpha, mask=m32),
+            T.simd.vmul(accf, scale_agg, mask=m32),
+            mask=m32,
+        )
+        y16 = T.simd.vcvt(yf, tl_dtype, mask=m16, part=0)
+        T.simd.vsts(x_ub[slot, off], y16, mask=m32, dist="PK_B32", extent=64)
 
 
 def _select_ar_aligned_config(
@@ -460,12 +1282,223 @@ def _build_ar_aligned_func(
     n_depth: int = 8,
     d_dim: int = 4096,
     tl_dtype: str = "bfloat16",
-    tile_m: int = 6,
+    tile_m: int = 5,
     schedule_mode: str = "tuned",
+    **_extra_kwargs,
 ):
-    return _build_attention_residual_prim_func(
-        n_depth, d_dim, tl_dtype, tile_m, schedule_mode
-    )
+    if (d_dim % 64) != 0:
+        raise ValueError(f"aligned regime requires d_dim % 64 == 0, got {d_dim}")
+    num_cores = 56
+    full_chunks = d_dim // 64
+    rows = max(1, int(tile_m))
+    num_stages = 2 if (schedule_mode == "tuned" and n_depth >= 2) else 1
+    pipe_ann = {"enable_offset": True} if schedule_mode == "tuned" else None
+    inv_sqrt_d = 1.0 / math.sqrt(d_dim)
+    inv_d = 1.0 / float(d_dim)
+
+    m_rows = T.dynamic("m_rows")
+    v_rows = T.dynamic("v_rows")
+
+    @T.prim_func
+    def main(
+        V: T.Tensor((v_rows, d_dim), tl_dtype),
+        X: T.Tensor((m_rows, d_dim), tl_dtype),
+        W: T.Tensor((d_dim,), tl_dtype),
+        G: T.Tensor((d_dim,), tl_dtype),
+        Y: T.Tensor((m_rows, d_dim), tl_dtype),
+        alpha_val: T.float32,
+        eps_val: T.float32,
+    ):
+        with T.Kernel(num_cores) as cid:
+            w_ub = T.alloc_shared((d_dim,), tl_dtype)
+            g_ub = T.alloc_shared((d_dim,), tl_dtype)
+            kw_ub = T.alloc_shared((d_dim,), "float32")
+            v_ub = T.alloc_shared((rows, d_dim), tl_dtype)
+            x_ub = T.alloc_shared((rows, d_dim), tl_dtype)
+            acc_ub = T.alloc_shared((rows, d_dim), "float32")
+            m_ub = T.alloc_shared((rows, 8), "float32")
+            l_ub = T.alloc_shared((rows, 8), "float32")
+            if rows > 1:
+                v_tail_ub = T.alloc_shared((1, d_dim), tl_dtype)
+                T.annotate_buffer_versions(
+                    {
+                        v_ub: num_stages,
+                        v_tail_ub: num_stages,
+                        acc_ub: 1,
+                        m_ub: 1,
+                        l_ub: 1,
+                        kw_ub: 1,
+                        w_ub: 1,
+                        g_ub: 1,
+                        x_ub: 1,
+                    }
+                )
+                T.annotate_unlimit_memory("shared")
+            else:
+                T.annotate_buffer_versions(
+                    {
+                        v_ub: num_stages,
+                        acc_ub: 1,
+                        m_ub: 1,
+                        l_ub: 1,
+                        kw_ub: 1,
+                        w_ub: 1,
+                        g_ub: 1,
+                        x_ub: 1,
+                    }
+                )
+
+            base_rows = m_rows // num_cores
+            rem_rows = m_rows % num_cores
+            m_start = cid * base_rows + T.min(cid, rem_rows)
+            m_count = base_rows + T.if_then_else(cid < rem_rows, 1, 0)
+            if m_count > 0:
+                T.copy(W[:d_dim], w_ub[:d_dim])
+                T.copy(G[:d_dim], g_ub[:d_dim])
+                with T.SimdVF():
+                    m32 = T.simd.pset(32, "PAT_ALL")
+                    m16 = T.simd.pset(16, "PAT_ALL")
+                    for c in T.serial(full_chunks):
+                        off = c * 64
+                        wf = T.simd.vcvt(
+                            T.simd.vld(w_ub[off], dist="US_B16"),
+                            "float32",
+                            mask=m16,
+                            part=0,
+                        )
+                        gf = T.simd.vcvt(
+                            T.simd.vld(g_ub[off], dist="US_B16"),
+                            "float32",
+                            mask=m16,
+                            part=0,
+                        )
+                        kwf = T.simd.vmul(wf, gf, mask=m32)
+                        T.simd.vsts(kw_ub[off], kwf, mask=m32, dist="NORM_B32")
+
+                if rows > 1:
+                    full_blocks = m_count // rows
+                    for mb in T.serial(full_blocks):
+                        m0 = m_start + mb * rows
+                        with T.SimdVF():
+                            for tm in T.serial(rows):
+                                _ar_aligned_init_row(
+                                    m_ub, l_ub, acc_ub, tm, full_chunks
+                                )
+                        for n in T.Pipelined(
+                            n_depth, num_stages=num_stages, annotations=pipe_ann
+                        ):
+                            T.copy(
+                                V[n * m_rows + m0 : n * m_rows + m0 + rows, :d_dim],
+                                v_ub[:, :d_dim],
+                            )
+                            with T.SimdVF():
+                                for tm in T.serial(rows):
+                                    _ar_aligned_step_row(
+                                        v_ub,
+                                        kw_ub,
+                                        m_ub,
+                                        l_ub,
+                                        acc_ub,
+                                        eps_val,
+                                        inv_d,
+                                        inv_sqrt_d,
+                                        tm,
+                                        full_chunks,
+                                    )
+                        T.copy(X[m0 : m0 + rows, :d_dim], x_ub[:, :d_dim])
+                        with T.SimdVF():
+                            for tm in T.serial(rows):
+                                _ar_aligned_blend_row(
+                                    x_ub,
+                                    acc_ub,
+                                    l_ub,
+                                    alpha_val,
+                                    tl_dtype,
+                                    tm,
+                                    full_chunks,
+                                )
+                        T.copy(x_ub[:, :d_dim], Y[m0 : m0 + rows, :d_dim])
+                        T.ascend_pipe_barrier("PIPE_ALL")
+
+                    tail_rows = m_count % rows
+                    tail_start = m_start + full_blocks * rows
+                    for rr in T.serial(tail_rows):
+                        m = tail_start + rr
+                        with T.SimdVF():
+                            _ar_aligned_init_row(
+                                m_ub, l_ub, acc_ub, 0, full_chunks
+                            )
+                        for n in T.Pipelined(
+                            n_depth, num_stages=num_stages, annotations=pipe_ann
+                        ):
+                            row_off = n * m_rows + m
+                            T.copy(V[row_off, :d_dim], v_tail_ub[0, :d_dim])
+                            with T.SimdVF():
+                                _ar_aligned_step_row(
+                                    v_tail_ub,
+                                    kw_ub,
+                                    m_ub,
+                                    l_ub,
+                                    acc_ub,
+                                    eps_val,
+                                    inv_d,
+                                    inv_sqrt_d,
+                                    0,
+                                    full_chunks,
+                                )
+                        T.copy(X[m, :d_dim], x_ub[0, :d_dim])
+                        with T.SimdVF():
+                            _ar_aligned_blend_row(
+                                x_ub,
+                                acc_ub,
+                                l_ub,
+                                alpha_val,
+                                tl_dtype,
+                                0,
+                                full_chunks,
+                            )
+                        T.copy(x_ub[0, :d_dim], Y[m, :d_dim])
+                        T.ascend_pipe_barrier("PIPE_ALL")
+                else:
+                    for local_m in T.serial(m_count):
+                        m = m_start + local_m
+                        with T.SimdVF():
+                            _ar_aligned_init_row(
+                                m_ub, l_ub, acc_ub, 0, full_chunks
+                            )
+                        for n in T.Pipelined(
+                            n_depth, num_stages=num_stages, annotations=pipe_ann
+                        ):
+                            row_off = n * m_rows + m
+                            T.copy(V[row_off, :d_dim], v_ub[0, :d_dim])
+                            with T.SimdVF():
+                                _ar_aligned_step_row(
+                                    v_ub,
+                                    kw_ub,
+                                    m_ub,
+                                    l_ub,
+                                    acc_ub,
+                                    eps_val,
+                                    inv_d,
+                                    inv_sqrt_d,
+                                    0,
+                                    full_chunks,
+                                )
+                        T.copy(X[m, :d_dim], x_ub[0, :d_dim])
+                        with T.SimdVF():
+                            _ar_aligned_blend_row(
+                                x_ub,
+                                acc_ub,
+                                l_ub,
+                                alpha_val,
+                                tl_dtype,
+                                0,
+                                full_chunks,
+                            )
+                        T.copy(x_ub[0, :d_dim], Y[m, :d_dim])
+                        T.ascend_pipe_barrier("PIPE_ALL")
+
+    return main
 
 
 def _freeze_attr_value(val: object) -> object:

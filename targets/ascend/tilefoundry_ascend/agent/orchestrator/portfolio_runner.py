@@ -462,9 +462,11 @@ def build_syntax_repair_request(dsl_source: str, error_message: str) -> Generati
     sys_prompt = (
         "You are a TileLang Ascend compiler repair engineer. Fix the syntax, API, or "
         "memory-capacity failure reported below without altering tensor semantics. "
-        "Output ONLY corrected Python code. Preserve existing top-level symbol names; "
+        "Output ONLY corrected Python code. You may output the fixed subset of "
+        "authorized slice functions or prefixed macros shown in BROKEN KERNEL DSL "
+        "(omitted sibling functions automatically inherit their parent implementation); "
         "any new top-level helper MUST reuse the exact regime prefix shown in "
-        "BROKEN KERNEL DSL (do NOT add unprefixed top-level functions)."
+        "BROKEN KERNEL DSL (do NOT add unprefixed or out-of-regime functions)."
     )
     user_prompt = (
         f"### VALID TILELANG ASCEND PRIMITIVES\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"

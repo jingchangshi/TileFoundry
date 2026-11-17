@@ -1285,12 +1285,16 @@ def test_scoped_multi_symbol_regime_slice_extract_and_patch(tmp_path: Path) -> N
     cleaned = patch_regime_into_module(patched, split_spec, snippet)
     assert "def _mla_decode_helper(" not in cleaned
 
-    with pytest.raises(ValueError, match="missing required regime symbol"):
-        patch_regime_into_module(
-            mla_src,
-            split_spec,
-            snippet.split("def _build_mla_split_kv_combine_func")[0],
-        )
+    partial_without_combine = patch_regime_into_module(
+        mla_src,
+        split_spec,
+        snippet.split("def _build_mla_split_kv_combine_func")[0],
+    )
+    assert "def _build_mla_split_kv_combine_func(" in partial_without_combine
+    assert "def _build_mla_split_kv_decode_func(" in partial_without_combine
+
+    with pytest.raises(ValueError, match="at least one authorized regime symbol"):
+        patch_regime_into_module(mla_src, split_spec, '"""empty candidate"""\n')
 
     with pytest.raises(ValueError, match="Unauthorized top-level symbol"):
         patch_regime_into_module(
@@ -2311,7 +2315,7 @@ def test_extract_regime_abi_context_covers_ar_and_mla_signatures() -> None:
     )
     ar_abi = _extract_regime_abi_context(ar_src, ar_spec)
     assert "IMMUTABLE HOST / PRIMFUNC ABI CONTRACT" in ar_abi
-    assert "def _build_attention_residual_prim_func(" in ar_abi
+    assert "def _build_ar_small_decode_func(" in ar_abi
     assert "@T.prim_func\ndef main(" in ar_abi
     assert "V: T.Tensor((v_rows, d_dim), tl_dtype)" in ar_abi
     assert "alpha_val: T.float32" in ar_abi
@@ -2321,7 +2325,8 @@ def test_extract_regime_abi_context_covers_ar_and_mla_signatures() -> None:
     )
     mla_spec = next(s for s in DEFAULT_REGIME_SPECS["mla"] if s.regime_tag == "split_kv_decode")
     mla_abi = _extract_regime_abi_context(mla_src, mla_spec)
-    assert "def _build_mla_prim_func(" in mla_abi
+    assert "def _build_mla_split_kv_decode_func(" in mla_abi
+    assert "def _build_mla_split_kv_combine_func(" in mla_abi
     assert "Q_nope: T.Tensor((q_total_rows, d_nope), tl_dtype)" in mla_abi
     assert "scale_val: T.float32" in mla_abi
 
@@ -2495,5 +2500,198 @@ def test_up3_domain_envelope_prompt_and_host_dispatch_cache(tmp_path: Path, monk
     mla_kernels.mla(qn, qr, kn, kr, vv)
     assert mla_calls["sel"] == 1
     assert mla_calls["bk"] == {"fast_exp2": True}
+
+
+def test_wp_final1_pruned_inline_regimes_partial_override_and_mla_combine_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify inline pruned kernels, partial override + orphan GC, cache, and combine gate."""
+    import pytest
+    import torch
+    from examples.ascend950pr_ops.mla import kernels as mla_kernels
+    from tilefoundry_ascend.agent.campaign import campaign_runner as cr_mod
+    from tilefoundry_ascend.agent.campaign import resolve_regime_config
+    from tilefoundry_ascend.agent.orchestrator import run_stage_a_static
+
+    root = Path(__file__).resolve().parents[3]
+    ar_path = root / "examples" / "ascend950pr_ops" / "attention_residual" / "kernels.py"
+    mla_path = root / "examples" / "ascend950pr_ops" / "mla" / "kernels.py"
+    ar_src = ar_path.read_text(encoding="utf-8")
+    mla_src = mla_path.read_text(encoding="utf-8")
+
+    for spec in DEFAULT_REGIME_SPECS["attention_residual"]:
+        _, snip = extract_regime_snippet(ar_src, spec)
+        assert "@T.prim_func" in snip
+        assert "_build_attention_residual_prim_func(" not in snip
+        if spec.regime_tag in ("small_decode", "aligned_prefill"):
+            assert "rem > 0" not in snip
+        else:
+            assert "rem > 0" in snip
+        assert f"def {spec.allowed_helper_prefix}init_row" in snip
+
+    for spec in DEFAULT_REGIME_SPECS["mla"]:
+        _, snip = extract_regime_snippet(mla_src, spec)
+        assert "@T.prim_func" in snip
+        assert "_build_mla_prim_func(" not in snip
+        if spec.regime_tag == "bnsd_gather":
+            assert '"BSND"' not in snip
+        elif spec.regime_tag == "prefill_compute":
+            assert '"BNSD"' not in snip
+
+    ar_aligned_spec = next(
+        s for s in DEFAULT_REGIME_SPECS["attention_residual"] if s.regime_tag == "aligned_prefill"
+    )
+    sel_only_patch = (
+        "def _select_ar_aligned_config(\n"
+        "    n_depth: int = 8,\n"
+        "    d_dim: int = 4096,\n"
+        '    tl_dtype: str = "bfloat16",\n'
+        '    schedule_mode: str = "tuned",\n'
+        "    m_rows: int = 2048,\n"
+        ") -> dict[str, object]:\n"
+        "    _ = (n_depth, d_dim, tl_dtype, m_rows)\n"
+        "    return {\n"
+        '        "tile_m": 4,\n'
+        '        "pass_configs": {},\n'
+        '        "compile_flags": _ar_default_flags(schedule_mode),\n'
+        "    }\n"
+    )
+    patched_sel_only = patch_regime_into_module(ar_src, ar_aligned_spec, sel_only_patch)
+    assert "def _build_ar_aligned_func(" in patched_sel_only
+    assert "def _ar_aligned_step_row(" in patched_sel_only
+    res_sel_only = resolve_regime_config(patched_sel_only, ar_aligned_spec)
+    assert res_sel_only.builder_kwargs["tile_m"] == 4
+    stage_a_partial = run_stage_a_static(
+        patched_sel_only,
+        factory_name=res_sel_only.builder_name,
+        factory_kwargs=res_sel_only.builder_kwargs,
+        pass_configs=res_sel_only.pass_configs or None,
+        compile_flags=res_sel_only.compile_flags or None,
+    )
+    assert stage_a_partial.passed, stage_a_partial.error_message
+
+    _, aligned_snip = extract_regime_snippet(ar_src, ar_aligned_spec)
+    init_start = aligned_snip.index("@T.macro\ndef _ar_aligned_init_row(")
+    init_end = aligned_snip.index("@T.macro\ndef _ar_aligned_step_row(")
+    init_macro = aligned_snip[init_start:init_end]
+    patched_macro_only = patch_regime_into_module(
+        ar_src,
+        ar_aligned_spec,
+        init_macro.replace("T.float32(-1.0e30)", "T.float32(-1.0e35)"),
+    )
+    assert "T.float32(-1.0e35)" in patched_macro_only
+    assert "def _ar_aligned_step_row(" in patched_macro_only
+    assert "def _build_ar_aligned_func(" in patched_macro_only
+
+    builder_start = aligned_snip.index("def _build_ar_aligned_func(")
+    new_init_macro = init_macro.replace("_ar_aligned_init_row", "_ar_aligned_init_v2")
+    replaced_builder = aligned_snip[builder_start:].replace(
+        "_ar_aligned_init_row(", "_ar_aligned_init_v2("
+    )
+    patched_gc = patch_regime_into_module(
+        ar_src,
+        ar_aligned_spec,
+        new_init_macro + "\n\n" + replaced_builder,
+    )
+    assert "def _ar_aligned_init_v2(" in patched_gc
+    assert "def _ar_aligned_init_row(" not in patched_gc
+    assert "def _ar_aligned_step_row(" in patched_gc
+
+    with pytest.raises(ValueError, match="protected symbol"):
+        patch_regime_into_module(
+            mla_src,
+            next(s for s in DEFAULT_REGIME_SPECS["mla"] if s.regime_tag == "split_kv_decode"),
+            "_WORKSPACE_CACHE = {}\n",
+        )
+
+    mla_kernels._DISPATCH_CACHE.clear()
+    mla_kernels._WORKSPACE_CACHE.clear()
+    captured_ptrs: list[tuple[int, int, bool, bool]] = []
+    captured_ck: list[object] = []
+
+    def _fake_stage1(qn_f, qr_f, kn_c, kr_c, v_c, o_p, lse_p, sc):
+        captured_ptrs.append(
+            (o_p.data_ptr(), lse_p.data_ptr(), o_p.is_contiguous(), lse_p.is_contiguous())
+        )
+
+    def _fake_combine(o_p, lse_p):
+        return o_p.sum(dim=0).to(torch.float16)
+
+    def _fake_sel_decode(**_kw):
+        return {
+            "bm": 64,
+            "aligned_group_q": True,
+            "num_kv_splits": 4,
+            "pass_configs": {},
+            "compile_flags": (),
+            "combine_kwargs": {"vec_w": 64},
+        }
+
+    def _fake_get_kernel(*_args, **_kwargs):
+        return _fake_stage1
+
+    def _fake_get_combine(*_args, extra_combine_kwargs=None, **_kwargs):
+        captured_ck.append(extra_combine_kwargs)
+        return _fake_combine
+
+    orig_empty = torch.empty
+    empty_calls = [0]
+
+    def _counting_empty(*args, **kwargs):
+        empty_calls[0] += 1
+        return orig_empty(*args, **kwargs)
+
+    monkeypatch.setattr(mla_kernels, "_select_mla_decode_config", _fake_sel_decode)
+    monkeypatch.setattr(mla_kernels, "_get_kernel", _fake_get_kernel)
+    monkeypatch.setattr(mla_kernels, "_get_combine_kernel", _fake_get_combine)
+    monkeypatch.setattr(mla_kernels.torch, "empty", _counting_empty)
+
+    qn_d = torch.zeros((1, 1, 128, 512), dtype=torch.float16)
+    qr_d = torch.zeros((1, 1, 128, 64), dtype=torch.float16)
+    kn_d = torch.zeros((1, 1024, 1, 512), dtype=torch.float16)
+    kr_d = torch.zeros((1, 1024, 1, 64), dtype=torch.float16)
+    vv_d = torch.zeros((1, 1024, 1, 512), dtype=torch.float16)
+
+    mla_kernels.mla(qn_d, qr_d, kn_d, kr_d, vv_d, num_kv_splits_override=4)
+    mla_kernels.mla(qn_d, qr_d, kn_d, kr_d, vv_d, num_kv_splits_override=4)
+    mla_kernels.mla(qn_d, qr_d, kn_d, kr_d, vv_d, num_kv_splits_override=2)
+    assert empty_calls[0] == 2
+    assert captured_ptrs[0] == captured_ptrs[1]
+    assert captured_ptrs[0][:2] == captured_ptrs[2][:2]
+    assert all(p[2] and p[3] for p in captured_ptrs)
+    assert captured_ck == [{"vec_w": 64}] * 3
+
+    split_spec = next(s for s in DEFAULT_REGIME_SPECS["mla"] if s.regime_tag == "split_kv_decode")
+    broken_combine_mod = mla_src.replace(
+        "lse_ub = T.alloc_shared((splits, 8), \"float32\")",
+        "lse_ub = T.alloc_shared((splits * 4096, 256), \"float32\")",
+        1,
+    )
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="mla", max_rounds=1),
+        target_module_path=mla_path,
+        perf_target=PerfTargetSpec("mla", 2.5, 1.35, 0.85),
+        regime_specs=(split_spec,),
+        llm_backend=MockLLMBackend({}),
+    )
+    l0_bad = runner._run_l0(broken_combine_mod, split_spec)
+    assert not l0_bad.passed
+    assert "combine_kernel(_build_mla_split_kv_combine_func)" in l0_bad.error_message
+
+    l1_builders: list[str] = []
+
+    def _fake_l1(mod_src, *, builder_name, **_kw):
+        l1_builders.append(builder_name)
+        if builder_name == "_build_mla_split_kv_combine_func":
+            return StageBResult(passed=False, error_message="broken combine ir")
+        return StageBResult(passed=True)
+
+    monkeypatch.setattr(cr_mod, "run_l1_compile_check", _fake_l1)
+    l1_bad = runner._run_l1(broken_combine_mod, split_spec)
+    assert not l1_bad.passed
+    assert l1_builders == ["_build_mla_split_kv_decode_func", "_build_mla_split_kv_combine_func"]
+    assert "combine_kernel(_build_mla_split_kv_combine_func): broken combine ir" == l1_bad.error_message
+
 
 
