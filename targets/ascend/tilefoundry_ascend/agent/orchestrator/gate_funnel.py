@@ -299,26 +299,27 @@ def run_stage_a_static(
     """Run millisecond Stage A AST, Two-Snapshot IR Diff, and optional track routing."""
     t0 = time.monotonic()
     try:
-        prim_func, sel_pc, sel_cf = _resolve_prim_func_and_configs_from_dsl(
-            dsl_source,
-            factory_name=factory_name,
-            factory_kwargs=factory_kwargs,
-            config_selector_name=config_selector_name,
-            dims=dims,
-        )
-        merged_pc, merged_cf = _merge_pass_configs_and_flags(
-            sel_pc,
-            sel_cf,
-            pass_configs,
-            compile_flags,
-        )
-        inspection: EnvelopeInspectionResult = inspect_tilelang_primfunc(
-            prim_func,
-            target=target,
-            pass_configs=merged_pc or None,
-            compile_flags=merged_cf or None,
-            var_bindings=var_bindings,
-        )
+        with _ascend_target_context():
+            prim_func, sel_pc, sel_cf = _resolve_prim_func_and_configs_from_dsl(
+                dsl_source,
+                factory_name=factory_name,
+                factory_kwargs=factory_kwargs,
+                config_selector_name=config_selector_name,
+                dims=dims,
+            )
+            merged_pc, merged_cf = _merge_pass_configs_and_flags(
+                sel_pc,
+                sel_cf,
+                pass_configs,
+                compile_flags,
+            )
+            inspection: EnvelopeInspectionResult = inspect_tilelang_primfunc(
+                prim_func,
+                target=target,
+                pass_configs=merged_pc or None,
+                compile_flags=merged_cf or None,
+                var_bindings=var_bindings,
+            )
     except Exception as exc:
         return StageAResult(
             passed=False,

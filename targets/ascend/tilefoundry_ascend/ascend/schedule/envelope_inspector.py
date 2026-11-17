@@ -2145,6 +2145,7 @@ def inspect_tilelang_primfunc(
     var_bindings: Mapping[str, int] | None = None,
 ) -> EnvelopeInspectionResult:
     """Inspect a TileLang PrimFunc using Two-Snapshot IR Diff without bisheng compile."""
+    import contextlib
     import tilelang
     from tilelang.backend.module import create_backend_context
     from tilelang.engine.lower import lower_to_host_device_ir
@@ -2236,8 +2237,15 @@ def inspect_tilelang_primfunc(
     lowering_error: str | None = None
     device_mod = None
     ctx = create_backend_context("ascend", None, "auto")
+    target_ctx = (
+        ctx.target
+        if tvm.target.Target.current(allow_none=True) is None
+        else contextlib.nullcontext()
+    )
     try:
-        with tvm.transform.PassContext(config=cfg, instruments=[_SnapshotCapture()]):
+        with target_ctx, tvm.transform.PassContext(
+            config=cfg, instruments=[_SnapshotCapture()]
+        ):
             _host_mod, device_mod, _params, _tgt, _htgt = lower_to_host_device_ir(mod_in, ctx)
     except Exception as exc:
         lowering_error = f"{type(exc).__name__}: {exc}"

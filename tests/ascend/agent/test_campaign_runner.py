@@ -2322,3 +2322,33 @@ def test_extract_regime_abi_context_covers_ar_and_mla_signatures() -> None:
     assert "Q_nope: T.Tensor((q_total_rows, d_nope), tl_dtype)" in mla_abi
     assert "scale_val: T.float32" in mla_abi
 
+
+def test_is_transient_blocked_env_retries_dependency_flake_not_device_fail():
+    """Verify DEPENDENCY_NOT_PASSED triggers retry while real device FAIL does not."""
+    import subprocess
+    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import _is_transient_blocked_env
+
+    proc_fail = subprocess.CompletedProcess(args=["agent-gates"], returncode=1, stdout="", stderr="")
+    dep_flake = {
+        "status": "FAIL",
+        "gates": [
+            {"gateId": "tilefoundry-npu-cpu", "status": "FAIL", "failures": ["NONZERO_EXIT"]},
+            {
+                "gateId": "tilefoundry-npu-device",
+                "status": "NOT_RUN",
+                "failures": ["DEPENDENCY_NOT_PASSED"],
+            },
+        ],
+    }
+    assert _is_transient_blocked_env(proc_fail, dep_flake) is True
+
+    real_device_fail = {
+        "status": "FAIL",
+        "gates": [
+            {"gateId": "tilefoundry-npu-cpu", "status": "PASS", "failures": []},
+            {"gateId": "tilefoundry-npu-device", "status": "FAIL", "failures": ["NONZERO_EXIT"]},
+        ],
+    }
+    assert _is_transient_blocked_env(proc_fail, real_device_fail) is False
+
+

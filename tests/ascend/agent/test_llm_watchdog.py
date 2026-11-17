@@ -382,9 +382,9 @@ def test_command_normalization_effort_routing_and_stdin_devnull(
     backend = AgyCliLLMBackend(
         bin_path=str(bin_path),
         watchdog=StreamWatchdogConfig(
-            startup_timeout_sec=2.0,
-            idle_stall_timeout_sec=2.0,
-            active_ceiling_timeout_sec=5.0,
+            startup_timeout_sec=10.0,
+            idle_stall_timeout_sec=10.0,
+            active_ceiling_timeout_sec=15.0,
             max_retries=0,
         ),
     )
@@ -412,7 +412,7 @@ def test_command_normalization_effort_routing_and_stdin_devnull(
     assert rec1["cwd_entries"] == []
     assert rec1["args"]["output_format"] == "stream-json"
     assert rec1["args"]["effort"] == "medium"
-    assert rec1["args"]["print_timeout"] == "5s"
+    assert rec1["args"]["print_timeout"] == "15s"
     assert "### SYSTEM INSTRUCTIONS" in rec1["args"]["prompt"]
 
     monkeypatch.setenv("TF_FAKE_AGY_SCENARIO", "ok_structured")

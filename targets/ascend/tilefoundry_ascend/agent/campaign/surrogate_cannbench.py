@@ -1128,6 +1128,21 @@ def _is_transient_blocked_env(
         return False
     if parsed.get("status") == "BLOCKED_ENV":
         return True
+    if parsed.get("status") == "FAIL":
+        gates = parsed.get("gates")
+        if isinstance(gates, Sequence) and not isinstance(gates, (str, bytes)):
+            for gate in gates:
+                if not isinstance(gate, Mapping):
+                    continue
+                failures = gate.get("failures")
+                if (
+                    gate.get("gateId") == "tilefoundry-npu-device"
+                    and gate.get("status") == "NOT_RUN"
+                    and isinstance(failures, Sequence)
+                    and not isinstance(failures, (str, bytes))
+                    and "DEPENDENCY_NOT_PASSED" in failures
+                ):
+                    return True
     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
     return "npu-smi" in combined
 

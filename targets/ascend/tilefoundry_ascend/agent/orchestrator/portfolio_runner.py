@@ -45,9 +45,17 @@ CREATIVE_FOCUS_HINTS: tuple[str, ...] = (
 TILELANG_ASCEND_PRIMITIVE_MENU: str = "\n".join(
     (
         "- T.MixedKernel(28, sids=2): coupled 1 AIC + 2 AIV execution (or pure-AIV sids=2)",
-        "- T.Kernel(blocks) / T.Persistent(...): grid dispatch and persistent 2D swizzle",
+        (
+            "- T.Kernel(blocks) / T.MixedKernel(blocks, sids=2): 1D core grid only "
+            "(NEVER pass is_npu=... or threads=...)"
+        ),
+        "- T.Persistent(...): persistent 2D core swizzle loop over logical tiles",
         "- T.Pipelined(count, num_stages=...): multi-buffered loop pipelining",
-        "- T.SimdVF(): native SIMD vector-function mode (256 KiB UB with PURE_SIMDVF_UBUF_FLAGS)",
+        (
+            "- T.SimdVF(): native SIMD vector-function mode (256 KiB UB with "
+            "PURE_SIMDVF_UBUF_FLAGS; T.Parallel must index plain UB tile buffers rather "
+            "than pipelined version-counter modulo slices)"
+        ),
         "- T.SimtVF(threads=128): SIMT vector-function mode for irregular/scalar-tail loops",
         (
             "- Module pre-imports tilelang, tilelang.ascend.language as T, torch, "
@@ -435,6 +443,7 @@ def build_syntax_repair_request(dsl_source: str, error_message: str) -> Generati
         "BROKEN KERNEL DSL (do NOT add unprefixed top-level functions)."
     )
     user_prompt = (
+        f"### VALID TILELANG ASCEND PRIMITIVES\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"
         f"### COMPILER / GATE DIAGNOSTIC\n{error_message}\n\n"
         f"### BROKEN KERNEL DSL\n```python\n{dsl_source}\n```\n"
     )

@@ -876,3 +876,43 @@ def make_fill_kernel():
     assert res.ledger is not None
 
 
+def test_envelope_inspector_binds_target_context_and_repair_menu():
+    """Verify inspect_tilelang_primfunc and syntax repair handle target context and menu."""
+    import tilelang.ascend.language as T
+    from tilelang import tvm
+    from tilelang.backend.module import create_backend_context
+    from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
+        TILELANG_ASCEND_PRIMITIVE_MENU,
+        build_syntax_repair_request,
+    )
+    from tilefoundry_ascend.ascend.schedule import inspect_tilelang_primfunc
+
+    if tvm.target.Target.current(allow_none=True) is None:
+        with create_backend_context("ascend").target:
+
+            @T.prim_func
+            def _mixed_fill_main(
+                X: T.Tensor((1, 64), "float32"),
+                Y: T.Tensor((1, 64), "float32"),
+            ):
+                with T.MixedKernel(1, sids=2) as (bx, sid):
+                    a_ub = T.alloc_shared((1, 64), "float32")
+                    with T.SimdVF():
+                        if bx == 0 and sid == 0:
+                            T.fill(a_ub, 0.0)
+                    if sid == 0:
+                        T.copy(a_ub, Y[0:1, 0:64])
+
+        fn = _mixed_fill_main
+    assert tvm.target.Target.current(allow_none=True) is None
+    inspection = inspect_tilelang_primfunc(fn)
+    assert inspection.lowering_error is None, inspection.lowering_error
+    assert inspection.ledger is not None
+
+    req = build_syntax_repair_request("def f():\n    pass\n", "some error")
+    assert "VALID TILELANG ASCEND PRIMITIVES" in req.user_prompt
+    assert TILELANG_ASCEND_PRIMITIVE_MENU in req.user_prompt
+    assert "is_npu" in req.user_prompt
+
+
+
