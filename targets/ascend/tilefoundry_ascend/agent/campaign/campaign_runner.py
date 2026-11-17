@@ -1482,9 +1482,11 @@ class PerfTargetCampaignRunner:
         else:
             nav_section = ""
         msprof_section = self._format_msprof_section(parent_residual)
-        domain_env = get_input_domain_envelope(
-            getattr(getattr(self, "_config", None), "operator", "")
+        cfg_obj = getattr(self, "_config", None)
+        op_name = str(
+            getattr(cfg_obj, "operator_name", "") or getattr(cfg_obj, "operator", "") or ""
         )
+        domain_env = get_input_domain_envelope(op_name)
         domain_section = (
             f"{domain_env.format_prompt_block()}\n\n" if domain_env is not None else ""
         )
@@ -1575,9 +1577,11 @@ class PerfTargetCampaignRunner:
             else ""
         )
         msprof_section = self._format_msprof_section(parent_residual)
-        domain_env = get_input_domain_envelope(
-            getattr(getattr(self, "_config", None), "operator", "")
+        cfg_obj = getattr(self, "_config", None)
+        op_name = str(
+            getattr(cfg_obj, "operator_name", "") or getattr(cfg_obj, "operator", "") or ""
         )
+        domain_env = get_input_domain_envelope(op_name)
         domain_section = (
             f"{domain_env.format_prompt_block()}\n\n" if domain_env is not None else ""
         )
@@ -2123,11 +2127,32 @@ class PerfTargetCampaignRunner:
                 (top_res.avg_speedup - best_result.avg_speedup)
                 / max(best_result.avg_speedup, 1e-6)
             )
-            tail_guard_ok = top_res.min_case_speedup >= 0.97 * best_result.min_case_speedup
-            dual_criterion_ok = surrogate_gain >= self._config.min_surrogate_gain or (
-                top_res.min_case_speedup >= 1.03 * best_result.min_case_speedup
+            tail_guard_ok = (
+                top_res.min_case_speedup >= 0.97 * best_result.min_case_speedup
                 and top_res.surrogate_score >= best_result.surrogate_score - 1e-6
             )
+            global_gain_ok = (
+                surrogate_gain >= self._config.min_surrogate_gain
+                or (
+                    top_res.min_case_speedup >= 1.03 * best_result.min_case_speedup
+                    and top_res.surrogate_score >= best_result.surrogate_score - 1e-6
+                )
+            )
+            top_local = top_res.for_regime(regime_spec.regime_tag)
+            best_local = best_result.for_regime(regime_spec.regime_tag)
+            local_gain_ok = bool(
+                top_local.anchors
+                and best_local.anchors
+                and (
+                    (top_local.surrogate_score - best_local.surrogate_score)
+                    >= self._config.min_surrogate_gain
+                    or (
+                        top_local.avg_speedup >= 1.02 * best_local.avg_speedup
+                        and top_res.surrogate_score > best_result.surrogate_score + 1e-6
+                    )
+                )
+            )
+            dual_criterion_ok = global_gain_ok or local_gain_ok
             if tail_guard_ok and dual_criterion_ok:
                 _atomic_write_text(self._target_module_path, top_chk.patched_module_source)
                 l3_res = self._run_l3_contract(self._target_module_path)

@@ -838,18 +838,33 @@ for idx, (cid, mod_path) in enumerate(cand_paths):
             for d_key, d_val in case_dims.items():
                 mapped = _HIR_DIM_ALIASES.get(str(d_key), str(d_key))
                 pool[mapped] = d_val
+            raw_bk = {{}}
+            raw_ck = {{}}
             sel_name = regime.config_selector_fn
             if sel_name and callable(getattr(mod, sel_name, None)):
                 sel_fn = getattr(mod, sel_name)
                 sel_out = sel_fn(**_filter_callable_kwargs(sel_fn, pool))
                 if isinstance(sel_out, dict):
+                    maybe_bk = sel_out.get("builder_kwargs")
+                    if isinstance(maybe_bk, dict):
+                        raw_bk = dict(maybe_bk)
+                    maybe_ck = sel_out.get("combine_kwargs")
+                    if isinstance(maybe_ck, dict):
+                        raw_ck = dict(maybe_ck)
                     for sk, sv in sel_out.items():
-                        if sk not in ("pass_configs", "compile_flags"):
+                        if sk not in (
+                            "pass_configs",
+                            "compile_flags",
+                            "builder_kwargs",
+                            "combine_kwargs",
+                        ):
                             pool[str(sk)] = sv
             pool.update(resolved.builder_kwargs)
             pool["builder_fn"] = builder_fn
             pool["pass_configs"] = dict(resolved.pass_configs)
             pool["compile_flags"] = tuple(resolved.compile_flags)
+            pool["extra_builder_kwargs"] = dict(raw_bk) if raw_bk else None
+            pool["extra_combine_kwargs"] = dict(raw_ck) if raw_ck else None
 
             used_get_kernel = False
             if callable(get_kernel_fn):
@@ -890,7 +905,9 @@ for idx, (cid, mod_path) in enumerate(cand_paths):
                     used_get_kernel = True
 
             if not used_get_kernel:
-                b_kwargs = _filter_callable_kwargs(builder_fn, resolved.builder_kwargs)
+                generic_pool = dict(resolved.builder_kwargs)
+                generic_pool.update(raw_bk)
+                b_kwargs = _filter_callable_kwargs(builder_fn, generic_pool)
                 pc_dict = dict(resolved.pass_configs)
                 cf_tuple = tuple(resolved.compile_flags)
                 sig_key = (

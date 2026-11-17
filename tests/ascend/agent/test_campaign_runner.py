@@ -2402,47 +2402,44 @@ def test_up3_domain_envelope_prompt_and_host_dispatch_cache(tmp_path: Path, monk
     resolved = resolve_regime_config(dummy_dsl, demo_spec, dims={"N": 8})
     assert resolved.builder_kwargs.get("omit_max_shift") is True
 
-    class _DummyRunner:
-        _enable_track_router = False
-        _format_msprof_section = staticmethod(lambda _r: "")
-        _slice_contract_instruction = staticmethod(lambda fn, _s: fn)
-
-        def __init__(self, op_name: str) -> None:
-            self._config = type("_Cfg", (), {"operator": op_name})()
-
-    runner = _DummyRunner("attention_residual")
     tracker = BayesianRuleTracker.from_seed_yaml()
     sample_rule = tracker.active_rules()[0]
-    dummy_res = CandidateSurrogateResult(
-        candidate_id="cand_0",
-        operator_name="attention_residual",
-        all_passed=True,
-        avg_speedup=1.0,
-        min_case_speedup=1.0,
-        avg_roofline_eta=0.5,
-        surrogate_score=0.5,
-    )
-    exp_req = PerfTargetCampaignRunner._build_exploit_regime_request(
-        runner,
-        snippet_source="def _select_ar_aligned_config():\n    return {}\n",
-        func_name="_select_ar_aligned_config",
-        regime_spec=spec,
-        rule=sample_rule,
-        best_result=dummy_res,
-    )
-    crt_req = PerfTargetCampaignRunner._build_creative_regime_request(
-        runner,
-        snippet_source="def _select_ar_aligned_config():\n    return {}\n",
-        func_name="_select_ar_aligned_config",
-        regime_spec=spec,
-        best_result=dummy_res,
-        effort="high",
-    )
-    for req in (exp_req, crt_req):
-        assert "### INPUT DOMAIN & FAST-MATH ENVELOPE (attention_residual)" in req.user_prompt
-        assert "builder_kwargs" in req.user_prompt
-    for rule in tracker.active_rules():
-        assert rule.rule_id not in crt_req.system_prompt + "\n" + crt_req.user_prompt
+    root = Path(__file__).resolve().parents[3]
+    for op_name in ("attention_residual", "mla"):
+        real_runner = PerfTargetCampaignRunner(
+            config=CampaignConfig(operator_name=op_name, max_rounds=1),
+            target_module_path=root / "examples" / "ascend950pr_ops" / op_name / "kernels.py",
+            llm_backend=MockLLMBackend({}),
+        )
+        op_spec = DEFAULT_REGIME_SPECS[op_name][0]
+        dummy_res = CandidateSurrogateResult(
+            candidate_id="cand_0",
+            operator_name=op_name,
+            all_passed=True,
+            avg_speedup=1.0,
+            min_case_speedup=1.0,
+            avg_roofline_eta=0.5,
+            surrogate_score=0.5,
+        )
+        exp_req = real_runner._build_exploit_regime_request(
+            snippet_source="def _select_demo():\n    return {}\n",
+            func_name=op_spec.builder_candidates[0],
+            regime_spec=op_spec,
+            rule=sample_rule,
+            best_result=dummy_res,
+        )
+        crt_req = real_runner._build_creative_regime_request(
+            snippet_source="def _select_demo():\n    return {}\n",
+            func_name=op_spec.builder_candidates[0],
+            regime_spec=op_spec,
+            best_result=dummy_res,
+            effort="high",
+        )
+        for req in (exp_req, crt_req):
+            assert f"### INPUT DOMAIN & FAST-MATH ENVELOPE ({op_name})" in req.user_prompt
+            assert "builder_kwargs" in req.user_prompt
+        for rule in tracker.active_rules():
+            assert rule.rule_id not in crt_req.system_prompt + "\n" + crt_req.user_prompt
 
     ar_calls = {"sel": 0, "bk": None}
 
@@ -2692,6 +2689,247 @@ def test_wp_final1_pruned_inline_regimes_partial_override_and_mla_combine_gate(
     assert not l1_bad.passed
     assert l1_builders == ["_build_mla_split_kv_decode_func", "_build_mla_split_kv_combine_func"]
     assert "combine_kernel(_build_mla_split_kv_combine_func): broken combine ir" == l1_bad.error_message
+
+
+def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify prewarm extra builder/combine kwargs forwarding and local regime L3 promotion."""
+    import yaml
+    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+        prewarm_surrogate_tilelang_cache,
+    )
+
+    fake_root = tmp_path / "repo"
+    (fake_root / "src").mkdir(parents=True)
+    ascend_agent_dir = fake_root / "targets" / "ascend"
+    ascend_agent_dir.mkdir(parents=True)
+    (ascend_agent_dir / "tilefoundry_ascend").symlink_to(
+        Path(__file__).resolve().parents[3] / "targets" / "ascend" / "tilefoundry_ascend"
+    )
+
+    cann_repo = tmp_path / "cann"
+    mla_dir = cann_repo / "operators" / "level4" / "mla"
+    mla_dir.mkdir(parents=True, exist_ok=True)
+    (mla_dir / "cases.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "cases": [
+                    {
+                        "case_id": 7,
+                        "input_shape": [
+                            [1, 1, 128, 512],
+                            [1, 1, 128, 64],
+                            [1, 2048, 1, 512],
+                            [1, 2048, 1, 64],
+                            [1, 2048, 1, 512],
+                        ],
+                        "dtype": "float16",
+                        "attrs": {"numKVHeads": 1, "inputLayout": "BSND", "is_causal": False},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tl_stub_dir = tmp_path / "tl_stub"
+    tl_stub_dir.mkdir()
+    (tl_stub_dir / "tilelang.py").write_text(
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "def compile(prog, *, target='ascend', out_idx=None, pass_configs=None, "
+        "compile_flags=None):\n"
+        "    cdir = Path(os.environ['TILELANG_CACHE_DIR'])\n"
+        "    cdir.mkdir(parents=True, exist_ok=True)\n"
+        "    with (cdir / 'compiled_entries.jsonl').open('a', encoding='utf-8') as fh:\n"
+        "        fh.write(json.dumps({'prog': prog, 'out_idx': out_idx}) + '\\n')\n"
+        "    return {'cached': prog}\n",
+        encoding="utf-8",
+    )
+
+    mla_cand = tmp_path / "cand_mla_kw.py"
+    mla_cand.write_text(
+        "import tilelang\n"
+        "def _select_mla_decode_config(b_dim=1, s_dim=1, s_kv=2048, n_q=128, n_kv=1, "
+        "d_nope=512, d_rope=64, tl_dtype='float16', input_layout='BSND', "
+        "is_causal=False, schedule_mode='tuned'):\n"
+        "    return {'bm': 64, 'aligned_group_q': True, 'num_kv_splits': 4, "
+        "'pass_configs': {}, 'compile_flags': [], "
+        "'builder_kwargs': {'unroll_k': 2}, 'combine_kwargs': {'vec_w': 64}}\n"
+        "def _build_mla_split_kv_decode_func(n_q=128, n_kv=1, d_nope=512, d_rope=64, "
+        "tl_dtype='float16', input_layout='BSND', is_causal=False, bm=64, "
+        "aligned_group_q=True, num_kv_splits=1, schedule_mode='tuned', unroll_k=1):\n"
+        "    return {'kind': 'stage1', 'splits': num_kv_splits, 'unroll_k': unroll_k}\n"
+        "def _get_kernel(n_q, n_kv, d_nope, d_rope, tl_dtype, input_layout, is_causal, "
+        "bm, aligned_group_q, schedule_mode, *, builder_fn=None, num_kv_splits=1, "
+        "pass_configs=None, compile_flags=None, extra_builder_kwargs=None):\n"
+        "    extra = dict(extra_builder_kwargs or {})\n"
+        "    prog = builder_fn(n_q=n_q, n_kv=n_kv, d_nope=d_nope, d_rope=d_rope, "
+        "tl_dtype=tl_dtype, input_layout=input_layout, is_causal=is_causal, bm=bm, "
+        "aligned_group_q=aligned_group_q, num_kv_splits=num_kv_splits, "
+        "schedule_mode=schedule_mode, **extra)\n"
+        "    prog['extra_builder_kwargs'] = extra\n"
+        "    return tilelang.compile(prog, target='ascend', out_idx=None)\n"
+        "def _get_combine_kernel(d_nope, tl_dtype, num_kv_splits, *, "
+        "pass_configs=None, compile_flags=None, extra_combine_kwargs=None):\n"
+        "    return tilelang.compile({'kind': 'combine', 'splits': num_kv_splits, "
+        "'extra_combine_kwargs': dict(extra_combine_kwargs or {})}, target='ascend', "
+        "out_idx=[2])\n",
+        encoding="utf-8",
+    )
+
+    tl_cache = tmp_path / "tl_cache_wp2"
+    ref_cache = tmp_path / "ref_cache_wp2"
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "")
+    monkeypatch.setenv("TILEFOUNDRY_NPU_TILELANG_SOURCE", str(tl_stub_dir))
+    monkeypatch.delenv("TILEFOUNDRY_NPU_CANN_SETUP", raising=False)
+    monkeypatch.delenv("TILEFOUNDRY_NPU_PYTHON", raising=False)
+
+    prewarm_surrogate_tilelang_cache(
+        "mla",
+        [("c_mla_kw", mla_cand)],
+        (AnchorCaseSpec("level4/mla", 7, "split_kv_decode", 4.5, 1.5),),
+        cannbench_repo=cann_repo,
+        cache_dir=ref_cache,
+        tl_cache_dir=tl_cache,
+        source_root=fake_root,
+    )
+    entries = [
+        json.loads(line)
+        for line in (tl_cache / "compiled_entries.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(entries) == 2
+    assert entries[0]["prog"]["unroll_k"] == 2
+    assert entries[0]["prog"]["extra_builder_kwargs"] == {"unroll_k": 2}
+    assert entries[1]["prog"]["extra_combine_kwargs"] == {"vec_w": 64}
+
+    six_anchors = (
+        AnchorCaseSpec("level4/attention_residual", 1, "regime_a", 10.0, 2.0),
+        AnchorCaseSpec("level4/attention_residual", 2, "regime_b", 10.0, 2.0),
+        AnchorCaseSpec("level4/attention_residual", 3, "regime_b", 10.0, 2.0),
+        AnchorCaseSpec("level4/attention_residual", 4, "regime_b", 10.0, 2.0),
+        AnchorCaseSpec("level4/attention_residual", 5, "regime_b", 10.0, 2.0),
+        AnchorCaseSpec("level4/attention_residual", 6, "regime_b", 10.0, 2.0),
+    )
+    regimes = (
+        RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),
+        RegimeTargetSpec("regime_b", ("_build_regime_b",), {}),
+    )
+    target_mod = tmp_path / "kernels_local_gain.py"
+    target_mod.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+
+    local_win_src = _IMPROVED_REGIME_A
+    regress_tail_src = _SSBUF_REGIME_A
+
+    def _l2_local_win(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            lats = {i: 10.0 for i in range(1, 7)}
+            if "T.alloc_ss" in src:
+                lats[1] = 9.40
+                lats[6] = 10.55
+            elif "with T.Kernel(2):" in src:
+                lats[1] = 9.40
+            out[cid] = _make_surrogate_result(
+                cid, "attention_residual", tuple(active_anchors), lats
+            )
+        return out
+
+    base_res = _l2_local_win([("base", target_mod)], six_anchors)["base"]
+    win_mod = tmp_path / "win_preview.py"
+    win_mod.write_text(
+        patch_regime_into_module(_MULTI_REGIME_MODULE, "_build_regime_a", local_win_src),
+        encoding="utf-8",
+    )
+    win_res = _l2_local_win([("win", win_mod)], six_anchors)["win"]
+    global_gain = win_res.surrogate_score - base_res.surrogate_score
+    assert 0.0 < global_gain < 0.25
+    assert win_res.for_regime("regime_a").avg_speedup >= 1.02 * base_res.for_regime("regime_a").avg_speedup
+
+    l3_calls = [0]
+
+    def _l3_pass(_p: Path) -> L3AcceptanceResult:
+        l3_calls[0] += 1
+        return L3AcceptanceResult(passed=True)
+
+    backend_win = MockLLMBackend(
+        responses={
+            "exploit_rule": [local_win_src] * 2,
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Regime A local 6pct gain",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": local_win_src,
+                    }
+                )
+            ],
+        }
+    )
+    runner_win = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=1,
+            k_rule_workers=1,
+            min_surrogate_gain=0.25,
+        ),
+        target_module_path=target_mod,
+        perf_target=PerfTargetSpec("attention_residual", 5.0, 5.0, 0.99, target_surrogate_score=99.0),
+        anchors=six_anchors,
+        regime_specs=regimes,
+        llm_backend=backend_win,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_local_win,
+        l3_contract_runner=_l3_pass,
+        checkpoint_path=tmp_path / "ckpt_local_win.json",
+    )
+    rep_win = asyncio.run(runner_win.run())
+    assert rep_win.promoted_rounds == (1,)
+    assert l3_calls[0] == 1
+
+    target_mod_reg = tmp_path / "kernels_local_regress.py"
+    target_mod_reg.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    backend_reg = MockLLMBackend(
+        responses={
+            "exploit_rule": [regress_tail_src] * 2,
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Regime A gain with tail regression",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": regress_tail_src,
+                    }
+                )
+            ],
+        }
+    )
+    runner_reg = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=1,
+            k_rule_workers=1,
+            min_surrogate_gain=0.25,
+        ),
+        target_module_path=target_mod_reg,
+        perf_target=PerfTargetSpec("attention_residual", 5.0, 5.0, 0.99, target_surrogate_score=99.0),
+        anchors=six_anchors,
+        regime_specs=regimes,
+        llm_backend=backend_reg,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_local_win,
+        l3_contract_runner=_l3_pass,
+        checkpoint_path=tmp_path / "ckpt_local_reg.json",
+    )
+    rep_reg = asyncio.run(runner_reg.run())
+    assert rep_reg.promoted_rounds == ()
+    assert l3_calls[0] == 1
+
 
 
 
