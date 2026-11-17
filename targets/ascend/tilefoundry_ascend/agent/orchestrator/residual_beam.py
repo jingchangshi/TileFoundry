@@ -16,6 +16,11 @@ _NOVELTY_TOKENS = (
     "T.Scope",
     "unit_flag_ctrl",
     "vgather2",
+    "T.MixedKernel",
+    "T.Pipelined",
+    "T.SimdVF",
+    "PURE_SIMDVF_UBUF_FLAGS",
+    "T.set_atomic",
 )
 
 
@@ -112,10 +117,10 @@ def compute_static_dynamic_residual(
     )
 
 
-def extract_structural_signature(dsl_source: str, track: str = "") -> tuple[str, ...]:
+def extract_structural_signature(dsl_source: str, *, track: str = "") -> tuple[str, ...]:
     """Extract sorted architectural primitive signature for stepping-stone diversity."""
     tags: list[str] = []
-    if track:
+    if track and track != "unconstrained":
         tags.append(f"track:{track}")
     for token in _NOVELTY_TOKENS:
         if token in dsl_source:
@@ -141,6 +146,10 @@ class BeamCandidate:
     hypothesis: str = ""
     parent_id: str | None = None
     features: StructuralFeatures | None = None
+
+    def __post_init__(self) -> None:
+        if not self.track:
+            object.__setattr__(self, "track", "unconstrained")
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable dictionary representation."""
@@ -192,7 +201,7 @@ class BeamCandidate:
             worker_kind=str(payload["worker_kind"]),
             rule_id=str(raw_rule) if raw_rule is not None else None,
             dsl_source=str(payload["dsl_source"]),
-            track=str(payload["track"]),
+            track=str(payload.get("track") or "unconstrained"),
             ledger=ledger,
             residual=residual,
             latency_us=float(payload["latency_us"]),

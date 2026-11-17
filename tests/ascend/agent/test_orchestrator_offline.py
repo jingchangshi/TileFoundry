@@ -24,10 +24,17 @@ from tilefoundry_ascend.agent.orchestrator import (
     CREATIVE_RESPONSE_SCHEMA,
     StageBResult,
     StageCResult,
+    build_creative_request,
+    build_exploit_request,
     compute_static_dynamic_residual,
     extract_creative_payload,
+    extract_structural_signature,
     run_stage_a_static,
 )
+from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
+    TILELANG_ASCEND_PRIMITIVE_MENU,
+)
+from tilefoundry_ascend.agent.kb import load_seed_rules
 from tilefoundry_ascend.ascend.passes import build_objective_physical_ledger, build_scope_waterline
 
 _SEED_DSL = """
@@ -586,3 +593,81 @@ def test_fp3_unmatched_rules_not_padded_and_transport_error_exempt() -> None:
     assert all(stage == "llm_transport" for _wid, stage, _err in fail_report.failed_candidates)
     for rid, stats in fail_tracker.posteriors.items():
         assert stats.trials == 0, f"transport error penalized rule {rid}"
+
+
+def test_stage_a_track_router_disabled_by_default_and_primitive_menu(monkeypatch) -> None:
+    """Verify router disabled by default, signature tokens, and unconstrained prompt menu."""
+    import tilefoundry_ascend.agent.router.capability_gate as cap_gate
+
+    calls: list[str] = []
+
+    def _boom_extract(*_args, **_kwargs):
+        calls.append("extract")
+        raise AssertionError("capability_gate must not run when enable_track_router=False")
+
+    def _boom_route(*_args, **_kwargs):
+        calls.append("route")
+        raise AssertionError("capability_gate must not run when enable_track_router=False")
+
+    monkeypatch.setattr(cap_gate, "extract_structural_features", _boom_extract)
+    monkeypatch.setattr(cap_gate, "route_execution_track", _boom_route)
+
+    st_default = run_stage_a_static(_SEED_DSL, factory_name="make_kernel")
+    assert st_default.passed is True
+    assert st_default.features is None
+    assert st_default.route is None
+    assert calls == []
+
+    monkeypatch.undo()
+    st_enabled = run_stage_a_static(
+        _SEED_DSL, factory_name="make_kernel", enable_track_router=True
+    )
+    assert st_enabled.passed is True
+    assert st_enabled.features is not None
+    assert st_enabled.route is not None
+
+    sig = extract_structural_signature(
+        "with T.MixedKernel(28, sids=2):\n"
+        "    for kt in T.Pipelined(2, num_stages=2):\n"
+        "        with T.SimdVF():\n"
+        "            T.set_atomic('add')\n"
+        "pass_configs = PURE_SIMDVF_UBUF_FLAGS\n",
+        track="unconstrained",
+    )
+    assert all(not item.startswith("track:") for item in sig)
+    for expected_tok in (
+        "T.MixedKernel",
+        "T.Pipelined",
+        "T.SimdVF",
+        "PURE_SIMDVF_UBUF_FLAGS",
+        "T.set_atomic",
+    ):
+        assert expected_tok in sig
+
+    ledger = _make_legal_ledger(ii=4, pipe_cycles={"AIC.PIPE_M": 32, "AIV0.PIPE_V": 64})
+    res = compute_static_dynamic_residual(ledger, {"dur_us": 20.0})
+    unconstrained_parent = BeamCandidate(
+        candidate_id="seed_unconstrained",
+        round_idx=0,
+        worker_kind="seed",
+        rule_id=None,
+        dsl_source=_SEED_DSL,
+        track="",
+        ledger=ledger,
+        residual=res,
+        latency_us=20.0,
+        accuracy_passed=True,
+    )
+    assert unconstrained_parent.track == "unconstrained"
+
+    rules = load_seed_rules()
+    exp_req = build_exploit_request(unconstrained_parent, rules[0])
+    assert "### EXECUTION TRACK" not in exp_req.user_prompt
+    assert "### TARGET TRACK" not in exp_req.user_prompt
+    assert "### TILELANG ASCEND PRIMITIVE REFERENCE" in exp_req.user_prompt
+    assert TILELANG_ASCEND_PRIMITIVE_MENU in exp_req.user_prompt
+
+    cre_req = build_creative_request(unconstrained_parent)
+    assert "### EXECUTION TRACK" not in cre_req.user_prompt
+    assert "### TILELANG ASCEND PRIMITIVE REFERENCE" in cre_req.user_prompt
+    assert TILELANG_ASCEND_PRIMITIVE_MENU in cre_req.user_prompt

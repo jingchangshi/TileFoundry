@@ -15,7 +15,9 @@ from tilefoundry_ascend.agent import (
     load_seed_rules,
     route_execution_track,
     safe_eval_predicate,
+    validate_rule_predicate,
 )
+from tilefoundry_ascend.agent.orchestrator import StaticDynamicResidual
 from tilefoundry_ascend.ascend.passes import (
     build_objective_physical_ledger,
     build_scope_waterline,
@@ -101,11 +103,22 @@ def test_capability_router_extracts_8_features_and_routes_tracks() -> None:
 
 
 def test_seed_rules_yaml_completeness_and_sanitization() -> None:
-    """Verify seed_rules.yaml loads R01..R12 with zero operator names or machine paths."""
+    """Verify seed_rules.yaml loads R01..R17 with pure ledger predicates and sanitization."""
     yaml_text = default_seed_rules_path().read_text(encoding="utf-8")
     assert "/home/" not in yaml_text
     assert "/Users/" not in yaml_text
     assert "/data" not in yaml_text
+    assert "phi_" not in yaml_text
+    for forbidden_router_field in (
+        "static_affine_bounds",
+        "indirect_sparse_gather",
+        "quant_granularity",
+        "cross_iter_recurrence",
+        "dynamic_cross_core_handoff",
+        "inner_contiguous_bytes",
+        "persistent_wave_occupancy",
+    ):
+        assert forbidden_router_field not in yaml_text
     for forbidden_op in (
         "sparse_flash_mla",
         "mixed_quant_sparse_flash_mla",
@@ -118,10 +131,15 @@ def test_seed_rules_yaml_completeness_and_sanitization() -> None:
     assert not re.search(r"\bmla\b", yaml_text.lower())
 
     rules = load_seed_rules()
-    assert len(rules) >= 10
+    assert len(rules) == 17
     ids = {rule.rule_id for rule in rules}
-    for prefix in ("R01_", "R02_", "R03_", "R04_", "R05_", "R06_", "R07_", "R08_", "R09_", "R10_"):
+    for idx in range(1, 18):
+        prefix = f"R{idx:02d}_"
         assert any(rid.startswith(prefix) for rid in ids)
+    for rule in rules:
+        validate_rule_predicate(rule.regime_guard)
+        validate_rule_predicate(rule.precondition)
+        validate_rule_predicate(rule.expected_postcondition)
 
 
 def test_safe_ast_evaluator_and_causal_rule_matching() -> None:
@@ -142,8 +160,7 @@ def test_safe_ast_evaluator_and_causal_rule_matching() -> None:
         pipe_cycles={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 96},
         waterlines={},
     )
-    feat_fix = extract_structural_features(ledger=before_fix)
-    ctx_fix = build_predicate_context(before_fix, features=feat_fix)
+    ctx_fix = build_predicate_context(before_fix)
     assert rules["R03_ACCUM_SPAN_FIXPIPE_RELIEF"].matches(ctx_fix) is True
 
     after_fix = build_objective_physical_ledger(
@@ -153,7 +170,7 @@ def test_safe_ast_evaluator_and_causal_rule_matching() -> None:
         pipe_cycles={"AIC.PIPE_M": 128, "AIC.PIPE_FIX": 96},
         waterlines={},
     )
-    post_ctx_fix = build_predicate_context(after_fix, features=feat_fix, prev_ledger=before_fix)
+    post_ctx_fix = build_predicate_context(after_fix, prev_ledger=before_fix)
     assert rules["R03_ACCUM_SPAN_FIXPIPE_RELIEF"].postcondition_realized(post_ctx_fix) is True
 
     before_split = build_objective_physical_ledger(
@@ -163,11 +180,19 @@ def test_safe_ast_evaluator_and_causal_rule_matching() -> None:
         pipe_cycles={"AIC.PIPE_M": 40, "AIV0.PIPE_V": 80},
         waterlines={},
     )
-    ctx_split = build_predicate_context(
-        before_split,
-        features=extract_structural_features(ledger=before_split),
-    )
+    ctx_split = build_predicate_context(before_split)
     assert rules["R01_DUAL_COPY_1C2V_SPLIT"].matches(ctx_split) is True
+
+    pure_vec_split = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 80, "AIV0.PIPE_MTE2": 100},
+        waterlines={},
+    )
+    assert rules["R01_DUAL_COPY_1C2V_SPLIT"].matches(
+        build_predicate_context(pure_vec_split)
+    ) is True
 
     after_split = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
@@ -199,13 +224,435 @@ def test_safe_ast_evaluator_and_causal_rule_matching() -> None:
         },
         mte2_inflight_per_aiv=32,
         unaligned_dma_padding_bytes=12,
+        has_indirect_gather=True,
     )
-    ctx_bloat = build_predicate_context(
-        bloat_ledger,
-        features=extract_structural_features(ledger=bloat_ledger, indirect_sparse_gather=True),
-    )
+    ctx_bloat = build_predicate_context(bloat_ledger)
     assert rules["R04_MTE2_SPARSE_GATHER_COALESCE"].matches(ctx_bloat) is True
     assert rules["R07_IMPLICIT_BLOAT_HEADROOM_TRIM"].matches(ctx_bloat) is True
+
+
+def test_all_17_seed_rules_fire_with_features_none() -> None:
+    """Verify all 17 rules R01..R17 match and realize postconditions when features=None."""
+    rules = {r.rule_id: r for r in load_seed_rules()}
+    ub_half = build_scope_waterline(
+        scope="UB",
+        capacity_bytes=262144,
+        explicit_buffers={"a": 131072},
+        implicit_buffers={},
+    )
+    ub_full = build_scope_waterline(
+        scope="UB",
+        capacity_bytes=253952,
+        explicit_buffers={"a": 230000},
+        implicit_buffers={},
+    )
+    ub_trimmed = build_scope_waterline(
+        scope="UB",
+        capacity_bytes=262144,
+        explicit_buffers={"a": 120000},
+        implicit_buffers={},
+    )
+
+    def _res(
+        lat: float,
+        *,
+        util: float = 0.85,
+        mte2_w: float = 0.0,
+        sync_s: float = 0.0,
+        gap: float = 0.0,
+        aiv_v: float = 0.0,
+    ) -> StaticDynamicResidual:
+        return StaticDynamicResidual(
+            measured_latency_us=lat,
+            predicted_bottleneck_util=util,
+            measured_aic_mac_ratio=0.4,
+            measured_aiv_vec_ratio=aiv_v,
+            measured_mte2_wait_ratio=mte2_w,
+            measured_sync_stall_ratio=sync_s,
+            unexplained_gap_ratio=gap,
+        )
+
+    cases = [
+        (
+            "R01_DUAL_COPY_1C2V_SPLIT",
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 100},
+                waterlines={},
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 50, "AIV1.PIPE_V": 50},
+                waterlines={},
+            ),
+            _res(40.0),
+            _res(22.0),
+        ),
+        (
+            "R02_ONCHIP_L0C_TO_UB_DIRECT",
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=4,
+                pipe_cycles={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 64, "AIV0.PIPE_MTE2": 80},
+                waterlines={},
+                gm_roundtrip_bytes=65536,
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=2,
+                pipe_cycles={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 64, "AIV0.PIPE_MTE2": 16},
+                waterlines={},
+                gm_roundtrip_bytes=0,
+            ),
+            _res(40.0),
+            _res(25.0),
+        ),
+        (
+            "R03_ACCUM_SPAN_FIXPIPE_RELIEF",
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=3,
+                pipe_cycles={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 96},
+                waterlines={},
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=2,
+                pipe_cycles={"AIC.PIPE_M": 128, "AIC.PIPE_FIX": 96},
+                waterlines={},
+            ),
+            _res(30.0),
+            _res(20.0),
+        ),
+        (
+            "R04_MTE2_SPARSE_GATHER_COALESCE",
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_MTE2": 64},
+                waterlines={},
+                mte2_inflight_per_aiv=24,
+                unaligned_dma_padding_bytes=16,
+                has_indirect_gather=True,
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_MTE2": 32},
+                waterlines={},
+                mte2_inflight_per_aiv=8,
+                unaligned_dma_padding_bytes=0,
+            ),
+            _res(35.0),
+            _res(20.0),
+        ),
+        (
+            "R05_SSBUF_RING_METADATA_HANDOFF",
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIC.PIPE_M": 32, "AIV0.PIPE_V": 32},
+                waterlines={},
+                opaque_dynamic_regions=("dynamic_loop",),
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIC.PIPE_M": 32, "AIV0.PIPE_V": 32},
+                waterlines={
+                    "SSBUF": build_scope_waterline(
+                        scope="SSBUF",
+                        capacity_bytes=3072,
+                        explicit_buffers={"meta": 512},
+                        implicit_buffers={},
+                    )
+                },
+            ),
+            _res(40.0, sync_s=0.25),
+            _res(28.0, sync_s=0.05),
+        ),
+        (
+            "R06_ONLINE_SOFTMAX_SKIP_SCALE",
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIC.PIPE_M": 32, "AIV0.PIPE_V": 96},
+                waterlines={},
+                has_online_rescale_loop=True,
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIC.PIPE_M": 32, "AIV0.PIPE_V": 48},
+                waterlines={},
+                has_online_rescale_loop=True,
+            ),
+            _res(30.0),
+            _res(20.0),
+        ),
+        (
+            "R07_IMPLICIT_BLOAT_HEADROOM_TRIM",
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=False,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 40},
+                waterlines={
+                    "UB": build_scope_waterline(
+                        scope="UB",
+                        capacity_bytes=253952,
+                        explicit_buffers={"x": 220000},
+                        implicit_buffers={"tmp": 65536},
+                        degraded_single_buffers=("x",),
+                    )
+                },
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 40},
+                waterlines={"UB": ub_half},
+            ),
+            _res(50.0),
+            _res(25.0),
+        ),
+        (
+            "R08_PERSISTENT_SWIZZLE_L2_LOCALITY",
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=4,
+                pipe_cycles={"AIC.PIPE_M": 64},
+                waterlines={},
+                grid_blocks=56,
+                wave_occupancy=1.0,
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=4,
+                pipe_cycles={"AIC.PIPE_M": 64},
+                waterlines={},
+                grid_blocks=56,
+                wave_occupancy=1.0,
+            ),
+            _res(45.0, util=0.90, mte2_w=0.35, gap=0.35),
+            _res(28.0, util=0.90, mte2_w=0.15, gap=0.15),
+        ),
+        (
+            "R09_MIXED_QUANT_DEQUANT_STAGE_OVERLAP",
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=6,
+                pipe_cycles={"AIC.PIPE_M": 40, "AIV0.PIPE_V": 60},
+                waterlines={},
+                has_lowbit_quant=True,
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=2,
+                pipe_cycles={"AIC.PIPE_M": 40, "AIV0.PIPE_V": 30},
+                waterlines={},
+                has_lowbit_quant=True,
+            ),
+            _res(40.0),
+            _res(24.0),
+        ),
+        (
+            "R10_BACKWARD_SYNC_CV_PINGPONG",
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=4,
+                pipe_cycles={"AIC.PIPE_M": 40, "AIV0.PIPE_V": 40},
+                waterlines={},
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=2,
+                pipe_cycles={"AIC.PIPE_M": 40, "AIV0.PIPE_V": 40},
+                waterlines={},
+            ),
+            _res(35.0, sync_s=0.22),
+            _res(22.0, sync_s=0.08),
+        ),
+        (
+            "R11_L2_NZ_PAD_BANK_CONFLICT_AVOID",
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 64},
+                waterlines={"UB": ub_half},
+                dominant_contig_bytes=512,
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 64},
+                waterlines={"UB": ub_half},
+                dominant_contig_bytes=544,
+            ),
+            _res(40.0, gap=0.35, aiv_v=0.4),
+            _res(24.0, gap=0.10, aiv_v=0.7),
+        ),
+        (
+            "R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION",
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=4,
+                pipe_cycles={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 64},
+                waterlines={},
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=2,
+                pipe_cycles={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 64},
+                waterlines={},
+            ),
+            _res(30.0),
+            _res(20.0),
+        ),
+        (
+            "R13_SPLIT_KV_WAVE_RECOVERY",
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=2,
+                pipe_cycles={"AIC.PIPE_M": 64},
+                waterlines={},
+                grid_blocks=4,
+                wave_occupancy=0.1428,
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=2,
+                pipe_cycles={"AIC.PIPE_M": 64},
+                waterlines={},
+                grid_blocks=28,
+                wave_occupancy=1.0,
+            ),
+            _res(60.0),
+            _res(18.0),
+        ),
+        (
+            "R14_GQA_HEAD_M_FOLDING",
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=2,
+                pipe_cycles={"AIC.PIPE_M": 64},
+                waterlines={},
+                effective_cube_m=1,
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=2,
+                pipe_cycles={"AIC.PIPE_M": 64},
+                waterlines={},
+                effective_cube_m=16,
+            ),
+            _res(50.0),
+            _res(20.0),
+        ),
+        (
+            "R15_ASYMMETRIC_1C2V_STAGE_FISSION",
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=12,
+                pipe_cycles={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 40, "AIV1.PIPE_V": 40},
+                waterlines={"UB": ub_full},
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="exact_modulo_z3",
+                is_legal=True,
+                steady_state_ii=4,
+                pipe_cycles={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 40, "AIV1.PIPE_V": 40},
+                waterlines={"UB": ub_trimmed},
+            ),
+            _res(45.0),
+            _res(25.0),
+        ),
+        (
+            "R16_PADDED_PITCH_TAIL_MASKING",
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 64},
+                waterlines={},
+                unaligned_dma_padding_bytes=16,
+                opaque_dynamic_regions=("simt_vf",),
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 40},
+                waterlines={},
+                unaligned_dma_padding_bytes=0,
+                opaque_dynamic_regions=(),
+            ),
+            _res(40.0),
+            _res(18.0),
+        ),
+        (
+            "R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK",
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 64},
+                waterlines={"UB": ub_full},
+                in_loop_ub_reload_stores=4,
+            ),
+            build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=None,
+                pipe_cycles={"AIV0.PIPE_V": 48},
+                waterlines={"UB": ub_trimmed},
+                in_loop_ub_reload_stores=0,
+            ),
+            _res(42.0),
+            _res(22.0),
+        ),
+    ]
+
+    for rule_id, pre_ledger, post_ledger, pre_res, post_res in cases:
+        pre_ctx = build_predicate_context(pre_ledger, residual=pre_res)
+        assert rules[rule_id].matches(pre_ctx) is True, f"{rule_id} failed pre match"
+        post_ctx = build_predicate_context(
+            post_ledger, residual=post_res, prev_ledger=pre_ledger
+        )
+        post_ctx["prev"].update(pre_res.to_dict())
+        assert rules[rule_id].postcondition_realized(post_ctx) is True, (
+            f"{rule_id} failed postcondition"
+        )
 
 
 def test_bayesian_rule_tracker_ranking_pruning_and_roundtrip(tmp_path: Path) -> None:

@@ -141,11 +141,13 @@ def test_single_variable_ablation_and_negative_filtering(tmp_path: Path) -> None
         assert safe_eval_predicate(
             rule.regime_guard,
             {
-                "static_affine_bounds": True,
-                "indirect_sparse_gather": False,
-                "inner_contiguous_bytes": 256,
-                "dynamic_cross_core_handoff": False,
+                "is_legal": True,
+                "any_overflow_bytes": 0,
+                "has_indirect_gather": False,
+                "dominant_contig_bytes": 256,
+                "has_dynamic_control": False,
                 "cube_to_vector_ratio": 1.0,
+                "AIV0.PIPE_V": 10,
             },
         )
     summary = json.loads(report.to_json())

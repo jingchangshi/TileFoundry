@@ -9,7 +9,6 @@ import operator
 from pathlib import Path
 import yaml
 
-from tilefoundry_ascend.agent.router.capability_gate import StructuralFeatures
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 
 _BIN_OPS = {
@@ -273,6 +272,16 @@ _DEFAULT_PIPE_KEYS = (
 
 _DEFAULT_SCOPES = ("UB", "L1", "L0A", "L0B", "L0C", "SSBUF")
 
+_RESIDUAL_DEFAULTS: dict[str, float] = {
+    "measured_latency_us": 0.0,
+    "predicted_bottleneck_util": 0.0,
+    "measured_aic_mac_ratio": 0.0,
+    "measured_aiv_vec_ratio": 0.0,
+    "measured_mte2_wait_ratio": 0.0,
+    "measured_sync_stall_ratio": 0.0,
+    "unexplained_gap_ratio": 0.0,
+}
+
 
 def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
     ns: dict[str, object] = {key: 0 for key in _DEFAULT_PIPE_KEYS}
@@ -295,6 +304,33 @@ def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
     ns["unaligned_dma_padding_bytes"] = ledger.unaligned_dma_padding_bytes
     ns["max_overflow_bytes"] = ledger.max_overflow_bytes
     ns["has_opaque_regions"] = bool(ledger.opaque_dynamic_regions)
+
+    cube_cycles = int(ledger.pipe_cycles.get("AIC.PIPE_M", 0)) + int(
+        ledger.pipe_cycles.get("AIC.CUBE", 0)
+    )
+    vec_cycles = int(ledger.pipe_cycles.get("AIV0.PIPE_V", 0)) + int(
+        ledger.pipe_cycles.get("AIV1.PIPE_V", 0)
+    )
+    ns["cube_cycles"] = cube_cycles
+    ns["vec_cycles"] = vec_cycles
+    ns["cube_to_vector_ratio"] = (
+        round(cube_cycles / float(max(1, vec_cycles)), 6) if cube_cycles > 0 else 0.0
+    )
+    ns["wave_occupancy"] = float(ledger.wave_occupancy)
+    ns["grid_blocks"] = int(ledger.grid_blocks)
+    ns["gm_roundtrip_bytes"] = int(ledger.gm_roundtrip_bytes)
+    ns["dominant_contig_bytes"] = int(ledger.dominant_contig_bytes)
+    ns["effective_cube_m"] = int(ledger.effective_cube_m)
+    ns["has_indirect_gather"] = bool(ledger.has_indirect_gather)
+    ns["has_lowbit_quant"] = bool(ledger.has_lowbit_quant)
+    ns["has_online_rescale_loop"] = bool(ledger.has_online_rescale_loop)
+    ns["in_loop_ub_reload_stores"] = int(ledger.in_loop_ub_reload_stores)
+    ns["uses_unreserved_ubuf"] = bool(ledger.uses_unreserved_ubuf)
+    ns["has_simtvf"] = any(
+        "simt_vf" in region.lower() or "simtvf" in region.lower()
+        for region in ledger.opaque_dynamic_regions
+    )
+    ns["has_dynamic_control"] = bool(ledger.opaque_dynamic_regions)
 
     total_bloat = 0
     degraded_total = 0
@@ -322,6 +358,11 @@ def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
                 "overflow_bytes": wl.overflow_bytes,
                 "degraded_count": len(wl.degraded_single_buffers),
             }
+    ub_ns = ns["UB"]
+    assert isinstance(ub_ns, dict)
+    ub_peak = int(ub_ns["peak_allocated_bytes"])
+    ub_cap = int(ub_ns["capacity_bytes"])
+    ns["ub_utilization_ratio"] = round(float(ub_peak) / float(max(1, ub_cap)), 6)
     ns["implicit_bloat_bytes"] = total_bloat
     ns["degraded_buffer_count"] = degraded_total
     ns["any_overflow_bytes"] = any_overflow
@@ -331,7 +372,7 @@ def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
 def build_predicate_context(
     ledger: ObjectivePhysicalLedger,
     *,
-    features: StructuralFeatures | None = None,
+    features: object | None = None,
     residual: Mapping[str, object] | object | None = None,
     prev_ledger: ObjectivePhysicalLedger | None = None,
     extra: Mapping[str, object] | None = None,
@@ -339,38 +380,12 @@ def build_predicate_context(
     """Assemble a flat and dotted-path dictionary for safe rule predicate evaluation."""
     ctx = _ledger_to_namespace(ledger)
     if features is not None:
-        ctx.update(features.to_dict())
-    else:
-        ctx.update(
-            {
-                "phi_1": True,
-                "phi_2": 0.0,
-                "phi_3": "none",
-                "phi_4": False,
-                "phi_5": "none",
-                "phi_6": False,
-                "phi_7": 0,
-                "phi_8": 0.0,
-                "static_affine_bounds": True,
-                "cube_to_vector_ratio": 0.0,
-                "quant_granularity": "none",
-                "indirect_sparse_gather": False,
-                "cross_iter_recurrence": "none",
-                "dynamic_cross_core_handoff": False,
-                "inner_contiguous_bytes": 0,
-                "persistent_wave_occupancy": 0.0,
-            }
-        )
+        if hasattr(features, "to_dict"):
+            ctx.update(features.to_dict())
+        elif isinstance(features, Mapping):
+            ctx.update(features)
 
-    res_defaults = {
-        "measured_latency_us": 0.0,
-        "predicted_bottleneck_util": 0.0,
-        "measured_aic_mac_ratio": 0.0,
-        "measured_aiv_vec_ratio": 0.0,
-        "measured_mte2_wait_ratio": 0.0,
-        "measured_sync_stall_ratio": 0.0,
-        "unexplained_gap_ratio": 0.0,
-    }
+    res_defaults = dict(_RESIDUAL_DEFAULTS)
     if residual is not None:
         for key in res_defaults:
             if isinstance(residual, Mapping) and key in residual:
@@ -380,7 +395,10 @@ def build_predicate_context(
     ctx.update(res_defaults)
 
     if prev_ledger is not None:
-        ctx["prev"] = _ledger_to_namespace(prev_ledger)
+        prev_ns = _ledger_to_namespace(prev_ledger)
+        for key, val in _RESIDUAL_DEFAULTS.items():
+            prev_ns.setdefault(key, val)
+        ctx["prev"] = prev_ns
     else:
         ctx["prev"] = dict(ctx)
 

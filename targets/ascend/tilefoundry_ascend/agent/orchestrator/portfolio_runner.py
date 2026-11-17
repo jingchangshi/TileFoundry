@@ -35,6 +35,23 @@ CREATIVE_FOCUS_HINTS: tuple[str, ...] = (
     "cross_core_dataflow_and_fusion",
 )
 
+TILELANG_ASCEND_PRIMITIVE_MENU: str = "\n".join(
+    (
+        "- T.MixedKernel(28, sids=2): coupled 1 AIC + 2 AIV execution (or pure-AIV sids=2)",
+        "- T.Kernel(blocks) / T.Persistent(...): grid dispatch and persistent 2D swizzle",
+        "- T.Pipelined(count, num_stages=...): multi-buffered loop pipelining",
+        "- T.SimdVF(): native SIMD vector-function mode (256 KiB UB with PURE_SIMDVF_UBUF_FLAGS)",
+        "- T.SimtVF(threads=128): SIMT vector-function mode for irregular/scalar-tail loops",
+        "- T.Scope('C') / T.Scope('V'): explicit AIC Cube and AIV Vector core regions",
+        "- T.gemm(a, b, c, ...): Cube MMAD on L1/L0A/L0B -> L0C",
+        "- T.copy(src, dst) / T.dual_copy(src, dst, ...): GM/L1/L0C/UB DMA and 1C2V split copy",
+        "- T.alloc_l1 / T.alloc_l0a / T.alloc_l0b / T.alloc_l0c: AIC hierarchical SRAM buffers",
+        "- T.alloc_shared(...) / T.alloc_ss(...): AIV Unified Buffer (UB) and 3 KiB shared SSBUF",
+        "- T.set_atomic(...): atomic reduction/accumulation mode on GM outputs",
+        "- PURE_SIMDVF_UBUF_FLAGS: pass config unlocking full 256 KiB UB on pure T.SimdVF()",
+    )
+)
+
 _RULE_CONCEPT_DESCRIPTIONS: dict[str, str] = {
     "R01_DUAL_COPY_1C2V_SPLIT": (
         "1C2V row-splitting via dual_copy across paired AIV sub-cores"
@@ -72,6 +89,21 @@ _RULE_CONCEPT_DESCRIPTIONS: dict[str, str] = {
     "R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION": (
         "Fine-grained hardware unit_flag handoff between MMAD and FixPipe"
     ),
+    "R13_SPLIT_KV_WAVE_RECOVERY": (
+        "Grid block splitting across paired sub-cores for wave occupancy recovery"
+    ),
+    "R14_GQA_HEAD_M_FOLDING": (
+        "Query-group head folding into Cube M-dimension for fractal utilization"
+    ),
+    "R15_ASYMMETRIC_1C2V_STAGE_FISSION": (
+        "Asymmetric 1C2V stage fission and pipelined UB footprint compression"
+    ),
+    "R16_PADDED_PITCH_TAIL_MASKING": (
+        "32B-aligned vector pitch padding with SIMD tail masking"
+    ),
+    "R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK": (
+        "Register-resident loop accumulation and full 256 KiB UB unlock"
+    ),
 }
 
 _SIGNATURE_DESCRIPTIONS: dict[str, str] = {
@@ -83,6 +115,11 @@ _SIGNATURE_DESCRIPTIONS: dict[str, str] = {
     "T.Persistent": "Persistent block dispatch scheduling",
     "T.SimtVF": "SIMT vector-function region",
     "T.Scope": "Explicit cross-core scope separation",
+    "T.MixedKernel": "Coupled mixed-kernel 1C2V dispatch",
+    "T.Pipelined": "Multi-stage loop pipelining",
+    "T.SimdVF": "Native SIMD vector-function execution",
+    "PURE_SIMDVF_UBUF_FLAGS": "Full 256 KiB UB unlock on pure SIMD vector functions",
+    "T.set_atomic": "Hardware atomic GM accumulation",
     "unit_flag_ctrl": "Hardware unit-flag MMAD/FixPipe chaining",
     "vgather2": "UB vector-gather indexing",
 }
@@ -200,8 +237,14 @@ def build_exploit_request(
         "faithfully to eliminate the bottleneck identified in the physical ledger while "
         "preserving exact numerical equivalence. Output ONLY valid Python code."
     )
+    if parent.track in ("", "unconstrained"):
+        track_section = (
+            f"### TILELANG ASCEND PRIMITIVE REFERENCE\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"
+        )
+    else:
+        track_section = f"### TARGET TRACK\n{parent.track}\n\n"
     user_prompt = (
-        f"### TARGET TRACK\n{parent.track}\n\n"
+        f"{track_section}"
         f"### SELECTED CAUSAL RULE\n"
         f"Rule ID: {rule.rule_id}\n"
         f"Precondition: {rule.precondition}\n"
@@ -243,6 +286,12 @@ def build_creative_request(
         "Propose a structurally orthogonal transformation that does NOT duplicate the "
         "mechanisms listed above.\n\n"
     )
+    if parent.track in ("", "unconstrained"):
+        track_section = (
+            f"### TILELANG ASCEND PRIMITIVE REFERENCE\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"
+        )
+    else:
+        track_section = f"### EXECUTION TRACK\n{parent.track}\n\n"
     focus_section = f"### ARCHITECTURAL FOCUS HINT\n{focus_hint}\n\n" if focus_hint else ""
     prescreen_section = (
         f"### TILE PRESCREEN GUIDANCE\n{prescreen_summary}\n\n"
@@ -250,7 +299,7 @@ def build_creative_request(
         else ""
     )
     user_prompt = (
-        f"### EXECUTION TRACK\n{parent.track}\n\n"
+        f"{track_section}"
         f"{focus_section}"
         f"{neg_section}"
         f"{prescreen_section}"
@@ -297,6 +346,7 @@ class PortfolioRunner:
         beam: TwoLaneBeamSearch | None = None,
         k_rule_workers: int = 2,
         max_syntax_repairs: int = 1,
+        enable_track_router: bool = False,
     ) -> None:
         self._backend = backend
         self._funnel = funnel
@@ -304,6 +354,7 @@ class PortfolioRunner:
         self._beam = beam or TwoLaneBeamSearch()
         self._k_rules = max(1, k_rule_workers)
         self._max_repairs = max(0, max_syntax_repairs)
+        self._enable_track_router = enable_track_router
 
     @property
     def beam(self) -> TwoLaneBeamSearch:
@@ -432,8 +483,12 @@ class PortfolioRunner:
         ledger = evaluation.stage_a.ledger
         track = (
             evaluation.stage_a.route.track
-            if evaluation.stage_a.route
-            else spec.parent_candidate.track
+            if self._enable_track_router and evaluation.stage_a.route is not None
+            else (
+                evaluation.stage_a.route.track
+                if evaluation.stage_a.route is not None
+                else (spec.parent_candidate.track or "unconstrained")
+            )
         )
         residual = (
             evaluation.stage_c.residual
@@ -531,6 +586,7 @@ __all__ = [
     "CREATIVE_FOCUS_HINTS",
     "PortfolioRoundReport",
     "PortfolioRunner",
+    "TILELANG_ASCEND_PRIMITIVE_MENU",
     "WorkerSpec",
     "build_creative_request",
     "build_exploit_request",

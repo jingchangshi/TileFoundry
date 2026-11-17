@@ -1272,44 +1272,44 @@ def _rule_predicates_for_kind(
 ) -> tuple[str, str, str]:
     if chunk.edit_kind == "core_parallelism":
         return (
-            "static_affine_bounds and not indirect_sparse_gather",
-            "persistent_wave_occupancy < 0.75 or PIPE_V > 0 or PIPE_MTE2 > 0",
+            "is_legal and any_overflow_bytes == 0 and not has_indirect_gather",
+            "wave_occupancy < 0.75 or PIPE_V > 0 or PIPE_MTE2 > 0",
             "measured_latency_us <= prev.measured_latency_us",
         )
     if chunk.edit_kind == "coalesced_copy":
         return (
-            "inner_contiguous_bytes >= 64",
+            "is_legal and dominant_contig_bytes >= 64",
             "mte2_inflight_per_aiv > 8 or PIPE_MTE2 > PIPE_M",
             "mte2_inflight_per_aiv <= prev.mte2_inflight_per_aiv and any_overflow_bytes == 0",
         )
     if chunk.edit_kind == "ssbuf_handoff":
         return (
-            "dynamic_cross_core_handoff or cube_to_vector_ratio >= 0.0",
+            "is_legal and (has_dynamic_control or cube_to_vector_ratio >= 0.0)",
             "unexplained_gap_ratio >= 0.15 or measured_sync_stall_ratio > 0.05",
             "measured_sync_stall_ratio <= prev.measured_sync_stall_ratio",
         )
     if chunk.edit_kind == "dual_copy_1c2v":
         return (
-            "cube_to_vector_ratio > 0.0 or static_affine_bounds",
+            "is_legal and (cube_to_vector_ratio > 0.0 or AIV0.PIPE_V > 0)",
             "PIPE_MTE2 > 0 or PIPE_V > 0 or measured_mte2_wait_ratio > 0.1",
             "any_overflow_bytes == 0 and measured_latency_us <= prev.measured_latency_us",
         )
     if chunk.edit_kind == "barrier_prune":
         return (
-            "static_affine_bounds",
+            "is_legal and not has_dynamic_control",
             "measured_sync_stall_ratio > 0.05 or PIPE_V > 0",
             "measured_sync_stall_ratio <= prev.measured_sync_stall_ratio and any_overflow_bytes == 0",
         )
     if chunk.edit_kind == "pad_alignment":
         return (
-            "inner_contiguous_bytes >= 16",
+            "is_legal and dominant_contig_bytes >= 16",
             "unaligned_dma_padding_bytes > 0 or PIPE_MTE2 > 0 or PIPE_V > 0",
             "unaligned_dma_padding_bytes <= prev.unaligned_dma_padding_bytes and any_overflow_bytes == 0",
         )
     dom = ledger.dominant_pipe if ledger is not None else "AIV0.PIPE_V"
     _ = dom
     return (
-        "inner_contiguous_bytes >= 64",
+        "is_legal and any_overflow_bytes == 0",
         "degraded_buffer_count >= 0 and (PIPE_V > 0 or PIPE_MTE2 > 0)",
         "degraded_buffer_count <= prev.degraded_buffer_count and any_overflow_bytes == 0",
     )

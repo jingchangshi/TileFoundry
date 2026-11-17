@@ -17,12 +17,6 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     StaticDynamicResidual,
     compute_static_dynamic_residual,
 )
-from tilefoundry_ascend.agent.router.capability_gate import (
-    RouteDecision,
-    StructuralFeatures,
-    extract_structural_features,
-    route_execution_track,
-)
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
     build_objective_physical_ledger,
@@ -41,8 +35,8 @@ class StageAResult:
     passed: bool
     prim_func: object | None
     ledger: ObjectivePhysicalLedger | None
-    features: StructuralFeatures | None
-    route: RouteDecision | None
+    features: object | None = None
+    route: object | None = None
     error_message: str = ""
     elapsed_ms: float = 0.0
 
@@ -132,8 +126,9 @@ def run_stage_a_static(
     factory_kwargs: Mapping[str, object] | None = None,
     target: AscendTarget | None = None,
     pass_configs: dict[str, object] | None = None,
+    enable_track_router: bool = False,
 ) -> StageAResult:
-    """Run millisecond Stage A AST, Two-Snapshot IR Diff, and track routing."""
+    """Run millisecond Stage A AST, Two-Snapshot IR Diff, and optional track routing."""
     t0 = time.monotonic()
     try:
         prim_func = _resolve_prim_func_from_dsl(
@@ -158,8 +153,16 @@ def run_stage_a_static(
         )
 
     ledger = inspection.ledger
-    features = extract_structural_features(prim_func, ledger=ledger, target=target)
-    route = route_execution_track(features)
+    features: object | None = None
+    route: object | None = None
+    if enable_track_router:
+        from tilefoundry_ascend.agent.router.capability_gate import (
+            extract_structural_features,
+            route_execution_track,
+        )
+
+        features = extract_structural_features(prim_func, ledger=ledger, target=target)
+        route = route_execution_track(features)
     if not ledger.is_legal:
         reasons: list[str] = []
         if ledger.max_overflow_bytes > 0:
@@ -366,11 +369,13 @@ class GateFunnel:
         skip_stage_b: bool = False,
         compile_runner: Callable[[str], StageBResult] | None = None,
         device_runner: Callable[[str, StageAResult], StageCResult] | None = None,
+        enable_track_router: bool = False,
     ) -> None:
         self._target = target or AscendTarget("ascend.950pr")
         self._skip_stage_b = skip_stage_b
         self._compile_runner = compile_runner
         self._device_runner = device_runner
+        self._enable_track_router = enable_track_router
 
     def evaluate(
         self,
@@ -385,6 +390,7 @@ class GateFunnel:
             factory_name=factory_name,
             factory_kwargs=factory_kwargs,
             target=self._target,
+            enable_track_router=self._enable_track_router,
         )
         if not stage_a.passed or stage_a.ledger is None:
             return FunnelEvaluation(
