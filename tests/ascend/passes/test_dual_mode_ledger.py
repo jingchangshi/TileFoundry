@@ -576,3 +576,145 @@ def make_dyn_q_head():
     assert bound_low.ledger.grid_is_symbolic is False
     assert 0.0 < bound_low.ledger.wave_occupancy < 0.5
     assert r13.matches(build_predicate_context(bound_low.ledger)) is True
+
+
+def test_tilelang_burst_efficiency_and_pipe_cycles() -> None:
+    """Verify 8 KiB GM->UB DMA incurs lower burst efficiency and higher cycles/byte than 32 KiB."""
+    import tilelang.ascend.language as T
+
+    @T.prim_func
+    def copy_8k(X: T.Tensor((16, 1024), "float32"), Y: T.Tensor((16, 1024), "float32")):
+        with T.Kernel(1) as _:
+            with T.SimdVF():
+                x_ub = T.alloc_shared((2, 1024), "float32")
+                T.copy(X[0:2, 0:1024], x_ub)
+                T.copy(x_ub, Y[0:2, 0:1024])
+
+    @T.prim_func
+    def copy_32k(X: T.Tensor((16, 1024), "float32"), Y: T.Tensor((16, 1024), "float32")):
+        with T.Kernel(1) as _:
+            with T.SimdVF():
+                x_ub = T.alloc_shared((8, 1024), "float32")
+                T.copy(X[0:8, 0:1024], x_ub)
+                T.copy(x_ub, Y[0:8, 0:1024])
+
+    r8k = inspect_tilelang_primfunc(copy_8k)
+    r32k = inspect_tilelang_primfunc(copy_32k)
+    assert r8k.ledger.min_gm_dma_bytes == 8192
+    assert r32k.ledger.min_gm_dma_bytes == 32768
+    assert r8k.ledger.dma_burst_efficiency_ratio < r32k.ledger.dma_burst_efficiency_ratio
+    mte2_8k = r8k.ledger.pipe_cycles.get("AIV0.PIPE_MTE2", 0)
+    mte2_32k = r32k.ledger.pipe_cycles.get("AIV0.PIPE_MTE2", 0)
+    assert mte2_8k > 0 and mte2_32k > 0
+    assert (mte2_8k / 8192.0) > (mte2_32k / 32768.0)
+
+
+def test_tilelang_unlimit_memory_preserves_ub_enforcement() -> None:
+    """Verify T.annotate_unlimit_memory('shared') records flag without disabling UB limit."""
+    import tilelang.ascend.language as T
+
+    @T.prim_func
+    def unlimit_fn(X: T.Tensor((16, 1024), "float16"), Y: T.Tensor((16, 1024), "float16")):
+        with T.Kernel(1) as _:
+            T.annotate_unlimit_memory("shared")
+            buf = T.alloc_shared((2, 1024), "float16")
+            for i in T.Pipelined(4, num_stages=2):
+                T.copy(X[i * 2 : (i + 1) * 2, :], buf)
+                T.copy(buf, Y[i * 2 : (i + 1) * 2, :])
+
+    res = inspect_tilelang_primfunc(unlimit_fn)
+    assert res.ledger.has_unlimit_memory_attr is True
+    assert "UB" in res.ledger.waterlines
+    assert res.ledger.waterlines["UB"].capacity_bytes in (248 * 1024, 256 * 1024)
+
+
+def test_tilelang_dynamic_offset_pipelining_vs_static_pingpong() -> None:
+    """Verify T.Pipelined marks dynamic-offset pipelining whereas static ping-pong does not."""
+    import tilelang.ascend.language as T
+
+    @T.prim_func
+    def pipelined_fn(X: T.Tensor((16, 1024), "float16"), Y: T.Tensor((16, 1024), "float16")):
+        with T.Kernel(1) as _:
+            buf = T.alloc_shared((2, 1024), "float16")
+            for i in T.Pipelined(4, num_stages=2):
+                T.copy(X[i * 2 : (i + 1) * 2, :], buf)
+                T.copy(buf, Y[i * 2 : (i + 1) * 2, :])
+
+    @T.prim_func
+    def static_pingpong_fn(
+        X: T.Tensor((16, 1024), "float16"), Y: T.Tensor((16, 1024), "float16")
+    ):
+        with T.Kernel(1) as _:
+            va = T.alloc_shared((2, 1024), "float16")
+            vb = T.alloc_shared((2, 1024), "float16")
+            for i in T.serial(2):
+                T.copy(X[i * 4 : i * 4 + 2, :], va)
+                T.copy(X[i * 4 + 2 : i * 4 + 4, :], vb)
+                T.copy(va, Y[i * 4 : i * 4 + 2, :])
+                T.copy(vb, Y[i * 4 + 2 : i * 4 + 4, :])
+
+    rp = inspect_tilelang_primfunc(pipelined_fn)
+    rs = inspect_tilelang_primfunc(static_pingpong_fn)
+    assert rp.ledger.uses_dynamic_offset_pipelining is True
+    assert rs.ledger.uses_dynamic_offset_pipelining is False
+
+
+def test_tilelang_coupled_reduce_sfu_vs_loop_fission() -> None:
+    """Verify coupled reduce+SFU+wide-accum detection vs two-pass loop fission."""
+    import tilelang.ascend.language as T
+
+    @T.prim_func
+    def coupled_fn(
+        Q: T.Tensor((4, 64), "float32"),
+        Out: T.Tensor((1, 64), "float32"),
+        ScalarOut: T.Tensor((4, 1), "float32"),
+    ):
+        with T.Kernel(1) as _:
+            q_ub = T.alloc_shared((1, 64), "float32")
+            acc_ub = T.alloc_shared((4, 64), "float32")
+            row_ub = T.alloc_shared((4, 1), "float32")
+            for s in T.serial(4):
+                T.copy(Q[s : s + 1, :], q_ub)
+                with T.SimdVF():
+                    m32 = T.simd.pset(32, "PAT_ALL")
+                    qv = T.simd.vld(q_ub[0, 0])
+                    sum_v = T.simd.vdupv(T.simd.vcadd(qv, mask=m32), mask=m32, pos="POS_LOWEST")
+                    exp_v = T.simd.vexp(sum_v, mask=m32)
+                    T.simd.vsts(row_ub[s, 0], exp_v, mask=m32, dist="ONEPT_B32")
+                    acc_v = T.simd.vld(acc_ub[s, 0])
+                    T.simd.vsts(acc_ub[s, 0], T.simd.vadd(acc_v, qv, mask=m32), mask=m32)
+            T.copy(acc_ub[0:1, :], Out)
+            T.copy(row_ub, ScalarOut)
+
+    @T.prim_func
+    def fission_fn(
+        Q: T.Tensor((4, 64), "float32"),
+        Out: T.Tensor((1, 64), "float32"),
+        ScalarOut: T.Tensor((4, 1), "float32"),
+    ):
+        with T.Kernel(1) as _:
+            q_ub = T.alloc_shared((1, 64), "float32")
+            acc_ub = T.alloc_shared((4, 64), "float32")
+            exb = T.alloc_shared((4, 1), "float32")
+            for s in T.serial(4):
+                T.copy(Q[s : s + 1, :], q_ub)
+                with T.SimdVF():
+                    m32 = T.simd.pset(32, "PAT_ALL")
+                    qv = T.simd.vld(q_ub[0, 0])
+                    sum_v = T.simd.vdupv(T.simd.vcadd(qv, mask=m32), mask=m32, pos="POS_LOWEST")
+                    exp_v = T.simd.vexp(sum_v, mask=m32)
+                    T.simd.vsts(exb[s, 0], exp_v, mask=m32, dist="ONEPT_B32")
+            for s in T.serial(4):
+                T.copy(Q[s : s + 1, :], q_ub)
+                with T.SimdVF():
+                    m32 = T.simd.pset(32, "PAT_ALL")
+                    qv = T.simd.vld(q_ub[0, 0])
+                    acc_v = T.simd.vld(acc_ub[s, 0])
+                    T.simd.vsts(acc_ub[s, 0], T.simd.vadd(acc_v, qv, mask=m32), mask=m32)
+            T.copy(acc_ub[0:1, :], Out)
+            T.copy(exb, ScalarOut)
+
+    rc = inspect_tilelang_primfunc(coupled_fn)
+    rf = inspect_tilelang_primfunc(fission_fn)
+    assert rc.ledger.has_coupled_reduce_sfu_accum is True
+    assert rf.ledger.has_coupled_reduce_sfu_accum is False

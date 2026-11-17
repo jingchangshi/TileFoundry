@@ -94,6 +94,13 @@ def build_ascend_950pr(document: HardwareDocument) -> Ascend950PR:
             ((DType.f32, reader.integer("throughput.aiv.f32", unit="flop/s")),),
         ),
     )
+    burst_bw_table = (
+        (4096, reader.integer("memory.hbm.burst_bandwidth.b4096", unit="byte/s")),
+        (8192, reader.integer("memory.hbm.burst_bandwidth.b8192", unit="byte/s")),
+        (16384, reader.integer("memory.hbm.burst_bandwidth.b16384", unit="byte/s")),
+        (32768, reader.integer("memory.hbm.burst_bandwidth.b32768", unit="byte/s")),
+        (65536, reader.integer("memory.hbm.burst_bandwidth.b65536", unit="byte/s")),
+    )
     device = Ascend950PR(
         name=reader.text("identity.name"),
         sm_count=reader.integer("compute.block_count", unit="count"),
@@ -102,6 +109,7 @@ def build_ascend_950pr(document: HardwareDocument) -> Ascend950PR:
         hbm_capacity_bytes=reader.integer("memory.hbm.capacity", unit="byte"),
         hbm_owner=_memory_owner(reader, "memory.hbm.owner"),
         hbm_bandwidth_bytes_per_second=reader.integer("memory.hbm.bandwidth", unit="byte/s"),
+        hbm_burst_bandwidth_table=burst_bw_table,
         l1_bytes_per_aic=reader.integer("memory.l1.per_aic", unit="byte"),
         l0a_bytes_per_aic=reader.integer("memory.l0a.per_aic", unit="byte"),
         l0b_bytes_per_aic=reader.integer("memory.l0b.per_aic", unit="byte"),

@@ -43,3 +43,18 @@ def test_ascend_topology_facts():
     assert levels.level("aiv") == TopologyLevelFacts("aiv", 2, 56)
     assert levels.level("lane") == TopologyLevelFacts("lane", 64, 56 * 64)
     assert levels.parallel() == levels.level("block")
+
+
+def test_ascend_hbm_burst_bandwidth_curve():
+    import pytest
+    from tilefoundry_ascend.ascend.target.facts import ascend_space_facts
+
+    target = AscendTarget()
+    facts = ascend_space_facts(target)
+    assert facts.hbm_burst_bandwidth_table[0][0] == 4096
+    assert facts.hbm_burst_bandwidth_table[-1][0] == 65536
+    bw_4k = facts.effective_hbm_bandwidth_bps(4096)
+    bw_32k = facts.effective_hbm_bandwidth_bps(32768)
+    assert bw_4k < bw_32k
+    assert facts.dma_burst_efficiency(4096) < 0.70
+    assert facts.dma_burst_efficiency(32768) == pytest.approx(1.0)

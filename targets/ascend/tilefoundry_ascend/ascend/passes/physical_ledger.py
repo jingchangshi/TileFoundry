@@ -78,6 +78,11 @@ class ObjectivePhysicalLedger:
     in_loop_ub_reload_stores: int = 0
     uses_unreserved_ubuf: bool = False
     grid_is_symbolic: bool = False
+    min_gm_dma_bytes: int = 0
+    dma_burst_efficiency_ratio: float = 1.0
+    uses_dynamic_offset_pipelining: bool = False
+    has_unlimit_memory_attr: bool = False
+    has_coupled_reduce_sfu_accum: bool = False
 
     def __post_init__(self) -> None:
         if self.analysis_mode not in ("exact_modulo_z3", "readonly_envelope"):
@@ -138,6 +143,13 @@ class ObjectivePhysicalLedger:
             in_loop_ub_reload_stores=int(payload.get("in_loop_ub_reload_stores", 0)),
             uses_unreserved_ubuf=bool(payload.get("uses_unreserved_ubuf", False)),
             grid_is_symbolic=bool(payload.get("grid_is_symbolic", False)),
+            min_gm_dma_bytes=int(payload.get("min_gm_dma_bytes", 0)),
+            dma_burst_efficiency_ratio=float(payload.get("dma_burst_efficiency_ratio", 1.0)),
+            uses_dynamic_offset_pipelining=bool(
+                payload.get("uses_dynamic_offset_pipelining", False)
+            ),
+            has_unlimit_memory_attr=bool(payload.get("has_unlimit_memory_attr", False)),
+            has_coupled_reduce_sfu_accum=bool(payload.get("has_coupled_reduce_sfu_accum", False)),
         )
 
 
@@ -201,6 +213,11 @@ def build_objective_physical_ledger(
     in_loop_ub_reload_stores: int = 0,
     uses_unreserved_ubuf: bool = False,
     grid_is_symbolic: bool = False,
+    min_gm_dma_bytes: int = 0,
+    dma_burst_efficiency_ratio: float = 1.0,
+    uses_dynamic_offset_pipelining: bool = False,
+    has_unlimit_memory_attr: bool = False,
+    has_coupled_reduce_sfu_accum: bool = False,
 ) -> ObjectivePhysicalLedger:
     """Assemble an ObjectivePhysicalLedger and derive the dominant pipe."""
     cleaned_pipes = dict(sorted(pipe_cycles.items()))
@@ -226,6 +243,11 @@ def build_objective_physical_ledger(
         in_loop_ub_reload_stores=int(in_loop_ub_reload_stores),
         uses_unreserved_ubuf=bool(uses_unreserved_ubuf),
         grid_is_symbolic=bool(grid_is_symbolic),
+        min_gm_dma_bytes=int(min_gm_dma_bytes),
+        dma_burst_efficiency_ratio=float(dma_burst_efficiency_ratio),
+        uses_dynamic_offset_pipelining=bool(uses_dynamic_offset_pipelining),
+        has_unlimit_memory_attr=bool(has_unlimit_memory_attr),
+        has_coupled_reduce_sfu_accum=bool(has_coupled_reduce_sfu_accum),
     )
 
 

@@ -49,6 +49,34 @@ class AscendSpaceFacts:
     forbidden_dma_paths: tuple[str, ...]
     num_aic_cores: int = 28
     num_aiv_cores: int = 56
+    hbm_peak_bandwidth_bps: int = 0
+    hbm_burst_bandwidth_table: tuple[tuple[int, int], ...] = ()
+
+    def effective_hbm_bandwidth_bps(self, payload_bytes: int) -> float:
+        """Return piecewise-linear HBM bandwidth estimate (byte/s) for *payload_bytes*."""
+        if not self.hbm_burst_bandwidth_table:
+            return float(self.hbm_peak_bandwidth_bps)
+        table = sorted(self.hbm_burst_bandwidth_table, key=lambda item: item[0])
+        if payload_bytes <= table[0][0]:
+            return float(table[0][1])
+        for idx in range(1, len(table)):
+            lo_b, lo_r = table[idx - 1]
+            hi_b, hi_r = table[idx]
+            if payload_bytes <= hi_b:
+                span = max(1, hi_b - lo_b)
+                frac = float(payload_bytes - lo_b) / float(span)
+                return float(lo_r) + (float(hi_r) - float(lo_r)) * frac
+        return float(table[-1][1])
+
+    def dma_burst_efficiency(self, payload_bytes: int) -> float:
+        """Return normalized [0, 1] burst efficiency against peak HBM burst rate."""
+        if payload_bytes <= 0 or not self.hbm_burst_bandwidth_table:
+            return 1.0
+        ref_peak = float(max(rate for _sz, rate in self.hbm_burst_bandwidth_table))
+        if ref_peak <= 0.0:
+            return 1.0
+        eff = self.effective_hbm_bandwidth_bps(payload_bytes)
+        return round(min(1.0, max(0.0, eff / ref_peak)), 6)
 
     def ub_limit_bytes(self, mode: str = "simdvf", *, unreserved_ubuf: bool = False) -> int:
         """Return mode-specific UB budget in bytes for SimdVF vs SimtVF execution."""
@@ -121,6 +149,8 @@ def ascend_space_facts(target, query: object = None) -> AscendSpaceFacts:
         forbidden_dma_paths=arch.forbidden_dma_paths,
         num_aic_cores=dev.aic_count,
         num_aiv_cores=dev.aiv_count,
+        hbm_peak_bandwidth_bps=dev.hbm_bandwidth_bytes_per_second,
+        hbm_burst_bandwidth_table=dev.hbm_burst_bandwidth_table,
     )
 
 

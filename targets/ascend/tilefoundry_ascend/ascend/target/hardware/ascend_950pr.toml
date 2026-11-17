@@ -55,6 +55,41 @@ origin = "measured"
 source = "Ascend 950PR NPU calibration micro-probe (probe_hbm_bw, 56 AIV double-buffered streaming)"
 conditions = "Measured sustainable aggregate HBM streaming bandwidth on target device (1633.11 GB/s, aiv_mte2=0.988)"
 
+[facts.memory.hbm.burst_bandwidth.b4096]
+value = 935722520326
+unit = "byte/s"
+origin = "measured"
+source = "Ascend 950PR NPU calibration micro-probe (probe_hbm_bw segmented GM->UB burst sweep)"
+conditions = "Measured 4 KiB contiguous GM->UB double-buffered burst rate across 56 AIV cores (935.72 GB/s)"
+
+[facts.memory.hbm.burst_bandwidth.b8192]
+value = 1378694147184
+unit = "byte/s"
+origin = "measured"
+source = "Ascend 950PR NPU calibration micro-probe (probe_hbm_bw segmented GM->UB burst sweep)"
+conditions = "Measured 8 KiB contiguous GM->UB double-buffered burst rate across 56 AIV cores (1378.69 GB/s)"
+
+[facts.memory.hbm.burst_bandwidth.b16384]
+value = 1579318254210
+unit = "byte/s"
+origin = "measured"
+source = "Ascend 950PR NPU calibration micro-probe (probe_hbm_bw segmented GM->UB burst sweep)"
+conditions = "Measured 16 KiB contiguous GM->UB double-buffered burst rate across 56 AIV cores (1579.32 GB/s)"
+
+[facts.memory.hbm.burst_bandwidth.b32768]
+value = 1636659101004
+unit = "byte/s"
+origin = "measured"
+source = "Ascend 950PR NPU calibration micro-probe (probe_hbm_bw segmented GM->UB burst sweep)"
+conditions = "Measured 32 KiB contiguous GM->UB double-buffered burst rate across 56 AIV cores (1636.66 GB/s)"
+
+[facts.memory.hbm.burst_bandwidth.b65536]
+value = 1604873884415
+unit = "byte/s"
+origin = "measured"
+source = "Ascend 950PR NPU calibration micro-probe (probe_hbm_bw segmented GM->UB burst sweep)"
+conditions = "Measured 64 KiB contiguous GM->UB double-buffered burst rate across 56 AIV cores (1604.87 GB/s)"
+
 [facts.memory.l1.per_aic]
 value = 524288
 unit = "byte"

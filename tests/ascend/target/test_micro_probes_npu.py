@@ -43,6 +43,8 @@ def test_ascend950_calibration_micro_probes() -> None:
             encoding="utf-8",
         )
     assert report["hbm_bw"]["bandwidth_bytes_per_sec"] > 0.0
+    assert report["hbm_bw"]["burst_4096_bps"] > 0.0
+    assert report["hbm_bw"]["burst_32768_bps"] > report["hbm_bw"]["burst_4096_bps"]
     assert report["fixpipe_rate"]["short_k_dur_us"] > 0.0
     assert report["mte2_queue"]["coalesce_speedup"] > 1.0
     assert report["ssbuf_latency"]["ssbuf_dur_us"] > 0.0

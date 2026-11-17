@@ -190,7 +190,10 @@ def _attrs_contain_flag(attrs: object, flag: str) -> bool:
     if isinstance(attrs, str):
         return flag in attrs
     if hasattr(attrs, "items"):
-        return any(_attrs_contain_flag(v, flag) for _k, v in attrs.items())
+        return any(
+            (flag in str(_k)) or _attrs_contain_flag(v, flag)
+            for _k, v in attrs.items()
+        )
     if isinstance(attrs, (tuple, list)) or (
         hasattr(attrs, "__iter__") and not isinstance(attrs, (bytes, bytearray))
     ):
@@ -438,6 +441,11 @@ class _TelemetryFeatures:
     in_loop_ub_reload_stores: int
     uses_unreserved_ubuf: bool
     grid_is_symbolic: bool = False
+    min_gm_dma_bytes: int = 0
+    dma_burst_efficiency_ratio: float = 1.0
+    uses_dynamic_offset_pipelining: bool = False
+    has_unlimit_memory_attr: bool = False
+    has_coupled_reduce_sfu_accum: bool = False
 
 
 def _collect_tirx_expr_vars(expr, *, tirx) -> list[object]:
@@ -646,8 +654,14 @@ def _collect_tilelang_telemetry(
     block_dims: dict[str, int] = {}
     has_lowbit_buf = [False]
     has_indirect_gather = [False]
+    has_unlimit_mem = [
+        _attrs_contain_flag(getattr(entry_fn, "attrs", None), "unlimit_memory")
+        or _attrs_contain_flag(getattr(mod_in, "attrs", None), "unlimit_memory")
+    ]
+    has_dyn_offset_pipe = [False]
     cube_m_values: list[int] = []
     gm_static_bytes: dict[str, int] = {}
+    ub_static_bytes: dict[str, int] = {}
     gm_scalar_names: set[str] = set()
     contig_candidates: list[tuple[int | None, int, int, int, int]] = []
     seen_gm_keys: set[str] = set()
@@ -657,6 +671,10 @@ def _collect_tilelang_telemetry(
         if _is_lowbit_dtype_name(dtype_str):
             has_lowbit_buf[0] = True
         scope = _map_tilelang_scope(buf.scope())
+        static_shape = _static_shape_ints(buf.shape)
+        if scope == "UB" and static_shape is not None:
+            ub_bytes = _buffer_bytes(static_shape, buf.dtype, DataTypeCls)
+            ub_static_bytes[buf.name] = max(ub_static_bytes.get(buf.name, 0), ub_bytes)
         if scope != "GM":
             return
         key = buf.name
@@ -701,14 +719,24 @@ def _collect_tilelang_telemetry(
 
     def _visit_all(node) -> None:
         if isinstance(node, tirx.SBlock):
+            if _attrs_contain_flag(getattr(node, "annotations", None), "unlimit_memory"):
+                has_unlimit_mem[0] = True
             for buf in node.alloc_buffers:
                 _register_buffer(buf)
+        elif isinstance(node, tirx.AttrStmt):
+            if "unlimit_memory" in str(node.attr_key).lower():
+                has_unlimit_mem[0] = True
         elif isinstance(node, (tirx.AllocBuffer, tirx.DeclBuffer)):
             _register_buffer(node.buffer)
         elif isinstance(node, tirx.BufferLoad):
             if any(_contains_buffer_load(idx, tirx) for idx in node.indices):
                 has_indirect_gather[0] = True
         elif isinstance(node, tirx.For):
+            ann = getattr(node, "annotations", None) or {}
+            kind_val = int(node.kind) if hasattr(node.kind, "value") else node.kind
+            stages_val = _static_tirx_int(ann.get("num_stages")) if "num_stages" in ann else None
+            if ann.get("enable_offset") or kind_val == 5 or (stages_val is not None and stages_val >= 2):
+                has_dyn_offset_pipe[0] = True
             tb = getattr(node, "thread_binding", None)
             if tb is None:
                 trip = _static_tirx_int(node.extent)
@@ -780,6 +808,24 @@ def _collect_tilelang_telemetry(
 
     gm_roundtrip_names = (gm_reads & gm_writes) | gm_loop_scalars
     gm_roundtrip_bytes = sum(gm_static_bytes.get(name, 0) for name in gm_roundtrip_names)
+    gm_dma_loop, gm_dma_all = _collect_gm_dma_payloads(
+        entry_fn.body,
+        tirx=tirx,
+        DataTypeCls=DataTypeCls,
+    )
+    dma_pool = gm_dma_loop if gm_dma_loop else gm_dma_all
+    min_gm_dma_bytes = min(dma_pool) if dma_pool else 0
+    dma_burst_eff = (
+        spaces.dma_burst_efficiency(min_gm_dma_bytes)
+        if (spaces is not None and min_gm_dma_bytes > 0)
+        else 1.0
+    )
+    wide_ub_names = {name for name, nbytes in ub_static_bytes.items() if nbytes >= 1024}
+    coupled_reduce_sfu = _detect_coupled_reduce_sfu_accum(
+        entry_fn.body,
+        wide_ub_names,
+        tirx=tirx,
+    )
 
     return _TelemetryFeatures(
         grid_blocks=grid_blocks,
@@ -792,6 +838,11 @@ def _collect_tilelang_telemetry(
         in_loop_ub_reload_stores=len(ub_reload_store_bufs),
         uses_unreserved_ubuf=effective_unreserved,
         grid_is_symbolic=grid_is_symbolic,
+        min_gm_dma_bytes=min_gm_dma_bytes,
+        dma_burst_efficiency_ratio=dma_burst_eff,
+        uses_dynamic_offset_pipelining=has_dyn_offset_pipe[0],
+        has_unlimit_memory_attr=has_unlimit_mem[0],
+        has_coupled_reduce_sfu_accum=coupled_reduce_sfu,
     )
 
 
@@ -1149,6 +1200,202 @@ def _sid_guard_branches(
     return None, None
 
 
+def _burst_scaled_copy_cycles(xfer_bytes: int, spaces: AscendSpaceFacts | None) -> int:
+    """Estimate DMA pipe cycles inflated by small-payload HBM burst inefficiency."""
+    base = max(1, (xfer_bytes + 63) // 64)
+    if spaces is None or xfer_bytes <= 0:
+        return base
+    eff = spaces.dma_burst_efficiency(xfer_bytes)
+    return int(math.ceil(float(base) / max(0.15, float(eff))))
+
+
+def _collect_gm_dma_payloads(
+    stmt,
+    *,
+    tirx,
+    DataTypeCls,
+) -> tuple[list[int], list[int]]:
+    """Collect GM<->UB/L1 copy byte payloads both inside loops and across the function."""
+    loop_sizes: list[int] = []
+    all_sizes: list[int] = []
+
+    def _walk(node, *, in_loop: bool) -> None:
+        if node is None:
+            return
+        if isinstance(node, tirx.SeqStmt):
+            for child in node.seq:
+                _walk(child, in_loop=in_loop)
+            return
+        if isinstance(node, tirx.For):
+            tb = getattr(node, "thread_binding", None)
+            trip = _static_tirx_int(node.extent) if tb is None else None
+            sub_loop = in_loop or (tb is None and (trip is None or trip > 1))
+            _walk(node.body, in_loop=sub_loop)
+            return
+        if isinstance(node, tirx.While):
+            _walk(node.body, in_loop=True)
+            return
+        if isinstance(node, tirx.IfThenElse):
+            _walk(node.then_case, in_loop=in_loop)
+            if node.else_case is not None:
+                _walk(node.else_case, in_loop=in_loop)
+            return
+        if isinstance(node, tirx.SBlockRealize):
+            _walk(node.block, in_loop=in_loop)
+            return
+        if isinstance(node, (tirx.SBlock, tirx.AttrStmt, tirx.Bind, tirx.AllocBuffer, tirx.DeclBuffer)):
+            if hasattr(node, "body"):
+                _walk(node.body, in_loop=in_loop)
+            return
+        if isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call):
+            op_name = str(getattr(node.value.op, "name", node.value.op))
+            args = list(node.value.args)
+            if "copy" in op_name and len(args) >= 2:
+                src_s, xfer_b, _in1 = _region_bytes(args[0], tirx, DataTypeCls)
+                dst_s, dst_b, _in2 = _region_bytes(args[1], tirx, DataTypeCls)
+                if src_s is not None and dst_s is not None and src_s != dst_s and "GM" in (src_s, dst_s):
+                    xfer = max(xfer_b, dst_b)
+                    if xfer >= 128:
+                        all_sizes.append(xfer)
+                        if in_loop:
+                            loop_sizes.append(xfer)
+
+    _walk(stmt, in_loop=False)
+    return loop_sizes, all_sizes
+
+
+def _is_reduce_or_sfu_call(op_name: str) -> bool:
+    lower = op_name.lower()
+    return any(
+        tok in lower
+        for tok in ("vcadd", "vreduce", "reduce_", "vexp", "exp2", ".exp", "vsqrt", "rsqrt", "vdiv")
+    ) or lower == "exp"
+
+
+def _detect_coupled_reduce_sfu_accum(
+    stmt,
+    wide_ub_names: set[str],
+    *,
+    tirx,
+) -> bool:
+    """Return True if a single leaf loop/SimdVF couples reduce+SFU with wide UB RMW."""
+    if not wide_ub_names:
+        return False
+
+    def _scan_expr_sfu_and_ub(expr, loads: set[str], stores: set[str], sfu_flag: list[bool]) -> None:
+        if expr is None:
+            return
+
+        def _pre(node):
+            if isinstance(node, tirx.Call):
+                op_name = str(getattr(node.op, "name", node.op)).lower()
+                if _is_reduce_or_sfu_call(op_name):
+                    sfu_flag[0] = True
+            return True
+
+        tirx.stmt_functor.pre_order_visit(expr, _pre)
+        ev, _exp, uloads, ustores = _collect_tilelang_expr_rw(expr, tirx=tirx)
+        del ev
+        loads.update(name for name in uloads if name in wide_ub_names)
+        stores.update(name for name in ustores if name in wide_ub_names)
+
+    def _is_scope_node(node) -> bool:
+        if isinstance(node, tirx.For) and getattr(node, "thread_binding", None) is None:
+            trip = _static_tirx_int(node.extent)
+            return trip is None or trip > 1
+        if isinstance(node, tirx.SBlock):
+            ann = getattr(node, "annotations", None) or {}
+            hint = str(getattr(node, "name_hint", "")).lower()
+            return "simd_vf" in hint or "tl.simdvf_lanes" in ann
+        return False
+
+    def _inspect(node) -> tuple[bool, bool, bool]:
+        if node is None:
+            return False, False, False
+        if _is_scope_node(node):
+            direct_loads: set[str] = set()
+            direct_stores: set[str] = set()
+            direct_sfu = [False]
+            child_sfu = False
+            child_wide_rmw = False
+            coupled = False
+
+            def _walk_scope(sub) -> None:
+                nonlocal child_sfu, child_wide_rmw, coupled
+                if sub is None:
+                    return
+                if sub is not node and _is_scope_node(sub):
+                    c_sfu, c_rmw, c_coupled = _inspect(sub)
+                    child_sfu = child_sfu or c_sfu
+                    child_wide_rmw = child_wide_rmw or c_rmw
+                    coupled = coupled or c_coupled
+                    return
+                if isinstance(sub, tirx.SeqStmt):
+                    for ch in sub.seq:
+                        _walk_scope(ch)
+                    return
+                if isinstance(sub, tirx.While):
+                    _scan_expr_sfu_and_ub(sub.condition, direct_loads, direct_stores, direct_sfu)
+                    _walk_scope(sub.body)
+                    return
+                if isinstance(sub, tirx.For):
+                    _walk_scope(sub.body)
+                    return
+                if isinstance(sub, tirx.IfThenElse):
+                    _scan_expr_sfu_and_ub(sub.condition, direct_loads, direct_stores, direct_sfu)
+                    _walk_scope(sub.then_case)
+                    if sub.else_case is not None:
+                        _walk_scope(sub.else_case)
+                    return
+                if isinstance(sub, tirx.SBlockRealize):
+                    _walk_scope(sub.block)
+                    return
+                if isinstance(sub, tirx.Bind):
+                    _scan_expr_sfu_and_ub(sub.value, direct_loads, direct_stores, direct_sfu)
+                    if hasattr(sub, "body"):
+                        _walk_scope(sub.body)
+                    return
+                if isinstance(sub, (tirx.SBlock, tirx.AttrStmt, tirx.AllocBuffer, tirx.DeclBuffer)):
+                    if hasattr(sub, "body"):
+                        _walk_scope(sub.body)
+                    return
+                if isinstance(sub, tirx.BufferStore):
+                    _scan_expr_sfu_and_ub(sub.value, direct_loads, direct_stores, direct_sfu)
+                    if (
+                        _map_tilelang_scope(sub.buffer.scope()) == "UB"
+                        and sub.buffer.name in wide_ub_names
+                    ):
+                        direct_stores.add(sub.buffer.name)
+                    return
+                if isinstance(sub, tirx.Evaluate):
+                    _scan_expr_sfu_and_ub(sub.value, direct_loads, direct_stores, direct_sfu)
+
+            _walk_scope(node.body)
+            direct_rmw = bool(direct_loads & direct_stores)
+            if (direct_sfu[0] and (direct_rmw or child_wide_rmw)) or (direct_rmw and child_sfu):
+                coupled = True
+            return bool(direct_sfu[0] or child_sfu), bool(direct_rmw or child_wide_rmw), coupled
+
+        if isinstance(node, tirx.SeqStmt):
+            results = [_inspect(ch) for ch in node.seq]
+            return (
+                any(r[0] for r in results),
+                any(r[1] for r in results),
+                any(r[2] for r in results),
+            )
+        if isinstance(node, (tirx.For, tirx.While, tirx.SBlock, tirx.AttrStmt, tirx.Bind, tirx.AllocBuffer, tirx.DeclBuffer)):
+            return _inspect(node.body) if hasattr(node, "body") else (False, False, False)
+        if isinstance(node, tirx.SBlockRealize):
+            return _inspect(node.block)
+        if isinstance(node, tirx.IfThenElse):
+            t_res = _inspect(node.then_case)
+            e_res = _inspect(node.else_case) if node.else_case is not None else (False, False, False)
+            return (t_res[0] or e_res[0], t_res[1] or e_res[1], t_res[2] or e_res[2])
+        return False, False, False
+
+    return _inspect(stmt)[2]
+
+
 def _scan_tilelang_ast(
     func,
     spaces: AscendSpaceFacts,
@@ -1360,14 +1607,14 @@ def _scan_tilelang_ast(
                         max_mte2[0] = max(max_mte2[0], mte2_run[0])
                         _emit_aiv_pipe(
                             "PIPE_MTE2",
-                            repeat * max(1, (xfer + 63) // 64),
+                            repeat * _burst_scaled_copy_cycles(xfer, spaces),
                             guarded_aiv=guarded_aiv,
                         )
                     elif src_s == "UB" and dst_s == "GM":
                         mte2_run[0] = 0
                         _emit_aiv_pipe(
                             "PIPE_MTE3",
-                            repeat * max(1, (xfer + 63) // 64),
+                            repeat * _burst_scaled_copy_cycles(xfer, spaces),
                             guarded_aiv=guarded_aiv,
                         )
                     elif src_s == "UB" and dst_s == "L1":
@@ -1379,7 +1626,7 @@ def _scan_tilelang_ast(
                             guarded_aiv=guarded_aiv,
                         )
                     elif src_s == "GM" and dst_s == "L1":
-                        _add_pipe("AIC.PIPE_MTE2", repeat * max(1, (xfer + 63) // 64))
+                        _add_pipe("AIC.PIPE_MTE2", repeat * _burst_scaled_copy_cycles(xfer, spaces))
                     elif src_s == "L1" and dst_s in ("L0A", "L0B"):
                         _add_pipe("AIC.PIPE_MTE1", repeat * max(1, (xfer + 255) // 256))
                     elif src_s == "L0C" and dst_s in ("GM", "L1", "UB"):
@@ -1592,6 +1839,7 @@ def _extract_pipelined_loop_tasks(
     aiv_split_factor: int,
     sid_vars: set[object],
     guarded_aiv: str | None,
+    spaces: AscendSpaceFacts | None = None,
 ) -> list[_TileLangLoopTask] | None:
     tasks: list[_TileLangLoopTask] = []
     aborted = [False]
@@ -1714,7 +1962,12 @@ def _extract_pipelined_loop_tasks(
                         guarded_aiv=cur_guard,
                     )
                     xfer = max(src_b, dst_b)
-                    lat = min(8, max(1, (xfer + 16383) // 16384) * scale)
+                    eff_xfer = xfer
+                    if spaces is not None and xfer > 0 and ("GM" in (src_s, dst_s)):
+                        eff_xfer = int(
+                            math.ceil(float(xfer) / max(0.15, float(spaces.dma_burst_efficiency(xfer))))
+                        )
+                    lat = min(8, max(1, (eff_xfer + 16383) // 16384) * scale)
                     reads = (src_n,) if (src_n is not None and src_s != "GM") else ()
                     writes = (dst_n,) if (dst_n is not None and dst_s != "GM") else ()
                     tasks.append(
@@ -1879,6 +2132,7 @@ def _try_solve_tilelang_pipelined_ii(
             aiv_split_factor=aiv_split_factor,
             sid_vars=sid_vars,
             guarded_aiv=loop_guard,
+            spaces=spaces,
         )
         if task_items is None:
             return None
@@ -2332,6 +2586,11 @@ def inspect_tilelang_primfunc(
         in_loop_ub_reload_stores=telemetry.in_loop_ub_reload_stores,
         uses_unreserved_ubuf=effective_unreserved,
         grid_is_symbolic=telemetry.grid_is_symbolic,
+        min_gm_dma_bytes=telemetry.min_gm_dma_bytes,
+        dma_burst_efficiency_ratio=telemetry.dma_burst_efficiency_ratio,
+        uses_dynamic_offset_pipelining=telemetry.uses_dynamic_offset_pipelining,
+        has_unlimit_memory_attr=telemetry.has_unlimit_memory_attr,
+        has_coupled_reduce_sfu_accum=telemetry.has_coupled_reduce_sfu_accum,
     )
     return EnvelopeInspectionResult(
         ledger=ledger,

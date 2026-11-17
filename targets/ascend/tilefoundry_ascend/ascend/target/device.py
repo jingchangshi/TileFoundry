@@ -19,6 +19,7 @@ class Ascend950PR(Device):
     hbm_capacity_bytes: int
     hbm_owner: str
     hbm_bandwidth_bytes_per_second: int
+    hbm_burst_bandwidth_table: tuple[tuple[int, int], ...]
     l1_bytes_per_aic: int
     l0a_bytes_per_aic: int
     l0b_bytes_per_aic: int
