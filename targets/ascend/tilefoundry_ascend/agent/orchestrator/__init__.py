@@ -55,6 +55,11 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     generate_aligned_neighborhood,
     prescreen_tile_configs,
 )
+from tilefoundry_ascend.agent.orchestrator.twin_bridge import (
+    build_tilelang_runtime_twin,
+    format_hir_tir_navigation_section,
+    verify_twin_cpu_reference,
+)
 
 __all__ = [
     "AgyCliLLMBackend",
@@ -85,12 +90,14 @@ __all__ = [
     "build_exploit_request",
     "build_hir_seed_request",
     "build_syntax_repair_request",
+    "build_tilelang_runtime_twin",
     "compute_static_dynamic_residual",
     "create_llm_backend_from_env",
     "evaluate_tile_candidate",
     "extract_creative_payload",
     "extract_python_dsl",
     "extract_structural_signature",
+    "format_hir_tir_navigation_section",
     "format_prescreen_summary",
     "generate_aligned_neighborhood",
     "prescreen_dsl_tile_kwargs",
@@ -100,4 +107,5 @@ __all__ = [
     "run_stage_b_compile",
     "run_stage_c_agent_gates",
     "synthesize_initial_dsl",
+    "verify_twin_cpu_reference",
 ]

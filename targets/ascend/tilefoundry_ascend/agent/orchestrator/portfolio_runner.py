@@ -20,6 +20,7 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate,
     TwoLaneBeamSearch,
+    compute_static_dynamic_residual,
     extract_structural_signature,
 )
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
@@ -28,6 +29,8 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     generate_aligned_neighborhood,
     prescreen_tile_configs,
 )
+from tilefoundry_ascend.agent.orchestrator.twin_bridge import format_hir_tir_navigation_section
+from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirTirNavigationPacket
 
 CREATIVE_FOCUS_HINTS: tuple[str, ...] = (
     "memory_hierarchy_and_tiling",
@@ -211,6 +214,7 @@ class WorkerSpec:
     rule: AscendCausalRule | None
     request: GenerationRequest
     parent_candidate: BeamCandidate
+    ideal_roofline_us: float = 0.0
 
 
 @dataclass
@@ -227,9 +231,27 @@ class PortfolioRoundReport:
     stepping_stone_beam: list[BeamCandidate] = field(default_factory=list)
 
 
+def _resolve_navigation_section(
+    parent: BeamCandidate,
+    navigation_context: str,
+    nav_packet: HirTirNavigationPacket | None,
+) -> str:
+    if nav_packet is not None:
+        nav_text = format_hir_tir_navigation_section(
+            nav_packet,
+            current_tl_ledger=parent.ledger,
+        )
+    else:
+        nav_text = navigation_context.strip()
+    return f"{nav_text}\n\n" if nav_text else ""
+
+
 def build_exploit_request(
     parent: BeamCandidate,
     rule: AscendCausalRule,
+    *,
+    navigation_context: str = "",
+    nav_packet: HirTirNavigationPacket | None = None,
 ) -> GenerationRequest:
     """Build causal-rule worker request routed to exploit model (Hydrogen Medium)."""
     sys_prompt = (
@@ -243,8 +265,10 @@ def build_exploit_request(
         )
     else:
         track_section = f"### TARGET TRACK\n{parent.track}\n\n"
+    nav_section = _resolve_navigation_section(parent, navigation_context, nav_packet)
     user_prompt = (
         f"{track_section}"
+        f"{nav_section}"
         f"### SELECTED CAUSAL RULE\n"
         f"Rule ID: {rule.rule_id}\n"
         f"Precondition: {rule.precondition}\n"
@@ -268,6 +292,8 @@ def build_creative_request(
     excluded_mechanisms: Sequence[str] = (),
     focus_hint: str = "",
     prescreen_summary: str = "",
+    navigation_context: str = "",
+    nav_packet: HirTirNavigationPacket | None = None,
 ) -> GenerationRequest:
     """Build rule-blind creative search request routed to Hydrogen High without rules."""
     sys_prompt = (
@@ -292,6 +318,7 @@ def build_creative_request(
         )
     else:
         track_section = f"### EXECUTION TRACK\n{parent.track}\n\n"
+    nav_section = _resolve_navigation_section(parent, navigation_context, nav_packet)
     focus_section = f"### ARCHITECTURAL FOCUS HINT\n{focus_hint}\n\n" if focus_hint else ""
     prescreen_section = (
         f"### TILE PRESCREEN GUIDANCE\n{prescreen_summary}\n\n"
@@ -300,6 +327,7 @@ def build_creative_request(
     )
     user_prompt = (
         f"{track_section}"
+        f"{nav_section}"
         f"{focus_section}"
         f"{neg_section}"
         f"{prescreen_section}"
@@ -367,6 +395,9 @@ class PortfolioRunner:
         round_idx: int,
         *,
         factory_kwargs: Mapping[str, object] | None = None,
+        navigation_context: str = "",
+        ideal_roofline_us: float = 0.0,
+        nav_packet: HirTirNavigationPacket | None = None,
     ) -> tuple[WorkerSpec, ...]:
         """Select matching causal rules and fill remaining slots with creative explorers."""
         ctx = build_predicate_context(
@@ -375,6 +406,11 @@ class PortfolioRunner:
             residual=parent.residual,
         )
         matched_rules = list(self._tracker.rank_applicable_rules(ctx, top_k=self._k_rules))
+        eff_roofline = (
+            ideal_roofline_us
+            if ideal_roofline_us > 0.0
+            else (nav_packet.roofline.ideal_roofline_us if nav_packet is not None else 0.0)
+        )
 
         specs: list[WorkerSpec] = []
         for idx, rule in enumerate(matched_rules[: self._k_rules]):
@@ -383,8 +419,14 @@ class PortfolioRunner:
                     worker_id=f"r{round_idx}_rule_{idx}",
                     worker_kind="rule_exploit",
                     rule=rule,
-                    request=build_exploit_request(parent, rule),
+                    request=build_exploit_request(
+                        parent,
+                        rule,
+                        navigation_context=navigation_context,
+                        nav_packet=nav_packet,
+                    ),
                     parent_candidate=parent,
+                    ideal_roofline_us=eff_roofline,
                 )
             )
 
@@ -412,8 +454,11 @@ class PortfolioRunner:
                         excluded_mechanisms=excluded,
                         focus_hint=hint,
                         prescreen_summary=prescreen_summary,
+                        navigation_context=navigation_context,
+                        nav_packet=nav_packet,
                     ),
                     parent_candidate=parent,
+                    ideal_roofline_us=eff_roofline,
                 )
             )
         return tuple(specs)
@@ -490,17 +535,32 @@ class PortfolioRunner:
                 else (spec.parent_candidate.track or "unconstrained")
             )
         )
-        residual = (
-            evaluation.stage_c.residual
-            if evaluation.stage_c and evaluation.stage_c.residual is not None
-            else spec.parent_candidate.residual
-        )
-        latency_us = (
-            evaluation.stage_c.measured_latency_us
-            if evaluation.stage_c
-            else spec.parent_candidate.latency_us
-        )
-        acc_ok = evaluation.stage_c.accuracy_passed if evaluation.stage_c else True
+        stage_c = evaluation.stage_c
+        if stage_c is not None:
+            latency_us = stage_c.measured_latency_us
+            acc_ok = stage_c.accuracy_passed
+            tel = dict(stage_c.telemetry)
+            dur_us = float(tel.get("dur_us", latency_us))
+            if (
+                spec.ideal_roofline_us > 0.0
+                and dur_us > 0.0
+                and "roofline_eta" not in tel
+            ):
+                eta = min(1.0, spec.ideal_roofline_us / max(1e-6, dur_us))
+                tel["roofline_eta"] = eta
+                if isinstance(stage_c.telemetry, dict):
+                    stage_c.telemetry["roofline_eta"] = eta
+                residual = compute_static_dynamic_residual(ledger, tel)
+            else:
+                residual = (
+                    stage_c.residual
+                    if stage_c.residual is not None
+                    else spec.parent_candidate.residual
+                )
+        else:
+            residual = spec.parent_candidate.residual
+            latency_us = spec.parent_candidate.latency_us
+            acc_ok = True
 
         if spec.rule is not None:
             post_ctx = build_predicate_context(
@@ -550,9 +610,19 @@ class PortfolioRunner:
         round_idx: int = 1,
         factory_name: str | None = None,
         factory_kwargs: dict[str, object] | None = None,
+        navigation_context: str = "",
+        ideal_roofline_us: float = 0.0,
+        nav_packet: HirTirNavigationPacket | None = None,
     ) -> PortfolioRoundReport:
         """Execute one parallel portfolio round across Rule and Creative workers."""
-        specs = self.plan_workers(parent, round_idx, factory_kwargs=factory_kwargs)
+        specs = self.plan_workers(
+            parent,
+            round_idx,
+            factory_kwargs=factory_kwargs,
+            navigation_context=navigation_context,
+            ideal_roofline_us=ideal_roofline_us,
+            nav_packet=nav_packet,
+        )
         tasks = [
             self._run_single_worker(
                 spec,

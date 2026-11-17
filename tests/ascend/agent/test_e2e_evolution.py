@@ -182,39 +182,46 @@ def test_e2e_evolution_offline_hir_to_converged_trajectories() -> None:
         assert len(payload["rounds"]) == 2
 
 
-def test_fp3_hir_prerouting_and_baseline_features_propagation() -> None:
-    """Verify L0 HIR pre-routing injects track/blueprint and populates baseline features."""
+def test_np3_hir_tir_navigation_router_off_and_scheduled_blueprint(monkeypatch) -> None:
+    """Verify router-off HIR/TIR navigation contract and zero capability_gate calls."""
+    import tilefoundry_ascend.agent.router.capability_gate as cap_gate
     from tilefoundry_ascend.agent.orchestrator import (
         TwoLaneBeamSearch,
         build_hir_seed_request,
     )
-    from tilefoundry_ascend.agent.orchestrator.e2e_evolution import _inspect_hir_for_seed
+    from tilefoundry_ascend.ascend.passes.hir_tir_bridge import compile_hir_navigation_packet
     from tilefoundry_ascend.ascend.target import AscendTarget
 
+    router_calls: list[str] = []
+
+    def _forbid_extract(*_args, **_kwargs):
+        router_calls.append("extract")
+        raise AssertionError("extract_structural_features must not be called")
+
+    def _forbid_route(*_args, **_kwargs):
+        router_calls.append("route")
+        raise AssertionError("route_execution_track must not be called")
+
+    monkeypatch.setattr(cap_gate, "extract_structural_features", _forbid_extract)
+    monkeypatch.setattr(cap_gate, "route_execution_track", _forbid_route)
+
     ar_hir = _AR_MODEL_PATH.read_text(encoding="utf-8")
-    route_summary, ar_blueprint = _inspect_hir_for_seed(ar_hir, AscendTarget("ascend.950pr"))
-    assert route_summary is not None and "developer" in route_summary
-    assert ar_blueprint is None
-
-    scheduled_mla_path = _MLA_MODEL_PATH.with_name("scheduled.py")
-    if scheduled_mla_path.is_file():
-        sched_src = scheduled_mla_path.read_text(encoding="utf-8")
-        sched_route, sched_blueprint = _inspect_hir_for_seed(
-            sched_src, AscendTarget("ascend.950pr")
-        )
-        assert sched_route is not None
-        assert sched_blueprint is not None and "ascend" in sched_blueprint
-
-    req = build_hir_seed_request(
+    ar_sched = _AR_MODEL_PATH.with_name("scheduled.py").read_text(encoding="utf-8")
+    nav_packet = compile_hir_navigation_packet(
+        ar_hir,
+        scheduled_hir_source=ar_sched,
+        anchor_dims={"N": 4, "B": 1, "S": 4, "D": 64},
+        target=AscendTarget("ascend.950pr"),
+    )
+    seed_req = build_hir_seed_request(
         ar_hir,
         "make_kernel()",
-        recommended_track="developer",
-        recommended_primitives=("T.Pipelined", "T.SimdVF"),
-        tir_blueprint="def main():\n    pass",
+        nav_packet=nav_packet,
     )
-    assert "### L0 RECOMMENDED EXECUTION TRACK" in req.user_prompt
-    assert "Track: developer" in req.user_prompt
-    assert "### LOWERED ASCEND TIR BLUEPRINT" in req.user_prompt
+    assert "### L0 RECOMMENDED EXECUTION TRACK" not in seed_req.user_prompt
+    assert "### HIR ANALYTICAL ROOFLINE & TRAFFIC FLOOR" in seed_req.user_prompt
+    assert "### LOWERED ASCEND TIR BLUEPRINT & Z3 SCHEDULE" in seed_req.user_prompt
+    assert "### TILELANG ASCEND PRIMITIVE REFERENCE" in seed_req.user_prompt
 
     backend = MockLLMBackend(
         responses={
@@ -230,8 +237,10 @@ def test_fp3_hir_prerouting_and_baseline_features_propagation() -> None:
     beam = TwoLaneBeamSearch(exploit_width=1, stepping_stone_width=1)
     traj = asyncio.run(
         run_e2e_evolution(
-            problem_name="ar_preroute",
+            problem_name="ar_hir_tir_nav",
             hir_source=ar_hir,
+            scheduled_hir_source=ar_sched,
+            anchor_dims={"N": 4, "B": 1, "S": 4, "D": 64},
             shape_contract="make_kernel()",
             backend=backend,
             funnel=funnel,
@@ -240,7 +249,18 @@ def test_fp3_hir_prerouting_and_baseline_features_propagation() -> None:
             k_rule_workers=2,
         )
     )
-    assert "### L0 RECOMMENDED EXECUTION TRACK" in backend.calls[0].user_prompt
-    assert traj.feature_vector["phi_2"] > 0.0
-    assert beam.exploit_beam[0].features is not None
-    assert ("track:developer",) in beam.exploited_signatures
+    assert router_calls == []
+    assert backend.calls
+    for req in backend.calls:
+        assert "### L0 RECOMMENDED EXECUTION TRACK" not in req.user_prompt
+    assert "### HIR ANALYTICAL ROOFLINE" in backend.calls[0].user_prompt
+    assert "### LOWERED ASCEND TIR BLUEPRINT" in backend.calls[0].user_prompt
+    assert traj.feature_vector == {}
+    assert traj.track == "unconstrained"
+    assert beam.exploit_beam[0].features is None
+    assert traj.hir_navigation_summary
+    assert traj.hir_navigation_summary["has_tir_blueprint"] is True
+    assert traj.hir_navigation_summary["roofline"]["ideal_roofline_us"] > 0.0
+    payload = json.loads(traj.to_json())
+    assert payload["feature_vector"] == {}
+    assert payload["hir_navigation_summary"]["entry_name"] == "forward"

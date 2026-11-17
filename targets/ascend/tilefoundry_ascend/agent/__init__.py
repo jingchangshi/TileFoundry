@@ -48,11 +48,14 @@ from tilefoundry_ascend.agent.orchestrator import (
     StreamWatchdogConfig,
     TileConfigCandidate,
     TwoLaneBeamSearch,
+    build_tilelang_runtime_twin,
+    format_hir_tir_navigation_section,
     format_prescreen_summary,
     generate_aligned_neighborhood,
     prescreen_dsl_tile_kwargs,
     prescreen_tile_configs,
     run_e2e_evolution,
+    verify_twin_cpu_reference,
 )
 from tilefoundry_ascend.agent.router import (
     RouteDecision,
@@ -95,8 +98,10 @@ __all__ = [
     "UnsafePredicateError",
     "append_dynamic_anchor",
     "build_predicate_context",
+    "build_tilelang_runtime_twin",
     "default_seed_rules_path",
     "extract_structural_features",
+    "format_hir_tir_navigation_section",
     "format_prescreen_summary",
     "generate_aligned_neighborhood",
     "get_default_anchors",
@@ -110,4 +115,5 @@ __all__ = [
     "safe_eval_predicate",
     "save_rules_yaml",
     "validate_rule_predicate",
+    "verify_twin_cpu_reference",
 ]
