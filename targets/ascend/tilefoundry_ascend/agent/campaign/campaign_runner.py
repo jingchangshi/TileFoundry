@@ -115,6 +115,7 @@ class CampaignConfig:
     device_id: str = "1"
     warmup: int = 3
     repeat: int = 5
+    enable_tilesize_prescreen: bool = False
 
 
 @dataclass(frozen=True)
@@ -1382,6 +1383,7 @@ class PerfTargetCampaignRunner:
         active_anchors: Sequence[AnchorCaseSpec],
         *,
         allow_satisfied_fallback: bool = False,
+        exclude_regime: str | None = None,
     ) -> RegimeTargetSpec | None:
         by_tag = {r.regime_tag: r for r in self._regime_specs}
         if current_regime and current_regime not in frozen_regimes and current_regime in by_tag:
@@ -1403,6 +1405,8 @@ class PerfTargetCampaignRunner:
             ]
         if not candidates:
             return None
+        if exclude_regime and any(spec.regime_tag != exclude_regime for spec in candidates):
+            candidates = [spec for spec in candidates if spec.regime_tag != exclude_regime]
         candidates.sort(
             key=lambda s: best_result.regime_headroom(s.regime_tag),
             reverse=True,
@@ -1535,6 +1539,7 @@ class PerfTargetCampaignRunner:
         parent_residual: StaticDynamicResidual | None = None,
         track: str = "unconstrained",
         incumbent_source: str = "",
+        parent_hypothesis: str = "",
     ) -> GenerationRequest:
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
         sys_prompt = (
@@ -1571,6 +1576,11 @@ class PerfTargetCampaignRunner:
         else:
             nav_section = ""
         focus_section = f"### ARCHITECTURAL FOCUS HINT\n{focus_hint}\n\n" if focus_hint else ""
+        parent_hyp_section = (
+            f"### STEPPING-STONE PARENT HYPOTHESIS\n{parent_hypothesis}\n\n"
+            if parent_hypothesis
+            else ""
+        )
         prescreen_section = (
             f"### TILE PRESCREEN GUIDANCE\n{prescreen_summary}\n\n"
             if prescreen_summary
@@ -1595,6 +1605,7 @@ class PerfTargetCampaignRunner:
             f"{track_section}"
             f"{nav_section}"
             f"{focus_section}"
+            f"{parent_hyp_section}"
             f"{neg_section}"
             f"{prescreen_section}"
             f"{msprof_section}"
@@ -1642,6 +1653,8 @@ class PerfTargetCampaignRunner:
         admitted_rule_ids: Sequence[str],
         stop_reason: str,
         l4_result: L4CannbenchResult | None,
+        stagnation_by_regime: Mapping[str, int] | None = None,
+        last_unpromoted_regime: str | None = None,
     ) -> None:
         if self._checkpoint_path is None:
             return
@@ -1656,6 +1669,10 @@ class PerfTargetCampaignRunner:
             "frozen_regimes": sorted(frozen_regimes),
             "current_regime": current_regime,
             "stagnation_rounds": stagnation_rounds,
+            "stagnation_by_regime": {
+                str(k): int(v) for k, v in sorted((stagnation_by_regime or {}).items())
+            },
+            "last_unpromoted_regime": last_unpromoted_regime,
             "rounds": [r.to_dict() for r in rounds],
             "promoted_rounds": list(promoted_rounds),
             "rolled_back_rounds": list(rolled_back_rounds),
@@ -1691,6 +1708,8 @@ class PerfTargetCampaignRunner:
         list[int],
         list[int],
         list[str],
+        dict[str, int],
+        str | None,
     ]:
         assert self._checkpoint_path is not None
         payload = json.loads(self._checkpoint_path.read_text(encoding="utf-8"))
@@ -1726,19 +1745,34 @@ class PerfTargetCampaignRunner:
                     for k, v in raw_metrics.items()
                     if isinstance(v, (int, float)) and not isinstance(v, bool)
                 }
+        rounds = [CampaignRoundRecord.from_dict(r) for r in payload.get("rounds", ())]
+        raw_stag_map = payload.get("stagnation_by_regime")
+        if isinstance(raw_stag_map, Mapping):
+            stagnation_by_regime = {str(k): int(v) for k, v in raw_stag_map.items()}
+        else:
+            stagnation_by_regime = {}
+            legacy_stag = int(payload.get("stagnation_rounds", 0))
+            if legacy_stag > 0:
+                fallback_tag = str(current_regime or (rounds[-1].regime_tag if rounds else ""))
+                if fallback_tag:
+                    stagnation_by_regime[fallback_tag] = legacy_stag
+        raw_last_unpromoted = payload.get("last_unpromoted_regime")
+        last_unpromoted_regime = str(raw_last_unpromoted) if raw_last_unpromoted else None
         return (
             incumbent_source,
             CandidateSurrogateResult.from_dict(payload["baseline_result"]),
             CandidateSurrogateResult.from_dict(payload["best_result"]),
             [AnchorCaseSpec.from_dict(item) for item in payload.get("active_anchors", ())],
             set(str(x) for x in payload.get("frozen_regimes", ())),
-            payload.get("current_regime"),
+            current_regime,
             int(payload.get("stagnation_rounds", 0)),
-            [CampaignRoundRecord.from_dict(r) for r in payload.get("rounds", ())],
+            rounds,
             [int(x) for x in payload.get("promoted_rounds", ())],
             [int(x) for x in payload.get("rolled_back_rounds", ())],
             [int(x) for x in payload.get("escalated_rounds", ())],
             [str(x) for x in payload.get("admitted_rule_ids", ())],
+            stagnation_by_regime,
+            last_unpromoted_regime,
         )
 
     async def _execute_single_round(
@@ -1771,6 +1805,8 @@ class PerfTargetCampaignRunner:
         parent_snippet = default_snippet
         stone_ledger: ObjectivePhysicalLedger | None = None
         stone_track: str | None = None
+        selected_stone_id: str | None = None
+        selected_stone_hypothesis = ""
         creative_effort = "high"
         if escalated:
             creative_effort = "xhigh"
@@ -1783,6 +1819,9 @@ class PerfTargetCampaignRunner:
                     parent_lane = "stepping_stone"
                     stone_ledger = stone.ledger
                     stone_track = stone.track
+                    selected_stone_id = stone.candidate_id
+                    if stone.worker_kind == "creative_explore":
+                        selected_stone_hypothesis = stone.hypothesis
                 except Exception as exc:
                     logger.warning(
                         "Failed to patch stepping-stone slice for regime %s: %s",
@@ -1792,6 +1831,16 @@ class PerfTargetCampaignRunner:
                     parent_lane = "stepping_stone"
             else:
                 parent_lane = "stepping_stone"
+
+        active_parent_id = (
+            selected_stone_id
+            if selected_stone_id
+            else (
+                regime_beam.exploit_beam[0].candidate_id
+                if regime_beam.exploit_beam
+                else f"incumbent_r{max(0, round_idx - 1)}"
+            )
+        )
 
         base_stage_a = self._run_l0(incumbent_source, regime_spec)
         base_ledger = base_stage_a.ledger if base_stage_a.ledger is not None else _fallback_ledger()
@@ -1872,40 +1921,43 @@ class PerfTargetCampaignRunner:
             ranked_rules,
             regime_beam.exploited_signatures,
         )
-        anchor_dims = (
-            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-        )
-        prescreen_kwargs: dict[str, object] = dict(regime_spec.sample_builder_kwargs)
-        prescreen_factory = func_name
-        prescreen_pc: dict[str, object] = {}
-        prescreen_cf: tuple[str, ...] = ()
-        try:
-            resolved_cfg = resolve_regime_config(
-                incumbent_source,
-                regime_spec,
+        if self._config.enable_tilesize_prescreen:
+            anchor_dims = (
+                regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+            )
+            prescreen_kwargs: dict[str, object] = dict(regime_spec.sample_builder_kwargs)
+            prescreen_factory = func_name
+            prescreen_pc: dict[str, object] = {}
+            prescreen_cf: tuple[str, ...] = ()
+            try:
+                resolved_cfg = resolve_regime_config(
+                    incumbent_source,
+                    regime_spec,
+                    dims=anchor_dims,
+                )
+                prescreen_kwargs.update(resolved_cfg.builder_kwargs)
+                prescreen_factory = resolved_cfg.builder_name
+                prescreen_pc = dict(resolved_cfg.pass_configs)
+                prescreen_cf = resolved_cfg.compile_flags
+            except Exception as exc:
+                logger.warning(
+                    "Failed to resolve prescreen config for regime %s: %s",
+                    regime_spec.regime_tag,
+                    exc,
+                )
+            var_bindings = build_anchor_var_bindings(anchor_dims, kwargs=prescreen_kwargs)
+            prescreen_summary = build_prescreen_summary_from_kwargs(
+                prescreen_kwargs,
+                dsl_source=incumbent_source,
+                factory_name=prescreen_factory,
+                var_bindings=var_bindings or None,
+                config_selector_name=regime_spec.config_selector_fn or None,
                 dims=anchor_dims,
+                pass_configs=prescreen_pc or None,
+                compile_flags=prescreen_cf or None,
             )
-            prescreen_kwargs.update(resolved_cfg.builder_kwargs)
-            prescreen_factory = resolved_cfg.builder_name
-            prescreen_pc = dict(resolved_cfg.pass_configs)
-            prescreen_cf = resolved_cfg.compile_flags
-        except Exception as exc:
-            logger.warning(
-                "Failed to resolve prescreen config for regime %s: %s",
-                regime_spec.regime_tag,
-                exc,
-            )
-        var_bindings = build_anchor_var_bindings(anchor_dims, kwargs=prescreen_kwargs)
-        prescreen_summary = build_prescreen_summary_from_kwargs(
-            prescreen_kwargs,
-            dsl_source=incumbent_source,
-            factory_name=prescreen_factory,
-            var_bindings=var_bindings or None,
-            config_selector_name=regime_spec.config_selector_fn or None,
-            dims=anchor_dims,
-            pass_configs=prescreen_pc or None,
-            compile_flags=prescreen_cf or None,
-        )
+        else:
+            prescreen_summary = ""
         deficit = max(0, self._config.k_rule_workers - len(ranked_rules))
         total_creative = 1 + deficit
         for c_idx in range(total_creative):
@@ -1934,6 +1986,7 @@ class PerfTargetCampaignRunner:
                         parent_residual=parent_residual,
                         track=parent_track,
                         incumbent_source=incumbent_source,
+                        parent_hypothesis=selected_stone_hypothesis,
                     ),
                 )
             )
@@ -1943,19 +1996,27 @@ class PerfTargetCampaignRunner:
             wkind: str,
             rule: AscendCausalRule | None,
             req: GenerationRequest,
-        ) -> tuple[str, str, AscendCausalRule | None, str | None, str, bool]:
+        ) -> tuple[str, str, AscendCausalRule | None, str | None, str, str, bool]:
             try:
                 raw = await backend.generate(req)
             except Exception as exc:
-                return wid, wkind, rule, None, f"llm_transport:{type(exc).__name__}:{exc}", True
+                return wid, wkind, rule, None, "", f"llm_transport:{type(exc).__name__}:{exc}", True
             try:
                 if wkind == "creative_explore":
-                    snippet = extract_creative_payload(raw)["dsl_source"]
+                    creative = extract_creative_payload(raw)
+                    snippet = creative["dsl_source"]
+                    raw_hyp = str(creative.get("physical_hypothesis", "")).strip()
+                    raw_metric = str(creative.get("target_local_metric", "")).strip()
+                    if raw_hyp and raw_metric:
+                        hypothesis_text = f"{raw_hyp} [target_metric={raw_metric}]"
+                    else:
+                        hypothesis_text = raw_hyp or raw_metric
                 else:
                     snippet = extract_python_dsl(raw)
-                return wid, wkind, rule, snippet, "", False
+                    hypothesis_text = ""
+                return wid, wkind, rule, snippet, hypothesis_text, "", False
             except Exception as exc:
-                return wid, wkind, rule, None, f"llm_parse:{type(exc).__name__}:{exc}", False
+                return wid, wkind, rule, None, "", f"llm_parse:{type(exc).__name__}:{exc}", False
 
         worker_replies = await asyncio.gather(
             *(_call_worker(wid, wkind, rule, req) for wid, wkind, rule, req in worker_specs)
@@ -1963,9 +2024,9 @@ class PerfTargetCampaignRunner:
 
         raw_candidates: list[tuple[str, str]] = []
         failed_entries: list[tuple[str, str, str]] = []
-        meta_by_id: dict[str, tuple[str, AscendCausalRule | None]] = {}
-        for wid, wkind, rule, snippet, err, is_transport_error in worker_replies:
-            meta_by_id[wid] = (wkind, rule)
+        meta_by_id: dict[str, tuple[str, AscendCausalRule | None, str]] = {}
+        for wid, wkind, rule, snippet, cand_hypothesis, err, is_transport_error in worker_replies:
+            meta_by_id[wid] = (wkind, rule, cand_hypothesis)
             if snippet is None:
                 stage_tag = "llm_transport" if is_transport_error else "llm_generate"
                 failed_entries.append((wid, stage_tag, err[:200]))
@@ -1997,7 +2058,7 @@ class PerfTargetCampaignRunner:
                 failed_entries.append(
                     (chk.candidate_id, chk.failed_tier or "l0_l1", chk.error_message[:200])
                 )
-                _wkind, rule = meta_by_id[chk.candidate_id]
+                _wkind, rule, _hyp = meta_by_id[chk.candidate_id]
                 if rule is not None:
                     self._tracker.record_outcome(
                         rule.rule_id,
@@ -2031,7 +2092,7 @@ class PerfTargetCampaignRunner:
             res = l2_results.get(chk.candidate_id)
             if res is None:
                 continue
-            wkind, rule = meta_by_id[chk.candidate_id]
+            wkind, rule, cand_hypothesis = meta_by_id[chk.candidate_id]
             ledger = (
                 chk.stage_a.ledger
                 if chk.stage_a and chk.stage_a.ledger is not None
@@ -2068,7 +2129,8 @@ class PerfTargetCampaignRunner:
                     structural_signature=extract_structural_signature(
                         chk.snippet_source, track=track
                     ),
-                    parent_id=f"round_{round_idx - 1}",
+                    hypothesis=cand_hypothesis,
+                    parent_id=active_parent_id,
                     features=(
                         chk.stage_a.features
                         if (self._enable_track_router and chk.stage_a)
@@ -2245,6 +2307,8 @@ class PerfTargetCampaignRunner:
                 rolled_back_rounds,
                 escalated_rounds,
                 admitted_rule_ids,
+                stagnation_by_regime,
+                last_unpromoted_regime,
             ) = self._restore_from_checkpoint()
         else:
             incumbent_source = self._target_module_path.read_text(encoding="utf-8")
@@ -2260,6 +2324,8 @@ class PerfTargetCampaignRunner:
             frozen_regimes = set()
             current_regime = None
             stagnation_rounds = 0
+            stagnation_by_regime = {}
+            last_unpromoted_regime = None
             rounds = []
             promoted_rounds = []
             rolled_back_rounds = []
@@ -2280,6 +2346,8 @@ class PerfTargetCampaignRunner:
                 admitted_rule_ids=admitted_rule_ids,
                 stop_reason="in_progress",
                 l4_result=None,
+                stagnation_by_regime=stagnation_by_regime,
+                last_unpromoted_regime=last_unpromoted_regime,
             )
 
         stop_reason = ""
@@ -2300,9 +2368,10 @@ class PerfTargetCampaignRunner:
                 stop_reason = "budget_exhausted"
                 break
 
-            if stagnation_rounds >= self._config.stagnation_freeze_rounds and current_regime:
-                frozen_regimes.add(current_regime)
-                stagnation_rounds = 0
+            for spec in self._regime_specs:
+                if stagnation_by_regime.get(spec.regime_tag, 0) >= self._config.stagnation_freeze_rounds:
+                    frozen_regimes.add(spec.regime_tag)
+            if current_regime and current_regime in frozen_regimes:
                 current_regime = None
 
             active_regime = self._select_active_regime(
@@ -2311,11 +2380,12 @@ class PerfTargetCampaignRunner:
                 best_result,
                 active_anchors,
                 allow_satisfied_fallback=not self._allow_early_stop(len(rounds)),
+                exclude_regime=last_unpromoted_regime,
             )
             if active_regime is None:
                 stop_reason = "all_regimes_converged"
                 break
-            current_regime = active_regime.regime_tag
+            active_tag = active_regime.regime_tag
 
             (
                 rec,
@@ -2331,12 +2401,20 @@ class PerfTargetCampaignRunner:
                 incumbent_source=incumbent_source,
                 best_result=best_result,
                 active_anchors=active_anchors,
-                stagnation_rounds=stagnation_rounds,
+                stagnation_rounds=stagnation_by_regime.get(active_tag, 0),
                 admitted_rule_ids=admitted_rule_ids,
             )
             rounds.append(rec)
             if promoted:
+                stagnation_rounds = 0
+                stagnation_by_regime[active_tag] = 0
+                current_regime = active_tag
+                last_unpromoted_regime = None
                 promoted_rounds.append(round_idx)
+            else:
+                stagnation_by_regime[active_tag] = stagnation_rounds
+                current_regime = None
+                last_unpromoted_regime = active_tag
             if rolled_back:
                 rolled_back_rounds.append(round_idx)
             if escalated:
@@ -2347,16 +2425,15 @@ class PerfTargetCampaignRunner:
                 stop_reason = "goal_met"
             elif early_stop_allowed and best_result.is_roofline_saturated(self._perf_target):
                 stop_reason = "roofline_saturated"
-            elif stagnation_rounds >= self._config.stagnation_freeze_rounds:
-                frozen_regimes.add(active_regime.regime_tag)
-                stagnation_rounds = 0
-                current_regime = None
+            elif stagnation_by_regime.get(active_tag, 0) >= self._config.stagnation_freeze_rounds:
+                frozen_regimes.add(active_tag)
                 next_reg = self._select_active_regime(
                     None,
                     frozen_regimes,
                     best_result,
                     active_anchors,
                     allow_satisfied_fallback=not early_stop_allowed,
+                    exclude_regime=last_unpromoted_regime,
                 )
                 if next_reg is None:
                     stop_reason = "all_regimes_converged"
@@ -2376,6 +2453,8 @@ class PerfTargetCampaignRunner:
                 admitted_rule_ids=admitted_rule_ids,
                 stop_reason=stop_reason or "in_progress",
                 l4_result=None,
+                stagnation_by_regime=stagnation_by_regime,
+                last_unpromoted_regime=last_unpromoted_regime,
             )
             if stop_reason:
                 break
@@ -2430,6 +2509,7 @@ class PerfTargetCampaignRunner:
                     key=lambda c: (l4_result.per_case_speedups.get(c, float("inf")), c),
                 )
                 catch_regime = resolved_by_cnum[worst_cnum]
+                catch_tag = catch_regime.regime_tag
                 catch_idx = (rounds[-1].round_idx + 1) if rounds else 1
                 (
                     rec,
@@ -2445,12 +2525,15 @@ class PerfTargetCampaignRunner:
                     incumbent_source=incumbent_source,
                     best_result=best_result,
                     active_anchors=active_anchors,
-                    stagnation_rounds=stagnation_rounds,
+                    stagnation_rounds=stagnation_by_regime.get(catch_tag, 0),
                     admitted_rule_ids=admitted_rule_ids,
                 )
                 rounds.append(rec)
                 if promoted:
+                    stagnation_by_regime[catch_tag] = 0
                     promoted_rounds.append(catch_idx)
+                else:
+                    stagnation_by_regime[catch_tag] = stagnation_rounds
                 if rolled_back:
                     rolled_back_rounds.append(catch_idx)
                 if escalated:
@@ -2472,6 +2555,8 @@ class PerfTargetCampaignRunner:
             admitted_rule_ids=admitted_rule_ids,
             stop_reason=stop_reason,
             l4_result=l4_result,
+            stagnation_by_regime=stagnation_by_regime,
+            last_unpromoted_regime=last_unpromoted_regime,
         )
 
         return CampaignReport(
@@ -2529,6 +2614,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--source-root", default=None, help="TileFoundry workspace root.")
     parser.add_argument("--env-file", default=None, help="Path to tilefoundry-npu env.sh.")
+    parser.add_argument(
+        "--enable-tilesize-prescreen",
+        action="store_true",
+        help="Enable tile-size prescreen guidance table in creative prompts.",
+    )
     return parser
 
 
@@ -2544,6 +2634,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         disable_early_goal_stop=bool(args.disable_early_goal_stop),
         run_final_l4=bool(args.run_final_l4),
         device_id=str(args.device_id),
+        enable_tilesize_prescreen=bool(args.enable_tilesize_prescreen),
     )
     tracker = BayesianRuleTracker.from_seed_yaml()
     flywheel = FlywheelDistiller(

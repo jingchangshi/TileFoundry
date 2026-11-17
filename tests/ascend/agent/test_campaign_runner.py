@@ -357,32 +357,34 @@ def test_campaign_patience_escalation_xhigh_stepping_stone_and_regime_rotation(
     target_path = tmp_path / "kernels.py"
     target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
 
-    exploit_replies = [_IMPROVED_REGIME_A] * 8 + [_IMPROVED_REGIME_B] * 8
-    creative_replies = [
-        json.dumps(
-            {
-                "physical_hypothesis": "Novel SSBUF path",
-                "target_local_metric": "sync_stall",
-                "dsl_source": _SSBUF_REGIME_A,
-            }
-        )
-        for _ in range(8)
-    ] + [
-        json.dumps(
-            {
-                "physical_hypothesis": "Regime B probe",
-                "target_local_metric": "aiv_vec",
-                "dsl_source": _IMPROVED_REGIME_B,
-            }
-        )
-        for _ in range(8)
-    ]
-    backend = MockLLMBackend(
-        responses={
-            "exploit_rule": exploit_replies,
-            "explore_creative": creative_replies,
+    creative_a_payload = json.dumps(
+        {
+            "physical_hypothesis": "Novel SSBUF path",
+            "target_local_metric": "sync_stall",
+            "dsl_source": _SSBUF_REGIME_A,
         }
     )
+    creative_b_payload = json.dumps(
+        {
+            "physical_hypothesis": "Regime B probe",
+            "target_local_metric": "aiv_vec",
+            "dsl_source": _IMPROVED_REGIME_B,
+        }
+    )
+
+    class _RegimeDispatchBackend:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def generate(self, req, *, effort_override=None):
+            _ = effort_override
+            self.calls.append(req)
+            is_a = "regime_a:" in req.user_prompt
+            if req.role == "explore_creative":
+                return creative_a_payload if is_a else creative_b_payload
+            return _IMPROVED_REGIME_A if is_a else _IMPROVED_REGIME_B
+
+    backend = _RegimeDispatchBackend()
 
     def _l2_stagnant(cands, active_anchors):
         out = {}
@@ -422,15 +424,18 @@ def test_campaign_patience_escalation_xhigh_stepping_stone_and_regime_rotation(
     assert report.stop_reason == "all_regimes_converged"
     assert report.total_rounds == 8
     assert report.frozen_regimes == ("regime_a", "regime_b")
-    assert report.escalated_rounds == (3, 4, 7, 8)
-    assert [r.regime_tag for r in report.rounds[:4]] == ["regime_a"] * 4
-    assert [r.regime_tag for r in report.rounds[4:]] == ["regime_b"] * 4
-    assert report.rounds[2].parent_lane == "stepping_stone"
-    assert report.rounds[2].creative_effort == "xhigh"
+    assert report.escalated_rounds == (5, 6, 7, 8)
+    assert [r.regime_tag for r in report.rounds] == ["regime_a", "regime_b"] * 4
+    assert [r.creative_effort for r in report.rounds] == ["high"] * 4 + ["xhigh"] * 4
+    assert report.rounds[4].parent_lane == "stepping_stone"
+    assert report.rounds[4].creative_effort == "xhigh"
 
     creative_calls = [c for c in backend.calls if c.role == "explore_creative"]
-    assert [c.effort for c in creative_calls[:8]] == ["high"] * 4 + ["xhigh"] * 4
-    assert "T.alloc_ss" in creative_calls[4].user_prompt
+    high_calls = [c for c in creative_calls if c.effort == "high"]
+    xhigh_calls = [c for c in creative_calls if c.effort == "xhigh"]
+    assert len(high_calls) >= 4 and len(xhigh_calls) >= 4
+    assert creative_calls[: len(high_calls)] == high_calls
+    assert any("regime_a:" in c.user_prompt and "T.alloc_ss" in c.user_prompt for c in xhigh_calls)
     for call in creative_calls:
         joined = call.system_prompt + "\n" + call.user_prompt
         assert "### NEGATIVE CONSTRAINTS (ALREADY EXPLORED BY PARALLEL WORKERS)" in joined
@@ -704,6 +709,7 @@ def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
             operator_name="attention_residual",
             max_rounds=2,
             stagnation_escalate_rounds=1,
+            enable_tilesize_prescreen=True,
         ),
         target_module_path=target_path,
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
@@ -1611,12 +1617,19 @@ def test_per_regime_beam_isolation_objective_ranking_and_checkpoint(tmp_path: Pa
             "dsl_source": _IMPROVED_REGIME_B,
         }
     )
-    backend = MockLLMBackend(
-        responses={
-            "exploit_rule": [_IMPROVED_REGIME_A] * 8 + [_IMPROVED_REGIME_B] * 8,
-            "explore_creative": [creative_a] * 4 + [creative_b] * 4,
-        }
-    )
+    class _IsolationDispatchBackend:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def generate(self, req, *, effort_override=None):
+            _ = effort_override
+            self.calls.append(req)
+            is_a = "regime_a:" in req.user_prompt
+            if req.role == "explore_creative":
+                return creative_a if is_a else creative_b
+            return _IMPROVED_REGIME_A if is_a else _IMPROVED_REGIME_B
+
+    backend = _IsolationDispatchBackend()
 
     def _l2_eval(cands, active_anchors):
         out = {}
@@ -1685,7 +1698,7 @@ def test_per_regime_beam_isolation_objective_ranking_and_checkpoint(tmp_path: Pa
 def test_campaign_paradigm_pruning_and_cross_paradigm_isolation(tmp_path: Path) -> None:
     """Verify round-end paradigm-scoped pruning never blocks rules in other paradigms."""
     anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 2.0),)
-    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),)
+    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {"bm": 64, "bn": 64, "bk": 64}),)
     target_path = tmp_path / "kernels.py"
     target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
 
@@ -3053,6 +3066,199 @@ def test_wp_final3_persistent_wave_occupancy_weighted_burst_pipe_all_and_r21() -
     assert rules["R19_STATIC_PINGPONG_UNROLL_NO_ALIAS"].matches(ctx_bar) is True
     ctx_post_bar = build_predicate_context(res_no_bar.ledger, prev_ledger=res_with_bar.ledger)
     assert rules["R19_STATIC_PINGPONG_UNROLL_NO_ALIAS"].postcondition_realized(ctx_post_bar) is True
+
+
+def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
+    tmp_path: Path,
+) -> None:
+    """Verify WP-FINAL-4 default-OFF prescreen, Cube norm, tags, lineage, and msprof sync."""
+    from types import SimpleNamespace
+
+    from tests.ascend.agent.test_surrogate_batch_npu import _extract_msprof_metrics
+    from tilefoundry_ascend.agent.campaign.campaign_runner import build_arg_parser
+    from tilefoundry_ascend.agent.orchestrator.portfolio_runner import summarize_excluded_mechanisms
+    from tilefoundry_ascend.agent.orchestrator.residual_beam import (
+        TwoLaneBeamSearch,
+        extract_structural_signature,
+    )
+    from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
+        TileConfigCandidate,
+        prescreen_live_ir_neighborhood,
+    )
+
+    default_cfg = CampaignConfig(operator_name="mla")
+    assert default_cfg.enable_tilesize_prescreen is False
+    parsed_default = build_arg_parser().parse_args(["--operator", "mla"])
+    parsed_enabled = build_arg_parser().parse_args(
+        ["--operator", "mla", "--enable-tilesize-prescreen"]
+    )
+    assert parsed_default.enable_tilesize_prescreen is False
+    assert parsed_enabled.enable_tilesize_prescreen is True
+
+    anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 2.0),)
+    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {"bm": 64, "bn": 64, "bk": 64}),)
+    creative_reply = json.dumps(
+        {
+            "physical_hypothesis": "Static pingpong buffers eliminate aliasing",
+            "target_local_metric": "mte2_wait_ratio",
+            "dsl_source": _SSBUF_REGIME_A,
+        }
+    )
+
+    def _l2_eval(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            lat = 15.0 if "T.alloc_ss" in src else 12.0
+            out[cid] = _make_surrogate_result(
+                cid,
+                "attention_residual",
+                tuple(active_anchors),
+                {2: lat},
+            )
+        return out
+
+    for flag, expected_present in ((False, False), (True, True)):
+        t_path = tmp_path / f"kernels_{int(flag)}.py"
+        t_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+        backend = MockLLMBackend(
+            responses={
+                "exploit_rule": [_IMPROVED_REGIME_A] * 8,
+                "explore_creative": [creative_reply] * 8,
+            }
+        )
+        beam = TwoLaneBeamSearch(exploit_width=2, stepping_stone_width=1)
+        runner = PerfTargetCampaignRunner(
+            config=CampaignConfig(
+                operator_name="attention_residual",
+                max_rounds=2,
+                stagnation_escalate_rounds=1,
+                enable_tilesize_prescreen=flag,
+            ),
+            target_module_path=t_path,
+            perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+            anchors=anchors,
+            regime_specs=regimes,
+            llm_backend=backend,
+            beam=beam,
+            l0_checker=lambda src, _reg: _make_stage_a(src),
+            l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+            l2_batch_evaluator=_l2_eval,
+            l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+            checkpoint_path=tmp_path / f"ckpt_{int(flag)}.json",
+        )
+        asyncio.run(runner.run(resume=False))
+        creative_calls = [c for c in backend.calls if c.role == "explore_creative"]
+        assert creative_calls
+        assert any("### TILE PRESCREEN GUIDANCE" in c.user_prompt for c in creative_calls) is expected_present
+        if not flag:
+            stone = beam.stepping_stone_beam[0]
+            assert stone.worker_kind == "creative_explore"
+            assert "Static pingpong buffers eliminate aliasing" in stone.hypothesis
+            assert "mte2_wait_ratio" in stone.hypothesis
+            assert stone.parent_id == "incumbent_r0"
+            assert any(
+                "### STEPPING-STONE PARENT HYPOTHESIS" in c.user_prompt and stone.hypothesis in c.user_prompt
+                for c in creative_calls
+            )
+            r2_rule = next((c for c in beam.exploit_beam if c.round_idx == 2), None)
+            assert r2_rule is not None and r2_rule.parent_id == stone.candidate_id
+
+    cube_dsl = (
+        "import tilelang.ascend.language as T\n\n"
+        "def make_cube_kernel(bm: int = 64, bn: int = 64):\n"
+        "    bk = 64\n"
+        "    @T.prim_func\n"
+        "    def main(\n"
+        "        X: T.Tensor((512, 512), 'bfloat16'),\n"
+        "        W: T.Tensor((512, 512), 'bfloat16'),\n"
+        "        Y: T.Tensor((512, 512), 'float32'),\n"
+        "    ):\n"
+        "        with T.Kernel(4) as bx:\n"
+        "            x_l1 = T.alloc_l1((bm, bk), 'bfloat16')\n"
+        "            w_l1 = T.alloc_l1((bn, bk), 'bfloat16')\n"
+        "            acc = T.alloc_l0c((bm, bn), 'float32')\n"
+        "            for kt in T.Pipelined(4, num_stages=2):\n"
+        "                T.copy(X[0:bm, kt * bk : (kt + 1) * bk], x_l1)\n"
+        "                T.copy(W[0:bn, kt * bk : (kt + 1) * bk], w_l1)\n"
+        "                T.gemm(x_l1, w_l1, acc, transpose_B=True, clear_accum=kt == 0)\n"
+        "            T.copy(acc, Y[0:bm, 0:bn])\n"
+        "    return main\n"
+    )
+    cube_summary = prescreen_live_ir_neighborhood(
+        cube_dsl,
+        factory_name="make_cube_kernel",
+        center=TileConfigCandidate(bm=64, bn=64, bk=64, stages=2),
+        max_variants=8,
+    )
+    cube_rank_1 = next(line for line in cube_summary.splitlines() if line.strip().startswith("1."))
+    assert "OK" in cube_rank_1
+    import re
+
+    m_tile = re.search(r"bm=(\d+),\s*bn=(\d+)", cube_rank_1)
+    assert m_tile is not None
+    assert int(m_tile.group(1)) * int(m_tile.group(2)) > 64 * 64
+
+    pingpong_split_dsl = (
+        "import tilelang.ascend.language as T\n\n"
+        "def _select_cfg():\n"
+        "    return {'num_kv_splits': 8}\n\n"
+        "def make_kernel():\n"
+        "    @T.prim_func\n"
+        "    def main(X: T.Tensor((4, 64), 'float16'), Out: T.Tensor((4, 64), 'float32')):\n"
+        "        with T.Kernel(4) as bx:\n"
+        "            va = T.alloc_shared((1, 64), 'float16')\n"
+        "            vb = T.alloc_shared((1, 64), 'float16')\n"
+        "            acc = T.alloc_fragment((64,), 'float32')\n"
+        "            for i in range(2):\n"
+        "                T.copy(X[i, :], va)\n"
+        "                T.ascend_pipe_barrier('PIPE_ALL')\n"
+        "            for j in range(64):\n"
+        "                acc[j] = acc[j] + vb[0, j] * 1.0\n"
+        "            T.copy(acc, Out[bx, :])\n"
+        "    return main\n"
+    )
+    sig = extract_structural_signature(pingpong_split_dsl)
+    for tag in (
+        "static_pingpong_2buf",
+        "loop_fission_multi_pass",
+        "pipe_all_barrier",
+        "vfma_unshifted",
+        "split_kv_multi",
+    ):
+        assert tag in sig
+    excluded_desc = summarize_excluded_mechanisms((), [sig])
+    joined_desc = " ".join(excluded_desc)
+    assert "Static double-buffered" in joined_desc
+    assert "Multi-pass loop fission" in joined_desc
+    assert "Split-KV" in joined_desc
+
+    pct_prof = SimpleNamespace(
+        aic_mad=90.0,
+        aiv_vec=20.0,
+        aic_mte2=10.0,
+        aiv_mte2=5.0,
+        aic_fixpipe=15.0,
+        aic_total_cycles=1000,
+        aiv_total_cycles=1000,
+        dur_us=12.5,
+    )
+    pct_metrics = _extract_msprof_metrics(pct_prof)
+    assert abs(float(pct_metrics["aic_mac_ratio"]) - 0.90) < 1e-6
+    assert abs(float(pct_metrics["aiv_vec_ratio"]) - 0.20) < 1e-6
+    assert abs(float(pct_metrics["sync_stall_ratio"]) - 0.0) < 1e-6
+
+    stall_prof = SimpleNamespace(
+        aic_mad=0.20,
+        aiv_vec=0.20,
+        aic_mte2=0.10,
+        aiv_mte2=0.10,
+        aic_total_cycles=1000,
+        aiv_total_cycles=1000,
+        dur_us=25.0,
+    )
+    stall_metrics = _extract_msprof_metrics(stall_prof)
+    assert abs(float(stall_metrics["sync_stall_ratio"]) - 0.65) < 1e-6
 
 
 

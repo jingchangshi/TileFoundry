@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -131,6 +132,131 @@ def compute_static_dynamic_residual(
     )
 
 
+def _is_int_gt_one(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, int)
+        and not isinstance(node.value, bool)
+        and node.value > 1
+    )
+
+
+def _extract_target_names(stmt: ast.AST) -> list[str]:
+    names: list[str] = []
+    if isinstance(stmt, ast.Assign):
+        for target in stmt.targets:
+            if isinstance(target, ast.Name):
+                names.append(target.id)
+    elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+        names.append(stmt.target.id)
+    return names
+
+
+def _has_static_pingpong_buffers(tree: ast.AST, dsl_source: str) -> bool:
+    if "enable_offset=True" in dsl_source:
+        return False
+    shape_counts: dict[str, int] = {}
+    two_slot_vars: set[str] = set()
+    for stmt in ast.walk(tree):
+        if not isinstance(stmt, (ast.Assign, ast.AnnAssign)) or stmt.value is None:
+            continue
+        call = stmt.value
+        if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+            continue
+        if call.func.attr not in ("alloc_shared", "alloc_ub", "alloc_fragment"):
+            continue
+        if not call.args:
+            continue
+        shape_node = call.args[0]
+        shape_key = ast.dump(shape_node)
+        target_names = _extract_target_names(stmt)
+        shape_counts[shape_key] = shape_counts.get(shape_key, 0) + max(1, len(target_names))
+        if isinstance(shape_node, (ast.Tuple, ast.List)) and len(shape_node.elts) >= 2:
+            lead = shape_node.elts[0]
+            if isinstance(lead, ast.Constant) and lead.value == 2:
+                two_slot_vars.update(target_names)
+    if any(count >= 2 for count in shape_counts.values()):
+        return True
+    if not two_slot_vars:
+        return False
+    seen_slots: dict[str, set[int]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Subscript) or not isinstance(node.value, ast.Name):
+            continue
+        var_name = node.value.id
+        if var_name not in two_slot_vars:
+            continue
+        lead_slice = node.slice.elts[0] if isinstance(node.slice, ast.Tuple) and node.slice.elts else node.slice
+        if isinstance(lead_slice, ast.Constant) and isinstance(lead_slice.value, int) and lead_slice.value in (0, 1):
+            seen_slots.setdefault(var_name, set()).add(lead_slice.value)
+    return any(len(slots) >= 2 for slots in seen_slots.values())
+
+
+def _has_loop_fission_multi_pass(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.With, ast.AsyncWith, ast.For, ast.AsyncFor)):
+            sibling_fors = sum(1 for stmt in node.body if isinstance(stmt, ast.For))
+            if sibling_fors >= 2:
+                return True
+    return False
+
+
+def _has_pipe_all_barrier(tree: ast.AST, dsl_source: str) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in ("ascend_pipe_barrier", "pipe_barrier"):
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and arg.value == "PIPE_ALL":
+                        return True
+    return "ascend_pipe_barrier" in dsl_source and "PIPE_ALL" in dsl_source
+
+
+def _node_has_add_mult_fma(loop_node: ast.For) -> bool:
+    has_exp = False
+    has_fma_expr = False
+    for inner in ast.walk(loop_node):
+        if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
+            if inner.func.attr in ("exp", "exp2"):
+                has_exp = True
+            elif inner.func.attr in ("fma", "vfma"):
+                has_fma_expr = True
+        elif isinstance(inner, ast.AugAssign) and isinstance(inner.op, ast.Add):
+            if any(isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Mult) for sub in ast.walk(inner.value)):
+                has_fma_expr = True
+        elif isinstance(inner, ast.Assign) and isinstance(inner.value, ast.BinOp) and isinstance(inner.value.op, ast.Add):
+            if any(isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Mult) for sub in ast.walk(inner.value)):
+                has_fma_expr = True
+    return has_fma_expr and not has_exp
+
+
+def _has_vfma_unshifted(tree: ast.AST, dsl_source: str) -> bool:
+    if "vfma" in dsl_source.lower():
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in ("fma", "vfma"):
+                return True
+        if isinstance(node, ast.For) and _node_has_add_mult_fma(node):
+            return True
+    return False
+
+
+def _has_split_kv_multi(tree: ast.AST, dsl_source: str) -> bool:
+    if "partial_out" in dsl_source:
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg == "num_kv_splits" and _is_int_gt_one(node.value):
+            return True
+        if isinstance(node, ast.Dict):
+            for key_node, val_node in zip(node.keys, node.values):
+                if isinstance(key_node, ast.Constant) and key_node.value == "num_kv_splits" and _is_int_gt_one(val_node):
+                    return True
+        if isinstance(node, ast.Assign):
+            if any(isinstance(t, ast.Name) and t.id == "num_kv_splits" for t in node.targets) and _is_int_gt_one(node.value):
+                return True
+    return False
+
+
 def extract_structural_signature(dsl_source: str, *, track: str = "") -> tuple[str, ...]:
     """Extract sorted architectural primitive signature for stepping-stone diversity."""
     tags: list[str] = []
@@ -139,6 +265,27 @@ def extract_structural_signature(dsl_source: str, *, track: str = "") -> tuple[s
     for token in _NOVELTY_TOKENS:
         if token in dsl_source:
             tags.append(token)
+    try:
+        tree = ast.parse(dsl_source)
+    except SyntaxError:
+        if "ascend_pipe_barrier" in dsl_source and "PIPE_ALL" in dsl_source:
+            tags.append("pipe_all_barrier")
+        if "vfma" in dsl_source.lower():
+            tags.append("vfma_unshifted")
+        if "partial_out" in dsl_source:
+            tags.append("split_kv_multi")
+        return tuple(sorted(set(tags)))
+
+    if _has_static_pingpong_buffers(tree, dsl_source):
+        tags.append("static_pingpong_2buf")
+    if _has_loop_fission_multi_pass(tree):
+        tags.append("loop_fission_multi_pass")
+    if _has_pipe_all_barrier(tree, dsl_source):
+        tags.append("pipe_all_barrier")
+    if _has_vfma_unshifted(tree, dsl_source):
+        tags.append("vfma_unshifted")
+    if _has_split_kv_multi(tree, dsl_source):
+        tags.append("split_kv_multi")
     return tuple(sorted(set(tags)))
 
 

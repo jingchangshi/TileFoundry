@@ -588,7 +588,10 @@ def prescreen_live_ir_neighborhood(
         elif pure_vector_row_tile:
             sort_key = (ii_rank, -burst_eff, float(dom_cycles), float(idx))
         else:
-            sort_key = (ii_rank, float(dom_cycles), float(idx))
+            area = max(1.0, float(cand.bm * cand.bn))
+            norm_ii = (ii_rank / area) if ii_rank != float("inf") else float("inf")
+            norm_cycles = float(dom_cycles) / area
+            sort_key = (norm_ii, norm_cycles, -area, float(idx))
         records.append(
             (
                 is_ok,

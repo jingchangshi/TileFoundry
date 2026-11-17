@@ -118,19 +118,26 @@ def _measure_npu_latency_us(fn_call, *, warmup: int, repeat: int) -> float:
         return float(statistics.median(samples_ms)) * 1000.0
 
 
+def _normalize_pmu_ratio(raw_val: object) -> float:
+    val = float(raw_val)
+    if val > 1.05:
+        val /= 100.0
+    return max(0.0, min(1.0, val))
+
+
 def _extract_msprof_metrics(prof: object) -> dict[str, float | int]:
-    aic_mad = float(getattr(prof, "aic_mad", 0.0))
-    aic_scalar = float(getattr(prof, "aic_scalar", 0.0))
-    aic_mte1 = float(getattr(prof, "aic_mte1", 0.0))
-    aic_mte2 = float(getattr(prof, "aic_mte2", 0.0))
-    aic_mte3 = float(getattr(prof, "aic_mte3", 0.0))
-    aic_fixpipe = float(getattr(prof, "aic_fixpipe", 0.0))
+    aic_mad = _normalize_pmu_ratio(getattr(prof, "aic_mad", 0.0))
+    aic_scalar = _normalize_pmu_ratio(getattr(prof, "aic_scalar", 0.0))
+    aic_mte1 = _normalize_pmu_ratio(getattr(prof, "aic_mte1", 0.0))
+    aic_mte2 = _normalize_pmu_ratio(getattr(prof, "aic_mte2", 0.0))
+    aic_mte3 = _normalize_pmu_ratio(getattr(prof, "aic_mte3", 0.0))
+    aic_fixpipe = _normalize_pmu_ratio(getattr(prof, "aic_fixpipe", 0.0))
     aic_total_cycles = int(getattr(prof, "aic_total_cycles", 0))
 
-    aiv_vec = float(getattr(prof, "aiv_vec", 0.0))
-    aiv_scalar = float(getattr(prof, "aiv_scalar", 0.0))
-    aiv_mte2 = float(getattr(prof, "aiv_mte2", 0.0))
-    aiv_mte3 = float(getattr(prof, "aiv_mte3", 0.0))
+    aiv_vec = _normalize_pmu_ratio(getattr(prof, "aiv_vec", 0.0))
+    aiv_scalar = _normalize_pmu_ratio(getattr(prof, "aiv_scalar", 0.0))
+    aiv_mte2 = _normalize_pmu_ratio(getattr(prof, "aiv_mte2", 0.0))
+    aiv_mte3 = _normalize_pmu_ratio(getattr(prof, "aiv_mte3", 0.0))
     aiv_total_cycles = int(getattr(prof, "aiv_total_cycles", 0))
 
     raw_dur_us = getattr(prof, "dur_us", None)
@@ -141,16 +148,23 @@ def _extract_msprof_metrics(prof: object) -> dict[str, float | int]:
 
     explicit_sync = getattr(prof, "sync_stall_ratio", None)
     if explicit_sync is not None:
-        sync_stall_ratio = float(explicit_sync)
+        sync_stall_ratio = _normalize_pmu_ratio(explicit_sync)
     else:
-        idle_fractions: list[float] = []
-        if aic_total_cycles > 0:
-            aic_sum = aic_mad + aic_scalar + aic_mte1 + aic_mte2 + aic_mte3 + aic_fixpipe
-            idle_fractions.append(max(0.0, 1.0 - min(1.0, aic_sum)))
-        if aiv_total_cycles > 0:
-            aiv_sum = aiv_vec + aiv_scalar + aiv_mte2 + aiv_mte3
-            idle_fractions.append(max(0.0, 1.0 - min(1.0, aiv_sum)))
-        sync_stall_ratio = sum(idle_fractions) / len(idle_fractions) if idle_fractions else 0.0
+        has_aic = (aic_total_cycles > 0) or any(
+            v > 0.0 for v in (aic_mad, aic_scalar, aic_mte1, aic_mte2, aic_mte3, aic_fixpipe)
+        )
+        has_aiv = (aiv_total_cycles > 0) or any(
+            v > 0.0 for v in (aiv_vec, aiv_scalar, aiv_mte2, aiv_mte3)
+        )
+        aic_active = (
+            max(aic_mad, aic_mte1, aic_mte2, aic_mte3, aic_fixpipe, aic_scalar) if has_aic else 0.0
+        )
+        aiv_active = max(aiv_vec, aiv_mte2, aiv_mte3, aiv_scalar) if has_aiv else 0.0
+        dominant_active = max(aic_active, aiv_active)
+        if has_aic or has_aiv:
+            sync_stall_ratio = max(0.0, 1.0 - min(1.0, dominant_active + 0.15))
+        else:
+            sync_stall_ratio = 0.0
 
     return {
         "aic_mac_ratio": aic_mad,

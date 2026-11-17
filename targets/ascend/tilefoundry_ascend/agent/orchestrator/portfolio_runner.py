@@ -175,6 +175,11 @@ _SIGNATURE_DESCRIPTIONS: dict[str, str] = {
     "T.set_atomic": "Hardware atomic GM accumulation",
     "unit_flag_ctrl": "Hardware unit-flag MMAD/FixPipe chaining",
     "vgather2": "UB vector-gather indexing",
+    "static_pingpong_2buf": "Static double-buffered ping-pong buffers avoiding offset aliasing",
+    "loop_fission_multi_pass": "Multi-pass loop fission separating reduction chains from FMA",
+    "pipe_all_barrier": "Coarse PIPE_ALL full-pipeline barrier synchronization",
+    "vfma_unshifted": "Unshifted vector FMA accumulation pass without per-step rescaling",
+    "split_kv_multi": "Multi-split Split-KV stage-1 parallel partition",
 }
 
 
@@ -497,6 +502,7 @@ class PortfolioRunner:
         k_rule_workers: int = 2,
         max_syntax_repairs: int = 1,
         enable_track_router: bool = False,
+        enable_tilesize_prescreen: bool = False,
     ) -> None:
         self._backend = backend
         self._funnel = funnel
@@ -505,6 +511,7 @@ class PortfolioRunner:
         self._k_rules = max(1, k_rule_workers)
         self._max_repairs = max(0, max_syntax_repairs)
         self._enable_track_router = enable_track_router
+        self._enable_tilesize_prescreen = bool(enable_tilesize_prescreen)
 
     @property
     def beam(self) -> TwoLaneBeamSearch:
@@ -561,14 +568,17 @@ class PortfolioRunner:
             matched_rules,
             self._beam.exploited_signatures,
         )
-        prescreen_summary = build_prescreen_summary_from_kwargs(
-            factory_kwargs,
-            dsl_source=parent.dsl_source,
-            factory_name=factory_name,
-            var_bindings=var_bindings,
-            config_selector_name=config_selector_name,
-            dims=dims,
-        )
+        if self._enable_tilesize_prescreen:
+            prescreen_summary = build_prescreen_summary_from_kwargs(
+                factory_kwargs,
+                dsl_source=parent.dsl_source,
+                factory_name=factory_name,
+                var_bindings=var_bindings,
+                config_selector_name=config_selector_name,
+                dims=dims,
+            )
+        else:
+            prescreen_summary = ""
         deficit = max(0, self._k_rules - len(matched_rules))
         total_creative = 1 + deficit
         for c_idx in range(total_creative):
