@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 import json
 
@@ -33,6 +34,24 @@ class ScopeWaterline:
             "implicit_buffers": dict(self.implicit_buffers),
             "degraded_single_buffers": list(self.degraded_single_buffers),
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> ScopeWaterline:
+        """Reconstruct a ScopeWaterline from a serialized dictionary."""
+        raw_exp = payload.get("explicit_buffers") or {}
+        raw_imp = payload.get("implicit_buffers") or {}
+        raw_deg = payload.get("degraded_single_buffers") or ()
+        return cls(
+            scope=str(payload["scope"]),
+            capacity_bytes=int(payload["capacity_bytes"]),
+            explicit_bytes=int(payload["explicit_bytes"]),
+            implicit_bloat_bytes=int(payload["implicit_bloat_bytes"]),
+            peak_allocated_bytes=int(payload["peak_allocated_bytes"]),
+            overflow_bytes=int(payload["overflow_bytes"]),
+            explicit_buffers={str(k): int(v) for k, v in dict(raw_exp).items()},
+            implicit_buffers={str(k): int(v) for k, v in dict(raw_imp).items()},
+            degraded_single_buffers=tuple(str(item) for item in raw_deg),
+        )
 
 
 @dataclass(frozen=True)
@@ -73,6 +92,31 @@ class ObjectivePhysicalLedger:
     def to_json(self, *, indent: int | None = 2) -> str:
         """Serialize the physical ledger into formatted JSON text."""
         return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> ObjectivePhysicalLedger:
+        """Reconstruct an ObjectivePhysicalLedger from a serialized dictionary."""
+        raw_ii = payload.get("steady_state_ii")
+        raw_pipes = payload.get("pipe_cycles") or {}
+        raw_waterlines = payload.get("waterlines") or {}
+        raw_opaque = payload.get("opaque_dynamic_regions") or ()
+        waterlines = {
+            str(scope): (
+                wl if isinstance(wl, ScopeWaterline) else ScopeWaterline.from_dict(wl)
+            )
+            for scope, wl in dict(raw_waterlines).items()
+        }
+        return cls(
+            analysis_mode=str(payload["analysis_mode"]),
+            is_legal=bool(payload["is_legal"]),
+            steady_state_ii=int(raw_ii) if raw_ii is not None else None,
+            pipe_cycles={str(k): int(v) for k, v in dict(raw_pipes).items()},
+            dominant_pipe=str(payload["dominant_pipe"]),
+            waterlines=waterlines,
+            mte2_inflight_per_aiv=int(payload.get("mte2_inflight_per_aiv", 0)),
+            unaligned_dma_padding_bytes=int(payload.get("unaligned_dma_padding_bytes", 0)),
+            opaque_dynamic_regions=tuple(str(item) for item in raw_opaque),
+        )
 
 
 def compute_dominant_pipe(pipe_cycles: dict[str, int]) -> str:

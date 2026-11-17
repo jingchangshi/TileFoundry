@@ -5,8 +5,10 @@ import pathlib
 
 from tilefoundry.analysis import analyze, check_program
 from tilefoundry.cli.source import load_authored_ir
+from tilefoundry.ir.core import Constant, Var
 from tilefoundry.ir.hir.pipeline import PipelineSpec
-from tilefoundry.ir.tir.stmts import For
+from tilefoundry.ir.tir.stmts import For, Sequential
+from tilefoundry.ir.types import TensorType
 from tilefoundry.ir.visitor import StmtVisitor, walk_prim_function
 from tilefoundry.schedule.finalize import finalize
 from tilefoundry.vendor.tilelang_z3 import (
@@ -24,6 +26,11 @@ from tilefoundry_ascend.ascend.schedule import (
     solve_ascend_pipeline,
     solve_loop_with_ledger,
     task_resource_mask,
+)
+from tilefoundry_ascend.ascend.schedule.envelope_inspector import (
+    _detect_tilelang_aiv_split_factor,
+    _tir_for_static_trip_count,
+    _try_solve_tilelang_pipelined_ii,
 )
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget, NodeResourceMask
 
@@ -162,8 +169,9 @@ def test_mode_b_two_snapshot_ir_diff_without_bisheng() -> None:
 
     inspection = inspect_tilelang_primfunc(sample_gemm)
     ledger = inspection.ledger
-    assert ledger.analysis_mode == "readonly_envelope"
-    assert ledger.steady_state_ii is None
+    assert ledger.analysis_mode == "exact_modulo_z3"
+    assert ledger.steady_state_ii is not None
+    assert ledger.steady_state_ii > 1
     assert ledger.is_legal is True
     assert "tl.MaterializeMultiBuffer" in inspection.lowered_passes_observed
     assert "tl.MergeUBAllocations" in inspection.lowered_passes_observed
@@ -262,3 +270,242 @@ class M:
     for py_file in ascend_root.rglob("*.py"):
         text = py_file.read_text(encoding="utf-8")
         assert "tilefoundry_ascend.agent" not in text
+
+
+def test_fp1_tir_for_static_trip_multiplication(tmp_path: pathlib.Path) -> None:
+    """Verify _tir_for_static_trip_count and inspect_tir_envelope loop trip scaling."""
+    sc = TensorType.umat_scalar()
+    iv = Var("k", type=sc)
+    empty_body = Sequential(())
+    c0 = Constant(0, type=sc)
+    c1 = Constant(1, type=sc)
+    c2 = Constant(2, type=sc)
+    c4 = Constant(4, type=sc)
+    c7 = Constant(7, type=sc)
+    assert _tir_for_static_trip_count(For(iv, c0, c4, c1, empty_body)) == 4
+    assert _tir_for_static_trip_count(For(iv, c1, c7, c2, empty_body)) == 3
+    assert _tir_for_static_trip_count(For(iv, c0, c0, c1, empty_body)) == 0
+    assert _tir_for_static_trip_count(For(iv, c0, Var("n", type=sc), c1, empty_body)) is None
+    assert _tir_for_static_trip_count(For(iv, c0, c4, c0, empty_body)) is None
+
+    body = """
+@module(entry="vec_copy", target=AscendTarget("ascend.950pr"), topologies=TOPOS)
+class M:
+    @func
+    def vec_copy(a: Tensor[(4, 60), "f32"]) -> Tensor[(4, 60), "f32"]:
+        with Mesh(("aiv",), (1,), names=("v",)) as _v:
+            c = tf.empty(Tensor[(4, 60), "f32", "gmem"])
+            for k in range(4):
+                a_ub = tf.schedule((a[k, :], tf.empty(Tensor[(60,), "f32", "smem"])), op=T.ascend_gm_to_ub())
+                c_row = tf.schedule((a_ub, tf.empty(Tensor[(60,), "f32", "gmem"])), op=T.ascend_ub_to_gm())
+                c = tf.insert_slice(c, tf.reshape(c_row, new_shape=(1, 60)), (k, 0))
+            return c
+"""
+    p = tmp_path / "vec_copy_trip.py"
+    p.write_text(HEADER + "\n" + body, encoding="utf-8")
+    mod = load_authored_ir(f"{p}:M")
+    c_mod, c_fn = check_program(mod, mod.entry_function())
+    low = finalize(analyze(c_mod, c_fn, analysis="memory"), authored=mod.entry_function())
+    res = inspect_tir_envelope(low.entry_function())
+    assert res.ledger.opaque_dynamic_regions == ()
+    assert res.ledger.pipe_cycles["AIV0.PIPE_MTE2"] == 4
+    assert res.ledger.pipe_cycles["AIV0.PIPE_MTE3"] == 4
+    assert res.ledger.unaligned_dma_padding_bytes == 64
+
+    zero_loop = For(iv, c0, c0, c1, Sequential(()))
+    zero_res = inspect_tir_envelope(zero_loop)
+    assert zero_res.ledger.pipe_cycles == {}
+    assert zero_res.ledger.opaque_dynamic_regions == ()
+
+    dyn_loop = For(iv, c0, Var("dyn_n", type=sc), c1, Sequential(()))
+    dyn_res = inspect_tir_envelope(dyn_loop)
+    assert "dynamic_for:k" in dyn_res.ledger.opaque_dynamic_regions
+
+
+def test_fp1_auto_detect_dual_aiv_and_sid_branch_split() -> None:
+    """Verify MixedKernel and dual_copy auto-detect 1C2V split and halve symmetric AIV work."""
+    import tilelang.ascend.language as T
+    from tilelang import tvm
+    from tvm import tirx
+
+    @T.prim_func
+    def single_aiv_kernel(X: T.Tensor((128, 128), "float32"), Y: T.Tensor((128, 128), "float32")):
+        with T.Kernel(1):
+            x_ub = T.alloc_shared((128, 128), "float32")
+            T.copy(X[0:128, 0:128], x_ub)
+            T.copy(x_ub, Y[0:128, 0:128])
+
+    @T.prim_func
+    def mixed_dual_kernel(X: T.Tensor((128, 128), "float32"), Y: T.Tensor((128, 128), "float32")):
+        with T.MixedKernel(1, sids=2) as (bx, sid):
+            x_ub = T.alloc_shared((64, 128), "float32")
+            x_l1 = T.alloc_l1((128, 128), "float32")
+            for _r in T.serial(4):
+                T.copy(X[sid * 64 : (sid + 1) * 64, 0:128], x_ub)
+            with T.SimdVF():
+                m32 = T.simd.pset(32, "PAT_ALL")
+                for r in T.serial(8):
+                    v = T.simd.vld(x_ub[r, 0], dist="NORM_B32")
+                    T.simd.vsts(x_ub[r, 0], v, mask=m32, dist="NORM_B32")
+            T.dual_copy(x_ub, x_l1)
+            T.copy(x_ub, Y[sid * 64 : (sid + 1) * 64, 0:128])
+
+    @T.prim_func
+    def guarded_sid_kernel(X: T.Tensor((128, 128), "float32")):
+        with T.MixedKernel(1, sids=2) as (bx, sid):
+            x_ub = T.alloc_shared((64, 128), "float32")
+            if sid == 0:
+                with T.SimdVF():
+                    m32 = T.simd.pset(32, "PAT_ALL")
+                    for r in T.serial(4):
+                        v = T.simd.vld(x_ub[r, 0], dist="NORM_B32")
+                        T.simd.vsts(x_ub[r, 0], v, mask=m32, dist="NORM_B32")
+
+    assert _detect_tilelang_aiv_split_factor(single_aiv_kernel, tirx=tirx) == 1
+    assert _detect_tilelang_aiv_split_factor(mixed_dual_kernel, tirx=tirx) == 2
+
+    cthread_iv = tirx.IterVar(tvm.ir.Range(0, 2), tirx.Var("sid", "int32"), 0, "cthread")
+    synth_body = tirx.AttrStmt(cthread_iv, "thread_extent", tirx.IntImm("int32", 2), tirx.Evaluate(0))
+    synth_fn = tirx.PrimFunc([], synth_body)
+    assert _detect_tilelang_aiv_split_factor(synth_fn, tirx=tirx) == 2
+
+    single_res = inspect_tilelang_primfunc(single_aiv_kernel)
+    assert single_res.ledger.analysis_mode == "readonly_envelope"
+    assert single_res.ledger.steady_state_ii is None
+    assert single_res.ledger.pipe_cycles.get("AIV1.PIPE_V", 0) == 0
+
+    split1 = inspect_tilelang_primfunc(mixed_dual_kernel, aiv_split_factor=1)
+    auto_split = inspect_tilelang_primfunc(mixed_dual_kernel)
+    assert auto_split.ledger.pipe_cycles.get("AIV1.PIPE_V", 0) > 0
+    assert auto_split.ledger.pipe_cycles["AIV0.PIPE_V"] == split1.ledger.pipe_cycles["AIV0.PIPE_V"] // 2
+    assert auto_split.ledger.pipe_cycles["AIV1.PIPE_MTE2"] > 0
+    assert (
+        auto_split.ledger.pipe_cycles["AIV0.PIPE_MTE2"]
+        == split1.ledger.pipe_cycles["AIV0.PIPE_MTE2"] // 2
+    )
+    assert auto_split.ledger.pipe_cycles["AIV1.PIPE_MTE3"] > 0
+    assert (
+        auto_split.ledger.pipe_cycles["AIV0.PIPE_MTE3"]
+        == split1.ledger.pipe_cycles["AIV0.PIPE_MTE3"] // 2
+    )
+
+    guarded_res = inspect_tilelang_primfunc(guarded_sid_kernel)
+    assert guarded_res.ledger.pipe_cycles.get("AIV0.PIPE_V", 0) == 4
+    assert guarded_res.ledger.pipe_cycles.get("AIV1.PIPE_V", 0) == 0
+
+
+def test_fp1_pipelined_mode_a_steady_state_ii_and_degraded_buffers() -> None:
+    """Verify Mode A Z3 II extraction on static T.Pipelined MixedKernel and dynamic fallback."""
+    import tilelang.ascend.language as T
+    from tilelang.utils.language import DataType as TLDataType
+    from tvm import tirx
+
+    @T.prim_func
+    def mixed_pipelined_gemm(
+        X: T.Tensor((128, 128), "bfloat16"),
+        W: T.Tensor((128, 128), "bfloat16"),
+        Y: T.Tensor((128, 128), "float32"),
+    ):
+        with T.MixedKernel(1, sids=2) as (bx, sid):
+            x_l1 = T.alloc_l1((128, 64), "bfloat16")
+            w_l1 = T.alloc_l1((128, 64), "bfloat16")
+            acc = T.alloc_l0c((128, 128), "float32")
+            out_ub = T.alloc_shared((64, 128), "float32")
+            for kt in T.Pipelined(2, num_stages=2):
+                T.copy(X[0:128, kt * 64 : (kt + 1) * 64], x_l1)
+                T.copy(W[0:128, kt * 64 : (kt + 1) * 64], w_l1)
+                T.gemm(x_l1, w_l1, acc, transpose_B=True, clear_accum=kt == 0)
+            T.dual_copy(acc, out_ub)
+            T.copy(out_ub, Y[sid * 64 : (sid + 1) * 64, 0:128])
+
+    res = inspect_tilelang_primfunc(mixed_pipelined_gemm)
+    assert res.ledger.analysis_mode == "exact_modulo_z3"
+    assert res.ledger.steady_state_ii is not None
+    assert res.ledger.steady_state_ii > 1
+
+    spaces = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
+    degraded_ii = _try_solve_tilelang_pipelined_ii(
+        mixed_pipelined_gemm,
+        spaces,
+        tirx=tirx,
+        DataTypeCls=TLDataType,
+        aiv_split_factor=2,
+        has_simtvf=False,
+        unreserved_ubuf=False,
+        degraded_names=("x_l1", "w_l1"),
+    )
+    assert degraded_ii is not None
+    assert degraded_ii >= res.ledger.steady_state_ii
+
+    @T.prim_func
+    def dynamic_pipelined(
+        X: T.Tensor((128, 128), "float32"),
+        Y: T.Tensor((128, 128), "float32"),
+        steps: T.Tensor((1,), "int32"),
+    ):
+        with T.Kernel(1):
+            ub = T.alloc_shared((32, 128), "float32")
+            for k in T.Pipelined(steps[0], num_stages=2):
+                T.copy(X[0:32, 0:128], ub)
+                T.copy(ub, Y[0:32, 0:128])
+
+    dyn_res = inspect_tilelang_primfunc(
+        dynamic_pipelined,
+        pass_configs={"tl.enable_auto_schedule": False},
+    )
+    assert dyn_res.ledger.analysis_mode == "readonly_envelope"
+    assert dyn_res.ledger.steady_state_ii is None
+
+
+def test_fp1_physical_ledger_from_dict_roundtrip() -> None:
+    """Verify ScopeWaterline and ObjectivePhysicalLedger lossless from_dict roundtrip."""
+    wl_ub = ScopeWaterline(
+        scope="UB",
+        capacity_bytes=245760,
+        explicit_bytes=32768,
+        implicit_bloat_bytes=4096,
+        peak_allocated_bytes=36864,
+        overflow_bytes=0,
+        explicit_buffers={"a_ub": 16384, "b_ub": 16384},
+        implicit_buffers={"a_ub_expansion": 4096},
+        degraded_single_buffers=("b_ub",),
+    )
+    wl_l1 = ScopeWaterline(
+        scope="L1",
+        capacity_bytes=1048576,
+        explicit_bytes=65536,
+        implicit_bloat_bytes=0,
+        peak_allocated_bytes=65536,
+        overflow_bytes=0,
+        explicit_buffers={"x_l1": 65536},
+        implicit_buffers={},
+    )
+    assert ScopeWaterline.from_dict(wl_ub.to_dict()) == wl_ub
+    assert ScopeWaterline.from_dict(wl_l1.to_dict()) == wl_l1
+
+    ledger = ObjectivePhysicalLedger(
+        analysis_mode="exact_modulo_z3",
+        is_legal=True,
+        steady_state_ii=8,
+        pipe_cycles={"AIC.PIPE_M": 8, "AIV0.PIPE_V": 4, "AIV1.PIPE_V": 4},
+        dominant_pipe="AIC.PIPE_M",
+        waterlines={"UB": wl_ub, "L1": wl_l1},
+        mte2_inflight_per_aiv=2,
+        unaligned_dma_padding_bytes=16,
+        opaque_dynamic_regions=("simt_vf",),
+    )
+    assert ObjectivePhysicalLedger.from_dict(ledger.to_dict()) == ledger
+    assert ObjectivePhysicalLedger.from_dict(json.loads(ledger.to_json())) == ledger
+
+    ro_ledger = ObjectivePhysicalLedger(
+        analysis_mode="readonly_envelope",
+        is_legal=False,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_MTE2": 12},
+        dominant_pipe="AIV0.PIPE_MTE2",
+        waterlines={"UB": wl_ub},
+        mte2_inflight_per_aiv=18,
+        unaligned_dma_padding_bytes=64,
+        opaque_dynamic_regions=("while_loop", "dynamic_for:k"),
+    )
+    assert ObjectivePhysicalLedger.from_dict(ro_ledger.to_dict()) == ro_ledger
