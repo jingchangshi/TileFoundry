@@ -10,6 +10,15 @@ import torch
 from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
 
 _KERNEL_CACHE: dict[tuple[object, ...], object] = {}
+_DISPATCH_CACHE: dict[tuple[object, ...], dict[str, object]] = {}
+
+
+def _callable_cache_key(fn: object) -> object:
+    try:
+        hash(fn)
+        return fn
+    except TypeError:
+        return id(fn)
 
 
 def _ascend_target_ctx():
@@ -1327,10 +1336,12 @@ def _get_kernel(
     pass_configs: dict[str, object] | None = None,
     compile_flags: list[str] | tuple[str, ...] | None = None,
     out_idx: list[int] | None = None,
+    extra_builder_kwargs: dict[str, object] | None = None,
 ):
     resolved_builder = builder_fn or _build_mla_prim_func
     splits = max(1, int(num_kv_splits))
     pc_dict = dict(pass_configs or {})
+    extra_bk = dict(extra_builder_kwargs or {})
     if compile_flags is None:
         flags_tuple = tuple(PURE_SIMDVF_UBUF_FLAGS) if schedule_mode == "tuned" else ()
     else:
@@ -1353,6 +1364,7 @@ def _get_kernel(
         schedule_mode,
         _normalize_pass_configs_key(pc_dict),
         flags_tuple,
+        _normalize_pass_configs_key(extra_bk),
     )
     compiled = _KERNEL_CACHE.get(key)
     if compiled is None:
@@ -1370,6 +1382,7 @@ def _get_kernel(
                     aligned_group_q,
                     splits,
                     schedule_mode,
+                    **extra_bk,
                 )
             else:
                 prog = resolved_builder(
@@ -1383,6 +1396,7 @@ def _get_kernel(
                     bm,
                     aligned_group_q,
                     schedule_mode,
+                    **extra_bk,
                 )
         flags_arg = list(flags_tuple) if flags_tuple else None
         compiled = tilelang.compile(
@@ -1475,19 +1489,38 @@ def mla(
     else:
         selector_fn, builder_fn = _select_mla_prefill_config, _build_mla_prefill_func
 
-    cfg = selector_fn(
-        b_dim=b_dim,
-        s_dim=s_dim,
-        s_kv=s_kv,
-        n_q=n_q,
-        n_kv=n_kv,
-        d_nope=d_nope,
-        d_rope=d_rope,
-        tl_dtype=tl_dtype,
-        input_layout=inputLayout,
-        is_causal=bool(is_causal),
-        schedule_mode=schedule_mode,
+    dispatch_key = (
+        _callable_cache_key(selector_fn),
+        b_dim,
+        s_dim,
+        s_kv,
+        n_q,
+        n_kv,
+        d_nope,
+        d_rope,
+        tl_dtype,
+        inputLayout,
+        bool(is_causal),
+        schedule_mode,
     )
+    cfg = _DISPATCH_CACHE.get(dispatch_key)
+    if cfg is None:
+        cfg = dict(
+            selector_fn(
+                b_dim=b_dim,
+                s_dim=s_dim,
+                s_kv=s_kv,
+                n_q=n_q,
+                n_kv=n_kv,
+                d_nope=d_nope,
+                d_rope=d_rope,
+                tl_dtype=tl_dtype,
+                input_layout=inputLayout,
+                is_causal=bool(is_causal),
+                schedule_mode=schedule_mode,
+            )
+        )
+        _DISPATCH_CACHE[dispatch_key] = cfg
     bm = int(cfg["bm"])
     aligned_group_q = bool(cfg["aligned_group_q"])
     num_kv_splits = (
@@ -1497,6 +1530,8 @@ def mla(
     )
     pass_configs = dict(cfg.get("pass_configs") or {})
     compile_flags = tuple(str(f) for f in (cfg.get("compile_flags") or ()))
+    raw_bk = cfg.get("builder_kwargs")
+    extra_builder_kwargs = dict(raw_bk) if isinstance(raw_bk, dict) else None
 
     q_rows_total = b_dim * s_dim * n_q
     q_n_flat = q_nope.contiguous().view(q_rows_total, d_nope)
@@ -1521,6 +1556,7 @@ def mla(
             num_kv_splits=1,
             pass_configs=pass_configs,
             compile_flags=compile_flags,
+            extra_builder_kwargs=extra_builder_kwargs,
         )
         out_flat = kernel(q_n_flat, q_r_flat, k_n_contig, k_r_contig, v_contig, scale)
     else:
@@ -1549,6 +1585,7 @@ def mla(
             num_kv_splits=num_kv_splits,
             pass_configs=pass_configs,
             compile_flags=compile_flags,
+            extra_builder_kwargs=extra_builder_kwargs,
         )
         stage1_kernel(
             q_n_flat,

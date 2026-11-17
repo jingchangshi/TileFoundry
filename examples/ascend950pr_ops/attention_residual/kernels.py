@@ -10,6 +10,15 @@ import torch
 from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
 
 _KERNEL_CACHE: dict[tuple[object, ...], object] = {}
+_DISPATCH_CACHE: dict[tuple[object, ...], dict[str, object]] = {}
+
+
+def _callable_cache_key(fn: object) -> object:
+    try:
+        hash(fn)
+        return fn
+    except TypeError:
+        return id(fn)
 
 
 def _ascend_target_ctx():
@@ -486,9 +495,11 @@ def _get_kernel(
     builder_fn=None,
     pass_configs: dict[str, object] | None = None,
     compile_flags: list[str] | tuple[str, ...] | None = None,
+    extra_builder_kwargs: dict[str, object] | None = None,
 ):
     resolved_builder = builder_fn or _build_attention_residual_prim_func
     pc_dict = dict(pass_configs or {})
+    extra_bk = dict(extra_builder_kwargs or {})
     if compile_flags is None:
         flags_tuple = tuple(PURE_SIMDVF_UBUF_FLAGS) if schedule_mode == "tuned" else ()
     else:
@@ -502,11 +513,19 @@ def _get_kernel(
         schedule_mode,
         _normalize_pass_configs_key(pc_dict),
         flags_tuple,
+        _normalize_pass_configs_key(extra_bk),
     )
     compiled = _KERNEL_CACHE.get(key)
     if compiled is None:
         with _ascend_target_ctx():
-            prog = resolved_builder(n_depth, d_dim, tl_dtype, tile_m, schedule_mode)
+            prog = resolved_builder(
+                n_depth,
+                d_dim,
+                tl_dtype,
+                tile_m,
+                schedule_mode,
+                **extra_bk,
+            )
         flags_arg = list(flags_tuple) if flags_tuple else None
         compiled = tilelang.compile(
             prog,
@@ -550,10 +569,23 @@ def attention_residual(
     else:
         selector_fn, builder_fn = _select_ar_aligned_config, _build_ar_aligned_func
 
-    cfg = selector_fn(n_depth, d_dim, tl_dtype, schedule_mode, m_rows=m_rows)
+    dispatch_key = (
+        _callable_cache_key(selector_fn),
+        n_depth,
+        d_dim,
+        tl_dtype,
+        schedule_mode,
+        m_rows,
+    )
+    cfg = _DISPATCH_CACHE.get(dispatch_key)
+    if cfg is None:
+        cfg = dict(selector_fn(n_depth, d_dim, tl_dtype, schedule_mode, m_rows=m_rows))
+        _DISPATCH_CACHE[dispatch_key] = cfg
     tile_m = int(cfg["tile_m"])
     pass_configs = dict(cfg.get("pass_configs") or {})
     compile_flags = tuple(str(f) for f in (cfg.get("compile_flags") or ()))
+    raw_bk = cfg.get("builder_kwargs")
+    extra_builder_kwargs = dict(raw_bk) if isinstance(raw_bk, dict) else None
     kernel = _get_kernel(
         n_depth,
         d_dim,
@@ -563,6 +595,7 @@ def attention_residual(
         builder_fn=builder_fn,
         pass_configs=pass_configs,
         compile_flags=compile_flags,
+        extra_builder_kwargs=extra_builder_kwargs,
     )
     y_flat = kernel(v_flat, x_flat, w_flat, g_flat, float(alpha), float(epsilon))
     return y_flat.view(b_dim, t_dim, d_dim)

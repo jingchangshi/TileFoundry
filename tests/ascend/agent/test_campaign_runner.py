@@ -2355,3 +2355,145 @@ def test_is_transient_blocked_env_retries_dependency_flake_not_device_fail():
     assert _is_transient_blocked_env(proc_fail, real_device_fail) is False
 
 
+def test_up3_domain_envelope_prompt_and_host_dispatch_cache(tmp_path: Path, monkeypatch) -> None:
+    """Verify InputDomainEnvelope prompts, builder_kwargs unpacking, and _DISPATCH_CACHE."""
+    import torch
+    from examples.ascend950pr_ops.attention_residual import kernels as ar_kernels
+    from examples.ascend950pr_ops.mla import kernels as mla_kernels
+    from tilefoundry_ascend.agent import (
+        BayesianRuleTracker,
+        CandidateSurrogateResult,
+        PerfTargetCampaignRunner,
+    )
+    from tilefoundry_ascend.agent.campaign import (
+        DEFAULT_REGIME_SPECS,
+        get_input_domain_envelope,
+        resolve_regime_config,
+    )
+    from tilefoundry_ascend.agent.campaign.campaign_runner import _FORBIDDEN_SLICE_SYMBOLS
+
+    ar_env = get_input_domain_envelope("attention_residual")
+    mla_env = get_input_domain_envelope("mla")
+    assert ar_env is not None and mla_env is not None
+    assert "builder_kwargs" in ar_env.format_prompt_block()
+    assert "builder_kwargs" in mla_env.format_prompt_block()
+    assert "_DISPATCH_CACHE" in _FORBIDDEN_SLICE_SYMBOLS
+
+    dummy_dsl = (
+        "def _select_demo_config(n_depth=8):\n"
+        "    return {'tile_m': 16, 'builder_kwargs': {'omit_max_shift': True}}\n\n"
+        "def _build_demo(tile_m=8, omit_max_shift=False):\n"
+        "    return (int(tile_m), bool(omit_max_shift))\n"
+    )
+    spec = DEFAULT_REGIME_SPECS["attention_residual"][0]
+    from dataclasses import replace
+
+    demo_spec = replace(
+        spec,
+        config_selector_fn="_select_demo_config",
+        builder_candidates=("_build_demo",),
+        editable_symbols=("_select_demo_config", "_build_demo"),
+    )
+    resolved = resolve_regime_config(dummy_dsl, demo_spec, dims={"N": 8})
+    assert resolved.builder_kwargs.get("omit_max_shift") is True
+
+    class _DummyRunner:
+        _enable_track_router = False
+        _format_msprof_section = staticmethod(lambda _r: "")
+        _slice_contract_instruction = staticmethod(lambda fn, _s: fn)
+
+        def __init__(self, op_name: str) -> None:
+            self._config = type("_Cfg", (), {"operator": op_name})()
+
+    runner = _DummyRunner("attention_residual")
+    tracker = BayesianRuleTracker.from_seed_yaml()
+    sample_rule = tracker.active_rules()[0]
+    dummy_res = CandidateSurrogateResult(
+        candidate_id="cand_0",
+        operator_name="attention_residual",
+        all_passed=True,
+        avg_speedup=1.0,
+        min_case_speedup=1.0,
+        avg_roofline_eta=0.5,
+        surrogate_score=0.5,
+    )
+    exp_req = PerfTargetCampaignRunner._build_exploit_regime_request(
+        runner,
+        snippet_source="def _select_ar_aligned_config():\n    return {}\n",
+        func_name="_select_ar_aligned_config",
+        regime_spec=spec,
+        rule=sample_rule,
+        best_result=dummy_res,
+    )
+    crt_req = PerfTargetCampaignRunner._build_creative_regime_request(
+        runner,
+        snippet_source="def _select_ar_aligned_config():\n    return {}\n",
+        func_name="_select_ar_aligned_config",
+        regime_spec=spec,
+        best_result=dummy_res,
+        effort="high",
+    )
+    for req in (exp_req, crt_req):
+        assert "### INPUT DOMAIN & FAST-MATH ENVELOPE (attention_residual)" in req.user_prompt
+        assert "builder_kwargs" in req.user_prompt
+    for rule in tracker.active_rules():
+        assert rule.rule_id not in crt_req.system_prompt + "\n" + crt_req.user_prompt
+
+    ar_calls = {"sel": 0, "bk": None}
+
+    def _fake_ar_sel(n_depth, d_dim, tl_dtype, schedule_mode, m_rows):
+        ar_calls["sel"] += 1
+        return {
+            "tile_m": 16,
+            "pass_configs": {},
+            "compile_flags": (),
+            "builder_kwargs": {"omit_max_shift": True},
+        }
+
+    def _fake_ar_get_kernel(*_args, extra_builder_kwargs=None, **_kwargs):
+        ar_calls["bk"] = extra_builder_kwargs
+        return lambda v_f, x_f, _w, _g, _a, _e: torch.zeros_like(x_f)
+
+    monkeypatch.setattr(ar_kernels, "_select_ar_aligned_config", _fake_ar_sel)
+    monkeypatch.setattr(ar_kernels, "_get_kernel", _fake_ar_get_kernel)
+    ar_kernels._DISPATCH_CACHE.clear()
+    v_stack = torch.zeros((4, 2, 16, 64), dtype=torch.float16)
+    x_in = torch.zeros((2, 16, 64), dtype=torch.float16)
+    w_in = torch.zeros((64,), dtype=torch.float16)
+    g_in = torch.ones((64,), dtype=torch.float16)
+    ar_kernels.attention_residual(v_stack, x_in, w_in, g_in, 1.0)
+    ar_kernels.attention_residual(v_stack, x_in, w_in, g_in, 1.0)
+    assert ar_calls["sel"] == 1
+    assert ar_calls["bk"] == {"omit_max_shift": True}
+
+    mla_calls = {"sel": 0, "bk": None}
+
+    def _fake_mla_sel(**_kwargs):
+        mla_calls["sel"] += 1
+        return {
+            "bm": 64,
+            "aligned_group_q": True,
+            "num_kv_splits": 1,
+            "pass_configs": {},
+            "compile_flags": (),
+            "builder_kwargs": {"fast_exp2": True},
+        }
+
+    def _fake_mla_get_kernel(*_args, extra_builder_kwargs=None, **_kwargs):
+        mla_calls["bk"] = extra_builder_kwargs
+        return lambda qn, _qr, _kn, _kr, _v, _s: torch.zeros_like(qn)
+
+    monkeypatch.setattr(mla_kernels, "_select_mla_prefill_config", _fake_mla_sel)
+    monkeypatch.setattr(mla_kernels, "_get_kernel", _fake_mla_get_kernel)
+    mla_kernels._DISPATCH_CACHE.clear()
+    qn = torch.zeros((1, 8, 4, 128), dtype=torch.float16)
+    qr = torch.zeros((1, 8, 4, 64), dtype=torch.float16)
+    kn = torch.zeros((1, 8, 1, 128), dtype=torch.float16)
+    kr = torch.zeros((1, 8, 1, 64), dtype=torch.float16)
+    vv = torch.zeros((1, 8, 1, 128), dtype=torch.float16)
+    mla_kernels.mla(qn, qr, kn, kr, vv)
+    mla_kernels.mla(qn, qr, kn, kr, vv)
+    assert mla_calls["sel"] == 1
+    assert mla_calls["bk"] == {"fast_exp2": True}
+
+

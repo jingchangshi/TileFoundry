@@ -812,12 +812,96 @@ def build_anchor_var_bindings(
     return out
 
 
+@dataclass(frozen=True)
+class InputDomainEnvelope:
+    """Operator input domain contract, safe fast-math notes, and constexpr hints."""
+
+    operator: str
+    tensor_distributions: tuple[str, ...]
+    algebraic_invariants: tuple[str, ...]
+    safe_fast_math_notes: tuple[str, ...]
+    constexpr_specialization_hints: tuple[str, ...]
+
+    def format_prompt_block(self) -> str:
+        """Render domain assumptions and safe fast-math contract for prompt injection."""
+        lines = [f"### INPUT DOMAIN & FAST-MATH ENVELOPE ({self.operator})"]
+        if self.tensor_distributions:
+            lines.append("Tensor Distributions:")
+            lines.extend(f"- {item}" for item in self.tensor_distributions)
+        if self.algebraic_invariants:
+            lines.append("Algebraic Invariants:")
+            lines.extend(f"- {item}" for item in self.algebraic_invariants)
+        if self.safe_fast_math_notes:
+            lines.append("Safe Fast-Math Transformations:")
+            lines.extend(f"- {item}" for item in self.safe_fast_math_notes)
+        if self.constexpr_specialization_hints:
+            lines.append("Constexpr Builder Specialization:")
+            lines.extend(f"- {item}" for item in self.constexpr_specialization_hints)
+        return "\n".join(lines)
+
+
+INPUT_DOMAIN_ENVELOPES: dict[str, InputDomainEnvelope] = {
+    "attention_residual": InputDomainEnvelope(
+        operator="attention_residual",
+        tensor_distributions=(
+            "v_stack and x are fp16/bf16 bounded normal tensors (~randn).",
+            "w is typically zero-initialized or small bounded normal, and gamma is near unit scale.",
+        ),
+        algebraic_invariants=(
+            "RMSNorm(V) normalizes across D with epsilon=1e-6 before depth scoring.",
+            "Normalized dot-product logits in fp32 stay tightly bounded around zero.",
+        ),
+        safe_fast_math_notes=(
+            (
+                "Unshifted exp(score) weights and single-pass vfma accumulation without online "
+                "max-shift rescaling stay finite and within rtol=1e-2, atol=1e-2 on normalized inputs."
+            ),
+            "Keep reductions and exponential weights in fp32 before casting final outputs.",
+        ),
+        constexpr_specialization_hints=(
+            (
+                "Return optional 'builder_kwargs': {...} from _select_*_config() to pass static "
+                "compile-time switches (for example unroll, fission, or fast-exp mode) to builders."
+            ),
+        ),
+    ),
+    "mla": InputDomainEnvelope(
+        operator="mla",
+        tensor_distributions=(
+            "q_nope, q_rope, k_nope, k_rope, and v are bounded fp16/bf16 normal tensors (~randn).",
+            "scale = 1 / sqrt(d_nope + d_rope) bounds QK^T magnitudes across heads.",
+        ),
+        algebraic_invariants=(
+            "Causal masking zeroes upper-triangular future KV positions when is_causal=True.",
+            "Group query ratio g_ratio = n_q // n_kv shares K/V heads per head group.",
+        ),
+        safe_fast_math_notes=(
+            "Retain fp32 online max-shift softmax stabilization across long KV sequence blocks.",
+            "Scale folding and exp2(x * log2(e)) approximations are legal within rtol=1e-2, atol=1e-2.",
+        ),
+        constexpr_specialization_hints=(
+            (
+                "Return optional 'builder_kwargs': {...} from _select_*_config() to specialize "
+                "static head counts, stage splits, or fast-math flags as compile-time constants."
+            ),
+        ),
+    ),
+}
+
+
+def get_input_domain_envelope(operator: str) -> InputDomainEnvelope | None:
+    """Return InputDomainEnvelope for *operator*, or None if unregistered."""
+    return INPUT_DOMAIN_ENVELOPES.get(str(operator).strip().lower())
+
+
 __all__ = [
     "ATTENTION_RESIDUAL_ANCHORS",
     "AnchorCaseSpec",
     "DEFAULT_ANCHORS",
     "DEFAULT_PERF_TARGETS",
     "DEFAULT_REGIME_SPECS",
+    "INPUT_DOMAIN_ENVELOPES",
+    "InputDomainEnvelope",
     "MLA_ANCHORS",
     "OPERATOR_METADATA",
     "PerfTargetSpec",
@@ -830,6 +914,7 @@ __all__ = [
     "get_default_anchors",
     "get_default_perf_target",
     "get_default_regime_specs",
+    "get_input_domain_envelope",
     "get_operator_entrypoint",
     "get_operator_module_relpath",
     "get_operator_task",

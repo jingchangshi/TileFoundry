@@ -157,7 +157,11 @@ def _split_selector_output(
             cf.append(flag)
 
     for k, v in sel_out.items():
-        if k not in ("pass_configs", "compile_flags"):
+        if k not in ("pass_configs", "compile_flags", "builder_kwargs"):
+            builder_overrides[str(k)] = v
+    raw_bk = sel_out.get("builder_kwargs")
+    if isinstance(raw_bk, Mapping):
+        for k, v in raw_bk.items():
             builder_overrides[str(k)] = v
     return builder_overrides, pc, cf
 

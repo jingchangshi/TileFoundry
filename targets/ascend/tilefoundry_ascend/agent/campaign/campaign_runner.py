@@ -30,6 +30,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     get_default_anchors,
     get_default_perf_target,
     get_default_regime_specs,
+    get_input_domain_envelope,
     get_operator_module_relpath,
     lookup_case_dims,
     resolve_regime_for_case,
@@ -254,6 +255,7 @@ _FORBIDDEN_SLICE_SYMBOLS: frozenset[str] = frozenset(
         "_get_combine_kernel",
         "_ascend_target_ctx",
         "_KERNEL_CACHE",
+        "_DISPATCH_CACHE",
     }
 )
 
@@ -369,7 +371,11 @@ def resolve_regime_config(
                     if fl not in compile_flags:
                         compile_flags.append(fl)
                 for k, v in sel_out.items():
-                    if k not in ("pass_configs", "compile_flags"):
+                    if k not in ("pass_configs", "compile_flags", "builder_kwargs"):
+                        context[str(k)] = v
+                raw_bk = sel_out.get("builder_kwargs")
+                if isinstance(raw_bk, Mapping):
+                    for k, v in raw_bk.items():
                         context[str(k)] = v
 
         builder_name = ""
@@ -598,7 +604,8 @@ def _extract_regime_abi_context(module_source: str, regime_spec: RegimeTargetSpe
         "Any custom @T.prim_func returned for this slice MUST keep the exact tensor/scalar "
         "parameter order, ranks, and dtypes above expected by _get_kernel (do NOT substitute "
         "the HIR forward(...) parameter list, and do NOT import tilelang.language as T or use "
-        "T.Scope).\n\n"
+        "T.Scope). _select_*_config() may return optional 'builder_kwargs': {...} forwarded to "
+        "custom builders for compile-time constexpr specialization.\n\n"
     )
 
 
@@ -1284,6 +1291,12 @@ class PerfTargetCampaignRunner:
         else:
             nav_section = ""
         msprof_section = self._format_msprof_section(parent_residual)
+        domain_env = get_input_domain_envelope(
+            getattr(getattr(self, "_config", None), "operator", "")
+        )
+        domain_section = (
+            f"{domain_env.format_prompt_block()}\n\n" if domain_env is not None else ""
+        )
         abi_section = (
             _extract_regime_abi_context(incumbent_source, regime_spec)
             if incumbent_source
@@ -1299,6 +1312,7 @@ class PerfTargetCampaignRunner:
             f"Transform Template:\n{rule.transform_template.strip()}\n"
             f"Expected Postcondition: {rule.expected_postcondition}\n\n"
             f"{msprof_section}"
+            f"{domain_section}"
             f"### SURROGATE ANCHOR TELEMETRY\n"
             f"{_format_anchor_telemetry(best_result, regime_spec.regime_tag)}\n\n"
             f"{abi_section}"
@@ -1370,6 +1384,12 @@ class PerfTargetCampaignRunner:
             else ""
         )
         msprof_section = self._format_msprof_section(parent_residual)
+        domain_env = get_input_domain_envelope(
+            getattr(getattr(self, "_config", None), "operator", "")
+        )
+        domain_section = (
+            f"{domain_env.format_prompt_block()}\n\n" if domain_env is not None else ""
+        )
         abi_section = (
             _extract_regime_abi_context(incumbent_source, regime_spec)
             if incumbent_source
@@ -1383,6 +1403,7 @@ class PerfTargetCampaignRunner:
             f"{neg_section}"
             f"{prescreen_section}"
             f"{msprof_section}"
+            f"{domain_section}"
             f"### SURROGATE ANCHOR TELEMETRY\n"
             f"{_format_anchor_telemetry(best_result, regime_spec.regime_tag)}\n\n"
             f"{abi_section}"

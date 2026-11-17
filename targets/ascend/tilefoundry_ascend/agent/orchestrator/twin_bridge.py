@@ -209,15 +209,44 @@ def _synthesize_seeded_tensor(
     generator: torch.Generator,
     *,
     test_dims: Mapping[str, int] | None,
+    param_name: str = "",
+    domain_profile: str = "contract",
 ) -> torch.Tensor:
-    """Create a deterministic CPU tensor matching *ttype* shape and dtype."""
+    """Create a deterministic CPU tensor matching *ttype* shape, dtype, and profile."""
     shape = _concrete_shape(ttype, test_dims)
     target_dtype = to_torch_dtype(ttype.dtype)
     if target_dtype.is_floating_point:
-        return torch.randn(shape, generator=generator, dtype=torch.float32).to(target_dtype)
+        norm_name = str(param_name).strip().lower()
+        if domain_profile == "contract" and norm_name in ("w", "weight_zero", "bias_zero"):
+            return torch.zeros(shape, dtype=target_dtype)
+        scale = 0.5 if domain_profile == "contract" else 1.0
+        vals = torch.randn(shape, generator=generator, dtype=torch.float32) * scale
+        return vals.to(target_dtype)
     if target_dtype == torch.bool:
         return torch.randint(0, 2, shape, generator=generator, dtype=torch.int64).to(target_dtype)
     return torch.randint(0, 4, shape, generator=generator, dtype=target_dtype)
+
+
+def _max_abs_diff(ref_out: object, cand_out: object) -> float:
+    if isinstance(ref_out, TensorValue):
+        ref_out = ref_out.data
+    elif isinstance(ref_out, TupleValue):
+        ref_out = tuple(
+            item.data if isinstance(item, TensorValue) else item for item in ref_out.elements
+        )
+    if isinstance(ref_out, tuple) and isinstance(cand_out, (tuple, list)):
+        if len(ref_out) != len(cand_out):
+            return float("inf")
+        return max(
+            (_max_abs_diff(r_i, c_i) for r_i, c_i in zip(ref_out, cand_out, strict=True)),
+            default=0.0,
+        )
+    if isinstance(ref_out, torch.Tensor) and isinstance(cand_out, torch.Tensor):
+        if tuple(ref_out.shape) != tuple(cand_out.shape):
+            return float("inf")
+        diff = (cand_out.detach().cpu().to(torch.float32) - ref_out.detach().cpu().to(torch.float32)).abs()
+        return float(diff.max().item()) if diff.numel() > 0 else 0.0
+    return float("inf")
 
 
 def _compare_outputs(
@@ -284,27 +313,34 @@ def verify_twin_cpu_reference(
     test_dims: Mapping[str, int] | None = None,
     rtol: float = 1e-2,
     atol: float = 1e-2,
+    dual_profile: bool = False,
 ) -> tuple[bool, str]:
     """Compare *candidate_runner* via a @runtime_module twin against CPU HIR evaluation."""
-    try:
-        with tempfile.TemporaryDirectory(prefix="tf_twin_ref_") as tmp_dir:
-            authored_mod = _load_authored_module(
-                authored_hir_source,
-                Path(tmp_dir),
-                test_dims=test_dims,
-            )
-        checked_mod, checked_fn = _check_module_dims(authored_mod, test_dims=test_dims)
+    def _eval_profile(
+        checked_mod,
+        checked_fn,
+        *,
+        profile: str,
+        seed: int,
+    ) -> tuple[bool, str, float]:
         generator = torch.Generator(device="cpu")
-        generator.manual_seed(0)
+        generator.manual_seed(seed)
         inputs: list[torch.Tensor] = []
         for param in checked_fn.params:
             if not isinstance(param.type, TensorType):
                 return (
                     False,
                     f"twin_unsupported_param_type: {param.name} has {type(param.type).__name__}",
+                    float("inf"),
                 )
             inputs.append(
-                _synthesize_seeded_tensor(param.type, generator, test_dims=test_dims)
+                _synthesize_seeded_tensor(
+                    param.type,
+                    generator,
+                    test_dims=test_dims,
+                    param_name=param.name,
+                    domain_profile=profile,
+                )
             )
         ref_out = evaluate(checked_fn, *inputs)
         twin_cls = build_tilelang_runtime_twin(
@@ -326,13 +362,35 @@ def verify_twin_cpu_reference(
             if not getattr(param, "is_const", False)
         ]
         cand_out = getattr(twin, checked_fn.name)(*activations)
+        ok, detail = _compare_outputs(ref_out, cand_out, rtol=rtol, atol=atol)
+        max_abs = _max_abs_diff(ref_out, cand_out)
+        return ok, detail, max_abs
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="tf_twin_ref_") as tmp_dir:
+            authored_mod = _load_authored_module(
+                authored_hir_source,
+                Path(tmp_dir),
+                test_dims=test_dims,
+            )
+        checked_mod, checked_fn = _check_module_dims(authored_mod, test_dims=test_dims)
+        ok, detail, _ = _eval_profile(checked_mod, checked_fn, profile="contract", seed=0)
+        if not ok:
+            return False, detail
+        stress_suffix = ""
+        if dual_profile:
+            stress_ok, _stress_detail, stress_err = _eval_profile(
+                checked_mod,
+                checked_fn,
+                profile="stress",
+                seed=17,
+            )
+            stress_tag = "ok" if stress_ok else "warn"
+            stress_suffix = f", stress_profile={stress_tag}(max_abs={stress_err:.3e})"
     except Exception as exc:
         return False, f"twin_execution_error: {type(exc).__name__}: {exc}"
 
-    ok, detail = _compare_outputs(ref_out, cand_out, rtol=rtol, atol=atol)
-    if not ok:
-        return False, detail
-    return True, f"twin_cpu_reference_passed: entry={checked_fn.name}, {detail}"
+    return True, f"twin_cpu_reference_passed: entry={checked_fn.name}, {detail}{stress_suffix}"
 
 
 _SCOPE_TOPOLOGY_MAP: dict[str, str] = {

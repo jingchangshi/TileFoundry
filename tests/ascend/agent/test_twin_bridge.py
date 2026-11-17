@@ -322,3 +322,45 @@ def test_format_hir_tir_navigation_section_gates_cross_scale_deltas() -> None:
     assert "ub_peak_bytes:" not in gated_nav
     assert "gm_roundtrip_bytes:" not in gated_nav
     assert "delta=" not in gated_nav
+
+
+def test_up3_twin_reference_contract_profile_and_dual_profile() -> None:
+    """Verify contract profile zero-inits w and dual_profile logs stress deltas."""
+    import torch
+
+    w_hir = (
+        "from __future__ import annotations\n"
+        "from tilefoundry.dsl import *\n"
+        "from tilefoundry_ascend import AscendTarget\n"
+        "TOPOS = (Topology('block', 1), Topology('aic', 1), "
+        "Topology('aiv', 2), Topology('lane', 64))\n"
+        "@module(entry='fwd', target=AscendTarget('ascend.950pr'), topologies=TOPOS)\n"
+        "class BiasMod:\n"
+        "    @func\n"
+        "    def fwd(x: Tensor[(4, 8), 'f32'], w: Tensor[(4, 8), 'f32']) -> Tensor[(4, 8), 'f32']:\n"
+        "        return tf.cast(x + w, dtype='f32')\n"
+    )
+    ok_fast, msg_fast = verify_twin_cpu_reference(
+        w_hir,
+        lambda x, _w: x,
+        dual_profile=True,
+    )
+    assert ok_fast is True, msg_fast
+    assert "stress_profile=warn" in msg_fast
+
+    seen_w: list[torch.Tensor] = []
+
+    def _capture_exact(x, w):
+        seen_w.append(w.detach().clone())
+        return x + w
+
+    ok_exact, msg_exact = verify_twin_cpu_reference(
+        w_hir,
+        _capture_exact,
+        dual_profile=True,
+    )
+    assert ok_exact is True, msg_exact
+    assert "stress_profile=ok" in msg_exact
+    assert len(seen_w) == 2
+    assert torch.all(seen_w[0] == 0)
+    assert torch.any(seen_w[1] != 0)
