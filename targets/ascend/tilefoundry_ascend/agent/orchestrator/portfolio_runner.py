@@ -465,8 +465,14 @@ def build_creative_request(
     )
 
 
-def build_syntax_repair_request(dsl_source: str, error_message: str) -> GenerationRequest:
+def build_syntax_repair_request(
+    dsl_source: str,
+    error_message: str,
+    *,
+    slice_hint: str = "",
+) -> GenerationRequest:
     """Build bounded syntax/compile repair request routed to Hydrogen Medium."""
+    hint_sentence = f" Authorized target: {slice_hint}." if slice_hint else ""
     sys_prompt = (
         "You are a TileLang Ascend compiler repair engineer. Fix the syntax, API, or "
         "memory-capacity failure reported below without altering tensor semantics. "
@@ -474,7 +480,7 @@ def build_syntax_repair_request(dsl_source: str, error_message: str) -> Generati
         "authorized slice functions or prefixed macros shown in BROKEN KERNEL DSL "
         "(omitted sibling functions automatically inherit their parent implementation); "
         "any new top-level helper MUST reuse the exact regime prefix shown in "
-        "BROKEN KERNEL DSL (do NOT add unprefixed or out-of-regime functions)."
+        f"BROKEN KERNEL DSL (do NOT add unprefixed or out-of-regime functions).{hint_sentence}"
     )
     user_prompt = (
         f"### VALID TILELANG ASCEND PRIMITIVES\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"

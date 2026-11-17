@@ -3314,6 +3314,85 @@ def test_l3_full_contract_via_agent_gates_timeout_and_target_module_env(
     assert "--device-id" in captured["cmd"] and "2" in captured["cmd"]
 
 
+def test_run_l0_l1_round_filter_isolates_syntax_repair_timeout(tmp_path: Path) -> None:
+    """Verify syntax_repair timeouts fail only the affected candidate without penalizing rules."""
+    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import run_l0_l1_round_filter
+
+    class _RepairTimeoutBackend:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def generate(self, req, *, effort_override=None):
+            _ = effort_override
+            self.calls.append(req)
+            if req.role == "syntax_repair":
+                raise TimeoutError("agy active_ceiling_timeout (240.0s) exceeded")
+            if req.role == "explore_creative":
+                return json.dumps(
+                    {
+                        "physical_hypothesis": "Timeout test",
+                        "target_local_metric": "sync_stall",
+                        "dsl_source": _SSBUF_REGIME_A,
+                    }
+                )
+            return _IMPROVED_REGIME_A
+
+    backend = _RepairTimeoutBackend()
+    checks = asyncio.run(
+        run_l0_l1_round_filter(
+            [("cand_ok", _IMPROVED_REGIME_A), ("cand_timeout", _SSBUF_REGIME_A)],
+            patch_fn=lambda snip: snip,
+            l0_checker=lambda snip: (
+                StageAResult(passed=True, prim_func=None, ledger=_make_stage_a(snip).ledger)
+                if "T.alloc_ss" not in snip
+                else StageAResult(passed=False, prim_func=None, ledger=None, error_message="bad_ssbuf")
+            ),
+            l1_compiler=lambda _src: StageBResult(passed=True),
+            repair_backend=backend,
+            max_syntax_repairs=1,
+            slice_hint="authorized slice symbols (_build_ar_small_decode_func)",
+        )
+    )
+    by_id = {c.candidate_id: c for c in checks}
+    assert by_id["cand_ok"].passed is True
+    assert by_id["cand_timeout"].passed is False
+    assert by_id["cand_timeout"].failed_tier == "llm_transport"
+    assert "TimeoutError" in by_id["cand_timeout"].error_message
+    assert any("Authorized target: authorized slice symbols" in c.system_prompt for c in backend.calls)
+
+    anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 2.0),)
+    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {"bm": 64, "bn": 64, "bk": 64}),)
+    t_path = tmp_path / "kernels_repair_timeout.py"
+    t_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    tracker = BayesianRuleTracker.from_seed_yaml()
+    before_trials = {rid: st.trials for rid, st in tracker.posteriors.items()}
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="attention_residual", max_rounds=1),
+        target_module_path=t_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=_RepairTimeoutBackend(),
+        tracker=tracker,
+        l0_checker=lambda src, _reg: (
+            _make_stage_a(src)
+            if "def _build_regime_a(tile_m=1)" in src
+            else StageAResult(passed=False, prim_func=None, ledger=None, error_message="bad")
+        ),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=lambda cands, aa: {
+            cid: _make_surrogate_result(cid, "attention_residual", tuple(aa), {2: 10.0})
+            for cid, _p in cands
+        },
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+    )
+    report = asyncio.run(runner.run())
+    assert report.total_rounds == 1
+    assert any(tier == "llm_transport" for _wid, tier, _msg in report.rounds[0].l0_l1_failed)
+    for rid, st in tracker.posteriors.items():
+        assert st.trials == before_trials[rid]
+
+
 
 
 

@@ -2052,6 +2052,7 @@ class PerfTargetCampaignRunner:
                 l1_compiler=lambda mod_src: self._run_l1(mod_src, regime_spec),
                 repair_backend=backend if self._config.max_syntax_repairs > 0 else None,
                 max_syntax_repairs=self._config.max_syntax_repairs,
+                slice_hint=self._slice_contract_instruction(func_name, regime_spec),
             )
 
         passed_checks = [chk for chk in l0_l1_checks if chk.passed]
@@ -2061,7 +2062,7 @@ class PerfTargetCampaignRunner:
                     (chk.candidate_id, chk.failed_tier or "l0_l1", chk.error_message[:200])
                 )
                 _wkind, rule, _hyp = meta_by_id[chk.candidate_id]
-                if rule is not None:
+                if rule is not None and chk.failed_tier != "llm_transport":
                     self._tracker.record_outcome(
                         rule.rule_id,
                         postcondition_realized=False,

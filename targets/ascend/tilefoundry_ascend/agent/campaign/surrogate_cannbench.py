@@ -562,8 +562,22 @@ async def run_l0_l1_round_filter(
     l1_compiler: Callable[[str], StageBResult],
     repair_backend: KernelLLMBackend | None = None,
     max_syntax_repairs: int = 1,
+    slice_hint: str = "",
 ) -> list[L0L1CandidateCheck]:
     """Filter candidate snippets through L0 static and concurrent L1 compile checks."""
+
+    async def _try_repair(cur_src: str, diag: str) -> tuple[str | None, str, bool]:
+        assert repair_backend is not None
+        req = build_syntax_repair_request(cur_src, diag, slice_hint=slice_hint)
+        try:
+            raw_reply = await repair_backend.generate(req)
+        except Exception as exc:
+            return None, f"{diag} | repair_transport: {type(exc).__name__}: {exc}", True
+        try:
+            repaired_src = extract_python_dsl(raw_reply)
+        except Exception as exc:
+            return None, f"{diag} | repair_parse: {type(exc).__name__}: {exc}", False
+        return repaired_src, "", False
 
     async def _check_one(cand_id: str, snippet: str) -> L0L1CandidateCheck:
         cur_snippet = snippet
@@ -583,8 +597,18 @@ async def run_l0_l1_round_filter(
                         repaired=repaired,
                         error_message=err,
                     )
-                req = build_syntax_repair_request(cur_snippet, err)
-                cur_snippet = extract_python_dsl(await repair_backend.generate(req))
+                next_snippet, rep_err, is_transport = await _try_repair(cur_snippet, err)
+                if next_snippet is None:
+                    return L0L1CandidateCheck(
+                        candidate_id=cand_id,
+                        passed=False,
+                        failed_tier="llm_transport" if is_transport else "stage_a",
+                        patched_module_source="",
+                        snippet_source=cur_snippet,
+                        repaired=repaired,
+                        error_message=rep_err,
+                    )
+                cur_snippet = next_snippet
                 repaired = True
                 continue
 
@@ -602,8 +626,19 @@ async def run_l0_l1_round_filter(
                         stage_a=stage_a,
                         error_message=err,
                     )
-                req = build_syntax_repair_request(cur_snippet, err)
-                cur_snippet = extract_python_dsl(await repair_backend.generate(req))
+                next_snippet, rep_err, is_transport = await _try_repair(cur_snippet, err)
+                if next_snippet is None:
+                    return L0L1CandidateCheck(
+                        candidate_id=cand_id,
+                        passed=False,
+                        failed_tier="llm_transport" if is_transport else "stage_a",
+                        patched_module_source=patched,
+                        snippet_source=cur_snippet,
+                        repaired=repaired,
+                        stage_a=stage_a,
+                        error_message=rep_err,
+                    )
+                cur_snippet = next_snippet
                 repaired = True
                 continue
 
@@ -622,8 +657,20 @@ async def run_l0_l1_round_filter(
                         stage_b=stage_b,
                         error_message=err,
                     )
-                req = build_syntax_repair_request(cur_snippet, err)
-                cur_snippet = extract_python_dsl(await repair_backend.generate(req))
+                next_snippet, rep_err, is_transport = await _try_repair(cur_snippet, err)
+                if next_snippet is None:
+                    return L0L1CandidateCheck(
+                        candidate_id=cand_id,
+                        passed=False,
+                        failed_tier="llm_transport" if is_transport else "stage_b",
+                        patched_module_source=patched,
+                        snippet_source=cur_snippet,
+                        repaired=repaired,
+                        stage_a=stage_a,
+                        stage_b=stage_b,
+                        error_message=rep_err,
+                    )
+                cur_snippet = next_snippet
                 repaired = True
                 continue
 
