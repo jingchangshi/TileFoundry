@@ -180,3 +180,67 @@ def test_e2e_evolution_offline_hir_to_converged_trajectories() -> None:
         payload = json.loads(traj.to_json())
         assert payload["best_candidate_id"].endswith("_creative")
         assert len(payload["rounds"]) == 2
+
+
+def test_fp3_hir_prerouting_and_baseline_features_propagation() -> None:
+    """Verify L0 HIR pre-routing injects track/blueprint and populates baseline features."""
+    from tilefoundry_ascend.agent.orchestrator import (
+        TwoLaneBeamSearch,
+        build_hir_seed_request,
+    )
+    from tilefoundry_ascend.agent.orchestrator.e2e_evolution import _inspect_hir_for_seed
+    from tilefoundry_ascend.ascend.target import AscendTarget
+
+    ar_hir = _AR_MODEL_PATH.read_text(encoding="utf-8")
+    route_summary, ar_blueprint = _inspect_hir_for_seed(ar_hir, AscendTarget("ascend.950pr"))
+    assert route_summary is not None and "developer" in route_summary
+    assert ar_blueprint is None
+
+    scheduled_mla_path = _MLA_MODEL_PATH.with_name("scheduled.py")
+    if scheduled_mla_path.is_file():
+        sched_src = scheduled_mla_path.read_text(encoding="utf-8")
+        sched_route, sched_blueprint = _inspect_hir_for_seed(
+            sched_src, AscendTarget("ascend.950pr")
+        )
+        assert sched_route is not None
+        assert sched_blueprint is not None and "ascend" in sched_blueprint
+
+    req = build_hir_seed_request(
+        ar_hir,
+        "make_kernel()",
+        recommended_track="developer",
+        recommended_primitives=("T.Pipelined", "T.SimdVF"),
+        tir_blueprint="def main():\n    pass",
+    )
+    assert "### L0 RECOMMENDED EXECUTION TRACK" in req.user_prompt
+    assert "Track: developer" in req.user_prompt
+    assert "### LOWERED ASCEND TIR BLUEPRINT" in req.user_prompt
+
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [_BASELINE_DSL, _RULE_IMPROVED_DSL, _RULE_IMPROVED_DSL],
+            "explore_creative": [_CREATIVE_SSBUF_JSON],
+        },
+        default_response=_RULE_IMPROVED_DSL,
+    )
+    funnel = GateFunnel(
+        compile_runner=lambda _dsl: StageBResult(passed=True),
+        device_runner=_surrogate_device_runner,
+    )
+    beam = TwoLaneBeamSearch(exploit_width=1, stepping_stone_width=1)
+    traj = asyncio.run(
+        run_e2e_evolution(
+            problem_name="ar_preroute",
+            hir_source=ar_hir,
+            shape_contract="make_kernel()",
+            backend=backend,
+            funnel=funnel,
+            beam=beam,
+            num_rounds=1,
+            k_rule_workers=2,
+        )
+    )
+    assert "### L0 RECOMMENDED EXECUTION TRACK" in backend.calls[0].user_prompt
+    assert traj.feature_vector["phi_2"] > 0.0
+    assert beam.exploit_beam[0].features is not None
+    assert ("track:developer",) in beam.exploited_signatures

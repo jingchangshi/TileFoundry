@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import hashlib
 import json
+from pathlib import Path
+import tempfile
 
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
@@ -29,6 +31,10 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     TwoLaneBeamSearch,
     compute_static_dynamic_residual,
     extract_structural_signature,
+)
+from tilefoundry_ascend.agent.router.capability_gate import (
+    extract_structural_features,
+    route_execution_track,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.target import AscendTarget
@@ -158,11 +164,49 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def _inspect_hir_for_seed(
+    hir_source: str,
+    target: AscendTarget | None = None,
+) -> tuple[str | None, str | None]:
+    """Run L0 HIR pre-routing and optional TIR blueprint lowering on CPU."""
+    try:
+        from tilefoundry.analysis import analyze, check_program
+        from tilefoundry.cli.source import load_authored_ir
+        from tilefoundry.inspection import as_script
+        from tilefoundry.schedule.finalize import finalize
+
+        resolved_target = target or AscendTarget("ascend.950pr")
+        with tempfile.TemporaryDirectory(prefix="tf_hir_seed_") as tmp_dir:
+            hir_path = Path(tmp_dir) / "authored_hir.py"
+            hir_path.write_text(hir_source, encoding="utf-8")
+            mod = load_authored_ir(str(hir_path))
+        entry_fn = mod.entry_function()
+        features = extract_structural_features(entry_fn, target=resolved_target)
+        route = route_execution_track(features)
+        prims = ", ".join(route.recommended_primitives)
+        route_summary = f"{route.track}: {prims}" if prims else route.track
+
+        tir_blueprint: str | None = None
+        try:
+            checked_mod, checked_fn = check_program(mod, entry_fn)
+            analyzed = analyze(checked_mod, checked_fn, analysis=("memory",))
+            lowered = finalize(analyzed, authored=entry_fn)
+            tir_blueprint = as_script(lowered.entry_function())
+        except Exception:
+            tir_blueprint = None
+        return route_summary, tir_blueprint
+    except Exception:
+        return None, None
+
+
 def build_hir_seed_request(
     hir_source: str,
     shape_contract: str,
     *,
     factory_name: str | None = None,
+    recommended_track: str | None = None,
+    recommended_primitives: Sequence[str] = (),
+    tir_blueprint: str | None = None,
 ) -> GenerationRequest:
     """Build initial Tier-0 TileLang synthesis request from mathematical HIR source."""
     target_factory = factory_name or "make_kernel"
@@ -173,8 +217,24 @@ def build_hir_seed_request(
         "Import 'import tilelang.ascend.language as T'. Do NOT include "
         "'from __future__ import annotations'. Output ONLY valid Python code."
     )
+    route_section = ""
+    if recommended_track:
+        prims_text = ", ".join(recommended_primitives) if recommended_primitives else "default"
+        route_section = (
+            f"### L0 RECOMMENDED EXECUTION TRACK\n"
+            f"Track: {recommended_track}\n"
+            f"Recommended Primitives: {prims_text}\n\n"
+        )
+    blueprint_section = ""
+    if tir_blueprint:
+        blueprint_section = (
+            f"### LOWERED ASCEND TIR BLUEPRINT\n"
+            f"```python\n{tir_blueprint[:4000]}\n```\n\n"
+        )
     user_prompt = (
         f"### SHAPE AND SIGNATURE CONTRACT\n{shape_contract.strip()}\n\n"
+        f"{route_section}"
+        f"{blueprint_section}"
         f"### MATHEMATICAL HIR SOURCE\n```python\n{hir_source.strip()}\n```\n"
     )
     return GenerationRequest(
@@ -194,12 +254,26 @@ async def synthesize_initial_dsl(
     factory_name: str | None = None,
     factory_kwargs: Mapping[str, object] | None = None,
     max_seed_repairs: int = 2,
+    target: AscendTarget | None = None,
 ) -> tuple[str, FunnelEvaluation]:
     """Synthesize and funnel-validate an initial @T.prim_func seed from HIR source."""
+    route_summary, tir_blueprint = _inspect_hir_for_seed(hir_source, target=target)
+    rec_track: str | None = None
+    rec_prims: tuple[str, ...] = ()
+    if route_summary:
+        if ":" in route_summary:
+            raw_track, raw_prims = route_summary.split(":", 1)
+            rec_track = raw_track.strip()
+            rec_prims = tuple(p.strip() for p in raw_prims.split(",") if p.strip())
+        else:
+            rec_track = route_summary.strip()
     req = build_hir_seed_request(
         hir_source,
         shape_contract,
         factory_name=factory_name,
+        recommended_track=rec_track,
+        recommended_primitives=rec_prims,
+        tir_blueprint=tir_blueprint,
     )
     raw = await backend.generate(req)
     dsl_source = extract_python_dsl(raw)
@@ -352,6 +426,7 @@ async def run_e2e_evolution(
             factory_name=factory_name,
             factory_kwargs=factory_kwargs,
             max_seed_repairs=max_seed_repairs,
+            target=target,
         )
 
     if not base_eval.passed or base_eval.stage_a is None or base_eval.stage_a.ledger is None:
@@ -386,6 +461,7 @@ async def run_e2e_evolution(
         structural_signature=extract_structural_signature(baseline_dsl, track=base_track),
         hypothesis="unscheduled_hir_baseline",
         parent_id=None,
+        features=stage_a.features,
     )
     active_beam.update([baseline_cand])
 
@@ -416,6 +492,7 @@ async def run_e2e_evolution(
         else:
             parent = baseline_cand
 
+        active_beam.mark_parent_selected(parent)
         prev_best_lat = best_so_far_lat
         report = await runner.run_round(
             parent,

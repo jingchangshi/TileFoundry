@@ -347,7 +347,7 @@ def test_campaign_patience_escalation_xhigh_stepping_stone_and_regime_rotation(
                 "dsl_source": _SSBUF_REGIME_A,
             }
         )
-        for _ in range(4)
+        for _ in range(8)
     ] + [
         json.dumps(
             {
@@ -356,7 +356,7 @@ def test_campaign_patience_escalation_xhigh_stepping_stone_and_regime_rotation(
                 "dsl_source": _IMPROVED_REGIME_B,
             }
         )
-        for _ in range(4)
+        for _ in range(8)
     ]
     backend = MockLLMBackend(
         responses={
@@ -410,10 +410,11 @@ def test_campaign_patience_escalation_xhigh_stepping_stone_and_regime_rotation(
     assert report.rounds[2].creative_effort == "xhigh"
 
     creative_calls = [c for c in backend.calls if c.role == "explore_creative"]
-    assert [c.effort for c in creative_calls[:4]] == ["high", "high", "xhigh", "xhigh"]
-    assert "T.alloc_ss" in creative_calls[2].user_prompt
+    assert [c.effort for c in creative_calls[:8]] == ["high"] * 4 + ["xhigh"] * 4
+    assert "T.alloc_ss" in creative_calls[4].user_prompt
     for call in creative_calls:
         joined = call.system_prompt + "\n" + call.user_prompt
+        assert "### NEGATIVE CONSTRAINTS (ALREADY EXPLORED BY PARALLEL WORKERS)" in joined
         for rule in tracker.active_rules():
             assert rule.rule_id not in joined
 
@@ -547,7 +548,7 @@ def test_campaign_atomic_checkpoint_and_exact_resume_plus_l4_catch(
                     }
                 )
             ]
-            * 3,
+            * 6,
         }
     )
     l4_calls = [0]
@@ -597,3 +598,113 @@ def test_campaign_atomic_checkpoint_and_exact_resume_plus_l4_catch(
     assert l4_calls[0] == 2
     assert [a.case_num for a in rep2.active_anchors] == [2, 5]
     assert rep2.l4_result is not None and rep2.l4_result.per_case_speedups[5] == 1.15
+
+
+def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
+    tmp_path: Path,
+) -> None:
+    """Verify --resume restores stepping_stone_beam, passes roofline_eta, and exempts 503."""
+    from tilefoundry_ascend.agent.orchestrator import TwoLaneBeamSearch
+
+    anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 4.0),)
+    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {"bm": 64, "bn": 64, "bk": 64}),)
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    ckpt_path = tmp_path / "ckpt_beam.json"
+
+    backend1 = MockLLMBackend(
+        responses={
+            "exploit_rule": [_IMPROVED_REGIME_A] * 2,
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Novel SSBUF handoff",
+                        "target_local_metric": "sync_stall",
+                        "dsl_source": _SSBUF_REGIME_A,
+                    }
+                )
+            ]
+            * 2,
+        }
+    )
+
+    def _l2_eval(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            lat = 15.0 if "T.alloc_ss" in src else 12.0
+            out[cid] = _make_surrogate_result(
+                cid, "attention_residual", tuple(active_anchors), {2: lat}
+            )
+        return out
+
+    beam1 = TwoLaneBeamSearch(exploit_width=1, stepping_stone_width=1)
+    runner1 = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=1,
+            stagnation_escalate_rounds=1,
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend1,
+        beam=beam1,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_eval,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        checkpoint_path=ckpt_path,
+    )
+    asyncio.run(runner1.run(resume=False))
+    assert any("T.alloc_ss" in c.structural_signature for c in beam1.stepping_stone_beam)
+    expected_gap = round(
+        beam1.exploit_beam[0].residual.predicted_bottleneck_util - 0.3333333333333333,
+        6,
+    )
+    assert abs(beam1.exploit_beam[0].residual.unexplained_gap_ratio - max(0.0, expected_gap)) < 1e-4
+
+    ckpt_payload = json.loads(ckpt_path.read_text(encoding="utf-8"))
+    assert "beam_state" in ckpt_payload
+    prior_trials = {rid: st.trials for rid, st in runner1._tracker.posteriors.items()}
+
+    class _FailingBackend:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def generate(self, req, *, effort_override=None):
+            self.calls.append(req)
+            raise RuntimeError("503 stream idle timeout")
+
+    fail_tracker = BayesianRuleTracker.from_seed_yaml()
+    fail_backend = _FailingBackend()
+    beam2 = TwoLaneBeamSearch(exploit_width=1, stepping_stone_width=1)
+    runner2 = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=2,
+            stagnation_escalate_rounds=1,
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=fail_backend,
+        tracker=fail_tracker,
+        beam=beam2,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_eval,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        checkpoint_path=ckpt_path,
+    )
+    asyncio.run(runner2.run(resume=True))
+    assert any("T.alloc_ss" in c.structural_signature for c in runner2._beam.stepping_stone_beam)
+    assert ("T.alloc_ss", "track:developer") in runner2._beam.exploited_signatures or (
+        "T.alloc_ss",
+    ) in runner2._beam.exploited_signatures
+    assert any("T.alloc_ss" in c.user_prompt for c in fail_backend.calls)
+    assert any("### TILE PRESCREEN GUIDANCE" in c.user_prompt for c in fail_backend.calls)
+    for rid, stats in fail_tracker.posteriors.items():
+        assert stats.trials == prior_trials[rid]

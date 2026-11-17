@@ -51,6 +51,11 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     extract_creative_payload,
     extract_python_dsl,
 )
+from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
+    CREATIVE_FOCUS_HINTS,
+    build_prescreen_summary_from_kwargs,
+    summarize_excluded_mechanisms,
+)
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate,
     TwoLaneBeamSearch,
@@ -533,6 +538,9 @@ class PerfTargetCampaignRunner:
         regime_spec: RegimeTargetSpec,
         best_result: CandidateSurrogateResult,
         effort: str,
+        excluded_mechanisms: Sequence[str] = (),
+        focus_hint: str = "",
+        prescreen_summary: str = "",
     ) -> GenerationRequest:
         sys_prompt = (
             "You are an Ascend 950PR (dav-3510) systems architect. Propose an architectural "
@@ -541,8 +549,27 @@ class PerfTargetCampaignRunner:
             "alignment, Split-KV parallelism). Preserve exact numerical semantics and function "
             "signature. Return JSON matching the schema."
         )
+        if excluded_mechanisms:
+            constraint_lines = "\n".join(f"- {item}" for item in excluded_mechanisms)
+        else:
+            constraint_lines = "- None recorded yet; explore any high-impact structural axis."
+        neg_section = (
+            "### NEGATIVE CONSTRAINTS (ALREADY EXPLORED BY PARALLEL WORKERS)\n"
+            f"{constraint_lines}\n"
+            "Propose a structurally orthogonal transformation that does NOT duplicate the "
+            "mechanisms listed above.\n\n"
+        )
+        focus_section = f"### ARCHITECTURAL FOCUS HINT\n{focus_hint}\n\n" if focus_hint else ""
+        prescreen_section = (
+            f"### TILE PRESCREEN GUIDANCE\n{prescreen_summary}\n\n"
+            if prescreen_summary
+            else ""
+        )
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
+            f"{focus_section}"
+            f"{neg_section}"
+            f"{prescreen_section}"
             f"### SURROGATE ANCHOR TELEMETRY\n"
             f"{_format_anchor_telemetry(best_result, regime_spec.regime_tag)}\n\n"
             f"### TARGET FUNCTION SNIPPET\n```python\n{snippet_source}\n```\n"
@@ -605,6 +632,7 @@ class PerfTargetCampaignRunner:
             "escalated_rounds": list(escalated_rounds),
             "admitted_rule_ids": list(admitted_rule_ids),
             "tracker_state": self._tracker.to_dict(),
+            "beam_state": self._beam.to_dict(),
             "stop_reason": stop_reason,
             "l4_result": l4_result.to_dict() if l4_result else None,
         }
@@ -648,6 +676,8 @@ class PerfTargetCampaignRunner:
                     self._tracker.load_posteriors_json(tmp_path)
                 finally:
                     tmp_path.unlink(missing_ok=True)
+        if isinstance(payload.get("beam_state"), Mapping):
+            self._beam = TwoLaneBeamSearch.from_dict(payload["beam_state"])
         return (
             incumbent_source,
             CandidateSurrogateResult.from_dict(payload["baseline_result"]),
@@ -693,6 +723,7 @@ class PerfTargetCampaignRunner:
             creative_effort = "xhigh"
             if self._beam.stepping_stone_beam:
                 stone = self._beam.stepping_stone_beam[0]
+                self._beam.mark_parent_selected(stone)
                 try:
                     patch_regime_into_module(incumbent_source, func_name, stone.dsl_source)
                     parent_snippet = stone.dsl_source
@@ -708,13 +739,6 @@ class PerfTargetCampaignRunner:
         ranked_rules = list(
             self._tracker.rank_applicable_rules(ctx, top_k=self._config.k_rule_workers)
         )
-        if len(ranked_rules) < self._config.k_rule_workers:
-            seen_ids = {r.rule_id for r in ranked_rules}
-            for rule in self._tracker.active_rules():
-                if rule.rule_id not in seen_ids:
-                    ranked_rules.append(rule)
-                    if len(ranked_rules) >= self._config.k_rule_workers:
-                        break
 
         worker_specs: list[tuple[str, str, AscendCausalRule | None, GenerationRequest]] = []
         for idx, rule in enumerate(ranked_rules[: self._config.k_rule_workers]):
@@ -732,36 +756,58 @@ class PerfTargetCampaignRunner:
                     ),
                 )
             )
-        worker_specs.append(
-            (
-                f"r{round_idx}_creative",
-                "creative_explore",
-                None,
-                self._build_creative_regime_request(
-                    snippet_source=parent_snippet,
-                    func_name=func_name,
-                    regime_spec=regime_spec,
-                    best_result=best_result,
-                    effort=creative_effort,
-                ),
-            )
+        excluded = summarize_excluded_mechanisms(
+            ranked_rules,
+            self._beam.exploited_signatures,
         )
+        prescreen_summary = build_prescreen_summary_from_kwargs(
+            regime_spec.sample_builder_kwargs
+        )
+        deficit = max(0, self._config.k_rule_workers - len(ranked_rules))
+        total_creative = 1 + deficit
+        for c_idx in range(total_creative):
+            wid = f"r{round_idx}_creative" if c_idx == 0 else f"r{round_idx}_creative_{c_idx}"
+            hint = (
+                CREATIVE_FOCUS_HINTS[c_idx % len(CREATIVE_FOCUS_HINTS)]
+                if total_creative > 1
+                else ""
+            )
+            worker_specs.append(
+                (
+                    wid,
+                    "creative_explore",
+                    None,
+                    self._build_creative_regime_request(
+                        snippet_source=parent_snippet,
+                        func_name=func_name,
+                        regime_spec=regime_spec,
+                        best_result=best_result,
+                        effort=creative_effort,
+                        excluded_mechanisms=excluded,
+                        focus_hint=hint,
+                        prescreen_summary=prescreen_summary,
+                    ),
+                )
+            )
 
         async def _call_worker(
             wid: str,
             wkind: str,
             rule: AscendCausalRule | None,
             req: GenerationRequest,
-        ) -> tuple[str, str, AscendCausalRule | None, str | None, str]:
+        ) -> tuple[str, str, AscendCausalRule | None, str | None, str, bool]:
             try:
                 raw = await backend.generate(req)
+            except Exception as exc:
+                return wid, wkind, rule, None, f"llm_transport:{type(exc).__name__}:{exc}", True
+            try:
                 if wkind == "creative_explore":
                     snippet = extract_creative_payload(raw)["dsl_source"]
                 else:
                     snippet = extract_python_dsl(raw)
-                return wid, wkind, rule, snippet, ""
+                return wid, wkind, rule, snippet, "", False
             except Exception as exc:
-                return wid, wkind, rule, None, f"llm_error:{type(exc).__name__}:{exc}"
+                return wid, wkind, rule, None, f"llm_parse:{type(exc).__name__}:{exc}", False
 
         worker_replies = await asyncio.gather(
             *(_call_worker(wid, wkind, rule, req) for wid, wkind, rule, req in worker_specs)
@@ -770,11 +816,12 @@ class PerfTargetCampaignRunner:
         raw_candidates: list[tuple[str, str]] = []
         failed_entries: list[tuple[str, str, str]] = []
         meta_by_id: dict[str, tuple[str, AscendCausalRule | None]] = {}
-        for wid, wkind, rule, snippet, err in worker_replies:
+        for wid, wkind, rule, snippet, err, is_transport_error in worker_replies:
             meta_by_id[wid] = (wkind, rule)
             if snippet is None:
-                failed_entries.append((wid, "llm_generate", err[:200]))
-                if rule is not None:
+                stage_tag = "llm_transport" if is_transport_error else "llm_generate"
+                failed_entries.append((wid, stage_tag, err[:200]))
+                if rule is not None and not is_transport_error:
                     self._tracker.record_outcome(rule.rule_id, postcondition_realized=False)
             else:
                 raw_candidates.append((wid, snippet))
@@ -841,7 +888,7 @@ class PerfTargetCampaignRunner:
                     ledger=ledger,
                     residual=compute_static_dynamic_residual(
                         ledger,
-                        {"dur_us": lat_us},
+                        {"dur_us": lat_us, "roofline_eta": res.avg_roofline_eta},
                     ),
                     latency_us=lat_us,
                     accuracy_passed=res.all_passed,
@@ -849,6 +896,7 @@ class PerfTargetCampaignRunner:
                         chk.snippet_source, track=track
                     ),
                     parent_id=f"round_{round_idx - 1}",
+                    features=chk.stage_a.features if chk.stage_a else None,
                 )
             )
             if rule is not None:

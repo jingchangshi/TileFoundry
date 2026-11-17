@@ -180,6 +180,7 @@ def test_portfolio_runner_k2_rule_plus_creative_repair_and_two_lane_beam() -> No
         residual=seed_residual,
         latency_us=40.0,
         accuracy_passed=True,
+        features=stage_a_seed.features,
     )
 
     broken_syntax = "def broken(:\n    pass"
@@ -460,3 +461,128 @@ def make_kernel(bm: int = 128, bn: int = 128, bk: int = 64, num_stages: int = 2)
             factory_name="make_kernel",
             candidate_kwargs_list=[{"bm": 512, "bn": 256, "bk": 64, "num_stages": 2}],
         )
+
+
+def test_fp3_unmatched_rules_not_padded_and_transport_error_exempt() -> None:
+    """Verify phi_2 matching, zero padding trials on unmatched rules, and transport exemption."""
+    stage_a_seed = run_stage_a_static(_SEED_DSL, factory_name="make_kernel")
+    assert stage_a_seed.passed and stage_a_seed.ledger is not None
+    seed_res = compute_static_dynamic_residual(stage_a_seed.ledger, {"dur_us": 40.0})
+    cube_parent = BeamCandidate(
+        candidate_id="cube_seed",
+        round_idx=0,
+        worker_kind="seed",
+        rule_id=None,
+        dsl_source=_SEED_DSL,
+        track="developer",
+        ledger=stage_a_seed.ledger,
+        residual=seed_res,
+        latency_us=40.0,
+        accuracy_passed=True,
+        features=stage_a_seed.features,
+    )
+
+    tracker = BayesianRuleTracker.from_seed_yaml()
+    funnel = GateFunnel(
+        compile_runner=lambda _dsl: StageBResult(passed=True),
+        device_runner=lambda _dsl, st_a: StageCResult(
+            passed=True,
+            accuracy_passed=True,
+            measured_latency_us=30.0,
+            residual=compute_static_dynamic_residual(st_a.ledger, {"dur_us": 30.0}),
+            telemetry={"dur_us": 30.0},
+        ),
+    )
+    runner = PortfolioRunner(
+        backend=MockLLMBackend(),
+        funnel=funnel,
+        tracker=tracker,
+        k_rule_workers=2,
+    )
+    specs_cube = runner.plan_workers(
+        cube_parent,
+        1,
+        factory_kwargs={"bm": 64, "bn": 64, "bk": 64},
+    )
+    matched_ids = [s.rule.rule_id for s in specs_cube if s.rule is not None]
+    assert any(rid in matched_ids for rid in (
+        "R02_ONCHIP_L0C_TO_UB_DIRECT",
+        "R03_ACCUM_SPAN_FIXPIPE_RELIEF",
+        "R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION",
+    ))
+    creative_specs = [s for s in specs_cube if s.worker_kind == "creative_explore"]
+    assert len(creative_specs) == 1
+    creative_text = (
+        creative_specs[0].request.system_prompt + "\n" + creative_specs[0].request.user_prompt
+    )
+    assert "### NEGATIVE CONSTRAINTS (ALREADY EXPLORED BY PARALLEL WORKERS)" in creative_text
+    assert "### TILE PRESCREEN GUIDANCE" in creative_text
+    for rule in tracker.active_rules():
+        assert rule.rule_id not in creative_text
+
+    sparse_ledger = _make_legal_ledger(ii=None, pipe_cycles={"AIV0.PIPE_S": 1})
+    sparse_parent = BeamCandidate(
+        candidate_id="sparse_seed",
+        round_idx=0,
+        worker_kind="seed",
+        rule_id=None,
+        dsl_source=_SEED_DSL,
+        track="developer",
+        ledger=sparse_ledger,
+        residual=compute_static_dynamic_residual(sparse_ledger, {"dur_us": 20.0}),
+        latency_us=20.0,
+        accuracy_passed=True,
+        features=StructuralFeatures(
+            phi_1_static_affine_bounds=True,
+            phi_2_cube_to_vector_ratio=0.0,
+            phi_3_quant_granularity="none",
+            phi_4_indirect_sparse_gather=False,
+            phi_5_cross_iter_recurrence="none",
+            phi_6_dynamic_cross_core_handoff=False,
+            phi_7_inner_contiguous_bytes=128,
+            phi_8_persistent_wave_occupancy=0.0,
+        ),
+    )
+    creative_json = json.dumps(
+        {
+            "physical_hypothesis": "Explore vector fusion",
+            "target_local_metric": "aiv_vec",
+            "dsl_source": _CREATIVE_SSBUF_DSL,
+        }
+    )
+    sparse_backend = MockLLMBackend(
+        responses={"explore_creative": [creative_json, creative_json, creative_json]}
+    )
+    sparse_runner = PortfolioRunner(
+        backend=sparse_backend,
+        funnel=funnel,
+        tracker=tracker,
+        k_rule_workers=2,
+    )
+    sparse_report = asyncio.run(
+        sparse_runner.run_round(sparse_parent, round_idx=1, factory_name="make_kernel")
+    )
+    assert len(sparse_report.spawned_workers) == 3
+    assert all(w.worker_kind == "creative_explore" for w in sparse_report.spawned_workers)
+    assert sparse_report.pruned_rule_ids == ()
+    for rid, stats in tracker.posteriors.items():
+        assert stats.trials == 0, f"unmatched rule {rid} received unexpected trial"
+
+    class _FailingBackend:
+        async def generate(self, req, *, effort_override=None):
+            raise RuntimeError("503 upstream capacity timeout")
+
+    fail_tracker = BayesianRuleTracker.from_seed_yaml()
+    fail_runner = PortfolioRunner(
+        backend=_FailingBackend(),
+        funnel=funnel,
+        tracker=fail_tracker,
+        k_rule_workers=2,
+    )
+    fail_report = asyncio.run(
+        fail_runner.run_round(cube_parent, round_idx=1, factory_name="make_kernel")
+    )
+    assert len(fail_report.failed_candidates) == 3
+    assert all(stage == "llm_transport" for _wid, stage, _err in fail_report.failed_candidates)
+    for rid, stats in fail_tracker.posteriors.items():
+        assert stats.trials == 0, f"transport error penalized rule {rid}"
