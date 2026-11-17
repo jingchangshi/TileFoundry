@@ -363,6 +363,7 @@ def build_creative_request(
     prescreen_summary: str = "",
     navigation_context: str = "",
     nav_packet: HirTirNavigationPacket | None = None,
+    effort: str | None = None,
 ) -> GenerationRequest:
     """Build rule-blind creative search request routed to Hydrogen High without rules."""
     sys_prompt = (
@@ -409,6 +410,7 @@ def build_creative_request(
         system_prompt=sys_prompt,
         user_prompt=user_prompt,
         json_schema=CREATIVE_RESPONSE_SCHEMA,
+        effort=effort,
     )
 
 
@@ -471,6 +473,7 @@ class PortfolioRunner:
         navigation_context: str = "",
         ideal_roofline_us: float = 0.0,
         nav_packet: HirTirNavigationPacket | None = None,
+        creative_effort: str = "high",
     ) -> tuple[WorkerSpec, ...]:
         """Select matching causal rules and fill remaining slots with creative explorers."""
         ctx = build_predicate_context(
@@ -536,6 +539,7 @@ class PortfolioRunner:
                         prescreen_summary=prescreen_summary,
                         navigation_context=navigation_context,
                         nav_packet=nav_packet,
+                        effort=creative_effort,
                     ),
                     parent_candidate=parent,
                     ideal_roofline_us=eff_roofline,
@@ -705,6 +709,7 @@ class PortfolioRunner:
         navigation_context: str = "",
         ideal_roofline_us: float = 0.0,
         nav_packet: HirTirNavigationPacket | None = None,
+        creative_effort: str = "high",
     ) -> PortfolioRoundReport:
         """Execute one parallel portfolio round across Rule and Creative workers."""
         specs = self.plan_workers(
@@ -718,6 +723,7 @@ class PortfolioRunner:
             navigation_context=navigation_context,
             ideal_roofline_us=ideal_roofline_us,
             nav_packet=nav_packet,
+            creative_effort=creative_effort,
         )
         tasks = [
             self._run_single_worker(

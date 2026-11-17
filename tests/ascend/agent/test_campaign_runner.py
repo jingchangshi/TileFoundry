@@ -1200,6 +1200,8 @@ def test_campaign_runner_cli_arg_parser() -> None:
             "--resume",
             "--k-rule-workers",
             "3",
+            "--target-module",
+            "custom_kernels.py",
             "--source-root",
             ".",
             "--env-file",
@@ -1217,12 +1219,14 @@ def test_campaign_runner_cli_arg_parser() -> None:
     assert parsed.run_final_l4 is True
     assert parsed.resume is True
     assert parsed.k_rule_workers == 3
+    assert parsed.target_module == "custom_kernels.py"
     assert parsed.source_root == "."
     assert parsed.env_file == "env.sh"
 
     defaults = parser.parse_args(["--operator", "attention_residual"])
     assert defaults.disable_early_goal_stop is False
     assert defaults.min_surrogate_gain == 0.25
+    assert defaults.target_module is None
 
 
 def test_scoped_multi_symbol_regime_slice_extract_and_patch(tmp_path: Path) -> None:
@@ -2030,3 +2034,215 @@ def test_for_regime_and_msprof_collector_caching_wakes_r05_and_r11(tmp_path: Pat
     )
     runner_resumed._restore_from_checkpoint()
     assert len(runner_resumed._msprof_cache) == 2
+
+
+def test_prewarm_surrogate_tilelang_cache_pure_cpu_without_harness_prepare(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify prewarm compiles via cases.yaml without calling Harness.prepare."""
+    import yaml
+    from tilefoundry_ascend.agent.campaign import prewarm_surrogate_tilelang_cache
+
+    repo_root = Path(__file__).resolve().parents[3]
+    cann_repo = _setup_mock_cann_repo(tmp_path)
+    ar_dir = cann_repo / "operators" / "level4" / "attention_residual"
+    ar_dir.mkdir(parents=True, exist_ok=True)
+    cases_payload = {
+        "cases": [
+            {
+                "case_id": 2,
+                "input_shape": [[2, 1, 1, 4096], [1, 1, 4096], [4096], [4096]],
+                "dtype": "bfloat16",
+                "attrs": {"alpha": 0.9, "epsilon": 1e-6},
+            },
+            {
+                "case_id": 3,
+                "input_shape": [[2, 1, 2, 4096], [1, 2, 4096], [4096], [4096]],
+                "dtype": "bfloat16",
+                "attrs": {"alpha": 0.9, "epsilon": 1e-6},
+            },
+            {
+                "case_id": 4,
+                "input_shape": [[8, 1, 16, 1000], [1, 16, 1000], [1000], [1000]],
+                "dtype": "bfloat16",
+                "attrs": {"alpha": 0.9, "epsilon": 1e-6},
+            },
+        ]
+    }
+    (ar_dir / "cases.yaml").write_text(yaml.safe_dump(cases_payload), encoding="utf-8")
+
+    fake_root = tmp_path / "fake_root"
+    fake_root.mkdir(parents=True, exist_ok=True)
+    (fake_root / "src").symlink_to(repo_root / "src")
+    (fake_root / "targets").symlink_to(repo_root / "targets")
+    bench_dir = fake_root / "tests" / "ascend" / "benchmarks"
+    bench_dir.mkdir(parents=True, exist_ok=True)
+    (bench_dir / "cannbench_contract.py").write_text(
+        "class Harness:\n"
+        "    def __init__(self, *args, **kwargs):\n"
+        "        raise RuntimeError('NPU prepare forbidden')\n"
+        "    def prepare(self, case):\n"
+        "        raise RuntimeError('NPU prepare forbidden')\n",
+        encoding="utf-8",
+    )
+
+    tl_stub_dir = tmp_path / "tl_stub"
+    tl_stub_dir.mkdir(parents=True, exist_ok=True)
+    (tl_stub_dir / "tilelang.py").write_text(
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "def compile(prog, target='ascend', out_idx=None, pass_configs=None, compile_flags=None):\n"
+        "    cache_dir = Path(os.environ['TILELANG_CACHE_DIR'])\n"
+        "    cache_dir.mkdir(parents=True, exist_ok=True)\n"
+        "    log_path = cache_dir / 'compiled_entries.jsonl'\n"
+        "    entry = {\n"
+        "        'prog': prog,\n"
+        "        'target': target,\n"
+        "        'out_idx': out_idx,\n"
+        "        'pass_configs': pass_configs,\n"
+        "        'compile_flags': compile_flags,\n"
+        "    }\n"
+        "    with log_path.open('a', encoding='utf-8') as fh:\n"
+        "        fh.write(json.dumps(entry) + '\\n')\n"
+        "    return {'cached': prog}\n",
+        encoding="utf-8",
+    )
+
+    cand_get_kernel = tmp_path / "cand_get_kernel.py"
+    cand_get_kernel.write_text(
+        "import tilelang\n"
+        "def _select_ar_small_decode_config(n_depth=2, d_dim=4096, tl_dtype='bfloat16', "
+        "schedule_mode='tuned', m_rows=1):\n"
+        "    return {'tile_m': 1, 'pass_configs': {}, 'compile_flags': ['--flag-a']}\n"
+        "def _build_ar_small_decode_func(n_depth=2, d_dim=4096, tl_dtype='bfloat16', "
+        "tile_m=1, schedule_mode='tuned'):\n"
+        "    return {'kind': 'small', 'n': n_depth, 'd': d_dim, 'dtype': tl_dtype}\n"
+        "def _select_ar_unaligned_config(n_depth=8, d_dim=1000, tl_dtype='bfloat16', "
+        "schedule_mode='tuned', m_rows=4):\n"
+        "    return {'tile_m': 1, 'pass_configs': {}, 'compile_flags': ['--flag-b']}\n"
+        "def _build_ar_unaligned_func(n_depth=8, d_dim=1000, tl_dtype='bfloat16', "
+        "tile_m=1, schedule_mode='tuned'):\n"
+        "    return {'kind': 'unaligned', 'n': n_depth, 'd': d_dim, 'dtype': tl_dtype}\n"
+        "def _get_kernel(n_depth, d_dim, tl_dtype, tile_m, schedule_mode, *, "
+        "builder_fn=None, pass_configs=None, compile_flags=None):\n"
+        "    prog = builder_fn(n_depth, d_dim, tl_dtype, tile_m, schedule_mode)\n"
+        "    return tilelang.compile(prog, target='ascend', out_idx=[4], "
+        "pass_configs=pass_configs, compile_flags=compile_flags)\n"
+        "def attention_residual(*args, **kwargs):\n"
+        "    raise RuntimeError('Entrypoint execution forbidden on CPU')\n",
+        encoding="utf-8",
+    )
+
+    cand_generic = tmp_path / "cand_generic.py"
+    cand_generic.write_text(
+        "def _build_ar_small_decode_func(n_depth=2, d_dim=4096, tl_dtype='bfloat16', "
+        "tile_m=1, schedule_mode='tuned'):\n"
+        "    return {'kind': 'generic_small', 'n': n_depth, 'd': d_dim}\n"
+        "def _build_ar_unaligned_func(n_depth=8, d_dim=1000, tl_dtype='bfloat16', "
+        "tile_m=1, schedule_mode='tuned'):\n"
+        "    return {'kind': 'generic_unaligned', 'n': n_depth, 'd': d_dim}\n",
+        encoding="utf-8",
+    )
+
+    tl_cache_dir = tmp_path / "tl_cache"
+    ref_cache_dir = tmp_path / "ref_cache"
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "")
+    monkeypatch.setenv("TILEFOUNDRY_NPU_TILELANG_SOURCE", str(tl_stub_dir))
+    monkeypatch.delenv("TILEFOUNDRY_NPU_CANN_SETUP", raising=False)
+    monkeypatch.delenv("TILEFOUNDRY_NPU_PYTHON", raising=False)
+
+    anchors = (
+        AnchorCaseSpec("level4/attention_residual", 2, "small_decode", 1.5, 0.5),
+        AnchorCaseSpec("level4/attention_residual", 3, "small_decode", 1.5, 0.5),
+        AnchorCaseSpec("level4/attention_residual", 4, "unaligned_d", 9.9, 3.3),
+        AnchorCaseSpec("level4/attention_residual", 999, "small_decode", 1.0, 0.5),
+    )
+    out_dir = prewarm_surrogate_tilelang_cache(
+        "attention_residual",
+        [("c_gk", cand_get_kernel), ("c_gen", cand_generic)],
+        anchors,
+        cannbench_repo=cann_repo,
+        cache_dir=ref_cache_dir,
+        tl_cache_dir=tl_cache_dir,
+        source_root=fake_root,
+    )
+    assert out_dir == tl_cache_dir
+    entries = [
+        json.loads(line)
+        for line in (tl_cache_dir / "compiled_entries.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(entries) == 4
+    kinds = [e["prog"]["kind"] for e in entries]
+    assert kinds == ["small", "unaligned", "generic_small", "generic_unaligned"]
+    assert entries[0]["out_idx"] == [4]
+    assert entries[0]["compile_flags"] == ["--flag-a"]
+
+    mla_dir = cann_repo / "operators" / "level4" / "mla"
+    mla_dir.mkdir(parents=True, exist_ok=True)
+    mla_cases = {
+        "cases": [
+            {
+                "case_id": 7,
+                "input_shape": [
+                    [1, 1, 128, 512],
+                    [1, 1, 128, 64],
+                    [1, 2048, 1, 512],
+                    [1, 2048, 1, 64],
+                    [1, 2048, 1, 512],
+                ],
+                "dtype": "float16",
+                "attrs": {"numKVHeads": 1, "inputLayout": "BSND", "is_causal": False},
+            }
+        ]
+    }
+    (mla_dir / "cases.yaml").write_text(yaml.safe_dump(mla_cases), encoding="utf-8")
+
+    mla_cand = tmp_path / "cand_mla.py"
+    mla_cand.write_text(
+        "import tilelang\n"
+        "def _select_mla_decode_config(b_dim=1, s_dim=1, s_kv=2048, n_q=128, n_kv=1, "
+        "d_nope=512, d_rope=64, tl_dtype='float16', input_layout='BSND', "
+        "is_causal=False, schedule_mode='tuned'):\n"
+        "    return {'bm': 64, 'aligned_group_q': True, 'num_kv_splits': 4, "
+        "'pass_configs': {}, 'compile_flags': []}\n"
+        "def _build_mla_split_kv_decode_func(n_q=128, n_kv=1, d_nope=512, d_rope=64, "
+        "tl_dtype='float16', input_layout='BSND', is_causal=False, bm=64, "
+        "aligned_group_q=True, num_kv_splits=1, schedule_mode='tuned'):\n"
+        "    return {'kind': 'mla_stage1', 'splits': num_kv_splits}\n"
+        "def _get_kernel(n_q, n_kv, d_nope, d_rope, tl_dtype, input_layout, is_causal, "
+        "bm, aligned_group_q, schedule_mode, *, builder_fn=None, num_kv_splits=1, "
+        "pass_configs=None, compile_flags=None):\n"
+        "    prog = builder_fn(n_q=n_q, n_kv=n_kv, d_nope=d_nope, d_rope=d_rope, "
+        "tl_dtype=tl_dtype, input_layout=input_layout, is_causal=is_causal, bm=bm, "
+        "aligned_group_q=aligned_group_q, num_kv_splits=num_kv_splits, "
+        "schedule_mode=schedule_mode)\n"
+        "    return tilelang.compile(prog, target='ascend', out_idx=None, "
+        "pass_configs=pass_configs, compile_flags=compile_flags)\n"
+        "def _get_combine_kernel(d_nope, tl_dtype, num_kv_splits, *, "
+        "pass_configs=None, compile_flags=None):\n"
+        "    return tilelang.compile({'kind': 'mla_combine', 'splits': num_kv_splits}, "
+        "target='ascend', out_idx=[2], pass_configs=pass_configs, compile_flags=compile_flags)\n",
+        encoding="utf-8",
+    )
+    mla_cache_dir = tmp_path / "mla_tl_cache"
+    prewarm_surrogate_tilelang_cache(
+        "mla",
+        [("c_mla", mla_cand)],
+        (AnchorCaseSpec("level4/mla", 7, "split_kv_decode", 4.5, 1.5),),
+        cannbench_repo=cann_repo,
+        cache_dir=ref_cache_dir,
+        tl_cache_dir=mla_cache_dir,
+        source_root=fake_root,
+    )
+    mla_entries = [
+        json.loads(line)
+        for line in (mla_cache_dir / "compiled_entries.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [e["prog"] for e in mla_entries] == [
+        {"kind": "mla_stage1", "splits": 4},
+        {"kind": "mla_combine", "splits": 4},
+    ]
+    assert mla_entries[1]["out_idx"] == [2]

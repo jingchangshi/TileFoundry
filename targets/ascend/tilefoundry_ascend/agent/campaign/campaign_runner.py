@@ -2157,6 +2157,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-final-l4", action="store_true", help="Run final official L4 gate.")
     parser.add_argument("--resume", action="store_true", help="Resume from existing checkpoint.")
     parser.add_argument("--k-rule-workers", type=int, default=2)
+    parser.add_argument(
+        "--target-module",
+        default=None,
+        help="Optional override path to target operator kernels module.",
+    )
     parser.add_argument("--source-root", default=None, help="TileFoundry workspace root.")
     parser.add_argument("--env-file", default=None, help="Path to tilefoundry-npu env.sh.")
     return parser
@@ -2182,6 +2187,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     runner = PerfTargetCampaignRunner(
         config=cfg,
+        target_module_path=args.target_module,
         tracker=tracker,
         flywheel_distiller=flywheel,
         checkpoint_path=args.checkpoint,

@@ -407,11 +407,68 @@ def test_command_normalization_effort_routing_and_stdin_devnull(
     assert parsed_schema["dsl_source"] == "x = 42"
     rec2 = json.loads((state_dir / "record_2.json").read_text(encoding="utf-8"))
     assert rec2["args"]["effort"] == "xhigh"
-    assert rec2["args"]["model"] == AgyCliLLMBackend.DEFAULT_EXPLORE_MODEL
+    assert rec2["args"]["model"] == AgyCliLLMBackend.DEFAULT_ESCALATE_MODEL
 
     monkeypatch.setenv("TF_FAKE_AGY_SCENARIO", "ok_delta_fallback")
     reply_delta = asyncio.run(backend.generate(GenerationRequest("syntax_repair", "sys", "usr")))
     assert reply_delta == "part_a_part_b"
+
+
+def test_agent_flag_stripping_and_tier_adaptive_watchdog(
+    tmp_path: Path,
+) -> None:
+    """Verify --agent stripping and tier-adaptive medium/high/xhigh watchdog timeouts."""
+    cleaned = _normalize_agy_common_args(
+        "--agent orchestrator --agent=custom --add-dir /tmp --sandbox --mode plan"
+    )
+    assert cleaned == ["--sandbox", "--mode", "plan"]
+
+    bin_path, _ = _write_fake_agy(tmp_path)
+    backend = AgyCliLLMBackend(bin_path=str(bin_path))
+
+    exploit_req = GenerationRequest("exploit_rule", "sys", "usr")
+    explore_req = GenerationRequest("explore_creative", "sys", "usr")
+    escalate_req = GenerationRequest("explore_creative", "sys", "usr", effort="xhigh")
+
+    exploit_model = backend.select_model("exploit_rule")
+    explore_model = backend.select_model("explore_creative")
+    escalate_model = backend.select_model("explore_creative", effort="xhigh")
+    assert exploit_model == "gemini-4-hydrogen-medium"
+    assert explore_model == "gemini-4-hydrogen-high"
+    assert escalate_model == "gemini-4-hydrogen-xhigh"
+
+    med_cfg = backend.watchdog_for_model(exploit_model)
+    high_cfg = backend.watchdog_for_model(explore_model)
+    xhigh_cfg = backend.watchdog_for_model(escalate_model)
+    assert (med_cfg.idle_stall_timeout_sec, med_cfg.active_ceiling_timeout_sec) == (120.0, 240.0)
+    assert (high_cfg.idle_stall_timeout_sec, high_cfg.active_ceiling_timeout_sec) == (180.0, 360.0)
+    assert (xhigh_cfg.idle_stall_timeout_sec, xhigh_cfg.active_ceiling_timeout_sec) == (
+        300.0,
+        540.0,
+    )
+
+    cmd_med = backend.build_command(exploit_req, "P")
+    cmd_high = backend.build_command(explore_req, "P")
+    cmd_xhigh = backend.build_command(escalate_req, "P")
+    assert "gemini-4-hydrogen-medium" in cmd_med
+    assert "--print-timeout=240s" in cmd_med
+    assert "gemini-4-hydrogen-high" in cmd_high
+    assert "--print-timeout=360s" in cmd_high
+    assert "gemini-4-hydrogen-xhigh" in cmd_xhigh
+    assert "--print-timeout=540s" in cmd_xhigh
+
+    from tilefoundry_ascend.agent.orchestrator.llm_client import MockLLMBackend
+
+    mock = MockLLMBackend(default_response="ok")
+    asyncio.run(mock.generate(exploit_req))
+    asyncio.run(mock.generate(explore_req))
+    asyncio.run(mock.generate(escalate_req))
+    assert mock.routed_models == [
+        "gemini-4-hydrogen-medium",
+        "gemini-4-hydrogen-high",
+        "gemini-4-hydrogen-xhigh",
+    ]
+    assert mock.routed_efforts == ["medium", "high", "xhigh"]
 
 
 def test_slow_actively_streaming_worker_exceeds_idle_without_false_timeout(

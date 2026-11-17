@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import shlex
@@ -16,6 +17,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import yaml
+
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
     PerfTargetSpec,
@@ -24,6 +27,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     get_default_anchors,
     get_operator_entrypoint,
     get_operator_task,
+    lookup_case_dims,
     parse_simple_env_file,
     resolve_cannbench_repo,
 )
@@ -736,6 +740,235 @@ def prewarm_anchor_reference_cache(
     return resolved_cache
 
 
+_PREWARM_TL_DRIVER_TEMPLATE = """import importlib.util
+import inspect
+import logging
+import sys
+import tilelang
+
+sys.path.insert(0, {ascend_target_dir!r})
+from tilefoundry_ascend.agent.campaign.anchor_specs import (
+    get_default_regime_specs,
+    resolve_regime_for_case,
+)
+from tilefoundry_ascend.agent.campaign.campaign_runner import (
+    _HIR_DIM_ALIASES,
+    _filter_callable_kwargs,
+    resolve_regime_config,
+)
+from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+    lookup_case_static_spec,
+)
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(levelname)s:%(name)s:%(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("tilefoundry_ascend.prewarm")
+
+def _freeze(val):
+    if isinstance(val, dict):
+        return tuple((str(k), _freeze(v)) for k, v in sorted(val.items()))
+    if isinstance(val, (list, tuple)):
+        return tuple(_freeze(x) for x in val)
+    if isinstance(val, set):
+        return tuple(sorted(_freeze(x) for x in val))
+    return val
+
+op_name = {op_name!r}
+case_ids = {case_ids_json}
+cand_paths = {cand_paths_json}
+repo = {repo!r}
+
+regime_specs = get_default_regime_specs(op_name)
+case_specs = []
+for cid_num in case_ids:
+    try:
+        case_dims = lookup_case_static_spec(op_name, cid_num, cannbench_repo=repo)
+        regime = resolve_regime_for_case(op_name, case_dims, regime_specs)
+        case_specs.append((cid_num, case_dims, regime))
+    except Exception as exc:
+        logger.warning(
+            "Prewarm static spec skipped for op=%s case=%s: %s: %s",
+            op_name,
+            cid_num,
+            type(exc).__name__,
+            exc,
+        )
+
+for idx, (cid, mod_path) in enumerate(cand_paths):
+    try:
+        mod_name = f"_tf_warm_{{idx}}"
+        spec = importlib.util.spec_from_file_location(mod_name, mod_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Failed to load module spec from {{mod_path}}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    except Exception as exc:
+        logger.warning(
+            "Prewarm module load skipped for candidate=%s (%s): %s: %s",
+            cid,
+            mod_path,
+            type(exc).__name__,
+            exc,
+        )
+        continue
+
+    seen_keys = set()
+    get_kernel_fn = getattr(mod, "_get_kernel", None)
+    combine_fn = getattr(mod, "_get_combine_kernel", None)
+
+    for cid_num, case_dims, regime in case_specs:
+        try:
+            resolved = resolve_regime_config(mod_path, regime, dims=case_dims)
+            builder_fn = getattr(mod, resolved.builder_name, None)
+            if not callable(builder_fn):
+                raise ValueError(f"Builder {{resolved.builder_name!r}} not callable")
+
+            pool = dict(regime.sample_builder_kwargs)
+            for h_key, h_val in regime.representative_hir_dims.items():
+                mapped = _HIR_DIM_ALIASES.get(str(h_key), str(h_key))
+                pool.setdefault(mapped, h_val)
+            for d_key, d_val in case_dims.items():
+                mapped = _HIR_DIM_ALIASES.get(str(d_key), str(d_key))
+                pool[mapped] = d_val
+            sel_name = regime.config_selector_fn
+            if sel_name and callable(getattr(mod, sel_name, None)):
+                sel_fn = getattr(mod, sel_name)
+                sel_out = sel_fn(**_filter_callable_kwargs(sel_fn, pool))
+                if isinstance(sel_out, dict):
+                    for sk, sv in sel_out.items():
+                        if sk not in ("pass_configs", "compile_flags"):
+                            pool[str(sk)] = sv
+            pool.update(resolved.builder_kwargs)
+            pool["builder_fn"] = builder_fn
+            pool["pass_configs"] = dict(resolved.pass_configs)
+            pool["compile_flags"] = tuple(resolved.compile_flags)
+
+            used_get_kernel = False
+            if callable(get_kernel_fn):
+                gk_sig = inspect.signature(get_kernel_fn)
+                has_req = all(
+                    p.name in pool
+                    for p in gk_sig.parameters.values()
+                    if p.default is inspect.Parameter.empty
+                    and p.kind not in (
+                        inspect.Parameter.VAR_POSITIONAL,
+                        inspect.Parameter.VAR_KEYWORD,
+                    )
+                )
+                if has_req:
+                    gk_kwargs = _filter_callable_kwargs(get_kernel_fn, pool)
+                    sig_key = (
+                        "_get_kernel",
+                        resolved.builder_name,
+                        tuple(
+                            (k, _freeze(v))
+                            for k, v in sorted(gk_kwargs.items())
+                            if k != "builder_fn"
+                        ),
+                    )
+                    if sig_key not in seen_keys:
+                        seen_keys.add(sig_key)
+                        get_kernel_fn(**gk_kwargs)
+                    splits = int(pool.get("num_kv_splits", 1) or 1)
+                    if splits > 1 and callable(combine_fn):
+                        comb_kwargs = _filter_callable_kwargs(combine_fn, pool)
+                        comb_key = (
+                            "_get_combine_kernel",
+                            tuple((k, _freeze(v)) for k, v in sorted(comb_kwargs.items())),
+                        )
+                        if comb_key not in seen_keys:
+                            seen_keys.add(comb_key)
+                            combine_fn(**comb_kwargs)
+                    used_get_kernel = True
+
+            if not used_get_kernel:
+                b_kwargs = _filter_callable_kwargs(builder_fn, resolved.builder_kwargs)
+                pc_dict = dict(resolved.pass_configs)
+                cf_tuple = tuple(resolved.compile_flags)
+                sig_key = (
+                    "generic",
+                    resolved.builder_name,
+                    tuple((k, _freeze(v)) for k, v in sorted(b_kwargs.items())),
+                    _freeze(pc_dict),
+                    cf_tuple,
+                )
+                if sig_key not in seen_keys:
+                    seen_keys.add(sig_key)
+                    prog = builder_fn(**b_kwargs)
+                    tilelang.compile(
+                        prog,
+                        target="ascend",
+                        pass_configs=pc_dict or None,
+                        compile_flags=list(cf_tuple) if cf_tuple else None,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "Prewarm compile skipped for candidate=%s case=%s: %s: %s",
+                cid,
+                cid_num,
+                type(exc).__name__,
+                exc,
+            )
+"""
+
+
+def lookup_case_static_spec(
+    operator_name: str,
+    case_num: int,
+    *,
+    cannbench_repo: str | Path | None = None,
+    env_file: str | Path | None = None,
+) -> dict[str, object]:
+    """Read static dims, tl_dtype, and attributes directly from cases.yaml."""
+    repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
+    task = get_operator_task(operator_name)
+    cases_path = repo / "operators" / task / "cases.yaml"
+    if not cases_path.is_file():
+        raise FileNotFoundError(f"cases.yaml not found at {cases_path}")
+    parsed = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
+    cases_list = parsed.get("cases") or []
+    target_id = int(case_num)
+    entry: Mapping[str, object] | None = None
+    for row in cases_list:
+        if isinstance(row, Mapping) and int(row.get("case_id", -1)) == target_id:
+            entry = row
+            break
+    if entry is None:
+        raise KeyError(f"case_num={target_id} missing in {cases_path}")
+
+    spec = lookup_case_dims(
+        operator_name,
+        target_id,
+        cannbench_repo=repo,
+        env_file=env_file,
+    )
+    raw_dtype = entry.get("dtype", "bfloat16")
+    if isinstance(raw_dtype, (list, tuple)):
+        tl_dtype = str(raw_dtype[0]) if raw_dtype else "bfloat16"
+    else:
+        tl_dtype = str(raw_dtype)
+    tl_dtype = tl_dtype.strip() or "bfloat16"
+    if tl_dtype.startswith("torch."):
+        tl_dtype = tl_dtype[len("torch.") :]
+    spec["tl_dtype"] = tl_dtype
+    if "inputLayout" in spec and "input_layout" not in spec:
+        spec["input_layout"] = str(spec["inputLayout"]).upper()
+    if "is_causal" in spec:
+        spec["is_causal"] = bool(spec["is_causal"])
+    if (
+        "B" in spec
+        and "S" in spec
+        and "m_rows" not in spec
+        and isinstance(spec["B"], int)
+        and isinstance(spec["S"], int)
+    ):
+        spec["m_rows"] = int(spec["B"]) * int(spec["S"])
+    return spec
+
+
 def prewarm_surrogate_tilelang_cache(
     operator_name: str,
     candidates: Sequence[tuple[str, str | Path]],
@@ -757,6 +990,8 @@ def prewarm_surrogate_tilelang_cache(
         Path(tl_cache_dir) if tl_cache_dir is not None else _default_surrogate_tl_cache_dir()
     )
     resolved_tl_cache.mkdir(parents=True, exist_ok=True)
+    if not candidates or not anchors:
+        return resolved_tl_cache
 
     env_vals = _resolve_env_values(env_file)
     python_bin = (
@@ -791,50 +1026,19 @@ def prewarm_surrogate_tilelang_cache(
         pp_parts.append(run_env["PYTHONPATH"])
     run_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
 
-    entrypoint = get_operator_entrypoint(operator_name)
     case_ids = [int(a.case_num) for a in anchors]
     cand_paths = [(str(cid), str(Path(p).resolve())) for cid, p in candidates]
 
     with tempfile.TemporaryDirectory(prefix="tf_tl_prewarm_") as tmp_dir:
         driver_path = Path(tmp_dir) / "prewarm_tl_driver.py"
         driver_path.write_text(
-            "import importlib.util, json, sys, tilelang\n"
-            f"sys.path.insert(0, {str(root / 'targets' / 'ascend')!r})\n"
-            "from tilefoundry_ascend.agent.campaign.anchor_specs import (\n"
-            "    AnchorCaseSpec, load_anchor_harness_and_cases\n"
-            ")\n"
-            "class _CacheWarmed(Exception):\n"
-            "    pass\n"
-            "_orig_compile = tilelang.compile\n"
-            "def _compile_only(*args, **kwargs):\n"
-            "    _orig_compile(*args, **kwargs)\n"
-            "    def _abort_launch(*_a, **_kw):\n"
-            "        raise _CacheWarmed()\n"
-            "    return _abort_launch\n"
-            "tilelang.compile = _compile_only\n"
-            f"op_name = {operator_name!r}\n"
-            f"entrypoint = {entrypoint!r}\n"
-            f"case_ids = {json.dumps(case_ids)}\n"
-            f"cand_paths = {json.dumps(cand_paths)}\n"
-            f"repo = {str(repo)!r}\n"
-            f"root = {str(root)!r}\n"
-            "specs = [AnchorCaseSpec('', cid, '', 1.0, 1.0) for cid in case_ids]\n"
-            "harness, cases = load_anchor_harness_and_cases(\n"
-            "    op_name, specs, cannbench_repo=repo, source_root=root\n"
-            ")\n"
-            "params_list = [harness.params(case, harness.prepare(case)) for case in cases]\n"
-            "for cid, mod_path in cand_paths:\n"
-            "    spec = importlib.util.spec_from_file_location(f'_tf_warm_{cid}', mod_path)\n"
-            "    mod = importlib.util.module_from_spec(spec)\n"
-            "    spec.loader.exec_module(mod)\n"
-            "    fn = getattr(mod, entrypoint)\n"
-            "    for params in params_list:\n"
-            "        try:\n"
-            "            fn(**params)\n"
-            "        except _CacheWarmed:\n"
-            "            pass\n"
-            "        except Exception:\n"
-            "            pass\n",
+            _PREWARM_TL_DRIVER_TEMPLATE.format(
+                ascend_target_dir=str(root / "targets" / "ascend"),
+                op_name=operator_name,
+                case_ids_json=json.dumps(case_ids),
+                cand_paths_json=json.dumps(cand_paths),
+                repo=str(repo),
+            ),
             encoding="utf-8",
         )
         if cann_setup and Path(cann_setup).is_file() and shutil.which("bisheng") is None:
@@ -856,6 +1060,11 @@ def prewarm_surrogate_tilelang_cache(
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[-1000:]
         raise RuntimeError(f"prewarm_surrogate_tilelang_cache failed: {detail}")
+    if proc.stderr and proc.stderr.strip():
+        logging.getLogger(__name__).warning(
+            "prewarm_surrogate_tilelang_cache warnings: %s",
+            proc.stderr.strip()[-1000:],
+        )
     return resolved_tl_cache
 
 
@@ -1428,6 +1637,7 @@ __all__ = [
     "build_anchor_metrics",
     "collect_bottleneck_msprof_via_agent_gates",
     "ensure_npu_compare_shim_dir",
+    "lookup_case_static_spec",
     "prewarm_anchor_reference_cache",
     "prewarm_surrogate_tilelang_cache",
     "run_l0_l1_round_filter",

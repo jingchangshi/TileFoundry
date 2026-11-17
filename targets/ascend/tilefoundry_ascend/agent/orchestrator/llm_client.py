@@ -149,6 +149,7 @@ def _normalize_agy_common_args(raw_common: str) -> list[str]:
         "--json-schema",
         "--model",
         "--add-dir",
+        "--agent",
         "--log-file",
         "--effort",
         "--print-timeout",
@@ -271,6 +272,7 @@ class AgyCliLLMBackend:
     )
     DEFAULT_EXPLOIT_MODEL = "gemini-4-hydrogen-medium"
     DEFAULT_EXPLORE_MODEL = "gemini-4-hydrogen-high"
+    DEFAULT_ESCALATE_MODEL = "gemini-4-hydrogen-xhigh"
 
     def __init__(
         self,
@@ -281,6 +283,7 @@ class AgyCliLLMBackend:
         max_concurrency: int | None = None,
         hard_timeout_sec: float | None = None,
         watchdog: StreamWatchdogConfig | None = None,
+        escalate_model: str | None = None,
     ) -> None:
         self._bin = _resolve_agy_binary(bin_path)
         self._exploit_model = (
@@ -293,6 +296,11 @@ class AgyCliLLMBackend:
             if explore_model is not None
             else os.environ.get("TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL", "")
         ).strip() or self.DEFAULT_EXPLORE_MODEL
+        self._escalate_model = (
+            escalate_model
+            if escalate_model is not None
+            else os.environ.get("TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL", "")
+        ).strip() or self.DEFAULT_ESCALATE_MODEL
 
         raw_common = (
             common_args
@@ -305,6 +313,7 @@ class AgyCliLLMBackend:
         conc = max_concurrency or (int(raw_conc) if raw_conc else 3)
         self._sem = asyncio.Semaphore(max(1, conc))
 
+        self._explicit_watchdog = watchdog is not None or hard_timeout_sec is not None
         if watchdog is not None:
             self._watchdog = watchdog
         elif hard_timeout_sec is not None:
@@ -315,7 +324,7 @@ class AgyCliLLMBackend:
                 active_ceiling_timeout_sec=ceiling,
             )
         else:
-            self._watchdog = StreamWatchdogConfig()
+            self._watchdog = self.watchdog_for_model(self._exploit_model)
         self._hard_timeout = self._watchdog.active_ceiling_timeout_sec
 
     @property
@@ -323,9 +332,36 @@ class AgyCliLLMBackend:
         """Return active StreamWatchdogConfig."""
         return self._watchdog
 
-    def select_model(self, role: str) -> str:
-        """Return target model ID for role ('explore_creative' -> High, others -> Medium)."""
-        return self._explore_model if role == "explore_creative" else self._exploit_model
+    def select_model(self, role: str, *, effort: str | None = None) -> str:
+        """Return target model ID for role and optional effort escalation."""
+        if role == "explore_creative":
+            if (effort or "").strip().lower() == "xhigh":
+                return self._escalate_model
+            return self._explore_model
+        return self._exploit_model
+
+    def watchdog_for_model(self, model_id: str) -> StreamWatchdogConfig:
+        """Return explicit or tier-adaptive StreamWatchdogConfig for model_id."""
+        if self._explicit_watchdog:
+            return self._watchdog
+        lower = model_id.strip().lower()
+        if lower.endswith("-xhigh") or "xhigh" in lower:
+            return StreamWatchdogConfig(
+                startup_timeout_sec=60.0,
+                idle_stall_timeout_sec=300.0,
+                active_ceiling_timeout_sec=540.0,
+            )
+        if lower.endswith("-high") or "high" in lower:
+            return StreamWatchdogConfig(
+                startup_timeout_sec=60.0,
+                idle_stall_timeout_sec=180.0,
+                active_ceiling_timeout_sec=360.0,
+            )
+        return StreamWatchdogConfig(
+            startup_timeout_sec=60.0,
+            idle_stall_timeout_sec=120.0,
+            active_ceiling_timeout_sec=240.0,
+        )
 
     def select_effort(
         self,
@@ -359,14 +395,15 @@ class AgyCliLLMBackend:
         effort_override: str | None = None,
     ) -> list[str]:
         """Build isolated agy stream-json CLI argument list without workspace mounts."""
-        model_id = self.select_model(req.role)
         effort = self.select_effort(req, effort_override=effort_override)
+        model_id = self.select_model(req.role, effort=effort)
+        cfg = self.watchdog_for_model(model_id)
         resolved_log = (
             str(log_file)
             if log_file is not None
             else str(Path(tempfile.gettempdir()) / "tf_agy_worker.log")
         )
-        print_timeout_sec = max(1, int(math.ceil(self._watchdog.active_ceiling_timeout_sec)))
+        print_timeout_sec = max(1, int(math.ceil(cfg.active_ceiling_timeout_sec)))
         cmd = [
             self._bin,
             "--model",
@@ -445,8 +482,9 @@ class AgyCliLLMBackend:
         *,
         effort_override: str | None = None,
     ) -> str:
-        model_id = self.select_model(req.role)
-        cfg = self._watchdog
+        effort = self.select_effort(req, effort_override=effort_override)
+        model_id = self.select_model(req.role, effort=effort)
+        cfg = self.watchdog_for_model(model_id)
         with (
             tempfile.TemporaryDirectory(prefix="tf_agy_worker_") as sandbox_dir,
             tempfile.TemporaryDirectory(prefix="tf_agy_log_") as log_dir,
@@ -649,7 +687,10 @@ class AgyCliLLMBackend:
             f"### SYSTEM INSTRUCTIONS\n{req.system_prompt}\n\n"
             f"### USER INPUT\n{req.user_prompt}\n"
         )
-        max_retries = max(0, self._watchdog.max_retries)
+        effort = self.select_effort(req, effort_override=effort_override)
+        model_id = self.select_model(req.role, effort=effort)
+        cfg = self.watchdog_for_model(model_id)
+        max_retries = max(0, cfg.max_retries)
         async with self._sem:
             for attempt_idx in range(max_retries + 1):
                 try:
@@ -660,8 +701,8 @@ class AgyCliLLMBackend:
                     )
                 except _AttemptFailure as failure:
                     if failure.retriable and attempt_idx < max_retries:
-                        if self._watchdog.retry_backoff_sec > 0.0:
-                            await asyncio.sleep(self._watchdog.retry_backoff_sec)
+                        if cfg.retry_backoff_sec > 0.0:
+                            await asyncio.sleep(cfg.retry_backoff_sec)
                         continue
                     raise failure.exc from None
         raise RuntimeError("unreachable retry termination")
@@ -685,18 +726,21 @@ class MockLLMBackend:
     ) -> str:
         """Record request and return next queued response for req.role."""
         self.calls.append(req)
-        model_id = (
-            AgyCliLLMBackend.DEFAULT_EXPLORE_MODEL
-            if req.role == "explore_creative"
-            else AgyCliLLMBackend.DEFAULT_EXPLOIT_MODEL
-        )
-        self.routed_models.append(model_id)
         if effort_override and effort_override.strip():
             effort = effort_override.strip()
         elif req.effort and req.effort.strip():
             effort = req.effort.strip()
         else:
             effort = "high" if req.role == "explore_creative" else "medium"
+        if req.role == "explore_creative":
+            model_id = (
+                AgyCliLLMBackend.DEFAULT_ESCALATE_MODEL
+                if effort.lower() == "xhigh"
+                else AgyCliLLMBackend.DEFAULT_EXPLORE_MODEL
+            )
+        else:
+            model_id = AgyCliLLMBackend.DEFAULT_EXPLOIT_MODEL
+        self.routed_models.append(model_id)
         self.routed_efforts.append(effort)
         queue = self.responses.get(req.role)
         if queue:
