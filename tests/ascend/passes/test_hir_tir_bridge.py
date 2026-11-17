@@ -301,3 +301,141 @@ def test_np1_tir_envelope_ledger_telemetry_and_roundtrip(tmp_path: pathlib.Path)
         waterlines={},
     )
     assert ObjectivePhysicalLedger.from_dict(default_led.to_dict()) == default_led
+
+
+def test_hir_tir_bridge_fallback_provenance_and_backward_compat() -> None:
+    """Verify D=1000 fallback sets shape_exact_match=False and preserves D=64 resolved dims."""
+    authored_src = (AR_DIR / "model.py").read_text(encoding="utf-8")
+    scheduled_src = (AR_DIR / "scheduled.py").read_text(encoding="utf-8")
+
+    req_dims = {"N": 8, "B": 1, "S": 4, "D": 1000}
+    pkt = compile_hir_navigation_packet(
+        authored_src,
+        scheduled_hir_source=scheduled_src,
+        anchor_dims=req_dims,
+    )
+    assert pkt.shape_exact_match is False
+    assert pkt.requested_anchor_dims == req_dims
+    assert pkt.resolved_hir_dims == {"N": 4, "B": 1, "S": 4, "D": 64}
+    assert pkt.fallback_reason is not None and "ValueError" in pkt.fallback_reason
+    assert pkt.roofline.fallback_reason == pkt.fallback_reason
+    assert pkt.tir_script is not None
+    assert pkt.tir_ledger is not None
+
+    sched_only_pkt = compile_hir_navigation_packet(
+        scheduled_src,
+        scheduled_hir_source=scheduled_src,
+        anchor_dims=req_dims,
+    )
+    assert sched_only_pkt.shape_exact_match is False
+    assert sched_only_pkt.resolved_hir_dims == {"N": 4, "B": 1, "S": 4, "D": 64}
+    assert sched_only_pkt.roofline.resolved_hir_dims == {"N": 4, "B": 1, "S": 4, "D": 64}
+    assert sched_only_pkt.roofline.shape_exact_match is False
+    assert sched_only_pkt.fallback_reason is not None
+    assert "ValueError" in sched_only_pkt.fallback_reason
+
+    rebuilt = HirTirNavigationPacket.from_dict(json.loads(json.dumps(pkt.to_dict())))
+    assert rebuilt == pkt
+
+    legacy_payload = pkt.to_dict()
+    for key in ("requested_anchor_dims", "resolved_hir_dims", "shape_exact_match", "fallback_reason"):
+        legacy_payload.pop(key, None)
+        legacy_payload["roofline"].pop(key, None)
+    legacy_rebuilt = HirTirNavigationPacket.from_dict(legacy_payload)
+    assert legacy_rebuilt.shape_exact_match is True
+    assert legacy_rebuilt.resolved_hir_dims == legacy_rebuilt.roofline.anchor_dims
+
+
+def test_adaptive_small_shape_scheduled_hir_resolution() -> None:
+    """Verify small decode shapes (S=1, S_kv=4/32, N_q=16) resolve cleanly without fallback."""
+    mla_model = (MLA_DIR / "model.py").read_text(encoding="utf-8")
+    mla_sched = (MLA_DIR / "scheduled.py").read_text(encoding="utf-8")
+    ar_model = (AR_DIR / "model.py").read_text(encoding="utf-8")
+    ar_sched = (AR_DIR / "scheduled.py").read_text(encoding="utf-8")
+
+    for dims in (
+        {"B": 1, "S": 1, "S_kv": 32, "N_q": 16, "N_kv": 1},
+        {"B": 1, "S": 1, "S_kv": 4, "N_q": 16, "N_kv": 1},
+    ):
+        pkt = compile_hir_navigation_packet(
+            mla_model,
+            scheduled_hir_source=mla_sched,
+            anchor_dims=dims,
+        )
+        assert pkt.shape_exact_match is True
+        assert pkt.fallback_reason is None
+        assert pkt.lowering_diagnostics == ()
+        assert pkt.tir_script is not None
+        assert pkt.tir_ledger is not None and pkt.tir_ledger.is_legal is True
+        for k, v in dims.items():
+            assert pkt.resolved_hir_dims[k] == v
+
+    ar_pkt = compile_hir_navigation_packet(
+        ar_model,
+        scheduled_hir_source=ar_sched,
+        anchor_dims={"N": 2, "B": 1, "S": 1, "D": 64},
+    )
+    assert ar_pkt.shape_exact_match is True
+    assert ar_pkt.fallback_reason is None
+    assert ar_pkt.tir_script is not None
+    assert ar_pkt.tir_ledger is not None and ar_pkt.tir_ledger.is_legal is True
+
+
+def test_pure_vector_and_transcendental_roofline_ownership() -> None:
+    """Verify pure-vector and special transcendental ops price against AIV peak, not Cube."""
+    target = AscendTarget("ascend.950pr")
+    dev = target.device
+    aiv_f32_rate = dev.unit_flops_per_second["aiv"][next(iter(dev.unit_flops_per_second["aiv"]))]
+    aic_f16_rate = dev.unit_flops_per_second["aic"][next(iter(dev.unit_flops_per_second["aic"]))]
+
+    ar_model = (AR_DIR / "model.py").read_text(encoding="utf-8")
+    ar_pkt = compile_hir_navigation_packet(
+        ar_model,
+        anchor_dims={"N": 4, "B": 1, "S": 4, "D": 64},
+        target=target,
+    )
+    rf = ar_pkt.roofline
+    assert rf.cube_flops == 0
+    assert rf.vector_flops == rf.compute_flops
+    assert rf.compute_floor_us == rf.vec_floor_us
+    expected_ar_us = (rf.vector_flops / float(aiv_f32_rate)) * 1e6
+    naive_cube_us = (rf.compute_flops / float(aic_f16_rate)) * 1e6
+    assert abs(rf.compute_floor_us - expected_ar_us) < 1e-9
+    assert rf.compute_floor_us > 10.0 * naive_cube_us
+
+    special_hir = (
+        "from __future__ import annotations\n"
+        "from tilefoundry.dsl import *\n"
+        "from tilefoundry_ascend import AscendTarget\n"
+        "TOPOS = (Topology('block', 1), Topology('aic', 1), "
+        "Topology('aiv', 2), Topology('lane', 64))\n"
+        "@module(entry='spec_fn', target=AscendTarget('ascend.950pr'), topologies=TOPOS)\n"
+        "class SpecMod:\n"
+        "    @func\n"
+        "    def spec_fn(x: Tensor[(16, 64), 'bf16']) -> Tensor[(16, 64), 'bf16']:\n"
+        "        xf = tf.cast(x, dtype='f32')\n"
+        "        e = tf.exp(xf)\n"
+        "        r = tf.rsqrt(e)\n"
+        "        return tf.cast(r, dtype='bf16')\n"
+    )
+    spec_pkt = compile_hir_navigation_packet(special_hir, target=target)
+    s_rf = spec_pkt.roofline
+    assert s_rf.cube_flops == 0
+    assert s_rf.special_ops == 2 * 16 * 64
+    assert s_rf.vector_flops > 2 * 16 * 64
+    assert s_rf.compute_floor_us == s_rf.vec_floor_us
+    expected_spec_us = (s_rf.vector_flops / float(aiv_f32_rate)) * 1e6
+    assert abs(s_rf.compute_floor_us - expected_spec_us) < 1e-9
+    naive_cast_only_us = (2 * 16 * 64 / float(aic_f16_rate)) * 1e6
+    assert s_rf.compute_floor_us > 50.0 * naive_cast_only_us
+
+    mla_model = (MLA_DIR / "model.py").read_text(encoding="utf-8")
+    mla_pkt = compile_hir_navigation_packet(
+        mla_model,
+        anchor_dims={"B": 1, "S": 16, "S_kv": 16, "N_q": 4, "N_kv": 1},
+        target=target,
+    )
+    m_rf = mla_pkt.roofline
+    assert m_rf.cube_flops > 0
+    assert m_rf.vector_flops > 0
+    assert m_rf.compute_floor_us == max(m_rf.cube_floor_us, m_rf.vec_floor_us)

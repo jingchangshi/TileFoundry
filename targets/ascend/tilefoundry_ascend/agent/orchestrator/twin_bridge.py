@@ -335,6 +335,18 @@ def verify_twin_cpu_reference(
     return True, f"twin_cpu_reference_passed: entry={checked_fn.name}, {detail}"
 
 
+_SCOPE_TOPOLOGY_MAP: dict[str, str] = {
+    "UB": "smem(AIV)",
+    "ub": "smem(AIV)",
+    "smem": "smem(AIV)",
+    "L1": "tmem(AIC)",
+    "L0A": "tmem(AIC)",
+    "L0B": "tmem(AIC)",
+    "L0C": "tmem(AIC)",
+    "SSBUF": "ssbuf(block)",
+}
+
+
 def _ub_peak_bytes(ledger: ObjectivePhysicalLedger) -> int:
     """Return peak allocated UB bytes from a physical ledger."""
     for key in ("UB", "ub", "smem"):
@@ -344,6 +356,22 @@ def _ub_peak_bytes(ledger: ObjectivePhysicalLedger) -> int:
     return 0
 
 
+def _format_scope_pct(waterline) -> str:
+    """Format peak / capacity percentage for one ScopeWaterline."""
+    if waterline is None or waterline.capacity_bytes <= 0:
+        return "n/a"
+    pct = 100.0 * float(waterline.peak_allocated_bytes) / float(waterline.capacity_bytes)
+    return f"{pct:.2f}%"
+
+
+def _structural_reference_banner(packet: HirTirNavigationPacket) -> str:
+    """Render the structural-only banner when requested and resolved HIR dims diverge."""
+    return (
+        f"[Structural Blueprint Reference Only: HIR resolved at "
+        f"dims={packet.resolved_hir_dims} vs Anchor dims={packet.requested_anchor_dims}]"
+    )
+
+
 def format_hir_tir_navigation_section(
     packet: HirTirNavigationPacket,
     *,
@@ -351,10 +379,11 @@ def format_hir_tir_navigation_section(
 ) -> str:
     """Format HIR roofline, legal TIR ops, Z3 schedule, and ledger delta sections."""
     rf = packet.roofline
-    dims_text = ", ".join(f"{k}={v}" for k, v in sorted(rf.anchor_dims.items())) or "default"
+    display_dims = rf.resolved_hir_dims or rf.anchor_dims
+    dims_text = ", ".join(f"{k}={v}" for k, v in sorted(display_dims.items())) or "default"
     roofline_lines = [
         "### HIR ANALYTICAL ROOFLINE & TRAFFIC FLOOR",
-        f"- entry: {packet.entry_name} (anchor_dims: {dims_text})",
+        f"- entry: {packet.entry_name} (resolved_hir_dims: {dims_text})",
         f"- compute_flops: {rf.compute_flops}",
         f"- min_gm_bytes: {rf.min_gm_bytes}",
         f"- arithmetic_intensity: {rf.arithmetic_intensity:.4f}",
@@ -363,6 +392,10 @@ def format_hir_tir_navigation_section(
         f"- ideal_roofline_us: {rf.ideal_roofline_us:.4f}",
         f"- dominant_bound: {rf.dominant_bound}",
     ]
+    if not rf.shape_exact_match:
+        roofline_lines.append(f"- requested_anchor_dims: {rf.requested_anchor_dims}")
+    if rf.fallback_reason:
+        roofline_lines.append(f"- fallback_reason: {rf.fallback_reason}")
 
     cand_lines = ["### LEGAL ASCEND TIR CANDIDATE PRIMITIVES"]
     if packet.candidate_ops:
@@ -371,6 +404,10 @@ def format_hir_tir_navigation_section(
         cand_lines.append("- None extracted")
 
     blueprint_lines = ["### LOWERED ASCEND TIR BLUEPRINT & Z3 SCHEDULE"]
+    if not packet.shape_exact_match:
+        blueprint_lines.append(_structural_reference_banner(packet))
+        if packet.fallback_reason:
+            blueprint_lines.append(f"- fallback_reason: {packet.fallback_reason}")
     z3_text = json.dumps(packet.z3_pipeline_summary, sort_keys=True)
     blueprint_lines.append(f"Z3 Pipeline Summary: {z3_text}")
     if packet.tir_script:
@@ -389,30 +426,56 @@ def format_hir_tir_navigation_section(
 
     if current_tl_ledger is not None and packet.tir_ledger is not None:
         tir_led = packet.tir_ledger
-        tir_ub = _ub_peak_bytes(tir_led)
-        tl_ub = _ub_peak_bytes(current_tl_ledger)
-        ub_delta = tl_ub - tir_ub
-        gm_delta = current_tl_ledger.gm_roundtrip_bytes - tir_led.gm_roundtrip_bytes
-        if tir_led.steady_state_ii is not None and current_tl_ledger.steady_state_ii is not None:
-            ii_delta = str(current_tl_ledger.steady_state_ii - tir_led.steady_state_ii)
+        if packet.shape_exact_match:
+            tir_ub = _ub_peak_bytes(tir_led)
+            tl_ub = _ub_peak_bytes(current_tl_ledger)
+            ub_delta = tl_ub - tir_ub
+            gm_delta = current_tl_ledger.gm_roundtrip_bytes - tir_led.gm_roundtrip_bytes
+            if (
+                tir_led.steady_state_ii is not None
+                and current_tl_ledger.steady_state_ii is not None
+            ):
+                ii_delta = str(current_tl_ledger.steady_state_ii - tir_led.steady_state_ii)
+            else:
+                ii_delta = "n/a"
+            delta_lines = [
+                "### TIR BLUEPRINT VS CURRENT TILELANG LEDGER DELTA",
+                (
+                    f"- steady_state_ii: tir={tir_led.steady_state_ii}, "
+                    f"current_tl={current_tl_ledger.steady_state_ii}, delta={ii_delta}"
+                ),
+                (
+                    f"- dominant_pipe: tir={tir_led.dominant_pipe}, "
+                    f"current_tl={current_tl_ledger.dominant_pipe}"
+                ),
+                f"- ub_peak_bytes: tir={tir_ub}, current_tl={tl_ub}, delta={ub_delta:+d}",
+                (
+                    f"- gm_roundtrip_bytes: tir={tir_led.gm_roundtrip_bytes}, "
+                    f"current_tl={current_tl_ledger.gm_roundtrip_bytes}, delta={gm_delta:+d}"
+                ),
+            ]
         else:
-            ii_delta = "n/a"
-        delta_lines = [
-            "### TIR BLUEPRINT VS CURRENT TILELANG LEDGER DELTA",
-            (
-                f"- steady_state_ii: tir={tir_led.steady_state_ii}, "
-                f"current_tl={current_tl_ledger.steady_state_ii}, delta={ii_delta}"
-            ),
-            (
+            delta_lines = [
+                "### TIR BLUEPRINT VS CURRENT TILELANG LEDGER DELTA",
+                _structural_reference_banner(packet),
+            ]
+            if packet.fallback_reason:
+                delta_lines.append(f"- fallback_reason: {packet.fallback_reason}")
+            delta_lines.append(
                 f"- dominant_pipe: tir={tir_led.dominant_pipe}, "
                 f"current_tl={current_tl_ledger.dominant_pipe}"
-            ),
-            f"- ub_peak_bytes: tir={tir_ub}, current_tl={tl_ub}, delta={ub_delta:+d}",
-            (
-                f"- gm_roundtrip_bytes: tir={tir_led.gm_roundtrip_bytes}, "
-                f"current_tl={current_tl_ledger.gm_roundtrip_bytes}, delta={gm_delta:+d}"
-            ),
-        ]
+            )
+            all_scopes = sorted(set(tir_led.waterlines) | set(current_tl_ledger.waterlines))
+            for scope in all_scopes:
+                topo = _SCOPE_TOPOLOGY_MAP.get(scope, scope)
+                tir_pct = _format_scope_pct(tir_led.waterlines.get(scope))
+                tl_pct = _format_scope_pct(current_tl_ledger.waterlines.get(scope))
+                delta_lines.append(
+                    f"- scope_utilization[{scope} -> {topo}]: "
+                    f"tir={tir_pct}, current_tl={tl_pct}"
+                )
+            if not all_scopes:
+                delta_lines.append("- scope_utilization: none")
         sections.append("\n".join(delta_lines))
 
     return "\n\n".join(sections)

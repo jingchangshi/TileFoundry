@@ -272,3 +272,53 @@ def test_format_hir_tir_navigation_section_and_portfolio_roofline_eta() -> None:
     for cand in report.evaluated_candidates:
         assert cand.residual.predicted_bottleneck_util >= 0.0
         assert cand.residual.unexplained_gap_ratio > 0.0
+
+
+def test_format_hir_tir_navigation_section_gates_cross_scale_deltas() -> None:
+    """Verify shape mismatch suppresses raw byte/cycle deltas in favor of normalized usage."""
+    ar_hir = _AR_MODEL_PATH.read_text(encoding="utf-8")
+    ar_sched = _AR_SCHED_PATH.read_text(encoding="utf-8")
+    tl_ledger = build_objective_physical_ledger(
+        analysis_mode="exact_modulo_z3",
+        is_legal=True,
+        steady_state_ii=18,
+        pipe_cycles={"AIV0.PIPE_V": 40},
+        waterlines={
+            "UB": build_scope_waterline(
+                scope="UB",
+                capacity_bytes=253952,
+                explicit_buffers={"tmp": 32768},
+                implicit_buffers={},
+            )
+        },
+        gm_roundtrip_bytes=4096,
+    )
+
+    exact_pkt = compile_hir_navigation_packet(
+        ar_hir,
+        scheduled_hir_source=ar_sched,
+        anchor_dims={"N": 4, "B": 1, "S": 4, "D": 64},
+    )
+    assert exact_pkt.shape_exact_match is True
+    exact_nav = format_hir_tir_navigation_section(exact_pkt, current_tl_ledger=tl_ledger)
+    assert "[Structural Blueprint Reference Only:" not in exact_nav
+    assert "ub_peak_bytes:" in exact_nav
+    assert "gm_roundtrip_bytes:" in exact_nav
+    assert "delta=" in exact_nav
+
+    fallback_pkt = compile_hir_navigation_packet(
+        ar_hir,
+        scheduled_hir_source=ar_sched,
+        anchor_dims={"N": 8, "B": 1, "S": 4, "D": 1000},
+    )
+    assert fallback_pkt.shape_exact_match is False
+    assert fallback_pkt.resolved_hir_dims == {"N": 4, "B": 1, "S": 4, "D": 64}
+    assert fallback_pkt.fallback_reason is not None
+    gated_nav = format_hir_tir_navigation_section(fallback_pkt, current_tl_ledger=tl_ledger)
+    assert "[Structural Blueprint Reference Only:" in gated_nav
+    assert "fallback_reason:" in gated_nav
+    assert "scope_utilization[" in gated_nav
+    assert "%" in gated_nav
+    assert "ub_peak_bytes:" not in gated_nav
+    assert "gm_roundtrip_bytes:" not in gated_nav
+    assert "delta=" not in gated_nav

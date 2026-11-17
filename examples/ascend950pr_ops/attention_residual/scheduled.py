@@ -25,6 +25,15 @@ def build(
     dtype: str = "bf16",
 ):
     """Build a single-pass online-softmax scheduled HIR AttentionResidual module."""
+    if N <= 0 or B <= 0 or S <= 0 or D <= 0:
+        raise ValueError(
+            f"AttentionResidualScheduled requires positive dimensions, "
+            f"got N={N}, B={B}, S={S}, D={D}"
+        )
+    if D % 64 != 0:
+        raise ValueError(
+            f"AttentionResidualScheduled requires D % 64 == 0 for 64-lane SimdVF, got D={D}"
+        )
     M = B * S
     inv_sqrt_d = 1.0 / math.sqrt(D)
     inv_d = 1.0 / float(D)

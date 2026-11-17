@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import inspect
 import math
 from pathlib import Path
@@ -12,26 +13,35 @@ import tempfile
 
 from tilefoundry.analysis import AnalysisError, ComputeCostMetadata, analyze, check_program
 from tilefoundry.analysis.check import program_dim_vars
+from tilefoundry.analysis.iteration_scope import ScopeBuilder
+from tilefoundry.analysis.visitor import AnalyzeContext
 from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.inspection import as_script
-from tilefoundry.ir.core import VerifyError, get_metadata
+from tilefoundry.ir.core import Call, VerifyError, get_metadata
 from tilefoundry.ir.core.module import Module
+from tilefoundry.ir.hir.nn.conv2d import Conv2D
+from tilefoundry.ir.hir.nn.matmul import MatMul
 from tilefoundry.ir.hir.pipeline import (
     PipelineError,
     normalize_pipeline_references,
     rebind_cloned_pipeline_references,
 )
-from tilefoundry.ir.hir.schedule import ScheduleRefusal
+from tilefoundry.ir.hir.schedule import ScheduleOp, ScheduleRefusal
 from tilefoundry.ir.types import DType, TensorType
 from tilefoundry.ir.types.substitute import dim_vars_by_name
 from tilefoundry.ir.types.utils import static_dim_value, tensor_types
 from tilefoundry.passes.transforms.convert_hir_to_tir import LoweringError
 from tilefoundry.schedule.candidates import candidates as report_candidates
 from tilefoundry.schedule.finalize import finalize
+from tilefoundry.visitor_registry.contexts import ValuationContext
+from tilefoundry.visitor_registry.valuation import ValuationVisitor
 from tilefoundry.visitor_registry.verify import verify_prim_function
+from tilefoundry_ascend.ascend.ir.tir.instructions import AscendMmad
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.schedule.envelope_inspector import inspect_tir_envelope
 from tilefoundry_ascend.ascend.target import AscendTarget
+
+_SPECIAL_VECTOR_OP_EQUIV = 8
 
 
 @dataclass(frozen=True)
@@ -46,15 +56,35 @@ class HirRooflineSummary:
     memory_floor_us: float
     ideal_roofline_us: float
     dominant_bound: str
+    requested_anchor_dims: dict[str, int] = field(default_factory=dict)
+    resolved_hir_dims: dict[str, int] = field(default_factory=dict)
+    shape_exact_match: bool = True
+    fallback_reason: str | None = None
+    cube_flops: int = 0
+    vector_flops: int = 0
+    special_ops: int = 0
+    cube_floor_us: float = 0.0
+    vec_floor_us: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable dictionary representation."""
         return {
             "anchor_dims": {str(k): int(v) for k, v in self.anchor_dims.items()},
+            "requested_anchor_dims": {
+                str(k): int(v) for k, v in self.requested_anchor_dims.items()
+            },
+            "resolved_hir_dims": {str(k): int(v) for k, v in self.resolved_hir_dims.items()},
+            "shape_exact_match": bool(self.shape_exact_match),
+            "fallback_reason": self.fallback_reason,
             "compute_flops": int(self.compute_flops),
+            "cube_flops": int(self.cube_flops),
+            "vector_flops": int(self.vector_flops),
+            "special_ops": int(self.special_ops),
             "min_gm_bytes": int(self.min_gm_bytes),
             "arithmetic_intensity": float(self.arithmetic_intensity),
             "compute_floor_us": float(self.compute_floor_us),
+            "cube_floor_us": float(self.cube_floor_us),
+            "vec_floor_us": float(self.vec_floor_us),
             "memory_floor_us": float(self.memory_floor_us),
             "ideal_roofline_us": float(self.ideal_roofline_us),
             "dominant_bound": str(self.dominant_bound),
@@ -64,8 +94,22 @@ class HirRooflineSummary:
     def from_dict(cls, payload: Mapping[str, object]) -> HirRooflineSummary:
         """Reconstruct a HirRooflineSummary from a serialized dictionary."""
         raw_dims = payload.get("anchor_dims") or {}
+        anchor_dims = {str(k): int(v) for k, v in dict(raw_dims).items()}
+        raw_req = payload.get("requested_anchor_dims")
+        raw_res = payload.get("resolved_hir_dims")
+        requested_dims = (
+            {str(k): int(v) for k, v in dict(raw_req).items()}
+            if raw_req is not None
+            else dict(anchor_dims)
+        )
+        resolved_dims = (
+            {str(k): int(v) for k, v in dict(raw_res).items()}
+            if raw_res is not None
+            else dict(anchor_dims)
+        )
+        raw_fallback = payload.get("fallback_reason")
         return cls(
-            anchor_dims={str(k): int(v) for k, v in dict(raw_dims).items()},
+            anchor_dims=anchor_dims,
             compute_flops=int(payload["compute_flops"]),
             min_gm_bytes=int(payload["min_gm_bytes"]),
             arithmetic_intensity=float(payload["arithmetic_intensity"]),
@@ -73,18 +117,34 @@ class HirRooflineSummary:
             memory_floor_us=float(payload["memory_floor_us"]),
             ideal_roofline_us=float(payload["ideal_roofline_us"]),
             dominant_bound=str(payload["dominant_bound"]),
+            requested_anchor_dims=requested_dims,
+            resolved_hir_dims=resolved_dims,
+            shape_exact_match=bool(payload.get("shape_exact_match", True)),
+            fallback_reason=str(raw_fallback) if raw_fallback is not None else None,
+            cube_flops=int(payload.get("cube_flops", 0)),
+            vector_flops=int(payload.get("vector_flops", 0)),
+            special_ops=int(payload.get("special_ops", 0)),
+            cube_floor_us=float(payload.get("cube_floor_us", 0.0)),
+            vec_floor_us=float(payload.get("vec_floor_us", 0.0)),
         )
 
     def format_for_prompt(self) -> str:
         """Format the roofline summary as compact prompt text."""
-        dims = ", ".join(f"{k}={v}" for k, v in sorted(self.anchor_dims.items())) or "default"
+        display_dims = self.resolved_hir_dims or self.anchor_dims
+        dims = ", ".join(f"{k}={v}" for k, v in sorted(display_dims.items())) or "default"
+        mismatch = ""
+        if not self.shape_exact_match:
+            mismatch = f", shape_exact_match=False, requested={self.requested_anchor_dims}"
+        if self.fallback_reason:
+            mismatch += f", fallback={self.fallback_reason}"
         return (
-            f"Roofline[{dims}]: flops={self.compute_flops}, "
+            f"Roofline[{dims}]: flops={self.compute_flops} "
+            f"(cube={self.cube_flops}, vec={self.vector_flops}, special={self.special_ops}), "
             f"min_gm_bytes={self.min_gm_bytes}, AI={self.arithmetic_intensity:.4f}, "
             f"compute_floor_us={self.compute_floor_us:.4f}, "
             f"memory_floor_us={self.memory_floor_us:.4f}, "
             f"ideal_roofline_us={self.ideal_roofline_us:.4f}, "
-            f"dominant_bound={self.dominant_bound}"
+            f"dominant_bound={self.dominant_bound}{mismatch}"
         )
 
 
@@ -131,6 +191,10 @@ class HirTirNavigationPacket:
     z3_pipeline_summary: dict[str, object]
     tir_ledger: ObjectivePhysicalLedger | None
     lowering_diagnostics: tuple[str, ...]
+    requested_anchor_dims: dict[str, int] = field(default_factory=dict)
+    resolved_hir_dims: dict[str, int] = field(default_factory=dict)
+    shape_exact_match: bool = True
+    fallback_reason: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable dictionary representation."""
@@ -142,18 +206,47 @@ class HirTirNavigationPacket:
             "z3_pipeline_summary": dict(self.z3_pipeline_summary),
             "tir_ledger": self.tir_ledger.to_dict() if self.tir_ledger is not None else None,
             "lowering_diagnostics": list(self.lowering_diagnostics),
+            "requested_anchor_dims": {
+                str(k): int(v) for k, v in self.requested_anchor_dims.items()
+            },
+            "resolved_hir_dims": {str(k): int(v) for k, v in self.resolved_hir_dims.items()},
+            "shape_exact_match": bool(self.shape_exact_match),
+            "fallback_reason": self.fallback_reason,
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> HirTirNavigationPacket:
         """Reconstruct a HirTirNavigationPacket from a serialized dictionary."""
+        roofline = HirRooflineSummary.from_dict(payload["roofline"])
         raw_cands = payload.get("candidate_ops") or ()
         raw_ledger = payload.get("tir_ledger")
         raw_z3 = payload.get("z3_pipeline_summary") or {}
         raw_diags = payload.get("lowering_diagnostics") or ()
+        raw_req = payload.get("requested_anchor_dims")
+        raw_res = payload.get("resolved_hir_dims")
+        requested_dims = (
+            {str(k): int(v) for k, v in dict(raw_req).items()}
+            if raw_req is not None
+            else dict(roofline.requested_anchor_dims)
+        )
+        resolved_dims = (
+            {str(k): int(v) for k, v in dict(raw_res).items()}
+            if raw_res is not None
+            else dict(roofline.resolved_hir_dims)
+        )
+        shape_exact = (
+            bool(payload["shape_exact_match"])
+            if "shape_exact_match" in payload
+            else roofline.shape_exact_match
+        )
+        if "fallback_reason" in payload:
+            raw_fb = payload.get("fallback_reason")
+            fallback_reason = str(raw_fb) if raw_fb is not None else None
+        else:
+            fallback_reason = roofline.fallback_reason
         return cls(
             entry_name=str(payload["entry_name"]),
-            roofline=HirRooflineSummary.from_dict(payload["roofline"]),
+            roofline=roofline,
             candidate_ops=tuple(
                 item
                 if isinstance(item, HirCandidateOpEntry)
@@ -168,6 +261,10 @@ class HirTirNavigationPacket:
                 else ObjectivePhysicalLedger.from_dict(raw_ledger)
             ),
             lowering_diagnostics=tuple(str(item) for item in raw_diags),
+            requested_anchor_dims=requested_dims,
+            resolved_hir_dims=resolved_dims,
+            shape_exact_match=shape_exact,
+            fallback_reason=fallback_reason,
         )
 
     def format_for_prompt(self) -> str:
@@ -175,10 +272,22 @@ class HirTirNavigationPacket:
         lines = [
             f"Entry: {self.entry_name}",
             self.roofline.format_for_prompt(),
-            f"Candidate Ops ({len(self.candidate_ops)}):",
-            *(entry.format_for_prompt() for entry in self.candidate_ops),
-            f"Z3 Pipelines: {self.z3_pipeline_summary}",
         ]
+        if not self.shape_exact_match or self.fallback_reason is not None:
+            lines.append(
+                f"Shape Provenance: shape_exact_match={self.shape_exact_match}, "
+                f"resolved_hir_dims={self.resolved_hir_dims}, "
+                f"requested_anchor_dims={self.requested_anchor_dims}"
+            )
+            if self.fallback_reason is not None:
+                lines.append(f"Fallback Reason: {self.fallback_reason}")
+        lines.extend(
+            [
+                f"Candidate Ops ({len(self.candidate_ops)}):",
+                *(entry.format_for_prompt() for entry in self.candidate_ops),
+                f"Z3 Pipelines: {self.z3_pipeline_summary}",
+            ]
+        )
         if self.tir_ledger is not None:
             lines.append(
                 f"TIR Ledger: mode={self.tir_ledger.analysis_mode}, "
@@ -195,39 +304,175 @@ class HirTirNavigationPacket:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class _LoadedModuleInfo:
+    """Loaded HIR module plus parameterized-build provenance."""
+
+    module: Module
+    parameterized_applied: bool
+    fallback_reason: str | None
+    build_param_names: frozenset[str]
+    source: str
+    path: Path
+
+
 def _load_module_from_source(
     source: str,
     tmpdir: Path,
     filename: str,
     *,
     anchor_dims: Mapping[str, int] | None,
-) -> Module:
+) -> _LoadedModuleInfo:
     """Write HIR source to *tmpdir* and load via build() factory or load_authored_ir."""
     path = tmpdir / filename
     path.write_text(source, encoding="utf-8")
-    if anchor_dims:
-        try:
-            ns = runpy.run_path(str(path))
-            build_fn = ns.get("build")
-            if callable(build_fn):
-                sig = inspect.signature(build_fn)
-                matched = {
-                    str(k): int(v)
-                    for k, v in anchor_dims.items()
-                    if str(k) in sig.parameters
-                    and sig.parameters[str(k)].kind
-                    in (
-                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                        inspect.Parameter.KEYWORD_ONLY,
-                    )
-                }
-                if matched:
+    fallback_reason: str | None = None
+    build_param_names: set[str] = set()
+    try:
+        ns = runpy.run_path(str(path))
+    except (VerifyError, ValueError, AssertionError, TypeError) as exc:
+        return _LoadedModuleInfo(
+            module=load_authored_ir(str(path)),
+            parameterized_applied=False,
+            fallback_reason=f"{type(exc).__name__}: {exc}",
+            build_param_names=frozenset(),
+            source=source,
+            path=path,
+        )
+
+    build_fn = ns.get("build")
+    if callable(build_fn):
+        sig = inspect.signature(build_fn)
+        build_param_names = {
+            str(k)
+            for k, param in sig.parameters.items()
+            if param.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+        if anchor_dims:
+            matched = {
+                str(k): int(v)
+                for k, v in anchor_dims.items()
+                if str(k) in build_param_names
+            }
+            if matched:
+                try:
                     built = build_fn(**matched)
                     if isinstance(built, Module):
-                        return built
-        except (ValueError, AssertionError, TypeError):
-            pass
-    return load_authored_ir(str(path))
+                        return _LoadedModuleInfo(
+                            module=built,
+                            parameterized_applied=True,
+                            fallback_reason=None,
+                            build_param_names=frozenset(build_param_names),
+                            source=source,
+                            path=path,
+                        )
+                except (VerifyError, ValueError, AssertionError, TypeError) as exc:
+                    fallback_reason = f"{type(exc).__name__}: {exc}"
+
+    return _LoadedModuleInfo(
+        module=load_authored_ir(str(path)),
+        parameterized_applied=False,
+        fallback_reason=fallback_reason,
+        build_param_names=frozenset(build_param_names),
+        source=source,
+        path=path,
+    )
+
+
+def _tensor_shape_expr_names(annotation: ast.expr | None) -> tuple[str | None, ...]:
+    """Return symbolic axis names from a Tensor[(d0, d1, ...), dtype] AST annotation."""
+    if not isinstance(annotation, ast.Subscript):
+        return ()
+    slc = annotation.slice
+    if isinstance(slc, ast.Tuple) and slc.elts:
+        shape_node = slc.elts[0]
+    else:
+        return ()
+    if isinstance(shape_node, ast.Tuple):
+        elts = shape_node.elts
+    else:
+        elts = [shape_node]
+    return tuple(elt.id if isinstance(elt, ast.Name) else None for elt in elts)
+
+
+def _extract_ast_param_shape_names(source: str, fn_name: str) -> dict[str, tuple[str | None, ...]]:
+    """Map parameter names of *fn_name* in *source* to their symbolic tensor axis names."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    mapping: dict[str, tuple[str | None, ...]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != fn_name:
+            continue
+        for arg in node.args.args:
+            if arg.arg in ("self", "cls"):
+                continue
+            names = _tensor_shape_expr_names(arg.annotation)
+            if names:
+                mapping.setdefault(arg.arg, names)
+    return mapping
+
+
+def _extract_resolved_hir_dims(
+    source: str,
+    authored_fn,
+    checked_fn,
+    build_param_names: frozenset[str],
+) -> dict[str, int]:
+    """Extract resolved static dimension bindings directly from *checked_fn* parameters."""
+    resolved: dict[str, int] = {}
+    for p_before, p_after in zip(authored_fn.params, checked_fn.params, strict=False):
+        if not isinstance(p_before.type, TensorType) or not isinstance(p_after.type, TensorType):
+            continue
+        for d_before, d_after in zip(p_before.type.shape, p_after.type.shape, strict=False):
+            dim_name = getattr(d_before, "name", None)
+            val = static_dim_value(d_after)
+            if dim_name and val is not None:
+                resolved.setdefault(str(dim_name), int(val))
+
+    ast_shapes = _extract_ast_param_shape_names(source, str(checked_fn.name))
+    for param in checked_fn.params:
+        if not isinstance(param.type, TensorType):
+            continue
+        axis_names = ast_shapes.get(str(param.name), ())
+        for axis_name, dim_val in zip(axis_names, param.type.shape, strict=False):
+            if axis_name is None:
+                continue
+            if build_param_names and axis_name not in build_param_names:
+                continue
+            val = static_dim_value(dim_val)
+            if val is not None:
+                resolved.setdefault(axis_name, int(val))
+    return resolved
+
+
+def _evaluate_shape_match(
+    requested_dims: Mapping[str, int],
+    resolved_dims: Mapping[str, int],
+    *,
+    fallback_reason: str | None,
+    parameterized_applied: bool,
+    declared_dimvars: set[str],
+    build_param_names: frozenset[str],
+) -> bool:
+    """Return True only when parameterized resolution succeeded and all resolvable dims match."""
+    if fallback_reason is not None:
+        return False
+    if not requested_dims:
+        return True
+    resolvable = set(resolved_dims.keys()) | declared_dimvars | set(build_param_names)
+    dimvar_bound = any(str(k) in declared_dimvars for k in requested_dims)
+    if not (parameterized_applied or dimvar_bound):
+        return False
+    for key, val in requested_dims.items():
+        if key in resolvable and resolved_dims.get(key) != int(val):
+            return False
+    return True
 
 
 def _check_with_filtered_dims(
@@ -235,7 +480,7 @@ def _check_with_filtered_dims(
     *,
     anchor_dims: Mapping[str, int] | None,
 ):
-    """Specialize only declared DimVars and return (checked_mod, checked_fn, authored_fn)."""
+    """Specialize declared DimVars and return checked module, fn, authored fn, and DimVars."""
     normalize_pipeline_references(mod)
     authored_fn = mod.entry_function()
     declared = set(program_dim_vars(mod, authored_fn).keys()) | set(
@@ -250,7 +495,7 @@ def _check_with_filtered_dims(
         mod, authored_fn, dims=filtered if filtered else None
     )
     rebind_cloned_pipeline_references(checked_mod)
-    return checked_mod, checked_fn, authored_fn
+    return checked_mod, checked_fn, authored_fn, declared
 
 
 def _tensor_static_bytes(ttype: TensorType) -> int:
@@ -265,22 +510,128 @@ def _tensor_static_bytes(ttype: TensorType) -> int:
     return (elems * ttype.dtype.bit_width + 7) // 8
 
 
+def _is_cube_matrix_op(op: object) -> bool:
+    """Return True if *op* executes on AIC Cube matrix units rather than AIV vector units."""
+    if isinstance(op, (MatMul, Conv2D)):
+        return True
+    if isinstance(op, ScheduleOp):
+        return isinstance(op.op, AscendMmad)
+    return False
+
+
+class _WorkSplitVisitor(ValuationVisitor[None]):
+    """Accumulate loop-multiplied Cube FLOPs, Vector FLOPs, and non-FLOP service ops."""
+
+    def __init__(
+        self,
+        callee_totals: Mapping[int, tuple[dict[str, int], dict[str, int], dict[str, int]]],
+    ) -> None:
+        super().__init__()
+        self.callee_totals = callee_totals
+        self.cube_flops: dict[str, int] = {}
+        self.vec_flops: dict[str, int] = {}
+        self.other_ops: dict[str, int] = {}
+
+    def default_visit_leaf(self, expr, _operands, ctx) -> None:
+        if not isinstance(expr, Call):
+            return
+        repeats = ctx.scope.repeats_of(expr, ctx.topology_level)
+        trips = int(repeats.loop_trips)
+        callee = ctx.callee
+        if callee is not None and id(callee) in self.callee_totals:
+            c_cube, c_vec, c_other = self.callee_totals[id(callee)]
+            for k, v in c_cube.items():
+                self.cube_flops[k] = self.cube_flops.get(k, 0) + v * trips
+            for k, v in c_vec.items():
+                self.vec_flops[k] = self.vec_flops.get(k, 0) + v * trips
+            for k, v in c_other.items():
+                self.other_ops[k] = self.other_ops.get(k, 0) + v * trips
+            return
+
+        record = get_metadata(expr, ComputeCostMetadata)
+        if record is None:
+            return
+        dest_flops = self.cube_flops if _is_cube_matrix_op(expr.target) else self.vec_flops
+        for dtype_name, spread in record.flops.kinds:
+            dest_flops[dtype_name] = dest_flops.get(dtype_name, 0) + int(spread.total) * trips
+        for kind, spread in record.other_ops.kinds:
+            self.other_ops[kind] = self.other_ops.get(kind, 0) + int(spread.total) * trips
+
+
+def _split_cube_and_vector_work(
+    checked_mod: Module,
+    checked_fn,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    """Split function compute cost into Cube FLOPs, Vector FLOPs, and service ops."""
+    topologies = checked_mod.effective_topologies()
+    topology_level = topologies[0].name if topologies else None
+    definitions: dict[int, object] = {}
+    contexts: list[AnalyzeContext] = []
+    frames = tuple(
+        ValuationVisitor.definitions(
+            ValuationContext(checked_mod, checked_fn), postorder=True
+        )
+    )
+    for frame in frames:
+        context = AnalyzeContext(
+            module=frame.module,
+            function=frame.function,
+            target=frame.target,
+            topologies=frame.topologies,
+            owner=frame.function,
+            topology_level=topology_level,
+            entry=checked_fn,
+            definitions=definitions,
+        )
+        context.scope = ScopeBuilder(
+            frame.module,
+            frame.function,
+            ctx=context,
+            is_root=frame.function is checked_fn,
+        ).build()
+        definitions[id(frame.function)] = context.scope
+        contexts.append(context)
+
+    per_fn: dict[int, tuple[dict[str, int], dict[str, int], dict[str, int]]] = {}
+    for context in contexts:
+        visitor = _WorkSplitVisitor(per_fn)
+        visitor.visit(context.function.body, context)
+        per_fn[id(context.function)] = (visitor.cube_flops, visitor.vec_flops, visitor.other_ops)
+
+    if id(checked_fn) in per_fn:
+        return per_fn[id(checked_fn)]
+    cc = get_metadata(checked_fn, ComputeCostMetadata)
+    if cc is None:
+        return {}, {}, {}
+    return (
+        {},
+        {name: int(spread.total) for name, spread in cc.flops.kinds},
+        {kind: int(spread.total) for kind, spread in cc.other_ops.kinds},
+    )
+
+
 def _compute_roofline_summary(
     checked_mod: Module,
     checked_fn,
     *,
-    anchor_dims: Mapping[str, int] | None,
+    requested_anchor_dims: Mapping[str, int],
+    resolved_hir_dims: Mapping[str, int],
+    shape_exact_match: bool,
+    fallback_reason: str | None,
     target: AscendTarget,
 ) -> HirRooflineSummary:
-    """Compute HirRooflineSummary using compute-cost analysis and device hardware ceilings."""
+    """Compute HirRooflineSummary separating AIC Cube and AIV Vector/transcendental work."""
     analyze(checked_mod, checked_fn, analysis=("compute-cost",))
-    cc = get_metadata(checked_fn, ComputeCostMetadata)
-    flops_by_dtype = (
-        {name: int(spread.total) for name, spread in cc.flops.kinds}
-        if cc is not None
-        else {}
+    cube_flops_by_dtype, vec_flops_by_dtype, other_ops_by_kind = _split_cube_and_vector_work(
+        checked_mod, checked_fn
     )
-    compute_flops = sum(flops_by_dtype.values())
+    cube_flops = sum(cube_flops_by_dtype.values())
+    special_ops = int(other_ops_by_kind.get("special", 0))
+    non_special_ops = sum(
+        int(count) for kind, count in other_ops_by_kind.items() if kind != "special" and count > 0
+    )
+    vector_flops = sum(vec_flops_by_dtype.values()) + special_ops * _SPECIAL_VECTOR_OP_EQUIV
+    compute_flops = cube_flops + vector_flops
 
     io_tensors: list[TensorType] = []
     for param in checked_fn.params:
@@ -297,22 +648,43 @@ def _compute_roofline_summary(
     unit_flops = dev.unit_flops_per_second
     aic_rates = unit_flops.get("aic", {}) if getattr(dev, "aic_count", 0) > 0 else {}
     aiv_rates = unit_flops.get("aiv", {}) if getattr(dev, "aiv_count", 0) > 0 else {}
-    merged_rates: dict[DType, int] = dict(aic_rates)
-    for dt, rate in aiv_rates.items():
-        merged_rates.setdefault(dt, rate)
-    fallback_rate = aiv_rates.get(DType.f32) or max(merged_rates.values(), default=0)
+    aic_fallback = max(aic_rates.values(), default=0)
+    aiv_vec_rate = (
+        aiv_rates.get(DType.f32)
+        or max(aiv_rates.values(), default=0)
+        or int(getattr(dev, "aiv_lane_events_per_second", 0))
+    )
+    aiv_service_rate = int(getattr(dev, "aiv_lane_events_per_second", 0)) or aiv_vec_rate
 
-    compute_floor_s = 0.0
-    for dtype_name, flop_count in flops_by_dtype.items():
+    cube_floor_s = 0.0
+    for dtype_name, flop_count in cube_flops_by_dtype.items():
         if flop_count <= 0:
             continue
         dt = getattr(DType, dtype_name, None)
-        rate = merged_rates.get(dt) if dt is not None else None
+        rate = aic_rates.get(dt) if dt is not None else None
         if rate is None or rate <= 0:
-            rate = fallback_rate
+            rate = aic_fallback or aiv_vec_rate
         if rate and rate > 0:
-            compute_floor_s += flop_count / float(rate)
-    compute_floor_us = compute_floor_s * 1e6
+            cube_floor_s += flop_count / float(rate)
+
+    vec_floor_s = 0.0
+    for dtype_name, flop_count in vec_flops_by_dtype.items():
+        if flop_count <= 0:
+            continue
+        dt = getattr(DType, dtype_name, None)
+        rate = aiv_rates.get(dt) if dt is not None else None
+        if rate is None or rate <= 0:
+            rate = aiv_vec_rate
+        if rate and rate > 0:
+            vec_floor_s += flop_count / float(rate)
+    if special_ops > 0 and aiv_vec_rate > 0:
+        vec_floor_s += (special_ops * _SPECIAL_VECTOR_OP_EQUIV) / float(aiv_vec_rate)
+    if non_special_ops > 0 and aiv_service_rate > 0:
+        vec_floor_s += non_special_ops / float(aiv_service_rate)
+
+    cube_floor_us = cube_floor_s * 1e6
+    vec_floor_us = vec_floor_s * 1e6
+    compute_floor_us = vec_floor_us if cube_flops == 0 else max(cube_floor_us, vec_floor_us)
 
     hbm_bw = float(getattr(dev, "hbm_bandwidth_bytes_per_second", 0))
     memory_floor_us = (min_gm_bytes / hbm_bw) * 1e6 if hbm_bw > 0 else 0.0
@@ -327,8 +699,9 @@ def _compute_roofline_summary(
     else:
         dominant_bound = "compute"
 
+    resolved_copy = dict(resolved_hir_dims)
     return HirRooflineSummary(
-        anchor_dims={str(k): int(v) for k, v in (anchor_dims or {}).items()},
+        anchor_dims=dict(resolved_copy),
         compute_flops=compute_flops,
         min_gm_bytes=min_gm_bytes,
         arithmetic_intensity=arithmetic_intensity,
@@ -336,6 +709,15 @@ def _compute_roofline_summary(
         memory_floor_us=memory_floor_us,
         ideal_roofline_us=ideal_roofline_us,
         dominant_bound=dominant_bound,
+        requested_anchor_dims={str(k): int(v) for k, v in requested_anchor_dims.items()},
+        resolved_hir_dims=resolved_copy,
+        shape_exact_match=bool(shape_exact_match),
+        fallback_reason=fallback_reason,
+        cube_flops=cube_flops,
+        vector_flops=vector_flops,
+        special_ops=special_ops,
+        cube_floor_us=cube_floor_us,
+        vec_floor_us=vec_floor_us,
     )
 
 
@@ -388,6 +770,52 @@ def _format_z3_pipeline_summary(raw_pipelines: object) -> dict[str, object]:
     return summary
 
 
+_LOWERING_ERRORS = (
+    ScheduleRefusal,
+    LoweringError,
+    AnalysisError,
+    PipelineError,
+    VerifyError,
+    ValueError,
+    TypeError,
+    KeyError,
+    RuntimeError,
+)
+
+
+def _lower_scheduled_module(
+    sched_info: _LoadedModuleInfo,
+    *,
+    anchor_dims: Mapping[str, int] | None,
+    resolved_target: AscendTarget,
+) -> tuple[str | None, ObjectivePhysicalLedger | None, dict[str, object], str | None, dict[str, int], set[str]]:
+    """Check, solve, verify, and inspect one scheduled HIR module."""
+    sched_checked_mod, sched_checked_fn, sched_authored_fn, sched_declared = (
+        _check_with_filtered_dims(sched_info.module, anchor_dims=anchor_dims)
+    )
+    sched_resolved_dims = _extract_resolved_hir_dims(
+        sched_info.source,
+        sched_authored_fn,
+        sched_checked_fn,
+        sched_info.build_param_names,
+    )
+    analyzed = analyze(sched_checked_mod, sched_checked_fn, analysis="memory")
+    lowered = finalize(analyzed, authored=sched_authored_fn)
+    lowered_entry = lowered.entry_function()
+    verify_prim_function(lowered_entry, module_fns=lowered)
+    tir_script = as_script(lowered)
+    tir_ledger = inspect_tir_envelope(lowered_entry, target=resolved_target).ledger
+    z3_summary = _format_z3_pipeline_summary(lowered.metadata.get("ascend.pipelines", {}))
+    return (
+        tir_script,
+        tir_ledger,
+        z3_summary,
+        str(lowered_entry.name),
+        sched_resolved_dims,
+        sched_declared,
+    )
+
+
 def compile_hir_navigation_packet(
     authored_hir_source: str,
     *,
@@ -396,61 +824,128 @@ def compile_hir_navigation_packet(
     target: AscendTarget | None = None,
 ) -> HirTirNavigationPacket:
     """Compile authored and optional scheduled HIR into a navigation packet for agents."""
+    requested_dims = {str(k): int(v) for k, v in (anchor_dims or {}).items()}
     with tempfile.TemporaryDirectory() as tmp_str:
         tmpdir = Path(tmp_str)
-        authored_mod = _load_module_from_source(
+        authored_info = _load_module_from_source(
             authored_hir_source, tmpdir, "authored_hir.py", anchor_dims=anchor_dims
         )
-        resolved_target = target or authored_mod.resolve_target()
+        resolved_target = target or authored_info.module.resolve_target()
         if not isinstance(resolved_target, AscendTarget):
             resolved_target = AscendTarget("ascend.950pr")
 
-        checked_mod, checked_fn, _authored_fn = _check_with_filtered_dims(
-            authored_mod, anchor_dims=anchor_dims
+        checked_mod, checked_fn, authored_fn, declared_dimvars = _check_with_filtered_dims(
+            authored_info.module, anchor_dims=anchor_dims
         )
         entry_name = str(checked_fn.name)
-        roofline = _compute_roofline_summary(
-            checked_mod, checked_fn, anchor_dims=anchor_dims, target=resolved_target
+        authored_resolved_dims = _extract_resolved_hir_dims(
+            authored_hir_source,
+            authored_fn,
+            checked_fn,
+            authored_info.build_param_names,
+        )
+        authored_exact = _evaluate_shape_match(
+            requested_dims,
+            authored_resolved_dims,
+            fallback_reason=authored_info.fallback_reason,
+            parameterized_applied=authored_info.parameterized_applied,
+            declared_dimvars=declared_dimvars,
+            build_param_names=authored_info.build_param_names,
         )
         candidate_ops = _extract_candidate_ops(checked_mod, checked_fn)
 
-        sched_mod = (
+        sched_info = (
             _load_module_from_source(
                 scheduled_hir_source, tmpdir, "scheduled_hir.py", anchor_dims=anchor_dims
             )
             if scheduled_hir_source is not None
-            else authored_mod
+            else authored_info
         )
 
-    tir_script: str | None = None
-    tir_ledger: ObjectivePhysicalLedger | None = None
-    z3_summary: dict[str, object] = {}
-    diagnostics: list[str] = []
+        tir_script: str | None = None
+        tir_ledger: ObjectivePhysicalLedger | None = None
+        z3_summary: dict[str, object] = {}
+        diagnostics: list[str] = []
+        sched_fallback_reason = sched_info.fallback_reason
+        sched_param_applied = sched_info.parameterized_applied
+        sched_resolved_dims: dict[str, int] = dict(authored_resolved_dims)
+        sched_declared: set[str] = set(declared_dimvars)
 
-    try:
-        sched_checked_mod, sched_checked_fn, sched_authored_fn = _check_with_filtered_dims(
-            sched_mod, anchor_dims=anchor_dims
+        try:
+            (
+                tir_script,
+                tir_ledger,
+                z3_summary,
+                lowered_name,
+                sched_resolved_dims,
+                sched_declared,
+            ) = _lower_scheduled_module(
+                sched_info, anchor_dims=anchor_dims, resolved_target=resolved_target
+            )
+            if lowered_name is not None:
+                entry_name = lowered_name
+        except _LOWERING_ERRORS as exc:
+            err_msg = f"{type(exc).__name__}: {exc}"
+            if scheduled_hir_source is not None and sched_info.parameterized_applied:
+                sched_fallback_reason = err_msg
+                sched_param_applied = False
+                try:
+                    fallback_info = _LoadedModuleInfo(
+                        module=load_authored_ir(str(sched_info.path)),
+                        parameterized_applied=False,
+                        fallback_reason=err_msg,
+                        build_param_names=sched_info.build_param_names,
+                        source=sched_info.source,
+                        path=sched_info.path,
+                    )
+                    (
+                        tir_script,
+                        tir_ledger,
+                        z3_summary,
+                        lowered_name,
+                        sched_resolved_dims,
+                        sched_declared,
+                    ) = _lower_scheduled_module(
+                        fallback_info, anchor_dims=None, resolved_target=resolved_target
+                    )
+                    if lowered_name is not None:
+                        entry_name = lowered_name
+                except _LOWERING_ERRORS as fb_exc:
+                    diagnostics.append(err_msg)
+                    diagnostics.append(f"{type(fb_exc).__name__}: {fb_exc}")
+            else:
+                diagnostics.append(err_msg)
+
+    combined_fallback = authored_info.fallback_reason or sched_fallback_reason
+    if authored_info.fallback_reason and sched_fallback_reason and (
+        authored_info.fallback_reason != sched_fallback_reason
+    ):
+        combined_fallback = (
+            f"authored={authored_info.fallback_reason}; scheduled={sched_fallback_reason}"
         )
-        analyzed = analyze(sched_checked_mod, sched_checked_fn, analysis="memory")
-        lowered = finalize(analyzed, authored=sched_authored_fn)
-        lowered_entry = lowered.entry_function()
-        verify_prim_function(lowered_entry, module_fns=lowered)
-        tir_script = as_script(lowered)
-        tir_ledger = inspect_tir_envelope(lowered_entry, target=resolved_target).ledger
-        z3_summary = _format_z3_pipeline_summary(lowered.metadata.get("ascend.pipelines", {}))
-        entry_name = str(lowered_entry.name)
-    except (
-        ScheduleRefusal,
-        LoweringError,
-        AnalysisError,
-        PipelineError,
-        VerifyError,
-        ValueError,
-        TypeError,
-        KeyError,
-        RuntimeError,
-    ) as exc:
-        diagnostics.append(f"{type(exc).__name__}: {exc}")
+
+    packet_resolved_dims = (
+        sched_resolved_dims if scheduled_hir_source is not None else authored_resolved_dims
+    )
+    sched_exact = _evaluate_shape_match(
+        requested_dims,
+        packet_resolved_dims,
+        fallback_reason=sched_fallback_reason,
+        parameterized_applied=sched_param_applied,
+        declared_dimvars=sched_declared,
+        build_param_names=sched_info.build_param_names,
+    )
+    packet_exact = bool(authored_exact and sched_exact and combined_fallback is None)
+
+    roofline = _compute_roofline_summary(
+        checked_mod,
+        checked_fn,
+        requested_anchor_dims=requested_dims,
+        resolved_hir_dims=authored_resolved_dims,
+        shape_exact_match=authored_exact,
+        fallback_reason=combined_fallback,
+        target=resolved_target,
+    )
 
     return HirTirNavigationPacket(
         entry_name=entry_name,
@@ -460,6 +955,10 @@ def compile_hir_navigation_packet(
         z3_pipeline_summary=z3_summary,
         tir_ledger=tir_ledger,
         lowering_diagnostics=tuple(diagnostics),
+        requested_anchor_dims=requested_dims,
+        resolved_hir_dims=dict(packet_resolved_dims),
+        shape_exact_match=packet_exact,
+        fallback_reason=combined_fallback,
     )
 
 

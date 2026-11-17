@@ -28,8 +28,22 @@ def build(
     kv_tile: int = 8,
 ):
     """Build a single-loop online FlashMLA Mix (Cube + SimdVF + dual_copy) HIR module."""
-    assert B == 1 and N_kv == 1
-    assert S_kv % kv_tile == 0
+    if B != 1 or N_kv != 1:
+        raise ValueError(f"MlaScheduled requires B=1 and N_kv=1, got B={B}, N_kv={N_kv}")
+    if S <= 0 or S_kv <= 0 or N_q <= 0 or D_nope <= 0 or D_rope <= 0 or kv_tile <= 0:
+        raise ValueError(
+            f"MlaScheduled requires positive dimensions, got "
+            f"S={S}, S_kv={S_kv}, N_q={N_q}, D_nope={D_nope}, D_rope={D_rope}, kv_tile={kv_tile}"
+        )
+    if D_nope % 16 != 0 or D_rope % 16 != 0:
+        raise ValueError(
+            f"MlaScheduled requires D_nope and D_rope divisible by 16, "
+            f"got D_nope={D_nope}, D_rope={D_rope}"
+        )
+    if kv_tile > S_kv:
+        kv_tile = S_kv
+    if S_kv % kv_tile != 0:
+        kv_tile = next(d for d in range(kv_tile, 0, -1) if S_kv % d == 0)
     M = N_q * S
     D_qk = D_nope + D_rope
     kv_tiles = S_kv // kv_tile
