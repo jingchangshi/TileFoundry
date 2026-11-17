@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from tilefoundry.ir.hir.function import Function as HirFunction
@@ -94,6 +95,35 @@ class StructuralFeatures:
             "inner_contiguous_bytes": self.phi_7_inner_contiguous_bytes,
             "persistent_wave_occupancy": self.phi_8_persistent_wave_occupancy,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> StructuralFeatures:
+        """Reconstruct StructuralFeatures from phi_1..phi_8 or symbolic dictionary keys."""
+
+        def _pick(short_key: str, long_key: str, default: object) -> object:
+            if short_key in payload:
+                return payload[short_key]
+            if long_key in payload:
+                return payload[long_key]
+            full_key = f"{short_key}_{long_key}"
+            if full_key in payload:
+                return payload[full_key]
+            return default
+
+        return cls(
+            phi_1_static_affine_bounds=bool(_pick("phi_1", "static_affine_bounds", True)),
+            phi_2_cube_to_vector_ratio=float(_pick("phi_2", "cube_to_vector_ratio", 0.0)),
+            phi_3_quant_granularity=str(_pick("phi_3", "quant_granularity", "none")),
+            phi_4_indirect_sparse_gather=bool(_pick("phi_4", "indirect_sparse_gather", False)),
+            phi_5_cross_iter_recurrence=str(_pick("phi_5", "cross_iter_recurrence", "none")),
+            phi_6_dynamic_cross_core_handoff=bool(
+                _pick("phi_6", "dynamic_cross_core_handoff", False)
+            ),
+            phi_7_inner_contiguous_bytes=int(_pick("phi_7", "inner_contiguous_bytes", 0)),
+            phi_8_persistent_wave_occupancy=float(
+                _pick("phi_8", "persistent_wave_occupancy", 0.0)
+            ),
+        )
 
 
 @dataclass(frozen=True)

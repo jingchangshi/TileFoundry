@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 import json
 import os
@@ -445,6 +445,59 @@ class GateFunnel:
         )
 
 
+def prescreen_dsl_tile_kwargs(
+    dsl_source: str,
+    *,
+    factory_name: str,
+    candidate_kwargs_list: Sequence[Mapping[str, object]],
+    target: AscendTarget | None = None,
+) -> tuple[dict[str, object], StageAResult]:
+    """Run Stage A across tile kwargs and pick the lowest-cost legal configuration."""
+    if not candidate_kwargs_list:
+        raise ValueError("candidate_kwargs_list must not be empty")
+    legal: list[tuple[tuple[float, int, int], dict[str, object], StageAResult]] = []
+    rejections: list[str] = []
+    for idx, raw_kwargs in enumerate(candidate_kwargs_list):
+        kwargs = dict(raw_kwargs)
+        res = run_stage_a_static(
+            dsl_source,
+            factory_name=factory_name,
+            factory_kwargs=kwargs,
+            target=target,
+        )
+        ledger = res.ledger
+        if not res.passed or ledger is None:
+            rejections.append(f"{kwargs}: {res.error_message or 'stage_a_failed'}")
+            continue
+        if not ledger.is_legal or ledger.max_overflow_bytes > 0:
+            rejections.append(f"{kwargs}: overflow={ledger.max_overflow_bytes}")
+            continue
+        degraded = [
+            buf
+            for wl in ledger.waterlines.values()
+            for buf in wl.degraded_single_buffers
+        ]
+        if degraded:
+            rejections.append(f"{kwargs}: degraded_single_buffers={degraded}")
+            continue
+        ii_rank = (
+            float(ledger.steady_state_ii)
+            if ledger.steady_state_ii is not None and ledger.steady_state_ii > 0
+            else float("inf")
+        )
+        dom_cycles = ledger.pipe_cycles.get(
+            ledger.dominant_pipe,
+            max((v for v in ledger.pipe_cycles.values() if v > 0), default=0),
+        )
+        legal.append(((ii_rank, dom_cycles, idx), kwargs, res))
+    if not legal:
+        detail = "; ".join(rejections[:5])
+        raise ValueError(f"no legal tile kwargs passed Stage A prescreen: {detail}")
+    legal.sort(key=lambda item: item[0])
+    _, best_kwargs, best_stage_a = legal[0]
+    return best_kwargs, best_stage_a
+
+
 def ledger_to_json(ledger: ObjectivePhysicalLedger | None) -> str:
     """Serialize an optional ledger safely for worker prompts."""
     if ledger is None:
@@ -468,6 +521,7 @@ __all__ = [
     "StageBResult",
     "StageCResult",
     "ledger_to_json",
+    "prescreen_dsl_tile_kwargs",
     "run_stage_a_static",
     "run_stage_b_compile",
     "run_stage_c_agent_gates",

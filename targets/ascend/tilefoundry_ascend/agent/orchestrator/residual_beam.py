@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
+from tilefoundry_ascend.agent.router.capability_gate import StructuralFeatures
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 
 _NOVELTY_TOKENS = (
@@ -42,6 +43,19 @@ class StaticDynamicResidual:
             "unexplained_gap_ratio": self.unexplained_gap_ratio,
         }
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> StaticDynamicResidual:
+        """Reconstruct StaticDynamicResidual from a serialized dictionary."""
+        return cls(
+            measured_latency_us=float(payload.get("measured_latency_us", 0.0)),
+            predicted_bottleneck_util=float(payload.get("predicted_bottleneck_util", 0.0)),
+            measured_aic_mac_ratio=float(payload.get("measured_aic_mac_ratio", 0.0)),
+            measured_aiv_vec_ratio=float(payload.get("measured_aiv_vec_ratio", 0.0)),
+            measured_mte2_wait_ratio=float(payload.get("measured_mte2_wait_ratio", 0.0)),
+            measured_sync_stall_ratio=float(payload.get("measured_sync_stall_ratio", 0.0)),
+            unexplained_gap_ratio=float(payload.get("unexplained_gap_ratio", 0.0)),
+        )
+
 
 def compute_static_dynamic_residual(
     ledger: ObjectivePhysicalLedger,
@@ -55,18 +69,38 @@ def compute_static_dynamic_residual(
     sync_stall = float(telemetry.get("sync_stall_ratio", 0.0))
 
     positive_cycles = [v for v in ledger.pipe_cycles.values() if v > 0]
-    if positive_cycles and ledger.steady_state_ii and ledger.steady_state_ii > 0:
-        predicted_util = min(1.0, max(positive_cycles) / float(max(1, sum(positive_cycles))))
+    if positive_cycles and ledger.steady_state_ii is not None and ledger.steady_state_ii > 0:
+        dom = max(positive_cycles)
+        predicted_util = min(1.0, float(dom) / float(max(dom, ledger.steady_state_ii)))
     elif positive_cycles:
         dom = max(positive_cycles)
-        total = max(1, sum(positive_cycles))
-        predicted_util = min(1.0, max(0.5, float(dom) / float(total) + 0.35))
+        non_dom = sum(positive_cycles) - dom
+        predicted_util = min(1.0, float(dom) / float(max(1.0, dom + 0.25 * non_dom)))
     else:
         predicted_util = 0.0
 
-    observed_util = max(aic_mac, aiv_vec, mte2_wait)
-    raw_gap = max(0.0, predicted_util - observed_util)
-    unexplained = min(1.0, max(raw_gap, sync_stall * 0.5))
+    pmu_keys = (
+        "aic_mac_ratio",
+        "aic_mad",
+        "aiv_vec_ratio",
+        "aiv_vec",
+        "mte2_wait_ratio",
+        "aiv_mte2",
+        "aic_fixpipe",
+    )
+    if any(key in telemetry for key in pmu_keys):
+        aic_fix = float(telemetry.get("aic_fixpipe", 0.0))
+        observed_util = max(aic_mac, aiv_vec, mte2_wait, aic_fix)
+        unexplained = min(
+            1.0,
+            max(max(0.0, predicted_util - observed_util), sync_stall * 0.5),
+        )
+    elif "roofline_eta" in telemetry:
+        eta = min(1.0, max(0.0, float(telemetry["roofline_eta"])))
+        unexplained = min(1.0, max(max(0.0, predicted_util - eta), sync_stall * 0.5))
+    else:
+        unexplained = min(1.0, sync_stall * 0.5)
+
     return StaticDynamicResidual(
         measured_latency_us=measured_us,
         predicted_bottleneck_util=round(predicted_util, 6),
@@ -106,6 +140,68 @@ class BeamCandidate:
     structural_signature: tuple[str, ...] = ()
     hypothesis: str = ""
     parent_id: str | None = None
+    features: StructuralFeatures | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable dictionary representation."""
+        return {
+            "candidate_id": self.candidate_id,
+            "round_idx": self.round_idx,
+            "worker_kind": self.worker_kind,
+            "rule_id": self.rule_id,
+            "dsl_source": self.dsl_source,
+            "track": self.track,
+            "ledger": self.ledger.to_dict(),
+            "residual": self.residual.to_dict(),
+            "latency_us": self.latency_us,
+            "accuracy_passed": self.accuracy_passed,
+            "structural_signature": list(self.structural_signature),
+            "hypothesis": self.hypothesis,
+            "parent_id": self.parent_id,
+            "features": self.features.to_dict() if self.features is not None else None,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> BeamCandidate:
+        """Reconstruct a BeamCandidate from a serialized dictionary."""
+        raw_ledger = payload["ledger"]
+        ledger = (
+            raw_ledger
+            if isinstance(raw_ledger, ObjectivePhysicalLedger)
+            else ObjectivePhysicalLedger.from_dict(raw_ledger)
+        )
+        raw_residual = payload["residual"]
+        residual = (
+            raw_residual
+            if isinstance(raw_residual, StaticDynamicResidual)
+            else StaticDynamicResidual.from_dict(raw_residual)
+        )
+        raw_features = payload.get("features")
+        if raw_features is None:
+            features = None
+        elif isinstance(raw_features, StructuralFeatures):
+            features = raw_features
+        else:
+            features = StructuralFeatures.from_dict(raw_features)
+        raw_rule = payload.get("rule_id")
+        raw_parent = payload.get("parent_id")
+        raw_sig = payload.get("structural_signature") or ()
+        return cls(
+            candidate_id=str(payload["candidate_id"]),
+            round_idx=int(payload["round_idx"]),
+            worker_kind=str(payload["worker_kind"]),
+            rule_id=str(raw_rule) if raw_rule is not None else None,
+            dsl_source=str(payload["dsl_source"]),
+            track=str(payload["track"]),
+            ledger=ledger,
+            residual=residual,
+            latency_us=float(payload["latency_us"]),
+            accuracy_passed=bool(payload["accuracy_passed"]),
+            structural_signature=tuple(str(item) for item in raw_sig),
+            hypothesis=str(payload.get("hypothesis", "")),
+            parent_id=str(raw_parent) if raw_parent is not None else None,
+            features=features,
+        )
 
 
 @dataclass
@@ -116,9 +212,16 @@ class TwoLaneBeamSearch:
     stepping_stone_width: int = 2
     exploit_beam: list[BeamCandidate] = field(default_factory=list)
     stepping_stone_beam: list[BeamCandidate] = field(default_factory=list)
-    seen_signatures: set[tuple[str, ...]] = field(default_factory=set)
+    exploited_signatures: set[tuple[str, ...]] = field(default_factory=set)
 
-    def update(self, new_candidates: Sequence[BeamCandidate]) -> tuple[list[BeamCandidate], list[BeamCandidate]]:
+    def mark_parent_selected(self, candidate: BeamCandidate) -> None:
+        """Record a parent candidate signature as exploited once expanded."""
+        self.exploited_signatures.add(candidate.structural_signature)
+
+    def update(
+        self,
+        new_candidates: Sequence[BeamCandidate],
+    ) -> tuple[list[BeamCandidate], list[BeamCandidate]]:
         """Update Exploit and Stepping-Stone lanes from legal, accurate candidates."""
         valid = [
             c
@@ -135,7 +238,7 @@ class TwoLaneBeamSearch:
         self.exploit_beam = sorted_exploit[: self.exploit_width]
         exploit_ids = {c.candidate_id for c in self.exploit_beam}
         for c in self.exploit_beam:
-            self.seen_signatures.add(c.structural_signature)
+            self.exploited_signatures.add(c.structural_signature)
 
         stone_pool = [
             c
@@ -152,15 +255,13 @@ class TwoLaneBeamSearch:
         novel_ranked = sorted(
             deduped_stones.values(),
             key=lambda c: (
-                0 if c.structural_signature not in self.seen_signatures else 1,
+                0 if c.structural_signature not in self.exploited_signatures else 1,
                 -len(c.structural_signature),
                 c.latency_us,
                 c.candidate_id,
             ),
         )
         self.stepping_stone_beam = novel_ranked[: self.stepping_stone_width]
-        for c in self.stepping_stone_beam:
-            self.seen_signatures.add(c.structural_signature)
         return list(self.exploit_beam), list(self.stepping_stone_beam)
 
     def parent_pool(self) -> list[BeamCandidate]:
@@ -169,6 +270,36 @@ class TwoLaneBeamSearch:
         for c in (*self.exploit_beam, *self.stepping_stone_beam):
             merged[c.candidate_id] = c
         return list(merged.values())
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable snapshot of both beam lanes and exploited signatures."""
+        return {
+            "exploit_width": self.exploit_width,
+            "stepping_stone_width": self.stepping_stone_width,
+            "exploit_beam": [c.to_dict() for c in self.exploit_beam],
+            "stepping_stone_beam": [c.to_dict() for c in self.stepping_stone_beam],
+            "exploited_signatures": [list(sig) for sig in sorted(self.exploited_signatures)],
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> TwoLaneBeamSearch:
+        """Reconstruct a TwoLaneBeamSearch instance from a serialized snapshot."""
+        raw_exploit = payload.get("exploit_beam") or ()
+        raw_stones = payload.get("stepping_stone_beam") or ()
+        raw_sigs = payload.get("exploited_signatures") or ()
+        return cls(
+            exploit_width=int(payload.get("exploit_width", 2)),
+            stepping_stone_width=int(payload.get("stepping_stone_width", 2)),
+            exploit_beam=[
+                c if isinstance(c, BeamCandidate) else BeamCandidate.from_dict(c)
+                for c in raw_exploit
+            ],
+            stepping_stone_beam=[
+                c if isinstance(c, BeamCandidate) else BeamCandidate.from_dict(c)
+                for c in raw_stones
+            ],
+            exploited_signatures={tuple(str(item) for item in sig) for sig in raw_sigs},
+        )
 
 
 __all__ = [

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from itertools import product
 
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
@@ -138,9 +139,90 @@ def prescreen_tile_configs(
     return feasible
 
 
+def _aligned_axis_values(
+    value: int,
+    step: int,
+    *,
+    max_val: int | None = None,
+    require_even_fractals: bool = False,
+) -> tuple[int, ...]:
+    if value % step == 0:
+        raw = (value - step, value, value + step)
+    else:
+        base = (value // step) * step
+        raw = (base, base + step)
+    valid: list[int] = []
+    for cand in raw:
+        if cand <= 0 or cand % 16 != 0:
+            continue
+        if require_even_fractals and (cand // 16) % 2 != 0:
+            continue
+        if max_val is not None and cand > max_val:
+            continue
+        if cand not in valid:
+            valid.append(cand)
+    return tuple(valid)
+
+
+def generate_aligned_neighborhood(
+    center: TileConfigCandidate,
+    *,
+    m_max: int | None = None,
+    n_max: int | None = None,
+    k_max: int | None = None,
+) -> tuple[TileConfigCandidate, ...]:
+    """Expand +/-1 fractal-aligned (bm, bn, bk, stages) neighbors around a tile config."""
+    m_step = 32 if center.aiv_split == 2 else 16
+    bm_vals = _aligned_axis_values(
+        center.bm,
+        m_step,
+        max_val=m_max,
+        require_even_fractals=(center.aiv_split == 2),
+    )
+    bn_vals = _aligned_axis_values(center.bn, 16, max_val=n_max)
+    bk_vals = _aligned_axis_values(center.bk, 16, max_val=k_max)
+    stage_vals = tuple(
+        dict.fromkeys(st for st in (center.stages - 1, center.stages, center.stages + 1) if st >= 1)
+    )
+    neighbors: list[TileConfigCandidate] = []
+    for bm, bn, bk, stages in product(bm_vals, bn_vals, bk_vals, stage_vals):
+        neighbors.append(
+            TileConfigCandidate(
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                stages=stages,
+                dtype_bytes=center.dtype_bytes,
+                accum_bytes=center.accum_bytes,
+                aiv_split=center.aiv_split,
+            )
+        )
+    return tuple(neighbors)
+
+
+def format_prescreen_summary(scores: Sequence[PrescreenScore]) -> str:
+    """Format ranked PrescreenScore entries into a concise prompt-ready summary."""
+    if not scores:
+        return "No feasible tile configurations found."
+    lines = ["Tile Prescreen Summary:"]
+    for idx, item in enumerate(scores, start=1):
+        c = item.candidate
+        status = "OK" if item.is_feasible else f"REJECT({item.rejection_reason or 'invalid'})"
+        lines.append(
+            f"  {idx}. bm={c.bm}, bn={c.bn}, bk={c.bk}, stages={c.stages}, "
+            f"aiv_split={c.aiv_split} | {status} | l1={item.l1_bytes}B, "
+            f"l0c={item.l0c_bytes}B, ub_aiv={item.ub_bytes_per_aiv}B | "
+            f"ai={item.arithmetic_intensity:.2f}, fp_ratio={item.fixpipe_to_cube_ratio:.2f}, "
+            f"score={item.score:.3f}"
+        )
+    return "\n".join(lines)
+
+
 __all__ = [
     "PrescreenScore",
     "TileConfigCandidate",
     "evaluate_tile_candidate",
+    "format_prescreen_summary",
+    "generate_aligned_neighborhood",
     "prescreen_tile_configs",
 ]

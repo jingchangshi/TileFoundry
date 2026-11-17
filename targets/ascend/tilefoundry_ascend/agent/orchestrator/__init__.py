@@ -14,6 +14,7 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
     StageCResult,
+    prescreen_dsl_tile_kwargs,
     run_stage_a_static,
     run_stage_b_compile,
     run_stage_c_agent_gates,
@@ -50,6 +51,8 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     PrescreenScore,
     TileConfigCandidate,
     evaluate_tile_candidate,
+    format_prescreen_summary,
+    generate_aligned_neighborhood,
     prescreen_tile_configs,
 )
 
@@ -88,6 +91,9 @@ __all__ = [
     "extract_creative_payload",
     "extract_python_dsl",
     "extract_structural_signature",
+    "format_prescreen_summary",
+    "generate_aligned_neighborhood",
+    "prescreen_dsl_tile_kwargs",
     "prescreen_tile_configs",
     "run_e2e_evolution",
     "run_stage_a_static",
