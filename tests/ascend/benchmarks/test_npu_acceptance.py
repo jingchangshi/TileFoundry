@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -27,6 +28,29 @@ from examples.ascend950pr_ops.attention_residual import attention_residual
 from examples.ascend950pr_ops.attention_residual import kernels as ar_kernels
 from examples.ascend950pr_ops.mla import kernels as mla_kernels
 from examples.ascend950pr_ops.mla import mla
+
+_L3_TARGET_OP = os.environ.get("TF_L3_TARGET_OPERATOR", "").strip()
+_L3_TARGET_MODULE_PATH = os.environ.get("TF_L3_TARGET_MODULE_PATH", "").strip()
+
+
+def _load_override_module(module_path_str: str, tag: str):
+    mod_path = Path(module_path_str).resolve()
+    spec = importlib.util.spec_from_file_location(f"_tf_l3_override_{tag}", mod_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load override candidate module: {mod_path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+if _L3_TARGET_MODULE_PATH:
+    if _L3_TARGET_OP == "attention_residual":
+        ar_kernels = _load_override_module(_L3_TARGET_MODULE_PATH, "attention_residual")
+        attention_residual = ar_kernels.attention_residual
+    elif _L3_TARGET_OP == "mla":
+        mla_kernels = _load_override_module(_L3_TARGET_MODULE_PATH, "mla")
+        mla = mla_kernels.mla
 
 
 def _require_npu_env() -> None:
@@ -56,12 +80,16 @@ def _call_single_kernel(kernel_module, fn, **kwargs):
 
 def test_attention_residual_cannbench_cases() -> None:
     """Verify all 20 CANNBench AttentionResidual cases on NPU."""
+    if _L3_TARGET_OP == "mla":
+        pytest.skip("Scoped to mla L3 target.")
     _require_npu_env()
     test_attention_residual.main(attention_residual)
 
 
 def test_attention_residual_baseline_vs_tuned_parity() -> None:
     """Verify AttentionResidual baseline schedule numerical parity on NPU."""
+    if _L3_TARGET_OP == "mla":
+        pytest.skip("Scoped to mla L3 target.")
     _require_npu_env()
     harness = cannbench_contract.Harness("level4/attention_residual", AR_DIR)
     target_cases = {1, 16, 20}
@@ -95,12 +123,16 @@ def test_attention_residual_baseline_vs_tuned_parity() -> None:
 
 def test_mla_cannbench_cases() -> None:
     """Verify all 20 CANNBench MLA cases on NPU."""
+    if _L3_TARGET_OP == "attention_residual":
+        pytest.skip("Scoped to attention_residual L3 target.")
     _require_npu_env()
     test_mla.main(mla)
 
 
 def test_mla_supplemental_cases() -> None:
     """Verify supplemental GQA, tail, layout, and scale MLA cases on NPU."""
+    if _L3_TARGET_OP == "attention_residual":
+        pytest.skip("Scoped to attention_residual L3 target.")
     _require_npu_env()
     payload = json.loads(SUPP_MLA_PATH.read_text(encoding="utf-8"))
     harness = cannbench_contract.Harness("level4/mla", MLA_DIR)
@@ -151,58 +183,60 @@ def test_dynamic_shape_kernel_cache_reuse() -> None:
     from tests.ascend.benchmarks.mla.golden import mla as mla_golden
 
     torch.manual_seed(0)
-    ar_kernels._KERNEL_CACHE.clear()
-    n_depth, d_dim = 4, 256
-    w = torch.randn(d_dim, dtype=torch.bfloat16)
-    gamma = torch.rand(d_dim, dtype=torch.bfloat16) + 0.5
-    for b_dim, t_dim in ((1, 16), (2, 32)):
-        v_stack = torch.randn(n_depth, b_dim, t_dim, d_dim, dtype=torch.bfloat16)
-        x = torch.randn(b_dim, t_dim, d_dim, dtype=torch.bfloat16)
-        ref = ar_golden(v_stack, x, w, gamma, alpha=0.5, epsilon=1e-6)
-        actual = _call_single_kernel(
-            ar_kernels,
-            attention_residual,
-            v_stack=v_stack.npu(),
-            x=x.npu(),
-            w=w.npu(),
-            gamma=gamma.npu(),
-            alpha=0.5,
-            epsilon=1e-6,
-        )
-        torch.testing.assert_close(actual.cpu().float(), ref.float(), rtol=2e-2, atol=2e-2)
-    assert len(ar_kernels._KERNEL_CACHE) == 1
+    if _L3_TARGET_OP != "mla":
+        ar_kernels._KERNEL_CACHE.clear()
+        n_depth, d_dim = 4, 256
+        w = torch.randn(d_dim, dtype=torch.bfloat16)
+        gamma = torch.rand(d_dim, dtype=torch.bfloat16) + 0.5
+        for b_dim, t_dim in ((1, 16), (2, 32)):
+            v_stack = torch.randn(n_depth, b_dim, t_dim, d_dim, dtype=torch.bfloat16)
+            x = torch.randn(b_dim, t_dim, d_dim, dtype=torch.bfloat16)
+            ref = ar_golden(v_stack, x, w, gamma, alpha=0.5, epsilon=1e-6)
+            actual = _call_single_kernel(
+                ar_kernels,
+                attention_residual,
+                v_stack=v_stack.npu(),
+                x=x.npu(),
+                w=w.npu(),
+                gamma=gamma.npu(),
+                alpha=0.5,
+                epsilon=1e-6,
+            )
+            torch.testing.assert_close(actual.cpu().float(), ref.float(), rtol=2e-2, atol=2e-2)
+        assert len(ar_kernels._KERNEL_CACHE) == 1
 
-    mla_kernels._KERNEL_CACHE.clear()
-    n_q, n_kv, d_nope, d_rope = 16, 1, 512, 64
-    for b_dim, s_dim, s_kv in ((2, 64, 128), (4, 128, 256)):
-        qn = torch.randn(b_dim, s_dim, n_q, d_nope, dtype=torch.bfloat16)
-        qr = torch.randn(b_dim, s_dim, n_q, d_rope, dtype=torch.bfloat16)
-        kn = torch.randn(b_dim, s_kv, n_kv, d_nope, dtype=torch.bfloat16)
-        kr = torch.randn(b_dim, s_kv, n_kv, d_rope, dtype=torch.bfloat16)
-        v = kn.clone()
-        ref = mla_golden(
-            qn,
-            qr,
-            kn,
-            kr,
-            v,
-            numKVHeads=n_kv,
-            scaleValue=-1.0,
-            inputLayout="BSND",
-            is_causal=True,
-        )
-        actual = _call_single_kernel(
-            mla_kernels,
-            mla,
-            q_nope=qn.npu(),
-            q_rope=qr.npu(),
-            k_nope=kn.npu(),
-            k_rope=kr.npu(),
-            v=v.npu(),
-            numKVHeads=n_kv,
-            scaleValue=-1.0,
-            inputLayout="BSND",
-            is_causal=True,
-        )
-        torch.testing.assert_close(actual.cpu().float(), ref.float(), rtol=2e-2, atol=2e-2)
-    assert len(mla_kernels._KERNEL_CACHE) == 1
+    if _L3_TARGET_OP != "attention_residual":
+        mla_kernels._KERNEL_CACHE.clear()
+        n_q, n_kv, d_nope, d_rope = 16, 1, 512, 64
+        for b_dim, s_dim, s_kv in ((2, 64, 128), (4, 128, 256)):
+            qn = torch.randn(b_dim, s_dim, n_q, d_nope, dtype=torch.bfloat16)
+            qr = torch.randn(b_dim, s_dim, n_q, d_rope, dtype=torch.bfloat16)
+            kn = torch.randn(b_dim, s_kv, n_kv, d_nope, dtype=torch.bfloat16)
+            kr = torch.randn(b_dim, s_kv, n_kv, d_rope, dtype=torch.bfloat16)
+            v = kn.clone()
+            ref = mla_golden(
+                qn,
+                qr,
+                kn,
+                kr,
+                v,
+                numKVHeads=n_kv,
+                scaleValue=-1.0,
+                inputLayout="BSND",
+                is_causal=True,
+            )
+            actual = _call_single_kernel(
+                mla_kernels,
+                mla,
+                q_nope=qn.npu(),
+                q_rope=qr.npu(),
+                k_nope=kn.npu(),
+                k_rope=kr.npu(),
+                v=v.npu(),
+                numKVHeads=n_kv,
+                scaleValue=-1.0,
+                inputLayout="BSND",
+                is_causal=True,
+            )
+            torch.testing.assert_close(actual.cpu().float(), ref.float(), rtol=2e-2, atol=2e-2)
+        assert len(mla_kernels._KERNEL_CACHE) == 1

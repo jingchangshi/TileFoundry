@@ -1534,6 +1534,8 @@ def collect_bottleneck_msprof_via_agent_gates(
 
 def run_l3_full_contract_via_agent_gates(
     *,
+    operator_name: str | None = None,
+    candidate_module_path: str | Path | None = None,
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     device_id: str = "1",
@@ -1582,19 +1584,22 @@ def run_l3_full_contract_via_agent_gates(
         ]
         prev_pp = os.environ.get("PYTHONPATH", "")
         new_pp = f"{shim_dir}{os.pathsep}{prev_pp}" if prev_pp else str(shim_dir)
-        sub_env = _clean_agent_gates_subprocess_env(
-            {
-                "PYTHONPATH": new_pp,
-                "CANNBENCH_CACHE_DIR": str(cache_dir),
-                "TF_SURROGATE_SHIM_ONLY": "1",
-                "TF_SURROGATE_SHIM_DIR": str(shim_dir),
-            }
-        )
+        l3_env: dict[str, str] = {
+            "PYTHONPATH": new_pp,
+            "CANNBENCH_CACHE_DIR": str(cache_dir),
+            "TF_SURROGATE_SHIM_ONLY": "1",
+            "TF_SURROGATE_SHIM_DIR": str(shim_dir),
+        }
+        if operator_name:
+            l3_env["TF_L3_TARGET_OPERATOR"] = str(operator_name)
+        if candidate_module_path is not None:
+            l3_env["TF_L3_TARGET_MODULE_PATH"] = str(Path(candidate_module_path).resolve())
+        sub_env = _clean_agent_gates_subprocess_env(l3_env)
         proc, parsed = _run_agent_gates_cmd(
             cmd,
             cwd=str(root),
             env=sub_env,
-            timeout=timeout_sec,
+            timeout_sec=timeout_sec,
         )
     ok = proc.returncode == 0 and parsed.get("status") == "PASS"
     err = "" if ok else (proc.stderr or proc.stdout or "L3 contract failed")[-1000:]

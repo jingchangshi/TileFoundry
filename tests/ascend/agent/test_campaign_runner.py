@@ -3261,6 +3261,59 @@ def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
     assert abs(float(stall_metrics["sync_stall_ratio"]) - 0.65) < 1e-6
 
 
+def test_l3_full_contract_via_agent_gates_timeout_and_target_module_env(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify L3 AgentGates helper passes timeout_sec and candidate module env vars cleanly."""
+    import subprocess
+    from tilefoundry_ascend.agent.campaign import surrogate_cannbench
+
+    fake_env = tmp_path / "env.sh"
+    fake_env.write_text("TILEFOUNDRY_NPU_CANNBENCH_REPO=/tmp/cb\n", encoding="utf-8")
+    cand_mod = tmp_path / "cand_kernels.py"
+    cand_mod.write_text("x = 1\n", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    def _fake_subprocess_run(cmd, *, text, capture_output, cwd, env, timeout):
+        _ = (text, capture_output, cwd)
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(env)
+        captured["timeout"] = timeout
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=json.dumps({"status": "PASS", "runId": "r_l3", "receiptPath": "/tmp/r_l3.json"}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_subprocess_run)
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_env_file_path", lambda _p: fake_env)
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "/tmp/ag")
+    monkeypatch.setattr(surrogate_cannbench, "resolve_cannbench_repo", lambda **_kw: tmp_path)
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "ensure_npu_compare_shim_dir",
+        lambda path, **_kw: Path(path),
+    )
+
+    l3_res = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=cand_mod,
+        source_root=tmp_path,
+        env_file=fake_env,
+        device_id="2",
+        timeout_sec=123,
+    )
+    assert l3_res.passed is True
+    assert l3_res.run_id == "r_l3"
+    assert captured["timeout"] == 123
+    env_sent = captured["env"]
+    assert env_sent["TF_L3_TARGET_OPERATOR"] == "attention_residual"
+    assert env_sent["TF_L3_TARGET_MODULE_PATH"] == str(cand_mod.resolve())
+    assert "--device-id" in captured["cmd"] and "2" in captured["cmd"]
+
+
 
 
 

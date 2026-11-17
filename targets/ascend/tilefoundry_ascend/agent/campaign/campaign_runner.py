@@ -1331,6 +1331,8 @@ class PerfTargetCampaignRunner:
         if self._l3_contract_runner is not None:
             return self._l3_contract_runner(module_path)
         return run_l3_full_contract_via_agent_gates(
+            operator_name=self._config.operator_name,
+            candidate_module_path=module_path,
             source_root=self._source_root,
             env_file=self._env_file,
             device_id=self._config.device_id,
