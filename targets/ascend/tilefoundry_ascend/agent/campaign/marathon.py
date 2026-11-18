@@ -23,6 +23,7 @@ import time
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
+    CannbotOpsRegistry,
     PerfTargetSpec,
     RegimeTargetSpec,
     default_source_root,
@@ -72,7 +73,7 @@ _DEFAULT_AGY_COMMON_ARGS = (
     "--print --input-format text --disable-slash-commands "
     "--sandbox --mode plan --dangerously-skip-permissions --print-timeout 240s"
 )
-_SUPPORTED_OPERATORS = ("attention_residual", "mla")
+_SUPPORTED_OPERATORS: tuple[str, ...] = ()
 _AGENT_GATES_ALLOWED_ENV_KEYS = frozenset(
     {
         "TILEFOUNDRY_NPU_CANN_SETUP",
@@ -145,13 +146,16 @@ class MarathonConfig:
     salvage_beam_candidates: bool = True
     resume: bool | None = None
     escalate_model: str = "gemini-4-hydrogen-high"
+    exploit_effort: str = "high"
+    auto_bootstrap_seed: bool = True
 
 
 def short_operator_tag(operator_name: str) -> str:
-    """Return short filesystem tag for an operator name."""
-    if operator_name == "attention_residual":
+    """Return short filesystem tag for an operator name or task id."""
+    norm = operator_name.rsplit("/", 1)[-1] if "/" in operator_name else operator_name
+    if norm == "attention_residual":
         return "ar"
-    return operator_name.replace("_", "-")
+    return norm.replace("_", "-")
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -168,6 +172,166 @@ def atomic_write_text(path: Path, text: str) -> None:
     finally:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
+
+
+def ensure_operator_seed_module(
+    operator_name: str,
+    target_module_path: Path,
+    *,
+    cannbench_repo: Path | None = None,
+) -> bool:
+    """Bootstrap a Stage-A-valid TileLang seed module + golden fallback for any CANNBench op."""
+    target_path = Path(target_module_path).resolve()
+    if target_path.is_file():
+        return False
+
+    ops_root: Path | None = None
+    if cannbench_repo is not None:
+        cand = Path(cannbench_repo).expanduser().resolve()
+        ops_root = (cand / "operators") if (cand / "operators").is_dir() else cand
+    try:
+        registry = (
+            CannbotOpsRegistry(operators_root=ops_root)
+            if ops_root is not None
+            else CannbotOpsRegistry.default()
+        )
+    except FileNotFoundError:
+        return False
+    if not registry.has_operator(operator_name):
+        return False
+
+    spec = registry.resolve(operator_name)
+    op_id = spec.op_id
+    entrypoint = spec.entrypoint
+    golden_path = (spec.op_dir / "golden.py").resolve()
+    default_dtype = "float16"
+    for case in spec.cases:
+        raw_dt = case.get("dtype")
+        if isinstance(raw_dt, (list, tuple)) and raw_dt:
+            cand_dt = str(raw_dt[0]).strip()
+        elif isinstance(raw_dt, str):
+            cand_dt = raw_dt.strip()
+        else:
+            cand_dt = ""
+        if cand_dt in ("float16", "bfloat16", "float32"):
+            default_dtype = cand_dt
+            break
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    init_path = target_path.parent / "__init__.py"
+    if not init_path.exists():
+        init_src = (
+            f'"""Auto-seeded Ascend 950PR operator package for {op_id}."""\n\n'
+            f"from .{target_path.stem} import {entrypoint}, kernel\n\n"
+            f'__all__ = [{entrypoint!r}, "kernel"]\n'
+        )
+        atomic_write_text(init_path, init_src)
+
+    seed_src = (
+        f'"""Auto-seeded TileLang Ascend950PR scaffold and golden fallback for {op_id}."""\n\n'
+        "import contextlib\n"
+        "import importlib.util\n"
+        "import os\n"
+        "from pathlib import Path\n\n"
+        "import tilelang\n"
+        "import tilelang.ascend.language as T\n"
+        "import torch\n\n"
+        "_KERNEL_CACHE: dict[tuple[object, ...], object] = {}\n"
+        "_GOLDEN_FN = None\n"
+        f"_GOLDEN_TASK = {spec.task!r}\n"
+        f"_DEFAULT_GOLDEN_PATH = Path({str(golden_path)!r})\n\n\n"
+        "def _ascend_target_ctx():\n"
+        "    try:\n"
+        "        from tilelang import tvm\n"
+        "        from tilelang.backend.module import create_backend_context\n\n"
+        "        if tvm.target.Target.current(allow_none=True) is None:\n"
+        '            return create_backend_context("ascend").target\n'
+        "    except Exception:\n"
+        "        pass\n"
+        "    return contextlib.nullcontext()\n\n\n"
+        "def _load_golden_fn():\n"
+        "    global _GOLDEN_FN\n"
+        "    if _GOLDEN_FN is not None:\n"
+        "        return _GOLDEN_FN\n"
+        "    candidates = [_DEFAULT_GOLDEN_PATH]\n"
+        '    env_repo = os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()\n'
+        "    if env_repo:\n"
+        '        candidates.insert(0, Path(env_repo).expanduser() / "operators" / _GOLDEN_TASK / "golden.py")\n'
+        "    for cand in candidates:\n"
+        "        if cand.is_file():\n"
+        '            mod_name = "_tf_golden_" + _GOLDEN_TASK.replace("/", "_")\n'
+        "            mod_spec = importlib.util.spec_from_file_location(mod_name, str(cand))\n"
+        "            if mod_spec is not None and mod_spec.loader is not None:\n"
+        "                mod = importlib.util.module_from_spec(mod_spec)\n"
+        "                mod_spec.loader.exec_module(mod)\n"
+        f"                fn = getattr(mod, {entrypoint!r}, None)\n"
+        "                if callable(fn):\n"
+        "                    _GOLDEN_FN = fn\n"
+        "                    return fn\n"
+        '    raise FileNotFoundError(f"Cannot locate golden.py for {_GOLDEN_TASK!r}")\n\n\n'
+        f"def _select_{op_id}_config(**kwargs) -> dict[str, object]:\n"
+        f'    """Select initial TileLang config for {op_id}."""\n'
+        f'    raw_dt = str(kwargs.get("tl_dtype", {default_dtype!r})).strip()\n'
+        '    tl_dtype = raw_dt if raw_dt in ("float16", "bfloat16", "float32") else "float16"\n'
+        "    return {\n"
+        '        "tile_m": 64,\n'
+        '        "tile_n": 64,\n'
+        '        "num_stages": 1,\n'
+        '        "tl_dtype": tl_dtype,\n'
+        '        "pass_configs": {},\n'
+        '        "compile_flags": [],\n'
+        "    }\n\n\n"
+        f"def _build_{op_id}_prim_func(\n"
+        "    tile_m: int = 64,\n"
+        "    tile_n: int = 64,\n"
+        "    num_stages: int = 1,\n"
+        f"    tl_dtype: str = {default_dtype!r},\n"
+        "    **_extra_kwargs,\n"
+        "):\n"
+        f'    """Build Stage-A-valid TileLang @T.prim_func scaffold for {op_id}."""\n'
+        "    _ = num_stages\n"
+        "    m_blk = max(16, min(64, int(tile_m)))\n"
+        "    n_blk = max(16, min(64, int(tile_n)))\n"
+        '    dt = tl_dtype if tl_dtype in ("float16", "bfloat16", "float32") else "float16"\n'
+        "    with _ascend_target_ctx():\n\n"
+        "        @T.prim_func\n"
+        "        def main(\n"
+        "            X: T.Tensor((m_blk, n_blk), dt),\n"
+        "            Y: T.Tensor((m_blk, n_blk), dt),\n"
+        "        ):\n"
+        "            with T.Kernel(1):\n"
+        "                x_ub = T.alloc_shared((m_blk, n_blk), dt)\n"
+        "                T.copy(X[0:m_blk, 0:n_blk], x_ub)\n"
+        "                T.copy(x_ub, Y[0:m_blk, 0:n_blk])\n\n"
+        "    return main\n\n\n"
+        "def _get_kernel(**kwargs):\n"
+        f"    cfg = _select_{op_id}_config(**kwargs)\n"
+        '    key = (int(cfg["tile_m"]), int(cfg["tile_n"]), str(cfg["tl_dtype"]))\n'
+        "    compiled = _KERNEL_CACHE.get(key)\n"
+        "    if compiled is None:\n"
+        "        with _ascend_target_ctx():\n"
+        f"            prog = _build_{op_id}_prim_func(\n"
+        '                tile_m=int(cfg["tile_m"]),\n'
+        '                tile_n=int(cfg["tile_n"]),\n'
+        '                num_stages=int(cfg["num_stages"]),\n'
+        '                tl_dtype=str(cfg["tl_dtype"]),\n'
+        "            )\n"
+        '        compiled = tilelang.compile(prog, target="ascend", out_idx=[1])\n'
+        "        _KERNEL_CACHE[key] = compiled\n"
+        "    return compiled\n\n\n"
+        f"def {entrypoint}(*args, **kwargs):\n"
+        f'    """Reference-backed entrypoint for {op_id} until promoted TileLang slices take over."""\n'
+        "    return _load_golden_fn()(*args, **kwargs)\n\n\n"
+        f"kernel = {entrypoint}\n\n"
+        f"__all__ = [\n"
+        f'    "_build_{op_id}_prim_func",\n'
+        f'    "_select_{op_id}_config",\n'
+        f'    {entrypoint!r},\n'
+        '    "kernel",\n'
+        "]\n"
+    )
+    atomic_write_text(target_path, seed_src)
+    return True
 
 
 def _ensure_sys_paths(worktree: Path) -> None:
@@ -622,6 +786,10 @@ def _prewarm_l3_candidate_kernels(
         pp_parts.insert(0, tl_source)
     run_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
 
+    task_name = get_operator_task(operator_name)
+    short_entry = task_name.rsplit("/", 1)[-1]
+    cann_repo_hint = (env_vals.get("TILEFOUNDRY_NPU_CANNBENCH_REPO") or "").strip()
+
     prewarm_script = f"""
 import importlib, importlib.util, json, os, sys
 from pathlib import Path
@@ -644,26 +812,29 @@ if str(bench_dir) not in sys.path:
     sys.path.insert(0, str(bench_dir))
 import cannbench_contract
 
-op_name = {operator_name!r}
+op_name = {short_entry!r}
+task_name = {task_name!r}
+cann_repo_hint = {cann_repo_hint!r}
 mod_path = Path({str(candidate_module_path.resolve())!r})
 spec = importlib.util.spec_from_file_location("_tf_l3_prewarm_cand", str(mod_path))
 mod = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mod
 spec.loader.exec_module(mod)
 
-orig_get_kernel = mod._get_kernel
+orig_get_kernel = getattr(mod, "_get_kernel", None)
 orig_combine = getattr(mod, "_get_combine_kernel", None)
 
-def _stub_get_kernel(*args, **kwargs):
-    _ = orig_get_kernel(*args, **kwargs)
-    splits = int(kwargs.get("num_kv_splits", 1) or 1)
-    if op_name == "attention_residual":
-        return lambda v_f, x_f, *rest: torch.empty_like(x_f)
-    if splits <= 1:
-        return lambda q_n, *rest: torch.empty_like(q_n)
-    return lambda *rest: None
+if callable(orig_get_kernel):
+    def _stub_get_kernel(*args, **kwargs):
+        _ = orig_get_kernel(*args, **kwargs)
+        splits = int(kwargs.get("num_kv_splits", 1) or 1)
+        if op_name == "attention_residual":
+            return lambda v_f, x_f, *rest: torch.empty_like(x_f)
+        if splits <= 1:
+            return lambda *a, **kw: torch.empty_like(a[0]) if a else None
+        return lambda *rest: None
 
-mod._get_kernel = _stub_get_kernel
+    mod._get_kernel = _stub_get_kernel
 
 if callable(orig_combine):
     def _stub_combine(*args, **kwargs):
@@ -677,15 +848,23 @@ def _empty_tensors(shapes, dtypes):
     return [
         torch.empty(tuple(sh), dtype=cannbench_contract.str_to_torch_dtype(dt), device="cpu")
         for sh, dt in zip(shapes, dtypes)
+        if sh is not None and dt is not None and str(dt).lower() != "none"
     ]
 
-harness = cannbench_contract.Harness(f"level4/{{op_name}}", bench_dir / op_name)
-entrypoint = getattr(mod, op_name)
+task_dir = bench_dir / op_name
+if not task_dir.is_dir() and cann_repo_hint:
+    cand_dir = Path(cann_repo_hint) / "operators" / task_name
+    if cand_dir.is_dir():
+        task_dir = cand_dir
+harness = cannbench_contract.Harness(task_name, task_dir)
+entrypoint = getattr(mod, op_name, getattr(mod, "kernel", None))
 compiled = 0
 warnings = 0
 
 def _try_call(tag, fn, params):
     global compiled, warnings
+    if not callable(fn):
+        return
     try:
         fn(**params)
         compiled += 1
@@ -749,7 +928,7 @@ if op_name == "mla":
             "is_causal": True,
         }},
     )
-else:
+elif op_name == "attention_residual":
     _try_call(
         "ar_dynamic_shape",
         entrypoint,
@@ -1283,6 +1462,21 @@ def run_operator_marathon(
         worktree,
         env_file,
     )
+    if cfg.auto_bootstrap_seed and not target_module.is_file():
+        raw_cb = (
+            parse_simple_env_file(env_file).get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
+            or os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
+        )
+        if ensure_operator_seed_module(
+            cfg.operator_name,
+            target_module,
+            cannbench_repo=Path(raw_cb) if raw_cb else None,
+        ):
+            op_logger.info(
+                "AUTO_BOOTSTRAP_SEED op=%s target=%s",
+                cfg.operator_name,
+                target_module,
+            )
 
     l2_evaluator = build_resilient_l2_evaluator(
         operator_name=cfg.operator_name,
@@ -1343,6 +1537,7 @@ def run_operator_marathon(
         warmup=cfg.warmup,
         repeat=cfg.repeat,
         enable_tilesize_prescreen=cfg.enable_tilesize_prescreen,
+        exploit_effort=cfg.exploit_effort,
     )
     tracker = BayesianRuleTracker.from_seed_yaml()
     flywheel = FlywheelDistiller(
@@ -1804,16 +1999,10 @@ def _discover_watch_state_dirs(
         for child in sorted(anchor.iterdir()):
             if child.is_dir() and (child / "checkpoint.json").is_file():
                 resolved[child.name] = child
-    if not resolved:
-        for default_name in ("ar", "mla"):
-            cand = anchor / default_name
-            if cand.is_dir():
-                resolved[default_name] = cand
-    if not resolved:
-        for op in _SUPPORTED_OPERATORS:
-            cand = anchor / op
-            if cand.is_dir():
-                resolved[op] = cand
+    if not resolved and anchor.is_dir():
+        for child in sorted(anchor.iterdir()):
+            if child.is_dir():
+                resolved[child.name] = child
     return resolved, anchor / "last_reported.json"
 
 
@@ -1821,8 +2010,7 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--operator",
         required=True,
-        choices=_SUPPORTED_OPERATORS,
-        help="Target production operator to optimize.",
+        help="Target operator to optimize (short name e.g. rms_norm or task id e.g. level2/rms_norm).",
     )
     parser.add_argument("--device-id", default="1", help="Authorized NPU device ID.")
     parser.add_argument("--source-root", default=None, help="TileFoundry repository root.")
@@ -1931,6 +2119,7 @@ __all__ = [
     "configure_marathon_process_env",
     "discover_marathon_environment",
     "ensure_marathon_env_file",
+    "ensure_operator_seed_module",
     "main",
     "run_operator_marathon",
     "salvage_unpromoted_beam_winner",

@@ -37,9 +37,18 @@ class StaticDynamicResidual:
     measured_sync_stall_ratio: float
     unexplained_gap_ratio: float
     pseudo_double_buffer_serialized: bool = False
+    spill_bytes: int = 0
+    bank_conflict_ratio: float = 0.0
+    l2_hit_rate: float = 1.0
+    vf_fusion_breaks: int = 0
+    alias_serialized_buffers: int = 0
+    dual_issue_ipc_collapse: float = 0.0
+    dcache_dcci_flushes: int = 0
+    has_local_membar_in_vf_call: bool = False
+    vloopv2_hit: bool = True
 
-    def to_dict(self) -> dict[str, float | bool]:
-        """Return float and flag dictionary representation."""
+    def to_dict(self) -> dict[str, float | int | bool]:
+        """Return float, int, and flag dictionary representation."""
         return {
             "measured_latency_us": self.measured_latency_us,
             "predicted_bottleneck_util": self.predicted_bottleneck_util,
@@ -49,6 +58,15 @@ class StaticDynamicResidual:
             "measured_sync_stall_ratio": self.measured_sync_stall_ratio,
             "unexplained_gap_ratio": self.unexplained_gap_ratio,
             "pseudo_double_buffer_serialized": self.pseudo_double_buffer_serialized,
+            "spill_bytes": self.spill_bytes,
+            "bank_conflict_ratio": self.bank_conflict_ratio,
+            "l2_hit_rate": self.l2_hit_rate,
+            "vf_fusion_breaks": self.vf_fusion_breaks,
+            "alias_serialized_buffers": self.alias_serialized_buffers,
+            "dual_issue_ipc_collapse": self.dual_issue_ipc_collapse,
+            "dcache_dcci_flushes": self.dcache_dcci_flushes,
+            "has_local_membar_in_vf_call": self.has_local_membar_in_vf_call,
+            "vloopv2_hit": self.vloopv2_hit,
         }
 
     @classmethod
@@ -65,12 +83,25 @@ class StaticDynamicResidual:
             pseudo_double_buffer_serialized=bool(
                 payload.get("pseudo_double_buffer_serialized", False)
             ),
+            spill_bytes=int(payload.get("spill_bytes", 0)),
+            bank_conflict_ratio=float(payload.get("bank_conflict_ratio", 0.0)),
+            l2_hit_rate=float(payload.get("l2_hit_rate", 1.0)),
+            vf_fusion_breaks=max(0, int(payload.get("vf_fusion_breaks", 0) or 0)),
+            alias_serialized_buffers=max(0, int(payload.get("alias_serialized_buffers", 0) or 0)),
+            dual_issue_ipc_collapse=max(
+                0.0, min(1.0, float(payload.get("dual_issue_ipc_collapse", 0.0) or 0.0))
+            ),
+            dcache_dcci_flushes=max(0, int(payload.get("dcache_dcci_flushes", 0) or 0)),
+            has_local_membar_in_vf_call=bool(payload.get("has_local_membar_in_vf_call", False)),
+            vloopv2_hit=bool(payload.get("vloopv2_hit", True)),
         )
 
 
 def compute_static_dynamic_residual(
     ledger: ObjectivePhysicalLedger,
     telemetry: Mapping[str, object],
+    *,
+    compiler_summary: object | None = None,
 ) -> StaticDynamicResidual:
     """Compute StaticDynamicResidual from static ledger and msprof telemetry counters."""
     measured_us = float(telemetry.get("measured_latency_us", telemetry.get("dur_us", 0.0)))
@@ -119,6 +150,62 @@ def compute_static_dynamic_residual(
         and ii_looks_pipelined
         and (mte2_wait >= 0.32 or unexplained >= 0.25 or sync_stall >= 0.20)
     )
+    comp_spill = (
+        int(getattr(compiler_summary, "spill_bytes", 0) or 0)
+        if compiler_summary is not None
+        else 0
+    )
+    spill_bytes = max(
+        0,
+        comp_spill,
+        int(telemetry.get("spill_bytes", getattr(ledger, "spill_bytes", 0)) or 0),
+    )
+    raw_bank = telemetry.get(
+        "bank_conflict_ratio",
+        telemetry.get("ub_bank_conflict_ratio", telemetry.get("resource_conflict_ratio", 0.0)),
+    )
+    bank_conflict_ratio = max(0.0, min(1.0, float(raw_bank or 0.0)))
+    raw_l2 = telemetry.get("l2_hit_rate", telemetry.get("l2_cache_hit_rate", 1.0))
+    l2_hit_rate = max(0.0, min(1.0, float(1.0 if raw_l2 is None else raw_l2)))
+
+    def _pick_comp_int(key: str) -> int:
+        t_val = telemetry.get(key)
+        c_val = getattr(compiler_summary, key, 0) if compiler_summary is not None else 0
+        return max(0, int(t_val if t_val is not None else 0), int(c_val or 0))
+
+    vf_fusion_breaks = _pick_comp_int("vf_fusion_breaks")
+    alias_serialized_buffers = _pick_comp_int("alias_serialized_buffers")
+    dcache_dcci_flushes = _pick_comp_int("dcache_dcci_flushes")
+    dual_issue_ipc_collapse = max(
+        0.0,
+        min(
+            1.0,
+            max(
+                float(telemetry.get("dual_issue_ipc_collapse", 0.0) or 0.0),
+                float(
+                    getattr(compiler_summary, "dual_issue_ipc_collapse", 0.0)
+                    if compiler_summary is not None
+                    else 0.0
+                ),
+            ),
+        ),
+    )
+    has_local_membar_in_vf_call = bool(
+        telemetry.get("has_local_membar_in_vf_call", False)
+        or (
+            getattr(compiler_summary, "has_local_membar_in_vf_call", False)
+            if compiler_summary is not None
+            else False
+        )
+    )
+    if "vloopv2_hit" in telemetry:
+        vloopv2_hit = bool(telemetry["vloopv2_hit"])
+    elif compiler_summary is not None:
+        sw_loops = int(getattr(compiler_summary, "software_loops", 0) or 0)
+        vl_loops = int(getattr(compiler_summary, "vloopv2_loops", 0) or 0)
+        vloopv2_hit = not (sw_loops > 0 and vl_loops == 0)
+    else:
+        vloopv2_hit = True
 
     return StaticDynamicResidual(
         measured_latency_us=measured_us,
@@ -129,7 +216,53 @@ def compute_static_dynamic_residual(
         measured_sync_stall_ratio=sync_stall,
         unexplained_gap_ratio=round(unexplained, 6),
         pseudo_double_buffer_serialized=pseudo_serialized,
+        spill_bytes=spill_bytes,
+        bank_conflict_ratio=round(bank_conflict_ratio, 6),
+        l2_hit_rate=round(l2_hit_rate, 6),
+        vf_fusion_breaks=vf_fusion_breaks,
+        alias_serialized_buffers=alias_serialized_buffers,
+        dual_issue_ipc_collapse=round(dual_issue_ipc_collapse, 6),
+        dcache_dcci_flushes=dcache_dcci_flushes,
+        has_local_membar_in_vf_call=has_local_membar_in_vf_call,
+        vloopv2_hit=vloopv2_hit,
     )
+
+
+def compute_eq3_hap_objective(
+    measured_latency_us: float,
+    *,
+    ref_perf_us: float = 0.0,
+    t_hw_us: float = 0.0,
+    spill_bytes: int = 0,
+    bank_conflict_ratio: float = 0.0,
+    l2_hit_rate: float = 1.0,
+    residual: StaticDynamicResidual | None = None,
+) -> float:
+    """Compute CANNBench Eq.3 performance score discounted by HAP hardware penalties."""
+    if measured_latency_us <= 0.0:
+        return 0.0
+    eff_spill = max(0, int(spill_bytes))
+    eff_bank = max(0.0, min(1.0, float(bank_conflict_ratio)))
+    eff_l2 = max(0.0, min(1.0, float(l2_hit_rate)))
+    if residual is not None:
+        eff_spill = max(eff_spill, int(residual.spill_bytes))
+        eff_bank = max(eff_bank, float(residual.bank_conflict_ratio))
+        if l2_hit_rate == 1.0:
+            eff_l2 = max(0.0, min(1.0, float(residual.l2_hit_rate)))
+
+    if t_hw_us > 0.0:
+        baseline = float(ref_perf_us) if ref_perf_us > 0.0 else max(t_hw_us * 10.0, 10.0)
+        denom = (measured_latency_us - t_hw_us) + (baseline - t_hw_us)
+        eq3 = max(0.0, (baseline - t_hw_us) / denom) if denom > 0.0 else 0.0
+    elif ref_perf_us > 0.0:
+        eq3 = float(ref_perf_us) / float(measured_latency_us)
+    else:
+        eq3 = 1.0 / float(measured_latency_us)
+
+    spill_penalty = 1.0 + min(1.0, float(eff_spill) / 1024.0) * 0.25
+    bank_penalty = 1.0 + eff_bank * 0.30
+    l2_penalty = 1.0 + (1.0 - eff_l2) * 0.15
+    return round(eq3 / (spill_penalty * bank_penalty * l2_penalty), 6)
 
 
 def _is_int_gt_one(node: ast.AST) -> bool:
@@ -257,7 +390,13 @@ def _has_split_kv_multi(tree: ast.AST, dsl_source: str) -> bool:
     return False
 
 
-def extract_structural_signature(dsl_source: str, *, track: str = "") -> tuple[str, ...]:
+def extract_structural_signature(
+    dsl_source: str,
+    *,
+    track: str = "",
+    residual: StaticDynamicResidual | None = None,
+    stage_b: object | None = None,
+) -> tuple[str, ...]:
     """Extract sorted architectural primitive signature for stepping-stone diversity."""
     tags: list[str] = []
     if track and track != "unconstrained":
@@ -265,6 +404,66 @@ def extract_structural_signature(dsl_source: str, *, track: str = "") -> tuple[s
     for token in _NOVELTY_TOKENS:
         if token in dsl_source:
             tags.append(token)
+    for hw_token in (
+        "SetL2CacheHint",
+        "CACHE_MODE_DISABLE",
+        "LocalMemBar",
+        "DATA_BLOCK_COPY",
+        "FixpipeParamsArch3510",
+        "__simd_vf__",
+        "__simt_vf__",
+        "__launch_bounds__",
+    ):
+        if hw_token in dsl_source:
+            tags.append(hw_token)
+    eff_spill = 0
+    eff_vf_breaks = 0
+    eff_alias_ser = 0
+    eff_ipc_collapse = 0.0
+    eff_dcci = 0
+    eff_local_membar = False
+    eff_vloop_miss = False
+    if residual is not None:
+        eff_spill = max(eff_spill, int(residual.spill_bytes))
+        eff_vf_breaks = max(eff_vf_breaks, int(residual.vf_fusion_breaks))
+        eff_alias_ser = max(eff_alias_ser, int(residual.alias_serialized_buffers))
+        eff_ipc_collapse = max(eff_ipc_collapse, float(residual.dual_issue_ipc_collapse))
+        eff_dcci = max(eff_dcci, int(residual.dcache_dcci_flushes))
+        eff_local_membar = eff_local_membar or bool(residual.has_local_membar_in_vf_call)
+        if residual.vloopv2_hit is False:
+            eff_vloop_miss = True
+        if residual.bank_conflict_ratio > 0.05:
+            tags.append("hw:bank_conflict")
+        if residual.l2_hit_rate < 0.70:
+            tags.append("hw:low_l2_hit")
+    if stage_b is not None:
+        eff_spill = max(eff_spill, int(getattr(stage_b, "spill_bytes", 0) or 0))
+        if getattr(stage_b, "vloopv2_hit", True) is False:
+            eff_vloop_miss = True
+        comp = getattr(stage_b, "compiler_summary", None)
+        if comp is not None:
+            eff_spill = max(eff_spill, int(getattr(comp, "spill_bytes", 0) or 0))
+            eff_vf_breaks = max(eff_vf_breaks, int(getattr(comp, "vf_fusion_breaks", 0) or 0))
+            eff_alias_ser = max(eff_alias_ser, int(getattr(comp, "alias_serialized_buffers", 0) or 0))
+            eff_ipc_collapse = max(eff_ipc_collapse, float(getattr(comp, "dual_issue_ipc_collapse", 0.0) or 0.0))
+            eff_dcci = max(eff_dcci, int(getattr(comp, "dcache_dcci_flushes", 0) or 0))
+            eff_local_membar = eff_local_membar or bool(getattr(comp, "has_local_membar_in_vf_call", False))
+            if int(getattr(comp, "software_loops", 0) or 0) > 0 and int(getattr(comp, "vloopv2_loops", 0) or 0) == 0:
+                eff_vloop_miss = True
+    if eff_vloop_miss:
+        tags.append("hw:vloopv2_miss")
+    if eff_spill > 0:
+        tags.append("hw:register_spill")
+    if eff_vf_breaks > 0:
+        tags.append("hw:vf_fusion_break")
+    if eff_alias_ser > 0:
+        tags.append("hw:alias_serialized")
+    if eff_ipc_collapse > 0.0:
+        tags.append("hw:ipc_collapse")
+    if eff_dcci > 0:
+        tags.append("hw:dcache_dcci")
+    if eff_local_membar:
+        tags.append("hw:local_membar_vf")
     try:
         tree = ast.parse(dsl_source)
     except SyntaxError:
@@ -493,6 +692,7 @@ __all__ = [
     "BeamCandidate",
     "StaticDynamicResidual",
     "TwoLaneBeamSearch",
+    "compute_eq3_hap_objective",
     "compute_static_dynamic_residual",
     "extract_structural_signature",
 ]

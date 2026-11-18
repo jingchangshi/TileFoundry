@@ -66,11 +66,11 @@ class RulePosterior:
 
 @dataclass
 class BayesianRuleTracker:
-    """Tracks causal rule efficacy and prunes persistently unrealized rules."""
+    """Tracks factorized 3-axis causal rule efficacy and prunes persistently unrealized rules."""
 
     rules: dict[str, AscendCausalRule] = field(default_factory=dict)
     posteriors: dict[str, RulePosterior] = field(default_factory=dict)
-    paradigm_posteriors: dict[str, dict[str, RulePosterior]] = field(default_factory=dict)
+    axis_posteriors: dict[str, dict[str, RulePosterior]] = field(default_factory=dict)
 
     @classmethod
     def from_rules(cls, rules: Iterable[AscendCausalRule]) -> BayesianRuleTracker:
@@ -84,11 +84,6 @@ class BayesianRuleTracker:
     def from_seed_yaml(cls, path: str | Path | None = None) -> BayesianRuleTracker:
         """Load seed rules YAML and initialize Bayesian priors."""
         return cls.from_rules(load_seed_rules(path))
-
-    @staticmethod
-    def _normalize_paradigm(paradigm: str) -> str:
-        text = str(paradigm).strip()
-        return text or "default"
 
     @staticmethod
     def _apply_outcome(
@@ -106,9 +101,22 @@ class BayesianRuleTracker:
             state.beta += 1.0
             state.failures += 1
 
-    def _ensure_paradigm_posterior(self, paradigm: str, rule_id: str) -> RulePosterior:
-        bucket = self._normalize_paradigm(paradigm)
-        bucket_map = self.paradigm_posteriors.setdefault(bucket, {})
+    @staticmethod
+    def _extract_axis_keys(topology_axes: object) -> tuple[str, str, str]:
+        if isinstance(topology_axes, Mapping):
+            ce = str(topology_axes["compute_engine"]).strip()
+            mr = str(topology_axes["memory_ring"]).strip()
+            ir = str(topology_axes["iteration_regularity"]).strip()
+        else:
+            ce = str(getattr(topology_axes, "compute_engine")).strip()
+            mr = str(getattr(topology_axes, "memory_ring")).strip()
+            ir = str(getattr(topology_axes, "iteration_regularity")).strip()
+        if not ce or not mr or not ir:
+            raise ValueError(f"Invalid topology_axes: {topology_axes!r}")
+        return (f"ce:{ce}", f"mr:{mr}", f"ir:{ir}")
+
+    def _ensure_axis_posterior(self, axis_key: str, rule_id: str) -> RulePosterior:
+        bucket_map = self.axis_posteriors.setdefault(axis_key, {})
         if rule_id not in bucket_map:
             rule = self.rules[rule_id]
             bucket_map[rule_id] = RulePosterior(
@@ -134,9 +142,9 @@ class BayesianRuleTracker:
         *,
         postcondition_realized: bool,
         speed_gain: float = 0.0,
-        paradigm: str | None = None,
+        topology_axes: object | None = None,
     ) -> RulePosterior:
-        """Update Beta posterior after evaluating a candidate kernel transform."""
+        """Update global and factorized 3-axis Beta posteriors after evaluating a kernel."""
         if rule_id not in self.rules:
             raise KeyError(f"unknown causal rule {rule_id!r}")
         state = self.posteriors[rule_id]
@@ -145,14 +153,14 @@ class BayesianRuleTracker:
             postcondition_realized=postcondition_realized,
             speed_gain=speed_gain,
         )
-        if paradigm is not None:
-            p_state = self._ensure_paradigm_posterior(paradigm, rule_id)
-            self._apply_outcome(
-                p_state,
-                postcondition_realized=postcondition_realized,
-                speed_gain=speed_gain,
-            )
-            return p_state
+        if topology_axes is not None:
+            for axis_key in self._extract_axis_keys(topology_axes):
+                a_state = self._ensure_axis_posterior(axis_key, rule_id)
+                self._apply_outcome(
+                    a_state,
+                    postcondition_realized=postcondition_realized,
+                    speed_gain=speed_gain,
+                )
         return state
 
     def prune_underperforming(
@@ -160,86 +168,125 @@ class BayesianRuleTracker:
         *,
         min_trials: int = 5,
         prune_threshold: float = 0.25,
-        paradigm: str | None = None,
+        topology_axes: object | None = None,
     ) -> tuple[str, ...]:
         """Mark rules with persistently low posterior realization rate as pruned."""
-        newly_pruned: list[str] = []
-        if paradigm is None:
-            target_map = self.posteriors
-        else:
-            bucket = self._normalize_paradigm(paradigm)
-            target_map = self.paradigm_posteriors.get(bucket, {})
-        for rule_id, state in sorted(target_map.items()):
-            if not state.pruned and state.trials >= min_trials:
-                if state.expected_rate < prune_threshold:
+        newly_pruned: set[str] = set()
+        if topology_axes is None:
+            for rule_id, state in sorted(self.posteriors.items()):
+                if not state.pruned and state.trials >= min_trials and state.expected_rate < prune_threshold:
                     state.pruned = True
-                    newly_pruned.append(rule_id)
-        return tuple(newly_pruned)
+                    newly_pruned.add(rule_id)
+            for bucket_map in self.axis_posteriors.values():
+                for rule_id, state in bucket_map.items():
+                    if not state.pruned and state.trials >= min_trials and state.expected_rate < prune_threshold:
+                        state.pruned = True
+            return tuple(sorted(newly_pruned))
 
-    def unprune(self, rule_id: str, *, paradigm: str | None = None) -> None:
-        """Re-enable a previously pruned rule globally or within one paradigm."""
-        if paradigm is None:
+        axis_keys = self._extract_axis_keys(topology_axes)
+        touched_rules: set[str] = set()
+        for axis_key in axis_keys:
+            bucket_map = self.axis_posteriors.get(axis_key, {})
+            for rule_id, state in bucket_map.items():
+                if not state.pruned and state.trials >= min_trials and state.expected_rate < prune_threshold:
+                    state.pruned = True
+                    touched_rules.add(rule_id)
+        for rule_id in touched_rules:
+            if self.is_pruned(rule_id, topology_axes=topology_axes):
+                newly_pruned.add(rule_id)
+        return tuple(sorted(newly_pruned))
+
+    def unprune(self, rule_id: str, *, topology_axes: object | None = None) -> None:
+        """Re-enable a previously pruned rule globally or within the given topology_axes."""
+        if topology_axes is None:
             if rule_id in self.posteriors:
                 self.posteriors[rule_id].pruned = False
-            for bucket_map in self.paradigm_posteriors.values():
+            for bucket_map in self.axis_posteriors.values():
                 if rule_id in bucket_map:
                     bucket_map[rule_id].pruned = False
             return
-        bucket = self._normalize_paradigm(paradigm)
-        bucket_map = self.paradigm_posteriors.get(bucket, {})
-        if rule_id in bucket_map:
-            bucket_map[rule_id].pruned = False
+        for axis_key in self._extract_axis_keys(topology_axes):
+            bucket_map = self.axis_posteriors.get(axis_key, {})
+            if rule_id in bucket_map:
+                bucket_map[rule_id].pruned = False
 
-    def is_pruned(self, rule_id: str, *, paradigm: str | None = None) -> bool:
-        """Return whether rule_id is pruned globally or in the specified paradigm."""
+    def is_pruned(self, rule_id: str, *, topology_axes: object | None = None) -> bool:
+        """Return whether rule_id is pruned globally or across a majority of the 3 axes."""
+        if topology_axes is not None:
+            axis_keys = self._extract_axis_keys(topology_axes)
+            axis_states = [
+                self.axis_posteriors.get(axis_key, {}).get(rule_id)
+                for axis_key in axis_keys
+            ]
+            if any(st is not None for st in axis_states):
+                # Require at least 2 of 3 factorized axes of this topology to be pruned
+                # so sharing a single axis (e.g. ir:affine_simd) never causes bleed.
+                return sum(1 for st in axis_states if st is not None and st.pruned) >= 2
+            if any(rule_id in states for states in self.axis_posteriors.values()):
+                return False
         global_state = self.posteriors.get(rule_id)
-        if global_state is not None and global_state.pruned:
-            return True
-        if paradigm is not None:
-            bucket = self._normalize_paradigm(paradigm)
-            p_state = self.paradigm_posteriors.get(bucket, {}).get(rule_id)
-            if p_state is not None and p_state.pruned:
-                return True
-        return False
+        return bool(global_state is not None and global_state.pruned)
 
-    def active_rules(self, *, paradigm: str | None = None) -> tuple[AscendCausalRule, ...]:
+    def active_rules(self, *, topology_axes: object | None = None) -> tuple[AscendCausalRule, ...]:
         """Return all non-pruned rules sorted deterministically."""
         return tuple(
             rule
             for rule_id, rule in sorted(self.rules.items())
-            if not self.is_pruned(rule_id, paradigm=paradigm)
+            if not self.is_pruned(rule_id, topology_axes=topology_axes)
         )
+
+    def _blended_axis_metrics(
+        self,
+        rule: AscendCausalRule,
+        *,
+        topology_axes: object,
+    ) -> tuple[float, float]:
+        """Blend factorized axis-level posteriors (ce/mr/ir)."""
+        alpha = float(rule.alpha_prior)
+        beta = float(rule.beta_prior)
+        succ_acc = 0.0
+        fail_acc = 0.0
+        speedup_acc = 0.0
+
+        axis_keys = self._extract_axis_keys(topology_axes)
+        axis_weight = 1.0 / float(len(axis_keys))
+        for axis_key in axis_keys:
+            a_state = self.axis_posteriors.get(axis_key, {}).get(rule.rule_id)
+            if a_state is not None and a_state.trials > 0:
+                succ_acc += axis_weight * float(a_state.successes)
+                fail_acc += axis_weight * float(a_state.failures)
+                speedup_acc += axis_weight * float(a_state.cumulative_speedup)
+
+        total_alpha = alpha + succ_acc
+        total_beta = beta + fail_acc
+        denom = total_alpha + total_beta
+        expected_rate = (total_alpha / denom) if denom > 0.0 else 0.0
+        mean_speedup = (speedup_acc / succ_acc) if succ_acc > 0.0 else 0.0
+        return expected_rate, mean_speedup
 
     def rank_applicable_rules(
         self,
         context: Mapping[str, object],
         *,
         top_k: int | None = None,
-        paradigm: str | None = None,
+        topology_axes: object | None = None,
     ) -> tuple[AscendCausalRule, ...]:
-        """Filter matching non-pruned rules and rank by posterior rate and priority."""
-        bucket_map = (
-            self.paradigm_posteriors.get(self._normalize_paradigm(paradigm), {})
-            if paradigm is not None
-            else None
-        )
+        """Filter matching non-pruned rules and rank by factorized 3-axis posterior rate and priority."""
         candidates: list[tuple[tuple[float, float, int, str], AscendCausalRule]] = []
-        for rule in self.active_rules(paradigm=paradigm):
+        for rule in self.active_rules(topology_axes=topology_axes):
             if not rule.matches(context):
                 continue
-            if bucket_map is not None:
-                state = bucket_map.get(rule.rule_id)
-                if state is None:
-                    state = RulePosterior(
-                        rule_id=rule.rule_id,
-                        alpha=rule.alpha_prior,
-                        beta=rule.beta_prior,
-                    )
+            if topology_axes is not None:
+                expected_rate, mean_speedup = self._blended_axis_metrics(
+                    rule, topology_axes=topology_axes
+                )
             else:
                 state = self.posteriors[rule.rule_id]
+                expected_rate = state.expected_rate
+                mean_speedup = state.mean_speedup
             score_key = (
-                round(state.expected_rate, 6),
-                round(state.mean_speedup, 6),
+                round(expected_rate, 6),
+                round(mean_speedup, 6),
                 -int(rule.priority),
                 rule.rule_id,
             )
@@ -251,18 +298,18 @@ class BayesianRuleTracker:
         return tuple(selected)
 
     def to_dict(self) -> dict[str, object]:
-        """Serialize tracker posteriors and rule IDs into JSON-safe dict."""
+        """Serialize global and factorized 3-axis tracker posteriors into JSON-safe dict."""
         payload: dict[str, object] = {
             "posteriors": {
                 rid: state.to_dict() for rid, state in sorted(self.posteriors.items())
             }
         }
-        if self.paradigm_posteriors:
-            payload["paradigm_posteriors"] = {
-                paradigm: {
+        if self.axis_posteriors:
+            payload["axis_posteriors"] = {
+                axis_key: {
                     rid: state.to_dict() for rid, state in sorted(states.items())
                 }
-                for paradigm, states in sorted(self.paradigm_posteriors.items())
+                for axis_key, states in sorted(self.axis_posteriors.items())
             }
         return payload
 
@@ -274,19 +321,18 @@ class BayesianRuleTracker:
         )
 
     def load_posteriors_dict(self, payload: Mapping[str, object]) -> None:
-        """Restore global and paradigm-bucketed posteriors from a serialized mapping."""
+        """Restore global and factorized 3-axis posteriors from a serialized mapping."""
         saved = payload.get("posteriors", {})
         if isinstance(saved, Mapping):
             for rid, raw in saved.items():
                 if rid in self.rules and isinstance(raw, Mapping):
                     self.posteriors[rid] = RulePosterior.from_dict(raw)
-        saved_paradigms = payload.get("paradigm_posteriors", {})
-        if isinstance(saved_paradigms, Mapping):
-            for paradigm, states in saved_paradigms.items():
+        saved_axes = payload.get("axis_posteriors", {})
+        if isinstance(saved_axes, Mapping):
+            for axis_key, states in saved_axes.items():
                 if not isinstance(states, Mapping):
                     continue
-                bucket = self._normalize_paradigm(str(paradigm))
-                bucket_map = self.paradigm_posteriors.setdefault(bucket, {})
+                bucket_map = self.axis_posteriors.setdefault(str(axis_key), {})
                 for rid, raw in states.items():
                     if rid in self.rules and isinstance(raw, Mapping):
                         bucket_map[rid] = RulePosterior.from_dict(raw)

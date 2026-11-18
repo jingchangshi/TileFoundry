@@ -40,6 +40,35 @@ class StreamWatchdogConfig:
     retry_backoff_sec: float = 1.0
 
 
+_XHIGH_RE = re.compile(r"xhigh", re.IGNORECASE)
+
+
+def sanitize_effort(effort: str | None, *, default: str = "medium") -> str:
+    """Enforce hard guardrail rejecting/downgrading xhigh thinking effort to high."""
+    if effort is None or not effort.strip():
+        return default
+    cleaned = effort.strip()
+    if cleaned.lower() == "xhigh":
+        return "high"
+    return cleaned
+
+
+def sanitize_model_id(model_id: str) -> str:
+    """Enforce hard guardrail downgrading any *-xhigh model string to -high."""
+    cleaned = model_id.strip()
+    if not cleaned:
+        return cleaned
+    if "xhigh" in cleaned.lower():
+        return _XHIGH_RE.sub("high", cleaned)
+    return cleaned
+
+
+def is_carbon_model(model_id: str) -> bool:
+    """Return True when model_id identifies a Carbon / gemini-pro-orchestrator model."""
+    lower = sanitize_model_id(model_id).strip().lower()
+    return "carbon" in lower or "gemini-pro-orchestrator" in lower
+
+
 @dataclass(frozen=True)
 class GenerationRequest:
     """Single stateless LLM generation request routed by worker role."""
@@ -49,6 +78,10 @@ class GenerationRequest:
     user_prompt: str
     json_schema: dict[str, object] | None = None
     effort: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.effort is not None and self.effort.strip().lower() == "xhigh":
+            object.__setattr__(self, "effort", "high")
 
 
 class KernelLLMBackend(Protocol):
@@ -289,7 +322,7 @@ class AgyCliLLMBackend:
     )
     DEFAULT_EXPLOIT_MODEL = "gemini-4-hydrogen-medium"
     DEFAULT_EXPLORE_MODEL = "gemini-4-hydrogen-high"
-    DEFAULT_ESCALATE_MODEL = "gemini-4-hydrogen-xhigh"
+    DEFAULT_ESCALATE_MODEL = "gemini-4-hydrogen-high"
 
     def __init__(
         self,
@@ -303,21 +336,30 @@ class AgyCliLLMBackend:
         escalate_model: str | None = None,
     ) -> None:
         self._bin = _resolve_agy_binary(bin_path)
-        self._exploit_model = (
-            exploit_model
-            if exploit_model is not None
-            else os.environ.get("TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL", "")
-        ).strip() or self.DEFAULT_EXPLOIT_MODEL
-        self._explore_model = (
-            explore_model
-            if explore_model is not None
-            else os.environ.get("TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL", "")
-        ).strip() or self.DEFAULT_EXPLORE_MODEL
-        self._escalate_model = (
-            escalate_model
-            if escalate_model is not None
-            else os.environ.get("TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL", "")
-        ).strip() or self.DEFAULT_ESCALATE_MODEL
+        self._exploit_model = sanitize_model_id(
+            (
+                exploit_model
+                if exploit_model is not None
+                else os.environ.get("TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL", "")
+            ).strip()
+            or self.DEFAULT_EXPLOIT_MODEL
+        )
+        self._explore_model = sanitize_model_id(
+            (
+                explore_model
+                if explore_model is not None
+                else os.environ.get("TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL", "")
+            ).strip()
+            or self.DEFAULT_EXPLORE_MODEL
+        )
+        self._escalate_model = sanitize_model_id(
+            (
+                escalate_model
+                if escalate_model is not None
+                else os.environ.get("TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL", "")
+            ).strip()
+            or self.DEFAULT_ESCALATE_MODEL
+        )
 
         raw_common = (
             common_args
@@ -350,24 +392,17 @@ class AgyCliLLMBackend:
         return self._watchdog
 
     def select_model(self, role: str, *, effort: str | None = None) -> str:
-        """Return target model ID for role and optional effort escalation."""
+        """Return target model ID for role; xhigh is strictly downgraded to high."""
+        _ = sanitize_effort(effort, default="medium")
         if role == "explore_creative":
-            if (effort or "").strip().lower() == "xhigh":
-                return self._escalate_model
-            return self._explore_model
-        return self._exploit_model
+            return sanitize_model_id(self._explore_model)
+        return sanitize_model_id(self._exploit_model)
 
     def watchdog_for_model(self, model_id: str) -> StreamWatchdogConfig:
         """Return explicit or tier-adaptive StreamWatchdogConfig for model_id."""
         if self._explicit_watchdog:
             return self._watchdog
-        lower = model_id.strip().lower()
-        if lower.endswith("-xhigh") or "xhigh" in lower:
-            return StreamWatchdogConfig(
-                startup_timeout_sec=60.0,
-                idle_stall_timeout_sec=300.0,
-                active_ceiling_timeout_sec=540.0,
-            )
+        lower = sanitize_model_id(model_id).strip().lower()
         if lower.endswith("-high") or "high" in lower:
             return StreamWatchdogConfig(
                 startup_timeout_sec=60.0,
@@ -385,11 +420,13 @@ class AgyCliLLMBackend:
         req: GenerationRequest,
         effort_override: str | None = None,
     ) -> str:
-        """Select reasoning effort from override, request field, or worker role."""
+        """Select reasoning effort from override, request field, or role (never xhigh)."""
         if effort_override is not None and effort_override.strip():
-            return effort_override.strip()
+            return sanitize_effort(effort_override)
         if req.effort is not None and req.effort.strip():
-            return req.effort.strip()
+            return sanitize_effort(req.effort)
+        if is_carbon_model(self.select_model(req.role)):
+            return "high"
         return "high" if req.role == "explore_creative" else "medium"
 
     @staticmethod
@@ -753,19 +790,15 @@ class MockLLMBackend:
         """Record request and return next queued response for req.role."""
         self.calls.append(req)
         if effort_override and effort_override.strip():
-            effort = effort_override.strip()
+            effort = sanitize_effort(effort_override)
         elif req.effort and req.effort.strip():
-            effort = req.effort.strip()
+            effort = sanitize_effort(req.effort)
         else:
             effort = "high" if req.role == "explore_creative" else "medium"
         if req.role == "explore_creative":
-            model_id = (
-                AgyCliLLMBackend.DEFAULT_ESCALATE_MODEL
-                if effort.lower() == "xhigh"
-                else AgyCliLLMBackend.DEFAULT_EXPLORE_MODEL
-            )
+            model_id = sanitize_model_id(AgyCliLLMBackend.DEFAULT_EXPLORE_MODEL)
         else:
-            model_id = AgyCliLLMBackend.DEFAULT_EXPLOIT_MODEL
+            model_id = sanitize_model_id(AgyCliLLMBackend.DEFAULT_EXPLOIT_MODEL)
         self.routed_models.append(model_id)
         self.routed_efforts.append(effort)
         queue = self.responses.get(req.role)
@@ -796,4 +829,7 @@ __all__ = [
     "create_llm_backend_from_env",
     "extract_creative_payload",
     "extract_python_dsl",
+    "is_carbon_model",
+    "sanitize_effort",
+    "sanitize_model_id",
 ]

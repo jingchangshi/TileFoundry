@@ -33,8 +33,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--operator",
         required=True,
-        choices=("attention_residual", "mla"),
-        help="Target production operator to optimize.",
+        help="Target operator to optimize (short name e.g. rms_norm or task id e.g. level2/rms_norm).",
     )
     parser.add_argument(
         "--marathon",

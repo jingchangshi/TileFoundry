@@ -14,10 +14,13 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
     StageCResult,
+    evaluate_ascendc_candidate,
     prescreen_dsl_tile_kwargs,
     run_stage_a_static,
+    run_stage_b_ascendc_compile,
     run_stage_b_compile,
     run_stage_c_agent_gates,
+    synthesize_pybind_extension_wrapper,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     CREATIVE_RESPONSE_SCHEMA,
@@ -35,6 +38,7 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     PortfolioRoundReport,
     PortfolioRunner,
+    RoundEscalationReport,
     WorkerSpec,
     build_creative_request,
     build_exploit_request,
@@ -77,6 +81,7 @@ __all__ = [
     "PrescreenScore",
     "RE_503_CAPACITY",
     "RE_STREAM_IDLE_LOG",
+    "RoundEscalationReport",
     "StageAResult",
     "StageBResult",
     "StageCResult",
@@ -93,6 +98,7 @@ __all__ = [
     "build_tilelang_runtime_twin",
     "compute_static_dynamic_residual",
     "create_llm_backend_from_env",
+    "evaluate_ascendc_candidate",
     "evaluate_tile_candidate",
     "extract_creative_payload",
     "extract_python_dsl",
@@ -104,8 +110,10 @@ __all__ = [
     "prescreen_tile_configs",
     "run_e2e_evolution",
     "run_stage_a_static",
+    "run_stage_b_ascendc_compile",
     "run_stage_b_compile",
     "run_stage_c_agent_gates",
+    "synthesize_pybind_extension_wrapper",
     "synthesize_initial_dsl",
     "verify_twin_cpu_reference",
 ]

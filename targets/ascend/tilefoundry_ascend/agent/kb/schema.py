@@ -272,7 +272,7 @@ _DEFAULT_PIPE_KEYS = (
 
 _DEFAULT_SCOPES = ("UB", "L1", "L0A", "L0B", "L0C", "SSBUF")
 
-_RESIDUAL_DEFAULTS: dict[str, float | bool] = {
+_RESIDUAL_DEFAULTS: dict[str, int | float | bool | str] = {
     "measured_latency_us": 0.0,
     "predicted_bottleneck_util": 0.0,
     "measured_aic_mac_ratio": 0.0,
@@ -281,6 +281,27 @@ _RESIDUAL_DEFAULTS: dict[str, float | bool] = {
     "measured_sync_stall_ratio": 0.0,
     "unexplained_gap_ratio": 0.0,
     "pseudo_double_buffer_serialized": False,
+    "spill_bytes": 0,
+    "vloopv2_hit": True,
+    "l2_hit_rate": 1.0,
+    "bank_conflict_ratio": 0.0,
+    "vf_fusion_breaks": 0,
+    "alias_serialized_buffers": 0,
+    "dual_issue_ipc_collapse": 0.0,
+    "dcache_dcci_flushes": 0,
+    "has_local_membar_in_vf_call": False,
+}
+
+_TELEMETRY_CONTEXT_DEFAULTS: dict[str, int | float | bool | str] = {
+    "num_aic_cores": 28,
+    "num_aiv_cores": 56,
+    "ub_bank_conflict_risk": 0.0,
+    "l1_bank_conflict_risk": 0.0,
+    "has_empty_group": False,
+    "has_loop_carried_state": False,
+    "compute_engine": "",
+    "memory_ring": "",
+    "iteration_regularity": "",
 }
 
 
@@ -341,6 +362,17 @@ def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
     )
     ns["has_dynamic_control"] = bool(ledger.opaque_dynamic_regions)
 
+    for key, default_val in _TELEMETRY_CONTEXT_DEFAULTS.items():
+        raw_val = getattr(ledger, key, default_val)
+        if isinstance(default_val, bool):
+            ns[key] = bool(raw_val)
+        elif isinstance(default_val, int):
+            ns[key] = int(raw_val)
+        elif isinstance(default_val, float):
+            ns[key] = float(raw_val)
+        else:
+            ns[key] = str(raw_val)
+
     total_bloat = 0
     degraded_total = 0
     any_overflow = 0
@@ -378,13 +410,38 @@ def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
     return ns
 
 
+def _extract_typed_defaults(
+    source: Mapping[str, object] | object,
+    defaults: Mapping[str, int | float | bool | str],
+) -> dict[str, int | float | bool | str]:
+    resolved: dict[str, int | float | bool | str] = {}
+    for key, default_val in defaults.items():
+        if isinstance(source, Mapping) and key in source:
+            raw_val = source[key]
+        elif hasattr(source, key):
+            raw_val = getattr(source, key)
+        else:
+            continue
+        if isinstance(default_val, bool):
+            resolved[key] = bool(raw_val)
+        elif isinstance(default_val, int):
+            resolved[key] = int(raw_val)
+        elif isinstance(default_val, float):
+            resolved[key] = float(raw_val)
+        else:
+            resolved[key] = str(raw_val)
+    return resolved
+
+
 def build_predicate_context(
     ledger: ObjectivePhysicalLedger,
     *,
     features: object | None = None,
     residual: Mapping[str, object] | object | None = None,
+    compiler_summary: Mapping[str, object] | object | None = None,
     prev_ledger: ObjectivePhysicalLedger | None = None,
     extra: Mapping[str, object] | None = None,
+    target: object | None = None,
 ) -> dict[str, object]:
     """Assemble a flat and dotted-path dictionary for safe rule predicate evaluation."""
     ctx = _ledger_to_namespace(ledger)
@@ -393,24 +450,59 @@ def build_predicate_context(
             ctx.update(features.to_dict())
         elif isinstance(features, Mapping):
             ctx.update(features)
+        for key in (
+            "compute_engine",
+            "memory_ring",
+            "iteration_regularity",
+            "has_empty_group",
+            "has_loop_carried_state",
+        ):
+            if hasattr(features, key):
+                ctx[key] = getattr(features, key)
+        feat_axes = getattr(features, "topology_axes", None)
+        if isinstance(feat_axes, Mapping):
+            for ak in ("compute_engine", "memory_ring", "iteration_regularity"):
+                if ak in feat_axes:
+                    ctx[ak] = str(feat_axes[ak])
+        elif feat_axes is not None:
+            for ak in ("compute_engine", "memory_ring", "iteration_regularity"):
+                if hasattr(feat_axes, ak):
+                    ctx[ak] = str(getattr(feat_axes, ak))
 
-    res_defaults: dict[str, float | bool] = dict(_RESIDUAL_DEFAULTS)
+    if target is not None:
+        dev = getattr(target, "device", target)
+        if hasattr(dev, "aic_count"):
+            ctx["num_aic_cores"] = int(dev.aic_count)
+        if hasattr(dev, "aiv_count"):
+            ctx["num_aiv_cores"] = int(dev.aiv_count)
+
+    res_defaults: dict[str, int | float | bool | str] = dict(_RESIDUAL_DEFAULTS)
+    if compiler_summary is not None:
+        comp_vals = _extract_typed_defaults(compiler_summary, _RESIDUAL_DEFAULTS)
+        # Preserve optimistic vloopv2_hit=True when BishengResourceSummary had no loop diagnostics
+        if isinstance(compiler_summary, Mapping):
+            sw = int(compiler_summary.get("software_loops", 0) or 0)
+            vl = int(compiler_summary.get("vloopv2_loops", 0) or 0)
+        else:
+            sw = int(getattr(compiler_summary, "software_loops", 0) or 0)
+            vl = int(getattr(compiler_summary, "vloopv2_loops", 0) or 0)
+        if sw == 0 and vl == 0 and "vloopv2_hit" in comp_vals:
+            comp_vals["vloopv2_hit"] = True
+        res_defaults.update(comp_vals)
     if residual is not None:
-        for key, default_val in _RESIDUAL_DEFAULTS.items():
-            if isinstance(residual, Mapping) and key in residual:
-                raw_val = residual[key]
-            elif hasattr(residual, key):
-                raw_val = getattr(residual, key)
-            else:
-                continue
-            res_defaults[key] = (
-                bool(raw_val) if isinstance(default_val, bool) else float(raw_val)
-            )
+        res_defaults.update(_extract_typed_defaults(residual, _RESIDUAL_DEFAULTS))
+        ctx.update(_extract_typed_defaults(residual, _TELEMETRY_CONTEXT_DEFAULTS))
     ctx.update(res_defaults)
+
+    # Also allow bank_conflict_ratio (from TelemetryFeedback) to seed ub_bank_conflict_risk
+    if float(ctx.get("ub_bank_conflict_risk", 0.0)) == 0.0 and float(ctx.get("bank_conflict_ratio", 0.0)) > 0.0:
+        ctx["ub_bank_conflict_risk"] = float(ctx["bank_conflict_ratio"])
 
     if prev_ledger is not None:
         prev_ns = _ledger_to_namespace(prev_ledger)
         for key, val in _RESIDUAL_DEFAULTS.items():
+            prev_ns.setdefault(key, val)
+        for key, val in _TELEMETRY_CONTEXT_DEFAULTS.items():
             prev_ns.setdefault(key, val)
         ctx["prev"] = prev_ns
     else:
@@ -418,6 +510,15 @@ def build_predicate_context(
 
     if extra:
         ctx.update(extra)
+        extra_axes = extra.get("topology_axes")
+        if isinstance(extra_axes, Mapping):
+            for ak in ("compute_engine", "memory_ring", "iteration_regularity"):
+                if ak in extra_axes:
+                    ctx[ak] = str(extra_axes[ak])
+        elif extra_axes is not None:
+            for ak in ("compute_engine", "memory_ring", "iteration_regularity"):
+                if hasattr(extra_axes, ak):
+                    ctx[ak] = str(getattr(extra_axes, ak))
     return ctx
 
 

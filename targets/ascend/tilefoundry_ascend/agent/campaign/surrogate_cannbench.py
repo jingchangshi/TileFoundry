@@ -46,6 +46,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     default_source_root,
     get_default_anchors,
     get_operator_entrypoint,
+    get_operator_module_relpath,
     get_operator_task,
     lookup_case_dims,
     parse_simple_env_file,
@@ -1888,11 +1889,7 @@ def run_l4_official_cannbench_via_agent_gates(
         overrides: dict[str, str] = {}
         if operator_name is not None:
             task = get_operator_task(operator_name)
-            rel_cand = (
-                "examples/ascend950pr_ops/attention_residual/kernels.py"
-                if operator_name == "attention_residual"
-                else "examples/ascend950pr_ops/mla/kernels.py"
-            )
+            rel_cand = get_operator_module_relpath(operator_name)
             overrides["TILEFOUNDRY_NPU_CANNBENCH_TARGETS"] = f"{task}:{rel_cand}"
         tmp_env = _write_temp_env_file(resolved_env, tmp / "env.sh", overrides)
         cmd = [

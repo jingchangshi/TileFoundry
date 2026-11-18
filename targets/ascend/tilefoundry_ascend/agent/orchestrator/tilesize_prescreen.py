@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from itertools import product
 import math
 
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
-from tilefoundry_ascend.ascend.target.facts import ascend_space_facts
+from tilefoundry_ascend.ascend.target.facts import ascend_space_facts, cube_macs_per_cycle as _default_cube_macs_per_cycle
 
 
 def _align512(nbytes: int) -> int:
@@ -31,6 +31,9 @@ class TileConfigCandidate:
     aiv_split: int = 2
     d_out: int = 0
     dual_accumulator: bool = False
+    dtype: str = ""
+    hf32: bool = False
+    l1_half_bank_split: bool = True
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,29 @@ class PrescreenScore:
     fixpipe_to_cube_ratio: float
     score: float
     rejection_reason: str | None = None
+    cube_macs_per_cycle: int = 4096
+    half_l1_penalty: float = 0.0
+
+
+def _resolve_candidate_dtype(cand: TileConfigCandidate, explicit_dtype: str | None) -> str:
+    if explicit_dtype and explicit_dtype.strip():
+        return explicit_dtype.strip().lower()
+    if cand.dtype and cand.dtype.strip():
+        return cand.dtype.strip().lower()
+    if cand.dtype_bytes == 1:
+        return "fp8e4m3"
+    if cand.dtype_bytes == 4:
+        return "f32"
+    return "f16"
+
+
+def _resolve_cube_macs(facts: AscendSpaceFacts, dtype_name: str, *, hf32: bool) -> int:
+    if hasattr(facts, "cube_macs_per_cycle"):
+        try:
+            return int(facts.cube_macs_per_cycle(dtype_name, hf32=hf32))
+        except Exception:
+            pass
+    return int(_default_cube_macs_per_cycle(dtype_name, hf32=hf32))
 
 
 def evaluate_tile_candidate(
@@ -55,8 +81,15 @@ def evaluate_tile_candidate(
     facts: AscendSpaceFacts,
     *,
     simtvf: bool = False,
+    dtype: str | None = None,
+    hf32: bool | None = None,
+    l1_half_bank_split: bool | None = None,
 ) -> PrescreenScore:
-    """Compute exact scratchpad occupancy and hardware balance for one tile tuple."""
+    """Compute exact scratchpad occupancy, per-dtype Cube balance, and Half-L1 conflict score."""
+    eff_dtype = _resolve_candidate_dtype(cand, dtype)
+    eff_hf32 = cand.hf32 if hf32 is None else bool(hf32)
+    macs_per_cycle = max(1, _resolve_cube_macs(facts, eff_dtype, hf32=eff_hf32))
+
     if cand.bm <= 0 or cand.bn <= 0 or cand.bk <= 0 or cand.stages < 1 or cand.aiv_split < 1:
         return PrescreenScore(
             candidate=cand,
@@ -70,6 +103,8 @@ def evaluate_tile_candidate(
             fixpipe_to_cube_ratio=0.0,
             score=0.0,
             rejection_reason="non_positive_tile_dimension",
+            cube_macs_per_cycle=macs_per_cycle,
+            half_l1_penalty=0.0,
         )
     if cand.bm % 16 != 0 or cand.bn % 16 != 0 or cand.bk % 16 != 0:
         return PrescreenScore(
@@ -84,6 +119,8 @@ def evaluate_tile_candidate(
             fixpipe_to_cube_ratio=0.0,
             score=0.0,
             rejection_reason="unaligned_mmad_16x16x16_atom",
+            cube_macs_per_cycle=macs_per_cycle,
+            half_l1_penalty=0.0,
         )
 
     l0a_slot = cand.bm * cand.bk * cand.dtype_bytes
@@ -117,14 +154,29 @@ def evaluate_tile_candidate(
     else:
         reason = None
 
+    eff_half_split = cand.l1_half_bank_split if l1_half_bank_split is None else bool(l1_half_bank_split)
+    half_l1_limit = int(getattr(facts, "l1_bank_bytes", facts.l1_bytes // 2) or (facts.l1_bytes // 2))
+    half_l1_penalty = 0.0
+    if cand.stages >= 2:
+        if not eff_half_split:
+            half_l1_penalty = 0.25
+        else:
+            stages_per_bank = math.ceil(cand.stages / 2)
+            half_bank_bytes = stages_per_bank * (l0a_slot + l0b_slot)
+            if half_bank_bytes > half_l1_limit:
+                overflow_ratio = (half_bank_bytes - half_l1_limit) / float(max(1, half_l1_limit))
+                half_l1_penalty = min(0.75, 0.25 + 0.50 * overflow_ratio)
+
     flops = float(2 * cand.bm * cand.bn * cand.bk)
     mem_traffic = float(l0a_slot + l0b_slot + l0c_bytes)
     intensity = flops / mem_traffic if mem_traffic > 0.0 else 0.0
-    cube_cycles = max(1.0, flops / 4096.0)
+    cube_cycles = max(1.0, flops / float(macs_per_cycle))
     fixpipe_cycles = float(l0c_bytes) / float(max(1, facts.fixpipe_bytes_per_cycle))
     fp_ratio = fixpipe_cycles / cube_cycles
     stage_bonus = 1.25 if cand.stages >= 2 else 1.0
-    score = (intensity * stage_bonus) / (1.0 + max(0.0, fp_ratio - 1.0))
+    score = (intensity * stage_bonus) / (
+        (1.0 + max(0.0, fp_ratio - 1.0)) * (1.0 + half_l1_penalty)
+    )
 
     return PrescreenScore(
         candidate=cand,
@@ -138,6 +190,8 @@ def evaluate_tile_candidate(
         fixpipe_to_cube_ratio=fp_ratio,
         score=score if reason is None else 0.0,
         rejection_reason=reason,
+        cube_macs_per_cycle=macs_per_cycle,
+        half_l1_penalty=round(half_l1_penalty, 6),
     )
 
 
@@ -147,10 +201,23 @@ def prescreen_tile_configs(
     target: AscendTarget | None = None,
     simtvf: bool = False,
     top_k: int | None = None,
+    dtype: str | None = None,
+    hf32: bool | None = None,
+    l1_half_bank_split: bool | None = None,
 ) -> list[PrescreenScore]:
     """Batch-filter and rank candidate tile shapes by scratchpad legality and balance."""
     facts = (target or AscendTarget("ascend.950pr")).get_facts(AscendSpaceFacts)
-    scored = [evaluate_tile_candidate(c, facts, simtvf=simtvf) for c in candidates]
+    scored = [
+        evaluate_tile_candidate(
+            c,
+            facts,
+            simtvf=simtvf,
+            dtype=dtype,
+            hf32=hf32,
+            l1_half_bank_split=l1_half_bank_split,
+        )
+        for c in candidates
+    ]
     feasible = [item for item in scored if item.is_feasible]
     feasible.sort(key=lambda item: item.score, reverse=True)
     if top_k is not None and top_k >= 0:
@@ -375,6 +442,12 @@ def _apply_tile_candidate_to_kwargs(
         kw["bm"] = cand.bm
     elif "tile_m" in params:
         kw["tile_m"] = cand.bm
+    elif "block_m" in params:
+        kw["block_m"] = cand.bm
+    elif "tile_rows" in params:
+        kw["tile_rows"] = cand.bm
+    elif "row_tile" in params:
+        kw["row_tile"] = cand.bm
     elif has_varkw:
         kw["bm"] = cand.bm
 
@@ -382,6 +455,8 @@ def _apply_tile_candidate_to_kwargs(
         kw["bn"] = cand.bn
     elif "tile_n" in params:
         kw["tile_n"] = cand.bn
+    elif "block_n" in params:
+        kw["block_n"] = cand.bn
     elif has_varkw:
         kw["bn"] = cand.bn
 
@@ -389,6 +464,8 @@ def _apply_tile_candidate_to_kwargs(
         kw["bk"] = cand.bk
     elif "tile_k" in params:
         kw["tile_k"] = cand.bk
+    elif "block_k" in params:
+        kw["block_k"] = cand.bk
 
     if "num_stages" in params:
         kw["num_stages"] = cand.stages
@@ -413,14 +490,20 @@ def prescreen_live_ir_neighborhood(
 ) -> str:
     """Run bounded Stage A live-IR dry-runs across aligned tile variants around center."""
     params, has_varkw = inspect_builder_tile_params(dsl_source, factory_name)
-    tune_m = has_varkw or "bm" in params or "tile_m" in params
-    tune_n = has_varkw or "bn" in params or "tile_n" in params
-    tune_k = has_varkw or "bk" in params or "tile_k" in params
+    m_keys = ("bm", "tile_m", "block_m", "tile_rows", "row_tile")
+    n_keys = ("bn", "tile_n", "block_n")
+    k_keys = ("bk", "tile_k", "block_k")
+    tune_m = has_varkw or any(k in params for k in m_keys)
+    tune_n = has_varkw or any(k in params for k in n_keys)
+    tune_k = has_varkw or any(k in params for k in k_keys)
     tune_stages = has_varkw or "stages" in params or "num_stages" in params
     if not (tune_m or tune_n or tune_k or tune_stages):
         return ""
     pure_vector_row_tile = (
-        count_dsl_gemm_calls(dsl_source) == 0 and "tile_m" in params and "bm" not in params
+        count_dsl_gemm_calls(dsl_source) == 0
+        and any(k in params for k in ("tile_m", "tile_rows", "row_tile"))
+        and "bm" not in params
+        and "block_m" not in params
     )
 
     from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
@@ -462,12 +545,12 @@ def prescreen_live_ir_neighborhood(
     total_rows = 0
     for src in (var_bindings, dims):
         if isinstance(src, Mapping):
-            raw_m = src.get("m_rows")
+            raw_m = src.get("m_rows", src.get("total_rows", src.get("M", src.get("m_dim"))))
             if isinstance(raw_m, int) and not isinstance(raw_m, bool) and raw_m > 0:
                 total_rows = int(raw_m)
                 break
-            b_val = src.get("B", src.get("b_dim"))
-            s_val = src.get("S", src.get("s_dim", src.get("S_q")))
+            b_val = src.get("B", src.get("b_dim", src.get("batch")))
+            s_val = src.get("S", src.get("s_dim", src.get("S_q", src.get("seq_len"))))
             if (
                 isinstance(b_val, int)
                 and isinstance(s_val, int)
@@ -676,10 +759,145 @@ def format_prescreen_summary(scores: Sequence[PrescreenScore]) -> str:
     return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class PrescreenAblationSample:
+    """Single paired A/B ablation sample comparing prescreen-off vs prescreen-on."""
+
+    case_id: str
+    baseline_score: float
+    prescreen_score: float
+    is_anchor: bool = False
+    baseline_latency_us: float | None = None
+    prescreen_latency_us: float | None = None
+
+    @property
+    def gain(self) -> float:
+        """Return net score improvement (positive means prescreen improved over baseline)."""
+        return float(self.prescreen_score) - float(self.baseline_score)
+
+    @property
+    def is_regression(self) -> bool:
+        """Return True if enabling prescreen degraded score relative to baseline."""
+        return self.gain < 0.0
+
+    def to_dict(self) -> dict[str, object]:
+        out = asdict(self)
+        out["gain"] = self.gain
+        out["is_regression"] = self.is_regression
+        return out
+
+
+@dataclass(frozen=True)
+class PrescreenAblationReport:
+    """Independent A/B ablation gate report controlling whether prescreener activation is allowed."""
+
+    recommended_enable: bool
+    sample_count: int
+    anchor_count: int
+    mean_gain: float
+    min_gain: float
+    max_gain: float
+    regression_count: int
+    anchor_regression_count: int
+    anchor_regressions: tuple[str, ...]
+    reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        out = asdict(self)
+        out["anchor_regressions"] = list(self.anchor_regressions)
+        out["reasons"] = list(self.reasons)
+        return out
+
+
+def evaluate_prescreen_ablation(
+    samples: Sequence[PrescreenAblationSample | Mapping[str, object]],
+    *,
+    min_mean_gain: float = 0.01,
+    allow_anchor_regressions: bool = False,
+) -> PrescreenAblationReport:
+    """Gate activation of tilesize_prescreen on independent net-gain + zero-anchor-regression proof."""
+    coerced: list[PrescreenAblationSample] = []
+    for item in samples:
+        if isinstance(item, PrescreenAblationSample):
+            coerced.append(item)
+        elif isinstance(item, Mapping):
+            coerced.append(
+                PrescreenAblationSample(
+                    case_id=str(item["case_id"]),
+                    baseline_score=float(item["baseline_score"]),
+                    prescreen_score=float(item["prescreen_score"]),
+                    is_anchor=bool(item.get("is_anchor", False)),
+                    baseline_latency_us=(
+                        float(item["baseline_latency_us"])
+                        if item.get("baseline_latency_us") is not None
+                        else None
+                    ),
+                    prescreen_latency_us=(
+                        float(item["prescreen_latency_us"])
+                        if item.get("prescreen_latency_us") is not None
+                        else None
+                    ),
+                )
+            )
+        else:
+            raise TypeError(f"Expected PrescreenAblationSample or Mapping, got {type(item).__name__}")
+
+    if not coerced:
+        return PrescreenAblationReport(
+            recommended_enable=False,
+            sample_count=0,
+            anchor_count=0,
+            mean_gain=0.0,
+            min_gain=0.0,
+            max_gain=0.0,
+            regression_count=0,
+            anchor_regression_count=0,
+            anchor_regressions=(),
+            reasons=("no_ablation_samples_keep_disabled",),
+        )
+
+    gains = [s.gain for s in coerced]
+    mean_gain = sum(gains) / float(len(gains))
+    min_gain = min(gains)
+    max_gain = max(gains)
+    regressions = [s for s in coerced if s.is_regression]
+    anchors = [s for s in coerced if s.is_anchor]
+    anchor_regs = tuple(s.case_id for s in anchors if s.is_regression)
+
+    reasons: list[str] = []
+    passed = True
+    if mean_gain < float(min_mean_gain):
+        passed = False
+        reasons.append(f"mean_gain={mean_gain:.4f} < min_mean_gain={float(min_mean_gain):.4f}")
+    if anchor_regs and not allow_anchor_regressions:
+        passed = False
+        reasons.append(f"anchor_regressions={list(anchor_regs)}")
+    if passed:
+        reasons.append(
+            f"ablation_passed: mean_gain={mean_gain:.4f}, anchor_regressions={len(anchor_regs)}"
+        )
+
+    return PrescreenAblationReport(
+        recommended_enable=passed,
+        sample_count=len(coerced),
+        anchor_count=len(anchors),
+        mean_gain=mean_gain,
+        min_gain=min_gain,
+        max_gain=max_gain,
+        regression_count=len(regressions),
+        anchor_regression_count=len(anchor_regs),
+        anchor_regressions=anchor_regs,
+        reasons=tuple(reasons),
+    )
+
+
 __all__ = [
+    "PrescreenAblationReport",
+    "PrescreenAblationSample",
     "PrescreenScore",
     "TileConfigCandidate",
     "count_dsl_gemm_calls",
+    "evaluate_prescreen_ablation",
     "evaluate_tile_candidate",
     "format_prescreen_summary",
     "generate_aligned_neighborhood",

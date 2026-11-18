@@ -162,6 +162,46 @@ OPERATOR_METADATA: dict[str, tuple[str, str, str]] = {
         "examples/ascend950pr_ops/mla/kernels.py",
         "mla",
     ),
+    "swi_glu": (
+        "level1/swi_glu",
+        "examples/ascend950pr_ops/swi_glu/kernels.py",
+        "swi_glu",
+    ),
+    "rms_norm": (
+        "level2/rms_norm",
+        "examples/ascend950pr_ops/rms_norm/kernels.py",
+        "rms_norm",
+    ),
+    "softmax": (
+        "level2/softmax",
+        "examples/ascend950pr_ops/softmax/kernels.py",
+        "softmax",
+    ),
+    "add_rms_norm_dynamic_quant": (
+        "level3/add_rms_norm_dynamic_quant",
+        "examples/ascend950pr_ops/add_rms_norm_dynamic_quant/kernels.py",
+        "add_rms_norm_dynamic_quant",
+    ),
+    "mhc_sinkhorn": (
+        "level3/mhc_sinkhorn",
+        "examples/ascend950pr_ops/mhc_sinkhorn/kernels.py",
+        "mhc_sinkhorn",
+    ),
+    "gqa": (
+        "level4/gqa",
+        "examples/ascend950pr_ops/gqa/kernels.py",
+        "gqa",
+    ),
+    "kimi_delta_attention": (
+        "level5/kimi_delta_attention",
+        "examples/ascend950pr_ops/kimi_delta_attention/kernels.py",
+        "kimi_delta_attention",
+    ),
+    "tensor_program_vm": (
+        "level5/tensor_program_vm",
+        "examples/ascend950pr_ops/tensor_program_vm/kernels.py",
+        "tensor_program_vm",
+    ),
 }
 
 ATTENTION_RESIDUAL_ANCHORS: tuple[AnchorCaseSpec, ...] = (
@@ -424,46 +464,660 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
 }
 
 
+def _normalize_shape_list(raw_shapes: object) -> list[list[int]]:
+    shapes: list[list[int]] = []
+    if not isinstance(raw_shapes, (list, tuple)):
+        return shapes
+    if raw_shapes and all(isinstance(x, int) and not isinstance(x, bool) for x in raw_shapes):
+        return [[int(x) for x in raw_shapes]]
+    for item in raw_shapes:
+        if item is None:
+            continue
+        if isinstance(item, (list, tuple)):
+            if item and all(isinstance(x, int) and not isinstance(x, bool) for x in item):
+                shapes.append([int(x) for x in item])
+            elif item and isinstance(item[0], (list, tuple)):
+                for sub in item:
+                    if isinstance(sub, (list, tuple)) and all(
+                        isinstance(x, int) and not isinstance(x, bool) for x in sub
+                    ):
+                        shapes.append([int(x) for x in sub])
+    return shapes
+
+
+def _is_prime_gt2(n: int) -> bool:
+    if n < 3 or n % 2 == 0:
+        return False
+    d = 3
+    while d * d <= n:
+        if n % d == 0:
+            return False
+        d += 2
+    return True
+
+
+def _analyze_case_geometry(case_entry: Mapping[str, object], ref_us: float, t_hw_us: float) -> dict[str, object]:
+    shapes = _normalize_shape_list(case_entry.get("input_shape"))
+    attrs = case_entry.get("attrs") if isinstance(case_entry.get("attrs"), Mapping) else {}
+    total_elems = 0
+    all_dims: list[int] = []
+    trailing_dims: list[int] = []
+    max_rank = 0
+    for sh in shapes:
+        max_rank = max(max_rank, len(sh))
+        prod = 1
+        for d in sh:
+            if d > 0:
+                prod *= d
+                all_dims.append(d)
+        total_elems += prod
+        if sh:
+            trailing_dims.append(sh[-1])
+
+    odd_or_prime_tail = any(
+        d > 1 and (d % 2 == 1 or _is_prime_gt2(d))
+        for d in trailing_dims
+    )
+    unaligned_16_tail = any(d > 1 and d % 16 != 0 for d in trailing_dims)
+    unaligned_any_dim = any(d > 1 and d % 16 != 0 for d in all_dims)
+    unaligned_64_tail = any(d > 1 and d % 64 != 0 for d in trailing_dims)
+    is_unaligned = odd_or_prime_tail or unaligned_16_tail or unaligned_any_dim or unaligned_64_tail
+    unaligned_score = (
+        (4 if odd_or_prime_tail else 0)
+        + (3 if unaligned_16_tail else 0)
+        + (2 if unaligned_any_dim else 0)
+        + (1 if unaligned_64_tail else 0)
+    )
+
+    aspect_ratio = 1.0
+    if all_dims:
+        pos_dims = [d for d in all_dims if d > 0]
+        if pos_dims:
+            aspect_ratio = float(max(pos_dims)) / float(max(1, min(pos_dims)))
+
+    has_empty_group = False
+    group_skew = 1.0
+    group_list = attrs.get("group_list")
+    if isinstance(group_list, (list, tuple)) and group_list:
+        try:
+            gvals = [int(x) for x in group_list]
+            diffs: list[int] = []
+            prev = 0
+            for g in gvals:
+                diffs.append(max(0, g - prev))
+                prev = g
+            has_empty_group = any(d == 0 for d in diffs)
+            pos_diffs = [d for d in diffs if d > 0]
+            if pos_diffs:
+                group_skew = float(max(pos_diffs)) / float(min(pos_diffs))
+        except (TypeError, ValueError):
+            pass
+
+    special_attr_score = 0
+    if attrs.get("inplace") is True:
+        special_attr_score += 2
+    if attrs.get("is_causal") is True:
+        special_attr_score += 1
+    if str(attrs.get("inputLayout", "")).upper() == "BNSD":
+        special_attr_score += 2
+    vr_text = repr(case_entry.get("value_range", "")).lower()
+    if "inf" in vr_text or "nan" in vr_text or "unique" in vr_text:
+        special_attr_score += 1
+
+    return {
+        "case_id": int(case_entry.get("case_id", 0)),
+        "shapes": shapes,
+        "attrs": dict(attrs),
+        "total_elems": max(1, total_elems),
+        "max_rank": max_rank,
+        "is_unaligned": is_unaligned,
+        "unaligned_score": unaligned_score,
+        "aspect_ratio": aspect_ratio,
+        "has_empty_group": has_empty_group,
+        "group_skew": group_skew,
+        "special_attr_score": special_attr_score,
+        "ref_perf_us": float(ref_us),
+        "t_hw_us": float(t_hw_us),
+    }
+
+
+def _stratify_operator_anchors(
+    task: str,
+    cases: Sequence[Mapping[str, object]],
+    meta_map: Mapping[int, tuple[float, float]],
+) -> tuple[AnchorCaseSpec, ...]:
+    """Stratify an operator's case list into 4-5 representative AnchorCaseSpecs."""
+    if not cases:
+        return ()
+    metrics = []
+    for raw in cases:
+        cid = int(raw.get("case_id", 0))
+        ref_us, hw_us = meta_map.get(cid, (0.0, 0.0))
+        metrics.append(_analyze_case_geometry(raw, ref_us, hw_us))
+
+    picked: list[tuple[dict[str, object], str]] = []
+    picked_ids: set[int] = set()
+
+    def _pick(cand_list: Sequence[dict[str, object]], tag: str) -> None:
+        for item in cand_list:
+            cid = int(item["case_id"])
+            if cid not in picked_ids:
+                picked_ids.add(cid)
+                picked.append((item, tag))
+                return
+
+    # 1. Smallest latency-bound case
+    by_small = sorted(
+        metrics,
+        key=lambda m: (
+            m["total_elems"],
+            m["t_hw_us"] if m["t_hw_us"] > 0.0 else float("inf"),
+            m["case_id"],
+        ),
+    )
+    _pick(by_small, "small_latency")
+
+    # 2. Prime/odd unaligned tail case
+    unaligned_pool = [m for m in metrics if m["is_unaligned"]]
+    if unaligned_pool:
+        by_unaligned = sorted(
+            unaligned_pool,
+            key=lambda m: (
+                -int(m["unaligned_score"]),
+                m["total_elems"],
+                m["case_id"],
+            ),
+        )
+        _pick(by_unaligned, "unaligned_tail")
+    else:
+        _pick(by_small, "unaligned_tail")
+
+    # 3. Largest throughput case
+    by_large = sorted(
+        metrics,
+        key=lambda m: (
+            -int(m["total_elems"]),
+            -float(m["t_hw_us"]),
+            m["case_id"],
+        ),
+    )
+    _pick(by_large, "large_throughput")
+
+    # 4. Extreme aspect / empty-group / special-case
+    by_extreme = sorted(
+        metrics,
+        key=lambda m: (
+            -(1 if m["has_empty_group"] else 0),
+            -float(m["group_skew"]),
+            -float(m["aspect_ratio"]),
+            -int(m["special_attr_score"]),
+            -int(m["total_elems"]),
+            m["case_id"],
+        ),
+    )
+    _pick(by_extreme, "extreme_aspect")
+
+    # 5. Balanced mid-regime case (up to 5 anchors total)
+    if len(picked) < 5 and len(metrics) >= 5:
+        by_mid = sorted(
+            metrics,
+            key=lambda m: (
+                float(m["t_hw_us"]) if m["t_hw_us"] > 0.0 else float(m["total_elems"]),
+                m["total_elems"],
+                m["case_id"],
+            ),
+        )
+        mid_idx = len(by_mid) // 2
+        ordered_mid = [by_mid[mid_idx], *by_mid[mid_idx + 1 :], *reversed(by_mid[:mid_idx])]
+        _pick(ordered_mid, "mid_balanced")
+
+    anchors = [
+        AnchorCaseSpec(
+            task=task,
+            case_num=int(item["case_id"]),
+            regime_tag=tag,
+            ref_perf_us=float(item["ref_perf_us"]),
+            t_hw_us=float(item["t_hw_us"]),
+        )
+        for item, tag in picked
+    ]
+    anchors.sort(key=lambda a: a.case_num)
+    return tuple(anchors)
+
+
+@dataclass(frozen=True)
+class CannbotOpSpec:
+    """Discovered operator specification from cannbot-ops/operators."""
+
+    op_id: str
+    task: str
+    level: str
+    level_num: int
+    op_dir: Path
+    proto: dict[str, object]
+    cases: tuple[dict[str, object], ...]
+    metadata_950pr: dict[int, tuple[float, float]]
+    anchors: tuple[AnchorCaseSpec, ...]
+    perf_target: PerfTargetSpec
+    module_relpath: str
+    entrypoint: str
+
+
+class CannbotOpsRegistry:
+    """Dynamic registry discovering all 60+ operators in cannbot-ops/operators."""
+
+    _DEFAULT_INSTANCE: CannbotOpsRegistry | None = None
+
+    def __init__(
+        self,
+        operators_root: str | Path | None = None,
+        *,
+        source_root: str | Path | None = None,
+    ) -> None:
+        self._source_root = (
+            Path(source_root).resolve() if source_root is not None else default_source_root()
+        )
+        self._operators_root = self._resolve_operators_root(operators_root)
+        self._meta_950pr: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
+        meta_path = self._operators_root / "metadata" / "950pr.json"
+        if meta_path.is_file():
+            self._meta_950pr = json.loads(meta_path.read_text(encoding="utf-8"))
+        self._entries: dict[str, dict[str, object]] = {}
+        self._task_to_op: dict[str, str] = {}
+        self._cache: dict[str, CannbotOpSpec] = {}
+        self._discover_manifest()
+
+    @classmethod
+    def default(cls) -> CannbotOpsRegistry:
+        """Return cached default CannbotOpsRegistry instance."""
+        if cls._DEFAULT_INSTANCE is None:
+            cls._DEFAULT_INSTANCE = cls()
+        return cls._DEFAULT_INSTANCE
+
+    def _resolve_operators_root(self, operators_root: str | Path | None) -> Path:
+        if operators_root is not None:
+            p = Path(operators_root).expanduser().resolve()
+            if (p / "operators").is_dir():
+                return (p / "operators").resolve()
+            if p.is_dir():
+                return p
+            raise FileNotFoundError(f"cannbot-ops operators directory not found: {p}")
+
+        candidates: list[Path] = []
+        env_repo = os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
+        if env_repo:
+            candidates.append(Path(env_repo).expanduser() / "operators")
+        candidates.append(self._source_root.parent / "cannbot-ops" / "operators")
+        candidates.append(Path.home() / "workspace" / "cannbot-ops" / "operators")
+        for cand in candidates:
+            if cand.is_dir():
+                return cand.resolve()
+        raise FileNotFoundError(
+            "Cannot locate cannbot-ops/operators directory. "
+            "Pass operators_root or set TILEFOUNDRY_NPU_CANNBENCH_REPO."
+        )
+
+    def _discover_manifest(self) -> None:
+        manifest_path = self._operators_root / "suite_manifest.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for row in manifest.get("operators", ()):
+                op_id = str(row["id"])
+                raw_path = str(row["path"]).removeprefix("tasks/").strip("/")
+                level_dir = raw_path.split("/", 1)[0]
+                op_dir = self._operators_root / raw_path
+                if op_dir.is_dir():
+                    level_num = int(level_dir.removeprefix("level")) if level_dir.startswith("level") else 1
+                    self._entries[op_id] = {
+                        "op_id": op_id,
+                        "task": raw_path,
+                        "level": str(row.get("level", f"L{level_num}")),
+                        "level_dir": level_dir,
+                        "level_num": level_num,
+                        "op_dir": op_dir,
+                    }
+                    self._task_to_op[raw_path] = op_id
+            return
+
+        for level_dir_path in sorted(self._operators_root.glob("level*")):
+            if not level_dir_path.is_dir():
+                continue
+            level_dir = level_dir_path.name
+            level_num = int(level_dir.removeprefix("level")) if level_dir.startswith("level") else 1
+            for op_dir in sorted(level_dir_path.iterdir()):
+                if not op_dir.is_dir() or not (op_dir / "cases.yaml").is_file():
+                    continue
+                op_id = op_dir.name
+                task = f"{level_dir}/{op_id}"
+                self._entries[op_id] = {
+                    "op_id": op_id,
+                    "task": task,
+                    "level": f"L{level_num}",
+                    "level_dir": level_dir,
+                    "level_num": level_num,
+                    "op_dir": op_dir,
+                }
+                self._task_to_op[task] = op_id
+
+    @property
+    def operators_root(self) -> Path:
+        """Return resolved cannbot-ops/operators root path."""
+        return self._operators_root
+
+    def _normalize_key(self, name_or_task: str) -> str:
+        raw = str(name_or_task).strip().removeprefix("tasks/")
+        if raw in self._entries:
+            return raw
+        if raw in self._task_to_op:
+            return self._task_to_op[raw]
+        if "/" in raw:
+            tail = raw.rsplit("/", 1)[-1]
+            if tail in self._entries:
+                return tail
+        raise KeyError(f"unsupported campaign operator {name_or_task!r}")
+
+    def has_operator(self, name_or_task: str) -> bool:
+        """Return True if operator short name or task id exists in registry."""
+        try:
+            self._normalize_key(name_or_task)
+            return True
+        except KeyError:
+            return False
+
+    def list_operators(self) -> tuple[str, ...]:
+        """Return sorted short operator names discovered in registry."""
+        return tuple(sorted(self._entries))
+
+    def list_tasks(self) -> tuple[str, ...]:
+        """Return sorted levelX/op task identifiers discovered in registry."""
+        return tuple(sorted(self._task_to_op))
+
+    def resolve_module_path(
+        self,
+        name_or_task: str,
+        *,
+        source_root: str | Path | None = None,
+    ) -> str:
+        """Resolve workspace-relative candidate module path (kernels.py or solution.py)."""
+        op_id = self._normalize_key(name_or_task)
+        if op_id in OPERATOR_METADATA:
+            return OPERATOR_METADATA[op_id][1]
+        root = Path(source_root).resolve() if source_root is not None else self._source_root
+        for fname in ("kernels.py", "solution.py"):
+            rel = f"examples/ascend950pr_ops/{op_id}/{fname}"
+            if (root / rel).is_file():
+                return rel
+        return f"examples/ascend950pr_ops/{op_id}/kernels.py"
+
+    def resolve(self, name_or_task: str) -> CannbotOpSpec:
+        """Load and cache full CannbotOpSpec (proto, cases, 950pr metadata, anchors, target)."""
+        op_id = self._normalize_key(name_or_task)
+        if op_id in self._cache:
+            return self._cache[op_id]
+
+        meta_entry = self._entries[op_id]
+        op_dir = Path(meta_entry["op_dir"])  # type: ignore[arg-type]
+        task = str(meta_entry["task"])
+        level_dir = str(meta_entry["level_dir"])
+        level = str(meta_entry["level"])
+        level_num = int(meta_entry["level_num"])
+
+        proto_path = op_dir / "proto.yaml"
+        proto_raw = yaml.safe_load(proto_path.read_text(encoding="utf-8")) if proto_path.is_file() else {}
+        proto = dict((proto_raw or {}).get("operator") or {})
+
+        cases_path = op_dir / "cases.yaml"
+        cases_raw = yaml.safe_load(cases_path.read_text(encoding="utf-8")) if cases_path.is_file() else {}
+        cases = tuple(
+            dict(row) for row in ((cases_raw or {}).get("cases") or ()) if isinstance(row, Mapping)
+        )
+
+        raw_meta = self._meta_950pr.get(level_dir, {}).get(op_id, {})
+        meta_950pr: dict[int, tuple[float, float]] = {}
+        for k, val in raw_meta.items():
+            if isinstance(val, Mapping):
+                meta_950pr[int(k)] = (
+                    float(val.get("baseline_perf_us", 0.0)),
+                    float(val.get("t_hw_us", 0.0)),
+                )
+
+        if op_id in DEFAULT_ANCHORS:
+            anchors = DEFAULT_ANCHORS[op_id]
+        else:
+            anchors = _stratify_operator_anchors(task, cases, meta_950pr)
+
+        if op_id in DEFAULT_PERF_TARGETS:
+            perf_target = DEFAULT_PERF_TARGETS[op_id]
+        else:
+            speedups = [
+                a.ref_perf_us / a.t_hw_us
+                for a in anchors
+                if a.ref_perf_us > 0.0 and a.t_hw_us > 0.0
+            ]
+            avg_spd = max(1.05, min(3.0, (sum(speedups) / len(speedups)) * 0.90)) if speedups else 2.0
+            min_spd = max(1.0, min(avg_spd, min(speedups) * 0.85)) if speedups else 1.25
+            per_max = {
+                int(a.case_num): round(max(a.t_hw_us * 1.15, a.t_hw_us), 4)
+                for a in anchors
+                if a.t_hw_us > 0.0
+            }
+            perf_target = PerfTargetSpec(
+                operator_name=op_id,
+                target_avg_speedup=round(avg_spd, 4),
+                target_min_case_speedup=round(min_spd, 4),
+                target_roofline_eta=0.90,
+                per_anchor_max_us=per_max,
+                target_surrogate_score=95.0,
+                min_optimization_rounds=3,
+            )
+
+        spec = CannbotOpSpec(
+            op_id=op_id,
+            task=task,
+            level=level,
+            level_num=level_num,
+            op_dir=op_dir,
+            proto=proto,
+            cases=cases,
+            metadata_950pr=meta_950pr,
+            anchors=anchors,
+            perf_target=perf_target,
+            module_relpath=self.resolve_module_path(op_id),
+            entrypoint=op_id,
+        )
+        self._cache[op_id] = spec
+        return spec
+
+    def get_anchors(self, name_or_task: str) -> tuple[AnchorCaseSpec, ...]:
+        """Return stratified AnchorCaseSpecs for any operator."""
+        return self.resolve(name_or_task).anchors
+
+    def get_perf_target(self, name_or_task: str) -> PerfTargetSpec:
+        """Return PerfTargetSpec targeting t_hw_us and HAP >= 95 for any operator."""
+        return self.resolve(name_or_task).perf_target
+
+    def get_regime_specs(self, name_or_task: str) -> tuple[RegimeTargetSpec, ...]:
+        """Return RegimeTargetSpecs for any operator (preserving legacy 2-op specs)."""
+        op_id = self._normalize_key(name_or_task)
+        if op_id in DEFAULT_REGIME_SPECS:
+            return DEFAULT_REGIME_SPECS[op_id]
+        spec = self.resolve(op_id)
+        mod_file = self._source_root / spec.module_relpath
+        mod_text = mod_file.read_text(encoding="utf-8") if mod_file.is_file() else ""
+        has_shared_selector = f"def _select_{op_id}_config(" in mod_text
+        case_by_id = {int(c.get("case_id", -1)): c for c in spec.cases}
+        seen_tags: set[str] = set()
+        regimes: list[RegimeTargetSpec] = []
+        for anchor in spec.anchors:
+            if anchor.regime_tag in seen_tags:
+                continue
+            seen_tags.add(anchor.regime_tag)
+            case_entry = case_by_id.get(int(anchor.case_num), {})
+            dims = _extract_generic_case_dims(case_entry)
+            safe_tag = anchor.regime_tag
+            per_regime_sel = f"_select_{op_id}_{safe_tag}_config"
+            shared_sel = f"_select_{op_id}_config"
+            has_per_regime_sel = f"def {per_regime_sel}(" in mod_text
+            selector_fn = (
+                per_regime_sel
+                if (has_per_regime_sel or not has_shared_selector)
+                else shared_sel
+            )
+            regimes.append(
+                RegimeTargetSpec(
+                    regime_tag=safe_tag,
+                    builder_candidates=(
+                        f"_build_{op_id}_{safe_tag}_func",
+                        f"_build_{op_id}_prim_func",
+                        "make_kernel",
+                    ),
+                    sample_builder_kwargs=dict(dims),
+                    description=f"Auto-stratified regime {safe_tag} for {spec.task}.",
+                    representative_hir_dims={
+                        k: int(v)
+                        for k, v in dims.items()
+                        if isinstance(v, int) and not isinstance(v, bool)
+                    },
+                    representative_anchor_dims={
+                        k: int(v)
+                        for k, v in dims.items()
+                        if isinstance(v, int) and not isinstance(v, bool)
+                    },
+                    config_selector_fn=selector_fn,
+                    editable_symbols=(
+                        per_regime_sel,
+                        shared_sel,
+                        f"_build_{op_id}_{safe_tag}_func",
+                        f"_build_{op_id}_prim_func",
+                    ),
+                    allowed_helper_prefix=f"_{op_id}_{safe_tag}_",
+                )
+            )
+        return tuple(regimes)
+
+
+def _extract_generic_case_dims(entry: Mapping[str, object]) -> dict[str, object]:
+    dims: dict[str, object] = {}
+    attrs = entry.get("attrs")
+    if isinstance(attrs, Mapping):
+        for k, v in attrs.items():
+            dims[str(k)] = v
+    raw_dtypes = entry.get("dtype")
+    if isinstance(raw_dtypes, (list, tuple)):
+        for dt in raw_dtypes:
+            dt_s = str(dt).strip()
+            if dt_s in ("float16", "bfloat16", "float32"):
+                dims.setdefault("tl_dtype", dt_s)
+                break
+    elif isinstance(raw_dtypes, str) and raw_dtypes.strip() in ("float16", "bfloat16", "float32"):
+        dims.setdefault("tl_dtype", raw_dtypes.strip())
+
+    op_label = str(entry.get("operator", "")).strip().lower()
+    shapes = _normalize_shape_list(entry.get("input_shape"))
+    if shapes:
+        lead = shapes[0]
+        total = 1
+        for d in lead:
+            total *= max(1, d)
+        dims["total_elements"] = total
+        if len(lead) == 1:
+            dims.setdefault("D", lead[0])
+            dims.setdefault("N", lead[0])
+        elif len(lead) == 2:
+            dims.setdefault("M", lead[0])
+            dims.setdefault("m_rows", lead[0])
+            dims.setdefault("D", lead[1])
+            dims.setdefault("K", lead[1])
+        elif len(lead) == 3:
+            dims.setdefault("B", lead[0])
+            dims.setdefault("S", lead[1])
+            dims.setdefault("m_rows", lead[0] * lead[1])
+            dims.setdefault("D", lead[2])
+        elif len(lead) >= 4:
+            dims.setdefault("B", lead[0])
+            dims.setdefault("S", lead[1])
+            dims.setdefault("N_h", lead[2])
+            dims.setdefault("D", lead[-1])
+            dims.setdefault("m_rows", lead[0] * lead[1])
+
+        if op_label == "swiglu":
+            dim_ax = int(attrs.get("dim", -1)) if isinstance(attrs, Mapping) else -1
+            if -len(lead) <= dim_ax < len(lead):
+                dims.setdefault("half_dim", max(1, int(lead[dim_ax]) // 2))
+        elif op_label == "mhcsinkhorn" and len(lead) >= 2:
+            dims.setdefault("hc_mult", int(lead[-1]))
+            dims.setdefault("b_dim", int(lead[0]))
+        elif op_label == "gqa" and len(lead) >= 4:
+            layout = str(dims.get("layout", dims.get("input_layout", "BSND"))).upper()
+            if layout == "BNSD":
+                dims.setdefault("n_q", int(lead[1]))
+                dims.setdefault("s_dim", int(lead[2]))
+                if len(shapes) >= 2 and len(shapes[1]) >= 4:
+                    dims.setdefault("n_kv", int(shapes[1][1]))
+            else:
+                dims.setdefault("s_dim", int(lead[1]))
+                dims.setdefault("n_q", int(lead[2]))
+                if len(shapes) >= 2 and len(shapes[1]) >= 4:
+                    dims.setdefault("n_kv", int(shapes[1][2]))
+            dims.setdefault("d_dim", int(lead[-1]))
+        elif op_label == "kimideltaattention" and len(lead) >= 4:
+            dims.setdefault("t_dim", int(lead[1]))
+            dims.setdefault("dk", int(lead[-1]))
+            dv = int(shapes[2][-1]) if len(shapes) >= 3 and shapes[2] else int(lead[-1])
+            dims.setdefault("dv", dv)
+        elif op_label == "tensorprogramvm" and len(shapes) >= 2:
+            if len(shapes[0]) >= 1:
+                dims.setdefault("prog_len", int(shapes[0][0]))
+            if len(shapes[1]) >= 2:
+                dims.setdefault("num_regs", int(shapes[1][0]))
+                dims.setdefault("w_dim", int(shapes[1][1]))
+
+        for idx, sh in enumerate(shapes):
+            for ax, dval in enumerate(sh):
+                dims[f"shape_{idx}_dim_{ax}"] = int(dval)
+    return dims
+
+
 def get_operator_task(operator_name: str) -> str:
-    """Return CANNBench task path (level4/<op>) for an operator name."""
-    if operator_name not in OPERATOR_METADATA:
-        raise KeyError(f"unsupported campaign operator {operator_name!r}")
-    return OPERATOR_METADATA[operator_name][0]
+    """Return CANNBench task path (levelX/<op>) for any supported operator name or task id."""
+    if operator_name in OPERATOR_METADATA:
+        return OPERATOR_METADATA[operator_name][0]
+    return CannbotOpsRegistry.default().resolve(operator_name).task
 
 
 def get_operator_module_relpath(operator_name: str) -> str:
-    """Return workspace-relative kernel module path for an operator name."""
-    if operator_name not in OPERATOR_METADATA:
-        raise KeyError(f"unsupported campaign operator {operator_name!r}")
-    return OPERATOR_METADATA[operator_name][1]
+    """Return workspace-relative kernel module path for any supported operator."""
+    if operator_name in OPERATOR_METADATA:
+        return OPERATOR_METADATA[operator_name][1]
+    return CannbotOpsRegistry.default().resolve_module_path(operator_name)
 
 
 def get_operator_entrypoint(operator_name: str) -> str:
-    """Return public Python callable name for an operator name."""
-    if operator_name not in OPERATOR_METADATA:
-        raise KeyError(f"unsupported campaign operator {operator_name!r}")
-    return OPERATOR_METADATA[operator_name][2]
+    """Return public Python callable name for any supported operator."""
+    if operator_name in OPERATOR_METADATA:
+        return OPERATOR_METADATA[operator_name][2]
+    return CannbotOpsRegistry.default().resolve(operator_name).entrypoint
 
 
 def get_default_anchors(operator_name: str) -> tuple[AnchorCaseSpec, ...]:
-    """Return stratified anchor cases for attention_residual or mla."""
-    if operator_name not in DEFAULT_ANCHORS:
-        raise KeyError(f"unsupported campaign operator {operator_name!r}")
-    return DEFAULT_ANCHORS[operator_name]
+    """Return stratified anchor cases for attention_residual, mla, or any cannbot-ops op."""
+    if operator_name in DEFAULT_ANCHORS:
+        return DEFAULT_ANCHORS[operator_name]
+    return CannbotOpsRegistry.default().get_anchors(operator_name)
 
 
 def get_default_perf_target(operator_name: str) -> PerfTargetSpec:
-    """Return default performance and Roofline target thresholds for an operator."""
-    if operator_name not in DEFAULT_PERF_TARGETS:
-        raise KeyError(f"unsupported campaign operator {operator_name!r}")
-    return DEFAULT_PERF_TARGETS[operator_name]
+    """Return default performance and Roofline target thresholds for any operator."""
+    if operator_name in DEFAULT_PERF_TARGETS:
+        return DEFAULT_PERF_TARGETS[operator_name]
+    return CannbotOpsRegistry.default().get_perf_target(operator_name)
 
 
 def get_default_regime_specs(operator_name: str) -> tuple[RegimeTargetSpec, ...]:
-    """Return ordered optimization regime specifications for an operator."""
-    if operator_name not in DEFAULT_REGIME_SPECS:
-        raise KeyError(f"unsupported campaign operator {operator_name!r}")
-    return DEFAULT_REGIME_SPECS[operator_name]
+    """Return ordered optimization regime specifications for any operator."""
+    if operator_name in DEFAULT_REGIME_SPECS:
+        return DEFAULT_REGIME_SPECS[operator_name]
+    return CannbotOpsRegistry.default().get_regime_specs(operator_name)
 
 
 def parse_simple_env_file(env_file: str | Path) -> dict[str, str]:
@@ -517,6 +1171,12 @@ def resolve_cannbench_repo(
         path = Path(raw).expanduser()
         if path.is_dir() and (path / "operators").is_dir():
             return path.resolve()
+    for fallback in (
+        default_source_root().parent / "cannbot-ops",
+        Path.home() / "workspace" / "cannbot-ops",
+    ):
+        if fallback.is_dir() and (fallback / "operators").is_dir():
+            return fallback.resolve()
     raise FileNotFoundError(
         "Cannot locate TILEFOUNDRY_NPU_CANNBENCH_REPO. "
         "Pass cannbench_repo or set TILEFOUNDRY_NPU_CANNBENCH_REPO."
@@ -661,7 +1321,7 @@ def lookup_case_dims(
         dims["is_causal"] = bool(dims.get("is_causal", False))
         return dims
 
-    return dims
+    return _extract_generic_case_dims(entry)
 
 
 def resolve_regime_for_case(
@@ -672,7 +1332,7 @@ def resolve_regime_for_case(
     """Resolve the active dispatch regime matching Host kernel routing for case_dims."""
     if not regime_specs:
         raise ValueError("regime_specs must not be empty")
-    target_tag = ""
+    target_tag = str(case_dims.get("regime_tag", "")).strip()
     if operator_name == "attention_residual":
         d_dim = int(case_dims.get("D", case_dims.get("d_dim", 0)))
         b_dim = int(case_dims.get("B", case_dims.get("b_dim", 1)))
@@ -694,6 +1354,14 @@ def resolve_regime_for_case(
             target_tag = "split_kv_decode"
         else:
             target_tag = "prefill_compute"
+    elif not target_tag:
+        d_val = case_dims.get("D", case_dims.get("d_dim", 0))
+        if isinstance(d_val, int) and not isinstance(d_val, bool) and d_val > 1 and d_val % 16 != 0:
+            target_tag = "unaligned_tail"
+        elif isinstance(case_dims.get("total_elements"), int) and int(case_dims["total_elements"]) <= 65536:
+            target_tag = "small_latency"
+        elif isinstance(case_dims.get("total_elements"), int) and int(case_dims["total_elements"]) >= 1048576:
+            target_tag = "large_throughput"
 
     for spec in regime_specs:
         if spec.regime_tag == target_tag:
@@ -897,6 +1565,8 @@ def get_input_domain_envelope(operator: str) -> InputDomainEnvelope | None:
 __all__ = [
     "ATTENTION_RESIDUAL_ANCHORS",
     "AnchorCaseSpec",
+    "CannbotOpSpec",
+    "CannbotOpsRegistry",
     "DEFAULT_ANCHORS",
     "DEFAULT_PERF_TARGETS",
     "DEFAULT_REGIME_SPECS",

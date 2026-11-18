@@ -33,8 +33,23 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     prescreen_tile_configs,
 )
 from tilefoundry_ascend.agent.orchestrator.twin_bridge import format_hir_tir_navigation_section
+from tilefoundry_ascend.agent.router.capability_gate import (
+    EscalationDecision,
+    evaluate_track_escalation,
+)
+from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
+from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
+    CostPrediction,
+    HybridAscendCostModel,
+)
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirTirNavigationPacket
+from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
+from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
+from tilefoundry_ascend.ascend.templates.registry import (
+    ConstraintRelaxationMask,
+    relax_facets_for_bottleneck,
+)
 
 CREATIVE_FOCUS_HINTS: tuple[str, ...] = (
     "memory_hierarchy_and_tiling",
@@ -155,7 +170,43 @@ _RULE_CONCEPT_DESCRIPTIONS: dict[str, str] = {
         "Two-pass loop fission separating reduce/SFU chains from wide vfma accumulation"
     ),
     "R21_SUBROW_DEPTH_OR_WIDTH_CORE_SHARDING": (
-        "Sub-row reduction depth or 64-element hidden-width core sharding across 56 AIVs"
+        "Sub-row reduction depth or 64-element hidden-width core sharding across AIVs"
+    ),
+    "R22_HALF_L1_BANK_ISOLATION": (
+        "Half-L1 ping/pong bank isolation ((TOTAL_L1_SIZE >> 1) * slot) across 2x256KB L1 banks"
+    ),
+    "R23_UB_16BANK_STRIDE_PAD_AND_SHIFT": (
+        "UB 16-bank conflict avoidance via +1 DataBlock row stride pad and +8 DataBlock R/W base shift"
+    ),
+    "R24_VLOOPV2_LEGALIZATION_AND_DIRECT_VF": (
+        "VLOOPv2 hardware loop legalization (uint16_t 0-based +1, branchless Select) and direct __simd_vf__"
+    ),
+    "R25_SCALAR_BOUND_SPILL_ELIMINATION": (
+        "Eliminate scalar register/stack spills via local scalar binding and 3-stage prologue/loop/epilogue"
+    ),
+    "R26_SWAT_SNAKE_AND_TAIL_WAVE_SPLIT": (
+        "SWAT serpentine tile swizzle (WINDOW_LEN=4) and tail-wave sub-tile / DPSK Stream-K rebalance"
+    ),
+    "R27_L2_CACHE_BYPASS_SINGLE_USE": (
+        "Bypass L2 allocation (CACHE_MODE_DISABLE) on single-use operands when M_tiles==1 or streaming KV"
+    ),
+    "R28_INPLACE_L1_SLOT_ALIASING": (
+        "In-place L1/UB slot aliasing reusing dead slices (e.g. K_rope -> P) across stages"
+    ),
+    "R29_W4_AIV_UNPACK_AND_FIXPIPE_SCALE_FOLD": (
+        "AIV INT4/FP4 unpack via DIST_UNPACK4_B8 or bit-shift + FixPipe deq_scale=64 fold on dav-3510"
+    ),
+    "R30_REGBASE_MX_QUANT_DATABLOCK": (
+        "RegBase microscaling MXFP8/MXFP4 quant via DIST_DINTLV_B16, ReduceDataBlock<MAX>, and SetCtrlSpr"
+    ),
+    "R31_SIMT_UB_PRIVATIZED_ATOMICS": (
+        "SIMT warp-privatized +8-padded UB atomics with __launch_bounds__(512) 0-spill and Simt::UintDiv"
+    ),
+    "R32_GROUPED_ROLLING_CORE_AND_EMPTY_SKIP": (
+        "Grouped MatMul rolling core assignment ((endBlockIdx+1)%coreNum) with m==0 empty-group fast skip"
+    ),
+    "R33_PERSISTENT_STATE_RESIDENCY": (
+        "Persistent on-chip UB/L1 FP32 state residency across chunks/iterations with initC=false accumulation"
     ),
 }
 
@@ -351,19 +402,191 @@ class PortfolioRoundReport:
     stepping_stone_beam: list[BeamCandidate] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class RoundEscalationReport:
+    """Closed-loop escalation, minimal facet relaxation, and cost prediction for a round."""
+
+    escalation: EscalationDecision
+    relaxed_mask: ConstraintRelaxationMask
+    cost_prediction: CostPrediction
+    roofline_eta: float
+    l1_overflow: bool = False
+    ub_overflow: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "should_escalate": self.escalation.should_escalate,
+            "from_tier": self.escalation.from_tier,
+            "to_tier": self.escalation.to_tier,
+            "trigger_reasons": list(self.escalation.trigger_reasons),
+            "freedom_mask": (
+                self.escalation.freedom_mask.to_dict()
+                if self.escalation.freedom_mask is not None
+                else None
+            ),
+            "relaxed_mask": self.relaxed_mask.to_dict(),
+            "cost_prediction": self.cost_prediction.to_dict(),
+            "roofline_eta": self.roofline_eta,
+            "l1_overflow": self.l1_overflow,
+            "ub_overflow": self.ub_overflow,
+        }
+
+
+def _coerce_topology_axes_opt(raw: object | None) -> TopologyAxes | None:
+    if raw is None:
+        return None
+    if isinstance(raw, TopologyAxes):
+        return raw
+    if isinstance(raw, Mapping) and all(
+        k in raw for k in ("compute_engine", "memory_ring", "iteration_regularity")
+    ):
+        return TopologyAxes.from_dict(raw)
+    return None
+
+
+def _derive_active_topology_axes(
+    ledger: object | None,
+    *,
+    features: object | None = None,
+    sil_advisory: object | None = None,
+    route: object | None = None,
+    topology_axes: object | None = None,
+) -> TopologyAxes:
+    explicit = _coerce_topology_axes_opt(topology_axes)
+    if explicit is not None:
+        return explicit
+    if sil_advisory is not None:
+        adv_axes = (
+            sil_advisory.get("topology_axes")
+            if isinstance(sil_advisory, Mapping)
+            else getattr(sil_advisory, "topology_axes", None)
+        )
+        coerced = _coerce_topology_axes_opt(adv_axes)
+        if coerced is not None:
+            return coerced
+    if route is not None:
+        r_axes = (
+            route.get("topology_axes")
+            if isinstance(route, Mapping)
+            else getattr(route, "topology_axes", None)
+        )
+        coerced = _coerce_topology_axes_opt(r_axes)
+        if coerced is not None:
+            return coerced
+    if sil_advisory is not None or features is not None:
+        return resolve_canonical_topology_axes(sil_advisory, features=features)
+
+    pipe_cycles = getattr(ledger, "pipe_cycles", None) or {}
+    if isinstance(pipe_cycles, Mapping) and (
+        pipe_cycles.get("AIC.PIPE_M", 0) > 0 or pipe_cycles.get("AIC.CUBE", 0) > 0
+    ):
+        return TopologyAxes(
+            compute_engine="aic_only",
+            memory_ring="gm_l1_l0_fixpipe",
+            iteration_regularity="affine_simd",
+        )
+    return TopologyAxes(
+        compute_engine="aiv_only",
+        memory_ring="gm_ub_stream",
+        iteration_regularity="affine_simd",
+    )
+
+
+def format_sil_diagnostics_section(
+    *,
+    sil_advisory: object | None = None,
+    sil_verification: object | None = None,
+) -> str:
+    """Format SIL AdvisoryEnvelope and VerificationReport diagnostics for prompts."""
+    sections: list[str] = []
+    if sil_advisory is not None:
+        adv = (
+            sil_advisory
+            if isinstance(sil_advisory, Mapping)
+            else (
+                sil_advisory.to_dict()
+                if hasattr(sil_advisory, "to_dict")
+                else vars(sil_advisory)
+            )
+        )
+        lines = [
+            "### SIL ADVISORY ENVELOPE",
+            f"- op_name: {adv.get('op_name', '')} (task={adv.get('cannbot_task', '')}, level={adv.get('level', '')})",
+            f"- topology_axes: {adv.get('topology_axes', '')}",
+            f"- dtypes: in={adv.get('input_dtypes', ())}, out={adv.get('output_dtypes', ())}",
+            f"- has_nan_inf_cases: {bool(adv.get('has_nan_inf_cases', False))}, has_inplace_aliasing: {bool(adv.get('has_inplace_aliasing', False))}",
+        ]
+        bounds = adv.get("legality_bounds")
+        if isinstance(bounds, Mapping):
+            lines.append(
+                f"- dav3510_bounds: L1={bounds.get('l1_bytes')}, UB_simdvf={bounds.get('ub_simdvf_bytes')}, "
+                f"UB_simtvf={bounds.get('ub_simtvf_bytes')}, forbidden_dma={bounds.get('forbidden_dma_paths')}, "
+                f"forbid_cube_int4={bounds.get('forbid_cube_int4')}"
+            )
+        roofline = adv.get("roofline")
+        if isinstance(roofline, Mapping) and roofline:
+            lines.append(f"- roofline: {json.dumps(roofline, sort_keys=True)}")
+        regimes = adv.get("regimes")
+        if isinstance(regimes, (list, tuple)) and regimes:
+            lines.append(f"- stratified_regimes: {len(regimes)}")
+        sections.append("\n".join(lines))
+
+    if sil_verification is not None:
+        ver = (
+            sil_verification
+            if isinstance(sil_verification, Mapping)
+            else (
+                sil_verification.to_dict()
+                if hasattr(sil_verification, "to_dict")
+                else vars(sil_verification)
+            )
+        )
+        lines = [
+            "### SIL VERIFICATION DIAGNOSTICS",
+            f"- passed: {bool(ver.get('passed', True))}",
+        ]
+        errors = ver.get("errors") or ()
+        warnings = ver.get("warnings") or ()
+        fixes = ver.get("suggested_fixes") or {}
+        if errors:
+            lines.append("Errors:")
+            lines.extend(f"- {e}" for e in errors)
+        if warnings:
+            lines.append("Warnings:")
+            lines.extend(f"- {w}" for w in warnings)
+        if fixes:
+            lines.append(f"Suggested Fixes: {json.dumps(fixes, sort_keys=True)}")
+        sections.append("\n".join(lines))
+
+    return "\n\n".join(sections)
+
+
 def _resolve_navigation_section(
     parent: BeamCandidate,
     navigation_context: str,
     nav_packet: HirTirNavigationPacket | None,
+    *,
+    sil_advisory: object | None = None,
+    sil_verification: object | None = None,
 ) -> str:
+    parts: list[str] = []
     if nav_packet is not None:
         nav_text = format_hir_tir_navigation_section(
             nav_packet,
             current_tl_ledger=parent.ledger,
         )
-    else:
-        nav_text = navigation_context.strip()
-    return f"{nav_text}\n\n" if nav_text else ""
+        if nav_text:
+            parts.append(nav_text)
+    elif navigation_context.strip():
+        parts.append(navigation_context.strip())
+    sil_text = format_sil_diagnostics_section(
+        sil_advisory=sil_advisory,
+        sil_verification=sil_verification,
+    )
+    if sil_text:
+        parts.append(sil_text)
+    joined = "\n\n".join(parts)
+    return f"{joined}\n\n" if joined else ""
 
 
 def build_exploit_request(
@@ -372,6 +595,8 @@ def build_exploit_request(
     *,
     navigation_context: str = "",
     nav_packet: HirTirNavigationPacket | None = None,
+    sil_advisory: object | None = None,
+    sil_verification: object | None = None,
 ) -> GenerationRequest:
     """Build causal-rule worker request routed to exploit model (Hydrogen Medium)."""
     sys_prompt = (
@@ -385,7 +610,13 @@ def build_exploit_request(
         )
     else:
         track_section = f"### TARGET TRACK\n{parent.track}\n\n"
-    nav_section = _resolve_navigation_section(parent, navigation_context, nav_packet)
+    nav_section = _resolve_navigation_section(
+        parent,
+        navigation_context,
+        nav_packet,
+        sil_advisory=sil_advisory,
+        sil_verification=sil_verification,
+    )
     user_prompt = (
         f"{track_section}"
         f"{nav_section}"
@@ -415,6 +646,8 @@ def build_creative_request(
     navigation_context: str = "",
     nav_packet: HirTirNavigationPacket | None = None,
     effort: str | None = None,
+    sil_advisory: object | None = None,
+    sil_verification: object | None = None,
 ) -> GenerationRequest:
     """Build rule-blind creative search request routed to Hydrogen High without rules."""
     sys_prompt = (
@@ -439,7 +672,13 @@ def build_creative_request(
         )
     else:
         track_section = f"### EXECUTION TRACK\n{parent.track}\n\n"
-    nav_section = _resolve_navigation_section(parent, navigation_context, nav_packet)
+    nav_section = _resolve_navigation_section(
+        parent,
+        navigation_context,
+        nav_packet,
+        sil_advisory=sil_advisory,
+        sil_verification=sil_verification,
+    )
     focus_section = f"### ARCHITECTURAL FOCUS HINT\n{focus_hint}\n\n" if focus_hint else ""
     prescreen_section = (
         f"### TILE PRESCREEN GUIDANCE\n{prescreen_summary}\n\n"
@@ -470,6 +709,7 @@ def build_syntax_repair_request(
     error_message: str,
     *,
     slice_hint: str = "",
+    sil_verification: object | None = None,
 ) -> GenerationRequest:
     """Build bounded syntax/compile repair request routed to Hydrogen Medium."""
     hint_sentence = f" Authorized target: {slice_hint}." if slice_hint else ""
@@ -482,8 +722,11 @@ def build_syntax_repair_request(
         "any new top-level helper MUST reuse the exact regime prefix shown in "
         f"BROKEN KERNEL DSL (do NOT add unprefixed or out-of-regime functions).{hint_sentence}"
     )
+    sil_text = format_sil_diagnostics_section(sil_verification=sil_verification)
+    sil_block = f"{sil_text}\n\n" if sil_text else ""
     user_prompt = (
         f"### VALID TILELANG ASCEND PRIMITIVES\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"
+        f"{sil_block}"
         f"### COMPILER / GATE DIAGNOSTIC\n{error_message}\n\n"
         f"### BROKEN KERNEL DSL\n```python\n{dsl_source}\n```\n"
     )
@@ -538,14 +781,30 @@ class PortfolioRunner:
         ideal_roofline_us: float = 0.0,
         nav_packet: HirTirNavigationPacket | None = None,
         creative_effort: str = "high",
+        sil_advisory: object | None = None,
+        sil_verification: object | None = None,
+        topology_axes: object | None = None,
     ) -> tuple[WorkerSpec, ...]:
         """Select matching causal rules and fill remaining slots with creative explorers."""
+        active_axes = _derive_active_topology_axes(
+            parent.ledger,
+            features=parent.features,
+            sil_advisory=sil_advisory,
+            topology_axes=topology_axes,
+        )
         ctx = build_predicate_context(
             parent.ledger,
             features=parent.features,
             residual=parent.residual,
+            extra={"topology_axes": active_axes},
         )
-        matched_rules = list(self._tracker.rank_applicable_rules(ctx, top_k=self._k_rules))
+        matched_rules = list(
+            self._tracker.rank_applicable_rules(
+                ctx,
+                top_k=self._k_rules,
+                topology_axes=active_axes,
+            )
+        )
         eff_roofline = (
             ideal_roofline_us
             if ideal_roofline_us > 0.0
@@ -564,6 +823,8 @@ class PortfolioRunner:
                         rule,
                         navigation_context=navigation_context,
                         nav_packet=nav_packet,
+                        sil_advisory=sil_advisory,
+                        sil_verification=sil_verification,
                     ),
                     parent_candidate=parent,
                     ideal_roofline_us=eff_roofline,
@@ -607,6 +868,8 @@ class PortfolioRunner:
                         navigation_context=navigation_context,
                         nav_packet=nav_packet,
                         effort=creative_effort,
+                        sil_advisory=sil_advisory,
+                        sil_verification=sil_verification,
                     ),
                     parent_candidate=parent,
                     ideal_roofline_us=eff_roofline,
@@ -624,11 +887,20 @@ class PortfolioRunner:
         var_bindings: Mapping[str, int] | None = None,
         config_selector_name: str | None = None,
         dims: Mapping[str, object] | None = None,
-    ) -> tuple[BeamCandidate | None, bool, tuple[str, str, str] | None]:
+        sil_advisory: object | None = None,
+        sil_verification: object | None = None,
+        topology_axes: object | None = None,
+    ) -> tuple[BeamCandidate | None, bool, tuple[str, str, str] | None, bool]:
+        active_axes = _derive_active_topology_axes(
+            spec.parent_candidate.ledger,
+            features=spec.parent_candidate.features,
+            sil_advisory=sil_advisory,
+            topology_axes=topology_axes,
+        )
         try:
             raw_reply = await self._backend.generate(spec.request)
         except Exception as exc:
-            return None, False, (spec.worker_id, "llm_transport", str(exc)[-400:])
+            return None, False, (spec.worker_id, "llm_transport", str(exc)[-400:]), False
 
         try:
             if spec.worker_kind == "creative_explore":
@@ -640,8 +912,12 @@ class PortfolioRunner:
                 hypothesis = spec.rule.rule_id if spec.rule is not None else ""
         except Exception as exc:
             if spec.rule is not None:
-                self._tracker.record_outcome(spec.rule.rule_id, postcondition_realized=False)
-            return None, False, (spec.worker_id, "llm_parse", str(exc)[-400:])
+                self._tracker.record_outcome(
+                    spec.rule.rule_id,
+                    postcondition_realized=False,
+                    topology_axes=active_axes,
+                )
+            return None, False, (spec.worker_id, "llm_parse", str(exc)[-400:]), False
 
         repaired = False
         evaluation: FunnelEvaluation = self._funnel.evaluate(
@@ -654,19 +930,25 @@ class PortfolioRunner:
         )
         if not evaluation.passed and evaluation.failed_stage in ("stage_a", "stage_b"):
             for _ in range(self._max_repairs):
-                repair_req = build_syntax_repair_request(dsl_source, evaluation.error_message)
+                repair_req = build_syntax_repair_request(
+                    dsl_source,
+                    evaluation.error_message,
+                    sil_verification=sil_verification,
+                )
                 try:
                     repaired_raw = await self._backend.generate(repair_req)
                 except Exception as exc:
-                    return None, repaired, (spec.worker_id, "llm_transport", str(exc)[-400:])
+                    return None, repaired, (spec.worker_id, "llm_transport", str(exc)[-400:]), False
                 try:
                     dsl_source = extract_python_dsl(repaired_raw)
                 except Exception as exc:
                     if spec.rule is not None:
                         self._tracker.record_outcome(
-                            spec.rule.rule_id, postcondition_realized=False
+                            spec.rule.rule_id,
+                            postcondition_realized=False,
+                            topology_axes=active_axes,
                         )
-                    return None, repaired, (spec.worker_id, "llm_parse", str(exc)[-400:])
+                    return None, repaired, (spec.worker_id, "llm_parse", str(exc)[-400:]), False
                 repaired = True
                 evaluation = self._funnel.evaluate(
                     dsl_source,
@@ -681,11 +963,23 @@ class PortfolioRunner:
 
         if not evaluation.passed or evaluation.stage_a.ledger is None:
             if spec.rule is not None:
-                self._tracker.record_outcome(spec.rule.rule_id, postcondition_realized=False)
+                self._tracker.record_outcome(
+                    spec.rule.rule_id,
+                    postcondition_realized=False,
+                    topology_axes=active_axes,
+                )
             fail_stage = evaluation.failed_stage or "unknown"
-            return None, repaired, (spec.worker_id, fail_stage, evaluation.error_message)
+            return None, repaired, (spec.worker_id, fail_stage, evaluation.error_message), False
 
         ledger = evaluation.stage_a.ledger
+        comp_summary = evaluation.stage_b.compiler_summary if evaluation.stage_b else None
+        cand_axes = _derive_active_topology_axes(
+            ledger,
+            features=evaluation.stage_a.features or spec.parent_candidate.features,
+            sil_advisory=sil_advisory,
+            route=evaluation.stage_a.route,
+            topology_axes=topology_axes,
+        )
         track = (
             evaluation.stage_a.route.track
             if self._enable_track_router and evaluation.stage_a.route is not None
@@ -696,10 +990,12 @@ class PortfolioRunner:
             )
         )
         stage_c = evaluation.stage_c
+        is_analytical_proxy = False
         if stage_c is not None:
             latency_us = stage_c.measured_latency_us
             acc_ok = stage_c.accuracy_passed
             tel = dict(stage_c.telemetry)
+            is_analytical_proxy = bool(tel.get("is_analytical_proxy", False))
             dur_us = float(tel.get("dur_us", latency_us))
             if (
                 spec.ideal_roofline_us > 0.0
@@ -710,7 +1006,9 @@ class PortfolioRunner:
                 tel["roofline_eta"] = eta
                 if isinstance(stage_c.telemetry, dict):
                     stage_c.telemetry["roofline_eta"] = eta
-                residual = compute_static_dynamic_residual(ledger, tel)
+                residual = compute_static_dynamic_residual(
+                    ledger, tel, compiler_summary=comp_summary
+                )
             else:
                 residual = (
                     stage_c.residual
@@ -727,6 +1025,7 @@ class PortfolioRunner:
                 ledger,
                 features=evaluation.stage_a.features,
                 residual=residual,
+                compiler_summary=comp_summary,
                 prev_ledger=spec.parent_candidate.ledger,
             )
             prev_ns = post_ctx.get("prev")
@@ -739,11 +1038,13 @@ class PortfolioRunner:
                 if parent_us > 0.0 and latency_us > 0.0
                 else 0.0
             )
-            self._tracker.record_outcome(
-                spec.rule.rule_id,
-                postcondition_realized=realized,
-                speed_gain=max(0.0, speed_gain),
-            )
+            if not is_analytical_proxy or realized:
+                self._tracker.record_outcome(
+                    spec.rule.rule_id,
+                    postcondition_realized=realized,
+                    speed_gain=max(0.0, speed_gain),
+                    topology_axes=cand_axes,
+                )
 
         cand = BeamCandidate(
             candidate_id=spec.worker_id,
@@ -756,12 +1057,17 @@ class PortfolioRunner:
             residual=residual,
             latency_us=latency_us,
             accuracy_passed=acc_ok,
-            structural_signature=extract_structural_signature(dsl_source, track=track),
+            structural_signature=extract_structural_signature(
+                dsl_source,
+                track=track,
+                residual=residual,
+                stage_b=evaluation.stage_b,
+            ),
             hypothesis=hypothesis,
             parent_id=spec.parent_candidate.candidate_id,
             features=evaluation.stage_a.features or spec.parent_candidate.features,
         )
-        return cand, repaired, None
+        return cand, repaired, None, is_analytical_proxy
 
     async def run_round(
         self,
@@ -777,8 +1083,17 @@ class PortfolioRunner:
         ideal_roofline_us: float = 0.0,
         nav_packet: HirTirNavigationPacket | None = None,
         creative_effort: str = "high",
+        sil_advisory: object | None = None,
+        sil_verification: object | None = None,
+        topology_axes: object | None = None,
     ) -> PortfolioRoundReport:
         """Execute one parallel portfolio round across Rule and Creative workers."""
+        active_axes = _derive_active_topology_axes(
+            parent.ledger,
+            features=parent.features,
+            sil_advisory=sil_advisory,
+            topology_axes=topology_axes,
+        )
         specs = self.plan_workers(
             parent,
             round_idx,
@@ -791,6 +1106,9 @@ class PortfolioRunner:
             ideal_roofline_us=ideal_roofline_us,
             nav_packet=nav_packet,
             creative_effort=creative_effort,
+            sil_advisory=sil_advisory,
+            sil_verification=sil_verification,
+            topology_axes=active_axes,
         )
         tasks = [
             self._run_single_worker(
@@ -801,38 +1119,142 @@ class PortfolioRunner:
                 var_bindings=var_bindings,
                 config_selector_name=config_selector_name,
                 dims=dims,
+                sil_advisory=sil_advisory,
+                sil_verification=sil_verification,
+                topology_axes=active_axes,
             )
             for spec in specs
         ]
         outcomes = await asyncio.gather(*tasks)
 
         report = PortfolioRoundReport(round_idx=round_idx, spawned_workers=specs)
-        for cand, repaired, fail in outcomes:
+        saw_proxy = False
+        saw_real_hw = False
+        for cand, repaired, fail, is_proxy in outcomes:
             if repaired:
                 uid = cand.candidate_id if cand else (fail[0] if fail else "")
                 report.repaired_worker_ids.append(uid)
             if cand is not None:
                 report.evaluated_candidates.append(cand)
+                if is_proxy:
+                    saw_proxy = True
+                else:
+                    saw_real_hw = True
             elif fail is not None:
                 report.failed_candidates.append(fail)
 
-        pruned = self._tracker.prune_underperforming()
+        if saw_proxy and not saw_real_hw:
+            pruned: tuple[str, ...] = ()
+        else:
+            pruned = self._tracker.prune_underperforming(topology_axes=active_axes)
         report.pruned_rule_ids = pruned
         exploit, stone = self._beam.update([parent, *report.evaluated_candidates])
         report.exploit_beam = exploit
         report.stepping_stone_beam = stone
         return report
 
+    def check_round_escalation(
+        self,
+        candidate: BeamCandidate,
+        *,
+        current_tier: str = "tilelang_dsl",
+        target_eta: float = 0.85,
+        stagnation_rounds: int = 0,
+        ideal_roofline_us: float = 0.0,
+        dominant_bound: str = "",
+        compiler_summary: BishengResourceSummary | Mapping[str, object] | None = None,
+        current_mask: ConstraintRelaxationMask | None = None,
+        cost_model: HybridAscendCostModel | None = None,
+        workload: Mapping[str, object] | None = None,
+    ) -> RoundEscalationReport:
+        """Closed-loop escalation check wiring HybridAscendCostModel + evaluate_track_escalation + relax_facets_for_bottleneck."""
+        model = cost_model if cost_model is not None else HybridAscendCostModel(AscendTarget("ascend.950pr"))
+        eff_workload = dict(workload or {})
+        if not eff_workload:
+            pipes = candidate.ledger.pipe_cycles if candidate.ledger else {}
+            cube_c = int(pipes.get("AIC.PIPE_M", 0)) + int(pipes.get("AIC.CUBE", 0))
+            vec_c = int(pipes.get("AIV0.PIPE_V", 0)) + int(pipes.get("AIV1.PIPE_V", 0))
+            eff_workload = {
+                "cube_flops": float(max(0, cube_c)) * 4096.0,
+                "vec_flops": float(max(1, vec_c)) * 128.0,
+                "gm_bytes": float(max(65536, getattr(candidate.ledger, "gm_roundtrip_bytes", 0) or 65536)),
+                "contig_burst_bytes": int(getattr(candidate.ledger, "dominant_contig_bytes", 0) or 32768),
+                "total_tiles": int(getattr(candidate.ledger, "grid_blocks", 0) or 56),
+            }
+
+        eff_summary: BishengResourceSummary | None
+        if compiler_summary is None:
+            eff_summary = BishengResourceSummary(
+                spill_bytes=int(candidate.residual.spill_bytes),
+                vloopv2_loops=1 if candidate.residual.vloopv2_hit else 0,
+                software_loops=0 if candidate.residual.vloopv2_hit else 1,
+                has_local_membar_in_vf_call=bool(candidate.residual.has_local_membar_in_vf_call),
+                vf_fusion_breaks=int(candidate.residual.vf_fusion_breaks),
+                alias_serialized_buffers=int(candidate.residual.alias_serialized_buffers),
+                dual_issue_ipc_collapse=float(candidate.residual.dual_issue_ipc_collapse),
+                dcache_dcci_flushes=int(candidate.residual.dcache_dcci_flushes),
+            )
+        elif isinstance(compiler_summary, BishengResourceSummary):
+            eff_summary = compiler_summary
+        else:
+            eff_summary = BishengResourceSummary.from_dict(compiler_summary)
+
+        cost_pred = model.predict(eff_workload, bisheng_res=eff_summary)
+
+        if ideal_roofline_us > 0.0 and candidate.latency_us > 0.0:
+            eta = min(1.0, float(ideal_roofline_us) / float(candidate.latency_us))
+        elif cost_pred.pred_us > 0.0 and cost_pred.tier0_physics_us > 0.0:
+            eta = min(1.0, float(cost_pred.tier0_physics_us) / float(cost_pred.pred_us))
+        else:
+            eta = max(0.0, 1.0 - min(1.0, float(candidate.residual.unexplained_gap_ratio)))
+
+        eff_bound = dominant_bound.strip() or cost_pred.dominant_bound
+        escalation = evaluate_track_escalation(
+            current_tier=current_tier,
+            roofline_eta=eta,
+            target_eta=target_eta,
+            stagnation_rounds=stagnation_rounds,
+            dominant_bound=eff_bound,
+            compiler_summary=eff_summary,
+            structural_features=candidate.features,
+        )
+
+        waterlines = getattr(candidate.ledger, "waterlines", {}) or {}
+        l1_wl = waterlines.get("L1")
+        ub_wl = waterlines.get("UB")
+        l1_overflow = bool(l1_wl is not None and int(getattr(l1_wl, "overflow_bytes", 0) or 0) > 0)
+        ub_overflow = bool(ub_wl is not None and int(getattr(ub_wl, "overflow_bytes", 0) or 0) > 0)
+
+        base_mask = current_mask if current_mask is not None else ConstraintRelaxationMask()
+        relaxed_mask = relax_facets_for_bottleneck(
+            base_mask,
+            dominant_bound=eff_bound,
+            residual=candidate.residual,
+            compiler_summary=eff_summary,
+            l1_overflow=l1_overflow,
+            ub_overflow=ub_overflow,
+        )
+        return RoundEscalationReport(
+            escalation=escalation,
+            relaxed_mask=relaxed_mask,
+            cost_prediction=cost_pred,
+            roofline_eta=round(eta, 6),
+            l1_overflow=l1_overflow,
+            ub_overflow=ub_overflow,
+        )
+
 
 __all__ = [
     "CREATIVE_FOCUS_HINTS",
     "PortfolioRoundReport",
     "PortfolioRunner",
+    "RoundEscalationReport",
     "TILELANG_ASCEND_PRIMITIVE_MENU",
     "WorkerSpec",
     "build_creative_request",
     "build_exploit_request",
     "build_prescreen_summary_from_kwargs",
     "build_syntax_repair_request",
+    "format_sil_diagnostics_section",
     "summarize_excluded_mechanisms",
 ]

@@ -68,6 +68,7 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     create_llm_backend_from_env,
     extract_creative_payload,
     extract_python_dsl,
+    sanitize_effort,
 )
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     CREATIVE_FOCUS_HINTS,
@@ -83,6 +84,9 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     extract_structural_signature,
 )
 from tilefoundry_ascend.agent.orchestrator.twin_bridge import format_hir_tir_navigation_section
+from tilefoundry_ascend.agent.router.capability_gate import evaluate_track_escalation
+from tilefoundry_ascend.agent.router.isa_gap_scanner import scan_tilelang_pipe_gaps
+from tilefoundry_ascend.ascend.cost_model import BishengResourceSummary, HybridAscendCostModel
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
     HirTirNavigationPacket,
     compile_hir_navigation_packet,
@@ -91,7 +95,22 @@ from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
     build_objective_physical_ledger,
 )
+from tilefoundry_ascend.ascend.schedule.regime_solver import (
+    RegimePiecewiseSolver,
+    RegimePlanResult,
+    recompute_regime_for_live_buffers,
+)
+from tilefoundry_ascend.ascend.sil.op_analyzer import (
+    OpAdvisoryExtractor,
+    resolve_canonical_topology_axes,
+)
+from tilefoundry_ascend.ascend.sil.schema import (
+    ConstraintRelaxationMask,
+    RegimeSlice,
+    TopologyAxes,
+)
 from tilefoundry_ascend.ascend.target import AscendTarget
+from tilefoundry_ascend.ascend.templates.registry import relax_facets_for_bottleneck
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +136,7 @@ class CampaignConfig:
     warmup: int = 3
     repeat: int = 5
     enable_tilesize_prescreen: bool = False
+    exploit_effort: str = "medium"
 
 
 @dataclass(frozen=True)
@@ -349,11 +369,18 @@ def resolve_regime_config(
             for d_key, d_val in dims.items():
                 mapped = _HIR_DIM_ALIASES.get(str(d_key), str(d_key))
                 context[mapped] = d_val
+        if "half_dim" not in context and isinstance(context.get("d_dim"), int):
+            context["half_dim"] = max(1, int(context["d_dim"]) // 2)
 
         pass_configs: dict[str, object] = {}
         compile_flags: list[str] = []
         combine_kwargs: dict[str, object] = {}
         selector_name = regime_spec.config_selector_fn
+        if not (selector_name and callable(getattr(mod, selector_name, None))):
+            for cand_sym in regime_spec.editable_symbols:
+                if cand_sym.startswith("_select_") and callable(getattr(mod, cand_sym, None)):
+                    selector_name = cand_sym
+                    break
         if selector_name and callable(getattr(mod, selector_name, None)):
             selector_fn = getattr(mod, selector_name)
             sel_args = _filter_callable_kwargs(selector_fn, context)
@@ -928,6 +955,8 @@ class PerfTargetCampaignRunner:
         enable_track_router: bool = False,
         target: AscendTarget | None = None,
         clock: Callable[[], float] = time.monotonic,
+        sil_advisory: object | None = None,
+        topology_axes: TopologyAxes | Mapping[str, object] | None = None,
     ) -> None:
         self._config = config
         self._source_root = (
@@ -1000,7 +1029,36 @@ class PerfTargetCampaignRunner:
         self._campaign_kb_path = Path(campaign_kb_path).resolve() if campaign_kb_path else None
         self._enable_track_router = bool(enable_track_router)
         self._target = target or AscendTarget("ascend.950pr")
+        self._regime_solver = RegimePiecewiseSolver(self._target)
+        self._cost_model = HybridAscendCostModel(self._target)
+        self._freedom_masks: dict[str, ConstraintRelaxationMask] = {}
+        self._live_regime_plans: dict[str, RegimePlanResult] = {}
         self._clock = clock
+        if sil_advisory is not None:
+            self._sil_advisory = sil_advisory
+        else:
+            self._sil_advisory = None
+            try:
+                ops_root = (
+                    (self._cannbench_repo / "operators")
+                    if self._cannbench_repo is not None
+                    else None
+                )
+                extractor = (
+                    OpAdvisoryExtractor(ops_root)
+                    if ops_root is not None
+                    else OpAdvisoryExtractor()
+                )
+                short_op = self._config.operator_name.rsplit("/", 1)[-1]
+                self._sil_advisory = extractor.extract(short_op)
+            except Exception:
+                self._sil_advisory = None
+        if isinstance(topology_axes, TopologyAxes):
+            self._topology_axes: TopologyAxes | None = topology_axes
+        elif isinstance(topology_axes, Mapping):
+            self._topology_axes = TopologyAxes.from_dict(topology_axes)
+        else:
+            self._topology_axes = None
 
         if authored_hir_path is not None:
             self._authored_hir_path: Path | None = Path(authored_hir_path).resolve()
@@ -1057,15 +1115,40 @@ class PerfTargetCampaignRunner:
     def _source_sha256(source: str) -> str:
         return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
-    def _derive_paradigm(self, ledger: ObjectivePhysicalLedger | None) -> str:
-        if ledger is not None and (
-            ledger.pipe_cycles.get("AIC.PIPE_M", 0) > 0
-            or ledger.pipe_cycles.get("AIC.CUBE", 0) > 0
-        ):
-            return "cv_coupled"
-        if self._config.operator_name == "mla":
-            return "cv_coupled"
-        return "pure_vector"
+    def _derive_topology_axes(
+        self,
+        ledger: ObjectivePhysicalLedger | None,
+        *,
+        features: object | None = None,
+        route: object | None = None,
+    ) -> TopologyAxes:
+        if self._topology_axes is not None:
+            return self._topology_axes
+        if self._sil_advisory is not None:
+            return resolve_canonical_topology_axes(self._sil_advisory, features=features)
+        if route is not None:
+            r_axes = (
+                route.get("topology_axes")
+                if isinstance(route, Mapping)
+                else getattr(route, "topology_axes", None)
+            )
+            if isinstance(r_axes, TopologyAxes):
+                return r_axes
+            if isinstance(r_axes, Mapping) and all(
+                k in r_axes for k in ("compute_engine", "memory_ring", "iteration_regularity")
+            ):
+                return TopologyAxes.from_dict(r_axes)
+        uses_cube = bool(
+            ledger is not None
+            and (
+                ledger.pipe_cycles.get("AIC.PIPE_M", 0) > 0
+                or ledger.pipe_cycles.get("AIC.CUBE", 0) > 0
+            )
+        )
+        return resolve_canonical_topology_axes(
+            {"op_name": self._config.operator_name, "uses_cube": uses_cube},
+            features=features,
+        )
 
     def _collect_msprof_for_regimes(
         self,
@@ -1458,21 +1541,174 @@ class PerfTargetCampaignRunner:
     def _format_msprof_section(residual: StaticDynamicResidual | None) -> str:
         if residual is None:
             return ""
-        if (
-            residual.measured_aic_mac_ratio <= 0.0
-            and residual.measured_aiv_vec_ratio <= 0.0
-            and residual.measured_mte2_wait_ratio <= 0.0
-            and residual.measured_sync_stall_ratio <= 0.0
-        ):
-            return ""
-        return (
-            "### HARDWARE MSPROF TELEMETRY\n"
-            f"aic_mac_ratio: {residual.measured_aic_mac_ratio:.4f}\n"
-            f"aiv_vec_ratio: {residual.measured_aiv_vec_ratio:.4f}\n"
-            f"mte2_wait_ratio: {residual.measured_mte2_wait_ratio:.4f}\n"
-            f"sync_stall_ratio: {residual.measured_sync_stall_ratio:.4f}\n"
-            f"unexplained_gap_ratio: {residual.unexplained_gap_ratio:.4f}\n\n"
+        has_pmu = (
+            residual.measured_aic_mac_ratio > 0.0
+            or residual.measured_aiv_vec_ratio > 0.0
+            or residual.measured_mte2_wait_ratio > 0.0
+            or residual.measured_sync_stall_ratio > 0.0
         )
+        has_compiler_hazard = (
+            residual.spill_bytes > 0
+            or (not residual.vloopv2_hit)
+            or residual.vf_fusion_breaks > 0
+            or residual.alias_serialized_buffers > 0
+            or residual.dual_issue_ipc_collapse > 0.0
+            or residual.dcache_dcci_flushes > 0
+            or bool(residual.has_local_membar_in_vf_call)
+        )
+        if not has_pmu and not has_compiler_hazard:
+            return ""
+        lines = ["### HARDWARE MSPROF TELEMETRY"]
+        if has_pmu:
+            lines.extend(
+                [
+                    f"aic_mac_ratio: {residual.measured_aic_mac_ratio:.4f}",
+                    f"aiv_vec_ratio: {residual.measured_aiv_vec_ratio:.4f}",
+                    f"mte2_wait_ratio: {residual.measured_mte2_wait_ratio:.4f}",
+                    f"sync_stall_ratio: {residual.measured_sync_stall_ratio:.4f}",
+                    f"unexplained_gap_ratio: {residual.unexplained_gap_ratio:.4f}",
+                ]
+            )
+        if has_compiler_hazard:
+            lines.extend(
+                [
+                    f"spill_bytes: {residual.spill_bytes}",
+                    f"vloopv2_hit: {residual.vloopv2_hit}",
+                    f"vf_fusion_breaks: {residual.vf_fusion_breaks}",
+                    f"alias_serialized_buffers: {residual.alias_serialized_buffers}",
+                    f"dual_issue_ipc_collapse: {residual.dual_issue_ipc_collapse:.4f}",
+                    f"dcache_dcci_flushes: {residual.dcache_dcci_flushes}",
+                    f"has_local_membar_in_vf_call: {residual.has_local_membar_in_vf_call}",
+                ]
+            )
+        return "\n".join(lines) + "\n\n"
+
+    @staticmethod
+    def _format_sil_live_policy_section(
+        *,
+        live_plan: RegimePlanResult | None,
+        active_mask: ConstraintRelaxationMask | None,
+        escalation: object | None = None,
+        pipe_gaps: object | None = None,
+        cost_pred: object | None = None,
+    ) -> str:
+        if live_plan is None and active_mask is None:
+            return ""
+        lines = ["### SIL LIVE POLICY & 7-FACET CONSTRAINT ENVELOPE"]
+        if live_plan is not None:
+            pol = live_plan.policy
+            lines.append(
+                f"- topology_axes: {live_plan.topology_axes.key()} "
+                f"(solver_mode={live_plan.solver_mode}, backend_tier={pol.get('backend_tier', 'tilelang_dsl')})"
+            )
+            lines.append(
+                f"- live_solved_knobs: tile_mnk={pol.get('tile_mnk')}, "
+                f"row_pack_factor={pol.get('row_pack_factor', 1)}, "
+                f"l1_stages={pol.get('l1_stages', 1)}, "
+                f"ub_bytes={pol.get('ub_estimated_bytes', 0)}, "
+                f"l1_bytes={pol.get('l1_estimated_bytes', 0)}"
+            )
+            if live_plan.notes:
+                lines.append(f"- solver_note: {live_plan.notes[-1]}")
+        if active_mask is not None:
+            lines.append(f"- unlocked_facets: {', '.join(active_mask.unlocked_facets())}")
+            locked = active_mask.locked_facets()
+            lines.append(f"- locked_facets: {', '.join(locked) if locked else 'none (top)'}")
+        if cost_pred is not None:
+            lines.append(
+                f"- cost_model_pred_us: {float(getattr(cost_pred, 'pred_us', 0.0)):.2f} "
+                f"(dominant_bound={getattr(cost_pred, 'dominant_bound', '')}, "
+                f"tier1_penalty_us={float(getattr(cost_pred, 'tier1_penalty_us', 0.0)):.2f})"
+            )
+        if escalation is not None:
+            should_esc = bool(getattr(escalation, "should_escalate", False))
+            to_tier = getattr(escalation, "to_tier", "")
+            reasons = tuple(getattr(escalation, "trigger_reasons", ()) or ())
+            lines.append(
+                f"- track_escalation: should_escalate={should_esc}, to_tier={to_tier}, "
+                f"reasons={list(reasons)}"
+            )
+        if pipe_gaps is not None:
+            cov = float(getattr(pipe_gaps, "coverage_ratio", 1.0))
+            missing = tuple(getattr(pipe_gaps, "missing_primitives", ()) or ())
+            lines.append(
+                f"- tilelang_7pipe_isa_coverage: {cov:.2%}, missing_count={len(missing)}, "
+                f"sample_gaps={list(missing[:6])}"
+            )
+        return "\n".join(lines) + "\n\n"
+
+    def _build_cost_workload(
+        self,
+        ledger: ObjectivePhysicalLedger,
+        *,
+        live_plan: RegimePlanResult | None = None,
+        axes: TopologyAxes | None = None,
+    ) -> dict[str, object]:
+        pipes = ledger.pipe_cycles or {}
+        cube_c = int(pipes.get("AIC.PIPE_M", 0)) + int(pipes.get("AIC.CUBE", 0))
+        vec_c = int(pipes.get("AIV0.PIPE_V", 0)) + int(pipes.get("AIV1.PIPE_V", 0))
+        gm_bytes = float(getattr(ledger, "gm_roundtrip_bytes", 0) or 0)
+        if gm_bytes <= 0.0 and self._sil_advisory is not None:
+            gm_bytes = float(
+                (getattr(self._sil_advisory, "roofline", {}) or {}).get("median_gm_bytes", 0) or 0
+            )
+        if gm_bytes <= 0.0:
+            gm_bytes = 65536.0
+        workload: dict[str, object] = {}
+        if live_plan is not None:
+            workload.update(live_plan.policy)
+        workload.update(
+            {
+                "cube_flops": float(max(0, cube_c)) * 4096.0,
+                "vec_flops": float(max(1, vec_c)) * 128.0,
+                "gm_bytes": gm_bytes,
+                "contig_burst_bytes": int(getattr(ledger, "dominant_contig_bytes", 0) or 32768),
+                "total_tiles": int(getattr(ledger, "grid_blocks", 0) or 56),
+            }
+        )
+        if axes is not None:
+            workload["topology_axes"] = axes
+        return workload
+
+    def _prune_stale_sibling_stepping_stones(
+        self,
+        promoted_regime: RegimeTargetSpec,
+        promoted_snippet: str,
+    ) -> None:
+        own_editable = set(promoted_regime.editable_symbols)
+        if not own_editable:
+            return
+        try:
+            promoted_dsl = extract_python_dsl(promoted_snippet)
+            promoted_syms = {
+                sym.name for sym in _collect_top_level_symbols(ast.parse(promoted_dsl))
+            }
+        except Exception:
+            promoted_syms = set(own_editable)
+        touched_own = promoted_syms & own_editable
+        if not touched_own:
+            return
+        for other_spec in self._regime_specs:
+            if other_spec.regime_tag == promoted_regime.regime_tag:
+                continue
+            shared_syms = touched_own & set(other_spec.editable_symbols)
+            if not shared_syms:
+                continue
+            other_beam = self._beams.get(other_spec.regime_tag)
+            if other_beam is None or not other_beam.stepping_stone_beam:
+                continue
+            kept_stones: list[BeamCandidate] = []
+            for stone in other_beam.stepping_stone_beam:
+                try:
+                    stone_dsl = extract_python_dsl(stone.dsl_source)
+                    stone_syms = {
+                        sym.name for sym in _collect_top_level_symbols(ast.parse(stone_dsl))
+                    }
+                except Exception:
+                    stone_syms = set(shared_syms)
+                if not (stone_syms & shared_syms):
+                    kept_stones.append(stone)
+            other_beam.stepping_stone_beam = kept_stones
 
     def _build_exploit_regime_request(
         self,
@@ -1487,6 +1723,8 @@ class PerfTargetCampaignRunner:
         parent_residual: StaticDynamicResidual | None = None,
         track: str = "unconstrained",
         incumbent_source: str = "",
+        sil_policy_section: str = "",
+        effort: str | None = None,
     ) -> GenerationRequest:
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
         sys_prompt = (
@@ -1525,6 +1763,7 @@ class PerfTargetCampaignRunner:
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
             f"{track_section}"
+            f"{sil_policy_section}"
             f"{nav_section}"
             f"### SELECTED CAUSAL RULE\n"
             f"Rule ID: {rule.rule_id}\n"
@@ -1538,12 +1777,14 @@ class PerfTargetCampaignRunner:
             f"{abi_section}"
             f"### TARGET FUNCTION SNIPPET\n```python\n{snippet_source}\n```\n"
         )
+        cfg_effort = getattr(getattr(self, "_config", None), "exploit_effort", "medium")
+        eff = sanitize_effort(effort if effort is not None else cfg_effort, default="medium")
         return GenerationRequest(
             role="exploit_rule",
             system_prompt=sys_prompt,
             user_prompt=user_prompt,
             json_schema=None,
-            effort="medium",
+            effort=eff,
         )
 
     def _build_creative_regime_request(
@@ -1563,6 +1804,7 @@ class PerfTargetCampaignRunner:
         track: str = "unconstrained",
         incumbent_source: str = "",
         parent_hypothesis: str = "",
+        sil_policy_section: str = "",
     ) -> GenerationRequest:
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
         sys_prompt = (
@@ -1626,6 +1868,7 @@ class PerfTargetCampaignRunner:
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
             f"{track_section}"
+            f"{sil_policy_section}"
             f"{nav_section}"
             f"{focus_section}"
             f"{parent_hyp_section}"
@@ -1916,7 +2159,7 @@ class PerfTargetCampaignRunner:
         func_name: str,
         regime_spec: RegimeTargetSpec,
         active_anchors: Sequence[AnchorCaseSpec],
-        paradigm: str,
+        topology_axes: TopologyAxes,
     ) -> list[str]:
         """Distill and verify causal rules on hardware through AgentGates."""
         if self._flywheel is None:
@@ -1958,7 +2201,7 @@ class PerfTargetCampaignRunner:
             config_selector_name=regime_spec.config_selector_fn or None,
             dims=anchor_dims or None,
             batch_latency_evaluator=_batch_chunk_latencies,
-            paradigm=paradigm,
+            topology_axes=topology_axes,
             kb_output_path=self._campaign_kb_path,
             rule_id_prefix="R_FLYWHEEL",
         )
@@ -1990,7 +2233,7 @@ class PerfTargetCampaignRunner:
         func_name, _default_snippet = extract_regime_snippet(incumbent_source, regime_spec)
 
         escalated = stagnation_rounds >= self._config.stagnation_escalate_rounds
-        creative_effort = "xhigh" if escalated else "high"
+        creative_effort = "high"
         (
             parent_module_source,
             parent_snippet,
@@ -2037,7 +2280,50 @@ class PerfTargetCampaignRunner:
 
         regime_best = best_result.for_regime(regime_spec.regime_tag)
         local_best = regime_best if regime_best.anchors else best_result
-        paradigm = self._derive_paradigm(parent_ledger)
+        parent_axes = self._derive_topology_axes(
+            parent_ledger,
+            features=parent_features,
+            route=base_stage_a.route,
+        )
+        rep_dims = {
+            str(k): int(v)
+            for k, v in (
+                regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+            ).items()
+            if isinstance(v, int) and not isinstance(v, bool)
+        }
+        sil_regime = None
+        if self._sil_advisory is not None:
+            for reg in getattr(self._sil_advisory, "regimes", ()) or ():
+                if getattr(reg, "regime_tag", None) == regime_spec.regime_tag:
+                    sil_regime = reg
+                    break
+        if sil_regime is None:
+            sil_regime = RegimeSlice(
+                regime_tag=regime_spec.regime_tag,
+                case_nums=(),
+                representative_dims=rep_dims,
+                has_unaligned_tail=(
+                    "unaligned" in regime_spec.regime_tag or "tail" in regime_spec.regime_tag
+                ),
+            )
+        adv_dtypes = tuple(getattr(self._sil_advisory, "input_dtypes", ()) or ())
+        adv_nan_inf = bool(getattr(self._sil_advisory, "has_nan_inf_cases", False))
+        live_plan = recompute_regime_for_live_buffers(
+            self._regime_solver,
+            sil_regime,
+            parent_ledger,
+            op_name=self._config.operator_name,
+            topology_axes=parent_axes,
+            input_dtypes=adv_dtypes or ("float16",),
+            has_nan_inf_cases=adv_nan_inf,
+            has_indirect_gather=(parent_axes.iteration_regularity == "irregular_simt"),
+            has_recurrence=(
+                parent_axes.memory_ring in ("persistent_onchip_state", "bidirectional_cv_ring")
+            ),
+            uses_cube=parent_axes.uses_cube,
+        )
+        self._live_regime_plans[regime_spec.regime_tag] = live_plan
         if stagnation_rounds >= 1:
             self._collect_msprof_for_regimes(
                 parent_module_source,
@@ -2071,6 +2357,14 @@ class PerfTargetCampaignRunner:
             selected_stone.residual.measured_aiv_vec_ratio > 0.0
             or selected_stone.residual.measured_aic_mac_ratio > 0.0
             or selected_stone.residual.measured_mte2_wait_ratio > 0.0
+            or selected_stone.residual.measured_sync_stall_ratio > 0.0
+            or selected_stone.residual.spill_bytes > 0
+            or (not selected_stone.residual.vloopv2_hit)
+            or selected_stone.residual.vf_fusion_breaks > 0
+            or selected_stone.residual.alias_serialized_buffers > 0
+            or selected_stone.residual.dual_issue_ipc_collapse > 0.0
+            or selected_stone.residual.dcache_dcci_flushes > 0
+            or bool(selected_stone.residual.has_local_membar_in_vf_call)
         ):
             parent_residual = selected_stone.residual
         else:
@@ -2083,12 +2377,85 @@ class PerfTargetCampaignRunner:
             parent_ledger,
             features=parent_features,
             residual=parent_residual,
+            extra={"topology_axes": parent_axes},
+        )
+        parent_comp_summary = BishengResourceSummary(
+            spill_bytes=int(parent_residual.spill_bytes),
+            vloopv2_loops=1 if parent_residual.vloopv2_hit else 0,
+            software_loops=0 if parent_residual.vloopv2_hit else 1,
+            has_local_membar_in_vf_call=bool(parent_residual.has_local_membar_in_vf_call),
+            vf_fusion_breaks=int(parent_residual.vf_fusion_breaks),
+            alias_serialized_buffers=int(parent_residual.alias_serialized_buffers),
+            dual_issue_ipc_collapse=float(parent_residual.dual_issue_ipc_collapse),
+            dcache_dcci_flushes=int(parent_residual.dcache_dcci_flushes),
+        )
+        parent_waterlines = getattr(parent_ledger, "waterlines", {}) or {}
+        l1_wl = parent_waterlines.get("L1")
+        ub_wl = parent_waterlines.get("UB")
+        l1_overflow = bool(l1_wl is not None and int(getattr(l1_wl, "overflow_bytes", 0) or 0) > 0)
+        ub_overflow = bool(ub_wl is not None and int(getattr(ub_wl, "overflow_bytes", 0) or 0) > 0)
+        parent_workload = self._build_cost_workload(
+            parent_ledger,
+            live_plan=live_plan,
+            axes=parent_axes,
+        )
+        parent_cost_pred = self._cost_model.predict(
+            parent_workload,
+            bisheng_res=parent_comp_summary,
+        )
+        active_mask = self._freedom_masks.get(
+            regime_spec.regime_tag,
+            ConstraintRelaxationMask.bottom(),
+        )
+        escalation_decision = None
+        pipe_gap_report = None
+        if escalated:
+            active_mask = relax_facets_for_bottleneck(
+                active_mask,
+                dominant_bound=parent_cost_pred.dominant_bound,
+                residual=parent_residual,
+                compiler_summary=parent_comp_summary,
+                l1_overflow=l1_overflow,
+                ub_overflow=ub_overflow,
+            )
+            self._freedom_masks[regime_spec.regime_tag] = active_mask
+            current_tier = str(live_plan.policy.get("backend_tier", "tilelang_dsl"))
+            if current_tier not in ("tilelang_dsl", "inline_ascendc_vf", "ascendc_template"):
+                current_tier = "tilelang_dsl"
+            sf_ctx = (
+                parent_features.to_dict()
+                if hasattr(parent_features, "to_dict")
+                else (dict(parent_features) if isinstance(parent_features, Mapping) else {})
+            )
+            sf_ctx["l1_overflow"] = l1_overflow
+            sf_ctx["ub_overflow"] = ub_overflow
+            sf_ctx["freedom_mask"] = active_mask
+            sf_ctx.setdefault("uses_cube", parent_axes.uses_cube)
+            escalation_decision = evaluate_track_escalation(
+                current_tier=current_tier,
+                roofline_eta=float(local_best.avg_roofline_eta),
+                target_eta=float(self._perf_target.target_roofline_eta),
+                stagnation_rounds=int(stagnation_rounds),
+                dominant_bound=parent_cost_pred.dominant_bound,
+                compiler_summary=parent_comp_summary,
+                structural_features=sf_ctx,
+            )
+            pipe_gap_report = scan_tilelang_pipe_gaps()
+        else:
+            self._freedom_masks.setdefault(regime_spec.regime_tag, active_mask)
+
+        sil_policy_section = self._format_sil_live_policy_section(
+            live_plan=live_plan,
+            active_mask=active_mask,
+            escalation=escalation_decision,
+            pipe_gaps=pipe_gap_report,
+            cost_pred=parent_cost_pred,
         )
         ranked_rules = list(
             self._tracker.rank_applicable_rules(
                 ctx,
                 top_k=self._config.k_rule_workers,
-                paradigm=paradigm,
+                topology_axes=parent_axes,
             )
         )
         nav_packet = self._regime_nav_packets.get(regime_spec.regime_tag)
@@ -2111,6 +2478,8 @@ class PerfTargetCampaignRunner:
                         parent_residual=parent_residual,
                         track=parent_track,
                         incumbent_source=parent_module_source,
+                        sil_policy_section=sil_policy_section,
+                        effort=self._config.exploit_effort,
                     ),
                 )
             )
@@ -2184,6 +2553,7 @@ class PerfTargetCampaignRunner:
                         track=parent_track,
                         incumbent_source=parent_module_source,
                         parent_hypothesis=selected_stone_hypothesis,
+                        sil_policy_section=sil_policy_section,
                     ),
                 )
             )
@@ -2231,7 +2601,7 @@ class PerfTargetCampaignRunner:
                     self._tracker.record_outcome(
                         rule.rule_id,
                         postcondition_realized=False,
-                        paradigm=paradigm,
+                        topology_axes=parent_axes,
                     )
             else:
                 raw_candidates.append((wid, snippet))
@@ -2261,7 +2631,7 @@ class PerfTargetCampaignRunner:
                     self._tracker.record_outcome(
                         rule.rule_id,
                         postcondition_realized=False,
-                        paradigm=paradigm,
+                        topology_axes=parent_axes,
                     )
 
         l2_results: dict[str, CandidateSurrogateResult] = {}
@@ -2414,7 +2784,32 @@ class PerfTargetCampaignRunner:
                     if k == "dur_us" and float(v) <= 0.0:
                         continue
                     cand_tel[k] = v
-            cand_residual = compute_static_dynamic_residual(ledger, cand_tel)
+            cand_comp_summary = (
+                chk.stage_b.compiler_summary if getattr(chk, "stage_b", None) is not None else None
+            )
+            cand_residual = compute_static_dynamic_residual(
+                ledger, cand_tel, compiler_summary=cand_comp_summary
+            )
+            cand_axes = self._derive_topology_axes(
+                ledger,
+                features=chk.stage_a.features if chk.stage_a else None,
+                route=chk.stage_a.route if chk.stage_a else None,
+            )
+            if res.all_passed and lat_us > 0.0:
+                try:
+                    cand_workload = self._build_cost_workload(
+                        ledger,
+                        live_plan=live_plan,
+                        axes=cand_axes,
+                    )
+                    self._cost_model.observe(
+                        cand_workload,
+                        lat_us,
+                        bisheng_res=cand_comp_summary,
+                        persist=False,
+                    )
+                except Exception as exc:
+                    logger.debug("Cost model online observation skipped: %s", exc)
             try:
                 _, canonical_slice = extract_regime_snippet(chk.patched_module_source, regime_spec)
             except Exception:
@@ -2433,7 +2828,10 @@ class PerfTargetCampaignRunner:
                     latency_us=lat_us,
                     accuracy_passed=local_res.all_passed,
                     structural_signature=extract_structural_signature(
-                        canonical_slice, track=track
+                        canonical_slice,
+                        track=track,
+                        residual=cand_residual,
+                        stage_b=getattr(chk, "stage_b", None),
                     ),
                     hypothesis=cand_hypothesis,
                     parent_id=active_parent_id,
@@ -2466,10 +2864,12 @@ class PerfTargetCampaignRunner:
                     rule.rule_id,
                     postcondition_realized=realized,
                     speed_gain=causal_gain,
-                    paradigm=paradigm,
+                    topology_axes=cand_axes,
                 )
 
         regime_beam.update(beam_updates)
+        if promoted and top_chk is not None:
+            self._prune_stale_sibling_stepping_stones(regime_spec, top_chk.snippet_source)
 
         if (
             promoted
@@ -2500,7 +2900,7 @@ class PerfTargetCampaignRunner:
                         func_name=func_name,
                         regime_spec=regime_spec,
                         active_anchors=active_anchors,
-                        paradigm=paradigm,
+                        topology_axes=parent_axes,
                     )
                 )
                 admitted_rule_ids.extend(round_admitted)
@@ -2511,9 +2911,9 @@ class PerfTargetCampaignRunner:
                     exc,
                 )
 
-        pruned_rules = self._tracker.prune_underperforming(paradigm=paradigm)
+        pruned_rules = self._tracker.prune_underperforming(topology_axes=parent_axes)
         if pruned_rules:
-            logger.debug("Pruned rules for paradigm %s: %s", paradigm, pruned_rules)
+            logger.debug("Pruned rules for topology_axes %s: %s", parent_axes.key(), pruned_rules)
 
         record = CampaignRoundRecord(
             round_idx=round_idx,
@@ -2838,8 +3238,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--operator",
         required=True,
-        choices=("attention_residual", "mla"),
-        help="Target production operator to optimize.",
+        help="Target operator to optimize (short name e.g. rms_norm or task id e.g. level2/rms_norm).",
     )
     parser.add_argument("--max-rounds", type=int, default=12)
     parser.add_argument("--max-wall-clock-min", type=float, default=180.0)

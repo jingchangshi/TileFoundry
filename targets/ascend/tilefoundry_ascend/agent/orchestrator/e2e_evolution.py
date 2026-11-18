@@ -368,6 +368,37 @@ def _build_round_record(
     return rec, new_best_so_far
 
 
+def _derive_proportional_pmu_ratios(ledger: ObjectivePhysicalLedger) -> tuple[float, float, float]:
+    """Derive proportional (aic_mad, aiv_vec, aiv_mte2) ratios from Stage-A pipe_cycles."""
+    pipes = ledger.pipe_cycles or {}
+    aic_cycles = sum(
+        max(0, int(v))
+        for k, v in pipes.items()
+        if any(tok in k.upper() for tok in ("PIPE_M", "CUBE", "MAD", "FIX"))
+    )
+    vec_cycles = sum(
+        max(0, int(v))
+        for k, v in pipes.items()
+        if any(tok in k.upper() for tok in ("PIPE_V", "VEC", "SIMT"))
+    )
+    mte_cycles = sum(
+        max(0, int(v))
+        for k, v in pipes.items()
+        if any(tok in k.upper() for tok in ("MTE2", "MTE3", "MTE1", "DMA"))
+    )
+    subtotal = float(aic_cycles + vec_cycles + mte_cycles)
+    if subtotal <= 0.0:
+        all_cycles = float(sum(max(0, int(v)) for v in pipes.values()))
+        if all_cycles <= 0.0:
+            return 0.0, 0.0, 0.0
+        return 0.0, 1.0, 0.0
+    return (
+        round(float(aic_cycles) / subtotal, 6),
+        round(float(vec_cycles) / subtotal, 6),
+        round(float(mte_cycles) / subtotal, 6),
+    )
+
+
 def _wrap_funnel_with_proxy(
     funnel: GateFunnel,
     target: AscendTarget | None,
@@ -378,11 +409,13 @@ def _wrap_funnel_with_proxy(
     def _proxy_device(_dsl: str, stage_a: StageAResult) -> StageCResult:
         assert stage_a.ledger is not None
         lat = _proxy_latency_from_ledger(stage_a.ledger)
+        aic_mad, aiv_vec, aiv_mte2 = _derive_proportional_pmu_ratios(stage_a.ledger)
         telemetry: dict[str, object] = {
             "dur_us": lat,
-            "aic_mad": 0.4,
-            "aiv_vec": 0.4,
-            "aiv_mte2": 0.2,
+            "aic_mad": aic_mad,
+            "aiv_vec": aiv_vec,
+            "aiv_mte2": aiv_mte2,
+            "is_analytical_proxy": True,
         }
         if ideal_roofline_us > 0.0 and lat > 0.0:
             telemetry["roofline_eta"] = min(1.0, ideal_roofline_us / max(1e-6, lat))
@@ -505,7 +538,14 @@ async def run_e2e_evolution(
             base_residual = base_eval.stage_c.residual
     else:
         proxy_lat = _proxy_latency_from_ledger(base_ledger)
-        proxy_tel: dict[str, object] = {"dur_us": proxy_lat}
+        aic_mad, aiv_vec, aiv_mte2 = _derive_proportional_pmu_ratios(base_ledger)
+        proxy_tel: dict[str, object] = {
+            "dur_us": proxy_lat,
+            "aic_mad": aic_mad,
+            "aiv_vec": aiv_vec,
+            "aiv_mte2": aiv_mte2,
+            "is_analytical_proxy": True,
+        }
         if ideal_roofline_us > 0.0 and proxy_lat > 0.0:
             proxy_tel["roofline_eta"] = min(1.0, ideal_roofline_us / max(1e-6, proxy_lat))
         base_residual = compute_static_dynamic_residual(base_ledger, proxy_tel)
