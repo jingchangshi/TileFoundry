@@ -462,6 +462,8 @@ class _TelemetryFeatures:
     has_coupled_reduce_sfu_accum: bool = False
     active_grid_blocks: int = 0
     in_loop_pipe_all_barriers: int = 0
+    ub_bank_conflict_risk: float = 0.0
+    l1_bank_conflict_risk: float = 0.0
 
 
 def _collect_tirx_expr_vars(expr, *, tirx) -> list[object]:
@@ -550,6 +552,50 @@ def _build_free_var_int_map(
     return vmap
 
 
+_DIM_ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("b", "b_dim", "batch", "batch_size"),
+    ("m", "m_dim", "m_rows", "q_total_rows", "num_tokens", "tokens"),
+    ("n", "n_dim", "n_cols"),
+    ("k", "k_dim"),
+    ("h", "h_dim", "heads", "num_heads", "n_q", "n_heads"),
+    ("l", "l_dim", "seq_len", "s", "s_dim"),
+    ("c", "c_dim", "channels", "in_channels", "out_channels"),
+    ("v", "v_dim", "vocab", "vocab_size"),
+    ("g", "g_dim", "groups", "num_groups"),
+    ("d", "d_dim", "head_dim", "d_nope"),
+    ("s_kv", "kv_len", "s_kv_dim"),
+)
+
+
+def _match_binding_for_var(
+    var,
+    eff: Mapping[str, int],
+    lower_eff: Mapping[str, int],
+) -> int | None:
+    """Resolve an integer binding for a TIR Var by exact name, suffix strip, or canonical alias."""
+    exact_name = str(getattr(var, "name", "") or "")
+    hint_name = str(getattr(var, "name_hint", "") or "")
+    for cname in (exact_name, hint_name):
+        if cname and cname in eff:
+            return eff[cname]
+        lc = cname.lower()
+        if lc and lc in lower_eff:
+            return lower_eff[lc]
+        for suffix in ("_dim", "_size", "_len", "_count", "_rows", "_cols"):
+            if lc.endswith(suffix):
+                stem = lc[: -len(suffix)]
+                if stem in lower_eff:
+                    return lower_eff[stem]
+            elif lc and f"{lc}{suffix}" in lower_eff:
+                return lower_eff[f"{lc}{suffix}"]
+        for group in _DIM_ALIAS_GROUPS:
+            if lc in group:
+                for alias in group:
+                    if alias in lower_eff:
+                        return lower_eff[alias]
+    return None
+
+
 def _augment_var_bindings_from_buffers(
     entry_fn,
     var_bindings: Mapping[str, int] | None,
@@ -568,44 +614,54 @@ def _augment_var_bindings_from_buffers(
     seen_ids: set[int] = set()
 
     def _is_already_bound(var) -> bool:
-        exact_name = str(getattr(var, "name", "") or "")
-        hint_name = str(getattr(var, "name_hint", "") or "")
-        for cname in (exact_name, hint_name):
-            if cname and (cname in eff or cname.lower() in lower_eff):
-                return True
-        return False
+        return id(var) in seen_ids
 
     def _bind_var(var, val: int) -> None:
-        if _is_already_bound(var):
-            return
         if id(var) not in seen_ids:
             seen_ids.add(id(var))
             obj_bindings.append((var, int(val)))
-        hint = str(getattr(var, "name_hint", "") or getattr(var, "name", "") or "")
-        if hint and hint not in eff:
-            eff[hint] = int(val)
+        for cname in (
+            str(getattr(var, "name", "") or ""),
+            str(getattr(var, "name_hint", "") or ""),
+        ):
+            if cname and cname not in eff:
+                eff[cname] = int(val)
+                lower_eff.setdefault(cname.lower(), int(val))
 
     buffer_map = getattr(entry_fn, "buffer_map", None) or {}
     for param in getattr(entry_fn, "params", ()):
         buf = buffer_map.get(param)
         if buf is None:
+            if isinstance(param, tirx.Var):
+                matched = _match_binding_for_var(param, eff, lower_eff)
+                if matched is not None:
+                    _bind_var(param, matched)
             continue
         shape = list(getattr(buf, "shape", ()))
+        strides = list(getattr(buf, "strides", ()) or ())
+        for dim_expr in (*shape, *strides):
+            for fv in _free_tirx_vars(dim_expr, tirx=tirx):
+                matched = _match_binding_for_var(fv, eff, lower_eff)
+                if matched is not None:
+                    _bind_var(fv, matched)
         if len(shape) == 2:
             d0, d1 = shape
-            if isinstance(d0, tirx.Var) and _static_tirx_int(d1) is not None:
-                row_val = lower_eff.get("q_total_rows", lower_eff.get("m_rows"))
+            if isinstance(d0, tirx.Var) and not _is_already_bound(d0) and _static_tirx_int(d1) is not None:
+                row_val = lower_eff.get("q_total_rows", lower_eff.get("m_rows", lower_eff.get("m")))
                 if row_val is not None:
                     _bind_var(d0, row_val)
         elif len(shape) == 4:
             d0, d1, d2, _d3 = shape
-            if isinstance(d0, tirx.Var) and "b_dim" in lower_eff:
-                _bind_var(d0, lower_eff["b_dim"])
-            if "s_kv" in lower_eff:
-                if isinstance(d1, tirx.Var) and _static_tirx_int(d2) is not None:
-                    _bind_var(d1, lower_eff["s_kv"])
-                elif isinstance(d2, tirx.Var) and _static_tirx_int(d1) is not None:
-                    _bind_var(d2, lower_eff["s_kv"])
+            if isinstance(d0, tirx.Var) and not _is_already_bound(d0):
+                b_val = lower_eff.get("b_dim", lower_eff.get("b"))
+                if b_val is not None:
+                    _bind_var(d0, b_val)
+            kv_val = lower_eff.get("s_kv")
+            if kv_val is not None:
+                if isinstance(d1, tirx.Var) and not _is_already_bound(d1) and _static_tirx_int(d2) is not None:
+                    _bind_var(d1, kv_val)
+                elif isinstance(d2, tirx.Var) and not _is_already_bound(d2) and _static_tirx_int(d1) is not None:
+                    _bind_var(d2, kv_val)
     return eff, obj_bindings
 
 
@@ -957,9 +1013,17 @@ def _collect_tilelang_telemetry(
     cube_m_values: list[int] = []
     gm_static_bytes: dict[str, int] = {}
     ub_static_bytes: dict[str, int] = {}
+    l1_static_bytes: dict[str, int] = {}
+    ub_2d_total_bytes = [0]
+    ub_2d_conflict_bytes = [0]
+    has_l1_half_isolation = [
+        _attrs_contain_flag(getattr(entry_fn, "attrs", None), "half_l1")
+        or _attrs_contain_flag(getattr(mod_in, "attrs", None), "half_l1")
+    ]
     gm_scalar_names: set[str] = set()
     contig_candidates: list[tuple[int | None, int, int, int, int]] = []
     seen_gm_keys: set[str] = set()
+    seen_ub_bank_keys: set[str] = set()
 
     def _register_buffer(buf) -> None:
         dtype_str = str(buf.dtype)
@@ -970,6 +1034,29 @@ def _collect_tilelang_telemetry(
         if scope == "UB" and static_shape is not None:
             ub_bytes = _buffer_bytes(static_shape, buf.dtype, DataTypeCls)
             ub_static_bytes[buf.name] = max(ub_static_bytes.get(buf.name, 0), ub_bytes)
+            if (
+                buf.name not in seen_ub_bank_keys
+                and len(static_shape) >= 2
+                and math.prod(static_shape[:-1]) > 1
+                and ub_bytes > 0
+            ):
+                seen_ub_bank_keys.add(buf.name)
+                elem_b = _dtype_bytes(buf.dtype, DataTypeCls)
+                strides = getattr(buf, "strides", None) or ()
+                row_stride = (
+                    _static_tirx_int(strides[-2])
+                    if len(strides) >= 2
+                    else None
+                )
+                row_elems = row_stride if (row_stride is not None and row_stride > 0) else static_shape[-1]
+                stride_bytes = int(math.ceil(row_elems * elem_b))
+                ub_2d_total_bytes[0] += ub_bytes
+                if stride_bytes >= 512 and stride_bytes % 512 == 0:
+                    ub_2d_conflict_bytes[0] += ub_bytes
+        if scope == "L1" and static_shape is not None:
+            l1_bytes = _buffer_bytes(static_shape, buf.dtype, DataTypeCls)
+            if l1_bytes > 0:
+                l1_static_bytes[buf.name] = max(l1_static_bytes.get(buf.name, 0), l1_bytes)
         if scope != "GM":
             return
         key = buf.name
@@ -1146,6 +1233,22 @@ def _collect_tilelang_telemetry(
         wide_ub_names,
         tirx=tirx,
     )
+    ub_bank_conflict_risk = (
+        round(min(1.0, ub_2d_conflict_bytes[0] / float(ub_2d_total_bytes[0])), 4)
+        if ub_2d_total_bytes[0] > 0 and ub_2d_conflict_bytes[0] > 0
+        else 0.0
+    )
+    l1_total = sum(l1_static_bytes.values())
+    l1_full = max(1, spaces.l1_bytes if spaces is not None else 524288)
+    l1_half = max(1, l1_full // 2)
+    if l1_total <= 0 or has_l1_half_isolation[0]:
+        l1_bank_conflict_risk = 0.0
+    elif l1_total > l1_half:
+        l1_bank_conflict_risk = round(min(1.0, l1_total / float(l1_full)), 4)
+    elif len(l1_static_bytes) >= 2:
+        l1_bank_conflict_risk = round(min(0.5, l1_total / float(l1_half)), 4)
+    else:
+        l1_bank_conflict_risk = 0.0
 
     return _TelemetryFeatures(
         grid_blocks=grid_blocks,
@@ -1165,6 +1268,8 @@ def _collect_tilelang_telemetry(
         has_coupled_reduce_sfu_accum=coupled_reduce_sfu,
         active_grid_blocks=active_grid_blocks,
         in_loop_pipe_all_barriers=in_loop_pipe_all,
+        ub_bank_conflict_risk=ub_bank_conflict_risk,
+        l1_bank_conflict_risk=l1_bank_conflict_risk,
     )
 
 
@@ -1767,6 +1872,141 @@ def _detect_coupled_reduce_sfu_accum(
     return _inspect(stmt)[2]
 
 
+def _dav3510_macs_and_k0(
+    dtype_str: str,
+    spaces: AscendSpaceFacts | None,
+) -> tuple[int, int]:
+    """Return (macs_per_cycle, fractal_k0) for Ascend 950 (dav-3510) Cube MMA."""
+    base = re.sub(r"x\d+$", "", str(dtype_str).strip().lower())
+    if base in ("fp4", "f4", "mxfp4", "f4e2m1", "f4e1m2", "float4_e2m1fn", "int4", "i4", "u4"):
+        key, k0, fallback = "f4e2m1", 64, 16384
+    elif base in (
+        "fp8",
+        "f8",
+        "fp8e4m3",
+        "fp8e5m2",
+        "float8_e4m3fn",
+        "float8_e5m2",
+        "hif8",
+        "hifp8",
+        "int8",
+        "uint8",
+        "i8",
+        "u8",
+    ):
+        key = "hif8" if "hif" in base else ("i8" if "i8" in base or "int8" in base else "fp8e4m3")
+        k0, fallback = 32, 8192
+    elif base in ("hf32", "tf32"):
+        key, k0, fallback = "hf32", 8, 2048
+    elif base in ("f32", "fp32", "float32"):
+        key, k0, fallback = "f32", 8, 256
+    else:
+        key, k0, fallback = "bf16", 16, 4096
+    if spaces is not None and hasattr(spaces, "cube_macs_per_cycle"):
+        try:
+            return int(spaces.cube_macs_per_cycle(key)), k0
+        except ValueError:
+            pass
+    return fallback, k0
+
+
+def _arg_shape_and_dtype(arg, tirx) -> tuple[tuple[int, ...] | None, str | None]:
+    """Extract static tile extents and dtype string from a TileLang call argument."""
+    if isinstance(arg, tirx.Call):
+        op_name = str(getattr(arg.op, "name", arg.op))
+        if ("region" in op_name or "access_ptr" in op_name) and arg.args:
+            first = arg.args[0]
+            if isinstance(first, tirx.BufferLoad):
+                buf = first.buffer
+                if "region" in op_name and len(arg.args) >= 3:
+                    ext = _static_shape_ints(arg.args[2:])
+                    if ext is not None:
+                        return ext, str(buf.dtype)
+                return _static_shape_ints(buf.shape), str(buf.dtype)
+    if isinstance(arg, tirx.BufferRegion):
+        buf = arg.buffer
+        ext = _static_shape_ints([r.extent for r in arg.region])
+        return (ext if ext is not None else _static_shape_ints(buf.shape)), str(buf.dtype)
+    if isinstance(arg, tirx.BufferLoad):
+        buf = arg.buffer
+        return _static_shape_ints(buf.shape), str(buf.dtype)
+    return None, None
+
+
+def _estimate_dav3510_cube_cycles(
+    args: Sequence[object],
+    spaces: AscendSpaceFacts | None,
+    tirx,
+) -> int:
+    """Estimate Ascend 950 (dav-3510) Cube PIPE_M cycles with 16x16xK0 alignment & hazard."""
+    ext_a, dt_a = _arg_shape_and_dtype(args[0], tirx) if len(args) > 0 else (None, None)
+    ext_b, dt_b = _arg_shape_and_dtype(args[1], tirx) if len(args) > 1 else (None, None)
+    ext_c, dt_c = _arg_shape_and_dtype(args[2], tirx) if len(args) > 2 else (None, None)
+    trans_a = _static_tirx_int(args[3]) if len(args) > 3 else 0
+    trans_b = _static_tirx_int(args[4]) if len(args) > 4 else 0
+    m = _static_tirx_int(args[5]) if len(args) > 5 else None
+    n = _static_tirx_int(args[6]) if len(args) > 6 else None
+    k = _static_tirx_int(args[7]) if len(args) > 7 else None
+    if ext_a and len(ext_a) >= 2:
+        if m is None:
+            m = ext_a[-1] if trans_a else ext_a[-2]
+        if k is None:
+            k = ext_a[-2] if trans_a else ext_a[-1]
+    if ext_b and len(ext_b) >= 2:
+        if n is None:
+            n = ext_b[-2] if trans_b else ext_b[-1]
+        if k is None:
+            k = ext_b[-1] if trans_b else ext_b[-2]
+    if ext_c and len(ext_c) >= 2:
+        if m is None:
+            m = ext_c[-2]
+        if n is None:
+            n = ext_c[-1]
+    if m and n and k and m > 0 and n > 0 and k > 0:
+        macs, k0 = _dav3510_macs_and_k0(dt_a or dt_b or dt_c or "bf16", spaces)
+        m_pad = ((m + 15) // 16) * 16
+        n_pad = ((n + 15) // 16) * 16
+        k_pad = ((k + k0 - 1) // k0) * k0
+        cycles = max(1, math.ceil((m_pad * n_pad * k_pad) / float(max(1, macs))))
+        tile_blocks = ((m + 15) // 16) * ((n + 15) // 16)
+        if tile_blocks < 10:
+            cycles += 6
+        return cycles
+    return 4
+
+
+def _estimate_dav3510_vec_cycles(
+    op_name: str,
+    args: Sequence[object],
+    tirx,
+    DataTypeCls,
+) -> int:
+    """Estimate Ascend 950 (dav-3510) Vector PIPE_V cycles for 256B RegTensor & SFU ops."""
+    max_bytes = 0
+    for arg in args:
+        _sc, total_b, _in_b = _region_bytes(arg, tirx, DataTypeCls)
+        if total_b > max_bytes:
+            max_bytes = total_b
+        elif total_b == 0 and isinstance(arg, tirx.Var):
+            dtype_str = str(getattr(arg, "dtype", ""))
+            if dtype_str and dtype_str != "handle":
+                try:
+                    dt = DataTypeCls(dtype_str)
+                    vec_b = int(math.ceil((dt.bits * dt.lanes) / 8.0))
+                    max_bytes = max(max_bytes, vec_b)
+                except Exception:
+                    pass
+    elem_bytes = max_bytes if max_bytes > 0 else 256
+    base_cycles = max(1, math.ceil(elem_bytes / 256.0))
+    lower = op_name.lower()
+    sfu_weight = (
+        4
+        if any(tok in lower for tok in ("exp", "log", "div", "sqrt", "rsqrt"))
+        else 1
+    )
+    return base_cycles * sfu_weight
+
+
 def _scan_tilelang_ast(
     func,
     spaces: AscendSpaceFacts,
@@ -1945,6 +2185,18 @@ def _scan_tilelang_ast(
             )
             return
         if isinstance(stmt, (tirx.Bind, tirx.AllocBuffer, tirx.DeclBuffer)):
+            if isinstance(stmt, tirx.Bind) and isinstance(getattr(stmt, "value", None), tirx.Call):
+                b_op = str(getattr(stmt.value.op, "name", stmt.value.op)).lower()
+                if (
+                    ("simd" in b_op or "vec" in b_op)
+                    and "vld" not in b_op
+                    and "pset" not in b_op
+                ):
+                    mte2_run[0] = 0
+                    vec_cyc = _estimate_dav3510_vec_cycles(
+                        b_op, list(stmt.value.args), tirx, DataTypeCls
+                    )
+                    _emit_aiv_pipe("PIPE_V", repeat * vec_cyc, guarded_aiv=guarded_aiv)
             if hasattr(stmt, "body"):
                 _walk(
                     stmt.body,
@@ -2012,12 +2264,14 @@ def _scan_tilelang_ast(
                                 repeat * max(1, (xfer + 63) // 64),
                                 guarded_aiv=guarded_aiv,
                             )
-            elif "gemm" in op_name:
+            elif "gemm" in op_name or "mmad" in op_name:
                 mte2_run[0] = 0
-                _add_pipe("AIC.PIPE_M", repeat * 4)
+                gemm_cyc = _estimate_dav3510_cube_cycles(args, spaces, tirx)
+                _add_pipe("AIC.PIPE_M", repeat * gemm_cyc)
             elif "simd" in op_name or "vec" in op_name:
                 mte2_run[0] = 0
-                _emit_aiv_pipe("PIPE_V", repeat, guarded_aiv=guarded_aiv)
+                vec_cyc = _estimate_dav3510_vec_cycles(op_name, args, tirx, DataTypeCls)
+                _emit_aiv_pipe("PIPE_V", repeat * vec_cyc, guarded_aiv=guarded_aiv)
 
     _walk(func.body)
     return (
@@ -2211,6 +2465,7 @@ def _extract_pipelined_loop_tasks(
     sid_vars: set[object],
     guarded_aiv: str | None,
     spaces: AscendSpaceFacts | None = None,
+    dynamic_inner_out: list[bool] | None = None,
 ) -> list[_TileLangLoopTask] | None:
     tasks: list[_TileLangLoopTask] = []
     aborted = [False]
@@ -2223,20 +2478,31 @@ def _extract_pipelined_loop_tasks(
                 _walk(child, scale=scale, cur_guard=cur_guard)
             return
         if isinstance(node, tirx.While):
-            aborted[0] = True
+            if dynamic_inner_out is not None:
+                dynamic_inner_out[0] = True
+                _walk(node.body, scale=scale, cur_guard=cur_guard)
+            else:
+                aborted[0] = True
             return
         if isinstance(node, tirx.For):
             trip = _static_tirx_int(node.extent)
             if trip is None:
-                aborted[0] = True
+                if dynamic_inner_out is not None:
+                    dynamic_inner_out[0] = True
+                    _walk(node.body, scale=scale, cur_guard=cur_guard)
+                else:
+                    aborted[0] = True
                 return
             if trip > 0:
                 _walk(node.body, scale=min(8, scale * trip), cur_guard=cur_guard)
             return
         if isinstance(node, tirx.IfThenElse):
             if _contains_buffer_load(node.condition, tirx):
-                aborted[0] = True
-                return
+                if dynamic_inner_out is not None:
+                    dynamic_inner_out[0] = True
+                else:
+                    aborted[0] = True
+                    return
             t_guard, e_guard = _sid_guard_branches(
                 node.condition, sid_vars, tirx, aiv_split_factor
             )
@@ -2355,13 +2621,8 @@ def _extract_pipelined_loop_tasks(
                 a_n, a_s, _ = _tilelang_arg_buf(args[0], tirx, DataTypeCls)
                 b_n, b_s, _ = _tilelang_arg_buf(args[1], tirx, DataTypeCls)
                 c_n, c_s, _ = _tilelang_arg_buf(args[2], tirx, DataTypeCls)
-                m = _static_tirx_int(args[5]) if len(args) > 5 else None
-                n = _static_tirx_int(args[6]) if len(args) > 6 else None
-                k = _static_tirx_int(args[7]) if len(args) > 7 else None
-                if m and n and k:
-                    lat = min(8, max(1, (2 * m * n * k + 65535) // 65536) * scale)
-                else:
-                    lat = min(8, 4 * scale)
+                gemm_cyc = _estimate_dav3510_cube_cycles(args, spaces, tirx)
+                lat = min(8, max(1, gemm_cyc) * scale)
                 clear_val = _static_tirx_int(args[9]) if len(args) > 9 else None
                 c_is_read = clear_val is None or clear_val == 0
                 reads_list: list[str] = []
@@ -2389,11 +2650,12 @@ def _extract_pipelined_loop_tasks(
                 mask = _aiv_mask(
                     "VECTOR", aiv_split_factor=aiv_split_factor, guarded_aiv=cur_guard
                 )
+                vec_cyc = _estimate_dav3510_vec_cycles(op_name, args, tirx, DataTypeCls)
                 tasks.append(
                     _TileLangLoopTask(
                         label="vec",
                         mask=mask,
-                        latency=min(8, scale),
+                        latency=min(8, vec_cyc * scale),
                         reads=tuple(reads),
                         writes=tuple(writes),
                     )
@@ -2403,6 +2665,18 @@ def _extract_pipelined_loop_tasks(
     if aborted[0]:
         return None
     return tasks
+
+
+def _analytical_pipelined_ii(task_items: Sequence[_TileLangLoopTask]) -> int:
+    """Compute analytical steady-state II lower bound (max_pipe_cycle) across overlapped stages."""
+    if not task_items:
+        return 1
+    pipe_totals: dict[tuple[str, str], int] = {}
+    for item in task_items:
+        lat = max(1, int(item.latency))
+        for core_key, pipe_name in item.mask.to_core_pipe_pairs():
+            pipe_totals[(core_key, pipe_name)] = pipe_totals.get((core_key, pipe_name), 0) + lat
+    return max(pipe_totals.values(), default=1)
 
 
 def _try_solve_tilelang_pipelined_ii(
@@ -2496,6 +2770,7 @@ def _try_solve_tilelang_pipelined_ii(
         num_stages = max(1, stages_val if stages_val is not None else 2)
         local_bufs = _collect_local_buf_names(loop.body, tirx=tirx)
         outer_bufs = all_buf_names - local_bufs
+        dynamic_inner = [False]
         task_items = _extract_pipelined_loop_tasks(
             loop.body,
             tirx=tirx,
@@ -2504,10 +2779,14 @@ def _try_solve_tilelang_pipelined_ii(
             sid_vars=sid_vars,
             guarded_aiv=loop_guard,
             spaces=spaces,
+            dynamic_inner_out=dynamic_inner,
         )
         if task_items is None:
             return None
         if not task_items:
+            continue
+        if dynamic_inner[0]:
+            solved_iis.append(_analytical_pipelined_ii(task_items))
             continue
 
         referenced_bufs: set[str] = set()
@@ -2672,7 +2951,8 @@ def _try_solve_tilelang_pipelined_ii(
         try:
             res = solve_ascend_pipeline(problem)
         except (PipelineError, ValueError):
-            return None
+            solved_iis.append(_analytical_pipelined_ii(task_items))
+            continue
         solved_iis.append(res.assignment.ii)
 
     return max(solved_iis) if solved_iis else None
@@ -2918,7 +3198,7 @@ def inspect_tilelang_primfunc(
 
     has_overflow = any(wl.overflow_bytes > 0 for wl in waterlines.values())
     solved_ii: int | None = None
-    if not opaque and not illegal_dma and not has_overflow:
+    if not illegal_dma and not has_overflow and "lowering_rejected" not in opaque:
         solved_ii = _try_solve_tilelang_pipelined_ii(
             entry_fn,
             spaces,
@@ -2929,7 +3209,9 @@ def inspect_tilelang_primfunc(
             unreserved_ubuf=effective_unreserved,
             degraded_names=degraded,
         )
-    analysis_mode = "exact_modulo_z3" if solved_ii is not None else "readonly_envelope"
+    analysis_mode = (
+        "exact_modulo_z3" if (solved_ii is not None and not opaque) else "readonly_envelope"
+    )
     wave_occ = (
         1.0
         if telemetry.grid_is_symbolic
@@ -2937,6 +3219,21 @@ def inspect_tilelang_primfunc(
             telemetry.grid_blocks, spaces, pipe_cycles, effective_aiv_split
         )
     )
+    l1_wl = waterlines.get("L1")
+    effective_l1_risk = telemetry.l1_bank_conflict_risk
+    if l1_wl is not None and l1_wl.peak_allocated_bytes > 0:
+        l1_full = max(1, spaces.l1_bytes)
+        l1_half = max(1, l1_full // 2)
+        if l1_wl.peak_allocated_bytes > l1_half and effective_l1_risk > 0.0:
+            effective_l1_risk = max(
+                effective_l1_risk,
+                round(min(1.0, l1_wl.peak_allocated_bytes / float(l1_full)), 4),
+            )
+        elif len(l1_wl.explicit_buffers) >= 2 and effective_l1_risk > 0.0:
+            effective_l1_risk = max(
+                effective_l1_risk,
+                round(min(0.5, l1_wl.peak_allocated_bytes / float(l1_half)), 4),
+            )
 
     ledger = build_objective_physical_ledger(
         analysis_mode=analysis_mode,
@@ -2965,6 +3262,8 @@ def inspect_tilelang_primfunc(
         has_coupled_reduce_sfu_accum=telemetry.has_coupled_reduce_sfu_accum,
         active_grid_blocks=telemetry.active_grid_blocks,
         in_loop_pipe_all_barriers=telemetry.in_loop_pipe_all_barriers,
+        ub_bank_conflict_risk=telemetry.ub_bank_conflict_risk,
+        l1_bank_conflict_risk=effective_l1_risk,
     )
     return EnvelopeInspectionResult(
         ledger=ledger,
@@ -3462,6 +3761,53 @@ def inspect_tir_envelope(
     wave_occ = _compute_wave_occupancy(
         telemetry.grid_blocks, spaces, pipe_cycles, tir_aiv_split
     )
+    # Compute UB 16-bank and L1 half-bank conflict risks from recorded TileFoundry TIR tensors
+    ub_risk_total = 0
+    ub_risk_conflict = 0
+    def _scan_tir_ub_bank(stmt: Stmt | None) -> None:
+        nonlocal ub_risk_total, ub_risk_conflict
+        if stmt is None:
+            return
+        if isinstance(stmt, Sequential):
+            for ch in stmt.body:
+                _scan_tir_ub_bank(ch)
+            return
+        if isinstance(stmt, LetStmt):
+            tt = stmt.var.type
+            if isinstance(tt, TensorType) and tt.storage is StorageKind.SMEM and len(tt.shape) >= 2:
+                dims = [static_dim_value(d) for d in tt.shape]
+                if all(d is not None and d > 0 for d in dims) and math.prod(dims[:-1]) > 1:
+                    nbytes, inner_b = _tir_tensor_bytes(tt)
+                    if nbytes > 0:
+                        ub_risk_total += nbytes
+                        if inner_b >= 512 and inner_b % 512 == 0:
+                            ub_risk_conflict += nbytes
+            return
+        if isinstance(stmt, (MeshScope, ExecutionScope, For, While)):
+            _scan_tir_ub_bank(stmt.body)
+        elif isinstance(stmt, If):
+            _scan_tir_ub_bank(stmt.then_body)
+            _scan_tir_ub_bank(stmt.else_body)
+
+    _scan_tir_ub_bank(body)
+    tir_ub_risk = (
+        round(min(1.0, ub_risk_conflict / float(ub_risk_total)), 4)
+        if ub_risk_total > 0 and ub_risk_conflict > 0
+        else 0.0
+    )
+    l1_bufs = explicit_by_scope.get("L1", {})
+    l1_total = sum(l1_bufs.values())
+    l1_full = max(1, spaces.l1_bytes)
+    l1_half = max(1, l1_full // 2)
+    if l1_total <= 0:
+        tir_l1_risk = 0.0
+    elif l1_total > l1_half:
+        tir_l1_risk = round(min(1.0, l1_total / float(l1_full)), 4)
+    elif len(l1_bufs) >= 2:
+        tir_l1_risk = round(min(0.5, l1_total / float(l1_half)), 4)
+    else:
+        tir_l1_risk = 0.0
+
     ledger = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
         is_legal=not illegal_dma[0],
@@ -3481,6 +3827,8 @@ def inspect_tir_envelope(
         has_online_rescale_loop=telemetry.has_online_rescale_loop,
         in_loop_ub_reload_stores=telemetry.in_loop_ub_reload_stores,
         uses_unreserved_ubuf=effective_unreserved,
+        ub_bank_conflict_risk=tir_ub_risk,
+        l1_bank_conflict_risk=tir_l1_risk,
     )
     return EnvelopeInspectionResult(
         ledger=ledger,

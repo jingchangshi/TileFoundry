@@ -718,3 +718,155 @@ def test_tilelang_coupled_reduce_sfu_vs_loop_fission() -> None:
     rf = inspect_tilelang_primfunc(fission_fn)
     assert rc.ledger.has_coupled_reduce_sfu_accum is True
     assert rf.ledger.has_coupled_reduce_sfu_accum is False
+
+
+def test_dav3510_calibrated_cycles_bank_conflicts_and_dynamic_pipelined_fallback(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Verify dav-3510 Cube/Vector cycles, UB/L1 bank conflicts, general var_bindings, and analytical II."""
+    import importlib.util
+    import tilelang.ascend.language as T
+    from tilelang.utils.language import DataType as TLDataType
+    from tvm import tirx
+
+    # 1. Calibrated Cube & Vector cycles + hazard penalty on small (<10 fractal blocks) tile
+    @T.prim_func
+    def gemm_bf16_small(
+        A: T.Tensor((32, 64), "bfloat16"),
+        B: T.Tensor((64, 32), "bfloat16"),
+        C: T.Tensor((32, 32), "float32"),
+    ):
+        with T.Kernel(1):
+            a_l1 = T.alloc_l1((32, 64), "bfloat16")
+            b_l1 = T.alloc_l1((64, 32), "bfloat16")
+            c_l0c = T.alloc_l0c((32, 32), "float32")
+            T.copy(A[0:32, 0:64], a_l1)
+            T.copy(B[0:64, 0:32], b_l1)
+            T.gemm(a_l1, b_l1, c_l0c, clear_accum=True)
+            T.copy(c_l0c, C[0:32, 0:32])
+
+    @T.prim_func
+    def gemm_fp8_small(
+        A: T.Tensor((32, 64), "float8_e4m3fn"),
+        B: T.Tensor((64, 32), "float8_e4m3fn"),
+        C: T.Tensor((32, 32), "float32"),
+    ):
+        with T.Kernel(1):
+            a_l1 = T.alloc_l1((32, 64), "float8_e4m3fn")
+            b_l1 = T.alloc_l1((64, 32), "float8_e4m3fn")
+            c_l0c = T.alloc_l0c((32, 32), "float32")
+            T.copy(A[0:32, 0:64], a_l1)
+            T.copy(B[0:64, 0:32], b_l1)
+            T.gemm(a_l1, b_l1, c_l0c, clear_accum=True)
+            T.copy(c_l0c, C[0:32, 0:32])
+
+    r_bf16 = inspect_tilelang_primfunc(gemm_bf16_small, pass_configs={"tl.enable_auto_schedule": False})
+    r_fp8 = inspect_tilelang_primfunc(gemm_fp8_small, pass_configs={"tl.enable_auto_schedule": False})
+    # (32*32*64 / 4096 = 16) + 6 hazard = 22; (32*32*64 / 8192 = 8) + 6 hazard = 14
+    assert r_bf16.ledger.pipe_cycles["AIC.PIPE_M"] == 22
+    assert r_fp8.ledger.pipe_cycles["AIC.PIPE_M"] == 14
+    # 2 L1 buffers in same half-L1 -> non-zero l1_bank_conflict_risk
+    assert 0.0 < r_bf16.ledger.l1_bank_conflict_risk <= 0.5
+
+    # Vector SFU 4x vs non-SFU 1x
+    @T.prim_func
+    def vec_sfu_kernel(X: T.Tensor((4, 64), "float32")):
+        with T.Kernel(1):
+            ub = T.alloc_shared((4, 64), "float32")
+            T.copy(X[0:4, 0:64], ub)
+            with T.SimdVF():
+                m32 = T.simd.pset(32, "PAT_ALL")
+                v = T.simd.vld(ub[0, 0], dist="NORM_B32")
+                e = T.simd.vexp(v, mask=m32)
+                T.simd.vsts(ub[0, 0], e, mask=m32, dist="NORM_B32")
+
+    r_sfu = inspect_tilelang_primfunc(vec_sfu_kernel, pass_configs={"tl.enable_auto_schedule": False})
+    assert r_sfu.ledger.pipe_cycles["AIV0.PIPE_V"] >= 4
+
+    # 2. UB 16-bank conflict (stride_bytes == 512) vs padded (stride_bytes == 544)
+    @T.prim_func
+    def ub_conflict_kernel(X: T.Tensor((16, 128), "float32"), Y: T.Tensor((16, 128), "float32")):
+        with T.Kernel(1):
+            ub = T.alloc_shared((16, 128), "float32")
+            T.copy(X[0:16, 0:128], ub)
+            T.copy(ub, Y[0:16, 0:128])
+
+    @T.prim_func
+    def ub_padded_kernel(X: T.Tensor((16, 136), "float32"), Y: T.Tensor((16, 136), "float32")):
+        with T.Kernel(1):
+            ub = T.alloc_shared((16, 136), "float32")
+            T.copy(X[0:16, 0:136], ub)
+            T.copy(ub, Y[0:16, 0:136])
+
+    r_conf = inspect_tilelang_primfunc(ub_conflict_kernel, pass_configs={"tl.enable_auto_schedule": False})
+    r_pad = inspect_tilelang_primfunc(ub_padded_kernel, pass_configs={"tl.enable_auto_schedule": False})
+    assert r_conf.ledger.ub_bank_conflict_risk == 1.0
+    assert r_pad.ledger.ub_bank_conflict_risk == 0.0
+
+    # 3. Generalized _augment_var_bindings_from_buffers for arbitrary operator dims (M, N, K, H, C, G)
+    sym_src = """
+import tilelang.ascend.language as T
+
+def make_op():
+    M = T.dynamic("M")
+    H = T.dynamic("H")
+    C = T.dynamic("C")
+    @T.prim_func
+    def main(X: T.Tensor((M, H, C), "float32"), Y: T.Tensor((M, H, C), "float32")):
+        with T.Kernel(T.ceildiv(M, 32) * H) as bx:
+            ub = T.alloc_shared((32, 64), "float32")
+            T.copy(X[(bx // H) * 32 : (bx // H) * 32 + 32, bx % H, 0:64], ub)
+            T.copy(ub, Y[(bx // H) * 32 : (bx // H) * 32 + 32, bx % H, 0:64])
+    return main
+"""
+    sym_path = tmp_path / "sym_mhc.py"
+    sym_path.write_text(sym_src, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("_tf_sym_mhc", str(sym_path))
+    assert spec is not None and spec.loader is not None
+    sym_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sym_mod)
+    r_sym = inspect_tilelang_primfunc(
+        sym_mod.make_op(),
+        var_bindings={"M": 128, "H": 4, "C": 64},
+        pass_configs={"tl.enable_auto_schedule": False},
+    )
+    assert r_sym.ledger.grid_is_symbolic is False
+    assert r_sym.ledger.grid_blocks == 4 * 4
+
+    # 4. Analytical pipelined-II fallback on guarded IfThenElse & dynamic inner loop inside static T.Pipelined
+    @T.prim_func
+    def guarded_pipelined_gemm(
+        X: T.Tensor((128, 128), "bfloat16"),
+        W: T.Tensor((128, 128), "bfloat16"),
+        Flag: T.Tensor((4,), "int32"),
+        Y: T.Tensor((128, 128), "float32"),
+    ):
+        with T.Kernel(1):
+            x_l1 = T.alloc_l1((128, 64), "bfloat16")
+            w_l1 = T.alloc_l1((128, 64), "bfloat16")
+            acc = T.alloc_l0c((128, 128), "float32")
+            for kt in T.Pipelined(2, num_stages=2):
+                T.copy(X[0:128, kt * 64 : (kt + 1) * 64], x_l1)
+                T.copy(W[0:128, kt * 64 : (kt + 1) * 64], w_l1)
+                if Flag[kt] > 0:
+                    T.gemm(x_l1, w_l1, acc, transpose_B=True, clear_accum=kt == 0)
+            T.copy(acc, Y[0:128, 0:128])
+
+    spaces = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
+    ana_ii = _try_solve_tilelang_pipelined_ii(
+        guarded_pipelined_gemm,
+        spaces,
+        tirx=tirx,
+        DataTypeCls=TLDataType,
+        aiv_split_factor=1,
+        has_simtvf=False,
+        unreserved_ubuf=False,
+    )
+    assert ana_ii is not None and ana_ii >= 1
+    r_guarded = inspect_tilelang_primfunc(
+        guarded_pipelined_gemm,
+        pass_configs={"tl.enable_auto_schedule": False},
+    )
+    assert "data_dependent_branch" in r_guarded.ledger.opaque_dynamic_regions
+    assert r_guarded.ledger.steady_state_ii == ana_ii
+    assert r_guarded.ledger.analysis_mode == "readonly_envelope"

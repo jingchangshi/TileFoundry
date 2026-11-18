@@ -85,6 +85,8 @@ class ObjectivePhysicalLedger:
     has_coupled_reduce_sfu_accum: bool = False
     active_grid_blocks: int = 0
     in_loop_pipe_all_barriers: int = 0
+    ub_bank_conflict_risk: float = 0.0
+    l1_bank_conflict_risk: float = 0.0
 
     def __post_init__(self) -> None:
         if self.analysis_mode not in ("exact_modulo_z3", "readonly_envelope"):
@@ -156,6 +158,8 @@ class ObjectivePhysicalLedger:
                 payload.get("active_grid_blocks", payload.get("grid_blocks", 1))
             ),
             in_loop_pipe_all_barriers=int(payload.get("in_loop_pipe_all_barriers", 0)),
+            ub_bank_conflict_risk=float(payload.get("ub_bank_conflict_risk", 0.0)),
+            l1_bank_conflict_risk=float(payload.get("l1_bank_conflict_risk", 0.0)),
         )
 
 
@@ -226,6 +230,8 @@ def build_objective_physical_ledger(
     has_coupled_reduce_sfu_accum: bool = False,
     active_grid_blocks: int | None = None,
     in_loop_pipe_all_barriers: int = 0,
+    ub_bank_conflict_risk: float = 0.0,
+    l1_bank_conflict_risk: float = 0.0,
 ) -> ObjectivePhysicalLedger:
     """Assemble an ObjectivePhysicalLedger and derive the dominant pipe."""
     cleaned_pipes = dict(sorted(pipe_cycles.items()))
@@ -261,6 +267,8 @@ def build_objective_physical_ledger(
         has_coupled_reduce_sfu_accum=bool(has_coupled_reduce_sfu_accum),
         active_grid_blocks=resolved_active,
         in_loop_pipe_all_barriers=int(in_loop_pipe_all_barriers),
+        ub_bank_conflict_risk=min(1.0, max(0.0, float(ub_bank_conflict_risk))),
+        l1_bank_conflict_risk=min(1.0, max(0.0, float(l1_bank_conflict_risk))),
     )
 
 

@@ -39,7 +39,7 @@ from tilefoundry.visitor_registry.verify import verify_prim_function
 from tilefoundry_ascend.ascend.ir.tir.instructions import AscendMmad
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.schedule.envelope_inspector import inspect_tir_envelope
-from tilefoundry_ascend.ascend.target import AscendTarget
+from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
 _SPECIAL_VECTOR_OP_EQUIV = 8
 
@@ -610,6 +610,49 @@ def _split_cube_and_vector_work(
     )
 
 
+_CUBE_DTYPE_ALIASES: dict[str, str] = {
+    "fp16": "f16",
+    "float16": "f16",
+    "bfloat16": "bf16",
+    "fp32": "f32",
+    "float32": "f32",
+    "fp8": "fp8e4m3",
+    "float8_e4m3fn": "fp8e4m3",
+    "float8_e5m2": "fp8e5m2",
+    "hifp8": "hif8",
+    "int8": "i8",
+    "uint8": "u8",
+    "fp4": "f4e2m1",
+    "mxfp4": "f4e2m1",
+    "float4_e2m1fn": "f4e2m1",
+}
+
+
+def _resolve_aic_rate(
+    dtype_name: str,
+    aic_rates: Mapping[DType, int],
+    *,
+    spaces: AscendSpaceFacts,
+    aic_bf16_rate: int | float,
+    fallback_rate: int | float,
+) -> float:
+    """Resolve AIC FLOP/s for *dtype_name* with dav-3510 precision scaling vs BF16."""
+    dt = getattr(DType, dtype_name, None)
+    direct = aic_rates.get(dt) if dt is not None else None
+    if direct is not None and direct > 0:
+        return float(direct)
+    norm_key = _CUBE_DTYPE_ALIASES.get(dtype_name.strip().lower(), dtype_name.strip().lower())
+    if aic_bf16_rate and aic_bf16_rate > 0:
+        try:
+            bf16_macs = float(spaces.cube_macs_per_cycle("bf16"))
+            macs = float(spaces.cube_macs_per_cycle(norm_key))
+            if bf16_macs > 0.0 and macs > 0.0:
+                return float(aic_bf16_rate) * (macs / bf16_macs)
+        except ValueError:
+            pass
+    return float(fallback_rate)
+
+
 def _compute_roofline_summary(
     checked_mod: Module,
     checked_fn,
@@ -656,16 +699,26 @@ def _compute_roofline_summary(
     )
     aiv_service_rate = int(getattr(dev, "aiv_lane_events_per_second", 0)) or aiv_vec_rate
 
+    spaces = target.get_facts(AscendSpaceFacts)
+    aic_bf16_rate = (
+        aic_rates.get(DType.bf16)
+        or aic_rates.get(DType.f16)
+        or aic_fallback
+    )
+
     cube_floor_s = 0.0
     for dtype_name, flop_count in cube_flops_by_dtype.items():
         if flop_count <= 0:
             continue
-        dt = getattr(DType, dtype_name, None)
-        rate = aic_rates.get(dt) if dt is not None else None
-        if rate is None or rate <= 0:
-            rate = aic_fallback or aiv_vec_rate
-        if rate and rate > 0:
-            cube_floor_s += flop_count / float(rate)
+        rate = _resolve_aic_rate(
+            dtype_name,
+            aic_rates,
+            spaces=spaces,
+            aic_bf16_rate=aic_bf16_rate,
+            fallback_rate=aic_fallback or aiv_vec_rate,
+        )
+        if rate > 0.0:
+            cube_floor_s += flop_count / rate
 
     vec_floor_s = 0.0
     for dtype_name, flop_count in vec_flops_by_dtype.items():

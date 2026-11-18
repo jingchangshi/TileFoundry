@@ -439,3 +439,33 @@ def test_pure_vector_and_transcendental_roofline_ownership() -> None:
     assert m_rf.cube_flops > 0
     assert m_rf.vector_flops > 0
     assert m_rf.compute_floor_us == max(m_rf.cube_floor_us, m_rf.vec_floor_us)
+
+
+def test_dtype_aware_cube_floor_precision_scaling() -> None:
+    """Verify dav-3510 Cube roofline scales FP8 (2x), MXFP4 (4x), and pure FP32 (1/16x) vs BF16."""
+    target = AscendTarget("ascend.950pr")
+
+    def _make_matmul_src(dtype_name: str, out_dtype: str) -> str:
+        return (
+            "from __future__ import annotations\n"
+            "from tilefoundry.dsl import *\n"
+            "from tilefoundry_ascend import AscendTarget\n"
+            "TOPOS = (Topology('block', 1), Topology('aic', 1), "
+            "Topology('aiv', 2), Topology('lane', 64))\n"
+            "@module(entry='mm', target=AscendTarget('ascend.950pr'), topologies=TOPOS)\n"
+            "class MmMod:\n"
+            "    @func\n"
+            f"    def mm(a: Tensor[(64, 128), '{dtype_name}'], "
+            f"b: Tensor[(128, 64), '{dtype_name}']) -> Tensor[(64, 64), '{out_dtype}']:\n"
+            f"        return tf.matmul(a, b, out_dtype='{out_dtype}')\n"
+        )
+
+    bf16_rf = compile_hir_navigation_packet(_make_matmul_src("bf16", "f32"), target=target).roofline
+    fp8_rf = compile_hir_navigation_packet(_make_matmul_src("fp8e4m3", "f32"), target=target).roofline
+    fp4_rf = compile_hir_navigation_packet(_make_matmul_src("f4e2m1", "f32"), target=target).roofline
+    fp32_rf = compile_hir_navigation_packet(_make_matmul_src("f32", "f32"), target=target).roofline
+
+    assert bf16_rf.cube_floor_us > 0.0
+    assert abs(fp8_rf.cube_floor_us * 2.0 - bf16_rf.cube_floor_us) < 1e-12
+    assert abs(fp4_rf.cube_floor_us * 4.0 - bf16_rf.cube_floor_us) < 1e-12
+    assert abs(fp32_rf.cube_floor_us - bf16_rf.cube_floor_us * 16.0) < 1e-12

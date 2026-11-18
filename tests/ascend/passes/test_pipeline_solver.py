@@ -512,3 +512,196 @@ class M:
         _collect_pipelined_loops(fn1)[0], fn_stmt=fn1.body, unreserved_ubuf=True
     )
     assert {(c.space, c.owner): c.bytes for c in prob_unres.capacities}[("UB", "aiv")] == 256 * 1024
+
+
+def test_sil_policy_override_shadow_dump_and_automatic_fallback(
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verify SIL policy overrides (L1/L0C/UB-256KB), shadow_dump_path, and automatic fallback."""
+    import json
+    from tilefoundry_ascend.ascend.schedule.pipeline_solver import _op_resource_mask
+    from tilefoundry_ascend.ascend.ir.tir.instructions import AscendDualCopyL0cToUb
+    from tilefoundry_ascend.ascend.target import NodeResourceMask
+
+    monkeypatch.chdir(tmp_path)
+
+    # 1. dav-3510 L0C->UB uses AIC.FIXPIPE writing directly to dual AIV UB (no AIV.MTE2)
+    mask = _op_resource_mask(AscendDualCopyL0cToUb(), (None, None))
+    assert mask == NodeResourceMask.for_aic("FIXPIPE")
+
+    # 2. Valid SIL policy override + shadow dump path (no root envelope.json)
+    facts = _target().get_facts(AscendSpaceFacts)
+    problem = Problem(
+        tasks=(
+            Task(name="load", resources=(("aiv", "aiv0", "mte2", 1),), latency=1, stage=0),
+            Task(name="vec", resources=(("aiv", "aiv0", "vector", 1),), latency=1, stage=1),
+        ),
+        buffers=(
+            Buffer(name="ub_big", slot_bytes=252 * 1024, space="UB", owner="aiv", fixed=1),
+            Buffer(name="l1_buf", slot_bytes=64 * 1024, space="L1", owner="aic", auto_min=1, auto_max=2),
+            Buffer(name="l0c_buf", slot_bytes=32 * 1024, space="L0C", owner="aic", auto_min=1, auto_max=2),
+        ),
+        edges=(Edge(src="load", dst="vec", distance=0, latency=1),),
+        reuses=(
+            Reuse(buffer="ub_big", last_reader="vec", next_writer="load", delta=0, read_latency=1),
+            Reuse(buffer="l1_buf", last_reader="vec", next_writer="load", delta=0, read_latency=1),
+        ),
+        resources=_vector_resources(),
+        capacities=(
+            Capacity(space="UB", owner="aiv", bytes=facts.ub_simdvf_usable_bytes),
+            Capacity(space="L1", owner="aic", bytes=facts.l1_bytes),
+            Capacity(space="L0C", owner="aic", bytes=facts.l0c_bytes),
+        ),
+        max_stage=1,
+        manual=True,
+    )
+    shadow_file = tmp_path / "shadow" / "solved.json"
+    res = solve_ascend_pipeline(
+        problem,
+        sil_policy={"ub_256kb_unlock": True, "l1_stages": 2, "l0c_buffers": 2},
+        shadow_dump_path=shadow_file,
+    )
+    assert res.fallback_used is False
+    assert res.buffer_versions["l1_buf"] == 2
+    assert res.buffer_versions["l0c_buf"] == 2
+    assert shadow_file.is_file()
+    shadow_data = json.loads(shadow_file.read_text(encoding="utf-8"))
+    assert shadow_data["ii"] == res.assignment.ii
+    assert shadow_data["fallback_used"] is False
+    assert not pathlib.Path("envelope.json").exists()
+
+    # 3. Over-capacity SIL policy triggers automatic fallback to deterministic solver
+    fallback_prob = Problem(
+        tasks=(
+            Task(name="load", resources=(("aiv", "aiv0", "mte2", 1),), latency=1, stage=0),
+            Task(name="vec", resources=(("aiv", "aiv0", "vector", 1),), latency=1, stage=1),
+        ),
+        buffers=(
+            Buffer(name="l1_buf", slot_bytes=128 * 1024, space="L1", owner="aic", auto_min=1, auto_max=2),
+        ),
+        edges=(Edge(src="load", dst="vec", distance=0, latency=1),),
+        reuses=(Reuse(buffer="l1_buf", last_reader="vec", next_writer="load", delta=0, read_latency=1),),
+        resources=_vector_resources(),
+        capacities=(Capacity(space="L1", owner="aic", bytes=facts.l1_bytes),),
+        max_stage=1,
+        manual=True,
+    )
+    fb_res = solve_ascend_pipeline(fallback_prob, sil_policy={"l1_stages": 8})
+    assert fb_res.fallback_used is True
+    assert "UNSAT" in fb_res.fallback_reason or "CAPACITY" in fb_res.fallback_reason
+    assert 1 <= fb_res.buffer_versions["l1_buf"] <= 2
+
+
+def test_sil_l1_slot_aliasing_saves_capacity_and_rejects_overlap():
+    """Verify MLA K_rope -> P L1 slot aliasing rescues capacity and falls back on overlap."""
+    facts = _target().get_facts(AscendSpaceFacts)
+    # K_rope (256KB) + P (256KB) with double-buffering or tight 384KB budget overflows unless aliased
+    problem = Problem(
+        tasks=(
+            Task(name="load_k_rope", resources=(("aic", "aic0", "mte2", 1),), latency=1, stage=0),
+            Task(name="mmad_qk", resources=(("aic", "aic0", "cube", 1),), latency=1, stage=0),
+            Task(name="dual_p", resources=(("aic", "aic0", "fixpipe", 1),), latency=1, stage=0),
+            Task(name="mmad_pv", resources=(("aic", "aic0", "cube", 1),), latency=1, stage=0),
+        ),
+        buffers=(
+            Buffer(name="l1_k_rope", slot_bytes=256 * 1024, space="L1", owner="aic", fixed=1),
+            Buffer(name="l1_p", slot_bytes=256 * 1024, space="L1", owner="aic", fixed=1),
+        ),
+        edges=(
+            Edge(src="load_k_rope", dst="mmad_qk", distance=0, latency=1),
+            Edge(src="mmad_qk", dst="dual_p", distance=0, latency=1),
+            Edge(src="dual_p", dst="mmad_pv", distance=0, latency=1),
+        ),
+        reuses=(
+            Reuse(buffer="l1_k_rope", last_reader="mmad_qk", next_writer="load_k_rope", delta=0, read_latency=1),
+            Reuse(buffer="l1_p", last_reader="mmad_pv", next_writer="dual_p", delta=0, read_latency=1),
+        ),
+        resources=_mix_resources(),
+        capacities=(Capacity(space="L1", owner="aic", bytes=300 * 1024),),
+        max_stage=0,
+        manual=False,
+    )
+    # Without aliasing: 256KB + 256KB > 300KB -> UNSAT
+    with pytest.raises(PipelineError, match="ASCEND_PIPELINE_UNSAT"):
+        solve_ascend_pipeline(problem)
+
+    # With L1 slot aliasing K_rope -> P: fits in 300KB!
+    res = solve_ascend_pipeline(problem, sil_policy={"l1_slot_aliasing": {"l1_p": "l1_k_rope"}})
+    assert res.fallback_used is False
+    assert verify_assignment(res.problem, res.assignment) == []
+    slot_map = {b.name: b.slot_bytes for b in res.problem.buffers}
+    assert slot_map["l1_k_rope"] == 256 * 1024
+    assert slot_map["l1_p"] == 0
+
+    # Illegal overlap: dual_p writes P in stage 0 BEFORE mmad_qk reads K_rope in stage 2
+    bad_prob = Problem(
+        tasks=(
+            Task(name="load_k_rope", resources=(("aic", "aic0", "mte2", 1),), latency=1, stage=0),
+            Task(name="dual_p", resources=(("aic", "aic0", "fixpipe", 1),), latency=1, stage=0),
+            Task(name="mmad_qk", resources=(("aic", "aic0", "cube", 1),), latency=1, stage=2),
+            Task(name="mmad_pv", resources=(("aic", "aic0", "cube", 1),), latency=1, stage=3),
+        ),
+        buffers=(
+            Buffer(name="l1_k_rope", slot_bytes=64 * 1024, space="L1", owner="aic", auto_min=1, auto_max=4),
+            Buffer(name="l1_p", slot_bytes=64 * 1024, space="L1", owner="aic", auto_min=1, auto_max=4),
+        ),
+        edges=(
+            Edge(src="load_k_rope", dst="mmad_qk", distance=0, latency=1),
+            Edge(src="dual_p", dst="mmad_pv", distance=0, latency=1),
+        ),
+        reuses=(
+            Reuse(buffer="l1_k_rope", last_reader="mmad_qk", next_writer="load_k_rope", delta=0, read_latency=1),
+            Reuse(buffer="l1_p", last_reader="mmad_pv", next_writer="dual_p", delta=0, read_latency=1),
+        ),
+        resources=_mix_resources(),
+        capacities=(Capacity(space="L1", owner="aic", bytes=facts.l1_bytes),),
+        max_stage=3,
+        manual=True,
+    )
+    bad_res = solve_ascend_pipeline(bad_prob, sil_policy={"l1_slot_aliasing": {"l1_p": "l1_k_rope"}})
+    assert bad_res.fallback_used is True
+
+
+def test_extract_tir_loop_problem_dynamic_fallback_with_dim_hints():
+    """Verify allow_dynamic_fallback + dim_hints evaluates symbolic DimVar buffer shapes."""
+    from tilefoundry.ir.core import Call, Constant, Var
+    from tilefoundry.ir.tir.memory import AllocTensor
+    from tilefoundry.ir.tir.stmts import Evaluate, For, LetStmt, Sequential
+    from tilefoundry.ir.types import DType, StorageKind, TensorType
+    from tilefoundry.ir.types.dim import DimVar
+    from tilefoundry_ascend.ascend.ir.tir.instructions import AscendGmToUb, AscendUbToGm
+
+    d_dyn = DimVar("N_dyn", 16, 512)
+    gm_ty = TensorType((4, d_dyn), DType.f16, None, StorageKind.GMEM)
+    ub_ty = TensorType((d_dyn,), DType.f16, None, StorageKind.SMEM)
+    sc = TensorType.umat_scalar()
+    k = Var("k", type=sc)
+    gm_in = Var("gm_in", type=gm_ty)
+    gm_out = Var("gm_out", type=gm_ty)
+    ub_var = Var("ub_buf", type=ub_ty)
+
+    alloc = LetStmt(ub_var, Call(AllocTensor(tensor_type=ub_ty), (), type=ub_ty))
+    load = Evaluate(AscendGmToUb(), (gm_in, ub_var))
+    store = Evaluate(AscendUbToGm(), (ub_var, gm_out))
+    loop = For(
+        k,
+        Constant(0, type=sc),
+        Constant(4, type=sc),
+        Constant(1, type=sc),
+        Sequential((alloc, load, store)),
+        pipeline=PipelineSpec(max_stage=1, max_buffer_versions=2, enable_offset=True),
+    )
+
+    with pytest.raises(PipelineError, match="ASCEND_DYNAMIC_PIPELINE_BUFFER"):
+        extract_tir_loop_problem(loop)
+
+    problem, _ = extract_tir_loop_problem(
+        loop,
+        dim_hints={"N_dyn": 128},
+        allow_dynamic_fallback=True,
+    )
+    buf = next(b for b in problem.buffers if b.name == "ub_buf")
+    assert buf.slot_bytes == 256
+    res = solve_ascend_pipeline(problem)
+    assert res.assignment.ii >= 1

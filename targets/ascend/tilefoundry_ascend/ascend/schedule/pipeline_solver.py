@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+import json
+import logging
+from pathlib import Path
+import time
+import uuid
+
 
 from tilefoundry.ir.core import Call, Expr, Op, Var
 from tilefoundry.ir.core.param_def import MemoryEffect, collect_param_defs
@@ -21,6 +27,17 @@ from tilefoundry.ir.tir.stmts import (
     While,
 )
 from tilefoundry.ir.types import StorageKind, TensorType, TupleType
+from tilefoundry.ir.types.dim import (
+    DimAdd,
+    DimConst,
+    DimFloorDiv,
+    DimMax,
+    DimMin,
+    DimMod,
+    DimMul,
+    DimSub,
+    DimVar,
+)
 from tilefoundry.ir.types.layout import size as layout_size
 from tilefoundry.ir.types.mesh import levels as mesh_levels
 from tilefoundry.ir.types.utils import static_dim_value
@@ -85,6 +102,74 @@ _PIPE_TO_LEDGER: dict[str, str] = {
     "SCALAR": "PIPE_S",
     "S": "PIPE_S",
 }
+
+try:
+    from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirRooflineSummary
+    _HAS_HIR_BRIDGE = True
+except ImportError:
+    _HAS_HIR_BRIDGE = False
+    HirRooflineSummary = None
+
+
+def read_from_sil(path: str) -> dict | None:
+    """Read and parse a SIL packet from a file, returning the parsed dict or None on failure."""
+    try:
+        p = Path(path)
+        if not p.exists():
+            logging.warning(f"SIL packet not found at {path}")
+            return fallback_from_sil(path)
+        with open(p, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        logging.error(f"Failed to read/parse SIL packet from {path}: {e}")
+        return fallback_from_sil(path)
+
+
+
+@dataclass(frozen=True)
+class _FallbackRooflineSummary:
+    path: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "anchor_dims": {},
+            "requested_anchor_dims": {},
+            "resolved_hir_dims": {},
+            "shape_exact_match": False,
+            "fallback_reason": f"sil_read_fallback_at_{self.path}",
+            "compute_flops": 0,
+            "cube_flops": 0,
+            "vector_flops": 0,
+            "special_ops": 0,
+            "min_gm_bytes": 0,
+            "arithmetic_intensity": 0.0,
+            "compute_floor_us": 0.0,
+            "cube_floor_us": 0.0,
+            "vec_floor_us": 0.0,
+            "memory_floor_us": 0.0,
+            "ideal_roofline_us": 0.0,
+            "dominant_bound": "none",
+        }
+
+
+def fallback_from_sil(path: str) -> dict | None:
+    """Fallback heuristic when SIL packet is unavailable or corrupted."""
+    logging.info(f"Falling back for SIL packet at {path}")
+    if _HAS_HIR_BRIDGE:
+        fallback = HirRooflineSummary(
+            anchor_dims={},
+            compute_flops=0,
+            min_gm_bytes=0,
+            arithmetic_intensity=0.0,
+            compute_floor_us=0.0,
+            memory_floor_us=0.0,
+            ideal_roofline_us=0.0,
+            dominant_bound="none",
+            fallback_reason=f"sil_read_fallback_at_{path}",
+        )
+        return fallback.to_dict()
+    return _FallbackRooflineSummary(path).to_dict()
+
 
 
 def format_pipe_key(core: str, pipe: str) -> str:
@@ -152,6 +237,9 @@ class AscendPipelineResult:
     assignment: Assignment
     task_stages: dict[str, int]
     buffer_versions: dict[str, int]
+    fallback_used: bool = False
+    fallback_reason: str = ""
+    applied_sil_policy: dict[str, object] | None = None
 
     @property
     def task_masks(self) -> dict[str, NodeResourceMask]:
@@ -172,16 +260,80 @@ def _align_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _eval_dim_with_hints(
+    dim: object,
+    *,
+    dim_hints: Mapping[str, int] | None = None,
+    allow_dynamic_fallback: bool = False,
+) -> int | None:
+    """Evaluate a static or symbolic dimension using optional regime dim hints."""
+    static = static_dim_value(dim)
+    if static is not None:
+        return static
+    if dim_hints is None and not allow_dynamic_fallback:
+        return None
+    if isinstance(dim, DimVar):
+        if dim_hints and dim.name in dim_hints:
+            return int(dim_hints[dim.name])
+        if allow_dynamic_fallback:
+            return max(1, int(dim.hi))
+        return None
+    if isinstance(dim, Var):
+        if dim_hints and dim.name in dim_hints:
+            return int(dim_hints[dim.name])
+        if allow_dynamic_fallback:
+            return 1
+        return None
+    if isinstance(dim, Call):
+        target = dim.target
+        if isinstance(target, DimConst):
+            return int(target.value)
+        if isinstance(target, DimVar):
+            if dim_hints and target.name in dim_hints:
+                return int(dim_hints[target.name])
+            if allow_dynamic_fallback:
+                return max(1, int(target.hi))
+            return None
+        if len(dim.args) == 2:
+            lhs = _eval_dim_with_hints(
+                dim.args[0], dim_hints=dim_hints, allow_dynamic_fallback=allow_dynamic_fallback
+            )
+            rhs = _eval_dim_with_hints(
+                dim.args[1], dim_hints=dim_hints, allow_dynamic_fallback=allow_dynamic_fallback
+            )
+            if lhs is None or rhs is None:
+                return None
+            if isinstance(target, DimAdd):
+                return lhs + rhs
+            if isinstance(target, DimSub):
+                return lhs - rhs
+            if isinstance(target, DimMul):
+                return lhs * rhs
+            if isinstance(target, DimFloorDiv):
+                return lhs // rhs if rhs != 0 else None
+            if isinstance(target, DimMod):
+                return lhs % rhs if rhs != 0 else None
+            if isinstance(target, DimMin):
+                return min(lhs, rhs)
+            if isinstance(target, DimMax):
+                return max(lhs, rhs)
+    return None
+
+
 def _tensor_byte_size(
     tensor_type: TensorType,
     space: str,
     facts: AscendSpaceFacts,
     *,
     aiv_factor: int = 1,
+    dim_hints: Mapping[str, int] | None = None,
+    allow_dynamic_fallback: bool = False,
 ) -> int:
     total = 1
     for dim in tensor_type.shape:
-        extent = static_dim_value(dim)
+        extent = _eval_dim_with_hints(
+            dim, dim_hints=dim_hints, allow_dynamic_fallback=allow_dynamic_fallback
+        )
         if extent is None or extent < 1:
             raise PipelineError(
                 "ASCEND_DYNAMIC_PIPELINE_BUFFER",
@@ -201,32 +353,57 @@ def _tensor_byte_size(
     return _align_up(raw_bytes, align)
 
 
-def _static_tensor_elems(tensor_type: TensorType | None) -> int:
+def _static_tensor_elems(
+    tensor_type: TensorType | None,
+    *,
+    dim_hints: Mapping[str, int] | None = None,
+    allow_dynamic_fallback: bool = False,
+) -> int:
     if tensor_type is None:
         return 0
     total = 1
     for dim in tensor_type.shape:
-        extent = static_dim_value(dim)
+        extent = _eval_dim_with_hints(
+            dim, dim_hints=dim_hints, allow_dynamic_fallback=allow_dynamic_fallback
+        )
         if extent is None or extent < 1:
             return 0
         total *= extent
     return total
 
 
-def _static_tensor_bytes(tensor_type: TensorType | None) -> int:
-    elems = _static_tensor_elems(tensor_type)
+def _static_tensor_bytes(
+    tensor_type: TensorType | None,
+    *,
+    dim_hints: Mapping[str, int] | None = None,
+    allow_dynamic_fallback: bool = False,
+) -> int:
+    elems = _static_tensor_elems(
+        tensor_type, dim_hints=dim_hints, allow_dynamic_fallback=allow_dynamic_fallback
+    )
     if elems <= 0 or tensor_type is None:
         return 0
     return (elems * tensor_type.dtype.bit_width + 7) // 8
 
 
-def _estimate_task_latency(item: _LoopTaskItem) -> int:
+def _estimate_task_latency(
+    item: _LoopTaskItem,
+    *,
+    dim_hints: Mapping[str, int] | None = None,
+    allow_dynamic_fallback: bool = False,
+) -> int:
     """Estimate normalized hardware cycle quanta (1..8) from DMA bytes, MMAD FLOPs, or VF ops."""
     if item.label in ("simdvf", "simtvf"):
         total_elems = 0
         for _op, args in item.calls:
             op_elems = max(
-                (_static_tensor_elems(arg.type) for arg in args if isinstance(arg.type, TensorType)),
+                (
+                    _static_tensor_elems(
+                        arg.type, dim_hints=dim_hints, allow_dynamic_fallback=allow_dynamic_fallback
+                    )
+                    for arg in args
+                    if isinstance(arg.type, TensorType)
+                ),
                 default=0,
             )
             total_elems += op_elems
@@ -238,9 +415,21 @@ def _estimate_task_latency(item: _LoopTaskItem) -> int:
         if isinstance(op, AscendMmad) and len(arg_types) >= 3:
             lhs, rhs = arg_types[1], arg_types[2]
             if lhs is not None and rhs is not None and len(lhs.shape) >= 2 and len(rhs.shape) >= 2:
-                m = static_dim_value(lhs.shape[-2] if op.a_layout == "MK" else lhs.shape[-1])
-                k = static_dim_value(lhs.shape[-1] if op.a_layout == "MK" else lhs.shape[-2])
-                n = static_dim_value(rhs.shape[-2] if op.b_layout == "NK" else rhs.shape[-1])
+                m = _eval_dim_with_hints(
+                    lhs.shape[-2] if op.a_layout == "MK" else lhs.shape[-1],
+                    dim_hints=dim_hints,
+                    allow_dynamic_fallback=allow_dynamic_fallback,
+                )
+                k = _eval_dim_with_hints(
+                    lhs.shape[-1] if op.a_layout == "MK" else lhs.shape[-2],
+                    dim_hints=dim_hints,
+                    allow_dynamic_fallback=allow_dynamic_fallback,
+                )
+                n = _eval_dim_with_hints(
+                    rhs.shape[-2] if op.b_layout == "NK" else rhs.shape[-1],
+                    dim_hints=dim_hints,
+                    allow_dynamic_fallback=allow_dynamic_fallback,
+                )
                 if m and k and n:
                     flops = 2 * m * n * k
                     total_quanta += max(1, (flops + 65535) // 65536)
@@ -263,10 +452,26 @@ def _estimate_task_latency(item: _LoopTaskItem) -> int:
                 AscendDualCopyUbToL1,
             ),
         ):
-            xfer_bytes = max((_static_tensor_bytes(t) for t in arg_types), default=0)
+            xfer_bytes = max(
+                (
+                    _static_tensor_bytes(
+                        t, dim_hints=dim_hints, allow_dynamic_fallback=allow_dynamic_fallback
+                    )
+                    for t in arg_types
+                ),
+                default=0,
+            )
             total_quanta += max(1, (xfer_bytes + 16383) // 16384)
             continue
-        elems = max((_static_tensor_elems(t) for t in arg_types), default=0)
+        elems = max(
+            (
+                _static_tensor_elems(
+                    t, dim_hints=dim_hints, allow_dynamic_fallback=allow_dynamic_fallback
+                )
+                for t in arg_types
+            ),
+            default=0,
+        )
         total_quanta += max(1, (elems + 4095) // 4096)
     return min(max(1, total_quanta), 8)
 
@@ -295,6 +500,9 @@ def _op_resource_mask(
     if resource == "dual_copy_engine":
         if isinstance(op, AscendDualCopyUbToL1):
             return NodeResourceMask.for_aic("MTE1") | NodeResourceMask.for_dual_aiv("MTE3")
+        if isinstance(op, AscendDualCopyL0cToUb):
+            # On dav-3510, L0C->UB uses AIC.FIXPIPE writing directly into dual AIV UB.
+            return NodeResourceMask.for_aic("FIXPIPE")
         return NodeResourceMask.for_aic("FIXPIPE") | NodeResourceMask.for_dual_aiv("MTE2")
     if resource == "vector_engine":
         return NodeResourceMask.for_core(aiv_core, "VECTOR")
@@ -690,6 +898,10 @@ def extract_tir_loop_problem(
     target: AscendTarget | None = None,
     fn_stmt: Stmt | None = None,
     unreserved_ubuf: bool = False,
+    sil_policy: Mapping[str, object] | object | None = None,
+    shadow_dump_path: str | Path | None = None,
+    dim_hints: Mapping[str, int] | None = None,
+    allow_dynamic_fallback: bool = False,
 ) -> tuple[Problem, dict[str, int]]:
     """Build a Z3 pipeline Problem and initial stage map from a TIR For loop."""
     spec = loop.pipeline
@@ -698,6 +910,7 @@ def extract_tir_loop_problem(
     resolved_target = target or AscendTarget("ascend.950pr")
     validate_pipeline_spec(spec, resolved_target)
     facts = resolved_target.get_facts(AscendSpaceFacts)
+    policy_dict = _coerce_sil_policy(sil_policy)
 
     aliases: dict[int, tuple[str, TensorType]] = {}
     outer_buffers: set[str] = set()
@@ -735,7 +948,11 @@ def extract_tir_loop_problem(
         latency = (
             intent.cost_override
             if (intent and intent.cost_override is not None)
-            else _estimate_task_latency(item)
+            else _estimate_task_latency(
+                item,
+                dim_hints=dim_hints,
+                allow_dynamic_fallback=allow_dynamic_fallback,
+            )
         )
         authored_stage = intent.stage if intent else None
         task_latency_by_name[t_name] = latency
@@ -872,7 +1089,14 @@ def extract_tir_loop_problem(
         else:
             space = _infer_tmem_space(buffer_roles.get(buf_name, set()))
         owner = (sched.owner if sched is not None and sched.owner else _space_owner(space))
-        slot_bytes = _tensor_byte_size(buf_type, space, facts, aiv_factor=aiv_factor)
+        slot_bytes = _tensor_byte_size(
+            buf_type,
+            space,
+            facts,
+            aiv_factor=aiv_factor,
+            dim_hints=dim_hints,
+            allow_dynamic_fallback=allow_dynamic_fallback,
+        )
         if sched is not None:
             if sched.versions[0] == "fixed":
                 buffers.append(
@@ -939,7 +1163,8 @@ def extract_tir_loop_problem(
                 issue_after.append((after_id, intent.task_id))
 
     has_simtvf = _contains_simtvf(fn_stmt if fn_stmt is not None else loop.body)
-    unreserved = unreserved_ubuf or spec.origin == "simdvf_unreserved"
+    policy_ub_unlock = bool(policy_dict.get("ub_256kb_unlock", False)) if policy_dict else False
+    unreserved = unreserved_ubuf or spec.origin == "simdvf_unreserved" or policy_ub_unlock
     problem = tf_adapter(
         {
             "tasks": tuple(tasks),
@@ -957,6 +1182,44 @@ def extract_tir_loop_problem(
             "issue_after": tuple(issue_after),
         }
     )
+    if policy_dict is not None:
+        try:
+            problem = _apply_sil_policy_to_problem(problem, policy_dict)
+        except PipelineError:
+            pass
+    if shadow_dump_path is not None:
+        _write_shadow_dump(
+            shadow_dump_path,
+            {
+                "kind": "extracted_problem",
+                "tasks": [
+                    {
+                        "name": t.name,
+                        "latency": t.latency,
+                        "stage": t.stage,
+                        "resources": [list(u) for u in t.resources],
+                    }
+                    for t in problem.tasks
+                ],
+                "buffers": [
+                    {
+                        "name": b.name,
+                        "space": b.space,
+                        "owner": b.owner,
+                        "slot_bytes": b.slot_bytes,
+                        "fixed": b.fixed,
+                        "auto_min": b.auto_min,
+                        "auto_max": b.auto_max,
+                    }
+                    for b in problem.buffers
+                ],
+                "capacities": [
+                    {"space": c.space, "owner": c.owner, "bytes": c.bytes}
+                    for c in problem.capacities
+                ],
+                "sil_policy": policy_dict,
+            },
+        )
     return problem, assigned_stages
 
 
@@ -982,14 +1245,179 @@ def _verify_bitwise_mask_schedule(problem: Problem, assignment: Assignment) -> l
     return problems
 
 
-def solve_ascend_pipeline(
+def _coerce_sil_policy(sil_policy: Mapping[str, object] | object | None) -> dict[str, object] | None:
+    """Normalize a SIL SchedulePolicy object or Mapping into a plain dictionary."""
+    if sil_policy is None:
+        return None
+    if isinstance(sil_policy, Mapping):
+        return dict(sil_policy)
+    to_dict = getattr(sil_policy, "to_dict", None)
+    if callable(to_dict):
+        res = to_dict()
+        if isinstance(res, Mapping):
+            return dict(res)
+    keys = (
+        "regime_tag",
+        "topology_axes",
+        "tile_mnk",
+        "l1_stages",
+        "l1_half_bank_split",
+        "l1_slot_aliasing",
+        "l0c_buffers",
+        "ub_256kb_unlock",
+        "vector_mode",
+    )
+    out: dict[str, object] = {}
+    for key in keys:
+        if hasattr(sil_policy, key):
+            out[key] = getattr(sil_policy, key)
+    return out
+
+
+def _write_shadow_dump(shadow_dump_path: str | Path | None, payload: dict[str, object]) -> None:
+    if shadow_dump_path is None:
+        return
+    path = Path(shadow_dump_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _resolve_aliased_l1_name(query: str, l1_names: set[str]) -> str | None:
+    if query in l1_names:
+        return query
+    q_lower = query.lower()
+    exact_ci = [n for n in l1_names if n.lower() == q_lower]
+    if len(exact_ci) == 1:
+        return exact_ci[0]
+    suffix = [n for n in l1_names if n.lower().endswith(f"_{q_lower}") or q_lower in n.lower()]
+    if len(suffix) == 1:
+        return suffix[0]
+    return None
+
+
+def _apply_sil_policy_to_problem(problem: Problem, policy: Mapping[str, object]) -> Problem:
+    """Project SIL policy overrides (L1 stages, L0C buffers, 256KB UB, L1 aliasing) onto Problem."""
+    l1_stages = policy.get("l1_stages")
+    l0c_buffers = policy.get("l0c_buffers")
+    ub_256kb_unlock = bool(policy.get("ub_256kb_unlock", False))
+    raw_aliasing = policy.get("l1_slot_aliasing") or {}
+
+    if l1_stages is not None:
+        if not isinstance(l1_stages, int) or isinstance(l1_stages, bool) or l1_stages < 1:
+            raise PipelineError("ASCEND_SIL_POLICY_INVALID", f"invalid l1_stages={l1_stages!r}")
+    if l0c_buffers is not None:
+        if not isinstance(l0c_buffers, int) or isinstance(l0c_buffers, bool) or l0c_buffers < 1:
+            raise PipelineError("ASCEND_SIL_POLICY_INVALID", f"invalid l0c_buffers={l0c_buffers!r}")
+
+    new_buffers: list[Buffer] = []
+    for buf in problem.buffers:
+        if buf.space == "L1" and l1_stages is not None:
+            new_buffers.append(
+                Buffer(
+                    name=buf.name,
+                    slot_bytes=buf.slot_bytes,
+                    space=buf.space,
+                    owner=buf.owner,
+                    fixed=int(l1_stages),
+                )
+            )
+        elif buf.space == "L0C" and l0c_buffers is not None:
+            new_buffers.append(
+                Buffer(
+                    name=buf.name,
+                    slot_bytes=buf.slot_bytes,
+                    space=buf.space,
+                    owner=buf.owner,
+                    fixed=int(l0c_buffers),
+                )
+            )
+        else:
+            new_buffers.append(buf)
+
+    buf_by_name = {b.name: b for b in new_buffers}
+    l1_names = {b.name for b in new_buffers if b.space == "L1"}
+    task_index = {t.name: idx for idx, t in enumerate(problem.tasks)}
+
+    writers: dict[str, set[str]] = {}
+    readers: dict[str, set[str]] = {}
+    for reuse in problem.reuses:
+        writers.setdefault(reuse.buffer, set()).add(reuse.next_writer)
+        readers.setdefault(reuse.buffer, set()).add(reuse.last_reader)
+
+    new_edges = list(problem.edges)
+    edge_keys = {(e.src, e.dst, e.distance, e.latency) for e in new_edges}
+    new_reuses = list(problem.reuses)
+    reuse_keys = {(r.buffer, r.last_reader, r.next_writer, r.delta) for r in new_reuses}
+
+    if isinstance(raw_aliasing, Mapping):
+        for raw_a, raw_b in raw_aliasing.items():
+            name_a = _resolve_aliased_l1_name(str(raw_a), l1_names)
+            name_b = _resolve_aliased_l1_name(str(raw_b), l1_names)
+            if not name_a or not name_b or name_a == name_b:
+                continue
+            order_a = min((task_index.get(w, 10**9) for w in writers.get(name_a, ())), default=10**9)
+            order_b = min((task_index.get(w, 10**9) for w in writers.get(name_b, ())), default=10**9)
+            if order_b < order_a:
+                first_name, second_name = name_b, name_a
+            else:
+                first_name, second_name = name_a, name_b
+            first_buf = buf_by_name[first_name]
+            second_buf = buf_by_name[second_name]
+            merged_bytes = max(first_buf.slot_bytes, second_buf.slot_bytes)
+            buf_by_name[first_name] = replace(first_buf, slot_bytes=merged_bytes)
+            buf_by_name[second_name] = replace(second_buf, slot_bytes=0)
+
+            for r_task in sorted(readers.get(first_name, ())):
+                for w_task in sorted(writers.get(second_name, ())):
+                    if r_task != w_task:
+                        ek = (r_task, w_task, 0, 1)
+                        if ek not in edge_keys:
+                            edge_keys.add(ek)
+                            new_edges.append(Edge(src=r_task, dst=w_task, distance=0, latency=1))
+            for r_task in sorted(readers.get(second_name, ())):
+                for w_task in sorted(writers.get(first_name, ())):
+                    if r_task != w_task:
+                        rk = (first_name, r_task, w_task, 0)
+                        if rk not in reuse_keys:
+                            reuse_keys.add(rk)
+                            new_reuses.append(
+                                Reuse(
+                                    buffer=first_name,
+                                    last_reader=r_task,
+                                    next_writer=w_task,
+                                    delta=0,
+                                    read_latency=1,
+                                )
+                            )
+
+    ordered_buffers = tuple(buf_by_name[b.name] for b in new_buffers)
+    new_capacities = []
+    for cap in problem.capacities:
+        if ub_256kb_unlock and cap.space == "UB" and cap.owner == "aiv" and cap.bytes < 256 * 1024:
+            new_capacities.append(Capacity(space=cap.space, owner=cap.owner, bytes=256 * 1024))
+        else:
+            new_capacities.append(cap)
+
+    return Problem(
+        tasks=problem.tasks,
+        edges=tuple(new_edges),
+        buffers=ordered_buffers,
+        reuses=tuple(new_reuses),
+        resources=problem.resources,
+        capacities=tuple(new_capacities),
+        max_stage=problem.max_stage,
+        manual=problem.manual,
+        issue_after=problem.issue_after,
+    )
+
+
+def _solve_problem_core(
     problem: Problem,
     *,
     fixed_ii: int | None = None,
     max_ii: int = 64,
     timeout_ms: int = 1000,
-) -> AscendPipelineResult:
-    """Solve for the minimum feasible initiation interval II and verify the model."""
+) -> Assignment:
     lb = lower_bound_ii(problem)
     if fixed_ii is not None:
         if fixed_ii < lb:
@@ -1016,12 +1444,7 @@ def solve_ascend_pipeline(
                     "ASCEND_PIPELINE_VERIFY_FAILED",
                     "; ".join(problems),
                 )
-            return AscendPipelineResult(
-                problem=problem,
-                assignment=assignment,
-                task_stages=dict(assignment.stages),
-                buffer_versions=dict(assignment.versions),
-            )
+            return assignment
         if status == "UNSAT":
             unknown_streak = 0
         else:
@@ -1034,6 +1457,83 @@ def solve_ascend_pipeline(
     )
 
 
+def solve_ascend_pipeline(
+    problem: Problem,
+    *,
+    fixed_ii: int | None = None,
+    max_ii: int = 64,
+    timeout_ms: int = 1000,
+    sil_policy: Mapping[str, object] | object | None = None,
+    shadow_dump_path: str | Path | None = None,
+) -> AscendPipelineResult:
+    """Solve for the minimum feasible initiation interval II and verify the model."""
+    policy_dict = _coerce_sil_policy(sil_policy)
+    solved_problem = problem
+    fallback_used = False
+    fallback_reason = ""
+
+    if policy_dict is not None:
+        try:
+            policy_problem = _apply_sil_policy_to_problem(problem, policy_dict)
+            assignment = _solve_problem_core(
+                policy_problem,
+                fixed_ii=fixed_ii,
+                max_ii=max_ii,
+                timeout_ms=timeout_ms,
+            )
+            solved_problem = policy_problem
+        except PipelineError as exc:
+            fallback_used = True
+            fallback_reason = str(exc)
+            assignment = _solve_problem_core(
+                problem,
+                fixed_ii=fixed_ii,
+                max_ii=max_ii,
+                timeout_ms=timeout_ms,
+            )
+            solved_problem = problem
+    else:
+        assignment = _solve_problem_core(
+            problem,
+            fixed_ii=fixed_ii,
+            max_ii=max_ii,
+            timeout_ms=timeout_ms,
+        )
+
+    if shadow_dump_path is not None:
+        _write_shadow_dump(
+            shadow_dump_path,
+            {
+                "kind": "solved_pipeline",
+                "ii": assignment.ii,
+                "starts": assignment.starts,
+                "stages": assignment.stages,
+                "versions": assignment.versions,
+                "fallback_used": fallback_used,
+                "fallback_reason": fallback_reason,
+                "sil_policy": policy_dict,
+                "tasks": [
+                    {"name": t.name, "latency": t.latency, "resources": str(t.resources)}
+                    for t in solved_problem.tasks
+                ],
+                "buffers": [
+                    {"name": b.name, "space": b.space, "slot_bytes": b.slot_bytes}
+                    for b in solved_problem.buffers
+                ],
+            },
+        )
+
+    return AscendPipelineResult(
+        problem=solved_problem,
+        assignment=assignment,
+        task_stages=dict(assignment.stages),
+        buffer_versions=dict(assignment.versions),
+        fallback_used=fallback_used,
+        fallback_reason=fallback_reason,
+        applied_sil_policy=policy_dict,
+    )
+
+
 def solve_loop_with_ledger(
     loop: For,
     *,
@@ -1041,6 +1541,10 @@ def solve_loop_with_ledger(
     fn_stmt: Stmt | None = None,
     fixed_ii: int | None = None,
     unreserved_ubuf: bool = False,
+    sil_policy: Mapping[str, object] | object | None = None,
+    shadow_dump_path: str | Path | None = None,
+    dim_hints: Mapping[str, int] | None = None,
+    allow_dynamic_fallback: bool = False,
 ) -> tuple[AscendPipelineResult, ObjectivePhysicalLedger]:
     """Solve a static TIR loop via Mode A Z3 and project an ObjectivePhysicalLedger."""
     resolved_target = target or AscendTarget("ascend.950pr")
@@ -1049,13 +1553,21 @@ def solve_loop_with_ledger(
         target=resolved_target,
         fn_stmt=fn_stmt,
         unreserved_ubuf=unreserved_ubuf,
+        dim_hints=dim_hints,
+        allow_dynamic_fallback=allow_dynamic_fallback,
     )
-    result = solve_ascend_pipeline(problem, fixed_ii=fixed_ii)
-    cap_map = {(c.space, c.owner): c.bytes for c in problem.capacities}
+    result = solve_ascend_pipeline(
+        problem,
+        fixed_ii=fixed_ii,
+        sil_policy=sil_policy,
+        shadow_dump_path=shadow_dump_path,
+    )
+    solved_problem = result.problem
+    cap_map = {(c.space, c.owner): c.bytes for c in solved_problem.capacities}
     waterlines: dict[str, ScopeWaterline] = {}
-    spaces = sorted({b.space for b in problem.buffers if b.space})
+    spaces = sorted({b.space for b in solved_problem.buffers if b.space})
     for space in spaces:
-        bufs = [b for b in problem.buffers if b.space == space]
+        bufs = [b for b in solved_problem.buffers if b.space == space]
         owner = bufs[0].owner
         cap_bytes = cap_map.get((space, owner), 0)
         explicit_bufs = {
@@ -1067,7 +1579,7 @@ def solve_loop_with_ledger(
             explicit_buffers=explicit_bufs,
             implicit_buffers={},
         )
-    pipe_cycles = pipe_cycles_from_problem(problem, result.assignment)
+    pipe_cycles = pipe_cycles_from_problem(solved_problem, result.assignment)
     ledger = build_objective_physical_ledger(
         analysis_mode="exact_modulo_z3",
         is_legal=True,
