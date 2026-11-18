@@ -647,7 +647,6 @@ def _build_ar_small_decode_func(
                                     full_chunks,
                                 )
                         T.copy(x_ub[:, :d_dim], Y[m0 : m0 + rows, :d_dim])
-                        T.ascend_pipe_barrier("PIPE_ALL")
 
                     tail_rows = m_count % rows
                     tail_start = m_start + full_blocks * rows
@@ -897,6 +896,22 @@ def _ar_unaligned_blend_row(
         )
 
 
+def _choose_ar_tile_m_for_rows(
+    d_dim: int, m_rows: int, schedule_mode: str, *, allow_unaligned: bool = False
+) -> int:
+    if schedule_mode != "tuned":
+        return 1
+    if not allow_unaligned and (d_dim % 64) != 0:
+        return 1
+    d_alloc = ((d_dim + 63) // 64) * 64
+    ub_budget = 256 * 1024 - 1024
+    max_rows = (ub_budget - 12 * d_alloc) // (10 * d_alloc + 64)
+    base_tile = max(1, min(8, max_rows))
+    if m_rows < 56:
+        return 1
+    return max(1, min(base_tile, m_rows // 56))
+
+
 def _select_ar_unaligned_config(
     n_depth: int = 8,
     d_dim: int = 1000,
@@ -904,9 +919,11 @@ def _select_ar_unaligned_config(
     schedule_mode: str = "tuned",
     m_rows: int = 4,
 ) -> dict[str, object]:
-    _ = (n_depth, d_dim, tl_dtype, m_rows)
+    _ = (n_depth, tl_dtype)
     return {
-        "tile_m": 1,
+        "tile_m": _choose_ar_tile_m_for_rows(
+            d_dim, m_rows, schedule_mode, allow_unaligned=True
+        ),
         "pass_configs": {},
         "compile_flags": _ar_default_flags(schedule_mode),
     }
@@ -1071,7 +1088,6 @@ def _build_ar_unaligned_func(
                                     rem,
                                 )
                         T.copy(x_ub[:, :d_dim], Y[m0 : m0 + rows, :d_dim])
-                        T.ascend_pipe_barrier("PIPE_ALL")
 
                     tail_rows = m_count % rows
                     tail_start = m_start + full_blocks * rows
@@ -1270,9 +1286,11 @@ def _select_ar_aligned_config(
     schedule_mode: str = "tuned",
     m_rows: int = 2048,
 ) -> dict[str, object]:
-    _ = (n_depth, tl_dtype, m_rows)
+    _ = (n_depth, tl_dtype)
     return {
-        "tile_m": _choose_ar_tile_m(d_dim, schedule_mode),
+        "tile_m": _choose_ar_tile_m_for_rows(
+            d_dim, m_rows, schedule_mode, allow_unaligned=False
+        ),
         "pass_configs": {},
         "compile_flags": _ar_default_flags(schedule_mode),
     }
@@ -1418,7 +1436,6 @@ def _build_ar_aligned_func(
                                     full_chunks,
                                 )
                         T.copy(x_ub[:, :d_dim], Y[m0 : m0 + rows, :d_dim])
-                        T.ascend_pipe_barrier("PIPE_ALL")
 
                     tail_rows = m_count % rows
                     tail_start = m_start + full_blocks * rows

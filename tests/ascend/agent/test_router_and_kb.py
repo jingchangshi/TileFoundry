@@ -131,9 +131,9 @@ def test_seed_rules_yaml_completeness_and_sanitization() -> None:
     assert not re.search(r"\bmla\b", yaml_text.lower())
 
     rules = load_seed_rules()
-    assert len(rules) == 21
+    assert len(rules) == 33
     ids = {rule.rule_id for rule in rules}
-    for idx in range(1, 22):
+    for idx in range(1, 34):
         prefix = f"R{idx:02d}_"
         assert any(rid.startswith(prefix) for rid in ids)
     for rule in rules:
@@ -826,9 +826,13 @@ def test_bayesian_rule_tracker_ranking_pruning_and_roundtrip(tmp_path: Path) -> 
     )
 
 
-def test_bayesian_tracker_paradigm_bucketed_pruning_and_isolation(tmp_path: Path) -> None:
-    """Verify paradigm-scoped pruning isolates pure_vector failures from cv_coupled."""
+def test_bayesian_tracker_axis_scoped_pruning_and_isolation(tmp_path: Path) -> None:
+    """Verify 3-axis TopologyAxes pruning isolates pure_vector failures from cv_coupled."""
+    from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
+
     tracker = BayesianRuleTracker.from_seed_yaml()
+    vec_axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
+    cube_axes = TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "affine_simd")
     vec_ledger = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
         is_legal=True,
@@ -843,41 +847,444 @@ def test_bayesian_tracker_paradigm_bucketed_pruning_and_isolation(tmp_path: Path
         pipe_cycles={"AIC.PIPE_M": 40, "AIV0.PIPE_V": 80},
         waterlines={},
     )
-    vec_ctx = build_predicate_context(vec_ledger)
-    cube_ctx = build_predicate_context(cube_ledger)
+    vec_ctx = build_predicate_context(vec_ledger, extra={"topology_axes": vec_axes})
+    cube_ctx = build_predicate_context(cube_ledger, extra={"topology_axes": cube_axes})
 
     rule_id = "R01_DUAL_COPY_1C2V_SPLIT"
     for _ in range(10):
-        tracker.record_outcome(rule_id, postcondition_realized=False, paradigm="pure_vector")
+        tracker.record_outcome(rule_id, postcondition_realized=False, topology_axes=vec_axes)
     tracker.record_outcome(
         rule_id,
         postcondition_realized=True,
         speed_gain=0.4,
-        paradigm="cv_coupled",
+        topology_axes=cube_axes,
     )
 
     pruned_vec = tracker.prune_underperforming(
-        min_trials=5, prune_threshold=0.25, paradigm="pure_vector"
+        min_trials=5, prune_threshold=0.25, topology_axes=vec_axes
     )
     assert rule_id in pruned_vec
-    assert tracker.is_pruned(rule_id, paradigm="pure_vector") is True
-    assert tracker.is_pruned(rule_id, paradigm="cv_coupled") is False
+    assert tracker.is_pruned(rule_id, topology_axes=vec_axes) is True
+    assert tracker.is_pruned(rule_id, topology_axes=cube_axes) is False
     assert tracker.is_pruned(rule_id) is False
 
-    vec_ids = [r.rule_id for r in tracker.rank_applicable_rules(vec_ctx, paradigm="pure_vector")]
-    cube_ids = [r.rule_id for r in tracker.rank_applicable_rules(cube_ctx, paradigm="cv_coupled")]
+    vec_ids = [r.rule_id for r in tracker.rank_applicable_rules(vec_ctx, topology_axes=vec_axes)]
+    cube_ids = [r.rule_id for r in tracker.rank_applicable_rules(cube_ctx, topology_axes=cube_axes)]
     assert rule_id not in vec_ids
     assert rule_id in cube_ids
 
-    ckpt_file = tmp_path / "paradigm_tracker.json"
+    ckpt_file = tmp_path / "axes_tracker.json"
     tracker.save_json(ckpt_file)
     restored = BayesianRuleTracker.from_seed_yaml()
     restored.load_posteriors_json(ckpt_file)
-    assert restored.is_pruned(rule_id, paradigm="pure_vector") is True
-    assert restored.is_pruned(rule_id, paradigm="cv_coupled") is False
+    assert restored.is_pruned(rule_id, topology_axes=vec_axes) is True
+    assert restored.is_pruned(rule_id, topology_axes=cube_axes) is False
     assert rule_id not in [
-        r.rule_id for r in restored.rank_applicable_rules(vec_ctx, paradigm="pure_vector")
+        r.rule_id for r in restored.rank_applicable_rules(vec_ctx, topology_axes=vec_axes)
     ]
     assert rule_id in [
-        r.rule_id for r in restored.rank_applicable_rules(cube_ctx, paradigm="cv_coupled")
+        r.rule_id for r in restored.rank_applicable_rules(cube_ctx, topology_axes=cube_axes)
     ]
+
+
+def test_r16_preserves_simtvf_on_indirect_gather_and_r22_to_r33_fire() -> None:
+    """Verify R16 never fires on indirect gather, R21 is dynamic-core-aware, and R22..R33 evaluate cleanly."""
+    rules = {r.rule_id: r for r in load_seed_rules()}
+
+    # R16 must NOT destroy SimtVF on indirect gather/scatter/hash kernels
+    indirect_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 64, "AIV0.PIPE_MTE2": 32},
+        waterlines={},
+        unaligned_dma_padding_bytes=16,
+        has_indirect_gather=True,
+        opaque_dynamic_regions=("simt_vf",),
+    )
+    indirect_ctx = build_predicate_context(indirect_ledger)
+    assert rules["R16_PADDED_PITCH_TAIL_MASKING"].matches(indirect_ctx) is False
+    assert rules["R31_SIMT_UB_PRIVATIZED_ATOMICS"].matches(indirect_ctx) is True
+
+    # Verify new context fields exist with safe defaults on legacy callers
+    legacy_ctx = build_predicate_context(
+        build_objective_physical_ledger(
+            analysis_mode="readonly_envelope",
+            is_legal=True,
+            steady_state_ii=None,
+            pipe_cycles={"AIV0.PIPE_V": 16},
+            waterlines={},
+        )
+    )
+    for required_key in (
+        "num_aic_cores",
+        "num_aiv_cores",
+        "spill_bytes",
+        "vloopv2_hit",
+        "ub_bank_conflict_risk",
+        "l1_bank_conflict_risk",
+        "l2_hit_rate",
+        "has_empty_group",
+        "has_loop_carried_state",
+        "compute_engine",
+        "memory_ring",
+        "iteration_regularity",
+    ):
+        assert required_key in legacy_ctx
+        assert required_key in legacy_ctx["prev"]
+
+    # R21 mentions dynamic num_aiv_cores across 950PR/950DT
+    assert "num_aiv_cores" in rules["R21_SUBROW_DEPTH_OR_WIDTH_CORE_SHARDING"].transform_template
+
+    l1_over_half = build_scope_waterline(
+        scope="L1",
+        capacity_bytes=524288,
+        explicit_buffers={"a": 320000},
+        implicit_buffers={},
+    )
+    l1_half = build_scope_waterline(
+        scope="L1",
+        capacity_bytes=524288,
+        explicit_buffers={"a": 220000},
+        implicit_buffers={},
+    )
+    ub_high = build_scope_waterline(
+        scope="UB",
+        capacity_bytes=253952,
+        explicit_buffers={"x": 200000},
+        implicit_buffers={},
+    )
+    ub_low = build_scope_waterline(
+        scope="UB",
+        capacity_bytes=253952,
+        explicit_buffers={"x": 120000},
+        implicit_buffers={},
+    )
+
+    def _mk_ledger(**kw):
+        base = dict(
+            analysis_mode="readonly_envelope",
+            is_legal=True,
+            steady_state_ii=None,
+            pipe_cycles={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 48, "AIV0.PIPE_MTE2": 32},
+            waterlines={},
+        )
+        base.update(kw)
+        return build_objective_physical_ledger(**base)
+
+    new_rule_cases = [
+        (
+            "R22_HALF_L1_BANK_ISOLATION",
+            _mk_ledger(waterlines={"L1": l1_over_half}),
+            _mk_ledger(waterlines={"L1": l1_half}),
+            {"l1_bank_conflict_risk": 0.5, "measured_mte2_wait_ratio": 0.30},
+            {"l1_bank_conflict_risk": 0.0, "measured_mte2_wait_ratio": 0.10},
+        ),
+        (
+            "R23_UB_16BANK_STRIDE_PAD_AND_SHIFT",
+            _mk_ledger(dominant_contig_bytes=512, waterlines={"UB": ub_low}),
+            _mk_ledger(
+                pipe_cycles={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 24, "AIV0.PIPE_MTE2": 32},
+                dominant_contig_bytes=544,
+                waterlines={"UB": ub_low},
+            ),
+            {"ub_bank_conflict_risk": 0.4},
+            {"ub_bank_conflict_risk": 0.0},
+        ),
+        (
+            "R24_VLOOPV2_LEGALIZATION_AND_DIRECT_VF",
+            _mk_ledger(pipe_cycles={"AIV0.PIPE_V": 80}, in_loop_ub_reload_stores=2),
+            _mk_ledger(pipe_cycles={"AIV0.PIPE_V": 40}, in_loop_ub_reload_stores=0),
+            {"vloopv2_hit": False},
+            {"vloopv2_hit": True},
+        ),
+        (
+            "R25_SCALAR_BOUND_SPILL_ELIMINATION",
+            _mk_ledger(pipe_cycles={"AIC.PIPE_S": 96, "AIC.PIPE_M": 64}),
+            _mk_ledger(pipe_cycles={"AIC.PIPE_S": 8, "AIC.PIPE_M": 64}),
+            {"spill_bytes": 64},
+            {"spill_bytes": 0},
+        ),
+        (
+            "R26_SWAT_SNAKE_AND_TAIL_WAVE_SPLIT",
+            _mk_ledger(grid_blocks=40, wave_occupancy=0.40),
+            _mk_ledger(grid_blocks=56, wave_occupancy=1.0),
+            {"l2_hit_rate": 0.55, "measured_mte2_wait_ratio": 0.30},
+            {"l2_hit_rate": 0.92, "measured_mte2_wait_ratio": 0.12},
+        ),
+        (
+            "R27_L2_CACHE_BYPASS_SINGLE_USE",
+            _mk_ledger(grid_blocks=16),
+            _mk_ledger(grid_blocks=16),
+            {"l2_hit_rate": 0.45, "measured_mte2_wait_ratio": 0.25},
+            {"l2_hit_rate": 0.85, "measured_mte2_wait_ratio": 0.12},
+        ),
+        (
+            "R28_INPLACE_L1_SLOT_ALIASING",
+            _mk_ledger(waterlines={"L1": l1_over_half, "UB": ub_high}, has_online_rescale_loop=True),
+            _mk_ledger(waterlines={"L1": l1_half, "UB": ub_low}, has_online_rescale_loop=True),
+            {},
+            {},
+        ),
+        (
+            "R29_W4_AIV_UNPACK_AND_FIXPIPE_SCALE_FOLD",
+            _mk_ledger(pipe_cycles={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 64}, has_lowbit_quant=True),
+            _mk_ledger(pipe_cycles={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 32}, has_lowbit_quant=True),
+            {},
+            {},
+        ),
+        (
+            "R30_REGBASE_MX_QUANT_DATABLOCK",
+            _mk_ledger(pipe_cycles={"AIV0.PIPE_V": 80}, has_lowbit_quant=True, in_loop_ub_reload_stores=3),
+            _mk_ledger(pipe_cycles={"AIV0.PIPE_V": 40}, has_lowbit_quant=True, in_loop_ub_reload_stores=0),
+            {"vloopv2_hit": False},
+            {"vloopv2_hit": True},
+        ),
+        (
+            "R31_SIMT_UB_PRIVATIZED_ATOMICS",
+            _mk_ledger(pipe_cycles={"AIV0.PIPE_V": 120}, has_indirect_gather=True),
+            _mk_ledger(pipe_cycles={"AIV0.PIPE_V": 30}, has_indirect_gather=True),
+            {"spill_bytes": 32, "measured_sync_stall_ratio": 0.25},
+            {"spill_bytes": 0, "measured_sync_stall_ratio": 0.05},
+        ),
+        (
+            "R32_GROUPED_ROLLING_CORE_AND_EMPTY_SKIP",
+            _mk_ledger(wave_occupancy=0.45),
+            _mk_ledger(wave_occupancy=0.95),
+            {"has_empty_group": True, "iteration_regularity": "ragged_group", "measured_sync_stall_ratio": 0.20},
+            {"has_empty_group": True, "iteration_regularity": "ragged_group", "measured_sync_stall_ratio": 0.05},
+        ),
+        (
+            "R33_PERSISTENT_STATE_RESIDENCY",
+            _mk_ledger(pipe_cycles={"AIV0.PIPE_V": 48, "AIV0.PIPE_MTE2": 96}, gm_roundtrip_bytes=65536),
+            _mk_ledger(pipe_cycles={"AIV0.PIPE_V": 48, "AIV0.PIPE_MTE2": 16}, gm_roundtrip_bytes=0),
+            {"has_loop_carried_state": True, "memory_ring": "persistent_onchip_state"},
+            {"has_loop_carried_state": True, "memory_ring": "persistent_onchip_state"},
+        ),
+    ]
+
+    for rule_id, pre_l, post_l, pre_extra, post_extra in new_rule_cases:
+        pre_ctx = build_predicate_context(pre_l, extra=pre_extra)
+        assert rules[rule_id].matches(pre_ctx) is True, f"{rule_id} failed pre match"
+        post_ctx = build_predicate_context(post_l, prev_ledger=pre_l, extra=post_extra)
+        post_ctx["prev"].update(pre_extra)
+        assert rules[rule_id].postcondition_realized(post_ctx) is True, (
+            f"{rule_id} failed postcondition"
+        )
+
+
+def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
+    """Verify real HIR/TIR scanning and structural TileLang recurrence detection."""
+    import tilelang.ascend.language as T
+    from tilefoundry.ir.core import Call, Constant, Var
+    from tilefoundry.ir.hir.function import Function as HirFunction
+    from tilefoundry.ir.hir.loop_region import LoopRegion
+    from tilefoundry.ir.hir.nn.matmul import MatMul
+    from tilefoundry.ir.hir.tensor.index_select import IndexSelect
+    from tilefoundry.ir.hir.tensor.quant import Quant
+    from tilefoundry.ir.tir.prim_function import PrimFunction
+    from tilefoundry.ir.tir.stmts import Evaluate, ExecutionScope, For, MeshScope, Sequential
+    from tilefoundry.ir.types import DType, StorageKind, TensorType, TupleType
+    from tilefoundry.ir.types.layout import Layout
+    from tilefoundry.ir.types.mesh import Mesh, Topology
+    from tilefoundry_ascend.ascend.ir.execution import SIMTVF_KIND
+    from tilefoundry_ascend.ascend.ir.tir.instructions import AscendDualCopyL0cToUb, AscendMmad
+
+    # 1. HIR Function with MatMul + Quant + IndexSelect + LoopRegion carried state
+    gmem = StorageKind.GMEM
+    x_ty = TensorType(shape=(16, 64), dtype=DType.bf16, layout=Layout((16, 64)), storage=gmem)
+    w_ty = TensorType(shape=(64, 64), dtype=DType.fp8e4m3, layout=Layout((64, 64)), storage=gmem)
+    idx_ty = TensorType(shape=(8,), dtype=DType.i32, layout=Layout((8,)), storage=gmem)
+    scalar_ty = TensorType(shape=(), dtype=DType.i32, layout=Layout(()), storage=StorageKind.RMEM)
+    x_var = Var("x", type=x_ty)
+    w_var = Var("w", type=w_ty)
+    idx_var = Var("idx", type=idx_ty)
+
+    gather_call = Call(IndexSelect(dim=0), (x_var, idx_var), type=TensorType(shape=(8, 64), dtype=DType.bf16, layout=Layout((8, 64)), storage=gmem))
+    quant_ty = TupleType(fields=(
+        TensorType(shape=(8, 64), dtype=DType.fp8e4m3, layout=Layout((8, 64)), storage=gmem),
+        TensorType(shape=(8, 1), dtype=DType.f32, layout=Layout((8, 1)), storage=gmem),
+    ))
+    quant_call = Call(Quant(group=64), (gather_call,), type=quant_ty)
+    mm_call = Call(MatMul(), (x_var, w_var), type=TensorType(shape=(16, 64), dtype=DType.bf16, layout=Layout((16, 64)), storage=gmem))
+    carry_var = Var("state", type=x_ty)
+    loop_expr = LoopRegion(
+        induction_var=Var("t", type=scalar_ty),
+        params=(carry_var,),
+        args=(mm_call,),
+        body=carry_var,
+        yield_values=(mm_call,),
+        extent=4,
+        step=1,
+        type=x_ty,
+    )
+    hir_fn = HirFunction.build(
+        name="hybrid_hir",
+        params=(x_var, w_var, idx_var),
+        body=loop_expr,
+        return_type=x_ty,
+    )
+    f_hir = extract_structural_features(hir_fn)
+    assert f_hir.phi_2_cube_to_vector_ratio > 0.0
+    assert f_hir.phi_3_quant_granularity == "per_token_or_block"
+    assert f_hir.phi_5_cross_iter_recurrence == "non_associative_scan"
+    assert f_hir.phi_7_inner_contiguous_bytes == 32
+
+    f_hir_gather = extract_structural_features(quant_call)
+    assert f_hir_gather.phi_3_quant_granularity == "per_token_or_block"
+    assert f_hir_gather.phi_4_indirect_sparse_gather is True
+
+    # 2. TIR PrimFunction with AscendMmad + AscendDualCopyL0cToUb + SimtVF + MeshScope
+    block_mesh = Mesh((Topology("block", 14),), Layout((14,)))
+    tmem = StorageKind.TMEM
+    smem = StorageKind.SMEM
+    a_var = Var("a", type=TensorType(shape=(16, 64), dtype=DType.f16, layout=Layout((16, 64)), storage=tmem))
+    b_var = Var("b", type=TensorType(shape=(64, 64), dtype=DType.f16, layout=Layout((64, 64)), storage=tmem))
+    c_var = Var("c", type=TensorType(shape=(16, 64), dtype=DType.f32, layout=Layout((16, 64)), storage=tmem))
+    ub_var = Var("ub", type=TensorType(shape=(16, 64), dtype=DType.f32, layout=Layout((16, 64)), storage=smem))
+    pf = PrimFunction(
+        name="tir_cube_simt_dual",
+        params=(a_var, b_var, c_var),
+        body=Sequential((
+            MeshScope(
+                mesh=block_mesh,
+                binding=Var("bid", type=scalar_ty),
+                body=Sequential((
+                    For(
+                        induction_var=Var("k", type=scalar_ty),
+                        start=Constant(0, type=scalar_ty),
+                        stop=Constant(4, type=scalar_ty),
+                        step=Constant(1, type=scalar_ty),
+                        body=Sequential((
+                            Evaluate(AscendMmad(), (c_var, a_var, b_var)),
+                            Evaluate(AscendDualCopyL0cToUb(), (c_var, ub_var)),
+                            ExecutionScope(kind=SIMTVF_KIND.name, body=Sequential(())),
+                        )),
+                    ),
+                )),
+            ),
+        )),
+    )
+    f_tir = extract_structural_features(pf)
+    assert f_tir.phi_1_static_affine_bounds is True
+    assert f_tir.phi_2_cube_to_vector_ratio == pytest.approx(1.0)
+    assert f_tir.phi_4_indirect_sparse_gather is True
+    assert f_tir.phi_6_dynamic_cross_core_handoff is True
+    assert f_tir.phi_7_inner_contiguous_bytes == 128
+    assert f_tir.phi_8_persistent_wave_occupancy == pytest.approx(
+        14.0 / float(AscendTarget("ascend.950pr").device.aic_count)
+    )
+
+    # 3. TileLang structural online_rescale (exp + max without "expdif" name) & non_associative_scan
+    @T.prim_func
+    def online_max_exp_loop(X: T.Tensor((16, 64), "float32"), Out: T.Tensor((16, 64), "float32")):
+        with T.Kernel(16):
+            m_buf = T.alloc_shared((16,), "float32")
+            l_buf = T.alloc_shared((16,), "float32")
+            x_ub = T.alloc_shared((16, 64), "float32")
+            T.copy(X, x_ub)
+            for k in T.serial(4):
+                for i in T.serial(16):
+                    m_new = T.max(m_buf[i], x_ub[i, k])
+                    scale = T.exp(m_buf[i] - m_new)
+                    l_buf[i] = l_buf[i] * scale + 1.0
+                    m_buf[i] = m_new
+            T.copy(x_ub, Out)
+
+    f_online = extract_structural_features(online_max_exp_loop)
+    assert f_online.phi_5_cross_iter_recurrence == "associative_online_rescale"
+
+    @T.prim_func
+    def sequential_state_scan(
+        X: T.Tensor((8, 64), "float32"),
+        Decay: T.Tensor((8, 64), "float32"),
+        Out: T.Tensor((8, 64), "float32"),
+    ):
+        with T.Kernel(1):
+            state = T.alloc_shared((64,), "float32")
+            for t in T.serial(8):
+                for j in T.serial(64):
+                    state[j] = state[j] * Decay[t, j] + X[t, j]
+                    Out[t, j] = state[j]
+
+    f_scan = extract_structural_features(sequential_state_scan)
+    assert f_scan.phi_5_cross_iter_recurrence == "non_associative_scan"
+    assert route_execution_track(f_scan).track == "simt_vf"
+    assert route_execution_track(f_scan).topology_axes.memory_ring == "persistent_onchip_state"
+
+
+def test_topology_axes_routing_and_60_cannbot_ops() -> None:
+    """Verify pure 3-axis TopologyAxes routing across all 60 cannbot-ops specs and isolation."""
+    import yaml
+    from tilefoundry_ascend.agent.router.capability_gate import (
+        VALID_BACKEND_TIERS,
+        route_from_op_spec,
+    )
+    from tilefoundry_ascend.ascend.sil.schema import (
+        VALID_COMPUTE_ENGINES,
+        VALID_ITERATION_REGULARITIES,
+        VALID_MEMORY_RINGS,
+        TopologyAxes,
+    )
+
+    # Representative checks across canonical 3-axis topologies
+    expectations = {
+        "rms_norm": TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd"),
+        "dynamic_mx_quant": TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd"),
+        "embedding_hash_table_lookup_or_insert": TopologyAxes("aiv_only", "ub_random_atomic", "irregular_simt"),
+        "roi_align": TopologyAxes("aiv_only", "ub_random_atomic", "irregular_simt"),
+        "unique": TopologyAxes("aiv_only", "ub_random_atomic", "irregular_simt"),
+        "nms": TopologyAxes("aiv_only", "ub_random_atomic", "irregular_simt"),
+        "q4_0_dequant_matmul": TopologyAxes("coupled_1c2v", "gm_l1_l0_fixpipe", "affine_simd"),
+        "conv_2d": TopologyAxes("aic_only", "gm_l1_l0_fixpipe", "affine_simd"),
+        "grouped_matmul_swiglu_quant": TopologyAxes("coupled_1c2v", "l0c_ub_epilogue", "ragged_group"),
+        "mla": TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "affine_simd"),
+        "gqa": TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "affine_simd"),
+        "linear_cross_entropy": TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "affine_simd"),
+        "kimi_delta_attention": TopologyAxes("coupled_1c2v", "persistent_onchip_state", "affine_simd"),
+        "mhc_sinkhorn": TopologyAxes("aiv_only", "persistent_onchip_state", "affine_simd"),
+        "lact_ttt_chunk": TopologyAxes("coupled_1c2v", "persistent_onchip_state", "affine_simd"),
+        "tensor_program_vm": TopologyAxes("aiv_only", "persistent_onchip_state", "dynamic_opcode_stream"),
+    }
+    for op_name, expected_axes in expectations.items():
+        dec = route_from_op_spec({"op_name": op_name})
+        assert dec.topology_axes == expected_axes
+        assert dec.recommended_backend_tier in VALID_BACKEND_TIERS
+
+    # Route ALL 60 real proto.yaml files in cannbot-ops if present on disk
+    ops_root = Path(__file__).resolve().parents[4] / "cannbot-ops" / "operators"
+    if ops_root.is_dir():
+        proto_files = sorted(ops_root.glob("level*/*/proto.yaml"))
+        assert len(proto_files) == 60
+        seen_engines: set[str] = set()
+        seen_rings: set[str] = set()
+        seen_regs: set[str] = set()
+        for pf in proto_files:
+            proto = yaml.safe_load(pf.read_text(encoding="utf-8"))
+            proto["id"] = pf.parent.name
+            dec = route_from_op_spec(proto)
+            assert dec.topology_axes.compute_engine in VALID_COMPUTE_ENGINES
+            assert dec.topology_axes.memory_ring in VALID_MEMORY_RINGS
+            assert dec.topology_axes.iteration_regularity in VALID_ITERATION_REGULARITIES
+            assert dec.track in ("developer", "simt_vf", "manual_ssbuf")
+            assert dec.recommended_backend_tier in VALID_BACKEND_TIERS
+            seen_engines.add(dec.topology_axes.compute_engine)
+            seen_rings.add(dec.topology_axes.memory_ring)
+            seen_regs.add(dec.topology_axes.iteration_regularity)
+        assert seen_engines == set(VALID_COMPUTE_ENGINES)
+        assert seen_rings == set(VALID_MEMORY_RINGS)
+        assert seen_regs == set(VALID_ITERATION_REGULARITIES)
+
+    # Verify global prune after axis A failures does NOT poison unrelated axis B
+    tracker = BayesianRuleTracker.from_seed_yaml()
+    rid = "R01_DUAL_COPY_1C2V_SPLIT"
+    axes_a = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
+    axes_b = TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "affine_simd")
+    axes_c = TopologyAxes("coupled_1c2v", "l0c_ub_epilogue", "ragged_group")
+    for _ in range(12):
+        tracker.record_outcome(rid, postcondition_realized=False, topology_axes=axes_a)
+    tracker.record_outcome(rid, postcondition_realized=True, speed_gain=0.3, topology_axes=axes_b)
+    tracker.prune_underperforming(min_trials=5, prune_threshold=0.25)
+    assert tracker.is_pruned(rid) is True
+    assert tracker.is_pruned(rid, topology_axes=axes_b) is False
+    assert tracker.is_pruned(rid, topology_axes=axes_c) is False

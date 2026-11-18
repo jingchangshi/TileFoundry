@@ -536,6 +536,9 @@ def make_reg_kernel(cores: int = 2):
         min_edit_gain=0.05,
         min_probe_speedup=1.08,
     )
+    from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
+
+    vec_axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
     rep = distiller.distill_from_pair(
         baseline_dsl=base_multi,
         winner_dsl=win_multi,
@@ -543,7 +546,7 @@ def make_reg_kernel(cores: int = 2):
         winner_latency_us=10.0,
         factory_name="make_reg_kernel",
         config_selector_name="_select_reg_config",
-        paradigm="pure_vector",
+        topology_axes=vec_axes,
         kb_output_path=tmp_path / "kb_multi.yaml",
     )
     assert rep.kept_positive_chunks
@@ -551,6 +554,6 @@ def make_reg_kernel(cores: int = 2):
         assert 0.0 < meas.variant_latency_us < 25.0
     assert rep.admitted_rule_ids
     for rid in rep.admitted_rule_ids:
-        assert rid in tracker.paradigm_posteriors.get("pure_vector", {})
+        assert rid in tracker.axis_posteriors.get("mr:gm_ub_stream", {})
 
 

@@ -54,7 +54,9 @@ def test_live_one_op_funnel_stage_a_b_c_on_npu() -> None:
     import tilelang.ascend.language as T
     from tilelang.profiler import do_bench
 
-    stage_a = run_stage_a_static(_SMOKE_DSL, factory_name="make_vec_add")
+    stage_a = run_stage_a_static(
+        _SMOKE_DSL, factory_name="make_vec_add", enable_track_router=True
+    )
     assert stage_a.passed is True
     assert stage_a.ledger is not None
     assert stage_a.route is not None and stage_a.route.track == "developer"

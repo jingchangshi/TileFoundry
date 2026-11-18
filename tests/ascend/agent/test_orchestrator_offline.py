@@ -536,6 +536,9 @@ def test_fp3_unmatched_rules_not_padded_and_transport_error_exempt() -> None:
         "R02_ONCHIP_L0C_TO_UB_DIRECT",
         "R03_ACCUM_SPAN_FIXPIPE_RELIEF",
         "R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION",
+        "R13_SPLIT_KV_WAVE_RECOVERY",
+        "R22_HALF_L1_BANK_ISOLATION",
+        "R26_SWAT_SNAKE_AND_TAIL_WAVE_SPLIT",
     ))
     creative_specs = [s for s in specs_cube if s.worker_kind == "creative_explore"]
     assert len(creative_specs) == 1

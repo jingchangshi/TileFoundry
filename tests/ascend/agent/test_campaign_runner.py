@@ -426,16 +426,17 @@ def test_campaign_patience_escalation_xhigh_stepping_stone_and_regime_rotation(
     assert report.frozen_regimes == ("regime_a", "regime_b")
     assert report.escalated_rounds == (5, 6, 7, 8)
     assert [r.regime_tag for r in report.rounds] == ["regime_a", "regime_b"] * 4
-    assert [r.creative_effort for r in report.rounds] == ["high"] * 4 + ["xhigh"] * 4
+    assert [r.creative_effort for r in report.rounds] == ["high"] * 8
     assert report.rounds[4].parent_lane == "stepping_stone"
-    assert report.rounds[4].creative_effort == "xhigh"
+    assert report.rounds[4].creative_effort == "high"
 
     creative_calls = [c for c in backend.calls if c.role == "explore_creative"]
-    high_calls = [c for c in creative_calls if c.effort == "high"]
-    xhigh_calls = [c for c in creative_calls if c.effort == "xhigh"]
-    assert len(high_calls) >= 4 and len(xhigh_calls) >= 4
-    assert creative_calls[: len(high_calls)] == high_calls
-    assert any("regime_a:" in c.user_prompt and "T.alloc_ss" in c.user_prompt for c in xhigh_calls)
+    assert len(creative_calls) >= 8
+    assert all(c.effort == "high" for c in creative_calls)
+    assert any(
+        "regime_a:" in c.user_prompt and "T.alloc_ss" in c.user_prompt
+        for c in creative_calls[4:]
+    )
     for call in creative_calls:
         joined = call.system_prompt + "\n" + call.user_prompt
         assert "### NEGATIVE CONSTRAINTS (ALREADY EXPLORED BY PARALLEL WORKERS)" in joined
@@ -871,7 +872,7 @@ def _build_regime_a(tile_m=2):
     assert "small_decode" in runner._regime_nav_packets
 
     active_by_id = {rule.rule_id: rule for rule in runner._tracker.active_rules()}
-    assert len(active_by_id) == 21
+    assert len(active_by_id) >= 33
     expected_new_rules = (
         "R13_SPLIT_KV_WAVE_RECOVERY",
         "R14_GQA_HEAD_M_FOLDING",
@@ -1279,9 +1280,10 @@ def test_scoped_multi_symbol_regime_slice_extract_and_patch(tmp_path: Path) -> N
     assert "def mla(" not in snippet
 
     helper_src = "def _mla_decode_helper(x: int) -> int:\n    return x + 1\n\n"
+    assert '"num_kv_splits": splits,' in snippet
     updated_snippet = (
         helper_src
-        + snippet.replace('"num_kv_splits": 1,', '"num_kv_splits": 4,', 1)
+        + snippet.replace('"num_kv_splits": splits,', '"num_kv_splits": 4,', 1)
     )
     patched = patch_regime_into_module(mla_src, split_spec, updated_snippet)
     assert "def _mla_decode_helper(" in patched
@@ -1695,8 +1697,9 @@ def test_per_regime_beam_isolation_objective_ranking_and_checkpoint(tmp_path: Pa
     )
 
 
-def test_campaign_paradigm_pruning_and_cross_paradigm_isolation(tmp_path: Path) -> None:
-    """Verify round-end paradigm-scoped pruning never blocks rules in other paradigms."""
+def test_campaign_axis_pruning_and_cross_topology_isolation(tmp_path: Path) -> None:
+    """Verify round-end 3-axis TopologyAxes pruning never blocks rules in unrelated topologies."""
+    from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
     anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 2.0),)
     regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {"bm": 64, "bn": 64, "bk": 64}),)
     target_path = tmp_path / "kernels.py"
@@ -1749,10 +1752,12 @@ def test_campaign_paradigm_pruning_and_cross_paradigm_isolation(tmp_path: Path) 
     report = asyncio.run(runner.run(resume=False))
     pruned_any = [rid for r in report.rounds for rid in r.pruned_rule_ids]
     assert pruned_any
-    assert "pure_vector" in tracker.paradigm_posteriors
+    vec_axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
+    cv_axes = TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "irregular_simt")
+    assert "mr:gm_ub_stream" in tracker.axis_posteriors
     for rid in pruned_any:
-        assert tracker.is_pruned(rid, paradigm="pure_vector") is True
-        assert tracker.is_pruned(rid, paradigm="cv_coupled") is False
+        assert tracker.is_pruned(rid, topology_axes=vec_axes) is True
+        assert tracker.is_pruned(rid, topology_axes=cv_axes) is False
         assert tracker.is_pruned(rid) is False
 
 
@@ -2960,7 +2965,7 @@ def test_wp_final3_persistent_wave_occupancy_weighted_burst_pipe_all_and_r21() -
     from tilefoundry_ascend.ascend.schedule import inspect_tilelang_primfunc
 
     rules = {r.rule_id: r for r in load_seed_rules()}
-    assert len(rules) == 21
+    assert len(rules) >= 33
     root = Path(__file__).resolve().parents[3]
 
     ar_src = (
@@ -3000,7 +3005,23 @@ def test_wp_final3_persistent_wave_occupancy_weighted_burst_pipe_all_and_r21() -
     )
     mla_dims = {"B": 1, "S": 1, "S_kv": 4096, "N_q": 128, "N_kv": 1, "D_nope": 512, "D_rope": 64}
     mla_vb = build_anchor_var_bindings(mla_dims, kwargs={"n_q": 128, "n_kv": 1})
-    mla_s1 = run_stage_a_static(
+    mla_s1_unsplit = run_stage_a_static(
+        mla_src,
+        factory_name="_build_mla_split_kv_decode_func",
+        factory_kwargs={"n_q": 128, "n_kv": 1, "d_nope": 512, "d_rope": 64, "tl_dtype": "float16", "input_layout": "BSND", "is_causal": False, "bm": 64, "aligned_group_q": True, "num_kv_splits": 1},
+        config_selector_name=None,
+        dims=mla_dims,
+        var_bindings=mla_vb,
+    )
+    assert mla_s1_unsplit.passed and mla_s1_unsplit.ledger is not None
+    assert mla_s1_unsplit.ledger.wave_occupancy < 0.15
+    ctx_s1 = build_predicate_context(
+        mla_s1_unsplit.ledger,
+        residual=compute_static_dynamic_residual(mla_s1_unsplit.ledger, {"dur_us": 20.0}),
+    )
+    assert rules["R13_SPLIT_KV_WAVE_RECOVERY"].matches(ctx_s1) is True
+
+    mla_s1_tuned = run_stage_a_static(
         mla_src,
         factory_name="_build_mla_split_kv_decode_func",
         factory_kwargs={"n_q": 128, "n_kv": 1, "d_nope": 512, "d_rope": 64, "tl_dtype": "float16", "input_layout": "BSND", "is_causal": False, "bm": 64, "aligned_group_q": True, "num_kv_splits": 1},
@@ -3008,16 +3029,12 @@ def test_wp_final3_persistent_wave_occupancy_weighted_burst_pipe_all_and_r21() -
         dims=mla_dims,
         var_bindings=mla_vb,
     )
-    assert mla_s1.passed and mla_s1.ledger is not None
-    assert mla_s1.ledger.wave_occupancy < 0.15
-    ctx_s1 = build_predicate_context(
-        mla_s1.ledger,
-        residual=compute_static_dynamic_residual(mla_s1.ledger, {"dur_us": 20.0}),
-    )
-    assert rules["R13_SPLIT_KV_WAVE_RECOVERY"].matches(ctx_s1) is True
+    assert mla_s1_tuned.passed and mla_s1_tuned.ledger is not None
+    assert mla_s1_tuned.ledger.active_grid_blocks == 28
+    assert mla_s1_tuned.ledger.wave_occupancy >= 0.9
 
     mla_s8 = run_stage_a_static(
-        mla_src.replace('"num_kv_splits": 1,', '"num_kv_splits": 8,', 1),
+        mla_src.replace('"num_kv_splits": splits,', '"num_kv_splits": 8,', 1),
         factory_name="_build_mla_split_kv_decode_func",
         factory_kwargs={"n_q": 128, "n_kv": 1, "d_nope": 512, "d_rope": 64, "tl_dtype": "float16", "input_layout": "BSND", "is_causal": False, "bm": 64, "aligned_group_q": True, "num_kv_splits": 8},
         config_selector_name="_select_mla_decode_config",

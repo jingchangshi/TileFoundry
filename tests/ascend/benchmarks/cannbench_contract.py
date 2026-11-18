@@ -765,7 +765,7 @@ def outputs(value):
 class ReferenceCache:
     """Five disk entries, with an exclusive lease per active operator test."""
     LIMIT = 5
-    DEFAULT_ROOT = '/data2/zhanghaotian/11-5-cannbench-cache-dir'
+    DEFAULT_ROOT = 'off'
 
     def __init__(self, harness):
         self.harness = harness

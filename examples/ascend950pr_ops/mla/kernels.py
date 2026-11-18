@@ -1676,15 +1676,26 @@ def _select_mla_decode_config(
     is_causal: bool = False,
     schedule_mode: str = "tuned",
 ) -> dict[str, object]:
-    _ = (s_kv, d_rope, tl_dtype, is_causal)
+    _ = (d_rope, tl_dtype, is_causal)
     q_rows = s_dim * (n_q // n_kv)
     bm, aligned_group_q = _choose_mla_bm(
         b_dim, n_kv, q_rows, d_nope, input_layout, schedule_mode
     )
+    splits = 1
+    if schedule_mode == "tuned" and s_kv >= 1024 and q_rows >= 64 and (q_rows % 64) == 0:
+        m_tiles = b_dim * n_kv * ((q_rows + bm - 1) // bm)
+        if m_tiles < 14:
+            if q_rows >= 64:
+                bm = 64
+                aligned_group_q = input_layout == "BNSD" or n_kv == 1
+                m_tiles = b_dim * n_kv * ((q_rows + 63) // 64)
+            kv_blocks = max(1, s_kv // 64)
+            target_splits = (28 + m_tiles - 1) // m_tiles
+            splits = max(1, min(14, min(kv_blocks, target_splits)))
     return {
         "bm": bm,
         "aligned_group_q": aligned_group_q,
-        "num_kv_splits": 1,
+        "num_kv_splits": splits,
         "pass_configs": {},
         "compile_flags": _mla_default_flags(schedule_mode),
     }
@@ -2847,6 +2858,33 @@ def mla(
     d_rope = q_rope.shape[-1]
     scale = (1.0 / math.sqrt(d_nope + d_rope)) if scaleValue <= 0 else float(scaleValue)
     tl_dtype = "bfloat16" if q_nope.dtype == torch.bfloat16 else "float16"
+
+    if (
+        schedule_mode == "tuned"
+        and inputLayout == "BNSD"
+        and n_kv == 1
+        and s_dim > 1
+        and (b_dim * n_q * s_dim) <= 32768
+    ):
+        q_nope_bsnd = q_nope.transpose(1, 2).contiguous()
+        q_rope_bsnd = q_rope.transpose(1, 2).contiguous()
+        k_nope_bsnd = k_nope.contiguous().view(b_dim, s_kv, 1, d_nope)
+        k_rope_bsnd = k_rope.contiguous().view(b_dim, s_kv, 1, d_rope)
+        v_bsnd = v.contiguous().view(b_dim, s_kv, 1, d_nope)
+        out_bsnd = mla(
+            q_nope_bsnd,
+            q_rope_bsnd,
+            k_nope_bsnd,
+            k_rope_bsnd,
+            v_bsnd,
+            numKVHeads=numKVHeads,
+            scaleValue=scaleValue,
+            inputLayout="BSND",
+            is_causal=is_causal,
+            schedule_mode=schedule_mode,
+            num_kv_splits_override=num_kv_splits_override,
+        )
+        return out_bsnd.transpose(1, 2).contiguous()
 
     if inputLayout == "BNSD":
         selector_fn, builder_fn = _select_mla_bnsd_config, _build_mla_bnsd_gather_func
