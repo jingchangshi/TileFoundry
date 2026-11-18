@@ -1158,7 +1158,13 @@ def prewarm_surrogate_tilelang_cache(
     return resolved_tl_cache
 
 
-_NON_AGENT_GATES_ENV_KEYS = frozenset({"TILEFOUNDRY_NPU_AGENT_GATES_BIN"})
+_NON_AGENT_GATES_ENV_KEYS = frozenset(
+    {
+        "TILEFOUNDRY_NPU_AGENT_GATES_BIN",
+        "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
+        "TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL",
+    }
+)
 
 
 def _write_temp_env_file(
@@ -1947,8 +1953,8 @@ def run_l4_official_cannbench_via_agent_gates(
                     cid_str = str(case_row.get("case_id", ""))
                     if "_" in cid_str and cid_str.rsplit("_", 1)[-1].isdigit():
                         cnum = int(cid_str.rsplit("_", 1)[-1])
-                        per_case_speedups[cnum] = float(case_row.get("speedup", 0.0))
-                        per_case_elapsed[cnum] = float(case_row.get("elapsed_us", 0.0))
+                        per_case_speedups[cnum] = float(case_row.get("speedup") or 0.0)
+                        per_case_elapsed[cnum] = float(case_row.get("elapsed_us") or 0.0)
 
     err = "" if ok else (proc.stderr or proc.stdout or "L4 CANNBench gate failed")[-1000:]
     return L4CannbenchResult(

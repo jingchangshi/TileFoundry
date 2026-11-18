@@ -1,10 +1,15 @@
 """TileLang Ascend950PR MIX SimdVF kernel implementation for Multi-Head Latent Attention."""
 
 import contextlib
+import ctypes
 import math
+import os
+from pathlib import Path
+import tempfile
 
 import tilelang
 import tilelang.ascend.language as T
+from tilelang.contrib.bisheng import compile_ascend
 import torch
 
 from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
@@ -2671,6 +2676,807 @@ def _build_mla_prefill_func(
     return main
 
 
+_MLA_TRACKB_SRC = r"""
+#include <tl_templates/ascend/common.h>
+#include <tl_templates/ascend/gemm.h>
+#include <tl_templates/ascend/nd2nz_copy.h>
+#include <tl_templates/ascend/simd_inst.h>
+
+template <int M, int K, int N, int TILE_K_SUB, typename InT, typename AccumT>
+__aicore__ inline void ascend_gemm_l1_nn(__cc__ AccumT *cc_ptr, __cbuf__ InT *cbuf_a_ptr,
+                                          __cbuf__ InT *cbuf_b_ptr, int clear_accum, int buf_offset = 0) {
+  constexpr int C0 = 32 / sizeof(InT);
+  constexpr int FRAC_N = 16;
+  constexpr int SUB_K = K / TILE_K_SUB;
+  constexpr int mStepA = M / FRAC_N;
+  constexpr int mStepB = N / FRAC_N;
+  constexpr int kStep = TILE_K_SUB / C0;
+  constexpr int L0A_STAGE = M * TILE_K_SUB;
+  constexpr int L0B_STAGE = N * TILE_K_SUB;
+  constexpr int srcStrideNN = K / C0;
+
+  __ca__ InT *l0a = (__ca__ InT *)0;
+  __cb__ InT *l0b = (__cb__ InT *)0;
+
+  for (int sk = 0; sk < SUB_K; ++sk) {
+    asc_lock(PIPE_MTE1, buf_offset + (sk & 1), ASC_LOCK_BLOCK);
+    asc_copy_l12l0a((__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)), cbuf_a_ptr, 0,
+                    (sk * kStep), mStepA, kStep, mStepA, mStepA);
+    asc_copy_l12l0b_transpose((__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), cbuf_b_ptr,
+                              (sk * kStep), 0, kStep, mStepB, srcStrideNN, mStepB);
+    asc_unlock(PIPE_MTE1, buf_offset + (sk & 1), ASC_LOCK_BLOCK);
+    asc_lock(PIPE_M, buf_offset + (sk & 1), ASC_LOCK_BLOCK);
+    asc_mmad(cc_ptr, (__ca__ InT *)(l0a + ((sk & 1) * L0A_STAGE)),
+             (__cb__ InT *)(l0b + ((sk & 1) * L0B_STAGE)), M, TILE_K_SUB, N,
+             0, true, false, clear_accum && (sk == 0));
+    asc_unlock(PIPE_M, buf_offset + (sk & 1), ASC_LOCK_BLOCK);
+  }
+}
+
+template <int ROWS, int D_NOPE>
+__simd_vf__ inline void vf_init_state(__ubuf__ float* m_prev, __ubuf__ float* l_prev, __ubuf__ float* acc_o) {
+  vector_bool m32 = asc_create_mask_b32(PAT_ALL);
+  auto v_neg_inf = simd_inst::vdup<float>(-1e30f, m32, MODE_ZEROING);
+  auto v_zero = simd_inst::vdup<float>(0.0f, m32, MODE_ZEROING);
+  for (int r = 0; r < ROWS; ++r) {
+    simd_inst::vsts_1st(v_neg_inf, m_prev + r * 8, 0, m32);
+    simd_inst::vsts_1st(v_zero, l_prev + r * 8, 0, m32);
+  }
+  constexpr int CHUNKS = D_NOPE >> 6;
+  for (int r = 0; r < ROWS; ++r) {
+    for (int c = 0; c < CHUNKS; ++c) {
+      simd_inst::vsts_norm(v_zero, acc_o + r * D_NOPE + (c << 6), 0, m32);
+    }
+  }
+}
+
+template <int ROWS, int BN, typename OutT>
+__simd_vf__ inline void vf_softmax_tail(__ubuf__ float* s_ub, __ubuf__ OutT* p_ub,
+                                        __ubuf__ float* m_prev, __ubuf__ float* l_prev,
+                                        __ubuf__ float* alpha_ub, int cur_n, float scale) {
+  vector_bool m32 = asc_create_mask_b32(PAT_ALL);
+  vector_bool m16 = asc_create_mask_b16(PAT_ALL);
+  auto v_zero = simd_inst::vdup<float>(0.0f, m32, MODE_ZEROING);
+  auto v_neg_inf = simd_inst::vdup<float>(-1e30f, m32, MODE_ZEROING);
+  auto col_base = simd_inst::vci<int32_t>(0, INC_ORDER);
+  auto col_hi = simd_inst::vci<int32_t>(64, INC_ORDER);
+  auto valid0 = simd_inst::vcmps_lt(col_base, cur_n, m32);
+  auto valid1 = simd_inst::vcmps_lt(col_hi, cur_n, m32);
+
+  for (int r = 0; r < ROWS; ++r) {
+    auto s0 = simd_inst::vsel(simd_inst::vmuls(simd_inst::vlds_norm<float>(s_ub + r * BN, 0), scale, m32, MODE_ZEROING), v_neg_inf, valid0);
+    auto s1 = simd_inst::vsel(simd_inst::vmuls(simd_inst::vlds_norm<float>(s_ub + r * BN + 64, 0), scale, m32, MODE_ZEROING), v_neg_inf, valid1);
+    auto smax = simd_inst::vmax(s0, s1, m32, MODE_ZEROING);
+    auto m_tile_v = simd_inst::vdupv(simd_inst::vcmax(smax, m32, MODE_ZEROING), m32, POS_LOWEST, MODE_ZEROING);
+    auto m_old_v = simd_inst::vlds_brc_elem<float>(m_prev + r * 8, 0);
+    auto l_old_v = simd_inst::vlds_brc_elem<float>(l_prev + r * 8, 0);
+    auto m_new_v = simd_inst::vmax(m_old_v, m_tile_v, m32, MODE_ZEROING);
+    auto m_safe_v = simd_inst::vmaxs(m_new_v, -1e30f, m32, MODE_ZEROING);
+    auto alpha_raw = simd_inst::vexp(simd_inst::vsub(m_old_v, m_safe_v, m32, MODE_ZEROING), m32, MODE_ZEROING);
+    auto old_valid = simd_inst::vcmps_gt(m_old_v, -1e30f, m32);
+    auto alpha_v = simd_inst::vsel(alpha_raw, v_zero, old_valid);
+    auto new_valid = simd_inst::vcmps_gt(m_new_v, -1e30f, m32);
+    auto p0_raw = simd_inst::vexp(simd_inst::vsub(s0, m_safe_v, m32, MODE_ZEROING), m32, MODE_ZEROING);
+    auto p1_raw = simd_inst::vexp(simd_inst::vsub(s1, m_safe_v, m32, MODE_ZEROING), m32, MODE_ZEROING);
+    auto p0_f = simd_inst::vsel(p0_raw, v_zero, simd_inst::pand(valid0, new_valid, m32));
+    auto p1_f = simd_inst::vsel(p1_raw, v_zero, simd_inst::pand(valid1, new_valid, m32));
+    auto row_sum_v = simd_inst::vdupv(simd_inst::vcadd(simd_inst::vadd(p0_f, p1_f, m32, MODE_ZEROING), m32, MODE_ZEROING), m32, POS_LOWEST, MODE_ZEROING);
+    auto l_new_v = simd_inst::vadd(simd_inst::vmul(l_old_v, alpha_v, m32, MODE_ZEROING), row_sum_v, m32, MODE_ZEROING);
+    simd_inst::vsts_1st(m_new_v, m_prev + r * 8, 0, m32);
+    simd_inst::vsts_1st(l_new_v, l_prev + r * 8, 0, m32);
+    simd_inst::vsts_1st(alpha_v, alpha_ub + r * 8, 0, m32);
+    auto p0_16 = simd_inst::vcvt<OutT>(p0_f, m16, ROUND_R, RS_ENABLE, PART_EVEN, MODE_ZEROING);
+    auto p1_16 = simd_inst::vcvt<OutT>(p1_f, m16, ROUND_R, RS_ENABLE, PART_EVEN, MODE_ZEROING);
+    simd_inst::vsts_pack_b32(p0_16, p_ub + r * BN, 0, m32);
+    simd_inst::vsts_pack_b32(p1_16, p_ub + r * BN + 64, 0, m32);
+  }
+}
+
+template <int ROWS, int BN, typename OutT>
+__simd_vf__ inline void vf_softmax_full(__ubuf__ float* s_ub, __ubuf__ OutT* p_ub,
+                                        __ubuf__ float* m_prev, __ubuf__ float* l_prev,
+                                        __ubuf__ float* alpha_ub, float scale) {
+  vector_bool m32 = asc_create_mask_b32(PAT_ALL);
+  vector_bool m16 = asc_create_mask_b16(PAT_ALL);
+  auto v_zero = simd_inst::vdup<float>(0.0f, m32, MODE_ZEROING);
+  for (int r = 0; r < ROWS; ++r) {
+    auto s0 = simd_inst::vmuls(simd_inst::vlds_norm<float>(s_ub + r * BN, 0), scale, m32, MODE_ZEROING);
+    auto s1 = simd_inst::vmuls(simd_inst::vlds_norm<float>(s_ub + r * BN + 64, 0), scale, m32, MODE_ZEROING);
+    auto smax = simd_inst::vmax(s0, s1, m32, MODE_ZEROING);
+    auto m_tile_v = simd_inst::vdupv(simd_inst::vcmax(smax, m32, MODE_ZEROING), m32, POS_LOWEST, MODE_ZEROING);
+    auto m_old_v = simd_inst::vlds_brc_elem<float>(m_prev + r * 8, 0);
+    auto l_old_v = simd_inst::vlds_brc_elem<float>(l_prev + r * 8, 0);
+    auto m_new_v = simd_inst::vmax(m_old_v, m_tile_v, m32, MODE_ZEROING);
+    auto alpha_raw = simd_inst::vexp(simd_inst::vsub(m_old_v, m_new_v, m32, MODE_ZEROING), m32, MODE_ZEROING);
+    auto old_valid = simd_inst::vcmps_gt(m_old_v, -1e30f, m32);
+    auto alpha_v = simd_inst::vsel(alpha_raw, v_zero, old_valid);
+    auto p0_f = simd_inst::vexp(simd_inst::vsub(s0, m_new_v, m32, MODE_ZEROING), m32, MODE_ZEROING);
+    auto p1_f = simd_inst::vexp(simd_inst::vsub(s1, m_new_v, m32, MODE_ZEROING), m32, MODE_ZEROING);
+    auto row_sum_v = simd_inst::vdupv(simd_inst::vcadd(simd_inst::vadd(p0_f, p1_f, m32, MODE_ZEROING), m32, MODE_ZEROING), m32, POS_LOWEST, MODE_ZEROING);
+    auto l_new_v = simd_inst::vadd(simd_inst::vmul(l_old_v, alpha_v, m32, MODE_ZEROING), row_sum_v, m32, MODE_ZEROING);
+    simd_inst::vsts_1st(m_new_v, m_prev + r * 8, 0, m32);
+    simd_inst::vsts_1st(l_new_v, l_prev + r * 8, 0, m32);
+    simd_inst::vsts_1st(alpha_v, alpha_ub + r * 8, 0, m32);
+    auto p0_16 = simd_inst::vcvt<OutT>(p0_f, m16, ROUND_R, RS_ENABLE, PART_EVEN, MODE_ZEROING);
+    auto p1_16 = simd_inst::vcvt<OutT>(p1_f, m16, ROUND_R, RS_ENABLE, PART_EVEN, MODE_ZEROING);
+    simd_inst::vsts_pack_b32(p0_16, p_ub + r * BN, 0, m32);
+    simd_inst::vsts_pack_b32(p1_16, p_ub + r * BN + 64, 0, m32);
+  }
+}
+
+template <int ROWS, int N_SLICE, int D_NOPE, int COL_OFF>
+__simd_vf__ inline void vf_acc_rescale(__ubuf__ float* acc_o, __ubuf__ float* o_ub, __ubuf__ float* alpha_ub) {
+  vector_bool m32 = asc_create_mask_b32(PAT_ALL);
+  constexpr int CHUNKS = N_SLICE >> 6;
+  for (int r = 0; r < ROWS; ++r) {
+    auto alpha_v = simd_inst::vlds_brc_elem<float>(alpha_ub + r * 8, 0);
+    for (int c = 0; c < CHUNKS; ++c) {
+      auto o_old = simd_inst::vlds_norm<float>(acc_o + r * D_NOPE + COL_OFF + (c << 6), 0);
+      auto o_tmp = simd_inst::vlds_norm<float>(o_ub + r * N_SLICE + (c << 6), 0);
+      auto o_new = simd_inst::vadd(simd_inst::vmul(o_old, alpha_v, m32, MODE_ZEROING), o_tmp, m32, MODE_ZEROING);
+      simd_inst::vsts_norm(o_new, acc_o + r * D_NOPE + COL_OFF + (c << 6), 0, m32);
+    }
+  }
+}
+
+template <int ROWS, int D_NOPE, typename OutT>
+__simd_vf__ inline void vf_finalize_out(__ubuf__ float* acc_o, __ubuf__ float* l_prev, __ubuf__ OutT* out_ub) {
+  vector_bool m32 = asc_create_mask_b32(PAT_ALL);
+  vector_bool m16 = asc_create_mask_b16(PAT_ALL);
+  auto v_one = simd_inst::vdup<float>(1.0f, m32, MODE_ZEROING);
+  auto v_zero = simd_inst::vdup<float>(0.0f, m32, MODE_ZEROING);
+  constexpr int CHUNKS = D_NOPE >> 6;
+  for (int r = 0; r < ROWS; ++r) {
+    auto l_v = simd_inst::vlds_brc_elem<float>(l_prev + r * 8, 0);
+    auto l_pos = simd_inst::vcmps_gt(l_v, 1e-30f, m32);
+    auto l_safe = simd_inst::vsel(l_v, v_one, l_pos);
+    auto inv_l = simd_inst::vsel(simd_inst::vdiv(v_one, l_safe, m32, MODE_ZEROING), v_zero, l_pos);
+    for (int c = 0; c < CHUNKS; ++c) {
+      auto y_f = simd_inst::vmul(simd_inst::vlds_norm<float>(acc_o + r * D_NOPE + (c << 6), 0), inv_l, m32, MODE_ZEROING);
+      auto y_16 = simd_inst::vcvt<OutT>(y_f, m16, ROUND_R, RS_ENABLE, PART_EVEN, MODE_ZEROING);
+      simd_inst::vsts_pack_b32(y_16, out_ub + r * D_NOPE + (c << 6), 0, m32);
+    }
+  }
+}
+
+template <int ROWS, int D_NOPE>
+__simd_vf__ inline void vf_finalize_partial(__ubuf__ float* acc_o, __ubuf__ float* m_prev, __ubuf__ float* l_prev) {
+  vector_bool m32 = asc_create_mask_b32(PAT_ALL);
+  auto v_one = simd_inst::vdup<float>(1.0f, m32, MODE_ZEROING);
+  auto v_zero = simd_inst::vdup<float>(0.0f, m32, MODE_ZEROING);
+  auto v_neg_inf = simd_inst::vdup<float>(-1e30f, m32, MODE_ZEROING);
+  constexpr int CHUNKS = D_NOPE >> 6;
+  for (int r = 0; r < ROWS; ++r) {
+    auto m_v = simd_inst::vlds_brc_elem<float>(m_prev + r * 8, 0);
+    auto l_v = simd_inst::vlds_brc_elem<float>(l_prev + r * 8, 0);
+    auto l_pos = simd_inst::vcmps_gt(l_v, 1e-30f, m32);
+    auto l_safe = simd_inst::vsel(l_v, v_one, l_pos);
+    auto inv_l = simd_inst::vsel(simd_inst::vdiv(v_one, l_safe, m32, MODE_ZEROING), v_zero, l_pos);
+    auto lse_v = simd_inst::vsel(simd_inst::vadd(m_v, simd_inst::vln(l_safe, m32, MODE_ZEROING), m32, MODE_ZEROING), v_neg_inf, l_pos);
+    for (int c = 0; c < CHUNKS; ++c) {
+      auto y_f = simd_inst::vmul(simd_inst::vlds_norm<float>(acc_o + r * D_NOPE + (c << 6), 0), inv_l, m32, MODE_ZEROING);
+      simd_inst::vsts_norm(y_f, acc_o + r * D_NOPE + (c << 6), 0, m32);
+    }
+    simd_inst::vsts_1st(lse_v, l_prev + r * 8, 0, m32);
+  }
+}
+
+template <int BM, int BN, int D_NOPE, int D_ROPE, typename InT>
+__global__ __mix__(1, 2) void mla_kv_reuse_c1c1c2(
+    __gm__ InT* Q_nope, __gm__ InT* Q_rope,
+    __gm__ InT* K_nope, __gm__ InT* K_rope,
+    __gm__ InT* Out, __gm__ float* O_part, __gm__ float* lse_part,
+    int B, int S_q, int S_kv, int N_q, int splits, int causal, int is_bnsd, float scale) {
+  asc_init();
+  constexpr int ROWS = BM / 2;
+  constexpr int NS = (BM <= 64) ? 256 : 128;
+  constexpr int NUM_SLICES = (D_NOPE + NS - 1) / NS;
+  constexpr int LAST_NS = D_NOPE - (NUM_SLICES - 1) * NS;
+
+  constexpr int Q_NOPE_ELEMS = BM * D_NOPE;
+  constexpr int Q_ROPE_ELEMS = BM * D_ROPE;
+  constexpr int P_ELEMS = BM * BN;
+  constexpr int K_NOPE_STAGE = BN * D_NOPE;
+  constexpr int K_ROPE_STAGE = BN * D_ROPE;
+
+  __cbuf__ InT* q_nope_l1 = (__cbuf__ InT*)0;
+  __cbuf__ InT* q_rope_l1 = (__cbuf__ InT*)(Q_NOPE_ELEMS * 2);
+  __cbuf__ InT* p_l1_base = (__cbuf__ InT*)((Q_NOPE_ELEMS + Q_ROPE_ELEMS) * 2);
+  __cbuf__ InT* k_nope_l1_base = (__cbuf__ InT*)((Q_NOPE_ELEMS + Q_ROPE_ELEMS + 2 * P_ELEMS) * 2);
+  __cbuf__ InT* k_rope_l1_base = (__cbuf__ InT*)((Q_NOPE_ELEMS + Q_ROPE_ELEMS + 2 * P_ELEMS + 2 * K_NOPE_STAGE) * 2);
+
+  __cc__ float* s_l0c = (__cc__ float*)0;
+  __cc__ float* o_l0c = (__cc__ float*)(BM * BN * 4);
+
+  constexpr int ACC_BYTES = ROWS * D_NOPE * 4;
+  constexpr int O_BYTES = ROWS * NS * 4;
+  constexpr int S_BYTES = ROWS * BN * 4;
+  constexpr int P_BYTES = ROWS * BN * 2;
+  constexpr int PNZ_BYTES = ((ROWS + 1) * BN * 2 + 255) & ~255;
+  __ubuf__ float* acc_o_ub = (__ubuf__ float*)0;
+  __ubuf__ float* o_ub = (__ubuf__ float*)(ACC_BYTES);
+  __ubuf__ InT* out_ub = (__ubuf__ InT*)(ACC_BYTES);
+  __ubuf__ float* s_ub = (__ubuf__ float*)(ACC_BYTES + O_BYTES);
+  __ubuf__ InT* p_ub = (__ubuf__ InT*)(ACC_BYTES + O_BYTES + S_BYTES);
+  __ubuf__ InT* p_nz_ub = (__ubuf__ InT*)(ACC_BYTES + O_BYTES + S_BYTES + P_BYTES);
+  int meta_off = ACC_BYTES + O_BYTES + S_BYTES + P_BYTES + PNZ_BYTES;
+  __ubuf__ float* m_prev_ub = (__ubuf__ float*)(meta_off);
+  __ubuf__ float* l_prev_ub = (__ubuf__ float*)(meta_off + ROWS * 32);
+  __ubuf__ float* alpha_ub0 = (__ubuf__ float*)(meta_off + ROWS * 64);
+  __ubuf__ float* alpha_ub1 = (__ubuf__ float*)(meta_off + ROWS * 96);
+  __ubuf__ float* lse_pack_ub = (__ubuf__ float*)(meta_off + ROWS * 128);
+
+  int total_bs = B * S_q;
+  int q_blocks = (N_q + BM - 1) / BM;
+  int total_tasks = total_bs * q_blocks * splits;
+  int cid = (int)block_idx;
+  int num_cores = 28;
+  if (cid >= total_tasks) return;
+
+  int q_head_stride = is_bnsd ? (S_q * D_NOPE) : D_NOPE;
+  int qr_head_stride = is_bnsd ? (S_q * D_ROPE) : D_ROPE;
+  int out_head_stride = is_bnsd ? (S_q * D_NOPE) : D_NOPE;
+
+  if ASCEND_IS_AIC {
+    asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)0);
+    asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)1);
+    asc_sync_notify(PIPE_M, PIPE_MTE2, (event_t)2);
+    asc_sync_notify(PIPE_FIX, PIPE_M, (event_t)0);
+    asc_sync_notify(PIPE_FIX, PIPE_M, (event_t)1);
+    bool prev_ran = false;
+
+    for (int t = cid; t < total_tasks; t += num_cores) {
+      int sp = t % splits;
+      int t2 = t / splits;
+      int qb = t2 % q_blocks;
+      int bs = t2 / q_blocks;
+      int b = bs / S_q;
+      int s = bs % S_q;
+      int m_off = qb * BM;
+      int actual_m = N_q - m_off;
+      if (actual_m > BM) actual_m = BM;
+
+      int kv_end = causal ? (S_kv - S_q + s + 1) : S_kv;
+      if (kv_end > S_kv) kv_end = S_kv;
+      if (kv_end < 0) kv_end = 0;
+      int total_kv_blks = (kv_end + BN - 1) / BN;
+      int sp_blks = (total_kv_blks + splits - 1) / splits;
+      int blk_start = sp * sp_blks;
+      int blk_end = blk_start + sp_blks;
+      if (blk_end > total_kv_blks) blk_end = total_kv_blks;
+      if (blk_start >= blk_end) continue;
+
+      int q_base = is_bnsd
+          ? ((b * N_q + m_off) * S_q + s) * D_NOPE
+          : ((b * S_q + s) * N_q + m_off) * D_NOPE;
+      int qr_base = is_bnsd
+          ? ((b * N_q + m_off) * S_q + s) * D_ROPE
+          : ((b * S_q + s) * N_q + m_off) * D_ROPE;
+
+      asc_sync_wait(PIPE_M, PIPE_MTE2, (event_t)2);
+      asc_set_gm2l1_nz_para(1, 1, BM, 0);
+      asc_copy_gm2l1_nd2nz(q_nope_l1, Q_nope + q_base, q_head_stride * 2, static_cast<asc_load_l2_cache_mode>(0), actual_m, D_NOPE, 0, 0);
+      asc_copy_gm2l1_nd2nz(q_rope_l1, Q_rope + qr_base, qr_head_stride * 2, static_cast<asc_load_l2_cache_mode>(0), actual_m, D_ROPE, 0, 0);
+      asc_sync_notify(PIPE_MTE2, PIPE_MTE1, (event_t)2);
+      asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)2);
+
+      int k_batch_base_n = b * S_kv * D_NOPE;
+      int k_batch_base_r = b * S_kv * D_ROPE;
+      int num_blks = blk_end - blk_start;
+
+      {
+        int kv_idx0 = blk_start * BN;
+        int cur_n0 = kv_end - kv_idx0;
+        if (cur_n0 > BN) cur_n0 = BN;
+        asc_sync_wait(PIPE_MTE1, PIPE_MTE2, (event_t)0);
+        if (cur_n0 < BN) {
+          asc_fill_value_config fc{}; fc.repeat = D_NOPE / 16; fc.blk_num = BN; fc.dst_gap = 0; asc_fill_l1((__cbuf__ uint16_t*)k_nope_l1_base, (uint32_t)0, fc);
+          asc_fill_value_config fr{}; fr.repeat = D_ROPE / 16; fr.blk_num = BN; fr.dst_gap = 0; asc_fill_l1((__cbuf__ uint16_t*)k_rope_l1_base, (uint32_t)0, fr);
+        }
+        asc_set_gm2l1_nz_para(1, 1, BN, 0);
+        asc_copy_gm2l1_nd2nz(k_nope_l1_base, K_nope + k_batch_base_n + kv_idx0 * D_NOPE, D_NOPE * 2, static_cast<asc_load_l2_cache_mode>(0), cur_n0, D_NOPE, 0, 0);
+        asc_copy_gm2l1_nd2nz(k_rope_l1_base, K_rope + k_batch_base_r + kv_idx0 * D_ROPE, D_ROPE * 2, static_cast<asc_load_l2_cache_mode>(0), cur_n0, D_ROPE, 0, 0);
+        asc_sync_notify(PIPE_MTE2, PIPE_MTE1, (event_t)0);
+
+        if (num_blks > 1) {
+          int kv_idx1 = (blk_start + 1) * BN;
+          int cur_n1 = kv_end - kv_idx1;
+          if (cur_n1 > BN) cur_n1 = BN;
+          asc_sync_wait(PIPE_MTE1, PIPE_MTE2, (event_t)1);
+          if (cur_n1 < BN) {
+            asc_fill_value_config fc1{}; fc1.repeat = D_NOPE / 16; fc1.blk_num = BN; fc1.dst_gap = 0; asc_fill_l1((__cbuf__ uint16_t*)(k_nope_l1_base + K_NOPE_STAGE), (uint32_t)0, fc1);
+            asc_fill_value_config fr1{}; fr1.repeat = D_ROPE / 16; fr1.blk_num = BN; fr1.dst_gap = 0; asc_fill_l1((__cbuf__ uint16_t*)(k_rope_l1_base + K_ROPE_STAGE), (uint32_t)0, fr1);
+          }
+          asc_set_gm2l1_nz_para(1, 1, BN, 0);
+          asc_copy_gm2l1_nd2nz(k_nope_l1_base + K_NOPE_STAGE, K_nope + k_batch_base_n + kv_idx1 * D_NOPE, D_NOPE * 2, static_cast<asc_load_l2_cache_mode>(0), cur_n1, D_NOPE, 0, 0);
+          asc_copy_gm2l1_nd2nz(k_rope_l1_base + K_ROPE_STAGE, K_rope + k_batch_base_r + kv_idx1 * D_ROPE, D_ROPE * 2, static_cast<asc_load_l2_cache_mode>(0), cur_n1, D_ROPE, 0, 0);
+          asc_sync_notify(PIPE_MTE2, PIPE_MTE1, (event_t)1);
+        }
+
+        asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)0);
+        asc_sync_wait(PIPE_FIX, PIPE_M, (event_t)0);
+        ascend_gemm_l1<BM, D_NOPE, BN, 64, true, InT>(s_l0c, q_nope_l1, k_nope_l1_base, 1, 0, 0);
+        ascend_gemm_l1<BM, D_ROPE, BN, 64, true, InT>(s_l0c, q_rope_l1, k_rope_l1_base, 0, 0, 0);
+        asc_sync_notify(PIPE_M, PIPE_FIX, (event_t)0);
+        asc_sync_wait(PIPE_M, PIPE_FIX, (event_t)0);
+        if (prev_ran) {
+          asc_sync_intra_wait(PIPE_FIX, 6);
+          asc_sync_intra_wait(PIPE_FIX, 22);
+        }
+        asc_set_l0c_copy_nz_para(1, 0, 0);
+        asc_copy_l0c2ub(s_ub, s_l0c, BN, BM, BN, BM, 0, static_cast<asc_dual_dst_mode>(1), static_cast<asc_unit_flag_mode>(0), static_cast<asc_quant_mode>(0), static_cast<asc_relu_pre_mode>(0), 0, 1, 0, 0);
+        asc_sync_notify(PIPE_FIX, PIPE_M, (event_t)0);
+        asc_sync_intra_arrive(PIPE_FIX, 5);
+        asc_sync_intra_arrive(PIPE_FIX, 21);
+      }
+
+      for (int bi = 0; bi < num_blks; ++bi) {
+        int stg = bi & 1;
+        __cbuf__ InT* kn_dst = k_nope_l1_base + stg * K_NOPE_STAGE;
+        __cbuf__ InT* p_dst = p_l1_base + stg * P_ELEMS;
+
+        if (bi + 1 < num_blks) {
+          int nxt = (bi + 1) & 1;
+          asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)nxt);
+          asc_sync_wait(PIPE_FIX, PIPE_M, (event_t)0);
+          ascend_gemm_l1<BM, D_NOPE, BN, 64, true, InT>(s_l0c, q_nope_l1, k_nope_l1_base + nxt * K_NOPE_STAGE, 1, 0, 0);
+          ascend_gemm_l1<BM, D_ROPE, BN, 64, true, InT>(s_l0c, q_rope_l1, k_rope_l1_base + nxt * K_ROPE_STAGE, 0, 0, 0);
+          asc_sync_notify(PIPE_M, PIPE_FIX, (event_t)0);
+
+          asc_sync_intra_wait(PIPE_MTE1, 4);
+          asc_sync_intra_wait(PIPE_MTE1, 20);
+          asc_sync_wait(PIPE_M, PIPE_FIX, (event_t)0);
+          asc_set_l0c_copy_nz_para(1, 0, 0);
+          asc_copy_l0c2ub(s_ub, s_l0c, BN, BM, BN, BM, 0, static_cast<asc_dual_dst_mode>(1), static_cast<asc_unit_flag_mode>(0), static_cast<asc_quant_mode>(0), static_cast<asc_relu_pre_mode>(0), 0, 1, 0, 0);
+          asc_sync_notify(PIPE_FIX, PIPE_M, (event_t)0);
+          asc_sync_intra_arrive(PIPE_FIX, 5);
+          asc_sync_intra_arrive(PIPE_FIX, 21);
+        } else {
+          asc_sync_intra_wait(PIPE_MTE1, 4);
+          asc_sync_intra_wait(PIPE_MTE1, 20);
+        }
+
+        for (int sl = 0; sl < NUM_SLICES; ++sl) {
+          asc_sync_wait(PIPE_FIX, PIPE_M, (event_t)1);
+          if (sl < NUM_SLICES - 1) {
+            ascend_gemm_l1_nn<BM, BN, NS, 64, InT>(o_l0c, p_dst, kn_dst + sl * BN * NS, 1, 0);
+          } else {
+            ascend_gemm_l1_nn<BM, BN, LAST_NS, 64, InT>(o_l0c, p_dst, kn_dst + sl * BN * NS, 1, 0);
+            asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)stg);
+            if (bi + 2 < num_blks) {
+              int kv_idx2 = (blk_start + bi + 2) * BN;
+              int cur_n2 = kv_end - kv_idx2;
+              if (cur_n2 > BN) cur_n2 = BN;
+              asc_sync_wait(PIPE_MTE1, PIPE_MTE2, (event_t)stg);
+              if (cur_n2 < BN) {
+                asc_fill_value_config fc2{}; fc2.repeat = D_NOPE / 16; fc2.blk_num = BN; fc2.dst_gap = 0; asc_fill_l1((__cbuf__ uint16_t*)(k_nope_l1_base + stg * K_NOPE_STAGE), (uint32_t)0, fc2);
+                asc_fill_value_config fr2{}; fr2.repeat = D_ROPE / 16; fr2.blk_num = BN; fr2.dst_gap = 0; asc_fill_l1((__cbuf__ uint16_t*)(k_rope_l1_base + stg * K_ROPE_STAGE), (uint32_t)0, fr2);
+              }
+              asc_set_gm2l1_nz_para(1, 1, BN, 0);
+              asc_copy_gm2l1_nd2nz(k_nope_l1_base + stg * K_NOPE_STAGE, K_nope + k_batch_base_n + kv_idx2 * D_NOPE, D_NOPE * 2, static_cast<asc_load_l2_cache_mode>(0), cur_n2, D_NOPE, 0, 0);
+              asc_copy_gm2l1_nd2nz(k_rope_l1_base + stg * K_ROPE_STAGE, K_rope + k_batch_base_r + kv_idx2 * D_ROPE, D_ROPE * 2, static_cast<asc_load_l2_cache_mode>(0), cur_n2, D_ROPE, 0, 0);
+              asc_sync_notify(PIPE_MTE2, PIPE_MTE1, (event_t)stg);
+            }
+          }
+          asc_sync_notify(PIPE_M, PIPE_FIX, (event_t)1);
+          asc_sync_wait(PIPE_M, PIPE_FIX, (event_t)1);
+          if (!(bi == 0 && sl == 0)) {
+            asc_sync_intra_wait(PIPE_FIX, 6);
+            asc_sync_intra_wait(PIPE_FIX, 22);
+          }
+          int cur_ns = (sl < NUM_SLICES - 1) ? NS : LAST_NS;
+          asc_set_l0c_copy_nz_para(1, 0, 0);
+          asc_copy_l0c2ub(o_ub, o_l0c, cur_ns, BM, cur_ns, BM, 0, static_cast<asc_dual_dst_mode>(1), static_cast<asc_unit_flag_mode>(0), static_cast<asc_quant_mode>(0), static_cast<asc_relu_pre_mode>(0), 0, 1, 0, 0);
+          asc_sync_notify(PIPE_FIX, PIPE_M, (event_t)1);
+          asc_sync_intra_arrive(PIPE_FIX, 3);
+          asc_sync_intra_arrive(PIPE_FIX, 19);
+        }
+      }
+      asc_sync_notify(PIPE_M, PIPE_MTE2, (event_t)2);
+      asc_sync_intra_wait(PIPE_FIX, 6);
+      asc_sync_intra_wait(PIPE_FIX, 22);
+      prev_ran = true;
+    }
+
+    asc_sync_wait(PIPE_MTE1, PIPE_MTE2, (event_t)0);
+    asc_sync_wait(PIPE_MTE1, PIPE_MTE2, (event_t)1);
+    asc_sync_wait(PIPE_M, PIPE_MTE2, (event_t)2);
+    asc_sync_wait(PIPE_FIX, PIPE_M, (event_t)0);
+    asc_sync_wait(PIPE_FIX, PIPE_M, (event_t)1);
+  }
+
+  if ASCEND_IS_AIV {
+    int sid = asc_get_sub_block_id();
+    int arrive_p = (sid == 0) ? 4 : 20;
+    int arrive_oub = (sid == 0) ? 6 : 22;
+
+    for (int t = cid; t < total_tasks; t += num_cores) {
+      int sp = t % splits;
+      int t2 = t / splits;
+      int qb = t2 % q_blocks;
+      int bs = t2 / q_blocks;
+      int b = bs / S_q;
+      int s = bs % S_q;
+      int m_off = qb * BM;
+      int actual_m = N_q - m_off;
+      if (actual_m > BM) actual_m = BM;
+      int my_m_start = sid * ROWS;
+      int my_rows = actual_m - my_m_start;
+      if (my_rows > ROWS) my_rows = ROWS;
+      if (my_rows < 0) my_rows = 0;
+
+      int kv_end = causal ? (S_kv - S_q + s + 1) : S_kv;
+      if (kv_end > S_kv) kv_end = S_kv;
+      if (kv_end < 0) kv_end = 0;
+      int total_kv_blks = (kv_end + BN - 1) / BN;
+      int sp_blks = (total_kv_blks + splits - 1) / splits;
+      int blk_start = sp * sp_blks;
+      int blk_end = blk_start + sp_blks;
+      if (blk_end > total_kv_blks) blk_end = total_kv_blks;
+      if (blk_start >= blk_end) continue;
+
+      vf_init_state<ROWS, D_NOPE>(m_prev_ub, l_prev_ub, acc_o_ub);
+
+      int num_blks = blk_end - blk_start;
+      {
+        int kv_idx0 = blk_start * BN;
+        int cur_n0 = kv_end - kv_idx0;
+        if (cur_n0 > BN) cur_n0 = BN;
+        asc_sync_intra_wait(PIPE_V, 5);
+        if (cur_n0 == BN) {
+          vf_softmax_full<ROWS, BN, InT>(s_ub, p_ub, m_prev_ub, l_prev_ub, alpha_ub0, scale);
+        } else {
+          vf_softmax_tail<ROWS, BN, InT>(s_ub, p_ub, m_prev_ub, l_prev_ub, alpha_ub0, cur_n0, scale);
+        }
+        ascend_nd2nz_scatter<ROWS, BN, ROWS + 1, InT, InT>(p_ub, p_nz_ub);
+        asc_sync_notify(PIPE_V, PIPE_MTE3, (event_t)0);
+        asc_sync_wait(PIPE_V, PIPE_MTE3, (event_t)0);
+        asc_copy_ub2l1((__cbuf__ void*)(p_l1_base + sid * (ROWS * 16)), (__ubuf__ void*)p_nz_ub,
+                       BN / 16, ROWS, 1, ROWS);
+        asc_sync_intra_arrive(PIPE_MTE3, arrive_p);
+      }
+
+      for (int bi = 0; bi < num_blks; ++bi) {
+        __ubuf__ float* cur_alpha = (bi & 1) ? alpha_ub1 : alpha_ub0;
+        if (bi + 1 < num_blks) {
+          int nxt = (bi + 1) & 1;
+          __ubuf__ float* nxt_alpha = nxt ? alpha_ub1 : alpha_ub0;
+          int kv_idx1 = (blk_start + bi + 1) * BN;
+          int cur_n1 = kv_end - kv_idx1;
+          if (cur_n1 > BN) cur_n1 = BN;
+          asc_sync_intra_wait(PIPE_V, 5);
+          if (cur_n1 == BN) {
+            vf_softmax_full<ROWS, BN, InT>(s_ub, p_ub, m_prev_ub, l_prev_ub, nxt_alpha, scale);
+          } else {
+            vf_softmax_tail<ROWS, BN, InT>(s_ub, p_ub, m_prev_ub, l_prev_ub, nxt_alpha, cur_n1, scale);
+          }
+          ascend_nd2nz_scatter<ROWS, BN, ROWS + 1, InT, InT>(p_ub, p_nz_ub);
+          asc_sync_notify(PIPE_V, PIPE_MTE3, (event_t)0);
+          asc_sync_wait(PIPE_V, PIPE_MTE3, (event_t)0);
+          asc_copy_ub2l1((__cbuf__ void*)(p_l1_base + nxt * P_ELEMS + sid * (ROWS * 16)), (__ubuf__ void*)p_nz_ub,
+                         BN / 16, ROWS, 1, ROWS);
+          asc_sync_intra_arrive(PIPE_MTE3, arrive_p);
+        }
+
+        for (int sl = 0; sl < NUM_SLICES; ++sl) {
+          asc_sync_intra_wait(PIPE_V, 3);
+          if (sl == NUM_SLICES - 1) vf_acc_rescale<ROWS, LAST_NS, D_NOPE, (NUM_SLICES - 1) * NS>(acc_o_ub, o_ub, cur_alpha);
+          else if (sl == 0) vf_acc_rescale<ROWS, NS, D_NOPE, 0>(acc_o_ub, o_ub, cur_alpha);
+          else if (sl == 1) vf_acc_rescale<ROWS, NS, D_NOPE, NS>(acc_o_ub, o_ub, cur_alpha);
+          else if (sl == 2) vf_acc_rescale<ROWS, NS, D_NOPE, 2 * NS>(acc_o_ub, o_ub, cur_alpha);
+          asc_sync_intra_arrive(PIPE_V, arrive_oub);
+        }
+      }
+
+      if (splits <= 1) {
+        vf_finalize_out<ROWS, D_NOPE, InT>(acc_o_ub, l_prev_ub, out_ub);
+        asc_sync_notify(PIPE_V, PIPE_MTE3, (event_t)0);
+        asc_sync_wait(PIPE_V, PIPE_MTE3, (event_t)0);
+        if (my_rows > 0) {
+          int out_base = is_bnsd
+              ? ((b * N_q + m_off + my_m_start) * S_q + s) * D_NOPE
+              : ((b * S_q + s) * N_q + m_off + my_m_start) * D_NOPE;
+          if (!is_bnsd || S_q == 1) {
+            asc_copy_ub2gm_align((__gm__ uint8_t*)(Out + out_base), (__ubuf__ uint8_t*)out_ub,
+                                 1, my_rows * D_NOPE * 2, static_cast<asc_store_l2_cache_mode>(4),
+                                 my_rows * D_NOPE * 2, my_rows * D_NOPE * 2);
+          } else {
+            asc_copy_ub2gm_align((__gm__ uint8_t*)(Out + out_base), (__ubuf__ uint8_t*)out_ub,
+                                 my_rows, D_NOPE * 2, static_cast<asc_store_l2_cache_mode>(4),
+                                 out_head_stride * 2, D_NOPE * 2);
+          }
+        }
+        asc_sync_notify(PIPE_MTE3, PIPE_V, (event_t)0);
+        asc_sync_wait(PIPE_MTE3, PIPE_V, (event_t)0);
+        asc_sync_intra_arrive(PIPE_V, arrive_oub);
+      } else {
+        vf_finalize_partial<ROWS, D_NOPE>(acc_o_ub, m_prev_ub, l_prev_ub);
+        asc_sync_notify(PIPE_V, PIPE_S, (event_t)0);
+        asc_sync_wait(PIPE_V, PIPE_S, (event_t)0);
+        for (int r = 0; r < my_rows; ++r) {
+          lse_pack_ub[r] = l_prev_ub[r * 8];
+        }
+        asc_sync_notify(PIPE_S, PIPE_MTE3, (event_t)0);
+        asc_sync_notify(PIPE_V, PIPE_MTE3, (event_t)0);
+        asc_sync_wait(PIPE_S, PIPE_MTE3, (event_t)0);
+        asc_sync_wait(PIPE_V, PIPE_MTE3, (event_t)0);
+        if (my_rows > 0) {
+          int flat_row = (bs * N_q + m_off + my_m_start);
+          int q_total = total_bs * N_q;
+          asc_copy_ub2gm_align((__gm__ uint8_t*)(O_part + (sp * q_total + flat_row) * D_NOPE),
+                               (__ubuf__ uint8_t*)acc_o_ub, 1, my_rows * D_NOPE * 4,
+                               static_cast<asc_store_l2_cache_mode>(4), my_rows * D_NOPE * 4, my_rows * D_NOPE * 4);
+          asc_copy_ub2gm_align((__gm__ uint8_t*)(lse_part + sp * q_total + flat_row),
+                               (__ubuf__ uint8_t*)lse_pack_ub, 1, my_rows * 4,
+                               static_cast<asc_store_l2_cache_mode>(4), my_rows * 4, my_rows * 4);
+        }
+        asc_sync_notify(PIPE_MTE3, PIPE_V, (event_t)0);
+        asc_sync_wait(PIPE_MTE3, PIPE_V, (event_t)0);
+        asc_sync_intra_arrive(PIPE_V, arrive_oub);
+      }
+    }
+  }
+}
+
+template <int D_NOPE>
+__simd_vf__ inline void vf_combine_zero(__ubuf__ float* acc, int rows) {
+  vector_bool m32 = asc_create_mask_b32(PAT_ALL);
+  auto v_zero = simd_inst::vdup<float>(0.0f, m32, MODE_ZEROING);
+  constexpr int CHUNKS = D_NOPE >> 6;
+  for (int r = 0; r < rows; ++r) {
+    for (int c = 0; c < CHUNKS; ++c) simd_inst::vsts_norm(v_zero, acc + r * D_NOPE + (c << 6), 0, m32);
+  }
+}
+
+template <int D_NOPE>
+__simd_vf__ inline void vf_combine_acc(__ubuf__ float* o_ub, __ubuf__ float* acc, __ubuf__ float* w_ptr, int rows) {
+  vector_bool m32 = asc_create_mask_b32(PAT_ALL);
+  constexpr int CHUNKS = D_NOPE >> 6;
+  for (int r = 0; r < rows; ++r) {
+    auto w_v = simd_inst::vlds_brc_elem<float>(w_ptr + r * 8, 0);
+    for (int c = 0; c < CHUNKS; ++c) {
+      auto o_v = simd_inst::vlds_norm<float>(o_ub + r * D_NOPE + (c << 6), 0);
+      auto a_v = simd_inst::vlds_norm<float>(acc + r * D_NOPE + (c << 6), 0);
+      simd_inst::vsts_norm(simd_inst::vadd(a_v, simd_inst::vmul(o_v, w_v, m32, MODE_ZEROING), m32, MODE_ZEROING), acc + r * D_NOPE + (c << 6), 0, m32);
+    }
+  }
+}
+
+template <int D_NOPE, typename OutT>
+__simd_vf__ inline void vf_combine_weights(__ubuf__ float* lse_ub, __ubuf__ float* w_ub, __ubuf__ float* inv_ub, int splits, int rows) {
+  vector_bool m32 = asc_create_mask_b32(PAT_ALL);
+  auto v_zero = simd_inst::vdup<float>(0.0f, m32, MODE_ZEROING);
+  auto v_one = simd_inst::vdup<float>(1.0f, m32, MODE_ZEROING);
+  for (int r = 0; r < rows; ++r) {
+    auto m_glob = simd_inst::vdup<float>(-1e30f, m32, MODE_ZEROING);
+    for (int s = 0; s < splits; ++s) {
+      auto lv = simd_inst::vlds_brc_elem<float>(lse_ub + (s * 4 + r) * 8, 0);
+      m_glob = simd_inst::vmax(m_glob, lv, m32, MODE_ZEROING);
+    }
+    auto sum_w = v_zero;
+    for (int s = 0; s < splits; ++s) {
+      auto lv = simd_inst::vlds_brc_elem<float>(lse_ub + (s * 4 + r) * 8, 0);
+      auto valid = simd_inst::vcmps_gt(lv, -1e29f, m32);
+      auto ws = simd_inst::vsel(simd_inst::vexp(simd_inst::vsub(lv, m_glob, m32, MODE_ZEROING), m32, MODE_ZEROING), v_zero, valid);
+      sum_w = simd_inst::vadd(sum_w, ws, m32, MODE_ZEROING);
+      simd_inst::vsts_1st(ws, w_ub + (s * 4 + r) * 8, 0, m32);
+    }
+    auto pos = simd_inst::vcmps_gt(sum_w, 1e-30f, m32);
+    auto inv = simd_inst::vsel(simd_inst::vdiv(v_one, simd_inst::vsel(sum_w, v_one, pos), m32, MODE_ZEROING), v_zero, pos);
+    simd_inst::vsts_1st(inv, inv_ub + r * 8, 0, m32);
+  }
+}
+
+template <int D_NOPE, typename OutT>
+__simd_vf__ inline void vf_combine_fin(__ubuf__ float* acc, __ubuf__ float* inv_ub, __ubuf__ OutT* out_ub, int rows) {
+  vector_bool m32 = asc_create_mask_b32(PAT_ALL);
+  vector_bool m16 = asc_create_mask_b16(PAT_ALL);
+  constexpr int CHUNKS = D_NOPE >> 6;
+  for (int r = 0; r < rows; ++r) {
+    auto inv_v = simd_inst::vlds_brc_elem<float>(inv_ub + r * 8, 0);
+    for (int c = 0; c < CHUNKS; ++c) {
+      auto y = simd_inst::vmul(simd_inst::vlds_norm<float>(acc + r * D_NOPE + (c << 6), 0), inv_v, m32, MODE_ZEROING);
+      auto y16 = simd_inst::vcvt<OutT>(y, m16, ROUND_R, RS_ENABLE, PART_EVEN, MODE_ZEROING);
+      simd_inst::vsts_pack_b32(y16, out_ub + r * D_NOPE + (c << 6), 0, m32);
+    }
+  }
+}
+
+template <int D_NOPE, typename OutT>
+__global__ __vector__ void mla_fast_combine(
+    __gm__ float* O_part, __gm__ float* lse_part, __gm__ OutT* Out,
+    int q_total, int splits, int B, int S_q, int N_q, int is_bnsd) {
+  asc_init();
+  constexpr int QT = 4;
+  __ubuf__ float* o_ub0 = (__ubuf__ float*)0;
+  __ubuf__ float* o_ub1 = (__ubuf__ float*)(8192);
+  __ubuf__ float* acc_ub = (__ubuf__ float*)(16384);
+  __ubuf__ OutT* out_ub = (__ubuf__ OutT*)(24576);
+  __ubuf__ float* lse_ub = (__ubuf__ float*)(32768);
+  __ubuf__ float* w_ub = (__ubuf__ float*)(40960);
+  __ubuf__ float* inv_ub = (__ubuf__ float*)(49152);
+  __ubuf__ float* lse_bulk = (__ubuf__ float*)(53248);
+
+  int cid = (int)block_idx;
+  int num_cores = 56;
+  int base_q = q_total / num_cores;
+  int rem_q = q_total % num_cores;
+  int q_start = cid * base_q + (cid < rem_q ? cid : rem_q);
+  int q_count = base_q + (cid < rem_q ? 1 : 0);
+  if (q_count == 0) return;
+
+  asc_sync_notify(PIPE_V, PIPE_MTE2, (event_t)0);
+  asc_sync_notify(PIPE_V, PIPE_MTE2, (event_t)1);
+  asc_sync_notify(PIPE_MTE3, PIPE_V, (event_t)0);
+  asc_sync_notify(PIPE_V, PIPE_S, (event_t)0);
+
+  int q_aligned = q_start & ~7;
+  int q_span = ((q_start + q_count - q_aligned + 7) & ~7);
+  for (int s = 0; s < splits; ++s) {
+    asc_copy_gm2ub_align((__ubuf__ uint8_t*)(lse_bulk + s * 256), (__gm__ uint8_t*)(lse_part + s * q_total + q_aligned),
+                         1, q_span * 4, 0, 0, 0, static_cast<asc_load_l2_cache_mode>(0), q_span * 4, q_span * 4);
+  }
+  asc_sync_notify(PIPE_MTE2, PIPE_S, (event_t)0);
+  asc_sync_wait(PIPE_MTE2, PIPE_S, (event_t)0);
+
+  for (int base = 0; base < q_count; base += QT) {
+    int rows = q_count - base;
+    if (rows > QT) rows = QT;
+    int qr = q_start + base;
+    int q_off = qr - q_aligned;
+
+    asc_sync_wait(PIPE_V, PIPE_S, (event_t)0);
+    for (int s = 0; s < splits; ++s) {
+      for (int r = 0; r < rows; ++r) {
+        lse_ub[(s * 4 + r) * 8] = lse_bulk[s * 256 + q_off + r];
+      }
+    }
+    asc_sync_notify(PIPE_S, PIPE_V, (event_t)0);
+    asc_sync_wait(PIPE_S, PIPE_V, (event_t)0);
+    vf_combine_weights<D_NOPE, OutT>(lse_ub, w_ub, inv_ub, splits, rows);
+    asc_sync_notify(PIPE_V, PIPE_S, (event_t)0);
+    vf_combine_zero<D_NOPE>(acc_ub, rows);
+
+    for (int s = 0; s < splits; ++s) {
+      int stg = s & 1;
+      __ubuf__ float* cur_o = stg ? o_ub1 : o_ub0;
+      asc_sync_wait(PIPE_V, PIPE_MTE2, (event_t)stg);
+      asc_copy_gm2ub_align((__ubuf__ uint8_t*)cur_o, (__gm__ uint8_t*)(O_part + (s * q_total + qr) * D_NOPE),
+                           1, rows * D_NOPE * 4, 0, 0, 0, static_cast<asc_load_l2_cache_mode>(0), rows * D_NOPE * 4, rows * D_NOPE * 4);
+      asc_sync_notify(PIPE_MTE2, PIPE_V, (event_t)stg);
+      asc_sync_wait(PIPE_MTE2, PIPE_V, (event_t)stg);
+      vf_combine_acc<D_NOPE>(cur_o, acc_ub, w_ub + s * 32, rows);
+      asc_sync_notify(PIPE_V, PIPE_MTE2, (event_t)stg);
+    }
+    asc_sync_wait(PIPE_MTE3, PIPE_V, (event_t)0);
+    vf_combine_fin<D_NOPE, OutT>(acc_ub, inv_ub, out_ub, rows);
+    asc_sync_notify(PIPE_V, PIPE_MTE3, (event_t)0);
+    asc_sync_wait(PIPE_V, PIPE_MTE3, (event_t)0);
+    if (!is_bnsd || S_q == 1) {
+      asc_copy_ub2gm_align((__gm__ uint8_t*)(Out + qr * D_NOPE), (__ubuf__ uint8_t*)out_ub,
+                           1, rows * D_NOPE * 2, static_cast<asc_store_l2_cache_mode>(4), rows * D_NOPE * 2, rows * D_NOPE * 2);
+    } else {
+      for (int r = 0; r < rows; ++r) {
+        int qri = qr + r;
+        int h = qri % N_q;
+        int bs = qri / N_q;
+        int b = bs / S_q;
+        int sq = bs % S_q;
+        int out_idx = (b * N_q + h) * S_q + sq;
+        asc_copy_ub2gm_align((__gm__ uint8_t*)(Out + out_idx * D_NOPE), (__ubuf__ uint8_t*)(out_ub + r * D_NOPE),
+                             1, D_NOPE * 2, static_cast<asc_store_l2_cache_mode>(4), D_NOPE * 2, D_NOPE * 2);
+      }
+    }
+    asc_sync_notify(PIPE_MTE3, PIPE_V, (event_t)0);
+  }
+  asc_sync_wait(PIPE_V, PIPE_MTE2, (event_t)0);
+  asc_sync_wait(PIPE_V, PIPE_MTE2, (event_t)1);
+  asc_sync_wait(PIPE_MTE3, PIPE_V, (event_t)0);
+  asc_sync_wait(PIPE_V, PIPE_S, (event_t)0);
+}
+"""
+
+
+def _build_mla_trackb_callable(
+    n_q: int,
+    d_nope: int,
+    tl_dtype: str,
+    input_layout: str,
+    is_causal: bool,
+    bm: int,
+):
+    c_dtype = "bfloat16_t" if tl_dtype == "bfloat16" else "half"
+    launcher_src = (
+        _MLA_TRACKB_SRC
+        + f"""
+extern "C" int launch_mla_trackb(
+    void* stream, void* q_n, void* q_r, void* k_n, void* k_r, void* out, void* o_part, void* lse_part,
+    int B, int S_q, int S_kv, int N_q, int splits, int causal, int is_bnsd, float scale) {{
+  mla_kv_reuse_c1c1c2<{bm}, 128, {d_nope}, 64, {c_dtype}><<<28, nullptr, stream>>>(
+      (__gm__ {c_dtype}*)q_n, (__gm__ {c_dtype}*)q_r, (__gm__ {c_dtype}*)k_n, (__gm__ {c_dtype}*)k_r,
+      (__gm__ {c_dtype}*)out, (__gm__ float*)o_part, (__gm__ float*)lse_part,
+      B, S_q, S_kv, N_q, splits, causal, is_bnsd, scale);
+  if (splits > 1) {{
+    mla_fast_combine<{d_nope}, {c_dtype}><<<56, nullptr, stream>>>(
+        (__gm__ float*)o_part, (__gm__ float*)lse_part, (__gm__ {c_dtype}*)out,
+        B * S_q * N_q, splits, B, S_q, N_q, is_bnsd);
+  }}
+  return 0;
+}}
+"""
+    )
+    tl_inc = str(Path(tilelang.__file__).resolve().parent.parent / "src")
+    asc_home = os.environ.get("ASCEND_HOME_PATH", "")
+    asc_inc = os.path.join(asc_home, "include") if asc_home else ""
+    opts = [f"-I{tl_inc}"]
+    if asc_inc and os.path.isdir(asc_inc):
+        opts.append(f"-I{asc_inc}")
+    opts.extend(PURE_SIMDVF_UBUF_FLAGS)
+    so_dir = tempfile.mkdtemp(prefix="mla_trackb_")
+    so_path = os.path.join(so_dir, "mla_trackb.so")
+    compile_ascend(
+        launcher_src,
+        target_format="so",
+        npu_arch="dav-3510",
+        options=opts,
+        path_target=so_path,
+    )
+    lib = ctypes.CDLL(so_path)
+    fn = lib.launch_mla_trackb
+    fn.argtypes = [ctypes.c_void_p] * 8 + [ctypes.c_int] * 7 + [ctypes.c_float]
+    is_bnsd = 1 if input_layout == "BNSD" else 0
+    causal_flag = 1 if is_causal else 0
+
+    def _run(q_n_flat, q_r_flat, k_n_contig, k_r_contig, _v_contig, scale):
+        b_dim = int(k_n_contig.shape[0])
+        s_kv = int(k_n_contig.shape[2] if is_bnsd else k_n_contig.shape[1])
+        q_rows_total = int(q_n_flat.shape[0])
+        if q_rows_total == 0 or s_kv <= 0:
+            return torch.zeros_like(q_n_flat)
+        s_dim = q_rows_total // (b_dim * n_q)
+        out_flat = torch.empty_like(q_n_flat)
+        splits = 1
+        if s_dim <= 2 and s_kv >= 512:
+            if b_dim == 1 and s_dim == 1 and s_kv >= 1024:
+                splits = min(7, max(1, (s_kv + 127) // 128))
+            elif b_dim <= 16 and s_kv >= 1024:
+                splits = 4 if (s_dim == 1) else 2
+            elif b_dim == 60 and s_dim == 1 and n_q == 64:
+                splits = 2
+            elif b_dim * s_dim <= 8 and s_kv >= 512:
+                splits = min(4, max(1, (s_kv + 127) // 128))
+        if splits > 1:
+            o_partial, lse_partial = _get_split_kv_workspace(
+                q_n_flat.device, splits, q_rows_total, d_nope
+            )
+            op_ptr, lp_ptr = o_partial.data_ptr(), lse_partial.data_ptr()
+        else:
+            op_ptr, lp_ptr = out_flat.data_ptr(), out_flat.data_ptr()
+        stream_ptr = torch.npu.current_stream().npu_stream
+        fn(
+            stream_ptr,
+            q_n_flat.data_ptr(),
+            q_r_flat.data_ptr(),
+            k_n_contig.data_ptr(),
+            k_r_contig.data_ptr(),
+            out_flat.data_ptr(),
+            op_ptr,
+            lp_ptr,
+            b_dim,
+            s_dim,
+            s_kv,
+            n_q,
+            splits,
+            causal_flag,
+            is_bnsd,
+            float(scale),
+        )
+        return out_flat
+
+    _run._so_lib = lib  # keep shared library loaded
+    return _run
+
+
 def _freeze_attr_value(val: object) -> object:
     if isinstance(val, dict):
         return tuple((str(k), _freeze_attr_value(v)) for k, v in sorted(val.items()))
@@ -2739,6 +3545,17 @@ def _get_kernel(
     )
     compiled = _KERNEL_CACHE.get(key)
     if compiled is None:
+        if extra_bk.get("_trackb"):
+            compiled = _build_mla_trackb_callable(
+                n_q=n_q,
+                d_nope=d_nope,
+                tl_dtype=tl_dtype,
+                input_layout=input_layout,
+                is_causal=bool(is_causal),
+                bm=int(bm),
+            )
+            _KERNEL_CACHE[key] = compiled
+            return compiled
         with _ascend_target_ctx():
             if resolved_builder is _build_mla_split_kv_decode_func:
                 prog = resolved_builder(
@@ -2859,8 +3676,20 @@ def mla(
     scale = (1.0 / math.sqrt(d_nope + d_rope)) if scaleValue <= 0 else float(scaleValue)
     tl_dtype = "bfloat16" if q_nope.dtype == torch.bfloat16 else "float16"
 
-    if (
+    use_trackb = (
         schedule_mode == "tuned"
+        and num_kv_splits_override is None
+        and n_kv == 1
+        and d_nope in (448, 512)
+        and d_rope == 64
+        and tl_dtype in ("float16", "bfloat16")
+        and inputLayout in ("BSND", "BNSD")
+        and getattr(q_nope, "is_npu", False)
+    )
+
+    if (
+        not use_trackb
+        and schedule_mode == "tuned"
         and inputLayout == "BNSD"
         and n_kv == 1
         and s_dim > 1
@@ -2938,6 +3767,21 @@ def mla(
     extra_builder_kwargs = dict(raw_bk) if isinstance(raw_bk, dict) else None
     raw_ck = cfg.get("combine_kwargs")
     extra_combine_kwargs = dict(raw_ck) if isinstance(raw_ck, dict) else None
+
+    if use_trackb:
+        if n_q >= 128:
+            if b_dim == 1 and s_dim == 1 and s_kv >= 1024:
+                bm = 32
+            elif s_dim <= 2 and b_dim <= 32 and s_kv >= 1024:
+                bm = 64
+            else:
+                bm = 128
+        elif n_q >= 64:
+            bm = 64
+        else:
+            bm = 32
+        num_kv_splits = 1
+        extra_builder_kwargs = {"_trackb": True}
 
     q_rows_total = b_dim * s_dim * n_q
     q_n_flat = q_nope.contiguous().view(q_rows_total, d_nope)
