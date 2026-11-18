@@ -1,0 +1,49 @@
+flowchart TB
+    classDef hw fill:#EEF4FA,stroke:#2B5B84,stroke-width:1.5px,color:#12263A
+    classDef boundary fill:#FDF6E9,stroke:#A66300,stroke-width:2px,color:#3B2300
+    classDef agent fill:#F2F8F2,stroke:#2D6A4F,stroke-width:1.5px,color:#133122
+    classDef verify fill:#F7F2FA,stroke:#6A3D9A,stroke-width:1.5px,color:#2E1647
+
+    subgraph PLANE_1["Plane 1: Hardware Specification and Core IR Substrate"]
+        P1_CORE["Core HIR / TIR and Effect System<br/>Addressable Scratchpads, Loop Pipelines,<br/>and Value-Form Reachability Guard"]:::hw
+        P1_HW["Hardware Fact Model<br/>Coupled Cube-Vector Topology, Memory Tiers,<br/>Legal DMA Paths, and Segmented Burst Curve"]:::hw
+        P1_OPS["Ascend Execution Scopes and Operators<br/>SIMD / SIMT Scopes, Pipe-Typed TIR Ops,<br/>and Storage-Typed Data-Movement Lowerings"]:::hw
+    end
+
+    subgraph PLANE_2["Plane 2: White-Box Compiler Analysis (Strict Compiler Objectivity Boundary)"]
+        P2_Z3["Modulo Pipeline Z3 Solver<br/>24-Bit Pipe Masks, Data/Reuse Edges,<br/>and Steady-State Initiation Interval"]:::boundary
+        P2_SNAP["Two-Snapshot Lowering Inspector<br/>Implicit Buffer Bloat, Single-Buffer Fallback,<br/>Burst-Scaled Cycles, and Alias Risk Scan"]:::boundary
+        P2_LEDGER["Objective Physical Ledger and Cross-IR Bridge<br/>Cube/Vector Roofline Floors, Scratchpad Waterlines,<br/>Wave Occupancy, and Diagnostic Telemetry"]:::boundary
+        P2_Z3 -->|"Initiation Interval and Schedule"| P2_LEDGER
+        P2_SNAP -->|"Snapshots, Cycles and Stall Flags"| P2_LEDGER
+    end
+
+    subgraph PLANE_3["Plane 3: Neuro-Symbolic Search and Knowledge Plane"]
+        P3_DIAG["Static-Dynamic Residual Analyzer and Causal KB<br/>Contrasts Analytical Bounds Against Measured Counters;<br/>Ranks Hardware Rules via Paradigm-Stratified Priors"]:::agent
+        P3_SYNTH["Dual-Channel Candidate Synthesizer<br/>Causal Rule Exploitation Paired with Isolated<br/>Zero-Prior Structural Exploration"]:::agent
+        P3_BEAM["Two-Lane Beam and Knowledge Flywheel<br/>Score-Winner Exploit Lane, Diverse Stepping-Stones,<br/>Counterfactual AST Ablation, and Probe Admission"]:::agent
+        P3_DIAG -->|"Bottleneck Context and Ranked Rules"| P3_SYNTH
+        P3_BEAM -->|"Parent Slice and Excluded Motifs"| P3_SYNTH
+        P3_BEAM -.->|"Admitted Verified Causal Rules"| P3_DIAG
+    end
+
+    subgraph PLANE_4["Plane 4: Regime-Sliced Kernels and Hardware Verification Plane"]
+        P4_REGIME["Regime-Sliced Operator Modules<br/>Shape-Specialized Sub-Kernels with<br/>AST-Isolated Partial-Symbol Override"]:::verify
+        P4_PYRAMID["Five-Tier Progressive Verification Pyramid<br/>Tier 0 Static Ledger Check / Tier 1 Offline Compile / Tier 2 Batched<br/>NPU Anchors and PMU / Tier 3 Full Gate / Tier 4 Official Benchmark"]:::verify
+        P4_REGIME -->|"Assembled Complete Module"| P4_PYRAMID
+    end
+
+    %% Plane 1 -> Plane 2 (planar non-crossing downward edges)
+    P1_CORE -->|"Loop Pipelines and Effects"| P2_Z3
+    P1_HW -->|"24-Bit Masks and Capacities"| P2_Z3
+    P1_HW -->|"Burst Curve and Hierarchy Limits"| P2_SNAP
+    P1_OPS -->|"Op Latency and DMA Rules"| P2_SNAP
+
+    %% Compiler Objectivity Boundary crossing (single clean trunk)
+    P2_LEDGER -->|"Objective Ledger and Blueprint"| P3_DIAG
+
+    %% Plane 3 -> Plane 4 forward path (left column)
+    P3_SYNTH -->|"Candidate Symbol Patch"| P4_REGIME
+
+    %% Plane 4 -> Plane 3 closed-loop feedback (right rail)
+    P4_PYRAMID -.->|"Evaluated Scores, Rollback Status and PMU Counters"| P3_BEAM

@@ -1,0 +1,68 @@
+flowchart TB
+    classDef prep fill:#EEF4FA,stroke:#2B5B84,stroke-width:1.5px,color:#12263A
+    classDef diag fill:#FDF6E9,stroke:#A66300,stroke-width:1.5px,color:#3B2300
+    classDef synth fill:#F2F8F2,stroke:#2D6A4F,stroke-width:1.5px,color:#133122
+    classDef gate fill:#F7F2FA,stroke:#6A3D9A,stroke-width:1.5px,color:#2E1647
+    classDef drop fill:#FDF0F0,stroke:#A61C1C,stroke-width:1.5px,color:#4A0D0D
+
+    subgraph S1["Stage 1: Operator Authoring and Baseline Grounding"]
+        S1_OP["Author Mathematical HIR, Scheduled HIR,<br/>and Regime-Sliced TileLang Module"]:::prep
+        S1_NAV["Lower Cross-IR Navigation Blueprint<br/>Cube/Vector Roofline, Legal Ops, and Z3 Schedule"]:::prep
+        S1_BASE["Benchmark Baseline Module on NPU<br/>Establish Anchor Speedups, Composite Score, and PMU Profile"]:::prep
+        S1_OP -->|"Authored and Scheduled IR"| S1_NAV
+        S1_NAV -->|"Navigation Blueprint"| S1_BASE
+    end
+
+    subgraph S2["Stage 2: Regime Selection and Bottleneck Diagnosis"]
+        S2_PICK["Select Target Regime by Remaining Headroom<br/>Pick Parent Kernel (Incumbent Winner or Stepping-Stone)"]:::diag
+        S2_RES["Inspect Static Physical Ledger and Input-Domain Envelope<br/>Quantify Static-vs-PMU Residual Gap and Alias/Barrier Risks"]:::diag
+        S2_PICK -->|"Active Regime Context"| S2_RES
+    end
+
+    subgraph S3["Stage 3: Dual-Channel Stateless Candidate Synthesis"]
+        S3_FREE["Zero-Prior Exploration Channel<br/>Explore Novel Loop and Buffer Schedules<br/>Under Negative Mechanism Constraints"]:::synth
+        S3_RULE["Rule-Guided Exploitation Channel<br/>Match Top Paradigm-Ranked Causal Rules<br/>to Active Ledger and Residual Predicates"]:::synth
+        S3_SPLICE["Splice Partial-Symbol Overrides via AST<br/>Preserve Protected Siblings; Garbage-Collect Dead Helpers"]:::synth
+        S3_FREE -->|"Structural Exploration Patch"| S3_SPLICE
+        S3_RULE -->|"Rule-Guided Patch"| S3_SPLICE
+    end
+
+    subgraph S4["Stage 4: Per-Round Progressive Verification (Tiers 0 to 3)"]
+        S4_T0["Tier 0: Static Physical Precheck<br/>Validate Symbol Contract, DMA Legality, and SRAM Limits"]:::gate
+        S4_T1["Tier 1: Offline Device Compilation<br/>Concurrent Backend Build with Bounded Syntax Repair"]:::gate
+        S4_DROP["Reject Candidate Prior to NPU Batch<br/>Penalize Failed Causal Rules (Exempt Transport Timeouts)"]:::drop
+        S4_T2["Tier 2: Batched NPU Anchor Evaluation<br/>Prewarm Host Cache, Rank Composite Score, Profile Winner PMU"]:::gate
+        S4_T3["Tier 3: Full-Suite Acceptance Gate<br/>Run Full Benchmark, Edge Shapes, and Dynamic Cache Check"]:::gate
+        S4_T0 -->|"Static OK"| S4_T1
+        S4_T0 -->|"Envelope Violation"| S4_DROP
+        S4_T1 -->|"Compile OK"| S4_T2
+        S4_T1 -->|"Unrepaired Compile Fail"| S4_DROP
+        S4_T2 -->|"Clears Tail Guard and Gain Gate"| S4_T3
+    end
+
+    subgraph S5["Stage 5: Evolutionary Beam Update and Knowledge Distillation"]
+        S5_BEAM["Update Two-Lane Beam State<br/>Advance Promoted Incumbent or Roll Back Regression;<br/>Retain Novel Near-Tie Stepping-Stones"]:::synth
+        S5_FLY["Counterfactual Flywheel Distillation<br/>Decompose Winning AST Diffs and Gate New Causal Rules<br/>via Parameterized Hardware Micro-Probes"]:::synth
+    end
+
+    subgraph S6["Stage 6: Official Full-Distribution Gate and Final Delivery"]
+        S6_T4["Tier 4: Official Full-Distribution Gate<br/>Score Entire Benchmark Suite; Detect Non-Anchor Regressions"]:::gate
+        S6_DONE["Verified Production Operator Module and Distilled Causal Rules"]:::prep
+        S6_T4 -->|"All Cases Verified"| S6_DONE
+    end
+
+    %% Stage-to-Stage Forward Flow
+    S1_BASE -->|"Initialized Baseline State"| S2_PICK
+    S2_RES -->|"Ledger Delta and Excluded Motifs"| S3_FREE
+    S2_RES -->|"Matched Rules and Context"| S3_RULE
+    S3_SPLICE -->|"Assembled Complete Operator Module"| S4_T0
+    S4_T3 -->|"Promoted Winner or Atomic Rollback"| S5_BEAM
+    S4_T2 -->|"Anchor Scores, Novelty and PMU"| S5_BEAM
+    %% Keep Left branch (S6_T4) declared before Right branch (S5_FLY) for planar rails
+    S5_BEAM -->|"Target Met or Round Budget Reached"| S6_T4
+    S5_BEAM -->|"Promoted Winner Delta"| S5_FLY
+
+    %% Clean Outer-Margin Feedback Rails
+    S5_BEAM -.->|"Next Optimization Round"| S2_PICK
+    S6_T4 -.->|"Dynamic Anchor Catch-Up on Non-Anchor Regression"| S2_PICK
+    S5_FLY -.->|"Admit Verified Causal Rule"| S3_RULE
