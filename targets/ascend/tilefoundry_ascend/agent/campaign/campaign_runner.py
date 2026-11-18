@@ -46,6 +46,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     run_l1_compile_check,
     run_l3_full_contract_via_agent_gates,
     run_l4_official_cannbench_via_agent_gates,
+    run_micro_probe_via_agent_gates,
     run_surrogate_batch_via_agent_gates,
 )
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
@@ -1013,6 +1014,22 @@ class PerfTargetCampaignRunner:
             self._compile_regime_nav_packets()
         )
         self._active_incumbent_source: str = ""
+        if (
+            self._flywheel is not None
+            and self._flywheel._probe_runner is None
+            and l2_batch_evaluator is None
+            and (
+                self._env_file is not None
+                or bool(os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip())
+            )
+        ):
+            self._flywheel._probe_runner = lambda spec: run_micro_probe_via_agent_gates(
+                spec,
+                source_root=self._source_root,
+                env_file=self._env_file,
+                device_id=self._config.device_id,
+                min_speedup=self._flywheel._min_probe_speedup,
+            )
 
     @property
     def _beam(self) -> TwoLaneBeamSearch:
@@ -1777,6 +1794,172 @@ class PerfTargetCampaignRunner:
             last_unpromoted_regime,
         )
 
+    def _resolve_round_parent(
+        self,
+        *,
+        incumbent_source: str,
+        regime_spec: RegimeTargetSpec,
+        regime_beam: TwoLaneBeamSearch,
+        escalated: bool,
+    ) -> tuple[str, str, str, BeamCandidate | None, str]:
+        """Select parent module, full slice snippet, lane, and stepping stone cleanly."""
+        _, default_snippet = extract_regime_snippet(incumbent_source, regime_spec)
+        if not escalated:
+            return incumbent_source, default_snippet, "exploit", None, ""
+        for stone in regime_beam.stepping_stone_beam:
+            try:
+                stone_patched = patch_regime_into_module(
+                    incumbent_source,
+                    regime_spec,
+                    stone.dsl_source,
+                )
+                l0_probe = self._run_l0(stone_patched, regime_spec)
+                if not l0_probe.passed:
+                    logger.warning(
+                        "Skipping invalid stepping-stone %s for regime %s: %s",
+                        stone.candidate_id,
+                        regime_spec.regime_tag,
+                        l0_probe.error_message[:160],
+                    )
+                    continue
+                _, hydrated_snippet = extract_regime_snippet(stone_patched, regime_spec)
+                regime_beam.mark_parent_selected(stone)
+                hyp = stone.hypothesis if stone.worker_kind == "creative_explore" else ""
+                return stone_patched, hydrated_snippet, "stepping_stone", stone, hyp
+            except Exception as exc:
+                logger.warning(
+                    "Failed to patch stepping-stone slice %s for regime %s: %s",
+                    stone.candidate_id,
+                    regime_spec.regime_tag,
+                    exc,
+                )
+        return incumbent_source, default_snippet, "stepping_stone", None, ""
+
+    @staticmethod
+    def _evaluate_causal_rule_outcome(
+        *,
+        rule: AscendCausalRule,
+        res_all_passed: bool,
+        rolled_back: bool,
+        ledger: ObjectivePhysicalLedger,
+        features: object,
+        cand_residual: StaticDynamicResidual,
+        cand_lat_us: float,
+        cand_obj_score: float,
+        parent_ledger: ObjectivePhysicalLedger,
+        parent_residual: StaticDynamicResidual,
+        parent_lat_us: float,
+        parent_obj_score: float,
+        has_cand_msprof: bool,
+    ) -> tuple[bool, float]:
+        """Evaluate whether a rule's causal postcondition materialized without regression."""
+        if not res_all_passed or not ledger.is_legal or rolled_back:
+            return False, 0.0
+        if parent_lat_us > 0.0 and cand_lat_us > parent_lat_us * 1.02:
+            return False, 0.0
+        if cand_obj_score < parent_obj_score - 0.05:
+            return False, 0.0
+
+        post_ctx = build_predicate_context(
+            ledger,
+            features=features,
+            residual=cand_residual,
+            prev_ledger=parent_ledger,
+        )
+        prev_ns = post_ctx.setdefault("prev", {})
+        if isinstance(prev_ns, dict):
+            prev_ns.update(parent_residual.to_dict())
+            prev_ns["measured_latency_us"] = float(parent_lat_us)
+        if not has_cand_msprof:
+            for ratio_key in (
+                "measured_aic_mac_ratio",
+                "measured_aiv_vec_ratio",
+                "measured_mte2_wait_ratio",
+                "measured_sync_stall_ratio",
+                "unexplained_gap_ratio",
+            ):
+                post_ctx[ratio_key] = getattr(parent_residual, ratio_key)
+
+        causal_ok = rule.postcondition_realized(post_ctx)
+        if not causal_ok and not has_cand_msprof:
+            pmu_fields = (
+                "measured_mte2_wait_ratio",
+                "measured_sync_stall_ratio",
+                "unexplained_gap_ratio",
+                "measured_aiv_vec_ratio",
+                "measured_aic_mac_ratio",
+            )
+            if any(k in rule.expected_postcondition for k in pmu_fields):
+                causal_ok = bool(
+                    parent_lat_us > 0.0
+                    and cand_lat_us < 0.98 * parent_lat_us
+                    and cand_obj_score > parent_obj_score + 0.02
+                )
+        gain = (
+            max(0.0, (parent_lat_us - cand_lat_us) / max(parent_lat_us, 1e-6))
+            if (causal_ok and parent_lat_us > 0.0 and cand_lat_us > 0.0)
+            else 0.0
+        )
+        return bool(causal_ok), gain
+
+    def _run_flywheel_distillation(
+        self,
+        *,
+        baseline_source: str,
+        winner_source: str,
+        baseline_latency_us: float,
+        winner_latency_us: float,
+        func_name: str,
+        regime_spec: RegimeTargetSpec,
+        active_anchors: Sequence[AnchorCaseSpec],
+        paradigm: str,
+    ) -> list[str]:
+        """Distill and verify causal rules on hardware through AgentGates."""
+        if self._flywheel is None:
+            return []
+        regime_anchors = [
+            a for a in active_anchors if a.regime_tag == regime_spec.regime_tag
+        ] or list(active_anchors)
+        anchor_dims = (
+            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+        )
+
+        def _batch_chunk_latencies(chunk_pairs: Sequence[tuple[str, str]]) -> dict[str, float]:
+            if not chunk_pairs or not regime_anchors:
+                return {}
+            with tempfile.TemporaryDirectory(prefix="tf_fly_batch_") as tmp_dir:
+                cand_files: list[tuple[str, Path]] = []
+                for chunk_id, ablated_src in chunk_pairs:
+                    cpath = Path(tmp_dir) / f"{chunk_id}.py"
+                    cpath.write_text(ablated_src, encoding="utf-8")
+                    cand_files.append((chunk_id, cpath))
+                try:
+                    batch_res = self._run_l2_batch(cand_files, regime_anchors)
+                except Exception as exc:
+                    logger.debug("Flywheel batched ablation timing skipped: %s", exc)
+                    return {}
+            out: dict[str, float] = {}
+            for cid, res in batch_res.items():
+                if res.all_passed and res.mean_latency_us() > 0.0:
+                    out[cid] = res.mean_latency_us()
+            return out
+
+        distill_rep = self._flywheel.distill_from_pair(
+            baseline_dsl=baseline_source,
+            winner_dsl=winner_source,
+            baseline_latency_us=baseline_latency_us,
+            winner_latency_us=winner_latency_us,
+            factory_name=func_name,
+            factory_kwargs=regime_spec.sample_builder_kwargs,
+            config_selector_name=regime_spec.config_selector_fn or None,
+            dims=anchor_dims or None,
+            batch_latency_evaluator=_batch_chunk_latencies,
+            paradigm=paradigm,
+            kb_output_path=self._campaign_kb_path,
+            rule_id_prefix="R_FLYWHEEL",
+        )
+        return list(distill_rep.admitted_rule_ids)
+
     async def _execute_single_round(
         self,
         *,
@@ -1800,39 +1983,25 @@ class PerfTargetCampaignRunner:
         self._active_incumbent_source = incumbent_source
         self._active_regime_tag = regime_spec.regime_tag
         regime_beam = self.beam_for_regime(regime_spec.regime_tag)
-        func_name, default_snippet = extract_regime_snippet(incumbent_source, regime_spec)
+        func_name, _default_snippet = extract_regime_snippet(incumbent_source, regime_spec)
 
         escalated = stagnation_rounds >= self._config.stagnation_escalate_rounds
-        parent_lane = "exploit"
-        parent_snippet = default_snippet
-        stone_ledger: ObjectivePhysicalLedger | None = None
-        stone_track: str | None = None
-        selected_stone_id: str | None = None
-        selected_stone_hypothesis = ""
-        creative_effort = "high"
-        if escalated:
-            creative_effort = "xhigh"
-            if regime_beam.stepping_stone_beam:
-                stone = regime_beam.stepping_stone_beam[0]
-                regime_beam.mark_parent_selected(stone)
-                try:
-                    patch_regime_into_module(incumbent_source, regime_spec, stone.dsl_source)
-                    parent_snippet = stone.dsl_source
-                    parent_lane = "stepping_stone"
-                    stone_ledger = stone.ledger
-                    stone_track = stone.track
-                    selected_stone_id = stone.candidate_id
-                    if stone.worker_kind == "creative_explore":
-                        selected_stone_hypothesis = stone.hypothesis
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to patch stepping-stone slice for regime %s: %s",
-                        regime_spec.regime_tag,
-                        exc,
-                    )
-                    parent_lane = "stepping_stone"
-            else:
-                parent_lane = "stepping_stone"
+        creative_effort = "xhigh" if escalated else "high"
+        (
+            parent_module_source,
+            parent_snippet,
+            parent_lane,
+            selected_stone,
+            selected_stone_hypothesis,
+        ) = self._resolve_round_parent(
+            incumbent_source=incumbent_source,
+            regime_spec=regime_spec,
+            regime_beam=regime_beam,
+            escalated=escalated,
+        )
+        stone_ledger = selected_stone.ledger if selected_stone is not None else None
+        stone_track = selected_stone.track if selected_stone is not None else None
+        selected_stone_id = selected_stone.candidate_id if selected_stone is not None else None
 
         active_parent_id = (
             selected_stone_id
@@ -1867,23 +2036,45 @@ class PerfTargetCampaignRunner:
         paradigm = self._derive_paradigm(parent_ledger)
         if stagnation_rounds >= 1:
             self._collect_msprof_for_regimes(
-                incumbent_source,
+                parent_module_source,
                 best_result,
                 active_anchors,
                 [regime_spec],
             )
-        incumbent_sha = self._source_sha256(incumbent_source)
-        telemetry_payload: dict[str, object] = {
-            "dur_us": local_best.mean_latency_us(),
-            "roofline_eta": local_best.avg_roofline_eta,
-        }
-        cached_msprof = self._msprof_cache.get((incumbent_sha, regime_spec.regime_tag))
-        if cached_msprof:
-            for k, v in cached_msprof.items():
+        parent_sha = self._source_sha256(parent_module_source)
+        cached_parent_msprof = self._msprof_cache.get((parent_sha, regime_spec.regime_tag))
+        parent_lat_us = (
+            selected_stone.latency_us
+            if (selected_stone is not None and selected_stone.latency_us > 0.0)
+            else local_best.mean_latency_us()
+        )
+        parent_obj_score = (
+            selected_stone.objective_score
+            if (selected_stone is not None and selected_stone.objective_score is not None)
+            else local_best.surrogate_score
+        )
+        if cached_parent_msprof:
+            telemetry_payload: dict[str, object] = {
+                "dur_us": parent_lat_us,
+                "roofline_eta": local_best.avg_roofline_eta,
+            }
+            for k, v in cached_parent_msprof.items():
                 if k == "dur_us" and float(v) <= 0.0:
                     continue
                 telemetry_payload[k] = v
-        parent_residual = compute_static_dynamic_residual(parent_ledger, telemetry_payload)
+            parent_residual = compute_static_dynamic_residual(parent_ledger, telemetry_payload)
+        elif selected_stone is not None and (
+            selected_stone.residual.measured_aiv_vec_ratio > 0.0
+            or selected_stone.residual.measured_aic_mac_ratio > 0.0
+            or selected_stone.residual.measured_mte2_wait_ratio > 0.0
+        ):
+            parent_residual = selected_stone.residual
+        else:
+            telemetry_payload = {
+                "dur_us": parent_lat_us,
+                "roofline_eta": local_best.avg_roofline_eta,
+            }
+            parent_residual = compute_static_dynamic_residual(parent_ledger, telemetry_payload)
         ctx = build_predicate_context(
             parent_ledger,
             features=parent_features,
@@ -1915,7 +2106,7 @@ class PerfTargetCampaignRunner:
                         parent_ledger=parent_ledger,
                         parent_residual=parent_residual,
                         track=parent_track,
-                        incumbent_source=incumbent_source,
+                        incumbent_source=parent_module_source,
                     ),
                 )
             )
@@ -1933,7 +2124,7 @@ class PerfTargetCampaignRunner:
             prescreen_cf: tuple[str, ...] = ()
             try:
                 resolved_cfg = resolve_regime_config(
-                    incumbent_source,
+                    parent_module_source,
                     regime_spec,
                     dims=anchor_dims,
                 )
@@ -1950,7 +2141,7 @@ class PerfTargetCampaignRunner:
             var_bindings = build_anchor_var_bindings(anchor_dims, kwargs=prescreen_kwargs)
             prescreen_summary = build_prescreen_summary_from_kwargs(
                 prescreen_kwargs,
-                dsl_source=incumbent_source,
+                dsl_source=parent_module_source,
                 factory_name=prescreen_factory,
                 var_bindings=var_bindings or None,
                 config_selector_name=regime_spec.config_selector_fn or None,
@@ -1987,7 +2178,7 @@ class PerfTargetCampaignRunner:
                         parent_ledger=parent_ledger,
                         parent_residual=parent_residual,
                         track=parent_track,
-                        incumbent_source=incumbent_source,
+                        incumbent_source=parent_module_source,
                         parent_hypothesis=selected_stone_hypothesis,
                     ),
                 )
@@ -2046,7 +2237,7 @@ class PerfTargetCampaignRunner:
             l0_l1_checks = await run_l0_l1_round_filter(
                 raw_candidates,
                 patch_fn=lambda snip: patch_regime_into_module(
-                    incumbent_source, regime_spec, snip
+                    parent_module_source, regime_spec, snip
                 ),
                 l0_checker=lambda mod_src: self._run_l0(mod_src, regime_spec),
                 l1_compiler=lambda mod_src: self._run_l1(mod_src, regime_spec),
@@ -2089,88 +2280,11 @@ class PerfTargetCampaignRunner:
                     for chk in passed_checks:
                         failed_entries.append((chk.candidate_id, "l2_error", str(exc)[:200]))
 
-        beam_updates: list[BeamCandidate] = []
-        passing_candidates: list[tuple[L0L1CandidateCheck, CandidateSurrogateResult]] = []
-        for chk in passed_checks:
-            res = l2_results.get(chk.candidate_id)
-            if res is None:
-                continue
-            wkind, rule, cand_hypothesis = meta_by_id[chk.candidate_id]
-            ledger = (
-                chk.stage_a.ledger
-                if chk.stage_a and chk.stage_a.ledger is not None
-                else _fallback_ledger()
-            )
-            track = (
-                chk.stage_a.route.track
-                if self._enable_track_router and chk.stage_a and chk.stage_a.route is not None
-                else "unconstrained"
-            )
-            cand_local_res = res.for_regime(regime_spec.regime_tag)
-            local_res = cand_local_res if cand_local_res.anchors else res
-            lat_us = local_res.mean_latency_us()
-            obj_score = (
-                cand_local_res.surrogate_score
-                if cand_local_res.anchors
-                else res.surrogate_score
-            )
-            beam_updates.append(
-                BeamCandidate(
-                    candidate_id=chk.candidate_id,
-                    round_idx=round_idx,
-                    worker_kind=wkind,
-                    rule_id=rule.rule_id if rule else None,
-                    dsl_source=chk.snippet_source,
-                    track=track,
-                    ledger=ledger,
-                    residual=compute_static_dynamic_residual(
-                        ledger,
-                        {"dur_us": lat_us, "roofline_eta": local_res.avg_roofline_eta},
-                    ),
-                    latency_us=lat_us,
-                    accuracy_passed=local_res.all_passed,
-                    structural_signature=extract_structural_signature(
-                        chk.snippet_source, track=track
-                    ),
-                    hypothesis=cand_hypothesis,
-                    parent_id=active_parent_id,
-                    features=(
-                        chk.stage_a.features
-                        if (self._enable_track_router and chk.stage_a)
-                        else None
-                    ),
-                    objective_score=obj_score,
-                )
-            )
-            if rule is not None:
-                if cand_local_res.anchors and regime_best.anchors:
-                    surrogate_gain = (
-                        (cand_local_res.surrogate_score - regime_best.surrogate_score)
-                        if res.all_passed
-                        else 0.0
-                    )
-                    realized = res.all_passed and (
-                        _surrogate_rank_key(cand_local_res) > _surrogate_rank_key(regime_best)
-                    )
-                else:
-                    surrogate_gain = (
-                        (res.surrogate_score - best_result.surrogate_score)
-                        if res.all_passed
-                        else 0.0
-                    )
-                    realized = res.all_passed and (
-                        _surrogate_rank_key(res) > _surrogate_rank_key(best_result)
-                    )
-                self._tracker.record_outcome(
-                    rule.rule_id,
-                    postcondition_realized=realized,
-                    speed_gain=max(0.0, surrogate_gain),
-                    paradigm=paradigm,
-                )
-            if res.all_passed:
-                passing_candidates.append((chk, res))
-
-        regime_beam.update(beam_updates)
+        passing_candidates: list[tuple[L0L1CandidateCheck, CandidateSurrogateResult]] = [
+            (chk, l2_results[chk.candidate_id])
+            for chk in passed_checks
+            if chk.candidate_id in l2_results and l2_results[chk.candidate_id].all_passed
+        ]
 
         best_round_speedup = best_result.avg_speedup
         best_round_surrogate_score = best_result.surrogate_score
@@ -2179,6 +2293,11 @@ class PerfTargetCampaignRunner:
         new_incumbent = incumbent_source
         new_best = best_result
         round_admitted: list[str] = []
+        top_chk: L0L1CandidateCheck | None = None
+        top_res: CandidateSurrogateResult | None = None
+        rel_gain = 0.0
+        local_rel_gain = 0.0
+        stagnation_after = stagnation_rounds + 1
 
         if passing_candidates:
             top_chk, top_res = max(
@@ -2217,7 +2336,30 @@ class PerfTargetCampaignRunner:
                     )
                 )
             )
+            if top_local.anchors and best_local.anchors:
+                top_local_lat = top_local.mean_latency_us()
+                best_local_lat = best_local.mean_latency_us()
+                local_rel_gain = max(
+                    (top_local.avg_speedup - best_local.avg_speedup)
+                    / max(best_local.avg_speedup, 1e-6),
+                    (
+                        (best_local_lat - top_local_lat) / max(best_local_lat, 1e-6)
+                        if (top_local_lat > 0.0 and best_local_lat > 0.0)
+                        else 0.0
+                    ),
+                )
+            else:
+                top_local_lat = 0.0
             dual_criterion_ok = global_gain_ok or local_gain_ok
+            if (tail_guard_ok and dual_criterion_ok) or (
+                top_local_lat > 0.0 and top_local_lat < 0.98 * local_best.mean_latency_us()
+            ):
+                self._collect_msprof_for_regimes(
+                    top_chk.patched_module_source,
+                    top_res,
+                    active_anchors,
+                    [regime_spec],
+                )
             if tail_guard_ok and dual_criterion_ok:
                 _atomic_write_text(self._target_module_path, top_chk.patched_module_source)
                 l3_res = self._run_l3_contract(self._target_module_path)
@@ -2226,40 +2368,144 @@ class PerfTargetCampaignRunner:
                     new_incumbent = top_chk.patched_module_source
                     new_best = top_res
                     stagnation_after = 0
-                    self._collect_msprof_for_regimes(
-                        new_incumbent,
-                        new_best,
-                        active_anchors,
-                        [regime_spec],
-                    )
-                    if rel_gain >= self._config.min_flywheel_gain and self._flywheel is not None:
-                        try:
-                            distill_rep = self._flywheel.distill_from_pair(
-                                baseline_dsl=incumbent_source,
-                                winner_dsl=top_chk.patched_module_source,
-                                baseline_latency_us=best_result.mean_latency_us(),
-                                winner_latency_us=top_res.mean_latency_us(),
-                                factory_name=func_name,
-                                factory_kwargs=regime_spec.sample_builder_kwargs,
-                                kb_output_path=self._campaign_kb_path,
-                                rule_id_prefix=f"R_{self._config.operator_name.upper()}",
-                            )
-                            round_admitted.extend(distill_rep.admitted_rule_ids)
-                            admitted_rule_ids.extend(distill_rep.admitted_rule_ids)
-                        except Exception as exc:
-                            logger.warning(
-                                "Flywheel distillation failed for regime %s: %s",
-                                regime_spec.regime_tag,
-                                exc,
-                            )
                 else:
                     _atomic_write_text(self._target_module_path, incumbent_source)
                     rolled_back_l3 = True
                     stagnation_after = stagnation_rounds + 1
-            else:
-                stagnation_after = stagnation_rounds + 1
-        else:
-            stagnation_after = stagnation_rounds + 1
+
+        beam_updates: list[BeamCandidate] = []
+        top_chk_id = top_chk.candidate_id if top_chk is not None else None
+        for chk in passed_checks:
+            res = l2_results.get(chk.candidate_id)
+            if res is None:
+                continue
+            wkind, rule, cand_hypothesis = meta_by_id[chk.candidate_id]
+            ledger = (
+                chk.stage_a.ledger
+                if chk.stage_a and chk.stage_a.ledger is not None
+                else _fallback_ledger()
+            )
+            track = (
+                chk.stage_a.route.track
+                if self._enable_track_router and chk.stage_a and chk.stage_a.route is not None
+                else "unconstrained"
+            )
+            cand_local_res = res.for_regime(regime_spec.regime_tag)
+            local_res = cand_local_res if cand_local_res.anchors else res
+            lat_us = local_res.mean_latency_us()
+            obj_score = (
+                cand_local_res.surrogate_score
+                if cand_local_res.anchors
+                else res.surrogate_score
+            )
+            cand_sha = self._source_sha256(chk.patched_module_source)
+            cached_cand_msprof = self._msprof_cache.get((cand_sha, regime_spec.regime_tag))
+            cand_tel: dict[str, object] = {
+                "dur_us": lat_us,
+                "measured_latency_us": lat_us,
+                "roofline_eta": local_res.avg_roofline_eta,
+            }
+            if cached_cand_msprof:
+                for k, v in cached_cand_msprof.items():
+                    if k == "dur_us" and float(v) <= 0.0:
+                        continue
+                    cand_tel[k] = v
+            cand_residual = compute_static_dynamic_residual(ledger, cand_tel)
+            try:
+                _, canonical_slice = extract_regime_snippet(chk.patched_module_source, regime_spec)
+            except Exception:
+                canonical_slice = chk.snippet_source
+
+            beam_updates.append(
+                BeamCandidate(
+                    candidate_id=chk.candidate_id,
+                    round_idx=round_idx,
+                    worker_kind=wkind,
+                    rule_id=rule.rule_id if rule else None,
+                    dsl_source=canonical_slice,
+                    track=track,
+                    ledger=ledger,
+                    residual=cand_residual,
+                    latency_us=lat_us,
+                    accuracy_passed=local_res.all_passed,
+                    structural_signature=extract_structural_signature(
+                        canonical_slice, track=track
+                    ),
+                    hypothesis=cand_hypothesis,
+                    parent_id=active_parent_id,
+                    features=(
+                        chk.stage_a.features
+                        if (self._enable_track_router and chk.stage_a)
+                        else None
+                    ),
+                    objective_score=obj_score,
+                )
+            )
+            if rule is not None:
+                cand_rolled_back = bool(rolled_back_l3 and chk.candidate_id == top_chk_id)
+                realized, causal_gain = self._evaluate_causal_rule_outcome(
+                    rule=rule,
+                    res_all_passed=res.all_passed,
+                    rolled_back=cand_rolled_back,
+                    ledger=ledger,
+                    features=chk.stage_a.features if chk.stage_a else None,
+                    cand_residual=cand_residual,
+                    cand_lat_us=lat_us,
+                    cand_obj_score=obj_score,
+                    parent_ledger=parent_ledger,
+                    parent_residual=parent_residual,
+                    parent_lat_us=parent_lat_us,
+                    parent_obj_score=parent_obj_score,
+                    has_cand_msprof=bool(cached_cand_msprof),
+                )
+                self._tracker.record_outcome(
+                    rule.rule_id,
+                    postcondition_realized=realized,
+                    speed_gain=causal_gain,
+                    paradigm=paradigm,
+                )
+
+        regime_beam.update(beam_updates)
+
+        if (
+            promoted
+            and top_chk is not None
+            and top_res is not None
+            and max(rel_gain, local_rel_gain) >= self._config.min_flywheel_gain
+            and self._flywheel is not None
+        ):
+            top_local_eval = top_res.for_regime(regime_spec.regime_tag)
+            best_local_eval = best_result.for_regime(regime_spec.regime_tag)
+            fly_base_lat = (
+                best_local_eval.mean_latency_us()
+                if best_local_eval.anchors
+                else best_result.mean_latency_us()
+            )
+            fly_win_lat = (
+                top_local_eval.mean_latency_us()
+                if top_local_eval.anchors
+                else top_res.mean_latency_us()
+            )
+            try:
+                round_admitted.extend(
+                    self._run_flywheel_distillation(
+                        baseline_source=incumbent_source,
+                        winner_source=new_incumbent,
+                        baseline_latency_us=fly_base_lat,
+                        winner_latency_us=fly_win_lat,
+                        func_name=func_name,
+                        regime_spec=regime_spec,
+                        active_anchors=active_anchors,
+                        paradigm=paradigm,
+                    )
+                )
+                admitted_rule_ids.extend(round_admitted)
+            except Exception as exc:
+                logger.warning(
+                    "Flywheel distillation failed for regime %s: %s",
+                    regime_spec.regime_tag,
+                    exc,
+                )
 
         pruned_rules = self._tracker.prune_underperforming(paradigm=paradigm)
         if pruned_rules:

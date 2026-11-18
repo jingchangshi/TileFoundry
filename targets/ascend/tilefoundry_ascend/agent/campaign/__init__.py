@@ -38,6 +38,15 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     patch_regime_into_module,
     resolve_regime_config,
 )
+from tilefoundry_ascend.agent.campaign.marathon import (
+    ExtremeCampaignRunner,
+    FastCreativeAgyBackend,
+    MarathonConfig,
+    discover_marathon_environment,
+    ensure_marathon_env_file,
+    run_operator_marathon,
+    watch_marathon_rounds,
+)
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     AnchorEvalMetrics,
     CandidateSurrogateResult,
@@ -56,6 +65,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     run_l1_compile_check,
     run_l3_full_contract_via_agent_gates,
     run_l4_official_cannbench_via_agent_gates,
+    run_micro_probe_via_agent_gates,
     run_multi_operator_surrogate_batch_via_agent_gates,
     run_surrogate_batch_via_agent_gates,
 )
@@ -71,12 +81,15 @@ __all__ = [
     "DEFAULT_ANCHORS",
     "DEFAULT_PERF_TARGETS",
     "DEFAULT_REGIME_SPECS",
+    "ExtremeCampaignRunner",
+    "FastCreativeAgyBackend",
     "INPUT_DOMAIN_ENVELOPES",
     "InputDomainEnvelope",
     "L0L1CandidateCheck",
     "L3AcceptanceResult",
     "L4CannbenchResult",
     "MLA_ANCHORS",
+    "MarathonConfig",
     "PerfTargetCampaignRunner",
     "PerfTargetSpec",
     "RegimeSpec",
@@ -90,6 +103,8 @@ __all__ = [
     "build_arg_parser",
     "collect_bottleneck_msprof_via_agent_gates",
     "compute_case_eq3_score",
+    "discover_marathon_environment",
+    "ensure_marathon_env_file",
     "ensure_npu_compare_shim_dir",
     "extract_regime_snippet",
     "get_default_anchors",
@@ -110,6 +125,9 @@ __all__ = [
     "run_l1_compile_check",
     "run_l3_full_contract_via_agent_gates",
     "run_l4_official_cannbench_via_agent_gates",
+    "run_micro_probe_via_agent_gates",
     "run_multi_operator_surrogate_batch_via_agent_gates",
+    "run_operator_marathon",
     "run_surrogate_batch_via_agent_gates",
+    "watch_marathon_rounds",
 ]

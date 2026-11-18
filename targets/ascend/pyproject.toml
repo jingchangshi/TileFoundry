@@ -14,6 +14,10 @@ license-files = ["LICENSE"]
 [project.entry-points."tilefoundry.targets"]
 ascend = "tilefoundry_ascend.ascend"
 
+[project.scripts]
+tilefoundry-ascend-campaign = "tilefoundry_ascend.agent.campaign.cli:main"
+tilefoundry-ascend-marathon = "tilefoundry_ascend.agent.campaign.marathon:main"
+
 [tool.setuptools_scm]
 root = "../.."
 

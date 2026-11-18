@@ -1659,6 +1659,190 @@ def run_l3_full_contract_via_agent_gates(
     )
 
 
+def _prewarm_micro_probe_cache(
+    spec: object,
+    *,
+    source_root: Path,
+    env_file: Path,
+    tl_cache_dir: Path,
+) -> None:
+    env_vals = parse_simple_env_file(env_file)
+    python_bin = (
+        env_vals.get("TILEFOUNDRY_NPU_PYTHON")
+        or os.environ.get("TILEFOUNDRY_NPU_PYTHON")
+        or sys.executable
+    )
+    cann_setup = (env_vals.get("TILEFOUNDRY_NPU_CANN_SETUP") or "").strip()
+    tl_source = (env_vals.get("TILEFOUNDRY_NPU_TILELANG_SOURCE") or "").strip()
+
+    tl_cache_dir.mkdir(parents=True, exist_ok=True)
+    run_env = dict(os.environ)
+    run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+    run_env["ASCEND_RT_VISIBLE_DEVICES"] = ""
+    run_env["USE_CUDA"] = "0"
+    run_env["TILELANG_CACHE_DIR"] = str(tl_cache_dir)
+    run_env["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
+    run_env["TILELANG_DISABLE_CACHE"] = "0"
+    run_env["PYTHONDONTWRITEBYTECODE"] = "1"
+    pp_parts = [str(source_root), str(source_root / "src"), str(source_root / "targets" / "ascend")]
+    if tl_source:
+        pp_parts.insert(0, tl_source)
+    run_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
+
+    factory_name = str(getattr(spec, "factory_name"))
+    sources = (
+        ("base", str(getattr(spec, "baseline_probe_source"))),
+        ("opt", str(getattr(spec, "optimized_probe_source"))),
+    )
+    script = (
+        "import importlib, importlib.util, os, sys, tempfile\n"
+        "from pathlib import Path\n"
+        f"os.environ['TILELANG_CACHE_DIR'] = {str(tl_cache_dir)!r}\n"
+        "os.environ['TILELANG_KERNEL_CACHE_USE_LIB_STAMP'] = '1'\n"
+        "os.environ['TILELANG_DISABLE_CACHE'] = '0'\n"
+        "import tilelang\n"
+        "tl_env = importlib.import_module('tilelang.env')\n"
+        "tl_kc = importlib.import_module('tilelang.cache.kernel_cache')\n"
+        "tl_env.env.enable_cache()\n"
+        "tl_kc.KernelCache._get_cache_namespace.cache_clear()\n"
+        "tl_kc.KernelCache._get_tilelang_lib_stamp.cache_clear()\n"
+        "tl_kc.KernelCache._create_dirs()\n"
+        f"sources = {json.dumps(sources)}\n"
+        f"factory = {factory_name!r}\n"
+        "with tempfile.TemporaryDirectory(prefix='tf_probe_pre_') as td:\n"
+        "    for tag, src in sources:\n"
+        "        p = Path(td) / f'{tag}.py'\n"
+        "        p.write_text(src, encoding='utf-8')\n"
+        "        sp = importlib.util.spec_from_file_location(f'_tf_p_{tag}', str(p))\n"
+        "        mod = importlib.util.module_from_spec(sp)\n"
+        "        sp.loader.exec_module(mod)\n"
+        "        fn = getattr(mod, factory)()\n"
+        "        tilelang.compile(fn, target='ascend', out_idx=-1)\n"
+    )
+    with tempfile.TemporaryDirectory(prefix="tf_probe_cpu_") as tmp_dir:
+        drv = Path(tmp_dir) / "prewarm_probe.py"
+        drv.write_text(script, encoding="utf-8")
+        if cann_setup and Path(cann_setup).is_file() and shutil.which("bisheng") is None:
+            bash_cmd = (
+                f"set +u && source {shlex.quote(cann_setup)} >/dev/null 2>&1 "
+                f"&& exec {shlex.quote(python_bin)} {shlex.quote(str(drv))}"
+            )
+            argv = ["/bin/bash", "-c", bash_cmd]
+        else:
+            argv = [python_bin, str(drv)]
+        try:
+            subprocess.run(
+                argv,
+                text=True,
+                capture_output=True,
+                cwd=str(source_root),
+                env=run_env,
+                timeout=180,
+            )
+        except Exception as exc:
+            logger.debug("Micro-probe CPU prewarm skipped: %s", exc)
+
+
+def run_micro_probe_via_agent_gates(
+    spec: object,
+    *,
+    source_root: str | Path | None = None,
+    env_file: str | Path | None = None,
+    device_id: str = "1",
+    min_speedup: float = 1.08,
+    timeout_sec: int = 360,
+    prewarm_cache: bool = True,
+) -> dict[str, float]:
+    """Run hardware micro-probe verification strictly through AgentGates NPU lease."""
+    root = Path(source_root).resolve() if source_root is not None else default_source_root()
+    resolved_env = _resolve_env_file_path(env_file)
+    ag_bin = _resolve_agent_gates_bin(root)
+    tl_cache_dir = _default_surrogate_tl_cache_dir()
+
+    if prewarm_cache:
+        _prewarm_micro_probe_cache(
+            spec,
+            source_root=root,
+            env_file=resolved_env,
+            tl_cache_dir=tl_cache_dir,
+        )
+
+    fail_closed = {
+        "baseline_dur_us": 0.0,
+        "optimized_dur_us": 0.0,
+        "speedup": 0.0,
+        "numerical_ok": 0.0,
+    }
+    with tempfile.TemporaryDirectory(prefix="tf_probe_gate_") as tmp_dir:
+        tmp = Path(tmp_dir)
+        request_path = tmp / "micro_probe_request.json"
+        response_path = tmp / "micro_probe_response.json"
+        tmp_env = _write_temp_env_file(
+            resolved_env,
+            tmp / "env.sh",
+            {
+                "TILEFOUNDRY_NPU_CPU_TESTS": "tests/ascend/agent/test_llm_watchdog.py",
+                "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/agent/test_surrogate_batch_npu.py",
+            },
+        )
+        payload = {
+            "probe_id": str(getattr(spec, "probe_id")),
+            "probe_kind": str(getattr(spec, "probe_kind")),
+            "factory_name": str(getattr(spec, "factory_name")),
+            "baseline_probe_source": str(getattr(spec, "baseline_probe_source")),
+            "optimized_probe_source": str(getattr(spec, "optimized_probe_source")),
+            "line_count_baseline": int(getattr(spec, "line_count_baseline", 0)),
+            "line_count_optimized": int(getattr(spec, "line_count_optimized", 0)),
+            "tensor_shape": [int(x) for x in getattr(spec, "tensor_shape", (16, 128))],
+            "tensor_dtype": str(getattr(spec, "tensor_dtype", "float32")),
+            "min_speedup": float(min_speedup),
+            "tilelang_cache_dir": str(tl_cache_dir),
+            "response_path": str(response_path),
+        }
+        request_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        cmd = [
+            ag_bin,
+            "run",
+            "--adapter",
+            "tilefoundry-npu",
+            "--source",
+            str(root),
+            "--env-file",
+            str(tmp_env),
+            "--device-id",
+            str(device_id),
+            "--gate",
+            "tilefoundry-npu-device",
+            "--json",
+        ]
+        sub_env = _clean_agent_gates_subprocess_env(
+            {
+                "TF_MICRO_PROBE_REQUEST": str(request_path),
+                "TF_SURROGATE_TL_CACHE_DIR": str(tl_cache_dir),
+            }
+        )
+        proc, _parsed = _run_agent_gates_cmd(
+            cmd,
+            cwd=str(root),
+            env=sub_env,
+            timeout_sec=timeout_sec,
+        )
+        if not response_path.is_file():
+            logger.warning(
+                "AgentGates micro-probe missing response (rc=%s): %s",
+                proc.returncode,
+                (proc.stderr or proc.stdout or "")[-400:],
+            )
+            return fail_closed
+        raw_resp = json.loads(response_path.read_text(encoding="utf-8"))
+        metrics_raw = raw_resp.get("metrics") or {}
+        return {
+            str(k): float(v)
+            for k, v in metrics_raw.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        } or fail_closed
+
+
 def run_l4_official_cannbench_via_agent_gates(
     *,
     operator_name: str | None = None,
@@ -1775,6 +1959,7 @@ __all__ = [
     "run_l1_compile_check",
     "run_l3_full_contract_via_agent_gates",
     "run_l4_official_cannbench_via_agent_gates",
+    "run_micro_probe_via_agent_gates",
     "run_multi_operator_surrogate_batch_via_agent_gates",
     "run_surrogate_batch_via_agent_gates",
 ]

@@ -482,3 +482,75 @@ def test_up2_static_pingpong_and_loop_fission_probes() -> None:
         assert sa_opt.passed, f"{kind} optimized failed Stage A: {sa_opt.error_message}"
     assert seen == {"static_pingpong_unroll", "loop_fission_sfu"}
 
+
+def test_multi_symbol_helper_attachment_and_dimensionless_static_fallback(tmp_path: Path) -> None:
+    """Verify AST ablation retains winner helpers and avoids unit mismatch under static funnel."""
+    base_multi = """
+import tilelang.ascend.language as T
+
+def _select_reg_config():
+    return {"cores": 2}
+
+def make_reg_kernel(cores: int = 2):
+    _nc = cores
+    @T.prim_func
+    def main(A: T.Tensor((24 * 128,), "float32"), B: T.Tensor((24 * 128,), "float32")):
+        with T.Kernel(_nc) as bx:
+            buf = T.alloc_shared((128,), "float32")
+            off = bx * 128
+            T.copy(A[off : off + 128], buf)
+            T.copy(buf, B[off : off + 128])
+    return main
+"""
+    win_multi = """
+import tilelang.ascend.language as T
+
+def _select_reg_config():
+    return {"cores": 24}
+
+def _helper_core_count(c: int) -> int:
+    return max(c, 24)
+
+def make_reg_kernel(cores: int = 2):
+    _nc = _helper_core_count(cores)
+    @T.prim_func
+    def main(A: T.Tensor((24 * 128,), "float32"), B: T.Tensor((24 * 128,), "float32")):
+        with T.Kernel(_nc) as bx:
+            buf = T.alloc_shared((128,), "float32")
+            off = bx * 128
+            T.copy(A[off : off + 128], buf)
+            T.copy(buf, B[off : off + 128])
+    return main
+"""
+    chunks = decompose_ast_ablations(base_multi, win_multi)
+    assert chunks
+    for chunk in chunks:
+        if "_helper_core_count(" in chunk.ablated_dsl:
+            assert "def _helper_core_count" in chunk.ablated_dsl
+
+    tracker = BayesianRuleTracker.from_seed_yaml()
+    distiller = FlywheelDistiller(
+        funnel=GateFunnel(skip_stage_b=True),
+        tracker=tracker,
+        probe_runner=lambda _s: {"baseline_dur_us": 40.0, "optimized_dur_us": 10.0, "numerical_ok": 1.0},
+        min_edit_gain=0.05,
+        min_probe_speedup=1.08,
+    )
+    rep = distiller.distill_from_pair(
+        baseline_dsl=base_multi,
+        winner_dsl=win_multi,
+        baseline_latency_us=25.0,
+        winner_latency_us=10.0,
+        factory_name="make_reg_kernel",
+        config_selector_name="_select_reg_config",
+        paradigm="pure_vector",
+        kb_output_path=tmp_path / "kb_multi.yaml",
+    )
+    assert rep.kept_positive_chunks
+    for meas in rep.kept_positive_chunks:
+        assert 0.0 < meas.variant_latency_us < 25.0
+    assert rep.admitted_rule_ids
+    for rid in rep.admitted_rule_ids:
+        assert rid in tracker.paradigm_posteriors.get("pure_vector", {})
+
+

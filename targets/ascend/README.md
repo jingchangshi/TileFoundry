@@ -15,8 +15,9 @@ python -m pip install -e . -e targets/ascend
 - `tilefoundry_ascend.ascend.visitor_registry`：面向 `MatMul`、`Cast`、统一数学 HIR（`HirBinary`/`HirUnary`/`HirReduce`/`HirWhere`/`HirClamp`）及 `Reshard`（16 个目标作用域候选）的 HIR->TIR 候选指令绑定。
 - `tilefoundry_ascend.ascend.schedule`：Z3 Modulo 流水线约束投影与求解器（`pipeline_solver.py`），支持循环携带依赖抽取、模式感知（`216/248/256 KiB`）与双 AIV UB 切分、DMA 字节与 Cube FLOPs 周期延迟估算。
 - `tilefoundry_ascend.ascend.passes`：面向 `AscendTarget` 的 `ValidateAscendPipelines`（`BEFORE_LOWER`）与 `ResolveAscendPipelines`（`AFTER_LOWER`）模块 Pass。
+- `tilefoundry_ascend.agent`：面向生产级算子的自动化性能冲分与经验演进框架，涵盖静态物理评估引导的规则推荐、双通道内核生成、五级编译与真机验证漏斗、反事实微探针规则提炼，以及可零配置复用启动的 `tilefoundry-ascend-marathon` 冲分与轮次监听模块。
 
 ## 相关文档
 
-- [Ascend 950PR 总体架构与 MLA 端到端流程指南](../../docs/reports/ascend950pr_architecture_and_e2e.md)
-- [Ascend 950PR 适配与 SimdVF 性能优化报告](../../docs/reports/ascend950pr_adaptation.md)
+- [Ascend 目标架构分层图](../../docs/reports/tilefoundry_ascend_architecture.mmd)
+- [Ascend 端到端优化与验证流程图](../../docs/reports/tilefoundry_ascend_e2e_flow.mmd)

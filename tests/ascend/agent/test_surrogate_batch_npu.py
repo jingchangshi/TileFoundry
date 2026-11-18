@@ -449,16 +449,73 @@ def _configure_tilelang_cache(tl_cache_dir: str) -> None:
     kc_mod.KernelCache._create_dirs()
 
 
+def _handle_micro_probe_request(probe_req_path: str) -> None:
+    from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
+        MicroProbeSpec,
+        verify_micro_probe_hardware,
+    )
+
+    payload = json.loads(Path(probe_req_path).read_text(encoding="utf-8"))
+    tl_cache_dir = str(payload.get("tilelang_cache_dir", "")).strip()
+    if tl_cache_dir:
+        _configure_tilelang_cache(tl_cache_dir)
+    spec = MicroProbeSpec(
+        probe_id=str(payload["probe_id"]),
+        probe_kind=str(payload["probe_kind"]),
+        factory_name=str(payload["factory_name"]),
+        baseline_probe_source=str(payload["baseline_probe_source"]),
+        optimized_probe_source=str(payload["optimized_probe_source"]),
+        line_count_baseline=int(payload.get("line_count_baseline", 0)),
+        line_count_optimized=int(payload.get("line_count_optimized", 0)),
+        tensor_shape=tuple(int(x) for x in payload.get("tensor_shape", (16, 128))),
+        tensor_dtype=str(payload.get("tensor_dtype", "float32")),
+    )
+    min_speedup = float(payload.get("min_speedup", 1.08))
+    resp_raw = str(payload.get("response_path", "")).strip()
+    try:
+        ok, metrics = verify_micro_probe_hardware(
+            spec,
+            probe_runner=None,
+            min_speedup=min_speedup,
+        )
+        out_payload: dict[str, object] = {
+            "passed": bool(ok),
+            "metrics": {str(k): float(v) for k, v in metrics.items()},
+        }
+    except Exception as exc:
+        out_payload = {
+            "passed": False,
+            "metrics": {
+                "baseline_dur_us": 0.0,
+                "optimized_dur_us": 0.0,
+                "speedup": 0.0,
+                "numerical_ok": 0.0,
+            },
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if resp_raw:
+        _atomic_write_json(Path(resp_raw), out_payload)
+    print(json.dumps(out_payload, sort_keys=True), flush=True)
+
+
 def test_surrogate_anchor_batch_npu() -> None:
     """Evaluate configured or baseline 10-anchor surrogate batch inside AgentGates lease."""
     _require_npu_env()
     torch.npu.set_device(0)
 
+    probe_req_env = os.environ.get("TF_MICRO_PROBE_REQUEST", "").strip()
+    if probe_req_env and Path(probe_req_env).is_file():
+        _handle_micro_probe_request(probe_req_env)
+        return
+
     req_env = os.environ.get("TF_SURROGATE_BATCH_REQUEST", "").strip()
     shim_only = os.environ.get("TF_SURROGATE_SHIM_ONLY", "").strip() == "1"
     shim_env_dir = os.environ.get("TF_SURROGATE_SHIM_DIR", "").strip()
+    tl_cache_env = os.environ.get("TF_SURROGATE_TL_CACHE_DIR", "").strip()
 
     if shim_only:
+        if tl_cache_env:
+            _configure_tilelang_cache(tl_cache_env)
         if shim_env_dir and (Path(shim_env_dir) / "npu_compare.py").is_file():
             if shim_env_dir not in sys.path:
                 sys.path.insert(0, shim_env_dir)

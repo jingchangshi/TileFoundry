@@ -4,46 +4,46 @@ flowchart TB
     classDef agent fill:#F2F8F2,stroke:#2D6A4F,stroke-width:1.5px,color:#133122
     classDef verify fill:#F7F2FA,stroke:#6A3D9A,stroke-width:1.5px,color:#2E1647
 
-    subgraph PLANE_1["Plane 1: Hardware Specification and Core IR Substrate"]
-        P1_CORE["Core HIR / TIR and Effect System<br/>Addressable Scratchpads, Loop Pipelines,<br/>and Value-Form Reachability Guard"]:::hw
-        P1_HW["Hardware Fact Model<br/>Coupled Cube-Vector Topology, Memory Tiers,<br/>Legal DMA Paths, and Segmented Burst Curve"]:::hw
-        P1_OPS["Ascend Execution Scopes and Operators<br/>SIMD / SIMT Scopes, Pipe-Typed TIR Ops,<br/>and Storage-Typed Data-Movement Lowerings"]:::hw
+    subgraph PLANE_1["第一层：硬件规格建模与核心中间表示层"]
+        P1_CORE["高层与底层中间表示及副作用系统\n片上可寻址存储区、循环流水线建模\n与计算图数值可达性保护"]:::hw
+        P1_HW["昇腾硬件规格与约束模型\nCube 与 Vector 耦合拓扑、片上分级存储容量、\n合法 DMA 通路与分段突发传输带宽曲线"]:::hw
+        P1_OPS["昇腾执行域与底层算子原语\n向量与标量执行域、绑定硬件流水通道的原语\n以及面向片上存储的数据重排与搬运指令"]:::hw
     end
 
-    subgraph PLANE_2["Plane 2: White-Box Compiler Analysis (Strict Compiler Objectivity Boundary)"]
-        P2_Z3["Modulo Pipeline Z3 Solver<br/>24-Bit Pipe Masks, Data/Reuse Edges,<br/>and Steady-State Initiation Interval"]:::boundary
-        P2_SNAP["Two-Snapshot Lowering Inspector<br/>Implicit Buffer Bloat, Single-Buffer Fallback,<br/>Burst-Scaled Cycles, and Alias Risk Scan"]:::boundary
-        P2_LEDGER["Objective Physical Ledger and Cross-IR Bridge<br/>Cube/Vector Roofline Floors, Scratchpad Waterlines,<br/>Wave Occupancy, and Diagnostic Telemetry"]:::boundary
-        P2_Z3 -->|"Initiation Interval and Schedule"| P2_LEDGER
-        P2_SNAP -->|"Snapshots, Cycles and Stall Flags"| P2_LEDGER
+    subgraph PLANE_2["第二层：白盒编译静态分析层（编译器客观性边界）"]
+        P2_Z3["循环模调度约束求解器（Z3）\n流水通道互斥掩码、数据与重用依赖边\n及稳态循环启动间隔（II）求解"]:::boundary
+        P2_SNAP["编译降级前后对比分析器\n隐式缓存膨胀审计、多缓冲退化识别、\n突发传输周期修正与指针别名风险扫描"]:::boundary
+        P2_LEDGER["静态硬件资源与理论性能评估器\nCube/Vector 屋脊线理论下限、各级片上内存水位、\n波次核心占用率与静态诊断遥测"]:::boundary
+        P2_Z3 -->|"稳态启动间隔与调度方案"| P2_LEDGER
+        P2_SNAP -->|"降级前后差值、修正周期与阻塞标记"| P2_LEDGER
     end
 
-    subgraph PLANE_3["Plane 3: Neuro-Symbolic Search and Knowledge Plane"]
-        P3_DIAG["Static-Dynamic Residual Analyzer and Causal KB<br/>Contrasts Analytical Bounds Against Measured Counters;<br/>Ranks Hardware Rules via Paradigm-Stratified Priors"]:::agent
-        P3_SYNTH["Dual-Channel Candidate Synthesizer<br/>Causal Rule Exploitation Paired with Isolated<br/>Zero-Prior Structural Exploration"]:::agent
-        P3_BEAM["Two-Lane Beam and Knowledge Flywheel<br/>Score-Winner Exploit Lane, Diverse Stepping-Stones,<br/>Counterfactual AST Ablation, and Probe Admission"]:::agent
-        P3_DIAG -->|"Bottleneck Context and Ranked Rules"| P3_SYNTH
-        P3_BEAM -->|"Parent Slice and Excluded Motifs"| P3_SYNTH
-        P3_BEAM -.->|"Admitted Verified Causal Rules"| P3_DIAG
+    subgraph PLANE_3["第三层：规则引导的混合搜索与经验演进层"]
+        P3_DIAG["理论与实测偏差分析器及优化规则库\n对比静态理论边界与硬件实测计数器偏差；\n按算子计算范式对硬件优化规则贝叶斯排序"]:::agent
+        P3_SYNTH["双通道候选内核生成器\n经验规则定向利用与无先验结构探索并行，\n生成符合分档切片约束的候选代码"]:::agent
+        P3_BEAM["双轨候选演进池与经验提炼闭环\n最优性能推进轨、潜力探索分支保留、\n反事实单变量拆解与微探针准入验证"]:::agent
+        P3_DIAG -->|"性能瓶颈诊断与排序规则"| P3_SYNTH
+        P3_BEAM -->|"父代内核切片与负向排除约束"| P3_SYNTH
+        P3_BEAM -.->|"准入经真机验证的新增规则"| P3_DIAG
     end
 
-    subgraph PLANE_4["Plane 4: Regime-Sliced Kernels and Hardware Verification Plane"]
-        P4_REGIME["Regime-Sliced Operator Modules<br/>Shape-Specialized Sub-Kernels with<br/>AST-Isolated Partial-Symbol Override"]:::verify
-        P4_PYRAMID["Five-Tier Progressive Verification Pyramid<br/>Tier 0 Static Ledger Check / Tier 1 Offline Compile / Tier 2 Batched<br/>NPU Anchors and PMU / Tier 3 Full Gate / Tier 4 Official Benchmark"]:::verify
-        P4_REGIME -->|"Assembled Complete Module"| P4_PYRAMID
+    subgraph PLANE_4["第四层：分档算子内核组装与多级硬件验证层"]
+        P4_REGIME["按输入规模分档的算子内核模块\n面向不同形状特征特化子内核，\n支持语法树级局部符号隔离替换"]:::verify
+        P4_PYRAMID["五级递进式编译与真机验证漏斗\n1. 静态资源预检 -> 2. 离线设备编译 -> 3. 代表用例批量测速与剖析\n-> 4. 全量契约回归门禁 -> 5. 官方基准全集评测"]:::verify
+        P4_REGIME -->|"拼装完整算子模块"| P4_PYRAMID
     end
 
-    %% Plane 1 -> Plane 2 (planar non-crossing downward edges)
-    P1_CORE -->|"Loop Pipelines and Effects"| P2_Z3
-    P1_HW -->|"24-Bit Masks and Capacities"| P2_Z3
-    P1_HW -->|"Burst Curve and Hierarchy Limits"| P2_SNAP
-    P1_OPS -->|"Op Latency and DMA Rules"| P2_SNAP
+    %% 第一层 -> 第二层（无交叉向下连线）
+    P1_CORE -->|"循环流水线与存储副作用"| P2_Z3
+    P1_HW -->|"硬件通道掩码与存储上限"| P2_Z3
+    P1_HW -->|"突发带宽曲线与层级容量"| P2_SNAP
+    P1_OPS -->|"算子延迟与 DMA 合法规则"| P2_SNAP
 
-    %% Compiler Objectivity Boundary crossing (single clean trunk)
-    P2_LEDGER -->|"Objective Ledger and Blueprint"| P3_DIAG
+    %% 跨越编译器客观性边界（单一主干）
+    P2_LEDGER -->|"静态评估结果与参考蓝图"| P3_DIAG
 
-    %% Plane 3 -> Plane 4 forward path (left column)
-    P3_SYNTH -->|"Candidate Symbol Patch"| P4_REGIME
+    %% 第三层 -> 第四层前向通道（左侧主干）
+    P3_SYNTH -->|"候选局部内核补丁"| P4_REGIME
 
-    %% Plane 4 -> Plane 3 closed-loop feedback (right rail)
-    P4_PYRAMID -.->|"Evaluated Scores, Rollback Status and PMU Counters"| P3_BEAM
+    %% 第四层 -> 第三层闭环反馈（右侧回流轨道）
+    P4_PYRAMID -.->|"实测得分、回滚状态与硬件性能计数器"| P3_BEAM

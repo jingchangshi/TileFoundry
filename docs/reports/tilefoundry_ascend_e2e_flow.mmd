@@ -1,68 +1,68 @@
 flowchart TB
     classDef prep fill:#EEF4FA,stroke:#2B5B84,stroke-width:1.5px,color:#12263A
-    classDef diag fill:#FDF6E9,stroke:#A66300,stroke-width:1.5px,color:#3B2300
+    classDef diag fill:#FDF6E9,stroke:#A66300,stroke-width:2px,color:#3B2300
     classDef synth fill:#F2F8F2,stroke:#2D6A4F,stroke-width:1.5px,color:#133122
     classDef gate fill:#F7F2FA,stroke:#6A3D9A,stroke-width:1.5px,color:#2E1647
     classDef drop fill:#FDF0F0,stroke:#A61C1C,stroke-width:1.5px,color:#4A0D0D
 
-    subgraph S1["Stage 1: Operator Authoring and Baseline Grounding"]
-        S1_OP["Author Mathematical HIR, Scheduled HIR,<br/>and Regime-Sliced TileLang Module"]:::prep
-        S1_NAV["Lower Cross-IR Navigation Blueprint<br/>Cube/Vector Roofline, Legal Ops, and Z3 Schedule"]:::prep
-        S1_BASE["Benchmark Baseline Module on NPU<br/>Establish Anchor Speedups, Composite Score, and PMU Profile"]:::prep
-        S1_OP -->|"Authored and Scheduled IR"| S1_NAV
-        S1_NAV -->|"Navigation Blueprint"| S1_BASE
+    subgraph S1["阶段一：算子数学建模与基线锚定"]
+        S1_OP["编写高层纯数学算子、调度描述\n与按输入规模分档的 TileLang 内核模块"]:::prep
+        S1_NAV["生成跨层编译参考蓝图\n计算屋脊线理论下限、合法指令集与 Z3 流水调度方案"]:::prep
+        S1_BASE["真机运行基线算子模块\n采集代表性用例加速比、综合评分与硬件性能剖析"]:::prep
+        S1_OP -->|"数学与调度中间表示"| S1_NAV
+        S1_NAV -->|"参考蓝图与性能上限"| S1_BASE
     end
 
-    subgraph S2["Stage 2: Regime Selection and Bottleneck Diagnosis"]
-        S2_PICK["Select Target Regime by Remaining Headroom<br/>Pick Parent Kernel (Incumbent Winner or Stepping-Stone)"]:::diag
-        S2_RES["Inspect Static Physical Ledger and Input-Domain Envelope<br/>Quantify Static-vs-PMU Residual Gap and Alias/Barrier Risks"]:::diag
-        S2_PICK -->|"Active Regime Context"| S2_RES
+    subgraph S2["阶段二：目标分档选择与瓶颈诊断"]
+        S2_PICK["按剩余优化空间筛选目标分档\n并结合停滞衰减策略选取当前父代内核"]:::diag
+        S2_RES["联合分析静态硬件资源评估结果与输入域约束\n量化理论下限与实测计数器之间的偏差及阻塞风险"]:::diag
+        S2_PICK -->|"选定分档与父代上下文"| S2_RES
     end
 
-    subgraph S3["Stage 3: Dual-Channel Stateless Candidate Synthesis"]
-        S3_FREE["Zero-Prior Exploration Channel<br/>Explore Novel Loop and Buffer Schedules<br/>Under Negative Mechanism Constraints"]:::synth
-        S3_RULE["Rule-Guided Exploitation Channel<br/>Match Top Paradigm-Ranked Causal Rules<br/>to Active Ledger and Residual Predicates"]:::synth
-        S3_SPLICE["Splice Partial-Symbol Overrides via AST<br/>Preserve Protected Siblings; Garbage-Collect Dead Helpers"]:::synth
-        S3_FREE -->|"Structural Exploration Patch"| S3_SPLICE
-        S3_RULE -->|"Rule-Guided Patch"| S3_SPLICE
+    subgraph S3["阶段三：双通道无状态候选生成"]
+        S3_FREE["无先验结构探索通道\n在负向排除约束下探索全新循环拆分与缓存排布"]:::synth
+        S3_RULE["规则引导定向优化通道\n将高置信度硬件规则匹配至当前瓶颈与偏差特征"]:::synth
+        S3_SPLICE["基于抽象语法树拼接局部符号补丁\n保护其他分档不变，并自动清理冗余辅助函数"]:::synth
+        S3_FREE -->|"结构探索补丁"| S3_SPLICE
+        S3_RULE -->|"规则优化补丁"| S3_SPLICE
     end
 
-    subgraph S4["Stage 4: Per-Round Progressive Verification (Tiers 0 to 3)"]
-        S4_T0["Tier 0: Static Physical Precheck<br/>Validate Symbol Contract, DMA Legality, and SRAM Limits"]:::gate
-        S4_T1["Tier 1: Offline Device Compilation<br/>Concurrent Backend Build with Bounded Syntax Repair"]:::gate
-        S4_DROP["Reject Candidate Prior to NPU Batch<br/>Penalize Failed Causal Rules (Exempt Transport Timeouts)"]:::drop
-        S4_T2["Tier 2: Batched NPU Anchor Evaluation<br/>Prewarm Host Cache, Rank Composite Score, Profile Winner PMU"]:::gate
-        S4_T3["Tier 3: Full-Suite Acceptance Gate<br/>Run Full Benchmark, Edge Shapes, and Dynamic Cache Check"]:::gate
-        S4_T0 -->|"Static OK"| S4_T1
-        S4_T0 -->|"Envelope Violation"| S4_DROP
-        S4_T1 -->|"Compile OK"| S4_T2
-        S4_T1 -->|"Unrepaired Compile Fail"| S4_DROP
-        S4_T2 -->|"Clears Tail Guard and Gain Gate"| S4_T3
+    subgraph S4["阶段四：单轮多级递进验证（预检至全量门禁）"]
+        S4_T0["第一关：静态硬件资源预检\n校验符号接口、DMA 通路合法性与片上内存上限"]:::gate
+        S4_T1["第二关：离线设备编译\n并发调用底层编译器并在有界次数内修复语法错误"]:::gate
+        S4_DROP["真机评测前快速淘汰无效候选\n下调未生效规则的贝叶斯置信度（通信超时豁免惩罚）"]:::drop
+        S4_T2["第三关：代表性用例真机批量测速\n预热编译缓存，排定综合得分并采集胜出者硬件剖析"]:::gate
+        S4_T3["第四关：全量契约与扩展边界门禁\n运行官方全集回归、极限尾块与动态形状缓存复用测试"]:::gate
+        S4_T0 -->|"静态检查通过"| S4_T1
+        S4_T0 -->|"违反硬件约束"| S4_DROP
+        S4_T1 -->|"设备编译成功"| S4_T2
+        S4_T1 -->|"语法修复后仍失败"| S4_DROP
+        S4_T2 -->|"通过长尾防退化与最小增益门槛"| S4_T3
     end
 
-    subgraph S5["Stage 5: Evolutionary Beam Update and Knowledge Distillation"]
-        S5_BEAM["Update Two-Lane Beam State<br/>Advance Promoted Incumbent or Roll Back Regression;<br/>Retain Novel Near-Tie Stepping-Stones"]:::synth
-        S5_FLY["Counterfactual Flywheel Distillation<br/>Decompose Winning AST Diffs and Gate New Causal Rules<br/>via Parameterized Hardware Micro-Probes"]:::synth
+    subgraph S5["阶段五：演进池更新与因果规则提炼"]
+        S5_BEAM["更新双轨候选演进池与原子检查点\n通过全量门禁则晋升主干版本，否则原子回滚；\n保留高潜力探索分支作为后续演进起点"]:::synth
+        S5_FLY["反事实单变量拆解与微探针验证飞轮\n拆解胜出改动的最小独立变体，在真机独立验证加速达标后\n将纯静态可判定的新规律沉淀入规则库"]:::synth
     end
 
-    subgraph S6["Stage 6: Official Full-Distribution Gate and Final Delivery"]
-        S6_T4["Tier 4: Official Full-Distribution Gate<br/>Score Entire Benchmark Suite; Detect Non-Anchor Regressions"]:::gate
-        S6_DONE["Verified Production Operator Module and Distilled Causal Rules"]:::prep
-        S6_T4 -->|"All Cases Verified"| S6_DONE
+    subgraph S6["阶段六：官方基准全集评测与最终交付"]
+        S6_T4["第五关：官方基准全集评测\n评测全部真实算例性能得分，识别代表用例之外的长尾退化"]:::gate
+        S6_DONE["交付通过全量门禁的生产级算子模块与扩展规则库"]:::prep
+        S6_T4 -->|"全集算例达标"| S6_DONE
     end
 
-    %% Stage-to-Stage Forward Flow
-    S1_BASE -->|"Initialized Baseline State"| S2_PICK
-    S2_RES -->|"Ledger Delta and Excluded Motifs"| S3_FREE
-    S2_RES -->|"Matched Rules and Context"| S3_RULE
-    S3_SPLICE -->|"Assembled Complete Operator Module"| S4_T0
-    S4_T3 -->|"Promoted Winner or Atomic Rollback"| S5_BEAM
-    S4_T2 -->|"Anchor Scores, Novelty and PMU"| S5_BEAM
-    %% Keep Left branch (S6_T4) declared before Right branch (S5_FLY) for planar rails
-    S5_BEAM -->|"Target Met or Round Budget Reached"| S6_T4
-    S5_BEAM -->|"Promoted Winner Delta"| S5_FLY
+    %% 阶段间前向数据流
+    S1_BASE -->|"初始化基线得分与演进池状态"| S2_PICK
+    S2_RES -->|"蓝图差距与负向排除机制"| S3_FREE
+    S2_RES -->|"命中规则与瓶颈上下文"| S3_RULE
+    S3_SPLICE -->|"拼装完整候选模块"| S4_T0
+    S4_T3 -->|"晋升主干或原子回滚"| S5_BEAM
+    S4_T2 -->|"分档实测得分、结构新颖度与剖析指标"| S5_BEAM
+    %% 保持左路（S6_T4）先于右路（S5_FLY）声明，确保回流线无交叉
+    S5_BEAM -->|"达到性能目标或耗尽轮数预算"| S6_T4
+    S5_BEAM -->|"主干相对基线的有效改动"| S5_FLY
 
-    %% Clean Outer-Margin Feedback Rails
-    S5_BEAM -.->|"Next Optimization Round"| S2_PICK
-    S6_T4 -.->|"Dynamic Anchor Catch-Up on Non-Anchor Regression"| S2_PICK
-    S5_FLY -.->|"Admit Verified Causal Rule"| S3_RULE
+    %% 外缘清晰闭环反馈轨道
+    S5_BEAM -.->|"进入下一轮分档优化"| S2_PICK
+    S6_T4 -.->|"将退化算例动态追加为代表用例并补跑"| S2_PICK
+    S5_FLY -.->|"向规则库补充经实测证实的新规则"| S3_RULE

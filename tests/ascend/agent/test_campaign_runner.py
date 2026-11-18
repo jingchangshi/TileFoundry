@@ -36,7 +36,7 @@ from tilefoundry_ascend.agent.campaign import (
 )
 from tilefoundry_ascend.agent.campaign.anchor_specs import DEFAULT_REGIME_SPECS
 from tilefoundry_ascend.agent.campaign.campaign_runner import _extract_regime_abi_context
-from tilefoundry_ascend.agent.orchestrator import StageAResult, StageBResult
+from tilefoundry_ascend.agent.orchestrator import StageAResult, StageBResult, TwoLaneBeamSearch
 from tilefoundry_ascend.agent.router import extract_structural_features, route_execution_track
 from tilefoundry_ascend.ascend.passes import build_objective_physical_ledger
 
@@ -3391,6 +3391,265 @@ def test_run_l0_l1_round_filter_isolates_syntax_repair_timeout(tmp_path: Path) -
     assert any(tier == "llm_transport" for _wid, tier, _msg in report.rounds[0].l0_l1_failed)
     for rid, st in tracker.posteriors.items():
         assert st.trials == before_trials[rid]
+
+
+def test_stepping_stone_splicing_causal_credit_and_live_flywheel_wiring(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify stepping-stone parent splicing, causal PMU credit, and AgentGates probe wiring."""
+    import ast
+    from tilefoundry_ascend.agent.flywheel.ablation_distiller import MicroProbeSpec
+    from tilefoundry_ascend.agent.kb.schema import AscendCausalRule
+
+    multi_sym_module = """
+import tilelang.ascend.language as T
+
+_KERNEL_CACHE = {}
+
+def _select_reg_a_config(tile_m=1):
+    return {"tile_m": tile_m}
+
+def _build_reg_a(tile_m=1):
+    @T.prim_func
+    def main(X: T.Tensor((128, 128), "bfloat16"), Y: T.Tensor((128, 128), "bfloat16")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((128, 128), "bfloat16")
+            T.copy(X[0:128, 0:128], a_ub)
+            T.copy(a_ub, Y[0:128, 0:128])
+    return main
+
+def _select_reg_b_config(tile_m=1):
+    return {"tile_m": tile_m}
+
+def _build_reg_b(tile_m=1):
+    @T.prim_func
+    def main(X: T.Tensor((64, 64), "bfloat16"), Y: T.Tensor((64, 64), "bfloat16")):
+        with T.Kernel(1):
+            b_ub = T.alloc_shared((64, 64), "bfloat16")
+            T.copy(X[0:64, 0:64], b_ub)
+            T.copy(b_ub, Y[0:64, 0:64])
+    return main
+"""
+    regimes = (
+        RegimeTargetSpec(
+            regime_tag="reg_a",
+            builder_candidates=("_build_reg_a",),
+            sample_builder_kwargs={"tile_m": 1},
+            description="Regime A",
+            config_selector_fn="_select_reg_a_config",
+            editable_symbols=("_select_reg_a_config", "_build_reg_a"),
+            allowed_helper_prefix="_reg_a_",
+        ),
+        RegimeTargetSpec(
+            regime_tag="reg_b",
+            builder_candidates=("_build_reg_b",),
+            sample_builder_kwargs={"tile_m": 1},
+            description="Regime B",
+            config_selector_fn="_select_reg_b_config",
+            editable_symbols=("_select_reg_b_config", "_build_reg_b"),
+            allowed_helper_prefix="_reg_b_",
+        ),
+    )
+    anchors = (
+        AnchorCaseSpec("level4/attention_residual", 2, "reg_a", 20.0, 2.0),
+        AnchorCaseSpec("level4/attention_residual", 16, "reg_b", 1000.0, 240.0),
+    )
+
+    stone_partial_dsl = """
+def _reg_a_helper():
+    return 2
+
+def _build_reg_a(tile_m=2):
+    _n = _reg_a_helper()
+    @T.prim_func
+    def main(X: T.Tensor((128, 128), "bfloat16"), Y: T.Tensor((128, 128), "bfloat16")):
+        with T.MixedKernel(_n) as (_, sid):
+            ss = T.alloc_ss((2,), "uint32")
+            a_ub = T.alloc_shared((128, 128), "bfloat16")
+            ss[sid] = T.Cast("uint32", 0)
+            T.copy(X[0:128, 0:128], a_ub)
+            T.copy(a_ub, Y[0:128, 0:128])
+    return main
+"""
+    child_partial_dsl = """
+def _build_reg_a(tile_m=4):
+    _n = _reg_a_helper()
+    @T.prim_func
+    def main(X: T.Tensor((128, 128), "bfloat16"), Y: T.Tensor((128, 128), "bfloat16")):
+        with T.Kernel(8) as bx:
+            a_ub = T.alloc_shared((64, 128), "bfloat16")
+            T.copy(X[0:64, 0:128], a_ub)
+            T.copy(a_ub, Y[0:64, 0:128])
+    return main
+"""
+    flat_dsl = """
+def _build_reg_a(tile_m=1):
+    @T.prim_func
+    def main(X: T.Tensor((128, 128), "bfloat16"), Y: T.Tensor((128, 128), "bfloat16")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((128, 128), "bfloat16")
+            T.copy(X[0:128, 0:128], a_ub)
+            T.copy(a_ub, Y[0:128, 0:128])
+    return main
+"""
+    causal_rule = AscendCausalRule(
+        rule_id="R_TEST_WAVE_ONLY",
+        regime_guard="PIPE_V > 0",
+        precondition="wave_occupancy < 0.5",
+        transform_template="Scale core blocks with helper macro.",
+        expected_postcondition="wave_occupancy > prev.wave_occupancy and measured_mte2_wait_ratio < prev.measured_mte2_wait_ratio",
+        source_provenance="test",
+        alpha_prior=10.0,
+        beta_prior=1.0,
+    )
+    tracker = BayesianRuleTracker.from_rules([causal_rule])
+
+    creative_r1 = json.dumps(
+        {
+            "physical_hypothesis": "Introduce helper macro and SSBUF stone",
+            "target_local_metric": "sync_stall_ratio",
+            "dsl_source": stone_partial_dsl,
+        }
+    )
+    creative_r2 = json.dumps(
+        {
+            "physical_hypothesis": "Keep inherited helper macro",
+            "target_local_metric": "wave_occupancy",
+            "dsl_source": child_partial_dsl,
+        }
+    )
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [flat_dsl, child_partial_dsl, child_partial_dsl],
+            "explore_creative": [creative_r1, creative_r2],
+        }
+    )
+
+    def _l0_check(mod_src: str, reg: RegimeTargetSpec) -> StageAResult:
+        if "_reg_a_helper()" in mod_src and "def _reg_a_helper" not in mod_src:
+            return StageAResult(passed=False, prim_func=None, ledger=None, error_message="NameError: _reg_a_helper")
+        ns: dict[str, object] = {"T": type("_DummyT", (), {"prim_func": staticmethod(lambda f: f)})}
+        try:
+            ast.parse(mod_src)
+        except SyntaxError as exc:
+            return StageAResult(passed=False, prim_func=None, ledger=None, error_message=str(exc))
+        _ = ns
+        high_wave = "T.Kernel(8)" in mod_src
+        wave_val = 0.50 if high_wave else (0.10 if "T.MixedKernel" in mod_src else 0.05)
+        cyc = 50 if high_wave else (110 if "T.MixedKernel" in mod_src else 120)
+        blocks = 8 if high_wave else (2 if "T.MixedKernel" in mod_src else 1)
+        ledger = build_objective_physical_ledger(
+            analysis_mode="readonly_envelope",
+            is_legal=True,
+            steady_state_ii=cyc,
+            pipe_cycles={"AIV0.PIPE_V": cyc},
+            waterlines={},
+            grid_blocks=blocks,
+            wave_occupancy=wave_val,
+        )
+        return StageAResult(passed=True, prim_func=None, ledger=ledger)
+
+    def _l2_eval(cands, aa):
+        out = {}
+        for cid, mpath in cands:
+            src = mpath.read_text(encoding="utf-8")
+            lat_a = 8.0 if "T.Kernel(8)" in src else (22.0 if "T.MixedKernel" in src else 20.0)
+            out[cid] = _make_surrogate_result(cid, "attention_residual", tuple(aa), {2: lat_a, 16: 250.0})
+        return out
+
+    msprof_calls: list[list[int]] = []
+
+    def _msprof_collect(op_name, cand_path, anc_seq):
+        src = Path(cand_path).read_text(encoding="utf-8")
+        msprof_calls.append([int(a.case_num) for a in anc_seq])
+        wait = 0.12 if "T.Kernel(8)" in src else 0.45
+        return {anc_seq[0].regime_tag: {"dur_us": 8.0 if "T.Kernel(8)" in src else 20.0, "aiv_vec": 0.45, "aiv_mte2": wait, "sync_stall_ratio": 0.1}}
+
+    t_path = tmp_path / "kernels_splice.py"
+    t_path.write_text(multi_sym_module, encoding="utf-8")
+    kb_out = tmp_path / "kb_out.yaml"
+    flywheel = FlywheelDistiller(
+        funnel=GateFunnel(skip_stage_b=True),
+        tracker=tracker,
+        probe_runner=lambda _spec: {"baseline_dur_us": 40.0, "optimized_dur_us": 20.0, "numerical_ok": 1.0},
+        min_edit_gain=0.05,
+        min_probe_speedup=1.08,
+    )
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=2,
+            stagnation_escalate_rounds=1,
+            stagnation_freeze_rounds=4,
+            k_rule_workers=1,
+            min_surrogate_gain=0.25,
+            min_flywheel_gain=0.03,
+        ),
+        target_module_path=t_path,
+        perf_target=PerfTargetSpec("attention_residual", 2.8, 1.5, 0.95),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        tracker=tracker,
+        beam=TwoLaneBeamSearch(exploit_width=1, stepping_stone_width=1),
+        flywheel_distiller=flywheel,
+        l0_checker=_l0_check,
+        l1_compiler=lambda _s, _r: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_eval,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        msprof_collector=_msprof_collect,
+        checkpoint_path=tmp_path / "ckpt_splice.json",
+        campaign_kb_path=kb_out,
+    )
+    report = asyncio.run(runner.run())
+    assert report.total_rounds == 2
+    assert report.rounds[1].parent_lane == "stepping_stone"
+    assert report.rounds[1].promoted is True
+    assert "def _reg_a_helper" in t_path.read_text(encoding="utf-8")
+    assert "with T.Kernel(8)" in t_path.read_text(encoding="utf-8")
+    st = tracker.posteriors["R_TEST_WAVE_ONLY"]
+    assert st.failures == 1 and st.successes == 1
+    assert report.admitted_rule_ids
+    assert kb_out.is_file()
+
+    env_f = tmp_path / "env.sh"
+    env_f.write_text("TILEFOUNDRY_NPU_CANNBENCH_REPO=" + str(tmp_path) + "\n", encoding="utf-8")
+    fake_ag = tmp_path / "agent-gates"
+    fake_ag.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("TILEFOUNDRY_NPU_AGENT_GATES_BIN", str(fake_ag))
+    seen_req_files: list[str] = []
+
+    def _fake_ag_cmd(cmd, *, cwd, env, timeout_sec, **kwargs):
+        req_file = Path(env["TF_MICRO_PROBE_REQUEST"])
+        seen_req_files.append(str(req_file))
+        req_json = json.loads(req_file.read_text(encoding="utf-8"))
+        Path(req_json["response_path"]).write_text(
+            json.dumps({"passed": True, "metrics": {"baseline_dur_us": 50.0, "optimized_dur_us": 20.0, "speedup": 2.5, "numerical_ok": 1.0}}),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(cmd, 0, "{}", ""), {"status": "PASS"}
+
+    monkeypatch.setattr(surrogate_cannbench, "_run_agent_gates_cmd", _fake_ag_cmd)
+    probe_metrics = surrogate_cannbench.run_micro_probe_via_agent_gates(
+        MicroProbeSpec(
+            probe_id="p_test",
+            probe_kind="core_parallelism",
+            factory_name="make_kernel",
+            baseline_probe_source="def make_kernel(): pass",
+            optimized_probe_source="def make_kernel(): pass",
+            line_count_baseline=30,
+            line_count_optimized=30,
+            tensor_shape=(16, 128),
+        ),
+        source_root=tmp_path,
+        env_file=env_f,
+        device_id="2",
+        prewarm_cache=False,
+    )
+    assert seen_req_files
+    assert probe_metrics["speedup"] == 2.5
+
 
 
 

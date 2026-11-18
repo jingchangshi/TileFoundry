@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 import copy
 from dataclasses import dataclass, field
 import difflib
@@ -19,7 +19,11 @@ from tilefoundry_ascend.agent.kb.schema import (
     save_rules_yaml,
     validate_rule_predicate,
 )
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import GateFunnel, StageAResult
+from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    GateFunnel,
+    StageAResult,
+    run_stage_a_static,
+)
 from tilefoundry_ascend.agent.orchestrator.e2e_evolution import EvolutionTrajectory
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 
@@ -196,6 +200,8 @@ def _node_key(node: ast.AST) -> str:
 
 
 def _node_tag(node: ast.AST) -> str:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return f"def:{node.name}"
     if isinstance(node, ast.With):
         if node.items:
             ctx = node.items[0].context_expr
@@ -334,6 +340,18 @@ def _set_stmt_by_path(tree: ast.Module, path: tuple[int, ...], new_stmt: ast.stm
     return False
 
 
+def _insert_stmt_by_path(tree: ast.Module, path: tuple[int, ...], new_stmt: ast.stmt) -> bool:
+    cur_list: list[ast.stmt] = tree.body
+    for idx in path[:-1]:
+        node = cur_list[idx]
+        if not hasattr(node, "body") or not isinstance(node.body, list):
+            return False
+        cur_list = node.body
+    leaf = max(0, min(path[-1], len(cur_list)))
+    cur_list.insert(leaf, copy.deepcopy(new_stmt))
+    return True
+
+
 def _replace_call_arg(
     tree: ast.Module,
     stmt_path: tuple[int, ...],
@@ -357,7 +375,72 @@ def _replace_call_arg(
     return False
 
 
-def _render_patched(base_tree: ast.Module) -> str:
+def _collect_top_defs(tree: ast.Module) -> list[tuple[str, ast.stmt]]:
+    defs: list[tuple[str, ast.stmt]] = []
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defs.append((stmt.name, stmt))
+        elif isinstance(stmt, ast.Assign):
+            if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+                defs.append((stmt.targets[0].id, stmt))
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            defs.append((stmt.target.id, stmt))
+    return defs
+
+
+def _attach_missing_winner_defs(
+    patched_tree: ast.Module,
+    new_defs: Mapping[str, ast.stmt] | None,
+    def_order: Sequence[str],
+) -> ast.Module:
+    if not new_defs:
+        return patched_tree
+    existing = {name for name, _stmt in _collect_top_defs(patched_tree)}
+    needed: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        roots: list[ast.AST] = [patched_tree]
+        for n in needed:
+            roots.append(new_defs[n])
+        for root in roots:
+            for sub in ast.walk(root):
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                    if sub.id in new_defs and sub.id not in existing and sub.id not in needed:
+                        needed.add(sub.id)
+                        changed = True
+    if not needed:
+        return patched_tree
+    order_rank = {name: idx for idx, name in enumerate(def_order)}
+    to_insert = [
+        copy.deepcopy(new_defs[name])
+        for name in sorted(needed, key=lambda n: order_rank.get(n, 0))
+    ]
+    insert_at = 0
+    for idx, stmt in enumerate(patched_tree.body):
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)) or (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            insert_at = idx + 1
+        elif idx == insert_at:
+            break
+    patched_tree.body = [
+        *patched_tree.body[:insert_at],
+        *to_insert,
+        *patched_tree.body[insert_at:],
+    ]
+    return patched_tree
+
+
+def _render_patched(
+    base_tree: ast.Module,
+    *,
+    new_defs: Mapping[str, ast.stmt] | None = None,
+    def_order: Sequence[str] = (),
+) -> str:
+    base_tree = _attach_missing_winner_defs(base_tree, new_defs, def_order)
     ast.fix_missing_locations(base_tree)
     code = ast.unparse(base_tree)
     ast.parse(code)
@@ -372,6 +455,9 @@ def _extract_stmt_list_deltas(
     path_label: str,
     chunks: list[AstEditChunk],
     seen_dsls: set[str],
+    *,
+    new_defs: Mapping[str, ast.stmt] | None = None,
+    def_order: Sequence[str] = (),
 ) -> None:
     base_tags = [_node_tag(s) for s in base_list]
     win_tags = [_node_tag(s) for s in win_list]
@@ -399,7 +485,7 @@ def _extract_stmt_list_deltas(
                     if b_hdr != w_hdr and w_stmt.items:
                         patched = copy.deepcopy(base_tree)
                         if _replace_call_arg(patched, cur_path, is_with_header=True, new_expr=w_stmt.items[0].context_expr):
-                            dsl = _render_patched(patched)
+                            dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
                             if dsl not in seen_dsls:
                                 seen_dsls.add(dsl)
                                 chunks.append(
@@ -420,6 +506,8 @@ def _extract_stmt_list_deltas(
                         f"{path_label}/with_{i1 + k}",
                         chunks,
                         seen_dsls,
+                        new_defs=new_defs,
+                        def_order=def_order,
                     )
                     continue
 
@@ -429,7 +517,7 @@ def _extract_stmt_list_deltas(
                     if b_iter != w_iter:
                         patched = copy.deepcopy(base_tree)
                         if _replace_call_arg(patched, cur_path, is_with_header=False, new_expr=w_stmt.iter):
-                            dsl = _render_patched(patched)
+                            dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
                             if dsl not in seen_dsls:
                                 seen_dsls.add(dsl)
                                 chunks.append(
@@ -450,6 +538,8 @@ def _extract_stmt_list_deltas(
                         f"{path_label}/for_{i1 + k}",
                         chunks,
                         seen_dsls,
+                        new_defs=new_defs,
+                        def_order=def_order,
                     )
                     continue
 
@@ -462,12 +552,14 @@ def _extract_stmt_list_deltas(
                         f"{path_label}/{b_stmt.name}",
                         chunks,
                         seen_dsls,
+                        new_defs=new_defs,
+                        def_order=def_order,
                     )
                     continue
 
                 patched = copy.deepcopy(base_tree)
                 if _set_stmt_by_path(patched, cur_path, w_stmt):
-                    dsl = _render_patched(patched)
+                    dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
                     if dsl not in seen_dsls:
                         seen_dsls.add(dsl)
                         chunks.append(
@@ -499,7 +591,7 @@ def _extract_stmt_list_deltas(
                                 is_with_header=True,
                                 new_expr=w_stmt.items[0].context_expr,
                             ):
-                                dsl = _render_patched(hdr_patch)
+                                dsl = _render_patched(hdr_patch, new_defs=new_defs, def_order=def_order)
                                 if dsl not in seen_dsls:
                                     seen_dsls.add(dsl)
                                     chunks.append(
@@ -520,12 +612,14 @@ def _extract_stmt_list_deltas(
                         f"{path_label}/block_{i1 + k}",
                         chunks,
                         seen_dsls,
+                        new_defs=new_defs,
+                        def_order=def_order,
                     )
                     continue
                 cur_path = parent_path + (i1 + k,)
                 patched = copy.deepcopy(base_tree)
                 if _set_stmt_by_path(patched, cur_path, w_stmt):
-                    dsl = _render_patched(patched)
+                    dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
                     if dsl not in seen_dsls:
                         seen_dsls.add(dsl)
                         chunks.append(
@@ -544,8 +638,8 @@ def _extract_stmt_list_deltas(
                 ins_idx = min(i2 + (j - (j1 + common)), len(base_list))
                 cur_path = parent_path + (ins_idx,)
                 patched = copy.deepcopy(base_tree)
-                if _set_stmt_by_path(patched, cur_path, w_stmt):
-                    dsl = _render_patched(patched)
+                if _insert_stmt_by_path(patched, cur_path, w_stmt):
+                    dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
                     if dsl not in seen_dsls:
                         seen_dsls.add(dsl)
                         kind = (
@@ -570,7 +664,7 @@ def _extract_stmt_list_deltas(
                 cur_path = parent_path + (idx,)
                 patched = copy.deepcopy(base_tree)
                 if _set_stmt_by_path(patched, cur_path, None):
-                    dsl = _render_patched(patched)
+                    dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
                     if dsl not in seen_dsls:
                         seen_dsls.add(dsl)
                         chunks.append(
@@ -589,8 +683,8 @@ def _extract_stmt_list_deltas(
                 w_txt = _node_key(w_stmt)
                 cur_path = parent_path + (min(i1, len(base_list)),)
                 patched = copy.deepcopy(base_tree)
-                if _set_stmt_by_path(patched, cur_path, w_stmt):
-                    dsl = _render_patched(patched)
+                if _insert_stmt_by_path(patched, cur_path, w_stmt):
+                    dsl = _render_patched(patched, new_defs=new_defs, def_order=def_order)
                     if dsl not in seen_dsls:
                         seen_dsls.add(dsl)
                         kind = (
@@ -617,6 +711,11 @@ def decompose_ast_ablations(baseline_dsl: str, winner_dsl: str) -> tuple[AstEdit
     chunks: list[AstEditChunk] = []
     seen_dsls: set[str] = {ast.unparse(base_tree)}
 
+    base_defs = dict(_collect_top_defs(base_tree))
+    win_defs_list = _collect_top_defs(win_tree)
+    new_defs = {name: stmt for name, stmt in win_defs_list if name not in base_defs}
+    def_order = [name for name, _stmt in win_defs_list if name in new_defs]
+
     _extract_stmt_list_deltas(
         base_tree,
         base_tree.body,
@@ -625,16 +724,36 @@ def decompose_ast_ablations(baseline_dsl: str, winner_dsl: str) -> tuple[AstEdit
         "module",
         chunks,
         seen_dsls,
+        new_defs=new_defs,
+        def_order=def_order,
     )
-    if not chunks and ast.unparse(win_tree) != ast.unparse(base_tree):
+    has_verifiable_chunk = any(c.edit_kind in _SUPPORTED_PROBE_KINDS for c in chunks)
+    win_rendered = ast.unparse(win_tree)
+    if (
+        (not chunks or (len(base_tree.body) > 2 and not has_verifiable_chunk))
+        and win_rendered != ast.unparse(base_tree)
+        and win_rendered not in seen_dsls
+    ):
+        win_defs_map = dict(win_defs_list)
+        diff_names = [
+            name
+            for name, w_stmt in win_defs_list
+            if name not in base_defs or _node_key(base_defs[name]) != _node_key(w_stmt)
+        ]
+        before_diff = "\n".join(
+            _node_key(base_defs[n]) for n in diff_names if n in base_defs
+        ) or ast.unparse(base_tree)
+        after_diff = "\n".join(
+            _node_key(win_defs_map[n]) for n in diff_names if n in win_defs_map
+        ) or win_rendered
         chunks.append(
             AstEditChunk(
-                chunk_id="edit_0",
-                edit_kind=_classify_edit(baseline_dsl, winner_dsl),
-                target_path="module/whole",
-                before_src=ast.unparse(base_tree),
-                after_src=ast.unparse(win_tree),
-                ablated_dsl=ast.unparse(win_tree),
+                chunk_id=f"edit_{len(chunks)}",
+                edit_kind=_classify_edit(before_diff, after_diff),
+                target_path="module/regime_composite" if chunks else "module/whole",
+                before_src=before_diff,
+                after_src=after_diff,
+                ablated_dsl=win_rendered,
             )
         )
     return tuple(chunks)
@@ -1582,6 +1701,24 @@ def distill_causal_rule(
     )
 
 
+def _ledger_cost_score(ledger: ObjectivePhysicalLedger) -> float:
+    dom = float(max(ledger.pipe_cycles.values(), default=100))
+    occ = float(ledger.wave_occupancy)
+    if occ <= 0.0:
+        occ = float(min(56, max(1, int(ledger.grid_blocks)))) / 56.0
+    occ = max(0.02, occ)
+    burst = max(0.15, float(ledger.dma_burst_efficiency_ratio))
+    degraded_count = sum(len(wl.degraded_single_buffers) for wl in ledger.waterlines.values())
+    penalty = 1.0
+    penalty += 0.25 * max(0, degraded_count)
+    penalty += 0.15 * max(0, int(ledger.in_loop_pipe_all_barriers))
+    if ledger.uses_dynamic_offset_pipelining:
+        penalty += 0.12
+    if ledger.has_coupled_reduce_sfu_accum:
+        penalty += 0.12
+    return (dom / occ / burst) * penalty
+
+
 class FlywheelDistiller:
     """Decomposes winning DSL edits, ablates negatives, probes NPU, and admits rules."""
 
@@ -1609,6 +1746,10 @@ class FlywheelDistiller:
         winner_latency_us: float,
         factory_name: str | None = None,
         factory_kwargs: Mapping[str, object] | None = None,
+        config_selector_name: str | None = None,
+        dims: Mapping[str, object] | None = None,
+        batch_latency_evaluator: Callable[[Sequence[tuple[str, str]]], Mapping[str, float]] | None = None,
+        paradigm: str | None = None,
         kb_output_path: str | Path | None = None,
         rule_id_prefix: str = "R_FLYWHEEL",
     ) -> FlywheelDistillationReport:
@@ -1619,13 +1760,59 @@ class FlywheelDistiller:
         outcomes: list[DistilledRuleOutcome] = []
         admitted_ids: list[str] = []
 
-        base_lat = max(baseline_latency_us, 1e-6)
+        base_sa = run_stage_a_static(
+            baseline_dsl,
+            factory_name=factory_name,
+            factory_kwargs=factory_kwargs,
+            config_selector_name=config_selector_name,
+            dims=dims,
+        )
+        base_cost = (
+            _ledger_cost_score(base_sa.ledger)
+            if base_sa.passed and base_sa.ledger is not None
+            else 0.0
+        )
+
+        funnel_results: list[tuple[AstEditChunk, object]] = []
         for chunk in chunks:
             eval_res = self._funnel.evaluate(
                 chunk.ablated_dsl,
                 factory_name=factory_name,
                 factory_kwargs=factory_kwargs,
+                config_selector_name=config_selector_name,
+                dims=dims,
             )
+            funnel_results.append((chunk, eval_res))
+
+        batch_latencies: dict[str, float] = {}
+        if batch_latency_evaluator is not None:
+            batch_targets: list[tuple[str, str]] = []
+            seen_batch_kinds: set[str] = set()
+            for chunk, eval_res in funnel_results:
+                if (
+                    not eval_res.passed
+                    or eval_res.stage_a is None
+                    or eval_res.stage_a.ledger is None
+                ):
+                    continue
+                if chunk.edit_kind not in _SUPPORTED_PROBE_KINDS:
+                    continue
+                if chunk.edit_kind in seen_batch_kinds:
+                    continue
+                seen_batch_kinds.add(chunk.edit_kind)
+                batch_targets.append((chunk.chunk_id, chunk.ablated_dsl))
+                if len(batch_targets) >= 4:
+                    break
+            if batch_targets:
+                raw_batch = batch_latency_evaluator(batch_targets)
+                batch_latencies = {
+                    str(k): float(v)
+                    for k, v in dict(raw_batch).items()
+                    if float(v) > 0.0
+                }
+
+        base_lat = max(baseline_latency_us, 1e-6)
+        for chunk, eval_res in funnel_results:
             if not eval_res.passed or eval_res.stage_a is None or eval_res.stage_a.ledger is None:
                 discarded.append(
                     AblationMeasurement(
@@ -1641,11 +1828,15 @@ class FlywheelDistiller:
                 )
                 continue
 
-            var_lat = (
-                eval_res.stage_c.measured_latency_us
-                if eval_res.stage_c and eval_res.stage_c.measured_latency_us > 0.0
-                else float(max(eval_res.stage_a.ledger.pipe_cycles.values(), default=100)) / 20.0
-            )
+            if chunk.chunk_id in batch_latencies:
+                var_lat = batch_latencies[chunk.chunk_id]
+            elif eval_res.stage_c and eval_res.stage_c.measured_latency_us > 0.0:
+                var_lat = eval_res.stage_c.measured_latency_us
+            elif base_cost > 0.0:
+                var_cost = _ledger_cost_score(eval_res.stage_a.ledger)
+                var_lat = base_lat * (var_cost / base_cost)
+            else:
+                var_lat = float(max(eval_res.stage_a.ledger.pipe_cycles.values(), default=100)) / 20.0
             rel_gain = (base_lat - var_lat) / base_lat
             is_pos = rel_gain >= self._min_edit_gain
             meas = AblationMeasurement(
@@ -1736,6 +1927,7 @@ class FlywheelDistiller:
                 rule.rule_id,
                 postcondition_realized=True,
                 speed_gain=max(0.0, meas.relative_gain),
+                paradigm=paradigm,
             )
             admitted_ids.append(rule.rule_id)
             outcomes.append(
