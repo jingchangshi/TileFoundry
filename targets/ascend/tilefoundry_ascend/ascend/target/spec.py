@@ -16,6 +16,22 @@ DEVICE_SCHEMA = "tilefoundry.ascend.device/v2"
 
 DAVINCI_950_ID = "ascend.davinci_950"
 ASCEND_950PR_ID = "ascend.950pr"
+ASCEND_950DT_ID = "ascend.950dt"
+
+_CUBE_MACS_DTYPES: tuple[str, ...] = (
+    "f4e2m1",
+    "f4e1m2",
+    "fp8e4m3",
+    "fp8e5m2",
+    "hif8",
+    "i8",
+    "u8",
+    "f16",
+    "bf16",
+    "hf32",
+    "f32",
+)
+_BURST_BANDWIDTH_SIZES: tuple[int, ...] = (4096, 8192, 16384, 32768, 65536)
 
 _ALLOWED_OWNERS = (TARGET_MEMORY_OWNER, "block", "aic", "aiv", "lane")
 
@@ -43,6 +59,10 @@ def _dtypes(names: tuple[str, ...], document: HardwareDocument) -> tuple[DType, 
 def build_davinci_950(document: HardwareDocument) -> DaVinci950:
     """Build the immutable DaVinci 950 architecture value from its document."""
     reader = SchemaReader(document)
+    cube_macs_per_cycle_table = tuple(
+        (name, reader.integer(f"throughput.cube_macs_per_cycle.{name}", unit="mac/cycle"))
+        for name in _CUBE_MACS_DTYPES
+    )
     architecture = DaVinci950(
         name=reader.text("identity.name"),
         supported_compute_dtypes=_dtypes(reader.names("instruction.compute_dtypes"), document),
@@ -68,6 +88,27 @@ def build_davinci_950(document: HardwareDocument) -> DaVinci950:
         fixpipe_bytes_per_cycle=reader.integer(
             "microarch.fixpipe_bytes_per_cycle", unit="byte/cycle"
         ),
+        cube_macs_per_cycle_table=cube_macs_per_cycle_table,
+        l1_banks=reader.integer("memory.l1.banks", unit="count"),
+        l1_bank_bytes=reader.integer("memory.l1.bank_bytes", unit="byte"),
+        ub_bank_groups=reader.integer("memory.ub.bank_groups", unit="count"),
+        ub_banks_per_group=reader.integer("memory.ub.banks_per_group", unit="count"),
+        ub_bank_bytes=reader.integer("memory.ub.bank_bytes", unit="byte"),
+        ub_datablock_bytes=reader.integer("memory.ub.datablock_bytes", unit="byte"),
+        bias_table_bytes=reader.integer("memory.bias_table.per_aic", unit="byte"),
+        fixbuf_bytes=reader.integer("memory.fixbuf.per_aic", unit="byte"),
+        l2_bytes_per_cycle_per_aic=reader.integer(
+            "memory.l2.bytes_per_cycle_per_aic", unit="byte/cycle"
+        ),
+        l0a_layout=reader.text("memory.l0a.layout"),
+        l0b_layout=reader.text("memory.l0b.layout"),
+        l0c_layout=reader.text("memory.l0c.layout"),
+        max_crosscore_flag_depth=reader.integer(
+            "microarch.max_crosscore_flag_depth", unit="count"
+        ),
+        hardware_mutex_count=reader.integer("microarch.hardware_mutex_count", unit="count"),
+        max_mmad_mnk=reader.integer("geometry.max_mmad_mnk", unit="element"),
+        forbidden_cube_dtypes=reader.names("instruction.forbidden_cube_dtypes"),
     )
     reader.close()
     overlap = set(architecture.valid_dma_paths) & set(architecture.forbidden_dma_paths)
@@ -94,12 +135,14 @@ def build_ascend_950pr(document: HardwareDocument) -> Ascend950PR:
             ((DType.f32, reader.integer("throughput.aiv.f32", unit="flop/s")),),
         ),
     )
-    burst_bw_table = (
-        (4096, reader.integer("memory.hbm.burst_bandwidth.b4096", unit="byte/s")),
-        (8192, reader.integer("memory.hbm.burst_bandwidth.b8192", unit="byte/s")),
-        (16384, reader.integer("memory.hbm.burst_bandwidth.b16384", unit="byte/s")),
-        (32768, reader.integer("memory.hbm.burst_bandwidth.b32768", unit="byte/s")),
-        (65536, reader.integer("memory.hbm.burst_bandwidth.b65536", unit="byte/s")),
+    burst_entries = tuple(
+        (size, reader.optional_integer(f"memory.hbm.burst_bandwidth.b{size}", unit="byte/s"))
+        for size in _BURST_BANDWIDTH_SIZES
+    )
+    burst_bw_table: tuple[tuple[int, int], ...] = (
+        tuple((size, rate) for size, rate in burst_entries if rate is not None)
+        if all(rate is not None for _size, rate in burst_entries)
+        else ()
     )
     device = Ascend950PR(
         name=reader.text("identity.name"),
@@ -124,6 +167,8 @@ def build_ascend_950pr(document: HardwareDocument) -> Ascend950PR:
         aiv_lane_events_per_second=reader.integer("performance.aiv.lane_events", unit="op/s"),
         ssbuf_bytes_per_block=reader.integer("memory.ssbuf.per_block", unit="byte"),
         ssbuf_latency_cycles=reader.integer("memory.ssbuf.latency_cycles", unit="cycle"),
+        clock_mhz=reader.integer("compute.clock_mhz", unit="MHz"),
+        l2_capacity_bytes=reader.integer("memory.l2.capacity", unit="byte"),
     )
     reader.close()
     if device.ub_simdvf_usable_bytes_per_aiv > device.ub_nominal_bytes_per_aiv:
@@ -284,6 +329,7 @@ class NodeResourceMask:
 
 __all__ = [
     "ARCHITECTURE_SCHEMA",
+    "ASCEND_950DT_ID",
     "ASCEND_950PR_ID",
     "CORE_BIT_SHIFT",
     "DAVINCI_950_ID",

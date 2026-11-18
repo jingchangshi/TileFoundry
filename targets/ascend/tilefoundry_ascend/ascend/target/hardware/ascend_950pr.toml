@@ -34,6 +34,13 @@ origin = "measured"
 source = "CANN runtime AIV core query on Ascend 950PR"
 conditions = "2 AIV cores per logical block across 28 blocks"
 
+[facts.compute.clock_mhz]
+value = 1650
+unit = "MHz"
+origin = "measured"
+source = "npu-smi info -t common -i 0 Aicore Freq on Ascend 950PR"
+conditions = "Nominal AI Core clock frequency 1.65 GHz (1650 MHz)"
+
 [facts.memory.hbm.capacity]
 value = 137438953472
 unit = "byte"
@@ -96,6 +103,13 @@ unit = "byte"
 origin = "vendor"
 source = "CANN dav-3510 hardware platform specification"
 conditions = "512 KiB L1 buffer per AIC core"
+
+[facts.memory.l2.capacity]
+value = 134217728
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 L2 cache specification (asc-devkit / catlass)"
+conditions = "128 MiB device-shared L2 cache capacity"
 
 [facts.memory.l0a.per_aic]
 value = 65536

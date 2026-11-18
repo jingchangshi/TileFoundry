@@ -1,0 +1,203 @@
+[spec]
+schema = "tilefoundry.ascend.device/v2"
+kind = "device"
+id = "ascend.950dt"
+
+[compatibility]
+architectures = ["ascend.davinci_950"]
+
+[facts.identity.name]
+value = "ascend_950dt"
+unit = "name"
+origin = "vendor"
+source = "Ascend 950DT (dav-3510) device hardware specification"
+conditions = "Ascend 950DT full-die NPU configuration"
+
+[facts.compute.block_count]
+value = 36
+unit = "count"
+origin = "vendor"
+source = "Ascend 950DT (dav-3510) hardware core topology specification"
+conditions = "36 coupled AIC/AIV logical blocks available on one Ascend 950DT die"
+
+[facts.compute.aic_count]
+value = 36
+unit = "count"
+origin = "vendor"
+source = "Ascend 950DT (dav-3510) hardware core topology specification"
+conditions = "1 AIC core per logical block across 36 blocks"
+
+[facts.compute.aiv_count]
+value = 72
+unit = "count"
+origin = "vendor"
+source = "Ascend 950DT (dav-3510) hardware core topology specification"
+conditions = "2 AIV cores per logical block across 36 blocks"
+
+[facts.compute.clock_mhz]
+value = 1650
+unit = "MHz"
+origin = "vendor"
+source = "Ascend 950DT (dav-3510) nominal AI Core clock specification"
+conditions = "Nominal AI Core clock frequency 1.65 GHz (1650 MHz)"
+
+[facts.memory.hbm.capacity]
+value = 154618822656
+unit = "byte"
+origin = "vendor"
+source = "Ascend 950DT (dav-3510) HBM capacity specification"
+conditions = "144 GiB HBM pool shared across all 36 blocks of this device"
+
+[facts.memory.hbm.owner]
+value = "target"
+unit = "name"
+origin = "vendor"
+source = "Ascend 950DT device memory model"
+conditions = "Device-global HBM memory is shared across all blocks"
+
+[facts.memory.hbm.bandwidth]
+value = 4000000000000
+unit = "byte/s"
+origin = "vendor"
+source = "Ascend 950DT (dav-3510) HBM peak bandwidth specification"
+conditions = "4.0 TB/s peak aggregate HBM bandwidth on Ascend 950DT"
+
+[facts.memory.hbm.burst_bandwidth.b4096]
+status = "unavailable"
+unit = "byte/s"
+origin = "vendor"
+source = "Ascend 950DT calibration placeholder"
+conditions = "Segmented 4 KiB HBM burst bandwidth micro-probe not yet measured on Ascend 950DT"
+
+[facts.memory.hbm.burst_bandwidth.b8192]
+status = "unavailable"
+unit = "byte/s"
+origin = "vendor"
+source = "Ascend 950DT calibration placeholder"
+conditions = "Segmented 8 KiB HBM burst bandwidth micro-probe not yet measured on Ascend 950DT"
+
+[facts.memory.hbm.burst_bandwidth.b16384]
+status = "unavailable"
+unit = "byte/s"
+origin = "vendor"
+source = "Ascend 950DT calibration placeholder"
+conditions = "Segmented 16 KiB HBM burst bandwidth micro-probe not yet measured on Ascend 950DT"
+
+[facts.memory.hbm.burst_bandwidth.b32768]
+status = "unavailable"
+unit = "byte/s"
+origin = "vendor"
+source = "Ascend 950DT calibration placeholder"
+conditions = "Segmented 32 KiB HBM burst bandwidth micro-probe not yet measured on Ascend 950DT"
+
+[facts.memory.hbm.burst_bandwidth.b65536]
+status = "unavailable"
+unit = "byte/s"
+origin = "vendor"
+source = "Ascend 950DT calibration placeholder"
+conditions = "Segmented 64 KiB HBM burst bandwidth micro-probe not yet measured on Ascend 950DT"
+
+[facts.memory.l2.capacity]
+value = 134217728
+unit = "byte"
+origin = "vendor"
+source = "Ascend 950DT (dav-3510) L2 cache specification"
+conditions = "128 MiB device-shared L2 cache capacity"
+
+[facts.memory.l1.per_aic]
+value = 524288
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 hardware platform specification"
+conditions = "512 KiB L1 buffer per AIC core"
+
+[facts.memory.l0a.per_aic]
+value = 65536
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 hardware platform specification"
+conditions = "64 KiB L0A buffer per AIC core"
+
+[facts.memory.l0b.per_aic]
+value = 65536
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 hardware platform specification"
+conditions = "64 KiB L0B buffer per AIC core"
+
+[facts.memory.l0c.per_aic]
+value = 262144
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 hardware platform specification"
+conditions = "256 KiB L0C accumulator buffer per AIC core"
+
+[facts.memory.ub.nominal_per_aiv]
+value = 262144
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 hardware platform specification"
+conditions = "256 KiB hardware Unified Buffer per AIV core"
+
+[facts.memory.ub.simdvf_usable_per_aiv]
+value = 253952
+unit = "byte"
+origin = "vendor"
+source = "Ascend dav-3510 UB layout and TileLang GetSharedMemoryLimit (!HasSimtVF)"
+conditions = "248 KiB default usable UB for pure SimdVF kernels (256 KiB - 6 KiB stack - 2 KiB runtime)"
+
+[facts.memory.ub.usable_per_aiv]
+value = 221184
+unit = "byte"
+origin = "vendor"
+source = "TileLang Ascend dav-3510 SIMT/runtime usable UB budget"
+conditions = "216 KiB usable UB when SimtVF carves out 32 KiB minimum SIMT Data Cache"
+
+[facts.memory.rmem.per_lane]
+value = 256
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 vector lane register model"
+conditions = "Logical register budget per vector lane inside a vector execution scope"
+
+[facts.throughput.aic.f16]
+value = 486606766080000
+unit = "flop/s"
+origin = "derived"
+source = "Ascend 950DT Cube fp16 peak (36 AIC * 4096 MAC/cycle * 2 FLOP/MAC * 1.65 GHz)"
+conditions = "Derived architectural peak for 36 AIC at 1.65 GHz"
+
+[facts.throughput.aic.bf16]
+value = 486606766080000
+unit = "flop/s"
+origin = "derived"
+source = "Ascend 950DT Cube bf16 peak (36 AIC * 4096 MAC/cycle * 2 FLOP/MAC * 1.65 GHz)"
+conditions = "Derived architectural peak for 36 AIC at 1.65 GHz"
+
+[facts.throughput.aiv.f32]
+value = 41142857142857
+unit = "flop/s"
+origin = "estimated"
+source = "Ascend 950DT nominal aggregate AIV fp32 vector compute estimate (72/56 scaled from 950PR)"
+conditions = "Nominal roofline peak across 72 AIV cores"
+
+[facts.performance.aiv.lane_events]
+value = 20571428571428
+unit = "op/s"
+origin = "estimated"
+source = "Ascend 950DT nominal AIV service-op throughput model (72/56 scaled from 950PR)"
+conditions = "Derived service rate for non-FLOP vector/scalar/select operations"
+
+[facts.memory.ssbuf.per_block]
+value = 3072
+unit = "byte"
+origin = "vendor"
+source = "CANN dav-3510 MixCore GetSsbufBaseAddr and TileLang ssbuf specification"
+conditions = "3 KiB SSBuffer capacity per coupled block (dirty initial state; explicit init required)"
+
+[facts.memory.ssbuf.latency_cycles]
+value = 8
+unit = "cycle"
+origin = "vendor"
+source = "CANN dav-3510 SSBuffer cross-core scalar handoff specification"
+conditions = "Nominal SSBuffer PIPE_S uncached cross-core handoff latency (~8 cycles)"

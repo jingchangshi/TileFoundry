@@ -8,8 +8,9 @@ from typing import Literal
 import isl
 
 from tilefoundry.evaluator.kernels import binary as eval_binary_kernel
+from tilefoundry.evaluator.kernels import gather as eval_gather_kernel
 from tilefoundry.evaluator.registry import register_schedule_eval
-from tilefoundry.evaluator.value import TensorValue, to_torch_dtype
+from tilefoundry.evaluator.value import EvalError, TensorValue, TupleValue, to_torch_dtype
 from tilefoundry.ir.core import Call, Op, OpCapability
 from tilefoundry.ir.core.execution import RegionRequirement
 from tilefoundry.ir.core.kinds import BinaryKind, ReduceKind, UnaryKind
@@ -28,7 +29,7 @@ from tilefoundry.ir.pattern import (
 )
 from tilefoundry.ir.pattern import predicates as P
 from tilefoundry.ir.tir.memory.copy import register_copy_semantics
-from tilefoundry.ir.types import DType, StorageKind, UnitType
+from tilefoundry.ir.types import DType, StorageKind, TupleType, UnitType
 from tilefoundry.ir.types.utils import static_dim_value
 from tilefoundry.utils.lazy import torch
 from tilefoundry.visitor_registry import register_typeinfer, register_verify_stmt
@@ -37,6 +38,7 @@ from tilefoundry.visitor_registry.access_relation import (
     broadcast_access,
     broadcast_all,
     broadcast_shapes,
+    gather_relations,
     identity_access,
     identity_relations,
     iterating,
@@ -535,7 +537,7 @@ class _VectorReduceBase(Op):
 
     src = ParamDef(kind="input", effect=MemoryEffect.READ, pattern=_RMEM_AIV)
     dst = ParamDef(kind="input", effect=MemoryEffect.WRITE, pattern=_RMEM_AIV)
-    axes = ParamDef(kind="attribute", annotation=tuple)
+    axes = ParamDef(kind="attribute", annotation=tuple, default=(-1,))
     keepdim = ParamDef(kind="attribute", annotation=bool, default=True)
 
 
@@ -1512,6 +1514,429 @@ def _verify_l0c_to_gm_atomic(call: Call, ctx) -> None:
         ctx.error(call, f"AscendL0cToGmAtomic: shape mismatch {sty.shape} vs {dty.shape}")
 
 
+def _safe_torch_dtype(dtype: DType, fallback=None):
+    try:
+        return to_torch_dtype(dtype)
+    except EvalError:
+        return fallback if fallback is not None else torch.float16
+
+
+@register_op(dialect="T", category="ascend", name="ascend_vgather")
+class AscendVgather(Op):
+    """AIV indexed gather (vgather2/vgatherb) along ``dim`` inside SimdVF."""
+
+    capability = OpCapability("ascend.vector")
+    resource = "vector_engine"
+    execution_mesh = _AIV_MESH
+    execution_region = _INSIDE_VF
+
+    src = ParamDef(kind="input", effect=MemoryEffect.READ, pattern=TensorPattern())
+    index = ParamDef(kind="input", effect=MemoryEffect.READ, pattern=_RMEM_AIV)
+    dst = ParamDef(kind="input", effect=MemoryEffect.WRITE, pattern=_RMEM_AIV)
+    dim = ParamDef(kind="attribute", annotation=int, default=0)
+    fill = ParamDef(kind="attribute", annotation=float | None, default=None)
+    mode = ParamDef(
+        kind="attribute",
+        annotation=Literal["vgather2", "vgatherb"],
+        default="vgather2",
+    )
+    between = (SameConstraint("dtype", "src", "dst"),)
+
+    def __init__(self, **attrs) -> None:
+        if "fill_value" in attrs and "fill" not in attrs:
+            attrs["fill"] = attrs.pop("fill_value")
+        super().__init__(**attrs)
+
+
+@register_typeinfer(AscendVgather)
+def _infer_vgather(call: Call, ctx) -> UnitType:
+    return UnitType()
+
+
+@register_access_relation(AscendVgather)
+def _access_vgather(call: Call, ctx) -> tuple[AccessRelation, ...]:
+    src_ty = ctx.type_of(call.args[0])
+    idx_ty = ctx.type_of(call.args[1])
+    rank = len(src_ty.shape)
+    axis = call.target.dim + rank if call.target.dim < 0 else call.target.dim
+    src_rel, idx_rel, dst_rel = gather_relations(src_ty, idx_ty, axis)
+    return src_rel, idx_rel, dst_rel, dst_rel
+
+
+@register_schedule_eval(AscendVgather)
+def _eval_vgather(ctx):
+    src = ctx.args[0].data
+    index = ctx.args[1].data.to(torch.int64)
+    axis = ctx.op.dim + src.ndim if ctx.op.dim < 0 else ctx.op.dim
+    out = eval_gather_kernel(src, index, axis, ctx.op.fill)
+    return TensorValue(data=out, type=ctx.result_type)
+
+
+@register_verify_stmt(AscendVgather)
+def _verify_vgather(call: Call, ctx) -> None:
+    sty, ity, dty = (ctx.type_of(arg) for arg in call.args)
+    if len(ity.shape) != 1:
+        ctx.error(call, f"AscendVgather: index must be 1-D, got {ity.shape}")
+        return
+    if ity.dtype not in (DType.i32, DType.i64):
+        ctx.error(call, f"AscendVgather: index must be i32 or i64, got {ity.dtype}")
+        return
+    rank = len(sty.shape)
+    axis = call.target.dim + rank if call.target.dim < 0 else call.target.dim
+    if axis < 0 or axis >= rank:
+        ctx.error(call, f"AscendVgather: dim {call.target.dim} out of range for rank {rank}")
+        return
+    expected = list(sty.shape)
+    expected[axis] = ity.shape[0]
+    if tuple(expected) != tuple(dty.shape):
+        ctx.error(call, f"AscendVgather: dst shape {dty.shape} != expected {tuple(expected)}")
+
+
+@register_op(dialect="T", category="ascend", name="ascend_bit_unpack")
+class AscendBitUnpack(Op):
+    """AIV 4-bit nibble unpack (DIST_UNPACK4_B8) inside SimdVF."""
+
+    capability = OpCapability("ascend.vector")
+    resource = "vector_engine"
+    execution_mesh = _AIV_MESH
+    execution_region = _INSIDE_VF
+
+    src = ParamDef(kind="input", effect=MemoryEffect.READ, pattern=_RMEM_AIV)
+    dst = ParamDef(kind="input", effect=MemoryEffect.WRITE, pattern=_RMEM_AIV)
+    src_bits = ParamDef(kind="attribute", annotation=int, default=4)
+    signed = ParamDef(kind="attribute", annotation=bool, default=True)
+    dst_dtype = ParamDef(kind="attribute", annotation=DType, default=DType.f16)
+    between = ()
+
+    def __init__(self, **attrs) -> None:
+        dst_dtype = attrs.get("dst_dtype")
+        if isinstance(dst_dtype, str):
+            attrs["dst_dtype"] = DType.from_name(dst_dtype)
+        super().__init__(**attrs)
+
+
+@register_typeinfer(AscendBitUnpack)
+def _infer_bit_unpack(call: Call, ctx) -> UnitType:
+    return UnitType()
+
+
+@register_access_relation(AscendBitUnpack)
+def _access_bit_unpack(call: Call, ctx) -> tuple[AccessRelation, ...]:
+    sty = ctx.type_of(call.args[0])
+    dty = ctx.type_of(call.args[1])
+    if tuple(sty.shape) == tuple(dty.shape):
+        return identity_relations(call, ctx)
+    rank = len(dty.shape)
+    dims = [f"d{i}" for i in range(rank)]
+    src_coords = [*dims[:-1], f"floor(d{rank - 1} / 2)"]
+    src_rel = AccessRelation(isl.map(f"{{ [{', '.join(dims)}] -> [{', '.join(src_coords)}] }}"))
+    id_rel = identity_access(rank)
+    return iterating(dty.shape, (src_rel, id_rel, id_rel))
+
+
+@register_schedule_eval(AscendBitUnpack)
+def _eval_bit_unpack(ctx):
+    src = ctx.args[0].data
+    dst_shape = _dst_shape_from_ctx(ctx)
+    target_dt = _safe_torch_dtype(ctx.op.dst_dtype, fallback=torch.float16)
+    if tuple(src.shape) == dst_shape:
+        return TensorValue(data=src.to(target_dt), type=ctx.result_type)
+    raw = src.to(torch.int32)
+    lo = raw & 0xF
+    hi = (raw >> 4) & 0xF
+    if ctx.op.signed:
+        lo = torch.where(lo >= 8, lo - 16, lo)
+        hi = torch.where(hi >= 8, hi - 16, hi)
+    unpacked = torch.stack((lo, hi), dim=-1).reshape(*src.shape[:-1], src.shape[-1] * 2)
+    if unpacked.shape != dst_shape and dst_shape:
+        unpacked = unpacked[..., : dst_shape[-1]]
+    return TensorValue(data=unpacked.to(target_dt), type=ctx.result_type)
+
+
+@register_verify_stmt(AscendBitUnpack)
+def _verify_bit_unpack(call: Call, ctx) -> None:
+    sty, dty = (ctx.type_of(arg) for arg in call.args)
+    if call.target.src_bits not in (2, 4, 8):
+        ctx.error(call, f"AscendBitUnpack: unsupported src_bits {call.target.src_bits}")
+        return
+    if len(sty.shape) != len(dty.shape) or not sty.shape:
+        ctx.error(call, f"AscendBitUnpack: rank mismatch {sty.shape} vs {dty.shape}")
+        return
+    if sty.shape[:-1] != dty.shape[:-1]:
+        ctx.error(call, f"AscendBitUnpack: prefix shape mismatch {sty.shape} vs {dty.shape}")
+        return
+    s_last = static_dim_value(sty.shape[-1])
+    d_last = static_dim_value(dty.shape[-1])
+    if s_last is not None and d_last is not None and d_last not in (s_last, s_last * 2):
+        ctx.error(
+            call,
+            f"AscendBitUnpack: dst last dim {d_last} must equal {s_last} or {s_last * 2}",
+        )
+
+
+@register_op(dialect="T", category="ascend", name="ascend_mx_quant")
+class AscendMxQuant(Op):
+    """AIV block-32 microscaling quantization (MXFP8/MXFP4 + E8M0 scale) inside SimdVF."""
+
+    capability = OpCapability("ascend.vector")
+    resource = "vector_engine"
+    execution_mesh = _AIV_MESH
+    execution_region = _INSIDE_VF
+
+    src = ParamDef(kind="input", effect=MemoryEffect.READ, pattern=_RMEM_AIV)
+    dst = ParamDef(kind="input", effect=MemoryEffect.WRITE, pattern=_RMEM_AIV)
+    scale = ParamDef(kind="input", effect=MemoryEffect.WRITE, optional=True, pattern=_RMEM_AIV)
+    scheme = ParamDef(kind="attribute", annotation=str, default="per_token_group")
+    group = ParamDef(kind="attribute", annotation=int, default=32)
+    target_dtype = ParamDef(kind="attribute", annotation=DType, default=DType.fp8e4m3)
+    between = ()
+
+    def __init__(self, **attrs) -> None:
+        target_dtype = attrs.get("target_dtype")
+        if isinstance(target_dtype, str):
+            attrs["target_dtype"] = DType.from_name(target_dtype)
+        super().__init__(**attrs)
+
+
+@register_typeinfer(AscendMxQuant)
+def _infer_mx_quant(call: Call, ctx) -> UnitType:
+    return UnitType()
+
+
+@register_access_relation(AscendMxQuant)
+def _access_mx_quant(call: Call, ctx) -> tuple[AccessRelation, ...]:
+    sty = ctx.type_of(call.args[0])
+    rank = len(sty.shape)
+    id_rel = identity_access(rank)
+    if len(call.args) < 3:
+        return iterating(sty.shape, (id_rel, id_rel, id_rel))
+    group = max(1, int(call.target.group))
+    dims = [f"d{i}" for i in range(rank)]
+    scale_coords = [*dims[:-1], f"floor(d{rank - 1} / {group})"]
+    scale_rel = AccessRelation(isl.map(f"{{ [{', '.join(dims)}] -> [{', '.join(scale_coords)}] }}"))
+    return iterating(sty.shape, (id_rel, id_rel, scale_rel, id_rel))
+
+
+@register_schedule_eval(AscendMxQuant)
+def _eval_mx_quant(ctx):
+    xf = ctx.args[0].data.to(torch.float32)
+    group = max(1, int(ctx.op.group))
+    last = xf.shape[-1]
+    pad = (group - (last % group)) % group
+    xf_padded = torch.nn.functional.pad(xf, (0, pad)) if pad > 0 else xf
+    blk = xf_padded.reshape(*xf_padded.shape[:-1], xf_padded.shape[-1] // group, group)
+    amax = blk.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    max_repr = 6.0 if ctx.op.target_dtype.bit_width <= 4 else 448.0
+    exp2 = torch.pow(2.0, torch.ceil(torch.log2(amax / max_repr)))
+    q_fp = torch.clamp(blk / exp2, min=-max_repr, max=max_repr).reshape(*xf_padded.shape)
+    if pad > 0:
+        q_fp = q_fp[..., :last]
+    q_dt = _safe_torch_dtype(ctx.op.target_dtype, fallback=torch.float32)
+    q_data = q_fp.to(q_dt)
+    scale_fp = exp2.squeeze(-1)
+
+    if isinstance(ctx.result_type, TupleType):
+        q_ty, s_ty = ctx.result_type.fields[0], ctx.result_type.fields[1]
+        s_dt = _safe_torch_dtype(s_ty.dtype, fallback=torch.float32)
+        return TupleValue(
+            elements=(
+                TensorValue(data=q_data, type=q_ty),
+                TensorValue(data=scale_fp.to(s_dt), type=s_ty),
+            )
+        )
+    if len(ctx.args) >= 3:
+        q_ty = ctx.args[1].type
+        s_ty = ctx.args[2].type
+        s_dt = _safe_torch_dtype(s_ty.dtype, fallback=torch.float32)
+        return TupleValue(
+            elements=(
+                TensorValue(data=q_data, type=q_ty),
+                TensorValue(data=scale_fp.to(s_dt), type=s_ty),
+            )
+        )
+    return TensorValue(data=q_data, type=ctx.result_type)
+
+
+@register_verify_stmt(AscendMxQuant)
+def _verify_mx_quant(call: Call, ctx) -> None:
+    sty = ctx.type_of(call.args[0])
+    dty = ctx.type_of(call.args[1])
+    if call.target.group <= 0:
+        ctx.error(call, f"AscendMxQuant: group must be positive, got {call.target.group}")
+        return
+    if not sty.shape:
+        ctx.error(call, "AscendMxQuant: src must be at least rank-1")
+        return
+    if tuple(sty.shape) != tuple(dty.shape):
+        ctx.error(call, f"AscendMxQuant: dst shape {dty.shape} != src shape {sty.shape}")
+        return
+    if len(call.args) >= 3:
+        scale_ty = ctx.type_of(call.args[2])
+        last = static_dim_value(sty.shape[-1])
+        s_last = static_dim_value(scale_ty.shape[-1]) if scale_ty.shape else None
+        if last is not None and s_last is not None:
+            expected_last = (last + call.target.group - 1) // call.target.group
+            if tuple(scale_ty.shape[:-1]) != tuple(sty.shape[:-1]) or s_last != expected_last:
+                ctx.error(
+                    call,
+                    f"AscendMxQuant: scale shape {scale_ty.shape} != expected {(*sty.shape[:-1], expected_last)}",
+                )
+
+
+@register_op(dialect="T", category="ascend", name="ascend_sort_topk")
+class AscendSortTopK(Op):
+    """AIV Sort32/MrgSort Top-K selection along ``axis`` inside SimdVF."""
+
+    capability = OpCapability("ascend.vector")
+    resource = "vector_engine"
+    execution_mesh = _AIV_MESH
+    execution_region = _INSIDE_VF
+
+    src = ParamDef(kind="input", effect=MemoryEffect.READ, pattern=_RMEM_AIV)
+    dst = ParamDef(kind="input", effect=MemoryEffect.WRITE, pattern=_RMEM_AIV)
+    indices = ParamDef(kind="input", effect=MemoryEffect.WRITE, optional=True, pattern=_RMEM_AIV)
+    k = ParamDef(kind="attribute", annotation=int, default=1)
+    axis = ParamDef(kind="attribute", annotation=int, default=-1)
+    largest = ParamDef(kind="attribute", annotation=bool, default=True)
+    sorted = ParamDef(kind="attribute", annotation=bool, default=True)
+    between = ()
+
+
+@register_typeinfer(AscendSortTopK)
+def _infer_sort_topk(call: Call, ctx) -> UnitType:
+    return UnitType()
+
+
+@register_access_relation(AscendSortTopK)
+def _access_sort_topk(call: Call, ctx) -> tuple[AccessRelation, ...]:
+    src_ty = ctx.type_of(call.args[0])
+    rank = len(src_ty.shape)
+    axis = call.target.axis + rank if call.target.axis < 0 else call.target.axis
+    dims = [f"d{i}" for i in range(rank + 1)]
+    walked = ", ".join(dims)
+    scanned = dims[rank]
+    reads = ", ".join(scanned if i == axis else dims[i] for i in range(rank))
+    kept = ", ".join(dims[:rank])
+    src_rel = AccessRelation(isl.map(f"{{ [{walked}] -> [{reads}] }}"))
+    written = AccessRelation(isl.map(f"{{ [{walked}] -> [{kept}] }}"))
+    out_shape = (*src_ty.shape[:axis], max(1, int(call.target.k)), *src_ty.shape[axis + 1 :])
+    space_shape = (*out_shape, src_ty.shape[axis])
+    if len(call.args) >= 3:
+        return iterating(space_shape, (src_rel, written, written, written))
+    return iterating(space_shape, (src_rel, written, written))
+
+
+@register_schedule_eval(AscendSortTopK)
+def _eval_sort_topk(ctx):
+    src = ctx.args[0].data
+    axis = ctx.op.axis + src.ndim if ctx.op.axis < 0 else ctx.op.axis
+    vals, idx = torch.topk(
+        src,
+        k=int(ctx.op.k),
+        dim=axis,
+        largest=bool(ctx.op.largest),
+        sorted=bool(ctx.op.sorted),
+    )
+    if isinstance(ctx.result_type, TupleType):
+        v_ty, i_ty = ctx.result_type.fields[0], ctx.result_type.fields[1]
+        return TupleValue(
+            elements=(
+                TensorValue(data=vals.to(_safe_torch_dtype(v_ty.dtype, src.dtype)), type=v_ty),
+                TensorValue(data=idx.to(_safe_torch_dtype(i_ty.dtype, torch.int64)), type=i_ty),
+            )
+        )
+    if len(ctx.args) >= 3:
+        v_ty, i_ty = ctx.args[1].type, ctx.args[2].type
+        return TupleValue(
+            elements=(
+                TensorValue(data=vals.to(_safe_torch_dtype(v_ty.dtype, src.dtype)), type=v_ty),
+                TensorValue(data=idx.to(_safe_torch_dtype(i_ty.dtype, torch.int64)), type=i_ty),
+            )
+        )
+    if ctx.result_type.dtype in (DType.i32, DType.i64):
+        idx_out = idx.squeeze(axis) if len(ctx.result_type.shape) < src.ndim else idx
+        return TensorValue(
+            data=idx_out.to(_safe_torch_dtype(ctx.result_type.dtype, torch.int64)),
+            type=ctx.result_type,
+        )
+    return TensorValue(
+        data=vals.to(_safe_torch_dtype(ctx.result_type.dtype, src.dtype)),
+        type=ctx.result_type,
+    )
+
+
+@register_verify_stmt(AscendSortTopK)
+def _verify_sort_topk(call: Call, ctx) -> None:
+    sty = ctx.type_of(call.args[0])
+    if call.target.k < 1:
+        ctx.error(call, f"AscendSortTopK: k must be >= 1, got {call.target.k}")
+        return
+    rank = len(sty.shape)
+    axis = call.target.axis + rank if call.target.axis < 0 else call.target.axis
+    if axis < 0 or axis >= rank:
+        ctx.error(call, f"AscendSortTopK: axis {call.target.axis} out of range for rank {rank}")
+        return
+    axis_ext = static_dim_value(sty.shape[axis])
+    if axis_ext is not None and call.target.k > axis_ext:
+        ctx.error(call, f"AscendSortTopK: k={call.target.k} exceeds axis extent {axis_ext}")
+
+
+@register_op(dialect="T", category="ascend", name="ascend_cross_core_sync")
+class AscendCrossCoreSync(Op):
+    """Cross-core AIC<->AIV Mode-4 / Mutex synchronization marker."""
+
+    capability = OpCapability("ascend.dual_copy")
+    resource = "dual_copy_engine"
+    execution_mesh = _MEM_MESH
+    execution_region = _OUTSIDE_VF
+
+    flag = ParamDef(
+        kind="input",
+        effect=MemoryEffect.READ | MemoryEffect.WRITE,
+        pattern=TensorPattern(),
+    )
+    mode = ParamDef(
+        kind="attribute",
+        annotation=Literal["mode4", "mutex", "flag_set", "flag_wait"],
+        default="mode4",
+    )
+    flag_id = ParamDef(kind="attribute", annotation=int, default=0)
+    sender = ParamDef(
+        kind="attribute",
+        annotation=Literal["aic", "aiv", "both"],
+        default="aic",
+    )
+    receiver = ParamDef(
+        kind="attribute",
+        annotation=Literal["aic", "aiv", "both"],
+        default="aiv",
+    )
+    between = ()
+
+
+@register_typeinfer(AscendCrossCoreSync)
+def _infer_cross_core_sync(call: Call, ctx) -> UnitType:
+    return UnitType()
+
+
+register_access_relation(AscendCrossCoreSync)(identity_relations)
+
+
+@register_schedule_eval(AscendCrossCoreSync)
+def _eval_cross_core_sync(ctx):
+    return TensorValue(data=ctx.args[0].data.clone(), type=ctx.result_type)
+
+
+@register_verify_stmt(AscendCrossCoreSync)
+def _verify_cross_core_sync(call: Call, ctx) -> None:
+    fid = call.target.flag_id
+    if call.target.mode == "mutex":
+        if fid < 0 or fid >= 28:
+            ctx.error(call, f"AscendCrossCoreSync(mutex): flag_id {fid} out of range [0, 28)")
+    elif fid < 0 or fid > 15:
+        ctx.error(call, f"AscendCrossCoreSync({call.target.mode}): flag_id {fid} exceeds depth 15")
+
+
 ASCEND_OP_SPECS: tuple[AscendOpSpec, ...] = tuple(
     AscendOpSpec(
         op_cls=cls,
@@ -1571,11 +1996,18 @@ ASCEND_OP_SPECS: tuple[AscendOpSpec, ...] = tuple(
         AscendVdupv,
         AscendVci,
         AscendVmula,
+        AscendVgather,
+        AscendBitUnpack,
+        AscendMxQuant,
+        AscendSortTopK,
+        AscendCrossCoreSync,
     )
 )
 
 __all__ = [
     "ASCEND_OP_SPECS",
+    "AscendBitUnpack",
+    "AscendCrossCoreSync",
     "AscendDualCopy",
     "AscendDualCopyL0cToUb",
     "AscendDualCopyUbToL1",
@@ -1588,6 +2020,7 @@ __all__ = [
     "AscendL1ToL0A",
     "AscendL1ToL0B",
     "AscendMmad",
+    "AscendMxQuant",
     "AscendOpSpec",
     "AscendPand",
     "AscendPnot",
@@ -1595,6 +2028,7 @@ __all__ = [
     "AscendPset",
     "AscendPxor",
     "AscendRegToUb",
+    "AscendSortTopK",
     "AscendUbToGm",
     "AscendUbToGmAtomic",
     "AscendUbToReg",
@@ -1611,6 +2045,7 @@ __all__ = [
     "AscendVdup",
     "AscendVdupv",
     "AscendVexp",
+    "AscendVgather",
     "AscendVldDist",
     "AscendVmax",
     "AscendVmaxs",

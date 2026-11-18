@@ -32,21 +32,32 @@ from tilefoundry.visitor_registry.access_relation import access_relation_registr
 from tilefoundry.visitor_registry.candidates import select_instruction, sole_candidate
 from tilefoundry.visitor_registry.verify import VerifyError, verify_prim_function
 from tilefoundry_ascend import AscendTarget
-from tilefoundry_ascend.ascend.ir.execution import SIMDVF_KIND, SIMTVF_KIND, SimdVF, SimtVF
+from tilefoundry_ascend.ascend.ir.execution import (
+    SIMDVF_KIND,
+    SIMTVF_KIND,
+    SUPPORTED_VECTOR_DTYPES,
+    SimdVF,
+    SimtVF,
+)
 from tilefoundry_ascend.ascend.ir.tir.instructions import (
     ASCEND_OP_SPECS,
+    AscendBitUnpack,
+    AscendCrossCoreSync,
     AscendDualCopyL0cToUb,
     AscendDualCopyUbToL1,
     AscendGmToL1,
     AscendGmToUb,
     AscendL0cToGm,
     AscendMmad,
+    AscendMxQuant,
     AscendRegToUb,
+    AscendSortTopK,
     AscendUbToGm,
     AscendUbToReg,
     AscendVbinary,
     AscendVcast,
     AscendVclamp,
+    AscendVgather,
     AscendVreduce,
     AscendVunary,
     AscendVwhere,
@@ -83,13 +94,18 @@ def test_simdvf_and_simtvf_execution_kind_registration():
     assert SIMDVF_KIND.conversion_mask_width_bits == 16
     assert SIMDVF_KIND.lane_count is None
     assert SIMDVF_KIND.register_storages == (StorageKind.RMEM, StorageKind.CARRIER)
-    assert SIMDVF_KIND.element_dtypes == (DType.f32,)
+    assert DType.f32 in SIMDVF_KIND.element_dtypes
+    assert DType.i32 in SIMDVF_KIND.element_dtypes
+    for dt_name in ("f32", "f16", "bf16", "i32", "i64", "fp8e4m3", "f8e8m0", "f4e2m1", "bool"):
+        assert getattr(DType, dt_name) in SUPPORTED_VECTOR_DTYPES
     assert SimdVF.execution_kind == SIMDVF_KIND
     assert execution_kind_for_surface("SimdVF", dialect="T") == SIMDVF_KIND
     assert SIMDVF_KIND in declared_kinds()
 
     assert SIMTVF_KIND.name == "ascend.simtvf"
     assert SIMTVF_KIND.surface == "SimtVF"
+    assert DType.f32 in SIMTVF_KIND.element_dtypes
+    assert DType.i32 in SIMTVF_KIND.element_dtypes
     assert SimtVF.execution_kind == SIMTVF_KIND
     assert execution_kind_for_surface("SimtVF", dialect="T") == SIMTVF_KIND
     assert SIMTVF_KIND in declared_kinds()
@@ -98,7 +114,15 @@ def test_simdvf_and_simtvf_execution_kind_registration():
 def test_ascend_ops_registered_with_target_and_semantics():
     target = AscendTarget("ascend.950pr")
     supported = {op_cls for op_cls, _ in supported_op_capabilities(target)}
-    assert len(ASCEND_OP_SPECS) == 50
+    assert len(ASCEND_OP_SPECS) == 55
+    for new_cls in (
+        AscendVgather,
+        AscendBitUnpack,
+        AscendMxQuant,
+        AscendSortTopK,
+        AscendCrossCoreSync,
+    ):
+        assert any(spec.op_cls is new_cls for spec in ASCEND_OP_SPECS)
     for spec in ASCEND_OP_SPECS:
         assert spec.op_cls in supported
         assert typeinfer_registry.lookup(spec.op_cls) is not None
@@ -543,3 +567,106 @@ class M:
     torch.testing.assert_close(out2, ref2, rtol=1e-3, atol=1e-3)
     lowered2 = _lower(mod2)
     verify_prim_function(lowered2.entry_function())
+
+
+def test_ascend950_primitives_eval_and_extended_candidates(tmp_path: pathlib.Path):
+    """Verify AscendVgather, AscendBitUnpack, AscendMxQuant, AscendSortTopK, AscendCrossCoreSync & candidates."""
+    from tilefoundry.ir.hir.nn.conv2d import Conv2D as HirConv2D
+    from tilefoundry.ir.hir.nn.gelu import Gelu as HirGelu
+    from tilefoundry.ir.hir.nn.layer_norm import LayerNorm as HirLayerNorm
+    from tilefoundry.ir.hir.nn.rms_norm import RMSNorm as HirRMSNorm
+    from tilefoundry.ir.hir.nn.rope import RoPE as HirRoPE
+    from tilefoundry.ir.hir.nn.sigmoid import Sigmoid as HirSigmoid
+    from tilefoundry.ir.hir.nn.silu import Silu as HirSilu
+    from tilefoundry.ir.hir.nn.softmax import SoftMax as HirSoftMax
+    from tilefoundry.ir.hir.nn.tanh import Tanh as HirTanh
+    from tilefoundry.ir.hir.math.softplus import Softplus as HirSoftplus
+    from tilefoundry.ir.hir.tensor.argmax import ArgMax as HirArgMax
+    from tilefoundry.ir.hir.tensor.index_add import IndexAdd as HirIndexAdd
+    from tilefoundry.ir.hir.tensor.index_copy import IndexCopy as HirIndexCopy
+    from tilefoundry.ir.hir.tensor.index_select import IndexSelect as HirIndexSelect
+    from tilefoundry.ir.hir.tensor.quant import Quant as HirQuant
+    from tilefoundry.ir.hir.tensor.topk import TopK as HirTopK
+    from tilefoundry.visitor_registry.candidates import target_candidate_ops
+
+    target = AscendTarget("ascend.950pr")
+    expected_registrations = {
+        HirConv2D: AscendMmad,
+        HirArgMax: AscendSortTopK,
+        HirTopK: AscendSortTopK,
+        HirIndexSelect: AscendVgather,
+        HirQuant: AscendMxQuant,
+    }
+    for hir_cls, expected_tir in expected_registrations.items():
+        assert expected_tir in target_candidate_ops(target, hir_cls)
+    for hir_cls in (
+        HirIndexAdd,
+        HirIndexCopy,
+        HirRoPE,
+        HirRMSNorm,
+        HirSoftMax,
+        HirLayerNorm,
+        HirGelu,
+        HirSilu,
+        HirSigmoid,
+        HirTanh,
+        HirSoftplus,
+    ):
+        assert len(target_candidate_ops(target, hir_cls)) >= 1
+
+    # Verify select_instruction for IndexSelect -> AscendVgather inside SimdVF
+    rmem_f32 = TensorType((8, 16), DType.f32, Layout((8, 16)), StorageKind.RMEM)
+    rmem_i32 = TensorType((4,), DType.i32, Layout((4,)), StorageKind.RMEM)
+    rmem_out = TensorType((4, 16), DType.f32, Layout((4, 16)), StorageKind.RMEM)
+    gather_call = Call(
+        HirIndexSelect(dim=0),
+        (Var("src", type=rmem_f32), Var("idx", type=rmem_i32)),
+        type=rmem_out,
+    )
+    sel_gather = select_instruction(
+        gather_call, target=target, inside=True, active_kind="ascend.simdvf"
+    )
+    assert type(sel_gather) is AscendVgather and sel_gather.dim == 0
+
+    # Verify CPU evaluation + lowering + verification for new Ascend 950 primitives
+    body = """
+@module(entry="k", target=AscendTarget("ascend.950pr"), topologies=TOPOS)
+class M:
+    @func
+    def k(
+        src: Tensor[(8, 32), "f32"],
+        idx: Tensor[(4,), "i32"],
+        packed: Tensor[(4, 16), "i32"],
+        flag: Tensor[(4,), "i32"],
+    ) -> Tensor[(4, 32), "f32"]:
+        with Mesh(("aiv",), (1,), names=("v",)) as _v:
+            flag_sync = tf.schedule((flag,), op=T.ascend_cross_core_sync(mode="mode4", flag_id=3))
+            src_ub = tf.schedule((src, tf.empty(Tensor[(8, 32), "f32", "smem"])), op=T.ascend_gm_to_ub())
+            idx_ub = tf.schedule((idx, tf.empty(Tensor[(4,), "i32", "smem"])), op=T.ascend_gm_to_ub())
+            pk_ub = tf.schedule((packed, tf.empty(Tensor[(4, 16), "i32", "smem"])), op=T.ascend_gm_to_ub())
+            with T.SimdVF():
+                idx_r = tf.schedule((idx_ub, tf.empty(Tensor[(4,), "i32", "rmem"])), op=T.ascend_ub_to_reg())
+                gathered = tf.schedule((src_ub, idx_r, tf.empty(Tensor[(4, 32), "f32", "rmem"])), op=T.ascend_vgather(dim=0))
+                pk_r = tf.schedule((pk_ub, tf.empty(Tensor[(4, 16), "i32", "rmem"])), op=T.ascend_ub_to_reg())
+                unpacked = tf.schedule((pk_r, tf.empty(Tensor[(4, 32), "f16", "rmem"])), op=T.ascend_bit_unpack(src_bits=4, signed=True, dst_dtype="f16"))
+                unpacked_f32 = tf.schedule((unpacked, tf.empty(Tensor[(4, 32), "f32", "rmem"])), op=T.ascend_vcast(dtype="f32"))
+                comb = gathered + unpacked_f32
+                quantized = tf.schedule((comb, tf.empty(Tensor[(4, 32), "fp8e4m3", "rmem"])), op=T.ascend_mx_quant(group=32, target_dtype="fp8e4m3"))
+                q_f32 = tf.schedule((quantized, tf.empty(Tensor[(4, 32), "f32", "rmem"])), op=T.ascend_vcast(dtype="f32"))
+                top_vals = tf.schedule((q_f32, tf.empty(Tensor[(4, 4), "f32", "rmem"])), op=T.ascend_sort_topk(k=4, axis=-1))
+                top_idx = tf.schedule((q_f32, tf.empty(Tensor[(4, 1), "i64", "rmem"])), op=T.ascend_sort_topk(k=1, axis=-1))
+                # Use q_f32 as output, keeping top_vals/top_idx/flag_sync exercised in IR & eval
+                out_ub = tf.schedule((q_f32, tf.empty(Tensor[(4, 32), "f32", "smem"])), op=T.ascend_reg_to_ub())
+            return tf.schedule((out_ub, tf.empty(Tensor[(4, 32), "f32", "gmem"])), op=T.ascend_ub_to_gm())
+"""
+    mod = _load_module(tmp_path, body, "ascend950_prims.py")
+    src_t = torch.randn(8, 32, dtype=torch.float32)
+    idx_t = torch.tensor([0, 3, 5, 7], dtype=torch.int32)
+    # Pack pairs of signed 4-bit values (1, 2) -> 0x21
+    packed_t = torch.full((4, 16), 0x21, dtype=torch.int32)
+    flag_t = torch.zeros((4,), dtype=torch.int32)
+    out = evaluate(mod.entry_function(), src_t, idx_t, packed_t, flag_t).data
+    assert out.shape == (4, 32)
+    assert torch.isfinite(out).all()
+    lowered = _lower(mod)
+    verify_prim_function(lowered.entry_function())

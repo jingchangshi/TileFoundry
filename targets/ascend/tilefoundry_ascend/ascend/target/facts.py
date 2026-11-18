@@ -15,6 +15,27 @@ from tilefoundry.analysis.facts import (
 )
 from tilefoundry.ir.types import DType
 from tilefoundry.target.base import UnsupportedCapabilityError
+from tilefoundry_ascend.ascend.target.architecture import resolve_cube_macs_per_cycle
+from tilefoundry_ascend.ascend.target.device import detect_runtime_core_counts
+
+DEFAULT_CUBE_MACS_PER_CYCLE: tuple[tuple[str, int], ...] = (
+    ("f4e2m1", 16384),
+    ("f4e1m2", 16384),
+    ("fp8e4m3", 8192),
+    ("fp8e5m2", 8192),
+    ("hif8", 8192),
+    ("i8", 8192),
+    ("u8", 8192),
+    ("f16", 4096),
+    ("bf16", 4096),
+    ("hf32", 2048),
+    ("f32", 256),
+)
+
+
+def cube_macs_per_cycle(dtype_name: str, hf32: bool = False) -> int:
+    """Return dav-3510 Cube MACs/cycle per AIC for *dtype_name*."""
+    return resolve_cube_macs_per_cycle(DEFAULT_CUBE_MACS_PER_CYCLE, dtype_name, hf32=hf32)
 
 PURE_SIMDVF_UBUF_FLAGS: tuple[str, str] = (
     "--cce-disable-vf-stack-reserved-ubuf",
@@ -51,6 +72,29 @@ class AscendSpaceFacts:
     num_aiv_cores: int = 56
     hbm_peak_bandwidth_bps: int = 0
     hbm_burst_bandwidth_table: tuple[tuple[int, int], ...] = ()
+    clock_ghz: float = 1.65
+    cube_macs_per_cycle_table: tuple[tuple[str, int], ...] = DEFAULT_CUBE_MACS_PER_CYCLE
+    l1_banks: int = 2
+    l1_bank_bytes: int = 262144
+    ub_bank_groups: int = 8
+    ub_banks_per_group: int = 2
+    ub_bank_bytes: int = 16384
+    ub_datablock_bytes: int = 32
+    bias_table_bytes: int = 4096
+    fixbuf_bytes: int = 16384
+    l2_capacity_bytes: int = 134217728
+    l2_bytes_per_cycle_per_aic: int = 101
+    l0a_layout: str = "NZ"
+    l0b_layout: str = "ZN"
+    l0c_layout: str = "NZ"
+    max_crosscore_flag_depth: int = 15
+    hardware_mutex_count: int = 28
+    max_mmad_mnk: int = 4095
+    forbid_cube_int4: bool = True
+
+    def cube_macs_per_cycle(self, dtype_name: str, hf32: bool = False) -> int:
+        """Return Cube MACs/cycle per AIC for *dtype_name* (with optional HF32 mode)."""
+        return resolve_cube_macs_per_cycle(self.cube_macs_per_cycle_table, dtype_name, hf32=hf32)
 
     def effective_hbm_bandwidth_bps(self, payload_bytes: int) -> float:
         """Return piecewise-linear HBM bandwidth estimate (byte/s) for *payload_bytes*."""
@@ -151,6 +195,25 @@ def ascend_space_facts(target, query: object = None) -> AscendSpaceFacts:
         num_aiv_cores=dev.aiv_count,
         hbm_peak_bandwidth_bps=dev.hbm_bandwidth_bytes_per_second,
         hbm_burst_bandwidth_table=dev.hbm_burst_bandwidth_table,
+        clock_ghz=dev.clock_ghz,
+        cube_macs_per_cycle_table=arch.cube_macs_per_cycle_table,
+        l1_banks=arch.l1_banks,
+        l1_bank_bytes=arch.l1_bank_bytes,
+        ub_bank_groups=arch.ub_bank_groups,
+        ub_banks_per_group=arch.ub_banks_per_group,
+        ub_bank_bytes=arch.ub_bank_bytes,
+        ub_datablock_bytes=arch.ub_datablock_bytes,
+        bias_table_bytes=arch.bias_table_bytes,
+        fixbuf_bytes=arch.fixbuf_bytes,
+        l2_capacity_bytes=dev.l2_capacity_bytes,
+        l2_bytes_per_cycle_per_aic=arch.l2_bytes_per_cycle_per_aic,
+        l0a_layout=arch.l0a_layout,
+        l0b_layout=arch.l0b_layout,
+        l0c_layout=arch.l0c_layout,
+        max_crosscore_flag_depth=arch.max_crosscore_flag_depth,
+        hardware_mutex_count=arch.hardware_mutex_count,
+        max_mmad_mnk=arch.max_mmad_mnk,
+        forbid_cube_int4=arch.forbid_cube_int4,
     )
 
 
@@ -288,9 +351,12 @@ def performance_service(target, query: object = None) -> PerformanceServiceFacts
 
 
 __all__ = [
+    "DEFAULT_CUBE_MACS_PER_CYCLE",
     "PURE_SIMDVF_UBUF_FLAGS",
     "AscendSpaceFacts",
     "ascend_space_facts",
+    "cube_macs_per_cycle",
+    "detect_runtime_core_counts",
     "memory_hierarchy",
     "performance_service",
     "throughput",

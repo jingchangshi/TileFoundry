@@ -29,11 +29,14 @@ from tilefoundry_ascend.ascend.target.architecture import DaVinci950
 from tilefoundry_ascend.ascend.target.device import Ascend950PR
 from tilefoundry_ascend.ascend.target.spec import (
     ARCHITECTURE_SCHEMA,
+    ASCEND_950DT_ID,
     ASCEND_950PR_ID,
     DEVICE_SCHEMA,
     build_ascend_950pr,
     build_davinci_950,
 )
+
+SUPPORTED_DEVICE_IDS: tuple[str, ...] = (ASCEND_950PR_ID, ASCEND_950DT_ID)
 
 
 @register_target
@@ -190,4 +193,4 @@ class AscendTarget(Target):
         return self.architecture.name
 
 
-__all__ = ["AscendTarget"]
+__all__ = ["ASCEND_950DT_ID", "ASCEND_950PR_ID", "SUPPORTED_DEVICE_IDS", "AscendTarget"]

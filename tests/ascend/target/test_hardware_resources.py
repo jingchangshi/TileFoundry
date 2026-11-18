@@ -35,7 +35,8 @@ def test_document_backends_reject_bare_projection_value_markers(construct, messa
 
 def test_no_installed_number_is_repeated_as_a_python_default() -> None:
     check_hardware_defaults(
-        AscendTarget.hardware, (ascend_spec.DAVINCI_950_ID, ascend_spec.ASCEND_950PR_ID)
+        AscendTarget.hardware,
+        (ascend_spec.DAVINCI_950_ID, ascend_spec.ASCEND_950PR_ID, ascend_spec.ASCEND_950DT_ID),
     )
 
 
@@ -48,6 +49,7 @@ def test_architecture_and_device_evidence_preserve_ownership() -> None:
             "memory.ssbuf.owner": "block",
         },
         "ascend.950pr": {"memory.hbm.owner": "target"},
+        "ascend.950dt": {"memory.hbm.owner": "target"},
     }
     check_document_evidence(AscendTarget.hardware, owners)
 
