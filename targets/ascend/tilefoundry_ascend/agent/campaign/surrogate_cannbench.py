@@ -19,6 +19,26 @@ from pathlib import Path
 
 import yaml
 
+def wait_for_npu_quiescent(max_retries: int = 10):
+    """Wait for NPU devices (davinci) to be closed in /proc/self/fd/."""
+    for _ in range(max_retries):
+        found = False
+        try:
+            fd_path = Path("/proc/self/fd")
+            for fd in fd_path.iterdir():
+                try:
+                    if "davinci" in str(fd.readlink()):
+                        found = True
+                        break
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        if not found:
+            return
+        time.sleep(1.0)
+    logger.warning("NPU still busy after waiting for quiescence.")
+
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
     PerfTargetSpec,
@@ -1227,6 +1247,7 @@ def _run_agent_gates_cmd(
     backoff_sec: float = DEFAULT_AGENT_GATES_BACKOFF_SEC,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+    wait_for_npu_quiescent()
     attempts = max(1, int(max_attempts))
     cmd_list = [str(part) for part in cmd]
     env_dict = dict(env)

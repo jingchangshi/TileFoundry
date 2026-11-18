@@ -628,28 +628,32 @@ def _extract_regime_abi_context(module_source: str, regime_spec: RegimeTargetSpe
     )
 
 
-def _patch_single_func_into_module(
+def apply_ast_patch(
     module_source: str,
-    func_name: str,
+    target_func: str,
     candidate_dsl: str,
 ) -> str:
+    """Robust SEARCH/REPLACE patcher using Python AST anchors."""
+    orig_tree = ast.parse(module_source)
     cand_tree = ast.parse(candidate_dsl)
-    cand_node = _find_top_level_func(cand_tree, (func_name,))
+    
+    cand_node = _find_top_level_func(cand_tree, (target_func,))
     if cand_node is None:
-        raise ValueError(f"Candidate source must define function {func_name!r}.")
-
+        raise ValueError(f"Candidate source must define function {target_func!r}.")
+    
     cand_lines = candidate_dsl.splitlines(keepends=True)
     c_start, c_end = _func_line_span(cand_node)
     replacement = "".join(cand_lines[c_start - 1 : c_end])
     if not replacement.endswith("\n"):
         replacement += "\n"
-
-    orig_tree = ast.parse(module_source)
-    orig_node = _find_top_level_func(orig_tree, (func_name,))
+        
+    orig_node = _find_top_level_func(orig_tree, (target_func,))
     if orig_node is None:
-        raise ValueError(f"Original module missing target function {func_name!r}.")
+        raise ValueError(f"Original module missing target function {target_func!r}.")
+        
     o_start, o_end = _func_line_span(orig_node)
     orig_lines = module_source.splitlines(keepends=True)
+    
     patched = "".join([*orig_lines[: o_start - 1], replacement, *orig_lines[o_end:]])
     ast.parse(patched)
     return patched
@@ -703,7 +707,7 @@ def patch_regime_into_module(
     """Splice single-function or partial/full multi-symbol regime slice into module_source."""
     candidate_dsl = extract_python_dsl(candidate_raw_source)
     if isinstance(regime_or_func, str):
-        return _patch_single_func_into_module(module_source, regime_or_func, candidate_dsl)
+        return apply_ast_patch(module_source, regime_or_func, candidate_dsl)
 
     regime_spec = regime_or_func
     orig_tree = ast.parse(module_source)
@@ -713,7 +717,7 @@ def patch_regime_into_module(
             raise ValueError(
                 f"Original module missing builder in {regime_spec.builder_candidates}."
             )
-        return _patch_single_func_into_module(module_source, orig_node.name, candidate_dsl)
+        return apply_ast_patch(module_source, orig_node.name, candidate_dsl)
 
     orig_symbols = _collect_top_level_symbols(orig_tree)
     orig_by_name = {sym.name: sym for sym in orig_symbols}
@@ -727,7 +731,7 @@ def patch_regime_into_module(
             raise ValueError(
                 f"Original module missing regime symbols {regime_spec.editable_symbols}."
             )
-        return _patch_single_func_into_module(module_source, orig_node.name, candidate_dsl)
+        return apply_ast_patch(module_source, orig_node.name, candidate_dsl)
 
     cand_tree = ast.parse(candidate_dsl)
     cand_symbols: list[_TopLevelSymbol] = []

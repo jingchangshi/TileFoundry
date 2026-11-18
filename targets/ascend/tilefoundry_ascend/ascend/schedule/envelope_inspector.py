@@ -104,6 +104,17 @@ class BufferSnapshot:
 
 
 @dataclass(frozen=True)
+class CornerShape:
+    """Corner shape descriptor."""
+    rows: int
+    cols: int
+
+def _instantiate_corner_shape_matrix(n: int = 3) -> tuple[CornerShape, ...]:
+    """Instantiate 3-4 corner shapes for Stage A pre-check."""
+    return tuple(CornerShape(rows=32 * (i + 1), cols=32 * (i + 1)) for i in range(n))
+
+
+@dataclass(frozen=True)
 class EnvelopeInspectionResult:
     """Output of Mode B dynamic envelope and Two-Snapshot IR Diff inspection."""
 
@@ -222,6 +233,9 @@ def _collect_tilelang_expr_rw(
 
     def _visit_indices(indices) -> None:
         for idx in indices:
+            # Hotfix: Check for prohibited TileLang expressions
+            if isinstance(idx, (tirx.And, tirx.Or, tirx.Not)):
+                 raise ValueError("Cannot use and / or / not operator to Expr, hint: use tvm.tirx.all / tvm.tirx.any instead")
             sub_ev, sub_exp, sub_ul, sub_us = _collect_tilelang_expr_rw(idx, tirx=tirx)
             events.extend(sub_ev)
             if sub_exp:
@@ -2766,6 +2780,7 @@ def inspect_tilelang_primfunc(
 
     resolved_target = target or AscendTarget("ascend.950pr")
     spaces = resolved_target.get_facts(AscendSpaceFacts)
+    corner_shapes = _instantiate_corner_shape_matrix()
 
     if isinstance(prim_func, tvm.IRModule):
         funcs = [fn for fn in prim_func.functions.values() if isinstance(fn, tirx.PrimFunc)]
@@ -3323,6 +3338,7 @@ def inspect_tir_envelope(
     """Read-only Mode B inspector for TileFoundry TIR containing dynamic or opaque scopes."""
     resolved_target = target or AscendTarget("ascend.950pr")
     spaces = resolved_target.get_facts(AscendSpaceFacts)
+    corner_shapes = _instantiate_corner_shape_matrix()
     body = fn_or_stmt.body if isinstance(fn_or_stmt, PrimFunction) else fn_or_stmt
 
     explicit_by_scope: dict[str, dict[str, int]] = {}
