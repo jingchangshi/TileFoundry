@@ -1137,17 +1137,23 @@ def prewarm_surrogate_tilelang_cache(
     return resolved_tl_cache
 
 
+_NON_AGENT_GATES_ENV_KEYS = frozenset({"TILEFOUNDRY_NPU_AGENT_GATES_BIN"})
+
+
 def _write_temp_env_file(
     base_env: Path,
     dest_path: Path,
     overrides: Mapping[str, str],
 ) -> Path:
+    stripped_keys = set(overrides) | _NON_AGENT_GATES_ENV_KEYS
     lines = [
         ln
         for ln in base_env.read_text(encoding="utf-8").splitlines()
-        if not any(ln.startswith(f"{key}=") for key in overrides)
+        if not any(ln.lstrip().startswith(f"{key}=") for key in stripped_keys)
     ]
     for key, value in overrides.items():
+        if key in _NON_AGENT_GATES_ENV_KEYS:
+            continue
         lines.append(f'{key}="{value}"')
     dest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return dest_path

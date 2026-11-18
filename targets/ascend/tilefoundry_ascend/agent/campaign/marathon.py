@@ -73,6 +73,35 @@ _DEFAULT_AGY_COMMON_ARGS = (
     "--sandbox --mode plan --dangerously-skip-permissions --print-timeout 240s"
 )
 _SUPPORTED_OPERATORS = ("attention_residual", "mla")
+_AGENT_GATES_ALLOWED_ENV_KEYS = frozenset(
+    {
+        "TILEFOUNDRY_NPU_CANN_SETUP",
+        "TILEFOUNDRY_NPU_CONDA_SH",
+        "TILEFOUNDRY_NPU_CONDA_ENV",
+        "TILEFOUNDRY_NPU_CONDA_ENVS_PATH",
+        "TILEFOUNDRY_NPU_PYTHON",
+        "TILEFOUNDRY_NPU_TILELANG_SOURCE",
+        "TILEFOUNDRY_NPU_TILELANG_BUILD",
+        "TILEFOUNDRY_NPU_CPU_TESTS",
+        "TILEFOUNDRY_NPU_DEVICE_TESTS",
+        "TILEFOUNDRY_NPU_BUILD_SUBDIR",
+        "TILEFOUNDRY_NPU_CANNBENCH_REPO",
+        "TILEFOUNDRY_NPU_WORK_ROOT",
+        "TILEFOUNDRY_NPU_CANNBENCH_ARCH",
+        "TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE",
+        "TILEFOUNDRY_NPU_CANNBENCH_TARGETS",
+        "TILEFOUNDRY_NPU_LLM_BACKEND",
+        "TILEFOUNDRY_NPU_AGY_BIN",
+        "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
+        "TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL",
+        "TILEFOUNDRY_NPU_AGY_COMMON_ARGS",
+        "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
+        "TILEFOUNDRY_NPU_TILELANG_REPO",
+        "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
+        "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
+        "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -322,19 +351,31 @@ def ensure_marathon_env_file(
         state_dir=state_dir,
         base_env_file=target if target.is_file() else None,
     )
+    allowed_discovered = {
+        key: val for key, val in discovered.items() if key in _AGENT_GATES_ALLOWED_ENV_KEYS
+    }
     if target.is_file():
         existing = parse_simple_env_file(target)
+        disallowed_existing = [
+            key for key in existing if key not in _AGENT_GATES_ALLOWED_ENV_KEYS
+        ]
         missing = [
             key
-            for key, val in discovered.items()
+            for key, val in allowed_discovered.items()
             if val and not existing.get(key)
         ]
-        if not missing:
+        if not missing and not disallowed_existing:
             return target
-        merged = dict(discovered)
-        merged.update({k: v for k, v in existing.items() if v})
+        merged = dict(allowed_discovered)
+        merged.update(
+            {
+                key: val
+                for key, val in existing.items()
+                if val and key in _AGENT_GATES_ALLOWED_ENV_KEYS
+            }
+        )
     else:
-        merged = discovered
+        merged = allowed_discovered
 
     lines = [
         f"# Isolated marathon environment for {operator_name}",
@@ -352,6 +393,7 @@ def configure_marathon_process_env(
     *,
     operator_name: str,
     env_file: Path,
+    worktree: Path | None = None,
 ) -> dict[str, str]:
     """Configure coordinator process env vars cleanly for isolated worker subprocesses."""
     short_op = short_operator_tag(operator_name)
@@ -383,6 +425,23 @@ def configure_marathon_process_env(
         val = parsed.get(key, "").strip()
         if val and not os.environ.get(key):
             os.environ[key] = val
+
+    if not os.environ.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "").strip():
+        candidates: list[Path] = []
+        if worktree is not None:
+            candidates.append(worktree.parent / "AgentGates" / ".venv" / "bin" / "agent-gates")
+        else:
+            src_root = Path(parsed.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "")).parent
+            if str(src_root):
+                candidates.append(src_root / "AgentGates" / ".venv" / "bin" / "agent-gates")
+        for cand in candidates:
+            if cand.is_file():
+                os.environ["TILEFOUNDRY_NPU_AGENT_GATES_BIN"] = str(cand)
+                break
+        else:
+            ag_which = shutil.which("agent-gates")
+            if ag_which:
+                os.environ["TILEFOUNDRY_NPU_AGENT_GATES_BIN"] = ag_which
     return parsed
 
 
@@ -1212,7 +1271,18 @@ def run_operator_marathon(
         state_dir=state_dir,
         env_file=cfg.env_file,
     )
-    configure_marathon_process_env(operator_name=cfg.operator_name, env_file=env_file)
+    configure_marathon_process_env(
+        operator_name=cfg.operator_name,
+        env_file=env_file,
+        worktree=worktree,
+    )
+    op_logger.info(
+        "MARATHON_BOOT op=%s device=%s worktree=%s env_file=%s",
+        cfg.operator_name,
+        cfg.device_id,
+        worktree,
+        env_file,
+    )
 
     l2_evaluator = build_resilient_l2_evaluator(
         operator_name=cfg.operator_name,

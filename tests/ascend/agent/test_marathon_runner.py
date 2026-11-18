@@ -64,6 +64,7 @@ def test_zero_config_env_discovery_and_existing_env_preservation(tmp_path: Path,
     assert env_path.is_file()
     content = env_path.read_text(encoding="utf-8")
     assert "TILEFOUNDRY_NPU_LLM_BACKEND=agy_cli" in content
+    assert "TILEFOUNDRY_NPU_AGENT_GATES_BIN" not in content
 
     marker_text = content + "\n# keep-existing-env\n"
     env_path.write_text(marker_text, encoding="utf-8")
@@ -75,6 +76,20 @@ def test_zero_config_env_discovery_and_existing_env_preservation(tmp_path: Path,
     )
     assert reused == env_path
     assert "# keep-existing-env" in reused.read_text(encoding="utf-8")
+
+    env_path.write_text(
+        content + "TILEFOUNDRY_NPU_AGENT_GATES_BIN=/tmp/fake_agent_gates\n",
+        encoding="utf-8",
+    )
+    sanitized = ensure_marathon_env_file(
+        operator_name="attention_residual",
+        worktree=worktree,
+        state_dir=state_dir,
+        env_file=env_path,
+    )
+    sanitized_text = sanitized.read_text(encoding="utf-8")
+    assert "TILEFOUNDRY_NPU_AGENT_GATES_BIN" not in sanitized_text
+    assert "TILEFOUNDRY_NPU_LLM_BACKEND=agy_cli" in sanitized_text
 
 
 def test_extreme_runner_rotation_fast_backend_and_resilient_l2(tmp_path: Path) -> None:
