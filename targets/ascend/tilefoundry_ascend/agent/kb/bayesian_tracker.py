@@ -574,6 +574,11 @@ class BayesianRuleTracker:
                 }
                 for axis_key, states in sorted(self.axis_posteriors.items())
             }
+        if self._synced_event_counts:
+            payload["synced_event_counts"] = {
+                str(fname): int(count)
+                for fname, count in sorted(self._synced_event_counts.items())
+            }
         return payload
 
     def save_json(self, path: str | Path) -> None:
@@ -599,6 +604,13 @@ class BayesianRuleTracker:
                 for rid, raw in states.items():
                     if rid in self.rules and isinstance(raw, Mapping):
                         bucket_map[rid] = RulePosterior.from_dict(raw)
+        saved_synced = payload.get("synced_event_counts")
+        if isinstance(saved_synced, Mapping):
+            for fname, count in saved_synced.items():
+                self._synced_event_counts[str(fname)] = max(
+                    self._synced_event_counts.get(str(fname), 0),
+                    int(count),
+                )
 
     def load_posteriors_json(self, path: str | Path) -> None:
         """Restore tracked posteriors from disk for matching rule IDs."""

@@ -33,6 +33,26 @@ _L3_TARGET_OP = os.environ.get("TF_L3_TARGET_OPERATOR", "").strip()
 _L3_TARGET_MODULE_PATH = os.environ.get("TF_L3_TARGET_MODULE_PATH", "").strip()
 
 
+def _normalize_target_op_short(target_op: str) -> str:
+    raw = str(target_op or "").strip()
+    return raw.rsplit("/", 1)[-1].strip().lower() if raw else ""
+
+
+_L3_TARGET_OP_SHORT = _normalize_target_op_short(_L3_TARGET_OP)
+
+
+def _should_run_acceptance_test(test_kind: str, target_op: str) -> bool:
+    """Return True when acceptance suite *test_kind* applies to *target_op*."""
+    short = _normalize_target_op_short(target_op)
+    if not short:
+        return test_kind in ("attention_residual", "mla", "dynamic_cache")
+    if short == "attention_residual":
+        return test_kind in ("attention_residual", "dynamic_cache")
+    if short == "mla":
+        return test_kind in ("mla", "dynamic_cache")
+    return test_kind == "generic_cannbench"
+
+
 def _load_override_module(module_path_str: str, tag: str):
     mod_path = Path(module_path_str).resolve()
     spec = importlib.util.spec_from_file_location(f"_tf_l3_override_{tag}", mod_path)
@@ -45,10 +65,10 @@ def _load_override_module(module_path_str: str, tag: str):
 
 
 if _L3_TARGET_MODULE_PATH:
-    if _L3_TARGET_OP == "attention_residual":
+    if _L3_TARGET_OP_SHORT == "attention_residual":
         ar_kernels = _load_override_module(_L3_TARGET_MODULE_PATH, "attention_residual")
         attention_residual = ar_kernels.attention_residual
-    elif _L3_TARGET_OP == "mla":
+    elif _L3_TARGET_OP_SHORT == "mla":
         mla_kernels = _load_override_module(_L3_TARGET_MODULE_PATH, "mla")
         mla = mla_kernels.mla
 
@@ -80,16 +100,16 @@ def _call_single_kernel(kernel_module, fn, **kwargs):
 
 def test_attention_residual_cannbench_cases() -> None:
     """Verify all 20 CANNBench AttentionResidual cases on NPU."""
-    if _L3_TARGET_OP == "mla":
-        pytest.skip("Scoped to mla L3 target.")
+    if not _should_run_acceptance_test("attention_residual", _L3_TARGET_OP):
+        pytest.skip(f"Scoped to {_L3_TARGET_OP} L3 target.")
     _require_npu_env()
     test_attention_residual.main(attention_residual)
 
 
 def test_attention_residual_baseline_vs_tuned_parity() -> None:
     """Verify AttentionResidual baseline schedule numerical parity on NPU."""
-    if _L3_TARGET_OP == "mla":
-        pytest.skip("Scoped to mla L3 target.")
+    if not _should_run_acceptance_test("attention_residual", _L3_TARGET_OP):
+        pytest.skip(f"Scoped to {_L3_TARGET_OP} L3 target.")
     _require_npu_env()
     harness = cannbench_contract.Harness("level4/attention_residual", AR_DIR)
     target_cases = {1, 16, 20}
@@ -123,16 +143,16 @@ def test_attention_residual_baseline_vs_tuned_parity() -> None:
 
 def test_mla_cannbench_cases() -> None:
     """Verify all 20 CANNBench MLA cases on NPU."""
-    if _L3_TARGET_OP == "attention_residual":
-        pytest.skip("Scoped to attention_residual L3 target.")
+    if not _should_run_acceptance_test("mla", _L3_TARGET_OP):
+        pytest.skip(f"Scoped to {_L3_TARGET_OP} L3 target.")
     _require_npu_env()
     test_mla.main(mla)
 
 
 def test_mla_supplemental_cases() -> None:
     """Verify supplemental GQA, tail, layout, and scale MLA cases on NPU."""
-    if _L3_TARGET_OP == "attention_residual":
-        pytest.skip("Scoped to attention_residual L3 target.")
+    if not _should_run_acceptance_test("mla", _L3_TARGET_OP):
+        pytest.skip(f"Scoped to {_L3_TARGET_OP} L3 target.")
     _require_npu_env()
     payload = json.loads(SUPP_MLA_PATH.read_text(encoding="utf-8"))
     harness = cannbench_contract.Harness("level4/mla", MLA_DIR)
@@ -161,7 +181,8 @@ def test_mla_supplemental_cases() -> None:
         native_fn = lambda case=case, tensors=tensors: harness.reference_output(
             case, tensors, native=True
         )
-        for mode in ("tuned", "baseline"):
+        modes = ("tuned",) if _L3_TARGET_OP_SHORT else ("tuned", "baseline")
+        for mode in modes:
             npu_tensors = cannbench_contract.map_tensors(tensors, lambda x: x.npu())
             call_params = harness.params(case, npu_tensors)
             actual = _call_single_kernel(
@@ -176,6 +197,8 @@ def test_mla_supplemental_cases() -> None:
 
 def test_dynamic_shape_kernel_cache_reuse() -> None:
     """Verify T.dynamic parameterization reuses compiled kernels across dynamic shapes."""
+    if not _should_run_acceptance_test("dynamic_cache", _L3_TARGET_OP):
+        pytest.skip(f"Scoped to {_L3_TARGET_OP} L3 target.")
     _require_npu_env()
     from tests.ascend.benchmarks.attention_residual.golden import (
         attention_residual as ar_golden,
@@ -183,7 +206,7 @@ def test_dynamic_shape_kernel_cache_reuse() -> None:
     from tests.ascend.benchmarks.mla.golden import mla as mla_golden
 
     torch.manual_seed(0)
-    if _L3_TARGET_OP != "mla":
+    if _L3_TARGET_OP_SHORT != "mla":
         ar_kernels._KERNEL_CACHE.clear()
         n_depth, d_dim = 4, 256
         w = torch.randn(d_dim, dtype=torch.bfloat16)
@@ -205,7 +228,7 @@ def test_dynamic_shape_kernel_cache_reuse() -> None:
             torch.testing.assert_close(actual.cpu().float(), ref.float(), rtol=2e-2, atol=2e-2)
         assert len(ar_kernels._KERNEL_CACHE) == 1
 
-    if _L3_TARGET_OP != "attention_residual":
+    if _L3_TARGET_OP_SHORT != "attention_residual":
         mla_kernels._KERNEL_CACHE.clear()
         n_q, n_kv, d_nope, d_rope = 16, 1, 512, 64
         for b_dim, s_dim, s_kv in ((2, 64, 128), (4, 128, 256)):
@@ -240,3 +263,42 @@ def test_dynamic_shape_kernel_cache_reuse() -> None:
             )
             torch.testing.assert_close(actual.cpu().float(), ref.float(), rtol=2e-2, atol=2e-2)
         assert len(mla_kernels._KERNEL_CACHE) == 1
+
+
+def test_target_operator_full_cannbench_contract() -> None:
+    """Verify full CANNBench contract for any scoped non-AR/MLA L3 target operator."""
+    if not _should_run_acceptance_test("generic_cannbench", _L3_TARGET_OP):
+        pytest.skip("Scoped to generic CANNBench L3 targets outside AR/MLA.")
+    if not hasattr(torch, "npu") or not torch.npu.is_available():
+        pytest.skip("Ascend NPU device is unavailable on this host.")
+
+    import tempfile
+
+    from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
+    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import ensure_npu_compare_shim_dir
+
+    reg = CannbenchOpsRegistry()
+    spec = reg.resolve(_L3_TARGET_OP)
+    if _L3_TARGET_MODULE_PATH:
+        mod = _load_override_module(_L3_TARGET_MODULE_PATH, _L3_TARGET_OP_SHORT or "target")
+    else:
+        repo_root = Path(__file__).resolve().parents[3]
+        mod = _load_override_module(
+            str(repo_root / spec.module_relpath),
+            _L3_TARGET_OP_SHORT or "target",
+        )
+    operator_api = getattr(mod, spec.entrypoint)
+    harness = cannbench_contract.Harness(spec.task, spec.op_dir)
+
+    if importlib.util.find_spec("npu_compare") is not None:
+        harness.run(operator_api)
+        return
+
+    with tempfile.TemporaryDirectory(prefix="tf_l3_shim_") as tmp_dir:
+        shim_dir = ensure_npu_compare_shim_dir(tmp_dir)
+        sys.path.insert(0, str(shim_dir))
+        try:
+            harness.run(operator_api)
+        finally:
+            if sys.path and sys.path[0] == str(shim_dir):
+                sys.path.pop(0)

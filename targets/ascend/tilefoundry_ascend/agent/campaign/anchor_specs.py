@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -102,6 +103,8 @@ class RegimeTargetSpec:
     config_selector_fn: str = ""
     editable_symbols: tuple[str, ...] = ()
     allowed_helper_prefix: str = ""
+    runtime_backend: str = "tilelang_dsl"
+    trackb_symbols: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """Serialize regime target specification to a JSON-compatible dictionary."""
@@ -119,6 +122,8 @@ class RegimeTargetSpec:
             "config_selector_fn": self.config_selector_fn,
             "editable_symbols": list(self.editable_symbols),
             "allowed_helper_prefix": self.allowed_helper_prefix,
+            "runtime_backend": self.runtime_backend,
+            "trackb_symbols": list(self.trackb_symbols),
         }
 
     @classmethod
@@ -145,6 +150,10 @@ class RegimeTargetSpec:
             config_selector_fn=str(payload.get("config_selector_fn", "")),
             editable_symbols=tuple(str(x) for x in payload.get("editable_symbols", ())),
             allowed_helper_prefix=str(payload.get("allowed_helper_prefix", "")),
+            runtime_backend=str(
+                payload.get("runtime_backend", "tilelang_dsl") or "tilelang_dsl"
+            ),
+            trackb_symbols=tuple(str(x) for x in (payload.get("trackb_symbols", ()) or ())),
         )
 
 
@@ -395,8 +404,11 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "_select_mla_decode_config",
                 "_build_mla_split_kv_decode_func",
                 "_build_mla_split_kv_combine_func",
+                "_MLA_TRACKB_SRC",
             ),
             allowed_helper_prefix="_mla_decode_",
+            runtime_backend="hybrid_trackb",
+            trackb_symbols=("_MLA_TRACKB_SRC",),
         ),
         RegimeTargetSpec(
             regime_tag="bnsd_gather",
@@ -439,8 +451,11 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
             editable_symbols=(
                 "_select_mla_bnsd_config",
                 "_build_mla_bnsd_gather_func",
+                "_MLA_TRACKB_SRC",
             ),
             allowed_helper_prefix="_mla_bnsd_",
+            runtime_backend="hybrid_trackb",
+            trackb_symbols=("_MLA_TRACKB_SRC",),
         ),
         RegimeTargetSpec(
             regime_tag="prefill_compute",
@@ -483,8 +498,11 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
             editable_symbols=(
                 "_select_mla_prefill_config",
                 "_build_mla_prefill_func",
+                "_MLA_TRACKB_SRC",
             ),
             allowed_helper_prefix="_mla_prefill_",
+            runtime_backend="hybrid_trackb",
+            trackb_symbols=("_MLA_TRACKB_SRC",),
         ),
     ),
 }
@@ -727,6 +745,99 @@ class CannbenchOpSpec:
     perf_target: PerfTargetSpec
     module_relpath: str
     entrypoint: str
+
+
+_TRACKB_CPP_MARKERS: tuple[str, ...] = (
+    "tl_templates/ascend/",
+    "__global__",
+    "__simt_vf__",
+    "SimdVF",
+    "kernel_entry",
+    "AscendC::",
+)
+
+
+def discover_module_trackb_symbols(module_text: str) -> tuple[str, ...]:
+    """Discover top-level Track-B C++20 kernel string constants and plan selectors."""
+    has_include = bool(module_text and "#include" in module_text)
+    try:
+        tree = ast.parse(module_text)
+    except SyntaxError:
+        return ()
+
+    cpp_symbols: list[str] = []
+    plan_symbols: list[str] = []
+    for node in tree.body:
+        name: str | None = None
+        val: ast.AST | None = None
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            name, val = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, val = node.target.id, node.value
+        if (
+            has_include
+            and name
+            and isinstance(val, ast.Constant)
+            and isinstance(val.value, str)
+            and "#include" in val.value
+            and any(marker in val.value for marker in _TRACKB_CPP_MARKERS)
+        ):
+            cpp_symbols.append(name)
+        elif isinstance(node, ast.FunctionDef):
+            low = node.name.lower()
+            if (
+                (low.startswith("_select_trackb_") or low.startswith("_select_"))
+                and ("trackb" in low or "track_b" in low)
+                and low.endswith("_plan")
+            ):
+                plan_symbols.append(node.name)
+
+    if not cpp_symbols:
+        return ()
+    return tuple(dict.fromkeys([*cpp_symbols, *plan_symbols]))
+
+
+def _coerce_positive_int(val: object, default: int = 0) -> int:
+    if isinstance(val, bool) or val is None:
+        return default
+    if isinstance(val, int):
+        return int(val)
+    try:
+        return int(str(val))
+    except (ValueError, TypeError):
+        return default
+
+
+def classify_regime_runtime_backend(
+    op_id: str,
+    regime_tag: str,
+    sample_dims: Mapping[str, object],
+    trackb_symbols: tuple[str, ...],
+) -> str:
+    """Classify runtime backend ('tilelang_dsl', 'ascendc_trackb', or 'hybrid_trackb')."""
+    _ = regime_tag
+    if not trackb_symbols:
+        return "tilelang_dsl"
+    canon = str(op_id).strip().lower()
+    if canon == "softmax":
+        inner = _coerce_positive_int(
+            sample_dims.get("inner", sample_dims.get("inner_dim", 1)),
+            default=1,
+        )
+        d_dim = _coerce_positive_int(
+            sample_dims.get("d_dim", sample_dims.get("D", 0)),
+            default=0,
+        )
+        if inner <= 1 and 0 < d_dim <= 16:
+            return "tilelang_dsl"
+        return "ascendc_trackb"
+    if canon == "mla":
+        return "hybrid_trackb"
+    return "ascendc_trackb"
 
 
 class CannbenchOpsRegistry:
@@ -974,6 +1085,7 @@ class CannbenchOpsRegistry:
         spec = self.resolve(op_id)
         mod_file = self._source_root / spec.module_relpath
         mod_text = mod_file.read_text(encoding="utf-8") if mod_file.is_file() else ""
+        discovered_tb = discover_module_trackb_symbols(mod_text)
         has_shared_selector = f"def _select_{op_id}_config(" in mod_text
         case_by_id = {int(c.get("case_id", -1)): c for c in spec.cases}
         seen_tags: set[str] = set()
@@ -992,6 +1104,28 @@ class CannbenchOpsRegistry:
                 per_regime_sel
                 if (has_per_regime_sel or not has_shared_selector)
                 else shared_sel
+            )
+            runtime_backend = classify_regime_runtime_backend(
+                op_id,
+                safe_tag,
+                dims,
+                discovered_tb,
+            )
+            regime_tb = (
+                discovered_tb
+                if runtime_backend in ("ascendc_trackb", "hybrid_trackb")
+                else ()
+            )
+            base_editable = (
+                per_regime_sel,
+                shared_sel,
+                f"_build_{op_id}_{safe_tag}_func",
+                f"_build_{op_id}_prim_func",
+            )
+            editable = (
+                tuple(dict.fromkeys([*base_editable, *regime_tb]))
+                if regime_tb
+                else base_editable
             )
             regimes.append(
                 RegimeTargetSpec(
@@ -1014,13 +1148,10 @@ class CannbenchOpsRegistry:
                         if isinstance(v, int) and not isinstance(v, bool)
                     },
                     config_selector_fn=selector_fn,
-                    editable_symbols=(
-                        per_regime_sel,
-                        shared_sel,
-                        f"_build_{op_id}_{safe_tag}_func",
-                        f"_build_{op_id}_prim_func",
-                    ),
+                    editable_symbols=editable,
                     allowed_helper_prefix=f"_{op_id}_{safe_tag}_",
+                    runtime_backend=runtime_backend,
+                    trackb_symbols=regime_tb,
                 )
             )
         return tuple(regimes)
@@ -1074,6 +1205,17 @@ def _extract_generic_case_dims(entry: Mapping[str, object]) -> dict[str, object]
             dim_ax = int(attrs.get("dim", -1)) if isinstance(attrs, Mapping) else -1
             if -len(lead) <= dim_ax < len(lead):
                 dims.setdefault("half_dim", max(1, int(lead[dim_ax]) // 2))
+        elif op_label == "softmax" and lead:
+            dim_ax = int(attrs.get("dim", -1)) if isinstance(attrs, Mapping) else -1
+            ndim = len(lead)
+            norm_dim = dim_ax if dim_ax >= 0 else ndim + dim_ax
+            if 0 <= norm_dim < ndim:
+                dims["d_dim"] = int(lead[norm_dim])
+                dims["D"] = int(lead[norm_dim])
+                inner = 1
+                for val in lead[norm_dim + 1 :]:
+                    inner *= max(1, int(val))
+                dims["inner"] = int(inner)
         elif op_label == "mhcsinkhorn" and len(lead) >= 2:
             dims.setdefault("hc_mult", int(lead[-1]))
             dims.setdefault("b_dim", int(lead[0]))
@@ -1652,8 +1794,10 @@ __all__ = [
     "RegimeTargetSpec",
     "append_dynamic_anchor",
     "build_anchor_var_bindings",
+    "classify_regime_runtime_backend",
     "compute_case_eq3_score",
     "default_source_root",
+    "discover_module_trackb_symbols",
     "get_default_anchors",
     "get_default_perf_target",
     "get_default_regime_specs",

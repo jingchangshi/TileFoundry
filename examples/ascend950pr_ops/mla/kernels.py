@@ -3676,7 +3676,7 @@ def mla(
     scale = (1.0 / math.sqrt(d_nope + d_rope)) if scaleValue <= 0 else float(scaleValue)
     tl_dtype = "bfloat16" if q_nope.dtype == torch.bfloat16 else "float16"
 
-    use_trackb = (
+    default_use_trackb = (
         schedule_mode == "tuned"
         and num_kv_splits_override is None
         and n_kv == 1
@@ -3688,7 +3688,7 @@ def mla(
     )
 
     if (
-        not use_trackb
+        not default_use_trackb
         and schedule_mode == "tuned"
         and inputLayout == "BNSD"
         and n_kv == 1
@@ -3768,8 +3768,25 @@ def mla(
     raw_ck = cfg.get("combine_kwargs")
     extra_combine_kwargs = dict(raw_ck) if isinstance(raw_ck, dict) else None
 
+    raw_use_trackb = cfg.get("use_trackb")
+    if isinstance(raw_use_trackb, bool):
+        use_trackb = (
+            raw_use_trackb
+            and num_kv_splits_override is None
+            and bool(getattr(q_nope, "is_npu", False))
+        )
+    else:
+        use_trackb = default_use_trackb
+
     if use_trackb:
-        if n_q >= 128:
+        raw_tb_bm = cfg.get("trackb_bm")
+        if (
+            isinstance(raw_tb_bm, int)
+            and not isinstance(raw_tb_bm, bool)
+            and raw_tb_bm in (32, 64, 128)
+        ):
+            bm = int(raw_tb_bm)
+        elif n_q >= 128:
             if b_dim == 1 and s_dim == 1 and s_kv >= 1024:
                 bm = 32
             elif s_dim <= 2 and b_dim <= 32 and s_kv >= 1024:
@@ -3781,7 +3798,9 @@ def mla(
         else:
             bm = 32
         num_kv_splits = 1
-        extra_builder_kwargs = {"_trackb": True}
+        merged_bk = dict(extra_builder_kwargs or {})
+        merged_bk["_trackb"] = True
+        extra_builder_kwargs = merged_bk
 
     q_rows_total = b_dim * s_dim * n_q
     q_n_flat = q_nope.contiguous().view(q_rows_total, d_nope)

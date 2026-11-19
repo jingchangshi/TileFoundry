@@ -35,6 +35,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     get_operator_module_relpath,
     lookup_case_dims,
     lookup_case_metadata,
+    parse_simple_env_file,
     resolve_cannbench_tasks_root,
     resolve_regime_for_case,
 )
@@ -67,7 +68,9 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
     StageAResult,
     StageBResult,
+    evaluate_ascendc_candidate,
     run_stage_a_static,
+    run_stage_b_ascendc_compile,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     GenerationRequest,
@@ -132,7 +135,7 @@ from tilefoundry_ascend.ascend.sil.schema import (
     RegimeSlice,
     TopologyAxes,
 )
-from tilefoundry_ascend.ascend.target import AscendTarget
+from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS, AscendTarget
 from tilefoundry_ascend.ascend.templates.registry import relax_facets_for_bottleneck
 
 logger = logging.getLogger(__name__)
@@ -503,6 +506,97 @@ def _collect_top_level_symbols(tree: ast.Module) -> list[_TopLevelSymbol]:
             if isinstance(node.target, ast.Name):
                 items.append(_TopLevelSymbol(node.target.id, "assign", start, end))
     return items
+
+
+def _extract_trackb_cpp_source(
+    module_source: str,
+    regime_spec: RegimeTargetSpec,
+) -> tuple[str, str] | None:
+    """Return `(symbol_name, cpp_source)` for the first Track-B C++20 string constant."""
+    if not regime_spec.trackb_symbols:
+        return None
+    try:
+        tree = ast.parse(module_source)
+    except SyntaxError:
+        return None
+
+    constants: dict[str, str] = {}
+    for node in tree.body:
+        name: str | None = None
+        val: ast.AST | None = None
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            name, val = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, val = node.target.id, node.value
+        if name and isinstance(val, ast.Constant) and isinstance(val.value, str):
+            constants[name] = val.value
+
+    for sym in regime_spec.trackb_symbols:
+        cpp = constants.get(sym)
+        if isinstance(cpp, str) and cpp.strip():
+            return sym, cpp
+    return None
+
+
+def _top_level_symbol_sources(module_source: str) -> dict[str, str]:
+    try:
+        tree = ast.parse(module_source)
+    except SyntaxError:
+        return {}
+    lines = module_source.splitlines(keepends=True)
+    return {
+        sym.name: "".join(lines[sym.start - 1 : sym.end]).strip()
+        for sym in _collect_top_level_symbols(tree)
+    }
+
+
+def _detect_trackb_dead_code_edit(
+    parent_source: str,
+    candidate_source: str,
+    regime_spec: RegimeTargetSpec,
+) -> str | None:
+    """Reject candidates that edit only inactive TileLang fallbacks in an ascendc_trackb regime."""
+    if regime_spec.runtime_backend != "ascendc_trackb" or not regime_spec.trackb_symbols:
+        return None
+    parent_syms = _top_level_symbol_sources(parent_source)
+    cand_syms = _top_level_symbol_sources(candidate_source)
+    if not parent_syms or not cand_syms:
+        return None
+    changed = {
+        name
+        for name in (set(parent_syms) | set(cand_syms))
+        if parent_syms.get(name, "") != cand_syms.get(name, "")
+    }
+    if not changed:
+        return None
+    active_syms = set(regime_spec.trackb_symbols)
+    if regime_spec.config_selector_fn:
+        active_syms.add(regime_spec.config_selector_fn)
+    if not (changed & active_syms):
+        return (
+            f"DEAD_CODE_TRACKB_EDIT: regime {regime_spec.regime_tag!r} executes "
+            f"runtime_backend=ascendc_trackb via {list(regime_spec.trackb_symbols)}; "
+            f"candidate modified only inactive fallback symbols {sorted(changed)}."
+        )
+    return None
+
+
+def _resolve_cann_root_from_env_file(env_file: str | Path | None) -> Path | None:
+    if env_file is None:
+        return None
+    p = Path(env_file)
+    if not p.is_file():
+        return None
+    vals = parse_simple_env_file(p)
+    setup_raw = vals.get("TILEFOUNDRY_NPU_CANN_SETUP", "").strip()
+    if not setup_raw:
+        return None
+    parent = Path(setup_raw).expanduser().parent
+    return parent if parent.is_dir() else None
 
 
 def _find_top_level_func(tree: ast.Module, names: Sequence[str]) -> ast.FunctionDef | None:
@@ -1365,11 +1459,41 @@ class PerfTargetCampaignRunner:
         }
         return combine_fn, combine_kwargs
 
+    def _compile_trackb_stage_b(self, cpp_source: str) -> StageBResult:
+        cann_root = _resolve_cann_root_from_env_file(self._env_file)
+        bisheng_bin: str | None = None
+        flags = list(PURE_SIMDVF_UBUF_FLAGS)
+        if cann_root is not None:
+            cand_bin = cann_root / "bin" / "bisheng"
+            if cand_bin.is_file():
+                bisheng_bin = str(cand_bin)
+            if (cann_root / "include").is_dir():
+                flags.append(f"-I{cann_root / 'include'}")
+        return run_stage_b_ascendc_compile(
+            cpp_source,
+            compile_flags=flags,
+            bisheng_bin=bisheng_bin,
+            cann_root=cann_root,
+        )
+
     def _default_l0_checker(
         self,
         module_source: str,
         regime_spec: RegimeTargetSpec,
     ) -> StageAResult:
+        tb_extracted = (
+            _extract_trackb_cpp_source(module_source, regime_spec)
+            if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
+            else None
+        )
+        if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
+            return evaluate_ascendc_candidate(
+                tb_extracted[1],
+                freedom_mask=ConstraintRelaxationMask.top(),
+                target=self._target,
+                enable_track_router=self._enable_track_router,
+            )
+
         anchor_dims = (
             regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
         )
@@ -1399,29 +1523,47 @@ class PerfTargetCampaignRunner:
         if not primary_res.passed:
             return primary_res
         combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
-        if combine_spec is None:
-            return primary_res
-        combine_fn, combine_kwargs = combine_spec
-        combine_res = run_stage_a_static(
-            module_source,
-            factory_name=combine_fn,
-            factory_kwargs=combine_kwargs,
-            pass_configs=resolved.pass_configs or None,
-            compile_flags=resolved.compile_flags or None,
-            target=self._target,
-            var_bindings=var_bindings or None,
-            enable_track_router=self._enable_track_router,
-        )
-        if not combine_res.passed:
-            return StageAResult(
-                passed=False,
-                prim_func=primary_res.prim_func,
-                ledger=primary_res.ledger,
-                features=primary_res.features,
-                route=primary_res.route,
-                error_message=f"combine_kernel({combine_fn}): {combine_res.error_message}",
-                elapsed_ms=primary_res.elapsed_ms + combine_res.elapsed_ms,
+        if combine_spec is not None:
+            combine_fn, combine_kwargs = combine_spec
+            combine_res = run_stage_a_static(
+                module_source,
+                factory_name=combine_fn,
+                factory_kwargs=combine_kwargs,
+                pass_configs=resolved.pass_configs or None,
+                compile_flags=resolved.compile_flags or None,
+                target=self._target,
+                var_bindings=var_bindings or None,
+                enable_track_router=self._enable_track_router,
             )
+            if not combine_res.passed:
+                return StageAResult(
+                    passed=False,
+                    prim_func=primary_res.prim_func,
+                    ledger=primary_res.ledger,
+                    features=primary_res.features,
+                    route=primary_res.route,
+                    error_message=f"combine_kernel({combine_fn}): {combine_res.error_message}",
+                    elapsed_ms=primary_res.elapsed_ms + combine_res.elapsed_ms,
+                )
+        if regime_spec.runtime_backend == "hybrid_trackb" and tb_extracted is not None:
+            tb_sym, tb_cpp = tb_extracted
+            tb_res = evaluate_ascendc_candidate(
+                tb_cpp,
+                freedom_mask=ConstraintRelaxationMask.top(),
+                target=self._target,
+                enable_track_router=self._enable_track_router,
+            )
+            if not tb_res.passed:
+                return StageAResult(
+                    passed=False,
+                    prim_func=primary_res.prim_func,
+                    ledger=primary_res.ledger,
+                    features=primary_res.features,
+                    route=primary_res.route,
+                    error_message=f"trackb_ascendc({tb_sym}): {tb_res.error_message}",
+                    elapsed_ms=primary_res.elapsed_ms + tb_res.elapsed_ms,
+                    backend_kind="ascendc",
+                )
         return primary_res
 
     def _run_l0(self, module_source: str, regime_spec: RegimeTargetSpec) -> StageAResult:
@@ -1432,6 +1574,14 @@ class PerfTargetCampaignRunner:
     def _run_l1(self, module_source: str, regime_spec: RegimeTargetSpec) -> StageBResult:
         if self._l1_compiler is not None:
             return self._l1_compiler(module_source, regime_spec)
+        tb_extracted = (
+            _extract_trackb_cpp_source(module_source, regime_spec)
+            if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
+            else None
+        )
+        if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
+            return self._compile_trackb_stage_b(tb_extracted[1])
+
         anchor_dims = (
             regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
         )
@@ -1454,27 +1604,36 @@ class PerfTargetCampaignRunner:
         )
         if not primary_b.passed:
             return primary_b
+        final_b = primary_b
         combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
-        if combine_spec is None:
-            return primary_b
-        combine_fn, combine_kwargs = combine_spec
-        combine_b = run_l1_compile_check(
-            module_source,
-            builder_name=combine_fn,
-            builder_kwargs=combine_kwargs,
-            config_selector_name=None,
-            pass_configs=resolved.pass_configs or None,
-            compile_flags=resolved.compile_flags or None,
-            source_root=self._source_root,
-            env_file=self._env_file,
-        )
-        if not combine_b.passed:
-            return StageBResult(
-                passed=False,
-                error_message=f"combine_kernel({combine_fn}): {combine_b.error_message}",
-                elapsed_sec=primary_b.elapsed_sec + combine_b.elapsed_sec,
+        if combine_spec is not None:
+            combine_fn, combine_kwargs = combine_spec
+            combine_b = run_l1_compile_check(
+                module_source,
+                builder_name=combine_fn,
+                builder_kwargs=combine_kwargs,
+                config_selector_name=None,
+                pass_configs=resolved.pass_configs or None,
+                compile_flags=resolved.compile_flags or None,
+                source_root=self._source_root,
+                env_file=self._env_file,
             )
-        return primary_b
+            if not combine_b.passed:
+                return StageBResult(
+                    passed=False,
+                    error_message=f"combine_kernel({combine_fn}): {combine_b.error_message}",
+                    elapsed_sec=primary_b.elapsed_sec + combine_b.elapsed_sec,
+                )
+        if regime_spec.runtime_backend == "hybrid_trackb" and tb_extracted is not None:
+            tb_sym, tb_cpp = tb_extracted
+            tb_b = self._compile_trackb_stage_b(tb_cpp)
+            if not tb_b.passed:
+                return StageBResult(
+                    passed=False,
+                    error_message=f"trackb_ascendc({tb_sym}): {tb_b.error_message}",
+                    elapsed_sec=final_b.elapsed_sec + tb_b.elapsed_sec,
+                )
+        return final_b
 
     def _run_l2_batch(
         self,
@@ -2142,6 +2301,26 @@ class PerfTargetCampaignRunner:
                     kept_stones.append(stone)
             other_beam.stepping_stone_beam = kept_stones
 
+    @staticmethod
+    def _format_trackb_hotpath_section(regime_spec: RegimeTargetSpec) -> tuple[str, str]:
+        """Return `(escalation_tier, hotpath_prompt_section)` for *regime_spec*."""
+        esc_tier = (
+            "ascendc_template"
+            if regime_spec.runtime_backend == "ascendc_trackb"
+            else "tilelang_dsl"
+        )
+        if not regime_spec.trackb_symbols:
+            return esc_tier, ""
+        section = (
+            "### ACTIVE RUNTIME HOT PATH\n"
+            f"- runtime_backend: {regime_spec.runtime_backend}\n"
+            f"- active_trackb_symbols: {list(regime_spec.trackb_symbols)}\n"
+            "- CRITICAL: On NPU this regime executes the Track-B AscendC/C++20 kernel string "
+            "and config selector shown in TARGET FUNCTION SNIPPET, NOT dead TileLang fallback "
+            "builders. Edit the active Track-B C++20 string / selector directly.\n\n"
+        )
+        return esc_tier, section
+
     def _build_exploit_regime_request(
         self,
         *,
@@ -2159,13 +2338,14 @@ class PerfTargetCampaignRunner:
         effort: str | None = None,
     ) -> GenerationRequest:
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
+        esc_tier, hotpath_section = self._format_trackb_hotpath_section(regime_spec)
         sys_prompt = (
-            "You are an Ascend 950PR TileLang DSL performance engineer. Apply the selected causal "
+            "You are an Ascend 950PR kernel performance engineer. Apply the selected causal "
             f"optimization rule cleanly while preserving exact numerical semantics, dynamic shape "
             f"compatibility, and {slice_desc}. Output ONLY Python code for this regime slice."
         )
         constraint_text = build_progressive_llm_constraints(
-            escalation_tier="tilelang_dsl",
+            escalation_tier=esc_tier,
             track=track,
             enable_track_router=bool(self._enable_track_router),
             sil_advisory=getattr(self, "_sil_advisory", None),
@@ -2192,6 +2372,7 @@ class PerfTargetCampaignRunner:
         )
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
+            f"{hotpath_section}"
             f"{track_section}"
             f"{sil_policy_section}"
             f"{nav_section}"
@@ -2237,6 +2418,7 @@ class PerfTargetCampaignRunner:
         sil_policy_section: str = "",
     ) -> GenerationRequest:
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
+        esc_tier, hotpath_section = self._format_trackb_hotpath_section(regime_spec)
         sys_prompt = (
             "You are an Ascend 950PR (dav-3510) systems architect. Propose an architectural "
             f"optimization grounded in Roofline limits (56 AIV / 28 MixCore blocks, 3 KiB SSBUF, "
@@ -2257,7 +2439,7 @@ class PerfTargetCampaignRunner:
             "mechanisms listed above.\n\n"
         )
         constraint_text = build_progressive_llm_constraints(
-            escalation_tier="tilelang_dsl",
+            escalation_tier=esc_tier,
             track=track,
             enable_track_router=bool(self._enable_track_router),
             sil_advisory=getattr(self, "_sil_advisory", None),
@@ -2296,6 +2478,7 @@ class PerfTargetCampaignRunner:
         )
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
+            f"{hotpath_section}"
             f"{track_section}"
             f"{sil_policy_section}"
             f"{nav_section}"
@@ -2355,6 +2538,7 @@ class PerfTargetCampaignRunner:
             return
         payload = {
             "version": 1,
+            "run_id": self._run_id,
             "operator_name": self._config.operator_name,
             "target_module_path": str(self._target_module_path),
             "incumbent_source": incumbent_source,
@@ -2408,6 +2592,9 @@ class PerfTargetCampaignRunner:
     ]:
         assert self._checkpoint_path is not None
         payload = json.loads(self._checkpoint_path.read_text(encoding="utf-8"))
+        saved_run_id = payload.get("run_id")
+        if isinstance(saved_run_id, str) and saved_run_id.strip():
+            self._run_id = saved_run_id.strip()
         incumbent_source = str(payload["incumbent_source"])
         _atomic_write_text(self._target_module_path, incumbent_source)
         if self._campaign_kb_path is not None and self._campaign_kb_path.is_file():
@@ -3122,12 +3309,26 @@ class PerfTargetCampaignRunner:
                 if prescreen_top_k is not None
                 else None
             )
+            def _candidate_l0_check(mod_src: str) -> StageAResult:
+                dead_err = _detect_trackb_dead_code_edit(
+                    parent_module_source, mod_src, regime_spec
+                )
+                if dead_err is not None:
+                    return StageAResult(
+                        passed=False,
+                        prim_func=None,
+                        ledger=None,
+                        error_message=dead_err,
+                        backend_kind="ascendc",
+                    )
+                return self._run_l0(mod_src, regime_spec)
+
             l0_l1_checks = await run_l0_l1_round_filter(
                 raw_candidates,
                 patch_fn=lambda snip: patch_regime_into_module(
                     parent_module_source, regime_spec, snip
                 ),
-                l0_checker=lambda mod_src: self._run_l0(mod_src, regime_spec),
+                l0_checker=_candidate_l0_check,
                 l1_compiler=lambda mod_src: self._run_l1(mod_src, regime_spec),
                 repair_backend=backend if self._config.max_syntax_repairs > 0 else None,
                 max_syntax_repairs=self._config.max_syntax_repairs,
