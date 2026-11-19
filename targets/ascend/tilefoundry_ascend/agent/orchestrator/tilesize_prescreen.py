@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from itertools import product
 import math
+from tilefoundry_ascend.ascend.cost_model.calibration_backtest import (
+    PrescreenAblationReport,
+    PrescreenAblationSample,
+    evaluate_prescreen_ablation,
+)
 from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
     CostPrediction,
     HybridAscendCostModel,
@@ -840,138 +845,6 @@ def format_prescreen_summary(scores: Sequence[PrescreenScore]) -> str:
             f"score={item.score:.3f}"
         )
     return "\n".join(lines)
-
-
-@dataclass(frozen=True)
-class PrescreenAblationSample:
-    """Single paired A/B ablation sample comparing prescreen-off vs prescreen-on."""
-
-    case_id: str
-    baseline_score: float
-    prescreen_score: float
-    is_anchor: bool = False
-    baseline_latency_us: float | None = None
-    prescreen_latency_us: float | None = None
-
-    @property
-    def gain(self) -> float:
-        """Return net score improvement (positive means prescreen improved over baseline)."""
-        return float(self.prescreen_score) - float(self.baseline_score)
-
-    @property
-    def is_regression(self) -> bool:
-        """Return True if enabling prescreen degraded score relative to baseline."""
-        return self.gain < 0.0
-
-    def to_dict(self) -> dict[str, object]:
-        out = asdict(self)
-        out["gain"] = self.gain
-        out["is_regression"] = self.is_regression
-        return out
-
-
-@dataclass(frozen=True)
-class PrescreenAblationReport:
-    """A/B ablation gate report controlling whether prescreener activation is allowed."""
-
-    recommended_enable: bool
-    sample_count: int
-    anchor_count: int
-    mean_gain: float
-    min_gain: float
-    max_gain: float
-    regression_count: int
-    anchor_regression_count: int
-    anchor_regressions: tuple[str, ...]
-    reasons: tuple[str, ...]
-
-    def to_dict(self) -> dict[str, object]:
-        out = asdict(self)
-        out["anchor_regressions"] = list(self.anchor_regressions)
-        out["reasons"] = list(self.reasons)
-        return out
-
-
-def evaluate_prescreen_ablation(
-    samples: Sequence[PrescreenAblationSample | Mapping[str, object]],
-    *,
-    min_mean_gain: float = 0.01,
-    allow_anchor_regressions: bool = False,
-) -> PrescreenAblationReport:
-    """Gate tilesize_prescreen activation on net gain and zero anchor regressions."""
-    coerced: list[PrescreenAblationSample] = []
-    for item in samples:
-        if isinstance(item, PrescreenAblationSample):
-            coerced.append(item)
-        elif isinstance(item, Mapping):
-            coerced.append(
-                PrescreenAblationSample(
-                    case_id=str(item["case_id"]),
-                    baseline_score=float(item["baseline_score"]),
-                    prescreen_score=float(item["prescreen_score"]),
-                    is_anchor=bool(item.get("is_anchor", False)),
-                    baseline_latency_us=(
-                        float(item["baseline_latency_us"])
-                        if item.get("baseline_latency_us") is not None
-                        else None
-                    ),
-                    prescreen_latency_us=(
-                        float(item["prescreen_latency_us"])
-                        if item.get("prescreen_latency_us") is not None
-                        else None
-                    ),
-                )
-            )
-        else:
-            raise TypeError(f"Expected PrescreenAblationSample or Mapping, got {type(item).__name__}")
-
-    if not coerced:
-        return PrescreenAblationReport(
-            recommended_enable=False,
-            sample_count=0,
-            anchor_count=0,
-            mean_gain=0.0,
-            min_gain=0.0,
-            max_gain=0.0,
-            regression_count=0,
-            anchor_regression_count=0,
-            anchor_regressions=(),
-            reasons=("no_ablation_samples_keep_disabled",),
-        )
-
-    gains = [s.gain for s in coerced]
-    mean_gain = sum(gains) / float(len(gains))
-    min_gain = min(gains)
-    max_gain = max(gains)
-    regressions = [s for s in coerced if s.is_regression]
-    anchors = [s for s in coerced if s.is_anchor]
-    anchor_regs = tuple(s.case_id for s in anchors if s.is_regression)
-
-    reasons: list[str] = []
-    passed = True
-    if mean_gain < float(min_mean_gain):
-        passed = False
-        reasons.append(f"mean_gain={mean_gain:.4f} < min_mean_gain={float(min_mean_gain):.4f}")
-    if anchor_regs and not allow_anchor_regressions:
-        passed = False
-        reasons.append(f"anchor_regressions={list(anchor_regs)}")
-    if passed:
-        reasons.append(
-            f"ablation_passed: mean_gain={mean_gain:.4f}, anchor_regressions={len(anchor_regs)}"
-        )
-
-    return PrescreenAblationReport(
-        recommended_enable=passed,
-        sample_count=len(coerced),
-        anchor_count=len(anchors),
-        mean_gain=mean_gain,
-        min_gain=min_gain,
-        max_gain=max_gain,
-        regression_count=len(regressions),
-        anchor_regression_count=len(anchor_regs),
-        anchor_regressions=anchor_regs,
-        reasons=tuple(reasons),
-    )
 
 
 __all__ = [

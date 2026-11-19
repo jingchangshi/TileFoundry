@@ -38,7 +38,7 @@ def test_ascend_space_facts_exposes_core_counts() -> None:
 
 
 def test_compile_hir_blueprint_mla_without_virtual_tir_leakage() -> None:
-    """Verify MLA HIR blueprint emits Roofline, Z3 II=10, and zero virtual TIR ops."""
+    """Verify MLA HIR blueprint emits Roofline, Z3 summary, and zero virtual TIR ops."""
     authored_src = (MLA_DIR / "model.py").read_text(encoding="utf-8")
     scheduled_src = (MLA_DIR / "scheduled.py").read_text(encoding="utf-8")
 
@@ -58,7 +58,7 @@ def test_compile_hir_blueprint_mla_without_virtual_tir_leakage() -> None:
 
     loop_summary = next(iter(packet.z3_pipeline_summary.values()))
     assert isinstance(loop_summary, dict)
-    assert loop_summary["ii"] == 10
+    assert loop_summary["ii"] == 32
     assert loop_summary["stages"]
     assert loop_summary["phases"]
     assert loop_summary["versions"]

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 import math
+import os
 from pathlib import Path
 import re
 import sys
@@ -34,6 +35,138 @@ from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
 _CASE_NUM_RE = re.compile(r"_(\d+)$")
 DEFAULT_AIV_VEC_FLOPS_PER_CYCLE = 256
+
+
+@dataclass(frozen=True)
+class PrescreenAblationSample:
+    """Single paired A/B ablation sample comparing prescreen-off vs prescreen-on."""
+
+    case_id: str
+    baseline_score: float
+    prescreen_score: float
+    is_anchor: bool = False
+    baseline_latency_us: float | None = None
+    prescreen_latency_us: float | None = None
+
+    @property
+    def gain(self) -> float:
+        """Return net score improvement (positive means prescreen improved over baseline)."""
+        return float(self.prescreen_score) - float(self.baseline_score)
+
+    @property
+    def is_regression(self) -> bool:
+        """Return True if enabling prescreen degraded score relative to baseline."""
+        return self.gain < 0.0
+
+    def to_dict(self) -> dict[str, object]:
+        out = asdict(self)
+        out["gain"] = self.gain
+        out["is_regression"] = self.is_regression
+        return out
+
+
+@dataclass(frozen=True)
+class PrescreenAblationReport:
+    """A/B ablation gate report controlling whether prescreener activation is allowed."""
+
+    recommended_enable: bool
+    sample_count: int
+    anchor_count: int
+    mean_gain: float
+    min_gain: float
+    max_gain: float
+    regression_count: int
+    anchor_regression_count: int
+    anchor_regressions: tuple[str, ...]
+    reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        out = asdict(self)
+        out["anchor_regressions"] = list(self.anchor_regressions)
+        out["reasons"] = list(self.reasons)
+        return out
+
+
+def evaluate_prescreen_ablation(
+    samples: Sequence[PrescreenAblationSample | Mapping[str, object]],
+    *,
+    min_mean_gain: float = 0.01,
+    allow_anchor_regressions: bool = False,
+) -> PrescreenAblationReport:
+    """Gate tilesize_prescreen activation on net gain and zero anchor regressions."""
+    coerced: list[PrescreenAblationSample] = []
+    for item in samples:
+        if isinstance(item, PrescreenAblationSample):
+            coerced.append(item)
+        elif isinstance(item, Mapping):
+            coerced.append(
+                PrescreenAblationSample(
+                    case_id=str(item["case_id"]),
+                    baseline_score=float(item["baseline_score"]),
+                    prescreen_score=float(item["prescreen_score"]),
+                    is_anchor=bool(item.get("is_anchor", False)),
+                    baseline_latency_us=(
+                        float(item["baseline_latency_us"])
+                        if item.get("baseline_latency_us") is not None
+                        else None
+                    ),
+                    prescreen_latency_us=(
+                        float(item["prescreen_latency_us"])
+                        if item.get("prescreen_latency_us") is not None
+                        else None
+                    ),
+                )
+            )
+        else:
+            raise TypeError(f"Expected PrescreenAblationSample or Mapping, got {type(item).__name__}")
+
+    if not coerced:
+        return PrescreenAblationReport(
+            recommended_enable=False,
+            sample_count=0,
+            anchor_count=0,
+            mean_gain=0.0,
+            min_gain=0.0,
+            max_gain=0.0,
+            regression_count=0,
+            anchor_regression_count=0,
+            anchor_regressions=(),
+            reasons=("no_ablation_samples_keep_disabled",),
+        )
+
+    gains = [s.gain for s in coerced]
+    mean_gain = sum(gains) / float(len(gains))
+    min_gain = min(gains)
+    max_gain = max(gains)
+    regressions = [s for s in coerced if s.is_regression]
+    anchors = [s for s in coerced if s.is_anchor]
+    anchor_regs = tuple(s.case_id for s in anchors if s.is_regression)
+
+    reasons: list[str] = []
+    passed = True
+    if mean_gain < float(min_mean_gain):
+        passed = False
+        reasons.append(f"mean_gain={mean_gain:.4f} < min_mean_gain={float(min_mean_gain):.4f}")
+    if anchor_regs and not allow_anchor_regressions:
+        passed = False
+        reasons.append(f"anchor_regressions={list(anchor_regs)}")
+    if passed:
+        reasons.append(
+            f"ablation_passed: mean_gain={mean_gain:.4f}, anchor_regressions={len(anchor_regs)}"
+        )
+
+    return PrescreenAblationReport(
+        recommended_enable=passed,
+        sample_count=len(coerced),
+        anchor_count=len(anchors),
+        mean_gain=mean_gain,
+        min_gain=min_gain,
+        max_gain=max_gain,
+        regression_count=len(regressions),
+        anchor_regression_count=len(anchor_regs),
+        anchor_regressions=anchor_regs,
+        reasons=tuple(reasons),
+    )
 
 
 @dataclass(frozen=True)
@@ -119,16 +252,12 @@ def _try_resolve_extractor(ops_root: str | Path | None) -> OpAdvisoryExtractor |
         p = Path(ops_root).expanduser().resolve()
         if p.is_dir():
             return OpAdvisoryExtractor(p)
-    try:
-        from tilefoundry_ascend.agent.campaign.anchor_specs import (  # noqa: PLC0415
-            resolve_cannbench_tasks_root,
-        )
-
-        resolved = resolve_cannbench_tasks_root()
-        if resolved.is_dir():
-            return OpAdvisoryExtractor(resolved)
-    except Exception:
-        pass
+    env_root = os.environ.get("TILEFOUNDRY_CANNBENCH_ROOT", "").strip()
+    if env_root:
+        cand = Path(env_root).expanduser().resolve()
+        for sub in (cand / "tasks", cand):
+            if sub.is_dir():
+                return OpAdvisoryExtractor(sub)
     try:
         default_ext = OpAdvisoryExtractor()
         if default_ext.ops_root.is_dir():
@@ -396,11 +525,6 @@ def run_p2_prescreen_ablation(
     target: AscendTarget | None = None,
 ) -> PrescreenAblationReport:
     """Evaluate offline prescreen gain across multi-checkpoint operators using LOO fitting."""
-    from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (  # noqa: PLC0415
-        PrescreenAblationSample,
-        evaluate_prescreen_ablation,
-    )
-
     eff_target = target or AscendTarget("ascend.950pr")
     by_op_sig: dict[str, dict[str, list[OfficialCaseRecord]]] = {}
     for rec in records:
@@ -456,10 +580,6 @@ def run_cost_model_backtest(
     )
     unique_records = _select_best_checkpoint_per_operator(all_records)
     if not unique_records:
-        from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (  # noqa: PLC0415
-            evaluate_prescreen_ablation,
-        )
-
         empty_eval = CostModelEvalReport(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         empty_ablation = evaluate_prescreen_ablation([])
         return BacktestSummary(
@@ -579,6 +699,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "BacktestSummary",
     "OfficialCaseRecord",
+    "PrescreenAblationReport",
+    "PrescreenAblationSample",
+    "evaluate_prescreen_ablation",
     "load_official_reports",
     "run_cost_model_backtest",
     "run_p2_prescreen_ablation",

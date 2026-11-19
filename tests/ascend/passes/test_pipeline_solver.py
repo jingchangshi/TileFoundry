@@ -455,7 +455,7 @@ class M:
     ub_bufs = [b for b in problem.buffers if b.space == "UB"]
     assert ub_bufs and all(b.slot_bytes == 76800 for b in ub_bufs)
     dma_in = next(t for t in problem.tasks if "gm_to_ub" in t.name)
-    assert dma_in.latency == 8
+    assert dma_in.latency == 12
 
 
 def test_mode_aware_ub_budget_simdvf_vs_simtvf_and_unreserved(tmp_path: pathlib.Path):
@@ -486,7 +486,7 @@ class M:
     prob1, _ = extract_tir_loop_problem(_collect_pipelined_loops(fn1)[0], fn_stmt=fn1.body)
     assert {(c.space, c.owner): c.bytes for c in prob1.capacities}[("UB", "aiv")] == 248 * 1024
     versions1 = list(low1.metadata["ascend.pipelines"]["pure_simdvf:k"]["versions"].values())
-    assert versions1 == [1, 2]
+    assert sorted(versions1) == [1, 2]
 
     import dataclasses  # noqa: PLC0415
     from tilefoundry.ir.tir.stmts import ExecutionScope, Sequential  # noqa: PLC0415

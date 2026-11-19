@@ -266,7 +266,7 @@ def test_format_blueprint_delta_section_and_portfolio_roofline_eta() -> None:
     assert report.evaluated_candidates
     for req in backend.calls:
         assert "### LAYER 3: PHYSICAL ROOFLINE & BLUEPRINT DELTA" in req.user_prompt
-        assert "### TIR BLUEPRINT VS CURRENT TILELANG LEDGER DELTA" in req.user_prompt
+        assert "- steady_state_ii:" in req.user_prompt
     for cand in report.evaluated_candidates:
         assert cand.residual.predicted_bottleneck_util >= 0.0
         assert cand.residual.unexplained_gap_ratio > 0.0

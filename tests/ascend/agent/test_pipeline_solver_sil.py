@@ -104,11 +104,13 @@ def test_sil_advisory_and_verification_flow_into_portfolio_prompts() -> None:
         _SAMPLE_DSL, "ub overflow", sil_verification=synthetic_ver
     )
 
-    assert "### SIL ADVISORY ENVELOPE" in exp_req.user_prompt
-    assert "rms_norm" in exp_req.user_prompt
-    assert "### SIL VERIFICATION DIAGNOSTICS" in exp_req.user_prompt
+    assert "### LAYER 1: HARDWARE REDLINES & 7-FACET SHELL CONTRACT" in exp_req.user_prompt
+    assert "- TopologyAxes:" in exp_req.user_prompt
+    assert "- Advisory Roofline:" in exp_req.user_prompt
+    assert "- SILVerifier Status: FAILED" in exp_req.user_prompt
     assert "ub_bank_pad_datablocks" in exp_req.user_prompt
-    assert "### SIL ADVISORY ENVELOPE" in cre_req.user_prompt
+    assert "### LAYER 1: HARDWARE REDLINES & 7-FACET SHELL CONTRACT" in cre_req.user_prompt
+    assert "- SILVerifier Status: FAILED" in cre_req.user_prompt
     assert "### SIL VERIFICATION DIAGNOSTICS" in rep_req.user_prompt
 
     creative_reply = json.dumps(
@@ -151,4 +153,5 @@ def test_sil_advisory_and_verification_flow_into_portfolio_prompts() -> None:
     assert round_report.evaluated_candidates
     assert f"ce:{advisory.topology_axes.compute_engine}" in tracker.axis_posteriors
     for req in backend.calls:
-        assert "### SIL ADVISORY ENVELOPE" in req.user_prompt
+        assert "### LAYER 1: HARDWARE REDLINES & 7-FACET SHELL CONTRACT" in req.user_prompt
+        assert "- SILVerifier Status: FAILED" in req.user_prompt

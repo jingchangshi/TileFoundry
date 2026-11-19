@@ -173,7 +173,7 @@ class M:
 
     x = torch.ones((4, 64), dtype=torch.float32)
     y = torch.ones((4, 64), dtype=torch.float32)
-    out = evaluate(lowered, x, y)
+    out = evaluate(mod.entry_function(), x, y).data
     torch.testing.assert_close(out, torch.exp(x + y))
 
 

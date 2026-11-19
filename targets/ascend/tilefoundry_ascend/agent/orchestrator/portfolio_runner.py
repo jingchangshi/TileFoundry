@@ -16,6 +16,7 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     KernelLLMBackend,
     extract_creative_payload,
     extract_python_dsl,
+    sanitize_effort,
 )
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate,
@@ -701,7 +702,7 @@ def build_creative_request(
     )
     eff = sanitize_effort(effort or "high", default="high")
     return GenerationRequest(
-        role="creative_explore",
+        role="explore_creative",
         system_prompt=sys_prompt,
         user_prompt=user_prompt,
         json_schema=CREATIVE_RESPONSE_SCHEMA,

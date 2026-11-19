@@ -545,7 +545,7 @@ def test_fp3_unmatched_rules_not_padded_and_transport_error_exempt() -> None:
     creative_text = (
         creative_specs[0].request.system_prompt + "\n" + creative_specs[0].request.user_prompt
     )
-    assert "### NEGATIVE CONSTRAINTS (ALREADY EXPLORED BY PARALLEL WORKERS)" in creative_text
+    assert "- Negative Structural Exclusions (do NOT duplicate):" in creative_text
     assert "### TILE PRESCREEN GUIDANCE" in creative_text
     for rule in tracker.active_rules():
         assert rule.rule_id not in creative_text
@@ -687,13 +687,16 @@ def test_stage_a_track_router_disabled_by_default_and_primitive_menu(monkeypatch
     exp_req = build_exploit_request(unconstrained_parent, rules[0])
     assert "### EXECUTION TRACK" not in exp_req.user_prompt
     assert "### TARGET TRACK" not in exp_req.user_prompt
-    assert "### TILELANG ASCEND PRIMITIVE REFERENCE" in exp_req.user_prompt
-    assert TILELANG_ASCEND_PRIMITIVE_MENU in exp_req.user_prompt
+    assert "Routed Execution Track:" not in exp_req.user_prompt
+    assert "### LAYER 1: HARDWARE REDLINES & 7-FACET SHELL CONTRACT" in exp_req.user_prompt
+    assert "### LAYER 2: TARGET DIALECT API SURFACE" in exp_req.user_prompt
 
     cre_req = build_creative_request(unconstrained_parent)
     assert "### EXECUTION TRACK" not in cre_req.user_prompt
-    assert "### TILELANG ASCEND PRIMITIVE REFERENCE" in cre_req.user_prompt
-    assert TILELANG_ASCEND_PRIMITIVE_MENU in cre_req.user_prompt
+    assert "### TARGET TRACK" not in cre_req.user_prompt
+    assert "Routed Execution Track:" not in cre_req.user_prompt
+    assert "### LAYER 1: HARDWARE REDLINES & 7-FACET SHELL CONTRACT" in cre_req.user_prompt
+    assert "### LAYER 2: TARGET DIALECT API SURFACE" in cre_req.user_prompt
 
 
 def test_dual_accumulator_analytical_and_live_ir_prescreen() -> None:

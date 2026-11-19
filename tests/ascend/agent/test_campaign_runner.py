@@ -765,9 +765,9 @@ def test_np4_default_regime_specs_hir_dims_and_navigation_packets() -> None:
                 target=target,
             )
             assert pkt.roofline.ideal_roofline_us > 0.0
-            assert pkt.tir_script is not None
-            assert pkt.tir_ledger is not None
-            assert pkt.tir_ledger.is_legal is True
+            assert not hasattr(pkt, "tir_script")
+            assert pkt.reference_ledger is not None
+            assert pkt.reference_ledger.is_legal is True
             assert pkt.lowering_diagnostics == ()
 
 
@@ -962,10 +962,10 @@ def _build_regime_a(tile_m=2):
     ]
     assert worker_reqs
     for req in worker_reqs:
-        assert "HIR ANALYTICAL ROOFLINE" in req.user_prompt
-        assert "LOWERED ASCEND TIR BLUEPRINT" in req.user_prompt
-        assert "TIR BLUEPRINT VS CURRENT TILELANG LEDGER DELTA" in req.user_prompt
-        assert "### TILELANG ASCEND PRIMITIVE REFERENCE" in req.user_prompt
+        assert "### LAYER 1: HARDWARE REDLINES & 7-FACET SHELL CONTRACT" in req.user_prompt
+        assert "### LAYER 2: TARGET DIALECT API SURFACE" in req.user_prompt
+        assert "### LAYER 3: PHYSICAL ROOFLINE & BLUEPRINT DELTA" in req.user_prompt
+        assert "Routed Execution Track:" not in req.user_prompt
         assert "### EXECUTION TRACK" not in req.user_prompt
         assert "### TARGET TRACK" not in req.user_prompt
 
