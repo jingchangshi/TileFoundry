@@ -32,7 +32,7 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     prescreen_live_ir_neighborhood,
     prescreen_tile_configs,
 )
-from tilefoundry_ascend.agent.orchestrator.twin_bridge import format_hir_tir_navigation_section
+from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
 from tilefoundry_ascend.agent.router.capability_gate import (
     EscalationDecision,
     evaluate_track_escalation,
@@ -44,7 +44,7 @@ from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
     HybridAscendCostModel,
     build_cost_features_from_ledger,
 )
-from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirTirNavigationPacket
+from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirBlueprintPacket
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
@@ -291,7 +291,7 @@ def build_prescreen_summary_from_kwargs(
     cost_model: HybridAscendCostModel | None = None,
     axes: TopologyAxes | None = None,
     live_plan: object | None = None,
-    nav_packet: object | None = None,
+    blueprint: object | None = None,
     sil_advisory: object | None = None,
 ) -> str:
     """Build live-IR or analytical dual-accumulator tile prescreen summary."""
@@ -345,7 +345,7 @@ def build_prescreen_summary_from_kwargs(
                 cost_model=cost_model,
                 axes=axes,
                 live_plan=live_plan,
-                nav_packet=nav_packet,
+                blueprint=blueprint,
                 sil_advisory=sil_advisory,
             )
             if live_summary:
@@ -573,65 +573,68 @@ def format_sil_diagnostics_section(
     return "\n\n".join(sections)
 
 
-def _resolve_navigation_section(
+def _resolve_constraint_section(
     parent: BeamCandidate,
-    navigation_context: str,
-    nav_packet: HirTirNavigationPacket | None,
+    blueprint_context: str,
+    blueprint: HirBlueprintPacket | None,
     *,
+    escalation_tier: str = "tilelang_dsl",
+    enable_track_router: bool = False,
     sil_advisory: object | None = None,
     sil_verification: object | None = None,
+    freedom_mask: ConstraintRelaxationMask | None = None,
+    excluded_mechanisms: Sequence[str] = (),
 ) -> str:
-    parts: list[str] = []
-    if nav_packet is not None:
-        nav_text = format_hir_tir_navigation_section(
-            nav_packet,
-            current_tl_ledger=parent.ledger,
-        )
-        if nav_text:
-            parts.append(nav_text)
-    elif navigation_context.strip():
-        parts.append(navigation_context.strip())
-    sil_text = format_sil_diagnostics_section(
+    """Build the unified 3-layer progressive LLM constraint section."""
+    enable_router = bool(
+        enable_track_router or (parent.track and parent.track not in ("", "unconstrained"))
+    )
+    rendered = build_progressive_llm_constraints(
+        escalation_tier=escalation_tier,
+        track=parent.track,
+        enable_track_router=enable_router,
         sil_advisory=sil_advisory,
         sil_verification=sil_verification,
+        freedom_mask=freedom_mask,
+        ub_256kb_unlock=bool(parent.ledger.uses_unreserved_ubuf),
+        blueprint=blueprint,
+        current_ledger=parent.ledger,
+        excluded_mechanisms=excluded_mechanisms,
+        extra_blueprint_context=blueprint_context,
     )
-    if sil_text:
-        parts.append(sil_text)
-    joined = "\n\n".join(parts)
-    return f"{joined}\n\n" if joined else ""
+    return f"{rendered}\n\n" if rendered else ""
 
 
 def build_exploit_request(
     parent: BeamCandidate,
     rule: AscendCausalRule,
     *,
-    navigation_context: str = "",
-    nav_packet: HirTirNavigationPacket | None = None,
+    blueprint_context: str = "",
+    blueprint: HirBlueprintPacket | None = None,
+    escalation_tier: str = "tilelang_dsl",
+    enable_track_router: bool = False,
     sil_advisory: object | None = None,
     sil_verification: object | None = None,
+    freedom_mask: ConstraintRelaxationMask | None = None,
 ) -> GenerationRequest:
-    """Build causal-rule worker request routed to exploit model (Hydrogen Medium)."""
+    """Build causal-rule worker request under the 3-layer progressive constraint stack."""
     sys_prompt = (
-        "You are an Ascend 950PR TileLang DSL optimization engineer. Apply the given causal rule "
+        "You are an Ascend 950PR kernel optimization engineer. Apply the given causal rule "
         "faithfully to eliminate the bottleneck identified in the physical ledger while "
-        "preserving exact numerical equivalence. Output ONLY valid Python code."
+        "preserving exact numerical equivalence. Output ONLY valid code."
     )
-    if parent.track in ("", "unconstrained"):
-        track_section = (
-            f"### TILELANG ASCEND PRIMITIVE REFERENCE\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"
-        )
-    else:
-        track_section = f"### TARGET TRACK\n{parent.track}\n\n"
-    nav_section = _resolve_navigation_section(
+    constraint_section = _resolve_constraint_section(
         parent,
-        navigation_context,
-        nav_packet,
+        blueprint_context,
+        blueprint,
+        escalation_tier=escalation_tier,
+        enable_track_router=enable_track_router,
         sil_advisory=sil_advisory,
         sil_verification=sil_verification,
+        freedom_mask=freedom_mask,
     )
     user_prompt = (
-        f"{track_section}"
-        f"{nav_section}"
+        f"{constraint_section}"
         f"### SELECTED CAUSAL RULE\n"
         f"Rule ID: {rule.rule_id}\n"
         f"Precondition: {rule.precondition}\n"
@@ -639,7 +642,7 @@ def build_exploit_request(
         f"Expected Postcondition: {rule.expected_postcondition}\n\n"
         f"### OBJECTIVE PHYSICAL LEDGER\n{parent.ledger.to_json()}\n\n"
         f"### STATIC-DYNAMIC RESIDUAL\n{json.dumps(parent.residual.to_dict(), indent=2)}\n\n"
-        f"### CURRENT KERNEL DSL\n```python\n{parent.dsl_source}\n```\n"
+        f"### CURRENT KERNEL SOURCE\n```python\n{parent.dsl_source}\n```\n"
     )
     return GenerationRequest(
         role="exploit_rule",
@@ -655,41 +658,32 @@ def build_creative_request(
     excluded_mechanisms: Sequence[str] = (),
     focus_hint: str = "",
     prescreen_summary: str = "",
-    navigation_context: str = "",
-    nav_packet: HirTirNavigationPacket | None = None,
+    blueprint_context: str = "",
+    blueprint: HirBlueprintPacket | None = None,
+    escalation_tier: str = "tilelang_dsl",
+    enable_track_router: bool = False,
     effort: str | None = None,
     sil_advisory: object | None = None,
     sil_verification: object | None = None,
+    freedom_mask: ConstraintRelaxationMask | None = None,
 ) -> GenerationRequest:
-    """Build rule-blind creative search request routed to Hydrogen High without rules."""
+    """Build rule-blind creative exploration request under 3-layer constraints."""
     sys_prompt = (
         "You are a first-principles Ascend 950PR (dav-3510) systems architect. Propose an "
         "architectural kernel optimization directly from hardware limits (1 AIC + 2 AIV coupled "
         "block, 3 KiB SSBUF, L0C->UB direct path, UB->L1 direct path, 16-entry MTE2 queue, "
         "128 B/cycle FixPipe) and the physical telemetry below. Return JSON matching the schema."
     )
-    if excluded_mechanisms:
-        constraint_lines = "\n".join(f"- {item}" for item in excluded_mechanisms)
-    else:
-        constraint_lines = "- None recorded yet; explore any high-impact structural axis."
-    neg_section = (
-        "### NEGATIVE CONSTRAINTS (ALREADY EXPLORED BY PARALLEL WORKERS)\n"
-        f"{constraint_lines}\n"
-        "Propose a structurally orthogonal transformation that does NOT duplicate the "
-        "mechanisms listed above.\n\n"
-    )
-    if parent.track in ("", "unconstrained"):
-        track_section = (
-            f"### TILELANG ASCEND PRIMITIVE REFERENCE\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"
-        )
-    else:
-        track_section = f"### EXECUTION TRACK\n{parent.track}\n\n"
-    nav_section = _resolve_navigation_section(
+    constraint_section = _resolve_constraint_section(
         parent,
-        navigation_context,
-        nav_packet,
+        blueprint_context,
+        blueprint,
+        escalation_tier=escalation_tier,
+        enable_track_router=enable_track_router,
         sil_advisory=sil_advisory,
         sil_verification=sil_verification,
+        freedom_mask=freedom_mask,
+        excluded_mechanisms=excluded_mechanisms,
     )
     focus_section = f"### ARCHITECTURAL FOCUS HINT\n{focus_hint}\n\n" if focus_hint else ""
     prescreen_section = (
@@ -698,21 +692,20 @@ def build_creative_request(
         else ""
     )
     user_prompt = (
-        f"{track_section}"
-        f"{nav_section}"
+        f"{constraint_section}"
         f"{focus_section}"
-        f"{neg_section}"
         f"{prescreen_section}"
         f"### OBJECTIVE PHYSICAL LEDGER\n{parent.ledger.to_json()}\n\n"
         f"### STATIC-DYNAMIC RESIDUAL\n{json.dumps(parent.residual.to_dict(), indent=2)}\n\n"
-        f"### CURRENT KERNEL DSL\n```python\n{parent.dsl_source}\n```\n"
+        f"### CURRENT KERNEL SOURCE\n```python\n{parent.dsl_source}\n```\n"
     )
+    eff = sanitize_effort(effort or "high", default="high")
     return GenerationRequest(
-        role="explore_creative",
+        role="creative_explore",
         system_prompt=sys_prompt,
         user_prompt=user_prompt,
         json_schema=CREATIVE_RESPONSE_SCHEMA,
-        effort=effort,
+        effort=eff,
     )
 
 
@@ -791,9 +784,9 @@ class PortfolioRunner:
         var_bindings: Mapping[str, int] | None = None,
         config_selector_name: str | None = None,
         dims: Mapping[str, object] | None = None,
-        navigation_context: str = "",
+        blueprint_context: str = "",
         ideal_roofline_us: float = 0.0,
-        nav_packet: HirTirNavigationPacket | None = None,
+        blueprint: HirBlueprintPacket | None = None,
         creative_effort: str = "high",
         sil_advisory: object | None = None,
         sil_verification: object | None = None,
@@ -823,7 +816,7 @@ class PortfolioRunner:
         eff_roofline = (
             ideal_roofline_us
             if ideal_roofline_us > 0.0
-            else (nav_packet.roofline.ideal_roofline_us if nav_packet is not None else 0.0)
+            else (blueprint.roofline.ideal_roofline_us if blueprint is not None else 0.0)
         )
 
         specs: list[WorkerSpec] = []
@@ -836,8 +829,8 @@ class PortfolioRunner:
                     request=build_exploit_request(
                         parent,
                         rule,
-                        navigation_context=navigation_context,
-                        nav_packet=nav_packet,
+                        blueprint_context=blueprint_context,
+                        blueprint=blueprint,
                         sil_advisory=sil_advisory,
                         sil_verification=sil_verification,
                     ),
@@ -860,7 +853,7 @@ class PortfolioRunner:
                 dims=dims,
                 cost_model=cost_model or self._cost_model,
                 axes=active_axes,
-                nav_packet=nav_packet,
+                blueprint=blueprint,
                 sil_advisory=sil_advisory,
             )
         else:
@@ -884,8 +877,8 @@ class PortfolioRunner:
                         excluded_mechanisms=excluded,
                         focus_hint=hint,
                         prescreen_summary=prescreen_summary,
-                        navigation_context=navigation_context,
-                        nav_packet=nav_packet,
+                        blueprint_context=blueprint_context,
+                        blueprint=blueprint,
                         effort=creative_effort,
                         sil_advisory=sil_advisory,
                         sil_verification=sil_verification,
@@ -1098,9 +1091,9 @@ class PortfolioRunner:
         var_bindings: Mapping[str, int] | None = None,
         config_selector_name: str | None = None,
         dims: Mapping[str, object] | None = None,
-        navigation_context: str = "",
+        blueprint_context: str = "",
         ideal_roofline_us: float = 0.0,
-        nav_packet: HirTirNavigationPacket | None = None,
+        blueprint: HirBlueprintPacket | None = None,
         creative_effort: str = "high",
         sil_advisory: object | None = None,
         sil_verification: object | None = None,
@@ -1121,9 +1114,9 @@ class PortfolioRunner:
             var_bindings=var_bindings,
             config_selector_name=config_selector_name,
             dims=dims,
-            navigation_context=navigation_context,
+            blueprint_context=blueprint_context,
             ideal_roofline_us=ideal_roofline_us,
-            nav_packet=nav_packet,
+            blueprint=blueprint,
             creative_effort=creative_effort,
             sil_advisory=sil_advisory,
             sil_verification=sil_verification,
@@ -1186,7 +1179,7 @@ class PortfolioRunner:
         cost_model: HybridAscendCostModel | None = None,
         workload: Mapping[str, object] | None = None,
     ) -> RoundEscalationReport:
-        """Closed-loop escalation check wiring HybridAscendCostModel + evaluate_track_escalation + relax_facets_for_bottleneck."""
+        """Run closed-loop track escalation and facet relaxation using HybridAscendCostModel."""
         model = cost_model if cost_model is not None else HybridAscendCostModel(AscendTarget("ascend.950pr"))
         eff_workload: CostFeatures | Mapping[str, object]
         if workload:

@@ -15,7 +15,6 @@ import yaml
 
 from tilefoundry_ascend.ascend.sil.schema import (
     AdvisoryEnvelope,
-    ConstraintRelaxationMask,
     HardwareLegalityBounds,
     PolicyEnvelope,
     RegimeSlice,
@@ -156,7 +155,6 @@ def _has_unaligned_tail_for_case(
                 if d > 1 and (d % cube_align != 0):
                     return True
         if len(shp) >= 2 and shp[0] > 1 and _is_prime_or_odd(shp[0]) and shp[0] not in (1, 3, 5, 7):
-            # Odd/prime outer dimension often causes uneven core/tail split
             if shp[0] % 2 == 1 and shp[0] > 15:
                 return True
     return False
@@ -313,7 +311,7 @@ def _infer_structural_axes_and_flags(
     features: object | None = None,
     any_empty_group_hint: bool = False,
 ) -> tuple[TopologyAxes, dict[str, bool]]:
-    """Infer 3-axis TopologyAxes and structural flags directly from structural/dtype/shape signals."""
+    """Infer 3-axis TopologyAxes and structural flags from dtype and shape signals."""
     norm = _to_snake_op_name(op_name)
     proto_map = proto if isinstance(proto, Mapping) else {}
     spec_map = spec_map if isinstance(spec_map, Mapping) else {}
@@ -656,7 +654,7 @@ class OpAdvisoryExtractor:
         raise KeyError(f"Operator {op_name!r} (level={level!r}) not found in {self.ops_root}")
 
     def extract(self, op_name: str, level: str | int | None = None) -> AdvisoryEnvelope:
-        """Build an AdvisoryEnvelope for one operator from proto.yaml, cases.yaml, and 950pr.json."""
+        """Build an AdvisoryEnvelope for an operator from proto, cases, and 950pr specs."""
         lvl_num, op_dir = self._find_op_entry(op_name, level=level)
         level_key = f"level{lvl_num}"
 
@@ -726,7 +724,6 @@ class OpAdvisoryExtractor:
             or "alias" in str(proto.get("description", "")).lower()
         )
 
-        # Group cases into RegimeSlices
         grouped_cases: dict[str, list[dict[str, Any]]] = {}
         has_prime_or_odd = False
         any_unaligned = False
@@ -845,7 +842,7 @@ class OpAdvisoryExtractor:
             has_nan_inf_cases=has_nan_inf_cases,
             has_inplace_aliasing=has_inplace_aliasing,
             precision_thresholds=precision_thresholds,
-            hir_navigation_packet=None,
+            hir_blueprint=None,
         )
 
     def extract_all(self) -> dict[str, AdvisoryEnvelope]:
@@ -870,7 +867,6 @@ def synthesize_default_policy(advisory: AdvisoryEnvelope) -> PolicyEnvelope:
     selected_rules: list[str] = [f"axes:{resolved_axes.key()}"]
     op = advisory.op_name
 
-    # Determine cube operand dtype & w4_mode when Cube is involved
     is_q4 = op == "q4_0_dequant_matmul"
     if is_q4:
         cube_dtype = "q4_0"
@@ -999,7 +995,6 @@ def synthesize_default_policy(advisory: AdvisoryEnvelope) -> PolicyEnvelope:
             bm, bn, bk = (128, 128, 64)
             if "small" in tag:
                 bm, bn, bk = (64, 64, 32)
-            # 2-stage Half-L1 safe estimate: (bm*bk + bk*bn)*2 bytes * 2 stages <= 262144
             elem_b = 1 if cube_dtype == "int8" else 2
             l1_per_stage = (bm * bk + bk * bn) * elem_b
             l1_total = min(l1_per_stage * 2, bounds.l1_bytes)
@@ -1076,7 +1071,7 @@ def synthesize_default_policy(advisory: AdvisoryEnvelope) -> PolicyEnvelope:
                 cube_operand_dtype="",
             )
 
-        else:  # aiv_only / gm_ub_stream / affine_simd
+        else:
             cols = max(1, min(int(dims.get("cols", 1024)), 2048))
             row_pack = 16 if cols <= 256 else 4
             tile_mnk = (min(row_pack * 2, 128), cols, 1)

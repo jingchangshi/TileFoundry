@@ -1,4 +1,4 @@
-"""Tests for HIR-to-TIR navigation packet bridge and NP1 physical ledger telemetry."""
+"""Tests for dialect-neutral HIR blueprint compilation and physical ledger telemetry."""
 
 from __future__ import annotations
 
@@ -8,16 +8,22 @@ import pathlib
 from tilefoundry.analysis import analyze, check_program
 from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.schedule.finalize import finalize
+from tilefoundry_ascend.agent.orchestrator.llm_constraints import (
+    build_progressive_llm_constraints,
+    format_blueprint_delta_section,
+)
 from tilefoundry_ascend.ascend import (
     AscendSpaceFacts,
     AscendTarget,
-    HirCandidateOpEntry,
+    HirBlueprintPacket,
     HirRooflineSummary,
-    HirTirNavigationPacket,
-    compile_hir_navigation_packet,
+    compile_hir_blueprint,
 )
-from tilefoundry_ascend.ascend.passes import ObjectivePhysicalLedger, build_objective_physical_ledger
-from tilefoundry_ascend.ascend.schedule import inspect_tilelang_primfunc, inspect_tir_envelope
+from tilefoundry_ascend.ascend.passes import (
+    ObjectivePhysicalLedger,
+    build_objective_physical_ledger,
+)
+from tilefoundry_ascend.ascend.schedule import inspect_tir_envelope
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 AR_DIR = REPO_ROOT / "examples" / "ascend950pr_ops" / "attention_residual"
@@ -31,26 +37,24 @@ def test_ascend_space_facts_exposes_core_counts() -> None:
     assert spaces.num_aiv_cores == 56
 
 
-def test_compile_hir_navigation_packet_mla() -> None:
-    """Verify MLA model + scheduled HIR produces valid roofline, Z3 II=10, and TIR ledger."""
+def test_compile_hir_blueprint_mla_without_virtual_tir_leakage() -> None:
+    """Verify MLA HIR blueprint emits Roofline, Z3 II=10, and zero virtual TIR ops."""
     authored_src = (MLA_DIR / "model.py").read_text(encoding="utf-8")
     scheduled_src = (MLA_DIR / "scheduled.py").read_text(encoding="utf-8")
 
-    packet = compile_hir_navigation_packet(
+    packet = compile_hir_blueprint(
         authored_src,
         scheduled_hir_source=scheduled_src,
         anchor_dims={"B": 1, "S": 16, "S_kv": 16, "N_q": 4, "N_kv": 1},
     )
-    assert isinstance(packet, HirTirNavigationPacket)
+    assert isinstance(packet, HirBlueprintPacket)
     assert packet.entry_name == "forward"
     assert packet.lowering_diagnostics == ()
-    assert packet.tir_script is not None and "tf.pipelined(" in packet.tir_script
-    assert "fixed_ii=10" in packet.tir_script
+    assert not hasattr(packet, "candidate_ops")
+    assert not hasattr(packet, "tir_script")
     assert packet.roofline.ideal_roofline_us > 0.0
     assert packet.roofline.compute_flops > 0
     assert packet.roofline.min_gm_bytes > 0
-    assert packet.candidate_ops
-    assert any(entry.hir_op_name == "tf.matmul" for entry in packet.candidate_ops)
 
     loop_summary = next(iter(packet.z3_pipeline_summary.values()))
     assert isinstance(loop_summary, dict)
@@ -59,59 +63,66 @@ def test_compile_hir_navigation_packet_mla() -> None:
     assert loop_summary["phases"]
     assert loop_summary["versions"]
 
-    ledger = packet.tir_ledger
+    ledger = packet.reference_ledger
     assert ledger is not None
     assert ledger.dominant_contig_bytes == 128
     assert ledger.effective_cube_m == 64
     assert ledger.has_online_rescale_loop is True
     assert ledger.in_loop_ub_reload_stores >= 3
 
-    rebuilt = HirTirNavigationPacket.from_dict(json.loads(json.dumps(packet.to_dict())))
+    rebuilt = HirBlueprintPacket.from_dict(json.loads(json.dumps(packet.to_dict())))
     assert rebuilt == packet
     prompt_text = packet.format_for_prompt()
     assert "Roofline[" in prompt_text
-    assert "Candidate Ops" in prompt_text
     assert "Z3 Pipelines:" in prompt_text
+    assert "T.ascend_mmad" not in prompt_text
+
+    constraint_block = build_progressive_llm_constraints(
+        escalation_tier="tilelang_dsl",
+        track="manual_ssbuf",
+        enable_track_router=True,
+        blueprint=packet,
+        current_ledger=ledger,
+    )
+    assert "### LAYER 1: HARDWARE REDLINES & 7-FACET SHELL CONTRACT" in constraint_block
+    assert "### LAYER 2: TARGET DIALECT API SURFACE" in constraint_block
+    assert "### LAYER 3: PHYSICAL ROOFLINE & BLUEPRINT DELTA" in constraint_block
+    assert "Routed Execution Track: manual_ssbuf" in constraint_block
+    assert "T.gemm_v0" in constraint_block
+    assert "T.ascend_mmad" not in constraint_block
 
 
-def test_compile_hir_navigation_packet_attention_residual_scheduled_and_unscheduled() -> None:
-    """Verify AttentionResidual scheduled lowering and graceful unscheduled fallback."""
+def test_compile_hir_blueprint_attention_residual_scheduled_and_unscheduled() -> None:
+    """Verify AttentionResidual scheduled blueprint and graceful unscheduled Roofline."""
     authored_src = (AR_DIR / "model.py").read_text(encoding="utf-8")
     scheduled_src = (AR_DIR / "scheduled.py").read_text(encoding="utf-8")
 
-    sched_packet = compile_hir_navigation_packet(
+    sched_packet = compile_hir_blueprint(
         authored_src,
         scheduled_hir_source=scheduled_src,
         anchor_dims={"N": 4, "B": 1, "S": 8, "D": 64},
     )
     assert sched_packet.lowering_diagnostics == ()
-    assert sched_packet.tir_script is not None and len(sched_packet.tir_script) > 0
     assert sched_packet.roofline.ideal_roofline_us > 0.0
     assert sched_packet.roofline.anchor_dims == {"N": 4, "B": 1, "S": 8, "D": 64}
-    assert sched_packet.tir_ledger is not None
-    assert sched_packet.tir_ledger.dominant_contig_bytes == 128
-    assert sched_packet.tir_ledger.effective_cube_m == 0
-    assert sched_packet.tir_ledger.has_online_rescale_loop is True
-    assert sched_packet.tir_ledger.in_loop_ub_reload_stores == 3
+    assert sched_packet.reference_ledger is not None
+    assert sched_packet.reference_ledger.dominant_contig_bytes == 128
+    assert sched_packet.reference_ledger.effective_cube_m == 0
+    assert sched_packet.reference_ledger.has_online_rescale_loop is True
+    assert sched_packet.reference_ledger.in_loop_ub_reload_stores == 3
 
-    unsched_packet = compile_hir_navigation_packet(
+    unsched_packet = compile_hir_blueprint(
         authored_src,
         anchor_dims={"N": 4, "B": 2, "S": 8, "D": 64},
     )
-    assert unsched_packet.tir_script is None
-    assert unsched_packet.tir_ledger is None
+    assert unsched_packet.reference_ledger is None
     assert unsched_packet.lowering_diagnostics
     assert unsched_packet.roofline.compute_flops > sched_packet.roofline.compute_flops
     assert unsched_packet.roofline.min_gm_bytes > sched_packet.roofline.min_gm_bytes
     assert unsched_packet.roofline.ideal_roofline_us > 0.0
-    assert unsched_packet.candidate_ops
-    assert any(
-        isinstance(entry, HirCandidateOpEntry) and entry.legal_ascend_ops
-        for entry in unsched_packet.candidate_ops
-    )
 
 
-def test_compile_hir_navigation_packet_with_dimvars() -> None:
+def test_compile_hir_blueprint_with_dimvars() -> None:
     """Verify DimVar HIR modules specialize cleanly without SpecializationError."""
     dimvar_source = (
         "from __future__ import annotations\n"
@@ -128,7 +139,7 @@ def test_compile_hir_navigation_packet_with_dimvars() -> None:
         "-> Tensor[(M, N), 'f32']:\n"
         "        return tf.cast(a + b, dtype='f32')\n"
     )
-    packet = compile_hir_navigation_packet(
+    packet = compile_hir_blueprint(
         dimvar_source,
         anchor_dims={"M": 16, "N": 64, "UNUSED": 99},
     )
@@ -136,92 +147,11 @@ def test_compile_hir_navigation_packet_with_dimvars() -> None:
     assert packet.roofline.compute_flops == 2 * 16 * 64
     assert packet.roofline.min_gm_bytes == 3 * 16 * 64 * 4
     assert packet.roofline.ideal_roofline_us > 0.0
-    assert packet.candidate_ops
     assert packet.lowering_diagnostics
 
 
-def test_np1_tilelang_primfunc_ledger_telemetry() -> None:
-    """Verify all 10 NP1 ObjectivePhysicalLedger fields populate on TileLang PrimFuncs."""
-    import tilelang.ascend.language as T
-
-    @T.prim_func
-    def rich_vector_kernel(
-        X: T.Tensor((28, 64, 128), "float16"),
-        Idx: T.Tensor((28, 64), "int32"),
-        Meta: T.Tensor((64, 1), "float32"),
-        Flag: T.Tensor((1,), "int32"),
-        TmpGM: T.Tensor((16, 64), "float32"),
-        Out: T.Tensor((28, 64, 128), "float16"),
-    ):
-        with T.Kernel(28) as bx:
-            ub = T.alloc_shared((4, 64), "float32")
-            acc = T.alloc_shared((4, 64), "float32")
-            T.copy(X[bx, 0:4, 0:64], ub)
-            T.copy(ub, TmpGM[0:4, 0:64])
-            T.copy(TmpGM[0:4, 0:64], ub)
-            for _it in T.serial(4):
-                with T.SimdVF():
-                    m32 = T.simd.pset(32, "PAT_ALL")
-                    v_acc = T.simd.vld(acc[0, 0], dist="NORM_B32")
-                    v_exp = T.simd.vexp(v_acc, mask=m32)
-                    T.simd.vsts(acc[0, 0], v_exp, mask=m32, dist="NORM_B32")
-                Flag[0] = Flag[0] + 1
-            acc[0, 0] = Meta[Idx[bx, 0], 0]
-            T.copy(acc, Out[bx, 0:4, 0:64])
-
-    rich_with_attr = rich_vector_kernel.with_attr(
-        "tir.cce_flags", ["--cce-disable-vf-stack-reserved-ubuf"]
-    )
-    res_vec = inspect_tilelang_primfunc(
-        rich_with_attr,
-        pass_configs={"tl.enable_auto_schedule": False},
-    )
-    led = res_vec.ledger
-    assert led.grid_blocks == 28
-    assert led.wave_occupancy == round(28 / 56.0, 4)
-    assert led.gm_roundtrip_bytes == 16 * 64 * 4 + 1 * 4
-    assert led.dominant_contig_bytes == 128 * 2
-    assert led.effective_cube_m == 0
-    assert led.has_indirect_gather is True
-    assert led.has_lowbit_quant is False
-    assert led.has_online_rescale_loop is True
-    assert led.in_loop_ub_reload_stores == 1
-    assert led.uses_unreserved_ubuf is True
-
-    @T.prim_func
-    def quant_cube_kernel(
-        A: T.Tensor((64, 128), "int8"),
-        B: T.Tensor((128, 64), "int8"),
-        C: T.Tensor((64, 64), "int32"),
-    ):
-        with T.MixedKernel(28, sids=2) as (_bx, _sid):
-            a_l1 = T.alloc_l1((64, 128), "int8")
-            b_l1 = T.alloc_l1((128, 64), "int8")
-            c_l0c = T.alloc_l0c((64, 64), "int32")
-            T.copy(A[0:64, 0:128], a_l1)
-            T.copy(B[0:128, 0:64], b_l1)
-            T.gemm(a_l1, b_l1, c_l0c, clear_accum=True)
-            T.copy(c_l0c, C[0:64, 0:64])
-
-    res_cube = inspect_tilelang_primfunc(
-        quant_cube_kernel,
-        pass_configs={"tl.enable_auto_schedule": False},
-        unreserved_ubuf=True,
-    )
-    c_led = res_cube.ledger
-    assert c_led.grid_blocks == 28
-    assert c_led.wave_occupancy == 1.0
-    assert c_led.effective_cube_m == 64
-    assert c_led.has_lowbit_quant is True
-    assert c_led.dominant_contig_bytes == 64 * 4
-    assert c_led.uses_unreserved_ubuf is True
-
-    roundtrip = ObjectivePhysicalLedger.from_dict(json.loads(c_led.to_json()))
-    assert roundtrip == c_led
-
-
 def test_np1_tir_envelope_ledger_telemetry_and_roundtrip(tmp_path: pathlib.Path) -> None:
-    """Verify all new ObjectivePhysicalLedger fields populate on TileFoundry TIR and roundtrip."""
+    """Verify ObjectivePhysicalLedger fields populate on canonical TIR and roundtrip."""
     source = (
         "from __future__ import annotations\n"
         "from tilefoundry.dsl import *\n"
@@ -260,9 +190,9 @@ def test_np1_tir_envelope_ledger_telemetry_and_roundtrip(tmp_path: pathlib.Path)
         "                    cr = tf.schedule((c_ub, tf.empty(Tensor[(32, 32), 'f32', 'rmem'])), "
         "op=T.ascend_ub_to_reg())\n"
         "                    er = tf.schedule((cr, tf.empty(Tensor[(32, 32), 'f32', 'rmem'])), "
-        "op=T.ascend_vexp())\n"
+        "op=T.ascend_vunary(kind='exp'))\n"
         "                    sr = tf.schedule((ar, er, tf.empty(Tensor[(32, 32), 'f32', 'rmem'])), "
-        "op=T.ascend_vadd())\n"
+        "op=T.ascend_vbinary(kind='add'))\n"
         "                    acc = tf.schedule((sr, tf.empty(Tensor[(32, 32), 'f32', 'smem'])), "
         "op=T.ascend_reg_to_ub())\n"
         "            mid_w = tf.schedule((acc, mid_gm), op=T.ascend_ub_to_gm())\n"
@@ -303,13 +233,13 @@ def test_np1_tir_envelope_ledger_telemetry_and_roundtrip(tmp_path: pathlib.Path)
     assert ObjectivePhysicalLedger.from_dict(default_led.to_dict()) == default_led
 
 
-def test_hir_tir_bridge_fallback_provenance_and_backward_compat() -> None:
-    """Verify D=1000 fallback sets shape_exact_match=False and preserves D=64 resolved dims."""
+def test_hir_blueprint_fallback_provenance_and_delta_gating() -> None:
+    """Verify D=1000 fallback sets shape_exact_match=False and suppresses raw byte deltas."""
     authored_src = (AR_DIR / "model.py").read_text(encoding="utf-8")
     scheduled_src = (AR_DIR / "scheduled.py").read_text(encoding="utf-8")
 
     req_dims = {"N": 8, "B": 1, "S": 4, "D": 1000}
-    pkt = compile_hir_navigation_packet(
+    pkt = compile_hir_blueprint(
         authored_src,
         scheduled_hir_source=scheduled_src,
         anchor_dims=req_dims,
@@ -318,131 +248,16 @@ def test_hir_tir_bridge_fallback_provenance_and_backward_compat() -> None:
     assert pkt.requested_anchor_dims == req_dims
     assert pkt.resolved_hir_dims == {"N": 4, "B": 1, "S": 4, "D": 64}
     assert pkt.fallback_reason is not None and "ValueError" in pkt.fallback_reason
-    assert pkt.roofline.fallback_reason == pkt.fallback_reason
-    assert pkt.tir_script is not None
-    assert pkt.tir_ledger is not None
+    assert pkt.reference_ledger is not None
 
-    sched_only_pkt = compile_hir_navigation_packet(
-        scheduled_src,
-        scheduled_hir_source=scheduled_src,
-        anchor_dims=req_dims,
-    )
-    assert sched_only_pkt.shape_exact_match is False
-    assert sched_only_pkt.resolved_hir_dims == {"N": 4, "B": 1, "S": 4, "D": 64}
-    assert sched_only_pkt.roofline.resolved_hir_dims == {"N": 4, "B": 1, "S": 4, "D": 64}
-    assert sched_only_pkt.roofline.shape_exact_match is False
-    assert sched_only_pkt.fallback_reason is not None
-    assert "ValueError" in sched_only_pkt.fallback_reason
-
-    rebuilt = HirTirNavigationPacket.from_dict(json.loads(json.dumps(pkt.to_dict())))
-    assert rebuilt == pkt
-
-    legacy_payload = pkt.to_dict()
-    for key in ("requested_anchor_dims", "resolved_hir_dims", "shape_exact_match", "fallback_reason"):
-        legacy_payload.pop(key, None)
-        legacy_payload["roofline"].pop(key, None)
-    legacy_rebuilt = HirTirNavigationPacket.from_dict(legacy_payload)
-    assert legacy_rebuilt.shape_exact_match is True
-    assert legacy_rebuilt.resolved_hir_dims == legacy_rebuilt.roofline.anchor_dims
-
-
-def test_adaptive_small_shape_scheduled_hir_resolution() -> None:
-    """Verify small decode shapes (S=1, S_kv=4/32, N_q=16) resolve cleanly without fallback."""
-    mla_model = (MLA_DIR / "model.py").read_text(encoding="utf-8")
-    mla_sched = (MLA_DIR / "scheduled.py").read_text(encoding="utf-8")
-    ar_model = (AR_DIR / "model.py").read_text(encoding="utf-8")
-    ar_sched = (AR_DIR / "scheduled.py").read_text(encoding="utf-8")
-
-    for dims in (
-        {"B": 1, "S": 1, "S_kv": 32, "N_q": 16, "N_kv": 1},
-        {"B": 1, "S": 1, "S_kv": 4, "N_q": 16, "N_kv": 1},
-    ):
-        pkt = compile_hir_navigation_packet(
-            mla_model,
-            scheduled_hir_source=mla_sched,
-            anchor_dims=dims,
-        )
-        assert pkt.shape_exact_match is True
-        assert pkt.fallback_reason is None
-        assert pkt.lowering_diagnostics == ()
-        assert pkt.tir_script is not None
-        assert pkt.tir_ledger is not None and pkt.tir_ledger.is_legal is True
-        for k, v in dims.items():
-            assert pkt.resolved_hir_dims[k] == v
-
-    ar_pkt = compile_hir_navigation_packet(
-        ar_model,
-        scheduled_hir_source=ar_sched,
-        anchor_dims={"N": 2, "B": 1, "S": 1, "D": 64},
-    )
-    assert ar_pkt.shape_exact_match is True
-    assert ar_pkt.fallback_reason is None
-    assert ar_pkt.tir_script is not None
-    assert ar_pkt.tir_ledger is not None and ar_pkt.tir_ledger.is_legal is True
-
-
-def test_pure_vector_and_transcendental_roofline_ownership() -> None:
-    """Verify pure-vector and special transcendental ops price against AIV peak, not Cube."""
-    target = AscendTarget("ascend.950pr")
-    dev = target.device
-    aiv_f32_rate = dev.unit_flops_per_second["aiv"][next(iter(dev.unit_flops_per_second["aiv"]))]
-    aic_f16_rate = dev.unit_flops_per_second["aic"][next(iter(dev.unit_flops_per_second["aic"]))]
-
-    ar_model = (AR_DIR / "model.py").read_text(encoding="utf-8")
-    ar_pkt = compile_hir_navigation_packet(
-        ar_model,
-        anchor_dims={"N": 4, "B": 1, "S": 4, "D": 64},
-        target=target,
-    )
-    rf = ar_pkt.roofline
-    assert rf.cube_flops == 0
-    assert rf.vector_flops == rf.compute_flops
-    assert rf.compute_floor_us == rf.vec_floor_us
-    expected_ar_us = (rf.vector_flops / float(aiv_f32_rate)) * 1e6
-    naive_cube_us = (rf.compute_flops / float(aic_f16_rate)) * 1e6
-    assert abs(rf.compute_floor_us - expected_ar_us) < 1e-9
-    assert rf.compute_floor_us > 10.0 * naive_cube_us
-
-    special_hir = (
-        "from __future__ import annotations\n"
-        "from tilefoundry.dsl import *\n"
-        "from tilefoundry_ascend import AscendTarget\n"
-        "TOPOS = (Topology('block', 1), Topology('aic', 1), "
-        "Topology('aiv', 2), Topology('lane', 64))\n"
-        "@module(entry='spec_fn', target=AscendTarget('ascend.950pr'), topologies=TOPOS)\n"
-        "class SpecMod:\n"
-        "    @func\n"
-        "    def spec_fn(x: Tensor[(16, 64), 'bf16']) -> Tensor[(16, 64), 'bf16']:\n"
-        "        xf = tf.cast(x, dtype='f32')\n"
-        "        e = tf.exp(xf)\n"
-        "        r = tf.rsqrt(e)\n"
-        "        return tf.cast(r, dtype='bf16')\n"
-    )
-    spec_pkt = compile_hir_navigation_packet(special_hir, target=target)
-    s_rf = spec_pkt.roofline
-    assert s_rf.cube_flops == 0
-    assert s_rf.special_ops == 2 * 16 * 64
-    assert s_rf.vector_flops > 2 * 16 * 64
-    assert s_rf.compute_floor_us == s_rf.vec_floor_us
-    expected_spec_us = (s_rf.vector_flops / float(aiv_f32_rate)) * 1e6
-    assert abs(s_rf.compute_floor_us - expected_spec_us) < 1e-9
-    naive_cast_only_us = (2 * 16 * 64 / float(aic_f16_rate)) * 1e6
-    assert s_rf.compute_floor_us > 50.0 * naive_cast_only_us
-
-    mla_model = (MLA_DIR / "model.py").read_text(encoding="utf-8")
-    mla_pkt = compile_hir_navigation_packet(
-        mla_model,
-        anchor_dims={"B": 1, "S": 16, "S_kv": 16, "N_q": 4, "N_kv": 1},
-        target=target,
-    )
-    m_rf = mla_pkt.roofline
-    assert m_rf.cube_flops > 0
-    assert m_rf.vector_flops > 0
-    assert m_rf.compute_floor_us == max(m_rf.cube_floor_us, m_rf.vec_floor_us)
+    delta_text = format_blueprint_delta_section(pkt, current_ledger=pkt.reference_ledger)
+    assert "[Structural Reference Only:" in delta_text
+    assert "scope_utilization[" in delta_text
+    assert "ub_peak_bytes:" not in delta_text
 
 
 def test_dtype_aware_cube_floor_precision_scaling() -> None:
-    """Verify dav-3510 Cube roofline scales FP8 (2x), MXFP4 (4x), and pure FP32 (1/16x) vs BF16."""
+    """Verify dav-3510 Cube Roofline scales FP8 (2x), MXFP4 (4x), and FP32 (1/16x) vs BF16."""
     target = AscendTarget("ascend.950pr")
 
     def _make_matmul_src(dtype_name: str, out_dtype: str) -> str:
@@ -460,10 +275,10 @@ def test_dtype_aware_cube_floor_precision_scaling() -> None:
             f"        return tf.matmul(a, b, out_dtype='{out_dtype}')\n"
         )
 
-    bf16_rf = compile_hir_navigation_packet(_make_matmul_src("bf16", "f32"), target=target).roofline
-    fp8_rf = compile_hir_navigation_packet(_make_matmul_src("fp8e4m3", "f32"), target=target).roofline
-    fp4_rf = compile_hir_navigation_packet(_make_matmul_src("f4e2m1", "f32"), target=target).roofline
-    fp32_rf = compile_hir_navigation_packet(_make_matmul_src("f32", "f32"), target=target).roofline
+    bf16_rf = compile_hir_blueprint(_make_matmul_src("bf16", "f32"), target=target).roofline
+    fp8_rf = compile_hir_blueprint(_make_matmul_src("fp8e4m3", "f32"), target=target).roofline
+    fp4_rf = compile_hir_blueprint(_make_matmul_src("f4e2m1", "f32"), target=target).roofline
+    fp32_rf = compile_hir_blueprint(_make_matmul_src("f32", "f32"), target=target).roofline
 
     assert bf16_rf.cube_floor_us > 0.0
     assert abs(fp8_rf.cube_floor_us * 2.0 - bf16_rf.cube_floor_us) < 1e-12

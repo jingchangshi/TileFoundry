@@ -1,10 +1,9 @@
 """Ascend compiler passes."""
 
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
-    HirCandidateOpEntry,
+    HirBlueprintPacket,
     HirRooflineSummary,
-    HirTirNavigationPacket,
-    compile_hir_navigation_packet,
+    compile_hir_blueprint,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
@@ -19,15 +18,14 @@ from tilefoundry_ascend.ascend.passes.pipeline import (
 )
 
 __all__ = [
-    "HirCandidateOpEntry",
+    "HirBlueprintPacket",
     "HirRooflineSummary",
-    "HirTirNavigationPacket",
     "ObjectivePhysicalLedger",
     "ResolveAscendPipelines",
     "ScopeWaterline",
     "ValidateAscendPipelines",
     "build_objective_physical_ledger",
     "build_scope_waterline",
-    "compile_hir_navigation_packet",
+    "compile_hir_blueprint",
     "compute_dominant_pipe",
 ]

@@ -5,67 +5,65 @@ flowchart TB
     classDef gate fill:#F5F3FF,stroke:#4C1D95,stroke-width:1.5px,color:#240E52
     classDef drop fill:#FEF2F2,stroke:#991B1B,stroke-width:1.5px,color:#450A0A
 
-    subgraph S1["阶段一：多算子发现、参考蓝图构建与基线锚定"]
-        S1_DISCOVER["算子注册发现与自动分层锚点\nCannbenchOpsRegistry 解析 proto/cases 与 950PR 元数据\n自动分层代表性锚点；Marathon 缺失时自举 kernels.py 并在启动前抢救未晋升优胜候选"]:::prep
-        S1_BLUEPRINT["SIL 静态画像与可选 HIR/TIR 导航蓝图\nOpAdvisoryExtractor 提取拓扑三轴、输入域包络与默认策略\n有 HIR/TIR 规范时由 HirTirBridge 生成屋脊线、合法原语与 Z3 流水蓝图"]:::prep
-        S1_BASE["经验湖回放校准与基线真机锚定\nExperienceLake 回放历史观测至三层混合代价模型\n通过 agent-gates 真机采集基线 Eq.3 得分、逐例耗时与瓶颈 MSProf"]:::prep
-        S1_DISCOVER -->|"分层锚点与初始算子模块"| S1_BLUEPRINT
-        S1_BLUEPRINT -->|"SIL 画像、策略与导航蓝图"| S1_BASE
+    subgraph S1["Stage 1: Operator Discovery, Physical Blueprinting & Baseline Anchoring"]
+        S1_DISCOVER["Operator Registry & Auto-Stratified Anchors\nCannbenchOpsRegistry parses proto/cases & 950PR metadata;\nMarathon auto-bootstraps seed kernels & salvages unpromoted beam winners"]:::prep
+        S1_BLUEPRINT["SIL Advisory & Optional Dialect-Neutral HIR Blueprint\nOpAdvisoryExtractor derives TopologyAxes, domain envelope & default policy;\ncompile_hir_blueprint emits Roofline, Z3 floor & reference ledger (zero virtual TIR)"]:::prep
+        S1_BASE["ExperienceLake Replay & NPU Baseline Anchoring\nReplay prior observations into 3-tier HybridAscendCostModel;\nmeasure baseline Eq.3 score, per-anchor latency & bottleneck MSProf via agent-gates"]:::prep
+        S1_DISCOVER -->|"Stratified anchors & seed module"| S1_BLUEPRINT
+        S1_BLUEPRINT -->|"SIL advisory & Roofline blueprint"| S1_BASE
     end
 
-    subgraph S2["阶段二：分档轮转选择、静动残差诊断与轨道升级"]
-        S2_PICK["按剩余优化空间与停滞衰减筛选目标分档\nExtremeCampaignRunner 按 headroom / (1 + 0.45 * stagnation) 动态轮转\n停滞超阈时切换至当前分档独立踏脚石分支 (Stepping-Stone) 作为父代"]:::diag
-        S2_DIAG["SIL 重算、三层代价诊断与轨道/自由度升级\nRegimePiecewiseSolver 基于活跃缓存不动点重算；HybridCostModel 预测瓶颈\n连续停滞且未达 η 目标时触发 CapabilityGate 升级 (DSL->InlineVF->AscendC)\n结合 ISAGapScanner 缺口报告按需松弛 7 维 ConstraintRelaxationMask"]:::diag
-        S2_PICK -->|"选定分档、父代源码与独立 Beam 上下文"| S2_DIAG
+    subgraph S2["Stage 2: Stagnation-Discounted Regime Selection & Escalation Diagnostics"]
+        S2_PICK["Regime Rotation & Parent Selection\nScore headroom / (1 + 0.45 * stagnation) across unfrozen regimes;\nswitch parent to per-regime Stepping-Stone branch upon stagnation"]:::diag
+        S2_DIAG["Fixed-Point SIL Re-Solve, Cost Prediction & Tier Escalation\nRegimePiecewiseSolver bidirectional live-buffer re-solve + HybridCostModel;\nevaluate_track_escalation (DSL->InlineVF->AscendC) + ISAGapScanner 7-facet unlock"]:::diag
+        S2_PICK -->|"Active regime, parent slice & beam state"| S2_DIAG
     end
 
-    subgraph S3["阶段三：无状态双通道生成与 AST 局部拼接"]
-        S3_RULE["规则引导定向利用通道（K 路）\nBayesianRuleTracker 按全局+三轴后验排序 33+ 条静态可判定规则\n注入蓝图差值、MSProf/BiSheng 残差与可选 TileSizePrescreen 建议"]:::synth
-        S3_FREE["无先验结构探索通道（1+缺口路）\n注入规则脱敏的负向排除机制，驱动全新循环拆分、缓存排布或 AscendC 壳层探索\nAgyCli 无状态空沙箱执行：强制 xhigh->high、SSE 双计时看门狗与工具循环熔断"]:::synth
-        S3_SPLICE["AST 局部符号拼接与双轨模板物化\npatch_regime_into_module 隔离替换目标分档并自动清理死辅助函数\nTrack-B 按 7 维掩码装配协同壳层或在 Top 自由态剥离壳层契约"]:::synth
-        S3_RULE -->|"规则定向补丁"| S3_SPLICE
-        S3_FREE -->|"结构探索补丁"| S3_SPLICE
+    subgraph S3["Stage 3: 3-Layer Progressive Constraint Synthesis & Stateless Generation"]
+        S3_RULE["Rule-Guided Exploitation Workers (K Parallel)\n3-axis Bayesian rule ranking + 3-layer progressive LLM constraints\n(L1 Redlines/Facets + L2 Grounded Dialect API + L3 Blueprint/Residual Delta)"]:::synth
+        S3_FREE["Rule-Blind Creative Exploration Workers (1 + Deficit)\nInject rule-blind negative structural exclusions & TileSizePrescreen hints;\nstateless Agy empty-sandbox execution with SSE dual-timer watchdog & xhigh cap"]:::synth
+        S3_SPLICE["Isolated AST Regime Splicing & Shell Materialization\npatch_regime_into_module isolates sibling regimes & prunes dead helpers;\nTrack-B materializes 7-facet coordination shells or strips locks at Top"]:::synth
+        S3_RULE -->|"Exploit patch"| S3_SPLICE
+        S3_FREE -->|"Explore patch"| S3_SPLICE
     end
 
-    subgraph S4["阶段四：五级递进式编译与真机验证漏斗（L0 -> L3）"]
-        S4_L0["L0 静态资源与 7 维红线预检（Stage A）\nTileLang 双快照降级审计生成 ObjectivePhysicalLedger\nAscendC 执行 SILVerifier 14 条红线 + C++ CFG 跨核 Flag 平衡校验"]:::gate
-        S4_PRE["可选代价模型预筛（L0 -> L1）\nHybridAscendCostModel 按预测延迟排序 Stage-A 通过候选\n仅保留 Top-K 进入耗时的离线设备编译"]:::gate
-        S4_L1["L1 离线 BiSheng 编译与微架构解析（Stage B）\n并发调用 bisheng (dav-3510) 并在有界次数内语法修复\n解析 --cce-res-usage 提取 spill / vloopv2 / vf_break / alias / dcci 摘要"]:::gate
-        S4_DROP["真机前快速淘汰无效候选\n下调未生效规则的贝叶斯后验\n通信超时 (llm_transport) 与代价预筛淘汰 (cost_prescreen) 豁免惩罚"]:::drop
-        S4_L2["L2 预热缓存批量代表用例真机测速（Stage C）\n预热 CPU 参考缓存与 TileLang 编译缓存，单次 agent-gates 批量评测\n计算 Eq.3-HAP 得分，校验长尾防退化 (>=0.97x) 与全局/局部增益并采集 MSProf"]:::gate
-        S4_L3["L3 全量契约回归与原子回滚门禁\n运行 20 例全量精度与动态形状缓存复用回归（含预热 L3）\n通过则原子写入主干并落盘 Checkpoint；失败则原子回滚至旧主干"]:::gate
+    subgraph S4["Stage 4: 5-Tier Progressive Verification Pyramid (L0 -> L3)"]
+        S4_L0["L0 Static Ledger & 7-Facet Redline Precheck (Stage A)\nTileLang Two-Snapshot lowering diff -> ObjectivePhysicalLedger;\nAscendC SILVerifier 14 redlines + C++ CFG CrossCore flag balance"]:::gate
+        S4_PRE["Optional Cost-Model Prescreen (L0 -> L1)\nRank Stage-A passers by HybridAscendCostModel pred_us;\nretain Top-K candidates before offline compilation"]:::gate
+        S4_L1["L1 Offline Compiler Build & Behavior Audit (Stage B)\nConcurrent device compile with bounded syntax repair;\nextract 7-class compiler behavior penalties (spill, vloopv2, vf_break, alias, dcci)"]:::gate
+        S4_DROP["Fast Pre-Hardware Candidate Rejection\nUpdate Bayesian failure posteriors;\nexempt llm_transport timeouts & cost_prescreen drops from penalty"]:::drop
+        S4_L2["L2 Prewarmed Batched Anchor NPU Evaluation (Stage C)\nPrewarm reference & TileLang caches; single batched agent-gates run;\nenforce >=0.97x tail guard + gain threshold & collect bottleneck MSProf"]:::gate
+        S4_L3["L3 Full 20-Case Contract & Atomic Rollback Gate\nRun full contract + dynamic-shape cache-reuse suite;\natomically promote winner & checkpoint, or roll back to prior incumbent"]:::gate
 
-        S4_L0 -->|"静态合法"| S4_PRE
-        S4_L0 -->|"违反硬件红线/溢出"| S4_DROP
-        S4_PRE -->|"Top-K 入选"| S4_L1
-        S4_PRE -->|"预筛淘汰 (豁免惩罚)"| S4_DROP
-        S4_L1 -->|"编译成功 + 微架构摘要"| S4_L2
-        S4_L1 -->|"修复后仍失败"| S4_DROP
-        S4_L2 -->|"通过长尾守护与最小增益门槛"| S4_L3
+        S4_L0 -->|"Static legal"| S4_PRE
+        S4_L0 -->|"Redline / overflow"| S4_DROP
+        S4_PRE -->|"Top-K"| S4_L1
+        S4_PRE -->|"Filtered (exempt)"| S4_DROP
+        S4_L1 -->|"Compiled + summary"| S4_L2
+        S4_L1 -->|"Compile failed"| S4_DROP
+        S4_L2 -->|"Passes tail & gain"| S4_L3
     end
 
-    subgraph S5["阶段五：分档演进池更新、在线校准与反事实飞轮"]
-        S5_BEAM["分档独立 Beam 更新与贝叶斯维护\n更新目标分档 TwoLaneBeamSearch 并剪枝过时兄弟踏脚石\n写入 ExperienceLake (SHA 寻址制品 + JSONL 观测) 在线校准混合代价模型\n执行规则剪枝、冷却复活 (decay_and_revive) 与局部规则跨算子晋升"]:::synth
-        S5_FLY["反事实单变量 / LOO 拆解与微探针准入飞轮\nFlywheelDistiller 拆解胜出改动的原子 AST/配置变体\n经真机微探针 (speedup>=1.08x 且 MTE2 不退化) 或候选 LOO 验证后沉淀入 KB"]:::synth
+    subgraph S5["Stage 5: Per-Regime Beam Update, Online Calibration & Flywheel Distillation"]
+        S5_BEAM["Per-Regime Beam, ExperienceLake & KB Maintenance\nUpdate regime TwoLaneBeamSearch & prune stale sibling stepping stones;\nappend SHA artifacts + observations to ExperienceLake; run decay_and_revive"]:::synth
+        S5_FLY["Counterfactual / LOO Ablation & Micro-Probe Flywheel\nDecompose atomic AST/knob deltas; admit generalizable static rules to KB\nafter NPU micro-probe (>=1.08x speedup & non-regressing MTE2 wait)"]:::synth
     end
 
-    subgraph S6["阶段六：L4 官方全集评测与动态长尾回补交付"]
-        S6_L4["L4 官方 CANNBench 全集评测\n评测全部真实算例得分与逐例加速比，识别代表锚点之外的长尾退化"]:::gate
-        S6_DONE["交付通过 L3/L4 门禁的生产级多档算子模块、校准经验湖与扩展规则库"]:::prep
-        S6_L4 -->|"全集无长尾退化且达标"| S6_DONE
+    subgraph S6["Stage 6: L4 Official Full-Suite Evaluation & Dynamic Tail Catch-Up"]
+        S6_L4["L4 Official CANNBench Full-Suite Benchmark\nEvaluate all suite cases to detect non-anchor tail regressions"]:::gate
+        S6_DONE["Deliver Verified Multi-Regime Kernel Module, Calibrated Lake & Distilled KB"]:::prep
+        S6_L4 -->|"All cases meet contract"| S6_DONE
     end
 
-    %% 阶段间前向数据流
-    S1_BASE -->|"基线得分、锚点与校准模型"| S2_PICK
-    S2_DIAG -->|"瓶颈残差与命中规则上下文"| S3_RULE
-    S2_DIAG -->|"负向排除机制与轨道/掩码约束"| S3_FREE
-    S3_SPLICE -->|"完整双轨候选模块"| S4_L0
-    S4_L3 -->|"晋升主干或原子回滚"| S5_BEAM
-    S4_L2 -->|"分档实测得分、结构指纹与 MSProf/BiSheng 残差"| S5_BEAM
-    S5_BEAM -->|"达到目标得分或耗尽轮次/墙钟预算"| S6_L4
-    S5_BEAM -->|"主干相对基线显著增益 (>=min_flywheel_gain)"| S5_FLY
+    S1_BASE -->|"Baseline score, anchors & calibrated model"| S2_PICK
+    S2_DIAG -->|"Ranked rules & 3-layer constraints"| S3_RULE
+    S2_DIAG -->|"Negative exclusions & tier/facet locks"| S3_FREE
+    S3_SPLICE -->|"Candidate module"| S4_L0
+    S4_L3 -->|"Promote or atomic rollback"| S5_BEAM
+    S4_L2 -->|"Eq.3-HAP, signature & MSProf/compiler residual"| S5_BEAM
+    S5_BEAM -->|"Target reached or budget exhausted"| S6_L4
+    S5_BEAM -->|"Significant gain (>=min_flywheel_gain)"| S5_FLY
 
-    %% 三条外缘闭环反馈轨道
-    S5_BEAM -.->|"进入下一轮分档优化"| S2_PICK
-    S6_L4 -.->|"退化算例动态追加为锚点 (append_dynamic_anchor) 并触发补跑"| S2_PICK
-    S5_FLY -.->|"向规则库准入经实测证实的新因果规则"| S3_RULE
+    S5_BEAM -.->|"Next regime optimization round"| S2_PICK
+    S6_L4 -.->|"Promote regressed tail cases via append_dynamic_anchor"| S2_PICK
+    S5_FLY -.->|"Admit verified causal rule into KB"| S3_RULE

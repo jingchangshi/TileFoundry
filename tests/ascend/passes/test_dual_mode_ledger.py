@@ -6,14 +6,11 @@ import pathlib
 from tilefoundry.analysis import analyze, check_program
 from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.ir.core import Constant, Var
-from tilefoundry.ir.hir.pipeline import PipelineSpec
 from tilefoundry.ir.tir.stmts import For, Sequential
 from tilefoundry.ir.types import TensorType
 from tilefoundry.ir.visitor import StmtVisitor, walk_prim_function
 from tilefoundry.schedule.finalize import finalize
 from tilefoundry.vendor.tilelang_z3 import (
-    Buffer,
-    Capacity,
     Problem,
     Resource,
     Task,
@@ -119,7 +116,7 @@ class M:
                 with T.SimdVF():
                     ar = tf.schedule((a_ub, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_ub_to_reg())
                     br = tf.schedule((b_ub, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_ub_to_reg())
-                    cr = tf.schedule((ar, br, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_vadd())
+                    cr = tf.schedule((ar, br, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_vbinary(kind="add"))
                     c_ub = tf.schedule((cr, tf.empty(Tensor[(64,), "f32", "smem"])), op=T.ascend_reg_to_ub())
                 c_row = tf.schedule((c_ub, tf.empty(Tensor[(64,), "f32", "gmem"])), op=T.ascend_ub_to_gm())
                 c = tf.insert_slice(c, tf.reshape(c_row, new_shape=(1, 64)), (k, 0))
@@ -149,7 +146,7 @@ class M:
 
 def test_mode_b_two_snapshot_ir_diff_without_bisheng() -> None:
     """Verify Two-Snapshot IR Diff captures TileLang lowering passes and buffer bloat."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
     @T.prim_func
     def sample_gemm(
@@ -185,7 +182,7 @@ def test_mode_b_two_snapshot_ir_diff_without_bisheng() -> None:
 
 def test_mode_b_detects_dynamic_while_mte2_queue_and_padding() -> None:
     """Verify Mode B detects dynamic While loops, MTE2 > 16 queue depth, and padding."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
     @T.prim_func
     def dynamic_fragmented(
@@ -216,7 +213,7 @@ def test_mode_b_detects_dynamic_while_mte2_queue_and_padding() -> None:
 
 def test_mode_b_detects_ub_overflow_in_two_snapshot_diff() -> None:
     """Verify Two-Snapshot IR Diff catches UB capacity overflow before bisheng."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
     @T.prim_func
     def huge_ub_kernel(
@@ -324,9 +321,9 @@ class M:
 
 def test_fp1_auto_detect_dual_aiv_and_sid_branch_split() -> None:
     """Verify MixedKernel and dual_copy auto-detect 1C2V split and halve symmetric AIV work."""
-    import tilelang.ascend.language as T
-    from tilelang import tvm
-    from tvm import tirx
+    import tilelang.ascend.language as T  # noqa: PLC0415
+    from tilelang import tvm  # noqa: PLC0415
+    from tvm import tirx  # noqa: PLC0415
 
     @T.prim_func
     def single_aiv_kernel(X: T.Tensor((128, 128), "float32"), Y: T.Tensor((128, 128), "float32")):
@@ -396,9 +393,9 @@ def test_fp1_auto_detect_dual_aiv_and_sid_branch_split() -> None:
 
 def test_fp1_pipelined_mode_a_steady_state_ii_and_degraded_buffers() -> None:
     """Verify Mode A Z3 II extraction on static T.Pipelined MixedKernel and dynamic fallback."""
-    import tilelang.ascend.language as T
-    from tilelang.utils.language import DataType as TLDataType
-    from tvm import tirx
+    import tilelang.ascend.language as T  # noqa: PLC0415
+    from tilelang.utils.language import DataType as TLDataType  # noqa: PLC0415
+    from tvm import tirx  # noqa: PLC0415
 
     @T.prim_func
     def mixed_pipelined_gemm(
@@ -514,8 +511,11 @@ def test_fp1_physical_ledger_from_dict_roundtrip() -> None:
 
 def test_symbolic_grid_var_bindings_and_r13_guard(tmp_path: pathlib.Path) -> None:
     """Verify symbolic grid resolution via var_bindings and R13 guard on unbound grids."""
-    import importlib.util
-    from tilefoundry_ascend.agent.kb import build_predicate_context, load_seed_rules
+    import importlib.util  # noqa: PLC0415
+    from tilefoundry_ascend.agent.kb import (  # noqa: PLC0415
+        build_predicate_context,
+        load_seed_rules,
+    )
 
     src = """
 import tilelang.ascend.language as T
@@ -580,7 +580,7 @@ def make_dyn_q_head():
 
 def test_tilelang_burst_efficiency_and_pipe_cycles() -> None:
     """Verify 8 KiB GM->UB DMA incurs lower burst efficiency and higher cycles/byte than 32 KiB."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
     @T.prim_func
     def copy_8k(X: T.Tensor((16, 1024), "float32"), Y: T.Tensor((16, 1024), "float32")):
@@ -611,7 +611,7 @@ def test_tilelang_burst_efficiency_and_pipe_cycles() -> None:
 
 def test_tilelang_unlimit_memory_preserves_ub_enforcement() -> None:
     """Verify T.annotate_unlimit_memory('shared') records flag without disabling UB limit."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
     @T.prim_func
     def unlimit_fn(X: T.Tensor((16, 1024), "float16"), Y: T.Tensor((16, 1024), "float16")):
@@ -630,7 +630,7 @@ def test_tilelang_unlimit_memory_preserves_ub_enforcement() -> None:
 
 def test_tilelang_dynamic_offset_pipelining_vs_static_pingpong() -> None:
     """Verify T.Pipelined marks dynamic-offset pipelining whereas static ping-pong does not."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
     @T.prim_func
     def pipelined_fn(X: T.Tensor((16, 1024), "float16"), Y: T.Tensor((16, 1024), "float16")):
@@ -661,7 +661,7 @@ def test_tilelang_dynamic_offset_pipelining_vs_static_pingpong() -> None:
 
 def test_tilelang_coupled_reduce_sfu_vs_loop_fission() -> None:
     """Verify coupled reduce+SFU+wide-accum detection vs two-pass loop fission."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
     @T.prim_func
     def coupled_fn(
@@ -723,13 +723,12 @@ def test_tilelang_coupled_reduce_sfu_vs_loop_fission() -> None:
 def test_dav3510_calibrated_cycles_bank_conflicts_and_dynamic_pipelined_fallback(
     tmp_path: pathlib.Path,
 ) -> None:
-    """Verify dav-3510 Cube/Vector cycles, UB/L1 bank conflicts, general var_bindings, and analytical II."""
-    import importlib.util
-    import tilelang.ascend.language as T
-    from tilelang.utils.language import DataType as TLDataType
-    from tvm import tirx
+    """Verify dav-3510 Cube/Vector cycles, bank conflicts, var_bindings, and analytical II."""
+    import importlib.util  # noqa: PLC0415
+    import tilelang.ascend.language as T  # noqa: PLC0415
+    from tilelang.utils.language import DataType as TLDataType  # noqa: PLC0415
+    from tvm import tirx  # noqa: PLC0415
 
-    # 1. Calibrated Cube & Vector cycles + hazard penalty on small (<10 fractal blocks) tile
     @T.prim_func
     def gemm_bf16_small(
         A: T.Tensor((32, 64), "bfloat16"),
@@ -762,13 +761,10 @@ def test_dav3510_calibrated_cycles_bank_conflicts_and_dynamic_pipelined_fallback
 
     r_bf16 = inspect_tilelang_primfunc(gemm_bf16_small, pass_configs={"tl.enable_auto_schedule": False})
     r_fp8 = inspect_tilelang_primfunc(gemm_fp8_small, pass_configs={"tl.enable_auto_schedule": False})
-    # (32*32*64 / 4096 = 16) + 6 hazard = 22; (32*32*64 / 8192 = 8) + 6 hazard = 14
     assert r_bf16.ledger.pipe_cycles["AIC.PIPE_M"] == 22
     assert r_fp8.ledger.pipe_cycles["AIC.PIPE_M"] == 14
-    # 2 L1 buffers in same half-L1 -> non-zero l1_bank_conflict_risk
     assert 0.0 < r_bf16.ledger.l1_bank_conflict_risk <= 0.5
 
-    # Vector SFU 4x vs non-SFU 1x
     @T.prim_func
     def vec_sfu_kernel(X: T.Tensor((4, 64), "float32")):
         with T.Kernel(1):
@@ -783,7 +779,6 @@ def test_dav3510_calibrated_cycles_bank_conflicts_and_dynamic_pipelined_fallback
     r_sfu = inspect_tilelang_primfunc(vec_sfu_kernel, pass_configs={"tl.enable_auto_schedule": False})
     assert r_sfu.ledger.pipe_cycles["AIV0.PIPE_V"] >= 4
 
-    # 2. UB 16-bank conflict (stride_bytes == 512) vs padded (stride_bytes == 544)
     @T.prim_func
     def ub_conflict_kernel(X: T.Tensor((16, 128), "float32"), Y: T.Tensor((16, 128), "float32")):
         with T.Kernel(1):
@@ -803,7 +798,6 @@ def test_dav3510_calibrated_cycles_bank_conflicts_and_dynamic_pipelined_fallback
     assert r_conf.ledger.ub_bank_conflict_risk == 1.0
     assert r_pad.ledger.ub_bank_conflict_risk == 0.0
 
-    # 3. Generalized _augment_var_bindings_from_buffers for arbitrary operator dims (M, N, K, H, C, G)
     sym_src = """
 import tilelang.ascend.language as T
 
@@ -833,7 +827,6 @@ def make_op():
     assert r_sym.ledger.grid_is_symbolic is False
     assert r_sym.ledger.grid_blocks == 4 * 4
 
-    # 4. Analytical pipelined-II fallback on guarded IfThenElse & dynamic inner loop inside static T.Pipelined
     @T.prim_func
     def guarded_pipelined_gemm(
         X: T.Tensor((128, 128), "bfloat16"),

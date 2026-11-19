@@ -629,7 +629,7 @@ def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
     tmp_path: Path,
 ) -> None:
     """Verify --resume restores stepping_stone_beam, passes roofline_eta, and exempts 503."""
-    from tilefoundry_ascend.agent.orchestrator import TwoLaneBeamSearch
+    from tilefoundry_ascend.agent.orchestrator import TwoLaneBeamSearch  # noqa: PLC0415
 
     anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 4.0),)
     regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {"bm": 64, "bn": 64, "bk": 64}),)
@@ -739,9 +739,11 @@ def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
 
 def test_np4_default_regime_specs_hir_dims_and_navigation_packets() -> None:
     """Verify default regime representative_hir_dims compile into valid HIR/TIR packets."""
-    from tilefoundry_ascend.agent.campaign import get_default_regime_specs
-    from tilefoundry_ascend.ascend.passes.hir_tir_bridge import compile_hir_navigation_packet
-    from tilefoundry_ascend.ascend.target import AscendTarget
+    from tilefoundry_ascend.agent.campaign import get_default_regime_specs  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (  # noqa: PLC0415
+        compile_hir_blueprint,
+    )
+    from tilefoundry_ascend.ascend.target import AscendTarget  # noqa: PLC0415
 
     repo_root = Path(__file__).resolve().parents[3]
     target = AscendTarget("ascend.950pr")
@@ -756,7 +758,7 @@ def test_np4_default_regime_specs_hir_dims_and_navigation_packets() -> None:
             assert spec.representative_hir_dims
             roundtrip = RegimeTargetSpec.from_dict(spec.to_dict())
             assert roundtrip.representative_hir_dims == spec.representative_hir_dims
-            pkt = compile_hir_navigation_packet(
+            pkt = compile_hir_blueprint(
                 model_src,
                 scheduled_hir_source=sched_src,
                 anchor_dims=spec.representative_hir_dims,
@@ -774,10 +776,12 @@ def test_np4_campaign_autodiscovery_nav_injection_router_off_and_17_rules(
     monkeypatch,
 ) -> None:
     """Verify sibling HIR/TIR autodiscovery, zero capability_gate calls, and R01-R17."""
-    import tilefoundry_ascend.agent.router.capability_gate as cap_gate
-    from tilefoundry_ascend.agent.kb import build_predicate_context
-    from tilefoundry_ascend.agent.orchestrator import compute_static_dynamic_residual
-    from tilefoundry_ascend.ascend.passes import build_scope_waterline
+    import tilefoundry_ascend.agent.router.capability_gate as cap_gate  # noqa: PLC0415
+    from tilefoundry_ascend.agent.kb import build_predicate_context  # noqa: PLC0415
+    from tilefoundry_ascend.agent.orchestrator import (  # noqa: PLC0415
+        compute_static_dynamic_residual,
+    )
+    from tilefoundry_ascend.ascend.passes import build_scope_waterline  # noqa: PLC0415
 
     router_calls: list[str] = []
 
@@ -869,7 +873,7 @@ def _build_regime_a(tile_m=2):
 
     assert runner._authored_hir_path == (tmp_path / "model.py").resolve()
     assert runner._scheduled_hir_path == (tmp_path / "scheduled.py").resolve()
-    assert "small_decode" in runner._regime_nav_packets
+    assert "small_decode" in runner._regime_blueprints
 
     active_by_id = {rule.rule_id: rule for rule in runner._tracker.active_rules()}
     assert len(active_by_id) >= 33
@@ -1246,8 +1250,8 @@ def test_campaign_runner_cli_arg_parser() -> None:
 
 def test_scoped_multi_symbol_regime_slice_extract_and_patch(tmp_path: Path) -> None:
     """Verify multi-symbol extraction, patching, helper lifecycle, and guardrails."""
-    import pytest
-    from tilefoundry_ascend.agent.campaign import (
+    import pytest  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign import (  # noqa: PLC0415
         RegimeSpec,
         get_default_regime_specs,
         patch_regime_into_module,
@@ -1373,10 +1377,10 @@ def test_scoped_multi_symbol_regime_slice_extract_and_patch(tmp_path: Path) -> N
 
 def test_config_selector_pass_configs_and_kernel_cache_plumbing(monkeypatch) -> None:
     """Verify _select_*_config, PrimFunc.attrs, Stage A 256 KiB UB, and _KERNEL_CACHE."""
-    import tilelang
-    from tilefoundry_ascend.agent.campaign import resolve_regime_config
-    from tilefoundry_ascend.agent.orchestrator import run_stage_a_static
-    from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
+    import tilelang  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign import resolve_regime_config  # noqa: PLC0415
+    from tilefoundry_ascend.agent.orchestrator import run_stage_a_static  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS  # noqa: PLC0415
 
     sample_mod = '''
 import tilelang.ascend.language as T
@@ -1460,8 +1464,8 @@ def _build_ar_small_decode_func(d_dim=64, tl_dtype="float16", tile_m=1):
     assert st_attr.ledger.uses_unreserved_ubuf is True
     assert st_attr.ledger.waterlines["UB"].capacity_bytes == 262144
 
-    from examples.ascend950pr_ops.attention_residual import kernels as ar_kernels
-    from examples.ascend950pr_ops.mla import kernels as mla_kernels
+    from examples.ascend950pr_ops.attention_residual import kernels as ar_kernels  # noqa: PLC0415
+    from examples.ascend950pr_ops.mla import kernels as mla_kernels  # noqa: PLC0415
 
     compile_calls: list[tuple[object, object]] = []
 
@@ -1503,11 +1507,14 @@ def _build_ar_small_decode_func(d_dim=64, tl_dtype="float16", tile_m=1):
 
 def test_all_six_production_regimes_extract_resolve_and_pass_stage_a() -> None:
     """Verify all 6 DEFAULT_REGIME_SPECS extract, resolve, and pass Stage A cleanly."""
-    from examples.ascend950pr_ops.mla import kernels as mla_kernels
-    from tilefoundry_ascend.agent.campaign import get_default_regime_specs, resolve_regime_config
-    from tilefoundry_ascend.agent.orchestrator import run_stage_a_static
-    from tilefoundry_ascend.ascend.schedule import inspect_tilelang_primfunc
-    from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
+    from examples.ascend950pr_ops.mla import kernels as mla_kernels  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign import (  # noqa: PLC0415
+        get_default_regime_specs,
+        resolve_regime_config,
+    )
+    from tilefoundry_ascend.agent.orchestrator import run_stage_a_static  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.schedule import inspect_tilelang_primfunc  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS  # noqa: PLC0415
 
     repo_root = Path(__file__).resolve().parents[3]
     module_paths = {
@@ -1546,7 +1553,7 @@ def test_all_six_production_regimes_extract_resolve_and_pass_stage_a() -> None:
 
 def test_per_regime_beam_isolation_objective_ranking_and_checkpoint(tmp_path: Path) -> None:
     """Verify isolated per-regime beams, objective_score ranking, and beam_states roundtrip."""
-    from tilefoundry_ascend.agent.orchestrator import (
+    from tilefoundry_ascend.agent.orchestrator import (  # noqa: PLC0415
         BeamCandidate,
         TwoLaneBeamSearch,
         compute_static_dynamic_residual,
@@ -1699,7 +1706,7 @@ def test_per_regime_beam_isolation_objective_ranking_and_checkpoint(tmp_path: Pa
 
 def test_campaign_axis_pruning_and_cross_topology_isolation(tmp_path: Path) -> None:
     """Verify round-end 3-axis TopologyAxes pruning never blocks rules in unrelated topologies."""
-    from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
+    from tilefoundry_ascend.ascend.sil.schema import TopologyAxes  # noqa: PLC0415
     anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 2.0),)
     regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {"bm": 64, "bn": 64, "bk": 64}),)
     target_path = tmp_path / "kernels.py"
@@ -1763,8 +1770,8 @@ def test_campaign_axis_pruning_and_cross_topology_isolation(tmp_path: Path) -> N
 
 def test_resolve_regime_for_case_and_dynamic_l4_regression_routing(tmp_path: Path) -> None:
     """Verify lookup_case_dims, resolve_regime_for_case, and L4 routing to non-zero regime."""
-    import yaml
-    from tilefoundry_ascend.agent.campaign import (
+    import yaml  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign import (  # noqa: PLC0415
         get_default_regime_specs,
         lookup_case_dims,
         resolve_regime_for_case,
@@ -1912,8 +1919,8 @@ def test_resolve_regime_for_case_and_dynamic_l4_regression_routing(tmp_path: Pat
 
 def test_for_regime_and_msprof_collector_caching_wakes_r05_and_r11(tmp_path: Path) -> None:
     """Verify strict for_regime filtering and msprof caching feeding R05/R11 and prompts."""
-    from tilefoundry_ascend.agent.campaign import bottleneck_anchor_for_regime
-    from tilefoundry_ascend.ascend.passes import build_scope_waterline
+    from tilefoundry_ascend.agent.campaign import bottleneck_anchor_for_regime  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.passes import build_scope_waterline  # noqa: PLC0415
 
     anchors = (
         AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 2.0),
@@ -1955,8 +1962,10 @@ def test_for_regime_and_msprof_collector_caching_wakes_r05_and_r11(tmp_path: Pat
     def _l0_r05_r11(_src: str, _reg: RegimeTargetSpec) -> StageAResult:
         return StageAResult(passed=True, prim_func=None, ledger=r05_r11_ledger)
 
-    from tilefoundry_ascend.agent.kb import build_predicate_context
-    from tilefoundry_ascend.agent.orchestrator import compute_static_dynamic_residual
+    from tilefoundry_ascend.agent.kb import build_predicate_context  # noqa: PLC0415
+    from tilefoundry_ascend.agent.orchestrator import (  # noqa: PLC0415
+        compute_static_dynamic_residual,
+    )
 
     no_msprof_ctx = build_predicate_context(
         r05_r11_ledger,
@@ -2071,8 +2080,8 @@ def test_prewarm_surrogate_tilelang_cache_pure_cpu_without_harness_prepare(
     monkeypatch,
 ) -> None:
     """Verify prewarm compiles via cases.yaml without calling Harness.prepare."""
-    import yaml
-    from tilefoundry_ascend.agent.campaign import prewarm_surrogate_tilelang_cache
+    import yaml  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign import prewarm_surrogate_tilelang_cache  # noqa: PLC0415
 
     repo_root = Path(__file__).resolve().parents[3]
     cann_repo = _setup_mock_cann_repo(tmp_path)
@@ -2353,8 +2362,10 @@ def test_extract_regime_abi_context_covers_ar_and_mla_signatures() -> None:
 
 def test_is_transient_blocked_env_retries_dependency_flake_not_device_fail():
     """Verify DEPENDENCY_NOT_PASSED triggers retry while real device FAIL does not."""
-    import subprocess
-    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import _is_transient_blocked_env
+    import subprocess  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (  # noqa: PLC0415
+        _is_transient_blocked_env,
+    )
 
     proc_fail = subprocess.CompletedProcess(args=["agent-gates"], returncode=1, stdout="", stderr="")
     dep_flake = {
@@ -2382,20 +2393,22 @@ def test_is_transient_blocked_env_retries_dependency_flake_not_device_fail():
 
 def test_up3_domain_envelope_prompt_and_host_dispatch_cache(tmp_path: Path, monkeypatch) -> None:
     """Verify InputDomainEnvelope prompts, builder_kwargs unpacking, and _DISPATCH_CACHE."""
-    import torch
-    from examples.ascend950pr_ops.attention_residual import kernels as ar_kernels
-    from examples.ascend950pr_ops.mla import kernels as mla_kernels
-    from tilefoundry_ascend.agent import (
+    import torch  # noqa: PLC0415
+    from examples.ascend950pr_ops.attention_residual import kernels as ar_kernels  # noqa: PLC0415
+    from examples.ascend950pr_ops.mla import kernels as mla_kernels  # noqa: PLC0415
+    from tilefoundry_ascend.agent import (  # noqa: PLC0415
         BayesianRuleTracker,
         CandidateSurrogateResult,
         PerfTargetCampaignRunner,
     )
-    from tilefoundry_ascend.agent.campaign import (
+    from tilefoundry_ascend.agent.campaign import (  # noqa: PLC0415
         DEFAULT_REGIME_SPECS,
         get_input_domain_envelope,
         resolve_regime_config,
     )
-    from tilefoundry_ascend.agent.campaign.campaign_runner import _FORBIDDEN_SLICE_SYMBOLS
+    from tilefoundry_ascend.agent.campaign.campaign_runner import (  # noqa: PLC0415
+        _FORBIDDEN_SLICE_SYMBOLS,
+    )
 
     ar_env = get_input_domain_envelope("attention_residual")
     mla_env = get_input_domain_envelope("mla")
@@ -2411,7 +2424,7 @@ def test_up3_domain_envelope_prompt_and_host_dispatch_cache(tmp_path: Path, monk
         "    return (int(tile_m), bool(omit_max_shift))\n"
     )
     spec = DEFAULT_REGIME_SPECS["attention_residual"][0]
-    from dataclasses import replace
+    from dataclasses import replace  # noqa: PLC0415
 
     demo_spec = replace(
         spec,
@@ -2524,12 +2537,12 @@ def test_wp_final1_pruned_inline_regimes_partial_override_and_mla_combine_gate(
     monkeypatch,
 ) -> None:
     """Verify inline pruned kernels, partial override + orphan GC, cache, and combine gate."""
-    import pytest
-    import torch
-    from examples.ascend950pr_ops.mla import kernels as mla_kernels
-    from tilefoundry_ascend.agent.campaign import campaign_runner as cr_mod
-    from tilefoundry_ascend.agent.campaign import resolve_regime_config
-    from tilefoundry_ascend.agent.orchestrator import run_stage_a_static
+    import pytest  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+    from examples.ascend950pr_ops.mla import kernels as mla_kernels  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign import campaign_runner as cr_mod  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign import resolve_regime_config  # noqa: PLC0415
+    from tilefoundry_ascend.agent.orchestrator import run_stage_a_static  # noqa: PLC0415
 
     root = Path(__file__).resolve().parents[3]
     ar_path = root / "examples" / "ascend950pr_ops" / "attention_residual" / "kernels.py"
@@ -2716,8 +2729,8 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
     monkeypatch,
 ) -> None:
     """Verify prewarm extra builder/combine kwargs forwarding and local regime L3 promotion."""
-    import yaml
-    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+    import yaml  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (  # noqa: PLC0415
         prewarm_surrogate_tilelang_cache,
     )
 
@@ -2954,15 +2967,18 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
 
 def test_wp_final3_persistent_wave_occupancy_weighted_burst_pipe_all_and_r21() -> None:
     """Verify persistent active wave occupancy, byte-weighted burst, PIPE_ALL, and R21."""
-    import tilelang.ascend.language as T
-    from tilefoundry_ascend.agent.campaign import build_anchor_var_bindings
-    from tilefoundry_ascend.agent.kb import build_predicate_context, load_seed_rules
-    from tilefoundry_ascend.agent.orchestrator import (
+    import tilelang.ascend.language as T  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign import build_anchor_var_bindings  # noqa: PLC0415
+    from tilefoundry_ascend.agent.kb import (  # noqa: PLC0415
+        build_predicate_context,
+        load_seed_rules,
+    )
+    from tilefoundry_ascend.agent.orchestrator import (  # noqa: PLC0415
         compute_static_dynamic_residual,
         run_stage_a_static,
     )
-    from tilefoundry_ascend.ascend.passes import ObjectivePhysicalLedger
-    from tilefoundry_ascend.ascend.schedule import inspect_tilelang_primfunc
+    from tilefoundry_ascend.ascend.passes import ObjectivePhysicalLedger  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.schedule import inspect_tilelang_primfunc  # noqa: PLC0415
 
     rules = {r.rule_id: r for r in load_seed_rules()}
     assert len(rules) >= 33
@@ -3089,16 +3105,18 @@ def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
     tmp_path: Path,
 ) -> None:
     """Verify WP-FINAL-4 default-OFF prescreen, Cube norm, tags, lineage, and msprof sync."""
-    from types import SimpleNamespace
+    from types import SimpleNamespace  # noqa: PLC0415
 
-    from tests.ascend.agent.test_surrogate_batch_npu import _extract_msprof_metrics
-    from tilefoundry_ascend.agent.campaign.campaign_runner import build_arg_parser
-    from tilefoundry_ascend.agent.orchestrator.portfolio_runner import summarize_excluded_mechanisms
-    from tilefoundry_ascend.agent.orchestrator.residual_beam import (
+    from tests.ascend.agent.test_surrogate_batch_npu import _extract_msprof_metrics  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign.campaign_runner import build_arg_parser  # noqa: PLC0415
+    from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (  # noqa: PLC0415
+        summarize_excluded_mechanisms,
+    )
+    from tilefoundry_ascend.agent.orchestrator.residual_beam import (  # noqa: PLC0415
         TwoLaneBeamSearch,
         extract_structural_signature,
     )
-    from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
+    from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (  # noqa: PLC0415
         TileConfigCandidate,
         prescreen_live_ir_neighborhood,
     )
@@ -3210,7 +3228,7 @@ def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
     )
     cube_rank_1 = next(line for line in cube_summary.splitlines() if line.strip().startswith("1."))
     assert "OK" in cube_rank_1
-    import re
+    import re  # noqa: PLC0415
 
     m_tile = re.search(r"bm=(\d+),\s*bn=(\d+)", cube_rank_1)
     assert m_tile is not None
@@ -3283,8 +3301,8 @@ def test_l3_full_contract_via_agent_gates_timeout_and_target_module_env(
     monkeypatch,
 ) -> None:
     """Verify L3 AgentGates helper passes timeout_sec and candidate module env vars cleanly."""
-    import subprocess
-    from tilefoundry_ascend.agent.campaign import surrogate_cannbench
+    import subprocess  # noqa: PLC0415
+    from tilefoundry_ascend.agent.campaign import surrogate_cannbench  # noqa: PLC0415
 
     fake_env = tmp_path / "env.sh"
     fake_env.write_text("TILEFOUNDRY_NPU_CANNBENCH_REPO=/tmp/cb\n", encoding="utf-8")
@@ -3333,7 +3351,9 @@ def test_l3_full_contract_via_agent_gates_timeout_and_target_module_env(
 
 def test_run_l0_l1_round_filter_isolates_syntax_repair_timeout(tmp_path: Path) -> None:
     """Verify syntax_repair timeouts fail only the affected candidate without penalizing rules."""
-    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import run_l0_l1_round_filter
+    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (  # noqa: PLC0415
+        run_l0_l1_round_filter,
+    )
 
     class _RepairTimeoutBackend:
         def __init__(self) -> None:
@@ -3415,9 +3435,9 @@ def test_stepping_stone_splicing_causal_credit_and_live_flywheel_wiring(
     monkeypatch,
 ) -> None:
     """Verify stepping-stone parent splicing, causal PMU credit, and AgentGates probe wiring."""
-    import ast
-    from tilefoundry_ascend.agent.flywheel.ablation_distiller import MicroProbeSpec
-    from tilefoundry_ascend.agent.kb.schema import AscendCausalRule
+    import ast  # noqa: PLC0415
+    from tilefoundry_ascend.agent.flywheel.ablation_distiller import MicroProbeSpec  # noqa: PLC0415
+    from tilefoundry_ascend.agent.kb.schema import AscendCausalRule  # noqa: PLC0415
 
     multi_sym_module = """
 import tilelang.ascend.language as T

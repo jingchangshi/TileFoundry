@@ -10,7 +10,7 @@ import re
 from tilefoundry.ir.core import Call, Constant, Expr, Op, Var
 from tilefoundry.ir.core.kinds import UnaryKind
 from tilefoundry.ir.core.param_def import MemoryEffect, collect_param_defs
-from tilefoundry.ir.hir.pipeline import BufferSchedule, PipelineError, PipelineSpec
+from tilefoundry.ir.hir.pipeline import PipelineError
 from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.tir.memory import AllocTensor, Copy, Fill, PtrOf, TensorView
 from tilefoundry.ir.tir.prim_function import PrimFunction
@@ -37,27 +37,17 @@ from tilefoundry.vendor.tilelang_z3 import (
     Task,
     tf_adapter,
 )
-from tilefoundry_ascend.ascend.ir.execution import SIMDVF_KIND, SIMTVF_KIND
+from tilefoundry_ascend.ascend.ir.execution import SIMTVF_KIND
 from tilefoundry_ascend.ascend.ir.tir.instructions import (
-    AscendDualCopy,
     AscendDualCopyL0cToUb,
-    AscendDualCopyUbToL1,
     AscendGmToL1,
-    AscendGmToL1Nz,
     AscendGmToUb,
-    AscendGmToUbPad,
     AscendL0cToGm,
-    AscendL0cToGmAtomic,
     AscendL1ToL0A,
     AscendL1ToL0B,
     AscendMmad,
     AscendRegToUb,
-    AscendUbToGm,
-    AscendUbToGmAtomic,
     AscendUbToReg,
-    AscendVexp,
-    AscendVldDist,
-    AscendVstsDist,
     AscendVunary,
 )
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
@@ -236,7 +226,6 @@ def _collect_tilelang_expr_rw(
 
     def _visit_indices(indices) -> None:
         for idx in indices:
-            # Hotfix: Check for prohibited TileLang expressions
             if isinstance(idx, (tirx.And, tirx.Or, tirx.Not)):
                  raise ValueError("Cannot use and / or / not operator to Expr, hint: use tvm.tirx.all / tvm.tirx.any instead")
             sub_ev, sub_exp, sub_ul, sub_us = _collect_tilelang_expr_rw(idx, tirx=tirx)
@@ -3053,13 +3042,13 @@ def inspect_tilelang_primfunc(
     var_bindings: Mapping[str, int] | None = None,
 ) -> EnvelopeInspectionResult:
     """Inspect a TileLang PrimFunc using Two-Snapshot IR Diff without bisheng compile."""
-    import contextlib
-    import tilelang
-    from tilelang.backend.module import create_backend_context
-    from tilelang.engine.lower import lower_to_host_device_ir
-    from tilelang.utils.language import DataType as TLDataType
-    from tilelang import tvm
-    from tvm import tirx
+    import contextlib  # noqa: PLC0415
+    import tilelang  # noqa: PLC0415
+    from tilelang.backend.module import create_backend_context  # noqa: PLC0415
+    from tilelang.engine.lower import lower_to_host_device_ir  # noqa: PLC0415
+    from tilelang.utils.language import DataType as TLDataType  # noqa: PLC0415
+    from tilelang import tvm  # noqa: PLC0415
+    from tvm import tirx  # noqa: PLC0415
 
     resolved_target = target or AscendTarget("ascend.950pr")
     spaces = resolved_target.get_facts(AscendSpaceFacts)
@@ -3302,7 +3291,7 @@ def _infer_tir_space(op: Op | None, tensor_type: TensorType) -> str:
         return "L0A"
     if isinstance(op, AscendL1ToL0B):
         return "L0B"
-    if isinstance(op, (AscendL0cToGm, AscendL0cToGmAtomic, AscendDualCopyL0cToUb)):
+    if isinstance(op, (AscendL0cToGm, AscendDualCopyL0cToUb)):
         return "L0C"
     return "L1"
 
@@ -3399,9 +3388,7 @@ def _collect_tir_stmt_events(
             return
         if isinstance(node, Evaluate) and isinstance(node.callable, Op):
             op = node.callable
-            if isinstance(op, AscendVexp) or (
-                isinstance(op, AscendVunary) and op.kind in (UnaryKind.EXP, UnaryKind.EXP2)
-            ):
+            if isinstance(op, AscendVunary) and op.kind in (UnaryKind.EXP, UnaryKind.EXP2):
                 has_exp[0] = True
             if isinstance(op, Fill):
                 if node.args:
@@ -3409,7 +3396,7 @@ def _collect_tir_stmt_events(
                     if key is not None:
                         events.append((key, st, "write"))
                 return
-            if isinstance(op, (AscendUbToReg, AscendVldDist)) and len(node.args) >= 2:
+            if isinstance(op, AscendUbToReg) and len(node.args) >= 2:
                 src_key, src_st = _resolve_tir_buffer_key(node.args[0], env)
                 dst_key, dst_st = _resolve_tir_buffer_key(node.args[1], env)
                 if src_key is not None:
@@ -3419,7 +3406,7 @@ def _collect_tir_stmt_events(
                 if dst_key is not None:
                     events.append((dst_key, dst_st, "write"))
                 return
-            if isinstance(op, (AscendRegToUb, AscendVstsDist)) and len(node.args) >= 2:
+            if isinstance(op, AscendRegToUb) and len(node.args) >= 2:
                 src_key, src_st = _resolve_tir_buffer_key(node.args[0], env)
                 dst_key, dst_st = _resolve_tir_buffer_key(node.args[1], env)
                 if src_key is not None:
@@ -3728,14 +3715,16 @@ def inspect_tir_envelope(
                             pad_bytes[0] += (spaces.ub_align_bytes - rem) * repeat
             else:
                 mte2_run[0] = 0
-            if isinstance(op, (AscendGmToL1, AscendGmToL1Nz, AscendGmToUb, AscendGmToUbPad)):
+            if isinstance(op, (AscendGmToL1, AscendGmToUb)):
                 src_s = "GM"
-                dst_s = "L1" if isinstance(op, (AscendGmToL1, AscendGmToL1Nz)) else "UB"
+                dst_s = "L1" if isinstance(op, AscendGmToL1) else "UB"
                 if not spaces.is_dma_path_legal(src_s, dst_s):
                     illegal_dma[0] = True
 
     def _tir_op_to_resources(op: Op, arg_types: tuple[TensorType | None, ...]) -> tuple[tuple, ...]:
-        from tilefoundry_ascend.ascend.schedule.pipeline_solver import _op_resources
+        from tilefoundry_ascend.ascend.schedule.pipeline_solver import (  # noqa: PLC0415
+            _op_resources,
+        )
 
         return _op_resources(op, arg_types)
 
@@ -3766,7 +3755,6 @@ def inspect_tir_envelope(
     wave_occ = _compute_wave_occupancy(
         telemetry.grid_blocks, spaces, pipe_cycles, tir_aiv_split
     )
-    # Compute UB 16-bank and L1 half-bank conflict risks from recorded TileFoundry TIR tensors
     ub_risk_total = 0
     ub_risk_conflict = 0
     def _scan_tir_ub_bank(stmt: Stmt | None) -> None:

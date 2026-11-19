@@ -20,7 +20,6 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     extract_python_dsl,
 )
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
-    TILELANG_ASCEND_PRIMITIVE_MENU,
     PortfolioRoundReport,
     PortfolioRunner,
     build_syntax_repair_request,
@@ -31,10 +30,10 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     compute_static_dynamic_residual,
     extract_structural_signature,
 )
-from tilefoundry_ascend.agent.orchestrator.twin_bridge import format_hir_tir_navigation_section
+from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
-    HirTirNavigationPacket,
-    compile_hir_navigation_packet,
+    HirBlueprintPacket,
+    compile_hir_blueprint,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.target import AscendTarget
@@ -124,7 +123,7 @@ class EvolutionTrajectory:
     rounds: tuple[EvolutionRoundRecord, ...] = field(default_factory=tuple)
     active_rules_after: tuple[str, ...] = field(default_factory=tuple)
     feature_vector: dict[str, object] = field(default_factory=dict)
-    hir_navigation_summary: dict[str, object] = field(default_factory=dict)
+    hir_blueprint_summary: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         """Serialize complete evolution trajectory to a JSON-compatible dictionary."""
@@ -143,7 +142,7 @@ class EvolutionTrajectory:
             "best_dsl_source": self.best_dsl_source,
             "rounds": [r.to_dict() for r in self.rounds],
             "active_rules_after": list(self.active_rules_after),
-            "hir_navigation_summary": dict(self.hir_navigation_summary),
+            "hir_blueprint_summary": dict(self.hir_blueprint_summary),
         }
 
     def to_json(self) -> str:
@@ -166,16 +165,16 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
-def _compile_nav_packet_safe(
+def _compile_blueprint_safe(
     hir_source: str,
     *,
     scheduled_hir_source: str | None = None,
     anchor_dims: Mapping[str, int] | None = None,
     target: AscendTarget | None = None,
-) -> HirTirNavigationPacket | None:
-    """Compile authored HIR and optional scheduled HIR into a navigation packet."""
+) -> HirBlueprintPacket | None:
+    """Compile authored HIR and optional scheduled HIR into a dialect-neutral blueprint."""
     try:
-        return compile_hir_navigation_packet(
+        return compile_hir_blueprint(
             hir_source,
             scheduled_hir_source=scheduled_hir_source,
             anchor_dims=anchor_dims,
@@ -185,18 +184,17 @@ def _compile_nav_packet_safe(
         return None
 
 
-def _summarize_nav_packet(packet: HirTirNavigationPacket | None) -> dict[str, object]:
+def _summarize_blueprint(packet: HirBlueprintPacket | None) -> dict[str, object]:
     """Return a compact JSON-serializable summary of *packet* for trajectory logs."""
     if packet is None:
         return {}
     return {
         "entry_name": packet.entry_name,
         "roofline": packet.roofline.to_dict(),
-        "candidate_op_count": len(packet.candidate_ops),
-        "candidate_ops": [entry.to_dict() for entry in packet.candidate_ops],
-        "has_tir_blueprint": packet.tir_script is not None,
         "z3_pipeline_summary": dict(packet.z3_pipeline_summary),
-        "tir_ledger": packet.tir_ledger.to_dict() if packet.tir_ledger is not None else None,
+        "reference_ledger": (
+            packet.reference_ledger.to_dict() if packet.reference_ledger is not None else None
+        ),
         "lowering_diagnostics": list(packet.lowering_diagnostics),
     }
 
@@ -206,10 +204,10 @@ def build_hir_seed_request(
     shape_contract: str,
     *,
     factory_name: str | None = None,
-    nav_packet: HirTirNavigationPacket | None = None,
-    navigation_context: str = "",
+    blueprint: HirBlueprintPacket | None = None,
+    blueprint_context: str = "",
 ) -> GenerationRequest:
-    """Build initial Tier-0 TileLang synthesis request from mathematical HIR source."""
+    """Build initial TileLang synthesis request under 3-layer progressive constraints."""
     target_factory = factory_name or "make_kernel"
     sys_prompt = (
         "You are an Ascend 950PR TileLang compiler engineer. Translate the mathematical HIR "
@@ -218,19 +216,14 @@ def build_hir_seed_request(
         "Import 'import tilelang.ascend.language as T'. Do NOT include "
         "'from __future__ import annotations'. Output ONLY valid Python code."
     )
-    nav_text = (
-        format_hir_tir_navigation_section(nav_packet)
-        if nav_packet is not None
-        else navigation_context.strip()
-    )
-    nav_section = f"{nav_text}\n\n" if nav_text else ""
-    primitive_section = (
-        f"### TILELANG ASCEND PRIMITIVE REFERENCE\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"
+    constraint_text = build_progressive_llm_constraints(
+        escalation_tier="tilelang_dsl",
+        blueprint=blueprint,
+        extra_blueprint_context=blueprint_context,
     )
     user_prompt = (
         f"### SHAPE AND SIGNATURE CONTRACT\n{shape_contract.strip()}\n\n"
-        f"{nav_section}"
-        f"{primitive_section}"
+        f"{constraint_text}\n\n"
         f"### MATHEMATICAL HIR SOURCE\n```python\n{hir_source.strip()}\n```\n"
     )
     return GenerationRequest(
@@ -254,10 +247,10 @@ async def synthesize_initial_dsl(
     enable_track_router: bool = False,
     scheduled_hir_source: str | None = None,
     anchor_dims: Mapping[str, int] | None = None,
-    nav_packet: HirTirNavigationPacket | None = None,
+    blueprint: HirBlueprintPacket | None = None,
 ) -> tuple[str, FunnelEvaluation]:
     """Synthesize and funnel-validate an initial @T.prim_func seed from HIR source."""
-    active_packet = nav_packet or _compile_nav_packet_safe(
+    active_packet = blueprint or _compile_blueprint_safe(
         hir_source,
         scheduled_hir_source=scheduled_hir_source,
         anchor_dims=anchor_dims,
@@ -278,7 +271,7 @@ async def synthesize_initial_dsl(
         hir_source,
         shape_contract,
         factory_name=factory_name,
-        nav_packet=active_packet,
+        blueprint=active_packet,
     )
     raw = await backend.generate(req)
     dsl_source = extract_python_dsl(raw)
@@ -472,14 +465,13 @@ async def run_e2e_evolution(
     """Drive dual-loop causal + creative evolution from unscheduled HIR to converged DSL."""
     active_tracker = tracker or BayesianRuleTracker.from_seed_yaml()
     active_beam = beam or TwoLaneBeamSearch()
-    nav_packet = _compile_nav_packet_safe(
+    blueprint = _compile_blueprint_safe(
         hir_source,
         scheduled_hir_source=scheduled_hir_source,
         anchor_dims=anchor_dims,
         target=target,
     )
-    ideal_roofline_us = nav_packet.roofline.ideal_roofline_us if nav_packet is not None else 0.0
-    nav_context = format_hir_tir_navigation_section(nav_packet) if nav_packet is not None else ""
+    ideal_roofline_us = blueprint.roofline.ideal_roofline_us if blueprint is not None else 0.0
     active_funnel = _wrap_funnel_with_proxy(
         funnel,
         target,
@@ -507,7 +499,7 @@ async def run_e2e_evolution(
             enable_track_router=enable_track_router,
             scheduled_hir_source=scheduled_hir_source,
             anchor_dims=anchor_dims,
-            nav_packet=nav_packet,
+            blueprint=blueprint,
         )
 
     if not base_eval.passed or base_eval.stage_a is None or base_eval.stage_a.ledger is None:
@@ -608,9 +600,8 @@ async def run_e2e_evolution(
             round_idx=round_idx,
             factory_name=factory_name,
             factory_kwargs=factory_kw_dict,
-            navigation_context=nav_context,
             ideal_roofline_us=ideal_roofline_us,
-            nav_packet=nav_packet,
+            blueprint=blueprint,
         )
         round_rec, best_so_far_lat = _build_round_record(report, parent, best_so_far_lat)
         rounds.append(round_rec)
@@ -638,7 +629,7 @@ async def run_e2e_evolution(
         best_dsl_source=best_cand.dsl_source,
         rounds=tuple(rounds),
         active_rules_after=tuple(r.rule_id for r in active_tracker.active_rules()),
-        hir_navigation_summary=_summarize_nav_packet(nav_packet),
+        hir_blueprint_summary=_summarize_blueprint(blueprint),
     )
 
 

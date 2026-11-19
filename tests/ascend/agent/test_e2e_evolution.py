@@ -184,13 +184,15 @@ def test_e2e_evolution_offline_hir_to_converged_trajectories() -> None:
 
 def test_np3_hir_tir_navigation_router_off_and_scheduled_blueprint(monkeypatch) -> None:
     """Verify router-off HIR/TIR navigation contract and zero capability_gate calls."""
-    import tilefoundry_ascend.agent.router.capability_gate as cap_gate
-    from tilefoundry_ascend.agent.orchestrator import (
+    import tilefoundry_ascend.agent.router.capability_gate as cap_gate  # noqa: PLC0415
+    from tilefoundry_ascend.agent.orchestrator import (  # noqa: PLC0415
         TwoLaneBeamSearch,
         build_hir_seed_request,
     )
-    from tilefoundry_ascend.ascend.passes.hir_tir_bridge import compile_hir_navigation_packet
-    from tilefoundry_ascend.ascend.target import AscendTarget
+    from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (  # noqa: PLC0415
+        compile_hir_blueprint,
+    )
+    from tilefoundry_ascend.ascend.target import AscendTarget  # noqa: PLC0415
 
     router_calls: list[str] = []
 
@@ -207,7 +209,7 @@ def test_np3_hir_tir_navigation_router_off_and_scheduled_blueprint(monkeypatch) 
 
     ar_hir = _AR_MODEL_PATH.read_text(encoding="utf-8")
     ar_sched = _AR_MODEL_PATH.with_name("scheduled.py").read_text(encoding="utf-8")
-    nav_packet = compile_hir_navigation_packet(
+    blueprint = compile_hir_blueprint(
         ar_hir,
         scheduled_hir_source=ar_sched,
         anchor_dims={"N": 4, "B": 1, "S": 4, "D": 64},
@@ -216,12 +218,12 @@ def test_np3_hir_tir_navigation_router_off_and_scheduled_blueprint(monkeypatch) 
     seed_req = build_hir_seed_request(
         ar_hir,
         "make_kernel()",
-        nav_packet=nav_packet,
+        blueprint=blueprint,
     )
     assert "### L0 RECOMMENDED EXECUTION TRACK" not in seed_req.user_prompt
-    assert "### HIR ANALYTICAL ROOFLINE & TRAFFIC FLOOR" in seed_req.user_prompt
-    assert "### LOWERED ASCEND TIR BLUEPRINT & Z3 SCHEDULE" in seed_req.user_prompt
-    assert "### TILELANG ASCEND PRIMITIVE REFERENCE" in seed_req.user_prompt
+    assert "### LAYER 1: HARDWARE REDLINES & 7-FACET SHELL CONTRACT" in seed_req.user_prompt
+    assert "### LAYER 3: PHYSICAL ROOFLINE & BLUEPRINT DELTA" in seed_req.user_prompt
+    assert "### LAYER 2: TARGET DIALECT API SURFACE" in seed_req.user_prompt
 
     backend = MockLLMBackend(
         responses={
@@ -253,14 +255,14 @@ def test_np3_hir_tir_navigation_router_off_and_scheduled_blueprint(monkeypatch) 
     assert backend.calls
     for req in backend.calls:
         assert "### L0 RECOMMENDED EXECUTION TRACK" not in req.user_prompt
-    assert "### HIR ANALYTICAL ROOFLINE" in backend.calls[0].user_prompt
-    assert "### LOWERED ASCEND TIR BLUEPRINT" in backend.calls[0].user_prompt
+    assert "### LAYER 3: PHYSICAL ROOFLINE & BLUEPRINT DELTA" in backend.calls[0].user_prompt
+    assert "### LAYER 2: TARGET DIALECT API SURFACE" in backend.calls[0].user_prompt
     assert traj.feature_vector == {}
     assert traj.track == "unconstrained"
     assert beam.exploit_beam[0].features is None
-    assert traj.hir_navigation_summary
-    assert traj.hir_navigation_summary["has_tir_blueprint"] is True
-    assert traj.hir_navigation_summary["roofline"]["ideal_roofline_us"] > 0.0
+    assert traj.hir_blueprint_summary
+    assert traj.hir_blueprint_summary["reference_ledger"] is not None
+    assert traj.hir_blueprint_summary["roofline"]["ideal_roofline_us"] > 0.0
     payload = json.loads(traj.to_json())
     assert payload["feature_vector"] == {}
-    assert payload["hir_navigation_summary"]["entry_name"] == "forward"
+    assert payload["hir_blueprint_summary"]["entry_name"] == "forward"

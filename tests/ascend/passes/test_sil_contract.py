@@ -73,7 +73,7 @@ def _sample_advisory(
         has_nan_inf_cases=has_nan_inf_cases,
         has_inplace_aliasing=False,
         precision_thresholds=precision_thresholds if precision_thresholds is not None else {},
-        hir_navigation_packet=None,
+        hir_blueprint=None,
     )
 
 
@@ -172,7 +172,6 @@ def test_verifier_memory_capacity_redlines() -> None:
     verifier = SILVerifier()
     advisory = _sample_advisory()
 
-    # L1 > 512KB
     rep_l1 = verifier.verify_policy(
         SchedulePolicy(
             regime_tag="aligned_main",
@@ -184,7 +183,6 @@ def test_verifier_memory_capacity_redlines() -> None:
     assert rep_l1.passed is False
     assert any("L1 footprint" in e for e in rep_l1.errors)
 
-    # Half-L1 > 256KB per ping/pong bank (3 stages sharing 2 half-banks: 2/3 * 450000 = 300000 > 262144)
     rep_half_l1 = verifier.verify_policy(
         SchedulePolicy(
             regime_tag="aligned_main",
@@ -198,7 +196,6 @@ def test_verifier_memory_capacity_redlines() -> None:
     assert rep_half_l1.passed is False
     assert any("Half-L1" in e for e in rep_half_l1.errors)
 
-    # L0C > 256KB (256 * 256 * 4 * 2 = 524288 > 262144)
     rep_l0c = verifier.verify_policy(
         SchedulePolicy(
             regime_tag="aligned_main",
@@ -211,7 +208,6 @@ def test_verifier_memory_capacity_redlines() -> None:
     assert rep_l0c.passed is False
     assert any("L0C" in e for e in rep_l0c.errors)
 
-    # UB > 248KB without unlock suggests ub_256kb_unlock=True
     rep_ub_locked = verifier.verify_policy(
         SchedulePolicy(
             regime_tag="aligned_main",
@@ -225,7 +221,6 @@ def test_verifier_memory_capacity_redlines() -> None:
     assert rep_ub_locked.passed is False
     assert rep_ub_locked.suggested_fixes.get("ub_256kb_unlock") is True
 
-    # UB <= 256KB passes with ub_256kb_unlock=True on simdvf
     rep_ub_unlocked = verifier.verify_policy(
         SchedulePolicy(
             regime_tag="aligned_main",
@@ -238,7 +233,6 @@ def test_verifier_memory_capacity_redlines() -> None:
     )
     assert rep_ub_unlocked.passed is True
 
-    # Reject ub_256kb_unlock=True on simtvf / hybrid and UB > 216KB
     for mode in ("simtvf", "hybrid"):
         rep_simt = verifier.verify_policy(
             SchedulePolicy(
@@ -259,7 +253,6 @@ def test_verifier_3510_paths_int4_wrap_and_unit_flag() -> None:
     verifier = SILVerifier()
     adv_tail = _sample_advisory(has_unaligned_tail=True)
 
-    # 3510 forbidden DMA paths
     for bad_path in ("L1->GM", "GM->L0A", "GM->L0B"):
         rep = verifier.verify_policy(
             SchedulePolicy(
@@ -272,7 +265,6 @@ def test_verifier_3510_paths_int4_wrap_and_unit_flag() -> None:
         assert rep.passed is False
         assert any(bad_path in e for e in rep.errors)
 
-    # Illegal direct Cube INT4
     for i4_dt in ("i4", "u4", "int4", "q4_0"):
         rep_i4 = verifier.verify_policy(
             SchedulePolicy(
@@ -287,7 +279,6 @@ def test_verifier_3510_paths_int4_wrap_and_unit_flag() -> None:
         assert rep_i4.suggested_fixes.get("w4_mode") == "aiv_unpack_f16"
         assert "mxa8w4_bitshift_x64" in rep_i4.suggested_fixes.get("w4_mode_alternatives", [])
 
-    # Valid W4 workaround passes
     rep_i4_ok = verifier.verify_policy(
         SchedulePolicy(
             regime_tag="aligned_main",
@@ -299,7 +290,6 @@ def test_verifier_3510_paths_int4_wrap_and_unit_flag() -> None:
     )
     assert rep_i4_ok.passed is True
 
-    # Silent uint16_t MMAD wrap (> 4095)
     rep_wrap = verifier.verify_policy(
         SchedulePolicy(
             regime_tag="aligned_main",
@@ -311,7 +301,6 @@ def test_verifier_3510_paths_int4_wrap_and_unit_flag() -> None:
     assert rep_wrap.passed is False
     assert any("4095" in e for e in rep_wrap.errors)
 
-    # unit_flag_2_3 deadlock hazard when l0c_buffers > 1 and has_unaligned_tail
     rep_uf = verifier.verify_policy(
         SchedulePolicy(
             regime_tag="aligned_main",
@@ -328,7 +317,6 @@ def test_verifier_3510_paths_int4_wrap_and_unit_flag() -> None:
 def test_verifier_bank_conflict_crosscore_simt_and_precision_guards() -> None:
     verifier = SILVerifier()
 
-    # Bank conflict suggestion
     adv = _sample_advisory()
     rep_bank = verifier.verify_policy(
         SchedulePolicy(
@@ -344,7 +332,6 @@ def test_verifier_bank_conflict_crosscore_simt_and_precision_guards() -> None:
     assert rep_bank.suggested_fixes["ub_bank_pad_datablocks"] == 1
     assert rep_bank.suggested_fixes["ub_rw_shift_datablocks"] == 8
 
-    # CrossCore depth > 15
     rep_cc = verifier.verify_policy(
         SchedulePolicy(
             regime_tag="aligned_main",
@@ -357,7 +344,6 @@ def test_verifier_bank_conflict_crosscore_simt_and_precision_guards() -> None:
     assert rep_cc.passed is False
     assert any("max_crosscore_depth=15" in e for e in rep_cc.errors)
 
-    # l0c2ub_split without empty subblock sync
     rep_split = verifier.verify_policy(
         SchedulePolicy(
             regime_tag="aligned_main",
@@ -370,7 +356,6 @@ def test_verifier_bank_conflict_crosscore_simt_and_precision_guards() -> None:
     assert rep_split.passed is False
     assert any("ensure_empty_subblock_sync=True" in e for e in rep_split.errors)
 
-    # SIMT threads > 1024 warning
     rep_simt_warn = verifier.verify_policy(
         SchedulePolicy(
             regime_tag="aligned_main",
@@ -383,7 +368,6 @@ def test_verifier_bank_conflict_crosscore_simt_and_precision_guards() -> None:
     assert rep_simt_warn.passed is True
     assert any("__launch_bounds__(512)" in w for w in rep_simt_warn.warnings)
 
-    # HF32 precision guard
     adv_strict_fp32 = _sample_advisory(precision_thresholds={"float32": 2.0**-13})
     rep_hf32 = verifier.verify_policy(
         SchedulePolicy(
@@ -396,7 +380,6 @@ def test_verifier_bank_conflict_crosscore_simt_and_precision_guards() -> None:
     assert rep_hf32.passed is False
     assert any("hf32_allowed=True" in e for e in rep_hf32.errors)
 
-    # fast_unshifted_exp with inf/nan cases
     adv_nan = _sample_advisory(has_nan_inf_cases=True)
     rep_exp = verifier.verify_policy(
         SchedulePolicy(
@@ -409,7 +392,6 @@ def test_verifier_bank_conflict_crosscore_simt_and_precision_guards() -> None:
     assert rep_exp.passed is False
     assert any("has_nan_inf_cases=True" in e for e in rep_exp.errors)
 
-    # bidirectional_cv_ring Prefill M < 82 warning
     adv_prefill = _sample_advisory(
         op_name="gqa",
         topology_axes=AXES_CV_RING,
@@ -457,12 +439,10 @@ def test_all_60_cannbench_operators_extract_synthesize_and_verify(tmp_path: Path
         assert report.passed is True, f"{op_name} failed SILVerifier: {report.errors}"
         assert report.errors == ()
 
-    # All compute engines, memory rings, and iteration regularities must be represented across the 60-op suite
     assert observed_engines == set(VALID_COMPUTE_ENGINES)
     assert observed_rings == set(VALID_MEMORY_RINGS)
     assert observed_regs == set(VALID_ITERATION_REGULARITIES)
 
-    # Domain-specific assertions on representative operators
     assert advisories["exp"].has_nan_inf_cases is True
     assert advisories["softmax"].has_nan_inf_cases is True
     assert advisories["kv_cache_append"].has_inplace_aliasing is True
@@ -478,7 +458,6 @@ def test_all_60_cannbench_operators_extract_synthesize_and_verify(tmp_path: Path
     for pol in q4_policy.policies.values():
         assert pol.w4_mode == "aiv_unpack_f16"
 
-    # End-to-end SchedulingEnvelope save/load check on a Level 5 operator
     kda_adv = advisories["kimi_delta_attention"]
     kda_pol = synthesize_default_policy(kda_adv)
     kda_rep = verify_policy_envelope(kda_pol, kda_adv)

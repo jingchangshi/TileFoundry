@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
 import re
 import sys
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import yaml
 
@@ -31,9 +31,6 @@ from tilefoundry_ascend.ascend.sil.op_analyzer import (
 )
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
-
-if TYPE_CHECKING:
-    from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import PrescreenAblationReport
 
 _CASE_NUM_RE = re.compile(r"_(\d+)$")
 DEFAULT_AIV_VEC_FLOPS_PER_CYCLE = 256
@@ -123,7 +120,9 @@ def _try_resolve_extractor(ops_root: str | Path | None) -> OpAdvisoryExtractor |
         if p.is_dir():
             return OpAdvisoryExtractor(p)
     try:
-        from tilefoundry_ascend.agent.campaign.anchor_specs import resolve_cannbench_tasks_root
+        from tilefoundry_ascend.agent.campaign.anchor_specs import (  # noqa: PLC0415
+            resolve_cannbench_tasks_root,
+        )
 
         resolved = resolve_cannbench_tasks_root()
         if resolved.is_dir():
@@ -214,7 +213,6 @@ def _build_static_case_features(
     vec_peak_flops = float(facts.num_aiv_cores) * float(DEFAULT_AIV_VEC_FLOPS_PER_CYCLE) * clock_hz
 
     safe_t_hw = max(0.05, float(t_hw_us))
-    # Static HBM bytes estimate: input tensors + minimal output allowance.
     static_gm = max(4096.0, input_bytes * 1.25) if input_bytes > 0.0 else max(
         4096.0, safe_t_hw * 1e-6 * hbm_bw
     )
@@ -398,7 +396,7 @@ def run_p2_prescreen_ablation(
     target: AscendTarget | None = None,
 ) -> PrescreenAblationReport:
     """Evaluate offline prescreen gain across multi-checkpoint operators using LOO fitting."""
-    from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
+    from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (  # noqa: PLC0415
         PrescreenAblationSample,
         evaluate_prescreen_ablation,
     )
@@ -424,7 +422,6 @@ def run_p2_prescreen_ablation(
 
         baseline_mean_score = sum(item[2] for item in ckpt_scores) / float(len(ckpt_scores))
         baseline_mean_lat = sum(item[3] for item in ckpt_scores) / float(len(ckpt_scores))
-        # Deterministic min-key tie-break mirrors what happens when pred_us ties across code versions.
         top_half_k = max(1, len(ckpt_scores) // 2)
         ranked_by_pred = sorted(ckpt_scores, key=lambda item: (item[1], item[0]))
         kept = ranked_by_pred[:top_half_k]
@@ -459,7 +456,9 @@ def run_cost_model_backtest(
     )
     unique_records = _select_best_checkpoint_per_operator(all_records)
     if not unique_records:
-        from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import evaluate_prescreen_ablation
+        from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (  # noqa: PLC0415
+            evaluate_prescreen_ablation,
+        )
 
         empty_eval = CostModelEvalReport(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         empty_ablation = evaluate_prescreen_ablation([])

@@ -148,15 +148,15 @@ def build(
                         )
                         scaled = tf.schedule(
                             (sr, scale_r, tf.empty(Tensor[(M, kv_tile), "f32", "rmem"])),
-                            op=T.ascend_vmul(),
+                            op=T.ascend_vbinary(kind="mul"),
                         )
                         masked = tf.schedule(
                             (scaled, mask_r, tf.empty(Tensor[(M, kv_tile), "f32", "rmem"])),
-                            op=T.ascend_vadd(),
+                            op=T.ascend_vbinary(kind="add"),
                         )
                         m_tile = tf.schedule(
                             (masked, tf.empty(Tensor[(M, 1), "f32", "rmem"])),
-                            op=T.ascend_vreduce_max(axes=(-1,), keepdim=True),
+                            op=T.ascend_vreduce(axes=(-1,), kind="max", keepdim=True),
                         )
                         m_prev = tf.schedule(
                             (m_ub, tf.empty(Tensor[(M, 1), "f32", "rmem"])),
@@ -168,35 +168,35 @@ def build(
                         )
                         m_next = tf.schedule(
                             (m_prev, m_tile, tf.empty(Tensor[(M, 1), "f32", "rmem"])),
-                            op=T.ascend_vmax(),
+                            op=T.ascend_vbinary(kind="max"),
                         )
                         alpha_diff = tf.schedule(
                             (m_prev, m_next, tf.empty(Tensor[(M, 1), "f32", "rmem"])),
-                            op=T.ascend_vsub(),
+                            op=T.ascend_vbinary(kind="sub"),
                         )
                         alpha_r = tf.schedule(
                             (alpha_diff, tf.empty(Tensor[(M, 1), "f32", "rmem"])),
-                            op=T.ascend_vexp(),
+                            op=T.ascend_vunary(kind="exp"),
                         )
                         s_shift = tf.schedule(
                             (masked, m_next, tf.empty(Tensor[(M, kv_tile), "f32", "rmem"])),
-                            op=T.ascend_vsub(),
+                            op=T.ascend_vbinary(kind="sub"),
                         )
                         p_f32 = tf.schedule(
                             (s_shift, tf.empty(Tensor[(M, kv_tile), "f32", "rmem"])),
-                            op=T.ascend_vexp(),
+                            op=T.ascend_vunary(kind="exp"),
                         )
                         row_sum = tf.schedule(
                             (p_f32, tf.empty(Tensor[(M, 1), "f32", "rmem"])),
-                            op=T.ascend_vreduce_sum(axes=(-1,), keepdim=True),
+                            op=T.ascend_vreduce(axes=(-1,), kind="sum", keepdim=True),
                         )
                         l_scaled = tf.schedule(
                             (l_prev, alpha_r, tf.empty(Tensor[(M, 1), "f32", "rmem"])),
-                            op=T.ascend_vmul(),
+                            op=T.ascend_vbinary(kind="mul"),
                         )
                         l_next = tf.schedule(
                             (l_scaled, row_sum, tf.empty(Tensor[(M, 1), "f32", "rmem"])),
-                            op=T.ascend_vadd(),
+                            op=T.ascend_vbinary(kind="add"),
                         )
                         p_cast = tf.schedule(
                             (p_f32, tf.empty(Tensor[(M, kv_tile), dtype, "rmem"])),
@@ -261,11 +261,11 @@ def build(
                         )
                         o_scaled = tf.schedule(
                             (o_prev, alpha_reg, tf.empty(Tensor[(M, D_nope), "f32", "rmem"])),
-                            op=T.ascend_vmul(),
+                            op=T.ascend_vbinary(kind="mul"),
                         )
                         o_next = tf.schedule(
                             (o_scaled, o_tile_reg, tf.empty(Tensor[(M, D_nope), "f32", "rmem"])),
-                            op=T.ascend_vadd(),
+                            op=T.ascend_vbinary(kind="add"),
                         )
                         o_acc_ub = tf.schedule(
                             (o_next, tf.empty(Tensor[(M, D_nope), "f32", "smem"])),
@@ -283,7 +283,7 @@ def build(
                     )
                     o_norm = tf.schedule(
                         (o_final_in, l_final, tf.empty(Tensor[(M, D_nope), "f32", "rmem"])),
-                        op=T.ascend_vdiv(),
+                        op=T.ascend_vbinary(kind="div"),
                     )
                     o_cast = tf.schedule(
                         (o_norm, tf.empty(Tensor[(M, D_nope), dtype, "rmem"])),

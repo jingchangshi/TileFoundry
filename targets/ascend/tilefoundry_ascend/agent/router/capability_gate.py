@@ -75,10 +75,7 @@ _AX_CV_PERSISTENT = TopologyAxes("coupled_1c2v", "persistent_onchip_state", "aff
 _AX_AIV_PERSISTENT = TopologyAxes("aiv_only", "persistent_onchip_state", "affine_simd")
 _AX_AIV_VM = TopologyAxes("aiv_only", "persistent_onchip_state", "dynamic_opcode_stream")
 
-# Canonical mapping from all 60 cann-bench snake_case operator names to
-# (topology_axes, default_track, default_backend_tier, op_profile).
 _CANNBENCH_OP_ROUTING: dict[str, tuple[TopologyAxes, str, str, dict[str, object]]] = {
-    # 1. AIV RegBase SIMD streaming
     "exp": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
     "swi_glu": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
     "apply_rotary_pos_emb": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
@@ -137,7 +134,6 @@ _CANNBENCH_OP_ROUTING: dict[str, tuple[TopologyAxes, str, str, dict[str, object]
     "fft_conv": (_AX_SIMD, "developer", "ascendc_template", {"cube_ratio": 0.0}),
     "cummin": (_AX_SIMD, "developer", "ascendc_template", {"cube_ratio": 0.0}),
     "attention_residual": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    # 2. AIV SIMT + Hybrid UB
     "gather": (
         _AX_SIMT,
         "manual_ssbuf",
@@ -228,7 +224,6 @@ _CANNBENCH_OP_ROUTING: dict[str, tuple[TopologyAxes, str, str, dict[str, object]
         "ascendc_template",
         {"cube_ratio": 0.0, "indirect": True, "static_bounds": False},
     ),
-    # 3. Dense & Quantized GEMM
     "conv_2d": (_AX_AIC_GEMM, "developer", "ascendc_template", {"cube_ratio": 2.0}),
     "conv_3d_backprop_filter": (
         _AX_AIC_GEMM,
@@ -254,7 +249,6 @@ _CANNBENCH_OP_ROUTING: dict[str, tuple[TopologyAxes, str, str, dict[str, object]
         "ascendc_template",
         {"cube_ratio": 1.5, "quant": "per_token_or_block", "handoff": True},
     ),
-    # 4. Grouped GEMM + Fused Epilogue
     "grouped_matmul": (
         _AX_CV_RAGGED,
         "manual_ssbuf",
@@ -272,7 +266,6 @@ _CANNBENCH_OP_ROUTING: dict[str, tuple[TopologyAxes, str, str, dict[str, object]
             "handoff": True,
         },
     ),
-    # 5. Heterogeneous CV Ring
     "mla": (
         _AX_CV_RING,
         "manual_ssbuf",
@@ -331,7 +324,6 @@ _CANNBENCH_OP_ROUTING: dict[str, tuple[TopologyAxes, str, str, dict[str, object]
         "ascendc_template",
         {"cube_ratio": 1.2, "recurrence": "associative_online_rescale", "handoff": True},
     ),
-    # 6. Persistent Chunk/Recurrent State
     "kimi_delta_attention": (
         _AX_CV_PERSISTENT,
         "manual_ssbuf",
@@ -368,7 +360,6 @@ _CANNBENCH_OP_ROUTING: dict[str, tuple[TopologyAxes, str, str, dict[str, object]
         "ascendc_template",
         {"cube_ratio": 0.0, "recurrence": "non_associative_scan"},
     ),
-    # 7. Striped Register-Resident VM
     "tensor_program_vm": (
         _AX_AIV_VM,
         "simt_vf",
@@ -578,9 +569,9 @@ def _resolve_quant_granularity(
 
 
 def _scan_tilelang_features(func) -> dict[str, object]:
-    """Scan a TVM/TileLang PrimFunc for static bounds, quant, indirect gather, recurrence, and sync."""
-    from tilelang.utils.language import DataType as TLDataType
-    from tvm import tirx
+    """Scan a PrimFunc for static bounds, quant, gather, recurrence, and sync."""
+    from tilelang.utils.language import DataType as TLDataType  # noqa: PLC0415
+    from tvm import tirx  # noqa: PLC0415
 
     static_bounds = [True]
     indirect_gather = [False]
@@ -646,7 +637,6 @@ def _scan_tilelang_features(func) -> dict[str, object]:
                 loaded_bufs.add(node.buffer)
             elif isinstance(node, tirx.BufferStore):
                 stored_bufs.add(node.buffer)
-                # Inspect RHS for structural non-trivial recurrence ops
                 rhs_ops = [False]
 
                 def _rhs_check(rnode) -> None:
@@ -665,7 +655,6 @@ def _scan_tilelang_features(func) -> dict[str, object]:
                 if "max" in op_name or "expdif" in op_name or "online" in op_name:
                     loop_has_max_or_online[0] = True
                 if ("gemm" in op_name or "mmad" in op_name) and len(node.args) >= 3:
-                    # T.gemm(A, B, C, ...): C is arg[2] (BufferLoad/Region)
                     c_arg = node.args[2]
                     if isinstance(c_arg, tirx.BufferLoad):
                         gemm_dst_bufs.add(c_arg.buffer)
@@ -679,7 +668,6 @@ def _scan_tilelang_features(func) -> dict[str, object]:
         elif is_while and (bool(stored_bufs) or bool(raw_bufs)):
             has_non_assoc_scan[0] = True
         elif raw_bufs and (loop_has_non_add_raw_op[0] or len(raw_bufs) >= 1):
-            # Exclude trivial single-iteration loops if extent == 1
             ext = getattr(loop_node, "extent", None)
             if not (hasattr(ext, "value") and isinstance(ext.value, int) and ext.value <= 1):
                 has_non_assoc_scan[0] = True
@@ -919,16 +907,16 @@ def _scan_tilefoundry_ir(fn_or_stmt) -> dict[str, object]:
             if in_loop:
                 has_softmax_in_loop[0] = True
 
-        if cls_name == "AscendVexp" or "vexp" in op_str or (
-            cls_name == "Unary" and str(getattr(op, "kind", "")).lower() == "exp"
+        if "vexp" in op_str or (
+            cls_name in ("Unary", "AscendVunary") and "exp" in str(getattr(op, "kind", "")).lower()
         ):
             has_vec[0] = True
             if in_loop:
                 has_exp_in_loop[0] = True
 
-        if cls_name in ("AscendVmax", "AscendVreduceMax", "AscendVmaxs") or (
-            cls_name == "Reduce" and str(getattr(op, "kind", "")).lower() == "max"
-        ) or "vmax" in op_str:
+        if "vmax" in op_str or (
+            cls_name in ("Reduce", "AscendVreduce", "Binary", "AscendVbinary") and "max" in str(getattr(op, "kind", "")).lower()
+        ):
             has_vec[0] = True
             if in_loop:
                 has_max_in_loop[0] = True
@@ -953,15 +941,6 @@ def _scan_tilefoundry_ir(fn_or_stmt) -> dict[str, object]:
             "ArgMax",
             "AscendUbToReg",
             "AscendRegToUb",
-            "AscendPset",
-            "AscendUpdateMask",
-            "AscendPand",
-            "AscendPor",
-            "AscendPxor",
-            "AscendPnot",
-            "AscendSortTopK",
-            "AscendBitUnpack",
-            "AscendMxQuant",
         ):
             has_vec[0] = True
 
@@ -1167,7 +1146,7 @@ def extract_structural_features(
         if isinstance(ir_obj, (PrimFunction, HirFunction, Stmt, LoopRegion, Expr)):
             info = _scan_tilefoundry_ir(ir_obj)
         else:
-            from tvm import IRModule, tirx
+            from tvm import IRModule, tirx  # noqa: PLC0415
 
             target_fn = None
             if isinstance(ir_obj, IRModule):
@@ -1481,7 +1460,6 @@ def route_from_op_spec(proto_or_advisory: Mapping[str, object]) -> RouteDecision
             recommended_backend_tier=backend_tier,
         )
 
-    # Heuristic fallback for unseen / custom operators directly via structural axes
     axes = (
         explicit_axes
         if explicit_axes is not None
@@ -1569,7 +1547,6 @@ def route_initial_by_input_contract(
             for k in ("semantic_contract", "formula", "description", "atomics", "op_kind")
         ).lower()
 
-        # 1. Sub-byte packed formats
         subbyte_hits = [dt for dt in dtypes if _is_subbyte_dtype(dt)]
         qmode = str(spec_map.get("quant_mode", source.get("quant_mode", ""))).strip().lower()
         if subbyte_hits:
@@ -1577,7 +1554,6 @@ def route_initial_by_input_contract(
         elif _is_subbyte_dtype(qmode):
             subbyte_reasons.append(f"input_contract: sub-byte quant_mode={qmode!r}")
 
-        # 2. In-place GM CAS atomics
         cas_flags = any(
             bool(src.get(k, False))
             for src in (spec_map, source)
@@ -1602,7 +1578,6 @@ def route_initial_by_input_contract(
         ):
             gm_cas_reasons.append("input_contract: in-place GM CAS atomic required")
 
-        # 3. Dynamic bytecode / opcode stream
         raw_axes = spec_map.get("topology_axes")
         axis_reg = ""
         if isinstance(raw_axes, Mapping):
@@ -1732,7 +1707,9 @@ def evaluate_track_escalation(
         )
 
     if tier == "ascendc_template":
-        from tilefoundry_ascend.ascend.templates.registry import relax_facets_for_bottleneck
+        from tilefoundry_ascend.ascend.templates.registry import (  # noqa: PLC0415
+            relax_facets_for_bottleneck,
+        )
 
         sf_map = (
             structural_features
@@ -1778,7 +1755,6 @@ def evaluate_track_escalation(
             trigger_reasons=(f"stagnation_rounds={stagnation_rounds}<2; keep iterating on {tier}",),
         )
 
-    # Extract compiler telemetry
     if compiler_summary is None:
         comp: dict[str, Any] = {}
     elif isinstance(compiler_summary, Mapping):
@@ -1797,7 +1773,6 @@ def evaluate_track_escalation(
             "dcache_dcci_flushes": getattr(compiler_summary, "dcache_dcci_flushes", 0),
         }
 
-    # Extract structural context
     if structural_features is None:
         sf: dict[str, Any] = {}
     elif isinstance(structural_features, StructuralFeatures):
@@ -1870,7 +1845,9 @@ def evaluate_track_escalation(
         reasons.append(f"ub_vector_distribution_bottleneck({dom or 'dist'})")
 
     if template_wall:
-        from tilefoundry_ascend.ascend.templates.registry import relax_facets_for_bottleneck
+        from tilefoundry_ascend.ascend.templates.registry import (  # noqa: PLC0415
+            relax_facets_for_bottleneck,
+        )
 
         relaxed_mask = relax_facets_for_bottleneck(
             ConstraintRelaxationMask.bottom(),

@@ -1,4 +1,4 @@
-"""HIR-to-TIR navigation packet compilation for Ascend targets."""
+"""Dialect-neutral HIR Roofline and Z3 blueprint compilation for Ascend targets."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from tilefoundry.analysis.check import program_dim_vars
 from tilefoundry.analysis.iteration_scope import ScopeBuilder
 from tilefoundry.analysis.visitor import AnalyzeContext
 from tilefoundry.cli.source import load_authored_ir
-from tilefoundry.inspection import as_script
 from tilefoundry.ir.core import Call, VerifyError, get_metadata
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.nn.conv2d import Conv2D
@@ -31,7 +30,6 @@ from tilefoundry.ir.types import DType, TensorType
 from tilefoundry.ir.types.substitute import dim_vars_by_name
 from tilefoundry.ir.types.utils import static_dim_value, tensor_types
 from tilefoundry.passes.transforms.convert_hir_to_tir import LoweringError
-from tilefoundry.schedule.candidates import candidates as report_candidates
 from tilefoundry.schedule.finalize import finalize
 from tilefoundry.visitor_registry.contexts import ValuationContext
 from tilefoundry.visitor_registry.valuation import ValuationVisitor
@@ -46,7 +44,7 @@ _SPECIAL_VECTOR_OP_EQUIV = 8
 
 @dataclass(frozen=True)
 class HirRooflineSummary:
-    """Analytical compute and HBM roofline summary derived from authored HIR."""
+    """Analytical compute and HBM Roofline summary derived from authored HIR."""
 
     anchor_dims: dict[str, int]
     compute_flops: int
@@ -129,7 +127,7 @@ class HirRooflineSummary:
         )
 
     def format_for_prompt(self) -> str:
-        """Format the roofline summary as compact prompt text."""
+        """Format the Roofline summary as compact prompt text."""
         display_dims = self.resolved_hir_dims or self.anchor_dims
         dims = ", ".join(f"{k}={v}" for k, v in sorted(display_dims.items())) or "default"
         mismatch = ""
@@ -149,47 +147,13 @@ class HirRooflineSummary:
 
 
 @dataclass(frozen=True)
-class HirCandidateOpEntry:
-    """Legal target instruction candidates for one authored HIR call site."""
-
-    hir_op_name: str
-    operand_shapes: tuple[str, ...]
-    legal_ascend_ops: tuple[str, ...]
-
-    def to_dict(self) -> dict[str, object]:
-        """Return a JSON-serializable dictionary representation."""
-        return {
-            "hir_op_name": self.hir_op_name,
-            "operand_shapes": list(self.operand_shapes),
-            "legal_ascend_ops": list(self.legal_ascend_ops),
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> HirCandidateOpEntry:
-        """Reconstruct a HirCandidateOpEntry from a serialized dictionary."""
-        return cls(
-            hir_op_name=str(payload["hir_op_name"]),
-            operand_shapes=tuple(str(item) for item in (payload.get("operand_shapes") or ())),
-            legal_ascend_ops=tuple(str(item) for item in (payload.get("legal_ascend_ops") or ())),
-        )
-
-    def format_for_prompt(self) -> str:
-        """Format this candidate op entry as one concise prompt line."""
-        shapes = ", ".join(self.operand_shapes)
-        ops = ", ".join(self.legal_ascend_ops) or "none"
-        return f"- {self.hir_op_name} ({shapes}) -> [{ops}]"
-
-
-@dataclass(frozen=True)
-class HirTirNavigationPacket:
-    """Combined HIR roofline, legal ops, Z3 pipeline schedule, and TIR ledger."""
+class HirBlueprintPacket:
+    """Dialect-neutral HIR Roofline, Z3 pipeline schedule, and reference physical ledger."""
 
     entry_name: str
     roofline: HirRooflineSummary
-    candidate_ops: tuple[HirCandidateOpEntry, ...]
-    tir_script: str | None
     z3_pipeline_summary: dict[str, object]
-    tir_ledger: ObjectivePhysicalLedger | None
+    reference_ledger: ObjectivePhysicalLedger | None
     lowering_diagnostics: tuple[str, ...]
     requested_anchor_dims: dict[str, int] = field(default_factory=dict)
     resolved_hir_dims: dict[str, int] = field(default_factory=dict)
@@ -201,10 +165,10 @@ class HirTirNavigationPacket:
         return {
             "entry_name": self.entry_name,
             "roofline": self.roofline.to_dict(),
-            "candidate_ops": [entry.to_dict() for entry in self.candidate_ops],
-            "tir_script": self.tir_script,
             "z3_pipeline_summary": dict(self.z3_pipeline_summary),
-            "tir_ledger": self.tir_ledger.to_dict() if self.tir_ledger is not None else None,
+            "reference_ledger": (
+                self.reference_ledger.to_dict() if self.reference_ledger is not None else None
+            ),
             "lowering_diagnostics": list(self.lowering_diagnostics),
             "requested_anchor_dims": {
                 str(k): int(v) for k, v in self.requested_anchor_dims.items()
@@ -215,11 +179,10 @@ class HirTirNavigationPacket:
         }
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> HirTirNavigationPacket:
-        """Reconstruct a HirTirNavigationPacket from a serialized dictionary."""
+    def from_dict(cls, payload: Mapping[str, object]) -> HirBlueprintPacket:
+        """Reconstruct a HirBlueprintPacket from a serialized dictionary."""
         roofline = HirRooflineSummary.from_dict(payload["roofline"])
-        raw_cands = payload.get("candidate_ops") or ()
-        raw_ledger = payload.get("tir_ledger")
+        raw_ledger = payload.get("reference_ledger")
         raw_z3 = payload.get("z3_pipeline_summary") or {}
         raw_diags = payload.get("lowering_diagnostics") or ()
         raw_req = payload.get("requested_anchor_dims")
@@ -247,15 +210,8 @@ class HirTirNavigationPacket:
         return cls(
             entry_name=str(payload["entry_name"]),
             roofline=roofline,
-            candidate_ops=tuple(
-                item
-                if isinstance(item, HirCandidateOpEntry)
-                else HirCandidateOpEntry.from_dict(item)
-                for item in raw_cands
-            ),
-            tir_script=str(payload["tir_script"]) if payload.get("tir_script") is not None else None,
             z3_pipeline_summary=dict(raw_z3),
-            tir_ledger=(
+            reference_ledger=(
                 raw_ledger
                 if isinstance(raw_ledger, ObjectivePhysicalLedger) or raw_ledger is None
                 else ObjectivePhysicalLedger.from_dict(raw_ledger)
@@ -268,7 +224,7 @@ class HirTirNavigationPacket:
         )
 
     def format_for_prompt(self) -> str:
-        """Render the navigation packet as structured prompt guidance."""
+        """Render dialect-neutral Roofline and physical schedule metrics."""
         lines = [
             f"Entry: {self.entry_name}",
             self.roofline.format_for_prompt(),
@@ -281,26 +237,17 @@ class HirTirNavigationPacket:
             )
             if self.fallback_reason is not None:
                 lines.append(f"Fallback Reason: {self.fallback_reason}")
-        lines.extend(
-            [
-                f"Candidate Ops ({len(self.candidate_ops)}):",
-                *(entry.format_for_prompt() for entry in self.candidate_ops),
-                f"Z3 Pipelines: {self.z3_pipeline_summary}",
-            ]
-        )
-        if self.tir_ledger is not None:
+        lines.append(f"Z3 Pipelines: {self.z3_pipeline_summary}")
+        if self.reference_ledger is not None:
             lines.append(
-                f"TIR Ledger: mode={self.tir_ledger.analysis_mode}, "
-                f"legal={self.tir_ledger.is_legal}, "
-                f"dominant_pipe={self.tir_ledger.dominant_pipe}, "
-                f"overflow={self.tir_ledger.max_overflow_bytes}"
+                f"Reference Ledger: mode={self.reference_ledger.analysis_mode}, "
+                f"legal={self.reference_ledger.is_legal}, "
+                f"dominant_pipe={self.reference_ledger.dominant_pipe}, "
+                f"overflow={self.reference_ledger.max_overflow_bytes}"
             )
         if self.lowering_diagnostics:
             lines.append("Lowering Diagnostics:")
             lines.extend(f"- {diag}" for diag in self.lowering_diagnostics)
-        if self.tir_script is not None:
-            lines.append("TIR Script:")
-            lines.append(self.tir_script)
         return "\n".join(lines)
 
 
@@ -392,10 +339,7 @@ def _tensor_shape_expr_names(annotation: ast.expr | None) -> tuple[str | None, .
         shape_node = slc.elts[0]
     else:
         return ()
-    if isinstance(shape_node, ast.Tuple):
-        elts = shape_node.elts
-    else:
-        elts = [shape_node]
+    elts = shape_node.elts if isinstance(shape_node, ast.Tuple) else [shape_node]
     return tuple(elt.id if isinstance(elt, ast.Name) else None for elt in elts)
 
 
@@ -555,7 +499,12 @@ class _WorkSplitVisitor(ValuationVisitor[None]):
         for dtype_name, spread in record.flops.kinds:
             dest_flops[dtype_name] = dest_flops.get(dtype_name, 0) + int(spread.total) * trips
         for kind, spread in record.other_ops.kinds:
-            self.other_ops[kind] = self.other_ops.get(kind, 0) + int(spread.total) * trips
+            self.other_ops[kind] = self.other_ops.get(kind, 0) + v_total(spread) * trips
+
+
+def v_total(spread) -> int:
+    """Return integer total from a ComputeCost spread entry."""
+    return int(spread.total)
 
 
 def _split_cube_and_vector_work(
@@ -774,32 +723,6 @@ def _compute_roofline_summary(
     )
 
 
-def _extract_candidate_ops(
-    checked_mod: Module,
-    checked_fn,
-) -> tuple[HirCandidateOpEntry, ...]:
-    """Extract per-call candidate instruction entries for unscheduled HIR calls."""
-    try:
-        cand_report = report_candidates(checked_mod, checked_fn)
-    except (ValueError, ScheduleRefusal, AnalysisError):
-        return ()
-
-    entries: list[HirCandidateOpEntry] = []
-    for row in cand_report.get("lines", ()):
-        cands = [str(item["id"]) for item in row.get("candidates", ())]
-        if not cands:
-            cands = [str(item["id"]) for item in row.get("refused", ())]
-        legal_ops = tuple(dict.fromkeys(cands))
-        entries.append(
-            HirCandidateOpEntry(
-                hir_op_name=str(row["op"]),
-                operand_shapes=tuple(str(opnd) for opnd in row.get("operands", ())),
-                legal_ascend_ops=legal_ops,
-            )
-        )
-    return tuple(entries)
-
-
 def _format_z3_pipeline_summary(raw_pipelines: object) -> dict[str, object]:
     """Extract normalized ii, stages, phases, and versions from ascend.pipelines metadata."""
     if not isinstance(raw_pipelines, Mapping):
@@ -841,8 +764,14 @@ def _lower_scheduled_module(
     *,
     anchor_dims: Mapping[str, int] | None,
     resolved_target: AscendTarget,
-) -> tuple[str | None, ObjectivePhysicalLedger | None, dict[str, object], str | None, dict[str, int], set[str]]:
-    """Check, solve, verify, and inspect one scheduled HIR module."""
+) -> tuple[
+    ObjectivePhysicalLedger | None,
+    dict[str, object],
+    str | None,
+    dict[str, int],
+    set[str],
+]:
+    """Check, solve, verify, and inspect one scheduled HIR module without TIR script dumps."""
     sched_checked_mod, sched_checked_fn, sched_authored_fn, sched_declared = (
         _check_with_filtered_dims(sched_info.module, anchor_dims=anchor_dims)
     )
@@ -856,12 +785,10 @@ def _lower_scheduled_module(
     lowered = finalize(analyzed, authored=sched_authored_fn)
     lowered_entry = lowered.entry_function()
     verify_prim_function(lowered_entry, module_fns=lowered)
-    tir_script = as_script(lowered)
-    tir_ledger = inspect_tir_envelope(lowered_entry, target=resolved_target).ledger
+    ref_ledger = inspect_tir_envelope(lowered_entry, target=resolved_target).ledger
     z3_summary = _format_z3_pipeline_summary(lowered.metadata.get("ascend.pipelines", {}))
     return (
-        tir_script,
-        tir_ledger,
+        ref_ledger,
         z3_summary,
         str(lowered_entry.name),
         sched_resolved_dims,
@@ -869,14 +796,14 @@ def _lower_scheduled_module(
     )
 
 
-def compile_hir_navigation_packet(
+def compile_hir_blueprint(
     authored_hir_source: str,
     *,
     scheduled_hir_source: str | None = None,
     anchor_dims: Mapping[str, int] | None = None,
     target: AscendTarget | None = None,
-) -> HirTirNavigationPacket:
-    """Compile authored and optional scheduled HIR into a navigation packet for agents."""
+) -> HirBlueprintPacket:
+    """Compile authored and optional scheduled HIR into a dialect-neutral blueprint."""
     requested_dims = {str(k): int(v) for k, v in (anchor_dims or {}).items()}
     with tempfile.TemporaryDirectory() as tmp_str:
         tmpdir = Path(tmp_str)
@@ -905,7 +832,6 @@ def compile_hir_navigation_packet(
             declared_dimvars=declared_dimvars,
             build_param_names=authored_info.build_param_names,
         )
-        candidate_ops = _extract_candidate_ops(checked_mod, checked_fn)
 
         sched_info = (
             _load_module_from_source(
@@ -915,8 +841,7 @@ def compile_hir_navigation_packet(
             else authored_info
         )
 
-        tir_script: str | None = None
-        tir_ledger: ObjectivePhysicalLedger | None = None
+        ref_ledger: ObjectivePhysicalLedger | None = None
         z3_summary: dict[str, object] = {}
         diagnostics: list[str] = []
         sched_fallback_reason = sched_info.fallback_reason
@@ -926,8 +851,7 @@ def compile_hir_navigation_packet(
 
         try:
             (
-                tir_script,
-                tir_ledger,
+                ref_ledger,
                 z3_summary,
                 lowered_name,
                 sched_resolved_dims,
@@ -952,8 +876,7 @@ def compile_hir_navigation_packet(
                         path=sched_info.path,
                     )
                     (
-                        tir_script,
-                        tir_ledger,
+                        ref_ledger,
                         z3_summary,
                         lowered_name,
                         sched_resolved_dims,
@@ -1000,13 +923,11 @@ def compile_hir_navigation_packet(
         target=resolved_target,
     )
 
-    return HirTirNavigationPacket(
+    return HirBlueprintPacket(
         entry_name=entry_name,
         roofline=roofline,
-        candidate_ops=candidate_ops,
-        tir_script=tir_script,
         z3_pipeline_summary=z3_summary,
-        tir_ledger=tir_ledger,
+        reference_ledger=ref_ledger,
         lowering_diagnostics=tuple(diagnostics),
         requested_anchor_dims=requested_dims,
         resolved_hir_dims=dict(packet_resolved_dims),
@@ -1016,8 +937,7 @@ def compile_hir_navigation_packet(
 
 
 __all__ = [
-    "HirCandidateOpEntry",
+    "HirBlueprintPacket",
     "HirRooflineSummary",
-    "HirTirNavigationPacket",
-    "compile_hir_navigation_packet",
+    "compile_hir_blueprint",
 ]

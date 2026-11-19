@@ -7,10 +7,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from itertools import product
 import math
-from typing import TYPE_CHECKING
-
 from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
-    CostFeatures,
     CostPrediction,
     HybridAscendCostModel,
     build_cost_features_from_ledger,
@@ -18,9 +15,6 @@ from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 from tilefoundry_ascend.ascend.target.facts import ascend_space_facts, cube_macs_per_cycle as _default_cube_macs_per_cycle
-
-if TYPE_CHECKING:
-    from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult
 
 
 def _align512(nbytes: int) -> int:
@@ -504,7 +498,7 @@ def rank_stage_a_candidates_with_cost_model(
     cost_model: HybridAscendCostModel,
     live_plan: object | None = None,
     axes: TopologyAxes | None = None,
-    nav_packet: object | None = None,
+    blueprint: object | None = None,
     sil_advisory: object | None = None,
 ) -> list[CostRankedCandidate]:
     """Score Stage-A passers with HybridAscendCostModel and sort ascending by pred_us."""
@@ -515,7 +509,7 @@ def rank_stage_a_candidates_with_cost_model(
             ledger,
             live_plan=live_plan,
             axes=axes,
-            nav_packet=nav_packet,
+            blueprint=blueprint,
             sil_advisory=sil_advisory,
             target=cost_model.target,
         )
@@ -550,7 +544,7 @@ def prescreen_live_ir_neighborhood(
     cost_model: HybridAscendCostModel | None = None,
     axes: TopologyAxes | None = None,
     live_plan: object | None = None,
-    nav_packet: object | None = None,
+    blueprint: object | None = None,
     sil_advisory: object | None = None,
 ) -> str:
     """Run bounded Stage A live-IR dry-runs across aligned tile variants around center."""
@@ -571,7 +565,7 @@ def prescreen_live_ir_neighborhood(
         and "block_m" not in params
     )
 
-    from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    from tilefoundry_ascend.agent.orchestrator.gate_funnel import (  # noqa: PLC0415
         _merge_pass_configs_and_flags,
         _resolve_prim_func_and_configs_from_dsl,
         run_stage_a_static,
@@ -751,7 +745,7 @@ def prescreen_live_ir_neighborhood(
                 ledger,
                 live_plan=live_plan,
                 axes=axes,
-                nav_packet=nav_packet,
+                blueprint=blueprint,
                 sil_advisory=sil_advisory,
                 target=cost_model.target,
             )
@@ -878,7 +872,7 @@ class PrescreenAblationSample:
 
 @dataclass(frozen=True)
 class PrescreenAblationReport:
-    """Independent A/B ablation gate report controlling whether prescreener activation is allowed."""
+    """A/B ablation gate report controlling whether prescreener activation is allowed."""
 
     recommended_enable: bool
     sample_count: int
@@ -904,7 +898,7 @@ def evaluate_prescreen_ablation(
     min_mean_gain: float = 0.01,
     allow_anchor_regressions: bool = False,
 ) -> PrescreenAblationReport:
-    """Gate activation of tilesize_prescreen on independent net-gain + zero-anchor-regression proof."""
+    """Gate tilesize_prescreen activation on net gain and zero anchor regressions."""
     coerced: list[PrescreenAblationSample] = []
     for item in samples:
         if isinstance(item, PrescreenAblationSample):

@@ -1,8 +1,8 @@
-"""Automated ISA-gap scanner comparing asc-devkit hardware capabilities against TileLang lowering surface."""
+"""Automated ISA-gap scanner comparing asc-devkit hardware ISA against TileLang lowering."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 import os
 from pathlib import Path
@@ -54,7 +54,7 @@ class PipeGapBreakdown:
 
 @dataclass(frozen=True)
 class PipeGapReport:
-    """Complete diff between asc-devkit hardware ISA surface and TileLang lowering surface by pipe."""
+    """Diff between asc-devkit hardware ISA surface and TileLang lowering surface by pipe."""
 
     surface_source: str
     pipes: dict[str, PipeGapBreakdown]
@@ -98,7 +98,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="mx_spr_scale_config",
         hardware_pipe="pipe_s_scalar_spr",
-        ascend_devkit_intrinsic="SetMxScaleSPR / AscendMxQuant",
+        ascend_devkit_intrinsic="SetMxScaleSPR / QuantMx",
         tilelang_symbols=("set_mx_scale_spr", "ascend_mx_quant"),
         workaround_track="ascendc_template",
         description="Hardware SPR microscaling configuration and online MX quantization",
@@ -328,6 +328,32 @@ def _default_tilelang_codegen_path() -> str:
 DEFAULT_ASCEND_SDK_HEADER_ROOTS: tuple[str, ...] = _default_ascend_sdk_header_roots()
 DEFAULT_TILELANG_CODEGEN_PATH = _default_tilelang_codegen_path()
 
+BASELINE_TILELANG_ASCEND_SURFACE: frozenset[str] = frozenset(
+    {
+        "copy",
+        "dual_copy",
+        "gemm",
+        "simd.vld",
+        "simd.vst2",
+        "simd.vsts",
+        "simd.vgather2",
+        "simd.vgatherb",
+        "simd.vscatter",
+        "simd.vci",
+        "simd.vcmax",
+        "simd.vcmin",
+        "shfl_sync",
+        "ballot_sync",
+        "activemask",
+        "atomic_add",
+        "atomic_max",
+        "atomic_min",
+        "ascend_cross_core_set_flag",
+        "ascend_cross_core_wait_flag",
+        "dcci",
+    }
+)
+
 
 @dataclass(frozen=True)
 class SdkHeaderScanResult:
@@ -484,7 +510,6 @@ def scan_ascend_sdk_headers(
                     other_syms.add(tok)
 
     if scanned_count == 0 or not symbols:
-        # Graceful fallback to static ASCEND_DEVKIT_ISA_CATALOG when paths are absent
         for spec in ASCEND_DEVKIT_ISA_CATALOG:
             for part in spec.ascend_devkit_intrinsic.split("/"):
                 tok = part.strip()
@@ -544,7 +569,6 @@ def _scan_tilelang_codegen_file(codegen_path: Path) -> set[str]:
         for m in re.finditer(r'DeviceCodegen\(\s*["\']([A-Za-z0-9_]+)["\']', text):
             found.add(f"codegen:{m.group(1)}")
 
-        # Also inspect sibling C++ Ascend codegen lowering files in the same TileLang checkout
         repo_root = codegen_path.resolve().parents[2]
         cpp_candidates = (
             repo_root / "src" / "ascend" / "codegen" / "codegen_ascend.cc",
@@ -573,7 +597,7 @@ def discover_tilelang_lowering_surface(
     source = "explicit_module"
     if mod is None:
         try:
-            import tilelang.ascend.language as tl_ascend
+            import tilelang.ascend.language as tl_ascend  # noqa: PLC0415
 
             mod = tl_ascend
             source = "tilelang.ascend.language"
@@ -608,7 +632,7 @@ def discover_tilelang_lowering_surface(
             break
 
     if mod is None and not codegen_scanned:
-        return "unavailable", frozenset()
+        return "baseline_fallback", BASELINE_TILELANG_ASCEND_SURFACE
     if mod is not None and codegen_scanned and source == "tilelang.ascend.language":
         source = "tilelang.ascend.language+codegen"
     elif mod is None and codegen_scanned:
@@ -632,7 +656,7 @@ def scan_tilelang_pipe_gaps(
     pipes: Iterable[str] | None = None,
     devkit_catalog: Iterable[IsaPrimitiveSpec] | None = None,
 ) -> PipeGapReport:
-    """Diff asc-devkit hardware capabilities against TileLang lowering across the 7 orthogonal pipes."""
+    """Diff asc-devkit hardware capabilities against TileLang across the 7 hardware pipes."""
     surface_source, surface = _resolve_surface(tilelang_surface)
 
     selected_pipes = tuple(pipes) if pipes is not None else VALID_HARDWARE_PIPES

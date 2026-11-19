@@ -19,7 +19,7 @@ from tilefoundry_ascend.agent import (
     PortfolioRunner,
     TwoLaneBeamSearch,
     build_tilelang_runtime_twin,
-    format_hir_tir_navigation_section,
+    format_blueprint_delta_section,
     verify_twin_cpu_reference,
 )
 from tilefoundry_ascend.agent.orchestrator import (
@@ -29,7 +29,7 @@ from tilefoundry_ascend.agent.orchestrator import (
     compute_static_dynamic_residual,
     extract_structural_signature,
 )
-from tilefoundry_ascend.ascend.passes.hir_tir_bridge import compile_hir_navigation_packet
+from tilefoundry_ascend.ascend.passes.hir_tir_bridge import compile_hir_blueprint
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     build_objective_physical_ledger,
     build_scope_waterline,
@@ -176,11 +176,11 @@ def test_verify_twin_cpu_reference_with_dimvars() -> None:
     assert "twin_numeric_mismatch" in bad_msg
 
 
-def test_format_hir_tir_navigation_section_and_portfolio_roofline_eta() -> None:
+def test_format_blueprint_delta_section_and_portfolio_roofline_eta() -> None:
     """Verify navigation formatting, ledger delta, and roofline_eta residual threading."""
     mla_hir = _MLA_MODEL_PATH.read_text(encoding="utf-8")
     mla_sched = _MLA_SCHED_PATH.read_text(encoding="utf-8")
-    packet = compile_hir_navigation_packet(
+    packet = compile_hir_blueprint(
         mla_hir,
         scheduled_hir_source=mla_sched,
         anchor_dims={"B": 1, "S": 16, "S_kv": 16, "N_q": 4, "N_kv": 1},
@@ -200,11 +200,9 @@ def test_format_hir_tir_navigation_section_and_portfolio_roofline_eta() -> None:
         },
         gm_roundtrip_bytes=8192,
     )
-    nav_text = format_hir_tir_navigation_section(packet, current_tl_ledger=tl_ledger)
-    assert "### HIR ANALYTICAL ROOFLINE & TRAFFIC FLOOR" in nav_text
-    assert "### LEGAL ASCEND TIR CANDIDATE PRIMITIVES" in nav_text
-    assert "### LOWERED ASCEND TIR BLUEPRINT & Z3 SCHEDULE" in nav_text
-    assert "### TIR BLUEPRINT VS CURRENT TILELANG LEDGER DELTA" in nav_text
+    nav_text = format_blueprint_delta_section(packet, current_ledger=tl_ledger)
+    assert "### LAYER 3: PHYSICAL ROOFLINE & BLUEPRINT DELTA" in nav_text
+    assert "T.ascend_mmad" not in nav_text
     assert "steady_state_ii:" in nav_text
     assert "ub_peak_bytes:" in nav_text
     assert "gm_roundtrip_bytes:" in nav_text
@@ -262,19 +260,19 @@ def test_format_hir_tir_navigation_section_and_portfolio_roofline_eta() -> None:
             round_idx=1,
             factory_name="make_kernel",
             ideal_roofline_us=5.0,
-            nav_packet=packet,
+            blueprint=packet,
         )
     )
     assert report.evaluated_candidates
     for req in backend.calls:
-        assert "### HIR ANALYTICAL ROOFLINE & TRAFFIC FLOOR" in req.user_prompt
+        assert "### LAYER 3: PHYSICAL ROOFLINE & BLUEPRINT DELTA" in req.user_prompt
         assert "### TIR BLUEPRINT VS CURRENT TILELANG LEDGER DELTA" in req.user_prompt
     for cand in report.evaluated_candidates:
         assert cand.residual.predicted_bottleneck_util >= 0.0
         assert cand.residual.unexplained_gap_ratio > 0.0
 
 
-def test_format_hir_tir_navigation_section_gates_cross_scale_deltas() -> None:
+def test_format_blueprint_delta_section_gates_cross_scale_deltas() -> None:
     """Verify shape mismatch suppresses raw byte/cycle deltas in favor of normalized usage."""
     ar_hir = _AR_MODEL_PATH.read_text(encoding="utf-8")
     ar_sched = _AR_SCHED_PATH.read_text(encoding="utf-8")
@@ -294,19 +292,19 @@ def test_format_hir_tir_navigation_section_gates_cross_scale_deltas() -> None:
         gm_roundtrip_bytes=4096,
     )
 
-    exact_pkt = compile_hir_navigation_packet(
+    exact_pkt = compile_hir_blueprint(
         ar_hir,
         scheduled_hir_source=ar_sched,
         anchor_dims={"N": 4, "B": 1, "S": 4, "D": 64},
     )
     assert exact_pkt.shape_exact_match is True
-    exact_nav = format_hir_tir_navigation_section(exact_pkt, current_tl_ledger=tl_ledger)
-    assert "[Structural Blueprint Reference Only:" not in exact_nav
+    exact_nav = format_blueprint_delta_section(exact_pkt, current_ledger=tl_ledger)
+    assert "[Structural Reference Only:" not in exact_nav
     assert "ub_peak_bytes:" in exact_nav
     assert "gm_roundtrip_bytes:" in exact_nav
     assert "delta=" in exact_nav
 
-    fallback_pkt = compile_hir_navigation_packet(
+    fallback_pkt = compile_hir_blueprint(
         ar_hir,
         scheduled_hir_source=ar_sched,
         anchor_dims={"N": 8, "B": 1, "S": 4, "D": 1000},
@@ -314,8 +312,8 @@ def test_format_hir_tir_navigation_section_gates_cross_scale_deltas() -> None:
     assert fallback_pkt.shape_exact_match is False
     assert fallback_pkt.resolved_hir_dims == {"N": 4, "B": 1, "S": 4, "D": 64}
     assert fallback_pkt.fallback_reason is not None
-    gated_nav = format_hir_tir_navigation_section(fallback_pkt, current_tl_ledger=tl_ledger)
-    assert "[Structural Blueprint Reference Only:" in gated_nav
+    gated_nav = format_blueprint_delta_section(fallback_pkt, current_ledger=tl_ledger)
+    assert "[Structural Reference Only:" in gated_nav
     assert "fallback_reason:" in gated_nav
     assert "scope_utilization[" in gated_nav
     assert "%" in gated_nav
@@ -326,7 +324,7 @@ def test_format_hir_tir_navigation_section_gates_cross_scale_deltas() -> None:
 
 def test_up3_twin_reference_contract_profile_and_dual_profile() -> None:
     """Verify contract profile zero-inits w and dual_profile logs stress deltas."""
-    import torch
+    import torch  # noqa: PLC0415
 
     w_hir = (
         "from __future__ import annotations\n"

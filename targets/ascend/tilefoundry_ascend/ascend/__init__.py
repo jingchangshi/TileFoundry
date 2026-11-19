@@ -2,10 +2,9 @@
 
 from tilefoundry_ascend.ascend import ir, passes, schedule, visitor_registry
 from tilefoundry_ascend.ascend.passes import (
-    HirCandidateOpEntry,
+    HirBlueprintPacket,
     HirRooflineSummary,
-    HirTirNavigationPacket,
-    compile_hir_navigation_packet,
+    compile_hir_blueprint,
 )
 from tilefoundry_ascend.ascend.target import (
     PURE_SIMDVF_UBUF_FLAGS,
@@ -22,11 +21,10 @@ __all__ = [
     "AscendSpaceFacts",
     "AscendTarget",
     "DaVinci950",
-    "HirCandidateOpEntry",
+    "HirBlueprintPacket",
     "HirRooflineSummary",
-    "HirTirNavigationPacket",
     "NodeResourceMask",
-    "compile_hir_navigation_packet",
+    "compile_hir_blueprint",
     "ir",
     "passes",
     "schedule",

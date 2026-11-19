@@ -24,7 +24,6 @@ from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
 )
 from tilefoundry_ascend.ascend.cost_model.pipe_schedule_eval import (
     Ascend950PipeScheduleEvaluator,
-    Ascend950PipeScheduleResult,
 )
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
@@ -47,10 +46,10 @@ CUBE_MACS_PER_CYCLE: dict[str, int] = {
 }
 
 DEFAULT_CLOCK_GHZ = 1.65
-DEFAULT_L2_CAPACITY_BYTES = 134_217_728  # 128 MiB
+DEFAULT_L2_CAPACITY_BYTES = 134_217_728
 DEFAULT_L2_BYTES_PER_CYCLE_PER_AIC = 101
-DEFAULT_UB_BANK_MODULUS_BYTES = 512  # 16 banks * 32B datablock
-DEFAULT_AIV_VEC_FLOPS_PER_CYCLE = 128  # 64 fp32 lanes * 2 FLOPs/cycle (FMA)
+DEFAULT_UB_BANK_MODULUS_BYTES = 512
+DEFAULT_AIV_VEC_FLOPS_PER_CYCLE = 128
 DEFAULT_LAUNCH_OVERHEAD_US = 3.2
 DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC = 128
 DEFAULT_CV_SYNC_EVENT_US = 0.08
@@ -196,7 +195,7 @@ class CostFeatures:
         *,
         bisheng_res: BishengResourceSummary | Mapping[str, object] | None = None,
     ) -> CostFeatures:
-        """Build CostFeatures from a dataclass, Mapping, or SIL SchedulePolicy + optional BishengResourceSummary."""
+        """Build CostFeatures from a dataclass, Mapping, or SIL policy and compiler summary."""
         if isinstance(workload, CostFeatures):
             base = asdict(workload)
         elif isinstance(workload, Mapping):
@@ -437,7 +436,7 @@ def evaluate_cost_model_ranking(
 
 
 class HybridAscendCostModel:
-    """3-Tier Hybrid Ascend 950 Cost Model (Physics Floor + Compiler Penalties + Hierarchical Ridge)."""
+    """3-Tier Hybrid Ascend 950 Cost Model (Roofline Floor, Compiler Penalties, Ridge)."""
 
     FEATURE_DIM = 13
 
@@ -543,19 +542,19 @@ class HybridAscendCostModel:
             else 0.0
         )
         return (
-            1.0,  # 0: bias
-            math.log1p(max(0.0, tier0_us)) / 10.0,  # 1: log scale
-            cube_floor_us / total_floor,  # 2: cube share
-            vec_floor_us / total_floor,  # 3: vec share
-            hbm_floor_us / total_floor,  # 4: hbm share
-            max(0.0, wave_ratio - 1.0),  # 5: wave quantization tail
-            1.0 - max(0.0, min(1.0, l2_hit_rate)),  # 6: L2 miss fraction
-            1.0 if cf.contig_burst_bytes < 16384 else 0.0,  # 7: short burst indicator
-            min(2.0, tier1_penalty_us / max(1e-3, tier0_us)),  # 8: compiler penalty ratio
-            launch_us / max(1e-3, tier0_us),  # 9: small-shape launch fraction
-            is_coupled,  # 10: coupled_1c2v indicator
-            is_aic,  # 11: aic_only indicator
-            is_irreg,  # 12: irregular/ragged/dynamic opcode indicator
+            1.0,
+            math.log1p(max(0.0, tier0_us)) / 10.0,
+            cube_floor_us / total_floor,
+            vec_floor_us / total_floor,
+            hbm_floor_us / total_floor,
+            max(0.0, wave_ratio - 1.0),
+            1.0 - max(0.0, min(1.0, l2_hit_rate)),
+            1.0 if cf.contig_burst_bytes < 16384 else 0.0,
+            min(2.0, tier1_penalty_us / max(1e-3, tier0_us)),
+            launch_us / max(1e-3, tier0_us),
+            is_coupled,
+            is_aic,
+            is_irreg,
         )
 
     def _compute_tier0_and_tier1(
@@ -596,12 +595,10 @@ class HybridAscendCostModel:
             }
         )
 
-        # 1. Per-dtype Cube MACs/cycle @ 1.65 GHz + Wave Quantization
         macs_per_cycle = _cube_macs_for_dtype(self.facts, cf.cube_dtype, hf32=cf.hf32)
         aic_peak_flops_per_sec = float(aic_cores) * float(macs_per_cycle) * 2.0 * clock_hz
         ideal_cube_us = (cf.cube_flops / aic_peak_flops_per_sec) * 1e6 if cf.cube_flops > 0 else 0.0
 
-        # Wave Quantization: ceil(tiles / active_cores)
         wave_ratio = 1.0
         if cf.total_tiles > 0:
             active_grid = aic_cores if cf.cube_flops > 0 else aiv_cores
@@ -610,13 +607,11 @@ class HybridAscendCostModel:
             wave_ratio = max(1.0, waves / max(1e-6, ideal_waves))
         cube_floor_us = ideal_cube_us * wave_ratio
 
-        # AIV Vector FLOPs floor
         aiv_peak_flops_per_sec = float(aiv_cores) * float(DEFAULT_AIV_VEC_FLOPS_PER_CYCLE) * clock_hz
         vec_floor_us = (cf.vec_flops / aiv_peak_flops_per_sec) * 1e6 if cf.vec_flops > 0 else 0.0
         if cf.cube_flops <= 0 and cf.total_tiles > 0:
             vec_floor_us *= wave_ratio
 
-        # 2. Segmented HBM burst curve + SWAT L2 reuse hit model
         burst_bytes = max(1, int(cf.contig_burst_bytes))
         eff_hbm_bw = max(1.0, self.facts.effective_hbm_bandwidth_bps(burst_bytes))
         l2_cap = int(getattr(self.facts, "l2_capacity_bytes", DEFAULT_L2_CAPACITY_BYTES))
@@ -633,11 +628,9 @@ class HybridAscendCostModel:
         effective_gm_bytes = float(cf.gm_bytes) * (1.0 - l2_hit_rate)
         hbm_floor_us = (effective_gm_bytes / eff_hbm_bw) * 1e6 if effective_gm_bytes > 0 else 0.0
 
-        # L2 bandwidth check (101 B/cycle/AIC)
         l2_bw_bps = float(aic_cores) * float(getattr(self.facts, "l2_bytes_per_cycle_per_aic", DEFAULT_L2_BYTES_PER_CYCLE_PER_AIC)) * clock_hz
         l2_floor_us = ((float(cf.gm_bytes) * l2_hit_rate) / max(1.0, l2_bw_bps)) * 1e6 if l2_hit_rate > 0 else 0.0
 
-        # 3. FixPipe writeback floor, 1C2V cross-core sync, Launch floor & bank-conflict penalties
         fixpipe_bpc = float(getattr(self.facts, "fixpipe_bytes_per_cycle", DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC) or DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC)
         fixpipe_bw_bps = float(aic_cores) * fixpipe_bpc * clock_hz
         fixpipe_floor_us = (
@@ -646,7 +639,6 @@ class HybridAscendCostModel:
             else 0.0
         )
 
-        # Apply MSProf Head-1 pipe multipliers cleanly (equal 1.0 before any msprof observation)
         cube_floor_us *= scales["CUBE"]
         vec_floor_us *= scales["VECTOR"]
         hbm_floor_us *= scales["MTE2"]
@@ -683,7 +675,6 @@ class HybridAscendCostModel:
         else:
             launch_us = 0.0
 
-        # L1/UB bank-conflict cycle penalties
         ub_conflict = max(0.0, min(1.0, cf.ub_bank_conflict_ratio))
         if (
             ub_conflict == 0.0
@@ -746,7 +737,6 @@ class HybridAscendCostModel:
             sched_exec_us = (sched.loop_total_ns * 1e-3) + max(cv_sync_us, sched_sync_us) + extra_bank_us
             exec_us = max(roofline_exec_us, sched_exec_us)
         else:
-            # Combine Roofline Physics Floor (Launch + bottleneck pipes + non-overlapped tail)
             compute_us = max(cube_floor_us, vec_floor_us, fixpipe_floor_us)
             exec_us = (
                 max(compute_us, hbm_floor_us, l2_floor_us)
@@ -756,7 +746,6 @@ class HybridAscendCostModel:
             )
         tier0_us = launch_us + exec_us
 
-        # 4. Tier 1: Compiler Resource Penalty via extensible CompilerBehaviorRegistry
         base_ref = max(1.0, tier0_us)
         res_summary = BishengResourceSummary(
             spill_bytes=cf.spill_bytes,
@@ -782,14 +771,12 @@ class HybridAscendCostModel:
             },
         )
 
-        # Short unaligned burst (< 16 KiB) / unaligned tail issue penalty
         if 0 < cf.contig_burst_bytes < 16384:
             shortness = (16384.0 - float(cf.contig_burst_bytes)) / 16384.0
             tier1_penalty_us += hbm_floor_us * 0.15 * shortness + 0.5 * shortness
         if cf.has_unaligned_tail:
             tier1_penalty_us += max(0.25, 0.03 * base_ref)
 
-        # Dominant bound classification
         if cf.spill_bytes > 0 and tier1_penalty_us >= base_ref * 0.3:
             dominant = "compiler_spill"
         elif bank_conflict_us > 0.3 * max(1e-6, tier0_us):
@@ -841,7 +828,7 @@ class HybridAscendCostModel:
         *,
         bisheng_res: BishengResourceSummary | Mapping[str, object] | None = None,
     ) -> CostPrediction:
-        """Predict kernel latency (us) across Tier 0 physics, Tier 1 compiler penalties, and Tier 2 surrogate."""
+        """Predict kernel latency (us) across Tier 0 physics, Tier 1 penalties, and Tier 2."""
         cf = CostFeatures.coerce(workload, bisheng_res=bisheng_res)
         (
             tier0_us,
@@ -895,7 +882,7 @@ class HybridAscendCostModel:
         persist: bool = True,
         refit: bool = True,
     ) -> float:
-        """Record an empirical measurement and incrementally refit hierarchical Ridge residual surrogates."""
+        """Record an empirical measurement and refit hierarchical Ridge residual weights."""
         if measured_us <= 0.0:
             raise ValueError(f"measured_us must be positive, got {measured_us!r}")
         cf = CostFeatures.coerce(workload, bisheng_res=bisheng_res)
@@ -1329,12 +1316,12 @@ def build_cost_features_from_ledger(
     target: AscendTarget | None = None,
     live_plan: object | None = None,
     axes: TopologyAxes | None = None,
-    nav_packet: object | None = None,
+    blueprint: object | None = None,
     sil_advisory: object | None = None,
     kernel_launches: int = 1,
     stage_b_profile: MicroarchProfile | Mapping[str, object] | None = None,
 ) -> CostFeatures:
-    """Convert ObjectivePhysicalLedger + HIR navigation / SIL advisory into chip-scaled CostFeatures."""
+    """Convert ObjectivePhysicalLedger, HIR blueprint, and SIL advisory into CostFeatures."""
     facts = (target or AscendTarget("ascend.950pr")).get_facts(AscendSpaceFacts)
     policy: dict[str, Any] = {}
     plan_axes: TopologyAxes | None = None
@@ -1378,7 +1365,7 @@ def build_cost_features_from_ledger(
         float(max(0, vec_c)) * float(DEFAULT_AIV_VEC_FLOPS_PER_CYCLE) * float(total_tiles)
     )
 
-    nav_roofline = getattr(nav_packet, "roofline", None) if nav_packet is not None else None
+    nav_roofline = getattr(blueprint, "roofline", None) if blueprint is not None else None
     nav_cube_flops = float(_read_attr_or_key(nav_roofline, "cube_flops", 0.0) or 0.0)
     nav_vec_flops = float(_read_attr_or_key(nav_roofline, "vector_flops", 0.0) or 0.0)
     nav_min_gm = float(_read_attr_or_key(nav_roofline, "min_gm_bytes", 0.0) or 0.0)

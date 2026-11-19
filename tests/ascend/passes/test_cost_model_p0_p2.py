@@ -59,14 +59,14 @@ def test_p0_chip_scaling_floors_persistence_and_observe_batch(tmp_path: Path) ->
         grid_blocks=28,
         waterlines={},
     )
-    nav_packet = SimpleNamespace(
+    blueprint = SimpleNamespace(
         roofline={"cube_flops": 2.0e12, "vector_flops": 1.0e10, "min_gm_bytes": 4_000_000}
     )
     cf = build_cost_features_from_ledger(
         ledger,
         live_plan={"policy": {"tile_mnk": [128, 128, 64], "l1_stages": 2, "cube_operand_dtype": "f16"}},
         axes=axes,
-        nav_packet=nav_packet,
+        blueprint=blueprint,
         target=target,
     )
     assert cf.total_tiles == 28
@@ -145,7 +145,6 @@ def test_p1_stage_b_cce_dump_7_detectors_and_hierarchical_ridge(tmp_path: Path) 
     assert vloop_hit is False
     assert summary.software_loops >= 1
     assert summary.has_local_membar_in_vf_call is True
-    # 2 asc_vf_call invocations -> 1 break (not double-counted with __simd_vf__ definitions/extern/comments).
     assert summary.vf_fusion_breaks == 1
     assert summary.alias_serialized_buffers >= 1
     assert summary.dual_issue_ipc_collapse > 0.0
@@ -269,7 +268,6 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
     assert checks[1].passed is False and checks[1].failed_tier == "stage_a"
     assert checks[2].passed is True and checks[3].passed is True
 
-    # End-to-end CampaignRunner round verifying cost_prescreen exemption + JSONL calibration persistence.
     assert CampaignConfig(operator_name="softmax").enable_tilesize_prescreen is False
     mod_file = tmp_path / "mod.py"
     base_src = "def kernel(m_dim=64):\n    # BASE\n    return m_dim\n"
@@ -386,7 +384,6 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
     assert report.rounds[0].l0_l1_passed_ids == ("r1_creative",)
     assert any(tier == "cost_prescreen" for _cid, tier, _msg in report.rounds[0].l0_l1_failed)
 
-    # Synthetic official_final.json fixtures + duplicate copy deduplication in calibration_backtest
     rep_dir1 = tmp_path / "reports_a"
     rep_dir2 = tmp_path / "reports_b"
     payload = {

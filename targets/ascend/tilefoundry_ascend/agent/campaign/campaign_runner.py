@@ -79,7 +79,6 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
 )
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     CREATIVE_FOCUS_HINTS,
-    TILELANG_ASCEND_PRIMITIVE_MENU,
     build_prescreen_summary_from_kwargs,
     summarize_excluded_mechanisms,
 )
@@ -93,7 +92,7 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     rank_stage_a_candidates_with_cost_model,
 )
-from tilefoundry_ascend.agent.orchestrator.twin_bridge import format_hir_tir_navigation_section
+from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
 from tilefoundry_ascend.agent.router.capability_gate import evaluate_track_escalation
 from tilefoundry_ascend.agent.router.isa_gap_scanner import scan_tilelang_pipe_gaps
 from tilefoundry_ascend.ascend.cost_model import (
@@ -112,8 +111,8 @@ from tilefoundry_ascend.ascend.cost_model.experience_lake import (
 )
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import merge_microarch_profiles
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
-    HirTirNavigationPacket,
-    compile_hir_navigation_packet,
+    HirBlueprintPacket,
+    compile_hir_blueprint,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
@@ -1138,8 +1137,8 @@ class PerfTargetCampaignRunner:
             sibling_sched = self._target_module_path.parent / "scheduled.py"
             self._scheduled_hir_path = sibling_sched.resolve() if sibling_sched.is_file() else None
 
-        self._regime_nav_packets: dict[str, HirTirNavigationPacket] = (
-            self._compile_regime_nav_packets()
+        self._regime_blueprints: dict[str, HirBlueprintPacket] = (
+            self._compile_regime_blueprints()
         )
         self._active_incumbent_source: str = ""
         if (
@@ -1277,7 +1276,7 @@ class PerfTargetCampaignRunner:
                 if clean:
                     self._msprof_cache[(sha, str(tag))] = clean
 
-    def _compile_regime_nav_packets(self) -> dict[str, HirTirNavigationPacket]:
+    def _compile_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
         if self._authored_hir_path is None or not self._authored_hir_path.is_file():
             return {}
         try:
@@ -1291,10 +1290,10 @@ class PerfTargetCampaignRunner:
             except OSError:
                 scheduled_hir_source = None
 
-        packets: dict[str, HirTirNavigationPacket] = {}
+        packets: dict[str, HirBlueprintPacket] = {}
         for regime_spec in self._regime_specs:
             try:
-                packets[regime_spec.regime_tag] = compile_hir_navigation_packet(
+                packets[regime_spec.regime_tag] = compile_hir_blueprint(
                     authored_hir_source,
                     scheduled_hir_source=scheduled_hir_source,
                     anchor_dims=regime_spec.representative_hir_dims,
@@ -1709,14 +1708,14 @@ class PerfTargetCampaignRunner:
         *,
         live_plan: RegimePlanResult | None = None,
         axes: TopologyAxes | None = None,
-        nav_packet: HirTirNavigationPacket | None = None,
+        blueprint: HirBlueprintPacket | None = None,
         stage_b_profile: Mapping[str, object] | None = None,
     ) -> CostFeatures:
         return build_cost_features_from_ledger(
             ledger,
             live_plan=live_plan,
             axes=axes,
-            nav_packet=nav_packet,
+            blueprint=blueprint,
             sil_advisory=self._sil_advisory,
             target=self._target,
             stage_b_profile=stage_b_profile,
@@ -1887,7 +1886,6 @@ class PerfTargetCampaignRunner:
                 axes=axes,
                 target=self._target,
             )
-            # Only attach candidate-specific msprof PMU (never copy parent telemetry)
             cand_msprof = self._msprof_cache.get((cand_sha, anc.regime_tag))
             bn_case = bn_by_regime.get(anc.regime_tag, -1)
             attach_msprof = (
@@ -2152,7 +2150,7 @@ class PerfTargetCampaignRunner:
         regime_spec: RegimeTargetSpec,
         rule: AscendCausalRule,
         best_result: CandidateSurrogateResult,
-        nav_packet: HirTirNavigationPacket | None = None,
+        blueprint: HirBlueprintPacket | None = None,
         parent_ledger: ObjectivePhysicalLedger | None = None,
         parent_residual: StaticDynamicResidual | None = None,
         track: str = "unconstrained",
@@ -2166,20 +2164,18 @@ class PerfTargetCampaignRunner:
             f"optimization rule cleanly while preserving exact numerical semantics, dynamic shape "
             f"compatibility, and {slice_desc}. Output ONLY Python code for this regime slice."
         )
-        if not self._enable_track_router or track in ("", "unconstrained"):
-            track_section = (
-                f"### TILELANG ASCEND PRIMITIVE REFERENCE\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"
-            )
-        else:
-            track_section = f"### TARGET TRACK\n{track}\n\n"
-        if nav_packet is not None:
-            nav_text = format_hir_tir_navigation_section(
-                nav_packet,
-                current_tl_ledger=parent_ledger,
-            )
-            nav_section = f"{nav_text}\n\n"
-        else:
-            nav_section = ""
+        constraint_text = build_progressive_llm_constraints(
+            escalation_tier="tilelang_dsl",
+            track=track,
+            enable_track_router=bool(self._enable_track_router),
+            sil_advisory=getattr(self, "_sil_advisory", None),
+            freedom_mask=self._freedom_masks.get(regime_spec.regime_tag),
+            ub_256kb_unlock=bool(parent_ledger.uses_unreserved_ubuf) if parent_ledger else False,
+            blueprint=blueprint,
+            current_ledger=parent_ledger,
+        )
+        track_section = f"{constraint_text}\n\n"
+        nav_section = ""
         msprof_section = self._format_msprof_section(parent_residual)
         cfg_obj = getattr(self, "_config", None)
         op_name = str(
@@ -2232,7 +2228,7 @@ class PerfTargetCampaignRunner:
         excluded_mechanisms: Sequence[str] = (),
         focus_hint: str = "",
         prescreen_summary: str = "",
-        nav_packet: HirTirNavigationPacket | None = None,
+        blueprint: HirBlueprintPacket | None = None,
         parent_ledger: ObjectivePhysicalLedger | None = None,
         parent_residual: StaticDynamicResidual | None = None,
         track: str = "unconstrained",
@@ -2260,20 +2256,19 @@ class PerfTargetCampaignRunner:
             "Propose a structurally orthogonal transformation that does NOT duplicate the "
             "mechanisms listed above.\n\n"
         )
-        if not self._enable_track_router or track in ("", "unconstrained"):
-            track_section = (
-                f"### TILELANG ASCEND PRIMITIVE REFERENCE\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"
-            )
-        else:
-            track_section = f"### EXECUTION TRACK\n{track}\n\n"
-        if nav_packet is not None:
-            nav_text = format_hir_tir_navigation_section(
-                nav_packet,
-                current_tl_ledger=parent_ledger,
-            )
-            nav_section = f"{nav_text}\n\n"
-        else:
-            nav_section = ""
+        constraint_text = build_progressive_llm_constraints(
+            escalation_tier="tilelang_dsl",
+            track=track,
+            enable_track_router=bool(self._enable_track_router),
+            sil_advisory=getattr(self, "_sil_advisory", None),
+            freedom_mask=self._freedom_masks.get(regime_spec.regime_tag),
+            ub_256kb_unlock=bool(parent_ledger.uses_unreserved_ubuf) if parent_ledger else False,
+            blueprint=blueprint,
+            current_ledger=parent_ledger,
+            excluded_mechanisms=excluded_mechanisms,
+        )
+        track_section = f"{constraint_text}\n\n"
+        nav_section = ""
         focus_section = f"### ARCHITECTURAL FOCUS HINT\n{focus_hint}\n\n" if focus_hint else ""
         parent_hyp_section = (
             f"### STEPPING-STONE PARENT HYPOTHESIS\n{parent_hypothesis}\n\n"
@@ -2862,12 +2857,12 @@ class PerfTargetCampaignRunner:
         ub_wl = parent_waterlines.get("UB")
         l1_overflow = bool(l1_wl is not None and int(getattr(l1_wl, "overflow_bytes", 0) or 0) > 0)
         ub_overflow = bool(ub_wl is not None and int(getattr(ub_wl, "overflow_bytes", 0) or 0) > 0)
-        nav_packet = self._regime_nav_packets.get(regime_spec.regime_tag)
+        blueprint = self._regime_blueprints.get(regime_spec.regime_tag)
         parent_workload = self._build_cost_workload(
             parent_ledger,
             live_plan=live_plan,
             axes=parent_axes,
-            nav_packet=nav_packet,
+            blueprint=blueprint,
         )
         if self._experience_lake_dir is not None:
             try:
@@ -2955,7 +2950,7 @@ class PerfTargetCampaignRunner:
                         regime_spec=regime_spec,
                         rule=rule,
                         best_result=local_best,
-                        nav_packet=nav_packet,
+                        blueprint=blueprint,
                         parent_ledger=parent_ledger,
                         parent_residual=parent_residual,
                         track=parent_track,
@@ -3006,7 +3001,7 @@ class PerfTargetCampaignRunner:
                 cost_model=self._cost_model,
                 axes=parent_axes,
                 live_plan=live_plan,
-                nav_packet=nav_packet,
+                blueprint=blueprint,
                 sil_advisory=self._sil_advisory,
             )
         else:
@@ -3034,7 +3029,7 @@ class PerfTargetCampaignRunner:
                         excluded_mechanisms=excluded,
                         focus_hint=hint,
                         prescreen_summary=prescreen_summary,
-                        nav_packet=nav_packet,
+                        blueprint=blueprint,
                         parent_ledger=parent_ledger,
                         parent_residual=parent_residual,
                         track=parent_track,
@@ -3119,7 +3114,7 @@ class PerfTargetCampaignRunner:
                             cost_model=self._cost_model,
                             live_plan=live_plan,
                             axes=parent_axes,
-                            nav_packet=nav_packet,
+                            blueprint=blueprint,
                             sil_advisory=self._sil_advisory,
                         )
                     ]

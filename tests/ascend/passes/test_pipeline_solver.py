@@ -352,7 +352,7 @@ class M:
                 with T.SimdVF():
                     ar = tf.schedule((a_ub, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_ub_to_reg())
                     br = tf.schedule((b_ub, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_ub_to_reg())
-                    cr = tf.schedule((ar, br, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_vadd())
+                    cr = tf.schedule((ar, br, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_vbinary(kind="add"))
                     c_ub = tf.schedule((cr, tf.empty(Tensor[(64,), "f32", "smem"])), op=T.ascend_reg_to_ub())
                 c_row = tf.schedule((c_ub, tf.empty(Tensor[(64,), "f32", "gmem"])), op=T.ascend_ub_to_gm())
                 c = tf.insert_slice(c, tf.reshape(c_row, new_shape=(1, 64)), (k, 0))
@@ -391,7 +391,7 @@ class M:
                 with T.SimdVF():
                     vr = tf.schedule((v_ub, tf.empty(Tensor[(64, 128), "f32", "rmem"])), op=T.ascend_ub_to_reg())
                     ar = tf.schedule((acc_ub, tf.empty(Tensor[(64, 128), "f32", "rmem"])), op=T.ascend_ub_to_reg())
-                    sr = tf.schedule((ar, vr, tf.empty(Tensor[(64, 128), "f32", "rmem"])), op=T.ascend_vadd())
+                    sr = tf.schedule((ar, vr, tf.empty(Tensor[(64, 128), "f32", "rmem"])), op=T.ascend_vbinary(kind="add"))
                     acc_ub = tf.schedule((sr, tf.empty(Tensor[(64, 128), "f32", "smem"])), op=T.ascend_reg_to_ub())
             return tf.schedule((acc_ub, tf.empty(Tensor[(64, 128), "f32", "gmem"])), op=T.ascend_ub_to_gm())
 """
@@ -435,7 +435,7 @@ class M:
                 x_ub = tf.schedule((xt, tf.empty(Tensor[(128, 300), "f32", "smem"])), op=T.ascend_gm_to_ub())
                 with T.SimdVF():
                     xr = tf.schedule((x_ub, tf.empty(Tensor[(128, 300), "f32", "rmem"])), op=T.ascend_ub_to_reg())
-                    yr = tf.schedule((xr, xr, tf.empty(Tensor[(128, 300), "f32", "rmem"])), op=T.ascend_vadd())
+                    yr = tf.schedule((xr, xr, tf.empty(Tensor[(128, 300), "f32", "rmem"])), op=T.ascend_vbinary(kind="add"))
                     y_ub = tf.schedule((yr, tf.empty(Tensor[(128, 300), "f32", "smem"])), op=T.ascend_reg_to_ub())
                 row_gm = tf.schedule((y_ub, tf.empty(Tensor[(128, 300), "f32", "gmem"])), op=T.ascend_ub_to_gm())
                 out = tf.insert_slice(out, tf.reshape(row_gm, new_shape=(1, 128, 300)), (k, 0, 0))
@@ -488,8 +488,8 @@ class M:
     versions1 = list(low1.metadata["ascend.pipelines"]["pure_simdvf:k"]["versions"].values())
     assert versions1 == [1, 2]
 
-    import dataclasses
-    from tilefoundry.ir.tir.stmts import ExecutionScope, Sequential
+    import dataclasses  # noqa: PLC0415
+    from tilefoundry.ir.tir.stmts import ExecutionScope, Sequential  # noqa: PLC0415
 
     def _with_simtvf(node):
         if isinstance(node, ExecutionScope):
@@ -519,18 +519,18 @@ def test_sil_policy_override_shadow_dump_and_automatic_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Verify SIL policy overrides (L1/L0C/UB-256KB), shadow_dump_path, and automatic fallback."""
-    import json
-    from tilefoundry_ascend.ascend.schedule.pipeline_solver import _op_resource_mask
-    from tilefoundry_ascend.ascend.ir.tir.instructions import AscendDualCopyL0cToUb
-    from tilefoundry_ascend.ascend.target import NodeResourceMask
+    import json  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.schedule.pipeline_solver import (  # noqa: PLC0415
+        _op_resource_mask,
+    )
+    from tilefoundry_ascend.ascend.ir.tir.instructions import AscendDualCopyL0cToUb  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.target import NodeResourceMask  # noqa: PLC0415
 
     monkeypatch.chdir(tmp_path)
 
-    # 1. dav-3510 L0C->UB uses AIC.FIXPIPE writing directly to dual AIV UB (no AIV.MTE2)
     mask = _op_resource_mask(AscendDualCopyL0cToUb(), (None, None))
     assert mask == NodeResourceMask.for_aic("FIXPIPE")
 
-    # 2. Valid SIL policy override + shadow dump path (no root envelope.json)
     facts = _target().get_facts(AscendSpaceFacts)
     problem = Problem(
         tasks=(
@@ -571,7 +571,6 @@ def test_sil_policy_override_shadow_dump_and_automatic_fallback(
     assert shadow_data["fallback_used"] is False
     assert not pathlib.Path("envelope.json").exists()
 
-    # 3. Over-capacity SIL policy triggers automatic fallback to deterministic solver
     fallback_prob = Problem(
         tasks=(
             Task(name="load", resources=(("aiv", "aiv0", "mte2", 1),), latency=1, stage=0),
@@ -596,7 +595,6 @@ def test_sil_policy_override_shadow_dump_and_automatic_fallback(
 def test_sil_l1_slot_aliasing_saves_capacity_and_rejects_overlap():
     """Verify MLA K_rope -> P L1 slot aliasing rescues capacity and falls back on overlap."""
     facts = _target().get_facts(AscendSpaceFacts)
-    # K_rope (256KB) + P (256KB) with double-buffering or tight 384KB budget overflows unless aliased
     problem = Problem(
         tasks=(
             Task(name="load_k_rope", resources=(("aic", "aic0", "mte2", 1),), latency=1, stage=0),
@@ -622,11 +620,9 @@ def test_sil_l1_slot_aliasing_saves_capacity_and_rejects_overlap():
         max_stage=0,
         manual=False,
     )
-    # Without aliasing: 256KB + 256KB > 300KB -> UNSAT
     with pytest.raises(PipelineError, match="ASCEND_PIPELINE_UNSAT"):
         solve_ascend_pipeline(problem)
 
-    # With L1 slot aliasing K_rope -> P: fits in 300KB!
     res = solve_ascend_pipeline(problem, sil_policy={"l1_slot_aliasing": {"l1_p": "l1_k_rope"}})
     assert res.fallback_used is False
     assert verify_assignment(res.problem, res.assignment) == []
@@ -634,7 +630,6 @@ def test_sil_l1_slot_aliasing_saves_capacity_and_rejects_overlap():
     assert slot_map["l1_k_rope"] == 256 * 1024
     assert slot_map["l1_p"] == 0
 
-    # Illegal overlap: dual_p writes P in stage 0 BEFORE mmad_qk reads K_rope in stage 2
     bad_prob = Problem(
         tasks=(
             Task(name="load_k_rope", resources=(("aic", "aic0", "mte2", 1),), latency=1, stage=0),
@@ -665,12 +660,15 @@ def test_sil_l1_slot_aliasing_saves_capacity_and_rejects_overlap():
 
 def test_extract_tir_loop_problem_dynamic_fallback_with_dim_hints():
     """Verify allow_dynamic_fallback + dim_hints evaluates symbolic DimVar buffer shapes."""
-    from tilefoundry.ir.core import Call, Constant, Var
-    from tilefoundry.ir.tir.memory import AllocTensor
-    from tilefoundry.ir.tir.stmts import Evaluate, For, LetStmt, Sequential
-    from tilefoundry.ir.types import DType, StorageKind, TensorType
-    from tilefoundry.ir.types.dim import DimVar
-    from tilefoundry_ascend.ascend.ir.tir.instructions import AscendGmToUb, AscendUbToGm
+    from tilefoundry.ir.core import Call, Constant, Var  # noqa: PLC0415
+    from tilefoundry.ir.tir.memory import AllocTensor  # noqa: PLC0415
+    from tilefoundry.ir.tir.stmts import Evaluate, For, LetStmt, Sequential  # noqa: PLC0415
+    from tilefoundry.ir.types import DType, StorageKind, TensorType  # noqa: PLC0415
+    from tilefoundry.ir.types.dim import DimVar  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.ir.tir.instructions import (  # noqa: PLC0415
+        AscendGmToUb,
+        AscendUbToGm,
+    )
 
     d_dyn = DimVar("N_dyn", 16, 512)
     gm_ty = TensorType((4, d_dyn), DType.f16, None, StorageKind.GMEM)

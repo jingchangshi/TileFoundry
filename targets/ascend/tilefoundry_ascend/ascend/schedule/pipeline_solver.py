@@ -7,8 +7,6 @@ from dataclasses import dataclass, replace
 import json
 import logging
 from pathlib import Path
-import time
-import uuid
 
 
 from tilefoundry.ir.core import Call, Expr, Op, Var
@@ -62,16 +60,12 @@ from tilefoundry_ascend.ascend.ir.tir.instructions import (
     AscendDualCopyL0cToUb,
     AscendDualCopyUbToL1,
     AscendGmToL1,
-    AscendGmToL1Nz,
     AscendGmToUb,
-    AscendGmToUbPad,
     AscendL0cToGm,
-    AscendL0cToGmAtomic,
     AscendL1ToL0A,
     AscendL1ToL0B,
     AscendMmad,
     AscendUbToGm,
-    AscendUbToGmAtomic,
 )
 from tilefoundry_ascend.ascend.cost_model.pipe_schedule_eval import (
     DIRECTION_SLOPE_MULT,
@@ -438,7 +432,6 @@ def _estimate_task_latency_ns(
                 issue_w = 3.0
             else:
                 issue_w = 0.5
-            # 128 FLOPs/cycle peak or AVE 256B vector beat latency
             beats = max(1.0, float(op_bytes) / 256.0 if op_bytes > 0 else float(op_elems) / 128.0)
             total_ns += (beats * issue_w) / max(0.1, clock_ghz)
         return max(26.0, total_ns)
@@ -474,15 +467,11 @@ def _estimate_task_latency_ns(
             op,
             (
                 AscendGmToUb,
-                AscendGmToUbPad,
                 AscendUbToGm,
-                AscendUbToGmAtomic,
                 AscendGmToL1,
-                AscendGmToL1Nz,
                 AscendL1ToL0A,
                 AscendL1ToL0B,
                 AscendL0cToGm,
-                AscendL0cToGmAtomic,
                 AscendDualCopy,
                 AscendDualCopyL0cToUb,
                 AscendDualCopyUbToL1,
@@ -501,11 +490,11 @@ def _estimate_task_latency_ns(
             )
             if isinstance(op, (AscendL1ToL0A, AscendL1ToL0B)):
                 pipe, mult = "MTE1", 1.0
-            elif isinstance(op, (AscendGmToL1, AscendGmToL1Nz, AscendGmToUb, AscendGmToUbPad)):
+            elif isinstance(op, (AscendGmToL1, AscendGmToUb)):
                 pipe, mult = "MTE2", 1.0
             elif isinstance(op, AscendDualCopyUbToL1):
                 pipe, mult = "MTE3", DIRECTION_SLOPE_MULT["ub_to_l1"]
-            elif isinstance(op, (AscendUbToGm, AscendUbToGmAtomic)):
+            elif isinstance(op, AscendUbToGm):
                 pipe, mult = "MTE3", 1.0
             elif isinstance(op, AscendDualCopyL0cToUb):
                 pipe, mult = "FIXPIPE", DIRECTION_SLOPE_MULT["l0c_to_ub"]
@@ -571,7 +560,6 @@ def _op_resource_mask(
         if isinstance(op, AscendDualCopyUbToL1):
             return NodeResourceMask.for_aic("MTE1") | NodeResourceMask.for_dual_aiv("MTE3")
         if isinstance(op, AscendDualCopyL0cToUb):
-            # On dav-3510, L0C->UB uses AIC.FIXPIPE writing directly into dual AIV UB.
             return NodeResourceMask.for_aic("FIXPIPE")
         return NodeResourceMask.for_aic("FIXPIPE") | NodeResourceMask.for_dual_aiv("MTE2")
     if resource == "vector_engine":
@@ -1062,7 +1050,7 @@ def extract_tir_loop_problem(
                         roles.add("l0c")
                 elif isinstance(
                     op,
-                    (AscendL0cToGm, AscendL0cToGmAtomic, AscendDualCopy, AscendDualCopyL0cToUb),
+                    (AscendL0cToGm, AscendDualCopy, AscendDualCopyL0cToUb),
                 ) and param.name == "src":
                     if buf_type.storage is StorageKind.TMEM:
                         roles.add("l0c")

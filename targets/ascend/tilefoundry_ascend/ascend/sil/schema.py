@@ -458,7 +458,7 @@ class AdvisoryEnvelope:
     has_nan_inf_cases: bool = False
     has_inplace_aliasing: bool = False
     precision_thresholds: dict[str, float] = field(default_factory=dict)
-    hir_navigation_packet: dict[str, object] | None = None
+    hir_blueprint: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.op_name, str) or not self.op_name.strip():
@@ -499,11 +499,11 @@ class AdvisoryEnvelope:
             "precision_thresholds",
             _as_float_dict(self.precision_thresholds, "precision_thresholds"),
         )
-        if self.hir_navigation_packet is not None:
-            if not isinstance(self.hir_navigation_packet, Mapping):
-                raise ValueError("hir_navigation_packet must be a mapping or None")
+        if self.hir_blueprint is not None:
+            if not isinstance(self.hir_blueprint, Mapping):
+                raise ValueError("hir_blueprint must be a mapping or None")
             object.__setattr__(
-                self, "hir_navigation_packet", _json_clone(self.hir_navigation_packet)
+                self, "hir_blueprint", _json_clone(self.hir_blueprint)
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -521,9 +521,9 @@ class AdvisoryEnvelope:
             "has_nan_inf_cases": self.has_nan_inf_cases,
             "has_inplace_aliasing": self.has_inplace_aliasing,
             "precision_thresholds": dict(self.precision_thresholds),
-            "hir_navigation_packet": (
-                _json_clone(self.hir_navigation_packet)
-                if self.hir_navigation_packet is not None
+            "hir_blueprint": (
+                _json_clone(self.hir_blueprint)
+                if self.hir_blueprint is not None
                 else None
             ),
         }
@@ -536,7 +536,7 @@ class AdvisoryEnvelope:
             if isinstance(raw_bounds, Mapping)
             else HardwareLegalityBounds()
         )
-        raw_packet = payload.get("hir_navigation_packet")
+        raw_packet = payload.get("hir_blueprint")
         raw_axes = payload["topology_axes"]
         axes = (
             raw_axes
@@ -560,7 +560,7 @@ class AdvisoryEnvelope:
                 str(k): float(v)
                 for k, v in (payload.get("precision_thresholds") or {}).items()
             },
-            hir_navigation_packet=dict(raw_packet) if isinstance(raw_packet, Mapping) else None,
+            hir_blueprint=dict(raw_packet) if isinstance(raw_packet, Mapping) else None,
         )
 
     def to_json(self, *, indent: int | None = 2) -> str:
