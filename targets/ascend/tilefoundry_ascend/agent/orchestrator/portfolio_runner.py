@@ -39,8 +39,10 @@ from tilefoundry_ascend.agent.router.capability_gate import (
 )
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
 from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
+    CostFeatures,
     CostPrediction,
     HybridAscendCostModel,
+    build_cost_features_from_ledger,
 )
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirTirNavigationPacket
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
@@ -286,6 +288,11 @@ def build_prescreen_summary_from_kwargs(
     dims: Mapping[str, object] | None = None,
     pass_configs: Mapping[str, object] | None = None,
     compile_flags: Sequence[str] | str | None = None,
+    cost_model: HybridAscendCostModel | None = None,
+    axes: TopologyAxes | None = None,
+    live_plan: object | None = None,
+    nav_packet: object | None = None,
+    sil_advisory: object | None = None,
 ) -> str:
     """Build live-IR or analytical dual-accumulator tile prescreen summary."""
     if not kwargs:
@@ -335,6 +342,11 @@ def build_prescreen_summary_from_kwargs(
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
                 dims=dims,
+                cost_model=cost_model,
+                axes=axes,
+                live_plan=live_plan,
+                nav_packet=nav_packet,
+                sil_advisory=sil_advisory,
             )
             if live_summary:
                 return live_summary
@@ -752,6 +764,7 @@ class PortfolioRunner:
         max_syntax_repairs: int = 1,
         enable_track_router: bool = False,
         enable_tilesize_prescreen: bool = False,
+        cost_model: HybridAscendCostModel | None = None,
     ) -> None:
         self._backend = backend
         self._funnel = funnel
@@ -761,6 +774,7 @@ class PortfolioRunner:
         self._max_repairs = max(0, max_syntax_repairs)
         self._enable_track_router = enable_track_router
         self._enable_tilesize_prescreen = bool(enable_tilesize_prescreen)
+        self._cost_model = cost_model
 
     @property
     def beam(self) -> TwoLaneBeamSearch:
@@ -784,6 +798,7 @@ class PortfolioRunner:
         sil_advisory: object | None = None,
         sil_verification: object | None = None,
         topology_axes: object | None = None,
+        cost_model: HybridAscendCostModel | None = None,
     ) -> tuple[WorkerSpec, ...]:
         """Select matching causal rules and fill remaining slots with creative explorers."""
         active_axes = _derive_active_topology_axes(
@@ -843,6 +858,10 @@ class PortfolioRunner:
                 var_bindings=var_bindings,
                 config_selector_name=config_selector_name,
                 dims=dims,
+                cost_model=cost_model or self._cost_model,
+                axes=active_axes,
+                nav_packet=nav_packet,
+                sil_advisory=sil_advisory,
             )
         else:
             prescreen_summary = ""
@@ -1169,18 +1188,14 @@ class PortfolioRunner:
     ) -> RoundEscalationReport:
         """Closed-loop escalation check wiring HybridAscendCostModel + evaluate_track_escalation + relax_facets_for_bottleneck."""
         model = cost_model if cost_model is not None else HybridAscendCostModel(AscendTarget("ascend.950pr"))
-        eff_workload = dict(workload or {})
-        if not eff_workload:
-            pipes = candidate.ledger.pipe_cycles if candidate.ledger else {}
-            cube_c = int(pipes.get("AIC.PIPE_M", 0)) + int(pipes.get("AIC.CUBE", 0))
-            vec_c = int(pipes.get("AIV0.PIPE_V", 0)) + int(pipes.get("AIV1.PIPE_V", 0))
-            eff_workload = {
-                "cube_flops": float(max(0, cube_c)) * 4096.0,
-                "vec_flops": float(max(1, vec_c)) * 128.0,
-                "gm_bytes": float(max(65536, getattr(candidate.ledger, "gm_roundtrip_bytes", 0) or 65536)),
-                "contig_burst_bytes": int(getattr(candidate.ledger, "dominant_contig_bytes", 0) or 32768),
-                "total_tiles": int(getattr(candidate.ledger, "grid_blocks", 0) or 56),
-            }
+        eff_workload: CostFeatures | Mapping[str, object]
+        if workload:
+            eff_workload = dict(workload)
+        else:
+            eff_workload = build_cost_features_from_ledger(
+                candidate.ledger,
+                target=model.target,
+            )
 
         eff_summary: BishengResourceSummary | None
         if compiler_summary is None:

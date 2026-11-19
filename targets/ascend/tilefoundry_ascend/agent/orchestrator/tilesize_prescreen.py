@@ -7,9 +7,20 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from itertools import product
 import math
+from typing import TYPE_CHECKING
 
+from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
+    CostFeatures,
+    CostPrediction,
+    HybridAscendCostModel,
+    build_cost_features_from_ledger,
+)
+from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 from tilefoundry_ascend.ascend.target.facts import ascend_space_facts, cube_macs_per_cycle as _default_cube_macs_per_cycle
+
+if TYPE_CHECKING:
+    from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult
 
 
 def _align512(nbytes: int) -> int:
@@ -474,6 +485,55 @@ def _apply_tile_candidate_to_kwargs(
     return kw
 
 
+@dataclass(frozen=True)
+class CostRankedCandidate:
+    """Stage-A feasible candidate scored by unified HybridAscendCostModel."""
+
+    candidate_id: str
+    pred_us: float
+    tier0_physics_us: float
+    tier1_penalty_us: float
+    dominant_bound: str
+    topology_bucket: str
+    ledger: object | None = None
+
+
+def rank_stage_a_candidates_with_cost_model(
+    candidates: Sequence[tuple[str, str, StageAResult]],
+    *,
+    cost_model: HybridAscendCostModel,
+    live_plan: object | None = None,
+    axes: TopologyAxes | None = None,
+    nav_packet: object | None = None,
+    sil_advisory: object | None = None,
+) -> list[CostRankedCandidate]:
+    """Score Stage-A passers with HybridAscendCostModel and sort ascending by pred_us."""
+    scored: list[tuple[float, int, CostRankedCandidate]] = []
+    for idx, (cand_id, _patched_src, stage_a) in enumerate(candidates):
+        ledger = getattr(stage_a, "ledger", None)
+        features = build_cost_features_from_ledger(
+            ledger,
+            live_plan=live_plan,
+            axes=axes,
+            nav_packet=nav_packet,
+            sil_advisory=sil_advisory,
+            target=cost_model.target,
+        )
+        pred = cost_model.predict(features)
+        ranked_item = CostRankedCandidate(
+            candidate_id=str(cand_id),
+            pred_us=float(pred.pred_us),
+            tier0_physics_us=float(pred.tier0_physics_us),
+            tier1_penalty_us=float(pred.tier1_penalty_us),
+            dominant_bound=str(pred.dominant_bound),
+            topology_bucket=str(pred.topology_bucket),
+            ledger=ledger,
+        )
+        scored.append((ranked_item.pred_us, idx, ranked_item))
+    scored.sort(key=lambda entry: (entry[0], entry[1]))
+    return [entry[2] for entry in scored]
+
+
 def prescreen_live_ir_neighborhood(
     dsl_source: str,
     *,
@@ -487,6 +547,11 @@ def prescreen_live_ir_neighborhood(
     dims: Mapping[str, object] | None = None,
     target: AscendTarget | None = None,
     max_variants: int = 8,
+    cost_model: HybridAscendCostModel | None = None,
+    axes: TopologyAxes | None = None,
+    live_plan: object | None = None,
+    nav_packet: object | None = None,
+    sil_advisory: object | None = None,
 ) -> str:
     """Run bounded Stage A live-IR dry-runs across aligned tile variants around center."""
     params, has_varkw = inspect_builder_tile_params(dsl_source, factory_name)
@@ -575,6 +640,7 @@ def prescreen_live_ir_neighborhood(
             float,
             int,
             float,
+            CostPrediction | None,
         ]
     ] = []
     any_ledger = False
@@ -605,6 +671,10 @@ def prescreen_live_ir_neighborhood(
                     f"REJECT({res.error_message or 'stage_a_failed'})",
                     {},
                     0,
+                    None,
+                    1.0,
+                    0,
+                    0.0,
                     None,
                 )
             )
@@ -675,6 +745,18 @@ def prescreen_live_ir_neighborhood(
             norm_ii = (ii_rank / area) if ii_rank != float("inf") else float("inf")
             norm_cycles = float(dom_cycles) / area
             sort_key = (norm_ii, norm_cycles, -area, float(idx))
+        cost_pred: CostPrediction | None = None
+        if cost_model is not None:
+            cf = build_cost_features_from_ledger(
+                ledger,
+                live_plan=live_plan,
+                axes=axes,
+                nav_packet=nav_packet,
+                sil_advisory=sil_advisory,
+                target=cost_model.target,
+            )
+            cost_pred = cost_model.predict(cf)
+            sort_key = (float(cost_pred.pred_us), *sort_key)
         records.append(
             (
                 is_ok,
@@ -687,6 +769,7 @@ def prescreen_live_ir_neighborhood(
                 burst_eff,
                 est_waves,
                 wave_burst_score,
+                cost_pred,
             )
         )
 
@@ -712,10 +795,16 @@ def prescreen_live_ir_neighborhood(
         burst_eff,
         est_waves,
         wave_burst_score,
+        cost_pred,
     ) in enumerate(ordered, start=1):
         extra = f", ii={ii_val}" if ii_val is not None else ""
         if deg_cnt > 0:
             extra += f", degraded={deg_cnt}"
+        cost_suffix = (
+            f", pred_us={cost_pred.pred_us:.2f}us ({cost_pred.dominant_bound})"
+            if cost_pred is not None
+            else ""
+        )
         if pure_vector_row_tile:
             wl_parts = [
                 f"{scope.lower()}={sbytes.get(scope, 0)}B"
@@ -726,7 +815,7 @@ def prescreen_live_ir_neighborhood(
                 vec_extra += f", est_waves={est_waves}, wave_burst_score={wave_burst_score:.2f}"
             lines.append(
                 f"  {rank_idx}. tile_m={cand.bm}, stages={cand.stages} "
-                f"| {status} | {', '.join(wl_parts)}{extra}{vec_extra}"
+                f"| {status} | {', '.join(wl_parts)}{extra}{vec_extra}{cost_suffix}"
             )
         else:
             wl_parts = [
@@ -735,7 +824,7 @@ def prescreen_live_ir_neighborhood(
             ]
             lines.append(
                 f"  {rank_idx}. bm={cand.bm}, bn={cand.bn}, bk={cand.bk}, stages={cand.stages} "
-                f"| {status} | {', '.join(wl_parts)}{extra}"
+                f"| {status} | {', '.join(wl_parts)}{extra}{cost_suffix}"
             )
     return "\n".join(lines)
 
@@ -892,6 +981,7 @@ def evaluate_prescreen_ablation(
 
 
 __all__ = [
+    "CostRankedCandidate",
     "PrescreenAblationReport",
     "PrescreenAblationSample",
     "PrescreenScore",
@@ -904,4 +994,5 @@ __all__ = [
     "inspect_builder_tile_params",
     "prescreen_live_ir_neighborhood",
     "prescreen_tile_configs",
+    "rank_stage_a_candidates_with_cost_model",
 ]

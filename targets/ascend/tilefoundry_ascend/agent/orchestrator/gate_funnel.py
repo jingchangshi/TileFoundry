@@ -235,12 +235,18 @@ _VLOOPV2_MISS_RE = re.compile(
 
 def _parse_cce_res_usage_with_summary(
     output_text: str,
+    *,
+    asm_or_dump_text: str = "",
 ) -> tuple[int, bool, BishengResourceSummary]:
-    """Parse bisheng diagnostics via bisheng_res_parser and return (spill_bytes, vloopv2_hit, summary)."""
-    summary = parse_bisheng_res_usage(output_text or "")
+    """Parse bisheng diagnostics and lowered source via bisheng_res_parser."""
+    summary = parse_bisheng_res_usage(
+        output_text or "",
+        asm_or_dump_text=asm_or_dump_text or "",
+    )
+    combined_vloop_text = f"{output_text or ''}\n{asm_or_dump_text or ''}"
     if summary.software_loops > 0 and summary.vloopv2_loops == 0:
         vloopv2_hit = False
-    elif _VLOOPV2_MISS_RE.search(output_text or ""):
+    elif _VLOOPV2_MISS_RE.search(combined_vloop_text):
         vloopv2_hit = False
     elif summary.vloopv2_loops > 0 and summary.software_loops == 0:
         vloopv2_hit = True
@@ -718,6 +724,7 @@ def build_stage_b_driver_source(
     dims: Mapping[str, object] | None = None,
     enable_device_compile: bool = True,
     include_res_usage: bool = True,
+    kernel_dump_path: str | Path | None = None,
 ) -> str:
     """Build standalone Python driver lowering and device-compiling a candidate DSL file."""
     eff_kwargs = _merge_dims_into_kwargs(factory_kwargs, dims)
@@ -732,6 +739,7 @@ def build_stage_b_driver_source(
             "compile_flags": ext_cf,
             "enable_device_compile": bool(enable_device_compile),
             "include_res_usage": bool(include_res_usage),
+            "kernel_dump_path": str(kernel_dump_path) if kernel_dump_path is not None else None,
         }
     )
     return (
@@ -833,10 +841,22 @@ def build_stage_b_driver_source(
         "    if _merged_cf:\n"
         "        _merged_pc['tl.device_compile_flags'] = list(_merged_cf)\n"
         "    with tvm.transform.PassContext(config=_merged_pc):\n"
-        "        _art = tilelang.lower(\n"
-        "            _fn, target='ascend', enable_device_compile=_cfg['enable_device_compile']\n"
-        "        )\n"
+        "        try:\n"
+        "            _art = tilelang.lower(\n"
+        "                _fn, target='ascend', enable_device_compile=_cfg['enable_device_compile']\n"
+        "            )\n"
+        "        except Exception:\n"
+        "            if _cfg.get('kernel_dump_path') and _cfg['enable_device_compile']:\n"
+        "                try:\n"
+        "                    _low_only = tilelang.lower(_fn, target='ascend', enable_device_compile=False)\n"
+        "                    if getattr(_low_only, 'kernel_source', None):\n"
+        "                        pathlib.Path(_cfg['kernel_dump_path']).write_text(str(_low_only.kernel_source), encoding='utf-8')\n"
+        "                except Exception:\n"
+        "                    pass\n"
+        "            raise\n"
         "    assert _art.kernel_source\n"
+        "    if _cfg.get('kernel_dump_path'):\n"
+        "        pathlib.Path(_cfg['kernel_dump_path']).write_text(str(_art.kernel_source), encoding='utf-8')\n"
     )
 
 
@@ -862,6 +882,7 @@ def run_stage_b_compile(
     with tempfile.TemporaryDirectory(prefix="tf_stage_b_") as tmp_dir:
         cand_path = Path(tmp_dir) / "candidate_dsl.py"
         cand_path.write_text(dsl_source, encoding="utf-8")
+        kernel_dump_path = Path(tmp_dir) / "lowered_kernel.cce"
 
         def _invoke(include_res_usage: bool) -> subprocess.CompletedProcess[str]:
             driver = build_stage_b_driver_source(
@@ -874,6 +895,7 @@ def run_stage_b_compile(
                 dims=dims,
                 enable_device_compile=enable_device_compile,
                 include_res_usage=include_res_usage,
+                kernel_dump_path=kernel_dump_path,
             )
             return subprocess.run(
                 [py_exe, "-c", driver],
@@ -899,8 +921,16 @@ def run_stage_b_compile(
                 error_message=f"stage_b_compile_timeout:{timeout_sec}s",
                 elapsed_sec=time.monotonic() - t0,
             )
+        lowered_dump = (
+            kernel_dump_path.read_text(encoding="utf-8", errors="ignore")
+            if kernel_dump_path.is_file()
+            else ""
+        )
     combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(combined_out)
+    spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
+        combined_out,
+        asm_or_dump_text=lowered_dump,
+    )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[-1500:]
         return StageBResult(
@@ -1118,7 +1148,10 @@ def run_stage_b_ascendc_compile(
             )
 
         combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(combined_out)
+        spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
+            combined_out,
+            asm_or_dump_text=cpp_source,
+        )
         if proc.returncode != 0 or not obj_path.is_file():
             detail = (proc.stderr or proc.stdout or "bisheng failed without diagnostics").strip()[-1500:]
             return StageBResult(

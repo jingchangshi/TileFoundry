@@ -155,6 +155,7 @@ class MarathonConfig:
     warmup: int = 3
     repeat: int = 5
     enable_tilesize_prescreen: bool = False
+    cost_prescreen_top_k: int | None = None
     prewarm_l3: bool = True
     salvage_beam_candidates: bool = True
     resume: bool | None = None
@@ -1558,6 +1559,7 @@ def run_operator_marathon(
         warmup=cfg.warmup,
         repeat=cfg.repeat,
         enable_tilesize_prescreen=cfg.enable_tilesize_prescreen,
+        cost_prescreen_top_k=cfg.cost_prescreen_top_k,
         exploit_effort=cfg.exploit_effort,
     )
     tracker = BayesianRuleTracker.from_seed_yaml()
@@ -1600,6 +1602,7 @@ def run_operator_marathon(
         ),
         checkpoint_path=checkpoint_path,
         campaign_kb_path=campaign_kb_path,
+        cost_calibration_path=state_dir / "cost_model_calibration.jsonl",
         source_root=worktree,
         env_file=env_file,
         stagnation_discount=cfg.stagnation_discount,

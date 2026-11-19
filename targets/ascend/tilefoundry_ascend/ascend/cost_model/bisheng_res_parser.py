@@ -133,15 +133,28 @@ def _detect_vf_fusion_breaks(res_text: str = "", asm_or_dump_text: str = "") -> 
     explicit = _match_int((r"\bvf_fusion_breaks\s*[:=]\s*(\d+)",), combined)
     if explicit is not None:
         return max(0, explicit)
-    src = asm_or_dump_text if asm_or_dump_text.strip() else combined
-    launches = re.findall(
-        r"(?:\basc_vf_call\b|\bT\.SimdVF\b|\b__simd_vf__\b|\bSimdVF\s*\()",
-        src,
+    raw_src = asm_or_dump_text if asm_or_dump_text.strip() else combined
+    # Strip C/C++ comments and forward prototypes so declarations don't double-count launches.
+    src_no_comments = re.sub(r"/\*.*?\*/", " ", raw_src, flags=re.DOTALL)
+    src_no_comments = re.sub(r"//[^\n]*", "", src_no_comments)
+    src_lines = [
+        ln
+        for ln in src_no_comments.splitlines()
+        if not re.match(r"^\s*(?:#\s*(?:define|include)|extern\b)", ln)
+    ]
+    clean_src = "\n".join(src_lines)
+    explicit_markers = re.findall(r"\bvf_fusion_break\b", clean_src, flags=re.IGNORECASE)
+    call_launches = re.findall(
+        r"(?:\basc_vf_call\s*(?:<[^>\n]*>\s*)?\(|\bT\.SimdVF\s*\(|\bSimdVF\s*\()",
+        clean_src,
         flags=re.IGNORECASE,
     )
-    explicit_markers = re.findall(r"\bvf_fusion_break\b", src, flags=re.IGNORECASE)
-    if len(launches) >= 2:
-        return (len(launches) - 1) + len(explicit_markers)
+    if call_launches:
+        launch_count = len(call_launches)
+    else:
+        launch_count = len(re.findall(r"\b__simd_vf__\b", clean_src, flags=re.IGNORECASE))
+    if launch_count >= 2:
+        return (launch_count - 1) + len(explicit_markers)
     return len(explicit_markers)
 
 

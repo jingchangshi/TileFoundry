@@ -56,6 +56,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
+    _parse_cce_res_usage_with_summary,
     build_stage_b_driver_source,
     run_stage_a_static,
     run_stage_b_compile,
@@ -529,6 +530,7 @@ def run_l1_compile_check(
         tmp = Path(tmp_dir)
         cand_path = tmp / "candidate_dsl.py"
         cand_path.write_text(module_source, encoding="utf-8")
+        kernel_dump_path = tmp / "lowered_kernel.cce"
         driver_path = tmp / "compile_driver.py"
         driver_path.write_text(
             build_stage_b_driver_source(
@@ -540,6 +542,7 @@ def run_l1_compile_check(
                 compile_flags=compile_flags,
                 dims=dims,
                 enable_device_compile=True,
+                kernel_dump_path=kernel_dump_path,
             ),
             encoding="utf-8",
         )
@@ -566,14 +569,33 @@ def run_l1_compile_check(
                 error_message=f"l1_compile_timeout:{timeout_sec}s",
                 elapsed_sec=time.monotonic() - t0,
             )
+        lowered_dump = (
+            kernel_dump_path.read_text(encoding="utf-8", errors="ignore")
+            if kernel_dump_path.is_file()
+            else ""
+        )
+    combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
+        combined_out,
+        asm_or_dump_text=lowered_dump,
+    )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[-1500:]
         return StageBResult(
             passed=False,
             error_message=f"l1_compile_failed (rc={proc.returncode}): {detail}",
             elapsed_sec=time.monotonic() - t0,
+            spill_bytes=spill_bytes,
+            vloopv2_hit=vloopv2_hit,
+            compiler_summary=summary,
         )
-    return StageBResult(passed=True, elapsed_sec=time.monotonic() - t0)
+    return StageBResult(
+        passed=True,
+        elapsed_sec=time.monotonic() - t0,
+        spill_bytes=spill_bytes,
+        vloopv2_hit=vloopv2_hit,
+        compiler_summary=summary,
+    )
 
 
 async def run_l0_l1_round_filter(
@@ -585,8 +607,14 @@ async def run_l0_l1_round_filter(
     repair_backend: KernelLLMBackend | None = None,
     max_syntax_repairs: int = 1,
     slice_hint: str = "",
+    stage_a_cost_ranker: Callable[
+        [Sequence[tuple[str, str, StageAResult]]], Sequence[tuple[str, float]]
+    ]
+    | None = None,
+    cost_prescreen_top_k: int | None = None,
 ) -> list[L0L1CandidateCheck]:
-    """Filter candidate snippets through L0 static and concurrent L1 compile checks."""
+    """Filter candidate snippets through L0 static, optional CostModel prescreen, and L1 compile."""
+    max_attempts = max(0, max_syntax_repairs)
 
     async def _try_repair(cur_src: str, diag: str) -> tuple[str | None, str, bool]:
         assert repair_backend is not None
@@ -601,114 +629,233 @@ async def run_l0_l1_round_filter(
             return None, f"{diag} | repair_parse: {type(exc).__name__}: {exc}", False
         return repaired_src, "", False
 
-    async def _check_one(cand_id: str, snippet: str) -> L0L1CandidateCheck:
-        cur_snippet = snippet
-        repaired = False
-        for attempt in range(max(0, max_syntax_repairs) + 1):
+    async def _run_stage_a_phase(
+        cand_id: str,
+        cur_snippet: str,
+        *,
+        start_attempt: int = 0,
+        repaired: bool = False,
+    ) -> tuple[L0L1CandidateCheck | None, tuple[str, str, StageAResult, bool, int] | None]:
+        snippet = cur_snippet
+        is_repaired = repaired
+        for attempt in range(start_attempt, max_attempts + 1):
             try:
-                patched = patch_fn(cur_snippet)
+                patched = patch_fn(snippet)
             except Exception as exc:
                 err = f"ast_patch_error: {type(exc).__name__}: {exc}"
-                if repair_backend is None or attempt >= max(0, max_syntax_repairs):
-                    return L0L1CandidateCheck(
-                        candidate_id=cand_id,
-                        passed=False,
-                        failed_tier="stage_a",
-                        patched_module_source="",
-                        snippet_source=cur_snippet,
-                        repaired=repaired,
-                        error_message=err,
+                if repair_backend is None or attempt >= max_attempts:
+                    return (
+                        L0L1CandidateCheck(
+                            candidate_id=cand_id,
+                            passed=False,
+                            failed_tier="stage_a",
+                            patched_module_source="",
+                            snippet_source=snippet,
+                            repaired=is_repaired,
+                            error_message=err,
+                        ),
+                        None,
                     )
-                next_snippet, rep_err, is_transport = await _try_repair(cur_snippet, err)
+                next_snippet, rep_err, is_transport = await _try_repair(snippet, err)
                 if next_snippet is None:
-                    return L0L1CandidateCheck(
-                        candidate_id=cand_id,
-                        passed=False,
-                        failed_tier="llm_transport" if is_transport else "stage_a",
-                        patched_module_source="",
-                        snippet_source=cur_snippet,
-                        repaired=repaired,
-                        error_message=rep_err,
+                    return (
+                        L0L1CandidateCheck(
+                            candidate_id=cand_id,
+                            passed=False,
+                            failed_tier="llm_transport" if is_transport else "stage_a",
+                            patched_module_source="",
+                            snippet_source=snippet,
+                            repaired=is_repaired,
+                            error_message=rep_err,
+                        ),
+                        None,
                     )
-                cur_snippet = next_snippet
-                repaired = True
+                snippet = next_snippet
+                is_repaired = True
                 continue
 
             stage_a = await asyncio.to_thread(l0_checker, patched)
             if not stage_a.passed:
                 err = stage_a.error_message or "l0_static_failed"
-                if repair_backend is None or attempt >= max(0, max_syntax_repairs):
-                    return L0L1CandidateCheck(
-                        candidate_id=cand_id,
-                        passed=False,
-                        failed_tier="stage_a",
-                        patched_module_source=patched,
-                        snippet_source=cur_snippet,
-                        repaired=repaired,
-                        stage_a=stage_a,
-                        error_message=err,
+                if repair_backend is None or attempt >= max_attempts:
+                    return (
+                        L0L1CandidateCheck(
+                            candidate_id=cand_id,
+                            passed=False,
+                            failed_tier="stage_a",
+                            patched_module_source=patched,
+                            snippet_source=snippet,
+                            repaired=is_repaired,
+                            stage_a=stage_a,
+                            error_message=err,
+                        ),
+                        None,
                     )
-                next_snippet, rep_err, is_transport = await _try_repair(cur_snippet, err)
+                next_snippet, rep_err, is_transport = await _try_repair(snippet, err)
                 if next_snippet is None:
-                    return L0L1CandidateCheck(
-                        candidate_id=cand_id,
-                        passed=False,
-                        failed_tier="llm_transport" if is_transport else "stage_a",
-                        patched_module_source=patched,
-                        snippet_source=cur_snippet,
-                        repaired=repaired,
-                        stage_a=stage_a,
-                        error_message=rep_err,
+                    return (
+                        L0L1CandidateCheck(
+                            candidate_id=cand_id,
+                            passed=False,
+                            failed_tier="llm_transport" if is_transport else "stage_a",
+                            patched_module_source=patched,
+                            snippet_source=snippet,
+                            repaired=is_repaired,
+                            stage_a=stage_a,
+                            error_message=rep_err,
+                        ),
+                        None,
                     )
-                cur_snippet = next_snippet
-                repaired = True
+                snippet = next_snippet
+                is_repaired = True
                 continue
+            return None, (snippet, patched, stage_a, is_repaired, attempt)
+        raise RuntimeError("unreachable repair termination")
 
-            stage_b = await asyncio.to_thread(l1_compiler, patched)
-            if not stage_b.passed:
-                err = stage_b.error_message or "l1_compile_failed"
-                if repair_backend is None or attempt >= max(0, max_syntax_repairs):
-                    return L0L1CandidateCheck(
-                        candidate_id=cand_id,
-                        passed=False,
-                        failed_tier="stage_b",
-                        patched_module_source=patched,
-                        snippet_source=cur_snippet,
-                        repaired=repaired,
-                        stage_a=stage_a,
-                        stage_b=stage_b,
-                        error_message=err,
-                    )
-                next_snippet, rep_err, is_transport = await _try_repair(cur_snippet, err)
-                if next_snippet is None:
-                    return L0L1CandidateCheck(
-                        candidate_id=cand_id,
-                        passed=False,
-                        failed_tier="llm_transport" if is_transport else "stage_b",
-                        patched_module_source=patched,
-                        snippet_source=cur_snippet,
-                        repaired=repaired,
-                        stage_a=stage_a,
-                        stage_b=stage_b,
-                        error_message=rep_err,
-                    )
-                cur_snippet = next_snippet
-                repaired = True
-                continue
+    async def _run_stage_b_and_repairs(
+        cand_id: str,
+        snippet: str,
+        patched: str,
+        stage_a: StageAResult,
+        repaired: bool,
+        attempt: int,
+    ) -> L0L1CandidateCheck:
+        cur_snippet = snippet
+        cur_patched = patched
+        cur_stage_a = stage_a
+        cur_repaired = repaired
+        cur_attempt = attempt
+        while True:
+            stage_b = await asyncio.to_thread(l1_compiler, cur_patched)
+            if stage_b.passed:
+                return L0L1CandidateCheck(
+                    candidate_id=cand_id,
+                    passed=True,
+                    failed_tier=None,
+                    patched_module_source=cur_patched,
+                    snippet_source=cur_snippet,
+                    repaired=cur_repaired,
+                    stage_a=cur_stage_a,
+                    stage_b=stage_b,
+                )
+            err = stage_b.error_message or "l1_compile_failed"
+            if repair_backend is None or cur_attempt >= max_attempts:
+                return L0L1CandidateCheck(
+                    candidate_id=cand_id,
+                    passed=False,
+                    failed_tier="stage_b",
+                    patched_module_source=cur_patched,
+                    snippet_source=cur_snippet,
+                    repaired=cur_repaired,
+                    stage_a=cur_stage_a,
+                    stage_b=stage_b,
+                    error_message=err,
+                )
+            next_snippet, rep_err, is_transport = await _try_repair(cur_snippet, err)
+            if next_snippet is None:
+                return L0L1CandidateCheck(
+                    candidate_id=cand_id,
+                    passed=False,
+                    failed_tier="llm_transport" if is_transport else "stage_b",
+                    patched_module_source=cur_patched,
+                    snippet_source=cur_snippet,
+                    repaired=cur_repaired,
+                    stage_a=cur_stage_a,
+                    stage_b=stage_b,
+                    error_message=rep_err,
+                )
+            failed_chk, passed_state = await _run_stage_a_phase(
+                cand_id,
+                next_snippet,
+                start_attempt=cur_attempt + 1,
+                repaired=True,
+            )
+            if failed_chk is not None:
+                return failed_chk
+            assert passed_state is not None
+            cur_snippet, cur_patched, cur_stage_a, cur_repaired, cur_attempt = passed_state
 
-            return L0L1CandidateCheck(
-                candidate_id=cand_id,
-                passed=True,
-                failed_tier=None,
+    async def _check_one(cand_id: str, snippet: str) -> L0L1CandidateCheck:
+        failed_chk, passed_state = await _run_stage_a_phase(cand_id, snippet)
+        if failed_chk is not None:
+            return failed_chk
+        assert passed_state is not None
+        cur_snippet, patched, stage_a, repaired, attempt = passed_state
+        return await _run_stage_b_and_repairs(
+            cand_id, cur_snippet, patched, stage_a, repaired, attempt
+        )
+
+    use_prescreen = (
+        stage_a_cost_ranker is not None
+        and cost_prescreen_top_k is not None
+        and int(cost_prescreen_top_k) > 0
+    )
+    if not use_prescreen:
+        return list(await asyncio.gather(*(_check_one(cid, src) for cid, src in candidates)))
+
+    assert stage_a_cost_ranker is not None
+    top_k = int(cost_prescreen_top_k or 0)
+    stage_a_outcomes = list(
+        await asyncio.gather(*(_run_stage_a_phase(cid, src) for cid, src in candidates))
+    )
+    results_by_idx: dict[int, L0L1CandidateCheck] = {}
+    passers: list[tuple[int, str, str, str, StageAResult, bool, int]] = []
+    for idx, ((cid, _src), (failed_chk, passed_state)) in enumerate(
+        zip(candidates, stage_a_outcomes)
+    ):
+        if failed_chk is not None:
+            results_by_idx[idx] = failed_chk
+        else:
+            assert passed_state is not None
+            cur_snippet, patched, stage_a, repaired, attempt = passed_state
+            passers.append((idx, cid, cur_snippet, patched, stage_a, repaired, attempt))
+
+    if len(passers) > top_k:
+        rank_input = [(cid, patched, stage_a) for _idx, cid, _snip, patched, stage_a, _rep, _att in passers]
+        ranked_pairs = list(stage_a_cost_ranker(rank_input))
+        pred_by_id: dict[str, float] = {}
+        order_by_id: dict[str, int] = {}
+        for rank_idx, (rcid, rscore) in enumerate(ranked_pairs):
+            sid = str(rcid)
+            if sid not in pred_by_id:
+                pred_by_id[sid] = float(rscore)
+                order_by_id[sid] = rank_idx
+        sorted_passers = sorted(
+            passers,
+            key=lambda item: (
+                pred_by_id.get(item[1], float("inf")),
+                order_by_id.get(item[1], len(passers) + item[0]),
+                item[0],
+            ),
+        )
+        kept_passers = sorted_passers[:top_k]
+        for idx, cid, cur_snippet, patched, stage_a, repaired, _att in sorted_passers[top_k:]:
+            pred_us = pred_by_id.get(cid, float("inf"))
+            results_by_idx[idx] = L0L1CandidateCheck(
+                candidate_id=cid,
+                passed=False,
+                failed_tier="cost_prescreen",
                 patched_module_source=patched,
                 snippet_source=cur_snippet,
                 repaired=repaired,
                 stage_a=stage_a,
-                stage_b=stage_b,
+                stage_b=None,
+                error_message=f"cost_prescreen_pruned:pred_us={pred_us:.2f}",
             )
-        raise RuntimeError("unreachable repair termination")
+    else:
+        kept_passers = passers
 
-    return list(await asyncio.gather(*(_check_one(cid, src) for cid, src in candidates)))
+    if kept_passers:
+        stage_b_checks = await asyncio.gather(
+            *(
+                _run_stage_b_and_repairs(cid, cur_snippet, patched, stage_a, repaired, attempt)
+                for _idx, cid, cur_snippet, patched, stage_a, repaired, attempt in kept_passers
+            )
+        )
+        for (idx, *_rest), chk in zip(kept_passers, stage_b_checks):
+            results_by_idx[idx] = chk
+
+    return [results_by_idx[i] for i in range(len(candidates))]
 
 
 def _resolve_agent_gates_bin(source_root: Path | None = None) -> str:

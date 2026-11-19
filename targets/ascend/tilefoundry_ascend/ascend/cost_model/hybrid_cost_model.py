@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 import json
 import math
 from pathlib import Path
+from typing import Any
 
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
     BishengResourceSummary,
@@ -38,6 +39,16 @@ DEFAULT_L2_CAPACITY_BYTES = 134_217_728  # 128 MiB
 DEFAULT_L2_BYTES_PER_CYCLE_PER_AIC = 101
 DEFAULT_UB_BANK_MODULUS_BYTES = 512  # 16 banks * 32B datablock
 DEFAULT_AIV_VEC_FLOPS_PER_CYCLE = 128  # 64 fp32 lanes * 2 FLOPs/cycle (FMA)
+DEFAULT_LAUNCH_OVERHEAD_US = 3.2
+DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC = 256
+DEFAULT_CV_SYNC_EVENT_US = 0.08
+
+
+def topology_bucket_for_axes(axes: TopologyAxes | None) -> str:
+    """Return canonical hierarchical residual bucket key for *axes*."""
+    if axes is None:
+        return "global"
+    return f"{axes.compute_engine}:{axes.memory_ring}"
 
 
 def _cube_macs_for_dtype(facts: AscendSpaceFacts, dtype_name: str, *, hf32: bool = False) -> int:
@@ -155,6 +166,10 @@ class CostFeatures:
     alias_serialized_buffers: int = 0
     dual_issue_ipc_collapse: float = 0.0
     dcache_dcci_flushes: int = 0
+    kernel_launches: int = 1
+    launch_overhead_us: float | None = None
+    fixpipe_bytes: float = 0.0
+    cv_sync_events: int = 0
     extra_signals: dict[str, float] = field(default_factory=dict)
     topology_axes: TopologyAxes | None = None
 
@@ -234,6 +249,10 @@ class CostPrediction:
     effective_hbm_bw_bps: float
     dominant_bound: str
     feature_vector: tuple[float, ...] = field(default_factory=tuple)
+    launch_overhead_us: float = 0.0
+    fixpipe_floor_us: float = 0.0
+    cv_sync_us: float = 0.0
+    topology_bucket: str = "global"
 
     def to_dict(self) -> dict[str, object]:
         """Serialize prediction breakdown to JSON-safe dictionary."""
@@ -249,12 +268,14 @@ class CalibrationSample:
     feature_vector: tuple[float, ...]
     measured_us: float
     analytical_us: float
+    topology_bucket: str = "global"
 
     def to_dict(self) -> dict[str, object]:
         return {
             "feature_vector": list(self.feature_vector),
             "measured_us": self.measured_us,
             "analytical_us": self.analytical_us,
+            "topology_bucket": self.topology_bucket,
         }
 
     @classmethod
@@ -263,13 +284,139 @@ class CalibrationSample:
             feature_vector=tuple(float(x) for x in (payload.get("feature_vector") or ())),
             measured_us=float(payload["measured_us"]),
             analytical_us=float(payload["analytical_us"]),
+            topology_bucket=str(payload.get("topology_bucket") or "global"),
         )
 
 
-class HybridAscendCostModel:
-    """3-Tier Hybrid Ascend 950 Cost Model (Physics Floor + Compiler Penalties + Online Ridge Surrogate)."""
+@dataclass(frozen=True)
+class CostModelEvalReport:
+    """Empirical accuracy and intra-operator ranking evaluation summary."""
 
-    FEATURE_DIM = 9
+    sample_count: int
+    mape: float
+    median_ape: float
+    overall_spearman_rho: float
+    mean_intra_group_spearman_rho: float
+    pairwise_accuracy: float
+    top1_regret_ratio: float
+
+    def to_dict(self) -> dict[str, float | int]:
+        """Serialize report to JSON-safe dictionary."""
+        return {
+            "sample_count": int(self.sample_count),
+            "mape": round(self.mape, 6),
+            "median_ape": round(self.median_ape, 6),
+            "overall_spearman_rho": round(self.overall_spearman_rho, 6),
+            "mean_intra_group_spearman_rho": round(self.mean_intra_group_spearman_rho, 6),
+            "pairwise_accuracy": round(self.pairwise_accuracy, 6),
+            "top1_regret_ratio": round(self.top1_regret_ratio, 6),
+        }
+
+
+def _average_ranks(values: Sequence[float]) -> list[float]:
+    indexed = sorted(enumerate(values), key=lambda item: float(item[1]))
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(indexed):
+        j = i + 1
+        v_i = float(indexed[i][1])
+        while j < len(indexed) and abs(float(indexed[j][1]) - v_i) <= 1e-12:
+            j += 1
+        avg_rank = 0.5 * float(i + j - 1) + 1.0
+        for k in range(i, j):
+            ranks[indexed[k][0]] = avg_rank
+        i = j
+    return ranks
+
+
+def _spearman_corr(xs: Sequence[float], ys: Sequence[float]) -> float:
+    n = len(xs)
+    if n < 2 or len(ys) != n:
+        return 0.0
+    rx = _average_ranks(xs)
+    ry = _average_ranks(ys)
+    mx = sum(rx) / float(n)
+    my = sum(ry) / float(n)
+    num = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    dx = math.sqrt(sum((a - mx) ** 2 for a in rx))
+    dy = math.sqrt(sum((b - my) ** 2 for b in ry))
+    if dx <= 1e-12 or dy <= 1e-12:
+        return 0.0
+    return max(-1.0, min(1.0, num / (dx * dy)))
+
+
+def evaluate_cost_model_ranking(
+    predictions: Sequence[float],
+    actuals: Sequence[float],
+    *,
+    groups: Sequence[str] | None = None,
+) -> CostModelEvalReport:
+    """Compute MAPE, Spearman rank correlation, pairwise accuracy, and Top-1 regret."""
+    n = len(predictions)
+    if n == 0 or len(actuals) != n:
+        return CostModelEvalReport(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    if groups is not None and len(groups) != n:
+        raise ValueError("groups length must match predictions and actuals length")
+
+    apes = sorted(
+        abs(float(p) - float(a)) / max(1e-6, abs(float(a)))
+        for p, a in zip(predictions, actuals)
+    )
+    mape = sum(apes) / float(n)
+    mid = n // 2
+    median_ape = apes[mid] if (n % 2 == 1) else 0.5 * (apes[mid - 1] + apes[mid])
+    overall_rho = _spearman_corr(predictions, actuals)
+
+    if groups is None:
+        bucket_indices: dict[str, list[int]] = {"global": list(range(n))}
+    else:
+        bucket_indices = {}
+        for idx, g in enumerate(groups):
+            bucket_indices.setdefault(str(g), []).append(idx)
+
+    group_rhos: list[float] = []
+    regrets: list[float] = []
+    pair_correct = 0.0
+    pair_total = 0
+
+    for idxs in bucket_indices.values():
+        if len(idxs) < 2:
+            continue
+        gp = [float(predictions[i]) for i in idxs]
+        ga = [float(actuals[i]) for i in idxs]
+        group_rhos.append(_spearman_corr(gp, ga))
+        best_pred_pos = min(range(len(idxs)), key=lambda pos: gp[pos])
+        oracle_min = min(ga)
+        if oracle_min > 0.0:
+            regrets.append((ga[best_pred_pos] - oracle_min) / oracle_min)
+        for i in range(len(idxs)):
+            for j in range(i + 1, len(idxs)):
+                if abs(ga[i] - ga[j]) <= 1e-9:
+                    continue
+                pair_total += 1
+                if abs(gp[i] - gp[j]) <= 1e-12:
+                    pair_correct += 0.5
+                elif (gp[i] < gp[j]) == (ga[i] < ga[j]):
+                    pair_correct += 1.0
+
+    mean_group_rho = sum(group_rhos) / float(len(group_rhos)) if group_rhos else overall_rho
+    pairwise_acc = (pair_correct / float(pair_total)) if pair_total > 0 else 0.0
+    mean_regret = (sum(regrets) / float(len(regrets))) if regrets else 0.0
+    return CostModelEvalReport(
+        sample_count=n,
+        mape=mape,
+        median_ape=median_ape,
+        overall_spearman_rho=overall_rho,
+        mean_intra_group_spearman_rho=mean_group_rho,
+        pairwise_accuracy=pairwise_acc,
+        top1_regret_ratio=mean_regret,
+    )
+
+
+class HybridAscendCostModel:
+    """3-Tier Hybrid Ascend 950 Cost Model (Physics Floor + Compiler Penalties + Hierarchical Ridge)."""
+
+    FEATURE_DIM = 13
 
     def __init__(
         self,
@@ -290,6 +437,7 @@ class HybridAscendCostModel:
         )
         self._samples: list[CalibrationSample] = []
         self._weights: list[float] = [0.0] * self.FEATURE_DIM
+        self._bucket_weights: dict[str, list[float]] = {}
         if self.calibration_path is not None and self.calibration_path.exists():
             self.load_calibration(self.calibration_path)
 
@@ -300,6 +448,16 @@ class HybridAscendCostModel:
     @property
     def weights(self) -> tuple[float, ...]:
         return tuple(self._weights)
+
+    @property
+    def bucket_weights(self) -> dict[str, tuple[float, ...]]:
+        return {k: tuple(v) for k, v in self._bucket_weights.items()}
+
+    def _pad_feature_vector(self, vec: Sequence[float]) -> tuple[float, ...]:
+        vals = [float(x) for x in vec[: self.FEATURE_DIM]]
+        if len(vals) < self.FEATURE_DIM:
+            vals.extend([0.0] * (self.FEATURE_DIM - len(vals)))
+        return tuple(vals)
 
     def _extract_surrogate_features(
         self,
@@ -312,24 +470,44 @@ class HybridAscendCostModel:
         l2_hit_rate: float,
         tier1_penalty_us: float,
         tier0_us: float,
+        launch_us: float,
     ) -> tuple[float, ...]:
         total_floor = max(1e-6, cube_floor_us + vec_floor_us + hbm_floor_us)
+        axes = cf.topology_axes
+        is_coupled = 1.0 if (axes is not None and axes.compute_engine == "coupled_1c2v") else 0.0
+        is_aic = 1.0 if (axes is not None and axes.compute_engine == "aic_only") else 0.0
+        is_irreg = (
+            1.0
+            if (
+                axes is not None
+                and axes.iteration_regularity
+                in ("irregular_simt", "ragged_group", "dynamic_opcode_stream")
+            )
+            else 0.0
+        )
         return (
-            1.0,  # bias
-            math.log1p(max(0.0, tier0_us)) / 10.0,
-            cube_floor_us / total_floor,
-            vec_floor_us / total_floor,
-            hbm_floor_us / total_floor,
-            max(0.0, wave_ratio - 1.0),
-            1.0 - max(0.0, min(1.0, l2_hit_rate)),
-            1.0 if cf.contig_burst_bytes < 16384 else 0.0,
-            min(2.0, tier1_penalty_us / max(1e-3, tier0_us)),
+            1.0,  # 0: bias
+            math.log1p(max(0.0, tier0_us)) / 10.0,  # 1: log scale
+            cube_floor_us / total_floor,  # 2: cube share
+            vec_floor_us / total_floor,  # 3: vec share
+            hbm_floor_us / total_floor,  # 4: hbm share
+            max(0.0, wave_ratio - 1.0),  # 5: wave quantization tail
+            1.0 - max(0.0, min(1.0, l2_hit_rate)),  # 6: L2 miss fraction
+            1.0 if cf.contig_burst_bytes < 16384 else 0.0,  # 7: short burst indicator
+            min(2.0, tier1_penalty_us / max(1e-3, tier0_us)),  # 8: compiler penalty ratio
+            launch_us / max(1e-3, tier0_us),  # 9: small-shape launch fraction
+            is_coupled,  # 10: coupled_1c2v indicator
+            is_aic,  # 11: aic_only indicator
+            is_irreg,  # 12: irregular/ragged/dynamic opcode indicator
         )
 
     def _compute_tier0_and_tier1(
         self,
         cf: CostFeatures,
     ) -> tuple[
+        float,
+        float,
+        float,
         float,
         float,
         float,
@@ -387,7 +565,44 @@ class HybridAscendCostModel:
         l2_bw_bps = float(aic_cores) * float(getattr(self.facts, "l2_bytes_per_cycle_per_aic", DEFAULT_L2_BYTES_PER_CYCLE_PER_AIC)) * clock_hz
         l2_floor_us = ((float(cf.gm_bytes) * l2_hit_rate) / max(1.0, l2_bw_bps)) * 1e6 if l2_hit_rate > 0 else 0.0
 
-        # 3. L1/UB bank-conflict cycle penalties
+        # 3. FixPipe writeback floor, 1C2V cross-core sync, Launch floor & bank-conflict penalties
+        fixpipe_bpc = float(getattr(self.facts, "fixpipe_bytes_per_cycle", DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC) or DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC)
+        fixpipe_bw_bps = float(aic_cores) * fixpipe_bpc * clock_hz
+        fixpipe_floor_us = (
+            (float(cf.fixpipe_bytes) / max(1.0, fixpipe_bw_bps)) * 1e6
+            if cf.fixpipe_bytes > 0.0
+            else 0.0
+        )
+
+        if cf.cv_sync_events > 0:
+            cv_sync_us = float(cf.cv_sync_events) * DEFAULT_CV_SYNC_EVENT_US
+        elif (
+            cf.topology_axes is not None
+            and cf.topology_axes.compute_engine == "coupled_1c2v"
+            and cube_floor_us > 0.0
+            and vec_floor_us > 0.0
+        ):
+            cv_sync_us = 0.08 * min(cube_floor_us, vec_floor_us)
+        else:
+            cv_sync_us = 0.0
+
+        has_work = (
+            cf.cube_flops > 0.0
+            or cf.vec_flops > 0.0
+            or cf.gm_bytes > 0.0
+            or cf.fixpipe_bytes > 0.0
+        )
+        if has_work and cf.kernel_launches > 0:
+            launch_unit = (
+                float(cf.launch_overhead_us)
+                if cf.launch_overhead_us is not None
+                else DEFAULT_LAUNCH_OVERHEAD_US
+            )
+            launch_us = float(cf.kernel_launches) * max(0.0, launch_unit)
+        else:
+            launch_us = 0.0
+
+        # L1/UB bank-conflict cycle penalties
         ub_conflict = max(0.0, min(1.0, cf.ub_bank_conflict_ratio))
         if (
             ub_conflict == 0.0
@@ -400,9 +615,15 @@ class HybridAscendCostModel:
         l1_conflict = 0.25 if (cf.l1_stages >= 2 and not cf.l1_half_bank_split) else 0.0
         bank_conflict_us = vec_floor_us * ub_conflict + cube_floor_us * l1_conflict
 
-        # Combine Roofline Physics Floor (max of bottleneck pipes + non-overlapped conflict/L2 tail)
-        compute_us = max(cube_floor_us, vec_floor_us)
-        tier0_us = max(compute_us, hbm_floor_us, l2_floor_us) + 0.15 * min(compute_us, hbm_floor_us) + bank_conflict_us
+        # Combine Roofline Physics Floor (Launch + bottleneck pipes + non-overlapped tail)
+        compute_us = max(cube_floor_us, vec_floor_us, fixpipe_floor_us)
+        exec_us = (
+            max(compute_us, hbm_floor_us, l2_floor_us)
+            + 0.15 * min(compute_us, hbm_floor_us)
+            + bank_conflict_us
+            + cv_sync_us
+        )
+        tier0_us = launch_us + exec_us
 
         # 4. Tier 1: Compiler Resource Penalty via extensible CompilerBehaviorRegistry
         base_ref = max(1.0, tier0_us)
@@ -437,11 +658,17 @@ class HybridAscendCostModel:
         if cf.has_unaligned_tail:
             tier1_penalty_us += max(0.25, 0.03 * base_ref)
 
-        # Dominant bound
+        # Dominant bound classification
         if cf.spill_bytes > 0 and tier1_penalty_us >= base_ref * 0.3:
             dominant = "compiler_spill"
         elif bank_conflict_us > 0.3 * max(1e-6, tier0_us):
             dominant = "bank_conflict"
+        elif launch_us > exec_us and launch_us > 0.5 * max(1e-6, tier0_us):
+            dominant = "launch_overhead"
+        elif fixpipe_floor_us > 0.0 and fixpipe_floor_us >= max(cube_floor_us, vec_floor_us, hbm_floor_us):
+            dominant = "fixpipe"
+        elif cv_sync_us > 0.25 * max(1e-6, tier0_us):
+            dominant = "cv_sync"
         elif hbm_floor_us >= max(cube_floor_us, vec_floor_us):
             dominant = "hbm"
         elif cube_floor_us >= vec_floor_us:
@@ -458,6 +685,7 @@ class HybridAscendCostModel:
             l2_hit_rate=l2_hit_rate,
             tier1_penalty_us=tier1_penalty_us,
             tier0_us=tier0_us,
+            launch_us=launch_us,
         )
         return (
             tier0_us,
@@ -469,6 +697,9 @@ class HybridAscendCostModel:
             wave_ratio,
             bank_conflict_us,
             eff_hbm_bw,
+            launch_us,
+            fixpipe_floor_us,
+            cv_sync_us,
             dominant,
             feat_vec,
         )
@@ -491,14 +722,19 @@ class HybridAscendCostModel:
             wave_ratio,
             bank_us,
             eff_bw,
+            launch_us,
+            fixpipe_us,
+            cv_sync_us,
             dominant,
             feat_vec,
         ) = self._compute_tier0_and_tier1(cf)
         base_us = max(1e-6, tier0_us + tier1_us)
-        log_res = sum(w * x for w, x in zip(self._weights, feat_vec))
-        log_res = max(-2.0, min(2.0, log_res))
+        bucket = topology_bucket_for_axes(cf.topology_axes)
+        weights = self._bucket_weights.get(bucket, self._weights)
+        log_res = sum(w * x for w, x in zip(weights, feat_vec))
+        log_res = max(-2.5, min(2.5, log_res))
         residual_factor = math.exp(log_res)
-        pred_us = base_us * residual_factor
+        pred_us = base_us * residual_factor if (tier0_us > 0.0 or tier1_us > 0.0) else 0.0
         return CostPrediction(
             pred_us=pred_us,
             tier0_physics_us=tier0_us,
@@ -513,6 +749,10 @@ class HybridAscendCostModel:
             effective_hbm_bw_bps=eff_bw,
             dominant_bound=dominant,
             feature_vector=feat_vec,
+            launch_overhead_us=launch_us,
+            fixpipe_floor_us=fixpipe_us,
+            cv_sync_us=cv_sync_us,
+            topology_bucket=bucket,
         )
 
     def observe(
@@ -522,40 +762,109 @@ class HybridAscendCostModel:
         *,
         bisheng_res: BishengResourceSummary | Mapping[str, object] | None = None,
         persist: bool = True,
+        refit: bool = True,
     ) -> float:
-        """Record an empirical measurement and incrementally refit the Ridge residual surrogate."""
+        """Record an empirical measurement and incrementally refit hierarchical Ridge residual surrogates."""
         if measured_us <= 0.0:
             raise ValueError(f"measured_us must be positive, got {measured_us!r}")
         cf = CostFeatures.coerce(workload, bisheng_res=bisheng_res)
         tier0_us, tier1_us, *_rest, feat_vec = self._compute_tier0_and_tier1(cf)
         analytical_us = max(1e-6, tier0_us + tier1_us)
+        bucket = topology_bucket_for_axes(cf.topology_axes)
         sample = CalibrationSample(
             feature_vector=feat_vec,
             measured_us=float(measured_us),
             analytical_us=analytical_us,
+            topology_bucket=bucket,
         )
         self._samples.append(sample)
-        self._refit_ridge()
+        if refit:
+            self._refit_ridge()
         if persist and self.calibration_path is not None:
             self.save_calibration(self.calibration_path)
         return analytical_us
 
+    def observe_batch(
+        self,
+        items: Sequence[
+            tuple[CostFeatures | Mapping[str, object], float]
+            | tuple[
+                CostFeatures | Mapping[str, object],
+                float,
+                BishengResourceSummary | Mapping[str, object] | None,
+            ]
+        ],
+        *,
+        persist: bool = True,
+    ) -> list[float]:
+        """Record multiple calibration measurements, refit Ridge once, and persist once."""
+        analytical_list: list[float] = []
+        for entry in items:
+            if len(entry) == 2:
+                workload, measured_us = entry
+                bres = None
+            elif len(entry) == 3:
+                workload, measured_us, bres = entry
+            else:
+                raise ValueError(f"Expected 2- or 3-tuple in observe_batch, got len={len(entry)}")
+            analytical_list.append(
+                self.observe(
+                    workload,
+                    measured_us,
+                    bisheng_res=bres,
+                    persist=False,
+                    refit=False,
+                )
+            )
+        if analytical_list:
+            self._refit_ridge()
+            if persist and self.calibration_path is not None:
+                self.save_calibration(self.calibration_path)
+        return analytical_list
+
     def _refit_ridge(self) -> None:
-        if not self._samples:
-            self._weights = [0.0] * self.FEATURE_DIM
-            return
         d = self.FEATURE_DIM
+        if not self._samples:
+            self._weights = [0.0] * d
+            self._bucket_weights = {}
+            return
+        decay = 0.985
+        n_total = len(self._samples)
         xtx = [[self.ridge_alpha if i == j else 0.0 for j in range(d)] for i in range(d)]
         xty = [0.0] * d
-        for s in self._samples:
-            x = s.feature_vector
+        by_bucket: dict[str, list[CalibrationSample]] = {}
+        for idx, s in enumerate(self._samples):
+            x = self._pad_feature_vector(s.feature_vector)
             y = math.log(max(1e-6, s.measured_us) / max(1e-6, s.analytical_us))
-            y = max(-2.0, min(2.0, y))
+            y = max(-2.5, min(2.5, y))
+            w = decay ** float(n_total - 1 - idx)
             for i in range(d):
-                xty[i] += x[i] * y
+                xty[i] += w * x[i] * y
                 for j in range(d):
-                    xtx[i][j] += x[i] * x[j]
+                    xtx[i][j] += w * x[i] * x[j]
+            if s.topology_bucket and s.topology_bucket != "global":
+                by_bucket.setdefault(s.topology_bucket, []).append(s)
         self._weights = _solve_linear_system(xtx, xty)
+
+        shrink_alpha = max(2.0, self.ridge_alpha * 2.0)
+        new_bucket_weights: dict[str, list[float]] = {}
+        for bucket, b_samples in by_bucket.items():
+            if len(b_samples) < 2:
+                continue
+            nb = len(b_samples)
+            bxtx = [[shrink_alpha if i == j else 0.0 for j in range(d)] for i in range(d)]
+            bxty = [shrink_alpha * self._weights[i] for i in range(d)]
+            for b_idx, s in enumerate(b_samples):
+                x = self._pad_feature_vector(s.feature_vector)
+                y = math.log(max(1e-6, s.measured_us) / max(1e-6, s.analytical_us))
+                y = max(-2.5, min(2.5, y))
+                bw = decay ** float(nb - 1 - b_idx)
+                for i in range(d):
+                    bxty[i] += bw * x[i] * y
+                    for j in range(d):
+                        bxtx[i][j] += bw * x[i] * x[j]
+            new_bucket_weights[bucket] = _solve_linear_system(bxtx, bxty)
+        self._bucket_weights = new_bucket_weights
 
     def save_calibration(self, path: str | Path) -> None:
         """Persist calibration samples to JSONL or JSON."""
@@ -605,12 +914,150 @@ class HybridAscendCostModel:
         return predict_cannbench_eq3_score(pred_us, ref_perf_us, t_hw_us)
 
 
+def _read_attr_or_key(obj: object | None, key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, Mapping):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def build_cost_features_from_ledger(
+    ledger: object | None,
+    *,
+    target: AscendTarget | None = None,
+    live_plan: object | None = None,
+    axes: TopologyAxes | None = None,
+    nav_packet: object | None = None,
+    sil_advisory: object | None = None,
+    kernel_launches: int = 1,
+) -> CostFeatures:
+    """Convert ObjectivePhysicalLedger + HIR navigation / SIL advisory into chip-scaled CostFeatures."""
+    facts = (target or AscendTarget("ascend.950pr")).get_facts(AscendSpaceFacts)
+    policy: dict[str, Any] = {}
+    plan_axes: TopologyAxes | None = None
+    if isinstance(live_plan, Mapping):
+        policy = dict(live_plan)
+    elif live_plan is not None:
+        raw_pol = getattr(live_plan, "policy", None)
+        if isinstance(raw_pol, Mapping):
+            policy = dict(raw_pol)
+        raw_plan_axes = getattr(live_plan, "topology_axes", None)
+        if isinstance(raw_plan_axes, TopologyAxes):
+            plan_axes = raw_plan_axes
+
+    eff_axes = axes if isinstance(axes, TopologyAxes) else plan_axes
+    if eff_axes is None and sil_advisory is not None:
+        adv_axes = getattr(sil_advisory, "topology_axes", None)
+        if isinstance(adv_axes, TopologyAxes):
+            eff_axes = adv_axes
+
+    grid_blocks = int(getattr(ledger, "grid_blocks", 0) or 0) if ledger is not None else 0
+    if grid_blocks <= 0:
+        grid_blocks = int(policy.get("grid_blocks") or 0)
+    total_tiles = grid_blocks if grid_blocks > 0 else 56
+
+    raw_dtype = str(
+        policy.get("cube_operand_dtype") or policy.get("dtype") or ""
+    ).strip()
+    if not raw_dtype and sil_advisory is not None:
+        in_dtypes = getattr(sil_advisory, "input_dtypes", ()) or ()
+        if in_dtypes:
+            raw_dtype = str(in_dtypes[0]).strip()
+    cube_dtype = raw_dtype or "f16"
+    hf32 = bool(policy.get("hf32", policy.get("hf32_allowed", False)))
+    macs_per_cycle = _cube_macs_for_dtype(facts, cube_dtype, hf32=hf32)
+
+    pipes = (getattr(ledger, "pipe_cycles", None) or {}) if ledger is not None else {}
+    cube_c = int(pipes.get("AIC.PIPE_M", 0)) + int(pipes.get("AIC.CUBE", 0))
+    vec_c = int(pipes.get("AIV0.PIPE_V", 0)) + int(pipes.get("AIV1.PIPE_V", 0))
+    ledger_cube_flops = float(max(0, cube_c)) * float(macs_per_cycle) * 2.0 * float(total_tiles)
+    ledger_vec_flops = (
+        float(max(0, vec_c)) * float(DEFAULT_AIV_VEC_FLOPS_PER_CYCLE) * float(total_tiles)
+    )
+
+    nav_roofline = getattr(nav_packet, "roofline", None) if nav_packet is not None else None
+    nav_cube_flops = float(_read_attr_or_key(nav_roofline, "cube_flops", 0.0) or 0.0)
+    nav_vec_flops = float(_read_attr_or_key(nav_roofline, "vector_flops", 0.0) or 0.0)
+    nav_min_gm = float(_read_attr_or_key(nav_roofline, "min_gm_bytes", 0.0) or 0.0)
+
+    cube_flops = max(ledger_cube_flops, nav_cube_flops) if nav_cube_flops > 0.0 else ledger_cube_flops
+    vec_flops = max(ledger_vec_flops, nav_vec_flops) if nav_vec_flops > 0.0 else ledger_vec_flops
+
+    adv_roofline = getattr(sil_advisory, "roofline", None) if sil_advisory is not None else None
+    adv_median_gm = float(_read_attr_or_key(adv_roofline, "median_gm_bytes", 0.0) or 0.0)
+
+    ledger_gm_per_tile = (
+        float(getattr(ledger, "gm_roundtrip_bytes", 0) or 0) if ledger is not None else 0.0
+    )
+    if ledger_gm_per_tile > 0.0:
+        if nav_min_gm <= 0.0 or ledger_gm_per_tile < nav_min_gm * 0.5:
+            gm_bytes = max(ledger_gm_per_tile * float(total_tiles), nav_min_gm)
+        else:
+            gm_bytes = max(ledger_gm_per_tile, nav_min_gm)
+    elif nav_min_gm > 0.0:
+        gm_bytes = nav_min_gm
+    elif adv_median_gm > 0.0:
+        gm_bytes = adv_median_gm
+    else:
+        gm_bytes = 65536.0
+
+    fixpipe_bytes = 0.0
+    if cube_flops > 0.0:
+        tile_mnk = policy.get("tile_mnk")
+        if (
+            isinstance(tile_mnk, (list, tuple))
+            and len(tile_mnk) >= 2
+            and int(tile_mnk[0] or 0) > 0
+            and int(tile_mnk[1] or 0) > 0
+        ):
+            fixpipe_bytes = float(int(tile_mnk[0]) * int(tile_mnk[1]) * 4 * total_tiles)
+        else:
+            fixpipe_bytes = 0.25 * gm_bytes
+
+    if eff_axes is not None and eff_axes.compute_engine == "coupled_1c2v":
+        raw_cv = policy.get("cv_sync_events")
+        cv_sync_events = int(raw_cv) if raw_cv is not None else max(2, int(policy.get("l1_stages", 2) or 2) * 2)
+    else:
+        cv_sync_events = 0
+
+    contig_burst = int(getattr(ledger, "dominant_contig_bytes", 0) or 0) if ledger is not None else 0
+    if contig_burst <= 0:
+        contig_burst = int(policy.get("contig_burst_bytes") or 32768)
+
+    merged: dict[str, Any] = dict(policy)
+    merged.update(
+        {
+            "cube_flops": cube_flops,
+            "vec_flops": vec_flops,
+            "cube_dtype": cube_dtype,
+            "hf32": hf32,
+            "gm_bytes": gm_bytes,
+            "contig_burst_bytes": contig_burst,
+            "total_tiles": total_tiles,
+            "fixpipe_bytes": fixpipe_bytes,
+            "cv_sync_events": cv_sync_events,
+            "kernel_launches": max(0, int(kernel_launches)),
+        }
+    )
+    if eff_axes is not None:
+        merged["topology_axes"] = eff_axes
+    return CostFeatures.coerce(merged)
+
+
 __all__ = [
     "CUBE_MACS_PER_CYCLE",
+    "DEFAULT_CV_SYNC_EVENT_US",
+    "DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC",
+    "DEFAULT_LAUNCH_OVERHEAD_US",
     "CalibrationSample",
     "CannbenchScorePrediction",
     "CostFeatures",
+    "CostModelEvalReport",
     "CostPrediction",
     "HybridAscendCostModel",
+    "build_cost_features_from_ledger",
+    "evaluate_cost_model_ranking",
     "predict_cannbench_eq3_score",
+    "topology_bucket_for_axes",
 ]

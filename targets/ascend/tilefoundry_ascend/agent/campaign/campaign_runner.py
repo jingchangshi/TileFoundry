@@ -84,10 +84,18 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     compute_static_dynamic_residual,
     extract_structural_signature,
 )
+from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
+    rank_stage_a_candidates_with_cost_model,
+)
 from tilefoundry_ascend.agent.orchestrator.twin_bridge import format_hir_tir_navigation_section
 from tilefoundry_ascend.agent.router.capability_gate import evaluate_track_escalation
 from tilefoundry_ascend.agent.router.isa_gap_scanner import scan_tilelang_pipe_gaps
-from tilefoundry_ascend.ascend.cost_model import BishengResourceSummary, HybridAscendCostModel
+from tilefoundry_ascend.ascend.cost_model import (
+    BishengResourceSummary,
+    CostFeatures,
+    HybridAscendCostModel,
+    build_cost_features_from_ledger,
+)
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
     HirTirNavigationPacket,
     compile_hir_navigation_packet,
@@ -137,6 +145,7 @@ class CampaignConfig:
     warmup: int = 3
     repeat: int = 5
     enable_tilesize_prescreen: bool = False
+    cost_prescreen_top_k: int | None = None
     exploit_effort: str = "medium"
 
 
@@ -958,6 +967,7 @@ class PerfTargetCampaignRunner:
         clock: Callable[[], float] = time.monotonic,
         sil_advisory: object | None = None,
         topology_axes: TopologyAxes | Mapping[str, object] | None = None,
+        cost_calibration_path: str | Path | None = None,
     ) -> None:
         self._config = config
         self._source_root = (
@@ -1031,7 +1041,22 @@ class PerfTargetCampaignRunner:
         self._enable_track_router = bool(enable_track_router)
         self._target = target or AscendTarget("ascend.950pr")
         self._regime_solver = RegimePiecewiseSolver(self._target)
-        self._cost_model = HybridAscendCostModel(self._target)
+        if cost_calibration_path is not None:
+            self._cost_calibration_path: Path | None = Path(cost_calibration_path).resolve()
+        elif self._checkpoint_path is not None:
+            self._cost_calibration_path = (
+                self._checkpoint_path.parent / "cost_model_calibration.jsonl"
+            )
+        elif self._campaign_kb_path is not None:
+            self._cost_calibration_path = (
+                self._campaign_kb_path.parent / "cost_model_calibration.jsonl"
+            )
+        else:
+            self._cost_calibration_path = None
+        self._cost_model = HybridAscendCostModel(
+            self._target,
+            calibration_path=self._cost_calibration_path,
+        )
         self._freedom_masks: dict[str, ConstraintRelaxationMask] = {}
         self._live_regime_plans: dict[str, RegimePlanResult] = {}
         self._clock = clock
@@ -1644,32 +1669,16 @@ class PerfTargetCampaignRunner:
         *,
         live_plan: RegimePlanResult | None = None,
         axes: TopologyAxes | None = None,
-    ) -> dict[str, object]:
-        pipes = ledger.pipe_cycles or {}
-        cube_c = int(pipes.get("AIC.PIPE_M", 0)) + int(pipes.get("AIC.CUBE", 0))
-        vec_c = int(pipes.get("AIV0.PIPE_V", 0)) + int(pipes.get("AIV1.PIPE_V", 0))
-        gm_bytes = float(getattr(ledger, "gm_roundtrip_bytes", 0) or 0)
-        if gm_bytes <= 0.0 and self._sil_advisory is not None:
-            gm_bytes = float(
-                (getattr(self._sil_advisory, "roofline", {}) or {}).get("median_gm_bytes", 0) or 0
-            )
-        if gm_bytes <= 0.0:
-            gm_bytes = 65536.0
-        workload: dict[str, object] = {}
-        if live_plan is not None:
-            workload.update(live_plan.policy)
-        workload.update(
-            {
-                "cube_flops": float(max(0, cube_c)) * 4096.0,
-                "vec_flops": float(max(1, vec_c)) * 128.0,
-                "gm_bytes": gm_bytes,
-                "contig_burst_bytes": int(getattr(ledger, "dominant_contig_bytes", 0) or 32768),
-                "total_tiles": int(getattr(ledger, "grid_blocks", 0) or 56),
-            }
+        nav_packet: HirTirNavigationPacket | None = None,
+    ) -> CostFeatures:
+        return build_cost_features_from_ledger(
+            ledger,
+            live_plan=live_plan,
+            axes=axes,
+            nav_packet=nav_packet,
+            sil_advisory=self._sil_advisory,
+            target=self._target,
         )
-        if axes is not None:
-            workload["topology_axes"] = axes
-        return workload
 
     def _prune_stale_sibling_stepping_stones(
         self,
@@ -2395,10 +2404,12 @@ class PerfTargetCampaignRunner:
         ub_wl = parent_waterlines.get("UB")
         l1_overflow = bool(l1_wl is not None and int(getattr(l1_wl, "overflow_bytes", 0) or 0) > 0)
         ub_overflow = bool(ub_wl is not None and int(getattr(ub_wl, "overflow_bytes", 0) or 0) > 0)
+        nav_packet = self._regime_nav_packets.get(regime_spec.regime_tag)
         parent_workload = self._build_cost_workload(
             parent_ledger,
             live_plan=live_plan,
             axes=parent_axes,
+            nav_packet=nav_packet,
         )
         parent_cost_pred = self._cost_model.predict(
             parent_workload,
@@ -2459,7 +2470,6 @@ class PerfTargetCampaignRunner:
                 topology_axes=parent_axes,
             )
         )
-        nav_packet = self._regime_nav_packets.get(regime_spec.regime_tag)
 
         worker_specs: list[tuple[str, str, AscendCausalRule | None, GenerationRequest]] = []
         for idx, rule in enumerate(ranked_rules[: self._config.k_rule_workers]):
@@ -2522,6 +2532,11 @@ class PerfTargetCampaignRunner:
                 dims=anchor_dims,
                 pass_configs=prescreen_pc or None,
                 compile_flags=prescreen_cf or None,
+                cost_model=self._cost_model,
+                axes=parent_axes,
+                live_plan=live_plan,
+                nav_packet=nav_packet,
+                sil_advisory=self._sil_advisory,
             )
         else:
             prescreen_summary = ""
@@ -2609,6 +2624,32 @@ class PerfTargetCampaignRunner:
 
         l0_l1_checks: list[L0L1CandidateCheck] = []
         if raw_candidates:
+            prescreen_top_k = (
+                int(self._config.cost_prescreen_top_k)
+                if (
+                    self._config.enable_tilesize_prescreen
+                    and self._config.cost_prescreen_top_k is not None
+                    and int(self._config.cost_prescreen_top_k) > 0
+                )
+                else None
+            )
+            stage_a_ranker = (
+                (
+                    lambda passers: [
+                        (item.candidate_id, item.pred_us)
+                        for item in rank_stage_a_candidates_with_cost_model(
+                            passers,
+                            cost_model=self._cost_model,
+                            live_plan=live_plan,
+                            axes=parent_axes,
+                            nav_packet=nav_packet,
+                            sil_advisory=self._sil_advisory,
+                        )
+                    ]
+                )
+                if prescreen_top_k is not None
+                else None
+            )
             l0_l1_checks = await run_l0_l1_round_filter(
                 raw_candidates,
                 patch_fn=lambda snip: patch_regime_into_module(
@@ -2619,6 +2660,8 @@ class PerfTargetCampaignRunner:
                 repair_backend=backend if self._config.max_syntax_repairs > 0 else None,
                 max_syntax_repairs=self._config.max_syntax_repairs,
                 slice_hint=self._slice_contract_instruction(func_name, regime_spec),
+                stage_a_cost_ranker=stage_a_ranker,
+                cost_prescreen_top_k=prescreen_top_k,
             )
 
         passed_checks = [chk for chk in l0_l1_checks if chk.passed]
@@ -2628,7 +2671,7 @@ class PerfTargetCampaignRunner:
                     (chk.candidate_id, chk.failed_tier or "l0_l1", chk.error_message[:200])
                 )
                 _wkind, rule, _hyp = meta_by_id[chk.candidate_id]
-                if rule is not None and chk.failed_tier != "llm_transport":
+                if rule is not None and chk.failed_tier not in ("llm_transport", "cost_prescreen"):
                     self._tracker.record_outcome(
                         rule.rule_id,
                         postcondition_realized=False,
@@ -2802,12 +2845,13 @@ class PerfTargetCampaignRunner:
                         ledger,
                         live_plan=live_plan,
                         axes=cand_axes,
+                        nav_packet=nav_packet,
                     )
                     self._cost_model.observe(
                         cand_workload,
                         lat_us,
                         bisheng_res=cand_comp_summary,
-                        persist=False,
+                        persist=(self._cost_calibration_path is not None),
                     )
                 except Exception as exc:
                     logger.debug("Cost model online observation skipped: %s", exc)
