@@ -24,6 +24,9 @@ from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
     BishengResourceSummary,
     parse_bisheng_res_usage,
 )
+from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
+    extract_microarch_profile_from_cce,
+)
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
     ScopeWaterline,
@@ -61,6 +64,7 @@ class StageBResult:
     spill_bytes: int = 0
     vloopv2_hit: bool = True
     compiler_summary: BishengResourceSummary | None = None
+    microarch_profile: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -931,6 +935,11 @@ def run_stage_b_compile(
         combined_out,
         asm_or_dump_text=lowered_dump,
     )
+    ma_profile = (
+        extract_microarch_profile_from_cce(lowered_dump).to_dict()
+        if lowered_dump.strip()
+        else None
+    )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[-1500:]
         return StageBResult(
@@ -940,6 +949,7 @@ def run_stage_b_compile(
             spill_bytes=spill_bytes,
             vloopv2_hit=vloopv2_hit,
             compiler_summary=summary,
+            microarch_profile=ma_profile,
         )
     return StageBResult(
         passed=True,
@@ -947,6 +957,7 @@ def run_stage_b_compile(
         spill_bytes=spill_bytes,
         vloopv2_hit=vloopv2_hit,
         compiler_summary=summary,
+        microarch_profile=ma_profile,
     )
 
 
@@ -1152,6 +1163,11 @@ def run_stage_b_ascendc_compile(
             combined_out,
             asm_or_dump_text=cpp_source,
         )
+        ma_profile = (
+            extract_microarch_profile_from_cce(cpp_source).to_dict()
+            if cpp_source.strip()
+            else None
+        )
         if proc.returncode != 0 or not obj_path.is_file():
             detail = (proc.stderr or proc.stdout or "bisheng failed without diagnostics").strip()[-1500:]
             return StageBResult(
@@ -1161,6 +1177,7 @@ def run_stage_b_ascendc_compile(
                 spill_bytes=spill_bytes,
                 vloopv2_hit=vloopv2_hit,
                 compiler_summary=summary,
+                microarch_profile=ma_profile,
             )
 
     return StageBResult(
@@ -1169,6 +1186,7 @@ def run_stage_b_ascendc_compile(
         spill_bytes=spill_bytes,
         vloopv2_hit=vloopv2_hit,
         compiler_summary=summary,
+        microarch_profile=ma_profile,
     )
 
 

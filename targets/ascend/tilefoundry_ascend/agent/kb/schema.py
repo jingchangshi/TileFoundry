@@ -206,10 +206,14 @@ class AscendCausalRule:
     beta_prior: float = 1.0
     rationale: str = ""
     priority: int = 100
+    scope: str = "cross_op"
+    origin_operator: str = ""
 
     def __post_init__(self) -> None:
         if not self.rule_id or not self.transform_template.strip():
             raise ValueError("rule_id and transform_template must be non-empty")
+        if self.scope not in ("cross_op", "operator_local"):
+            raise ValueError(f"invalid rule scope {self.scope!r}; expected 'cross_op' or 'operator_local'")
         validate_rule_predicate(self.regime_guard)
         validate_rule_predicate(self.precondition)
         validate_rule_predicate(self.expected_postcondition)
@@ -237,7 +241,7 @@ class AscendCausalRule:
 
     def to_dict(self) -> dict[str, object]:
         """Serialize rule into a YAML/JSON-compatible mapping."""
-        return {
+        payload: dict[str, object] = {
             "rule_id": self.rule_id,
             "regime_guard": self.regime_guard,
             "precondition": self.precondition,
@@ -248,7 +252,28 @@ class AscendCausalRule:
             "beta_prior": self.beta_prior,
             "rationale": self.rationale,
             "priority": self.priority,
+            "scope": self.scope,
+            "origin_operator": self.origin_operator,
         }
+        return payload
+
+    @classmethod
+    def from_dict(cls, entry: Mapping[str, object]) -> AscendCausalRule:
+        """Deserialize rule from YAML/JSON mapping."""
+        return cls(
+            rule_id=str(entry["rule_id"]),
+            regime_guard=str(entry["regime_guard"]),
+            precondition=str(entry["precondition"]),
+            transform_template=str(entry["transform_template"]),
+            expected_postcondition=str(entry["expected_postcondition"]),
+            source_provenance=str(entry["source_provenance"]),
+            alpha_prior=float(entry.get("alpha_prior", 2.0)),
+            beta_prior=float(entry.get("beta_prior", 1.0)),
+            rationale=str(entry.get("rationale", "")),
+            priority=int(entry.get("priority", 100)),
+            scope=str(entry.get("scope", "cross_op") or "cross_op"),
+            origin_operator=str(entry.get("origin_operator", "") or ""),
+        )
 
 
 _DEFAULT_PIPE_KEYS = (
@@ -539,20 +564,7 @@ def load_seed_rules(path: str | Path | None = None) -> tuple[AscendCausalRule, .
         raise ValueError(f"invalid rules YAML root in {target_path}")
     rules: list[AscendCausalRule] = []
     for entry in items:
-        rules.append(
-            AscendCausalRule(
-                rule_id=str(entry["rule_id"]),
-                regime_guard=str(entry["regime_guard"]),
-                precondition=str(entry["precondition"]),
-                transform_template=str(entry["transform_template"]),
-                expected_postcondition=str(entry["expected_postcondition"]),
-                source_provenance=str(entry["source_provenance"]),
-                alpha_prior=float(entry.get("alpha_prior", 2.0)),
-                beta_prior=float(entry.get("beta_prior", 1.0)),
-                rationale=str(entry.get("rationale", "")),
-                priority=int(entry.get("priority", 100)),
-            )
-        )
+        rules.append(AscendCausalRule.from_dict(entry))
     return tuple(rules)
 
 

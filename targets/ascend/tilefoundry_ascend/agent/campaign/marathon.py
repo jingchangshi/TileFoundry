@@ -64,6 +64,13 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     AgyCliLLMBackend,
     GenerationRequest,
 )
+from tilefoundry_ascend.ascend.cost_model.experience_lake import (
+    CandidateArtifactRecord,
+    CaseObservationRecord,
+    ExperienceLake,
+    compute_source_sha256,
+    resolve_default_experience_lake_dir,
+)
 
 logger = logging.getLogger("tilefoundry_ascend.marathon")
 
@@ -133,6 +140,7 @@ class MarathonConfig:
     checkpoint_path: Path | None = None
     report_path: Path | None = None
     campaign_kb_path: Path | None = None
+    experience_lake_dir: Path | None = None
     log_path: Path | None = None
     max_rounds: int = 80
     max_wall_clock_min: float = 720.0
@@ -1238,6 +1246,7 @@ def salvage_unpromoted_beam_winner(
     ],
     l3_runner: Callable[[Path], L3AcceptanceResult],
     op_logger: logging.Logger | None = None,
+    experience_lake_dir: str | Path | None = None,
 ) -> bool:
     """Re-verify and promote high-scoring unpromoted beam entries across restarts."""
     if not checkpoint_path.is_file():
@@ -1311,11 +1320,66 @@ def salvage_unpromoted_beam_winner(
                 log.warning("SALVAGE_SKIPPED %s L2 eval failed: %s", cid, exc)
                 continue
         cand_res = res_map.get(cid)
+        salvage_lake = (
+            ExperienceLake(experience_lake_dir)
+            if experience_lake_dir is not None and str(experience_lake_dir).strip()
+            else None
+        )
+
+        def _record_salvage(msprof_pmu: Mapping[str, float] | None = None) -> None:
+            if salvage_lake is None or cand_res is None:
+                return
+            try:
+                cand_sha = compute_source_sha256(patched_src)
+                parent_sha = compute_source_sha256(incumbent_src)
+                salvage_lake.register_candidate(
+                    CandidateArtifactRecord(
+                        cand_sha=cand_sha,
+                        operator=operator_name,
+                        regime_tag=rtag,
+                        backend_track=str(row.get("track") or "tilelang_dsl"),
+                        parent_sha=parent_sha,
+                        worker_kind=str(row.get("worker_kind") or "salvage"),
+                        rule_id=(str(row["rule_id"]) if row.get("rule_id") else None),
+                        dsl_line_count=len(patched_src.splitlines()),
+                    )
+                )
+                run_id = f"salvage_{operator_name.replace('/', '_')}_{int(time.time())}_{os.getpid()}"
+                for a in cand_res.anchors:
+                    if a.cand_us <= 0.0:
+                        continue
+                    salvage_lake.append_observation(
+                        CaseObservationRecord(
+                            run_id=run_id,
+                            operator=operator_name,
+                            regime_tag=a.regime_tag,
+                            cand_sha=cand_sha,
+                            eval_tier="salvage",
+                            case_num=int(a.case_num),
+                            measured_us=float(a.cand_us),
+                            accuracy_passed=bool(a.accuracy_passed),
+                            parent_sha=parent_sha,
+                            device_id=str(device_id),
+                            t_hw_us=float(a.t_hw_us),
+                            ref_perf_us=float(a.ref_perf_us),
+                            speedup=float(a.speedup),
+                            eq3_score=float(a.eq3_score),
+                            msprof_pmu=(
+                                {str(k): float(v) for k, v in msprof_pmu.items()}
+                                if (msprof_pmu and a.regime_tag == rtag)
+                                else {}
+                            ),
+                        )
+                    )
+            except Exception as exc:
+                log.debug("Salvage ExperienceLake write skipped: %s", exc)
+
         if (
             cand_res is None
             or not cand_res.all_passed
             or cand_res.surrogate_score <= best_res.surrogate_score + min_surrogate_gain
         ):
+            _record_salvage()
             tried_keys.add(cache_key)
             atomic_write_text(tried_cache_path, json.dumps(sorted(tried_keys)) + "\n")
             continue
@@ -1323,6 +1387,7 @@ def salvage_unpromoted_beam_winner(
         atomic_write_text(target_module_path, patched_src)
         l3_res = l3_runner(target_module_path)
         if not l3_res.passed:
+            _record_salvage()
             atomic_write_text(target_module_path, incumbent_src)
             tried_keys.add(cache_key)
             atomic_write_text(tried_cache_path, json.dumps(sorted(tried_keys)) + "\n")
@@ -1346,6 +1411,8 @@ def salvage_unpromoted_beam_winner(
         except Exception as exc:
             log.warning("SALVAGE msprof refresh failed (non-fatal): %s", exc)
             msprof_map = {}
+
+        _record_salvage(msprof_map.get(rtag))
 
         msprof_cache = dict(payload.get("msprof_cache") or {})
         if rtag in msprof_map:
@@ -1518,6 +1585,12 @@ def run_operator_marathon(
         op_logger=op_logger,
     )
 
+    lake_dir = resolve_default_experience_lake_dir(
+        worktree=worktree,
+        checkpoint_path=checkpoint_path,
+        explicit_dir=cfg.experience_lake_dir,
+    )
+
     if cfg.salvage_beam_candidates:
         salvage_unpromoted_beam_winner(
             operator_name=cfg.operator_name,
@@ -1530,6 +1603,7 @@ def run_operator_marathon(
             l2_evaluator=l2_evaluator,
             l3_runner=l3_runner,
             op_logger=op_logger,
+            experience_lake_dir=lake_dir,
         )
 
     perf_target = PerfTargetSpec(
@@ -1562,7 +1636,7 @@ def run_operator_marathon(
         cost_prescreen_top_k=cfg.cost_prescreen_top_k,
         exploit_effort=cfg.exploit_effort,
     )
-    tracker = BayesianRuleTracker.from_seed_yaml()
+    tracker = BayesianRuleTracker.from_experience_lake(lake_dir)
     flywheel = FlywheelDistiller(
         funnel=GateFunnel(skip_stage_b=True),
         tracker=tracker,
@@ -1603,6 +1677,7 @@ def run_operator_marathon(
         checkpoint_path=checkpoint_path,
         campaign_kb_path=campaign_kb_path,
         cost_calibration_path=state_dir / "cost_model_calibration.jsonl",
+        experience_lake_dir=lake_dir,
         source_root=worktree,
         env_file=env_file,
         stagnation_discount=cfg.stagnation_discount,

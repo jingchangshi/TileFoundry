@@ -66,6 +66,9 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     extract_python_dsl,
 )
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import build_syntax_repair_request
+from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
+    extract_microarch_profile_from_cce,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -579,6 +582,11 @@ def run_l1_compile_check(
         combined_out,
         asm_or_dump_text=lowered_dump,
     )
+    ma_profile = (
+        extract_microarch_profile_from_cce(lowered_dump).to_dict()
+        if lowered_dump.strip()
+        else None
+    )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[-1500:]
         return StageBResult(
@@ -588,6 +596,7 @@ def run_l1_compile_check(
             spill_bytes=spill_bytes,
             vloopv2_hit=vloopv2_hit,
             compiler_summary=summary,
+            microarch_profile=ma_profile,
         )
     return StageBResult(
         passed=True,
@@ -595,6 +604,7 @@ def run_l1_compile_check(
         spill_bytes=spill_bytes,
         vloopv2_hit=vloopv2_hit,
         compiler_summary=summary,
+        microarch_profile=ma_profile,
     )
 
 

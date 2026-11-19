@@ -60,6 +60,9 @@ from tilefoundry_ascend.ascend.ir.tir.instructions import (
     AscendVstsDist,
     AscendVunary,
 )
+from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
+    extract_microarch_profile_from_tirx,
+)
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
     ScopeWaterline,
@@ -3235,6 +3238,7 @@ def inspect_tilelang_primfunc(
                 round(min(0.5, l1_wl.peak_allocated_bytes / float(l1_half)), 4),
             )
 
+    ma_prof = extract_microarch_profile_from_tirx(entry_fn, var_bindings=var_bindings)
     ledger = build_objective_physical_ledger(
         analysis_mode=analysis_mode,
         is_legal=(not illegal_dma) and (lowering_error is None),
@@ -3264,6 +3268,7 @@ def inspect_tilelang_primfunc(
         in_loop_pipe_all_barriers=telemetry.in_loop_pipe_all_barriers,
         ub_bank_conflict_risk=telemetry.ub_bank_conflict_risk,
         l1_bank_conflict_risk=effective_l1_risk,
+        microarch_profile=ma_prof.to_dict(),
     )
     return EnvelopeInspectionResult(
         ledger=ledger,

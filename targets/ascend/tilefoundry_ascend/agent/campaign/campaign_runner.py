@@ -51,7 +51,11 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     run_surrogate_batch_via_agent_gates,
 )
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
-from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
+from tilefoundry_ascend.agent.kb.bayesian_tracker import (
+    BayesianRuleTracker,
+    append_kb_event_shard,
+    save_distilled_rule_file,
+)
 from tilefoundry_ascend.agent.kb.schema import (
     AscendCausalRule,
     build_predicate_context,
@@ -96,6 +100,15 @@ from tilefoundry_ascend.ascend.cost_model import (
     HybridAscendCostModel,
     build_cost_features_from_ledger,
 )
+from tilefoundry_ascend.ascend.cost_model.experience_lake import (
+    CandidateArtifactRecord,
+    CaseObservationRecord,
+    ExperienceLake,
+    compute_source_sha256,
+    project_case_workload,
+    resolve_default_experience_lake_dir,
+)
+from tilefoundry_ascend.ascend.cost_model.microarch_profile import merge_microarch_profiles
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
     HirTirNavigationPacket,
     compile_hir_navigation_packet,
@@ -968,6 +981,7 @@ class PerfTargetCampaignRunner:
         sil_advisory: object | None = None,
         topology_axes: TopologyAxes | Mapping[str, object] | None = None,
         cost_calibration_path: str | Path | None = None,
+        experience_lake_dir: str | Path | None = None,
     ) -> None:
         self._config = config
         self._source_root = (
@@ -1057,6 +1071,24 @@ class PerfTargetCampaignRunner:
             self._target,
             calibration_path=self._cost_calibration_path,
         )
+        self._experience_lake_dir = resolve_default_experience_lake_dir(
+            worktree=None,
+            checkpoint_path=self._checkpoint_path or self._campaign_kb_path,
+            explicit_dir=experience_lake_dir,
+        )
+        self._experience_lake = (
+            ExperienceLake(self._experience_lake_dir)
+            if self._experience_lake_dir is not None
+            else None
+        )
+        op_slug = self._config.operator_name.replace("/", "_")
+        self._run_id = f"{op_slug}_{int(time.time())}_{os.getpid()}"
+        self._case_dims_cache: dict[int, dict[str, object]] = {}
+        if self._experience_lake_dir is not None:
+            try:
+                self._cost_model.replay_experience_lake(self._experience_lake_dir)
+            except Exception as exc:
+                logger.debug("ExperienceLake startup replay skipped: %s", exc)
         self._freedom_masks: dict[str, ConstraintRelaxationMask] = {}
         self._live_regime_plans: dict[str, RegimePlanResult] = {}
         self._clock = clock
@@ -1670,6 +1702,7 @@ class PerfTargetCampaignRunner:
         live_plan: RegimePlanResult | None = None,
         axes: TopologyAxes | None = None,
         nav_packet: HirTirNavigationPacket | None = None,
+        stage_b_profile: Mapping[str, object] | None = None,
     ) -> CostFeatures:
         return build_cost_features_from_ledger(
             ledger,
@@ -1678,7 +1711,371 @@ class PerfTargetCampaignRunner:
             nav_packet=nav_packet,
             sil_advisory=self._sil_advisory,
             target=self._target,
+            stage_b_profile=stage_b_profile,
         )
+
+    def _lookup_case_dims_safe(
+        self,
+        case_num: int,
+        regime_tag: str = "",
+    ) -> dict[str, object]:
+        cnum = int(case_num)
+        if cnum in self._case_dims_cache:
+            return dict(self._case_dims_cache[cnum])
+        dims: dict[str, object] = {}
+        try:
+            dims = dict(
+                lookup_case_dims(
+                    self._config.operator_name,
+                    cnum,
+                    cannbench_repo=self._cannbench_repo,
+                    env_file=self._env_file,
+                )
+            )
+        except Exception:
+            for spec in self._regime_specs:
+                if regime_tag and spec.regime_tag == regime_tag:
+                    dims = dict(spec.representative_anchor_dims or spec.representative_hir_dims)
+                    break
+            if not dims and self._regime_specs:
+                first = self._regime_specs[0]
+                dims = dict(first.representative_anchor_dims or first.representative_hir_dims)
+        self._case_dims_cache[cnum] = dict(dims)
+        return dims
+
+    def _record_kb_event(
+        self,
+        *,
+        rule_id: str,
+        postcondition_realized: bool,
+        speed_gain: float = 0.0,
+        topology_axes: object | None = None,
+        round_idx: int = 0,
+    ) -> None:
+        if self._experience_lake_dir is None:
+            return
+        try:
+            append_kb_event_shard(
+                self._experience_lake_dir,
+                run_id=self._run_id,
+                rule_id=rule_id,
+                postcondition_realized=postcondition_realized,
+                speed_gain=speed_gain,
+                topology_axes=topology_axes,
+                operator_name=self._config.operator_name,
+                round_idx=round_idx,
+            )
+        except Exception as exc:
+            logger.debug("KB event shard append skipped: %s", exc)
+
+    def _record_surrogate_observations(
+        self,
+        *,
+        source: str,
+        result: CandidateSurrogateResult,
+        active_anchors: Sequence[AnchorCaseSpec],
+        eval_tier_override: str | None = None,
+        parent_source: str = "",
+        parent_result: CandidateSurrogateResult | None = None,
+        parent_ledger: ObjectivePhysicalLedger | None = None,
+        parent_bisheng_res: BishengResourceSummary | Mapping[str, object] | None = None,
+        parent_stage_b_profile: Mapping[str, object] | None = None,
+        parent_axes: TopologyAxes | None = None,
+        ledger: ObjectivePhysicalLedger | None = None,
+        bisheng_summary: BishengResourceSummary | Mapping[str, object] | None = None,
+        stage_b_profile: Mapping[str, object] | None = None,
+        axes: TopologyAxes | None = None,
+        policy: Mapping[str, object] | None = None,
+        worker_kind: str = "",
+        rule_id: str | None = None,
+        backend_track: str = "tilelang_dsl",
+        regime_tag: str = "",
+    ) -> None:
+        cand_sha = compute_source_sha256(source)
+        parent_sha = compute_source_sha256(parent_source) if parent_source else ""
+        stage_a_prof = getattr(ledger, "microarch_profile", None) if ledger is not None else None
+        merged_prof = merge_microarch_profiles(stage_a_prof, stage_b_profile)
+        prof_dict = merged_prof.to_dict() if not merged_prof.is_empty else {}
+        ledger_dict = ledger.to_dict() if ledger is not None else {}
+        if hasattr(bisheng_summary, "to_dict"):
+            bsum_dict = dict(bisheng_summary.to_dict())
+        elif isinstance(bisheng_summary, Mapping):
+            bsum_dict = dict(bisheng_summary)
+        else:
+            bsum_dict = {}
+        if axes is not None and hasattr(axes, "to_dict"):
+            axes_dict = dict(axes.to_dict())
+        elif axes is not None:
+            axes_dict = {
+                "compute_engine": axes.compute_engine,
+                "memory_ring": axes.memory_ring,
+                "iteration_regularity": axes.iteration_regularity,
+            }
+        else:
+            axes_dict = {}
+        pol_dict = dict(policy or {})
+        eff_regime = regime_tag or (result.anchors[0].regime_tag if result.anchors else "")
+
+        if self._experience_lake is not None:
+            try:
+                self._experience_lake.register_candidate(
+                    CandidateArtifactRecord(
+                        cand_sha=cand_sha,
+                        operator=self._config.operator_name,
+                        regime_tag=eff_regime,
+                        backend_track=backend_track,
+                        parent_sha=parent_sha,
+                        worker_kind=worker_kind,
+                        rule_id=rule_id,
+                        config_knobs=pol_dict,
+                        topology_axes=axes_dict,
+                        base_ledger=ledger_dict,
+                        microarch_profile=prof_dict,
+                        bisheng_summary=bsum_dict,
+                        dsl_line_count=len(source.splitlines()),
+                        subkernel_count=max(1, merged_prof.subkernel_count),
+                    )
+                )
+            except Exception as exc:
+                logger.debug("ExperienceLake register_candidate skipped: %s", exc)
+
+        parent_by_case = (
+            {int(a.case_num): a for a in parent_result.anchors}
+            if parent_result is not None
+            else {}
+        )
+        parent_prof = (
+            merge_microarch_profiles(
+                getattr(parent_ledger, "microarch_profile", None) if parent_ledger is not None else None,
+                parent_stage_b_profile,
+            )
+            if (parent_ledger is not None or parent_stage_b_profile is not None)
+            else None
+        )
+        bn_by_regime: dict[str, int] = {}
+        for anc in result.anchors:
+            if anc.regime_tag not in bn_by_regime:
+                bn = bottleneck_anchor_for_regime(result, anc.regime_tag)
+                bn_by_regime[anc.regime_tag] = int(bn.case_num) if bn is not None else -1
+
+        observed_count = 0
+        delta_count = 0
+        msprof_count = 0
+        for anc in result.anchors:
+            if anc.cand_us <= 0.0:
+                continue
+            eval_tier = (
+                eval_tier_override
+                if eval_tier_override is not None
+                else ("l2_pass" if anc.accuracy_passed else "l2_acc_fail")
+            )
+            dims = self._lookup_case_dims_safe(anc.case_num, anc.regime_tag)
+            proj_wl = project_case_workload(
+                ledger_dict,
+                microarch_profile=prof_dict,
+                case_dims=dims,
+                policy=pol_dict,
+                t_hw_us=anc.t_hw_us,
+                axes=axes,
+                target=self._target,
+            )
+            # Only attach candidate-specific msprof PMU (never copy parent telemetry)
+            cand_msprof = self._msprof_cache.get((cand_sha, anc.regime_tag))
+            bn_case = bn_by_regime.get(anc.regime_tag, -1)
+            attach_msprof = (
+                dict(cand_msprof)
+                if (cand_msprof and (bn_case < 0 or int(anc.case_num) == bn_case))
+                else {}
+            )
+            if self._experience_lake is not None:
+                try:
+                    self._experience_lake.append_observation(
+                        CaseObservationRecord(
+                            run_id=self._run_id,
+                            operator=self._config.operator_name,
+                            regime_tag=anc.regime_tag,
+                            cand_sha=cand_sha,
+                            eval_tier=eval_tier,
+                            case_num=int(anc.case_num),
+                            measured_us=float(anc.cand_us),
+                            accuracy_passed=bool(anc.accuracy_passed),
+                            parent_sha=parent_sha,
+                            device_id=str(self._config.device_id),
+                            case_dims=dims,
+                            t_hw_us=float(anc.t_hw_us),
+                            ref_perf_us=float(anc.ref_perf_us),
+                            speedup=float(anc.speedup),
+                            eq3_score=float(anc.eq3_score),
+                            msprof_pmu=attach_msprof,
+                            projected_tiles=int(proj_wl.get("total_tiles", 0) or 0),
+                            projected_gm_bytes=float(proj_wl.get("gm_bytes", 0.0) or 0.0),
+                            projected_contig_bytes=int(proj_wl.get("contig_burst_bytes", 32768) or 32768),
+                        )
+                    )
+                except Exception as exc:
+                    logger.debug("ExperienceLake append_observation skipped: %s", exc)
+
+            try:
+                if attach_msprof:
+                    self._cost_model.observe_msprof(
+                        proj_wl,
+                        attach_msprof,
+                        measured_us=float(anc.cand_us),
+                        bisheng_res=bisheng_summary,
+                        persist=False,
+                    )
+                    msprof_count += 1
+                self._cost_model.observe(
+                    proj_wl,
+                    float(anc.cand_us),
+                    bisheng_res=bisheng_summary,
+                    persist=False,
+                    refit=False,
+                )
+                observed_count += 1
+                p_anc = parent_by_case.get(int(anc.case_num))
+                if (
+                    p_anc is not None
+                    and p_anc.cand_us > 0.0
+                    and parent_sha
+                    and parent_sha != cand_sha
+                ):
+                    parent_proj = project_case_workload(
+                        parent_ledger.to_dict() if parent_ledger is not None else ledger_dict,
+                        microarch_profile=(parent_prof.to_dict() if parent_prof is not None and not parent_prof.is_empty else prof_dict),
+                        case_dims=dims,
+                        policy=pol_dict,
+                        t_hw_us=p_anc.t_hw_us,
+                        axes=parent_axes or axes,
+                        target=self._target,
+                    )
+                    self._cost_model.observe_pair_delta(
+                        proj_wl,
+                        float(anc.cand_us),
+                        parent_proj,
+                        float(p_anc.cand_us),
+                        cand_bisheng_res=bisheng_summary,
+                        parent_bisheng_res=parent_bisheng_res,
+                        refit=False,
+                    )
+                    delta_count += 1
+            except Exception as exc:
+                logger.debug("Cost model online observation skipped: %s", exc)
+
+        if delta_count > 0:
+            self._cost_model._refit_delta_ridge()
+        if observed_count > 0 or msprof_count > 0:
+            if observed_count > 0:
+                self._cost_model._refit_ridge()
+            if self._cost_calibration_path is not None:
+                self._cost_model.save_calibration(self._cost_calibration_path)
+
+    def _record_l4_observations(
+        self,
+        *,
+        source: str,
+        l4_result: L4CannbenchResult,
+        active_anchors: Sequence[AnchorCaseSpec],
+    ) -> None:
+        if not l4_result.per_case_elapsed_us:
+            return
+        cand_sha = compute_source_sha256(source)
+        stage_a = None
+        if self._regime_specs:
+            try:
+                stage_a = self._run_l0(source, self._regime_specs[0])
+            except Exception:
+                stage_a = None
+        ledger = stage_a.ledger if (stage_a is not None and stage_a.ledger is not None) else _fallback_ledger()
+        axes = self._derive_topology_axes(
+            ledger,
+            features=stage_a.features if stage_a is not None else None,
+            route=stage_a.route if stage_a is not None else None,
+        )
+        prof_dict = dict(getattr(ledger, "microarch_profile", None) or {})
+        ledger_dict = ledger.to_dict() if ledger is not None else {}
+        axes_dict = axes.to_dict() if hasattr(axes, "to_dict") else {}
+        first_reg = self._regime_specs[0].regime_tag if self._regime_specs else ""
+        if self._experience_lake is not None:
+            try:
+                self._experience_lake.register_candidate(
+                    CandidateArtifactRecord(
+                        cand_sha=cand_sha,
+                        operator=self._config.operator_name,
+                        regime_tag=first_reg,
+                        backend_track=(
+                            stage_a.route.track
+                            if self._enable_track_router and stage_a is not None and stage_a.route is not None
+                            else "tilelang_dsl"
+                        ),
+                        topology_axes=axes_dict,
+                        base_ledger=ledger_dict,
+                        microarch_profile=prof_dict,
+                        dsl_line_count=len(source.splitlines()),
+                    )
+                )
+            except Exception as exc:
+                logger.debug("ExperienceLake register L4 candidate skipped: %s", exc)
+
+        by_case_anchor = {int(a.case_num): a for a in active_anchors}
+        observed = 0
+        for cnum_raw, elapsed_raw in sorted(l4_result.per_case_elapsed_us.items()):
+            cnum = int(cnum_raw)
+            elapsed_us = float(elapsed_raw or 0.0)
+            if elapsed_us <= 0.0:
+                continue
+            anc = by_case_anchor.get(cnum)
+            rtag = anc.regime_tag if anc is not None else first_reg
+            dims = self._lookup_case_dims_safe(cnum, rtag)
+            t_hw = anc.t_hw_us if anc is not None else 0.0
+            ref_perf = anc.ref_perf_us if anc is not None else 0.0
+            sp = float(l4_result.per_case_speedups.get(cnum, 0.0) or 0.0)
+            proj_wl = project_case_workload(
+                ledger_dict,
+                microarch_profile=prof_dict,
+                case_dims=dims,
+                t_hw_us=t_hw,
+                axes=axes,
+                target=self._target,
+            )
+            if self._experience_lake is not None:
+                try:
+                    self._experience_lake.append_observation(
+                        CaseObservationRecord(
+                            run_id=self._run_id,
+                            operator=self._config.operator_name,
+                            regime_tag=rtag,
+                            cand_sha=cand_sha,
+                            eval_tier="l4_official",
+                            case_num=cnum,
+                            measured_us=elapsed_us,
+                            accuracy_passed=bool(l4_result.passed),
+                            device_id=str(self._config.device_id),
+                            case_dims=dims,
+                            t_hw_us=t_hw,
+                            ref_perf_us=ref_perf,
+                            speedup=sp,
+                            projected_tiles=int(proj_wl.get("total_tiles", 0) or 0),
+                            projected_gm_bytes=float(proj_wl.get("gm_bytes", 0.0) or 0.0),
+                            projected_contig_bytes=int(proj_wl.get("contig_burst_bytes", 32768) or 32768),
+                        )
+                    )
+                except Exception as exc:
+                    logger.debug("ExperienceLake L4 append skipped: %s", exc)
+            try:
+                self._cost_model.observe(
+                    proj_wl,
+                    elapsed_us,
+                    persist=False,
+                    refit=False,
+                )
+                observed += 1
+            except Exception as exc:
+                logger.debug("Cost model L4 observe skipped: %s", exc)
+        if observed > 0:
+            self._cost_model._refit_ridge()
+            if self._cost_calibration_path is not None:
+                self._cost_model.save_calibration(self._cost_calibration_path)
 
     def _prune_stale_sibling_stepping_stones(
         self,
@@ -2170,6 +2567,7 @@ class PerfTargetCampaignRunner:
         regime_spec: RegimeTargetSpec,
         active_anchors: Sequence[AnchorCaseSpec],
         topology_axes: TopologyAxes,
+        rel_gain: float = 0.0,
     ) -> list[str]:
         """Distill and verify causal rules on hardware through AgentGates."""
         if self._flywheel is None:
@@ -2214,7 +2612,19 @@ class PerfTargetCampaignRunner:
             topology_axes=topology_axes,
             kb_output_path=self._campaign_kb_path,
             rule_id_prefix="R_FLYWHEEL",
+            verify_on_candidate=(rel_gain >= 0.05 and self._l2_batch_evaluator is not None),
+            max_loo_chunks=3,
+            operator_name=self._config.operator_name,
+            rule_scope="operator_local",
         )
+        if self._experience_lake_dir is not None:
+            for rid in distill_rep.admitted_rule_ids:
+                rule_obj = self._tracker.rules.get(rid)
+                if rule_obj is not None:
+                    try:
+                        save_distilled_rule_file(self._experience_lake_dir, rule_obj)
+                    except Exception as exc:
+                        logger.debug("Persisting distilled rule %s skipped: %s", rid, exc)
         return list(distill_rep.admitted_rule_ids)
 
     async def _execute_single_round(
@@ -2468,6 +2878,7 @@ class PerfTargetCampaignRunner:
                 ctx,
                 top_k=self._config.k_rule_workers,
                 topology_axes=parent_axes,
+                operator_name=self._config.operator_name,
             )
         )
 
@@ -2619,6 +3030,12 @@ class PerfTargetCampaignRunner:
                         postcondition_realized=False,
                         topology_axes=parent_axes,
                     )
+                    self._record_kb_event(
+                        rule_id=rule.rule_id,
+                        postcondition_realized=False,
+                        topology_axes=parent_axes,
+                        round_idx=round_idx,
+                    )
             else:
                 raw_candidates.append((wid, snippet))
 
@@ -2676,6 +3093,12 @@ class PerfTargetCampaignRunner:
                         rule.rule_id,
                         postcondition_realized=False,
                         topology_axes=parent_axes,
+                    )
+                    self._record_kb_event(
+                        rule_id=rule.rule_id,
+                        postcondition_realized=False,
+                        topology_axes=parent_axes,
+                        round_idx=round_idx,
                     )
 
         l2_results: dict[str, CandidateSurrogateResult] = {}
@@ -2831,6 +3254,11 @@ class PerfTargetCampaignRunner:
             cand_comp_summary = (
                 chk.stage_b.compiler_summary if getattr(chk, "stage_b", None) is not None else None
             )
+            cand_stage_b_prof = (
+                getattr(chk.stage_b, "microarch_profile", None)
+                if getattr(chk, "stage_b", None) is not None
+                else None
+            )
             cand_residual = compute_static_dynamic_residual(
                 ledger, cand_tel, compiler_summary=cand_comp_summary
             )
@@ -2839,22 +3267,25 @@ class PerfTargetCampaignRunner:
                 features=chk.stage_a.features if chk.stage_a else None,
                 route=chk.stage_a.route if chk.stage_a else None,
             )
-            if res.all_passed and lat_us > 0.0:
-                try:
-                    cand_workload = self._build_cost_workload(
-                        ledger,
-                        live_plan=live_plan,
-                        axes=cand_axes,
-                        nav_packet=nav_packet,
-                    )
-                    self._cost_model.observe(
-                        cand_workload,
-                        lat_us,
-                        bisheng_res=cand_comp_summary,
-                        persist=(self._cost_calibration_path is not None),
-                    )
-                except Exception as exc:
-                    logger.debug("Cost model online observation skipped: %s", exc)
+            self._record_surrogate_observations(
+                source=chk.patched_module_source,
+                result=res,
+                active_anchors=active_anchors,
+                parent_source=parent_module_source,
+                parent_result=(best_result if parent_module_source == incumbent_source else None),
+                parent_ledger=parent_ledger,
+                parent_bisheng_res=parent_comp_summary,
+                parent_axes=parent_axes,
+                ledger=ledger,
+                bisheng_summary=cand_comp_summary,
+                stage_b_profile=cand_stage_b_prof,
+                axes=cand_axes,
+                policy=getattr(live_plan, "policy", None),
+                worker_kind=wkind,
+                rule_id=rule.rule_id if rule else None,
+                backend_track=track,
+                regime_tag=regime_spec.regime_tag,
+            )
             try:
                 _, canonical_slice = extract_regime_snippet(chk.patched_module_source, regime_spec)
             except Exception:
@@ -2911,6 +3342,13 @@ class PerfTargetCampaignRunner:
                     speed_gain=causal_gain,
                     topology_axes=cand_axes,
                 )
+                self._record_kb_event(
+                    rule_id=rule.rule_id,
+                    postcondition_realized=realized,
+                    speed_gain=causal_gain,
+                    topology_axes=cand_axes,
+                    round_idx=round_idx,
+                )
 
         regime_beam.update(beam_updates)
         if promoted and top_chk is not None:
@@ -2946,6 +3384,7 @@ class PerfTargetCampaignRunner:
                         regime_spec=regime_spec,
                         active_anchors=active_anchors,
                         topology_axes=parent_axes,
+                        rel_gain=max(rel_gain, local_rel_gain),
                     )
                 )
                 admitted_rule_ids.extend(round_admitted)
@@ -2956,9 +3395,26 @@ class PerfTargetCampaignRunner:
                     exc,
                 )
 
-        pruned_rules = self._tracker.prune_underperforming(topology_axes=parent_axes)
+        pruned_rules = self._tracker.prune_underperforming(
+            topology_axes=parent_axes,
+            round_idx=round_idx,
+        )
         if pruned_rules:
             logger.debug("Pruned rules for topology_axes %s: %s", parent_axes.key(), pruned_rules)
+        self._tracker.decay_and_revive(
+            round_idx=round_idx,
+            min_cooldown_rounds=10,
+            decay_factor=0.99,
+        )
+        promoted_local = self._tracker.promote_verified_local_rules()
+        if promoted_local and self._experience_lake_dir is not None:
+            for rid in promoted_local:
+                rule_obj = self._tracker.rules.get(rid)
+                if rule_obj is not None:
+                    try:
+                        save_distilled_rule_file(self._experience_lake_dir, rule_obj)
+                    except Exception as exc:
+                        logger.debug("Persisting promoted rule %s skipped: %s", rid, exc)
 
         record = CampaignRoundRecord(
             round_idx=round_idx,
@@ -3017,6 +3473,36 @@ class PerfTargetCampaignRunner:
                 baseline_result,
                 active_anchors,
                 self._regime_specs,
+            )
+            base_sa = None
+            if self._regime_specs:
+                try:
+                    base_sa = self._run_l0(incumbent_source, self._regime_specs[0])
+                except Exception:
+                    base_sa = None
+            base_ledger = (
+                base_sa.ledger
+                if (base_sa is not None and base_sa.ledger is not None)
+                else _fallback_ledger()
+            )
+            base_axes = self._derive_topology_axes(
+                base_ledger,
+                features=base_sa.features if base_sa is not None else None,
+                route=base_sa.route if base_sa is not None else None,
+            )
+            self._record_surrogate_observations(
+                source=incumbent_source,
+                result=baseline_result,
+                active_anchors=active_anchors,
+                eval_tier_override="baseline",
+                ledger=base_ledger,
+                axes=base_axes,
+                worker_kind="baseline",
+                backend_track=(
+                    base_sa.route.track
+                    if self._enable_track_router and base_sa is not None and base_sa.route is not None
+                    else "tilelang_dsl"
+                ),
             )
             best_result = baseline_result
             frozen_regimes = set()
@@ -3163,6 +3649,11 @@ class PerfTargetCampaignRunner:
         l4_result: L4CannbenchResult | None = None
         if self._config.run_final_l4:
             l4_result = self._run_l4_cannbench(self._target_module_path)
+            self._record_l4_observations(
+                source=incumbent_source,
+                l4_result=l4_result,
+                active_anchors=active_anchors,
+            )
             anchor_nums = {a.case_num for a in active_anchors}
             regressed_nums = sorted(
                 cnum
@@ -3237,6 +3728,11 @@ class PerfTargetCampaignRunner:
                 if escalated:
                     escalated_rounds.append(catch_idx)
                 l4_result = self._run_l4_cannbench(self._target_module_path)
+                self._record_l4_observations(
+                    source=incumbent_source,
+                    l4_result=l4_result,
+                    active_anchors=active_anchors,
+                )
 
         self._save_checkpoint(
             incumbent_source=incumbent_source,

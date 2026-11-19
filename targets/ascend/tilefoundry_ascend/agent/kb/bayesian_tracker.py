@@ -3,11 +3,89 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
+import os
 from pathlib import Path
+import re
+import tempfile
+import time
 
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, load_seed_rules
+
+_SAFE_KB_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_kb_slug(raw: str, default: str = "default") -> str:
+    cleaned = _SAFE_KB_SLUG_RE.sub("_", str(raw or "").strip()).strip("._-")
+    return cleaned or default
+
+
+def _serialize_axes(topology_axes: object | None) -> dict[str, str] | None:
+    if topology_axes is None:
+        return None
+    if isinstance(topology_axes, Mapping):
+        return {
+            "compute_engine": str(topology_axes.get("compute_engine", "")),
+            "memory_ring": str(topology_axes.get("memory_ring", "")),
+            "iteration_regularity": str(topology_axes.get("iteration_regularity", "")),
+        }
+    ce = str(getattr(topology_axes, "compute_engine", ""))
+    mr = str(getattr(topology_axes, "memory_ring", ""))
+    ir = str(getattr(topology_axes, "iteration_regularity", ""))
+    if ce and mr and ir:
+        return {"compute_engine": ce, "memory_ring": mr, "iteration_regularity": ir}
+    return None
+
+
+def append_kb_event_shard(
+    lake_dir: str | Path,
+    *,
+    run_id: str,
+    rule_id: str,
+    postcondition_realized: bool,
+    speed_gain: float = 0.0,
+    topology_axes: object | None = None,
+    operator_name: str = "",
+    round_idx: int = 0,
+    event_kind: str = "outcome",
+) -> Path:
+    """Append a single lock-free JSONL KB telemetry event into the sharded lake."""
+    events_dir = Path(lake_dir) / "kb" / "events"
+    events_dir.mkdir(parents=True, exist_ok=True)
+    shard = events_dir / f"{_safe_kb_slug(run_id, 'default')}.jsonl"
+    payload: dict[str, object] = {
+        "timestamp": time.time(),
+        "run_id": str(run_id),
+        "event_kind": str(event_kind),
+        "rule_id": str(rule_id),
+        "postcondition_realized": bool(postcondition_realized),
+        "speed_gain": float(speed_gain),
+        "operator_name": str(operator_name),
+        "round_idx": int(round_idx),
+        "topology_axes": _serialize_axes(topology_axes),
+    }
+    with shard.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, sort_keys=True) + "\n")
+    return shard
+
+
+def save_distilled_rule_file(lake_dir: str | Path, rule: AscendCausalRule) -> Path:
+    """Atomically write or update one distilled causal rule JSON inside the shared KB lake."""
+    rules_dir = Path(lake_dir) / "kb" / "distilled_rules"
+    rules_dir.mkdir(parents=True, exist_ok=True)
+    target = rules_dir / f"{_safe_kb_slug(rule.rule_id, 'rule')}.json"
+    raw = json.dumps(rule.to_dict(), indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{_safe_kb_slug(rule.rule_id, 'rule')}_", suffix=".json", dir=str(rules_dir))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(raw)
+        tmp_path.replace(target)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+    return target
 
 
 @dataclass
@@ -21,6 +99,7 @@ class RulePosterior:
     failures: int = 0
     cumulative_speedup: float = 0.0
     pruned: bool = False
+    pruned_at_round: int = -1
 
     @property
     def trials(self) -> int:
@@ -48,6 +127,7 @@ class RulePosterior:
             "failures": self.failures,
             "cumulative_speedup": self.cumulative_speedup,
             "pruned": self.pruned,
+            "pruned_at_round": self.pruned_at_round,
         }
 
     @classmethod
@@ -61,6 +141,7 @@ class RulePosterior:
             failures=int(payload.get("failures", 0)),
             cumulative_speedup=float(payload.get("cumulative_speedup", 0.0)),
             pruned=bool(payload.get("pruned", False)),
+            pruned_at_round=int(payload.get("pruned_at_round", -1)),
         )
 
 
@@ -71,6 +152,7 @@ class BayesianRuleTracker:
     rules: dict[str, AscendCausalRule] = field(default_factory=dict)
     posteriors: dict[str, RulePosterior] = field(default_factory=dict)
     axis_posteriors: dict[str, dict[str, RulePosterior]] = field(default_factory=dict)
+    _round_counter: int = field(default=0, init=False, repr=False)
 
     @classmethod
     def from_rules(cls, rules: Iterable[AscendCausalRule]) -> BayesianRuleTracker:
@@ -84,6 +166,62 @@ class BayesianRuleTracker:
     def from_seed_yaml(cls, path: str | Path | None = None) -> BayesianRuleTracker:
         """Load seed rules YAML and initialize Bayesian priors."""
         return cls.from_rules(load_seed_rules(path))
+
+    @classmethod
+    def from_experience_lake(
+        cls,
+        lake_dir: str | Path | None = None,
+        *,
+        seed_path: str | Path | None = None,
+    ) -> BayesianRuleTracker:
+        """Initialize from seed rules, then replay shared distilled rules and KB event shards."""
+        tracker = cls.from_seed_yaml(seed_path)
+        if lake_dir is None or not str(lake_dir).strip():
+            return tracker
+        kb_root = Path(lake_dir) / "kb"
+        distilled_dir = kb_root / "distilled_rules"
+        if distilled_dir.is_dir():
+            for rpath in sorted(distilled_dir.glob("*.json")):
+                try:
+                    raw = json.loads(rpath.read_text(encoding="utf-8"))
+                    if isinstance(raw, Mapping):
+                        tracker.admit_rule(AscendCausalRule.from_dict(raw))
+                except Exception:
+                    continue
+
+        events_dir = kb_root / "events"
+        events: list[Mapping[str, object]] = []
+        if events_dir.is_dir():
+            for epath in sorted(events_dir.glob("*.jsonl")):
+                try:
+                    for line in epath.read_text(encoding="utf-8").splitlines():
+                        text = line.strip()
+                        if not text:
+                            continue
+                        obj = json.loads(text)
+                        if isinstance(obj, Mapping):
+                            events.append(obj)
+                except Exception:
+                    continue
+        events.sort(key=lambda ev: float(ev.get("timestamp", 0.0) or 0.0))
+        for ev in events:
+            rid = str(ev.get("rule_id") or "")
+            if not rid or rid not in tracker.rules:
+                continue
+            ridx = int(ev.get("round_idx", 0) or 0)
+            axes_raw = ev.get("topology_axes")
+            tracker.record_outcome(
+                rid,
+                postcondition_realized=bool(ev.get("postcondition_realized", False)),
+                speed_gain=float(ev.get("speed_gain", 0.0) or 0.0),
+                topology_axes=axes_raw if isinstance(axes_raw, Mapping) else None,
+            )
+            tracker.prune_underperforming(
+                topology_axes=axes_raw if isinstance(axes_raw, Mapping) else None,
+                round_idx=ridx,
+            )
+        tracker.promote_verified_local_rules()
+        return tracker
 
     @staticmethod
     def _apply_outcome(
@@ -169,18 +307,22 @@ class BayesianRuleTracker:
         min_trials: int = 5,
         prune_threshold: float = 0.25,
         topology_axes: object | None = None,
+        round_idx: int | None = None,
     ) -> tuple[str, ...]:
         """Mark rules with persistently low posterior realization rate as pruned."""
+        eff_round = int(round_idx) if round_idx is not None else self._round_counter
         newly_pruned: set[str] = set()
         if topology_axes is None:
             for rule_id, state in sorted(self.posteriors.items()):
                 if not state.pruned and state.trials >= min_trials and state.expected_rate < prune_threshold:
                     state.pruned = True
+                    state.pruned_at_round = eff_round
                     newly_pruned.add(rule_id)
             for bucket_map in self.axis_posteriors.values():
                 for rule_id, state in bucket_map.items():
                     if not state.pruned and state.trials >= min_trials and state.expected_rate < prune_threshold:
                         state.pruned = True
+                        state.pruned_at_round = eff_round
             return tuple(sorted(newly_pruned))
 
         axis_keys = self._extract_axis_keys(topology_axes)
@@ -190,25 +332,101 @@ class BayesianRuleTracker:
             for rule_id, state in bucket_map.items():
                 if not state.pruned and state.trials >= min_trials and state.expected_rate < prune_threshold:
                     state.pruned = True
+                    state.pruned_at_round = eff_round
                     touched_rules.add(rule_id)
         for rule_id in touched_rules:
             if self.is_pruned(rule_id, topology_axes=topology_axes):
                 newly_pruned.add(rule_id)
         return tuple(sorted(newly_pruned))
 
+    def decay_and_revive(
+        self,
+        *,
+        round_idx: int | None = None,
+        min_cooldown_rounds: int = 10,
+        decay_factor: float = 0.99,
+    ) -> tuple[str, ...]:
+        """Gently decay stale Beta evidence toward priors and revive rules past cooldown."""
+        if round_idx is not None:
+            self._round_counter = max(self._round_counter, int(round_idx))
+        else:
+            self._round_counter += 1
+        eff_round = int(round_idx) if round_idx is not None else self._round_counter
+        df = max(0.5, min(1.0, float(decay_factor)))
+
+        revived: set[str] = set()
+        for rid, state in sorted(self.posteriors.items()):
+            rule = self.rules.get(rid)
+            ap = float(rule.alpha_prior) if rule is not None else 2.0
+            bp = float(rule.beta_prior) if rule is not None else 1.0
+            if state.pruned and state.pruned_at_round >= 0 and (eff_round - state.pruned_at_round) >= int(min_cooldown_rounds):
+                state.pruned = False
+                state.pruned_at_round = -1
+                state.alpha = ap + 1.0
+                state.beta = bp + 1.0
+                revived.add(rid)
+            elif df < 1.0:
+                state.alpha = ap + max(0.0, state.alpha - ap) * df
+                state.beta = bp + max(0.0, state.beta - bp) * df
+
+        for bucket_map in self.axis_posteriors.values():
+            for rid, a_state in bucket_map.items():
+                rule = self.rules.get(rid)
+                ap = float(rule.alpha_prior) if rule is not None else 2.0
+                bp = float(rule.beta_prior) if rule is not None else 1.0
+                if (
+                    a_state.pruned
+                    and a_state.pruned_at_round >= 0
+                    and (eff_round - a_state.pruned_at_round) >= int(min_cooldown_rounds)
+                ):
+                    a_state.pruned = False
+                    a_state.pruned_at_round = -1
+                    a_state.alpha = ap + 1.0
+                    a_state.beta = bp + 1.0
+                    revived.add(rid)
+                elif df < 1.0:
+                    a_state.alpha = ap + max(0.0, a_state.alpha - ap) * df
+                    a_state.beta = bp + max(0.0, a_state.beta - bp) * df
+        return tuple(sorted(revived))
+
+    def promote_verified_local_rules(
+        self,
+        *,
+        min_successes: int = 2,
+        min_rate: float = 0.6,
+    ) -> tuple[str, ...]:
+        """Graduate proven operator-local rules to cross_op visibility."""
+        promoted: list[str] = []
+        for rid, rule in sorted(self.rules.items()):
+            if rule.scope != "operator_local":
+                continue
+            state = self.posteriors.get(rid)
+            if (
+                state is not None
+                and not state.pruned
+                and state.successes >= int(min_successes)
+                and state.expected_rate >= float(min_rate)
+            ):
+                self.rules[rid] = replace(rule, scope="cross_op")
+                promoted.append(rid)
+        return tuple(promoted)
+
     def unprune(self, rule_id: str, *, topology_axes: object | None = None) -> None:
         """Re-enable a previously pruned rule globally or within the given topology_axes."""
         if topology_axes is None:
             if rule_id in self.posteriors:
                 self.posteriors[rule_id].pruned = False
+                self.posteriors[rule_id].pruned_at_round = -1
             for bucket_map in self.axis_posteriors.values():
                 if rule_id in bucket_map:
                     bucket_map[rule_id].pruned = False
+                    bucket_map[rule_id].pruned_at_round = -1
             return
         for axis_key in self._extract_axis_keys(topology_axes):
             bucket_map = self.axis_posteriors.get(axis_key, {})
             if rule_id in bucket_map:
                 bucket_map[rule_id].pruned = False
+                bucket_map[rule_id].pruned_at_round = -1
 
     def is_pruned(self, rule_id: str, *, topology_axes: object | None = None) -> bool:
         """Return whether rule_id is pruned globally or across a majority of the 3 axes."""
@@ -227,13 +445,27 @@ class BayesianRuleTracker:
         global_state = self.posteriors.get(rule_id)
         return bool(global_state is not None and global_state.pruned)
 
-    def active_rules(self, *, topology_axes: object | None = None) -> tuple[AscendCausalRule, ...]:
-        """Return all non-pruned rules sorted deterministically."""
-        return tuple(
-            rule
-            for rule_id, rule in sorted(self.rules.items())
-            if not self.is_pruned(rule_id, topology_axes=topology_axes)
-        )
+    def active_rules(
+        self,
+        *,
+        topology_axes: object | None = None,
+        operator_name: str = "",
+    ) -> tuple[AscendCausalRule, ...]:
+        """Return all non-pruned rules visible to *operator_name* sorted deterministically."""
+        eff_op = str(operator_name or "").strip()
+        selected: list[AscendCausalRule] = []
+        for rule_id, rule in sorted(self.rules.items()):
+            if self.is_pruned(rule_id, topology_axes=topology_axes):
+                continue
+            if (
+                rule.scope == "operator_local"
+                and eff_op
+                and rule.origin_operator.strip()
+                and rule.origin_operator.strip() != eff_op
+            ):
+                continue
+            selected.append(rule)
+        return tuple(selected)
 
     def _blended_axis_metrics(
         self,
@@ -270,10 +502,12 @@ class BayesianRuleTracker:
         *,
         top_k: int | None = None,
         topology_axes: object | None = None,
+        operator_name: str = "",
     ) -> tuple[AscendCausalRule, ...]:
         """Filter matching non-pruned rules and rank by factorized 3-axis posterior rate and priority."""
+        eff_op = str(operator_name or "").strip() or str(context.get("operator_name") or "").strip()
         candidates: list[tuple[tuple[float, float, int, str], AscendCausalRule]] = []
-        for rule in self.active_rules(topology_axes=topology_axes):
+        for rule in self.active_rules(topology_axes=topology_axes, operator_name=eff_op):
             if not rule.matches(context):
                 continue
             if topology_axes is not None:
@@ -344,4 +578,9 @@ class BayesianRuleTracker:
             self.load_posteriors_dict(payload)
 
 
-__all__ = ["BayesianRuleTracker", "RulePosterior"]
+__all__ = [
+    "BayesianRuleTracker",
+    "RulePosterior",
+    "append_kb_event_shard",
+    "save_distilled_rule_file",
+]

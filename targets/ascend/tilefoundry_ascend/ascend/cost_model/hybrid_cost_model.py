@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 import math
 from pathlib import Path
@@ -13,6 +13,18 @@ from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
     BishengResourceSummary,
     CompilerBehaviorRegistry,
     DEFAULT_COMPILER_BEHAVIOR_REGISTRY,
+)
+from tilefoundry_ascend.ascend.cost_model.experience_lake import (
+    ExperienceLake,
+    project_case_workload,
+)
+from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
+    MicroarchProfile,
+    merge_microarch_profiles,
+)
+from tilefoundry_ascend.ascend.cost_model.pipe_schedule_eval import (
+    Ascend950PipeScheduleEvaluator,
+    Ascend950PipeScheduleResult,
 )
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
@@ -40,7 +52,7 @@ DEFAULT_L2_BYTES_PER_CYCLE_PER_AIC = 101
 DEFAULT_UB_BANK_MODULUS_BYTES = 512  # 16 banks * 32B datablock
 DEFAULT_AIV_VEC_FLOPS_PER_CYCLE = 128  # 64 fp32 lanes * 2 FLOPs/cycle (FMA)
 DEFAULT_LAUNCH_OVERHEAD_US = 3.2
-DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC = 256
+DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC = 128
 DEFAULT_CV_SYNC_EVENT_US = 0.08
 
 
@@ -172,6 +184,10 @@ class CostFeatures:
     cv_sync_events: int = 0
     extra_signals: dict[str, float] = field(default_factory=dict)
     topology_axes: TopologyAxes | None = None
+    microarch_profile: dict[str, object] = field(default_factory=dict)
+    steady_state_ii: int = 0
+    loop_trips: int = 1
+    pipeline_depth: int = 1
 
     @classmethod
     def coerce(
@@ -229,6 +245,13 @@ class CostFeatures:
         raw_axes = filtered.get("topology_axes")
         if isinstance(raw_axes, Mapping):
             filtered["topology_axes"] = TopologyAxes.from_dict(raw_axes)
+        raw_prof = filtered.get("microarch_profile")
+        if raw_prof is None:
+            filtered["microarch_profile"] = {}
+        elif isinstance(raw_prof, MicroarchProfile):
+            filtered["microarch_profile"] = raw_prof.to_dict()
+        elif isinstance(raw_prof, Mapping):
+            filtered["microarch_profile"] = dict(raw_prof)
         return cls(**filtered)
 
 
@@ -438,6 +461,13 @@ class HybridAscendCostModel:
         self._samples: list[CalibrationSample] = []
         self._weights: list[float] = [0.0] * self.FEATURE_DIM
         self._bucket_weights: dict[str, list[float]] = {}
+        self._pipe_evaluator = Ascend950PipeScheduleEvaluator(self.target)
+        self._msprof_pipe_scales: dict[str, dict[str, tuple[float, float]]] = {}
+        self._msprof_event_count: int = 0
+        self._pair_deltas: list[tuple[tuple[float, ...], float]] = []
+        self._delta_weights: list[float] = [0.0] * self.FEATURE_DIM
+        self._replayed_obs_keys: set[tuple[str, int, str, float]] = set()
+        self._replayed_pair_keys: set[tuple[str, str, int]] = set()
         if self.calibration_path is not None and self.calibration_path.exists():
             self.load_calibration(self.calibration_path)
 
@@ -452,6 +482,33 @@ class HybridAscendCostModel:
     @property
     def bucket_weights(self) -> dict[str, tuple[float, ...]]:
         return {k: tuple(v) for k, v in self._bucket_weights.items()}
+
+    @property
+    def delta_weights(self) -> tuple[float, ...]:
+        return tuple(self._delta_weights)
+
+    @property
+    def pair_delta_count(self) -> int:
+        return len(self._pair_deltas)
+
+    @property
+    def msprof_event_count(self) -> int:
+        return self._msprof_event_count
+
+    def pipe_scale_multipliers(self, bucket: str = "global") -> dict[str, float]:
+        """Return Bayes-shrunk [0.5, 2.0] per-pipe multipliers for *bucket*."""
+        prior_alpha = 10.0
+        pipes = ("CUBE", "VECTOR", "MTE1", "MTE2", "MTE3", "FIXPIPE")
+        bucket_stats = self._msprof_pipe_scales.get(bucket) or {}
+        global_stats = self._msprof_pipe_scales.get("global") or {}
+        out: dict[str, float] = {}
+        for pipe in pipes:
+            s_log, s_w = bucket_stats.get(pipe, (0.0, 0.0))
+            if s_w <= 0.0:
+                s_log, s_w = global_stats.get(pipe, (0.0, 0.0))
+            scale = math.exp(s_log / (prior_alpha + s_w)) if s_w > 0.0 else 1.0
+            out[pipe] = max(0.5, min(2.0, scale))
+        return out
 
     def _pad_feature_vector(self, vec: Sequence[float]) -> tuple[float, ...]:
         vals = [float(x) for x in vec[: self.FEATURE_DIM]]
@@ -504,6 +561,8 @@ class HybridAscendCostModel:
     def _compute_tier0_and_tier1(
         self,
         cf: CostFeatures,
+        *,
+        use_pipe_scales: bool = True,
     ) -> tuple[
         float,
         float,
@@ -523,6 +582,19 @@ class HybridAscendCostModel:
         aic_cores = max(1, cf.active_aic_cores or self.facts.num_aic_cores)
         aiv_cores = max(1, cf.active_aiv_cores or self.facts.num_aiv_cores)
         clock_hz = self.clock_ghz * 1e9
+        bucket = topology_bucket_for_axes(cf.topology_axes)
+        scales = (
+            self.pipe_scale_multipliers(bucket)
+            if use_pipe_scales
+            else {
+                "CUBE": 1.0,
+                "VECTOR": 1.0,
+                "MTE1": 1.0,
+                "MTE2": 1.0,
+                "MTE3": 1.0,
+                "FIXPIPE": 1.0,
+            }
+        )
 
         # 1. Per-dtype Cube MACs/cycle @ 1.65 GHz + Wave Quantization
         macs_per_cycle = _cube_macs_for_dtype(self.facts, cf.cube_dtype, hf32=cf.hf32)
@@ -574,6 +646,12 @@ class HybridAscendCostModel:
             else 0.0
         )
 
+        # Apply MSProf Head-1 pipe multipliers cleanly (equal 1.0 before any msprof observation)
+        cube_floor_us *= scales["CUBE"]
+        vec_floor_us *= scales["VECTOR"]
+        hbm_floor_us *= scales["MTE2"]
+        fixpipe_floor_us *= scales["FIXPIPE"]
+
         if cf.cv_sync_events > 0:
             cv_sync_us = float(cf.cv_sync_events) * DEFAULT_CV_SYNC_EVENT_US
         elif (
@@ -586,19 +664,22 @@ class HybridAscendCostModel:
         else:
             cv_sync_us = 0.0
 
+        prof = MicroarchProfile.coerce(cf.microarch_profile) if cf.microarch_profile else MicroarchProfile()
         has_work = (
             cf.cube_flops > 0.0
             or cf.vec_flops > 0.0
             or cf.gm_bytes > 0.0
             or cf.fixpipe_bytes > 0.0
+            or (not prof.is_empty)
         )
-        if has_work and cf.kernel_launches > 0:
+        eff_launches = max(cf.kernel_launches, prof.subkernel_count) if (cf.kernel_launches > 0 and not prof.is_empty) else cf.kernel_launches
+        if has_work and eff_launches > 0:
             launch_unit = (
                 float(cf.launch_overhead_us)
                 if cf.launch_overhead_us is not None
                 else DEFAULT_LAUNCH_OVERHEAD_US
             )
-            launch_us = float(cf.kernel_launches) * max(0.0, launch_unit)
+            launch_us = float(eff_launches) * max(0.0, launch_unit)
         else:
             launch_us = 0.0
 
@@ -615,14 +696,64 @@ class HybridAscendCostModel:
         l1_conflict = 0.25 if (cf.l1_stages >= 2 and not cf.l1_half_bank_split) else 0.0
         bank_conflict_us = vec_floor_us * ub_conflict + cube_floor_us * l1_conflict
 
-        # Combine Roofline Physics Floor (Launch + bottleneck pipes + non-overlapped tail)
-        compute_us = max(cube_floor_us, vec_floor_us, fixpipe_floor_us)
-        exec_us = (
-            max(compute_us, hbm_floor_us, l2_floor_us)
-            + 0.15 * min(compute_us, hbm_floor_us)
-            + bank_conflict_us
-            + cv_sync_us
-        )
+        if not prof.is_empty:
+            eff_prof = replace(
+                prof,
+                pipeline_depth=max(prof.pipeline_depth, cf.pipeline_depth),
+                inner_loop_trips=max(prof.inner_loop_trips, cf.loop_trips),
+                subkernel_count=max(prof.subkernel_count, eff_launches),
+            )
+            peak_hbm_bw = max(1.0, self.facts.effective_hbm_bandwidth_bps(65536))
+            burst_eff = max(0.10, min(1.0, eff_hbm_bw / peak_hbm_bw))
+            is_coupled = cf.topology_axes is not None and cf.topology_axes.compute_engine == "coupled_1c2v"
+            sched = self._pipe_evaluator.evaluate_profile(
+                eff_prof,
+                cube_flops=cf.cube_flops,
+                vec_flops=cf.vec_flops,
+                cube_dtype=cf.cube_dtype,
+                hf32=cf.hf32,
+                total_tiles=cf.total_tiles,
+                active_aic_cores=cf.active_aic_cores,
+                active_aiv_cores=cf.active_aiv_cores,
+                dma_burst_efficiency=burst_eff,
+                is_coupled_1c2v=is_coupled,
+                ledger_steady_state_ii=cf.steady_state_ii,
+                pipe_scale_multipliers=scales,
+            )
+            cube_floor_us = max(cube_floor_us, sched.pipe_ns["CUBE"] * 1e-3)
+            vec_floor_us = max(vec_floor_us, sched.pipe_ns["VECTOR"] * 1e-3)
+            fixpipe_floor_us = max(fixpipe_floor_us, sched.pipe_ns["FIXPIPE"] * 1e-3)
+            hbm_floor_us = max(hbm_floor_us, (sched.pipe_ns["MTE2"] * 1e-3) * (1.0 - l2_hit_rate))
+            mte1_us = sched.pipe_ns["MTE1"] * 1e-3
+            mte3_us = sched.pipe_ns["MTE3"] * 1e-3
+            if prof.cv_sync_barriers > 0:
+                cv_sync_us = max(cv_sync_us, float(eff_prof.cv_sync_barriers) * DEFAULT_CV_SYNC_EVENT_US)
+            prof_has_bank = prof.ub_bank_conflict_factor > 1.0 or prof.l1_bank_conflict_factor > 1.0
+            extra_bank_us = 0.0 if prof_has_bank else bank_conflict_us
+            if prof.ub_bank_conflict_factor > 1.0:
+                bank_conflict_us = max(
+                    bank_conflict_us,
+                    vec_floor_us * (1.0 - 1.0 / max(1.0, prof.ub_bank_conflict_factor)),
+                )
+            compute_us = max(cube_floor_us, vec_floor_us, fixpipe_floor_us, mte1_us, mte3_us)
+            roofline_exec_us = (
+                max(compute_us, hbm_floor_us, l2_floor_us)
+                + 0.15 * min(compute_us, hbm_floor_us)
+                + extra_bank_us
+                + cv_sync_us
+            )
+            sched_sync_us = max(0.0, (sched.total_ns - sched.loop_total_ns) * 1e-3)
+            sched_exec_us = (sched.loop_total_ns * 1e-3) + max(cv_sync_us, sched_sync_us) + extra_bank_us
+            exec_us = max(roofline_exec_us, sched_exec_us)
+        else:
+            # Combine Roofline Physics Floor (Launch + bottleneck pipes + non-overlapped tail)
+            compute_us = max(cube_floor_us, vec_floor_us, fixpipe_floor_us)
+            exec_us = (
+                max(compute_us, hbm_floor_us, l2_floor_us)
+                + 0.15 * min(compute_us, hbm_floor_us)
+                + bank_conflict_us
+                + cv_sync_us
+            )
         tier0_us = launch_us + exec_us
 
         # 4. Tier 1: Compiler Resource Penalty via extensible CompilerBehaviorRegistry
@@ -867,7 +998,7 @@ class HybridAscendCostModel:
         self._bucket_weights = new_bucket_weights
 
     def save_calibration(self, path: str | Path) -> None:
-        """Persist calibration samples to JSONL or JSON."""
+        """Persist calibration samples (and JSON Two-Head state) to JSONL or JSON."""
         target_path = Path(path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if target_path.suffix == ".jsonl":
@@ -877,11 +1008,21 @@ class HybridAscendCostModel:
             payload = {
                 "samples": [s.to_dict() for s in self._samples],
                 "weights": list(self._weights),
+                "delta_weights": list(self._delta_weights),
+                "pair_deltas": [
+                    {"delta_x": list(dx), "delta_y": float(dy)}
+                    for dx, dy in self._pair_deltas
+                ],
+                "msprof_pipe_scales": {
+                    bkt: {p: [float(sl), float(sw)] for p, (sl, sw) in pmap.items()}
+                    for bkt, pmap in self._msprof_pipe_scales.items()
+                },
+                "msprof_event_count": int(self._msprof_event_count),
             }
             target_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
     def load_calibration(self, path: str | Path) -> int:
-        """Reload calibration samples from JSONL or JSON and refit Ridge weights."""
+        """Reload calibration samples from JSONL or JSON and refit Ridge surrogates."""
         src = Path(path)
         if not src.exists():
             return 0
@@ -900,9 +1041,269 @@ class HybridAscendCostModel:
             payload = json.loads(raw)
             for item in payload.get("samples") or ():
                 samples.append(CalibrationSample.from_dict(item))
+            raw_pmap = payload.get("msprof_pipe_scales")
+            if isinstance(raw_pmap, Mapping):
+                loaded_scales: dict[str, dict[str, tuple[float, float]]] = {}
+                for bkt, pmap in raw_pmap.items():
+                    if isinstance(pmap, Mapping):
+                        loaded_scales[str(bkt)] = {
+                            str(p): (float(vals[0]), float(vals[1]))
+                            for p, vals in pmap.items()
+                            if isinstance(vals, (list, tuple)) and len(vals) == 2
+                        }
+                self._msprof_pipe_scales = loaded_scales
+            self._msprof_event_count = int(payload.get("msprof_event_count", 0) or 0)
+            raw_deltas = payload.get("pair_deltas")
+            if isinstance(raw_deltas, list):
+                self._pair_deltas = [
+                    (
+                        tuple(float(v) for v in (item.get("delta_x") or ())),
+                        float(item.get("delta_y", 0.0)),
+                    )
+                    for item in raw_deltas
+                    if isinstance(item, Mapping)
+                ]
         self._samples = samples
         self._refit_ridge()
+        self._refit_delta_ridge()
         return len(self._samples)
+
+    def observe_msprof(
+        self,
+        workload: CostFeatures | Mapping[str, object],
+        msprof_pmu: Mapping[str, object],
+        *,
+        measured_us: float | None = None,
+        bisheng_res: BishengResourceSummary | Mapping[str, object] | None = None,
+        persist: bool = False,
+    ) -> dict[str, float]:
+        """Head-1 online calibrator: adjust per-pipe scale multipliers from MSProf PMU ratios."""
+        cf = CostFeatures.coerce(workload, bisheng_res=bisheng_res)
+        bucket = topology_bucket_for_axes(cf.topology_axes)
+        if not isinstance(msprof_pmu, Mapping) or not msprof_pmu:
+            return self.pipe_scale_multipliers(bucket)
+
+        raw_dur = measured_us if (measured_us is not None and float(measured_us) > 0.0) else msprof_pmu.get("dur_us", 0.0)
+        try:
+            dur_us = float(raw_dur or 0.0)
+        except Exception:
+            dur_us = 0.0
+        if dur_us <= 0.0:
+            return self.pipe_scale_multipliers(bucket)
+
+        res = self._compute_tier0_and_tier1(cf, use_pipe_scales=False)
+        raw_cube_us = float(res[2])
+        raw_vec_us = float(res[3])
+        raw_hbm_us = float(res[4])
+        raw_fixpipe_us = float(res[10])
+
+        def _pmu_ratio(*keys: str) -> float:
+            best = 0.0
+            for key in keys:
+                val = msprof_pmu.get(key)
+                if val is None:
+                    continue
+                try:
+                    num = float(val)
+                except Exception:
+                    continue
+                if not math.isfinite(num) or num <= 0.0:
+                    continue
+                if num > 1.0:
+                    num /= 100.0
+                best = max(best, min(1.0, num))
+            return best
+
+        pipe_observations = (
+            ("CUBE", _pmu_ratio("aic_mad", "aic_mac_ratio"), raw_cube_us),
+            ("VECTOR", _pmu_ratio("aiv_vec", "aiv_vec_ratio"), raw_vec_us),
+            ("FIXPIPE", _pmu_ratio("aic_fixpipe"), raw_fixpipe_us),
+            ("MTE2", _pmu_ratio("aiv_mte2", "aic_mte2", "mte2_wait_ratio"), raw_hbm_us),
+        )
+        max_log = math.log(2.0)
+        updated = False
+        target_buckets = [bucket] if bucket == "global" else [bucket, "global"]
+        for pipe, ratio, analytical_us in pipe_observations:
+            if ratio <= 0.0 or analytical_us <= 1e-3:
+                continue
+            obs_pipe_us = dur_us * ratio
+            if obs_pipe_us <= 0.0:
+                continue
+            log_r = math.log(max(1e-6, obs_pipe_us) / max(1e-6, analytical_us))
+            log_r = max(-max_log, min(max_log, log_r))
+            w = min(1.0, max(0.05, ratio))
+            for bkt in target_buckets:
+                bmap = self._msprof_pipe_scales.setdefault(bkt, {})
+                prev_log, prev_w = bmap.get(pipe, (0.0, 0.0))
+                bmap[pipe] = (prev_log + w * log_r, prev_w + w)
+            updated = True
+        if updated:
+            self._msprof_event_count += 1
+            if persist and self.calibration_path is not None and self.calibration_path.suffix != ".jsonl":
+                self.save_calibration(self.calibration_path)
+        return self.pipe_scale_multipliers(bucket)
+
+    def _refit_delta_ridge(self) -> None:
+        """Fit Head-2 Ridge regression over paired same-case feature differences."""
+        d = self.FEATURE_DIM
+        if not self._pair_deltas:
+            self._delta_weights = [0.0] * d
+            return
+        decay = 0.985
+        n_total = len(self._pair_deltas)
+        alpha = max(1.0, self.ridge_alpha)
+        xtx = [[alpha if i == j else 0.0 for j in range(d)] for i in range(d)]
+        xty = [0.0] * d
+        for idx, (dx, dy) in enumerate(self._pair_deltas):
+            x = self._pad_feature_vector(dx)
+            y = max(-2.5, min(2.5, float(dy)))
+            w = decay ** float(n_total - 1 - idx)
+            for i in range(d):
+                xty[i] += w * x[i] * y
+                for j in range(d):
+                    xtx[i][j] += w * x[i] * x[j]
+        self._delta_weights = _solve_linear_system(xtx, xty)
+
+    def observe_pair_delta(
+        self,
+        cand_workload: CostFeatures | Mapping[str, object],
+        cand_us: float,
+        parent_workload: CostFeatures | Mapping[str, object],
+        parent_us: float,
+        *,
+        cand_bisheng_res: BishengResourceSummary | Mapping[str, object] | None = None,
+        parent_bisheng_res: BishengResourceSummary | Mapping[str, object] | None = None,
+        refit: bool = True,
+    ) -> float:
+        """Head-2 calibration: learn residual log-ratio from same-(op, case) candidate vs parent."""
+        if cand_us <= 0.0 or parent_us <= 0.0:
+            raise ValueError(f"Both cand_us and parent_us must be positive, got {cand_us!r}, {parent_us!r}")
+        cf_c = CostFeatures.coerce(cand_workload, bisheng_res=cand_bisheng_res)
+        cf_p = CostFeatures.coerce(parent_workload, bisheng_res=parent_bisheng_res)
+        res_c = self._compute_tier0_and_tier1(cf_c)
+        res_p = self._compute_tier0_and_tier1(cf_p)
+        base_c = max(1e-6, float(res_c[0]) + float(res_c[1]))
+        base_p = max(1e-6, float(res_p[0]) + float(res_p[1]))
+        x_c = self._pad_feature_vector(res_c[-1])
+        x_p = self._pad_feature_vector(res_p[-1])
+        delta_x = tuple(float(a) - float(b) for a, b in zip(x_c, x_p))
+        actual_log_ratio = math.log(float(cand_us) / float(parent_us))
+        analytical_log_ratio = math.log(base_c / base_p)
+        delta_y = max(-2.5, min(2.5, actual_log_ratio - analytical_log_ratio))
+        self._pair_deltas.append((delta_x, delta_y))
+        if refit:
+            self._refit_delta_ridge()
+        return delta_y
+
+    def predict_delta_ratio(
+        self,
+        cand_workload: CostFeatures | Mapping[str, object],
+        parent_workload: CostFeatures | Mapping[str, object],
+        *,
+        cand_bisheng_res: BishengResourceSummary | Mapping[str, object] | None = None,
+        parent_bisheng_res: BishengResourceSummary | Mapping[str, object] | None = None,
+    ) -> float:
+        """Predict relative latency ratio cand_us / parent_us (< 1.0 means cand is faster)."""
+        cf_c = CostFeatures.coerce(cand_workload, bisheng_res=cand_bisheng_res)
+        cf_p = CostFeatures.coerce(parent_workload, bisheng_res=parent_bisheng_res)
+        if not self._pair_deltas:
+            pred_c = max(1e-6, self.predict(cf_c).pred_us)
+            pred_p = max(1e-6, self.predict(cf_p).pred_us)
+            return pred_c / pred_p
+        res_c = self._compute_tier0_and_tier1(cf_c)
+        res_p = self._compute_tier0_and_tier1(cf_p)
+        base_c = max(1e-6, float(res_c[0]) + float(res_c[1]))
+        base_p = max(1e-6, float(res_p[0]) + float(res_p[1]))
+        x_c = self._pad_feature_vector(res_c[-1])
+        x_p = self._pad_feature_vector(res_p[-1])
+        delta_x = tuple(float(a) - float(b) for a, b in zip(x_c, x_p))
+        log_res = max(-2.5, min(2.5, sum(w * dx for w, dx in zip(self._delta_weights, delta_x))))
+        return max(1e-4, (base_c / base_p) * math.exp(log_res))
+
+    def replay_experience_lake(
+        self,
+        lake_dir: str | Path,
+        *,
+        persist_calibration: bool = False,
+    ) -> dict[str, int]:
+        """Idempotently replay candidates, case observations, MSProf PMU, and pairwise deltas."""
+        lake = ExperienceLake(lake_dir)
+        candidates, observations = lake.load_records()
+        n_obs = 0
+        n_msprof = 0
+        n_pairs = 0
+
+        def _project_for(art_sha: str, obs_rec: Any) -> tuple[dict[str, object], dict[str, object] | None]:
+            art = candidates.get(art_sha)
+            if art is None:
+                proj = project_case_workload(
+                    None,
+                    case_dims=obs_rec.case_dims,
+                    t_hw_us=obs_rec.t_hw_us,
+                    target=self.target,
+                )
+                return proj, None
+            axes_obj = TopologyAxes.from_dict(art.topology_axes) if art.topology_axes else None
+            proj = project_case_workload(
+                art.base_ledger,
+                microarch_profile=art.microarch_profile,
+                case_dims=obs_rec.case_dims,
+                policy=art.config_knobs,
+                t_hw_us=obs_rec.t_hw_us,
+                axes=axes_obj,
+                target=self.target,
+            )
+            return proj, (art.bisheng_summary or None)
+
+        pending_obs: list[tuple[dict[str, object], dict[str, object] | None, float]] = []
+        for obs in observations:
+            if obs.measured_us <= 0.0:
+                continue
+            obs_key = (obs.cand_sha, int(obs.case_num), obs.eval_tier, round(float(obs.measured_us), 6))
+            if obs_key in self._replayed_obs_keys:
+                continue
+            self._replayed_obs_keys.add(obs_key)
+            wl, bres = _project_for(obs.cand_sha, obs)
+            pending_obs.append((wl, bres, obs.measured_us))
+            if obs.msprof_pmu:
+                self.observe_msprof(
+                    wl,
+                    obs.msprof_pmu,
+                    measured_us=obs.measured_us,
+                    bisheng_res=bres,
+                    persist=False,
+                )
+                n_msprof += 1
+
+        for wl, bres, measured_us in pending_obs:
+            self.observe(wl, measured_us, bisheng_res=bres, persist=False, refit=False)
+            n_obs += 1
+
+        for cand_art, cand_obs, parent_art, parent_obs in lake.extract_pairwise_deltas():
+            pkey = (cand_obs.cand_sha, parent_obs.cand_sha, int(cand_obs.case_num))
+            if pkey in self._replayed_pair_keys:
+                continue
+            self._replayed_pair_keys.add(pkey)
+            wl_c, bres_c = _project_for(cand_art.cand_sha, cand_obs)
+            wl_p, bres_p = _project_for(parent_art.cand_sha, parent_obs)
+            self.observe_pair_delta(
+                wl_c,
+                cand_obs.measured_us,
+                wl_p,
+                parent_obs.measured_us,
+                cand_bisheng_res=bres_c,
+                parent_bisheng_res=bres_p,
+                refit=False,
+            )
+            n_pairs += 1
+
+        if n_obs > 0:
+            self._refit_ridge()
+        if n_pairs > 0:
+            self._refit_delta_ridge()
+        if persist_calibration and self.calibration_path is not None and (n_obs > 0 or n_msprof > 0 or n_pairs > 0):
+            self.save_calibration(self.calibration_path)
+        return {"observations": n_obs, "msprof_events": n_msprof, "pair_deltas": n_pairs}
 
     def predict_cannbench_eq3_score(
         self,
@@ -931,6 +1332,7 @@ def build_cost_features_from_ledger(
     nav_packet: object | None = None,
     sil_advisory: object | None = None,
     kernel_launches: int = 1,
+    stage_b_profile: MicroarchProfile | Mapping[str, object] | None = None,
 ) -> CostFeatures:
     """Convert ObjectivePhysicalLedger + HIR navigation / SIL advisory into chip-scaled CostFeatures."""
     facts = (target or AscendTarget("ascend.950pr")).get_facts(AscendSpaceFacts)
@@ -1025,6 +1427,13 @@ def build_cost_features_from_ledger(
     if contig_burst <= 0:
         contig_burst = int(policy.get("contig_burst_bytes") or 32768)
 
+    raw_stage_a_prof = getattr(ledger, "microarch_profile", None) if ledger is not None else None
+    merged_prof = merge_microarch_profiles(raw_stage_a_prof, stage_b_profile)
+    steady_ii = int(getattr(ledger, "steady_state_ii", 0) or 0) if ledger is not None else 0
+    eff_launches = max(0, int(kernel_launches))
+    if eff_launches == 1 and not merged_prof.is_empty:
+        eff_launches = max(eff_launches, merged_prof.subkernel_count)
+
     merged: dict[str, Any] = dict(policy)
     merged.update(
         {
@@ -1037,7 +1446,11 @@ def build_cost_features_from_ledger(
             "total_tiles": total_tiles,
             "fixpipe_bytes": fixpipe_bytes,
             "cv_sync_events": cv_sync_events,
-            "kernel_launches": max(0, int(kernel_launches)),
+            "kernel_launches": eff_launches,
+            "steady_state_ii": steady_ii,
+            "loop_trips": max(1, merged_prof.inner_loop_trips) if not merged_prof.is_empty else 1,
+            "pipeline_depth": max(1, merged_prof.pipeline_depth) if not merged_prof.is_empty else 1,
+            "microarch_profile": merged_prof.to_dict() if not merged_prof.is_empty else {},
         }
     )
     if eff_axes is not None:

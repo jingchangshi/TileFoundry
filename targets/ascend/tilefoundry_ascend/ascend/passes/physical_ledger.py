@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 
 
@@ -87,6 +87,7 @@ class ObjectivePhysicalLedger:
     in_loop_pipe_all_barriers: int = 0
     ub_bank_conflict_risk: float = 0.0
     l1_bank_conflict_risk: float = 0.0
+    microarch_profile: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.analysis_mode not in ("exact_modulo_z3", "readonly_envelope"):
@@ -160,6 +161,7 @@ class ObjectivePhysicalLedger:
             in_loop_pipe_all_barriers=int(payload.get("in_loop_pipe_all_barriers", 0)),
             ub_bank_conflict_risk=float(payload.get("ub_bank_conflict_risk", 0.0)),
             l1_bank_conflict_risk=float(payload.get("l1_bank_conflict_risk", 0.0)),
+            microarch_profile=dict(payload.get("microarch_profile") or {}),
         )
 
 
@@ -232,6 +234,7 @@ def build_objective_physical_ledger(
     in_loop_pipe_all_barriers: int = 0,
     ub_bank_conflict_risk: float = 0.0,
     l1_bank_conflict_risk: float = 0.0,
+    microarch_profile: Mapping[str, object] | None = None,
 ) -> ObjectivePhysicalLedger:
     """Assemble an ObjectivePhysicalLedger and derive the dominant pipe."""
     cleaned_pipes = dict(sorted(pipe_cycles.items()))
@@ -269,6 +272,7 @@ def build_objective_physical_ledger(
         in_loop_pipe_all_barriers=int(in_loop_pipe_all_barriers),
         ub_bank_conflict_risk=min(1.0, max(0.0, float(ub_bank_conflict_risk))),
         l1_bank_conflict_risk=min(1.0, max(0.0, float(l1_bank_conflict_risk))),
+        microarch_profile=dict(microarch_profile or {}),
     )
 
 

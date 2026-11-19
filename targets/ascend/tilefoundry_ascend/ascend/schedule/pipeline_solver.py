@@ -73,6 +73,13 @@ from tilefoundry_ascend.ascend.ir.tir.instructions import (
     AscendUbToGm,
     AscendUbToGmAtomic,
 )
+from tilefoundry_ascend.ascend.cost_model.pipe_schedule_eval import (
+    DIRECTION_SLOPE_MULT,
+    MS_PIPE_INTERCEPT_US,
+    MS_PIPE_SLOPE_US_PER_BYTE,
+    normalize_ns_to_z3_ticks,
+    resolve_cube_macs_safe,
+)
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
     ScopeWaterline,
@@ -386,16 +393,30 @@ def _static_tensor_bytes(
     return (elems * tensor_type.dtype.bit_width + 7) // 8
 
 
-def _estimate_task_latency(
+_DEFAULT_SOLVER_FACTS = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
+
+
+def _estimate_task_latency_ns(
     item: _LoopTaskItem,
     *,
     dim_hints: Mapping[str, int] | None = None,
     allow_dynamic_fallback: bool = False,
-) -> int:
-    """Estimate normalized hardware cycle quanta (1..8) from DMA bytes, MMAD FLOPs, or VF ops."""
+) -> float:
+    """Estimate continuous Ascend 950 nanosecond latency across 6-pipe + AVE op classes."""
+    clock_ghz = float(getattr(_DEFAULT_SOLVER_FACTS, "clock_ghz", 1.65) or 1.65)
     if item.label in ("simdvf", "simtvf"):
-        total_elems = 0
-        for _op, args in item.calls:
+        total_ns = MS_PIPE_INTERCEPT_US["VECTOR"] * 1000.0
+        for op, args in item.calls:
+            op_bytes = max(
+                (
+                    _static_tensor_bytes(
+                        arg.type, dim_hints=dim_hints, allow_dynamic_fallback=allow_dynamic_fallback
+                    )
+                    for arg in args
+                    if isinstance(arg.type, TensorType)
+                ),
+                default=0,
+            )
             op_elems = max(
                 (
                     _static_tensor_elems(
@@ -406,10 +427,23 @@ def _estimate_task_latency(
                 ),
                 default=0,
             )
-            total_elems += op_elems
-        return min(max(1, (total_elems + 4095) // 4096), 8)
+            op_low = type(op).__name__.lower()
+            is_f16 = any(
+                isinstance(arg.type, TensorType) and arg.type.dtype.bit_width <= 16
+                for arg in args
+            )
+            if any(tok in op_low for tok in ("exp", "log", "sqrt", "rsqrt", "div")):
+                issue_w = 4.0 if is_f16 else 2.0
+            elif "reduce" in op_low:
+                issue_w = 3.0
+            else:
+                issue_w = 0.5
+            # 128 FLOPs/cycle peak or AVE 256B vector beat latency
+            beats = max(1.0, float(op_bytes) / 256.0 if op_bytes > 0 else float(op_elems) / 128.0)
+            total_ns += (beats * issue_w) / max(0.1, clock_ghz)
+        return max(26.0, total_ns)
 
-    total_quanta = 0
+    total_ns = 0.0
     for op, args in item.calls:
         arg_types = [arg.type if isinstance(arg.type, TensorType) else None for arg in args]
         if isinstance(op, AscendMmad) and len(arg_types) >= 3:
@@ -431,8 +465,10 @@ def _estimate_task_latency(
                     allow_dynamic_fallback=allow_dynamic_fallback,
                 )
                 if m and k and n:
-                    flops = 2 * m * n * k
-                    total_quanta += max(1, (flops + 65535) // 65536)
+                    macs = float(resolve_cube_macs_safe(_DEFAULT_SOLVER_FACTS, lhs.dtype))
+                    flops = float(2 * m * n * k)
+                    compute_ns = flops / max(1e-6, macs * 2.0 * clock_ghz)
+                    total_ns += compute_ns + MS_PIPE_INTERCEPT_US["CUBE"] * 1000.0
                     continue
         if isinstance(
             op,
@@ -452,16 +488,32 @@ def _estimate_task_latency(
                 AscendDualCopyUbToL1,
             ),
         ):
-            xfer_bytes = max(
-                (
-                    _static_tensor_bytes(
-                        t, dim_hints=dim_hints, allow_dynamic_fallback=allow_dynamic_fallback
-                    )
-                    for t in arg_types
-                ),
-                default=0,
+            xfer_bytes = float(
+                max(
+                    (
+                        _static_tensor_bytes(
+                            t, dim_hints=dim_hints, allow_dynamic_fallback=allow_dynamic_fallback
+                        )
+                        for t in arg_types
+                    ),
+                    default=0,
+                )
             )
-            total_quanta += max(1, (xfer_bytes + 16383) // 16384)
+            if isinstance(op, (AscendL1ToL0A, AscendL1ToL0B)):
+                pipe, mult = "MTE1", 1.0
+            elif isinstance(op, (AscendGmToL1, AscendGmToL1Nz, AscendGmToUb, AscendGmToUbPad)):
+                pipe, mult = "MTE2", 1.0
+            elif isinstance(op, AscendDualCopyUbToL1):
+                pipe, mult = "MTE3", DIRECTION_SLOPE_MULT["ub_to_l1"]
+            elif isinstance(op, (AscendUbToGm, AscendUbToGmAtomic)):
+                pipe, mult = "MTE3", 1.0
+            elif isinstance(op, AscendDualCopyL0cToUb):
+                pipe, mult = "FIXPIPE", DIRECTION_SLOPE_MULT["l0c_to_ub"]
+            else:
+                pipe, mult = "FIXPIPE", 1.0
+            total_ns += (
+                xfer_bytes * MS_PIPE_SLOPE_US_PER_BYTE[pipe] * mult + MS_PIPE_INTERCEPT_US[pipe]
+            ) * 1000.0
             continue
         elems = max(
             (
@@ -472,8 +524,26 @@ def _estimate_task_latency(
             ),
             default=0,
         )
-        total_quanta += max(1, (elems + 4095) // 4096)
-    return min(max(1, total_quanta), 8)
+        total_ns += (
+            (max(1.0, float(elems) / 128.0) / max(0.1, clock_ghz))
+            + MS_PIPE_INTERCEPT_US["VECTOR"] * 1000.0
+        )
+    return max(20.0, total_ns)
+
+
+def _estimate_task_latency(
+    item: _LoopTaskItem,
+    *,
+    dim_hints: Mapping[str, int] | None = None,
+    allow_dynamic_fallback: bool = False,
+) -> int:
+    """Estimate normalized hardware cycle quanta (1..12) from continuous Ascend 950 latencies."""
+    ns = _estimate_task_latency_ns(
+        item,
+        dim_hints=dim_hints,
+        allow_dynamic_fallback=allow_dynamic_fallback,
+    )
+    return min(12, max(1, int(round(ns / 400.0))))
 
 
 def _op_resource_mask(
@@ -941,6 +1011,16 @@ def extract_tir_loop_problem(
     edge_keys: set[tuple[str, str, int, int]] = set()
     reuse_keys: set[tuple[str, str, str]] = set()
 
+    raw_ns = [
+        _estimate_task_latency_ns(
+            item,
+            dim_hints=dim_hints,
+            allow_dynamic_fallback=allow_dynamic_fallback,
+        )
+        for item in task_items
+    ]
+    norm_latencies = normalize_ns_to_z3_ticks(raw_ns, max_ticks=12)
+
     for idx, item in enumerate(task_items):
         t_name = f"t{idx}_{item.label}"
         intent = authored_by_anchor.get(idx) or authored_by_id.get(t_name)
@@ -948,11 +1028,7 @@ def extract_tir_loop_problem(
         latency = (
             intent.cost_override
             if (intent and intent.cost_override is not None)
-            else _estimate_task_latency(
-                item,
-                dim_hints=dim_hints,
-                allow_dynamic_fallback=allow_dynamic_fallback,
-            )
+            else norm_latencies[idx]
         )
         authored_stage = intent.stage if intent else None
         task_latency_by_name[t_name] = latency

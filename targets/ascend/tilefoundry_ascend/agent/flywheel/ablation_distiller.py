@@ -2065,6 +2065,8 @@ def distill_causal_rule(
     ledger: ObjectivePhysicalLedger | None = None,
     probe: MicroProbeSpec | None = None,
     probe_metrics: Mapping[str, float] | None = None,
+    scope: str = "cross_op",
+    origin_operator: str = "",
 ) -> AscendCausalRule:
     """Synthesize a pure-English 6-tuple AscendCausalRule from a verified AST edit."""
     regime_guard, precondition, expected_post = _rule_predicates_for_kind(chunk, ledger)
@@ -2085,6 +2087,8 @@ def distill_causal_rule(
         beta_prior=1.0,
         rationale=rationale,
         priority=85,
+        scope=scope,
+        origin_operator=origin_operator,
     )
 
 
@@ -2139,9 +2143,14 @@ class FlywheelDistiller:
         topology_axes: object | None = None,
         kb_output_path: str | Path | None = None,
         rule_id_prefix: str = "R_FLYWHEEL_LOO",
+        max_loo_chunks: int | None = 3,
+        operator_name: str = "",
+        rule_scope: str = "operator_local",
     ) -> FlywheelDistillationReport:
         """Run Leave-One-Out AST/config ablation directly on real candidate winner_dsl."""
         chunks = decompose_leave_one_out_ablations(baseline_dsl, winner_dsl)
+        if max_loo_chunks is not None and int(max_loo_chunks) > 0:
+            chunks = chunks[: int(max_loo_chunks)]
         kept: list[AblationMeasurement] = []
         discarded: list[AblationMeasurement] = []
         outcomes: list[DistilledRuleOutcome] = []
@@ -2246,12 +2255,17 @@ class FlywheelDistiller:
             rule_num = len(self._tracker.rules) + 1
             suffix = meas.chunk.edit_kind.upper()
             cand_rule_id = f"{rule_id_prefix}_{rule_num:02d}_{suffix}"
+            while cand_rule_id in self._tracker.rules:
+                rule_num += 1
+                cand_rule_id = f"{rule_id_prefix}_{rule_num:02d}_{suffix}"
             rule = distill_causal_rule(
                 meas.chunk,
                 rule_id=cand_rule_id,
                 ledger=meas.stage_a_result.ledger if meas.stage_a_result else None,
                 probe=None,
                 probe_metrics=metrics,
+                scope=rule_scope,
+                origin_operator=operator_name,
             )
             clean_ok, clean_err = _is_rule_text_clean(rule)
             if not clean_ok:
@@ -2315,6 +2329,9 @@ class FlywheelDistiller:
         kb_output_path: str | Path | None = None,
         rule_id_prefix: str = "R_FLYWHEEL",
         verify_on_candidate: bool = False,
+        max_loo_chunks: int | None = 3,
+        operator_name: str = "",
+        rule_scope: str = "cross_op",
     ) -> FlywheelDistillationReport:
         """Run full counterfactual ablation, micro-probe or LOO check, and KB admission."""
         if verify_on_candidate:
@@ -2331,6 +2348,9 @@ class FlywheelDistiller:
                 topology_axes=topology_axes,
                 kb_output_path=kb_output_path,
                 rule_id_prefix=rule_id_prefix,
+                max_loo_chunks=max_loo_chunks,
+                operator_name=operator_name,
+                rule_scope=rule_scope,
             )
         chunks = decompose_ast_ablations(baseline_dsl, winner_dsl)
         kept: list[AblationMeasurement] = []
@@ -2473,12 +2493,17 @@ class FlywheelDistiller:
             rule_num = len(self._tracker.rules) + 1
             suffix = meas.chunk.edit_kind.upper()
             cand_rule_id = f"{rule_id_prefix}_{rule_num:02d}_{suffix}"
+            while cand_rule_id in self._tracker.rules:
+                rule_num += 1
+                cand_rule_id = f"{rule_id_prefix}_{rule_num:02d}_{suffix}"
             rule = distill_causal_rule(
                 meas.chunk,
                 rule_id=cand_rule_id,
                 ledger=meas.stage_a_result.ledger if meas.stage_a_result else None,
                 probe=probe,
                 probe_metrics=metrics,
+                scope=rule_scope,
+                origin_operator=operator_name,
             )
             clean_ok, clean_err = _is_rule_text_clean(rule)
             if not clean_ok:
