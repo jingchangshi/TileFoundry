@@ -190,7 +190,7 @@ def test_extreme_runner_rotation_fast_backend_and_resilient_l2(tmp_path: Path) -
 
 def test_marathon_cli_and_watch_round_detection(tmp_path: Path, monkeypatch) -> None:
     """Verify CLI parser defaults/shorthand and watch_marathon_rounds event output."""
-    from tilefoundry_ascend.agent.campaign import cli, marathon
+    from tilefoundry_ascend.agent.campaign import cli, marathon  # noqa: PLC0415
 
     parser = build_marathon_arg_parser()
     parsed_run = parser.parse_args(["run", "--operator", "mla", "--device-id", "2"])
@@ -262,3 +262,63 @@ def test_marathon_cli_and_watch_round_detection(tmp_path: Path, monkeypatch) -> 
     cfg = MarathonConfig(operator_name="attention_residual")
     assert cfg.max_rounds == 80
     assert cfg.target_surrogate_score == 99.8
+
+
+def test_cann_opp_integrity_preference_and_source_root_sibling_lookup(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Verify intact CANN OPP is preferred and source_root.parent resolves sibling repos."""
+    for env_key in list(os.environ):
+        if env_key.startswith("TILEFOUNDRY_NPU_"):
+            monkeypatch.delenv(env_key, raising=False)
+
+    vendor_root = tmp_path / "pri"
+    broken_cann = vendor_root / "9.3.0-weekly" / "cann-9.3.0"
+    (broken_cann / "opp" / "built-in").mkdir(parents=True)
+    broken_setup = broken_cann / "set_env.sh"
+    broken_setup.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    intact_cann = vendor_root / "Ascend" / "9.3.0-weekly" / "cann-9.3.0"
+    (
+        intact_cann
+        / "opp"
+        / "built-in"
+        / "op_impl"
+        / "ai_core"
+        / "tbe"
+        / "kernel"
+        / "config"
+        / "ascend950"
+    ).mkdir(parents=True)
+    intact_setup = intact_cann / "set_env.sh"
+    intact_setup.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(broken_cann))
+    monkeypatch.setenv("ASCEND_TOOLKIT_HOME", str(broken_cann))
+
+    ws = tmp_path / "workspace"
+    src_root = ws / "TileFoundry"
+    src_root.mkdir(parents=True)
+    (ws / "cann-bench" / "tasks").mkdir(parents=True)
+    (ws / "tilelang" / "build").mkdir(parents=True)
+    ag_bin = ws / "AgentGates" / ".venv" / "bin" / "agent-gates"
+    ag_bin.parent.mkdir(parents=True)
+    ag_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    external_wt = tmp_path / "scratch" / "worktrees" / "grouped_matmul"
+    external_wt.mkdir(parents=True)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+
+    discovered = discover_marathon_environment(
+        operator_name="level3/grouped_matmul",
+        worktree=external_wt,
+        state_dir=state_dir,
+        source_root=src_root,
+    )
+    assert discovered["TILEFOUNDRY_NPU_CANN_SETUP"] == str(intact_setup.resolve())
+    assert discovered["TILEFOUNDRY_NPU_CANNBENCH_REPO"] == str((ws / "cann-bench").resolve())
+    assert discovered["TILEFOUNDRY_NPU_TILELANG_SOURCE"] == str((ws / "tilelang").resolve())
+    assert discovered["TILEFOUNDRY_NPU_AGENT_GATES_BIN"] == str(ag_bin.resolve())

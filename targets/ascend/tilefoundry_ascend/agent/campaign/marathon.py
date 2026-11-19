@@ -345,26 +345,78 @@ def _ensure_sys_paths(worktree: Path) -> None:
             sys.path.insert(0, entry)
 
 
+def _has_intact_cann_opp(set_env_path: Path) -> bool:
+    """Return True when the CANN install has intact built-in OPP kernel configs."""
+    tbe_kernel_cfg = (
+        set_env_path.parent
+        / "opp"
+        / "built-in"
+        / "op_impl"
+        / "ai_core"
+        / "tbe"
+        / "kernel"
+        / "config"
+    )
+    return tbe_kernel_cfg.is_dir()
+
+
 def _find_cann_setup_script(seeded: Mapping[str, str]) -> str:
     direct = seeded.get("TILEFOUNDRY_NPU_CANN_SETUP", "").strip()
     if direct and Path(direct).is_file():
         return str(Path(direct).resolve())
+
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add_candidate(path: Path) -> None:
+        if path.is_file():
+            resolved = path.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                candidates.append(resolved)
+
+    base_roots: list[Path] = []
     for env_key in ("ASCEND_TOOLKIT_HOME", "ASCEND_HOME_PATH"):
         raw = os.environ.get(env_key, "").strip()
         if not raw:
             continue
         base = Path(raw).expanduser()
-        for cand in (base / "set_env.sh", base.parent / "set_env.sh"):
-            if cand.is_file():
-                return str(cand.resolve())
+        base_roots.append(base)
+        _add_candidate(base / "set_env.sh")
+        _add_candidate(base.parent / "set_env.sh")
+
+    for base in base_roots:
+        for v_root in (base.parent, base.parent.parent):
+            if not v_root.is_dir():
+                continue
+            _add_candidate(v_root / "Ascend" / "9.3.0-weekly" / "cann-9.3.0" / "set_env.sh")
+            for pattern in (
+                "Ascend/*/cann-*/set_env.sh",
+                "*/cann-*/set_env.sh",
+                "cann-*/set_env.sh",
+            ):
+                for match in sorted(v_root.glob(pattern)):
+                    _add_candidate(match)
+
     bisheng = shutil.which("bisheng")
     if bisheng:
         b_path = Path(bisheng).resolve()
         for parent in b_path.parents[:5]:
-            cand = parent / "set_env.sh"
-            if cand.is_file():
-                return str(cand)
-    return ""
+            _add_candidate(parent / "set_env.sh")
+            for v_root in (parent.parent, parent.parent.parent):
+                if v_root.is_dir():
+                    for pattern in (
+                        "Ascend/*/cann-*/set_env.sh",
+                        "*/cann-*/set_env.sh",
+                        "cann-*/set_env.sh",
+                    ):
+                        for match in sorted(v_root.glob(pattern)):
+                            _add_candidate(match)
+
+    for cand in candidates:
+        if _has_intact_cann_opp(cand):
+            return str(cand)
+    return str(candidates[0]) if candidates else ""
 
 
 def _infer_conda_settings(python_bin: str, seeded: Mapping[str, str]) -> dict[str, str]:
@@ -414,6 +466,7 @@ def discover_marathon_environment(
     worktree: Path,
     state_dir: Path,
     base_env_file: str | Path | None = None,
+    source_root: Path | None = None,
 ) -> dict[str, str]:
     """Discover runtime toolchain and workspace paths with no hardcoded machine paths."""
     seeded: dict[str, str] = {}
@@ -425,7 +478,12 @@ def discover_marathon_environment(
         if key.startswith("TILEFOUNDRY_NPU_") and value.strip() and key not in seeded:
             seeded[key] = value.strip()
 
-    ws_parent = worktree.resolve().parent
+    ws_parents: list[Path] = [worktree.resolve().parent]
+    if source_root is not None:
+        src_parent = source_root.resolve().parent
+        if src_parent not in ws_parents:
+            ws_parents.append(src_parent)
+
     python_bin = (
         seeded.get("TILEFOUNDRY_NPU_PYTHON")
         or os.environ.get("TILEFOUNDRY_NPU_PYTHON", "").strip()
@@ -439,19 +497,28 @@ def discover_marathon_environment(
     if cann_setup:
         values["TILEFOUNDRY_NPU_CANN_SETUP"] = cann_setup
 
-    tl_dir = ws_parent / "tilelang"
+    tl_dir = next(
+        (parent / "tilelang" for parent in ws_parents if (parent / "tilelang").is_dir()),
+        ws_parents[0] / "tilelang",
+    )
     if "TILEFOUNDRY_NPU_TILELANG_SOURCE" not in values and tl_dir.is_dir():
         values["TILEFOUNDRY_NPU_TILELANG_SOURCE"] = str(tl_dir)
     if "TILEFOUNDRY_NPU_TILELANG_REPO" not in values and tl_dir.is_dir():
         values["TILEFOUNDRY_NPU_TILELANG_REPO"] = str(tl_dir)
-    tl_src = Path(values["TILEFOUNDRY_NPU_TILELANG_SOURCE"]) if values.get("TILEFOUNDRY_NPU_TILELANG_SOURCE") else tl_dir
+    tl_src = (
+        Path(values["TILEFOUNDRY_NPU_TILELANG_SOURCE"])
+        if values.get("TILEFOUNDRY_NPU_TILELANG_SOURCE")
+        else tl_dir
+    )
     if "TILEFOUNDRY_NPU_TILELANG_BUILD" not in values and (tl_src / "build").is_dir():
         values["TILEFOUNDRY_NPU_TILELANG_BUILD"] = str(tl_src / "build")
 
     if not values.get("TILEFOUNDRY_NPU_CANNBENCH_REPO"):
-        cand = ws_parent / "cann-bench"
-        if cand.is_dir() and (cand / "tasks").is_dir():
-            values["TILEFOUNDRY_NPU_CANNBENCH_REPO"] = str(cand)
+        for parent in ws_parents:
+            cand = parent / "cann-bench"
+            if cand.is_dir() and (cand / "tasks").is_dir():
+                values["TILEFOUNDRY_NPU_CANNBENCH_REPO"] = str(cand)
+                break
 
     sibling_keys = (
         ("TILEFOUNDRY_NPU_CANNBOT_DSL_REPO", "cannbot-dsl"),
@@ -460,15 +527,19 @@ def discover_marathon_environment(
     )
     for key, folder_name in sibling_keys:
         if not values.get(key):
-            cand = ws_parent / folder_name
-            if cand.is_dir():
-                values[key] = str(cand)
+            for parent in ws_parents:
+                cand = parent / folder_name
+                if cand.is_dir():
+                    values[key] = str(cand)
+                    break
 
     if not values.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN"):
-        ag_cand = ws_parent / "AgentGates" / ".venv" / "bin" / "agent-gates"
-        if ag_cand.is_file():
-            values["TILEFOUNDRY_NPU_AGENT_GATES_BIN"] = str(ag_cand)
-        else:
+        for parent in ws_parents:
+            ag_cand = parent / "AgentGates" / ".venv" / "bin" / "agent-gates"
+            if ag_cand.is_file():
+                values["TILEFOUNDRY_NPU_AGENT_GATES_BIN"] = str(ag_cand)
+                break
+        if not values.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN"):
             ag_which = shutil.which("agent-gates")
             if ag_which:
                 values["TILEFOUNDRY_NPU_AGENT_GATES_BIN"] = ag_which
@@ -510,6 +581,7 @@ def ensure_marathon_env_file(
     worktree: Path,
     state_dir: Path,
     env_file: str | Path | None = None,
+    source_root: Path | None = None,
 ) -> Path:
     """Reuse an existing env.sh or materialize a discovered zero-config env.sh."""
     target = Path(env_file).expanduser() if env_file is not None else (state_dir / "env.sh")
@@ -519,6 +591,7 @@ def ensure_marathon_env_file(
         worktree=worktree,
         state_dir=state_dir,
         base_env_file=target if target.is_file() else None,
+        source_root=source_root,
     )
     allowed_discovered = {
         key: val for key, val in discovered.items() if _is_agent_gates_allowed_env_key(key)
@@ -563,6 +636,7 @@ def configure_marathon_process_env(
     operator_name: str,
     env_file: Path,
     worktree: Path | None = None,
+    source_root: Path | None = None,
 ) -> dict[str, str]:
     """Configure coordinator process env vars cleanly for isolated worker subprocesses."""
     short_op = short_operator_tag(operator_name)
@@ -600,10 +674,15 @@ def configure_marathon_process_env(
         candidates: list[Path] = []
         if worktree is not None:
             candidates.append(worktree.parent / "AgentGates" / ".venv" / "bin" / "agent-gates")
-        else:
-            src_root = Path(parsed.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "")).parent
-            if str(src_root):
-                candidates.append(src_root / "AgentGates" / ".venv" / "bin" / "agent-gates")
+        if source_root is not None:
+            candidates.append(
+                source_root.resolve().parent / "AgentGates" / ".venv" / "bin" / "agent-gates"
+            )
+        cb_repo = parsed.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
+        if cb_repo:
+            candidates.append(
+                Path(cb_repo).parent / "AgentGates" / ".venv" / "bin" / "agent-gates"
+            )
         for cand in candidates:
             if cand.is_file():
                 os.environ["TILEFOUNDRY_NPU_AGENT_GATES_BIN"] = str(cand)
@@ -1572,11 +1651,13 @@ def run_operator_marathon(
         worktree=worktree,
         state_dir=state_dir,
         env_file=cfg.env_file,
+        source_root=_source_root,
     )
     configure_marathon_process_env(
         operator_name=cfg.operator_name,
         env_file=env_file,
         worktree=worktree,
+        source_root=_source_root,
     )
     op_logger.info(
         "MARATHON_BOOT op=%s device=%s worktree=%s env_file=%s",

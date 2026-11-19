@@ -73,7 +73,7 @@ def wait_for_npu_quiescent(max_retries: int = 10):
         time.sleep(1.0)
     logger.warning("NPU still busy after waiting for quiescence.")
 
-DEFAULT_AGENT_GATES_MAX_ATTEMPTS = 4
+DEFAULT_AGENT_GATES_MAX_ATTEMPTS = 5
 DEFAULT_AGENT_GATES_BACKOFF_SEC = 3.0
 
 
@@ -1058,6 +1058,8 @@ for idx, (cid, mod_path) in enumerate(cand_paths):
     combine_fn = getattr(mod, "_get_combine_kernel", None)
 
     for cid_num, case_dims, regime in case_specs:
+        if getattr(regime, "runtime_backend", "") == "ascendc_trackb":
+            continue
         try:
             resolved = resolve_regime_config(mod_path, regime, dims=case_dims)
             builder_fn = getattr(mod, resolved.builder_name, None)
@@ -1448,7 +1450,7 @@ def _run_agent_gates_cmd(
         last_parsed = _parse_agent_gates_json(last_proc.stdout)
         if not (_is_transient_blocked_env(last_proc, last_parsed) and attempt < attempts):
             return last_proc, last_parsed
-        delay = min(15.0, max(0.0, float(backoff_sec)) * (2 ** (attempt - 1)))
+        delay = min(20.0, max(0.0, float(backoff_sec)) * (2 ** (attempt - 1)))
         logger.warning(
             "AgentGates transient BLOCKED_ENV (attempt %d/%d); retrying in %.1fs",
             attempt,
