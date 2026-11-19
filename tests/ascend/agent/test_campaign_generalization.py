@@ -1,4 +1,4 @@
-"""Tests for 60-op CannbotOpsRegistry, CannbotContractOracle, LOO ablation, and proxy guards."""
+"""Tests for 60-op CannbenchOpsRegistry, CannbenchContractOracle, LOO ablation, and proxy guards."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
-    CannbotOpsRegistry,
+    CannbenchOpsRegistry,
     get_default_anchors,
     get_default_perf_target,
     get_operator_entrypoint,
@@ -38,14 +38,14 @@ from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     _RULE_CONCEPT_DESCRIPTIONS,
 )
 from tilefoundry_ascend.agent.orchestrator.twin_bridge import (
-    CannbotContractOracle,
+    CannbenchContractOracle,
     compare_cannbench_tensor,
 )
 
 
-def test_cannbot_ops_registry_discovers_all_60_ops_and_stratifies() -> None:
-    """Verify CannbotOpsRegistry discovers all 60 cannbot-ops and stratifies 4-5 anchors."""
-    reg = CannbotOpsRegistry()
+def test_cannbench_ops_registry_discovers_all_60_ops_and_stratifies() -> None:
+    """Verify CannbenchOpsRegistry discovers all 60 cann-bench tasks and stratifies 4-5 anchors."""
+    reg = CannbenchOpsRegistry()
     ops = reg.list_operators()
     tasks = reg.list_tasks()
     assert len(ops) == 60
@@ -78,8 +78,8 @@ def test_cannbot_ops_registry_discovers_all_60_ops_and_stratifies() -> None:
     assert m_args.operator == "swi_glu"
 
 
-def test_cannbot_contract_oracle_synthesis_and_mere_mare_bit_exact() -> None:
-    """Verify CannbotContractOracle faithful synthesis (inf/nan/unique/q4_0/group_list/inplace)."""
+def test_cannbench_contract_oracle_synthesis_and_mere_mare_bit_exact() -> None:
+    """Verify CannbenchContractOracle faithful synthesis (inf/nan/unique/q4_0/group_list/inplace)."""
     # 1. Bit-exact threshold==0 semantics (+0.0 vs -0.0)
     pos_zero = torch.tensor([0.0], dtype=torch.float32)
     neg_zero = torch.tensor([-0.0], dtype=torch.float32)
@@ -94,17 +94,17 @@ def test_cannbot_contract_oracle_synthesis_and_mere_mare_bit_exact() -> None:
     assert compare_cannbench_tensor(far, gold, threshold=1e-3)["passed"] is False
 
     # 3. Special ranges: [-inf, inf] and [nan, nan] on exp
-    exp_oracle = CannbotContractOracle("level1/exp")
+    exp_oracle = CannbenchContractOracle("level1/exp")
     t_inf, _ = exp_oracle.synthesize_case_inputs(12)
     assert bool(torch.isinf(t_inf[0]).any().item())
     t_nan, _ = exp_oracle.synthesize_case_inputs(13)
     assert bool(torch.isnan(t_nan[0]).any().item())
 
     # 4. Unique integer synthesis
-    unique_oracle = CannbotContractOracle("level3/unique")
+    unique_oracle = CannbenchContractOracle("level3/unique")
     # Pick a case from unique or test unique range directly
     assert unique_oracle.cases
-    rms_oracle = CannbotContractOracle("rms_norm")
+    rms_oracle = CannbenchContractOracle("rms_norm")
     tensors, kwargs = rms_oracle.synthesize_case_inputs(1)
     assert bool((kwargs["gamma"] != 0).any().item())  # Non-zero weights!
 
@@ -117,20 +117,20 @@ def test_cannbot_contract_oracle_synthesis_and_mere_mare_bit_exact() -> None:
     assert ok is True, reports
 
     # 5. Q4_0 packed uint8 nibbles + positive scales
-    q4_oracle = CannbotContractOracle("q4_0_dequant_matmul")
+    q4_oracle = CannbenchContractOracle("q4_0_dequant_matmul")
     q4_tensors, q4_kw = q4_oracle.synthesize_case_inputs(2)
     assert q4_kw["qweight"].dtype == torch.uint8
     assert bool((q4_kw["scales"] > 0).all().item())
     assert q4_tensors
 
     # 6. Cumsum group_list with empty groups
-    gmm_oracle = CannbotContractOracle("grouped_matmul_swiglu_quant")
+    gmm_oracle = CannbenchContractOracle("grouped_matmul_swiglu_quant")
     _gmm_t, gmm_kw = gmm_oracle.synthesize_case_inputs(7)
     glist = gmm_kw["group_list"]
     assert len(glist) >= 2 and any(glist[i] == glist[i - 1] for i in range(1, len(glist)))
 
     # 7. In-place buffer aliasing clone protection
-    kv_oracle = CannbotContractOracle("kv_cache_append")
+    kv_oracle = CannbenchContractOracle("kv_cache_append")
     small_kv_case = min(kv_oracle.cases, key=lambda c: sum(math.prod(s) for s in c["input_shape"]))
     cid = int(small_kv_case["case_id"])
     raw_before, _ = kv_oracle.synthesize_case_inputs(cid)

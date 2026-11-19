@@ -949,7 +949,7 @@ def _synthesize_contract_tensor(
     return torch.randint(lo_i, hi_i + 1, target_shape, generator=generator, dtype=tdtype)
 
 
-class CannbotContractOracle:
+class CannbenchContractOracle:
     """Faithful CANNBench contract input synthesizer and MERE/MARE + bit-exact accuracy oracle."""
 
     def __init__(
@@ -957,19 +957,19 @@ class CannbotContractOracle:
         operator_name: str | None = None,
         *,
         task_dir: str | Path | None = None,
-        operators_root: str | Path | None = None,
+        tasks_root: str | Path | None = None,
     ) -> None:
         if task_dir is not None:
             self.task_dir = Path(task_dir).expanduser().resolve()
             self.task = f"{self.task_dir.parent.name}/{self.task_dir.name}"
             self.op_name = self.task_dir.name
         elif operator_name is not None:
-            from tilefoundry_ascend.agent.campaign.anchor_specs import CannbotOpsRegistry
+            from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
 
             registry = (
-                CannbotOpsRegistry(operators_root=operators_root)
-                if operators_root is not None
-                else CannbotOpsRegistry.default()
+                CannbenchOpsRegistry(tasks_root=tasks_root)
+                if tasks_root is not None
+                else CannbenchOpsRegistry.default()
             )
             spec = registry.resolve(operator_name)
             self.task_dir = spec.op_dir
@@ -998,7 +998,7 @@ class CannbotContractOracle:
         if not ref_file.is_file():
             raise FileNotFoundError(f"Neither reference.py nor golden.py found in {self.task_dir}")
         mod_spec = importlib.util.spec_from_file_location(
-            f"_cannbot_oracle_{self.task.replace('/', '_')}", str(ref_file)
+            f"_cannbench_oracle_{self.task.replace('/', '_')}", str(ref_file)
         )
         if mod_spec is None or mod_spec.loader is None:
             raise RuntimeError(f"Failed to load reference module {ref_file}")
@@ -1257,7 +1257,7 @@ class CannbotContractOracle:
 
 
 __all__ = [
-    "CannbotContractOracle",
+    "CannbenchContractOracle",
     "build_tilelang_runtime_twin",
     "compare_cannbench_tensor",
     "format_hir_tir_navigation_section",

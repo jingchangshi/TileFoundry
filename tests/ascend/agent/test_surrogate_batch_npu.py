@@ -63,10 +63,9 @@ def _resolve_batch_cannbench_repo(source_root: Path) -> Path:
     try:
         return resolve_cannbench_repo()
     except FileNotFoundError:
-        for folder, subdir in (("cann-bench", "tasks"), ("cannbot-ops", "operators")):
-            sibling = source_root.parent / folder
-            if (sibling / subdir).is_dir():
-                return sibling.resolve()
+        sibling = source_root.parent / "cann-bench"
+        if (sibling / "tasks").is_dir():
+            return sibling.resolve()
         raise
 
 

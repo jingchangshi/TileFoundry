@@ -1,4 +1,4 @@
-"""Operator advisory extractor and default SIL policy synthesizer for cannbot-ops."""
+"""Operator advisory extractor and default SIL policy synthesizer for cann-bench."""
 
 from __future__ import annotations
 
@@ -25,10 +25,9 @@ from tilefoundry_ascend.ascend.sil.schema import (
 
 def _resolve_ops_root_path(path: str | Path) -> Path:
     cand = Path(path).expanduser()
-    for subdir in ("tasks", "operators"):
-        sub = cand / subdir
-        if sub.is_dir():
-            return sub
+    sub = cand / "tasks"
+    if sub.is_dir():
+        return sub
     return cand
 
 
@@ -37,10 +36,6 @@ def _default_ops_root() -> Path:
     if env_repo:
         return _resolve_ops_root_path(env_repo)
     ws_parent = Path(__file__).resolve().parents[5].parent
-    for rel in (("cann-bench", "tasks"), ("cannbot-ops", "operators")):
-        cand = ws_parent / rel[0] / rel[1]
-        if cand.is_dir():
-            return cand
     return ws_parent / "cann-bench" / "tasks"
 
 
@@ -606,7 +601,7 @@ def resolve_canonical_topology_axes(
 
 
 class OpAdvisoryExtractor:
-    """Extracts SIL AdvisoryEnvelopes from cannbot-ops operator definitions and 950PR metadata."""
+    """Extracts SIL AdvisoryEnvelopes from cann-bench operator definitions and 950PR metadata."""
 
     def __init__(self, ops_root: str | Path = DEFAULT_OPS_ROOT) -> None:
         self.ops_root = _resolve_ops_root_path(ops_root)
@@ -1127,5 +1122,5 @@ def synthesize_default_policy(advisory: AdvisoryEnvelope) -> PolicyEnvelope:
 
 @lru_cache(maxsize=4)
 def get_default_extractor(ops_root: str = str(DEFAULT_OPS_ROOT)) -> OpAdvisoryExtractor:
-    """Return a cached OpAdvisoryExtractor for the given cannbot-ops root."""
+    """Return a cached OpAdvisoryExtractor for the given cann-bench tasks root."""
     return OpAdvisoryExtractor(ops_root)

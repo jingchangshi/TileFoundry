@@ -28,19 +28,19 @@ from tilefoundry_ascend.ascend.templates import (
     render_template,
 )
 
-def _resolve_cannbot_ops_root() -> Path:
+def _resolve_cannbench_tasks_root() -> Path:
     env_repo = os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
     if env_repo:
         cand = Path(env_repo).expanduser()
-        return (cand / "operators") if (cand / "operators").is_dir() else cand
-    return Path(__file__).resolve().parents[3].parent / "cannbot-ops" / "operators"
+        return (cand / "tasks") if (cand / "tasks").is_dir() else cand
+    return Path(__file__).resolve().parents[3].parent / "cann-bench" / "tasks"
 
 
-CANNBOT_OPS_ROOT = _resolve_cannbot_ops_root()
+CANNBENCH_TASKS_ROOT = _resolve_cannbench_tasks_root()
 
 
 def _load_golden(level: str, op_name: str):
-    path = CANNBOT_OPS_ROOT / level / op_name / "golden.py"
+    path = CANNBENCH_TASKS_ROOT / level / op_name / "golden.py"
     spec = importlib.util.spec_from_file_location(f"_golden_{op_name}", str(path))
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)

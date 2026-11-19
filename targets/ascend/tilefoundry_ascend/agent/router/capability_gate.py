@@ -75,9 +75,9 @@ _AX_CV_PERSISTENT = TopologyAxes("coupled_1c2v", "persistent_onchip_state", "aff
 _AX_AIV_PERSISTENT = TopologyAxes("aiv_only", "persistent_onchip_state", "affine_simd")
 _AX_AIV_VM = TopologyAxes("aiv_only", "persistent_onchip_state", "dynamic_opcode_stream")
 
-# Canonical mapping from all 60 cannbot-ops snake_case operator names to
+# Canonical mapping from all 60 cann-bench snake_case operator names to
 # (topology_axes, default_track, default_backend_tier, op_profile).
-_CANNBOT_OP_ROUTING: dict[str, tuple[TopologyAxes, str, str, dict[str, object]]] = {
+_CANNBENCH_OP_ROUTING: dict[str, tuple[TopologyAxes, str, str, dict[str, object]]] = {
     # 1. AIV RegBase SIMD streaming
     "exp": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
     "swi_glu": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
@@ -1417,7 +1417,7 @@ def _extract_op_name_and_dtypes(proto_or_advisory: Mapping[str, object]) -> tupl
 
 
 def route_from_op_spec(proto_or_advisory: Mapping[str, object]) -> RouteDecision:
-    """Route a cannbot-ops proto.yaml or AdvisoryEnvelope dict to 3-axis TopologyAxes & 3 tracks."""
+    """Route a cann-bench proto.yaml or AdvisoryEnvelope dict to 3-axis TopologyAxes & 3 tracks."""
     op_name, dtypes, _desc_text = _extract_op_name_and_dtypes(proto_or_advisory)
     raw_axes = proto_or_advisory.get("topology_axes")
     explicit_axes: TopologyAxes | None = None
@@ -1449,8 +1449,8 @@ def route_from_op_spec(proto_or_advisory: Mapping[str, object]) -> RouteDecision
     else:
         base_features = None
 
-    if op_name in _CANNBOT_OP_ROUTING:
-        default_axes, track, backend_tier, profile = _CANNBOT_OP_ROUTING[op_name]
+    if op_name in _CANNBENCH_OP_ROUTING:
+        default_axes, track, backend_tier, profile = _CANNBENCH_OP_ROUTING[op_name]
         axes = explicit_axes if explicit_axes is not None else default_axes
         if base_features is None:
             prof_quant = str(profile.get("quant", "none"))

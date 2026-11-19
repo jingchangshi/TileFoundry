@@ -19,7 +19,7 @@ from tilefoundry.ir.types.dim import DimVar
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     OPERATOR_METADATA,
     AnchorCaseSpec,
-    CannbotOpsRegistry,
+    CannbenchOpsRegistry,
     PerfTargetSpec,
     RegimeTargetSpec,
     default_source_root,
@@ -64,7 +64,7 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     compute_static_dynamic_residual,
     extract_structural_signature,
 )
-from tilefoundry_ascend.agent.orchestrator.twin_bridge import CannbotContractOracle
+from tilefoundry_ascend.agent.orchestrator.twin_bridge import CannbenchContractOracle
 from tilefoundry_ascend.agent.router.capability_gate import (
     route_execution_track,
     route_from_op_spec,
@@ -117,8 +117,8 @@ IMPLEMENTED_OPS: tuple[str, ...] = (
 )
 
 
-def _cannbot_ops_dir() -> Path:
-    return default_source_root().parent / "cannbot-ops" / "operators"
+def _cannbench_tasks_dir() -> Path:
+    return default_source_root().parent / "cann-bench" / "tasks"
 
 
 def _make_static_ub_loop(*, max_stage: int = 1, max_versions: int = 2, with_pipeline: bool = True) -> For:
@@ -153,7 +153,7 @@ def _make_static_ub_loop(*, max_stage: int = 1, max_versions: int = 2, with_pipe
 def test_all_10_implemented_ops_resolve_metadata_and_regime_selectors() -> None:
     """Verify all 10 implemented operator packages resolve cleanly through anchor_specs & campaign_runner."""
     root = default_source_root()
-    registry = CannbotOpsRegistry(operators_root=_cannbot_ops_dir(), source_root=root)
+    registry = CannbenchOpsRegistry(tasks_root=_cannbench_tasks_dir(), source_root=root)
 
     for op_name in IMPLEMENTED_OPS:
         assert op_name in OPERATOR_METADATA
@@ -187,9 +187,9 @@ def test_all_10_implemented_ops_resolve_metadata_and_regime_selectors() -> None:
             assert f"def _select_{op_name}_config(" in snippet
 
 
-def test_all_60_cannbot_ops_unified_sil_router_solver_template_cost_pipeline(tmp_path: Path) -> None:
+def test_all_60_cannbench_ops_unified_sil_router_solver_template_cost_pipeline(tmp_path: Path) -> None:
     """Test (a): All 60 ops flow through OpAdvisoryExtractor -> Router -> Solver -> SILVerifier -> Templates -> CostModel."""
-    ops_root = _cannbot_ops_dir()
+    ops_root = _cannbench_tasks_dir()
     extractor = OpAdvisoryExtractor(ops_root)
     advisories = extractor.extract_all()
     assert len(advisories) == 60
@@ -484,7 +484,7 @@ def test_multi_round_marathon_portfolio_kb_cost_oracle_non_ar_mla(
         == "high"
     )
 
-    advisory = OpAdvisoryExtractor(_cannbot_ops_dir()).extract(op_name)
+    advisory = OpAdvisoryExtractor(_cannbench_tasks_dir()).extract(op_name)
     route = route_from_op_spec(advisory.to_dict())
     anchors = get_default_anchors(op_name)
     regime_specs = get_default_regime_specs(op_name)
@@ -520,7 +520,7 @@ def test_multi_round_marathon_portfolio_kb_cost_oracle_non_ar_mla(
     )
 
     cost_model = HybridAscendCostModel(AscendTarget("ascend.950pr"))
-    oracle = CannbotContractOracle(get_operator_task(op_name), operators_root=_cannbot_ops_dir())
+    oracle = CannbenchContractOracle(get_operator_task(op_name), tasks_root=_cannbench_tasks_dir())
 
     def _stage_a_checker(src: str, _reg: RegimeTargetSpec) -> StageAResult:
         tier = 2 if "marathon_opt_tier=2" in src else (1 if "marathon_opt_tier=1" in src else 0)
@@ -586,7 +586,7 @@ def test_multi_round_marathon_portfolio_kb_cost_oracle_non_ar_mla(
             out[cid] = aggregate_surrogate_result(cid, op_name, metrics)
         return out
 
-    # Validate CannbotContractOracle CPU reference execution on small cases for CPU-friendly golden ops
+    # Validate CannbenchContractOracle CPU reference execution on small cases for CPU-friendly golden ops
     if oracle_verify:
         small_case = min(
             oracle.cases,
@@ -640,7 +640,7 @@ def test_multi_round_marathon_portfolio_kb_cost_oracle_non_ar_mla(
         checkpoint_path=tmp_path / f"{op_name}_ckpt.json",
         campaign_kb_path=tmp_path / f"{op_name}_kb.yaml",
         source_root=root,
-        cannbench_repo=_cannbot_ops_dir().parent,
+        cannbench_repo=_cannbench_tasks_dir().parent,
     )
 
     report = asyncio.run(runner.run())

@@ -52,8 +52,8 @@ from tilefoundry_ascend.ascend.passes.physical_ledger import (
 )
 
 
-def _cannbot_ops_root() -> Path:
-    return default_source_root().parent / "cannbot-ops" / "operators"
+def _cannbench_tasks_root() -> Path:
+    return default_source_root().parent / "cann-bench" / "tasks"
 
 
 def test_campaign_runner_live_sil_7facet_cost_calibration_and_shared_stone_pruning(
@@ -328,8 +328,8 @@ def test_ensure_operator_seed_module_bootstraps_apply_rotary_pos_emb_and_passes_
     tmp_path: Path,
 ) -> None:
     """Verify ensure_operator_seed_module bootstraps apply_rotary_pos_emb and passes _run_l0."""
-    if not _cannbot_ops_root().is_dir():
-        pytest.skip("cannbot-ops repository not present on disk")
+    if not _cannbench_tasks_root().is_dir():
+        pytest.skip("cann-bench repository not present on disk")
 
     seed_path = tmp_path / "examples" / "ascend950pr_ops" / "apply_rotary_pos_emb" / "kernels.py"
     created = ensure_operator_seed_module("apply_rotary_pos_emb", seed_path)
@@ -376,13 +376,8 @@ def test_ensure_operator_seed_module_bootstraps_apply_rotary_pos_emb_and_passes_
         sys.modules.pop(mod_spec.name, None)
 
 
-def _create_synthetic_cannbench_repo(
-    repo_root: Path,
-    *,
-    layout_subdir: str,
-    use_top_level_src: bool,
-) -> Path:
-    tasks_root = repo_root / layout_subdir
+def _create_synthetic_cannbench_repo(repo_root: Path) -> Path:
+    tasks_root = repo_root / "tasks"
     op_dir = tasks_root / "level2" / "softmax"
     op_dir.mkdir(parents=True, exist_ok=True)
     meta_dir = tasks_root / "metadata"
@@ -436,11 +431,7 @@ def _create_synthetic_cannbench_repo(
         "    return torch.softmax(x, dim=dim)\n",
         encoding="utf-8",
     )
-    src_dir = (
-        repo_root / "src" / "kernel_eval" / "utils"
-        if use_top_level_src
-        else repo_root / "vendor" / "cannbench" / "src" / "kernel_eval" / "utils"
-    )
+    src_dir = repo_root / "src" / "kernel_eval" / "utils"
     src_dir.mkdir(parents=True, exist_ok=True)
     (src_dir.parent.parent / "__init__.py").write_text("", encoding="utf-8")
     (src_dir.parent / "__init__.py").write_text("", encoding="utf-8")
@@ -454,19 +445,13 @@ def _create_synthetic_cannbench_repo(
     return repo_root
 
 
-@pytest.mark.parametrize(
-    ("layout_subdir", "use_top_level_src"),
-    [("tasks", True), ("operators", False)],
-)
-def test_cannbench_dual_layout_decoupling(
+def test_cannbench_pure_tasks_layout_and_rejects_legacy_operators_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    layout_subdir: str,
-    use_top_level_src: bool,
 ) -> None:
-    """Verify TileFoundry Ascend works cleanly with both cann-bench (tasks/) and cannbot-ops (operators/)."""
+    """Verify TileFoundry Ascend uses cann-bench tasks/+src/ exclusively and rejects legacy layouts."""
     from tilefoundry_ascend.agent.campaign.anchor_specs import (
-        CannbotOpsRegistry,
+        CannbenchOpsRegistry,
         lookup_case_dims,
         lookup_case_metadata,
         resolve_cannbench_repo,
@@ -478,17 +463,13 @@ def test_cannbench_dual_layout_decoupling(
     )
     from tilefoundry_ascend.ascend.sil.op_analyzer import OpAdvisoryExtractor
 
-    repo = _create_synthetic_cannbench_repo(
-        tmp_path / f"repo_{layout_subdir}",
-        layout_subdir=layout_subdir,
-        use_top_level_src=use_top_level_src,
-    )
+    repo = _create_synthetic_cannbench_repo(tmp_path / "cann_bench")
     monkeypatch.setenv("TILEFOUNDRY_NPU_CANNBENCH_REPO", str(repo))
 
     assert resolve_cannbench_repo() == repo.resolve()
-    assert resolve_cannbench_tasks_root(repo) == (repo / layout_subdir).resolve()
+    assert resolve_cannbench_tasks_root(repo) == (repo / "tasks").resolve()
 
-    reg = CannbotOpsRegistry(operators_root=repo)
+    reg = CannbenchOpsRegistry(tasks_root=repo)
     assert reg.has_operator("softmax")
     assert reg.resolve("softmax").task == "level2/softmax"
 
@@ -504,27 +485,33 @@ def test_cannbench_dual_layout_decoupling(
     assert static_spec["tl_dtype"] == "bfloat16"
 
     extractor = OpAdvisoryExtractor(repo)
-    assert extractor.ops_root == (repo / layout_subdir)
+    assert extractor.ops_root == (repo / "tasks")
     advisory = extractor.extract("softmax")
     assert advisory.op_name == "softmax"
 
-    seed_path = tmp_path / f"seed_{layout_subdir}" / "softmax" / "kernels.py"
+    seed_path = tmp_path / "seed_tasks" / "softmax" / "kernels.py"
     assert ensure_operator_seed_module("softmax", seed_path, cannbench_repo=repo) is True
     seed_src = seed_path.read_text(encoding="utf-8")
     assert '/ "tasks" / _GOLDEN_TASK / "golden.py"' in seed_src
-    assert '/ "operators" / _GOLDEN_TASK / "golden.py"' in seed_src
+    assert "/ \"operators\" /" not in seed_src
 
-    shim_dir = ensure_npu_compare_shim_dir(tmp_path / f"shim_{layout_subdir}", cannbench_repo=repo)
+    shim_dir = ensure_npu_compare_shim_dir(tmp_path / "shim_tasks", cannbench_repo=repo)
     shim_src = (shim_dir / "npu_compare.py").read_text(encoding="utf-8")
     assert 'cann_repo / "src"' in shim_src
-    assert 'cann_repo / "vendor" / "cannbench" / "src"' in shim_src
+    assert "vendor" not in shim_src
+
+    # Negative check: legacy operators/-only repo is rejected cleanly
+    legacy_only = tmp_path / "legacy_repo"
+    (legacy_only / "operators" / "level2" / "softmax").mkdir(parents=True)
+    with pytest.raises(FileNotFoundError):
+        resolve_cannbench_tasks_root(legacy_only)
 
 
 def test_marathon_env_preserves_cannbench_mcp_keys_and_prefers_cann_bench(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify marathon env discovery prefers cann-bench and preserves all TILEFOUNDRY_NPU_CANNBENCH_* keys."""
+    """Verify marathon env discovery finds cann-bench and preserves all TILEFOUNDRY_NPU_CANNBENCH_* keys."""
     from tilefoundry_ascend.agent.campaign.anchor_specs import parse_simple_env_file
     from tilefoundry_ascend.agent.campaign.marathon import (
         discover_marathon_environment,
@@ -535,7 +522,6 @@ def test_marathon_env_preserves_cannbench_mcp_keys_and_prefers_cann_bench(
     worktree = ws / "TileFoundry"
     worktree.mkdir(parents=True)
     (ws / "cann-bench" / "tasks").mkdir(parents=True)
-    (ws / "cannbot-ops" / "operators").mkdir(parents=True)
     state_dir = tmp_path / "state"
     state_dir.mkdir(parents=True)
 

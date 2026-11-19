@@ -1213,8 +1213,8 @@ def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
     assert route_execution_track(f_scan).topology_axes.memory_ring == "persistent_onchip_state"
 
 
-def test_topology_axes_routing_and_60_cannbot_ops() -> None:
-    """Verify pure 3-axis TopologyAxes routing across all 60 cannbot-ops specs and isolation."""
+def test_topology_axes_routing_and_60_cannbench_ops() -> None:
+    """Verify pure 3-axis TopologyAxes routing across all 60 cann-bench specs and isolation."""
     import yaml
     from tilefoundry_ascend.agent.router.capability_gate import (
         VALID_BACKEND_TIERS,
@@ -1251,8 +1251,8 @@ def test_topology_axes_routing_and_60_cannbot_ops() -> None:
         assert dec.topology_axes == expected_axes
         assert dec.recommended_backend_tier in VALID_BACKEND_TIERS
 
-    # Route ALL 60 real proto.yaml files in cannbot-ops if present on disk
-    ops_root = Path(__file__).resolve().parents[4] / "cannbot-ops" / "operators"
+    # Route ALL 60 real proto.yaml files in cann-bench if present on disk
+    ops_root = Path(__file__).resolve().parents[4] / "cann-bench" / "tasks"
     if ops_root.is_dir():
         proto_files = sorted(ops_root.glob("level*/*/proto.yaml"))
         assert len(proto_files) == 60

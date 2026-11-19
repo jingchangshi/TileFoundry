@@ -428,9 +428,9 @@ def test_verifier_bank_conflict_crosscore_simt_and_precision_guards() -> None:
     assert any("mte2_bound_below_82" in w for w in rep_m82.warnings)
 
 
-def test_all_60_cannbot_operators_extract_synthesize_and_verify(tmp_path: Path) -> None:
+def test_all_60_cannbench_operators_extract_synthesize_and_verify(tmp_path: Path) -> None:
     if not DEFAULT_OPS_ROOT.exists():
-        pytest.skip(f"cannbot-ops root missing: {DEFAULT_OPS_ROOT}")
+        pytest.skip(f"cann-bench tasks root missing: {DEFAULT_OPS_ROOT}")
 
     extractor = OpAdvisoryExtractor(DEFAULT_OPS_ROOT)
     advisories = extractor.extract_all()

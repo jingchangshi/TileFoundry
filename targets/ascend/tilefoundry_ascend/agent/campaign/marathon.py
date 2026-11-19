@@ -23,7 +23,7 @@ import time
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
-    CannbotOpsRegistry,
+    CannbenchOpsRegistry,
     PerfTargetSpec,
     RegimeTargetSpec,
     default_source_root,
@@ -207,9 +207,9 @@ def ensure_operator_seed_module(
             ops_root = cand
     try:
         registry = (
-            CannbotOpsRegistry(operators_root=ops_root)
+            CannbenchOpsRegistry(tasks_root=ops_root)
             if ops_root is not None
-            else CannbotOpsRegistry.default()
+            else CannbenchOpsRegistry.default()
         )
     except FileNotFoundError:
         return False
@@ -272,7 +272,6 @@ def ensure_operator_seed_module(
         "    candidates = [_DEFAULT_GOLDEN_PATH]\n"
         '    env_repo = os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()\n'
         "    if env_repo:\n"
-        '        candidates.insert(0, Path(env_repo).expanduser() / "operators" / _GOLDEN_TASK / "golden.py")\n'
         '        candidates.insert(0, Path(env_repo).expanduser() / "tasks" / _GOLDEN_TASK / "golden.py")\n'
         "    for cand in candidates:\n"
         "        if cand.is_file():\n"
@@ -465,11 +464,9 @@ def discover_marathon_environment(
         values["TILEFOUNDRY_NPU_TILELANG_BUILD"] = str(tl_src / "build")
 
     if not values.get("TILEFOUNDRY_NPU_CANNBENCH_REPO"):
-        for folder_name in ("cann-bench", "cannbot-ops"):
-            cand = ws_parent / folder_name
-            if cand.is_dir() and ((cand / "tasks").is_dir() or (cand / "operators").is_dir()):
-                values["TILEFOUNDRY_NPU_CANNBENCH_REPO"] = str(cand)
-                break
+        cand = ws_parent / "cann-bench"
+        if cand.is_dir() and (cand / "tasks").is_dir():
+            values["TILEFOUNDRY_NPU_CANNBENCH_REPO"] = str(cand)
 
     sibling_keys = (
         ("TILEFOUNDRY_NPU_CANNBOT_DSL_REPO", "cannbot-dsl"),
@@ -877,11 +874,9 @@ def _empty_tensors(shapes, dtypes):
 
 task_dir = bench_dir / op_name
 if not task_dir.is_dir() and cann_repo_hint:
-    for _subdir in ("tasks", "operators"):
-        cand_dir = Path(cann_repo_hint) / _subdir / task_name
-        if cand_dir.is_dir():
-            task_dir = cand_dir
-            break
+    cand_dir = Path(cann_repo_hint) / "tasks" / task_name
+    if cand_dir.is_dir():
+        task_dir = cand_dir
 harness = cannbench_contract.Harness(task_name, task_dir)
 entrypoint = getattr(mod, op_name, getattr(mod, "kernel", None))
 compiled = 0

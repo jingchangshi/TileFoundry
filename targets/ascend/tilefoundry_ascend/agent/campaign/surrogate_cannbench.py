@@ -367,12 +367,9 @@ from types import SimpleNamespace
 
 def _load_compare_tensors():
     cann_repo = Path({cann_repo!r})
-    for src_dir in (
-        cann_repo / "src",
-        cann_repo / "vendor" / "cannbench" / "src",
-    ):
-        if src_dir.is_dir() and str(src_dir) not in sys.path:
-            sys.path.insert(0, str(src_dir))
+    bench_src = str(cann_repo / "src")
+    if bench_src not in sys.path:
+        sys.path.insert(0, bench_src)
     from kernel_eval.utils.compare import compare_tensors
 
     return compare_tensors

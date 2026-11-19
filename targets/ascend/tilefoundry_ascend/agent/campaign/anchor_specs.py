@@ -686,8 +686,8 @@ def _stratify_operator_anchors(
 
 
 @dataclass(frozen=True)
-class CannbotOpSpec:
-    """Discovered operator specification from cannbot-ops/operators."""
+class CannbenchOpSpec:
+    """Discovered operator specification from cann-bench/tasks."""
 
     op_id: str
     task: str
@@ -703,58 +703,51 @@ class CannbotOpSpec:
     entrypoint: str
 
 
-class CannbotOpsRegistry:
-    """Dynamic registry discovering all 60+ operators in cannbot-ops/operators."""
+class CannbenchOpsRegistry:
+    """Dynamic registry discovering all 60+ operators in cann-bench/tasks."""
 
-    _DEFAULT_INSTANCE: CannbotOpsRegistry | None = None
+    _DEFAULT_INSTANCE: CannbenchOpsRegistry | None = None
 
     def __init__(
         self,
-        operators_root: str | Path | None = None,
+        tasks_root: str | Path | None = None,
         *,
         source_root: str | Path | None = None,
     ) -> None:
         self._source_root = (
             Path(source_root).resolve() if source_root is not None else default_source_root()
         )
-        self._operators_root = self._resolve_operators_root(operators_root)
+        self._tasks_root = self._resolve_tasks_root(tasks_root)
         self._meta_950pr: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
-        meta_path = self._operators_root / "metadata" / "950pr.json"
+        meta_path = self._tasks_root / "metadata" / "950pr.json"
         if meta_path.is_file():
             self._meta_950pr = json.loads(meta_path.read_text(encoding="utf-8"))
         self._entries: dict[str, dict[str, object]] = {}
         self._task_to_op: dict[str, str] = {}
-        self._cache: dict[str, CannbotOpSpec] = {}
+        self._cache: dict[str, CannbenchOpSpec] = {}
         self._discover_manifest()
 
     @classmethod
-    def default(cls) -> CannbotOpsRegistry:
-        """Return cached default CannbotOpsRegistry instance."""
+    def default(cls) -> CannbenchOpsRegistry:
+        """Return cached default CannbenchOpsRegistry instance."""
         if cls._DEFAULT_INSTANCE is None:
             cls._DEFAULT_INSTANCE = cls()
         return cls._DEFAULT_INSTANCE
 
-    def _resolve_operators_root(self, operators_root: str | Path | None) -> Path:
-        if operators_root is not None:
-            p = Path(operators_root).expanduser().resolve()
-            try:
-                return resolve_cannbench_tasks_root(p)
-            except FileNotFoundError:
-                if p.is_dir():
-                    return p
-                raise FileNotFoundError(f"CANNBench tasks/operators directory not found: {p}")
+    def _resolve_tasks_root(self, tasks_root: str | Path | None) -> Path:
+        if tasks_root is not None:
+            p = Path(tasks_root).expanduser().resolve()
+            return resolve_cannbench_tasks_root(p)
 
         candidates: list[Path] = []
         env_repo = os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
         if env_repo:
             env_path = Path(env_repo).expanduser()
-            candidates.extend((env_path / "tasks", env_path / "operators", env_path))
+            candidates.extend((env_path / "tasks", env_path))
         candidates.extend(
             (
                 self._source_root.parent / "cann-bench" / "tasks",
-                self._source_root.parent / "cannbot-ops" / "operators",
                 Path.home() / "workspace" / "cann-bench" / "tasks",
-                Path.home() / "workspace" / "cannbot-ops" / "operators",
             )
         )
         for cand in candidates:
@@ -764,19 +757,19 @@ class CannbotOpsRegistry:
             if cand.is_dir():
                 return cand.resolve()
         raise FileNotFoundError(
-            "Cannot locate CANNBench tasks/ or operators/ directory. "
-            "Pass operators_root or set TILEFOUNDRY_NPU_CANNBENCH_REPO."
+            "Cannot locate cann-bench/tasks directory. "
+            "Pass tasks_root or set TILEFOUNDRY_NPU_CANNBENCH_REPO."
         )
 
     def _discover_manifest(self) -> None:
-        manifest_path = self._operators_root / "suite_manifest.json"
+        manifest_path = self._tasks_root / "suite_manifest.json"
         if manifest_path.is_file():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             for row in manifest.get("operators", ()):
                 op_id = str(row["id"])
                 raw_path = str(row["path"]).removeprefix("tasks/").strip("/")
                 level_dir = raw_path.split("/", 1)[0]
-                op_dir = self._operators_root / raw_path
+                op_dir = self._tasks_root / raw_path
                 if op_dir.is_dir():
                     level_num = int(level_dir.removeprefix("level")) if level_dir.startswith("level") else 1
                     self._entries[op_id] = {
@@ -790,7 +783,7 @@ class CannbotOpsRegistry:
                     self._task_to_op[raw_path] = op_id
             return
 
-        for level_dir_path in sorted(self._operators_root.glob("level*")):
+        for level_dir_path in sorted(self._tasks_root.glob("level*")):
             if not level_dir_path.is_dir():
                 continue
             level_dir = level_dir_path.name
@@ -811,9 +804,9 @@ class CannbotOpsRegistry:
                 self._task_to_op[task] = op_id
 
     @property
-    def operators_root(self) -> Path:
-        """Return resolved cannbot-ops/operators root path."""
-        return self._operators_root
+    def tasks_root(self) -> Path:
+        """Return resolved cann-bench/tasks root path."""
+        return self._tasks_root
 
     def _normalize_key(self, name_or_task: str) -> str:
         raw = str(name_or_task).strip().removeprefix("tasks/")
@@ -860,8 +853,8 @@ class CannbotOpsRegistry:
                 return rel
         return f"examples/ascend950pr_ops/{op_id}/kernels.py"
 
-    def resolve(self, name_or_task: str) -> CannbotOpSpec:
-        """Load and cache full CannbotOpSpec (proto, cases, 950pr metadata, anchors, target)."""
+    def resolve(self, name_or_task: str) -> CannbenchOpSpec:
+        """Load and cache full CannbenchOpSpec (proto, cases, 950pr metadata, anchors, target)."""
         op_id = self._normalize_key(name_or_task)
         if op_id in self._cache:
             return self._cache[op_id]
@@ -922,7 +915,7 @@ class CannbotOpsRegistry:
                 min_optimization_rounds=3,
             )
 
-        spec = CannbotOpSpec(
+        spec = CannbenchOpSpec(
             op_id=op_id,
             task=task,
             level=level,
@@ -1093,42 +1086,42 @@ def get_operator_task(operator_name: str) -> str:
     """Return CANNBench task path (levelX/<op>) for any supported operator name or task id."""
     if operator_name in OPERATOR_METADATA:
         return OPERATOR_METADATA[operator_name][0]
-    return CannbotOpsRegistry.default().resolve(operator_name).task
+    return CannbenchOpsRegistry.default().resolve(operator_name).task
 
 
 def get_operator_module_relpath(operator_name: str) -> str:
     """Return workspace-relative kernel module path for any supported operator."""
     if operator_name in OPERATOR_METADATA:
         return OPERATOR_METADATA[operator_name][1]
-    return CannbotOpsRegistry.default().resolve_module_path(operator_name)
+    return CannbenchOpsRegistry.default().resolve_module_path(operator_name)
 
 
 def get_operator_entrypoint(operator_name: str) -> str:
     """Return public Python callable name for any supported operator."""
     if operator_name in OPERATOR_METADATA:
         return OPERATOR_METADATA[operator_name][2]
-    return CannbotOpsRegistry.default().resolve(operator_name).entrypoint
+    return CannbenchOpsRegistry.default().resolve(operator_name).entrypoint
 
 
 def get_default_anchors(operator_name: str) -> tuple[AnchorCaseSpec, ...]:
-    """Return stratified anchor cases for attention_residual, mla, or any cannbot-ops op."""
+    """Return stratified anchor cases for attention_residual, mla, or any cann-bench op."""
     if operator_name in DEFAULT_ANCHORS:
         return DEFAULT_ANCHORS[operator_name]
-    return CannbotOpsRegistry.default().get_anchors(operator_name)
+    return CannbenchOpsRegistry.default().get_anchors(operator_name)
 
 
 def get_default_perf_target(operator_name: str) -> PerfTargetSpec:
     """Return default performance and Roofline target thresholds for any operator."""
     if operator_name in DEFAULT_PERF_TARGETS:
         return DEFAULT_PERF_TARGETS[operator_name]
-    return CannbotOpsRegistry.default().get_perf_target(operator_name)
+    return CannbenchOpsRegistry.default().get_perf_target(operator_name)
 
 
 def get_default_regime_specs(operator_name: str) -> tuple[RegimeTargetSpec, ...]:
     """Return ordered optimization regime specifications for any operator."""
     if operator_name in DEFAULT_REGIME_SPECS:
         return DEFAULT_REGIME_SPECS[operator_name]
-    return CannbotOpsRegistry.default().get_regime_specs(operator_name)
+    return CannbenchOpsRegistry.default().get_regime_specs(operator_name)
 
 
 def parse_simple_env_file(env_file: str | Path) -> dict[str, str]:
@@ -1158,7 +1151,7 @@ def parse_simple_env_file(env_file: str | Path) -> dict[str, str]:
 
 
 def _has_task_layout(path: Path) -> bool:
-    """Return True if *path* contains CANNBench tasks/operators metadata or level dirs."""
+    """Return True if *path* contains cann-bench tasks metadata or level dirs."""
     if not path.is_dir():
         return False
     if (path / "suite_manifest.json").is_file() or (path / "metadata").is_dir():
@@ -1167,31 +1160,24 @@ def _has_task_layout(path: Path) -> bool:
 
 
 def resolve_cannbench_tasks_root(repo: str | Path) -> Path:
-    """Resolve the tasks/operators root inside a CANNBench checkout.
-
-    Supports both official ``cann-bench`` (``<repo>/tasks``) and legacy
-    ``cannbot-ops`` (``<repo>/operators``) layouts as well as a direct tasks root.
-    """
+    """Resolve the tasks/ root inside an official cann-bench checkout (or direct tasks dir)."""
     base = Path(repo).expanduser().resolve()
-    for subdir in ("tasks", "operators"):
-        cand = base / subdir
-        if cand.is_dir() and _has_task_layout(cand):
-            return cand.resolve()
+    cand = base / "tasks"
+    if cand.is_dir() and _has_task_layout(cand):
+        return cand.resolve()
     if _has_task_layout(base):
         return base
-    for subdir in ("tasks", "operators"):
-        cand = base / subdir
-        if cand.is_dir():
-            return cand.resolve()
+    if cand.is_dir():
+        return cand.resolve()
     raise FileNotFoundError(
-        f"Cannot locate tasks/ or operators/ directory under CANNBench repo: {base}"
+        f"Cannot locate tasks/ directory under cann-bench repo: {base}"
     )
 
 
 def _is_valid_cannbench_repo(path: Path) -> bool:
     if not path.is_dir():
         return False
-    return (path / "tasks").is_dir() or (path / "operators").is_dir() or _has_task_layout(path)
+    return (path / "tasks").is_dir() or _has_task_layout(path)
 
 
 def resolve_cannbench_repo(
@@ -1221,9 +1207,7 @@ def resolve_cannbench_repo(
             return path.resolve()
     for fallback in (
         default_source_root().parent / "cann-bench",
-        default_source_root().parent / "cannbot-ops",
         Path.home() / "workspace" / "cann-bench",
-        Path.home() / "workspace" / "cannbot-ops",
     ):
         if _is_valid_cannbench_repo(fallback):
             return fallback.resolve()
@@ -1616,8 +1600,8 @@ def get_input_domain_envelope(operator: str) -> InputDomainEnvelope | None:
 __all__ = [
     "ATTENTION_RESIDUAL_ANCHORS",
     "AnchorCaseSpec",
-    "CannbotOpSpec",
-    "CannbotOpsRegistry",
+    "CannbenchOpSpec",
+    "CannbenchOpsRegistry",
     "DEFAULT_ANCHORS",
     "DEFAULT_PERF_TARGETS",
     "DEFAULT_REGIME_SPECS",

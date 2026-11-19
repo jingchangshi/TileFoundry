@@ -33,7 +33,7 @@ def test_zero_config_env_discovery_and_existing_env_preservation(tmp_path: Path,
     ws = tmp_path / "ws"
     worktree = ws / "TileFoundry"
     worktree.mkdir(parents=True)
-    (ws / "cannbot-ops" / "operators").mkdir(parents=True)
+    (ws / "cann-bench" / "tasks").mkdir(parents=True)
     (ws / "tilelang" / "build").mkdir(parents=True)
     ag_bin = ws / "AgentGates" / ".venv" / "bin" / "agent-gates"
     ag_bin.parent.mkdir(parents=True)
@@ -46,7 +46,7 @@ def test_zero_config_env_discovery_and_existing_env_preservation(tmp_path: Path,
         worktree=worktree,
         state_dir=state_dir,
     )
-    assert discovered["TILEFOUNDRY_NPU_CANNBENCH_REPO"] == str((ws / "cannbot-ops").resolve())
+    assert discovered["TILEFOUNDRY_NPU_CANNBENCH_REPO"] == str((ws / "cann-bench").resolve())
     assert discovered["TILEFOUNDRY_NPU_TILELANG_SOURCE"] == str((ws / "tilelang").resolve())
     assert discovered["TILEFOUNDRY_NPU_TILELANG_BUILD"] == str((ws / "tilelang" / "build").resolve())
     assert discovered["TILEFOUNDRY_NPU_AGENT_GATES_BIN"] == str(ag_bin.resolve())

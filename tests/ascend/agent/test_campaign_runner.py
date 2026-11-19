@@ -143,7 +143,7 @@ def _make_surrogate_result(
 
 def _setup_mock_cann_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "mock_cannbench"
-    meta_dir = repo / "operators" / "metadata"
+    meta_dir = repo / "tasks" / "metadata"
     meta_dir.mkdir(parents=True, exist_ok=True)
     meta_payload = {
         "level4": {
@@ -1780,7 +1780,7 @@ def test_resolve_regime_for_case_and_dynamic_l4_regression_routing(tmp_path: Pat
     assert resolve_regime_for_case("mla", {"inputLayout": "BSND", "S": 128}, mla_specs).regime_tag == "prefill_compute"
 
     repo = _setup_mock_cann_repo(tmp_path)
-    ar_dir = repo / "operators" / "level4" / "attention_residual"
+    ar_dir = repo / "tasks" / "level4" / "attention_residual"
     ar_dir.mkdir(parents=True, exist_ok=True)
     cases_payload = {
         "cases": [
@@ -1800,7 +1800,7 @@ def test_resolve_regime_for_case_and_dynamic_l4_regression_routing(tmp_path: Pat
     dims_5 = lookup_case_dims("attention_residual", 5, cannbench_repo=repo)
     assert dims_5["N"] == 8 and dims_5["B"] == 1 and dims_5["S"] == 512 and dims_5["D"] == 1024
 
-    mla_dir = repo / "operators" / "level4" / "mla"
+    mla_dir = repo / "tasks" / "level4" / "mla"
     mla_dir.mkdir(parents=True, exist_ok=True)
     mla_cases = {
         "cases": [
@@ -2076,7 +2076,7 @@ def test_prewarm_surrogate_tilelang_cache_pure_cpu_without_harness_prepare(
 
     repo_root = Path(__file__).resolve().parents[3]
     cann_repo = _setup_mock_cann_repo(tmp_path)
-    ar_dir = cann_repo / "operators" / "level4" / "attention_residual"
+    ar_dir = cann_repo / "tasks" / "level4" / "attention_residual"
     ar_dir.mkdir(parents=True, exist_ok=True)
     cases_payload = {
         "cases": [
@@ -2210,7 +2210,7 @@ def test_prewarm_surrogate_tilelang_cache_pure_cpu_without_harness_prepare(
     assert entries[0]["out_idx"] == [4]
     assert entries[0]["compile_flags"] == ["--flag-a"]
 
-    mla_dir = cann_repo / "operators" / "level4" / "mla"
+    mla_dir = cann_repo / "tasks" / "level4" / "mla"
     mla_dir.mkdir(parents=True, exist_ok=True)
     mla_cases = {
         "cases": [
@@ -2730,7 +2730,7 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
     )
 
     cann_repo = tmp_path / "cann"
-    mla_dir = cann_repo / "operators" / "level4" / "mla"
+    mla_dir = cann_repo / "tasks" / "level4" / "mla"
     mla_dir.mkdir(parents=True, exist_ok=True)
     (mla_dir / "cases.yaml").write_text(
         yaml.safe_dump(
