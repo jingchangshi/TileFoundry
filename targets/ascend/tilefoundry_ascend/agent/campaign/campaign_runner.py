@@ -26,6 +26,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     RegimeTargetSpec,
     append_dynamic_anchor,
     build_anchor_var_bindings,
+    compute_case_eq3_score,
     default_source_root,
     get_default_anchors,
     get_default_perf_target,
@@ -33,6 +34,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     get_input_domain_envelope,
     get_operator_module_relpath,
     lookup_case_dims,
+    lookup_case_metadata,
     resolve_cannbench_tasks_root,
     resolve_regime_for_case,
 )
@@ -2033,9 +2035,27 @@ class PerfTargetCampaignRunner:
             anc = by_case_anchor.get(cnum)
             rtag = anc.regime_tag if anc is not None else first_reg
             dims = self._lookup_case_dims_safe(cnum, rtag)
-            t_hw = anc.t_hw_us if anc is not None else 0.0
-            ref_perf = anc.ref_perf_us if anc is not None else 0.0
+            if anc is not None:
+                t_hw = anc.t_hw_us
+                ref_perf = anc.ref_perf_us
+            else:
+                try:
+                    ref_perf, t_hw = lookup_case_metadata(
+                        self._config.operator_name,
+                        cnum,
+                        cannbench_repo=self._cannbench_repo,
+                        env_file=self._env_file,
+                    )
+                except Exception:
+                    ref_perf, t_hw = 0.0, 0.0
             sp = float(l4_result.per_case_speedups.get(cnum, 0.0) or 0.0)
+            if sp <= 0.0 and ref_perf > 0.0 and elapsed_us > 0.0:
+                sp = ref_perf / elapsed_us
+            eq3 = (
+                compute_case_eq3_score(ref_perf, elapsed_us, t_hw)
+                if (ref_perf > 0.0 and t_hw > 0.0)
+                else 0.0
+            )
             proj_wl = project_case_workload(
                 ledger_dict,
                 microarch_profile=prof_dict,
@@ -2061,6 +2081,7 @@ class PerfTargetCampaignRunner:
                             t_hw_us=t_hw,
                             ref_perf_us=ref_perf,
                             speedup=sp,
+                            eq3_score=eq3,
                             projected_tiles=int(proj_wl.get("total_tiles", 0) or 0),
                             projected_gm_bytes=float(proj_wl.get("gm_bytes", 0.0) or 0.0),
                             projected_contig_bytes=int(proj_wl.get("contig_burst_bytes", 32768) or 32768),

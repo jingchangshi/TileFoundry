@@ -744,3 +744,97 @@ def build_vec(tile_m=1):
     assert any(int(c.microarch_profile.get("sfu_f16_ops", 0) or 0) >= 8 for c in cands.values())
     # Experience lake has pairwise delta for same-case fast vs baseline
     assert lake.extract_pairwise_deltas()
+
+
+def test_record_l4_observations_hydrates_non_anchor_metadata_from_cannbench(
+    tmp_path: Path,
+) -> None:
+    """Verify _record_l4_observations populates ref_perf_us, t_hw_us, and eq3 for non-anchors."""
+    cann_repo = tmp_path / "cann_repo"
+    op_dir = cann_repo / "tasks" / "level2" / "softmax"
+    meta_dir = cann_repo / "tasks" / "metadata"
+    op_dir.mkdir(parents=True, exist_ok=True)
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    (op_dir / "proto.yaml").write_text("operator:\n  name: Softmax\n", encoding="utf-8")
+    (op_dir / "cases.yaml").write_text(
+        "cases:\n"
+        "- case_id: 1\n  input_shape: [[32, 128]]\n  dtype: [float16]\n"
+        "- case_id: 2\n  input_shape: [[64, 256]]\n  dtype: [float16]\n"
+        "- case_id: 3\n  input_shape: [[16, 512]]\n  dtype: [float16]\n",
+        encoding="utf-8",
+    )
+    (meta_dir / "950pr.json").write_text(
+        json.dumps(
+            {
+                "level2": {
+                    "softmax": {
+                        "1": {"baseline_perf_us": 100.0, "t_hw_us": 20.0},
+                        "2": {"baseline_perf_us": 200.0, "t_hw_us": 50.0},
+                        "3": {"baseline_perf_us": 60.0, "t_hw_us": 20.0},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    mod_path = tmp_path / "softmax_mod.py"
+    mod_src = "def build_vec(tile_m=1):\n    return tile_m\n"
+    mod_path.write_text(mod_src, encoding="utf-8")
+    lake_dir = tmp_path / "experience_lake"
+    reg = RegimeTargetSpec("small", ("build_vec",), {}, representative_anchor_dims={"M": 32, "D": 128})
+    anchors = (AnchorCaseSpec("level2/softmax", 1, "small", ref_perf_us=100.0, t_hw_us=20.0),)
+
+    class _DummyBackend:
+        async def generate(self, req):
+            _ = req
+            return ""
+
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="level2/softmax", max_rounds=1),
+        target_module_path=mod_path,
+        cannbench_repo=cann_repo,
+        anchors=anchors,
+        regime_specs=[reg],
+        llm_backend=_DummyBackend(),
+        l0_checker=lambda _s, _r: StageAResult(
+            passed=True,
+            prim_func=None,
+            ledger=build_objective_physical_ledger(
+                analysis_mode="readonly_envelope",
+                is_legal=True,
+                steady_state_ii=100,
+                pipe_cycles={"AIV0.PIPE_V": 200},
+                gm_roundtrip_bytes=16384,
+                grid_blocks=16,
+                waterlines={},
+            ),
+        ),
+        checkpoint_path=tmp_path / "ckpt.json",
+        experience_lake_dir=lake_dir,
+    )
+    l4_res = L4CannbenchResult(
+        passed=True,
+        avg_speedup=2.25,
+        score=82.0,
+        per_case_speedups={1: 2.5, 3: 2.0},
+        per_case_elapsed_us={1: 40.0, 2: 100.0, 3: 30.0},
+        run_id="l4_non_anchor",
+    )
+    runner._record_l4_observations(source=mod_src, l4_result=l4_res, active_anchors=anchors)
+
+    _cands, obs = ExperienceLake(lake_dir).load_records()
+    by_case = {int(o.case_num): o for o in obs if o.eval_tier == "l4_official"}
+    assert set(by_case.keys()) == {1, 2, 3}
+    assert by_case[1].ref_perf_us == pytest.approx(100.0)
+    assert by_case[1].t_hw_us == pytest.approx(20.0)
+    assert by_case[1].eq3_score == pytest.approx(0.8)
+    assert by_case[2].ref_perf_us == pytest.approx(200.0)
+    assert by_case[2].t_hw_us == pytest.approx(50.0)
+    assert by_case[2].speedup == pytest.approx(2.0)
+    assert by_case[2].eq3_score == pytest.approx(0.75)
+    assert by_case[3].ref_perf_us == pytest.approx(60.0)
+    assert by_case[3].t_hw_us == pytest.approx(20.0)
+    assert by_case[3].speedup == pytest.approx(2.0)
+    assert by_case[3].eq3_score == pytest.approx(0.8)
+
