@@ -39,6 +39,7 @@ from tilefoundry_ascend.agent.kb.bayesian_tracker import (
 )
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import GateFunnel, StageAResult, StageBResult
+from tilefoundry_ascend.agent.orchestrator.residual_beam import StaticDynamicResidual
 from tilefoundry_ascend.ascend.cost_model import (
     DIRECTION_SLOPE_MULT,
     Ascend950PipeScheduleEvaluator,
@@ -837,4 +838,210 @@ def test_record_l4_observations_hydrates_non_anchor_metadata_from_cannbench(
     assert by_case[3].t_hw_us == pytest.approx(20.0)
     assert by_case[3].speedup == pytest.approx(2.0)
     assert by_case[3].eq3_score == pytest.approx(0.8)
+
+
+def test_evaluate_causal_rule_outcome_rejects_zero_gain_and_global_regression() -> None:
+    """Verify causal rule realization requires real non-regressive local/global gain."""
+    rule = AscendCausalRule(
+        rule_id="R_TEST_REAL_GAIN",
+        regime_guard="is_legal",
+        precondition="PIPE_V >= 0",
+        transform_template="Test rule with trivially satisfied static postcondition",
+        expected_postcondition="any_overflow_bytes == 0",
+        source_provenance="seed:test",
+    )
+    ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=100,
+        pipe_cycles={"AIV0.PIPE_V": 200},
+        gm_roundtrip_bytes=16384,
+        grid_blocks=16,
+        waterlines={},
+    )
+    parent_res = StaticDynamicResidual(
+        measured_latency_us=286.35,
+        predicted_bottleneck_util=0.5,
+        measured_aic_mac_ratio=0.0,
+        measured_aiv_vec_ratio=0.5,
+        measured_mte2_wait_ratio=0.2,
+        measured_sync_stall_ratio=0.1,
+        unexplained_gap_ratio=0.1,
+    )
+    cand_res_slower = StaticDynamicResidual(
+        measured_latency_us=286.82,
+        predicted_bottleneck_util=0.5,
+        measured_aic_mac_ratio=0.0,
+        measured_aiv_vec_ratio=0.5,
+        measured_mte2_wait_ratio=0.2,
+        measured_sync_stall_ratio=0.1,
+        unexplained_gap_ratio=0.1,
+    )
+    # Case 1: Zero/negative speedup must return (False, 0.0)
+    ok_zero, gain_zero = PerfTargetCampaignRunner._evaluate_causal_rule_outcome(
+        rule=rule,
+        res_all_passed=True,
+        rolled_back=False,
+        ledger=ledger,
+        features=None,
+        cand_residual=cand_res_slower,
+        cand_lat_us=286.82,
+        cand_obj_score=55.0,
+        parent_ledger=ledger,
+        parent_residual=parent_res,
+        parent_lat_us=286.35,
+        parent_obj_score=55.0,
+        has_cand_msprof=False,
+    )
+    assert (ok_zero, gain_zero) == (False, 0.0)
+
+    # Case 2: Noise-level gain (+0.85% < 1%) must return (False, 0.0)
+    cand_res_noise = StaticDynamicResidual(
+        measured_latency_us=11.61,
+        predicted_bottleneck_util=0.5,
+        measured_aic_mac_ratio=0.0,
+        measured_aiv_vec_ratio=0.5,
+        measured_mte2_wait_ratio=0.2,
+        measured_sync_stall_ratio=0.1,
+        unexplained_gap_ratio=0.1,
+    )
+    ok_noise, gain_noise = PerfTargetCampaignRunner._evaluate_causal_rule_outcome(
+        rule=rule,
+        res_all_passed=True,
+        rolled_back=False,
+        ledger=ledger,
+        features=None,
+        cand_residual=cand_res_noise,
+        cand_lat_us=11.61,
+        cand_obj_score=55.01,
+        parent_ledger=ledger,
+        parent_residual=parent_res,
+        parent_lat_us=11.71,
+        parent_obj_score=55.0,
+        has_cand_msprof=False,
+    )
+    assert (ok_noise, gain_noise) == (False, 0.0)
+
+    # Case 3: Local speedup (+5%) WITH global regression must return (False, 0.0)
+    cand_res_fast = StaticDynamicResidual(
+        measured_latency_us=95.0,
+        predicted_bottleneck_util=0.5,
+        measured_aic_mac_ratio=0.0,
+        measured_aiv_vec_ratio=0.5,
+        measured_mte2_wait_ratio=0.2,
+        measured_sync_stall_ratio=0.1,
+        unexplained_gap_ratio=0.1,
+    )
+    ok_glob_reg, gain_glob_reg = PerfTargetCampaignRunner._evaluate_causal_rule_outcome(
+        rule=rule,
+        res_all_passed=True,
+        rolled_back=False,
+        ledger=ledger,
+        features=None,
+        cand_residual=cand_res_fast,
+        cand_lat_us=95.0,
+        cand_obj_score=62.0,
+        parent_ledger=ledger,
+        parent_residual=parent_res,
+        parent_lat_us=100.0,
+        parent_obj_score=60.0,
+        has_cand_msprof=False,
+        cand_global_score=54.8,
+        parent_global_score=55.0,
+    )
+    assert (ok_glob_reg, gain_glob_reg) == (False, 0.0)
+
+    # Case 4: Genuine non-regressive improvement (+5%, global >= parent) returns (True, 0.05)
+    ok_good, gain_good = PerfTargetCampaignRunner._evaluate_causal_rule_outcome(
+        rule=rule,
+        res_all_passed=True,
+        rolled_back=False,
+        ledger=ledger,
+        features=None,
+        cand_residual=cand_res_fast,
+        cand_lat_us=95.0,
+        cand_obj_score=62.0,
+        parent_ledger=ledger,
+        parent_residual=parent_res,
+        parent_lat_us=100.0,
+        parent_obj_score=60.0,
+        has_cand_msprof=False,
+        cand_global_score=56.0,
+        parent_global_score=55.0,
+    )
+    assert ok_good is True
+    assert abs(gain_good - 0.05) < 1e-6
+
+
+def test_bayesian_tracker_sync_from_experience_lake_incremental_and_excludes_self(
+    tmp_path: Path,
+) -> None:
+    """Verify incremental peer KB event sync, self-shard exclusion, idempotency, and graduation."""
+    lake_dir = tmp_path / "sync_lake"
+    axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
+
+    tracker = BayesianRuleTracker.from_experience_lake(lake_dir)
+    # Self shard writes 1 outcome; must be skipped when exclude_run_id="self_run_1"
+    append_kb_event_shard(
+        lake_dir,
+        run_id="self_run_1",
+        rule_id="R01_DUAL_COPY_1C2V_SPLIT",
+        postcondition_realized=False,
+        speed_gain=0.0,
+        topology_axes=axes,
+        operator_name="level2/softmax",
+        round_idx=1,
+    )
+    # Peer shard writes 1 success
+    append_kb_event_shard(
+        lake_dir,
+        run_id="peer_run_2",
+        rule_id="R01_DUAL_COPY_1C2V_SPLIT",
+        postcondition_realized=True,
+        speed_gain=0.08,
+        topology_axes=axes,
+        operator_name="level2/rms_norm",
+        round_idx=1,
+    )
+
+    ingested = tracker.sync_from_experience_lake(lake_dir, exclude_run_id="self_run_1")
+    assert ingested == 1
+    assert tracker.posteriors["R01_DUAL_COPY_1C2V_SPLIT"].successes == 1
+    assert tracker.posteriors["R01_DUAL_COPY_1C2V_SPLIT"].failures == 0
+
+    # Repeating sync without new events is a no-op
+    assert tracker.sync_from_experience_lake(lake_dir, exclude_run_id="self_run_1") == 0
+
+    # Distill an operator_local rule on disk + emit 2 peer successes -> admitted & promoted
+    local_rule = AscendCausalRule(
+        rule_id="R_SYNC_LOCAL_99",
+        regime_guard="is_legal",
+        precondition="PIPE_V >= 0",
+        transform_template="Sync test rule",
+        expected_postcondition="any_overflow_bytes == 0",
+        source_provenance="flywheel:ablation",
+        alpha_prior=2.0,
+        beta_prior=1.0,
+        scope="operator_local",
+        origin_operator="level2/rms_norm",
+    )
+    save_distilled_rule_file(lake_dir, local_rule)
+    for ridx in (2, 3):
+        append_kb_event_shard(
+            lake_dir,
+            run_id="peer_run_2",
+            rule_id="R_SYNC_LOCAL_99",
+            postcondition_realized=True,
+            speed_gain=0.12,
+            topology_axes=axes,
+            operator_name="level2/rms_norm",
+            round_idx=ridx,
+        )
+
+    ingested_2 = tracker.sync_from_experience_lake(lake_dir, exclude_run_id="self_run_1")
+    assert ingested_2 == 2
+    assert "R_SYNC_LOCAL_99" in tracker.rules
+    assert tracker.posteriors["R_SYNC_LOCAL_99"].successes == 2
+    assert tracker.rules["R_SYNC_LOCAL_99"].scope == "cross_op"
+
 

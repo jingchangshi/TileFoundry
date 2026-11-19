@@ -2532,13 +2532,39 @@ class PerfTargetCampaignRunner:
         parent_lat_us: float,
         parent_obj_score: float,
         has_cand_msprof: bool,
+        cand_global_score: float | None = None,
+        parent_global_score: float | None = None,
+        min_speedup_gain: float = 0.01,
+        min_score_gain: float = 0.05,
     ) -> tuple[bool, float]:
-        """Evaluate whether a rule's causal postcondition materialized without regression."""
+        """Evaluate whether a rule's causal postcondition materialized with real non-regressive gain."""
         if not res_all_passed or not ledger.is_legal or rolled_back:
             return False, 0.0
-        if parent_lat_us > 0.0 and cand_lat_us > parent_lat_us * 1.02:
+        if (
+            cand_global_score is not None
+            and parent_global_score is not None
+            and cand_global_score < parent_global_score - 1e-6
+        ):
             return False, 0.0
-        if cand_obj_score < parent_obj_score - 0.05:
+        if parent_lat_us > 0.0 and cand_lat_us > 0.0 and cand_lat_us >= parent_lat_us:
+            return False, 0.0
+        if cand_obj_score < parent_obj_score - 1e-6:
+            return False, 0.0
+
+        rel_lat_gain = (
+            (parent_lat_us - cand_lat_us) / max(parent_lat_us, 1e-6)
+            if (parent_lat_us > 0.0 and cand_lat_us > 0.0)
+            else 0.0
+        )
+        local_score_gain = cand_obj_score - parent_obj_score
+        has_real_gain = (
+            rel_lat_gain >= float(min_speedup_gain)
+            or (
+                local_score_gain >= float(min_score_gain)
+                and (parent_lat_us <= 0.0 or cand_lat_us <= 0.0 or cand_lat_us < parent_lat_us)
+            )
+        )
+        if not has_real_gain:
             return False, 0.0
 
         post_ctx = build_predicate_context(
@@ -2576,12 +2602,7 @@ class PerfTargetCampaignRunner:
                     and cand_lat_us < 0.98 * parent_lat_us
                     and cand_obj_score > parent_obj_score + 0.02
                 )
-        gain = (
-            max(0.0, (parent_lat_us - cand_lat_us) / max(parent_lat_us, 1e-6))
-            if (causal_ok and parent_lat_us > 0.0 and cand_lat_us > 0.0)
-            else 0.0
-        )
-        return bool(causal_ok), gain
+        return bool(causal_ok), (rel_lat_gain if causal_ok else 0.0)
 
     def _run_flywheel_distillation(
         self,
@@ -2848,6 +2869,18 @@ class PerfTargetCampaignRunner:
             axes=parent_axes,
             nav_packet=nav_packet,
         )
+        if self._experience_lake_dir is not None:
+            try:
+                self._tracker.sync_from_experience_lake(
+                    self._experience_lake_dir,
+                    exclude_run_id=self._run_id,
+                )
+            except Exception as exc:
+                logger.debug("ExperienceLake per-round KB sync skipped: %s", exc)
+            try:
+                self._cost_model.replay_experience_lake(self._experience_lake_dir)
+            except Exception as exc:
+                logger.debug("ExperienceLake per-round cost replay skipped: %s", exc)
         parent_cost_pred = self._cost_model.predict(
             parent_workload,
             bisheng_res=parent_comp_summary,
@@ -3362,6 +3395,8 @@ class PerfTargetCampaignRunner:
                     parent_lat_us=parent_lat_us,
                     parent_obj_score=parent_obj_score,
                     has_cand_msprof=bool(cached_cand_msprof),
+                    cand_global_score=(res.surrogate_score if selected_stone is None else None),
+                    parent_global_score=(best_result.surrogate_score if selected_stone is None else None),
                 )
                 self._tracker.record_outcome(
                     rule.rule_id,

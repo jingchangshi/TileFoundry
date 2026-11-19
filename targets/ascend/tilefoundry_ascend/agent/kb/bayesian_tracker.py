@@ -153,6 +153,7 @@ class BayesianRuleTracker:
     posteriors: dict[str, RulePosterior] = field(default_factory=dict)
     axis_posteriors: dict[str, dict[str, RulePosterior]] = field(default_factory=dict)
     _round_counter: int = field(default=0, init=False, repr=False)
+    _synced_event_counts: dict[str, int] = field(default_factory=dict, init=False, repr=False)
 
     @classmethod
     def from_rules(cls, rules: Iterable[AscendCausalRule]) -> BayesianRuleTracker:
@@ -167,6 +168,78 @@ class BayesianRuleTracker:
         """Load seed rules YAML and initialize Bayesian priors."""
         return cls.from_rules(load_seed_rules(path))
 
+    def sync_from_experience_lake(
+        self,
+        lake_dir: str | Path | None,
+        *,
+        exclude_run_id: str | None = None,
+    ) -> int:
+        """Incrementally ingest shared distilled rules and peer KB events from Experience Lake."""
+        if lake_dir is None or not str(lake_dir).strip():
+            return 0
+        kb_root = Path(lake_dir) / "kb"
+        distilled_dir = kb_root / "distilled_rules"
+        if distilled_dir.is_dir():
+            for rpath in sorted(distilled_dir.glob("*.json")):
+                try:
+                    raw = json.loads(rpath.read_text(encoding="utf-8"))
+                    if isinstance(raw, Mapping):
+                        rule = AscendCausalRule.from_dict(raw)
+                        existing = self.rules.get(rule.rule_id)
+                        if existing is None:
+                            self.admit_rule(rule)
+                        elif rule.scope == "cross_op" and existing.scope == "operator_local":
+                            self.rules[rule.rule_id] = rule
+                except Exception:
+                    continue
+
+        events_dir = kb_root / "events"
+        exclude_slug = _safe_kb_slug(exclude_run_id, "default") if exclude_run_id else None
+        new_events: list[Mapping[str, object]] = []
+        if events_dir.is_dir():
+            for epath in sorted(events_dir.glob("*.jsonl")):
+                if exclude_slug is not None and epath.stem == exclude_slug:
+                    continue
+                valid_objs: list[Mapping[str, object]] = []
+                try:
+                    for line in epath.read_text(encoding="utf-8", errors="replace").splitlines():
+                        text = line.strip()
+                        if not text:
+                            continue
+                        try:
+                            obj = json.loads(text)
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(obj, Mapping):
+                            valid_objs.append(obj)
+                except Exception:
+                    continue
+                prev = self._synced_event_counts.get(epath.name, 0)
+                if len(valid_objs) <= prev:
+                    continue
+                new_events.extend(valid_objs[prev:])
+                self._synced_event_counts[epath.name] = len(valid_objs)
+
+        new_events.sort(key=lambda ev: float(ev.get("timestamp", 0.0) or 0.0))
+        for ev in new_events:
+            rid = str(ev.get("rule_id") or "")
+            if not rid or rid not in self.rules:
+                continue
+            ridx = int(ev.get("round_idx", 0) or 0)
+            axes_raw = ev.get("topology_axes")
+            self.record_outcome(
+                rid,
+                postcondition_realized=bool(ev.get("postcondition_realized", False)),
+                speed_gain=float(ev.get("speed_gain", 0.0) or 0.0),
+                topology_axes=axes_raw if isinstance(axes_raw, Mapping) else None,
+            )
+            self.prune_underperforming(
+                topology_axes=axes_raw if isinstance(axes_raw, Mapping) else None,
+                round_idx=ridx,
+            )
+        self.promote_verified_local_rules()
+        return len(new_events)
+
     @classmethod
     def from_experience_lake(
         cls,
@@ -176,51 +249,7 @@ class BayesianRuleTracker:
     ) -> BayesianRuleTracker:
         """Initialize from seed rules, then replay shared distilled rules and KB event shards."""
         tracker = cls.from_seed_yaml(seed_path)
-        if lake_dir is None or not str(lake_dir).strip():
-            return tracker
-        kb_root = Path(lake_dir) / "kb"
-        distilled_dir = kb_root / "distilled_rules"
-        if distilled_dir.is_dir():
-            for rpath in sorted(distilled_dir.glob("*.json")):
-                try:
-                    raw = json.loads(rpath.read_text(encoding="utf-8"))
-                    if isinstance(raw, Mapping):
-                        tracker.admit_rule(AscendCausalRule.from_dict(raw))
-                except Exception:
-                    continue
-
-        events_dir = kb_root / "events"
-        events: list[Mapping[str, object]] = []
-        if events_dir.is_dir():
-            for epath in sorted(events_dir.glob("*.jsonl")):
-                try:
-                    for line in epath.read_text(encoding="utf-8").splitlines():
-                        text = line.strip()
-                        if not text:
-                            continue
-                        obj = json.loads(text)
-                        if isinstance(obj, Mapping):
-                            events.append(obj)
-                except Exception:
-                    continue
-        events.sort(key=lambda ev: float(ev.get("timestamp", 0.0) or 0.0))
-        for ev in events:
-            rid = str(ev.get("rule_id") or "")
-            if not rid or rid not in tracker.rules:
-                continue
-            ridx = int(ev.get("round_idx", 0) or 0)
-            axes_raw = ev.get("topology_axes")
-            tracker.record_outcome(
-                rid,
-                postcondition_realized=bool(ev.get("postcondition_realized", False)),
-                speed_gain=float(ev.get("speed_gain", 0.0) or 0.0),
-                topology_axes=axes_raw if isinstance(axes_raw, Mapping) else None,
-            )
-            tracker.prune_underperforming(
-                topology_axes=axes_raw if isinstance(axes_raw, Mapping) else None,
-                round_idx=ridx,
-            )
-        tracker.promote_verified_local_rules()
+        tracker.sync_from_experience_lake(lake_dir)
         return tracker
 
     @staticmethod
