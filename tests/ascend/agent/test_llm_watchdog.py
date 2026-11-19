@@ -703,3 +703,16 @@ def test_sse_thinking_defers_idle_timeout_without_json_schema(
     assert reply == "sse_thinking_succeeded"
 
 
+def test_build_command_reconciles_model_effort_tier_suffix() -> None:
+    """Ensure explicit -low/-medium/-high model tier suffix overrides conflicting effort flags."""
+    backend = AgyCliLLMBackend(exploit_model="gemini-4-hydrogen-medium")
+    cmd = backend.build_command(
+        GenerationRequest("exploit_rule", "sys", "usr", effort="high"),
+        "hello",
+    )
+    model_idx = cmd.index("--model")
+    assert cmd[model_idx + 1] == "gemini-4-hydrogen-medium"
+    assert "--effort=medium" in cmd
+    assert "--effort=high" not in cmd
+
+

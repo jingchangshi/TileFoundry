@@ -451,6 +451,10 @@ class AgyCliLLMBackend:
         """Build isolated agy stream-json CLI argument list without workspace mounts."""
         effort = self.select_effort(req, effort_override=effort_override)
         model_id = self.select_model(req.role, effort=effort)
+        for tier_suffix in ("-low", "-medium", "-high"):
+            if model_id.endswith(tier_suffix):
+                effort = tier_suffix[1:]
+                break
         cfg = self.watchdog_for_model(model_id)
         resolved_log = (
             str(log_file)
