@@ -102,9 +102,22 @@ def _build_mla_prim_func(
     pipe_ann = {"enable_offset": True} if schedule_mode == "tuned" else None
 
     b_dim = T.dynamic("b_dim")
-    q_total_rows = T.dynamic("q_total_rows")
+    q_rows_sym = T.dynamic("q_rows")
+    s_dim_sym = T.dynamic("s_dim")
     s_kv = T.dynamic("s_kv")
 
+    is_struct_4d = input_layout == "BNSD" or n_kv == 1
+    eff_aligned_group_q = bool(aligned_group_q and is_struct_4d)
+    q_nope_shape = (
+        (b_dim, n_kv, q_rows_sym, d_nope)
+        if is_struct_4d
+        else (b_dim, s_dim_sym, n_kv, g_ratio, d_nope)
+    )
+    q_rope_shape = (
+        (b_dim, n_kv, q_rows_sym, d_rope)
+        if is_struct_4d
+        else (b_dim, s_dim_sym, n_kv, g_ratio, d_rope)
+    )
     k_nope_shape = (
         (b_dim, s_kv, n_kv, d_nope) if input_layout == "BSND" else (b_dim, n_kv, s_kv, d_nope)
     )
@@ -112,14 +125,179 @@ def _build_mla_prim_func(
         (b_dim, s_kv, n_kv, d_rope) if input_layout == "BSND" else (b_dim, n_kv, s_kv, d_rope)
     )
 
+    @T.macro
+    def _kv_step(
+        kv, K_nope, K_rope, V,
+        scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+        k_rope_l1, p_l1, v0_l1, v1_l1,
+        s_l0c, o_l0c, o1_l0c, S_ub,
+        P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+        m_ub, l_ub, alpha_ub, sid,
+        b_idx, kv_h, q_base, q_rows,
+        s_dim,
+    ):
+        """Execute one KV tile step inside the MLA loop."""
+        if input_layout == "BSND":
+            T.copy(
+                K_nope[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d_nope],
+                k_nope_l1,
+            )
+            T.copy(
+                K_rope[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d_rope],
+                k_rope_l1,
+            )
+            T.copy(
+                V[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d0],
+                v0_l1,
+                transpose=True,
+            )
+            if d1 > 0:
+                T.copy(
+                    V[b_idx, kv * bn : kv * bn + bn, kv_h, d0:d_nope],
+                    v1_l1,
+                    transpose=True,
+                )
+        else:
+            T.copy(
+                K_nope[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d_nope],
+                k_nope_l1,
+            )
+            T.copy(
+                K_rope[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d_rope],
+                k_rope_l1,
+            )
+            T.copy(
+                V[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d0],
+                v0_l1,
+                transpose=True,
+            )
+            if d1 > 0:
+                T.copy(
+                    V[b_idx, kv_h, kv * bn : kv * bn + bn, d0:d_nope],
+                    v1_l1,
+                    transpose=True,
+                )
+
+        T.gemm(q_nope_l1, k_nope_l1, s_l0c, transpose_B=True, clear_accum=True)
+        T.gemm(q_rope_l1, k_rope_l1, s_l0c, transpose_B=True, clear_accum=False)
+        T.dual_copy(s_l0c, S_ub)
+
+        with T.SimdVF():
+            m32 = T.simd.pset(32, "PAT_ALL")
+            m16 = T.simd.pset(16, "PAT_ALL")
+            v_neg_inf = T.simd.vdup(T.float32(-1e38), "float32", mask=m32)
+            v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
+            col_idx = T.simd.vci(kv * bn, "int32")
+            for r in T.serial(rows_per_sid):
+                q_row = q_base + sid * rows_per_sid + r
+                if input_layout == "BSND":
+                    s_idx = q_row // g_ratio
+                else:
+                    s_idx = q_row % s_dim
+                raw_limit = (
+                    T.min(s_kv, s_idx + s_kv - s_dim + 1)
+                    if is_causal
+                    else s_kv
+                )
+                limit_col = T.if_then_else(q_row < q_rows, raw_limit, 0)
+                valid_mask = T.simd.vcmps(col_idx, limit_col, mask=m32, op="lt")
+                s_vec = T.simd.vld(S_ub[r, 0], dist="NORM_B32")
+                s_scaled = T.simd.vmuls(s_vec, scale_val, mask=m32)
+                s_masked = T.simd.vsel(s_scaled, v_neg_inf, valid_mask)
+                m_tile_v = T.simd.vdupv(
+                    T.simd.vcmax(s_masked, mask=m32),
+                    mask=m32,
+                    pos="POS_LOWEST",
+                )
+                m_old_v = T.simd.vld(m_ub[r, 0], dist="BRC_B32")
+                l_old_v = T.simd.vld(l_ub[r, 0], dist="BRC_B32")
+                m_new_v = T.simd.vmax(m_old_v, m_tile_v, mask=m32)
+                m_safe_v = T.simd.vmaxs(
+                    m_new_v, T.float32(-1e30), mask=m32
+                )
+                alpha_raw = T.simd.vexp(
+                    T.simd.vsub(m_old_v, m_safe_v, mask=m32), mask=m32
+                )
+                old_valid = T.simd.vcmps(
+                    m_old_v, T.float32(-1e30), mask=m32, op="gt"
+                )
+                alpha_v = T.simd.vsel(alpha_raw, v_zero, old_valid)
+                p_raw = T.simd.vexp(
+                    T.simd.vsub(s_masked, m_safe_v, mask=m32), mask=m32
+                )
+                new_valid = T.simd.vcmps(
+                    m_new_v, T.float32(-1e30), mask=m32, op="gt"
+                )
+                p_mask = T.simd.pand(valid_mask, new_valid, m32)
+                p_f32 = T.simd.vsel(p_raw, v_zero, p_mask)
+                row_sum_v = T.simd.vdupv(
+                    T.simd.vcadd(p_f32, mask=m32),
+                    mask=m32,
+                    pos="POS_LOWEST",
+                )
+                l_new_v = T.simd.vadd(
+                    T.simd.vmul(l_old_v, alpha_v, mask=m32),
+                    row_sum_v,
+                    mask=m32,
+                )
+                T.simd.vsts(m_ub[r, 0], m_new_v, mask=m32, dist="ONEPT_B32")
+                T.simd.vsts(l_ub[r, 0], l_new_v, mask=m32, dist="ONEPT_B32")
+                T.simd.vsts(alpha_ub[r, 0], alpha_v, mask=m32, dist="ONEPT_B32")
+                p_16 = T.simd.vcvt(p_f32, tl_dtype, mask=m16, part=0)
+                T.simd.vsts(
+                    P_ub[r, 0], p_16, mask=m32, dist="PK_B32", extent=64
+                )
+
+        T.dual_copy(P_ub, p_l1)
+        T.gemm(p_l1, v0_l1, o_l0c, transpose_B=True, clear_accum=True)
+        T.dual_copy(o_l0c, O_tmp_ub)
+        with T.SimdVF():
+            m32 = T.simd.pset(32, "PAT_ALL")
+            for r in T.serial(rows_per_sid):
+                alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
+                for c in T.serial(d0_chunks):
+                    off = c * 64
+                    o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
+                    o_tmp = T.simd.vld(O_tmp_ub[r, off], dist="NORM_B32")
+                    o_new = T.simd.vadd(
+                        T.simd.vmul(o_old, alpha_v, mask=m32),
+                        o_tmp,
+                        mask=m32,
+                    )
+                    T.simd.vsts(
+                        O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
+                    )
+
+        if d1 > 0:
+            T.gemm(p_l1, v1_l1, o1_l0c, transpose_B=True, clear_accum=True)
+            T.dual_copy(o1_l0c, O_tmp1_ub)
+            with T.SimdVF():
+                m32 = T.simd.pset(32, "PAT_ALL")
+                for r in T.serial(rows_per_sid):
+                    alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
+                    for c in T.serial(d1_chunks):
+                        off = d0 + c * 64
+                        o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
+                        o_tmp = T.simd.vld(
+                            O_tmp1_ub[r, c * 64], dist="NORM_B32"
+                        )
+                        o_new = T.simd.vadd(
+                            T.simd.vmul(o_old, alpha_v, mask=m32),
+                            o_tmp,
+                            mask=m32,
+                        )
+                        T.simd.vsts(
+                            O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
+                        )
+
     @T.prim_func
     def main(
-        Q_nope: T.Tensor((q_total_rows, d_nope), tl_dtype),
-        Q_rope: T.Tensor((q_total_rows, d_rope), tl_dtype),
+        Q_nope: T.Tensor(q_nope_shape, tl_dtype),
+        Q_rope: T.Tensor(q_rope_shape, tl_dtype),
         K_nope: T.Tensor(k_nope_shape, tl_dtype),
         K_rope: T.Tensor(k_rope_shape, tl_dtype),
         V: T.Tensor(k_nope_shape, tl_dtype),
-        Out: T.Tensor((q_total_rows, d_nope), tl_dtype),
+        Out: T.Tensor(q_nope_shape, tl_dtype),
         scale_val: T.float32,
     ):
         with T.MixedKernel(num_cores, sids=2) as (bx, sid):
@@ -135,7 +313,7 @@ def _build_mla_prim_func(
             o_l0c = T.alloc_l0c((bm, d0), "float32")
             o1_l0c = o_l0c if (d1 == 0 or d1 == d0) else T.alloc_l0c((bm, d1_alloc), "float32")
 
-            if not aligned_group_q:
+            if not eff_aligned_group_q:
                 q_nope_ub = T.alloc_shared((rows_per_sid, d_nope), tl_dtype)
                 q_rope_ub = T.alloc_shared((rows_per_sid, d_rope), tl_dtype)
             S_ub = T.alloc_shared((rows_per_sid, bn), "float32")
@@ -168,7 +346,7 @@ def _build_mla_prim_func(
                 l_ub: 1,
                 alpha_ub: 1,
             }
-            if not aligned_group_q:
+            if not eff_aligned_group_q:
                 pinned[q_nope_ub] = 1
                 pinned[q_rope_ub] = 1
             if d1 > 0 and d1 != d0:
@@ -187,8 +365,12 @@ def _build_mla_prim_func(
             if bm == 128:
                 T.annotate_unlimit_memory("shared")
 
-            s_dim = q_total_rows // (b_dim * n_q)
-            q_rows = s_dim * g_ratio
+            if is_struct_4d:
+                q_rows = q_rows_sym
+                s_dim = q_rows_sym // g_ratio
+            else:
+                s_dim = s_dim_sym
+                q_rows = s_dim_sym * g_ratio
             m_tiles_per_group = (q_rows + bm - 1) // bm
             total_groups = b_dim * n_kv
             total_m_tiles = total_groups * m_tiles_per_group
@@ -205,14 +387,13 @@ def _build_mla_prim_func(
                 kv_h = group_id % n_kv
                 q_base = mt * bm
 
-                if aligned_group_q:
-                    q_gm_base = group_id * q_rows + q_base
+                if eff_aligned_group_q:
                     T.copy(
-                        Q_nope[q_gm_base : q_gm_base + bm, 0:d_nope],
+                        Q_nope[b_idx, kv_h, q_base : q_base + bm, 0:d_nope],
                         q_nope_l1,
                     )
                     T.copy(
-                        Q_rope[q_gm_base : q_gm_base + bm, 0:d_rope],
+                        Q_rope[b_idx, kv_h, q_base : q_base + bm, 0:d_rope],
                         q_rope_l1,
                     )
                 else:
@@ -246,15 +427,26 @@ def _build_mla_prim_func(
                     for r in T.serial(rows_per_sid):
                         q_row = q_base + sid * rows_per_sid + r
                         if q_row < q_rows:
-                            if input_layout == "BSND":
+                            if is_struct_4d:
+                                T.copy(
+                                    Q_nope[b_idx, kv_h, q_row, 0:d_nope],
+                                    q_nope_ub[r, 0:d_nope],
+                                )
+                                T.copy(
+                                    Q_rope[b_idx, kv_h, q_row, 0:d_rope],
+                                    q_rope_ub[r, 0:d_rope],
+                                )
+                            else:
                                 s_i = q_row // g_ratio
                                 h_loc = q_row % g_ratio
-                                q_h = kv_h * g_ratio + h_loc
-                                gm_r = (b_idx * s_dim + s_i) * n_q + q_h
-                            else:
-                                gm_r = group_id * q_rows + q_row
-                            T.copy(Q_nope[gm_r, 0:d_nope], q_nope_ub[r, 0:d_nope])
-                            T.copy(Q_rope[gm_r, 0:d_rope], q_rope_ub[r, 0:d_rope])
+                                T.copy(
+                                    Q_nope[b_idx, s_i, kv_h, h_loc, 0:d_nope],
+                                    q_nope_ub[r, 0:d_nope],
+                                )
+                                T.copy(
+                                    Q_rope[b_idx, s_i, kv_h, h_loc, 0:d_rope],
+                                    q_rope_ub[r, 0:d_rope],
+                                )
 
                     T.dual_copy(q_nope_ub, q_nope_l1)
                     T.dual_copy(q_rope_ub, q_rope_l1)
@@ -289,163 +481,34 @@ def _build_mla_prim_func(
                 else:
                     kv_limit = max_kv_blocks
 
-                for kv in T.Pipelined(
-                    kv_limit, num_stages=num_stages, annotations=pipe_ann
-                ):
-                    if input_layout == "BSND":
-                        T.copy(
-                            K_nope[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d_nope],
-                            k_nope_l1,
+                if num_stages >= 2:
+                    for kv in T.Pipelined(
+                        kv_limit, num_stages=num_stages, annotations=pipe_ann
+                    ):
+                        _kv_step(
+                            kv, K_nope, K_rope, V,
+                            scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+                            k_rope_l1, p_l1, v0_l1, v1_l1,
+                            s_l0c, o_l0c, o1_l0c, S_ub,
+                            P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+                            m_ub, l_ub, alpha_ub, sid,
+                            b_idx, kv_h, q_base, q_rows,
+                            s_dim,
                         )
-                        T.copy(
-                            K_rope[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d_rope],
-                            k_rope_l1,
+                else:
+                    for kv in T.serial(kv_limit):
+                        _kv_step(
+                            kv, K_nope, K_rope, V,
+                            scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+                            k_rope_l1, p_l1, v0_l1, v1_l1,
+                            s_l0c, o_l0c, o1_l0c, S_ub,
+                            P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+                            m_ub, l_ub, alpha_ub, sid,
+                            b_idx, kv_h, q_base, q_rows,
+                            s_dim,
                         )
-                        T.copy(
-                            V[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d0],
-                            v0_l1,
-                            transpose=True,
-                        )
-                        if d1 > 0:
-                            T.copy(
-                                V[b_idx, kv * bn : kv * bn + bn, kv_h, d0:d_nope],
-                                v1_l1,
-                                transpose=True,
-                            )
-                    else:
-                        T.copy(
-                            K_nope[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d_nope],
-                            k_nope_l1,
-                        )
-                        T.copy(
-                            K_rope[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d_rope],
-                            k_rope_l1,
-                        )
-                        T.copy(
-                            V[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d0],
-                            v0_l1,
-                            transpose=True,
-                        )
-                        if d1 > 0:
-                            T.copy(
-                                V[b_idx, kv_h, kv * bn : kv * bn + bn, d0:d_nope],
-                                v1_l1,
-                                transpose=True,
-                            )
 
-                    T.gemm(q_nope_l1, k_nope_l1, s_l0c, transpose_B=True, clear_accum=True)
-                    T.gemm(q_rope_l1, k_rope_l1, s_l0c, transpose_B=True, clear_accum=False)
-                    T.dual_copy(s_l0c, S_ub)
-
-                    with T.SimdVF():
-                        m32 = T.simd.pset(32, "PAT_ALL")
-                        m16 = T.simd.pset(16, "PAT_ALL")
-                        v_neg_inf = T.simd.vdup(T.float32(-1e38), "float32", mask=m32)
-                        v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
-                        col_idx = T.simd.vci(kv * bn, "int32")
-                        for r in T.serial(rows_per_sid):
-                            q_row = q_base + sid * rows_per_sid + r
-                            if input_layout == "BSND":
-                                s_idx = q_row // g_ratio
-                            else:
-                                s_idx = q_row % s_dim
-                            raw_limit = (
-                                T.min(s_kv, s_idx + s_kv - s_dim + 1)
-                                if is_causal
-                                else s_kv
-                            )
-                            limit_col = T.if_then_else(q_row < q_rows, raw_limit, 0)
-                            valid_mask = T.simd.vcmps(col_idx, limit_col, mask=m32, op="lt")
-                            s_vec = T.simd.vld(S_ub[r, 0], dist="NORM_B32")
-                            s_scaled = T.simd.vmuls(s_vec, scale_val, mask=m32)
-                            s_masked = T.simd.vsel(s_scaled, v_neg_inf, valid_mask)
-                            m_tile_v = T.simd.vdupv(
-                                T.simd.vcmax(s_masked, mask=m32),
-                                mask=m32,
-                                pos="POS_LOWEST",
-                            )
-                            m_old_v = T.simd.vld(m_ub[r, 0], dist="BRC_B32")
-                            l_old_v = T.simd.vld(l_ub[r, 0], dist="BRC_B32")
-                            m_new_v = T.simd.vmax(m_old_v, m_tile_v, mask=m32)
-                            m_safe_v = T.simd.vmaxs(
-                                m_new_v, T.float32(-1e30), mask=m32
-                            )
-                            alpha_raw = T.simd.vexp(
-                                T.simd.vsub(m_old_v, m_safe_v, mask=m32), mask=m32
-                            )
-                            old_valid = T.simd.vcmps(
-                                m_old_v, T.float32(-1e30), mask=m32, op="gt"
-                            )
-                            alpha_v = T.simd.vsel(alpha_raw, v_zero, old_valid)
-                            p_raw = T.simd.vexp(
-                                T.simd.vsub(s_masked, m_safe_v, mask=m32), mask=m32
-                            )
-                            new_valid = T.simd.vcmps(
-                                m_new_v, T.float32(-1e30), mask=m32, op="gt"
-                            )
-                            p_mask = T.simd.pand(valid_mask, new_valid, m32)
-                            p_f32 = T.simd.vsel(p_raw, v_zero, p_mask)
-                            row_sum_v = T.simd.vdupv(
-                                T.simd.vcadd(p_f32, mask=m32),
-                                mask=m32,
-                                pos="POS_LOWEST",
-                            )
-                            l_new_v = T.simd.vadd(
-                                T.simd.vmul(l_old_v, alpha_v, mask=m32),
-                                row_sum_v,
-                                mask=m32,
-                            )
-                            T.simd.vsts(m_ub[r, 0], m_new_v, mask=m32, dist="ONEPT_B32")
-                            T.simd.vsts(l_ub[r, 0], l_new_v, mask=m32, dist="ONEPT_B32")
-                            T.simd.vsts(alpha_ub[r, 0], alpha_v, mask=m32, dist="ONEPT_B32")
-                            p_16 = T.simd.vcvt(p_f32, tl_dtype, mask=m16, part=0)
-                            T.simd.vsts(
-                                P_ub[r, 0], p_16, mask=m32, dist="PK_B32", extent=64
-                            )
-
-                    T.dual_copy(P_ub, p_l1)
-                    T.gemm(p_l1, v0_l1, o_l0c, transpose_B=True, clear_accum=True)
-                    T.dual_copy(o_l0c, O_tmp_ub)
-                    with T.SimdVF():
-                        m32 = T.simd.pset(32, "PAT_ALL")
-                        for r in T.serial(rows_per_sid):
-                            alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
-                            for c in T.serial(d0_chunks):
-                                off = c * 64
-                                o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
-                                o_tmp = T.simd.vld(O_tmp_ub[r, off], dist="NORM_B32")
-                                o_new = T.simd.vadd(
-                                    T.simd.vmul(o_old, alpha_v, mask=m32),
-                                    o_tmp,
-                                    mask=m32,
-                                )
-                                T.simd.vsts(
-                                    O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
-                                )
-
-                    if d1 > 0:
-                        T.gemm(p_l1, v1_l1, o1_l0c, transpose_B=True, clear_accum=True)
-                        T.dual_copy(o1_l0c, O_tmp1_ub)
-                        with T.SimdVF():
-                            m32 = T.simd.pset(32, "PAT_ALL")
-                            for r in T.serial(rows_per_sid):
-                                alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
-                                for c in T.serial(d1_chunks):
-                                    off = d0 + c * 64
-                                    o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
-                                    o_tmp = T.simd.vld(
-                                        O_tmp1_ub[r, c * 64], dist="NORM_B32"
-                                    )
-                                    o_new = T.simd.vadd(
-                                        T.simd.vmul(o_old, alpha_v, mask=m32),
-                                        o_tmp,
-                                        mask=m32,
-                                    )
-                                    T.simd.vsts(
-                                        O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
-                                    )
-
-                if aligned_group_q and out_tile_rows < rows_per_sid:
+                if eff_aligned_group_q and out_tile_rows < rows_per_sid:
                     out_row_blocks = rows_per_sid // out_tile_rows
                     for rb in T.serial(out_row_blocks):
                         with T.SimdVF():
@@ -478,15 +541,15 @@ def _build_mla_prim_func(
                                         dist="PK_B32",
                                         extent=64,
                                     )
-                        out_gm_base = (
-                            group_id * q_rows
-                            + q_base
-                            + sid * rows_per_sid
-                            + rb * out_tile_rows
-                        )
+                        out_q_base = q_base + sid * rows_per_sid + rb * out_tile_rows
                         T.copy(
                             out_ub,
-                            Out[out_gm_base : out_gm_base + out_tile_rows, 0:d_nope],
+                            Out[
+                                b_idx,
+                                kv_h,
+                                out_q_base : out_q_base + out_tile_rows,
+                                0:d_nope,
+                            ],
                         )
                 else:
                     with T.SimdVF():
@@ -519,24 +582,33 @@ def _build_mla_prim_func(
                                     extent=64,
                                 )
 
-                    if aligned_group_q:
-                        out_gm_base = group_id * q_rows + q_base + sid * rows_per_sid
+                    if eff_aligned_group_q:
+                        out_q_base = q_base + sid * rows_per_sid
                         T.copy(
                             out_ub,
-                            Out[out_gm_base : out_gm_base + rows_per_sid, 0:d_nope],
+                            Out[
+                                b_idx,
+                                kv_h,
+                                out_q_base : out_q_base + rows_per_sid,
+                                0:d_nope,
+                            ],
                         )
                     else:
                         for r in T.serial(rows_per_sid):
                             q_row = q_base + sid * rows_per_sid + r
                             if q_row < q_rows:
-                                if input_layout == "BSND":
+                                if is_struct_4d:
+                                    T.copy(
+                                        out_ub[r, 0:d_nope],
+                                        Out[b_idx, kv_h, q_row, 0:d_nope],
+                                    )
+                                else:
                                     s_i = q_row // g_ratio
                                     h_loc = q_row % g_ratio
-                                    q_h = kv_h * g_ratio + h_loc
-                                    out_r = (b_idx * s_dim + s_i) * n_q + q_h
-                                else:
-                                    out_r = group_id * q_rows + q_row
-                                T.copy(out_ub[r, 0:d_nope], Out[out_r, 0:d_nope])
+                                    T.copy(
+                                        out_ub[r, 0:d_nope],
+                                        Out[b_idx, s_i, kv_h, h_loc, 0:d_nope],
+                                    )
 
     return main
 
@@ -579,8 +651,22 @@ def _build_mla_split_kv_decode_func(
 
     b_dim = T.dynamic("b_dim")
     q_total_rows = T.dynamic("q_total_rows")
+    q_rows_sym = T.dynamic("q_rows")
+    s_dim_sym = T.dynamic("s_dim")
     s_kv = T.dynamic("s_kv")
 
+    is_struct_4d = input_layout == "BNSD" or n_kv == 1
+    eff_aligned_group_q = bool(aligned_group_q and is_struct_4d)
+    q_nope_shape = (
+        (b_dim, n_kv, q_rows_sym, d_nope)
+        if is_struct_4d
+        else (b_dim, s_dim_sym, n_kv, g_ratio, d_nope)
+    )
+    q_rope_shape = (
+        (b_dim, n_kv, q_rows_sym, d_rope)
+        if is_struct_4d
+        else (b_dim, s_dim_sym, n_kv, g_ratio, d_rope)
+    )
     k_nope_shape = (
         (b_dim, s_kv, n_kv, d_nope)
         if input_layout == "BSND"
@@ -593,14 +679,214 @@ def _build_mla_split_kv_decode_func(
     )
 
     if splits <= 1:
+        @T.macro
+        def _kv_step(
+            kv, K_nope, K_rope, V,
+            scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+            k_rope_l1, p_l1, v0_l1, v1_l1,
+            s_l0c, o_l0c, o1_l0c, S_ub,
+            P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+            m_ub, l_ub, alpha_ub, sid,
+            b_idx, kv_h, q_base, q_rows,
+            s_dim,
+        ):
+            """Execute one KV tile step inside the MLA loop."""
+            if input_layout == "BSND":
+                T.copy(
+                    K_nope[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d_nope],
+                    k_nope_l1,
+                )
+                T.copy(
+                    K_rope[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d_rope],
+                    k_rope_l1,
+                )
+                T.copy(
+                    V[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d0],
+                    v0_l1,
+                    transpose=True,
+                )
+                if d1 > 0:
+                    T.copy(
+                        V[b_idx, kv * bn : kv * bn + bn, kv_h, d0:d_nope],
+                        v1_l1,
+                        transpose=True,
+                    )
+            else:
+                T.copy(
+                    K_nope[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d_nope],
+                    k_nope_l1,
+                )
+                T.copy(
+                    K_rope[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d_rope],
+                    k_rope_l1,
+                )
+                T.copy(
+                    V[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d0],
+                    v0_l1,
+                    transpose=True,
+                )
+                if d1 > 0:
+                    T.copy(
+                        V[b_idx, kv_h, kv * bn : kv * bn + bn, d0:d_nope],
+                        v1_l1,
+                        transpose=True,
+                    )
+
+            T.gemm(
+                q_nope_l1,
+                k_nope_l1,
+                s_l0c,
+                transpose_B=True,
+                clear_accum=True,
+            )
+            T.gemm(
+                q_rope_l1,
+                k_rope_l1,
+                s_l0c,
+                transpose_B=True,
+                clear_accum=False,
+            )
+            T.dual_copy(s_l0c, S_ub)
+
+            with T.SimdVF():
+                m32 = T.simd.pset(32, "PAT_ALL")
+                m16 = T.simd.pset(16, "PAT_ALL")
+                v_neg_inf = T.simd.vdup(
+                    T.float32(-1e38), "float32", mask=m32
+                )
+                v_zero = T.simd.vdup(
+                    T.float32(0.0), "float32", mask=m32
+                )
+                col_idx = T.simd.vci(kv * bn, "int32")
+                for r in T.serial(rows_per_sid):
+                    q_row = q_base + sid * rows_per_sid + r
+                    if input_layout == "BSND":
+                        s_idx = q_row // g_ratio
+                    else:
+                        s_idx = q_row % s_dim
+                    raw_limit = (
+                        T.min(s_kv, s_idx + s_kv - s_dim + 1)
+                        if is_causal
+                        else s_kv
+                    )
+                    limit_col = T.if_then_else(q_row < q_rows, raw_limit, 0)
+                    valid_mask = T.simd.vcmps(
+                        col_idx, limit_col, mask=m32, op="lt"
+                    )
+                    s_vec = T.simd.vld(S_ub[r, 0], dist="NORM_B32")
+                    s_scaled = T.simd.vmuls(s_vec, scale_val, mask=m32)
+                    s_masked = T.simd.vsel(s_scaled, v_neg_inf, valid_mask)
+                    m_tile_v = T.simd.vdupv(
+                        T.simd.vcmax(s_masked, mask=m32),
+                        mask=m32,
+                        pos="POS_LOWEST",
+                    )
+                    m_old_v = T.simd.vld(m_ub[r, 0], dist="BRC_B32")
+                    l_old_v = T.simd.vld(l_ub[r, 0], dist="BRC_B32")
+                    m_new_v = T.simd.vmax(m_old_v, m_tile_v, mask=m32)
+                    m_safe_v = T.simd.vmaxs(
+                        m_new_v, T.float32(-1e30), mask=m32
+                    )
+                    alpha_raw = T.simd.vexp(
+                        T.simd.vsub(m_old_v, m_safe_v, mask=m32), mask=m32
+                    )
+                    old_valid = T.simd.vcmps(
+                        m_old_v, T.float32(-1e30), mask=m32, op="gt"
+                    )
+                    alpha_v = T.simd.vsel(alpha_raw, v_zero, old_valid)
+                    p_raw = T.simd.vexp(
+                        T.simd.vsub(s_masked, m_safe_v, mask=m32), mask=m32
+                    )
+                    new_valid = T.simd.vcmps(
+                        m_new_v, T.float32(-1e30), mask=m32, op="gt"
+                    )
+                    p_mask = T.simd.pand(valid_mask, new_valid, m32)
+                    p_f32 = T.simd.vsel(p_raw, v_zero, p_mask)
+                    row_sum_v = T.simd.vdupv(
+                        T.simd.vcadd(p_f32, mask=m32),
+                        mask=m32,
+                        pos="POS_LOWEST",
+                    )
+                    l_new_v = T.simd.vadd(
+                        T.simd.vmul(l_old_v, alpha_v, mask=m32),
+                        row_sum_v,
+                        mask=m32,
+                    )
+                    T.simd.vsts(
+                        m_ub[r, 0], m_new_v, mask=m32, dist="ONEPT_B32"
+                    )
+                    T.simd.vsts(
+                        l_ub[r, 0], l_new_v, mask=m32, dist="ONEPT_B32"
+                    )
+                    T.simd.vsts(
+                        alpha_ub[r, 0], alpha_v, mask=m32, dist="ONEPT_B32"
+                    )
+                    p_16 = T.simd.vcvt(p_f32, tl_dtype, mask=m16, part=0)
+                    T.simd.vsts(
+                        P_ub[r, 0], p_16, mask=m32, dist="PK_B32", extent=64
+                    )
+
+            T.dual_copy(P_ub, p_l1)
+            T.gemm(p_l1, v0_l1, o_l0c, transpose_B=True, clear_accum=True)
+            T.dual_copy(o_l0c, O_tmp_ub)
+            with T.SimdVF():
+                m32 = T.simd.pset(32, "PAT_ALL")
+                for r in T.serial(rows_per_sid):
+                    alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
+                    for c in T.serial(d0_chunks):
+                        off = c * 64
+                        o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
+                        o_tmp = T.simd.vld(
+                            O_tmp_ub[r, off], dist="NORM_B32"
+                        )
+                        o_new = T.simd.vadd(
+                            T.simd.vmul(o_old, alpha_v, mask=m32),
+                            o_tmp,
+                            mask=m32,
+                        )
+                        T.simd.vsts(
+                            O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
+                        )
+
+            if d1 > 0:
+                T.gemm(
+                    p_l1, v1_l1, o1_l0c, transpose_B=True, clear_accum=True
+                )
+                T.dual_copy(o1_l0c, O_tmp1_ub)
+                with T.SimdVF():
+                    m32 = T.simd.pset(32, "PAT_ALL")
+                    for r in T.serial(rows_per_sid):
+                        alpha_v = T.simd.vld(
+                            alpha_ub[r, 0], dist="BRC_B32"
+                        )
+                        for c in T.serial(d1_chunks):
+                            off = d0 + c * 64
+                            o_old = T.simd.vld(
+                                O_ub[r, off], dist="NORM_B32"
+                            )
+                            o_tmp = T.simd.vld(
+                                O_tmp1_ub[r, c * 64], dist="NORM_B32"
+                            )
+                            o_new = T.simd.vadd(
+                                T.simd.vmul(o_old, alpha_v, mask=m32),
+                                o_tmp,
+                                mask=m32,
+                            )
+                            T.simd.vsts(
+                                O_ub[r, off],
+                                o_new,
+                                mask=m32,
+                                dist="NORM_B32",
+                            )
+
         @T.prim_func
         def main(
-            Q_nope: T.Tensor((q_total_rows, d_nope), tl_dtype),
-            Q_rope: T.Tensor((q_total_rows, d_rope), tl_dtype),
+            Q_nope: T.Tensor(q_nope_shape, tl_dtype),
+            Q_rope: T.Tensor(q_rope_shape, tl_dtype),
             K_nope: T.Tensor(k_nope_shape, tl_dtype),
             K_rope: T.Tensor(k_rope_shape, tl_dtype),
             V: T.Tensor(k_nope_shape, tl_dtype),
-            Out: T.Tensor((q_total_rows, d_nope), tl_dtype),
+            Out: T.Tensor(q_nope_shape, tl_dtype),
             scale_val: T.float32,
         ):
             with T.MixedKernel(num_cores, sids=2) as (bx, sid):
@@ -620,7 +906,7 @@ def _build_mla_split_kv_decode_func(
                     else T.alloc_l0c((bm, d1_alloc), "float32")
                 )
 
-                if not aligned_group_q:
+                if not eff_aligned_group_q:
                     q_nope_ub = T.alloc_shared((rows_per_sid, d_nope), tl_dtype)
                     q_rope_ub = T.alloc_shared((rows_per_sid, d_rope), tl_dtype)
                 S_ub = T.alloc_shared((rows_per_sid, bn), "float32")
@@ -655,7 +941,7 @@ def _build_mla_split_kv_decode_func(
                     l_ub: 1,
                     alpha_ub: 1,
                 }
-                if not aligned_group_q:
+                if not eff_aligned_group_q:
                     pinned[q_nope_ub] = 1
                     pinned[q_rope_ub] = 1
                 if d1 > 0 and d1 != d0:
@@ -674,8 +960,12 @@ def _build_mla_split_kv_decode_func(
                 if bm == 128:
                     T.annotate_unlimit_memory("shared")
 
-                s_dim = q_total_rows // (b_dim * n_q)
-                q_rows = s_dim * g_ratio
+                if is_struct_4d:
+                    q_rows = q_rows_sym
+                    s_dim = q_rows_sym // g_ratio
+                else:
+                    s_dim = s_dim_sym
+                    q_rows = s_dim_sym * g_ratio
                 m_tiles_per_group = (q_rows + bm - 1) // bm
                 total_groups = b_dim * n_kv
                 total_m_tiles = total_groups * m_tiles_per_group
@@ -692,14 +982,13 @@ def _build_mla_split_kv_decode_func(
                     kv_h = group_id % n_kv
                     q_base = mt * bm
 
-                    if aligned_group_q:
-                        q_gm_base = group_id * q_rows + q_base
+                    if eff_aligned_group_q:
                         T.copy(
-                            Q_nope[q_gm_base : q_gm_base + bm, 0:d_nope],
+                            Q_nope[b_idx, kv_h, q_base : q_base + bm, 0:d_nope],
                             q_nope_l1,
                         )
                         T.copy(
-                            Q_rope[q_gm_base : q_gm_base + bm, 0:d_rope],
+                            Q_rope[b_idx, kv_h, q_base : q_base + bm, 0:d_rope],
                             q_rope_l1,
                         )
                     else:
@@ -733,15 +1022,26 @@ def _build_mla_split_kv_decode_func(
                         for r in T.serial(rows_per_sid):
                             q_row = q_base + sid * rows_per_sid + r
                             if q_row < q_rows:
-                                if input_layout == "BSND":
+                                if is_struct_4d:
+                                    T.copy(
+                                        Q_nope[b_idx, kv_h, q_row, 0:d_nope],
+                                        q_nope_ub[r, 0:d_nope],
+                                    )
+                                    T.copy(
+                                        Q_rope[b_idx, kv_h, q_row, 0:d_rope],
+                                        q_rope_ub[r, 0:d_rope],
+                                    )
+                                else:
                                     s_i = q_row // g_ratio
                                     h_loc = q_row % g_ratio
-                                    q_h = kv_h * g_ratio + h_loc
-                                    gm_r = (b_idx * s_dim + s_i) * n_q + q_h
-                                else:
-                                    gm_r = group_id * q_rows + q_row
-                                T.copy(Q_nope[gm_r, 0:d_nope], q_nope_ub[r, 0:d_nope])
-                                T.copy(Q_rope[gm_r, 0:d_rope], q_rope_ub[r, 0:d_rope])
+                                    T.copy(
+                                        Q_nope[b_idx, s_i, kv_h, h_loc, 0:d_nope],
+                                        q_nope_ub[r, 0:d_nope],
+                                    )
+                                    T.copy(
+                                        Q_rope[b_idx, s_i, kv_h, h_loc, 0:d_rope],
+                                        q_rope_ub[r, 0:d_rope],
+                                    )
 
                         T.dual_copy(q_nope_ub, q_nope_l1)
                         T.dual_copy(q_rope_ub, q_rope_l1)
@@ -776,198 +1076,34 @@ def _build_mla_split_kv_decode_func(
                     else:
                         kv_limit = max_kv_blocks
 
-                    for kv in T.Pipelined(
-                        kv_limit, num_stages=num_stages, annotations=pipe_ann
-                    ):
-                        if input_layout == "BSND":
-                            T.copy(
-                                K_nope[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d_nope],
-                                k_nope_l1,
+                    if num_stages >= 2:
+                        for kv in T.Pipelined(
+                            kv_limit, num_stages=num_stages, annotations=pipe_ann
+                        ):
+                            _kv_step(
+                                kv, K_nope, K_rope, V,
+                                scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+                                k_rope_l1, p_l1, v0_l1, v1_l1,
+                                s_l0c, o_l0c, o1_l0c, S_ub,
+                                P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+                                m_ub, l_ub, alpha_ub, sid,
+                                b_idx, kv_h, q_base, q_rows,
+                                s_dim,
                             )
-                            T.copy(
-                                K_rope[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d_rope],
-                                k_rope_l1,
+                    else:
+                        for kv in T.serial(kv_limit):
+                            _kv_step(
+                                kv, K_nope, K_rope, V,
+                                scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+                                k_rope_l1, p_l1, v0_l1, v1_l1,
+                                s_l0c, o_l0c, o1_l0c, S_ub,
+                                P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+                                m_ub, l_ub, alpha_ub, sid,
+                                b_idx, kv_h, q_base, q_rows,
+                                s_dim,
                             )
-                            T.copy(
-                                V[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d0],
-                                v0_l1,
-                                transpose=True,
-                            )
-                            if d1 > 0:
-                                T.copy(
-                                    V[b_idx, kv * bn : kv * bn + bn, kv_h, d0:d_nope],
-                                    v1_l1,
-                                    transpose=True,
-                                )
-                        else:
-                            T.copy(
-                                K_nope[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d_nope],
-                                k_nope_l1,
-                            )
-                            T.copy(
-                                K_rope[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d_rope],
-                                k_rope_l1,
-                            )
-                            T.copy(
-                                V[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d0],
-                                v0_l1,
-                                transpose=True,
-                            )
-                            if d1 > 0:
-                                T.copy(
-                                    V[b_idx, kv_h, kv * bn : kv * bn + bn, d0:d_nope],
-                                    v1_l1,
-                                    transpose=True,
-                                )
 
-                        T.gemm(
-                            q_nope_l1,
-                            k_nope_l1,
-                            s_l0c,
-                            transpose_B=True,
-                            clear_accum=True,
-                        )
-                        T.gemm(
-                            q_rope_l1,
-                            k_rope_l1,
-                            s_l0c,
-                            transpose_B=True,
-                            clear_accum=False,
-                        )
-                        T.dual_copy(s_l0c, S_ub)
-
-                        with T.SimdVF():
-                            m32 = T.simd.pset(32, "PAT_ALL")
-                            m16 = T.simd.pset(16, "PAT_ALL")
-                            v_neg_inf = T.simd.vdup(
-                                T.float32(-1e38), "float32", mask=m32
-                            )
-                            v_zero = T.simd.vdup(
-                                T.float32(0.0), "float32", mask=m32
-                            )
-                            col_idx = T.simd.vci(kv * bn, "int32")
-                            for r in T.serial(rows_per_sid):
-                                q_row = q_base + sid * rows_per_sid + r
-                                if input_layout == "BSND":
-                                    s_idx = q_row // g_ratio
-                                else:
-                                    s_idx = q_row % s_dim
-                                raw_limit = (
-                                    T.min(s_kv, s_idx + s_kv - s_dim + 1)
-                                    if is_causal
-                                    else s_kv
-                                )
-                                limit_col = T.if_then_else(q_row < q_rows, raw_limit, 0)
-                                valid_mask = T.simd.vcmps(
-                                    col_idx, limit_col, mask=m32, op="lt"
-                                )
-                                s_vec = T.simd.vld(S_ub[r, 0], dist="NORM_B32")
-                                s_scaled = T.simd.vmuls(s_vec, scale_val, mask=m32)
-                                s_masked = T.simd.vsel(s_scaled, v_neg_inf, valid_mask)
-                                m_tile_v = T.simd.vdupv(
-                                    T.simd.vcmax(s_masked, mask=m32),
-                                    mask=m32,
-                                    pos="POS_LOWEST",
-                                )
-                                m_old_v = T.simd.vld(m_ub[r, 0], dist="BRC_B32")
-                                l_old_v = T.simd.vld(l_ub[r, 0], dist="BRC_B32")
-                                m_new_v = T.simd.vmax(m_old_v, m_tile_v, mask=m32)
-                                m_safe_v = T.simd.vmaxs(
-                                    m_new_v, T.float32(-1e30), mask=m32
-                                )
-                                alpha_raw = T.simd.vexp(
-                                    T.simd.vsub(m_old_v, m_safe_v, mask=m32), mask=m32
-                                )
-                                old_valid = T.simd.vcmps(
-                                    m_old_v, T.float32(-1e30), mask=m32, op="gt"
-                                )
-                                alpha_v = T.simd.vsel(alpha_raw, v_zero, old_valid)
-                                p_raw = T.simd.vexp(
-                                    T.simd.vsub(s_masked, m_safe_v, mask=m32), mask=m32
-                                )
-                                new_valid = T.simd.vcmps(
-                                    m_new_v, T.float32(-1e30), mask=m32, op="gt"
-                                )
-                                p_mask = T.simd.pand(valid_mask, new_valid, m32)
-                                p_f32 = T.simd.vsel(p_raw, v_zero, p_mask)
-                                row_sum_v = T.simd.vdupv(
-                                    T.simd.vcadd(p_f32, mask=m32),
-                                    mask=m32,
-                                    pos="POS_LOWEST",
-                                )
-                                l_new_v = T.simd.vadd(
-                                    T.simd.vmul(l_old_v, alpha_v, mask=m32),
-                                    row_sum_v,
-                                    mask=m32,
-                                )
-                                T.simd.vsts(
-                                    m_ub[r, 0], m_new_v, mask=m32, dist="ONEPT_B32"
-                                )
-                                T.simd.vsts(
-                                    l_ub[r, 0], l_new_v, mask=m32, dist="ONEPT_B32"
-                                )
-                                T.simd.vsts(
-                                    alpha_ub[r, 0], alpha_v, mask=m32, dist="ONEPT_B32"
-                                )
-                                p_16 = T.simd.vcvt(p_f32, tl_dtype, mask=m16, part=0)
-                                T.simd.vsts(
-                                    P_ub[r, 0], p_16, mask=m32, dist="PK_B32", extent=64
-                                )
-
-                        T.dual_copy(P_ub, p_l1)
-                        T.gemm(p_l1, v0_l1, o_l0c, transpose_B=True, clear_accum=True)
-                        T.dual_copy(o_l0c, O_tmp_ub)
-                        with T.SimdVF():
-                            m32 = T.simd.pset(32, "PAT_ALL")
-                            for r in T.serial(rows_per_sid):
-                                alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
-                                for c in T.serial(d0_chunks):
-                                    off = c * 64
-                                    o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
-                                    o_tmp = T.simd.vld(
-                                        O_tmp_ub[r, off], dist="NORM_B32"
-                                    )
-                                    o_new = T.simd.vadd(
-                                        T.simd.vmul(o_old, alpha_v, mask=m32),
-                                        o_tmp,
-                                        mask=m32,
-                                    )
-                                    T.simd.vsts(
-                                        O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
-                                    )
-
-                        if d1 > 0:
-                            T.gemm(
-                                p_l1, v1_l1, o1_l0c, transpose_B=True, clear_accum=True
-                            )
-                            T.dual_copy(o1_l0c, O_tmp1_ub)
-                            with T.SimdVF():
-                                m32 = T.simd.pset(32, "PAT_ALL")
-                                for r in T.serial(rows_per_sid):
-                                    alpha_v = T.simd.vld(
-                                        alpha_ub[r, 0], dist="BRC_B32"
-                                    )
-                                    for c in T.serial(d1_chunks):
-                                        off = d0 + c * 64
-                                        o_old = T.simd.vld(
-                                            O_ub[r, off], dist="NORM_B32"
-                                        )
-                                        o_tmp = T.simd.vld(
-                                            O_tmp1_ub[r, c * 64], dist="NORM_B32"
-                                        )
-                                        o_new = T.simd.vadd(
-                                            T.simd.vmul(o_old, alpha_v, mask=m32),
-                                            o_tmp,
-                                            mask=m32,
-                                        )
-                                        T.simd.vsts(
-                                            O_ub[r, off],
-                                            o_new,
-                                            mask=m32,
-                                            dist="NORM_B32",
-                                        )
-
-                    if aligned_group_q and out_tile_rows < rows_per_sid:
+                    if eff_aligned_group_q and out_tile_rows < rows_per_sid:
                         out_row_blocks = rows_per_sid // out_tile_rows
                         for rb in T.serial(out_row_blocks):
                             with T.SimdVF():
@@ -1002,15 +1138,17 @@ def _build_mla_split_kv_decode_func(
                                             dist="PK_B32",
                                             extent=64,
                                         )
-                            out_gm_base = (
-                                group_id * q_rows
-                                + q_base
-                                + sid * rows_per_sid
-                                + rb * out_tile_rows
+                            out_q_base = (
+                                q_base + sid * rows_per_sid + rb * out_tile_rows
                             )
                             T.copy(
                                 out_ub,
-                                Out[out_gm_base : out_gm_base + out_tile_rows, 0:d_nope],
+                                Out[
+                                    b_idx,
+                                    kv_h,
+                                    out_q_base : out_q_base + out_tile_rows,
+                                    0:d_nope,
+                                ],
                             )
                     else:
                         with T.SimdVF():
@@ -1045,28 +1183,240 @@ def _build_mla_split_kv_decode_func(
                                         extent=64,
                                     )
 
-                        if aligned_group_q:
-                            out_gm_base = (
-                                group_id * q_rows + q_base + sid * rows_per_sid
-                            )
+                        if eff_aligned_group_q:
+                            out_q_base = q_base + sid * rows_per_sid
                             T.copy(
                                 out_ub,
-                                Out[out_gm_base : out_gm_base + rows_per_sid, 0:d_nope],
+                                Out[
+                                    b_idx,
+                                    kv_h,
+                                    out_q_base : out_q_base + rows_per_sid,
+                                    0:d_nope,
+                                ],
                             )
                         else:
                             for r in T.serial(rows_per_sid):
                                 q_row = q_base + sid * rows_per_sid + r
                                 if q_row < q_rows:
-                                    if input_layout == "BSND":
+                                    if is_struct_4d:
+                                        T.copy(
+                                            out_ub[r, 0:d_nope],
+                                            Out[b_idx, kv_h, q_row, 0:d_nope],
+                                        )
+                                    else:
                                         s_i = q_row // g_ratio
                                         h_loc = q_row % g_ratio
-                                        q_h = kv_h * g_ratio + h_loc
-                                        out_r = (b_idx * s_dim + s_i) * n_q + q_h
-                                    else:
-                                        out_r = group_id * q_rows + q_row
-                                    T.copy(out_ub[r, 0:d_nope], Out[out_r, 0:d_nope])
+                                        T.copy(
+                                            out_ub[r, 0:d_nope],
+                                            Out[b_idx, s_i, kv_h, h_loc, 0:d_nope],
+                                        )
 
         return main
+
+    @T.macro
+    def _kv_split_step(
+        kv_i, K_nope, K_rope, V,
+        scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+        k_rope_l1, p_l1, v0_l1, v1_l1,
+        s_l0c, o_l0c, o1_l0c, S_ub,
+        P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+        m_ub, l_ub, alpha_ub, sid,
+        b_idx, kv_h, q_base, q_rows,
+        s_dim, kv_start, eff_kv_end,
+    ):
+        """Execute one KV tile step inside the MLA loop."""
+        kv_pos = kv_start + kv_i * bn
+        if input_layout == "BSND":
+            T.copy(
+                K_nope[b_idx, kv_pos : kv_pos + bn, kv_h, 0:d_nope],
+                k_nope_l1,
+            )
+            T.copy(
+                K_rope[b_idx, kv_pos : kv_pos + bn, kv_h, 0:d_rope],
+                k_rope_l1,
+            )
+            T.copy(
+                V[b_idx, kv_pos : kv_pos + bn, kv_h, 0:d0],
+                v0_l1,
+                transpose=True,
+            )
+            if d1 > 0:
+                T.copy(
+                    V[b_idx, kv_pos : kv_pos + bn, kv_h, d0:d_nope],
+                    v1_l1,
+                    transpose=True,
+                )
+        else:
+            T.copy(
+                K_nope[b_idx, kv_h, kv_pos : kv_pos + bn, 0:d_nope],
+                k_nope_l1,
+            )
+            T.copy(
+                K_rope[b_idx, kv_h, kv_pos : kv_pos + bn, 0:d_rope],
+                k_rope_l1,
+            )
+            T.copy(
+                V[b_idx, kv_h, kv_pos : kv_pos + bn, 0:d0],
+                v0_l1,
+                transpose=True,
+            )
+            if d1 > 0:
+                T.copy(
+                    V[b_idx, kv_h, kv_pos : kv_pos + bn, d0:d_nope],
+                    v1_l1,
+                    transpose=True,
+                )
+
+        T.gemm(
+            q_nope_l1,
+            k_nope_l1,
+            s_l0c,
+            transpose_B=True,
+            clear_accum=True,
+        )
+        T.gemm(
+            q_rope_l1,
+            k_rope_l1,
+            s_l0c,
+            transpose_B=True,
+            clear_accum=False,
+        )
+        T.dual_copy(s_l0c, S_ub)
+
+        with T.SimdVF():
+            m32 = T.simd.pset(32, "PAT_ALL")
+            m16 = T.simd.pset(16, "PAT_ALL")
+            v_neg_inf = T.simd.vdup(
+                T.float32(-1e38), "float32", mask=m32
+            )
+            v_zero = T.simd.vdup(
+                T.float32(0.0), "float32", mask=m32
+            )
+            col_idx = T.simd.vci(kv_pos, "int32")
+            for r in T.serial(rows_per_sid):
+                q_row = q_base + sid * rows_per_sid + r
+                if input_layout == "BSND":
+                    s_idx = q_row // g_ratio
+                else:
+                    s_idx = q_row % s_dim
+                raw_limit = (
+                    T.min(s_kv, s_idx + s_kv - s_dim + 1)
+                    if is_causal
+                    else s_kv
+                )
+                limit_col = T.if_then_else(
+                    q_row < q_rows,
+                    T.min(eff_kv_end, raw_limit),
+                    0,
+                )
+                valid_mask = T.simd.vcmps(
+                    col_idx, limit_col, mask=m32, op="lt"
+                )
+                s_vec = T.simd.vld(S_ub[r, 0], dist="NORM_B32")
+                s_scaled = T.simd.vmuls(s_vec, scale_val, mask=m32)
+                s_masked = T.simd.vsel(s_scaled, v_neg_inf, valid_mask)
+                m_tile_v = T.simd.vdupv(
+                    T.simd.vcmax(s_masked, mask=m32),
+                    mask=m32,
+                    pos="POS_LOWEST",
+                )
+                m_old_v = T.simd.vld(m_ub[r, 0], dist="BRC_B32")
+                l_old_v = T.simd.vld(l_ub[r, 0], dist="BRC_B32")
+                m_new_v = T.simd.vmax(m_old_v, m_tile_v, mask=m32)
+                m_safe_v = T.simd.vmaxs(
+                    m_new_v, T.float32(-1e30), mask=m32
+                )
+                alpha_raw = T.simd.vexp(
+                    T.simd.vsub(m_old_v, m_safe_v, mask=m32), mask=m32
+                )
+                old_valid = T.simd.vcmps(
+                    m_old_v, T.float32(-1e30), mask=m32, op="gt"
+                )
+                alpha_v = T.simd.vsel(alpha_raw, v_zero, old_valid)
+                p_raw = T.simd.vexp(
+                    T.simd.vsub(s_masked, m_safe_v, mask=m32), mask=m32
+                )
+                new_valid = T.simd.vcmps(
+                    m_new_v, T.float32(-1e30), mask=m32, op="gt"
+                )
+                p_mask = T.simd.pand(valid_mask, new_valid, m32)
+                p_f32 = T.simd.vsel(p_raw, v_zero, p_mask)
+                row_sum_v = T.simd.vdupv(
+                    T.simd.vcadd(p_f32, mask=m32),
+                    mask=m32,
+                    pos="POS_LOWEST",
+                )
+                l_new_v = T.simd.vadd(
+                    T.simd.vmul(l_old_v, alpha_v, mask=m32),
+                    row_sum_v,
+                    mask=m32,
+                )
+                T.simd.vsts(
+                    m_ub[r, 0], m_new_v, mask=m32, dist="ONEPT_B32"
+                )
+                T.simd.vsts(
+                    l_ub[r, 0], l_new_v, mask=m32, dist="ONEPT_B32"
+                )
+                T.simd.vsts(
+                    alpha_ub[r, 0], alpha_v, mask=m32, dist="ONEPT_B32"
+                )
+                p_16 = T.simd.vcvt(p_f32, tl_dtype, mask=m16, part=0)
+                T.simd.vsts(
+                    P_ub[r, 0], p_16, mask=m32, dist="PK_B32", extent=64
+                )
+
+        T.dual_copy(P_ub, p_l1)
+        T.gemm(p_l1, v0_l1, o_l0c, transpose_B=True, clear_accum=True)
+        T.dual_copy(o_l0c, O_tmp_ub)
+        with T.SimdVF():
+            m32 = T.simd.pset(32, "PAT_ALL")
+            for r in T.serial(rows_per_sid):
+                alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
+                for c in T.serial(d0_chunks):
+                    off = c * 64
+                    o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
+                    o_tmp = T.simd.vld(
+                        O_tmp_ub[r, off], dist="NORM_B32"
+                    )
+                    o_new = T.simd.vadd(
+                        T.simd.vmul(o_old, alpha_v, mask=m32),
+                        o_tmp,
+                        mask=m32,
+                    )
+                    T.simd.vsts(
+                        O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
+                    )
+
+        if d1 > 0:
+            T.gemm(
+                p_l1, v1_l1, o1_l0c, transpose_B=True, clear_accum=True
+            )
+            T.dual_copy(o1_l0c, O_tmp1_ub)
+            with T.SimdVF():
+                m32 = T.simd.pset(32, "PAT_ALL")
+                for r in T.serial(rows_per_sid):
+                    alpha_v = T.simd.vld(
+                        alpha_ub[r, 0], dist="BRC_B32"
+                    )
+                    for c in T.serial(d1_chunks):
+                        off = d0 + c * 64
+                        o_old = T.simd.vld(
+                            O_ub[r, off], dist="NORM_B32"
+                        )
+                        o_tmp = T.simd.vld(
+                            O_tmp1_ub[r, c * 64], dist="NORM_B32"
+                        )
+                        o_new = T.simd.vadd(
+                            T.simd.vmul(o_old, alpha_v, mask=m32),
+                            o_tmp,
+                            mask=m32,
+                        )
+                        T.simd.vsts(
+                            O_ub[r, off],
+                            o_new,
+                            mask=m32,
+                            dist="NORM_B32",
+                        )
 
     @T.prim_func
     def main(
@@ -1259,201 +1609,32 @@ def _build_mla_split_kv_decode_func(
 
                 if eff_kv_end > kv_start:
                     split_iters = T.ceildiv(eff_kv_end - kv_start, bn)
-                    for kv_i in T.Pipelined(
-                        split_iters, num_stages=num_stages, annotations=pipe_ann
-                    ):
-                        kv_pos = kv_start + kv_i * bn
-                        if input_layout == "BSND":
-                            T.copy(
-                                K_nope[b_idx, kv_pos : kv_pos + bn, kv_h, 0:d_nope],
-                                k_nope_l1,
+                    if num_stages >= 2:
+                        for kv_i in T.Pipelined(
+                            split_iters, num_stages=num_stages, annotations=pipe_ann
+                        ):
+                            _kv_split_step(
+                                kv_i, K_nope, K_rope, V,
+                                scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+                                k_rope_l1, p_l1, v0_l1, v1_l1,
+                                s_l0c, o_l0c, o1_l0c, S_ub,
+                                P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+                                m_ub, l_ub, alpha_ub, sid,
+                                b_idx, kv_h, q_base, q_rows,
+                                s_dim, kv_start, eff_kv_end,
                             )
-                            T.copy(
-                                K_rope[b_idx, kv_pos : kv_pos + bn, kv_h, 0:d_rope],
-                                k_rope_l1,
+                    else:
+                        for kv_i in T.serial(split_iters):
+                            _kv_split_step(
+                                kv_i, K_nope, K_rope, V,
+                                scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+                                k_rope_l1, p_l1, v0_l1, v1_l1,
+                                s_l0c, o_l0c, o1_l0c, S_ub,
+                                P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+                                m_ub, l_ub, alpha_ub, sid,
+                                b_idx, kv_h, q_base, q_rows,
+                                s_dim, kv_start, eff_kv_end,
                             )
-                            T.copy(
-                                V[b_idx, kv_pos : kv_pos + bn, kv_h, 0:d0],
-                                v0_l1,
-                                transpose=True,
-                            )
-                            if d1 > 0:
-                                T.copy(
-                                    V[b_idx, kv_pos : kv_pos + bn, kv_h, d0:d_nope],
-                                    v1_l1,
-                                    transpose=True,
-                                )
-                        else:
-                            T.copy(
-                                K_nope[b_idx, kv_h, kv_pos : kv_pos + bn, 0:d_nope],
-                                k_nope_l1,
-                            )
-                            T.copy(
-                                K_rope[b_idx, kv_h, kv_pos : kv_pos + bn, 0:d_rope],
-                                k_rope_l1,
-                            )
-                            T.copy(
-                                V[b_idx, kv_h, kv_pos : kv_pos + bn, 0:d0],
-                                v0_l1,
-                                transpose=True,
-                            )
-                            if d1 > 0:
-                                T.copy(
-                                    V[b_idx, kv_h, kv_pos : kv_pos + bn, d0:d_nope],
-                                    v1_l1,
-                                    transpose=True,
-                                )
-
-                        T.gemm(
-                            q_nope_l1,
-                            k_nope_l1,
-                            s_l0c,
-                            transpose_B=True,
-                            clear_accum=True,
-                        )
-                        T.gemm(
-                            q_rope_l1,
-                            k_rope_l1,
-                            s_l0c,
-                            transpose_B=True,
-                            clear_accum=False,
-                        )
-                        T.dual_copy(s_l0c, S_ub)
-
-                        with T.SimdVF():
-                            m32 = T.simd.pset(32, "PAT_ALL")
-                            m16 = T.simd.pset(16, "PAT_ALL")
-                            v_neg_inf = T.simd.vdup(
-                                T.float32(-1e38), "float32", mask=m32
-                            )
-                            v_zero = T.simd.vdup(
-                                T.float32(0.0), "float32", mask=m32
-                            )
-                            col_idx = T.simd.vci(kv_pos, "int32")
-                            for r in T.serial(rows_per_sid):
-                                q_row = q_base + sid * rows_per_sid + r
-                                if input_layout == "BSND":
-                                    s_idx = q_row // g_ratio
-                                else:
-                                    s_idx = q_row % s_dim
-                                raw_limit = (
-                                    T.min(s_kv, s_idx + s_kv - s_dim + 1)
-                                    if is_causal
-                                    else s_kv
-                                )
-                                limit_col = T.if_then_else(
-                                    q_row < q_rows,
-                                    T.min(eff_kv_end, raw_limit),
-                                    0,
-                                )
-                                valid_mask = T.simd.vcmps(
-                                    col_idx, limit_col, mask=m32, op="lt"
-                                )
-                                s_vec = T.simd.vld(S_ub[r, 0], dist="NORM_B32")
-                                s_scaled = T.simd.vmuls(s_vec, scale_val, mask=m32)
-                                s_masked = T.simd.vsel(s_scaled, v_neg_inf, valid_mask)
-                                m_tile_v = T.simd.vdupv(
-                                    T.simd.vcmax(s_masked, mask=m32),
-                                    mask=m32,
-                                    pos="POS_LOWEST",
-                                )
-                                m_old_v = T.simd.vld(m_ub[r, 0], dist="BRC_B32")
-                                l_old_v = T.simd.vld(l_ub[r, 0], dist="BRC_B32")
-                                m_new_v = T.simd.vmax(m_old_v, m_tile_v, mask=m32)
-                                m_safe_v = T.simd.vmaxs(
-                                    m_new_v, T.float32(-1e30), mask=m32
-                                )
-                                alpha_raw = T.simd.vexp(
-                                    T.simd.vsub(m_old_v, m_safe_v, mask=m32), mask=m32
-                                )
-                                old_valid = T.simd.vcmps(
-                                    m_old_v, T.float32(-1e30), mask=m32, op="gt"
-                                )
-                                alpha_v = T.simd.vsel(alpha_raw, v_zero, old_valid)
-                                p_raw = T.simd.vexp(
-                                    T.simd.vsub(s_masked, m_safe_v, mask=m32), mask=m32
-                                )
-                                new_valid = T.simd.vcmps(
-                                    m_new_v, T.float32(-1e30), mask=m32, op="gt"
-                                )
-                                p_mask = T.simd.pand(valid_mask, new_valid, m32)
-                                p_f32 = T.simd.vsel(p_raw, v_zero, p_mask)
-                                row_sum_v = T.simd.vdupv(
-                                    T.simd.vcadd(p_f32, mask=m32),
-                                    mask=m32,
-                                    pos="POS_LOWEST",
-                                )
-                                l_new_v = T.simd.vadd(
-                                    T.simd.vmul(l_old_v, alpha_v, mask=m32),
-                                    row_sum_v,
-                                    mask=m32,
-                                )
-                                T.simd.vsts(
-                                    m_ub[r, 0], m_new_v, mask=m32, dist="ONEPT_B32"
-                                )
-                                T.simd.vsts(
-                                    l_ub[r, 0], l_new_v, mask=m32, dist="ONEPT_B32"
-                                )
-                                T.simd.vsts(
-                                    alpha_ub[r, 0], alpha_v, mask=m32, dist="ONEPT_B32"
-                                )
-                                p_16 = T.simd.vcvt(p_f32, tl_dtype, mask=m16, part=0)
-                                T.simd.vsts(
-                                    P_ub[r, 0], p_16, mask=m32, dist="PK_B32", extent=64
-                                )
-
-                        T.dual_copy(P_ub, p_l1)
-                        T.gemm(p_l1, v0_l1, o_l0c, transpose_B=True, clear_accum=True)
-                        T.dual_copy(o_l0c, O_tmp_ub)
-                        with T.SimdVF():
-                            m32 = T.simd.pset(32, "PAT_ALL")
-                            for r in T.serial(rows_per_sid):
-                                alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
-                                for c in T.serial(d0_chunks):
-                                    off = c * 64
-                                    o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
-                                    o_tmp = T.simd.vld(
-                                        O_tmp_ub[r, off], dist="NORM_B32"
-                                    )
-                                    o_new = T.simd.vadd(
-                                        T.simd.vmul(o_old, alpha_v, mask=m32),
-                                        o_tmp,
-                                        mask=m32,
-                                    )
-                                    T.simd.vsts(
-                                        O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
-                                    )
-
-                        if d1 > 0:
-                            T.gemm(
-                                p_l1, v1_l1, o1_l0c, transpose_B=True, clear_accum=True
-                            )
-                            T.dual_copy(o1_l0c, O_tmp1_ub)
-                            with T.SimdVF():
-                                m32 = T.simd.pset(32, "PAT_ALL")
-                                for r in T.serial(rows_per_sid):
-                                    alpha_v = T.simd.vld(
-                                        alpha_ub[r, 0], dist="BRC_B32"
-                                    )
-                                    for c in T.serial(d1_chunks):
-                                        off = d0 + c * 64
-                                        o_old = T.simd.vld(
-                                            O_ub[r, off], dist="NORM_B32"
-                                        )
-                                        o_tmp = T.simd.vld(
-                                            O_tmp1_ub[r, c * 64], dist="NORM_B32"
-                                        )
-                                        o_new = T.simd.vadd(
-                                            T.simd.vmul(o_old, alpha_v, mask=m32),
-                                            o_tmp,
-                                            mask=m32,
-                                        )
-                                        T.simd.vsts(
-                                            O_ub[r, off],
-                                            o_new,
-                                            mask=m32,
-                                            dist="NORM_B32",
-                                        )
 
                 with T.SimdVF():
                     m32 = T.simd.pset(32, "PAT_ALL")
@@ -1772,20 +1953,179 @@ def _build_mla_bnsd_gather_func(
     pipe_ann = {"enable_offset": True} if schedule_mode == "tuned" else None
 
     b_dim = T.dynamic("b_dim")
-    q_total_rows = T.dynamic("q_total_rows")
+    q_rows_sym = T.dynamic("q_rows")
     s_kv = T.dynamic("s_kv")
 
+    q_nope_shape = (b_dim, n_kv, q_rows_sym, d_nope)
+    q_rope_shape = (b_dim, n_kv, q_rows_sym, d_rope)
     k_nope_shape = (b_dim, n_kv, s_kv, d_nope)
     k_rope_shape = (b_dim, n_kv, s_kv, d_rope)
 
+    @T.macro
+    def _kv_step(
+        kv, K_nope, K_rope, V,
+        scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+        k_rope_l1, p_l1, v0_l1, v1_l1,
+        s_l0c, o_l0c, o1_l0c, S_ub,
+        P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+        m_ub, l_ub, alpha_ub, sid,
+        b_idx, kv_h, q_base, q_rows,
+        s_dim,
+    ):
+        """Execute one KV tile step inside the MLA loop."""
+        T.copy(
+            K_nope[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d_nope],
+            k_nope_l1,
+        )
+        T.copy(
+            K_rope[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d_rope],
+            k_rope_l1,
+        )
+        T.copy(
+            V[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d0],
+            v0_l1,
+            transpose=True,
+        )
+        if d1 > 0:
+            T.copy(
+                V[b_idx, kv_h, kv * bn : kv * bn + bn, d0:d_nope],
+                v1_l1,
+                transpose=True,
+            )
+
+        T.gemm(
+            q_nope_l1,
+            k_nope_l1,
+            s_l0c,
+            transpose_B=True,
+            clear_accum=True,
+        )
+        T.gemm(
+            q_rope_l1,
+            k_rope_l1,
+            s_l0c,
+            transpose_B=True,
+            clear_accum=False,
+        )
+        T.dual_copy(s_l0c, S_ub)
+
+        with T.SimdVF():
+            m32 = T.simd.pset(32, "PAT_ALL")
+            m16 = T.simd.pset(16, "PAT_ALL")
+            v_neg_inf = T.simd.vdup(T.float32(-1e38), "float32", mask=m32)
+            v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
+            col_idx = T.simd.vci(kv * bn, "int32")
+            for r in T.serial(rows_per_sid):
+                q_row = q_base + sid * rows_per_sid + r
+                s_idx = q_row % s_dim
+                raw_limit = (
+                    T.min(s_kv, s_idx + s_kv - s_dim + 1)
+                    if is_causal
+                    else s_kv
+                )
+                limit_col = T.if_then_else(q_row < q_rows, raw_limit, 0)
+                valid_mask = T.simd.vcmps(
+                    col_idx, limit_col, mask=m32, op="lt"
+                )
+                s_vec = T.simd.vld(S_ub[r, 0], dist="NORM_B32")
+                s_scaled = T.simd.vmuls(s_vec, scale_val, mask=m32)
+                s_masked = T.simd.vsel(s_scaled, v_neg_inf, valid_mask)
+                m_tile_v = T.simd.vdupv(
+                    T.simd.vcmax(s_masked, mask=m32),
+                    mask=m32,
+                    pos="POS_LOWEST",
+                )
+                m_old_v = T.simd.vld(m_ub[r, 0], dist="BRC_B32")
+                l_old_v = T.simd.vld(l_ub[r, 0], dist="BRC_B32")
+                m_new_v = T.simd.vmax(m_old_v, m_tile_v, mask=m32)
+                m_safe_v = T.simd.vmaxs(
+                    m_new_v, T.float32(-1e30), mask=m32
+                )
+                alpha_raw = T.simd.vexp(
+                    T.simd.vsub(m_old_v, m_safe_v, mask=m32), mask=m32
+                )
+                old_valid = T.simd.vcmps(
+                    m_old_v, T.float32(-1e30), mask=m32, op="gt"
+                )
+                alpha_v = T.simd.vsel(alpha_raw, v_zero, old_valid)
+                p_raw = T.simd.vexp(
+                    T.simd.vsub(s_masked, m_safe_v, mask=m32), mask=m32
+                )
+                new_valid = T.simd.vcmps(
+                    m_new_v, T.float32(-1e30), mask=m32, op="gt"
+                )
+                p_mask = T.simd.pand(valid_mask, new_valid, m32)
+                p_f32 = T.simd.vsel(p_raw, v_zero, p_mask)
+                row_sum_v = T.simd.vdupv(
+                    T.simd.vcadd(p_f32, mask=m32),
+                    mask=m32,
+                    pos="POS_LOWEST",
+                )
+                l_new_v = T.simd.vadd(
+                    T.simd.vmul(l_old_v, alpha_v, mask=m32),
+                    row_sum_v,
+                    mask=m32,
+                )
+                T.simd.vsts(m_ub[r, 0], m_new_v, mask=m32, dist="ONEPT_B32")
+                T.simd.vsts(l_ub[r, 0], l_new_v, mask=m32, dist="ONEPT_B32")
+                T.simd.vsts(
+                    alpha_ub[r, 0], alpha_v, mask=m32, dist="ONEPT_B32"
+                )
+                p_16 = T.simd.vcvt(p_f32, tl_dtype, mask=m16, part=0)
+                T.simd.vsts(
+                    P_ub[r, 0], p_16, mask=m32, dist="PK_B32", extent=64
+                )
+
+        T.dual_copy(P_ub, p_l1)
+        T.gemm(p_l1, v0_l1, o_l0c, transpose_B=True, clear_accum=True)
+        T.dual_copy(o_l0c, O_tmp_ub)
+        with T.SimdVF():
+            m32 = T.simd.pset(32, "PAT_ALL")
+            for r in T.serial(rows_per_sid):
+                alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
+                for c in T.serial(d0_chunks):
+                    off = c * 64
+                    o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
+                    o_tmp = T.simd.vld(O_tmp_ub[r, off], dist="NORM_B32")
+                    o_new = T.simd.vadd(
+                        T.simd.vmul(o_old, alpha_v, mask=m32),
+                        o_tmp,
+                        mask=m32,
+                    )
+                    T.simd.vsts(
+                        O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
+                    )
+
+        if d1 > 0:
+            T.gemm(p_l1, v1_l1, o1_l0c, transpose_B=True, clear_accum=True)
+            T.dual_copy(o1_l0c, O_tmp1_ub)
+            with T.SimdVF():
+                m32 = T.simd.pset(32, "PAT_ALL")
+                for r in T.serial(rows_per_sid):
+                    alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
+                    for c in T.serial(d1_chunks):
+                        off = d0 + c * 64
+                        o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
+                        o_tmp = T.simd.vld(
+                            O_tmp1_ub[r, c * 64], dist="NORM_B32"
+                        )
+                        o_new = T.simd.vadd(
+                            T.simd.vmul(o_old, alpha_v, mask=m32),
+                            o_tmp,
+                            mask=m32,
+                        )
+                        T.simd.vsts(
+                            O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
+                        )
+
     @T.prim_func
     def main(
-        Q_nope: T.Tensor((q_total_rows, d_nope), tl_dtype),
-        Q_rope: T.Tensor((q_total_rows, d_rope), tl_dtype),
+        Q_nope: T.Tensor(q_nope_shape, tl_dtype),
+        Q_rope: T.Tensor(q_rope_shape, tl_dtype),
         K_nope: T.Tensor(k_nope_shape, tl_dtype),
         K_rope: T.Tensor(k_rope_shape, tl_dtype),
         V: T.Tensor(k_nope_shape, tl_dtype),
-        Out: T.Tensor((q_total_rows, d_nope), tl_dtype),
+        Out: T.Tensor(q_nope_shape, tl_dtype),
         scale_val: T.float32,
     ):
         with T.MixedKernel(num_cores, sids=2) as (bx, sid):
@@ -1859,8 +2199,8 @@ def _build_mla_bnsd_gather_func(
             if bm == 128:
                 T.annotate_unlimit_memory("shared")
 
-            s_dim = q_total_rows // (b_dim * n_q)
-            q_rows = s_dim * g_ratio
+            q_rows = q_rows_sym
+            s_dim = q_rows_sym // g_ratio
             m_tiles_per_group = (q_rows + bm - 1) // bm
             total_groups = b_dim * n_kv
             total_m_tiles = total_groups * m_tiles_per_group
@@ -1878,13 +2218,12 @@ def _build_mla_bnsd_gather_func(
                 q_base = mt * bm
 
                 if aligned_group_q:
-                    q_gm_base = group_id * q_rows + q_base
                     T.copy(
-                        Q_nope[q_gm_base : q_gm_base + bm, 0:d_nope],
+                        Q_nope[b_idx, kv_h, q_base : q_base + bm, 0:d_nope],
                         q_nope_l1,
                     )
                     T.copy(
-                        Q_rope[q_gm_base : q_gm_base + bm, 0:d_rope],
+                        Q_rope[b_idx, kv_h, q_base : q_base + bm, 0:d_rope],
                         q_rope_l1,
                     )
                 else:
@@ -1918,9 +2257,14 @@ def _build_mla_bnsd_gather_func(
                     for r in T.serial(rows_per_sid):
                         q_row = q_base + sid * rows_per_sid + r
                         if q_row < q_rows:
-                            gm_r = group_id * q_rows + q_row
-                            T.copy(Q_nope[gm_r, 0:d_nope], q_nope_ub[r, 0:d_nope])
-                            T.copy(Q_rope[gm_r, 0:d_rope], q_rope_ub[r, 0:d_rope])
+                            T.copy(
+                                Q_nope[b_idx, kv_h, q_row, 0:d_nope],
+                                q_nope_ub[r, 0:d_nope],
+                            )
+                            T.copy(
+                                Q_rope[b_idx, kv_h, q_row, 0:d_rope],
+                                q_rope_ub[r, 0:d_rope],
+                            )
 
                     T.dual_copy(q_nope_ub, q_nope_l1)
                     T.dual_copy(q_rope_ub, q_rope_l1)
@@ -1952,153 +2296,32 @@ def _build_mla_bnsd_gather_func(
                 else:
                     kv_limit = max_kv_blocks
 
-                for kv in T.Pipelined(
-                    kv_limit, num_stages=num_stages, annotations=pipe_ann
-                ):
-                    T.copy(
-                        K_nope[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d_nope],
-                        k_nope_l1,
-                    )
-                    T.copy(
-                        K_rope[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d_rope],
-                        k_rope_l1,
-                    )
-                    T.copy(
-                        V[b_idx, kv_h, kv * bn : kv * bn + bn, 0:d0],
-                        v0_l1,
-                        transpose=True,
-                    )
-                    if d1 > 0:
-                        T.copy(
-                            V[b_idx, kv_h, kv * bn : kv * bn + bn, d0:d_nope],
-                            v1_l1,
-                            transpose=True,
+                if num_stages >= 2:
+                    for kv in T.Pipelined(
+                        kv_limit, num_stages=num_stages, annotations=pipe_ann
+                    ):
+                        _kv_step(
+                            kv, K_nope, K_rope, V,
+                            scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+                            k_rope_l1, p_l1, v0_l1, v1_l1,
+                            s_l0c, o_l0c, o1_l0c, S_ub,
+                            P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+                            m_ub, l_ub, alpha_ub, sid,
+                            b_idx, kv_h, q_base, q_rows,
+                            s_dim,
                         )
-
-                    T.gemm(
-                        q_nope_l1,
-                        k_nope_l1,
-                        s_l0c,
-                        transpose_B=True,
-                        clear_accum=True,
-                    )
-                    T.gemm(
-                        q_rope_l1,
-                        k_rope_l1,
-                        s_l0c,
-                        transpose_B=True,
-                        clear_accum=False,
-                    )
-                    T.dual_copy(s_l0c, S_ub)
-
-                    with T.SimdVF():
-                        m32 = T.simd.pset(32, "PAT_ALL")
-                        m16 = T.simd.pset(16, "PAT_ALL")
-                        v_neg_inf = T.simd.vdup(T.float32(-1e38), "float32", mask=m32)
-                        v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
-                        col_idx = T.simd.vci(kv * bn, "int32")
-                        for r in T.serial(rows_per_sid):
-                            q_row = q_base + sid * rows_per_sid + r
-                            s_idx = q_row % s_dim
-                            raw_limit = (
-                                T.min(s_kv, s_idx + s_kv - s_dim + 1)
-                                if is_causal
-                                else s_kv
-                            )
-                            limit_col = T.if_then_else(q_row < q_rows, raw_limit, 0)
-                            valid_mask = T.simd.vcmps(
-                                col_idx, limit_col, mask=m32, op="lt"
-                            )
-                            s_vec = T.simd.vld(S_ub[r, 0], dist="NORM_B32")
-                            s_scaled = T.simd.vmuls(s_vec, scale_val, mask=m32)
-                            s_masked = T.simd.vsel(s_scaled, v_neg_inf, valid_mask)
-                            m_tile_v = T.simd.vdupv(
-                                T.simd.vcmax(s_masked, mask=m32),
-                                mask=m32,
-                                pos="POS_LOWEST",
-                            )
-                            m_old_v = T.simd.vld(m_ub[r, 0], dist="BRC_B32")
-                            l_old_v = T.simd.vld(l_ub[r, 0], dist="BRC_B32")
-                            m_new_v = T.simd.vmax(m_old_v, m_tile_v, mask=m32)
-                            m_safe_v = T.simd.vmaxs(
-                                m_new_v, T.float32(-1e30), mask=m32
-                            )
-                            alpha_raw = T.simd.vexp(
-                                T.simd.vsub(m_old_v, m_safe_v, mask=m32), mask=m32
-                            )
-                            old_valid = T.simd.vcmps(
-                                m_old_v, T.float32(-1e30), mask=m32, op="gt"
-                            )
-                            alpha_v = T.simd.vsel(alpha_raw, v_zero, old_valid)
-                            p_raw = T.simd.vexp(
-                                T.simd.vsub(s_masked, m_safe_v, mask=m32), mask=m32
-                            )
-                            new_valid = T.simd.vcmps(
-                                m_new_v, T.float32(-1e30), mask=m32, op="gt"
-                            )
-                            p_mask = T.simd.pand(valid_mask, new_valid, m32)
-                            p_f32 = T.simd.vsel(p_raw, v_zero, p_mask)
-                            row_sum_v = T.simd.vdupv(
-                                T.simd.vcadd(p_f32, mask=m32),
-                                mask=m32,
-                                pos="POS_LOWEST",
-                            )
-                            l_new_v = T.simd.vadd(
-                                T.simd.vmul(l_old_v, alpha_v, mask=m32),
-                                row_sum_v,
-                                mask=m32,
-                            )
-                            T.simd.vsts(m_ub[r, 0], m_new_v, mask=m32, dist="ONEPT_B32")
-                            T.simd.vsts(l_ub[r, 0], l_new_v, mask=m32, dist="ONEPT_B32")
-                            T.simd.vsts(
-                                alpha_ub[r, 0], alpha_v, mask=m32, dist="ONEPT_B32"
-                            )
-                            p_16 = T.simd.vcvt(p_f32, tl_dtype, mask=m16, part=0)
-                            T.simd.vsts(
-                                P_ub[r, 0], p_16, mask=m32, dist="PK_B32", extent=64
-                            )
-
-                    T.dual_copy(P_ub, p_l1)
-                    T.gemm(p_l1, v0_l1, o_l0c, transpose_B=True, clear_accum=True)
-                    T.dual_copy(o_l0c, O_tmp_ub)
-                    with T.SimdVF():
-                        m32 = T.simd.pset(32, "PAT_ALL")
-                        for r in T.serial(rows_per_sid):
-                            alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
-                            for c in T.serial(d0_chunks):
-                                off = c * 64
-                                o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
-                                o_tmp = T.simd.vld(O_tmp_ub[r, off], dist="NORM_B32")
-                                o_new = T.simd.vadd(
-                                    T.simd.vmul(o_old, alpha_v, mask=m32),
-                                    o_tmp,
-                                    mask=m32,
-                                )
-                                T.simd.vsts(
-                                    O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
-                                )
-
-                    if d1 > 0:
-                        T.gemm(p_l1, v1_l1, o1_l0c, transpose_B=True, clear_accum=True)
-                        T.dual_copy(o1_l0c, O_tmp1_ub)
-                        with T.SimdVF():
-                            m32 = T.simd.pset(32, "PAT_ALL")
-                            for r in T.serial(rows_per_sid):
-                                alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
-                                for c in T.serial(d1_chunks):
-                                    off = d0 + c * 64
-                                    o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
-                                    o_tmp = T.simd.vld(
-                                        O_tmp1_ub[r, c * 64], dist="NORM_B32"
-                                    )
-                                    o_new = T.simd.vadd(
-                                        T.simd.vmul(o_old, alpha_v, mask=m32),
-                                        o_tmp,
-                                        mask=m32,
-                                    )
-                                    T.simd.vsts(
-                                        O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
-                                    )
+                else:
+                    for kv in T.serial(kv_limit):
+                        _kv_step(
+                            kv, K_nope, K_rope, V,
+                            scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+                            k_rope_l1, p_l1, v0_l1, v1_l1,
+                            s_l0c, o_l0c, o1_l0c, S_ub,
+                            P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+                            m_ub, l_ub, alpha_ub, sid,
+                            b_idx, kv_h, q_base, q_rows,
+                            s_dim,
+                        )
 
                 if aligned_group_q and out_tile_rows < rows_per_sid:
                     out_row_blocks = rows_per_sid // out_tile_rows
@@ -2133,15 +2356,15 @@ def _build_mla_bnsd_gather_func(
                                         dist="PK_B32",
                                         extent=64,
                                     )
-                        out_gm_base = (
-                            group_id * q_rows
-                            + q_base
-                            + sid * rows_per_sid
-                            + rb * out_tile_rows
-                        )
+                        out_q_base = q_base + sid * rows_per_sid + rb * out_tile_rows
                         T.copy(
                             out_ub,
-                            Out[out_gm_base : out_gm_base + out_tile_rows, 0:d_nope],
+                            Out[
+                                b_idx,
+                                kv_h,
+                                out_q_base : out_q_base + out_tile_rows,
+                                0:d_nope,
+                            ],
                         )
                 else:
                     with T.SimdVF():
@@ -2175,17 +2398,24 @@ def _build_mla_bnsd_gather_func(
                                 )
 
                     if aligned_group_q:
-                        out_gm_base = group_id * q_rows + q_base + sid * rows_per_sid
+                        out_q_base = q_base + sid * rows_per_sid
                         T.copy(
                             out_ub,
-                            Out[out_gm_base : out_gm_base + rows_per_sid, 0:d_nope],
+                            Out[
+                                b_idx,
+                                kv_h,
+                                out_q_base : out_q_base + rows_per_sid,
+                                0:d_nope,
+                            ],
                         )
                     else:
                         for r in T.serial(rows_per_sid):
                             q_row = q_base + sid * rows_per_sid + r
                             if q_row < q_rows:
-                                out_r = group_id * q_rows + q_row
-                                T.copy(out_ub[r, 0:d_nope], Out[out_r, 0:d_nope])
+                                T.copy(
+                                    out_ub[r, 0:d_nope],
+                                    Out[b_idx, kv_h, q_row, 0:d_nope],
+                                )
 
     return main
 
@@ -2256,20 +2486,190 @@ def _build_mla_prefill_func(
     pipe_ann = {"enable_offset": True} if schedule_mode == "tuned" else None
 
     b_dim = T.dynamic("b_dim")
-    q_total_rows = T.dynamic("q_total_rows")
+    q_rows_sym = T.dynamic("q_rows")
+    s_dim_sym = T.dynamic("s_dim")
     s_kv = T.dynamic("s_kv")
 
+    is_struct_4d = n_kv == 1
+    eff_aligned_group_q = bool(aligned_group_q and is_struct_4d)
+    q_nope_shape = (
+        (b_dim, n_kv, q_rows_sym, d_nope)
+        if is_struct_4d
+        else (b_dim, s_dim_sym, n_kv, g_ratio, d_nope)
+    )
+    q_rope_shape = (
+        (b_dim, n_kv, q_rows_sym, d_rope)
+        if is_struct_4d
+        else (b_dim, s_dim_sym, n_kv, g_ratio, d_rope)
+    )
     k_nope_shape = (b_dim, s_kv, n_kv, d_nope)
     k_rope_shape = (b_dim, s_kv, n_kv, d_rope)
 
+    @T.macro
+    def _kv_step(
+        kv, K_nope, K_rope, V,
+        scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+        k_rope_l1, p_l1, v0_l1, v1_l1,
+        s_l0c, o_l0c, o1_l0c, S_ub,
+        P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+        m_ub, l_ub, alpha_ub, sid,
+        b_idx, kv_h, q_base, q_rows,
+        s_dim,
+    ):
+        """Execute one KV tile step inside the MLA loop."""
+        T.copy(
+            K_nope[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d_nope],
+            k_nope_l1,
+        )
+        T.copy(
+            K_rope[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d_rope],
+            k_rope_l1,
+        )
+        T.copy(
+            V[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d0],
+            v0_l1,
+            transpose=True,
+        )
+        if d1 > 0:
+            T.copy(
+                V[b_idx, kv * bn : kv * bn + bn, kv_h, d0:d_nope],
+                v1_l1,
+                transpose=True,
+            )
+
+        T.gemm(
+            q_nope_l1,
+            k_nope_l1,
+            s_l0c,
+            transpose_B=True,
+            clear_accum=True,
+        )
+        T.gemm(
+            q_rope_l1,
+            k_rope_l1,
+            s_l0c,
+            transpose_B=True,
+            clear_accum=False,
+        )
+        T.dual_copy(s_l0c, S_ub)
+
+        with T.SimdVF():
+            m32 = T.simd.pset(32, "PAT_ALL")
+            m16 = T.simd.pset(16, "PAT_ALL")
+            v_neg_inf = T.simd.vdup(T.float32(-1e38), "float32", mask=m32)
+            v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
+            col_idx = T.simd.vci(kv * bn, "int32")
+            for r in T.serial(rows_per_sid):
+                q_row = q_base + sid * rows_per_sid + r
+                s_idx = q_row // g_ratio
+                raw_limit = (
+                    T.min(s_kv, s_idx + s_kv - s_dim + 1)
+                    if is_causal
+                    else s_kv
+                )
+                limit_col = T.if_then_else(q_row < q_rows, raw_limit, 0)
+                valid_mask = T.simd.vcmps(
+                    col_idx, limit_col, mask=m32, op="lt"
+                )
+                s_vec = T.simd.vld(S_ub[r, 0], dist="NORM_B32")
+                s_scaled = T.simd.vmuls(s_vec, scale_val, mask=m32)
+                s_masked = T.simd.vsel(s_scaled, v_neg_inf, valid_mask)
+                m_tile_v = T.simd.vdupv(
+                    T.simd.vcmax(s_masked, mask=m32),
+                    mask=m32,
+                    pos="POS_LOWEST",
+                )
+                m_old_v = T.simd.vld(m_ub[r, 0], dist="BRC_B32")
+                l_old_v = T.simd.vld(l_ub[r, 0], dist="BRC_B32")
+                m_new_v = T.simd.vmax(m_old_v, m_tile_v, mask=m32)
+                m_safe_v = T.simd.vmaxs(
+                    m_new_v, T.float32(-1e30), mask=m32
+                )
+                alpha_raw = T.simd.vexp(
+                    T.simd.vsub(m_old_v, m_safe_v, mask=m32), mask=m32
+                )
+                old_valid = T.simd.vcmps(
+                    m_old_v, T.float32(-1e30), mask=m32, op="gt"
+                )
+                alpha_v = T.simd.vsel(alpha_raw, v_zero, old_valid)
+                p_raw = T.simd.vexp(
+                    T.simd.vsub(s_masked, m_safe_v, mask=m32), mask=m32
+                )
+                new_valid = T.simd.vcmps(
+                    m_new_v, T.float32(-1e30), mask=m32, op="gt"
+                )
+                p_mask = T.simd.pand(valid_mask, new_valid, m32)
+                p_f32 = T.simd.vsel(p_raw, v_zero, p_mask)
+                row_sum_v = T.simd.vdupv(
+                    T.simd.vcadd(p_f32, mask=m32),
+                    mask=m32,
+                    pos="POS_LOWEST",
+                )
+                l_new_v = T.simd.vadd(
+                    T.simd.vmul(l_old_v, alpha_v, mask=m32),
+                    row_sum_v,
+                    mask=m32,
+                )
+                T.simd.vsts(m_ub[r, 0], m_new_v, mask=m32, dist="ONEPT_B32")
+                T.simd.vsts(l_ub[r, 0], l_new_v, mask=m32, dist="ONEPT_B32")
+                T.simd.vsts(
+                    alpha_ub[r, 0], alpha_v, mask=m32, dist="ONEPT_B32"
+                )
+                p_16 = T.simd.vcvt(p_f32, tl_dtype, mask=m16, part=0)
+                T.simd.vsts(
+                    P_ub[r, 0], p_16, mask=m32, dist="PK_B32", extent=64
+                )
+
+        T.dual_copy(P_ub, p_l1)
+        T.gemm(p_l1, v0_l1, o_l0c, transpose_B=True, clear_accum=True)
+        T.dual_copy(o_l0c, O_tmp_ub)
+        with T.SimdVF():
+            m32 = T.simd.pset(32, "PAT_ALL")
+            for r in T.serial(rows_per_sid):
+                alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
+                for c in T.serial(d0_chunks):
+                    off = c * 64
+                    o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
+                    o_tmp = T.simd.vld(O_tmp_ub[r, off], dist="NORM_B32")
+                    o_new = T.simd.vadd(
+                        T.simd.vmul(o_old, alpha_v, mask=m32),
+                        o_tmp,
+                        mask=m32,
+                    )
+                    T.simd.vsts(
+                        O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
+                    )
+
+        if d1 > 0:
+            T.gemm(p_l1, v1_l1, o1_l0c, transpose_B=True, clear_accum=True)
+            T.dual_copy(o1_l0c, O_tmp1_ub)
+            with T.SimdVF():
+                m32 = T.simd.pset(32, "PAT_ALL")
+                for r in T.serial(rows_per_sid):
+                    alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
+                    for c in T.serial(d1_chunks):
+                        off = d0 + c * 64
+                        o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
+                        o_tmp = T.simd.vld(
+                            O_tmp1_ub[r, c * 64], dist="NORM_B32"
+                        )
+                        o_new = T.simd.vadd(
+                            T.simd.vmul(o_old, alpha_v, mask=m32),
+                            o_tmp,
+                            mask=m32,
+                        )
+                        T.simd.vsts(
+                            O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
+                        )
+
     @T.prim_func
     def main(
-        Q_nope: T.Tensor((q_total_rows, d_nope), tl_dtype),
-        Q_rope: T.Tensor((q_total_rows, d_rope), tl_dtype),
+        Q_nope: T.Tensor(q_nope_shape, tl_dtype),
+        Q_rope: T.Tensor(q_rope_shape, tl_dtype),
         K_nope: T.Tensor(k_nope_shape, tl_dtype),
         K_rope: T.Tensor(k_rope_shape, tl_dtype),
         V: T.Tensor(k_nope_shape, tl_dtype),
-        Out: T.Tensor((q_total_rows, d_nope), tl_dtype),
+        Out: T.Tensor(q_nope_shape, tl_dtype),
         scale_val: T.float32,
     ):
         with T.MixedKernel(num_cores, sids=2) as (bx, sid):
@@ -2289,7 +2689,7 @@ def _build_mla_prefill_func(
                 else T.alloc_l0c((bm, d1_alloc), "float32")
             )
 
-            if not aligned_group_q:
+            if not eff_aligned_group_q:
                 q_nope_ub = T.alloc_shared((rows_per_sid, d_nope), tl_dtype)
                 q_rope_ub = T.alloc_shared((rows_per_sid, d_rope), tl_dtype)
             S_ub = T.alloc_shared((rows_per_sid, bn), "float32")
@@ -2324,7 +2724,7 @@ def _build_mla_prefill_func(
                 l_ub: 1,
                 alpha_ub: 1,
             }
-            if not aligned_group_q:
+            if not eff_aligned_group_q:
                 pinned[q_nope_ub] = 1
                 pinned[q_rope_ub] = 1
             if d1 > 0 and d1 != d0:
@@ -2343,8 +2743,12 @@ def _build_mla_prefill_func(
             if bm == 128:
                 T.annotate_unlimit_memory("shared")
 
-            s_dim = q_total_rows // (b_dim * n_q)
-            q_rows = s_dim * g_ratio
+            if is_struct_4d:
+                q_rows = q_rows_sym
+                s_dim = q_rows_sym // g_ratio
+            else:
+                s_dim = s_dim_sym
+                q_rows = s_dim_sym * g_ratio
             m_tiles_per_group = (q_rows + bm - 1) // bm
             total_groups = b_dim * n_kv
             total_m_tiles = total_groups * m_tiles_per_group
@@ -2361,14 +2765,13 @@ def _build_mla_prefill_func(
                 kv_h = group_id % n_kv
                 q_base = mt * bm
 
-                if aligned_group_q:
-                    q_gm_base = group_id * q_rows + q_base
+                if eff_aligned_group_q:
                     T.copy(
-                        Q_nope[q_gm_base : q_gm_base + bm, 0:d_nope],
+                        Q_nope[b_idx, kv_h, q_base : q_base + bm, 0:d_nope],
                         q_nope_l1,
                     )
                     T.copy(
-                        Q_rope[q_gm_base : q_gm_base + bm, 0:d_rope],
+                        Q_rope[b_idx, kv_h, q_base : q_base + bm, 0:d_rope],
                         q_rope_l1,
                     )
                 else:
@@ -2402,12 +2805,26 @@ def _build_mla_prefill_func(
                     for r in T.serial(rows_per_sid):
                         q_row = q_base + sid * rows_per_sid + r
                         if q_row < q_rows:
-                            s_i = q_row // g_ratio
-                            h_loc = q_row % g_ratio
-                            q_h = kv_h * g_ratio + h_loc
-                            gm_r = (b_idx * s_dim + s_i) * n_q + q_h
-                            T.copy(Q_nope[gm_r, 0:d_nope], q_nope_ub[r, 0:d_nope])
-                            T.copy(Q_rope[gm_r, 0:d_rope], q_rope_ub[r, 0:d_rope])
+                            if is_struct_4d:
+                                T.copy(
+                                    Q_nope[b_idx, kv_h, q_row, 0:d_nope],
+                                    q_nope_ub[r, 0:d_nope],
+                                )
+                                T.copy(
+                                    Q_rope[b_idx, kv_h, q_row, 0:d_rope],
+                                    q_rope_ub[r, 0:d_rope],
+                                )
+                            else:
+                                s_i = q_row // g_ratio
+                                h_loc = q_row % g_ratio
+                                T.copy(
+                                    Q_nope[b_idx, s_i, kv_h, h_loc, 0:d_nope],
+                                    q_nope_ub[r, 0:d_nope],
+                                )
+                                T.copy(
+                                    Q_rope[b_idx, s_i, kv_h, h_loc, 0:d_rope],
+                                    q_rope_ub[r, 0:d_rope],
+                                )
 
                     T.dual_copy(q_nope_ub, q_nope_l1)
                     T.dual_copy(q_rope_ub, q_rope_l1)
@@ -2435,155 +2852,34 @@ def _build_mla_prefill_func(
                 else:
                     kv_limit = max_kv_blocks
 
-                for kv in T.Pipelined(
-                    kv_limit, num_stages=num_stages, annotations=pipe_ann
-                ):
-                    T.copy(
-                        K_nope[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d_nope],
-                        k_nope_l1,
-                    )
-                    T.copy(
-                        K_rope[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d_rope],
-                        k_rope_l1,
-                    )
-                    T.copy(
-                        V[b_idx, kv * bn : kv * bn + bn, kv_h, 0:d0],
-                        v0_l1,
-                        transpose=True,
-                    )
-                    if d1 > 0:
-                        T.copy(
-                            V[b_idx, kv * bn : kv * bn + bn, kv_h, d0:d_nope],
-                            v1_l1,
-                            transpose=True,
+                if num_stages >= 2:
+                    for kv in T.Pipelined(
+                        kv_limit, num_stages=num_stages, annotations=pipe_ann
+                    ):
+                        _kv_step(
+                            kv, K_nope, K_rope, V,
+                            scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+                            k_rope_l1, p_l1, v0_l1, v1_l1,
+                            s_l0c, o_l0c, o1_l0c, S_ub,
+                            P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+                            m_ub, l_ub, alpha_ub, sid,
+                            b_idx, kv_h, q_base, q_rows,
+                            s_dim,
+                        )
+                else:
+                    for kv in T.serial(kv_limit):
+                        _kv_step(
+                            kv, K_nope, K_rope, V,
+                            scale_val, q_nope_l1, q_rope_l1, k_nope_l1,
+                            k_rope_l1, p_l1, v0_l1, v1_l1,
+                            s_l0c, o_l0c, o1_l0c, S_ub,
+                            P_ub, O_tmp_ub, O_tmp1_ub, O_ub,
+                            m_ub, l_ub, alpha_ub, sid,
+                            b_idx, kv_h, q_base, q_rows,
+                            s_dim,
                         )
 
-                    T.gemm(
-                        q_nope_l1,
-                        k_nope_l1,
-                        s_l0c,
-                        transpose_B=True,
-                        clear_accum=True,
-                    )
-                    T.gemm(
-                        q_rope_l1,
-                        k_rope_l1,
-                        s_l0c,
-                        transpose_B=True,
-                        clear_accum=False,
-                    )
-                    T.dual_copy(s_l0c, S_ub)
-
-                    with T.SimdVF():
-                        m32 = T.simd.pset(32, "PAT_ALL")
-                        m16 = T.simd.pset(16, "PAT_ALL")
-                        v_neg_inf = T.simd.vdup(T.float32(-1e38), "float32", mask=m32)
-                        v_zero = T.simd.vdup(T.float32(0.0), "float32", mask=m32)
-                        col_idx = T.simd.vci(kv * bn, "int32")
-                        for r in T.serial(rows_per_sid):
-                            q_row = q_base + sid * rows_per_sid + r
-                            s_idx = q_row // g_ratio
-                            raw_limit = (
-                                T.min(s_kv, s_idx + s_kv - s_dim + 1)
-                                if is_causal
-                                else s_kv
-                            )
-                            limit_col = T.if_then_else(q_row < q_rows, raw_limit, 0)
-                            valid_mask = T.simd.vcmps(
-                                col_idx, limit_col, mask=m32, op="lt"
-                            )
-                            s_vec = T.simd.vld(S_ub[r, 0], dist="NORM_B32")
-                            s_scaled = T.simd.vmuls(s_vec, scale_val, mask=m32)
-                            s_masked = T.simd.vsel(s_scaled, v_neg_inf, valid_mask)
-                            m_tile_v = T.simd.vdupv(
-                                T.simd.vcmax(s_masked, mask=m32),
-                                mask=m32,
-                                pos="POS_LOWEST",
-                            )
-                            m_old_v = T.simd.vld(m_ub[r, 0], dist="BRC_B32")
-                            l_old_v = T.simd.vld(l_ub[r, 0], dist="BRC_B32")
-                            m_new_v = T.simd.vmax(m_old_v, m_tile_v, mask=m32)
-                            m_safe_v = T.simd.vmaxs(
-                                m_new_v, T.float32(-1e30), mask=m32
-                            )
-                            alpha_raw = T.simd.vexp(
-                                T.simd.vsub(m_old_v, m_safe_v, mask=m32), mask=m32
-                            )
-                            old_valid = T.simd.vcmps(
-                                m_old_v, T.float32(-1e30), mask=m32, op="gt"
-                            )
-                            alpha_v = T.simd.vsel(alpha_raw, v_zero, old_valid)
-                            p_raw = T.simd.vexp(
-                                T.simd.vsub(s_masked, m_safe_v, mask=m32), mask=m32
-                            )
-                            new_valid = T.simd.vcmps(
-                                m_new_v, T.float32(-1e30), mask=m32, op="gt"
-                            )
-                            p_mask = T.simd.pand(valid_mask, new_valid, m32)
-                            p_f32 = T.simd.vsel(p_raw, v_zero, p_mask)
-                            row_sum_v = T.simd.vdupv(
-                                T.simd.vcadd(p_f32, mask=m32),
-                                mask=m32,
-                                pos="POS_LOWEST",
-                            )
-                            l_new_v = T.simd.vadd(
-                                T.simd.vmul(l_old_v, alpha_v, mask=m32),
-                                row_sum_v,
-                                mask=m32,
-                            )
-                            T.simd.vsts(m_ub[r, 0], m_new_v, mask=m32, dist="ONEPT_B32")
-                            T.simd.vsts(l_ub[r, 0], l_new_v, mask=m32, dist="ONEPT_B32")
-                            T.simd.vsts(
-                                alpha_ub[r, 0], alpha_v, mask=m32, dist="ONEPT_B32"
-                            )
-                            p_16 = T.simd.vcvt(p_f32, tl_dtype, mask=m16, part=0)
-                            T.simd.vsts(
-                                P_ub[r, 0], p_16, mask=m32, dist="PK_B32", extent=64
-                            )
-
-                    T.dual_copy(P_ub, p_l1)
-                    T.gemm(p_l1, v0_l1, o_l0c, transpose_B=True, clear_accum=True)
-                    T.dual_copy(o_l0c, O_tmp_ub)
-                    with T.SimdVF():
-                        m32 = T.simd.pset(32, "PAT_ALL")
-                        for r in T.serial(rows_per_sid):
-                            alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
-                            for c in T.serial(d0_chunks):
-                                off = c * 64
-                                o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
-                                o_tmp = T.simd.vld(O_tmp_ub[r, off], dist="NORM_B32")
-                                o_new = T.simd.vadd(
-                                    T.simd.vmul(o_old, alpha_v, mask=m32),
-                                    o_tmp,
-                                    mask=m32,
-                                )
-                                T.simd.vsts(
-                                    O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
-                                )
-
-                    if d1 > 0:
-                        T.gemm(p_l1, v1_l1, o1_l0c, transpose_B=True, clear_accum=True)
-                        T.dual_copy(o1_l0c, O_tmp1_ub)
-                        with T.SimdVF():
-                            m32 = T.simd.pset(32, "PAT_ALL")
-                            for r in T.serial(rows_per_sid):
-                                alpha_v = T.simd.vld(alpha_ub[r, 0], dist="BRC_B32")
-                                for c in T.serial(d1_chunks):
-                                    off = d0 + c * 64
-                                    o_old = T.simd.vld(O_ub[r, off], dist="NORM_B32")
-                                    o_tmp = T.simd.vld(
-                                        O_tmp1_ub[r, c * 64], dist="NORM_B32"
-                                    )
-                                    o_new = T.simd.vadd(
-                                        T.simd.vmul(o_old, alpha_v, mask=m32),
-                                        o_tmp,
-                                        mask=m32,
-                                    )
-                                    T.simd.vsts(
-                                        O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
-                                    )
-
-                if aligned_group_q and out_tile_rows < rows_per_sid:
+                if eff_aligned_group_q and out_tile_rows < rows_per_sid:
                     out_row_blocks = rows_per_sid // out_tile_rows
                     for rb in T.serial(out_row_blocks):
                         with T.SimdVF():
@@ -2616,15 +2912,15 @@ def _build_mla_prefill_func(
                                         dist="PK_B32",
                                         extent=64,
                                     )
-                        out_gm_base = (
-                            group_id * q_rows
-                            + q_base
-                            + sid * rows_per_sid
-                            + rb * out_tile_rows
-                        )
+                        out_q_base = q_base + sid * rows_per_sid + rb * out_tile_rows
                         T.copy(
                             out_ub,
-                            Out[out_gm_base : out_gm_base + out_tile_rows, 0:d_nope],
+                            Out[
+                                b_idx,
+                                kv_h,
+                                out_q_base : out_q_base + out_tile_rows,
+                                0:d_nope,
+                            ],
                         )
                 else:
                     with T.SimdVF():
@@ -2657,21 +2953,33 @@ def _build_mla_prefill_func(
                                     extent=64,
                                 )
 
-                    if aligned_group_q:
-                        out_gm_base = group_id * q_rows + q_base + sid * rows_per_sid
+                    if eff_aligned_group_q:
+                        out_q_base = q_base + sid * rows_per_sid
                         T.copy(
                             out_ub,
-                            Out[out_gm_base : out_gm_base + rows_per_sid, 0:d_nope],
+                            Out[
+                                b_idx,
+                                kv_h,
+                                out_q_base : out_q_base + rows_per_sid,
+                                0:d_nope,
+                            ],
                         )
                     else:
                         for r in T.serial(rows_per_sid):
                             q_row = q_base + sid * rows_per_sid + r
                             if q_row < q_rows:
-                                s_i = q_row // g_ratio
-                                h_loc = q_row % g_ratio
-                                q_h = kv_h * g_ratio + h_loc
-                                out_r = (b_idx * s_dim + s_i) * n_q + q_h
-                                T.copy(out_ub[r, 0:d_nope], Out[out_r, 0:d_nope])
+                                if is_struct_4d:
+                                    T.copy(
+                                        out_ub[r, 0:d_nope],
+                                        Out[b_idx, kv_h, q_row, 0:d_nope],
+                                    )
+                                else:
+                                    s_i = q_row // g_ratio
+                                    h_loc = q_row % g_ratio
+                                    T.copy(
+                                        out_ub[r, 0:d_nope],
+                                        Out[b_idx, s_i, kv_h, h_loc, 0:d_nope],
+                                    )
 
     return main
 
@@ -3377,6 +3685,27 @@ __global__ __vector__ void mla_fast_combine(
 """
 
 
+def _cann_include_flags() -> list[str]:
+    asc_home = os.environ.get("ASCEND_HOME_PATH", "")
+    if not asc_home:
+        return []
+    flags: list[str] = []
+    for sub in ("include", "x86_64-linux/include", "aarch64-linux/include", "runtime/include"):
+        asc_inc = os.path.join(asc_home, sub)
+        flag = f"-I{asc_inc}"
+        if os.path.isdir(asc_inc) and flag not in flags:
+            flags.append(flag)
+    return flags
+
+
+def _merge_compile_flags(flags: list[str] | tuple[str, ...]) -> list[str] | None:
+    merged = [str(f) for f in flags]
+    for flag in _cann_include_flags():
+        if flag not in merged:
+            merged.append(flag)
+    return merged or None
+
+
 def _build_mla_trackb_callable(
     n_q: int,
     d_nope: int,
@@ -3406,11 +3735,7 @@ extern "C" int launch_mla_trackb(
 """
     )
     tl_inc = str(Path(tilelang.__file__).resolve().parent.parent / "src")
-    asc_home = os.environ.get("ASCEND_HOME_PATH", "")
-    asc_inc = os.path.join(asc_home, "include") if asc_home else ""
-    opts = [f"-I{tl_inc}"]
-    if asc_inc and os.path.isdir(asc_inc):
-        opts.append(f"-I{asc_inc}")
+    opts = [f"-I{tl_inc}", *_cann_include_flags()]
     opts.extend(PURE_SIMDVF_UBUF_FLAGS)
     so_dir = tempfile.mkdtemp(prefix="mla_trackb_")
     so_path = os.path.join(so_dir, "mla_trackb.so")
@@ -3586,7 +3911,7 @@ def _get_kernel(
                     schedule_mode,
                     **extra_bk,
                 )
-        flags_arg = list(flags_tuple) if flags_tuple else None
+        flags_arg = _merge_compile_flags(flags_tuple)
         compiled = tilelang.compile(
             prog,
             target="ascend",
@@ -3629,7 +3954,7 @@ def _get_combine_kernel(
                 num_kv_splits=splits,
                 **extra_ck,
             )
-        flags_arg = list(flags_tuple) if flags_tuple else None
+        flags_arg = _merge_compile_flags(flags_tuple)
         compiled = tilelang.compile(
             prog,
             target="ascend",
@@ -3686,34 +4011,6 @@ def mla(
         and inputLayout in ("BSND", "BNSD")
         and getattr(q_nope, "is_npu", False)
     )
-
-    if (
-        not default_use_trackb
-        and schedule_mode == "tuned"
-        and inputLayout == "BNSD"
-        and n_kv == 1
-        and s_dim > 1
-        and (b_dim * n_q * s_dim) <= 32768
-    ):
-        q_nope_bsnd = q_nope.transpose(1, 2).contiguous()
-        q_rope_bsnd = q_rope.transpose(1, 2).contiguous()
-        k_nope_bsnd = k_nope.contiguous().view(b_dim, s_kv, 1, d_nope)
-        k_rope_bsnd = k_rope.contiguous().view(b_dim, s_kv, 1, d_rope)
-        v_bsnd = v.contiguous().view(b_dim, s_kv, 1, d_nope)
-        out_bsnd = mla(
-            q_nope_bsnd,
-            q_rope_bsnd,
-            k_nope_bsnd,
-            k_rope_bsnd,
-            v_bsnd,
-            numKVHeads=numKVHeads,
-            scaleValue=scaleValue,
-            inputLayout="BSND",
-            is_causal=is_causal,
-            schedule_mode=schedule_mode,
-            num_kv_splits_override=num_kv_splits_override,
-        )
-        return out_bsnd.transpose(1, 2).contiguous()
 
     if inputLayout == "BNSD":
         selector_fn, builder_fn = _select_mla_bnsd_config, _build_mla_bnsd_gather_func
@@ -3827,7 +4124,16 @@ def mla(
             compile_flags=compile_flags,
             extra_builder_kwargs=extra_builder_kwargs,
         )
-        out_flat = kernel(q_n_flat, q_r_flat, k_n_contig, k_r_contig, v_contig, scale)
+        if use_trackb:
+            q_n_in, q_r_in = q_n_flat, q_r_flat
+        elif inputLayout == "BNSD" or n_kv == 1:
+            q_rows_group = s_dim * (n_q // n_kv)
+            q_n_in = q_nope.contiguous().view(b_dim, n_kv, q_rows_group, d_nope)
+            q_r_in = q_rope.contiguous().view(b_dim, n_kv, q_rows_group, d_rope)
+        else:
+            q_n_in = q_nope.contiguous().view(b_dim, s_dim, n_kv, n_q // n_kv, d_nope)
+            q_r_in = q_rope.contiguous().view(b_dim, s_dim, n_kv, n_q // n_kv, d_rope)
+        out_flat = kernel(q_n_in, q_r_in, k_n_contig, k_r_contig, v_contig, scale)
     else:
         o_partial, lse_partial = _get_split_kv_workspace(
             q_nope.device,

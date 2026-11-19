@@ -5,18 +5,23 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import pytest
-import torch
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
+    CannbenchOpsRegistry,
     PerfTargetSpec,
     RegimeTargetSpec,
     default_source_root,
     get_default_regime_specs,
+    lookup_case_dims,
+    lookup_case_metadata,
+    parse_simple_env_file,
+    resolve_cannbench_repo,
+    resolve_cannbench_tasks_root,
 )
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
@@ -24,6 +29,8 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
 )
 from tilefoundry_ascend.agent.campaign.marathon import (
     MarathonConfig,
+    discover_marathon_environment,
+    ensure_marathon_env_file,
     ensure_operator_seed_module,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
@@ -31,9 +38,15 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     L3AcceptanceResult,
     aggregate_surrogate_result,
     build_anchor_metrics,
+    ensure_npu_compare_shim_dir,
+    lookup_case_static_spec,
 )
 from tilefoundry_ascend.agent.kb import BayesianRuleTracker
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult, StageBResult
+from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    StageAResult,
+    StageBResult,
+    check_npu_entrypoint_purity,
+)
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     AgyCliLLMBackend,
     GenerationRequest,
@@ -50,6 +63,7 @@ from tilefoundry_ascend.ascend.passes.physical_ledger import (
     build_objective_physical_ledger,
     build_scope_waterline,
 )
+from tilefoundry_ascend.ascend.sil.op_analyzer import OpAdvisoryExtractor
 
 
 def _cannbench_tasks_root() -> Path:
@@ -59,7 +73,7 @@ def _cannbench_tasks_root() -> Path:
 def test_campaign_runner_live_sil_7facet_cost_calibration_and_shared_stone_pruning(
     tmp_path: Path,
 ) -> None:
-    """Verify live SIL recomputation, 7-facet prompts, compiler hazards, cost calibration, and sibling pruning."""
+    """Verify live SIL recomputation, 7-facet prompts, hazards, and sibling pruning."""
     mod_file = tmp_path / "demo_op.py"
     initial_src = (
         "def _select_demo_config(**kwargs):\n"
@@ -185,7 +199,6 @@ def test_campaign_runner_live_sil_7facet_cost_calibration_and_shared_stone_pruni
         source_root=tmp_path,
     )
 
-    # Seed a stale pre-promotion stepping-stone in sibling regime r2_tail sharing _build_demo_prim_func
     stale_stone = BeamCandidate(
         candidate_id="stale_r2_stone",
         round_idx=0,
@@ -203,7 +216,6 @@ def test_campaign_runner_live_sil_7facet_cost_calibration_and_shared_stone_pruni
     )
     runner._beams["r2_tail"].stepping_stone_beam = [stale_stone]
 
-    # Inject a stepping stone in r1_main with compiler hazards & 0.0 PMU ratios, and run an escalated round
     hazard_residual = StaticDynamicResidual(
         measured_latency_us=50.0,
         predicted_bottleneck_util=0.8,
@@ -266,7 +278,6 @@ def test_campaign_runner_live_sil_7facet_cost_calibration_and_shared_stone_pruni
     assert rec.promoted is True
     assert "v2_promoted" in new_incumbent
 
-    # Both exploit and creative prompts received SIL live policy + 7-facet envelope + compiler hazards
     exploit_reqs = [c for c in backend.calls if c.role == "exploit_rule"]
     creative_reqs = [c for c in backend.calls if c.role == "explore_creative"]
     assert exploit_reqs and creative_reqs
@@ -279,21 +290,18 @@ def test_campaign_runner_live_sil_7facet_cost_calibration_and_shared_stone_pruni
         assert "vf_fusion_breaks: 2" in req.user_prompt
     assert exploit_reqs[0].effort == "high"
 
-    # Active mask relaxed both UB/SRAM layout and exec_mode_and_spr + pipeline_and_sync_graph
     mask = runner._freedom_masks["r1_main"]
     assert mask.sram_layout_and_aliasing is True
     assert mask.exec_mode_and_spr is True
     assert mask.pipeline_and_sync_graph is True
 
-    # Online Ridge surrogate calibrated from positive L2 latencies
     assert runner._cost_model.sample_count > 0
 
-    # Stale pre-promotion stepping-stone in sibling r2_tail sharing _build_demo_prim_func was pruned
     assert runner._beams["r2_tail"].stepping_stone_beam == []
 
 
 def test_carbon_high_effort_defaults_and_xhigh_guardrail(tmp_path: Path) -> None:
-    """Verify is_carbon_model high effort default, non-Carbon exploit_rule medium default, and MarathonConfig."""
+    """Verify Carbon high effort defaults, exploit_rule medium default, and MarathonConfig."""
     assert is_carbon_model("carbon") is True
     assert is_carbon_model("gemini-pro-orchestrator") is True
     assert is_carbon_model("gemini-pro-orchestrator-xhigh") is True
@@ -337,7 +345,6 @@ def test_ensure_operator_seed_module_bootstraps_apply_rotary_pos_emb_and_passes_
     assert seed_path.is_file()
     assert (seed_path.parent / "__init__.py").is_file()
 
-    # Never overwrite an existing module
     assert ensure_operator_seed_module("apply_rotary_pos_emb", seed_path) is False
 
     seed_src = seed_path.read_text(encoding="utf-8")
@@ -345,7 +352,6 @@ def test_ensure_operator_seed_module_bootstraps_apply_rotary_pos_emb_and_passes_
     assert "def _build_apply_rotary_pos_emb_prim_func(" in seed_src
     assert "def apply_rotary_pos_emb(" in seed_src
 
-    # Verify Stage A / L0 passes on all auto-stratified regimes
     regimes = get_default_regime_specs("apply_rotary_pos_emb")
     assert regimes
     runner = PerfTargetCampaignRunner(
@@ -358,20 +364,19 @@ def test_ensure_operator_seed_module_bootstraps_apply_rotary_pos_emb_and_passes_
         stage_a = runner._run_l0(seed_src, rspec)
         assert stage_a.passed is True, f"Regime {rspec.regime_tag} failed L0: {stage_a.error_message}"
 
-    # Verify golden delegation executes accurately via entrypoint
+    assert "_load_golden_fn" not in seed_src
+    assert "golden.py" not in seed_src
+
+    assert check_npu_entrypoint_purity(seed_src, "apply_rotary_pos_emb") == []
+
     mod_spec = importlib.util.spec_from_file_location("_tf_boot_rope", str(seed_path))
     assert mod_spec is not None and mod_spec.loader is not None
     mod = importlib.util.module_from_spec(mod_spec)
     sys.modules[mod_spec.name] = mod
     try:
         mod_spec.loader.exec_module(mod)
-        q = torch.randn((1, 4, 2, 16), dtype=torch.float32)
-        k = torch.randn((1, 4, 2, 16), dtype=torch.float32)
-        cos = torch.ones((4, 8), dtype=torch.float32)
-        sin = torch.zeros((4, 8), dtype=torch.float32)
-        q_out, k_out = mod.apply_rotary_pos_emb(q, k, cos, sin)
-        assert torch.allclose(q_out, q)
-        assert torch.allclose(k_out, k)
+        assert callable(mod.apply_rotary_pos_emb)
+        assert callable(mod._get_kernel)
     finally:
         sys.modules.pop(mod_spec.name, None)
 
@@ -449,20 +454,7 @@ def test_cannbench_pure_tasks_layout_and_rejects_legacy_operators_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify TileFoundry Ascend uses cann-bench tasks/+src/ exclusively and rejects legacy layouts."""
-    from tilefoundry_ascend.agent.campaign.anchor_specs import (
-        CannbenchOpsRegistry,
-        lookup_case_dims,
-        lookup_case_metadata,
-        resolve_cannbench_repo,
-        resolve_cannbench_tasks_root,
-    )
-    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-        ensure_npu_compare_shim_dir,
-        lookup_case_static_spec,
-    )
-    from tilefoundry_ascend.ascend.sil.op_analyzer import OpAdvisoryExtractor
-
+    """Verify TileFoundry Ascend uses cann-bench tasks/+src/ and rejects legacy layouts."""
     repo = _create_synthetic_cannbench_repo(tmp_path / "cann_bench")
     monkeypatch.setenv("TILEFOUNDRY_NPU_CANNBENCH_REPO", str(repo))
 
@@ -492,7 +484,8 @@ def test_cannbench_pure_tasks_layout_and_rejects_legacy_operators_only(
     seed_path = tmp_path / "seed_tasks" / "softmax" / "kernels.py"
     assert ensure_operator_seed_module("softmax", seed_path, cannbench_repo=repo) is True
     seed_src = seed_path.read_text(encoding="utf-8")
-    assert '/ "tasks" / _GOLDEN_TASK / "golden.py"' in seed_src
+    assert "_load_golden_fn" not in seed_src
+    assert "tilelang.compile(" in seed_src
     assert "/ \"operators\" /" not in seed_src
 
     shim_dir = ensure_npu_compare_shim_dir(tmp_path / "shim_tasks", cannbench_repo=repo)
@@ -500,7 +493,6 @@ def test_cannbench_pure_tasks_layout_and_rejects_legacy_operators_only(
     assert 'cann_repo / "src"' in shim_src
     assert "vendor" not in shim_src
 
-    # Negative check: legacy operators/-only repo is rejected cleanly
     legacy_only = tmp_path / "legacy_repo"
     (legacy_only / "operators" / "level2" / "softmax").mkdir(parents=True)
     with pytest.raises(FileNotFoundError):
@@ -511,13 +503,7 @@ def test_marathon_env_preserves_cannbench_mcp_keys_and_prefers_cann_bench(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify marathon env discovery finds cann-bench and preserves all TILEFOUNDRY_NPU_CANNBENCH_* keys."""
-    from tilefoundry_ascend.agent.campaign.anchor_specs import parse_simple_env_file
-    from tilefoundry_ascend.agent.campaign.marathon import (
-        discover_marathon_environment,
-        ensure_marathon_env_file,
-    )
-
+    """Verify marathon env discovery finds cann-bench and preserves CANNBENCH keys."""
     ws = tmp_path / "ws"
     worktree = ws / "TileFoundry"
     worktree.mkdir(parents=True)

@@ -20,7 +20,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
-    DEFAULT_REGIME_SPECS,
     AnchorCaseSpec,
     PerfTargetSpec,
     RegimeTargetSpec,
@@ -32,6 +31,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     get_default_perf_target,
     get_default_regime_specs,
     get_input_domain_envelope,
+    get_operator_entrypoint,
     get_operator_module_relpath,
     lookup_case_dims,
     lookup_case_metadata,
@@ -80,6 +80,7 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     extract_python_dsl,
     sanitize_effort,
 )
+from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     CREATIVE_FOCUS_HINTS,
     build_prescreen_summary_from_kwargs,
@@ -95,7 +96,6 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     rank_stage_a_candidates_with_cost_model,
 )
-from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
 from tilefoundry_ascend.agent.router.capability_gate import evaluate_track_escalation
 from tilefoundry_ascend.agent.router.isa_gap_scanner import scan_tilelang_pipe_gaps
 from tilefoundry_ascend.ascend.cost_model import (
@@ -617,18 +617,32 @@ def _func_line_span(node: ast.FunctionDef) -> tuple[int, int]:
     return start, end
 
 
-def _other_regime_forbidden_symbols(regime_spec: RegimeTargetSpec) -> set[str]:
+def _resolve_operator_entrypoint_safe(operator_name: str) -> str:
+    try:
+        return get_operator_entrypoint(operator_name)
+    except (KeyError, FileNotFoundError):
+        return str(operator_name).rsplit("/", 1)[-1].strip()
+
+
+def _other_regime_forbidden_symbols(
+    regime_spec: RegimeTargetSpec,
+    *,
+    operator_entrypoint: str = "",
+    sibling_specs: Sequence[RegimeTargetSpec] = (),
+) -> set[str]:
     forbidden: set[str] = set(_FORBIDDEN_SLICE_SYMBOLS)
+    if operator_entrypoint:
+        forbidden.add(operator_entrypoint)
+    forbidden.add("kernel")
     own_editable = set(regime_spec.editable_symbols)
-    for specs in DEFAULT_REGIME_SPECS.values():
-        for spec in specs:
-            if spec.regime_tag == regime_spec.regime_tag:
-                continue
-            for sym in spec.editable_symbols:
-                if sym not in own_editable:
-                    forbidden.add(sym)
-            if spec.config_selector_fn and spec.config_selector_fn not in own_editable:
-                forbidden.add(spec.config_selector_fn)
+    for spec in sibling_specs:
+        if spec.regime_tag == regime_spec.regime_tag:
+            continue
+        for sym in spec.editable_symbols:
+            if sym not in own_editable:
+                forbidden.add(sym)
+        if spec.config_selector_fn and spec.config_selector_fn not in own_editable:
+            forbidden.add(spec.config_selector_fn)
     return forbidden
 
 
@@ -781,24 +795,24 @@ def apply_ast_patch(
     """Robust SEARCH/REPLACE patcher using Python AST anchors."""
     orig_tree = ast.parse(module_source)
     cand_tree = ast.parse(candidate_dsl)
-    
+
     cand_node = _find_top_level_func(cand_tree, (target_func,))
     if cand_node is None:
         raise ValueError(f"Candidate source must define function {target_func!r}.")
-    
+
     cand_lines = candidate_dsl.splitlines(keepends=True)
     c_start, c_end = _func_line_span(cand_node)
     replacement = "".join(cand_lines[c_start - 1 : c_end])
     if not replacement.endswith("\n"):
         replacement += "\n"
-        
+
     orig_node = _find_top_level_func(orig_tree, (target_func,))
     if orig_node is None:
         raise ValueError(f"Original module missing target function {target_func!r}.")
-        
+
     o_start, o_end = _func_line_span(orig_node)
     orig_lines = module_source.splitlines(keepends=True)
-    
+
     patched = "".join([*orig_lines[: o_start - 1], replacement, *orig_lines[o_end:]])
     ast.parse(patched)
     return patched
@@ -848,6 +862,9 @@ def patch_regime_into_module(
     module_source: str,
     regime_or_func: RegimeTargetSpec | str,
     candidate_raw_source: str,
+    *,
+    operator_entrypoint: str = "",
+    sibling_specs: Sequence[RegimeTargetSpec] = (),
 ) -> str:
     """Splice single-function or partial/full multi-symbol regime slice into module_source."""
     candidate_dsl = extract_python_dsl(candidate_raw_source)
@@ -882,7 +899,14 @@ def patch_regime_into_module(
     cand_symbols: list[_TopLevelSymbol] = []
     cand_ast_by_name: dict[str, ast.stmt] = {}
     seen_cand: set[str] = set()
-    forbidden = _other_regime_forbidden_symbols(regime_spec)
+    forbidden = _other_regime_forbidden_symbols(
+        regime_spec,
+        operator_entrypoint=operator_entrypoint,
+        sibling_specs=sibling_specs,
+    )
+    for sym_name in orig_by_name:
+        if sym_name not in editable_set and not (prefix and sym_name.startswith(prefix)):
+            forbidden.add(sym_name)
 
     for node in cand_tree.body:
         start, end = _stmt_line_span(node)
@@ -1451,12 +1475,26 @@ class PerfTargetCampaignRunner:
         if splits <= 1 and not modified:
             return None
         combine_splits = splits if splits > 1 else 4
-        combine_kwargs: dict[str, object] = {
-            "d_nope": int(resolved.builder_kwargs.get("d_nope", 512) or 512),
-            "tl_dtype": str(resolved.builder_kwargs.get("tl_dtype", "float16")),
+        merged_kwargs: dict[str, object] = {
+            **regime_spec.sample_builder_kwargs,
+            **resolved.builder_kwargs,
             "num_kv_splits": combine_splits,
             **resolved.combine_kwargs,
         }
+        try:
+            mod_tree = ast.parse(module_source)
+            fn_node = _find_top_level_func(mod_tree, (combine_fn,))
+        except SyntaxError:
+            fn_node = None
+        if fn_node is not None and fn_node.args.kwarg is None:
+            accepted = {
+                *(a.arg for a in fn_node.args.posonlyargs),
+                *(a.arg for a in fn_node.args.args),
+                *(a.arg for a in fn_node.args.kwonlyargs),
+            }
+            combine_kwargs = {k: v for k, v in merged_kwargs.items() if k in accepted}
+        else:
+            combine_kwargs = merged_kwargs
         return combine_fn, combine_kwargs
 
     def _compile_trackb_stage_b(self, cpp_source: str) -> StageBResult:
@@ -2675,6 +2713,10 @@ class PerfTargetCampaignRunner:
                     incumbent_source,
                     regime_spec,
                     stone.dsl_source,
+                    operator_entrypoint=_resolve_operator_entrypoint_safe(
+                        self._config.operator_name
+                    ),
+                    sibling_specs=self._regime_specs,
                 )
                 l0_probe = self._run_l0(stone_patched, regime_spec)
                 if not l0_probe.passed:
@@ -3083,7 +3125,10 @@ class PerfTargetCampaignRunner:
                 ub_overflow=ub_overflow,
             )
             self._freedom_masks[regime_spec.regime_tag] = active_mask
-            current_tier = str(live_plan.policy.get("backend_tier", "tilelang_dsl"))
+            if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb"):
+                current_tier = "ascendc_template"
+            else:
+                current_tier = str(live_plan.policy.get("backend_tier", "tilelang_dsl"))
             if current_tier not in ("tilelang_dsl", "inline_ascendc_vf", "ascendc_template"):
                 current_tier = "tilelang_dsl"
             sf_ctx = (
@@ -3326,7 +3371,13 @@ class PerfTargetCampaignRunner:
             l0_l1_checks = await run_l0_l1_round_filter(
                 raw_candidates,
                 patch_fn=lambda snip: patch_regime_into_module(
-                    parent_module_source, regime_spec, snip
+                    parent_module_source,
+                    regime_spec,
+                    snip,
+                    operator_entrypoint=_resolve_operator_entrypoint_safe(
+                        self._config.operator_name
+                    ),
+                    sibling_specs=self._regime_specs,
                 ),
                 l0_checker=_candidate_l0_check,
                 l1_compiler=lambda mod_src: self._run_l1(mod_src, regime_spec),

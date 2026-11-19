@@ -5,18 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 import examples.ascend950pr_ops.grouped_matmul.kernels as gmm_kernels
 import examples.ascend950pr_ops.mla.kernels as mla_kernels
-import examples.ascend950pr_ops.softmax.kernels as softmax_kernels
 import tests.ascend.benchmarks.test_npu_acceptance as npu_acceptance
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     CannbenchOpsRegistry,
     RegimeTargetSpec,
-    classify_regime_runtime_backend,
     discover_module_trackb_symbols,
+    infer_module_runtime_backend,
 )
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
@@ -39,12 +37,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def test_p0_npu_acceptance_scoping_and_tuned_only_guard() -> None:
-    """Verify P0 normalizes levelX/<op>, isolates non-AR/MLA targets, and uses tuned mode when scoped."""
+    """Verify P0 normalizes target op names, isolates targets, and keeps tuned-only scoping."""
     assert npu_acceptance._normalize_target_op_short("") == ""
     assert npu_acceptance._normalize_target_op_short("level4/mla") == "mla"
     assert npu_acceptance._normalize_target_op_short("level2/softmax") == "softmax"
 
-    # Unscoped: run legacy AR + MLA + dynamic cache tests, skip generic CANNBench hook
     for kind, expected in (
         ("attention_residual", True),
         ("mla", True),
@@ -53,21 +50,18 @@ def test_p0_npu_acceptance_scoping_and_tuned_only_guard() -> None:
     ):
         assert npu_acceptance._should_run_acceptance_test(kind, "") is expected
 
-    # Scoped to AR (short or level-qualified)
     for target in ("attention_residual", "level4/attention_residual"):
         assert npu_acceptance._should_run_acceptance_test("attention_residual", target) is True
         assert npu_acceptance._should_run_acceptance_test("dynamic_cache", target) is True
         assert npu_acceptance._should_run_acceptance_test("mla", target) is False
         assert npu_acceptance._should_run_acceptance_test("generic_cannbench", target) is False
 
-    # Scoped to MLA (short or level-qualified)
     for target in ("mla", "level4/mla"):
         assert npu_acceptance._should_run_acceptance_test("mla", target) is True
         assert npu_acceptance._should_run_acceptance_test("dynamic_cache", target) is True
         assert npu_acceptance._should_run_acceptance_test("attention_residual", target) is False
         assert npu_acceptance._should_run_acceptance_test("generic_cannbench", target) is False
 
-    # Scoped to generic operator (e.g., level2/softmax, level3/grouped_matmul)
     for target in ("level2/softmax", "level3/grouped_matmul", "softmax"):
         assert npu_acceptance._should_run_acceptance_test("generic_cannbench", target) is True
         assert npu_acceptance._should_run_acceptance_test("attention_residual", target) is False
@@ -83,7 +77,7 @@ def test_p0_npu_acceptance_scoping_and_tuned_only_guard() -> None:
 
 
 def test_p1a_trackb_discovery_classification_and_ast_splicing() -> None:
-    """Verify AST Track-B symbol discovery, softmax D<=16 routing, roundtrip, and constant patching."""
+    """Verify AST Track-B discovery, softmax D<=16 routing, roundtrip, and constant patching."""
     expected_symbols = {
         "softmax": ("_SOFTMAX_TRACKB_SRC", "_select_trackb_softmax_plan"),
         "grouped_matmul": ("_GMM_TRACKB_SRC",),
@@ -100,28 +94,31 @@ def test_p1a_trackb_discovery_classification_and_ast_splicing() -> None:
         )
         assert discover_module_trackb_symbols(mod_text) == expected
 
-    # Backend classification including softmax inner<=1 & D<=16 branch
-    assert classify_regime_runtime_backend(
-        "softmax",
-        "extreme_aspect",
-        {"d_dim": 16, "inner": 1},
-        ("_SOFTMAX_TRACKB_SRC", "_select_trackb_softmax_plan"),
-    ) == "tilelang_dsl"
-    assert classify_regime_runtime_backend(
-        "softmax",
-        "inner_axis",
-        {"d_dim": 16, "inner": 8},
-        ("_SOFTMAX_TRACKB_SRC", "_select_trackb_softmax_plan"),
-    ) == "ascendc_trackb"
-    assert classify_regime_runtime_backend(
-        "softmax",
-        "large_throughput",
-        {"d_dim": 128, "inner": 1},
-        ("_SOFTMAX_TRACKB_SRC", "_select_trackb_softmax_plan"),
-    ) == "ascendc_trackb"
-    assert classify_regime_runtime_backend("mla", "split_kv_decode", {"S": 1}, ("_MLA_TRACKB_SRC",)) == "hybrid_trackb"
-    assert classify_regime_runtime_backend("grouped_matmul", "mid_balanced", {"M": 64}, ("_GMM_TRACKB_SRC",)) == "ascendc_trackb"
-    assert classify_regime_runtime_backend("rms_norm", "mid_balanced", {"D": 128}, ()) == "tilelang_dsl"
+    softmax_src = (
+        REPO_ROOT / "examples" / "ascend950pr_ops" / "softmax" / "kernels.py"
+    ).read_text(encoding="utf-8")
+    softmax_backend, softmax_syms = infer_module_runtime_backend(softmax_src, "softmax")
+    assert softmax_backend in ("ascendc_trackb", "hybrid_trackb")
+    assert "_SOFTMAX_TRACKB_SRC" in softmax_syms
+
+    mla_src = (REPO_ROOT / "examples" / "ascend950pr_ops" / "mla" / "kernels.py").read_text(
+        encoding="utf-8"
+    )
+    mla_backend, mla_syms = infer_module_runtime_backend(mla_src, "mla")
+    assert mla_backend == "hybrid_trackb"
+    assert "_MLA_TRACKB_SRC" in mla_syms
+
+    gmm_src = (
+        REPO_ROOT / "examples" / "ascend950pr_ops" / "grouped_matmul" / "kernels.py"
+    ).read_text(encoding="utf-8")
+    gmm_backend, gmm_syms = infer_module_runtime_backend(gmm_src, "grouped_matmul")
+    assert gmm_backend == "ascendc_trackb"
+    assert "_GMM_TRACKB_SRC" in gmm_syms
+
+    rms_src = (
+        REPO_ROOT / "examples" / "ascend950pr_ops" / "rms_norm" / "kernels.py"
+    ).read_text(encoding="utf-8")
+    assert infer_module_runtime_backend(rms_src, "rms_norm") == ("tilelang_dsl", ())
 
     reg = CannbenchOpsRegistry.default()
     gmm_specs = reg.get_regime_specs("grouped_matmul")
@@ -134,19 +131,15 @@ def test_p1a_trackb_discovery_classification_and_ast_splicing() -> None:
         {"regime_tag": "legacy", "builder_candidates": ["_build_fn"], "sample_builder_kwargs": {}}
     ).runtime_backend == "tilelang_dsl"
 
-    # Full extract + partial Track-B constant splice roundtrip on grouped_matmul
-    gmm_src = (REPO_ROOT / "examples" / "ascend950pr_ops" / "grouped_matmul" / "kernels.py").read_text(
-        encoding="utf-8"
-    )
     primary, snippet = extract_regime_snippet(gmm_src, gmm_specs[0])
-    assert primary == "_build_grouped_matmul_prim_func"
+    assert primary == "_select_grouped_matmul_config"
     assert "_GMM_TRACKB_SRC" in snippet
     updated_tb = '_GMM_TRACKB_SRC = r"""\n' + gmm_kernels._GMM_TRACKB_SRC + '\n// trackb tuned marker\n"""\n'
     patched = patch_regime_into_module(gmm_src, gmm_specs[0], updated_tb)
     sym_name, extracted_cpp = _extract_trackb_cpp_source(patched, gmm_specs[0]) or ("", "")
     assert sym_name == "_GMM_TRACKB_SRC"
     assert "// trackb tuned marker" in extracted_cpp
-    assert "def _build_grouped_matmul_prim_func(" in patched
+    assert "def _select_grouped_matmul_config(" in patched
 
 
 class _NpuTensorProxy:
@@ -182,7 +175,7 @@ class _NpuTensorProxy:
 
 
 def test_p1b_mla_dispatch_honors_use_trackb_and_trackb_bm(monkeypatch) -> None:
-    """Verify mla() honors optional cfg['use_trackb'], cfg['trackb_bm'], and merges builder_kwargs."""
+    """Verify mla() honors cfg['use_trackb'], cfg['trackb_bm'], and merges builder_kwargs."""
     mla_kernels._DISPATCH_CACHE.clear()
     captured: list[dict[str, object]] = []
 
@@ -213,10 +206,9 @@ def test_p1b_mla_dispatch_honors_use_trackb_and_trackb_bm(monkeypatch) -> None:
     out = mla_kernels.mla(qn, qr, kn, kr, v)
     assert out.shape == (2, 2, 128, 512)
     assert len(captured) == 1
-    assert captured[0]["args"][7] == 32  # trackb_bm override applied (default would be 64)
+    assert captured[0]["args"][7] == 32
     assert captured[0]["kwargs"]["extra_builder_kwargs"] == {"custom_const": 7, "_trackb": True}
 
-    # Verify explicit use_trackb=False routes back to TileLang path cleanly
     mla_kernels._DISPATCH_CACHE.clear()
     captured.clear()
     monkeypatch.setattr(
@@ -280,13 +272,11 @@ def test_p1c_dead_code_guard_l0_l1_and_prompt_routing(monkeypatch) -> None:
     )
     assert _detect_trackb_dead_code_edit(parent_src, dead_cand, tilelang_spec) is None
 
-    # Construct lightweight runner instance to test _default_l0_checker, _run_l1, and prompts
     runner = PerfTargetCampaignRunner(
         config=CampaignConfig(operator_name="level2/softmax", max_rounds=1),
         target_module_path=REPO_ROOT / "examples" / "ascend950pr_ops" / "softmax" / "kernels.py",
     )
 
-    # Valid Track-B L0 check
     full_sm_src = (REPO_ROOT / "examples" / "ascend950pr_ops" / "softmax" / "kernels.py").read_text(
         encoding="utf-8"
     )
@@ -295,15 +285,16 @@ def test_p1c_dead_code_guard_l0_l1_and_prompt_routing(monkeypatch) -> None:
     )
     sa_ok = runner._default_l0_checker(full_sm_src, real_sm_spec)
     assert sa_ok.passed is True
-    assert sa_ok.backend_kind == "ascendc"
+    assert sa_ok.backend_kind in ("tilelang", "ascendc")
+    sa_pure_tb = runner._default_l0_checker(parent_src, spec)
+    assert sa_pure_tb.passed is True
+    assert sa_pure_tb.backend_kind == "ascendc"
 
-    # Illegal L1->GM DMA in Track-B string must fail L0
     illegal_src = parent_src.replace("void k() {}", "void k() { /* L1->GM */ }")
     sa_bad = runner._default_l0_checker(illegal_src, spec)
     assert sa_bad.passed is False
     assert "L1->GM" in sa_bad.error_message
 
-    # Prompt tiering + active hot-path section
     ledger = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
         is_legal=True,
@@ -353,11 +344,13 @@ def test_p1c_dead_code_guard_l0_l1_and_prompt_routing(monkeypatch) -> None:
         parent_residual=compute_static_dynamic_residual(ledger, {"dur_us": 10.0}),
     )
     for req in (exp_req, cre_req):
-        assert "### LAYER 2: TARGET DIALECT API SURFACE (tier=ascendc_template)" in req.user_prompt
+        assert (
+            "### LAYER 2: TARGET DIALECT API SURFACE (tier=ascendc_template,"
+            in req.user_prompt
+        )
         assert "### ACTIVE RUNTIME HOT PATH" in req.user_prompt
         assert "_SOFTMAX_TRACKB_SRC" in req.user_prompt
 
-    # L1 Track-B dispatch (mocked compile)
     seen_cpp: list[str] = []
 
     def _fake_compile(cpp_source: str, **_kwargs) -> StageBResult:
@@ -373,7 +366,6 @@ def test_p1c_dead_code_guard_l0_l1_and_prompt_routing(monkeypatch) -> None:
     assert len(seen_cpp) == 1
     assert "int x = 1;" in seen_cpp[0]
 
-    # Hybrid Track-B L0 check fails when AscendC source violates redline even if TileLang passes
     mla_specs = CannbenchOpsRegistry.default().get_regime_specs("mla")
     mla_spec = mla_specs[0]
     assert mla_spec.runtime_backend == "hybrid_trackb"

@@ -2,33 +2,19 @@
 
 from __future__ import annotations
 
-import contextlib
 import ctypes
 import os
-import tempfile
 from pathlib import Path
+import tempfile
 from typing import Optional, Sequence
 
 import tilelang
-import tilelang.ascend.language as T
 import torch
 from tilelang.contrib.bisheng import compile_ascend
 
 from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
 
 _KERNEL_CACHE: dict[tuple[object, ...], object] = {}
-
-
-def _ascend_target_ctx():
-    try:
-        from tilelang import tvm
-        from tilelang.backend.module import create_backend_context
-
-        if tvm.target.Target.current(allow_none=True) is None:
-            return create_backend_context("ascend").target
-    except Exception:
-        pass
-    return contextlib.nullcontext()
 
 
 def _select_grouped_matmul_config(
@@ -98,111 +84,6 @@ def _select_grouped_matmul_config(
         "schedule_mode": "tuned",
         "compile_flags": list(PURE_SIMDVF_UBUF_FLAGS),
     }
-
-
-def _build_grouped_matmul_prim_func(
-    *,
-    k_dim: int = 256,
-    n_dim: int = 512,
-    tl_dtype: str = "float16",
-    transpose_weight: bool = False,
-    bm: int = 64,
-    bn: int = 64,
-    bk: int = 64,
-    num_stages: int = 2,
-    num_cores: int = 28,
-    **_extra_kwargs,
-):
-    """Build TileLang single-group MixCore GEMM PrimFunc for SIL/Stage-A analysis."""
-    gemm_dt = "float16" if tl_dtype == "float32" else tl_dtype
-    rows = bm // 2
-    stages = max(1, int(num_stages))
-    m_dyn = T.dynamic("m_dyn")
-
-    with _ascend_target_ctx():
-
-        @T.prim_func
-        def main(
-            X: T.Tensor((m_dyn, k_dim), gemm_dt),
-            W: T.Tensor((n_dim, k_dim) if transpose_weight else (k_dim, n_dim), gemm_dt),
-            Y: T.Tensor((m_dyn, n_dim), tl_dtype),
-        ):
-            m_tiles = (m_dyn + bm - 1) // bm
-            n_tiles = (n_dim + bn - 1) // bn
-            total_tiles = m_tiles * n_tiles
-            k_iters = (k_dim + bk - 1) // bk
-            with T.MixedKernel(num_cores, sids=2) as (cid, sid):
-                a_l1 = T.alloc_l1((bm, bk), gemm_dt)
-                b_l1 = T.alloc_l1((bn, bk), gemm_dt)
-                c_l0c = T.alloc_l0c((bm, bn), "float32")
-                c_ub = T.alloc_shared((rows, bn), "float32")
-                out_ub = T.alloc_shared((rows, bn), tl_dtype)
-                T.annotate_buffer_versions(
-                    {
-                        a_l1: stages,
-                        b_l1: stages,
-                        c_l0c: 1,
-                        c_ub: 1,
-                        out_ub: 1,
-                    }
-                )
-
-                for lt in T.serial((total_tiles - cid + num_cores - 1) // num_cores):
-                    tid = cid + lt * num_cores
-                    mt = tid // n_tiles
-                    nt = tid % n_tiles
-                    m0 = mt * bm
-                    n0 = nt * bn
-
-                    for ki in T.Pipelined(k_iters, num_stages=stages):
-                        k0 = ki * bk
-                        T.copy(X[m0 : m0 + bm, k0 : k0 + bk], a_l1)
-                        if transpose_weight:
-                            T.copy(W[n0 : n0 + bn, k0 : k0 + bk], b_l1)
-                        else:
-                            T.copy(W[k0 : k0 + bk, n0 : n0 + bn], b_l1, transpose=True)
-                        if ki == 0:
-                            T.gemm(
-                                a_l1,
-                                b_l1,
-                                c_l0c,
-                                transpose_B=True,
-                                clear_accum=True,
-                            )
-                        else:
-                            T.gemm(
-                                a_l1,
-                                b_l1,
-                                c_l0c,
-                                transpose_B=True,
-                                clear_accum=False,
-                            )
-
-                    T.dual_copy(c_l0c, c_ub)
-                    with T.SimdVF():
-                        m32 = T.simd.pset(32, "PAT_ALL")
-                        m16 = T.simd.pset(16, "PAT_ALL")
-                        for r in T.serial(rows):
-                            for c in T.serial(bn // 64):
-                                off = c * 64
-                                v_f = T.simd.vld(c_ub[r, off], dist="NORM_B32")
-                                if tl_dtype == "float32":
-                                    T.simd.vsts(out_ub[r, off], v_f, mask=m32, dist="NORM_B32")
-                                else:
-                                    v_16 = T.simd.vcvt(v_f, tl_dtype, mask=m16, part=0)
-                                    T.simd.vsts(
-                                        out_ub[r, off],
-                                        v_16,
-                                        mask=m32,
-                                        dist="PK_B32",
-                                        extent=64,
-                                    )
-                    T.copy(
-                        out_ub,
-                        Y[m0 + sid * rows : m0 + sid * rows + rows, n0 : n0 + bn],
-                    )
-
-    return main
 
 
 _GMM_TRACKB_SRC = r"""
@@ -1132,10 +1013,12 @@ extern "C" int launch_gmm_16(
 
     tl_inc = str(Path(tilelang.__file__).resolve().parent.parent / "src")
     asc_home = os.environ.get("ASCEND_HOME_PATH", "")
-    asc_inc = os.path.join(asc_home, "include") if asc_home else ""
     opts = [f"-I{tl_inc}"]
-    if asc_inc and os.path.isdir(asc_inc):
-        opts.append(f"-I{asc_inc}")
+    if asc_home:
+        for sub in ("include", "x86_64-linux/include", "aarch64-linux/include", "runtime/include"):
+            asc_inc = os.path.join(asc_home, sub)
+            if os.path.isdir(asc_inc) and f"-I{asc_inc}" not in opts:
+                opts.append(f"-I{asc_inc}")
     opts.extend(PURE_SIMDVF_UBUF_FLAGS)
     so_dir = tempfile.mkdtemp(prefix="gmm_trackb_")
     so_path = os.path.join(so_dir, "gmm_trackb.so")

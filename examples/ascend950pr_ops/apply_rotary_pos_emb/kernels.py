@@ -1,23 +1,11 @@
-"""Ascend 950PR fused 56-AIV ApplyRotaryPosEmb kernel package.
-
-Single-launch double-buffered Track-B AscendC vector kernel eliminating the
-5-kernel (or 11-kernel with Transpose+RepeatInterleave) ConcatD+BroadcastTo+RoPE
-decomposition:
-  - Fuses BOTH ``query`` and ``key`` rotary updates in one launch across 56 AIVs.
-  - Performs on-chip ``cos``/``sin`` broadcast in UB + FP32 arithmetic matching
-    the ``golden.py`` promotion contract across ``float16``, ``bfloat16``, and
-    ``float32``.
-  - Supports ``layout=0`` ``[B, S, N, D]`` and ``layout=1`` ``[B, N, S, D]``,
-    both ``"half"`` and ``"interleaved"`` rotary modes (via hardware
-    ``V::vdintlv`` / ``V::vintlv``), for ``D in {64, 128}``.
-"""
+"""TileLang Ascend950PR SimdVF kernel implementation for rotary position embeddings."""
 
 from __future__ import annotations
 
-import contextlib
 import ctypes
 import fcntl
 import hashlib
+import math
 import os
 from pathlib import Path
 import shutil
@@ -25,10 +13,8 @@ import subprocess
 import tempfile
 
 import tilelang
-import tilelang.ascend.language as T
 import torch
 
-_KERNEL_CACHE: dict[tuple[object, ...], object] = {}
 _TRACK_B_LIB_CACHE: dict[str, ctypes.CDLL] = {}
 
 _ROPE_ASC_SRC = r'''
@@ -577,18 +563,6 @@ extern "C" void launch_rope(
 '''
 
 
-def _ascend_target_ctx():
-    try:
-        from tilelang import tvm
-        from tilelang.backend.module import create_backend_context
-
-        if tvm.target.Target.current(allow_none=True) is None:
-            return create_backend_context("ascend").target
-    except Exception:
-        pass
-    return contextlib.nullcontext()
-
-
 def _find_bisheng() -> str | None:
     found = shutil.which("bisheng")
     if found:
@@ -675,7 +649,7 @@ def _get_track_b_lib() -> ctypes.CDLL | None:
 
 
 def _select_apply_rotary_pos_emb_config(**kwargs) -> dict[str, object]:
-    """Select TileLang / Track-B config for apply_rotary_pos_emb."""
+    """Select Track-B config for apply_rotary_pos_emb."""
     raw_dt = str(kwargs.get("tl_dtype", "float16")).strip()
     tl_dtype = raw_dt if raw_dt in ("float16", "bfloat16", "float32") else "float16"
     d_dim = int(kwargs.get("d_dim", 128))
@@ -689,85 +663,134 @@ def _select_apply_rotary_pos_emb_config(**kwargs) -> dict[str, object]:
     }
 
 
-def _build_apply_rotary_pos_emb_prim_func(
-    tile_m: int = 64,
-    tile_n: int = 64,
-    num_stages: int = 2,
-    tl_dtype: str = "float16",
-    **_extra_kwargs,
-):
-    """Build Stage-A-valid TileLang @T.prim_func for apply_rotary_pos_emb."""
-    _ = num_stages
-    m_blk = max(16, min(64, int(tile_m)))
-    n_blk = max(16, min(128, int(tile_n)))
-    dt = tl_dtype if tl_dtype in ("float16", "bfloat16", "float32") else "float16"
-    with _ascend_target_ctx():
-
-        @T.prim_func
-        def main(
-            X: T.Tensor((m_blk, n_blk), dt),
-            Y: T.Tensor((m_blk, n_blk), dt),
-        ):
-            with T.Kernel(1):
-                x_ub = T.alloc_shared((m_blk, n_blk), dt)
-                T.copy(X[0:m_blk, 0:n_blk], x_ub)
-                T.copy(x_ub, Y[0:m_blk, 0:n_blk])
-
-    return main
+_ACL_LIB = None
+_ACL_MEMCPY_D2D = 3
 
 
-def _get_kernel(**kwargs):
-    cfg = _select_apply_rotary_pos_emb_config(**kwargs)
-    key = (int(cfg["tile_m"]), int(cfg["tile_n"]), str(cfg["tl_dtype"]))
-    compiled = _KERNEL_CACHE.get(key)
-    if compiled is None:
-        with _ascend_target_ctx():
-            prog = _build_apply_rotary_pos_emb_prim_func(
-                tile_m=int(cfg["tile_m"]),
-                tile_n=int(cfg["tile_n"]),
-                num_stages=int(cfg["num_stages"]),
-                tl_dtype=str(cfg["tl_dtype"]),
-            )
-        compiled = tilelang.compile(prog, target="ascend", out_idx=[1])
-        _KERNEL_CACHE[key] = compiled
-    return compiled
+def _get_acl_lib() -> ctypes.CDLL:
+    global _ACL_LIB
+    if _ACL_LIB is None:
+        lib = ctypes.CDLL("libascendcl.so")
+        lib.aclrtMemsetAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+        ]
+        lib.aclrtMemsetAsync.restype = ctypes.c_int
+        lib.aclrtMemcpy2dAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        lib.aclrtMemcpy2dAsync.restype = ctypes.c_int
+        _ACL_LIB = lib
+    return _ACL_LIB
 
 
-def _torch_apply_rotary_pos_emb(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    layout: int = 0,
-    rotaryMode: str = "half",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    orig_dtype = query.dtype
-    qf = query.to(torch.float32) if orig_dtype in (torch.float16, torch.bfloat16) else query
-    kf = key.to(torch.float32) if orig_dtype in (torch.float16, torch.bfloat16) else key
-    cf = cos.to(torch.float32) if orig_dtype in (torch.float16, torch.bfloat16) else cos
-    sf = sin.to(torch.float32) if orig_dtype in (torch.float16, torch.bfloat16) else sin
+def _acl_check(rc: int, op: str) -> None:
+    if rc != 0:
+        raise RuntimeError(f"{op} failed with acl error code {rc}")
 
-    if cf.dim() == 2:
-        if layout == 0:
-            cf = cf.unsqueeze(0).unsqueeze(2)
-            sf = sf.unsqueeze(0).unsqueeze(2)
-        else:
-            cf = cf.unsqueeze(0).unsqueeze(1)
-            sf = sf.unsqueeze(0).unsqueeze(1)
 
-    if rotaryMode == "half":
-        half = qf.shape[-1] // 2
-        q0, q1 = qf[..., :half], qf[..., half:]
-        k0, k1 = kf[..., :half], kf[..., half:]
-        q_out = torch.cat((q0 * cf - q1 * sf, q1 * cf + q0 * sf), dim=-1)
-        k_out = torch.cat((k0 * cf - k1 * sf, k1 * cf + k0 * sf), dim=-1)
-    else:
-        q0, q1 = qf[..., 0::2], qf[..., 1::2]
-        k0, k1 = kf[..., 0::2], kf[..., 1::2]
-        q_out = torch.stack((q0 * cf - q1 * sf, q1 * cf + q0 * sf), dim=-1).flatten(-2)
-        k_out = torch.stack((k0 * cf - k1 * sf, k1 * cf + k0 * sf), dim=-1).flatten(-2)
+def _alloc_zero_npu(shape: tuple[int, ...], dtype: torch.dtype, device: object) -> torch.Tensor:
+    out = torch.empty(shape, dtype=dtype, device=device)
+    nbytes = out.numel() * out.element_size()
+    if nbytes > 0:
+        import torch_npu
 
-    return q_out.to(orig_dtype), k_out.to(orig_dtype)
+        lib = _get_acl_lib()
+        stream = torch_npu.npu.current_stream().npu_stream
+        _acl_check(
+            lib.aclrtMemsetAsync(
+                ctypes.c_void_p(out.data_ptr()), nbytes, 0, nbytes, ctypes.c_void_p(stream)
+            ),
+            "aclrtMemsetAsync",
+        )
+    return out
+
+
+def _copy_last_dim_2d(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    dst_col_offset: int,
+    src_col_offset: int,
+    copy_cols: int,
+) -> None:
+    if copy_cols <= 0 or src.numel() == 0:
+        return
+    import torch_npu
+
+    elem = src.element_size()
+    src_w = src.shape[-1]
+    dst_w = dst.shape[-1]
+    rows = src.numel() // src_w
+    lib = _get_acl_lib()
+    stream = torch_npu.npu.current_stream().npu_stream
+    _acl_check(
+        lib.aclrtMemcpy2dAsync(
+            ctypes.c_void_p(dst.data_ptr() + dst_col_offset * elem),
+            dst_w * elem,
+            ctypes.c_void_p(src.data_ptr() + src_col_offset * elem),
+            src_w * elem,
+            copy_cols * elem,
+            rows,
+            _ACL_MEMCPY_D2D,
+            ctypes.c_void_p(stream),
+        ),
+        "aclrtMemcpy2dAsync",
+    )
+
+
+def _pad_last_dim_rope(
+    tensor: torch.Tensor,
+    hdim: int,
+    target_d: int,
+    rotary_mode: str,
+) -> torch.Tensor:
+    if hdim == target_d:
+        return tensor
+    half = hdim // 2
+    thalf = target_d // 2
+    out = _alloc_zero_npu((*tensor.shape[:-1], target_d), tensor.dtype, tensor.device)
+    if rotary_mode == "half":
+        _copy_last_dim_2d(tensor, out, 0, 0, half)
+        _copy_last_dim_2d(tensor, out, thalf, half, half)
+        return out
+    _copy_last_dim_2d(tensor, out, 0, 0, hdim)
+    return out
+
+
+def _pad_freq_half(tensor: torch.Tensor, target_half: int) -> torch.Tensor:
+    src_half = tensor.shape[-1]
+    out = _alloc_zero_npu((*tensor.shape[:-1], target_half), tensor.dtype, tensor.device)
+    _copy_last_dim_2d(tensor, out, 0, 0, src_half)
+    return out
+
+
+def _unpad_last_dim_rope(
+    tensor: torch.Tensor,
+    hdim: int,
+    target_d: int,
+    rotary_mode: str,
+) -> torch.Tensor:
+    if hdim == target_d:
+        return tensor
+    half = hdim // 2
+    thalf = target_d // 2
+    out = torch.empty((*tensor.shape[:-1], hdim), dtype=tensor.dtype, device=tensor.device)
+    if rotary_mode == "half":
+        _copy_last_dim_2d(tensor, out, 0, 0, half)
+        _copy_last_dim_2d(tensor, out, half, thalf, half)
+        return out
+    _copy_last_dim_2d(tensor, out, 0, 0, hdim)
+    return out
 
 
 def apply_rotary_pos_emb(
@@ -778,71 +801,100 @@ def apply_rotary_pos_emb(
     layout: int = 0,
     rotaryMode: str = "half",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply fused rotary position embedding to query and key matching cannbot-ops contract."""
+    """Apply fused rotary position embedding to query and key on Ascend 950PR NPU."""
     if query.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError(f"unsupported dtype {query.dtype}")
     if layout not in (0, 1):
         raise ValueError(f"unsupported layout={layout}")
     if rotaryMode not in ("half", "interleaved"):
         raise ValueError(f"unsupported rotaryMode={rotaryMode!r}")
+    if query.device.type != "npu":
+        raise RuntimeError("apply_rotary_pos_emb requires NPU device")
+    if query.shape != key.shape:
+        raise ValueError(f"query {query.shape} != key {key.shape}")
+    if key.dtype != query.dtype or cos.dtype != query.dtype or sin.dtype != query.dtype:
+        raise TypeError("query, key, cos, and sin must share the same dtype")
+    if sin.shape != cos.shape:
+        raise ValueError(f"cos {cos.shape} != sin {sin.shape}")
 
-    if query.ndim == 4 and query.shape == key.shape:
-        if layout == 0:
-            bsz, seqlen, nheads, hdim = query.shape
-        else:
-            bsz, nheads, seqlen, hdim = query.shape
-        cos_ok = (cos.ndim == 2 and tuple(cos.shape) == (seqlen, hdim // 2)) or (
-            cos.ndim == 3 and tuple(cos.shape) == (bsz, seqlen, hdim // 2)
-        )
-        if (
-            query.device.type == "npu"
-            and hdim in (64, 128)
-            and cos_ok
-            and sin.shape == cos.shape
-            and key.dtype == query.dtype
-            and cos.dtype == query.dtype
-            and sin.dtype == query.dtype
-        ):
-            lib = _get_track_b_lib()
-            if lib is not None:
-                import torch_npu
+    orig_shape = query.shape
+    hdim = int(query.shape[-1])
+    if hdim <= 0 or hdim % 2 != 0 or hdim > 128:
+        raise ValueError(f"unsupported rotary head dim {hdim}")
 
-                qc = query.contiguous()
-                kc = key.contiguous()
-                cc = cos.contiguous()
-                sc = sin.contiguous()
-                qo = torch.empty_like(qc)
-                ko = torch.empty_like(kc)
-                dcode = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}[qc.dtype]
-                mode_id = 1 if rotaryMode == "interleaved" else 0
-                cos_has_b = 1 if cc.ndim == 3 else 0
-                stream = torch_npu.npu.current_stream().npu_stream
-                lib.launch_rope(
-                    ctypes.c_void_p(stream),
-                    ctypes.c_void_p(qc.data_ptr()),
-                    ctypes.c_void_p(kc.data_ptr()),
-                    ctypes.c_void_p(cc.data_ptr()),
-                    ctypes.c_void_p(sc.data_ptr()),
-                    ctypes.c_void_p(qo.data_ptr()),
-                    ctypes.c_void_p(ko.data_ptr()),
-                    bsz,
-                    seqlen,
-                    nheads,
-                    hdim,
-                    int(layout),
-                    mode_id,
-                    cos_has_b,
-                    dcode,
-                )
-                return qo, ko
+    if query.ndim == 4:
+        q_4d, k_4d = query, key
+        c_work, s_work = cos, sin
+        eff_layout = int(layout)
+    elif query.ndim == 3:
+        q_4d = query.unsqueeze(0)
+        k_4d = key.unsqueeze(0)
+        c_work, s_work = cos, sin
+        eff_layout = int(layout)
+    elif query.ndim == 2:
+        q_4d = query.unsqueeze(0).unsqueeze(2)
+        k_4d = key.unsqueeze(0).unsqueeze(2)
+        c_work, s_work = cos, sin
+        eff_layout = 0
+    else:
+        b_flat = int(math.prod(query.shape[:-3]))
+        q_4d = query.reshape(b_flat, *query.shape[-3:])
+        k_4d = key.reshape(b_flat, *key.shape[-3:])
+        c_work = cos.reshape(-1, *cos.shape[-2:]) if cos.ndim >= 3 else cos
+        s_work = sin.reshape(-1, *sin.shape[-2:]) if sin.ndim >= 3 else sin
+        eff_layout = int(layout)
 
-    return _torch_apply_rotary_pos_emb(query, key, cos, sin, layout=layout, rotaryMode=rotaryMode)
+    if eff_layout == 0:
+        bsz, seqlen, nheads, _ = q_4d.shape
+    else:
+        bsz, nheads, seqlen, _ = q_4d.shape
+    target_d = 64 if hdim <= 64 else 128
+    q_padded = _pad_last_dim_rope(q_4d.contiguous(), hdim, target_d, rotaryMode)
+    k_padded = _pad_last_dim_rope(k_4d.contiguous(), hdim, target_d, rotaryMode)
+    if hdim != target_d:
+        c_work = _pad_freq_half(c_work, target_d // 2)
+        s_work = _pad_freq_half(s_work, target_d // 2)
+
+    lib = _get_track_b_lib()
+    if lib is None:
+        raise RuntimeError("bisheng compiler unavailable for apply_rotary_pos_emb Track-B")
+    import torch_npu
+
+    qc = q_padded.contiguous()
+    kc = k_padded.contiguous()
+    cc = c_work.contiguous()
+    sc = s_work.contiguous()
+    qo = torch.empty_like(qc)
+    ko = torch.empty_like(kc)
+    dcode = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}[qc.dtype]
+    mode_id = 1 if rotaryMode == "interleaved" else 0
+    cos_has_b = 1 if cc.ndim == 3 else 0
+    stream = torch_npu.npu.current_stream().npu_stream
+    lib.launch_rope(
+        ctypes.c_void_p(stream),
+        ctypes.c_void_p(qc.data_ptr()),
+        ctypes.c_void_p(kc.data_ptr()),
+        ctypes.c_void_p(cc.data_ptr()),
+        ctypes.c_void_p(sc.data_ptr()),
+        ctypes.c_void_p(qo.data_ptr()),
+        ctypes.c_void_p(ko.data_ptr()),
+        bsz,
+        seqlen,
+        nheads,
+        target_d,
+        eff_layout,
+        mode_id,
+        cos_has_b,
+        dcode,
+    )
+    qo_unpad = _unpad_last_dim_rope(qo, hdim, target_d, rotaryMode)
+    ko_unpad = _unpad_last_dim_rope(ko, hdim, target_d, rotaryMode)
+    return qo_unpad.reshape(orig_shape), ko_unpad.reshape(orig_shape)
 
 
 kernel = apply_rotary_pos_emb
 
 __all__ = [
-    "_build_apply_rotary_pos_emb_prim_func",
     "_select_apply_rotary_pos_emb_config",
     "apply_rotary_pos_emb",
     "kernel",

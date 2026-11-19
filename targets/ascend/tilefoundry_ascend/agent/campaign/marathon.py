@@ -4,15 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections.abc import Callable, Mapping, Sequence
 import ctypes
-from dataclasses import dataclass
 import hashlib
-import importlib.util
 import json
 import logging
 import os
-from pathlib import Path
 import select
 import shlex
 import shutil
@@ -20,6 +16,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
@@ -196,13 +195,95 @@ def atomic_write_text(path: Path, text: str) -> None:
             tmp_path.unlink(missing_ok=True)
 
 
+def render_direct_tilelang_seed_module(
+    op_id: str,
+    entrypoint: str,
+    default_dtype: str,
+) -> str:
+    """Emit a golden-free TileLang seed module where entrypoint invokes _get_kernel."""
+    return (
+        f'"""TileLang Ascend950PR seed module for {op_id} (zero golden fallback)."""\n\n'
+        "import contextlib\n"
+        "import tilelang\n"
+        "import tilelang.ascend.language as T\n"
+        "import torch\n\n"
+        "_KERNEL_CACHE: dict[tuple[object, ...], object] = {}\n\n\n"
+        "def _ascend_target_ctx():\n"
+        "    from tilelang import tvm\n"
+        "    from tilelang.backend.module import create_backend_context\n\n"
+        "    if tvm.target.Target.current(allow_none=True) is None:\n"
+        '        return create_backend_context("ascend").target\n'
+        "    return contextlib.nullcontext()\n\n\n"
+        f"def _select_{op_id}_config(**kwargs) -> dict[str, object]:\n"
+        f'    """Select initial TileLang config for {op_id}."""\n'
+        f'    raw_dt = str(kwargs.get("tl_dtype", {default_dtype!r})).strip()\n'
+        '    tl_dtype = raw_dt if raw_dt in ("float16", "bfloat16", "float32") else "float16"\n'
+        "    return {\n"
+        '        "tile_elems": int(kwargs.get("tile_elems", 1024)),\n'
+        '        "tl_dtype": tl_dtype,\n'
+        '        "pass_configs": {},\n'
+        '        "compile_flags": [],\n'
+        "    }\n\n\n"
+        f"def _build_{op_id}_prim_func(\n"
+        "    total_elems: int = 1024,\n"
+        "    tile_elems: int = 1024,\n"
+        f"    tl_dtype: str = {default_dtype!r},\n"
+        "    **_extra_kwargs,\n"
+        "):\n"
+        f'    """Build Stage-A-valid TileLang @T.prim_func scaffold for {op_id}."""\n'
+        "    blk = max(32, min(4096, ((int(tile_elems) + 31) // 32) * 32))\n"
+        "    tot = max(blk, ((int(total_elems) + blk - 1) // blk) * blk)\n"
+        "    blocks = tot // blk\n"
+        '    dt = tl_dtype if tl_dtype in ("float16", "bfloat16", "float32") else "float16"\n'
+        "    with _ascend_target_ctx():\n\n"
+        "        @T.prim_func\n"
+        "        def main(X: T.Tensor((tot,), dt), Y: T.Tensor((tot,), dt)):\n"
+        "            with T.Kernel(blocks) as cid:\n"
+        "                ub = T.alloc_shared((blk,), dt)\n"
+        "                T.copy(X[cid * blk : (cid + 1) * blk], ub)\n"
+        "                T.copy(ub, Y[cid * blk : (cid + 1) * blk])\n\n"
+        "    return main\n\n\n"
+        "def _get_kernel(total_elems: int, tl_dtype: str):\n"
+        f"    cfg = _select_{op_id}_config(tl_dtype=tl_dtype)\n"
+        '    key = (int(total_elems), int(cfg["tile_elems"]), tl_dtype)\n'
+        "    if key not in _KERNEL_CACHE:\n"
+        "        with _ascend_target_ctx():\n"
+        f"            prog = _build_{op_id}_prim_func(\n"
+        "                total_elems=total_elems,\n"
+        '                tile_elems=int(cfg["tile_elems"]),\n'
+        "                tl_dtype=tl_dtype,\n"
+        "            )\n"
+        '        _KERNEL_CACHE[key] = tilelang.compile(prog, target="ascend", out_idx=[1])\n'
+        "    return _KERNEL_CACHE[key]\n\n\n"
+        f"def {entrypoint}(x: torch.Tensor, *args, **kwargs) -> torch.Tensor:\n"
+        f'    """Execute pure TileLang NPU seed kernel for {op_id}."""\n'
+        "    orig_shape = x.shape\n"
+        "    flat = x.contiguous().view(-1)\n"
+        "    blk = 1024\n"
+        "    pad = (blk - (flat.numel() % blk)) % blk\n"
+        "    work = torch.nn.functional.pad(flat, (0, pad)) if pad else flat\n"
+        '    dt_map = {torch.float16: "float16", torch.bfloat16: "bfloat16", '
+        'torch.float32: "float32"}\n'
+        "    fn = _get_kernel(work.numel(), dt_map[work.dtype])\n"
+        "    out = fn(work)\n"
+        "    return out[: flat.numel()].view(orig_shape)\n\n\n"
+        f"kernel = {entrypoint}\n\n"
+        "__all__ = [\n"
+        f'    "_build_{op_id}_prim_func",\n'
+        f'    "_select_{op_id}_config",\n'
+        f"    {entrypoint!r},\n"
+        '    "kernel",\n'
+        "]\n"
+    )
+
+
 def ensure_operator_seed_module(
     operator_name: str,
     target_module_path: Path,
     *,
     cannbench_repo: Path | None = None,
 ) -> bool:
-    """Bootstrap a Stage-A-valid TileLang seed module + golden fallback for any CANNBench op."""
+    """Bootstrap a pure Stage-A-valid TileLang seed module without golden fallbacks."""
     target_path = Path(target_module_path).resolve()
     if target_path.is_file():
         return False
@@ -228,7 +309,6 @@ def ensure_operator_seed_module(
     spec = registry.resolve(operator_name)
     op_id = spec.op_id
     entrypoint = spec.entrypoint
-    golden_path = (spec.op_dir / "golden.py").resolve()
     default_dtype = "float16"
     for case in spec.cases:
         raw_dt = case.get("dtype")
@@ -252,109 +332,7 @@ def ensure_operator_seed_module(
         )
         atomic_write_text(init_path, init_src)
 
-    seed_src = (
-        f'"""Auto-seeded TileLang Ascend950PR scaffold and golden fallback for {op_id}."""\n\n'
-        "import contextlib\n"
-        "import importlib.util\n"
-        "import os\n"
-        "from pathlib import Path\n\n"
-        "import tilelang\n"
-        "import tilelang.ascend.language as T\n"
-        "import torch\n\n"
-        "_KERNEL_CACHE: dict[tuple[object, ...], object] = {}\n"
-        "_GOLDEN_FN = None\n"
-        f"_GOLDEN_TASK = {spec.task!r}\n"
-        f"_DEFAULT_GOLDEN_PATH = Path({str(golden_path)!r})\n\n\n"
-        "def _ascend_target_ctx():\n"
-        "    try:\n"
-        "        from tilelang import tvm\n"
-        "        from tilelang.backend.module import create_backend_context\n\n"
-        "        if tvm.target.Target.current(allow_none=True) is None:\n"
-        '            return create_backend_context("ascend").target\n'
-        "    except Exception:\n"
-        "        pass\n"
-        "    return contextlib.nullcontext()\n\n\n"
-        "def _load_golden_fn():\n"
-        "    global _GOLDEN_FN\n"
-        "    if _GOLDEN_FN is not None:\n"
-        "        return _GOLDEN_FN\n"
-        "    candidates = [_DEFAULT_GOLDEN_PATH]\n"
-        '    env_repo = os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()\n'
-        "    if env_repo:\n"
-        '        candidates.insert(0, Path(env_repo).expanduser() / "tasks" / _GOLDEN_TASK / "golden.py")\n'
-        "    for cand in candidates:\n"
-        "        if cand.is_file():\n"
-        '            mod_name = "_tf_golden_" + _GOLDEN_TASK.replace("/", "_")\n'
-        "            mod_spec = importlib.util.spec_from_file_location(mod_name, str(cand))\n"
-        "            if mod_spec is not None and mod_spec.loader is not None:\n"
-        "                mod = importlib.util.module_from_spec(mod_spec)\n"
-        "                mod_spec.loader.exec_module(mod)\n"
-        f"                fn = getattr(mod, {entrypoint!r}, None)\n"
-        "                if callable(fn):\n"
-        "                    _GOLDEN_FN = fn\n"
-        "                    return fn\n"
-        '    raise FileNotFoundError(f"Cannot locate golden.py for {_GOLDEN_TASK!r}")\n\n\n'
-        f"def _select_{op_id}_config(**kwargs) -> dict[str, object]:\n"
-        f'    """Select initial TileLang config for {op_id}."""\n'
-        f'    raw_dt = str(kwargs.get("tl_dtype", {default_dtype!r})).strip()\n'
-        '    tl_dtype = raw_dt if raw_dt in ("float16", "bfloat16", "float32") else "float16"\n'
-        "    return {\n"
-        '        "tile_m": 64,\n'
-        '        "tile_n": 64,\n'
-        '        "num_stages": 1,\n'
-        '        "tl_dtype": tl_dtype,\n'
-        '        "pass_configs": {},\n'
-        '        "compile_flags": [],\n'
-        "    }\n\n\n"
-        f"def _build_{op_id}_prim_func(\n"
-        "    tile_m: int = 64,\n"
-        "    tile_n: int = 64,\n"
-        "    num_stages: int = 1,\n"
-        f"    tl_dtype: str = {default_dtype!r},\n"
-        "    **_extra_kwargs,\n"
-        "):\n"
-        f'    """Build Stage-A-valid TileLang @T.prim_func scaffold for {op_id}."""\n'
-        "    _ = num_stages\n"
-        "    m_blk = max(16, min(64, int(tile_m)))\n"
-        "    n_blk = max(16, min(64, int(tile_n)))\n"
-        '    dt = tl_dtype if tl_dtype in ("float16", "bfloat16", "float32") else "float16"\n'
-        "    with _ascend_target_ctx():\n\n"
-        "        @T.prim_func\n"
-        "        def main(\n"
-        "            X: T.Tensor((m_blk, n_blk), dt),\n"
-        "            Y: T.Tensor((m_blk, n_blk), dt),\n"
-        "        ):\n"
-        "            with T.Kernel(1):\n"
-        "                x_ub = T.alloc_shared((m_blk, n_blk), dt)\n"
-        "                T.copy(X[0:m_blk, 0:n_blk], x_ub)\n"
-        "                T.copy(x_ub, Y[0:m_blk, 0:n_blk])\n\n"
-        "    return main\n\n\n"
-        "def _get_kernel(**kwargs):\n"
-        f"    cfg = _select_{op_id}_config(**kwargs)\n"
-        '    key = (int(cfg["tile_m"]), int(cfg["tile_n"]), str(cfg["tl_dtype"]))\n'
-        "    compiled = _KERNEL_CACHE.get(key)\n"
-        "    if compiled is None:\n"
-        "        with _ascend_target_ctx():\n"
-        f"            prog = _build_{op_id}_prim_func(\n"
-        '                tile_m=int(cfg["tile_m"]),\n'
-        '                tile_n=int(cfg["tile_n"]),\n'
-        '                num_stages=int(cfg["num_stages"]),\n'
-        '                tl_dtype=str(cfg["tl_dtype"]),\n'
-        "            )\n"
-        '        compiled = tilelang.compile(prog, target="ascend", out_idx=[1])\n'
-        "        _KERNEL_CACHE[key] = compiled\n"
-        "    return compiled\n\n\n"
-        f"def {entrypoint}(*args, **kwargs):\n"
-        f'    """Reference-backed entrypoint for {op_id} until promoted TileLang slices take over."""\n'
-        "    return _load_golden_fn()(*args, **kwargs)\n\n\n"
-        f"kernel = {entrypoint}\n\n"
-        f"__all__ = [\n"
-        f'    "_build_{op_id}_prim_func",\n'
-        f'    "_select_{op_id}_config",\n'
-        f'    {entrypoint!r},\n'
-        '    "kernel",\n'
-        "]\n"
-    )
+    seed_src = render_direct_tilelang_seed_module(op_id, entrypoint, default_dtype)
     atomic_write_text(target_path, seed_src)
     return True
 
@@ -2220,6 +2198,7 @@ __all__ = [
     "ensure_marathon_env_file",
     "ensure_operator_seed_module",
     "main",
+    "render_direct_tilelang_seed_module",
     "run_operator_marathon",
     "salvage_unpromoted_beam_winner",
     "short_operator_tag",

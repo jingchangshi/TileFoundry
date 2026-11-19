@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 import importlib.util
 import json
+import math
 import os
+import re
 import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -650,7 +652,6 @@ def _stratify_operator_anchors(
                 picked.append((item, tag))
                 return
 
-    # 1. Smallest latency-bound case
     by_small = sorted(
         metrics,
         key=lambda m: (
@@ -661,7 +662,6 @@ def _stratify_operator_anchors(
     )
     _pick(by_small, "small_latency")
 
-    # 2. Prime/odd unaligned tail case
     unaligned_pool = [m for m in metrics if m["is_unaligned"]]
     if unaligned_pool:
         by_unaligned = sorted(
@@ -676,7 +676,6 @@ def _stratify_operator_anchors(
     else:
         _pick(by_small, "unaligned_tail")
 
-    # 3. Largest throughput case
     by_large = sorted(
         metrics,
         key=lambda m: (
@@ -687,7 +686,6 @@ def _stratify_operator_anchors(
     )
     _pick(by_large, "large_throughput")
 
-    # 4. Extreme aspect / empty-group / special-case
     by_extreme = sorted(
         metrics,
         key=lambda m: (
@@ -701,7 +699,6 @@ def _stratify_operator_anchors(
     )
     _pick(by_extreme, "extreme_aspect")
 
-    # 5. Balanced mid-regime case (up to 5 anchors total)
     if len(picked) < 5 and len(metrics) >= 5:
         by_mid = sorted(
             metrics,
@@ -812,32 +809,48 @@ def _coerce_positive_int(val: object, default: int = 0) -> int:
         return default
 
 
-def classify_regime_runtime_backend(
-    op_id: str,
-    regime_tag: str,
-    sample_dims: Mapping[str, object],
-    trackb_symbols: tuple[str, ...],
-) -> str:
-    """Classify runtime backend ('tilelang_dsl', 'ascendc_trackb', or 'hybrid_trackb')."""
-    _ = regime_tag
-    if not trackb_symbols:
-        return "tilelang_dsl"
-    canon = str(op_id).strip().lower()
-    if canon == "softmax":
-        inner = _coerce_positive_int(
-            sample_dims.get("inner", sample_dims.get("inner_dim", 1)),
-            default=1,
-        )
-        d_dim = _coerce_positive_int(
-            sample_dims.get("d_dim", sample_dims.get("D", 0)),
-            default=0,
-        )
-        if inner <= 1 and 0 < d_dim <= 16:
-            return "tilelang_dsl"
-        return "ascendc_trackb"
-    if canon == "mla":
-        return "hybrid_trackb"
-    return "ascendc_trackb"
+def infer_module_runtime_backend(
+    module_text: str,
+    entrypoint: str,
+) -> tuple[str, tuple[str, ...]]:
+    """Derive ('tilelang_dsl' | 'ascendc_trackb' | 'hybrid_trackb', symbols) from AST graph."""
+    trackb_syms = discover_module_trackb_symbols(module_text)
+    if not module_text.strip():
+        return "tilelang_dsl", ()
+    try:
+        tree = ast.parse(module_text)
+    except SyntaxError:
+        return ("ascendc_trackb" if trackb_syms else "tilelang_dsl"), trackb_syms
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    if entrypoint not in funcs:
+        return ("ascendc_trackb" if trackb_syms else "tilelang_dsl"), trackb_syms
+
+    reachable: set[str] = set()
+    queue = [entrypoint]
+    while queue:
+        cur = queue.pop(0)
+        if cur in reachable or cur not in funcs:
+            continue
+        reachable.add(cur)
+        for sub in ast.walk(funcs[cur]):
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
+                if sub.func.id in funcs and sub.func.id not in reachable:
+                    queue.append(sub.func.id)
+
+    reaches_tl = False
+    reaches_tb = False
+    for fn_name in reachable:
+        seg = ast.get_source_segment(module_text, funcs[fn_name]) or ""
+        if "tilelang.compile(" in seg:
+            reaches_tl = True
+        if any(sym in seg for sym in trackb_syms) or "_get_track_b_lib" in seg:
+            reaches_tb = True
+
+    if reaches_tl and reaches_tb:
+        return "hybrid_trackb", trackb_syms
+    if reaches_tb or trackb_syms:
+        return "ascendc_trackb", trackb_syms
+    return "tilelang_dsl", ()
 
 
 class CannbenchOpsRegistry:
@@ -1085,7 +1098,15 @@ class CannbenchOpsRegistry:
         spec = self.resolve(op_id)
         mod_file = self._source_root / spec.module_relpath
         mod_text = mod_file.read_text(encoding="utf-8") if mod_file.is_file() else ""
-        discovered_tb = discover_module_trackb_symbols(mod_text)
+        runtime_backend, discovered_tb = infer_module_runtime_backend(
+            mod_text,
+            spec.entrypoint,
+        )
+        proto_inputs = (
+            spec.proto.get("inputs")
+            if isinstance(spec.proto.get("inputs"), (list, tuple))
+            else ()
+        )
         has_shared_selector = f"def _select_{op_id}_config(" in mod_text
         case_by_id = {int(c.get("case_id", -1)): c for c in spec.cases}
         seen_tags: set[str] = set()
@@ -1095,7 +1116,7 @@ class CannbenchOpsRegistry:
                 continue
             seen_tags.add(anchor.regime_tag)
             case_entry = case_by_id.get(int(anchor.case_num), {})
-            dims = _extract_generic_case_dims(case_entry)
+            dims = extract_schema_driven_case_dims(case_entry, proto_inputs=proto_inputs)
             safe_tag = anchor.regime_tag
             per_regime_sel = f"_select_{op_id}_{safe_tag}_config"
             shared_sel = f"_select_{op_id}_config"
@@ -1104,12 +1125,6 @@ class CannbenchOpsRegistry:
                 per_regime_sel
                 if (has_per_regime_sel or not has_shared_selector)
                 else shared_sel
-            )
-            runtime_backend = classify_regime_runtime_backend(
-                op_id,
-                safe_tag,
-                dims,
-                discovered_tb,
             )
             regime_tb = (
                 discovered_tb
@@ -1157,96 +1172,194 @@ class CannbenchOpsRegistry:
         return tuple(regimes)
 
 
-def _extract_generic_case_dims(entry: Mapping[str, object]) -> dict[str, object]:
+def _parse_proto_shape_axes(shape_spec: object, layout: str) -> list[str]:
+    if not isinstance(shape_spec, str) or "[" not in shape_spec:
+        return []
+    matches = re.findall(r"(?:([A-Za-z0-9_]+)\s*:\s*)?\[([^\]]+)\]", shape_spec)
+    chosen = ""
+    upper_layout = layout.strip().upper()
+    for tag, inner in matches:
+        if tag.strip().upper() == upper_layout and upper_layout:
+            chosen = inner
+            break
+    if not chosen and matches:
+        chosen = matches[0][1]
+    if not chosen:
+        return []
+    return [tok.strip() for tok in chosen.split(",") if tok.strip()]
+
+
+def extract_schema_driven_case_dims(
+    case_entry: Mapping[str, object],
+    proto_inputs: Sequence[Mapping[str, object]] = (),
+) -> dict[str, object]:
+    """Derive case dimension dictionary from proto parameter schemas and attrs."""
     dims: dict[str, object] = {}
-    attrs = entry.get("attrs")
+    attrs = case_entry.get("attrs")
     if isinstance(attrs, Mapping):
         for k, v in attrs.items():
             dims[str(k)] = v
-    raw_dtypes = entry.get("dtype")
+
+    raw_dtypes = case_entry.get("dtype")
     if isinstance(raw_dtypes, (list, tuple)):
         for dt in raw_dtypes:
             dt_s = str(dt).strip()
             if dt_s in ("float16", "bfloat16", "float32"):
                 dims.setdefault("tl_dtype", dt_s)
                 break
-    elif isinstance(raw_dtypes, str) and raw_dtypes.strip() in ("float16", "bfloat16", "float32"):
+    elif isinstance(raw_dtypes, str) and raw_dtypes.strip() in (
+        "float16",
+        "bfloat16",
+        "float32",
+    ):
         dims.setdefault("tl_dtype", raw_dtypes.strip())
 
-    op_label = str(entry.get("operator", "")).strip().lower()
-    shapes = _normalize_shape_list(entry.get("input_shape"))
-    if shapes:
-        lead = shapes[0]
-        total = 1
-        for d in lead:
-            total *= max(1, d)
-        dims["total_elements"] = total
-        if len(lead) == 1:
-            dims.setdefault("D", lead[0])
+    shapes = _normalize_shape_list(case_entry.get("input_shape"))
+    if not shapes:
+        return dims
+
+    lead = [int(x) for x in shapes[0]]
+    dims["total_elements"] = int(math.prod(max(1, d) for d in lead))
+    if "dim" in dims and isinstance(dims["dim"], int) and lead:
+        dim_ax = int(dims["dim"])
+        ndim = len(lead)
+        norm_dim = dim_ax if dim_ax >= 0 else ndim + dim_ax
+        if 0 <= norm_dim < ndim:
+            dims["d_dim"] = int(lead[norm_dim])
+            dims["D"] = int(lead[norm_dim])
+            inner = 1
+            for val in lead[norm_dim + 1 :]:
+                inner *= max(1, int(val))
+            dims["inner"] = int(inner)
+            dims.setdefault("half_dim", max(1, int(lead[norm_dim]) // 2))
+
+    layout = str(dims.get("inputLayout", dims.get("layout", "BSND"))).upper()
+    if "inputLayout" in dims or "input_layout" in dims:
+        dims.setdefault("inputLayout", layout)
+
+    if len(lead) == 1:
+        dims.setdefault("D", lead[0])
+        dims.setdefault("d_dim", lead[0])
+        dims.setdefault("N", lead[0])
+    elif len(lead) == 2:
+        dims.setdefault("M", lead[0])
+        dims.setdefault("m_rows", lead[0])
+        dims.setdefault("D", lead[1])
+        dims.setdefault("K", lead[1])
+    elif len(lead) == 3:
+        dims.setdefault("B", lead[0])
+        dims.setdefault("b_dim", lead[0])
+        dims.setdefault("S", lead[1])
+        dims.setdefault("s_dim", lead[1])
+        dims.setdefault("m_rows", lead[0] * lead[1])
+        dims.setdefault("D", lead[2])
+        dims.setdefault("hc_mult", lead[2])
+    elif len(lead) >= 4:
+        has_stacked_prefix = (
+            not proto_inputs
+            and len(shapes) >= 2
+            and len(shapes[1]) == len(lead) - 1
+            and list(shapes[1]) == list(lead[1:])
+        )
+        if has_stacked_prefix:
             dims.setdefault("N", lead[0])
-        elif len(lead) == 2:
-            dims.setdefault("M", lead[0])
-            dims.setdefault("m_rows", lead[0])
-            dims.setdefault("D", lead[1])
-            dims.setdefault("K", lead[1])
-        elif len(lead) == 3:
+            dims.setdefault("B", lead[1])
+            dims.setdefault("b_dim", lead[1])
+            dims.setdefault("S", lead[2])
+            dims.setdefault("s_dim", lead[2])
+            dims.setdefault("D", lead[3])
+            dims.setdefault("m_rows", lead[1] * lead[2])
+        elif layout == "BNSD":
             dims.setdefault("B", lead[0])
-            dims.setdefault("S", lead[1])
-            dims.setdefault("m_rows", lead[0] * lead[1])
-            dims.setdefault("D", lead[2])
-        elif len(lead) >= 4:
+            dims.setdefault("b_dim", lead[0])
+            dims.setdefault("N_q", lead[1])
+            dims.setdefault("n_q", lead[1])
+            dims.setdefault("N_h", lead[1])
+            dims.setdefault("S", lead[2])
+            dims.setdefault("s_dim", lead[2])
+            dims.setdefault("D", lead[-1])
+            dims.setdefault("m_rows", lead[0] * lead[2])
+        else:
             dims.setdefault("B", lead[0])
+            dims.setdefault("b_dim", lead[0])
             dims.setdefault("S", lead[1])
+            dims.setdefault("s_dim", lead[1])
+            dims.setdefault("t_dim", lead[1])
             dims.setdefault("N_h", lead[2])
+            dims.setdefault("N_q", lead[2])
+            dims.setdefault("n_q", lead[2])
             dims.setdefault("D", lead[-1])
             dims.setdefault("m_rows", lead[0] * lead[1])
 
-        if op_label == "swiglu":
-            dim_ax = int(attrs.get("dim", -1)) if isinstance(attrs, Mapping) else -1
-            if -len(lead) <= dim_ax < len(lead):
-                dims.setdefault("half_dim", max(1, int(lead[dim_ax]) // 2))
-        elif op_label == "softmax" and lead:
-            dim_ax = int(attrs.get("dim", -1)) if isinstance(attrs, Mapping) else -1
-            ndim = len(lead)
-            norm_dim = dim_ax if dim_ax >= 0 else ndim + dim_ax
-            if 0 <= norm_dim < ndim:
-                dims["d_dim"] = int(lead[norm_dim])
-                dims["D"] = int(lead[norm_dim])
-                inner = 1
-                for val in lead[norm_dim + 1 :]:
-                    inner *= max(1, int(val))
-                dims["inner"] = int(inner)
-        elif op_label == "mhcsinkhorn" and len(lead) >= 2:
-            dims.setdefault("hc_mult", int(lead[-1]))
-            dims.setdefault("b_dim", int(lead[0]))
-        elif op_label == "gqa" and len(lead) >= 4:
-            layout = str(dims.get("layout", dims.get("input_layout", "BSND"))).upper()
-            if layout == "BNSD":
-                dims.setdefault("n_q", int(lead[1]))
-                dims.setdefault("s_dim", int(lead[2]))
-                if len(shapes) >= 2 and len(shapes[1]) >= 4:
-                    dims.setdefault("n_kv", int(shapes[1][1]))
-            else:
-                dims.setdefault("s_dim", int(lead[1]))
-                dims.setdefault("n_q", int(lead[2]))
-                if len(shapes) >= 2 and len(shapes[1]) >= 4:
-                    dims.setdefault("n_kv", int(shapes[1][2]))
-            dims.setdefault("d_dim", int(lead[-1]))
-        elif op_label == "kimideltaattention" and len(lead) >= 4:
-            dims.setdefault("t_dim", int(lead[1]))
-            dims.setdefault("dk", int(lead[-1]))
-            dv = int(shapes[2][-1]) if len(shapes) >= 3 and shapes[2] else int(lead[-1])
-            dims.setdefault("dv", dv)
-        elif op_label == "tensorprogramvm" and len(shapes) >= 2:
-            if len(shapes[0]) >= 1:
-                dims.setdefault("prog_len", int(shapes[0][0]))
-            if len(shapes[1]) >= 2:
-                dims.setdefault("num_regs", int(shapes[1][0]))
-                dims.setdefault("w_dim", int(shapes[1][1]))
+    if (
+        len(shapes) >= 3
+        and len(shapes[0]) >= 4
+        and len(shapes[1]) >= 4
+        and len(shapes[2]) >= 4
+        and shapes[0][-1] != shapes[1][-1]
+    ):
+        dims.setdefault("D_nope", int(shapes[0][-1]))
+        dims.setdefault("D_rope", int(shapes[1][-1]))
+        k_sh = shapes[2]
+        if layout == "BNSD":
+            dims.setdefault("N_kv", int(k_sh[1]))
+            dims.setdefault("S_kv", int(k_sh[2]))
+        else:
+            dims.setdefault("S_kv", int(k_sh[1]))
+            dims.setdefault("N_kv", int(k_sh[2]))
+        dims["is_causal"] = bool(dims.get("is_causal", False))
+    elif "numKVHeads" in dims:
+        dims.setdefault("N_kv", int(dims["numKVHeads"]))
+    elif len(shapes) >= 2 and len(shapes[1]) >= 4:
+        kv_idx = 1 if layout == "BNSD" else 2
+        dims.setdefault("n_kv", int(shapes[1][kv_idx]))
+        dims.setdefault("N_kv", int(shapes[1][kv_idx]))
 
-        for idx, sh in enumerate(shapes):
-            for ax, dval in enumerate(sh):
-                dims[f"shape_{idx}_dim_{ax}"] = int(dval)
+    if len(shapes) >= 3 and shapes[2]:
+        dims.setdefault("dv", int(shapes[2][-1]))
+    if lead:
+        dims.setdefault("half_dim", max(1, int(lead[-1]) // 2))
+        dims.setdefault("d_dim", int(lead[-1]))
+        dims.setdefault("dk", int(lead[-1]))
+    if len(shapes) >= 2 and len(shapes[1]) >= 2 and len(lead) == 2:
+        dims.setdefault("prog_len", int(lead[0]))
+        dims.setdefault("num_regs", int(shapes[1][0]))
+        dims.setdefault("w_dim", int(shapes[1][1]))
+
+    axis_aliases = {
+        "d_nope": ("D_nope", "d_nope"),
+        "d_rope": ("D_rope", "d_rope"),
+        "n_q": ("N_q", "n_q"),
+        "n_kv": ("N_kv", "n_kv"),
+        "s_kv": ("S_kv", "s_kv"),
+        "b": ("B", "b_dim"),
+        "s": ("S", "s_dim"),
+        "t": ("S", "s_dim", "t_dim"),
+        "d": ("D", "d_dim"),
+        "n": ("N",),
+    }
+
+    for idx, sh in enumerate(shapes):
+        pname = (
+            str(proto_inputs[idx].get("name", f"in_{idx}"))
+            if idx < len(proto_inputs) and isinstance(proto_inputs[idx], Mapping)
+            else f"in_{idx}"
+        )
+        schema_axes = (
+            _parse_proto_shape_axes(proto_inputs[idx].get("shape"), layout)
+            if idx < len(proto_inputs) and isinstance(proto_inputs[idx], Mapping)
+            else []
+        )
+        for ax, dval in enumerate(sh):
+            iv = int(dval)
+            dims[f"{pname}_dim_{ax}"] = iv
+            dims[f"shape_{idx}_dim_{ax}"] = iv
+            if ax < len(schema_axes):
+                raw_ax = schema_axes[ax]
+                if raw_ax.isidentifier():
+                    dims[raw_ax] = iv
+                    for alias in axis_aliases.get(raw_ax.lower(), ()):
+                        dims[alias] = iv
     return dims
 
 
@@ -1484,59 +1597,14 @@ def lookup_case_dims(
     if entry is None:
         raise KeyError(f"case_num={target_id} missing in {cases_path}")
 
-    raw_shapes = entry.get("input_shape") or []
-    shapes = (
-        [raw_shapes]
-        if raw_shapes and not isinstance(raw_shapes[0], (list, tuple))
-        else list(raw_shapes)
-    )
-    attrs = entry.get("attrs") or {}
-    dims: dict[str, object] = {}
-    if isinstance(attrs, Mapping):
-        for k, v in attrs.items():
-            dims[str(k)] = v
-
-    if operator_name == "attention_residual":
-        v_shape = shapes[0] if shapes else ()
-        if len(v_shape) >= 4:
-            dims["N"] = int(v_shape[0])
-            dims["B"] = int(v_shape[1])
-            dims["S"] = int(v_shape[2])
-            dims["D"] = int(v_shape[3])
-        return dims
-
-    if operator_name == "mla":
-        layout = str(dims.get("inputLayout", "BSND")).upper()
-        dims["inputLayout"] = layout
-        q_nope = shapes[0] if len(shapes) > 0 else ()
-        q_rope = shapes[1] if len(shapes) > 1 else ()
-        k_nope = shapes[2] if len(shapes) > 2 else ()
-        if len(q_nope) >= 4:
-            if layout == "BNSD":
-                dims["B"] = int(q_nope[0])
-                dims["N_q"] = int(q_nope[1])
-                dims["S"] = int(q_nope[2])
-                dims["D_nope"] = int(q_nope[3])
-            else:
-                dims["B"] = int(q_nope[0])
-                dims["S"] = int(q_nope[1])
-                dims["N_q"] = int(q_nope[2])
-                dims["D_nope"] = int(q_nope[3])
-        if len(k_nope) >= 4:
-            if layout == "BNSD":
-                dims["N_kv"] = int(k_nope[1])
-                dims["S_kv"] = int(k_nope[2])
-            else:
-                dims["S_kv"] = int(k_nope[1])
-                dims["N_kv"] = int(k_nope[2])
-        elif "numKVHeads" in dims:
-            dims["N_kv"] = int(dims["numKVHeads"])
-        if q_rope:
-            dims["D_rope"] = int(q_rope[-1])
-        dims["is_causal"] = bool(dims.get("is_causal", False))
-        return dims
-
-    return _extract_generic_case_dims(entry)
+    proto_inputs: Sequence[Mapping[str, object]] = ()
+    proto_path = cases_path.parent / "proto.yaml"
+    if proto_path.is_file():
+        proto_raw = yaml.safe_load(proto_path.read_text(encoding="utf-8")) or {}
+        op_block = proto_raw.get("operator", proto_raw)
+        if isinstance(op_block, Mapping) and isinstance(op_block.get("inputs"), (list, tuple)):
+            proto_inputs = op_block["inputs"]
+    return extract_schema_driven_case_dims(entry, proto_inputs=proto_inputs)
 
 
 def resolve_regime_for_case(
@@ -1544,43 +1612,48 @@ def resolve_regime_for_case(
     case_dims: Mapping[str, object],
     regime_specs: Sequence[RegimeTargetSpec],
 ) -> RegimeTargetSpec:
-    """Resolve the active dispatch regime matching Host kernel routing for case_dims."""
+    """Resolve the active dispatch regime matching structural case dimensions."""
+    _ = operator_name
     if not regime_specs:
         raise ValueError("regime_specs must not be empty")
+    spec_by_tag = {spec.regime_tag: spec for spec in regime_specs}
     target_tag = str(case_dims.get("regime_tag", "")).strip()
-    if operator_name == "attention_residual":
-        d_dim = int(case_dims.get("D", case_dims.get("d_dim", 0)))
-        b_dim = int(case_dims.get("B", case_dims.get("b_dim", 1)))
-        s_dim = int(case_dims.get("S", case_dims.get("s_dim", case_dims.get("S_q", 1))))
-        if d_dim % 64 != 0:
-            target_tag = "unaligned_d"
-        elif b_dim * s_dim < 16:
-            target_tag = "small_decode"
-        else:
-            target_tag = "aligned_prefill"
-    elif operator_name == "mla":
-        layout = str(
-            case_dims.get("inputLayout", case_dims.get("input_layout", "BSND"))
-        ).upper()
-        s_dim = int(case_dims.get("S", case_dims.get("s_dim", case_dims.get("S_q", 1))))
-        if layout == "BNSD":
-            target_tag = "bnsd_gather"
-        elif s_dim <= 2:
-            target_tag = "split_kv_decode"
-        else:
-            target_tag = "prefill_compute"
-    elif not target_tag:
-        d_val = case_dims.get("D", case_dims.get("d_dim", 0))
-        if isinstance(d_val, int) and not isinstance(d_val, bool) and d_val > 1 and d_val % 16 != 0:
-            target_tag = "unaligned_tail"
-        elif isinstance(case_dims.get("total_elements"), int) and int(case_dims["total_elements"]) <= 65536:
-            target_tag = "small_latency"
-        elif isinstance(case_dims.get("total_elements"), int) and int(case_dims["total_elements"]) >= 1048576:
-            target_tag = "large_throughput"
+    if target_tag and target_tag in spec_by_tag:
+        return spec_by_tag[target_tag]
 
-    for spec in regime_specs:
-        if spec.regime_tag == target_tag:
-            return spec
+    layout = str(
+        case_dims.get("inputLayout", case_dims.get("input_layout", "BSND"))
+    ).upper()
+    d_val = case_dims.get("D", case_dims.get("d_dim", 0))
+    d_dim = int(d_val) if isinstance(d_val, int) and not isinstance(d_val, bool) else 0
+    b_dim = int(case_dims.get("B", case_dims.get("b_dim", 1)))
+    s_dim = int(case_dims.get("S", case_dims.get("s_dim", case_dims.get("S_q", 1))))
+
+    if "bnsd_gather" in spec_by_tag or "split_kv_decode" in spec_by_tag:
+        if layout == "BNSD" and "bnsd_gather" in spec_by_tag:
+            return spec_by_tag["bnsd_gather"]
+        if s_dim <= 2 and "split_kv_decode" in spec_by_tag:
+            return spec_by_tag["split_kv_decode"]
+        if "prefill_compute" in spec_by_tag:
+            return spec_by_tag["prefill_compute"]
+
+    if "unaligned_d" in spec_by_tag or "small_decode" in spec_by_tag:
+        if d_dim > 0 and d_dim % 64 != 0 and "unaligned_d" in spec_by_tag:
+            return spec_by_tag["unaligned_d"]
+        if b_dim * s_dim < 16 and "small_decode" in spec_by_tag:
+            return spec_by_tag["small_decode"]
+        if "aligned_prefill" in spec_by_tag:
+            return spec_by_tag["aligned_prefill"]
+
+    if d_dim > 1 and d_dim % 16 != 0 and "unaligned_tail" in spec_by_tag:
+        return spec_by_tag["unaligned_tail"]
+    total_elems = case_dims.get("total_elements")
+    if isinstance(total_elems, int):
+        if int(total_elems) <= 65536 and "small_latency" in spec_by_tag:
+            return spec_by_tag["small_latency"]
+        if int(total_elems) >= 1048576 and "large_throughput" in spec_by_tag:
+            return spec_by_tag["large_throughput"]
+
     return regime_specs[0]
 
 
@@ -1794,10 +1867,10 @@ __all__ = [
     "RegimeTargetSpec",
     "append_dynamic_anchor",
     "build_anchor_var_bindings",
-    "classify_regime_runtime_backend",
     "compute_case_eq3_score",
     "default_source_root",
     "discover_module_trackb_symbols",
+    "extract_schema_driven_case_dims",
     "get_default_anchors",
     "get_default_perf_target",
     "get_default_regime_specs",
@@ -1805,6 +1878,7 @@ __all__ = [
     "get_operator_entrypoint",
     "get_operator_module_relpath",
     "get_operator_task",
+    "infer_module_runtime_backend",
     "load_anchor_harness_and_cases",
     "load_cannbench_contract_module",
     "lookup_case_dims",

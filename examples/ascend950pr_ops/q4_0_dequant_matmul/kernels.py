@@ -13,7 +13,6 @@ with dynamic toolchain discovery (no hardcoded workspace paths):
 
 from __future__ import annotations
 
-import contextlib
 import ctypes
 import fcntl
 import hashlib
@@ -24,10 +23,8 @@ import subprocess
 import tempfile
 
 import tilelang
-import tilelang.ascend.language as T
 import torch
 
-_KERNEL_CACHE: dict[tuple[object, ...], object] = {}
 _TRACK_B_LIB_CACHE: dict[str, ctypes.CDLL] = {}
 
 _Q4_0_ASC_SRC = r'''
@@ -537,18 +534,6 @@ extern "C" void launch_q4_0(
 '''
 
 
-def _ascend_target_ctx():
-    try:
-        from tilelang import tvm
-        from tilelang.backend.module import create_backend_context
-
-        if tvm.target.Target.current(allow_none=True) is None:
-            return create_backend_context("ascend").target
-    except Exception:
-        pass
-    return contextlib.nullcontext()
-
-
 def _find_bisheng() -> str | None:
     found = shutil.which("bisheng")
     if found:
@@ -652,66 +637,32 @@ def _select_q4_0_dequant_matmul_config(**kwargs) -> dict[str, object]:
     }
 
 
-def _build_q4_0_dequant_matmul_prim_func(
-    tile_m: int = 16,
-    tile_n: int = 64,
-    num_stages: int = 2,
-    tl_dtype: str = "bfloat16",
-    **_extra_kwargs,
-):
-    """Build Stage-A-valid TileLang @T.prim_func for q4_0_dequant_matmul."""
-    _ = num_stages
-    m_blk = max(16, min(64, ((int(tile_m) + 15) // 16) * 16))
-    n_blk = max(16, min(64, ((int(tile_n) + 15) // 16) * 16))
-    dt = tl_dtype if tl_dtype in ("float16", "bfloat16", "float32") else "bfloat16"
-    with _ascend_target_ctx():
-
-        @T.prim_func
-        def main(
-            X: T.Tensor((m_blk, n_blk), dt),
-            Y: T.Tensor((m_blk, n_blk), dt),
-        ):
-            with T.Kernel(1):
-                x_ub = T.alloc_shared((m_blk, n_blk), dt)
-                T.copy(X[0:m_blk, 0:n_blk], x_ub)
-                T.copy(x_ub, Y[0:m_blk, 0:n_blk])
-
-    return main
+_ACL_LIB = None
 
 
-def _get_kernel(**kwargs):
-    cfg = _select_q4_0_dequant_matmul_config(**kwargs)
-    key = (int(cfg["tile_m"]), int(cfg["tile_n"]), str(cfg["tl_dtype"]))
-    compiled = _KERNEL_CACHE.get(key)
-    if compiled is None:
-        with _ascend_target_ctx():
-            prog = _build_q4_0_dequant_matmul_prim_func(
-                tile_m=int(cfg["tile_m"]),
-                tile_n=int(cfg["tile_n"]),
-                num_stages=int(cfg["num_stages"]),
-                tl_dtype=str(cfg["tl_dtype"]),
-            )
-        compiled = tilelang.compile(prog, target="ascend", out_idx=[1])
-        _KERNEL_CACHE[key] = compiled
-    return compiled
-
-
-def _torch_q4_0_dequant_matmul(
-    x: torch.Tensor,
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    out_features: int,
-    in_features: int,
-    block_size: int = 32,
-) -> torch.Tensor:
-    num_blocks = in_features // block_size
-    packed = qweight.to(torch.uint8).reshape(out_features, num_blocks, 16)
-    low = (packed & 0x0F).to(torch.int16) - 8
-    high = ((packed >> 4) & 0x0F).to(torch.int16) - 8
-    codes = torch.cat((low, high), dim=-1).reshape(out_features, in_features).to(torch.float32)
-    w = codes * scales.to(torch.float32).repeat_interleave(block_size, dim=1)
-    out = torch.matmul(x.to(torch.float32), w.t())
-    return out.to(x.dtype)
+def _get_acl_lib() -> ctypes.CDLL:
+    global _ACL_LIB
+    if _ACL_LIB is None:
+        lib = ctypes.CDLL("libascendcl.so")
+        lib.aclrtMemsetAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+        ]
+        lib.aclrtMemsetAsync.restype = ctypes.c_int
+        lib.aclrtMemcpyAsync.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        ]
+        lib.aclrtMemcpyAsync.restype = ctypes.c_int
+        _ACL_LIB = lib
+    return _ACL_LIB
 
 
 def q4_0_dequant_matmul(
@@ -723,48 +674,103 @@ def q4_0_dequant_matmul(
     block_size: int = 32,
     quant_type: str = "q4_0",
 ) -> torch.Tensor:
-    """Compute Q4_0 dequantized matrix multiplication matching cannbot-ops contract."""
+    """Compute Q4_0 dequantized matrix multiplication on Ascend 950PR NPU."""
     if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError(f"unsupported dtype {x.dtype}")
     if quant_type != "q4_0" or block_size != 32:
         raise ValueError(f"unsupported quant_type={quant_type!r} block_size={block_size}")
+    if x.device.type != "npu":
+        raise RuntimeError("q4_0_dequant_matmul requires NPU device")
 
     n_feat = int(out_features)
     k_feat = int(in_features)
+    if k_feat % 32 != 0:
+        raise ValueError(f"in_features must be divisible by 32, got {k_feat}")
     m_rows = x.numel() // k_feat
+    out_shape = (*x.shape[:-1], n_feat) if x.ndim > 1 else (n_feat,)
+    if m_rows == 0 or n_feat == 0 or k_feat == 0:
+        return torch.empty(out_shape, dtype=x.dtype, device=x.device)
 
-    if x.device.type == "npu" and k_feat % 32 == 0 and (m_rows > 8 or k_feat <= 512):
-        lib = _get_track_b_lib()
-        if lib is not None:
-            import torch_npu
+    lib = _get_track_b_lib()
+    if lib is None:
+        raise RuntimeError("bisheng compiler unavailable for q4_0_dequant_matmul Track-B")
+    import torch_npu
 
-            xc = x.contiguous()
-            qwc = qweight.contiguous()
-            scc = scales.to(torch.float16).contiguous()
-            out_shape = (*x.shape[:-1], n_feat) if x.ndim > 1 else (n_feat,)
-            y = torch.empty(out_shape, dtype=xc.dtype, device=xc.device)
-            dcode = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}[xc.dtype]
-            stream = torch_npu.npu.current_stream().npu_stream
-            lib.launch_q4_0(
-                ctypes.c_void_p(stream),
-                ctypes.c_void_p(xc.data_ptr()),
-                ctypes.c_void_p(qwc.data_ptr()),
-                ctypes.c_void_p(scc.data_ptr()),
-                ctypes.c_void_p(y.data_ptr()),
-                m_rows,
-                n_feat,
-                k_feat,
-                dcode,
-            )
-            return y
+    xc = x.contiguous()
+    qwc = qweight.contiguous()
+    scc = scales.to(torch.float16).contiguous()
+    dcode = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}[xc.dtype]
+    stream = torch_npu.npu.current_stream().npu_stream
 
-    return _torch_q4_0_dequant_matmul(x, qweight, scales, n_feat, k_feat, block_size)
+    if m_rows <= 8 and k_feat > 512:
+        x_2d = xc.view(m_rows, k_feat)
+        x_pad = torch.empty((16, k_feat), dtype=xc.dtype, device=xc.device)
+        libacl = _get_acl_lib()
+        pad_bytes = x_pad.numel() * x_pad.element_size()
+        rc_memset = libacl.aclrtMemsetAsync(
+            ctypes.c_void_p(x_pad.data_ptr()),
+            pad_bytes,
+            0,
+            pad_bytes,
+            ctypes.c_void_p(stream),
+        )
+        if rc_memset != 0:
+            raise RuntimeError(f"aclrtMemsetAsync failed with acl error code {rc_memset}")
+        src_bytes = x_2d.numel() * x_2d.element_size()
+        rc_cp_in = libacl.aclrtMemcpyAsync(
+            ctypes.c_void_p(x_pad.data_ptr()),
+            pad_bytes,
+            ctypes.c_void_p(x_2d.data_ptr()),
+            src_bytes,
+            3,
+            ctypes.c_void_p(stream),
+        )
+        if rc_cp_in != 0:
+            raise RuntimeError(f"aclrtMemcpyAsync input failed with acl error code {rc_cp_in}")
+        y_pad = torch.empty((16, n_feat), dtype=xc.dtype, device=xc.device)
+        lib.launch_q4_0(
+            ctypes.c_void_p(stream),
+            ctypes.c_void_p(x_pad.data_ptr()),
+            ctypes.c_void_p(qwc.data_ptr()),
+            ctypes.c_void_p(scc.data_ptr()),
+            ctypes.c_void_p(y_pad.data_ptr()),
+            16,
+            n_feat,
+            k_feat,
+            dcode,
+        )
+        y_out = torch.empty(out_shape, dtype=xc.dtype, device=xc.device)
+        out_bytes = y_out.numel() * y_out.element_size()
+        rc_cp_out = libacl.aclrtMemcpyAsync(
+            ctypes.c_void_p(y_out.data_ptr()),
+            out_bytes,
+            ctypes.c_void_p(y_pad.data_ptr()),
+            out_bytes,
+            3,
+            ctypes.c_void_p(stream),
+        )
+        if rc_cp_out != 0:
+            raise RuntimeError(f"aclrtMemcpyAsync output failed with acl error code {rc_cp_out}")
+        return y_out
+
+    y = torch.empty(out_shape, dtype=xc.dtype, device=xc.device)
+    lib.launch_q4_0(
+        ctypes.c_void_p(stream),
+        ctypes.c_void_p(xc.data_ptr()),
+        ctypes.c_void_p(qwc.data_ptr()),
+        ctypes.c_void_p(scc.data_ptr()),
+        ctypes.c_void_p(y.data_ptr()),
+        m_rows,
+        n_feat,
+        k_feat,
+        dcode,
+    )
+    return y
 
 
 kernel = q4_0_dequant_matmul
 
 __all__ = [
-    "_build_q4_0_dequant_matmul_prim_func",
     "_select_q4_0_dequant_matmul_config",
     "kernel",
     "q4_0_dequant_matmul",

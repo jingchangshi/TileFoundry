@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable, Mapping, Sequence
 import contextlib
-from dataclasses import dataclass, replace
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from pathlib import Path
 
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     StaticDynamicResidual,
@@ -144,8 +144,103 @@ def _normalize_flag_list(raw_flags: object) -> list[str]:
     return [text] if text else []
 
 
+_FORBIDDEN_NPU_HOST_CALLS: frozenset[str] = frozenset(
+    {
+        "_load_golden_fn",
+        "_torch_apply_rotary_pos_emb",
+        "_torch_q4_0_dequant_matmul",
+        "matmul",
+        "bmm",
+        "einsum",
+        "rms_norm",
+        "softmax",
+        "silu",
+        "layer_norm",
+        "scaled_dot_product_attention",
+    }
+)
+
+
+def _detect_module_entrypoint(tree: ast.Module) -> str:
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                if (
+                    isinstance(tgt, ast.Name)
+                    and tgt.id == "kernel"
+                    and isinstance(node.value, ast.Name)
+                ):
+                    return node.value.id
+    return ""
+
+
+def check_npu_entrypoint_purity(module_source: str, entrypoint: str) -> list[str]:
+    """Reject detached decoy @T.prim_func scaffolds and NPU-side PyTorch/golden fallbacks."""
+    try:
+        tree = ast.parse(module_source)
+    except SyntaxError as exc:
+        return [f"syntax_error:{exc}"]
+    funcs = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    if entrypoint not in funcs:
+        return []
+
+    from tilefoundry_ascend.agent.campaign.anchor_specs import (  # noqa: PLC0415
+        infer_module_runtime_backend,
+    )
+
+    errors: list[str] = []
+    backend, _tb_syms = infer_module_runtime_backend(module_source, entrypoint)
+    reachable_src: list[str] = []
+    visited: set[str] = set()
+    queue = [entrypoint]
+    while queue:
+        fn_name = queue.pop(0)
+        if fn_name in visited or fn_name not in funcs:
+            continue
+        visited.add(fn_name)
+        fnode = funcs[fn_name]
+        reachable_src.append(ast.get_source_segment(module_source, fnode) or "")
+        for stmt in fnode.body:
+            cond_txt = (
+                (ast.get_source_segment(module_source, stmt.test) or "")
+                if isinstance(stmt, ast.If)
+                else ""
+            )
+            if isinstance(stmt, ast.If) and "device.type" in cond_txt and "!=" in cond_txt:
+                continue
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Call):
+                    callee = (
+                        sub.func.id
+                        if isinstance(sub.func, ast.Name)
+                        else (sub.func.attr if isinstance(sub.func, ast.Attribute) else "")
+                    )
+                    if callee in _FORBIDDEN_NPU_HOST_CALLS:
+                        errors.append(f"npu_host_fallback_forbidden:{fn_name}->{callee}")
+                    if isinstance(sub.func, ast.Name) and sub.func.id in funcs:
+                        queue.append(sub.func.id)
+                elif (
+                    isinstance(sub, ast.Name)
+                    and isinstance(sub.ctx, ast.Load)
+                    and sub.id in funcs
+                ):
+                    queue.append(sub.id)
+
+    for fname, fnode in funcs.items():
+        seg = ast.get_source_segment(module_source, fnode) or ""
+        if "@T.prim_func" in seg and fname not in visited:
+            errors.append(
+                f"unreachable_decoy_primfunc:{fname} is never reachable from {entrypoint}"
+            )
+    if backend == "tilelang_dsl" and "tilelang.compile(" not in "\n".join(reachable_src):
+        errors.append(
+            f"detached_decoy_primfunc:{entrypoint} never invokes tilelang.compile"
+        )
+    return errors
+
+
 def _filter_kwargs_for_callable(fn: object, kwargs: Mapping[str, object]) -> dict[str, object]:
-    import inspect
+    import inspect  # noqa: PLC0415
 
     sig = inspect.signature(fn)
     if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
@@ -220,8 +315,8 @@ def _split_selector_output(
 
 def _ascend_target_context():
     try:
-        from tilelang import tvm
-        from tilelang.backend.module import create_backend_context
+        from tilelang import tvm  # noqa: PLC0415
+        from tilelang.backend.module import create_backend_context  # noqa: PLC0415
 
         if tvm.target.Target.current(allow_none=True) is None:
             return create_backend_context("ascend").target
@@ -300,7 +395,7 @@ def _build_ascendc_static_ledger(
 ) -> ObjectivePhysicalLedger:
     """Estimate static resource ledger and waterlines for a Track-B AscendC C++ candidate."""
     resolved_target = target or AscendTarget("ascend.950pr")
-    from tilefoundry_ascend.ascend.target import AscendSpaceFacts
+    from tilefoundry_ascend.ascend.target import AscendSpaceFacts  # noqa: PLC0415
 
     facts = resolved_target.get_facts(AscendSpaceFacts)
     lower = cpp_source.lower()
@@ -387,7 +482,7 @@ def evaluate_ascendc_candidate(
     max_flag_depth: int = 15,
     enable_track_router: bool = False,
 ) -> StageAResult:
-    """Validate a Track-B AscendC C++ candidate via 7-facet verification and static ledger estimation."""
+    """Validate a Track-B AscendC C++ candidate via 7-facet checks and static ledger."""
     t0 = time.monotonic()
     if not isinstance(cpp_source, str) or not cpp_source.strip():
         return StageAResult(
@@ -399,8 +494,8 @@ def evaluate_ascendc_candidate(
             backend_kind="ascendc",
         )
 
-    from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask
-    from tilefoundry_ascend.ascend.sil.verifier import (
+    from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.sil.verifier import (  # noqa: PLC0415
         SILVerifier,
         verify_source_against_facets,
     )
@@ -426,7 +521,7 @@ def evaluate_ascendc_candidate(
     features: object | None = None
     route: object | None = None
     if enable_track_router:
-        from tilefoundry_ascend.agent.router.capability_gate import (
+        from tilefoundry_ascend.agent.router.capability_gate import (  # noqa: PLC0415
             StructuralFeatures,
             route_execution_track,
         )
@@ -487,8 +582,8 @@ def _build_custom_kernel_ledger(dsl_source: str) -> ObjectivePhysicalLedger:
 
 def _is_tvm_ir_node(obj: object) -> bool:
     try:
-        import tilelang  # noqa: F401
-        from tvm import IRModule, tirx
+        import tilelang  # noqa: F401, PLC0415
+        from tvm import IRModule, tirx  # noqa: PLC0415
 
         return isinstance(obj, (tirx.PrimFunc, IRModule))
     except Exception:
@@ -504,7 +599,7 @@ def _resolve_prim_func_and_configs_from_dsl(
     dims: Mapping[str, object] | None = None,
 ) -> tuple[object, dict[str, object], list[str]]:
     """Load DSL source via a temp module, invoke selector if present, and build PrimFunc."""
-    import importlib.util
+    import importlib.util  # noqa: PLC0415
 
     ast.parse(dsl_source)
     sel_pass_configs: dict[str, object] = {}
@@ -619,6 +714,18 @@ def run_stage_a_static(
     """Run millisecond Stage A AST, Two-Snapshot IR Diff, and optional track routing."""
     t0 = time.monotonic()
     try:
+        parsed_tree = ast.parse(dsl_source)
+        entry_name = _detect_module_entrypoint(parsed_tree)
+        if entry_name:
+            purity_errs = check_npu_entrypoint_purity(dsl_source, entry_name)
+            if purity_errs:
+                return StageAResult(
+                    passed=False,
+                    prim_func=None,
+                    ledger=None,
+                    error_message="; ".join(purity_errs),
+                    elapsed_ms=(time.monotonic() - t0) * 1000.0,
+                )
         with _ascend_target_context():
             prim_func, sel_pc, sel_cf = _resolve_prim_func_and_configs_from_dsl(
                 dsl_source,
@@ -676,7 +783,7 @@ def run_stage_a_static(
     features: object | None = None
     route: object | None = None
     if enable_track_router:
-        from tilefoundry_ascend.agent.router.capability_gate import (
+        from tilefoundry_ascend.agent.router.capability_gate import (  # noqa: PLC0415
             extract_structural_features,
             route_execution_track,
         )
@@ -999,7 +1106,7 @@ def _resolve_bisheng_bin(
 
 def _detect_tilelang_include_dir() -> str | None:
     try:
-        import tilelang
+        import tilelang  # noqa: PLC0415
 
         src_dir = Path(tilelang.__file__).resolve().parents[1] / "src"
         if (src_dir / "tl_templates" / "ascend").is_dir():
@@ -1198,7 +1305,7 @@ def synthesize_pybind_extension_wrapper(
     output_arg_names: Sequence[str] | None = None,
     scalar_params: Sequence[tuple[str, str]] | None = None,
 ) -> str:
-    """Generate a thin torch_npu pybind11 C++ extension binding preserving Python op_fn(*inputs) ABI."""
+    """Generate a thin torch_npu pybind11 wrapper preserving Python op_fn(*inputs) ABI."""
     safe_op = re.sub(r"[^A-Za-z0-9_]", "_", (op_name or "ascend_op").strip())
     if not safe_op or safe_op[0].isdigit():
         safe_op = f"op_{safe_op}"
@@ -1625,6 +1732,7 @@ __all__ = [
     "StageBResult",
     "StageCResult",
     "build_stage_b_driver_source",
+    "check_npu_entrypoint_purity",
     "evaluate_ascendc_candidate",
     "ledger_to_json",
     "parse_cce_res_usage",
