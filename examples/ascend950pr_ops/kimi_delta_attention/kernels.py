@@ -45,7 +45,6 @@ def _select_kimi_delta_attention_config(
     """Select persistent (B, H) UB-resident state regime and chunking for KDA."""
     dk_alloc = ((max(1, int(dk)) + 63) // 64) * 64
     dv_alloc = ((max(1, int(dv)) + 63) // 64) * 64
-    # Persistent FP32 state [dk_alloc, dv_alloc] in UB (128x128*4B = 64KB < 256KB)
     state_bytes = dk_alloc * dv_alloc * 4
     if state_bytes <= 192 * 1024:
         regime = "persistent_ub_state_resident"
@@ -72,7 +71,7 @@ def _build_kimi_delta_attention_prim_func(
     schedule_mode: str = "tuned",
     **_extra_kwargs,
 ):
-    """Build Ascend 950 DV-Sharded T-Batched Register-Resident @T.prim_func for KimiDeltaAttention."""
+    """Build Ascend 950 DV-sharded @T.prim_func for KimiDeltaAttention."""
     if dk <= 0 or dv <= 0:
         raise ValueError(f"dk and dv must be positive, got ({dk}, {dv})")
     if tl_dtype not in ("float16", "bfloat16", "float32"):
@@ -105,8 +104,6 @@ def _build_kimi_delta_attention_prim_func(
             scale_val: T.float32,
         ):
             with T.Kernel(num_cores) as cid:
-                # Shard across (B, H, dv_tile) so state_ub[dk_alloc, 64] fits <=32KB in UB
-                # and pred/y accumulators stay in SIMD vector registers across all dk rows.
                 state_ub = T.alloc_shared((dk_alloc, 64), "float32")
                 q_tile_ub = T.alloc_shared((t_blk, dk_alloc), tl_dtype)
                 k_tile_ub = T.alloc_shared((t_blk, dk_alloc), tl_dtype)
@@ -294,7 +291,6 @@ def _build_kimi_delta_attention_prim_func(
                                 y_reg[0] = v_zero
                                 T.simd.mem_bar("VST_VLD")
 
-                                # Loop 1: Hbar = exp(g) * Hprev, pred_reg = k^T @ Hbar (100% in register)
                                 for r in T.serial(dk):
                                     decay_v = T.simd.vld(g1_ub[r], dist="BRC_B32")
                                     k_norm_r = T.simd.vld(kf_ub[r], dist="BRC_B32")
@@ -303,7 +299,6 @@ def _build_kimi_delta_attention_prim_func(
                                     T.simd.vsts(state_ub[r, 0], h_bar, mask=mv32, dist="NORM_B32")
                                     pred_reg[0] = T.simd.vadd(pred_reg[0], T.simd.vmul(h_bar, k_norm_r, mask=mv32), mask=mv32)
 
-                                # corr = (v - pred) * beta_t kept in pred_reg[0], then Loop 2: Hnew + y_reg
                                 corr_v = T.simd.vmuls(T.simd.vsub(vf_reg[0], pred_reg[0], mask=mv32), beta_t, mask=mv32)
                                 T.simd.mem_bar("VST_VLD")
 
@@ -1930,6 +1925,12 @@ extern "C" void launch_kda(
   }
 }
 '''
+
+
+def _render_trackb_tu(**dims: object) -> str:
+    """Render an instantiated C++20 Track-B translation unit for kimi_delta_attention."""
+    raw_src = dims.get("trackb_src")
+    return str(raw_src) if raw_src is not None else _TRACK_B_ASC_SRC
 
 
 def _find_bisheng() -> str | None:

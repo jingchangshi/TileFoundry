@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
 import hashlib
 import importlib.util
 import inspect
 import math
-from pathlib import Path
 import runpy
 import tempfile
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -395,6 +396,133 @@ def verify_twin_cpu_reference(
     return True, f"twin_cpu_reference_passed: entry={checked_fn.name}, {detail}{stress_suffix}"
 
 
+@dataclass(frozen=True)
+class NumericalTwinResult:
+    """Result of CPU numerical twin comparison between authored HIR and candidate source."""
+
+    passed: bool
+    error_message: str = ""
+    detail: str = ""
+
+
+def _resolve_candidate_cpu_runner(
+    candidate_source: str,
+    *,
+    entry_name: str,
+    anchor_dims: Mapping[str, int] | None,
+) -> tuple[Callable[..., object] | None, str]:
+    """Extract a CPU-evaluable callable from candidate HIR or Python module source."""
+    if not candidate_source.strip():
+        return None, "twin_empty_candidate_source"
+    if "@module" in candidate_source:
+        try:
+            with tempfile.TemporaryDirectory(prefix="tf_twin_cand_") as tmp_dir:
+                cand_mod = _load_authored_module(
+                    candidate_source,
+                    Path(tmp_dir),
+                    test_dims=anchor_dims,
+                )
+            _checked_cand_mod, checked_cand_fn = _check_module_dims(
+                cand_mod,
+                test_dims=anchor_dims,
+            )
+            return (lambda *args: evaluate(checked_cand_fn, *args)), ""
+        except Exception as exc:
+            return None, f"twin_candidate_hir_error: {type(exc).__name__}: {exc}"
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="tf_twin_py_") as tmp_dir:
+            cand_path = Path(tmp_dir) / "candidate_mod.py"
+            cand_path.write_text(candidate_source, encoding="utf-8")
+            ns = runpy.run_path(str(cand_path))
+    except Exception as exc:
+        return None, f"twin_candidate_exec_error: {type(exc).__name__}: {exc}"
+
+    preferred_names = [
+        "cpu_reference",
+        "reference",
+        "golden",
+        entry_name,
+        "forward",
+        "kernel",
+        "main",
+    ]
+    candidates: list[Callable[..., object]] = []
+    seen_ids: set[int] = set()
+    for name in preferred_names:
+        obj = ns.get(name)
+        if callable(obj) and id(obj) not in seen_ids:
+            seen_ids.add(id(obj))
+            candidates.append(obj)
+    for name, obj in ns.items():
+        if name.startswith("_") or not callable(obj) or id(obj) in seen_ids:
+            continue
+        if getattr(obj, "__module__", None) in (None, "<run_path>"):
+            seen_ids.add(id(obj))
+            candidates.append(obj)
+
+    for obj in candidates:
+        type_name = type(obj).__name__
+        if type_name in ("PrimFunc", "IRModule"):
+            continue
+        try:
+            sig = inspect.signature(obj)
+        except (TypeError, ValueError):
+            continue
+        if len(sig.parameters) == 0:
+            continue
+        return obj, ""
+
+    return None, "twin_no_cpu_executable_candidate: candidate defines no CPU-evaluable callable"
+
+
+def verify_numerical_twin(
+    hir_source: str,
+    candidate_source: str,
+    *,
+    anchor_dims: Mapping[str, int] | None = None,
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+) -> NumericalTwinResult:
+    """Verify candidate_source against authored HIR via CPU interpreter evaluation."""
+    if not hir_source.strip():
+        return NumericalTwinResult(passed=False, error_message="twin_empty_hir_source")
+    try:
+        with tempfile.TemporaryDirectory(prefix="tf_twin_hir_") as tmp_dir:
+            authored_mod = _load_authored_module(
+                hir_source,
+                Path(tmp_dir),
+                test_dims=anchor_dims,
+            )
+        _checked_mod, checked_fn = _check_module_dims(authored_mod, test_dims=anchor_dims)
+    except Exception as exc:
+        return NumericalTwinResult(
+            passed=False,
+            error_message=f"twin_hir_load_error: {type(exc).__name__}: {exc}",
+        )
+
+    runner, err = _resolve_candidate_cpu_runner(
+        candidate_source,
+        entry_name=checked_fn.name,
+        anchor_dims=anchor_dims,
+    )
+    if runner is None:
+        return NumericalTwinResult(passed=False, error_message=err)
+
+    ok, detail = verify_twin_cpu_reference(
+        hir_source,
+        runner,
+        test_dims=anchor_dims,
+        rtol=rtol,
+        atol=atol,
+    )
+    return NumericalTwinResult(
+        passed=ok,
+        error_message="" if ok else detail,
+        detail=detail,
+    )
+
+
 
 _CANNNBENCH_THRESHOLDS: dict[str, float] = {
     "float16": 2**-10,
@@ -711,10 +839,7 @@ def _synthesize_contract_tensor(
     elif value_range is not None:
         lo_raw = hi_raw = _coerce_vr_endpoint(value_range)
     else:
-        norm_name = param_name.strip().lower()
-        if "scale" in norm_name:
-            lo_raw, hi_raw = 0.01, 0.08
-        elif tdtype == torch.uint8:
+        if tdtype == torch.uint8:
             lo_raw, hi_raw = 0, 255
         elif tdtype.is_floating_point:
             lo_raw, hi_raw = -1.0, 1.0
@@ -770,10 +895,12 @@ def _synthesize_contract_tensor(
         lo_c = max(lo_f, float(finfo.min))
         hi_c = min(hi_f, float(finfo.max))
         vals = torch.rand(target_shape, dtype=torch.float64, generator=generator) * (hi_c - lo_c) + lo_c
-        if param_name.strip().lower() in ("w", "weight", "gamma", "scale", "scales") and vals.numel() > 0:
-            zero_mask = vals == 0.0
-            if bool(zero_mask.any().item()):
-                vals[zero_mask] = 0.05
+        if lo_c < 0.0 < hi_c and vals.numel() > 0:
+            near_zero = vals.abs() < 1e-4
+            if bool(near_zero.any().item()):
+                pos_step = torch.tensor(min(1e-2, hi_c * 0.5), dtype=torch.float64)
+                neg_step = torch.tensor(max(-1e-2, lo_c * 0.5), dtype=torch.float64)
+                vals[near_zero] = torch.where(vals[near_zero] >= 0.0, pos_step, neg_step)
         return torch.clamp(vals, float(finfo.min), float(finfo.max)).to(tdtype)
 
     lo_i = int(_to_float(lo_raw))
@@ -1097,7 +1224,9 @@ class CannbenchContractOracle:
 
 __all__ = [
     "CannbenchContractOracle",
+    "NumericalTwinResult",
     "build_tilelang_runtime_twin",
     "compare_cannbench_tensor",
+    "verify_numerical_twin",
     "verify_twin_cpu_reference",
 ]

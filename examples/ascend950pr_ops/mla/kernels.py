@@ -3706,17 +3706,17 @@ def _merge_compile_flags(flags: list[str] | tuple[str, ...]) -> list[str] | None
     return merged or None
 
 
-def _build_mla_trackb_callable(
-    n_q: int,
+def _render_mla_trackb_launcher(
+    trackb_src: str,
+    *,
+    bm: int,
     d_nope: int,
     tl_dtype: str,
-    input_layout: str,
-    is_causal: bool,
-    bm: int,
-):
+) -> str:
+    """Append concrete launch_mla_trackb template instantiation to *trackb_src*."""
     c_dtype = "bfloat16_t" if tl_dtype == "bfloat16" else "half"
-    launcher_src = (
-        _MLA_TRACKB_SRC
+    return (
+        trackb_src
         + f"""
 extern "C" int launch_mla_trackb(
     void* stream, void* q_n, void* q_r, void* k_n, void* k_r, void* out, void* o_part, void* lse_part,
@@ -3733,6 +3733,38 @@ extern "C" int launch_mla_trackb(
   return 0;
 }}
 """
+    )
+
+
+def _render_trackb_tu(**dims: object) -> str:
+    """Render an instantiated C++20 Track-B translation unit for MLA."""
+    raw_src = dims.get("trackb_src")
+    trackb_src = str(raw_src) if raw_src is not None else _MLA_TRACKB_SRC
+    bm = int(dims.get("bm", 64) or 64)
+    d_nope = int(dims.get("d_nope", dims.get("D_nope", 512)) or 512)
+    raw_dt = str(dims.get("tl_dtype", dims.get("dtype", "float16")) or "float16").strip()
+    tl_dtype = raw_dt if raw_dt in ("float16", "bfloat16") else "float16"
+    return _render_mla_trackb_launcher(
+        trackb_src,
+        bm=bm,
+        d_nope=d_nope,
+        tl_dtype=tl_dtype,
+    )
+
+
+def _build_mla_trackb_callable(
+    n_q: int,
+    d_nope: int,
+    tl_dtype: str,
+    input_layout: str,
+    is_causal: bool,
+    bm: int,
+):
+    launcher_src = _render_mla_trackb_launcher(
+        _MLA_TRACKB_SRC,
+        bm=bm,
+        d_nope=d_nope,
+        tl_dtype=tl_dtype,
     )
     tl_inc = str(Path(tilelang.__file__).resolve().parent.parent / "src")
     opts = [f"-I{tl_inc}", *_cann_include_flags()]
@@ -3798,7 +3830,7 @@ extern "C" int launch_mla_trackb(
         )
         return out_flat
 
-    _run._so_lib = lib  # keep shared library loaded
+    _run._so_lib = lib
     return _run
 
 

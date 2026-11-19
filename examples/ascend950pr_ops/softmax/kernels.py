@@ -43,7 +43,6 @@ def _select_softmax_config(
 
     if inner_dim > 1:
         w_tile = 64
-        # Check if full column slice (d_dim, 64) fits in UB for single-load softmax
         stages_ub = 2 if schedule_mode == "tuned" else 1
         need_s2 = d_dim * w_tile * (2 * elem_bytes * stages_ub + 4)
         need_s1 = d_dim * w_tile * (2 * elem_bytes + 4)
@@ -160,7 +159,7 @@ def _build_softmax_prim_func(
     schedule_mode: str = "tuned",
     **_extra_kwargs,
 ):
-    """Build Ascend 950 Pure RegBase SimdVF / SimtVF @T.prim_func for Softmax with inf/nan-safe math."""
+    """Build Ascend 950 RegBase SimdVF/SimtVF @T.prim_func for inf/nan-safe Softmax."""
     if d_dim <= 0:
         raise ValueError(f"d_dim must be positive, got {d_dim}")
     if tl_dtype not in ("float16", "bfloat16", "float32"):
@@ -241,7 +240,6 @@ def _build_softmax_prim_func(
 
             return main
 
-        # Online 2-pass softmax for tall d_dim (> 512) with 2D burst DMA
         d_blk = min(d_dim, int(d_tile) if d_tile else 256)
         d_blocks = (d_dim + d_blk - 1) // d_blk
 
@@ -283,7 +281,6 @@ def _build_softmax_prim_func(
                             T.simd.vsts(max_ub[0], T.simd.vdup(T.float32(-1.0e38), "float32", mask=mw), mask=mw, dist="NORM_B32")
                             T.simd.vsts(sum_ub[0], T.simd.vdup(T.float32(0.0), "float32", mask=mw), mask=mw, dist="NORM_B32")
 
-                        # Pass 1: online max + rescaled exp sum in one read pass
                         for db in T.Pipelined(d_blocks, num_stages=stages, annotations=pipe_ann):
                             d0 = db * d_blk
                             d_cur = T.min(d_blk, d_dim - d0)
@@ -315,7 +312,6 @@ def _build_softmax_prim_func(
                                 T.simd.vsts(max_ub[0], m_new, mask=mw, dist="NORM_B32")
                                 T.simd.vsts(sum_ub[0], s_acc[0], mask=mw, dist="NORM_B32")
 
-                        # Pass 2: normalize and write Y
                         for db in T.Pipelined(d_blocks, num_stages=stages, annotations=pipe_ann):
                             d0 = db * d_blk
                             d_cur = T.min(d_blk, d_dim - d0)
@@ -1306,13 +1302,27 @@ __global__ __vector__ void softmax_inner_2pass_kernel(
 """
 
 
+def _cann_include_flags() -> list[str]:
+    """Discover CANN include directories from ASCEND_HOME_PATH or ASCEND_TOOLKIT_HOME."""
+    flags: list[str] = []
+    for env_key in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME"):
+        asc_home = os.environ.get(env_key, "").strip()
+        if not asc_home:
+            continue
+        for sub in ("include", "x86_64-linux/include", "aarch64-linux/include", "runtime/include"):
+            asc_inc = os.path.join(asc_home, sub)
+            flag = f"-I{asc_inc}"
+            if os.path.isdir(asc_inc) and flag not in flags:
+                flags.append(flag)
+    return flags
+
+
 def _select_trackb_softmax_plan(d_dim: int, tl_dtype: str, m_rows: int, inner_dim: int):
+    """Select Track-B Softmax tiling and pass regime."""
     elem_bytes = 4 if tl_dtype == "float32" else 2
     ub_budget = 248 * 1024
 
     if inner_dim > 1:
-        # Check if 1-pass fits with generous w_tile maximizing burst length & core occupancy
-        # Candidate w_tiles (multiples of 16)
         w_align = ((inner_dim + 15) // 16) * 16
         cand_ws = []
         if w_align <= 512:
@@ -1340,7 +1350,6 @@ def _select_trackb_softmax_plan(d_dim: int, tl_dtype: str, m_rows: int, inner_di
             _, wt, stages = best_1p
             return ("inner_1pass", wt, stages, d_dim)
 
-        # 2-pass online: maximize burst width & fit in 1 wave if m_rows == 1
         if m_rows == 1:
             target_w = max(64, ((inner_dim + 55) // 56 + 15) // 16 * 16)
             wt = min(256, target_w)
@@ -1351,11 +1360,9 @@ def _select_trackb_softmax_plan(d_dim: int, tl_dtype: str, m_rows: int, inner_di
             d_blk = min(d_dim, max(16, (ub_budget - 2 * wt * 4) // (2 * wt * elem_bytes)))
         return ("inner_2pass", wt, 2, d_blk)
 
-    # inner_dim == 1, d_dim > 16
     d_ub_stride = ((d_dim + 15) // 16) * 16
     is_reg = 1 if d_dim <= 512 else 0
     exp_b = 0 if (elem_bytes == 4 or is_reg) else (d_ub_stride * 4)
-    # Two stages of (rows_blk * d_ub_stride + 64) * elem_bytes
     slack_b = 2 * 64 * elem_bytes
     avail = max(1, ub_budget - exp_b - slack_b)
     max_rows = max(1, min(256, avail // (2 * d_ub_stride * elem_bytes)))
@@ -1367,19 +1374,19 @@ def _select_trackb_softmax_plan(d_dim: int, tl_dtype: str, m_rows: int, inner_di
     return ("last_axis", d_ub_stride, rows_blk, is_reg)
 
 
-def _get_trackb_kernel(d_dim: int, tl_dtype: str, m_rows: int, inner_dim: int):
-    plan = _select_trackb_softmax_plan(d_dim, tl_dtype, m_rows, inner_dim)
-    key = ("softmax_trackb", d_dim, tl_dtype, plan)
-    cached = _KERNEL_CACHE.get(key)
-    if cached is not None:
-        return cached
-
+def _render_softmax_trackb_launcher(
+    trackb_src: str,
+    d_dim: int,
+    tl_dtype: str,
+    plan: tuple[object, ...],
+) -> str:
+    """Append concrete launch_softmax_tb template instantiation to *trackb_src*."""
     c_in = {"float16": "half", "bfloat16": "bfloat16_t", "float32": "float"}[tl_dtype]
     kind = plan[0]
     if kind == "last_axis":
         _, d_ub_stride, rows_blk, is_reg = plan
-        launcher = (
-            _SOFTMAX_TRACKB_SRC
+        return (
+            trackb_src
             + f"""
 extern "C" int launch_softmax_tb(void* stream, void* x_ptr, void* y_ptr, int a, int b) {{
   softmax_last_axis_kernel<{d_dim}, {d_ub_stride}, {rows_blk}, {is_reg}, {c_in}><<<56, nullptr, stream>>>(
@@ -1388,10 +1395,10 @@ extern "C" int launch_softmax_tb(void* stream, void* x_ptr, void* y_ptr, int a, 
 }}
 """
         )
-    elif kind == "inner_1pass":
+    if kind == "inner_1pass":
         _, w_tile, stages, _ = plan
-        launcher = (
-            _SOFTMAX_TRACKB_SRC
+        return (
+            trackb_src
             + f"""
 extern "C" int launch_softmax_tb(void* stream, void* x_ptr, void* y_ptr, int a, int b) {{
   softmax_inner_1pass_kernel<{d_dim}, {w_tile}, {stages}, {c_in}><<<56, nullptr, stream>>>(
@@ -1400,25 +1407,43 @@ extern "C" int launch_softmax_tb(void* stream, void* x_ptr, void* y_ptr, int a, 
 }}
 """
         )
-    else:
-        _, w_tile, _, d_blk = plan
-        launcher = (
-            _SOFTMAX_TRACKB_SRC
-            + f"""
+    _, w_tile, _, d_blk = plan
+    return (
+        trackb_src
+        + f"""
 extern "C" int launch_softmax_tb(void* stream, void* x_ptr, void* y_ptr, int a, int b) {{
   softmax_inner_2pass_kernel<{d_dim}, {d_blk}, {w_tile}, {c_in}><<<56, nullptr, stream>>>(
       (__gm__ {c_in}*)x_ptr, (__gm__ {c_in}*)y_ptr, a, b);
   return 0;
 }}
 """
-        )
+    )
+
+
+def _render_trackb_tu(**dims: object) -> str:
+    """Render an instantiated C++20 Track-B translation unit for Softmax."""
+    raw_src = dims.get("trackb_src")
+    trackb_src = str(raw_src) if raw_src is not None else _SOFTMAX_TRACKB_SRC
+    d_dim = int(dims.get("d_dim", dims.get("D", dims.get("dim_d", 128))) or 128)
+    m_rows = int(dims.get("m_rows", dims.get("M", dims.get("outer_dim", 64))) or 64)
+    inner_dim = int(dims.get("inner_dim", dims.get("inner", 1)) or 1)
+    raw_dt = str(dims.get("tl_dtype", dims.get("dtype", "float16")) or "float16").strip()
+    tl_dtype = raw_dt if raw_dt in ("float16", "bfloat16", "float32") else "float16"
+    plan = _select_trackb_softmax_plan(d_dim, tl_dtype, m_rows, inner_dim)
+    return _render_softmax_trackb_launcher(trackb_src, d_dim, tl_dtype, plan)
+
+
+def _get_trackb_kernel(d_dim: int, tl_dtype: str, m_rows: int, inner_dim: int):
+    plan = _select_trackb_softmax_plan(d_dim, tl_dtype, m_rows, inner_dim)
+    key = ("softmax_trackb", d_dim, tl_dtype, plan)
+    cached = _KERNEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    launcher = _render_softmax_trackb_launcher(_SOFTMAX_TRACKB_SRC, d_dim, tl_dtype, plan)
 
     tl_inc = str(Path(tilelang.__file__).resolve().parent.parent / "src")
-    asc_home = os.environ.get("ASCEND_HOME_PATH", "")
-    asc_inc = os.path.join(asc_home, "include") if asc_home else ""
-    opts = [f"-I{tl_inc}"]
-    if asc_inc and os.path.isdir(asc_inc):
-        opts.append(f"-I{asc_inc}")
+    opts = [f"-I{tl_inc}", *_cann_include_flags()]
     opts.extend(PURE_SIMDVF_UBUF_FLAGS)
     so_dir = tempfile.mkdtemp(prefix="softmax_tb_")
     so_path = os.path.join(so_dir, "softmax_tb.so")

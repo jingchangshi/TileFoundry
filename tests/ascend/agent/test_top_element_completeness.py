@@ -101,7 +101,7 @@ def vec_copy_add(A: T.Tensor((512,), "float32"), B: T.Tensor((512,), "float32"),
         T.copy(c_ub, C)
 """
     pf = _resolve_prim_func_from_dsl(dsl)
-    art = tilelang.lower(pf, target="ascend", enable_device_compile=False)
+    art = tilelang.lower(pf, target="ascend")
     assert art.kernel_source
     tu_tl = materialize_top_translation_unit(
         "vec_copy_add",
@@ -211,9 +211,9 @@ def test_cfg_flag_balance_1c2v_core_roles_and_symbolic_flags() -> None:
     }
     """
     rep_sym_top = verify_source_against_facets(tu_symbolic_1c2v, m_top)
-    assert rep_sym_top.passed is True, rep_sym_top.errors
-    assert rep_sym_top.errors == ()
-    assert len(rep_sym_top.warnings) >= 1
+    assert rep_sym_top.passed is False
+    assert len(rep_sym_top.errors) >= 1
+    assert rep_sym_top.warnings == ()
 
     tu_symbolic_helpers = """
     void ProduceStep(int sid) {
@@ -224,8 +224,9 @@ def test_cfg_flag_balance_1c2v_core_roles_and_symbolic_flags() -> None:
     }
     """
     rep_helpers_top = verify_source_against_facets(tu_symbolic_helpers, m_top)
-    assert rep_helpers_top.passed is True
-    assert len(rep_helpers_top.warnings) >= 1
+    assert rep_helpers_top.passed is False
+    assert len(rep_helpers_top.errors) >= 1
+    assert rep_helpers_top.warnings == ()
 
     rep_sym_nontop = verify_source_against_facets(tu_symbolic_1c2v, m_sync)
     assert rep_sym_nontop.passed is False
@@ -290,14 +291,13 @@ extern "C" __global__ __aicore__ __vector__ void broken_k(__gm__ float* x) {
 
 
 def test_stage_b_ascendc_graceful_no_bisheng_and_pybind_abi_wrapper() -> None:
-    """Verify enable_device_compile=False fallback and torch_npu pybind extension ABI helper."""
-    sb_disabled = run_stage_b_ascendc_compile(
-        "extern \"C\" __global__ __aicore__ void k() {}",
-        bisheng_bin="/nonexistent/bin/bisheng",
-        enable_device_compile=False,
-    )
-    assert sb_disabled.passed is True
-    assert sb_disabled.compiler_summary == BishengResourceSummary()
+    """Verify enable_device_compile=False raises ValueError and pybind ABI wrapper helper."""
+    with pytest.raises(ValueError, match="enable_device_compile=False"):
+        run_stage_b_ascendc_compile(
+            'extern "C" __global__ __aicore__ void k() {}',
+            bisheng_bin="/nonexistent/bin/bisheng",
+            enable_device_compile=False,
+        )
 
     sb_missing = run_stage_b_ascendc_compile(
         "extern \"C\" __global__ __aicore__ void k() {}",

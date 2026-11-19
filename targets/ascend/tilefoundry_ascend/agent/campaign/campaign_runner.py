@@ -126,7 +126,6 @@ from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
-    build_objective_physical_ledger,
 )
 from tilefoundry_ascend.ascend.schedule.regime_solver import (
     RegimePiecewiseSolver,
@@ -142,6 +141,7 @@ from tilefoundry_ascend.ascend.sil.schema import (
     RegimeSlice,
     TopologyAxes,
 )
+from tilefoundry_ascend.ascend.sil.verifier import verify_source_against_facets
 from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS, AscendTarget
 from tilefoundry_ascend.ascend.templates.registry import relax_facets_for_bottleneck
 
@@ -1162,16 +1162,6 @@ def _surrogate_rank_key(res: CandidateSurrogateResult) -> tuple[float, float, fl
     return (res.surrogate_score, res.min_case_speedup, res.avg_speedup)
 
 
-def _fallback_ledger() -> ObjectivePhysicalLedger:
-    return build_objective_physical_ledger(
-        analysis_mode="readonly_envelope",
-        is_legal=True,
-        steady_state_ii=100,
-        pipe_cycles={"AIV0.PIPE_V": 100},
-        waterlines={},
-    )
-
-
 def _format_anchor_telemetry(
     result: CandidateSurrogateResult,
     regime_tag: str,
@@ -1644,6 +1634,83 @@ class PerfTargetCampaignRunner:
             combine_kwargs = merged_kwargs
         return combine_fn, combine_kwargs
 
+    def _instantiate_trackb_tu(
+        self,
+        module_source: str,
+        cpp_source: str,
+        regime_spec: RegimeTargetSpec,
+    ) -> str:
+        """Instantiate Track-B C++20 TU via module _render_trackb_tu if present."""
+        try:
+            tree = ast.parse(module_source)
+        except SyntaxError:
+            return cpp_source
+        if _find_top_level_func(tree, ("_render_trackb_tu",)) is None:
+            return cpp_source
+        dims: dict[str, object] = dict(
+            regime_spec.representative_anchor_dims
+            or regime_spec.representative_hir_dims
+            or regime_spec.sample_builder_kwargs
+            or {}
+        )
+        try:
+            resolved = resolve_regime_config(module_source, regime_spec, dims=dims)
+            for k, v in resolved.builder_kwargs.items():
+                dims.setdefault(k, v)
+        except Exception:
+            pass
+        dims["trackb_src"] = cpp_source
+        with tempfile.TemporaryDirectory(prefix="tf_trackb_inst_") as tmp_dir:
+            mod_file = Path(tmp_dir) / "candidate_mod.py"
+            mod_file.write_text(module_source, encoding="utf-8")
+            spec = importlib.util.spec_from_file_location("_tf_trackb_render", str(mod_file))
+            if spec is None or spec.loader is None:
+                return cpp_source
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            fn = getattr(mod, "_render_trackb_tu", None)
+            if not callable(fn):
+                return cpp_source
+            rendered = fn(**dims)
+        return str(rendered) if isinstance(rendered, str) and rendered.strip() else cpp_source
+
+    def _resolve_trackb_freedom_mask(
+        self,
+        regime_spec: RegimeTargetSpec,
+    ) -> ConstraintRelaxationMask:
+        """Return active 7-facet mask for *regime_spec*, seeding Track-B baseline facets once."""
+        existing = self._freedom_masks.get(regime_spec.regime_tag)
+        if existing is not None:
+            return existing
+        baseline_src = self._active_incumbent_source
+        if not baseline_src and self._target_module_path.is_file():
+            baseline_src = self._target_module_path.read_text(encoding="utf-8")
+        if baseline_src and regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb"):
+            base_tb = _extract_trackb_cpp_source(baseline_src, regime_spec)
+            if base_tb is not None:
+                base_tu = self._instantiate_trackb_tu(baseline_src, base_tb[1], regime_spec)
+                rep = verify_source_against_facets(base_tu, ConstraintRelaxationMask.bottom())
+                fixes = rep.suggested_fixes
+                if not rep.passed and fixes:
+                    return ConstraintRelaxationMask(
+                        alg_compute_and_monoid=not bool(fixes.get("unlock_alg_compute_and_monoid")),
+                        tile_and_stage_knobs=True,
+                        exec_mode_and_spr=bool(fixes.get("unlock_exec_mode_and_spr", False)),
+                        sram_layout_and_aliasing=bool(
+                            fixes.get("unlock_sram_layout_and_aliasing", False)
+                        ),
+                        dma_and_cache_hierarchy=bool(
+                            fixes.get("unlock_dma_and_cache_hierarchy", False)
+                        ),
+                        pipeline_and_sync_graph=bool(
+                            fixes.get("unlock_pipeline_and_sync_graph", False)
+                        ),
+                        grid_and_workspace_topology=bool(
+                            fixes.get("unlock_grid_and_workspace_topology", False)
+                        ),
+                    )
+        return ConstraintRelaxationMask.bottom()
+
     def _compile_trackb_stage_b(self, cpp_source: str) -> StageBResult:
         cann_root = _resolve_cann_root_from_env_file(self._env_file)
         bisheng_bin: str | None = None
@@ -1672,9 +1739,13 @@ class PerfTargetCampaignRunner:
             else None
         )
         if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
+            active_mask = self._resolve_trackb_freedom_mask(regime_spec)
+            instantiated_tu = self._instantiate_trackb_tu(
+                module_source, tb_extracted[1], regime_spec
+            )
             return evaluate_ascendc_candidate(
-                tb_extracted[1],
-                freedom_mask=ConstraintRelaxationMask.top(),
+                instantiated_tu,
+                freedom_mask=active_mask,
                 target=self._target,
                 enable_track_router=self._enable_track_router,
             )
@@ -1732,9 +1803,11 @@ class PerfTargetCampaignRunner:
                 )
         if regime_spec.runtime_backend == "hybrid_trackb" and tb_extracted is not None:
             tb_sym, tb_cpp = tb_extracted
+            active_mask = self._resolve_trackb_freedom_mask(regime_spec)
+            instantiated_tu = self._instantiate_trackb_tu(module_source, tb_cpp, regime_spec)
             tb_res = evaluate_ascendc_candidate(
-                tb_cpp,
-                freedom_mask=ConstraintRelaxationMask.top(),
+                instantiated_tu,
+                freedom_mask=active_mask,
                 target=self._target,
                 enable_track_router=self._enable_track_router,
             )
@@ -1765,7 +1838,10 @@ class PerfTargetCampaignRunner:
             else None
         )
         if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
-            return self._compile_trackb_stage_b(tb_extracted[1])
+            instantiated_tu = self._instantiate_trackb_tu(
+                module_source, tb_extracted[1], regime_spec
+            )
+            return self._compile_trackb_stage_b(instantiated_tu)
 
         anchor_dims = (
             regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
@@ -1811,7 +1887,8 @@ class PerfTargetCampaignRunner:
                 )
         if regime_spec.runtime_backend == "hybrid_trackb" and tb_extracted is not None:
             tb_sym, tb_cpp = tb_extracted
-            tb_b = self._compile_trackb_stage_b(tb_cpp)
+            instantiated_tu = self._instantiate_trackb_tu(module_source, tb_cpp, regime_spec)
+            tb_b = self._compile_trackb_stage_b(instantiated_tu)
             if not tb_b.passed:
                 return StageBResult(
                     passed=False,
@@ -2342,7 +2419,7 @@ class PerfTargetCampaignRunner:
                 stage_a = self._run_l0(source, self._regime_specs[0])
             except Exception:
                 stage_a = None
-        ledger = stage_a.ledger if (stage_a is not None and stage_a.ledger is not None) else _fallback_ledger()
+        ledger = stage_a.ledger if stage_a is not None else None
         axes = self._derive_topology_axes(
             ledger,
             features=stage_a.features if stage_a is not None else None,
@@ -3118,8 +3195,12 @@ class PerfTargetCampaignRunner:
         )
 
         base_stage_a = self._run_l0(incumbent_source, regime_spec)
-        base_ledger = base_stage_a.ledger if base_stage_a.ledger is not None else _fallback_ledger()
-        parent_ledger = stone_ledger if stone_ledger is not None else base_ledger
+        parent_ledger = stone_ledger if stone_ledger is not None else base_stage_a.ledger
+        if parent_ledger is None:
+            raise RuntimeError(
+                f"Stage-A L0 produced no ledger for regime {regime_spec.regime_tag!r}: "
+                f"{base_stage_a.error_message}"
+            )
         if self._enable_track_router:
             parent_track = (
                 stone_track
@@ -3274,10 +3355,7 @@ class PerfTargetCampaignRunner:
             parent_workload,
             bisheng_res=parent_comp_summary,
         )
-        active_mask = self._freedom_masks.get(
-            regime_spec.regime_tag,
-            ConstraintRelaxationMask.bottom(),
-        )
+        active_mask = self._resolve_trackb_freedom_mask(regime_spec)
         escalation_decision = None
         pipe_gap_report = None
         escalated_trackb_tu = ""
@@ -3715,11 +3793,9 @@ class PerfTargetCampaignRunner:
             if res is None:
                 continue
             wkind, rule, cand_hypothesis = meta_by_id[chk.candidate_id]
-            ledger = (
-                chk.stage_a.ledger
-                if chk.stage_a and chk.stage_a.ledger is not None
-                else _fallback_ledger()
-            )
+            ledger = chk.stage_a.ledger if chk.stage_a else None
+            if ledger is None:
+                continue
             track = (
                 chk.stage_a.route.track
                 if self._enable_track_router and chk.stage_a and chk.stage_a.route is not None
@@ -3976,11 +4052,7 @@ class PerfTargetCampaignRunner:
                     base_sa = self._run_l0(incumbent_source, self._regime_specs[0])
                 except Exception:
                     base_sa = None
-            base_ledger = (
-                base_sa.ledger
-                if (base_sa is not None and base_sa.ledger is not None)
-                else _fallback_ledger()
-            )
+            base_ledger = base_sa.ledger if base_sa is not None else None
             base_axes = self._derive_topology_axes(
                 base_ledger,
                 features=base_sa.features if base_sa is not None else None,

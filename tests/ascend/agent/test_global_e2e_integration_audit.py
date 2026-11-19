@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 from pathlib import Path
@@ -18,7 +19,6 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     PerfTargetCampaignRunner,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
-    CandidateSurrogateResult,
     L3AcceptanceResult,
     aggregate_surrogate_result,
     build_anchor_metrics,
@@ -44,7 +44,6 @@ from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate,
     StaticDynamicResidual,
-    TwoLaneBeamSearch,
     compute_static_dynamic_residual,
     extract_structural_signature,
 )
@@ -74,7 +73,6 @@ from tilefoundry_ascend.ascend.sil import (
     OpAdvisoryExtractor,
     RegimeSlice,
     SILVerifier,
-    SchedulePolicy,
     TopologyAxes,
     verify_source_against_facets,
 )
@@ -99,28 +97,27 @@ def make_kernel(M: int = 64, N: int = 64):
 """
 
 
-# ---------------------------------------------------------------------------
-# 1. Unified Compiler Telemetry & False-Positive Stack-Spill Fix
-# ---------------------------------------------------------------------------
-
-
 def test_audit1_stack_frame_not_spill_and_7_compiler_signals_e2e() -> None:
-    """Stack Frame Size != spill, StageBResult carries BishengResourceSummary, and all 7 signals reach KB & Beam."""
-    # Normal stack frame size must NOT be misclassified as register spill
-    spill_clean, vloop_clean = parse_cce_res_usage(
+    """Stack Frame Size != spill, StageBResult carries summary, and signals reach KB & Beam."""
+    spill_no_vloop, vloop_no_ev = parse_cce_res_usage(
         "Vector Register Usage: 32\nScalar Register Usage: 16\nStack Frame Size: 128 bytes\n"
+    )
+    assert spill_no_vloop == 0
+    assert vloop_no_ev is False
+
+    spill_clean, vloop_clean = parse_cce_res_usage(
+        "Vector Register Usage: 32\nScalar Register Usage: 16\n"
+        "Stack Frame Size: 128 bytes\nVLOOPv2 hit\n"
     )
     assert spill_clean == 0
     assert vloop_clean is True
 
-    # Real register spill + VLOOPv2 miss must still be detected accurately
     spill_real, vloop_miss = parse_cce_res_usage(
         "Register Spill: 64 bytes\nStack Frame Size: 128 bytes\nremark: VLOOPv2 miss: inner branch\n"
     )
     assert spill_real == 64
     assert vloop_miss is False
 
-    # Construct StageBResult with rich 7-signal BishengResourceSummary
     comp_summary = BishengResourceSummary(
         vec_regs=64,
         scalar_regs=48,
@@ -163,10 +160,8 @@ def test_audit1_stack_frame_not_spill_and_7_compiler_signals_e2e() -> None:
     assert res.dcache_dcci_flushes == 4
     assert res.has_local_membar_in_vf_call is True
 
-    # Roundtrip StaticDynamicResidual
     assert StaticDynamicResidual.from_dict(res.to_dict()) == res
 
-    # ResidualBeam structural signature captures compiler hazards
     sig = extract_structural_signature(_SIMPLE_VECTOR_DSL, residual=res, stage_b=ev.stage_b)
     assert "hw:register_spill" in sig
     assert "hw:vloopv2_miss" in sig
@@ -176,7 +171,6 @@ def test_audit1_stack_frame_not_spill_and_7_compiler_signals_e2e() -> None:
     assert "hw:dcache_dcci" in sig
     assert "hw:local_membar_vf" in sig
 
-    # KB predicate context observes all 7 signals cleanly (in ctx and ctx['prev'])
     ctx = build_predicate_context(ev.stage_a.ledger, residual=res)
     for key in (
         "spill_bytes",
@@ -205,13 +199,8 @@ def test_audit1_stack_frame_not_spill_and_7_compiler_signals_e2e() -> None:
     assert compiler_rule.matches(ctx) is True
 
 
-# ---------------------------------------------------------------------------
-# 2. TopologyAxes End-to-End Wiring + Split-Brain Truth Table Reconciliation
-# ---------------------------------------------------------------------------
-
-
 def test_audit2_reconciled_truth_tables_and_bayesian_axis_transfer_in_runners(tmp_path: Path) -> None:
-    """Reconcile op_analyzer vs capability_gate, bridge via resolve_canonical_topology_axes, and wire runners."""
+    """Reconcile op_analyzer vs capability_gate, bridge via canonical axes, and wire runners."""
     if DEFAULT_OPS_ROOT.is_dir():
         extractor = OpAdvisoryExtractor(DEFAULT_OPS_ROOT)
         for op_name in (
@@ -228,7 +217,6 @@ def test_audit2_reconciled_truth_tables_and_bayesian_axis_transfer_in_runners(tm
             dec = route_from_op_spec(adv.to_dict())
             assert dec.topology_axes == adv.topology_axes == resolve_canonical_topology_axes(adv)
 
-    # Unseen op resolution parity across string, dict, and StructuralFeatures
     unseen_axes = resolve_canonical_topology_axes(
         "unseen_sparse_attention_v2",
         features=StructuralFeatures(False, 1.0, "none", True, "associative_online_rescale", True, 128, 1.0),
@@ -236,7 +224,6 @@ def test_audit2_reconciled_truth_tables_and_bayesian_axis_transfer_in_runners(tm
     assert unseen_axes.compute_engine == "coupled_1c2v"
     assert unseen_axes.iteration_regularity == "irregular_simt"
 
-    # PortfolioRunner passes topology_axes into BayesianRuleTracker rank & record_outcome
     tracker = BayesianRuleTracker.from_seed_yaml()
     funnel = GateFunnel(
         compile_runner=lambda _s: StageBResult(passed=True),
@@ -289,7 +276,6 @@ def test_audit2_reconciled_truth_tables_and_bayesian_axis_transfer_in_runners(tm
     assert "mr:persistent_onchip_state" in tracker.axis_posteriors
     assert "ir:irregular_simt" in tracker.axis_posteriors
 
-    # PerfTargetCampaignRunner passes topology_axes into rank_applicable_rules & record_outcome
     mod_file = tmp_path / "dummy_op.py"
     mod_file.write_text(
         "def _select_dummy_config(**kw):\n"
@@ -359,11 +345,6 @@ def test_audit2_reconciled_truth_tables_and_bayesian_axis_transfer_in_runners(tm
     assert "ir:ragged_group" in camp_tracker.axis_posteriors
 
 
-# ---------------------------------------------------------------------------
-# 3. Live Mechanical SDK Header & TileLang Codegen Scanner
-# ---------------------------------------------------------------------------
-
-
 def test_audit3_live_sdk_header_and_tilelang_codegen_scanner() -> None:
     """Scan real Ascend SDK headers on disk (fail closed unless fallback allowed)."""
     with pytest.raises(FileNotFoundError):
@@ -395,11 +376,6 @@ def test_audit3_live_sdk_header_and_tilelang_codegen_scanner() -> None:
         assert "target.build.tilelang_ascend" in syms
 
 
-# ---------------------------------------------------------------------------
-# 4. Orthogonal 6-Facet Constraint Relaxation Lattice & Verifier
-# ---------------------------------------------------------------------------
-
-
 def test_audit4_mece_7facet_relaxation_lattice_and_verifier() -> None:
     """Minimal causal facet unlocking + per-facet verification + CFG SetFlag/WaitFlag symmetry."""
     assert VALID_FREEDOM_FACETS == (
@@ -424,7 +400,6 @@ def test_audit4_mece_7facet_relaxation_lattice_and_verifier() -> None:
     assert top_mask.is_unrestricted_top is True
     assert top_mask.locked_facets() == ()
 
-    # Causal minimal relaxation: l1_overflow -> sram_layout_and_aliasing ONLY
     m_ovf = relax_facets_for_bottleneck(default_mask, l1_overflow=True)
     assert m_ovf.sram_layout_and_aliasing is True
     assert m_ovf.pipeline_and_sync_graph is False
@@ -432,7 +407,6 @@ def test_audit4_mece_7facet_relaxation_lattice_and_verifier() -> None:
     assert m_ovf.exec_mode_and_spr is False
     assert m_ovf.grid_and_workspace_topology is False
 
-    # reg_spill_bytes > 0 -> exec_mode_and_spr ONLY
     m_exec = relax_facets_for_bottleneck(
         default_mask,
         compiler_summary=BishengResourceSummary(spill_bytes=64),
@@ -441,7 +415,6 @@ def test_audit4_mece_7facet_relaxation_lattice_and_verifier() -> None:
     assert m_exec.sram_layout_and_aliasing is False
     assert m_exec.pipeline_and_sync_graph is False
 
-    # measured_sync_stall_ratio > 0.25 -> pipeline_and_sync_graph ONLY
     m_sync = relax_facets_for_bottleneck(
         default_mask,
         residual=StaticDynamicResidual(30.0, 0.8, 0.2, 0.2, 0.1, 0.35, 0.2),
@@ -451,7 +424,6 @@ def test_audit4_mece_7facet_relaxation_lattice_and_verifier() -> None:
     assert m_sync.dma_and_cache_hierarchy is False
     assert m_sync.grid_and_workspace_topology is False
 
-    # mte2 stall -> dma_and_cache_hierarchy ONLY
     m_dma = relax_facets_for_bottleneck(
         default_mask,
         dominant_bound="hbm_mte2_stall",
@@ -459,7 +431,6 @@ def test_audit4_mece_7facet_relaxation_lattice_and_verifier() -> None:
     assert m_dma.dma_and_cache_hierarchy is True
     assert m_dma.grid_and_workspace_topology is False
 
-    # wave quantization -> grid_and_workspace_topology ONLY
     m_grid = relax_facets_for_bottleneck(
         default_mask,
         dominant_bound="wave_quantization_swat",
@@ -467,12 +438,10 @@ def test_audit4_mece_7facet_relaxation_lattice_and_verifier() -> None:
     assert m_grid.grid_and_workspace_topology is True
     assert m_grid.pipeline_and_sync_graph is False
 
-    # Monotonic convergence to top()
     m_all = m_ovf.join(m_exec).join(m_sync).join(m_dma).join(m_grid)
     assert m_all == top_mask
     assert m_all.is_unrestricted_top is True
 
-    # Facet verifier enforcement
     assert verify_source_against_facets("Reg::Exp(a, b);", default_mask).passed is True
     assert verify_source_against_facets("l1_slot_aliasing(p, k);", default_mask).passed is False
     assert verify_source_against_facets("l1_slot_aliasing(p, k);", m_ovf).passed is True
@@ -490,7 +459,6 @@ def test_audit4_mece_7facet_relaxation_lattice_and_verifier() -> None:
         ).passed
         is True
     )
-    # At top(), zero shell syntax locks apply while hardware legality invariants STILL hold!
     assert (
         verify_source_against_facets(
             "__simt_vf__ void k() { l1_slot_aliasing(p, k); Nd2NzParams x; STREAMK_SCHEDULE; CrossCoreSetFlag<0x2, PIPE_FIX>(0); CrossCoreWaitFlag(0); }",
@@ -510,15 +478,8 @@ def test_audit4_mece_7facet_relaxation_lattice_and_verifier() -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# 5. Bidirectional Payload <-> Shell Capacity Fixed-Point Re-Solver
-# ---------------------------------------------------------------------------
-
-
 def test_audit5_bidirectional_live_buffer_fixed_point_resolver() -> None:
     """Re-solver shrinks tiles on live buffer overflow and expands when buffers are removed."""
-    from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
-
     solver = RegimePiecewiseSolver(AscendTarget("ascend.950pr"))
     gemm_axes = TopologyAxes("aic_only", "gm_l1_l0_fixpipe", "affine_simd")
     vec_axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
@@ -536,7 +497,6 @@ def test_audit5_bidirectional_live_buffer_fixed_point_resolver() -> None:
     )
     assert base_plan.policy["tile_mnk"] == [128, 128, 64]
 
-    # Case A: Payload adds extra L1 & UB buffers causing overflow -> solver shrinks
     overflow_ledger = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
         is_legal=False,
@@ -569,7 +529,6 @@ def test_audit5_bidirectional_live_buffer_fixed_point_resolver() -> None:
     assert shrunk.policy["ub_estimated_bytes"] <= 253952
     assert shrunk.policy["l1_estimated_bytes"] <= 524288
 
-    # Case B: Vector payload removes intermediate UB buffers -> solver expands row_pack_factor
     vec_reg = RegimeSlice(
         regime_tag="vec_main",
         case_nums=(1,),
@@ -595,13 +554,8 @@ def test_audit5_bidirectional_live_buffer_fixed_point_resolver() -> None:
     assert expanded.policy["ub_estimated_bytes"] <= 262144
 
 
-# ---------------------------------------------------------------------------
-# 6. Dual-Track Candidate Handling & Closed-Loop Escalation Hook
-# ---------------------------------------------------------------------------
-
-
 def test_audit6_ascendc_candidate_eval_and_closed_loop_escalation_hook() -> None:
-    """Track-B C++ passes Stage A without Python SyntaxError, and PortfolioRunner escalates closed-loop."""
+    """Track-B C++ passes Stage A without SyntaxError, and PortfolioRunner escalates."""
     cpp_ok = """
     // Valid bottom() compute body (no raw CrossCore or L1 aliasing)
     constexpr int CUBE_TILE_M = 64;
@@ -620,19 +574,16 @@ def test_audit6_ascendc_candidate_eval_and_closed_loop_escalation_hook() -> None
     assert res_ok.backend_kind == "ascendc"
     assert res_ok.ledger is not None and res_ok.ledger.is_legal is True
 
-    # GateFunnel.evaluate with backend_kind="ascendc" does NOT reject C++ as Python SyntaxError
     funnel = GateFunnel(skip_stage_b=True)
     ev = funnel.evaluate(cpp_ok, backend_kind="ascendc", freedom_mask=m_bot)
     assert ev.passed is True
     assert ev.stage_a.backend_kind == "ascendc"
 
-    # Violating locked pipeline_and_sync_graph at bottom() fails cleanly via facet verifier
     cpp_bad_sync = "CrossCoreSetFlag<0x2, PIPE_FIX>(0); CrossCoreWaitFlag(0);"
     res_bad = evaluate_ascendc_candidate(cpp_bad_sync, freedom_mask=m_bot)
     assert res_bad.passed is False
     assert "pipeline_and_sync_graph=locked" in res_bad.error_message
 
-    # Closed-loop escalation hook on PortfolioRunner
     runner = PortfolioRunner(
         backend=MockLLMBackend(),
         funnel=funnel,
@@ -678,9 +629,7 @@ def test_audit6_ascendc_candidate_eval_and_closed_loop_escalation_hook() -> None
 
 
 def test_audit7_zero_legacy_interfaces_lint_gate() -> None:
-    """Assert ZERO occurrences of superseded transitional interfaces under targets/ascend/tilefoundry_ascend/."""
-    import ast
-
+    """Assert ZERO superseded legacy interfaces under targets/ascend/tilefoundry_ascend/."""
     root = Path(__file__).resolve().parents[3] / "targets" / "ascend" / "tilefoundry_ascend"
     assert root.is_dir(), f"Missing target root: {root}"
 
@@ -696,7 +645,6 @@ def test_audit7_zero_legacy_interfaces_lint_gate() -> None:
     hits: list[str] = []
     for py_file in sorted(root.rglob("*.py")):
         source = py_file.read_text(encoding="utf-8")
-        # Ensure every file parses as valid Python AST too
         ast.parse(source, filename=str(py_file))
         for tok in forbidden_tokens:
             if tok in source:

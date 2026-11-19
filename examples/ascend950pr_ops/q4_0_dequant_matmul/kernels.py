@@ -1,14 +1,9 @@
 """Ascend 950PR high-performance Q4_0 dequant-matmul kernel package.
 
-Dual-regime Track-B AscendC architecture compiled dynamically via ``bisheng``
-with dynamic toolchain discovery (no hardcoded workspace paths):
-  1. GEMV / Tiny-M regime (M <= 8, 56 AIVs): Direct on-chip ``vlds_unpack4``
-     int4 nibble extraction + FP32 scale dequantization fused with SIMD dot
-     reduction across 56 Vector cores (single launch, zero HBM intermediate).
-  2. MixCore GEMM regime (M > 8, 28 MixCores ``__mix__(1, 2)``): 2 AIV sub-blocks
-     dequantize uint4 weights + scales into NZ L1 tiles in parallel while AIC
-     streams ``l1_X`` via ``gm2l1_nd2nz`` and executes ``ascend_gemm_l1`` FP32
-     L0C accumulation + ``DUAL_DST_SPLIT_M`` fixpipe epilogue.
+Dual-regime Track-B AscendC architecture compiled dynamically via ``bisheng``:
+1. GEMV / Tiny-M regime (M <= 8, 56 AIVs): ``vlds_unpack4`` int4 extraction + SIMD dot.
+2. MixCore GEMM regime (M > 8, 28 MixCores): 2 AIV sub-blocks dequantize into NZ L1 tiles
+   while AIC executes ``ascend_gemm_l1`` FP32 L0C accumulation and fixpipe epilogue.
 """
 
 from __future__ import annotations
@@ -532,6 +527,12 @@ extern "C" void launch_q4_0(
   }
 }
 '''
+
+
+def _render_trackb_tu(**dims: object) -> str:
+    """Render an instantiated C++20 Track-B translation unit for q4_0_dequant_matmul."""
+    raw_src = dims.get("trackb_src")
+    return str(raw_src) if raw_src is not None else _Q4_0_ASC_SRC
 
 
 def _find_bisheng() -> str | None:

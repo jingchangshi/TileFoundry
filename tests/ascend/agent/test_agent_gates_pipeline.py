@@ -35,17 +35,27 @@ def kernel(x):
 """
 
 
-def test_gate_funnel_python_kernel_module_and_cce_res_usage_parsing() -> None:
-    """Verify Stage A/B support Python kernel(...) modules and parse --cce-res-usage."""
-    sa_ok = run_stage_a_static(_PYTHON_KERNEL_MODULE)
-    assert sa_ok.passed is True
-    assert sa_ok.backend_kind == "python_kernel"
-    assert sa_ok.ledger is not None and sa_ok.ledger.is_legal is True
+_PRIM_FUNC_KERNEL_MODULE = """
+import tilelang.ascend.language as T
 
-    sb_ok = run_stage_b_compile(_PYTHON_KERNEL_MODULE)
-    assert sb_ok.passed is True
-    assert sb_ok.spill_bytes == 0
-    assert sb_ok.vloopv2_hit is True
+@T.prim_func
+def main(X: T.Tensor((1, 64), "float16"), Y: T.Tensor((1, 64), "float16")):
+    with T.Kernel(1):
+        x_ub = T.alloc_shared((1, 64), "float16")
+        T.copy(X, x_ub)
+        T.copy(x_ub, Y)
+"""
+
+
+def test_gate_funnel_python_kernel_module_and_cce_res_usage_parsing() -> None:
+    """Verify Stage A/B reject plain Python callables and parse --cce-res-usage."""
+    sa_py = run_stage_a_static(_PYTHON_KERNEL_MODULE)
+    assert sa_py.passed is False
+    assert sa_py.backend_kind == "python_kernel"
+    assert "stage_a_non_kernel_callable" in sa_py.error_message
+
+    sb_py = run_stage_b_compile(_PYTHON_KERNEL_MODULE)
+    assert sb_py.passed is False
 
     sa_bad = run_stage_a_static(_ILLEGAL_ASCENDC_WRAPPER)
     assert sa_bad.passed is False
@@ -63,6 +73,7 @@ def test_gate_funnel_python_kernel_module_and_cce_res_usage_parsing() -> None:
 
     funnel = GateFunnel(
         skip_stage_b=False,
+        compile_runner=lambda _src: StageBResult(passed=True, spill_bytes=0, vloopv2_hit=True),
         device_runner=lambda _src, st_a: StageCResult(
             passed=True,
             accuracy_passed=True,
@@ -79,7 +90,7 @@ def test_gate_funnel_python_kernel_module_and_cce_res_usage_parsing() -> None:
             telemetry={"dur_us": 5.0, "spill_bytes": 256},
         ),
     )
-    ev = funnel.evaluate(_PYTHON_KERNEL_MODULE)
+    ev = funnel.evaluate(_PRIM_FUNC_KERNEL_MODULE)
     assert ev.passed is True
     assert ev.stage_c is not None and ev.stage_c.residual is not None
     assert ev.stage_c.residual.spill_bytes == 256

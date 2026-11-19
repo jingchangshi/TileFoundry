@@ -25,6 +25,7 @@ from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
     parse_bisheng_res_usage,
 )
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
+    MicroarchProfile,
     extract_microarch_profile_from_cce,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
@@ -337,20 +338,17 @@ def _parse_cce_res_usage_with_summary(
     *,
     asm_or_dump_text: str = "",
 ) -> tuple[int, bool, BishengResourceSummary]:
-    """Parse bisheng diagnostics and lowered source via bisheng_res_parser."""
+    """Parse bisheng diagnostics and lowered/disassembled code via bisheng_res_parser."""
     summary = parse_bisheng_res_usage(
         output_text or "",
         asm_or_dump_text=asm_or_dump_text or "",
     )
     combined_vloop_text = f"{output_text or ''}\n{asm_or_dump_text or ''}"
-    if summary.software_loops > 0 and summary.vloopv2_loops == 0:
-        vloopv2_hit = False
-    elif _VLOOPV2_MISS_RE.search(combined_vloop_text):
-        vloopv2_hit = False
-    elif summary.vloopv2_loops > 0 and summary.software_loops == 0:
-        vloopv2_hit = True
-    else:
-        vloopv2_hit = True
+    vloopv2_hit = (
+        summary.vloopv2_loops > 0
+        and summary.software_loops == 0
+        and not bool(_VLOOPV2_MISS_RE.search(combined_vloop_text))
+    )
     return int(summary.spill_bytes), vloopv2_hit, summary
 
 
@@ -388,19 +386,273 @@ def _check_custom_kernel_redlines(dsl_source: str) -> list[str]:
     return errors
 
 
+_CPP_DTYPE_BYTES: dict[str, int] = {
+    "uint8_t": 1,
+    "int8_t": 1,
+    "char": 1,
+    "half": 2,
+    "bfloat16_t": 2,
+    "uint16_t": 2,
+    "int16_t": 2,
+    "float": 4,
+    "int": 4,
+    "int32_t": 4,
+    "uint32_t": 4,
+    "double": 8,
+    "int64_t": 8,
+    "uint64_t": 8,
+}
+
+
+def _rewrite_cpp_ternary(expr: str) -> str:
+    depth = 0
+    q_idx = -1
+    for i, ch in enumerate(expr):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "?" and depth == 0:
+            q_idx = i
+            break
+    if q_idx < 0:
+        return expr
+    depth = 0
+    c_idx = -1
+    nested = 0
+    for i in range(q_idx + 1, len(expr)):
+        ch = expr[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "?" and depth == 0:
+            nested += 1
+        elif ch == ":" and depth == 0:
+            if nested == 0:
+                c_idx = i
+                break
+            nested -= 1
+    if c_idx < 0:
+        return expr
+    cond = _rewrite_cpp_ternary(expr[:q_idx].strip())
+    t_arm = _rewrite_cpp_ternary(expr[q_idx + 1 : c_idx].strip())
+    f_arm = _rewrite_cpp_ternary(expr[c_idx + 1 :].strip())
+    return f"(({t_arm}) if ({cond}) else ({f_arm}))"
+
+
+def _eval_cpp_ast_node(node: ast.AST, env: Mapping[str, int]) -> int:
+    if isinstance(node, ast.Expression):
+        return _eval_cpp_ast_node(node.body, env)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, bool)):
+        return int(node.value)
+    if isinstance(node, ast.Name):
+        if node.id in env:
+            return int(env[node.id])
+        raise KeyError(node.id)
+    if isinstance(node, ast.UnaryOp):
+        val = _eval_cpp_ast_node(node.operand, env)
+        if isinstance(node.op, ast.UAdd):
+            return +val
+        if isinstance(node.op, ast.USub):
+            return -val
+        if isinstance(node.op, ast.Invert):
+            return ~val
+        raise ValueError("unsupported unary op")
+    if isinstance(node, ast.BinOp):
+        left = _eval_cpp_ast_node(node.left, env)
+        right = _eval_cpp_ast_node(node.right, env)
+        ops = {
+            ast.Add: lambda a, b: a + b,
+            ast.Sub: lambda a, b: a - b,
+            ast.Mult: lambda a, b: a * b,
+            ast.Div: lambda a, b: a // b,
+            ast.FloorDiv: lambda a, b: a // b,
+            ast.Mod: lambda a, b: a % b,
+            ast.LShift: lambda a, b: a << b,
+            ast.RShift: lambda a, b: a >> b,
+            ast.BitAnd: lambda a, b: a & b,
+            ast.BitOr: lambda a, b: a | b,
+            ast.BitXor: lambda a, b: a ^ b,
+        }
+        fn = ops.get(type(node.op))
+        if fn is None or (isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)) and right == 0):
+            raise ValueError("unsupported binary op")
+        return int(fn(left, right))
+    if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
+        left = _eval_cpp_ast_node(node.left, env)
+        right = _eval_cpp_ast_node(node.comparators[0], env)
+        cmp_ops = {
+            ast.Lt: left < right,
+            ast.LtE: left <= right,
+            ast.Gt: left > right,
+            ast.GtE: left >= right,
+            ast.Eq: left == right,
+            ast.NotEq: left != right,
+        }
+        op_type = type(node.ops[0])
+        if op_type in cmp_ops:
+            return int(cmp_ops[op_type])
+    if isinstance(node, ast.IfExp):
+        cond = _eval_cpp_ast_node(node.test, env)
+        return _eval_cpp_ast_node(node.body if cond else node.orelse, env)
+    raise ValueError("unsupported ast node")
+
+
+def _safe_eval_cpp_int(expr: str, env: Mapping[str, int]) -> int | None:
+    cleaned = re.sub(r"\b(\d+)[uUlL]+\b", r"\1", str(expr or "").strip())
+    if not cleaned:
+        return None
+    py_expr = _rewrite_cpp_ternary(cleaned)
+    try:
+        tree = ast.parse(py_expr, mode="eval")
+        return _eval_cpp_ast_node(tree, env)
+    except Exception:
+        return None
+
+
+def _parse_objdump_pipe_counts(objdump_text: str) -> dict[str, int]:
+    counts: dict[str, int] = {
+        "total_insns": 0,
+        "cube_mmad": 0,
+        "fixpipe": 0,
+        "mte1": 0,
+        "mte2": 0,
+        "mte3": 0,
+        "vec": 0,
+        "vloopv2": 0,
+        "dcci": 0,
+        "sync": 0,
+        "sw_back_branches": 0,
+        "vf_sw_back_branches": 0,
+        "scalar_regs": 0,
+        "vec_regs": 0,
+    }
+    if not objdump_text.strip():
+        return counts
+    xregs: set[int] = set()
+    vregs: set[int] = set()
+    in_vf = False
+    for raw_ln in objdump_text.splitlines():
+        lbl_m = re.match(r"^[0-9a-f]+\s+<([^>]+)>:\s*$", raw_ln.strip())
+        if lbl_m:
+            in_vf = ".vector.thread" in lbl_m.group(1)
+            continue
+        m = re.match(r"^\s*([0-9a-f]+):\s+[0-9a-f]+\s+([A-Za-z0-9_.]+)(.*)$", raw_ln)
+        if not m:
+            continue
+        pc = int(m.group(1), 16)
+        mnem = m.group(2).upper()
+        rest = m.group(3)
+        counts["total_insns"] += 1
+        xregs.update(int(r) for r in re.findall(r"\bX(\d+)\b", rest))
+        vregs.update(int(r) for r in re.findall(r"\bV(\d+)\b", rest))
+        if mnem.startswith("VLOOP"):
+            if "VLOOPV2" in mnem or "VLOOP_V2" in mnem:
+                counts["vloopv2"] += 1
+        elif mnem.startswith("MMAD"):
+            counts["cube_mmad"] += 1
+        elif mnem.startswith("FIX_"):
+            counts["fixpipe"] += 1
+        elif mnem.startswith("LOAD_L1_TO_L0"):
+            counts["mte1"] += 1
+        elif mnem.startswith("MOV_OUT_TO_"):
+            counts["mte2"] += 1
+        elif mnem.startswith("MOV_UB_TO_"):
+            counts["mte3"] += 1
+        elif mnem.startswith("DCCI"):
+            counts["dcci"] += 1
+        elif mnem.startswith(("SET_FLAG", "WAIT_FLAG", "SET_INTRA", "WAIT_INTRA", "BAR.")):
+            counts["sync"] += 1
+        elif mnem.startswith("V") and not mnem.startswith("VF"):
+            counts["vec"] += 1
+        if mnem.startswith(("JUMP", "B.", "CBNZ", "CBZ", "TBNZ", "TBZ")) or mnem == "B":
+            tgt_m = re.search(r"\+0x([0-9a-f]+)>", rest, re.IGNORECASE)
+            hash_m = re.search(r"#(-?\d+)", rest)
+            is_back = False
+            if tgt_m:
+                is_back = int(tgt_m.group(1), 16) <= pc
+            elif hash_m:
+                is_back = int(hash_m.group(1)) <= pc
+            if is_back:
+                counts["sw_back_branches"] += 1
+                if in_vf:
+                    counts["vf_sw_back_branches"] += 1
+    counts["scalar_regs"] = len(xregs)
+    counts["vec_regs"] = len(vregs)
+    return counts
+
+
 def _build_ascendc_static_ledger(
     cpp_source: str,
     *,
     target: AscendTarget | None = None,
+    compiler_summary: BishengResourceSummary | None = None,
+    objdump_text: str = "",
+    microarch_profile: MicroarchProfile | Mapping[str, object] | None = None,
 ) -> ObjectivePhysicalLedger:
-    """Estimate static resource ledger and waterlines for a Track-B AscendC C++ candidate."""
+    """Compute SRAM waterlines and pipe cycles from C++20 constexprs, calls, and objdump."""
     resolved_target = target or AscendTarget("ascend.950pr")
     from tilefoundry_ascend.ascend.target import AscendSpaceFacts  # noqa: PLC0415
 
     facts = resolved_target.get_facts(AscendSpaceFacts)
     lower = cpp_source.lower()
 
-    uses_cube = any(tok in lower for tok in ("mmad", "l0c", "l1a", "l1b", "cube_tile"))
+    consts: dict[str, int] = {}
+    for m in re.finditer(
+        r"\bconstexpr\s+(?:int|int32_t|uint32_t|size_t)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);",
+        cpp_source,
+    ):
+        val = _safe_eval_cpp_int(m.group(2), consts)
+        if val is not None:
+            consts[m.group(1)] = val
+
+    ub_offsets: list[tuple[str, int, int]] = []
+    l1_offsets: list[tuple[str, int, int]] = []
+    ptr_env: dict[str, tuple[str, int]] = {}
+
+    cast_pat = re.compile(
+        r"__(ubuf|cbuf)__\s+([A-Za-z0-9_]+)\s*\*\s*(\w+)\s*=\s*"
+        r"\(\s*__\1__\s+[A-Za-z0-9_]+\s*\*\s*\)\s*([^;]+);"
+    )
+    plus_pat = re.compile(
+        r"__(ubuf|cbuf)__\s+([A-Za-z0-9_]+)\s*\*\s*(\w+)\s*=\s*"
+        r"([A-Za-z_]\w*)\s*\+\s*([^;]+);"
+    )
+    for ln in cpp_source.splitlines():
+        cm = cast_pat.search(ln)
+        if cm:
+            space, ctype, name, expr = cm.group(1), cm.group(2), cm.group(3), cm.group(4)
+            off = _safe_eval_cpp_int(expr, consts)
+            if off is not None and off >= 0:
+                eb = _CPP_DTYPE_BYTES.get(ctype, 2)
+                ptr_env[name] = (space, off)
+                (ub_offsets if space == "ubuf" else l1_offsets).append((name, off, eb))
+            continue
+        pm = plus_pat.search(ln)
+        if pm:
+            space, ctype, name, base, expr = (
+                pm.group(1),
+                pm.group(2),
+                pm.group(3),
+                pm.group(4),
+                pm.group(5),
+            )
+            base_entry = ptr_env.get(base)
+            delta = _safe_eval_cpp_int(expr, consts)
+            if delta is not None:
+                eb = _CPP_DTYPE_BYTES.get(ctype, 2)
+                base_off = base_entry[1] if base_entry and base_entry[0] == space else 0
+                off = max(0, base_off + delta * eb)
+                ptr_env[name] = (space, off)
+                (ub_offsets if space == "ubuf" else l1_offsets).append((name, off, eb))
+
+    tile_m = max(1, consts.get("CUBE_TILE_M", consts.get("BM", consts.get("TILE_M", 64))))
+    tile_n = max(1, consts.get("CUBE_TILE_N", consts.get("BN", consts.get("TILE_N", 64))))
+    tile_k = max(1, consts.get("CUBE_TILE_K", consts.get("BK", consts.get("TILE_K", 64))))
+    uses_cube = any(
+        tok in lower for tok in ("asc_mmad", "ascend_gemm_l1", "mmad", "l0c", "cube_tile", "__cbuf__")
+    )
     uses_simt = "__simt_vf__" in cpp_source or "Simt::" in cpp_source
     uses_256kb_ub = (
         "ub_256kb_unlock" in lower
@@ -408,35 +660,52 @@ def _build_ascendc_static_ledger(
         or "262144" in cpp_source
     ) and not uses_simt
 
-    m_tile = 128
-    n_tile = 128
-    k_tile = 64
-    for key, var in (("CUBE_TILE_M", "m"), ("CUBE_TILE_N", "n"), ("CUBE_TILE_K", "k")):
-        m = re.search(rf"\b{key}\s*=\s*(\d+)", cpp_source)
-        if m:
-            val = max(1, int(m.group(1)))
-            if var == "m":
-                m_tile = val
-            elif var == "n":
-                n_tile = val
+    def _span_from_offsets(entries: list[tuple[str, int, int]]) -> dict[str, int]:
+        if not entries:
+            return {}
+        ordered = sorted(entries, key=lambda item: item[1])
+        bufs: dict[str, int] = {}
+        for idx, (name, off, eb) in enumerate(ordered):
+            if idx + 1 < len(ordered):
+                size = max(0, ordered[idx + 1][1] - off)
+            elif idx > 0:
+                prev_gap = max(0, off - ordered[idx - 1][1])
+                size = prev_gap if prev_gap > 0 else max(eb * 64, tile_n * eb)
             else:
-                k_tile = val
+                size = max(eb * 64, tile_m * tile_n * eb)
+            if size > 0:
+                bufs[name] = size
+        return bufs
 
-    explicit_ub: dict[str, int] = {}
-    explicit_l1: dict[str, int] = {}
+    explicit_ub = _span_from_offsets(ub_offsets)
+    explicit_l1 = _span_from_offsets(l1_offsets)
+
     ub_match = re.search(r"\bub_bytes\s*=\s*(\d+)", cpp_source, re.IGNORECASE)
     l1_match = re.search(r"\bl1_bytes\s*=\s*(\d+)", cpp_source, re.IGNORECASE)
     if ub_match:
-        explicit_ub["ub_declared"] = int(ub_match.group(1))
+        explicit_ub = {"ub_declared": int(ub_match.group(1))}
     if l1_match:
-        explicit_l1["l1_declared"] = int(l1_match.group(1))
+        explicit_l1 = {"l1_declared": int(l1_match.group(1))}
 
     if not explicit_l1 and uses_cube:
+        stages = max(1, consts.get("L1_STAGES", 2))
         l1_stages_m = re.search(r"\bl1_stages\s*=\s*(\d+)", cpp_source, re.IGNORECASE)
-        stages = max(1, int(l1_stages_m.group(1))) if l1_stages_m else 2
-        explicit_l1["l1_AB"] = (m_tile * k_tile + k_tile * n_tile) * 2 * stages
+        if l1_stages_m:
+            stages = max(1, int(l1_stages_m.group(1)))
+        explicit_l1["l1_AB"] = (tile_m * tile_k + tile_k * tile_n) * 2 * stages
     if not explicit_ub:
-        explicit_ub["ub_work"] = (m_tile * n_tile * 2) if uses_cube else 65536
+        ub_rows = consts.get("ROWS", tile_m)
+        ub_blk = consts.get("BLK", tile_n)
+        explicit_ub["ub_work"] = (
+            ub_rows * ub_blk * 2 if uses_cube else max(1024, ub_rows * ub_blk * 2)
+        )
+
+    implicit_ub: dict[str, int] = {}
+    if compiler_summary is not None:
+        if compiler_summary.spill_bytes > 0:
+            implicit_ub["register_spill"] = int(compiler_summary.spill_bytes)
+        if compiler_summary.stack_bytes > 0:
+            implicit_ub["stack_frame"] = int(compiler_summary.stack_bytes)
 
     ub_cap = (
         int(facts.ub_simtvf_usable_bytes)
@@ -448,7 +717,7 @@ def _build_ascendc_static_ledger(
             scope="UB",
             capacity_bytes=ub_cap,
             explicit_buffers=explicit_ub,
-            implicit_buffers={},
+            implicit_buffers=implicit_ub,
         )
     }
     if explicit_l1 or uses_cube:
@@ -459,17 +728,55 @@ def _build_ascendc_static_ledger(
             implicit_buffers={},
         )
 
-    pipe_cycles: dict[str, int] = {"AIV0.PIPE_V": 100, "AIV0.PIPE_MTE2": 60}
-    if uses_cube:
-        pipe_cycles["AIC.PIPE_M"] = 120
-        pipe_cycles["AIC.PIPE_FIX"] = 40
+    dis_counts = _parse_objdump_pipe_counts(objdump_text)
+    mte2_src_cnt = len(re.findall(r"\basc_copy_gm2(?:ub|l1)\w*\s*\(", cpp_source))
+    mte3_src_cnt = len(re.findall(r"\basc_copy_ub2gm\w*\s*\(", cpp_source))
+    fix_src_cnt = len(re.findall(r"\basc_copy_l0c2\w*\s*\(", cpp_source))
+    mmad_src_cnt = len(re.findall(r"\basc_mmad\s*\(", cpp_source))
+    vf_src_cnt = len(re.findall(r"\b(?:simd_inst|Reg)::\w+\s*(?:<[^>]*>)?\s*\(", cpp_source))
+
+    mte2_cnt = max(mte2_src_cnt, dis_counts["mte2"])
+    mte3_cnt = max(mte3_src_cnt, dis_counts["mte3"])
+    fix_cnt = max(fix_src_cnt, dis_counts["fixpipe"])
+    mmad_cnt = max(mmad_src_cnt, dis_counts["cube_mmad"])
+    vf_cnt = max(vf_src_cnt, dis_counts["vec"])
+
+    spill_penalty = int(compiler_summary.spill_bytes) * 2 if compiler_summary else 0
+    sw_loop_mult = 2 if (compiler_summary and not compiler_summary.vloopv2_hit) else 1
+
+    pipe_cycles: dict[str, int] = {}
+    if mte2_cnt > 0 or not uses_cube:
+        pipe_cycles["AIV0.PIPE_MTE2"] = max(1, mte2_cnt) * max(16, (tile_m * tile_n * 2) // 64)
+    if mte3_cnt > 0:
+        pipe_cycles["AIV0.PIPE_MTE3"] = mte3_cnt * max(16, (tile_m * tile_n * 2) // 64)
+    if vf_cnt > 0 or not uses_cube:
+        pipe_cycles["AIV0.PIPE_V"] = (
+            max(1, vf_cnt) * max(8, (tile_m * tile_n) // 64) * sw_loop_mult + spill_penalty
+        )
+    if mmad_cnt > 0 or uses_cube:
+        pipe_cycles["AIC.PIPE_M"] = max(1, mmad_cnt) * max(16, (tile_m * tile_n * tile_k) // 4096)
+    if fix_cnt > 0 or uses_cube:
+        pipe_cycles["AIC.PIPE_FIX"] = max(1, fix_cnt) * max(12, (tile_m * tile_n * 2) // 256)
+    if dis_counts["mte1"] > 0:
+        pipe_cycles["AIC.PIPE_MTE1"] = dis_counts["mte1"] * max(8, (tile_m * tile_k) // 128)
+
+    if isinstance(microarch_profile, MicroarchProfile):
+        ma_dict = microarch_profile.to_dict()
+    elif isinstance(microarch_profile, Mapping):
+        ma_dict = dict(microarch_profile)
+    else:
+        ma_dict = extract_microarch_profile_from_cce(cpp_source).to_dict()
+
+    is_legal = all(wl.overflow_bytes == 0 for wl in waterlines.values())
+    steady_ii = max(pipe_cycles.values()) if pipe_cycles else None
     return build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
-        is_legal=True,
-        steady_state_ii=None,
+        is_legal=is_legal,
+        steady_state_ii=steady_ii,
         pipe_cycles=pipe_cycles,
         waterlines=waterlines,
         has_indirect_gather=uses_simt,
+        microarch_profile=ma_dict,
     )
 
 
@@ -561,22 +868,6 @@ def evaluate_ascendc_candidate(
         route=route,
         elapsed_ms=(time.monotonic() - t0) * 1000.0,
         backend_kind="ascendc",
-    )
-
-
-def _build_custom_kernel_ledger(dsl_source: str) -> ObjectivePhysicalLedger:
-    lower = dsl_source.lower()
-    uses_cube = any(tok in lower for tok in ("mmad", "matmul", "gemm", "cube", "l0c"))
-    pipe_cycles: dict[str, int] = {"AIV0.PIPE_V": 100, "AIV0.PIPE_MTE2": 60}
-    if uses_cube:
-        pipe_cycles["AIC.PIPE_M"] = 120
-        pipe_cycles["AIC.PIPE_FIX"] = 40
-    return build_objective_physical_ledger(
-        analysis_mode="readonly_envelope",
-        is_legal=True,
-        steady_state_ii=None,
-        pipe_cycles=pipe_cycles,
-        waterlines={},
     )
 
 
@@ -736,22 +1027,20 @@ def run_stage_a_static(
             )
             if not _is_tvm_ir_node(prim_func) and callable(prim_func):
                 redline_errs = _check_custom_kernel_redlines(dsl_source)
-                if redline_errs:
-                    return StageAResult(
-                        passed=False,
-                        prim_func=None,
-                        ledger=None,
-                        error_message="; ".join(redline_errs),
-                        elapsed_ms=(time.monotonic() - t0) * 1000.0,
-                        backend_kind="python_kernel",
-                    )
-                custom_ledger = _build_custom_kernel_ledger(dsl_source)
+                err_parts = [
+                    *redline_errs,
+                    (
+                        "stage_a_non_kernel_callable: candidate is a plain Python function "
+                        "without @T.prim_func or Track-B TU"
+                    ),
+                ]
                 return StageAResult(
-                    passed=True,
+                    passed=False,
                     prim_func=None,
-                    ledger=custom_ledger,
+                    ledger=None,
                     features=None,
                     route=None,
+                    error_message="; ".join(err_parts),
                     elapsed_ms=(time.monotonic() - t0) * 1000.0,
                     backend_kind="python_kernel",
                 )
@@ -834,10 +1123,11 @@ def build_stage_b_driver_source(
     compile_flags: Sequence[str] | str | None = None,
     dims: Mapping[str, object] | None = None,
     enable_device_compile: bool = True,
-    include_res_usage: bool = True,
     kernel_dump_path: str | Path | None = None,
 ) -> str:
     """Build standalone Python driver lowering and device-compiling a candidate DSL file."""
+    if not enable_device_compile:
+        raise ValueError("enable_device_compile=False bypass has been removed")
     eff_kwargs = _merge_dims_into_kwargs(factory_kwargs, dims)
     ext_pc, ext_cf = _merge_pass_configs_and_flags(None, None, pass_configs, compile_flags)
     payload = json.dumps(
@@ -848,8 +1138,6 @@ def build_stage_b_driver_source(
             "config_selector_name": config_selector_name,
             "pass_configs": ext_pc,
             "compile_flags": ext_cf,
-            "enable_device_compile": bool(enable_device_compile),
-            "include_res_usage": bool(include_res_usage),
             "kernel_dump_path": str(kernel_dump_path) if kernel_dump_path is not None else None,
         }
     )
@@ -922,8 +1210,11 @@ def build_stage_b_driver_source(
         "assert _fn is not None\n"
         "if not isinstance(_fn, (tirx.PrimFunc, IRModule)) and callable(_fn):\n"
         "    _compile_hook = getattr(_mod, 'compile_kernel', getattr(_mod, 'build_kernel', None))\n"
-        "    if callable(_compile_hook):\n"
-        "        _compile_hook()\n"
+        "    if not callable(_compile_hook):\n"
+        "        raise RuntimeError(\n"
+        "            'stage_b_non_kernel_callable: plain Python function lacks @T.prim_func or compile_kernel'\n"
+        "        )\n"
+        "    _compile_hook()\n"
         "else:\n"
         "    _merged_pc, _merged_cf = {}, []\n"
         "    def _absorb_flags(items):\n"
@@ -947,17 +1238,16 @@ def build_stage_b_driver_source(
         "    _absorb_flags(_sel_cf)\n"
         "    _merged_pc.update(_cfg['pass_configs'])\n"
         "    _absorb_flags(_cfg['compile_flags'])\n"
-        "    if _cfg['enable_device_compile'] and _cfg.get('include_res_usage', True):\n"
-        "        _absorb_flags(['--cce-res-usage'])\n"
+        "    _absorb_flags(['--cce-res-usage'])\n"
         "    if _merged_cf:\n"
         "        _merged_pc['tl.device_compile_flags'] = list(_merged_cf)\n"
         "    with tvm.transform.PassContext(config=_merged_pc):\n"
         "        try:\n"
         "            _art = tilelang.lower(\n"
-        "                _fn, target='ascend', enable_device_compile=_cfg['enable_device_compile']\n"
+        "                _fn, target='ascend', enable_device_compile=True\n"
         "            )\n"
         "        except Exception:\n"
-        "            if _cfg.get('kernel_dump_path') and _cfg['enable_device_compile']:\n"
+        "            if _cfg.get('kernel_dump_path'):\n"
         "                try:\n"
         "                    _low_only = tilelang.lower(_fn, target='ascend', enable_device_compile=False)\n"
         "                    if getattr(_low_only, 'kernel_source', None):\n"
@@ -985,6 +1275,8 @@ def run_stage_b_compile(
     enable_device_compile: bool = True,
 ) -> StageBResult:
     """Verify full TileLang + bisheng device compilation in an isolated subprocess."""
+    if not enable_device_compile:
+        raise ValueError("enable_device_compile=False bypass has been removed")
     t0 = time.monotonic()
     py_exe = _resolve_conda_python(python_bin)
     env = dict(os.environ)
@@ -994,21 +1286,18 @@ def run_stage_b_compile(
         cand_path = Path(tmp_dir) / "candidate_dsl.py"
         cand_path.write_text(dsl_source, encoding="utf-8")
         kernel_dump_path = Path(tmp_dir) / "lowered_kernel.cce"
-
-        def _invoke(include_res_usage: bool) -> subprocess.CompletedProcess[str]:
-            driver = build_stage_b_driver_source(
-                cand_path,
-                factory_name=factory_name,
-                factory_kwargs=factory_kwargs,
-                config_selector_name=config_selector_name,
-                pass_configs=pass_configs,
-                compile_flags=compile_flags,
-                dims=dims,
-                enable_device_compile=enable_device_compile,
-                include_res_usage=include_res_usage,
-                kernel_dump_path=kernel_dump_path,
-            )
-            return subprocess.run(
+        driver = build_stage_b_driver_source(
+            cand_path,
+            factory_name=factory_name,
+            factory_kwargs=factory_kwargs,
+            config_selector_name=config_selector_name,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+            dims=dims,
+            kernel_dump_path=kernel_dump_path,
+        )
+        try:
+            proc = subprocess.run(
                 [py_exe, "-c", driver],
                 text=True,
                 capture_output=True,
@@ -1016,16 +1305,6 @@ def run_stage_b_compile(
                 env=env,
                 timeout=timeout_sec,
             )
-
-        try:
-            proc = _invoke(True)
-            if proc.returncode != 0:
-                combined_err = (proc.stderr or "") + "\n" + (proc.stdout or "")
-                if "--cce-res-usage" in combined_err and any(
-                    tok in combined_err.lower()
-                    for tok in ("unknown", "unrecognized", "unsupported", "invalid")
-                ):
-                    proc = _invoke(False)
         except subprocess.TimeoutExpired:
             return StageBResult(
                 passed=False,
@@ -1068,13 +1347,47 @@ def run_stage_b_compile(
     )
 
 
-def _resolve_cann_root(cann_root: str | Path | None = None) -> Path | None:
+_CANN_INCLUDE_SUBDIRS: tuple[str, ...] = (
+    "include",
+    "x86_64-linux/include",
+    "aarch64-linux/include",
+    "runtime/include",
+    "asc/include",
+    "tools/tikcpp/tikcfw",
+    "compiler/tikcpp/tikcfw",
+)
+
+
+def _resolve_cann_root(
+    cann_root: str | Path | None = None,
+    *,
+    bisheng_bin: str | Path | None = None,
+) -> Path | None:
     if cann_root is not None and str(cann_root).strip():
         return Path(cann_root).expanduser()
-    for env_key in ("ASCEND_TOOLKIT_HOME", "ASCEND_HOME_PATH"):
+    for env_key in ("ASCEND_TOOLKIT_HOME", "ASCEND_HOME_PATH", "BISHENG_HOME"):
         raw = os.environ.get(env_key, "").strip()
         if raw:
-            return Path(raw).expanduser()
+            cand = Path(raw).expanduser()
+            if env_key == "BISHENG_HOME" and not any(
+                (cand / sub).is_dir() for sub in _CANN_INCLUDE_SUBDIRS[:4]
+            ):
+                for parent in cand.parents:
+                    if any((parent / sub).is_dir() for sub in _CANN_INCLUDE_SUBDIRS[:4]):
+                        return parent
+            return cand
+    for env_key in ("ASCEND_OPP_PATH", "ASCEND_AICPU_PATH"):
+        raw = os.environ.get(env_key, "").strip()
+        if raw:
+            parent = Path(raw).expanduser().parent
+            if any((parent / sub).is_dir() for sub in _CANN_INCLUDE_SUBDIRS[:4]):
+                return parent
+    resolved_bin = bisheng_bin or shutil.which("bisheng")
+    if resolved_bin:
+        bpath = Path(str(resolved_bin)).resolve()
+        for parent in bpath.parents:
+            if any((parent / sub).is_dir() for sub in _CANN_INCLUDE_SUBDIRS[:4]):
+                return parent
     return None
 
 
@@ -1093,15 +1406,212 @@ def _resolve_bisheng_bin(
             if which_explicit:
                 return which_explicit
         return None
+    bh = os.environ.get("BISHENG_HOME", "").strip()
+    if bh:
+        bh_cand = Path(bh).expanduser() / "bin" / "bisheng"
+        if bh_cand.is_file():
+            return str(bh_cand)
     found = shutil.which("bisheng")
     if found:
         return found
     resolved_cann = _resolve_cann_root(cann_root)
     if resolved_cann is not None:
-        candidate = resolved_cann / "bin" / "bisheng"
-        if candidate.is_file():
-            return str(candidate)
+        for rel in ("tools/ccec_compiler/bin/bisheng", "bin/bisheng"):
+            candidate = resolved_cann / rel
+            if candidate.is_file():
+                return str(candidate)
     return None
+
+
+def _detect_cann_include_dirs(
+    cann_root: str | Path | None = None,
+    *,
+    bisheng_bin: str | Path | None = None,
+) -> list[str]:
+    """Auto-discover CANN C/C++ header include directories from env and toolchain."""
+    roots: list[Path] = []
+    if cann_root is not None and str(cann_root).strip():
+        roots.append(Path(cann_root).expanduser())
+    for env_key in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME"):
+        raw = os.environ.get(env_key, "").strip()
+        if raw:
+            roots.append(Path(raw).expanduser())
+    inferred = _resolve_cann_root(cann_root, bisheng_bin=bisheng_bin)
+    if inferred is not None:
+        roots.append(inferred)
+
+    found: list[str] = []
+    seen_resolved: set[str] = set()
+    for root in roots:
+        for sub in _CANN_INCLUDE_SUBDIRS:
+            inc = root / sub
+            if inc.is_dir():
+                res_key = str(inc.resolve())
+                if res_key not in seen_resolved:
+                    seen_resolved.add(res_key)
+                    found.append(str(inc))
+    return found
+
+
+def _resolve_toolchain_tool(
+    tool_names: Sequence[str],
+    *,
+    bisheng_bin: str | Path | None = None,
+) -> str | None:
+    """Resolve a companion binutils/LLVM tool near bisheng or on PATH."""
+    if bisheng_bin is not None:
+        bpath = Path(str(bisheng_bin))
+        if bpath.is_file():
+            for name in tool_names:
+                cand = bpath.resolve().with_name(name)
+                if cand.is_file():
+                    return str(cand)
+    for name in tool_names:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def _verify_object_has_instantiated_kernel(
+    obj_path: Path,
+    *,
+    bisheng_bin: str | Path | None = None,
+) -> tuple[bool, str]:
+    """Ensure bisheng emitted at least one concrete instantiated kernel symbol in .text."""
+    if not obj_path.is_file():
+        return False, "stage_b_ascendc_missing_object: object file was not generated"
+    nm_bin = _resolve_toolchain_tool(("llvm-nm", "nm"), bisheng_bin=bisheng_bin)
+    if nm_bin:
+        proc = subprocess.run(
+            [nm_bin, "--defined-only", str(obj_path)],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        if proc.returncode == 0:
+            defined_text_syms = [
+                ln.strip()
+                for ln in (proc.stdout or "").splitlines()
+                if re.search(r"\b[Tt]\s+(?!\$)\S+", ln)
+            ]
+            if not defined_text_syms:
+                return False, (
+                    "stage_b_ascendc_uninstantiated_template: object file contains zero "
+                    "instantiated code symbols (.text is empty); provide concrete template "
+                    "instantiation via _render_trackb_tu"
+                )
+            return True, ""
+
+    objdump_bin = _resolve_toolchain_tool(("llvm-objdump", "objdump"), bisheng_bin=bisheng_bin)
+    if objdump_bin:
+        proc = subprocess.run(
+            [objdump_bin, "-h", str(obj_path)],
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=False,
+        )
+        if proc.returncode == 0:
+            text_sec = re.search(r"\.text(?:\.\S+)?\s+([0-9a-fA-F]+)\s", proc.stdout or "")
+            if text_sec and int(text_sec.group(1), 16) > 0:
+                return True, ""
+            return False, (
+                "stage_b_ascendc_uninstantiated_template: .text section size is 0; "
+                "provide concrete template instantiation via _render_trackb_tu"
+            )
+
+    if obj_path.stat().st_size > 2048:
+        return True, ""
+    return False, (
+        "stage_b_ascendc_uninstantiated_template: object file contains no verifiable "
+        "instantiated kernel code"
+    )
+
+
+def _disassemble_object(
+    obj_path: Path,
+    *,
+    bisheng_bin: str | Path | None = None,
+) -> str:
+    """Run llvm-objdump -d on a compiled Ascend object file."""
+    objdump_bin = _resolve_toolchain_tool(("llvm-objdump", "objdump"), bisheng_bin=bisheng_bin)
+    if not objdump_bin or not obj_path.is_file():
+        return ""
+    proc = subprocess.run(
+        [objdump_bin, "-d", str(obj_path)],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def _augment_bisheng_telemetry_text(
+    compiler_out: str,
+    objdump_text: str,
+) -> str:
+    """Normalize bisheng --cce-res-usage and llvm-objdump -d metrics for bisheng_res_parser."""
+    vreg_vals = [int(m) for m in re.findall(r"\bVReg\s+number\s*:\s*(\d+)", compiler_out)]
+    stack_vals = [
+        int(m)
+        for m in re.findall(
+            r"(?:^|[,\s])Stack\s+size\s*:\s*(\d+)\s*bytes",
+            compiler_out,
+            flags=re.IGNORECASE,
+        )
+    ]
+    dis = _parse_objdump_pipe_counts(objdump_text)
+    vec_regs = max([*vreg_vals, dis["vec_regs"], 0])
+    scalar_regs = dis["scalar_regs"]
+    stack_bytes = max(stack_vals, default=0)
+
+    extra_lines: list[str] = []
+    if vec_regs > 0 and not re.search(
+        r"(?:vector\s+register\s+usage|vec_reg_num)", compiler_out, re.IGNORECASE
+    ):
+        extra_lines.append(f"Vector Register Usage: {vec_regs}")
+    if scalar_regs > 0 and not re.search(
+        r"(?:scalar\s+register\s+usage|scalar_reg_num)", compiler_out, re.IGNORECASE
+    ):
+        extra_lines.append(f"Scalar Register Usage: {scalar_regs}")
+    if stack_bytes > 0 and not re.search(r"stack\s+frame\s+size", compiler_out, re.IGNORECASE):
+        extra_lines.append(f"Stack Frame Size: {stack_bytes} bytes")
+    if objdump_text.strip():
+        vloop_cnt = dis["vloopv2"]
+        sw_cnt = dis["vf_sw_back_branches"] if vloop_cnt > 0 else dis["sw_back_branches"]
+        extra_lines.append(f"vloopv2_loops: {vloop_cnt}")
+        extra_lines.append(f"software_loops: {sw_cnt}")
+    if not extra_lines:
+        return compiler_out
+    return f"{compiler_out}\n" + "\n".join(extra_lines)
+
+
+def _merge_disassembly_microarch_profile(
+    cpp_source: str,
+    objdump_text: str,
+) -> dict[str, object] | None:
+    if not cpp_source.strip() and not objdump_text.strip():
+        return None
+    base = extract_microarch_profile_from_cce(cpp_source)
+    dis = _parse_objdump_pipe_counts(objdump_text)
+    if dis["total_insns"] == 0:
+        return base.to_dict()
+    unit_xfer = 32768
+    updated = replace(
+        base,
+        fp_alu_ops=max(base.fp_alu_ops, dis["vec"]),
+        cube_mmad_count=max(base.cube_mmad_count, dis["cube_mmad"]),
+        gm_to_l1_bytes=max(base.gm_to_l1_bytes, dis["mte2"] * unit_xfer if dis["cube_mmad"] else 0),
+        gm_to_ub_bytes=max(base.gm_to_ub_bytes, dis["mte2"] * unit_xfer if not dis["cube_mmad"] else 0),
+        l1_to_l0a_bytes=max(base.l1_to_l0a_bytes, dis["mte1"] * unit_xfer),
+        l0c_to_ub_bytes=max(base.l0c_to_ub_bytes, dis["fixpipe"] * unit_xfer),
+        ub_to_gm_bytes=max(base.ub_to_gm_bytes, dis["mte3"] * unit_xfer),
+        cv_sync_barriers=max(base.cv_sync_barriers, dis["sync"]),
+    )
+    return updated.to_dict()
 
 
 def _detect_tilelang_include_dir() -> str | None:
@@ -1147,21 +1657,14 @@ def run_stage_b_ascendc_compile(
     enable_device_compile: bool = True,
 ) -> StageBResult:
     """Verify native AscendC C++ translation unit compilation via bisheng in an isolated tempdir."""
+    if not enable_device_compile:
+        raise ValueError("enable_device_compile=False bypass has been removed")
     t0 = time.monotonic()
     if not isinstance(cpp_source, str) or not cpp_source.strip():
         return StageBResult(
             passed=False,
             error_message="stage_b_ascendc_empty_source",
             elapsed_sec=time.monotonic() - t0,
-        )
-
-    if not enable_device_compile:
-        return StageBResult(
-            passed=True,
-            elapsed_sec=time.monotonic() - t0,
-            spill_bytes=0,
-            vloopv2_hit=True,
-            compiler_summary=BishengResourceSummary(),
         )
 
     resolved_bisheng = _resolve_bisheng_bin(bisheng_bin, cann_root=cann_root)
@@ -1176,29 +1679,42 @@ def run_stage_b_ascendc_compile(
     has_explicit_std = any(f.startswith("-std=") for f in extra_flags)
     has_explicit_x = "-x" in extra_flags
     has_tl_templates = "tl_templates/ascend/" in cpp_source
-    has_unconditional_kernel_op = bool(
+    has_kernel_op = bool(
         re.search(r'^\s*#\s*include\s+[<"]kernel_operator\.h[>"]', cpp_source, re.MULTILINE)
-    ) and "#if __cplusplus < 202002L" not in cpp_source
+    )
 
     std_flags: list[str] = []
     if not has_explicit_std:
-        std_flags = ["-std=c++20"] if (has_tl_templates and not has_unconditional_kernel_op) else ["-std=c++17"]
+        std_flags = (
+            ["-std=c++20"]
+            if (has_tl_templates and not has_kernel_op)
+            else ["-std=c++17"]
+        )
 
     include_flags: list[str] = []
+    seen_inc_flags = set(extra_flags)
+
+    def _add_inc(inc_dir: str) -> None:
+        flag = f"-I{inc_dir}"
+        if inc_dir and Path(inc_dir).is_dir() and flag not in seen_inc_flags:
+            seen_inc_flags.add(flag)
+            include_flags.append(flag)
+
     asc_inc_str = (
         str(asc_devkit_include).strip()
         if asc_devkit_include is not None
         else _default_asc_devkit_include()
     )
-    if asc_inc_str and Path(asc_inc_str).is_dir() and f"-I{asc_inc_str}" not in extra_flags:
-        include_flags.append(f"-I{asc_inc_str}")
+    _add_inc(asc_inc_str)
     if has_tl_templates:
         tl_inc = _detect_tilelang_include_dir()
-        if tl_inc and f"-I{tl_inc}" not in extra_flags:
-            include_flags.append(f"-I{tl_inc}")
+        if tl_inc:
+            _add_inc(tl_inc)
+    for cann_inc in _detect_cann_include_dirs(cann_root, bisheng_bin=resolved_bisheng):
+        _add_inc(cann_inc)
 
     env = dict(os.environ)
-    resolved_cann = _resolve_cann_root(cann_root)
+    resolved_cann = _resolve_cann_root(cann_root, bisheng_bin=resolved_bisheng)
     cann_root_str = str(resolved_cann).strip() if resolved_cann is not None else ""
     if cann_root_str and Path(cann_root_str).is_dir() and not env.get("ASCEND_HOME_PATH"):
         env["ASCEND_HOME_PATH"] = cann_root_str
@@ -1209,22 +1725,17 @@ def run_stage_b_ascendc_compile(
         obj_path = Path(tmp_dir) / "kernel.o"
         src_path.write_text(cpp_source, encoding="utf-8")
 
-        def _invoke(
-            *,
-            include_res_usage: bool,
-            use_legacy_cce_flags: bool,
-        ) -> subprocess.CompletedProcess[str]:
+        def _invoke(*, use_legacy_cce_flags: bool) -> subprocess.CompletedProcess[str]:
             arch_flags = (
                 ["-x", "cce", f"--cce-aicore-arch={arch}"]
                 if use_legacy_cce_flags
                 else [f"--npu-arch={arch}"]
             )
-            res_flags = ["--cce-res-usage"] if include_res_usage else []
             cmd = [
                 resolved_bisheng,
                 *arch_flags,
                 "--cce-aicore-only",
-                *res_flags,
+                "--cce-res-usage",
                 "-O2",
                 *std_flags,
                 *include_flags,
@@ -1244,20 +1755,14 @@ def run_stage_b_ascendc_compile(
             )
 
         try:
-            proc = _invoke(include_res_usage=True, use_legacy_cce_flags=False)
+            proc = _invoke(use_legacy_cce_flags=False)
             if proc.returncode != 0:
                 combined_err = (proc.stderr or "") + "\n" + (proc.stdout or "")
                 low_err = combined_err.lower()
                 if "--npu-arch" in low_err and any(
                     tok in low_err for tok in ("unknown", "unrecognized", "unsupported", "invalid")
                 ):
-                    proc = _invoke(include_res_usage=True, use_legacy_cce_flags=True)
-                    combined_err = (proc.stderr or "") + "\n" + (proc.stdout or "")
-                    low_err = combined_err.lower()
-                if proc.returncode != 0 and "--cce-res-usage" in combined_err and any(
-                    tok in low_err for tok in ("unknown", "unrecognized", "unsupported", "invalid")
-                ):
-                    proc = _invoke(include_res_usage=False, use_legacy_cce_flags=False)
+                    proc = _invoke(use_legacy_cce_flags=True)
         except subprocess.TimeoutExpired:
             return StageBResult(
                 passed=False,
@@ -1266,20 +1771,44 @@ def run_stage_b_ascendc_compile(
             )
 
         combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
-            combined_out,
-            asm_or_dump_text=cpp_source,
-        )
-        ma_profile = (
-            extract_microarch_profile_from_cce(cpp_source).to_dict()
-            if cpp_source.strip()
-            else None
-        )
         if proc.returncode != 0 or not obj_path.is_file():
-            detail = (proc.stderr or proc.stdout or "bisheng failed without diagnostics").strip()[-1500:]
+            spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
+                combined_out,
+                asm_or_dump_text=cpp_source,
+            )
+            ma_profile = (
+                extract_microarch_profile_from_cce(cpp_source).to_dict()
+                if cpp_source.strip()
+                else None
+            )
+            detail = (proc.stderr or proc.stdout or "bisheng failed without diagnostics").strip()[
+                -1500:
+            ]
             return StageBResult(
                 passed=False,
                 error_message=f"stage_b_ascendc_compile_failed (rc={proc.returncode}): {detail}",
+                elapsed_sec=time.monotonic() - t0,
+                spill_bytes=spill_bytes,
+                vloopv2_hit=vloopv2_hit,
+                compiler_summary=summary,
+                microarch_profile=ma_profile,
+            )
+
+        inst_ok, inst_err = _verify_object_has_instantiated_kernel(
+            obj_path, bisheng_bin=resolved_bisheng
+        )
+        objdump_text = _disassemble_object(obj_path, bisheng_bin=resolved_bisheng)
+        telemetry_out = _augment_bisheng_telemetry_text(combined_out, objdump_text)
+        dump_text = f"{objdump_text}\n{cpp_source}" if objdump_text.strip() else cpp_source
+        spill_bytes, vloopv2_hit, summary = _parse_cce_res_usage_with_summary(
+            telemetry_out,
+            asm_or_dump_text=dump_text,
+        )
+        ma_profile = _merge_disassembly_microarch_profile(cpp_source, objdump_text)
+        if not inst_ok:
+            return StageBResult(
+                passed=False,
+                error_message=inst_err,
                 elapsed_sec=time.monotonic() - t0,
                 spill_bytes=spill_bytes,
                 vloopv2_hit=vloopv2_hit,
@@ -1605,7 +2134,7 @@ class GateFunnel:
                 res = stage_c.residual
                 sw_loops = int(getattr(comp_summary, "software_loops", 0) or 0)
                 vl_loops = int(getattr(comp_summary, "vloopv2_loops", 0) or 0)
-                comp_vloop_hit = not (sw_loops > 0 and vl_loops == 0)
+                comp_vloop_hit = bool(stage_b.vloopv2_hit) and vl_loops > 0 and sw_loops == 0
                 merged_res = replace(
                     res,
                     spill_bytes=max(res.spill_bytes, int(comp_summary.spill_bytes)),

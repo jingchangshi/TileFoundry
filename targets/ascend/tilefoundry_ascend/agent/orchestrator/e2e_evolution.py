@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, field
 import hashlib
 import json
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
@@ -19,6 +19,7 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     KernelLLMBackend,
     extract_python_dsl,
 )
+from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     PortfolioRoundReport,
     PortfolioRunner,
@@ -30,7 +31,7 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     compute_static_dynamic_residual,
     extract_structural_signature,
 )
-from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
+from tilefoundry_ascend.agent.orchestrator.twin_bridge import verify_numerical_twin
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
     HirBlueprintPacket,
     compile_hir_blueprint,
@@ -396,11 +397,23 @@ def _wrap_funnel_with_proxy(
     funnel: GateFunnel,
     target: AscendTarget | None,
     *,
+    hir_source: str = "",
+    anchor_dims: Mapping[str, int] | None = None,
     enable_track_router: bool = False,
     ideal_roofline_us: float = 0.0,
 ) -> GateFunnel:
-    def _proxy_device(_dsl: str, stage_a: StageAResult) -> StageCResult:
+    def _proxy_device(dsl_src: str, stage_a: StageAResult) -> StageCResult:
         assert stage_a.ledger is not None
+        acc_ok = True
+        err_msg = ""
+        if hir_source.strip() and "@module" in hir_source:
+            twin_res = verify_numerical_twin(
+                hir_source,
+                dsl_src,
+                anchor_dims=anchor_dims or {},
+            )
+            acc_ok = twin_res.passed
+            err_msg = twin_res.error_message
         lat = _proxy_latency_from_ledger(stage_a.ledger)
         aic_mad, aiv_vec, aiv_mte2 = _derive_proportional_pmu_ratios(stage_a.ledger)
         telemetry: dict[str, object] = {
@@ -413,11 +426,12 @@ def _wrap_funnel_with_proxy(
         if ideal_roofline_us > 0.0 and lat > 0.0:
             telemetry["roofline_eta"] = min(1.0, ideal_roofline_us / max(1e-6, lat))
         return StageCResult(
-            passed=True,
-            accuracy_passed=True,
+            passed=acc_ok,
+            accuracy_passed=acc_ok,
             measured_latency_us=lat,
             residual=compute_static_dynamic_residual(stage_a.ledger, telemetry),
             telemetry=telemetry,
+            error_message=err_msg,
         )
 
     eff_router = enable_track_router or funnel._enable_track_router
@@ -475,6 +489,8 @@ async def run_e2e_evolution(
     active_funnel = _wrap_funnel_with_proxy(
         funnel,
         target,
+        hir_source=hir_source,
+        anchor_dims=anchor_dims,
         enable_track_router=enable_track_router,
         ideal_roofline_us=ideal_roofline_us,
     )
@@ -557,7 +573,9 @@ async def run_e2e_evolution(
         ledger=base_ledger,
         residual=base_residual,
         latency_us=base_lat,
-        accuracy_passed=True,
+        accuracy_passed=(
+            bool(base_eval.stage_c.accuracy_passed) if base_eval.stage_c is not None else True
+        ),
         structural_signature=extract_structural_signature(baseline_dsl, track=base_track),
         hypothesis="unscheduled_hir_baseline",
         parent_id=None,

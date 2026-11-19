@@ -563,6 +563,12 @@ extern "C" void launch_rope(
 '''
 
 
+def _render_trackb_tu(**dims: object) -> str:
+    """Render an instantiated C++20 Track-B translation unit for apply_rotary_pos_emb."""
+    raw_src = dims.get("trackb_src")
+    return str(raw_src) if raw_src is not None else _ROPE_ASC_SRC
+
+
 def _find_bisheng() -> str | None:
     found = shutil.which("bisheng")
     if found:

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
 import math
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 
 from tilefoundry_ascend.ascend.sil.schema import (
     VALID_FREEDOM_FACETS,
@@ -66,7 +66,6 @@ class SILVerifier:
         tag = policy.regime_tag
         axes = policy.topology_axes
 
-        # 1. L1 capacity & Half-L1 ping/pong isolation
         if policy.l1_estimated_bytes > bounds.l1_bytes:
             errors.append(
                 f"[{tag}] L1 footprint {policy.l1_estimated_bytes} B exceeds dav-3510 L1 limit {bounds.l1_bytes} B"
@@ -81,7 +80,6 @@ class SILVerifier:
                     f"(l1_stages={policy.l1_stages})"
                 )
 
-        # 2. L0C accumulator tile capacity
         uses_cube = (
             axes.uses_cube
             or bool(policy.cube_operand_dtype)
@@ -97,7 +95,6 @@ class SILVerifier:
                     f"exceeds dav-3510 L0C limit {bounds.l0c_bytes} B"
                 )
 
-        # 3. UB capacity & 256KB unlock legality + cross-axis (coupled_1c2v x irregular_simt) carveout
         is_coupled_simt = (
             axes.compute_engine == "coupled_1c2v"
             and axes.iteration_regularity == "irregular_simt"
@@ -142,7 +139,6 @@ class SILVerifier:
                 ):
                     suggested_fixes["ub_256kb_unlock"] = True
 
-        # 4. Forbidden 3510 DMA paths
         forbidden_map = {_normalize_dma_path(p): p for p in bounds.forbidden_dma_paths}
         for path in policy.dma_paths_used:
             norm = _normalize_dma_path(path)
@@ -152,7 +148,6 @@ class SILVerifier:
                     f"(forbidden={bounds.forbidden_dma_paths})"
                 )
 
-        # 5. Illegal direct Cube INT4
         if (
             bounds.forbid_cube_int4
             and policy.cube_operand_dtype.strip().lower() in _INT4_DTYPES
@@ -165,14 +160,12 @@ class SILVerifier:
             suggested_fixes["w4_mode"] = "aiv_unpack_f16"
             suggested_fixes["w4_mode_alternatives"] = ["aiv_unpack_f16", "mxa8w4_bitshift_x64"]
 
-        # 6. Silent uint16_t MMAD wrap
         if max(policy.tile_mnk) > bounds.max_mmad_mnk:
             errors.append(
                 f"[{tag}] tile_mnk={policy.tile_mnk} exceeds max_mmad_mnk={bounds.max_mmad_mnk} "
                 f"(silent uint16_t MMAD wrap hazard)"
             )
 
-        # 7. unit_flag_2_3 deadlock hazard
         if (
             policy.sync_mode in ("unit_flag_2_3", "unit_flag")
             and policy.l0c_buffers > 1
@@ -185,7 +178,6 @@ class SILVerifier:
             )
             suggested_fixes["l0c_buffers"] = 1
 
-        # 8. UB bank conflict check (512B stride across 16 banks * 32B datablocks)
         if (
             policy.ub_row_stride_bytes > 0
             and (policy.ub_row_stride_bytes % 512 == 0)
@@ -198,7 +190,6 @@ class SILVerifier:
             suggested_fixes["ub_bank_pad_datablocks"] = 1
             suggested_fixes["ub_rw_shift_datablocks"] = 8
 
-        # 9. CrossCore depth > 15 guard (sync_mode OR coupled_1c2v axis)
         if (
             policy.sync_mode in _CROSSCORE_FLAG_MODES
             and policy.reverse_ack_period > bounds.max_crosscore_depth
@@ -218,7 +209,6 @@ class SILVerifier:
             )
             suggested_fixes["reverse_ack_period"] = min(14, bounds.max_crosscore_depth)
 
-        # 10. l0c2ub_split & ragged_group empty-subblock sync parity guard
         if (
             policy.cv_datapath.startswith(("l0c2ub_split", "l0c_to_ub_split"))
             and not policy.ensure_empty_subblock_sync
@@ -238,7 +228,6 @@ class SILVerifier:
             )
             suggested_fixes["ensure_empty_subblock_sync"] = True
 
-        # 11. SIMT thread count warning
         if policy.vector_mode in _SIMT_VECTOR_MODES and policy.simt_threads > 1024:
             warnings.append(
                 f"[{tag}] simt_threads={policy.simt_threads} > 1024 on {policy.vector_mode}; "
@@ -246,7 +235,6 @@ class SILVerifier:
             )
             suggested_fixes["simt_threads"] = 512
 
-        # 12. HF32 precision guard
         fp32_thresh = _resolve_fp32_threshold(advisory.precision_thresholds)
         if policy.hf32_allowed and fp32_thresh is not None and fp32_thresh < _HF32_MIN_FP32_THRESHOLD:
             errors.append(
@@ -255,14 +243,12 @@ class SILVerifier:
             )
             suggested_fixes["hf32_allowed"] = False
 
-        # 13. Non-IEEE unshifted exp guard on inf/nan inputs
         if policy.fast_unshifted_exp and advisory.has_nan_inf_cases:
             errors.append(
                 f"[{tag}] fast_unshifted_exp=True is unsafe when advisory.has_nan_inf_cases=True"
             )
             suggested_fixes["fast_unshifted_exp"] = False
 
-        # 14. bidirectional_cv_ring Prefill M < 82 warning
         if axes.memory_ring == "bidirectional_cv_ring" and _is_prefill_regime(tag):
             rep_m = regime.representative_dims.get("M") if regime is not None else None
             if bm < 82 or (rep_m is not None and 0 < rep_m < 82):
@@ -343,7 +329,7 @@ class SILVerifier:
         *,
         max_flag_depth: int = 15,
     ) -> VerificationReport:
-        """Verify AscendC source text against the 7-facet MECE ConstraintRelaxationMask + hardware invariants."""
+        """Verify AscendC source text against 7-facet MECE locks and hardware invariants."""
         return verify_source_against_facets(source_text, mask, max_flag_depth=max_flag_depth)
 
 
@@ -404,13 +390,20 @@ def _strip_cpp_comments_and_strings(src: str) -> str:
 
 @dataclass(frozen=True)
 class _FlagEvent:
-    kind: str  # "set" or "wait"
+    """Single hardware flag, sync, or slot-lock event extracted from C++ control flow."""
+
+    kind: str
     flag_id: str
+    family: str = "crosscore"
+    pipe_pair: tuple[str, str] = ("", "")
+    event_expr: str = ""
 
 
 @dataclass(frozen=True)
 class _TermStmt:
-    kind: str  # "return", "continue", "break"
+    """Control-flow terminator statement."""
+
+    kind: str
 
 
 @dataclass(frozen=True)
@@ -472,10 +465,45 @@ def _consume_balanced(src: str, idx: int, open_ch: str, close_ch: str) -> int:
     return n
 
 
+def _split_top_level_args(raw_args: str) -> list[str]:
+    parts: list[str] = []
+    cur: list[str] = []
+    paren = 0
+    angle = 0
+    bracket = 0
+    for ch in raw_args:
+        if ch == "(":
+            paren += 1
+        elif ch == ")" and paren > 0:
+            paren -= 1
+        elif ch == "<":
+            angle += 1
+        elif ch == ">" and angle > 0:
+            angle -= 1
+        elif ch == "[":
+            bracket += 1
+        elif ch == "]" and bracket > 0:
+            bracket -= 1
+        if ch == "," and paren == 0 and angle == 0 and bracket == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail or parts:
+        parts.append(tail)
+    return parts
+
+
+def _is_literal_event_expr(expr: str) -> bool:
+    return bool(re.fullmatch(r"(?:-?\d+[uUlL]*|EVENT_ID\d+)", expr.strip()))
+
+
 def _match_flag_call_at(src: str, idx: int) -> tuple[_FlagEvent, int] | None:
-    """Try to parse a SetFlag/WaitFlag call starting at idx."""
+    """Try to parse a CrossCore/SetFlag, asc_sync, or asc_lock call starting at idx."""
     m = re.match(
-        r"(CrossCoreSetFlag|CrossCoreWaitFlag|SetFlag|WaitFlag)\b",
+        r"(CrossCoreSetFlag|CrossCoreWaitFlag|SetFlag|WaitFlag|"
+        r"asc_sync_notify|asc_sync_wait|asc_lock|asc_unlock)\b",
         src[idx:],
     )
     if not m:
@@ -495,8 +523,40 @@ def _match_flag_call_at(src: str, idx: int) -> tuple[_FlagEvent, int] | None:
         return None
     end_paren = _consume_balanced(src, pos, "(", ")")
     args = src[pos + 1 : end_paren - 1]
+    if name in ("asc_lock", "asc_unlock"):
+        parts = _split_top_level_args(args)
+        pipe = " ".join(parts[0].split()) if parts else ""
+        slot = " ".join(parts[1].split()) if len(parts) > 1 else "0"
+        kind = "set" if name == "asc_lock" else "wait"
+        return (
+            _FlagEvent(
+                kind=kind,
+                flag_id=f"lock:{pipe}:{slot}",
+                family="lock",
+                pipe_pair=(pipe, ""),
+                event_expr=slot,
+            ),
+            end_paren,
+        )
+    if name in ("asc_sync_notify", "asc_sync_wait"):
+        parts = _split_top_level_args(args)
+        src_p = " ".join(parts[0].split()) if parts else ""
+        dst_p = " ".join(parts[1].split()) if len(parts) > 1 else ""
+        ev_raw = " ".join(parts[2].split()) if len(parts) > 2 else "0"
+        ev_norm = re.sub(r"^\(\s*event_t\s*\)\s*", "", ev_raw).strip()
+        kind = "set" if name == "asc_sync_notify" else "wait"
+        return (
+            _FlagEvent(
+                kind=kind,
+                flag_id=f"sync:{src_p}:{dst_p}:{ev_norm}",
+                family="asc_sync",
+                pipe_pair=(src_p, dst_p),
+                event_expr=ev_norm,
+            ),
+            end_paren,
+        )
     kind = "set" if "SetFlag" in name else "wait"
-    return _FlagEvent(kind=kind, flag_id=_normalize_flag_id(args)), end_paren
+    return _FlagEvent(kind=kind, flag_id=_normalize_flag_id(args), family="crosscore"), end_paren
 
 
 def _strip_outer_parens(text: str) -> str:
@@ -593,7 +653,6 @@ def _parse_stmt_sequence(src: str, idx: int, stop_on_rbrace: bool) -> tuple[_Blo
             items.append(sub_block)
             continue
 
-        # Check control-flow keywords
         if_hit = _try_parse_if_at(src, idx)
         if if_hit is not None:
             if_node, idx = if_hit
@@ -633,19 +692,16 @@ def _parse_stmt_sequence(src: str, idx: int, stop_on_rbrace: bool) -> tuple[_Blo
             idx = pos
             continue
 
-        # Check flag call
         flag_hit = _match_flag_call_at(src, idx)
         if flag_hit is not None:
             ev, idx = flag_hit
             items.append(ev)
             continue
 
-        # Check early terminator
         m_term = re.match(r"(return|continue|break)\b", src[idx:])
         if m_term and (idx == 0 or not (src[idx - 1].isalnum() or src[idx - 1] == "_")):
             kind = m_term.group(1)
             pos = idx + len(kind)
-            # Scan until ';' for any inline flag call in return expression (rare)
             while pos < n and src[pos] != ";" and src[pos] != "}":
                 pos += 1
             if pos < n and src[pos] == ";":
@@ -700,6 +756,75 @@ def _merge_delta_maps(a: dict[str, int], b: dict[str, int]) -> dict[str, int]:
     return out
 
 
+def _collect_asc_sync_analysis(
+    root_block: object,
+    errors: list[str],
+) -> frozenset[tuple[str, str]]:
+    """Validate asc_sync_notify/wait pipe-pair coverage and detect loop-carried ping-pong."""
+    notify_counts: dict[tuple[str, str], int] = {}
+    wait_counts: dict[tuple[str, str], int] = {}
+    notify_events: dict[tuple[str, str], set[str]] = {}
+    wait_events: dict[tuple[str, str], set[str]] = {}
+    in_loop_pairs: set[tuple[str, str]] = set()
+    out_loop_pairs: set[tuple[str, str]] = set()
+    in_loop_symbolic_pairs: set[tuple[str, str]] = set()
+
+    def _walk(node: object, in_loop: bool) -> None:
+        if isinstance(node, _FlagEvent):
+            if node.family == "asc_sync":
+                pair = node.pipe_pair
+                if node.kind == "set":
+                    notify_counts[pair] = notify_counts.get(pair, 0) + 1
+                    notify_events.setdefault(pair, set()).add(node.event_expr)
+                else:
+                    wait_counts[pair] = wait_counts.get(pair, 0) + 1
+                    wait_events.setdefault(pair, set()).add(node.event_expr)
+                if in_loop:
+                    in_loop_pairs.add(pair)
+                    if not _is_literal_event_expr(node.event_expr):
+                        in_loop_symbolic_pairs.add(pair)
+                else:
+                    out_loop_pairs.add(pair)
+            return
+        if isinstance(node, _LoopNode):
+            _walk(node.body, True)
+            return
+        if isinstance(node, _IfNode):
+            _walk(node.then_branch, in_loop)
+            if node.else_branch is not None:
+                _walk(node.else_branch, in_loop)
+            return
+        if isinstance(node, _BlockNode):
+            for stmt in node.stmts:
+                _walk(stmt, in_loop)
+
+    _walk(root_block, False)
+
+    all_pairs = sorted(set(notify_counts) | set(wait_counts))
+    pingpong_pairs: set[tuple[str, str]] = set(in_loop_pairs & out_loop_pairs)
+    for pair in all_pairs:
+        nc = notify_counts.get(pair, 0)
+        wc = wait_counts.get(pair, 0)
+        if nc == 0 or wc == 0:
+            errors.append(
+                f"[hw_legality] Unpaired asc_sync_notify/wait on pipe pair "
+                f"{pair[0]}->{pair[1]} (notify={nc}, wait={wc})"
+            )
+            continue
+        n_evs = notify_events.get(pair, set())
+        w_evs = wait_events.get(pair, set())
+        all_evs = n_evs | w_evs
+        if all(_is_literal_event_expr(ev) for ev in all_evs) and n_evs != w_evs:
+            errors.append(
+                f"[hw_legality] Mismatched asc_sync_notify/wait event IDs on "
+                f"{pair[0]}->{pair[1]} (notify={sorted(n_evs)}, wait={sorted(w_evs)})"
+            )
+        elif pair in in_loop_symbolic_pairs:
+            pingpong_pairs.add(pair)
+
+    return frozenset(pingpong_pairs)
+
+
 def _eval_cfg_node(
     node: object,
     *,
@@ -711,10 +836,13 @@ def _eval_cfg_node(
     core_role: str | None = None,
     warnings: list[str] | None = None,
     warn_symbolic: bool = False,
+    skip_asc_sync_pairs: frozenset[tuple[str, str]] = frozenset(),
 ) -> tuple[dict[str, int], dict[str, int], dict[str, int], str | None]:
     """Evaluate per-flag-ID Set/Wait deltas across CFG + 1C2V core-role branches."""
     if isinstance(node, _FlagEvent):
-        if _is_literal_flag_id(node.flag_id):
+        if node.family == "asc_sync" and node.pipe_pair in skip_asc_sync_pairs:
+            return ({}, {}, {}, None)
+        if node.family == "crosscore" and _is_literal_flag_id(node.flag_id):
             fid_int = int(node.flag_id)
             if fid_int < 0 or fid_int > max_flag_depth:
                 errors.append(
@@ -741,6 +869,7 @@ def _eval_cfg_node(
             core_role=core_role,
             warnings=warnings,
             warn_symbolic=warn_symbolic,
+            skip_asc_sync_pairs=skip_asc_sync_pairs,
         )
         for fid, val in sorted(b_common.items()):
             if val != 0:
@@ -777,6 +906,7 @@ def _eval_cfg_node(
                 core_role=branch_role,
                 warnings=warnings,
                 warn_symbolic=warn_symbolic,
+                skip_asc_sync_pairs=skip_asc_sync_pairs,
             )
             ec: dict[str, int] = {}
             eaic: dict[str, int] = {}
@@ -800,6 +930,7 @@ def _eval_cfg_node(
                     core_role=opp_role,
                     warnings=warnings,
                     warn_symbolic=warn_symbolic,
+                    skip_asc_sync_pairs=skip_asc_sync_pairs,
                 )
             out_aic = _merge_delta_maps(taic, eaic)
             out_aiv = _merge_delta_maps(taiv, eaiv)
@@ -825,6 +956,7 @@ def _eval_cfg_node(
             core_role=core_role,
             warnings=warnings,
             warn_symbolic=warn_symbolic,
+            skip_asc_sync_pairs=skip_asc_sync_pairs,
         )
         if node.else_branch is not None:
             ec, eaic, eaiv, eterm = _eval_cfg_node(
@@ -837,6 +969,7 @@ def _eval_cfg_node(
                 core_role=core_role,
                 warnings=warnings,
                 warn_symbolic=warn_symbolic,
+                skip_asc_sync_pairs=skip_asc_sync_pairs,
             )
         else:
             ec, eaic, eaiv, eterm = {}, {}, {}, None
@@ -922,6 +1055,7 @@ def _eval_cfg_node(
                 core_role=core_role,
                 warnings=warnings,
                 warn_symbolic=warn_symbolic,
+                skip_asc_sync_pairs=skip_asc_sync_pairs,
             )
             if term_kind is not None:
                 continue
@@ -933,7 +1067,7 @@ def _eval_cfg_node(
                 for fid, delta_val in d_map.items():
                     target_run[fid] = target_run.get(fid, 0) + delta_val
                     depth_now = target_inc.get(fid, 0) + target_run[fid]
-                    if depth_now > max_flag_depth:
+                    if not fid.startswith(("lock:", "sync:")) and depth_now > max_flag_depth:
                         _record_flag_issue(
                             fid,
                             f"In-flight SetFlag depth {depth_now} for flag {fid!r} exceeds max_flag_depth={max_flag_depth}",
@@ -981,8 +1115,9 @@ def _eval_cfg_flag_balance(
     incoming_delta: dict[str, int] | None = None,
     warnings: list[str] | None = None,
     warn_symbolic: bool = False,
+    skip_asc_sync_pairs: frozenset[tuple[str, str]] = frozenset(),
 ) -> tuple[dict[str, int], str | None]:
-    """Evaluate per-flag-ID Set/Wait deltas across CFG + 1C2V core-role branches."""
+    """Evaluate per-flag-ID Set/Wait, asc_sync, and asc_lock deltas across CFG branches."""
     inc = dict(incoming_delta or {})
     r_common, r_aic, r_aiv, term_kind = _eval_cfg_node(
         node,
@@ -994,10 +1129,9 @@ def _eval_cfg_flag_balance(
         core_role=None,
         warnings=warnings,
         warn_symbolic=warn_symbolic,
+        skip_asc_sync_pairs=skip_asc_sync_pairs,
     )
     r_cv = _merge_delta_maps(r_aic, r_aiv)
-    # Prevent unguarded common flags from silently canceling core-role guarded flags
-    # (unguarded WaitFlag runs on BOTH AIC and AIV, whereas SetFlag in AIC runs only on AIC).
     for fid in sorted(set(r_common) & (set(r_aic) | set(r_aiv))):
         c_val = r_common.get(fid, 0)
         cv_val = r_cv.get(fid, 0)
@@ -1022,7 +1156,7 @@ _L1_BYTES_DECL_RE = re.compile(r"\bl1_bytes\s*=\s*(\d+)", re.IGNORECASE)
 _TILE_DIM_DECL_RE = re.compile(r"\b(?:CUBE_)?TILE_([MNK])\s*=\s*(\d+)")
 
 _FACET_ALG_COMPUTE_RE = re.compile(
-    r"\b(?:Reg::[A-Za-z_]\w*|Mmad|T\.gemm|asc_reduce_[A-Za-z0-9_]+)\b"
+    r"\b(?:Reg::[A-Za-z_]\w*|Mmad|T\.gemm|asc_mmad|asc_reduce_[A-Za-z0-9_]+)\b"
 )
 _FACET_TILE_STAGE_RE = re.compile(
     r"\b(?:CUBE_TILE_M|CUBE_TILE_N|CUBE_TILE_K|TILE_M|TILE_N|TILE_K|"
@@ -1030,7 +1164,8 @@ _FACET_TILE_STAGE_RE = re.compile(
 )
 _FACET_EXEC_MODE_SPR_RE = re.compile(
     r"\b(?:__simt_vf__|__simd_vf__|__launch_bounds__|LoadDist::[A-Za-z0-9_]+|"
-    r"StoreDist::[A-Za-z0-9_]+|DIST_[A-Z0-9_]+|SetCtrlSpr|SetMxScaleSPR|Simt::[A-Za-z0-9_]+)\b"
+    r"StoreDist::[A-Za-z0-9_]+|DIST_[A-Z0-9_]+|SetCtrlSpr|SetMxScaleSPR|"
+    r"Simt::[A-Za-z0-9_]+|simd_inst::[A-Za-z0-9_]+)\b"
 )
 _FACET_SRAM_LAYOUT_ALIAS_RE = re.compile(
     r"\b(?:l1_slot_aliasing|L1_SLOT_ALIAS|inplace_l1_alias|reuse_l1_slot|alias_l1_slot|"
@@ -1039,11 +1174,13 @@ _FACET_SRAM_LAYOUT_ALIAS_RE = re.compile(
 )
 _FACET_DMA_CACHE_RE = re.compile(
     r"\b(?:DataCopyPad|DataCopy|Nd2NzParams|Load2D|Load3D|LoadData2D|LoadData3D|"
-    r"FixpipeParamsArch3510|FixPipeDeqScale|SetL2CacheHint|CACHE_MODE_DISABLE|dcci)\b"
+    r"FixpipeParamsArch3510|FixPipeDeqScale|SetL2CacheHint|CACHE_MODE_DISABLE|dcci|"
+    r"asc_copy_[A-Za-z0-9_]+)\b"
 )
 _FACET_PIPELINE_SYNC_RE = re.compile(
     r"\b(?:STAGE_[A-Z0-9_]+|CrossCoreSetFlag|CrossCoreWaitFlag|PipeBarrier|LocalMemBar|"
-    r"HwMutexLock|HwMutexUnlock|enUnitFlag|unitFlag)\b"
+    r"HwMutexLock|HwMutexUnlock|enUnitFlag|unitFlag|"
+    r"asc_sync_notify|asc_sync_wait|asc_lock|asc_unlock)\b"
     r"|\b(?:cmatrixInitVal|initC)\s*=\s*false\b"
     r"|\b(?<![A-Za-z0-9_])(?:SetFlag|WaitFlag)\b(?=\s*(?:<|\())"
 )
@@ -1076,7 +1213,7 @@ def verify_source_against_facets(
     max_flag_depth: int = 15,
     bounds: HardwareLegalityBounds | None = None,
 ) -> VerificationReport:
-    """Enforce the MECE 7-facet AST partition locks + unconditional dav-3510 hardware legality invariants.
+    """Enforce MECE 7-facet AST locks and unconditional dav-3510 hardware invariants.
 
     When ``mask == ConstraintRelaxationMask.top()`` (``mask.is_unrestricted_top`` is True),
     ZERO shell syntax locks apply; only physical hardware legality invariants are enforced.
@@ -1093,7 +1230,6 @@ def verify_source_against_facets(
     warnings: list[str] = []
     suggested_fixes: dict[str, object] = {}
 
-    # 1. Unconditional SILVerifier hardware legality invariants (always checked, including at top())
     for bad_dma in _FORBIDDEN_DMA_SOURCE_RE.findall(raw_text):
         errors.append(
             f"[hw_legality] Forbidden dav-3510 DMA path {bad_dma.strip()!r} "
@@ -1116,23 +1252,25 @@ def verify_source_against_facets(
             )
 
     root_block, _ = _parse_stmt_sequence(stripped, 0, stop_on_rbrace=False)
+    pingpong_sync_pairs = _collect_asc_sync_analysis(root_block, errors)
     top_delta, _ = _eval_cfg_flag_balance(
         root_block,
         max_flag_depth=eff_max_depth,
         errors=errors,
         incoming_delta={},
         warnings=warnings,
-        warn_symbolic=mask_obj.is_unrestricted_top,
+        warn_symbolic=False,
+        skip_asc_sync_pairs=pingpong_sync_pairs,
     )
     for fid, net in sorted(top_delta.items()):
         if net != 0:
             _record_flag_issue(
                 fid,
-                f"[hw_legality] Unbalanced CrossCore SetFlag/WaitFlag count for flag {fid!r} "
+                f"[hw_legality] Unbalanced CrossCore/asc_sync count for flag {fid!r} "
                 f"(net delta={net}; expected 0)",
                 errors=errors,
                 warnings=warnings,
-                warn_symbolic=mask_obj.is_unrestricted_top,
+                warn_symbolic=False,
             )
 
     for m in _UB_BYTES_DECL_RE.finditer(stripped):
@@ -1163,7 +1301,6 @@ def verify_source_against_facets(
                 f"exceeds L0C limit {hw_bounds.l0c_bytes} B"
             )
 
-    # 2. Shell syntax locks (bypassed completely when mask == ConstraintRelaxationMask.top())
     if not mask_obj.is_unrestricted_top:
         if not mask_obj.alg_compute_and_monoid:
             comp_hits = sorted(set(_FACET_ALG_COMPUTE_RE.findall(stripped)))

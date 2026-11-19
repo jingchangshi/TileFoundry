@@ -937,7 +937,8 @@ class _GmmGroupMeta(ctypes.Structure):
     _fields_ = [("starts", ctypes.c_int * 32), ("ends", ctypes.c_int * 32)]
 
 
-def _build_gmm_trackb_callable(
+def _render_gmm_trackb_launcher(
+    trackb_src: str,
     *,
     bm: int,
     bn: int,
@@ -946,12 +947,8 @@ def _build_gmm_trackb_callable(
     bias_dtype: str,
     transpose_weight: bool,
     has_bias: bool,
-):
-    key = ("gmm_trackb", bm, bn, bk, tl_dtype, bias_dtype, bool(transpose_weight), bool(has_bias))
-    cached = _KERNEL_CACHE.get(key)
-    if cached is not None:
-        return cached
-
+) -> str:
+    """Append concrete launch_gmm_* template instantiation to *trackb_src*."""
     trans_flag = 1 if transpose_weight else 0
     bias_flag = 1 if has_bias else 0
 
@@ -965,8 +962,8 @@ def _build_gmm_trackb_callable(
             f"      (__gm__ half*)x_hi, (__gm__ half*)x_lo, (__gm__ half*)w_hi, (__gm__ half*)w_lo,\n"
             f"      (__gm__ float*)y_ptr, meta, E, K, N);"
         )
-        launcher = (
-            _GMM_TRACKB_SRC
+        return (
+            trackb_src
             + f"""
 extern "C" int launch_gmm_f32(
     void* stream, void* x_ptr, void* w_ptr, void* bias_ptr, void* y_ptr,
@@ -982,26 +979,25 @@ extern "C" int launch_gmm_f32(
 }}
 """
         )
+    c_in = "bfloat16_t" if tl_dtype == "bfloat16" else "half"
+    quant_mode = 16 if tl_dtype == "bfloat16" else 1
+    if bias_dtype == "float32":
+        c_bias = "float"
+    elif bias_dtype == "bfloat16":
+        c_bias = "bfloat16_t"
     else:
-        c_in = "bfloat16_t" if tl_dtype == "bfloat16" else "half"
-        quant_mode = 16 if tl_dtype == "bfloat16" else 1
-        if bias_dtype == "float32":
-            c_bias = "float"
-        elif bias_dtype == "bfloat16":
-            c_bias = "bfloat16_t"
-        else:
-            c_bias = "half"
-        kernel_call = (
-            f"gmm_persistent_16<{bm}, {bn}, {bk}, {trans_flag}, {bias_flag}, {c_in}, {c_bias}><<<28, nullptr, stream>>>(\n"
-            f"      (__gm__ {c_in}*)x_ptr, (__gm__ {c_in}*)w_ptr, (__gm__ {c_bias}*)bias_ptr,\n"
-            f"      (__gm__ {c_in}*)y_ptr, meta, E, K, N);"
-            if has_bias
-            else f"gmm_persistent_16_cube<{bm}, {bn}, {bk}, {trans_flag}, {quant_mode}, {c_in}><<<28, nullptr, stream>>>(\n"
-            f"      (__gm__ {c_in}*)x_ptr, (__gm__ {c_in}*)w_ptr, (__gm__ {c_in}*)y_ptr, meta, E, K, N);"
-        )
-        launcher = (
-            _GMM_TRACKB_SRC
-            + f"""
+        c_bias = "half"
+    kernel_call = (
+        f"gmm_persistent_16<{bm}, {bn}, {bk}, {trans_flag}, {bias_flag}, {c_in}, {c_bias}><<<28, nullptr, stream>>>(\n"
+        f"      (__gm__ {c_in}*)x_ptr, (__gm__ {c_in}*)w_ptr, (__gm__ {c_bias}*)bias_ptr,\n"
+        f"      (__gm__ {c_in}*)y_ptr, meta, E, K, N);"
+        if has_bias
+        else f"gmm_persistent_16_cube<{bm}, {bn}, {bk}, {trans_flag}, {quant_mode}, {c_in}><<<28, nullptr, stream>>>(\n"
+        f"      (__gm__ {c_in}*)x_ptr, (__gm__ {c_in}*)w_ptr, (__gm__ {c_in}*)y_ptr, meta, E, K, N);"
+    )
+    return (
+        trackb_src
+        + f"""
 extern "C" int launch_gmm_16(
     void* stream, void* x_ptr, void* w_ptr, void* bias_ptr, void* y_ptr,
     GmmGroupMeta meta, int E, int K, int N) {{
@@ -1009,7 +1005,70 @@ extern "C" int launch_gmm_16(
   return 0;
 }}
 """
-        )
+    )
+
+
+def _render_trackb_tu(**dims: object) -> str:
+    """Render an instantiated C++20 Track-B translation unit for grouped_matmul."""
+    raw_src = dims.get("trackb_src")
+    trackb_src = str(raw_src) if raw_src is not None else _GMM_TRACKB_SRC
+    raw_dt = str(dims.get("tl_dtype", dims.get("dtype", "float16")) or "float16").strip()
+    tl_dtype = raw_dt if raw_dt in ("float16", "bfloat16", "float32") else "float16"
+    raw_bdt = str(dims.get("bias_dtype", tl_dtype) or tl_dtype).strip()
+    bias_dtype = raw_bdt if raw_bdt in ("float16", "bfloat16", "float32") else tl_dtype
+    k_dim = int(dims.get("k_dim", dims.get("K", 256)) or 256)
+    n_dim = int(dims.get("n_dim", dims.get("N", 512)) or 512)
+    m_dim = int(dims.get("m_dim", dims.get("M", 128)) or 128)
+    transpose_weight = bool(dims.get("transpose_weight", False))
+    has_bias = bool(dims.get("has_bias", False))
+    cfg = _select_grouped_matmul_config(
+        group_sizes=(m_dim,),
+        k_dim=k_dim,
+        n_dim=n_dim,
+        tl_dtype=tl_dtype,
+        transpose_weight=transpose_weight,
+        has_bias=has_bias,
+    )
+    bm = int(dims.get("bm", cfg["bm"]) or cfg["bm"])
+    bn = int(dims.get("bn", cfg["bn"]) or cfg["bn"])
+    bk = int(dims.get("bk", cfg["bk"]) or cfg["bk"])
+    return _render_gmm_trackb_launcher(
+        trackb_src,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        tl_dtype=tl_dtype,
+        bias_dtype=bias_dtype,
+        transpose_weight=transpose_weight,
+        has_bias=has_bias,
+    )
+
+
+def _build_gmm_trackb_callable(
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    tl_dtype: str,
+    bias_dtype: str,
+    transpose_weight: bool,
+    has_bias: bool,
+):
+    key = ("gmm_trackb", bm, bn, bk, tl_dtype, bias_dtype, bool(transpose_weight), bool(has_bias))
+    cached = _KERNEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    launcher = _render_gmm_trackb_launcher(
+        _GMM_TRACKB_SRC,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        tl_dtype=tl_dtype,
+        bias_dtype=bias_dtype,
+        transpose_weight=transpose_weight,
+        has_bias=has_bias,
+    )
 
     tl_inc = str(Path(tilelang.__file__).resolve().parent.parent / "src")
     asc_home = os.environ.get("ASCEND_HOME_PATH", "")

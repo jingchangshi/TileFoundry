@@ -129,9 +129,6 @@ def _build_mhc_sinkhorn_prim_func(
             regime = "sfu_pipelined_tile_mat"
 
     with _ascend_target_ctx():
-        # ------------------------------------------------------------------
-        # 1. 4x4 2-cols-per-VREG (8 VREGs total, zero work_ub, zero mem_bar)
-        # ------------------------------------------------------------------
         if m_n == 4 and regime == "vreg_b32_4x4":
             b_t = 32
             io_cap = b_t * 16 + 64
@@ -179,7 +176,6 @@ def _build_mhc_sinkhorn_prim_func(
                                     idx = T.reinterpret("uint32x64", off_elem)
                                     x[r * 2 + p] = T.simd.vsel(T.simd.vgather2(io_ub[0], idx, mask=m_hi_active), v_zero, m_hi_active)
 
-                            # Iter 1: row-softmax + eps
                             for r in T.unroll(4):
                                 rm0 = T.simd.vmax(x[r * 2], x[r * 2 + 1], mask=m32)
                                 rm = T.simd.vmax(rm0, T.simd.vselr(rm0, idx_swap32), mask=m32)
@@ -191,7 +187,6 @@ def _build_mhc_sinkhorn_prim_func(
                                 x[r * 2] = T.simd.vadds(T.simd.vmul(e0, inv_r, mask=m32), eps, mask=m32)
                                 x[r * 2 + 1] = T.simd.vadds(T.simd.vmul(e1, inv_r, mask=m32), eps, mask=m32)
 
-                            # Iter 1: col-norm
                             for p in T.unroll(2):
                                 cs = T.simd.vadd(
                                     T.simd.vadd(x[p], x[2 + p], mask=m32),
@@ -229,9 +224,6 @@ def _build_mhc_sinkhorn_prim_func(
 
             return main_b32_4x4
 
-        # ------------------------------------------------------------------
-        # 2. 4x4 SIMT 1-thread-per-matrix for large B (4096, 16384)
-        # ------------------------------------------------------------------
         if m_n == 4 and regime == "simt_per_mat_4x4":
             threads = 320
             b_t = max(threads, int(batch_tile))
@@ -312,9 +304,6 @@ def _build_mhc_sinkhorn_prim_func(
 
             return main_simt_4x4
 
-        # ------------------------------------------------------------------
-        # 3. Batched 64-lane VREG-resident for hc_mult in (2, 3)
-        # ------------------------------------------------------------------
         if m_n in (2, 3):
             io_cap = ((b_tile * mat_elems + 63) // 64) * 64 + 64
             stages = 2 if (use_pipelined and schedule_mode == "tuned") else 1
@@ -414,9 +403,6 @@ def _build_mhc_sinkhorn_prim_func(
 
             return main_vreg_small
 
-        # ------------------------------------------------------------------
-        # 4. 2-cols-per-VREG UB-cached SimdVF for hc_mult in (6, 8, 12, 16)
-        # ------------------------------------------------------------------
         if m_n in (6, 8, 12, 16):
             b_t = 32
             half_n = m_n // 2
@@ -567,9 +553,6 @@ def _build_mhc_sinkhorn_prim_func(
 
             return main_b32_work
 
-        # ------------------------------------------------------------------
-        # 5. Generic fallback for any odd/arbitrary hc_mult
-        # ------------------------------------------------------------------
         io_cap = ((b_tile * mat_elems + 63) // 64) * 64 + 64
         use_double_buf = m_n <= 8
         stages = 2 if (use_double_buf and use_pipelined) else 1
@@ -997,6 +980,12 @@ extern "C" void launch_mhc_sinkhorn(void* comb, void* out, int32_t b_dim, int32_
   else if (hc == 16) mhc_b32_work_kernel<16><<<n_cores, nullptr, (aclrtStream)stream>>>((__gm__ float*)comb, (__gm__ float*)out, b_dim, n_iter, eps, n_cores);
 }
 """
+
+
+def _render_trackb_tu(**dims: object) -> str:
+    """Render an instantiated C++20 Track-B translation unit for mhc_sinkhorn."""
+    raw_src = dims.get("trackb_src")
+    return str(raw_src) if raw_src is not None else _TRACK_B_CODE
 
 
 def _get_track_b_lib():

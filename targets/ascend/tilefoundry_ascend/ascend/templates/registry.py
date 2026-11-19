@@ -1044,7 +1044,7 @@ def _extract_body_from_input(
     try:
         import tilelang  # noqa: PLC0415
 
-        art = tilelang.lower(source_or_slot, target="ascend", enable_device_compile=False)
+        art = tilelang.lower(source_or_slot, target="ascend")
         ks = getattr(art, "kernel_source", "")
         if ks:
             return str(ks), op_name, axes
