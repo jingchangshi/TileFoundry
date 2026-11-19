@@ -88,7 +88,9 @@ def test_compile_hir_blueprint_mla_without_virtual_tir_leakage() -> None:
     assert "### LAYER 2: TARGET DIALECT API SURFACE" in constraint_block
     assert "### LAYER 3: PHYSICAL ROOFLINE & BLUEPRINT DELTA" in constraint_block
     assert "Routed Execution Track: manual_ssbuf" in constraint_block
+    assert "T.gemm(" in constraint_block
     assert "T.gemm_v0" in constraint_block
+    assert "Strictly Forbidden Symbols" in constraint_block
     assert "T.ascend_mmad" not in constraint_block
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from functools import lru_cache
 import json
 import math
@@ -64,18 +64,6 @@ _DTYPE_BYTES: dict[str, float] = {
     "float4_e2m1": 0.5,
     "float4_e1m2": 0.5,
 }
-
-_ATTENTION_RING_OPS: frozenset[str] = frozenset(
-    {
-        "gqa",
-        "mla",
-        "mla_prolog",
-        "sparse_flash_attention",
-        "flash_attention_score_grad_enhance",
-        "compressed_sparse_attention_core",
-        "sparse_lightning_indexer_grad_kl_loss_enhance",
-    }
-)
 
 
 def _flatten_strs(value: Any) -> Iterable[str]:
@@ -160,64 +148,83 @@ def _has_unaligned_tail_for_case(
     return False
 
 
-def _infer_case_dims(
-    op_name: str,
+def _infer_case_dims_structural(
     shapes: list[list[int]],
     attrs: Mapping[str, Any],
+    *,
+    axes: TopologyAxes,
+    uses_cube: bool,
 ) -> dict[str, int]:
-    if not shapes:
+    """Extract canonical (M, N, K, E) and sequence dims structurally without op names."""
+    if not shapes or not shapes[0]:
         return {"M": 1, "N": 1, "K": 1}
     primary = shapes[0]
     dims: dict[str, int] = {}
 
-    if op_name in ("grouped_matmul", "grouped_matmul_swiglu_quant") and len(shapes) >= 2:
+    if (axes.iteration_regularity == "ragged_group" or "group_list" in attrs) and len(shapes) >= 2:
         dims["M"] = primary[0] if len(primary) >= 1 else 1
         dims["K"] = primary[-1] if len(primary) >= 1 else 1
-        w = shapes[1]
-        dims["E"] = w[0] if len(w) >= 3 else 1
-        dims["N"] = w[-1] if len(w) >= 2 else 1
+        weight = shapes[1]
+        dims["E"] = weight[0] if len(weight) >= 3 else 1
+        dims["N"] = weight[-1] if len(weight) >= 2 else 1
         return dims
 
-    if op_name in ("quant_matmul", "weight_quant_batch_matmul") and len(shapes) >= 2:
-        dims["M"] = int(math.prod(primary[:-1])) if len(primary) >= 2 else 1
-        dims["K"] = primary[-1]
-        dims["N"] = shapes[1][-1] if len(shapes[1]) >= 1 else 1
-        return dims
-
-    if op_name == "q4_0_dequant_matmul":
+    if ("in_features" in attrs or "out_features" in attrs) and len(shapes) >= 2:
         dims["M"] = primary[0] if len(primary) == 1 else int(math.prod(primary[:-1]))
         dims["K"] = int(attrs.get("in_features", primary[-1]))
         dims["N"] = int(attrs.get("out_features", shapes[-1][0] if shapes[-1] else 1))
         return dims
 
-    if op_name in _ATTENTION_RING_OPS:
+    if axes.memory_ring == "bidirectional_cv_ring" and len(shapes) >= 2:
         if len(primary) == 4:
-            dims["B"] = primary[0]
-            dims["S_q"] = primary[1]
-            dims["H_q"] = primary[2]
+            layout = str(attrs.get("inputLayout", attrs.get("layout", "BSND"))).upper()
+            b_dim = primary[0]
+            s_q = primary[2] if layout == "BNSD" else primary[1]
+            h_q = primary[1] if layout == "BNSD" else primary[2]
+            dims["B"] = b_dim
+            dims["S_q"] = s_q
+            dims["H_q"] = h_q
             dims["D"] = primary[3]
-            dims["M"] = primary[0] * primary[1]
+            dims["M"] = b_dim * s_q
         elif len(primary) == 3:
             dims["T"] = primary[0]
             dims["H_q"] = primary[1]
             dims["D"] = primary[2]
             q_lens = attrs.get("actual_seq_qlen")
-            if isinstance(q_lens, list) and q_lens:
-                dims["S_q"] = max(int(x) for x in q_lens)
-            else:
-                dims["S_q"] = primary[0]
+            dims["S_q"] = (
+                max(int(x) for x in q_lens)
+                if isinstance(q_lens, list) and q_lens
+                else primary[0]
+            )
             dims["M"] = dims["S_q"]
         else:
-            dims["M"] = primary[0]
-            dims["D"] = primary[-1]
-        if len(shapes) >= 2 and len(shapes[1]) >= 2:
-            dims["S_kv"] = shapes[1][1] if len(shapes[1]) == 4 else shapes[1][0]
+            dims["M"] = int(math.prod(primary[:-1])) if len(primary) >= 2 else primary[0]
+            dims["K"] = primary[-1]
+            sec_shape = shapes[1]
+            if len(sec_shape) == 2 and sec_shape[-1] == dims["K"] and sec_shape[0] != dims["K"]:
+                dims["N"] = sec_shape[0]
+            else:
+                dims["N"] = sec_shape[-1] if sec_shape else primary[-1]
+            return dims
+        sec = shapes[1]
+        if len(sec) >= 2:
+            layout = str(attrs.get("inputLayout", attrs.get("layout", "BSND"))).upper()
+            if len(sec) == 4:
+                dims["S_kv"] = sec[2] if layout == "BNSD" else sec[1]
+            else:
+                dims["S_kv"] = sec[0]
+        dims["K"] = primary[-1]
+        dims["N"] = shapes[2][-1] if len(shapes) >= 3 and shapes[2] else primary[-1]
         return dims
 
-    if op_name == "linear_cross_entropy" and len(shapes) >= 2:
+    if uses_cube and len(shapes) >= 2 and shapes[1] and len(primary) <= 3 and len(shapes[1]) <= 3:
         dims["M"] = int(math.prod(primary[:-1])) if len(primary) >= 2 else 1
         dims["K"] = primary[-1]
-        dims["N"] = shapes[1][0]
+        rhs = shapes[1]
+        if len(rhs) == 2 and rhs[-1] == dims["K"] and rhs[0] != dims["K"]:
+            dims["N"] = rhs[0]
+        else:
+            dims["N"] = rhs[-1] if len(rhs) >= 1 else 1
         return dims
 
     if len(primary) >= 2:
@@ -235,7 +242,6 @@ def _infer_case_dims(
 
 
 def _classify_case_regime(
-    op_name: str,
     memory_ring: str,
     uses_cube: bool,
     case: Mapping[str, Any],
@@ -249,7 +255,7 @@ def _classify_case_regime(
 
     unaligned = _has_unaligned_tail_for_case(shapes, dtypes, uses_cube)
     if memory_ring == "bidirectional_cv_ring":
-        if op_name == "linear_cross_entropy":
+        if "S_q" not in dims and "B" not in dims:
             return "unaligned_tail" if unaligned else "aligned_main"
         s_q = dims.get("S_q", dims.get("M", 0))
         if s_q < 82:
@@ -260,6 +266,306 @@ def _classify_case_regime(
     if total_elems <= 8192:
         return "small_unaligned" if unaligned else "small"
     return "unaligned_tail" if unaligned else "aligned_main"
+
+
+def _extract_attr_names(raw_attrs: object) -> set[str]:
+    names: set[str] = set()
+    if isinstance(raw_attrs, Mapping):
+        names.update(str(k) for k in raw_attrs.keys())
+    elif isinstance(raw_attrs, (list, tuple)):
+        for item in raw_attrs:
+            if isinstance(item, Mapping) and item.get("name"):
+                names.add(str(item["name"]))
+    return names
+
+
+def infer_contraction_and_axes_from_proto(
+    proto: Mapping[str, Any],
+    cases: Sequence[Mapping[str, Any]] = (),
+    *,
+    spec_map: Mapping[str, Any] | None = None,
+    sf_map: Mapping[str, Any] | None = None,
+    features: object | None = None,
+    regimes: Any = (),
+    dtypes: Iterable[str] = (),
+    any_empty_group_hint: bool = False,
+) -> tuple[TopologyAxes, dict[str, bool]]:
+    """Derive 3-axis TopologyAxes and structural flags from tensor/proto/feature contracts."""
+    proto_map = proto if isinstance(proto, Mapping) else {}
+    spec_dict = spec_map if isinstance(spec_map, Mapping) else {}
+    sf_dict = sf_map if isinstance(sf_map, Mapping) else {}
+    feat = _extract_feature_flags(features)
+
+    dtype_strs = [str(dt).strip().lower() for dt in dtypes if str(dt).strip()]
+    inputs = list(proto_map.get("inputs") or ())
+    outputs = list(proto_map.get("outputs") or ())
+    for item in (*inputs, *outputs):
+        if isinstance(item, Mapping):
+            for dt in _flatten_strs(item.get("dtype")):
+                val = dt.strip().lower()
+                if val and val not in dtype_strs:
+                    dtype_strs.append(val)
+    for case in cases:
+        if isinstance(case, Mapping):
+            for dt in _flatten_strs(case.get("dtype")):
+                val = dt.strip().lower()
+                if val and val not in dtype_strs:
+                    dtype_strs.append(val)
+
+    attrs_keys = _extract_attr_names(proto_map.get("attrs"))
+    attrs_keys.update(str(k) for k in (sf_dict.get("attrs_keys") or ()))
+    any_empty_group = (
+        bool(any_empty_group_hint)
+        or bool(sf_dict.get("has_empty_group", False))
+        or bool(spec_dict.get("has_empty_group", False))
+    )
+    for case in cases:
+        if isinstance(case, Mapping):
+            c_attrs = case.get("attrs") or {}
+            attrs_keys.update(_extract_attr_names(c_attrs))
+            if _has_empty_group_in_attrs(c_attrs):
+                any_empty_group = True
+    if not any_empty_group and isinstance(regimes, (list, tuple)):
+        for reg in regimes:
+            if isinstance(reg, Mapping) and reg.get("has_empty_group"):
+                any_empty_group = True
+                break
+            if getattr(reg, "has_empty_group", False):
+                any_empty_group = True
+                break
+
+    cat = str(sf_dict.get("category") or proto_map.get("category") or "").strip().lower()
+    formula = str(proto_map.get("formula", "")).lower()
+    desc = str(proto_map.get("description", "")).lower()
+    shape_sup = str(proto_map.get("shape_support", "")).lower()
+    contract_text = "\n".join(
+        str(src.get(k, "")).lower()
+        for src in (proto_map, spec_dict)
+        for k in ("formula", "description", "semantic_contract", "shape_support")
+    )
+
+    is_opcode_stream = (
+        str(spec_dict.get("iteration_regularity", "")).strip().lower() == "dynamic_opcode_stream"
+        or bool(spec_dict.get("dynamic_bytecode", False))
+        or bool(spec_dict.get("dynamic_opcode_stream", False))
+        or "program_pattern" in attrs_keys
+        or "bytecode" in contract_text
+        or "opcode_stream" in contract_text
+        or ("program[" in formula and "op =" in formula)
+    )
+
+    is_recurrent = (
+        bool(sf_dict.get("is_recurrent", spec_dict.get("is_recurrent", False)))
+        or feat.get("recurrence") == "non_associative_scan"
+        or "iter_step" in attrs_keys
+        or "chunk_size" in attrs_keys
+        or "hiddensize" in {k.lower() for k in attrs_keys}
+        or ("conv_mode" in attrs_keys and "inplace" in attrs_keys)
+        or "h_{t-1}" in formula
+        or "hprev" in formula
+        or "iter 2" in formula
+    )
+
+    is_grouped = (
+        bool(sf_dict.get("is_ragged", spec_dict.get("is_ragged", False)))
+        or "group_list" in attrs_keys
+    )
+    has_attention_attrs = bool(
+        {
+            "is_causal",
+            "scaleValue",
+            "scale_value",
+            "sparse_mode",
+            "inputLayout",
+            "input_layout",
+            "n_heads",
+            "query_start",
+        }
+        & attrs_keys
+    )
+
+    transposed_weight_pair = (
+        "\u1d40" in formula
+        or ("chunk_size" in attrs_keys and "[b, h, dh, d]" in shape_sup and "[b, h, d, dh]" in shape_sup)
+    )
+    depthwise_flag = (
+        "groups = c" in desc
+        or "depthwise" in contract_text
+        or ("groups" in attrs_keys and "weight[c," in formula)
+    )
+    if "uses_cube" in sf_dict:
+        uses_cube = bool(sf_dict["uses_cube"])
+    elif "uses_cube" in spec_dict:
+        uses_cube = bool(spec_dict["uses_cube"])
+    elif feat and float(feat.get("cube_ratio", 0.0)) > 0.0:
+        uses_cube = True
+    else:
+        uses_cube = bool(
+            "@" in formula
+            or "matmul" in contract_text
+            or "mmad" in contract_text
+            or "gemm" in contract_text
+            or "conv3d_filter_grad" in contract_text
+            or transposed_weight_pair
+            or (
+                cat == "contraction"
+                and not depthwise_flag
+                and "max_{" not in formula
+            )
+            or (formula.strip().startswith("y = conv(") and "groups" not in attrs_keys)
+            or "computes original query, key and value gradients" in desc
+            or "kl-loss gradients" in desc
+        )
+
+    is_cv_ring = uses_cube and (
+        has_attention_attrs
+        or feat.get("recurrence") == "associative_online_rescale"
+        or "online softmax" in contract_text
+        or ("log_softmax" in formula and "@" in formula)
+        or ("softmax(" in formula and "@" in formula)
+        or "attn_sink" in contract_text
+        or "sparse" in contract_text
+    )
+
+    has_w4_quant = (
+        bool(sf_dict.get("has_w4_quant", spec_dict.get("has_w4_quant", False)))
+        or feat.get("quant") == "mixed_fp8_fp4"
+        or any(
+            tok in dt
+            for dt in dtype_strs
+            for tok in ("float4", "fp4", "q4", "int4", "uint4")
+        )
+        or any(dt in ("i4", "u4") for dt in dtype_strs)
+        or ("quant_type" in attrs_keys and any(dt == "uint8" for dt in dtype_strs))
+    )
+    has_mx_quant = (
+        bool(sf_dict.get("has_mx_quant", False))
+        or any("e8m0" in dt for dt in dtype_strs)
+        or ("blocksize" in attrs_keys and "dst_type" in attrs_keys)
+    )
+    has_quant = (
+        has_w4_quant
+        or has_mx_quant
+        or (cat == "quantization")
+        or ("scaleout" in formula)
+        or (feat.get("quant", "none") != "none")
+        or any(
+            tok in dt
+            for dt in dtype_strs
+            for tok in ("int8", "uint8", "float8", "fp8", "hif8")
+        )
+    )
+
+    is_ragged = (
+        any_empty_group
+        or is_grouped
+        or (
+            uses_cube
+            and bool(feat)
+            and (not feat.get("static_bounds", True))
+            and not feat.get("indirect", False)
+        )
+    )
+
+    has_index_input = any(
+        idx > 0 and any(tok in dt for tok in ("int32", "int64"))
+        for idx, item in enumerate(inputs)
+        if isinstance(item, Mapping)
+        for dt in _flatten_strs(item.get("dtype"))
+    )
+    has_sparse_gather = (
+        any(
+            any(
+                tok in str(item.get("name", "")).lower()
+                for tok in ("sparse", "compressed_indices", "topk_index")
+            )
+            for item in inputs
+            if isinstance(item, Mapping)
+        )
+        or ("gather(" in formula)
+    )
+    uses_simt = (
+        bool(sf_dict.get("uses_simt", spec_dict.get("uses_simt", False)))
+        or bool(feat.get("indirect", False))
+        or (0 < int(feat.get("inner_bytes", 0)) < 32 and not uses_cube)
+        or (
+            bool(feat)
+            and not bool(feat.get("static_bounds", True))
+            and not uses_cube
+            and not is_opcode_stream
+        )
+        or cat in ("hash", "hashtable", "index", "indexgather", "scatterupdate")
+        or (cat == "sortselect" and (len(outputs) >= 2 or "iou_threshold" in attrs_keys))
+        or ("grid_sample" in formula or "roi_align" in formula)
+        or ("max_{" in formula and "filter[" in formula)
+        or ("gcd(" in formula)
+        or (
+            has_index_input
+            and cat in ("layouttransform", "transform")
+            and ("dstoffset" in contract_text or "slot_mapping" in contract_text)
+        )
+        or (is_cv_ring and has_sparse_gather)
+    )
+
+    if is_opcode_stream:
+        iteration_regularity = "dynamic_opcode_stream"
+    elif is_ragged:
+        iteration_regularity = "ragged_group"
+    elif uses_simt:
+        iteration_regularity = "irregular_simt"
+    else:
+        iteration_regularity = "affine_simd"
+
+    if is_recurrent or is_opcode_stream:
+        memory_ring = "persistent_onchip_state"
+    elif is_cv_ring:
+        memory_ring = "bidirectional_cv_ring"
+    elif uses_cube and iteration_regularity == "ragged_group":
+        memory_ring = "l0c_ub_epilogue"
+    elif uses_cube:
+        memory_ring = "gm_l1_l0_fixpipe"
+    elif iteration_regularity == "irregular_simt":
+        memory_ring = "ub_random_atomic"
+    else:
+        memory_ring = "gm_ub_stream"
+
+    if uses_cube and (
+        memory_ring in ("bidirectional_cv_ring", "l0c_ub_epilogue", "persistent_onchip_state")
+        or has_quant
+        or uses_simt
+        or is_ragged
+    ):
+        compute_engine = "coupled_1c2v"
+    elif uses_cube:
+        compute_engine = "aic_only"
+    else:
+        compute_engine = "aiv_only"
+
+    axes = TopologyAxes(
+        compute_engine=compute_engine,
+        memory_ring=memory_ring,
+        iteration_regularity=iteration_regularity,
+    )
+    has_kv_cache = has_index_input and cat == "transform" and "slot_mapping" in contract_text
+    has_dead_l1_slice = len(inputs) >= 4 and axes.memory_ring == "bidirectional_cv_ring"
+    uses_mutex_atomic = cat in ("hash", "hashtable") or (
+        cat == "sortselect" and "return_inverse" in attrs_keys
+    )
+    flags = {
+        "uses_cube": uses_cube,
+        "uses_simt": uses_simt and not uses_cube,
+        "is_recurrent": is_recurrent,
+        "has_w4_quant": has_w4_quant,
+        "has_mx_quant": has_mx_quant,
+        "has_quant": has_quant,
+        "is_ragged": bool(is_ragged),
+        "is_cv_ring": is_cv_ring,
+        "is_opcode_stream": is_opcode_stream,
+        "has_kv_cache": has_kv_cache,
+        "has_dead_l1_slice": has_dead_l1_slice,
+        "uses_mutex_atomic": uses_mutex_atomic,
+    }
+    return axes, flags
 
 
 def _to_snake_op_name(raw: str) -> str:
@@ -300,224 +606,11 @@ def _extract_feature_flags(features: object | None) -> dict[str, Any]:
     return {}
 
 
-def _infer_structural_axes_and_flags(
-    op_name: str,
-    *,
-    proto: Mapping[str, Any] | None = None,
-    spec_map: Mapping[str, Any] | None = None,
-    sf_map: Mapping[str, Any] | None = None,
-    dtypes: Iterable[str] = (),
-    regimes: Any = (),
-    features: object | None = None,
-    any_empty_group_hint: bool = False,
-) -> tuple[TopologyAxes, dict[str, bool]]:
-    """Infer 3-axis TopologyAxes and structural flags from dtype and shape signals."""
-    norm = _to_snake_op_name(op_name)
-    proto_map = proto if isinstance(proto, Mapping) else {}
-    spec_map = spec_map if isinstance(spec_map, Mapping) else {}
-    sf_map = sf_map if isinstance(sf_map, Mapping) else {}
-    cat = str(sf_map.get("category") or proto_map.get("category") or "").strip().lower()
-    desc = " ".join(
-        str(proto_map.get(k, "")) for k in ("category", "formula", "description")
-    ).lower()
-    feat = _extract_feature_flags(features)
-    dtype_strs = [str(dt).strip().lower() for dt in dtypes]
-
-    any_empty_group = (
-        bool(any_empty_group_hint)
-        or bool(sf_map.get("has_empty_group", False))
-        or bool(spec_map.get("has_empty_group", False))
-    )
-    if not any_empty_group and isinstance(regimes, (list, tuple)):
-        for reg in regimes:
-            if isinstance(reg, Mapping) and reg.get("has_empty_group"):
-                any_empty_group = True
-                break
-            if getattr(reg, "has_empty_group", False):
-                any_empty_group = True
-                break
-
-    is_opcode_stream = (
-        str(spec_map.get("iteration_regularity", "")).strip().lower() == "dynamic_opcode_stream"
-        or bool(spec_map.get("dynamic_bytecode", False))
-        or bool(spec_map.get("dynamic_opcode_stream", False))
-        or "vm" in norm
-        or "bytecode" in desc
-        or "opcode_stream" in desc
-    )
-
-    is_recurrent = (
-        bool(sf_map.get("is_recurrent", spec_map.get("is_recurrent", False)))
-        or feat.get("recurrence") == "non_associative_scan"
-        or any(
-            tok in norm
-            for tok in ("delta_attention", "selective_scan", "lstm", "ttt", "sinkhorn", "causal_conv")
-        )
-    )
-
-    is_grouped = ("grouped" in norm and ("matmul" in norm or "gemm" in norm)) or (
-        "group_list" in (sf_map.get("attrs_keys") or ())
-    )
-
-    is_attention_ring_op = (
-        any(
-            tok in norm
-            for tok in (
-                "mla",
-                "gqa",
-                "flash_attention",
-                "sparse_attention",
-                "compressed_sparse_attention",
-                "linear_cross_entropy",
-                "lightning_indexer",
-            )
-        )
-        or (
-            ("attention" in norm or cat == "attention")
-            and "attention_residual" not in norm
-            and "delta_attention" not in norm
-            and "mhc_post_grad" not in norm
-        )
-    )
-
-    if "uses_cube" in sf_map:
-        uses_cube = bool(sf_map["uses_cube"])
-    elif "uses_cube" in spec_map:
-        uses_cube = bool(spec_map["uses_cube"])
-    elif feat and float(feat.get("cube_ratio", 0.0)) > 0.0:
-        uses_cube = True
-    else:
-        is_contraction = any(
-            tok in norm for tok in ("matmul", "gemm", "conv_2d", "conv_3d", "lstm")
-        ) or (cat == "contraction" and "depthwise" not in norm and "dilation" not in norm)
-        uses_cube = (
-            is_contraction
-            or is_attention_ring_op
-            or is_grouped
-            or norm in ("kimi_delta_attention", "lact_ttt_chunk")
-        )
-
-    is_cv_ring = uses_cube and (
-        is_attention_ring_op
-        or feat.get("recurrence") == "associative_online_rescale"
-    )
-
-    has_w4_quant = (
-        bool(sf_map.get("has_w4_quant", spec_map.get("has_w4_quant", False)))
-        or feat.get("quant") == "mixed_fp8_fp4"
-        or any(
-            tok in dt
-            for dt in dtype_strs
-            for tok in ("float4", "fp4", "q4", "int4", "uint4")
-        )
-        or any(dt in ("i4", "u4") for dt in dtype_strs)
-        or "q4_0" in norm
-        or norm == "dynamic_mx_quant"
-    )
-
-    has_quant = (
-        has_w4_quant
-        or "quant" in norm
-        or (feat.get("quant", "none") != "none")
-        or any(
-            tok in dt
-            for dt in dtype_strs
-            for tok in ("int8", "uint8", "float8", "fp8", "hif8")
-        )
-    )
-
-    is_ragged = any_empty_group or is_grouped or (
-        uses_cube and feat and (not feat.get("static_bounds", True)) and not feat.get("indirect", False)
-    )
-
-    uses_simt = (
-        bool(sf_map.get("uses_simt", spec_map.get("uses_simt", False)))
-        or bool(feat.get("indirect", False))
-        or (0 < int(feat.get("inner_bytes", 0)) < 32 and not uses_cube)
-        or (not bool(feat.get("static_bounds", True)) and not uses_cube and not is_opcode_stream)
-        or (
-            cat in ("hash", "hashtable", "index", "indexgather", "scatterupdate", "sortselect")
-            and norm not in ("arg_max", "moe_gating_top_k_softmax")
-        )
-        or any(
-            tok in norm
-            for tok in (
-                "hash",
-                "scatter",
-                "gather",
-                "roi",
-                "unique",
-                "nms",
-                "embedding_bag",
-                "grid_sampler",
-                "dilation",
-                "kv_cache",
-                "re_routing",
-                "gcd",
-                "sparse",
-            )
-        )
-        or (norm == "top_k")
-    )
-
-    if is_opcode_stream:
-        iteration_regularity = "dynamic_opcode_stream"
-    elif is_ragged:
-        iteration_regularity = "ragged_group"
-    elif uses_simt:
-        iteration_regularity = "irregular_simt"
-    else:
-        iteration_regularity = "affine_simd"
-
-    if is_recurrent or is_opcode_stream:
-        memory_ring = "persistent_onchip_state"
-    elif is_cv_ring:
-        memory_ring = "bidirectional_cv_ring"
-    elif uses_cube and iteration_regularity == "ragged_group":
-        memory_ring = "l0c_ub_epilogue"
-    elif uses_cube:
-        memory_ring = "gm_l1_l0_fixpipe"
-    elif iteration_regularity == "irregular_simt":
-        memory_ring = "ub_random_atomic"
-    else:
-        memory_ring = "gm_ub_stream"
-
-    if uses_cube and (
-        memory_ring in ("bidirectional_cv_ring", "l0c_ub_epilogue", "persistent_onchip_state")
-        or has_w4_quant
-        or has_quant
-        or uses_simt
-        or is_ragged
-    ):
-        compute_engine = "coupled_1c2v"
-    elif uses_cube:
-        compute_engine = "aic_only"
-    else:
-        compute_engine = "aiv_only"
-
-    axes = TopologyAxes(
-        compute_engine=compute_engine,
-        memory_ring=memory_ring,
-        iteration_regularity=iteration_regularity,
-    )
-    flags = {
-        "uses_cube": uses_cube,
-        "uses_simt": uses_simt and not uses_cube,
-        "is_recurrent": is_recurrent,
-        "has_w4_quant": has_w4_quant,
-        "has_quant": has_quant,
-        "is_ragged": bool(is_ragged),
-        "is_cv_ring": is_cv_ring,
-        "is_opcode_stream": is_opcode_stream,
-    }
-    return axes, flags
-
-
 def resolve_canonical_topology_axes(
     spec_or_name: object,
     features: object | None = None,
 ) -> TopologyAxes:
-    """Resolve canonical 3-axis TopologyAxes directly from structural, dtype, and shape features."""
+    """Resolve canonical 3-axis TopologyAxes directly from structural and dtype features."""
     if spec_or_name is not None:
         direct_axes = (
             spec_or_name.get("topology_axes")
@@ -531,29 +624,16 @@ def resolve_canonical_topology_axes(
         ):
             return TopologyAxes.from_dict(direct_axes)
 
-    op_name = ""
     spec_map: Mapping[str, Any] = {}
-    proto_map: Mapping[str, Any] | None = None
+    proto_map: Mapping[str, Any] = {}
     sf_map: Mapping[str, Any] = {}
     regimes: Any = ()
     dtypes: list[str] = []
 
-    if isinstance(spec_or_name, str):
-        op_name = _to_snake_op_name(spec_or_name)
-    elif isinstance(spec_or_name, Mapping):
+    if isinstance(spec_or_name, Mapping):
         spec_map = spec_or_name
         op_block = spec_map.get("operator")
-        source = op_block if isinstance(op_block, Mapping) else spec_map
-        proto_map = source
-        raw_name = (
-            spec_map.get("op_name")
-            or spec_map.get("cannbot_task")
-            or spec_map.get("id")
-            or source.get("schema")
-            or source.get("name")
-            or ""
-        )
-        op_name = _to_snake_op_name(str(raw_name))
+        proto_map = op_block if isinstance(op_block, Mapping) else spec_map
         raw_sf = spec_map.get("structural_features")
         if isinstance(raw_sf, Mapping):
             sf_map = raw_sf
@@ -563,18 +643,12 @@ def resolve_canonical_topology_axes(
             if isinstance(vals, (list, tuple)):
                 dtypes.extend(str(v) for v in vals)
         for sec in ("inputs", "outputs"):
-            entries = source.get(sec)
+            entries = proto_map.get(sec)
             if isinstance(entries, (list, tuple)):
                 for entry in entries:
                     if isinstance(entry, Mapping):
                         dtypes.extend(_flatten_strs(entry.get("dtype")))
-    elif spec_or_name is not None:
-        raw_name = (
-            getattr(spec_or_name, "op_name", None)
-            or getattr(spec_or_name, "cannbot_task", None)
-            or ""
-        )
-        op_name = _to_snake_op_name(str(raw_name))
+    elif spec_or_name is not None and not isinstance(spec_or_name, str):
         raw_sf = getattr(spec_or_name, "structural_features", None)
         if isinstance(raw_sf, Mapping):
             sf_map = raw_sf
@@ -586,9 +660,9 @@ def resolve_canonical_topology_axes(
         if features is None and hasattr(spec_or_name, "features"):
             features = getattr(spec_or_name, "features")
 
-    axes, _flags = _infer_structural_axes_and_flags(
-        op_name,
-        proto=proto_map,
+    axes, _flags = infer_contraction_and_axes_from_proto(
+        proto_map,
+        (),
         spec_map=spec_map,
         sf_map=sf_map,
         dtypes=dtypes,
@@ -690,9 +764,9 @@ class OpAdvisoryExtractor:
             if _has_empty_group_in_attrs(attrs):
                 any_empty_group = True
 
-        topology_axes, flags = _infer_structural_axes_and_flags(
-            op_name,
-            proto=proto,
+        topology_axes, flags = infer_contraction_and_axes_from_proto(
+            proto,
+            cases,
             sf_map={"attrs_keys": sorted(attrs_keys)},
             dtypes=(*in_dtypes_set, *out_dtypes_set),
             any_empty_group_hint=any_empty_group,
@@ -701,6 +775,10 @@ class OpAdvisoryExtractor:
         uses_simt = flags["uses_simt"]
         is_recurrent = flags["is_recurrent"]
         has_w4_quant = flags["has_w4_quant"]
+        has_mx_quant = flags["has_mx_quant"]
+        has_kv_cache = flags["has_kv_cache"]
+        has_dead_l1_slice = flags["has_dead_l1_slice"]
+        uses_mutex_atomic = flags["uses_mutex_atomic"]
 
         raw_pt = proto.get("precision_thresholds") or {}
         precision_thresholds: dict[str, float] = {
@@ -716,12 +794,13 @@ class OpAdvisoryExtractor:
             for c in cases
         )
         has_inplace_aliasing = (
-            op_name == "kv_cache_append"
+            has_kv_cache
             or any(
                 isinstance(c.get("attrs"), Mapping) and bool(c["attrs"].get("inplace", False))
                 for c in cases
             )
             or "alias" in str(proto.get("description", "")).lower()
+            or "inplace" in attrs_keys
         )
 
         grouped_cases: dict[str, list[dict[str, Any]]] = {}
@@ -737,9 +816,14 @@ class OpAdvisoryExtractor:
             dtypes = list(_flatten_strs(case.get("dtype")))
             attrs = case.get("attrs") or {}
 
-            dims = _infer_case_dims(op_name, shapes, attrs)
+            dims = _infer_case_dims_structural(
+                shapes,
+                attrs,
+                axes=topology_axes,
+                uses_cube=uses_cube,
+            )
             tag = _classify_case_regime(
-                op_name, topology_axes.memory_ring, uses_cube, case, shapes, dtypes, dims
+                topology_axes.memory_ring, uses_cube, case, shapes, dtypes, dims
             )
             unaligned = _has_unaligned_tail_for_case(shapes, dtypes, uses_cube)
             empty_grp = _has_empty_group_in_attrs(attrs)
@@ -822,9 +906,11 @@ class OpAdvisoryExtractor:
             "uses_cube": uses_cube,
             "uses_simt": uses_simt,
             "has_w4_quant": has_w4_quant,
-            "has_mx_quant": op_name == "dynamic_mx_quant",
+            "has_mx_quant": has_mx_quant,
             "is_recurrent": is_recurrent,
-            "has_kv_cache": "kv_cache" in op_name,
+            "has_kv_cache": has_kv_cache,
+            "has_dead_l1_slice": has_dead_l1_slice,
+            "uses_mutex_atomic": uses_mutex_atomic,
             "attrs_keys": sorted(attrs_keys),
         }
 
@@ -865,9 +951,11 @@ def synthesize_default_policy(advisory: AdvisoryEnvelope) -> PolicyEnvelope:
     policies: dict[str, SchedulePolicy] = {}
     resolved_axes = advisory.topology_axes
     selected_rules: list[str] = [f"axes:{resolved_axes.key()}"]
-    op = advisory.op_name
 
-    is_q4 = op == "q4_0_dequant_matmul"
+    is_q4 = bool(advisory.structural_features.get("has_w4_quant", False)) and (
+        resolved_axes.uses_cube
+        or bool(advisory.structural_features.get("uses_cube", False))
+    )
     if is_q4:
         cube_dtype = "q4_0"
         w4_mode = "aiv_unpack_f16"
@@ -957,7 +1045,8 @@ def synthesize_default_policy(advisory: AdvisoryEnvelope) -> PolicyEnvelope:
             tile_mnk = (16, 128, 64) if is_decode else (96, 112, 64)
             bm, bn, bk = tile_mnk
             l1_total = min((bm * bk + bk * bn) * 2 * 2, bounds.l1_bytes)
-            slot_alias = {"K_rope": "P_slot"} if "mla" in op else {}
+            has_dead_l1 = bool(advisory.structural_features.get("has_dead_l1_slice", False))
+            slot_alias = {"aux_key_tail": "epilogue_l1_slot"} if has_dead_l1 else {}
             policies[tag] = SchedulePolicy(
                 regime_tag=tag,
                 topology_axes=resolved_axes,
@@ -1043,6 +1132,8 @@ def synthesize_default_policy(advisory: AdvisoryEnvelope) -> PolicyEnvelope:
             cols = max(1, min(int(dims.get("cols", 256)), 1024))
             tile_mnk = (32, cols, 1)
             ub_bytes = min(131072, bounds.ub_simtvf_bytes)
+            uses_mutex = bool(advisory.structural_features.get("uses_mutex_atomic", False))
+            sync_mode = "mutex" if uses_mutex else "local_bar"
             policies[tag] = SchedulePolicy(
                 regime_tag=tag,
                 topology_axes=resolved_axes,
@@ -1059,7 +1150,7 @@ def synthesize_default_policy(advisory: AdvisoryEnvelope) -> PolicyEnvelope:
                 ub_rw_shift_datablocks=8,
                 ub_row_stride_bytes=0,
                 cv_datapath="none",
-                sync_mode="mutex" if op in ("embedding_hash_table_lookup_or_insert", "unique") else "local_bar",
+                sync_mode=sync_mode,
                 preload_depth=1,
                 reverse_ack_period=0,
                 ensure_empty_subblock_sync=True,

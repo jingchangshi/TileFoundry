@@ -389,10 +389,23 @@ def test_sil_verifier_catches_invalid_policies_and_solvers_fallback_cleanly() ->
     assert "invalid l1_stages" in fallback_pipe.fallback_reason
     assert fallback_pipe.assignment.ii >= 1
 
-    # Clean fallback in RegimePiecewiseSolver when Z3 projection fails (missing PipelineSpec)
+    # Strict failure propagation in RegimePiecewiseSolver on missing PipelineSpec
+    from tilefoundry.ir.hir.pipeline import PipelineError  # noqa: PLC0415
+
     unpipelined_loop = _make_static_ub_loop(with_pipeline=False)
     regime_solver = RegimePiecewiseSolver()
-    fallback_reg = regime_solver.solve_regime(
+    with pytest.raises(PipelineError, match="PIPELINE_MISSING"):
+        regime_solver.solve_regime(
+            {
+                "regime_tag": "main",
+                "representative_dims": {"M": 16, "N": 1024, "D": 1024},
+                "has_unaligned_tail": False,
+            },
+            op_name="rms_norm",
+            topology_axes=ax_simd,
+            loop=unpipelined_loop,
+        )
+    analytical_reg = regime_solver.solve_regime(
         {
             "regime_tag": "main",
             "representative_dims": {"M": 16, "N": 1024, "D": 1024},
@@ -400,13 +413,11 @@ def test_sil_verifier_catches_invalid_policies_and_solvers_fallback_cleanly() ->
         },
         op_name="rms_norm",
         topology_axes=ax_simd,
-        loop=unpipelined_loop,
+        loop=None,
     )
-    assert fallback_reg.solver_mode == "z3_fallback_analytical"
-    assert fallback_reg.fallback_used is True
-    assert "PIPELINE_MISSING" in fallback_reg.fallback_reason
+    assert analytical_reg.solver_mode == "analytical_piecewise"
     assert verifier.verify_policy(
-        SchedulePolicy.from_dict(fallback_reg.to_dict()),
+        SchedulePolicy.from_dict(analytical_reg.to_dict()),
         AdvisoryEnvelope(
             op_name="rms_norm",
             cannbot_task="level2/rms_norm",

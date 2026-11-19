@@ -2719,7 +2719,7 @@ class PerfTargetCampaignRunner:
         min_speedup_gain: float = 0.01,
         min_score_gain: float = 0.05,
     ) -> tuple[bool, float]:
-        """Evaluate whether a rule's causal postcondition materialized with real non-regressive gain."""
+        """Evaluate whether a causal postcondition materialized with non-regressive gain."""
         if not res_all_passed or not ledger.is_legal or rolled_back:
             return False, 0.0
         if (
@@ -3333,6 +3333,7 @@ class PerfTargetCampaignRunner:
                 repair_backend=backend if self._config.max_syntax_repairs > 0 else None,
                 max_syntax_repairs=self._config.max_syntax_repairs,
                 slice_hint=self._slice_contract_instruction(func_name, regime_spec),
+                backend_kind=regime_spec.runtime_backend,
                 stage_a_cost_ranker=stage_a_ranker,
                 cost_prescreen_top_k=prescreen_top_k,
             )

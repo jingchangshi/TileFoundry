@@ -617,6 +617,7 @@ async def run_l0_l1_round_filter(
     repair_backend: KernelLLMBackend | None = None,
     max_syntax_repairs: int = 1,
     slice_hint: str = "",
+    backend_kind: str = "tilelang_dsl",
     stage_a_cost_ranker: Callable[
         [Sequence[tuple[str, str, StageAResult]]], Sequence[tuple[str, float]]
     ]
@@ -628,7 +629,12 @@ async def run_l0_l1_round_filter(
 
     async def _try_repair(cur_src: str, diag: str) -> tuple[str | None, str, bool]:
         assert repair_backend is not None
-        req = build_syntax_repair_request(cur_src, diag, slice_hint=slice_hint)
+        req = build_syntax_repair_request(
+            cur_src,
+            diag,
+            slice_hint=slice_hint,
+            backend_kind=backend_kind,
+        )
         try:
             raw_reply = await repair_backend.generate(req)
         except Exception as exc:

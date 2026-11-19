@@ -10,37 +10,13 @@ from tilefoundry.ir.hir.pipeline import PipelineError
 from tilefoundry.ir.tir.stmts import For, Stmt
 from tilefoundry_ascend.ascend.schedule.pipeline_solver import (
     extract_tir_loop_problem,
-    solve_ascend_pipeline,
+    solve_pipeline_with_monotone_backoff,
 )
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 from tilefoundry_ascend.ascend.target.facts import (
     cube_macs_per_cycle as _default_cube_macs_per_cycle,
-)
-
-_RAGGED_OR_RECURRENT_OPS: frozenset[str] = frozenset(
-    {
-        "grouped_matmul",
-        "grouped_matmul_swiglu",
-        "gmm",
-        "sparse_flash_attention",
-        "sparse_fa",
-        "kimi_delta_attention",
-        "kda",
-        "mhc_sinkhorn",
-        "sinkhorn",
-        "tensor_program_vm",
-        "lact_ttt",
-        "causal_conv1d",
-        "fused_causal_conv1d",
-        "selective_scan",
-        "lstm",
-        "mla",
-        "gqa",
-        "flash_attention",
-        "linear_cross_entropy",
-    }
 )
 
 _DTYPE_BYTES: dict[str, int] = {
@@ -345,7 +321,7 @@ class PiecewiseSchedulePlan:
 
 
 class RegimePiecewiseSolver:
-    """Hybrid hierarchical piecewise solver dispatching static loops to Z3 and structural topologies to analytical inequality planning."""
+    """Hierarchical solver dispatching static loops to Z3 and structural topologies analytically."""
 
     def __init__(self, target: AscendTarget | None = None) -> None:
         self.target = target or AscendTarget("ascend.950pr")
@@ -354,14 +330,12 @@ class RegimePiecewiseSolver:
     def _is_ragged_or_recurrent(
         self,
         *,
-        op_name: str,
         axes: TopologyAxes,
         has_empty_group: bool,
         has_indirect_gather: bool,
         has_recurrence: bool,
         has_persistent_state: bool | None,
         loop: For | None,
-        legacy_op_fallback: bool,
     ) -> bool:
         if loop is None:
             return True
@@ -371,9 +345,6 @@ class RegimePiecewiseSolver:
             return True
         if axes.memory_ring in ("ub_random_atomic", "l0c_ub_epilogue", "bidirectional_cv_ring", "persistent_onchip_state"):
             return True
-        if legacy_op_fallback:
-            norm = op_name.strip().lower()
-            return any(key in norm for key in _RAGGED_OR_RECURRENT_OPS)
         return False
 
     def _base_policy(
@@ -439,52 +410,30 @@ class RegimePiecewiseSolver:
         has_dead_l1_slice: bool | None = None,
         has_indirect_gather: bool = False,
         quant_mode: str | None = None,
-        legacy_op_fallback: bool = True,
         solver_mode: str = "analytical_piecewise",
         fallback_used: bool = False,
         fallback_reason: str = "",
     ) -> RegimePlanResult:
-        norm_op = op_name.strip().lower() if legacy_op_fallback else ""
         elem_dtype = input_dtypes[0] if input_dtypes else "f16"
         elem_bytes = _dtype_bytes(elem_dtype)
 
-        # Orthogonal structural flag resolution (zero op_name reliance unless legacy_op_fallback=True)
-        if uses_cube is not None:
-            eff_uses_cube = bool(uses_cube)
-        elif not legacy_op_fallback:
-            eff_uses_cube = axes.uses_cube
-        else:
-            eff_uses_cube = axes.uses_cube and not (
-                axes.memory_ring == "persistent_onchip_state" and "sinkhorn" in norm_op
-            )
+        eff_uses_cube = bool(uses_cube) if uses_cube is not None else axes.uses_cube
 
         eff_persistent_state = (
             bool(has_persistent_state)
             if has_persistent_state is not None
             else (axes.memory_ring == "persistent_onchip_state")
         )
-        eff_dead_l1_slice = (
-            bool(has_dead_l1_slice)
-            if has_dead_l1_slice is not None
-            else (legacy_op_fallback and ("mla" in norm_op or "rope" in norm_op))
-        )
+        eff_dead_l1_slice = bool(has_dead_l1_slice) if has_dead_l1_slice is not None else False
         eff_indirect = (
             bool(has_indirect_gather)
             or axes.iteration_regularity == "irregular_simt"
             or axes.memory_ring == "ub_random_atomic"
-            or (legacy_op_fallback and "sparse" in norm_op)
         )
         eff_ragged = axes.iteration_regularity == "ragged_group" or bool(has_empty_group)
         eff_opcode_stream = axes.iteration_regularity == "dynamic_opcode_stream"
 
-        raw_qmode = (quant_mode or "").strip().lower()
-        if not raw_qmode and legacy_op_fallback:
-            if "q4" in norm_op or "w4" in norm_op:
-                raw_qmode = "q4_0"
-            elif "quant" in norm_op:
-                raw_qmode = "quant"
-        if not raw_qmode:
-            raw_qmode = "none"
+        raw_qmode = (quant_mode or "").strip().lower() or "none"
 
         _cube_dtype_aliases = {
             "f4e2m1": "f4e2m1",
@@ -546,13 +495,11 @@ class RegimePiecewiseSolver:
         crit_cube_m = compute_critical_cube_tile_m(self.facts, elem_dtype)
         aligned_crit_m = max(16, ((crit_cube_m + 15) // 16) * 16)
 
-        # Axis 1 + 2: Orthogonal Hardware Topology Inequality Dispatch
         if eff_uses_cube and (
             axes.memory_ring in ("bidirectional_cv_ring", "persistent_onchip_state", "l0c_ub_epilogue")
             or eff_persistent_state
             or eff_ragged
         ):
-            # Coupled AIC/AIV Cube+Vector pipeline (CV ring, persistent L1/UB chunk state, and/or ragged epilogue)
             if axes.memory_ring == "bidirectional_cv_ring":
                 if cube_bound or m_dim >= crit_cube_m:
                     if crit_cube_m >= 82:
@@ -613,7 +560,6 @@ class RegimePiecewiseSolver:
                     notes.append("Persistent on-chip FP32 state paired with bidirectional CV ring")
 
             elif eff_persistent_state:
-                # Persistent chunk/recurrent state with Cube + Vector (optionally also ragged)
                 if cube_bound:
                     if crit_cube_m >= 82:
                         chunk_m = aligned_crit_m
@@ -657,7 +603,6 @@ class RegimePiecewiseSolver:
                 notes.append("Persistent core ownership + FP32 state residency without GM roundtrips")
 
             else:
-                # L0C->UB epilogue / ragged group GEMM
                 if cube_bound:
                     if m_dim >= 128:
                         tile_m = 128
@@ -690,9 +635,7 @@ class RegimePiecewiseSolver:
                 policy["dma_paths_used"] = ["GM->L1", "L1->L0A", "L1->L0B", "L0C->UB", "UB->GM"]
 
             if eff_dead_l1_slice:
-                policy["l1_slot_aliasing"] = (
-                    {"P": "K_rope"} if legacy_op_fallback else {"reused_stage": "dead_l1_slice"}
-                )
+                policy["l1_slot_aliasing"] = {"reused_stage": "dead_l1_slice"}
                 notes.append("In-place L1 slot aliasing on dead L1 slice")
 
             if eff_indirect:
@@ -708,7 +651,6 @@ class RegimePiecewiseSolver:
                 notes.append("Rolling cross-group core assignment + per-group BaseMBalance")
 
         elif eff_uses_cube:
-            # Dense / quantized GEMM on GM->L1->L0->FixPipe (or L0C->UB if AIV unpack/coupled)
             if m_dim >= 128 or m_dim == 0:
                 tile_m = max(aligned_crit_m, 128)
             elif m_dim >= crit_cube_m:
@@ -751,7 +693,6 @@ class RegimePiecewiseSolver:
                 notes.append("In-place L1 slot aliasing on dead L1 slice")
 
         elif eff_opcode_stream:
-            # AIV-only striped register VM / dynamic opcode stream
             num_regs = max(4, min(64, dims.get("R", dims.get("num_regs", 16))))
             width = max(64, dims.get("W", dims.get("N", dims.get("cols", 1024))))
             w_slice = max(32, math.ceil(width / max(1, self.facts.num_aiv_cores)))
@@ -778,7 +719,6 @@ class RegimePiecewiseSolver:
             notes.append("Horizontal W-slice striping across AIV cores; 100% UB-resident VM registers")
 
         elif eff_persistent_state:
-            # AIV-only persistent on-chip FP32 UB state residency (e.g. Sinkhorn / iterative state)
             rows = min(max(1, m_dim), 64)
             cols = max(16, min(2048, dims.get("N", dims.get("D", dims.get("cols", 64)))))
             padded_row_bytes = cols * 4 + 32
@@ -803,7 +743,6 @@ class RegimePiecewiseSolver:
             notes.append("Persistent FP32 UB state residency across iterative loop")
 
         elif axes.memory_ring == "ub_random_atomic" or eff_indirect or axes.iteration_regularity == "irregular_simt":
-            # AIV SIMT + Hybrid UB random atomic / indirect gather
             tile_m = min(64, max(16, m_dim))
             tile_n = min(128, max(32, n_dim))
             policy["tile_mnk"] = [tile_m, tile_n, 1]
@@ -821,7 +760,6 @@ class RegimePiecewiseSolver:
             notes.append("SIMT __launch_bounds__(512) + warp-privatized +8-padded UB accumulators")
 
         else:
-            # AIV-only GM->UB affine SIMD stream
             tile_n = max(1, min(2048, dims.get("N", dims.get("D", dims.get("cols", 1024)))))
             row_bytes = max(32, tile_n * elem_bytes)
             pack = min(16, max(1, (16384 + row_bytes - 1) // row_bytes))
@@ -882,7 +820,7 @@ class RegimePiecewiseSolver:
         quant_mode: str | None = None,
         unreserved_ubuf: bool = False,
     ) -> RegimePlanResult:
-        """Solve one shape regime via Z3 projection (static-affine) or structural topology planning."""
+        """Solve one shape regime via Z3 projection or structural topology planning."""
         tag, dims, has_tail, has_empty, reg_roofline, reg_axes = _extract_regime_fields(
             regime
         )
@@ -893,7 +831,6 @@ class RegimePiecewiseSolver:
 
         if explicit_axes_obj is not None:
             resolved_axes = explicit_axes_obj
-            legacy_op_fallback = False
         elif has_explicit_flags:
             resolved_axes = _synthesize_axes_from_flags(
                 uses_cube=bool(uses_cube) if uses_cube is not None else False,
@@ -904,123 +841,97 @@ class RegimePiecewiseSolver:
                 has_recurrence=has_recurrence,
                 quant_mode=quant_mode or "none",
             )
-            legacy_op_fallback = False
         else:
-            resolved_axes = resolve_canonical_topology_axes(op_name)
-            legacy_op_fallback = True
+            resolved_axes = resolve_canonical_topology_axes(
+                regime if isinstance(regime, Mapping) else {}
+            )
 
         resolved_roofline = roofline if roofline is not None else reg_roofline
 
         if not self._is_ragged_or_recurrent(
-            op_name=op_name,
             axes=resolved_axes,
             has_empty_group=has_empty,
             has_indirect_gather=has_indirect_gather,
             has_recurrence=has_recurrence,
             has_persistent_state=has_persistent_state,
             loop=loop,
-            legacy_op_fallback=legacy_op_fallback,
         ):
             assert loop is not None
-            try:
-                problem, _ = extract_tir_loop_problem(
-                    loop,
-                    target=self.target,
-                    fn_stmt=fn_stmt,
-                    unreserved_ubuf=unreserved_ubuf,
-                    dim_hints=dims,
-                    allow_dynamic_fallback=True,
-                )
-                z3_res = solve_ascend_pipeline(problem)
-                base_plan = self._plan_analytical_regime(
-                    regime_tag=tag,
-                    op_name=op_name,
-                    axes=resolved_axes,
-                    explicit_axes=(explicit_axes_obj is not None),
-                    dims=dims,
-                    roofline=resolved_roofline,
-                    has_unaligned_tail=has_tail,
-                    has_empty_group=has_empty,
-                    input_dtypes=input_dtypes,
-                    has_nan_inf_cases=has_nan_inf_cases,
-                    uses_cube=uses_cube,
-                    has_persistent_state=has_persistent_state,
-                    has_dead_l1_slice=has_dead_l1_slice,
-                    has_indirect_gather=has_indirect_gather,
-                    quant_mode=quant_mode,
-                    legacy_op_fallback=legacy_op_fallback,
-                    solver_mode="z3_projected",
-                )
-                policy = dict(base_plan.policy)
-                ub_bytes = sum(
-                    b.slot_bytes * z3_res.buffer_versions.get(b.name, 1)
-                    for b in z3_res.problem.buffers
-                    if b.space == "UB"
-                )
-                l1_bytes = sum(
-                    b.slot_bytes * z3_res.buffer_versions.get(b.name, 1)
-                    for b in z3_res.problem.buffers
-                    if b.space == "L1"
-                )
-                l1_vers = [
-                    z3_res.buffer_versions.get(b.name, 1)
-                    for b in z3_res.problem.buffers
-                    if b.space == "L1"
-                ]
-                l0c_vers = [
-                    z3_res.buffer_versions.get(b.name, 1)
-                    for b in z3_res.problem.buffers
-                    if b.space == "L0C"
-                ]
-                if l1_vers:
-                    policy["l1_stages"] = max(l1_vers)
-                    policy["l1_half_bank_split"] = max(l1_vers) >= 2
-                if l0c_vers:
-                    policy["l0c_buffers"] = max(l0c_vers)
-                if ub_bytes > 0:
-                    policy["ub_estimated_bytes"] = ub_bytes
-                    policy["ub_256kb_unlock"] = ub_bytes > self.facts.ub_simdvf_usable_bytes
-                if l1_bytes > 0:
-                    policy["l1_estimated_bytes"] = l1_bytes
+            problem, _ = extract_tir_loop_problem(
+                loop,
+                target=self.target,
+                fn_stmt=fn_stmt,
+                unreserved_ubuf=unreserved_ubuf,
+                dim_hints=dims,
+                allow_dynamic_fallback=True,
+            )
+            z3_res = solve_pipeline_with_monotone_backoff(problem)
+            base_plan = self._plan_analytical_regime(
+                regime_tag=tag,
+                op_name=op_name,
+                axes=resolved_axes,
+                explicit_axes=(explicit_axes_obj is not None),
+                dims=dims,
+                roofline=resolved_roofline,
+                has_unaligned_tail=has_tail,
+                has_empty_group=has_empty,
+                input_dtypes=input_dtypes,
+                has_nan_inf_cases=has_nan_inf_cases,
+                uses_cube=uses_cube,
+                has_persistent_state=has_persistent_state,
+                has_dead_l1_slice=has_dead_l1_slice,
+                has_indirect_gather=has_indirect_gather,
+                quant_mode=quant_mode,
+                solver_mode="z3_projected",
+            )
+            policy = dict(base_plan.policy)
+            ub_bytes = sum(
+                b.slot_bytes * z3_res.buffer_versions.get(b.name, 1)
+                for b in z3_res.problem.buffers
+                if b.space == "UB"
+            )
+            l1_bytes = sum(
+                b.slot_bytes * z3_res.buffer_versions.get(b.name, 1)
+                for b in z3_res.problem.buffers
+                if b.space == "L1"
+            )
+            l1_vers = [
+                z3_res.buffer_versions.get(b.name, 1)
+                for b in z3_res.problem.buffers
+                if b.space == "L1"
+            ]
+            l0c_vers = [
+                z3_res.buffer_versions.get(b.name, 1)
+                for b in z3_res.problem.buffers
+                if b.space == "L0C"
+            ]
+            if l1_vers:
+                policy["l1_stages"] = max(l1_vers)
+                policy["l1_half_bank_split"] = max(l1_vers) >= 2
+            if l0c_vers:
+                policy["l0c_buffers"] = max(l0c_vers)
+            if ub_bytes > 0:
+                policy["ub_estimated_bytes"] = ub_bytes
+                policy["ub_256kb_unlock"] = ub_bytes > self.facts.ub_simdvf_usable_bytes
+            if l1_bytes > 0:
+                policy["l1_estimated_bytes"] = l1_bytes
 
-                return RegimePlanResult(
-                    regime_tag=tag,
-                    op_name=op_name,
-                    topology_axes=resolved_axes,
-                    solver_mode="z3_projected",
-                    policy=policy,
-                    representative_dims=dims,
-                    ii=z3_res.assignment.ii,
-                    buffer_versions=dict(z3_res.buffer_versions),
-                    task_stages=dict(z3_res.task_stages),
-                    fallback_used=False,
-                    fallback_reason="",
-                    persistent_state_space=base_plan.persistent_state_space,
-                    persistent_state_bytes=base_plan.persistent_state_bytes,
-                    notes=("Z3 modulo schedule projected at regime representative dims",),
-                )
-            except PipelineError as exc:
-                return self._plan_analytical_regime(
-                    regime_tag=tag,
-                    op_name=op_name,
-                    axes=resolved_axes,
-                    explicit_axes=(explicit_axes_obj is not None),
-                    dims=dims,
-                    roofline=resolved_roofline,
-                    has_unaligned_tail=has_tail,
-                    has_empty_group=has_empty,
-                    input_dtypes=input_dtypes,
-                    has_nan_inf_cases=has_nan_inf_cases,
-                    uses_cube=uses_cube,
-                    has_persistent_state=has_persistent_state,
-                    has_dead_l1_slice=has_dead_l1_slice,
-                    has_indirect_gather=has_indirect_gather,
-                    quant_mode=quant_mode,
-                    legacy_op_fallback=legacy_op_fallback,
-                    solver_mode="z3_fallback_analytical",
-                    fallback_used=True,
-                    fallback_reason=str(exc),
-                )
+            return RegimePlanResult(
+                regime_tag=tag,
+                op_name=op_name,
+                topology_axes=resolved_axes,
+                solver_mode="z3_projected",
+                policy=policy,
+                representative_dims=dims,
+                ii=z3_res.assignment.ii,
+                buffer_versions=dict(z3_res.buffer_versions),
+                task_stages=dict(z3_res.task_stages),
+                fallback_used=False,
+                fallback_reason="",
+                persistent_state_space=base_plan.persistent_state_space,
+                persistent_state_bytes=base_plan.persistent_state_bytes,
+                notes=("Z3 modulo schedule projected at regime representative dims",),
+            )
 
         return self._plan_analytical_regime(
             regime_tag=tag,
@@ -1038,7 +949,6 @@ class RegimePiecewiseSolver:
             has_dead_l1_slice=has_dead_l1_slice,
             has_indirect_gather=has_indirect_gather,
             quant_mode=quant_mode,
-            legacy_op_fallback=legacy_op_fallback,
             solver_mode="analytical_piecewise",
         )
 
@@ -1077,7 +987,14 @@ class RegimePiecewiseSolver:
                 quant_mode=quant_mode or "none",
             )
         else:
-            resolved_axes = resolve_canonical_topology_axes(op_name)
+            first_reg = regimes[0] if regimes else {}
+            if isinstance(first_reg, Mapping):
+                resolved_axes = resolve_canonical_topology_axes(first_reg)
+            else:
+                reg_axes = getattr(first_reg, "topology_axes", None)
+                resolved_axes = (
+                    _coerce_topology_axes(reg_axes) or resolve_canonical_topology_axes({})
+                )
 
         results: dict[str, RegimePlanResult] = {}
         policies: dict[str, dict[str, object]] = {}
@@ -1113,7 +1030,7 @@ class RegimePiecewiseSolver:
         live_buffers_or_ledger: object,
         **kwargs: object,
     ) -> RegimePlanResult:
-        """Fixed-point re-solve tile_mnk/row_pack_factor/l1_stages for actual live buffer footprints."""
+        """Re-solve tile sizes and stages for live buffer footprints."""
         return recompute_regime_for_live_buffers(
             self,
             regime,
@@ -1271,7 +1188,6 @@ def recompute_regime_for_live_buffers(
     cur_l1 = _estimate_l1(tm, tn, tk, l1_stages)
     shrank = False
 
-    # Fixed-point Phase A: shrink to fit UB and Half-L1/L1 capacities
     for _ in range(16):
         ub_over = live_ub > 0 and cur_ub > ub_limit
         l1_over = live_l1 > 0 and (
@@ -1347,7 +1263,6 @@ def recompute_regime_for_live_buffers(
         cur_ub = _estimate_ub(tm, tn, row_pack)
         cur_l1 = _estimate_l1(tm, tn, tk, l1_stages)
 
-    # Fixed-point Phase B: expand tile_mnk / row_pack_factor / l1_stages when buffer headroom freed
     expanded = False
     if not shrank:
         max_m_cap = max(tm0, min(128, int(dims.get("M", dims.get("S_q", dims.get("rows", 128))) or 128)))

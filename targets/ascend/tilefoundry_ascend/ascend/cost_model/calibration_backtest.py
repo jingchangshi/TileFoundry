@@ -250,20 +250,18 @@ def _normalize_cube_dtype(raw: str) -> str:
 def _try_resolve_extractor(ops_root: str | Path | None) -> OpAdvisoryExtractor | None:
     if ops_root is not None:
         p = Path(ops_root).expanduser().resolve()
-        if p.is_dir():
-            return OpAdvisoryExtractor(p)
+        if not p.is_dir():
+            raise ValueError(f"Canonical ops_root does not exist: {p}")
+        return OpAdvisoryExtractor(p)
     env_root = os.environ.get("TILEFOUNDRY_CANNBENCH_ROOT", "").strip()
     if env_root:
         cand = Path(env_root).expanduser().resolve()
         for sub in (cand / "tasks", cand):
             if sub.is_dir():
                 return OpAdvisoryExtractor(sub)
-    try:
-        default_ext = OpAdvisoryExtractor()
-        if default_ext.ops_root.is_dir():
-            return default_ext
-    except Exception:
-        pass
+    default_ext = OpAdvisoryExtractor()
+    if default_ext.ops_root.is_dir():
+        return default_ext
     return None
 
 
@@ -284,17 +282,14 @@ def _build_static_case_features(
             lvl_part, _, op_id = rel_path.partition("/")
             if not op_id:
                 op_id, lvl_part = rel_path, ""
-            try:
-                adv = extractor.extract(op_id, level=lvl_part or None)
-                _lvl, op_dir = extractor._find_op_entry(op_id, level=lvl_part or None)
-                cases_raw = yaml.safe_load((op_dir / "cases.yaml").read_text(encoding="utf-8"))
-                cmap: dict[int, dict[str, Any]] = {}
-                for idx, entry in enumerate(cases_raw.get("cases", []) or []):
-                    cid = int(entry.get("case_id", idx + 1))
-                    cmap[cid] = dict(entry)
-                advisory_cache[rel_path] = (adv, cmap)
-            except Exception:
-                advisory_cache[rel_path] = (None, {})
+            adv = extractor.extract(op_id, level=lvl_part or None)
+            _lvl, op_dir = extractor._find_op_entry(op_id, level=lvl_part or None)
+            cases_raw = yaml.safe_load((op_dir / "cases.yaml").read_text(encoding="utf-8"))
+            cmap: dict[int, dict[str, Any]] = {}
+            for idx, entry in enumerate(cases_raw.get("cases", []) or []):
+                cid = int(entry.get("case_id", idx + 1))
+                cmap[cid] = dict(entry)
+            advisory_cache[rel_path] = (adv, cmap)
         op_adv, case_map = advisory_cache[rel_path]
 
     case_entry = case_map.get(case_num, {})
@@ -312,18 +307,15 @@ def _build_static_case_features(
         dt = dtypes[idx] if idx < len(dtypes) else raw_dtype
         input_bytes += float(_shape_numel(shp)) * float(_DTYPE_BYTES.get(dt, elem_bytes))
 
-    if op_adv is not None:
-        axes: TopologyAxes | None = op_adv.topology_axes
-        uses_cube = axes.compute_engine in ("aic_only", "coupled_1c2v")
-        is_coupled = axes.compute_engine == "coupled_1c2v"
-        dom_bound = str(op_adv.roofline.get("dominant_bound", "memory_bandwidth"))
-        unaligned_tail = _has_unaligned_tail_for_case(shapes, dtypes, uses_cube) if shapes else False
-    else:
-        axes = None
-        uses_cube = "matmul" in rel_path or "attention" in rel_path or "mla" in rel_path
-        is_coupled = "attention" in rel_path or "mla" in rel_path or "dequant" in rel_path
-        dom_bound = "cube_compute" if uses_cube else "memory_bandwidth"
-        unaligned_tail = False
+    if op_adv is None:
+        raise ValueError(
+            f"Canonical OpAdvisoryExtractor failed to resolve topology_axes for {rel_path!r}"
+        )
+    axes: TopologyAxes = op_adv.topology_axes
+    uses_cube = axes.compute_engine in ("aic_only", "coupled_1c2v")
+    is_coupled = axes.compute_engine == "coupled_1c2v"
+    dom_bound = str(op_adv.roofline.get("dominant_bound", "memory_bandwidth"))
+    unaligned_tail = _has_unaligned_tail_for_case(shapes, dtypes, uses_cube) if shapes else False
 
     if shapes and shapes[0]:
         inner_dim = int(shapes[0][-1] or 1)
@@ -523,9 +515,11 @@ def run_p2_prescreen_ablation(
     records: Sequence[OfficialCaseRecord],
     *,
     target: AscendTarget | None = None,
+    anchor_rel_paths: Sequence[str] = (),
 ) -> PrescreenAblationReport:
     """Evaluate offline prescreen gain across multi-checkpoint operators using LOO fitting."""
     eff_target = target or AscendTarget("ascend.950pr")
+    anchor_set = frozenset(str(p).strip() for p in anchor_rel_paths if str(p).strip())
     by_op_sig: dict[str, dict[str, list[OfficialCaseRecord]]] = {}
     for rec in records:
         by_op_sig.setdefault(rec.rel_path, {}).setdefault(rec.report_signature, []).append(rec)
@@ -556,7 +550,7 @@ def run_p2_prescreen_ablation(
                 case_id=rel_path,
                 baseline_score=baseline_mean_score,
                 prescreen_score=prescreen_mean_score,
-                is_anchor=(rel_path in ("level2/softmax", "level3/grouped_matmul", "level4/mla")),
+                is_anchor=(rel_path in anchor_set),
                 baseline_latency_us=baseline_mean_lat,
                 prescreen_latency_us=prescreen_mean_lat,
             )
@@ -570,6 +564,7 @@ def run_cost_model_backtest(
     *,
     ops_root: str | Path | None = None,
     target: AscendTarget | None = None,
+    anchor_rel_paths: Sequence[str] = (),
 ) -> BacktestSummary:
     """Run Legacy vs P0 Physics vs P0+P1 LOCO/LOOO cross-validation & P2 prescreen ablation."""
     eff_target = target or AscendTarget("ascend.950pr")
@@ -639,7 +634,11 @@ def run_cost_model_backtest(
             "topology_bucket": unique_records[idxs[0]].topology_bucket,
         }
 
-    ablation = run_p2_prescreen_ablation(all_records, target=eff_target)
+    ablation = run_p2_prescreen_ablation(
+        all_records,
+        target=eff_target,
+        anchor_rel_paths=anchor_rel_paths,
+    )
     enable_ok = bool(
         loco_report.mean_intra_group_spearman_rho >= 0.85
         and looo_report.mean_intra_group_spearman_rho >= 0.85

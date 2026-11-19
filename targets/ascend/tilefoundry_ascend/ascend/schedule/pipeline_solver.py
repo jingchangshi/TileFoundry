@@ -104,72 +104,20 @@ _PIPE_TO_LEDGER: dict[str, str] = {
     "S": "PIPE_S",
 }
 
-try:
-    from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirRooflineSummary
-    _HAS_HIR_BRIDGE = True
-except ImportError:
-    _HAS_HIR_BRIDGE = False
-    HirRooflineSummary = None
-
-
-def read_from_sil(path: str) -> dict | None:
-    """Read and parse a SIL packet from a file, returning the parsed dict or None on failure."""
+def read_from_sil(path: str | Path) -> dict | None:
+    """Read and parse a SIL packet from a file, returning None if missing or invalid."""
+    p = Path(path)
+    if not p.is_file():
+        logging.warning("SIL packet not found at %s", p)
+        return None
     try:
-        p = Path(path)
-        if not p.exists():
-            logging.warning(f"SIL packet not found at {path}")
-            return fallback_from_sil(path)
-        with open(p, 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        logging.error(f"Failed to read/parse SIL packet from {path}: {e}")
-        return fallback_from_sil(path)
-
-
-
-@dataclass(frozen=True)
-class _FallbackRooflineSummary:
-    path: str
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "anchor_dims": {},
-            "requested_anchor_dims": {},
-            "resolved_hir_dims": {},
-            "shape_exact_match": False,
-            "fallback_reason": f"sil_read_fallback_at_{self.path}",
-            "compute_flops": 0,
-            "cube_flops": 0,
-            "vector_flops": 0,
-            "special_ops": 0,
-            "min_gm_bytes": 0,
-            "arithmetic_intensity": 0.0,
-            "compute_floor_us": 0.0,
-            "cube_floor_us": 0.0,
-            "vec_floor_us": 0.0,
-            "memory_floor_us": 0.0,
-            "ideal_roofline_us": 0.0,
-            "dominant_bound": "none",
-        }
-
-
-def fallback_from_sil(path: str) -> dict | None:
-    """Fallback heuristic when SIL packet is unavailable or corrupted."""
-    logging.info(f"Falling back for SIL packet at {path}")
-    if _HAS_HIR_BRIDGE:
-        fallback = HirRooflineSummary(
-            anchor_dims={},
-            compute_flops=0,
-            min_gm_bytes=0,
-            arithmetic_intensity=0.0,
-            compute_floor_us=0.0,
-            memory_floor_us=0.0,
-            ideal_roofline_us=0.0,
-            dominant_bound="none",
-            fallback_reason=f"sil_read_fallback_at_{path}",
-        )
-        return fallback.to_dict()
-    return _FallbackRooflineSummary(path).to_dict()
+        payload = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logging.error("Failed to read/parse SIL packet from %s: %s", p, exc)
+        return None
+    if not isinstance(payload, dict) or not payload.get("roofline"):
+        return None
+    return payload
 
 
 
@@ -1247,10 +1195,7 @@ def extract_tir_loop_problem(
         }
     )
     if policy_dict is not None:
-        try:
-            problem = _apply_sil_policy_to_problem(problem, policy_dict)
-        except PipelineError:
-            pass
+        problem = _apply_sil_policy_to_problem(problem, policy_dict)
     if shadow_dump_path is not None:
         _write_shadow_dump(
             shadow_dump_path,
@@ -1598,6 +1543,56 @@ def solve_ascend_pipeline(
     )
 
 
+def solve_pipeline_with_monotone_backoff(
+    problem: Problem,
+    *,
+    fixed_ii: int | None = None,
+    max_ii: int = 64,
+    timeout_ms: int = 1000,
+    sil_policy: Mapping[str, object] | object | None = None,
+    shadow_dump_path: str | Path | None = None,
+    max_retries: int = 4,
+) -> AscendPipelineResult:
+    """Solve Z3 modulo schedule with monotone tile-byte backoff before raising PipelineError."""
+    cur_problem = problem
+    for step in range(max(0, int(max_retries)) + 1):
+        try:
+            return solve_ascend_pipeline(
+                cur_problem,
+                fixed_ii=fixed_ii,
+                max_ii=max_ii,
+                timeout_ms=timeout_ms,
+                sil_policy=sil_policy,
+                shadow_dump_path=shadow_dump_path,
+            )
+        except PipelineError as exc:
+            if step >= max_retries:
+                raise exc
+            shrunk_buffers: list[Buffer] = []
+            changed = False
+            for buf in cur_problem.buffers:
+                if buf.slot_bytes > 32:
+                    new_bytes = max(32, ((buf.slot_bytes // 2) // 32) * 32)
+                    if new_bytes < buf.slot_bytes:
+                        changed = True
+                        shrunk_buffers.append(replace(buf, slot_bytes=new_bytes))
+                        continue
+                shrunk_buffers.append(buf)
+            if not changed:
+                single_ver_buffers: list[Buffer] = []
+                for buf in shrunk_buffers:
+                    if buf.fixed is None and (buf.auto_max is None or buf.auto_max > 1):
+                        changed = True
+                        single_ver_buffers.append(replace(buf, fixed=1, auto_min=1, auto_max=1))
+                    else:
+                        single_ver_buffers.append(buf)
+                shrunk_buffers = single_ver_buffers
+            if not changed:
+                raise exc
+            cur_problem = replace(cur_problem, buffers=tuple(shrunk_buffers))
+    raise PipelineError("ASCEND_PIPELINE_UNSAT", "monotone backoff exhausted")
+
+
 def solve_loop_with_ledger(
     loop: For,
     *,
@@ -1706,8 +1701,10 @@ __all__ = [
     "format_pipe_key",
     "masks_conflict",
     "pipe_cycles_from_problem",
+    "read_from_sil",
     "solve_ascend_pipeline",
     "solve_loop_with_ledger",
+    "solve_pipeline_with_monotone_backoff",
     "task_resource_mask",
     "validate_pipeline_spec",
 ]

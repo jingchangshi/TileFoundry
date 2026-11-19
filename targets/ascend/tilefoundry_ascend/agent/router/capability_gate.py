@@ -64,311 +64,6 @@ _SUBBYTE_DTYPE_TOKENS: tuple[str, ...] = (
     "q4_0",
 )
 
-_AX_SIMD = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
-_AX_SIMT = TopologyAxes("aiv_only", "ub_random_atomic", "irregular_simt")
-_AX_AIC_GEMM = TopologyAxes("aic_only", "gm_l1_l0_fixpipe", "affine_simd")
-_AX_CV_GEMM = TopologyAxes("coupled_1c2v", "gm_l1_l0_fixpipe", "affine_simd")
-_AX_CV_RAGGED = TopologyAxes("coupled_1c2v", "l0c_ub_epilogue", "ragged_group")
-_AX_CV_RING = TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "affine_simd")
-_AX_CV_RING_SPARSE = TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "irregular_simt")
-_AX_CV_PERSISTENT = TopologyAxes("coupled_1c2v", "persistent_onchip_state", "affine_simd")
-_AX_AIV_PERSISTENT = TopologyAxes("aiv_only", "persistent_onchip_state", "affine_simd")
-_AX_AIV_VM = TopologyAxes("aiv_only", "persistent_onchip_state", "dynamic_opcode_stream")
-
-_CANNBENCH_OP_ROUTING: dict[str, tuple[TopologyAxes, str, str, dict[str, object]]] = {
-    "exp": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    "swi_glu": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    "apply_rotary_pos_emb": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    "arg_max": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    "cross_entropy_loss": (
-        _AX_SIMD,
-        "developer",
-        "tilelang_dsl",
-        {"cube_ratio": 0.0, "recurrence": "associative_online_rescale"},
-    ),
-    "dynamic_quant": (
-        _AX_SIMD,
-        "developer",
-        "tilelang_dsl",
-        {"cube_ratio": 0.0, "quant": "per_token_or_block"},
-    ),
-    "image_resize_normalize": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    "rms_norm": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    "softmax": (
-        _AX_SIMD,
-        "developer",
-        "tilelang_dsl",
-        {"cube_ratio": 0.0, "recurrence": "associative_online_rescale"},
-    ),
-    "add_rms_norm_dynamic_quant": (
-        _AX_SIMD,
-        "developer",
-        "tilelang_dsl",
-        {"cube_ratio": 0.0, "quant": "per_token_or_block"},
-    ),
-    "aggregate_hidden": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    "aggregate_hidden_grad": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    "depthwise_conv_2d": (_AX_SIMD, "developer", "ascendc_template", {"cube_ratio": 0.0}),
-    "dequant_swiglu_quant": (
-        _AX_SIMD,
-        "developer",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "quant": "per_token_or_block"},
-    ),
-    "engram_gate_fusion": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    "mhc_post_grad": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    "moe_gating_top_k_softmax": (
-        _AX_SIMD,
-        "developer",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "recurrence": "associative_online_rescale"},
-    ),
-    "strided_slice": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    "transpose": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    "dynamic_mx_quant": (
-        _AX_SIMD,
-        "developer",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "quant": "mixed_fp8_fp4"},
-    ),
-    "fft_conv": (_AX_SIMD, "developer", "ascendc_template", {"cube_ratio": 0.0}),
-    "cummin": (_AX_SIMD, "developer", "ascendc_template", {"cube_ratio": 0.0}),
-    "attention_residual": (_AX_SIMD, "developer", "tilelang_dsl", {"cube_ratio": 0.0}),
-    "gather": (
-        _AX_SIMT,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "indirect": True, "static_bounds": False},
-    ),
-    "gcd": (
-        _AX_SIMT,
-        "simt_vf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "static_bounds": False},
-    ),
-    "grid_sampler_3d": (
-        _AX_SIMT,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "indirect": True, "static_bounds": False},
-    ),
-    "scatter": (
-        _AX_SIMT,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "indirect": True, "static_bounds": False},
-    ),
-    "unsorted_segment_sum": (
-        _AX_SIMT,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "indirect": True, "static_bounds": False},
-    ),
-    "categorical_embedding_bag": (
-        _AX_SIMT,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "indirect": True, "static_bounds": False},
-    ),
-    "dilation_2d": (
-        _AX_SIMT,
-        "simt_vf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "static_bounds": False},
-    ),
-    "embedding_hash_table_lookup_or_insert": (
-        _AX_SIMT,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "indirect": True, "static_bounds": False},
-    ),
-    "kv_cache_append": (
-        _AX_SIMT,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "indirect": True},
-    ),
-    "moe_re_routing": (
-        _AX_SIMT,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "indirect": True, "static_bounds": False},
-    ),
-    "nms": (
-        _AX_SIMT,
-        "simt_vf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "indirect": True, "static_bounds": False},
-    ),
-    "roi_align": (
-        _AX_SIMT,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "indirect": True, "static_bounds": False},
-    ),
-    "scatter_block_update": (
-        _AX_SIMT,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "indirect": True},
-    ),
-    "top_k": (
-        _AX_SIMT,
-        "simt_vf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "static_bounds": False},
-    ),
-    "unique": (
-        _AX_SIMT,
-        "simt_vf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "indirect": True, "static_bounds": False},
-    ),
-    "conv_2d": (_AX_AIC_GEMM, "developer", "ascendc_template", {"cube_ratio": 2.0}),
-    "conv_3d_backprop_filter": (
-        _AX_AIC_GEMM,
-        "developer",
-        "ascendc_template",
-        {"cube_ratio": 2.0},
-    ),
-    "q4_0_dequant_matmul": (
-        _AX_CV_GEMM,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 1.5, "quant": "per_token_or_block", "handoff": True},
-    ),
-    "quant_matmul": (
-        _AX_CV_GEMM,
-        "developer",
-        "ascendc_template",
-        {"cube_ratio": 2.0, "quant": "per_token_or_block"},
-    ),
-    "weight_quant_batch_matmul": (
-        _AX_CV_GEMM,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 1.5, "quant": "per_token_or_block", "handoff": True},
-    ),
-    "grouped_matmul": (
-        _AX_CV_RAGGED,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 2.0, "static_bounds": False, "handoff": True},
-    ),
-    "grouped_matmul_swiglu_quant": (
-        _AX_CV_RAGGED,
-        "manual_ssbuf",
-        "ascendc_template",
-        {
-            "cube_ratio": 1.5,
-            "static_bounds": False,
-            "quant": "per_token_or_block",
-            "handoff": True,
-        },
-    ),
-    "mla": (
-        _AX_CV_RING,
-        "manual_ssbuf",
-        "tilelang_dsl",
-        {"cube_ratio": 1.0, "recurrence": "associative_online_rescale", "handoff": True},
-    ),
-    "mla_prolog": (
-        _AX_CV_RING,
-        "developer",
-        "ascendc_template",
-        {"cube_ratio": 1.2},
-    ),
-    "gqa": (
-        _AX_CV_RING,
-        "developer",
-        "tilelang_dsl",
-        {"cube_ratio": 1.0, "recurrence": "associative_online_rescale"},
-    ),
-    "sparse_flash_attention": (
-        _AX_CV_RING_SPARSE,
-        "manual_ssbuf",
-        "ascendc_template",
-        {
-            "cube_ratio": 1.0,
-            "indirect": True,
-            "recurrence": "associative_online_rescale",
-            "handoff": True,
-        },
-    ),
-    "flash_attention_score_grad_enhance": (
-        _AX_CV_RING,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 1.0, "recurrence": "associative_online_rescale", "handoff": True},
-    ),
-    "compressed_sparse_attention_core": (
-        _AX_CV_RING_SPARSE,
-        "manual_ssbuf",
-        "ascendc_template",
-        {
-            "cube_ratio": 1.0,
-            "indirect": True,
-            "recurrence": "associative_online_rescale",
-            "handoff": True,
-        },
-    ),
-    "sparse_lightning_indexer_grad_kl_loss_enhance": (
-        _AX_CV_RING_SPARSE,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 1.0, "indirect": True, "handoff": True},
-    ),
-    "linear_cross_entropy": (
-        _AX_CV_RING,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 1.2, "recurrence": "associative_online_rescale", "handoff": True},
-    ),
-    "kimi_delta_attention": (
-        _AX_CV_PERSISTENT,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 1.0, "recurrence": "non_associative_scan", "handoff": True},
-    ),
-    "selective_scan": (
-        _AX_AIV_PERSISTENT,
-        "simt_vf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "recurrence": "non_associative_scan"},
-    ),
-    "lstm": (
-        _AX_CV_PERSISTENT,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 1.0, "recurrence": "non_associative_scan", "handoff": True},
-    ),
-    "lact_ttt_chunk": (
-        _AX_CV_PERSISTENT,
-        "manual_ssbuf",
-        "ascendc_template",
-        {"cube_ratio": 1.0, "recurrence": "non_associative_scan", "handoff": True},
-    ),
-    "mhc_sinkhorn": (
-        _AX_AIV_PERSISTENT,
-        "simt_vf",
-        "tilelang_dsl",
-        {"cube_ratio": 0.0, "recurrence": "non_associative_scan"},
-    ),
-    "fused_causal_conv1d": (
-        _AX_AIV_PERSISTENT,
-        "simt_vf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "recurrence": "non_associative_scan"},
-    ),
-    "tensor_program_vm": (
-        _AX_AIV_VM,
-        "simt_vf",
-        "ascendc_template",
-        {"cube_ratio": 0.0, "static_bounds": False, "recurrence": "non_associative_scan"},
-    ),
-}
-
-
 def _primitives_for_axes(axes: TopologyAxes) -> tuple[str, ...]:
     if axes.iteration_regularity == "dynamic_opcode_stream":
         return ("T.SimdVF", "T.SimtVF", "T.Persistent")
@@ -1389,15 +1084,24 @@ def _extract_op_name_and_dtypes(proto_or_advisory: Mapping[str, object]) -> tupl
                         dtypes.extend(str(d) for d in dt)
                     elif isinstance(dt, str):
                         dtypes.append(dt)
-    desc_text = " ".join(
-        str(source.get(k, "")) for k in ("category", "formula", "description")
-    ).lower()
+    parts: list[str] = [
+        str(src.get(k, ""))
+        for src in (proto_or_advisory, source)
+        for k in ("category", "formula", "description", "semantic_contract", "quant_mode", "op_kind")
+    ]
+    attrs = source.get("attrs")
+    if isinstance(attrs, (list, tuple)):
+        for a in attrs:
+            parts.append(str(a.get("name", "")) if isinstance(a, Mapping) else str(a))
+    elif isinstance(attrs, Mapping):
+        parts.extend(str(k) for k in attrs.keys())
+    desc_text = " ".join(parts).lower()
     return op_name, dtypes, desc_text
 
 
 def route_from_op_spec(proto_or_advisory: Mapping[str, object]) -> RouteDecision:
     """Route a cann-bench proto.yaml or AdvisoryEnvelope dict to 3-axis TopologyAxes & 3 tracks."""
-    op_name, dtypes, _desc_text = _extract_op_name_and_dtypes(proto_or_advisory)
+    _op_name, dtypes, desc_text = _extract_op_name_and_dtypes(proto_or_advisory)
     raw_axes = proto_or_advisory.get("topology_axes")
     explicit_axes: TopologyAxes | None = None
     if isinstance(raw_axes, TopologyAxes):
@@ -1415,11 +1119,15 @@ def route_from_op_spec(proto_or_advisory: Mapping[str, object]) -> RouteDecision
         has_fp8 = has_fp8 or is_fp8
         has_fp4 = has_fp4 or is_fp4
         has_i8 = has_i8 or is_i8
+    has_quant_structural = any(
+        tok in desc_text
+        for tok in ("quant", "antiquant", "scaleout", "pertokenquant", "qweight", "mxscale")
+    )
     quant = _resolve_quant_granularity(
         has_fp8=has_fp8,
         has_fp4=has_fp4,
         has_i8=has_i8,
-        has_quant_op=("quant" in op_name),
+        has_quant_op=has_quant_structural,
     )
 
     raw_sf = proto_or_advisory.get("structural_features")
@@ -1427,38 +1135,6 @@ def route_from_op_spec(proto_or_advisory: Mapping[str, object]) -> RouteDecision
         base_features = StructuralFeatures.from_dict(raw_sf)
     else:
         base_features = None
-
-    if op_name in _CANNBENCH_OP_ROUTING:
-        default_axes, track, backend_tier, profile = _CANNBENCH_OP_ROUTING[op_name]
-        axes = explicit_axes if explicit_axes is not None else default_axes
-        if base_features is None:
-            prof_quant = str(profile.get("quant", "none"))
-            resolved_quant = quant if quant != "none" else prof_quant
-            features = StructuralFeatures(
-                phi_1_static_affine_bounds=bool(profile.get("static_bounds", True)),
-                phi_2_cube_to_vector_ratio=float(profile.get("cube_ratio", 0.0)),
-                phi_3_quant_granularity=resolved_quant,
-                phi_4_indirect_sparse_gather=bool(profile.get("indirect", False)),
-                phi_5_cross_iter_recurrence=str(profile.get("recurrence", "none")),
-                phi_6_dynamic_cross_core_handoff=bool(profile.get("handoff", False)),
-                phi_7_inner_contiguous_bytes=int(
-                    proto_or_advisory.get("inner_contiguous_bytes", 128)
-                ),
-                phi_8_persistent_wave_occupancy=float(
-                    proto_or_advisory.get("wave_occupancy", 1.0)
-                ),
-            )
-        else:
-            features = base_features
-        reasons = (f"op_spec {op_name!r} matched topology_axes {axes.key()}",)
-        return RouteDecision(
-            track=track,
-            features=features,
-            rationale=reasons,
-            recommended_primitives=_primitives_for_axes(axes),
-            topology_axes=axes,
-            recommended_backend_tier=backend_tier,
-        )
 
     axes = (
         explicit_axes
@@ -1491,7 +1167,7 @@ def route_from_op_spec(proto_or_advisory: Mapping[str, object]) -> RouteDecision
     return RouteDecision(
         track=decision.track,
         features=base_features,
-        rationale=(f"heuristic op_spec route for {op_name or 'unknown'!r} -> {axes.key()}",),
+        rationale=(f"structural op_spec route -> {axes.key()}",),
         recommended_primitives=_primitives_for_axes(axes),
         topology_axes=axes,
         recommended_backend_tier=_backend_tier_for_axes(axes, base_features),
@@ -1622,7 +1298,7 @@ def route_initial_by_input_contract(
                 has_fp8=has_fp8,
                 has_fp4=has_fp4,
                 has_i8=has_i8,
-                has_quant_op=("quant" in op_name or "quant" in contract_text),
+                has_quant_op=any(tok in contract_text for tok in ("quant", "antiquant")),
             )
             uses_cube = bool(spec_map.get("uses_cube", False)) or (
                 isinstance(raw_axes, Mapping)

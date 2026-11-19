@@ -1246,12 +1246,90 @@ def test_topology_axes_routing_and_60_cannbench_ops() -> None:
         "lact_ttt_chunk": TopologyAxes("coupled_1c2v", "persistent_onchip_state", "affine_simd"),
         "tensor_program_vm": TopologyAxes("aiv_only", "persistent_onchip_state", "dynamic_opcode_stream"),
     }
-    for op_name, expected_axes in expectations.items():
-        dec = route_from_op_spec({"op_name": op_name})
+    structural_expectations = [
+        ({"category": "Vector", "formula": "y = rsqrt(mean(x^2) + eps)"}, TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")),
+        (
+            {
+                "category": "Quantization",
+                "formula": "y_i = cast(V_i / mxscale, round_mode)",
+                "inputs": [{"dtype": ["float16", "bfloat16"]}],
+                "outputs": [{"dtype": ["float4_e2m1"]}],
+            },
+            TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd"),
+        ),
+        (
+            {
+                "category": "IndexGather",
+                "formula": "out = gather(table, indices) + atomic_cas(slot)",
+                "inputs": [{"dtype": ["float16"]}, {"dtype": ["int64"]}],
+            },
+            TopologyAxes("aiv_only", "ub_random_atomic", "irregular_simt"),
+        ),
+        (
+            {
+                "category": "Contraction",
+                "formula": "y = x @ dequant(qweight, scales)",
+                "inputs": [{"dtype": ["float16"]}, {"dtype": ["int8"]}],
+            },
+            TopologyAxes("coupled_1c2v", "gm_l1_l0_fixpipe", "affine_simd"),
+        ),
+        (
+            {
+                "category": "Contraction",
+                "formula": "y = conv2d(x, w)",
+                "inputs": [{"dtype": ["float16"]}, {"dtype": ["float16"]}],
+            },
+            TopologyAxes("aic_only", "gm_l1_l0_fixpipe", "affine_simd"),
+        ),
+        (
+            {
+                "category": "FusedComposite",
+                "formula": "mm_g = x[rows_g] @ weight[g]; act = silu(mm_g); y = quant(act)",
+                "attrs": [{"name": "group_list"}],
+                "inputs": [{"dtype": ["int8"]}, {"dtype": ["int8"]}],
+            },
+            TopologyAxes("coupled_1c2v", "l0c_ub_epilogue", "ragged_group"),
+        ),
+        (
+            {
+                "category": "FusedComposite",
+                "formula": "S = Q @ K^T; P = softmax(S); O = P @ V",
+                "inputs": [{"dtype": ["bfloat16"]}, {"dtype": ["bfloat16"]}, {"dtype": ["bfloat16"]}],
+            },
+            TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "affine_simd"),
+        ),
+        (
+            {
+                "category": "FusedComposite",
+                "formula": "Hbar = A @ Hprev; o = q^T @ Hbar",
+                "attrs": [{"name": "chunk_size"}],
+                "inputs": [{"dtype": ["bfloat16"]}],
+            },
+            TopologyAxes("coupled_1c2v", "persistent_onchip_state", "affine_simd"),
+        ),
+        (
+            {
+                "category": "FusedComposite",
+                "formula": "for iter in iters: P = sinkhorn_step(P)",
+                "attrs": [{"name": "iter_step"}],
+                "inputs": [{"dtype": ["float32"]}],
+            },
+            TopologyAxes("aiv_only", "persistent_onchip_state", "affine_simd"),
+        ),
+        (
+            {
+                "category": "VMInterpreter",
+                "formula": "execute opcode instruction bytecode stream",
+                "inputs": [{"dtype": ["int32"]}],
+            },
+            TopologyAxes("aiv_only", "persistent_onchip_state", "dynamic_opcode_stream"),
+        ),
+    ]
+    for spec, expected_axes in structural_expectations:
+        dec = route_from_op_spec(spec)
         assert dec.topology_axes == expected_axes
         assert dec.recommended_backend_tier in VALID_BACKEND_TIERS
 
-    # Route ALL 60 real proto.yaml files in cann-bench if present on disk
     ops_root = Path(__file__).resolve().parents[4] / "cann-bench" / "tasks"
     if ops_root.is_dir():
         proto_files = sorted(ops_root.glob("level*/*/proto.yaml"))
@@ -1268,6 +1346,8 @@ def test_topology_axes_routing_and_60_cannbench_ops() -> None:
             assert dec.topology_axes.iteration_regularity in VALID_ITERATION_REGULARITIES
             assert dec.track in ("developer", "simt_vf", "manual_ssbuf")
             assert dec.recommended_backend_tier in VALID_BACKEND_TIERS
+            if pf.parent.name in expectations:
+                assert dec.topology_axes == expectations[pf.parent.name]
             seen_engines.add(dec.topology_axes.compute_engine)
             seen_rings.add(dec.topology_axes.memory_ring)
             seen_regs.add(dec.topology_axes.iteration_regularity)

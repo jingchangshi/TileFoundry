@@ -445,12 +445,85 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
     (rep_dir1 / "official_final.json").write_text(json.dumps(payload), encoding="utf-8")
     (rep_dir2 / "official_final.json").write_text(json.dumps(payload), encoding="utf-8")
     missing_ops = tmp_path / "no_tasks_here"
-    recs, scanned, dedup_reps = load_official_reports([rep_dir1, rep_dir2], ops_root=missing_ops)
+    with pytest.raises(ValueError, match="Canonical ops_root does not exist"):
+        load_official_reports([rep_dir1, rep_dir2], ops_root=missing_ops)
+
+    tmp_ops = tmp_path / "ops_tasks"
+    op_a_dir = tmp_ops / "level2" / "fake_op_a"
+    op_b_dir = tmp_ops / "level3" / "fake_op_b"
+    op_a_dir.mkdir(parents=True)
+    op_b_dir.mkdir(parents=True)
+    (tmp_ops / "metadata").mkdir(parents=True)
+    (tmp_ops / "metadata" / "950pr.json").write_text(
+        json.dumps({"level2": {}, "level3": {}}),
+        encoding="utf-8",
+    )
+    (tmp_ops / "suite_manifest.json").write_text(
+        json.dumps(
+            {
+                "operators": [
+                    {"id": "fake_op_a", "level": "L2", "path": "tasks/level2/fake_op_a"},
+                    {"id": "fake_op_b", "level": "L3", "path": "tasks/level3/fake_op_b"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (op_a_dir / "proto.yaml").write_text(
+        "operator:\n"
+        "  name: fake_op_a\n"
+        "  category: ElementWise\n"
+        "  inputs:\n"
+        "    - name: x\n"
+        "      dtype: [float16]\n"
+        "  outputs:\n"
+        "    - name: y\n"
+        "      dtype: [float16]\n"
+        "  formula: y = exp(x)\n",
+        encoding="utf-8",
+    )
+    (op_a_dir / "cases.yaml").write_text(
+        "cases:\n"
+        "  - case_id: 1\n"
+        "    input_shape: [[16, 1024]]\n"
+        "    dtype: [float16]\n"
+        "  - case_id: 2\n"
+        "    input_shape: [[32, 2048]]\n"
+        "    dtype: [float16]\n",
+        encoding="utf-8",
+    )
+    (op_b_dir / "proto.yaml").write_text(
+        "operator:\n"
+        "  name: fake_op_b\n"
+        "  category: Contraction\n"
+        "  inputs:\n"
+        "    - name: x\n"
+        "      dtype: [float16]\n"
+        "    - name: w\n"
+        "      dtype: [float16]\n"
+        "  outputs:\n"
+        "    - name: y\n"
+        "      dtype: [float16]\n"
+        "  formula: y = x @ w\n",
+        encoding="utf-8",
+    )
+    (op_b_dir / "cases.yaml").write_text(
+        "cases:\n"
+        "  - case_id: 1\n"
+        "    input_shape: [[64, 128], [128, 256]]\n"
+        "    dtype: [float16, float16]\n"
+        "  - case_id: 2\n"
+        "    input_shape: [[128, 256], [256, 512]]\n"
+        "    dtype: [float16, float16]\n",
+        encoding="utf-8",
+    )
+
+    recs, scanned, dedup_reps = load_official_reports([rep_dir1, rep_dir2], ops_root=tmp_ops)
     assert scanned == 2
     assert dedup_reps == 2
     assert len(recs) == 4
 
-    summary = run_cost_model_backtest([rep_dir1, rep_dir2], ops_root=missing_ops)
+    summary = run_cost_model_backtest([rep_dir1, rep_dir2], ops_root=tmp_ops)
     assert summary.unique_operator_cases == 4
     assert summary.p0_p1_loco_cv.mean_intra_group_spearman_rho == pytest.approx(1.0)
     assert summary.enable_prescreen_recommended is False

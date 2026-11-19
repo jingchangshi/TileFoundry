@@ -23,7 +23,9 @@ from tilefoundry.vendor.tilelang_z3 import (
 )
 from tilefoundry_ascend.ascend.schedule import (
     extract_tir_loop_problem,
+    read_from_sil,
     solve_ascend_pipeline,
+    solve_pipeline_with_monotone_backoff,
     validate_pipeline_spec,
 )
 from tilefoundry_ascend.ascend.schedule.pipeline_solver import build_resolved_spec
@@ -703,3 +705,58 @@ def test_extract_tir_loop_problem_dynamic_fallback_with_dim_hints():
     assert buf.slot_bytes == 256
     res = solve_ascend_pipeline(problem)
     assert res.assignment.ii >= 1
+
+
+def test_solve_pipeline_with_monotone_backoff_and_strict_read_from_sil(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Verify monotone backoff converges or raises PipelineError and SIL read returns None."""
+    import json  # noqa: PLC0415
+
+    assert read_from_sil(tmp_path / "missing_sil.json") is None
+    bad_json = tmp_path / "empty_sil.json"
+    bad_json.write_text(json.dumps({"roofline": {}}), encoding="utf-8")
+    assert read_from_sil(bad_json) is None
+    valid_json = tmp_path / "valid_sil.json"
+    valid_json.write_text(json.dumps({"roofline": {"compute_flops": 1024}}), encoding="utf-8")
+    assert read_from_sil(valid_json) == {"roofline": {"compute_flops": 1024}}
+
+    facts = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
+    tasks = (
+        Task(name="load", resources=(("aiv", "aiv0", "mte2", 1),), latency=1, stage=0),
+        Task(name="vec", resources=(("aiv", "aiv0", "vector", 1),), latency=1, stage=1),
+    )
+    edges = (Edge(src="load", dst="vec", distance=0, latency=1),)
+    reuses = (Reuse(buffer="b0", last_reader="vec", next_writer="load", delta=0, read_latency=1),)
+    resources = _vector_resources()
+
+    tight_problem = Problem(
+        tasks=tasks,
+        edges=edges,
+        buffers=(Buffer(name="b0", slot_bytes=262144, space="UB", owner="aiv", fixed=1),),
+        reuses=reuses,
+        resources=resources,
+        capacities=(Capacity(space="UB", owner="aiv", bytes=facts.ub_simdvf_usable_bytes),),
+        max_stage=1,
+        manual=True,
+    )
+    with pytest.raises(PipelineError):
+        solve_ascend_pipeline(tight_problem)
+
+    backed_off = solve_pipeline_with_monotone_backoff(tight_problem, max_retries=4)
+    assert backed_off.fallback_used is False
+    assert verify_assignment(backed_off.problem, backed_off.assignment) == []
+    assert backed_off.problem.buffers[0].slot_bytes <= facts.ub_simdvf_usable_bytes
+
+    impossible_problem = Problem(
+        tasks=tasks,
+        edges=edges,
+        buffers=(Buffer(name="b0", slot_bytes=32, space="UB", owner="aiv", fixed=1),),
+        reuses=reuses,
+        resources=resources,
+        capacities=(Capacity(space="UB", owner="aiv", bytes=16),),
+        max_stage=1,
+        manual=True,
+    )
+    with pytest.raises(PipelineError):
+        solve_pipeline_with_monotone_backoff(impossible_problem, max_retries=4)

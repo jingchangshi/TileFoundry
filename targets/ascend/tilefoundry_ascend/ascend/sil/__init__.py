@@ -4,6 +4,7 @@ from tilefoundry_ascend.ascend.sil.op_analyzer import (
     DEFAULT_OPS_ROOT,
     OpAdvisoryExtractor,
     get_default_extractor,
+    infer_contraction_and_axes_from_proto,
     resolve_canonical_topology_axes,
     synthesize_default_policy,
 )
@@ -52,6 +53,7 @@ __all__ = [
     "TopologyAxes",
     "VerificationReport",
     "get_default_extractor",
+    "infer_contraction_and_axes_from_proto",
     "resolve_canonical_topology_axes",
     "synthesize_default_policy",
     "verify_policy_envelope",

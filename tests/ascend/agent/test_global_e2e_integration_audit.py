@@ -365,8 +365,13 @@ def test_audit2_reconciled_truth_tables_and_bayesian_axis_transfer_in_runners(tm
 
 
 def test_audit3_live_sdk_header_and_tilelang_codegen_scanner() -> None:
-    """Scan real Ascend SDK headers on disk (with graceful fallback) + TileLang codegen.py."""
-    fallback = scan_ascend_sdk_headers(header_roots=["/nonexistent/asc_sdk_path_xyz"])
+    """Scan real Ascend SDK headers on disk (fail closed unless fallback allowed)."""
+    with pytest.raises(FileNotFoundError):
+        scan_ascend_sdk_headers(header_roots=["/nonexistent/asc_sdk_path_xyz"])
+    fallback = scan_ascend_sdk_headers(
+        header_roots=["/nonexistent/asc_sdk_path_xyz"],
+        allow_offline_catalog=True,
+    )
     assert fallback.fallback_used is True
     assert fallback.source == "catalog_fallback"
     assert "CrossCoreSetFlag" in fallback.symbols

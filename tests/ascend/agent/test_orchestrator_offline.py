@@ -931,9 +931,16 @@ def test_envelope_inspector_binds_target_context_and_repair_menu():
     assert inspection.ledger is not None
 
     req = build_syntax_repair_request("def f():\n    pass\n", "some error")
-    assert "VALID TILELANG ASCEND PRIMITIVES" in req.user_prompt
-    assert TILELANG_ASCEND_PRIMITIVE_MENU in req.user_prompt
-    assert "is_npu" in req.user_prompt
+    assert "VALID TARGET DIALECT PRIMITIVES" in req.user_prompt
+    callable_surface = req.user_prompt.split("Strictly Forbidden", 1)[0]
+    assert "T.MixedKernel" in callable_surface
+    assert "T.gemm(" in callable_surface
+    assert "T.gemm_v0" not in callable_surface
+    req_trackb = build_syntax_repair_request(
+        "__global__ void f() {}", "some error", backend_kind="ascendc_trackb"
+    )
+    assert "asc_copy_gm2ub_align" in req_trackb.user_prompt
+    assert "T.Kernel" not in req_trackb.user_prompt
 
 
 def test_up2_pseudo_double_buffer_residual_and_wave_burst_prescreen() -> None:

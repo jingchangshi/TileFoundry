@@ -34,6 +34,7 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     prescreen_tile_configs,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
+from tilefoundry_ascend.ascend.target.dialect_surface import get_dialect_surface
 from tilefoundry_ascend.agent.router.capability_gate import (
     EscalationDecision,
     evaluate_track_escalation,
@@ -716,25 +717,39 @@ def build_syntax_repair_request(
     *,
     slice_hint: str = "",
     sil_verification: object | None = None,
+    backend_kind: str = "tilelang_dsl",
 ) -> GenerationRequest:
-    """Build bounded syntax/compile repair request routed to Hydrogen Medium."""
+    """Build bounded syntax/compile repair request routed to the active backend dialect."""
     hint_sentence = f" Authorized target: {slice_hint}." if slice_hint else ""
-    sys_prompt = (
-        "You are a TileLang Ascend compiler repair engineer. Fix the syntax, API, or "
-        "memory-capacity failure reported below without altering tensor semantics. "
-        "Output ONLY corrected Python code. You may output the fixed subset of "
-        "authorized slice functions or prefixed macros shown in BROKEN KERNEL DSL "
-        "(omitted sibling functions automatically inherit their parent implementation); "
-        "any new top-level helper MUST reuse the exact regime prefix shown in "
-        f"BROKEN KERNEL DSL (do NOT add unprefixed or out-of-regime functions).{hint_sentence}"
-    )
+    surface = get_dialect_surface(backend_kind)
+    is_cpp = surface.dialect_id == "tl_templates_cpp20"
+    fence_lang = "cpp" if is_cpp else "python"
+    if is_cpp:
+        sys_prompt = (
+            "You are an AscendC C++20 (tl_templates/ascend) kernel repair engineer. Fix the "
+            "syntax, API, sync-pairing, or SRAM-capacity failure reported below without altering "
+            "tensor semantics. Output ONLY valid C++20 SEARCH/REPLACE hunks or authorized "
+            f"kernel code matching the target regime contract.{hint_sentence}"
+        )
+    else:
+        sys_prompt = (
+            "You are a TileLang Ascend compiler repair engineer. Fix the syntax, API, or "
+            "memory-capacity failure reported below without altering tensor semantics. "
+            "Output ONLY corrected Python code. You may output the fixed subset of "
+            "authorized slice functions or prefixed macros shown in BROKEN KERNEL SOURCE "
+            "(omitted sibling functions automatically inherit their parent implementation); "
+            "any new top-level helper MUST reuse the exact regime prefix shown in "
+            f"BROKEN KERNEL SOURCE (do NOT add unprefixed or out-of-regime functions)."
+            f"{hint_sentence}"
+        )
     sil_text = format_sil_diagnostics_section(sil_verification=sil_verification)
     sil_block = f"{sil_text}\n\n" if sil_text else ""
     user_prompt = (
-        f"### VALID TILELANG ASCEND PRIMITIVES\n{TILELANG_ASCEND_PRIMITIVE_MENU}\n\n"
+        f"### VALID TARGET DIALECT PRIMITIVES ({surface.dialect_id})\n"
+        f"{surface.render_prompt_reference()}\n\n"
         f"{sil_block}"
         f"### COMPILER / GATE DIAGNOSTIC\n{error_message}\n\n"
-        f"### BROKEN KERNEL DSL\n```python\n{dsl_source}\n```\n"
+        f"### BROKEN KERNEL SOURCE\n```{fence_lang}\n{dsl_source}\n```\n"
     )
     return GenerationRequest(
         role="syntax_repair",
@@ -793,6 +808,7 @@ class PortfolioRunner:
         sil_verification: object | None = None,
         topology_axes: object | None = None,
         cost_model: HybridAscendCostModel | None = None,
+        escalation_tier: str = "tilelang_dsl",
     ) -> tuple[WorkerSpec, ...]:
         """Select matching causal rules and fill remaining slots with creative explorers."""
         active_axes = _derive_active_topology_axes(
@@ -832,6 +848,8 @@ class PortfolioRunner:
                         rule,
                         blueprint_context=blueprint_context,
                         blueprint=blueprint,
+                        escalation_tier=escalation_tier,
+                        enable_track_router=self._enable_track_router,
                         sil_advisory=sil_advisory,
                         sil_verification=sil_verification,
                     ),
@@ -881,6 +899,8 @@ class PortfolioRunner:
                         blueprint_context=blueprint_context,
                         blueprint=blueprint,
                         effort=creative_effort,
+                        escalation_tier=escalation_tier,
+                        enable_track_router=self._enable_track_router,
                         sil_advisory=sil_advisory,
                         sil_verification=sil_verification,
                     ),
@@ -903,6 +923,7 @@ class PortfolioRunner:
         sil_advisory: object | None = None,
         sil_verification: object | None = None,
         topology_axes: object | None = None,
+        escalation_tier: str = "tilelang_dsl",
     ) -> tuple[BeamCandidate | None, bool, tuple[str, str, str] | None, bool]:
         active_axes = _derive_active_topology_axes(
             spec.parent_candidate.ledger,
@@ -947,6 +968,7 @@ class PortfolioRunner:
                     dsl_source,
                     evaluation.error_message,
                     sil_verification=sil_verification,
+                    backend_kind=escalation_tier,
                 )
                 try:
                     repaired_raw = await self._backend.generate(repair_req)
@@ -1099,6 +1121,7 @@ class PortfolioRunner:
         sil_advisory: object | None = None,
         sil_verification: object | None = None,
         topology_axes: object | None = None,
+        escalation_tier: str = "tilelang_dsl",
     ) -> PortfolioRoundReport:
         """Execute one parallel portfolio round across Rule and Creative workers."""
         active_axes = _derive_active_topology_axes(
@@ -1122,6 +1145,7 @@ class PortfolioRunner:
             sil_advisory=sil_advisory,
             sil_verification=sil_verification,
             topology_axes=active_axes,
+            escalation_tier=escalation_tier,
         )
         tasks = [
             self._run_single_worker(
@@ -1135,6 +1159,7 @@ class PortfolioRunner:
                 sil_advisory=sil_advisory,
                 sil_verification=sil_verification,
                 topology_axes=active_axes,
+                escalation_tier=escalation_tier,
             )
             for spec in specs
         ]

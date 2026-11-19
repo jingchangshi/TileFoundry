@@ -301,8 +301,16 @@ def test_causal_t0_router_t_gt_0_escalation_and_isa_gap_scanner() -> None:
     )
     assert d_vm.recommended_backend_tier == "ascendc_template"
 
-    # Legacy route_from_op_spec / route_execution_track remain intact
-    assert route_from_op_spec({"op_name": "gather"}).recommended_backend_tier == "ascendc_template"
+    # Structural route_from_op_spec / route_execution_track without op-name hardcoding
+    assert (
+        route_from_op_spec(
+            {
+                "category": "IndexGather",
+                "inputs": [{"dtype": ["float16"]}, {"dtype": ["int32"]}],
+            }
+        ).recommended_backend_tier
+        == "ascendc_template"
+    )
     assert route_execution_track(
         StructuralFeatures(True, 0.0, "none", False, "none", False, 128, 1.0)
     ).track == "developer"

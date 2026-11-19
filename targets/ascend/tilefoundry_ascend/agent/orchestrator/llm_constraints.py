@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 import json
+from collections.abc import Sequence
 
 from tilefoundry_ascend.agent.router.isa_gap_scanner import (
     PipeGapReport,
@@ -19,36 +19,7 @@ from tilefoundry_ascend.ascend.sil.schema import (
     ConstraintRelaxationMask,
     HardwareLegalityBounds,
 )
-
-TILELANG_ASCEND_SURFACE_REFERENCE = (
-    "Verified `@tilelang.jit(out_idx=...)` / `tilelang.language as T` surface:\n"
-    "- Execution & Grid: `with T.Kernel(grid, is_npu=True) as (cid, vid):`, "
-    "`T.Pipelined(extent, num_stages=S)`, `T.Parallel(...)`, `T.serial(...)`\n"
-    "- Scratchpad Alloc: `T.alloc_ub(shape, dtype)`, `T.alloc_L1(shape, dtype)`, "
-    "`T.alloc_L0A(shape, dtype)`, `T.alloc_L0B(shape, dtype)`, `T.alloc_L0C(shape, dtype)`, "
-    "`T.alloc_ss(shape, dtype)`\n"
-    "- Data & Compute: `T.copy(src, dst)`, `T.gemm_v0(A, B, C, transpose_A=..., "
-    "transpose_B=..., init=...)`, `T.fill(buf, val)`, `T.clear(buf)`, "
-    "`T.reduce_sum(src, dst, dim=...)`, `T.reduce_max(src, dst, dim=...)`\n"
-    "- Forbidden virtual dialect: NEVER emit `T.ascend_*` internal TileFoundry TIR ops "
-    "(except `T.ascend_pipe_barrier` when supported by TileLang)."
-)
-
-INLINE_ASCENDC_VF_SURFACE_REFERENCE = (
-    "Hybrid TileLang DMA shell + Inline AscendC Vector (`inline_ascendc_vf`) surface:\n"
-    "- Keep outer `T.Kernel`, `T.Pipelined`, and GM<->UB `T.copy` in TileLang.\n"
-    "- Express tight inner vector chains via `asc_vf_call` / `Reg::` register-resident "
-    "intrinsics without intermediate UB roundtrips or `LocalMemBar` inside VF bodies."
-)
-
-ASCENDC_TEMPLATE_SURFACE_REFERENCE = (
-    "Native AscendC C++20 (`dav-3510`) kernel surface:\n"
-    "- DMA & FixPipe: `DataCopyPad`, `Nd2Nz`, `Fixpipe<...>(..., FixpipeParamsArch3510)`.\n"
-    "- Cube & Sync: `Mmad`, `CrossCoreSetFlag<0x2, PIPE_FIX>(fid)`, "
-    "`CrossCoreWaitFlag<0x2, PIPE_VF>(fid)` (`fid` in `[0, 15]`, balanced across all CFG paths).\n"
-    "- Vector / SIMT: `SimdVF` `Reg::` register ops or `__simt_vf__` `__launch_bounds__(512)` "
-    "(respecting 216 KiB UB ceiling under SIMT)."
-)
+from tilefoundry_ascend.ascend.target.dialect_surface import get_dialect_surface
 
 _SCOPE_TOPOLOGY_MAP: dict[str, str] = {
     "UB": "smem (AIV)",
@@ -156,15 +127,11 @@ def format_target_dialect_layer(
 ) -> str:
     """Render Layer 2: grounded target-dialect callable surface and negative exclusions."""
     tier = str(escalation_tier or "tilelang_dsl").strip().lower()
-    if tier == "ascendc_template":
-        surface = ASCENDC_TEMPLATE_SURFACE_REFERENCE
-    elif tier == "inline_ascendc_vf":
-        surface = INLINE_ASCENDC_VF_SURFACE_REFERENCE
-    else:
-        surface = TILELANG_ASCEND_SURFACE_REFERENCE
+    dialect = get_dialect_surface(tier)
+    surface = dialect.render_prompt_reference()
 
     lines = [
-        f"### LAYER 2: TARGET DIALECT API SURFACE (tier={tier})",
+        f"### LAYER 2: TARGET DIALECT API SURFACE (tier={tier}, dialect={dialect.dialect_id})",
         surface,
     ]
     if enable_track_router and track and track not in ("", "unconstrained"):
@@ -172,10 +139,7 @@ def format_target_dialect_layer(
 
     gap_report = pipe_gap_report
     if gap_report is None and tier == "tilelang_dsl":
-        try:
-            gap_report = scan_tilelang_pipe_gaps()
-        except Exception:
-            gap_report = None
+        gap_report = scan_tilelang_pipe_gaps()
     if gap_report is not None and gap_report.missing_primitives:
         missing_preview = list(gap_report.missing_primitives[:6])
         lines.append(
@@ -335,9 +299,6 @@ def build_progressive_llm_constraints(
 
 
 __all__ = [
-    "ASCENDC_TEMPLATE_SURFACE_REFERENCE",
-    "INLINE_ASCENDC_VF_SURFACE_REFERENCE",
-    "TILELANG_ASCEND_SURFACE_REFERENCE",
     "build_progressive_llm_constraints",
     "format_blueprint_delta_section",
     "format_hardware_and_sil_layer",

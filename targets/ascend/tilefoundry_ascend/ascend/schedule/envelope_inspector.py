@@ -65,6 +65,7 @@ from tilefoundry_ascend.ascend.schedule.pipeline_solver import (
     _resources_for_tasks,
     format_pipe_key,
     solve_ascend_pipeline,
+    solve_pipeline_with_monotone_backoff,
     task_resource_mask,
 )
 from tilefoundry_ascend.ascend.target import (
@@ -2940,11 +2941,7 @@ def _try_solve_tilelang_pipelined_ii(
                 "issue_after": (),
             }
         )
-        try:
-            res = solve_ascend_pipeline(problem)
-        except (PipelineError, ValueError):
-            solved_iis.append(_analytical_pipelined_ii(task_items))
-            continue
+        res = solve_pipeline_with_monotone_backoff(problem)
         solved_iis.append(res.assignment.ii)
 
     return max(solved_iis) if solved_iis else None

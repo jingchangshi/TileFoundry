@@ -430,8 +430,10 @@ def _extract_namespace_symbols(text: str, ns_name: str, out: set[str]) -> None:
 
 def scan_ascend_sdk_headers(
     header_roots: Sequence[str | Path] | str | Path | None = None,
+    *,
+    allow_offline_catalog: bool = False,
 ) -> SdkHeaderScanResult:
-    """Mechanically scan installed Ascend C++ SDK headers on disk, falling back to catalog."""
+    """Mechanically scan installed Ascend C++ SDK headers on disk."""
     if header_roots is None:
         roots = [Path(p) for p in DEFAULT_ASCEND_SDK_HEADER_ROOTS]
     elif isinstance(header_roots, (str, Path)):
@@ -510,6 +512,11 @@ def scan_ascend_sdk_headers(
                     other_syms.add(tok)
 
     if scanned_count == 0 or not symbols:
+        if not allow_offline_catalog:
+            roots_preview = tuple(str(r) for r in existing_roots)
+            raise FileNotFoundError(
+                f"No Ascend SDK or tl_templates headers found under {roots_preview}"
+            )
         for spec in ASCEND_DEVKIT_ISA_CATALOG:
             for part in spec.ascend_devkit_intrinsic.split("/"):
                 tok = part.strip()
@@ -591,6 +598,7 @@ def discover_tilelang_lowering_surface(
     tilelang_module: object | None = None,
     *,
     codegen_path: str | Path | None = None,
+    allow_offline_catalog: bool = False,
 ) -> tuple[str, frozenset[str]]:
     """Discover registered TileLang Ascend lowering symbols from language + codegen.py."""
     mod = tilelang_module
@@ -601,7 +609,7 @@ def discover_tilelang_lowering_surface(
 
             mod = tl_ascend
             source = "tilelang.ascend.language"
-        except Exception:
+        except ImportError:
             mod = None
 
     symbols: set[str] = set()
@@ -632,6 +640,10 @@ def discover_tilelang_lowering_surface(
             break
 
     if mod is None and not codegen_scanned:
+        if not allow_offline_catalog:
+            raise ImportError(
+                "tilelang.ascend.language and codegen.py are both unavailable"
+            )
         return "baseline_fallback", BASELINE_TILELANG_ASCEND_SURFACE
     if mod is not None and codegen_scanned and source == "tilelang.ascend.language":
         source = "tilelang.ascend.language+codegen"
@@ -642,12 +654,19 @@ def discover_tilelang_lowering_surface(
 
 def _resolve_surface(
     tilelang_surface: Iterable[str] | object | None,
+    *,
+    allow_offline_catalog: bool = False,
 ) -> tuple[str, frozenset[str]]:
     if tilelang_surface is None:
-        return discover_tilelang_lowering_surface()
+        return discover_tilelang_lowering_surface(
+            allow_offline_catalog=allow_offline_catalog
+        )
     if isinstance(tilelang_surface, (set, frozenset, list, tuple)):
         return "explicit_surface", frozenset(str(s) for s in tilelang_surface)
-    return discover_tilelang_lowering_surface(tilelang_surface)
+    return discover_tilelang_lowering_surface(
+        tilelang_surface,
+        allow_offline_catalog=allow_offline_catalog,
+    )
 
 
 def scan_tilelang_pipe_gaps(
@@ -655,9 +674,13 @@ def scan_tilelang_pipe_gaps(
     tilelang_surface: Iterable[str] | object | None = None,
     pipes: Iterable[str] | None = None,
     devkit_catalog: Iterable[IsaPrimitiveSpec] | None = None,
+    allow_offline_catalog: bool = False,
 ) -> PipeGapReport:
     """Diff asc-devkit hardware capabilities against TileLang across the 7 hardware pipes."""
-    surface_source, surface = _resolve_surface(tilelang_surface)
+    surface_source, surface = _resolve_surface(
+        tilelang_surface,
+        allow_offline_catalog=allow_offline_catalog,
+    )
 
     selected_pipes = tuple(pipes) if pipes is not None else VALID_HARDWARE_PIPES
     for pipe in selected_pipes:
