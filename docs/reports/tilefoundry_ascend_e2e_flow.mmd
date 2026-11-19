@@ -1,68 +1,71 @@
 flowchart TB
-    classDef prep fill:#EEF4FA,stroke:#2B5B84,stroke-width:1.5px,color:#12263A
-    classDef diag fill:#FDF6E9,stroke:#A66300,stroke-width:2px,color:#3B2300
-    classDef synth fill:#F2F8F2,stroke:#2D6A4F,stroke-width:1.5px,color:#133122
-    classDef gate fill:#F7F2FA,stroke:#6A3D9A,stroke-width:1.5px,color:#2E1647
-    classDef drop fill:#FDF0F0,stroke:#A61C1C,stroke-width:1.5px,color:#4A0D0D
+    classDef prep fill:#EEF4FA,stroke:#1E3A8A,stroke-width:1.5px,color:#0F172A
+    classDef diag fill:#FEF7EB,stroke:#92400E,stroke-width:2px,color:#3B1D00
+    classDef synth fill:#ECFDF5,stroke:#065F46,stroke-width:1.5px,color:#062E22
+    classDef gate fill:#F5F3FF,stroke:#4C1D95,stroke-width:1.5px,color:#240E52
+    classDef drop fill:#FEF2F2,stroke:#991B1B,stroke-width:1.5px,color:#450A0A
 
-    subgraph S1["阶段一：算子数学建模与基线锚定"]
-        S1_OP["编写高层纯数学算子、调度描述\n与按输入规模分档的 TileLang 内核模块"]:::prep
-        S1_NAV["生成跨层编译参考蓝图\n计算屋脊线理论下限、合法指令集与 Z3 流水调度方案"]:::prep
-        S1_BASE["真机运行基线算子模块\n采集代表性用例加速比、综合评分与硬件性能剖析"]:::prep
-        S1_OP -->|"数学与调度中间表示"| S1_NAV
-        S1_NAV -->|"参考蓝图与性能上限"| S1_BASE
+    subgraph S1["阶段一：多算子发现、参考蓝图构建与基线锚定"]
+        S1_DISCOVER["算子注册发现与自动分层锚点\nCannbenchOpsRegistry 解析 proto/cases 与 950PR 元数据\n自动分层代表性锚点；Marathon 缺失时自举 kernels.py 并在启动前抢救未晋升优胜候选"]:::prep
+        S1_BLUEPRINT["SIL 静态画像与可选 HIR/TIR 导航蓝图\nOpAdvisoryExtractor 提取拓扑三轴、输入域包络与默认策略\n有 HIR/TIR 规范时由 HirTirBridge 生成屋脊线、合法原语与 Z3 流水蓝图"]:::prep
+        S1_BASE["经验湖回放校准与基线真机锚定\nExperienceLake 回放历史观测至三层混合代价模型\n通过 agent-gates 真机采集基线 Eq.3 得分、逐例耗时与瓶颈 MSProf"]:::prep
+        S1_DISCOVER -->|"分层锚点与初始算子模块"| S1_BLUEPRINT
+        S1_BLUEPRINT -->|"SIL 画像、策略与导航蓝图"| S1_BASE
     end
 
-    subgraph S2["阶段二：目标分档选择与瓶颈诊断"]
-        S2_PICK["按剩余优化空间筛选目标分档\n并结合停滞衰减策略选取当前父代内核"]:::diag
-        S2_RES["联合分析静态硬件资源评估结果与输入域约束\n量化理论下限与实测计数器之间的偏差及阻塞风险"]:::diag
-        S2_PICK -->|"选定分档与父代上下文"| S2_RES
+    subgraph S2["阶段二：分档轮转选择、静动残差诊断与轨道升级"]
+        S2_PICK["按剩余优化空间与停滞衰减筛选目标分档\nExtremeCampaignRunner 按 headroom / (1 + 0.45 * stagnation) 动态轮转\n停滞超阈时切换至当前分档独立踏脚石分支 (Stepping-Stone) 作为父代"]:::diag
+        S2_DIAG["SIL 重算、三层代价诊断与轨道/自由度升级\nRegimePiecewiseSolver 基于活跃缓存不动点重算；HybridCostModel 预测瓶颈\n连续停滞且未达 η 目标时触发 CapabilityGate 升级 (DSL->InlineVF->AscendC)\n结合 ISAGapScanner 缺口报告按需松弛 7 维 ConstraintRelaxationMask"]:::diag
+        S2_PICK -->|"选定分档、父代源码与独立 Beam 上下文"| S2_DIAG
     end
 
-    subgraph S3["阶段三：双通道无状态候选生成"]
-        S3_FREE["无先验结构探索通道\n在负向排除约束下探索全新循环拆分与缓存排布"]:::synth
-        S3_RULE["规则引导定向优化通道\n将高置信度硬件规则匹配至当前瓶颈与偏差特征"]:::synth
-        S3_SPLICE["基于抽象语法树拼接局部符号补丁\n保护其他分档不变，并自动清理冗余辅助函数"]:::synth
+    subgraph S3["阶段三：无状态双通道生成与 AST 局部拼接"]
+        S3_RULE["规则引导定向利用通道（K 路）\nBayesianRuleTracker 按全局+三轴后验排序 33+ 条静态可判定规则\n注入蓝图差值、MSProf/BiSheng 残差与可选 TileSizePrescreen 建议"]:::synth
+        S3_FREE["无先验结构探索通道（1+缺口路）\n注入规则脱敏的负向排除机制，驱动全新循环拆分、缓存排布或 AscendC 壳层探索\nAgyCli 无状态空沙箱执行：强制 xhigh->high、SSE 双计时看门狗与工具循环熔断"]:::synth
+        S3_SPLICE["AST 局部符号拼接与双轨模板物化\npatch_regime_into_module 隔离替换目标分档并自动清理死辅助函数\nTrack-B 按 7 维掩码装配协同壳层或在 Top 自由态剥离壳层契约"]:::synth
+        S3_RULE -->|"规则定向补丁"| S3_SPLICE
         S3_FREE -->|"结构探索补丁"| S3_SPLICE
-        S3_RULE -->|"规则优化补丁"| S3_SPLICE
     end
 
-    subgraph S4["阶段四：单轮多级递进验证（预检至全量门禁）"]
-        S4_T0["第一关：静态硬件资源预检\n校验符号接口、DMA 通路合法性与片上内存上限"]:::gate
-        S4_T1["第二关：离线设备编译\n并发调用底层编译器并在有界次数内修复语法错误"]:::gate
-        S4_DROP["真机评测前快速淘汰无效候选\n下调未生效规则的贝叶斯置信度（通信超时豁免惩罚）"]:::drop
-        S4_T2["第三关：代表性用例真机批量测速\n预热编译缓存，排定综合得分并采集胜出者硬件剖析"]:::gate
-        S4_T3["第四关：全量契约与扩展边界门禁\n运行官方全集回归、极限尾块与动态形状缓存复用测试"]:::gate
-        S4_T0 -->|"静态检查通过"| S4_T1
-        S4_T0 -->|"违反硬件约束"| S4_DROP
-        S4_T1 -->|"设备编译成功"| S4_T2
-        S4_T1 -->|"语法修复后仍失败"| S4_DROP
-        S4_T2 -->|"通过长尾防退化与最小增益门槛"| S4_T3
+    subgraph S4["阶段四：五级递进式编译与真机验证漏斗（L0 -> L3）"]
+        S4_L0["L0 静态资源与 7 维红线预检（Stage A）\nTileLang 双快照降级审计生成 ObjectivePhysicalLedger\nAscendC 执行 SILVerifier 14 条红线 + C++ CFG 跨核 Flag 平衡校验"]:::gate
+        S4_PRE["可选代价模型预筛（L0 -> L1）\nHybridAscendCostModel 按预测延迟排序 Stage-A 通过候选\n仅保留 Top-K 进入耗时的离线设备编译"]:::gate
+        S4_L1["L1 离线 BiSheng 编译与微架构解析（Stage B）\n并发调用 bisheng (dav-3510) 并在有界次数内语法修复\n解析 --cce-res-usage 提取 spill / vloopv2 / vf_break / alias / dcci 摘要"]:::gate
+        S4_DROP["真机前快速淘汰无效候选\n下调未生效规则的贝叶斯后验\n通信超时 (llm_transport) 与代价预筛淘汰 (cost_prescreen) 豁免惩罚"]:::drop
+        S4_L2["L2 预热缓存批量代表用例真机测速（Stage C）\n预热 CPU 参考缓存与 TileLang 编译缓存，单次 agent-gates 批量评测\n计算 Eq.3-HAP 得分，校验长尾防退化 (>=0.97x) 与全局/局部增益并采集 MSProf"]:::gate
+        S4_L3["L3 全量契约回归与原子回滚门禁\n运行 20 例全量精度与动态形状缓存复用回归（含预热 L3）\n通过则原子写入主干并落盘 Checkpoint；失败则原子回滚至旧主干"]:::gate
+
+        S4_L0 -->|"静态合法"| S4_PRE
+        S4_L0 -->|"违反硬件红线/溢出"| S4_DROP
+        S4_PRE -->|"Top-K 入选"| S4_L1
+        S4_PRE -->|"预筛淘汰 (豁免惩罚)"| S4_DROP
+        S4_L1 -->|"编译成功 + 微架构摘要"| S4_L2
+        S4_L1 -->|"修复后仍失败"| S4_DROP
+        S4_L2 -->|"通过长尾守护与最小增益门槛"| S4_L3
     end
 
-    subgraph S5["阶段五：演进池更新与因果规则提炼"]
-        S5_BEAM["更新双轨候选演进池与原子检查点\n通过全量门禁则晋升主干版本，否则原子回滚；\n保留高潜力探索分支作为后续演进起点"]:::synth
-        S5_FLY["反事实单变量拆解与微探针验证飞轮\n拆解胜出改动的最小独立变体，在真机独立验证加速达标后\n将纯静态可判定的新规律沉淀入规则库"]:::synth
+    subgraph S5["阶段五：分档演进池更新、在线校准与反事实飞轮"]
+        S5_BEAM["分档独立 Beam 更新与贝叶斯维护\n更新目标分档 TwoLaneBeamSearch 并剪枝过时兄弟踏脚石\n写入 ExperienceLake (SHA 寻址制品 + JSONL 观测) 在线校准混合代价模型\n执行规则剪枝、冷却复活 (decay_and_revive) 与局部规则跨算子晋升"]:::synth
+        S5_FLY["反事实单变量 / LOO 拆解与微探针准入飞轮\nFlywheelDistiller 拆解胜出改动的原子 AST/配置变体\n经真机微探针 (speedup>=1.08x 且 MTE2 不退化) 或候选 LOO 验证后沉淀入 KB"]:::synth
     end
 
-    subgraph S6["阶段六：官方基准全集评测与最终交付"]
-        S6_T4["第五关：官方基准全集评测\n评测全部真实算例性能得分，识别代表用例之外的长尾退化"]:::gate
-        S6_DONE["交付通过全量门禁的生产级算子模块与扩展规则库"]:::prep
-        S6_T4 -->|"全集算例达标"| S6_DONE
+    subgraph S6["阶段六：L4 官方全集评测与动态长尾回补交付"]
+        S6_L4["L4 官方 CANNBench 全集评测\n评测全部真实算例得分与逐例加速比，识别代表锚点之外的长尾退化"]:::gate
+        S6_DONE["交付通过 L3/L4 门禁的生产级多档算子模块、校准经验湖与扩展规则库"]:::prep
+        S6_L4 -->|"全集无长尾退化且达标"| S6_DONE
     end
 
     %% 阶段间前向数据流
-    S1_BASE -->|"初始化基线得分与演进池状态"| S2_PICK
-    S2_RES -->|"蓝图差距与负向排除机制"| S3_FREE
-    S2_RES -->|"命中规则与瓶颈上下文"| S3_RULE
-    S3_SPLICE -->|"拼装完整候选模块"| S4_T0
-    S4_T3 -->|"晋升主干或原子回滚"| S5_BEAM
-    S4_T2 -->|"分档实测得分、结构新颖度与剖析指标"| S5_BEAM
-    %% 保持左路（S6_T4）先于右路（S5_FLY）声明，确保回流线无交叉
-    S5_BEAM -->|"达到性能目标或耗尽轮数预算"| S6_T4
-    S5_BEAM -->|"主干相对基线的有效改动"| S5_FLY
+    S1_BASE -->|"基线得分、锚点与校准模型"| S2_PICK
+    S2_DIAG -->|"瓶颈残差与命中规则上下文"| S3_RULE
+    S2_DIAG -->|"负向排除机制与轨道/掩码约束"| S3_FREE
+    S3_SPLICE -->|"完整双轨候选模块"| S4_L0
+    S4_L3 -->|"晋升主干或原子回滚"| S5_BEAM
+    S4_L2 -->|"分档实测得分、结构指纹与 MSProf/BiSheng 残差"| S5_BEAM
+    S5_BEAM -->|"达到目标得分或耗尽轮次/墙钟预算"| S6_L4
+    S5_BEAM -->|"主干相对基线显著增益 (>=min_flywheel_gain)"| S5_FLY
 
-    %% 外缘清晰闭环反馈轨道
+    %% 三条外缘闭环反馈轨道
     S5_BEAM -.->|"进入下一轮分档优化"| S2_PICK
-    S6_T4 -.->|"将退化算例动态追加为代表用例并补跑"| S2_PICK
-    S5_FLY -.->|"向规则库补充经实测证实的新规则"| S3_RULE
+    S6_L4 -.->|"退化算例动态追加为锚点 (append_dynamic_anchor) 并触发补跑"| S2_PICK
+    S5_FLY -.->|"向规则库准入经实测证实的新因果规则"| S3_RULE
