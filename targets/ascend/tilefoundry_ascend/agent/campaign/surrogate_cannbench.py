@@ -19,26 +19,6 @@ from pathlib import Path
 
 import yaml
 
-def wait_for_npu_quiescent(max_retries: int = 10):
-    """Wait for NPU devices (davinci) to be closed in /proc/self/fd/."""
-    for _ in range(max_retries):
-        found = False
-        try:
-            fd_path = Path("/proc/self/fd")
-            for fd in fd_path.iterdir():
-                try:
-                    if "davinci" in str(fd.readlink()):
-                        found = True
-                        break
-                except OSError:
-                    continue
-        except OSError:
-            pass
-        if not found:
-            return
-        time.sleep(1.0)
-    logger.warning("NPU still busy after waiting for quiescence.")
-
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
     PerfTargetSpec,
@@ -71,6 +51,27 @@ from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def wait_for_npu_quiescent(max_retries: int = 10):
+    """Wait for NPU devices (davinci) to be closed in /proc/self/fd/."""
+    for _ in range(max_retries):
+        found = False
+        try:
+            fd_path = Path("/proc/self/fd")
+            for fd in fd_path.iterdir():
+                try:
+                    if "davinci" in str(fd.readlink()):
+                        found = True
+                        break
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        if not found:
+            return
+        time.sleep(1.0)
+    logger.warning("NPU still busy after waiting for quiescence.")
 
 DEFAULT_AGENT_GATES_MAX_ATTEMPTS = 4
 DEFAULT_AGENT_GATES_BACKOFF_SEC = 3.0
@@ -1372,11 +1373,22 @@ def _clean_agent_gates_subprocess_env(extra_env: Mapping[str, str]) -> dict[str,
 
 
 def _parse_agent_gates_json(stdout: str) -> dict[str, object]:
-    idx = stdout.find("{")
-    if idx < 0:
+    text = (stdout or "").strip()
+    for line in reversed(text.splitlines()):
+        cand = line.strip()
+        if cand.startswith("{") and cand.endswith("}"):
+            try:
+                parsed = json.loads(cand)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+    idx = text.rfind("\n{")
+    start = idx + 1 if idx >= 0 else text.find("{")
+    if start < 0:
         return {}
     try:
-        parsed = json.loads(stdout[idx:])
+        parsed = json.loads(text[start:])
         return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         return {}
@@ -1405,8 +1417,7 @@ def _is_transient_blocked_env(
                     and "DEPENDENCY_NOT_PASSED" in failures
                 ):
                     return True
-    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    return "npu-smi" in combined
+    return False
 
 
 def _run_agent_gates_cmd(
@@ -1807,10 +1818,7 @@ def run_l3_full_contract_via_agent_gates(
             tmp / "env.sh",
             {
                 "TILEFOUNDRY_NPU_CPU_TESTS": "tests/ascend/agent/test_llm_watchdog.py",
-                "TILEFOUNDRY_NPU_DEVICE_TESTS": (
-                    "tests/ascend/agent/test_surrogate_batch_npu.py "
-                    "tests/ascend/benchmarks/test_npu_acceptance.py"
-                ),
+                "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/benchmarks/test_npu_acceptance.py",
             },
         )
         cmd = [

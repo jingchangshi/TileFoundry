@@ -325,7 +325,7 @@ DEFAULT_REGIME_SPECS: dict[str, tuple[RegimeTargetSpec, ...]] = {
                 "Non-64-aligned D tail regime enabling padded UB row pitch and multi-row "
                 "buffering."
             ),
-            representative_hir_dims={"N": 8, "B": 1, "S": 4, "D": 1000},
+            representative_hir_dims={"N": 8, "B": 1, "S": 4, "D": 1024},
             representative_anchor_dims={"N": 8, "B": 1, "S": 16, "D": 1000},
             config_selector_fn="_select_ar_unaligned_config",
             editable_symbols=(

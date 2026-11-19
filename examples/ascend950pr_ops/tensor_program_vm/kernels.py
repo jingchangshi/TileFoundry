@@ -1,4 +1,4 @@
-"""TileLang Ascend950PR Full-Opcode Register-Resident / GM-Streaming VM kernel for TensorProgramVm."""
+"""TileLang Ascend950PR Full-Opcode Register-Resident / GM-Streaming VM kernel."""
 
 import contextlib
 
@@ -79,7 +79,7 @@ def _build_tensor_program_vm_prim_func(
     schedule_mode: str = "tuned",
     **_extra_kwargs,
 ):
-    """Build Ascend 950 VM @T.prim_func supporting all 8 opcodes (ADD/MUL/RELU/MEANB/MAX/ROLL/MAC/COPY)."""
+    """Build Ascend 950 VM @T.prim_func supporting all 8 opcodes."""
     if num_regs <= 0:
         raise ValueError(f"num_regs must be positive, got {num_regs}")
     if tl_dtype not in ("float16", "bfloat16", "float32"):

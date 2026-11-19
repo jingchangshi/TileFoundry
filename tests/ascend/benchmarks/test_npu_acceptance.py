@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 import torch
@@ -20,14 +22,7 @@ for _path in (BENCHMARKS_DIR, AR_DIR, MLA_DIR):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-import cannbench_contract
-import test_attention_residual
-import test_mla
-
-from examples.ascend950pr_ops.attention_residual import attention_residual
-from examples.ascend950pr_ops.attention_residual import kernels as ar_kernels
-from examples.ascend950pr_ops.mla import kernels as mla_kernels
-from examples.ascend950pr_ops.mla import mla
+import cannbench_contract  # noqa: E402
 
 _L3_TARGET_OP = os.environ.get("TF_L3_TARGET_OPERATOR", "").strip()
 _L3_TARGET_MODULE_PATH = os.environ.get("TF_L3_TARGET_MODULE_PATH", "").strip()
@@ -64,13 +59,10 @@ def _load_override_module(module_path_str: str, tag: str):
     return mod
 
 
-if _L3_TARGET_MODULE_PATH:
-    if _L3_TARGET_OP_SHORT == "attention_residual":
-        ar_kernels = _load_override_module(_L3_TARGET_MODULE_PATH, "attention_residual")
-        attention_residual = ar_kernels.attention_residual
-    elif _L3_TARGET_OP_SHORT == "mla":
-        mla_kernels = _load_override_module(_L3_TARGET_MODULE_PATH, "mla")
-        mla = mla_kernels.mla
+def _load_scoped_operator_module(op_short_name: str):
+    if _L3_TARGET_MODULE_PATH and _L3_TARGET_OP_SHORT == op_short_name:
+        return _load_override_module(_L3_TARGET_MODULE_PATH, op_short_name)
+    return importlib.import_module(f"examples.ascend950pr_ops.{op_short_name}.kernels")
 
 
 def _require_npu_env() -> None:
@@ -103,7 +95,10 @@ def test_attention_residual_cannbench_cases() -> None:
     if not _should_run_acceptance_test("attention_residual", _L3_TARGET_OP):
         pytest.skip(f"Scoped to {_L3_TARGET_OP} L3 target.")
     _require_npu_env()
-    test_attention_residual.main(attention_residual)
+    import test_attention_residual  # noqa: PLC0415
+
+    ar_kernels = _load_scoped_operator_module("attention_residual")
+    test_attention_residual.main(ar_kernels.attention_residual)
 
 
 def test_attention_residual_baseline_vs_tuned_parity() -> None:
@@ -111,6 +106,8 @@ def test_attention_residual_baseline_vs_tuned_parity() -> None:
     if not _should_run_acceptance_test("attention_residual", _L3_TARGET_OP):
         pytest.skip(f"Scoped to {_L3_TARGET_OP} L3 target.")
     _require_npu_env()
+    ar_kernels = _load_scoped_operator_module("attention_residual")
+    attention_residual = ar_kernels.attention_residual
     harness = cannbench_contract.Harness("level4/attention_residual", AR_DIR)
     target_cases = {1, 16, 20}
     checked = 0
@@ -146,7 +143,10 @@ def test_mla_cannbench_cases() -> None:
     if not _should_run_acceptance_test("mla", _L3_TARGET_OP):
         pytest.skip(f"Scoped to {_L3_TARGET_OP} L3 target.")
     _require_npu_env()
-    test_mla.main(mla)
+    import test_mla  # noqa: PLC0415
+
+    mla_kernels = _load_scoped_operator_module("mla")
+    test_mla.main(mla_kernels.mla)
 
 
 def test_mla_supplemental_cases() -> None:
@@ -154,6 +154,8 @@ def test_mla_supplemental_cases() -> None:
     if not _should_run_acceptance_test("mla", _L3_TARGET_OP):
         pytest.skip(f"Scoped to {_L3_TARGET_OP} L3 target.")
     _require_npu_env()
+    mla_kernels = _load_scoped_operator_module("mla")
+    mla = mla_kernels.mla
     payload = json.loads(SUPP_MLA_PATH.read_text(encoding="utf-8"))
     harness = cannbench_contract.Harness("level4/mla", MLA_DIR)
     for raw in payload["cases"]:
@@ -178,10 +180,9 @@ def test_mla_supplemental_cases() -> None:
         params.update({k: v for k, v in case.attrs.items() if k not in params})
         tensors = harness.get_input(**params)
         oracle = harness.reference_output(case, tensors)
-        native_fn = lambda case=case, tensors=tensors: harness.reference_output(
-            case, tensors, native=True
-        )
-        modes = ("tuned",) if _L3_TARGET_OP_SHORT else ("tuned", "baseline")
+        def native_fn(case=case, tensors=tensors):
+            return harness.reference_output(case, tensors, native=True)
+        modes = ("tuned", "baseline")
         for mode in modes:
             npu_tensors = cannbench_contract.map_tensors(tensors, lambda x: x.npu())
             call_params = harness.params(case, npu_tensors)
@@ -200,13 +201,15 @@ def test_dynamic_shape_kernel_cache_reuse() -> None:
     if not _should_run_acceptance_test("dynamic_cache", _L3_TARGET_OP):
         pytest.skip(f"Scoped to {_L3_TARGET_OP} L3 target.")
     _require_npu_env()
-    from tests.ascend.benchmarks.attention_residual.golden import (
-        attention_residual as ar_golden,
-    )
-    from tests.ascend.benchmarks.mla.golden import mla as mla_golden
 
     torch.manual_seed(0)
     if _L3_TARGET_OP_SHORT != "mla":
+        from tests.ascend.benchmarks.attention_residual.golden import (  # noqa: PLC0415
+            attention_residual as ar_golden,
+        )
+
+        ar_kernels = _load_scoped_operator_module("attention_residual")
+        attention_residual = ar_kernels.attention_residual
         ar_kernels._KERNEL_CACHE.clear()
         n_depth, d_dim = 4, 256
         w = torch.randn(d_dim, dtype=torch.bfloat16)
@@ -229,6 +232,10 @@ def test_dynamic_shape_kernel_cache_reuse() -> None:
         assert len(ar_kernels._KERNEL_CACHE) == 1
 
     if _L3_TARGET_OP_SHORT != "attention_residual":
+        from tests.ascend.benchmarks.mla.golden import mla as mla_golden  # noqa: PLC0415
+
+        mla_kernels = _load_scoped_operator_module("mla")
+        mla = mla_kernels.mla
         mla_kernels._KERNEL_CACHE.clear()
         n_q, n_kv, d_nope, d_rope = 16, 1, 512, 64
         for b_dim, s_dim, s_kv in ((2, 64, 128), (4, 128, 256)):
@@ -272,10 +279,12 @@ def test_target_operator_full_cannbench_contract() -> None:
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("Ascend NPU device is unavailable on this host.")
 
-    import tempfile
-
-    from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
-    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import ensure_npu_compare_shim_dir
+    from tilefoundry_ascend.agent.campaign.anchor_specs import (  # noqa: PLC0415
+        CannbenchOpsRegistry,
+    )
+    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (  # noqa: PLC0415
+        ensure_npu_compare_shim_dir,
+    )
 
     reg = CannbenchOpsRegistry()
     spec = reg.resolve(_L3_TARGET_OP)

@@ -73,7 +73,6 @@ def build(
                 c_res_ub = tf.full_like(z_md, one_minus_alpha)
                 c_agg_ub = tf.full_like(z_md, alpha_val)
 
-                # Precompute fused RMSNorm key weight kw = w * gamma once per row.
                 with T.SimdVF():
                     wr = tf.schedule(
                         (w_ub, tf.empty(Tensor[(1, D), dtype, "rmem"])),
@@ -100,7 +99,6 @@ def build(
                         op=T.ascend_reg_to_ub(),
                     )
 
-                # Online softmax streaming state across depth N (single pass over V).
                 m_ub = tf.full_like(z_m1, -1.0e30)
                 l_ub = tf.zeros(Tensor[(M, 1), "f32", "smem"])
                 acc_ub = tf.zeros(Tensor[(M, D), "f32", "smem"])

@@ -5,7 +5,6 @@ import math
 import tilelang
 import tilelang.ascend.language as T
 import torch
-from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
 
 _KERNEL_CACHE: dict[tuple[object, ...], object] = {}
 
@@ -111,7 +110,6 @@ def _emit_quant_vec(
     v_half,
 ):
     """Quantize and encode 64 float32 values into 64 FP8/FP4 uint8 codes (in int32x64)."""
-    # Multiply by exact 2^(-shared_exp) (0 cycles of division, 0 rounding error).
     ret_raw = T.simd.vmul(v_val, v_inv_scale_f32, mask=m32)
     ret = T.simd.vsel(v_zero, ret_raw, v_is_bad_blk)
 
@@ -144,7 +142,6 @@ def _emit_quant_vec(
     abs_qi = T.simd.vand(q_i, v_abs_mask, mask=m32)
 
     if is_fp4:
-        # Preserve original IEEE signbit (including -0.0 when negative small values round to 0).
         sign_nibble = T.simd.vand(T.simd.vshrs(ret_i, 28, mask=m32), v_i8, mask=m32)
         q_abs = T.reinterpret("float32x64", abs_qi)
         if dst_type == 41:
@@ -159,7 +156,6 @@ def _emit_quant_vec(
             mag_code = T.simd.vsel(v_i0, T.simd.vsel(v_i1, norm_code, is_h), is_z)
         return T.simd.vor(mag_code, sign_nibble, mask=m32)
 
-    # FP8 exact bitwise encode (E5M2 / E4M3FN), preserving -0.0 signbit from ret
     sign_b = T.simd.vshls(T.simd.vand(T.simd.vshrs(ret_i, 31, mask=m32), v_i1, mask=m32), 7, mask=m32)
     mant_q = T.simd.vand(abs_qi, v_mant_mask, mask=m32)
     exp_q = T.simd.vadds(T.simd.vshrs(abs_qi, 23, mask=m32), -127, mask=m32)
@@ -289,7 +285,7 @@ def _build_dynamic_mx_quant_prim_func(
     with _ascend_target_ctx():
         if is_tail_axis:
             c_blks = int(blks_per_chunk)
-            chunk_elems = c_blks * bs  # multiple of 64 (2048)
+            chunk_elems = c_blks * bs
             out_chunk_cols = chunk_elems // 2 if is_fp4 else chunk_elems
             stages = 2 if (use_pipelined and schedule_mode == "tuned") else 1
 
@@ -439,7 +435,6 @@ def _build_dynamic_mx_quant_prim_func(
                                     s_u8 = T.simd.vcvt(s_u16, "uint8", mask=m8, round="ROUND_R", sat=False, part=0)
                                     T.simd.vsts(s_ub[seg_blk0], s_u8, mask=m32, dist="PK4_B32", extent=64)
                             else:
-                                # blocksize >= 64 (multiple of 64)
                                 blks_64 = bs // 64
                                 amax_acc = T.simd.alloc_local((1,), "float32")
                                 s_vec[0] = T.simd.vdup(0, "int32", mask=m32)
@@ -535,7 +530,6 @@ def _build_dynamic_mx_quant_prim_func(
 
             return main_tail
 
-        # Non-tail axis: [outer, axis_dim, inner]
         ct = int(col_tile)
         out_ct = ct // 2 if is_fp4 else ct
         y_ub_cols = ((out_ct + 63) // 64) * 64 + 64

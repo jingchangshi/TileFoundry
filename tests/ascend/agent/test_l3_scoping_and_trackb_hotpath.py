@@ -71,8 +71,8 @@ def test_p0_npu_acceptance_scoping_and_tuned_only_guard() -> None:
     src = (REPO_ROOT / "tests" / "ascend" / "benchmarks" / "test_npu_acceptance.py").read_text(
         encoding="utf-8"
     )
-    assert 'modes = ("tuned",) if _L3_TARGET_OP_SHORT else ("tuned", "baseline")' in src
-    assert 'if _L3_TARGET_OP_SHORT == "mla":' in src
+    assert 'modes = ("tuned", "baseline")' in src
+    assert "def _load_scoped_operator_module(" in src
     assert "def test_target_operator_full_cannbench_contract()" in src
 
 

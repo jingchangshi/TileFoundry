@@ -77,7 +77,6 @@ def _build_sparse_flash_attention_prim_func(
     num_cores = max(1, int(num_cores))
     tl_dtype = str(dtype)
     layout = str(input_layout).upper()
-    causal_flag = bool(is_causal)
 
     d0 = 256 if dv_val > 256 else dv_val
     d1 = dv_val - d0
@@ -191,7 +190,6 @@ def _build_sparse_flash_attention_prim_func(
                         kv_h = rem_sn // s1_dim
                         s1_i = rem_sn % s1_dim
 
-                    # Initialize online-softmax state and tail q_ub/P_ub zero padding.
                     q_start_row = q_base + sid * rows_per_sid
                     q_active = T.max(0, T.min(rows_per_sid, g_val - q_start_row))
                     if layout == "BSND":
@@ -218,7 +216,6 @@ def _build_sparse_flash_attention_prim_func(
                             for c_p in T.serial(bn_chunks):
                                 T.simd.vsts(P_ub[rr, c_p * 64], v_zero16, mask=m32, dist="PK_B32", extent=64)
 
-                    # Load Q rows assigned to this AIV half and send to q_l1.
                     if layout == "BSND":
                         q_gm_base = ((b_idx * s1_dim + s1_i) * n_kv + kv_h) * g_val + q_start_row
                         if q_active == rows_per_sid:

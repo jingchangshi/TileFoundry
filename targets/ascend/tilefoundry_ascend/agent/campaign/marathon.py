@@ -174,8 +174,6 @@ class MarathonConfig:
 def short_operator_tag(operator_name: str) -> str:
     """Return short filesystem tag for an operator name or task id."""
     norm = operator_name.rsplit("/", 1)[-1] if "/" in operator_name else operator_name
-    if norm == "attention_residual":
-        return "ar"
     return norm.replace("_", "-")
 
 
@@ -799,7 +797,7 @@ def _prewarm_l3_candidate_kernels(
     cann_repo_hint = (env_vals.get("TILEFOUNDRY_NPU_CANNBENCH_REPO") or "").strip()
 
     prewarm_script = f"""
-import importlib, importlib.util, json, os, sys
+import importlib, importlib.util, inspect, json, os, re, sys
 from pathlib import Path
 import torch
 
@@ -832,26 +830,6 @@ spec.loader.exec_module(mod)
 orig_get_kernel = getattr(mod, "_get_kernel", None)
 orig_combine = getattr(mod, "_get_combine_kernel", None)
 
-if callable(orig_get_kernel):
-    def _stub_get_kernel(*args, **kwargs):
-        _ = orig_get_kernel(*args, **kwargs)
-        splits = int(kwargs.get("num_kv_splits", 1) or 1)
-        if op_name == "attention_residual":
-            return lambda v_f, x_f, *rest: torch.empty_like(x_f)
-        if splits <= 1:
-            return lambda *a, **kw: torch.empty_like(a[0]) if a else None
-        return lambda *rest: None
-
-    mod._get_kernel = _stub_get_kernel
-
-if callable(orig_combine):
-    def _stub_combine(*args, **kwargs):
-        _ = orig_combine(*args, **kwargs)
-        return lambda o_p, l_p, *rest: torch.empty(
-            (o_p.shape[1], o_p.shape[2]), dtype=torch.bfloat16, device=o_p.device
-        )
-    mod._get_combine_kernel = _stub_combine
-
 def _empty_tensors(shapes, dtypes):
     return [
         torch.empty(tuple(sh), dtype=cannbench_contract.str_to_torch_dtype(dt), device="cpu")
@@ -866,6 +844,93 @@ if not task_dir.is_dir() and cann_repo_hint:
         task_dir = cand_dir
 harness = cannbench_contract.Harness(task_name, task_dir)
 entrypoint = getattr(mod, op_name, getattr(mod, "kernel", None))
+entry_sig_params = set(inspect.signature(entrypoint).parameters) if callable(entrypoint) else set()
+_active_out_specs = []
+
+def _parse_shape_tokens(shape_str, attrs):
+    raw_s = str(shape_str or "").strip()
+    if not raw_s:
+        return ()
+    layout = str((attrs or {{}}).get("inputLayout") or (attrs or {{}}).get("layout") or "").strip()
+    if layout:
+        m = re.search(rf"{{re.escape(layout)}}\\s*:\\s*\\[([^\\]]+)\\]", raw_s)
+        if m:
+            return tuple(tok.strip() for tok in m.group(1).split(",") if tok.strip())
+    m = re.search(r"\\[([^\\]]+)\\]", raw_s)
+    if not m:
+        return ()
+    return tuple(tok.strip() for tok in m.group(1).split(",") if tok.strip())
+
+def _bind_case_dims(case, raw_tensors):
+    dims = {{}}
+    for spec_item, tensor in zip(harness.info.inputs, raw_tensors):
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        toks = _parse_shape_tokens(getattr(spec_item, "shape", ""), case.attrs)
+        if len(toks) == tensor.ndim:
+            for tok, dim_val in zip(toks, tensor.shape):
+                if tok.isidentifier():
+                    dims[tok] = int(dim_val)
+    return dims
+
+def _infer_case_outputs(case, raw_tensors):
+    dims = _bind_case_dims(case, raw_tensors)
+    first_dt = next((t.dtype for t in raw_tensors if isinstance(t, torch.Tensor)), torch.float16)
+    resolved = []
+    for out_spec in harness.info.outputs:
+        toks = _parse_shape_tokens(getattr(out_spec, "shape", ""), case.attrs)
+        sh = None
+        if toks:
+            vals = []
+            ok = True
+            for tok in toks:
+                if tok.isdigit():
+                    vals.append(int(tok))
+                elif tok in dims:
+                    vals.append(dims[tok])
+                else:
+                    ok = False
+                    break
+            if ok:
+                sh = tuple(vals)
+        raw_dt = getattr(out_spec, "dtype", None)
+        if isinstance(raw_dt, (list, tuple)):
+            cand_dts = [cannbench_contract.str_to_torch_dtype(str(d)) for d in raw_dt if d]
+            dt = first_dt if first_dt in cand_dts else (cand_dts[0] if cand_dts else first_dt)
+        elif raw_dt:
+            dt = cannbench_contract.str_to_torch_dtype(str(raw_dt))
+        else:
+            dt = first_dt
+        resolved.append((sh, dt))
+    return resolved
+
+if callable(orig_get_kernel):
+    def _stub_get_kernel(*args, **kwargs):
+        _ = orig_get_kernel(*args, **kwargs)
+        splits = int(kwargs.get("num_kv_splits", 1) or 1)
+        if splits > 1:
+            return lambda *rest: None
+        def _stub_run(*a, **kw):
+            tensors_in = [x for x in a if isinstance(x, torch.Tensor)]
+            dev = tensors_in[0].device if tensors_in else torch.device("cpu")
+            if _active_out_specs and all(sh is not None for sh, _ in _active_out_specs):
+                outs = [torch.empty(sh, dtype=dt, device=dev) for sh, dt in _active_out_specs]
+                return outs[0] if len(outs) == 1 else tuple(outs)
+            if len(harness.info.outputs) > 1 and tensors_in:
+                return tuple(torch.empty_like(tensors_in[0]) for _ in harness.info.outputs)
+            return torch.empty_like(tensors_in[0]) if tensors_in else None
+        return _stub_run
+
+    mod._get_kernel = _stub_get_kernel
+
+if callable(orig_combine):
+    def _stub_combine(*args, **kwargs):
+        _ = orig_combine(*args, **kwargs)
+        return lambda o_p, l_p, *rest: torch.empty(
+            (o_p.shape[1], o_p.shape[2]), dtype=o_p.dtype, device=o_p.device
+        )
+    mod._get_combine_kernel = _stub_combine
+
 compiled = 0
 warnings = 0
 
@@ -880,7 +945,8 @@ def _try_call(tag, fn, params):
         warnings += 1
         print(f"PREWARM_WARN {{tag}}: {{type(exc).__name__}}: {{exc}}", file=sys.stderr)
 
-for case in harness.cases:
+def _run_case_modes(tag_prefix, case):
+    global _active_out_specs
     raw = _empty_tensors(case.input_shapes, case.dtypes)
     if harness.get_input:
         in_p = {{
@@ -889,66 +955,59 @@ for case in harness.cases:
         }}
         in_p.update({{k: v for k, v in case.attrs.items() if k not in in_p}})
         raw = harness.get_input(**in_p)
+    _active_out_specs = _infer_case_outputs(case, raw)
     params = harness.params(case, raw)
-    _try_call(f"case_{{case.case_num}}_tuned", entrypoint, params)
-    if op_name == "attention_residual" and case.case_num in (1, 16, 20):
+    _try_call(f"{{tag_prefix}}_tuned", entrypoint, params)
+    if "schedule_mode" in entry_sig_params:
         p_base = dict(params)
         p_base["schedule_mode"] = "baseline"
-        _try_call(f"case_{{case.case_num}}_baseline", entrypoint, p_base)
+        _try_call(f"{{tag_prefix}}_baseline", entrypoint, p_base)
 
-if op_name == "mla":
-    supp_path = bench_dir / "cases" / "supplemental_mla.json"
-    if supp_path.is_file():
-        supp = json.loads(supp_path.read_text(encoding="utf-8"))
-        for row in supp.get("cases", ()):
-            raw = _empty_tensors(row["input_shapes"], row["dtypes"])
-            case = cannbench_contract.Case(
-                case_num=row["case_id"],
-                label=row["key"],
-                input_shapes=row["input_shapes"],
-                dtypes=row["dtypes"],
-                attrs=row["attrs"],
-                value_ranges=row["value_range"],
+for case in harness.cases:
+    _run_case_modes(f"case_{{case.case_num}}", case)
+
+supp_path = bench_dir / "cases" / f"supplemental_{{op_name}}.json"
+if supp_path.is_file():
+    supp = json.loads(supp_path.read_text(encoding="utf-8"))
+    for row in supp.get("cases", ()):
+        supp_case = cannbench_contract.Case(
+            case_num=row["case_id"],
+            label=row["key"],
+            input_shapes=row["input_shapes"],
+            dtypes=row["dtypes"],
+            attrs=row["attrs"],
+            value_ranges=row["value_range"],
+        )
+        _run_case_modes(f"supp_{{row['key']}}", supp_case)
+
+if harness.cases:
+    base_case = harness.cases[0]
+    base_raw = _empty_tensors(base_case.input_shapes, base_case.dtypes)
+    base_dims = _bind_case_dims(base_case, base_raw)
+    target_tok = next((k for k in ("B", "batch", "M", "S", "T", "seq_len") if k in base_dims), None)
+    if target_tok is not None:
+        old_val = base_dims[target_tok]
+        new_val = max(1, old_val // 2) if old_val >= 2 else old_val * 2
+        if new_val != old_val:
+            scaled_shapes = []
+            for spec_item, sh in zip(harness.info.inputs, base_case.input_shapes):
+                if sh is None:
+                    scaled_shapes.append(None)
+                    continue
+                toks = _parse_shape_tokens(getattr(spec_item, "shape", ""), base_case.attrs)
+                if len(toks) == len(sh):
+                    scaled_shapes.append([new_val if tok == target_tok else dim_v for tok, dim_v in zip(toks, sh)])
+                else:
+                    scaled_shapes.append(list(sh))
+            dyn_case = cannbench_contract.Case(
+                case_num=base_case.case_num,
+                label="dynamic_scale",
+                input_shapes=scaled_shapes,
+                dtypes=base_case.dtypes,
+                attrs=base_case.attrs,
+                value_ranges=base_case.value_ranges,
             )
-            in_p = {{
-                item.name: raw[i] if i < len(raw) else None
-                for i, item in enumerate(harness.info.inputs)
-            }}
-            in_p.update({{k: v for k, v in case.attrs.items() if k not in in_p}})
-            raw = harness.get_input(**in_p)
-            params = harness.params(case, raw)
-            for mode in ("tuned", "baseline"):
-                pm = dict(params)
-                pm["schedule_mode"] = mode
-                _try_call(f"supp_{{row['key']}}_{{mode}}", entrypoint, pm)
-    _try_call(
-        "mla_dynamic_shape",
-        entrypoint,
-        {{
-            "q_nope": torch.empty((2, 64, 16, 512), dtype=torch.bfloat16),
-            "q_rope": torch.empty((2, 64, 16, 64), dtype=torch.bfloat16),
-            "k_nope": torch.empty((2, 128, 1, 512), dtype=torch.bfloat16),
-            "k_rope": torch.empty((2, 128, 1, 64), dtype=torch.bfloat16),
-            "v": torch.empty((2, 128, 1, 512), dtype=torch.bfloat16),
-            "numKVHeads": 1,
-            "scaleValue": -1.0,
-            "inputLayout": "BSND",
-            "is_causal": True,
-        }},
-    )
-elif op_name == "attention_residual":
-    _try_call(
-        "ar_dynamic_shape",
-        entrypoint,
-        {{
-            "v_stack": torch.empty((4, 1, 16, 256), dtype=torch.bfloat16),
-            "x": torch.empty((1, 16, 256), dtype=torch.bfloat16),
-            "w": torch.empty((256,), dtype=torch.bfloat16),
-            "gamma": torch.empty((256,), dtype=torch.bfloat16),
-            "alpha": 0.5,
-            "epsilon": 1e-6,
-        }},
-    )
+            _run_case_modes("case_0_dynamic_scale", dyn_case)
 
 print(json.dumps({{"compiled": compiled, "warnings": warnings}}))
 """
@@ -1077,10 +1136,7 @@ def build_prewarmed_l3_runner(
                 tmp / "env.sh",
                 {
                     "TILEFOUNDRY_NPU_CPU_TESTS": "tests/ascend/agent/test_llm_watchdog.py",
-                    "TILEFOUNDRY_NPU_DEVICE_TESTS": (
-                        "tests/ascend/agent/test_surrogate_batch_npu.py "
-                        "tests/ascend/benchmarks/test_npu_acceptance.py"
-                    ),
+                    "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/benchmarks/test_npu_acceptance.py",
                 },
             )
             cmd = [

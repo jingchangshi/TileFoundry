@@ -2,11 +2,77 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import asdict, dataclass
 import math
 import re
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 from typing import Any
+
+_KNOWN_ASCEND_DTYPE_BYTES: dict[str, float] = {
+    "f16": 2.0,
+    "fp16": 2.0,
+    "float16": 2.0,
+    "bf16": 2.0,
+    "bfloat16": 2.0,
+    "f32": 4.0,
+    "fp32": 4.0,
+    "float32": 4.0,
+    "hf32": 4.0,
+    "f64": 8.0,
+    "fp64": 8.0,
+    "float64": 8.0,
+    "fp8e4m3": 1.0,
+    "fp8_e4m3": 1.0,
+    "float8_e4m3": 1.0,
+    "float8_e4m3fn": 1.0,
+    "e4m3": 1.0,
+    "fp8e5m2": 1.0,
+    "fp8_e5m2": 1.0,
+    "float8_e5m2": 1.0,
+    "e5m2": 1.0,
+    "hif8": 1.0,
+    "i8": 1.0,
+    "int8": 1.0,
+    "u8": 1.0,
+    "uint8": 1.0,
+    "i16": 2.0,
+    "int16": 2.0,
+    "u16": 2.0,
+    "uint16": 2.0,
+    "i32": 4.0,
+    "int32": 4.0,
+    "u32": 4.0,
+    "uint32": 4.0,
+    "i64": 8.0,
+    "int64": 8.0,
+    "u64": 8.0,
+    "uint64": 8.0,
+    "f4e2m1": 0.5,
+    "f4e1m2": 0.5,
+    "fp4": 0.5,
+    "i4": 0.5,
+    "int4": 0.5,
+    "u4": 0.5,
+    "uint4": 0.5,
+    "bool": 1.0,
+    "int1": 1.0,
+}
+
+
+def _dtype_bytes_strict(dtype_name: object) -> float:
+    raw = str(getattr(dtype_name, "name", dtype_name) or "").strip().lower()
+    if raw in _KNOWN_ASCEND_DTYPE_BYTES:
+        return _KNOWN_ASCEND_DTYPE_BYTES[raw]
+    m = re.fullmatch(r"([a-z0-9_]+)x(\d+)", raw)
+    if m:
+        base, lanes = m.group(1), int(m.group(2))
+        if base in _KNOWN_ASCEND_DTYPE_BYTES and lanes > 0:
+            return _KNOWN_ASCEND_DTYPE_BYTES[base] * lanes
+    raise ValueError(f"Unknown Ascend dtype {dtype_name!r}; refusing 16-bit silent fallback")
+
+
+def _dtype_bits_strict(dtype_name: object) -> int:
+    return max(1, int(round(_dtype_bytes_strict(dtype_name) * 8.0)))
 
 
 def _safe_int(val: object, default: int = 0) -> int:
@@ -28,7 +94,6 @@ def _safe_float(val: object, default: float = 0.0) -> float:
 class MicroarchProfile:
     """Compiler-invariant hardware operation, DMA edge, and bank geometry telemetry."""
 
-    # L1 AVE instruction & load/store balance counters (per representative kernel launch)
     fp_alu_ops: int = 0
     int_alu_ops: int = 0
     sfu_f16_ops: int = 0
@@ -38,7 +103,6 @@ class MicroarchProfile:
     ub_load_bytes: int = 0
     ub_store_bytes: int = 0
 
-    # Explicit 6-pipe directional storage-transition byte volumes (DAG2)
     gm_to_l1_bytes: int = 0
     gm_to_ub_bytes: int = 0
     l1_to_l0a_bytes: int = 0
@@ -49,7 +113,6 @@ class MicroarchProfile:
     ub_to_l1_bytes: int = 0
     ub_to_gm_bytes: int = 0
 
-    # Cube, sync & pipeline loop structure
     cube_mmad_count: int = 0
     cube_macs_total: int = 0
     cv_sync_barriers: int = 0
@@ -58,7 +121,6 @@ class MicroarchProfile:
     inner_loop_trips: int = 1
     subkernel_count: int = 1
 
-    # Memory bank conflict multipliers (>= 1.0)
     ub_bank_conflict_factor: float = 1.0
     l1_bank_conflict_factor: float = 1.0
     simt_shm_conflict_factor: float = 1.0
@@ -181,11 +243,11 @@ def _extract_region_info(
             extents = args[2:]
             if buf is not None:
                 scope = _map_tl_scope_name(buf.scope())
-                dtype_str = str(getattr(buf, "dtype", "float16"))
+                dtype_str = str(getattr(buf, "dtype", ""))
                 try:
                     elem_bits = int(DataTypeCls(dtype_str).bits)
                 except Exception:
-                    elem_bits = 16
+                    elem_bits = _dtype_bits_strict(dtype_str)
                 elems = 1
                 known = True
                 for ext in extents:
@@ -209,11 +271,11 @@ def _extract_region_info(
             buf = getattr(bl, "buffer", None)
             if buf is not None:
                 scope = _map_tl_scope_name(buf.scope())
-                dtype_str = str(getattr(buf, "dtype", "float16"))
+                dtype_str = str(getattr(buf, "dtype", ""))
                 try:
                     elem_bits = int(DataTypeCls(dtype_str).bits)
                 except Exception:
-                    elem_bits = 16
+                    elem_bits = _dtype_bits_strict(dtype_str)
                 iv = _eval_tirx_expr_int(args[3], var_bindings) if len(args) > 3 else None
                 if iv is None or iv <= 0:
                     elems = 1
@@ -230,11 +292,11 @@ def _extract_region_info(
     buf = getattr(arg, "buffer", None)
     if buf is not None:
         scope = _map_tl_scope_name(buf.scope())
-        dtype_str = str(getattr(buf, "dtype", "float16"))
+        dtype_str = str(getattr(buf, "dtype", ""))
         try:
             elem_bits = int(DataTypeCls(dtype_str).bits)
         except Exception:
-            elem_bits = 16
+            elem_bits = _dtype_bits_strict(dtype_str)
         elems = 1
         for ext in getattr(buf, "shape", ()) or ():
             d = _eval_tirx_expr_int(ext, var_bindings)
@@ -256,10 +318,10 @@ def extract_microarch_profile_from_tirx(
     if prim_func is None:
         return MicroarchProfile()
     try:
-        from tilelang import tvm
-        from tilelang.utils.language import DataType as TLDataType
-        from tvm import tirx
-    except Exception:
+        from tilelang import tvm  # noqa: PLC0415
+        from tilelang.utils.language import DataType as TLDataType  # noqa: PLC0415
+        from tvm import tirx  # noqa: PLC0415
+    except ImportError:
         return MicroarchProfile()
 
     funcs: list[Any] = []
@@ -301,10 +363,13 @@ def extract_microarch_profile_from_tirx(
     l1_buffers: list[int] = []
 
     def _classify_dtype_family(dtype_str: str) -> str:
-        low = str(dtype_str or "").lower()
-        if "float16" in low or "bfloat16" in low or low.startswith(("f16", "bf16")):
+        low = str(dtype_str or "").strip().lower()
+        if not low or low in ("void", "handle"):
+            return "f32"
+        _dtype_bytes_strict(low)
+        if "float16" in low or "bfloat16" in low or low.startswith(("f16", "bf16", "fp16")):
             return "f16"
-        if "int" in low or "uint" in low or low == "bool":
+        if "int" in low or "uint" in low or low == "bool" or low.startswith(("i", "u")):
             return "int"
         return "f32"
 
@@ -326,7 +391,7 @@ def extract_microarch_profile_from_tirx(
         try:
             bits = int(TLDataType(str(buf.dtype)).bits)
         except Exception:
-            bits = 16
+            bits = _dtype_bits_strict(getattr(buf, "dtype", ""))
         total_b = (math.prod(dims) * bits + 7) // 8
         inner_b = (dims[-1] * bits + 7) // 8
         if scope == "UB" and len(dims) >= 2 and math.prod(dims[:-1]) > 1:
@@ -365,9 +430,10 @@ def extract_microarch_profile_from_tirx(
             scope = _map_tl_scope_name(expr.buffer.scope())
             if scope == "UB":
                 try:
-                    b = max(2, int(TLDataType(str(expr.dtype)).bits) * int(TLDataType(str(expr.dtype)).lanes) // 8)
+                    dt = TLDataType(str(expr.dtype))
+                    b = max(1, (int(dt.bits) * int(dt.lanes) + 7) // 8)
                 except Exception:
-                    b = 2
+                    b = max(1, int(math.ceil(_dtype_bytes_strict(getattr(expr, "dtype", "")))))
                 c["ub_load_bytes"] += repeat * b
             return str(getattr(expr, "dtype", ""))
         if isinstance(expr, (tirx.Add, tirx.Sub, tirx.Mul, tirx.Div, tirx.FloorDiv, tirx.Mod, tirx.Min, tirx.Max)):
@@ -441,9 +507,9 @@ def extract_microarch_profile_from_tirx(
             if scope == "UB":
                 try:
                     dt = TLDataType(str(stmt.value.dtype))
-                    b = max(2, (int(dt.bits) * int(dt.lanes) + 7) // 8)
+                    b = max(1, (int(dt.bits) * int(dt.lanes) + 7) // 8)
                 except Exception:
-                    b = 2
+                    b = max(1, int(math.ceil(_dtype_bytes_strict(getattr(stmt.value, "dtype", "")))))
                 c["ub_store_bytes"] += repeat * b
             _scan_expr(stmt.value, repeat=repeat)
             return
@@ -491,7 +557,6 @@ def extract_microarch_profile_from_tirx(
                     if len(args) >= 3
                     else (None, 0, 0, "")
                 )
-                # Try inferring exact M*N*K when buffer shapes are known; else approximate safely.
                 m_val, n_val, k_val = 0, 0, 0
                 buf_a = getattr(getattr(args[0], "args", [None])[0] if isinstance(args[0], tirx.Call) else args[0], "buffer", None)
                 buf_b = getattr(getattr(args[1], "args", [None])[0] if isinstance(args[1], tirx.Call) else args[1], "buffer", None)
@@ -572,7 +637,6 @@ def extract_microarch_profile_from_cce(source_text: str) -> MicroarchProfile:
     fp_alu = len(re.findall(r"\b(?:vadd|vmul|vsub|vmad|vfma|vfadd|vfmul|Add|Mul|Sub|Muls|Adds)\b", clean))
     int_alu = len(re.findall(r"\b(?:viadd|vimul|vand|vor|vshl|vshr)\b", clean))
 
-    # Transfer-op occurrence counts scaled by typical single-tile packet (32 KiB) only when no TIR volume exists.
     unit_xfer = 32768
     gm_l1 = len(re.findall(r"\bcopy_gm_to_cbuf\b", clean)) * unit_xfer
     gm_ub = len(re.findall(r"\bcopy_gm_to_ubuf\b", clean)) * unit_xfer
@@ -584,7 +648,6 @@ def extract_microarch_profile_from_cce(source_text: str) -> MicroarchProfile:
     ub_l1 = len(re.findall(r"\bcopy_ubuf_to_cbuf\b", clean)) * unit_xfer
     ub_gm = len(re.findall(r"\bcopy_ubuf_to_gm\b", clean)) * unit_xfer
 
-    # Detect SIMT shared-memory power-of-2 innermost stride patterns if present.
     simt_factor = 1.0
     if re.search(r"__simt_vf__|__shared__", clean):
         shm_strs = re.findall(r"__shared__[^;]*\[(\d+)\]\s*\[(\d+)\]", clean)

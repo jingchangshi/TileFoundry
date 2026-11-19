@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Mapping
-from dataclasses import dataclass, field
 import inspect
 import math
-from pathlib import Path
 import runpy
 import tempfile
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from tilefoundry.analysis import AnalysisError, ComputeCostMetadata, analyze, check_program
 from tilefoundry.analysis.check import program_dim_vars
@@ -277,15 +277,8 @@ def _load_module_from_source(
     build_param_names: set[str] = set()
     try:
         ns = runpy.run_path(str(path))
-    except (VerifyError, ValueError, AssertionError, TypeError) as exc:
-        return _LoadedModuleInfo(
-            module=load_authored_ir(str(path)),
-            parameterized_applied=False,
-            fallback_reason=f"{type(exc).__name__}: {exc}",
-            build_param_names=frozenset(),
-            source=source,
-            path=path,
-        )
+    except (VerifyError, ValueError, AssertionError, TypeError):
+        raise
 
     build_fn = ns.get("build")
     if callable(build_fn):
@@ -317,8 +310,8 @@ def _load_module_from_source(
                             source=source,
                             path=path,
                         )
-                except (VerifyError, ValueError, AssertionError, TypeError) as exc:
-                    fallback_reason = f"{type(exc).__name__}: {exc}"
+                except (VerifyError, ValueError, AssertionError, TypeError):
+                    raise
 
     return _LoadedModuleInfo(
         module=load_authored_ir(str(path)),
@@ -862,35 +855,9 @@ def compile_hir_blueprint(
             if lowered_name is not None:
                 entry_name = lowered_name
         except _LOWERING_ERRORS as exc:
-            err_msg = f"{type(exc).__name__}: {exc}"
-            if scheduled_hir_source is not None and sched_info.parameterized_applied:
-                sched_fallback_reason = err_msg
-                sched_param_applied = False
-                try:
-                    fallback_info = _LoadedModuleInfo(
-                        module=load_authored_ir(str(sched_info.path)),
-                        parameterized_applied=False,
-                        fallback_reason=err_msg,
-                        build_param_names=sched_info.build_param_names,
-                        source=sched_info.source,
-                        path=sched_info.path,
-                    )
-                    (
-                        ref_ledger,
-                        z3_summary,
-                        lowered_name,
-                        sched_resolved_dims,
-                        sched_declared,
-                    ) = _lower_scheduled_module(
-                        fallback_info, anchor_dims=None, resolved_target=resolved_target
-                    )
-                    if lowered_name is not None:
-                        entry_name = lowered_name
-                except _LOWERING_ERRORS as fb_exc:
-                    diagnostics.append(err_msg)
-                    diagnostics.append(f"{type(fb_exc).__name__}: {fb_exc}")
-            else:
-                diagnostics.append(err_msg)
+            if scheduled_hir_source is not None:
+                raise
+            diagnostics.append(f"{type(exc).__name__}: {exc}")
 
     combined_fallback = authored_info.fallback_reason or sched_fallback_reason
     if authored_info.fallback_reason and sched_fallback_reason and (

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import json
 import math
 from pathlib import Path
 
+import pytest
 import torch
 
 from tilefoundry.cli.source import load_authored_ir
@@ -304,12 +306,19 @@ def test_format_blueprint_delta_section_gates_cross_scale_deltas() -> None:
     assert "gm_roundtrip_bytes:" in exact_nav
     assert "delta=" in exact_nav
 
-    fallback_pkt = compile_hir_blueprint(
-        ar_hir,
-        scheduled_hir_source=ar_sched,
-        anchor_dims={"N": 8, "B": 1, "S": 4, "D": 1000},
+    with pytest.raises(ValueError, match="D % 64 == 0"):
+        compile_hir_blueprint(
+            ar_hir,
+            scheduled_hir_source=ar_sched,
+            anchor_dims={"N": 8, "B": 1, "S": 4, "D": 1000},
+        )
+
+    fallback_pkt = dataclasses.replace(
+        exact_pkt,
+        shape_exact_match=False,
+        requested_anchor_dims={"N": 8, "B": 1, "S": 4, "D": 1000},
+        fallback_reason="ValueError: D % 64 != 0",
     )
-    assert fallback_pkt.shape_exact_match is False
     assert fallback_pkt.resolved_hir_dims == {"N": 4, "B": 1, "S": 4, "D": 64}
     assert fallback_pkt.fallback_reason is not None
     gated_nav = format_blueprint_delta_section(fallback_pkt, current_ledger=tl_ledger)

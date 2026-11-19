@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import pathlib
+
+import pytest
 
 from tilefoundry.analysis import analyze, check_program
 from tilefoundry.cli.source import load_authored_ir
@@ -236,23 +239,32 @@ def test_np1_tir_envelope_ledger_telemetry_and_roundtrip(tmp_path: pathlib.Path)
 
 
 def test_hir_blueprint_fallback_provenance_and_delta_gating() -> None:
-    """Verify D=1000 fallback sets shape_exact_match=False and suppresses raw byte deltas."""
+    """Verify invalid D=1000 raises fail-closed and fallback_pkt suppresses raw byte deltas."""
     authored_src = (AR_DIR / "model.py").read_text(encoding="utf-8")
     scheduled_src = (AR_DIR / "scheduled.py").read_text(encoding="utf-8")
 
     req_dims = {"N": 8, "B": 1, "S": 4, "D": 1000}
-    pkt = compile_hir_blueprint(
+    with pytest.raises(ValueError, match="D % 64 == 0"):
+        compile_hir_blueprint(
+            authored_src,
+            scheduled_hir_source=scheduled_src,
+            anchor_dims=req_dims,
+        )
+
+    exact_pkt = compile_hir_blueprint(
         authored_src,
         scheduled_hir_source=scheduled_src,
-        anchor_dims=req_dims,
+        anchor_dims={"N": 4, "B": 1, "S": 4, "D": 64},
     )
-    assert pkt.shape_exact_match is False
-    assert pkt.requested_anchor_dims == req_dims
-    assert pkt.resolved_hir_dims == {"N": 4, "B": 1, "S": 4, "D": 64}
-    assert pkt.fallback_reason is not None and "ValueError" in pkt.fallback_reason
-    assert pkt.reference_ledger is not None
+    fallback_pkt = dataclasses.replace(
+        exact_pkt,
+        shape_exact_match=False,
+        requested_anchor_dims=req_dims,
+        fallback_reason="ValueError: D % 64 != 0",
+    )
+    assert fallback_pkt.reference_ledger is not None
 
-    delta_text = format_blueprint_delta_section(pkt, current_ledger=pkt.reference_ledger)
+    delta_text = format_blueprint_delta_section(fallback_pkt, current_ledger=fallback_pkt.reference_ledger)
     assert "[Structural Reference Only:" in delta_text
     assert "scope_utilization[" in delta_text
     assert "ub_peak_bytes:" not in delta_text

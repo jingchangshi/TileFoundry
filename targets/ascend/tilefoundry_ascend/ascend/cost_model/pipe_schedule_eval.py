@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
 import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import MicroarchProfile
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
-# Calibrated from AscendNPU-IR-1 MSCostParams.h + davinci_950.toml
 MS_PIPE_SLOPE_US_PER_BYTE: dict[str, float] = {
     "MTE1": 5.54e-6,
     "MTE2": 6.39e-6,
@@ -39,6 +38,17 @@ _CUBE_DTYPE_ALIASES: dict[str, str] = {
     "fp32": "f32",
     "int8": "i8",
     "uint8": "u8",
+    "e4m3": "fp8e4m3",
+    "fp8_e4m3": "fp8e4m3",
+    "float8_e4m3": "fp8e4m3",
+    "float8_e4m3fn": "fp8e4m3",
+    "e5m2": "fp8e5m2",
+    "fp8_e5m2": "fp8e5m2",
+    "float8_e5m2": "fp8e5m2",
+    "float4_e2m1": "f4e2m1",
+    "fp4_e2m1": "f4e2m1",
+    "float4_e1m2": "f4e1m2",
+    "fp4_e1m2": "f4e1m2",
 }
 
 
@@ -49,14 +59,18 @@ def resolve_cube_macs_safe(
     hf32: bool = False,
 ) -> int:
     """Resolve Cube MACs/cycle safely from canonical or full TIR dtype names."""
-    raw = str(getattr(dtype_name, "name", dtype_name) or "f16").strip().lower()
+    raw = str(getattr(dtype_name, "name", dtype_name) or "").strip().lower()
+    if not raw:
+        raise ValueError(f"Unsupported empty Cube operand dtype {dtype_name!r}")
     canon = _CUBE_DTYPE_ALIASES.get(raw, raw)
     if hf32 and canon in ("f32", "hf32"):
         canon = "hf32"
     try:
         return int(facts.cube_macs_per_cycle(canon, hf32=hf32))
-    except (ValueError, KeyError, TypeError):
-        return 256 if canon == "f32" else (2048 if canon == "hf32" else 4096)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ValueError(
+            f"Unsupported Cube operand dtype {dtype_name!r} (canonical={canon!r})"
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -125,7 +139,7 @@ class Ascend950PipeScheduleEvaluator:
         ledger_steady_state_ii: int = 0,
         pipe_scale_multipliers: Mapping[str, float] | None = None,
     ) -> Ascend950PipeScheduleResult:
-        """Compute single-wave/block continuous pipe ns, AVE score, steady II, and loop drain bubble."""
+        """Compute single-wave continuous pipe ns, AVE score, steady II, and drain bubble."""
         prof = MicroarchProfile.coerce(profile)
         scales = dict(pipe_scale_multipliers or {})
 
@@ -137,18 +151,15 @@ class Ascend950PipeScheduleEvaluator:
         aiv_cores = max(1, int(active_aiv_cores or self.facts.num_aiv_cores))
         burst_eff = max(0.10, min(1.0, float(dma_burst_efficiency or 1.0)))
 
-        # Wave multiplier for chip-wide occupancy when grid size is explicitly known.
         is_cube_work = cube_flops > 0.0 or prof.cube_mmad_count > 0 or prof.cube_macs_total > 0
         active_grid = aic_cores if is_cube_work else aiv_cores
         if total_tiles > 0:
             waves = float(max(1, math.ceil(total_tiles / max(1, active_grid))))
-            # Scale global chip FLOPs down to one block for single-wave evaluation, then scale back by waves.
             block_from_chip_scale = 1.0 / float(max(1, total_tiles))
         else:
             waves = 1.0
             block_from_chip_scale = 1.0 / float(active_grid)
 
-        # 1. CUBE pipe ns (single block across its inner loop iterations)
         cube_macs_per_cyc = float(resolve_cube_macs_safe(self.facts, cube_dtype, hf32=hf32))
         block_macs_flops = float(prof.cube_macs_total) * 2.0
         chip_cube_flops = float(cube_flops) * block_from_chip_scale
@@ -167,7 +178,6 @@ class Ascend950PipeScheduleEvaluator:
         else:
             cube_ns = 0.0
 
-        # 2. VECTOR AVE instruction + 2-Load / 1-Store UB port model (ns, single block)
         ave_weighted_issues = (
             0.5 * float(prof.fp_alu_ops)
             + 1.0 * float(prof.int_alu_ops)
@@ -179,12 +189,10 @@ class Ascend950PipeScheduleEvaluator:
         vec_block_flops = float(vec_flops) * block_from_chip_scale
         aiv_peak_flops_per_ns = 128.0 * self.clock_ghz
         vec_flop_ns = vec_block_flops / max(1e-6, aiv_peak_flops_per_ns)
-        # Convert weighted 256B-vector issue beats into ns (@ clock_ghz)
         ave_issue_ns = (ave_weighted_issues * 8.0) / max(0.1, self.clock_ghz)
         cv_vec_factor = 0.5 if is_coupled_1c2v else 1.0
         ave_compute_ns = max(vec_flop_ns, ave_issue_ns) * cv_vec_factor
 
-        # 2 Load ports (512B/cycle read) + 1 Store port (256B/cycle write)
         ub_load_ns = (float(prof.ub_load_bytes) / 512.0) / max(0.1, self.clock_ghz)
         ub_store_ns = (float(prof.ub_store_bytes) / 256.0) / max(0.1, self.clock_ghz)
         if ub_store_ns >= ub_load_ns:
@@ -199,7 +207,6 @@ class Ascend950PipeScheduleEvaluator:
         else:
             vector_ns = 0.0
 
-        # 3. Transfer pipes (MTE1, MTE2, MTE3, FIXPIPE) with directional multipliers (single block)
         mte1_bytes = float(prof.l1_to_l0a_bytes + prof.l1_to_l0b_bytes)
         mte1_ns = (
             (mte1_bytes * MS_PIPE_SLOPE_US_PER_BYTE["MTE1"] + MS_PIPE_INTERCEPT_US["MTE1"]) * 1000.0 * _scale("MTE1")
@@ -254,7 +261,6 @@ class Ascend950PipeScheduleEvaluator:
         else:
             dom_pipe, max_pipe_block_ns = "VECTOR", 0.0
 
-        # Blend solved Z3 II if present (convert cycles -> ns @ clock_ghz) as a consistency check.
         if ledger_steady_state_ii > 0:
             z3_ii_ns = (float(ledger_steady_state_ii) / max(0.1, self.clock_ghz)) * waves
             if z3_ii_ns > max_pipe_block_ns and max_pipe_block_ns > 0.0:
@@ -266,7 +272,6 @@ class Ascend950PipeScheduleEvaluator:
         per_iter_ii_ns = max_pipe_block_ns / float(trips)
         non_dom_tail_ns = max(0.0, total_active_sum - max_pipe_block_ns)
         if depth > 1 and total_active_sum > max_pipe_block_ns:
-            # Estimate fill/drain bubble accurately without double-counting trips (counters already sum over loop).
             drain_bubble_ns = min(non_dom_tail_ns, float(depth - 1) * per_iter_ii_ns * 0.65)
             overlap_efficiency = max(0.0, min(1.0, float(trips - 1) / float(trips + depth - 1)))
             residual_non_dom = non_dom_tail_ns * (1.0 - overlap_efficiency)
@@ -275,7 +280,6 @@ class Ascend950PipeScheduleEvaluator:
             drain_bubble_ns = non_dom_tail_ns * 0.65
             loop_total_ns = max_pipe_block_ns + drain_bubble_ns
 
-        # Add explicit cross-core & PIPE_ALL serialization penalties (in ns) scaled by waves
         sync_ns = waves * (float(prof.cv_sync_barriers) * 80.0 + float(prof.pipe_all_barriers) * 180.0)
         total_ns = loop_total_ns + sync_ns
         return Ascend950PipeScheduleResult(

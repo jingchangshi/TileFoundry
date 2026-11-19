@@ -181,7 +181,7 @@ def _compile_blueprint_safe(
             anchor_dims=anchor_dims,
             target=target,
         )
-    except Exception:
+    except (FileNotFoundError, OSError):
         return None
 
 

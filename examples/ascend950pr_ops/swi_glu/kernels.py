@@ -37,7 +37,6 @@ def _select_swi_glu_config(
     ub_budget = 256 * 1024 - 4096 if schedule_mode == "tuned" else 192 * 1024
 
     if inner_dim > 1:
-        # Non-last-dim split: contiguous [outer, 2, w_total] layout with zero transpose copies
         w_tile = 2048 if tl_dtype == "float32" else 4096
         stages = 2 if schedule_mode == "tuned" else 1
         return {
@@ -69,7 +68,6 @@ def _select_swi_glu_config(
             "compile_flags": list(PURE_SIMDVF_UBUF_FLAGS) if schedule_mode == "tuned" else [],
         }
 
-    # Narrow unaligned rows (e.g. half_dim=7 or unaligned fp32 half_dim=50): 1D contiguous DMA + SimtVF
     if half_dim <= 32 or (tl_dtype == "float32" and (half_dim % 16) != 0 and half_dim <= 64):
         rows_blk = 256 if half_dim <= 16 else (64 if half_dim <= 32 else 32)
         if m_rows < 56 * rows_blk * 2:
@@ -100,7 +98,6 @@ def _select_swi_glu_config(
         max_rows = max(1, min(64, ub_budget // max(1, row_bytes)))
         if (half_dim % 64) != 0:
             max_rows = min(max_rows, 32)
-        # Ensure at least 2 pipelined blocks per core when m_rows is large enough
         if max_rows > 1 and m_rows >= 112 and m_rows < 56 * max_rows * 2:
             max_rows = max(1, min(max_rows, max(1, m_rows // 112)))
         elif max_rows > 1 and m_rows < 56 * max_rows:
@@ -489,14 +486,12 @@ def swi_glu(input: torch.Tensor, dim: int = -1, *, schedule_mode: str = "tuned")
     if input.shape[norm_dim] % 2 != 0:
         raise ValueError(f"split dim size must be even, got {input.shape[norm_dim]}")
 
-    # CPU fallback / simulation path for offline unit verification
     if input.device.type != "npu":
         out_dtype = input.dtype
         xf = input.to(torch.float32)
         x0, x1 = xf.chunk(2, dim=norm_dim)
         return (F.silu(x0) * x1).to(out_dtype)
 
-    # NPU TileLang compiled kernel path
     tl_dtype = {
         torch.float16: "float16",
         torch.bfloat16: "bfloat16",

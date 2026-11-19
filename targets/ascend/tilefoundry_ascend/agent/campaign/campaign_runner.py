@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -979,7 +980,7 @@ def _is_real_tir_primfunc(obj: object) -> bool:
         tir_mod = getattr(tvm, "tir", None)
         prim_cls = getattr(tirx_mod, "PrimFunc", None) or getattr(tir_mod, "PrimFunc", None)
         return isinstance(prim_cls, type) and isinstance(obj, prim_cls)
-    except Exception:
+    except ImportError:
         return False
 
 
@@ -1337,10 +1338,10 @@ class PerfTargetCampaignRunner:
         op_slug = self._config.operator_name.replace("/", "_")
         self._run_id = f"{op_slug}_{int(time.time())}_{os.getpid()}"
         self._case_dims_cache: dict[int, dict[str, object]] = {}
-        if self._experience_lake_dir is not None:
+        if self._experience_lake_dir is not None and self._experience_lake_dir.exists():
             try:
                 self._cost_model.replay_experience_lake(self._experience_lake_dir)
-            except Exception as exc:
+            except (OSError, json.JSONDecodeError) as exc:
                 logger.debug("ExperienceLake startup replay skipped: %s", exc)
         self._freedom_masks: dict[str, ConstraintRelaxationMask] = {}
         self._live_regime_plans: dict[str, RegimePlanResult] = {}
@@ -1362,7 +1363,7 @@ class PerfTargetCampaignRunner:
                 )
                 short_op = self._config.operator_name.rsplit("/", 1)[-1]
                 self._sil_advisory = extractor.extract(short_op)
-            except Exception:
+            except (FileNotFoundError, OSError, KeyError):
                 self._sil_advisory = None
         if isinstance(topology_axes, TopologyAxes):
             self._topology_axes: TopologyAxes | None = topology_axes
@@ -1506,7 +1507,7 @@ class PerfTargetCampaignRunner:
                     str(cand_path),
                     anchors_to_collect,
                 )
-        except Exception as exc:
+        except (OSError, subprocess.SubprocessError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
             logger.warning("On-demand msprof collection failed: %s", exc)
             return
 
@@ -1545,7 +1546,7 @@ class PerfTargetCampaignRunner:
                     anchor_dims=regime_spec.representative_hir_dims,
                     target=self._target,
                 )
-            except Exception as exc:
+            except (FileNotFoundError, OSError) as exc:
                 logger.warning(
                     "Failed to compile HIR navigation packet for regime %s: %s",
                     regime_spec.regime_tag,
@@ -1639,7 +1640,7 @@ class PerfTargetCampaignRunner:
             resolved = resolve_regime_config(module_source, regime_spec, dims=dims)
             for k, v in resolved.builder_kwargs.items():
                 dims.setdefault(k, v)
-        except Exception:
+        except (AttributeError, KeyError, TypeError, ValueError):
             pass
         dims["trackb_src"] = cpp_source
         with tempfile.TemporaryDirectory(prefix="tf_trackb_inst_") as tmp_dir:
@@ -1737,7 +1738,16 @@ class PerfTargetCampaignRunner:
         )
         try:
             resolved = resolve_regime_config(module_source, regime_spec, dims=anchor_dims)
-        except Exception as exc:
+        except (
+            SyntaxError,
+            AttributeError,
+            ImportError,
+            KeyError,
+            NameError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
             return StageAResult(
                 passed=False,
                 prim_func=None,
@@ -1830,7 +1840,16 @@ class PerfTargetCampaignRunner:
         )
         try:
             resolved = resolve_regime_config(module_source, regime_spec, dims=anchor_dims)
-        except Exception as exc:
+        except (
+            SyntaxError,
+            AttributeError,
+            ImportError,
+            KeyError,
+            NameError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
             return StageBResult(
                 passed=False,
                 error_message=f"l1_config_resolve_error: {type(exc).__name__}: {exc}",
@@ -2148,7 +2167,7 @@ class PerfTargetCampaignRunner:
                     env_file=self._env_file,
                 )
             )
-        except Exception:
+        except (FileNotFoundError, OSError, KeyError, ValueError):
             for spec in self._regime_specs:
                 if regime_tag and spec.regime_tag == regime_tag:
                     dims = dict(spec.representative_anchor_dims or spec.representative_hir_dims)
@@ -2181,7 +2200,7 @@ class PerfTargetCampaignRunner:
                 operator_name=self._config.operator_name,
                 round_idx=round_idx,
             )
-        except Exception as exc:
+        except (OSError, ValueError) as exc:
             logger.debug("KB event shard append skipped: %s", exc)
 
     def _record_surrogate_observations(
@@ -2252,7 +2271,7 @@ class PerfTargetCampaignRunner:
                         subkernel_count=max(1, merged_prof.subkernel_count),
                     )
                 )
-            except Exception as exc:
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
                 logger.debug("ExperienceLake register_candidate skipped: %s", exc)
 
         parent_by_case = (
@@ -2327,7 +2346,7 @@ class PerfTargetCampaignRunner:
                             projected_contig_bytes=int(proj_wl.get("contig_burst_bytes", 32768) or 32768),
                         )
                     )
-                except Exception as exc:
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
                     logger.debug("ExperienceLake append_observation skipped: %s", exc)
 
             try:
@@ -2374,7 +2393,7 @@ class PerfTargetCampaignRunner:
                         refit=False,
                     )
                     delta_count += 1
-            except Exception as exc:
+            except (OSError, ValueError) as exc:
                 logger.debug("Cost model online observation skipped: %s", exc)
 
         if delta_count > 0:
@@ -2399,7 +2418,7 @@ class PerfTargetCampaignRunner:
         if self._regime_specs:
             try:
                 stage_a = self._run_l0(source, self._regime_specs[0])
-            except Exception:
+            except (SyntaxError, RuntimeError, ValueError, TypeError, OSError):
                 stage_a = None
         ledger = stage_a.ledger if stage_a is not None else None
         axes = self._derive_topology_axes(
@@ -2429,7 +2448,7 @@ class PerfTargetCampaignRunner:
                         dsl_line_count=len(source.splitlines()),
                     )
                 )
-            except Exception as exc:
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
                 logger.debug("ExperienceLake register L4 candidate skipped: %s", exc)
 
         by_case_anchor = {int(a.case_num): a for a in active_anchors}
@@ -2453,7 +2472,7 @@ class PerfTargetCampaignRunner:
                         cannbench_repo=self._cannbench_repo,
                         env_file=self._env_file,
                     )
-                except Exception:
+                except (FileNotFoundError, OSError, KeyError, ValueError):
                     ref_perf, t_hw = 0.0, 0.0
             sp = float(l4_result.per_case_speedups.get(cnum, 0.0) or 0.0)
             if sp <= 0.0 and ref_perf > 0.0 and elapsed_us > 0.0:
@@ -2494,7 +2513,7 @@ class PerfTargetCampaignRunner:
                             projected_contig_bytes=int(proj_wl.get("contig_burst_bytes", 32768) or 32768),
                         )
                     )
-                except Exception as exc:
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
                     logger.debug("ExperienceLake L4 append skipped: %s", exc)
             try:
                 self._cost_model.observe(
@@ -2504,7 +2523,7 @@ class PerfTargetCampaignRunner:
                     refit=False,
                 )
                 observed += 1
-            except Exception as exc:
+            except (OSError, ValueError) as exc:
                 logger.debug("Cost model L4 observe skipped: %s", exc)
         if observed > 0:
             self._cost_model._refit_ridge()
@@ -2968,7 +2987,7 @@ class PerfTargetCampaignRunner:
                 regime_beam.mark_parent_selected(stone)
                 hyp = stone.hypothesis if stone.worker_kind == "creative_explore" else ""
                 return stone_patched, hydrated_snippet, "stepping_stone", stone, hyp
-            except Exception as exc:
+            except (SyntaxError, ValueError, KeyError) as exc:
                 logger.warning(
                     "Failed to patch stepping-stone slice %s for regime %s: %s",
                     stone.candidate_id,
@@ -3099,7 +3118,7 @@ class PerfTargetCampaignRunner:
                     cand_files.append((chunk_id, cpath))
                 try:
                     batch_res = self._run_l2_batch(cand_files, regime_anchors)
-                except Exception as exc:
+                except (OSError, subprocess.SubprocessError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
                     logger.debug("Flywheel batched ablation timing skipped: %s", exc)
                     return {}
             out: dict[str, float] = {}
@@ -3132,7 +3151,7 @@ class PerfTargetCampaignRunner:
                 if rule_obj is not None:
                     try:
                         save_distilled_rule_file(self._experience_lake_dir, rule_obj)
-                    except Exception as exc:
+                    except (OSError, ValueError) as exc:
                         logger.debug("Persisting distilled rule %s skipped: %s", rid, exc)
         return list(distill_rep.admitted_rule_ids)
 
@@ -3340,11 +3359,11 @@ class PerfTargetCampaignRunner:
                     self._experience_lake_dir,
                     exclude_run_id=self._run_id,
                 )
-            except Exception as exc:
+            except (OSError, json.JSONDecodeError) as exc:
                 logger.debug("ExperienceLake per-round KB sync skipped: %s", exc)
             try:
                 self._cost_model.replay_experience_lake(self._experience_lake_dir)
-            except Exception as exc:
+            except (OSError, json.JSONDecodeError) as exc:
                 logger.debug("ExperienceLake per-round cost replay skipped: %s", exc)
         parent_cost_pred = self._cost_model.predict(
             parent_workload,
@@ -3406,7 +3425,7 @@ class PerfTargetCampaignRunner:
                         )
                     else:
                         escalated_trackb_tu = raw_tu
-                except Exception as exc:
+                except (ImportError, OSError, RuntimeError, ValueError) as exc:
                     logger.warning("Track-B PrimFunc escalation lowering skipped: %s", exc)
         else:
             self._freedom_masks.setdefault(regime_spec.regime_tag, active_mask)
@@ -3474,7 +3493,15 @@ class PerfTargetCampaignRunner:
                 prescreen_factory = resolved_cfg.builder_name
                 prescreen_pc = dict(resolved_cfg.pass_configs)
                 prescreen_cf = resolved_cfg.compile_flags
-            except Exception as exc:
+            except (
+                SyntaxError,
+                AttributeError,
+                ImportError,
+                KeyError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as exc:
                 logger.warning(
                     "Failed to resolve prescreen config for regime %s: %s",
                     regime_spec.regime_tag,
@@ -3540,7 +3567,7 @@ class PerfTargetCampaignRunner:
         ) -> tuple[str, str, AscendCausalRule | None, str | None, str, str, bool]:
             try:
                 raw = await backend.generate(req)
-            except Exception as exc:
+            except (OSError, subprocess.SubprocessError, TimeoutError, RuntimeError, ConnectionError) as exc:
                 return wid, wkind, rule, None, "", f"llm_transport:{type(exc).__name__}:{exc}", True
             try:
                 if wkind == "creative_explore":
@@ -3556,7 +3583,7 @@ class PerfTargetCampaignRunner:
                     snippet = extract_python_dsl(raw)
                     hypothesis_text = ""
                 return wid, wkind, rule, snippet, hypothesis_text, "", False
-            except Exception as exc:
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 return wid, wkind, rule, None, "", f"llm_parse:{type(exc).__name__}:{exc}", False
 
         worker_replies = await asyncio.gather(
@@ -3679,7 +3706,7 @@ class PerfTargetCampaignRunner:
                     cand_paths.append((chk.candidate_id, cand_file))
                 try:
                     l2_results = self._run_l2_batch(cand_paths, active_anchors)
-                except Exception as exc:
+                except (OSError, subprocess.SubprocessError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
                     logger.warning(
                         "Round %d L2 batch failed after retries: %s",
                         round_idx,
@@ -3854,7 +3881,7 @@ class PerfTargetCampaignRunner:
             )
             try:
                 _, canonical_slice = extract_regime_snippet(chk.patched_module_source, regime_spec)
-            except Exception:
+            except (SyntaxError, ValueError):
                 canonical_slice = chk.snippet_source
 
             beam_updates.append(
@@ -3956,7 +3983,7 @@ class PerfTargetCampaignRunner:
                     )
                 )
                 admitted_rule_ids.extend(round_admitted)
-            except Exception as exc:
+            except (OSError, subprocess.SubprocessError, TimeoutError, RuntimeError, ValueError) as exc:
                 logger.warning(
                     "Flywheel distillation failed for regime %s: %s",
                     regime_spec.regime_tag,
@@ -3981,7 +4008,7 @@ class PerfTargetCampaignRunner:
                 if rule_obj is not None:
                     try:
                         save_distilled_rule_file(self._experience_lake_dir, rule_obj)
-                    except Exception as exc:
+                    except (OSError, ValueError) as exc:
                         logger.debug("Persisting promoted rule %s skipped: %s", rid, exc)
 
         record = CampaignRoundRecord(
@@ -4046,7 +4073,7 @@ class PerfTargetCampaignRunner:
             if self._regime_specs:
                 try:
                     base_sa = self._run_l0(incumbent_source, self._regime_specs[0])
-                except Exception:
+                except (SyntaxError, RuntimeError, ValueError, TypeError, OSError):
                     base_sa = None
             base_ledger = base_sa.ledger if base_sa is not None else None
             base_axes = self._derive_topology_axes(
@@ -4240,7 +4267,7 @@ class PerfTargetCampaignRunner:
                             dims,
                             self._regime_specs,
                         )
-                    except Exception as exc:
+                    except (FileNotFoundError, OSError, KeyError, ValueError) as exc:
                         logger.warning(
                             "Failed to resolve regime for regressed case %s: %s",
                             cnum,

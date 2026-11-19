@@ -26,7 +26,14 @@ EXEMPT_PREFIXES = (
     "tests/core/models/decode_oracle.py",
     "tests/core/models/dense_decode.py",
     "targets/nvidia/tilefoundry_nvidia/cuda/models/",
-    "examples/",
+    "examples/granite_4_0_h_small-cuda/",
+    "examples/minicpm3_4b-cutedsl/",
+    "examples/nemotron_3_5_lightning_30b_a3b-tilelang/",
+    "examples/qwen3_1_7b-tilelang/",
+    "examples/qwen3_5_35b_a3b-tilelang/",
+    "examples/qwen3_8_27b_prefill-tilelang/",
+    "examples/qwen3_8_27b_prefill_short-tilelang/",
+    "examples/qwen_prefill-amx/",
 )
 DIRECTIVE_PREFIXES = ("ruff:", "noqa", "type:", "pragma:", "mypy:", "fmt:", "isort:")
 PYTHON_SUFFIXES = frozenset({".py"})
