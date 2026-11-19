@@ -992,17 +992,23 @@ class PerfTargetCampaignRunner:
             if target_module_path is not None
             else (self._source_root / get_operator_module_relpath(config.operator_name)).resolve()
         )
+        self._env_file = Path(env_file).resolve() if env_file is not None else None
+        self._cannbench_repo = Path(cannbench_repo).resolve() if cannbench_repo is not None else None
         self._perf_target = perf_target or get_default_perf_target(config.operator_name)
         self._initial_anchors = tuple(
-            anchors if anchors is not None else get_default_anchors(config.operator_name)
+            anchors
+            if anchors is not None
+            else get_default_anchors(
+                config.operator_name,
+                cannbench_repo=self._cannbench_repo,
+                env_file=self._env_file,
+            )
         )
         self._regime_specs = tuple(
             regime_specs
             if regime_specs is not None
             else get_default_regime_specs(config.operator_name)
         )
-        self._env_file = Path(env_file).resolve() if env_file is not None else None
-        self._cannbench_repo = Path(cannbench_repo).resolve() if cannbench_repo is not None else None
         self._backend = llm_backend
         self._tracker = tracker or BayesianRuleTracker.from_seed_yaml()
         base_ew = beam.exploit_width if beam is not None else 2

@@ -213,12 +213,38 @@ ATTENTION_RESIDUAL_ANCHORS: tuple[AnchorCaseSpec, ...] = (
 )
 
 MLA_ANCHORS: tuple[AnchorCaseSpec, ...] = (
-    AnchorCaseSpec("level4/mla", 1, "prefill_compute", 69.16, 23.0568),
-    AnchorCaseSpec("level4/mla", 6, "prefill_compute", 223.696, 74.5654),
-    AnchorCaseSpec("level4/mla", 7, "split_kv_decode", 4.558, 1.5192),
-    AnchorCaseSpec("level4/mla", 11, "split_kv_decode", 174.88, 102.9511),
-    AnchorCaseSpec("level4/mla", 13, "bnsd_gather", 69.13, 23.0568),
+    AnchorCaseSpec("level4/mla", 1, "prefill_compute", 34.8532, 11.6177),
+    AnchorCaseSpec("level4/mla", 6, "prefill_compute", 30.7423, 10.2474),
+    AnchorCaseSpec("level4/mla", 7, "split_kv_decode", 4.5577, 1.5192),
+    AnchorCaseSpec("level4/mla", 11, "split_kv_decode", 68.6341, 22.8780),
+    AnchorCaseSpec("level4/mla", 13, "bnsd_gather", 34.8532, 11.6177),
 )
+
+
+def _hydrate_anchors_from_metadata(
+    anchors: Sequence[AnchorCaseSpec],
+    meta_950pr: Mapping[int, tuple[float, float]],
+) -> tuple[AnchorCaseSpec, ...]:
+    """Hydrate reference and hardware-limit timings from live 950pr metadata."""
+    hydrated: list[AnchorCaseSpec] = []
+    for anchor in anchors:
+        entry = meta_950pr.get(int(anchor.case_num))
+        if entry is not None:
+            ref_val = float(entry[0])
+            hw_val = float(entry[1])
+            if hw_val > 0.0:
+                hydrated.append(
+                    AnchorCaseSpec(
+                        task=anchor.task,
+                        case_num=anchor.case_num,
+                        regime_tag=anchor.regime_tag,
+                        ref_perf_us=ref_val if ref_val > 0.0 else anchor.ref_perf_us,
+                        t_hw_us=hw_val,
+                    )
+                )
+                continue
+        hydrated.append(anchor)
+    return tuple(hydrated)
 
 DEFAULT_ANCHORS: dict[str, tuple[AnchorCaseSpec, ...]] = {
     "attention_residual": ATTENTION_RESIDUAL_ANCHORS,
@@ -886,7 +912,7 @@ class CannbenchOpsRegistry:
                 )
 
         if op_id in DEFAULT_ANCHORS:
-            anchors = DEFAULT_ANCHORS[op_id]
+            anchors = _hydrate_anchors_from_metadata(DEFAULT_ANCHORS[op_id], meta_950pr)
         else:
             anchors = _stratify_operator_anchors(task, cases, meta_950pr)
 
@@ -1103,11 +1129,23 @@ def get_operator_entrypoint(operator_name: str) -> str:
     return CannbenchOpsRegistry.default().resolve(operator_name).entrypoint
 
 
-def get_default_anchors(operator_name: str) -> tuple[AnchorCaseSpec, ...]:
-    """Return stratified anchor cases for attention_residual, mla, or any cann-bench op."""
-    if operator_name in DEFAULT_ANCHORS:
-        return DEFAULT_ANCHORS[operator_name]
-    return CannbenchOpsRegistry.default().get_anchors(operator_name)
+def get_default_anchors(
+    operator_name: str,
+    *,
+    cannbench_repo: str | Path | None = None,
+    env_file: str | Path | None = None,
+) -> tuple[AnchorCaseSpec, ...]:
+    """Return stratified anchor cases hydrated from live 950pr metadata when available."""
+    try:
+        if cannbench_repo is not None or env_file is not None:
+            repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
+            tasks_root = resolve_cannbench_tasks_root(repo)
+            return CannbenchOpsRegistry(tasks_root=tasks_root).get_anchors(operator_name)
+        return CannbenchOpsRegistry.default().get_anchors(operator_name)
+    except (FileNotFoundError, KeyError):
+        if operator_name in DEFAULT_ANCHORS:
+            return DEFAULT_ANCHORS[operator_name]
+        raise
 
 
 def get_default_perf_target(operator_name: str) -> PerfTargetSpec:

@@ -3668,6 +3668,58 @@ def _build_reg_a(tile_m=1):
     assert probe_metrics["speedup"] == 2.5
 
 
+def test_default_anchors_hydrate_live_metadata_from_cannbench_repo(tmp_path: Path) -> None:
+    """Verify get_default_anchors hydrates live 950pr.json values for DEFAULT_ANCHORS ops."""
+    repo = tmp_path / "live_cannbench"
+    mla_dir = repo / "tasks" / "level4" / "mla"
+    meta_dir = repo / "tasks" / "metadata"
+    mla_dir.mkdir(parents=True, exist_ok=True)
+    meta_dir.mkdir(parents=True, exist_ok=True)
+
+    (mla_dir / "proto.yaml").write_text("operator:\n  name: MLA\n", encoding="utf-8")
+    (mla_dir / "cases.yaml").write_text(
+        "cases:\n"
+        "- case_id: 1\n  input_shape: [[2, 64, 128, 512]]\n  dtype: [float16]\n  attrs: {inputLayout: BSND}\n"
+        "- case_id: 6\n  input_shape: [[1, 128, 128, 448]]\n  dtype: [float16]\n  attrs: {inputLayout: BSND}\n"
+        "- case_id: 7\n  input_shape: [[1, 1, 128, 512]]\n  dtype: [float16]\n  attrs: {inputLayout: BSND}\n"
+        "- case_id: 11\n  input_shape: [[128, 1, 128, 512]]\n  dtype: [float16]\n  attrs: {inputLayout: BSND}\n"
+        "- case_id: 13\n  input_shape: [[2, 128, 64, 512]]\n  dtype: [float16]\n  attrs: {inputLayout: BNSD}\n",
+        encoding="utf-8",
+    )
+    meta_payload = {
+        "level4": {
+            "mla": {
+                "1": {"baseline_perf_us": 41.25, "t_hw_us": 13.75},
+                "6": {"baseline_perf_us": 30.7423, "t_hw_us": 10.2474},
+                "7": {"baseline_perf_us": 5.25, "t_hw_us": 1.75},
+                "11": {"baseline_perf_us": 68.6341, "t_hw_us": 22.878},
+                "13": {"baseline_perf_us": 39.0, "t_hw_us": 12.5},
+            }
+        }
+    }
+    (meta_dir / "950pr.json").write_text(json.dumps(meta_payload), encoding="utf-8")
+
+    anchors = get_default_anchors("mla", cannbench_repo=repo)
+    assert [a.case_num for a in anchors] == [1, 6, 7, 11, 13]
+    assert [a.regime_tag for a in anchors] == [
+        "prefill_compute",
+        "prefill_compute",
+        "split_kv_decode",
+        "split_kv_decode",
+        "bnsd_gather",
+    ]
+    by_case = {a.case_num: a for a in anchors}
+    assert abs(by_case[1].ref_perf_us - 41.25) < 1e-6
+    assert abs(by_case[1].t_hw_us - 13.75) < 1e-6
+    assert abs(by_case[6].ref_perf_us - 30.7423) < 1e-6
+    assert abs(by_case[6].t_hw_us - 10.2474) < 1e-6
+    assert abs(by_case[11].ref_perf_us - 68.6341) < 1e-6
+    assert abs(by_case[11].t_hw_us - 22.878) < 1e-6
+    assert abs(by_case[13].ref_perf_us - 39.0) < 1e-6
+    assert abs(by_case[13].t_hw_us - 12.5) < 1e-6
+
+
+
 
 
 
