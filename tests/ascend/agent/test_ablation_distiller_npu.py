@@ -1,6 +1,5 @@
 """Live Ascend 950 NPU verification for WP6 flywheel micro-probe synthesis and admission."""
 
-import json
 import os
 from pathlib import Path
 
@@ -84,18 +83,19 @@ def test_live_flywheel_micro_probe_verification_and_kb_admission(tmp_path: Path)
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("Ascend NPU device is required for live flywheel micro-probe verification.")
 
-    import tilelang
-    from tilelang.profiler import do_bench
+    import tilelang  # noqa: PLC0415
+
+    from tilefoundry_ascend.agent.probes import run_msprof_detail  # noqa: PLC0415
 
     def _npu_eval(_dsl: str, stage_a) -> StageCResult:
         assert stage_a.prim_func is not None and stage_a.ledger is not None
         try:
             kernel = tilelang.compile(stage_a.prim_func, target="ascend", out_idx=[1])
-            a = torch.randn((4, 4, 128), dtype=torch.float32, device="npu")
+            a = torch.randn((4, 4, 128), dtype=torch.float32).npu()
             out = kernel(a)
             torch.npu.synchronize()
-            torch.testing.assert_close(out.cpu(), a.sum(dim=0).cpu(), atol=1e-4, rtol=1e-4)
-            prof = do_bench(lambda: kernel(a), backend="msprof_detail", _n_warmup=2, _n_repeat=5)
+            torch.testing.assert_close(out.cpu(), a.cpu().sum(dim=0), atol=1e-4, rtol=1e-4)
+            prof = run_msprof_detail(lambda: kernel(a), n_warmup=2, n_repeat=5)
             tel = {"dur_us": float(prof.dur_us), "aiv_vec": float(prof.aiv_vec), "aiv_mte2": float(prof.aiv_mte2)}
             return StageCResult(
                 passed=True,

@@ -1,10 +1,9 @@
 """Live isolated agy + Ascend 950 NPU end-to-end evolution test from HIR models."""
 
 import asyncio
-import json
 import os
-from pathlib import Path
 import shutil
+from pathlib import Path
 
 import pytest
 import torch
@@ -292,9 +291,12 @@ def _require_live_npu_and_agy() -> AgyCliLLMBackend:
 
 
 def _ar_npu_device_runner(_dsl_source: str, stage_a) -> StageCResult:
-    import tilelang
-    from tilelang.profiler import do_bench
-    from tests.ascend.benchmarks.attention_residual.golden import attention_residual as ar_golden
+    import tilelang  # noqa: PLC0415
+
+    from tests.ascend.benchmarks.attention_residual.golden import (  # noqa: PLC0415
+        attention_residual as ar_golden,
+    )
+    from tilefoundry_ascend.agent.probes import run_msprof_detail  # noqa: PLC0415
 
     assert stage_a.prim_func is not None and stage_a.ledger is not None
     torch.manual_seed(7)
@@ -319,7 +321,11 @@ def _ar_npu_device_runner(_dsl_source: str, stage_a) -> StageCResult:
         rtol=2e-2,
         atol=2e-2,
     )
-    prof = do_bench(lambda: kernel(v_flat, x_flat, w_npu, g_npu, 0.5, 1e-6), backend="msprof_detail", _n_warmup=2, _n_repeat=5)
+    prof = run_msprof_detail(
+        lambda: kernel(v_flat, x_flat, w_npu, g_npu, 0.5, 1e-6),
+        n_warmup=2,
+        n_repeat=5,
+    )
     tel = {
         "dur_us": float(prof.dur_us),
         "aic_mac_ratio": float(prof.aic_mad),
@@ -337,9 +343,10 @@ def _ar_npu_device_runner(_dsl_source: str, stage_a) -> StageCResult:
 
 
 def _mla_npu_device_runner(_dsl_source: str, stage_a) -> StageCResult:
-    import tilelang
-    from tilelang.profiler import do_bench
-    from tests.ascend.benchmarks.mla.golden import mla as mla_golden
+    import tilelang  # noqa: PLC0415
+
+    from tests.ascend.benchmarks.mla.golden import mla as mla_golden  # noqa: PLC0415
+    from tilefoundry_ascend.agent.probes import run_msprof_detail  # noqa: PLC0415
 
     assert stage_a.prim_func is not None and stage_a.ledger is not None
     torch.manual_seed(11)
@@ -367,7 +374,11 @@ def _mla_npu_device_runner(_dsl_source: str, stage_a) -> StageCResult:
         rtol=2e-2,
         atol=2e-2,
     )
-    prof = do_bench(lambda: kernel(qn_f, qr_f, kn_n, kr_n, v_n, scale), backend="msprof_detail", _n_warmup=2, _n_repeat=5)
+    prof = run_msprof_detail(
+        lambda: kernel(qn_f, qr_f, kn_n, kr_n, v_n, scale),
+        n_warmup=2,
+        n_repeat=5,
+    )
     tel = {
         "dur_us": float(prof.dur_us),
         "aic_mac_ratio": float(prof.aic_mad),

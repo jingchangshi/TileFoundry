@@ -1,11 +1,11 @@
-"""Unified Wave-5 E2E integration tests: SIL + Solver + Router + Templates + CostModel + Marathon."""
+"""Unified Wave-5 E2E tests: SIL, Solver, Router, Templates, CostModel, and Marathon."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 import shutil
+from pathlib import Path
 
 import pytest
 import torch
@@ -66,18 +66,10 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
 )
 from tilefoundry_ascend.agent.orchestrator.twin_bridge import CannbenchContractOracle
 from tilefoundry_ascend.agent.router.capability_gate import (
-    route_execution_track,
     route_from_op_spec,
-)
-from tilefoundry_ascend.ascend.sil.schema import (
-    VALID_COMPUTE_ENGINES,
-    VALID_ITERATION_REGULARITIES,
-    VALID_MEMORY_RINGS,
-    TopologyAxes,
 )
 from tilefoundry_ascend.ascend.cost_model import (
     HybridAscendCostModel,
-    predict_cannbench_eq3_score,
 )
 from tilefoundry_ascend.ascend.ir.tir.instructions import AscendGmToUb, AscendUbToGm
 from tilefoundry_ascend.ascend.passes.physical_ledger import build_objective_physical_ledger
@@ -88,14 +80,19 @@ from tilefoundry_ascend.ascend.schedule.pipeline_solver import (
 from tilefoundry_ascend.ascend.schedule.regime_solver import RegimePiecewiseSolver
 from tilefoundry_ascend.ascend.sil import (
     AdvisoryEnvelope,
-    HardwareLegalityBounds,
     OpAdvisoryExtractor,
     PolicyEnvelope,
     RegimeSlice,
-    SILVerifier,
     SchedulePolicy,
     SchedulingEnvelope,
+    SILVerifier,
     verify_policy_envelope,
+)
+from tilefoundry_ascend.ascend.sil.schema import (
+    VALID_COMPUTE_ENGINES,
+    VALID_ITERATION_REGULARITIES,
+    VALID_MEMORY_RINGS,
+    TopologyAxes,
 )
 from tilefoundry_ascend.ascend.target import AscendTarget
 from tilefoundry_ascend.ascend.templates import (
@@ -151,7 +148,7 @@ def _make_static_ub_loop(*, max_stage: int = 1, max_versions: int = 2, with_pipe
 
 
 def test_all_10_implemented_ops_resolve_metadata_and_regime_selectors() -> None:
-    """Verify all 10 implemented operator packages resolve cleanly through anchor_specs & campaign_runner."""
+    """Verify all 10 implemented ops resolve through anchor_specs and campaign_runner."""
     root = default_source_root()
     registry = CannbenchOpsRegistry(tasks_root=_cannbench_tasks_dir(), source_root=root)
 
@@ -188,7 +185,7 @@ def test_all_10_implemented_ops_resolve_metadata_and_regime_selectors() -> None:
 
 
 def test_all_60_cannbench_ops_unified_sil_router_solver_template_cost_pipeline(tmp_path: Path) -> None:
-    """Test (a): All 60 ops flow through OpAdvisoryExtractor -> Router -> Solver -> SILVerifier -> Templates -> CostModel."""
+    """Test (a): All 60 ops flow through SIL, Router, Solver, Templates, and CostModel."""
     ops_root = _cannbench_tasks_dir()
     extractor = OpAdvisoryExtractor(ops_root)
     advisories = extractor.extract_all()
@@ -226,7 +223,6 @@ def test_all_60_cannbench_ops_unified_sil_router_solver_template_cost_pipeline(t
         report = verify_policy_envelope(policy_envelope, advisory)
         assert report.passed is True, f"{op_name} failed SILVerifier: {report.errors}"
 
-        # Ensure SchedulingEnvelope JSON roundtrip works for every operator
         sched_env = SchedulingEnvelope(
             advisory=advisory,
             policy=policy_envelope,
@@ -236,7 +232,6 @@ def test_all_60_cannbench_ops_unified_sil_router_solver_template_cost_pipeline(t
 
         for regime in advisory.regimes:
             pol = policy_envelope.policies[regime.regime_tag]
-            # Verify SchedulePolicy and SchedulePolicy.to_dict() pass seamlessly into verifier, templates, and cost model
             assert verifier.verify(pol, advisory).passed is True
 
             rendered_via_reg = tmpl_reg.render_template(route.topology_axes, pol, track="both")
@@ -245,7 +240,6 @@ def test_all_60_cannbench_ops_unified_sil_router_solver_template_cost_pipeline(t
             assert rendered_via_dict.prim_func is not None
             assert "Kernel" in rendered_via_reg.ascendc_cpp or "AscendC" in rendered_via_reg.ascendc_cpp
 
-            # Merge workload FLOPs/bytes with SchedulePolicy.to_dict() and score via Eq.3/HAP
             gm_bytes = float(advisory.roofline.get("median_gm_bytes") or 65536)
             uses_cube = bool(advisory.structural_features.get("uses_cube", False))
             workload = {
@@ -269,7 +263,6 @@ def test_all_60_cannbench_ops_unified_sil_router_solver_template_cost_pipeline(t
     assert observed_engines == set(VALID_COMPUTE_ENGINES)
     assert observed_rings == set(VALID_MEMORY_RINGS)
     assert observed_regs == set(VALID_ITERATION_REGULARITIES)
-    # Persist and reload one SchedulingEnvelope as smoke check
     sample_adv = advisories["rms_norm"]
     sample_plan = solver.solve_all_regimes(sample_adv.regimes, op_name="rms_norm")
     saved = SchedulingEnvelope(
@@ -374,7 +367,6 @@ def test_sil_verifier_catches_invalid_policies_and_solvers_fallback_cleanly() ->
         assert rep.passed is False, f"{label} unexpectedly passed"
         assert any(expected_substr in err for err in rep.errors), (label, rep.errors)
 
-    # Clean fallback in pipeline_solver when sil_policy specifies impossible/invalid stages
     loop = _make_static_ub_loop(with_pipeline=True)
     problem, _ = extract_tir_loop_problem(
         loop,
@@ -389,7 +381,6 @@ def test_sil_verifier_catches_invalid_policies_and_solvers_fallback_cleanly() ->
     assert "invalid l1_stages" in fallback_pipe.fallback_reason
     assert fallback_pipe.assignment.ii >= 1
 
-    # Strict failure propagation in RegimePiecewiseSolver on missing PipelineSpec
     from tilefoundry.ir.hir.pipeline import PipelineError  # noqa: PLC0415
 
     unpipelined_loop = _make_static_ub_loop(with_pipeline=False)
@@ -472,20 +463,18 @@ def test_multi_round_marathon_portfolio_kb_cost_oracle_non_ar_mla(
     op_name: str,
     oracle_verify: bool,
 ) -> None:
-    """Test (c): Multi-round ExtremeCampaignRunner + PortfolioRunner + R01-R33 + CostModel + Oracle."""
+    """Test (c): Multi-round ExtremeCampaignRunner + PortfolioRunner + KB + Oracle."""
     root = default_source_root()
     src_kernel = root / get_operator_module_relpath(op_name)
     work_kernel = tmp_path / f"{op_name}_kernels.py"
     shutil.copy2(src_kernel, work_kernel)
 
-    # Confirm all 33 causal rules R01-R33 are loaded
     rules = load_seed_rules()
     rule_ids = {r.rule_id for r in rules}
     assert len(rules) >= 33
     for idx in range(1, 34):
         assert any(rid.startswith(f"R{idx:02d}_") for rid in rule_ids)
 
-    # Confirm FastCreativeAgyBackend clamps xhigh -> high
     fast_backend = FastCreativeAgyBackend()
     assert (
         fast_backend.select_effort(
@@ -501,7 +490,6 @@ def test_multi_round_marathon_portfolio_kb_cost_oracle_non_ar_mla(
     regime_specs = get_default_regime_specs(op_name)
     single_regime = (regime_specs[0],)
 
-    # Extract original regime slice and craft 2 progressively improved edits (via schedule tag comment)
     orig_text = work_kernel.read_text(encoding="utf-8")
     _, base_slice = extract_regime_snippet(orig_text, single_regime[0])
     round1_slice = f"# marathon_opt_tier=1\n{base_slice}"
@@ -577,7 +565,6 @@ def test_multi_round_marathon_portfolio_kb_cost_oracle_non_ar_mla(
                         "vloopv2_loops": 0 if tier == 0 else 2,
                     }
                 )
-                # Anchor latency scales smoothly down across tiers while guaranteeing realistic > t_hw
                 cand_us = max(t_hw * 1.05, min(ref_us * 1.5, pred.pred_us * (1.0 - 0.12 * tier)))
                 if tier == 0:
                     cand_us = max(cand_us, ref_us * 0.95)
@@ -597,7 +584,6 @@ def test_multi_round_marathon_portfolio_kb_cost_oracle_non_ar_mla(
             out[cid] = aggregate_surrogate_result(cid, op_name, metrics)
         return out
 
-    # Validate CannbenchContractOracle CPU reference execution on small cases for CPU-friendly golden ops
     if oracle_verify:
         small_case = min(
             oracle.cases,
@@ -660,14 +646,12 @@ def test_multi_round_marathon_portfolio_kb_cost_oracle_non_ar_mla(
     assert "xhigh" not in [(e or "").lower() for e in backend.efforts]
     assert all(r.creative_effort != "xhigh" for r in report.rounds)
 
-    # Verify monotonic non-decreasing best-score & best-speedup tracking
     scores = [r.best_so_far_surrogate_score for r in report.rounds]
     speedups = [r.best_so_far_speedup for r in report.rounds]
     assert scores[0] <= scores[1]
     assert speedups[0] <= speedups[1]
     assert report.best_result.avg_speedup >= report.baseline_result.avg_speedup
 
-    # Verify PortfolioRunner + SIL advisory/verification + paradigm-isolated BayesianRuleTracker directly
     portfolio_tracker = BayesianRuleTracker.from_seed_yaml()
     portfolio_funnel = GateFunnel(
         compile_runner=lambda _dsl: StageBResult(passed=True),

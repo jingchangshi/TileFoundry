@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import re
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
-import os
 from pathlib import Path
-import re
 from typing import Any
 
 VALID_HARDWARE_PIPES: tuple[str, ...] = (

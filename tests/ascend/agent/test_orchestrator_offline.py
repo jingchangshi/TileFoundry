@@ -12,7 +12,6 @@ from tilefoundry_ascend.agent import (
     GenerationRequest,
     MockLLMBackend,
     PortfolioRunner,
-    StaticDynamicResidual,
     StructuralFeatures,
     TileConfigCandidate,
     TwoLaneBeamSearch,
@@ -21,6 +20,8 @@ from tilefoundry_ascend.agent import (
     prescreen_dsl_tile_kwargs,
     prescreen_tile_configs,
 )
+from tilefoundry_ascend.agent.campaign.anchor_specs import build_anchor_var_bindings
+from tilefoundry_ascend.agent.kb import load_seed_rules
 from tilefoundry_ascend.agent.orchestrator import (
     CREATIVE_RESPONSE_SCHEMA,
     StageBResult,
@@ -37,8 +38,6 @@ from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     build_prescreen_summary_from_kwargs,
 )
 from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import evaluate_tile_candidate
-from tilefoundry_ascend.agent.campaign.anchor_specs import build_anchor_var_bindings
-from tilefoundry_ascend.agent.kb import load_seed_rules
 from tilefoundry_ascend.ascend.passes import build_objective_physical_ledger, build_scope_waterline
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
@@ -318,7 +317,7 @@ def test_residual_balanced_multipipe_and_telemetry_regimes() -> None:
 
 def test_two_lane_beam_novelty_preservation_and_roundtrip() -> None:
     """Verify stepping-stone novelty persists until selected and beam/features roundtrip."""
-    import pytest
+    import pytest  # noqa: PLC0415
 
     ledger = _make_legal_ledger(ii=500)
     res = compute_static_dynamic_residual(ledger, {"dur_us": 20.0})
@@ -407,7 +406,7 @@ def test_two_lane_beam_novelty_preservation_and_roundtrip() -> None:
 
 def test_prescreen_neighborhood_summary_and_dsl_tile_kwargs_cliff_rejection() -> None:
     """Verify aligned neighborhood rules, summary formatting, and Stage A cliff rejection."""
-    import pytest
+    import pytest  # noqa: PLC0415
 
     center = TileConfigCandidate(bm=64, bn=64, bk=64, stages=2, aiv_split=2)
     neighbors = generate_aligned_neighborhood(center, m_max=96, n_max=80, k_max=64)
@@ -620,7 +619,7 @@ def test_fp3_unmatched_rules_not_padded_and_transport_error_exempt() -> None:
 
 def test_stage_a_track_router_disabled_by_default_and_primitive_menu(monkeypatch) -> None:
     """Verify router disabled by default, signature tokens, and unconstrained prompt menu."""
-    import tilefoundry_ascend.agent.router.capability_gate as cap_gate
+    import tilefoundry_ascend.agent.router.capability_gate as cap_gate  # noqa: PLC0415
 
     calls: list[str] = []
 
@@ -876,7 +875,7 @@ def _build_mla_prefill_func(bm=64):
 
 
 def test_stage_a_binds_ascend_target_context_for_t_fill() -> None:
-    from tilelang import tvm
+    from tilelang import tvm  # noqa: PLC0415
 
     assert tvm.target.Target.current(allow_none=True) is None
     t_fill_dsl = """
@@ -899,14 +898,14 @@ def make_fill_kernel():
 
 def test_envelope_inspector_binds_target_context_and_repair_menu():
     """Verify inspect_tilelang_primfunc and syntax repair handle target context and menu."""
-    import tilelang.ascend.language as T
-    from tilelang import tvm
-    from tilelang.backend.module import create_backend_context
-    from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
-        TILELANG_ASCEND_PRIMITIVE_MENU,
+    import tilelang.ascend.language as T  # noqa: PLC0415
+    from tilelang import tvm  # noqa: PLC0415
+    from tilelang.backend.module import create_backend_context  # noqa: PLC0415
+
+    from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (  # noqa: PLC0415
         build_syntax_repair_request,
     )
-    from tilefoundry_ascend.ascend.schedule import inspect_tilelang_primfunc
+    from tilefoundry_ascend.ascend.schedule import inspect_tilelang_primfunc  # noqa: PLC0415
 
     if tvm.target.Target.current(allow_none=True) is None:
         with create_backend_context("ascend").target:
@@ -945,12 +944,16 @@ def test_envelope_inspector_binds_target_context_and_repair_menu():
 
 def test_up2_pseudo_double_buffer_residual_and_wave_burst_prescreen() -> None:
     """Verify pseudo-double-buffer serialization detector and wave*burst prescreen ranking."""
-    from tilefoundry_ascend.agent.orchestrator.residual_beam import compute_static_dynamic_residual
-    from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
+    from tilefoundry_ascend.agent.orchestrator.residual_beam import (  # noqa: PLC0415
+        compute_static_dynamic_residual,
+    )
+    from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (  # noqa: PLC0415
         TileConfigCandidate,
         prescreen_live_ir_neighborhood,
     )
-    from tilefoundry_ascend.ascend.passes.physical_ledger import build_objective_physical_ledger
+    from tilefoundry_ascend.ascend.passes.physical_ledger import (  # noqa: PLC0415
+        build_objective_physical_ledger,
+    )
 
     dyn_ledger = build_objective_physical_ledger(
         analysis_mode="exact_modulo_z3",

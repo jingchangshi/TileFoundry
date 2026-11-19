@@ -32,7 +32,7 @@ from tilefoundry_ascend.ascend.target import AscendTarget
 
 def test_capability_router_extracts_8_features_and_routes_tracks() -> None:
     """Verify phi_1..phi_8 extraction across developer, simt_vf, and manual_ssbuf tracks."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
     @T.prim_func
     def static_gemm(
@@ -833,7 +833,7 @@ def test_bayesian_rule_tracker_ranking_pruning_and_roundtrip(tmp_path: Path) -> 
 
 def test_bayesian_tracker_axis_scoped_pruning_and_isolation(tmp_path: Path) -> None:
     """Verify 3-axis TopologyAxes pruning isolates pure_vector failures from cv_coupled."""
-    from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
+    from tilefoundry_ascend.ascend.sil.schema import TopologyAxes  # noqa: PLC0415
 
     tracker = BayesianRuleTracker.from_seed_yaml()
     vec_axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
@@ -1077,21 +1077,30 @@ def test_r16_preserves_simtvf_on_indirect_gather_and_r22_to_r33_fire() -> None:
 
 def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
     """Verify real HIR/TIR scanning and structural TileLang recurrence detection."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
-    from tilefoundry.ir.core import Call, Constant, Var
-    from tilefoundry.ir.hir.function import Function as HirFunction
-    from tilefoundry.ir.hir.loop_region import LoopRegion
-    from tilefoundry.ir.hir.nn.matmul import MatMul
-    from tilefoundry.ir.hir.tensor.index_select import IndexSelect
-    from tilefoundry.ir.hir.tensor.quant import Quant
-    from tilefoundry.ir.tir.prim_function import PrimFunction
-    from tilefoundry.ir.tir.stmts import Evaluate, ExecutionScope, For, MeshScope, Sequential
-    from tilefoundry.ir.types import DType, StorageKind, TensorType, TupleType
-    from tilefoundry.ir.types.layout import Layout
-    from tilefoundry.ir.types.mesh import Mesh, Topology
-    from tilefoundry_ascend.ascend.ir.execution import SIMTVF_KIND
-    from tilefoundry_ascend.ascend.ir.tir.instructions import AscendDualCopyL0cToUb, AscendMmad
+    from tilefoundry.ir.core import Call, Constant, Var  # noqa: PLC0415
+    from tilefoundry.ir.hir.function import Function as HirFunction  # noqa: PLC0415
+    from tilefoundry.ir.hir.loop_region import LoopRegion  # noqa: PLC0415
+    from tilefoundry.ir.hir.nn.matmul import MatMul  # noqa: PLC0415
+    from tilefoundry.ir.hir.tensor.index_select import IndexSelect  # noqa: PLC0415
+    from tilefoundry.ir.hir.tensor.quant import Quant  # noqa: PLC0415
+    from tilefoundry.ir.tir.prim_function import PrimFunction  # noqa: PLC0415
+    from tilefoundry.ir.tir.stmts import (  # noqa: PLC0415
+        Evaluate,
+        ExecutionScope,
+        For,
+        MeshScope,
+        Sequential,
+    )
+    from tilefoundry.ir.types import DType, StorageKind, TensorType, TupleType  # noqa: PLC0415
+    from tilefoundry.ir.types.layout import Layout  # noqa: PLC0415
+    from tilefoundry.ir.types.mesh import Mesh, Topology  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.ir.execution import SIMTVF_KIND  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.ir.tir.instructions import (  # noqa: PLC0415
+        AscendDualCopyL0cToUb,
+        AscendMmad,
+    )
 
     gmem = StorageKind.GMEM
     x_ty = TensorType(shape=(16, 64), dtype=DType.bf16, layout=Layout((16, 64)), storage=gmem)
@@ -1215,13 +1224,13 @@ def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
 
 def test_topology_axes_routing_and_60_cannbench_ops() -> None:
     """Verify pure 3-axis TopologyAxes routing across all 60 cann-bench specs and isolation."""
-    import yaml
+    import yaml  # noqa: PLC0415
 
-    from tilefoundry_ascend.agent.router.capability_gate import (
+    from tilefoundry_ascend.agent.router.capability_gate import (  # noqa: PLC0415
         VALID_BACKEND_TIERS,
         route_from_op_spec,
     )
-    from tilefoundry_ascend.ascend.sil.schema import (
+    from tilefoundry_ascend.ascend.sil.schema import (  # noqa: PLC0415
         VALID_COMPUTE_ENGINES,
         VALID_ITERATION_REGULARITIES,
         VALID_MEMORY_RINGS,

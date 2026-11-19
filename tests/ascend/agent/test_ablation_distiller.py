@@ -262,9 +262,13 @@ def test_all_seven_mechanism_probes_extract_params_and_pass_stage_a() -> None:
 
 def test_unverifiable_stmt_rewrite_rejected_fail_closed(tmp_path: Path) -> None:
     """Verify arbitrary stmt_rewrite edits return no probe and never enter the KB."""
-    from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
-    from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
-    from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    from tilefoundry_ascend.agent.flywheel.ablation_distiller import (  # noqa: PLC0415
+        FlywheelDistiller,
+    )
+    from tilefoundry_ascend.agent.kb.bayesian_tracker import (  # noqa: PLC0415
+        BayesianRuleTracker,
+    )
+    from tilefoundry_ascend.agent.orchestrator.gate_funnel import (  # noqa: PLC0415
         GateFunnel,
         StageCResult,
     )
@@ -337,13 +341,15 @@ def test_unverifiable_stmt_rewrite_rejected_fail_closed(tmp_path: Path) -> None:
 
 def test_hardware_gate_enforces_108x_and_wait_ratio_non_regression(tmp_path: Path) -> None:
     """Verify micro-probe gate enforces 1.08x speedup default and wait-ratio checks."""
-    from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
+    from tilefoundry_ascend.agent.flywheel.ablation_distiller import (  # noqa: PLC0415
         FlywheelDistiller,
         verify_micro_probe_hardware,
     )
-    from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
-    from tilefoundry_ascend.agent.kb.schema import validate_rule_predicate
-    from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    from tilefoundry_ascend.agent.kb.bayesian_tracker import (  # noqa: PLC0415
+        BayesianRuleTracker,
+    )
+    from tilefoundry_ascend.agent.kb.schema import validate_rule_predicate  # noqa: PLC0415
+    from tilefoundry_ascend.agent.orchestrator.gate_funnel import (  # noqa: PLC0415
         GateFunnel,
         StageCResult,
     )
@@ -545,7 +551,7 @@ def make_reg_kernel(cores: int = 2):
         min_edit_gain=0.05,
         min_probe_speedup=1.08,
     )
-    from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
+    from tilefoundry_ascend.ascend.sil.schema import TopologyAxes  # noqa: PLC0415
 
     vec_axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
     rep = distiller.distill_from_pair(

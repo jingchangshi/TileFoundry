@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
 import json
 import math
 import os
-from pathlib import Path
 import re
 import sys
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import yaml

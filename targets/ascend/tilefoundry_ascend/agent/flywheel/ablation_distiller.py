@@ -2061,12 +2061,18 @@ def verify_micro_probe_hardware(
         )
         return passed, raw
 
-    import importlib.util
-    import tempfile
+    import importlib.util  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
 
-    import tilelang
-    import torch
-    from tilelang.profiler import do_bench
+    import tilelang  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
+    from tilefoundry_ascend.agent.probes import (  # noqa: PLC0415
+        ensure_cann_include_cpath,
+        run_msprof_detail,
+    )
+
+    ensure_cann_include_cpath()
 
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         raise RuntimeError("Ascend NPU device is required for live micro-probe verification.")
@@ -2085,46 +2091,43 @@ def verify_micro_probe_hardware(
         torch.manual_seed(42)
         if kind == "ssbuf_handoff":
             rounds = spec.tensor_shape[0]
-            seed = torch.zeros((16, 16), dtype=torch.float16, device="npu")
+            seed = torch.zeros((16, 16), dtype=torch.float16).npu()
             expected = torch.tensor(
                 [[(i + 1) * 100 + (((i + 1) * 101) << 32)] for i in range(rounds)],
                 dtype=torch.uint64,
             )
             if tag == "base":
-                scratch = torch.zeros((rounds, 2), dtype=torch.uint32, device="npu")
+                scratch = torch.zeros((rounds, 2), dtype=torch.uint32).npu()
                 out = kernel(seed, scratch)
                 torch.npu.synchronize()
                 torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
-                prof = do_bench(
+                prof = run_msprof_detail(
                     lambda: kernel(seed, scratch),
-                    backend="msprof_detail",
-                    _n_warmup=3,
-                    _n_repeat=6,
+                    n_warmup=3,
+                    n_repeat=6,
                 )
             else:
                 out = kernel(seed)
                 torch.npu.synchronize()
                 torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
-                prof = do_bench(
+                prof = run_msprof_detail(
                     lambda: kernel(seed),
-                    backend="msprof_detail",
-                    _n_warmup=3,
-                    _n_repeat=6,
+                    n_warmup=3,
+                    n_repeat=6,
                 )
         else:
             run_shape = spec.tensor_shape
             if kind == "pad_alignment" and tag == "base":
                 run_shape = (spec.tensor_shape[0], 70)
-            a = torch.randn(run_shape, dtype=torch.float32, device="npu")
-            b = torch.randn(run_shape, dtype=torch.float32, device="npu")
+            a = torch.randn(run_shape, dtype=torch.float32).npu()
+            b = torch.randn(run_shape, dtype=torch.float32).npu()
             out = kernel(a, b)
             torch.npu.synchronize()
-            torch.testing.assert_close(out.cpu(), (a + b).cpu(), atol=1e-4, rtol=1e-4)
-            prof = do_bench(
+            torch.testing.assert_close(out.cpu(), a.cpu() + b.cpu(), atol=1e-4, rtol=1e-4)
+            prof = run_msprof_detail(
                 lambda: kernel(a, b),
-                backend="msprof_detail",
-                _n_warmup=3,
-                _n_repeat=6,
+                n_warmup=3,
+                n_repeat=6,
             )
         ratios = {
             "aiv_mte2": float(getattr(prof, "aiv_mte2", 0.0)),

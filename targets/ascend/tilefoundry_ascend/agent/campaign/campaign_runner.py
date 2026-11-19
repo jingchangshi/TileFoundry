@@ -645,6 +645,7 @@ def _other_regime_forbidden_symbols(
                 forbidden.add(sym)
         if spec.config_selector_fn and spec.config_selector_fn not in own_editable:
             forbidden.add(spec.config_selector_fn)
+    forbidden.difference_update(own_editable)
     return forbidden
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+
 import pytest
 
 from tilefoundry_ascend.agent.campaign.campaign_runner import CampaignConfig
@@ -62,7 +63,6 @@ def test_tier1_compiler_behavior_registry_detects_all_7_phenomena_and_custom_plu
     """Verify all 7 built-in compiler phenomena + extensible register_compiler_detector plugin."""
     assert len(DEFAULT_COMPILER_BEHAVIOR_REGISTRY.list_detectors()) == 7
 
-    # Clean VLOOPv2 dump produces zero hazard signals
     clean_res = "Vector Register Usage: 32\nScalar Register Usage: 16\nStack Frame Size: 128 bytes\n"
     clean_asm = "VLOOPv2 r0, 32\nVADD v0, v1, v2\n"
     clean_sum = parse_bisheng_res_usage(clean_res, clean_asm)
@@ -73,7 +73,6 @@ def test_tier1_compiler_behavior_registry_detects_all_7_phenomena_and_custom_plu
     assert clean_sum.dcache_dcci_flushes == 0
     assert clean_sum.extra_signals == {}
 
-    # Dump exhibiting all 7 compiler phenomena (a)-(g)
     hazard_res = (
         "Vector Register Usage: 64\n"
         "Scalar Register Usage: 48\n"
@@ -107,11 +106,9 @@ def test_tier1_compiler_behavior_registry_detects_all_7_phenomena_and_custom_plu
     assert bad_sum.dual_issue_ipc_collapse > 0.0
     assert bad_sum.dcache_dcci_flushes >= 2
 
-    # Roundtrip serialization
     rt = BishengResourceSummary.from_dict(bad_sum.to_dict())
     assert rt == bad_sum
 
-    # Tier-1 cost model reflects each hazard monotonically
     model = HybridAscendCostModel(AscendTarget("ascend.950pr"))
     base_wl = {
         "vec_flops": 5e9,
@@ -129,7 +126,6 @@ def test_tier1_compiler_behavior_registry_detects_all_7_phenomena_and_custom_plu
     assert p_ipc.tier1_penalty_us > p_clean.tier1_penalty_us
     assert p_dcci.tier1_penalty_us > p_clean.tier1_penalty_us
 
-    # Extensible plugin registration on isolated cloned registry
     custom_reg: CompilerBehaviorRegistry = DEFAULT_COMPILER_BEHAVIOR_REGISTRY.clone()
     det = register_compiler_detector(
         "mte2_queue_stall",
@@ -152,7 +148,7 @@ def test_tier1_compiler_behavior_registry_detects_all_7_phenomena_and_custom_plu
 
 
 def test_topology_axes_roundtrip_and_structural_regime_dispatch() -> None:
-    """Verify 3-axis TopologyAxes schema, optional serialization, and op_name-free solver dispatch."""
+    """Verify 3-axis TopologyAxes schema and op_name-free solver dispatch."""
     for ce in VALID_COMPUTE_ENGINES:
         assert ce in ("aiv_only", "aic_only", "coupled_1c2v")
     for mr in VALID_MEMORY_RINGS:
@@ -175,7 +171,6 @@ def test_topology_axes_roundtrip_and_structural_regime_dispatch() -> None:
     for axes in CANONICAL_TOPOLOGY_PRESETS:
         assert TopologyAxes.from_dict(axes.to_dict()) == axes
 
-    # Required topology_axes field and roundtrip serialization
     reg = RegimeSlice(
         regime_tag="hybrid_main",
         case_nums=(1,),
@@ -217,7 +212,6 @@ def test_topology_axes_roundtrip_and_structural_regime_dispatch() -> None:
     assert adv_axes.to_dict()["topology_axes"] == hybrid_axes.to_dict()
     assert AdvisoryEnvelope.from_dict(adv_axes.to_dict()) == adv_axes
 
-    # Solve unseen hybrid topology WITHOUT any op_name reliance
     solver = RegimePiecewiseSolver(AscendTarget("ascend.950pr"))
     plan_unknown_name = solver.solve_regime(
         reg,
@@ -256,7 +250,6 @@ def test_topology_axes_roundtrip_and_structural_regime_dispatch() -> None:
 
 def test_causal_t0_router_t_gt_0_escalation_and_isa_gap_scanner() -> None:
     """Verify causal t=0 contract routing, t>0 escalation, and 6-domain ISA gap scanner."""
-    # t=0: Standard dtypes start on tilelang_dsl without hindsight bias (even for historically Track-B ops!)
     for op_name in ("gqa", "grouped_matmul", "gather", "kimi_delta_attention", "brand_new_op"):
         dec = route_initial_by_input_contract(
             {
@@ -267,27 +260,22 @@ def test_causal_t0_router_t_gt_0_escalation_and_isa_gap_scanner() -> None:
         )
         assert dec.recommended_backend_tier == "tilelang_dsl"
 
-    # FP8 / INT8 are representable in TileLang DSL -> start at tilelang_dsl
     fp8_dec = route_initial_by_input_contract(
         {"op_name": "unseen_fp8_gemm", "input_dtypes": ["fp8e4m3", "i8"], "output_dtypes": ["f16"]}
     )
     assert fp8_dec.recommended_backend_tier == "tilelang_dsl"
 
-    # t=0 -> ascendc_template ONLY for unrepresentable input contracts:
-    # (1) sub-byte packed formats
     for sb_dtype in ("f4e2m1", "f4e1m2", "i4", "u4", "q4_0", "mxfp4"):
         d_sub = route_initial_by_input_contract(
             {"op_name": "unseen_quant", "input_dtypes": ["f16", sb_dtype], "output_dtypes": ["f16"]}
         )
         assert d_sub.recommended_backend_tier == "ascendc_template", sb_dtype
 
-    # (2) in-place GM CAS atomics
     d_cas = route_initial_by_input_contract(
         {"op_name": "hash_probe", "input_dtypes": ["uint64"], "requires_inplace_gm_cas": True}
     )
     assert d_cas.recommended_backend_tier == "ascendc_template"
 
-    # (3) dynamic bytecode / opcode stream
     d_vm = route_initial_by_input_contract(
         {
             "op_name": "unseen_interpreter",
@@ -301,7 +289,6 @@ def test_causal_t0_router_t_gt_0_escalation_and_isa_gap_scanner() -> None:
     )
     assert d_vm.recommended_backend_tier == "ascendc_template"
 
-    # Structural route_from_op_spec / route_execution_track without op-name hardcoding
     assert (
         route_from_op_spec(
             {
@@ -315,7 +302,6 @@ def test_causal_t0_router_t_gt_0_escalation_and_isa_gap_scanner() -> None:
         StructuralFeatures(True, 0.0, "none", False, "none", False, 128, 1.0)
     ).track == "developer"
 
-    # t>0 Closed-loop bottleneck escalation
     no_esc = evaluate_track_escalation(
         current_tier="tilelang_dsl",
         roofline_eta=0.90,
@@ -363,7 +349,6 @@ def test_causal_t0_router_t_gt_0_escalation_and_isa_gap_scanner() -> None:
     assert esc_tpl.should_escalate is True
     assert esc_tpl.to_tier == "ascendc_template"
 
-    # 7-pipe ISA gap scanner
     live_report = scan_tilelang_pipe_gaps()
     assert isinstance(live_report, PipeGapReport)
     assert tuple(live_report.pipes.keys()) == VALID_HARDWARE_PIPES
@@ -381,7 +366,7 @@ def test_causal_t0_router_t_gt_0_escalation_and_isa_gap_scanner() -> None:
 
 
 def test_mece_7_facet_freedom_lattice_and_composable_compute_slot() -> None:
-    """Verify MECE 7-facet ConstraintRelaxationMask lattice (bottom -> selective -> top) and ComposableComputeSlotSpec."""
+    """Verify 7-facet ConstraintRelaxationMask lattice and ComposableComputeSlotSpec."""
     assert VALID_FREEDOM_FACETS == (
         "alg_compute_and_monoid",
         "tile_and_stage_knobs",
@@ -416,7 +401,6 @@ def test_mece_7_facet_freedom_lattice_and_composable_compute_slot() -> None:
     assert pol_m.to_dict()["freedom_mask"] == m_pipe.to_dict()
     assert SchedulePolicy.from_dict(pol_m.to_dict()) == pol_m
 
-    # Guardrail: bottom mask cannot specify cross-stage L1 aliasing or custom ring sync
     with pytest.raises(ValueError, match="sram_layout_and_aliasing"):
         ComposableComputeSlotSpec(
             op_name="bad_sram",
@@ -458,7 +442,6 @@ def test_mece_7_facet_freedom_lattice_and_composable_compute_slot() -> None:
     assert "CUBE_TILE_M = 96U" in rendered.ascendc_cpp
     assert rendered.policy["freedom_mask"] == slot_unlocked.freedom_mask.to_dict()
 
-    # top() element lifts ALL coordination shell syntax locks
     slot_top = ComposableComputeSlotSpec(
         op_name="free_ast_kernel",
         freedom_mask=ConstraintRelaxationMask.top(),
@@ -469,7 +452,7 @@ def test_mece_7_facet_freedom_lattice_and_composable_compute_slot() -> None:
     )
     rendered_top = get_template_registry().render_with_compute_slot(slot_top)
     assert "unrestricted_top=True" in rendered_top.ascendc_cpp
-    assert "CUBE_TILE_M" not in rendered_top.ascendc_cpp  # No shell boilerplate lock at top()!
+    assert "CUBE_TILE_M" not in rendered_top.ascendc_cpp
 
 
 def test_tilesize_prescreen_default_off_per_dtype_half_l1_and_ablation_gate() -> None:
@@ -504,7 +487,6 @@ def test_tilesize_prescreen_default_off_per_dtype_half_l1_and_ablation_gate() ->
     assert fp32_score.cube_macs_per_cycle == 256
     assert fp8_score.fixpipe_to_cube_ratio > fp16_score.fixpipe_to_cube_ratio > fp32_score.fixpipe_to_cube_ratio
 
-    # Half-L1 bank conflict penalty
     no_split_score = evaluate_tile_candidate(
         TileConfigCandidate(
             bm=128, bn=128, bk=64, stages=2, dtype_bytes=2, dtype="f16", l1_half_bank_split=False
@@ -515,7 +497,6 @@ def test_tilesize_prescreen_default_off_per_dtype_half_l1_and_ablation_gate() ->
     assert no_split_score.half_l1_penalty == pytest.approx(0.25)
     assert no_split_score.score < fp16_score.score
 
-    # Independent A/B ablation gate
     assert evaluate_prescreen_ablation([]).recommended_enable is False
 
     anchor_regressed = evaluate_prescreen_ablation(

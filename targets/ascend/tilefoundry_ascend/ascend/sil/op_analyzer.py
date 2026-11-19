@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
-from functools import lru_cache
 import json
 import math
 import os
-from pathlib import Path
 import re
 import statistics
+from collections.abc import Iterable, Mapping, Sequence
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
+
 import yaml
 
 from tilefoundry_ascend.ascend.sil.schema import (
@@ -21,6 +22,7 @@ from tilefoundry_ascend.ascend.sil.schema import (
     SchedulePolicy,
     TopologyAxes,
 )
+
 
 def _resolve_ops_root_path(path: str | Path) -> Path:
     cand = Path(path).expanduser()

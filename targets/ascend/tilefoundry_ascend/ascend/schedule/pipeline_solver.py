@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
 import json
 import logging
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
-
 
 from tilefoundry.ir.core import Call, Expr, Op, Var
 from tilefoundry.ir.core.param_def import MemoryEffect, collect_param_defs
@@ -54,6 +53,13 @@ from tilefoundry.vendor.tilelang_z3 import (
     tf_adapter,
     verify_assignment,
 )
+from tilefoundry_ascend.ascend.cost_model.pipe_schedule_eval import (
+    DIRECTION_SLOPE_MULT,
+    MS_PIPE_INTERCEPT_US,
+    MS_PIPE_SLOPE_US_PER_BYTE,
+    normalize_ns_to_z3_ticks,
+    resolve_cube_macs_safe,
+)
 from tilefoundry_ascend.ascend.ir.execution import SIMDVF_KIND, SIMTVF_KIND
 from tilefoundry_ascend.ascend.ir.tir.instructions import (
     AscendDualCopy,
@@ -66,13 +72,6 @@ from tilefoundry_ascend.ascend.ir.tir.instructions import (
     AscendL1ToL0B,
     AscendMmad,
     AscendUbToGm,
-)
-from tilefoundry_ascend.ascend.cost_model.pipe_schedule_eval import (
-    DIRECTION_SLOPE_MULT,
-    MS_PIPE_INTERCEPT_US,
-    MS_PIPE_SLOPE_US_PER_BYTE,
-    normalize_ns_to_z3_ticks,
-    resolve_cube_macs_safe,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,

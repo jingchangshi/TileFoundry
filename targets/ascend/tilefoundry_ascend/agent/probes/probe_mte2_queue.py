@@ -1,11 +1,16 @@
 """Standalone MTE2 inflight queue and gather coalescing micro-probe."""
 
+from tilefoundry_ascend.agent.probes._cann_env import (
+    ensure_cann_include_cpath,
+    run_msprof_detail,
+)
+
 
 def build_mte2_coalesce_func(
     rows: int = 56 * 64, cols: int = 256, coalesced: bool = True, num_cores: int = 56
 ):
     """Build a PrimFunc comparing coalesced block copy against fragmented slice loads."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
     rows_per_core = rows // num_cores
     sub_chunk = 8
@@ -29,18 +34,18 @@ def build_mte2_coalesce_func(
 
 def run_mte2_queue_probe(rows: int = 56 * 64, cols: int = 256) -> dict[str, float]:
     """Benchmark coalesced vs fragmented MTE2 DMA throughput on Ascend 950."""
-    import tilelang
-    from tilelang.profiler import do_bench
-    import torch
+    import tilelang  # noqa: PLC0415
+    import torch  # noqa: PLC0415
 
-    x = torch.randn((rows, cols), dtype=torch.float32, device="npu")
+    ensure_cann_include_cpath()
+    x = torch.randn((rows, cols), dtype=torch.float32).npu()
     timings: dict[str, float] = {}
     for label, flag in (("coalesced", True), ("fragmented", False)):
         kernel = tilelang.compile(build_mte2_coalesce_func(rows, cols, flag), out_idx=-1)
         out = kernel(x)
         torch.npu.synchronize()
         torch.testing.assert_close(out.cpu(), x.cpu(), atol=1e-5, rtol=1e-5)
-        prof = do_bench(lambda: kernel(x), backend="msprof_detail", _n_warmup=5, _n_repeat=8)
+        prof = run_msprof_detail(lambda: kernel(x), n_warmup=5, n_repeat=8)
         timings[f"{label}_dur_us"] = float(prof.dur_us)
         timings[f"{label}_aiv_mte2"] = float(prof.aiv_mte2)
     f_us = timings["fragmented_dur_us"]

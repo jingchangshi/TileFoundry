@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
 import math
 import re
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 from tilefoundry.ir.core import Call, Constant, Expr, Op, Var
 from tilefoundry.ir.core.kinds import UnaryKind
 from tilefoundry.ir.core.param_def import MemoryEffect, collect_param_defs
-from tilefoundry.ir.hir.pipeline import PipelineError
 from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.tir.memory import AllocTensor, Copy, Fill, PtrOf, TensorView
 from tilefoundry.ir.tir.prim_function import PrimFunction
@@ -37,6 +36,9 @@ from tilefoundry.vendor.tilelang_z3 import (
     Task,
     tf_adapter,
 )
+from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
+    extract_microarch_profile_from_tirx,
+)
 from tilefoundry_ascend.ascend.ir.execution import SIMTVF_KIND
 from tilefoundry_ascend.ascend.ir.tir.instructions import (
     AscendDualCopyL0cToUb,
@@ -50,9 +52,6 @@ from tilefoundry_ascend.ascend.ir.tir.instructions import (
     AscendUbToReg,
     AscendVunary,
 )
-from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
-    extract_microarch_profile_from_tirx,
-)
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
     ScopeWaterline,
@@ -64,7 +63,6 @@ from tilefoundry_ascend.ascend.schedule.pipeline_solver import (
     _capacities_from_facts,
     _resources_for_tasks,
     format_pipe_key,
-    solve_ascend_pipeline,
     solve_pipeline_with_monotone_backoff,
     task_resource_mask,
 )
@@ -3040,16 +3038,15 @@ def inspect_tilelang_primfunc(
 ) -> EnvelopeInspectionResult:
     """Inspect a TileLang PrimFunc using Two-Snapshot IR Diff without bisheng compile."""
     import contextlib  # noqa: PLC0415
-    import tilelang  # noqa: PLC0415
+
+    from tilelang import tvm  # noqa: PLC0415
     from tilelang.backend.module import create_backend_context  # noqa: PLC0415
     from tilelang.engine.lower import lower_to_host_device_ir  # noqa: PLC0415
     from tilelang.utils.language import DataType as TLDataType  # noqa: PLC0415
-    from tilelang import tvm  # noqa: PLC0415
     from tvm import tirx  # noqa: PLC0415
 
     resolved_target = target or AscendTarget("ascend.950pr")
     spaces = resolved_target.get_facts(AscendSpaceFacts)
-    corner_shapes = _instantiate_corner_shape_matrix()
 
     if isinstance(prim_func, tvm.IRModule):
         funcs = [fn for fn in prim_func.functions.values() if isinstance(fn, tirx.PrimFunc)]
@@ -3626,7 +3623,6 @@ def inspect_tir_envelope(
     """Read-only Mode B inspector for TileFoundry TIR containing dynamic or opaque scopes."""
     resolved_target = target or AscendTarget("ascend.950pr")
     spaces = resolved_target.get_facts(AscendSpaceFacts)
-    corner_shapes = _instantiate_corner_shape_matrix()
     body = fn_or_stmt.body if isinstance(fn_or_stmt, PrimFunction) else fn_or_stmt
 
     explicit_by_scope: dict[str, dict[str, int]] = {}

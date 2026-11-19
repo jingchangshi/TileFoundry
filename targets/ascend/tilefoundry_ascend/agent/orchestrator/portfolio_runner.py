@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-import json
 
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, build_predicate_context
@@ -18,6 +18,7 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     extract_python_dsl,
     sanitize_effort,
 )
+from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate,
     TwoLaneBeamSearch,
@@ -33,8 +34,6 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     prescreen_live_ir_neighborhood,
     prescreen_tile_configs,
 )
-from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
-from tilefoundry_ascend.ascend.target.dialect_surface import get_dialect_surface
 from tilefoundry_ascend.agent.router.capability_gate import (
     EscalationDecision,
     evaluate_track_escalation,
@@ -50,6 +49,7 @@ from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirBlueprintPacket
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
+from tilefoundry_ascend.ascend.target.dialect_surface import get_dialect_surface
 from tilefoundry_ascend.ascend.templates.registry import (
     ConstraintRelaxationMask,
     relax_facets_for_bottleneck,

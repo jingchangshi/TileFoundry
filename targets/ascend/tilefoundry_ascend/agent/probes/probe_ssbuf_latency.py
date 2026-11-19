@@ -1,9 +1,14 @@
 """Standalone SSBuffer cross-core scalar handoff latency micro-probe."""
 
+from tilefoundry_ascend.agent.probes._cann_env import (
+    ensure_cann_include_cpath,
+    run_msprof_detail,
+)
+
 
 def build_ssbuf_handoff_func(rounds: int = 64, use_ssbuf: bool = True):
     """Build a MixCore 1:2 scalar handoff PrimFunc via SSBUF or GM scratch."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
     @T.prim_func
     def main_ss(seed: T.Tensor((16, 16), "float16"), out: T.Tensor((rounds, 1), "uint64")):
@@ -44,11 +49,11 @@ def build_ssbuf_handoff_func(rounds: int = 64, use_ssbuf: bool = True):
 
 def run_ssbuf_probe(rounds: int = 64) -> dict[str, float]:
     """Verify dirty-init safety and benchmark SSBUF vs GM scalar handoff latency."""
-    import tilelang
-    from tilelang.profiler import do_bench
-    import torch
+    import tilelang  # noqa: PLC0415
+    import torch  # noqa: PLC0415
 
-    seed = torch.zeros((16, 16), dtype=torch.float16, device="npu")
+    ensure_cann_include_cpath()
+    seed = torch.zeros((16, 16), dtype=torch.float16).npu()
     expected = torch.tensor(
         [[(i + 1) * 100 + (((i + 1) * 101) << 32)] for i in range(rounds)],
         dtype=torch.uint64,
@@ -57,18 +62,18 @@ def run_ssbuf_probe(rounds: int = 64) -> dict[str, float]:
     out_ss = k_ss(seed)
     torch.npu.synchronize()
     torch.testing.assert_close(out_ss.cpu(), expected, rtol=0, atol=0)
-    prof_ss = do_bench(lambda: k_ss(seed), backend="msprof_detail", _n_warmup=5, _n_repeat=10)
+    prof_ss = run_msprof_detail(lambda: k_ss(seed), n_warmup=5, n_repeat=10)
 
     k_gm = tilelang.compile(
         build_ssbuf_handoff_func(rounds, use_ssbuf=False),
         out_idx=-1,
         pass_configs={"tl.enable_auto_schedule": False},
     )
-    scratch = torch.zeros((rounds, 2), dtype=torch.int32, device="npu")
+    scratch = torch.zeros((rounds, 2), dtype=torch.int32).npu()
     out_gm = k_gm(scratch)
     torch.npu.synchronize()
     torch.testing.assert_close(out_gm.cpu(), expected, rtol=0, atol=0)
-    prof_gm = do_bench(lambda: k_gm(scratch), backend="msprof_detail", _n_warmup=5, _n_repeat=10)
+    prof_gm = run_msprof_detail(lambda: k_gm(scratch), n_warmup=5, n_repeat=10)
 
     ss_us = float(prof_ss.dur_us)
     gm_us = float(prof_gm.dur_us)

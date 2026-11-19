@@ -12,6 +12,10 @@ from tilefoundry_ascend.agent.orchestrator import (
     run_stage_a_static,
     run_stage_b_compile,
 )
+from tilefoundry_ascend.agent.probes import (
+    ensure_cann_include_cpath,
+    run_msprof_detail,
+)
 
 _SMOKE_DSL = """
 import tilelang.ascend.language as T
@@ -49,10 +53,10 @@ def _require_npu() -> None:
 def test_live_one_op_funnel_stage_a_b_c_on_npu() -> None:
     """Execute Stage A static -> Stage B bisheng -> Stage C NPU msprof on Ascend 950PR."""
     _require_npu()
-    import math
-    import tilelang
-    import tilelang.ascend.language as T
-    from tilelang.profiler import do_bench
+
+    import tilelang  # noqa: PLC0415
+
+    ensure_cann_include_cpath()
 
     stage_a = run_stage_a_static(
         _SMOKE_DSL, factory_name="make_vec_add", enable_track_router=True
@@ -71,13 +75,13 @@ def test_live_one_op_funnel_stage_a_b_c_on_npu() -> None:
     prim_func = stage_a.prim_func
     kernel = tilelang.compile(prim_func, out_idx=-1)
 
-    a = torch.randn((4096,), dtype=torch.float32, device="npu")
-    b = torch.randn((4096,), dtype=torch.float32, device="npu")
+    a = torch.randn((4096,), dtype=torch.float32).npu()
+    b = torch.randn((4096,), dtype=torch.float32).npu()
     out = kernel(a, b)
     torch.npu.synchronize()
-    torch.testing.assert_close(out.cpu(), (a + b).cpu(), atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(out.cpu(), a.cpu() + b.cpu(), atol=1e-4, rtol=1e-4)
 
-    prof = do_bench(lambda: kernel(a, b), backend="msprof_detail", _n_warmup=3, _n_repeat=5)
+    prof = run_msprof_detail(lambda: kernel(a, b), n_warmup=3, n_repeat=5)
     telemetry = {
         "dur_us": float(prof.dur_us),
         "aic_mac_ratio": float(prof.aic_mad),

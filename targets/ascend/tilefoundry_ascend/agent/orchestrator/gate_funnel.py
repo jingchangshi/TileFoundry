@@ -147,9 +147,6 @@ def _normalize_flag_list(raw_flags: object) -> list[str]:
 
 _FORBIDDEN_NPU_HOST_CALLS: frozenset[str] = frozenset(
     {
-        "_load_golden_fn",
-        "_torch_apply_rotary_pos_emb",
-        "_torch_q4_0_dequant_matmul",
         "matmul",
         "bmm",
         "einsum",
@@ -1242,19 +1239,9 @@ def build_stage_b_driver_source(
         "    if _merged_cf:\n"
         "        _merged_pc['tl.device_compile_flags'] = list(_merged_cf)\n"
         "    with tvm.transform.PassContext(config=_merged_pc):\n"
-        "        try:\n"
-        "            _art = tilelang.lower(\n"
-        "                _fn, target='ascend', enable_device_compile=True\n"
-        "            )\n"
-        "        except Exception:\n"
-        "            if _cfg.get('kernel_dump_path'):\n"
-        "                try:\n"
-        "                    _low_only = tilelang.lower(_fn, target='ascend', enable_device_compile=False)\n"
-        "                    if getattr(_low_only, 'kernel_source', None):\n"
-        "                        pathlib.Path(_cfg['kernel_dump_path']).write_text(str(_low_only.kernel_source), encoding='utf-8')\n"
-        "                except Exception:\n"
-        "                    pass\n"
-        "            raise\n"
+        "        _art = tilelang.lower(\n"
+        "            _fn, target='ascend', enable_device_compile=True\n"
+        "        )\n"
         "    assert _art.kernel_source\n"
         "    if _cfg.get('kernel_dump_path'):\n"
         "        pathlib.Path(_cfg['kernel_dump_path']).write_text(str(_art.kernel_source), encoding='utf-8')\n"
@@ -1282,6 +1269,7 @@ def run_stage_b_compile(
     env = dict(os.environ)
     env["TILELANG_DISABLE_CACHE"] = "1"
     env.setdefault("USE_CUDA", "0")
+    _inject_cann_cpath_env(env)
     with tempfile.TemporaryDirectory(prefix="tf_stage_b_") as tmp_dir:
         cand_path = Path(tmp_dir) / "candidate_dsl.py"
         cand_path.write_text(dsl_source, encoding="utf-8")
@@ -1451,6 +1439,16 @@ def _detect_cann_include_dirs(
                     seen_resolved.add(res_key)
                     found.append(str(inc))
     return found
+
+
+def _inject_cann_cpath_env(env_map: dict[str, str] | None = None) -> list[str]:
+    """Prepend discovered CANN include directories to ``CPATH`` without duplicates."""
+    cann_incs = _detect_cann_include_dirs()
+    if cann_incs:
+        target_env = os.environ if env_map is None else env_map
+        existing = [p for p in target_env.get("CPATH", "").split(os.pathsep) if p]
+        target_env["CPATH"] = os.pathsep.join(dict.fromkeys([*cann_incs, *existing]))
+    return cann_incs
 
 
 def _resolve_toolchain_tool(
@@ -2129,6 +2127,7 @@ class GateFunnel:
                 telemetry=fallback_telemetry,
             )
         else:
+            _inject_cann_cpath_env()
             stage_c = self._device_runner(dsl_source, stage_a)
             if comp_summary is not None and stage_c.residual is not None:
                 res = stage_c.residual

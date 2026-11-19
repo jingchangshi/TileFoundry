@@ -2,6 +2,11 @@
 
 from collections.abc import Sequence
 
+from tilefoundry_ascend.agent.probes._cann_env import (
+    ensure_cann_include_cpath,
+    run_msprof_detail,
+)
+
 DEFAULT_HBM_BURST_BYTES: tuple[int, ...] = (4096, 8192, 16384, 32768, 65536)
 
 
@@ -16,7 +21,7 @@ def _default_burst_steps(burst_bytes: int, num_cores: int, total_stream_bytes: i
 
 def build_hbm_stream_func(num_elems: int = 56 * 8192 * 32, num_cores: int = 56):
     """Build a double-buffered GM streaming PrimFunc saturating HBM bandwidth."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
     tile = 8192
     steps = num_elems // (num_cores * tile)
@@ -53,7 +58,7 @@ def build_hbm_burst_probe_func(
     num_cores: int = 56,
 ):
     """Build a single-slab double-buffered GM->UB burst probe for a given byte payload."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
     tile_elems = _burst_tile_elems(burst_bytes)
     steps = (
@@ -97,10 +102,10 @@ def run_hbm_burst_bw_probe(
     num_cores: int = 56,
 ) -> dict[int, dict[str, float]]:
     """Measure GM->UB effective HBM bandwidth across contiguous payload byte sizes."""
-    import tilelang
-    from tilelang.profiler import do_bench
-    import torch
+    import tilelang  # noqa: PLC0415
+    import torch  # noqa: PLC0415
 
+    ensure_cann_include_cpath()
     results: dict[int, dict[str, float]] = {}
     for raw_bytes in burst_bytes_list:
         req_bytes = int(raw_bytes)
@@ -113,13 +118,13 @@ def run_hbm_burst_bw_probe(
         total_elems = num_cores * steps * tile_elems
         fn = build_hbm_burst_probe_func(req_bytes, steps, num_cores)
         kernel = tilelang.compile(fn, out_idx=-1)
-        a = torch.randn(total_elems, dtype=torch.float32, device="npu")
+        a = torch.randn(total_elems, dtype=torch.float32).npu()
         out = kernel(a)
         torch.npu.synchronize()
         a_view = a.cpu().view(steps, num_cores, tile_elems)
         ref = (a_view[:, :, :64] + a_view[:, :, tile_elems - 64 :]).sum(dim=0)
         torch.testing.assert_close(out.cpu(), ref, atol=1e-2, rtol=1e-2)
-        prof = do_bench(lambda: kernel(a), backend="msprof_detail", _n_warmup=5, _n_repeat=8)
+        prof = run_msprof_detail(lambda: kernel(a), n_warmup=5, n_repeat=8)
         dur_s = float(prof.dur_ns) * 1e-9
         total_bytes = float(total_elems * 4 + num_cores * 64 * 4)
         bw_bps = total_bytes / dur_s if dur_s > 0.0 else 0.0
@@ -134,17 +139,17 @@ def run_hbm_burst_bw_probe(
 
 def run_hbm_bw_probe(num_elems: int = 56 * 8192 * 32, num_cores: int = 56) -> dict[str, float]:
     """Compile, verify, and benchmark sustainable and segmented HBM bandwidth."""
-    import tilelang
-    from tilelang.profiler import do_bench
-    import torch
+    import tilelang  # noqa: PLC0415
+    import torch  # noqa: PLC0415
 
+    ensure_cann_include_cpath()
     kernel = tilelang.compile(build_hbm_stream_func(num_elems, num_cores), out_idx=-1)
-    a = torch.randn(num_elems, dtype=torch.float32, device="npu")
-    b = torch.randn(num_elems, dtype=torch.float32, device="npu")
+    a = torch.randn(num_elems, dtype=torch.float32).npu()
+    b = torch.randn(num_elems, dtype=torch.float32).npu()
     out = kernel(a, b)
     torch.npu.synchronize()
-    torch.testing.assert_close(out.cpu(), (a + b).cpu(), atol=1e-4, rtol=1e-4)
-    profile = do_bench(lambda: kernel(a, b), backend="msprof_detail", _n_warmup=5, _n_repeat=8)
+    torch.testing.assert_close(out.cpu(), a.cpu() + b.cpu(), atol=1e-4, rtol=1e-4)
+    profile = run_msprof_detail(lambda: kernel(a, b), n_warmup=5, n_repeat=8)
     dur_s = float(profile.dur_ns) * 1e-9
     total_bytes = float(3 * num_elems * 4)
     bw_bps = total_bytes / dur_s if dur_s > 0.0 else 0.0

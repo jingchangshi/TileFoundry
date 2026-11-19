@@ -1,11 +1,16 @@
 """Standalone FixPipe bottleneck and K-accumulation span micro-probe."""
 
+from tilefoundry_ascend.agent.probes._cann_env import (
+    ensure_cann_include_cpath,
+    run_msprof_detail,
+)
+
 
 def build_fixpipe_gemm_func(
     m_dim: int = 3584, n_dim: int = 256, k_dim: int = 64, num_cores: int = 28
 ):
     """Build a Cube GEMM PrimFunc exposing FixPipe writeout pressure vs K span."""
-    import tilelang.ascend.language as T
+    import tilelang.ascend.language as T  # noqa: PLC0415
 
     tm, tn, tk = 128, 256, 64
     k_tiles = k_dim // tk
@@ -34,20 +39,20 @@ def build_fixpipe_gemm_func(
 
 def run_fixpipe_probe(m_dim: int = 3584, n_dim: int = 256) -> dict[str, float]:
     """Compare FixPipe utilization across short and enlarged K accumulation spans."""
-    import tilelang
-    from tilelang.profiler import do_bench
-    import torch
+    import tilelang  # noqa: PLC0415
+    import torch  # noqa: PLC0415
 
+    ensure_cann_include_cpath()
     results: dict[str, float] = {}
     for label, k_dim in (("short_k", 64), ("long_k", 1024)):
         kernel = tilelang.compile(build_fixpipe_gemm_func(m_dim, n_dim, k_dim), out_idx=-1)
-        x = torch.randn((m_dim, k_dim), dtype=torch.bfloat16, device="npu")
-        w = torch.randn((n_dim, k_dim), dtype=torch.bfloat16, device="npu")
+        x = torch.randn((m_dim, k_dim), dtype=torch.bfloat16).npu()
+        w = torch.randn((n_dim, k_dim), dtype=torch.bfloat16).npu()
         out = kernel(x, w)
         torch.npu.synchronize()
         ref = torch.matmul(x.cpu().float(), w.cpu().float().t())
         torch.testing.assert_close(out.cpu(), ref, atol=1e-1, rtol=5e-2)
-        prof = do_bench(lambda: kernel(x, w), backend="msprof_detail", _n_warmup=5, _n_repeat=8)
+        prof = run_msprof_detail(lambda: kernel(x, w), n_warmup=5, n_repeat=8)
         results[f"{label}_dur_us"] = float(prof.dur_us)
         results[f"{label}_aic_mad"] = float(prof.aic_mad)
         results[f"{label}_aic_fixpipe"] = float(prof.aic_fixpipe)

@@ -2,6 +2,8 @@
 
 import contextlib
 import math
+import os
+from pathlib import Path
 
 import tilelang
 import tilelang.ascend.language as T
@@ -19,6 +21,24 @@ def _callable_cache_key(fn: object) -> object:
         return fn
     except TypeError:
         return id(fn)
+
+
+def _cann_include_flags() -> list[str]:
+    flags: list[str] = []
+    seen: set[str] = set()
+    for env_key in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME"):
+        raw = os.environ.get(env_key, "").strip()
+        if not raw:
+            continue
+        root = Path(raw).expanduser()
+        for sub in ("include", "x86_64-linux/include", "aarch64-linux/include", "runtime/include"):
+            inc = root / sub
+            if inc.is_dir():
+                flag = f"-I{inc}"
+                if flag not in seen:
+                    seen.add(flag)
+                    flags.append(flag)
+    return flags
 
 
 def _ascend_target_ctx():
@@ -1576,7 +1596,8 @@ def _get_kernel(
                 schedule_mode,
                 **extra_bk,
             )
-        flags_arg = list(flags_tuple) if flags_tuple else None
+        merged_flags = list(dict.fromkeys([*_cann_include_flags(), *flags_tuple]))
+        flags_arg = merged_flags or None
         compiled = tilelang.compile(
             prog,
             target="ascend",

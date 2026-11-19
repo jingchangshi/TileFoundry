@@ -174,6 +174,8 @@ def _compile_blueprint_safe(
     target: AscendTarget | None = None,
 ) -> HirBlueprintPacket | None:
     """Compile authored HIR and optional scheduled HIR into a dialect-neutral blueprint."""
+    if "@module" not in hir_source:
+        return None
     try:
         return compile_hir_blueprint(
             hir_source,

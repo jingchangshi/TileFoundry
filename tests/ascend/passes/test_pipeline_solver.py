@@ -10,6 +10,8 @@ from tilefoundry.analysis import analyze, check_program
 from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.inspection import as_script
 from tilefoundry.ir.hir.pipeline import BufferSchedule, PipelineError, PipelineSpec
+from tilefoundry.ir.tir.stmts import For
+from tilefoundry.ir.visitor import StmtVisitor, walk_prim_function
 from tilefoundry.schedule.finalize import finalize
 from tilefoundry.vendor.tilelang_z3 import (
     Buffer,
@@ -30,8 +32,6 @@ from tilefoundry_ascend.ascend.schedule import (
 )
 from tilefoundry_ascend.ascend.schedule.pipeline_solver import build_resolved_spec
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
-from tilefoundry.ir.tir.stmts import For
-from tilefoundry.ir.visitor import StmtVisitor, walk_prim_function
 
 
 def _collect_pipelined_loops(fn) -> list[For]:
@@ -491,6 +491,7 @@ class M:
     assert sorted(versions1) == [1, 2]
 
     import dataclasses  # noqa: PLC0415
+
     from tilefoundry.ir.tir.stmts import ExecutionScope, Sequential  # noqa: PLC0415
 
     def _with_simtvf(node):
@@ -522,10 +523,11 @@ def test_sil_policy_override_shadow_dump_and_automatic_fallback(
 ):
     """Verify SIL policy overrides (L1/L0C/UB-256KB), shadow_dump_path, and automatic fallback."""
     import json  # noqa: PLC0415
+
+    from tilefoundry_ascend.ascend.ir.tir.instructions import AscendDualCopyL0cToUb  # noqa: PLC0415
     from tilefoundry_ascend.ascend.schedule.pipeline_solver import (  # noqa: PLC0415
         _op_resource_mask,
     )
-    from tilefoundry_ascend.ascend.ir.tir.instructions import AscendDualCopyL0cToUb  # noqa: PLC0415
     from tilefoundry_ascend.ascend.target import NodeResourceMask  # noqa: PLC0415
 
     monkeypatch.chdir(tmp_path)

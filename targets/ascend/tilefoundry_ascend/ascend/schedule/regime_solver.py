@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-import math
 
-from tilefoundry.ir.hir.pipeline import PipelineError
 from tilefoundry.ir.tir.stmts import For, Stmt
 from tilefoundry_ascend.ascend.schedule.pipeline_solver import (
     extract_tir_loop_problem,
@@ -284,7 +283,7 @@ class RegimePlanResult:
     def to_sil_policy(self) -> object:
         """Convert to ``ascend.sil.SchedulePolicy`` if available, else return dict."""
         try:
-            from tilefoundry_ascend.ascend.sil import SchedulePolicy
+            from tilefoundry_ascend.ascend.sil import SchedulePolicy  # noqa: PLC0415
 
             return SchedulePolicy.from_dict(self.policy)
         except ImportError:
@@ -313,7 +312,7 @@ class PiecewiseSchedulePlan:
     def to_sil_policy_envelope(self) -> object:
         """Convert to ``ascend.sil.PolicyEnvelope`` if available, else return dict."""
         try:
-            from tilefoundry_ascend.ascend.sil import PolicyEnvelope
+            from tilefoundry_ascend.ascend.sil import PolicyEnvelope  # noqa: PLC0415
 
             return PolicyEnvelope.from_dict(self.to_dict())
         except ImportError:

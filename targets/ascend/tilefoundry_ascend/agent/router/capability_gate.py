@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-import re
 
-from tilefoundry.ir.core.expr import Call, Constant, Expr, Tuple as IrTuple
+from tilefoundry.ir.core.expr import Call, Constant, Expr
+from tilefoundry.ir.core.expr import Tuple as IrTuple
 from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.ir.hir.loop_region import LoopRegion
