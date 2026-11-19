@@ -522,10 +522,7 @@ def _extract_trackb_cpp_source(
     """Return `(symbol_name, cpp_source)` for the first Track-B C++20 string constant."""
     if not regime_spec.trackb_symbols:
         return None
-    try:
-        tree = ast.parse(module_source)
-    except SyntaxError:
-        return None
+    tree = ast.parse(module_source)
 
     constants: dict[str, str] = {}
     for node in tree.body:
@@ -550,10 +547,7 @@ def _extract_trackb_cpp_source(
 
 
 def _top_level_symbol_sources(module_source: str) -> dict[str, str]:
-    try:
-        tree = ast.parse(module_source)
-    except SyntaxError:
-        return {}
+    tree = ast.parse(module_source)
     lines = module_source.splitlines(keepends=True)
     return {
         sym.name: "".join(lines[sym.start - 1 : sym.end]).strip()
@@ -718,10 +712,7 @@ def _extract_func_signature_header(lines: Sequence[str], node: ast.FunctionDef) 
 
 def _extract_regime_abi_context(module_source: str, regime_spec: RegimeTargetSpec) -> str:
     """Extract slice, helper builder, and @T.prim_func ABI signatures for the target regime."""
-    try:
-        tree = ast.parse(module_source)
-    except SyntaxError:
-        return ""
+    tree = ast.parse(module_source)
     lines = module_source.splitlines(keepends=True)
     top_funcs = {
         node.name: node
@@ -1570,10 +1561,7 @@ class PerfTargetCampaignRunner:
 
     @staticmethod
     def _function_ast_dump(module_source: str, func_name: str) -> str:
-        try:
-            tree = ast.parse(module_source)
-        except SyntaxError:
-            return ""
+        tree = ast.parse(module_source)
         node = _find_top_level_func(tree, (func_name,))
         return ast.dump(node) if node is not None else ""
 
@@ -1618,11 +1606,8 @@ class PerfTargetCampaignRunner:
             "num_kv_splits": combine_splits,
             **resolved.combine_kwargs,
         }
-        try:
-            mod_tree = ast.parse(module_source)
-            fn_node = _find_top_level_func(mod_tree, (combine_fn,))
-        except SyntaxError:
-            fn_node = None
+        mod_tree = ast.parse(module_source)
+        fn_node = _find_top_level_func(mod_tree, (combine_fn,))
         if fn_node is not None and fn_node.args.kwarg is None:
             accepted = {
                 *(a.arg for a in fn_node.args.posonlyargs),
@@ -1641,10 +1626,7 @@ class PerfTargetCampaignRunner:
         regime_spec: RegimeTargetSpec,
     ) -> str:
         """Instantiate Track-B C++20 TU via module _render_trackb_tu if present."""
-        try:
-            tree = ast.parse(module_source)
-        except SyntaxError:
-            return cpp_source
+        tree = ast.parse(module_source)
         if _find_top_level_func(tree, ("_render_trackb_tu",)) is None:
             return cpp_source
         dims: dict[str, object] = dict(
@@ -2537,13 +2519,17 @@ class PerfTargetCampaignRunner:
         own_editable = set(promoted_regime.editable_symbols)
         if not own_editable:
             return
-        try:
-            promoted_dsl = extract_python_dsl(promoted_snippet)
+        promoted_dsl = extract_python_dsl(promoted_snippet)
+        if (
+            promoted_regime.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
+            and promoted_regime.trackb_symbols
+            and parse_scoped_search_replace_blocks(promoted_dsl)
+        ):
+            promoted_syms = set(promoted_regime.trackb_symbols)
+        else:
             promoted_syms = {
                 sym.name for sym in _collect_top_level_symbols(ast.parse(promoted_dsl))
             }
-        except Exception:
-            promoted_syms = set(own_editable)
         touched_own = promoted_syms & own_editable
         if not touched_own:
             return
@@ -2558,13 +2544,17 @@ class PerfTargetCampaignRunner:
                 continue
             kept_stones: list[BeamCandidate] = []
             for stone in other_beam.stepping_stone_beam:
-                try:
-                    stone_dsl = extract_python_dsl(stone.dsl_source)
+                stone_dsl = extract_python_dsl(stone.dsl_source)
+                if (
+                    other_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
+                    and other_spec.trackb_symbols
+                    and parse_scoped_search_replace_blocks(stone_dsl)
+                ):
+                    stone_syms = set(other_spec.trackb_symbols)
+                else:
                     stone_syms = {
                         sym.name for sym in _collect_top_level_symbols(ast.parse(stone_dsl))
                     }
-                except Exception:
-                    stone_syms = set(shared_syms)
                 if not (stone_syms & shared_syms):
                     kept_stones.append(stone)
             other_beam.stepping_stone_beam = kept_stones
@@ -2644,6 +2634,11 @@ class PerfTargetCampaignRunner:
             if incumbent_source
             else ""
         )
+        eff_rule = (
+            rule.render_for_backend(regime_spec.runtime_backend)
+            if hasattr(rule, "render_for_backend")
+            else rule
+        )
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
             f"{hotpath_section}"
@@ -2651,10 +2646,10 @@ class PerfTargetCampaignRunner:
             f"{sil_policy_section}"
             f"{nav_section}"
             f"### SELECTED CAUSAL RULE\n"
-            f"Rule ID: {rule.rule_id}\n"
-            f"Precondition: {rule.precondition}\n"
-            f"Transform Template:\n{rule.transform_template.strip()}\n"
-            f"Expected Postcondition: {rule.expected_postcondition}\n\n"
+            f"Rule ID: {eff_rule.rule_id}\n"
+            f"Precondition: {eff_rule.precondition}\n"
+            f"Transform Template:\n{eff_rule.transform_template.strip()}\n"
+            f"Expected Postcondition: {eff_rule.expected_postcondition}\n\n"
             f"{msprof_section}"
             f"{domain_section}"
             f"### SURROGATE ANCHOR TELEMETRY\n"
@@ -3430,6 +3425,7 @@ class PerfTargetCampaignRunner:
                 top_k=self._config.k_rule_workers,
                 topology_axes=parent_axes,
                 operator_name=self._config.operator_name,
+                runtime_backend=regime_spec.runtime_backend,
             )
         )
 

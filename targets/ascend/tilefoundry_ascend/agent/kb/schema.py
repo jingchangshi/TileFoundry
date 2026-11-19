@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Mapping
-from dataclasses import dataclass
 import operator
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
+
 import yaml
 
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
@@ -192,6 +193,24 @@ def safe_eval_predicate(expr: str, env: Mapping[str, object]) -> bool:
     return bool(_eval_node(tree, env))
 
 
+_BACKEND_ALIASES = {
+    "tilelang": "tilelang_dsl",
+    "ascendc": "ascendc_trackb",
+    "ascendc_template": "ascendc_trackb",
+    "hybrid": "hybrid_trackb",
+}
+
+
+def normalize_runtime_backend(backend: str | None) -> str | None:
+    """Normalize runtime backend aliases to canonical KB backend identifiers."""
+    if backend is None:
+        return None
+    cleaned = str(backend).strip()
+    if not cleaned:
+        return None
+    return _BACKEND_ALIASES.get(cleaned, cleaned)
+
+
 @dataclass(frozen=True)
 class AscendCausalRule:
     """Six-tuple causal optimization rule grounded in physical hardware telemetry."""
@@ -208,15 +227,50 @@ class AscendCausalRule:
     priority: int = 100
     scope: str = "cross_op"
     origin_operator: str = ""
+    compatible_backends: tuple[str, ...] = ("tilelang_dsl", "ascendc_trackb", "hybrid_trackb")
+    cpp20_transform_template: str = ""
 
     def __post_init__(self) -> None:
         if not self.rule_id or not self.transform_template.strip():
             raise ValueError("rule_id and transform_template must be non-empty")
         if self.scope not in ("cross_op", "operator_local"):
-            raise ValueError(f"invalid rule scope {self.scope!r}; expected 'cross_op' or 'operator_local'")
+            raise ValueError(
+                f"invalid rule scope {self.scope!r}; expected 'cross_op' or 'operator_local'"
+            )
+        normalized_backends = tuple(
+            norm
+            for raw in self.compatible_backends
+            if (norm := normalize_runtime_backend(str(raw)))
+        )
+        if not normalized_backends:
+            raise ValueError("compatible_backends must contain at least one backend")
+        object.__setattr__(self, "compatible_backends", normalized_backends)
         validate_rule_predicate(self.regime_guard)
         validate_rule_predicate(self.precondition)
         validate_rule_predicate(self.expected_postcondition)
+
+    def supports_backend(self, runtime_backend: str | None) -> bool:
+        """Return whether this rule applies to *runtime_backend*."""
+        norm = normalize_runtime_backend(runtime_backend)
+        if norm is None:
+            return True
+        return norm in self.compatible_backends
+
+    def render_for_backend(self, runtime_backend: str | None = None) -> AscendCausalRule:
+        """Return rule rendered with Track-B C++20 guidance when targeting C++20 backends."""
+        norm = normalize_runtime_backend(runtime_backend)
+        cpp_guide = self.cpp20_transform_template.strip()
+        if not cpp_guide:
+            return self
+        if norm == "ascendc_trackb":
+            return replace(self, transform_template=cpp_guide)
+        if norm == "hybrid_trackb" and cpp_guide not in self.transform_template:
+            combined = (
+                f"{self.transform_template.strip()}\n\n"
+                f"Track-B C++20 (tl_templates/ascend):\n{cpp_guide}"
+            )
+            return replace(self, transform_template=combined)
+        return self
 
     def as_six_tuple(self) -> tuple[str, str, str, str, str, str]:
         """Return canonical 6-tuple fields."""
@@ -254,12 +308,21 @@ class AscendCausalRule:
             "priority": self.priority,
             "scope": self.scope,
             "origin_operator": self.origin_operator,
+            "compatible_backends": list(self.compatible_backends),
+            "cpp20_transform_template": self.cpp20_transform_template,
         }
         return payload
 
     @classmethod
     def from_dict(cls, entry: Mapping[str, object]) -> AscendCausalRule:
         """Deserialize rule from YAML/JSON mapping."""
+        raw_backends = entry.get("compatible_backends")
+        if raw_backends is None:
+            backends: tuple[str, ...] = ("tilelang_dsl", "ascendc_trackb", "hybrid_trackb")
+        elif isinstance(raw_backends, str):
+            backends = tuple(b.strip() for b in raw_backends.split(",") if b.strip())
+        else:
+            backends = tuple(str(b).strip() for b in raw_backends if str(b).strip())
         return cls(
             rule_id=str(entry["rule_id"]),
             regime_guard=str(entry["regime_guard"]),
@@ -273,6 +336,8 @@ class AscendCausalRule:
             priority=int(entry.get("priority", 100)),
             scope=str(entry.get("scope", "cross_op") or "cross_op"),
             origin_operator=str(entry.get("origin_operator", "") or ""),
+            compatible_backends=backends,
+            cpp20_transform_template=str(entry.get("cpp20_transform_template", "") or ""),
         )
 
 
@@ -504,7 +569,6 @@ def build_predicate_context(
     res_defaults: dict[str, int | float | bool | str] = dict(_RESIDUAL_DEFAULTS)
     if compiler_summary is not None:
         comp_vals = _extract_typed_defaults(compiler_summary, _RESIDUAL_DEFAULTS)
-        # Preserve optimistic vloopv2_hit=True when BishengResourceSummary had no loop diagnostics
         if isinstance(compiler_summary, Mapping):
             sw = int(compiler_summary.get("software_loops", 0) or 0)
             vl = int(compiler_summary.get("vloopv2_loops", 0) or 0)
@@ -519,8 +583,10 @@ def build_predicate_context(
         ctx.update(_extract_typed_defaults(residual, _TELEMETRY_CONTEXT_DEFAULTS))
     ctx.update(res_defaults)
 
-    # Also allow bank_conflict_ratio (from TelemetryFeedback) to seed ub_bank_conflict_risk
-    if float(ctx.get("ub_bank_conflict_risk", 0.0)) == 0.0 and float(ctx.get("bank_conflict_ratio", 0.0)) > 0.0:
+    if (
+        float(ctx.get("ub_bank_conflict_risk", 0.0)) == 0.0
+        and float(ctx.get("bank_conflict_ratio", 0.0)) > 0.0
+    ):
         ctx["ub_bank_conflict_risk"] = float(ctx["bank_conflict_ratio"])
 
     if prev_ledger is not None:
@@ -583,6 +649,7 @@ __all__ = [
     "build_predicate_context",
     "default_seed_rules_path",
     "load_seed_rules",
+    "normalize_runtime_backend",
     "safe_eval_predicate",
     "save_rules_yaml",
     "validate_rule_predicate",

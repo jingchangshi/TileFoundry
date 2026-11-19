@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
@@ -390,6 +391,32 @@ def _has_split_kv_multi(tree: ast.AST, dsl_source: str) -> bool:
     return False
 
 
+_SYNC_NOTIFY_EVENT_RE = re.compile(
+    r"asc_sync_notify\s*\([^,]+,[^,]+,\s*((?:[^()]+|\([^()]*\))+)\)"
+)
+
+
+def extract_cpp_trackb_signature_tags(cpp_source: str) -> set[str]:
+    """Extract structural mechanism tags from tl_templates/ascend C++20 kernel bodies."""
+    tags: set[str] = set()
+    if "asc_mmad(" in cpp_source:
+        tags.add("cpp:cube_mmad")
+    if "asc_copy_gm2l1_nd2nz(" in cpp_source:
+        tags.add("cpp:gm2l1_nd2nz")
+    if "asc_copy_l0c2ub(" in cpp_source:
+        tags.add("cpp:l0c2ub_ring")
+    if "asc_lock(" in cpp_source and "asc_unlock(" in cpp_source:
+        tags.add("cpp:slot_lock_pipeline")
+    events = {ev.strip() for ev in _SYNC_NOTIFY_EVENT_RE.findall(cpp_source) if ev.strip()}
+    if len(events) >= 2 or any("%" in ev or "& 1" in ev or "&1" in ev for ev in events):
+        tags.add("cpp:pingpong_event_parity")
+    if "simd_inst::vsts_pack_b32" in cpp_source:
+        tags.add("cpp:vsts_pack_b32")
+    if "+ 16" in cpp_source or "+ 32" in cpp_source:
+        tags.add("cpp:ub_bank_pad")
+    return tags
+
+
 def extract_structural_signature(
     dsl_source: str,
     *,
@@ -464,16 +491,22 @@ def extract_structural_signature(
         tags.append("hw:dcache_dcci")
     if eff_local_membar:
         tags.append("hw:local_membar_vf")
-    try:
-        tree = ast.parse(dsl_source)
-    except SyntaxError:
-        if "ascend_pipe_barrier" in dsl_source and "PIPE_ALL" in dsl_source:
-            tags.append("pipe_all_barrier")
-        if "vfma" in dsl_source.lower():
-            tags.append("vfma_unshifted")
-        if "partial_out" in dsl_source:
-            tags.append("split_kv_multi")
-        return tuple(sorted(set(tags)))
+    tree = ast.parse(dsl_source)
+    for node in tree.body:
+        val_node = None
+        if isinstance(node, ast.Assign):
+            val_node = node.value
+        elif isinstance(node, ast.AnnAssign):
+            val_node = node.value
+        if isinstance(val_node, ast.Constant) and isinstance(val_node.value, str):
+            cpp_text = val_node.value
+            if (
+                "tl_templates/ascend/" in cpp_text
+                or "__aicore__" in cpp_text
+                or "__global__" in cpp_text
+                or "__simd_vf__" in cpp_text
+            ):
+                tags.extend(extract_cpp_trackb_signature_tags(cpp_text))
 
     if _has_static_pingpong_buffers(tree, dsl_source):
         tags.append("static_pingpong_2buf")
@@ -694,5 +727,6 @@ __all__ = [
     "TwoLaneBeamSearch",
     "compute_eq3_hap_objective",
     "compute_static_dynamic_residual",
+    "extract_cpp_trackb_signature_tags",
     "extract_structural_signature",
 ]

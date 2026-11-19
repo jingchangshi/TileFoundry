@@ -6,7 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
+from tilefoundry_ascend.agent.campaign.anchor_specs import (
+    CannbenchOpsRegistry,
+    RegimeTargetSpec,
+)
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
     PerfTargetCampaignRunner,
@@ -19,7 +22,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     AnchorEvalMetrics,
     CandidateSurrogateResult,
 )
-from tilefoundry_ascend.agent.kb.schema import load_seed_rules
+from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, load_seed_rules
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     apply_scoped_trackb_patch,
     build_trackb_context_view,
@@ -359,3 +362,79 @@ def test_format_host_launcher_stub_all_branches_and_edge_cases() -> None:
     stub_bare = _format_host_launcher_stub("launch_bare", "bare_kernel")
     assert 'extern "C" inline void launch_bare(void* stream, void* x, void* y)' in stub_bare
     assert "bare_kernel<<<1, nullptr, stream>>>(x, y);" in stub_bare
+
+
+def test_m4_hub_glue_kb_backend_rendering_and_syntax_fail_closed(tmp_path: Path) -> None:
+    """Verify M4 Track-B rule rendering and fail-closed SyntaxError pruning in campaign_runner."""
+    spec = RegimeTargetSpec(
+        regime_tag="main",
+        builder_candidates=("_build_demo",),
+        sample_builder_kwargs={},
+        editable_symbols=("_DEMO_TRACKB_SRC", "_select_demo"),
+        runtime_backend="ascendc_trackb",
+        trackb_symbols=("_DEMO_TRACKB_SRC",),
+    )
+    mod_file = tmp_path / "demo_mod.py"
+    mod_file.write_text(
+        '_DEMO_TRACKB_SRC = r"""\n__global__ __vector__ void k() {}\n"""\n'
+        "def _select_demo():\n    return {}\n",
+        encoding="utf-8",
+    )
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="level2/softmax", max_rounds=1),
+        target_module_path=mod_file,
+        regime_specs=[spec],
+    )
+    ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 100},
+        waterlines={},
+    )
+    surrogate_res = CandidateSurrogateResult(
+        candidate_id="base",
+        operator_name="demo",
+        all_passed=True,
+        avg_speedup=1.0,
+        min_case_speedup=1.0,
+        avg_roofline_eta=0.2,
+        surrogate_score=50.0,
+        anchors=(
+            AnchorEvalMetrics(
+                case_num=1,
+                regime_tag="main",
+                accuracy_passed=True,
+                cand_us=10.0,
+                ref_perf_us=10.0,
+                t_hw_us=2.0,
+                speedup=1.0,
+                roofline_eta=0.2,
+                eq3_score=50.0,
+            ),
+        ),
+    )
+    dual_rule = AscendCausalRule(
+        rule_id="R_M4_TEST",
+        regime_guard="True",
+        precondition="True",
+        transform_template="TILELANG_TEMPLATE_MARKER",
+        expected_postcondition="True",
+        source_provenance="test",
+        compatible_backends=("tilelang_dsl", "ascendc_trackb"),
+        cpp20_transform_template="CPP20_TRACKB_TEMPLATE_MARKER",
+    )
+    req = runner._build_exploit_regime_request(
+        snippet_source=mod_file.read_text(encoding="utf-8"),
+        func_name="_select_demo",
+        regime_spec=spec,
+        rule=dual_rule,
+        best_result=surrogate_res,
+        parent_ledger=ledger,
+        parent_residual=compute_static_dynamic_residual(ledger, {"dur_us": 10.0}),
+    )
+    assert "CPP20_TRACKB_TEMPLATE_MARKER" in req.user_prompt
+    assert "TILELANG_TEMPLATE_MARKER" not in req.user_prompt
+
+    with pytest.raises(SyntaxError):
+        runner._prune_stale_sibling_stepping_stones(spec, "def broken(:")

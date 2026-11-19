@@ -11,6 +11,11 @@ rules:
     alpha_prior: 3.0
     beta_prior: 1.0
     priority: 10
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Split row/tile work across paired AIV sub-cores (get_subblockid() == 0 vs 1,
+      half_rows = row_tile / 2) for asc_copy_l0c2ub writeout and simd_inst vector passes
+      with symmetric asc_sync_notify flags so both AIV sub-cores execute concurrently.
     rationale: "Coupled 1-AIC-to-2-AIV execution doubles effective vector throughput when both AIV sub-cores share the row work."
 
   - rule_id: R02_ONCHIP_L0C_TO_UB_DIRECT
@@ -25,6 +30,11 @@ rules:
     alpha_prior: 3.0
     beta_prior: 1.0
     priority: 15
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Replace intermediate GM workspace roundtrips with direct on-chip asc_copy_l0c2ub() from
+      L0C to __ubuf__ and asc_copy_ub2l1() back to __cbuf__ guarded by paired
+      asc_sync_notify(PIPE_M, PIPE_FIX, ev) and asc_sync_notify(PIPE_V, PIPE_MTE3, ev).
     rationale: "3510 hardware supports native L0C->UB and UB->L1 on-chip pipes without draining through global HBM."
 
   - rule_id: R03_ACCUM_SPAN_FIXPIPE_RELIEF
@@ -39,6 +49,10 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 20
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Enlarge inner K steps accumulated in __cc__ before calling asc_copy_l0c2ub() by keeping
+      initC=false on subsequent asc_mmad() iterations while staying within L1/L0C capacity.
     rationale: "Increasing K steps between L0C drains raises cube compute per FixPipe byte emitted."
 
   - rule_id: R04_MTE2_SPARSE_GATHER_COALESCE
@@ -53,6 +67,10 @@ rules:
     alpha_prior: 3.0
     beta_prior: 1.0
     priority: 12
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Coalesce fragmented GM loads into 32B-aligned asc_copy_gm2ub_align() or
+      asc_copy_gm2l1_nd2nz() block transfers so MTE2 queue depth stays at or below 16 entries.
     rationale: "Fragmented MTE2 sub-loads saturate the 16-entry issue queue and waste bus transactions."
 
   - rule_id: R05_SSBUF_RING_METADATA_HANDOFF
@@ -67,6 +85,7 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 18
+    compatible_backends: ["tilelang_dsl"]
     rationale: "SSBUF provides low-latency (~8-cycle) shared scalar storage across 1 AIC + 2 AIV without GM roundtrips."
 
   - rule_id: R06_ONLINE_SOFTMAX_SKIP_SCALE
@@ -81,6 +100,10 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 22
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Defer accumulator normalization to epilogue and guard intermediate simd_inst::vmul
+      rescaling inside __simd_vf__ with a max-shift threshold to skip identity-scale passes.
     rationale: "Guarded skip-scale cuts vector multiply pressure on online reduction pipelines."
 
   - rule_id: R07_IMPLICIT_BLOAT_HEADROOM_TRIM
@@ -95,6 +118,7 @@ rules:
     alpha_prior: 3.5
     beta_prior: 1.0
     priority: 5
+    compatible_backends: ["tilelang_dsl"]
     rationale: "Single-buffered degradation or scratchpad overflow destroys pipeline overlap far more than slightly smaller tiles."
 
   - rule_id: R08_PERSISTENT_SWIZZLE_L2_LOCALITY
@@ -109,6 +133,10 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 25
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Apply 2D diagonal/group block-index swizzling in the C++20 __aicore__ dispatch loop so
+      adjacent physical cores reuse shared A/B tiles in L2 cache and cut MTE2 stalls.
     rationale: "Persistent 2D swizzling exploits spatial reuse across the shared L2 cache on multi-wave problems."
 
   - rule_id: R09_MIXED_QUANT_DEQUANT_STAGE_OVERLAP
@@ -123,6 +151,10 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 20
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Stage low-bit unpack and scale multiply in __simd_vf__ UB buffers one iteration ahead,
+      streaming via asc_copy_ub2l1() with asc_sync_notify parity to overlap with asc_mmad().
     rationale: "Overlapping AIV vector dequantization ahead of Cube MMAD hides mixed-precision unpacking latency."
 
   - rule_id: R10_BACKWARD_SYNC_CV_PINGPONG
@@ -137,6 +169,10 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 24
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Use dual-slot ping-pong parity (slot = iter & 1) across __cbuf__/__ca__/__cb__/__ubuf__
+      with paired asc_lock()/asc_unlock() and asc_sync_notify(..., (event_t)(iter & 1)).
     rationale: "Ping-pong parity flags allow one core side to compute iteration t+1 while the peer consumes iteration t."
 
   - rule_id: R11_L2_NZ_PAD_BANK_CONFLICT_AVOID
@@ -150,6 +186,10 @@ rules:
     alpha_prior: 2.0
     beta_prior: 1.0
     priority: 30
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Add +16 or +32 element stride padding on __ubuf__ / __cbuf__ scratchpads to eliminate
+      SRAM bank aliasing across simd_inst::vlds_norm and simd_inst::vsts_pack_b32.
     rationale: "Adding a minimal fractal stride pad breaks power-of-two bank aliasing on L1/UB NZ reads."
 
   - rule_id: R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION
@@ -164,6 +204,7 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 26
+    compatible_backends: ["tilelang_dsl"]
     rationale: "Hardware unit_flag handoffs eliminate full-tile FixPipe barrier bubbles between MMAD and drain."
 
   - rule_id: R13_SPLIT_KV_WAVE_RECOVERY
@@ -178,6 +219,10 @@ rules:
     alpha_prior: 3.0
     beta_prior: 1.0
     priority: 8
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Split the outer reduction dimension across multiple grid blocks in the Track-B C++20
+      launcher and accumulate partial outputs before a final vector combine pass.
     rationale: "Low wave occupancy leaves most physical AIC and AIV cores idle during small-batch execution."
 
   - rule_id: R14_GQA_HEAD_M_FOLDING
@@ -192,6 +237,10 @@ rules:
     alpha_prior: 3.0
     beta_prior: 1.0
     priority: 11
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Fold grouped query heads into the M dimension (M >= 16) before asc_copy_gm2l1_nd2nz() and
+      asc_mmad() so the 16x16 Cube fractal unit runs densely without zero-padding waste.
     rationale: "Packing grouped heads along M saturates the 16-row Cube fractal unit on single-token decode."
 
   - rule_id: R15_ASYMMETRIC_1C2V_STAGE_FISSION
@@ -206,6 +255,7 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 16
+    compatible_backends: ["tilelang_dsl"]
     rationale: "Splitting heavy vector epilogues into slimmer pipelined stages prevents UB exhaustion and II stalls."
 
   - rule_id: R16_PADDED_PITCH_TAIL_MASKING
@@ -220,6 +270,7 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 14
+    compatible_backends: ["tilelang_dsl"]
     rationale: "Replacing unaligned SIMT tails with 32B-padded SIMD masking eliminates DMA padding and scalar stalls."
 
   - rule_id: R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK
@@ -236,6 +287,10 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 13
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Keep reduction accumulators in vector_f32 registers inside __simd_vf__ instead of
+      reloading from __ubuf__ and pass PURE_SIMDVF_UBUF_FLAGS in compile_flags to unlock 256 KiB UB.
     rationale: "Register accumulation and 256 KiB UB unlock eliminate redundant UB traffic and capacity throttling."
 
   - rule_id: R18_WAVE_QUANTIZED_BURST_TILING
@@ -253,6 +308,10 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 14
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Tune tile_rows in _select_*_config() so asc_copy_gm2ub_align() / asc_copy_ub2gm_align()
+      transfer 16-32 KiB per burst without adding core waves, clamping tail start row0 cleanly.
     rationale: "Joint wave quantization and GM burst-curve co-selection maximizes sustained AIV DMA throughput."
 
   - rule_id: R19_STATIC_PINGPONG_UNROLL_NO_ALIAS
@@ -269,6 +328,7 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 15
+    compatible_backends: ["tilelang_dsl"]
     rationale: "Explicit static ping-pong unrolling removes dynamic-offset pointer aliasing and serial DMA waits."
 
   - rule_id: R20_LOOP_FISSION_REDUCE_SFU_HIDING
@@ -284,6 +344,10 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 17
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Split coupled simd_inst::vcadd/vexp reductions and wide simd_inst::vfma accumulation into
+      two separate loops inside __simd_vf__ to hide SFU latency chains.
     rationale: "Fissioning reduce/SFU from wide vector accumulation hides long SFU latency chains."
 
   - rule_id: R21_SUBROW_DEPTH_OR_WIDTH_CORE_SHARDING
@@ -301,6 +365,10 @@ rules:
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 19
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Shard outer reduction depth or 64-element-aligned feature slices across all num_aiv_cores
+      using block_idx in the C++20 kernel when output rows alone underfill the AIV pool.
     rationale: "Sharding sub-row width or depth recovers full dynamic num_aiv_cores parallelism across 950PR/950DT SKUs on small-batch vector kernels."
 
   - rule_id: R22_HALF_L1_BANK_ISOLATION
@@ -316,6 +384,10 @@ rules:
     alpha_prior: 2.8
     beta_prior: 1.0
     priority: 16
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Isolate __cbuf__ ping/pong slot offsets across [0, 256 KiB) and [256 KiB, 512 KiB) with
+      asc_lock(PIPE_MTE1, slot, ASC_LOCK_BLOCK) so asc_copy_gm2l1_nd2nz and asc_copy_l12l0a never collide.
     rationale: "Half-L1 bank isolation prevents MTE2/MTE1 port collisions across Ascend 950's dual 256 KiB L1 banks."
 
   - rule_id: R23_UB_16BANK_STRIDE_PAD_AND_SHIFT
@@ -330,6 +402,10 @@ rules:
     alpha_prior: 2.8
     beta_prior: 1.0
     priority: 17
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Pad __ubuf__ 2D row stride by + 16 (half/bf16) or + 32 (byte) elements (+32 B) and stagger
+      concurrent read/write base pointers by +256 B across simd_inst loads and vsts_pack_b32.
     rationale: "Adding +1 DataBlock row padding and +8 DataBlock R/W base shift breaks 16-bank aliasing on 256 KiB UB."
 
   - rule_id: R24_VLOOPV2_LEGALIZATION_AND_DIRECT_VF
@@ -346,6 +422,10 @@ rules:
     alpha_prior: 2.7
     beta_prior: 1.0
     priority: 15
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Use 0-based unit-step uint16_t loops with simd_inst::vsel inside __simd_vf__ and annotate
+      __no_simd_vf_fusion__ __simd_vf__ when intra-VF LocalMemBar reuse is needed.
     rationale: "Hardware VLOOPv2 loops and direct __no_simd_vf_fusion__ calls eliminate software branch overhead and UB recomputes."
 
   - rule_id: R25_SCALAR_BOUND_SPILL_ELIMINATION
@@ -361,6 +441,10 @@ rules:
     alpha_prior: 3.0
     beta_prior: 1.0
     priority: 9
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Hoist scalar tiling parameters into local constexpr/scalar registers, avoid dynamically
+      indexed struct arrays, and use direct static __ubuf__/__cbuf__ byte offsets.
     rationale: "Dynamic struct arrays disable constant propagation and trigger stack spills that cause >30% scalar overhead."
 
   - rule_id: R26_SWAT_SNAKE_AND_TAIL_WAVE_SPLIT
@@ -375,6 +459,10 @@ rules:
     alpha_prior: 2.8
     beta_prior: 1.0
     priority: 13
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Reorder M/N block coordinates in a WINDOW_LEN=4 serpentine pattern in C++20 __aicore__
+      dispatch and split tail-wave tiles so all num_aic_cores stay busy with high L2 locality.
     rationale: "SWAT serpentine ordering raises L2 reuse while tail-wave splitting / DPSK eliminates half-empty final waves."
 
   - rule_id: R27_L2_CACHE_BYPASS_SINGLE_USE
@@ -389,6 +477,10 @@ rules:
     alpha_prior: 2.6
     beta_prior: 1.0
     priority: 21
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Use CACHE_MODE_DISABLE cache hints on single-use streaming asc_copy_gm2l1_nd2nz() /
+      asc_copy_gm2ub_align() loads so cold weights do not evict reused activations from L2.
     rationale: "Bypassing L2 allocation on non-reused weights preserves L2 residency for shared activations."
 
   - rule_id: R28_INPLACE_L1_SLOT_ALIASING
@@ -404,6 +496,10 @@ rules:
     alpha_prior: 2.7
     beta_prior: 1.0
     priority: 12
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Reuse non-overlapping __cbuf__ / __ubuf__ byte offsets across sequential matmul/vector
+      stages after asc_sync_notify barriers to fit within 512 KiB L1 and 248 KiB UB.
     rationale: "In-place L1/UB lifetime aliasing avoids GM workspace roundtrips and fits 3-stage CV rings on chip."
 
   - rule_id: R29_W4_AIV_UNPACK_AND_FIXPIPE_SCALE_FOLD
@@ -419,6 +515,10 @@ rules:
     alpha_prior: 2.9
     beta_prior: 1.0
     priority: 11
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Unpack 4-bit weights in __simd_vf__ UB, stream to __cbuf__ via asc_copy_ub2l1(), and
+      fold scale compensation into asc_copy_l0c2ub() FixPipe deq_scale after asc_mmad().
     rationale: "AIV 4-bit unpack with FixPipe deq_scale=64 folding achieves native Cube throughput on W4 quantized GEMMs."
 
   - rule_id: R30_REGBASE_MX_QUANT_DATABLOCK
@@ -434,6 +534,10 @@ rules:
     alpha_prior: 2.7
     beta_prior: 1.0
     priority: 18
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Keep MX block scaling in RegBase vector registers inside __simd_vf__ and emit packed
+      simd_inst::vsts_pack_b32 stores to __ubuf__ without intermediate UB roundtrips.
     rationale: "DataBlock microscaling in RegBase eliminates intermediate UB scale/quant roundtrips."
 
   - rule_id: R31_SIMT_UB_PRIVATIZED_ATOMICS
@@ -449,6 +553,10 @@ rules:
     alpha_prior: 2.8
     beta_prior: 1.0
     priority: 14
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Allocate warp-privatized +8-padded __ubuf__ accumulators inside __simt_vf__ with
+      __launch_bounds__(512) and asc_atomic_add / __shfl reduction to prevent spills and contention.
     rationale: "Warp-privatized +8-padded UB atomics and 512-thread launch bounds eliminate global atomic contention and spills."
 
   - rule_id: R32_GROUPED_ROLLING_CORE_AND_EMPTY_SKIP
@@ -464,6 +572,10 @@ rules:
     alpha_prior: 2.8
     beta_prior: 1.0
     priority: 12
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Rotate core indices continuously across groups with m == 0 fast-skip while preserving
+      paired asc_sync_notify / asc_lock parity on asc_copy_l0c2ub() epilogue paths.
     rationale: "Rolling core assignment and m == 0 fast-skip eliminate inter-group barrier bubbles and empty-subblock deadlocks."
 
   - rule_id: R33_PERSISTENT_STATE_RESIDENCY
@@ -479,4 +591,8 @@ rules:
     alpha_prior: 2.9
     beta_prior: 1.0
     priority: 10
+    compatible_backends: ["tilelang_dsl", "ascendc_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Keep loop-carried state resident in __ubuf__/__cbuf__ across chunks inside __aicore__
+      (zero GM roundtrips) and accumulate in-place in __cc__ via asc_mmad(..., initC=false).
     rationale: "On-chip recurrent state residency with L0C initC=false accumulation eliminates per-chunk GM state traffic."

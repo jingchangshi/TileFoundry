@@ -1,7 +1,7 @@
 """Unit tests for WP3 8-dim capability router, causal rules KB, and Bayesian tracker."""
 
-from pathlib import Path
 import re
+from pathlib import Path
 
 import pytest
 
@@ -17,7 +17,12 @@ from tilefoundry_ascend.agent import (
     safe_eval_predicate,
     validate_rule_predicate,
 )
+from tilefoundry_ascend.agent.kb.schema import save_rules_yaml
 from tilefoundry_ascend.agent.orchestrator import StaticDynamicResidual
+from tilefoundry_ascend.agent.orchestrator.residual_beam import (
+    extract_cpp_trackb_signature_tags,
+    extract_structural_signature,
+)
 from tilefoundry_ascend.ascend.passes import (
     build_objective_physical_ledger,
     build_scope_waterline,
@@ -888,10 +893,9 @@ def test_bayesian_tracker_axis_scoped_pruning_and_isolation(tmp_path: Path) -> N
 
 
 def test_r16_preserves_simtvf_on_indirect_gather_and_r22_to_r33_fire() -> None:
-    """Verify R16 never fires on indirect gather, R21 is dynamic-core-aware, and R22..R33 evaluate cleanly."""
+    """Verify R16 avoids indirect gather, R21 uses dynamic cores, and R22..R33 evaluate cleanly."""
     rules = {r.rule_id: r for r in load_seed_rules()}
 
-    # R16 must NOT destroy SimtVF on indirect gather/scatter/hash kernels
     indirect_ledger = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
         is_legal=True,
@@ -906,7 +910,6 @@ def test_r16_preserves_simtvf_on_indirect_gather_and_r22_to_r33_fire() -> None:
     assert rules["R16_PADDED_PITCH_TAIL_MASKING"].matches(indirect_ctx) is False
     assert rules["R31_SIMT_UB_PRIVATIZED_ATOMICS"].matches(indirect_ctx) is True
 
-    # Verify new context fields exist with safe defaults on legacy callers
     legacy_ctx = build_predicate_context(
         build_objective_physical_ledger(
             analysis_mode="readonly_envelope",
@@ -933,7 +936,6 @@ def test_r16_preserves_simtvf_on_indirect_gather_and_r22_to_r33_fire() -> None:
         assert required_key in legacy_ctx
         assert required_key in legacy_ctx["prev"]
 
-    # R21 mentions dynamic num_aiv_cores across 950PR/950DT
     assert "num_aiv_cores" in rules["R21_SUBROW_DEPTH_OR_WIDTH_CORE_SHARDING"].transform_template
 
     l1_over_half = build_scope_waterline(
@@ -1076,6 +1078,7 @@ def test_r16_preserves_simtvf_on_indirect_gather_and_r22_to_r33_fire() -> None:
 def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
     """Verify real HIR/TIR scanning and structural TileLang recurrence detection."""
     import tilelang.ascend.language as T
+
     from tilefoundry.ir.core import Call, Constant, Var
     from tilefoundry.ir.hir.function import Function as HirFunction
     from tilefoundry.ir.hir.loop_region import LoopRegion
@@ -1090,7 +1093,6 @@ def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
     from tilefoundry_ascend.ascend.ir.execution import SIMTVF_KIND
     from tilefoundry_ascend.ascend.ir.tir.instructions import AscendDualCopyL0cToUb, AscendMmad
 
-    # 1. HIR Function with MatMul + Quant + IndexSelect + LoopRegion carried state
     gmem = StorageKind.GMEM
     x_ty = TensorType(shape=(16, 64), dtype=DType.bf16, layout=Layout((16, 64)), storage=gmem)
     w_ty = TensorType(shape=(64, 64), dtype=DType.fp8e4m3, layout=Layout((64, 64)), storage=gmem)
@@ -1134,7 +1136,6 @@ def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
     assert f_hir_gather.phi_3_quant_granularity == "per_token_or_block"
     assert f_hir_gather.phi_4_indirect_sparse_gather is True
 
-    # 2. TIR PrimFunction with AscendMmad + AscendDualCopyL0cToUb + SimtVF + MeshScope
     block_mesh = Mesh((Topology("block", 14),), Layout((14,)))
     tmem = StorageKind.TMEM
     smem = StorageKind.SMEM
@@ -1175,7 +1176,6 @@ def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
         14.0 / float(AscendTarget("ascend.950pr").device.aic_count)
     )
 
-    # 3. TileLang structural online_rescale (exp + max without "expdif" name) & non_associative_scan
     @T.prim_func
     def online_max_exp_loop(X: T.Tensor((16, 64), "float32"), Out: T.Tensor((16, 64), "float32")):
         with T.Kernel(16):
@@ -1216,6 +1216,7 @@ def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
 def test_topology_axes_routing_and_60_cannbench_ops() -> None:
     """Verify pure 3-axis TopologyAxes routing across all 60 cann-bench specs and isolation."""
     import yaml
+
     from tilefoundry_ascend.agent.router.capability_gate import (
         VALID_BACKEND_TIERS,
         route_from_op_spec,
@@ -1227,7 +1228,6 @@ def test_topology_axes_routing_and_60_cannbench_ops() -> None:
         TopologyAxes,
     )
 
-    # Representative checks across canonical 3-axis topologies
     expectations = {
         "rms_norm": TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd"),
         "dynamic_mx_quant": TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd"),
@@ -1355,7 +1355,6 @@ def test_topology_axes_routing_and_60_cannbench_ops() -> None:
         assert seen_rings == set(VALID_MEMORY_RINGS)
         assert seen_regs == set(VALID_ITERATION_REGULARITIES)
 
-    # Verify global prune after axis A failures does NOT poison unrelated axis B
     tracker = BayesianRuleTracker.from_seed_yaml()
     rid = "R01_DUAL_COPY_1C2V_SPLIT"
     axes_a = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
@@ -1368,3 +1367,111 @@ def test_topology_axes_routing_and_60_cannbench_ops() -> None:
     assert tracker.is_pruned(rid) is True
     assert tracker.is_pruned(rid, topology_axes=axes_b) is False
     assert tracker.is_pruned(rid, topology_axes=axes_c) is False
+
+
+def test_dual_track_kb_backend_filtering_and_cpp20_rendering(tmp_path: Path) -> None:
+    """Verify runtime_backend filtering and tl_templates/ascend C++20 rendering in KB tracker."""
+    tracker = BayesianRuleTracker.from_seed_yaml()
+    ledger = build_objective_physical_ledger(
+        analysis_mode="exact_modulo_z3",
+        is_legal=True,
+        steady_state_ii=4,
+        pipe_cycles={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 64, "AIV0.PIPE_V": 80, "AIV0.PIPE_MTE2": 80},
+        waterlines={},
+        gm_roundtrip_bytes=65536,
+        uses_dynamic_offset_pipelining=True,
+        in_loop_pipe_all_barriers=2,
+    )
+    ctx = build_predicate_context(ledger)
+
+    tilelang_ids = {
+        r.rule_id for r in tracker.rank_applicable_rules(ctx, runtime_backend="tilelang_dsl")
+    }
+    assert "R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION" in tilelang_ids
+    assert "R19_STATIC_PINGPONG_UNROLL_NO_ALIAS" in tilelang_ids
+
+    trackb_rules = tracker.rank_applicable_rules(ctx, runtime_backend="ascendc_trackb")
+    trackb_ids = {r.rule_id for r in trackb_rules}
+    assert "R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION" not in trackb_ids
+    assert "R19_STATIC_PINGPONG_UNROLL_NO_ALIAS" not in trackb_ids
+    assert "R02_ONCHIP_L0C_TO_UB_DIRECT" in trackb_ids
+    assert "R10_BACKWARD_SYNC_CV_PINGPONG" in trackb_ids
+
+    r02_tb = next(r for r in trackb_rules if r.rule_id == "R02_ONCHIP_L0C_TO_UB_DIRECT")
+    assert "asc_copy_l0c2ub" in r02_tb.transform_template
+    assert "T.dual_copy" not in r02_tb.transform_template
+
+    hybrid_rules = tracker.rank_applicable_rules(ctx, runtime_backend="hybrid_trackb")
+    r02_hyb = next(r for r in hybrid_rules if r.rule_id == "R02_ONCHIP_L0C_TO_UB_DIRECT")
+    assert "T.dual_copy" in r02_hyb.transform_template
+    assert "asc_copy_l0c2ub" in r02_hyb.transform_template
+
+    custom = AscendCausalRule(
+        rule_id="R_TB_CUSTOM",
+        regime_guard="is_legal",
+        precondition="PIPE_V > 0",
+        transform_template="Optimize generic vector stage.",
+        expected_postcondition="PIPE_V <= prev.PIPE_V",
+        source_provenance="flywheel:ablation",
+        compatible_backends=("ascendc_trackb", "hybrid_trackb"),
+        cpp20_transform_template="Use simd_inst::vsts_pack_b32 in __simd_vf__.",
+    )
+    yaml_path = tmp_path / "dual_rules.yaml"
+    save_rules_yaml([custom], yaml_path)
+    reloaded = load_seed_rules(yaml_path)
+    assert reloaded[0].compatible_backends == ("ascendc_trackb", "hybrid_trackb")
+    assert reloaded[0].cpp20_transform_template == custom.cpp20_transform_template
+
+
+def test_residual_beam_syntax_error_fail_closed_and_trackb_cpp_signatures() -> None:
+    """Verify SyntaxError propagates and Track-B C++20 signatures distinguish buffer rings."""
+    with pytest.raises(SyntaxError):
+        extract_structural_signature("def broken_kernel(:\n    pass\n")
+
+    single_buf_mod = (
+        '_TRACKB_SRC = r"""\n'
+        '#include <tl_templates/ascend/common.h>\n'
+        '__aicore__ void k() {\n'
+        '  asc_copy_gm2l1_nd2nz(l1, gm, 64, 64);\n'
+        '  asc_mmad(l0c, l0a, l0b, 16, 16, 16, 0, true, false, true);\n'
+        '  asc_sync_notify(PIPE_MTE2, PIPE_V, EVENT_ID0);\n'
+        '}\n'
+        '"""\n'
+    )
+    pingpong_ring_mod = (
+        '_TRACKB_SRC = r"""\n'
+        '#include <tl_templates/ascend/common.h>\n'
+        '__aicore__ void k(int iter) {\n'
+        '  asc_lock(PIPE_MTE1, iter & 1, ASC_LOCK_BLOCK);\n'
+        '  asc_mmad(l0c, l0a, l0b, 16, 16, 16, 0, true, false, true);\n'
+        '  asc_unlock(PIPE_MTE1, iter & 1, ASC_LOCK_BLOCK);\n'
+        '  asc_sync_notify(PIPE_MTE2, PIPE_V, (event_t)(iter & 1));\n'
+        '  asc_copy_l0c2ub(ub + 16, l0c, 16, 16);\n'
+        '  simd_inst::vsts_pack_b32(v, ub, 0, m32);\n'
+        '}\n'
+        '"""\n'
+    )
+
+    sig_single = extract_structural_signature(single_buf_mod, track="manual_ssbuf")
+    sig_pingpong = extract_structural_signature(pingpong_ring_mod, track="manual_ssbuf")
+    assert "cpp:cube_mmad" in sig_single
+    assert "cpp:gm2l1_nd2nz" in sig_single
+    assert "cpp:pingpong_event_parity" not in sig_single
+    assert "cpp:l0c2ub_ring" not in sig_single
+
+    for expected_tag in (
+        "cpp:cube_mmad",
+        "cpp:slot_lock_pipeline",
+        "cpp:pingpong_event_parity",
+        "cpp:l0c2ub_ring",
+        "cpp:vsts_pack_b32",
+        "cpp:ub_bank_pad",
+    ):
+        assert expected_tag in sig_pingpong
+    assert sig_single != sig_pingpong
+
+    dual_event_tags = extract_cpp_trackb_signature_tags(
+        "asc_sync_notify(PIPE_V, PIPE_MTE2, (event_t)0);\n"
+        "asc_sync_notify(PIPE_V, PIPE_MTE2, (event_t)1);\n"
+    )
+    assert "cpp:pingpong_event_parity" in dual_event_tags

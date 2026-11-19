@@ -1747,6 +1747,7 @@ def build_anchor_var_bindings(
     b_val = out.get("B", out.get("b_dim"))
     s_val = out.get("S", out.get("S_q", out.get("s_dim")))
     nq_val = out.get("N_q", out.get("n_q"))
+    nkv_val = out.get("N_kv", out.get("n_kv"))
     n_val = out.get("N", out.get("n_depth"))
 
     if b_val is not None and s_val is not None and "m_rows" not in explicit_dim_keys:
@@ -1758,6 +1759,14 @@ def build_anchor_var_bindings(
         and "q_total_rows" not in explicit_dim_keys
     ):
         out["q_total_rows"] = int(b_val) * int(s_val) * int(nq_val)
+    if (
+        s_val is not None
+        and nq_val is not None
+        and nkv_val is not None
+        and int(nkv_val) > 0
+        and "q_rows" not in explicit_dim_keys
+    ):
+        out["q_rows"] = int(s_val) * (int(nq_val) // int(nkv_val))
     if (
         n_val is not None
         and b_val is not None

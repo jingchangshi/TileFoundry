@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import ast
-from collections.abc import Callable, Mapping, Sequence
 import copy
-from dataclasses import dataclass, field
 import difflib
 import hashlib
 import json
-from pathlib import Path
 import re
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
 
+from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.kb.schema import (
     AscendCausalRule,
@@ -19,23 +20,54 @@ from tilefoundry_ascend.agent.kb.schema import (
     save_rules_yaml,
     validate_rule_predicate,
 )
+from tilefoundry_ascend.agent.orchestrator.e2e_evolution import EvolutionTrajectory
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
     StageAResult,
     run_stage_a_static,
 )
-from tilefoundry_ascend.agent.orchestrator.e2e_evolution import EvolutionTrajectory
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 
-_DISALLOWED_PROVENANCE_TOKENS = (
-    "/home/",
-    "/users/",
-    "/data/",
-    "attention_residual",
-    "mla_model",
-    "deepgemm",
-    "flash_attention",
+_STATIC_DISALLOWED_PROVENANCE_TOKENS = frozenset(
+    {
+        "/home/",
+        "/users/",
+        "/data/",
+        "attention_residual",
+        "attn_res",
+        "mla",
+        "mla_model",
+        "grouped_matmul",
+        "softmax",
+        "deepgemm",
+        "flash_attention",
+    }
 )
+_SUBSTRING_PROVENANCE_TOKENS = frozenset(
+    {
+        "/home/",
+        "/users/",
+        "/data/",
+        "attention_residual",
+        "attn_res",
+        "mla_model",
+        "deepgemm",
+        "flash_attention",
+    }
+)
+
+
+def _build_disallowed_provenance_tokens() -> frozenset[str]:
+    """Dynamically collect all registered operator IDs to prevent operator-specific leakage."""
+    tokens = set(_STATIC_DISALLOWED_PROVENANCE_TOKENS)
+    try:
+        for op_id in CannbenchOpsRegistry.default().list_operators():
+            cleaned = str(op_id).strip().lower()
+            if cleaned:
+                tokens.add(cleaned)
+    except (FileNotFoundError, OSError):
+        pass
+    return frozenset(tokens)
 
 
 @dataclass(frozen=True)
@@ -822,6 +854,8 @@ def _extract_leave_one_out_stmt_deltas(
     path_label: str,
     chunks: list[AstEditChunk],
     seen_dsls: set[str],
+    *,
+    skip_assign_symbols: frozenset[str] = frozenset(),
 ) -> None:
     """Extract Leave-One-Out AST chunks on winner_dsl reverting one change at a time."""
     base_tags = [_node_tag(s) for s in base_list]
@@ -835,6 +869,18 @@ def _extract_leave_one_out_stmt_deltas(
                 w_stmt = win_list[j1 + k]
                 if _node_key(b_stmt) == _node_key(w_stmt):
                     continue
+                if skip_assign_symbols and not parent_path:
+                    w_tag = _node_tag(w_stmt)
+                    if w_tag.startswith("assign:") and (
+                        w_tag.removeprefix("assign:") in skip_assign_symbols
+                    ):
+                        continue
+                    if (
+                        isinstance(w_stmt, ast.AnnAssign)
+                        and isinstance(w_stmt.target, ast.Name)
+                        and w_stmt.target.id in skip_assign_symbols
+                    ):
+                        continue
                 cur_path = parent_path + (j1 + k,)
                 if isinstance(b_stmt, ast.With) and isinstance(w_stmt, ast.With):
                     b_hdr = _node_key(b_stmt.items[0].context_expr) if b_stmt.items else ""
@@ -1055,15 +1101,201 @@ def _extract_leave_one_out_stmt_deltas(
                         )
 
 
+def _find_str_constant_node(tree: ast.Module, symbol_name: str) -> ast.Constant | None:
+    for node in tree.body:
+        val: ast.AST | None = None
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == symbol_name
+        ):
+            val = node.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == symbol_name
+        ):
+            val = node.value
+        if isinstance(val, ast.Constant) and isinstance(val.value, str):
+            return val
+    return None
+
+
+def _extract_str_constant(tree: ast.Module, symbol_name: str) -> str | None:
+    node = _find_str_constant_node(tree, symbol_name)
+    return str(node.value) if node is not None else None
+
+
+def _format_cpp_string_literal(cpp_src: str) -> str:
+    if '"""' not in cpp_src and not cpp_src.endswith(('"', "\\")):
+        return f'r"""{cpp_src}"""'
+    if "'''" not in cpp_src and not cpp_src.endswith(("'", "\\")):
+        return f"r'''{cpp_src}'''"
+    return repr(cpp_src)
+
+
+def _replace_str_constant_in_module(
+    module_src: str,
+    symbol_name: str,
+    new_cpp_src: str,
+) -> str:
+    tree = ast.parse(module_src)
+    node = _find_str_constant_node(tree, symbol_name)
+    if (
+        node is not None
+        and node.end_lineno is not None
+        and node.end_col_offset is not None
+    ):
+        lines = module_src.splitlines(keepends=True)
+        start_line = lines[node.lineno - 1].encode("utf-8")
+        end_line = lines[node.end_lineno - 1].encode("utf-8")
+        prefix = "".join(lines[: node.lineno - 1]) + start_line[: node.col_offset].decode("utf-8")
+        suffix = end_line[node.end_col_offset :].decode("utf-8") + "".join(lines[node.end_lineno :])
+        candidate = f"{prefix}{_format_cpp_string_literal(new_cpp_src)}{suffix}"
+        try:
+            parsed = ast.parse(candidate)
+            if _extract_str_constant(parsed, symbol_name) == new_cpp_src:
+                return candidate
+        except SyntaxError:
+            pass
+    if node is not None:
+        node.value = new_cpp_src
+    ast.fix_missing_locations(tree)
+    return ast.unparse(tree)
+
+
+def _classify_cpp_hunk_kind(before_seg: str, after_seg: str) -> str:
+    combined = f"{before_seg} {after_seg}"
+    if "& 1" in combined or "% 2" in combined or "(event_t)1" in combined:
+        return "static_pingpong_unroll"
+    if (
+        "asc_sync_notify" in combined
+        or "asc_lock" in combined
+        or "asc_unlock" in combined
+        or "pipe_barrier" in combined
+        or "CrossCore" in combined
+    ):
+        return "barrier_prune"
+    if "+ 16" in combined or "+ 32" in combined or "STRIDE" in combined or "PAD" in combined:
+        return "pad_alignment"
+    if (
+        "asc_copy_gm2ub" in combined
+        or "asc_copy_ub2gm" in combined
+        or "asc_copy_gm2l1" in combined
+        or "asc_copy_l0c2ub" in combined
+    ):
+        return "coalesced_copy"
+    if "get_subblockid" in combined or "1c2v" in combined.lower():
+        return "dual_copy_1c2v"
+    if "block_idx" in combined or "num_cores" in combined or "get_block_num" in combined:
+        return "core_parallelism"
+    if "simd_inst::" in combined and after_seg.count("for ") > before_seg.count("for "):
+        return "loop_fission_sfu"
+    return "cpp_hunk_edit"
+
+
+def _discover_trackb_cpp_symbols(tree: ast.Module) -> list[str]:
+    symbols: list[str] = []
+    for node in tree.body:
+        name: str | None = None
+        val: ast.AST | None = None
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            name, val = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, val = node.target.id, node.value
+        if not name or not isinstance(val, ast.Constant) or not isinstance(val.value, str):
+            continue
+        cpp_text = val.value
+        if (
+            name.endswith("_TRACKB_SRC")
+            or "tl_templates/ascend/" in cpp_text
+            or "__aicore__" in cpp_text
+            or "__global__" in cpp_text
+            or "__simd_vf__" in cpp_text
+        ):
+            symbols.append(name)
+    return symbols
+
+
+def decompose_cpp_string_leave_one_out(
+    baseline_module_src: str,
+    winner_module_src: str,
+    cpp_symbol_name: str,
+) -> list[AstEditChunk]:
+    """Generate Leave-One-Out counterfactual modules by reverting one C++ diff hunk at a time."""
+    base_tree = ast.parse(baseline_module_src)
+    win_tree = ast.parse(winner_module_src)
+    base_cpp = _extract_str_constant(base_tree, cpp_symbol_name)
+    win_cpp = _extract_str_constant(win_tree, cpp_symbol_name)
+    if not base_cpp or not win_cpp or base_cpp == win_cpp:
+        return []
+
+    base_lines = base_cpp.splitlines(keepends=True)
+    win_lines = win_cpp.splitlines(keepends=True)
+    matcher = difflib.SequenceMatcher(a=base_lines, b=win_lines, autojunk=False)
+    diff_ops = [
+        (tag, i1, i2, j1, j2)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes()
+        if tag != "equal"
+    ]
+    if len(diff_ops) <= 1:
+        return []
+
+    chunks: list[AstEditChunk] = []
+    for idx, (_tag, i1, i2, j1, j2) in enumerate(diff_ops):
+        mid_lines = list(base_lines[i1:i2])
+        if mid_lines and j2 < len(win_lines) and not mid_lines[-1].endswith("\n"):
+            mid_lines[-1] = mid_lines[-1] + "\n"
+        ablated_cpp = "".join([*win_lines[:j1], *mid_lines, *win_lines[j2:]])
+        if ablated_cpp.count("{") != ablated_cpp.count("}"):
+            continue
+        before_seg = "".join(base_lines[i1:i2]).strip()
+        after_seg = "".join(win_lines[j1:j2]).strip()
+        ablated_mod_src = _replace_str_constant_in_module(
+            winner_module_src, cpp_symbol_name, ablated_cpp
+        )
+        chunks.append(
+            AstEditChunk(
+                chunk_id=f"cpp_loo_{cpp_symbol_name}_{idx}",
+                edit_kind=_classify_cpp_hunk_kind(before_seg, after_seg),
+                target_path=f"{cpp_symbol_name}:L{j1 + 1}-L{max(j1 + 1, j2)}",
+                before_src=before_seg,
+                after_src=after_seg,
+                ablated_dsl=ablated_mod_src,
+            )
+        )
+    return chunks
+
+
 def decompose_leave_one_out_ablations(
     baseline_dsl: str,
     winner_dsl: str,
 ) -> tuple[AstEditChunk, ...]:
-    """Decompose winner_dsl into Leave-One-Out AST and config-dict ablations."""
+    """Decompose winner_dsl into Leave-One-Out AST, config-dict, and Track-B C++ ablations."""
     base_tree = ast.parse(baseline_dsl)
     win_tree = ast.parse(winner_dsl)
     chunks: list[AstEditChunk] = []
     seen_dsls: set[str] = {ast.unparse(win_tree)}
+
+    base_cpp_syms = set(_discover_trackb_cpp_symbols(base_tree))
+    decomposed_cpp_syms: set[str] = set()
+    for sym_name in _discover_trackb_cpp_symbols(win_tree):
+        if sym_name not in base_cpp_syms:
+            continue
+        cpp_chunks = decompose_cpp_string_leave_one_out(baseline_dsl, winner_dsl, sym_name)
+        if not cpp_chunks:
+            continue
+        decomposed_cpp_syms.add(sym_name)
+        for ch in cpp_chunks:
+            norm = ast.unparse(ast.parse(ch.ablated_dsl))
+            if norm not in seen_dsls:
+                seen_dsls.add(norm)
+                chunks.append(ch)
 
     _extract_config_dict_loo_chunks(base_tree, win_tree, chunks, seen_dsls)
     _extract_leave_one_out_stmt_deltas(
@@ -1074,6 +1306,7 @@ def decompose_leave_one_out_ablations(
         "module",
         chunks,
         seen_dsls,
+        skip_assign_symbols=frozenset(decomposed_cpp_syms),
     )
     return tuple(chunks)
 
@@ -1830,9 +2063,10 @@ def verify_micro_probe_hardware(
 
     import importlib.util
     import tempfile
+
     import tilelang
-    from tilelang.profiler import do_bench
     import torch
+    from tilelang.profiler import do_bench
 
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         raise RuntimeError("Ascend NPU device is required for live micro-probe verification.")
@@ -1975,6 +2209,11 @@ def _generalize_template_text(chunk: AstEditChunk) -> str:
             "Tune schedule configuration dictionary parameters (tile shapes, buffer stages, "
             "swizzle window, and bank padding) to maximize hardware pipeline occupancy without overflow."
         )
+    if chunk.edit_kind == "cpp_hunk_edit":
+        return (
+            "Apply targeted tl_templates/ascend C++20 kernel optimizations across vector SIMD, "
+            "DMA alignment, and on-chip buffer staging while preserving exact synchronization parity."
+        )
     return (
         "Replace sequential or over-synchronized inner statements with non-blocking "
         "pipelined vector and DMA execution while preserving static UB headroom."
@@ -2044,8 +2283,13 @@ def _rule_predicates_for_kind(
 
 def _is_rule_text_clean(rule: AscendCausalRule) -> tuple[bool, str]:
     joined = " ".join(rule.as_six_tuple()).lower()
-    for bad in _DISALLOWED_PROVENANCE_TOKENS:
-        if bad in joined:
+    if rule.cpp20_transform_template:
+        joined = f"{joined} {rule.cpp20_transform_template.lower()}"
+    for bad in _build_disallowed_provenance_tokens():
+        if bad in _SUBSTRING_PROVENANCE_TOKENS:
+            if bad in joined:
+                return False, f"disallowed token {bad!r} in distilled rule text"
+        elif re.search(rf"(?<![a-z0-9_]){re.escape(bad)}(?![a-z0-9_])", joined):
             return False, f"disallowed token {bad!r} in distilled rule text"
     if re.search(r"/(home|tmp|var|usr)/", joined):
         return False, "filesystem path leaked into rule text"
@@ -2076,6 +2320,13 @@ def distill_causal_rule(
         f"Counterfactual single-variable ablation verified on Ascend 950 micro-probe "
         f"({chunk.edit_kind}, speedup={speedup:.3f}x)."
     )
+    is_cpp_chunk = chunk.chunk_id.startswith("cpp_loo_") or chunk.edit_kind == "cpp_hunk_edit"
+    backends: tuple[str, ...] = (
+        ("ascendc_trackb", "hybrid_trackb")
+        if is_cpp_chunk
+        else ("tilelang_dsl", "ascendc_trackb", "hybrid_trackb")
+    )
+    cpp_template = template if is_cpp_chunk else ""
     return AscendCausalRule(
         rule_id=rule_id,
         regime_guard=regime_guard,
@@ -2089,6 +2340,8 @@ def distill_causal_rule(
         priority=85,
         scope=scope,
         origin_operator=origin_operator,
+        compatible_backends=backends,
+        cpp20_transform_template=cpp_template,
     )
 
 
@@ -2221,7 +2474,6 @@ class FlywheelDistiller:
             else:
                 var_lat = float(max(eval_res.stage_a.ledger.pipe_cycles.values(), default=100)) / 20.0
 
-            # Leave-One-Out causal gain: removing/reverting edit hurts latency (var_lat > win_lat)
             rel_gain = (var_lat - win_lat) / max(var_lat, 1e-6)
             is_pos = var_lat > win_lat and rel_gain >= self._min_edit_gain
             meas = AblationMeasurement(
@@ -2585,7 +2837,9 @@ __all__ = [
     "FlywheelDistillationReport",
     "FlywheelDistiller",
     "MicroProbeSpec",
+    "_build_disallowed_provenance_tokens",
     "decompose_ast_ablations",
+    "decompose_cpp_string_leave_one_out",
     "decompose_leave_one_out_ablations",
     "distill_causal_rule",
     "synthesize_micro_probe",

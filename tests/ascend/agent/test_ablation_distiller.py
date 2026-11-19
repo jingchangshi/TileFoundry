@@ -1,14 +1,23 @@
 """Offline unit tests for WP6 counterfactual AST ablation distiller and KB admission."""
 
+import ast
 import json
 from pathlib import Path
 
 from tilefoundry_ascend.agent import BayesianRuleTracker, FlywheelDistiller, GateFunnel
+from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
 from tilefoundry_ascend.agent.flywheel import (
     decompose_ast_ablations,
     synthesize_micro_probe,
 )
-from tilefoundry_ascend.agent.kb import load_seed_rules, safe_eval_predicate
+from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
+    AstEditChunk,
+    _build_disallowed_provenance_tokens,
+    _is_rule_text_clean,
+    decompose_leave_one_out_ablations,
+    distill_causal_rule,
+)
+from tilefoundry_ascend.agent.kb import AscendCausalRule, load_seed_rules, safe_eval_predicate
 from tilefoundry_ascend.agent.orchestrator import (
     StageBResult,
     StageCResult,
@@ -332,8 +341,8 @@ def test_hardware_gate_enforces_108x_and_wait_ratio_non_regression(tmp_path: Pat
         FlywheelDistiller,
         verify_micro_probe_hardware,
     )
-    from tilefoundry_ascend.agent.kb.schema import validate_rule_predicate
     from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
+    from tilefoundry_ascend.agent.kb.schema import validate_rule_predicate
     from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
         GateFunnel,
         StageCResult,
@@ -555,5 +564,78 @@ def make_reg_kernel(cores: int = 2):
     assert rep.admitted_rule_ids
     for rid in rep.admitted_rule_ids:
         assert rid in tracker.axis_posteriors.get("mr:gm_ub_stream", {})
+
+
+def test_trackb_cpp_hunk_leave_one_out_and_60_op_provenance_guard() -> None:
+    """Verify 3-edit _SOFTMAX_TRACKB_SRC LOO yields 3 variants and blocks all 60 op names."""
+    base_trackb_mod = (
+        '_SOFTMAX_TRACKB_SRC = r"""\n'
+        '#include <tl_templates/ascend/common.h>\n'
+        '#include <tl_templates/ascend/simd_inst.h>\n'
+        '__aicore__ void kernel_entry(int n_iters) {\n'
+        '  int stride = 64;\n'
+        '  for (int i = 0; i < n_iters; ++i) {\n'
+        '    asc_sync_notify(PIPE_MTE2, PIPE_V, EVENT_ID0);\n'
+        '  }\n'
+        '  simd_inst::vsts_norm(vec_out, ub_dst, 0, m32);\n'
+        '}\n'
+        '"""\n'
+    )
+    win_trackb_mod = (
+        '_SOFTMAX_TRACKB_SRC = r"""\n'
+        '#include <tl_templates/ascend/common.h>\n'
+        '#include <tl_templates/ascend/simd_inst.h>\n'
+        '__aicore__ void kernel_entry(int n_iters) {\n'
+        '  int stride = 64 + 16;\n'
+        '  for (int i = 0; i < n_iters; ++i) {\n'
+        '    asc_sync_notify(PIPE_MTE2, PIPE_V, (event_t)(i & 1));\n'
+        '  }\n'
+        '  simd_inst::vsts_pack_b32(vec_out16, ub_dst, 0, m32);\n'
+        '}\n'
+        '"""\n'
+    )
+
+    chunks = decompose_leave_one_out_ablations(base_trackb_mod, win_trackb_mod)
+    assert len(chunks) == 3
+
+    seen_cpp_bodies: list[str] = []
+    for ch in chunks:
+        assert ch.chunk_id.startswith("cpp_loo__SOFTMAX_TRACKB_SRC_")
+        assert ch.target_path.startswith("_SOFTMAX_TRACKB_SRC:L")
+        tree = ast.parse(ch.ablated_dsl)
+        assign = next(n for n in tree.body if isinstance(n, ast.Assign))
+        assert isinstance(assign.value, ast.Constant)
+        cpp_body = str(assign.value.value)
+        assert cpp_body.count("{") == cpp_body.count("}")
+        seen_cpp_bodies.append(cpp_body)
+
+        rule = distill_causal_rule(ch, rule_id=f"R_TB_{ch.chunk_id}")
+        assert rule.compatible_backends == ("ascendc_trackb", "hybrid_trackb")
+        assert rule.cpp20_transform_template
+        clean_ok, clean_msg = _is_rule_text_clean(rule)
+        assert clean_ok is True, clean_msg
+
+    assert any("int stride = 64;" in body and "i & 1" in body for body in seen_cpp_bodies)
+    assert any("EVENT_ID0" in body and "64 + 16" in body for body in seen_cpp_bodies)
+    assert any("vsts_norm" in body and "i & 1" in body for body in seen_cpp_bodies)
+
+    disallowed = _build_disallowed_provenance_tokens()
+    all_ops = CannbenchOpsRegistry.default().list_operators()
+    assert len(all_ops) == 60
+    for op_id in all_ops:
+        assert op_id.lower() in disallowed
+        leaky_rule = AscendCausalRule(
+            rule_id="R_LEAKY",
+            regime_guard="is_legal",
+            precondition="PIPE_V > 0",
+            transform_template=f"Apply custom optimization for {op_id} kernel.",
+            expected_postcondition="PIPE_V <= prev.PIPE_V",
+            source_provenance="flywheel:ablation",
+        )
+        ok, _reason = _is_rule_text_clean(leaky_rule)
+        assert ok is False, f"Expected provenance filter to reject {op_id!r}"
+
+    clean_chunk = AstEditChunk("c_ok", "pad_alignment", "module", "64", "64 + 16", win_trackb_mod)
+    assert _is_rule_text_clean(distill_causal_rule(clean_chunk, rule_id="R_CLEAN"))[0] is True
 
 

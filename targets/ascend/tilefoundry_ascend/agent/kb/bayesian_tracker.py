@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field, replace
 import json
 import os
-from pathlib import Path
 import re
 import tempfile
 import time
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field, replace
+from pathlib import Path
 
-from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, load_seed_rules
+from tilefoundry_ascend.agent.kb.schema import (
+    AscendCausalRule,
+    load_seed_rules,
+    normalize_runtime_backend,
+)
 
 _SAFE_KB_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -466,8 +470,6 @@ class BayesianRuleTracker:
                 for axis_key in axis_keys
             ]
             if any(st is not None for st in axis_states):
-                # Require at least 2 of 3 factorized axes of this topology to be pruned
-                # so sharing a single axis (e.g. ir:affine_simd) never causes bleed.
                 return sum(1 for st in axis_states if st is not None and st.pruned) >= 2
             if any(rule_id in states for states in self.axis_posteriors.values()):
                 return False
@@ -479,12 +481,16 @@ class BayesianRuleTracker:
         *,
         topology_axes: object | None = None,
         operator_name: str = "",
+        runtime_backend: str | None = None,
     ) -> tuple[AscendCausalRule, ...]:
-        """Return all non-pruned rules visible to *operator_name* sorted deterministically."""
+        """Return all non-pruned rules visible to *operator_name* and *runtime_backend*."""
         eff_op = str(operator_name or "").strip()
+        eff_backend = normalize_runtime_backend(runtime_backend)
         selected: list[AscendCausalRule] = []
         for rule_id, rule in sorted(self.rules.items()):
             if self.is_pruned(rule_id, topology_axes=topology_axes):
+                continue
+            if not rule.supports_backend(eff_backend):
                 continue
             if (
                 rule.scope == "operator_local"
@@ -532,11 +538,22 @@ class BayesianRuleTracker:
         top_k: int | None = None,
         topology_axes: object | None = None,
         operator_name: str = "",
+        runtime_backend: str | None = None,
     ) -> tuple[AscendCausalRule, ...]:
-        """Filter matching non-pruned rules and rank by factorized 3-axis posterior rate and priority."""
+        """Filter matching rules by backend and rank by 3-axis posterior rate and priority."""
         eff_op = str(operator_name or "").strip() or str(context.get("operator_name") or "").strip()
+        raw_backend = (
+            runtime_backend
+            if runtime_backend is not None
+            else (context.get("runtime_backend") or context.get("backend_kind"))
+        )
+        eff_backend = normalize_runtime_backend(str(raw_backend)) if raw_backend else None
         candidates: list[tuple[tuple[float, float, int, str], AscendCausalRule]] = []
-        for rule in self.active_rules(topology_axes=topology_axes, operator_name=eff_op):
+        for rule in self.active_rules(
+            topology_axes=topology_axes,
+            operator_name=eff_op,
+            runtime_backend=eff_backend,
+        ):
             if not rule.matches(context):
                 continue
             if topology_axes is not None:
@@ -553,7 +570,7 @@ class BayesianRuleTracker:
                 -int(rule.priority),
                 rule.rule_id,
             )
-            candidates.append((score_key, rule))
+            candidates.append((score_key, rule.render_for_backend(eff_backend)))
         candidates.sort(key=lambda item: item[0], reverse=True)
         selected = [rule for _key, rule in candidates]
         if top_k is not None and top_k >= 0:
