@@ -33,6 +33,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     get_operator_task,
     parse_simple_env_file,
     resolve_cannbench_repo,
+    resolve_cannbench_tasks_root,
 )
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
@@ -91,6 +92,13 @@ _AGENT_GATES_ALLOWED_ENV_KEYS = frozenset(
         "TILEFOUNDRY_NPU_CANNBENCH_ARCH",
         "TILEFOUNDRY_NPU_CANNBENCH_TARGETS_FILE",
         "TILEFOUNDRY_NPU_CANNBENCH_TARGETS",
+        "TILEFOUNDRY_NPU_CANNBENCH_MCP_URL",
+        "TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN",
+        "TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE",
+        "TILEFOUNDRY_NPU_CANNBENCH_BENCHMARK_VERSION",
+        "TILEFOUNDRY_NPU_CANNBENCH_POOL_ID",
+        "TILEFOUNDRY_NPU_CANNBENCH_AGGREGATION_TOKEN",
+        "TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT",
         "TILEFOUNDRY_NPU_LLM_BACKEND",
         "TILEFOUNDRY_NPU_AGY_BIN",
         "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
@@ -103,6 +111,11 @@ _AGENT_GATES_ALLOWED_ENV_KEYS = frozenset(
         "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
     }
 )
+
+
+def _is_agent_gates_allowed_env_key(key: str) -> bool:
+    """Return True if *key* is accepted by the AgentGates tilefoundry-npu adapter."""
+    return key in _AGENT_GATES_ALLOWED_ENV_KEYS or key.startswith("TILEFOUNDRY_NPU_CANNBENCH_")
 
 
 @dataclass(frozen=True)
@@ -188,7 +201,10 @@ def ensure_operator_seed_module(
     ops_root: Path | None = None
     if cannbench_repo is not None:
         cand = Path(cannbench_repo).expanduser().resolve()
-        ops_root = (cand / "operators") if (cand / "operators").is_dir() else cand
+        try:
+            ops_root = resolve_cannbench_tasks_root(cand)
+        except FileNotFoundError:
+            ops_root = cand
     try:
         registry = (
             CannbotOpsRegistry(operators_root=ops_root)
@@ -257,6 +273,7 @@ def ensure_operator_seed_module(
         '    env_repo = os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()\n'
         "    if env_repo:\n"
         '        candidates.insert(0, Path(env_repo).expanduser() / "operators" / _GOLDEN_TASK / "golden.py")\n'
+        '        candidates.insert(0, Path(env_repo).expanduser() / "tasks" / _GOLDEN_TASK / "golden.py")\n'
         "    for cand in candidates:\n"
         "        if cand.is_file():\n"
         '            mod_name = "_tf_golden_" + _GOLDEN_TASK.replace("/", "_")\n'
@@ -447,8 +464,14 @@ def discover_marathon_environment(
     if "TILEFOUNDRY_NPU_TILELANG_BUILD" not in values and (tl_src / "build").is_dir():
         values["TILEFOUNDRY_NPU_TILELANG_BUILD"] = str(tl_src / "build")
 
+    if not values.get("TILEFOUNDRY_NPU_CANNBENCH_REPO"):
+        for folder_name in ("cann-bench", "cannbot-ops"):
+            cand = ws_parent / folder_name
+            if cand.is_dir() and ((cand / "tasks").is_dir() or (cand / "operators").is_dir()):
+                values["TILEFOUNDRY_NPU_CANNBENCH_REPO"] = str(cand)
+                break
+
     sibling_keys = (
-        ("TILEFOUNDRY_NPU_CANNBENCH_REPO", "cannbot-ops"),
         ("TILEFOUNDRY_NPU_CANNBOT_DSL_REPO", "cannbot-dsl"),
         ("TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO", "ops-transformer"),
         ("TILEFOUNDRY_NPU_ASC_DEVKIT_REPO", "asc-devkit"),
@@ -516,12 +539,12 @@ def ensure_marathon_env_file(
         base_env_file=target if target.is_file() else None,
     )
     allowed_discovered = {
-        key: val for key, val in discovered.items() if key in _AGENT_GATES_ALLOWED_ENV_KEYS
+        key: val for key, val in discovered.items() if _is_agent_gates_allowed_env_key(key)
     }
     if target.is_file():
         existing = parse_simple_env_file(target)
         disallowed_existing = [
-            key for key in existing if key not in _AGENT_GATES_ALLOWED_ENV_KEYS
+            key for key in existing if not _is_agent_gates_allowed_env_key(key)
         ]
         missing = [
             key
@@ -535,7 +558,7 @@ def ensure_marathon_env_file(
             {
                 key: val
                 for key, val in existing.items()
-                if val and key in _AGENT_GATES_ALLOWED_ENV_KEYS
+                if val and _is_agent_gates_allowed_env_key(key)
             }
         )
     else:
@@ -568,6 +591,7 @@ def configure_marathon_process_env(
     os.environ["TMP"] = str(tmp_dir)
     os.environ["PYTHONUNBUFFERED"] = "1"
     os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+    os.environ.setdefault("PYTHONNOUSERSITE", "1")
     os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
     os.environ["USE_CUDA"] = "0"
     os.environ.pop("ASCEND_RT_VISIBLE_DEVICES", None)
@@ -853,9 +877,11 @@ def _empty_tensors(shapes, dtypes):
 
 task_dir = bench_dir / op_name
 if not task_dir.is_dir() and cann_repo_hint:
-    cand_dir = Path(cann_repo_hint) / "operators" / task_name
-    if cand_dir.is_dir():
-        task_dir = cand_dir
+    for _subdir in ("tasks", "operators"):
+        cand_dir = Path(cann_repo_hint) / _subdir / task_name
+        if cand_dir.is_dir():
+            task_dir = cand_dir
+            break
 harness = cannbench_contract.Harness(task_name, task_dir)
 entrypoint = getattr(mod, op_name, getattr(mod, "kernel", None))
 compiled = 0

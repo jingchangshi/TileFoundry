@@ -737,23 +737,34 @@ class CannbotOpsRegistry:
     def _resolve_operators_root(self, operators_root: str | Path | None) -> Path:
         if operators_root is not None:
             p = Path(operators_root).expanduser().resolve()
-            if (p / "operators").is_dir():
-                return (p / "operators").resolve()
-            if p.is_dir():
-                return p
-            raise FileNotFoundError(f"cannbot-ops operators directory not found: {p}")
+            try:
+                return resolve_cannbench_tasks_root(p)
+            except FileNotFoundError:
+                if p.is_dir():
+                    return p
+                raise FileNotFoundError(f"CANNBench tasks/operators directory not found: {p}")
 
         candidates: list[Path] = []
         env_repo = os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
         if env_repo:
-            candidates.append(Path(env_repo).expanduser() / "operators")
-        candidates.append(self._source_root.parent / "cannbot-ops" / "operators")
-        candidates.append(Path.home() / "workspace" / "cannbot-ops" / "operators")
+            env_path = Path(env_repo).expanduser()
+            candidates.extend((env_path / "tasks", env_path / "operators", env_path))
+        candidates.extend(
+            (
+                self._source_root.parent / "cann-bench" / "tasks",
+                self._source_root.parent / "cannbot-ops" / "operators",
+                Path.home() / "workspace" / "cann-bench" / "tasks",
+                Path.home() / "workspace" / "cannbot-ops" / "operators",
+            )
+        )
+        for cand in candidates:
+            if cand.is_dir() and _has_task_layout(cand):
+                return cand.resolve()
         for cand in candidates:
             if cand.is_dir():
                 return cand.resolve()
         raise FileNotFoundError(
-            "Cannot locate cannbot-ops/operators directory. "
+            "Cannot locate CANNBench tasks/ or operators/ directory. "
             "Pass operators_root or set TILEFOUNDRY_NPU_CANNBENCH_REPO."
         )
 
@@ -1146,6 +1157,43 @@ def parse_simple_env_file(env_file: str | Path) -> dict[str, str]:
     return parsed
 
 
+def _has_task_layout(path: Path) -> bool:
+    """Return True if *path* contains CANNBench tasks/operators metadata or level dirs."""
+    if not path.is_dir():
+        return False
+    if (path / "suite_manifest.json").is_file() or (path / "metadata").is_dir():
+        return True
+    return any((path / f"level{lvl}").is_dir() for lvl in range(1, 6))
+
+
+def resolve_cannbench_tasks_root(repo: str | Path) -> Path:
+    """Resolve the tasks/operators root inside a CANNBench checkout.
+
+    Supports both official ``cann-bench`` (``<repo>/tasks``) and legacy
+    ``cannbot-ops`` (``<repo>/operators``) layouts as well as a direct tasks root.
+    """
+    base = Path(repo).expanduser().resolve()
+    for subdir in ("tasks", "operators"):
+        cand = base / subdir
+        if cand.is_dir() and _has_task_layout(cand):
+            return cand.resolve()
+    if _has_task_layout(base):
+        return base
+    for subdir in ("tasks", "operators"):
+        cand = base / subdir
+        if cand.is_dir():
+            return cand.resolve()
+    raise FileNotFoundError(
+        f"Cannot locate tasks/ or operators/ directory under CANNBench repo: {base}"
+    )
+
+
+def _is_valid_cannbench_repo(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    return (path / "tasks").is_dir() or (path / "operators").is_dir() or _has_task_layout(path)
+
+
 def resolve_cannbench_repo(
     cannbench_repo: str | Path | None = None,
     env_file: str | Path | None = None,
@@ -1169,13 +1217,15 @@ def resolve_cannbench_repo(
 
     for raw in candidates:
         path = Path(raw).expanduser()
-        if path.is_dir() and (path / "operators").is_dir():
+        if _is_valid_cannbench_repo(path):
             return path.resolve()
     for fallback in (
+        default_source_root().parent / "cann-bench",
         default_source_root().parent / "cannbot-ops",
+        Path.home() / "workspace" / "cann-bench",
         Path.home() / "workspace" / "cannbot-ops",
     ):
-        if fallback.is_dir() and (fallback / "operators").is_dir():
+        if _is_valid_cannbench_repo(fallback):
             return fallback.resolve()
     raise FileNotFoundError(
         "Cannot locate TILEFOUNDRY_NPU_CANNBENCH_REPO. "
@@ -1213,7 +1263,8 @@ def load_anchor_harness_and_cases(
     """Instantiate cannbench_contract.Harness and filter active anchor Case objects."""
     task = get_operator_task(operator_name)
     repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
-    task_dir = repo / "operators" / task
+    tasks_root = resolve_cannbench_tasks_root(repo)
+    task_dir = tasks_root / task
     if not task_dir.is_dir():
         raise FileNotFoundError(f"CANNBench task directory missing: {task_dir}")
     contract_mod = load_cannbench_contract_module(source_root=source_root)
@@ -1235,9 +1286,9 @@ def lookup_case_metadata(
     cannbench_repo: str | Path | None = None,
     env_file: str | Path | None = None,
 ) -> tuple[float, float]:
-    """Read (baseline_perf_us, t_hw_us) from operators/metadata/950pr.json."""
+    """Read (baseline_perf_us, t_hw_us) from <tasks_root>/metadata/950pr.json."""
     repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
-    meta_path = repo / "operators" / "metadata" / "950pr.json"
+    meta_path = resolve_cannbench_tasks_root(repo) / "metadata" / "950pr.json"
     payload = json.loads(meta_path.read_text(encoding="utf-8"))
     task = get_operator_task(operator_name)
     level, op_key = task.split("/", 1)
@@ -1252,10 +1303,10 @@ def lookup_case_dims(
     cannbench_repo: str | Path | None = None,
     env_file: str | Path | None = None,
 ) -> dict[str, object]:
-    """Extract tensor dimensions and dispatch attributes from operators/<task>/cases.yaml."""
+    """Extract tensor dimensions and dispatch attributes from <tasks_root>/<task>/cases.yaml."""
     repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
     task = get_operator_task(operator_name)
-    cases_path = repo / "operators" / task / "cases.yaml"
+    cases_path = resolve_cannbench_tasks_root(repo) / task / "cases.yaml"
     if not cases_path.is_file():
         raise FileNotFoundError(f"cases.yaml not found at {cases_path}")
     parsed = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
@@ -1594,5 +1645,6 @@ __all__ = [
     "lookup_case_metadata",
     "parse_simple_env_file",
     "resolve_cannbench_repo",
+    "resolve_cannbench_tasks_root",
     "resolve_regime_for_case",
 ]

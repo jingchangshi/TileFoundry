@@ -51,6 +51,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     lookup_case_dims,
     parse_simple_env_file,
     resolve_cannbench_repo,
+    resolve_cannbench_tasks_root,
 )
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
@@ -365,10 +366,13 @@ from types import SimpleNamespace
 
 
 def _load_compare_tensors():
-    cann_repo = {cann_repo!r}
-    vendor_src = str(Path(cann_repo) / "vendor" / "cannbench" / "src")
-    if vendor_src not in sys.path:
-        sys.path.insert(0, vendor_src)
+    cann_repo = Path({cann_repo!r})
+    for src_dir in (
+        cann_repo / "src",
+        cann_repo / "vendor" / "cannbench" / "src",
+    ):
+        if src_dir.is_dir() and str(src_dir) not in sys.path:
+            sys.path.insert(0, str(src_dir))
     from kernel_eval.utils.compare import compare_tensors
 
     return compare_tensors
@@ -1015,7 +1019,7 @@ def lookup_case_static_spec(
     """Read static dims, tl_dtype, and attributes directly from cases.yaml."""
     repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
     task = get_operator_task(operator_name)
-    cases_path = repo / "operators" / task / "cases.yaml"
+    cases_path = resolve_cannbench_tasks_root(repo) / task / "cases.yaml"
     if not cases_path.is_file():
         raise FileNotFoundError(f"cases.yaml not found at {cases_path}")
     parsed = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
@@ -1202,6 +1206,7 @@ def _clean_agent_gates_subprocess_env(extra_env: Mapping[str, str]) -> dict[str,
         for k, v in os.environ.items()
         if not k.startswith("TILEFOUNDRY_NPU_") and k not in _STRIPPED_HOST_CPU_ENV_KEYS
     }
+    env.setdefault("PYTHONNOUSERSITE", "1")
     env.update(extra_env)
     return env
 

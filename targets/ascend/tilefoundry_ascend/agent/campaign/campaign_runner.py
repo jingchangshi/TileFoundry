@@ -33,6 +33,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     get_input_domain_envelope,
     get_operator_module_relpath,
     lookup_case_dims,
+    resolve_cannbench_tasks_root,
     resolve_regime_for_case,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
@@ -1040,7 +1041,7 @@ class PerfTargetCampaignRunner:
             self._sil_advisory = None
             try:
                 ops_root = (
-                    (self._cannbench_repo / "operators")
+                    resolve_cannbench_tasks_root(self._cannbench_repo)
                     if self._cannbench_repo is not None
                     else None
                 )

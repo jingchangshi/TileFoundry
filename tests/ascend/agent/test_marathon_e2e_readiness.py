@@ -374,3 +374,210 @@ def test_ensure_operator_seed_module_bootstraps_apply_rotary_pos_emb_and_passes_
         assert torch.allclose(k_out, k)
     finally:
         sys.modules.pop(mod_spec.name, None)
+
+
+def _create_synthetic_cannbench_repo(
+    repo_root: Path,
+    *,
+    layout_subdir: str,
+    use_top_level_src: bool,
+) -> Path:
+    tasks_root = repo_root / layout_subdir
+    op_dir = tasks_root / "level2" / "softmax"
+    op_dir.mkdir(parents=True, exist_ok=True)
+    meta_dir = tasks_root / "metadata"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+
+    (tasks_root / "suite_manifest.json").write_text(
+        json.dumps(
+            {
+                "operators": [
+                    {"id": "softmax", "level": "L2", "path": "tasks/level2/softmax"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    (meta_dir / "950pr.json").write_text(
+        json.dumps(
+            {
+                "level2": {
+                    "softmax": {
+                        "1": {"baseline_perf_us": 42.5, "t_hw_us": 10.5},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (op_dir / "proto.yaml").write_text(
+        "name: softmax\n"
+        "inputs:\n"
+        "  - name: x\n"
+        "outputs:\n"
+        "  - name: y\n"
+        "attributes:\n"
+        "  - name: dim\n"
+        "    default: -1\n",
+        encoding="utf-8",
+    )
+    (op_dir / "cases.yaml").write_text(
+        "cases:\n"
+        "  - case_id: 1\n"
+        "    input_shape: [[16, 128]]\n"
+        "    dtype: bfloat16\n"
+        "    attrs:\n"
+        "      dim: -1\n",
+        encoding="utf-8",
+    )
+    (op_dir / "golden.py").write_text(
+        "import torch\n"
+        "def softmax(x, dim=-1):\n"
+        "    return torch.softmax(x, dim=dim)\n",
+        encoding="utf-8",
+    )
+    src_dir = (
+        repo_root / "src" / "kernel_eval" / "utils"
+        if use_top_level_src
+        else repo_root / "vendor" / "cannbench" / "src" / "kernel_eval" / "utils"
+    )
+    src_dir.mkdir(parents=True, exist_ok=True)
+    (src_dir.parent.parent / "__init__.py").write_text("", encoding="utf-8")
+    (src_dir.parent / "__init__.py").write_text("", encoding="utf-8")
+    (src_dir / "__init__.py").write_text("", encoding="utf-8")
+    (src_dir / "compare.py").write_text(
+        "from types import SimpleNamespace\n"
+        "def compare_tensors(actual, golden, **kwargs):\n"
+        "    return SimpleNamespace(passed=True, mere=0.0, mare=0.0, max_diff=0.0, error_msg='')\n",
+        encoding="utf-8",
+    )
+    return repo_root
+
+
+@pytest.mark.parametrize(
+    ("layout_subdir", "use_top_level_src"),
+    [("tasks", True), ("operators", False)],
+)
+def test_cannbench_dual_layout_decoupling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layout_subdir: str,
+    use_top_level_src: bool,
+) -> None:
+    """Verify TileFoundry Ascend works cleanly with both cann-bench (tasks/) and cannbot-ops (operators/)."""
+    from tilefoundry_ascend.agent.campaign.anchor_specs import (
+        CannbotOpsRegistry,
+        lookup_case_dims,
+        lookup_case_metadata,
+        resolve_cannbench_repo,
+        resolve_cannbench_tasks_root,
+    )
+    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+        ensure_npu_compare_shim_dir,
+        lookup_case_static_spec,
+    )
+    from tilefoundry_ascend.ascend.sil.op_analyzer import OpAdvisoryExtractor
+
+    repo = _create_synthetic_cannbench_repo(
+        tmp_path / f"repo_{layout_subdir}",
+        layout_subdir=layout_subdir,
+        use_top_level_src=use_top_level_src,
+    )
+    monkeypatch.setenv("TILEFOUNDRY_NPU_CANNBENCH_REPO", str(repo))
+
+    assert resolve_cannbench_repo() == repo.resolve()
+    assert resolve_cannbench_tasks_root(repo) == (repo / layout_subdir).resolve()
+
+    reg = CannbotOpsRegistry(operators_root=repo)
+    assert reg.has_operator("softmax")
+    assert reg.resolve("softmax").task == "level2/softmax"
+
+    baseline_us, t_hw_us = lookup_case_metadata("softmax", 1, cannbench_repo=repo)
+    assert baseline_us == pytest.approx(42.5)
+    assert t_hw_us == pytest.approx(10.5)
+
+    dims = lookup_case_dims("softmax", 1, cannbench_repo=repo)
+    assert dims["dim"] == -1
+    assert dims["M"] == 16 and dims["D"] == 128
+
+    static_spec = lookup_case_static_spec("softmax", 1, cannbench_repo=repo)
+    assert static_spec["tl_dtype"] == "bfloat16"
+
+    extractor = OpAdvisoryExtractor(repo)
+    assert extractor.ops_root == (repo / layout_subdir)
+    advisory = extractor.extract("softmax")
+    assert advisory.op_name == "softmax"
+
+    seed_path = tmp_path / f"seed_{layout_subdir}" / "softmax" / "kernels.py"
+    assert ensure_operator_seed_module("softmax", seed_path, cannbench_repo=repo) is True
+    seed_src = seed_path.read_text(encoding="utf-8")
+    assert '/ "tasks" / _GOLDEN_TASK / "golden.py"' in seed_src
+    assert '/ "operators" / _GOLDEN_TASK / "golden.py"' in seed_src
+
+    shim_dir = ensure_npu_compare_shim_dir(tmp_path / f"shim_{layout_subdir}", cannbench_repo=repo)
+    shim_src = (shim_dir / "npu_compare.py").read_text(encoding="utf-8")
+    assert 'cann_repo / "src"' in shim_src
+    assert 'cann_repo / "vendor" / "cannbench" / "src"' in shim_src
+
+
+def test_marathon_env_preserves_cannbench_mcp_keys_and_prefers_cann_bench(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify marathon env discovery prefers cann-bench and preserves all TILEFOUNDRY_NPU_CANNBENCH_* keys."""
+    from tilefoundry_ascend.agent.campaign.anchor_specs import parse_simple_env_file
+    from tilefoundry_ascend.agent.campaign.marathon import (
+        discover_marathon_environment,
+        ensure_marathon_env_file,
+    )
+
+    ws = tmp_path / "ws"
+    worktree = ws / "TileFoundry"
+    worktree.mkdir(parents=True)
+    (ws / "cann-bench" / "tasks").mkdir(parents=True)
+    (ws / "cannbot-ops" / "operators").mkdir(parents=True)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True)
+
+    monkeypatch.delenv("TILEFOUNDRY_NPU_CANNBENCH_REPO", raising=False)
+    monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
+
+    discovered = discover_marathon_environment(
+        operator_name="softmax",
+        worktree=worktree,
+        state_dir=state_dir,
+    )
+    assert discovered["TILEFOUNDRY_NPU_CANNBENCH_REPO"] == str(ws / "cann-bench")
+
+    token_file = tmp_path / "token.txt"
+    env_path = state_dir / "env.sh"
+    env_path.write_text(
+        "\n".join(
+            [
+                f"TILEFOUNDRY_NPU_CANNBENCH_REPO={ws / 'cann-bench'}",
+                "TILEFOUNDRY_NPU_CANNBENCH_MCP_URL=https://example.invalid/mcp",
+                f"TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE={token_file}",
+                "TILEFOUNDRY_NPU_CANNBENCH_BENCHMARK_VERSION=v2",
+                "TILEFOUNDRY_NPU_CANNBENCH_POOL_ID=pool-950pr",
+                "TILEFOUNDRY_NPU_CANNBENCH_AGGREGATION_TOKEN=agg-123",
+                "TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT=1",
+                "TILEFOUNDRY_NPU_CANNBENCH_FUTURE_FLAG=yes",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out_env = ensure_marathon_env_file(
+        operator_name="softmax",
+        worktree=worktree,
+        state_dir=state_dir,
+        env_file=env_path,
+    )
+    parsed = parse_simple_env_file(out_env)
+    assert parsed["TILEFOUNDRY_NPU_CANNBENCH_MCP_URL"] == "https://example.invalid/mcp"
+    assert parsed["TILEFOUNDRY_NPU_CANNBENCH_MCP_TOKEN_FILE"] == str(token_file)
+    assert parsed["TILEFOUNDRY_NPU_CANNBENCH_BENCHMARK_VERSION"] == "v2"
+    assert parsed["TILEFOUNDRY_NPU_CANNBENCH_POOL_ID"] == "pool-950pr"
+    assert parsed["TILEFOUNDRY_NPU_CANNBENCH_AGGREGATION_TOKEN"] == "agg-123"
+    assert parsed["TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT"] == "1"
+    assert parsed["TILEFOUNDRY_NPU_CANNBENCH_FUTURE_FLAG"] == "yes"

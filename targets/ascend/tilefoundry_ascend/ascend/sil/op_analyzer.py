@@ -23,12 +23,25 @@ from tilefoundry_ascend.ascend.sil.schema import (
     TopologyAxes,
 )
 
+def _resolve_ops_root_path(path: str | Path) -> Path:
+    cand = Path(path).expanduser()
+    for subdir in ("tasks", "operators"):
+        sub = cand / subdir
+        if sub.is_dir():
+            return sub
+    return cand
+
+
 def _default_ops_root() -> Path:
     env_repo = os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
     if env_repo:
-        cand = Path(env_repo).expanduser()
-        return (cand / "operators") if (cand / "operators").is_dir() else cand
-    return Path(__file__).resolve().parents[5].parent / "cannbot-ops" / "operators"
+        return _resolve_ops_root_path(env_repo)
+    ws_parent = Path(__file__).resolve().parents[5].parent
+    for rel in (("cann-bench", "tasks"), ("cannbot-ops", "operators")):
+        cand = ws_parent / rel[0] / rel[1]
+        if cand.is_dir():
+            return cand
+    return ws_parent / "cann-bench" / "tasks"
 
 
 DEFAULT_OPS_ROOT = _default_ops_root()
@@ -596,7 +609,7 @@ class OpAdvisoryExtractor:
     """Extracts SIL AdvisoryEnvelopes from cannbot-ops operator definitions and 950PR metadata."""
 
     def __init__(self, ops_root: str | Path = DEFAULT_OPS_ROOT) -> None:
-        self.ops_root = Path(ops_root)
+        self.ops_root = _resolve_ops_root_path(ops_root)
         self._manifest_cache: dict[str, Any] | None = None
         self._perf_cache: dict[str, Any] | None = None
 
