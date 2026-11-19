@@ -1,4 +1,4 @@
-"""SchedulePolicy contract, MECE 7-Facet Lattice, and Dual-Track Template Registry for Ascend 950 (dav-3510)."""
+"""SchedulePolicy contract, MECE 7-Facet Lattice, and Dual-Track Template Registry."""
 
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ def relax_facets_for_bottleneck(
     l1_overflow: bool = False,
     ub_overflow: bool = False,
 ) -> ConstraintRelaxationMask:
-    """Unlock ONLY the minimal causal MECE facet(s) matching the observed hardware/compiler bottleneck."""
+    """Unlock ONLY minimal causal MECE facet(s) matching the observed bottleneck."""
     unlock_exec_mode_and_spr = mask.exec_mode_and_spr
     unlock_sram_layout = mask.sram_layout_and_aliasing
     unlock_dma_cache = mask.dma_and_cache_hierarchy
@@ -146,7 +146,6 @@ def relax_facets_for_bottleneck(
         or _read_attr_or_key(compiler_summary, "has_local_membar_in_vf_call", False)
     )
 
-    # Facet 3: exec_mode_and_spr (spill, VLOOPV2 collapse, SIMT/SIMD/SPR mode)
     if (
         spill_bytes > 0
         or (software_loops > 0 and vloopv2_loops == 0)
@@ -158,7 +157,6 @@ def relax_facets_for_bottleneck(
     ):
         unlock_exec_mode_and_spr = True
 
-    # Facet 4: sram_layout_and_aliasing (L1/UB overflow, bank split/pad/shift, aliasing)
     if (
         l1_overflow
         or ub_overflow
@@ -170,7 +168,6 @@ def relax_facets_for_bottleneck(
     ):
         unlock_sram_layout = True
 
-    # Facet 5: dma_and_cache_hierarchy (DMA engines, FixPipe deq/act fold, L2 cache mode, dcci)
     if (
         mte2_wait > 0.30
         or l2_hit < 0.70
@@ -179,7 +176,6 @@ def relax_facets_for_bottleneck(
     ):
         unlock_dma_cache = True
 
-    # Facet 6: pipeline_and_sync_graph (stage DAG, initC=false, LocalMemBar/UnitFlag, async sync)
     if (
         sync_stall > 0.25
         or local_membar
@@ -202,7 +198,6 @@ def relax_facets_for_bottleneck(
     ):
         unlock_pipeline_sync = True
 
-    # Facet 7: grid_and_workspace_topology (SWAT/Stream-K/rolling-core grid, GM workspace/atomics)
     if wave_ratio > 1.25 or any(
         tok in dom for tok in ("grid", "wave", "swat", "streamk", "workspace", "gm_atomic")
     ):
@@ -220,7 +215,7 @@ def relax_facets_for_bottleneck(
 
 
 class SchedulePolicy(TypedDict, total=False):
-    """Parameterization contract shared by SIL, TileLang, and AscendC coordination shell templates."""
+    """Parameterization contract shared by SIL, TileLang, and AscendC shell templates."""
 
     regime_tag: str
     topology_axes: dict[str, str] | TopologyAxes
@@ -406,7 +401,7 @@ def normalize_schedule_policy(
     topology_axes: TopologyAxes | Mapping[str, Any],
     policy: Mapping[str, Any] | object | None = None,
 ) -> dict[str, Any]:
-    """Resolve *topology_axes* to its canonical shell and merge SchedulePolicy overrides onto defaults."""
+    """Resolve *topology_axes* to its canonical shell and merge SchedulePolicy overrides."""
     shell_axes = resolve_canonical_shell_axes(topology_axes, DEFAULT_POLICIES_BY_AXES)
     merged = dict(DEFAULT_POLICIES_BY_AXES[shell_axes])
     merged["topology_axes"] = shell_axes.to_dict()
@@ -567,7 +562,7 @@ class ComposableComputeSlotSpec:
         )
 
     def render_contract(self, policy: Mapping[str, Any] | None = None) -> str:
-        """Render [Coordination Shell + SchedulePolicy Knobs + Synthesized Compute Graph] AscendC artifact."""
+        """Render [Coordination Shell + SchedulePolicy + Compute Graph] AscendC artifact."""
         norm = normalize_schedule_policy(self.coordination_shell, policy)
         norm["freedom_mask"] = self.freedom_mask.to_dict()
         atoms_line = ", ".join(self.atom_sequence) if self.atom_sequence else "default_shell_atoms"
@@ -589,8 +584,6 @@ class ComposableComputeSlotSpec:
             f"// === End Synthesized Compute Slot ===\n"
         )
         if self.freedom_mask.is_unrestricted_top and self.compute_body_cpp.strip():
-            # Top element of the MECE lattice removes all coordination shell syntax locks;
-            # hardware legality rests solely on SILVerifier invariants.
             return "\n".join(header) + "\n" + slot_block
         shell_cpp = render_template(self.coordination_shell, norm, track="ascendc").ascendc_cpp
         return "\n".join(header) + "\n" + slot_block + "\n" + shell_cpp
@@ -598,7 +591,7 @@ class ComposableComputeSlotSpec:
 
 @dataclass(frozen=True)
 class CoordinationShellSpec:
-    """Descriptor for one canonical 3-axis Ascend 950 coordination shell in the dual-track registry."""
+    """Descriptor for one canonical 3-axis Ascend 950 coordination shell."""
 
     topology_axes: TopologyAxes
     title: str
@@ -611,7 +604,7 @@ class CoordinationShellSpec:
 
 @dataclass(frozen=True)
 class RenderedTemplate:
-    """Dual-track template rendering output for a TopologyAxes coordination shell and SchedulePolicy."""
+    """Dual-track template rendering output for a TopologyAxes shell and SchedulePolicy."""
 
     topology_axes: TopologyAxes
     policy: dict[str, Any]
@@ -724,13 +717,13 @@ _GLOBAL_REGISTRY: TemplateRegistry | None = None
 
 
 def get_template_registry() -> TemplateRegistry:
-    """Return the singleton TemplateRegistry populated with all canonical Ascend 950 coordination shells."""
+    """Return the singleton TemplateRegistry with all canonical Ascend 950 shells."""
     global _GLOBAL_REGISTRY
     if _GLOBAL_REGISTRY is None:
-        from tilefoundry_ascend.ascend.templates.ascendc_templates import (
+        from tilefoundry_ascend.ascend.templates.ascendc_templates import (  # noqa: PLC0415
             ASCENDC_RENDERERS,
         )
-        from tilefoundry_ascend.ascend.templates.tilelang_templates import (
+        from tilefoundry_ascend.ascend.templates.tilelang_templates import (  # noqa: PLC0415
             TILELANG_BUILDERS,
         )
 
@@ -836,6 +829,70 @@ def _sanitize_c_ident(name: str, default: str = "ascend_top_kernel") -> str:
     return cleaned
 
 
+_C_TYPE_KEYWORDS = frozenset(
+    {
+        "auto",
+        "bool",
+        "char",
+        "const",
+        "double",
+        "float",
+        "int",
+        "long",
+        "short",
+        "signed",
+        "struct",
+        "unsigned",
+        "void",
+        "volatile",
+    }
+)
+
+
+def _split_top_level_csv(params_text: str) -> list[str]:
+    parts: list[str] = []
+    cur: list[str] = []
+    depth = 0
+    for ch in params_text:
+        if ch in "(<[":
+            depth += 1
+        elif ch in ")>]" and depth > 0:
+            depth -= 1
+        elif ch == "," and depth == 0:
+            item = "".join(cur).strip()
+            if item:
+                parts.append(item)
+            cur = []
+            continue
+        cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _extract_c_param_name(param_decl: str) -> str:
+    depth = 0
+    eq_idx = -1
+    for idx, ch in enumerate(param_decl):
+        if ch in "(<[":
+            depth += 1
+        elif ch in ")>]" and depth > 0:
+            depth -= 1
+        elif ch == "=" and depth == 0:
+            eq_idx = idx
+            break
+    lhs = param_decl[:eq_idx].strip() if eq_idx >= 0 else param_decl.strip()
+    lhs = re.sub(r"(?:\s*\[[^\]]*\])+\s*$", "", lhs).strip()
+    fn_ptr = re.search(r"\(\s*\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)", lhs)
+    if fn_ptr:
+        return fn_ptr.group(1)
+    ident = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*$", lhs)
+    if ident and ident.group(1) not in _C_TYPE_KEYWORDS:
+        return ident.group(1)
+    return ""
+
+
 def _format_host_launcher_stub(
     host_signature: str | Mapping[str, Any],
     entry_fn: str,
@@ -850,25 +907,32 @@ def _format_host_launcher_stub(
         call_args: list[str] = []
         for item in raw_params:
             if isinstance(item, (tuple, list)) and len(item) >= 2:
-                ptype, pname = str(item[0]).strip(), _sanitize_c_ident(str(item[1]), "arg")
-                param_parts.append(f"{ptype} {pname}")
-                call_args.append(pname)
+                ptype = str(item[0]).strip()
+                pname = _sanitize_c_ident(str(item[1]), "arg")
+                if pname == "stream":
+                    param_parts[0] = f"{ptype} stream"
+                else:
+                    param_parts.append(f"{ptype} {pname}")
+                    call_args.append(pname)
             else:
                 pstr = str(item).strip()
-                if pstr:
+                if not pstr or pstr == "void":
+                    continue
+                pname = _extract_c_param_name(pstr)
+                if pname == "stream":
+                    param_parts[0] = pstr
+                else:
                     param_parts.append(pstr)
-                    call_args.append(pstr.split()[-1].lstrip("*&"))
+                    if pname:
+                        call_args.append(pname)
         if len(param_parts) == 1:
             param_parts.extend(["void* x", "void* y"])
             call_args.extend(["x", "y"])
         sig_decl = f"inline void {fn_name}({', '.join(param_parts)})"
-        body_comment = f"/* Host launcher stub for {entry_fn}({', '.join(call_args)}) on stream */"
         return (
             "#ifndef __CCE_AICORE__\n"
-            f"{sig_decl} {{\n"
-            "    (void)stream;\n"
-            + "".join(f"    (void){a};\n" for a in call_args)
-            + f"    {body_comment}\n"
+            f'extern "C" {sig_decl} {{\n'
+            f"    {entry_fn}<<<1, nullptr, stream>>>({', '.join(call_args)});\n"
             "}\n"
             "#endif"
         )
@@ -877,21 +941,45 @@ def _format_host_launcher_stub(
     if "(" in sig_text and ")" in sig_text:
         if "{" in sig_text:
             return f"#ifndef __CCE_AICORE__\n{sig_text}\n#endif"
+        l_paren = sig_text.find("(")
+        r_paren = sig_text.rfind(")")
+        params_inner = sig_text[l_paren + 1 : r_paren].strip()
+        call_args = []
+        stream_expr = ""
+        for p_item in _split_top_level_csv(params_inner):
+            if p_item in ("void", "..."):
+                continue
+            pname = _extract_c_param_name(p_item)
+            if not pname:
+                continue
+            if not stream_expr and (
+                pname == "stream" or re.search(r"\b(?:aclrtStream|rtStream_t)\b", p_item)
+            ):
+                stream_expr = pname
+            else:
+                call_args.append(pname)
+        sig_decl = re.sub(r'^extern\s+"C"\s+', "", sig_text)
+        if stream_expr == "stream":
+            stream_setup = ""
+        elif stream_expr:
+            stream_setup = f"    void* stream = {stream_expr};\n"
+        else:
+            stream_setup = "    void* stream = nullptr;\n"
         return (
             "#ifndef __CCE_AICORE__\n"
-            f"{sig_text} {{\n"
-            f"    /* Host launcher stub for {entry_fn} */\n"
+            f'extern "C" {sig_decl} {{\n'
+            f"{stream_setup}"
+            f"    {entry_fn}<<<1, nullptr, stream>>>({', '.join(call_args)});\n"
             "}\n"
             "#endif"
         )
+
     fn_name = _sanitize_c_ident(sig_text, f"launch_{entry_fn}")
+    sig_decl = f"inline void {fn_name}(void* stream, void* x, void* y)"
     return (
         "#ifndef __CCE_AICORE__\n"
-        f"inline void {fn_name}(void* stream, void* x, void* y) {{\n"
-        "    (void)stream;\n"
-        "    (void)x;\n"
-        "    (void)y;\n"
-        f"    /* Host launcher stub for {entry_fn} */\n"
+        f'extern "C" {sig_decl} {{\n'
+        f"    {entry_fn}<<<1, nullptr, stream>>>(x, y);\n"
         "}\n"
         "#endif"
     )
@@ -953,9 +1041,8 @@ def _extract_body_from_input(
     if isinstance(source_or_slot, str):
         return source_or_slot, op_name, axes
 
-    # Attempt Track-A TileLang PrimFunc / IRModule lowering if passed directly.
     try:
-        import tilelang
+        import tilelang  # noqa: PLC0415
 
         art = tilelang.lower(source_or_slot, target="ascend", enable_device_compile=False)
         ks = getattr(art, "kernel_source", "")
@@ -1013,7 +1100,6 @@ def materialize_top_translation_unit(
     core_attr = _infer_entry_core_attr(cleaned, axes=axes)
     entry_fn = _sanitize_c_ident(f"{op_name}_kernel", "ascend_top_kernel")
 
-    # Upgrade existing `extern "C" __global__` entry to include `__aicore__` if missing.
     has_global_entry = bool(re.search(r"\b__global__\b", cleaned))
     if has_global_entry:
         def _upgrade_global(m: re.Match[str]) -> str:
@@ -1039,22 +1125,12 @@ def materialize_top_translation_unit(
 
     if not has_kernel_op_inc:
         if has_tl_templates:
-            # Guard kernel_operator.h under C++20 so tl_templates (std::bit_cast) and
-            # CANN 9.3.0 headers compile cleanly without libstdc++13 std::pair conflict.
-            header_lines.extend(
-                [
-                    "#if __cplusplus < 202002L",
-                    '#include "kernel_operator.h"',
-                    "using namespace AscendC;",
-                    "#endif",
-                ]
-            )
+            pass
         else:
             header_lines.append('#include "kernel_operator.h"')
             if not has_using_ns:
                 header_lines.append("using namespace AscendC;")
     elif not has_using_ns and not has_tl_templates:
-        # Place using namespace AscendC after existing #include block if omitted
         cleaned = "using namespace AscendC;\n\n" + cleaned
 
     parts: list[str] = ["\n".join(header_lines)]

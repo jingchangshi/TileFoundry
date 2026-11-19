@@ -1,16 +1,17 @@
-"""End-to-end tests for MECE 7-Facet Lattice Top Element (ConstraintRelaxationMask.top()) across all 5 layers."""
+"""End-to-end tests for MECE 7-Facet Lattice Top Element across all 5 layers."""
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import shutil
+from pathlib import Path
 
 import pytest
+import tilelang
 
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
-    StageBResult,
+    _resolve_prim_func_from_dsl,
     run_stage_b_ascendc_compile,
     synthesize_pybind_extension_wrapper,
 )
@@ -27,6 +28,7 @@ from tilefoundry_ascend.ascend.templates import (
     materialize_top_translation_unit,
 )
 
+
 def _has_real_bisheng() -> bool:
     if shutil.which("bisheng") is not None:
         return True
@@ -37,13 +39,8 @@ def _has_real_bisheng() -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# Layer 1 & 2: Self-Contained Translation-Unit Materialization
-# ---------------------------------------------------------------------------
-
-
 def test_materialize_top_tu_from_slot_shell_and_lowered_tilelang() -> None:
-    """Materialize standalone AscendC TUs with zero locked shell wrappers from slot, shell, and lowered PrimFunc."""
+    """Materialize standalone AscendC TUs from slot, shell, and lowered PrimFunc."""
     slot = ComposableComputeSlotSpec(
         op_name="custom_1c2v_fused",
         freedom_mask=ConstraintRelaxationMask.bottom(),
@@ -71,11 +68,9 @@ def test_materialize_top_tu_from_slot_shell_and_lowered_tilelang() -> None:
     assert "Synthesized Compute Slot" not in tu_slot
     assert "unrestricted_top=True" in tu_slot
 
-    # Materialized 1C2V TU must pass SILVerifier at ConstraintRelaxationMask.top()
     rep_top = verify_source_against_facets(tu_slot, ConstraintRelaxationMask.top())
     assert rep_top.passed is True, rep_top.errors
 
-    # Materializing from a canonical TopologyAxes shell removes locked contract wrappers
     tu_shell = materialize_top_translation_unit(
         SHELL_AIV_SIMD_STREAM,
         policy={"row_pack_factor": 4, "ub_256kb_unlock": True},
@@ -85,10 +80,6 @@ def test_materialize_top_tu_from_slot_shell_and_lowered_tilelang() -> None:
     assert 'extern "C" __global__ __aicore__' in tu_shell
     assert "launch_simd_stream" in tu_shell
     assert "Synthesized Compute Slot" not in tu_shell
-
-    # Materializing from a lowered Track-A TileLang PrimFunc kernel_source
-    import tilelang
-    from tilefoundry_ascend.agent.orchestrator.gate_funnel import _resolve_prim_func_from_dsl
 
     dsl = """
 import tilelang.ascend.language as T
@@ -117,24 +108,19 @@ def vec_copy_add(A: T.Tensor((512,), "float32"), B: T.Tensor((512,), "float32"),
         lowered_kernel_cpp=art.kernel_source,
         host_signature="void launch_vec_copy_add(void* stream, void* A, void* B, void* C)",
     )
-    assert '#include "kernel_operator.h"' in tu_tl
+    assert "tl_templates/ascend/" in tu_tl
+    assert "#if __cplusplus < 202002L" not in tu_tl
     assert 'extern "C" __global__ __aicore__' in tu_tl
     assert "vec_copy_add_kernel" in tu_tl
     assert "launch_vec_copy_add" in tu_tl
     assert verify_source_against_facets(tu_tl, ConstraintRelaxationMask.top()).passed is True
 
 
-# ---------------------------------------------------------------------------
-# Layer 3: Soundness vs Completeness of Static CFG Flag Check at top()
-# ---------------------------------------------------------------------------
-
-
 def test_cfg_flag_balance_1c2v_core_roles_and_symbolic_flags() -> None:
-    """Verify 1C2V complementary ASCEND_IS_AIC/ASCEND_IS_AIV pairing and symbolic flag warnings at top()."""
+    """Verify 1C2V complementary ASCEND_IS_AIC/AIV pairing and symbolic flag warnings."""
     m_top = ConstraintRelaxationMask.top()
     m_sync = ConstraintRelaxationMask.bottom().unlock("pipeline_and_sync_graph")
 
-    # 1. Complementary if (ASCEND_IS_AIC) / if (ASCEND_IS_AIV) sequential blocks
     tu_1c2v_seq = """
     void Kernel1C2V() {
         if (ASCEND_IS_AIC) {
@@ -150,7 +136,6 @@ def test_cfg_flag_balance_1c2v_core_roles_and_symbolic_flags() -> None:
     assert rep_seq.errors == ()
     assert rep_seq.warnings == ()
 
-    # 2. Complementary if (ASCEND_IS_AIC) { SetFlag(0); } else { WaitFlag(0); }
     tu_1c2v_else = """
     void Kernel1C2VElse() {
         if (ASCEND_IS_AIC) {
@@ -164,7 +149,6 @@ def test_cfg_flag_balance_1c2v_core_roles_and_symbolic_flags() -> None:
     assert rep_else.passed is True, rep_else.errors
     assert rep_else.warnings == ()
 
-    # 3. Complementary if ASCEND_IS_AIC ... else if ASCEND_IS_AIV ... inside loop
     tu_1c2v_loop = """
     void Kernel1C2VLoop(int n) {
         for (int k = 0; k < n; ++k) {
@@ -182,7 +166,6 @@ def test_cfg_flag_balance_1c2v_core_roles_and_symbolic_flags() -> None:
     assert rep_loop.passed is True, rep_loop.errors
     assert rep_loop.warnings == ()
 
-    # 4. Literal integer mismatch across 1C2V branches MUST still fail with errors
     tu_1c2v_bad_id = """
     void Kernel1C2VBadId() {
         if (ASCEND_IS_AIC) {
@@ -197,7 +180,6 @@ def test_cfg_flag_balance_1c2v_core_roles_and_symbolic_flags() -> None:
     assert rep_bad_id.passed is False
     assert len(rep_bad_id.errors) >= 1
 
-    # 5. Literal flag ID > max_flag_depth MUST still fail with errors
     tu_over_depth = """
     void KernelOverDepth() {
         if (ASCEND_IS_AIC) {
@@ -210,7 +192,6 @@ def test_cfg_flag_balance_1c2v_core_roles_and_symbolic_flags() -> None:
     """
     assert verify_source_against_facets(tu_over_depth, m_top, max_flag_depth=15).passed is False
 
-    # 6. Arbitrary non-core-role branches remain strictly rejected even at top()
     tu_non_role = """
     void KernelArbitrary(bool a, bool b) {
         if (a) { CrossCoreSetFlag<0x2, PIPE_FIX>(0); }
@@ -219,7 +200,6 @@ def test_cfg_flag_balance_1c2v_core_roles_and_symbolic_flags() -> None:
     """
     assert verify_source_against_facets(tu_non_role, m_top).passed is False
 
-    # 7. Dynamic runtime symbolic expressions at top() emit warnings instead of false-positive errors
     tu_symbolic_1c2v = """
     void KernelDynamicFlag(int sid, int parity_flag) {
         if (ASCEND_IS_AIC) {
@@ -235,7 +215,6 @@ def test_cfg_flag_balance_1c2v_core_roles_and_symbolic_flags() -> None:
     assert rep_sym_top.errors == ()
     assert len(rep_sym_top.warnings) >= 1
 
-    # Helper-function dynamic symbolic expressions at top() also emit warnings
     tu_symbolic_helpers = """
     void ProduceStep(int sid) {
         CrossCoreSetFlag<0x2, PIPE_FIX>(sid ^ 1);
@@ -248,15 +227,9 @@ def test_cfg_flag_balance_1c2v_core_roles_and_symbolic_flags() -> None:
     assert rep_helpers_top.passed is True
     assert len(rep_helpers_top.warnings) >= 1
 
-    # Non-top mask still strictly rejects unproved symbolic asymmetry as errors
     rep_sym_nontop = verify_source_against_facets(tu_symbolic_1c2v, m_sync)
     assert rep_sym_nontop.passed is False
     assert len(rep_sym_nontop.errors) >= 1
-
-
-# ---------------------------------------------------------------------------
-# Layer 4 & 5: Real bisheng Stage-B Compilation, GateFunnel Dispatch & Host ABI
-# ---------------------------------------------------------------------------
 
 
 def test_stage_b_ascendc_real_bisheng_compile_and_gate_funnel_dispatch() -> None:
@@ -288,7 +261,6 @@ def test_stage_b_ascendc_real_bisheng_compile_and_gate_funnel_dispatch() -> None
     assert isinstance(sb_ok.compiler_summary, BishengResourceSummary)
     assert sb_ok.elapsed_sec >= 0.0
 
-    # GateFunnel with backend_kind="ascendc" automatically routes Stage B to bisheng
     funnel = GateFunnel(skip_stage_b=False)
     ev_ok = funnel.evaluate(
         tu_cpp,
@@ -299,7 +271,6 @@ def test_stage_b_ascendc_real_bisheng_compile_and_gate_funnel_dispatch() -> None
     assert ev_ok.stage_a.passed is True
     assert ev_ok.stage_b is not None and ev_ok.stage_b.passed is True
 
-    # Broken C++ fails cleanly at Stage B with real bisheng diagnostics
     bad_cpp = """
 #include "kernel_operator.h"
 using namespace AscendC;

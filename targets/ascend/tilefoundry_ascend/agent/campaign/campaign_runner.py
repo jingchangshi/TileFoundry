@@ -64,6 +64,13 @@ from tilefoundry_ascend.agent.kb.schema import (
     build_predicate_context,
     load_seed_rules,
 )
+from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+    apply_scoped_trackb_patch,
+    build_trackb_context_view,
+    escalate_primfunc_to_trackb_tu,
+    parse_scoped_search_replace_blocks,
+    select_active_trackb_kernel,
+)
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
     StageAResult,
@@ -858,6 +865,133 @@ def _collect_referenced_helper_names(
     return live
 
 
+def _ast_char_offset(lines: Sequence[str], lineno: int, col_offset: int) -> int:
+    prefix = sum(len(lines[idx]) for idx in range(lineno - 1))
+    line_bytes = lines[lineno - 1].encode("utf-8")
+    return prefix + len(line_bytes[:col_offset].decode("utf-8"))
+
+
+def _format_raw_cpp_literal(cpp_text: str) -> str:
+    if '"""' not in cpp_text and not cpp_text.endswith('"'):
+        return f'r"""{cpp_text}"""'
+    return repr(cpp_text)
+
+
+def _find_top_level_str_assign_span(
+    tree: ast.Module,
+    lines: Sequence[str],
+    target_names: set[str],
+) -> list[tuple[str, str, int, int]]:
+    hits: list[tuple[str, str, int, int]] = []
+    for node in tree.body:
+        name: str | None = None
+        val: ast.AST | None = None
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            name, val = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, val = node.target.id, node.value
+        if (
+            name in target_names
+            and isinstance(val, ast.Constant)
+            and isinstance(val.value, str)
+            and val.end_lineno is not None
+            and val.end_col_offset is not None
+        ):
+            start_pos = _ast_char_offset(lines, val.lineno, val.col_offset)
+            end_pos = _ast_char_offset(lines, val.end_lineno, val.end_col_offset)
+            hits.append((name, val.value, start_pos, end_pos))
+    return hits
+
+
+def _apply_scoped_trackb_patch_to_module(
+    module_source: str,
+    regime_spec: RegimeTargetSpec,
+    patch_text: str,
+) -> str:
+    extracted = _extract_trackb_cpp_source(module_source, regime_spec)
+    if extracted is None:
+        raise ValueError(
+            f"Original module missing Track-B C++ constant in {regime_spec.trackb_symbols}."
+        )
+    sym_name, orig_cpp = extracted
+    active_kernel = select_active_trackb_kernel(
+        orig_cpp,
+        regime_tag=regime_spec.regime_tag,
+        module_source=module_source,
+    )
+    updated_cpp, _applied = apply_scoped_trackb_patch(
+        orig_cpp,
+        patch_text,
+        active_kernel=active_kernel,
+    )
+    orig_tree = ast.parse(module_source)
+    lines = module_source.splitlines(keepends=True)
+    hits = _find_top_level_str_assign_span(orig_tree, lines, {sym_name})
+    if not hits:
+        raise ValueError(f"Track-B symbol {sym_name!r} assignment not found in module_source.")
+    _, _, start_pos, end_pos = hits[0]
+    patched = module_source[:start_pos] + _format_raw_cpp_literal(updated_cpp) + module_source[end_pos:]
+    ast.parse(patched)
+    return patched
+
+
+def _compact_trackb_snippet_source(
+    snippet_source: str,
+    regime_spec: RegimeTargetSpec,
+    *,
+    incumbent_source: str = "",
+    max_bytes: int = 14800,
+) -> str:
+    if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
+        return snippet_source
+    if not regime_spec.trackb_symbols:
+        return snippet_source
+    try:
+        tree = ast.parse(snippet_source)
+    except SyntaxError:
+        return snippet_source
+    lines = snippet_source.splitlines(keepends=True)
+    hits = _find_top_level_str_assign_span(tree, lines, set(regime_spec.trackb_symbols))
+    replacements: list[tuple[int, int, str]] = []
+    for sym_name, cpp_text, start_pos, end_pos in hits:
+        if len(cpp_text.encode("utf-8")) <= max_bytes:
+            continue
+        view = build_trackb_context_view(
+            cpp_text,
+            regime_tag=regime_spec.regime_tag,
+            module_source=incumbent_source or snippet_source,
+            trackb_symbol=sym_name,
+            max_bytes=max_bytes,
+        )
+        wrapped = view if view.startswith("\n") else f"\n{view}\n"
+        replacements.append((start_pos, end_pos, _format_raw_cpp_literal(wrapped)))
+    if not replacements:
+        return snippet_source
+    updated = snippet_source
+    for start_pos, end_pos, literal in reversed(replacements):
+        updated = updated[:start_pos] + literal + updated[end_pos:]
+    return updated
+
+
+def _is_real_tir_primfunc(obj: object) -> bool:
+    if obj is None or isinstance(obj, (tuple, list, dict, str, bytes, int, float, bool)):
+        return False
+    try:
+        import tilelang  # noqa: F401, PLC0415
+        import tvm  # noqa: PLC0415
+
+        tirx_mod = getattr(tvm, "tirx", None)
+        tir_mod = getattr(tvm, "tir", None)
+        prim_cls = getattr(tirx_mod, "PrimFunc", None) or getattr(tir_mod, "PrimFunc", None)
+        return isinstance(prim_cls, type) and isinstance(obj, prim_cls)
+    except Exception:
+        return False
+
+
 def patch_regime_into_module(
     module_source: str,
     regime_or_func: RegimeTargetSpec | str,
@@ -872,6 +1006,19 @@ def patch_regime_into_module(
         return apply_ast_patch(module_source, regime_or_func, candidate_dsl)
 
     regime_spec = regime_or_func
+    if (
+        regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
+        and regime_spec.trackb_symbols
+        and parse_scoped_search_replace_blocks(candidate_dsl)
+    ):
+        try:
+            ast.parse(candidate_dsl)
+        except SyntaxError:
+            return _apply_scoped_trackb_patch_to_module(
+                module_source,
+                regime_spec,
+                candidate_dsl,
+            )
     orig_tree = ast.parse(module_source)
     if not regime_spec.editable_symbols:
         orig_node = _find_top_level_func(orig_tree, regime_spec.builder_candidates)
@@ -1853,6 +2000,7 @@ class PerfTargetCampaignRunner:
         escalation: object | None = None,
         pipe_gaps: object | None = None,
         cost_pred: object | None = None,
+        escalated_trackb_tu: str = "",
     ) -> str:
         if live_plan is None and active_mask is None:
             return ""
@@ -1890,6 +2038,11 @@ class PerfTargetCampaignRunner:
                 f"- track_escalation: should_escalate={should_esc}, to_tier={to_tier}, "
                 f"reasons={list(reasons)}"
             )
+        if escalated_trackb_tu.strip():
+            lines.append("- escalated_trackb_seed_cpp:")
+            lines.append("```cpp")
+            lines.append(escalated_trackb_tu.strip())
+            lines.append("```")
         if pipe_gaps is not None:
             cov = float(getattr(pipe_gaps, "coverage_ratio", 1.0))
             missing = tuple(getattr(pipe_gaps, "missing_primitives", ()) or ())
@@ -2375,6 +2528,12 @@ class PerfTargetCampaignRunner:
         sil_policy_section: str = "",
         effort: str | None = None,
     ) -> GenerationRequest:
+        snippet_source = _compact_trackb_snippet_source(
+            snippet_source,
+            regime_spec,
+            incumbent_source=incumbent_source,
+            max_bytes=14800,
+        )
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
         esc_tier, hotpath_section = self._format_trackb_hotpath_section(regime_spec)
         sys_prompt = (
@@ -2455,6 +2614,12 @@ class PerfTargetCampaignRunner:
         parent_hypothesis: str = "",
         sil_policy_section: str = "",
     ) -> GenerationRequest:
+        snippet_source = _compact_trackb_snippet_source(
+            snippet_source,
+            regime_spec,
+            incumbent_source=incumbent_source,
+            max_bytes=14800,
+        )
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
         esc_tier, hotpath_section = self._format_trackb_hotpath_section(regime_spec)
         sys_prompt = (
@@ -3115,6 +3280,7 @@ class PerfTargetCampaignRunner:
         )
         escalation_decision = None
         pipe_gap_report = None
+        escalated_trackb_tu = ""
         if escalated:
             active_mask = relax_facets_for_bottleneck(
                 active_mask,
@@ -3150,6 +3316,25 @@ class PerfTargetCampaignRunner:
                 structural_features=sf_ctx,
             )
             pipe_gap_report = scan_tilelang_pipe_gaps()
+            if (
+                escalation_decision is not None
+                and bool(getattr(escalation_decision, "should_escalate", False))
+                and str(getattr(escalation_decision, "to_tier", "")) == "ascendc_template"
+                and _is_real_tir_primfunc(base_stage_a.prim_func)
+            ):
+                try:
+                    raw_tu = escalate_primfunc_to_trackb_tu(base_stage_a.prim_func)
+                    if len(raw_tu.encode("utf-8")) > 8192:
+                        escalated_trackb_tu = build_trackb_context_view(
+                            raw_tu,
+                            regime_tag=regime_spec.regime_tag,
+                            module_source=parent_module_source,
+                            max_bytes=8192,
+                        )
+                    else:
+                        escalated_trackb_tu = raw_tu
+                except Exception as exc:
+                    logger.warning("Track-B PrimFunc escalation lowering skipped: %s", exc)
         else:
             self._freedom_masks.setdefault(regime_spec.regime_tag, active_mask)
 
@@ -3159,6 +3344,7 @@ class PerfTargetCampaignRunner:
             escalation=escalation_decision,
             pipe_gaps=pipe_gap_report,
             cost_pred=parent_cost_pred,
+            escalated_trackb_tu=escalated_trackb_tu,
         )
         ranked_rules = list(
             self._tracker.rank_applicable_rules(
