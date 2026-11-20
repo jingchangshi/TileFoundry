@@ -6,10 +6,16 @@ import json
 import os
 from pathlib import Path
 
-from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec, RegimeTargetSpec
+import pytest
+
+from tilefoundry_ascend.agent.campaign import cli, marathon
+from tilefoundry_ascend.agent.campaign.anchor_specs import (
+    AnchorCaseSpec,
+    RegimeTargetSpec,
+    parse_simple_env_file,
+)
 from tilefoundry_ascend.agent.campaign.marathon import (
     ExtremeCampaignRunner,
-    FastCreativeAgyBackend,
     MarathonConfig,
     build_marathon_arg_parser,
     build_resilient_l2_evaluator,
@@ -20,8 +26,13 @@ from tilefoundry_ascend.agent.campaign.marathon import (
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     AnchorEvalMetrics,
     CandidateSurrogateResult,
+    _write_temp_env_file,
 )
-from tilefoundry_ascend.agent.orchestrator.llm_client import GenerationRequest
+from tilefoundry_ascend.agent.orchestrator.llm_client import (
+    GenerationRequest,
+    MockLLMBackend,
+    create_llm_backend_from_env,
+)
 
 
 def test_zero_config_env_discovery_and_existing_env_preservation(tmp_path: Path, monkeypatch) -> None:
@@ -63,7 +74,8 @@ def test_zero_config_env_discovery_and_existing_env_preservation(tmp_path: Path,
     assert env_path == state_dir / "env.sh"
     assert env_path.is_file()
     content = env_path.read_text(encoding="utf-8")
-    assert "TILEFOUNDRY_NPU_LLM_BACKEND=agy_cli" in content
+    assert "TILEFOUNDRY_NPU_LLM_BACKEND" not in content
+    assert "TILEFOUNDRY_NPU_AGY_" not in content
     assert "TILEFOUNDRY_NPU_AGENT_GATES_BIN" not in content
 
     marker_text = content + "\n# keep-existing-env\n"
@@ -89,21 +101,11 @@ def test_zero_config_env_discovery_and_existing_env_preservation(tmp_path: Path,
     )
     sanitized_text = sanitized.read_text(encoding="utf-8")
     assert "TILEFOUNDRY_NPU_AGENT_GATES_BIN" not in sanitized_text
-    assert "TILEFOUNDRY_NPU_LLM_BACKEND=agy_cli" in sanitized_text
+    assert "TILEFOUNDRY_NPU_AGY_" not in sanitized_text
 
 
-def test_extreme_runner_rotation_fast_backend_and_resilient_l2(tmp_path: Path) -> None:
-    """Verify stagnation-discounted regime rotation, xhigh clamp, and L2 isolation fallback."""
-    backend = FastCreativeAgyBackend(escalate_model="gemini-4-hydrogen-high")
-    req = GenerationRequest(
-        role="creative_explore",
-        system_prompt="sys",
-        user_prompt="usr",
-        effort="xhigh",
-    )
-    assert backend.select_effort(req) == "high"
-    assert backend.select_effort(req, effort_override="xhigh") == "high"
-
+def test_extreme_runner_rotation_and_resilient_l2(tmp_path: Path) -> None:
+    """Verify stagnation-discounted regime rotation and L2 isolation fallback."""
     target = tmp_path / "kernels.py"
     target.write_text("def _b1():\n    pass\n", encoding="utf-8")
     r_a = RegimeTargetSpec(
@@ -188,10 +190,114 @@ def test_extreme_runner_rotation_fast_backend_and_resilient_l2(tmp_path: Path) -
     assert set(merged) == {"c1", "c2"}
 
 
-def test_marathon_cli_and_watch_round_detection(tmp_path: Path, monkeypatch) -> None:
-    """Verify CLI parser defaults/shorthand and watch_marathon_rounds event output."""
-    from tilefoundry_ascend.agent.campaign import cli, marathon  # noqa: PLC0415
+@pytest.mark.parametrize("entrypoint", ["dedicated", "campaign_marathon", "campaign"])
+@pytest.mark.parametrize("override_backend", [False, True])
+def test_campaign_entrypoints_inject_selected_provider(
+    tmp_path: Path, monkeypatch, entrypoint: str, override_backend: bool
+) -> None:
+    """Exercise each entry point through runner construction without live evaluations."""
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+    ambient = {
+        "TILEFOUNDRY_NPU_LLM_BACKEND": "unsupported",
+        "TILEFOUNDRY_NPU_LLM_EXPLOIT_MODEL": "ambient-exploit",
+        "TILEFOUNDRY_NPU_LLM_EXPLORE_MODEL": "ambient-explore",
+        "TILEFOUNDRY_NPU_LLM_MAX_EFFORT": "low",
+    }
+    os.environ.update(ambient)
+    env_path = tmp_path / "env.sh"
+    file_backend = "unsupported" if override_backend else "mock"
+    env_path.write_text(
+        f"TILEFOUNDRY_NPU_LLM_BACKEND={file_backend}\n"
+        "TILEFOUNDRY_NPU_LLM_EXPLOIT_MODEL=file-exploit\n"
+        "TILEFOUNDRY_NPU_LLM_EXPLORE_MODEL=file-explore\n"
+        "TILEFOUNDRY_NPU_LLM_ESCALATE_MODEL=file-escalate\n"
+        "TILEFOUNDRY_NPU_LLM_EFFORT_CAP=xhigh\n",
+        encoding="utf-8",
+    )
+    os.environ["TILEFOUNDRY_NPU_ENV_FILE"] = str(env_path)
+    seen_overrides = []
 
+    def make_backend(overrides):
+        seen_overrides.append(overrides)
+        return create_llm_backend_from_env(overrides=overrides)
+
+    class Report:
+        def to_dict(self):
+            return {"status": "ok"}
+
+    class Runner:
+        def __init__(self, *, llm_backend, **kwargs):
+            assert isinstance(llm_backend, MockLLMBackend)
+            self.backend = llm_backend
+
+        async def run(self, *, resume):
+            for role in ("exploit_rule", "explore_creative", "escalate_trackb"):
+                await self.backend.generate(GenerationRequest(role, "s", "u", effort="xhigh"))
+            explore_model = "cli-explore" if override_backend else "file-explore"
+            assert self.backend.routed_models == ["cli-exploit", explore_model, "cli-escalate"]
+            assert self.backend.routed_efforts == ["xhigh"] * 3
+            return Report()
+
+    monkeypatch.setattr(cli, "PerfTargetCampaignRunner", Runner)
+    monkeypatch.setattr(cli, "create_llm_backend_from_env", make_backend)
+    monkeypatch.setattr(marathon, "ExtremeCampaignRunner", Runner)
+    monkeypatch.setattr(marathon, "_ensure_sys_paths", lambda _: None)
+    monkeypatch.setattr(marathon, "build_resilient_l2_evaluator", lambda **_: None)
+    monkeypatch.setattr(marathon, "build_prewarmed_l3_runner", lambda **_: None)
+    monkeypatch.setattr(marathon, "salvage_unpromoted_beam_winner", lambda **_: None)
+    monkeypatch.setattr(marathon, "create_llm_backend_from_env", make_backend)
+    target = tmp_path / "kernels.py"
+    target.touch()
+    args = [
+        "--operator", "mla",
+        "--source-root", str(tmp_path),
+        "--target-file", str(target),
+        "--checkpoint", str(tmp_path / "checkpoint.json"),
+        "--exploit-model", "cli-exploit",
+        "--escalate-model", "cli-escalate",
+        "--llm-api-base", "https://provider.example/v1",
+    ]
+    if override_backend:
+        args.extend(["--llm-backend", "mock", "--explore-model", "cli-explore"])
+    if entrypoint == "dedicated":
+        assert marathon.main(["run", *args, "--env-file", str(env_path)]) == 0
+    elif entrypoint == "campaign_marathon":
+        assert cli.main(["--marathon", *args, "--env-file", str(env_path)]) == 0
+    else:
+        assert cli.main(args) == 0
+    assert len(seen_overrides) == 1
+    assert seen_overrides[0]["TILEFOUNDRY_NPU_LLM_API_BASE"] == "https://provider.example/v1"
+    assert all(os.environ[key] == value for key, value in ambient.items())
+
+
+def test_marathon_env_provider_values_round_trip(tmp_path, monkeypatch) -> None:
+    """Preserve generic CLI templates and legacy aliases in both env files."""
+    template_key = "TILEFOUNDRY_NPU_LLM_CLI_TEMPLATE"
+    api_key_env = "TILEFOUNDRY_NPU_LLM_API_KEY_ENV"
+    raw_key = "TILEFOUNDRY_NPU_LLM_API_KEY"
+    legacy_key = "TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL"
+    template = "{bin} --tag 'a#b;$c|d' --path \"C:\\bin\\tool\" --prompt {prompt}"
+    monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
+    monkeypatch.setenv(template_key, template)
+    monkeypatch.setenv(api_key_env, "EXAMPLE_PROVIDER_TOKEN")
+    monkeypatch.setenv("EXAMPLE_PROVIDER_TOKEN", "example-value-that-stays-in-environment")
+    monkeypatch.setenv(raw_key, "example-value-that-stays-in-environment")
+    monkeypatch.setenv(legacy_key, "legacy-escalate")
+    env_file = ensure_marathon_env_file(
+        operator_name="mla", worktree=tmp_path, state_dir=tmp_path
+    )
+    temp_env = _write_temp_env_file(env_file, tmp_path / "temp.sh", {template_key: template})
+    for path in (env_file, temp_env):
+        values = parse_simple_env_file(path)
+        assert values[template_key] == template
+        assert values[api_key_env] == "EXAMPLE_PROVIDER_TOKEN"
+        assert values[legacy_key] == "legacy-escalate"
+        assert raw_key not in values
+        assert "example-value-that-stays-in-environment" not in path.read_text(encoding="utf-8")
+
+
+def test_marathon_cli_and_watch_round_detection(tmp_path: Path, monkeypatch) -> None:
+    """Verify CLI parser defaults, shorthand, and watch events."""
     parser = build_marathon_arg_parser()
     parsed_run = parser.parse_args(["run", "--operator", "mla", "--device-id", "2"])
     assert parsed_run.command == "run"

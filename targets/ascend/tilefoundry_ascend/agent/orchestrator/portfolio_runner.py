@@ -16,7 +16,6 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     KernelLLMBackend,
     extract_creative_payload,
     extract_python_dsl,
-    sanitize_effort,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
@@ -701,13 +700,13 @@ def build_creative_request(
         f"### STATIC-DYNAMIC RESIDUAL\n{json.dumps(parent.residual.to_dict(), indent=2)}\n\n"
         f"### CURRENT KERNEL SOURCE\n```python\n{parent.dsl_source}\n```\n"
     )
-    eff = sanitize_effort(effort or "high", default="high")
+    is_trackb = get_dialect_surface(escalation_tier).dialect_id == "tl_templates_cpp20"
     return GenerationRequest(
-        role="explore_creative",
+        role="escalate_trackb" if is_trackb else "explore_creative",
         system_prompt=sys_prompt,
         user_prompt=user_prompt,
         json_schema=CREATIVE_RESPONSE_SCHEMA,
-        effort=eff,
+        effort=effort or "high",
     )
 
 

@@ -1,22 +1,27 @@
-"""Live isolated agy + Ascend 950 NPU end-to-end evolution test from HIR models."""
+"""Live Ascend 950 NPU evolution test from HIR models using a configured provider."""
 
 import asyncio
 import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from tilefoundry_ascend.agent import (
-    AgyCliLLMBackend,
     BayesianRuleTracker,
     GateFunnel,
     run_e2e_evolution,
 )
+from tilefoundry_ascend.agent.campaign.anchor_specs import parse_simple_env_file
 from tilefoundry_ascend.agent.orchestrator import (
+    KernelLLMBackend,
+    MockLLMBackend,
+    OpenAICompatHTTPBackend,
     StageCResult,
     compute_static_dynamic_residual,
+    create_llm_backend_from_env,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -280,14 +285,68 @@ def make_mla_kernel():
 """
 
 
-def _require_live_npu_and_agy() -> AgyCliLLMBackend:
+def _require_live_npu_and_llm_backend() -> KernelLLMBackend:
     if not hasattr(torch, "npu") or not torch.npu.is_available():
         pytest.skip("Ascend NPU device is required for live e2e evolution test.")
-    if os.environ.get("TILEFOUNDRY_NPU_LLM_BACKEND", "").strip().lower() == "mock":
-        pytest.skip("Mock LLM backend configured; skipping live agy NPU evolution.")
-    if not shutil.which("agy") and not os.environ.get("TILEFOUNDRY_NPU_AGY_BIN", "").strip():
-        pytest.skip("agy CLI binary not available.")
-    return AgyCliLLMBackend(max_concurrency=3, hard_timeout_sec=95)
+
+    env_hint = os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
+    overrides = parse_simple_env_file(Path(env_hint).expanduser()) if env_hint else {}
+    sources = (overrides, os.environ)
+
+    def configured_value(*keys: str, default: str = "") -> str:
+        return next(
+            (value for source in sources for key in keys if (value := source.get(key, "").strip())),
+            default,
+        )
+
+    kind = configured_value("TILEFOUNDRY_NPU_LLM_BACKEND", default="agy_cli").lower()
+    bin_keys = ("TILEFOUNDRY_NPU_LLM_CLI_BIN",)
+    if kind in ("agy_cli", "agy"):
+        bin_keys += ("TILEFOUNDRY_NPU_AGY_BIN",)
+    configured_bin = configured_value(*bin_keys)
+    if kind in ("agy_cli", "agy") and configured_bin and not shutil.which(configured_bin):
+        raise FileNotFoundError("The configured LLM CLI binary is missing or not executable.")
+
+    try:
+        backend = create_llm_backend_from_env(overrides=overrides)
+    except FileNotFoundError:
+        if not configured_bin and kind in ("agy_cli", "agy", "claude_cli", "codex_cli"):
+            pytest.skip("The default LLM CLI executable is unavailable.")
+        raise
+    if isinstance(backend, MockLLMBackend):
+        pytest.skip("Mock LLM backend configured for live NPU evolution.")
+    return backend
+
+
+@pytest.mark.parametrize(
+    ("config", "expected_error"),
+    [
+        ({"BACKEND": "openai_compat", "EXPLOIT_MODEL": "test-model"}, None),
+        ({"BACKEND": "openai_compat", "API_BASE": "invalid-url"}, ValueError),
+        ({"BACKEND": "mock"}, pytest.skip.Exception),
+        ({"BACKEND": "unsupported"}, ValueError),
+        ({"BACKEND": "codex_cli"}, pytest.skip.Exception),
+        ({"BACKEND": "agy_cli", "CLI_BIN": "missing-llm-bin"}, FileNotFoundError),
+    ],
+)
+def test_configured_backend_readiness_offline(tmp_path: Path, monkeypatch, config, expected_error):
+    """Check provider selection and skip behavior with simulated NPU availability."""
+    monkeypatch.setattr(torch, "npu", SimpleNamespace(is_available=lambda: True), raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    for key in os.environ.copy():
+        if key.startswith(("TILEFOUNDRY_NPU_LLM_", "TILEFOUNDRY_NPU_AGY_")):
+            monkeypatch.delenv(key)
+    env_file = tmp_path / "env.sh"
+    env_file.write_text(
+        "".join(f"TILEFOUNDRY_NPU_LLM_{key}={value}\n" for key, value in config.items()),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TILEFOUNDRY_NPU_ENV_FILE", str(env_file))
+    if expected_error is None:
+        assert isinstance(_require_live_npu_and_llm_backend(), OpenAICompatHTTPBackend)
+    else:
+        with pytest.raises(expected_error):
+            _require_live_npu_and_llm_backend()
 
 
 def _ar_npu_device_runner(_dsl_source: str, stage_a) -> StageCResult:
@@ -430,8 +489,8 @@ def _save_trajectory(name: str, traj) -> None:
 
 
 def test_live_e2e_agent_evolution_on_npu() -> None:
-    """Drive isolated agy dual-loop evolution from AR and MLA HIR on live Ascend 950 NPU."""
-    backend = _require_live_npu_and_agy()
+    """Drive dual-loop evolution from AR and MLA HIR on a live Ascend 950 NPU."""
+    backend = _require_live_npu_and_llm_backend()
     ar_hir = _AR_MODEL_PATH.read_text(encoding="utf-8")
     mla_hir = _MLA_MODEL_PATH.read_text(encoding="utf-8")
     selected = os.environ.get("TILEFOUNDRY_E2E_PROBLEM", "all").strip().lower()
@@ -497,6 +556,13 @@ def test_live_e2e_agent_evolution_on_npu() -> None:
         for traj in results.values():
             assert traj.baseline_latency_us > 0.0
             assert traj.best_latency_us <= traj.baseline_latency_us
+            workers = [worker for round_ in traj.rounds for worker in round_.workers]
+            assert workers, f"{traj.problem_name} evolution made no generation attempts"
+            for kind in {worker.worker_kind for worker in workers}:
+                attempts = [worker for worker in workers if worker.worker_kind == kind]
+                assert any(worker.failed_stage != "llm_transport" for worker in attempts), (
+                    f"{traj.problem_name} {kind} provider failed: {attempts[0].hypothesis}"
+                )
     except Exception as exc:
         _log_progress(f"EXCEPTION: {type(exc).__name__}: {str(exc)[-800:]}")
         raise AssertionError(f"WP5 NPU evolution error: {type(exc).__name__}: {str(exc)[-800:]}") from None

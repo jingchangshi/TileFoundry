@@ -4,7 +4,7 @@ flowchart TB
     classDef agent fill:#ECFDF5,stroke:#065F46,stroke-width:1.5px,color:#062E22
     classDef verify fill:#F5F3FF,stroke:#4C1D95,stroke-width:1.5px,color:#240E52
 
-    subgraph PLANE_1["Plane 1: Hardware Spec, Canonical Pipe IR & Dual-Track Shells (target · ir · templates)"]
+    subgraph PLANE_1["Plane 1: Hardware Spec, Canonical Pipe IR & Dual-Track Shells (target, ir, templates)"]
         P1_HW["Ascend Hardware Spec & Fact Projections\nDaVinci950 (dav_3510) + Ascend950PR (28C/56V) / 950DT (36C/72V)\n1C2V coupled block, 24-bit pipe mask, 216/248/256 KiB UB tiers,\n9 legal / 3 forbidden DMA paths & segmented HBM burst curve"]:::hw
         P1_IR["Execution Domains & 19 Canonical Pipe Primitives\nSimdVF / SimtVF domains + 8 core HIR->TIR algebraic/sharding bindings\n6 DMA + 4 DualCopy/Sync + 1 MMAD + 8 parametric Vector/Reg ops\nPure pipe/storage abstraction without ISA enumeration bloat"]:::hw
         P1_TPL["Dual-Track 3-Axis Coordination Shell Engine (7 Presets)\nTrack-A TileLang DSL + Track-B AscendC C++20 renderers\nKeyed by TopologyAxes with Top-lattice shell-lock stripping"]:::hw
@@ -23,7 +23,7 @@ flowchart TB
     subgraph PLANE_3["Plane 3: Capability Routing, Causal KB & Progressive Constraint Synthesis"]
         P3_ROUTE["8D Capability Router & ISA Pipe-Gap Scanner\nCapabilityGate (Router ON/OFF ablatable) + 3-tier escalation (DSL->InlineVF->AscendC)\nISAGapScanner checks 27 devkit primitives across 7 pipes to relax MECE facets"]:::agent
         P3_KB["33 Cross-Op Causal Rules & 3-Axis Bayesian Tracker\nAST-safe static predicates; global + factorized (ce/mr/ir) Beta-Binomial posteriors\nCooldown revival, lock-free JSONL shards & local-to-cross-op promotion"]:::agent
-        P3_PORT["3-Layer Progressive Constraints & Stateless Portfolio\nllm_constraints: L1 Redlines/Facets + L2 Grounded Target API + L3 Residual Delta\nK rule-exploit + rule-blind creative workers; TileSizePrescreen & Agy watchdog"]:::agent
+        P3_PORT["3-Layer Progressive Constraints & Stateless Portfolio\nllm_constraints: L1 Redlines/Facets + L2 Grounded Target API + L3 Residual Delta\nK rule-exploit + rule-blind creative workers with TileSizePrescreen\nPluggable LLM or agent backend with liveness monitoring"]:::agent
         P3_BEAM["Per-Regime Two-Lane Beam, ExperienceLake & Flywheel\nIsolated per-regime Exploit + Stepping-Stone beams with Eq.3-HAP objective\nSHA-addressed ExperienceLake replay; counterfactual/LOO micro-probe distillation"]:::agent
         P3_ROUTE -->|"Tier escalation & ISA gaps"| P3_PORT
         P3_KB -->|"3-axis ranked rules"| P3_PORT

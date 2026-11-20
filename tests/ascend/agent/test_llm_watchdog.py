@@ -14,6 +14,7 @@ import pytest
 from tilefoundry_ascend.agent import (
     AgyCliLLMBackend,
     GenerationRequest,
+    MockLLMBackend,
     StreamWatchdogConfig,
 )
 from tilefoundry_ascend.agent.orchestrator import (
@@ -451,12 +452,13 @@ def test_agent_flag_stripping_and_tier_adaptive_watchdog(
 
     exploit_req = GenerationRequest("exploit_rule", "sys", "usr")
     explore_req = GenerationRequest("explore_creative", "sys", "usr")
-    escalate_req = GenerationRequest("explore_creative", "sys", "usr", effort="xhigh")
-    assert escalate_req.effort == "high"
+    escalate_req = GenerationRequest("escalate_trackb", "sys", "usr", effort="xhigh")
+    assert escalate_req.effort == "xhigh"
+    assert backend.select_effort(escalate_req) == "high"
 
     exploit_model = backend.select_model("exploit_rule")
     explore_model = backend.select_model("explore_creative")
-    escalate_model = backend.select_model("explore_creative", effort="xhigh")
+    escalate_model = backend.select_model("escalate_trackb", effort="xhigh")
     assert exploit_model == "gemini-4-hydrogen-medium"
     assert explore_model == "gemini-4-hydrogen-high"
     assert escalate_model == "gemini-4-hydrogen-high"
@@ -483,18 +485,12 @@ def test_agent_flag_stripping_and_tier_adaptive_watchdog(
     assert "--effort=high" in cmd_xhigh
     assert "--print-timeout=360s" in cmd_xhigh
 
-    from tilefoundry_ascend.agent.orchestrator.llm_client import MockLLMBackend
-
     mock = MockLLMBackend(default_response="ok")
     asyncio.run(mock.generate(exploit_req))
     asyncio.run(mock.generate(explore_req))
     asyncio.run(mock.generate(escalate_req))
-    assert mock.routed_models == [
-        "gemini-4-hydrogen-medium",
-        "gemini-4-hydrogen-high",
-        "gemini-4-hydrogen-high",
-    ]
-    assert mock.routed_efforts == ["medium", "high", "high"]
+    assert mock.routed_models == ["mock-exploit", "mock-explore", "mock-escalate"]
+    assert mock.routed_efforts == ["medium", "high", "xhigh"]
 
 
 def test_slow_actively_streaming_worker_exceeds_idle_without_false_timeout(

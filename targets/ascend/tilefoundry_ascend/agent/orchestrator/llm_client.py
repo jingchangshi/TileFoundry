@@ -1,4 +1,4 @@
-"""Stateless agy CLI backend with streaming liveness watchdog and mock backend."""
+"""Stateless LLM providers for Ascend kernel evolution."""
 
 from __future__ import annotations
 
@@ -12,9 +12,17 @@ import shutil
 import signal
 import tempfile
 import time
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
+from http.client import HTTPException, HTTPResponse
 from pathlib import Path
+from string import Formatter
+from threading import Event
 from typing import Protocol
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 RE_503_CAPACITY = re.compile(
     r"UNAVAILABLE\s*\(code\s*503\)(?::\s*No capacity available)?",
@@ -40,33 +48,24 @@ class StreamWatchdogConfig:
     retry_backoff_sec: float = 1.0
 
 
-_XHIGH_RE = re.compile(r"xhigh", re.IGNORECASE)
+_LLM_ENV_PREFIX = "TILEFOUNDRY_NPU_LLM_"
+_AGY_ENV_PREFIX = "TILEFOUNDRY_NPU_AGY_"
+_REASONING_ROLES = frozenset({"explore_creative", "escalate_trackb"})
+_EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def _config_value(overrides: Mapping[str, str] | None, *keys: str, default: str = "") -> str:
+    for source in (overrides or {}, os.environ):
+        for key in keys:
+            value = source.get(key, "").strip()
+            if value:
+                return value
+    return default
 
 
 def sanitize_effort(effort: str | None, *, default: str = "medium") -> str:
-    """Enforce hard guardrail rejecting/downgrading xhigh thinking effort to high."""
-    if effort is None or not effort.strip():
-        return default
-    cleaned = effort.strip()
-    if cleaned.lower() == "xhigh":
-        return "high"
-    return cleaned
-
-
-def sanitize_model_id(model_id: str) -> str:
-    """Enforce hard guardrail downgrading any *-xhigh model string to -high."""
-    cleaned = model_id.strip()
-    if not cleaned:
-        return cleaned
-    if "xhigh" in cleaned.lower():
-        return _XHIGH_RE.sub("high", cleaned)
-    return cleaned
-
-
-def is_carbon_model(model_id: str) -> bool:
-    """Return True when model_id identifies a Carbon / gemini-pro-orchestrator model."""
-    lower = sanitize_model_id(model_id).strip().lower()
-    return "carbon" in lower or "gemini-pro-orchestrator" in lower
+    """Return the requested effort label, using the default for empty input."""
+    return (effort or "").strip() or default
 
 
 @dataclass(frozen=True)
@@ -79,16 +78,98 @@ class GenerationRequest:
     json_schema: dict[str, object] | None = None
     effort: str | None = None
 
+
+@dataclass(frozen=True)
+class RoleRoutingConfig:
+    """Select a model and timeout from the worker role and cap effort explicitly."""
+
+    exploit_model: str
+    explore_model: str
+    escalate_model: str
+    repair_model: str
+    max_effort: str = "xhigh"
+    exploit_timeout_sec: float = 240.0
+    reasoning_timeout_sec: float = 420.0
+
     def __post_init__(self) -> None:
-        if self.effort is not None and self.effort.strip().lower() == "xhigh":
-            object.__setattr__(self, "effort", "high")
+        if self.max_effort.lower() not in _EFFORT_LEVELS:
+            raise ValueError("LLM max effort must be a supported effort level")
+        if any(
+            not math.isfinite(timeout) or timeout <= 0
+            for timeout in (self.exploit_timeout_sec, self.reasoning_timeout_sec)
+        ):
+            raise ValueError("LLM role timeouts must be finite and positive")
+
+    def model_for_role(self, role: str) -> str:
+        """Return the model configured for this worker role."""
+        if role == "explore_creative":
+            return self.explore_model
+        if role == "escalate_trackb":
+            return self.escalate_model
+        if role == "syntax_repair":
+            return self.repair_model
+        return self.exploit_model
+
+    def timeout_for_role(self, role: str) -> float:
+        """Return the time budget for this worker role in seconds."""
+        if role in _REASONING_ROLES:
+            return self.reasoning_timeout_sec
+        return self.exploit_timeout_sec
+
+    def effort_for_request(
+        self, req: GenerationRequest, override: str | None = None, *, default: str = ""
+    ) -> str:
+        """Apply the ceiling to recognized levels and preserve provider-specific labels."""
+        effort = sanitize_effort(override, default=sanitize_effort(req.effort, default=default))
+        ceiling = self.max_effort.lower()
+        if effort.lower() in _EFFORT_LEVELS:
+            if _EFFORT_LEVELS.index(effort.lower()) > _EFFORT_LEVELS.index(ceiling):
+                return ceiling
+        return effort
+
+    @classmethod
+    def from_env(
+        cls, overrides: Mapping[str, str] | None = None, *, backend: str | None = None
+    ) -> RoleRoutingConfig:
+        """Load role settings with explicit values taking precedence over the environment."""
+        kind = (backend or _config_value(overrides, f"{_LLM_ENV_PREFIX}BACKEND", default="agy_cli")).lower()
+        is_agy = kind in ("agy_cli", "agy")
+
+        def pick(key: str, default: str, *, legacy: bool = False) -> str:
+            keys = [f"{_LLM_ENV_PREFIX}{key}"]
+            if legacy and is_agy:
+                keys.append(f"{_AGY_ENV_PREFIX}{key}")
+            return _config_value(overrides, *keys, default=default)
+
+        if is_agy:
+            default_exploit = AgyCliLLMBackend.DEFAULT_EXPLOIT_MODEL
+        else:
+            default_exploit = "mock" if kind == "mock" else ""
+        exploit = pick("EXPLOIT_MODEL", default_exploit, legacy=True)
+        default_explore = AgyCliLLMBackend.DEFAULT_EXPLORE_MODEL if is_agy else exploit
+        explore = pick("EXPLORE_MODEL", default_explore, legacy=True)
+        return cls(
+            exploit_model=exploit,
+            explore_model=explore,
+            escalate_model=pick("ESCALATE_MODEL", explore, legacy=True),
+            repair_model=pick("REPAIR_MODEL", exploit),
+            max_effort=_config_value(
+                overrides,
+                f"{_LLM_ENV_PREFIX}MAX_EFFORT",
+                f"{_LLM_ENV_PREFIX}EFFORT_CAP",
+                default="high" if is_agy else "xhigh",
+            ),
+            exploit_timeout_sec=float(pick("EXPLOIT_TIMEOUT_SEC", "240")),
+            reasoning_timeout_sec=float(pick("REASONING_TIMEOUT_SEC", "360" if is_agy else "420")),
+        )
 
 
 class KernelLLMBackend(Protocol):
-    """Protocol implemented by both live AgyCliLLMBackend and MockLLMBackend."""
+    """Stateless generation interface shared by remote, subprocess, and offline providers."""
 
     async def generate(self, req: GenerationRequest) -> str:
-        """Generate response text or JSON string for a GenerationRequest."""
+        """Generate response text or a JSON string for a worker request."""
+        ...
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
@@ -143,7 +224,9 @@ def extract_creative_payload(raw_response: str) -> dict[str, str]:
             if isinstance(obj, dict):
                 if isinstance(obj.get("structured_output"), dict):
                     obj = obj["structured_output"]
-                elif isinstance(obj.get("response"), str) and obj["response"].strip().startswith("{"):
+                elif isinstance(obj.get("response"), str) and obj["response"].strip().startswith(
+                    "{"
+                ):
                     inner = json.loads(obj["response"])
                     if isinstance(inner, dict):
                         obj = inner
@@ -167,10 +250,10 @@ def _resolve_agy_binary(explicit_bin: str | None = None) -> str:
     if candidate:
         resolved = shutil.which(candidate) or (candidate if Path(candidate).is_file() else None)
         if resolved:
-            return resolved
+            return os.path.abspath(resolved)
     on_path = shutil.which("agy")
     if on_path:
-        return on_path
+        return os.path.abspath(on_path)
     user_local = Path.home() / ".local" / "bin" / "agy"
     if user_local.is_file():
         return str(user_local)
@@ -276,41 +359,16 @@ class _AttemptFailure(Exception):
 
 
 async def _terminate_process_group(proc: asyncio.subprocess.Process) -> None:
-    """Terminate an agy subprocess and its entire session process group cleanly."""
-    try:
-        pgid: int | None = os.getpgid(proc.pid)
-    except (ProcessLookupError, PermissionError, OSError):
-        pgid = proc.pid
-
+    """Terminate the subprocess session and reap the process."""
     if proc.returncode is None:
-        try:
-            if pgid is not None:
-                os.killpg(pgid, signal.SIGTERM)
-            else:
-                proc.terminate()
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-
-        try:
+        with suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGTERM)
+        with suppress(TimeoutError):
             await asyncio.wait_for(proc.wait(), timeout=1.0)
-        except asyncio.TimeoutError:
-            try:
-                if pgid is not None:
-                    os.killpg(pgid, signal.SIGKILL)
-                else:
-                    proc.kill()
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=1.0)
-            except (asyncio.TimeoutError, ProcessLookupError):
-                pass
 
-    if pgid is not None:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+    with suppress(ProcessLookupError):
+        os.killpg(proc.pid, signal.SIGKILL)
+    await proc.wait()
 
 
 class AgyCliLLMBackend:
@@ -334,32 +392,22 @@ class AgyCliLLMBackend:
         hard_timeout_sec: float | None = None,
         watchdog: StreamWatchdogConfig | None = None,
         escalate_model: str | None = None,
+        repair_model: str | None = None,
+        *,
+        routing: RoleRoutingConfig | None = None,
     ) -> None:
         self._bin = _resolve_agy_binary(bin_path)
-        self._exploit_model = sanitize_model_id(
-            (
-                exploit_model
-                if exploit_model is not None
-                else os.environ.get("TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL", "")
-            ).strip()
-            or self.DEFAULT_EXPLOIT_MODEL
-        )
-        self._explore_model = sanitize_model_id(
-            (
-                explore_model
-                if explore_model is not None
-                else os.environ.get("TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL", "")
-            ).strip()
-            or self.DEFAULT_EXPLORE_MODEL
-        )
-        self._escalate_model = sanitize_model_id(
-            (
-                escalate_model
-                if escalate_model is not None
-                else os.environ.get("TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL", "")
-            ).strip()
-            or self.DEFAULT_ESCALATE_MODEL
-        )
+        model_overrides = {
+            f"{_LLM_ENV_PREFIX}{role}_MODEL": model
+            for role, model in (
+                ("EXPLOIT", exploit_model),
+                ("EXPLORE", explore_model),
+                ("ESCALATE", escalate_model),
+                ("REPAIR", repair_model),
+            )
+            if model is not None
+        }
+        self._routing = routing or RoleRoutingConfig.from_env(model_overrides, backend="agy_cli")
 
         raw_common = (
             common_args
@@ -383,36 +431,39 @@ class AgyCliLLMBackend:
                 active_ceiling_timeout_sec=ceiling,
             )
         else:
-            self._watchdog = self.watchdog_for_model(self._exploit_model)
-        self._hard_timeout = self._watchdog.active_ceiling_timeout_sec
+            self._watchdog = self.watchdog_for_role("exploit_rule")
 
     @property
     def watchdog(self) -> StreamWatchdogConfig:
-        """Return active StreamWatchdogConfig."""
+        """Return the watchdog configuration for default exploit workers."""
         return self._watchdog
 
+    @staticmethod
+    def _agy_model_id(model_id: str) -> str:
+        return re.sub(r"-xhigh$", "-high", model_id.strip(), flags=re.IGNORECASE)
+
     def select_model(self, role: str, *, effort: str | None = None) -> str:
-        """Return target model ID for role; xhigh is strictly downgraded to high."""
-        _ = sanitize_effort(effort, default="medium")
-        if role == "explore_creative":
-            return sanitize_model_id(self._explore_model)
-        return sanitize_model_id(self._exploit_model)
+        """Return the worker's model ID using legacy Agy tier names."""
+        return self._agy_model_id(self._routing.model_for_role(role))
 
     def watchdog_for_model(self, model_id: str) -> StreamWatchdogConfig:
-        """Return explicit or tier-adaptive StreamWatchdogConfig for model_id."""
+        """Return the legacy Agy watchdog settings for a model tier."""
         if self._explicit_watchdog:
             return self._watchdog
-        lower = sanitize_model_id(model_id).strip().lower()
-        if lower.endswith("-high") or "high" in lower:
-            return StreamWatchdogConfig(
-                startup_timeout_sec=60.0,
-                idle_stall_timeout_sec=180.0,
-                active_ceiling_timeout_sec=360.0,
-            )
+        role = (
+            "explore_creative" if "high" in self._agy_model_id(model_id).lower() else "exploit_rule"
+        )
+        return self.watchdog_for_role(role)
+
+    def watchdog_for_role(self, role: str) -> StreamWatchdogConfig:
+        """Return the explicit or role-based Agy watchdog settings."""
+        if self._explicit_watchdog:
+            return self._watchdog
+        ceiling = self._routing.timeout_for_role(role)
         return StreamWatchdogConfig(
-            startup_timeout_sec=60.0,
-            idle_stall_timeout_sec=120.0,
-            active_ceiling_timeout_sec=240.0,
+            startup_timeout_sec=min(60.0, ceiling),
+            idle_stall_timeout_sec=min(180.0 if role in _REASONING_ROLES else 120.0, ceiling),
+            active_ceiling_timeout_sec=ceiling,
         )
 
     def select_effort(
@@ -420,14 +471,17 @@ class AgyCliLLMBackend:
         req: GenerationRequest,
         effort_override: str | None = None,
     ) -> str:
-        """Select reasoning effort from override, request field, or role (never xhigh)."""
-        if effort_override is not None and effort_override.strip():
-            return sanitize_effort(effort_override)
-        if req.effort is not None and req.effort.strip():
-            return sanitize_effort(req.effort)
-        if is_carbon_model(self.select_model(req.role)):
-            return "high"
-        return "high" if req.role == "explore_creative" else "medium"
+        """Select effort for Agy, including compatibility with its legacy tiers."""
+        model = self.select_model(req.role).lower()
+        default = (
+            "high"
+            if req.role in _REASONING_ROLES
+            or "carbon" in model
+            or "gemini-pro-orchestrator" in model
+            else "medium"
+        )
+        effort = self._routing.effort_for_request(req, effort_override, default=default)
+        return "high" if effort.lower() in ("xhigh", "max") else effort
 
     @staticmethod
     def _sanitized_env(sandbox_dir: str) -> dict[str, str]:
@@ -455,7 +509,7 @@ class AgyCliLLMBackend:
             if model_id.endswith(tier_suffix):
                 effort = tier_suffix[1:]
                 break
-        cfg = self.watchdog_for_model(model_id)
+        cfg = self.watchdog_for_role(req.role)
         resolved_log = (
             str(log_file)
             if log_file is not None
@@ -482,7 +536,6 @@ class AgyCliLLMBackend:
         self,
         *,
         req: GenerationRequest,
-        model_id: str,
         exit_code: int | None,
         result_payload: dict[str, object] | None,
         text_deltas: list[str],
@@ -515,7 +568,7 @@ class AgyCliLLMBackend:
                 or bool(RE_STREAM_IDLE_LOG.search(err_detail))
             )
             raise _AttemptFailure(
-                RuntimeError(f"agy failed (model={model_id}): {err_detail}"),
+                RuntimeError(f"Agy generation failed with exit status {exit_code}"),
                 retriable=is_retriable,
             )
 
@@ -529,7 +582,7 @@ class AgyCliLLMBackend:
             or bool(RE_STREAM_IDLE_LOG.search(stderr_text))
         )
         raise _AttemptFailure(
-            RuntimeError(f"agy exited with {exit_code} (model={model_id}): {stderr_text}"),
+            RuntimeError(f"Agy generation failed with exit status {exit_code}"),
             retriable=is_retriable,
         )
 
@@ -542,7 +595,7 @@ class AgyCliLLMBackend:
     ) -> str:
         effort = self.select_effort(req, effort_override=effort_override)
         model_id = self.select_model(req.role, effort=effort)
-        cfg = self.watchdog_for_model(model_id)
+        cfg = self.watchdog_for_role(req.role)
         with (
             tempfile.TemporaryDirectory(prefix="tf_agy_worker_") as sandbox_dir,
             tempfile.TemporaryDirectory(prefix="tf_agy_log_") as log_dir,
@@ -659,7 +712,9 @@ class AgyCliLLMBackend:
                                             text_deltas.append(delta)
                                     elif ev_type == "result":
                                         raw_res = ev.get("result")
-                                        result_payload = raw_res if isinstance(raw_res, dict) else ev
+                                        result_payload = (
+                                            raw_res if isinstance(raw_res, dict) else ev
+                                        )
                                         got_init = True
                                         last_activity_ts = time.monotonic()
                     elif tag == "stderr":
@@ -725,7 +780,6 @@ class AgyCliLLMBackend:
                 tailer.poll()
                 return self._extract_stream_output(
                     req=req,
-                    model_id=model_id,
                     exit_code=proc.returncode,
                     result_payload=result_payload,
                     text_deltas=text_deltas,
@@ -733,11 +787,11 @@ class AgyCliLLMBackend:
                     tailer=tailer,
                 )
             finally:
+                await _terminate_process_group(proc)
                 for task in (pump_out, pump_err):
                     if not task.done():
                         task.cancel()
                 await asyncio.gather(pump_out, pump_err, return_exceptions=True)
-                await _terminate_process_group(proc)
 
     async def generate(
         self,
@@ -754,9 +808,7 @@ class AgyCliLLMBackend:
             f"### SYSTEM INSTRUCTIONS\n{req.system_prompt}\n\n"
             f"### USER INPUT\n{req.user_prompt}\n"
         )
-        effort = self.select_effort(req, effort_override=effort_override)
-        model_id = self.select_model(req.role, effort=effort)
-        cfg = self.watchdog_for_model(model_id)
+        cfg = self.watchdog_for_role(req.role)
         max_retries = max(0, cfg.max_retries)
         async with self._sem:
             for attempt_idx in range(max_retries + 1):
@@ -775,6 +827,429 @@ class AgyCliLLMBackend:
         raise RuntimeError("unreachable retry termination")
 
 
+_STATELESS_INSTRUCTION = (
+    "[STATELESS GENERATION CONTRACT: Do NOT invoke ANY tool calls. "
+    "Answer directly in a single turn using ONLY the prompt context below.]"
+)
+
+
+def _system_prompt(req: GenerationRequest) -> str:
+    if req.json_schema is None:
+        return req.system_prompt
+    return f"{req.system_prompt}\n\nReturn only JSON matching this schema:\n{json.dumps(req.json_schema)}"
+
+
+class _NoHTTPRedirects(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_SSE_LINE_END = re.compile(rb"\r\n|\r|\n")
+
+
+def _iter_sse_data(chunks: Iterable[bytes]) -> Iterator[bytes]:
+    pending_line = b""
+    data: list[bytes] = []
+    first_line = True
+    previous_cr = False
+    for chunk in chunks:
+        if previous_cr:
+            chunk = chunk.removeprefix(b"\n")
+        pending_line += chunk
+        previous_cr = pending_line.endswith(b"\r")
+        start = 0
+        for match in _SSE_LINE_END.finditer(pending_line):
+            line = pending_line[start : match.start()]
+            start = match.end()
+            if first_line:
+                line = line.removeprefix(b"\xef\xbb\xbf")
+                first_line = False
+            if not line and data:
+                yield b"\n".join(data)
+                data.clear()
+            elif line == b"data" or line.startswith(b"data:"):
+                data.append(line.partition(b":")[2].removeprefix(b" "))
+        pending_line = pending_line[start:]
+
+
+def _reject_http_tools(message: Mapping[str, object], finish_reason: object = None) -> None:
+    if (
+        message.get("tool_calls")
+        or message.get("function_call")
+        or finish_reason in ("tool_calls", "function_call")
+    ):
+        raise RuntimeError("LLM HTTP response attempted a tool call")
+
+
+def _read_sse_completion(chunks: Iterable[bytes]) -> str:
+    text: list[str] = []
+    for data in _iter_sse_data(chunks):
+        if data.strip() == b"[DONE]":
+            return "".join(text)
+        if not data.strip():
+            continue
+        event = json.loads(data)
+        if not isinstance(event, dict):
+            raise ValueError
+        if event.get("error"):
+            raise RuntimeError("LLM HTTP stream reported an error")
+        for index, choice in enumerate(event.get("choices", ())):
+            delta = choice.get("delta") or {}
+            finish = choice.get("finish_reason")
+            _reject_http_tools(delta, finish)
+            if choice.get("index", index) != 0:
+                continue
+            content = delta.get("content")
+            if isinstance(content, str):
+                text.append(content)
+            if finish:
+                return "".join(text)
+    raise RuntimeError("LLM HTTP stream ended before completion")
+
+
+def _read_http_chunks(response: HTTPResponse, deadline: float, cancelled: Event) -> Iterator[bytes]:
+    while not cancelled.is_set() and time.monotonic() < deadline:
+        chunk = response.read1(64 * 1024)
+        if cancelled.is_set() or time.monotonic() >= deadline:
+            break
+        if not chunk:
+            return
+        yield chunk
+    raise TimeoutError
+
+
+class OpenAICompatHTTPBackend:
+    """Send stateless chat completions using standard-library JSON and SSE decoding."""
+
+    def __init__(
+        self,
+        routing: RoleRoutingConfig,
+        *,
+        api_base: str | None = None,
+        api_key_env: str | None = None,
+        max_concurrency: int = 4,
+        pass_reasoning_effort: bool | None = None,
+        stream: bool | None = None,
+    ) -> None:
+        self._routing = routing
+        base = api_base or _config_value(
+            None, f"{_LLM_ENV_PREFIX}API_BASE", default="http://127.0.0.1:8000/v1"
+        )
+        try:
+            url = urlsplit(base.strip())
+            if (
+                url.scheme not in ("http", "https")
+                or not url.hostname
+                or url.username is not None
+                or url.query
+                or url.fragment
+            ):
+                raise ValueError
+        except ValueError:
+            raise ValueError("LLM API base must be an HTTP(S) URL without credentials") from None
+        path = url.path.rstrip("/") or "/v1"
+        if not path.endswith("/chat/completions"):
+            path += "/chat/completions"
+        self._endpoint = url._replace(path=path).geturl()
+        default_key_var = (
+            "OPENAI_API_KEY" if url.scheme == "https" and url.hostname == "api.openai.com" else ""
+        )
+        self._key_var = api_key_env or _config_value(
+            None, f"{_LLM_ENV_PREFIX}API_KEY_ENV", default=default_key_var
+        )
+        if self._key_var and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self._key_var):
+            raise ValueError("LLM API key configuration must be an environment variable name")
+        self._pass_effort = (
+            pass_reasoning_effort
+            if pass_reasoning_effort is not None
+            else _config_value(None, f"{_LLM_ENV_PREFIX}PASS_REASONING_EFFORT") == "1"
+        )
+        self._stream = (
+            stream if stream is not None else _config_value(None, f"{_LLM_ENV_PREFIX}STREAM") == "1"
+        )
+        self._sem = asyncio.Semaphore(max(1, max_concurrency))
+
+    def _sync_post(
+        self, body: dict[str, object], timeout_sec: float, cancelled: Event
+    ) -> str:
+        deadline = time.monotonic() + timeout_sec
+        accept = "text/event-stream, application/json" if self._stream else "application/json"
+        headers = {"Content-Type": "application/json", "Accept": accept}
+        key = os.environ.get(self._key_var, "").strip()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        request = Request(
+            self._endpoint, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
+        )
+        try:
+            if cancelled.is_set():
+                raise TimeoutError
+            with build_opener(_NoHTTPRedirects()).open(request, timeout=timeout_sec) as response:
+                chunks = _read_http_chunks(response, deadline, cancelled)
+                media_type = response.getheader("Content-Type", "").partition(";")[0].strip().lower()
+                if media_type == "text/event-stream":
+                    content = _read_sse_completion(chunks)
+                else:
+                    payload = json.loads(b"".join(chunks))
+                    choice = payload["choices"][0]
+                    message = choice["message"]
+                    _reject_http_tools(message, choice.get("finish_reason"))
+                    content = message.get("content")
+        except HTTPError as exc:
+            exc.close()
+            raise RuntimeError(f"LLM HTTP request failed with status {exc.code}") from None
+        except URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                raise TimeoutError("LLM HTTP request timed out") from None
+            raise RuntimeError("LLM HTTP transport failed") from None
+        except TimeoutError:
+            raise TimeoutError("LLM HTTP request timed out") from None
+        except (OSError, HTTPException):
+            raise RuntimeError("LLM HTTP transport failed") from None
+        except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+            raise RuntimeError("LLM HTTP response has an invalid completion") from None
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError("LLM HTTP response has no text completion")
+        return content.strip()
+
+    async def generate(self, req: GenerationRequest, *, effort_override: str | None = None) -> str:
+        """Generate a text completion for a role without exposing any tools."""
+        model = self._routing.model_for_role(req.role)
+        if not model:
+            raise ValueError("Configure an LLM model for the requested HTTP generation role")
+        timeout = self._routing.timeout_for_role(req.role)
+        body: dict[str, object] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": _system_prompt(req)},
+                {"role": "user", "content": req.user_prompt},
+            ],
+        }
+        if self._stream:
+            body["stream"] = True
+        effort = self._routing.effort_for_request(req, effort_override)
+        if self._pass_effort and effort:
+            body["reasoning_effort"] = effort
+
+        await self._sem.acquire()
+        cancelled = Event()
+        try:
+            pending = asyncio.get_running_loop().run_in_executor(
+                None, self._sync_post, body, timeout, cancelled
+            )
+        except RuntimeError:
+            self._sem.release()
+            raise
+
+        def release_slot(completed: asyncio.Future[str]) -> None:
+            self._sem.release()
+            if not completed.cancelled():
+                completed.exception()
+
+        pending.add_done_callback(release_slot)
+        try:
+            return await asyncio.wait_for(asyncio.shield(pending), timeout)
+        except TimeoutError:
+            raise TimeoutError("LLM HTTP request timed out") from None
+        finally:
+            cancelled.set()
+
+
+class SubprocessCliTemplateBackend:
+    """Run a single generation in an empty working directory using an argument vector."""
+
+    def __init__(
+        self,
+        kind: str,
+        routing: RoleRoutingConfig,
+        *,
+        bin_path: str | None = None,
+        template: str | None = None,
+        max_concurrency: int = 2,
+    ) -> None:
+        if kind not in ("claude_cli", "codex_cli", "custom_cli"):
+            raise ValueError("Unknown LLM CLI profile")
+        self._kind = kind
+        self._routing = routing
+        self._template: list[str] = []
+        self._template_fields: set[str] = set()
+        configured_bin = bin_path or _config_value(None, f"{_LLM_ENV_PREFIX}CLI_BIN")
+        if kind == "custom_cli":
+            raw_template = template or _config_value(None, f"{_LLM_ENV_PREFIX}CLI_TEMPLATE")
+            try:
+                self._template = shlex.split(raw_template)
+                fields = {"bin", "model", "prompt", "effort"}
+                for arg in self._template:
+                    for _, name, spec, conversion in Formatter().parse(arg):
+                        if name is None:
+                            continue
+                        if name not in fields or spec or conversion:
+                            raise ValueError
+                        self._template_fields.add(name)
+                if not self._template:
+                    raise ValueError
+                executable = self._template[0]
+                if executable == "{bin}":
+                    executable = configured_bin
+                elif "{" in executable or "}" in executable:
+                    raise ValueError
+            except ValueError:
+                raise ValueError("Invalid LLM CLI template") from None
+            if not executable:
+                raise ValueError("Configure an executable for the custom LLM CLI template")
+        else:
+            executable = configured_bin or kind.removesuffix("_cli")
+        resolved = shutil.which(executable)
+        if resolved is None:
+            raise FileNotFoundError("Cannot locate the configured LLM CLI executable")
+        self._bin = os.path.abspath(resolved)
+        self._sem = asyncio.Semaphore(max(1, max_concurrency))
+
+    def _command(self, model: str, effort: str, prompt: str) -> tuple[list[str], bytes | None]:
+        if self._kind == "custom_cli":
+            values = {"bin": self._bin, "model": model, "effort": effort, "prompt": prompt}
+            argv = [self._bin, *(arg.format_map(values) for arg in self._template[1:])]
+            stdin = None if "prompt" in self._template_fields else prompt.encode("utf-8")
+            return argv, stdin
+
+        if self._kind == "claude_cli":
+            argv = [
+                self._bin,
+                "--print",
+                "--output-format",
+                "text",
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--disable-slash-commands",
+                "--no-session-persistence",
+                "--setting-sources",
+                "",
+                "--permission-mode",
+                "dontAsk",
+                "--no-chrome",
+            ]
+            if effort:
+                argv.append(f"--effort={effort}")
+        else:
+            argv = [
+                self._bin,
+                "--no-daemon",
+                "--ask-for-approval",
+                "never",
+                "exec",
+                "--sandbox",
+                "read-only",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--json",
+                "-c",
+                'web_search="disabled"',
+                "-c",
+                "mcp_servers={}",
+            ]
+            for feature in (
+                "shell_tool",
+                "unified_exec",
+                "multi_agent",
+                "multi_agent_v2",
+                "apps",
+                "plugins",
+                "hooks",
+                "browser_use",
+                "image_generation",
+                "view_image",
+            ):
+                argv.extend(("--disable", feature))
+            if effort:
+                argv.extend(("-c", f"model_reasoning_effort={json.dumps(effort)}"))
+        if model:
+            argv.append(f"--model={model}")
+        if self._kind == "codex_cli":
+            argv.append("-")
+        return argv, prompt.encode("utf-8")
+
+    @staticmethod
+    def _codex_text(output: str) -> str:
+        text = ""
+        for line in output.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                raise RuntimeError("Codex CLI returned an invalid generation event") from None
+            if not isinstance(event, dict):
+                raise RuntimeError("Codex CLI returned an invalid generation event")
+            event_type = event.get("type")
+            item = event.get("item")
+            if event_type in ("error", "turn.failed"):
+                raise RuntimeError("Codex CLI reported a generation failure")
+            if isinstance(item, dict):
+                if item.get("type") not in ("agent_message", "reasoning"):
+                    raise RuntimeError("Codex CLI attempted to use a tool during generation")
+                if event_type == "item.completed" and item.get("type") == "agent_message":
+                    value = item.get("text")
+                    if isinstance(value, str):
+                        text = value
+        return text.strip()
+
+    async def _run(self, argv: list[str], stdin: bytes | None, timeout: float) -> bytes:
+        with tempfile.TemporaryDirectory(prefix="tf_llm_worker_") as sandbox_dir:
+            env = {**os.environ, "PWD": sandbox_dir}
+            env.pop("CLAUDECODE", None)
+            spawn = asyncio.create_task(
+                asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.DEVNULL if stdin is None else asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    cwd=sandbox_dir,
+                    env=env,
+                    start_new_session=True,
+                )
+            )
+            try:
+                proc = await asyncio.shield(spawn)
+            except asyncio.CancelledError:
+                with suppress(OSError, ValueError):
+                    proc = await spawn
+                    await asyncio.gather(_terminate_process_group(proc), proc.communicate())
+                raise
+            except (OSError, ValueError):
+                raise RuntimeError("Could not start the configured LLM CLI") from None
+
+            communication = asyncio.create_task(proc.communicate(stdin))
+            try:
+                output, _ = await asyncio.wait_for(asyncio.shield(communication), timeout)
+            except TimeoutError:
+                raise TimeoutError("LLM CLI generation timed out") from None
+            finally:
+                await _terminate_process_group(proc)
+                await asyncio.gather(communication, return_exceptions=True)
+            if proc.returncode:
+                raise RuntimeError(f"LLM CLI generation failed with exit status {proc.returncode}")
+            return output
+
+    async def generate(self, req: GenerationRequest, *, effort_override: str | None = None) -> str:
+        """Route a generation request to the CLI and return its final response text."""
+        model = self._routing.model_for_role(req.role)
+        effort = self._routing.effort_for_request(req, effort_override)
+        prompt = (
+            f"{_STATELESS_INSTRUCTION}\n\n### SYSTEM INSTRUCTIONS\n{_system_prompt(req)}\n\n"
+            f"### USER INPUT\n{req.user_prompt}\n"
+        )
+        argv, stdin = self._command(model, effort, prompt)
+        async with self._sem:
+            output = await self._run(argv, stdin, self._routing.timeout_for_role(req.role))
+        text = output.decode("utf-8", errors="replace").strip()
+        if self._kind == "codex_cli":
+            text = self._codex_text(text)
+        if not text:
+            raise RuntimeError("LLM CLI returned no text completion")
+        return text
+
+
 @dataclass
 class MockLLMBackend:
     """Deterministic scriptable LLM backend for offline orchestrator testing."""
@@ -784,6 +1259,11 @@ class MockLLMBackend:
     calls: list[GenerationRequest] = field(default_factory=list)
     routed_models: list[str] = field(default_factory=list)
     routed_efforts: list[str] = field(default_factory=list)
+    routing: RoleRoutingConfig = field(
+        default_factory=lambda: RoleRoutingConfig(
+            "mock-exploit", "mock-explore", "mock-escalate", "mock-repair"
+        )
+    )
 
     async def generate(
         self,
@@ -791,34 +1271,59 @@ class MockLLMBackend:
         *,
         effort_override: str | None = None,
     ) -> str:
-        """Record request and return next queued response for req.role."""
+        """Record a request and return the next queued response for its role."""
         self.calls.append(req)
-        if effort_override and effort_override.strip():
-            effort = sanitize_effort(effort_override)
-        elif req.effort and req.effort.strip():
-            effort = sanitize_effort(req.effort)
-        else:
-            effort = "high" if req.role == "explore_creative" else "medium"
-        if req.role == "explore_creative":
-            model_id = sanitize_model_id(AgyCliLLMBackend.DEFAULT_EXPLORE_MODEL)
-        else:
-            model_id = sanitize_model_id(AgyCliLLMBackend.DEFAULT_EXPLOIT_MODEL)
-        self.routed_models.append(model_id)
-        self.routed_efforts.append(effort)
+        default = "high" if req.role in _REASONING_ROLES else "medium"
+        self.routed_models.append(self.routing.model_for_role(req.role))
+        self.routed_efforts.append(
+            self.routing.effort_for_request(req, effort_override, default=default)
+        )
         queue = self.responses.get(req.role)
+        if queue is None and req.role == "escalate_trackb":
+            queue = self.responses.get("explore_creative")
         if queue:
             return queue.pop(0)
         return self.default_response
 
 
-def create_llm_backend_from_env() -> KernelLLMBackend:
-    """Instantiate configured LLM backend from TILEFOUNDRY_NPU_LLM_BACKEND."""
-    kind = os.environ.get("TILEFOUNDRY_NPU_LLM_BACKEND", "agy_cli").strip().lower()
-    if kind in ("agy_cli", "agy", ""):
-        return AgyCliLLMBackend()
+def create_llm_backend_from_env(overrides: Mapping[str, str] | None = None) -> KernelLLMBackend:
+    """Create a generation provider using explicit overrides and environment settings."""
+
+    def pick(key: str, default: str = "", *, legacy: str = "") -> str:
+        keys = [f"{_LLM_ENV_PREFIX}{key}"]
+        if legacy:
+            keys.append(f"{_AGY_ENV_PREFIX}{legacy}")
+        return _config_value(overrides, *keys, default=default)
+
+    kind = pick("BACKEND", "agy_cli").lower()
+    routing = RoleRoutingConfig.from_env(overrides, backend=kind)
+    if kind in ("agy_cli", "agy"):
+        return AgyCliLLMBackend(
+            bin_path=pick("CLI_BIN", legacy="BIN") or None,
+            routing=routing,
+            common_args=_config_value(overrides, f"{_AGY_ENV_PREFIX}COMMON_ARGS") or None,
+            max_concurrency=int(pick("MAX_CONCURRENCY", "3", legacy="MAX_CONCURRENCY")),
+        )
     if kind == "mock":
-        return MockLLMBackend()
-    raise ValueError(f"unsupported TILEFOUNDRY_NPU_LLM_BACKEND={kind!r}")
+        return MockLLMBackend(routing=routing)
+    if kind in ("openai_compat", "openai", "vllm", "sglang", "http"):
+        return OpenAICompatHTTPBackend(
+            routing,
+            api_base=pick("API_BASE") or None,
+            api_key_env=pick("API_KEY_ENV") or None,
+            max_concurrency=int(pick("MAX_CONCURRENCY", "4")),
+            pass_reasoning_effort=pick("PASS_REASONING_EFFORT") == "1",
+            stream=pick("STREAM") == "1",
+        )
+    if kind in ("claude_cli", "codex_cli", "custom_cli"):
+        return SubprocessCliTemplateBackend(
+            kind,
+            routing,
+            bin_path=pick("CLI_BIN") or None,
+            template=pick("CLI_TEMPLATE") or None,
+            max_concurrency=int(pick("MAX_CONCURRENCY", "2")),
+        )
+    raise ValueError("Unsupported TILEFOUNDRY_NPU_LLM_BACKEND value")
 
 
 __all__ = [
@@ -827,13 +1332,14 @@ __all__ = [
     "GenerationRequest",
     "KernelLLMBackend",
     "MockLLMBackend",
+    "OpenAICompatHTTPBackend",
     "RE_503_CAPACITY",
     "RE_STREAM_IDLE_LOG",
+    "RoleRoutingConfig",
     "StreamWatchdogConfig",
+    "SubprocessCliTemplateBackend",
     "create_llm_backend_from_env",
     "extract_creative_payload",
     "extract_python_dsl",
-    "is_carbon_model",
     "sanitize_effort",
-    "sanitize_model_id",
 ]

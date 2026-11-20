@@ -51,7 +51,7 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     AgyCliLLMBackend,
     GenerationRequest,
     MockLLMBackend,
-    is_carbon_model,
+    RoleRoutingConfig,
 )
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate,
@@ -300,20 +300,15 @@ def test_campaign_runner_live_sil_7facet_cost_calibration_and_shared_stone_pruni
     assert runner._beams["r2_tail"].stepping_stone_beam == []
 
 
-def test_carbon_high_effort_defaults_and_xhigh_guardrail(tmp_path: Path) -> None:
-    """Verify Carbon high effort defaults, exploit_rule medium default, and MarathonConfig."""
-    assert is_carbon_model("carbon") is True
-    assert is_carbon_model("gemini-pro-orchestrator") is True
-    assert is_carbon_model("gemini-pro-orchestrator-xhigh") is True
-    assert is_carbon_model("gemini-4-hydrogen-medium") is False
-
+def test_agy_effort_defaults_and_campaign_defaults(tmp_path: Path) -> None:
+    """Verify Agy compatibility stays in its provider and campaign defaults are neutral."""
     fake_agy = tmp_path / "fake_agy"
     fake_agy.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     fake_agy.chmod(0o755)
 
     carbon_backend = AgyCliLLMBackend(
         bin_path=str(fake_agy),
-        exploit_model="gemini-pro-orchestrator",
+        routing=RoleRoutingConfig("gemini-pro-orchestrator", "explore", "escalate", "repair"),
     )
     assert carbon_backend.select_effort(GenerationRequest("exploit_rule", "s", "u")) == "high"
     assert (
@@ -321,10 +316,15 @@ def test_carbon_high_effort_defaults_and_xhigh_guardrail(tmp_path: Path) -> None
         == "high"
     )
 
-    hydrogen_backend = AgyCliLLMBackend(bin_path=str(fake_agy))
+    hydrogen_backend = AgyCliLLMBackend(
+        bin_path=str(fake_agy),
+        routing=RoleRoutingConfig("gemini-4-hydrogen-medium", "explore", "escalate", "repair"),
+    )
     assert hydrogen_backend.select_effort(GenerationRequest("exploit_rule", "s", "u")) == "medium"
 
     m_cfg = MarathonConfig(operator_name="rms_norm")
+    assert m_cfg.llm_backend is None
+    assert m_cfg.escalate_model is None
     assert m_cfg.exploit_effort == "high"
     assert m_cfg.auto_bootstrap_seed is True
 

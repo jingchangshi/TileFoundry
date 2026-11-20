@@ -40,14 +40,18 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     patch_regime_into_module,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+    _LLM_API_KEY_ENV,
+    _NON_AGENT_GATES_ENV_KEYS,
     CandidateSurrogateResult,
     L3AcceptanceResult,
     _clean_agent_gates_subprocess_env,
     _default_surrogate_cache_dir,
     _default_surrogate_tl_cache_dir,
+    _format_env_line,
     _resolve_agent_gates_bin,
     _resolve_env_file_path,
     _run_agent_gates_cmd,
+    _validate_llm_api_key_env,
     _write_temp_env_file,
     collect_bottleneck_msprof_via_agent_gates,
     ensure_npu_compare_shim_dir,
@@ -61,7 +65,7 @@ from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import GateFunnel
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     AgyCliLLMBackend,
-    GenerationRequest,
+    create_llm_backend_from_env,
 )
 from tilefoundry_ascend.ascend.cost_model.experience_lake import (
     CandidateArtifactRecord,
@@ -76,9 +80,23 @@ logger = logging.getLogger("tilefoundry_ascend.marathon")
 _IN_CLOSE_WRITE = 0x00000008
 _IN_MOVED_TO = 0x00000080
 _WATCH_MASK = _IN_CLOSE_WRITE | _IN_MOVED_TO
-_DEFAULT_AGY_COMMON_ARGS = (
-    "--print --input-format text --disable-slash-commands "
-    "--sandbox --mode plan --dangerously-skip-permissions --print-timeout 240s"
+_LLM_ENV_PREFIX = "TILEFOUNDRY_NPU_LLM_"
+_LLM_CLI_OPTIONS = {
+    "llm_backend": ("BACKEND", "Generation backend."),
+    "exploit_model": ("EXPLOIT_MODEL", "Model for rule-guided exploitation."),
+    "explore_model": ("EXPLORE_MODEL", "Model for creative exploration."),
+    "escalate_model": ("ESCALATE_MODEL", "Model for escalated exploration."),
+    "llm_api_base": ("API_BASE", "Base URL for the HTTP generation backend."),
+}
+_LEGACY_AGY_ENV_KEYS = frozenset(
+    {
+        "TILEFOUNDRY_NPU_AGY_BIN",
+        "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
+        "TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL",
+        "TILEFOUNDRY_NPU_AGY_ESCALATE_MODEL",
+        "TILEFOUNDRY_NPU_AGY_COMMON_ARGS",
+        "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
+    }
 )
 _SUPPORTED_OPERATORS: tuple[str, ...] = ()
 _AGENT_GATES_ALLOWED_ENV_KEYS = frozenset(
@@ -105,12 +123,6 @@ _AGENT_GATES_ALLOWED_ENV_KEYS = frozenset(
         "TILEFOUNDRY_NPU_CANNBENCH_POOL_ID",
         "TILEFOUNDRY_NPU_CANNBENCH_AGGREGATION_TOKEN",
         "TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT",
-        "TILEFOUNDRY_NPU_LLM_BACKEND",
-        "TILEFOUNDRY_NPU_AGY_BIN",
-        "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
-        "TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL",
-        "TILEFOUNDRY_NPU_AGY_COMMON_ARGS",
-        "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
         "TILEFOUNDRY_NPU_TILELANG_REPO",
         "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
         "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
@@ -119,9 +131,40 @@ _AGENT_GATES_ALLOWED_ENV_KEYS = frozenset(
 )
 
 
+def _is_llm_env_key(key: str) -> bool:
+    return key.startswith(_LLM_ENV_PREFIX) or key in _LEGACY_AGY_ENV_KEYS
+
+
 def _is_agent_gates_allowed_env_key(key: str) -> bool:
-    """Return True if *key* is accepted by the AgentGates tilefoundry-npu adapter."""
-    return key in _AGENT_GATES_ALLOWED_ENV_KEYS or key.startswith("TILEFOUNDRY_NPU_CANNBENCH_")
+    """Return whether the environment key belongs in an AgentGates file."""
+    return key not in _NON_AGENT_GATES_ENV_KEYS and (
+        _is_llm_env_key(key)
+        or key in _AGENT_GATES_ALLOWED_ENV_KEYS
+        or key.startswith("TILEFOUNDRY_NPU_CANNBENCH_")
+    )
+
+
+def _add_llm_arguments(parser: argparse.ArgumentParser) -> None:
+    for name, (_, help_text) in _LLM_CLI_OPTIONS.items():
+        parser.add_argument(f"--{name.replace('_', '-')}", help=help_text)
+
+
+def _llm_backend_overrides(
+    env_values: Mapping[str, str], options: argparse.Namespace | MarathonConfig
+) -> dict[str, str]:
+    overrides = {
+        key: value
+        for key, value in env_values.items()
+        if _is_llm_env_key(key) and key not in _NON_AGENT_GATES_ENV_KEYS
+    }
+    overrides.update(
+        {
+            f"{_LLM_ENV_PREFIX}{key}": value
+            for name, (key, _) in _LLM_CLI_OPTIONS.items()
+            if (value := getattr(options, name)) is not None
+        }
+    )
+    return overrides
 
 
 @dataclass(frozen=True)
@@ -166,9 +209,13 @@ class MarathonConfig:
     prewarm_l3: bool = True
     salvage_beam_candidates: bool = True
     resume: bool | None = None
-    escalate_model: str = "gemini-4-hydrogen-high"
+    escalate_model: str | None = None
     exploit_effort: str = "high"
     auto_bootstrap_seed: bool = True
+    llm_backend: str | None = None
+    exploit_model: str | None = None
+    explore_model: str | None = None
+    llm_api_base: str | None = None
 
 
 def short_operator_tag(operator_name: str) -> str:
@@ -469,12 +516,15 @@ def discover_marathon_environment(
     source_root: Path | None = None,
 ) -> dict[str, str]:
     """Discover runtime toolchain and workspace paths with no hardcoded machine paths."""
-    seeded: dict[str, str] = {}
     env_hint = base_env_file or os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
-    if env_hint and Path(env_hint).is_file():
-        seeded.update(parse_simple_env_file(env_hint))
+    env_path = Path(env_hint).expanduser() if env_hint else None
+    if env_path is not None and not env_path.is_file():
+        env_path = None
+    seeded = parse_simple_env_file(env_path) if env_path is not None else {}
 
     for key, value in os.environ.items():
+        if env_path is not None and _is_llm_env_key(key):
+            continue
         if key.startswith("TILEFOUNDRY_NPU_") and value.strip() and key not in seeded:
             seeded[key] = value.strip()
 
@@ -544,14 +594,6 @@ def discover_marathon_environment(
             if ag_which:
                 values["TILEFOUNDRY_NPU_AGENT_GATES_BIN"] = ag_which
 
-    if not values.get("TILEFOUNDRY_NPU_AGY_BIN"):
-        agy_which = shutil.which("agy")
-        local_agy = Path.home() / ".local" / "bin" / "agy"
-        if agy_which:
-            values["TILEFOUNDRY_NPU_AGY_BIN"] = agy_which
-        elif local_agy.is_file():
-            values["TILEFOUNDRY_NPU_AGY_BIN"] = str(local_agy)
-
     values.setdefault("TILEFOUNDRY_NPU_CPU_TESTS", "")
     values.setdefault("TILEFOUNDRY_NPU_DEVICE_TESTS", "")
     values.setdefault("TILEFOUNDRY_NPU_BUILD_SUBDIR", "build")
@@ -560,19 +602,7 @@ def discover_marathon_environment(
     values["TILEFOUNDRY_NPU_CANNBENCH_TARGETS"] = (
         f"{get_operator_task(operator_name)}:{get_operator_module_relpath(operator_name)}"
     )
-    values.setdefault("TILEFOUNDRY_NPU_LLM_BACKEND", "agy_cli")
-    values.setdefault("TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL", "gemini-4-hydrogen-medium")
-    values.setdefault("TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL", "gemini-4-hydrogen-high")
-    values.setdefault("TILEFOUNDRY_NPU_AGY_COMMON_ARGS", _DEFAULT_AGY_COMMON_ARGS)
-    values.setdefault("TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY", "2")
     return values
-
-
-def _format_env_line(key: str, value: str) -> str:
-    if any(ch.isspace() for ch in value):
-        escaped = value.replace('"', '\\"')
-        return f'{key}="{escaped}"'
-    return f"{key}={value}"
 
 
 def ensure_marathon_env_file(
@@ -596,6 +626,7 @@ def ensure_marathon_env_file(
     allowed_discovered = {
         key: val for key, val in discovered.items() if _is_agent_gates_allowed_env_key(key)
     }
+    _validate_llm_api_key_env(allowed_discovered.get(_LLM_API_KEY_ENV, "").strip())
     if target.is_file():
         existing = parse_simple_env_file(target)
         disallowed_existing = [
@@ -656,12 +687,6 @@ def configure_marathon_process_env(
     parsed = parse_simple_env_file(env_file)
     for key in (
         "TILEFOUNDRY_NPU_AGENT_GATES_BIN",
-        "TILEFOUNDRY_NPU_LLM_BACKEND",
-        "TILEFOUNDRY_NPU_AGY_BIN",
-        "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
-        "TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL",
-        "TILEFOUNDRY_NPU_AGY_COMMON_ARGS",
-        "TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY",
         "TILEFOUNDRY_NPU_CANNBENCH_REPO",
         "TILEFOUNDRY_NPU_TILELANG_SOURCE",
         "TILEFOUNDRY_NPU_TILELANG_BUILD",
@@ -718,22 +743,7 @@ def _resolve_worktree(cfg: MarathonConfig) -> tuple[Path, Path]:
     return source_root, cand.resolve()
 
 
-class FastCreativeAgyBackend(AgyCliLLMBackend):
-    """Route escalated creative requests to stable high-tier exploration model."""
-
-    def __init__(self, escalate_model: str = "gemini-4-hydrogen-high") -> None:
-        super().__init__(escalate_model=escalate_model)
-
-    def select_effort(
-        self,
-        req: GenerationRequest,
-        effort_override: str | None = None,
-    ) -> str:
-        """Clamp unsupported xhigh effort requests down to high."""
-        effort = super().select_effort(req, effort_override=effort_override)
-        if effort.strip().lower() == "xhigh":
-            return "high"
-        return effort
+FastCreativeAgyBackend = AgyCliLLMBackend
 
 
 class ExtremeCampaignRunner(PerfTargetCampaignRunner):
@@ -1653,12 +1663,13 @@ def run_operator_marathon(
         env_file=cfg.env_file,
         source_root=_source_root,
     )
-    configure_marathon_process_env(
+    env_values = configure_marathon_process_env(
         operator_name=cfg.operator_name,
         env_file=env_file,
         worktree=worktree,
         source_root=_source_root,
     )
+    llm_backend = create_llm_backend_from_env(overrides=_llm_backend_overrides(env_values, cfg))
     op_logger.info(
         "MARATHON_BOOT op=%s device=%s worktree=%s env_file=%s",
         cfg.operator_name,
@@ -1668,7 +1679,7 @@ def run_operator_marathon(
     )
     if cfg.auto_bootstrap_seed and not target_module.is_file():
         raw_cb = (
-            parse_simple_env_file(env_file).get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
+            env_values.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
             or os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
         )
         if ensure_operator_seed_module(
@@ -1768,7 +1779,7 @@ def run_operator_marathon(
         config=campaign_cfg,
         target_module_path=target_module,
         perf_target=perf_target,
-        llm_backend=FastCreativeAgyBackend(escalate_model=cfg.escalate_model),
+        llm_backend=llm_backend,
         tracker=tracker,
         flywheel_distiller=flywheel,
         l2_batch_evaluator=l2_evaluator,
@@ -2237,6 +2248,7 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state-dir", default=None, help="Directory for checkpoint/logs/env.")
     parser.add_argument("--target-file", default=None, help="Override target kernels.py path.")
     parser.add_argument("--env-file", default=None, help="Optional pre-existing env.sh path.")
+    _add_llm_arguments(parser)
     parser.add_argument("--checkpoint", default=None, help="Override checkpoint JSON path.")
     parser.add_argument("--report-json", default=None, help="Override final report JSON path.")
     parser.add_argument("--campaign-kb", default=None, help="Override distilled KB YAML path.")
@@ -2318,6 +2330,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_final_l4=not bool(args.no_final_l4),
         resume=False if args.fresh else None,
         salvage_beam_candidates=not bool(args.no_salvage),
+        llm_backend=args.llm_backend,
+        exploit_model=args.exploit_model,
+        explore_model=args.explore_model,
+        escalate_model=args.escalate_model,
+        llm_api_base=args.llm_api_base,
     )
     return run_operator_marathon(cfg)
 

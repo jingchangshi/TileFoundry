@@ -248,8 +248,9 @@ def test_portfolio_runner_k2_rule_plus_creative_repair_and_two_lane_beam() -> No
     for rule in tracker.active_rules():
         assert rule.rule_id not in creative_prompt
 
-    assert mock_backend.routed_models.count("gemini-4-hydrogen-high") == 1
-    assert mock_backend.routed_models.count("gemini-4-hydrogen-medium") == 3
+    assert mock_backend.routed_models.count("mock-explore") == 1
+    assert mock_backend.routed_models.count("mock-exploit") == 2
+    assert mock_backend.routed_models.count("mock-repair") == 1
 
     assert report.exploit_beam[0].latency_us == 28.0
     assert any("T.alloc_ss" in c.structural_signature for c in report.stepping_stone_beam)

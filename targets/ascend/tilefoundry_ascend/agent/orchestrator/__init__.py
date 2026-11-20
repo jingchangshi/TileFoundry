@@ -1,4 +1,4 @@
-"""Dual-loop agy orchestrator, tile-size prescreener, gate funnel, and two-lane beam."""
+"""Provider-backed kernel evolution, tile-size prescreening, and gate evaluation."""
 
 from tilefoundry_ascend.agent.orchestrator.e2e_evolution import (
     EvolutionRoundRecord,
@@ -30,10 +30,19 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     GenerationRequest,
     KernelLLMBackend,
     MockLLMBackend,
+    OpenAICompatHTTPBackend,
+    RoleRoutingConfig,
     StreamWatchdogConfig,
+    SubprocessCliTemplateBackend,
     create_llm_backend_from_env,
     extract_creative_payload,
     extract_python_dsl,
+)
+from tilefoundry_ascend.agent.orchestrator.llm_constraints import (
+    build_progressive_llm_constraints,
+    format_blueprint_delta_section,
+    format_hardware_and_sil_layer,
+    format_target_dialect_layer,
 )
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     PortfolioRoundReport,
@@ -59,12 +68,6 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     generate_aligned_neighborhood,
     prescreen_tile_configs,
 )
-from tilefoundry_ascend.agent.orchestrator.llm_constraints import (
-    build_progressive_llm_constraints,
-    format_blueprint_delta_section,
-    format_hardware_and_sil_layer,
-    format_target_dialect_layer,
-)
 from tilefoundry_ascend.agent.orchestrator.twin_bridge import (
     build_tilelang_runtime_twin,
     verify_twin_cpu_reference,
@@ -81,17 +84,20 @@ __all__ = [
     "GenerationRequest",
     "KernelLLMBackend",
     "MockLLMBackend",
+    "OpenAICompatHTTPBackend",
     "PortfolioRoundReport",
     "PortfolioRunner",
     "PrescreenScore",
     "RE_503_CAPACITY",
     "RE_STREAM_IDLE_LOG",
     "RoundEscalationReport",
+    "RoleRoutingConfig",
     "StageAResult",
     "StageBResult",
     "StageCResult",
     "StaticDynamicResidual",
     "StreamWatchdogConfig",
+    "SubprocessCliTemplateBackend",
     "TileConfigCandidate",
     "TwoLaneBeamSearch",
     "WorkerSpec",

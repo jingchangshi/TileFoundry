@@ -5,15 +5,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from pathlib import Path
+import os
 import sys
+from pathlib import Path
 
+from tilefoundry_ascend.agent.campaign.anchor_specs import parse_simple_env_file
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
     PerfTargetCampaignRunner,
 )
 from tilefoundry_ascend.agent.campaign.marathon import (
     MarathonConfig,
+    _add_llm_arguments,
+    _llm_backend_overrides,
     run_operator_marathon,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
@@ -22,6 +26,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import GateFunnel
+from tilefoundry_ascend.agent.orchestrator.llm_client import create_llm_backend_from_env
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -47,6 +52,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-final-l4", action="store_true", help="Run final official L4 gate.")
     parser.add_argument("--device-id", default="1", help="Authorized NPU device ID.")
     parser.add_argument("--env-file", default=None, help="Path to tilefoundry-npu env.sh.")
+    _add_llm_arguments(parser)
     parser.add_argument("--source-root", default=None, help="TileFoundry workspace root.")
     parser.add_argument("--target-file", default=None, help="Override target kernels.py path.")
     parser.add_argument("--campaign-kb", default=None, help="Optional YAML path for distilled rules.")
@@ -76,11 +82,20 @@ def main(argv: list[str] | None = None) -> int:
             k_rule_workers=int(args.k_rule_workers),
             run_final_l4=True if args.run_final_l4 else True,
             resume=True if args.resume else None,
+            llm_backend=args.llm_backend,
+            exploit_model=args.exploit_model,
+            explore_model=args.explore_model,
+            escalate_model=args.escalate_model,
+            llm_api_base=args.llm_api_base,
         )
         return run_operator_marathon(m_cfg)
 
     if not args.checkpoint:
         parser.error("--checkpoint is required unless --marathon is set")
+
+    env_hint = args.env_file or os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
+    env_values = parse_simple_env_file(Path(env_hint).expanduser()) if env_hint else {}
+    llm_backend = create_llm_backend_from_env(overrides=_llm_backend_overrides(env_values, args))
 
     max_rounds = int(args.max_rounds) if args.max_rounds is not None else 12
     max_wall_clock_min = (
@@ -112,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
     runner = PerfTargetCampaignRunner(
         config=cfg,
         target_module_path=args.target_file,
+        llm_backend=llm_backend,
         tracker=tracker,
         flywheel_distiller=flywheel,
         checkpoint_path=args.checkpoint,

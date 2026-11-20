@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -1325,13 +1326,24 @@ def prewarm_surrogate_tilelang_cache(
     return resolved_tl_cache
 
 
+_LLM_API_KEY_ENV = "TILEFOUNDRY_NPU_LLM_API_KEY_ENV"
 _NON_AGENT_GATES_ENV_KEYS = frozenset(
-    {
-        "TILEFOUNDRY_NPU_AGENT_GATES_BIN",
-        "TILEFOUNDRY_NPU_AGY_EXPLOIT_MODEL",
-        "TILEFOUNDRY_NPU_AGY_EXPLORE_MODEL",
-    }
+    {"TILEFOUNDRY_NPU_AGENT_GATES_BIN", "TILEFOUNDRY_NPU_LLM_API_KEY"}
 )
+
+
+def _validate_llm_api_key_env(name: str) -> None:
+    if name and (
+        not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+        or name.startswith("TILEFOUNDRY_NPU_")
+    ):
+        raise ValueError(f"{_LLM_API_KEY_ENV} must name a separate environment variable")
+
+
+def _format_env_line(key: str, value: str) -> str:
+    if any(char in value for char in "\n\r\x00"):
+        raise ValueError(f"{key} must be single-line")
+    return f"{key}={shlex.quote(value)}"
 
 
 def _write_temp_env_file(
@@ -1339,16 +1351,19 @@ def _write_temp_env_file(
     dest_path: Path,
     overrides: Mapping[str, str],
 ) -> Path:
+    values = parse_simple_env_file(base_env)
+    values.update(overrides)
+    _validate_llm_api_key_env(values.get(_LLM_API_KEY_ENV, "").strip())
     stripped_keys = set(overrides) | _NON_AGENT_GATES_ENV_KEYS
     lines = [
-        ln
-        for ln in base_env.read_text(encoding="utf-8").splitlines()
-        if not any(ln.lstrip().startswith(f"{key}=") for key in stripped_keys)
+        line
+        for line in base_env.read_text(encoding="utf-8").splitlines()
+        if line.partition("=")[0].strip().removeprefix("export ").strip() not in stripped_keys
     ]
     for key, value in overrides.items():
         if key in _NON_AGENT_GATES_ENV_KEYS:
             continue
-        lines.append(f'{key}="{value}"')
+        lines.append(_format_env_line(key, value))
     dest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return dest_path
 

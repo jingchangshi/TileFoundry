@@ -21,7 +21,7 @@ flowchart TB
 
     subgraph S3["Stage 3: 3-Layer Progressive Constraint Synthesis & Stateless Generation"]
         S3_RULE["Rule-Guided Exploitation Workers (K Parallel)\n3-axis Bayesian rule ranking + 3-layer progressive LLM constraints\n(L1 Redlines/Facets + L2 Grounded Dialect API + L3 Blueprint/Residual Delta)"]:::synth
-        S3_FREE["Rule-Blind Creative Exploration Workers (1 + Deficit)\nInject rule-blind negative structural exclusions & TileSizePrescreen hints;\nstateless Agy empty-sandbox execution with SSE dual-timer watchdog & xhigh cap"]:::synth
+        S3_FREE["Rule-Blind Creative Exploration Workers (1 + Deficit)\nInject rule-blind negative structural exclusions & TileSizePrescreen hints;\nstateless generation through a pluggable LLM or agent backend with liveness monitoring"]:::synth
         S3_SPLICE["Isolated AST Regime Splicing & Shell Materialization\npatch_regime_into_module isolates sibling regimes & prunes dead helpers;\nTrack-B materializes 7-facet coordination shells or strips locks at Top"]:::synth
         S3_RULE -->|"Exploit patch"| S3_SPLICE
         S3_FREE -->|"Explore patch"| S3_SPLICE
