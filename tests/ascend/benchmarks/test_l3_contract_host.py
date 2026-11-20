@@ -958,8 +958,9 @@ class _StubHarness:
         *,
         passed: bool = True,
         compare_error: BaseException | None = None,
+        cases: tuple[object, ...] | None = None,
     ) -> None:
-        self.cases = (_StubCase("1"),)
+        self.cases = cases if cases is not None else (_StubCase("1"),)
         self.passed = passed
         self.compare_error = compare_error
 
@@ -1025,6 +1026,31 @@ def _run_stub_harness(
 def _mapping(value: object) -> Mapping[str, object]:
     assert isinstance(value, Mapping)
     return value
+
+
+def test_executed_real_case_binds_official_case_id(tmp_path: Path) -> None:
+    declared_ids = l3_contract.load_case_ids(l3_contract.AR_DIR)
+    real_case = cannbench_contract.load_cases(
+        l3_contract.AR_DIR, l3_contract.AR_TASK
+    )[0]
+    assert real_case.label == f"{l3_contract.AR_TASK}_{real_case.case_num}"
+    assert real_case.label != real_case.get_case_id_str()
+    assert real_case.get_case_id_str() == declared_ids[0]
+    recorder = l3_contract.EvidenceRecorder(
+        tmp_path / "evidence.json", _single_case_contract(tmp_path)
+    )
+    with recorder.node("node_one"):
+        cannbench_contract.Harness._run(
+            _StubHarness(cases=(real_case,)),
+            _constant_operator,
+            _PassThroughCache(),
+            recorder,
+            "node_one",
+        )
+    payload = json.loads((tmp_path / "evidence.json").read_text(encoding="utf-8"))
+    assert _mapping(payload["nodes"][0])["cases"] == {"1": "passed"}
+    coverage_cases = _mapping(_mapping(payload["coverage"])["cases"])
+    assert coverage_cases["unexpected"] == []
 
 
 def test_comparator_deviation_records_candidate_numeric_evidence(

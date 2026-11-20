@@ -725,6 +725,11 @@ def validate_index_gather_outputs(op_info: Any, params: Dict[str, Any], case_att
 
 class Case(SimpleNamespace):
     def get_case_id_str(self):
+        """Return the official ``cases.yaml`` case ID."""
+        return str(self.case_num).strip()
+
+    def get_case_key(self):
+        """Return the canonical case-matrix key that seeds deterministic inputs."""
         return self.label
 
 
@@ -743,10 +748,10 @@ def load_cases(task_dir, task):
             input_shapes=shapes, dtypes=dtypes, attrs=raw.get('attrs') or {},
             value_ranges=raw.get('value_range') or []))
     assert result
-    case_ids = [case.case_num for case in result]
+    case_ids = [case.get_case_id_str() for case in result]
     assert len(set(case_ids)) == len(case_ids), f'{task}: duplicate case_id in cases.yaml'
-    labels = [case.get_case_id_str() for case in result]
-    assert len(set(labels)) == len(labels), f'{task}: duplicate case label in cases.yaml'
+    case_keys = [case.get_case_key() for case in result]
+    assert len(set(case_keys)) == len(case_keys), f'{task}: duplicate case key in cases.yaml'
     return result
 
 
@@ -1172,7 +1177,7 @@ class Harness:
         self.param_builder = ParamBuilder()
 
     def prepare(self, case):
-        seed = int.from_bytes(hashlib.sha256(case.get_case_id_str().encode()).digest()[:8], 'big') % (2**31)
+        seed = int.from_bytes(hashlib.sha256(case.get_case_key().encode()).digest()[:8], 'big') % (2**31)
         tensors = DataGenerator().generate_input_tensors_from_case(
             input_shapes=case.input_shapes, dtypes=case.dtypes,
             value_ranges=case.value_ranges, seed=seed)
