@@ -289,6 +289,23 @@ __aicore__ inline void gmm_issue_k_dma(
   asc_sync_notify(PIPE_MTE2, PIPE_MTE1, (event_t)stg_id);
 }
 
+template <int BM, int BN, int BK, int TRANS_W, int A_STAGE, int B_STAGE, typename InT>
+__aicore__ inline void gmm_consume_k_stage(
+    __cc__ float* cur_l0c, __cbuf__ InT* a_l1_base, __cbuf__ InT* b_l1_base,
+    int stg, int clear_accum) {
+  __cbuf__ InT* a_dst = a_l1_base + stg * A_STAGE;
+  __cbuf__ InT* b_dst = b_l1_base + stg * B_STAGE;
+  asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)stg);
+
+  constexpr int SUB_K_STEP = (BK < 64) ? BK : 64;
+  if constexpr (TRANS_W) {
+    ascend_gemm_l1<BM, BK, BN, SUB_K_STEP, true, InT>(cur_l0c, a_dst, b_dst, clear_accum, 0, 0);
+  } else {
+    ascend_gemm_l1_nn<BM, BK, BN, SUB_K_STEP, InT, float>(cur_l0c, a_dst, b_dst, clear_accum, 0);
+  }
+  asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)stg);
+}
+
 template <int BM, int BN, int BK, int TRANS_W, int HAS_BIAS, typename InT, typename BiasT>
 __global__ __mix__(1, 2) void gmm_persistent_16(
     __gm__ InT* X, __gm__ InT* W, __gm__ BiasT* Bias, __gm__ InT* Y,
@@ -374,17 +391,8 @@ __global__ __mix__(1, 2) void gmm_persistent_16(
           gmm_issue_k_dma<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE, InT>(
               a_l1_base, b_l1_base, X, W, g, m0, m_cur, n0, n_cur, K, N, ki + 1, (ki + 1) & 1);
         }
-        __cbuf__ InT* a_dst = a_l1_base + stg * A_STAGE;
-        __cbuf__ InT* b_dst = b_l1_base + stg * B_STAGE;
-        asc_sync_wait(PIPE_MTE2, PIPE_MTE1, (event_t)stg);
-
-        constexpr int SUB_K_STEP = (BK < 64) ? BK : 64;
-        if constexpr (TRANS_W) {
-          ascend_gemm_l1<BM, BK, BN, SUB_K_STEP, true, InT>(cur_l0c, a_dst, b_dst, (ki == 0) ? 1 : 0, 0, 0);
-        } else {
-          ascend_gemm_l1_nn<BM, BK, BN, SUB_K_STEP, InT, float>(cur_l0c, a_dst, b_dst, (ki == 0) ? 1 : 0, 0);
-        }
-        asc_sync_notify(PIPE_MTE1, PIPE_MTE2, (event_t)stg);
+        gmm_consume_k_stage<BM, BN, BK, TRANS_W, A_STAGE, B_STAGE, InT>(
+            cur_l0c, a_l1_base, b_l1_base, stg, (ki == 0) ? 1 : 0);
       }
 
       asc_sync_notify(PIPE_M, PIPE_FIX, (event_t)buf);
