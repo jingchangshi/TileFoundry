@@ -1,24 +1,27 @@
-"""CPU-only contract tests for campaign AgentGates routes and receipt checks."""
+"""CPU-only contract tests for campaign AgentGates L2/L3/L4 routes and receipts."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 
 from tilefoundry_ascend.agent.campaign import surrogate_cannbench
 from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec
-from tilefoundry_ascend.agent.orchestrator import gate_funnel
 
 _FAST_GATE = "tilefoundry-npu-device-fast"
+_L3_GATE = "tilefoundry-npu-l3-promotion"
+_L4_GATE = "tilefoundry-npu-cannbench"
 
 
-def _completed(cmd: list[str], parsed: dict[str, object], returncode: int = 0) -> subprocess.CompletedProcess[str]:
+def _completed(
+    cmd: list[str], parsed: dict[str, object], returncode: int = 0
+) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(
         args=cmd,
         returncode=returncode,
@@ -46,7 +49,9 @@ def _patch_common(monkeypatch, tmp_path: Path) -> Path:
     monkeypatch.setattr(surrogate_cannbench, "resolve_cannbench_repo", lambda **_kw: tmp_path)
     monkeypatch.setattr(surrogate_cannbench, "_default_surrogate_cache_dir", lambda: cache)
     monkeypatch.setattr(surrogate_cannbench, "_default_surrogate_tl_cache_dir", lambda: tl_cache)
-    monkeypatch.setattr(surrogate_cannbench, "prewarm_anchor_reference_cache", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        surrogate_cannbench, "prewarm_anchor_reference_cache", lambda *_a, **_kw: None
+    )
     monkeypatch.setattr(
         surrogate_cannbench,
         "prewarm_surrogate_tilelang_cache",
@@ -60,8 +65,385 @@ def _anchor(case_num: int = 2) -> AnchorCaseSpec:
     return AnchorCaseSpec("level4/attention_residual", case_num, "small_decode", 10.0, 3.0)
 
 
-def test_inner_loop_routes_use_fast_gate_and_l2_msprof_lock(tmp_path: Path, monkeypatch) -> None:
-    """All four inner-loop routes use the fast gate, and only L2 profiling locks msprof."""
+def _agent_gates_config(tmp_path: Path) -> Path:
+    evidence_root = tmp_path / "v2-evidence"
+    config = tmp_path / "agent-gates.toml"
+    config.write_text(
+        f'evidence_root = "{evidence_root}"\n'
+        "\n"
+        "[workspaces.tilefoundry]\n"
+        f'source_root = "{tmp_path.resolve()}"\n'
+        'adapters = ["tilefoundry-npu"]\n',
+        encoding="utf-8",
+    )
+    return config
+
+
+def _digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _verified(
+    root: Path,
+    *,
+    satisfied: bool = True,
+    failures: list[str] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "satisfied": satisfied,
+        "status": "PASS" if satisfied else "FAIL",
+        "current_source_identity": {"root": str(root.resolve())},
+    }
+    if failures:
+        payload["failures"] = failures
+    return payload
+
+
+def _l3_candidate_failure(
+    *,
+    node: str = "test_case_20",
+    case_id: str = "20",
+    role: str = "candidate",
+) -> dict[str, object]:
+    """Producer marker for an explicit numeric comparison failure."""
+    return {
+        "kind": "candidate" if role == "candidate" else "infrastructure",
+        "category": "numeric" if role == "candidate" else "baseline_mismatch",
+        "stage": "comparison",
+        "node": node,
+        "case": case_id,
+        "role": role,
+        "comparator": "torch.testing.assert_close",
+        "references": ["oracle"],
+        "comparisons": [
+            {"output": 0, "passed": role != "candidate", "message": "max_abs_error exceeded"},
+        ],
+        "exceptionType": None,
+        "detail": "candidate numeric comparison failed",
+    }
+
+
+def _l3_infrastructure_failure(
+    *,
+    kind: str = "infrastructure",
+    category: str = "exception",
+    stage: str = "run",
+    node: str | None = "test_case_20",
+    case_id: str | None = "20",
+    role: str | None = None,
+    comparator: str | None = None,
+    detail: str = "device runtime error",
+) -> dict[str, object]:
+    """Producer marker for a runtime, baseline, or coverage fault."""
+    return {
+        "kind": kind,
+        "category": category,
+        "stage": stage,
+        "node": node,
+        "case": case_id,
+        "role": role,
+        "comparator": comparator,
+        "references": [],
+        "comparisons": [],
+        "exceptionType": "RuntimeError" if category == "exception" else None,
+        "detail": detail,
+    }
+
+
+def _l3_node(
+    *,
+    node: str = "test_case_20",
+    case_id: str = "20",
+    status: str = "failed",
+    failure: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Signed node/case record matching a producer failure marker."""
+    return {
+        "name": node,
+        "nodeId": f"{node}::0",
+        "status": status,
+        "requiredCases": [case_id],
+        "cases": {case_id: status},
+        "details": {},
+        "failure": dict(failure) if failure is not None else None,
+        "error": None,
+        "startedAt": None,
+        "endedAt": None,
+    }
+
+
+def _l3_coverage(kind: str) -> dict[str, object]:
+    """Signed coverage counters for one L3 classification scenario."""
+    if kind == "qualified_complete":
+        return {
+            "qualified": True,
+            "nodes": {
+                "expected": 2,
+                "completed": 2,
+                "missing": [],
+                "failed": [],
+                "skipped": [],
+                "blocked": [],
+            },
+            "cases": {"expected": 20, "completed": 20, "missing": [], "unexpected": []},
+            "referenceCacheProblem": None,
+        }
+    if kind == "complete":
+        return {
+            "qualified": False,
+            "nodes": {
+                "expected": 2,
+                "completed": 2,
+                "missing": [],
+                "failed": [],
+                "skipped": [],
+                "blocked": [],
+            },
+            "cases": {"expected": 20, "completed": 20, "missing": [], "unexpected": []},
+            "referenceCacheProblem": None,
+        }
+    if kind == "missing_node":
+        return {
+            "qualified": False,
+            "nodes": {
+                "expected": 2,
+                "completed": 0,
+                "missing": ["test_case_20"],
+                "failed": [],
+                "skipped": [],
+                "blocked": [],
+            },
+            "cases": {"expected": 20, "completed": 0, "missing": [], "unexpected": []},
+            "referenceCacheProblem": None,
+        }
+    skipped = kind == "skipped"
+    return {
+        "qualified": False,
+        "nodes": {
+            "expected": 2,
+            "completed": 0 if skipped else 1,
+            "missing": [],
+            "failed": [] if skipped else ["test_case_20"],
+            "skipped": ["test_case_20"] if skipped else [],
+            "blocked": [],
+        },
+        "cases": {
+            "expected": 20,
+            "completed": 0 if skipped else 19,
+            "missing": ["test_case_20:20"],
+            "unexpected": [],
+        },
+        "referenceCacheProblem": None,
+    }
+
+
+def _l3_report(
+    *,
+    candidate: Path,
+    status: str = "PASS",
+    coverage: dict[str, object] | None = None,
+    failure_category: str = "",
+    failure: Mapping[str, object] | None = None,
+    nodes: list[dict[str, object]] | None = None,
+) -> dict[str, object]:
+    coverage_payload: dict[str, object] = coverage or {
+        "qualified": True,
+        "nodes": {
+            "expected": 2,
+            "completed": 2,
+            "missing": [],
+            "failed": [],
+            "skipped": [],
+            "blocked": [],
+        },
+        "cases": {
+            "expected": 20,
+            "completed": 20,
+            "missing": [],
+            "unexpected": [],
+        },
+        "referenceCacheProblem": None,
+    }
+    candidate_digest = _digest(candidate)
+    summary: dict[str, object] = {
+        "schema": "tilefoundry-l3-evidence/v1",
+        "profile": "l3-promotion",
+        "task": "level4/attention_residual",
+        "operator": "attention_residual",
+        "target": {
+            "operator": "attention_residual",
+            "task": "level4/attention_residual",
+            "taskDir": None,
+            "modulePath": str(candidate),
+            "cases": [],
+        },
+        "targetCaseCount": 0,
+        "candidate": {
+            "modulePath": str(candidate),
+            "relativePath": candidate.name,
+            "declaredPath": str(candidate),
+            "sha256": candidate_digest,
+        },
+        "expectedIdentity": {
+            "target": {"modulePath": str(candidate)},
+            "candidate": {
+                "modulePath": str(candidate),
+                "relativePath": candidate.name,
+                "sha256": candidate_digest,
+            },
+        },
+        "interpreter": {
+            "sysExecutable": "/adapter/python3",
+            "expected": "/adapter/python3",
+            "match": True,
+        },
+        "coverage": coverage_payload,
+        "referenceCache": {},
+        "writeErrors": [],
+        "interruption": {
+            "interrupted": False,
+            "errorCategory": None,
+            "signal": None,
+        },
+        "phase": "finished",
+        "nodes": list(nodes or []),
+    }
+    if failure is not None:
+        summary["failure"] = dict(failure)
+        summary["failures"] = [dict(failure)]
+    observations: dict[str, object] = {
+        "profile": "l3-promotion",
+        "task": "level4/attention_residual",
+        "operator": "attention_residual",
+        "candidate": {
+            "path": candidate.name,
+            "absolutePath": str(candidate),
+            "sha256": candidate_digest,
+            "sizeBytes": candidate.stat().st_size,
+        },
+        "coverage": coverage_payload,
+        "evidence": summary,
+    }
+    if failure_category:
+        observations["failureCategory"] = failure_category
+    return {
+        "status": status,
+        "runId": "run-l3",
+        "receiptPath": "/receipt-l3.json",
+        "recordedStatus": status,
+        "gates": [
+            {
+                "gateId": _L3_GATE,
+                "status": status,
+                "recordedStatus": status,
+                "observations": observations,
+            }
+        ],
+    }
+
+
+def _l4_report(
+    *, candidate: str, flags: Mapping[str, object] | None = None
+) -> dict[str, object]:
+    observations: dict[str, object] = {
+        "avgSpeedup": 4.25,
+        "score": 99.5,
+        "officialReportValid": True,
+        "allCasesPassed": True,
+        "allTimingsValid": True,
+        "caseCount": 1,
+        "passedCases": 1,
+        "timedCases": 1,
+        "results": [
+            {
+                "task": "level4/attention_residual",
+                "candidate": candidate,
+                "reportDir": "/signed-report",
+                "reportValid": True,
+                "cases": [
+                    {
+                        "case_id": "level4/attention_residual_2",
+                        "speedup": 3.5,
+                        "elapsed_us": 12.5,
+                    }
+                ],
+            }
+        ],
+    }
+    observations.update(flags or {})
+    return {
+        "status": "PASS",
+        "runId": "run-l4",
+        "receiptPath": "/receipt-l4.json",
+        "recordedStatus": "PASS",
+        "gates": [
+            {
+                "gateId": _L4_GATE,
+                "status": "PASS",
+                "recordedStatus": "PASS",
+                "observations": observations,
+            }
+        ],
+    }
+
+
+def _v2_handler(
+    *,
+    report: Mapping[str, object],
+    root: Path,
+    verification: Mapping[str, object] | None = None,
+    submit_payload: Mapping[str, object] | None = None,
+    wait_payloads: list[dict[str, object]] | None = None,
+):
+    calls: list[list[str]] = []
+    waits = list(
+        wait_payloads
+        or [
+            {
+                "execution_id": "exec-1",
+                "timed_out": False,
+                "status": {"state": "FINISHED", "run_id": str(report.get("runId"))},
+            }
+        ]
+    )
+    verify = verification if verification is not None else _verified(root)
+
+    def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
+        _ = (cwd, timeout, kwargs)
+        cmd_list = [str(part) for part in cmd]
+        calls.append(cmd_list)
+        command = cmd_list[1]
+        if command == "submit":
+            return _completed(
+                cmd_list, dict(submit_payload or {"execution_id": "exec-1"})
+            )
+        if command == "wait":
+            payload = waits.pop(0) if len(waits) > 1 else waits[0]
+            return _completed(cmd_list, payload)
+        if command == "report":
+            return _completed(cmd_list, dict(report))
+        if command == "verify-requirements":
+            return _completed(cmd_list, dict(verify))
+        raise AssertionError(cmd_list)
+
+    return _fake_run, calls
+
+
+class _JumpClock:
+    """Monotonic clock that jumps forward so a bounded wait expires immediately."""
+
+    def __init__(self, step: float = 1000.0) -> None:
+        self._step = step
+        self._now = 0.0
+
+    def __call__(self) -> float:
+        current = self._now
+        self._now += self._step
+        return current
+
+
+def test_l2_inner_loop_routes_keep_fast_gate_and_temp_env(tmp_path: Path, monkeypatch) -> None:
+    """L2 callers keep the device-fast gate and their adapter env overrides."""
     env_file = _patch_common(monkeypatch, tmp_path)
     calls: list[dict[str, Any]] = []
     env_paths: list[Path] = []
@@ -72,17 +454,11 @@ def test_inner_loop_routes_use_fast_gate_and_l2_msprof_lock(tmp_path: Path, monk
         cmd_list = [str(part) for part in cmd]
         env_path = Path(cmd_list[cmd_list.index("--env-file") + 1])
         env_paths.append(env_path)
-        env_text = env_path.read_text(encoding="utf-8")
-        sitecustomize = ""
-        shim_dir = str(env.get("TF_SURROGATE_SHIM_DIR", ""))
-        if shim_dir:
-            sitecustomize = (Path(shim_dir) / "sitecustomize.py").read_text(encoding="utf-8")
         calls.append(
             {
                 "cmd": cmd_list,
                 "env": dict(env),
-                "env_text": env_text,
-                "sitecustomize": sitecustomize,
+                "env_text": env_path.read_text(encoding="utf-8"),
             }
         )
         request_key = next(
@@ -135,12 +511,6 @@ def test_inner_loop_routes_use_fast_gate_and_l2_msprof_lock(tmp_path: Path, monk
         source_root=tmp_path,
         env_file=env_file,
     )
-    surrogate_cannbench.run_l3_full_contract_via_agent_gates(
-        operator_name="attention_residual",
-        candidate_module_path=candidate,
-        source_root=tmp_path,
-        env_file=env_file,
-    )
     probe = SimpleNamespace(
         probe_id="probe",
         probe_kind="vector",
@@ -157,21 +527,18 @@ def test_inner_loop_routes_use_fast_gate_and_l2_msprof_lock(tmp_path: Path, monk
         prewarm_cache=False,
     )
 
-    assert len(calls) == 4
+    assert len(calls) == 3
     for call in calls:
         assert call["cmd"][call["cmd"].index("--gate") + 1] == _FAST_GATE
         assert "TILEFOUNDRY_NPU_CPU_TESTS" not in call["env_text"]
         assert "TILEFOUNDRY_NPU_DEVICE_TESTS" in call["env_text"]
     assert "TILEFOUNDRY_NPU_MSPROF_LOCK=1" not in calls[0]["env_text"]
     assert "TILEFOUNDRY_NPU_MSPROF_LOCK=1" in calls[1]["env_text"]
-    assert "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE=1" in calls[2]["env_text"]
-    assert calls[2]["env"]["TF_SURROGATE_TL_CACHE_DIR"] == str(tmp_path / "tl-cache")
-    assert "enable_cache()" in calls[2]["sitecustomize"]
-    assert verify_calls == ["run-fast"] * 4
+    assert verify_calls == ["run-fast"] * 3
 
 
-def test_fast_routes_reject_failed_receipts(tmp_path: Path, monkeypatch) -> None:
-    """Every fast route suppresses results when its signed receipt fails verification."""
+def test_l2_routes_reject_failed_receipts(tmp_path: Path, monkeypatch) -> None:
+    """L2 routes suppress results when their signed receipt fails verification."""
     env_file = _patch_common(monkeypatch, tmp_path)
     parsed = {
         "status": "PASS",
@@ -179,22 +546,19 @@ def test_fast_routes_reject_failed_receipts(tmp_path: Path, monkeypatch) -> None
         "receiptPath": "/receipt-fast.json",
         "gates": [{"gateId": _FAST_GATE, "observations": {}}],
     }
-    verify_calls: list[str] = []
 
     def _fake_run(cmd, **_kw):
         return _completed([str(part) for part in cmd], parsed), parsed
 
-    def _verify(_bin, run_id, *, source_root, **kwargs):
-        _ = (source_root, kwargs)
-        verify_calls.append(run_id)
-        return False, "receipt_verification_failed: STALE"
-
     monkeypatch.setattr(surrogate_cannbench, "_run_agent_gates_cmd", _fake_run)
-    monkeypatch.setattr(surrogate_cannbench, "verify_agent_gates_receipt", _verify)
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "verify_agent_gates_receipt",
+        lambda *_a, **_kw: (False, "receipt_verification_failed: STALE"),
+    )
     candidate = tmp_path / "candidate.py"
     candidate.write_text("x = 1\n", encoding="utf-8")
     anchors = [_anchor()]
-
     with pytest.raises(RuntimeError, match="verification failed"):
         surrogate_cannbench.run_multi_operator_surrogate_batch_via_agent_gates(
             [("attention_residual", [("cand", candidate)], anchors)],
@@ -210,14 +574,6 @@ def test_fast_routes_reject_failed_receipts(tmp_path: Path, monkeypatch) -> None
             source_root=tmp_path,
             env_file=env_file,
         )
-    l3_result = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
-        operator_name="attention_residual",
-        candidate_module_path=candidate,
-        source_root=tmp_path,
-        env_file=env_file,
-    )
-    assert l3_result.passed is False
-    assert "STALE" in l3_result.error_message
     probe = SimpleNamespace(
         probe_id="probe",
         probe_kind="vector",
@@ -234,143 +590,791 @@ def test_fast_routes_reject_failed_receipts(tmp_path: Path, monkeypatch) -> None
         prewarm_cache=False,
     )
     assert metrics["speedup"] == 0.0
-    assert verify_calls == ["run-fast"] * 4
 
 
-def test_l3_sitecustomize_enables_tilelang_cache(tmp_path: Path, monkeypatch) -> None:
-    """The generated startup hook enables TileLang caching before the harness imports it."""
-    shim = tmp_path / "shim"
-    monkeypatch.setattr(surrogate_cannbench, "resolve_cannbench_repo", lambda **_kw: tmp_path)
-    surrogate_cannbench.ensure_npu_compare_shim_dir(shim, cannbench_repo=tmp_path)
-    (shim / "sitecustomize.py").write_text(
-        surrogate_cannbench._L3_CACHE_SITECUSTOMIZE,
-        encoding="utf-8",
-    )
-    fake = tmp_path / "fake"
-    tilelang = fake / "tilelang"
-    (tilelang / "cache").mkdir(parents=True)
-    (tilelang / "__init__.py").write_text("", encoding="utf-8")
-    (tilelang / "env.py").write_text(
-        "class _Env:\n"
-        "    enabled = False\n"
-        "    def enable_cache(self):\n"
-        "        self.enabled = True\n"
-        "env = _Env()\n",
-        encoding="utf-8",
-    )
-    (tilelang / "cache" / "__init__.py").write_text("", encoding="utf-8")
-    (tilelang / "cache" / "kernel_cache.py").write_text(
-        "def _namespace():\n"
-        "    return None\n"
-        "_namespace.cache_clear = lambda: None\n"
-        "def _stamp():\n"
-        "    return None\n"
-        "_stamp.cache_clear = lambda: None\n"
-        "class KernelCache:\n"
-        "    _get_cache_namespace = staticmethod(_namespace)\n"
-        "    _get_tilelang_lib_stamp = staticmethod(_stamp)\n"
-        "    created = False\n"
-        "    @staticmethod\n"
-        "    def _create_dirs():\n"
-        "        KernelCache.created = True\n",
-        encoding="utf-8",
-    )
-    cache_dir = tmp_path / "tl-cache"
-    script = (
-        "import json, os\n"
-        "from tilelang.env import env\n"
-        "from tilelang.cache.kernel_cache import KernelCache\n"
-        "print(json.dumps({\n"
-        "    'enabled': env.enabled,\n"
-        "    'created': KernelCache.created,\n"
-        "    'cache': os.environ.get('TILELANG_CACHE_DIR'),\n"
-        "    'disabled': os.environ.get('TILELANG_DISABLE_CACHE'),\n"
-        "    'stamp': os.environ.get('TILELANG_KERNEL_CACHE_USE_LIB_STAMP'),\n"
-        "}))\n"
-    )
-    proc = subprocess.run(
-        [sys.executable, "-B", "-c", script],
-        text=True,
-        capture_output=True,
-        env={
-            "PATH": "/usr/bin:/bin",
-            "PYTHONPATH": f"{shim}:{fake}",
-            "PYTHONNOUSERSITE": "1",
-            "TF_SURROGATE_TL_CACHE_DIR": str(cache_dir),
-        },
-        timeout=30,
-    )
-    assert proc.returncode == 0, proc.stderr
-    result = json.loads(proc.stdout.strip().splitlines()[-1])
-    assert result == {
-        "enabled": True,
-        "created": True,
-        "cache": str(cache_dir),
-        "disabled": "0",
-        "stamp": "1",
-    }
-    assert cache_dir.is_dir()
-
-
-def _l4_parsed() -> dict[str, object]:
-    return {
-        "status": "PASS",
-        "runId": "run-l4",
-        "receiptPath": "/receipt-l4.json",
-        "gates": [
-            {
-                "gateId": "tilefoundry-npu-cannbench",
-                "observations": {
-                    "avgSpeedup": 4.25,
-                    "score": 99.5,
-                    "results": [
-                        {
-                            "task": "level4/attention_residual",
-                            "reportDir": "/signed-report",
-                            "cases": [
-                                {
-                                    "case_id": "level4/attention_residual_2",
-                                    "speedup": 3.5,
-                                    "elapsed_us": 12.5,
-                                }
-                            ],
-                        }
-                    ],
-                },
-            }
-        ],
-    }
-
-
-def test_l4_sync_uses_signed_cases_and_verifies_before_temp_env_cleanup(
-    tmp_path: Path,
-    monkeypatch,
+def test_l3_promotion_uses_v2_target_and_candidate_without_injection(
+    tmp_path: Path, monkeypatch
 ) -> None:
-    """A pass-eligible synchronous L4 run is verified inside the temp-env lifetime."""
-    env_file = _patch_common(monkeypatch, tmp_path)
-    env_paths: list[Path] = []
-    verify_calls: list[tuple[str, str]] = []
+    """L3 submits the promotion gate with canonical target and relative candidate only."""
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    report = _l3_report(candidate=candidate)
+    handler, calls = _v2_handler(
+        report=report,
+        root=tmp_path,
+        submit_payload={"execution_id": "exec-l3"},
+        wait_payloads=[
+            {
+                "execution_id": "exec-l3",
+                "timed_out": True,
+                "status": {"state": "RUNNING"},
+            },
+            {
+                "execution_id": "exec-l3",
+                "timed_out": False,
+                "status": {"state": "FINISHED", "run_id": "run-l3"},
+            },
+        ],
+    )
+    original = handler
+
+    def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
+        submit = [str(part) for part in cmd][1] == "submit"
+        if submit:
+            cmd_list = [str(part) for part in cmd]
+            assert "--target" in cmd_list
+            assert cmd_list[cmd_list.index("--target") + 1] == "level4/attention_residual"
+            assert cmd_list[cmd_list.index("--candidate") + 1] == "kernels.py"
+            assert cmd_list[cmd_list.index("--gate") + 1] == _L3_GATE
+            assert "--env-file" not in cmd_list
+        assert "PYTHONPATH" not in env
+        return original(cmd, cwd=cwd, env=env, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
     monkeypatch.setattr(
         surrogate_cannbench,
-        "_run_agent_gates_cmd",
-        lambda cmd, **_kw: (
-            env_paths.append(Path(cmd[cmd.index("--env-file") + 1])),
-            (_completed([str(p) for p in cmd], _l4_parsed()), _l4_parsed()),
-        )[1],
+        "_agent_gates_evidence_root",
+        lambda: tmp_path / "v2-evidence",
+    )
+    result = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
+        source_root=tmp_path,
+        env_file=tmp_path / "unused-env.sh",
+        device_id="7",
+    )
+    assert result.passed is True
+    assert result.run_id == "run-l3"
+    assert result.execution_id == "exec-l3"
+    assert result.candidate_sha256 == _digest(candidate)
+    assert result.target_path == str(candidate.resolve())
+    assert result.failure_kind == ""
+    wait_cmd = [cmd for cmd in calls if cmd[1] == "wait"]
+    assert len(wait_cmd) == 2
+    assert {cmd[cmd.index("--execution-id") + 1] for cmd in wait_cmd} == {"exec-l3"}
+    verify_cmd = [cmd for cmd in calls if cmd[1] == "verify-requirements"][0]
+    assert verify_cmd[verify_cmd.index("--gate") + 1] == _L3_GATE
+    assert verify_cmd[verify_cmd.index("--target") + 1] == "level4/attention_residual"
+    assert verify_cmd[verify_cmd.index("--candidate") + 1] == "kernels.py"
+
+
+def test_l3_promotion_accepts_qualified_and_rejects_numeric_or_coverage(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """One adapter summary accepts a qualified run and distinguishes numeric from coverage."""
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "_agent_gates_evidence_root",
+        lambda: tmp_path / "v2-evidence",
+    )
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    qualified = _l3_report(candidate=candidate)
+    numeric_failure = _l3_candidate_failure()
+    numeric = _l3_report(
+        candidate=candidate,
+        status="FAIL",
+        failure_category="numeric",
+        failure=numeric_failure,
+        nodes=[_l3_node(failure=numeric_failure)],
+        coverage={
+            "qualified": False,
+            "nodes": {
+                "expected": 2,
+                "completed": 1,
+                "missing": [],
+                "failed": ["test_case_20"],
+                "skipped": [],
+                "blocked": [],
+            },
+            "cases": {
+                "expected": 20,
+                "completed": 19,
+                "missing": ["test_case_20:20"],
+                "unexpected": [],
+            },
+            "referenceCacheProblem": None,
+        },
+    )
+    coverage = _l3_report(
+        candidate=candidate,
+        status="FAIL",
+        failure_category="coverage",
+        coverage={
+            "qualified": False,
+            "nodes": {
+                "expected": 2,
+                "completed": 0,
+                "missing": [],
+                "failed": [],
+                "skipped": ["test_case_20"],
+                "blocked": [],
+            },
+            "cases": {
+                "expected": 20,
+                "completed": 0,
+                "missing": ["test_case_20:20"],
+                "unexpected": [],
+            },
+            "referenceCacheProblem": None,
+        },
     )
 
-    def _verify(_bin: str, run_id: str, *, source_root, timeout_sec=30.0):
-        _ = (source_root, timeout_sec)
-        assert env_paths and env_paths[-1].is_file()
-        verify_calls.append((run_id, _bin))
-        return True, ""
+    outcomes: list[tuple[bool, str, str, bool]] = []
+    for report in (qualified, numeric, coverage):
+        handler, _calls = _v2_handler(report=report, root=tmp_path)
+        monkeypatch.setattr(surrogate_cannbench.subprocess, "run", handler)
+        result = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+            operator_name="attention_residual",
+            candidate_module_path=candidate,
+            source_root=tmp_path,
+        )
+        outcomes.append(
+            (result.passed, result.failure_kind, result.failure_category, result.pending)
+        )
 
-    monkeypatch.setattr(surrogate_cannbench, "verify_agent_gates_receipt", _verify)
+    assert outcomes == [
+        (True, "", "", False),
+        (False, surrogate_cannbench.FAILURE_KIND_CANDIDATE, "numeric", False),
+        (False, surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE, "coverage", True),
+    ]
+
+
+@pytest.mark.parametrize(
+    (
+        "coverage_kind",
+        "failure_category",
+        "interruption_error",
+        "marker_kind",
+        "expected_kind",
+    ),
+    [
+        ("failed", "", None, "none", surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE),
+        ("failed", "numeric", None, "none", surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE),
+        ("skipped", "coverage", None, "none", surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE),
+        ("skipped", "", None, "none", surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE),
+        (
+            "missing_node",
+            "",
+            None,
+            "none",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        ),
+        (
+            "skipped",
+            "",
+            "reference_cache_unavailable",
+            "none",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        ),
+        (
+            "qualified_complete",
+            "reference_cache_expectation_cold",
+            None,
+            "none",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        ),
+        ("complete", "numeric", None, "none", surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE),
+        (
+            "failed",
+            "numeric",
+            "reference_cache_error",
+            "candidate",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        ),
+        ("failed", "numeric", None, "candidate", surrogate_cannbench.FAILURE_KIND_CANDIDATE),
+        (
+            "failed",
+            "numeric",
+            None,
+            "candidate_no_nodes",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        ),
+        ("failed", "", None, "candidate", surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE),
+        (
+            "failed",
+            "numeric",
+            None,
+            "candidate_baseline_role",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        ),
+        (
+            "failed",
+            "numeric",
+            None,
+            "candidate_all_passed",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        ),
+        (
+            "failed",
+            "numeric",
+            None,
+            "candidate_case_mismatch",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        ),
+        (
+            "failed",
+            "numeric",
+            None,
+            "candidate_with_infra_row",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        ),
+        (
+            "failed",
+            "baseline_mismatch",
+            None,
+            "baseline_mismatch",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        ),
+        (
+            "failed",
+            "coverage",
+            None,
+            "coverage_case_identity",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        ),
+        (
+            "failed",
+            "exception",
+            None,
+            "runtime_exception",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        ),
+    ],
+)
+def test_l3_promotion_classifies_coverage_failure(
+    tmp_path: Path,
+    monkeypatch,
+    coverage_kind,
+    failure_category,
+    interruption_error,
+    marker_kind,
+    expected_kind,
+) -> None:
+    """Only explicit candidate evidence rolls back; other failures preserve pending."""
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+
+    marker: dict[str, object] | None = None
+    nodes: list[dict[str, object]] = []
+    if marker_kind == "candidate":
+        marker = _l3_candidate_failure()
+        nodes = [_l3_node(failure=marker)]
+    elif marker_kind == "candidate_no_nodes":
+        marker = _l3_candidate_failure()
+    elif marker_kind == "candidate_baseline_role":
+        marker = _l3_candidate_failure(role="baseline")
+        nodes = [_l3_node(failure=marker)]
+    elif marker_kind == "candidate_all_passed":
+        marker = _l3_candidate_failure()
+        marker["comparisons"] = [
+            {"output": 0, "passed": True, "message": ""},
+        ]
+        nodes = [_l3_node(failure=marker)]
+    elif marker_kind == "candidate_case_mismatch":
+        marker = _l3_candidate_failure()
+        nodes = [_l3_node(case_id="21", failure=marker)]
+    elif marker_kind == "candidate_with_infra_row":
+        marker = _l3_candidate_failure()
+        nodes = [_l3_node(failure=marker)]
+    elif marker_kind == "baseline_mismatch":
+        marker = _l3_infrastructure_failure(
+            category="baseline_mismatch",
+            stage="comparison",
+        )
+        nodes = [_l3_node(failure=marker)]
+    elif marker_kind == "coverage_case_identity":
+        marker = _l3_infrastructure_failure(
+            kind="coverage",
+            category="case_identity",
+            stage="contract",
+            case_id=None,
+        )
+        nodes = [_l3_node(failure=marker)]
+    elif marker_kind == "runtime_exception":
+        marker = _l3_infrastructure_failure()
+        nodes = [_l3_node(failure=marker)]
+
+    report = _l3_report(
+        candidate=candidate,
+        status="FAIL",
+        coverage=_l3_coverage(coverage_kind),
+        failure_category=failure_category,
+        failure=marker,
+        nodes=nodes,
+    )
+    evidence_block = report["gates"][0]["observations"]["evidence"]
+    assert isinstance(evidence_block, dict)
+    if marker_kind == "candidate_with_infra_row":
+        evidence_block["failures"] = [
+            dict(marker or {}),
+            _l3_infrastructure_failure(category="exception", detail="kernel crashed"),
+        ]
+        evidence_block["failure"] = _l3_infrastructure_failure(
+            category="exception", detail="kernel crashed"
+        )
+    interruption = evidence_block["interruption"]
+    assert isinstance(interruption, dict)
+    interruption["errorCategory"] = interruption_error
+    handler, _calls = _v2_handler(
+        report=report,
+        root=tmp_path,
+        verification=_verified(tmp_path, satisfied=False, failures=["gate failed"]),
+    )
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", handler)
+    result = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
+        source_root=tmp_path,
+    )
+    assert result.passed is False
+    assert result.failure_kind == expected_kind
+    assert result.pending is (expected_kind != surrogate_cannbench.FAILURE_KIND_CANDIDATE)
+    assert result.run_id == "run-l3"
+    assert result.execution_id == "exec-1"
+
+
+def test_l3_promotion_treats_incomplete_case_count_as_infrastructure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A qualified report whose case count is short is a coverage fault, not a candidate miss."""
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    report = _l3_report(
+        candidate=candidate,
+        coverage={
+            "qualified": True,
+            "nodes": {
+                "expected": 2,
+                "completed": 2,
+                "missing": [],
+                "failed": [],
+                "skipped": [],
+                "blocked": [],
+            },
+            "cases": {
+                "expected": 20,
+                "completed": 19,
+                "missing": [],
+                "unexpected": [],
+            },
+            "referenceCacheProblem": None,
+        },
+    )
+    handler, _calls = _v2_handler(report=report, root=tmp_path)
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", handler)
+    result = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
+        source_root=tmp_path,
+    )
+    assert result.passed is False
+    assert result.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    assert "case coverage incomplete" in result.error_message
+
+
+@pytest.mark.parametrize("marker", ["write_errors", "unfinished_phase"])
+def test_l3_promotion_untrustworthy_numeric_evidence_is_infrastructure(
+    tmp_path: Path, monkeypatch, marker: str
+) -> None:
+    """Evidence-write failure or a stale phase overrides a claimed numeric failure."""
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    candidate_failure = _l3_candidate_failure()
+    report = _l3_report(
+        candidate=candidate,
+        status="FAIL",
+        coverage=_l3_coverage("failed"),
+        failure_category="numeric",
+        failure=candidate_failure,
+        nodes=[_l3_node(failure=candidate_failure)],
+    )
+    evidence_block = report["gates"][0]["observations"]["evidence"]
+    assert isinstance(evidence_block, dict)
+    if marker == "write_errors":
+        evidence_block["writeErrors"] = ["evidence write failed"]
+    else:
+        evidence_block["phase"] = "verifying"
+    handler, _calls = _v2_handler(
+        report=report,
+        root=tmp_path,
+        verification=_verified(tmp_path, satisfied=False, failures=["gate failed"]),
+    )
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", handler)
+    result = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
+        source_root=tmp_path,
+    )
+    assert result.passed is False
+    assert result.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    assert result.execution_terminal is True
+
+
+def test_l3_observation_mapping_matches_acceptance_contract(tmp_path: Path) -> None:
+    """The pure observation mapping separates producer evidence from failure state."""
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    candidate_digest = _digest(candidate)
+    candidate_failure = _l3_candidate_failure()
+    runtime_failure = _l3_infrastructure_failure()
+    coverage_failure = _l3_infrastructure_failure(
+        kind="coverage",
+        category="case_identity",
+        stage="contract",
+        case_id=None,
+    )
+
+    def _observation(
+        failure: Mapping[str, object],
+        *,
+        category: str,
+        failures: list[Mapping[str, object]] | None = None,
+        write_errors: list[str] | None = None,
+    ) -> dict[str, object]:
+        evidence = {
+            "phase": "finished",
+            "failure": dict(failure),
+            "failures": [dict(row) for row in failures or [failure]],
+            "writeErrors": list(write_errors or []),
+            "nodes": [_l3_node(failure=failure)],
+            "interruption": {
+                "interrupted": False,
+                "errorCategory": None,
+                "signal": None,
+            },
+        }
+        return {"failureCategory": category, "evidence": evidence}
+
+    observations = [
+        _observation(runtime_failure, category="exception"),
+        _observation(candidate_failure, category="numeric"),
+        _observation(coverage_failure, category="coverage"),
+        _observation(
+            runtime_failure,
+            category="numeric",
+            failures=[candidate_failure, runtime_failure],
+        ),
+        _observation(
+            candidate_failure,
+            category="numeric",
+            write_errors=["evidence write failed"],
+        ),
+    ]
+    mapped = [
+        surrogate_cannbench.l3_failure_result_from_observation(
+            observation,
+            run_id="run-l3",
+            receipt_path="/receipt-l3.json",
+            execution_id="exec-1",
+            candidate_sha256=candidate_digest,
+            target_path=str(candidate),
+            device_id="4",
+            state="FINISHED",
+            execution_terminal=True,
+        )
+        for observation in observations
+    ]
+
+    assert [
+        (result.failure_kind, result.failure_category, result.pending)
+        for result in mapped
+    ] == [
+        (surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE, "exception", True),
+        (surrogate_cannbench.FAILURE_KIND_CANDIDATE, "numeric", False),
+        (surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE, "coverage", True),
+        (surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE, "numeric", True),
+        (surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE, "numeric", True),
+    ]
+    assert all(result.run_id == "run-l3" for result in mapped)
+    assert all(result.execution_id == "exec-1" for result in mapped)
+    assert all(result.device_id == "4" for result in mapped)
+    assert all(result.state == "FINISHED" for result in mapped)
+    assert all(result.candidate_sha256 == candidate_digest for result in mapped)
+    assert all(result.target_path == str(candidate) for result in mapped)
+    assert all(result.execution_terminal is True for result in mapped)
+
+
+def test_l3_promotion_rejects_candidate_identity_mismatch(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The signed L3 evidence must bind the exact target, candidate path and digest."""
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    other = tmp_path / "other.py"
+    other.write_text("x = 2\n", encoding="utf-8")
+
+    report = _l3_report(candidate=other)
+    evidence_block = report["gates"][0]["observations"]["evidence"]
+    assert isinstance(evidence_block, dict)
+    evidence_block["target"]["modulePath"] = str(candidate)  # type: ignore[index]
+    handler, _calls = _v2_handler(report=report, root=tmp_path)
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", handler)
+    path_mismatch = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
+        source_root=tmp_path,
+    )
+    assert path_mismatch.passed is False
+    assert path_mismatch.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    assert "candidate path" in path_mismatch.error_message
+
+    report = _l3_report(candidate=other)
+    evidence_block = report["gates"][0]["observations"]["evidence"]
+    assert isinstance(evidence_block, dict)
+    evidence_block["target"]["modulePath"] = str(candidate)  # type: ignore[index]
+    declared = evidence_block["candidate"]
+    assert isinstance(declared, dict)
+    declared["modulePath"] = str(candidate)
+    handler, _calls = _v2_handler(report=report, root=tmp_path)
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", handler)
+    digest_mismatch = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
+        source_root=tmp_path,
+    )
+    assert digest_mismatch.passed is False
+    assert digest_mismatch.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    assert "digest" in digest_mismatch.error_message
+
+
+def test_l3_promotion_rejects_unverified_receipt(tmp_path: Path, monkeypatch) -> None:
+    """A receipt that verify-requirements does not satisfy is infrastructure, not a candidate."""
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    handler, _calls = _v2_handler(
+        report=_l3_report(candidate=candidate),
+        root=tmp_path,
+        verification=_verified(
+            tmp_path,
+            satisfied=False,
+            failures=["RECEIPT_INVALID: signature"],
+        ),
+    )
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", handler)
+    stale = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
+        source_root=tmp_path,
+    )
+    assert stale.passed is False
+    assert stale.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    assert "did not verify" in stale.error_message
+    assert stale.run_id == "run-l3"
+    assert stale.receipt_path == "/receipt-l3.json"
+
+
+def test_l3_promotion_timeout_preserves_execution_id(tmp_path: Path, monkeypatch) -> None:
+    """A bounded deadline reports the execution id without resubmitting the recipe."""
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    commands: list[str] = []
+
+    def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
+        _ = (cwd, env, timeout, kwargs)
+        cmd_list = [str(part) for part in cmd]
+        commands.append(cmd_list[1])
+        return _completed(cmd_list, {"execution_id": "exec-timeout"})
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
+    monkeypatch.setattr(surrogate_cannbench.time, "monotonic", _JumpClock())
+    result = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
+        source_root=tmp_path,
+        timeout_sec=1,
+    )
+    assert result.passed is False
+    assert result.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    assert result.execution_id == "exec-timeout"
+    assert result.execution_terminal is False
+    assert "timed out" in result.error_message
+    assert commands == ["submit"]
+
+
+def test_l3_promotion_submits_requested_device_and_reports_receipt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The requested card is sent on submit; the callback persists the resolved identity."""
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    handler, calls = _v2_handler(
+        report=_l3_report(candidate=candidate),
+        root=tmp_path,
+        submit_payload={"execution_id": "exec-dev", "device_id": "5"},
+    )
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", handler)
+    started: list[tuple[str, str]] = []
+    result = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
+        source_root=tmp_path,
+        device_id="3",
+        on_execution_started=lambda execution_id, device_id: started.append(
+            (execution_id, device_id)
+        ),
+    )
+    assert result.passed is True
+    assert result.execution_id == "exec-dev"
+    assert result.device_id == "5"
+    submit = calls[0]
+    assert submit[submit.index("--device-id") + 1] == "3"
+    assert started == [("exec-dev", "5")]
+
+
+def test_l3_promotion_resumes_saved_execution_without_resubmit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A saved execution id is waited on directly; no duplicate submit is made."""
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "_agent_gates_evidence_root",
+        lambda: tmp_path / "v2-evidence",
+    )
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    handler, calls = _v2_handler(report=_l3_report(candidate=candidate), root=tmp_path)
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", handler)
+    result = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
+        source_root=tmp_path,
+        resume_execution_id="exec-saved",
+    )
+    assert result.passed is True
+    assert [cmd[1] for cmd in calls] == ["wait", "report", "verify-requirements"]
+    wait_cmd = calls[0]
+    assert wait_cmd[wait_cmd.index("--execution-id") + 1] == "exec-saved"
+
+
+def test_l3_promotion_resumes_finished_run_without_wait_or_submit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A finished run whose report failed is recovered from the same run id."""
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "_agent_gates_evidence_root",
+        lambda: tmp_path / "v2-evidence",
+    )
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    handler, calls = _v2_handler(report=_l3_report(candidate=candidate), root=tmp_path)
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", handler)
+    result = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
+        source_root=tmp_path,
+        resume_execution_id="exec-saved",
+        resume_run_id="run-l3",
+    )
+    assert result.passed is True
+    assert [cmd[1] for cmd in calls] == ["report", "verify-requirements"]
+
+
+def test_l3_promotion_resumed_wait_timeout_keeps_execution_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An expired continuation reports the original execution id and never resubmits."""
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    commands: list[str] = []
+
+    def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
+        _ = (cwd, env, timeout, kwargs)
+        commands.append([str(part) for part in cmd][1])
+        raise AssertionError("resume must not submit")
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
+    monkeypatch.setattr(surrogate_cannbench.time, "monotonic", _JumpClock())
+    result = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
+        source_root=tmp_path,
+        timeout_sec=1,
+        resume_execution_id="exec-saved",
+    )
+    assert result.passed is False
+    assert result.execution_id == "exec-saved"
+    assert "timed out" in result.error_message
+    assert commands == []
+
+
+def _v2_l4_run(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    report: Mapping[str, object],
+    verification: Mapping[str, object] | None = None,
+    submit_payload: Mapping[str, object] | None = None,
+    resume_execution_id: str = "",
+    resume_run_id: str = "",
+    on_execution_started=None,
+) -> tuple[Any, list[list[str]], list[dict[str, str]]]:
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "_agent_gates_evidence_root",
+        lambda: tmp_path / "v2-evidence",
+    )
+    envs: list[dict[str, str]] = []
+    handler, calls = _v2_handler(
+        report=report,
+        root=tmp_path,
+        verification=verification,
+        submit_payload=submit_payload,
+    )
+
+    def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
+        envs.append(dict(env))
+        return handler(cmd, cwd=cwd, env=env, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
     result = surrogate_cannbench.run_l4_official_cannbench_via_agent_gates(
         operator_name="attention_residual",
+        candidate_module_path=candidate,
         source_root=tmp_path,
-        env_file=env_file,
+        env_file=tmp_path / "ignored-env.sh",
+        device_id="7",
+        resume_execution_id=resume_execution_id,
+        resume_run_id=resume_run_id,
+        on_execution_started=on_execution_started,
     )
+    return result, calls, envs
+
+
+def test_l4_always_uses_v2_and_requires_official_final_binding(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """L4 ignores legacy env/device overrides and accepts only bound official evidence."""
+    report = _l4_report(candidate="kernels.py")
+    result, calls, envs = _v2_l4_run(tmp_path, monkeypatch, report=report)
     assert result.passed is True
     assert result.run_id == "run-l4"
     assert result.avg_speedup == 4.25
@@ -378,241 +1382,155 @@ def test_l4_sync_uses_signed_cases_and_verifies_before_temp_env_cleanup(
     assert result.per_case_speedups == {2: 3.5}
     assert result.per_case_elapsed_us == {2: 12.5}
     assert result.report_dir == "/signed-report"
-    assert verify_calls == [("run-l4", "agent-gates")]
+    assert result.official_report_valid is True
+    assert result.all_cases_passed is True
+    assert result.all_timings_valid is True
+    assert result.case_count == 1
+    assert result.passed_cases == 1
+    submit = calls[0]
+    assert submit[submit.index("--gate") + 1] == _L4_GATE
+    assert submit[submit.index("--target") + 1] == "level4/attention_residual"
+    assert submit[submit.index("--candidate") + 1] == "kernels.py"
+    assert "--env-file" not in submit
+    assert envs and all("PYTHONPATH" not in env for env in envs)
+    verify = [cmd for cmd in calls if cmd[1] == "verify-requirements"][0]
+    assert verify[verify.index("--target") + 1] == "level4/attention_residual"
+    assert verify[verify.index("--candidate") + 1] == "kernels.py"
 
 
-def test_l4_sync_rejects_failed_verification_and_missing_run_id(tmp_path: Path, monkeypatch) -> None:
-    """Sync L4 never promotes metrics when verification fails or no run id exists."""
-    env_file = _patch_common(monkeypatch, tmp_path)
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "_run_agent_gates_cmd",
-        lambda cmd, **_kw: (_completed([str(p) for p in cmd], _l4_parsed()), _l4_parsed()),
-    )
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "verify_agent_gates_receipt",
-        lambda *_a, **_kw: (False, "receipt_verification_failed: STALE"),
-    )
-    stale = surrogate_cannbench.run_l4_official_cannbench_via_agent_gates(
-        operator_name="attention_residual",
-        source_root=tmp_path,
-        env_file=env_file,
-    )
-    assert stale.passed is False
-    assert stale.per_case_speedups == {}
-    assert "STALE" in stale.error_message
-
-    missing = dict(_l4_parsed())
-    missing.pop("runId")
-    verify_called = []
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "_run_agent_gates_cmd",
-        lambda cmd, **_kw: (_completed([str(p) for p in cmd], missing), missing),
-    )
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "verify_agent_gates_receipt",
-        lambda *_a, **_kw: verify_called.append(True) or (True, ""),
-    )
-    no_id = surrogate_cannbench.run_l4_official_cannbench_via_agent_gates(
-        operator_name="attention_residual",
-        source_root=tmp_path,
-        env_file=env_file,
-    )
-    assert no_id.passed is False
-    assert no_id.per_case_speedups == {}
-    assert verify_called == []
-
-
-def test_l4_sync_requires_valid_receipt_payload(tmp_path: Path, monkeypatch) -> None:
-    """The real shared helper promotes a sync result only when verify reports valid=true."""
-    env_file = _patch_common(monkeypatch, tmp_path)
-    parsed = _l4_parsed()
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "_run_agent_gates_cmd",
-        lambda cmd, **_kw: (_completed([str(part) for part in cmd], parsed), parsed),
-    )
-    verify_payload = {"status": "PASS", "runId": "run-l4", "valid": True}
-
-    def _fake_verify(cmd, **kwargs):
-        _ = kwargs
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=0,
-            stdout=json.dumps(verify_payload),
-            stderr="",
-        )
-
-    monkeypatch.setattr(gate_funnel.subprocess, "run", _fake_verify)
-    result = surrogate_cannbench.run_l4_official_cannbench_via_agent_gates(
-        operator_name="attention_residual",
-        source_root=tmp_path,
-        env_file=env_file,
+def test_l4_submits_requested_device_and_reports_receipt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """L4 sends the authorized card and exposes the resolved execution identity."""
+    report = _l4_report(candidate="kernels.py")
+    started: list[tuple[str, str]] = []
+    result, calls, _envs = _v2_l4_run(
+        tmp_path,
+        monkeypatch,
+        report=report,
+        submit_payload={"execution_id": "exec-l4", "device_id": "8"},
+        on_execution_started=lambda execution_id, device_id: started.append(
+            (execution_id, device_id)
+        ),
     )
     assert result.passed is True
-    assert result.per_case_speedups == {2: 3.5}
-
-    verify_payload["valid"] = False
-    rejected = surrogate_cannbench.run_l4_official_cannbench_via_agent_gates(
-        operator_name="attention_residual",
-        source_root=tmp_path,
-        env_file=env_file,
-    )
-    assert rejected.passed is False
-    assert rejected.per_case_speedups == {}
-    assert "valid=False" in rejected.error_message
+    assert result.execution_id == "exec-l4"
+    assert result.device_id == "8"
+    submit = calls[0]
+    assert submit[submit.index("--device-id") + 1] == "7"
+    assert started == [("exec-l4", "8")]
 
 
-def _v2_config(tmp_path: Path, evidence_root: Path) -> Path:
-    config = tmp_path / "agent-gates.toml"
-    config.write_text(f'evidence_root = "{evidence_root}"\n', encoding="utf-8")
-    return config
-
-
-def test_l4_v2_uses_submit_wait_requirements_and_configured_report(
-    tmp_path: Path,
-    monkeypatch,
+def test_l4_resumes_execution_without_duplicate_submit(
+    tmp_path: Path, monkeypatch
 ) -> None:
-    """V2 waits for the worker, requires verification, and reads the configured evidence root."""
-    evidence_root = tmp_path / "v2-evidence"
-    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_v2_config(tmp_path, evidence_root)))
-    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
-    wait_count = 0
-    wait_requests: list[tuple[float, str]] = []
-
-    def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
-        nonlocal wait_count
-        _ = (cwd, env, kwargs)
-        cmd_list = [str(part) for part in cmd]
-        command = cmd_list[1]
-        if command == "submit":
-            return _completed(cmd_list, {"execution_id": "exec-1", "state": "SUBMITTED"})
-        if command == "wait":
-            wait_count += 1
-            wait_requests.append((timeout, cmd_list[cmd_list.index("--timeout") + 1]))
-            if wait_count == 1:
-                return _completed(
-                    cmd_list,
-                    {"execution_id": "exec-1", "timed_out": True, "status": {"state": "RUNNING"}},
-                )
-            return _completed(
-                cmd_list,
-                {
-                    "execution_id": "exec-1",
-                    "timed_out": False,
-                    "status": {"state": "FINISHED", "run_id": "run-v2"},
-                },
-            )
-        if command == "verify-requirements":
-            return _completed(
-                cmd_list,
-                {
-                    "satisfied": True,
-                    "status": "PASS",
-                    "run_id": "run-v2",
-                    "current_source_identity": {"root": str(tmp_path.resolve())},
-                    "matched_gates": ["tilefoundry-npu-cannbench"],
-                },
-            )
-        if command == "report":
-            return _completed(cmd_list, _l4_parsed())
-        raise AssertionError(cmd_list)
-
-    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
-    result = surrogate_cannbench.run_l4_official_cannbench_via_agent_gates(
-        workspace="tilefoundry",
-        source_root=tmp_path,
+    """A saved L4 execution is continued on its original card; no fresh submit occurs."""
+    report = _l4_report(candidate="kernels.py")
+    result, calls, _envs = _v2_l4_run(
+        tmp_path,
+        monkeypatch,
+        report=report,
+        resume_execution_id="exec-saved",
     )
     assert result.passed is True
-    assert result.run_id == "run-v2"
-    assert result.per_case_speedups == {2: 3.5}
-    assert result.per_case_elapsed_us == {2: 12.5}
-    assert result.receipt_path == "/receipt-l4.json"
-    assert wait_requests == [(65.0, "60"), (65.0, "60")]
+    assert result.execution_id == "exec-saved"
+    assert result.device_id == "7"
+    assert [cmd[1] for cmd in calls] == ["wait", "report", "verify-requirements"]
+    wait = calls[0]
+    assert wait[wait.index("--execution-id") + 1] == "exec-saved"
+
+    result, calls, _envs = _v2_l4_run(
+        tmp_path,
+        monkeypatch,
+        report=report,
+        resume_execution_id="exec-saved",
+        resume_run_id="run-l4",
+    )
+    assert result.passed is True
+    assert [cmd[1] for cmd in calls] == ["report", "verify-requirements"]
+    assert "submit" not in [cmd[1] for cmd in calls]
 
 
-def test_l4_v2_rejects_unsatisfied_requirements_and_source_mismatch(
-    tmp_path: Path,
-    monkeypatch,
+def test_l4_default_wait_covers_queue_prep_and_official_run() -> None:
+    """The 3600s official recipe alone cannot fit the default L4 wait budget."""
+    assert surrogate_cannbench.DEFAULT_L4_CANNBENCH_WAIT_SEC >= 4500
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        {"officialReportValid": False},
+        {"allCasesPassed": False},
+        {"allTimingsValid": False},
+        {"passedCases": 0},
+        {"timedCases": 0},
+        {"caseCount": 0},
+    ],
+)
+def test_l4_rejects_incomplete_official_final(tmp_path: Path, monkeypatch, flags) -> None:
+    """Missing official_final, failed cases, or invalid timings never yield metrics."""
+    report = _l4_report(candidate="kernels.py", flags=flags)
+    result, _calls, _envs = _v2_l4_run(tmp_path, monkeypatch, report=report)
+    assert result.passed is False
+    assert result.per_case_speedups == {}
+    assert result.failure_kind in {
+        surrogate_cannbench.FAILURE_KIND_CANDIDATE,
+        surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+    }
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [{"caseCount": 0}, {"timedCases": 0}, {"passedCases": None}],
+)
+def test_l4_missing_case_coverage_preserves_candidate(
+    tmp_path: Path, monkeypatch, flags
 ) -> None:
-    """V2 fails closed on unsatisfied requirements or a workspace source mismatch."""
-    evidence_root = tmp_path / "v2-evidence"
-    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_v2_config(tmp_path, evidence_root)))
-    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
-    commands: list[str] = []
+    """Absent official cases or timings are unknown coverage, not a candidate regression."""
+    report = _l4_report(candidate="kernels.py", flags=flags)
+    result, _calls, _envs = _v2_l4_run(tmp_path, monkeypatch, report=report)
+    assert result.passed is False
+    assert result.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
 
-    def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
-        _ = (cwd, env, timeout, kwargs)
-        cmd_list = [str(part) for part in cmd]
-        commands.append(cmd_list[1])
-        if cmd_list[1] == "submit":
-            return _completed(cmd_list, {"execution_id": "exec-1"})
-        if cmd_list[1] == "wait":
-            return _completed(
-                cmd_list,
-                {
-                    "execution_id": "exec-1",
-                    "timed_out": False,
-                    "status": {"state": "FINISHED", "run_id": "run-v2"},
-                },
-            )
-        if cmd_list[1] == "verify-requirements":
-            return _completed(
-                cmd_list,
-                {
-                    "satisfied": True,
-                    "status": "PASS",
-                    "run_id": "run-v2",
-                    "current_source_identity": {"root": str((tmp_path / "other").resolve())},
-                },
-            )
-        raise AssertionError(cmd_list)
 
-    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
-    result = surrogate_cannbench.run_l4_official_cannbench_via_agent_gates(
-        workspace="tilefoundry",
-        source_root=tmp_path,
+def test_l4_rejects_candidate_mismatch_and_unsatisfied_requirements(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The signed L4 receipt must name the candidate the campaign wrote."""
+    report = _l4_report(candidate="some/other.py")
+    result, _calls, _envs = _v2_l4_run(tmp_path, monkeypatch, report=report)
+    assert result.passed is False
+    assert "candidate" in result.error_message
+
+    report = _l4_report(candidate="kernels.py")
+    result, calls, _envs = _v2_l4_run(
+        tmp_path,
+        monkeypatch,
+        report=report,
+        verification=_verified(
+            tmp_path,
+            satisfied=False,
+            failures=["REQUIREMENTS_UNSATISFIED: stale"],
+        ),
     )
     assert result.passed is False
-    assert commands == ["submit", "wait", "verify-requirements"]
-    assert "source identity" in result.error_message
-
-    commands.clear()
-
-    def _unsatisfied_run(cmd, *, cwd, env, timeout, **kwargs):
-        _ = (cwd, env, timeout, kwargs)
-        cmd_list = [str(part) for part in cmd]
-        commands.append(cmd_list[1])
-        if cmd_list[1] == "submit":
-            return _completed(cmd_list, {"execution_id": "exec-1"})
-        if cmd_list[1] == "wait":
-            return _completed(
-                cmd_list,
-                {
-                    "execution_id": "exec-1",
-                    "timed_out": False,
-                    "status": {"state": "FINISHED", "run_id": "run-v2"},
-                },
-            )
-        return _completed(cmd_list, {"satisfied": False, "failures": ["RECEIPT_INVALID: STALE"]})
-
-    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _unsatisfied_run)
-    rejected = surrogate_cannbench.run_l4_official_cannbench_via_agent_gates(
-        workspace="tilefoundry",
-        source_root=tmp_path,
-    )
-    assert rejected.passed is False
-    assert commands == ["submit", "wait", "verify-requirements"]
+    assert "did not verify" in result.error_message
+    assert result.run_id == "run-l4"
+    assert result.receipt_path == "/receipt-l4.json"
+    assert [cmd[1] for cmd in calls] == [
+        "submit",
+        "wait",
+        "report",
+        "verify-requirements",
+    ]
 
 
 def test_l4_v2_timeout_includes_execution_id(tmp_path: Path, monkeypatch) -> None:
     """The wait budget reports the execution id so an independent worker is recoverable."""
-    evidence_root = tmp_path / "v2-evidence"
-    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_v2_config(tmp_path, evidence_root)))
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
     monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
 
     def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
         _ = (cwd, env, timeout, kwargs)
@@ -621,42 +1539,28 @@ def test_l4_v2_timeout_includes_execution_id(tmp_path: Path, monkeypatch) -> Non
         return _completed(cmd_list, {"execution_id": "exec-timeout"})
 
     monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
+    monkeypatch.setattr(surrogate_cannbench.time, "monotonic", _JumpClock())
     result = surrogate_cannbench.run_l4_official_cannbench_via_agent_gates(
-        workspace="tilefoundry",
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
         source_root=tmp_path,
-        timeout_sec=0,
+        timeout_sec=1,
     )
     assert result.passed is False
+    assert result.execution_id == "exec-timeout"
     assert "exec-timeout" in result.error_message
     assert "timed out" in result.error_message
 
 
-def test_l4_workspace_with_env_override_uses_sync_route(tmp_path: Path, monkeypatch) -> None:
-    """Supplying an env override keeps L4 on the synchronous receipt-verifying route."""
-    env_file = _patch_common(monkeypatch, tmp_path)
-    sync_calls: list[list[str]] = []
-
-    def _fake_run(cmd, **_kw):
-        cmd_list = [str(part) for part in cmd]
-        sync_calls.append(cmd_list)
-        return _completed(cmd_list, _l4_parsed()), _l4_parsed()
-
-    monkeypatch.setattr(surrogate_cannbench, "_run_agent_gates_cmd", _fake_run)
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "verify_agent_gates_receipt",
-        lambda *_a, **_kw: (True, ""),
-    )
-    monkeypatch.setattr(
-        surrogate_cannbench.subprocess,
-        "run",
-        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("V2 route must not run")),
-    )
-    result = surrogate_cannbench.run_l4_official_cannbench_via_agent_gates(
-        workspace="tilefoundry",
-        source_root=tmp_path,
-        env_file=env_file,
-    )
-    assert result.passed is True
-    assert sync_calls
-    assert sync_calls[0][sync_calls[0].index("--gate") + 1] == "tilefoundry-npu-cannbench"
+def test_agent_gates_bin_has_no_sibling_venv_fallback(tmp_path: Path, monkeypatch) -> None:
+    """The CLI must come from explicit configuration or PATH, never a sibling checkout."""
+    source_root = tmp_path / "TileFoundry"
+    source_root.mkdir()
+    sibling = tmp_path / "AgentGates" / ".venv" / "bin" / "agent-gates"
+    sibling.parent.mkdir(parents=True)
+    sibling.write_text("#!/bin/sh\n", encoding="utf-8")
+    sibling.chmod(0o755)
+    monkeypatch.delenv("TILEFOUNDRY_NPU_AGENT_GATES_BIN", raising=False)
+    monkeypatch.setattr(surrogate_cannbench.shutil, "which", lambda _name: None)
+    with pytest.raises(FileNotFoundError):
+        surrogate_cannbench._resolve_agent_gates_bin(source_root)

@@ -26,6 +26,7 @@ from tilefoundry_ascend.agent.campaign.marathon import (
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     AnchorEvalMetrics,
     CandidateSurrogateResult,
+    L3AcceptanceResult,
     _write_temp_env_file,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
@@ -303,14 +304,28 @@ def test_marathon_cli_and_watch_round_detection(tmp_path: Path, monkeypatch) -> 
     assert parsed_run.command == "run"
     assert parsed_run.operator == "mla"
     assert parsed_run.device_id == "2"
+    assert parsed_run.retry_device_id == ""
 
     seen_cfgs: list[MarathonConfig] = []
     monkeypatch.setattr(marathon, "run_operator_marathon", lambda c: (seen_cfgs.append(c), 0)[1])
     monkeypatch.setattr(cli, "run_operator_marathon", lambda c: (seen_cfgs.append(c), 0)[1])
-    assert marathon.main(["--operator", "attention_residual", "--device-id", "1"]) == 0
+    assert (
+        marathon.main(
+            [
+                "--operator",
+                "attention_residual",
+                "--device-id",
+                "1",
+                "--retry-device-id",
+                "6",
+            ]
+        )
+        == 0
+    )
     assert cli.main(["--operator", "mla", "--marathon", "--device-id", "2"]) == 0
     assert [c.operator_name for c in seen_cfgs] == ["attention_residual", "mla"]
     assert seen_cfgs[0].device_id == "1"
+    assert seen_cfgs[0].retry_device_id == "6"
     assert seen_cfgs[1].device_id == "2"
 
     parsed_watch = parser.parse_args(
@@ -368,6 +383,46 @@ def test_marathon_cli_and_watch_round_detection(tmp_path: Path, monkeypatch) -> 
     cfg = MarathonConfig(operator_name="attention_residual")
     assert cfg.max_rounds == 80
     assert cfg.target_surrogate_score == 99.8
+
+
+def test_marathon_l3_runner_forwards_resume_and_authorized_card(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """L3 continuation uses the saved execution and the requested card, never a resubmit."""
+    seen: list[dict[str, object]] = []
+
+    def _fake_l3(**kwargs):
+        seen.append(dict(kwargs))
+        return L3AcceptanceResult(passed=True)
+
+    monkeypatch.setattr(marathon, "run_l3_full_contract_via_agent_gates", _fake_l3)
+    runner = marathon.build_prewarmed_l3_runner(
+        operator_name="mla",
+        worktree=tmp_path,
+        env_file=tmp_path / "env.sh",
+        device_id="1",
+        prewarm_l3=False,
+    )
+    callback = lambda *_args: None
+    result = runner(
+        tmp_path / "kernels.py",
+        resume_execution_id="exec-saved",
+        resume_run_id="run-saved",
+        device_id="6",
+        on_execution_started=callback,
+    )
+    assert result.passed is True
+    assert seen == [
+        {
+            "operator_name": "mla",
+            "candidate_module_path": tmp_path / "kernels.py",
+            "source_root": tmp_path,
+            "device_id": "6",
+            "resume_execution_id": "exec-saved",
+            "resume_run_id": "run-saved",
+            "on_execution_started": callback,
+        }
+    ]
 
 
 def test_cann_opp_integrity_preference_and_source_root_sibling_lookup(

@@ -42,20 +42,14 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     _LLM_API_KEY_ENV,
     _NON_AGENT_GATES_ENV_KEYS,
+    DEFAULT_L4_CANNBENCH_WAIT_SEC,
     CandidateSurrogateResult,
     L3AcceptanceResult,
-    _clean_agent_gates_subprocess_env,
-    _default_surrogate_cache_dir,
-    _default_surrogate_tl_cache_dir,
     _format_env_line,
-    _resolve_agent_gates_bin,
     _resolve_env_file_path,
-    _run_agent_gates_cmd,
     _validate_llm_api_key_env,
-    _write_temp_env_file,
     collect_bottleneck_msprof_via_agent_gates,
-    ensure_npu_compare_shim_dir,
-    prewarm_anchor_reference_cache,
+    run_l3_full_contract_via_agent_gates,
     run_l4_official_cannbench_via_agent_gates,
     run_micro_probe_via_agent_gates,
     run_surrogate_batch_via_agent_gates,
@@ -173,6 +167,7 @@ class MarathonConfig:
 
     operator_name: str
     device_id: str = "1"
+    retry_device_id: str = ""
     source_root: Path | None = None
     worktree: Path | None = None
     isolate_worktree: bool = False
@@ -696,26 +691,9 @@ def configure_marathon_process_env(
             os.environ[key] = val
 
     if not os.environ.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "").strip():
-        candidates: list[Path] = []
-        if worktree is not None:
-            candidates.append(worktree.parent / "AgentGates" / ".venv" / "bin" / "agent-gates")
-        if source_root is not None:
-            candidates.append(
-                source_root.resolve().parent / "AgentGates" / ".venv" / "bin" / "agent-gates"
-            )
-        cb_repo = parsed.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
-        if cb_repo:
-            candidates.append(
-                Path(cb_repo).parent / "AgentGates" / ".venv" / "bin" / "agent-gates"
-            )
-        for cand in candidates:
-            if cand.is_file():
-                os.environ["TILEFOUNDRY_NPU_AGENT_GATES_BIN"] = str(cand)
-                break
-        else:
-            ag_which = shutil.which("agent-gates")
-            if ag_which:
-                os.environ["TILEFOUNDRY_NPU_AGENT_GATES_BIN"] = ag_which
+        ag_which = shutil.which("agent-gates")
+        if ag_which:
+            os.environ["TILEFOUNDRY_NPU_AGENT_GATES_BIN"] = ag_which
     return parsed
 
 
@@ -844,292 +822,6 @@ class ExtremeCampaignRunner(PerfTargetCampaignRunner):
             )
 
 
-def _prewarm_l3_candidate_kernels(
-    *,
-    operator_name: str,
-    candidate_module_path: Path,
-    worktree: Path,
-    env_file: Path,
-    tl_cache_dir: Path,
-    op_logger: logging.Logger,
-) -> None:
-    resolved_env = _resolve_env_file_path(env_file)
-    env_vals = parse_simple_env_file(resolved_env)
-    python_bin = (
-        env_vals.get("TILEFOUNDRY_NPU_PYTHON")
-        or os.environ.get("TILEFOUNDRY_NPU_PYTHON")
-        or sys.executable
-    )
-    cann_setup = (env_vals.get("TILEFOUNDRY_NPU_CANN_SETUP") or "").strip()
-    tl_source = (env_vals.get("TILEFOUNDRY_NPU_TILELANG_SOURCE") or "").strip()
-
-    tl_cache_dir.mkdir(parents=True, exist_ok=True)
-    run_env = dict(os.environ)
-    run_env["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
-    run_env["ASCEND_RT_VISIBLE_DEVICES"] = ""
-    run_env["USE_CUDA"] = "0"
-    run_env["TILELANG_CACHE_DIR"] = str(tl_cache_dir)
-    run_env["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
-    run_env["TILELANG_DISABLE_CACHE"] = "0"
-    run_env["PYTHONDONTWRITEBYTECODE"] = "1"
-    pp_parts = [
-        str(worktree),
-        str(worktree / "src"),
-        str(worktree / "targets" / "ascend"),
-    ]
-    if tl_source:
-        pp_parts.insert(0, tl_source)
-    run_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
-
-    task_name = get_operator_task(operator_name)
-    short_entry = task_name.rsplit("/", 1)[-1]
-    cann_repo_hint = (env_vals.get("TILEFOUNDRY_NPU_CANNBENCH_REPO") or "").strip()
-
-    prewarm_script = f"""
-import importlib, importlib.util, inspect, json, os, re, sys
-from pathlib import Path
-import torch
-
-os.environ["TILELANG_CACHE_DIR"] = {str(tl_cache_dir)!r}
-os.environ["TILELANG_KERNEL_CACHE_USE_LIB_STAMP"] = "1"
-os.environ["TILELANG_DISABLE_CACHE"] = "0"
-
-tl_env_mod = importlib.import_module("tilelang.env")
-tl_kc = importlib.import_module("tilelang.cache.kernel_cache")
-tl_env_mod.env.enable_cache()
-tl_kc.KernelCache._get_cache_namespace.cache_clear()
-tl_kc.KernelCache._get_tilelang_lib_stamp.cache_clear()
-tl_kc.KernelCache._create_dirs()
-
-worktree = Path({str(worktree)!r})
-bench_dir = worktree / "tests" / "ascend" / "benchmarks"
-if str(bench_dir) not in sys.path:
-    sys.path.insert(0, str(bench_dir))
-import cannbench_contract
-
-op_name = {short_entry!r}
-task_name = {task_name!r}
-cann_repo_hint = {cann_repo_hint!r}
-mod_path = Path({str(candidate_module_path.resolve())!r})
-spec = importlib.util.spec_from_file_location("_tf_l3_prewarm_cand", str(mod_path))
-mod = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = mod
-spec.loader.exec_module(mod)
-
-orig_get_kernel = getattr(mod, "_get_kernel", None)
-orig_combine = getattr(mod, "_get_combine_kernel", None)
-
-def _empty_tensors(shapes, dtypes):
-    return [
-        torch.empty(tuple(sh), dtype=cannbench_contract.str_to_torch_dtype(dt), device="cpu")
-        for sh, dt in zip(shapes, dtypes)
-        if sh is not None and dt is not None and str(dt).lower() != "none"
-    ]
-
-task_dir = bench_dir / op_name
-if not task_dir.is_dir() and cann_repo_hint:
-    cand_dir = Path(cann_repo_hint) / "tasks" / task_name
-    if cand_dir.is_dir():
-        task_dir = cand_dir
-harness = cannbench_contract.Harness(task_name, task_dir)
-entrypoint = getattr(mod, op_name, getattr(mod, "kernel", None))
-entry_sig_params = set(inspect.signature(entrypoint).parameters) if callable(entrypoint) else set()
-_active_out_specs = []
-
-def _parse_shape_tokens(shape_str, attrs):
-    raw_s = str(shape_str or "").strip()
-    if not raw_s:
-        return ()
-    layout = str((attrs or {{}}).get("inputLayout") or (attrs or {{}}).get("layout") or "").strip()
-    if layout:
-        m = re.search(rf"{{re.escape(layout)}}\\s*:\\s*\\[([^\\]]+)\\]", raw_s)
-        if m:
-            return tuple(tok.strip() for tok in m.group(1).split(",") if tok.strip())
-    m = re.search(r"\\[([^\\]]+)\\]", raw_s)
-    if not m:
-        return ()
-    return tuple(tok.strip() for tok in m.group(1).split(",") if tok.strip())
-
-def _bind_case_dims(case, raw_tensors):
-    dims = {{}}
-    for spec_item, tensor in zip(harness.info.inputs, raw_tensors):
-        if not isinstance(tensor, torch.Tensor):
-            continue
-        toks = _parse_shape_tokens(getattr(spec_item, "shape", ""), case.attrs)
-        if len(toks) == tensor.ndim:
-            for tok, dim_val in zip(toks, tensor.shape):
-                if tok.isidentifier():
-                    dims[tok] = int(dim_val)
-    return dims
-
-def _infer_case_outputs(case, raw_tensors):
-    dims = _bind_case_dims(case, raw_tensors)
-    first_dt = next((t.dtype for t in raw_tensors if isinstance(t, torch.Tensor)), torch.float16)
-    resolved = []
-    for out_spec in harness.info.outputs:
-        toks = _parse_shape_tokens(getattr(out_spec, "shape", ""), case.attrs)
-        sh = None
-        if toks:
-            vals = []
-            ok = True
-            for tok in toks:
-                if tok.isdigit():
-                    vals.append(int(tok))
-                elif tok in dims:
-                    vals.append(dims[tok])
-                else:
-                    ok = False
-                    break
-            if ok:
-                sh = tuple(vals)
-        raw_dt = getattr(out_spec, "dtype", None)
-        if isinstance(raw_dt, (list, tuple)):
-            cand_dts = [cannbench_contract.str_to_torch_dtype(str(d)) for d in raw_dt if d]
-            dt = first_dt if first_dt in cand_dts else (cand_dts[0] if cand_dts else first_dt)
-        elif raw_dt:
-            dt = cannbench_contract.str_to_torch_dtype(str(raw_dt))
-        else:
-            dt = first_dt
-        resolved.append((sh, dt))
-    return resolved
-
-if callable(orig_get_kernel):
-    def _stub_get_kernel(*args, **kwargs):
-        _ = orig_get_kernel(*args, **kwargs)
-        splits = int(kwargs.get("num_kv_splits", 1) or 1)
-        if splits > 1:
-            return lambda *rest: None
-        def _stub_run(*a, **kw):
-            tensors_in = [x for x in a if isinstance(x, torch.Tensor)]
-            dev = tensors_in[0].device if tensors_in else torch.device("cpu")
-            if _active_out_specs and all(sh is not None for sh, _ in _active_out_specs):
-                outs = [torch.empty(sh, dtype=dt, device=dev) for sh, dt in _active_out_specs]
-                return outs[0] if len(outs) == 1 else tuple(outs)
-            if len(harness.info.outputs) > 1 and tensors_in:
-                return tuple(torch.empty_like(tensors_in[0]) for _ in harness.info.outputs)
-            return torch.empty_like(tensors_in[0]) if tensors_in else None
-        return _stub_run
-
-    mod._get_kernel = _stub_get_kernel
-
-if callable(orig_combine):
-    def _stub_combine(*args, **kwargs):
-        _ = orig_combine(*args, **kwargs)
-        return lambda o_p, l_p, *rest: torch.empty(
-            (o_p.shape[1], o_p.shape[2]), dtype=o_p.dtype, device=o_p.device
-        )
-    mod._get_combine_kernel = _stub_combine
-
-compiled = 0
-warnings = 0
-
-def _try_call(tag, fn, params):
-    global compiled, warnings
-    if not callable(fn):
-        return
-    try:
-        fn(**params)
-        compiled += 1
-    except Exception as exc:
-        warnings += 1
-        print(f"PREWARM_WARN {{tag}}: {{type(exc).__name__}}: {{exc}}", file=sys.stderr)
-
-def _run_case_modes(tag_prefix, case):
-    global _active_out_specs
-    raw = _empty_tensors(case.input_shapes, case.dtypes)
-    if harness.get_input:
-        in_p = {{
-            item.name: raw[i] if i < len(raw) else None
-            for i, item in enumerate(harness.info.inputs)
-        }}
-        in_p.update({{k: v for k, v in case.attrs.items() if k not in in_p}})
-        raw = harness.get_input(**in_p)
-    _active_out_specs = _infer_case_outputs(case, raw)
-    params = harness.params(case, raw)
-    _try_call(f"{{tag_prefix}}_tuned", entrypoint, params)
-    if "schedule_mode" in entry_sig_params:
-        p_base = dict(params)
-        p_base["schedule_mode"] = "baseline"
-        _try_call(f"{{tag_prefix}}_baseline", entrypoint, p_base)
-
-for case in harness.cases:
-    _run_case_modes(f"case_{{case.case_num}}", case)
-
-supp_path = bench_dir / "cases" / f"supplemental_{{op_name}}.json"
-if supp_path.is_file():
-    supp = json.loads(supp_path.read_text(encoding="utf-8"))
-    for row in supp.get("cases", ()):
-        supp_case = cannbench_contract.Case(
-            case_num=row["case_id"],
-            label=row["key"],
-            input_shapes=row["input_shapes"],
-            dtypes=row["dtypes"],
-            attrs=row["attrs"],
-            value_ranges=row["value_range"],
-        )
-        _run_case_modes(f"supp_{{row['key']}}", supp_case)
-
-if harness.cases:
-    base_case = harness.cases[0]
-    base_raw = _empty_tensors(base_case.input_shapes, base_case.dtypes)
-    base_dims = _bind_case_dims(base_case, base_raw)
-    target_tok = next((k for k in ("B", "batch", "M", "S", "T", "seq_len") if k in base_dims), None)
-    if target_tok is not None:
-        old_val = base_dims[target_tok]
-        new_val = max(1, old_val // 2) if old_val >= 2 else old_val * 2
-        if new_val != old_val:
-            scaled_shapes = []
-            for spec_item, sh in zip(harness.info.inputs, base_case.input_shapes):
-                if sh is None:
-                    scaled_shapes.append(None)
-                    continue
-                toks = _parse_shape_tokens(getattr(spec_item, "shape", ""), base_case.attrs)
-                if len(toks) == len(sh):
-                    scaled_shapes.append([new_val if tok == target_tok else dim_v for tok, dim_v in zip(toks, sh)])
-                else:
-                    scaled_shapes.append(list(sh))
-            dyn_case = cannbench_contract.Case(
-                case_num=base_case.case_num,
-                label="dynamic_scale",
-                input_shapes=scaled_shapes,
-                dtypes=base_case.dtypes,
-                attrs=base_case.attrs,
-                value_ranges=base_case.value_ranges,
-            )
-            _run_case_modes("case_0_dynamic_scale", dyn_case)
-
-print(json.dumps({{"compiled": compiled, "warnings": warnings}}))
-"""
-    with tempfile.TemporaryDirectory(prefix="tf_l3_prewarm_") as tmp_dir:
-        driver_path = Path(tmp_dir) / "prewarm_l3_driver.py"
-        driver_path.write_text(prewarm_script, encoding="utf-8")
-        if cann_setup and Path(cann_setup).is_file() and shutil.which("bisheng") is None:
-            bash_cmd = (
-                f"set +u && source {shlex.quote(cann_setup)} >/dev/null 2>&1 "
-                f"&& exec {shlex.quote(python_bin)} {shlex.quote(str(driver_path))}"
-            )
-            argv = ["/bin/bash", "-c", bash_cmd]
-        else:
-            argv = [python_bin, str(driver_path)]
-        proc = subprocess.run(
-            argv,
-            text=True,
-            capture_output=True,
-            cwd=str(worktree),
-            env=run_env,
-            timeout=900,
-        )
-    if proc.returncode != 0:
-        op_logger.warning(
-            "L3 CPU prewarm exited rc=%d: %s",
-            proc.returncode,
-            (proc.stderr or proc.stdout or "")[-600:],
-        )
-    else:
-        last_line = (proc.stdout or "").strip().splitlines()[-1:] or ["{}"]
-        op_logger.info("L3_CPU_PREWARM_OK op=%s summary=%s", operator_name, last_line[0])
-
-
 def build_prewarmed_l3_runner(
     *,
     operator_name: str,
@@ -1138,142 +830,45 @@ def build_prewarmed_l3_runner(
     device_id: str,
     prewarm_l3: bool = True,
     op_logger: logging.Logger | None = None,
-) -> Callable[[Path], L3AcceptanceResult]:
-    """Build an L3 contract verifier with one-time reference and CPU kernel prewarming."""
+) -> Callable[..., L3AcceptanceResult]:
+    """Build the L3 runner; the adapter owns environment, cache and prompt loading.
+
+    ``prewarm_l3`` remains accepted so existing marathon configurations keep parsing,
+    but promotion evidence now comes from the adapter-owned V2 gate, which prepares
+    its own interpreter, cache policy and compare bridge inside the workspace.
+    """
+    _ = env_file, prewarm_l3
     log = op_logger or logger
-    ref_prewarmed = False
+    default_device_id = str(device_id)
 
-    def _ensure_ref_cache() -> None:
-        nonlocal ref_prewarmed
-        if ref_prewarmed:
-            return
-        resolved_env = _resolve_env_file_path(env_file)
-        env_vals = parse_simple_env_file(resolved_env)
-        cann_repo = resolve_cannbench_repo(
-            cannbench_repo=env_vals.get("TILEFOUNDRY_NPU_CANNBENCH_REPO"),
-            env_file=resolved_env,
+    def _run_l3(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started: Callable[[str, str], None] | None = None,
+    ) -> L3AcceptanceResult:
+        result = run_l3_full_contract_via_agent_gates(
+            operator_name=operator_name,
+            candidate_module_path=module_path,
+            source_root=worktree,
+            device_id=str(device_id or default_device_id),
+            resume_execution_id=resume_execution_id,
+            resume_run_id=resume_run_id,
+            on_execution_started=on_execution_started,
         )
-        cache_dir = _default_surrogate_cache_dir()
-        task = get_operator_task(operator_name)
-        all_specs = [AnchorCaseSpec(task, i, "", 1.0, 1.0) for i in range(1, 21)]
-        for start in range(0, len(all_specs), 5):
-            chunk = all_specs[start : start + 5]
-            prewarm_anchor_reference_cache(
-                operator_name,
-                chunk,
-                cannbench_repo=cann_repo,
-                env_file=resolved_env,
-                cache_dir=cache_dir,
-                source_root=worktree,
-            )
-        ref_prewarmed = True
-        log.info("L3_REF_CACHE_READY op=%s cases=1..20 cache=%s", operator_name, cache_dir)
-
-    shim_cache_hook = (
-        "\nimport importlib as _tf_importlib\n"
-        "import os as _tf_os\n"
-        "_tf_tl_dir = _tf_os.environ.get('TF_SURROGATE_TL_CACHE_DIR', '').strip()\n"
-        "if _tf_tl_dir:\n"
-        "    _tf_os.makedirs(_tf_tl_dir, exist_ok=True)\n"
-        "    _tf_os.environ['TILELANG_CACHE_DIR'] = _tf_tl_dir\n"
-        "    _tf_os.environ['TILELANG_KERNEL_CACHE_USE_LIB_STAMP'] = '1'\n"
-        "    _tf_os.environ['TILELANG_DISABLE_CACHE'] = '0'\n"
-        "    try:\n"
-        "        _tl_env_mod = _tf_importlib.import_module('tilelang.env')\n"
-        "        _tl_kc = _tf_importlib.import_module('tilelang.cache.kernel_cache')\n"
-        "        _tl_env_mod.env.enable_cache()\n"
-        "        _tl_kc.KernelCache._get_cache_namespace.cache_clear()\n"
-        "        _tl_kc.KernelCache._get_tilelang_lib_stamp.cache_clear()\n"
-        "        _tl_kc.KernelCache._create_dirs()\n"
-        "    except Exception:\n"
-        "        pass\n"
-    )
-
-    def _run_l3(module_path: Path) -> L3AcceptanceResult:
-        t0 = time.monotonic()
-        resolved_env = _resolve_env_file_path(env_file)
-        ag_bin = _resolve_agent_gates_bin(worktree)
-        env_vals = parse_simple_env_file(resolved_env)
-        cann_repo = resolve_cannbench_repo(
-            cannbench_repo=env_vals.get("TILEFOUNDRY_NPU_CANNBENCH_REPO"),
-            env_file=resolved_env,
-        )
-        cache_dir = _default_surrogate_cache_dir()
-        tl_cache_dir = _default_surrogate_tl_cache_dir()
-
-        if prewarm_l3:
-            _ensure_ref_cache()
-            _prewarm_l3_candidate_kernels(
-                operator_name=operator_name,
-                candidate_module_path=module_path,
-                worktree=worktree,
-                env_file=resolved_env,
-                tl_cache_dir=tl_cache_dir,
-                op_logger=log,
-            )
-
-        with tempfile.TemporaryDirectory(prefix="tf_l3_gate_") as tmp_dir:
-            tmp = Path(tmp_dir)
-            shim_dir = ensure_npu_compare_shim_dir(tmp / "shim", cannbench_repo=cann_repo)
-            shim_py = shim_dir / "npu_compare.py"
-            shim_py.write_text(
-                shim_py.read_text(encoding="utf-8") + shim_cache_hook,
-                encoding="utf-8",
-            )
-            tmp_env = _write_temp_env_file(
-                resolved_env,
-                tmp / "env.sh",
-                {
-                    "TILEFOUNDRY_NPU_CPU_TESTS": "tests/ascend/agent/test_llm_watchdog.py",
-                    "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/benchmarks/test_npu_acceptance.py",
-                },
-            )
-            cmd = [
-                ag_bin,
-                "run",
-                "--adapter",
-                "tilefoundry-npu",
-                "--source",
-                str(worktree),
-                "--env-file",
-                str(tmp_env),
-                "--device-id",
-                str(device_id),
-                "--gate",
-                "tilefoundry-npu-device",
-                "--json",
-            ]
-            l3_env = {
-                "CANNBENCH_CACHE_DIR": str(cache_dir),
-                "TF_SURROGATE_TL_CACHE_DIR": str(tl_cache_dir),
-                "TF_SURROGATE_SHIM_ONLY": "1",
-                "TF_SURROGATE_SHIM_DIR": str(shim_dir),
-                "TF_L3_TARGET_OPERATOR": operator_name,
-                "TF_L3_TARGET_MODULE_PATH": str(Path(module_path).resolve()),
-            }
-            sub_env = _clean_agent_gates_subprocess_env(l3_env)
-            proc, parsed = _run_agent_gates_cmd(
-                cmd,
-                cwd=str(worktree),
-                env=sub_env,
-                timeout_sec=900,
-            )
-        ok = proc.returncode == 0 and parsed.get("status") == "PASS"
-        err = "" if ok else (proc.stderr or proc.stdout or "L3 contract failed")[-1000:]
         log.info(
-            "L3_CONTRACT_DONE op=%s passed=%s elapsed=%.1fs run_id=%s",
+            "L3_CONTRACT_DONE op=%s passed=%s elapsed=%.1fs run_id=%s execution_id=%s "
+            "failure_kind=%s",
             operator_name,
-            ok,
-            time.monotonic() - t0,
-            parsed.get("runId", ""),
+            result.passed,
+            result.elapsed_sec,
+            result.run_id,
+            result.execution_id,
+            result.failure_kind,
         )
-        return L3AcceptanceResult(
-            passed=ok,
-            run_id=str(parsed.get("runId", "")),
-            receipt_path=str(parsed.get("receiptPath", "")),
-            elapsed_sec=time.monotonic() - t0,
-            error_message=err,
-        )
+        return result
 
     return _run_l3
 
@@ -1756,6 +1351,7 @@ def run_operator_marathon(
         run_final_l4=cfg.run_final_l4,
         l4_regression_ratio=cfg.l4_regression_ratio,
         device_id=str(cfg.device_id),
+        retry_device_id=str(cfg.retry_device_id),
         warmup=cfg.warmup,
         repeat=cfg.repeat,
         enable_tilesize_prescreen=cfg.enable_tilesize_prescreen,
@@ -1793,12 +1389,15 @@ def run_operator_marathon(
             timeout_sec=600,
         ),
         l3_contract_runner=l3_runner,
-        l4_cannbench_runner=lambda _mod_path: run_l4_official_cannbench_via_agent_gates(
+        l4_cannbench_runner=lambda mod_path, **kwargs: run_l4_official_cannbench_via_agent_gates(
             operator_name=cfg.operator_name,
+            candidate_module_path=mod_path,
             source_root=worktree,
-            env_file=env_file,
-            device_id=str(cfg.device_id),
-            timeout_sec=3600,
+            device_id=str(kwargs.get("device_id") or cfg.device_id),
+            timeout_sec=DEFAULT_L4_CANNBENCH_WAIT_SEC,
+            resume_execution_id=str(kwargs.get("resume_execution_id") or ""),
+            resume_run_id=str(kwargs.get("resume_run_id") or ""),
+            on_execution_started=kwargs.get("on_execution_started"),
         ),
         checkpoint_path=checkpoint_path,
         campaign_kb_path=campaign_kb_path,
@@ -2238,6 +1837,14 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         help="Target operator to optimize (short name e.g. rms_norm or task id e.g. level2/rms_norm).",
     )
     parser.add_argument("--device-id", default="1", help="Authorized NPU device ID.")
+    parser.add_argument(
+        "--retry-device-id",
+        default="",
+        help=(
+            "A second explicitly authorized NPU card for at most one fresh "
+            "retry after a proven-terminal infrastructure failure."
+        ),
+    )
     parser.add_argument("--source-root", default=None, help="TileFoundry repository root.")
     parser.add_argument("--worktree", default=None, help="Optional isolated worktree root.")
     parser.add_argument(
@@ -2314,6 +1921,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg = MarathonConfig(
         operator_name=str(args.operator),
         device_id=str(args.device_id),
+        retry_device_id=str(args.retry_device_id),
         source_root=Path(args.source_root) if args.source_root else None,
         worktree=Path(args.worktree) if args.worktree else None,
         isolate_worktree=bool(args.isolate_worktree),

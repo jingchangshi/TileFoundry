@@ -36,6 +36,8 @@ EXEMPT_PREFIXES = (
     "examples/qwen_prefill-amx/",
 )
 DIRECTIVE_PREFIXES = ("ruff:", "noqa", "type:", "pragma:", "mypy:", "fmt:", "isort:")
+METADATA_HEADER_KEYS = frozenset({"test-mode", "compute-kind", "api-name", "api-kind", "kernels"})
+METADATA_HEADER = re.compile(r"#\s+([a-z][a-z0-9-]*):\s+\S.*")
 PYTHON_SUFFIXES = frozenset({".py"})
 C_SUFFIXES = frozenset({".h", ".hpp", ".cuh", ".cu", ".cpp", ".cc"})
 GOOGLE_SECTION = re.compile(
@@ -89,6 +91,24 @@ def is_directive(token: tokenize.TokenInfo) -> bool:
     body = token.string.lstrip("#").strip()
     return body.startswith(DIRECTIVE_PREFIXES) or (
         token.start[0] == 1 and token.start[1] == 0 and token.string.startswith("#!")
+    )
+
+
+def _metadata_key(line: str) -> str | None:
+    """The key of a generated-harness metadata line, if it is one."""
+    match = METADATA_HEADER.fullmatch(line.rstrip("\r\n"))
+    if match is None or match.group(1) not in METADATA_HEADER_KEYS:
+        return None
+    return match.group(1)
+
+
+def is_metadata_header(token: tokenize.TokenInfo, source_lines: list[str]) -> bool:
+    """Whether *token* belongs to a leading generated-harness metadata block."""
+    if token.start[1] != 0 or _metadata_key(source_lines[token.start[0] - 1]) is None:
+        return False
+    return all(
+        not line.strip() or _metadata_key(line) is not None
+        for line in source_lines[: token.start[0] - 1]
     )
 
 
@@ -147,11 +167,12 @@ def narration_findings(text: str) -> list[tuple[int, str]]:
 
 
 def placement_findings(text: str) -> list[tuple[int, str]]:
-    """Python comments that are neither tool directives nor a shebang."""
+    """Python comments outside directives, generated metadata, and docstrings."""
+    source_lines = text.splitlines()
     return [
         (token.start[0], "explanation outside a docstring")
         for token in comment_tokens(text)
-        if not is_directive(token)
+        if not is_directive(token) and not is_metadata_header(token, source_lines)
     ]
 
 

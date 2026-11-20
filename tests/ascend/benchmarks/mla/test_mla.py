@@ -3,10 +3,14 @@
 # api-name: mla
 # api-kind: torch-function
 # kernels: mla
+"""Standalone CANNBench MLA correctness harness.
+
+Locates ``cannbench_contract.py`` in this checkout or an archived source
+snapshot and delegates every case to the shared harness.
+"""
 from pathlib import Path
 import sys
 
-# Find the shared helper in this checkout or an archived source snapshot.
 for parent in Path(__file__).resolve().parents:
     if (parent / 'cannbench_contract.py').is_file():
         sys.path.insert(0, str(parent))
@@ -14,5 +18,7 @@ for parent in Path(__file__).resolve().parents:
 from cannbench_contract import Harness, load_cases
 
 
-def main(operator_api):
-    Harness('level4/mla', Path(__file__).resolve().parent).run(operator_api)
+def main(operator_api, observer=None, node=None):
+    Harness('level4/mla', Path(__file__).resolve().parent).run(
+        operator_api, observer=observer, node=node
+    )

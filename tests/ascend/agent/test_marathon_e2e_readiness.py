@@ -261,6 +261,7 @@ def test_campaign_runner_live_sil_7facet_cost_calibration_and_shared_stone_pruni
         promoted,
         _rolled_back,
         escalated,
+        _promotion_blocked,
     ) = asyncio.run(
         runner._execute_single_round(
             round_idx=1,

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from tilefoundry_ascend.agent import (
     AnchorCaseSpec,
@@ -29,6 +32,7 @@ from tilefoundry_ascend.agent.campaign import (
     aggregate_surrogate_result,
     build_anchor_metrics,
     build_arg_parser,
+    campaign_runner,
     compute_case_eq3_score,
     extract_regime_snippet,
     patch_regime_into_module,
@@ -139,6 +143,144 @@ def _make_surrogate_result(
         for spec in anchors
     ]
     return aggregate_surrogate_result(cid, op_name, metrics)
+
+
+def _single_round_promotion_runner(
+    tmp_path: Path,
+    *,
+    target_path: Path,
+    checkpoint_path: Path,
+    l3_runner,
+    l4_runner=None,
+    max_rounds: int = 1,
+    run_final_l4: bool = False,
+    retry_device_id: str = "",
+    backend: MockLLMBackend | None = None,
+) -> PerfTargetCampaignRunner:
+    """Build a one-regime campaign with injected L3/L4 transports."""
+    anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 3.0),)
+    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),)
+    if backend is None:
+        backend = MockLLMBackend(
+            responses={
+                "exploit_rule": [_IMPROVED_REGIME_A] * 4,
+                "explore_creative": [
+                    json.dumps(
+                        {
+                            "physical_hypothesis": "Promotion transport",
+                            "target_local_metric": "aiv_vec",
+                            "dsl_source": _IMPROVED_REGIME_A,
+                        }
+                    )
+                ]
+                * 2,
+            }
+        )
+
+    def _l2_fast(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            lat = 5.0 if "T.Kernel(2)" in src else 12.0
+            out[cid] = _make_surrogate_result(
+                cid, "attention_residual", tuple(active_anchors), {2: lat}
+            )
+        return out
+
+    extra = {}
+    if l4_runner is not None:
+        extra["l4_cannbench_runner"] = l4_runner
+    return PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=max_rounds,
+            run_final_l4=run_final_l4,
+            retry_device_id=retry_device_id,
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_fast,
+        l3_contract_runner=l3_runner,
+        checkpoint_path=checkpoint_path,
+        **extra,
+    )
+
+
+def _signed_l3_observation(scenario: str) -> dict[str, object]:
+    """Adapter-shaped L3 evidence for one campaign classification scenario."""
+    candidate_failure: dict[str, object] = {
+        "kind": "candidate",
+        "category": "numeric",
+        "stage": "comparison",
+        "node": "test_case_20",
+        "case": "20",
+        "role": "candidate",
+        "comparator": "torch.testing.assert_close",
+        "references": ["oracle"],
+        "comparisons": [{"output": 0, "passed": False, "message": "mismatch"}],
+        "exceptionType": None,
+        "detail": "candidate numeric comparison failed",
+    }
+    runtime_failure: dict[str, object] = {
+        "kind": "infrastructure",
+        "category": "exception",
+        "stage": "run",
+        "node": "test_case_20",
+        "case": "20",
+        "role": None,
+        "comparator": None,
+        "references": [],
+        "comparisons": [],
+        "exceptionType": "RuntimeError",
+        "detail": "device runtime error",
+    }
+    coverage_failure: dict[str, object] = {
+        "kind": "coverage",
+        "category": "case_identity",
+        "stage": "contract",
+        "node": "test_case_20",
+        "case": None,
+        "role": None,
+        "comparator": None,
+        "references": [],
+        "comparisons": [],
+        "exceptionType": None,
+        "detail": "case identity missing",
+    }
+    if scenario == "runtime":
+        failure, category = runtime_failure, "exception"
+    elif scenario in {"numeric", "active_numeric"}:
+        failure, category = candidate_failure, "numeric"
+    elif scenario == "case_identity":
+        failure, category = coverage_failure, "coverage"
+    else:
+        raise AssertionError(scenario)
+    node = {
+        "name": "test_case_20",
+        "status": "passed" if scenario == "case_identity" else "failed",
+        "cases": {} if scenario == "case_identity" else {"20": "failed"},
+        "failure": failure,
+    }
+    return {
+        "failureCategory": category,
+        "evidence": {
+            "phase": "finished",
+            "failure": failure,
+            "failures": [failure],
+            "writeErrors": [],
+            "nodes": [node],
+            "interruption": {
+                "interrupted": False,
+                "errorCategory": None,
+                "signal": None,
+            },
+        },
+    }
 
 
 def _setup_mock_cann_repo(tmp_path: Path) -> Path:
@@ -490,7 +632,9 @@ def test_campaign_l3_contract_failure_atomic_rollback_and_budget_exhausted(
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
         l2_batch_evaluator=_l2_fast,
         l3_contract_runner=lambda _p: L3AcceptanceResult(
-            passed=False, error_message="case 20 precision mismatch"
+            passed=False,
+            error_message="case 20 precision mismatch",
+            failure_kind=surrogate_cannbench.FAILURE_KIND_CANDIDATE,
         ),
         checkpoint_path=tmp_path / "ckpt_rollback.json",
     )
@@ -499,6 +643,843 @@ def test_campaign_l3_contract_failure_atomic_rollback_and_budget_exhausted(
     assert report.rolled_back_rounds == (1, 2)
     assert report.promoted_rounds == ()
     assert target_path.read_text(encoding="utf-8") == _MULTI_REGIME_MODULE
+
+
+def test_campaign_l3_infrastructure_failure_preserves_pending_promotion(
+    tmp_path: Path,
+) -> None:
+    """Infrastructure L3 faults restore the incumbent but keep the candidate pending."""
+    anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 3.0),)
+    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),)
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    ckpt_path = tmp_path / "ckpt_promotion_blocked.json"
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [_IMPROVED_REGIME_A] * 4,
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Blocked by device occupancy",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": _IMPROVED_REGIME_A,
+                    }
+                )
+            ]
+            * 2,
+        }
+    )
+
+    def _l2_fast(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            lat = 5.0 if "T.Kernel(2)" in src else 12.0
+            out[cid] = _make_surrogate_result(
+                cid, "attention_residual", tuple(active_anchors), {2: lat}
+            )
+        return out
+
+    l4_calls: list[Path] = []
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=2,
+            run_final_l4=True,
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_fast,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(
+            passed=False,
+            run_id="run-l3-infra",
+            receipt_path="/receipt-l3-infra.json",
+            error_message="BLOCKED_ENV: device busy",
+            failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+            failure_category="occupancy",
+            pending=True,
+            execution_id="exec-l3-infra",
+            candidate_sha256="deadbeef",
+            target_path=str(target_path),
+        ),
+        l4_cannbench_runner=lambda path: (
+            l4_calls.append(path) or L4CannbenchResult(passed=True)
+        ),
+        checkpoint_path=ckpt_path,
+    )
+    report = asyncio.run(runner.run())
+    assert report.stop_reason == "promotion_blocked"
+    assert report.promotion_blocked is True
+    assert report.total_rounds == 1
+    assert report.promoted_rounds == ()
+    assert report.rolled_back_rounds == (1,)
+    assert report.rounds[0].stagnation_rounds_after == 0
+    assert target_path.read_text(encoding="utf-8") == _MULTI_REGIME_MODULE
+    assert l4_calls == []
+    pending = report.pending_promotion
+    assert pending is not None
+    assert pending.round_idx == 1
+    assert pending.execution_id == "exec-l3-infra"
+    assert pending.run_id == "run-l3-infra"
+    assert pending.receipt_path == "/receipt-l3-infra.json"
+    assert pending.candidate_sha256 == "deadbeef"
+    assert "T.Kernel(2)" in pending.candidate_source
+    assert pending.attempts[0]["execution_id"] == "exec-l3-infra"
+    assert pending.attempts[0]["device_id"] == "1"
+    assert pending.attempts[0]["failure_category"] == "occupancy"
+    assert pending.attempts[0]["pending"] == "true"
+    assert pending.attempts[0]["candidate_sha256"] == "deadbeef"
+    saved = json.loads(ckpt_path.read_text(encoding="utf-8"))
+    assert saved["stop_reason"] == "promotion_blocked"
+    assert saved["pending_promotion"]["execution_id"] == "exec-l3-infra"
+
+
+def test_campaign_l3_candidate_failure_clears_pending_and_counts_stagnation(
+    tmp_path: Path,
+) -> None:
+    """A numeric L3 failure rolls back the candidate, clears pending, and counts a miss."""
+    anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 3.0),)
+    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),)
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [_IMPROVED_REGIME_A] * 2,
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Precision regression",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": _IMPROVED_REGIME_A,
+                    }
+                )
+            ]
+            * 2,
+        }
+    )
+
+    def _l2_fast(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            lat = 5.0 if "T.Kernel(2)" in src else 12.0
+            out[cid] = _make_surrogate_result(
+                cid, "attention_residual", tuple(active_anchors), {2: lat}
+            )
+        return out
+
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=1,
+            retry_device_id="6",
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_fast,
+        l3_contract_runner=lambda p, **_kw: (
+            l3_calls.append(p)
+            or L3AcceptanceResult(
+                passed=False,
+                error_message="case 20 precision mismatch",
+                failure_kind=surrogate_cannbench.FAILURE_KIND_CANDIDATE,
+                execution_id="exec-l3-candidate",
+                run_id="run-l3-candidate",
+                device_id="1",
+            )
+        ),
+        checkpoint_path=tmp_path / "ckpt_candidate.json",
+    )
+    l3_calls: list[Path] = []
+    report = asyncio.run(runner.run())
+    assert report.stop_reason == "budget_exhausted"
+    assert report.promotion_blocked is False
+    assert report.pending_promotion is None
+    assert report.promoted_rounds == ()
+    assert report.rolled_back_rounds == (1,)
+    assert report.rounds[0].stagnation_rounds_after == 1
+    assert target_path.read_text(encoding="utf-8") == _MULTI_REGIME_MODULE
+    assert len(l3_calls) == 1
+
+
+def test_campaign_l3_active_wait_timeout_keeps_candidate_and_resume_identity(
+    tmp_path: Path,
+) -> None:
+    """A bounded wait expiry is not a verdict: bytes, card and execution stay recoverable."""
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    ckpt_path = tmp_path / "ckpt_l3_active.json"
+    submitted: list[str] = []
+
+    def _l3_active(path: Path, *, device_id: str = "", on_execution_started=None):
+        _ = device_id
+        assert on_execution_started is not None
+        on_execution_started("exec-active", "4")
+        submitted.append(path.read_text(encoding="utf-8"))
+        return L3AcceptanceResult(
+            passed=False,
+            error_message="wait timed out",
+            failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+            execution_id="exec-active",
+            device_id="4",
+            state="RUNNING",
+            execution_terminal=False,
+        )
+
+    runner = _single_round_promotion_runner(
+        tmp_path,
+        target_path=target_path,
+        checkpoint_path=ckpt_path,
+        l3_runner=_l3_active,
+    )
+    report = asyncio.run(runner.run())
+    pending = report.pending_promotion
+    assert report.stop_reason == "promotion_blocked"
+    assert report.promotion_blocked is True
+    assert report.rounds[0].stagnation_rounds_after == 0
+    assert pending is not None
+    assert pending.execution_id == "exec-active"
+    assert pending.device_id == "4"
+    assert pending.execution_terminal is False
+    assert submitted and submitted[0] == pending.candidate_source
+    assert target_path.read_text(encoding="utf-8") == pending.candidate_source
+    attempt = pending.attempts[0]
+    assert attempt["device_id"] == "4"
+    assert attempt["execution_id"] == "exec-active"
+    assert attempt["state"] == "RUNNING"
+    assert attempt["pending"] == "true"
+    assert attempt["execution_terminal"] == "false"
+    assert attempt["candidate_sha256"] == hashlib.sha256(
+        pending.candidate_source.encode("utf-8")
+    ).hexdigest()
+    saved = json.loads(ckpt_path.read_text(encoding="utf-8"))
+    assert saved["pending_promotion"]["execution_id"] == "exec-active"
+    assert saved["pending_promotion"]["execution_terminal"] is False
+    assert saved["active_promotion"]["execution_id"] == "exec-active"
+
+    resumed_calls: list[tuple[str, str, str, str]] = []
+
+    def _l3_resume(
+        path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L3AcceptanceResult:
+        _ = on_execution_started
+        source = path.read_text(encoding="utf-8")
+        resumed_calls.append(
+            (source, resume_execution_id, resume_run_id, device_id)
+        )
+        return L3AcceptanceResult(
+            passed=True,
+            run_id="run-resumed",
+            execution_id=resume_execution_id,
+            device_id=device_id,
+        )
+
+    resumed = _single_round_promotion_runner(
+        tmp_path,
+        target_path=target_path,
+        checkpoint_path=ckpt_path,
+        l3_runner=_l3_resume,
+        backend=MockLLMBackend(responses={}),
+    )
+    resumed_report = asyncio.run(resumed.run(resume=True))
+    assert resumed_calls == [
+        (pending.candidate_source, "exec-active", "", "4")
+    ]
+    assert resumed_report.pending_promotion is None
+    assert resumed_report.promoted_rounds == (1,)
+    assert target_path.read_text(encoding="utf-8") == pending.candidate_source
+
+
+@pytest.mark.parametrize(
+    (
+        "scenario",
+        "expected_kind",
+        "expected_category",
+        "pending",
+        "stagnation",
+        "blocked",
+        "rolled_back",
+    ),
+    [
+        (
+            "runtime",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+            "exception",
+            True,
+            0,
+            True,
+            True,
+        ),
+        (
+            "numeric",
+            surrogate_cannbench.FAILURE_KIND_CANDIDATE,
+            "numeric",
+            False,
+            1,
+            False,
+            True,
+        ),
+        (
+            "case_identity",
+            surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+            "coverage",
+            True,
+            0,
+            True,
+            True,
+        ),
+        (
+            "active_numeric",
+            surrogate_cannbench.FAILURE_KIND_CANDIDATE,
+            "numeric",
+            True,
+            0,
+            True,
+            False,
+        ),
+    ],
+)
+def test_campaign_consumes_signed_l3_observation_classification(
+    tmp_path: Path,
+    scenario: str,
+    expected_kind: str,
+    expected_category: str,
+    pending: bool,
+    stagnation: int,
+    blocked: bool,
+    rolled_back: bool,
+) -> None:
+    """Runtime and case gaps stay pending; a live candidate never yields to the incumbent."""
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    ckpt_path = tmp_path / f"ckpt_l3_{scenario}.json"
+    observation = _signed_l3_observation(scenario)
+    terminal = scenario != "active_numeric"
+    execution_id = "exec-l3" if terminal else "exec-active"
+    seen: dict[str, str] = {}
+
+    def _l3(path: Path, *, device_id: str = "", on_execution_started=None):
+        _ = device_id
+        source = path.read_text(encoding="utf-8")
+        seen["source"] = source
+        if on_execution_started is not None:
+            on_execution_started(execution_id, "4")
+        return surrogate_cannbench.l3_failure_result_from_observation(
+            observation,
+            run_id="run-l3" if terminal else "",
+            receipt_path="/receipt-l3.json",
+            execution_id=execution_id,
+            candidate_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            target_path=str(path),
+            device_id="4",
+            state="FINISHED" if terminal else "RUNNING",
+            execution_terminal=terminal,
+        )
+
+    runner = _single_round_promotion_runner(
+        tmp_path,
+        target_path=target_path,
+        checkpoint_path=ckpt_path,
+        l3_runner=_l3,
+    )
+    report = asyncio.run(runner.run())
+
+    candidate_source = seen["source"]
+    candidate_sha = hashlib.sha256(candidate_source.encode("utf-8")).hexdigest()
+    assert candidate_source != _MULTI_REGIME_MODULE
+    assert report.promotion_blocked is blocked
+    assert report.rounds[0].stagnation_rounds_after == stagnation
+    assert report.rolled_back_rounds == ((1,) if rolled_back else ())
+    if terminal:
+        assert target_path.read_text(encoding="utf-8") == _MULTI_REGIME_MODULE
+    else:
+        assert target_path.read_text(encoding="utf-8") == candidate_source
+
+    attempts = report.rounds[0].promotion_attempts
+    assert len(attempts) == 1
+    attempt = attempts[0]
+    assert attempt["execution_id"] == execution_id
+    assert attempt["device_id"] == "4"
+    assert attempt["failure_kind"] == expected_kind
+    assert attempt["failure_category"] == expected_category
+    assert attempt["candidate_sha256"] == candidate_sha
+    assert attempt["state"] == ("FINISHED" if terminal else "RUNNING")
+    assert attempt["execution_terminal"] == str(terminal).lower()
+    if pending:
+        stored = report.pending_promotion
+        assert stored is not None
+        assert stored.execution_id == execution_id
+        assert stored.device_id == "4"
+        assert stored.execution_terminal is terminal
+        assert stored.candidate_source == candidate_source
+        assert stored.candidate_sha256 == candidate_sha
+        assert attempt["pending"] == "true"
+    else:
+        assert report.pending_promotion is None
+        assert attempt["pending"] == "false"
+
+
+def test_campaign_l3_terminal_infrastructure_retries_once_on_authorized_card(
+    tmp_path: Path,
+) -> None:
+    """Only terminal proof permits one linked retry on the configured other card."""
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    ckpt_path = tmp_path / "ckpt_l3_retry.json"
+
+    def _l3_initial(path: Path, *, device_id: str = "", on_execution_started=None):
+        _ = (path, device_id)
+        assert on_execution_started is not None
+        on_execution_started("exec-orig", "4")
+        return L3AcceptanceResult(
+            passed=False,
+            error_message="device reset",
+            failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+            execution_id="exec-orig",
+            run_id="run-orig",
+            device_id="4",
+            execution_terminal=True,
+        )
+
+    first = _single_round_promotion_runner(
+        tmp_path,
+        target_path=target_path,
+        checkpoint_path=ckpt_path,
+        l3_runner=_l3_initial,
+    )
+    first_report = asyncio.run(first.run())
+    assert first_report.pending_promotion is not None
+    assert first_report.pending_promotion.execution_terminal is True
+
+    l3_calls: list[tuple[str, str, str]] = []
+
+    def _l3_retry(
+        path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L3AcceptanceResult:
+        _ = path
+        l3_calls.append((resume_execution_id, resume_run_id, device_id))
+        if resume_execution_id:
+            assert on_execution_started is None or callable(on_execution_started)
+            return L3AcceptanceResult(
+                passed=False,
+                error_message="device reset persists",
+                failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+                execution_id=resume_execution_id,
+                run_id=resume_run_id,
+                device_id="4",
+                execution_terminal=True,
+            )
+        assert device_id == "6"
+        assert on_execution_started is not None
+        on_execution_started("exec-alt", "6")
+        return L3AcceptanceResult(
+            passed=True,
+            run_id="run-alt",
+            execution_id="exec-alt",
+            device_id="6",
+        )
+
+    resumed = _single_round_promotion_runner(
+        tmp_path,
+        target_path=target_path,
+        checkpoint_path=ckpt_path,
+        l3_runner=_l3_retry,
+        retry_device_id="6",
+        backend=MockLLMBackend(responses={}),
+    )
+    resumed_report = asyncio.run(resumed.run(resume=True))
+    assert [call[0] for call in l3_calls] == ["exec-orig", ""]
+    assert l3_calls[1][2] == "6"
+    assert resumed_report.pending_promotion is None
+    assert resumed_report.promoted_rounds == (1,)
+    attempts = resumed_report.rounds[0].promotion_attempts
+    assert [attempt["execution_id"] for attempt in attempts] == [
+        "exec-orig",
+        "exec-orig",
+        "exec-alt",
+    ]
+    assert attempts[-1]["device_id"] == "6"
+    assert target_path.read_text(encoding="utf-8").find("T.Kernel(2)") >= 0
+
+
+def test_campaign_resume_retries_pending_candidate_before_new_rounds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A resumed campaign retries the saved candidate without regenerating it."""
+    anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 3.0),)
+    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),)
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    ckpt_path = tmp_path / "ckpt_resume_pending.json"
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [_IMPROVED_REGIME_A] * 4,
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Resume promotion",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": _IMPROVED_REGIME_A,
+                    }
+                )
+            ]
+            * 2,
+        }
+    )
+
+    def _l2_fast(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            lat = 5.0 if "T.Kernel(2)" in src else 12.0
+            out[cid] = _make_surrogate_result(
+                cid, "attention_residual", tuple(active_anchors), {2: lat}
+            )
+        return out
+
+    first_runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="attention_residual", max_rounds=2),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_fast,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(
+            passed=False,
+            failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+            execution_id="exec-pending",
+            run_id="run-pending",
+            error_message="timeout",
+        ),
+        checkpoint_path=ckpt_path,
+    )
+    first = asyncio.run(first_runner.run())
+    assert first.pending_promotion is not None
+    pending_source = first.pending_promotion.candidate_source
+
+    retried: list[str] = []
+    resume_calls: list[tuple[str, str]] = []
+
+    def _l3_resume(
+        *,
+        operator_name: str,
+        candidate_module_path: Path,
+        source_root: Path,
+        env_file: Path | None,
+        device_id: str,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+    ) -> L3AcceptanceResult:
+        _ = (operator_name, source_root, env_file, device_id)
+        retried.append(candidate_module_path.read_text(encoding="utf-8"))
+        resume_calls.append((resume_execution_id, resume_run_id))
+        return L3AcceptanceResult(
+            passed=True,
+            run_id="run-retried",
+            execution_id="exec-retried",
+            receipt_path="/receipt-retried.json",
+        )
+
+    monkeypatch.setattr(
+        campaign_runner,
+        "run_l3_full_contract_via_agent_gates",
+        _l3_resume,
+    )
+
+    second_runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="attention_residual", max_rounds=1),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=MockLLMBackend(responses={}),
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_fast,
+        checkpoint_path=ckpt_path,
+    )
+    resumed = asyncio.run(second_runner.run(resume=True))
+    assert retried == [pending_source]
+    assert resume_calls == [("exec-pending", "run-pending")]
+    assert resumed.promotion_blocked is False
+    assert resumed.pending_promotion is None
+    assert resumed.promoted_rounds == (1,)
+    assert resumed.rolled_back_rounds == ()
+    assert resumed.total_rounds == 1
+    assert target_path.read_text(encoding="utf-8") == pending_source
+    saved = json.loads(ckpt_path.read_text(encoding="utf-8"))
+    assert saved["pending_promotion"] is None
+    assert saved["promoted_rounds"] == [1]
+
+
+def test_campaign_failed_final_l4_does_not_catch_up(tmp_path: Path) -> None:
+    """A failed official L4 blocks per-case catch-up rounds and formal scoring."""
+    anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 3.0),)
+    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),)
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    backend = MockLLMBackend(
+        responses={
+            "exploit_rule": [_IMPROVED_REGIME_A] * 2,
+            "explore_creative": [
+                json.dumps(
+                    {
+                        "physical_hypothesis": "Final L4 failure",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": _IMPROVED_REGIME_A,
+                    }
+                )
+            ]
+            * 2,
+        }
+    )
+
+    def _l2_fast(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            lat = 5.0 if "T.Kernel(2)" in src else 12.0
+            out[cid] = _make_surrogate_result(
+                cid, "attention_residual", tuple(active_anchors), {2: lat}
+            )
+        return out
+
+    l4_calls: list[Path] = []
+
+    def _l4_fail(path: Path) -> L4CannbenchResult:
+        l4_calls.append(path)
+        return L4CannbenchResult(
+            passed=False,
+            per_case_speedups={2: 1.5, 5: 0.50},
+            error_message="official_final.json missing",
+            failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        )
+
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=1,
+            run_final_l4=True,
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        llm_backend=backend,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_fast,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        l4_cannbench_runner=_l4_fail,
+        checkpoint_path=tmp_path / "ckpt_l4_failed.json",
+    )
+    report = asyncio.run(runner.run())
+    assert l4_calls == [target_path]
+    assert report.total_rounds == 1
+    assert report.l4_result is not None
+    assert report.l4_result.passed is False
+    assert report.stop_reason == "budget_exhausted"
+
+
+def test_campaign_pending_l4_resumes_same_execution_and_card(tmp_path: Path) -> None:
+    """A timed-out L4 keeps its execution/card identity and is continued, not resubmitted."""
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    ckpt_path = tmp_path / "ckpt_l4_pending.json"
+
+    def _l4_pending(path: Path, *, device_id: str = "", on_execution_started=None):
+        _ = device_id
+        assert on_execution_started is not None
+        on_execution_started("exec-l4", "5")
+        return L4CannbenchResult(
+            passed=False,
+            error_message="wait timed out",
+            failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+            execution_id="exec-l4",
+            device_id="5",
+            state="RUNNING",
+            execution_terminal=False,
+            target_path=str(path),
+        )
+
+    first = _single_round_promotion_runner(
+        tmp_path,
+        target_path=target_path,
+        checkpoint_path=ckpt_path,
+        l3_runner=lambda _p, **_kw: L3AcceptanceResult(passed=True),
+        l4_runner=_l4_pending,
+        run_final_l4=True,
+    )
+    report = asyncio.run(first.run())
+    pending = report.pending_l4
+    assert pending is not None
+    assert pending.execution_id == "exec-l4"
+    assert pending.device_id == "5"
+    assert pending.execution_terminal is False
+    assert report.l4_result is not None and report.l4_result.passed is False
+    assert "T.Kernel(2)" in target_path.read_text(encoding="utf-8")
+    saved = json.loads(ckpt_path.read_text(encoding="utf-8"))
+    assert saved["pending_l4"]["execution_id"] == "exec-l4"
+    assert saved["pending_l4"]["device_id"] == "5"
+    assert saved["pending_l4"]["execution_terminal"] is False
+
+    calls: list[tuple[str, str, str]] = []
+
+    def _l4_resume(
+        path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        _ = on_execution_started
+        calls.append(
+            (path.read_text(encoding="utf-8"), resume_execution_id, device_id)
+        )
+        assert resume_run_id == ""
+        return L4CannbenchResult(
+            passed=True,
+            per_case_speedups={2: 4.0},
+            per_case_elapsed_us={2: 12.5},
+            execution_id=resume_execution_id,
+            device_id=device_id,
+            official_report_valid=True,
+            all_cases_passed=True,
+            all_timings_valid=True,
+            case_count=1,
+            passed_cases=1,
+        )
+
+    resumed = _single_round_promotion_runner(
+        tmp_path,
+        target_path=target_path,
+        checkpoint_path=ckpt_path,
+        l3_runner=lambda _p, **_kw: L3AcceptanceResult(passed=True),
+        l4_runner=_l4_resume,
+        run_final_l4=True,
+        backend=MockLLMBackend(responses={}),
+    )
+    resumed_report = asyncio.run(resumed.run(resume=True))
+    assert calls == [(target_path.read_text(encoding="utf-8"), "exec-l4", "5")]
+    assert resumed_report.pending_l4 is None
+    assert resumed_report.l4_result is not None
+    assert resumed_report.l4_result.passed is True
+    assert resumed_report.l4_result.device_id == "5"
+    assert "T.Kernel(2)" in target_path.read_text(encoding="utf-8")
+
+
+def test_campaign_terminal_l4_infrastructure_retries_fresh_whole_run(tmp_path: Path) -> None:
+    """A terminal L4 infrastructure fault retries once on another card with no stitched timings."""
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    ckpt_path = tmp_path / "ckpt_l4_retry.json"
+
+    def _l4_pending(path: Path, *, device_id: str = "", on_execution_started=None):
+        _ = device_id
+        assert on_execution_started is not None
+        on_execution_started("exec-l4", "5")
+        return L4CannbenchResult(
+            passed=False,
+            error_message="wait timed out",
+            failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+            execution_id="exec-l4",
+            device_id="5",
+            state="RUNNING",
+            execution_terminal=False,
+            target_path=str(path),
+        )
+
+    first = _single_round_promotion_runner(
+        tmp_path,
+        target_path=target_path,
+        checkpoint_path=ckpt_path,
+        l3_runner=lambda _p, **_kw: L3AcceptanceResult(passed=True),
+        l4_runner=_l4_pending,
+        run_final_l4=True,
+    )
+    asyncio.run(first.run())
+
+    calls: list[tuple[str, str]] = []
+
+    def _l4_retry(
+        path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        _ = (path, resume_run_id)
+        calls.append((resume_execution_id, device_id))
+        if resume_execution_id:
+            return L4CannbenchResult(
+                passed=False,
+                per_case_speedups={2: 99.0},
+                error_message="device lost",
+                failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+                execution_id=resume_execution_id,
+                device_id="5",
+                state="INTERRUPTED",
+                execution_terminal=True,
+            )
+        assert device_id == "6"
+        assert on_execution_started is not None
+        on_execution_started("exec-l4-alt", "6")
+        return L4CannbenchResult(
+            passed=True,
+            per_case_speedups={2: 4.0},
+            per_case_elapsed_us={2: 12.5},
+            execution_id="exec-l4-alt",
+            device_id="6",
+            official_report_valid=True,
+            all_cases_passed=True,
+            all_timings_valid=True,
+            case_count=1,
+            passed_cases=1,
+        )
+
+    resumed = _single_round_promotion_runner(
+        tmp_path,
+        target_path=target_path,
+        checkpoint_path=ckpt_path,
+        l3_runner=lambda _p, **_kw: L3AcceptanceResult(passed=True),
+        l4_runner=_l4_retry,
+        run_final_l4=True,
+        retry_device_id="6",
+        backend=MockLLMBackend(responses={}),
+    )
+    resumed_report = asyncio.run(resumed.run(resume=True))
+    assert calls == [("exec-l4", "5"), ("", "6")]
+    assert resumed_report.pending_l4 is None
+    assert resumed_report.l4_result is not None
+    assert resumed_report.l4_result.passed is True
+    assert resumed_report.l4_result.device_id == "6"
+    assert resumed_report.l4_result.per_case_speedups == {2: 4.0}
+    assert "T.Kernel(2)" in target_path.read_text(encoding="utf-8")
 
 
 def test_campaign_atomic_checkpoint_and_exact_resume_plus_l4_catch(
@@ -3294,77 +4275,6 @@ def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
     )
     stall_metrics = _extract_msprof_metrics(stall_prof)
     assert abs(float(stall_metrics["sync_stall_ratio"]) - 0.65) < 1e-6
-
-
-def test_l3_full_contract_via_agent_gates_timeout_and_target_module_env(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """Verify L3 AgentGates helper passes timeout_sec and candidate module env vars cleanly."""
-    import subprocess  # noqa: PLC0415
-    from tilefoundry_ascend.agent.campaign import surrogate_cannbench  # noqa: PLC0415
-
-    fake_env = tmp_path / "env.sh"
-    fake_env.write_text("TILEFOUNDRY_NPU_CANNBENCH_REPO=/tmp/cb\n", encoding="utf-8")
-    cand_mod = tmp_path / "cand_kernels.py"
-    cand_mod.write_text("x = 1\n", encoding="utf-8")
-    captured: dict[str, object] = {}
-
-    def _fake_subprocess_run(cmd, *, text, capture_output, cwd, env, timeout):
-        _ = (text, capture_output, cwd)
-        captured["cmd"] = list(cmd)
-        captured["env"] = dict(env)
-        captured["timeout"] = timeout
-        env_file_arg = cmd[list(cmd).index("--env-file") + 1]
-        captured["env_text"] = Path(env_file_arg).read_text(encoding="utf-8")
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=0,
-            stdout=json.dumps({"status": "PASS", "runId": "r_l3", "receiptPath": "/tmp/r_l3.json"}),
-            stderr="",
-        )
-
-    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_subprocess_run)
-    monkeypatch.setattr(surrogate_cannbench, "_resolve_env_file_path", lambda _p: fake_env)
-    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "/tmp/ag")
-    monkeypatch.setattr(surrogate_cannbench, "resolve_cannbench_repo", lambda **_kw: tmp_path)
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "verify_agent_gates_receipt",
-        lambda *_a, **_kw: (True, ""),
-    )
-
-    def _make_shim(path, **_kw):
-        shim = Path(path)
-        shim.mkdir(parents=True, exist_ok=True)
-        return shim
-
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "ensure_npu_compare_shim_dir",
-        _make_shim,
-    )
-
-    l3_res = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
-        operator_name="attention_residual",
-        candidate_module_path=cand_mod,
-        source_root=tmp_path,
-        env_file=fake_env,
-        device_id="2",
-        timeout_sec=123,
-    )
-    assert l3_res.passed is True
-    assert l3_res.run_id == "r_l3"
-    assert captured["timeout"] == 123
-    env_sent = captured["env"]
-    assert env_sent["TF_L3_TARGET_OPERATOR"] == "attention_residual"
-    assert env_sent["TF_L3_TARGET_MODULE_PATH"] == str(cand_mod.resolve())
-    assert env_sent["TF_SURROGATE_TL_CACHE_DIR"]
-    assert "--device-id" in captured["cmd"] and "2" in captured["cmd"]
-    assert captured["cmd"][captured["cmd"].index("--gate") + 1] == "tilefoundry-npu-device-fast"
-    env_text = str(captured["env_text"])
-    assert "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE=1" in env_text
-    assert "TILEFOUNDRY_NPU_CPU_TESTS" not in env_text
 
 
 def test_run_l0_l1_round_filter_isolates_syntax_repair_timeout(tmp_path: Path) -> None:

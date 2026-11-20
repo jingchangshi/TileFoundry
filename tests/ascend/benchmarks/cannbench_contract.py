@@ -1,7 +1,12 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd.
-# Shared Helix precision harness adapted from CANNBench
-# e90a053df93997e026d19fd4fd42fc03cbf2b2fd.
-# See CANN_CONTRACT_LICENSE. No CANNBench API dependency at runtime.
+"""Shared Helix precision harness adapted from CANNBench.
+
+Copyright (c) 2026 Huawei Technologies Co., Ltd.
+
+Adapted from CANNBench e90a053df93997e026d19fd4fd42fc03cbf2b2fd modules
+``utils/dtype_mapper.py``, ``data/data_generator.py``,
+``utils/param_builder.py`` and ``eval/index_check.py``. See
+CANN_CONTRACT_LICENSE; there is no CANNBench API dependency at runtime.
+"""
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from inspect import Parameter, signature
 from pathlib import Path
@@ -16,12 +21,12 @@ import os
 import platform
 import re
 import shutil
+import sys
 import tempfile
 import torch
 import yaml
 
 
-# Adapted source: utils/dtype_mapper.py
 DTYPE_MAP: Dict = {}
 DTYPE_STR_MAP: Dict = {}
 
@@ -76,7 +81,6 @@ def get_supported_dtypes() -> list:
         DTYPE_MAP = _build_dtype_map()
     return list(DTYPE_MAP.keys())
 
-# Adapted source: data/data_generator.py
 INPUT_DISTRIBUTIONS = {'uniform': ('uniform', 'u'), 'normal': ('normal', 'norm', 'gaussian', 'n')}
 _DIST_ALIASES = {a: canon for canon, aliases in INPUT_DISTRIBUTIONS.items() for a in aliases}
 INPUT_DIST_CHOICES = sorted(_DIST_ALIASES)
@@ -379,7 +383,6 @@ class DataGenerator:
                     self._generate_tensors(sub_item, sub_d, sub_vr_item, sub_list, generator=generator)
                 output.append(sub_list)
 
-# Adapted source: utils/param_builder.py
 class ParamBuilder:
 
     def __init__(self, importer=None):
@@ -534,7 +537,6 @@ class ParamBuilder:
                 pass
         return value
 
-# Adapted source: eval/index_check.py
 def _as_list(outputs: Any) -> List[Any]:
     if isinstance(outputs, (list, tuple)):
         return list(outputs)
@@ -740,7 +742,11 @@ def load_cases(task_dir, task):
         result.append(Case(case_num=raw['case_id'], label=f"{task}_{raw['case_id']}",
             input_shapes=shapes, dtypes=dtypes, attrs=raw.get('attrs') or {},
             value_ranges=raw.get('value_range') or []))
-    assert result and len({c.case_num for c in result}) == len(result)
+    assert result
+    case_ids = [case.case_num for case in result]
+    assert len(set(case_ids)) == len(case_ids), f'{task}: duplicate case_id in cases.yaml'
+    labels = [case.get_case_id_str() for case in result]
+    assert len(set(labels)) == len(labels), f'{task}: duplicate case label in cases.yaml'
     return result
 
 
@@ -762,17 +768,151 @@ def outputs(value):
     raise AssertionError(f'Unsupported output type: {type(value).__name__}')
 
 
+class ReferenceCacheError(RuntimeError):
+    """Required reference cache could not be used for a promotion run."""
+
+    def __init__(self, message, observation):
+        super().__init__(message)
+        self.observation = observation
+
+
+def reference_cache_error_category(error):
+    """Classify a required-cache failure as environment block subcategory."""
+    return 'reference_cache_error' if 'write failed' in str(error) else 'reference_cache_unavailable'
+
+
+class _ClassifiedHarnessFailure(AssertionError):
+    """Aggregate failure whose per-case structured evidence is already recorded."""
+
+    l3_failure_classified = True
+
+
+def _comparison_failure(node, case_id, role, details):
+    """Build the structured comparator result without inferring from message text."""
+    comparisons = []
+    for row in details:
+        if not isinstance(row, dict):
+            continue
+        comparisons.append({
+            'output': row.get('output'),
+            'passed': bool(row.get('passed')),
+            'message': ' '.join(str(row.get('message') or '').split())[:800],
+        })
+    if not comparisons:
+        comparisons = [{
+            'output': None,
+            'passed': False,
+            'message': 'comparator returned a deviation without output details',
+        }]
+    detail = json.dumps(comparisons, sort_keys=True)[:800]
+    return {
+        'kind': 'candidate' if role == 'candidate' else 'infrastructure',
+        'category': 'numeric' if role == 'candidate' else 'baseline_mismatch',
+        'stage': 'comparison',
+        'node': node,
+        'case': case_id,
+        'role': role,
+        'comparator': 'cannbench',
+        'references': ['oracle', 'native'],
+        'comparisons': comparisons,
+        'exceptionType': None,
+        'detail': detail,
+    }
+
+
+def _exception_failure(node, case_id, stage, error):
+    """Build an infrastructure failure for a kernel/prepare/comparator exception."""
+    detail = f'{type(error).__name__}: {error}'
+    return {
+        'kind': 'infrastructure',
+        'category': 'assertion' if isinstance(error, AssertionError) else 'exception',
+        'stage': stage,
+        'node': node,
+        'case': case_id,
+        'role': None,
+        'comparator': None,
+        'references': [],
+        'comparisons': [],
+        'exceptionType': type(error).__name__,
+        'detail': ' '.join(detail.split())[:800],
+    }
+
+
 class ReferenceCache:
-    """Five disk entries, with an exclusive lease per active operator test."""
+    """Five disk entries, with an exclusive lease per active operator test.
+
+    ``CANNBENCH_CACHE_MODE`` selects ``off``, ``optional`` or ``required``.
+    Required mode reports an unusable cache as :class:`ReferenceCacheError`
+    instead of silently computing without persistence, and refuses to lose a
+    successfully computed reference value on a failed write.  Hits, misses,
+    writes and errors are observable through :meth:`observation`.
+    """
     LIMIT = 5
     DEFAULT_ROOT = 'off'
+    MODE_ENV = 'CANNBENCH_CACHE_MODE'
+    EXPECTATION_ENV = 'TF_L3_CACHE_EXPECTATION'
+    MODES = ('off', 'optional', 'required')
+    KINDS = ('oracle', 'native')
 
     def __init__(self, harness):
         self.harness = harness
         self.folder = None
         self.lease = None
-        self.hits = self.misses = 0
+        self.hits = self.misses = self.writes = 0
         self.generations = {}
+        self.mode = self._resolve_mode()
+        self.expectation = self._resolve_expectation()
+        self.usable = self.mode == 'off'
+        self.errors = []
+        self.by_kind = {kind: {'hits': 0, 'misses': 0, 'writes': 0} for kind in self.KINDS}
+
+    def _resolve_mode(self):
+        raw = os.environ.get(self.MODE_ENV, '').strip().lower()
+        if not raw:
+            location = os.environ.get('CANNBENCH_CACHE_DIR', self.DEFAULT_ROOT)
+            return 'off' if location == 'off' else 'optional'
+        if raw not in self.MODES:
+            raise ValueError(f'{self.MODE_ENV} must be one of {self.MODES}, got {raw!r}')
+        return raw
+
+    def _resolve_expectation(self):
+        raw = os.environ.get(self.EXPECTATION_ENV, 'any').strip().lower() or 'any'
+        if raw not in ('cold', 'warm', 'any'):
+            raise ValueError(f'{self.EXPECTATION_ENV} must be cold, warm or any, got {raw!r}')
+        return raw
+
+    def observation(self):
+        """Return the cache policy and the observed hit/miss/write counters."""
+        return {
+            'mode': self.mode,
+            'required': self.mode == 'required',
+            'expectation': self.expectation,
+            'usable': self.usable,
+            'location': os.environ.get('CANNBENCH_CACHE_DIR', self.DEFAULT_ROOT),
+            'hits': self.hits, 'misses': self.misses, 'writes': self.writes,
+            'errors': list(self.errors),
+            'byKind': {kind: dict(counters) for kind, counters in self.by_kind.items()},
+        }
+
+    def _unavailable(self, detail):
+        message = f'reference cache unavailable: {detail}'
+        self.errors.append(message)
+        self.usable = False
+        self._release()
+        print(f'[reference-cache] {message}', flush=True)
+        if self.mode == 'required':
+            raise ReferenceCacheError(message, self.observation())
+        return self
+
+    def _release(self):
+        if self.folder is not None:
+            try:
+                os.utime(self.folder, None)
+            except OSError:
+                pass
+        if self.lease is not None:
+            self.lease.close()
+        self.folder = self.lease = None
 
     def identity(self):
         versions = {}
@@ -811,8 +951,10 @@ class ReferenceCache:
 
     def __enter__(self):
         location = os.environ.get('CANNBENCH_CACHE_DIR', self.DEFAULT_ROOT)
-        if location == 'off':
+        if self.mode == 'off':
             return self
+        if location == 'off':
+            return self._unavailable('CANNBENCH_CACHE_DIR is off')
         try:
             if not re.fullmatch(r'level[1-9][0-9]*/[a-z][a-z0-9_]*', self.harness.task):
                 raise ValueError('Invalid cache task')
@@ -826,7 +968,7 @@ class ReferenceCache:
                 fcntl.flock(guard, fcntl.LOCK_EX)
                 self.lease = self.acquire(locks / (key + '.lock'))
                 if self.lease is None:
-                    return self
+                    return self._unavailable('another process holds the operator lease')
                 folder = entries / key
                 if not folder.exists():
                     occupied = sorted(entries.iterdir(), key=lambda p: p.stat().st_mtime_ns)
@@ -841,9 +983,7 @@ class ReferenceCache:
                                 occupied.remove(old)
                                 break
                         else:
-                            self.lease.close()
-                            self.lease = None
-                            return self
+                            return self._unavailable('cache entry limit reached with all entries leased')
                 manifest = folder / 'identity.json'
                 try:
                     previous = json.loads(manifest.read_text())
@@ -857,24 +997,25 @@ class ReferenceCache:
                     folder.mkdir()
                     manifest.write_text(json.dumps({'task': self.harness.task, 'identity': self.signature}))
                 self.folder = folder
+                self.usable = True
                 os.utime(folder, None)
         except (OSError, ValueError) as error:
-            print(f'[reference-cache] unavailable: {error}', flush=True)
-            self.__exit__(None, None, None)
+            return self._unavailable(f'{type(error).__name__}: {error}')
         return self
 
     def __exit__(self, *unused):
-        if self.folder is not None:
-            try:
-                os.utime(self.folder, None)
-            except OSError:
-                pass
-        if self.lease is not None:
-            self.lease.close()
-        print(f'[reference-cache] hits={self.hits} misses={self.misses} active={self.folder is not None}', flush=True)
-        self.folder = self.lease = None
+        self._release()
+        print(f'[reference-cache] hits={self.hits} misses={self.misses} writes={self.writes} '
+              f'active={self.usable and self.mode != "off"} errors={len(self.errors)}', flush=True)
 
     def get(self, case, kind, compute):
+        """Return the cached value, computing it on a miss when the cache is active.
+
+        Errors raised by ``compute`` propagate to the caller's precision failure
+        path instead of being converted into a cache miss.
+        """
+        if kind not in self.KINDS:
+            raise ValueError(f'unknown reference kind {kind!r}')
         if self.folder is None:
             return compute()
         name = hashlib.sha256(case.get_case_id_str().encode()).hexdigest() + '.' + kind + '.pt'
@@ -891,14 +1032,15 @@ class ReferenceCache:
             if kind == 'oracle':
                 self.generations[case.get_case_id_str()] = record['generation']
             self.hits += 1
+            self.by_kind[kind]['hits'] += 1
             os.utime(self.folder, None)
             return value
         except FileNotFoundError:
             pass
         except Exception as error:
             print(f'[reference-cache] rebuilding {case.get_case_id_str()} {kind}: {type(error).__name__}', flush=True)
-        # Reference failures must propagate to the normal precision failure path.
         self.misses += 1
+        self.by_kind[kind]['misses'] += 1
         value = compute()
         if kind == 'oracle':
             self.generations[case.get_case_id_str()] = os.urandom(16).hex()
@@ -910,9 +1052,19 @@ class ReferenceCache:
                         'generation': self.generations.get(case.get_case_id_str()),
                         'value': map_tensors(value, lambda x: x.detach().cpu())}, temporary)
             os.replace(temporary, path)
-            os.utime(self.folder, None)
+            self.writes += 1
+            self.by_kind[kind]['writes'] += 1
+            try:
+                os.utime(self.folder, None)
+            except OSError:
+                pass
         except Exception as error:
-            print(f'[reference-cache] write skipped: {type(error).__name__}: {error}', flush=True)
+            message = (f'reference cache write failed for {case.get_case_id_str()} {kind}: '
+                       f'{type(error).__name__}: {error}')
+            self.errors.append(message)
+            print(f'[reference-cache] {message}', flush=True)
+            if self.mode == 'required':
+                raise ReferenceCacheError(message, self.observation()) from error
         finally:
             if temporary is not None:
                 try:
@@ -920,6 +1072,83 @@ class ReferenceCache:
                 except OSError:
                     pass
         return value
+
+
+_COMPARE_CASE_RESULT = None
+_CANNBENCH_SRC_ENV = ('TF_L3_CANNBENCH_REPO', 'CANNBENCH_REPO', 'TILEFOUNDRY_NPU_CANNBENCH_REPO')
+
+
+def _resolve_cannbench_src():
+    """Return the CANNBench ``src`` directory that provides the comparator."""
+    candidates = []
+    for name in _CANNBENCH_SRC_ENV:
+        raw = os.environ.get(name, '').strip()
+        if raw:
+            candidates.append(Path(raw))
+    candidates.append(Path(__file__).resolve().parents[3].parent / 'cann-bench')
+    for candidate in candidates:
+        src = candidate / 'src'
+        if (src / 'kernel_eval' / 'utils' / 'compare.py').is_file():
+            return src
+    return None
+
+
+def _load_compare_case_result():
+    """Load the official comparator, or adapt CANNBench ``compare_tensors``.
+
+    The installed ``npu_compare`` module wins.  Without it, the same
+    ``kernel_eval.utils.compare.compare_tensors`` call is imported directly
+    from the CANNBench checkout the gate passed, so no caller-side shim file or
+    parent ``PYTHONPATH`` is required.
+    """
+    global _COMPARE_CASE_RESULT
+    if _COMPARE_CASE_RESULT is not None:
+        return _COMPARE_CASE_RESULT
+    try:
+        from npu_compare import compare_case_result as official
+        _COMPARE_CASE_RESULT = official
+        return official
+    except ImportError:
+        pass
+    src = _resolve_cannbench_src()
+    if src is None:
+        raise RuntimeError(
+            'CANNBench comparator unavailable: npu_compare is not installed and no '
+            'CANNBench checkout was provided through ' + '/'.join(_CANNBENCH_SRC_ENV)
+        )
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+    from kernel_eval.utils.compare import compare_tensors
+
+    def compare_case_result(*, case_id, actual, golden, inputs=(), compute=True,
+                            accuracy_mode=None, native_ref_operator=None, extra=None):
+        """Compare candidate tensor against golden oracle using CANNBench thresholds."""
+        _ = (case_id, inputs, compute, accuracy_mode)
+        custom_thresholds = (extra or {}).get('precision_thresholds') or {}
+        dtype_str = str(getattr(actual, 'dtype', 'float32')).removeprefix('torch.')
+        res = compare_tensors(
+            actual, golden, dtype=dtype_str, native_output=None,
+            custom_thresholds=custom_thresholds)
+        if not res.passed and native_ref_operator is not None:
+            native_val = native_ref_operator(None)
+            res = compare_tensors(
+                actual, golden, dtype=dtype_str, native_output=native_val,
+                custom_thresholds=custom_thresholds)
+        msg = res.error_msg or (
+            f'MERE={res.mere:.6e}, MARE={res.mare:.6e}, max_diff={res.max_diff:.6e}')
+        return SimpleNamespace(passed=bool(res.passed), message=msg)
+
+    _COMPARE_CASE_RESULT = compare_case_result
+    return compare_case_result
+
+
+def comparator_available():
+    """Return True when the precision comparator can be imported."""
+    try:
+        _load_compare_case_result()
+    except (ImportError, RuntimeError):
+        return False
+    return True
 
 
 class Harness:
@@ -970,9 +1199,13 @@ class Harness:
         return params
 
     def reference_output(self, case, tensors, *, native=False):
+        """Return reference outputs from independent input copies.
+
+        Reference implementations may mutate their inputs, so every execution
+        receives cloned storage before the reference function is called.
+        """
         suffix = '_bench' if native else '_oracle'
         function = getattr(self.reference_module, self.task.rsplit('/', 1)[-1] + suffix, self.reference)
-        # References may mutate inputs; every execution gets independent storage.
         copied = map_tensors(tensors, lambda x: x.clone())
         if not native:
             copied = map_tensors(copied, lambda x: x.double() if x.is_floating_point() else x)
@@ -980,7 +1213,7 @@ class Harness:
             return function(**self.params(case, copied, function))
 
     def compare(self, case, actual, oracle, tensors, native_fn):
-        from npu_compare import compare_case_result
+        compare_case_result = _load_compare_case_result()
         actuals, goldens = outputs(actual), outputs(oracle)
         assert len(actuals) == len(goldens), 'Output count differs from oracle'
         for i, spec in enumerate(self.info.outputs):
@@ -1012,33 +1245,89 @@ class Harness:
         assert ok, message
         return all(row['passed'] for row in details), details
 
-    def run(self, operator_api):
-        with ReferenceCache(self) as cache:
-            self._run(operator_api, cache)
+    def run(self, operator_api, observer=None, *, node=None):
+        """Run every case, reporting per-case progress to *observer*.
 
-    def _run(self, operator_api, cache):
+        ``observer`` is the L3 evidence recorder; ``node`` is the pytest node
+        identity the cases belong to so a partial run keeps case-level
+        attribution in the receipt.
+        """
+        cache = ReferenceCache(self)
+        try:
+            with cache:
+                self._run(operator_api, cache, observer, node)
+        except ReferenceCacheError as error:
+            if observer is not None:
+                observer.environment_block(
+                    reference_cache_error_category(error), str(error)
+                )
+            raise
+        finally:
+            if observer is not None:
+                observer.reference_cache(cache.observation())
+
+    def _run(self, operator_api, cache, observer=None, node=None):
         failures = []
+        node_name = node or self.task
         for case in self.cases:
             label = case.get_case_id_str()
+            if observer is not None:
+                observer.case_started(node_name, label)
+            stage = 'prepare'
             try:
                 def prepare_reference():
+                    nonlocal stage
+                    stage = 'prepare'
                     tensors = self.prepare(case)
+                    stage = 'reference'
                     return {'inputs': tensors, 'oracle': self.reference_output(case, tensors)}
                 bundle = cache.get(case, 'oracle', prepare_reference)
                 tensors, oracle = bundle['inputs'], bundle['oracle']
                 params = self.params(case, map_tensors(tensors, lambda x: x.npu()))
+                stage = 'kernel'
                 actual = operator_api(**params)
+                stage = 'comparison'
                 passed, details = self.compare(case, actual, oracle, tensors,
                     lambda: cache.get(case, 'native',
                         lambda: self.reference_output(case, tensors, native=True)))
                 if not passed:
                     failures.append(label)
                 print(json.dumps({'case': label, 'passed': passed, 'outputs': details}), flush=True)
+                if observer is not None:
+                    observer.case_finished(
+                        node_name,
+                        label,
+                        'passed' if passed else 'failed',
+                        '' if passed else json.dumps(details)[:800],
+                        failure=None if passed else _comparison_failure(
+                            node_name, label, 'candidate', details
+                        ),
+                    )
                 del tensors, oracle, params, actual, bundle
+            except ReferenceCacheError as error:
+                failures.append(label)
+                if observer is not None:
+                    observer.case_finished(node_name, label, 'error', str(cache.observation()))
+                    observer.environment_block(
+                        reference_cache_error_category(error), str(error)
+                    )
+                raise
             except Exception as exc:
                 failures.append(label)
                 print(json.dumps({'case': label, 'passed': False, 'error': str(exc)}), flush=True)
-        assert not failures, f'Failed {len(failures)}/{len(self.cases)} cases: {failures}'
+                if observer is not None:
+                    observer.case_finished(
+                        node_name,
+                        label,
+                        'failed',
+                        f'{type(exc).__name__}: {exc}',
+                        failure=_exception_failure(node_name, label, stage, exc),
+                    )
+        if failures:
+            message = f'Failed {len(failures)}/{len(self.cases)} cases: {failures}'
+            if observer is not None:
+                raise _ClassifiedHarnessFailure(message)
+            raise AssertionError(message)
         print('All tests passed!')
 
     def bench_cases(self):

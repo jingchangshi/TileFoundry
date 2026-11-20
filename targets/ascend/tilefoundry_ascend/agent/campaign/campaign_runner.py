@@ -17,7 +17,7 @@ import tempfile
 import textwrap
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
@@ -41,6 +41,8 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     resolve_regime_for_case,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+    FAILURE_KIND_CANDIDATE,
+    FAILURE_KIND_INFRASTRUCTURE,
     CandidateSurrogateResult,
     L0L1CandidateCheck,
     L3AcceptanceResult,
@@ -151,7 +153,13 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class CampaignConfig:
-    """Configuration controlling stopping policy, escalation, and gate thresholds."""
+    """Configuration controlling stopping policy, escalation, and gate thresholds.
+
+    ``retry_device_id`` names an explicitly authorized, healthy alternate card.
+    A terminal infrastructure failure may be retried there at most once; an
+    empty value keeps the run recoverable for an operator instead of silently
+    changing hardware.
+    """
 
     operator_name: str
     max_rounds: int = 12
@@ -167,6 +175,7 @@ class CampaignConfig:
     run_final_l4: bool = False
     l4_regression_ratio: float = 0.95
     device_id: str = "1"
+    retry_device_id: str = ""
     warmup: int = 3
     repeat: int = 5
     enable_tilesize_prescreen: bool = False
@@ -194,6 +203,7 @@ class CampaignRoundRecord:
     best_round_surrogate_score: float = 0.0
     best_so_far_surrogate_score: float = 0.0
     pruned_rule_ids: tuple[str, ...] = ()
+    promotion_attempts: tuple[dict[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """Serialize CampaignRoundRecord into a JSON-compatible dictionary."""
@@ -214,6 +224,7 @@ class CampaignRoundRecord:
             "stagnation_rounds_after": self.stagnation_rounds_after,
             "admitted_rule_ids": list(self.admitted_rule_ids),
             "pruned_rule_ids": list(self.pruned_rule_ids),
+            "promotion_attempts": [dict(item) for item in self.promotion_attempts],
         }
 
     @classmethod
@@ -242,6 +253,165 @@ class CampaignRoundRecord:
             best_round_surrogate_score=float(payload.get("best_round_surrogate_score", 0.0)),
             best_so_far_surrogate_score=float(payload.get("best_so_far_surrogate_score", 0.0)),
             pruned_rule_ids=tuple(str(x) for x in payload.get("pruned_rule_ids", ())),
+            promotion_attempts=tuple(
+                {str(k): str(v) for k, v in item.items()}
+                for item in payload.get("promotion_attempts", ())
+                if isinstance(item, Mapping)
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class PendingPromotion:
+    """Candidate held for promotion after an infrastructure L3 failure.
+
+    The candidate source and its evaluation survive the failure so a resumed campaign
+    can retry verification without regenerating it. Execution/run IDs and receipts are
+    kept for diagnosis and never reused for a different candidate.
+    """
+
+    candidate_source: str
+    candidate_sha256: str
+    target_path: str
+    round_idx: int
+    regime_tag: str
+    candidate_result: CandidateSurrogateResult
+    candidate_id: str = ""
+    builder_name: str = ""
+    parent_lane: str = ""
+    creative_effort: str = ""
+    execution_id: str = ""
+    run_id: str = ""
+    receipt_path: str = ""
+    error_message: str = ""
+    attempts: tuple[dict[str, str], ...] = ()
+    device_id: str = ""
+    execution_terminal: bool = True
+    retry_used: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize the pending promotion record for the checkpoint and report."""
+        return {
+            "candidate_source": self.candidate_source,
+            "candidate_sha256": self.candidate_sha256,
+            "target_path": self.target_path,
+            "round_idx": self.round_idx,
+            "regime_tag": self.regime_tag,
+            "candidate_result": self.candidate_result.to_dict(),
+            "candidate_id": self.candidate_id,
+            "builder_name": self.builder_name,
+            "parent_lane": self.parent_lane,
+            "creative_effort": self.creative_effort,
+            "execution_id": self.execution_id,
+            "run_id": self.run_id,
+            "receipt_path": self.receipt_path,
+            "error_message": self.error_message,
+            "attempts": [dict(item) for item in self.attempts],
+            "device_id": self.device_id,
+            "execution_terminal": self.execution_terminal,
+            "retry_used": self.retry_used,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> PendingPromotion:
+        """Reconstruct a pending promotion record from a checkpoint mapping."""
+        raw_result = payload.get("candidate_result")
+        if not isinstance(raw_result, Mapping):
+            raise ValueError("pending_promotion.candidate_result must be a mapping")
+        raw_attempts = payload.get("attempts", ())
+        attempts = tuple(
+            {str(k): str(v) for k, v in item.items()}
+            for item in raw_attempts
+            if isinstance(item, Mapping)
+        )
+        return cls(
+            candidate_source=str(payload["candidate_source"]),
+            candidate_sha256=str(payload.get("candidate_sha256", "")),
+            target_path=str(payload.get("target_path", "")),
+            round_idx=int(payload.get("round_idx", 0)),
+            regime_tag=str(payload.get("regime_tag", "")),
+            candidate_result=CandidateSurrogateResult.from_dict(raw_result),
+            candidate_id=str(payload.get("candidate_id", "")),
+            builder_name=str(payload.get("builder_name", "")),
+            parent_lane=str(payload.get("parent_lane", "")),
+            creative_effort=str(payload.get("creative_effort", "")),
+            execution_id=str(payload.get("execution_id", "")),
+            run_id=str(payload.get("run_id", "")),
+            receipt_path=str(payload.get("receipt_path", "")),
+            error_message=str(payload.get("error_message", "")),
+            attempts=attempts,
+            device_id=str(payload.get("device_id", "")),
+            execution_terminal=bool(payload.get("execution_terminal", True)),
+            retry_used=bool(payload.get("retry_used", False)),
+        )
+
+
+@dataclass(frozen=True)
+class PendingL4:
+    """An official L4 execution preserved across wait timeouts and process restarts.
+
+    L4 is never split across cards: a retry on another card is a fresh, complete
+    run. The original execution/run IDs, receipt, card and candidate digest stay
+    attached so an operator can prove what happened.
+    """
+
+    target_path: str
+    candidate_relative: str
+    candidate_sha256: str
+    execution_id: str = ""
+    run_id: str = ""
+    receipt_path: str = ""
+    device_id: str = ""
+    state: str = ""
+    error_message: str = ""
+    failure_kind: str = FAILURE_KIND_INFRASTRUCTURE
+    execution_terminal: bool = True
+    retry_used: bool = False
+    attempts: tuple[dict[str, str], ...] = ()
+    prior_stop_reason: str = ""
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize the pending L4 record for the checkpoint and report."""
+        return {
+            "target_path": self.target_path,
+            "candidate_relative": self.candidate_relative,
+            "candidate_sha256": self.candidate_sha256,
+            "execution_id": self.execution_id,
+            "run_id": self.run_id,
+            "receipt_path": self.receipt_path,
+            "device_id": self.device_id,
+            "state": self.state,
+            "error_message": self.error_message,
+            "failure_kind": self.failure_kind,
+            "execution_terminal": self.execution_terminal,
+            "retry_used": self.retry_used,
+            "attempts": [dict(item) for item in self.attempts],
+            "prior_stop_reason": self.prior_stop_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> PendingL4:
+        """Reconstruct a pending L4 record from a checkpoint mapping."""
+        attempts = tuple(
+            {str(k): str(v) for k, v in item.items()}
+            for item in payload.get("attempts", ())
+            if isinstance(item, Mapping)
+        )
+        return cls(
+            target_path=str(payload.get("target_path", "")),
+            candidate_relative=str(payload.get("candidate_relative", "")),
+            candidate_sha256=str(payload.get("candidate_sha256", "")),
+            execution_id=str(payload.get("execution_id", "")),
+            run_id=str(payload.get("run_id", "")),
+            receipt_path=str(payload.get("receipt_path", "")),
+            device_id=str(payload.get("device_id", "")),
+            state=str(payload.get("state", "")),
+            error_message=str(payload.get("error_message", "")),
+            failure_kind=str(payload.get("failure_kind", FAILURE_KIND_INFRASTRUCTURE)),
+            execution_terminal=bool(payload.get("execution_terminal", True)),
+            retry_used=bool(payload.get("retry_used", False)),
+            attempts=attempts,
+            prior_stop_reason=str(payload.get("prior_stop_reason", "")),
         )
 
 
@@ -262,6 +432,9 @@ class CampaignReport:
     active_anchors: tuple[AnchorCaseSpec, ...] = ()
     admitted_rule_ids: tuple[str, ...] = ()
     l4_result: L4CannbenchResult | None = None
+    pending_promotion: PendingPromotion | None = None
+    pending_l4: PendingL4 | None = None
+    promotion_blocked: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """Serialize CampaignReport into a JSON-compatible dictionary."""
@@ -279,6 +452,11 @@ class CampaignReport:
             "active_anchors": [a.to_dict() for a in self.active_anchors],
             "admitted_rule_ids": list(self.admitted_rule_ids),
             "l4_result": self.l4_result.to_dict() if self.l4_result else None,
+            "pending_promotion": (
+                self.pending_promotion.to_dict() if self.pending_promotion else None
+            ),
+            "pending_l4": self.pending_l4.to_dict() if self.pending_l4 else None,
+            "promotion_blocked": self.promotion_blocked,
         }
 
 
@@ -1389,6 +1567,9 @@ class PerfTargetCampaignRunner:
             self._compile_regime_blueprints()
         )
         self._active_incumbent_source: str = ""
+        self._pending_promotion: PendingPromotion | None = None
+        self._active_promotion: PendingPromotion | None = None
+        self._pending_l4: PendingL4 | None = None
         if (
             self._flywheel is not None
             and self._flywheel._probe_runner is None
@@ -1427,6 +1608,100 @@ class PerfTargetCampaignRunner:
     @staticmethod
     def _source_sha256(source: str) -> str:
         return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+    def _write_source_and_verify(
+        self,
+        path: Path,
+        source: str,
+        *,
+        expected_sha256: str | None = None,
+    ) -> str:
+        """Atomically write source and prove the restored bytes have the expected identity."""
+        expected = expected_sha256 or self._source_sha256(source)
+        _atomic_write_text(path, source)
+        try:
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            return f"restored module {path} cannot be read back: {exc}"
+        if actual != expected:
+            return (
+                f"restored module {path} digest {actual} does not match expected {expected}"
+            )
+        return ""
+
+    def _ensure_candidate_bytes(
+        self,
+        *,
+        path: Path,
+        source: str,
+        expected_sha256: str,
+    ) -> str:
+        """Leave the exact submitted candidate at its path, even after a crash.
+
+        An active worker may still be testing this path; restoring the incumbent
+        here would swap the code under it. If the bytes drifted, put the original
+        candidate back and prove the digest before any resume.
+        """
+        expected = expected_sha256 or self._source_sha256(source)
+        try:
+            current = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            current = ""
+        if current == expected:
+            return ""
+        error = self._write_source_and_verify(path, source, expected_sha256=expected)
+        if error:
+            return error
+        return ""
+
+    def _persist_runtime_state(
+        self,
+        key: str,
+        value: Mapping[str, object] | None,
+    ) -> None:
+        """Upsert a recoverable execution record before a long V2 wait starts.
+
+        The campaign checkpoint also carries round state; this read-modify-write
+        adds only ``key`` so a process killed during submit/wait still leaves the
+        exact execution and candidate identity on disk.
+        """
+        if self._checkpoint_path is None:
+            return
+        payload: dict[str, object] = {}
+        if self._checkpoint_path.is_file():
+            try:
+                loaded = json.loads(self._checkpoint_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, Mapping):
+                    payload = dict(loaded)
+            except (OSError, ValueError):
+                payload = {}
+        payload[key] = dict(value) if value is not None else None
+        _atomic_write_text(
+            self._checkpoint_path,
+            json.dumps(payload, indent=2) + "\n",
+        )
+
+    @staticmethod
+    def _invoke_with_optional_kwargs(
+        runner: Callable[..., object],
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        """Pass only the optional keywords an injected runner actually accepts."""
+        try:
+            signature = inspect.signature(runner)
+        except (TypeError, ValueError):
+            return runner(*args)
+        accepts_any = any(
+            param.kind is inspect.Parameter.VAR_KEYWORD
+            for param in signature.parameters.values()
+        )
+        accepted = {
+            name: value
+            for name, value in kwargs.items()
+            if accepts_any or name in signature.parameters
+        }
+        return runner(*args, **accepted)
 
     def _derive_topology_axes(
         self,
@@ -1919,26 +2194,90 @@ class PerfTargetCampaignRunner:
         )
         return results
 
-    def _run_l3_contract(self, module_path: Path) -> L3AcceptanceResult:
+    def _run_l3_contract(
+        self,
+        module_path: Path,
+        *,
+        device_id: str | None = None,
+        on_execution_started: Callable[[str, str], None] | None = None,
+    ) -> L3AcceptanceResult:
+        requested_device = str(device_id or self._config.device_id)
         if self._l3_contract_runner is not None:
-            return self._l3_contract_runner(module_path)
-        return run_l3_full_contract_via_agent_gates(
+            return self._invoke_with_optional_kwargs(
+                self._l3_contract_runner,
+                module_path,
+                device_id=requested_device,
+                on_execution_started=on_execution_started,
+            )  # type: ignore[return-value]
+        return self._invoke_with_optional_kwargs(
+            run_l3_full_contract_via_agent_gates,
             operator_name=self._config.operator_name,
             candidate_module_path=module_path,
             source_root=self._source_root,
             env_file=self._env_file,
-            device_id=self._config.device_id,
-        )
+            device_id=requested_device,
+            on_execution_started=on_execution_started,
+        )  # type: ignore[return-value]
 
-    def _run_l4_cannbench(self, module_path: Path) -> L4CannbenchResult:
-        if self._l4_cannbench_runner is not None:
-            return self._l4_cannbench_runner(module_path)
-        return run_l4_official_cannbench_via_agent_gates(
+    def _resume_l3_contract(
+        self,
+        module_path: Path,
+        pending: PendingPromotion,
+        *,
+        on_execution_started: Callable[[str, str], None] | None = None,
+    ) -> L3AcceptanceResult:
+        """Continue the saved L3 execution instead of submitting a duplicate."""
+        if self._l3_contract_runner is not None:
+            return self._invoke_with_optional_kwargs(
+                self._l3_contract_runner,
+                module_path,
+                resume_execution_id=pending.execution_id,
+                resume_run_id=pending.run_id,
+                device_id=pending.device_id or self._config.device_id,
+                on_execution_started=on_execution_started,
+            )  # type: ignore[return-value]
+        return self._invoke_with_optional_kwargs(
+            run_l3_full_contract_via_agent_gates,
             operator_name=self._config.operator_name,
+            candidate_module_path=module_path,
             source_root=self._source_root,
             env_file=self._env_file,
-            device_id=self._config.device_id,
-        )
+            device_id=pending.device_id or self._config.device_id,
+            resume_execution_id=pending.execution_id,
+            resume_run_id=pending.run_id,
+            on_execution_started=on_execution_started,
+        )  # type: ignore[return-value]
+
+    def _run_l4_cannbench(
+        self,
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str | None = None,
+        on_execution_started: Callable[[str, str], None] | None = None,
+    ) -> L4CannbenchResult:
+        requested_device = str(device_id or self._config.device_id)
+        if self._l4_cannbench_runner is not None:
+            return self._invoke_with_optional_kwargs(
+                self._l4_cannbench_runner,
+                module_path,
+                resume_execution_id=resume_execution_id,
+                resume_run_id=resume_run_id,
+                device_id=requested_device,
+                on_execution_started=on_execution_started,
+            )  # type: ignore[return-value]
+        return self._invoke_with_optional_kwargs(
+            run_l4_official_cannbench_via_agent_gates,
+            operator_name=self._config.operator_name,
+            candidate_module_path=module_path,
+            source_root=self._source_root,
+            env_file=self._env_file,
+            device_id=requested_device,
+            resume_execution_id=resume_execution_id,
+            resume_run_id=resume_run_id,
+            on_execution_started=on_execution_started,
+        )  # type: ignore[return-value]
 
     def _is_regime_satisfied(
         self,
@@ -2828,9 +3167,14 @@ class PerfTargetCampaignRunner:
         l4_result: L4CannbenchResult | None,
         stagnation_by_regime: Mapping[str, int] | None = None,
         last_unpromoted_regime: str | None = None,
+        pending_promotion: PendingPromotion | None = None,
+        pending_l4: PendingL4 | None = None,
     ) -> None:
         if self._checkpoint_path is None:
             return
+        active_promotion = self._active_promotion
+        promotion = active_promotion or pending_promotion or self._pending_promotion
+        pending_l4_record = pending_l4 or self._pending_l4
         payload = {
             "version": 1,
             "run_id": self._run_id,
@@ -2861,6 +3205,13 @@ class PerfTargetCampaignRunner:
             },
             "stop_reason": stop_reason,
             "l4_result": l4_result.to_dict() if l4_result else None,
+            "pending_promotion": promotion.to_dict() if promotion is not None else None,
+            "active_promotion": (
+                active_promotion.to_dict() if active_promotion is not None else None
+            ),
+            "pending_l4": (
+                pending_l4_record.to_dict() if pending_l4_record is not None else None
+            ),
         }
         _atomic_write_text(
             self._checkpoint_path,
@@ -2884,14 +3235,24 @@ class PerfTargetCampaignRunner:
         list[str],
         dict[str, int],
         str | None,
+        PendingPromotion | None,
+        PendingL4 | None,
     ]:
+        """Rehydrate campaign state and re-prove the bytes a live execution owns.
+
+        An ``active_promotion`` record was persisted by the submission callback
+        and owns the live execution identity even when the round-level pending
+        record still describes an earlier attempt. A non-terminal execution
+        keeps exactly the source it was submitted against; replacing it with
+        the incumbent would silently change the code under a queued or running
+        worker.
+        """
         assert self._checkpoint_path is not None
         payload = json.loads(self._checkpoint_path.read_text(encoding="utf-8"))
         saved_run_id = payload.get("run_id")
         if isinstance(saved_run_id, str) and saved_run_id.strip():
             self._run_id = saved_run_id.strip()
         incumbent_source = str(payload["incumbent_source"])
-        _atomic_write_text(self._target_module_path, incumbent_source)
         if self._campaign_kb_path is not None and self._campaign_kb_path.is_file():
             for rule in load_seed_rules(self._campaign_kb_path):
                 self._tracker.admit_rule(rule)
@@ -2935,6 +3296,44 @@ class PerfTargetCampaignRunner:
                     stagnation_by_regime[fallback_tag] = legacy_stag
         raw_last_unpromoted = payload.get("last_unpromoted_regime")
         last_unpromoted_regime = str(raw_last_unpromoted) if raw_last_unpromoted else None
+        raw_pending = payload.get("pending_promotion")
+        pending_promotion = (
+            PendingPromotion.from_dict(raw_pending)
+            if isinstance(raw_pending, Mapping)
+            else None
+        )
+        raw_active = payload.get("active_promotion")
+        active_promotion = (
+            PendingPromotion.from_dict(raw_active)
+            if isinstance(raw_active, Mapping)
+            else None
+        )
+        if active_promotion is not None:
+            pending_promotion = active_promotion
+        raw_pending_l4 = payload.get("pending_l4")
+        pending_l4 = (
+            PendingL4.from_dict(raw_pending_l4)
+            if isinstance(raw_pending_l4, Mapping)
+            else None
+        )
+        if pending_promotion is not None and not pending_promotion.execution_terminal:
+            restore_error = self._ensure_candidate_bytes(
+                path=self._target_module_path,
+                source=pending_promotion.candidate_source,
+                expected_sha256=pending_promotion.candidate_sha256,
+            )
+        elif pending_l4 is not None and not pending_l4.execution_terminal:
+            restore_error = self._ensure_candidate_bytes(
+                path=self._target_module_path,
+                source=incumbent_source,
+                expected_sha256=pending_l4.candidate_sha256,
+            )
+        else:
+            restore_error = self._write_source_and_verify(
+                self._target_module_path, incumbent_source
+            )
+        if restore_error:
+            raise RuntimeError(restore_error)
         return (
             incumbent_source,
             CandidateSurrogateResult.from_dict(payload["baseline_result"]),
@@ -2950,6 +3349,8 @@ class PerfTargetCampaignRunner:
             [str(x) for x in payload.get("admitted_rule_ids", ())],
             stagnation_by_regime,
             last_unpromoted_regime,
+            pending_promotion,
+            pending_l4,
         )
 
     def _resolve_round_parent(
@@ -3156,6 +3557,627 @@ class PerfTargetCampaignRunner:
                         logger.debug("Persisting distilled rule %s skipped: %s", rid, exc)
         return list(distill_rep.admitted_rule_ids)
 
+    def _can_retry_on_alt_card(self, pending: PendingPromotion, attempted_device: str) -> bool:
+        retry_device = self._config.retry_device_id.strip()
+        return bool(
+            retry_device
+            and not pending.retry_used
+            and retry_device != (attempted_device or pending.device_id)
+        )
+
+    @staticmethod
+    def _promotion_attempt(result: L3AcceptanceResult, device_id: str) -> dict[str, str]:
+        """One auditable L3 attempt, including the card and candidate identity."""
+        return {
+            "execution_id": result.execution_id,
+            "run_id": result.run_id,
+            "receipt_path": result.receipt_path,
+            "error_message": result.error_message,
+            "failure_kind": result.failure_kind,
+            "failure_category": result.failure_category,
+            "pending": str(
+                result.pending
+                or result.failure_kind != FAILURE_KIND_CANDIDATE
+                or not result.execution_terminal
+            ).lower(),
+            "device_id": result.device_id or device_id,
+            "state": result.state,
+            "candidate_sha256": result.candidate_sha256,
+            "execution_terminal": str(result.execution_terminal).lower(),
+        }
+
+    def _retry_l3_on_alt_card(
+        self,
+        pending: PendingPromotion,
+        attempts: tuple[dict[str, str], ...],
+    ) -> L3AcceptanceResult:
+        """Start one fresh L3 execution on the explicitly authorized alternate card."""
+        retry_device = self._config.retry_device_id.strip()
+        retry_pending = replace(
+            pending,
+            execution_id="",
+            run_id="",
+            receipt_path="",
+            error_message="",
+            attempts=attempts,
+            device_id=retry_device,
+            execution_terminal=False,
+            retry_used=True,
+        )
+
+        def _record_started(execution_id: str, device: str) -> None:
+            started = replace(
+                retry_pending,
+                execution_id=execution_id,
+                device_id=device,
+                execution_terminal=False,
+            )
+            self._active_promotion = started
+            self._pending_promotion = started
+            self._persist_runtime_state("active_promotion", started.to_dict())
+
+        result = self._run_l3_contract(
+            self._target_module_path,
+            device_id=retry_device,
+            on_execution_started=_record_started,
+        )
+        self._active_promotion = None
+        return result
+
+    @staticmethod
+    def _record_promotion_attempts(
+        rounds: list[CampaignRoundRecord],
+        pending: PendingPromotion,
+        attempts: tuple[dict[str, str], ...],
+        *,
+        promoted: bool,
+        rolled_back: bool,
+        stagnation_after: int,
+    ) -> None:
+        for idx, record in enumerate(rounds):
+            if record.round_idx == pending.round_idx:
+                rounds[idx] = replace(
+                    record,
+                    promoted=promoted,
+                    rolled_back_l3=rolled_back,
+                    stagnation_rounds_after=stagnation_after,
+                    promotion_attempts=attempts,
+                )
+                break
+
+    def _resolve_pending_promotion(
+        self,
+        pending: PendingPromotion,
+        *,
+        incumbent_source: str,
+        best_result: CandidateSurrogateResult,
+        stagnation_by_regime: dict[str, int],
+        rounds: list[CampaignRoundRecord],
+        promoted_rounds: list[int],
+        rolled_back_rounds: list[int],
+        active_anchors: Sequence[AnchorCaseSpec],
+    ) -> tuple[
+        str,
+        CandidateSurrogateResult,
+        dict[str, int],
+        PendingPromotion | None,
+        bool,
+    ]:
+        """Resume, retry once on another card, or return a recoverable pending L3.
+
+        Candidate bytes are re-proved first. A live execution has no run id and a
+        terminal one with a run id can have its receipt re-read; neither path
+        submits again. A wait timeout keeps the candidate and continues the same
+        execution. Only a proven-terminal infrastructure failure restores the
+        incumbent, and only then may one fresh retry start on an explicitly
+        authorized other card. Numeric/assertion candidate failures never retry.
+        """
+        _ = active_anchors
+        ensure_error = self._ensure_candidate_bytes(
+            path=self._target_module_path,
+            source=pending.candidate_source,
+            expected_sha256=pending.candidate_sha256,
+        )
+        if ensure_error:
+            updated = replace(pending, error_message=ensure_error)
+            self._pending_promotion = updated
+            self._active_promotion = updated if not updated.execution_terminal else None
+            return incumbent_source, best_result, stagnation_by_regime, updated, True
+
+        attempts = list(pending.attempts)
+        current = pending
+
+        def _keep_pending(result: L3AcceptanceResult, *, terminal: bool) -> tuple[
+            str,
+            CandidateSurrogateResult,
+            dict[str, int],
+            PendingPromotion | None,
+            bool,
+        ]:
+            nonlocal current
+            attempt = self._promotion_attempt(result, current.device_id)
+            attempts.append(attempt)
+            current = replace(
+                current,
+                execution_id=result.execution_id or current.execution_id,
+                run_id=result.run_id or current.run_id,
+                receipt_path=result.receipt_path or current.receipt_path,
+                error_message=result.error_message or current.error_message,
+                attempts=tuple(attempts),
+                device_id=result.device_id or current.device_id,
+                execution_terminal=terminal,
+            )
+            if terminal:
+                restore_error = self._write_source_and_verify(
+                    self._target_module_path, incumbent_source
+                )
+                if restore_error:
+                    raise RuntimeError(restore_error)
+                self._active_promotion = None
+                self._persist_runtime_state("active_promotion", None)
+            else:
+                self._active_promotion = current
+                self._persist_runtime_state("active_promotion", current.to_dict())
+            self._pending_promotion = current
+            self._persist_runtime_state("pending_promotion", current.to_dict())
+            self._record_promotion_attempts(
+                rounds,
+                current,
+                tuple(attempts),
+                promoted=False,
+                rolled_back=terminal,
+                stagnation_after=stagnation_by_regime.get(current.regime_tag, 0),
+            )
+            return incumbent_source, best_result, stagnation_by_regime, current, True
+
+        def _promote() -> tuple[
+            str,
+            CandidateSurrogateResult,
+            dict[str, int],
+            PendingPromotion | None,
+            bool,
+        ]:
+            nonlocal current
+            self._record_promotion_attempts(
+                rounds,
+                current,
+                tuple(attempts),
+                promoted=True,
+                rolled_back=False,
+                stagnation_after=0,
+            )
+            if current.round_idx in rolled_back_rounds:
+                rolled_back_rounds.remove(current.round_idx)
+            if current.round_idx not in promoted_rounds:
+                promoted_rounds.append(current.round_idx)
+            stagnation_by_regime[current.regime_tag] = 0
+            self._pending_promotion = None
+            self._active_promotion = None
+            self._persist_runtime_state("active_promotion", None)
+            self._persist_runtime_state("pending_promotion", None)
+            return (
+                current.candidate_source,
+                current.candidate_result,
+                stagnation_by_regime,
+                None,
+                False,
+            )
+
+        def _candidate_failure(result: L3AcceptanceResult) -> tuple[
+            str,
+            CandidateSurrogateResult,
+            dict[str, int],
+            PendingPromotion | None,
+            bool,
+        ]:
+            nonlocal current
+            attempts.append(self._promotion_attempt(result, current.device_id))
+            restore_error = self._write_source_and_verify(
+                self._target_module_path, incumbent_source
+            )
+            if restore_error:
+                raise RuntimeError(restore_error)
+            stagnation_by_regime[current.regime_tag] = (
+                stagnation_by_regime.get(current.regime_tag, 0) + 1
+            )
+            self._record_promotion_attempts(
+                rounds,
+                current,
+                tuple(attempts),
+                promoted=False,
+                rolled_back=True,
+                stagnation_after=stagnation_by_regime[current.regime_tag],
+            )
+            self._pending_promotion = None
+            self._active_promotion = None
+            self._persist_runtime_state("active_promotion", None)
+            self._persist_runtime_state("pending_promotion", None)
+            return incumbent_source, best_result, stagnation_by_regime, None, False
+
+        result: L3AcceptanceResult | None = None
+        if pending.execution_id and (not pending.execution_terminal or pending.run_id):
+            result = self._resume_l3_contract(self._target_module_path, pending)
+            attempts.append(self._promotion_attempt(result, pending.device_id))
+            current = replace(
+                pending,
+                execution_id=result.execution_id or pending.execution_id,
+                run_id=result.run_id or pending.run_id,
+                receipt_path=result.receipt_path or pending.receipt_path,
+                error_message=result.error_message or pending.error_message,
+                attempts=tuple(attempts),
+                device_id=result.device_id or pending.device_id,
+                execution_terminal=result.execution_terminal,
+            )
+            if result.passed:
+                return _promote()
+            if not result.execution_terminal:
+                return _keep_pending(result, terminal=False)
+            if result.failure_kind == FAILURE_KIND_CANDIDATE:
+                return _candidate_failure(result)
+            if self._can_retry_on_alt_card(current, result.device_id):
+                retry_result = self._retry_l3_on_alt_card(current, tuple(attempts))
+                attempts.append(
+                    self._promotion_attempt(retry_result, current.device_id)
+                )
+                current = replace(
+                    current,
+                    execution_id=retry_result.execution_id or current.execution_id,
+                    run_id=retry_result.run_id or current.run_id,
+                    receipt_path=retry_result.receipt_path or current.receipt_path,
+                    error_message=retry_result.error_message or current.error_message,
+                    attempts=tuple(attempts),
+                    device_id=retry_result.device_id or current.device_id,
+                    execution_terminal=retry_result.execution_terminal,
+                    retry_used=True,
+                )
+                if retry_result.passed:
+                    return _promote()
+                if not retry_result.execution_terminal:
+                    return _keep_pending(retry_result, terminal=False)
+                if retry_result.failure_kind == FAILURE_KIND_CANDIDATE:
+                    return _candidate_failure(retry_result)
+                return _keep_pending(retry_result, terminal=retry_result.execution_terminal)
+            return _keep_pending(result, terminal=True)
+
+        if self._can_retry_on_alt_card(pending, pending.device_id):
+            retry_result = self._retry_l3_on_alt_card(pending, tuple(attempts))
+            attempts.append(self._promotion_attempt(retry_result, pending.device_id))
+            current = replace(
+                pending,
+                execution_id=retry_result.execution_id or pending.execution_id,
+                run_id=retry_result.run_id or pending.run_id,
+                receipt_path=retry_result.receipt_path or pending.receipt_path,
+                error_message=retry_result.error_message or pending.error_message,
+                attempts=tuple(attempts),
+                device_id=retry_result.device_id or pending.device_id,
+                execution_terminal=retry_result.execution_terminal,
+                retry_used=True,
+            )
+            if retry_result.passed:
+                return _promote()
+            if not retry_result.execution_terminal:
+                return _keep_pending(retry_result, terminal=False)
+            if retry_result.failure_kind == FAILURE_KIND_CANDIDATE:
+                return _candidate_failure(retry_result)
+            return _keep_pending(retry_result, terminal=retry_result.execution_terminal)
+        self._pending_promotion = pending
+        self._active_promotion = pending if not pending.execution_terminal else None
+        return incumbent_source, best_result, stagnation_by_regime, pending, True
+
+    @staticmethod
+    def _l4_attempt(result: L4CannbenchResult) -> dict[str, str]:
+        """One auditable L4 attempt, including the card and official coverage."""
+        return {
+            "execution_id": result.execution_id,
+            "run_id": result.run_id,
+            "receipt_path": result.receipt_path,
+            "error_message": result.error_message,
+            "failure_kind": result.failure_kind,
+            "device_id": result.device_id,
+            "state": result.state,
+            "execution_terminal": str(result.execution_terminal).lower(),
+            "official_report_valid": str(result.official_report_valid).lower(),
+            "all_cases_passed": str(result.all_cases_passed).lower(),
+            "all_timings_valid": str(result.all_timings_valid).lower(),
+            "case_count": str(result.case_count),
+            "passed_cases": str(result.passed_cases),
+        }
+
+    def _can_retry_l4_on_alt_card(
+        self,
+        pending: PendingL4,
+        attempted_device: str,
+    ) -> bool:
+        retry_device = self._config.retry_device_id.strip()
+        return bool(
+            retry_device
+            and not pending.retry_used
+            and retry_device != (attempted_device or pending.device_id)
+        )
+
+    @staticmethod
+    def _merge_l4_identity(
+        result: L4CannbenchResult,
+        pending: PendingL4,
+    ) -> L4CannbenchResult:
+        return replace(
+            result,
+            target_path=result.target_path or pending.target_path,
+            candidate_sha256=result.candidate_sha256 or pending.candidate_sha256,
+            device_id=result.device_id or pending.device_id,
+        )
+
+    @staticmethod
+    def _pending_l4_after(
+        pending: PendingL4,
+        result: L4CannbenchResult,
+        attempts: tuple[dict[str, str], ...],
+        *,
+        retry_used: bool,
+    ) -> PendingL4:
+        return replace(
+            pending,
+            target_path=result.target_path or pending.target_path,
+            candidate_sha256=result.candidate_sha256 or pending.candidate_sha256,
+            execution_id=result.execution_id or pending.execution_id,
+            run_id=result.run_id or pending.run_id,
+            receipt_path=result.receipt_path or pending.receipt_path,
+            device_id=result.device_id or pending.device_id,
+            state=result.state or pending.state,
+            error_message=result.error_message or pending.error_message,
+            failure_kind=result.failure_kind or pending.failure_kind,
+            execution_terminal=result.execution_terminal,
+            retry_used=retry_used,
+            attempts=attempts,
+        )
+
+    def _resolve_pending_l4(
+        self,
+        pending: PendingL4,
+        *,
+        incumbent_source: str,
+    ) -> tuple[L4CannbenchResult, PendingL4 | None]:
+        """Continue the saved L4 execution, or retry one whole run on another card.
+
+        A live execution has no run id and a terminal one with a run id can have
+        its signed receipt re-read; neither path submits again. A bounded wait
+        that expired is not a failure: the same execution ID is polled again on
+        the original card. Only a proven-terminal infrastructure failure may
+        start one complete L4 run on an explicitly authorized other card, and
+        its identity is persisted before the wait. Numeric/official-validation
+        failures are verdicts and never retry; timings are never stitched.
+        """
+        expected = pending.candidate_sha256 or self._source_sha256(incumbent_source)
+        digest_error = ""
+        try:
+            current_digest = hashlib.sha256(
+                self._target_module_path.read_bytes()
+            ).hexdigest()
+        except OSError as exc:
+            digest_error = (
+                f"pending L4 candidate {self._target_module_path} cannot be read: {exc}"
+            )
+        else:
+            if current_digest != expected:
+                digest_error = (
+                    f"pending L4 candidate {self._target_module_path} digest "
+                    f"{current_digest} does not match submitted {expected}; "
+                    "refusing to resume or replace it"
+                )
+        if digest_error:
+            failed = L4CannbenchResult(
+                passed=False,
+                error_message=digest_error,
+                failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+                execution_id=pending.execution_id,
+                run_id=pending.run_id,
+                receipt_path=pending.receipt_path,
+                device_id=pending.device_id,
+                state=pending.state,
+                execution_terminal=pending.execution_terminal,
+                target_path=pending.target_path,
+                candidate_sha256=expected,
+                attempts=pending.attempts,
+            )
+            updated = replace(
+                pending,
+                candidate_sha256=expected,
+                error_message=digest_error,
+            )
+            self._pending_l4 = updated
+            return failed, updated
+
+        attempts = list(pending.attempts)
+        current = pending
+
+        def _record_started(execution_id: str, device: str) -> None:
+            nonlocal current
+            current = replace(
+                current,
+                execution_id=execution_id or current.execution_id,
+                device_id=device or current.device_id,
+                state="SUBMITTED",
+                execution_terminal=False,
+            )
+            self._pending_l4 = current
+            self._persist_runtime_state("pending_l4", current.to_dict())
+
+        def _keep(
+            result: L4CannbenchResult,
+            *,
+            retry_used: bool,
+        ) -> tuple[L4CannbenchResult, PendingL4 | None]:
+            nonlocal current
+            updated = self._pending_l4_after(
+                current,
+                result,
+                tuple(attempts),
+                retry_used=retry_used,
+            )
+            self._pending_l4 = updated
+            self._persist_runtime_state("pending_l4", updated.to_dict())
+            return self._merge_l4_identity(result, updated), updated
+
+        def _finish(
+            result: L4CannbenchResult,
+        ) -> tuple[L4CannbenchResult, PendingL4 | None]:
+            self._pending_l4 = None
+            self._persist_runtime_state("pending_l4", None)
+            return self._merge_l4_identity(result, current), None
+
+        def _retry_whole_l4() -> tuple[L4CannbenchResult, PendingL4 | None]:
+            nonlocal current
+            retry_device = self._config.retry_device_id.strip()
+            current = replace(
+                current,
+                execution_id="",
+                run_id="",
+                receipt_path="",
+                device_id=retry_device,
+                state="SUBMITTED",
+                error_message="",
+                failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+                execution_terminal=False,
+                retry_used=True,
+            )
+            retry_result = self._run_l4_cannbench(
+                self._target_module_path,
+                device_id=retry_device,
+                on_execution_started=_record_started,
+            )
+            attempts.append(self._l4_attempt(retry_result))
+            current = replace(
+                current,
+                execution_id=retry_result.execution_id or current.execution_id,
+                run_id=retry_result.run_id or current.run_id,
+                receipt_path=retry_result.receipt_path or current.receipt_path,
+                device_id=retry_result.device_id or current.device_id,
+                state=retry_result.state or current.state,
+                error_message=retry_result.error_message or current.error_message,
+                failure_kind=retry_result.failure_kind or current.failure_kind,
+                execution_terminal=retry_result.execution_terminal,
+                attempts=tuple(attempts),
+            )
+            if retry_result.passed:
+                return _finish(retry_result)
+            if retry_result.failure_kind == FAILURE_KIND_CANDIDATE:
+                return _finish(retry_result)
+            return _keep(retry_result, retry_used=True)
+
+        if pending.execution_id and (not pending.execution_terminal or pending.run_id):
+            result = self._run_l4_cannbench(
+                self._target_module_path,
+                resume_execution_id=pending.execution_id,
+                resume_run_id=pending.run_id,
+                device_id=pending.device_id or self._config.device_id,
+                on_execution_started=_record_started,
+            )
+            attempts.append(self._l4_attempt(result))
+            current = replace(
+                current,
+                execution_id=result.execution_id or current.execution_id,
+                run_id=result.run_id or current.run_id,
+                receipt_path=result.receipt_path or current.receipt_path,
+                device_id=result.device_id or current.device_id,
+                state=result.state or current.state,
+                error_message=result.error_message or current.error_message,
+                failure_kind=result.failure_kind or current.failure_kind,
+                execution_terminal=result.execution_terminal,
+                attempts=tuple(attempts),
+            )
+            if result.passed:
+                return _finish(result)
+            if result.failure_kind == FAILURE_KIND_CANDIDATE:
+                return _finish(result)
+            if not result.execution_terminal:
+                return _keep(result, retry_used=False)
+            if self._can_retry_l4_on_alt_card(current, result.device_id):
+                return _retry_whole_l4()
+            return _keep(result, retry_used=False)
+
+        if self._can_retry_l4_on_alt_card(pending, pending.device_id):
+            return _retry_whole_l4()
+        self._pending_l4 = pending
+        failed = L4CannbenchResult(
+            passed=False,
+            error_message=(
+                pending.error_message
+                or "L4 infrastructure failure has no resumable execution and no "
+                "other authorized card is configured"
+            ),
+            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+            execution_id=pending.execution_id,
+            run_id=pending.run_id,
+            receipt_path=pending.receipt_path,
+            device_id=pending.device_id,
+            state=pending.state,
+            execution_terminal=pending.execution_terminal,
+            target_path=pending.target_path,
+            candidate_sha256=expected,
+            attempts=pending.attempts,
+        )
+        return failed, pending
+
+    def _l4_candidate_relative(self) -> str:
+        try:
+            return self._target_module_path.resolve().relative_to(
+                Path(self._source_root).resolve()
+            ).as_posix()
+        except (OSError, ValueError):
+            return self._target_module_path.name
+
+    def _run_final_l4_tracked(
+        self,
+        *,
+        incumbent_source: str,
+        prior_stop_reason: str,
+    ) -> L4CannbenchResult:
+        """Submit the official L4 run and persist its identity before waiting."""
+        candidate_sha = self._source_sha256(incumbent_source)
+        candidate_relative = self._l4_candidate_relative()
+
+        def _record_started(execution_id: str, device: str) -> None:
+            provisional = PendingL4(
+                target_path=str(self._target_module_path),
+                candidate_relative=candidate_relative,
+                candidate_sha256=candidate_sha,
+                execution_id=execution_id,
+                device_id=device,
+                state="SUBMITTED",
+                execution_terminal=False,
+                prior_stop_reason=prior_stop_reason,
+            )
+            self._pending_l4 = provisional
+            self._persist_runtime_state("pending_l4", provisional.to_dict())
+
+        result = self._run_l4_cannbench(
+            self._target_module_path,
+            device_id=self._config.device_id,
+            on_execution_started=_record_started,
+        )
+        if result.passed or result.failure_kind == FAILURE_KIND_CANDIDATE:
+            self._pending_l4 = None
+            self._persist_runtime_state("pending_l4", None)
+            return result
+        pending = PendingL4(
+            target_path=result.target_path or str(self._target_module_path),
+            candidate_relative=candidate_relative,
+            candidate_sha256=result.candidate_sha256 or candidate_sha,
+            execution_id=result.execution_id,
+            run_id=result.run_id,
+            receipt_path=result.receipt_path,
+            device_id=result.device_id or self._config.device_id,
+            state=result.state,
+            error_message=result.error_message,
+            failure_kind=result.failure_kind or FAILURE_KIND_INFRASTRUCTURE,
+            execution_terminal=result.execution_terminal,
+            attempts=(self._l4_attempt(result),),
+            prior_stop_reason=prior_stop_reason,
+        )
+        self._pending_l4 = pending
+        self._persist_runtime_state("pending_l4", pending.to_dict())
+        return result
+
     async def _execute_single_round(
         self,
         *,
@@ -3174,7 +4196,16 @@ class PerfTargetCampaignRunner:
         bool,
         bool,
         bool,
+        bool,
     ]:
+        """Run one optimisation round and promote the best candidate through L3.
+
+        The execution identity is persisted at submission, before the potentially
+        long wait, so a killed process can recover the same run. A terminal
+        infrastructure fault restores the incumbent and blocks promotion without
+        counting stagnation; a live or queued execution keeps the exact candidate
+        bytes because replacing them would silently change the code under test.
+        """
         backend = self._get_backend()
         self._active_incumbent_source = incumbent_source
         self._active_regime_tag = regime_spec.regime_tag
@@ -3728,6 +4759,7 @@ class PerfTargetCampaignRunner:
         best_round_surrogate_score = best_result.surrogate_score
         promoted = False
         rolled_back_l3 = False
+        promotion_blocked = False
         new_incumbent = incumbent_source
         new_best = best_result
         round_admitted: list[str] = []
@@ -3736,6 +4768,7 @@ class PerfTargetCampaignRunner:
         rel_gain = 0.0
         local_rel_gain = 0.0
         stagnation_after = stagnation_rounds + 1
+        promotion_attempts: tuple[dict[str, str], ...] = ()
 
         if passing_candidates:
             top_chk, top_res = max(
@@ -3800,16 +4833,119 @@ class PerfTargetCampaignRunner:
                 )
             if tail_guard_ok and dual_criterion_ok:
                 _atomic_write_text(self._target_module_path, top_chk.patched_module_source)
-                l3_res = self._run_l3_contract(self._target_module_path)
+                candidate_sha = self._source_sha256(top_chk.patched_module_source)
+
+                def _record_l3_started(execution_id: str, device: str) -> None:
+                    provisional = PendingPromotion(
+                        candidate_source=top_chk.patched_module_source,
+                        candidate_sha256=candidate_sha,
+                        target_path=str(self._target_module_path),
+                        round_idx=round_idx,
+                        regime_tag=regime_spec.regime_tag,
+                        candidate_result=top_res,
+                        candidate_id=top_chk.candidate_id,
+                        builder_name=func_name,
+                        parent_lane=parent_lane,
+                        creative_effort=creative_effort,
+                        execution_id=execution_id,
+                        device_id=device,
+                        execution_terminal=False,
+                    )
+                    self._active_promotion = provisional
+                    self._pending_promotion = provisional
+                    self._persist_runtime_state(
+                        "active_promotion", provisional.to_dict()
+                    )
+
+                l3_res = self._run_l3_contract(
+                    self._target_module_path,
+                    on_execution_started=_record_l3_started,
+                )
+                self._active_promotion = None
                 if l3_res.passed:
                     promoted = True
                     new_incumbent = top_chk.patched_module_source
                     new_best = top_res
                     stagnation_after = 0
+                    self._pending_promotion = None
+                    self._persist_runtime_state("active_promotion", None)
+                    self._persist_runtime_state("pending_promotion", None)
+                elif (
+                    l3_res.failure_kind != FAILURE_KIND_CANDIDATE
+                    or not l3_res.execution_terminal
+                ):
+                    if l3_res.execution_terminal:
+                        restore_error = self._write_source_and_verify(
+                            self._target_module_path, incumbent_source
+                        )
+                        if restore_error:
+                            raise RuntimeError(restore_error)
+                        rolled_back_l3 = True
+                    else:
+                        rolled_back_l3 = False
+                    promotion_blocked = True
+                    stagnation_after = stagnation_rounds
+                    attempt = {
+                        "execution_id": l3_res.execution_id,
+                        "run_id": l3_res.run_id,
+                        "receipt_path": l3_res.receipt_path,
+                        "error_message": l3_res.error_message,
+                        "failure_kind": l3_res.failure_kind,
+                        "failure_category": l3_res.failure_category,
+                        "pending": str(
+                            l3_res.pending
+                            or l3_res.failure_kind != FAILURE_KIND_CANDIDATE
+                            or not l3_res.execution_terminal
+                        ).lower(),
+                        "device_id": l3_res.device_id or self._config.device_id,
+                        "state": l3_res.state,
+                        "candidate_sha256": l3_res.candidate_sha256 or candidate_sha,
+                        "execution_terminal": str(l3_res.execution_terminal).lower(),
+                    }
+                    self._pending_promotion = PendingPromotion(
+                        candidate_source=top_chk.patched_module_source,
+                        candidate_sha256=l3_res.candidate_sha256 or candidate_sha,
+                        target_path=l3_res.target_path or str(self._target_module_path),
+                        round_idx=round_idx,
+                        regime_tag=regime_spec.regime_tag,
+                        candidate_result=top_res,
+                        candidate_id=top_chk.candidate_id,
+                        builder_name=func_name,
+                        parent_lane=parent_lane,
+                        creative_effort=creative_effort,
+                        execution_id=l3_res.execution_id,
+                        run_id=l3_res.run_id,
+                        receipt_path=l3_res.receipt_path,
+                        error_message=l3_res.error_message,
+                        attempts=(attempt,),
+                        device_id=l3_res.device_id or self._config.device_id,
+                        execution_terminal=l3_res.execution_terminal,
+                    )
+                    promotion_attempts = self._pending_promotion.attempts
+                    self._persist_runtime_state(
+                        "pending_promotion", self._pending_promotion.to_dict()
+                    )
+                    if l3_res.execution_terminal:
+                        self._persist_runtime_state("active_promotion", None)
+                    else:
+                        self._active_promotion = self._pending_promotion
+                        self._persist_runtime_state(
+                            "active_promotion", self._pending_promotion.to_dict()
+                        )
                 else:
-                    _atomic_write_text(self._target_module_path, incumbent_source)
+                    promotion_attempts = (
+                        self._promotion_attempt(l3_res, self._config.device_id),
+                    )
+                    restore_error = self._write_source_and_verify(
+                        self._target_module_path, incumbent_source
+                    )
+                    if restore_error:
+                        raise RuntimeError(restore_error)
                     rolled_back_l3 = True
                     stagnation_after = stagnation_rounds + 1
+                    self._pending_promotion = None
+                    self._persist_runtime_state("active_promotion", None)
+                    self._persist_runtime_state("pending_promotion", None)
 
         beam_updates: list[BeamCandidate] = []
         top_chk_id = top_chk.candidate_id if top_chk is not None else None
@@ -3915,7 +5051,9 @@ class PerfTargetCampaignRunner:
                 )
             )
             if rule is not None:
-                cand_rolled_back = bool(rolled_back_l3 and chk.candidate_id == top_chk_id)
+                cand_rolled_back = bool(
+                    rolled_back_l3 and not promotion_blocked and chk.candidate_id == top_chk_id
+                )
                 realized, causal_gain = self._evaluate_causal_rule_outcome(
                     rule=rule,
                     res_all_passed=res.all_passed,
@@ -4030,6 +5168,7 @@ class PerfTargetCampaignRunner:
             best_round_surrogate_score=best_round_surrogate_score,
             best_so_far_surrogate_score=new_best.surrogate_score,
             pruned_rule_ids=pruned_rules,
+            promotion_attempts=promotion_attempts,
         )
         return (
             record,
@@ -4039,10 +5178,17 @@ class PerfTargetCampaignRunner:
             promoted,
             rolled_back_l3,
             escalated,
+            promotion_blocked,
         )
 
     async def run(self, *, resume: bool = False) -> CampaignReport:
-        """Execute unattended optimization campaign until stopping criterion triggers."""
+        """Execute the unattended optimisation campaign until a stopping criterion.
+
+        A resumed campaign first continues any saved L3 execution, then any saved
+        L4 execution, without regenerating or resubmitting the candidate. L4 is
+        never submitted while L3 promotion evidence is unresolved, and a
+        successful same-candidate retry resumes from the promoted regime.
+        """
         campaign_start = self._clock()
         if resume and self._checkpoint_path is not None and self._checkpoint_path.is_file():
             (
@@ -4060,6 +5206,8 @@ class PerfTargetCampaignRunner:
                 admitted_rule_ids,
                 stagnation_by_regime,
                 last_unpromoted_regime,
+                pending_promotion,
+                pending_l4,
             ) = self._restore_from_checkpoint()
         else:
             incumbent_source = self._target_module_path.read_text(encoding="utf-8")
@@ -4103,6 +5251,8 @@ class PerfTargetCampaignRunner:
             stagnation_rounds = 0
             stagnation_by_regime = {}
             last_unpromoted_regime = None
+            pending_promotion = None
+            pending_l4 = None
             rounds = []
             promoted_rounds = []
             rolled_back_rounds = []
@@ -4125,10 +5275,62 @@ class PerfTargetCampaignRunner:
                 l4_result=None,
                 stagnation_by_regime=stagnation_by_regime,
                 last_unpromoted_regime=last_unpromoted_regime,
+                pending_promotion=pending_promotion,
+                pending_l4=pending_l4,
             )
 
+        self._pending_promotion = pending_promotion
+        self._pending_l4 = pending_l4
         stop_reason = ""
-        if self._allow_early_stop(len(rounds)):
+        promotion_blocked = False
+        l4_result: L4CannbenchResult | None = None
+        l4_was_resolved = False
+        if pending_promotion is not None:
+            retried_pending = pending_promotion
+            self._pending_promotion = retried_pending
+            (
+                incumbent_source,
+                best_result,
+                stagnation_by_regime,
+                pending_promotion,
+                promotion_blocked,
+            ) = self._resolve_pending_promotion(
+                retried_pending,
+                incumbent_source=incumbent_source,
+                best_result=best_result,
+                stagnation_by_regime=stagnation_by_regime,
+                rounds=rounds,
+                promoted_rounds=promoted_rounds,
+                rolled_back_rounds=rolled_back_rounds,
+                active_anchors=active_anchors,
+            )
+            stagnation_rounds = stagnation_by_regime.get(retried_pending.regime_tag, 0)
+            if promotion_blocked:
+                stop_reason = "promotion_blocked"
+            elif (
+                pending_promotion is None
+                and retried_pending.round_idx in promoted_rounds
+            ):
+                current_regime = retried_pending.regime_tag
+                last_unpromoted_regime = None
+        if pending_l4 is not None and not promotion_blocked:
+            prior_stop_reason = pending_l4.prior_stop_reason
+            l4_result, pending_l4 = self._resolve_pending_l4(
+                pending_l4,
+                incumbent_source=incumbent_source,
+            )
+            self._pending_l4 = pending_l4
+            l4_was_resolved = True
+            if not stop_reason:
+                stop_reason = prior_stop_reason or "l4_pending"
+            self._record_l4_observations(
+                source=incumbent_source,
+                l4_result=l4_result,
+                active_anchors=active_anchors,
+            )
+        elif pending_l4 is not None:
+            l4_was_resolved = True
+        if not stop_reason and self._allow_early_stop(len(rounds)):
             if best_result.meets_perf_target(self._perf_target):
                 stop_reason = "goal_met"
             elif best_result.is_roofline_saturated(self._perf_target):
@@ -4172,6 +5374,7 @@ class PerfTargetCampaignRunner:
                 promoted,
                 rolled_back,
                 escalated,
+                promotion_blocked,
             ) = await self._execute_single_round(
                 round_idx=round_idx,
                 regime_spec=active_regime,
@@ -4182,6 +5385,7 @@ class PerfTargetCampaignRunner:
                 admitted_rule_ids=admitted_rule_ids,
             )
             rounds.append(rec)
+            pending_promotion = self._pending_promotion
             if promoted:
                 stagnation_rounds = 0
                 stagnation_by_regime[active_tag] = 0
@@ -4196,24 +5400,27 @@ class PerfTargetCampaignRunner:
                 rolled_back_rounds.append(round_idx)
             if escalated:
                 escalated_rounds.append(round_idx)
+            if promotion_blocked:
+                stop_reason = "promotion_blocked"
 
             early_stop_allowed = self._allow_early_stop(len(rounds))
-            if early_stop_allowed and best_result.meets_perf_target(self._perf_target):
-                stop_reason = "goal_met"
-            elif early_stop_allowed and best_result.is_roofline_saturated(self._perf_target):
-                stop_reason = "roofline_saturated"
-            elif stagnation_by_regime.get(active_tag, 0) >= self._config.stagnation_freeze_rounds:
-                frozen_regimes.add(active_tag)
-                next_reg = self._select_active_regime(
-                    None,
-                    frozen_regimes,
-                    best_result,
-                    active_anchors,
-                    allow_satisfied_fallback=not early_stop_allowed,
-                    exclude_regime=last_unpromoted_regime,
-                )
-                if next_reg is None:
-                    stop_reason = "all_regimes_converged"
+            if not promotion_blocked:
+                if early_stop_allowed and best_result.meets_perf_target(self._perf_target):
+                    stop_reason = "goal_met"
+                elif early_stop_allowed and best_result.is_roofline_saturated(self._perf_target):
+                    stop_reason = "roofline_saturated"
+                elif stagnation_by_regime.get(active_tag, 0) >= self._config.stagnation_freeze_rounds:
+                    frozen_regimes.add(active_tag)
+                    next_reg = self._select_active_regime(
+                        None,
+                        frozen_regimes,
+                        best_result,
+                        active_anchors,
+                        allow_satisfied_fallback=not early_stop_allowed,
+                        exclude_regime=last_unpromoted_regime,
+                    )
+                    if next_reg is None:
+                        stop_reason = "all_regimes_converged"
 
             self._save_checkpoint(
                 incumbent_source=incumbent_source,
@@ -4232,6 +5439,8 @@ class PerfTargetCampaignRunner:
                 l4_result=None,
                 stagnation_by_regime=stagnation_by_regime,
                 last_unpromoted_regime=last_unpromoted_regime,
+                pending_promotion=pending_promotion,
+                pending_l4=self._pending_l4,
             )
             if stop_reason:
                 break
@@ -4239,9 +5448,15 @@ class PerfTargetCampaignRunner:
         if not stop_reason:
             stop_reason = "budget_exhausted"
 
-        l4_result: L4CannbenchResult | None = None
-        if self._config.run_final_l4:
-            l4_result = self._run_l4_cannbench(self._target_module_path)
+        if (
+            self._config.run_final_l4
+            and not promotion_blocked
+            and not l4_was_resolved
+        ):
+            l4_result = self._run_final_l4_tracked(
+                incumbent_source=incumbent_source,
+                prior_stop_reason=stop_reason,
+            )
             self._record_l4_observations(
                 source=incumbent_source,
                 l4_result=l4_result,
@@ -4253,7 +5468,7 @@ class PerfTargetCampaignRunner:
                 for cnum, sp in l4_result.per_case_speedups.items()
                 if cnum not in anchor_nums and sp < self._config.l4_regression_ratio
             )
-            if regressed_nums:
+            if regressed_nums and l4_result.passed:
                 resolved_by_cnum: dict[int, RegimeTargetSpec] = {}
                 for cnum in regressed_nums:
                     resolved = self._regime_specs[0]
@@ -4301,6 +5516,7 @@ class PerfTargetCampaignRunner:
                     promoted,
                     rolled_back,
                     escalated,
+                    promotion_blocked,
                 ) = await self._execute_single_round(
                     round_idx=catch_idx,
                     regime_spec=catch_regime,
@@ -4311,6 +5527,7 @@ class PerfTargetCampaignRunner:
                     admitted_rule_ids=admitted_rule_ids,
                 )
                 rounds.append(rec)
+                pending_promotion = self._pending_promotion
                 if promoted:
                     stagnation_by_regime[catch_tag] = 0
                     promoted_rounds.append(catch_idx)
@@ -4320,12 +5537,18 @@ class PerfTargetCampaignRunner:
                     rolled_back_rounds.append(catch_idx)
                 if escalated:
                     escalated_rounds.append(catch_idx)
-                l4_result = self._run_l4_cannbench(self._target_module_path)
-                self._record_l4_observations(
-                    source=incumbent_source,
-                    l4_result=l4_result,
-                    active_anchors=active_anchors,
-                )
+                if promotion_blocked:
+                    stop_reason = "promotion_blocked"
+                if l4_result.passed and not promotion_blocked:
+                    l4_result = self._run_final_l4_tracked(
+                        incumbent_source=incumbent_source,
+                        prior_stop_reason=stop_reason,
+                    )
+                    self._record_l4_observations(
+                        source=incumbent_source,
+                        l4_result=l4_result,
+                        active_anchors=active_anchors,
+                    )
 
         self._save_checkpoint(
             incumbent_source=incumbent_source,
@@ -4344,6 +5567,8 @@ class PerfTargetCampaignRunner:
             l4_result=l4_result,
             stagnation_by_regime=stagnation_by_regime,
             last_unpromoted_regime=last_unpromoted_regime,
+            pending_promotion=pending_promotion,
+            pending_l4=self._pending_l4,
         )
 
         return CampaignReport(
@@ -4360,6 +5585,9 @@ class PerfTargetCampaignRunner:
             active_anchors=tuple(active_anchors),
             admitted_rule_ids=tuple(admitted_rule_ids),
             l4_result=l4_result,
+            pending_promotion=pending_promotion,
+            pending_l4=self._pending_l4,
+            promotion_blocked=promotion_blocked,
         )
 
 
@@ -4377,6 +5605,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-rounds", type=int, default=12)
     parser.add_argument("--max-wall-clock-min", type=float, default=180.0)
     parser.add_argument("--device-id", default="1", help="Authorized NPU device ID.")
+    parser.add_argument(
+        "--retry-device-id",
+        default="",
+        help=(
+            "Explicitly authorized alternate NPU card for at most one fresh "
+            "retry after a proven-terminal infrastructure failure."
+        ),
+    )
     parser.add_argument(
         "--disable-early-goal-stop",
         action="store_true",
@@ -4420,6 +5656,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         disable_early_goal_stop=bool(args.disable_early_goal_stop),
         run_final_l4=bool(args.run_final_l4),
         device_id=str(args.device_id),
+        retry_device_id=str(args.retry_device_id),
         enable_tilesize_prescreen=bool(args.enable_tilesize_prescreen),
     )
     tracker = BayesianRuleTracker.from_seed_yaml()

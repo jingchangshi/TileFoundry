@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -78,6 +79,21 @@ def wait_for_npu_quiescent(max_retries: int = 10):
 
 DEFAULT_AGENT_GATES_MAX_ATTEMPTS = 5
 DEFAULT_AGENT_GATES_BACKOFF_SEC = 3.0
+
+AGENT_GATES_ADAPTER = "tilefoundry-npu"
+AGENT_GATES_L3_PROMOTION_GATE = "tilefoundry-npu-l3-promotion"
+AGENT_GATES_L4_CANNBENCH_GATE = "tilefoundry-npu-cannbench"
+DEFAULT_L3_PROMOTION_WAIT_SEC = 1920
+DEFAULT_L4_CANNBENCH_WAIT_SEC = 5400
+_V2_WAIT_SLICE_SEC = 60.0
+_V2_SUBMIT_TIMEOUT_SEC = 60.0
+_V2_POST_WAIT_TIMEOUT_SEC = 60.0
+_V2_STRIPPED_PYTHON_ENV_KEYS = frozenset(
+    {"PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE"}
+)
+
+FAILURE_KIND_CANDIDATE = "candidate"
+FAILURE_KIND_INFRASTRUCTURE = "infrastructure"
 
 
 @dataclass(frozen=True)
@@ -263,6 +279,15 @@ class L3AcceptanceResult:
     receipt_path: str = ""
     elapsed_sec: float = 0.0
     error_message: str = ""
+    failure_kind: str = ""
+    failure_category: str = ""
+    pending: bool = False
+    execution_id: str = ""
+    candidate_sha256: str = ""
+    target_path: str = ""
+    device_id: str = ""
+    state: str = ""
+    execution_terminal: bool = True
 
 
 @dataclass(frozen=True)
@@ -278,6 +303,19 @@ class L4CannbenchResult:
     receipt_path: str = ""
     report_dir: str = ""
     error_message: str = ""
+    failure_kind: str = ""
+    execution_id: str = ""
+    official_report_valid: bool = False
+    all_cases_passed: bool = False
+    all_timings_valid: bool = False
+    case_count: int = 0
+    passed_cases: int = 0
+    device_id: str = ""
+    state: str = ""
+    execution_terminal: bool = True
+    target_path: str = ""
+    candidate_sha256: str = ""
+    attempts: tuple[dict[str, str], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """Serialize L4 official CANNBench result to a JSON-compatible dictionary."""
@@ -291,6 +329,19 @@ class L4CannbenchResult:
             "receipt_path": self.receipt_path,
             "report_dir": self.report_dir,
             "error_message": self.error_message,
+            "failure_kind": self.failure_kind,
+            "execution_id": self.execution_id,
+            "official_report_valid": self.official_report_valid,
+            "all_cases_passed": self.all_cases_passed,
+            "all_timings_valid": self.all_timings_valid,
+            "case_count": self.case_count,
+            "passed_cases": self.passed_cases,
+            "device_id": self.device_id,
+            "state": self.state,
+            "execution_terminal": self.execution_terminal,
+            "target_path": self.target_path,
+            "candidate_sha256": self.candidate_sha256,
+            "attempts": [dict(item) for item in self.attempts],
         }
 
 
@@ -422,24 +473,6 @@ def compare_case_result(
     )
     return SimpleNamespace(passed=bool(res.passed), message=msg)
 '''
-
-
-_L3_CACHE_SITECUSTOMIZE = (
-    "import importlib as _tf_importlib\n"
-    "import os as _tf_os\n"
-    "_tf_tl_dir = _tf_os.environ.get('TF_SURROGATE_TL_CACHE_DIR', '').strip()\n"
-    "if _tf_tl_dir:\n"
-    "    _tf_os.makedirs(_tf_tl_dir, exist_ok=True)\n"
-    "    _tf_os.environ['TILELANG_CACHE_DIR'] = _tf_tl_dir\n"
-    "    _tf_os.environ['TILELANG_KERNEL_CACHE_USE_LIB_STAMP'] = '1'\n"
-    "    _tf_os.environ['TILELANG_DISABLE_CACHE'] = '0'\n"
-    "    _tl_env_mod = _tf_importlib.import_module('tilelang.env')\n"
-    "    _tl_kc = _tf_importlib.import_module('tilelang.cache.kernel_cache')\n"
-    "    _tl_env_mod.env.enable_cache()\n"
-    "    _tl_kc.KernelCache._get_cache_namespace.cache_clear()\n"
-    "    _tl_kc.KernelCache._get_tilelang_lib_stamp.cache_clear()\n"
-    "    _tl_kc.KernelCache._create_dirs()\n"
-)
 
 
 def ensure_npu_compare_shim_dir(
@@ -897,16 +930,14 @@ async def run_l0_l1_round_filter(
 
 
 def _resolve_agent_gates_bin(source_root: Path | None = None) -> str:
+    """Resolve the AgentGates CLI from explicit configuration or the installed entry point."""
+    _ = source_root
     env_bin = os.environ.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "").strip()
     if env_bin and Path(env_bin).is_file():
         return env_bin
     on_path = shutil.which("agent-gates")
     if on_path:
         return on_path
-    if source_root is not None:
-        sibling = source_root.parent / "AgentGates" / ".venv" / "bin" / "agent-gates"
-        if sibling.is_file():
-            return str(sibling)
     raise FileNotFoundError(
         "Cannot locate 'agent-gates' binary. Set TILEFOUNDRY_NPU_AGENT_GATES_BIN or PATH."
     )
@@ -1853,6 +1884,577 @@ def collect_bottleneck_msprof_via_agent_gates(
     return out
 
 
+_AGENT_GATES_CONFIG_ENV = "AGENT_GATES_CONFIG"
+
+
+def _agent_gates_config_path() -> Path:
+    configured = os.environ.get(_AGENT_GATES_CONFIG_ENV, "").strip()
+    return (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".config/agent-gates/config.toml"
+    )
+
+
+def _agent_gates_config() -> Mapping[str, object]:
+    return tomllib.loads(_agent_gates_config_path().read_text(encoding="utf-8"))
+
+
+def _agent_gates_workspace_name(source_root: Path) -> str:
+    """Resolve the configured V2 workspace whose source root is ``source_root``."""
+    raw = _agent_gates_config()
+    workspaces = raw.get("workspaces")
+    if not isinstance(workspaces, Mapping):
+        raise ValueError("AgentGates config must define [workspaces]")
+    wanted = source_root.resolve()
+    for name, entry in workspaces.items():
+        if not isinstance(entry, Mapping):
+            continue
+        configured = entry.get("source_root")
+        if isinstance(configured, str) and Path(configured).expanduser().resolve() == wanted:
+            return str(name)
+    raise ValueError(f"No AgentGates workspace is configured for source root {wanted}")
+
+
+def _workspace_relative_candidate(source_root: Path, candidate_path: Path) -> str | None:
+    try:
+        relative = candidate_path.resolve().relative_to(source_root.resolve())
+    except ValueError:
+        return None
+    return relative.as_posix()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@dataclass(frozen=True)
+class _V2GateExecution:
+    """Outcome of one V2 submit/wait/report/verify sequence."""
+
+    execution_id: str = ""
+    run_id: str = ""
+    receipt_path: str = ""
+    report: Mapping[str, object] = field(default_factory=dict)
+    verification: Mapping[str, object] = field(default_factory=dict)
+    transport_error: str = ""
+    elapsed_sec: float = 0.0
+    device_id: str = ""
+    state: str = ""
+    execution_terminal: bool = True
+
+    @property
+    def execution_active(self) -> bool:
+        """Return whether an execution may still be running and must be resumed."""
+        return bool(self.execution_id) and not self.execution_terminal
+
+    @property
+    def verified(self) -> bool:
+        """Return whether verify-requirements proved this run against current sources."""
+        return (
+            not self.transport_error
+            and self.execution_id != ""
+            and self.verification.get("satisfied") is True
+        )
+
+
+def _agent_gates_cli_env() -> dict[str, str]:
+    """Build the CLI environment without project Python startup injection."""
+    env = _clean_agent_gates_subprocess_env({})
+    for key in _V2_STRIPPED_PYTHON_ENV_KEYS:
+        env.pop(key, None)
+    env["PYTHONNOUSERSITE"] = "1"
+    return env
+
+
+def _gate_row(report: Mapping[str, object], gate_id: str) -> Mapping[str, object] | None:
+    for row in report.get("gates", ()):
+        if isinstance(row, Mapping) and row.get("gateId") == gate_id:
+            return row
+    return None
+
+
+def _gate_observation(
+    report: Mapping[str, object], gate_id: str
+) -> tuple[Mapping[str, object] | None, Mapping[str, object]]:
+    row = _gate_row(report, gate_id)
+    if row is None:
+        return None, {}
+    obs = row.get("observations")
+    return row, dict(obs) if isinstance(obs, Mapping) else {}
+
+
+def _gate_recorded_status(row: Mapping[str, object] | None) -> str:
+    if row is None:
+        return ""
+    return str(row.get("recordedStatus") or row.get("status") or "")
+
+
+def _as_positive_int(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return max(0, int(value))
+
+
+def _run_v2_gate(
+    *,
+    agent_gates_bin: str,
+    root: Path,
+    workspace: str,
+    gate_id: str,
+    target: str,
+    candidate_path: str | None = None,
+    timeout_sec: float,
+    device_id: str = "",
+    resume_execution_id: str = "",
+    resume_run_id: str = "",
+    on_execution_started: Callable[[str, str], None] | None = None,
+) -> _V2GateExecution:
+    """Run one V2 gate with a single monotonic deadline and one execution identity.
+
+    Resume IDs recover an already submitted run instead of submitting again. A
+    bounded local wait slice continues the same execution; an unproven terminal
+    state stays recoverable, and a terminal state wins even when that wait
+    reports ``timed_out`` at its boundary. The submission callback persists the
+    identity immediately so a killed campaign recovers it. Verification binds
+    the receipt to the requested target and candidate; ``device_id`` is part of
+    the execution identity and a resume keeps its card.
+    """
+    started = time.monotonic()
+    deadline = started + max(1.0, float(timeout_sec))
+    requested_device = str(device_id or "").strip()
+    submit_cmd = [
+        agent_gates_bin,
+        "submit",
+        "--workspace",
+        workspace,
+        "--adapter",
+        AGENT_GATES_ADAPTER,
+        "--gate",
+        gate_id,
+        "--target",
+        target,
+        "--json",
+    ]
+    if candidate_path is not None:
+        submit_cmd.extend(["--candidate", candidate_path])
+    if requested_device:
+        submit_cmd.extend(["--device-id", requested_device])
+
+    def _failed(
+        execution_id: str,
+        message: str,
+        *,
+        run_id: str = "",
+        receipt_path: str = "",
+        resolved_device_id: str = "",
+        state: str = "",
+        execution_terminal: bool = True,
+    ) -> _V2GateExecution:
+        return _V2GateExecution(
+            execution_id=execution_id,
+            run_id=run_id,
+            receipt_path=receipt_path,
+            transport_error=message[-1000:],
+            elapsed_sec=time.monotonic() - started,
+            device_id=resolved_device_id or requested_device,
+            state=state,
+            execution_terminal=execution_terminal,
+        )
+
+    if resume_execution_id:
+        execution_id = resume_execution_id
+        resolved_device = requested_device
+    else:
+        try:
+            proc, parsed = _run_agent_gates_v2_cmd(
+                submit_cmd,
+                root=root,
+                timeout_sec=min(_V2_SUBMIT_TIMEOUT_SEC, max(1.0, deadline - started)),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return _failed("", f"{gate_id} submit failed: {exc}")
+        if proc.returncode != 0:
+            return _failed("", proc.stderr or proc.stdout or f"{gate_id} submit failed")
+        execution_id = str(parsed.get("execution_id", ""))
+        if not execution_id:
+            return _failed("", f"{gate_id} submit returned no execution_id")
+        resolved_device = str(
+            parsed.get("device_id") or parsed.get("deviceId") or requested_device or ""
+        )
+        if on_execution_started is not None:
+            on_execution_started(execution_id, resolved_device)
+
+    run_id = resume_run_id
+    last_state = ""
+    if not run_id:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                terminal = last_state in {"FINISHED", "CANCELLED", "INTERRUPTED"}
+                return _failed(
+                    execution_id,
+                    f"{gate_id} execution {execution_id} wait timed out",
+                    resolved_device_id=resolved_device,
+                    state=last_state or "RUNNING",
+                    execution_terminal=terminal,
+                )
+            wait_seconds = min(_V2_WAIT_SLICE_SEC, remaining)
+            wait_cmd = [
+                agent_gates_bin,
+                "wait",
+                "--execution-id",
+                execution_id,
+                "--timeout",
+                f"{wait_seconds:g}",
+                "--json",
+            ]
+            try:
+                proc, parsed = _run_agent_gates_v2_cmd(
+                    wait_cmd,
+                    root=root,
+                    timeout_sec=wait_seconds + 5.0,
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            except OSError as exc:
+                return _failed(
+                    execution_id,
+                    f"{gate_id} execution {execution_id} wait failed: {exc}",
+                    resolved_device_id=resolved_device,
+                    state=last_state,
+                    execution_terminal=False,
+                )
+            if proc.returncode != 0:
+                return _failed(
+                    execution_id,
+                    proc.stderr or proc.stdout or f"{gate_id} execution {execution_id} wait failed",
+                    resolved_device_id=resolved_device,
+                    state=last_state,
+                    execution_terminal=False,
+                )
+            status = parsed.get("status")
+            state = str(status.get("state") or "") if isinstance(status, Mapping) else ""
+            if state:
+                last_state = state
+            if state == "FINISHED":
+                run_id = str(status.get("run_id") or "")
+                break
+            if state in {"CANCELLED", "INTERRUPTED"}:
+                return _failed(
+                    execution_id,
+                    f"{gate_id} execution {execution_id} ended in state {state!r}",
+                    resolved_device_id=resolved_device,
+                    state=state,
+                    execution_terminal=True,
+                )
+            if parsed.get("timed_out") is True:
+                continue
+            if state is None or not state:
+                return _failed(
+                    execution_id,
+                    f"{gate_id} execution {execution_id} wait returned no status",
+                    resolved_device_id=resolved_device,
+                    state=last_state,
+                    execution_terminal=False,
+                )
+            if state != "FINISHED":
+                return _failed(
+                    execution_id,
+                    f"{gate_id} execution {execution_id} ended in state {state!r}",
+                    resolved_device_id=resolved_device,
+                    state=state,
+                    execution_terminal=True,
+                )
+            run_id = str(status.get("run_id") or "")
+            break
+    if not run_id:
+        return _failed(
+            execution_id,
+            f"{gate_id} execution {execution_id} finished without run_id",
+            resolved_device_id=resolved_device,
+            state=last_state or "FINISHED",
+            execution_terminal=True,
+        )
+
+    try:
+        evidence_root = _agent_gates_evidence_root()
+    except (OSError, ValueError) as exc:
+        return _failed(
+            execution_id,
+            f"{gate_id} evidence root unavailable: {exc}",
+            run_id=run_id,
+            resolved_device_id=resolved_device,
+            state=last_state or "FINISHED",
+        )
+    report_cmd = [
+        agent_gates_bin,
+        "report",
+        "--run-id",
+        run_id,
+        "--evidence-root",
+        str(evidence_root),
+        "--json",
+    ]
+    post_wait = min(_V2_POST_WAIT_TIMEOUT_SEC, max(1.0, deadline - time.monotonic()))
+    try:
+        proc, report = _run_agent_gates_v2_cmd(report_cmd, root=root, timeout_sec=post_wait)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _failed(
+            execution_id,
+            f"{gate_id} report failed: {exc}",
+            run_id=run_id,
+            resolved_device_id=resolved_device,
+            state=last_state or "FINISHED",
+        )
+    if not report or "receiptPath" not in report:
+        return _failed(
+            execution_id,
+            proc.stderr or proc.stdout or f"{gate_id} report returned no receipt",
+            run_id=run_id,
+            resolved_device_id=resolved_device,
+            state=last_state or "FINISHED",
+        )
+    receipt_path = str(report.get("receiptPath", ""))
+
+    verify_cmd = [
+        agent_gates_bin,
+        "verify-requirements",
+        "--workspace",
+        workspace,
+        "--adapter",
+        AGENT_GATES_ADAPTER,
+        "--gate",
+        gate_id,
+        "--run-id",
+        run_id,
+        "--json",
+    ]
+    if candidate_path is not None:
+        verify_cmd.extend(["--target", target, "--candidate", candidate_path])
+    post_wait = min(_V2_POST_WAIT_TIMEOUT_SEC, max(1.0, deadline - time.monotonic()))
+    try:
+        proc, verification = _run_agent_gates_v2_cmd(verify_cmd, root=root, timeout_sec=post_wait)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _failed(
+            execution_id,
+            f"{gate_id} requirement verification failed: {exc}",
+            run_id=run_id,
+            receipt_path=receipt_path,
+            resolved_device_id=resolved_device,
+            state=last_state or "FINISHED",
+        )
+    if not verification or "satisfied" not in verification:
+        return _failed(
+            execution_id,
+            proc.stderr or proc.stdout or f"{gate_id} requirement verification returned no verdict",
+            run_id=run_id,
+            receipt_path=receipt_path,
+            resolved_device_id=resolved_device,
+            state=last_state or "FINISHED",
+        )
+    return _V2GateExecution(
+        execution_id=execution_id,
+        run_id=run_id,
+        receipt_path=receipt_path,
+        report=report,
+        verification=verification,
+        elapsed_sec=time.monotonic() - started,
+        device_id=resolved_device,
+        state=last_state or "FINISHED",
+        execution_terminal=True,
+    )
+
+
+def _source_identity_matches(verification: Mapping[str, object], root: Path) -> bool:
+    identity = verification.get("current_source_identity")
+    identity_root = identity.get("root") if isinstance(identity, Mapping) else None
+    return bool(identity_root) and Path(str(identity_root)).resolve() == root
+
+
+def _l3_evidence_payload(observation: Mapping[str, object]) -> Mapping[str, object]:
+    for key in ("l3Evidence", "evidence"):
+        candidate = observation.get(key)
+        if isinstance(candidate, Mapping):
+            return candidate
+    return observation
+
+
+def _l3_signed_failure_category(
+    observation: Mapping[str, object],
+    evidence: Mapping[str, object],
+) -> str:
+    """Return the adapter-signed category, falling back to the structured kind."""
+    for container in (observation, evidence):
+        raw = container.get("failureCategory")
+        if raw is not None and str(raw).strip():
+            return str(raw).strip().lower()
+    structured = evidence.get("failure")
+    if isinstance(structured, Mapping):
+        return str(structured.get("kind") or "").strip().lower()
+    return FAILURE_KIND_INFRASTRUCTURE
+
+
+def _l3_structured_failure(
+    observation: Mapping[str, object],
+    evidence: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    """Return the producer's highest-precedence structured failure, if any."""
+    for container in (evidence, observation):
+        structured = container.get("failure")
+        if isinstance(structured, Mapping) and structured:
+            return structured
+    return None
+
+
+def _l3_candidate_numeric_failure(
+    marker: Mapping[str, object],
+    evidence: Mapping[str, object],
+    raw_category: str,
+) -> bool:
+    """Whether a producer marker binds a numeric regression to this candidate.
+
+    A bare failed node/case is never enough. The marker must name a candidate
+    comparison failure, and the signed summary must show that same node and
+    case in a failed state.
+    """
+    if raw_category != "numeric":
+        return False
+    expected = {
+        "kind": "candidate",
+        "category": "numeric",
+        "role": "candidate",
+        "stage": "comparison",
+    }
+    for key, value in expected.items():
+        if str(marker.get(key) or "").strip().lower() != value:
+            return False
+    if not str(marker.get("comparator") or "").strip():
+        return False
+    node_name = marker.get("node")
+    case_id = marker.get("case")
+    if not isinstance(node_name, str) or not node_name or case_id is None:
+        return False
+    comparisons = marker.get("comparisons")
+    if not isinstance(comparisons, Sequence) or isinstance(comparisons, (str, bytes)):
+        return False
+    if not any(
+        isinstance(row, Mapping) and row.get("passed") is False
+        for row in comparisons
+    ):
+        return False
+    failures = evidence.get("failures")
+    if isinstance(failures, Sequence) and not isinstance(failures, (str, bytes)):
+        blocked = {"infrastructure", "coverage"}
+        if any(
+            isinstance(row, Mapping)
+            and str(row.get("kind") or "").strip().lower() in blocked
+            for row in failures
+        ):
+            return False
+    nodes = evidence.get("nodes")
+    if not isinstance(nodes, Sequence) or isinstance(nodes, (str, bytes)):
+        return False
+    for node in nodes:
+        if not isinstance(node, Mapping) or node.get("name") != node_name:
+            continue
+        if str(node.get("status") or "").strip().lower() not in {"failed", "error"}:
+            return False
+        cases = node.get("cases")
+        if not isinstance(cases, Mapping):
+            return False
+        if str(cases.get(str(case_id)) or "").strip().lower() not in {"failed", "error"}:
+            return False
+        return True
+    return False
+
+
+def _l3_failure_kind(
+    observation: Mapping[str, object],
+    evidence: Mapping[str, object],
+    coverage: Mapping[str, object] | None,
+) -> str:
+    """Classify a candidate defect only from explicit signed producer evidence.
+
+    A failed JUnit/node/case row, a bare failure category, or a marker whose
+    role/node/case/comparison does not line up is infrastructure. Missing or
+    skipped coverage, interruptions, write errors and unreadable snapshots
+    preserve the pending candidate and never consume stagnation.
+    """
+    _ = coverage
+    interruption = evidence.get("interruption")
+    if isinstance(interruption, Mapping):
+        error_category = str(interruption.get("errorCategory") or "").strip()
+        if error_category or interruption.get("signal") or interruption.get("interrupted"):
+            return FAILURE_KIND_INFRASTRUCTURE
+    write_errors = evidence.get("writeErrors")
+    if (
+        isinstance(write_errors, Sequence)
+        and not isinstance(write_errors, (str, bytes))
+        and len(write_errors) > 0
+    ):
+        return FAILURE_KIND_INFRASTRUCTURE
+    phase = str(evidence.get("phase") or "").strip().lower()
+    if phase != "finished":
+        return FAILURE_KIND_INFRASTRUCTURE
+    raw = _l3_signed_failure_category(observation, evidence)
+    structured = _l3_structured_failure(observation, evidence)
+    if structured is None:
+        return FAILURE_KIND_INFRASTRUCTURE
+    if _l3_candidate_numeric_failure(structured, evidence, raw):
+        return FAILURE_KIND_CANDIDATE
+    return FAILURE_KIND_INFRASTRUCTURE
+
+
+def classify_l3_observation_failure(
+    observation: Mapping[str, object],
+) -> tuple[str, bool]:
+    """Return ``(failure_kind, pending)`` for a signed L3 gate observation."""
+    evidence = _l3_evidence_payload(observation)
+    coverage_raw = evidence.get("coverage")
+    kind = _l3_failure_kind(
+        observation,
+        evidence,
+        coverage_raw if isinstance(coverage_raw, Mapping) else None,
+    )
+    return kind, kind != FAILURE_KIND_CANDIDATE
+
+
+def l3_failure_result_from_observation(
+    observation: Mapping[str, object],
+    *,
+    run_id: str = "",
+    receipt_path: str = "",
+    execution_id: str = "",
+    candidate_sha256: str = "",
+    target_path: str = "",
+    device_id: str = "",
+    state: str = "",
+    execution_terminal: bool = True,
+) -> L3AcceptanceResult:
+    """Map an adapter L3 observation to the campaign failure result."""
+    evidence = _l3_evidence_payload(observation)
+    kind, pending = classify_l3_observation_failure(observation)
+    return L3AcceptanceResult(
+        passed=False,
+        run_id=run_id,
+        receipt_path=receipt_path,
+        failure_kind=kind,
+        failure_category=_l3_signed_failure_category(observation, evidence),
+        pending=pending,
+        execution_id=execution_id,
+        candidate_sha256=candidate_sha256,
+        target_path=target_path,
+        device_id=device_id,
+        state=state,
+        execution_terminal=execution_terminal,
+    )
+
+
 def run_l3_full_contract_via_agent_gates(
     *,
     operator_name: str | None = None,
@@ -1860,90 +2462,221 @@ def run_l3_full_contract_via_agent_gates(
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     device_id: str = "1",
-    timeout_sec: int = 600,
+    timeout_sec: int = DEFAULT_L3_PROMOTION_WAIT_SEC,
+    resume_execution_id: str = "",
+    resume_run_id: str = "",
+    on_execution_started: Callable[[str, str], None] | None = None,
 ) -> L3AcceptanceResult:
-    """Run full 20-case + dynamic-cache test_npu_acceptance.py via AgentGates L3 gate."""
-    t0 = time.monotonic()
-    root = Path(source_root).resolve() if source_root is not None else default_source_root()
-    resolved_env = _resolve_env_file_path(env_file)
-    ag_bin = _resolve_agent_gates_bin(root)
-    env_vals = parse_simple_env_file(resolved_env)
-    cann_repo = resolve_cannbench_repo(
-        cannbench_repo=env_vals.get("TILEFOUNDRY_NPU_CANNBENCH_REPO"),
-        env_file=resolved_env,
-    )
-    cache_dir = _default_surrogate_cache_dir()
-    tl_cache_dir = _default_surrogate_tl_cache_dir()
+    """Run the L3 promotion gate through V2 and validate its signed promotion evidence.
 
-    with tempfile.TemporaryDirectory(prefix="tf_l3_gate_") as tmp_dir:
-        tmp = Path(tmp_dir)
-        shim_dir = ensure_npu_compare_shim_dir(tmp / "shim", cannbench_repo=cann_repo)
-        (shim_dir / "sitecustomize.py").write_text(_L3_CACHE_SITECUSTOMIZE, encoding="utf-8")
-        tmp_env = _write_temp_env_file(
-            resolved_env,
-            tmp / "env.sh",
-            {
-                "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/benchmarks/test_npu_acceptance.py",
-                "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE": "1",
-            },
+    The adapter owns the interpreter, CANN/TileLang setup, cache policy and device.
+    TileFoundry supplies only the canonical target and the workspace-relative candidate;
+    the signed receipt must bind the actual imported candidate digest and full coverage.
+    """
+    _ = env_file
+    result_device = str(device_id or "")
+    started = time.monotonic()
+
+    def _fail(
+        message: str,
+        *,
+        execution_id: str = "",
+        run_id: str = "",
+        receipt: str = "",
+        result_device_id: str = "",
+        state: str = "",
+        execution_terminal: bool = True,
+    ) -> L3AcceptanceResult:
+        return L3AcceptanceResult(
+            passed=False,
+            run_id=run_id,
+            receipt_path=receipt,
+            elapsed_sec=time.monotonic() - started,
+            error_message=message[-1000:],
+            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+            execution_id=execution_id,
+            candidate_sha256="",
+            target_path="",
+            device_id=result_device_id or result_device,
+            state=state,
+            execution_terminal=execution_terminal,
         )
-        cmd = [
-            ag_bin,
-            "run",
-            "--adapter",
-            "tilefoundry-npu",
-            "--source",
-            str(root),
-            "--env-file",
-            str(tmp_env),
-            "--device-id",
-            str(device_id),
-            "--gate",
-            "tilefoundry-npu-device-fast",
-            "--json",
-        ]
-        prev_pp = os.environ.get("PYTHONPATH", "")
-        new_pp = f"{shim_dir}{os.pathsep}{prev_pp}" if prev_pp else str(shim_dir)
-        l3_env: dict[str, str] = {
-            "PYTHONPATH": new_pp,
-            "CANNBENCH_CACHE_DIR": str(cache_dir),
-            "TF_SURROGATE_TL_CACHE_DIR": str(tl_cache_dir),
-            "TF_SURROGATE_SHIM_ONLY": "1",
-            "TF_SURROGATE_SHIM_DIR": str(shim_dir),
-        }
-        if operator_name:
-            l3_env["TF_L3_TARGET_OPERATOR"] = str(operator_name)
-        if candidate_module_path is not None:
-            l3_env["TF_L3_TARGET_MODULE_PATH"] = str(Path(candidate_module_path).resolve())
-        sub_env = _clean_agent_gates_subprocess_env(l3_env)
-        proc, parsed = _run_agent_gates_cmd(
-            cmd,
-            cwd=str(root),
-            env=sub_env,
-            timeout_sec=timeout_sec,
+
+    if operator_name is None or candidate_module_path is None:
+        return _fail("L3 promotion requires an operator name and candidate module path")
+    try:
+        target_task = get_operator_task(operator_name)
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        return _fail(f"L3 promotion target resolution failed: {exc}")
+    root = Path(source_root).resolve() if source_root is not None else default_source_root()
+    candidate = Path(candidate_module_path).resolve()
+    relative = _workspace_relative_candidate(root, candidate)
+    if relative is None:
+        return _fail(f"L3 candidate {candidate} is outside workspace source root {root}")
+    if not candidate.is_file():
+        return _fail(f"L3 candidate module {candidate} does not exist")
+    candidate_digest = _sha256_file(candidate)
+    try:
+        agent_gates_bin = _resolve_agent_gates_bin(root)
+        workspace = _agent_gates_workspace_name(root)
+    except (OSError, ValueError) as exc:
+        return _fail(str(exc))
+    target_path = str(candidate)
+
+    execution = _run_v2_gate(
+        agent_gates_bin=agent_gates_bin,
+        root=root,
+        workspace=workspace,
+        gate_id=AGENT_GATES_L3_PROMOTION_GATE,
+        target=target_task,
+        candidate_path=relative,
+        timeout_sec=timeout_sec,
+        device_id=result_device,
+        resume_execution_id=resume_execution_id,
+        resume_run_id=resume_run_id,
+        on_execution_started=on_execution_started,
+    )
+    if execution.transport_error:
+        return _fail(
+            execution.transport_error,
+            execution_id=execution.execution_id,
+            run_id=execution.run_id,
+            receipt=execution.receipt_path,
+            result_device_id=execution.device_id,
+            state=execution.state,
+            execution_terminal=execution.execution_terminal,
         )
-        run_id = str(parsed.get("runId", ""))
-        ok = proc.returncode == 0 and parsed.get("status") == "PASS"
-        err = "" if ok else (proc.stderr or proc.stdout or "L3 contract failed")[-1000:]
-        if ok:
-            if not run_id:
-                ok = False
-                err = "AgentGates L3 contract reported PASS without a runId"
-            else:
-                verified, verify_error = verify_agent_gates_receipt(
-                    ag_bin,
-                    run_id,
-                    source_root=root,
-                )
-                if not verified:
-                    ok = False
-                    err = verify_error or "L3 receipt verification failed"
+    row, observation = _gate_observation(execution.report, AGENT_GATES_L3_PROMOTION_GATE)
+    if row is None:
+        return _fail(
+            "L3 signed receipt has no promotion gate observation",
+            execution_id=execution.execution_id,
+            run_id=execution.run_id,
+            receipt=execution.receipt_path,
+            result_device_id=execution.device_id,
+            state=execution.state,
+            execution_terminal=execution.execution_terminal,
+        )
+    evidence = _l3_evidence_payload(observation)
+    coverage_raw = evidence.get("coverage")
+    coverage = coverage_raw if isinstance(coverage_raw, Mapping) else None
+    recorded_status = _gate_recorded_status(row)
+
+    def _reject(message: str, *, failure_kind: str) -> L3AcceptanceResult:
+        return L3AcceptanceResult(
+            passed=False,
+            run_id=execution.run_id,
+            receipt_path=execution.receipt_path,
+            elapsed_sec=time.monotonic() - started,
+            error_message=message[-1000:],
+            failure_kind=failure_kind,
+            failure_category=_l3_signed_failure_category(observation, evidence),
+            pending=failure_kind != FAILURE_KIND_CANDIDATE,
+            execution_id=execution.execution_id,
+            candidate_sha256=candidate_digest,
+            target_path=target_path,
+            device_id=execution.device_id or result_device,
+            state=execution.state,
+            execution_terminal=execution.execution_terminal,
+        )
+
+    if recorded_status != "PASS":
+        return _reject(
+            f"L3 gate recorded status {recorded_status or 'missing'}: "
+            f"{row.get('failures') or observation.get('error') or 'no detail'}",
+            failure_kind=_l3_failure_kind(observation, evidence, coverage),
+        )
+    if not execution.verified:
+        return _reject(
+            f"L3 receipt did not verify: {execution.verification.get('failures') or 'unsatisfied'}",
+            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+        )
+    if not _source_identity_matches(execution.verification, root):
+        return _reject(
+            "L3 verified source identity does not match requested source",
+            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+        )
+    schema = str(evidence.get("schema", ""))
+    profile = str(evidence.get("profile", ""))
+    if schema != "tilefoundry-l3-evidence/v1" or profile != "l3-promotion":
+        return _reject(
+            f"L3 evidence schema/profile mismatch: schema={schema or 'missing'} "
+            f"profile={profile or 'missing'}",
+            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+        )
+    target = evidence.get("target")
+    declared_task = target.get("task") if isinstance(target, Mapping) else None
+    if not declared_task or str(declared_task) != target_task:
+        return _reject(
+            f"L3 evidence target task {declared_task or 'missing'} does not match {target_task}",
+            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+        )
+    target_module = target.get("modulePath") if isinstance(target, Mapping) else None
+    if not target_module or Path(str(target_module)).resolve() != Path(target_path):
+        return _reject(
+            "L3 evidence target does not match requested target module",
+            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+        )
+    declared = evidence.get("candidate")
+    declared_path = declared.get("modulePath") if isinstance(declared, Mapping) else None
+    declared_digest = declared.get("sha256") if isinstance(declared, Mapping) else None
+    if not declared_path or Path(str(declared_path)).resolve() != candidate:
+        return _reject(
+            "L3 evidence candidate path does not match the promoted candidate",
+            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+        )
+    if str(declared_digest or "") != candidate_digest:
+        return _reject(
+            "L3 evidence candidate digest does not match the promoted candidate",
+            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+        )
+    interpreter = evidence.get("interpreter")
+    if not isinstance(interpreter, Mapping) or interpreter.get("match") is not True:
+        return _reject(
+            "L3 evidence interpreter did not match the adapter-resolved interpreter",
+            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+        )
+    if coverage is None or coverage.get("qualified") is not True:
+        return _reject(
+            "L3 evidence did not qualify full contract coverage",
+            failure_kind=_l3_failure_kind(observation, evidence, coverage),
+        )
+    nodes = coverage.get("nodes") if isinstance(coverage.get("nodes"), Mapping) else {}
+    cases = coverage.get("cases") if isinstance(coverage.get("cases"), Mapping) else {}
+    assert isinstance(nodes, Mapping) and isinstance(cases, Mapping)
+    if (
+        nodes.get("missing")
+        or nodes.get("failed")
+        or nodes.get("skipped")
+        or nodes.get("blocked")
+        or cases.get("missing")
+        or cases.get("unexpected")
+        or coverage.get("referenceCacheProblem")
+    ):
+        return _reject(
+            "L3 evidence coverage is incomplete: "
+            f"{dict(nodes)} / {dict(cases)} / "
+            f"referenceCacheProblem={coverage.get('referenceCacheProblem')}",
+            failure_kind=_l3_failure_kind(observation, evidence, coverage),
+        )
+    expected_cases = _as_positive_int(cases.get("expected"))
+    completed_cases = _as_positive_int(cases.get("completed"))
+    if expected_cases <= 0 or completed_cases != expected_cases:
+        return _reject(
+            f"L3 evidence case coverage incomplete: {completed_cases}/{expected_cases}",
+            failure_kind=_l3_failure_kind(observation, evidence, coverage),
+        )
     return L3AcceptanceResult(
-        passed=ok,
-        run_id=run_id,
-        receipt_path=str(parsed.get("receiptPath", "")),
-        elapsed_sec=time.monotonic() - t0,
-        error_message=err,
+        passed=True,
+        run_id=execution.run_id,
+        receipt_path=execution.receipt_path,
+        elapsed_sec=time.monotonic() - started,
+        execution_id=execution.execution_id,
+        candidate_sha256=candidate_digest,
+        target_path=target_path,
+        device_id=execution.device_id or result_device,
+        state=execution.state,
+        execution_terminal=execution.execution_terminal,
     )
 
 
@@ -2146,13 +2879,7 @@ def run_micro_probe_via_agent_gates(
 
 def _agent_gates_evidence_root() -> Path:
     """Read the configured AgentGates evidence root used by the V2 worker."""
-    configured = os.environ.get("AGENT_GATES_CONFIG", "").strip()
-    path = (
-        Path(configured).expanduser()
-        if configured
-        else Path.home() / ".config/agent-gates/config.toml"
-    )
-    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    raw = _agent_gates_config()
     evidence_root = raw.get("evidence_root")
     if not isinstance(evidence_root, str) or not evidence_root.strip():
         raise ValueError("AgentGates evidence_root must be configured")
@@ -2172,7 +2899,7 @@ def _extract_l4_metrics(
     for gate_row in parsed.get("gates", ()):
         if not isinstance(gate_row, Mapping):
             continue
-        if gate_row.get("gateId") != "tilefoundry-npu-cannbench":
+        if gate_row.get("gateId") != AGENT_GATES_L4_CANNBENCH_GATE:
             continue
         obs = gate_row.get("observations") or {}
         if not isinstance(obs, Mapping):
@@ -2209,248 +2936,298 @@ def _run_agent_gates_v2_cmd(
         text=True,
         capture_output=True,
         cwd=str(root),
-        env=_clean_agent_gates_subprocess_env({}),
+        env=_agent_gates_cli_env(),
         timeout=timeout_sec,
     )
     return proc, _parse_agent_gates_json(proc.stdout)
 
 
-def _l4_failure(error_message: str) -> L4CannbenchResult:
-    """Return a failed L4 result without metrics or promotion evidence."""
-    return L4CannbenchResult(passed=False, error_message=error_message[-1000:])
-
-
-def _run_l4_v2_agent_gates(
+def _l4_failure(
+    error_message: str,
     *,
-    agent_gates_bin: str,
-    root: Path,
-    workspace: str,
-    timeout_sec: int,
+    failure_kind: str = FAILURE_KIND_INFRASTRUCTURE,
+    execution_id: str = "",
+    run_id: str = "",
+    receipt_path: str = "",
+    observation: Mapping[str, object] | None = None,
+    device_id: str = "",
+    state: str = "",
+    execution_terminal: bool = True,
+    target_path: str = "",
+    candidate_sha256: str = "",
+    attempts: tuple[dict[str, str], ...] = (),
 ) -> L4CannbenchResult:
-    """Run one L4 execution through the V2 worker and authoritative verification."""
-    submit_cmd = [
-        agent_gates_bin,
-        "submit",
-        "--workspace",
-        workspace,
-        "--adapter",
-        "tilefoundry-npu",
-        "--gate",
-        "tilefoundry-npu-cannbench",
-        "--json",
-    ]
-    try:
-        proc, parsed = _run_agent_gates_v2_cmd(submit_cmd, root=root, timeout_sec=60.0)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return _l4_failure(f"L4 submit failed: {exc}")
-    if proc.returncode != 0:
-        return _l4_failure(proc.stderr or proc.stdout or "L4 submit failed")
-    execution_id = str(parsed.get("execution_id", ""))
-    if not execution_id:
-        return _l4_failure("L4 submit returned no execution_id")
+    """Return a failed L4 result without metrics or promotion evidence."""
+    obs = observation or {}
+    return L4CannbenchResult(
+        passed=False,
+        run_id=run_id,
+        receipt_path=receipt_path,
+        error_message=error_message[-1000:],
+        failure_kind=failure_kind,
+        execution_id=execution_id,
+        official_report_valid=obs.get("officialReportValid") is True,
+        all_cases_passed=obs.get("allCasesPassed") is True,
+        all_timings_valid=obs.get("allTimingsValid") is True,
+        case_count=_as_positive_int(obs.get("caseCount")),
+        passed_cases=_as_positive_int(obs.get("passedCases")),
+        device_id=device_id,
+        state=state,
+        execution_terminal=execution_terminal,
+        target_path=target_path,
+        candidate_sha256=candidate_sha256,
+        attempts=attempts,
+    )
 
-    deadline = time.monotonic() + timeout_sec
-    run_id = ""
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return _l4_failure(f"L4 execution {execution_id} wait timed out")
-        wait_seconds = min(60.0, remaining)
-        wait_cmd = [
-            agent_gates_bin,
-            "wait",
-            "--execution-id",
-            execution_id,
-            "--timeout",
-            f"{wait_seconds:g}",
-            "--json",
-        ]
-        try:
-            proc, parsed = _run_agent_gates_v2_cmd(
-                wait_cmd,
-                root=root,
-                timeout_sec=wait_seconds + 5.0,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return _l4_failure(f"L4 execution {execution_id} wait failed: {exc}")
-        if proc.returncode != 0:
-            return _l4_failure(
-                proc.stderr or proc.stdout or f"L4 execution {execution_id} wait failed"
-            )
-        if parsed.get("timed_out") is True:
+
+def _l4_candidate_matches(raw: object, expected: str, root: Path) -> bool:
+    text = str(raw or "").strip()
+    if not text:
+        return False
+    if text.endswith(expected) and (
+        text == expected or text.endswith("/" + expected)
+    ):
+        return True
+    path = Path(text)
+    return path.is_absolute() and path.resolve() == (root / expected).resolve()
+
+
+def _validate_l4_report(
+    execution: _V2GateExecution,
+    *,
+    root: Path,
+    target_task: str,
+    expected_candidate: str,
+) -> tuple[str, str]:
+    """Validate signed L4 evidence; return ``(error_message, failure_kind)``.
+
+    Only a complete official case set where every case passed is a candidate
+    verdict. Missing cases, a missing or non-numeric passed count, and missing
+    timings are unknown coverage: they preserve the pending candidate instead of
+    blaming it. Report validation flags and a short passed-case count are
+    candidate failures; identity, directory and signature problems are not.
+    """
+    if not execution.verified:
+        return (
+            f"L4 receipt did not verify: {execution.verification.get('failures') or 'unsatisfied'}",
+            FAILURE_KIND_INFRASTRUCTURE,
+        )
+    if not _source_identity_matches(execution.verification, root):
+        return (
+            "L4 verified source identity does not match requested source",
+            FAILURE_KIND_INFRASTRUCTURE,
+        )
+    row, obs = _gate_observation(execution.report, AGENT_GATES_L4_CANNBENCH_GATE)
+    if row is None:
+        return ("L4 signed receipt has no cannbench gate observation", FAILURE_KIND_INFRASTRUCTURE)
+    status = _gate_recorded_status(row)
+    if status != "PASS":
+        return (
+            f"L4 gate recorded status {status or 'missing'}: "
+            f"{row.get('failures') or obs.get('error') or 'no detail'}",
+            FAILURE_KIND_CANDIDATE if status == "FAIL" else FAILURE_KIND_INFRASTRUCTURE,
+        )
+    flags = {
+        "officialReportValid": obs.get("officialReportValid"),
+        "allCasesPassed": obs.get("allCasesPassed"),
+        "allTimingsValid": obs.get("allTimingsValid"),
+    }
+    bad_flags = [name for name, value in flags.items() if value is not True]
+    if bad_flags:
+        return (
+            f"L4 official report validation failed: {', '.join(bad_flags)}",
+            FAILURE_KIND_CANDIDATE,
+        )
+    case_count = _as_positive_int(obs.get("caseCount"))
+    passed_raw = obs.get("passedCases")
+    passed_cases = _as_positive_int(passed_raw)
+    timed_cases = _as_positive_int(obs.get("timedCases"))
+    if case_count <= 0:
+        return ("L4 signed observation reports no official cases", FAILURE_KIND_INFRASTRUCTURE)
+    if isinstance(passed_raw, bool) or not isinstance(passed_raw, (int, float)):
+        return (
+            "L4 signed observation has no valid passed-case count",
+            FAILURE_KIND_INFRASTRUCTURE,
+        )
+    if passed_cases != case_count:
+        return (
+            f"L4 passed {passed_cases}/{case_count} official cases",
+            FAILURE_KIND_CANDIDATE,
+        )
+    if timed_cases != case_count:
+        return (
+            f"L4 timed {timed_cases}/{case_count} official cases",
+            FAILURE_KIND_INFRASTRUCTURE,
+        )
+    results = obs.get("results")
+    if not isinstance(results, Sequence) or isinstance(results, (str, bytes)):
+        return ("L4 signed observation has no per-target results", FAILURE_KIND_INFRASTRUCTURE)
+    matched = 0
+    for res_row in results:
+        if not isinstance(res_row, Mapping):
             continue
-        status = parsed.get("status")
-        state = status.get("state") if isinstance(status, Mapping) else None
-        if state is None:
-            return _l4_failure(f"L4 execution {execution_id} wait returned no status")
-        if state != "FINISHED":
-            return _l4_failure(f"L4 execution {execution_id} ended in state {state!r}")
-        run_id = str(status.get("run_id") or "")
-        break
-    if not run_id:
-        return _l4_failure(f"L4 execution {execution_id} finished without run_id")
-
-    verify_cmd = [
-        agent_gates_bin,
-        "verify-requirements",
-        "--workspace",
-        workspace,
-        "--adapter",
-        "tilefoundry-npu",
-        "--gate",
-        "tilefoundry-npu-cannbench",
-        "--run-id",
-        run_id,
-        "--json",
-    ]
-    try:
-        proc, verified = _run_agent_gates_v2_cmd(
-            verify_cmd,
-            root=root,
-            timeout_sec=min(60.0, max(1.0, timeout_sec)),
+        if target_task and res_row.get("task") != target_task:
+            continue
+        matched += 1
+        if res_row.get("reportValid") is not True:
+            return (
+                f"L4 official report is not valid for task {target_task or res_row.get('task')}",
+                FAILURE_KIND_CANDIDATE,
+            )
+        if not str(res_row.get("reportDir", "")).strip():
+            return ("L4 official report directory is missing", FAILURE_KIND_INFRASTRUCTURE)
+        if not _l4_candidate_matches(res_row.get("candidate"), expected_candidate, root):
+            return (
+                f"L4 receipt candidate does not match {expected_candidate}",
+                FAILURE_KIND_INFRASTRUCTURE,
+            )
+    if matched == 0:
+        return (
+            f"L4 signed observation has no result for task {target_task or '<any>'}",
+            FAILURE_KIND_INFRASTRUCTURE,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return _l4_failure(f"L4 requirement verification failed: {exc}")
-    if proc.returncode != 0 or verified.get("satisfied") is not True:
-        details = verified.get("failures") or proc.stderr or proc.stdout or "unsatisfied"
-        return _l4_failure(f"L4 requirements not satisfied: {details}")
-    identity = verified.get("current_source_identity")
-    identity_root = identity.get("root") if isinstance(identity, Mapping) else None
-    if not identity_root or Path(str(identity_root)).resolve() != root:
-        return _l4_failure("L4 verified source identity does not match requested source")
+    return ("", "")
 
+
+def run_l4_official_cannbench_via_agent_gates(
+    *,
+    operator_name: str | None = None,
+    candidate_module_path: str | Path | None = None,
+    workspace: str | None = None,
+    source_root: str | Path | None = None,
+    env_file: str | Path | None = None,
+    device_id: str = "1",
+    timeout_sec: int = DEFAULT_L4_CANNBENCH_WAIT_SEC,
+    resume_execution_id: str = "",
+    resume_run_id: str = "",
+    on_execution_started: Callable[[str, str], None] | None = None,
+) -> L4CannbenchResult:
+    """Run official tilefoundry-npu-cannbench through V2 and verify its signed receipt.
+
+    The campaign's actual entry always uses V2: the adapter owns environment, device
+    lease and cache policy, while the candidate module is bound by path and signed
+    observation. The default wait budgets queueing, prep and the 3600 s official bound.
+    Metrics are returned only after the official-final validation flags, case counts,
+    source identity and candidate binding check out. A resume keeps its original card,
+    and a retry on another card is a fresh call so no timings are stitched across cards.
+    """
+    _ = env_file
+    result_device = str(device_id or "")
+    if operator_name is None:
+        return _l4_failure("L4 cannbench requires a canonical operator name", device_id=result_device)
     try:
-        evidence_root = _agent_gates_evidence_root()
+        target_task = get_operator_task(operator_name)
+    except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        return _l4_failure(
+            f"L4 cannbench target resolution failed: {exc}", device_id=result_device
+        )
+    root = Path(source_root).resolve() if source_root is not None else default_source_root()
+    if candidate_module_path is not None:
+        expected_path = Path(candidate_module_path).resolve()
+    else:
+        expected_path = (root / get_operator_module_relpath(operator_name)).resolve()
+    relative = _workspace_relative_candidate(root, expected_path)
+    if relative is None:
+        return _l4_failure(
+            f"L4 candidate {expected_path} is outside workspace source root {root}",
+            device_id=result_device,
+        )
+    try:
+        candidate_digest = _sha256_file(expected_path)
+    except OSError as exc:
+        return _l4_failure(
+            f"L4 candidate module {expected_path} cannot be read: {exc}",
+            device_id=result_device,
+            target_path=str(expected_path),
+        )
+    try:
+        agent_gates_bin = _resolve_agent_gates_bin(root)
+        resolved_workspace = workspace or _agent_gates_workspace_name(root)
     except (OSError, ValueError) as exc:
-        return _l4_failure(f"L4 evidence root unavailable: {exc}")
-    report_cmd = [
-        agent_gates_bin,
-        "report",
-        "--run-id",
-        run_id,
-        "--evidence-root",
-        str(evidence_root),
-        "--json",
-    ]
-    try:
-        proc, report = _run_agent_gates_v2_cmd(
-            report_cmd,
-            root=root,
-            timeout_sec=min(60.0, max(1.0, timeout_sec)),
+        return _l4_failure(str(exc), device_id=result_device)
+
+    execution = _run_v2_gate(
+        agent_gates_bin=agent_gates_bin,
+        root=root,
+        workspace=resolved_workspace,
+        gate_id=AGENT_GATES_L4_CANNBENCH_GATE,
+        target=target_task,
+        candidate_path=relative,
+        timeout_sec=timeout_sec,
+        device_id=result_device,
+        resume_execution_id=resume_execution_id,
+        resume_run_id=resume_run_id,
+        on_execution_started=on_execution_started,
+    )
+    if execution.transport_error:
+        return _l4_failure(
+            execution.transport_error,
+            execution_id=execution.execution_id,
+            run_id=execution.run_id,
+            receipt_path=execution.receipt_path,
+            device_id=execution.device_id or result_device,
+            state=execution.state,
+            execution_terminal=execution.execution_terminal,
+            target_path=str(expected_path),
+            candidate_sha256=candidate_digest,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return _l4_failure(f"L4 report failed: {exc}")
-    if proc.returncode != 0:
-        return _l4_failure(proc.stderr or proc.stdout or "L4 report failed")
-    avg_speedup, score, report_dir, speedups, elapsed = _extract_l4_metrics(report, "")
+    _, observation = _gate_observation(execution.report, AGENT_GATES_L4_CANNBENCH_GATE)
+    error, failure_kind = _validate_l4_report(
+        execution,
+        root=root,
+        target_task=target_task,
+        expected_candidate=relative,
+    )
+    if error:
+        return _l4_failure(
+            error,
+            failure_kind=failure_kind,
+            execution_id=execution.execution_id,
+            run_id=execution.run_id,
+            receipt_path=execution.receipt_path,
+            observation=observation,
+            device_id=execution.device_id or result_device,
+            state=execution.state,
+            execution_terminal=execution.execution_terminal,
+            target_path=str(expected_path),
+            candidate_sha256=candidate_digest,
+        )
+    avg_speedup, score, report_dir, speedups, elapsed = _extract_l4_metrics(
+        execution.report, target_task
+    )
     return L4CannbenchResult(
         passed=True,
         avg_speedup=avg_speedup,
         score=score,
         per_case_speedups=speedups,
         per_case_elapsed_us=elapsed,
-        run_id=run_id,
-        receipt_path=str(report.get("receiptPath", "")),
+        run_id=execution.run_id,
+        receipt_path=execution.receipt_path,
         report_dir=report_dir,
-    )
-
-
-def run_l4_official_cannbench_via_agent_gates(
-    *,
-    operator_name: str | None = None,
-    workspace: str | None = None,
-    source_root: str | Path | None = None,
-    env_file: str | Path | None = None,
-    device_id: str = "1",
-    timeout_sec: int = 3600,
-) -> L4CannbenchResult:
-    """Run official tilefoundry-npu-cannbench and verify its signed receipt.
-
-    Calls registered through ``workspace`` without env or device overrides use V2, where the
-    worker owns device selection and configuration.
-    """
-    root = Path(source_root).resolve() if source_root is not None else default_source_root()
-    ag_bin = _resolve_agent_gates_bin(root)
-    if (
-        operator_name is None
-        and workspace is not None
-        and env_file is None
-        and device_id == "1"
-    ):
-        return _run_l4_v2_agent_gates(
-            agent_gates_bin=ag_bin,
-            root=root,
-            workspace=workspace,
-            timeout_sec=timeout_sec,
-        )
-
-    resolved_env = _resolve_env_file_path(env_file)
-    target_task = get_operator_task(operator_name) if operator_name else ""
-    with tempfile.TemporaryDirectory(prefix="tf_l4_gate_") as tmp_dir:
-        tmp = Path(tmp_dir)
-        overrides: dict[str, str] = {}
-        if operator_name is not None:
-            rel_cand = get_operator_module_relpath(operator_name)
-            overrides["TILEFOUNDRY_NPU_CANNBENCH_TARGETS"] = f"{target_task}:{rel_cand}"
-        tmp_env = _write_temp_env_file(resolved_env, tmp / "env.sh", overrides)
-        cmd = [
-            ag_bin,
-            "run",
-            "--adapter",
-            "tilefoundry-npu",
-            "--source",
-            str(root),
-            "--env-file",
-            str(tmp_env),
-            "--device-id",
-            str(device_id),
-            "--gate",
-            "tilefoundry-npu-cannbench",
-            "--json",
-        ]
-        proc, parsed = _run_agent_gates_cmd(
-            cmd,
-            cwd=str(root),
-            env=_clean_agent_gates_subprocess_env({}),
-            timeout_sec=timeout_sec,
-        )
-        run_id = str(parsed.get("runId", ""))
-        receipt_path = str(parsed.get("receiptPath", ""))
-        run_passed = proc.returncode == 0 and parsed.get("status") == "PASS"
-        verified = False
-        verify_error = ""
-        if run_passed and run_id:
-            verified, verify_error = verify_agent_gates_receipt(
-                ag_bin,
-                run_id,
-                source_root=root,
-            )
-        ok = run_passed and verified
-        if not ok:
-            err = verify_error or (
-                proc.stderr or proc.stdout or "L4 CANNBench gate failed"
-            )[-1000:]
-        else:
-            err = ""
-
-    metrics = _extract_l4_metrics(parsed, target_task) if ok else (0.0, 0.0, "", {}, {})
-    avg_speedup, score, report_dir, speedups, elapsed = metrics
-    return L4CannbenchResult(
-        passed=ok,
-        avg_speedup=avg_speedup,
-        score=score,
-        per_case_speedups=speedups,
-        per_case_elapsed_us=elapsed,
-        run_id=run_id,
-        receipt_path=receipt_path,
-        report_dir=report_dir,
-        error_message=err,
+        execution_id=execution.execution_id,
+        official_report_valid=True,
+        all_cases_passed=True,
+        all_timings_valid=True,
+        case_count=_as_positive_int(observation.get("caseCount")),
+        passed_cases=_as_positive_int(observation.get("passedCases")),
+        device_id=execution.device_id or result_device,
+        state=execution.state,
+        execution_terminal=execution.execution_terminal,
+        target_path=str(expected_path),
+        candidate_sha256=candidate_digest,
     )
 
 
 __all__ = [
+    "AGENT_GATES_ADAPTER",
+    "AGENT_GATES_L3_PROMOTION_GATE",
+    "AGENT_GATES_L4_CANNBENCH_GATE",
     "AnchorEvalMetrics",
     "CandidateSurrogateResult",
+    "DEFAULT_L3_PROMOTION_WAIT_SEC",
+    "DEFAULT_L4_CANNBENCH_WAIT_SEC",
+    "FAILURE_KIND_CANDIDATE",
+    "FAILURE_KIND_INFRASTRUCTURE",
     "L0L1CandidateCheck",
     "L3AcceptanceResult",
     "L4CannbenchResult",
