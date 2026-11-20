@@ -2373,7 +2373,7 @@ def test_is_transient_blocked_env_retries_dependency_flake_not_device_fail():
         "gates": [
             {"gateId": "tilefoundry-npu-cpu", "status": "FAIL", "failures": ["NONZERO_EXIT"]},
             {
-                "gateId": "tilefoundry-npu-device",
+                "gateId": "tilefoundry-npu-device-fast",
                 "status": "NOT_RUN",
                 "failures": ["DEPENDENCY_NOT_PASSED"],
             },
@@ -3315,6 +3315,8 @@ def test_l3_full_contract_via_agent_gates_timeout_and_target_module_env(
         captured["cmd"] = list(cmd)
         captured["env"] = dict(env)
         captured["timeout"] = timeout
+        env_file_arg = cmd[list(cmd).index("--env-file") + 1]
+        captured["env_text"] = Path(env_file_arg).read_text(encoding="utf-8")
         return subprocess.CompletedProcess(
             args=cmd,
             returncode=0,
@@ -3328,8 +3330,19 @@ def test_l3_full_contract_via_agent_gates_timeout_and_target_module_env(
     monkeypatch.setattr(surrogate_cannbench, "resolve_cannbench_repo", lambda **_kw: tmp_path)
     monkeypatch.setattr(
         surrogate_cannbench,
+        "verify_agent_gates_receipt",
+        lambda *_a, **_kw: (True, ""),
+    )
+
+    def _make_shim(path, **_kw):
+        shim = Path(path)
+        shim.mkdir(parents=True, exist_ok=True)
+        return shim
+
+    monkeypatch.setattr(
+        surrogate_cannbench,
         "ensure_npu_compare_shim_dir",
-        lambda path, **_kw: Path(path),
+        _make_shim,
     )
 
     l3_res = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
@@ -3346,7 +3359,12 @@ def test_l3_full_contract_via_agent_gates_timeout_and_target_module_env(
     env_sent = captured["env"]
     assert env_sent["TF_L3_TARGET_OPERATOR"] == "attention_residual"
     assert env_sent["TF_L3_TARGET_MODULE_PATH"] == str(cand_mod.resolve())
+    assert env_sent["TF_SURROGATE_TL_CACHE_DIR"]
     assert "--device-id" in captured["cmd"] and "2" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--gate") + 1] == "tilefoundry-npu-device-fast"
+    env_text = str(captured["env_text"])
+    assert "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE=1" in env_text
+    assert "TILEFOUNDRY_NPU_CPU_TESTS" not in env_text
 
 
 def test_run_l0_l1_round_filter_isolates_syntax_repair_timeout(tmp_path: Path) -> None:
@@ -3665,9 +3683,17 @@ def _build_reg_a(tile_m=1):
             json.dumps({"passed": True, "metrics": {"baseline_dur_us": 50.0, "optimized_dur_us": 20.0, "speedup": 2.5, "numerical_ok": 1.0}}),
             encoding="utf-8",
         )
-        return subprocess.CompletedProcess(cmd, 0, "{}", ""), {"status": "PASS"}
+        return subprocess.CompletedProcess(cmd, 0, "{}", ""), {
+            "status": "PASS",
+            "runId": "r_micro",
+        }
 
     monkeypatch.setattr(surrogate_cannbench, "_run_agent_gates_cmd", _fake_ag_cmd)
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "verify_agent_gates_receipt",
+        lambda *_a, **_kw: (True, ""),
+    )
     probe_metrics = surrogate_cannbench.run_micro_probe_via_agent_gates(
         MicroProbeSpec(
             probe_id="p_test",

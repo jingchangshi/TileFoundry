@@ -1,4 +1,6 @@
-"""Parser for ``bisheng --cce-res-usage`` output, CCE assembly/IR dumps, and Tier-1 behavior registry."""
+"""Parse ``bisheng --cce-res-usage`` output, CCE assembly/IR dumps, and Tier-1
+behavior registry.
+"""
 
 from __future__ import annotations
 
@@ -129,12 +131,12 @@ def _detect_local_membar_in_vf(res_text: str = "", asm_or_dump_text: str = "") -
 
 
 def _detect_vf_fusion_breaks(res_text: str = "", asm_or_dump_text: str = "") -> int:
+    """Count VF fusion breaks, ignoring comments and prototypes that double-count launches."""
     combined = "\n".join(part for part in (res_text, asm_or_dump_text) if part)
     explicit = _match_int((r"\bvf_fusion_breaks\s*[:=]\s*(\d+)",), combined)
     if explicit is not None:
         return max(0, explicit)
     raw_src = asm_or_dump_text if asm_or_dump_text.strip() else combined
-    # Strip C/C++ comments and forward prototypes so declarations don't double-count launches.
     src_no_comments = re.sub(r"/\*.*?\*/", " ", raw_src, flags=re.DOTALL)
     src_no_comments = re.sub(r"//[^\n]*", "", src_no_comments)
     src_lines = [
@@ -434,7 +436,7 @@ def _invoke_penalty_fn(
 
 @dataclass(frozen=True)
 class CompilerBehaviorDetector:
-    """Plugin descriptor for one compiler-level phenomenon parsed from dumps and penalized in Tier-1."""
+    """One compiler-level phenomenon parsed from dumps and penalized in Tier-1."""
 
     name: str
     parse_fn: Callable[..., Any]
@@ -510,7 +512,7 @@ class CompilerBehaviorRegistry:
         return CompilerBehaviorRegistry(list(self._detectors.values()))
 
     def parse(self, res_text: str = "", asm_or_dump_text: str = "") -> BishengResourceSummary:
-        """Run all registered detectors on compiler/asm/IR text to produce BishengResourceSummary."""
+        """Run registered detectors over compiler, assembly, or IR text."""
         combined = "\n".join(part for part in (res_text, asm_or_dump_text) if part)
         if not combined.strip():
             return BishengResourceSummary()

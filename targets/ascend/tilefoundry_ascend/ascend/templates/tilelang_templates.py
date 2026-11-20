@@ -44,7 +44,10 @@ def _align64(val: int) -> int:
 
 
 def build_pure_regbase_simd_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Shell 1 (aiv_only/gm_ub_stream/affine_simd): Pure RegBase SIMD VF with 256KB UB unlock, row packing, 2-row unroll."""
+    """Shell 1 (aiv_only/gm_ub_stream/affine_simd): pure RegBase SIMD VF.
+
+    Unlocks 256 KB UB, packs rows, and unrolls two rows.
+    """
     T = _get_tl_ascend()
     p = normalize_schedule_policy(SHELL_AIV_SIMD_STREAM, policy)
     tile_m, tile_n, _ = p["tile_mnk"]
@@ -186,7 +189,11 @@ def build_pure_regbase_simd_template(policy: dict[str, Any] | None = None) -> di
 
 
 def build_simt_and_hybrid_ub_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Shell 2 (aiv_only/ub_random_atomic/irregular_simt): Hybrid SIMT/SIMD UB kernel with +8-padded slots."""
+    """Shell 2 (aiv_only/ub_random_atomic/irregular_simt): hybrid SIMT/SIMD kernel.
+
+    Shared slots carry eight datablocks of padding to avoid UB bank conflicts
+    across SIMT warps.
+    """
     T = _get_tl_ascend()
     p = normalize_schedule_policy(SHELL_AIV_SIMT_ATOMIC, policy)
     tile_m, tile_n, _ = p["tile_mnk"]
@@ -206,7 +213,6 @@ def build_simt_and_hybrid_ub_template(policy: dict[str, Any] | None = None) -> d
             Dst: T.Tensor((n_rows, slot_w), "float32"),
         ):
             with T.Kernel(num_cores) as cid:
-                # +8 datablock padding avoids UB bank conflicts across SIMT warps
                 ub_in = T.alloc_shared((rows_blk, slot_w + pad_slots), "float32")
                 ub_out = T.alloc_shared((rows_blk, slot_w + pad_slots), "float32")
                 idx_ub = T.alloc_shared((rows_blk,), "int32")
@@ -240,7 +246,10 @@ def build_simt_and_hybrid_ub_template(policy: dict[str, Any] | None = None) -> d
 
 
 def build_dense_and_quant_gemm_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Shell 3 (aic_only/gm_l1_l0_fixpipe/affine_simd): Dense/Quantized GEMM with SWAT swizzle, Half-L1 isolation."""
+    """Shell 3 (aic_only/gm_l1_l0_fixpipe/affine_simd): dense/quantized GEMM.
+
+    Applies SWAT swizzling and Half-L1 isolation.
+    """
     T = _get_tl_ascend()
     p = normalize_schedule_policy(SHELL_AIC_GEMM_FIXPIPE, policy)
     bm, bn, bk = p["tile_mnk"]
@@ -324,7 +333,10 @@ def build_dense_and_quant_gemm_template(policy: dict[str, Any] | None = None) ->
 
 
 def build_grouped_gemm_epilogue_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Shell 4 (coupled_1c2v/l0c_ub_epilogue/ragged_group): Grouped GEMM + direct L0C->UB SPLIT_M."""
+    """Shell 4 (coupled_1c2v/l0c_ub_epilogue/ragged_group): grouped GEMM.
+
+    Moves results directly from L0C to UB with SPLIT_M.
+    """
     T = _get_tl_ascend()
     p = normalize_schedule_policy(SHELL_CV_RAGGED_EPILOGUE, policy)
     bm, bn, bk = p["tile_mnk"]
@@ -408,7 +420,10 @@ def build_grouped_gemm_epilogue_template(policy: dict[str, Any] | None = None) -
 
 
 def build_heterogeneous_cv_ring_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Shell 5 (coupled_1c2v/bidirectional_cv_ring/affine_simd): Heterogeneous CV ring (Cube QK^T -> UB -> L1 -> Cube PV)."""
+    """Shell 5 (coupled_1c2v/bidirectional_cv_ring/affine_simd): heterogeneous CV ring.
+
+    Routes Cube QK^T through UB and L1 into Cube PV.
+    """
     T = _get_tl_ascend()
     p = normalize_schedule_policy(SHELL_CV_RING_PIPELINE, policy)
     bm, bn, _ = p["tile_mnk"]
@@ -556,7 +571,11 @@ def build_heterogeneous_cv_ring_template(policy: dict[str, Any] | None = None) -
 
 
 def build_persistent_chunk_state_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Shell 6 (coupled_1c2v/persistent_onchip_state/affine_simd): Persistent (B, H) core ownership, FP32 state resident in UB."""
+    """Shell 6 (coupled_1c2v/persistent_onchip_state/affine_simd): persistent state.
+
+    Each (B, H) pair owns a core and keeps FP32 state resident in UB. The decay
+    exponent splits into ``exp(g/2) * exp(g/2)`` to halve its dynamic range.
+    """
     T = _get_tl_ascend()
     p = normalize_schedule_policy(SHELL_CV_PERSISTENT_STATE, policy)
     d_head = max(64, min(128, _align64(p["dim_size"])))
@@ -602,7 +621,6 @@ def build_persistent_chunk_state_template(policy: dict[str, Any] | None = None) 
                             for c in T.serial(d_chunks):
                                 off = c * 64
                                 gv = T.simd.vld(g_ub[off], dist="NORM_B32")
-                                # Anchor exp split: exp(g/2) * exp(g/2) halves dynamic range
                                 half_g = T.simd.vmuls(gv, T.float32(0.5), mask=m32)
                                 decay_half = T.simd.vexp(half_g, mask=m32)
                                 decay_v = T.simd.vmul(decay_half, decay_half, mask=m32)
@@ -629,7 +647,10 @@ def build_persistent_chunk_state_template(policy: dict[str, Any] | None = None) 
 
 
 def build_striped_register_vm_template(policy: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Shell 7 (aiv_only/persistent_onchip_state/dynamic_opcode_stream): Horizontal W-dimension striped UB-resident VM."""
+    """Shell 7 (aiv_only/persistent_onchip_state/dynamic_opcode_stream): striped VM.
+
+    Partitions the horizontal W dimension into UB-resident stripes.
+    """
     T = _get_tl_ascend()
     p = normalize_schedule_policy(SHELL_AIV_STRIPED_VM, policy)
     num_regs = max(4, min(32, int(p["tile_mnk"][0])))

@@ -13,6 +13,7 @@ from tilefoundry_ascend.ascend.cost_model.calibration_backtest import (
     evaluate_prescreen_ablation,
 )
 from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
+    CostFeatures,
     CostPrediction,
     HybridAscendCostModel,
     build_cost_features_from_ledger,
@@ -505,8 +506,21 @@ def rank_stage_a_candidates_with_cost_model(
     axes: TopologyAxes | None = None,
     blueprint: object | None = None,
     sil_advisory: object | None = None,
+    parent_ledger: object | None = None,
+    parent_features: CostFeatures | None = None,
 ) -> list[CostRankedCandidate]:
-    """Score Stage-A passers with HybridAscendCostModel and sort ascending by pred_us."""
+    """Rank Stage-A passers by parent-relative delta cost, ascending, with stable ties."""
+    parent_cf = parent_features
+    if parent_cf is None and parent_ledger is not None:
+        parent_cf = build_cost_features_from_ledger(
+            parent_ledger,
+            live_plan=live_plan,
+            axes=axes,
+            blueprint=blueprint,
+            sil_advisory=sil_advisory,
+            target=cost_model.target,
+        )
+    parent_pred = cost_model.predict(parent_cf) if parent_cf is not None else None
     scored: list[tuple[float, int, CostRankedCandidate]] = []
     for idx, (cand_id, _patched_src, stage_a) in enumerate(candidates):
         ledger = getattr(stage_a, "ledger", None)
@@ -519,9 +533,13 @@ def rank_stage_a_candidates_with_cost_model(
             target=cost_model.target,
         )
         pred = cost_model.predict(features)
+        score = float(pred.pred_us)
+        if parent_pred is not None and parent_cf is not None:
+            ratio = cost_model.predict_delta_ratio(features, parent_cf)
+            score = float(parent_pred.pred_us) * float(ratio)
         ranked_item = CostRankedCandidate(
             candidate_id=str(cand_id),
-            pred_us=float(pred.pred_us),
+            pred_us=score,
             tier0_physics_us=float(pred.tier0_physics_us),
             tier1_penalty_us=float(pred.tier1_penalty_us),
             dominant_bound=str(pred.dominant_bound),
@@ -640,9 +658,12 @@ def prescreen_live_ir_neighborhood(
             int,
             float,
             CostPrediction | None,
+            float,
         ]
     ] = []
     any_ledger = False
+    parent_features: CostFeatures | None = None
+    parent_pred: CostPrediction | None = None
     for idx, cand in enumerate(variants):
         cand_kwargs = _apply_tile_candidate_to_kwargs(
             base_kwargs,
@@ -675,6 +696,7 @@ def prescreen_live_ir_neighborhood(
                     0,
                     0.0,
                     None,
+                    0.0,
                 )
             )
             continue
@@ -745,6 +767,7 @@ def prescreen_live_ir_neighborhood(
             norm_cycles = float(dom_cycles) / area
             sort_key = (norm_ii, norm_cycles, -area, float(idx))
         cost_pred: CostPrediction | None = None
+        cost_score = 0.0
         if cost_model is not None:
             cf = build_cost_features_from_ledger(
                 ledger,
@@ -755,7 +778,14 @@ def prescreen_live_ir_neighborhood(
                 target=cost_model.target,
             )
             cost_pred = cost_model.predict(cf)
-            sort_key = (float(cost_pred.pred_us), *sort_key)
+            cost_score = float(cost_pred.pred_us)
+            if parent_pred is not None and parent_features is not None:
+                ratio = cost_model.predict_delta_ratio(cf, parent_features)
+                cost_score = float(parent_pred.pred_us) * float(ratio)
+            sort_key = (cost_score, *sort_key)
+            if idx == 0:
+                parent_features = cf
+                parent_pred = cost_pred
         records.append(
             (
                 is_ok,
@@ -769,6 +799,7 @@ def prescreen_live_ir_neighborhood(
                 est_waves,
                 wave_burst_score,
                 cost_pred,
+                cost_score,
             )
         )
 
@@ -795,12 +826,13 @@ def prescreen_live_ir_neighborhood(
         est_waves,
         wave_burst_score,
         cost_pred,
+        cost_score,
     ) in enumerate(ordered, start=1):
         extra = f", ii={ii_val}" if ii_val is not None else ""
         if deg_cnt > 0:
             extra += f", degraded={deg_cnt}"
         cost_suffix = (
-            f", pred_us={cost_pred.pred_us:.2f}us ({cost_pred.dominant_bound})"
+            f", pred_us={cost_score:.2f}us ({cost_pred.dominant_bound})"
             if cost_pred is not None
             else ""
         )

@@ -25,7 +25,10 @@ def _cpp_dtype(dtype: str) -> str:
 
 
 def render_pure_regbase_simd_cpp(policy: dict[str, Any] | None = None) -> str:
-    """Shell 1 (aiv_only/gm_ub_stream/affine_simd): AscendC RegBase __no_simd_vf_fusion__ __simd_vf__ C++20 template."""
+    """Shell 1 (aiv_only/gm_ub_stream/affine_simd): RegBase C++20 template.
+
+    Disables SIMD VF fusion and exposes ``__simd_vf__`` vector functions.
+    """
     p = normalize_schedule_policy(SHELL_AIV_SIMD_STREAM, policy)
     cpp_t = _cpp_dtype(p["dtype"])
     tile_m, _, _ = p["tile_mnk"]
@@ -102,7 +105,10 @@ __no_simd_vf_fusion__ __simd_vf__ void RegBaseRowKernelVF(
 
 
 def render_simt_and_hybrid_ub_cpp(policy: dict[str, Any] | None = None) -> str:
-    """Shell 2 (aiv_only/ub_random_atomic/irregular_simt): AscendC __simt_vf__ __launch_bounds__(512) + Hybrid template."""
+    """Shell 2 (aiv_only/ub_random_atomic/irregular_simt): hybrid SIMT template.
+
+    Uses ``__simt_vf__`` kernels with ``__launch_bounds__(512)``.
+    """
     p = normalize_schedule_policy(SHELL_AIV_SIMT_ATOMIC, policy)
     threads = p["simt_threads"] or 512
     pad_slots = max(8, p["ub_bank_pad_datablocks"])
@@ -158,7 +164,10 @@ __aicore__ inline void AdaptiveSimdOrSimtDispatch(uint32_t rowBytes) {{
 
 
 def render_dense_and_quant_gemm_cpp(policy: dict[str, Any] | None = None) -> str:
-    """Shell 3 (aic_only/gm_l1_l0_fixpipe/affine_simd): CATLASS/asc::te-grade GEMM + W4A16/MXA8W4 template."""
+    """Shell 3 (aic_only/gm_l1_l0_fixpipe/affine_simd): CATLASS GEMM template.
+
+    Covers ``asc::te`` graded kernels plus W4A16 and MXA8W4 variants.
+    """
     p = normalize_schedule_policy(SHELL_AIC_GEMM_FIXPIPE, policy)
     bm, bn, bk = p["tile_mnk"]
     win = p["swizzle_window"]
@@ -218,7 +227,10 @@ __aicore__ inline void LaunchGemmCoreTile(
 
 
 def render_grouped_gemm_epilogue_cpp(policy: dict[str, Any] | None = None) -> str:
-    """Shell 4 (coupled_1c2v/l0c_ub_epilogue/ragged_group): Grouped MatMul + Fused SwiGLU/Quant template."""
+    """Shell 4 (coupled_1c2v/l0c_ub_epilogue/ragged_group): grouped MatMul.
+
+    Fuses the SwiGLU and quantization epilogue.
+    """
     p = normalize_schedule_policy(SHELL_CV_RAGGED_EPILOGUE, policy)
     bm, bn, bk = p["tile_mnk"]
     return f"""// Ascend 950 (dav-3510) Paradigm 4: Grouped GEMM + Direct L0C->UB SPLIT_M + Fused SwiGLU
@@ -259,10 +271,13 @@ __aicore__ inline void GroupedGemmRollingDispatch(
 
 
 def render_heterogeneous_cv_ring_cpp(policy: dict[str, Any] | None = None) -> str:
-    """Shell 5 (coupled_1c2v/bidirectional_cv_ring/affine_simd): Heterogeneous 3-4 stage CV ring."""
+    """Shell 5 (coupled_1c2v/bidirectional_cv_ring/affine_simd): heterogeneous CV ring.
+
+    Tile rows stay at or above 82 so the Cube path remains compute-bound.
+    """
     p = normalize_schedule_policy(SHELL_CV_RING_PIPELINE, policy)
     bm, bn, bk = p["tile_mnk"]
-    eff_bm = max(82, bm)  # M >= 82 Cube-bound tile sizing (e.g. 96x112)
+    eff_bm = max(82, bm)
     stages = max(3, p["l1_stages"])
     return f"""// Ascend 950 (dav-3510) Paradigm 5: Heterogeneous {stages}-Stage CV Ring (GQA / MLA / SparseFA)
 #include "kernel_operator.h"
@@ -298,7 +313,10 @@ __aicore__ inline void HeterogeneousCVRingStep(
 
 
 def render_persistent_chunk_state_cpp(policy: dict[str, Any] | None = None) -> str:
-    """Shell 6 (coupled_1c2v/persistent_onchip_state/affine_simd): Persistent (B, H) chunk/recurrent state."""
+    """Shell 6 (coupled_1c2v/persistent_onchip_state/affine_simd): persistent state.
+
+    Keeps chunk and recurrent state on chip across the (B, H) grid.
+    """
     p = normalize_schedule_policy(SHELL_CV_PERSISTENT_STATE, policy)
     bm, bn, bk = p["tile_mnk"]
     return f"""// Ascend 950 (dav-3510) Paradigm 6: Persistent (B, H) Chunk State (KDA / Sinkhorn / LaCT-TTT)
@@ -328,7 +346,10 @@ __aicore__ inline void PersistentChunkStateLoop(
 
 
 def render_striped_register_vm_cpp(policy: dict[str, Any] | None = None) -> str:
-    """Shell 7 (aiv_only/persistent_onchip_state/dynamic_opcode_stream): Horizontal W-dimension striped VM."""
+    """Shell 7 (aiv_only/persistent_onchip_state/dynamic_opcode_stream): striped VM.
+
+    Partitions the horizontal W dimension across register-resident stripes.
+    """
     p = normalize_schedule_policy(SHELL_AIV_STRIPED_VM, policy)
     num_regs, w_slice, _ = p["tile_mnk"]
     return f"""// Ascend 950 (dav-3510) Paradigm 7: Striped Register-Resident VM (tensor_program_vm)

@@ -1,4 +1,4 @@
-"""Eight-dimensional structural feature extractor, execution track router, and 7-pipe ISA gap scanner."""
+"""Structural feature extraction, execution-track routing, and 7-pipe ISA gap scanning."""
 
 from tilefoundry_ascend.agent.router.capability_gate import (
     VALID_BACKEND_TIERS,

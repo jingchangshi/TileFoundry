@@ -1,4 +1,9 @@
-"""Ascend execution mode declarations."""
+"""Ascend execution mode declarations.
+
+``ExecutionKind.__post_init__`` enforces a 32-bit mask width for element dtypes,
+while ``SUPPORTED_VECTOR_DTYPES`` also exposes non-32-bit vector register
+transport and compute types.
+"""
 
 from __future__ import annotations
 
@@ -44,8 +49,6 @@ def _supported_vector_dtypes(*, mask_width_bits: int | None = None) -> tuple[DTy
     return tuple(dtypes)
 
 
-# ExecutionKind.__post_init__ enforces dtype.bit_width == mask_width_bits (32),
-# while non-32-bit vector register transport/compute types are exposed in SUPPORTED_VECTOR_DTYPES.
 SUPPORTED_VECTOR_DTYPES: tuple[DType, ...] = _supported_vector_dtypes(mask_width_bits=None)
 _MASK_COMPATIBLE_ELEMENT_DTYPES: tuple[DType, ...] = _supported_vector_dtypes(mask_width_bits=32)
 

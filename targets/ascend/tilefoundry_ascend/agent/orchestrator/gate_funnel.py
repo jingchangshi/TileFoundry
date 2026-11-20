@@ -496,11 +496,31 @@ def _eval_cpp_ast_node(node: ast.AST, env: Mapping[str, int]) -> int:
     raise ValueError("unsupported ast node")
 
 
+def _strip_outer_parens(expr: str) -> str:
+    """Remove balanced parentheses that enclose an entire C++ expression."""
+    text = expr.strip()
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        enclosed = True
+        for idx, ch in enumerate(text):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            if depth == 0 and idx < len(text) - 1:
+                enclosed = False
+                break
+        if not enclosed:
+            break
+        text = text[1:-1].strip()
+    return text
+
+
 def _safe_eval_cpp_int(expr: str, env: Mapping[str, int]) -> int | None:
     cleaned = re.sub(r"\b(\d+)[uUlL]+\b", r"\1", str(expr or "").strip())
     if not cleaned:
         return None
-    py_expr = _rewrite_cpp_ternary(cleaned)
+    py_expr = _rewrite_cpp_ternary(_strip_outer_parens(cleaned))
     try:
         tree = ast.parse(py_expr, mode="eval")
         return _eval_cpp_ast_node(tree, env)
@@ -524,6 +544,15 @@ def _parse_objdump_pipe_counts(objdump_text: str) -> dict[str, int]:
         "vf_sw_back_branches": 0,
         "scalar_regs": 0,
         "vec_regs": 0,
+        "gm_to_l1_insns": 0,
+        "gm_to_ub_insns": 0,
+        "l1_to_l0a_insns": 0,
+        "l1_to_l0b_insns": 0,
+        "l0c_to_ub_insns": 0,
+        "l0c_to_l1_insns": 0,
+        "l0c_to_gm_insns": 0,
+        "ub_to_gm_insns": 0,
+        "ub_to_l1_insns": 0,
     }
     if not objdump_text.strip():
         return counts
@@ -551,12 +580,30 @@ def _parse_objdump_pipe_counts(objdump_text: str) -> dict[str, int]:
             counts["cube_mmad"] += 1
         elif mnem.startswith("FIX_"):
             counts["fixpipe"] += 1
+            if "L1" in mnem or "CBUF" in mnem:
+                counts["l0c_to_l1_insns"] += 1
+            elif "UB" in mnem:
+                counts["l0c_to_ub_insns"] += 1
+            elif "GM" in mnem:
+                counts["l0c_to_gm_insns"] += 1
         elif mnem.startswith("LOAD_L1_TO_L0"):
             counts["mte1"] += 1
+            if "L0B" in mnem:
+                counts["l1_to_l0b_insns"] += 1
+            else:
+                counts["l1_to_l0a_insns"] += 1
         elif mnem.startswith("MOV_OUT_TO_"):
             counts["mte2"] += 1
+            if "L1" in mnem or "CBUF" in mnem:
+                counts["gm_to_l1_insns"] += 1
+            elif "UB" in mnem:
+                counts["gm_to_ub_insns"] += 1
         elif mnem.startswith("MOV_UB_TO_"):
             counts["mte3"] += 1
+            if "L1" in mnem or "CBUF" in mnem:
+                counts["ub_to_l1_insns"] += 1
+            else:
+                counts["ub_to_gm_insns"] += 1
         elif mnem.startswith("DCCI"):
             counts["dcci"] += 1
         elif mnem.startswith(("SET_FLAG", "WAIT_FLAG", "SET_INTRA", "WAIT_INTRA", "BAR.")):
@@ -580,6 +627,208 @@ def _parse_objdump_pipe_counts(objdump_text: str) -> dict[str, int]:
     return counts
 
 
+_STAGE_KEYS: tuple[str, ...] = (
+    "STAGES",
+    "NUM_STAGES",
+    "N_STAGES",
+    "NSTAGES",
+)
+
+
+def _rewrite_sizeof(expr: str, type_bytes: Mapping[str, int]) -> str:
+    """Replace sizeof(T) with the byte width of a resolved dtype or template parameter."""
+    return re.sub(
+        r"\bsizeof\s*\(\s*([A-Za-z_]\w*)\s*\)",
+        lambda m: str(type_bytes.get(m.group(1), _CPP_DTYPE_BYTES.get(m.group(1), 2))),
+        expr,
+    )
+
+
+def _split_cpp_args(text: str) -> list[str]:
+    """Split a C++ template or call argument list at top-level commas."""
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for idx, ch in enumerate(text):
+        if ch in "(<[":
+            depth += 1
+        elif ch in ")>]" and depth > 0:
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(text[start:idx].strip())
+            start = idx + 1
+    parts.append(text[start:].strip())
+    return [part for part in parts if part]
+
+
+def _template_bindings(
+    cpp_source: str,
+    consts: Mapping[str, int],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Resolve integral template arguments and typename dtype widths from concrete calls."""
+    values: dict[str, int] = {}
+    types: dict[str, int] = {}
+    blocks = re.finditer(
+        r"template\s*<([^<>]*)>\s*"
+        r"(?:__\w+\s*(?:\([^()]*\))?\s*)*"
+        r"(?:(?:inline|static|void)\s+)*"
+        r"([A-Za-z_]\w*)\s*\(",
+        cpp_source,
+    )
+    for block in blocks:
+        params = _split_cpp_args(block.group(1))
+        call = re.search(
+            rf"\b{re.escape(block.group(2))}\s*<\s*([^<>]*)\s*>\s*(?:<<<|\()",
+            cpp_source,
+        )
+        if call is None:
+            continue
+        args = _split_cpp_args(call.group(1))
+        if len(args) != len(params):
+            continue
+        for declaration, argument in zip(params, args):
+            names = re.findall(r"[A-Za-z_]\w*", declaration.split("=")[0])
+            if not names:
+                continue
+            name = names[-1]
+            if re.match(r"(?:typename|class)\b", declaration):
+                type_name = argument.split("::")[-1].strip()
+                types[name] = _CPP_DTYPE_BYTES.get(type_name, 2)
+                continue
+            val = _safe_eval_cpp_int(argument, consts)
+            if val is not None:
+                values[name] = max(values.get(name, val), val)
+    return values, types
+
+
+def _resolve_cpp_consts(cpp_source: str) -> dict[str, int]:
+    """Fold constexpr integers with template arguments, aliases, and sizeof dtype widths."""
+    declarations = [
+        (m.group(1), m.group(2))
+        for m in re.finditer(
+            r"\bconstexpr\s+(?:int|int32_t|uint32_t|size_t)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);",
+            cpp_source,
+        )
+    ]
+    consts: dict[str, int] = {}
+    type_bytes: dict[str, int] = {}
+    for _ in range(4):
+        previous = dict(consts)
+        for name, expr in declarations:
+            val = _safe_eval_cpp_int(_rewrite_sizeof(expr, type_bytes), consts)
+            if val is not None:
+                consts[name] = val
+        values, types = _template_bindings(cpp_source, consts)
+        consts.update(values)
+        type_bytes.update(types)
+        if consts == previous:
+            break
+    return consts
+
+
+def _stage_multiplicity(
+    cpp_source: str,
+    consts: Mapping[str, int],
+    *,
+    scope: str,
+    names: Sequence[str] = (),
+    strides: Mapping[str, int] | None = None,
+) -> int:
+    """Estimate buffer stage count from constexpr/template values, slots, and sync pairs."""
+    stages = 1
+    for key in (f"{scope}_STAGES", *_STAGE_KEYS):
+        value = consts.get(key)
+        if value is not None:
+            stages = max(stages, int(value))
+    if stages > 1:
+        return min(stages, 8)
+    if strides is not None and any(name in strides for name in names):
+        return 2
+    slot_stems: dict[str, set[str]] = {}
+    for name in names:
+        if _is_numbered_slot(name):
+            slot_stems.setdefault(re.sub(r"\d+$", "", name), set()).add(name)
+    if any(len(slots) > 1 for slots in slot_stems.values()):
+        return 2
+    ub_pairs = {frozenset(("PIPE_MTE3", "PIPE_MTE2")), frozenset(("PIPE_V", "PIPE_MTE2"))}
+    l1_pairs = {frozenset(("PIPE_MTE1", "PIPE_MTE2")), frozenset(("PIPE_M", "PIPE_MTE2"))}
+    pairs = ub_pairs if scope == "UB" else l1_pairs
+    events: set[int] = set()
+    for m in re.finditer(
+        r"asc_sync_(?:notify|wait)\s*\(\s*(PIPE_[A-Z0-9_]+)\s*,\s*(PIPE_[A-Z0-9_]+)\s*,\s*"
+        r"(?:\(event_t\))?\s*(\d+)",
+        cpp_source,
+    ):
+        if frozenset((m.group(1), m.group(2))) in pairs:
+            events.add(int(m.group(3)))
+    return 2 if {0, 1} <= events else 1
+
+
+def _is_numbered_slot(name: str) -> bool:
+    """Report whether a buffer name carries an attached physical slot index."""
+    return bool(re.search(r"\d+$", name))
+
+
+def _stage_storage_pointer(name: str, names: Sequence[str]) -> bool:
+    """Report whether one pointer is the sole physical slot for its buffer family."""
+    stem = re.sub(r"\d+$", "", name)
+    return not any(
+        other != name and re.sub(r"\d+$", "", other) == stem for other in names
+    )
+
+
+def _stage_stride_elems(cpp_source: str, consts: Mapping[str, int]) -> dict[str, int]:
+    """Resolve per-buffer element strides from pointer plus stage-index expressions."""
+    strides: dict[str, int] = {}
+    for m in re.finditer(
+        r"\b([A-Za-z_]\w*)\s*\+\s*(?:\(\s*)?"
+        r"(?:stg_id|stage_id|stg|stage|slot|buf)\s*\*\s*([A-Za-z_]\w*|\d+)\s*\)?",
+        cpp_source,
+    ):
+        value = _safe_eval_cpp_int(m.group(2), consts)
+        if value is not None and value > 0:
+            strides[m.group(1)] = max(strides.get(m.group(1), value), value)
+    return strides
+
+
+def _declared_stage_bytes(
+    name: str,
+    elem_bytes: int,
+    consts: Mapping[str, int],
+    *,
+    stages: int,
+    single_pointer: bool,
+) -> int:
+    """Return an explicit byte size or per-stage element count for one buffer pointer."""
+    upper = name.upper()
+    numbered = _is_numbered_slot(name)
+    bases = [upper]
+    for suffix in ("_BASE", "_BUF", "_PTR", "_0", "_1"):
+        if upper.endswith(suffix):
+            bases.append(upper[: -len(suffix)])
+    roots: list[str] = []
+    for base in bases:
+        slotless = re.sub(r"\d+$", "", base)
+        roots.extend((slotless, slotless.replace("_L1", "").replace("_UB", "")))
+    for root in dict.fromkeys(roots):
+        for suffix in ("_STAGE_BYTES", "_BYTES", "_STAGE", "_BASE", "_BUF", "_PTR"):
+            if root.endswith(suffix):
+                root = root[: -len(suffix)]
+                break
+        for key, is_bytes in (
+            (f"{root}_STAGE_BYTES", True),
+            (f"{root}_BYTES", True),
+            (f"{root}_STAGE", False),
+        ):
+            if key not in consts:
+                continue
+            if is_bytes:
+                return int(consts[key])
+            scale = stages if single_pointer and not numbered else 1
+            return int(consts[key]) * elem_bytes * scale
+    return 0
+
+
 def _build_ascendc_static_ledger(
     cpp_source: str,
     *,
@@ -595,14 +844,7 @@ def _build_ascendc_static_ledger(
     facts = resolved_target.get_facts(AscendSpaceFacts)
     lower = cpp_source.lower()
 
-    consts: dict[str, int] = {}
-    for m in re.finditer(
-        r"\bconstexpr\s+(?:int|int32_t|uint32_t|size_t)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);",
-        cpp_source,
-    ):
-        val = _safe_eval_cpp_int(m.group(2), consts)
-        if val is not None:
-            consts[m.group(1)] = val
+    consts = _resolve_cpp_consts(cpp_source)
 
     ub_offsets: list[tuple[str, int, int]] = []
     l1_offsets: list[tuple[str, int, int]] = []
@@ -657,25 +899,64 @@ def _build_ascendc_static_ledger(
         or "262144" in cpp_source
     ) and not uses_simt
 
-    def _span_from_offsets(entries: list[tuple[str, int, int]]) -> dict[str, int]:
+    def _span_from_offsets(
+        entries: list[tuple[str, int, int]],
+        *,
+        scope: str,
+        stages: int,
+        strides: Mapping[str, int],
+    ) -> dict[str, int]:
         if not entries:
             return {}
         ordered = sorted(entries, key=lambda item: item[1])
+        names = [item[0] for item in ordered]
         bufs: dict[str, int] = {}
         for idx, (name, off, eb) in enumerate(ordered):
-            if idx + 1 < len(ordered):
+            stride = strides.get(name)
+            if stride is not None:
+                size = stride * eb * stages
+            elif idx + 1 < len(ordered):
                 size = max(0, ordered[idx + 1][1] - off)
             elif idx > 0:
                 prev_gap = max(0, off - ordered[idx - 1][1])
                 size = prev_gap if prev_gap > 0 else max(eb * 64, tile_n * eb)
             else:
-                size = max(eb * 64, tile_m * tile_n * eb)
+                stage_bytes = consts.get(f"{scope}_STAGE_BYTES", consts.get("STAGE_BYTES"))
+                if _stage_storage_pointer(name, names) and stages > 1 and stage_bytes:
+                    size = int(stage_bytes) * stages
+                else:
+                    size = max(eb * 64, tile_m * tile_n * eb)
+            if idx + 1 == len(ordered):
+                size = max(
+                    size,
+                    _declared_stage_bytes(
+                        name,
+                        eb,
+                        consts,
+                        stages=stages,
+                        single_pointer=_stage_storage_pointer(name, names),
+                    ),
+                )
             if size > 0:
                 bufs[name] = size
         return bufs
 
-    explicit_ub = _span_from_offsets(ub_offsets)
-    explicit_l1 = _span_from_offsets(l1_offsets)
+    ub_stages = _stage_multiplicity(
+        cpp_source,
+        consts,
+        scope="UB",
+        names=[name for name, _, _ in ub_offsets],
+    )
+    strides = _stage_stride_elems(cpp_source, consts)
+    l1_stages = _stage_multiplicity(
+        cpp_source,
+        consts,
+        scope="L1",
+        names=[name for name, _, _ in l1_offsets],
+        strides=strides,
+    )
+    explicit_ub = _span_from_offsets(ub_offsets, scope="UB", stages=ub_stages, strides=strides)
+    explicit_l1 = _span_from_offsets(l1_offsets, scope="L1", stages=l1_stages, strides=strides)
 
     ub_match = re.search(r"\bub_bytes\s*=\s*(\d+)", cpp_source, re.IGNORECASE)
     l1_match = re.search(r"\bl1_bytes\s*=\s*(\d+)", cpp_source, re.IGNORECASE)
@@ -685,10 +966,7 @@ def _build_ascendc_static_ledger(
         explicit_l1 = {"l1_declared": int(l1_match.group(1))}
 
     if not explicit_l1 and uses_cube:
-        stages = max(1, consts.get("L1_STAGES", 2))
-        l1_stages_m = re.search(r"\bl1_stages\s*=\s*(\d+)", cpp_source, re.IGNORECASE)
-        if l1_stages_m:
-            stages = max(1, int(l1_stages_m.group(1)))
+        stages = max(2, l1_stages)
         explicit_l1["l1_AB"] = (tile_m * tile_k + tile_k * tile_n) * 2 * stages
     if not explicit_ub:
         ub_rows = consts.get("ROWS", tile_m)
@@ -1587,6 +1865,135 @@ def _augment_bisheng_telemetry_text(
     return f"{compiler_out}\n" + "\n".join(extra_lines)
 
 
+_TRANSFER_ROUTES: tuple[str, ...] = (
+    "gm_to_l1",
+    "gm_to_ub",
+    "l1_to_l0a",
+    "l1_to_l0b",
+    "l0c_to_ub",
+    "l0c_to_l1",
+    "l0c_to_gm",
+    "ub_to_gm",
+    "ub_to_l1",
+)
+
+_TRANSFER_CALL_SPECS: dict[str, tuple[str, int, int, str]] = {
+    "gm_to_l1": ("asc_copy_gm2l1", 4, 5, "elem"),
+    "gm_to_ub": ("asc_copy_gm2ub", 2, 3, "bytes"),
+    "l1_to_l0a": ("asc_copy_l12l0a", 4, 5, "elem"),
+    "l1_to_l0b": ("asc_copy_l12l0b", 4, 5, "elem"),
+    "l0c_to_ub": ("asc_copy_l0c2ub", 2, 3, "float"),
+    "l0c_to_l1": ("asc_copy_l0c2l1", 2, 3, "float"),
+    "l0c_to_gm": ("asc_copy_l0c2gm", 2, 3, "float"),
+    "ub_to_gm": ("asc_copy_ub2gm", 2, 3, "bytes"),
+}
+
+
+def _strip_cpp_casts(expr: str) -> str:
+    """Drop C-style scalar casts so call arguments can be folded numerically."""
+    return re.sub(
+        r"\(\s*(?:u?int(?:8|16|32|64)_t|size_t|unsigned|int|float|double|half)\s*\)",
+        "",
+        expr,
+    )
+
+
+def _eval_call_arg(expr: str, consts: Mapping[str, int], elem_bytes: int) -> int | None:
+    """Evaluate one data-copy call argument with sizeof and template constants folded."""
+    type_bytes = {"InT": elem_bytes, "half": 2, "float": 4, "bfloat16_t": 2}
+    return _safe_eval_cpp_int(_rewrite_sizeof(_strip_cpp_casts(expr), type_bytes), consts)
+
+
+def _call_elem_bytes(call_text: str) -> int:
+    """Return the element width named in one copy call, defaulting to half precision."""
+    for type_name, width in _CPP_DTYPE_BYTES.items():
+        if re.search(rf"\b{re.escape(type_name)}\b", call_text):
+            return width
+    return 2
+
+
+def _source_call_payloads(
+    cpp_source: str,
+    route: str,
+    consts: Mapping[str, int],
+) -> list[int]:
+    """Collect copy payloads from CBE-style call arguments for one transfer route."""
+    spec = _TRANSFER_CALL_SPECS.get(route)
+    if spec is None:
+        return []
+    prefix, rows_idx, cols_idx, kind = spec
+    payloads: list[int] = []
+    for call in re.finditer(rf"\b{prefix}\w*\s*\(([^;]*)\)\s*;", cpp_source, re.S):
+        text = call.group(0)
+        args = _split_cpp_args(call.group(1))
+        if len(args) <= max(rows_idx, cols_idx):
+            continue
+        elem_bytes = _call_elem_bytes(text)
+        rows = _eval_call_arg(args[rows_idx], consts, elem_bytes)
+        cols = _eval_call_arg(args[cols_idx], consts, elem_bytes)
+        if rows is None or cols is None or rows <= 0 or cols <= 0:
+            continue
+        if kind == "bytes":
+            payloads.append(rows * cols)
+        elif kind == "float":
+            payloads.append(rows * cols * 4)
+        else:
+            payloads.append(rows * cols * elem_bytes)
+    return payloads
+
+
+def _tile_shape_payload(cpp_source: str, route: str, consts: Mapping[str, int]) -> int:
+    """Estimate one transfer payload from C++20 tile extents when a call cannot be folded."""
+    shape_keys = (
+        "CUBE_TILE_M",
+        "CUBE_TILE_N",
+        "CUBE_TILE_K",
+        "BM",
+        "BN",
+        "BK",
+        "TILE_M",
+        "TILE_N",
+        "TILE_K",
+    )
+    if not any(key in consts for key in shape_keys):
+        return 0
+    tile_m = max(1, consts.get("CUBE_TILE_M", consts.get("BM", consts.get("TILE_M", 64))))
+    tile_n = max(1, consts.get("CUBE_TILE_N", consts.get("BN", consts.get("TILE_N", 64))))
+    tile_k = max(1, consts.get("CUBE_TILE_K", consts.get("BK", consts.get("TILE_K", 64))))
+    shape_source = re.sub(r"\bconstexpr\s+[^;]+;", "", cpp_source)
+    elem_bytes = _call_elem_bytes(shape_source)
+    if route == "gm_to_l1":
+        return max(tile_m * tile_k, tile_k * tile_n) * elem_bytes
+    if route in ("gm_to_ub", "ub_to_gm", "ub_to_l1"):
+        return tile_m * tile_n * elem_bytes
+    if route == "l1_to_l0a":
+        return tile_m * tile_k * elem_bytes
+    if route == "l1_to_l0b":
+        return tile_k * tile_n * elem_bytes
+    return tile_m * tile_n * 4
+
+
+def _median_payload(values: Sequence[int]) -> int:
+    """Return the integer median of a nonempty payload sample."""
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
+
+
+def _estimate_transfer_granularity(cpp_source: str) -> dict[str, int]:
+    """Estimate per-instruction transfer bytes from copy-call operands or tile extents."""
+    consts = _resolve_cpp_consts(cpp_source)
+    estimates: dict[str, int] = {}
+    for route in _TRANSFER_ROUTES:
+        source_payloads = _source_call_payloads(cpp_source, route, consts)
+        if source_payloads:
+            estimates[route] = _median_payload(source_payloads)
+            continue
+        tile_payload = _tile_shape_payload(cpp_source, route, consts)
+        if tile_payload > 0:
+            estimates[route] = tile_payload
+    return estimates
+
+
 def _merge_disassembly_microarch_profile(
     cpp_source: str,
     objdump_text: str,
@@ -1597,19 +2004,30 @@ def _merge_disassembly_microarch_profile(
     dis = _parse_objdump_pipe_counts(objdump_text)
     if dis["total_insns"] == 0:
         return base.to_dict()
-    unit_xfer = 32768
-    updated = replace(
-        base,
-        fp_alu_ops=max(base.fp_alu_ops, dis["vec"]),
-        cube_mmad_count=max(base.cube_mmad_count, dis["cube_mmad"]),
-        gm_to_l1_bytes=max(base.gm_to_l1_bytes, dis["mte2"] * unit_xfer if dis["cube_mmad"] else 0),
-        gm_to_ub_bytes=max(base.gm_to_ub_bytes, dis["mte2"] * unit_xfer if not dis["cube_mmad"] else 0),
-        l1_to_l0a_bytes=max(base.l1_to_l0a_bytes, dis["mte1"] * unit_xfer),
-        l0c_to_ub_bytes=max(base.l0c_to_ub_bytes, dis["fixpipe"] * unit_xfer),
-        ub_to_gm_bytes=max(base.ub_to_gm_bytes, dis["mte3"] * unit_xfer),
-        cv_sync_barriers=max(base.cv_sync_barriers, dis["sync"]),
+    granularity = _estimate_transfer_granularity(cpp_source)
+    updates: dict[str, object] = {
+        "fp_alu_ops": max(base.fp_alu_ops, dis["vec"]),
+        "cube_mmad_count": max(base.cube_mmad_count, dis["cube_mmad"]),
+        "cv_sync_barriers": max(base.cv_sync_barriers, dis["sync"]),
+    }
+    byte_routes = (
+        ("gm_to_l1_insns", "gm_to_l1_bytes"),
+        ("gm_to_ub_insns", "gm_to_ub_bytes"),
+        ("l1_to_l0a_insns", "l1_to_l0a_bytes"),
+        ("l1_to_l0b_insns", "l1_to_l0b_bytes"),
+        ("l0c_to_ub_insns", "l0c_to_ub_bytes"),
+        ("l0c_to_l1_insns", "l0c_to_l1_bytes"),
+        ("l0c_to_gm_insns", "l0c_to_gm_bytes"),
+        ("ub_to_gm_insns", "ub_to_gm_bytes"),
+        ("ub_to_l1_insns", "ub_to_l1_bytes"),
     )
-    return updated.to_dict()
+    for count_key, byte_field in byte_routes:
+        route = byte_field.removesuffix("_bytes")
+        if dis[count_key] > 0 and route in granularity:
+            updates[byte_field] = dis[count_key] * granularity[route]
+        else:
+            updates[byte_field] = getattr(base, byte_field)
+    return replace(base, **updates).to_dict()
 
 
 def _detect_tilelang_include_dir() -> str | None:
@@ -1936,6 +2354,49 @@ def _resolve_agent_gates_bin() -> str:
     )
 
 
+def verify_agent_gates_receipt(
+    agent_gates_bin: str,
+    run_id: str,
+    *,
+    source_root: str | Path,
+    env: Mapping[str, str] | None = None,
+    timeout_sec: float = 30.0,
+) -> tuple[bool, str]:
+    """Verify one AgentGates receipt by run ID and require an authoritative PASS."""
+    try:
+        proc = subprocess.run(
+            [agent_gates_bin, "verify", "--run-id", run_id, "--json"],
+            text=True,
+            capture_output=True,
+            cwd=str(Path(source_root).resolve()),
+            env=dict(env) if env is not None else None,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"agent-gates verify timed out after {timeout_sec:.0f}s"
+    parsed: dict[str, object] = {}
+    brace_idx = proc.stdout.find("{")
+    if brace_idx >= 0:
+        try:
+            loaded = json.loads(proc.stdout[brace_idx:])
+        except json.JSONDecodeError as exc:
+            return False, f"agent-gates verify returned malformed JSON: {exc}"
+        if isinstance(loaded, dict):
+            parsed = loaded
+    status = str(parsed.get("status", ""))
+    verified_run_id = str(parsed.get("runId", ""))
+    valid = parsed.get("valid") is True
+    if proc.returncode == 0 and status == "PASS" and verified_run_id == run_id and valid:
+        return True, ""
+    detail = (proc.stderr or proc.stdout or "agent-gates verify failed").strip()
+    return False, (
+        "receipt_verification_failed: "
+        f"status={status or 'MISSING'} runId={verified_run_id or 'MISSING'} "
+        f"valid={valid} {detail[-1000:]}"
+    )
+
+
 def run_stage_c_agent_gates(
     ledger: ObjectivePhysicalLedger,
     *,
@@ -1984,32 +2445,42 @@ def run_stage_c_agent_gates(
             cwd=str(src_path),
             timeout=timeout_sec,
         )
+        parsed: dict[str, object] = {}
+        brace_idx = proc.stdout.find("{")
+        if brace_idx >= 0:
+            try:
+                loaded = json.loads(proc.stdout[brace_idx:])
+            except json.JSONDecodeError:
+                loaded = {}
+            if isinstance(loaded, dict):
+                parsed = loaded
 
-    parsed: dict[str, object] = {}
-    for line in proc.stdout.splitlines():
-        pass
-    try:
-        idx = proc.stdout.find("{")
-        if idx >= 0:
-            parsed = json.loads(proc.stdout[idx:])
-    except json.JSONDecodeError:
-        parsed = {}
-
-    status = str(parsed.get("status", "FAIL"))
-    run_id = str(parsed.get("runId", ""))
-    receipt_path = str(parsed.get("receiptPath", ""))
-    passed = proc.returncode == 0 and status == "PASS"
+        status = str(parsed.get("status", "FAIL"))
+        run_id = str(parsed.get("runId", "")).strip()
+        receipt_path = str(parsed.get("receiptPath", ""))
+        passed = proc.returncode == 0 and status == "PASS"
+        run_error = (proc.stderr or proc.stdout or "agent-gates failed")[-1000:]
+        verify_error = ""
+        if passed and not run_id:
+            passed = False
+            run_error = "agent-gates run reported PASS without a runId"
+        elif passed:
+            passed, verify_error = verify_agent_gates_receipt(
+                ag_bin,
+                run_id,
+                source_root=src_path,
+            )
 
     telemetry: dict[str, object] = {}
-    if telemetry_report_path and Path(telemetry_report_path).is_file():
+    if passed and telemetry_report_path and Path(telemetry_report_path).is_file():
         try:
             telemetry = json.loads(Path(telemetry_report_path).read_text(encoding="utf-8"))
-        except Exception:
+        except (OSError, json.JSONDecodeError):
             telemetry = {}
 
     latency_us = float(telemetry.get("dur_us", telemetry.get("measured_latency_us", 0.0)))
     residual = compute_static_dynamic_residual(ledger, telemetry)
-    err = "" if passed else (proc.stderr or proc.stdout or "agent-gates failed")[-1000:]
+    err = "" if passed else (verify_error or run_error)[-1000:]
     return StageCResult(
         passed=passed,
         accuracy_passed=passed,
@@ -2270,4 +2741,5 @@ __all__ = [
     "run_stage_b_compile",
     "run_stage_c_agent_gates",
     "synthesize_pybind_extension_wrapper",
+    "verify_agent_gates_receipt",
 ]

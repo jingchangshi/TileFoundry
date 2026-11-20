@@ -3636,6 +3636,7 @@ class PerfTargetCampaignRunner:
                             axes=parent_axes,
                             blueprint=blueprint,
                             sil_advisory=self._sil_advisory,
+                            parent_ledger=parent_ledger,
                         )
                     ]
                 )

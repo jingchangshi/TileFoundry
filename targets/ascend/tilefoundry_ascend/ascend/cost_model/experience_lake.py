@@ -52,7 +52,7 @@ def resolve_default_experience_lake_dir(
 
 @dataclass(frozen=True)
 class CandidateArtifactRecord:
-    """Static candidate IR, schedule, compiler summary, and lineage snapshot (written once per sha)."""
+    """Static candidate IR, schedule, compiler summary, and lineage snapshot per sha."""
 
     cand_sha: str
     operator: str
@@ -170,7 +170,10 @@ def project_case_workload(
     axes: object | None = None,
     target: AscendTarget | None = None,
 ) -> dict[str, object]:
-    """Parametrically project a single static candidate ledger onto concrete case dimensions (<1ms)."""
+    """Project one static candidate ledger onto concrete case dimensions in under a millisecond.
+
+    Analytical GM-byte and FLOP projections follow the concrete case dimensions.
+    """
     eff_target = target or AscendTarget("ascend.950pr")
     facts = eff_target.get_facts(AscendSpaceFacts)
     prof = MicroarchProfile.coerce(microarch_profile)
@@ -227,7 +230,6 @@ def project_case_workload(
     inner_dim = k_dim or n_dim or m_dim
     proj_contig = max(32, min(base_contig, inner_dim * elem_b)) if inner_dim > 0 else base_contig
 
-    # Analytical GM bytes & FLOP projection for the specific case_dims
     case_gm = 0.0
     cube_flops = 0.0
     vec_flops = 0.0

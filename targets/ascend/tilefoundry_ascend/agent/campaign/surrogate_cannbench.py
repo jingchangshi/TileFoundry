@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +42,7 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     build_stage_b_driver_source,
     run_stage_a_static,
     run_stage_b_compile,
+    verify_agent_gates_receipt,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     KernelLLMBackend,
@@ -420,6 +422,24 @@ def compare_case_result(
     )
     return SimpleNamespace(passed=bool(res.passed), message=msg)
 '''
+
+
+_L3_CACHE_SITECUSTOMIZE = (
+    "import importlib as _tf_importlib\n"
+    "import os as _tf_os\n"
+    "_tf_tl_dir = _tf_os.environ.get('TF_SURROGATE_TL_CACHE_DIR', '').strip()\n"
+    "if _tf_tl_dir:\n"
+    "    _tf_os.makedirs(_tf_tl_dir, exist_ok=True)\n"
+    "    _tf_os.environ['TILELANG_CACHE_DIR'] = _tf_tl_dir\n"
+    "    _tf_os.environ['TILELANG_KERNEL_CACHE_USE_LIB_STAMP'] = '1'\n"
+    "    _tf_os.environ['TILELANG_DISABLE_CACHE'] = '0'\n"
+    "    _tl_env_mod = _tf_importlib.import_module('tilelang.env')\n"
+    "    _tl_kc = _tf_importlib.import_module('tilelang.cache.kernel_cache')\n"
+    "    _tl_env_mod.env.enable_cache()\n"
+    "    _tl_kc.KernelCache._get_cache_namespace.cache_clear()\n"
+    "    _tl_kc.KernelCache._get_tilelang_lib_stamp.cache_clear()\n"
+    "    _tl_kc.KernelCache._create_dirs()\n"
+)
 
 
 def ensure_npu_compare_shim_dir(
@@ -1427,7 +1447,7 @@ def _is_transient_blocked_env(
                     continue
                 failures = gate.get("failures")
                 if (
-                    gate.get("gateId") == "tilefoundry-npu-device"
+                    gate.get("gateId") == "tilefoundry-npu-device-fast"
                     and gate.get("status") == "NOT_RUN"
                     and isinstance(failures, Sequence)
                     and not isinstance(failures, (str, bytes))
@@ -1531,7 +1551,6 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
             resolved_env,
             tmp / "env.sh",
             {
-                "TILEFOUNDRY_NPU_CPU_TESTS": "tests/ascend/agent/test_llm_watchdog.py",
                 "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/agent/test_surrogate_batch_npu.py",
             },
         )
@@ -1570,7 +1589,7 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
             "--device-id",
             str(device_id),
             "--gate",
-            "tilefoundry-npu-device",
+            "tilefoundry-npu-device-fast",
             "--json",
         ]
         sub_env = _clean_agent_gates_subprocess_env(
@@ -1588,12 +1607,27 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
         )
         run_id = str(parsed.get("runId", ""))
         receipt_path = str(parsed.get("receiptPath", ""))
+        run_passed = proc.returncode == 0 and parsed.get("status") == "PASS"
+        if run_passed:
+            verified, verify_error = (
+                verify_agent_gates_receipt(ag_bin, run_id, source_root=root)
+                if run_id
+                else (False, "AgentGates L2 surrogate batch reported PASS without a runId")
+            )
+            if not verified:
+                raise RuntimeError(
+                    "AgentGates L2 surrogate batch receipt verification failed: "
+                    f"{verify_error or 'unknown failure'}"
+                )
         held_sec = 0.0
         for gate_row in parsed.get("gates", ()):
-            if isinstance(gate_row, dict) and gate_row.get("gateId") == "tilefoundry-npu-device":
-                obs = gate_row.get("observations") or {}
-                win = obs.get("deviceWindow") or {}
-                held_sec = float(win.get("heldSeconds", 0.0))
+            if not isinstance(gate_row, dict):
+                continue
+            if gate_row.get("gateId") != "tilefoundry-npu-device-fast":
+                continue
+            obs = gate_row.get("observations") or {}
+            win = obs.get("deviceWindow") or {}
+            held_sec = float(win.get("heldSeconds", 0.0))
 
         if not response_path.is_file():
             detail = (proc.stderr or proc.stdout or "surrogate batch missing response").strip()[-1000:]
@@ -1724,8 +1758,8 @@ def collect_bottleneck_msprof_via_agent_gates(
             resolved_env,
             tmp / "env.sh",
             {
-                "TILEFOUNDRY_NPU_CPU_TESTS": "tests/ascend/agent/test_llm_watchdog.py",
                 "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/agent/test_surrogate_batch_npu.py",
+                "TILEFOUNDRY_NPU_MSPROF_LOCK": "1",
             },
         )
         payload = {
@@ -1764,7 +1798,7 @@ def collect_bottleneck_msprof_via_agent_gates(
             "--device-id",
             str(device_id),
             "--gate",
-            "tilefoundry-npu-device",
+            "tilefoundry-npu-device-fast",
             "--json",
         ]
         sub_env = _clean_agent_gates_subprocess_env(
@@ -1774,12 +1808,25 @@ def collect_bottleneck_msprof_via_agent_gates(
                 "CANNBENCH_CACHE_DIR": str(cache_dir),
             }
         )
-        proc, _parsed = _run_agent_gates_cmd(
+        proc, parsed = _run_agent_gates_cmd(
             cmd,
             cwd=str(root),
             env=sub_env,
             timeout_sec=timeout_sec,
         )
+        run_id = str(parsed.get("runId", ""))
+        run_passed = proc.returncode == 0 and parsed.get("status") == "PASS"
+        if run_passed:
+            verified, verify_error = (
+                verify_agent_gates_receipt(ag_bin, run_id, source_root=root)
+                if run_id
+                else (False, "AgentGates msprof collection reported PASS without a runId")
+            )
+            if not verified:
+                raise RuntimeError(
+                    "AgentGates msprof receipt verification failed: "
+                    f"{verify_error or 'unknown failure'}"
+                )
         if not response_path.is_file():
             detail = (proc.stderr or proc.stdout or "msprof request missing response").strip()[
                 -1000:
@@ -1826,16 +1873,18 @@ def run_l3_full_contract_via_agent_gates(
         env_file=resolved_env,
     )
     cache_dir = _default_surrogate_cache_dir()
+    tl_cache_dir = _default_surrogate_tl_cache_dir()
 
     with tempfile.TemporaryDirectory(prefix="tf_l3_gate_") as tmp_dir:
         tmp = Path(tmp_dir)
         shim_dir = ensure_npu_compare_shim_dir(tmp / "shim", cannbench_repo=cann_repo)
+        (shim_dir / "sitecustomize.py").write_text(_L3_CACHE_SITECUSTOMIZE, encoding="utf-8")
         tmp_env = _write_temp_env_file(
             resolved_env,
             tmp / "env.sh",
             {
-                "TILEFOUNDRY_NPU_CPU_TESTS": "tests/ascend/agent/test_llm_watchdog.py",
                 "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/benchmarks/test_npu_acceptance.py",
+                "TILEFOUNDRY_NPU_ENABLE_TILELANG_CACHE": "1",
             },
         )
         cmd = [
@@ -1850,7 +1899,7 @@ def run_l3_full_contract_via_agent_gates(
             "--device-id",
             str(device_id),
             "--gate",
-            "tilefoundry-npu-device",
+            "tilefoundry-npu-device-fast",
             "--json",
         ]
         prev_pp = os.environ.get("PYTHONPATH", "")
@@ -1858,6 +1907,7 @@ def run_l3_full_contract_via_agent_gates(
         l3_env: dict[str, str] = {
             "PYTHONPATH": new_pp,
             "CANNBENCH_CACHE_DIR": str(cache_dir),
+            "TF_SURROGATE_TL_CACHE_DIR": str(tl_cache_dir),
             "TF_SURROGATE_SHIM_ONLY": "1",
             "TF_SURROGATE_SHIM_DIR": str(shim_dir),
         }
@@ -1872,11 +1922,25 @@ def run_l3_full_contract_via_agent_gates(
             env=sub_env,
             timeout_sec=timeout_sec,
         )
-    ok = proc.returncode == 0 and parsed.get("status") == "PASS"
-    err = "" if ok else (proc.stderr or proc.stdout or "L3 contract failed")[-1000:]
+        run_id = str(parsed.get("runId", ""))
+        ok = proc.returncode == 0 and parsed.get("status") == "PASS"
+        err = "" if ok else (proc.stderr or proc.stdout or "L3 contract failed")[-1000:]
+        if ok:
+            if not run_id:
+                ok = False
+                err = "AgentGates L3 contract reported PASS without a runId"
+            else:
+                verified, verify_error = verify_agent_gates_receipt(
+                    ag_bin,
+                    run_id,
+                    source_root=root,
+                )
+                if not verified:
+                    ok = False
+                    err = verify_error or "L3 receipt verification failed"
     return L3AcceptanceResult(
         passed=ok,
-        run_id=str(parsed.get("runId", "")),
+        run_id=run_id,
         receipt_path=str(parsed.get("receiptPath", "")),
         elapsed_sec=time.monotonic() - t0,
         error_message=err,
@@ -2005,7 +2069,6 @@ def run_micro_probe_via_agent_gates(
             resolved_env,
             tmp / "env.sh",
             {
-                "TILEFOUNDRY_NPU_CPU_TESTS": "tests/ascend/agent/test_llm_watchdog.py",
                 "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/agent/test_surrogate_batch_npu.py",
             },
         )
@@ -2036,7 +2099,7 @@ def run_micro_probe_via_agent_gates(
             "--device-id",
             str(device_id),
             "--gate",
-            "tilefoundry-npu-device",
+            "tilefoundry-npu-device-fast",
             "--json",
         ]
         sub_env = _clean_agent_gates_subprocess_env(
@@ -2045,12 +2108,26 @@ def run_micro_probe_via_agent_gates(
                 "TF_SURROGATE_TL_CACHE_DIR": str(tl_cache_dir),
             }
         )
-        proc, _parsed = _run_agent_gates_cmd(
+        proc, parsed = _run_agent_gates_cmd(
             cmd,
             cwd=str(root),
             env=sub_env,
             timeout_sec=timeout_sec,
         )
+        run_id = str(parsed.get("runId", ""))
+        run_passed = proc.returncode == 0 and parsed.get("status") == "PASS"
+        if run_passed:
+            verified, verify_error = (
+                verify_agent_gates_receipt(ag_bin, run_id, source_root=root)
+                if run_id
+                else (False, "AgentGates micro-probe reported PASS without a runId")
+            )
+            if not verified:
+                logger.warning(
+                    "AgentGates micro-probe receipt verification failed: %s",
+                    verify_error or "unknown failure",
+                )
+                return fail_closed
         if not response_path.is_file():
             logger.warning(
                 "AgentGates micro-probe missing response (rc=%s): %s",
@@ -2067,26 +2144,254 @@ def run_micro_probe_via_agent_gates(
         } or fail_closed
 
 
+def _agent_gates_evidence_root() -> Path:
+    """Read the configured AgentGates evidence root used by the V2 worker."""
+    configured = os.environ.get("AGENT_GATES_CONFIG", "").strip()
+    path = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".config/agent-gates/config.toml"
+    )
+    raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    evidence_root = raw.get("evidence_root")
+    if not isinstance(evidence_root, str) or not evidence_root.strip():
+        raise ValueError("AgentGates evidence_root must be configured")
+    return Path(evidence_root).expanduser().resolve()
+
+
+def _extract_l4_metrics(
+    parsed: Mapping[str, object],
+    target_task: str,
+) -> tuple[float, float, str, dict[int, float], dict[int, float]]:
+    """Extract L4 aggregate and per-case metrics from signed gate observations."""
+    avg_speedup = 0.0
+    score = 0.0
+    report_dir = ""
+    per_case_speedups: dict[int, float] = {}
+    per_case_elapsed: dict[int, float] = {}
+    for gate_row in parsed.get("gates", ()):
+        if not isinstance(gate_row, Mapping):
+            continue
+        if gate_row.get("gateId") != "tilefoundry-npu-cannbench":
+            continue
+        obs = gate_row.get("observations") or {}
+        if not isinstance(obs, Mapping):
+            continue
+        avg_speedup = float(obs.get("avgSpeedup", 0.0))
+        score = float(obs.get("score", 0.0))
+        for res_row in obs.get("results", ()):
+            if not isinstance(res_row, Mapping):
+                continue
+            if target_task and res_row.get("task") != target_task:
+                continue
+            report_dir = str(res_row.get("reportDir", ""))
+            for case_row in res_row.get("cases", ()):
+                if not isinstance(case_row, Mapping):
+                    continue
+                cid_str = str(case_row.get("case_id", ""))
+                if "_" not in cid_str or not cid_str.rsplit("_", 1)[-1].isdigit():
+                    continue
+                cnum = int(cid_str.rsplit("_", 1)[-1])
+                per_case_speedups[cnum] = float(case_row.get("speedup") or 0.0)
+                per_case_elapsed[cnum] = float(case_row.get("elapsed_us") or 0.0)
+    return avg_speedup, score, report_dir, per_case_speedups, per_case_elapsed
+
+
+def _run_agent_gates_v2_cmd(
+    cmd: Sequence[str],
+    *,
+    root: Path,
+    timeout_sec: float,
+) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+    """Run one V2 AgentGates command against the configured worker evidence."""
+    proc = subprocess.run(
+        [str(part) for part in cmd],
+        text=True,
+        capture_output=True,
+        cwd=str(root),
+        env=_clean_agent_gates_subprocess_env({}),
+        timeout=timeout_sec,
+    )
+    return proc, _parse_agent_gates_json(proc.stdout)
+
+
+def _l4_failure(error_message: str) -> L4CannbenchResult:
+    """Return a failed L4 result without metrics or promotion evidence."""
+    return L4CannbenchResult(passed=False, error_message=error_message[-1000:])
+
+
+def _run_l4_v2_agent_gates(
+    *,
+    agent_gates_bin: str,
+    root: Path,
+    workspace: str,
+    timeout_sec: int,
+) -> L4CannbenchResult:
+    """Run one L4 execution through the V2 worker and authoritative verification."""
+    submit_cmd = [
+        agent_gates_bin,
+        "submit",
+        "--workspace",
+        workspace,
+        "--adapter",
+        "tilefoundry-npu",
+        "--gate",
+        "tilefoundry-npu-cannbench",
+        "--json",
+    ]
+    try:
+        proc, parsed = _run_agent_gates_v2_cmd(submit_cmd, root=root, timeout_sec=60.0)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _l4_failure(f"L4 submit failed: {exc}")
+    if proc.returncode != 0:
+        return _l4_failure(proc.stderr or proc.stdout or "L4 submit failed")
+    execution_id = str(parsed.get("execution_id", ""))
+    if not execution_id:
+        return _l4_failure("L4 submit returned no execution_id")
+
+    deadline = time.monotonic() + timeout_sec
+    run_id = ""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return _l4_failure(f"L4 execution {execution_id} wait timed out")
+        wait_seconds = min(60.0, remaining)
+        wait_cmd = [
+            agent_gates_bin,
+            "wait",
+            "--execution-id",
+            execution_id,
+            "--timeout",
+            f"{wait_seconds:g}",
+            "--json",
+        ]
+        try:
+            proc, parsed = _run_agent_gates_v2_cmd(
+                wait_cmd,
+                root=root,
+                timeout_sec=wait_seconds + 5.0,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return _l4_failure(f"L4 execution {execution_id} wait failed: {exc}")
+        if proc.returncode != 0:
+            return _l4_failure(
+                proc.stderr or proc.stdout or f"L4 execution {execution_id} wait failed"
+            )
+        if parsed.get("timed_out") is True:
+            continue
+        status = parsed.get("status")
+        state = status.get("state") if isinstance(status, Mapping) else None
+        if state is None:
+            return _l4_failure(f"L4 execution {execution_id} wait returned no status")
+        if state != "FINISHED":
+            return _l4_failure(f"L4 execution {execution_id} ended in state {state!r}")
+        run_id = str(status.get("run_id") or "")
+        break
+    if not run_id:
+        return _l4_failure(f"L4 execution {execution_id} finished without run_id")
+
+    verify_cmd = [
+        agent_gates_bin,
+        "verify-requirements",
+        "--workspace",
+        workspace,
+        "--adapter",
+        "tilefoundry-npu",
+        "--gate",
+        "tilefoundry-npu-cannbench",
+        "--run-id",
+        run_id,
+        "--json",
+    ]
+    try:
+        proc, verified = _run_agent_gates_v2_cmd(
+            verify_cmd,
+            root=root,
+            timeout_sec=min(60.0, max(1.0, timeout_sec)),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _l4_failure(f"L4 requirement verification failed: {exc}")
+    if proc.returncode != 0 or verified.get("satisfied") is not True:
+        details = verified.get("failures") or proc.stderr or proc.stdout or "unsatisfied"
+        return _l4_failure(f"L4 requirements not satisfied: {details}")
+    identity = verified.get("current_source_identity")
+    identity_root = identity.get("root") if isinstance(identity, Mapping) else None
+    if not identity_root or Path(str(identity_root)).resolve() != root:
+        return _l4_failure("L4 verified source identity does not match requested source")
+
+    try:
+        evidence_root = _agent_gates_evidence_root()
+    except (OSError, ValueError) as exc:
+        return _l4_failure(f"L4 evidence root unavailable: {exc}")
+    report_cmd = [
+        agent_gates_bin,
+        "report",
+        "--run-id",
+        run_id,
+        "--evidence-root",
+        str(evidence_root),
+        "--json",
+    ]
+    try:
+        proc, report = _run_agent_gates_v2_cmd(
+            report_cmd,
+            root=root,
+            timeout_sec=min(60.0, max(1.0, timeout_sec)),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _l4_failure(f"L4 report failed: {exc}")
+    if proc.returncode != 0:
+        return _l4_failure(proc.stderr or proc.stdout or "L4 report failed")
+    avg_speedup, score, report_dir, speedups, elapsed = _extract_l4_metrics(report, "")
+    return L4CannbenchResult(
+        passed=True,
+        avg_speedup=avg_speedup,
+        score=score,
+        per_case_speedups=speedups,
+        per_case_elapsed_us=elapsed,
+        run_id=run_id,
+        receipt_path=str(report.get("receiptPath", "")),
+        report_dir=report_dir,
+    )
+
+
 def run_l4_official_cannbench_via_agent_gates(
     *,
     operator_name: str | None = None,
+    workspace: str | None = None,
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     device_id: str = "1",
     timeout_sec: int = 3600,
 ) -> L4CannbenchResult:
-    """Run official tilefoundry-npu-cannbench gate once and parse per-case metrics."""
-    root = Path(source_root).resolve() if source_root is not None else default_source_root()
-    resolved_env = _resolve_env_file_path(env_file)
-    ag_bin = _resolve_agent_gates_bin(root)
+    """Run official tilefoundry-npu-cannbench and verify its signed receipt.
 
+    Calls registered through ``workspace`` without env or device overrides use V2, where the
+    worker owns device selection and configuration.
+    """
+    root = Path(source_root).resolve() if source_root is not None else default_source_root()
+    ag_bin = _resolve_agent_gates_bin(root)
+    if (
+        operator_name is None
+        and workspace is not None
+        and env_file is None
+        and device_id == "1"
+    ):
+        return _run_l4_v2_agent_gates(
+            agent_gates_bin=ag_bin,
+            root=root,
+            workspace=workspace,
+            timeout_sec=timeout_sec,
+        )
+
+    resolved_env = _resolve_env_file_path(env_file)
+    target_task = get_operator_task(operator_name) if operator_name else ""
     with tempfile.TemporaryDirectory(prefix="tf_l4_gate_") as tmp_dir:
         tmp = Path(tmp_dir)
         overrides: dict[str, str] = {}
         if operator_name is not None:
-            task = get_operator_task(operator_name)
             rel_cand = get_operator_module_relpath(operator_name)
-            overrides["TILEFOUNDRY_NPU_CANNBENCH_TARGETS"] = f"{task}:{rel_cand}"
+            overrides["TILEFOUNDRY_NPU_CANNBENCH_TARGETS"] = f"{target_task}:{rel_cand}"
         tmp_env = _write_temp_env_file(resolved_env, tmp / "env.sh", overrides)
         cmd = [
             ag_bin,
@@ -2109,50 +2414,33 @@ def run_l4_official_cannbench_via_agent_gates(
             env=_clean_agent_gates_subprocess_env({}),
             timeout_sec=timeout_sec,
         )
+        run_id = str(parsed.get("runId", ""))
+        receipt_path = str(parsed.get("receiptPath", ""))
+        run_passed = proc.returncode == 0 and parsed.get("status") == "PASS"
+        verified = False
+        verify_error = ""
+        if run_passed and run_id:
+            verified, verify_error = verify_agent_gates_receipt(
+                ag_bin,
+                run_id,
+                source_root=root,
+            )
+        ok = run_passed and verified
+        if not ok:
+            err = verify_error or (
+                proc.stderr or proc.stdout or "L4 CANNBench gate failed"
+            )[-1000:]
+        else:
+            err = ""
 
-    ok = proc.returncode == 0 and parsed.get("status") == "PASS"
-    run_id = str(parsed.get("runId", ""))
-    receipt_path = str(parsed.get("receiptPath", ""))
-
-    avg_speedup = 0.0
-    score = 0.0
-    report_dir = ""
-    per_case_speedups: dict[int, float] = {}
-    per_case_elapsed: dict[int, float] = {}
-
-    target_task = get_operator_task(operator_name) if operator_name else ""
-    for gate_row in parsed.get("gates", ()):
-        if not isinstance(gate_row, dict) or gate_row.get("gateId") != "tilefoundry-npu-cannbench":
-            continue
-        obs = gate_row.get("observations") or {}
-        avg_speedup = float(obs.get("avgSpeedup", 0.0))
-        score = float(obs.get("score", 0.0))
-        for res_row in obs.get("results", ()):
-            if not isinstance(res_row, dict):
-                continue
-            if target_task and res_row.get("task") != target_task:
-                continue
-            report_dir = str(res_row.get("reportDir", ""))
-            final_json = Path(report_dir) / "official_final.json"
-            if final_json.is_file():
-                final_data = json.loads(final_json.read_text(encoding="utf-8"))
-                op_entry = final_data["operators"][0]
-                avg_speedup = float(op_entry.get("avg_speedup", avg_speedup))
-                score = float(op_entry.get("score", score))
-                for case_row in op_entry.get("cases", ()):
-                    cid_str = str(case_row.get("case_id", ""))
-                    if "_" in cid_str and cid_str.rsplit("_", 1)[-1].isdigit():
-                        cnum = int(cid_str.rsplit("_", 1)[-1])
-                        per_case_speedups[cnum] = float(case_row.get("speedup") or 0.0)
-                        per_case_elapsed[cnum] = float(case_row.get("elapsed_us") or 0.0)
-
-    err = "" if ok else (proc.stderr or proc.stdout or "L4 CANNBench gate failed")[-1000:]
+    metrics = _extract_l4_metrics(parsed, target_task) if ok else (0.0, 0.0, "", {}, {})
+    avg_speedup, score, report_dir, speedups, elapsed = metrics
     return L4CannbenchResult(
         passed=ok,
         avg_speedup=avg_speedup,
         score=score,
-        per_case_speedups=per_case_speedups,
-        per_case_elapsed_us=per_case_elapsed,
+        per_case_speedups=speedups,
+        per_case_elapsed_us=elapsed,
         run_id=run_id,
         receipt_path=receipt_path,
         report_dir=report_dir,

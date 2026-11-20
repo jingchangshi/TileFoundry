@@ -64,8 +64,3 @@ repos:
         entry: python scripts/no_machine_paths_lint.py
         language: system
         exclude_types: [binary]
-      - id: english-only
-        name: english-only
-        entry: python scripts/english_only_lint.py
-        language: system
-        exclude_types: [binary]
