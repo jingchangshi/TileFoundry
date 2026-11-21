@@ -518,6 +518,17 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
             "In Python entrypoints, guard any non-NPU CPU fallback inside "
             "if x.device.type != \"npu\":."
         ),
+        (
+            "PURE_SIMDVF_UBUF_FLAGS (--cce-disable-vf-stack-reserved-ubuf, "
+            "--cce-disable-asc-reserved-ubuf) and raw integer UB pointer casts "
+            "((__ubuf__ T*)0 or (__ubuf__ T*)offset) are ONLY valid in pure __simd_vf__ "
+            "translation units with zero __simt_vf__ functions. In any TU defining "
+            "__simt_vf__, omit PURE_SIMDVF_UBUF_FLAGS and never pass raw integer "
+            "(__ubuf__ T*) offsets into __simt_vf__ (doing so overwrites the SIMT "
+            "thread stack/data cache in UB and triggers vector core exception 507035); "
+            "operate directly on __gm__ pointers or pass an explicit __gm__ scratch "
+            "tensor allocated from Python instead."
+        ),
     ),
 )
 

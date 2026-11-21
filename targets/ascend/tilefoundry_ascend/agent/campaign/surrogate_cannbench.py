@@ -2695,7 +2695,7 @@ def _submit_fast_gate(
     if _sha256_file(request_path) != request_sha256:
         raise RuntimeError("fast request file changed after it was written")
     backoff = (8.0, 12.0, 16.0, 20.0, 25.0, 30.0)
-    max_retries = len(backoff)
+    max_retries = 14
     execution: _V2GateExecution | None = None
     for retry_idx in range(max_retries + 1):
         execution = _run_v2_gate(

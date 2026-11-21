@@ -55,6 +55,7 @@ class OracleAccuracyResult:
     l3_receipt_path: str = ""
     l3_state: str = ""
     elapsed_sec: float = 0.0
+    failure_kind: str = "candidate"
 
 
 @dataclass(frozen=True)
@@ -737,12 +738,17 @@ def _seed_module_abi(
             "any selector `builder_kwargs`, and returns the Track-B kernel plan/translation-unit "
             "selection that `_get_kernel` compiles.\n"
             "- `_get_kernel` compiles and caches the Track-B shared library via:\n"
-            "  - `from tilelang.contrib.bisheng import compile_ascend` and "
-            "`from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS`\n"
+            "  - `from tilelang.contrib.bisheng import compile_ascend` (and import "
+            "`PURE_SIMDVF_UBUF_FLAGS` from `tilefoundry_ascend.ascend.target` ONLY for pure "
+            "`__simd_vf__` kernels without `__simt_vf__`)\n"
             "  - include flags: `-I{Path(tilelang.__file__).resolve().parent.parent / \"src\"}` "
             "plus existing CANN include directories (`include`, `x86_64-linux/include`, "
             "`aarch64-linux/include`, `runtime/include` under `ASCEND_HOME_PATH` or "
-            "`ASCEND_TOOLKIT_HOME`) and `PURE_SIMDVF_UBUF_FLAGS`\n"
+            "`ASCEND_TOOLKIT_HOME`); include `PURE_SIMDVF_UBUF_FLAGS` ONLY when the TU defines "
+            "zero `__simt_vf__` functions (whenever `__simt_vf__` is present, omit "
+            "`PURE_SIMDVF_UBUF_FLAGS` and never cast raw integer offsets to `__ubuf__ T*`, "
+            "which overwrites the SIMT stack/data cache; use `__gm__` pointers or a `__gm__` "
+            "scratch tensor instead)\n"
             "  - `compile_ascend(tu_src, target_format=\"so\", npu_arch=\"dav-3510\", "
             "options=opts, path_target=so_path)` into a temporary `.so`, load with "
             "`lib = ctypes.CDLL(so_path)` (retain `lib` on the cached runner to prevent GC), and "
@@ -971,6 +977,7 @@ async def prepare_operator_seed_or_takeover(
     force_cold_start: bool = False,
     max_seed_attempts: int = 4,
     max_transport_retries: int = 2,
+    max_env_retries: int = 3,
     desc_text: str = "",
     golden_contract: GoldenEntrypointContract | None = None,
 ) -> SeedSynthesisOutcome:
@@ -1156,6 +1163,35 @@ async def prepare_operator_seed_or_takeover(
             continue
 
         evidence = oracle_accuracy_validator(synthesized_src)
+        env_retries = 0
+        while (
+            not evidence.passed
+            and evidence.failure_kind == "environment"
+            and env_retries < max(0, max_env_retries)
+        ):
+            env_retries += 1
+            oracle_detail = (
+                evidence.error_message or f"L3 environment blocked state={evidence.l3_state}"
+            )
+            logger.info(
+                "STAGE0_ATTEMPT_ENV_BLOCKED op=%s attempt=%d retry=%d/%d track=%s detail=%s",
+                operator_name,
+                attempt,
+                env_retries,
+                max(0, max_env_retries),
+                initial_track,
+                oracle_detail.replace("\n", " ")[:500],
+            )
+            evidence = oracle_accuracy_validator(synthesized_src)
+        if not evidence.passed and evidence.failure_kind == "environment":
+            oracle_detail = (
+                evidence.error_message or f"L3 environment blocked state={evidence.l3_state}"
+            )
+            raise RuntimeError(
+                f"Stage-0 cold-start oracle verification blocked by environment for "
+                f"{operator_name} on attempt {attempt} after {env_retries} retries: "
+                f"{oracle_detail}"
+            )
         if evidence.passed:
             digest = _sha256_text(synthesized_src)
             if evidence.candidate_sha256 != digest:

@@ -1457,3 +1457,217 @@ def test_submit_fast_gate_retries_transient_build_lock_backoff(
     assert raw["status"] == "ok"
     assert len(calls) == 2
     assert sleeps == [8.0]
+
+
+def test_prepare_seed_retries_same_candidate_on_environment_blockage(tmp_path: Path) -> None:
+    """Verify environment blockage retries same seed without burning LLM attempts."""
+    golden = dedent(
+        """
+        import torch
+
+        def vec_op(x: torch.Tensor) -> torch.Tensor:
+            return torch.exp(x)
+        """
+    )
+    proto = {
+        "name": "vec_op",
+        "inputs": [{"name": "x", "dtype": "float32"}],
+        "outputs": [{"name": "y", "dtype": "float32"}],
+    }
+    cases = [{"case_id": 1, "input_shape": [[64, 128]], "dtype": ["float32"], "attrs": {}}]
+    seed_src = dedent(
+        """
+        import torch
+        import tilelang
+        import tilelang.ascend.language as T
+
+        def _select_vec_op_config(M: int = 64, D: int = 128) -> dict[str, object]:
+            return {"pass_configs": {}, "compile_flags": []}
+
+        def _build_vec_op_prim_func(M: int = 64, D: int = 128):
+            @T.prim_func
+            def main(X: T.Tensor((M, D), "float32")):
+                pass
+            return main
+
+        def _get_kernel(M: int = 64, D: int = 128):
+            return tilelang.compile(_build_vec_op_prim_func(M, D), target="ascend")
+
+        def vec_op(x: torch.Tensor) -> torch.Tensor:
+            if x.device.type != "npu":
+                return torch.exp(x)
+            return _get_kernel(int(x.shape[0]), int(x.shape[1]))(x)
+
+        kernel = vec_op
+        """
+    )
+    digest = hashlib.sha256(seed_src.strip().encode("utf-8")).hexdigest()
+    backend = _ScriptedBackend([seed_src.strip()])
+    oracle_calls = 0
+
+    def _blocked_then_ok(module_source: str) -> OracleAccuracyResult:
+        nonlocal oracle_calls
+        oracle_calls += 1
+        assert hashlib.sha256(module_source.encode("utf-8")).hexdigest() == digest
+        if oracle_calls <= 2:
+            return OracleAccuracyResult(
+                passed=False,
+                error_message="L3 gate recorded status BLOCKED_ENV: ['resource busy: build:/repo/build']",
+                l3_state="FINISHED",
+                failure_kind="environment",
+            )
+        return OracleAccuracyResult(
+            passed=True,
+            candidate_sha256=digest,
+            l3_run_id="run-env-recovered",
+            l3_receipt_path=str(tmp_path / "receipt.json"),
+            l3_state="FINISHED",
+        )
+
+    outcome = asyncio.run(
+        prepare_operator_seed_or_takeover(
+            operator_name="level1/vec_op",
+            entrypoint="vec_op",
+            pytorch_golden_source=golden,
+            proto=proto,
+            cases=cases,
+            legacy_regime_specs=None,
+            llm_backend=backend,
+            l0_l1_validator_factory=lambda _regimes: (lambda _src, _track: (True, "")),
+            oracle_accuracy_validator=_blocked_then_ok,
+            force_cold_start=True,
+            max_seed_attempts=1,
+            max_env_retries=3,
+        )
+    )
+    assert outcome.oracle_accuracy_passed is True
+    assert outcome.attempts_used == 1
+    assert oracle_calls == 3
+    assert len(backend.requests) == 1
+
+    backend_exhausted = _ScriptedBackend([seed_src.strip()])
+    exhausted_calls = 0
+
+    def _always_blocked(_module_source: str) -> OracleAccuracyResult:
+        nonlocal exhausted_calls
+        exhausted_calls += 1
+        return OracleAccuracyResult(
+            passed=False,
+            error_message="L3 gate recorded status BLOCKED_ENV: ['resource busy: build:/repo/build']",
+            l3_state="FINISHED",
+            failure_kind="environment",
+        )
+
+    with pytest.raises(RuntimeError, match="blocked by environment"):
+        asyncio.run(
+            prepare_operator_seed_or_takeover(
+                operator_name="level1/vec_op",
+                entrypoint="vec_op",
+                pytorch_golden_source=golden,
+                proto=proto,
+                cases=cases,
+                legacy_regime_specs=None,
+                llm_backend=backend_exhausted,
+                l0_l1_validator_factory=lambda _regimes: (lambda _src, _track: (True, "")),
+                oracle_accuracy_validator=_always_blocked,
+                force_cold_start=True,
+                max_seed_attempts=2,
+                max_env_retries=2,
+            )
+        )
+    assert exhausted_calls == 3
+    assert len(backend_exhausted.requests) == 1
+
+
+def test_validate_stage0_track_b_omits_simdvf_ubuf_flags_for_simtvf(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Stage-0 Track-B omits PURE_SIMDVF_UBUF_FLAGS whenever __simt_vf__ appears."""
+    recorded_flags: list[list[str]] = []
+
+    def _fake_compile(tu_src: str, **kwargs: object) -> StageBResult:
+        _ = tu_src
+        raw_flags = kwargs.get("compile_flags")
+        assert isinstance(raw_flags, Sequence)
+        recorded_flags.append([str(item) for item in raw_flags])
+        return StageBResult(passed=True)
+
+    monkeypatch.setattr(marathon, "evaluate_ascendc_candidate", lambda *_a, **_kw: StageAResult(passed=True, prim_func=None, ledger=None))
+    monkeypatch.setattr(marathon, "run_stage_b_ascendc_compile", _fake_compile)
+
+    contract = extract_golden_entrypoint_contract(
+        "import torch\ndef vec_op(x: torch.Tensor) -> torch.Tensor:\n    return x\n",
+        "vec_op",
+    )
+    spec = RegimeTargetSpec(
+        regime_tag="stream",
+        builder_candidates=("_build_vec_op_prim_func",),
+        sample_builder_kwargs={"M": 64, "D": 128},
+        representative_hir_dims={"M": 64, "D": 128},
+        config_selector_fn="_select_vec_op_config",
+        runtime_backend="ascendc_trackb",
+        trackb_symbols=("VEC_OP_TRACKB_CU",),
+    )
+    template = dedent(
+        '''
+        import ctypes
+        import torch
+        from tilelang.contrib.bisheng import compile_ascend
+
+        VEC_OP_TRACKB_CU = r"""
+        #include <tl_templates/ascend/common.h>
+        __VF_ATTR__ void helper(__gm__ float* x) {}
+        extern "C" __global__ __aicore__ __vector__ void vec_op_k(__gm__ float* x) {}
+        extern "C" int launch_vec_op(void* stream, void* x) {
+            vec_op_k<<<1, nullptr, stream>>>((__gm__ float*)x);
+            return 0;
+        }
+        """
+
+        def _render_trackb_tu(**dims: object) -> str:
+            _ = dims
+            return VEC_OP_TRACKB_CU
+
+        def _select_vec_op_config(M: int = 64, D: int = 128) -> dict[str, object]:
+            return {"compile_flags": []}
+
+        def _build_vec_op_prim_func(M: int = 64, D: int = 128) -> object:
+            return VEC_OP_TRACKB_CU
+
+        def _get_kernel(M: int = 64, D: int = 128) -> object:
+            compile_ascend(VEC_OP_TRACKB_CU, target_format="so", npu_arch="dav-3510")
+            return ctypes.CDLL("dummy.so")
+
+        def vec_op(x: torch.Tensor) -> torch.Tensor:
+            if x.device.type != "npu":
+                return x
+            return _get_kernel()(x)
+
+        kernel = vec_op
+        '''
+    )
+    validator = build_stage0_static_validator(
+        (spec,),
+        entrypoint="vec_op",
+        worktree=tmp_path,
+        env_file=None,
+        entrypoint_contract=contract,
+    )
+    ok_simd, err_simd = validator(template.replace("__VF_ATTR__", "__simd_vf__ inline"), "cce_trackb")
+    assert ok_simd is True, err_simd
+    ok_simt, err_simt = validator(template.replace("__VF_ATTR__", "__simt_vf__"), "cce_trackb")
+    assert ok_simt is True, err_simt
+    assert len(recorded_flags) == 2
+    assert "--cce-disable-vf-stack-reserved-ubuf" in recorded_flags[0]
+    assert "--cce-disable-vf-stack-reserved-ubuf" not in recorded_flags[1]
+
+
+def test_cce_cpp20_surface_warns_against_simtvf_ubuf_flags_and_raw_ub_casts() -> None:
+    """Verify CCE C++20 reference forbids PURE_SIMDVF_UBUF_FLAGS and raw __ubuf__ casts in __simt_vf__."""
+    rendered = CCE_CPP20_SURFACE.render_prompt_reference()
+    assert "PURE_SIMDVF_UBUF_FLAGS" in rendered
+    assert "__simt_vf__" in rendered
+    assert "(__ubuf__" in rendered
+    assert "507035" in rendered
+

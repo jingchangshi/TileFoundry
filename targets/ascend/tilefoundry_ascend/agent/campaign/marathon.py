@@ -483,7 +483,7 @@ def _validate_stage0_track_b(
     if not verdict.passed:
         return False, f"Track-B L0 token purity ({symbol}): {verdict.error_message}"
     cann_root = _resolve_cann_root_from_env(env_file)
-    flags = list(PURE_SIMDVF_UBUF_FLAGS)
+    flags = list(PURE_SIMDVF_UBUF_FLAGS) if "__simt_vf__" not in instantiated_tu else []
     bisheng_bin: str | None = None
     if cann_root is not None:
         candidate_bin = cann_root / "bin" / "bisheng"
@@ -599,8 +599,8 @@ def build_stage0_oracle_validator(
     worktree: Path,
     device_id: str,
     op_logger: logging.Logger,
-    blocked_env_max_retries: int = 6,
-    blocked_env_backoff_sec: tuple[float, ...] = (10.0, 15.0, 20.0, 25.0, 30.0, 30.0),
+    blocked_env_max_retries: int = 12,
+    blocked_env_backoff_sec: tuple[float, ...] = (10.0, 15.0, 20.0, 25.0, 30.0),
 ) -> Callable[[str], OracleAccuracyResult]:
     """Build the NPU accuracy validator that stages seed bytes by digest before L3 verification."""
 
@@ -610,6 +610,7 @@ def build_stage0_oracle_validator(
         atomic_write_text(staged_module, module_source)
         max_retries = max(0, int(blocked_env_max_retries))
         result: L3AcceptanceResult | None = None
+        is_transient_blocked_env = False
         for retry_idx in range(max_retries + 1):
             result = run_l3_full_contract_via_agent_gates(
                 operator_name=operator_name,
@@ -618,6 +619,7 @@ def build_stage0_oracle_validator(
                 device_id=str(device_id),
             )
             if result.passed:
+                is_transient_blocked_env = False
                 break
             err_low = (result.error_message or "").lower()
             is_transient_blocked_env = result.failure_kind != "candidate" and (
@@ -640,6 +642,11 @@ def build_stage0_oracle_validator(
             )
             time.sleep(wait_sec)
         assert result is not None
+        oracle_failure_kind = (
+            "environment"
+            if (not result.passed and is_transient_blocked_env)
+            else (result.failure_kind or "candidate")
+        )
         op_logger.info(
             "STAGE0_ORACLE op=%s sha256=%s passed=%s run_id=%s state=%s elapsed=%.1fs",
             operator_name,
@@ -657,6 +664,7 @@ def build_stage0_oracle_validator(
             l3_receipt_path=result.receipt_path,
             l3_state=result.state,
             elapsed_sec=result.elapsed_sec,
+            failure_kind=oracle_failure_kind,
         )
 
     return _validate
