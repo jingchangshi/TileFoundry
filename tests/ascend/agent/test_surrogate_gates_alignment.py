@@ -394,6 +394,8 @@ def _v2_handler(
     verification: Mapping[str, object] | None = None,
     submit_payload: Mapping[str, object] | None = None,
     wait_payloads: list[dict[str, object]] | None = None,
+    doctor: Mapping[str, object] | None = None,
+    doctor_returncode: int = 0,
 ):
     calls: list[list[str]] = []
     waits = list(
@@ -407,12 +409,15 @@ def _v2_handler(
         ]
     )
     verify = verification if verification is not None else _verified(root)
+    doctor_payload = dict(doctor or {"status": "PASS"})
 
     def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
         _ = (cwd, timeout, kwargs)
         cmd_list = [str(part) for part in cmd]
         calls.append(cmd_list)
         command = cmd_list[1]
+        if command == "doctor":
+            return _completed(cmd_list, doctor_payload, returncode=doctor_returncode)
         if command == "submit":
             return _completed(
                 cmd_list, dict(submit_payload or {"execution_id": "exec-1"})
@@ -429,6 +434,193 @@ def _v2_handler(
     return _fake_run, calls
 
 
+def _fast_response(
+    request: Mapping[str, object],
+    *,
+    request_sha256: str,
+    tamper: str = "",
+) -> dict[str, object]:
+    batches = request.get("batches") or []
+    targets = request.get("msprof_targets") or []
+    assert isinstance(batches, list)
+    assert isinstance(targets, list)
+    operators: dict[str, dict[str, object]] = {}
+    bindings: dict[str, dict[str, dict[str, str]]] = {}
+    for batch in batches:
+        assert isinstance(batch, Mapping)
+        op_name = str(batch["operator_name"])
+        candidates = batch["candidates"]
+        assert isinstance(candidates, list)
+        operators[op_name] = {}
+        for candidate in candidates:
+            assert isinstance(candidate, Mapping)
+            candidate_id = str(candidate["candidate_id"])
+            operators[op_name][candidate_id] = {
+                "candidate_id": candidate_id,
+                "operator_name": op_name,
+                "all_passed": True,
+                "avg_speedup": 2.0,
+                "min_case_speedup": 1.5,
+                "avg_roofline_eta": 0.5,
+                "surrogate_score": 0.75,
+                "anchors": [],
+                "error_message": "",
+            }
+            bindings.setdefault(op_name, {})[candidate_id] = {
+                "module_path": str(candidate["module_path"]),
+                "sha256": str(candidate["sha256"]),
+                "post_sha256": str(candidate["sha256"]),
+            }
+    telemetry: dict[str, dict[str, dict[str, dict[str, object]]]] = {}
+    for row in targets:
+        assert isinstance(row, Mapping)
+        op_name = str(row["operator_name"])
+        candidate_id = str(row["candidate_id"])
+        bindings.setdefault(op_name, {})[candidate_id] = {
+            "module_path": str(row["module_path"]),
+            "sha256": str(row["sha256"]),
+            "post_sha256": str(row["sha256"]),
+        }
+        telemetry.setdefault(op_name, {}).setdefault(candidate_id, {})[
+            str(row["case_num"])
+        ] = {"aicore_time_us": 12.5, "mte2_ratio": 0.25}
+    unique_candidates = len(
+        {(op, cid) for op, cands in bindings.items() for cid in cands}
+    )
+    coverage = {
+        "expected_candidates": unique_candidates,
+        "evaluated_candidates": unique_candidates,
+        "expected_msprof_targets": len(targets),
+        "observed_msprof_targets": len(targets),
+    }
+    status = "ok"
+    error = ""
+    if tamper == "sha":
+        for op_bindings in bindings.values():
+            for binding in op_bindings.values():
+                binding["sha256"] = "0" * 64
+    elif tamper == "post_sha":
+        for op_bindings in bindings.values():
+            for binding in op_bindings.values():
+                binding["post_sha256"] = "0" * 64
+    elif tamper == "coverage":
+        coverage["observed_msprof_targets"] = 0
+    elif tamper == "request_error":
+        status = "request_error"
+        error = "staged candidate sha256 mismatch"
+    elif tamper == "infrastructure":
+        status = "infrastructure_error"
+        error = "device lost"
+    return {
+        "schema": surrogate_cannbench.FAST_RESPONSE_SCHEMA,
+        "request_id": request["request_id"],
+        "request_sha256": request_sha256,
+        "mode": request["mode"],
+        "status": status,
+        "error": error,
+        "operators": operators,
+        "msprof_telemetry": telemetry,
+        "candidates": bindings,
+        "coverage": coverage,
+    }
+
+
+def _fast_gate_run(
+    root: Path,
+    monkeypatch,
+    *,
+    tamper: str = "",
+    satisfied: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(root)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "_agent_gates_evidence_root",
+        lambda: root / "v2-evidence",
+    )
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "verify_agent_gates_receipt",
+        lambda *_a, **_kw: (True, ""),
+    )
+    calls: list[dict[str, Any]] = []
+    requests: list[dict[str, Any]] = []
+    env_texts: list[str] = []
+
+    def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
+        _ = (cwd, timeout, kwargs)
+        cmd_list = [str(part) for part in cmd]
+        calls.append({"cmd": cmd_list, "env": dict(env)})
+        command = cmd_list[1]
+        if command == "doctor":
+            return _completed(cmd_list, {"status": "PASS"})
+        if command == "submit":
+            candidate_relative = cmd_list[cmd_list.index("--candidate") + 1]
+            request_path = root / candidate_relative
+            request_bytes = request_path.read_bytes()
+            request = json.loads(request_bytes)
+            assert isinstance(request, dict)
+            requests.append(request)
+            response_path = root / str(request["response_path"])
+            response_path.write_text(
+                json.dumps(
+                    _fast_response(
+                        request,
+                        request_sha256=hashlib.sha256(request_bytes).hexdigest(),
+                        tamper=tamper,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            return _completed(cmd_list, {"execution_id": "exec-fast"})
+        if command == "wait":
+            return _completed(
+                cmd_list,
+                {
+                    "timed_out": False,
+                    "status": {"state": "FINISHED", "run_id": "run-fast"},
+                },
+            )
+        if command == "report":
+            return _completed(
+                cmd_list,
+                {
+                    "status": "PASS",
+                    "runId": "run-fast",
+                    "receiptPath": "/receipt-fast.json",
+                    "gates": [
+                        {
+                            "gateId": _FAST_GATE,
+                            "observations": {"deviceWindow": {"heldSeconds": 2.5}},
+                        }
+                    ],
+                },
+            )
+        if command == "verify-requirements":
+            return _completed(cmd_list, _verified(root, satisfied=satisfied))
+        if command == "run":
+            env_file = Path(cmd_list[cmd_list.index("--env-file") + 1])
+            env_texts.append(env_file.read_text(encoding="utf-8"))
+            request_path = Path(str(env["TF_MICRO_PROBE_REQUEST"]))
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            Path(str(request["response_path"])).write_text(
+                '{"metrics": {"speedup": 1.25}}', encoding="utf-8"
+            )
+            return _completed(
+                cmd_list,
+                {
+                    "status": "PASS",
+                    "runId": "run-probe",
+                    "receiptPath": "/receipt-probe.json",
+                },
+            )
+        raise AssertionError(cmd_list)
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
+    return calls, requests, env_texts
+
+
 class _JumpClock:
     """Monotonic clock that jumps forward so a bounded wait expires immediately."""
 
@@ -442,138 +634,58 @@ class _JumpClock:
         return current
 
 
-def test_l2_inner_loop_routes_keep_fast_gate_and_temp_env(tmp_path: Path, monkeypatch) -> None:
-    """L2 callers keep the device-fast gate and their adapter env overrides."""
+def test_l2_fast_contract_is_workspace_relative_and_sha_bound(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Batch and profile requests stay immutable, workspace-relative, and content-bound."""
     env_file = _patch_common(monkeypatch, tmp_path)
-    calls: list[dict[str, Any]] = []
-    env_paths: list[Path] = []
-    verify_calls: list[str] = []
+    reference_prewarms: list[dict[str, Any]] = []
+    tilelang_prewarms: list[dict[str, Any]] = []
 
-    def _fake_run(cmd, *, cwd, env, timeout_sec):
-        _ = (cwd, timeout_sec)
-        cmd_list = [str(part) for part in cmd]
-        env_path = Path(cmd_list[cmd_list.index("--env-file") + 1])
-        env_paths.append(env_path)
-        calls.append(
-            {
-                "cmd": cmd_list,
-                "env": dict(env),
-                "env_text": env_path.read_text(encoding="utf-8"),
-            }
-        )
-        request_key = next(
-            (key for key in ("TF_SURROGATE_BATCH_REQUEST", "TF_MICRO_PROBE_REQUEST") if key in env),
-            "",
-        )
-        if request_key:
-            request = json.loads(Path(env[request_key]).read_text(encoding="utf-8"))
-            response_path = Path(request["response_path"])
-            if request.get("collect_msprof_detail"):
-                response_path.write_text('{"msprof_telemetry": {}}', encoding="utf-8")
-            elif request_key == "TF_MICRO_PROBE_REQUEST":
-                response_path.write_text('{"metrics": {"speedup": 1.25}}', encoding="utf-8")
-            else:
-                response_path.write_text('{"operators": {}}', encoding="utf-8")
-        parsed = {
-            "status": "PASS",
-            "runId": "run-fast",
-            "receiptPath": "/receipt-fast.json",
-            "gates": [
-                {
-                    "gateId": _FAST_GATE,
-                    "observations": {"deviceWindow": {"heldSeconds": 2.5}},
-                }
-            ],
-        }
-        return _completed(cmd_list, parsed), parsed
+    def _record_reference(*_args, **kwargs):
+        reference_prewarms.append(dict(kwargs))
 
-    def _verify(_bin, run_id, *, source_root, **kwargs):
-        _ = (kwargs, source_root)
-        assert env_paths and env_paths[-1].is_file()
-        verify_calls.append(run_id)
-        return True, ""
+    def _record_tilelang(*_args, **kwargs):
+        tilelang_prewarms.append(dict(kwargs))
+        return Path(str(kwargs["tl_cache_dir"]))
 
-    monkeypatch.setattr(surrogate_cannbench, "_run_agent_gates_cmd", _fake_run)
-    monkeypatch.setattr(surrogate_cannbench, "verify_agent_gates_receipt", _verify)
+    monkeypatch.setattr(
+        surrogate_cannbench, "prewarm_anchor_reference_cache", _record_reference
+    )
+    monkeypatch.setattr(
+        surrogate_cannbench, "prewarm_surrogate_tilelang_cache", _record_tilelang
+    )
+    calls, requests, env_texts = _fast_gate_run(tmp_path, monkeypatch)
     candidate = tmp_path / "candidate.py"
     candidate.write_text("x = 1\n", encoding="utf-8")
-    anchors = [_anchor()]
-    surrogate_cannbench.run_multi_operator_surrogate_batch_via_agent_gates(
-        [("attention_residual", [("cand", candidate)], anchors)],
-        source_root=tmp_path,
-        env_file=env_file,
-        prewarm_cache=False,
+    anchors = [_anchor(), _anchor(case_num=3)]
+    mla_anchor = AnchorCaseSpec("level4/mla", 4, "small_decode", 10.0, 3.0)
+    by_op, run_id, receipt_path, held = (
+        surrogate_cannbench.run_multi_operator_surrogate_batch_via_agent_gates(
+            [
+                ("attention_residual", [("cand", candidate)], anchors),
+                ("mla", [("cand", candidate)], [mla_anchor]),
+            ],
+            source_root=tmp_path,
+            env_file=env_file,
+            prewarm_cache=False,
+        )
     )
-    surrogate_cannbench.collect_bottleneck_msprof_via_agent_gates(
+    assert run_id == "run-fast"
+    assert receipt_path == "/receipt-fast.json"
+    assert held == 2.5
+    assert by_op["attention_residual"]["cand"].all_passed is True
+    assert by_op["mla"]["cand"].all_passed is True
+
+    telemetry = surrogate_cannbench.collect_bottleneck_msprof_via_agent_gates(
         "attention_residual",
         candidate,
         anchors,
         source_root=tmp_path,
         env_file=env_file,
     )
-    probe = SimpleNamespace(
-        probe_id="probe",
-        probe_kind="vector",
-        factory_name="entry",
-        baseline_probe_source="x = 1\n",
-        optimized_probe_source="x = 2\n",
-        tensor_shape=(16, 128),
-        tensor_dtype="float32",
-    )
-    surrogate_cannbench.run_micro_probe_via_agent_gates(
-        probe,
-        source_root=tmp_path,
-        env_file=env_file,
-        prewarm_cache=False,
-    )
+    assert telemetry == {"small_decode": {"aicore_time_us": 12.5, "mte2_ratio": 0.25}}
 
-    assert len(calls) == 3
-    for call in calls:
-        assert call["cmd"][call["cmd"].index("--gate") + 1] == _FAST_GATE
-        assert "TILEFOUNDRY_NPU_CPU_TESTS" not in call["env_text"]
-        assert "TILEFOUNDRY_NPU_DEVICE_TESTS" in call["env_text"]
-    assert "TILEFOUNDRY_NPU_MSPROF_LOCK=1" not in calls[0]["env_text"]
-    assert "TILEFOUNDRY_NPU_MSPROF_LOCK=1" in calls[1]["env_text"]
-    assert verify_calls == ["run-fast"] * 3
-
-
-def test_l2_routes_reject_failed_receipts(tmp_path: Path, monkeypatch) -> None:
-    """L2 routes suppress results when their signed receipt fails verification."""
-    env_file = _patch_common(monkeypatch, tmp_path)
-    parsed = {
-        "status": "PASS",
-        "runId": "run-fast",
-        "receiptPath": "/receipt-fast.json",
-        "gates": [{"gateId": _FAST_GATE, "observations": {}}],
-    }
-
-    def _fake_run(cmd, **_kw):
-        return _completed([str(part) for part in cmd], parsed), parsed
-
-    monkeypatch.setattr(surrogate_cannbench, "_run_agent_gates_cmd", _fake_run)
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "verify_agent_gates_receipt",
-        lambda *_a, **_kw: (False, "receipt_verification_failed: STALE"),
-    )
-    candidate = tmp_path / "candidate.py"
-    candidate.write_text("x = 1\n", encoding="utf-8")
-    anchors = [_anchor()]
-    with pytest.raises(RuntimeError, match="verification failed"):
-        surrogate_cannbench.run_multi_operator_surrogate_batch_via_agent_gates(
-            [("attention_residual", [("cand", candidate)], anchors)],
-            source_root=tmp_path,
-            env_file=env_file,
-            prewarm_cache=False,
-        )
-    with pytest.raises(RuntimeError, match="verification failed"):
-        surrogate_cannbench.collect_bottleneck_msprof_via_agent_gates(
-            "attention_residual",
-            candidate,
-            anchors,
-            source_root=tmp_path,
-            env_file=env_file,
-        )
     probe = SimpleNamespace(
         probe_id="probe",
         probe_kind="vector",
@@ -589,7 +701,232 @@ def test_l2_routes_reject_failed_receipts(tmp_path: Path, monkeypatch) -> None:
         env_file=env_file,
         prewarm_cache=False,
     )
-    assert metrics["speedup"] == 0.0
+    assert metrics["speedup"] == 1.25
+
+    batch_commands = calls[:5]
+    profile_commands = calls[5:10]
+    probe_commands = calls[10:]
+    assert [call["cmd"][1] for call in batch_commands] == [
+        "doctor",
+        "submit",
+        "wait",
+        "report",
+        "verify-requirements",
+    ]
+    for group in (batch_commands, profile_commands):
+        for call in group:
+            assert "--env-file" not in call["cmd"]
+            assert surrogate_cannbench.FAST_REQUEST_ENV not in call["env"]
+            assert "TF_SURROGATE_BATCH_REQUEST" not in call["env"]
+            assert "TILEFOUNDRY_NPU_MSPROF_LOCK" not in call["env"]
+        for index in (0, 1, 4):
+            cmd = group[index]["cmd"]
+            assert cmd[cmd.index("--gate") + 1] == _FAST_GATE
+    assert len(probe_commands) == 1
+    probe_cmd = probe_commands[0]["cmd"]
+    assert probe_cmd[1] == "run"
+    assert probe_cmd[probe_cmd.index("--gate") + 1] == _FAST_GATE
+    assert "TF_MICRO_PROBE_REQUEST" in probe_commands[0]["env"]
+    assert len(env_texts) == 1
+    assert "TILEFOUNDRY_NPU_DEVICE_TESTS" in env_texts[0]
+    assert "TILEFOUNDRY_NPU_CPU_TESTS" not in env_texts[0]
+
+    batch_request, profile_request = requests
+    request_root = tmp_path / "build" / "agent_gates" / "fast"
+    batch_id = str(batch_request["request_id"])
+    batch_submit = batch_commands[1]["cmd"]
+    assert batch_submit[batch_submit.index("--target") + 1] == f"fast/{batch_id}"
+    assert (
+        batch_submit[batch_submit.index("--candidate") + 1]
+        == f"build/agent_gates/fast/{batch_id}.request.json"
+    )
+    assert batch_request["schema"] == surrogate_cannbench.FAST_REQUEST_SCHEMA
+    assert batch_request["mode"] == "batch"
+    for machine_field in (
+        "source_root",
+        "cannbench_repo",
+        "tilelang_cache_dir",
+        "reference_cache_dir",
+    ):
+        assert machine_field not in batch_request
+    assert (
+        batch_request["response_path"]
+        == f"build/agent_gates/fast/{batch_id}.response.json"
+    )
+    assert not Path(str(batch_request["response_path"])).is_absolute()
+    assert batch_request["msprof_targets"] == []
+    assert {
+        Path(str(call["cache_dir"])) for call in reference_prewarms
+    } == {Path("/configured/work/surrogate/reference").resolve()}
+    assert {
+        Path(str(call["tl_cache_dir"])) for call in tilelang_prewarms
+    } == {Path("/configured/work/surrogate/tilelang").resolve()}
+    batch_entries = {
+        str(entry["operator_name"]): entry for entry in batch_request["batches"]
+    }
+    assert set(batch_entries) == {"attention_residual", "mla"}
+    candidate_sha256 = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    for operator_name, entry in batch_entries.items():
+        assert set(entry) == {"operator_name", "entrypoint", "candidates", "anchors"}
+        for anchor in entry["anchors"]:
+            assert set(anchor) == {
+                "task",
+                "case_num",
+                "regime_tag",
+                "ref_perf_us",
+                "t_hw_us",
+            }
+        staged_entry = entry["candidates"][0]
+        assert staged_entry["candidate_id"] == "cand"
+        assert not Path(str(staged_entry["module_path"])).is_absolute()
+        assert str(staged_entry["module_path"]).startswith(
+            f"build/agent_gates/fast/{batch_id}/candidates/{operator_name}/"
+        )
+        staged_path = tmp_path / str(staged_entry["module_path"])
+        assert staged_path.is_file()
+        assert staged_path.stat().st_mode & 0o777 == 0o444
+        assert staged_entry["sha256"] == candidate_sha256
+        assert hashlib.sha256(staged_path.read_bytes()).hexdigest() == candidate_sha256
+    assert (request_root / f"{batch_id}.request.json").stat().st_mode & 0o777 == 0o444
+
+    profile_id = str(profile_request["request_id"])
+    profile_submit = profile_commands[1]["cmd"]
+    assert profile_submit[profile_submit.index("--target") + 1] == f"fast/{profile_id}"
+    assert profile_request["mode"] == "profile"
+    assert profile_request["batches"] == []
+    for machine_field in (
+        "source_root",
+        "cannbench_repo",
+        "tilelang_cache_dir",
+        "reference_cache_dir",
+    ):
+        assert machine_field not in profile_request
+    profile_targets = profile_request["msprof_targets"]
+    assert [row["case_num"] for row in profile_targets] == [2, 3]
+    for row in profile_targets:
+        assert set(row) == {
+            "operator_name",
+            "candidate_id",
+            "module_path",
+            "sha256",
+            "case_num",
+            "warmup",
+            "repeat",
+        }
+        assert not Path(str(row["module_path"])).is_absolute()
+        assert row["sha256"] == hashlib.sha256(
+            (tmp_path / str(row["module_path"])).read_bytes()
+        ).hexdigest()
+
+    env_file.write_text(
+        "TILEFOUNDRY_NPU_CANNBENCH_REPO=/configured/cannbench\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="TILEFOUNDRY_NPU_WORK_ROOT"):
+        surrogate_cannbench.run_multi_operator_surrogate_batch_via_agent_gates(
+            [("attention_residual", [("cand", candidate)], anchors)],
+            source_root=tmp_path,
+            env_file=env_file,
+            prewarm_cache=False,
+        )
+    env_file.write_text(
+        "TILEFOUNDRY_NPU_CANNBENCH_REPO=/configured/cannbench\n"
+        f"TILEFOUNDRY_NPU_WORK_ROOT={tmp_path / 'work'}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="outside the source root"):
+        surrogate_cannbench.run_multi_operator_surrogate_batch_via_agent_gates(
+            [("attention_residual", [("cand", candidate)], anchors)],
+            source_root=tmp_path,
+            env_file=env_file,
+            prewarm_cache=False,
+        )
+
+
+def test_l2_fast_contract_rejects_unverified_or_tampered_responses(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """L2 routes fail closed on unverified receipts, tampered bindings, and coverage gaps."""
+    env_file = _patch_common(monkeypatch, tmp_path)
+    candidate = tmp_path / "candidate.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    anchors = [_anchor()]
+
+    _fast_gate_run(tmp_path, monkeypatch, satisfied=False)
+    with pytest.raises(RuntimeError, match="did not verify"):
+        surrogate_cannbench.run_multi_operator_surrogate_batch_via_agent_gates(
+            [("attention_residual", [("cand", candidate)], anchors)],
+            source_root=tmp_path,
+            env_file=env_file,
+            prewarm_cache=False,
+        )
+    with pytest.raises(RuntimeError, match="did not verify"):
+        surrogate_cannbench.collect_bottleneck_msprof_via_agent_gates(
+            "attention_residual",
+            candidate,
+            anchors,
+            source_root=tmp_path,
+            env_file=env_file,
+        )
+
+    _fast_gate_run(tmp_path, monkeypatch, tamper="sha")
+    with pytest.raises(RuntimeError, match="does not match the staged candidate"):
+        surrogate_cannbench.run_multi_operator_surrogate_batch_via_agent_gates(
+            [("attention_residual", [("cand", candidate)], anchors)],
+            source_root=tmp_path,
+            env_file=env_file,
+            prewarm_cache=False,
+        )
+
+    _fast_gate_run(tmp_path, monkeypatch, tamper="coverage")
+    with pytest.raises(RuntimeError, match="msprof coverage"):
+        surrogate_cannbench.collect_bottleneck_msprof_via_agent_gates(
+            "attention_residual",
+            candidate,
+            anchors,
+            source_root=tmp_path,
+            env_file=env_file,
+        )
+
+    _fast_gate_run(tmp_path, monkeypatch, tamper="infrastructure")
+    with pytest.raises(RuntimeError, match="infrastructure_error"):
+        surrogate_cannbench.run_multi_operator_surrogate_batch_via_agent_gates(
+            [("attention_residual", [("cand", candidate)], anchors)],
+            source_root=tmp_path,
+            env_file=env_file,
+            prewarm_cache=False,
+        )
+
+
+def test_l2_fast_contract_classifies_post_execution_mutation_as_infrastructure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Post-timing mutation is an infrastructure error, not a request or candidate fault."""
+    env_file = _patch_common(monkeypatch, tmp_path)
+    candidate = tmp_path / "candidate.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    anchors = [_anchor()]
+
+    _fast_gate_run(tmp_path, monkeypatch, tamper="request_error")
+    with pytest.raises(RuntimeError, match="fast gate request_error"):
+        surrogate_cannbench.run_multi_operator_surrogate_batch_via_agent_gates(
+            [("attention_residual", [("cand", candidate)], anchors)],
+            source_root=tmp_path,
+            env_file=env_file,
+            prewarm_cache=False,
+        )
+
+    _fast_gate_run(tmp_path, monkeypatch, tamper="post_sha")
+    with pytest.raises(
+        RuntimeError,
+        match=r"infrastructure_error: candidate attention_residual/\S+ changed during evaluation",
+    ):
+        surrogate_cannbench.collect_bottleneck_msprof_via_agent_gates(
+            "attention_residual",
+            candidate,
+            anchors,
+            source_root=tmp_path,
+            env_file=env_file,
+        )
 
 
 def test_l3_promotion_uses_v2_target_and_candidate_without_injection(
@@ -651,6 +988,11 @@ def test_l3_promotion_uses_v2_target_and_candidate_without_injection(
     assert result.candidate_sha256 == _digest(candidate)
     assert result.target_path == str(candidate.resolve())
     assert result.failure_kind == ""
+    doctor = calls[0]
+    assert doctor[1] == "doctor"
+    assert doctor[doctor.index("--gate") + 1] == _L3_GATE
+    assert doctor[doctor.index("--target") + 1] == "level4/attention_residual"
+    assert doctor[doctor.index("--candidate") + 1] == "kernels.py"
     wait_cmd = [cmd for cmd in calls if cmd[1] == "wait"]
     assert len(wait_cmd) == 2
     assert {cmd[cmd.index("--execution-id") + 1] for cmd in wait_cmd} == {"exec-l3"}
@@ -1190,6 +1532,8 @@ def test_l3_promotion_timeout_preserves_execution_id(tmp_path: Path, monkeypatch
         _ = (cwd, env, timeout, kwargs)
         cmd_list = [str(part) for part in cmd]
         commands.append(cmd_list[1])
+        if cmd_list[1] == "doctor":
+            return _completed(cmd_list, {"status": "PASS"})
         return _completed(cmd_list, {"execution_id": "exec-timeout"})
 
     monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
@@ -1205,7 +1549,7 @@ def test_l3_promotion_timeout_preserves_execution_id(tmp_path: Path, monkeypatch
     assert result.execution_id == "exec-timeout"
     assert result.execution_terminal is False
     assert "timed out" in result.error_message
-    assert commands == ["submit"]
+    assert commands == ["doctor", "submit"]
 
 
 def test_l3_promotion_submits_requested_device_and_reports_receipt(
@@ -1235,7 +1579,9 @@ def test_l3_promotion_submits_requested_device_and_reports_receipt(
     assert result.passed is True
     assert result.execution_id == "exec-dev"
     assert result.device_id == "5"
-    submit = calls[0]
+    assert calls[0][1] == "doctor"
+    assert calls[0][calls[0].index("--device-id") + 1] == "3"
+    submit = [cmd for cmd in calls if cmd[1] == "submit"][0]
     assert submit[submit.index("--device-id") + 1] == "3"
     assert started == [("exec-dev", "5")]
 
@@ -1387,7 +1733,15 @@ def test_l4_always_uses_v2_and_requires_official_final_binding(
     assert result.all_timings_valid is True
     assert result.case_count == 1
     assert result.passed_cases == 1
-    submit = calls[0]
+    doctor = calls[0]
+    assert doctor[1] == "doctor"
+    assert doctor[doctor.index("--source") + 1] == str(tmp_path.resolve())
+    assert doctor[doctor.index("--gate") + 1] == _L4_GATE
+    assert doctor[doctor.index("--target") + 1] == "level4/attention_residual"
+    assert doctor[doctor.index("--candidate") + 1] == "kernels.py"
+    assert "--workspace" not in doctor
+    assert "--env-file" not in doctor
+    submit = [cmd for cmd in calls if cmd[1] == "submit"][0]
     assert submit[submit.index("--gate") + 1] == _L4_GATE
     assert submit[submit.index("--target") + 1] == "level4/attention_residual"
     assert submit[submit.index("--candidate") + 1] == "kernels.py"
@@ -1416,7 +1770,9 @@ def test_l4_submits_requested_device_and_reports_receipt(
     assert result.passed is True
     assert result.execution_id == "exec-l4"
     assert result.device_id == "8"
-    submit = calls[0]
+    assert calls[0][1] == "doctor"
+    assert calls[0][calls[0].index("--device-id") + 1] == "7"
+    submit = [cmd for cmd in calls if cmd[1] == "submit"][0]
     assert submit[submit.index("--device-id") + 1] == "7"
     assert started == [("exec-l4", "8")]
 
@@ -1449,6 +1805,39 @@ def test_l4_resumes_execution_without_duplicate_submit(
     assert result.passed is True
     assert [cmd[1] for cmd in calls] == ["report", "verify-requirements"]
     assert "submit" not in [cmd[1] for cmd in calls]
+
+
+def test_l4_doctor_blocks_submit_when_route_is_not_ready(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A blocked machine is refused before an execution exists, never blamed on the candidate."""
+    monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(tmp_path)))
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "_agent_gates_evidence_root",
+        lambda: tmp_path / "v2-evidence",
+    )
+    candidate = tmp_path / "kernels.py"
+    candidate.write_text("x = 1\n", encoding="utf-8")
+    handler, calls = _v2_handler(
+        report=_l4_report(candidate="kernels.py"),
+        root=tmp_path,
+        doctor={"status": "BLOCKED_ENV", "failures": ["CONFIG_CHECK_FAILED: device"]},
+        doctor_returncode=1,
+    )
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", handler)
+    result = surrogate_cannbench.run_l4_official_cannbench_via_agent_gates(
+        operator_name="attention_residual",
+        candidate_module_path=candidate,
+        source_root=tmp_path,
+    )
+    assert result.passed is False
+    assert result.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    assert result.execution_id == ""
+    assert result.execution_terminal is True
+    assert "CONFIG_CHECK_FAILED: device" in result.error_message
+    assert [cmd[1] for cmd in calls] == ["doctor"]
 
 
 def test_l4_default_wait_covers_queue_prep_and_official_run() -> None:
@@ -1518,6 +1907,7 @@ def test_l4_rejects_candidate_mismatch_and_unsatisfied_requirements(
     assert result.run_id == "run-l4"
     assert result.receipt_path == "/receipt-l4.json"
     assert [cmd[1] for cmd in calls] == [
+        "doctor",
         "submit",
         "wait",
         "report",
@@ -1535,6 +1925,8 @@ def test_l4_v2_timeout_includes_execution_id(tmp_path: Path, monkeypatch) -> Non
     def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
         _ = (cwd, env, timeout, kwargs)
         cmd_list = [str(part) for part in cmd]
+        if cmd_list[1] == "doctor":
+            return _completed(cmd_list, {"status": "PASS"})
         assert cmd_list[1] == "submit"
         return _completed(cmd_list, {"execution_id": "exec-timeout"})
 

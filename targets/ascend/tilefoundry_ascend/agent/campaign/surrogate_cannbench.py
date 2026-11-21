@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import tomllib
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,8 +82,17 @@ DEFAULT_AGENT_GATES_MAX_ATTEMPTS = 5
 DEFAULT_AGENT_GATES_BACKOFF_SEC = 3.0
 
 AGENT_GATES_ADAPTER = "tilefoundry-npu"
+AGENT_GATES_DEVICE_FAST_GATE = "tilefoundry-npu-device-fast"
 AGENT_GATES_L3_PROMOTION_GATE = "tilefoundry-npu-l3-promotion"
 AGENT_GATES_L4_CANNBENCH_GATE = "tilefoundry-npu-cannbench"
+FAST_REQUEST_SCHEMA = "tilefoundry-fast-request/v1"
+FAST_RESPONSE_SCHEMA = "tilefoundry-fast-response/v1"
+FAST_REQUEST_ENV = "TF_FAST_REQUEST"
+FAST_SOURCE_ROOT_ENV = "TF_FAST_SOURCE_ROOT"
+FAST_STATUS_OK = "ok"
+FAST_STATUS_CANDIDATE_FAILURE = "candidate_failure"
+FAST_STATUS_REQUEST_ERROR = "request_error"
+FAST_STATUS_INFRASTRUCTURE_ERROR = "infrastructure_error"
 DEFAULT_L3_PROMOTION_WAIT_SEC = 1920
 DEFAULT_L4_CANNBENCH_WAIT_SEC = 5400
 _V2_WAIT_SLICE_SEC = 60.0
@@ -1550,8 +1560,7 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
         cannbench_repo=env_vals.get("TILEFOUNDRY_NPU_CANNBENCH_REPO"),
         env_file=resolved_env,
     )
-    cache_dir = _default_surrogate_cache_dir()
-    tl_cache_dir = _default_surrogate_tl_cache_dir()
+    cache_dir, tl_cache_dir = _fast_cache_roots(root, env_vals)
 
     if prewarm_cache:
         for op_name, cands, op_anchors in batches:
@@ -1574,109 +1583,109 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
                 source_root=root,
             )
 
-    with tempfile.TemporaryDirectory(prefix="tf_l2_batch_") as tmp_dir:
-        tmp = Path(tmp_dir)
-        request_path = tmp / "surrogate_request.json"
-        response_path = tmp / "surrogate_response.json"
-        tmp_env = _write_temp_env_file(
-            resolved_env,
-            tmp / "env.sh",
-            {
-                "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/agent/test_surrogate_batch_npu.py",
-            },
-        )
-        payload = {
-            "source_root": str(root),
-            "cannbench_repo": str(cann_repo),
-            "tilelang_cache_dir": str(tl_cache_dir),
-            "warmup": int(warmup),
-            "repeat": int(repeat),
-            "require_all_passed": bool(require_all_passed),
-            "response_path": str(response_path),
-            "batches": [
-                {
-                    "operator_name": op_name,
-                    "entrypoint": get_operator_entrypoint(op_name),
-                    "candidates": [
-                        {"candidate_id": cid, "module_path": str(Path(mod_path).resolve())}
-                        for cid, mod_path in cands
-                    ],
-                    "anchors": [a.to_dict() for a in op_anchors],
-                }
-                for op_name, cands, op_anchors in batches
-            ],
-        }
-        request_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    request_root = _fast_request_root(root, env_vals)
+    request_id = uuid.uuid4().hex
+    request_dir = request_root / request_id
+    request_path = request_root / f"{request_id}.request.json"
+    response_path = request_root / f"{request_id}.response.json"
 
-        cmd = [
-            ag_bin,
-            "run",
-            "--adapter",
-            "tilefoundry-npu",
-            "--source",
-            str(root),
-            "--env-file",
-            str(tmp_env),
-            "--device-id",
-            str(device_id),
-            "--gate",
-            "tilefoundry-npu-device-fast",
-            "--json",
-        ]
-        sub_env = _clean_agent_gates_subprocess_env(
-            {
-                "TF_SURROGATE_BATCH_REQUEST": str(request_path),
-                "TF_SURROGATE_TL_CACHE_DIR": str(tl_cache_dir),
-                "CANNBENCH_CACHE_DIR": str(cache_dir),
-            }
-        )
-        proc, parsed = _run_agent_gates_cmd(
-            cmd,
-            cwd=str(root),
-            env=sub_env,
-            timeout_sec=timeout_sec,
-        )
-        run_id = str(parsed.get("runId", ""))
-        receipt_path = str(parsed.get("receiptPath", ""))
-        run_passed = proc.returncode == 0 and parsed.get("status") == "PASS"
-        if run_passed:
-            verified, verify_error = (
-                verify_agent_gates_receipt(ag_bin, run_id, source_root=root)
-                if run_id
-                else (False, "AgentGates L2 surrogate batch reported PASS without a runId")
-            )
-            if not verified:
-                raise RuntimeError(
-                    "AgentGates L2 surrogate batch receipt verification failed: "
-                    f"{verify_error or 'unknown failure'}"
+    staged: dict[str, dict[str, dict[str, str]]] = {}
+    request_batches: list[dict[str, object]] = []
+    seen_operators: set[str] = set()
+    for op_name, cands, op_anchors in batches:
+        if op_name in seen_operators:
+            raise ValueError(f"duplicate operator_name {op_name!r} in one fast batch")
+        seen_operators.add(op_name)
+        bindings: dict[str, dict[str, str]] = {}
+        entries: list[dict[str, str]] = []
+        for index, (candidate_id, module_path) in enumerate(cands):
+            if candidate_id in bindings:
+                raise ValueError(
+                    f"duplicate candidate_id {candidate_id!r} for operator {op_name!r}"
                 )
-        held_sec = 0.0
-        for gate_row in parsed.get("gates", ()):
-            if not isinstance(gate_row, dict):
-                continue
-            if gate_row.get("gateId") != "tilefoundry-npu-device-fast":
-                continue
-            obs = gate_row.get("observations") or {}
-            win = obs.get("deviceWindow") or {}
-            held_sec = float(win.get("heldSeconds", 0.0))
-
-        if not response_path.is_file():
-            detail = (proc.stderr or proc.stdout or "surrogate batch missing response").strip()[-1000:]
-            raise RuntimeError(
-                f"AgentGates L2 surrogate batch failed (rc={proc.returncode}): {detail}"
+            relative, digest = _stage_fast_candidate(
+                request_dir,
+                root,
+                op_name,
+                index,
+                candidate_id,
+                Path(module_path),
             )
-        raw_resp = json.loads(response_path.read_text(encoding="utf-8"))
-        out_by_op: dict[str, dict[str, CandidateSurrogateResult]] = {}
-        for op_name, cands_map in raw_resp.get("operators", {}).items():
-            out_by_op[op_name] = {
-                cid: CandidateSurrogateResult.from_dict(item)
-                for cid, item in cands_map.items()
+            bindings[candidate_id] = {"module_path": relative, "sha256": digest}
+            entries.append(
+                {"candidate_id": candidate_id, "module_path": relative, "sha256": digest}
+            )
+        staged[op_name] = bindings
+        request_batches.append(
+            {
+                "operator_name": op_name,
+                "entrypoint": get_operator_entrypoint(op_name),
+                "candidates": entries,
+                "anchors": [a.to_dict() for a in op_anchors],
             }
-        if proc.returncode != 0 or parsed.get("status") != "PASS":
-            detail = (proc.stderr or proc.stdout or "agent-gates status FAIL").strip()[-1000:]
-            if require_all_passed:
-                raise RuntimeError(f"AgentGates L2 batch rejected candidate(s): {detail}")
-        return out_by_op, run_id, receipt_path, held_sec
+        )
+
+    payload: dict[str, object] = {
+        "schema": FAST_REQUEST_SCHEMA,
+        "request_id": request_id,
+        "mode": "batch",
+        "warmup": int(warmup),
+        "repeat": int(repeat),
+        "require_all_passed": bool(require_all_passed),
+        "response_path": response_path.relative_to(root).as_posix(),
+        "batches": request_batches,
+        "msprof_targets": [],
+    }
+    request_sha256 = _write_fast_request(request_path, payload)
+    workspace = _agent_gates_workspace_name(root)
+    raw_resp, execution = _submit_fast_gate(
+        agent_gates_bin=ag_bin,
+        root=root,
+        workspace=workspace,
+        request_id=request_id,
+        request_relative_path=request_path.relative_to(root).as_posix(),
+        request_path=request_path,
+        response_path=response_path,
+        request_sha256=request_sha256,
+        mode="batch",
+        timeout_sec=float(timeout_sec),
+        device_id=str(device_id),
+    )
+    _verify_fast_bindings(raw_resp, staged)
+    _verify_fast_coverage(
+        raw_resp,
+        expected_candidates=sum(len(cands) for _op, cands, _anchors in batches),
+        expected_msprof_targets=0,
+    )
+    operators_raw = _fast_response_mapping(raw_resp, "operators")
+    out_by_op: dict[str, dict[str, CandidateSurrogateResult]] = {}
+    failures: list[str] = []
+    for op_name, cands, _anchors in batches:
+        cands_raw = operators_raw.get(op_name)
+        if not isinstance(cands_raw, Mapping):
+            raise RuntimeError(f"fast response has no results for operator {op_name!r}")
+        parsed_candidates: dict[str, CandidateSurrogateResult] = {}
+        for candidate_id, _module_path in cands:
+            item = cands_raw.get(candidate_id)
+            if not isinstance(item, Mapping):
+                raise RuntimeError(
+                    f"fast response has no result for {op_name}/{candidate_id}"
+                )
+            result = CandidateSurrogateResult.from_dict(item)
+            parsed_candidates[candidate_id] = result
+            if not result.all_passed:
+                failures.append(f"{op_name}/{candidate_id}")
+        out_by_op[op_name] = parsed_candidates
+    if require_all_passed and failures:
+        raise RuntimeError(
+            "AgentGates L2 batch rejected candidate(s): " + ", ".join(failures)
+        )
+    return (
+        out_by_op,
+        execution.run_id,
+        execution.receipt_path,
+        _fast_held_seconds(execution.report),
+    )
 
 
 def run_surrogate_batch_via_agent_gates(
@@ -1754,8 +1763,7 @@ def collect_bottleneck_msprof_via_agent_gates(
         cannbench_repo=env_vals.get("TILEFOUNDRY_NPU_CANNBENCH_REPO"),
         env_file=resolved_env,
     )
-    cache_dir = _default_surrogate_cache_dir()
-    tl_cache_dir = _default_surrogate_tl_cache_dir()
+    cache_dir, tl_cache_dir = _fast_cache_roots(root, env_vals)
     cand_resolved = Path(candidate_path).resolve()
 
     unique_specs = [
@@ -1781,97 +1789,73 @@ def collect_bottleneck_msprof_via_agent_gates(
         source_root=root,
     )
 
-    with tempfile.TemporaryDirectory(prefix="tf_msprof_gate_") as tmp_dir:
-        tmp = Path(tmp_dir)
-        request_path = tmp / "msprof_request.json"
-        response_path = tmp / "msprof_response.json"
-        tmp_env = _write_temp_env_file(
-            resolved_env,
-            tmp / "env.sh",
-            {
-                "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/agent/test_surrogate_batch_npu.py",
-                "TILEFOUNDRY_NPU_MSPROF_LOCK": "1",
-            },
-        )
-        payload = {
-            "source_root": str(root),
-            "cannbench_repo": str(cann_repo),
-            "tilelang_cache_dir": str(tl_cache_dir),
-            "warmup": int(warmup),
-            "repeat": int(repeat),
-            "require_all_passed": False,
-            "collect_msprof_detail": True,
-            "response_path": str(response_path),
-            "batches": [],
-            "msprof_targets": [
-                {
-                    "operator_name": operator_name,
-                    "candidate_id": "bottleneck_probe",
-                    "module_path": str(cand_resolved),
-                    "case_num": cnum,
-                    "warmup": int(warmup),
-                    "repeat": int(repeat),
-                }
-                for cnum in unique_case_nums
-            ],
-        }
-        request_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-        cmd = [
-            ag_bin,
-            "run",
-            "--adapter",
-            "tilefoundry-npu",
-            "--source",
-            str(root),
-            "--env-file",
-            str(tmp_env),
-            "--device-id",
-            str(device_id),
-            "--gate",
-            "tilefoundry-npu-device-fast",
-            "--json",
-        ]
-        sub_env = _clean_agent_gates_subprocess_env(
-            {
-                "TF_SURROGATE_BATCH_REQUEST": str(request_path),
-                "TF_SURROGATE_TL_CACHE_DIR": str(tl_cache_dir),
-                "CANNBENCH_CACHE_DIR": str(cache_dir),
-            }
-        )
-        proc, parsed = _run_agent_gates_cmd(
-            cmd,
-            cwd=str(root),
-            env=sub_env,
-            timeout_sec=timeout_sec,
-        )
-        run_id = str(parsed.get("runId", ""))
-        run_passed = proc.returncode == 0 and parsed.get("status") == "PASS"
-        if run_passed:
-            verified, verify_error = (
-                verify_agent_gates_receipt(ag_bin, run_id, source_root=root)
-                if run_id
-                else (False, "AgentGates msprof collection reported PASS without a runId")
-            )
-            if not verified:
-                raise RuntimeError(
-                    "AgentGates msprof receipt verification failed: "
-                    f"{verify_error or 'unknown failure'}"
-                )
-        if not response_path.is_file():
-            detail = (proc.stderr or proc.stdout or "msprof request missing response").strip()[
-                -1000:
-            ]
-            raise RuntimeError(
-                f"AgentGates msprof collection failed (rc={proc.returncode}): {detail}"
-            )
-        raw_resp = json.loads(response_path.read_text(encoding="utf-8"))
-
-    by_case = (
-        raw_resp.get("msprof_telemetry", {})
-        .get(operator_name, {})
-        .get("bottleneck_probe", {})
+    request_root = _fast_request_root(root, env_vals)
+    request_id = uuid.uuid4().hex
+    request_dir = request_root / request_id
+    request_path = request_root / f"{request_id}.request.json"
+    response_path = request_root / f"{request_id}.response.json"
+    relative, digest = _stage_fast_candidate(
+        request_dir,
+        root,
+        operator_name,
+        0,
+        "bottleneck_probe",
+        cand_resolved,
     )
+    payload: dict[str, object] = {
+        "schema": FAST_REQUEST_SCHEMA,
+        "request_id": request_id,
+        "mode": "profile",
+        "warmup": int(warmup),
+        "repeat": int(repeat),
+        "require_all_passed": False,
+        "response_path": response_path.relative_to(root).as_posix(),
+        "batches": [],
+        "msprof_targets": [
+            {
+                "operator_name": operator_name,
+                "candidate_id": "bottleneck_probe",
+                "module_path": relative,
+                "sha256": digest,
+                "case_num": cnum,
+                "warmup": int(warmup),
+                "repeat": int(repeat),
+            }
+            for cnum in unique_case_nums
+        ],
+    }
+    request_sha256 = _write_fast_request(request_path, payload)
+    workspace = _agent_gates_workspace_name(root)
+    raw_resp, _execution = _submit_fast_gate(
+        agent_gates_bin=ag_bin,
+        root=root,
+        workspace=workspace,
+        request_id=request_id,
+        request_relative_path=request_path.relative_to(root).as_posix(),
+        request_path=request_path,
+        response_path=response_path,
+        request_sha256=request_sha256,
+        mode="profile",
+        timeout_sec=float(timeout_sec),
+        device_id=str(device_id),
+    )
+    _verify_fast_bindings(
+        raw_resp,
+        {operator_name: {"bottleneck_probe": {"module_path": relative, "sha256": digest}}},
+    )
+    _verify_fast_coverage(
+        raw_resp,
+        expected_candidates=1,
+        expected_msprof_targets=len(unique_case_nums),
+    )
+    telemetry_raw = _fast_response_mapping(raw_resp, "msprof_telemetry").get(operator_name)
+    by_case = (
+        telemetry_raw.get("bottleneck_probe") if isinstance(telemetry_raw, Mapping) else None
+    )
+    if not isinstance(by_case, Mapping):
+        raise RuntimeError(
+            f"fast profile response has no msprof telemetry for {operator_name!r}"
+        )
     out: dict[str, dict[str, float]] = {}
     for tag, spec in regime_items:
         raw_metrics = by_case.get(str(int(spec.case_num)))
@@ -2016,13 +2000,18 @@ def _run_v2_gate(
 ) -> _V2GateExecution:
     """Run one V2 gate with a single monotonic deadline and one execution identity.
 
-    Resume IDs recover an already submitted run instead of submitting again. A
-    bounded local wait slice continues the same execution; an unproven terminal
-    state stays recoverable, and a terminal state wins even when that wait
-    reports ``timed_out`` at its boundary. The submission callback persists the
-    identity immediately so a killed campaign recovers it. Verification binds
-    the receipt to the requested target and candidate; ``device_id`` is part of
-    the execution identity and a resume keeps its card.
+    A new submission first diagnoses the same route with the same target and
+    candidate, so a blocked machine or an unusable pair is refused before an
+    execution exists; a resumed execution goes straight to its wait and recovers
+    the submitted run by its IDs. A bounded local wait slice continues the same
+    execution; a terminal state wins even at the ``timed_out`` boundary.
+
+    Note:
+        An unproven terminal state stays recoverable. The submission callback
+        persists the identity immediately so a killed campaign recovers it, and
+        verification binds the receipt to the requested target and candidate;
+        ``device_id`` is part of the execution identity and a resume keeps its
+        card.
     """
     started = time.monotonic()
     deadline = started + max(1.0, float(timeout_sec))
@@ -2070,6 +2059,45 @@ def _run_v2_gate(
         execution_id = resume_execution_id
         resolved_device = requested_device
     else:
+        doctor_cmd = [
+            agent_gates_bin,
+            "doctor",
+            "--adapter",
+            AGENT_GATES_ADAPTER,
+            "--source",
+            str(root),
+            "--gate",
+            gate_id,
+            "--target",
+            target,
+            "--json",
+        ]
+        if candidate_path is not None:
+            doctor_cmd.extend(["--candidate", candidate_path])
+        if requested_device:
+            doctor_cmd.extend(["--device-id", requested_device])
+        try:
+            doctor_proc, doctor = _run_agent_gates_v2_cmd(
+                doctor_cmd,
+                root=root,
+                timeout_sec=min(_V2_SUBMIT_TIMEOUT_SEC, max(1.0, deadline - started)),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return _failed("", f"{gate_id} doctor failed: {exc}")
+        if doctor_proc.returncode != 0 or doctor.get("status") != "PASS":
+            raw_failures = doctor.get("failures")
+            failures = (
+                "; ".join(str(item) for item in raw_failures)
+                if isinstance(raw_failures, list)
+                else ""
+            )
+            return _failed(
+                "",
+                failures
+                or doctor_proc.stderr
+                or doctor_proc.stdout
+                or f"{gate_id} doctor did not pass for target {target}",
+            )
         try:
             proc, parsed = _run_agent_gates_v2_cmd(
                 submit_cmd,
@@ -2268,6 +2296,273 @@ def _run_v2_gate(
         state=last_state or "FINISHED",
         execution_terminal=True,
     )
+
+
+_FAST_ID_SANITIZER = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _fast_slug(value: str, *, fallback: str) -> str:
+    slug = _FAST_ID_SANITIZER.sub("_", value).strip("._")
+    return slug or fallback
+
+
+def _fast_request_root(root: Path, env_vals: Mapping[str, str]) -> Path:
+    """Resolve the request staging root under the AgentGates lease-managed build directory."""
+    build_subdir = env_vals.get("TILEFOUNDRY_NPU_BUILD_SUBDIR", "").strip() or "build"
+    if build_subdir in {".", ".."} or Path(build_subdir).name != build_subdir:
+        raise ValueError(
+            "TILEFOUNDRY_NPU_BUILD_SUBDIR must be one relative directory name, "
+            f"got {build_subdir!r}"
+        )
+    return root / build_subdir / "agent_gates" / "fast"
+
+
+def _fast_cache_roots(root: Path, env_vals: Mapping[str, str]) -> tuple[Path, Path]:
+    """Resolve the reference and TileLang caches the device-fast child also uses."""
+    raw = env_vals.get("TILEFOUNDRY_NPU_WORK_ROOT", "").strip()
+    if not raw:
+        raise ValueError(
+            "AgentGates machine env has no TILEFOUNDRY_NPU_WORK_ROOT for device-fast"
+        )
+    work_root = Path(raw).expanduser()
+    if not work_root.is_absolute():
+        raise ValueError(
+            f"TILEFOUNDRY_NPU_WORK_ROOT must be an absolute path, got {raw!r}"
+        )
+    resolved = work_root.resolve()
+    if resolved == root or resolved.is_relative_to(root):
+        raise ValueError(
+            f"TILEFOUNDRY_NPU_WORK_ROOT must be outside the source root, got {resolved}"
+        )
+    base = resolved / "surrogate"
+    return base / "reference", base / "tilelang"
+
+
+def _stage_fast_candidate(
+    request_dir: Path,
+    root: Path,
+    operator_name: str,
+    index: int,
+    candidate_id: str,
+    module_path: Path,
+) -> tuple[str, str]:
+    """Copy a candidate into the request staging tree, returning (relative path, sha256)."""
+    source = module_path.resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"candidate module {source} does not exist")
+    if source.suffix != ".py":
+        raise ValueError(f"candidate module {source} must be a Python file")
+    operator_dir = request_dir / "candidates" / _fast_slug(operator_name, fallback="operator")
+    operator_dir.mkdir(parents=True, exist_ok=True)
+    staged = operator_dir / f"{index:03d}_{_fast_slug(candidate_id, fallback='candidate')}.py"
+    if staged.exists():
+        raise FileExistsError(f"staged candidate {staged} already exists")
+    shutil.copyfile(source, staged)
+    staged.chmod(0o444)
+    return staged.relative_to(root).as_posix(), _sha256_file(staged)
+
+
+def _write_fast_request(path: Path, payload: Mapping[str, object]) -> str:
+    """Write the request once as an immutable descriptor and return its sha256."""
+    data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fchmod(stream.fileno(), 0o444)
+    return hashlib.sha256(data).hexdigest()
+
+
+def _fast_response_mapping(raw: Mapping[str, object], key: str) -> Mapping[str, object]:
+    value = raw.get(key)
+    if not isinstance(value, Mapping):
+        raise RuntimeError(f"fast response field {key!r} must be a mapping")
+    return value
+
+
+def _require_fast_envelope(
+    raw: Mapping[str, object],
+    *,
+    request_id: str,
+    request_sha256: str,
+    mode: str,
+) -> str:
+    """Validate the response envelope against the submitted request and return its status."""
+    if raw.get("schema") != FAST_RESPONSE_SCHEMA:
+        raise RuntimeError(
+            f"fast response schema {raw.get('schema')!r} != {FAST_RESPONSE_SCHEMA!r}"
+        )
+    if raw.get("request_id") != request_id:
+        raise RuntimeError(
+            f"fast response request_id {raw.get('request_id')!r} != {request_id!r}"
+        )
+    if raw.get("request_sha256") != request_sha256:
+        raise RuntimeError("fast response request_sha256 does not match the submitted request")
+    if raw.get("mode") != mode:
+        raise RuntimeError(f"fast response mode {raw.get('mode')!r} != {mode!r}")
+    status = raw.get("status")
+    if status not in (
+        FAST_STATUS_OK,
+        FAST_STATUS_CANDIDATE_FAILURE,
+        FAST_STATUS_REQUEST_ERROR,
+        FAST_STATUS_INFRASTRUCTURE_ERROR,
+    ):
+        raise RuntimeError(f"fast response status {status!r} is not recognized")
+    return str(status)
+
+
+def _raise_for_fast_status(status: str, raw: Mapping[str, object]) -> None:
+    if status in (FAST_STATUS_REQUEST_ERROR, FAST_STATUS_INFRASTRUCTURE_ERROR):
+        detail = str(raw.get("error", "")).strip() or "no detail"
+        raise RuntimeError(f"fast gate {status}: {detail}")
+
+
+def _verify_fast_bindings(
+    raw: Mapping[str, object],
+    expected: Mapping[str, Mapping[str, Mapping[str, str]]],
+) -> None:
+    """Prove every evaluated candidate matches its staged path and content digest."""
+    bindings = _fast_response_mapping(raw, "candidates")
+    for operator_name, candidates in expected.items():
+        operator_bindings = bindings.get(operator_name)
+        if not isinstance(operator_bindings, Mapping):
+            raise RuntimeError(
+                f"fast response has no candidate bindings for operator {operator_name!r}"
+            )
+        if set(operator_bindings) != set(candidates):
+            raise RuntimeError(
+                f"fast response candidate set for operator {operator_name!r} "
+                "does not match the request"
+            )
+        for candidate_id, binding in candidates.items():
+            actual = operator_bindings.get(candidate_id)
+            if not isinstance(actual, Mapping):
+                raise RuntimeError(
+                    f"fast response binding for {operator_name}/{candidate_id} is malformed"
+                )
+            if actual.get("module_path") != binding["module_path"]:
+                raise RuntimeError(
+                    f"fast response module_path for {operator_name}/{candidate_id} "
+                    "does not match the staged candidate"
+                )
+            if actual.get("sha256") != binding["sha256"]:
+                raise RuntimeError(
+                    f"fast response sha256 for {operator_name}/{candidate_id} "
+                    "does not match the staged candidate"
+                )
+            if actual.get("post_sha256") != binding["sha256"]:
+                raise RuntimeError(
+                    f"fast gate {FAST_STATUS_INFRASTRUCTURE_ERROR}: candidate "
+                    f"{operator_name}/{candidate_id} changed during evaluation"
+                )
+
+
+def _verify_fast_coverage(
+    raw: Mapping[str, object],
+    *,
+    expected_candidates: int,
+    expected_msprof_targets: int,
+) -> None:
+    coverage = _fast_response_mapping(raw, "coverage")
+    expected_seen = coverage.get("expected_candidates")
+    evaluated = coverage.get("evaluated_candidates")
+    targets_expected = coverage.get("expected_msprof_targets")
+    targets_observed = coverage.get("observed_msprof_targets")
+    if expected_seen != expected_candidates or evaluated != expected_candidates:
+        raise RuntimeError(
+            "fast response candidate coverage "
+            f"expected={expected_seen!r} evaluated={evaluated!r} "
+            f"request={expected_candidates}"
+        )
+    if targets_expected != expected_msprof_targets or targets_observed != expected_msprof_targets:
+        raise RuntimeError(
+            "fast response msprof coverage "
+            f"expected={targets_expected!r} observed={targets_observed!r} "
+            f"request={expected_msprof_targets}"
+        )
+
+
+def _submit_fast_gate(
+    *,
+    agent_gates_bin: str,
+    root: Path,
+    workspace: str,
+    request_id: str,
+    request_relative_path: str,
+    request_path: Path,
+    response_path: Path,
+    request_sha256: str,
+    mode: str,
+    timeout_sec: float,
+    device_id: str,
+) -> tuple[Mapping[str, object], _V2GateExecution]:
+    """Submit the device-fast dynamic target, verify its receipt, and load the response."""
+    if _sha256_file(request_path) != request_sha256:
+        raise RuntimeError("fast request file changed after it was written")
+    execution = _run_v2_gate(
+        agent_gates_bin=agent_gates_bin,
+        root=root,
+        workspace=workspace,
+        gate_id=AGENT_GATES_DEVICE_FAST_GATE,
+        target=f"fast/{request_id}",
+        candidate_path=request_relative_path,
+        timeout_sec=timeout_sec,
+        device_id=device_id,
+    )
+    if execution.transport_error:
+        raise RuntimeError(f"AgentGates device-fast batch failed: {execution.transport_error}")
+    if not execution.verified:
+        failures = execution.verification.get("failures")
+        response_detail = ""
+        if response_path.is_file():
+            try:
+                failed_raw = json.loads(response_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                failed_raw = None
+            if isinstance(failed_raw, Mapping):
+                status = str(failed_raw.get("status", "")).strip()
+                error = str(failed_raw.get("error", "")).strip()
+                if status:
+                    response_detail = f"; response status {status}: {error or 'no detail'}"
+        raise RuntimeError(
+            "AgentGates device-fast receipt did not verify: "
+            f"{failures or 'unsatisfied'}{response_detail}"
+        )
+    if not _source_identity_matches(execution.verification, root):
+        raise RuntimeError(
+            "AgentGates device-fast verified source identity does not match requested source"
+        )
+    if not response_path.is_file():
+        row, _observation = _gate_observation(execution.report, AGENT_GATES_DEVICE_FAST_GATE)
+        detail = (
+            (row.get("failures") if row is not None else None)
+            or execution.report.get("status")
+            or "missing response"
+        )
+        raise RuntimeError(f"AgentGates device-fast batch produced no response: {detail}")
+    raw = json.loads(response_path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise RuntimeError("AgentGates device-fast response must be a JSON object")
+    status = _require_fast_envelope(
+        raw,
+        request_id=request_id,
+        request_sha256=request_sha256,
+        mode=mode,
+    )
+    _raise_for_fast_status(status, raw)
+    return raw, execution
+
+
+def _fast_held_seconds(report: Mapping[str, object]) -> float:
+    _row, observation = _gate_observation(report, AGENT_GATES_DEVICE_FAST_GATE)
+    window = observation.get("deviceWindow")
+    if not isinstance(window, Mapping):
+        return 0.0
+    held = window.get("heldSeconds")
+    if isinstance(held, bool) or not isinstance(held, (int, float)):
+        return 0.0
+    return float(held)
 
 
 def _source_identity_matches(verification: Mapping[str, object], root: Path) -> bool:
@@ -3220,12 +3515,21 @@ def run_l4_official_cannbench_via_agent_gates(
 
 __all__ = [
     "AGENT_GATES_ADAPTER",
+    "AGENT_GATES_DEVICE_FAST_GATE",
     "AGENT_GATES_L3_PROMOTION_GATE",
     "AGENT_GATES_L4_CANNBENCH_GATE",
     "AnchorEvalMetrics",
     "CandidateSurrogateResult",
     "DEFAULT_L3_PROMOTION_WAIT_SEC",
     "DEFAULT_L4_CANNBENCH_WAIT_SEC",
+    "FAST_REQUEST_ENV",
+    "FAST_REQUEST_SCHEMA",
+    "FAST_RESPONSE_SCHEMA",
+    "FAST_SOURCE_ROOT_ENV",
+    "FAST_STATUS_CANDIDATE_FAILURE",
+    "FAST_STATUS_INFRASTRUCTURE_ERROR",
+    "FAST_STATUS_OK",
+    "FAST_STATUS_REQUEST_ERROR",
     "FAILURE_KIND_CANDIDATE",
     "FAILURE_KIND_INFRASTRUCTURE",
     "L0L1CandidateCheck",

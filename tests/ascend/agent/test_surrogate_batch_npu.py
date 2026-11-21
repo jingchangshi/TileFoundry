@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import gc
+import hashlib
 import importlib
 import importlib.util
 import json
 import os
+import re
 import statistics
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -28,11 +31,23 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     resolve_cannbench_repo,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+    FAST_REQUEST_ENV,
+    FAST_REQUEST_SCHEMA,
+    FAST_RESPONSE_SCHEMA,
+    FAST_SOURCE_ROOT_ENV,
+    FAST_STATUS_CANDIDATE_FAILURE,
+    FAST_STATUS_INFRASTRUCTURE_ERROR,
+    FAST_STATUS_OK,
+    FAST_STATUS_REQUEST_ERROR,
     AnchorEvalMetrics,
     CandidateSurrogateResult,
     aggregate_surrogate_result,
     build_anchor_metrics,
     ensure_npu_compare_shim_dir,
+)
+from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
+    MicroProbeSpec,
+    verify_micro_probe_hardware,
 )
 
 _ENV_SHIM_DIR = os.environ.get("TF_SURROGATE_SHIM_DIR", "").strip()
@@ -51,7 +66,9 @@ def _require_npu_env() -> None:
         except ImportError:
             pass
     if not hasattr(torch, "npu") or not torch.npu.is_available():
-        if os.environ.get("TF_SURROGATE_BATCH_REQUEST", "").strip():
+        if os.environ.get(FAST_REQUEST_ENV, "").strip() or os.environ.get(
+            "TF_SURROGATE_BATCH_REQUEST", ""
+        ).strip():
             raise RuntimeError("Ascend NPU device is unavailable for surrogate batch request.")
         pytest.skip("Ascend NPU device is unavailable on this host.")
 
@@ -428,6 +445,442 @@ def _collect_msprof_targets(
     return telemetry_out
 
 
+_FAST_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+class _FastRequestError(RuntimeError):
+    """A fast request contract violation reported as a request_error response."""
+
+
+@dataclass(frozen=True)
+class _FastCandidate:
+    operator_name: str
+    candidate_id: str
+    module_path: Path
+    relative_path: str
+    sha256: str
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fast_int(value: object, field: str, *, default: int) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise _FastRequestError(f"fast request field {field!r} must be a positive integer")
+    return value
+
+
+def _fast_source_root(source_root_raw: str) -> Path:
+    raw = source_root_raw.strip()
+    if not raw:
+        raise RuntimeError(
+            f"fast request requires {FAST_SOURCE_ROOT_ENV} from the AgentGates adapter"
+        )
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise RuntimeError(f"fast request environment {FAST_SOURCE_ROOT_ENV} must be absolute")
+    resolved = path.resolve()
+    if not resolved.is_dir():
+        raise RuntimeError(
+            f"fast request environment {FAST_SOURCE_ROOT_ENV} must be a directory: {resolved}"
+        )
+    return resolved
+
+
+def _fast_env_dir(name: str, *, create: bool) -> Path:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        raise RuntimeError(f"fast request requires {name} from the AgentGates adapter")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise RuntimeError(f"fast request environment {name} must be absolute")
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    elif not path.is_dir():
+        raise RuntimeError(f"fast request environment {name} must be a directory: {path}")
+    return path.resolve()
+
+
+def _fast_path(source_root: Path, value: object, field: str) -> Path:
+    raw = str(value or "").strip()
+    if not raw:
+        raise _FastRequestError(f"fast request field {field!r} is required")
+    relative = Path(raw)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise _FastRequestError(f"fast request field {field!r} must be workspace-relative")
+    unresolved = source_root / relative
+    if unresolved.is_symlink():
+        raise _FastRequestError(f"fast request field {field!r} must not be a symlink")
+    try:
+        resolved = unresolved.resolve()
+        resolved.relative_to(source_root)
+    except ValueError:
+        raise _FastRequestError(
+            f"fast request field {field!r} escapes the source root"
+        ) from None
+    return resolved
+
+
+def _fast_candidate(
+    source_root: Path,
+    operator_name: str,
+    row: Mapping[str, object],
+    used: set[tuple[str, str]],
+) -> _FastCandidate:
+    candidate_id = str(row.get("candidate_id", "")).strip()
+    if not candidate_id:
+        raise _FastRequestError(
+            f"fast request candidate under {operator_name!r} has no candidate_id"
+        )
+    key = (operator_name, candidate_id)
+    if key in used:
+        raise _FastRequestError(
+            f"duplicate fast request candidate {operator_name}/{candidate_id}"
+        )
+    used.add(key)
+    relative_path = str(row.get("module_path", "")).strip()
+    module_path = _fast_path(source_root, relative_path, "module_path")
+    if not module_path.is_file():
+        raise _FastRequestError(
+            f"fast request module {relative_path!r} is not a regular file"
+        )
+    sha256 = str(row.get("sha256", "")).strip().lower()
+    if not _FAST_SHA256.fullmatch(sha256):
+        raise _FastRequestError(
+            f"fast request module {relative_path!r} has no valid sha256"
+        )
+    if _sha256_file(module_path) != sha256:
+        raise _FastRequestError(
+            f"fast request module {relative_path!r} does not match its declared sha256"
+        )
+    return _FastCandidate(
+        operator_name=operator_name,
+        candidate_id=candidate_id,
+        module_path=module_path,
+        relative_path=relative_path,
+        sha256=sha256,
+    )
+
+
+def _fast_bindings(candidates: list[_FastCandidate]) -> dict[str, dict[str, dict[str, str]]]:
+    bindings: dict[str, dict[str, dict[str, str]]] = {}
+    for candidate in candidates:
+        post_sha256 = _sha256_file(candidate.module_path)
+        if post_sha256 != candidate.sha256:
+            raise RuntimeError(
+                f"fast gate {FAST_STATUS_INFRASTRUCTURE_ERROR}: candidate "
+                f"{candidate.operator_name}/{candidate.candidate_id} changed during evaluation"
+            )
+        bindings.setdefault(candidate.operator_name, {})[candidate.candidate_id] = {
+            "module_path": candidate.relative_path,
+            "sha256": candidate.sha256,
+            "post_sha256": post_sha256,
+        }
+    return bindings
+
+
+def _fast_response_payload(
+    *,
+    request_id: str,
+    request_sha256: str,
+    mode: str,
+    status: str,
+    error: str = "",
+    operators: Mapping[str, object] | None = None,
+    msprof_telemetry: Mapping[str, object] | None = None,
+    candidates: Mapping[str, object] | None = None,
+    coverage: Mapping[str, int] | None = None,
+) -> dict[str, object]:
+    return {
+        "schema": FAST_RESPONSE_SCHEMA,
+        "request_id": request_id,
+        "request_sha256": request_sha256,
+        "mode": mode,
+        "status": status,
+        "error": error[-1000:],
+        "operators": dict(operators or {}),
+        "msprof_telemetry": dict(msprof_telemetry or {}),
+        "candidates": dict(candidates or {}),
+        "coverage": dict(
+            coverage
+            or {
+                "expected_candidates": 0,
+                "evaluated_candidates": 0,
+                "expected_msprof_targets": 0,
+                "observed_msprof_targets": 0,
+            }
+        ),
+    }
+
+
+def _run_fast_batch(
+    req: Mapping[str, object],
+    *,
+    source_root: Path,
+    cannbench_repo: Path,
+    response_path: Path,
+    request_id: str,
+    request_sha256: str,
+) -> None:
+    raw_batches = req.get("batches")
+    if not isinstance(raw_batches, list) or not raw_batches:
+        raise _FastRequestError("fast batch request requires a non-empty batches list")
+    if req.get("msprof_targets") not in (None, []):
+        raise _FastRequestError("fast batch request must not declare msprof_targets")
+    warmup = _fast_int(req.get("warmup"), "warmup", default=3)
+    repeat = _fast_int(req.get("repeat"), "repeat", default=5)
+
+    used_candidates: set[tuple[str, str]] = set()
+    operators: set[str] = set()
+    candidates: list[_FastCandidate] = []
+    normalized_batches: list[dict[str, object]] = []
+    for row in raw_batches:
+        if not isinstance(row, Mapping):
+            raise _FastRequestError("fast batch entries must be objects")
+        operator_name = str(row.get("operator_name", "")).strip()
+        if not operator_name:
+            raise _FastRequestError("fast batch entry has no operator_name")
+        if operator_name in operators:
+            raise _FastRequestError(f"duplicate fast batch operator {operator_name!r}")
+        operators.add(operator_name)
+        raw_candidates = row.get("candidates")
+        if not isinstance(raw_candidates, list) or not raw_candidates:
+            raise _FastRequestError(
+                f"fast batch operator {operator_name!r} has no candidates"
+            )
+        normalized_candidates: list[dict[str, str]] = []
+        for cand_row in raw_candidates:
+            if not isinstance(cand_row, Mapping):
+                raise _FastRequestError("fast batch candidates must be objects")
+            candidate = _fast_candidate(source_root, operator_name, cand_row, used_candidates)
+            candidates.append(candidate)
+            normalized_candidates.append(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "module_path": str(candidate.module_path),
+                }
+            )
+        raw_anchors = row.get("anchors")
+        if not isinstance(raw_anchors, list) or not raw_anchors:
+            raise _FastRequestError(
+                f"fast batch operator {operator_name!r} has no anchors"
+            )
+        normalized_batches.append(
+            {
+                "operator_name": operator_name,
+                "entrypoint": str(row.get("entrypoint") or get_operator_entrypoint(operator_name)),
+                "candidates": normalized_candidates,
+                "anchors": raw_anchors,
+            }
+        )
+
+    results_by_op: dict[str, dict[str, dict[str, object]]] = {}
+    failures: list[str] = []
+    for batch in normalized_batches:
+        op_name = str(batch["operator_name"])
+        op_res = _evaluate_operator_batch(
+            batch,
+            source_root=source_root,
+            cannbench_repo=cannbench_repo,
+            warmup=warmup,
+            repeat=repeat,
+        )
+        results_by_op[op_name] = {cid: res.to_dict() for cid, res in op_res.items()}
+        failures.extend(
+            f"{op_name}/{cid}" for cid, res in op_res.items() if not res.all_passed
+        )
+    payload = _fast_response_payload(
+        request_id=request_id,
+        request_sha256=request_sha256,
+        mode="batch",
+        status=FAST_STATUS_OK if not failures else FAST_STATUS_CANDIDATE_FAILURE,
+        operators=results_by_op,
+        candidates=_fast_bindings(candidates),
+        coverage={
+            "expected_candidates": len(candidates),
+            "evaluated_candidates": sum(len(cands) for cands in results_by_op.values()),
+            "expected_msprof_targets": 0,
+            "observed_msprof_targets": 0,
+        },
+    )
+    _atomic_write_json(response_path, payload)
+    print(json.dumps(payload, sort_keys=True), flush=True)
+
+
+def _run_fast_profile(
+    req: Mapping[str, object],
+    *,
+    source_root: Path,
+    cannbench_repo: Path,
+    response_path: Path,
+    request_id: str,
+    request_sha256: str,
+) -> None:
+    raw_targets = req.get("msprof_targets")
+    if not isinstance(raw_targets, list) or not raw_targets:
+        raise _FastRequestError("fast profile request requires a non-empty msprof_targets list")
+    if req.get("batches") not in (None, []):
+        raise _FastRequestError("fast profile request must not declare batches")
+    default_warmup = _fast_int(req.get("warmup"), "warmup", default=1)
+    default_repeat = _fast_int(req.get("repeat"), "repeat", default=3)
+
+    used_candidates: set[tuple[str, str]] = set()
+    candidate_by_key: dict[tuple[str, str], _FastCandidate] = {}
+    seen_targets: set[tuple[str, str, int]] = set()
+    candidates: list[_FastCandidate] = []
+    normalized_rows: list[dict[str, object]] = []
+    for row in raw_targets:
+        if not isinstance(row, Mapping):
+            raise _FastRequestError("fast profile targets must be objects")
+        operator_name = str(row.get("operator_name", "")).strip()
+        if not operator_name:
+            raise _FastRequestError("fast profile target has no operator_name")
+        declared_candidate_id = str(row.get("candidate_id", "")).strip()
+        if not declared_candidate_id:
+            raise _FastRequestError(
+                f"fast request candidate under {operator_name!r} has no candidate_id"
+            )
+        key = (operator_name, declared_candidate_id)
+        candidate = candidate_by_key.get(key)
+        if candidate is None:
+            candidate = _fast_candidate(source_root, operator_name, row, used_candidates)
+            candidate_by_key[key] = candidate
+            candidates.append(candidate)
+        elif (
+            str(row.get("module_path", "")).strip() != candidate.relative_path
+            or str(row.get("sha256", "")).strip().lower() != candidate.sha256
+        ):
+            raise _FastRequestError(
+                f"fast profile candidate {operator_name}/{candidate.candidate_id} "
+                "changes module_path or sha256 across targets"
+            )
+        case_num = row.get("case_num")
+        if isinstance(case_num, bool) or not isinstance(case_num, int) or case_num <= 0:
+            raise _FastRequestError(
+                "fast profile target case_num must be a positive integer"
+            )
+        target_key = (operator_name, candidate.candidate_id, case_num)
+        if target_key in seen_targets:
+            raise _FastRequestError(
+                f"duplicate fast profile target {operator_name}/"
+                f"{candidate.candidate_id}#{case_num}"
+            )
+        seen_targets.add(target_key)
+        normalized_rows.append(
+            {
+                "operator_name": operator_name,
+                "candidate_id": candidate.candidate_id,
+                "module_path": str(candidate.module_path),
+                "case_num": case_num,
+                "warmup": _fast_int(row.get("warmup"), "warmup", default=default_warmup),
+                "repeat": _fast_int(row.get("repeat"), "repeat", default=default_repeat),
+            }
+        )
+
+    telemetry = _collect_msprof_targets(
+        normalized_rows,
+        source_root=source_root,
+        cannbench_repo=cannbench_repo,
+    )
+    observed_targets = sum(
+        len(cases) for cands in telemetry.values() for cases in cands.values()
+    )
+    payload = _fast_response_payload(
+        request_id=request_id,
+        request_sha256=request_sha256,
+        mode="profile",
+        status=FAST_STATUS_OK,
+        msprof_telemetry=telemetry,
+        candidates=_fast_bindings(candidates),
+        coverage={
+            "expected_candidates": len(candidates),
+            "evaluated_candidates": len(candidates),
+            "expected_msprof_targets": len(raw_targets),
+            "observed_msprof_targets": observed_targets,
+        },
+    )
+    _atomic_write_json(response_path, payload)
+    print(json.dumps(payload, sort_keys=True), flush=True)
+
+
+def _handle_fast_request(request_path_raw: str, source_root_raw: str, shim_dir: Path) -> None:
+    request_path = Path(request_path_raw)
+    if not request_path.is_file():
+        raise RuntimeError(f"fast request {request_path} does not exist")
+    request_bytes = request_path.read_bytes()
+    request_sha256 = hashlib.sha256(request_bytes).hexdigest()
+    try:
+        req = json.loads(request_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"fast request {request_path} is not valid JSON: {exc}") from None
+    if not isinstance(req, dict):
+        raise RuntimeError(f"fast request {request_path} must be a JSON object")
+    source_root = _fast_source_root(source_root_raw)
+    response_path = _fast_path(source_root, req.get("response_path"), "response_path")
+    request_id = str(req.get("request_id", "")).strip()
+    mode = str(req.get("mode", "")).strip()
+
+    def _fail(status: str, message: str) -> None:
+        _atomic_write_json(
+            response_path,
+            _fast_response_payload(
+                request_id=request_id,
+                request_sha256=request_sha256,
+                mode=mode,
+                status=status,
+                error=message,
+            ),
+        )
+
+    try:
+        if req.get("schema") != FAST_REQUEST_SCHEMA:
+            raise _FastRequestError(
+                f"fast request schema {req.get('schema')!r} != {FAST_REQUEST_SCHEMA!r}"
+            )
+        if not request_id:
+            raise _FastRequestError("fast request has no request_id")
+        if mode not in ("batch", "profile"):
+            raise _FastRequestError(f"fast request mode {mode!r} is not recognized")
+        cannbench_repo = _fast_env_dir(
+            "TILEFOUNDRY_NPU_CANNBENCH_REPO", create=False
+        )
+        tl_cache_dir = _fast_env_dir("TILELANG_CACHE_DIR", create=True)
+        reference_cache_dir = _fast_env_dir("CANNBENCH_CACHE_DIR", create=True)
+        os.environ["CANNBENCH_CACHE_DIR"] = str(reference_cache_dir)
+        _ensure_npu_compare(cannbench_repo, shim_dir)
+        _configure_tilelang_cache(str(tl_cache_dir))
+        if mode == "batch":
+            _run_fast_batch(
+                req,
+                source_root=source_root,
+                cannbench_repo=cannbench_repo,
+                response_path=response_path,
+                request_id=request_id,
+                request_sha256=request_sha256,
+            )
+        else:
+            _run_fast_profile(
+                req,
+                source_root=source_root,
+                cannbench_repo=cannbench_repo,
+                response_path=response_path,
+                request_id=request_id,
+                request_sha256=request_sha256,
+            )
+    except _FastRequestError as exc:
+        _fail(FAST_STATUS_REQUEST_ERROR, str(exc))
+    except Exception as exc:
+        _fail(FAST_STATUS_INFRASTRUCTURE_ERROR, f"{type(exc).__name__}: {exc}")
+        raise
+
+
 def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(".tmp")
@@ -450,11 +903,6 @@ def _configure_tilelang_cache(tl_cache_dir: str) -> None:
 
 
 def _handle_micro_probe_request(probe_req_path: str) -> None:
-    from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
-        MicroProbeSpec,
-        verify_micro_probe_hardware,
-    )
-
     payload = json.loads(Path(probe_req_path).read_text(encoding="utf-8"))
     tl_cache_dir = str(payload.get("tilelang_cache_dir", "")).strip()
     if tl_cache_dir:
@@ -498,6 +946,25 @@ def _handle_micro_probe_request(probe_req_path: str) -> None:
     print(json.dumps(out_payload, sort_keys=True), flush=True)
 
 
+def test_fast_bindings_treat_candidate_change_as_infrastructure(tmp_path: Path) -> None:
+    """A candidate rewritten after evaluation invalidates the run without blaming the request."""
+    module = tmp_path / "kernel.py"
+    module.write_text("x = 1\n", encoding="utf-8")
+    candidate = _FastCandidate(
+        operator_name="softmax",
+        candidate_id="cand-1",
+        module_path=module,
+        relative_path="kernel.py",
+        sha256=_sha256_file(module),
+    )
+    module.write_text("x = 2\n", encoding="utf-8")
+    with pytest.raises(RuntimeError) as failure:
+        _fast_bindings([candidate])
+    assert not isinstance(failure.value, _FastRequestError)
+    assert FAST_STATUS_INFRASTRUCTURE_ERROR in str(failure.value)
+    assert "changed during evaluation" in str(failure.value)
+
+
 def test_surrogate_anchor_batch_npu() -> None:
     """Evaluate configured or baseline 10-anchor surrogate batch inside AgentGates lease."""
     _require_npu_env()
@@ -508,7 +975,12 @@ def test_surrogate_anchor_batch_npu() -> None:
         _handle_micro_probe_request(probe_req_env)
         return
 
+    fast_req_env = os.environ.get(FAST_REQUEST_ENV, "").strip()
     req_env = os.environ.get("TF_SURROGATE_BATCH_REQUEST", "").strip()
+    if fast_req_env and req_env:
+        raise RuntimeError(
+            f"{FAST_REQUEST_ENV} and TF_SURROGATE_BATCH_REQUEST must not both be set"
+        )
     shim_only = os.environ.get("TF_SURROGATE_SHIM_ONLY", "").strip() == "1"
     shim_env_dir = os.environ.get("TF_SURROGATE_SHIM_DIR", "").strip()
     tl_cache_env = os.environ.get("TF_SURROGATE_TL_CACHE_DIR", "").strip()
@@ -532,6 +1004,15 @@ def test_surrogate_anchor_batch_npu() -> None:
         return
 
     with tempfile.TemporaryDirectory(prefix="tf_surrogate_shim_") as shim_dir:
+        if fast_req_env:
+            if not Path(fast_req_env).is_file():
+                raise RuntimeError(f"{FAST_REQUEST_ENV} does not exist: {fast_req_env}")
+            _handle_fast_request(
+                fast_req_env,
+                os.environ.get(FAST_SOURCE_ROOT_ENV, "").strip(),
+                Path(shim_dir),
+            )
+            return
         if req_env and Path(req_env).is_file():
             req = json.loads(Path(req_env).read_text(encoding="utf-8"))
             source_root = Path(str(req["source_root"])).resolve()
