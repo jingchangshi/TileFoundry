@@ -1624,12 +1624,21 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
     response_path = request_root / f"{request_id}.response.json"
 
     staged: dict[str, dict[str, dict[str, str]]] = {}
+    wire_ops: dict[str, str] = {}
     request_batches: list[dict[str, object]] = []
     seen_operators: set[str] = set()
+    seen_wire_ops: set[str] = set()
     for op_name, cands, op_anchors in batches:
         if op_name in seen_operators:
             raise ValueError(f"duplicate operator_name {op_name!r} in one fast batch")
         seen_operators.add(op_name)
+        wire_op = _fast_wire_operator_name(op_name)
+        if wire_op in seen_wire_ops:
+            raise ValueError(
+                f"duplicate wire operator_name {wire_op!r} (from {op_name!r}) in one fast batch"
+            )
+        seen_wire_ops.add(wire_op)
+        wire_ops[op_name] = wire_op
         bindings: dict[str, dict[str, str]] = {}
         entries: list[dict[str, str]] = []
         for index, (candidate_id, module_path) in enumerate(cands):
@@ -1640,7 +1649,7 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
             relative, digest = _stage_fast_candidate(
                 request_dir,
                 root,
-                op_name,
+                wire_op,
                 index,
                 candidate_id,
                 Path(module_path),
@@ -1649,10 +1658,10 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
             entries.append(
                 {"candidate_id": candidate_id, "module_path": relative, "sha256": digest}
             )
-        staged[op_name] = bindings
+        staged[wire_op] = bindings
         request_batches.append(
             {
-                "operator_name": op_name,
+                "operator_name": wire_op,
                 "entrypoint": get_operator_entrypoint(op_name),
                 "candidates": entries,
                 "anchors": [a.to_dict() for a in op_anchors],
@@ -1695,7 +1704,10 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
     out_by_op: dict[str, dict[str, CandidateSurrogateResult]] = {}
     failures: list[str] = []
     for op_name, cands, _anchors in batches:
-        cands_raw = operators_raw.get(op_name)
+        wire_op = wire_ops[op_name]
+        cands_raw = operators_raw.get(wire_op)
+        if cands_raw is None and wire_op != op_name:
+            cands_raw = operators_raw.get(op_name)
         if not isinstance(cands_raw, Mapping):
             raise RuntimeError(f"fast response has no results for operator {op_name!r}")
         parsed_candidates: dict[str, CandidateSurrogateResult] = {}
@@ -1829,10 +1841,11 @@ def _collect_profile_via_agent_gates(
     request_dir = request_root / request_id
     request_path = request_root / f"{request_id}.request.json"
     response_path = request_root / f"{request_id}.response.json"
+    wire_op = _fast_wire_operator_name(operator_name)
     relative, digest = _stage_fast_candidate(
         request_dir,
         root,
-        operator_name,
+        wire_op,
         0,
         candidate_id,
         cand_resolved,
@@ -1848,7 +1861,7 @@ def _collect_profile_via_agent_gates(
         "batches": [],
         "msprof_targets": [
             {
-                "operator_name": operator_name,
+                "operator_name": wire_op,
                 "candidate_id": candidate_id,
                 "module_path": relative,
                 "sha256": digest,
@@ -1876,14 +1889,17 @@ def _collect_profile_via_agent_gates(
     )
     _verify_fast_bindings(
         raw_resp,
-        {operator_name: {candidate_id: {"module_path": relative, "sha256": digest}}},
+        {wire_op: {candidate_id: {"module_path": relative, "sha256": digest}}},
     )
     _verify_fast_coverage(
         raw_resp,
         expected_candidates=1,
         expected_msprof_targets=len(unique_case_nums),
     )
-    telemetry_raw = _fast_response_mapping(raw_resp, "msprof_telemetry").get(operator_name)
+    telemetry_all = _fast_response_mapping(raw_resp, "msprof_telemetry")
+    telemetry_raw = (
+        telemetry_all.get(wire_op) if wire_op in telemetry_all else telemetry_all.get(operator_name)
+    )
     by_case = (
         telemetry_raw.get(candidate_id) if isinstance(telemetry_raw, Mapping) else None
     )
@@ -2455,6 +2471,12 @@ def _fast_slug(value: str, *, fallback: str) -> str:
     return slug or fallback
 
 
+def _fast_wire_operator_name(operator_name: str) -> str:
+    """Return leaf operator name matching AgentGates FAST_NAME_RE without slashes."""
+    leaf = str(operator_name or "").strip().rsplit("/", 1)[-1]
+    return _fast_slug(leaf, fallback="operator")
+
+
 def _fast_request_root(root: Path, env_vals: Mapping[str, str]) -> Path:
     """Resolve the request staging root under the AgentGates lease-managed build directory."""
     build_subdir = env_vals.get("TILEFOUNDRY_NPU_BUILD_SUBDIR", "").strip() or "build"
@@ -2632,6 +2654,29 @@ def _verify_fast_coverage(
         )
 
 
+def _is_fast_transient_build_lock(execution: _V2GateExecution) -> bool:
+    if execution.transport_error:
+        low = execution.transport_error.lower()
+        return "resource busy" in low and "build:" in low
+    if execution.verified:
+        return False
+    row, _ = _gate_observation(execution.report, AGENT_GATES_DEVICE_FAST_GATE)
+    status = str(
+        (row or {}).get("recordedStatus")
+        or (row or {}).get("status")
+        or execution.report.get("status")
+        or ""
+    ).upper()
+    if status != "BLOCKED_ENV":
+        return False
+    failures_txt = (
+        (_gate_failure_text(row) if row is not None else "")
+        + " "
+        + str(execution.verification.get("failures") or "")
+    ).lower()
+    return "resource busy" in failures_txt and "build:" in failures_txt
+
+
 def _submit_fast_gate(
     *,
     agent_gates_bin: str,
@@ -2649,16 +2694,32 @@ def _submit_fast_gate(
     """Submit the device-fast dynamic target, verify its receipt, and load the response."""
     if _sha256_file(request_path) != request_sha256:
         raise RuntimeError("fast request file changed after it was written")
-    execution = _run_v2_gate(
-        agent_gates_bin=agent_gates_bin,
-        root=root,
-        workspace=workspace,
-        gate_id=AGENT_GATES_DEVICE_FAST_GATE,
-        target=f"fast/{request_id}",
-        candidate_path=request_relative_path,
-        timeout_sec=timeout_sec,
-        device_id=device_id,
-    )
+    backoff = (8.0, 12.0, 16.0, 20.0, 25.0, 30.0)
+    max_retries = len(backoff)
+    execution: _V2GateExecution | None = None
+    for retry_idx in range(max_retries + 1):
+        execution = _run_v2_gate(
+            agent_gates_bin=agent_gates_bin,
+            root=root,
+            workspace=workspace,
+            gate_id=AGENT_GATES_DEVICE_FAST_GATE,
+            target=f"fast/{request_id}",
+            candidate_path=request_relative_path,
+            timeout_sec=timeout_sec,
+            device_id=device_id,
+        )
+        if not _is_fast_transient_build_lock(execution) or retry_idx >= max_retries:
+            break
+        wait_sec = backoff[min(retry_idx, len(backoff) - 1)]
+        logger.info(
+            "FAST_GATE_RETRY_BUILD_LOCK request=%s retry=%d/%d wait=%.1fs",
+            request_id,
+            retry_idx + 1,
+            max_retries,
+            wait_sec,
+        )
+        time.sleep(wait_sec)
+    assert execution is not None
     if execution.transport_error:
         raise RuntimeError(f"AgentGates device-fast batch failed: {execution.transport_error}")
     if not execution.verified:
@@ -2899,6 +2960,40 @@ def l3_failure_result_from_observation(
     )
 
 
+def _is_coverage_only_failure(row: object) -> bool:
+    if not isinstance(row, Mapping) or not row:
+        return True
+    category = str(row.get("category") or "").strip().lower()
+    stage = str(row.get("stage") or "").strip().lower()
+    return category == "missing_case" or stage == "coverage"
+
+
+def _select_primary_l3_failure(evidence: Mapping[str, object]) -> Mapping[str, object] | None:
+    nodes = evidence.get("nodes")
+    if isinstance(nodes, Sequence) and not isinstance(nodes, (str, bytes)):
+        for node in nodes:
+            if not isinstance(node, Mapping):
+                continue
+            node_fail = node.get("failure")
+            if isinstance(node_fail, Mapping) and not _is_coverage_only_failure(node_fail):
+                return node_fail
+    failures_seq = evidence.get("failures")
+    if isinstance(failures_seq, Sequence) and not isinstance(failures_seq, (str, bytes)):
+        for item in failures_seq:
+            if isinstance(item, Mapping) and not _is_coverage_only_failure(item):
+                return item
+    ev_failure = evidence.get("failure")
+    if isinstance(ev_failure, Mapping) and ev_failure and not _is_coverage_only_failure(ev_failure):
+        return ev_failure
+    if isinstance(ev_failure, Mapping) and ev_failure:
+        return ev_failure
+    if isinstance(failures_seq, Sequence) and not isinstance(failures_seq, (str, bytes)):
+        for item in failures_seq:
+            if isinstance(item, Mapping) and item:
+                return item
+    return None
+
+
 def _format_l3_failure_detail(
     row: Mapping[str, object],
     observation: Mapping[str, object],
@@ -2907,18 +3002,7 @@ def _format_l3_failure_detail(
     """Extract concise compiler/runtime/comparison diagnostics from a failed L3 gate."""
     base_raw = row.get("failures") or observation.get("error") or "no detail"
     base_text = str(base_raw)
-    failure = evidence.get("failure")
-    if not isinstance(failure, Mapping) or not failure:
-        failures_seq = evidence.get("failures")
-        if (
-            isinstance(failures_seq, Sequence)
-            and not isinstance(failures_seq, (str, bytes))
-            and failures_seq
-            and isinstance(failures_seq[0], Mapping)
-        ):
-            failure = failures_seq[0]
-        else:
-            failure = None
+    failure = _select_primary_l3_failure(evidence)
     if not isinstance(failure, Mapping):
         return base_text
 
@@ -2952,12 +3036,25 @@ def _format_l3_failure_detail(
             (c for c in comparisons if isinstance(c, Mapping) and c.get("passed") is False),
             None,
         )
+        if failing_cmp is None:
+            failing_cmp = next(
+                (
+                    c
+                    for c in comparisons
+                    if isinstance(c, Mapping)
+                    and (str(c.get("message") or "").strip() or str(c.get("detail") or "").strip())
+                ),
+                None,
+            )
         if isinstance(failing_cmp, Mapping):
             cmp_bits: list[str] = []
-            for key in ("name", "max_abs_diff", "max_rel_diff", "atol", "rtol", "detail"):
+            for key in ("name", "max_abs_diff", "max_rel_diff", "atol", "rtol", "detail", "message"):
                 val = failing_cmp.get(key)
                 if val is not None and str(val).strip():
-                    cmp_bits.append(f"{key}={val}")
+                    val_str = str(val).strip()
+                    if key in ("message", "detail") and len(val_str) > 600:
+                        val_str = val_str[:600]
+                    cmp_bits.append(f"{key}={val_str}")
             if cmp_bits:
                 parts.append("comparison(" + ", ".join(cmp_bits) + ")")
 

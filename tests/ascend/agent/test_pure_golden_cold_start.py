@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import subprocess
@@ -17,6 +19,7 @@ from tilefoundry_ascend.agent.campaign import marathon
 from tilefoundry_ascend.agent.campaign import surrogate_cannbench
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     DEFAULT_REGIME_SPECS,
+    AnchorCaseSpec,
     CannbenchOpsRegistry,
     RegimeTargetSpec,
     build_semantic_regime_specs,
@@ -43,8 +46,14 @@ from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
     validate_entrypoint_signature_compatibility,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+    FAST_RESPONSE_SCHEMA,
     L3AcceptanceResult,
+    _V2GateExecution,
+    _collect_profile_via_agent_gates,
+    _fast_wire_operator_name,
     _format_l3_failure_detail,
+    _submit_fast_gate,
+    run_multi_operator_surrogate_batch_via_agent_gates,
 )
 from tilefoundry_ascend.agent.orchestrator import gate_funnel
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
@@ -1191,3 +1200,260 @@ def test_cce_cpp20_surface_prompt_includes_dav3510_compiler_rules() -> None:
     assert "__simt_callee__" in rendered
     assert "MODE_ZEROING" in rendered
     assert 'if x.device.type != "npu":' in rendered
+
+
+def test_fast_wire_operator_name_normalization_in_batch_and_profile(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify fast batch and profile serialize slashless wire names and restore caller keys."""
+    assert _fast_wire_operator_name("level2/softmax") == "softmax"
+    assert (
+        _fast_wire_operator_name("level3/add_rms_norm_dynamic_quant")
+        == "add_rms_norm_dynamic_quant"
+    )
+
+    source_root = tmp_path / "repo"
+    source_root.mkdir()
+    cand = source_root / "cand.py"
+    cand.write_text("kernel = object()\n", encoding="utf-8")
+    env_file = source_root / "env.sh"
+    work_root = tmp_path / "work"
+    work_root.mkdir()
+    env_file.write_text(
+        f"TILEFOUNDRY_NPU_CANNBENCH_REPO={tmp_path / 'cb'}\n"
+        f"TILEFOUNDRY_NPU_WORK_ROOT={work_root}\n",
+        encoding="utf-8",
+    )
+    anchor = AnchorCaseSpec("level2/softmax", 1, "reduce_tail", 10.0, 5.0)
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    monkeypatch.setattr(surrogate_cannbench, "_agent_gates_workspace_name", lambda _r: "tilefoundry")
+    monkeypatch.setattr(surrogate_cannbench, "get_operator_entrypoint", lambda _op: "softmax")
+    monkeypatch.setattr(
+        surrogate_cannbench, "prewarm_anchor_reference_cache", lambda *_a, **_kw: None
+    )
+    monkeypatch.setattr(
+        surrogate_cannbench, "prewarm_surrogate_tilelang_cache", lambda *_a, **_kw: None
+    )
+
+    seen_payloads: list[dict[str, object]] = []
+
+    def _fake_submit(
+        *,
+        request_id: str,
+        request_path: Path,
+        response_path: Path,
+        mode: str,
+        **_kw: object,
+    ) -> tuple[dict[str, object], _V2GateExecution]:
+        req_payload = json.loads(request_path.read_text(encoding="utf-8"))
+        seen_payloads.append(req_payload)
+        bindings = {
+            row["operator_name"]: {
+                c["candidate_id"]: {
+                    "module_path": c["module_path"],
+                    "sha256": c["sha256"],
+                    "post_sha256": c["sha256"],
+                }
+                for c in ([row] if mode == "profile" else row["candidates"])
+            }
+            for row in (
+                req_payload["msprof_targets"] if mode == "profile" else req_payload["batches"]
+            )
+        }
+        if mode == "batch":
+            resp: dict[str, object] = {
+                "schema": FAST_RESPONSE_SCHEMA,
+                "request_id": request_id,
+                "mode": "batch",
+                "status": "ok",
+                "candidates": bindings,
+                "coverage": {
+                    "expected_candidates": 1,
+                    "evaluated_candidates": 1,
+                    "expected_msprof_targets": 0,
+                    "observed_msprof_targets": 0,
+                },
+                "operators": {
+                    "softmax": {
+                        "c0": {
+                            "candidate_id": "c0",
+                            "operator_name": "softmax",
+                            "all_passed": True,
+                            "avg_speedup": 2.0,
+                            "min_case_speedup": 2.0,
+                            "avg_roofline_eta": 1.0,
+                            "surrogate_score": 88.0,
+                            "anchors": [
+                                {
+                                    "case_num": 1,
+                                    "regime_tag": "reduce_tail",
+                                    "ref_perf_us": 10.0,
+                                    "cand_us": 5.0,
+                                    "t_hw_us": 5.0,
+                                    "speedup": 2.0,
+                                    "roofline_eta": 1.0,
+                                    "eq3_score": 88.0,
+                                    "accuracy_passed": True,
+                                }
+                            ],
+                        }
+                    }
+                },
+            }
+        else:
+            resp = {
+                "schema": FAST_RESPONSE_SCHEMA,
+                "request_id": request_id,
+                "mode": "profile",
+                "status": "ok",
+                "candidates": bindings,
+                "coverage": {
+                    "expected_candidates": 1,
+                    "evaluated_candidates": 1,
+                    "expected_msprof_targets": 1,
+                    "observed_msprof_targets": 1,
+                },
+                "msprof_telemetry": {
+                    "softmax": {"bottleneck_probe": {"1": {"aiv_vec_ratio": 0.72}}}
+                },
+            }
+        return resp, _V2GateExecution(
+            execution_id="exec-fast-1",
+            report={
+                "status": "PASS",
+                "gates": [{"gateId": "tilefoundry-npu-device-fast", "observations": {"heldSeconds": 1.0}}],
+            },
+            verification={"satisfied": True},
+            run_id="run-fast-1",
+            receipt_path=str(response_path),
+            elapsed_sec=1.0,
+        )
+
+    monkeypatch.setattr(surrogate_cannbench, "_submit_fast_gate", _fake_submit)
+    by_op, run_id, _rcp, _held = run_multi_operator_surrogate_batch_via_agent_gates(
+        [("level2/softmax", [("c0", cand)], [anchor])],
+        source_root=source_root,
+        env_file=env_file,
+        prewarm_cache=False,
+    )
+    assert run_id == "run-fast-1"
+    assert seen_payloads[0]["batches"][0]["operator_name"] == "softmax"
+    assert "level2/softmax" in by_op
+    assert by_op["level2/softmax"]["c0"].surrogate_score == 88.0
+
+    profile = _collect_profile_via_agent_gates(
+        "level2/softmax",
+        cand,
+        [anchor],
+        candidate_id="bottleneck_probe",
+        source_root=source_root,
+        env_file=env_file,
+    )
+    assert seen_payloads[1]["msprof_targets"][0]["operator_name"] == "softmax"
+    assert profile["reduce_tail"]["aiv_vec_ratio"] == 0.72
+
+
+def test_l3_failure_detail_prefers_node_comparison_message_over_coverage() -> None:
+    """Verify node failure message is prioritized ahead of trailing coverage missing_case."""
+    row = {"failures": ["NONZERO_EXIT", "INVALID_TEST_COUNT"]}
+    obs = {"error": "failed"}
+    evidence = {
+        "failure": {
+            "case": "2",
+            "category": "missing_case",
+            "stage": "coverage",
+            "detail": "test_target_operator_full_cannbench_contract:2 was not completed",
+        },
+        "nodes": [
+            {
+                "name": "test_target_operator_full_cannbench_contract",
+                "failure": {
+                    "case": "1",
+                    "category": "numeric",
+                    "comparisons": [
+                        {
+                            "message": (
+                                "RuntimeError: rtStreamSynchronize execution failed, "
+                                "reason=vector core exception"
+                            )
+                        }
+                    ],
+                },
+            }
+        ],
+    }
+    msg = _format_l3_failure_detail(row, obs, evidence)
+    assert "reason=vector core exception" in msg
+    assert "was not completed" not in msg
+
+
+def test_submit_fast_gate_retries_transient_build_lock_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify _submit_fast_gate retries BLOCKED_ENV resource busy build lock before succeeding."""
+    req_path = tmp_path / "req.json"
+    req_bytes = b'{"schema": "tilefoundry-fast-request/v1"}\n'
+    req_path.write_bytes(req_bytes)
+    req_sha = hashlib.sha256(req_bytes).hexdigest()
+    resp_path = tmp_path / "resp.json"
+    resp_payload = {
+        "schema": FAST_RESPONSE_SCHEMA,
+        "request_id": "req1",
+        "request_sha256": req_sha,
+        "mode": "batch",
+        "status": "ok",
+    }
+    resp_path.write_text(json.dumps(resp_payload), encoding="utf-8")
+
+    executions = [
+        _V2GateExecution(
+            report={
+                "status": "BLOCKED_ENV",
+                "gates": [
+                    {
+                        "gateId": "tilefoundry-npu-device-fast",
+                        "status": "BLOCKED_ENV",
+                        "failures": ["resource busy: build:/repo/build (waited 0.0s)"],
+                        "observations": {},
+                    }
+                ],
+            },
+            verification={"satisfied": False, "failures": ["resource busy: build:/repo/build"]},
+        ),
+        _V2GateExecution(
+            execution_id="exec-fast-ok",
+            report={"status": "PASS", "gates": []},
+            verification={"satisfied": True},
+            run_id="run-fast-ok",
+        ),
+    ]
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    def _fake_v2(**kwargs: object) -> _V2GateExecution:
+        calls.append(str(kwargs.get("target")))
+        return executions[len(calls) - 1]
+
+    monkeypatch.setattr(surrogate_cannbench, "_run_v2_gate", _fake_v2)
+    monkeypatch.setattr(surrogate_cannbench, "_source_identity_matches", lambda *_a: True)
+    monkeypatch.setattr(surrogate_cannbench.time, "sleep", lambda sec: sleeps.append(float(sec)))
+
+    raw, final_exec = _submit_fast_gate(
+        agent_gates_bin="agent-gates",
+        root=tmp_path,
+        workspace="tilefoundry",
+        request_id="req1",
+        request_relative_path="req.json",
+        request_path=req_path,
+        response_path=resp_path,
+        request_sha256=req_sha,
+        mode="batch",
+        timeout_sec=60.0,
+        device_id="1",
+    )
+    assert final_exec.run_id == "run-fast-ok"
+    assert raw["status"] == "ok"
+    assert len(calls) == 2
+    assert sleeps == [8.0]
