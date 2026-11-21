@@ -189,19 +189,13 @@ def _is_occupancy_blocked_env(failure_kind: str, blocked_env_category: str) -> b
 class CampaignConfig:
     """Configuration controlling stopping policy, escalation, and gate thresholds.
 
-    ``device_id`` is the campaign's primary card and the first whole-L4
-    candidate. ``device_ids`` names additional explicitly authorized physical
-    cards for whole-L4 attempts: a terminal BLOCKED_ENV (exit 75) moves the
-    complete official run to the next untried pool card before any backoff,
-    while only a fully blocked round waits the bounded linear retry. The legacy
-    ``retry_device_id`` keeps its single whole-run retry after a proven-terminal
-    infrastructure failure and also joins the blocked-env pool. An empty pool
-    therefore keeps the single-card bounded backoff. The pool may also be
-    declared once in the managed env file under
-    ``TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS``; entry points resolve that file into
-    ``device_ids`` before constructing this config. ``round_regime_tags``
-    forces one regime per 1-based round position and falls back to adaptive
-    rotation for later rounds.
+    ``device_id`` is the primary card and first whole-L4 candidate; ``device_ids``
+    adds authorized pool cards; an empty pool keeps the single-card bounded backoff.
+    A terminal occupancy BLOCKED_ENV moves the complete official run to the next
+    untried card before any backoff, while ``retry_device_id`` keeps its single
+    whole-run retry and joins that pool. The managed env file may declare it via
+    ``TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS``; ``round_regime_tags`` forces one
+    regime per 1-based round position.
     """
 
     operator_name: str
@@ -262,15 +256,10 @@ def resolve_campaign_device_plan(
     """Resolve the primary card and ordered pool from CLI and managed env declarations.
 
     Explicit ``--device-ids`` cards override the env-file pool; otherwise the
-    env-file pool is the declaration source. The primary is an explicitly
-    supplied ``--device-id``, otherwise the first configured pool card, and only
-    then the legacy ``"1"``. A CLI default therefore never injects a card that
-    the managed pool did not declare.
-
-    ``visible_device_ids`` is the parent process's physical visibility set. It
-    only narrows the resolved plan: a card missing from it is never used, and a
-    plan with no visible card is a configuration error rather than an implicit
-    expansion to the full pool.
+    env-file pool is the declaration source. The primary is an explicit
+    ``--device-id``, else the first configured pool card, else the legacy ``"1"``.
+    ``visible_device_ids`` only narrows this plan; a missing card is never used and
+    an entirely invisible plan is a configuration error, not an implicit expansion.
     """
     configured = device_ids or env_device_ids
     canonical_configured = tuple(
@@ -503,20 +492,12 @@ class PendingPromotion:
 class PendingL4:
     """An official L4 execution preserved across wait timeouts and process restarts.
 
-    L4 is never split across cards: a retry on another card is a fresh, complete
-    run. The original execution/run IDs, receipt, card and candidate digest stay
-    attached so an operator can prove what happened. ``device_pool`` snapshots
-    the cards this run may use, ``blocked_env_round_attempted_device_ids``
-    records which cards the current blocked-env round already tried, and
-    ``blocked_env_rounds_used``/``blocked_env_round_limit`` bound the number of
-    complete blocked rounds, so a restart continues at the next untried card
-    instead of spending a recorded round or retry twice. A ``None`` limit marks
-    a legacy record without a stored quota; an explicit ``0`` forbids every
-    additional round. ``blocked_env_category`` keeps the signed occupancy
-    classification so a build-lock BLOCKED_ENV never rotates cards.
-    ``device_rejected`` records that V2 refused the last submitted card as
-    unauthorized; ``rejected_device_ids`` keeps every such card out of later
-    attempts so an exhausted authorization terminates after a bounded sweep.
+    L4 is never split across cards: a retry elsewhere is a complete run. The
+    original execution/run IDs, receipt, card, and candidate digest stay attached.
+    ``device_pool`` snapshots usable cards; attempted and rejected device ids keep
+    a blocked-env round and V2 refusals from repeating, while quota and occupancy
+    category fields bound backoff and prevent build-lock rotation. ``None`` quota
+    means a legacy record; explicit ``0`` forbids another round.
     """
 
     target_path: str
@@ -571,7 +552,11 @@ class PendingL4:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> PendingL4:
-        """Reconstruct a pending L4 record from a checkpoint mapping."""
+        """Reconstruct a pending L4 record from a checkpoint mapping.
+
+        Pre-pool checkpoints counted same-card retries, which are exactly
+        single-card blocked-env rounds.
+        """
         attempts = tuple(
             {str(k): str(v) for k, v in item.items()}
             for item in payload.get("attempts", ())
@@ -598,8 +583,6 @@ class PendingL4:
                     (),
                 )
             ),
-            # Checkpoints written before the pool existed counted same-card
-            # retries, which are exactly single-card blocked-env rounds.
             blocked_env_rounds_used=max(
                 0,
                 int(
@@ -4765,16 +4748,13 @@ class PerfTargetCampaignRunner:
     ) -> tuple[L4CannbenchResult, PendingL4]:
         """Move a terminal L4 run across the configured card pool.
 
-        An occupancy-blocked card or a submit refusal for an unauthorized card
-        advances immediately to the next untried card: the complete official L4
-        restarts there for the same candidate SHA, and no timings are stitched.
-        A rejected card stays excluded on every later round. Only after every
-        remaining card was occupancy-blocked does one bounded linear backoff run
-        before the next round, while a rejected-only sweep terminates without
-        spending a round. A candidate verdict, a live execution or exhausted
-        rounds leave the loop. Each submission intent is persisted before its
-        long wait, so a restart continues on the next untried card instead of
-        spending a recorded round twice.
+        An occupancy-blocked card or an unauthorized-card refusal advances immediately
+        to the next untried card: the complete official L4 restarts there for the same
+        candidate SHA, and no timings are stitched. Rejected cards stay excluded later;
+        only an all-blocked pool spends one bounded linear backoff, and a rejected-only
+        sweep terminates without a round. A candidate verdict, live execution, or
+        exhausted rounds leave the loop, and each submission intent is persisted before
+        its long wait so a restart continues on the next untried card.
         """
         pool = self._effective_l4_pool(pending)
         limit = self._effective_l4_round_limit(pending)
@@ -4935,14 +4915,12 @@ class PerfTargetCampaignRunner:
     ) -> tuple[L4CannbenchResult, PendingL4 | None]:
         """Continue the saved L4 execution, or move the complete run to another card.
 
-        A live execution has no run id and a terminal one with a run id can have
-        its signed receipt re-read; neither path submits again. A bounded wait
-        that expired is not a failure: the same execution ID is polled again on
-        the original card. A terminal BLOCKED_ENV preemption continues on the
-        next untried card of the saved pool before any bounded round backoff.
-        Any other proven-terminal infrastructure failure may start one complete
-        L4 run on the explicitly authorized alternate card, and its identity is
-        persisted before the wait. Numeric/official-validation failures are
+        A live execution or a terminal one with a signed receipt is re-read, never
+        resubmitted; an expired bounded wait polls the same execution on the original
+        card. A terminal BLOCKED_ENV preemption continues on the next untried card of
+        the saved pool before any bounded round backoff, while another proven-terminal
+        infrastructure failure may start one complete L4 run on the explicitly
+        authorized alternate card. Numeric and official-validation failures are
         verdicts and never retry; timings are never stitched.
         """
         expected = pending.candidate_sha256 or self._source_sha256(incumbent_source)

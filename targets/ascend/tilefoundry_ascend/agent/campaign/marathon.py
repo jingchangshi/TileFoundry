@@ -1458,7 +1458,11 @@ def run_operator_marathon(
     config: MarathonConfig | None = None,
     **overrides: object,
 ) -> int:
-    """Configure workspace, environment, and run ExtremeCampaignRunner."""
+    """Configure workspace, environment, and run ExtremeCampaignRunner.
+
+    Capture the parent's physical visibility before configure_marathon_process_env
+    removes it, so it may only narrow the declared device pool.
+    """
     if config is None:
         cfg = MarathonConfig(**overrides)  # type: ignore[arg-type]
     elif overrides:
@@ -1511,9 +1515,6 @@ def run_operator_marathon(
         env_file=cfg.env_file,
         source_root=_source_root,
     )
-    # configure_marathon_process_env removes the parent's visibility variable so
-    # coordinator subprocesses do not inherit a stale logical mapping. Capture
-    # the physical set first: it may only narrow the declared pool.
     visible_device_ids = parse_device_ids(
         os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
     )
