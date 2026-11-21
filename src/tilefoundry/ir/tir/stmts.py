@@ -11,14 +11,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from typing import TYPE_CHECKING
-
 from tilefoundry.ir.core import Expr, Var
 from tilefoundry.ir.tir.stmt import Stmt
 from tilefoundry.ir.types.mesh import Mesh
-
-if TYPE_CHECKING:  # the HIR package auto-imports, so a runtime import here cycles
-    from tilefoundry.ir.hir.pipeline import PipelineSpec
 
 
 @dataclass(unsafe_hash=True)
@@ -62,7 +57,7 @@ class For(Stmt):
     stop: Expr
     step: Expr
     body: Sequential
-    pipeline: PipelineSpec | None = None
+    pipeline: "PipelineSpec | None" = None
 
 
 @dataclass(unsafe_hash=True)

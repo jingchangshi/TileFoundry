@@ -94,7 +94,8 @@ template <class Axes, int Axis> CUTE_HOST_DEVICE constexpr bool is_reduced() {
         ((found = found || int(cute::remove_cvref_t<decltype(cute::get<Js>(
                                    Axes{}))>::value) == Axis),
          ...);
-    }(std::make_index_sequence<cute::tuple_size<Axes>::value>{});
+    }
+    (std::make_index_sequence<cute::tuple_size<Axes>::value>{});
     return found;
 }
 
@@ -266,7 +267,8 @@ CUTE_HOST_DEVICE constexpr reduce_dispatch_info reduce_dispatch() {
         ((thread_axis[Is] =
               mesh_t::template axis_scope<int(Is)>() == TopologyScope::thread),
          ...);
-    }(std::make_index_sequence<m_rank>{});
+    }
+    (std::make_index_sequence<m_rank>{});
 
     /// How each mesh axis divides into lanes and warps. A thread-level axis
     /// spends the lane budget, fastest axis first; a cta-level axis reduces

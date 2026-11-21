@@ -1,17 +1,12 @@
 """Effect-form TIR Ops for async completion: per-buffer flag set/wait and a drain.
 
-A completion edge is generic: a producer SETs a flag for a buffer slot at a generation,
-and a consumer WAITs for it before touching that slot. Ring depth ("versions") is an
-attribute, so the rule "slot == generation % versions" is target-agnostic.
-
-TARGET-AGNOSTIC BY DESIGN. The channel NAME, pipe names and flag id are opaque attributes
-supplied by the target (the Ascend side owns their vocabulary). The core validates only
-structure: a non-empty channel name, a known completion KIND, non-negative generation,
-positive versions, slot == generation % versions, non-negative flag id, and a legal
-pipe pair. Per-target name/scoping checks live in the target verifier.
-
-This module deliberately registers NO candidate and changes NO default, so targets that do
-not emit these ops are unaffected.
+A completion edge is generic: a producer SETs a flag for a buffer slot at a
+generation, and a consumer WAITs before touching that slot. Ring depth
+("versions") is an attribute, so "slot == generation % versions" is
+target-agnostic. Channel names, pipe names, and flag ids are opaque target
+vocabulary; this core validates structure only, leaving per-target names and
+scoping to the target verifier. No candidate or default is registered, so
+targets that do not emit these ops are unaffected.
 """
 
 from __future__ import annotations
@@ -31,11 +26,16 @@ from tilefoundry.visitor_registry.access_relation import (
 
 
 class CompletionKind(str, Enum):
-    """What a flag edge orders (target-agnostic)."""
+    """What a flag edge orders (target-agnostic).
 
-    READY = "ready"   # producer finished writing a slot; consumer may read
-    FREE = "free"     # consumer finished using a slot; producer may overwrite
-    ONCE = "once"     # a one-shot ordering edge (not ring-slotted)
+    READY: producer finished writing a slot; consumer may read.
+    FREE: consumer finished using a slot; producer may overwrite.
+    ONCE: a one-shot ordering edge, not ring-slotted.
+    """
+
+    READY = "ready"
+    FREE = "free"
+    ONCE = "once"
 
 
 _ALLOWED_KINDS = {k.value for k in CompletionKind}
@@ -91,13 +91,12 @@ _ATTRS = dict(
 
 @register_op(dialect="T", category="sync", name="flag_set")
 class FlagSet(Op):
-    """Producer SETs a completion flag for a buffer slot at a generation."""
+    """Producer SETs a completion flag for a buffer slot at a generation.
 
-    # The execution domain is the TARGET's, resolved from its own
-    # MemoryExecutionFacts. thread_execution_mesh() hard-coded the topology name
-    # "thread", the one place this module broke the target-agnostic contract its
-    # own docstring states; on Ascend that made every event op fail the kernel
-    # frame's aiv mesh with a declaration error rather than a program error.
+    The execution mesh comes from the target's own facts, so the op stays
+    target-agnostic instead of naming a topology.
+    """
+
     execution_mesh = utils.memory_execution_mesh()
 
     channel_name = _ATTRS["channel_name"]
@@ -160,9 +159,11 @@ def _verify_flag_wait(call, ctx) -> None:
 
 @register_verify_stmt(Drain)
 def _verify_drain(call, ctx) -> None:
-    # A drain carries no operands or attributes; its position is checked at function
-    # level by the target verifier (it must be the final statement and must follow all
-    # flag waits).
+    """A drain carries no operands or attributes.
+
+    Its position is checked at function level by the target verifier: it must be
+    the final statement and must follow all flag waits.
+    """
     return None
 
 

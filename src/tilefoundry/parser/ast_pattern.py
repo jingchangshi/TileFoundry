@@ -34,11 +34,11 @@ from tilefoundry.ir.core.expr import Tuple as IrTuple
 from tilefoundry.ir.core.kinds import BinaryKind, UnaryKind
 from tilefoundry.ir.core.module import Module, ModuleList
 from tilefoundry.ir.core.op_schema import OpSchema
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.math.unary import Unary
-from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.sharding.local import Local
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
@@ -106,6 +106,11 @@ _TYPE_INFER_CONTEXT = "<type_infer_context>"
 
 
 def _hardware_context(target: Target | None) -> dict[str, object]:
+    """Return the hardware storage context for *target*, admitting register classes.
+
+    UMAT and CARRIER are register classes, not memory levels: the execution mode
+    (register_storages) decides where CARRIER may actually live.
+    """
     if target is None:
         return {}
     try:
@@ -113,8 +118,6 @@ def _hardware_context(target: Target | None) -> dict[str, object]:
     except UnsupportedCapabilityError:
         return {}
     allowed = tuple(resolve_storage(level.name) for level in facts.explicit_levels)
-    # CARRIER is a register class, not a memory level: it is admitted like UMAT is, and
-    # the execution mode (register_storages) decides where it may actually live.
     return {"allowed_storage": (*allowed, StorageKind.UMAT, StorageKind.CARRIER)}
 
 

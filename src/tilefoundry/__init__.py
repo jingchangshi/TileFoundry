@@ -12,26 +12,6 @@ from importlib.metadata import version as _distribution_version
 
 # ruff: noqa: I001 -- curated re-export order; alphabetical sort breaks staged imports.
 
-try:
-    __version__ = _distribution_version("tilefoundry")
-    __version_source__ = "installed"
-except PackageNotFoundError:  # clean archive: no installed egg-info, still importable
-    __version__ = "0.0.0+unknown"
-    __version_source__ = "fallback-uninstalled"
-
-
-def require_version() -> str:
-    """Return the distribution version only when it is authoritative.
-
-    A fallback version is deliberately NOT a normal version: features that gate on
-    version compatibility must call this (or check __version_source__) and fail by
-    name instead of accepting 0.0.0+unknown.
-    """
-    if __version_source__ != "installed":
-        raise RuntimeError("VERSION_SOURCE_FALLBACK: tilefoundry distribution metadata is not installed")
-    return __version__
-
-
 from tilefoundry.ir.core import (
     DispatchRegistry,
     Call,
@@ -96,6 +76,26 @@ from tilefoundry.module import module
 
 from tilefoundry.compile import build, compile, jit, normalize_to_module, CompilerOptions
 from tilefoundry.inspection.viewer import Viewer as _Viewer
+
+
+try:
+    __version__ = _distribution_version("tilefoundry")
+    __version_source__ = "installed"
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"
+    __version_source__ = "fallback-uninstalled"
+
+
+def require_version() -> str:
+    """Return the distribution version only when it is authoritative.
+
+    A fallback version is deliberately NOT a normal version: features that gate on
+    version compatibility must call this (or check __version_source__) and fail by
+    name instead of accepting 0.0.0+unknown.
+    """
+    if __version_source__ != "installed":
+        raise RuntimeError("VERSION_SOURCE_FALLBACK: tilefoundry distribution metadata is not installed")
+    return __version__
 
 
 _register_dim_typeinfer()

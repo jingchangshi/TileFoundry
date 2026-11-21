@@ -8,8 +8,8 @@ import isl
 
 from tilefoundry.ir.core import Expr, Var, get_metadata
 from tilefoundry.ir.core.expr import SSAValue
-from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.execution_region import ExecutionRegion
+from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.isl_interop import dim_range
 from tilefoundry.ir.types import Mesh, Topology

@@ -1,12 +1,19 @@
-"""Registered HIR-to-TIR candidate pairings."""
+"""Registered HIR-to-TIR candidate pairings.
+
+Target-scoped candidates are not global candidates: they are offered only when
+that target lowers the program. Keeping them out of ``_CANDIDATES`` is
+deliberate, because appending an Ascend op to the global HIR Binary/Copy list
+would make ``sole_candidate`` return None for every target, including CUDA,
+whose default has to stay byte-identical.
+"""
 
 from __future__ import annotations
 
 import importlib
 import pkgutil
 
-from tilefoundry.ir.core.expr import Call
 from tilefoundry.ir.core.execution import region_requirement
+from tilefoundry.ir.core.expr import Call
 from tilefoundry.ir.core.op import Op, op_identifier
 from tilefoundry.ir.core.param_def import MemoryEffect, collect_param_defs
 from tilefoundry.ir.hir.schedule import ScheduleRefusal
@@ -14,12 +21,6 @@ from tilefoundry.ir.hir.schedule import ScheduleRefusal
 _CANDIDATES: dict[type, list[type]] = {}
 _CALLBACKS: dict[type, object] = {}
 
-#: Target-scoped candidate instructions, keyed by (target name, HIR op type).
-#:
-#: These are NOT global candidates: they are only offered when that target is the one
-#: lowering the program. Keeping them out of _CANDIDATES is deliberate -- appending an
-#: Ascend op to the global HIR Binary/Copy list would make sole_candidate return None
-#: for every target (including CUDA), and the default has to stay byte-identical.
 _TARGET_CANDIDATES: dict[tuple[str, type], list[type]] = {}
 
 
@@ -98,15 +99,12 @@ def candidate_operands(call, op_type, *, target=None):
 def sole_candidate(hir_op: Op, *, target=None, inside: bool = False, active_kind=None) -> Op | None:
     """The single registered instruction, or None when the choice is not the default.
 
-    With ``target=None`` this is the historical, GLOBAL query: exactly one globally
-    registered carrier for the HIR op, resolved from same-named attributes. That is the
-    behaviour every existing caller (and CUDA) depends on, so it is unchanged.
-
-    With a ``target`` supplied, target-scoped candidates are offered first: the result is
-    the target-resolved instruction for the requested placement, ``None`` if the target
-    declares no scoped candidate for this op (fall back to the global query), and a
-    ``ScheduleRefusal`` if the scoped set is ambiguous or cannot fit. This is what makes
-    selection target-aware in one place instead of a later converter-only substitution.
+    ``target=None`` is the historical GLOBAL query: exactly one globally registered
+    carrier for the HIR op, resolved from same-named attributes, unchanged for every
+    existing caller and for CUDA. With a ``target``, target-scoped candidates are
+    offered first: the target-resolved instruction for the requested placement,
+    ``None`` if the target scopes nothing for this op (fall back to the global
+    query), and ``ScheduleRefusal`` if the scoped set is ambiguous or cannot fit.
     """
     if target is not None:
         scoped = select_instruction(hir_op, target=target, inside=inside, active_kind=active_kind)
@@ -194,17 +192,13 @@ def _storages_fit(declared: tuple, actual: tuple) -> bool:
 def select_instruction(hir_op, *, target, inside: bool, active_kind=None):
     """Target-aware automatic instruction for one HIR op, or None if target declares none.
 
-    Resolution, in one place shared by lowering and reporting:
-    * ask only the TARGET-scoped candidates (global list untouched);
-    * keep those whose DECLARED placement matches where the op sits -- "inside" for a
-      mode-scoped generic op, "outside" otherwise -- and, inside, whose declared kind is
-      the active mode;
-    * among those, keep those whose declared operand storages fit the actual operands;
-    * exactly one -> select it; more than one -> refuse as ambiguous; none -> refuse with
-      the candidates it did have.
-
-    Returns None only when the target declares NO scoped candidate for this HIR op, so the
-    caller keeps the existing global selection (this is what leaves CUDA byte-identical).
+    Only TARGET-scoped candidates are considered (the global list is untouched). One
+    fits when its declared placement matches where the op sits -- inside for a
+    mode-scoped generic op, outside otherwise -- its declared kind is the active
+    mode when inside, and its operand storages fit. Exactly one fits -> select it;
+    more -> refuse as ambiguous; none -> refuse naming the candidates it had. None
+    is returned only when the target declares no scoped candidate, so callers keep
+    global selection and CUDA stays byte-identical.
     """
     call = hir_op if isinstance(hir_op, Call) else None
     target_op = call.target if call is not None else hir_op

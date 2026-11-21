@@ -1,23 +1,19 @@
 """Fixed-interval modulo scheduling: the single constraint path.
 
-One core; the Tensor-Foundry and TileLang adapters only project into it. An authored
-stage is a constant, an authored Fixed(V) is an equality, and the model value is
-exported unchanged.
-
-    t_u = II * stage_u + phase_u,  0 <= phase_u < II
-    t_dst + distance * II >= t_src + latency
-    t_next_writer + (V + delta) * II >= t_last_reader + read_latency
-    delta_slot = ((t_v + offset_v) - (t_u + offset_u)) mod II
-    q_u <= delta_slot AND q_v <= II - delta_slot
-    sum(V_b * slot_bytes_b) <= usable_bytes   per (space, owner)
-
-The resource condition is a conjunction: two cyclic intervals on one capacity-1
-resource must not overlap, so each has to fit ahead of the other. A disjunction
-would accept II=1 with two unit tasks, which is an overlapping schedule.
+Timing is t_u = II*stage_u + phase_u, 0 <= phase_u < II; edges obey
+t_dst + distance*II >= t_src + latency; writer/reader pairs obey
+t_next_writer + (V + delta)*II >= t_last_reader + read_latency; cyclic offsets
+obey delta_slot = ((t_v + offset_v) - (t_u + offset_u)) mod II, q_u <= delta_slot
+and q_v <= II - delta_slot; and sum(V_b * slot_bytes_b) <= usable_bytes per
+(space, owner). The resource condition is a conjunction: two cyclic intervals
+on one capacity-1 resource must each fit ahead of the other, never a disjunction.
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
+from importlib.util import find_spec
+from pathlib import Path
 
 SAT = "SAT"
 UNSAT = "UNSAT"
@@ -197,7 +193,11 @@ def _buffer_map(problem):
 
 
 def lower_bound_ii(problem):
-    """A necessary lower bound on II: it narrows the search and never decides it."""
+    """A necessary lower bound on II: it narrows the search and never decides it.
+
+    A zero-distance self edge is ``t >= t + latency``: trivially true at latency
+    0 and infeasible otherwise, which solve decides rather than the bound.
+    """
     bound = 1
     per_resource = {}
     for task in problem.tasks:
@@ -208,8 +208,6 @@ def lower_bound_ii(problem):
         bound = max(bound, max(per_resource.values()))
     for edge in problem.edges:
         if edge.src != edge.dst or edge.distance == 0:
-            # A zero-distance self edge is t >= t + latency: trivially true for
-            # latency 0 and infeasible otherwise (decided in solve, not by a bound).
             continue
         bound = max(bound, -(-edge.latency // edge.distance))
     return bound
@@ -267,7 +265,15 @@ def _issue_order(problem, phases, by_name):
 
 
 def solve(problem, ii, timeout_ms=None):
-    """Decide one fixed II. Returns (status, Assignment | None, detail)."""
+    """Decide one fixed II. Returns (status, Assignment | None, detail).
+
+    A manual list pins unannotated siblings to stage 0 rather than letting them
+    drift. Within one cycle, issue order is physical: an earlier-issued task may
+    not sit at a later phase, and same-phase ties follow ``_issue_order``.
+    Capacity constraints exist only for a space that publishes a usable size; a
+    space without a fact stays unconstrained here and must stay UNRESOLVED in the
+    storage plan, never treated as infinite.
+    """
     if not isinstance(ii, int) or ii < 1:
         raise SolverError("SOLVER_II", "II must be a positive int")
     by_name = _task_map(problem)
@@ -284,7 +290,7 @@ def solve(problem, ii, timeout_ms=None):
         return SAT, Assignment(ii=ii, starts={}, stages={}, phases={}, versions={},
                                issue_order=(), detail="EMPTY_PROBLEM"), "EMPTY_PROBLEM"
     try:
-        import z3
+        import z3  # noqa: PLC0415
     except ImportError:
         return UNKNOWN, None, "Z3_UNAVAILABLE"
     solver = z3.Solver()
@@ -302,8 +308,6 @@ def solve(problem, ii, timeout_ms=None):
         elif task.stage is not None:
             solver.add(stage[task.name] == task.stage)
         else:
-            # A manual list pins unannotated siblings to stage 0: they are not
-            # free to drift because some sibling declared a stage.
             solver.add(stage[task.name] == 0)
 
     def start(name):
@@ -339,13 +343,7 @@ def solve(problem, ii, timeout_ms=None):
                 solver.add(first_quantity <= delta)
                 solver.add(second_quantity <= ii - delta)
     for earlier, later in problem.issue_after:
-        # Emission order is physical: within one cycle the earlier-issued task may
-        # not sit at a later phase. Same-phase ties are settled by the linear
-        # extension recorded in issue_order.
         solver.add(phase[earlier] <= phase[later])
-    # Capacity constraints exist only for a space that publishes a usable size.
-    # A space without a fact is unconstrained here and must stay UNRESOLVED in the
-    # storage plan; treating it as infinite would be the backfill this core refuses.
     for capacity in problem.capacities:
         terms = [version[buffer.name] * buffer.slot_bytes for buffer in problem.buffers
                  if buffer.space == capacity.space and buffer.owner == capacity.owner]
@@ -471,15 +469,10 @@ def verify_assignment(problem, assignment):
 
 def core_source_sha256() -> str:
     """Content identity of this core, for provenance without a second digest."""
-    import hashlib
-    from pathlib import Path
-
     return "sha256:" + hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def _z3_available() -> bool:
-    from importlib.util import find_spec
-
     return find_spec("z3") is not None
 
 

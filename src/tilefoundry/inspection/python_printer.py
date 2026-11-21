@@ -33,11 +33,11 @@ from tilefoundry.ir.core.expr import SSAValue
 from tilefoundry.ir.core.kinds import BinaryKind, UnaryKind
 from tilefoundry.ir.core.module import Module, ModuleList
 from tilefoundry.ir.core.param_def import variadic_item_annotation
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.math.unary import Unary
-from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.specialize import (
     canonical_specialization_signature,
@@ -735,7 +735,6 @@ def _emit_def(
             for _ in iter_exprs(expr.body, _mesh_region_internal_ids):
                 pass
         elif isinstance(expr, ExecutionRegion):
-            # The body belongs inside the region's with-block, not beside it.
             for _ in iter_exprs(expr.body, _execution_region_internal_ids):
                 pass
 
@@ -942,6 +941,11 @@ def _emit_def(
         printed.add(key)
 
     def _emit_loop_region(region: LoopRegion, level: str) -> None:
+        """Emit a loop region, recognising a pipelined loop first.
+
+        Printing a pipelined loop as range()/tf.tile() would erase the authored
+        declaration on a print->parse roundtrip, so it prints as itself.
+        """
         key = id(region)
         if key in printed:
             return
@@ -960,10 +964,6 @@ def _emit_def(
         start = printer.visit(region.start, ctx)
         pipeline = getattr(region, "pipeline", None)
         if pipeline is not None:
-            # A pipelined loop is recognised FIRST and printed as itself. Falling
-            # through to range()/tf.tile() would erase the declaration on a
-            # print->parse roundtrip, so the intent would silently disappear from
-            # anything that round-trips through source.
             loop = _pipeline_loop_surface(pipeline, extent)
         elif id(region.induction_var) in _tile_window_steps:
             loop = (

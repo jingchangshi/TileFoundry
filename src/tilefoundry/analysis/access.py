@@ -8,8 +8,8 @@ from enum import IntEnum
 import isl
 
 from tilefoundry.ir.core import Call, Constant, Expr, SSAValue, Tuple, Var
-from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.execution_region import ExecutionRegion
+from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.schedule import ScheduleOp, instruction_schema
 from tilefoundry.ir.hir.sharding.local import Local

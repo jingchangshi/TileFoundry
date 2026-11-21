@@ -4731,6 +4731,11 @@ class WithPattern(ElementPattern):
 
     @staticmethod
     def construct(match, children, context):
+        """Construct one parsed ``with`` block as an execution scope or mesh region.
+
+        In TIR a mode is a lexical scope without yield or captures, so the printed
+        form reloads as the scope rather than as a region.
+        """
         if context.function is None:
             raise ParseError.from_node(match.node, context, "`with` requires function context")
         kind = match.captures.get("kind")
@@ -4745,10 +4750,6 @@ class WithPattern(ElementPattern):
             if active_kind is not kind:
                 raise ParseError.from_node(match.node, context, "Execution stack is unbalanced")
             if context.function.dialect != "hir":
-                # The same surface, read back as the statement it lowers to. A
-                # TIR function has no yield and no region captures: it is a
-                # straight-line body in which the mode is a lexical scope, so the
-                # printed form reloads as the scope rather than as a region.
                 return runtime.ExecutionScope(kind=kind.name, body=children["body"])
             return WithPattern._construct_execution(match, children, context, kind, frame)
         mesh = children["mesh"]
@@ -5069,14 +5070,16 @@ def _pipelined_iterator_callee():
 
 
 def _loop_iterator_kind(call: ast.Call) -> str | None:
-    """Recognize the iterator surface shared by syntax and diagnostics."""
+    """Recognize the iterator surface shared by syntax and diagnostics.
+
+    The pipeline iterator is only ``tf.pipelined``; a bare ``pipelined`` name is not
+    accepted, matching ``tf.tile`` being the only tile spelling.
+    """
     callee = call.func
     if isinstance(callee, ast.Name) and callee.id in {"tile", "range"}:
         return "bare_tile" if callee.id == "tile" else "range"
     if _tile_iterator_callee().match(callee, None) is not None:
         return "tile"
-    # The pipeline iterator is expressed only as tf.pipelined(stop, ...).
-    # Bare 'pipelined' is not accepted, matching how tf.tile is the only spelling.
     if _pipelined_iterator_callee().match(callee, None) is not None:
         return "pipelined"
     return None
@@ -5157,9 +5160,6 @@ def _reads_program_value(node: ast.AST, context: MatchContext) -> bool:
     )
 
 
-#: The only keywords tf.pipelined accepts at D0. Anything else is named, never
-#: quietly ignored: an annotation the author believes in and the compiler drops is
-#: worse than a refusal.
 _PIPELINE_KEYWORDS = frozenset({"max_stage", "fixed_ii", "max_buffer_versions",
                               "task_intents", "buffer_schedules", "enable_offset"})
 
@@ -5169,10 +5169,14 @@ def _pipeline_spec_from_keywords(call: ast.Call):
 
     Every value must be a LITERAL. D0 has no way to carry "resolve the stage count
     later" without pretending a solver already ran, so a symbolic or computed
-    expression is a refusal rather than a deferred unknown.
+    expression is a refusal rather than a deferred unknown. Unknown keywords are
+    refused by name rather than quietly ignored.
     """
     from tilefoundry.ir.hir.pipeline import (  # noqa: PLC0415
-        BufferSchedule, PipelineError, PipelineSpec, TaskIntent,
+        BufferSchedule,
+        PipelineError,
+        PipelineSpec,
+        TaskIntent,
     )
 
     def task_intents_from_literal(value):
@@ -5250,7 +5254,7 @@ def _pipeline_spec_from_keywords(call: ast.Call):
 def _iterator_arity_failure(kind: str, count: int, node: ast.Call) -> PatternFailure | None:
     """Describe an invalid tile/range arity, if this call has one."""
     if kind == "pipelined":
-        return None  # validated in enter(), which names the reason
+        return None
     if count in ({2, 3} if kind == "tile" else {1, 2, 3}):
         return None
     if kind == "tile" and count == 1:
@@ -5298,6 +5302,7 @@ class LoopHeaderPattern(ElementPattern):
         The syntax encodes each iterator's arity so the generated grammar shows
         what the parser accepts. A shape mismatch alone would report only that
         the pattern did not match, so the specific reason is stated here first.
+        Only ``tf.pipelined`` accepts keyword arguments; tile/range stay positional.
         """
         if isinstance(node, ast.For) and isinstance(node.iter, ast.Call):
             kind = _loop_iterator_kind(node.iter)
@@ -5312,8 +5317,6 @@ class LoopHeaderPattern(ElementPattern):
                     node.iter.func,
                     "loop iterator must be tf.tile(...) or range(...)",
                 )
-            # tf.pipelined is the ONE iterator that takes keywords (max_stage,
-            # annotations); tile/range stay positional-only at the IR level.
             if node.iter.keywords and kind != "pipelined":
                 return PatternFailure(
                     "loop_header",
@@ -5328,6 +5331,11 @@ class LoopHeaderPattern(ElementPattern):
     def enter(
         node: object, context: MatchContext, matched: AstMatch[Any]
     ) -> AstMatch[Any] | MatchFailure | None:
+        """Enter one loop header, carrying ``tf.pipelined`` intent onto the TIR loop.
+
+        ``tf.pipelined(stop)`` uses start 0, step 1; the exclusive stop becomes the
+        extent and stays the one authority for the loop bound.
+        """
         assert isinstance(node, ast.For)
         assert isinstance(node.target, ast.Name)
         assert isinstance(node.iter, ast.Call)
@@ -5343,9 +5351,6 @@ class LoopHeaderPattern(ElementPattern):
             return failure
         pipeline = None
         if kind == "pipelined":
-            # tf.pipelined(stop, ...) -> start 0, step 1. The single positional
-            # argument is the EXCLUSIVE stop; it also becomes extent, which stays
-            # the one authority for the loop bound.
             if count != 1:
                 return PatternFailure(
                     "loop_header",

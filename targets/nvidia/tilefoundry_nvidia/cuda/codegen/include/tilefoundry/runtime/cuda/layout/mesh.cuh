@@ -46,7 +46,8 @@ template <class TLayout, TopologyScope... Topos> struct Mesh {
                      first += width;
                  }()),
                  ...);
-            }(std::make_index_sequence<sizeof...(Topos)>{});
+            }
+            (std::make_index_sequence<sizeof...(Topos)>{});
             return found;
         }
     }
@@ -217,7 +218,8 @@ CUTE_HOST_DEVICE constexpr bool is_warped(Mesh<L, Topos...> const &mesh) {
                 (int(cute::get<Is + 1>(cute::stride(ids_t{}))) % kWarpSize ==
                  0) &&
                 ...);
-        }(std::make_index_sequence<r - 1>{});
+        }
+        (std::make_index_sequence<r - 1>{});
     }
 }
 

@@ -24,6 +24,8 @@ class TensorView(Op):
     ``shape`` overrides the logical shape. When omitted, it is inherited only
     from a syntactic ``PtrOf(tensor)`` input. Integer inputs are byte offsets
     from the dynamic shared-memory base and require dtype, storage, and shape.
+    A view states how a value is addressed, so it registers as structural and
+    may appear wherever its base does.
     """
 
     pointer = ParamDef(kind="input")
@@ -33,10 +35,6 @@ class TensorView(Op):
     shape = ParamDef(kind="attribute", annotation=tuple, default=None)
 
 
-# A view states how a value is addressed, not what computes it: it is admissible
-# wherever its base is, and the base carries the placement question. Registering
-# it as structural is what stops operand views from having to masquerade as
-# vector instructions to survive inside a mode.
 register_structural(TensorView)
 
 

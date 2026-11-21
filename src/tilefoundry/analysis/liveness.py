@@ -7,9 +7,9 @@ from typing import ClassVar
 
 from tilefoundry.ir.core import Call, Constant, Expr, IRMetadata, Var, get_metadata
 from tilefoundry.ir.core.expr import SSAValue
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
-from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.tensor.empty import Empty
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem

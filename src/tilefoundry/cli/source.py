@@ -49,8 +49,6 @@ def checked_program(
         checked, entry = check_program(module, authored, topology_level=topology_level, dims=bound)
     except SpecializationError as error:
         raise ValueError(f"{command}: {error}") from None
-    # check_program/specialize returns CLONED functions. Rebind the copied typed object
-    # refs to the clone's own children/buffers before any consumer reads Program.entry.
     rebind_cloned_pipeline_references(checked)
     return Program(authored, checked, entry)
 

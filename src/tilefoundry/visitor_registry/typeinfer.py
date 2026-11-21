@@ -11,9 +11,9 @@ from tilefoundry.ir.core.metadata import (
     detach_metadata,
 )
 from tilefoundry.ir.core.module import ModuleList
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
-from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.isl_interop import dim_range
@@ -363,7 +363,7 @@ class TypeInferVisitor(ValuationVisitor[Type]):
         because a region whose boundary is wrong has no meaning whatever its body
         computes.
         """
-        from .verify import verify_region_isolated, verify_execution_boundary  # noqa: PLC0415
+        from .verify import verify_execution_boundary, verify_region_isolated  # noqa: PLC0415
 
         memo = self._region_memo(expr, ctx)
         verify_region_isolated(expr, ctx)

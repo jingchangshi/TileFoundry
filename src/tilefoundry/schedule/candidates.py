@@ -8,10 +8,10 @@ from tilefoundry.analysis.metadata import ExecutionMeshMetadata
 from tilefoundry.inspection import PatternPrinter, PythonPrinter
 from tilefoundry.ir.core import Call, OpCapability, get_metadata, op_identifier, value_label
 from tilefoundry.ir.core.metadata import SourceSpanMetadata
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.schedule import ScheduleRefusal, match_instruction
 from tilefoundry.ir.types import StorageKind, TensorType
 from tilefoundry.ir.types.dim import is_dim_op_call
-from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.visitor import collect_exprs, expr_children
 from tilefoundry.schedule._reporting import capability_families
 from tilefoundry.target import Target
@@ -20,7 +20,6 @@ from tilefoundry.visitor_registry.buffer_alias import aliased_operand
 from tilefoundry.visitor_registry.candidates import (
     candidate_operands,
     candidate_ops,
-    select_instruction,
     sole_candidate,
     target_candidate_ops,
 )
@@ -41,19 +40,13 @@ def _instructions(target: Target) -> tuple[tuple[type, OpCapability], ...]:
 def _execution_context(function) -> dict[int, str]:
     """Call id -> the ACTIVE execution kind where that call lexically executes.
 
-    Classification is by LEXICAL definition/evaluation context, not by recursive
-    data-dependency reachability:
-
-    * an ExecutionRegion ARGS are the captured values and are evaluated in the
-      ENCLOSING context; a producer whose result a VF body captures is still lexically
-      outside and must NOT be reported as inside (that mistake dropped gm_to_ub from the
-      outside default set);
-    * only the region BODY executes in the region kind, and that kind is the ACTIVE kind
-      for everything reachable through it until an inner region changes it.
-
-    Returning the kind (not just a boolean) is what lets the report resolve placement
-    with the same active-kind rule the lowering uses; a call absent from the map is
-    outside every execution region.
+    Classification is lexical, not data-dependency reachability: an
+    ExecutionRegion's args are captured values evaluated in the ENCLOSING
+    context, so a producer whose result a VF body captures is lexically outside;
+    only the region BODY executes in the region kind, which stays active until
+    an inner region changes it. Returning the kind rather than a boolean lets
+    the report resolve placement by the same active-kind rule the lowering uses;
+    a call absent from the map is outside every execution region.
     """
     active: dict[int, str] = {}
     stack: list[tuple[object, str | None]] = [(function.body, None)]
@@ -75,7 +68,14 @@ def _execution_context(function) -> dict[int, str]:
 def candidates(
     module, entry, *, source: str | None = None
 ) -> dict[str, Any]:
-    """Report instructions for a program ``check_program`` returned."""
+    """Report instructions for a program ``check_program`` returned.
+
+    Global carriers are extended by the ones this target scopes to the same HIR
+    op, so a generic unscheduled op is reportable and selectable for Ascend
+    without changing the global list a CUDA program sees. A call whose target
+    scopes candidates but fits none reports no default rather than inventing one;
+    the lowering path raises the same refusal.
+    """
     target = module.resolve_target()
     contexts = {}
     frames = tuple(ValuationVisitor.definitions(ValuationContext(module, entry)))
@@ -106,9 +106,6 @@ def candidates(
             or not isinstance(call.type, TensorType)
         ):
             continue
-        # Global carriers plus the ones THIS target scopes to the same HIR op. The
-        # scoped ones are what let a generic, unscheduled op be reported/selected for
-        # Ascend without changing the global list a CUDA program sees.
         instructions = candidate_ops(type(call.target)) + target_candidate_ops(
             target, type(call.target)
         )
@@ -127,8 +124,6 @@ def candidates(
                 call, target=target, inside=active_kind is not None, active_kind=active_kind
             )
         except ScheduleRefusal:
-            # The target scopes candidates but none fits this call; report no default
-            # rather than inventing one. The lowering path raises the same refusal.
             default_op = None
         for op_type, capability in declared:
             if op_type not in instructions:

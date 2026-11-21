@@ -5,9 +5,9 @@ from __future__ import annotations
 from tilefoundry.inspection.print_context import TirPrintContext
 from tilefoundry.inspection.printer_base import PythonPrinter
 from tilefoundry.ir.core import Call, Constant, Op, Tuple, Var
+from tilefoundry.ir.core.execution import execution_kind
 from tilefoundry.ir.core.kinds import BinaryKind
 from tilefoundry.ir.core.module import Module, ModuleList
-from tilefoundry.ir.core.execution import execution_kind
 from tilefoundry.ir.core.param_def import collect_param_defs
 from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.ir.hir.tensor.slice import Slice
@@ -17,7 +17,6 @@ from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.shape import ShapeOf
 from tilefoundry.ir.tir.stmts import (
     Evaluate,
-    ExecutionScope,
     For,
     LetStmt,
     MeshScope,
@@ -266,13 +265,11 @@ class TirPrinter(PythonPrinter, StmtVisitor[list[str]], ExprVisitor[str]):
 
         A bound may name a coordinate of an enclosing mesh -- a CTA grid deals
         each CTA its own tiles -- and which scope binds that mesh is what the
-        print context holds, so the bounds are rendered through it.
+        print context holds, so the bounds are rendered through it. A pipelined
+        loop prints its declaration explicitly, so a reparse preserves intent.
         """
         pipeline = getattr(stmt, "pipeline", None)
         if pipeline is not None:
-            # A TIR roundtrip must rebuild the declaration explicitly. Printing a
-            # plain range() here would drop the authored intent and the reparsed
-            # program would silently differ from the one that was lowered.
             parts = ["max_stage=%d" % pipeline.max_stage,
                      "max_buffer_versions=%d" % pipeline.max_buffer_versions,
                      "enable_offset=%s" % ("True" if pipeline.enable_offset else "False")]

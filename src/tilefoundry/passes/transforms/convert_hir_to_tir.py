@@ -3,6 +3,8 @@
 The pass consumes a memory analysis and lowers each retained definition once.
 StoragePlan interprets raw allocation decisions and registered access
 relations; the visitor writes the resulting declarations and statements.
+Dimension-form binary ops cover add/sub/mul/floor_div/mod/min only: minimum is
+the sole added dim op, lowered as a value-form dim call, never a thread Where.
 """
 
 from __future__ import annotations
@@ -70,7 +72,6 @@ from tilefoundry.ir.types import (
     TensorType,
     TupleType,
 )
-from tilefoundry.ir.types.dtype_view import DtypeViewError, DtypeViewSpec, validate_view
 from tilefoundry.ir.types.dim import (
     DimAdd,
     DimFloorDiv,
@@ -82,6 +83,7 @@ from tilefoundry.ir.types.dim import (
     is_dim_op_call,
     simplify_dim,
 )
+from tilefoundry.ir.types.dtype_view import DtypeViewError, DtypeViewSpec, validate_view
 from tilefoundry.ir.types.int_tuple import flatten as flatten_tuple
 from tilefoundry.ir.types.layout import flatten
 from tilefoundry.ir.types.layout import get as get_layout
@@ -126,8 +128,6 @@ _DIM_BINARY = {
     BinaryKind.MUL: DimMul,
     BinaryKind.FLOOR_DIV: DimFloorDiv,
     BinaryKind.MOD: DimMod,
-    # rank-0 pure-value minimum (03-24 ragged ownership): the ONLY added dim op. It lowers to a
-    # value-form dim call, never to the thread-level Where; maximum/select are NOT added.
     BinaryKind.MIN: DimMin,
 }
 
@@ -138,7 +138,10 @@ class LoweringError(ValueError):
 
 @dataclass(frozen=True, eq=False)
 class View:
-    """An address recipe, materialized only in its consuming scope."""
+    """An address recipe, materialized only in its consuming scope.
+
+    ``ssa`` is the in-run HIR identity used for escape pairing; it is never serialized.
+    """
 
     base: Expr | View
     starts: tuple[Expr, ...]
@@ -146,7 +149,7 @@ class View:
     type: TensorType
     stem: str = "tile"
     whole_tensor: bool = False
-    ssa: int | None = None  # in-run HIR SSA identity for escape pairing (never serialized)
+    ssa: int | None = None
 
 
 @dataclass
@@ -161,15 +164,17 @@ class TirScope:
 
 @dataclass
 class TirBuilder:
-    """The only component that declares values and appends TIR statements."""
+    """The only component that declares values and appends TIR statements.
+
+    ``invariant`` records values proven region-invariant by construction, with the
+    reason. Only explicitly marked values are exempt from the escape check; it is a
+    class, not a blanket allowance.
+    """
 
     blocks: list[TirScope]
     loops: list = field(default_factory=list)
     loop_nodes: dict = field(default_factory=dict)
     stage_counters: dict = field(default_factory=dict)
-    # Values proven REGION-INVARIANT by construction, with the reason they are invariant.
-    # Only explicitly marked values are exempt from the escape check; this is a class, not
-    # a blanket allowance.
     invariant: dict = field(default_factory=dict)
 
     def mark_invariant(self, value, reason: str):
@@ -195,6 +200,11 @@ class TirBuilder:
 
     @contextmanager
     def region(self, *, owner=None, mesh=None, binding=None, loop=None, execution=None):
+        """Open one lexical scope and carry authored pipeline intent onto its For.
+
+        The intent is stored as a typed field so a TIR roundtrip rebuilds it; it is
+        not consumed here, and a D0 For still runs serially.
+        """
         if mesh is not None and owner is None:
             current = self.blocks[-1].mesh
             if current is not None and current == mesh:
@@ -242,17 +252,19 @@ class TirBuilder:
         elif execution is not None:
             self.add(ExecutionScope(execution, self.build(region)))
         elif loop is not None:
-            # The authored pipeline intent is CARRIED onto the TIR For as a typed
-            # field, so a TIR roundtrip rebuilds it instead of losing it to a
-            # default. It is not consumed here: a D0 for still runs serially, and
-            # reading this as "a schedule exists" would be a false claim.
             for_stmt = For(*loop, self.build(region), pipeline=getattr(owner, "pipeline", None))
             self.add(for_stmt)
             if owner is not None:
                 self.loop_nodes[id(owner)] = for_stmt
 
     def declare(self, leaf, *, ctx, values, desired=None):
-        """Declare one allocation root in its owning scope."""
+        """Declare one allocation root in its owning scope.
+
+        A mode-private register class (RMEM element registers and CARRIER transport
+        windows) is allocated as a register, not as an addressable smem/gmem buffer:
+        a carrier has no byte address, must not be charged to the UB budget, and
+        exists only inside the region that owns it.
+        """
         expr = leaf.expr
         type_ = desired or leaves_of(expr.type)[leaf.index]
         buffers = getattr(expr.target, "buffers", 1) if isinstance(expr, Call) else 1
@@ -270,10 +282,6 @@ class TirBuilder:
                 expr.name if isinstance(expr, Var) else "value",
                 ctx.authored_values.get(id(expr)),
             )
-            # A mode-private register class (RMEM element registers and CARRIER
-            # transport windows) is allocated as a register, not as an addressable
-            # smem/gmem buffer. A carrier has no byte address and must not be charged
-            # to the UB budget; it exists only inside the region that owns it.
             if type_.storage in (StorageKind.RMEM, StorageKind.CARRIER):
                 storage_type = type_
                 var = Var(stem, type=storage_type)
@@ -378,7 +386,12 @@ class TirBuilder:
             return Call(TupleGetItem(), (stages, index), type=field)
 
     def value(self, value, *, ctx):
-        """Materialize a recipe in its consuming scope without changing it."""
+        """Materialize a recipe in its consuming scope without changing it.
+
+        A recipe carrying SSA also records the exact TIR value that carries the
+        declaration, so the final TIR walk can name its statement by structure;
+        no statement, type, or schedule decision changes.
+        """
         if not isinstance(value, View):
             return value
         scope = self.blocks[-1]
@@ -394,8 +407,6 @@ class TirBuilder:
             result = self.bind(Var(stem, type=expression.type), expression)
             if getattr(value, "ssa", None) is not None:
                 ctx.var_ssa[id(result)] = value.ssa
-                # RECORD-ONLY: remember the exact TIR value that carries this declaration, so the
-                # final TIR walk can name its statement by structure. No stmt/type/schedule change.
                 ctx._note_escape_declaration_view(ctx.escape_ssa_ref.get(value.ssa), expression)
             scope.views[id(value)] = (value, result)
         return scope.views[id(value)][1]
@@ -1130,16 +1141,18 @@ class IssuePlan:
     """Instruction selection and one shared geometric projection, without admission."""
 
     def op(self, call, ctx=None):
+        """Select the instruction for one call, honoring target-scoped candidates.
+
+        Target-aware selection lives in the candidates registry so the reporting path
+        and lowering share one rule. A target with no scoped candidate returns None
+        and falls through to the global single-candidate query.
+        """
         if isinstance(call.target, ScheduleOp):
             return call.target.op
         target = None if ctx is None else getattr(ctx, "target", None)
         inside = ctx is not None and bool(getattr(ctx, "executions", ()))
         active_kind = ctx.executions[-1] if ctx is not None and inside else None
         if target is not None:
-            # Target-aware selection lives in the candidates registry, not here: the same
-            # rule must be what the reporting path shows. A target that declares no
-            # scoped candidates for this op returns None and falls through to the global
-            # single-candidate query below, which is exactly today's behaviour for CUDA.
             try:
                 selected = select_instruction(
                     call, target=target, inside=inside, active_kind=active_kind
@@ -1218,7 +1231,14 @@ class IssuePlan:
 
 @dataclass(kw_only=True)
 class LoweringContext(TypeInferContext):
-    """Carry storage answers and shared emission state through lexical visits."""
+    """Carry storage answers and shared emission state through lexical visits.
+
+    ``escape_declaration_views`` maps an SSA group to the fresh-view Call its
+    declaration produced. Ordinals are assigned when a view is derived but the
+    LetStmt is emitted later (or never for a duplicate), so this map addresses the
+    final TIR structurally without assuming ordinal walk order. The declaration-
+    ordinal map records what each group's sites actually emitted.
+    """
 
     storage: StoragePlan
     issues: IssuePlan
@@ -1241,13 +1261,7 @@ class LoweringContext(TypeInferContext):
     escape_duplicates: list = field(default_factory=list)
     escape_ssa_ref: dict = field(default_factory=dict)
     declare_counter: int = 0
-    # RECORD-ONLY: ssa_group -> the fresh-view Call the declaration actually produced. The
-    # declaration ordinal is assigned while the view is DERIVED, but the TIR LetStmt is emitted
-    # later (or never, for a duplicate declare), so the ordinal alone cannot address a TIR
-    # statement. This map lets the final TIR be walked once and turned into stable structural
-    # paths per ssa_group, without any ordinal->walk-order assumption.
     escape_declaration_views: dict = field(default_factory=dict)
-    # RECORD-ONLY: ssa_group -> the declaration ordinals this group's sites actually emitted.
     escape_declaration_ordinals: dict = field(default_factory=dict)
     _pending_escape_ordinal: int | None = None
 
@@ -1316,15 +1330,19 @@ class LoweringContext(TypeInferContext):
                 pending.append(int(ordinal))
 
     def _note_escape_declare(self, ssa, type_, source="unknown"):
-        """Single-point record from StoragePlan.view (fresh SMEM view) with an SSA key."""
+        """Single-point record from StoragePlan.view (fresh SMEM view) with an SSA key.
+
+        A repeat of the same SSA at the same scope level does not create a second
+        record; it is counted as ESCAPE_DUPLICATE_DECLARE and the first record wins.
+        The same SSA declared in a different scope binds as the outer declaration of
+        the existing field (the weight-VF -> main-VF case).
+        """
         if getattr(type_, "storage", None) is not StorageKind.SMEM:
             return
         level = len(self.execution_records)
         key = (ssa, level)
         group = self.escape_ssa_ref.setdefault(ssa, len(self.escape_ssa_ref))
         if key in self.escape_seen:
-            # The same SSA at the same scope level must NOT create a second record. Repeats are
-            # counted as ESCAPE_DUPLICATE_DECLARE for audit; the first record wins.
             self.duplicate_declares += 1
             self.escape_duplicates.append({"ssa_group": group, "layer": level,
                                            "source": source, "event": len(self.escape_duplicates)})
@@ -1333,12 +1351,13 @@ class LoweringContext(TypeInferContext):
         self.declare_counter += 1
         ordinal = self.declare_counter
         current_scope = self.execution_records[-1]["scope_path"] if self.execution_records else None
-        # Bind the SAME SSA declared in a DIFFERENT scope (sibling scope consumer) as the outer
-        # binding of the existing field; this is the weight-VF -> main-VF case.
-        for field in reversed(self.escape_by_ssa.get(ssa, [])):
-            if field["outer_declaration_ordinal"] is None and field.get("_scope") != current_scope:
-                field["outer_declaration_ordinal"] = ordinal
-                field["outer_type"] = str(type_)
+        for escape_field in reversed(self.escape_by_ssa.get(ssa, [])):
+            if (
+                escape_field["outer_declaration_ordinal"] is None
+                and escape_field.get("_scope") != current_scope
+            ):
+                escape_field["outer_declaration_ordinal"] = ordinal
+                escape_field["outer_type"] = str(type_)
                 self._note_escape_ordinal(group, ordinal)
                 return
         self._note_escape_ordinal(group, ordinal)
@@ -1349,7 +1368,7 @@ class LoweringContext(TypeInferContext):
                      "outer_declaration_ordinal": None, "outer_consume_ordinal": None,
                      "outer_type": None, "_scope": current_scope, "_ssa_group": group}
             record["fields"].append(field)
-            self.escape_by_ssa.setdefault(ssa, []).append(field)  # in-run pairing only
+            self.escape_by_ssa.setdefault(ssa, []).append(field)
             return
         fields = self.escape_by_ssa.get(ssa)
         if fields:
@@ -1372,7 +1391,12 @@ class LoweringContext(TypeInferContext):
         raise LoweringError(f"missing lowered leaf {leaf.index} of {_label(leaf.expr)}")
 
     def result(self, expr):
-        """Select result storage using completed Visit results and root declarations."""
+        """Select result storage using completed Visit results and root declarations.
+
+        A GMEM root read at another element size is an explicit aliasing view that
+        states element size, byte offset, extent, alignment and the aliased root; an
+        unsound view is refused by name, never silently copied or converted in place.
+        """
         values = {key: value for key, (_expr, value) in self.memo.items()}
         values.update(
             (id(value), self.dim(value, self.memo))
@@ -1392,10 +1416,6 @@ class LoweringContext(TypeInferContext):
                     result = self.builder.declare(source, ctx=self, values=values)
                     self.allocations[source] = result
             if desired.storage is StorageKind.GMEM and desired.dtype != result.type.dtype:
-                # A GMEM root read at another element size is an EXPLICIT aliasing view:
-                # element size, BYTE offset, extent, alignment and the aliased root are
-                # stated, and an unsound view is refused by name. It is never a silent copy
-                # and never a fabricated in-place conversion.
                 element_bytes = desired.dtype.bit_width // 8
                 root_element_bytes = result.type.dtype.bit_width // 8
                 root_dims = tuple(result.type.shape)
@@ -1478,6 +1498,15 @@ class LoweringContext(TypeInferContext):
         return pack(expr.type)
 
     def dim(self, value, values) -> Expr:
+        """Lower one dimension operand, keeping pure value forms in value form.
+
+        Static dims become i64 constants. A named 0-d pure-value arithmetic
+        result used as a dimension is already a value-form dim expression, so
+        inlining it avoids materializing an rmem allocation outside the execution
+        region; an ordinary value use still materializes through ``builder.value``.
+        A MeshCoord used as a dimension lowers to a UMAT-typed pure value so it is
+        never treated as an rmem allocation, while its shared HIR type is unchanged.
+        """
         number = static_dim_value(value)
         if number is not None:
             return i64_const(number)
@@ -1486,10 +1515,6 @@ class LoweringContext(TypeInferContext):
             if known is None:
                 raise LoweringError(f"dimension uses unbound value {value.name!r}")
             lowered = known[1]
-            # A NAMED 0-d pure-value arithmetic result that is used as a DIMENSION is already a
-            # value-form dim expression; inlining it here avoids materializing an rmem allocation
-            # outside the execution region. This branch is on the dim() path only: an ordinary
-            # value use still goes through builder.value and is materialized as before.
             if isinstance(lowered, Constant) or (
                 isinstance(lowered, Call)
                 and isinstance(
@@ -1500,9 +1525,6 @@ class LoweringContext(TypeInferContext):
                 return lowered
             return self.builder.value(lowered, ctx=self)
         if isinstance(value, Call) and isinstance(value.target, MeshCoord):
-            # A coordinate used as a DIMENSION is a pure value: its TIR value is UMAT-typed so it
-            # is never treated as an rmem allocation outside a region. The shared HIR MeshCoord
-            # type is unchanged; only this dim-lowered TIR value is umat.
             return Call(
                 MeshCoord(mesh=value.target.mesh),
                 value.args,
@@ -1657,7 +1679,9 @@ class Lowering(ValuationVisitor[Expr | View]):
         The scope states the mode; it opens no participants, so the mesh in
         force is the one the region was entered under. The region has exactly one
         result, which is what makes register non-escape a property of the
-        produced IR rather than a promise about the body.
+        produced IR rather than a promise about the body. The record is appended
+        even when the scope has no SMEM output: an empty ``fields=[]`` is an
+        auditable scope, never a scope that was not recorded.
         """
         ctx.executions.append(region.kind)
         record = {"scope_path": f"execution_scope[{len(ctx.escape_records)}]/{region.kind}",
@@ -1670,8 +1694,6 @@ class Lowering(ValuationVisitor[Expr | View]):
         finally:
             ctx.execution_records.pop()
             ctx.executions.pop()
-            # Always recorded: 'fields=[]' (a scope with no SMEM output) is auditable and
-            # must not be confused with 'scope not recorded'.
             ctx.escape_records.append(record)
         return result
 
@@ -2124,6 +2146,15 @@ class ConvertHIRToTIR(ModulePass):
     requires = ()
 
     def run(self, module: Module) -> Module:
+        """Lower the analyzed module and record escape and declaration-site metadata.
+
+        Only fields bound to an outer view are ESCAPE records; an SMEM allocation
+        with no outer binding is a non-escape temporary, counted but not recorded
+        as an escape field. Escape declaration sites are record-only: they say
+        where the final TIR emitted each recorded declaration so the ledger can
+        address endpoints structurally, and change no statement, schedule
+        decision, or semantic value.
+        """
         result = self.analyzed
         if "memory" not in result.executed or module is not result.module:
             raise LoweringError(
@@ -2139,30 +2170,28 @@ class ConvertHIRToTIR(ModulePass):
         )
         lowering.lowered = lowering.run()
         records = lowering.context.escape_records
-        # Only fields bound to an outer view are ESCAPE records; an SMEM allocation with no outer
-        # binding is a non-escape temporary and is counted, not recorded as an escape field.
         for record in records:
             kept = []
             dropped_fields = []
-            for field in record["fields"]:
-                if field["outer_declaration_ordinal"] is None and field.get("outer_consume_ordinal") is None:
+            for escape_field in record["fields"]:
+                if (
+                    escape_field["outer_declaration_ordinal"] is None
+                    and escape_field.get("outer_consume_ordinal") is None
+                ):
                     dropped_fields.append({"scope_path": record["scope_path"],
-                                           "declaration_ordinal": field["declaration_ordinal"],
-                                           "ssa_group": field.get("_ssa_group"),
-                                           "inner_type": field["inner_type"],
+                                           "declaration_ordinal": escape_field["declaration_ordinal"],
+                                           "ssa_group": escape_field.get("_ssa_group"),
+                                           "inner_type": escape_field["inner_type"],
                                            "had_outer_binding": False})
                 else:
-                    field["field_path"] = f"out[{len(kept)}]"
-                    field["ssa_group"] = field.pop("_ssa_group", None)
-                    field.pop("_scope", None)
-                    kept.append(field)
+                    escape_field["field_path"] = f"out[{len(kept)}]"
+                    escape_field["ssa_group"] = escape_field.pop("_ssa_group", None)
+                    escape_field.pop("_scope", None)
+                    kept.append(escape_field)
             record["fields"] = kept
             record["dropped_fields"] = dropped_fields
             record["dropped_non_escape"] = len(dropped_fields)
         result.module.metadata["escape_records"] = records
-        # RECORD-ONLY: where the final TIR actually emitted each recorded declaration. The
-        # ledger consumes this to address endpoints structurally; nothing here is a statement,
-        # a schedule decision, or a semantic value.
         result.module.metadata["escape_declaration_sites"] = _escape_declaration_sites(lowering)
         result.module.metadata["duplicate_declares"] = lowering.context.duplicate_declares
         result.module.metadata["escape_duplicates"] = lowering.context.escape_duplicates
@@ -2193,7 +2222,6 @@ class ConvertHIRToTIR(ModulePass):
 
 
 def _hir_loops(node, out):
-    from tilefoundry.ir.hir.loop_region import LoopRegion
     if isinstance(node, LoopRegion):
         out.append(node)
     fields = getattr(node, "__dataclass_fields__", None)
@@ -2211,7 +2239,6 @@ def _hir_loops(node, out):
 
 
 def _tir_loops(stmt, out):
-    from tilefoundry.ir.tir.stmts import For, Sequential
     if isinstance(stmt, For):
         out.append(stmt)
     if isinstance(stmt, Sequential):
@@ -2229,12 +2256,14 @@ def _tir_loops(stmt, out):
 
 
 def _region_binding_summaries(authored_function, lowered_function, lowering=None):
-    """P1 source binding summary bound by object identity, never by names or loop order."""
+    """P1 source binding summary bound by object identity, never by names.
+
+    Loops keep visit order with duplicates removed.
+    """
     if lowering is None:
         raise LoweringError("region binding requires the active Lowering context")
     source_loops = [value[0] for value in getattr(lowering, "_memo", {}).values()
                     if type(value[0]).__name__ == "LoopRegion"]
-    # Deduplicate while preserving visit order.
     seen_loops = set()
     source_loops = [loop for loop in source_loops
                     if not (id(loop) in seen_loops or seen_loops.add(id(loop)))]

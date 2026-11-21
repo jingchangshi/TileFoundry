@@ -12,19 +12,20 @@ from typing import Iterable
 
 from tilefoundry.inspection.tir_printer import TirPrinter
 from tilefoundry.ir.core import Expr, Op, Var, VerifyError
-from tilefoundry.ir.core.execution import declared_mask_width, is_structural
+from tilefoundry.ir.core.execution import (
+    declared_kinds,
+    declared_mask_width,
+    execution_kind,
+    is_structural,
+    region_requirement,
+)
 from tilefoundry.ir.core.expr import Call, Constant
 from tilefoundry.ir.core.metadata import diagnostic_location
 from tilefoundry.ir.core.module import Module, ModuleList, resolve_symbol
+from tilefoundry.ir.core.param_def import MemoryEffect
+from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
-from tilefoundry.ir.core.param_def import MemoryEffect
-from tilefoundry.ir.core.execution import (
-    declared_kinds,
-    execution_kind,
-    region_requirement,
-)
-from tilefoundry.ir.hir.execution_region import ExecutionRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
 from tilefoundry.ir.hir.specialize import canonical_specialization_signature
@@ -36,8 +37,8 @@ from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.shape import ShapeOf
 from tilefoundry.ir.tir.stmt import Stmt
 from tilefoundry.ir.tir.stmts import (
-    ExecutionScope,
     Evaluate,
+    ExecutionScope,
     For,
     If,
     LetStmt,
@@ -62,7 +63,6 @@ from tilefoundry.ir.types.dim import (
 from tilefoundry.ir.types.layout import ComposedLayout, LayoutBase, flatten
 from tilefoundry.ir.types.mesh import Mesh, make_mesh
 from tilefoundry.ir.types.shard_layout import ShardLayout
-from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.ir.types.tensor_type import TupleType
 from tilefoundry.ir.types.utils import static_dim_value, tensor_types
 from tilefoundry.ir.visitor import ExprVisitor, collect_exprs, expr_children

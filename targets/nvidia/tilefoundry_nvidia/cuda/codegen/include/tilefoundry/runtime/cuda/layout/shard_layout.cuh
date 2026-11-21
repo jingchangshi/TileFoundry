@@ -225,7 +225,8 @@ CUTE_HOST_DEVICE constexpr bool shard_layout_is_full_broadcast() {
             true && ... &&
             attr_leaves_tensor_whole<
                 cute::remove_cvref_t<decltype(cute::get<Is>(attrs_t{}))>>());
-    }(std::make_index_sequence<cute::tuple_size<attrs_t>::value>{});
+    }
+    (std::make_index_sequence<cute::tuple_size<attrs_t>::value>{});
 }
 
 /// The layout one mesh instance holds: each tensor axis narrowed by what
@@ -240,7 +241,8 @@ CUTE_HOST_DEVICE constexpr auto local_layout(ShardLayout<L, A, M> const &sl) {
         return cute::make_layout(cute::make_shape(local_extent<Is>(sl)...),
                                  cute::make_stride(cute::stride<int(Is)>(
                                      affine_portion(sl.layout_value))...));
-    }(std::make_index_sequence<t_rank>{});
+    }
+    (std::make_index_sequence<t_rank>{});
 }
 
 /// What ``cute::slice_and_offset`` is to a Layout, this is to a ShardLayout:
@@ -263,8 +265,9 @@ local_layout_and_offset(ShardLayout<L, A, M> const &sl, Coord const &coord) {
         auto mesh_layout =
             cute::make_layout(mesh_shape, cute::unflatten(flat, mesh_shape));
         return cute::make_tuple(local_layout(sl), int(mesh_layout(coord)));
-    }(std::make_index_sequence<
-               cute::tuple_size<shard_mesh_flat_t<SL>>::value>{});
+    }
+    (std::make_index_sequence<
+        cute::tuple_size<shard_mesh_flat_t<SL>>::value>{});
 }
 }
 

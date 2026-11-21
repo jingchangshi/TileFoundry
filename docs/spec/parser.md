@@ -251,6 +251,7 @@ if                    ::= if cond-node block (block)?
 while                 ::= while cond-node block
 loop-iterator         ::= 'tf' '.' 'tile' '(' (expression ',' expression | expression ',' expression
                             ',' expression) ')'
+                          | 'tf' '.' 'pipelined' '(' expression ')'
                           | 'range' '(' (expression | expression ',' expression | expression ','
                             expression ',' expression) ')'
 loop-carry-statement  ::= expression '=' expression
@@ -264,7 +265,8 @@ mesh-context          ::= ('Mesh' | primary '.' 'Mesh') '(' (expression | ('layo
                             expression) (',' (expression | ('layout' | 'names') '=' expression))*
                             ')'
                           | expression
-with                  ::= 'with' mesh-context ('as' identifier)? ':' block
+execution-context     ::= (identifier | primary '.' identifier) '(' ')'
+with                  ::= 'with' (mesh-context | execution-context) ('as' (identifier)?)? ':' block
 slice-endpoint-binary ::= index-endpoint dim-op index-endpoint
 mesh-coordinate       ::= identifier '.' string-literal
 index-endpoint        ::= literal
@@ -362,13 +364,13 @@ function              ::= 'def' name '(' signature ')' ('->' return-type)? ':' b
 | mesh_axis | call_attribute, layout, mesh_layout, tensor_optional_slot, tensor_shape | BareMeshAxisRule | A bare Mesh placement names a one-axis mesh. | src/tilefoundry/parser/pattern_nodes.py |
 | mesh_axis | call_attribute, layout, mesh_layout, tensor_optional_slot, tensor_shape | MeshAxisBindingRule | A placement axis resolves to a lexical Mesh binding. | src/tilefoundry/parser/pattern_nodes.py |
 | mesh_axis | call_attribute, layout, mesh_layout, tensor_optional_slot, tensor_shape | MeshAxisNameRule | A named placement axis exists in its lexical Mesh. | src/tilefoundry/parser/pattern_nodes.py |
-| mesh_context | mesh_context | SelectionBindingRule | A mesh selection names a lexical Mesh binding or its constant slice. | src/tilefoundry/parser/pattern_nodes.py |
-| mesh_context | mesh_context | SelectionConstructionRule | A checked selection constructs a Mesh with its topology and offset, enters its execution scope, and defines its lexical binding. | src/tilefoundry/parser/pattern_nodes.py |
-| mesh_context | mesh_context | SelectionCoverRule | A mesh selection layout covers each selection-local index exactly once. | src/tilefoundry/parser/pattern_nodes.py |
-| mesh_context | mesh_context | SelectionLayoutFormRule | A mesh selection layout is a shape tuple or a shape/stride tuple pair. | src/tilefoundry/parser/pattern_nodes.py |
-| mesh_context | mesh_context | SelectionLevelRule | A mesh selection names exactly one topology level. | src/tilefoundry/parser/pattern_nodes.py |
-| mesh_context | mesh_context | SelectionSizeRule | A mesh selection layout has positive static extents, static strides, matching shape/stride and name ranks, and the same size as its selection. | src/tilefoundry/parser/pattern_nodes.py |
-| mesh_context | mesh_context | SelectionStrideRule | Each new mesh selection axis maps to one fixed physical stride. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | with_context | SelectionBindingRule | A mesh selection names a lexical Mesh binding or its constant slice. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | with_context | SelectionConstructionRule | A checked selection constructs a Mesh with its topology and offset, enters its execution scope, and defines its lexical binding. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | with_context | SelectionCoverRule | A mesh selection layout covers each selection-local index exactly once. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | with_context | SelectionLayoutFormRule | A mesh selection layout is a shape tuple or a shape/stride tuple pair. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | with_context | SelectionLevelRule | A mesh selection names exactly one topology level. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | with_context | SelectionSizeRule | A mesh selection layout has positive static extents, static strides, matching shape/stride and name ranks, and the same size as its selection. | src/tilefoundry/parser/pattern_nodes.py |
+| mesh_context | with_context | SelectionStrideRule | Each new mesh selection axis maps to one fixed physical stride. | src/tilefoundry/parser/pattern_nodes.py |
 | module | module_finalization | ModuleFinalizationRule | A module declaration must contain valid unique members and a resolvable entry. | src/tilefoundry/parser/ast_pattern.py |
 | module | module_function | ModuleFunctionRegistrationRule | A validated module function must be recorded in declaration order. | src/tilefoundry/parser/ast_pattern.py |
 | module | module_function | ModuleFunctionValidationRule | A module function must satisfy its root, variant, or converter role before mutation. | src/tilefoundry/parser/ast_pattern.py |

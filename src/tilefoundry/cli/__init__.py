@@ -9,7 +9,6 @@ from typing import Sequence
 
 from tilefoundry import __version__ as _tf_version
 from tilefoundry import __version_source__ as _tf_version_source
-
 from tilefoundry.analysis import AnalysisError
 from tilefoundry.cli.analyze import ANALYSES, EVIDENCE, run_authored_analysis
 from tilefoundry.cli.analyze import guidance as analyze_guidance

@@ -1,49 +1,19 @@
 """Effect roots for dead-code elimination over value-form HIR.
 
-D0 HIR is pure SSA: a loop's observable effect is exactly the value it produces.
-So the effect-aware rule is a reachability rule with one explicit exclusion:
-
-1. EXTERNAL WRITE (write GM / return value / loop carry) -- a loop whose produced
-   value is reachable from the function result is retained, because that value IS
-   the externally visible write. "Returned" and "loop-carried into a returned value"
-   are the same statement in SSA: reachable from Function.body.
-2. PRIVATE SMEM DEAD VALUE -- a loop whose produced value has no consumer is not
-   reachable and may be deleted. Deleting it changes nothing anyone can observe.
-3. INSTRUCTION OPERAND WRITE IS NOT AN HIR MUTATION -- an instruction (tf.schedule)
-   declares its operand's memory effect, but writing a register/UB window does NOT
-   turn the old Var into a new value. It is therefore NOT a DCE root on its own;
-   only a consumed produced value keeps a loop. Counting operand writes as effects is
-   exactly the "keep every store loop" over-retention this module forbids.
-
-RETENTION ASSUMPTION (explicit, D0 value-form SSA)
------------------------------------------------------
-This module ONLY implements value-form retention. It assumes every externally visible
-write is carried by a PRODUCED VALUE that is reachable from the function result. D0 does
-NOT model imperative mutation of an existing Var: an instruction that writes a GM operand
-is NOT treated as producing a new externally visible value. A program whose only external
-effect is such an unconsumed operand write cannot be represented, and
-assert_value_form_retention refuses it by name (DCE_VALUE_FORM_ASSUMPTION_VIOLATED) rather
-than silently dropping it or pretending it was carried. If D0 ever grows
-imperative-mutation semantics, this assumption must be revisited and this module widened
-deliberately.
-
-WIRING (production vs test-only), per function:
-  * reachable_loops                -- PRODUCTION: parser/pipeline_intents uses it to decide
-                                      which authored pipeline declarations survived.
-  * reachable_loop_ids, loop_is_retained -- helper/test-only (not on a production path).
-  * storage_of, is_external_storage, value_is_external -- test-only predicates.
-  * instruction_operand_writes     -- test-only; documents that an operand WRITE is not a
-                                      DCE root.
-  * classify_dropped_loop          -- test-only; classifies a dropped loop.
-  * assert_value_form_retention    -- PRODUCTION-callable guard (see assumption above).
+D0 HIR is pure SSA, so a loop's observable effect is the value it produces.
+Reachability from ``Function.body`` decides retention: a returned or carried
+produced value is retained, a produced value with no consumer may be deleted,
+and an instruction operand write is not an HIR mutation on its own. External
+writes must therefore be carried by a produced value; ``assert_value_form_retention``
+refuses an unconsumed GMEM operand write by name instead of dropping it.
 """
 
 from __future__ import annotations
 
 from tilefoundry.ir.core import Call
 from tilefoundry.ir.core.param_def import MemoryEffect
-from tilefoundry.ir.hir.pipeline import PipelineError
 from tilefoundry.ir.hir.loop_region import LoopRegion
+from tilefoundry.ir.hir.pipeline import PipelineError
 from tilefoundry.ir.types import TensorType
 from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.ir.visitor import collect_exprs
@@ -159,14 +129,10 @@ def assert_value_form_retention(function, candidate_loops=()) -> dict:
     """Assert the value-form SSA retention assumption for dropped loops, or refuse by name.
 
     D0 cannot express an unconsumed external (GMEM) operand WRITE as a new value. A dropped
-    loop (one not reachable from the result) whose body contains an instruction writing a
-    GMEM operand is therefore exactly the case the value-form model cannot represent: it is
-    refused with DCE_VALUE_FORM_ASSUMPTION_VIOLATED instead of being silently deleted. A
-    dropped loop that only writes private storages (SMEM/RMEM/CARRIER) is a private dead
-    value and is allowed to disappear.
-
-    Wiring: PRODUCTION-callable guard. Callers pass the LoopRegions they built (including
-    ones DCE may drop); pass no candidates when only the surviving body is available.
+    loop whose body contains an instruction writing a GMEM operand is therefore refused
+    with DCE_VALUE_FORM_ASSUMPTION_VIOLATED instead of being silently deleted. A dropped
+    loop that only writes private storages (SMEM/RMEM/CARRIER) is a private dead value and
+    may disappear. Callers pass the LoopRegions they built, including ones DCE may drop.
     """
     reachable = reachable_loop_ids(function)
     inspected = 0

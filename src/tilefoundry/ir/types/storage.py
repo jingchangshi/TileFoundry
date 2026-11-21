@@ -16,7 +16,12 @@ from enum import IntEnum
 
 
 class StorageKind(IntEnum):
-    """Memory-space level (backend-generic)."""
+    """Memory-space level (backend-generic).
+
+    CARRIER is an opaque carrier register class: bf16 carriers (two per 32-bit
+    word) in a vector window. It is distinct from an f32 element register, and
+    only a conversion op may consume it.
+    """
 
     HOST = 1
     GMEM = 2
@@ -24,8 +29,6 @@ class StorageKind(IntEnum):
     RMEM = 4
     TMEM = 5
     UMAT = 6
-    #: Opaque carrier register class: bf16 carriers (two per 32-bit word) in a vector
-    #: window. Distinct from an f32 element register; only a conversion op may consume it.
     CARRIER = 7
 
     def __str__(self) -> str:

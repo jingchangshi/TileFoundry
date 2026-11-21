@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from tilefoundry.ir.core import Expr, Var
-from tilefoundry.ir.hir.pipeline import PipelineError, PipelineSpec
+from tilefoundry.ir.hir.pipeline_spec import PipelineError, PipelineSpec
 from tilefoundry.ir.types.tensor_type import ShapeDim
 
 

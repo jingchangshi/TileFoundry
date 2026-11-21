@@ -8,9 +8,23 @@ an empty problem, because an empty problem is vacuously satisfiable.
 from __future__ import annotations
 
 from . import core
-from .core import (SAT, UNSAT, UNKNOWN, Assignment, Buffer, Capacity, Edge, Problem,
-                   Resource, Reuse, SolverError, Task, lower_bound_ii, solve,
-                   verify_assignment)
+from .core import (
+    SAT,
+    UNKNOWN,
+    UNSAT,
+    Assignment,
+    Buffer,
+    Capacity,
+    Edge,
+    Problem,
+    Resource,
+    Reuse,
+    SolverError,
+    Task,
+    lower_bound_ii,
+    solve,
+    verify_assignment,
+)
 
 __all__ = [
     "tf_adapter", "tl_adapter", "project", "solve", "lower_bound_ii",
