@@ -1020,6 +1020,8 @@ class CannbenchOpsRegistry:
     def _resolve_tasks_root(self, tasks_root: str | Path | None) -> Path:
         if tasks_root is not None:
             p = Path(tasks_root).expanduser().resolve()
+            if _has_flat_operator_layout(p):
+                return p
             return resolve_cannbench_tasks_root(p)
 
         candidates: list[Path] = []
@@ -1085,6 +1087,30 @@ class CannbenchOpsRegistry:
                     "op_dir": op_dir,
                 }
                 self._task_to_op[task] = op_id
+
+        if self._entries or not _has_flat_operator_layout(self._tasks_root):
+            return
+        for op_dir in sorted(self._tasks_root.iterdir()):
+            if not op_dir.is_dir() or not (op_dir / "cases.yaml").is_file():
+                continue
+            op_id = op_dir.name
+            if op_id not in OPERATOR_METADATA:
+                raise ValueError(
+                    f"flat benchmark root {self._tasks_root} contains operator {op_id!r} "
+                    "without an official task mapping in OPERATOR_METADATA"
+                )
+            task, _module_relpath, _entry = OPERATOR_METADATA[op_id]
+            level_dir, _op_name = task.split("/", 1)
+            level_num = int(level_dir.removeprefix("level"))
+            self._entries[op_id] = {
+                "op_id": op_id,
+                "task": task,
+                "level": f"L{level_num}",
+                "level_dir": level_dir,
+                "level_num": level_num,
+                "op_dir": op_dir,
+            }
+            self._task_to_op[task] = op_id
 
     @property
     def tasks_root(self) -> Path:
@@ -1330,20 +1356,69 @@ class CannbenchOpsRegistry:
             f"case_num={target_case} missing from semantic regime partition of {op_id!r}"
         )
 
+    def _hydrate_authored_regime_specs(
+        self,
+        spec: CannbenchOpSpec,
+        regimes: Sequence[RegimeTargetSpec],
+    ) -> tuple[RegimeTargetSpec, ...]:
+        """Attach the max-workload anchor case and its physics ratios to authored regimes."""
+        partition = self._semantic_partition(spec)
+        ratios_by_case = {ratios.case_id: ratios for ratios in partition.ratios}
+        raw_case_by_case_id = {int(case["case_id"]): dict(case) for case in spec.cases}
+        anchor_case_ids_by_tag: dict[str, list[int]] = {}
+        for anchor in spec.anchors:
+            anchor_case_ids_by_tag.setdefault(anchor.regime_tag, []).append(anchor.case_num)
+        hydrated: list[RegimeTargetSpec] = []
+        for regime in regimes:
+            member_case_ids = [
+                case_id
+                for case_id in anchor_case_ids_by_tag.get(regime.regime_tag, ())
+                if case_id in raw_case_by_case_id
+            ]
+            if not member_case_ids:
+                raise ValueError(
+                    f"authored regime {regime.regime_tag!r} of {spec.op_id!r} matches no "
+                    "official anchor case"
+                )
+            workload_bytes_by_case = {
+                case_id: case_workload_bytes(
+                    flatten_int_shapes(raw_case_by_case_id[case_id].get("input_shape")),
+                    flatten_str_values(raw_case_by_case_id[case_id].get("dtype")),
+                )
+                for case_id in member_case_ids
+            }
+            representative_case_id = max(
+                member_case_ids,
+                key=lambda case_id: (workload_bytes_by_case[case_id], case_id),
+            )
+            hydrated.append(
+                replace(
+                    regime,
+                    representative_case_entry=dict(
+                        raw_case_by_case_id[representative_case_id]
+                    ),
+                    representative_case_ratios=ratios_by_case[representative_case_id],
+                )
+            )
+        return tuple(hydrated)
+
     def get_regime_specs(self, name_or_task: str) -> tuple[RegimeTargetSpec, ...]:
         """Return RegimeTargetSpecs partitioned by WP1's physical case mapping.
 
         Authored incumbent partitions remain authoritative while their module is present because
         their public entrypoints dispatch through per-regime selectors that WP1 phase tags do not
-        reproduce (MLA layout branches and attention-residual D-alignment branches). Cold starts
-        for those operators, and all other operators, derive 2-4 regimes from golden semantics.
+        reproduce (MLA layout branches and attention-residual D-alignment branches). Each authored
+        partition receives the max-workload anchor case of its regime and that case's physics
+        ratios so Stage-A, predicate context, and Stage-0 instantiation share real case data.
+        Cold starts for those operators, and all other operators, derive 2-4 regimes from golden
+        semantics.
         """
         op_id = self._normalize_key(name_or_task)
         spec = self.resolve(op_id)
         mod_file = self._module_path(spec)
         mod_text = self._module_source(spec)
         if op_id in DEFAULT_REGIME_SPECS and mod_file.is_file():
-            return DEFAULT_REGIME_SPECS[op_id]
+            return self._hydrate_authored_regime_specs(spec, DEFAULT_REGIME_SPECS[op_id])
         partition = self._semantic_partition(spec)
         runtime_backend, discovered_tb = infer_module_runtime_backend(
             mod_text,
@@ -1940,6 +2015,17 @@ def _has_task_layout(path: Path) -> bool:
     if (path / "suite_manifest.json").is_file() or (path / "metadata").is_dir():
         return True
     return any((path / f"level{lvl}").is_dir() for lvl in range(1, 6))
+
+
+def _has_flat_operator_layout(path: Path) -> bool:
+    """Return True if *path* directly contains official operator task directories."""
+    if not path.is_dir():
+        return False
+    return any(
+        (child / "cases.yaml").is_file() and (child / "proto.yaml").is_file()
+        for child in path.iterdir()
+        if child.is_dir()
+    )
 
 
 def resolve_cannbench_tasks_root(repo: str | Path) -> Path:
