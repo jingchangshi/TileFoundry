@@ -257,6 +257,7 @@ def resolve_campaign_device_plan(
     device_id: str,
     device_ids: tuple[str, ...],
     env_device_ids: tuple[str, ...],
+    visible_device_ids: tuple[str, ...] = (),
 ) -> tuple[str, tuple[str, ...]]:
     """Resolve the primary card and ordered pool from CLI and managed env declarations.
 
@@ -265,19 +266,44 @@ def resolve_campaign_device_plan(
     supplied ``--device-id``, otherwise the first configured pool card, and only
     then the legacy ``"1"``. A CLI default therefore never injects a card that
     the managed pool did not declare.
+
+    ``visible_device_ids`` is the parent process's physical visibility set. It
+    only narrows the resolved plan: a card missing from it is never used, and a
+    plan with no visible card is a configuration error rather than an implicit
+    expansion to the full pool.
     """
     configured = device_ids or env_device_ids
     canonical_configured = tuple(
         _canonical_device_id(value, field=f"configured_device_ids[{index}]")
         for index, value in enumerate(configured)
     )
-    primary = _canonical_device_id(device_id, field="device_id") if device_id.strip() else ""
+    explicit_primary = bool(device_id.strip())
+    primary = _canonical_device_id(device_id, field="device_id") if explicit_primary else ""
     if not primary:
         primary = canonical_configured[0] if canonical_configured else "1"
     pool = [primary]
     for canonical in canonical_configured:
         if canonical not in pool:
             pool.append(canonical)
+
+    if visible_device_ids:
+        visible = {
+            _canonical_device_id(value, field=f"visible_device_ids[{index}]")
+            for index, value in enumerate(visible_device_ids)
+        }
+        if explicit_primary and primary not in visible:
+            raise ValueError(
+                f"requested device {primary!r} is not visible to this process "
+                f"(visible: {', '.join(sorted(visible))})"
+            )
+        narrowed = [device for device in pool if device in visible]
+        if not narrowed:
+            raise ValueError(
+                "configured device pool has no card visible to this process "
+                f"(pool: {', '.join(pool)}; visible: {', '.join(sorted(visible))})"
+            )
+        primary = primary if primary in visible else narrowed[0]
+        pool = [primary, *(device for device in narrowed if device != primary)]
     return primary, tuple(pool)
 
 
@@ -488,6 +514,9 @@ class PendingL4:
     a legacy record without a stored quota; an explicit ``0`` forbids every
     additional round. ``blocked_env_category`` keeps the signed occupancy
     classification so a build-lock BLOCKED_ENV never rotates cards.
+    ``device_rejected`` records that V2 refused the last submitted card as
+    unauthorized; ``rejected_device_ids`` keeps every such card out of later
+    attempts so an exhausted authorization terminates after a bounded sweep.
     """
 
     target_path: str
@@ -507,6 +536,8 @@ class PendingL4:
     blocked_env_rounds_used: int = 0
     blocked_env_round_limit: int | None = None
     blocked_env_category: str = ""
+    device_rejected: bool = False
+    rejected_device_ids: tuple[str, ...] = ()
     attempts: tuple[dict[str, str], ...] = ()
     prior_stop_reason: str = ""
 
@@ -532,6 +563,8 @@ class PendingL4:
             "blocked_env_rounds_used": self.blocked_env_rounds_used,
             "blocked_env_round_limit": self.blocked_env_round_limit,
             "blocked_env_category": self.blocked_env_category,
+            "device_rejected": self.device_rejected,
+            "rejected_device_ids": list(self.rejected_device_ids),
             "attempts": [dict(item) for item in self.attempts],
             "prior_stop_reason": self.prior_stop_reason,
         }
@@ -587,6 +620,10 @@ class PendingL4:
                 )
             ),
             blocked_env_category=str(payload.get("blocked_env_category", "")),
+            device_rejected=bool(payload.get("device_rejected", False)),
+            rejected_device_ids=tuple(
+                str(item) for item in payload.get("rejected_device_ids", ())
+            ),
             attempts=attempts,
             prior_stop_reason=str(payload.get("prior_stop_reason", "")),
         )
@@ -4673,6 +4710,7 @@ class PerfTargetCampaignRunner:
             "state": result.state,
             "execution_terminal": str(result.execution_terminal).lower(),
             "blocked_env_category": result.blocked_env_category,
+            "device_rejected": str(result.device_rejected).lower(),
             "official_report_valid": str(result.official_report_valid).lower(),
             "all_cases_passed": str(result.all_cases_passed).lower(),
             "all_timings_valid": str(result.all_timings_valid).lower(),
@@ -4719,21 +4757,24 @@ class PerfTargetCampaignRunner:
         narrowed = tuple(device for device in pending.device_pool if device in allowed)
         return narrowed or self._l4_device_pool
 
-    def _advance_blocked_env_l4(
+    def _advance_l4_card_failure(
         self,
         pending: PendingL4,
         result: L4CannbenchResult,
         attempts: list[dict[str, str]],
     ) -> tuple[L4CannbenchResult, PendingL4]:
-        """Move a terminal occupancy-blocked L4 run across the configured card pool.
+        """Move a terminal L4 run across the configured card pool.
 
-        Another untried card in the same round is submitted immediately: the
-        complete official L4 restarts there for the same candidate SHA, and no
-        timings are stitched. Only after every pool card was blocked does one
-        bounded linear backoff run before the next round. A candidate verdict,
-        a live execution or exhausted rounds leave the loop. Each submission
-        intent is persisted before its long wait, so a restart continues on the
-        next untried card instead of spending a recorded round twice.
+        An occupancy-blocked card or a submit refusal for an unauthorized card
+        advances immediately to the next untried card: the complete official L4
+        restarts there for the same candidate SHA, and no timings are stitched.
+        A rejected card stays excluded on every later round. Only after every
+        remaining card was occupancy-blocked does one bounded linear backoff run
+        before the next round, while a rejected-only sweep terminates without
+        spending a round. A candidate verdict, a live execution or exhausted
+        rounds leave the loop. Each submission intent is persisted before its
+        long wait, so a restart continues on the next untried card instead of
+        spending a recorded round twice.
         """
         pool = self._effective_l4_pool(pending)
         limit = self._effective_l4_round_limit(pending)
@@ -4760,24 +4801,35 @@ class PerfTargetCampaignRunner:
             self._pending_l4 = current
             self._persist_runtime_state("pending_l4", current.to_dict())
 
-        while result.execution_terminal and _is_occupancy_blocked_env(
-            result.failure_kind,
-            result.blocked_env_category,
+        while result.execution_terminal and (
+            _is_occupancy_blocked_env(
+                result.failure_kind,
+                result.blocked_env_category,
+            )
+            or self._is_rejected_card_l4(result)
         ):
+            rejected = self._is_rejected_card_l4(result)
             attempted = self._l4_round_attempted_devices(current)
-            untried = tuple(device for device in pool if device not in attempted)
+            eligible = tuple(
+                device for device in pool if device not in current.rejected_device_ids
+            )
+            untried = tuple(device for device in eligible if device not in attempted)
             if untried:
                 next_device = untried[0]
                 next_rounds = current.blocked_env_rounds_used
                 next_attempted = (*attempted, next_device)
                 delay = 0.0
-            elif current.blocked_env_rounds_used < limit:
+            elif (
+                rejected
+                or not eligible
+                or current.blocked_env_rounds_used >= limit
+            ):
+                break
+            else:
                 next_rounds = current.blocked_env_rounds_used + 1
-                next_device = pool[0]
+                next_device = eligible[0]
                 next_attempted = (next_device,)
                 delay = max(0.0, self._config.l4_retry_backoff_sec) * next_rounds
-            else:
-                break
             current = replace(
                 current,
                 execution_id="",
@@ -4791,6 +4843,7 @@ class PerfTargetCampaignRunner:
                 blocked_env_rounds_used=next_rounds,
                 blocked_env_round_attempted_device_ids=next_attempted,
                 blocked_env_category="",
+                device_rejected=False,
             )
             self._pending_l4 = current
             self._persist_runtime_state("pending_l4", current.to_dict())
@@ -4834,6 +4887,26 @@ class PerfTargetCampaignRunner:
         *,
         retry_used: bool,
     ) -> PendingL4:
+        rejected_device_ids = pending.rejected_device_ids
+        if (
+            result.device_rejected
+            and result.device_id
+            and result.device_id not in rejected_device_ids
+        ):
+            rejected_device_ids = (*rejected_device_ids, result.device_id)
+        attempted_device_ids = pending.blocked_env_round_attempted_device_ids
+        if (
+            result.device_id
+            and (
+                result.device_rejected
+                or _is_occupancy_blocked_env(
+                    result.failure_kind,
+                    result.blocked_env_category,
+                )
+            )
+            and result.device_id not in attempted_device_ids
+        ):
+            attempted_device_ids = (*attempted_device_ids, result.device_id)
         return replace(
             pending,
             target_path=result.target_path or pending.target_path,
@@ -4848,6 +4921,9 @@ class PerfTargetCampaignRunner:
             execution_terminal=result.execution_terminal,
             retry_used=retry_used,
             blocked_env_category=result.blocked_env_category,
+            device_rejected=result.device_rejected,
+            rejected_device_ids=rejected_device_ids,
+            blocked_env_round_attempted_device_ids=attempted_device_ids,
             attempts=attempts,
         )
 
@@ -4969,6 +5045,7 @@ class PerfTargetCampaignRunner:
                 execution_terminal=False,
                 retry_used=True,
                 blocked_env_category="",
+                device_rejected=False,
             )
             retry_result = self._run_l4_cannbench(
                 self._target_module_path,
@@ -4998,11 +5075,14 @@ class PerfTargetCampaignRunner:
             result: L4CannbenchResult,
         ) -> tuple[L4CannbenchResult, PendingL4 | None]:
             nonlocal current
-            if _is_occupancy_blocked_env(
-                result.failure_kind,
-                result.blocked_env_category,
+            if (
+                _is_occupancy_blocked_env(
+                    result.failure_kind,
+                    result.blocked_env_category,
+                )
+                or self._is_rejected_card_l4(result)
             ):
-                result, current = self._advance_blocked_env_l4(
+                result, current = self._advance_l4_card_failure(
                     current,
                     result,
                     attempts,
@@ -5038,6 +5118,10 @@ class PerfTargetCampaignRunner:
             pending.failure_kind,
             pending.blocked_env_category,
         )
+        rejected_pending = (
+            pending.device_rejected
+            and pending.failure_kind == FAILURE_KIND_INFRASTRUCTURE
+        )
         interrupted_submission = (
             not pending.execution_terminal
             and not pending.execution_id
@@ -5046,6 +5130,7 @@ class PerfTargetCampaignRunner:
         )
         if (
             (blocked_env_pending and pending.execution_terminal)
+            or rejected_pending
             or (
                 interrupted_submission
                 and current.blocked_env_rounds_used <= effective_limit
@@ -5084,6 +5169,7 @@ class PerfTargetCampaignRunner:
                     state=pending.state,
                     execution_terminal=pending.execution_terminal,
                     blocked_env_category=pending.blocked_env_category,
+                    device_rejected=pending.device_rejected,
                     target_path=pending.target_path,
                     candidate_sha256=expected,
                     attempts=pending.attempts,
@@ -5108,6 +5194,7 @@ class PerfTargetCampaignRunner:
             state=pending.state,
             execution_terminal=pending.execution_terminal,
             blocked_env_category=pending.blocked_env_category,
+            device_rejected=pending.device_rejected,
             target_path=pending.target_path,
             candidate_sha256=expected,
             attempts=pending.attempts,
@@ -5128,6 +5215,19 @@ class PerfTargetCampaignRunner:
         return _is_occupancy_blocked_env(
             result.failure_kind,
             result.blocked_env_category,
+        )
+
+    @staticmethod
+    def _is_rejected_card_l4(result: L4CannbenchResult) -> bool:
+        """Return True when V2 refused the submitted card as unauthorized.
+
+        Submit is the sole authorization authority. A refusal proves only that
+        this card is outside the current allowlist, so the pool keeps moving;
+        it never widens authorization and never hides a usable card.
+        """
+        return (
+            result.device_rejected
+            and result.failure_kind == FAILURE_KIND_INFRASTRUCTURE
         )
 
     def _run_final_l4_tracked(
@@ -5187,8 +5287,8 @@ class PerfTargetCampaignRunner:
             tuple(attempts),
             retry_used=False,
         )
-        if self._is_blocked_env_l4(result):
-            result, current = self._advance_blocked_env_l4(current, result, attempts)
+        if self._is_blocked_env_l4(result) or self._is_rejected_card_l4(result):
+            result, current = self._advance_l4_card_failure(current, result, attempts)
         if result.passed or result.failure_kind == FAILURE_KIND_CANDIDATE:
             self._pending_l4 = None
             self._persist_runtime_state("pending_l4", None)

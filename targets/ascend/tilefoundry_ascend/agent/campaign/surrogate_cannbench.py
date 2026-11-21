@@ -86,6 +86,7 @@ AGENT_GATES_ADAPTER = "tilefoundry-npu"
 AGENT_GATES_DEVICE_FAST_GATE = "tilefoundry-npu-device-fast"
 AGENT_GATES_L3_PROMOTION_GATE = "tilefoundry-npu-l3-promotion"
 AGENT_GATES_L4_CANNBENCH_GATE = "tilefoundry-npu-cannbench"
+AGENT_GATES_L4_CANNBENCH_PREP_GATE = "tilefoundry-npu-cannbench-prep"
 FAST_REQUEST_SCHEMA = "tilefoundry-fast-request/v1"
 FAST_RESPONSE_SCHEMA = "tilefoundry-fast-response/v1"
 FAST_REQUEST_ENV = "TF_FAST_REQUEST"
@@ -342,6 +343,7 @@ class L4CannbenchResult:
     state: str = ""
     execution_terminal: bool = True
     blocked_env_category: str = ""
+    device_rejected: bool = False
     target_path: str = ""
     candidate_sha256: str = ""
     attempts: tuple[dict[str, str], ...] = ()
@@ -369,6 +371,7 @@ class L4CannbenchResult:
             "state": self.state,
             "execution_terminal": self.execution_terminal,
             "blocked_env_category": self.blocked_env_category,
+            "device_rejected": self.device_rejected,
             "target_path": self.target_path,
             "candidate_sha256": self.candidate_sha256,
             "attempts": [dict(item) for item in self.attempts],
@@ -1961,6 +1964,7 @@ class _V2GateExecution:
     device_id: str = ""
     state: str = ""
     execution_terminal: bool = True
+    device_rejected: bool = False
 
     @property
     def execution_active(self) -> bool:
@@ -2009,29 +2013,50 @@ def _gate_recorded_status(row: Mapping[str, object] | None) -> str:
     return str(row.get("recordedStatus") or row.get("status") or "")
 
 
-def _blocked_env_category(
-    row: Mapping[str, object] | None,
-    observation: Mapping[str, object],
-) -> str:
-    """Return the signed BLOCKED_ENV category; only occupancy is card-local.
+def _gate_failure_text(row: Mapping[str, object]) -> str:
+    raw_failures = row.get("failures")
+    if isinstance(raw_failures, Sequence) and not isinstance(raw_failures, (str, bytes)):
+        return " ".join(str(item) for item in raw_failures)
+    return str(raw_failures or "")
 
+
+def _blocked_env_category(report: Mapping[str, object]) -> str:
+    """Return the signed BLOCKED_ENV category across both L4 gate rows.
+
+    The official gate can record the preemption itself, or the prep gate can be
+    blocked first while the official gate only records ``DEPENDENCY_NOT_PASSED``.
     A shared build lock also ends as BLOCKED_ENV, so the receipt's
     ``errorCategory`` distinguishes an occupied card from a machine-wide
     environment fault. Missing or unparsable categories stay unclassified and
     never trigger card rotation.
     """
-    if row is None:
-        return ""
-    raw_failures = row.get("failures")
-    failures = (
-        " ".join(str(item) for item in raw_failures)
-        if isinstance(raw_failures, Sequence) and not isinstance(raw_failures, (str, bytes))
-        else str(raw_failures or "")
-    )
-    blocked = _gate_recorded_status(row).upper() == "BLOCKED_ENV"
-    if not blocked and "BLOCKED_EXIT_CODE: 75" not in failures:
-        return ""
-    return str(observation.get("errorCategory") or "").strip().lower()
+    for gate_id in (AGENT_GATES_L4_CANNBENCH_GATE, AGENT_GATES_L4_CANNBENCH_PREP_GATE):
+        row, observation = _gate_observation(report, gate_id)
+        if row is None:
+            continue
+        blocked = _gate_recorded_status(row).upper() == "BLOCKED_ENV"
+        if not blocked and "BLOCKED_EXIT_CODE: 75" not in _gate_failure_text(row):
+            continue
+        category = str(observation.get("errorCategory") or "").strip().lower()
+        if category:
+            return category
+    return ""
+
+
+def _submit_device_rejected(
+    proc: subprocess.CompletedProcess[str],
+    parsed: Mapping[str, object],
+) -> bool:
+    """Return True when V2 refused the named card as unauthorized.
+
+    Submit is the sole authorization authority; doctor deliberately does not
+    check the allowlist. The CLI reports the refusal as a structured
+    ``DEVICE_NOT_AUTHORIZED`` payload with exit code 2. Anything else is an
+    ordinary submission failure and must not mark the card itself unusable.
+    """
+    if str(parsed.get("code", "")) == "DEVICE_NOT_AUTHORIZED":
+        return True
+    return "DEVICE_NOT_AUTHORIZED" in f"{proc.stdout}\n{proc.stderr}"
 
 
 def _as_positive_int(value: object) -> int:
@@ -2099,6 +2124,7 @@ def _run_v2_gate(
         resolved_device_id: str = "",
         state: str = "",
         execution_terminal: bool = True,
+        device_rejected: bool = False,
     ) -> _V2GateExecution:
         return _V2GateExecution(
             execution_id=execution_id,
@@ -2109,6 +2135,7 @@ def _run_v2_gate(
             device_id=resolved_device_id or requested_device,
             state=state,
             execution_terminal=execution_terminal,
+            device_rejected=device_rejected,
         )
 
     if resume_execution_id:
@@ -2163,7 +2190,11 @@ def _run_v2_gate(
         except (OSError, subprocess.TimeoutExpired) as exc:
             return _failed("", f"{gate_id} submit failed: {exc}")
         if proc.returncode != 0:
-            return _failed("", proc.stderr or proc.stdout or f"{gate_id} submit failed")
+            return _failed(
+                "",
+                proc.stderr or proc.stdout or f"{gate_id} submit failed",
+                device_rejected=_submit_device_rejected(proc, parsed),
+            )
         execution_id = str(parsed.get("execution_id", ""))
         if not execution_id:
             return _failed("", f"{gate_id} submit returned no execution_id")
@@ -3316,6 +3347,7 @@ def _l4_failure(
     state: str = "",
     execution_terminal: bool = True,
     blocked_env_category: str = "",
+    device_rejected: bool = False,
     target_path: str = "",
     candidate_sha256: str = "",
     attempts: tuple[dict[str, str], ...] = (),
@@ -3338,6 +3370,7 @@ def _l4_failure(
         state=state,
         execution_terminal=execution_terminal,
         blocked_env_category=blocked_env_category,
+        device_rejected=device_rejected,
         target_path=target_path,
         candidate_sha256=candidate_sha256,
         attempts=attempts,
@@ -3523,8 +3556,8 @@ def run_l4_official_cannbench_via_agent_gates(
         resume_run_id=resume_run_id,
         on_execution_started=on_execution_started,
     )
-    row, observation = _gate_observation(execution.report, AGENT_GATES_L4_CANNBENCH_GATE)
-    blocked_env_category = _blocked_env_category(row, observation)
+    _row, observation = _gate_observation(execution.report, AGENT_GATES_L4_CANNBENCH_GATE)
+    blocked_env_category = _blocked_env_category(execution.report)
     if execution.transport_error:
         return _l4_failure(
             execution.transport_error,
@@ -3535,6 +3568,7 @@ def run_l4_official_cannbench_via_agent_gates(
             state=execution.state,
             execution_terminal=execution.execution_terminal,
             blocked_env_category=blocked_env_category,
+            device_rejected=execution.device_rejected,
             target_path=str(expected_path),
             candidate_sha256=candidate_digest,
         )

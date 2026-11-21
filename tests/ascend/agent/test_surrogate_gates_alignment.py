@@ -17,6 +17,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec
 _FAST_GATE = "tilefoundry-npu-device-fast"
 _L3_GATE = "tilefoundry-npu-l3-promotion"
 _L4_GATE = "tilefoundry-npu-cannbench"
+_L4_PREP_GATE = "tilefoundry-npu-cannbench-prep"
 
 
 def _completed(
@@ -348,6 +349,10 @@ def _l4_report(
     flags: Mapping[str, object] | None = None,
     status: str = "PASS",
     failure: Mapping[str, object] | None = None,
+    gate_failures: tuple[str, ...] | None = None,
+    prep_status: str = "PASS",
+    prep_failures: tuple[str, ...] = (),
+    prep_observations: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     observations: dict[str, object] = {
         "avgSpeedup": 4.25,
@@ -375,20 +380,30 @@ def _l4_report(
         ],
     }
     observations.update(flags or {})
+    prep_gate: dict[str, object] = {
+        "gateId": _L4_PREP_GATE,
+        "status": prep_status,
+        "recordedStatus": prep_status,
+        "observations": dict(prep_observations or {}),
+    }
+    if prep_failures:
+        prep_gate["failures"] = list(prep_failures)
     gate: dict[str, object] = {
         "gateId": _L4_GATE,
         "status": status,
         "recordedStatus": status,
         "observations": observations,
     }
-    if failure is not None:
+    if gate_failures is not None:
+        gate["failures"] = list(gate_failures)
+    elif failure is not None:
         gate["failures"] = [dict(failure)]
     report: dict[str, object] = {
         "status": status,
         "runId": "run-l4",
         "receiptPath": "/receipt-l4.json",
         "recordedStatus": status,
-        "gates": [gate],
+        "gates": [prep_gate, gate],
     }
     if failure is not None:
         report["failure"] = dict(failure)
@@ -402,6 +417,7 @@ def _v2_handler(
     root: Path,
     verification: Mapping[str, object] | None = None,
     submit_payload: Mapping[str, object] | None = None,
+    submit_returncode: int = 0,
     wait_payloads: list[dict[str, object]] | None = None,
     doctor: Mapping[str, object] | None = None,
     doctor_returncode: int = 0,
@@ -429,7 +445,9 @@ def _v2_handler(
             return _completed(cmd_list, doctor_payload, returncode=doctor_returncode)
         if command == "submit":
             return _completed(
-                cmd_list, dict(submit_payload or {"execution_id": "exec-1"})
+                cmd_list,
+                dict(submit_payload or {"execution_id": "exec-1"}),
+                returncode=submit_returncode,
             )
         if command == "wait":
             payload = waits.pop(0) if len(waits) > 1 else waits[0]
@@ -1733,6 +1751,7 @@ def _v2_l4_run(
     report: Mapping[str, object],
     verification: Mapping[str, object] | None = None,
     submit_payload: Mapping[str, object] | None = None,
+    submit_returncode: int = 0,
     resume_execution_id: str = "",
     resume_run_id: str = "",
     on_execution_started=None,
@@ -1750,6 +1769,7 @@ def _v2_l4_run(
         root=tmp_path,
         verification=verification,
         submit_payload=submit_payload,
+        submit_returncode=submit_returncode,
     )
 
     def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
@@ -1935,6 +1955,117 @@ def test_l4_candidate_failure_never_carries_blocked_env_category(
     result, _calls, _envs = _v2_l4_run(tmp_path, monkeypatch, report=report)
     assert result.passed is False
     assert result.failure_kind == surrogate_cannbench.FAILURE_KIND_CANDIDATE
+    assert result.blocked_env_category == ""
+
+
+def test_l4_prep_occupancy_survives_official_dependency_skip(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The prep gate's signed occupancy survives an official DEPENDENCY_NOT_PASSED.
+
+    This mirrors the older exp receipts: prep exits 75 with an occupancy
+    category, so the official cannbench gate never opens and only records the
+    dependency skip.
+    """
+    report = _l4_report(
+        candidate="kernels.py",
+        status="NOT_RUN",
+        gate_failures=("DEPENDENCY_NOT_PASSED",),
+        prep_status="BLOCKED_ENV",
+        prep_failures=("BLOCKED_EXIT_CODE: 75",),
+        prep_observations={
+            "errorCategory": "occupancy",
+            "error": "device npu:1 is shared(1) and requires an idle device",
+        },
+    )
+    result, calls, _envs = _v2_l4_run(tmp_path, monkeypatch, report=report)
+    assert result.passed is False
+    assert result.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    assert result.blocked_env_category == "occupancy"
+    assert [cmd[1] for cmd in calls] == [
+        "doctor",
+        "submit",
+        "wait",
+        "report",
+        "verify-requirements",
+    ]
+
+
+def test_l4_official_occupancy_after_prep_pass(tmp_path: Path, monkeypatch) -> None:
+    """The current softmax receipt shape: prep passes, the official gate is preempted."""
+    report = _l4_report(
+        candidate="kernels.py",
+        status="BLOCKED_ENV",
+        gate_failures=("BLOCKED_EXIT_CODE: 75",),
+        flags={
+            "errorCategory": "occupancy",
+            "error": (
+                "runtime health abort (external_occupancy) in phase workload "
+                "on device 2 (npu 2)"
+            ),
+        },
+        prep_observations={"errorCategory": "none"},
+    )
+    result, _calls, _envs = _v2_l4_run(tmp_path, monkeypatch, report=report)
+    assert result.passed is False
+    assert result.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    assert result.blocked_env_category == "occupancy"
+
+
+def test_l4_prep_build_lock_is_not_card_local(tmp_path: Path, monkeypatch) -> None:
+    """A shared build lock is BLOCKED_ENV too, so it must never rotate cards."""
+    report = _l4_report(
+        candidate="kernels.py",
+        status="NOT_RUN",
+        gate_failures=("DEPENDENCY_NOT_PASSED",),
+        prep_status="BLOCKED_ENV",
+        prep_failures=("resource busy: build:/workspace/TileFoundry/build (waited 0.0s)",),
+        prep_observations={"error": "resource busy: build:/workspace/TileFoundry/build"},
+    )
+    result, _calls, _envs = _v2_l4_run(tmp_path, monkeypatch, report=report)
+    assert result.passed is False
+    assert result.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    assert result.blocked_env_category == ""
+
+
+def test_l4_submit_device_refusal_marks_the_card_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Submit is the authorization authority; only its refusal marks the card."""
+    report = _l4_report(candidate="kernels.py")
+    result, calls, _envs = _v2_l4_run(
+        tmp_path,
+        monkeypatch,
+        report=report,
+        submit_payload={
+            "code": "DEVICE_NOT_AUTHORIZED",
+            "family": "request",
+            "message": "device 7 is excluded by devices.allowed_npu_devices",
+        },
+        submit_returncode=2,
+    )
+    assert result.passed is False
+    assert result.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    assert result.device_rejected is True
+    assert result.blocked_env_category == ""
+    assert result.execution_id == ""
+    assert [cmd[1] for cmd in calls] == ["doctor", "submit"]
+
+
+def test_l4_ordinary_submit_failure_is_not_card_local(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """An unrelated submit error leaves the card classification untouched."""
+    report = _l4_report(candidate="kernels.py")
+    result, _calls, _envs = _v2_l4_run(
+        tmp_path,
+        monkeypatch,
+        report=report,
+        submit_payload={"code": "CONFIG_INVALID", "message": "worker is not running"},
+        submit_returncode=2,
+    )
+    assert result.passed is False
+    assert result.device_rejected is False
     assert result.blocked_env_category == ""
 
 

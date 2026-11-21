@@ -122,6 +122,9 @@ def main(argv: list[str] | None = None) -> int:
         env_device_ids=parse_device_ids(
             env_values.get(CAMPAIGN_DEVICE_IDS_ENV_KEY, "")
         ),
+        visible_device_ids=parse_device_ids(
+            os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+        ),
     )
     llm_backend = create_llm_backend_from_env(overrides=_llm_backend_overrides(env_values, args))
 

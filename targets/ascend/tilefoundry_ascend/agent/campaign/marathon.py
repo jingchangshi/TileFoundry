@@ -1511,6 +1511,12 @@ def run_operator_marathon(
         env_file=cfg.env_file,
         source_root=_source_root,
     )
+    # configure_marathon_process_env removes the parent's visibility variable so
+    # coordinator subprocesses do not inherit a stale logical mapping. Capture
+    # the physical set first: it may only narrow the declared pool.
+    visible_device_ids = parse_device_ids(
+        os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+    )
     env_values = configure_marathon_process_env(
         operator_name=cfg.operator_name,
         env_file=env_file,
@@ -1523,6 +1529,7 @@ def run_operator_marathon(
         env_device_ids=parse_device_ids(
             env_values.get(CAMPAIGN_DEVICE_IDS_ENV_KEY, "")
         ),
+        visible_device_ids=visible_device_ids,
     )
     llm_backend = create_llm_backend_from_env(overrides=_llm_backend_overrides(env_values, cfg))
     raw_cannbench_repo = (

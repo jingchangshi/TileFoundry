@@ -535,6 +535,7 @@ def test_marathon_entrypoint_resolves_managed_device_pool(
     monkeypatch.setattr(os, "environ", os.environ.copy())
     monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
     monkeypatch.delenv("TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS", raising=False)
+    monkeypatch.delenv("ASCEND_RT_VISIBLE_DEVICES", raising=False)
     seen_configs: list[CampaignConfig] = []
     env_path = tmp_path / "env.sh"
     env_path.write_text(
@@ -582,6 +583,64 @@ def test_marathon_entrypoint_resolves_managed_device_pool(
     )
     assert seen_configs[0].device_id == "0"
     assert seen_configs[0].device_ids == ("2",)
+
+
+def test_marathon_entrypoint_narrows_managed_pool_to_parent_visibility(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The captured parent visibility narrows the pool after the env pop."""
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+    monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
+    monkeypatch.delenv("TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS", raising=False)
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "2")
+    seen_configs: list[CampaignConfig] = []
+    env_path = tmp_path / "env.sh"
+    env_path.write_text(
+        "TILEFOUNDRY_NPU_LLM_BACKEND=mock\n"
+        "TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS=0,1,2\n",
+        encoding="utf-8",
+    )
+
+    class Report:
+        def to_dict(self):
+            return {"status": "ok"}
+
+    class Runner:
+        def __init__(self, *, llm_backend, **kwargs):
+            assert isinstance(llm_backend, MockLLMBackend)
+            seen_configs.append(kwargs["config"])
+
+        async def run(self, *, resume):
+            return Report()
+
+    monkeypatch.setattr(marathon, "ExtremeCampaignRunner", Runner)
+    monkeypatch.setattr(marathon, "_ensure_sys_paths", lambda _: None)
+    monkeypatch.setattr(marathon, "build_resilient_l2_evaluator", lambda **_: None)
+    monkeypatch.setattr(marathon, "build_prewarmed_l3_runner", lambda **_: None)
+    monkeypatch.setattr(marathon, "salvage_unpromoted_beam_winner", lambda **_: None)
+    target = tmp_path / "kernels.py"
+    target.touch()
+    assert (
+        marathon.main(
+            [
+                "run",
+                "--operator",
+                "mla",
+                "--source-root",
+                str(tmp_path),
+                "--target-file",
+                str(target),
+                "--checkpoint",
+                str(tmp_path / "checkpoint.json"),
+                "--env-file",
+                str(env_path),
+            ]
+        )
+        == 0
+    )
+    assert seen_configs[0].device_id == "2"
+    assert seen_configs[0].device_ids == ()
+    assert "ASCEND_RT_VISIBLE_DEVICES" not in os.environ
 
 
 def test_salvage_skips_pending_l4_checkpoint_without_touching_target(

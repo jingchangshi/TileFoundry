@@ -5894,6 +5894,17 @@ def _blocked_env_l4(device_id: str, *, category: str = "occupancy") -> L4Cannben
     )
 
 
+def _rejected_l4(device_id: str) -> L4CannbenchResult:
+    return L4CannbenchResult(
+        passed=False,
+        failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        error_message="DEVICE_NOT_AUTHORIZED: device is excluded by the allowlist",
+        device_id=device_id,
+        state="REJECTED",
+        device_rejected=True,
+    )
+
+
 def test_final_l4_retries_blocked_env_on_same_device_until_pass(tmp_path: Path) -> None:
     """Retry a blocked_env L4 on the configured card and clear pending on success."""
     calls: list[str] = []
@@ -6763,3 +6774,264 @@ def test_pending_l4_resume_intersects_saved_pool_with_current_authorization(
     assert updated.device_pool == ("0", "1")
     assert updated.blocked_env_rounds_used == 1
     assert updated.blocked_env_round_limit == 1
+
+
+def test_final_l4_submit_refusal_skips_to_next_authorized_card(tmp_path: Path) -> None:
+    """A refused card is skipped without widening authorization or blocking others."""
+    calls: list[str] = []
+    sleeps: list[float] = []
+    outcomes = iter(
+        [
+            _rejected_l4("0"),
+            L4CannbenchResult(passed=True, device_id="1", execution_id="exec-ok"),
+        ]
+    )
+
+    def _fake_l4(module_path: Path, *, device_id: str = "") -> L4CannbenchResult:
+        calls.append(device_id)
+        return next(outcomes)
+
+    runner = _l4_campaign_runner(
+        tmp_path,
+        _fake_l4,
+        device_id="0",
+        device_ids=("1",),
+        retries=2,
+        backoff_sec=5.0,
+    )
+    result = runner._run_final_l4_tracked(
+        incumbent_source="candidate",
+        prior_stop_reason="final",
+    )
+    assert result.passed is True
+    assert calls == ["0", "1"]
+    assert sleeps == []
+    assert runner._pending_l4 is None
+
+
+def test_final_l4_all_cards_refused_terminates_bounded(tmp_path: Path) -> None:
+    """When every pool card is unauthorized the sweep ends without spending rounds."""
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    def _fake_l4(module_path: Path, *, device_id: str = "") -> L4CannbenchResult:
+        calls.append(device_id)
+        return _rejected_l4(device_id)
+
+    def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    original_sleep = campaign_runner.time.sleep
+    campaign_runner.time.sleep = _sleep
+    try:
+        runner = _l4_campaign_runner(
+            tmp_path,
+            _fake_l4,
+            device_id="0",
+            device_ids=("1", "2"),
+            retries=2,
+            backoff_sec=5.0,
+        )
+        result = runner._run_final_l4_tracked(
+            incumbent_source="candidate",
+            prior_stop_reason="final",
+        )
+    finally:
+        campaign_runner.time.sleep = original_sleep
+    assert result.passed is False
+    assert result.device_rejected is True
+    assert calls == ["0", "1", "2"]
+    assert sleeps == []
+    pending = runner._pending_l4
+    assert pending is not None
+    assert pending.device_rejected is True
+    assert pending.rejected_device_ids == ("0", "1", "2")
+    assert pending.blocked_env_rounds_used == 0
+    payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    assert payload["pending_l4"]["rejected_device_ids"] == ["0", "1", "2"]
+
+
+def test_pending_l4_resume_skips_already_refused_cards(tmp_path: Path) -> None:
+    """A resumed refusal sweep keeps any remaining authorized card usable."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+    calls: list[str] = []
+
+    def _l4(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        assert module_path == target_path
+        calls.append(device_id)
+        return L4CannbenchResult(
+            passed=True,
+            device_id=device_id,
+            execution_id=f"exec-{device_id}",
+        )
+
+    runner = _l4_campaign_runner(
+        tmp_path,
+        _l4,
+        device_id="0",
+        device_ids=("1", "2"),
+    )
+    pending = _pending_l4_checkpoint(
+        target_path,
+        digest=digest,
+        blocked_env_rounds_used=0,
+        blocked_env_round_limit=0,
+        state="REJECTED",
+        device_id="1",
+        device_pool=("0", "1", "2"),
+        blocked_env_round_attempted_device_ids=("0", "1"),
+        blocked_env_category="",
+    )
+    pending = replace(
+        pending,
+        device_rejected=True,
+        rejected_device_ids=("0", "1"),
+        failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert calls == ["2"]
+    assert result.passed is True
+    assert updated is None
+    assert runner._pending_l4 is None
+
+
+def test_pending_l4_all_cards_refused_does_not_resubmit(tmp_path: Path) -> None:
+    """An exhausted authorization terminates without another doctor/submit sweep."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+
+    def _l4_must_not_run(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        raise AssertionError(
+            f"refused pending L4 must not run for {module_path} "
+            f"({resume_execution_id}, {resume_run_id}, {device_id}, {on_execution_started})"
+        )
+
+    runner = _l4_campaign_runner(
+        tmp_path,
+        _l4_must_not_run,
+        device_id="0",
+        device_ids=("1",),
+    )
+    pending = _pending_l4_checkpoint(
+        target_path,
+        digest=digest,
+        blocked_env_rounds_used=0,
+        blocked_env_round_limit=0,
+        state="REJECTED",
+        device_id="1",
+        device_pool=("0", "1"),
+        blocked_env_round_attempted_device_ids=("0", "1"),
+        blocked_env_category="",
+    )
+    pending = replace(
+        pending,
+        device_rejected=True,
+        rejected_device_ids=("0", "1"),
+        failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert result.passed is False
+    assert result.device_rejected is True
+    assert updated is not None
+    assert updated.rejected_device_ids == ("0", "1")
+    assert runner._pending_l4 == updated
+
+
+def test_pending_l4_legacy_checkpoint_uses_current_narrowed_pool(tmp_path: Path) -> None:
+    """A pre-pool checkpoint resumes only within the pool the current run authorizes."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+    calls: list[str] = []
+
+    def _l4(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        assert module_path == target_path
+        calls.append(device_id)
+        return _blocked_env_l4(device_id)
+
+    runner = _l4_campaign_runner(
+        tmp_path,
+        _l4,
+        device_id="0",
+        device_ids=("1",),
+        retries=0,
+    )
+    pending = _pending_l4_checkpoint(
+        target_path,
+        digest=digest,
+        blocked_env_rounds_used=0,
+        blocked_env_round_limit=0,
+        state="BLOCKED",
+        device_id="0",
+        device_pool=(),
+        blocked_env_round_attempted_device_ids=(),
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert calls == ["1"]
+    assert result.passed is False
+    assert updated is not None
+    assert updated.device_pool == ("0", "1")
+    assert updated.blocked_env_rounds_used == 0
+
+
+def test_resolve_campaign_device_plan_only_narrows_to_visible_cards() -> None:
+    """The parent visibility set removes cards but never adds an undeclared one."""
+    assert resolve_campaign_device_plan(
+        device_id="",
+        device_ids=(),
+        env_device_ids=("0", "2"),
+        visible_device_ids=("2",),
+    ) == ("2", ("2",))
+    assert resolve_campaign_device_plan(
+        device_id="1",
+        device_ids=(),
+        env_device_ids=(),
+        visible_device_ids=("1",),
+    ) == ("1", ("1",))
+    with pytest.raises(ValueError, match="not visible"):
+        resolve_campaign_device_plan(
+            device_id="0",
+            device_ids=(),
+            env_device_ids=("0", "2"),
+            visible_device_ids=("2",),
+        )
+    with pytest.raises(ValueError, match="no card visible"):
+        resolve_campaign_device_plan(
+            device_id="",
+            device_ids=(),
+            env_device_ids=("0", "2"),
+            visible_device_ids=("3",),
+        )
