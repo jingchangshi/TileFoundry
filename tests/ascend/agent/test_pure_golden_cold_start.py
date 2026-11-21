@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from textwrap import dedent
@@ -13,6 +14,7 @@ import pytest
 
 from tests.ascend.benchmarks.cannbench_contract import ParamBuilder
 from tilefoundry_ascend.agent.campaign import marathon
+from tilefoundry_ascend.agent.campaign import surrogate_cannbench
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     DEFAULT_REGIME_SPECS,
     CannbenchOpsRegistry,
@@ -26,6 +28,7 @@ from tilefoundry_ascend.agent.campaign.marathon import (
     MarathonConfig,
     _stage0_entrypoint_contract_error,
     build_marathon_arg_parser,
+    build_stage0_oracle_validator,
     build_stage0_static_validator,
     run_operator_marathon,
 )
@@ -39,17 +42,26 @@ from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
     prepare_operator_seed_or_takeover,
     validate_entrypoint_signature_compatibility,
 )
+from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+    L3AcceptanceResult,
+    _format_l3_failure_detail,
+)
+from tilefoundry_ascend.agent.orchestrator import gate_funnel
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
     check_npu_entrypoint_purity,
+    run_stage_b_ascendc_compile,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import GenerationRequest, MockLLMBackend
 from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
     PyTorchSemanticAnalyzer,
     RepresentativeCase,
 )
-from tilefoundry_ascend.ascend.target.dialect_surface import get_dialect_surface
+from tilefoundry_ascend.ascend.target.dialect_surface import (
+    CCE_CPP20_SURFACE,
+    get_dialect_surface,
+)
 
 
 def _real_cannbench_repo() -> Path | None:
@@ -969,3 +981,213 @@ def test_seed_module_abi_trackb_prompt_includes_compile_ascend_recipe() -> None:
     assert '__mix__(1, 2)' in prompt
     assert 'SOFTMAX_TRACKB_CU = r"""' in prompt
     assert "torch.npu.current_stream().npu_stream" in prompt
+
+
+def test_entrypoint_purity_allows_non_npu_guards_self_calls_and_ctypes_lib() -> None:
+    """Verify purity skips CPU guards, helpers, and ctypes handles while blocking NPU fallbacks."""
+    clean_src = dedent(
+        '''
+        import torch
+        import torch.nn.functional as F
+        from tilelang.contrib.bisheng import compile_ascend
+
+        RMS_NORM_TRACKB_CU = r"""
+        #include <tl_templates/ascend/common.h>
+        __global__ __aicore__ __vector__ void k(__gm__ float* x) {}
+        """
+
+        def _get_kernel(lib: object) -> object:
+            return lib
+
+        def _launch_helper(x: torch.Tensor, lib: object) -> torch.Tensor:
+            lib.rms_norm(x.data_ptr())
+            return x
+
+        def rms_norm(x: torch.Tensor, recurse: bool = False) -> torch.Tensor:
+            if not x.is_npu:
+                return F.softmax(x, dim=-1)
+            if x.device.type == "cpu":
+                return F.rms_norm(x, x.shape[-1:])
+            if x.device.type == "npu":
+                if recurse:
+                    return _launch_helper(x, _get_kernel(None))
+                return rms_norm(x.contiguous(), recurse=True)
+            else:
+                return F.softmax(x, dim=-1)
+
+        kernel = rms_norm
+        '''
+    )
+    assert check_npu_entrypoint_purity(clean_src, "rms_norm", track="cce_trackb") == []
+
+    bad_else = dedent(
+        '''
+        import torch
+        import torch.nn.functional as F
+
+        RMS_NORM_TRACKB_CU = r"""
+        #include <tl_templates/ascend/common.h>
+        __global__ __aicore__ __vector__ void k(__gm__ float* x) {}
+        """
+
+        def rms_norm(x: torch.Tensor) -> torch.Tensor:
+            if not x.is_npu:
+                return x
+            return F.rms_norm(x, x.shape[-1:])
+
+        kernel = rms_norm
+        '''
+    )
+    errs = check_npu_entrypoint_purity(bad_else, "rms_norm", track="cce_trackb")
+    assert any("npu_host_fallback_forbidden:rms_norm->rms_norm" in e for e in errs)
+
+
+def test_l3_failure_detail_preserves_compiler_and_comparison_diagnostics() -> None:
+    """Verify failed L3 status formatting preserves compiler stderr and comparison metrics."""
+    row = {"failures": ["NONZERO_EXIT", "OBSERVATION_MISMATCH: exitCodeZero"]}
+    obs = {"error": "failed"}
+    evidence = {
+        "failure": {
+            "case": "1",
+            "stage": "kernel",
+            "exceptionType": "RuntimeError",
+            "detail": (
+                "RuntimeError: Ascend compilation failed. Command: bisheng ... "
+                "Compiler output: ld.lld: error: undefined symbol: expf"
+            ),
+            "comparisons": [
+                {"name": "y", "passed": False, "max_abs_diff": 0.25, "atol": 1e-3}
+            ],
+        }
+    }
+    msg = _format_l3_failure_detail(row, obs, evidence)
+    assert "case=1 stage=kernel type=RuntimeError" in msg
+    assert "ld.lld: error: undefined symbol: expf" in msg
+    assert "max_abs_diff=0.25" in msg
+    assert "atol=0.001" in msg
+
+
+def test_stage_b_ascendc_verify_shared_link_catches_linker_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify optional shared-library link verification catches ld.lld undefined symbol errors."""
+    cann_root = tmp_path / "cann"
+    (cann_root / "include").mkdir(parents=True)
+    bisheng = cann_root / "bin" / "bisheng"
+    bisheng.parent.mkdir(parents=True)
+    bisheng.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    tu = (
+        '#include <tl_templates/ascend/common.h>\n'
+        '__global__ __aicore__ __vector__ void k(__gm__ float* x) {}\n'
+        'extern "C" int launch_k(void* s, void* x) { k<<<1, nullptr, s>>>((__gm__ float*)x); return 0; }\n'
+    )
+    monkeypatch.setattr(
+        gate_funnel, "_verify_object_has_instantiated_kernel", lambda *_a, **_kw: (True, "")
+    )
+    monkeypatch.setattr(gate_funnel, "_disassemble_object", lambda *_a, **_kw: "")
+
+    commands: list[list[str]] = []
+
+    def _run_c_pass_link_fail(cmd, **_kw):
+        cmd_list = [str(x) for x in cmd]
+        if cmd_list[0] != str(bisheng):
+            return subprocess.CompletedProcess(cmd_list, 0, stdout="", stderr="")
+        commands.append(cmd_list)
+        out_path = Path(cmd_list[cmd_list.index("-o") + 1])
+        if "-shared" in cmd_list:
+            return subprocess.CompletedProcess(
+                cmd_list, 1, stdout="", stderr="ld.lld: error: undefined symbol: expf\n"
+            )
+        out_path.write_bytes(b"\x7fELF")
+        return subprocess.CompletedProcess(cmd_list, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(gate_funnel.subprocess, "run", _run_c_pass_link_fail)
+
+    res_no_link = run_stage_b_ascendc_compile(
+        tu, bisheng_bin=bisheng, cann_root=cann_root, verify_shared_link=False
+    )
+    assert res_no_link.passed is True
+    assert len(commands) == 1
+
+    commands.clear()
+    res_fail_link = run_stage_b_ascendc_compile(
+        tu, bisheng_bin=bisheng, cann_root=cann_root, verify_shared_link=True
+    )
+    assert res_fail_link.passed is False
+    assert "stage_b_ascendc_shared_link_failed" in res_fail_link.error_message
+    assert "undefined symbol: expf" in res_fail_link.error_message
+    assert len(commands) == 2
+
+    def _run_both_pass(cmd, **_kw):
+        cmd_list = [str(x) for x in cmd]
+        out_path = Path(cmd_list[cmd_list.index("-o") + 1])
+        out_path.write_bytes(b"\x7fELF")
+        return subprocess.CompletedProcess(cmd_list, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(gate_funnel.subprocess, "run", _run_both_pass)
+    res_ok = run_stage_b_ascendc_compile(
+        tu, bisheng_bin=bisheng, cann_root=cann_root, verify_shared_link=True
+    )
+    assert res_ok.passed is True
+
+
+def test_stage0_oracle_validator_retries_transient_blocked_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify transient BLOCKED_ENV resource-busy results retry with backoff before returning."""
+    results = [
+        L3AcceptanceResult(
+            passed=False,
+            failure_kind="infrastructure",
+            error_message="L3 gate recorded status BLOCKED_ENV: ['resource busy: build:/repo/build']",
+        ),
+        L3AcceptanceResult(
+            passed=False,
+            failure_kind="infrastructure",
+            error_message="L3 gate recorded status BLOCKED_ENV: ['resource busy: build:/repo/build']",
+        ),
+        L3AcceptanceResult(
+            passed=True,
+            run_id="run-ok",
+            receipt_path=str(tmp_path / "receipt.json"),
+            candidate_sha256="abc",
+            state="FINISHED",
+        ),
+    ]
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    def _fake_l3(**kwargs: object) -> L3AcceptanceResult:
+        calls.append(str(kwargs.get("operator_name")))
+        return results[len(calls) - 1]
+
+    monkeypatch.setattr(marathon, "run_l3_full_contract_via_agent_gates", _fake_l3)
+    monkeypatch.setattr(marathon.time, "sleep", lambda sec: sleeps.append(float(sec)))
+
+    oracle = build_stage0_oracle_validator(
+        operator_name="level4/gqa",
+        staging_dir=tmp_path / "staging",
+        worktree=tmp_path,
+        device_id="0",
+        op_logger=logging.getLogger("test.oracle"),
+        blocked_env_max_retries=4,
+        blocked_env_backoff_sec=(10.0, 15.0),
+    )
+    outcome = oracle("kernel = object()\n")
+    assert outcome.passed is True
+    assert outcome.l3_run_id == "run-ok"
+    assert len(calls) == 3
+    assert sleeps == [10.0, 15.0]
+
+
+def test_cce_cpp20_surface_prompt_includes_dav3510_compiler_rules() -> None:
+    """Verify CCE C++20 surface reference teaches dav-3510 GM qualifiers, math, and callee rules."""
+    rendered = CCE_CPP20_SURFACE.render_prompt_reference()
+    assert "__gm__ T*" in rendered
+    assert "__builtin_expf" in rendered
+    assert "__simt_callee__" in rendered
+    assert "MODE_ZEROING" in rendered
+    assert 'if x.device.type != "npu":' in rendered

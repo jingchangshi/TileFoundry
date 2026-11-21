@@ -496,6 +496,7 @@ def _validate_stage0_track_b(
         compile_flags=flags,
         bisheng_bin=bisheng_bin,
         cann_root=cann_root,
+        verify_shared_link=True,
     )
     if not compiled.passed:
         return False, f"Track-B L1 bisheng compilation ({symbol}): {compiled.error_message}"
@@ -598,6 +599,8 @@ def build_stage0_oracle_validator(
     worktree: Path,
     device_id: str,
     op_logger: logging.Logger,
+    blocked_env_max_retries: int = 6,
+    blocked_env_backoff_sec: tuple[float, ...] = (10.0, 15.0, 20.0, 25.0, 30.0, 30.0),
 ) -> Callable[[str], OracleAccuracyResult]:
     """Build the NPU accuracy validator that stages seed bytes by digest before L3 verification."""
 
@@ -605,12 +608,38 @@ def build_stage0_oracle_validator(
         digest = hashlib.sha256(module_source.encode("utf-8")).hexdigest()
         staged_module = staging_dir / f"{digest}.py"
         atomic_write_text(staged_module, module_source)
-        result = run_l3_full_contract_via_agent_gates(
-            operator_name=operator_name,
-            candidate_module_path=staged_module,
-            source_root=worktree,
-            device_id=str(device_id),
-        )
+        max_retries = max(0, int(blocked_env_max_retries))
+        result: L3AcceptanceResult | None = None
+        for retry_idx in range(max_retries + 1):
+            result = run_l3_full_contract_via_agent_gates(
+                operator_name=operator_name,
+                candidate_module_path=staged_module,
+                source_root=worktree,
+                device_id=str(device_id),
+            )
+            if result.passed:
+                break
+            err_low = (result.error_message or "").lower()
+            is_transient_blocked_env = result.failure_kind != "candidate" and (
+                "blocked_env" in err_low or "resource busy" in err_low
+            )
+            if not is_transient_blocked_env or retry_idx >= max_retries:
+                break
+            wait_sec = (
+                float(blocked_env_backoff_sec[min(retry_idx, len(blocked_env_backoff_sec) - 1)])
+                if blocked_env_backoff_sec
+                else 10.0
+            )
+            op_logger.info(
+                "STAGE0_ORACLE_RETRY_BLOCKED_ENV op=%s retry=%d/%d wait=%.1fs detail=%s",
+                operator_name,
+                retry_idx + 1,
+                max_retries,
+                wait_sec,
+                result.error_message[:240],
+            )
+            time.sleep(wait_sec)
+        assert result is not None
         op_logger.info(
             "STAGE0_ORACLE op=%s sha256=%s passed=%s run_id=%s state=%s elapsed=%.1fs",
             operator_name,
@@ -731,6 +760,7 @@ def prepare_marathon_seed(
                 authored_hir_source=None,
                 scheduled_hir_source=None,
                 force_cold_start=effective_cold_start,
+                max_seed_attempts=6,
                 desc_text=desc_text,
                 golden_contract=golden_contract,
             )
@@ -1685,7 +1715,12 @@ def run_operator_marathon(
         else (state_dir / "campaign_kb.yaml")
     )
 
-    _configure_marathon_logging(cfg.log_path)
+    resolved_log_path = (
+        Path(cfg.log_path).expanduser().resolve()
+        if cfg.log_path is not None
+        else (state_dir / "marathon.log")
+    )
+    _configure_marathon_logging(resolved_log_path)
     op_logger = logging.getLogger(f"tilefoundry_ascend.marathon.{short_op}")
 
     env_file = ensure_marathon_env_file(

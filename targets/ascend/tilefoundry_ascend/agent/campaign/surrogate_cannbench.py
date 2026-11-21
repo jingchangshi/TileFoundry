@@ -2899,6 +2899,74 @@ def l3_failure_result_from_observation(
     )
 
 
+def _format_l3_failure_detail(
+    row: Mapping[str, object],
+    observation: Mapping[str, object],
+    evidence: Mapping[str, object],
+) -> str:
+    """Extract concise compiler/runtime/comparison diagnostics from a failed L3 gate."""
+    base_raw = row.get("failures") or observation.get("error") or "no detail"
+    base_text = str(base_raw)
+    failure = evidence.get("failure")
+    if not isinstance(failure, Mapping) or not failure:
+        failures_seq = evidence.get("failures")
+        if (
+            isinstance(failures_seq, Sequence)
+            and not isinstance(failures_seq, (str, bytes))
+            and failures_seq
+            and isinstance(failures_seq[0], Mapping)
+        ):
+            failure = failures_seq[0]
+        else:
+            failure = None
+    if not isinstance(failure, Mapping):
+        return base_text
+
+    parts: list[str] = []
+    case_id = failure.get("case")
+    stage = failure.get("stage")
+    exc_type = failure.get("exceptionType")
+    header_bits = [
+        f"case={case_id}" if case_id is not None else "",
+        f"stage={stage}" if stage else "",
+        f"type={exc_type}" if exc_type else "",
+    ]
+    header = " ".join(bit for bit in header_bits if bit)
+    if header:
+        parts.append(header)
+
+    detail_raw = str(failure.get("detail") or "").strip()
+    if detail_raw:
+        marker = "Compiler output:"
+        idx = detail_raw.find(marker)
+        if idx >= 0:
+            parts.append(detail_raw[idx : idx + 900])
+        elif len(detail_raw) <= 900:
+            parts.append(detail_raw)
+        else:
+            parts.append(f"{detail_raw[:420]} ... {detail_raw[-450:]}")
+
+    comparisons = failure.get("comparisons")
+    if isinstance(comparisons, Sequence) and not isinstance(comparisons, (str, bytes)):
+        failing_cmp = next(
+            (c for c in comparisons if isinstance(c, Mapping) and c.get("passed") is False),
+            None,
+        )
+        if isinstance(failing_cmp, Mapping):
+            cmp_bits: list[str] = []
+            for key in ("name", "max_abs_diff", "max_rel_diff", "atol", "rtol", "detail"):
+                val = failing_cmp.get(key)
+                if val is not None and str(val).strip():
+                    cmp_bits.append(f"{key}={val}")
+            if cmp_bits:
+                parts.append("comparison(" + ", ".join(cmp_bits) + ")")
+
+    extracted = " | ".join(part for part in parts if part)
+    if not extracted:
+        return base_text
+    return f"{base_text} | {extracted}"
+
+
 def run_l3_full_contract_via_agent_gates(
     *,
     operator_name: str | None = None,
@@ -3012,7 +3080,7 @@ def run_l3_full_contract_via_agent_gates(
             run_id=execution.run_id,
             receipt_path=execution.receipt_path,
             elapsed_sec=time.monotonic() - started,
-            error_message=message[-1000:],
+            error_message=message[:1800],
             failure_kind=failure_kind,
             failure_category=_l3_signed_failure_category(observation, evidence),
             pending=failure_kind != FAILURE_KIND_CANDIDATE,
@@ -3027,7 +3095,7 @@ def run_l3_full_contract_via_agent_gates(
     if recorded_status != "PASS":
         return _reject(
             f"L3 gate recorded status {recorded_status or 'missing'}: "
-            f"{row.get('failures') or observation.get('error') or 'no detail'}",
+            f"{_format_l3_failure_detail(row, observation, evidence)}",
             failure_kind=_l3_failure_kind(observation, evidence, coverage),
         )
     if not execution.verified:

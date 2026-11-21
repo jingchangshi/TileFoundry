@@ -163,6 +163,50 @@ _FORBIDDEN_NPU_HOST_CALLS: frozenset[str] = frozenset(
         "scaled_dot_product_attention",
     }
 )
+_CTYPES_LIB_RECEIVERS: frozenset[str] = frozenset(
+    {"lib", "_lib", "so_lib", "dll", "cdll", "handle"}
+)
+
+
+def _is_non_npu_guard(cond_txt: str) -> bool:
+    compact = cond_txt.replace(" ", "")
+    if "device.type" in cond_txt and (
+        "!=" in cond_txt or '=="cpu"' in compact or "=='cpu'" in compact
+    ):
+        return True
+    return "is_npu" in cond_txt and (
+        "not " in cond_txt or "==False" in compact or "isFalse" in compact
+    )
+
+
+def _is_npu_positive_guard(cond_txt: str) -> bool:
+    compact = cond_txt.replace(" ", "")
+    if "device.type" in cond_txt and ('=="npu"' in compact or "=='npu'" in compact):
+        return True
+    return "is_npu" in cond_txt and not _is_non_npu_guard(cond_txt)
+
+
+def _collect_npu_reachable_nodes(
+    module_source: str,
+    stmts: Sequence[ast.stmt],
+) -> list[ast.AST]:
+    """Return AST nodes on reachable NPU execution paths, skipping non-NPU fallback branches."""
+    collected: list[ast.AST] = []
+    for stmt in stmts:
+        if isinstance(stmt, ast.If):
+            cond_txt = ast.get_source_segment(module_source, stmt.test) or ""
+            collected.append(stmt.test)
+            if _is_non_npu_guard(cond_txt):
+                collected.extend(_collect_npu_reachable_nodes(module_source, stmt.orelse))
+                continue
+            if _is_npu_positive_guard(cond_txt):
+                collected.extend(_collect_npu_reachable_nodes(module_source, stmt.body))
+                continue
+            collected.extend(_collect_npu_reachable_nodes(module_source, stmt.body))
+            collected.extend(_collect_npu_reachable_nodes(module_source, stmt.orelse))
+            continue
+        collected.append(stmt)
+    return collected
 
 
 def _detect_module_entrypoint(tree: ast.Module) -> str:
@@ -209,24 +253,28 @@ def check_npu_entrypoint_purity(
         visited.add(fn_name)
         fnode = funcs[fn_name]
         reachable_src.append(ast.get_source_segment(module_source, fnode) or "")
-        for stmt in fnode.body:
-            cond_txt = (
-                (ast.get_source_segment(module_source, stmt.test) or "")
-                if isinstance(stmt, ast.If)
-                else ""
-            )
-            if isinstance(stmt, ast.If) and "device.type" in cond_txt and "!=" in cond_txt:
-                continue
-            for sub in ast.walk(stmt):
+        for node in _collect_npu_reachable_nodes(module_source, fnode.body):
+            for sub in ast.walk(node):
                 if isinstance(sub, ast.Call):
                     callee = (
                         sub.func.id
                         if isinstance(sub.func, ast.Name)
                         else (sub.func.attr if isinstance(sub.func, ast.Attribute) else "")
                     )
-                    if callee in _FORBIDDEN_NPU_HOST_CALLS:
+                    is_local_fn = isinstance(sub.func, ast.Name) and sub.func.id in funcs
+                    is_ctypes_lib = (
+                        isinstance(sub.func, ast.Attribute)
+                        and isinstance(sub.func.value, ast.Name)
+                        and sub.func.value.id.lower() in _CTYPES_LIB_RECEIVERS
+                    )
+                    if (
+                        callee in _FORBIDDEN_NPU_HOST_CALLS
+                        and not is_local_fn
+                        and not is_ctypes_lib
+                    ):
                         errors.append(f"npu_host_fallback_forbidden:{fn_name}->{callee}")
-                    if isinstance(sub.func, ast.Name) and sub.func.id in funcs:
+                    if is_local_fn:
+                        assert isinstance(sub.func, ast.Name)
                         queue.append(sub.func.id)
                 elif (
                     isinstance(sub, ast.Name)
@@ -2326,6 +2374,7 @@ def run_stage_b_ascendc_compile(
     asc_devkit_include: str | Path | None = None,
     timeout_sec: int = 120,
     enable_device_compile: bool = True,
+    verify_shared_link: bool = False,
 ) -> StageBResult:
     """Verify native AscendC C++ translation unit compilation via bisheng in an isolated tempdir."""
     if not enable_device_compile:
@@ -2488,6 +2537,66 @@ def run_stage_b_ascendc_compile(
                 compiler_summary=summary,
                 microarch_profile=ma_profile,
             )
+
+        if (
+            verify_shared_link
+            and 'extern "C"' in cpp_source
+            and "<<<" in cpp_source
+            and not has_explicit_x
+            and env.get("ASCEND_HOME_PATH")
+        ):
+            so_path = Path(tmp_dir) / "kernel.so"
+            link_cmd = [
+                resolved_bisheng,
+                "-O2",
+                "-fPIC",
+                *std_flags,
+                "-mllvm",
+                "-cce-aicore-dcpreload-args=false",
+                f"--npu-arch={arch}",
+                *include_flags,
+                *extra_flags,
+                "-Wl,--no-mmap-output-file",
+                "-shared",
+                str(src_path),
+                "-o",
+                str(so_path),
+            ]
+            try:
+                link_proc = subprocess.run(
+                    link_cmd,
+                    text=True,
+                    capture_output=True,
+                    cwd=tmp_dir,
+                    env=env,
+                    timeout=timeout_sec,
+                )
+            except subprocess.TimeoutExpired:
+                return StageBResult(
+                    passed=False,
+                    error_message=f"stage_b_ascendc_shared_link_timeout:{timeout_sec}s",
+                    elapsed_sec=time.monotonic() - t0,
+                    spill_bytes=spill_bytes,
+                    vloopv2_hit=vloopv2_hit,
+                    compiler_summary=summary,
+                    microarch_profile=ma_profile,
+                )
+            link_raw = (link_proc.stderr or "") + "\n" + (link_proc.stdout or "")
+            if link_proc.returncode != 0 or not so_path.is_file():
+                link_detail = _bounded_compile_diagnostic(link_raw)
+                return StageBResult(
+                    passed=False,
+                    error_message=(
+                        f"stage_b_ascendc_shared_link_failed (rc={link_proc.returncode}): "
+                        f"{link_detail}"
+                    ),
+                    elapsed_sec=time.monotonic() - t0,
+                    spill_bytes=spill_bytes,
+                    vloopv2_hit=vloopv2_hit,
+                    compiler_summary=summary,
+                    microarch_profile=ma_profile,
+                    full_diagnostic=link_raw,
+                )
 
     return StageBResult(
         passed=True,

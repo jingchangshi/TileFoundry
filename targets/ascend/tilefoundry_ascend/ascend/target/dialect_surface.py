@@ -498,6 +498,26 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
             "(for example float tmp[64];) or runtime-indexed local structs inside a "
             "__simd_vf__ body; stage scratch in __ubuf__ pointer ranges or vector registers."
         ),
+        (
+            "Every __global__ GM pointer parameter must carry literal __gm__ T* directly in "
+            "the signature (never via a using/typedef alias); in host extern \"C\" launchers "
+            "cast void* arguments with C-style (__gm__ T*)ptr (never static_cast<__gm__ T*>)."
+        ),
+        (
+            "Never call __builtin_expf, std::exp, or std::sqrt inside device kernels "
+            "(ld.lld fails with undefined symbol). Inside __simt_vf__, call expf(x), sqrtf(x), "
+            "rsqrtf(x), or logf(x) from <tl_templates/ascend/common.h> (simt_api/math_functions.h); "
+            "inside __simd_vf__, call simd_inst::vexp(v, mask, MODE_ZEROING) or "
+            "simd_inst::vsqrt(v, mask, MODE_ZEROING)."
+        ),
+        (
+            "Helpers called from __simd_vf__ must be annotated __simd_callee__; helpers called "
+            "from __simt_vf__ must be annotated __simt_callee__ (not bare __aicore__)."
+        ),
+        (
+            "In Python entrypoints, guard any non-NPU CPU fallback inside "
+            "if x.device.type != \"npu\":."
+        ),
     ),
 )
 

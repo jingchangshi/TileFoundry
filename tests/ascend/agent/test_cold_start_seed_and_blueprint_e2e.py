@@ -1949,7 +1949,9 @@ def test_stage0_trackb_validator_instantiates_each_regime_before_gates(
         compile_flags: Sequence[str],
         bisheng_bin: str | None,
         cann_root: Path | None,
+        verify_shared_link: bool = False,
     ) -> StageBResult:
+        _ = verify_shared_link
         compiled.append(cpp_source)
         return StageBResult(passed=True)
 
