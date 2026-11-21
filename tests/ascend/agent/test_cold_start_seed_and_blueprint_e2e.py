@@ -1700,7 +1700,7 @@ def test_trackb_round_evidence_persists_blueprint_observation_and_provenance(
         checks=(check, unsubmitted_check),
         l2_results={"r2_trackb": _surrogate_result("exp")},
         active_kernel="gather_kernel",
-        l2_run_id="run-fast-42",
+        l2_run_ids={"r2_trackb": "run-fast-42"},
         parent_sha256=parent_sha,
         parent_l1_summary=compiler_summary,
         parent_l1_summary_source="bisheng_l1",

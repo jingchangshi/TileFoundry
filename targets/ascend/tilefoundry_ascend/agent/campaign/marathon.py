@@ -51,6 +51,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     _NON_AGENT_GATES_ENV_KEYS,
     DEFAULT_L4_CANNBENCH_WAIT_SEC,
     CandidateSurrogateResult,
+    L2BatchResults,
     L3AcceptanceResult,
     _format_env_line,
     _validate_llm_api_key_env,
@@ -1114,7 +1115,7 @@ def build_resilient_l2_evaluator(
     repeat: int = 5,
     batch_fn: Callable[..., tuple[dict[str, CandidateSurrogateResult], str, str]] | None = None,
     op_logger: logging.Logger | None = None,
-) -> Callable[[Sequence[tuple[str, Path]], Sequence[AnchorCaseSpec]], dict[str, CandidateSurrogateResult]]:
+) -> Callable[[Sequence[tuple[str, Path]], Sequence[AnchorCaseSpec]], L2BatchResults]:
     """Build batched L2 evaluator with single-candidate isolation fallback on failures."""
     log = op_logger or logger
     eval_fn = batch_fn or run_surrogate_batch_via_agent_gates
@@ -1122,10 +1123,10 @@ def build_resilient_l2_evaluator(
     def _eval(
         cands: Sequence[tuple[str, Path]],
         anc_seq: Sequence[AnchorCaseSpec],
-    ) -> dict[str, CandidateSurrogateResult]:
+    ) -> L2BatchResults:
         cand_list = list(cands)
         try:
-            res, _rid, _rcp = eval_fn(
+            res, run_id, _rcp = eval_fn(
                 operator_name,
                 cand_list,
                 anc_seq,
@@ -1137,7 +1138,7 @@ def build_resilient_l2_evaluator(
                 require_all_passed=False,
                 timeout_sec=660,
             )
-            return res
+            return L2BatchResults(res, {cid: run_id for cid in res})
         except Exception as exc:
             if len(cand_list) <= 1:
                 raise
@@ -1148,10 +1149,11 @@ def build_resilient_l2_evaluator(
                 [cid for cid, _ in cand_list],
             )
             merged: dict[str, CandidateSurrogateResult] = {}
+            run_ids: dict[str, str] = {}
             last_exc: Exception | None = None
             for cid, mod_path in cand_list:
                 try:
-                    one_res, _rid, _rcp = eval_fn(
+                    one_res, run_id, _rcp = eval_fn(
                         operator_name,
                         [(cid, mod_path)],
                         anc_seq,
@@ -1164,6 +1166,7 @@ def build_resilient_l2_evaluator(
                         timeout_sec=360,
                     )
                     merged.update(one_res)
+                    run_ids.update({cand_id: run_id for cand_id in one_res})
                 except Exception as sub_exc:
                     last_exc = sub_exc
                     log.warning(
@@ -1173,7 +1176,7 @@ def build_resilient_l2_evaluator(
                         sub_exc,
                     )
             if merged:
-                return merged
+                return L2BatchResults(merged, run_ids)
             assert last_exc is not None
             raise last_exc
 

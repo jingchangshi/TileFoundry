@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import json
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -354,6 +354,64 @@ def _setup_mock_cann_repo(tmp_path: Path) -> Path:
     }
     (meta_dir / "950pr.json").write_text(json.dumps(meta_payload), encoding="utf-8")
     return repo
+
+
+def test_run_l2_batch_binds_per_candidate_run_ids_and_accepts_legacy_mapping(
+    tmp_path: Path,
+) -> None:
+    """Injected L2 evaluators keep run ids per measured candidate without breaking mappings."""
+    target = tmp_path / "kernels.py"
+    target.write_text("def _build_regime_a():\n    pass\n", encoding="utf-8")
+    anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 3.0),)
+    module_path = tmp_path / "candidate.py"
+    module_path.write_text("def _build_regime_a():\n    pass\n", encoding="utf-8")
+
+    def _result(cid: str, active_anchors: Sequence[AnchorCaseSpec]) -> CandidateSurrogateResult:
+        return _make_surrogate_result(
+            cid, "attention_residual", tuple(active_anchors), {2: 5.0}
+        )
+
+    def _legacy_evaluator(
+        cands: Sequence[tuple[str, Path]],
+        active_anchors: Sequence[AnchorCaseSpec],
+    ) -> dict[str, CandidateSurrogateResult]:
+        return {cid: _result(cid, active_anchors) for cid, _path in cands}
+
+    def _measured_evaluator(
+        cands: Sequence[tuple[str, Path]],
+        active_anchors: Sequence[AnchorCaseSpec],
+    ) -> surrogate_cannbench.L2BatchResults:
+        results = {cid: _result(cid, active_anchors) for cid, _path in cands}
+        return surrogate_cannbench.L2BatchResults(
+            results, {"cand_a": "run-a", "cand_b": "run-b"}
+        )
+
+    def _runner(
+        evaluator: Callable[
+            [Sequence[tuple[str, Path]], Sequence[AnchorCaseSpec]],
+            Mapping[str, CandidateSurrogateResult],
+        ],
+    ) -> PerfTargetCampaignRunner:
+        return PerfTargetCampaignRunner(
+            config=CampaignConfig(operator_name="attention_residual", max_rounds=0),
+            target_module_path=target,
+            anchors=anchors,
+            regime_specs=(RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),),
+            regime_blueprints={"regime_a": _blueprint_packet()},
+            l2_batch_evaluator=evaluator,
+        )
+
+    legacy_results, legacy_run_ids = _runner(_legacy_evaluator)._run_l2_batch(
+        [("cand_a", module_path)], anchors
+    )
+    assert set(legacy_results) == {"cand_a"}
+    assert legacy_run_ids == {}
+
+    measured_results, measured_run_ids = _runner(_measured_evaluator)._run_l2_batch(
+        [("cand_a", module_path), ("cand_b", module_path)], anchors
+    )
+    assert set(measured_results) == {"cand_a", "cand_b"}
+    assert measured_run_ids == {"cand_a": "run-a", "cand_b": "run-b"}
 
 
 def test_anchor_registry_dynamic_append_and_eq3_scoring(tmp_path: Path) -> None:

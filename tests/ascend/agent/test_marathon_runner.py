@@ -178,7 +178,7 @@ def test_extreme_runner_rotation_and_resilient_l2(tmp_path: Path) -> None:
         if len(cands) > 1:
             raise RuntimeError("transient batch timeout")
         cid, _ = cands[0]
-        return {cid: best}, "rid", "rcp"
+        return {cid: best}, f"rid_{cid}", "rcp"
 
     eval_fn = build_resilient_l2_evaluator(
         operator_name="attention_residual",
@@ -189,6 +189,26 @@ def test_extreme_runner_rotation_and_resilient_l2(tmp_path: Path) -> None:
     )
     merged = eval_fn([("c1", target), ("c2", target)], anchors)
     assert set(merged) == {"c1", "c2"}
+    assert merged.run_ids == {"c1": "rid_c1", "c2": "rid_c2"}
+
+    def _shared_batch(
+        _op,
+        cands,
+        anc_seq,
+        **_kwargs,
+    ):
+        return {cid: best for cid, _path in cands}, "batch-rid", "rcp"
+
+    shared_fn = build_resilient_l2_evaluator(
+        operator_name="attention_residual",
+        worktree=tmp_path,
+        env_file=tmp_path / "env.sh",
+        device_id="1",
+        batch_fn=_shared_batch,
+    )
+    shared = shared_fn([("c1", target), ("c2", target)], anchors)
+    assert set(shared) == {"c1", "c2"}
+    assert shared.run_ids == {"c1": "batch-rid", "c2": "batch-rid"}
 
 
 @pytest.mark.parametrize("entrypoint", ["dedicated", "campaign_marathon", "campaign"])

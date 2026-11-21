@@ -266,6 +266,23 @@ class CandidateSurrogateResult:
         )
 
 
+class L2BatchResults(dict[str, CandidateSurrogateResult]):
+    """L2 candidate results that also carry the V2 run id of their measuring execution.
+
+    The mapping protocol is unchanged so legacy evaluators can keep returning plain
+    dictionaries; ``run_ids`` maps each candidate that was actually measured to the
+    AgentGates run that produced its L2 result.
+    """
+
+    def __init__(
+        self,
+        results: Mapping[str, CandidateSurrogateResult],
+        run_ids: Mapping[str, str],
+    ) -> None:
+        super().__init__(results)
+        self.run_ids: dict[str, str] = dict(run_ids)
+
+
 @dataclass(frozen=True)
 class L0L1CandidateCheck:
     """Host-CPU Stage L0 static + Stage L1 bisheng pre-filter result for one candidate."""

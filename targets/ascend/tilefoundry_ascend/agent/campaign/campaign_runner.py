@@ -52,6 +52,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     FAILURE_KIND_INFRASTRUCTURE,
     CandidateSurrogateResult,
     L0L1CandidateCheck,
+    L2BatchResults,
     L3AcceptanceResult,
     L4CannbenchResult,
     bottleneck_anchor_for_regime,
@@ -2757,9 +2758,17 @@ class PerfTargetCampaignRunner:
         self,
         candidates: Sequence[tuple[str, Path]],
         active_anchors: Sequence[AnchorCaseSpec],
-    ) -> tuple[dict[str, CandidateSurrogateResult], str]:
+    ) -> tuple[dict[str, CandidateSurrogateResult], dict[str, str]]:
+        """Evaluate one batch and return results plus each measured candidate's V2 run id.
+
+        Legacy injected evaluators return a plain mapping; their results keep working and
+        carry no run ids rather than borrowing an id from a different execution.
+        """
         if self._l2_batch_evaluator is not None:
-            return dict(self._l2_batch_evaluator(candidates, active_anchors)), ""
+            evaluated = self._l2_batch_evaluator(candidates, active_anchors)
+            if isinstance(evaluated, L2BatchResults):
+                return dict(evaluated), dict(evaluated.run_ids)
+            return dict(evaluated), {}
         results, run_id, _receipt = run_surrogate_batch_via_agent_gates(
             self._config.operator_name,
             candidates,
@@ -2771,7 +2780,7 @@ class PerfTargetCampaignRunner:
             repeat=self._config.repeat,
             require_all_passed=False,
         )
-        return results, run_id
+        return results, {candidate_id: run_id for candidate_id in results}
 
     def _run_l3_contract(
         self,
@@ -3789,7 +3798,7 @@ class PerfTargetCampaignRunner:
         with tempfile.TemporaryDirectory(prefix="tf_camp_base_") as tmp_dir:
             mod_path = Path(tmp_dir) / "incumbent.py"
             mod_path.write_text(incumbent_source, encoding="utf-8")
-            results, _run_id = self._run_l2_batch(
+            results, _run_ids = self._run_l2_batch(
                 [("incumbent_baseline", mod_path)], active_anchors
             )
         if "incumbent_baseline" not in results:
@@ -4171,7 +4180,7 @@ class PerfTargetCampaignRunner:
                     cpath.write_text(ablated_src, encoding="utf-8")
                     cand_files.append((chunk_id, cpath))
                 try:
-                    batch_res, _run_id = self._run_l2_batch(cand_files, regime_anchors)
+                    batch_res, _run_ids = self._run_l2_batch(cand_files, regime_anchors)
                 except (OSError, subprocess.SubprocessError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
                     logger.debug("Flywheel batched ablation timing skipped: %s", exc)
                     return {}
@@ -5021,7 +5030,7 @@ class PerfTargetCampaignRunner:
         checks: Sequence[L0L1CandidateCheck],
         l2_results: Mapping[str, CandidateSurrogateResult],
         active_kernel: str,
-        l2_run_id: str,
+        l2_run_ids: Mapping[str, str],
         parent_sha256: str,
         parent_l1_summary: BishengResourceSummary | None,
         parent_l1_summary_source: str,
@@ -5115,7 +5124,11 @@ class PerfTargetCampaignRunner:
                     "candidate_id": chk.candidate_id,
                     "candidate_sha256": cand_sha,
                     "active_kernel": active_kernel,
-                    "l2_run_id": l2_run_id if l2_result is not None else "",
+                    "l2_run_id": (
+                        l2_run_ids.get(chk.candidate_id, "")
+                        if l2_result is not None
+                        else ""
+                    ),
                     "parent_candidate_sha256": parent_sha256,
                     "parent_compiler_summary": (
                         dict(parent_summary_payload)
@@ -5767,7 +5780,7 @@ class PerfTargetCampaignRunner:
                     )
 
         l2_results: dict[str, CandidateSurrogateResult] = {}
-        l2_run_id = ""
+        l2_run_ids: dict[str, str] = {}
         if passed_checks:
             with tempfile.TemporaryDirectory(prefix=f"tf_camp_r{round_idx}_") as tmp_dir:
                 cand_paths: list[tuple[str, Path]] = []
@@ -5776,7 +5789,7 @@ class PerfTargetCampaignRunner:
                     cand_file.write_text(chk.patched_module_source, encoding="utf-8")
                     cand_paths.append((chk.candidate_id, cand_file))
                 try:
-                    l2_results, l2_run_id = self._run_l2_batch(cand_paths, active_anchors)
+                    l2_results, l2_run_ids = self._run_l2_batch(cand_paths, active_anchors)
                 except (OSError, subprocess.SubprocessError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
                     logger.warning(
                         "Round %d L2 batch failed after retries: %s",
@@ -5784,6 +5797,7 @@ class PerfTargetCampaignRunner:
                         exc,
                     )
                     l2_results = {}
+                    l2_run_ids = {}
                     for chk in passed_checks:
                         failed_entries.append((chk.candidate_id, "l2_error", str(exc)[:1500]))
 
@@ -6198,7 +6212,7 @@ class PerfTargetCampaignRunner:
             checks=l0_l1_checks,
             l2_results=l2_results,
             active_kernel=round_active_kernel,
-            l2_run_id=l2_run_id,
+            l2_run_ids=l2_run_ids,
             parent_sha256=parent_sha,
             parent_l1_summary=parent_l1_summary,
             parent_l1_summary_source=parent_l1_summary_source,
