@@ -8,7 +8,7 @@ from __future__ import annotations
 import pytest
 
 from tilefoundry.ir.core import Var, VerifyError
-from tilefoundry.ir.tir.flag import CompletionKind, Drain, FlagSet, FlagWait
+from tilefoundry.ir.tir.flag import CompletionKind, Drain, FlagSet
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Evaluate, MeshScope, Sequential
 from tilefoundry.ir.types import Layout, Mesh, Topology, make_tensor_type

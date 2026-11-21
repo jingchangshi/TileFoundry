@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 import tempfile
 
@@ -14,9 +15,12 @@ from tilefoundry.analysis.pipeline_declarations import (
 from tilefoundry.analysis.pipeline_reader import collect_buffer_versions
 from tilefoundry.cli.source import load_authored_ir
 from tilefoundry.inspection import as_script
+from tilefoundry.ir.core import Constant
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.pipeline import PipelineError, PipelineSpec
-from tilefoundry.ir.visitor import ExprCloner, collect_exprs
+from tilefoundry.ir.hir.specialize import InstantiateDimensionCloner
+from tilefoundry.ir.tir.stmts import For, Sequential
+from tilefoundry.ir.visitor import ExprCloner, _rebuild_stmt_children, collect_exprs
 
 HEADER = (
     "from __future__ import annotations\n\n"
@@ -143,8 +147,6 @@ def test_clone_preserves_the_declaration():
 
 
 def test_specialize_preserves_the_declaration():
-    from tilefoundry.ir.hir.specialize import InstantiateDimensionCloner
-
     module, _ = build(
         "for i in tf.pipelined(4, max_stage=2, max_buffer_versions=2, enable_offset=False):"
     )
@@ -157,8 +159,6 @@ def test_specialize_preserves_the_declaration():
 
 
 def test_bad_control_lost_pipeline_declaration_is_caught():
-    import dataclasses
-
     module, _ = build("for i in tf.pipelined(4, max_stage=2, max_buffer_versions=2):")
     loop = only_loop(module)
     assert loop.pipeline is not None
@@ -223,9 +223,6 @@ def test_verify_buffer_versions_needs_a_real_reader():
 
 
 def test_tir_for_carries_pipeline_through_stmt_rebuild():
-    from tilefoundry.ir.tir.stmts import For, Sequential
-    from tilefoundry.ir.visitor import _rebuild_stmt_children
-
     module, _ = build(
         "for i in tf.pipelined(4, max_stage=2, max_buffer_versions=2, enable_offset=True):"
     )
@@ -240,8 +237,6 @@ def test_tir_for_carries_pipeline_through_stmt_rebuild():
 
 
 def test_tir_for_without_pipeline_is_distinguishable_from_one_with_it():
-    from tilefoundry.ir.tir.stmts import For, Sequential
-
     module, _ = build("for i in tf.pipelined(4, max_stage=2, max_buffer_versions=2):")
     loop = only_loop(module)
     bare = For(loop.induction_var, loop.start, loop.extent, loop.step, Sequential(()))
@@ -264,7 +259,6 @@ def test_symbolic_extent_is_kept_not_normalized_to_zero():
         header_extra='N = DimVar("n", 0, 64)\n',
     )
     loop = only_loop(module)
-    from tilefoundry.ir.core import Constant
 
     extent = loop.extent
     assert not isinstance(extent, Constant) or extent.value != 0
