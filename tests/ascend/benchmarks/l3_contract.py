@@ -52,6 +52,8 @@ from types import ModuleType
 
 import yaml
 
+from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
+
 EVIDENCE_ENV = "TF_L3_EVIDENCE_PATH"
 PROFILE_ENV = "TF_L3_PROFILE"
 TARGET_ENV = "TF_L3_TARGET_OPERATOR"
@@ -398,8 +400,6 @@ def load_supplemental_mla_ids(path: Path = SUPPLEMENTAL_MLA_PATH) -> tuple[str, 
 
 
 def _resolve_generic_contract(target: str, source_root: Path) -> TargetContract:
-    from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
-
     spec = CannbenchOpsRegistry(source_root=source_root).resolve(target)
     case_ids = load_case_ids(spec.op_dir)
     return TargetContract(

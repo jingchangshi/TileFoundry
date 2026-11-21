@@ -13,9 +13,8 @@ import os
 import signal
 from pathlib import Path
 
-import pytest
-
 import l3_contract
+import pytest
 
 _ACCEPTANCE_FILE = "test_npu_acceptance.py"
 

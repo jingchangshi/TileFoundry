@@ -8,14 +8,15 @@
 Locates ``cannbench_contract.py`` in this checkout or an archived source
 snapshot and delegates every case to the shared harness.
 """
-from pathlib import Path
+import importlib
 import sys
+from pathlib import Path
 
 for parent in Path(__file__).resolve().parents:
     if (parent / 'cannbench_contract.py').is_file():
         sys.path.insert(0, str(parent))
         break
-from cannbench_contract import Harness, load_cases
+Harness = importlib.import_module('cannbench_contract').Harness
 
 
 def main(operator_api, observer=None, node=None):

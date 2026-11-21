@@ -116,5 +116,11 @@ ignore = ["E501", "F821", "E741"]
 # `src/` uses explicit imports except for the curated DSL re-exports.
 "tests/**/*.py" = ["F403", "F405"]
 "src/tilefoundry/dsl/__init__.py" = ["F403"]
+# Keep byte-identical CANNBench fixtures pinned by tests/ascend/benchmarks/source_manifest.json.
+"tests/ascend/benchmarks/attention_residual/bench_attention_residual.py" = ["I001"]
+"tests/ascend/benchmarks/attention_residual/golden.py" = ["D415"]
+"tests/ascend/benchmarks/mla/bench_mla.py" = ["I001"]
+"tests/ascend/benchmarks/mla/golden.py" = ["D212", "D415"]
+
 [tool.ruff.lint.pydocstyle]
 convention = "google"

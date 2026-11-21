@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -15,11 +16,11 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from xml.etree import ElementTree
 
-import pytest
-import torch
-
 import cannbench_contract
 import l3_contract
+import pytest
+import torch
+from _pytest.outcomes import Exit, Skipped
 
 
 def _unit_contract(tmp_path: Path) -> l3_contract.TargetContract:
@@ -882,8 +883,6 @@ def test_comparator_fallback_uses_cannbench_thresholds_and_native(
 
 
 def _acceptance_module() -> ModuleType:
-    import importlib.util
-
     spec = importlib.util.spec_from_file_location(
         "_l3_acceptance_under_test",
         Path(__file__).resolve().parent / "test_npu_acceptance.py",
@@ -904,8 +903,6 @@ class _FailingHarness:
 
 
 def test_mid_run_required_cache_error_blocks_the_promotion(tmp_path: Path) -> None:
-    from _pytest.outcomes import Exit
-
     acceptance = _acceptance_module()
     recorder = l3_contract.EvidenceRecorder(
         tmp_path / "evidence.json", _unit_contract(tmp_path)
@@ -1341,8 +1338,6 @@ def test_contract_case_identity_mismatch_is_coverage(tmp_path: Path) -> None:
 
 
 def test_skipped_node_is_coverage_not_infrastructure(tmp_path: Path) -> None:
-    from _pytest.outcomes import Skipped
-
     recorder = l3_contract.EvidenceRecorder(
         tmp_path / "evidence.json", _single_case_contract(tmp_path)
     )

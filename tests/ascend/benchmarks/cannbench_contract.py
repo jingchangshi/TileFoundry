@@ -7,31 +7,30 @@ Adapted from CANNBench e90a053df93997e026d19fd4fd42fc03cbf2b2fd modules
 ``utils/param_builder.py`` and ``eval/index_check.py``. See
 CANN_CONTRACT_LICENSE; there is no CANNBench API dependency at runtime.
 """
-from typing import Any, Callable, Dict, List, Optional, Tuple
-from inspect import Parameter, signature
-from pathlib import Path
-from types import SimpleNamespace
+import fcntl
 import hashlib
+import importlib.metadata
 import importlib.util
 import json
 import math
-import fcntl
-import importlib.metadata
 import os
 import platform
 import re
 import shutil
 import sys
 import tempfile
+from inspect import Parameter, signature
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
 import torch
 import yaml
-
 
 DTYPE_MAP: Dict = {}
 DTYPE_STR_MAP: Dict = {}
 
 def _build_dtype_map() -> Dict:
-    import torch
     dtype_map = {'float16': torch.float16, 'float32': torch.float32, 'float64': torch.float64, 'int8': torch.int8, 'int16': torch.int16, 'int32': torch.int32, 'int64': torch.int64, 'uint8': torch.uint8}
     optional_types = [('bfloat16', 'bfloat16'), ('uint16', 'uint16'), ('uint32', 'uint32'), ('uint64', 'uint64'), ('bool', 'bool')]
     for attr_name, key_name in optional_types:
@@ -241,7 +240,6 @@ class DataGenerator:
 
     @staticmethod
     def _is_special_float(val: Any) -> bool:
-        import math
         return isinstance(val, float) and (math.isnan(val) or math.isinf(val))
 
     def _is_tensor_list(self, shape_item: Any) -> bool:
@@ -284,8 +282,6 @@ class DataGenerator:
         return tensor_f64.to(dtype)
 
     def _gen_special(self, shape: List[int], dtype: torch.dtype, min_val: Any, max_val: Any, generator: Optional[torch.Generator]=None) -> torch.Tensor:
-        import math
-
         def to_float(v):
             if v == 'inf':
                 return float('inf')
@@ -486,11 +482,8 @@ class ParamBuilder:
         return params
 
     def _build_tensor_param_map(self, tensor_params: List[str], tensor_list_params: List[str], original_shapes: Optional[List], optional_tensor_params: List[str]=None, optional_tensor_list_params: List[str]=None, all_tensor_params_in_order: List[str]=None) -> Dict[int, str]:
-        optional_tensor_params = optional_tensor_params or []
-        optional_tensor_list_params = optional_tensor_list_params or []
         all_tensor_params_in_order = all_tensor_params_in_order or []
         required_params = tensor_params + tensor_list_params
-        optional_params = optional_tensor_params + optional_tensor_list_params
         if original_shapes is None:
             result = {}
             idx = 0
@@ -1110,7 +1103,7 @@ def _load_compare_case_result():
     if _COMPARE_CASE_RESULT is not None:
         return _COMPARE_CASE_RESULT
     try:
-        from npu_compare import compare_case_result as official
+        official = importlib.import_module('npu_compare').compare_case_result
         _COMPARE_CASE_RESULT = official
         return official
     except ImportError:
@@ -1123,7 +1116,7 @@ def _load_compare_case_result():
         )
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
-    from kernel_eval.utils.compare import compare_tensors
+    compare_tensors = importlib.import_module('kernel_eval.utils.compare').compare_tensors
 
     def compare_case_result(*, case_id, actual, golden, inputs=(), compute=True,
                             accuracy_mode=None, native_ref_operator=None, extra=None):
