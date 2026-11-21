@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -189,9 +191,415 @@ def _canonical_seed_track(initial_track: str) -> tuple[str, str]:
     backend = normalize_runtime_backend(initial_track)
     if backend == "tilelang_dsl":
         return "tilelang_dsl", "tilelang_dsl"
-    if backend in ("ascendc_trackb", "hybrid_trackb"):
+    if backend == "ascendc_trackb":
         return "ascendc_trackb", "cce_cpp20"
+    if backend == "hybrid_trackb":
+        return "hybrid_trackb", "cce_cpp20"
     raise RuntimeError(f"unsupported Stage-0 seed track {initial_track!r}")
+
+
+@dataclass(frozen=True)
+class GoldenParamSpec:
+    """Normalized parameter specification extracted from golden.py and proto.yaml."""
+
+    name: str
+    annotation: str
+    default_repr: str | None = None
+    has_default: bool = False
+    is_tensor: bool = False
+    is_tensor_list: bool = False
+    is_optional: bool = False
+
+
+@dataclass(frozen=True)
+class GoldenEntrypointContract:
+    """Typed public entrypoint signature and concise mathematical specification."""
+
+    entrypoint: str
+    parameters: tuple[GoldenParamSpec, ...]
+    return_annotation: str
+    signature_line: str
+    math_summary: str = ""
+    output_names: tuple[str, ...] = ()
+    output_dtypes: tuple[str, ...] = ()
+
+
+def _unwrap_proto_operator(proto: Mapping[str, object] | None) -> Mapping[str, object]:
+    if not isinstance(proto, Mapping):
+        return {}
+    inner = proto.get("operator")
+    if isinstance(inner, Mapping) and (
+        "inputs" in inner or "outputs" in inner or "attrs" in inner or "formula" in inner
+    ):
+        return inner
+    return proto
+
+
+def _normalize_scalar_annotation(raw_type: str) -> str:
+    low = raw_type.strip().lower()
+    if low in ("int", "int32", "int64"):
+        return "int"
+    if low in ("float", "float32", "float64"):
+        return "float"
+    if low in ("bool",):
+        return "bool"
+    if low in ("str", "string"):
+        return "str"
+    if low in ("listint", "list[int]"):
+        return "list[int]"
+    if low in ("listfloat", "list[float]"):
+        return "list[float]"
+    if low in ("list",):
+        return "list"
+    return raw_type.strip() or "object"
+
+
+def _normalize_param_annotation(
+    raw_ann: str,
+    *,
+    has_default: bool,
+    default_is_none: bool,
+    proto_input: Mapping[str, object] | None,
+    proto_attr: Mapping[str, object] | None,
+) -> tuple[str, bool, bool, bool]:
+    cleaned = raw_ann.strip()
+    is_optional = (
+        default_is_none
+        or "Optional[" in cleaned
+        or "| None" in cleaned
+        or "None |" in cleaned
+        or bool((proto_input or {}).get("optional", False))
+    )
+    if "Tensor" in cleaned:
+        is_list = "List[" in cleaned or "list[" in cleaned
+        if is_list:
+            ann = "Optional[List[torch.Tensor]]" if is_optional else "List[torch.Tensor]"
+            return ann, True, True, is_optional
+        ann = "Optional[torch.Tensor]" if is_optional else "torch.Tensor"
+        return ann, True, False, is_optional
+    if proto_input is not None and not cleaned:
+        raw_shape = str(proto_input.get("shape", ""))
+        is_list = "List[" in raw_shape or "list[" in raw_shape
+        if is_list:
+            ann = "Optional[List[torch.Tensor]]" if is_optional else "List[torch.Tensor]"
+            return ann, True, True, is_optional
+        ann = "Optional[torch.Tensor]" if is_optional else "torch.Tensor"
+        return ann, True, False, is_optional
+    if cleaned:
+        if cleaned.startswith("Optional[") and cleaned.endswith("]"):
+            inner = _normalize_scalar_annotation(cleaned[len("Optional[") : -1])
+            return f"Optional[{inner}]", False, False, True
+        norm = _normalize_scalar_annotation(cleaned)
+        if default_is_none and not has_default:
+            return f"Optional[{norm}]", False, False, True
+        return norm, False, False, is_optional
+    if proto_attr is not None:
+        attr_type = str(proto_attr.get("type", "")).strip()
+        if attr_type:
+            norm = _normalize_scalar_annotation(attr_type)
+            if default_is_none:
+                return f"Optional[{norm}]", False, False, True
+            return norm, False, False, is_optional
+    return ("object", False, False, is_optional)
+
+
+def _extract_math_summary(
+    proto: Mapping[str, object],
+    desc_text: str,
+) -> str:
+    parts: list[str] = []
+    formula = str(proto.get("formula", "")).strip()
+    desc = str(proto.get("description", "")).strip()
+    if desc:
+        parts.append(desc)
+    if formula:
+        compact_formula = " ".join(line.strip() for line in formula.splitlines() if line.strip())
+        if compact_formula:
+            parts.append(f"Formula: {compact_formula[:220]}")
+    if desc_text.strip():
+        lines = [
+            re.sub(r"^#+\s*", "", line).strip()
+            for line in desc_text.splitlines()
+            if line.strip()
+            and not line.strip().startswith("---")
+            and "Copyright" not in line
+            and "License" not in line
+        ]
+        if lines:
+            parts.append(" ".join(lines)[:240])
+    combined = " | ".join(dict.fromkeys(p for p in parts if p))
+    return combined[:420]
+
+
+def _find_entrypoint_def(
+    tree: ast.Module,
+    entrypoint: str,
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    top_defs = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    for node in top_defs:
+        if node.name == entrypoint:
+            return node
+    if len(top_defs) == 1:
+        return top_defs[0]
+    return None
+
+
+def extract_golden_entrypoint_contract(
+    golden_source: str,
+    entrypoint: str,
+    *,
+    proto: Mapping[str, object] | None = None,
+    desc_text: str = "",
+) -> GoldenEntrypointContract:
+    """Extract typed entrypoint parameters, defaults, return type, and math summary."""
+    op_proto = _unwrap_proto_operator(proto)
+    proto_inputs = {
+        str(row["name"]): row
+        for row in (op_proto.get("inputs") or ())
+        if isinstance(row, Mapping) and "name" in row
+    }
+    proto_attrs = {
+        str(row["name"]): row
+        for row in (op_proto.get("attrs") or ())
+        if isinstance(row, Mapping) and "name" in row
+    }
+    raw_outputs = [
+        row for row in (op_proto.get("outputs") or ()) if isinstance(row, Mapping)
+    ]
+    output_names = tuple(str(row.get("name", "")) for row in raw_outputs if row.get("name"))
+    out_dtype_tokens: list[str] = []
+    for row in raw_outputs:
+        raw_dt = row.get("dtype")
+        if isinstance(raw_dt, str) and raw_dt.strip():
+            out_dtype_tokens.append(raw_dt.strip())
+        elif isinstance(raw_dt, Sequence) and not isinstance(raw_dt, (str, bytes)):
+            cands = [str(item).strip() for item in raw_dt if item is not None]
+            if cands:
+                out_dtype_tokens.append("/".join(cands))
+    output_dtypes = tuple(out_dtype_tokens)
+    math_summary = _extract_math_summary(op_proto, desc_text)
+
+    params: list[GoldenParamSpec] = []
+    return_annotation = (
+        "tuple[torch.Tensor, ...]" if len(raw_outputs) > 1 else "torch.Tensor"
+    )
+    fn_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None
+    if golden_source.strip():
+        try:
+            tree = ast.parse(golden_source)
+            fn_node = _find_entrypoint_def(tree, entrypoint)
+        except SyntaxError:
+            fn_node = None
+
+    if fn_node is not None:
+        pos_args = [*fn_node.args.posonlyargs, *fn_node.args.args]
+        pos_defaults: list[ast.expr | None] = [None] * (
+            len(pos_args) - len(fn_node.args.defaults)
+        ) + list(fn_node.args.defaults)
+        all_args: list[tuple[ast.arg, ast.expr | None]] = list(zip(pos_args, pos_defaults))
+        for kw_arg, kw_def in zip(fn_node.args.kwonlyargs, fn_node.args.kw_defaults):
+            all_args.append((kw_arg, kw_def))
+
+        for arg, default_node in all_args:
+            raw_ann = ast.unparse(arg.annotation) if arg.annotation is not None else ""
+            has_default = default_node is not None
+            default_repr = ast.unparse(default_node) if default_node is not None else None
+            default_is_none = default_repr == "None"
+            ann, is_tensor, is_tensor_list, is_optional = _normalize_param_annotation(
+                raw_ann,
+                has_default=has_default,
+                default_is_none=default_is_none,
+                proto_input=proto_inputs.get(arg.arg),
+                proto_attr=proto_attrs.get(arg.arg),
+            )
+            params.append(
+                GoldenParamSpec(
+                    name=arg.arg,
+                    annotation=ann,
+                    default_repr=default_repr,
+                    has_default=has_default,
+                    is_tensor=is_tensor,
+                    is_tensor_list=is_tensor_list,
+                    is_optional=is_optional,
+                )
+            )
+        if fn_node.returns is not None:
+            raw_ret = ast.unparse(fn_node.returns).strip()
+            if raw_ret:
+                return_annotation = raw_ret
+    else:
+        for row in (op_proto.get("inputs") or ()):
+            if not isinstance(row, Mapping) or "name" not in row:
+                continue
+            pname = str(row["name"])
+            is_opt = bool(row.get("optional", False))
+            ann, is_tensor, is_tensor_list, _ = _normalize_param_annotation(
+                "",
+                has_default=is_opt,
+                default_is_none=is_opt,
+                proto_input=row,
+                proto_attr=None,
+            )
+            params.append(
+                GoldenParamSpec(
+                    name=pname,
+                    annotation=ann,
+                    default_repr="None" if is_opt else None,
+                    has_default=is_opt,
+                    is_tensor=is_tensor,
+                    is_tensor_list=is_tensor_list,
+                    is_optional=is_opt,
+                )
+            )
+        for row in (op_proto.get("attrs") or ()):
+            if not isinstance(row, Mapping) or "name" not in row:
+                continue
+            pname = str(row["name"])
+            has_def = "default" in row
+            def_repr = repr(row["default"]) if has_def else None
+            ann, _, _, is_opt = _normalize_param_annotation(
+                "",
+                has_default=has_def,
+                default_is_none=has_def and row["default"] is None,
+                proto_input=None,
+                proto_attr=row,
+            )
+            params.append(
+                GoldenParamSpec(
+                    name=pname,
+                    annotation=ann,
+                    default_repr=def_repr,
+                    has_default=has_def,
+                    is_tensor=False,
+                    is_tensor_list=False,
+                    is_optional=is_opt,
+                )
+            )
+
+    rendered_params = ", ".join(
+        f"{p.name}: {p.annotation} = {p.default_repr}"
+        if p.has_default and p.default_repr is not None
+        else f"{p.name}: {p.annotation}"
+        for p in params
+    )
+    signature_line = f"def {entrypoint}({rendered_params}) -> {return_annotation}:"
+    return GoldenEntrypointContract(
+        entrypoint=entrypoint,
+        parameters=tuple(params),
+        return_annotation=return_annotation,
+        signature_line=signature_line,
+        math_summary=math_summary,
+        output_names=output_names,
+        output_dtypes=output_dtypes,
+    )
+
+
+def validate_entrypoint_signature_compatibility(
+    module_source: str,
+    contract: GoldenEntrypointContract,
+) -> str:
+    """Return an error when candidate entrypoint breaks ParamBuilder tensor/param ABI."""
+    if not contract.parameters:
+        return ""
+    try:
+        tree = ast.parse(module_source)
+    except SyntaxError as exc:
+        return f"seed module syntax error: {exc}"
+    fn_node = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == contract.entrypoint
+        ),
+        None,
+    )
+    if fn_node is None:
+        return f"seed module does not define the public entrypoint {contract.entrypoint}"
+
+    pos_args = [*fn_node.args.posonlyargs, *fn_node.args.args]
+    pos_defaults: list[ast.expr | None] = [None] * (
+        len(pos_args) - len(fn_node.args.defaults)
+    ) + list(fn_node.args.defaults)
+    cand_args: list[tuple[ast.arg, ast.expr | None]] = list(zip(pos_args, pos_defaults))
+    for kw_arg, kw_def in zip(fn_node.args.kwonlyargs, fn_node.args.kw_defaults):
+        cand_args.append((kw_arg, kw_def))
+
+    expected_names = [p.name for p in contract.parameters]
+    cand_names = [arg.arg for arg, _ in cand_args]
+    if cand_names[: len(expected_names)] != expected_names:
+        return (
+            f"entrypoint {contract.entrypoint!r} parameter signature mismatch for ParamBuilder: "
+            f"expected {expected_names}, got {cand_names}"
+        )
+    for extra_arg, extra_def in cand_args[len(expected_names) :]:
+        if extra_def is None:
+            return (
+                f"entrypoint {contract.entrypoint!r} adds required parameter "
+                f"{extra_arg.arg!r} absent from golden signature"
+            )
+
+    for param, (cand_arg, cand_def) in zip(contract.parameters, cand_args):
+        cand_ann = ast.unparse(cand_arg.annotation) if cand_arg.annotation is not None else ""
+        if param.is_tensor:
+            if "Tensor" not in cand_ann:
+                return (
+                    f"entrypoint {contract.entrypoint!r} parameter {param.name!r} must carry "
+                    f"a Tensor annotation ({param.annotation}) so ParamBuilder binds it as a tensor"
+                )
+            if param.is_tensor_list and ("List[" not in cand_ann and "list[" not in cand_ann):
+                return (
+                    f"entrypoint {contract.entrypoint!r} parameter {param.name!r} must carry "
+                    f"a List[torch.Tensor] annotation ({param.annotation})"
+                )
+            if (
+                param.is_optional
+                and cand_def is None
+                and "Optional" not in cand_ann
+                and "None" not in cand_ann
+            ):
+                return (
+                    f"entrypoint {contract.entrypoint!r} optional tensor {param.name!r} "
+                    f"must preserve Optional/default None"
+                )
+        else:
+            if "Tensor" in cand_ann:
+                return (
+                    f"entrypoint {contract.entrypoint!r} scalar parameter {param.name!r} "
+                    f"must not carry a Tensor annotation"
+                )
+            if param.has_default and cand_def is None:
+                return (
+                    f"entrypoint {contract.entrypoint!r} parameter {param.name!r} must "
+                    f"preserve default value ({param.default_repr})"
+                )
+    return ""
+
+
+def format_golden_entrypoint_prompt_block(contract: GoldenEntrypointContract) -> str:
+    """Format exact entrypoint ABI and math contract for Stage-0 and optimization prompts."""
+    lines = [
+        "### EXACT GOLDEN ENTRYPOINT ABI (ParamBuilder-checked)",
+        "```python",
+        contract.signature_line,
+        "```",
+        (
+            "- Keep parameter names, order, defaults, and `torch.Tensor` / "
+            "`Optional[torch.Tensor]` / `List[torch.Tensor]` annotations exact."
+        ),
+    ]
+    if contract.math_summary:
+        lines.append(f"- Mathematical specification: {contract.math_summary}")
+    if contract.output_names or contract.output_dtypes:
+        lines.append(
+            f"- Declared outputs: names={list(contract.output_names)} "
+            f"dtypes={list(contract.output_dtypes)}"
+        )
+    return "\n".join(lines) + "\n\n"
 
 
 def _prompt_type_name(value: object) -> str:
@@ -218,8 +626,11 @@ def _seed_parameter_specs(
     ordered: dict[str, object] = {}
     for regime in regime_specs:
         for key in sorted(regime.sample_builder_kwargs):
+            val = regime.sample_builder_kwargs[key]
+            if isinstance(val, (list, tuple)) and len(val) > 8:
+                continue
             if key not in ordered:
-                ordered[key] = regime.sample_builder_kwargs[key]
+                ordered[key] = val
     return tuple(ordered.items())
 
 
@@ -239,26 +650,68 @@ def _seed_module_abi(
     parameters: Sequence[tuple[str, object]],
     surface: DialectSurfaceSpec,
     track: str,
+    *,
+    golden_contract: GoldenEntrypointContract | None = None,
+    regime_specs: Sequence[RegimeTargetSpec] = (),
 ) -> str:
     """Describe the concrete module symbols and invocation contract Stage-0 resolves."""
     selector = _render_signature(f"_select_{entrypoint}_config", parameters, "dict[str, object]")
     builder = _render_signature(f"_build_{entrypoint}_prim_func", parameters, "object")
     get_kernel = _render_signature("_get_kernel", parameters, "object")
     render_tu = "def _render_trackb_tu(**dims: object) -> str:"
-    dispatch = f"def {entrypoint}(...) -> object:"
+    dispatch = (
+        golden_contract.signature_line
+        if golden_contract is not None and golden_contract.signature_line
+        else f"def {entrypoint}(...) -> object:"
+    )
     forbidden = ", ".join(f"`{token}`" for token in surface.forbidden_tokens)
+    per_regime_lines: list[str] = []
+    if len(regime_specs) > 1:
+        for regime in regime_specs:
+            tag = regime.regime_tag
+            r_sel = _render_signature(
+                f"_select_{entrypoint}_{tag}_config",
+                parameters,
+                "dict[str, object]",
+            )
+            r_bld = _render_signature(
+                f"_build_{entrypoint}_{tag}_prim_func",
+                parameters,
+                "object",
+            )
+            per_regime_lines.extend((r_sel, r_bld))
+
     if track in ("cce_trackb", "hybrid_trackb"):
+        symbol_block = [
+            *per_regime_lines,
+            selector,
+            builder,
+            get_kernel,
+            render_tu,
+            dispatch,
+            f"{entrypoint.upper()}_TRACKB_CU: str",
+            f"kernel = {entrypoint}",
+        ]
+        hybrid_note = (
+            "- `hybrid_trackb`: pair Track-B C++20 translation units with `@T.prim_func` "
+            "builders compiled via `tilelang.compile(prog, target=\"ascend\")` when "
+            "splitting Cube/Vector/prologue/combine stages.\n"
+            if track == "hybrid_trackb"
+            else ""
+        )
+        multi_note = (
+            f"- Multiple regimes detected: emit per-regime `_select_{entrypoint}_<tag>_config` "
+            f"and `_build_{entrypoint}_<tag>_prim_func` functions so each regime edits "
+            f"orthogonal symbols, and dispatch across them from `_select_{entrypoint}_config` "
+            f"/ `{entrypoint}`.\n"
+            if len(regime_specs) > 1
+            else ""
+        )
         return (
             "Required module symbols and exact Stage-0 instantiations:\n"
             "```python\n"
-            f"{selector}\n"
-            f"{builder}\n"
-            f"{get_kernel}\n"
-            f"{render_tu}\n"
-            f"{dispatch}\n"
-            f"{entrypoint.upper()}_TRACKB_CU: str  # top-level C++20 translation unit\n"
-            f"kernel = {entrypoint}\n"
-            "```\n"
+            + "\n".join(symbol_block)
+            + "\n```\n"
             f"- `{entrypoint.upper()}_TRACKB_CU` is a top-level C++20 translation-unit string "
             "constant starting with `#include <tl_templates/ascend/...>` that bisheng compiles "
             "standalone.\n"
@@ -275,17 +728,30 @@ def _seed_module_abi(
             "- `_get_kernel` compiles and caches that Track-B plan for the dispatch callable.\n"
             f"- `{entrypoint}` dispatches NPU tensors through the bisheng-compiled Track-B "
             "library; no torch/CPU fallback may remain on the NPU path.\n"
+            f"{hybrid_note}{multi_note}"
             f"- The module must not contain any forbidden Track-B symbol: {forbidden}.\n"
         )
+    symbol_block = [
+        *per_regime_lines,
+        selector,
+        builder,
+        get_kernel,
+        dispatch,
+        f"kernel = {entrypoint}",
+    ]
+    multi_note = (
+        f"- Multiple regimes detected: emit per-regime `_select_{entrypoint}_<tag>_config` "
+        f"and `_build_{entrypoint}_<tag>_prim_func` functions so each regime edits "
+        f"orthogonal symbols, and dispatch across them from `_select_{entrypoint}_config` "
+        f"/ `{entrypoint}`.\n"
+        if len(regime_specs) > 1
+        else ""
+    )
     return (
         "Required module symbols and exact Stage-0 instantiations:\n"
         "```python\n"
-        f"{selector}\n"
-        f"{builder}\n"
-        f"{get_kernel}\n"
-        f"{dispatch}\n"
-        f"kernel = {entrypoint}\n"
-        "```\n"
+        + "\n".join(symbol_block)
+        + "\n```\n"
         f"- `_select_{entrypoint}_config` is called with the regime keyword arguments above and "
         "returns optional `pass_configs`, `compile_flags`, and `builder_kwargs`.\n"
         f"- `_build_{entrypoint}_prim_func` is called with the same keyword arguments plus any "
@@ -294,6 +760,7 @@ def _seed_module_abi(
         '`tilelang.compile(prog, target="ascend")` and caches the compiled callable.\n'
         f"- `{entrypoint}` performs the operator on NPU tensors through `_get_kernel`; no "
         "torch/CPU fallback may remain on the NPU path.\n"
+        f"{multi_note}"
     )
 
 
@@ -303,13 +770,16 @@ def _seed_system_prompt(
     surface: DialectSurfaceSpec,
     track: str,
     parameters: Sequence[tuple[str, object]],
+    *,
+    golden_contract: GoldenEntrypointContract | None = None,
+    regime_specs: Sequence[RegimeTargetSpec] = (),
 ) -> str:
     return (
         f"Synthesize a self-contained Ascend 950PR ({surface.display_label}) module "
         f"for operator '{operator_name}' exposing `{entrypoint}` and "
         f"`kernel = {entrypoint}` with exact numerical parity against the PyTorch "
         "reference across all shapes. Zero PyTorch/CPU fallback is permitted on NPU tensors. "
-        f"{_seed_module_abi(entrypoint, parameters, surface, track)}"
+        f"{_seed_module_abi(entrypoint, parameters, surface, track, golden_contract=golden_contract, regime_specs=regime_specs)}"
     )
 
 
@@ -317,6 +787,8 @@ def _official_contract_section(
     proto: Mapping[str, object],
     cases: Sequence[Mapping[str, object]],
     regime_specs: Sequence[RegimeTargetSpec],
+    *,
+    entrypoint: str = "",
 ) -> str:
     """Render proto.yaml, cases.yaml and the semantic regime instantiations for the prompt."""
     lines = [
@@ -330,13 +802,20 @@ def _official_contract_section(
         "```",
         "### CAMPAIGN REGIME INSTANTIATIONS (partitioned from golden+proto+cases semantics)",
     ]
+    shared_sel = f"_select_{entrypoint}_config" if entrypoint else ""
     for regime in regime_specs:
         kwargs = ", ".join(
             f"{key}={value!r}" for key, value in sorted(regime.sample_builder_kwargs.items())
         )
+        dispatch_note = (
+            f" (or `{shared_sel}({kwargs})`)"
+            if shared_sel and regime.config_selector_fn != shared_sel
+            else ""
+        )
         lines.append(
-            f"- regime `{regime.regime_tag}`: call `{regime.config_selector_fn}({kwargs})`, "
-            f"then a builder from {list(regime.builder_candidates)} with those keyword arguments"
+            f"- regime `{regime.regime_tag}`: call `{regime.config_selector_fn}({kwargs})`"
+            f"{dispatch_note}, then a builder from {list(regime.builder_candidates)} "
+            "with those keyword arguments"
         )
     return "\n".join(lines) + "\n\n"
 
@@ -407,6 +886,7 @@ def _build_blueprints(
     *,
     authored_hir_source: str | None,
     scheduled_hir_source: str | None,
+    proto: Mapping[str, object] | None = None,
 ) -> dict[str, HirBlueprintPacket]:
     return {
         regime.regime_tag: analyzer.build_universal_blueprint(
@@ -415,7 +895,10 @@ def _build_blueprints(
             authored_hir_source=authored_hir_source,
             scheduled_hir_source=scheduled_hir_source,
             representative_case=(
-                RepresentativeCase.from_case_entry(regime.representative_case_entry)
+                RepresentativeCase.from_case_entry(
+                    regime.representative_case_entry,
+                    proto=proto,
+                )
                 if regime.representative_case_entry
                 else None
             ),
@@ -429,7 +912,7 @@ def _bind_trackb_symbols(
     module_source: str,
     runtime_backend: str,
 ) -> tuple[RegimeTargetSpec, ...]:
-    if runtime_backend != "ascendc_trackb":
+    if runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
         return tuple(regime_specs)
     symbols = discover_module_trackb_symbols(module_source)
     if not symbols:
@@ -439,7 +922,7 @@ def _bind_trackb_symbols(
     return tuple(
         replace(
             regime,
-            runtime_backend="ascendc_trackb",
+            runtime_backend=runtime_backend,
             trackb_symbols=symbols,
             editable_symbols=tuple(dict.fromkeys([*regime.editable_symbols, *symbols])),
         )
@@ -466,6 +949,8 @@ async def prepare_operator_seed_or_takeover(
     force_cold_start: bool = False,
     max_seed_attempts: int = 4,
     max_transport_retries: int = 2,
+    desc_text: str = "",
+    golden_contract: GoldenEntrypointContract | None = None,
 ) -> SeedSynthesisOutcome:
     """Execute unified Stage-0 preparation: pure PyTorch cold start or incumbent takeover."""
     analyzer = PyTorchSemanticAnalyzer()
@@ -502,6 +987,7 @@ async def prepare_operator_seed_or_takeover(
                 incumbent_regimes,
                 authored_hir_source=authored_hir_source,
                 scheduled_hir_source=scheduled_hir_source,
+                proto=proto,
             ),
             attempts_used=0,
             verification_state="unverified_incumbent",
@@ -530,6 +1016,7 @@ async def prepare_operator_seed_or_takeover(
         provisional_regimes,
         authored_hir_source=authored_hir_source,
         scheduled_hir_source=scheduled_hir_source,
+        proto=proto,
     )
     initial_track = select_initial_track_from_semantics(
         semantics,
@@ -558,6 +1045,16 @@ async def prepare_operator_seed_or_takeover(
         freedom_mask=ConstraintRelaxationMask.top(),
         blueprint=first_bp,
     )
+    contract = (
+        golden_contract
+        if golden_contract is not None
+        else extract_golden_entrypoint_contract(
+            pytorch_golden_source,
+            entrypoint,
+            proto=proto,
+            desc_text=desc_text,
+        )
+    )
     parameters = _seed_parameter_specs(regime_specs)
     system_prompt = _seed_system_prompt(
         operator_name,
@@ -565,12 +1062,20 @@ async def prepare_operator_seed_or_takeover(
         surface,
         initial_track,
         parameters,
+        golden_contract=contract,
+        regime_specs=regime_specs,
     )
+    golden_abi_block = format_golden_entrypoint_prompt_block(contract)
     golden_block = (
         "### PYTORCH MATHEMATICAL REFERENCE (GOLDEN ORACLE)\n"
         f"```python\n{pytorch_golden_source.strip()}\n```\n\n"
     )
-    contract_block = _official_contract_section(proto, cases, regime_specs)
+    contract_block = _official_contract_section(
+        proto,
+        cases,
+        regime_specs,
+        entrypoint=entrypoint,
+    )
     blueprint_block = _blueprint_summary_section(blueprints, regime_specs)
 
     last_error = ""
@@ -590,6 +1095,7 @@ async def prepare_operator_seed_or_takeover(
             system_prompt=system_prompt,
             user_prompt=(
                 f"{constraint_block}\n\n"
+                f"{golden_abi_block}"
                 f"{blueprint_block}"
                 f"{golden_block}"
                 f"{contract_block}"
@@ -670,10 +1176,15 @@ async def prepare_operator_seed_or_takeover(
 
 
 __all__ = [
+    "GoldenEntrypointContract",
+    "GoldenParamSpec",
     "OracleAccuracyResult",
     "SeedMode",
     "SeedSynthesisOutcome",
     "SeedVerificationState",
+    "extract_golden_entrypoint_contract",
+    "format_golden_entrypoint_prompt_block",
     "prepare_operator_seed_or_takeover",
     "select_initial_track_from_semantics",
+    "validate_entrypoint_signature_compatibility",
 ]

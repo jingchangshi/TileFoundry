@@ -1086,9 +1086,25 @@ def test_extract_trackb_cpp_source_scans_top_level_string_constants() -> None:
 def test_cold_start_seed_module_resolves_campaign_regime_config(tmp_path: Path) -> None:
     repo = _write_fixture_repo(tmp_path / "cann-bench")
     regimes = CannbenchOpsRegistry(tasks_root=repo).get_regime_specs("exp")
-    resolved = resolve_regime_config(_SEED_MODULE, regimes[0], dims={"M": 1024, "D": 1024})
-    assert resolved.builder_name == "_build_exp_prim_func"
-    assert resolved.selector_name == "_select_exp_config"
+    tag = regimes[0].regime_tag
+    per_regime_module = (
+        f"def _select_exp_{tag}_config(\n"
+        f"    M: int = 1024,\n"
+        f"    D: int = 1024,\n"
+        f'    tl_dtype: str = "float16",\n'
+        f") -> dict[str, object]:\n"
+        f'    return {{"tile_m": 64, "pass_configs": {{}}, "compile_flags": []}}\n\n'
+        f"def _build_exp_{tag}_prim_func(\n"
+        f"    M: int = 1024,\n"
+        f"    D: int = 1024,\n"
+        f"    tile_m: int = 64,\n"
+        f'    tl_dtype: str = "float16",\n'
+        f"):\n"
+        f"    return None\n"
+    )
+    resolved = resolve_regime_config(per_regime_module, regimes[0], dims={"M": 1024, "D": 1024})
+    assert resolved.builder_name == f"_build_exp_{tag}_prim_func"
+    assert resolved.selector_name == f"_select_exp_{tag}_config"
     assert resolved.builder_kwargs["tile_m"] == 64
 
 

@@ -7,6 +7,7 @@ import ast
 import asyncio
 import ctypes
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -45,9 +46,12 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     resolve_regime_config,
 )
 from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
+    GoldenEntrypointContract,
     OracleAccuracyResult,
     SeedSynthesisOutcome,
+    extract_golden_entrypoint_contract,
     prepare_operator_seed_or_takeover,
+    validate_entrypoint_signature_compatibility,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     _LLM_API_KEY_ENV,
@@ -231,6 +235,7 @@ class MarathonConfig:
     exploit_effort: str = "high"
     auto_bootstrap_seed: bool = True
     cold_start: bool = False
+    pure_golden: bool = False
     llm_backend: str | None = None
     exploit_model: str | None = None
     explore_model: str | None = None
@@ -289,9 +294,15 @@ def _module_binds_kernel_alias(tree: ast.Module, entrypoint: str) -> bool:
     return False
 
 
-def _stage0_entrypoint_contract_error(module_source: str, entrypoint: str, track: str) -> str:
+def _stage0_entrypoint_contract_error(
+    module_source: str,
+    entrypoint: str,
+    track: str,
+    *,
+    contract: GoldenEntrypointContract | None = None,
+) -> str:
     """Return a rejection reason when the public entrypoint or its dispatch chain is absent."""
-    if track not in ("cce_trackb", "tilelang_dsl"):
+    if track not in ("cce_trackb", "hybrid_trackb", "tilelang_dsl"):
         return f"unknown Stage-0 track {track!r}"
     try:
         tree = ast.parse(module_source)
@@ -303,10 +314,14 @@ def _stage0_entrypoint_contract_error(module_source: str, entrypoint: str, track
         return f"seed module does not define the public entrypoint {entrypoint}"
     if not _module_binds_kernel_alias(tree, entrypoint):
         return f"seed module does not bind `kernel = {entrypoint}`"
+    if contract is not None:
+        sig_error = validate_entrypoint_signature_compatibility(module_source, contract)
+        if sig_error:
+            return sig_error
     purity_errors = check_npu_entrypoint_purity(module_source, entrypoint)
     if purity_errors:
         return "entrypoint purity rejection: " + "; ".join(purity_errors)
-    if track == "cce_trackb":
+    if track in ("cce_trackb", "hybrid_trackb"):
         offending = {
             token: count
             for token, count in CCE_CPP20_SURFACE.count_forbidden_tokens(module_source).items()
@@ -316,6 +331,30 @@ def _stage0_entrypoint_contract_error(module_source: str, entrypoint: str, track
             rendered = ", ".join(f"{token}={count}" for token, count in offending.items())
             return f"CCE C++20 seed references forbidden tokens: {rendered}"
     return ""
+
+
+def _has_prim_func_builder(
+    module_source: str,
+    builder_candidates: Sequence[str],
+) -> bool:
+    if not builder_candidates:
+        return False
+    try:
+        tree = ast.parse(module_source)
+    except SyntaxError:
+        return False
+    candidate_set = set(builder_candidates)
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in candidate_set:
+            continue
+        for sub in ast.walk(node):
+            if not isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) or sub is node:
+                continue
+            for dec in sub.decorator_list:
+                dec_src = ast.get_source_segment(module_source, dec) or ""
+                if "prim_func" in dec_src:
+                    return True
+    return False
 
 
 def _instantiate_stage0_trackb_tu(
@@ -339,9 +378,15 @@ def _validate_stage0_track_a(
     entrypoint: str,
     worktree: Path,
     env_file: Path | None,
+    contract: GoldenEntrypointContract | None = None,
 ) -> tuple[bool, str]:
     """Run L0 static purity/waterline and L1 device compilation for a Track-A seed."""
-    contract_error = _stage0_entrypoint_contract_error(module_source, entrypoint, "tilelang_dsl")
+    contract_error = _stage0_entrypoint_contract_error(
+        module_source,
+        entrypoint,
+        "tilelang_dsl",
+        contract=contract,
+    )
     if contract_error:
         return False, contract_error
     dims = dict(regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims)
@@ -388,9 +433,16 @@ def _validate_stage0_track_b(
     *,
     entrypoint: str,
     env_file: Path | None,
+    contract: GoldenEntrypointContract | None = None,
+    track: str = "cce_trackb",
 ) -> tuple[bool, str]:
     """Run L0 token purity and L1 bisheng compilation for a Track-B CCE seed."""
-    contract_error = _stage0_entrypoint_contract_error(module_source, entrypoint, "cce_trackb")
+    contract_error = _stage0_entrypoint_contract_error(
+        module_source,
+        entrypoint,
+        track,
+        contract=contract,
+    )
     if contract_error:
         return False, contract_error
     trackb_symbols = regime_spec.trackb_symbols or discover_module_trackb_symbols(module_source)
@@ -438,17 +490,58 @@ def _validate_stage0_track_b(
     return True, ""
 
 
+def _validate_stage0_hybrid_track_b(
+    module_source: str,
+    regime_spec: RegimeTargetSpec,
+    *,
+    entrypoint: str,
+    worktree: Path,
+    env_file: Path | None,
+    contract: GoldenEntrypointContract | None = None,
+) -> tuple[bool, str]:
+    """Validate hybrid Track-B TU and optional TileLang @T.prim_func builder."""
+    passed_tb, error_tb = _validate_stage0_track_b(
+        module_source,
+        regime_spec,
+        entrypoint=entrypoint,
+        env_file=env_file,
+        contract=contract,
+        track="hybrid_trackb",
+    )
+    if not passed_tb:
+        return False, error_tb
+    if _has_prim_func_builder(module_source, regime_spec.builder_candidates):
+        return _validate_stage0_track_a(
+            module_source,
+            regime_spec,
+            entrypoint=entrypoint,
+            worktree=worktree,
+            env_file=env_file,
+            contract=contract,
+        )
+    return True, ""
+
+
 def build_stage0_static_validator(
     regime_specs: Sequence[RegimeTargetSpec],
     *,
     entrypoint: str,
     worktree: Path,
     env_file: Path | None,
+    entrypoint_contract: GoldenEntrypointContract | None = None,
 ) -> Callable[[str, str], tuple[bool, str]]:
     """Build the L0/L1 gate pair the bounded Stage-0 seed loop invokes per attempt."""
     assert regime_specs, "Stage-0 seed synthesis requires at least one regime specification"
 
     def _validate(module_source: str, track: str) -> tuple[bool, str]:
+        if track not in ("cce_trackb", "hybrid_trackb", "tilelang_dsl"):
+            err = _stage0_entrypoint_contract_error(
+                module_source,
+                entrypoint,
+                track,
+                contract=entrypoint_contract,
+            )
+            return False, f"[{regime_specs[0].regime_tag}] {err}"
         failures: list[str] = []
         for regime_spec in regime_specs:
             if track == "cce_trackb":
@@ -457,6 +550,16 @@ def build_stage0_static_validator(
                     regime_spec,
                     entrypoint=entrypoint,
                     env_file=env_file,
+                    contract=entrypoint_contract,
+                )
+            elif track == "hybrid_trackb":
+                passed, error = _validate_stage0_hybrid_track_b(
+                    module_source,
+                    regime_spec,
+                    entrypoint=entrypoint,
+                    worktree=worktree,
+                    env_file=env_file,
+                    contract=entrypoint_contract,
                 )
             else:
                 passed, error = _validate_stage0_track_a(
@@ -465,6 +568,7 @@ def build_stage0_static_validator(
                     entrypoint=entrypoint,
                     worktree=worktree,
                     env_file=env_file,
+                    contract=entrypoint_contract,
                 )
             if not passed:
                 failures.append(f"[{regime_spec.regime_tag}] {error}")
@@ -538,18 +642,33 @@ def prepare_marathon_seed(
     cold_start: bool,
     device_id: str,
     op_logger: logging.Logger,
+    pure_golden: bool = False,
 ) -> SeedSynthesisOutcome:
     """Run bounded Stage-0 seed synthesis or explicit incumbent takeover before the campaign."""
+    effective_cold_start = bool(cold_start or pure_golden)
     registry = CannbenchOpsRegistry(
         tasks_root=cannbench_repo,
         source_root=worktree,
+        pure_golden=pure_golden,
     )
     spec = registry.resolve(operator_name)
     if not spec.golden_path.is_file():
         raise FileNotFoundError(
             f"operator {operator_name} has no PyTorch golden reference at {spec.golden_path}"
         )
-    take_over_incumbent = not cold_start and target_module.is_file()
+    golden_source = spec.golden_path.read_text(encoding="utf-8")
+    desc_text = (
+        spec.desc_path.read_text(encoding="utf-8")
+        if spec.desc_path.is_file()
+        else ""
+    )
+    golden_contract = extract_golden_entrypoint_contract(
+        golden_source,
+        spec.entrypoint,
+        proto=spec.proto,
+        desc_text=desc_text,
+    )
+    take_over_incumbent = not effective_cold_start and target_module.is_file()
     legacy_regime_specs = (
         registry.get_regime_specs(operator_name) if take_over_incumbent else None
     )
@@ -557,6 +676,15 @@ def prepare_marathon_seed(
     def _stage0_static_validator_factory(
         regime_specs: tuple[RegimeTargetSpec, ...],
     ) -> Callable[[str, str], tuple[bool, str]]:
+        validator_params = inspect.signature(build_stage0_static_validator).parameters
+        if "entrypoint_contract" in validator_params:
+            return build_stage0_static_validator(
+                regime_specs,
+                entrypoint=spec.entrypoint,
+                worktree=worktree,
+                env_file=env_file,
+                entrypoint_contract=golden_contract,
+            )
         return build_stage0_static_validator(
             regime_specs,
             entrypoint=spec.entrypoint,
@@ -574,7 +702,7 @@ def prepare_marathon_seed(
             prepare_operator_seed_or_takeover(
                 operator_name=operator_name,
                 entrypoint=spec.entrypoint,
-                pytorch_golden_source=spec.golden_path.read_text(encoding="utf-8"),
+                pytorch_golden_source=golden_source,
                 proto=spec.proto,
                 cases=spec.cases,
                 legacy_regime_specs=legacy_regime_specs,
@@ -587,8 +715,12 @@ def prepare_marathon_seed(
                     device_id=device_id,
                     op_logger=op_logger,
                 ),
-                existing_module_path=None if cold_start else target_module,
-                force_cold_start=cold_start,
+                existing_module_path=None if effective_cold_start else target_module,
+                authored_hir_source=None,
+                scheduled_hir_source=None,
+                force_cold_start=effective_cold_start,
+                desc_text=desc_text,
+                golden_contract=golden_contract,
             )
         )
     except (OSError, RuntimeError, ValueError):
@@ -1484,11 +1616,13 @@ def run_operator_marathon(
     state_dir.mkdir(parents=True, exist_ok=True)
     staging_dir = (state_dir / "stage0_candidates").resolve()
 
-    target_module = (
-        Path(cfg.target_module_path).expanduser().resolve()
-        if cfg.target_module_path is not None
-        else (worktree / get_operator_module_relpath(cfg.operator_name)).resolve()
-    )
+    if cfg.target_module_path is not None:
+        target_module = Path(cfg.target_module_path).expanduser().resolve()
+    elif cfg.pure_golden:
+        op_tag = cfg.operator_name.rsplit("/", 1)[-1]
+        target_module = (state_dir / "pure_golden_ops" / op_tag / "kernels.py").resolve()
+    else:
+        target_module = (worktree / get_operator_module_relpath(cfg.operator_name)).resolve()
     checkpoint_path = (
         Path(cfg.checkpoint_path).expanduser().resolve()
         if cfg.checkpoint_path is not None
@@ -1550,18 +1684,36 @@ def run_operator_marathon(
     seed_outcome: SeedSynthesisOutcome | None = None
     if cfg.auto_bootstrap_seed:
         try:
-            seed_outcome = prepare_marathon_seed(
-                operator_name=cfg.operator_name,
-                target_module=target_module,
-                staging_dir=staging_dir,
-                worktree=worktree,
-                env_file=env_file,
-                cannbench_repo=cannbench_repo,
-                llm_backend=llm_backend,
-                cold_start=cfg.cold_start,
-                device_id=primary_device_id,
-                op_logger=op_logger,
-            )
+            if (
+                cfg.pure_golden
+                and "pure_golden" in inspect.signature(prepare_marathon_seed).parameters
+            ):
+                seed_outcome = prepare_marathon_seed(
+                    operator_name=cfg.operator_name,
+                    target_module=target_module,
+                    staging_dir=staging_dir,
+                    worktree=worktree,
+                    env_file=env_file,
+                    cannbench_repo=cannbench_repo,
+                    llm_backend=llm_backend,
+                    cold_start=cfg.cold_start,
+                    device_id=primary_device_id,
+                    op_logger=op_logger,
+                    pure_golden=True,
+                )
+            else:
+                seed_outcome = prepare_marathon_seed(
+                    operator_name=cfg.operator_name,
+                    target_module=target_module,
+                    staging_dir=staging_dir,
+                    worktree=worktree,
+                    env_file=env_file,
+                    cannbench_repo=cannbench_repo,
+                    llm_backend=llm_backend,
+                    cold_start=cfg.cold_start,
+                    device_id=primary_device_id,
+                    op_logger=op_logger,
+                )
         except (OSError, RuntimeError, ValueError) as exc:
             op_logger.error("STAGE0_SEED_FAILED op=%s error=%s", cfg.operator_name, exc)
             return 2
@@ -1667,16 +1819,23 @@ def run_operator_marathon(
             timeout_sec=360,
         ),
     )
-    runner = ExtremeCampaignRunner(
-        config=campaign_cfg,
-        target_module_path=target_module,
-        regime_specs=seeded_regime_specs,
-        perf_target=perf_target,
-        llm_backend=llm_backend,
-        tracker=tracker,
-        flywheel_distiller=flywheel,
-        l2_batch_evaluator=l2_evaluator,
-        msprof_collector=lambda op_name, cand_path, anc_seq: collect_bottleneck_msprof_via_agent_gates(
+    pure_anchors: tuple[AnchorCaseSpec, ...] | None = None
+    if cfg.pure_golden:
+        pure_registry = CannbenchOpsRegistry(
+            tasks_root=cannbench_repo,
+            source_root=worktree,
+            pure_golden=True,
+        )
+        pure_anchors = pure_registry.get_anchors(cfg.operator_name)
+        if seeded_regime_specs is None:
+            seeded_regime_specs = pure_registry.get_regime_specs(cfg.operator_name)
+
+    def _msprof_fn(
+        op_name: str,
+        cand_path: Path,
+        anc_seq: Sequence[AnchorCaseSpec],
+    ) -> Mapping[str, Mapping[str, float]]:
+        return collect_bottleneck_msprof_via_agent_gates(
             op_name,
             cand_path,
             anc_seq,
@@ -1684,9 +1843,10 @@ def run_operator_marathon(
             env_file=env_file,
             device_id=primary_device_id,
             timeout_sec=600,
-        ),
-        l3_contract_runner=l3_runner,
-        l4_cannbench_runner=lambda mod_path, **kwargs: run_l4_official_cannbench_via_agent_gates(
+        )
+
+    def _l4_fn(mod_path: Path, **kwargs: object) -> object:
+        return run_l4_official_cannbench_via_agent_gates(
             operator_name=cfg.operator_name,
             candidate_module_path=mod_path,
             source_root=worktree,
@@ -1695,23 +1855,69 @@ def run_operator_marathon(
             resume_execution_id=str(kwargs.get("resume_execution_id") or ""),
             resume_run_id=str(kwargs.get("resume_run_id") or ""),
             on_execution_started=kwargs.get("on_execution_started"),
-        ),
-        checkpoint_path=checkpoint_path,
-        campaign_kb_path=campaign_kb_path,
-        cost_calibration_path=state_dir / "cost_model_calibration.jsonl",
-        experience_lake_dir=lake_dir,
-        source_root=worktree,
-        env_file=env_file,
-        cannbench_repo=cannbench_repo,
-        regime_blueprints=(
-            seed_outcome.blueprints_by_regime if seed_outcome is not None else None
-        ),
-        topology_axes=(
-            seed_outcome.semantics.base_axes if seed_outcome is not None else None
-        ),
-        stagnation_discount=cfg.stagnation_discount,
-        op_logger=op_logger,
-    )
+        )
+
+    if cfg.pure_golden:
+        runner = ExtremeCampaignRunner(
+            config=campaign_cfg,
+            target_module_path=target_module,
+            anchors=pure_anchors,
+            regime_specs=seeded_regime_specs,
+            perf_target=perf_target,
+            llm_backend=llm_backend,
+            tracker=tracker,
+            flywheel_distiller=flywheel,
+            l2_batch_evaluator=l2_evaluator,
+            msprof_collector=_msprof_fn,
+            l3_contract_runner=l3_runner,
+            l4_cannbench_runner=_l4_fn,
+            checkpoint_path=checkpoint_path,
+            campaign_kb_path=campaign_kb_path,
+            cost_calibration_path=state_dir / "cost_model_calibration.jsonl",
+            experience_lake_dir=lake_dir,
+            source_root=worktree,
+            env_file=env_file,
+            cannbench_repo=cannbench_repo,
+            authored_hir_path=None,
+            scheduled_hir_path=None,
+            regime_blueprints=(
+                seed_outcome.blueprints_by_regime if seed_outcome is not None else None
+            ),
+            topology_axes=(
+                seed_outcome.semantics.base_axes if seed_outcome is not None else None
+            ),
+            stagnation_discount=cfg.stagnation_discount,
+            op_logger=op_logger,
+        )
+    else:
+        runner = ExtremeCampaignRunner(
+            config=campaign_cfg,
+            target_module_path=target_module,
+            regime_specs=seeded_regime_specs,
+            perf_target=perf_target,
+            llm_backend=llm_backend,
+            tracker=tracker,
+            flywheel_distiller=flywheel,
+            l2_batch_evaluator=l2_evaluator,
+            msprof_collector=_msprof_fn,
+            l3_contract_runner=l3_runner,
+            l4_cannbench_runner=_l4_fn,
+            checkpoint_path=checkpoint_path,
+            campaign_kb_path=campaign_kb_path,
+            cost_calibration_path=state_dir / "cost_model_calibration.jsonl",
+            experience_lake_dir=lake_dir,
+            source_root=worktree,
+            env_file=env_file,
+            cannbench_repo=cannbench_repo,
+            regime_blueprints=(
+                seed_outcome.blueprints_by_regime if seed_outcome is not None else None
+            ),
+            topology_axes=(
+                seed_outcome.semantics.base_axes if seed_outcome is not None else None
+            ),
+            stagnation_discount=cfg.stagnation_discount,
+            op_logger=op_logger,
+        )
     resume_flag = checkpoint_path.is_file() if cfg.resume is None else bool(cfg.resume)
     op_logger.info(
         "Launching ExtremeCampaignRunner op=%s device=%s resume=%s max_rounds=%d "
@@ -2203,6 +2409,24 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         help="Force bounded Stage-0 cold-start seed synthesis over an existing kernels.py.",
     )
     parser.add_argument(
+        "--pure-golden",
+        dest="pure_golden",
+        action="store_true",
+        default=None,
+        help="Isolate synthesis from authored HIR, DEFAULT_REGIME_SPECS, and repo incumbents.",
+    )
+    parser.add_argument(
+        "--no-pure-golden",
+        dest="pure_golden",
+        action="store_false",
+        help="Disable pure-golden isolation even when --cold-start is set.",
+    )
+    parser.add_argument(
+        "--experience-lake-dir",
+        default=None,
+        help="Override experience lake directory for Bayesian tracker and distilled rules.",
+    )
+    parser.add_argument(
         "--enable-tilesize-prescreen",
         action="store_true",
         help="Enable tile-size prescreen guidance table in creative prompts.",
@@ -2265,6 +2489,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps(output, indent=2), flush=True)
         return 0
 
+    pure_golden = bool(args.cold_start) if args.pure_golden is None else bool(args.pure_golden)
     cfg = MarathonConfig(
         operator_name=str(args.operator),
         device_id=str(args.device_id),
@@ -2279,6 +2504,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint_path=Path(args.checkpoint) if args.checkpoint else None,
         report_path=Path(args.report_json) if args.report_json else None,
         campaign_kb_path=Path(args.campaign_kb) if args.campaign_kb else None,
+        experience_lake_dir=(
+            Path(args.experience_lake_dir) if args.experience_lake_dir else None
+        ),
         log_path=Path(args.log_file) if args.log_file else None,
         max_rounds=int(args.max_rounds),
         round_regime_tags=tuple(args.round_regime or ()),
@@ -2288,6 +2516,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         resume=False if args.fresh else None,
         salvage_beam_candidates=not bool(args.no_salvage),
         cold_start=bool(args.cold_start),
+        pure_golden=pure_golden,
         enable_tilesize_prescreen=bool(args.enable_tilesize_prescreen),
         cost_prescreen_top_k=(
             int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None

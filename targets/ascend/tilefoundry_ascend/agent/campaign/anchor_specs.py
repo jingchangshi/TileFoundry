@@ -17,6 +17,7 @@ import yaml
 
 from tilefoundry_ascend.ascend.sil.pytorch_frontend import PyTorchSemanticAnalyzer
 from tilefoundry_ascend.ascend.sil.schema import (
+    DTYPE_BYTES,
     AlignmentBand,
     CasePhysicsRatios,
     CasePhysicsRegimeGroup,
@@ -836,6 +837,11 @@ class CannbenchOpSpec:
         """Return the PyTorch golden reference path inside the task directory."""
         return self.op_dir / "golden.py"
 
+    @property
+    def desc_path(self) -> Path:
+        """Return the operator markdown description path inside the task directory."""
+        return self.op_dir / "desc.md"
+
 
 _TRACKB_CPP_MARKERS: tuple[str, ...] = (
     "tl_templates/ascend/",
@@ -984,6 +990,31 @@ class _SemanticCasePartition:
     ratios: tuple[CasePhysicsRatios, ...]
 
 
+def _module_defines_authored_regimes(
+    mod_text: str,
+    regimes: Sequence[RegimeTargetSpec],
+) -> bool:
+    if not mod_text.strip():
+        return False
+    try:
+        tree = ast.parse(mod_text)
+    except SyntaxError:
+        return False
+    defined_funcs = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for regime in regimes:
+        if regime.config_selector_fn and regime.config_selector_fn not in defined_funcs:
+            return False
+        if regime.builder_candidates and not any(
+            cand in defined_funcs for cand in regime.builder_candidates
+        ):
+            return False
+    return True
+
+
 class CannbenchOpsRegistry:
     """Dynamic registry discovering all 60+ operators in cann-bench/tasks."""
 
@@ -994,10 +1025,12 @@ class CannbenchOpsRegistry:
         tasks_root: str | Path | None = None,
         *,
         source_root: str | Path | None = None,
+        pure_golden: bool = False,
     ) -> None:
         self._source_root = (
             Path(source_root).resolve() if source_root is not None else default_source_root()
         )
+        self._pure_golden = bool(pure_golden)
         self._tasks_root = self._resolve_tasks_root(tasks_root)
         self._meta_950pr: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
         meta_path = self._tasks_root / "metadata" / "950pr.json"
@@ -1291,17 +1324,34 @@ class CannbenchOpsRegistry:
         self._semantic_groups[spec.op_id] = groups
         return groups
 
-    def get_anchors(self, name_or_task: str) -> tuple[AnchorCaseSpec, ...]:
-        """Return anchor cases tagged with this operator's campaign regimes.
+    def _use_authored_regimes(
+        self,
+        op_id: str,
+        spec: CannbenchOpSpec,
+        *,
+        pure_golden: bool | None = None,
+    ) -> bool:
+        is_pure = self._pure_golden if pure_golden is None else bool(pure_golden)
+        if is_pure or op_id not in DEFAULT_REGIME_SPECS:
+            return False
+        mod_file = self._module_path(spec)
+        if not mod_file.is_file():
+            return False
+        return _module_defines_authored_regimes(
+            self._module_source(spec),
+            DEFAULT_REGIME_SPECS[op_id],
+        )
 
-        Authored incumbents keep their curated dispatch tags so takeover selectors and anchor
-        routing stay on the module's real ABI. Every other operator, including cold starts, uses
-        WP1's case-to-regime mapping and gains one representative anchor for any regime that the
-        legacy anchor stratification did not cover.
-        """
+    def get_anchors(
+        self,
+        name_or_task: str,
+        *,
+        pure_golden: bool | None = None,
+    ) -> tuple[AnchorCaseSpec, ...]:
+        """Return anchor cases tagged with this operator's campaign regimes."""
         op_id = self._normalize_key(name_or_task)
         spec = self.resolve(op_id)
-        if op_id in DEFAULT_REGIME_SPECS and self._module_path(spec).is_file():
+        if self._use_authored_regimes(op_id, spec, pure_golden=pure_golden):
             return spec.anchors
         groups = self._semantic_regime_groups(spec)
         tag_by_case = {
@@ -1336,16 +1386,17 @@ class CannbenchOpsRegistry:
         """Return PerfTargetSpec targeting t_hw_us and HAP >= 95 for any operator."""
         return self.resolve(name_or_task).perf_target
 
-    def get_case_regime_tag(self, name_or_task: str, case_num: int) -> str | None:
-        """Return the campaign regime tag for one official case.
-
-        Authored incumbents keep their curated dispatch partitions, where routing depends on
-        layout and alignment rather than WP1's current phase tags, so they return ``None`` and
-        callers retain the authored selector routing.
-        """
+    def get_case_regime_tag(
+        self,
+        name_or_task: str,
+        case_num: int,
+        *,
+        pure_golden: bool | None = None,
+    ) -> str | None:
+        """Return the campaign regime tag for one official case."""
         op_id = self._normalize_key(name_or_task)
         spec = self.resolve(op_id)
-        if op_id in DEFAULT_REGIME_SPECS and self._module_path(spec).is_file():
+        if self._use_authored_regimes(op_id, spec, pure_golden=pure_golden):
             return None
         groups = self._semantic_regime_groups(spec)
         target_case = int(case_num)
@@ -1402,27 +1453,24 @@ class CannbenchOpsRegistry:
             )
         return tuple(hydrated)
 
-    def get_regime_specs(self, name_or_task: str) -> tuple[RegimeTargetSpec, ...]:
-        """Return RegimeTargetSpecs partitioned by WP1's physical case mapping.
-
-        Authored incumbent partitions remain authoritative while their module is present because
-        their public entrypoints dispatch through per-regime selectors that WP1 phase tags do not
-        reproduce (MLA layout branches and attention-residual D-alignment branches). Each authored
-        partition receives the max-workload anchor case of its regime and that case's physics
-        ratios so Stage-A, predicate context, and Stage-0 instantiation share real case data.
-        Cold starts for those operators, and all other operators, derive 2-4 regimes from golden
-        semantics.
-        """
+    def get_regime_specs(
+        self,
+        name_or_task: str,
+        *,
+        pure_golden: bool | None = None,
+    ) -> tuple[RegimeTargetSpec, ...]:
+        """Return RegimeTargetSpecs partitioned by physical case mapping."""
         op_id = self._normalize_key(name_or_task)
         spec = self.resolve(op_id)
-        mod_file = self._module_path(spec)
-        mod_text = self._module_source(spec)
-        if op_id in DEFAULT_REGIME_SPECS and mod_file.is_file():
+        is_pure = self._pure_golden if pure_golden is None else bool(pure_golden)
+        if self._use_authored_regimes(op_id, spec, pure_golden=is_pure):
             return self._hydrate_authored_regime_specs(spec, DEFAULT_REGIME_SPECS[op_id])
+        mod_text = "" if is_pure else self._module_source(spec)
         partition = self._semantic_partition(spec)
-        runtime_backend, discovered_tb = infer_module_runtime_backend(
-            mod_text,
-            spec.entrypoint,
+        runtime_backend, discovered_tb = (
+            ("tilelang_dsl", ())
+            if is_pure
+            else infer_module_runtime_backend(mod_text, spec.entrypoint)
         )
         regimes = build_semantic_regime_specs(
             operator_name=op_id,
@@ -1435,16 +1483,33 @@ class CannbenchOpsRegistry:
             runtime_backend=runtime_backend,
             trackb_symbols=discovered_tb,
         )
-        if mod_text and f"def _select_{op_id}_config(" not in mod_text:
-            regimes = tuple(
-                replace(
-                    regime,
-                    config_selector_fn=f"_select_{op_id}_{regime.regime_tag}_config",
-                )
-                if f"def _select_{op_id}_{regime.regime_tag}_config(" in mod_text
-                else regime
-                for regime in regimes
-            )
+        if not is_pure and mod_text:
+            shared_sel = f"_select_{spec.entrypoint}_config"
+            shared_bld = f"_build_{spec.entrypoint}_prim_func"
+            adapted: list[RegimeTargetSpec] = []
+            for regime in regimes:
+                per_sel = f"_select_{spec.entrypoint}_{regime.regime_tag}_config"
+                if f"def {per_sel}(" in mod_text:
+                    adapted.append(replace(regime, config_selector_fn=per_sel))
+                elif f"def {shared_sel}(" in mod_text:
+                    adapted.append(
+                        replace(
+                            regime,
+                            config_selector_fn=shared_sel,
+                            editable_symbols=tuple(
+                                dict.fromkeys(
+                                    (
+                                        *regime.editable_symbols,
+                                        shared_sel,
+                                        shared_bld,
+                                    )
+                                )
+                            ),
+                        )
+                    )
+                else:
+                    adapted.append(regime)
+            regimes = tuple(adapted)
         return regimes
 
 
@@ -1687,6 +1752,7 @@ def build_semantic_regime_specs(
     )
     shared_selector = f"_select_{entrypoint}_config"
     shared_builder = f"_build_{entrypoint}_prim_func"
+    multi_regime = len(groups) > 1
     regimes: list[RegimeTargetSpec] = []
     for group in groups:
         tag = group.regime_tag
@@ -1702,27 +1768,45 @@ def build_semantic_regime_specs(
                 "concrete integer dimensions for Stage-0 instantiation"
             )
         per_regime_selector = f"_select_{entrypoint}_{tag}_config"
-        per_regime_builder = f"_build_{entrypoint}_{tag}_func"
+        per_regime_builder = f"_build_{entrypoint}_{tag}_prim_func"
+        legacy_per_regime_builder = f"_build_{entrypoint}_{tag}_func"
+        if multi_regime:
+            selector_fn = per_regime_selector
+            builder_candidates = (
+                per_regime_builder,
+                legacy_per_regime_builder,
+                shared_builder,
+                "make_kernel",
+            )
+            editable = (
+                per_regime_selector,
+                per_regime_builder,
+                legacy_per_regime_builder,
+                *trackb_symbols,
+            )
+        else:
+            selector_fn = shared_selector
+            builder_candidates = (
+                shared_builder,
+                per_regime_builder,
+                legacy_per_regime_builder,
+                "make_kernel",
+            )
+            editable = (
+                shared_selector,
+                shared_builder,
+                *trackb_symbols,
+            )
         regimes.append(
             RegimeTargetSpec(
                 regime_tag=tag,
-                builder_candidates=(per_regime_builder, shared_builder, "make_kernel"),
+                builder_candidates=builder_candidates,
                 sample_builder_kwargs=dict(representative_dims),
                 description=group.description,
                 representative_hir_dims=dict(int_dims),
                 representative_anchor_dims=dict(int_dims),
-                config_selector_fn=shared_selector,
-                editable_symbols=tuple(
-                    dict.fromkeys(
-                        (
-                            per_regime_selector,
-                            shared_selector,
-                            per_regime_builder,
-                            shared_builder,
-                            *trackb_symbols,
-                        )
-                    )
-                ),
+                config_selector_fn=selector_fn,
+                editable_symbols=tuple(dict.fromkeys(editable)),
                 allowed_helper_prefix=f"_{operator_name}_{tag}_",
                 runtime_backend=runtime_backend,
                 trackb_symbols=tuple(trackb_symbols),
@@ -1750,6 +1834,25 @@ def _parse_proto_shape_axes(shape_spec: object, layout: str) -> list[str]:
     return [tok.strip() for tok in chosen.split(",") if tok.strip()]
 
 
+_FLOATING_SCHEMA_DTYPES = frozenset(
+    {
+        "float16",
+        "bfloat16",
+        "float32",
+        "float64",
+        "float8_e4m3fn",
+        "float8_e5m2",
+        "float8_e8m0fnu",
+        "float4_e2m1",
+        "float4_e1m2",
+        "float4_e2m1fn",
+        "float4_e2m1fnx2",
+    }
+)
+_ALL_SCHEMA_DTYPES = frozenset(DTYPE_BYTES) | _FLOATING_SCHEMA_DTYPES
+_VM_PROTO_PARAM_NAMES = frozenset({"program", "prog_len", "num_regs", "w_dim"})
+
+
 def extract_schema_driven_case_dims(
     case_entry: Mapping[str, object],
     proto_inputs: Sequence[Mapping[str, object]] = (),
@@ -1762,18 +1865,20 @@ def extract_schema_driven_case_dims(
             dims[str(k)] = v
 
     raw_dtypes = case_entry.get("dtype")
-    if isinstance(raw_dtypes, (list, tuple)):
-        for dt in raw_dtypes:
-            dt_s = str(dt).strip()
-            if dt_s in ("float16", "bfloat16", "float32"):
+    flat_dtypes = [
+        dt.strip()
+        for dt in flatten_str_values(raw_dtypes)
+        if dt.strip() and dt.strip().lower() != "none"
+    ]
+    for dt_s in flat_dtypes:
+        if dt_s.lower() in _FLOATING_SCHEMA_DTYPES:
+            dims.setdefault("tl_dtype", dt_s)
+            break
+    if "tl_dtype" not in dims:
+        for dt_s in flat_dtypes:
+            if dt_s.lower() in _ALL_SCHEMA_DTYPES:
                 dims.setdefault("tl_dtype", dt_s)
                 break
-    elif isinstance(raw_dtypes, str) and raw_dtypes.strip() in (
-        "float16",
-        "bfloat16",
-        "float32",
-    ):
-        dims.setdefault("tl_dtype", raw_dtypes.strip())
 
     shapes = _normalize_shape_list(case_entry.get("input_shape"))
     if not shapes:
@@ -1882,7 +1987,17 @@ def extract_schema_driven_case_dims(
         dims.setdefault("half_dim", max(1, int(lead[-1]) // 2))
         dims.setdefault("d_dim", int(lead[-1]))
         dims.setdefault("dk", int(lead[-1]))
-    if len(shapes) >= 2 and len(shapes[1]) >= 2 and len(lead) == 2:
+    proto_param_names = {
+        str(item.get("name", "")).strip().lower()
+        for item in proto_inputs
+        if isinstance(item, Mapping)
+    }
+    if (
+        len(shapes) >= 2
+        and len(shapes[1]) >= 2
+        and len(lead) == 2
+        and bool(proto_param_names & _VM_PROTO_PARAM_NAMES)
+    ):
         dims.setdefault("prog_len", int(lead[0]))
         dims.setdefault("num_regs", int(shapes[1][0]))
         dims.setdefault("w_dim", int(shapes[1][1]))
