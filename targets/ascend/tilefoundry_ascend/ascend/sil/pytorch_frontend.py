@@ -557,7 +557,7 @@ def _return_value_is_shape_reduced(
             _return_value_is_shape_reduced(element, definitions, set(seen))
             for element in elements
         )
-    head = _resolved_return_head(node, definitions, set(seen))
+    head = _resolved_return_head(node, definitions, seen)
     if isinstance(head, ast.BinOp):
         return _return_value_is_shape_reduced(
             head.left, definitions, set(seen)

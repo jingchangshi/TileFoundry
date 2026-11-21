@@ -632,6 +632,40 @@ def test_softmax_shape_preservation_requires_a_shape_preserving_return_path(
     assert helper.preserves_input_shape is True
 
 
+def test_self_referential_reassignment_on_the_return_path_terminates(
+    analyzer: PyTorchSemanticAnalyzer,
+) -> None:
+    """A name reassigned through its own conversion must not re-resolve forever."""
+    reassigned = analyzer.analyze_source(
+        dedent(
+            """
+            import torch
+
+            def gather_like(x, index, dim):
+                if index.dtype != torch.int64:
+                    index = index.long()
+                gathered = torch.gather(x, dim, index)
+                return gathered
+            """
+        ),
+        entry_name="gather_like",
+    )
+    assert reassigned.preserves_input_shape is False
+    returned_conversion = analyzer.analyze_source(
+        dedent(
+            """
+            import torch
+
+            def returned_conversion(index):
+                index = index.long()
+                return index
+            """
+        ),
+        entry_name="returned_conversion",
+    )
+    assert returned_conversion.preserves_input_shape is False
+
+
 def test_obfuscated_softmax_and_shrinking_sum_price_output_write_back(
     analyzer: PyTorchSemanticAnalyzer,
 ) -> None:
