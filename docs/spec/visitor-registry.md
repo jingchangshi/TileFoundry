@@ -496,6 +496,78 @@ class VerifyContext(TypeInferContext):   # inherits frame / current_mesh
     single composed `Mesh | None` value. TIR verification uses the independent
     `mesh_scope` tuple as a traversal cache; it MUST NOT write the HIR field.
 
+**Operand lane and element-type rules.** `verify_operand_lanes` refuses an
+instruction operand whose extent is not the lane count its execution mode
+declares. A lane count that only appears in a constant is documentation: the
+mode states how many lanes one issue covers, and an operand of a different
+extent is a quantity that mode cannot issue, whether shorter (a partial issue
+nothing describes) or longer (tiling this build has no rule for). Only register
+operands are measured: memory operands are tiles staged by transfers, and the
+predicate is measured by the instruction that consumes it, so the mask keeps
+one owner instead of two that could disagree. The carrier register class is
+BF16 transport/conversion rather than a compute register: it is exempt from
+the compute-dtype rule exactly as the predicate is, and is still fully checked
+for lane extent. `verify_operand_dtypes` then refuses a register operand whose
+element type the mode does not compute on — i32 is also 32 bits wide, so
+"the widths agree" admits integers to an add that only performs floating-point
+arithmetic. Operand types are read off the operation's own operands rather
+than a list of parameter names, so a later instruction is covered without
+editing the check.
+
+**Execution-boundary checks.** `verify_execution_boundary` refuses a region
+whose kind nothing declares, whose declaration has no mask width or no required
+topology, or that is entered inside a non-nestable mode. The domain is read
+from the mesh in force at the region, never from the module declaration: a
+module that declares an AIV level says what the program may use, not that every
+region in it runs there. A region with no mesh in force therefore states a mode
+with nowhere to run and is refused, which is also why a module declaring no
+topologies cannot slip through as an empty set that trivially contains the
+requirement.
+
+**Expression and storage placement.** `verify_expression_placement` checks
+every operation reachable from one expression under the modes in force: a
+LetStmt value, a call argument, a view chain, and a retained callee are equally
+good hiding places, so "inside the with-block" means "checked". A callable that
+is not a direct operation is refused inside a mode because callee verification
+is not mode-aware; a callee is verified where it is defined, which says nothing
+about the mode at the call site. `verify_allocation_placement` and
+`verify_private_parameters` enforce the same privacy in both directions: a
+mode-private storage class may be allocated only inside a mode that owns it,
+and cannot be supplied as a parameter from outside one. Both rules are stated
+over the modes the function enters, not over every loaded declaration, so
+importing another target cannot make a program unverifiable. Ownership is
+decided over both sets: an allocation is legal as soon as any mode in force
+owns the storage, and refused only when a mode this function enters owns it
+while none in force does. With multiple owners the diagnostic names every
+entering owner rather than the first.
+
+**Predicate production.** `verify_predicate_producers` requires a predicate's
+producer to dominate its reader in resolved statement order; presence in the
+scope is not enough. A producer is an Evaluate of a declared operation with
+declared WRITE effect on that operand position earlier in the walk; an
+allocation that merely binds the name produces nothing. Only predicate operands
+the instruction reads are subjects, so pset's write-only dst is not asked to
+have produced the mask it produces. In a mode declaring two independently
+checked mask widths (arithmetic and conversion), the writer must also declare
+the width it produces and that width must match the reader's declared mask
+class; a bool tensor's shape says nothing about the physical PREG encoding, so
+shape is never used here, and a producer with no declared width is refused
+rather than skipped. Control flow is conservative: a write inside an If branch
+or a loop body does not dominate statements after the construct, because the
+branch may not have run. Any mask written inside a construct has unknown
+granularity afterwards, so a consumer requiring a specific width is refused
+instead of being checked against the resurrected pre-construct record; uses
+inside the same construct are still checked against the write that precedes
+them there.
+
+**Callable resolution.** `verify_evaluate_callable` refuses every callable
+route other than a direct declared operation, which `verify_op_placement` then
+judges on its own terms. A computed instance target is a `Call` and reaches the
+retained route, the same route as a direct `PrimFunction` reference; the
+rejection set follows the routes the walker takes, not the shapes an author
+might write. A retained instance target is resolved through its projection, and
+a failure names the resolved callee while tolerating a result without a name.
+
 Registry + decorator:
 
 ```python

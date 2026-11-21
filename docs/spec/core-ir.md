@@ -911,3 +911,37 @@ class ReduceKind(enum.Enum):
   - These enums MUST be the single shared kind vocabulary carried by HIR and
     TIR generic operations; lowering MUST preserve a kind without remapping it.
   - The member names and string values above are the complete built-in sets.
+
+## 5. Execution regions
+
+An execution region is not a mesh. A mesh answers *which participants run this
+work*; an execution region answers *in which execution mode the work runs*, and
+therefore which values may cross its boundary at all. A vector-register value
+has no meaning outside the region that gives it one, so the boundary rule is a
+semantic rule, not a convention.
+
+`ir/core/execution.py` owns the vocabulary only:
+
+- `ExecutionKind` — one target-declared execution mode: its surface spelling,
+  the storage classes private to it, the mask width its instructions expect,
+  the lane count one issue covers, the element types it computes on, and the
+  topology it must be entered under. `register_storages` values may not be
+  captured, yielded, or read outside the region. `mask_width_bits` is the
+  predicate width the region's instructions reduce to;
+  `conversion_mask_width_bits` is the independent conversion-mask granularity
+  (BF16↔F32 uses 16). Every declared element dtype MUST be exactly
+  `mask_width_bits` wide: a same-width integer is a different quantity, not an
+  equally good operand. `required_topologies` names the hardware levels the
+  region must be entered under; the region does not open a mesh.
+- `RegionRequirement` — what one operation states about where it may appear.
+  `"inside"` means the operation is only meaningful with that region in force;
+  `"outside"` means entering that region makes the operation invalid. Both
+  directions are needed: a register instruction outside its region and a
+  direct-memory transfer inside one are different defects of the same
+  boundary. `None` means the operation states nothing, so every pre-existing
+  operation keeps its behaviour unchanged.
+- the registry mapping a surface marker to its declaration.
+
+The checks live in `tilefoundry.visitor_registry.verify`; this module only
+states the facts they read, so one declaration drives parse, analysis and
+diagnosis instead of three copies drifting apart.

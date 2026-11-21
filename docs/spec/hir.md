@@ -344,6 +344,7 @@ class LoopRegion(Expr):
         extent: attribute; iteration-domain stop (half-open).
         step: attribute; induction-var stride.
         start: attribute; iteration-domain start (default 0).
+        pipeline: attribute; authored pipelining intent (`PipelineSpec | None`).
     """
 
     induction_var: Var
@@ -354,12 +355,23 @@ class LoopRegion(Expr):
     extent: ShapeDim
     step: ShapeDim
     start: ShapeDim = 0
+    pipeline: PipelineSpec | None = None
 ```
 - constraints:
   - the only HIR exception to pure Call DAG: loop-phi-shaped structured SSA that
     folds a tile-style loop into one `Expr` value; `type` is `TensorType` (single
     carry) or `TupleType` (multi-carry).
   - mutable during the compiler's authorised typing and metadata updates.
+  - a region rather than a scope: the values the loop carries are its own
+    state, stated once here, not something every expression inside holds a
+    copy of.
+  - `pipeline` records authored pipelining INTENT (D0 surface only). It is
+    `None` for an ordinary range/`tf.tile` loop. It is not a schedule: no
+    offset plan is generated here and no solver is implied.
+  - the loop bounds are the SINGLE authority. A pipeline spec MUST NOT carry a
+    second copy of `stop`, because two copies of one expression drift apart
+    under clone and substitute; a mismatched `pipeline` type MUST raise
+    `PIPELINE_DECLARATION_INVALID` by name.
 
 **Iteration domain.** Both DSL loop surfaces — `for i in tf.tile(...)` and
 `for i in range(...)` — lower to this one node; they share the domain

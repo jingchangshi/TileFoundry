@@ -142,21 +142,10 @@ def _mesh_topology_names(mesh) -> tuple[str, ...]:
 def verify_execution_boundary(region, ctx) -> None:
     """Check one execution region states a mode that may be entered here.
 
-    Everything here is about the boundary; the body is the body walker s
-    question. Four refusals, each of which would otherwise be a silent yes:
-
-    - a kind nothing declares, which has no rules to hold the region to;
-    - a declaration with no mask width, whose instructions cannot be bounded;
-    - a declaration with no required topology, which names no domain at all;
-    - an enclosing mode that is not nestable, which for the parser and for
-      this check alike means no execution region may be entered inside it.
-
-    The domain itself is read off the mesh *in force at the region*, never off
-    the module declaration: a module that declares an AIV level says what the
-    program may use, not that every region in it runs there. A region with no
-    mesh in force therefore states a mode with nowhere to run and is refused,
-    which is also why a module declaring no topologies cannot slip through as
-    an empty set that trivially contains the requirement.
+    Four refusals: undeclared kind, no mask width, no required topology, or a
+    non-nestable enclosing mode. The domain is read from the mesh in force at
+    the region, never the module declaration; see
+    [visitor-registry §5](docs/spec/visitor-registry.md#5-instance-2--verify).
     """
     if ctx is None:
         raise VerifyError(
@@ -557,6 +546,13 @@ class _Binders:
 
 
 def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: tuple = ()):
+    """Walk one TIR statement, checking each rule at its own layer.
+
+    Predicate production runs after the body so an ill-typed mask stays an
+    operand-type refusal; evaluate operands are scanned on every callable route;
+    inline views and allocations are checked like let-bound ones. See
+    [visitor-registry §5](docs/spec/visitor-registry.md#5-instance-2--verify).
+    """
     for _, value in _iter_stmt_expr_fields(stmt):
         if isinstance(value, Expr):
             verify_value_layouts(value)
@@ -625,14 +621,6 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: t
         case ExecutionScope():
             _verify_execution_scope(stmt, ctx, scope, modes)
             _walk_stmt(stmt.body, ctx, scope, fn, module_context, binders, (*modes, stmt.kind))
-            # AFTER the body, deliberately. The producer rule presumes a well-formed
-            # predicate: if the operand in the mask slot is the wrong TYPE (i32, say),
-            # that is an operand-type refusal and must remain the reported layer. Only
-            # a mask that is otherwise well formed -- a genuine bool register -- can be
-            # "unproduced". Running this before the walk made every unproduced mask
-            # preempt the dtype/lane rules and stole their negatives; deferring keeps
-            # each rule owning its own case and still catches the mask that is correct
-            # in every respect except that nothing wrote it.
             verify_predicate_producers(stmt)
             return
         case Return():
@@ -641,15 +629,8 @@ def _walk_stmt(stmt, ctx, scope, fn, module_context, binders: _Binders, modes: t
             return
         case Evaluate():
             binders.uses((stmt.callable, stmt.args), stmt)
-            # Every operand is scanned under the modes in force, whichever route
-            # the callable itself takes. Doing this per-route meant a computed
-            # instruction target skipped the scan entirely.
             for argument in stmt.args:
                 verify_expression_placement(argument, modes, where="ExecutionScope")
-                # An inline view or allocation written straight into an operand
-                # position is the same claim as one bound with LetStmt, so it is
-                # checked by the same rule rather than only where it is spelled
-                # with a name.
                 verify_allocation_placement(argument, modes, _modes_used_by(fn))
             verify_operand_lanes(stmt, modes)
             verify_evaluate_callable(stmt.callable, modes)
@@ -698,17 +679,10 @@ def _call_like(value) -> bool:
 def verify_expression_placement(value, modes: tuple, *, where: str) -> None:
     """Check every operation reachable from one expression under the modes in force.
 
-    Placement is a property of the whole statement, not only of the operation a
-    statement happens to evaluate. An operation can appear in a LetStmt value, in
-    a call argument, in a tensor view chain or behind a retained callee, and each
-    of those positions is an equally good hiding place for something the mode
-    does not admit. The whole expression is walked so that "inside the with-block"
-    means the same thing as "checked".
-
-    A callable that is not a direct operation is refused inside a mode while
-    callee verification is not mode-aware: a callee is verified where it is
-    defined, which says nothing about the mode at the call site, so admitting it
-    here would be a loophole rather than a check.
+    Placement covers the whole expression, not only the evaluated operation.
+    A call-like target is refused inside a mode because callee verification is
+    not mode-aware; see
+    [visitor-registry §5](docs/spec/visitor-registry.md#5-instance-2--verify).
     """
     if not modes:
         for reachable in collect_exprs(value) if isinstance(value, Expr) else ():
@@ -741,24 +715,9 @@ def _modes_used_by(fn) -> frozenset:
 def verify_allocation_placement(value, modes: tuple, enclosing: frozenset = frozenset()) -> None:
     """Refuse a region-private allocation made outside the region that owns it.
 
-    A register value is private to its mode: it exists because the mode has a
-    register file, and it has no meaning in an issue stream that is not the vector
-    one. So an allocation of register storage *outside* the mode is not a
-    near-miss to be repaired later -- it is a buffer that should not exist, and a
-    later pass that hoists one "for reuse" would be manufacturing exactly the
-    value this rule forbids.
-
-    Checked at the allocation rather than at its uses because the allocation is
-    where the lifetime is decided. A use outside the region is then impossible
-    without also crossing the binding scope, which the binder check already
-    refuses.
-
-    The rule is stated relative to the modes *this function* enters, not to every
-    kind any loaded target declares. Register storage is not globally private: it
-    is private to a mode, and a program with no mode has none. Keying off the
-    registry instead would make one target program unverifiable because another
-    target happened to be imported into the same process, which is a property of
-    the process rather than of the program.
+    Checked at the allocation, where lifetime is decided, and stated over the
+    modes this function enters rather than every loaded declaration; see
+    [visitor-registry §5](docs/spec/visitor-registry.md#5-instance-2--verify).
     """
     for reachable in collect_exprs(value) if isinstance(value, Expr) else ():
         if not isinstance(reachable, Call):
@@ -767,20 +726,6 @@ def verify_allocation_placement(value, modes: tuple, enclosing: frozenset = froz
         storage = getattr(type_, "storage", None)
         if storage is None:
             continue
-        # Which declarations treat this storage as theirs, and which of those the
-        # function actually enters. Ownership must be decided over BOTH sets: an
-        # allocation is legal as soon as ANY mode in force owns the storage, and is
-        # a violation only when a mode this function enters owns it while none of
-        # the modes in force does.
-        #
-        # Iterating the declarations and refusing on the first owner that is "in
-        # enclosing but not in modes" would refuse a legal allocation whenever two
-        # modes own the same storage: standing inside the first, the second is
-        # entered somewhere in the function and always looks violated. That shape
-        # cannot occur today -- exactly one declared kind claims register storage --
-        # but the rule should not depend on that remaining true, so it is written to
-        # be correct for any number of owners rather than for the one we happen to
-        # have.
         owners = [declared for declared in declared_kinds() if declared.owns_storage(storage)]
         if not owners:
             continue
@@ -788,7 +733,7 @@ def verify_allocation_placement(value, modes: tuple, enclosing: frozenset = froz
             continue
         entered = [declared for declared in owners if declared.name in enclosing]
         if not entered:
-            continue  # private to a mode this function never enters: not this rule
+            continue
         holder = modes[-1] if modes else None
         where = (
             f"runs inside {holder!r}"
@@ -806,19 +751,9 @@ def verify_allocation_placement(value, modes: tuple, enclosing: frozenset = froz
 def verify_private_parameters(fn, enclosing: frozenset) -> None:
     """Refuse an externally supplied value in storage a mode owns.
 
-    A register value exists because the region has a register file, so it cannot
-    also be handed in from outside: the caller has no register file to supply it
-    from. A parameter whose storage is private to a mode *this function enters*
-    therefore has no possible producer, which is why the rule is stated over the
-    modes the function enters rather than over every declared kind. In a program
-    with no mode, register storage is ordinary CUDA thread-local memory and the
-    rule does not apply -- the same reasoning as the allocation check above.
-
-    This is the fail-closed half of the capture rule. The allocation check refuses
-    making a private value outside the region; this refuses arriving with one, so
-    there is no shape of private value whose owner is unaccounted for: allocated
-    in the region, or handed in (refused here), or viewed inline (refused by the
-    same expression walk, since a view call carries its result type).
+    A private value is created inside its region, so it cannot also arrive as a
+    parameter; the rule is stated over the modes this function enters. See
+    [visitor-registry §5](docs/spec/visitor-registry.md#5-instance-2--verify).
     """
     if not enclosing:
         return
@@ -827,12 +762,6 @@ def verify_private_parameters(fn, enclosing: frozenset) -> None:
         storage = getattr(type_, "storage", None)
         if storage is None:
             continue
-        # Named over EVERY declaring mode the function enters, for the reason given
-        # on the allocation check: with more than one owner, reporting only the first
-        # found would name a mode that is not the one the reader was thinking of, and
-        # the message would be right for the wrong place. The rule is the same either
-        # way -- such a parameter has no possible producer -- so the parameter is
-        # refused once, with every owner named.
         entered = [
             declared
             for declared in declared_kinds()
@@ -850,21 +779,13 @@ def verify_private_parameters(fn, enclosing: frozenset) -> None:
 
 
 def verify_operand_lanes(stmt, modes: tuple) -> None:
-    '''Refuse an instruction operand whose extent is not the declared lane count.
+    """Refuse an instruction operand whose extent is not the declared lane count.
 
-    A lane count that only appears in a constant is documentation. The mode
-    states how many lanes one issue covers, and an instruction in that mode
-    operates on exactly that many: an operand of a different extent is a
-    quantity this mode cannot issue, whether it is shorter (a partial issue
-    nothing here describes) or longer (tiling this build has no rule for).
-    Stating the check makes the extent a contract; leaving it out would make a
-    64-lane add and a 32-lane add equally acceptable.
-
-    Only register operands are measured. Memory operands are tiles staged by the
-    transfers, whose extent rules belong to the instruction that moves them, and
-    the predicate is measured by the instruction that consumes it, so the mask
-    keeps one owner instead of two that could disagree.
-    '''
+    Only register operands are measured: memory operands are staged by their
+    transfers, and the predicate belongs to its consuming instruction. The
+    lane-count and element-type rules are specified in
+    [visitor-registry §5](docs/spec/visitor-registry.md#5-instance-2--verify).
+    """
     if not modes:
         return
     declared = execution_kind(modes[-1])
@@ -878,13 +799,8 @@ def verify_operand_lanes(stmt, modes: tuple) -> None:
         name = getattr(stmt.callable, "name", type(stmt.callable).__name__)
         dtype_name = getattr(getattr(type_, "dtype", None), "name", None)
         if dtype_name == "bool":
-            # the predicate: owned by the instruction that consumes it
             continue
         if storage is StorageKind.CARRIER:
-            # The carrier register class is BF16 TRANSPORT/CONVERSION, not a compute
-            # register. It is exempt from the compute-dtype rule exactly as the predicate
-            # is, and stays fully checked for lane extent below. This ADDS a capability; it
-            # does not disable the check for compute registers.
             pass
         allowed = tuple(getattr(dtype, "name", None) for dtype in declared.element_dtypes) if storage is not StorageKind.CARRIER else ()
         if allowed and dtype_name not in allowed:
@@ -931,18 +847,8 @@ def verify_operand_dtypes(op, declared, name: str) -> None:
             for option in getattr(dtype, "patterns", (dtype,))
         )
         if names == ("bool",):
-            # The predicate register is a mask, not an element: it is one bit per
-            # lane and no arithmetic is performed on it, so the element-type rule
-            # does not apply to it. Without this exemption every instruction that
-            # WRITES the predicate -- pset -- would be refused by a rule about
-            # elements, which is the positive part of the chain failing its own
-            # check. The extent rule above already exempts it for the same reason;
-            # the two must agree or the chain is unverifiable.
             continue
         if getattr(pattern, "storage", None) is StorageKind.CARRIER:
-            # Same capability split at the pattern level: a carrier operand is transport/
-            # conversion, not a compute element. Every other operand is still checked, so
-            # bf16 in an element register stays refused.
             continue
         if any(name_ not in allowed for name_ in names):
             raise VerifyError(
@@ -954,75 +860,18 @@ def verify_operand_dtypes(op, declared, name: str) -> None:
 
 
 def verify_predicate_producers(scope_stmt) -> None:
-    """Refuse a predicate operand whose producing instruction does not DOMINATE it.
+    """Refuse a predicate operand whose producer does not dominate its reader.
 
-    Two failures, one rule:
-      * a mask with NO producing instruction in the region (the pset was dropped), and
-      * a mask whose producing instruction comes AFTER the instruction that reads it
-        (the pset was placed after the vadd).
-    Both leave the predicated result reading the mask register as it stood before any
-    mask was written.
-
-    The second is why this cannot be a set-membership test over the whole scope. The
-    resolved TIR is a Sequential and execution order IS statement order, so "a writer
-    exists somewhere in this scope" does not mean the writer RAN before the reader. A
-    later writer is not legitimate for a mask: nothing in this IR carries a mask write
-    across a later read, there is no reordering pass, and no semantic basis for one --
-    pset writes a value register, not a deferred promise. The producer must PRECEDE the
-    consumer in the resolved statement order. This is dominance, not presence.
-
-    A mask is just a bool register, so an allocated-but-never-written mask type-checks,
-    matches the bool-in-rmem operand pattern, passes the lane rule (bool exempt) and
-    the dtype rule (bool is a mask, not an element). Without this rule a dropped or
-    misordered pset is ACCEPTED and the predicated instruction reads garbage.
-
-    Same region instance means same ExecutionScope body: a writer in a sibling or
-    enclosing scope does not make this instance's mask produced, and nesting is refused
-    separately (a non-nestable mode cannot be entered inside itself).
-
-    A producer is an instruction (an Evaluate of a declared operation) with declared
-    WRITE effect on that operand position that appears EARLIER in the walk. An
-    allocation that merely binds the name is not a producer. Only predicate operands the
-    instruction READS are subjects: pset's own dst is WRITE and is not a read, so pset
-    is not asked to have produced the mask it produces.
-
-    GRANULARITY is the second half of the producer check. In a mode that declares TWO
-    independently checked mask widths (arithmetic 32, conversion 16 -- see
-    verify_op_placement), "a mask was written" is not enough: the writer must have
-    DECLARED the width it produced, and that width must match the class of the reader.
-    A bool tensor's shape says nothing about the physical PREG encoding, so shape is
-    never used here. The mode declares both widths, so this rule is FAIL-CLOSED inside
-    it: a producer with no declared width, or a producer that is not a declared mask
-    producer at all, is refused by name rather than skipped. Modes that do not declare
-    two widths keep the original behaviour (the check simply does not apply).
-
-    Ordering under control flow is conservative: a write inside an If branch or a loop
-    body does not dominate statements after the construct (it may not have executed),
-    so it is not carried out of the construct. A write before the construct does
-    dominate inside it.
-
-    CONTROL-FLOW CLOBBER. Restoring the pre-construct producer must not RESURRECT a
-    granularity that the construct may have overwritten. If a mask Var is written
-    ANYWHERE inside an If/For/While body, then after the construct its granularity is
-    UNKNOWN (it may be the pre-construct width or a width the body wrote, depending on
-    whether the branch ran). A consumer that requires a specific width is then refused by
-    name instead of being checked against the stale pre-construct width. Example caught:
-    pset16(mask) then 'if True: pset32(mask)' then vcvt16(mask) was accepted because the
-    save/restore brought the 16-bit record back; now it is refused. Uses of a mask INSIDE
-    the same construct are still checked against the write that precedes them there.
+    Covers dropped and misordered writers, two-width granularity, and
+    control-flow clobber; see
+    [visitor-registry §5](docs/spec/visitor-registry.md#5-instance-2--verify).
     """
     declared = execution_kind(scope_stmt.kind)
     if declared is None:
-        return  # an undeclared kind is refused by the scope check; not this rule
+        return
 
-    produced = set()  # ids of Vars WRITTEN by a statement already passed in this chain
-    # id(Var) -> (producer op, declared mask width or None). Kept in lockstep with
-    # 'produced' through the Sequential/For/If walks below, so the granularity recorded
-    # is always the LAST writer before the read (the same writer dominance uses).
+    produced = set()
     produced_mask = {}
-    # Ordered log of ids written so far, including inside control-flow bodies. A
-    # construct's "writes inside" are the entries after its entry mark; a set would lose
-    # that distinction because a Var written BEFORE the construct is already in it.
     write_log = []
     two_widths = declared.mask_width_bits is not None and declared.conversion_mask_width_bits is not None
 
@@ -1151,8 +1000,6 @@ def verify_predicate_producers(scope_stmt) -> None:
             produced.update(saved)
             produced_mask.clear()
             produced_mask.update(saved_mask)
-            # A loop body may run zero or more times, so any mask it overwrote has an
-            # UNKNOWN granularity afterwards: do not resurrect the pre-loop record.
             for key in written_inside & produced:
                 produced_mask[key] = (None, None)
             return
@@ -1171,13 +1018,9 @@ def verify_predicate_producers(scope_stmt) -> None:
             produced.update(saved)
             produced_mask.clear()
             produced_mask.update(saved_mask)
-            # Either branch may have run (or neither, for an if without else): any mask
-            # written in either branch has an UNKNOWN granularity afterwards.
             for key in written_inside & produced:
                 produced_mask[key] = (None, None)
             return
-        # LetStmt / anything else: an allocation binds a name, it does not produce a
-        # mask, so it has no ordering effect here.
 
     visit(scope_stmt.body)
 def verify_op_placement(op, modes: tuple, *, where: str = "execution region") -> None:
@@ -1218,9 +1061,6 @@ def verify_op_placement(op, modes: tuple, *, where: str = "execution region") ->
     declared = execution_kind(requirement.kind)
     width = declared_mask_width(op)
     if width is not None and declared is not None:
-        # ONE mode identity, TWO independently checked widths: an ARITHMETIC instruction is
-        # bound to mask_width_bits, a CONVERSION instruction to conversion_mask_width_bits.
-        # Neither check may be satisfied by defaulting.
         mask_class = getattr(type(op), "mask_class", "arithmetic")
         if mask_class not in ("arithmetic", "conversion"):
             raise VerifyError(
@@ -1250,22 +1090,10 @@ def verify_op_placement(op, modes: tuple, *, where: str = "execution region") ->
 def verify_evaluate_callable(callable_value, modes: tuple) -> None:
     """Check the callable slot of one Evaluate under the modes in force.
 
-    A computed instance target is a ``Call`` here, and it reaches the retained
-    route -- the same route as a direct reference to a PrimFunction. Listing the
-    rejection set by the shapes an author might write rather than by the routes
-    the walker actually takes is what left ``Call`` out: the guard named four
-    types, the dispatch handled five, and an instruction selected at runtime
-    walked straight past the mode.
-
-    A declared operation is the one callable this walker *can* judge inside a
-    mode, and it is judged on its own terms by verify_op_placement immediately
-    afterwards. It must therefore pass through here untouched: refusing it would
-    replace a placement verdict with "not verified yet", which is a weaker
-    statement about a case that has a real answer.
-
-    While no callee verification carries a mode stack, there is no honest answer
-    for a callee inside a mode, so every non-operation callable is refused rather
-    than admitted by the route it happens to arrive on.
+    A declared operation is judged by verify_op_placement immediately afterwards.
+    Every other callable route is refused while callee verification carries no
+    mode stack; see
+    [visitor-registry §5](docs/spec/visitor-registry.md#5-instance-2--verify).
     """
     if not modes or isinstance(callable_value, Op):
         return
@@ -1526,9 +1354,6 @@ def _retained_callee(target, frame):
     inner = None if frame is None else frame._callee_context(Call(target, (), type=UnitType()))
     callee = inner.function if inner is not None else target
     if not isinstance(callee, PrimFunction):
-        # The label has to survive the failure it reports: a computed instance
-        # target resolves to whatever the projection returns, so reading `.name`
-        # off it unconditionally turned this diagnostic into an AttributeError.
         label = getattr(callee, "name", None) or type(callee).__name__
         raise VerifyError(f"TIR instance entry {label!r} is not a PrimFunction")
     return callee, inner

@@ -12,14 +12,10 @@ class LoopRegion(Expr):
     """Loop-phi-shaped structured SSA folding a tile-style loop into one region.
 
     A region rather than a scope: the values the loop carries are its own state,
-    stated once here, not something every expression inside holds a copy of.
-
-    The first len(yield_values) params carry state; remaining params capture
-    invariant values. All matching args are evaluated outside the loop.
-
-    pipeline records authored pipelining INTENT (D0 surface only). It is None for
-    an ordinary range/tf.tile loop, and nothing about it is a schedule: no offset
-    plan is generated here and no solver is implied.
+    stated once here. The first len(yield_values) params carry state; remaining
+    params capture invariant values. ``pipeline`` records authored pipelining
+    intent (D0 surface only), not a schedule. Semantics are specified in
+    [hir §1.2](docs/spec/hir.md#12-loopregion).
     """
 
     induction_var: Var
@@ -33,10 +29,11 @@ class LoopRegion(Expr):
     pipeline: PipelineSpec | None = None
 
     def __post_init__(self) -> None:
-        # The bounds are the SINGLE authority: a pipeline spec must never carry a
-        # second copy of stop, because two copies of one expression drift apart
-        # under clone and substitute. Time is bought by refusing the mismatch by
-        # name here instead of debugging it after a lowering.
+        """Refuse a pipeline declaration that is not a PipelineSpec.
+
+        Bounds are the single authority: a pipeline spec must never carry a
+        second copy of stop, because the copies drift under clone and substitute.
+        """
         if self.pipeline is not None and not isinstance(self.pipeline, PipelineSpec):
             raise PipelineError(
                 "PIPELINE_DECLARATION_INVALID",

@@ -1,24 +1,9 @@
 """Declare execution regions and the placement law of the operations inside them.
 
-An execution region is not a mesh. A mesh answers *which participants run this
-work*; an execution region answers *in which execution mode the work runs*, and
-therefore which values may cross its boundary at all. A vector-register value
-has no meaning outside the region that gives it one, so the boundary rule is a
-semantic rule, not a convention.
-
-This module owns the vocabulary only:
-
-* ExecutionKind -- one target-declared execution mode: its surface spelling
-  (T.SimdVF), the storage classes that are private to it, the mask width its
-  instructions expect, and the topology it must be entered under.
-* RegionRequirement -- what one operation states about where it may appear.
-  None means the operation states nothing, which is why every pre-existing
-  operation keeps its behaviour unchanged.
-* the registry that maps a surface marker to its declaration.
-
-The checks live in tilefoundry.visitor_registry.verify; this module only states
-the facts they read, so one declaration drives parse, analysis and diagnosis
-instead of three copies drifting apart.
+A region states the execution mode the work runs in; mesh participation is a
+different question. The vocabulary and boundary rules are specified in
+[core-ir §5](docs/spec/core-ir.md#5-execution-regions). The checks live in
+`tilefoundry.visitor_registry.verify`; this module states the facts they read.
 """
 
 from __future__ import annotations
@@ -62,26 +47,18 @@ class RegionRequirement:
 class ExecutionKind:
     """One target-declared execution mode and the boundary it draws.
 
-    register_storages are the storage classes that exist only inside the
-    region: a value held there may not be captured, yielded, or read outside.
-    mask_width_bits is the element width the region's instructions reduce
-    their predicates to; an instruction that states a different width is
-    addressing lanes the region does not have. lane_count is how many lanes
-    one issue of the region covers: the extent an instruction operand must
-    have, so a lane count is a checked contract rather than a comment.
-    element_dtypes are the element types the mode computes on, and each must
-    be exactly mask_width_bits wide: a same-width integer is a different
-    quantity, not an equally good operand.
-    required_topologies names the hardware levels the region must be entered
-    under -- a region is not a mesh, so it does not open one; it requires one.
+    Register storages, mask widths, lane count, element dtypes, and required
+    topologies are declared properties checked by
+    `tilefoundry.visitor_registry.verify`; see
+    [core-ir §5](docs/spec/core-ir.md#5-execution-regions).
+    A conversion mask (bf16<->f32 uses 16) is declared separately from the
+    arithmetic mask width; neither defaults.
     """
 
     name: str
     surface: str
     register_storages: tuple[StorageKind, ...] = ()
     mask_width_bits: int | None = None
-    #: Granularity of a CONVERSION mask (bf16<->f32 uses 16), checked independently of the
-    #: arithmetic mask width. One mode identity, two declared properties; neither defaults.
     conversion_mask_width_bits: int | None = None
     lane_count: int | None = None
     element_dtypes: tuple = ()
