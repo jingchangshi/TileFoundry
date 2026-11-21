@@ -469,7 +469,8 @@ def test_agent_flag_stripping_and_tier_adaptive_watchdog(
     med_cfg = backend.watchdog_for_model(exploit_model)
     high_cfg = backend.watchdog_for_model(explore_model)
     xhigh_cfg = backend.watchdog_for_model("gemini-4-hydrogen-xhigh")
-    assert (med_cfg.idle_stall_timeout_sec, med_cfg.active_ceiling_timeout_sec) == (120.0, 240.0)
+    assert (med_cfg.idle_stall_timeout_sec, med_cfg.active_ceiling_timeout_sec) == (120.0, 360.0)
+    assert med_cfg.startup_timeout_sec == 60.0
     assert (high_cfg.idle_stall_timeout_sec, high_cfg.active_ceiling_timeout_sec) == (180.0, 360.0)
     assert (xhigh_cfg.idle_stall_timeout_sec, xhigh_cfg.active_ceiling_timeout_sec) == (
         180.0,
@@ -480,7 +481,7 @@ def test_agent_flag_stripping_and_tier_adaptive_watchdog(
     cmd_high = backend.build_command(explore_req, "P")
     cmd_xhigh = backend.build_command(escalate_req, "P")
     assert "gemini-4-hydrogen-medium" in cmd_med
-    assert "--print-timeout=240s" in cmd_med
+    assert "--print-timeout=360s" in cmd_med
     assert "gemini-4-hydrogen-high" in cmd_high
     assert "--print-timeout=360s" in cmd_high
     assert "gemini-4-hydrogen-high" in cmd_xhigh
@@ -811,10 +812,15 @@ def main():
         return 0
     if scenario == "eof_hang":
         _emit({"type": "system", "subtype": "init"})
-        sys.stdout.close()
-        sys.stderr.close()
+        os.close(1)
+        os.close(2)
         time.sleep(30.0)
         return 0
+    if scenario == "infinite_stream":
+        _emit({"type": "system", "subtype": "init"})
+        while True:
+            _emit({"type": "stream_event", "event": {"type": "content_block_delta"}})
+            time.sleep(0.05)
     if scenario == "proxy_echo":
         payload = {
             "https": os.environ.get("HTTPS_PROXY", ""),
@@ -876,6 +882,13 @@ def _claude_backend(
     )
 
 
+def _telemetry_activity_age(line: str) -> float:
+    token = next(
+        part for part in line.split() if part.startswith("since_last_activity_sec=")
+    )
+    return float(token.split("=", 1)[1])
+
+
 def test_claude_stream_json_startup_retry_and_telemetry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -913,24 +926,43 @@ def test_claude_stream_json_startup_retry_and_telemetry(
     assert "model=exploit-model" in telemetry[0]
     assert "status=timeout" in telemetry[0]
     assert "proxy_configured=false" in telemetry[0]
+    assert "timeout_stage=startup" in telemetry[0]
+    assert 0.0 <= _telemetry_activity_age(telemetry[0]) < 3.0
+    assert "timeout_stage=none" in telemetry[1]
     assert "status=ok" in telemetry[1]
+    assert "since_last_activity_sec=-1.000" in telemetry[1]
+    assert "### SYSTEM INSTRUCTIONS" not in telemetry[0]
+    assert "### USER INPUT" not in telemetry[0]
 
 
 def test_claude_idle_stall_interrupts_and_recovers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Verify a silent stream is interrupted at the idle threshold and retried once."""
     bin_path, state_dir = _write_fake_claude(tmp_path)
     monkeypatch.setenv("TF_FAKE_CLAUDE_STATE_DIR", str(state_dir))
     monkeypatch.setenv("TF_FAKE_CLAUDE_SCENARIO", "idle_stall_once_then_ok")
     backend = _claude_backend(bin_path, startup=3.0, idle=0.3)
+    caplog.set_level(logging.INFO)
 
     t0 = time.monotonic()
     reply = asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
     assert reply == "def ok():\n    return 1"
     assert time.monotonic() - t0 < 3.0
     assert (state_dir / "attempt.txt").read_text(encoding="utf-8") == "2"
+
+    telemetry = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("LLM_CALL_TELEMETRY")
+    ]
+    assert len(telemetry) == 2
+    assert "status=timeout" in telemetry[0]
+    assert "timeout_stage=idle_stall" in telemetry[0]
+    assert 0.3 <= _telemetry_activity_age(telemetry[0]) < 3.0
+    assert "timeout_stage=none" in telemetry[1]
 
 
 def test_claude_stderr_redacted_and_result_error(
@@ -1030,18 +1062,58 @@ def test_claude_structured_metadata_never_returns_as_output(
 def test_claude_stream_eof_with_live_child_is_bounded_by_ceiling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Verify a child that closes both pipes but keeps running is killed at the ceiling."""
     bin_path, state_dir = _write_fake_claude(tmp_path)
     monkeypatch.setenv("TF_FAKE_CLAUDE_STATE_DIR", str(state_dir))
     monkeypatch.setenv("TF_FAKE_CLAUDE_SCENARIO", "eof_hang")
     backend = _claude_backend(bin_path, startup=5.0, idle=5.0, ceiling=0.6, max_retries=0)
+    caplog.set_level(logging.INFO)
 
     t0 = time.monotonic()
     with pytest.raises(TimeoutError, match="active_ceiling_timeout"):
         asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
     assert time.monotonic() - t0 < 3.0
     assert (state_dir / "attempt.txt").read_text(encoding="utf-8") == "1"
+
+    telemetry = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("LLM_CALL_TELEMETRY")
+    ]
+    assert len(telemetry) == 1
+    assert "status=timeout" in telemetry[0]
+    assert "timeout_stage=after_eof" in telemetry[0]
+    assert 0.0 <= _telemetry_activity_age(telemetry[0]) < 3.0
+
+
+def test_claude_infinite_stream_hits_active_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify an endlessly active stream is bounded by the ceiling and reports the branch."""
+    bin_path, state_dir = _write_fake_claude(tmp_path)
+    monkeypatch.setenv("TF_FAKE_CLAUDE_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("TF_FAKE_CLAUDE_SCENARIO", "infinite_stream")
+    backend = _claude_backend(bin_path, startup=5.0, idle=5.0, ceiling=0.8, max_retries=0)
+    caplog.set_level(logging.INFO)
+
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError, match="active_ceiling_timeout"):
+        asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
+    assert time.monotonic() - t0 < 3.0
+
+    telemetry = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("LLM_CALL_TELEMETRY")
+    ]
+    assert len(telemetry) == 1
+    assert "status=timeout" in telemetry[0]
+    assert "timeout_stage=active_ceiling" in telemetry[0]
+    assert 0.0 <= _telemetry_activity_age(telemetry[0]) < 0.5
 
 
 def test_claude_watchdog_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1068,5 +1140,24 @@ def test_claude_watchdog_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TILEFOUNDRY_NPU_LLM_STARTUP_TIMEOUT_SEC", "not-a-number")
     with pytest.raises(ValueError, match="watchdog timeouts"):
         backend.watchdog_for_role("exploit_rule")
+
+
+def test_cli_watchdog_defaults_preserve_startup_idle_and_single_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify default CLI watchdog keeps 90s startup, 120s idle, and one retry."""
+    monkeypatch.delenv("TILEFOUNDRY_NPU_LLM_STARTUP_TIMEOUT_SEC", raising=False)
+    monkeypatch.delenv("TILEFOUNDRY_NPU_LLM_IDLE_STALL_TIMEOUT_SEC", raising=False)
+    backend = SubprocessCliTemplateBackend(
+        "claude_cli", RoleRoutingConfig("e", "c", "b", "r"), bin_path=sys.executable
+    )
+
+    exploit = backend.watchdog_for_role("exploit_rule")
+    assert exploit.startup_timeout_sec == 90.0
+    assert exploit.idle_stall_timeout_sec == 120.0
+    assert exploit.active_ceiling_timeout_sec == 360.0
+    assert exploit.max_retries == 1
+    assert backend.watchdog_for_role("syntax_repair").active_ceiling_timeout_sec == 240.0
+    assert backend.watchdog_for_role("explore_creative").active_ceiling_timeout_sec == 420.0
 
 

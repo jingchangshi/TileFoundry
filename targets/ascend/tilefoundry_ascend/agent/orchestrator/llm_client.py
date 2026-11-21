@@ -20,7 +20,7 @@ from http.client import HTTPException, HTTPResponse
 from pathlib import Path
 from string import Formatter
 from threading import Event
-from typing import Protocol
+from typing import Literal, Protocol, TypeAlias
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -55,6 +55,7 @@ _LLM_ENV_PREFIX = "TILEFOUNDRY_NPU_LLM_"
 _AGY_ENV_PREFIX = "TILEFOUNDRY_NPU_AGY_"
 _REASONING_ROLES = frozenset({"explore_creative", "escalate_trackb"})
 _EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+_TimeoutStage: TypeAlias = Literal["startup", "idle_stall", "active_ceiling", "after_eof"]
 
 
 def _config_value(overrides: Mapping[str, str] | None, *keys: str, default: str = "") -> str:
@@ -82,7 +83,7 @@ class GenerationRequest:
     effort: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class RoleRoutingConfig:
     """Select a model and timeout from the worker role and cap effort explicitly."""
 
@@ -91,17 +92,49 @@ class RoleRoutingConfig:
     escalate_model: str
     repair_model: str
     max_effort: str = "xhigh"
-    exploit_timeout_sec: float = 240.0
+    exploit_timeout_sec: float = 360.0
     reasoning_timeout_sec: float = 420.0
+    repair_timeout_sec: float = 240.0
 
-    def __post_init__(self) -> None:
-        if self.max_effort.lower() not in _EFFORT_LEVELS:
+    def __init__(
+        self,
+        exploit_model: str,
+        explore_model: str,
+        escalate_model: str,
+        repair_model: str,
+        max_effort: str = "xhigh",
+        exploit_timeout_sec: float | None = None,
+        reasoning_timeout_sec: float = 420.0,
+        repair_timeout_sec: float | None = None,
+    ) -> None:
+        """Bound repair by an explicit exploit budget, else keep its own default."""
+        if exploit_timeout_sec is None:
+            effective_exploit = RoleRoutingConfig.exploit_timeout_sec
+            effective_repair = (
+                RoleRoutingConfig.repair_timeout_sec
+                if repair_timeout_sec is None
+                else repair_timeout_sec
+            )
+        else:
+            effective_exploit = exploit_timeout_sec
+            effective_repair = (
+                exploit_timeout_sec if repair_timeout_sec is None else repair_timeout_sec
+            )
+        if max_effort.lower() not in _EFFORT_LEVELS:
             raise ValueError("LLM max effort must be a supported effort level")
         if any(
             not math.isfinite(timeout) or timeout <= 0
-            for timeout in (self.exploit_timeout_sec, self.reasoning_timeout_sec)
+            for timeout in (effective_exploit, reasoning_timeout_sec, effective_repair)
         ):
             raise ValueError("LLM role timeouts must be finite and positive")
+        object.__setattr__(self, "exploit_model", exploit_model)
+        object.__setattr__(self, "explore_model", explore_model)
+        object.__setattr__(self, "escalate_model", escalate_model)
+        object.__setattr__(self, "repair_model", repair_model)
+        object.__setattr__(self, "max_effort", max_effort)
+        object.__setattr__(self, "exploit_timeout_sec", effective_exploit)
+        object.__setattr__(self, "reasoning_timeout_sec", reasoning_timeout_sec)
+        object.__setattr__(self, "repair_timeout_sec", effective_repair)
 
     def model_for_role(self, role: str) -> str:
         """Return the model configured for this worker role."""
@@ -117,6 +150,8 @@ class RoleRoutingConfig:
         """Return the time budget for this worker role in seconds."""
         if role in _REASONING_ROLES:
             return self.reasoning_timeout_sec
+        if role == "syntax_repair":
+            return self.repair_timeout_sec
         return self.exploit_timeout_sec
 
     def effort_for_request(
@@ -151,6 +186,10 @@ class RoleRoutingConfig:
         exploit = pick("EXPLOIT_MODEL", default_exploit, legacy=True)
         default_explore = AgyCliLLMBackend.DEFAULT_EXPLORE_MODEL if is_agy else exploit
         explore = pick("EXPLORE_MODEL", default_explore, legacy=True)
+        exploit_timeout_raw = pick("EXPLOIT_TIMEOUT_SEC", "")
+        exploit_timeout_sec = (
+            float(exploit_timeout_raw) if exploit_timeout_raw else cls.exploit_timeout_sec
+        )
         return cls(
             exploit_model=exploit,
             explore_model=explore,
@@ -162,8 +201,11 @@ class RoleRoutingConfig:
                 f"{_LLM_ENV_PREFIX}EFFORT_CAP",
                 default="high" if is_agy else "xhigh",
             ),
-            exploit_timeout_sec=float(pick("EXPLOIT_TIMEOUT_SEC", "240")),
+            exploit_timeout_sec=exploit_timeout_sec,
             reasoning_timeout_sec=float(pick("REASONING_TIMEOUT_SEC", "360" if is_agy else "420")),
+            repair_timeout_sec=(
+                exploit_timeout_sec if exploit_timeout_raw else cls.repair_timeout_sec
+            ),
         )
 
 
@@ -355,17 +397,23 @@ class _AgyLogTailer:
 class _AttemptFailure(Exception):
     """Internal wrapper pairing a worker failure with retry eligibility."""
 
+    timeout_stage: _TimeoutStage | None
+
     def __init__(
         self,
         exc: Exception,
         *,
         retriable: bool,
         ttft_sec: float | None = None,
+        timeout_stage: _TimeoutStage | None = None,
+        since_last_activity_sec: float | None = None,
     ) -> None:
         super().__init__(str(exc))
         self.exc = exc
         self.retriable = retriable
         self.ttft_sec = ttft_sec
+        self.timeout_stage = timeout_stage
+        self.since_last_activity_sec = since_last_activity_sec
 
 
 async def _terminate_process_group(proc: asyncio.subprocess.Process) -> None:
@@ -1068,8 +1116,36 @@ class OpenAICompatHTTPBackend:
 _CLI_PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
 _CLI_TELEMETRY_FORMAT = (
     "LLM_CALL_TELEMETRY backend=%s role=%s model=%s ttft_sec=%.3f "
-    "elapsed_sec=%.3f status=%s proxy_configured=%s"
+    "elapsed_sec=%.3f status=%s proxy_configured=%s timeout_stage=%s "
+    "since_last_activity_sec=%.3f"
 )
+
+
+def _log_cli_telemetry(
+    *,
+    backend: str,
+    role: str,
+    model: str,
+    ttft_sec: float,
+    elapsed_sec: float,
+    status: str,
+    proxy_configured: str,
+    timeout_stage: _TimeoutStage | None,
+    since_last_activity_sec: float | None,
+) -> None:
+    """Emit one non-sensitive telemetry line for a CLI generation attempt."""
+    logger.info(
+        _CLI_TELEMETRY_FORMAT,
+        backend,
+        role,
+        model,
+        ttft_sec,
+        elapsed_sec,
+        status,
+        proxy_configured,
+        timeout_stage or "none",
+        -1.0 if since_last_activity_sec is None else since_last_activity_sec,
+    )
 
 
 def _proxy_env(environ: Mapping[str, str]) -> dict[str, str]:
@@ -1450,6 +1526,8 @@ class SubprocessCliTemplateBackend:
                             ),
                             retriable=True,
                             ttft_sec=ttft_sec,
+                            timeout_stage="active_ceiling",
+                            since_last_activity_sec=now - last_activity_ts,
                         )
                     if (
                         proc.returncode is None
@@ -1465,6 +1543,8 @@ class SubprocessCliTemplateBackend:
                             ),
                             retriable=True,
                             ttft_sec=ttft_sec,
+                            timeout_stage="startup",
+                            since_last_activity_sec=now - last_activity_ts,
                         )
                     if (
                         proc.returncode is None
@@ -1479,6 +1559,8 @@ class SubprocessCliTemplateBackend:
                             ),
                             retriable=True,
                             ttft_sec=ttft_sec,
+                            timeout_stage="idle_stall",
+                            since_last_activity_sec=now - last_activity_ts,
                         )
 
                 remaining_budget = cfg.active_ceiling_timeout_sec - (
@@ -1487,6 +1569,7 @@ class SubprocessCliTemplateBackend:
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=max(0.0, remaining_budget))
                 except asyncio.TimeoutError:
+                    timed_out_at = time.monotonic()
                     await _terminate_process_group(proc)
                     raise _AttemptFailure(
                         TimeoutError(
@@ -1496,6 +1579,8 @@ class SubprocessCliTemplateBackend:
                         ),
                         retriable=True,
                         ttft_sec=ttft_sec,
+                        timeout_stage="after_eof",
+                        since_last_activity_sec=timed_out_at - last_activity_ts,
                     ) from None
                 stderr_tail = _redact_secrets("\n".join(stderr_lines))[-2000:]
                 if proc.returncode:
@@ -1578,15 +1663,16 @@ class SubprocessCliTemplateBackend:
                     elapsed = time.monotonic() - start_ts
                     status = "timeout" if isinstance(failure.exc, TimeoutError) else "error"
                     ttft = failure.ttft_sec if failure.ttft_sec is not None else -1.0
-                    logger.info(
-                        _CLI_TELEMETRY_FORMAT,
-                        self._kind,
-                        req.role,
-                        model,
-                        ttft,
-                        elapsed,
-                        status,
-                        proxy_configured,
+                    _log_cli_telemetry(
+                        backend=self._kind,
+                        role=req.role,
+                        model=model,
+                        ttft_sec=ttft,
+                        elapsed_sec=elapsed,
+                        status=status,
+                        proxy_configured=proxy_configured,
+                        timeout_stage=failure.timeout_stage,
+                        since_last_activity_sec=failure.since_last_activity_sec,
                     )
                     if failure.retriable and attempt_idx < max_retries:
                         if cfg.retry_backoff_sec > 0.0:
@@ -1595,15 +1681,16 @@ class SubprocessCliTemplateBackend:
                     raise failure.exc from None
                 elapsed = time.monotonic() - start_ts
                 ttft = ttft_sec if ttft_sec is not None else elapsed
-                logger.info(
-                    _CLI_TELEMETRY_FORMAT,
-                    self._kind,
-                    req.role,
-                    model,
-                    ttft,
-                    elapsed,
-                    "ok",
-                    proxy_configured,
+                _log_cli_telemetry(
+                    backend=self._kind,
+                    role=req.role,
+                    model=model,
+                    ttft_sec=ttft,
+                    elapsed_sec=elapsed,
+                    status="ok",
+                    proxy_configured=proxy_configured,
+                    timeout_stage=None,
+                    since_last_activity_sec=None,
                 )
                 return text
         raise RuntimeError("unreachable retry termination")

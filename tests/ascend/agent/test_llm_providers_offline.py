@@ -3,6 +3,7 @@
 import asyncio
 import io
 import json
+import math
 import os
 import sys
 from email.message import Message
@@ -294,6 +295,60 @@ def test_factory_preserves_agy_aliases_and_neutral_mock(
     asyncio.run(mock.generate(GenerationRequest("escalate_trackb", "sys", "user", effort="xhigh")))
     assert mock.routed_models == ["mock-model"]
     assert mock.routed_efforts == ["xhigh"]
+
+
+def test_role_timeouts_default_and_explicit_overrides() -> None:
+    """Keep repair's own default while an explicit exploit timeout governs both roles."""
+    routing = RoleRoutingConfig.from_env(
+        _settings(BACKEND="openai_compat", EXPLOIT_MODEL="worker")
+    )
+    assert routing.timeout_for_role("exploit_rule") == 360.0
+    assert routing.timeout_for_role("syntax_repair") == 240.0
+    assert routing.timeout_for_role("explore_creative") == 420.0
+    assert routing.timeout_for_role("escalate_trackb") == 420.0
+
+    explicit = RoleRoutingConfig.from_env(
+        _settings(
+            BACKEND="openai_compat",
+            EXPLOIT_MODEL="worker",
+            EXPLOIT_TIMEOUT_SEC="17",
+            REASONING_TIMEOUT_SEC="55",
+        )
+    )
+    assert explicit.timeout_for_role("exploit_rule") == 17.0
+    assert explicit.timeout_for_role("syntax_repair") == 17.0
+    assert explicit.timeout_for_role("explore_creative") == 55.0
+    assert explicit.timeout_for_role("escalate_trackb") == 55.0
+
+    direct = RoleRoutingConfig(
+        "e", "c", "b", "r", exploit_timeout_sec=300.0, repair_timeout_sec=90.0
+    )
+    assert direct.timeout_for_role("exploit_rule") == 300.0
+    assert direct.timeout_for_role("syntax_repair") == 90.0
+
+    exploit_only = RoleRoutingConfig("e", "c", "b", "r", exploit_timeout_sec=300.0)
+    assert exploit_only.timeout_for_role("exploit_rule") == 300.0
+    assert exploit_only.timeout_for_role("syntax_repair") == 300.0
+
+    explicit_default = RoleRoutingConfig("e", "c", "b", "r", exploit_timeout_sec=360.0)
+    assert explicit_default.timeout_for_role("exploit_rule") == 360.0
+    assert explicit_default.timeout_for_role("syntax_repair") == 360.0
+
+    tight_budget = RoleRoutingConfig("e", "c", "b", "r", exploit_timeout_sec=120.0)
+    assert tight_budget.timeout_for_role("syntax_repair") == 120.0
+
+    defaulted = RoleRoutingConfig("e", "c", "b", "r")
+    assert defaulted.timeout_for_role("exploit_rule") == 360.0
+    assert defaulted.timeout_for_role("syntax_repair") == 240.0
+
+
+@pytest.mark.parametrize("repair_timeout", [0.0, -1.0, math.inf, math.nan])
+def test_role_timeouts_reject_non_positive_or_non_finite_repair(
+    repair_timeout: float,
+) -> None:
+    """Reject invalid repair budgets at construction like the other role timeouts."""
+    with pytest.raises(ValueError, match="finite and positive"):
+        RoleRoutingConfig("e", "c", "b", "r", repair_timeout_sec=repair_timeout)
 
 
 def test_mock_trackb_uses_old_creative_queue_only_when_absent() -> None:
