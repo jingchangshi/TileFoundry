@@ -205,6 +205,90 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "alg_compute_and_monoid",
             "T.reduce_max(src, dst, dim=...)",
         ),
+        PrimitiveEntry(
+            "T.simd.pset",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.pset(width, \"PAT_ALL\")",
+        ),
+        PrimitiveEntry(
+            "T.simd.update_mask",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.update_mask(count, width=32)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vdup",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.vdup(value, dtype, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vld",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.vld(buf[offset], dist=\"NORM_B32\")",
+        ),
+        PrimitiveEntry(
+            "T.simd.vcvt",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.vcvt(vec, dtype, mask=mask, part=0)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vexp",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.vexp(vec, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vadd",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vadd(lhs, rhs, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vsub",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vsub(lhs, rhs, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vmul",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vmul(lhs, rhs, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vmuls",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vmuls(vec, scalar, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vdiv",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vdiv(lhs, rhs, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vsts",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.vsts(buf[offset], vec, mask=mask, dist=\"PK_B32\", extent=64)",
+        ),
+        PrimitiveEntry(
+            "T.annotate_buffer_versions",
+            "SCALAR",
+            "pipeline_and_sync_graph",
+            "T.annotate_buffer_versions({buf: stages})",
+        ),
+        PrimitiveEntry(
+            "T.annotate_unlimit_memory",
+            "SCALAR",
+            "sram_layout_and_aliasing",
+            "T.annotate_unlimit_memory(\"shared\")",
+        ),
     ),
     forbidden_tokens=(
         "tilelang.language",
@@ -221,6 +305,17 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "reserve T.Pipelined for num_stages >= 2."
         ),
         "Unlock 256 KiB UB via PURE_SIMDVF_UBUF_FLAGS in selector pass_configs.",
+        (
+            "Inside T.Parallel never call T.Cast, T.exp, T.log, T.tanh, T.sigmoid, or T.rsqrt "
+            "unless the loop is nested under `with T.SimtVF(threads=128):`; the SIMD-VF "
+            "parallel lowering rejects scalar cast and transcendental expressions."
+        ),
+        (
+            "Run elementwise transcendental or mixed-precision math under `with T.SimdVF():` "
+            "with `T.simd.*` (f32 via NORM_B32; f16/bf16 via US_B16 -> vcvt(\"float32\") -> "
+            "compute -> vcvt(tl_dtype) -> PK_B32), or under `with T.SimtVF(threads=128):` "
+            "with lowercase T.cast."
+        ),
     ),
 )
 
@@ -398,6 +493,11 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
         "Compile target is Track-B CCE C++20 (-std=c++20 --npu-arch=dav-3510) via tl_templates.",
         "Do NOT emit high-level AscendC classes or legacy 910B raw CCE intrinsics.",
         "Every asc_sync_notify and asc_lock MUST pair symmetrically across all CFG paths.",
+        (
+            "The __simd_vf__ stack frame is exactly 0 bytes: never declare local C arrays "
+            "(for example float tmp[64];) or runtime-indexed local structs inside a "
+            "__simd_vf__ body; stage scratch in __ubuf__ pointer ranges or vector registers."
+        ),
     ),
 )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -20,10 +21,6 @@ _SEARCH_REPLACE_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
 )
 
-_GLOBAL_PREFIX_RE = re.compile(
-    r"^\s*(?:#\s*(?:include|pragma|define|if|ifdef|ifndef|elif|else|endif)\b|"
-    r"struct\s+\w+|enum\s+\w+|using\s+\w+|typedef\s+|(?:static\s+)?constexpr\b)"
-)
 _UNIT_START_RE = re.compile(
     r"^\s*(?:template\s*<|__(?:global|aicore|simd_vf|simt_vf|simd_callee)__\b|"
     r"extern\s+\"C\"|struct\s+\w+|(?:static\s+)?constexpr\b|using\s+\w+|inline\s+)"
@@ -32,6 +29,7 @@ _FUNC_NAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 _CALL_NAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{}()]*>)?\s*\(")
 _C_CONTROL_KEYWORDS = frozenset({"if", "for", "while", "switch", "return", "sizeof", "alignof"})
 _SIBLING_MARKER_RE = re.compile(r"/\*\s*\[READ-ONLY SIBLING KERNEL:")
+_LAUNCH_CONFIG_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{}]*>)?\s*<<<")
 
 
 @dataclass(frozen=True)
@@ -47,7 +45,8 @@ class _CppUnit:
     line_count: int
 
 
-def _strip_cpp_comments_and_strings(text: str) -> str:
+def strip_cpp_comments_and_strings(text: str) -> str:
+    """Blank C++ comments and string/char literals while preserving byte offsets and newlines."""
     chars = list(text)
     n = len(chars)
     i = 0
@@ -105,7 +104,7 @@ def _extract_unit_name(header_text: str, *, is_struct: bool = False) -> str:
 
 def _split_cpp_units(cpp_source: str) -> tuple[list[str], list[_CppUnit]]:
     lines = cpp_source.splitlines(keepends=True)
-    masked_lines = _strip_cpp_comments_and_strings(cpp_source).splitlines(keepends=True)
+    masked_lines = strip_cpp_comments_and_strings(cpp_source).splitlines(keepends=True)
     line_offsets: list[int] = []
     pos = 0
     for ln in lines:
@@ -208,7 +207,10 @@ def extract_trackb_launcher_preview(module_source: str, *, max_bytes: int = 1600
             lines = module_source.splitlines()
             for node in tree.body:
                 if isinstance(node, ast.FunctionDef) and "trackb" in node.name:
-                    hdr = "\n".join(lines[node.lineno - 1 : min(node.lineno + 6, node.end_lineno)])
+                    assert node.end_lineno is not None
+                    hdr = "\n".join(
+                        lines[node.lineno - 1 : min(node.lineno + 6, node.end_lineno)]
+                    )
                     previews.append(hdr.strip())
                     break
         except SyntaxError:
@@ -229,7 +231,7 @@ def select_active_trackb_kernel(
     module_source: str = "",
 ) -> str | None:
     """Resolve the active ``__global__`` kernel name for scoped Track-B context extraction."""
-    _dirs, units = _split_cpp_units(cpp_source)
+    _, units = _split_cpp_units(cpp_source)
     kernels = [u for u in units if u.kind == "kernel" and u.name]
     if not kernels:
         return None
@@ -267,6 +269,38 @@ def select_active_trackb_kernel(
         if called:
             return max(called, key=lambda u: u.line_count).name
     return kernels[0].name
+
+
+def resolve_instantiated_trackb_kernel(
+    instantiated_tu: str,
+    raw_cpp_source: str,
+) -> str | None:
+    """Resolve the unique active ``__global__`` kernel from instantiated launcher truth.
+
+    The module renderer appends an ``extern "C"`` launcher stub to the raw Track-B
+    source, so the ``<<<...>>>`` call sites in that tail name the kernel chosen for
+    the representative case. Comments and literals are masked before scanning;
+    repeated launches of one kernel resolve, while distinct launched kernels are
+    ambiguous and return ``None``.
+    """
+    _, units = _split_cpp_units(raw_cpp_source)
+    kernels = {u.name for u in units if u.kind == "kernel" and u.name}
+    if not kernels or not instantiated_tu.strip():
+        return None
+    masked = strip_cpp_comments_and_strings(instantiated_tu)
+    launch_region = (
+        masked[len(raw_cpp_source) :]
+        if instantiated_tu.startswith(raw_cpp_source)
+        else masked
+    )
+    launched = {
+        match.group(1)
+        for match in _LAUNCH_CONFIG_RE.finditer(launch_region)
+        if match.group(1) in kernels
+    }
+    if len(launched) == 1:
+        return next(iter(launched))
+    return None
 
 
 def _truncate_kernel_body(kernel_text: str, max_bytes: int) -> str:
@@ -420,53 +454,172 @@ def _reject_introduced_forbidden_tokens(search_block: str, replace_block: str) -
         raise ValueError(f"Track-B CCE patch introduces forbidden symbols: {joined}")
 
 
+def _leading_ws_len(line: str) -> int:
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def _common_indent(lines: Sequence[str]) -> int:
+    indents = [_leading_ws_len(line) for line in lines if line.strip()]
+    return min(indents) if indents else 0
+
+
+def _normalized_line_matches(
+    text: str,
+    search_block: str,
+) -> list[tuple[int, int, int]]:
+    """Locate *search_block* windows after stripping line-tail whitespace and common indent."""
+    text_lines = text.splitlines(keepends=True)
+    search_lines = search_block.splitlines()
+    if not search_lines or not any(line.strip() for line in search_lines):
+        return []
+    search_common = _common_indent(search_lines)
+    normalized_search = [
+        line.rstrip()[search_common:] if line.strip() else "" for line in search_lines
+    ]
+    offsets: list[int] = []
+    pos = 0
+    for line in text_lines:
+        offsets.append(pos)
+        pos += len(line)
+    window = len(search_lines)
+    matches: list[tuple[int, int, int]] = []
+    for idx in range(len(text_lines) - window + 1):
+        window_lines = text_lines[idx : idx + window]
+        window_common = _common_indent(window_lines)
+        normalized_window = [
+            line.rstrip()[window_common:] if line.strip() else "" for line in window_lines
+        ]
+        if normalized_window != normalized_search:
+            continue
+        start = offsets[idx]
+        end = offsets[idx + window - 1] + len(window_lines[-1])
+        matches.append((start, end, window_common))
+    return matches
+
+
+def _reindent_replacement(replace_block: str, search_block: str, window_indent: int) -> str:
+    search_common = _common_indent(search_block.splitlines())
+    lines: list[str] = []
+    for line in replace_block.splitlines():
+        if not line.strip():
+            lines.append("")
+            continue
+        lines.append(" " * window_indent + line[min(search_common, _leading_ws_len(line)) :])
+    return "\n".join(lines)
+
+
+def _helper_call_closure(unit: _CppUnit, helpers_by_name: dict[str, _CppUnit]) -> set[str]:
+    reached: set[str] = set()
+    pending: list[_CppUnit] = [unit]
+    while pending:
+        current = pending.pop()
+        masked = strip_cpp_comments_and_strings(current.text)
+        for match in _CALL_NAME_RE.finditer(masked):
+            name = match.group(1)
+            if name in helpers_by_name and name not in reached:
+                reached.add(name)
+                pending.append(helpers_by_name[name])
+    return reached
+
+
+def _scoped_editable_units(
+    cpp_source: str,
+    active_kernel: str,
+    *,
+    allow_exclusive_helpers: bool,
+) -> list[_CppUnit]:
+    """Return the active kernel unit plus helpers reachable only from that kernel."""
+    _, units = _split_cpp_units(cpp_source)
+    kernels = [u for u in units if u.kind == "kernel"]
+    target_unit = next((u for u in kernels if u.name == active_kernel), None)
+    if target_unit is None:
+        target_unit = next((u for u in units if u.name == active_kernel), None)
+    if target_unit is None:
+        raise ValueError(f"Active kernel {active_kernel!r} not found in C++ source")
+    editable = [target_unit]
+    if allow_exclusive_helpers:
+        helpers_by_name = {u.name: u for u in units if u.kind == "helper" and u.name}
+        if helpers_by_name:
+            shared: set[str] = set()
+            for kernel in kernels:
+                if kernel.name == target_unit.name:
+                    continue
+                shared |= _helper_call_closure(kernel, helpers_by_name)
+            exclusive = _helper_call_closure(target_unit, helpers_by_name) - shared
+            editable.extend(helpers_by_name[name] for name in exclusive)
+    return sorted(editable, key=lambda u: u.start_char)
+
+
 def apply_scoped_trackb_patch(
     cpp_source: str,
     patch_text: str,
     *,
     active_kernel: str | None = None,
+    allow_exclusive_helpers: bool = True,
 ) -> tuple[str, int]:
-    """Apply scoped SEARCH/REPLACE hunks to *cpp_source*, forbidding read-only sibling edits."""
+    """Apply scoped SEARCH/REPLACE hunks to *cpp_source*, forbidding read-only sibling edits.
+
+    With *active_kernel* set, hunks must match the active kernel body or a helper
+    reachable only from that kernel; helpers shared with sibling kernels stay
+    read-only. When the exact substring lookup misses, a unique match ignoring
+    line-tail whitespace and common indentation is accepted.
+    """
     if _SIBLING_MARKER_RE.search(patch_text):
         raise ValueError("Patch attempted to copy or edit a read-only sibling kernel marker")
 
     hunks = parse_scoped_search_replace_blocks(patch_text)
     if not hunks:
         raise ValueError("patch_text must contain at least one valid SEARCH/REPLACE block")
-    for search_block, replace_block in hunks:
-        _reject_introduced_forbidden_tokens(search_block, replace_block)
 
     updated = cpp_source
     applied = 0
     for search_block, replace_block in hunks:
         if not search_block.strip():
             raise ValueError("Empty SEARCH block is forbidden")
+        _reject_introduced_forbidden_tokens(search_block, replace_block)
 
         if active_kernel is not None:
-            _dirs, units = _split_cpp_units(updated)
-            target_unit = next(
-                (u for u in units if u.kind == "kernel" and u.name == active_kernel),
-                None,
+            editable = _scoped_editable_units(
+                updated,
+                active_kernel,
+                allow_exclusive_helpers=allow_exclusive_helpers,
             )
-            if target_unit is None:
-                target_unit = next((u for u in units if u.name == active_kernel), None)
-            if target_unit is None:
-                raise ValueError(f"Active kernel {active_kernel!r} not found in C++ source")
-            scope_start, scope_end = target_unit.start_char, target_unit.end_char
+            scope = [(unit.start_char, unit.end_char) for unit in editable]
         else:
-            scope_start, scope_end = 0, len(updated)
+            scope = [(0, len(updated))]
+
+        def _in_scope(start_char: int, end_char: int) -> bool:
+            return any(start_char >= start and end_char <= end for start, end in scope)
 
         match_count = updated.count(search_block)
         if match_count == 0:
-            raise ValueError("SEARCH block did not match target C++ source")
+            fallback = _normalized_line_matches(updated, search_block)
+            if not fallback:
+                raise ValueError("SEARCH block did not match target C++ source")
+            if len(fallback) > 1:
+                raise ValueError(
+                    f"Ambiguous SEARCH block matched {len(fallback)} locations; "
+                    "provide more context"
+                )
+            match_start, match_end, window_indent = fallback[0]
+            if not _in_scope(match_start, match_end):
+                raise ValueError(
+                    f"Scoped patch targets read-only code outside active kernel {active_kernel!r}"
+                )
+            replacement = _reindent_replacement(replace_block, search_block, window_indent)
+            if updated[match_start:match_end].endswith("\n") and not replacement.endswith("\n"):
+                replacement = replacement + "\n"
+            updated = updated[:match_start] + replacement + updated[match_end:]
+            applied += 1
+            continue
+
         if match_count > 1:
             raise ValueError(
                 f"Ambiguous SEARCH block matched {match_count} locations; provide more context"
             )
-
         match_start = updated.index(search_block)
         match_end = match_start + len(search_block)
-        if match_start < scope_start or match_end > scope_end:
+        if not _in_scope(match_start, match_end):
             raise ValueError(
                 f"Scoped patch targets read-only code outside active kernel {active_kernel!r}"
             )
@@ -475,6 +628,57 @@ def apply_scoped_trackb_patch(
         applied += 1
 
     return updated, applied
+
+
+def splice_cpp_units_into_tu(
+    cpp_source: str,
+    candidate_cpp: str,
+    *,
+    active_kernel: str | None = None,
+) -> tuple[str, int]:
+    """Replace same-name top-level C++ units of *cpp_source* with *candidate_cpp* units.
+
+    Bare kernel and helper definitions from *candidate_cpp* are spliced in place by
+    unit name. With *active_kernel* set, only that kernel and its exclusive helpers
+    are replaceable, so a candidate can never overwrite a read-only sibling kernel.
+    """
+    _, candidate_units = _split_cpp_units(candidate_cpp)
+    replacements = [u for u in candidate_units if u.kind in ("kernel", "helper") and u.name]
+    if not replacements:
+        raise ValueError("candidate_cpp does not contain any bare C++ kernel or helper definition")
+    replacement_names: set[str] = set()
+    for unit in replacements:
+        if unit.name in replacement_names:
+            raise ValueError(f"Candidate C++ unit {unit.name!r} is defined more than once")
+        replacement_names.add(unit.name)
+
+    _, units = _split_cpp_units(cpp_source)
+    if active_kernel is not None:
+        editable = _scoped_editable_units(
+            cpp_source,
+            active_kernel,
+            allow_exclusive_helpers=True,
+        )
+    else:
+        editable = [u for u in units if u.kind in ("kernel", "helper") and u.name]
+    editable_by_name = {u.name: u for u in editable}
+
+    targets: list[tuple[int, int, str]] = []
+    for unit in replacements:
+        target = editable_by_name.get(unit.name)
+        if target is None:
+            if active_kernel is not None:
+                raise ValueError(
+                    f"Candidate C++ unit {unit.name!r} is outside the editable scope "
+                    f"of active kernel {active_kernel!r}"
+                )
+            raise ValueError(f"Candidate C++ unit {unit.name!r} not found in C++ source")
+        targets.append((target.start_char, target.end_char, unit.text))
+
+    updated = cpp_source
+    for start_char, end_char, replacement_text in sorted(targets, reverse=True):
+        updated = updated[:start_char] + replacement_text + updated[end_char:]
+    return updated, len(targets)
 
 
 def escalate_primfunc_to_trackb_tu(prim_func: Any) -> str:
@@ -494,5 +698,8 @@ __all__ = [
     "escalate_primfunc_to_trackb_tu",
     "extract_trackb_launcher_preview",
     "parse_scoped_search_replace_blocks",
+    "resolve_instantiated_trackb_kernel",
     "select_active_trackb_kernel",
+    "splice_cpp_units_into_tu",
+    "strip_cpp_comments_and_strings",
 ]

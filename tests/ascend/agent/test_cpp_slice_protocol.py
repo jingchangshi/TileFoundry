@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,9 @@ from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     apply_scoped_trackb_patch,
     build_trackb_context_view,
     escalate_primfunc_to_trackb_tu,
+    resolve_instantiated_trackb_kernel,
     select_active_trackb_kernel,
+    splice_cpp_units_into_tu,
 )
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import _resolve_prim_func_from_dsl
 from tilefoundry_ascend.agent.orchestrator.residual_beam import compute_static_dynamic_residual
@@ -169,6 +172,219 @@ def test_apply_scoped_trackb_patch_exact_multiblock_and_error_guards() -> None:
     )
     with pytest.raises(ValueError, match="read-only code outside active kernel"):
         apply_scoped_trackb_patch(cpp, sibling_patch, active_kernel="kernel_active")
+
+
+_SCOPED_HELPER_CPP = (
+    "#include <tl_templates/ascend/common.h>\n"
+    "template <typename InT>\n"
+    "__simd_vf__ inline void vf_helper_exclusive(__ubuf__ InT* x) {\n"
+    "  int step = 1;\n"
+    "  x[0] = step;\n"
+    "}\n"
+    "template <typename InT>\n"
+    "__simd_vf__ inline void vf_helper_twin(__ubuf__ InT* x) {\n"
+    "    int step = 1;\n"
+    "    x[0] = step;\n"
+    "}\n"
+    "template <typename InT>\n"
+    "__simd_vf__ inline void vf_helper_shared(__ubuf__ InT* x) {\n"
+    "  int keep = 2;\n"
+    "  x[0] = keep;\n"
+    "}\n"
+    'extern "C" __global__ __vector__ void kernel_active(__gm__ float* x) {\n'
+    "  vf_helper_exclusive(x);\n"
+    "  vf_helper_shared(x);\n"
+    "}\n"
+    'extern "C" __global__ __vector__ void kernel_sibling(__gm__ float* y) {\n'
+    "  vf_helper_shared(y);\n"
+    "}\n"
+)
+
+
+def _hunk(search: str, replace: str) -> str:
+    """Render one SEARCH/REPLACE hunk in the scoped Track-B patch format."""
+    return f"<<<<<<< SEARCH\n{search}\n=======\n{replace}\n>>>>>>> REPLACE\n"
+
+
+def test_apply_scoped_trackb_patch_scopes_exclusive_helpers_and_normalized_matches() -> None:
+    """Allow exclusive helpers and normalized hunks while shared helpers stay read-only."""
+    exclusive_hunk = _hunk(
+        "  int step = 1;\n  x[0] = step;", "  int step = 3;\n  x[0] = step;"
+    )
+    updated, applied = apply_scoped_trackb_patch(
+        _SCOPED_HELPER_CPP, exclusive_hunk, active_kernel="kernel_active"
+    )
+    assert applied == 1
+    assert "  int step = 3;" in updated
+
+    for search, replace in (
+        ("  int keep = 2;", "  int keep = 4;"),
+        ("  vf_helper_shared(y);", "  vf_helper_shared(x);"),
+    ):
+        with pytest.raises(ValueError, match="read-only code outside active kernel"):
+            apply_scoped_trackb_patch(
+                _SCOPED_HELPER_CPP, _hunk(search, replace), active_kernel="kernel_active"
+            )
+
+    with pytest.raises(ValueError, match="read-only code outside active kernel"):
+        apply_scoped_trackb_patch(
+            _SCOPED_HELPER_CPP,
+            exclusive_hunk,
+            active_kernel="kernel_active",
+            allow_exclusive_helpers=False,
+        )
+
+    normalized, normalized_count = apply_scoped_trackb_patch(
+        _SCOPED_HELPER_CPP,
+        _hunk(
+            "vf_helper_exclusive(x);\nvf_helper_shared(x);",
+            "vf_helper_exclusive(x);\nvf_helper_shared(x);\nx[0] = x[0] + 1.0f;",
+        ),
+        active_kernel="kernel_active",
+    )
+    assert normalized_count == 1
+    assert "  vf_helper_shared(x);\n  x[0] = x[0] + 1.0f;\n}" in normalized
+
+    with pytest.raises(ValueError, match="Ambiguous SEARCH block matched 2 locations"):
+        apply_scoped_trackb_patch(
+            _SCOPED_HELPER_CPP,
+            _hunk("int step = 1;\nx[0] = step;", "int step = 9;\nx[0] = step * 2;"),
+            active_kernel="kernel_active",
+        )
+
+    with pytest.raises(ValueError, match="read-only code outside active kernel"):
+        apply_scoped_trackb_patch(
+            _SCOPED_HELPER_CPP,
+            _hunk("int keep = 2;\nx[0] = keep;", "int keep = 6;\nx[0] = keep;"),
+            active_kernel="kernel_active",
+        )
+
+
+def test_splice_cpp_units_into_tu_replaces_only_scoped_bare_units() -> None:
+    """Replace same-name kernel and helper definitions while sibling kernels stay untouched."""
+    candidate_kernel = (
+        'extern "C" __global__ __vector__ void kernel_active(__gm__ float* x) {\n'
+        "  vf_helper_exclusive(x);\n"
+        "  vf_helper_shared(x);\n"
+        "  x[0] = x[0] + 1.0f;\n"
+        "}\n"
+    )
+    updated, count = splice_cpp_units_into_tu(
+        _SCOPED_HELPER_CPP, candidate_kernel, active_kernel="kernel_active"
+    )
+    assert count == 1
+    assert "x[0] = x[0] + 1.0f;" in updated
+    assert "vf_helper_shared(y);" in updated
+
+    candidate_helper = (
+        "__simd_vf__ inline void vf_helper_exclusive(__ubuf__ InT* x) {\n"
+        "  x[0] = 42;\n"
+        "}\n"
+    )
+    updated_helper, helper_count = splice_cpp_units_into_tu(
+        _SCOPED_HELPER_CPP, candidate_helper, active_kernel="kernel_active"
+    )
+    assert helper_count == 1
+    assert "x[0] = 42;" in updated_helper
+    assert "int keep = 2;" in updated_helper
+
+    sibling = (
+        'extern "C" __global__ __vector__ void kernel_sibling(__gm__ float* y) {\n'
+        "  y[0] = 1.0f;\n"
+        "}\n"
+    )
+    with pytest.raises(ValueError, match="outside the editable scope"):
+        splice_cpp_units_into_tu(_SCOPED_HELPER_CPP, sibling, active_kernel="kernel_active")
+    with pytest.raises(ValueError, match="defined more than once"):
+        splice_cpp_units_into_tu(
+            _SCOPED_HELPER_CPP, candidate_helper + candidate_helper, active_kernel="kernel_active"
+        )
+    with pytest.raises(ValueError, match="not found in C\\+\\+ source"):
+        splice_cpp_units_into_tu(
+            _SCOPED_HELPER_CPP,
+            "__simd_vf__ inline void vf_helper_absent(__ubuf__ InT* x) {\n  x[0] = 0;\n}\n",
+        )
+    with pytest.raises(ValueError, match="does not contain any bare C\\+\\+ kernel or helper"):
+        splice_cpp_units_into_tu(_SCOPED_HELPER_CPP, "int x = 1;\n", active_kernel="kernel_active")
+    with pytest.raises(ValueError, match="Active kernel 'missing_kernel' not found"):
+        splice_cpp_units_into_tu(_SCOPED_HELPER_CPP, candidate_helper, active_kernel="missing_kernel")
+
+
+def test_resolve_instantiated_trackb_kernel_reads_launcher_truth_per_regime() -> None:
+    """Resolve each Softmax regime's active kernel from the instantiated launcher tail."""
+    mod_path = REPO_ROOT / "examples" / "ascend950pr_ops" / "softmax" / "kernels.py"
+    mod_src = mod_path.read_text(encoding="utf-8")
+    mod_spec = importlib.util.spec_from_file_location("softmax_trackb_protocol", mod_path)
+    assert mod_spec is not None and mod_spec.loader is not None
+    mod = importlib.util.module_from_spec(mod_spec)
+    mod_spec.loader.exec_module(mod)
+    render = mod._render_trackb_tu
+    expected = {
+        "reduce_tail": "softmax_last_axis_kernel",
+        "reduce_strided_twopass": "softmax_inner_2pass_kernel",
+        "reduce_strided": "softmax_inner_1pass_kernel",
+    }
+    for regime in CannbenchOpsRegistry.default().get_regime_specs("softmax"):
+        extracted = _extract_trackb_cpp_source(mod_src, regime)
+        assert extracted is not None
+        raw_cpp = extracted[1]
+        dims = dict(regime.representative_hir_dims or {})
+        dims["trackb_src"] = raw_cpp
+        instantiated = render(**dims)
+        assert resolve_instantiated_trackb_kernel(instantiated, raw_cpp) == expected[regime.regime_tag]
+
+    raw_cpp = (
+        'extern "C" __global__ __vector__ void present_kernel(__gm__ float* x) {\n'
+        "  x[0] = 1.0f;\n"
+        "}\n"
+    )
+    absent_launcher = (
+        'extern "C" int launch() {\n'
+        "  absent_kernel<<<56, nullptr, stream>>>();\n"
+        "  return 0;\n"
+        "}\n"
+    )
+    assert resolve_instantiated_trackb_kernel(absent_launcher, raw_cpp) is None
+    assert resolve_instantiated_trackb_kernel("", raw_cpp) is None
+
+
+def test_resolve_instantiated_trackb_kernel_requires_one_distinct_launched_kernel() -> None:
+    """Mask comments and literals, accept repeated launches, and reject ambiguity."""
+    raw_cpp = (
+        "// softmax_last_axis_kernel<<<1, nullptr, stream>>>();\n"
+        'extern "C" __global__ __vector__ void softmax_last_axis_kernel(__gm__ float* x) {\n'
+        "  x[0] = 1.0f;\n"
+        "}\n"
+        'extern "C" __global__ __vector__ void softmax_inner_kernel(__gm__ float* x) {\n'
+        "  x[1] = 1.0f;\n"
+        "}\n"
+    )
+    repeated = (
+        raw_cpp
+        + 'extern "C" int launch(void* stream) {\n'
+        "  // softmax_inner_kernel<<<4, nullptr, stream>>>();\n"
+        '  const char* doc = "softmax_inner_kernel<<<4, nullptr, stream>>>();";\n'
+        "  softmax_last_axis_kernel<<<56, nullptr, stream>>>();\n"
+        "  softmax_last_axis_kernel<<<28, nullptr, stream>>>();\n"
+        "  return 0;\n"
+        "}\n"
+    )
+    assert resolve_instantiated_trackb_kernel(repeated, raw_cpp) == "softmax_last_axis_kernel"
+
+    ambiguous = repeated.replace(
+        "  softmax_last_axis_kernel<<<28, nullptr, stream>>>();\n",
+        "  softmax_inner_kernel<<<28, nullptr, stream>>>();\n",
+    )
+    assert resolve_instantiated_trackb_kernel(ambiguous, raw_cpp) is None
+
+    only_commented = (
+        raw_cpp
+        + 'extern "C" int launch(void* stream) {\n'
+        "  // softmax_last_axis_kernel<<<56, nullptr, stream>>>();\n"
+        "  return 0;\n"
+        "}\n"
+    )
+    assert resolve_instantiated_trackb_kernel(only_commented, raw_cpp) is None
 
 
 def test_patch_regime_into_module_search_replace_and_python_fallback() -> None:

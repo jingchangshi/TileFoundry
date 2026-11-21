@@ -16,6 +16,9 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+    strip_cpp_comments_and_strings,
+)
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     StaticDynamicResidual,
     compute_static_dynamic_residual,
@@ -40,6 +43,7 @@ from tilefoundry_ascend.ascend.schedule.envelope_inspector import (
 )
 from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios
 from tilefoundry_ascend.ascend.target import AscendTarget
+from tilefoundry_ascend.ascend.target.dialect_surface import CCE_CPP20_SURFACE
 
 
 @dataclass(frozen=True)
@@ -67,6 +71,7 @@ class StageBResult:
     vloopv2_hit: bool = True
     compiler_summary: BishengResourceSummary | None = None
     microarch_profile: dict[str, object] | None = None
+    full_diagnostic: str = ""
 
 
 @dataclass(frozen=True)
@@ -331,8 +336,9 @@ _VLOOPV2_MISS_RE = re.compile(
 )
 
 _COMPILE_DIAGNOSTIC_LIMIT = 1500
+_COMPILE_ERROR_CONTEXT_LINES = 6
 _COMPILE_ERROR_RE = re.compile(
-    r"(?i)(?:\[error\]|(?:^|[\s:\[(])(?:fatal\s+)?error:)"
+    r"(?i)(?:\[error\]|\btvm\s*error\b|\bfatal\s*:|(?:^|[\s:\[(])(?:fatal\s+)?error:)"
 )
 
 
@@ -341,20 +347,26 @@ def _bounded_compile_diagnostic(
     *,
     limit: int = _COMPILE_DIAGNOSTIC_LIMIT,
 ) -> str:
-    """Keep the primary compiler error line and a bounded tail of its output."""
+    """Keep the primary compiler error with adjacent context and a bounded output tail."""
     text = output_text.strip()
     if len(text) <= limit:
         return text
-    error_line = next(
-        (line.strip() for line in text.splitlines() if _COMPILE_ERROR_RE.search(line)),
-        "",
+    lines = text.splitlines()
+    error_idx = next(
+        (idx for idx, line in enumerate(lines) if _COMPILE_ERROR_RE.search(line)),
+        None,
     )
     tail = text[-limit:]
-    if not error_line or error_line in tail:
+    if error_idx is None:
         return tail
-    prefix = f"{error_line}\n[... compiler output truncated ...]\n"
+    error_line = lines[error_idx].strip()
+    if error_line in tail:
+        return tail
+    context_end = min(len(lines), error_idx + 1 + _COMPILE_ERROR_CONTEXT_LINES)
+    header = "\n".join([error_line, *(line.rstrip() for line in lines[error_idx + 1 : context_end])])
+    prefix = f"{header}\n[... compiler output truncated ...]\n"
     if len(prefix) >= limit:
-        return error_line[:limit]
+        return header[:limit]
     return prefix + text[-(limit - len(prefix)) :]
 
 
@@ -401,6 +413,34 @@ def _resolve_custom_kernel_callable(
     return None
 
 
+_SIMDVF_LOCAL_ARRAY_RE = re.compile(
+    r"\b(?:float|half|bfloat16_t|u?int(?:8|16|32|64)_t|bool)\s+[A-Za-z_]\w*\s*\[[^\]]+\]"
+)
+
+
+def _simdvf_function_bodies(cpp_source: str) -> list[str]:
+    """Return brace-matched bodies of every ``__simd_vf__`` function definition."""
+    masked = strip_cpp_comments_and_strings(cpp_source)
+    bodies: list[str] = []
+    for match in re.finditer(r"__simd_vf__", masked):
+        brace = masked.find("{", match.end())
+        if brace < 0:
+            continue
+        if masked.find(";", match.end(), brace) >= 0:
+            continue
+        depth = 0
+        for idx in range(brace, len(masked)):
+            char = masked[idx]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    bodies.append(masked[brace + 1 : idx])
+                    break
+    return bodies
+
+
 def _check_custom_kernel_redlines(dsl_source: str) -> list[str]:
     errors: list[str] = []
     lower = dsl_source.lower()
@@ -408,6 +448,11 @@ def _check_custom_kernel_redlines(dsl_source: str) -> list[str]:
         errors.append("forbidden_dav3510_dma_path")
     if ("int4b_t" in lower or "cube_int4" in lower) and "dist_unpack4" not in lower and "aiv_unpack" not in lower:
         errors.append("forbidden_dav3510_cube_int4_without_aiv_unpack")
+    if any(_SIMDVF_LOCAL_ARRAY_RE.search(body) for body in _simdvf_function_bodies(dsl_source)):
+        errors.append(
+            "simdvf_nonzero_stack_array: local array inside __simd_vf__ violates vf stack "
+            "size (0); allocate in __ubuf__ workspace instead"
+        )
     return errors
 
 
@@ -554,6 +599,53 @@ def _safe_eval_cpp_int(expr: str, env: Mapping[str, int]) -> int | None:
         return _eval_cpp_ast_node(tree, env)
     except Exception:
         return None
+
+
+_LAUNCH_BLOCK_DIM_RE = re.compile(r"<<<\s*([^,<>]+?)\s*(?:,|>>>)")
+_UB_STRIDED_ACCESS_RE = re.compile(
+    r"\b([A-Za-z_]\w*)\s*\+\s*(?:\(\s*[A-Za-z_]\w*\s*\)\s*)?"
+    r"[A-Za-z_]\w*\s*\*\s*([A-Za-z_]\w*|\d+)\b"
+)
+
+
+def _parse_cce_launch_block_dim(cpp_source: str, consts: Mapping[str, int]) -> int | None:
+    """Resolve the first positive ``<<<block_dim, ...>>>`` launch dimension in C++ source."""
+    for match in _LAUNCH_BLOCK_DIM_RE.finditer(strip_cpp_comments_and_strings(cpp_source)):
+        block_dim = _safe_eval_cpp_int(match.group(1), consts)
+        if block_dim is not None and block_dim > 0:
+            return block_dim
+    return None
+
+
+def _estimate_ub_bank_conflict_risk(
+    cpp_source: str,
+    consts: Mapping[str, int],
+    pointer_element_bytes: Mapping[str, int],
+) -> float:
+    """Estimate the share of constant UB row strides that alias one bank group.
+
+    Only pointers with a concrete element type and a fully constant row stride are
+    weighed; template-typed or runtime-strided access stays unknown instead of being
+    counted as a conflict, so ordinary double-buffered aligned base offsets never
+    saturate the risk. Row strides landing a 512-byte multiple apart map onto the same
+    bank group, matching the TileLang envelope inspection rule.
+    """
+    strides: dict[str, int] = {}
+    for match in _UB_STRIDED_ACCESS_RE.finditer(strip_cpp_comments_and_strings(cpp_source)):
+        pointer_name = match.group(1)
+        elem_bytes = pointer_element_bytes.get(pointer_name)
+        if elem_bytes is None:
+            continue
+        stride_elems = _safe_eval_cpp_int(match.group(2), consts)
+        if stride_elems is None or stride_elems <= 0:
+            continue
+        strides[pointer_name] = max(strides.get(pointer_name, 0), stride_elems * elem_bytes)
+    if not strides:
+        return 0.0
+    conflicting = sum(
+        1 for stride_bytes in strides.values() if stride_bytes >= 512 and stride_bytes % 512 == 0
+    )
+    return conflicting / len(strides)
 
 
 def _parse_objdump_pipe_counts(objdump_text: str) -> dict[str, int]:
@@ -864,12 +956,13 @@ def _build_ascendc_static_ledger(
     compiler_summary: BishengResourceSummary | None = None,
     objdump_text: str = "",
     microarch_profile: MicroarchProfile | Mapping[str, object] | None = None,
+    case_ratios: CasePhysicsRatios | None = None,
 ) -> ObjectivePhysicalLedger:
     """Compute SRAM waterlines and pipe cycles from C++20 constexprs, calls, and objdump."""
     resolved_target = target or AscendTarget("ascend.950pr")
-    from tilefoundry_ascend.ascend.target import AscendSpaceFacts  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.target.facts import ascend_space_facts  # noqa: PLC0415
 
-    facts = resolved_target.get_facts(AscendSpaceFacts)
+    facts = ascend_space_facts(resolved_target)
     lower = cpp_source.lower()
 
     consts = _resolve_cpp_consts(cpp_source)
@@ -877,6 +970,7 @@ def _build_ascendc_static_ledger(
     ub_offsets: list[tuple[str, int, int]] = []
     l1_offsets: list[tuple[str, int, int]] = []
     ptr_env: dict[str, tuple[str, int]] = {}
+    concrete_pointer_bytes: dict[str, int] = {}
 
     cast_pat = re.compile(
         r"__(ubuf|cbuf)__\s+([A-Za-z0-9_]+)\s*\*\s*(\w+)\s*=\s*"
@@ -890,6 +984,8 @@ def _build_ascendc_static_ledger(
         cm = cast_pat.search(ln)
         if cm:
             space, ctype, name, expr = cm.group(1), cm.group(2), cm.group(3), cm.group(4)
+            if ctype in _CPP_DTYPE_BYTES:
+                concrete_pointer_bytes[name] = _CPP_DTYPE_BYTES[ctype]
             off = _safe_eval_cpp_int(expr, consts)
             if off is not None and off >= 0:
                 eb = _CPP_DTYPE_BYTES.get(ctype, 2)
@@ -905,6 +1001,8 @@ def _build_ascendc_static_ledger(
                 pm.group(4),
                 pm.group(5),
             )
+            if ctype in _CPP_DTYPE_BYTES:
+                concrete_pointer_bytes[name] = _CPP_DTYPE_BYTES[ctype]
             base_entry = ptr_env.get(base)
             delta = _safe_eval_cpp_int(expr, consts)
             if delta is not None:
@@ -926,6 +1024,23 @@ def _build_ascendc_static_ledger(
         or "__simd_vf__" in cpp_source
         or "262144" in cpp_source
     ) and not uses_simt
+
+    block_dim = _parse_cce_launch_block_dim(cpp_source, consts)
+    physical_cores = int(facts.num_aic_cores) if uses_cube else int(facts.num_aiv_cores)
+    if block_dim is not None:
+        grid_blocks = block_dim
+        wave_occupancy = block_dim / max(1, physical_cores)
+    elif case_ratios is not None:
+        grid_blocks = 1
+        wave_occupancy = float(case_ratios.wave_occupancy_ratio)
+    else:
+        grid_blocks = 1
+        wave_occupancy = 0.0
+    ub_bank_conflict_risk = _estimate_ub_bank_conflict_risk(
+        cpp_source,
+        consts,
+        concrete_pointer_bytes,
+    )
 
     def _span_from_offsets(
         entries: list[tuple[str, int, int]],
@@ -1078,6 +1193,9 @@ def _build_ascendc_static_ledger(
         steady_state_ii=steady_ii,
         pipe_cycles=pipe_cycles,
         waterlines=waterlines,
+        grid_blocks=grid_blocks,
+        wave_occupancy=wave_occupancy,
+        ub_bank_conflict_risk=ub_bank_conflict_risk,
         has_indirect_gather=uses_simt,
         microarch_profile=ma_dict,
     )
@@ -1092,6 +1210,7 @@ def evaluate_ascendc_candidate(
     max_flag_depth: int = 15,
     enable_track_router: bool = False,
     case_ratios: CasePhysicsRatios | None = None,
+    baseline_cpp_source: str | None = None,
 ) -> StageAResult:
     """Validate a Track-B AscendC C++ candidate via 7-facet checks and static ledger."""
     t0 = time.monotonic()
@@ -1123,9 +1242,21 @@ def evaluate_ascendc_candidate(
         )
 
     redline_errs = _check_custom_kernel_redlines(cpp_source)
-    ledger = _build_ascendc_static_ledger(cpp_source, target=target)
+    ledger = _build_ascendc_static_ledger(cpp_source, target=target, case_ratios=case_ratios)
 
+    if baseline_cpp_source is not None:
+        forbidden_tokens = CCE_CPP20_SURFACE.introduced_forbidden_tokens(
+            baseline_cpp_source, cpp_source
+        )
+    else:
+        forbidden_tokens = tuple(
+            token
+            for token, count in CCE_CPP20_SURFACE.count_forbidden_tokens(cpp_source).items()
+            if count > 0
+        )
     errors = [*redline_errs, *facet_report.errors]
+    if forbidden_tokens:
+        errors.append(f"cce_forbidden_tokens: {', '.join(forbidden_tokens)}")
     if ledger.max_overflow_bytes > 0:
         errors.append(f"max_overflow_bytes={ledger.max_overflow_bytes}")
 
@@ -1308,6 +1439,42 @@ def _merge_pass_configs_and_flags(
     return merged_pc, merged_cf
 
 
+_PARALLEL_FORBIDDEN_MATH = ("Cast", "exp", "log", "tanh", "sigmoid", "rsqrt")
+
+
+def _is_t_dsl_call(node: ast.AST, attr: str) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == attr
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "T"
+    )
+
+
+def _parallel_forbidden_math_calls(tree: ast.AST) -> list[str]:
+    """Return sorted ``T.<op>`` scalar-math calls in ``T.Parallel`` bodies outside SimtVF."""
+    found: set[str] = set()
+
+    def _visit(node: ast.AST, in_simt_vf: bool) -> None:
+        if isinstance(node, ast.For) and _is_t_dsl_call(node.iter, "Parallel") and not in_simt_vf:
+            for body_node in node.body:
+                for inner in ast.walk(body_node):
+                    if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
+                        attr = inner.func.attr
+                        if attr in _PARALLEL_FORBIDDEN_MATH and _is_t_dsl_call(inner, attr):
+                            found.add(attr)
+        nested_simt_vf = in_simt_vf or (
+            isinstance(node, ast.With)
+            and any(_is_t_dsl_call(item.context_expr, "SimtVF") for item in node.items)
+        )
+        for child in ast.iter_child_nodes(node):
+            _visit(child, nested_simt_vf)
+
+    _visit(tree, False)
+    return sorted(found)
+
+
 def run_stage_a_static(
     dsl_source: str,
     *,
@@ -1326,6 +1493,20 @@ def run_stage_a_static(
     t0 = time.monotonic()
     try:
         parsed_tree = ast.parse(dsl_source)
+        parallel_math = _parallel_forbidden_math_calls(parsed_tree)
+        if parallel_math:
+            return StageAResult(
+                passed=False,
+                prim_func=None,
+                ledger=None,
+                error_message=(
+                    "forbidden_tracka_parallel_scalar_math: T.Parallel body calls "
+                    f"{', '.join(f'T.{op}' for op in parallel_math)}; move elementwise math "
+                    "under with T.SimdVF(): with T.simd.vcvt / T.simd.vexp, or under "
+                    "with T.SimtVF(threads=128): with T.cast"
+                ),
+                elapsed_ms=(time.monotonic() - t0) * 1000.0,
+            )
         entry_name = _detect_module_entrypoint(parsed_tree)
         if entry_name:
             purity_errs = check_npu_entrypoint_purity(dsl_source, entry_name)
@@ -1645,7 +1826,8 @@ def run_stage_b_compile(
         else None
     )
     if proc.returncode != 0:
-        detail = _bounded_compile_diagnostic(proc.stderr or proc.stdout or "")
+        raw_detail = proc.stderr or proc.stdout or ""
+        detail = _bounded_compile_diagnostic(raw_detail)
         return StageBResult(
             passed=False,
             error_message=f"stage_b_compile_failed (rc={proc.returncode}): {detail}",
@@ -1654,6 +1836,7 @@ def run_stage_b_compile(
             vloopv2_hit=vloopv2_hit,
             compiler_summary=summary,
             microarch_profile=ma_profile,
+            full_diagnostic=raw_detail,
         )
     return StageBResult(
         passed=True,
@@ -2249,9 +2432,10 @@ def run_stage_b_ascendc_compile(
                 if cpp_source.strip()
                 else None
             )
-            detail = _bounded_compile_diagnostic(
+            raw_detail = (
                 proc.stderr or proc.stdout or "bisheng failed without diagnostics"
             )
+            detail = _bounded_compile_diagnostic(raw_detail)
             return StageBResult(
                 passed=False,
                 error_message=f"stage_b_ascendc_compile_failed (rc={proc.returncode}): {detail}",
@@ -2260,6 +2444,7 @@ def run_stage_b_ascendc_compile(
                 vloopv2_hit=vloopv2_hit,
                 compiler_summary=summary,
                 microarch_profile=ma_profile,
+                full_diagnostic=raw_detail,
             )
 
         inst_ok, inst_err = _verify_object_has_instantiated_kernel(

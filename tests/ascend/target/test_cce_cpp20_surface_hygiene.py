@@ -11,6 +11,7 @@ from tilefoundry_ascend.agent.kb.schema import (
     normalize_runtime_backend,
 )
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import apply_scoped_trackb_patch
+from tilefoundry_ascend.agent.orchestrator.gate_funnel import _check_custom_kernel_redlines
 from tilefoundry_ascend.agent.orchestrator.llm_constraints import format_target_dialect_layer
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import build_syntax_repair_request
 from tilefoundry_ascend.ascend.target.dialect_surface import (
@@ -157,6 +158,79 @@ def test_tilelang_repair_prompt_keeps_python_dialect() -> None:
     assert "```python" in request.user_prompt
     assert "T.MixedKernel" in request.user_prompt
     assert "CCE C++20 (tl_templates/ascend)" not in request.user_prompt
+
+
+def test_tilelang_surface_registers_simd_register_primitives_and_parallel_math_ban() -> None:
+    """Expose every verified T.simd intrinsic and steer scalar math out of plain T.Parallel."""
+    entries = {entry.symbol: entry for entry in TILELANG_DSL_SURFACE.primitives}
+    expected_signatures = {
+        "T.simd.pset": 'T.simd.pset(width, "PAT_ALL")',
+        "T.simd.update_mask": "T.simd.update_mask(count, width=32)",
+        "T.simd.vdup": "T.simd.vdup(value, dtype, mask=mask)",
+        "T.simd.vld": 'T.simd.vld(buf[offset], dist="NORM_B32")',
+        "T.simd.vcvt": "T.simd.vcvt(vec, dtype, mask=mask, part=0)",
+        "T.simd.vexp": "T.simd.vexp(vec, mask=mask)",
+        "T.simd.vadd": "T.simd.vadd(lhs, rhs, mask=mask)",
+        "T.simd.vsub": "T.simd.vsub(lhs, rhs, mask=mask)",
+        "T.simd.vmul": "T.simd.vmul(lhs, rhs, mask=mask)",
+        "T.simd.vmuls": "T.simd.vmuls(vec, scalar, mask=mask)",
+        "T.simd.vdiv": "T.simd.vdiv(lhs, rhs, mask=mask)",
+        "T.simd.vsts": 'T.simd.vsts(buf[offset], vec, mask=mask, dist="PK_B32", extent=64)',
+        "T.annotate_buffer_versions": "T.annotate_buffer_versions({buf: stages})",
+        "T.annotate_unlimit_memory": 'T.annotate_unlimit_memory("shared")',
+    }
+    for symbol, signature in expected_signatures.items():
+        assert symbol in entries, symbol
+        assert entries[symbol].signature == signature
+        assert entries[symbol].pipe == "PIPE_V" or symbol.startswith("T.annotate")
+    symbols = [entry.symbol for entry in TILELANG_DSL_SURFACE.primitives]
+    assert len(symbols) == len(set(symbols))
+
+    rendered = TILELANG_DSL_SURFACE.render_prompt_reference()
+    ban = (
+        "Inside T.Parallel never call T.Cast, T.exp, T.log, T.tanh, T.sigmoid, or T.rsqrt "
+        "unless the loop is nested under `with T.SimtVF(threads=128):`"
+    )
+    assert ban in rendered
+    assert "T.simd.vexp(vec, mask=mask)" in rendered
+    assert "T.simd.vcvt(vec, dtype, mask=mask, part=0)" in rendered
+    assert 'vcvt("float32")' in rendered
+    assert "US_B16" in rendered and "PK_B32" in rendered
+    assert "`with T.SimtVF(threads=128):` with lowercase T.cast" in rendered
+
+
+def test_cce_cpp20_zero_stack_array_note_is_frozen() -> None:
+    """Pin the zero-byte __simd_vf__ stack frame guidance on the CCE surface."""
+    rendered = CCE_CPP20_SURFACE.render_prompt_reference()
+    assert (
+        "The __simd_vf__ stack frame is exactly 0 bytes: never declare local C arrays "
+        "(for example float tmp[64];) or runtime-indexed local structs inside a "
+        "__simd_vf__ body; stage scratch in __ubuf__ pointer ranges or vector registers."
+    ) in rendered
+
+
+def test_custom_kernel_redlines_flag_local_arrays_only_inside_simdvf_bodies() -> None:
+    """Flag scalar local arrays in __simd_vf__ bodies but not comments, strings, or registers."""
+    expected = (
+        "simdvf_nonzero_stack_array: local array inside __simd_vf__ violates vf stack "
+        "size (0); allocate in __ubuf__ workspace instead"
+    )
+    flagged = (
+        '__simd_vf__ inline void vf(__ubuf__ float* x) {\n  float tmp[64];\n}\n',
+        '__simd_vf__ inline void vf(__ubuf__ float* x) {\n  uint16_t idx[8];\n}\n',
+    )
+    for source in flagged:
+        assert _check_custom_kernel_redlines(source) == [expected]
+    allowed = (
+        '// float tmp[64];\n__simd_vf__ inline void vf(__ubuf__ float* x) {\n  x[0] = 1.0f;\n}\n',
+        'const char* s = "float tmp[64];";\n'
+        '__simd_vf__ inline void vf(__ubuf__ float* x) {\n  x[0] = 1.0f;\n}\n',
+        '__simd_vf__ inline void vf(__ubuf__ float* x) {\n  vector_f32 rg0[4];\n}\n',
+        'float tmp[64];\nextern "C" __global__ void k() {}\n',
+        '// __simd_vf__ inline void vf() { float tmp[4]; }\nextern "C" __global__ void k() {}\n',
+    )
+    for source in allowed:
+        assert _check_custom_kernel_redlines(source) == []
 
 
 def test_kb_legacy_aliases_normalize_and_render_cce_guidance() -> None:
