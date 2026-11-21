@@ -3701,6 +3701,29 @@ class PerfTargetCampaignRunner:
             if self._cost_calibration_path is not None:
                 self._cost_model.save_calibration(self._cost_calibration_path)
 
+    @staticmethod
+    def _touched_symbols_for_regime_snippet(
+        regime_spec: RegimeTargetSpec,
+        snippet_source: str,
+    ) -> set[str]:
+        """Resolve top-level symbol names touched by a promoted or candidate snippet."""
+        dsl_text = extract_python_dsl(snippet_source)
+        if (
+            regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
+            and regime_spec.trackb_symbols
+        ):
+            if parse_scoped_search_replace_blocks(dsl_text):
+                touched = set(regime_spec.trackb_symbols)
+                residual = _trackb_python_residual(dsl_text)
+                if residual:
+                    touched.update(
+                        sym.name for sym in _collect_top_level_symbols(ast.parse(residual))
+                    )
+                return touched
+            if not _parses_as_python(dsl_text) and _looks_like_bare_trackb_cpp(dsl_text):
+                return set(regime_spec.trackb_symbols)
+        return {sym.name for sym in _collect_top_level_symbols(ast.parse(dsl_text))}
+
     def _prune_stale_sibling_stepping_stones(
         self,
         promoted_regime: RegimeTargetSpec,
@@ -3709,17 +3732,9 @@ class PerfTargetCampaignRunner:
         own_editable = set(promoted_regime.editable_symbols)
         if not own_editable:
             return
-        promoted_dsl = extract_python_dsl(promoted_snippet)
-        if (
-            promoted_regime.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
-            and promoted_regime.trackb_symbols
-            and parse_scoped_search_replace_blocks(promoted_dsl)
-        ):
-            promoted_syms = set(promoted_regime.trackb_symbols)
-        else:
-            promoted_syms = {
-                sym.name for sym in _collect_top_level_symbols(ast.parse(promoted_dsl))
-            }
+        promoted_syms = self._touched_symbols_for_regime_snippet(
+            promoted_regime, promoted_snippet
+        )
         touched_own = promoted_syms & own_editable
         if not touched_own:
             return
@@ -3734,22 +3749,13 @@ class PerfTargetCampaignRunner:
                 continue
             kept_stones: list[BeamCandidate] = []
             for stone in other_beam.stepping_stone_beam:
-                stone_dsl = extract_python_dsl(stone.dsl_source)
-                if (
-                    other_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
-                    and other_spec.trackb_symbols
-                    and parse_scoped_search_replace_blocks(stone_dsl)
-                ):
-                    stone_syms = set(other_spec.trackb_symbols)
-                else:
-                    stone_syms = {
-                        sym.name for sym in _collect_top_level_symbols(ast.parse(stone_dsl))
-                    }
+                stone_syms = self._touched_symbols_for_regime_snippet(
+                    other_spec, stone.dsl_source
+                )
                 if not (stone_syms & shared_syms):
                     kept_stones.append(stone)
             other_beam.stepping_stone_beam = kept_stones
 
-    @staticmethod
     @staticmethod
     def _format_trackb_hotpath_section(
         regime_spec: RegimeTargetSpec,

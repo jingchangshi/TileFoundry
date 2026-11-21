@@ -33,7 +33,10 @@ from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     splice_cpp_units_into_tu,
 )
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import _resolve_prim_func_from_dsl
-from tilefoundry_ascend.agent.orchestrator.residual_beam import compute_static_dynamic_residual
+from tilefoundry_ascend.agent.orchestrator.residual_beam import (
+    BeamCandidate,
+    compute_static_dynamic_residual,
+)
 from tilefoundry_ascend.ascend.passes.physical_ledger import build_objective_physical_ledger
 from tilefoundry_ascend.ascend.templates.registry import _format_host_launcher_stub
 
@@ -655,3 +658,83 @@ def test_m4_hub_glue_kb_backend_rendering_and_syntax_fail_closed(tmp_path: Path)
 
     with pytest.raises(SyntaxError):
         runner._prune_stale_sibling_stepping_stones(spec, "def broken(:")
+
+
+def test_prune_stale_sibling_stepping_stones_handles_bare_fenced_trackb_cpp(
+    tmp_path: Path,
+) -> None:
+    """Prune sibling stepping stones touching shared Track-B constants without SyntaxError."""
+    promoted_spec = RegimeTargetSpec(
+        regime_tag="primary",
+        builder_candidates=("_build_primary",),
+        sample_builder_kwargs={},
+        representative_hir_dims={"total_elements": 16384, "M": 16, "D": 64},
+        editable_symbols=("_DEMO_TRACKB_SRC", "_select_primary"),
+        runtime_backend="hybrid_trackb",
+        trackb_symbols=("_DEMO_TRACKB_SRC",),
+    )
+    sibling_spec = RegimeTargetSpec(
+        regime_tag="sibling",
+        builder_candidates=("_build_sibling",),
+        sample_builder_kwargs={},
+        representative_hir_dims={"total_elements": 16384, "M": 16, "D": 64},
+        editable_symbols=("_DEMO_TRACKB_SRC", "_select_sibling"),
+        runtime_backend="hybrid_trackb",
+        trackb_symbols=("_DEMO_TRACKB_SRC",),
+    )
+    mod_file = tmp_path / "demo_sibling_mod.py"
+    mod_file.write_text(
+        '_DEMO_TRACKB_SRC = r"""\n__global__ __vector__ void kernel_active(float* x) {}\n"""\n'
+        "def _select_primary():\n    return {}\n"
+        "def _select_sibling():\n    return {}\n",
+        encoding="utf-8",
+    )
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="level2/softmax", max_rounds=1),
+        target_module_path=mod_file,
+        regime_specs=[promoted_spec, sibling_spec],
+    )
+    ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 100},
+        waterlines={},
+    )
+    residual = compute_static_dynamic_residual(ledger, {"dur_us": 10.0})
+    fenced_cpp = "```cpp\n__global__ __vector__ void kernel_active(float* x) {\n}\n```"
+    py_sibling = "def _select_sibling():\n    return {'tile_m': 8}\n"
+    runner._beams["sibling"].stepping_stone_beam = [
+        BeamCandidate(
+            candidate_id="stone_cpp",
+            round_idx=1,
+            worker_kind="explore_creative",
+            rule_id=None,
+            dsl_source=fenced_cpp,
+            track="unconstrained",
+            ledger=ledger,
+            residual=residual,
+            latency_us=12.0,
+            accuracy_passed=True,
+        ),
+        BeamCandidate(
+            candidate_id="stone_py",
+            round_idx=1,
+            worker_kind="explore_creative",
+            rule_id=None,
+            dsl_source=py_sibling,
+            track="unconstrained",
+            ledger=ledger,
+            residual=residual,
+            latency_us=11.0,
+            accuracy_passed=True,
+        ),
+    ]
+
+    runner._prune_stale_sibling_stepping_stones(promoted_spec, fenced_cpp)
+    assert [
+        stone.candidate_id for stone in runner._beams["sibling"].stepping_stone_beam
+    ] == ["stone_py"]
+
+    with pytest.raises(SyntaxError):
+        runner._prune_stale_sibling_stepping_stones(promoted_spec, "def broken(:")
