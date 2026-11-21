@@ -37,6 +37,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
     PerfTargetCampaignRunner,
+    _render_trackb_tu_from_module,
     patch_regime_into_module,
     resolve_regime_config,
 )
@@ -195,6 +196,7 @@ class MarathonConfig:
     experience_lake_dir: Path | None = None
     log_path: Path | None = None
     max_rounds: int = 80
+    round_regime_tags: tuple[str, ...] = ()
     max_wall_clock_min: float = 720.0
     k_rule_workers: int = 2
     max_syntax_repairs: int = 1
@@ -310,6 +312,20 @@ def _stage0_entrypoint_contract_error(module_source: str, entrypoint: str, track
     return ""
 
 
+def _instantiate_stage0_trackb_tu(
+    module_source: str,
+    cpp_source: str,
+    regime_spec: RegimeTargetSpec,
+) -> str:
+    """Render a seed's Track-B launcher for *regime_spec* before Stage-0 gating."""
+    return _render_trackb_tu_from_module(
+        module_source,
+        cpp_source,
+        regime_spec,
+        require_renderer=True,
+    )
+
+
 def _validate_stage0_track_a(
     module_source: str,
     regime_spec: RegimeTargetSpec,
@@ -341,6 +357,7 @@ def _validate_stage0_track_a(
         factory_kwargs=resolved.builder_kwargs,
         pass_configs=resolved.pass_configs or None,
         compile_flags=resolved.compile_flags or None,
+        case_ratios=regime_spec.representative_case_ratios,
     )
     if not static.passed:
         return False, f"L0 static/waterline rejection: {static.error_message}"
@@ -375,7 +392,24 @@ def _validate_stage0_track_b(
     if extracted is None:
         return False, "seed exposes no Track-B C++20 translation-unit string constant"
     symbol, cpp_source = extracted
-    verdict = evaluate_ascendc_candidate(cpp_source)
+    try:
+        instantiated_tu = _instantiate_stage0_trackb_tu(module_source, cpp_source, regime_spec)
+    except (
+        SyntaxError,
+        AttributeError,
+        ImportError,
+        KeyError,
+        NameError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return False, f"Track-B _render_trackb_tu instantiation failed ({symbol}): {exc}"
+    verdict = evaluate_ascendc_candidate(
+        instantiated_tu,
+        case_ratios=regime_spec.representative_case_ratios,
+    )
     if not verdict.passed:
         return False, f"Track-B L0 token purity ({symbol}): {verdict.error_message}"
     cann_root = _resolve_cann_root_from_env(env_file)
@@ -388,7 +422,7 @@ def _validate_stage0_track_b(
         if (cann_root / "include").is_dir():
             flags.append(f"-I{cann_root / 'include'}")
     compiled = run_stage_b_ascendc_compile(
-        cpp_source,
+        instantiated_tu,
         compile_flags=flags,
         bisheng_bin=bisheng_bin,
         cann_root=cann_root,
@@ -407,23 +441,30 @@ def build_stage0_static_validator(
 ) -> Callable[[str, str], tuple[bool, str]]:
     """Build the L0/L1 gate pair the bounded Stage-0 seed loop invokes per attempt."""
     assert regime_specs, "Stage-0 seed synthesis requires at least one regime specification"
-    primary = regime_specs[0]
 
     def _validate(module_source: str, track: str) -> tuple[bool, str]:
-        if track == "cce_trackb":
-            return _validate_stage0_track_b(
-                module_source,
-                primary,
-                entrypoint=entrypoint,
-                env_file=env_file,
-            )
-        return _validate_stage0_track_a(
-            module_source,
-            primary,
-            entrypoint=entrypoint,
-            worktree=worktree,
-            env_file=env_file,
-        )
+        failures: list[str] = []
+        for regime_spec in regime_specs:
+            if track == "cce_trackb":
+                passed, error = _validate_stage0_track_b(
+                    module_source,
+                    regime_spec,
+                    entrypoint=entrypoint,
+                    env_file=env_file,
+                )
+            else:
+                passed, error = _validate_stage0_track_a(
+                    module_source,
+                    regime_spec,
+                    entrypoint=entrypoint,
+                    worktree=worktree,
+                    env_file=env_file,
+                )
+            if not passed:
+                failures.append(f"[{regime_spec.regime_tag}] {error}")
+        if failures:
+            return False, "; ".join(failures)
+        return True, ""
 
     return _validate
 
@@ -1477,6 +1518,7 @@ def run_operator_marathon(
         env_file,
     )
     seeded_regime_specs: Sequence[RegimeTargetSpec] | None = None
+    seed_outcome: SeedSynthesisOutcome | None = None
     if cfg.auto_bootstrap_seed:
         try:
             seed_outcome = prepare_marathon_seed(
@@ -1580,6 +1622,7 @@ def run_operator_marathon(
         enable_tilesize_prescreen=cfg.enable_tilesize_prescreen,
         cost_prescreen_top_k=cfg.cost_prescreen_top_k,
         exploit_effort=cfg.exploit_effort,
+        round_regime_tags=tuple(cfg.round_regime_tags),
     )
     tracker = BayesianRuleTracker.from_experience_lake(lake_dir)
     flywheel = FlywheelDistiller(
@@ -1630,6 +1673,12 @@ def run_operator_marathon(
         source_root=worktree,
         env_file=env_file,
         cannbench_repo=cannbench_repo,
+        regime_blueprints=(
+            seed_outcome.blueprints_by_regime if seed_outcome is not None else None
+        ),
+        topology_axes=(
+            seed_outcome.semantics.base_axes if seed_outcome is not None else None
+        ),
         stagnation_discount=cfg.stagnation_discount,
         op_logger=op_logger,
     )
@@ -2086,6 +2135,16 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--campaign-kb", default=None, help="Override distilled KB YAML path.")
     parser.add_argument("--log-file", default=None, help="Optional file path to tee runner logs.")
     parser.add_argument("--max-rounds", type=int, default=80)
+    parser.add_argument(
+        "--round-regime",
+        action="append",
+        default=None,
+        metavar="TAG",
+        help=(
+            "Force the regime of the next round; repeat in round order. "
+            "Later rounds keep adaptive regime rotation."
+        ),
+    )
     parser.add_argument("--max-wall-clock-min", type=float, default=720.0)
     parser.add_argument("--k-rule-workers", type=int, default=2)
     parser.add_argument("--no-final-l4", action="store_true", help="Skip final L4 CANNBench gate.")
@@ -2174,6 +2233,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         campaign_kb_path=Path(args.campaign_kb) if args.campaign_kb else None,
         log_path=Path(args.log_file) if args.log_file else None,
         max_rounds=int(args.max_rounds),
+        round_regime_tags=tuple(args.round_regime or ()),
         max_wall_clock_min=float(args.max_wall_clock_min),
         k_rule_workers=int(args.k_rule_workers),
         run_final_l4=not bool(args.no_final_l4),

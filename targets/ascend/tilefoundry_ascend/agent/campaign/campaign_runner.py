@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -24,8 +25,10 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
     CannbenchOpSpec,
     CannbenchOpsRegistry,
+    CasePhysicsRatios,
     PerfTargetSpec,
     RegimeTargetSpec,
+    _has_flat_operator_layout,
     append_dynamic_anchor,
     build_anchor_var_bindings,
     compute_case_eq3_score,
@@ -73,11 +76,18 @@ from tilefoundry_ascend.agent.kb.schema import (
     normalize_runtime_backend,
 )
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+    _LAUNCH_CONFIG_RE,
+    _SEARCH_REPLACE_PATTERNS,
+    _scoped_editable_units,
+    _split_cpp_units,
     apply_scoped_trackb_patch,
     build_trackb_context_view,
     escalate_primfunc_to_trackb_tu,
     parse_scoped_search_replace_blocks,
+    resolve_instantiated_trackb_kernel,
     select_active_trackb_kernel,
+    splice_cpp_units_into_tu,
+    strip_cpp_comments_and_strings,
 )
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
@@ -161,6 +171,18 @@ from tilefoundry_ascend.ascend.templates.registry import relax_facets_for_bottle
 logger = logging.getLogger(__name__)
 
 
+def _is_blocked_env_failure(
+    failure_kind: str,
+    error_message: str,
+    state: str,
+) -> bool:
+    """Return True when an L4 attempt was preempted by an external process (exit 75)."""
+    if failure_kind != FAILURE_KIND_INFRASTRUCTURE:
+        return False
+    message = " ".join((error_message, state)).lower()
+    return "blocked_env" in message or "blocked_exit_code: 75" in message
+
+
 @dataclass(frozen=True)
 class CampaignConfig:
     """Configuration controlling stopping policy, escalation, and gate thresholds.
@@ -168,7 +190,8 @@ class CampaignConfig:
     ``retry_device_id`` names an explicitly authorized, healthy alternate card.
     A terminal infrastructure failure may be retried there at most once; an
     empty value keeps the run recoverable for an operator instead of silently
-    changing hardware.
+    changing hardware. ``round_regime_tags`` forces one regime per 1-based round
+    position and falls back to adaptive rotation for later rounds.
     """
 
     operator_name: str
@@ -186,11 +209,14 @@ class CampaignConfig:
     l4_regression_ratio: float = 0.95
     device_id: str = "1"
     retry_device_id: str = ""
+    l4_blocked_env_max_retries: int = 2
+    l4_retry_backoff_sec: float = 45.0
     warmup: int = 3
     repeat: int = 5
     enable_tilesize_prescreen: bool = False
     cost_prescreen_top_k: int | None = None
     exploit_effort: str = "medium"
+    round_regime_tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -384,6 +410,8 @@ class PendingL4:
     failure_kind: str = FAILURE_KIND_INFRASTRUCTURE
     execution_terminal: bool = True
     retry_used: bool = False
+    same_card_retries_used: int = 0
+    same_card_retry_limit: int = 0
     attempts: tuple[dict[str, str], ...] = ()
     prior_stop_reason: str = ""
 
@@ -402,6 +430,8 @@ class PendingL4:
             "failure_kind": self.failure_kind,
             "execution_terminal": self.execution_terminal,
             "retry_used": self.retry_used,
+            "same_card_retries_used": self.same_card_retries_used,
+            "same_card_retry_limit": self.same_card_retry_limit,
             "attempts": [dict(item) for item in self.attempts],
             "prior_stop_reason": self.prior_stop_reason,
         }
@@ -427,6 +457,8 @@ class PendingL4:
             failure_kind=str(payload.get("failure_kind", FAILURE_KIND_INFRASTRUCTURE)),
             execution_terminal=bool(payload.get("execution_terminal", True)),
             retry_used=bool(payload.get("retry_used", False)),
+            same_card_retries_used=max(0, int(payload.get("same_card_retries_used", 0) or 0)),
+            same_card_retry_limit=max(0, int(payload.get("same_card_retry_limit", 0) or 0)),
             attempts=attempts,
             prior_stop_reason=str(payload.get("prior_stop_reason", "")),
         )
@@ -522,6 +554,7 @@ _HIR_DIM_ALIASES: dict[str, str] = {
     "N_kv": "n_kv",
     "D_nope": "d_nope",
     "D_rope": "d_rope",
+    "inner": "inner_dim",
 }
 
 
@@ -728,13 +761,273 @@ def _top_level_symbol_sources(module_source: str) -> dict[str, str]:
     }
 
 
+_TRACKB_FOLDING_MARKERS: tuple[str, ...] = (
+    "READ-ONLY SIBLING KERNEL",
+    "READ-ONLY HELPER",
+    "MIDDLE BODY OMITTED",
+)
+
+
+def _reject_trackb_folding_markers(candidate_text: str, regime_tag: str) -> None:
+    """Reject a Track-B reply that echoes truncated-context folding markers."""
+    found = [marker for marker in _TRACKB_FOLDING_MARKERS if marker in candidate_text]
+    if found:
+        raise ValueError(
+            f"Track-B candidate for regime {regime_tag!r} echoes truncated context markers "
+            f"{found}; reply with SEARCH/REPLACE hunks or the complete TU instead"
+        )
+
+
+def _strip_trackb_patch_hunks(patch_text: str) -> str:
+    """Return *patch_text* with its SEARCH/REPLACE blocks removed."""
+    residual = patch_text
+    for pattern in _SEARCH_REPLACE_PATTERNS:
+        residual = pattern.sub("", residual)
+    return residual.strip()
+
+
+def _looks_like_bare_trackb_cpp(candidate_text: str) -> bool:
+    """Return True when a Track-B reply carries bare C++ units rather than Python."""
+    if re.search(r"(?m)^\s*(?:async\s+)?def\s+", candidate_text):
+        return False
+    _, units = _split_cpp_units(candidate_text)
+    return any(unit.kind in ("kernel", "helper") and unit.name for unit in units)
+
+
+def _parses_as_python(candidate_text: str) -> bool:
+    """Return True when *candidate_text* is a syntactically valid Python snippet."""
+    try:
+        ast.parse(candidate_text)
+    except SyntaxError:
+        return False
+    return True
+
+
+def _render_trackb_tu_from_module(
+    module_source: str,
+    cpp_source: str,
+    regime_spec: RegimeTargetSpec,
+    *,
+    require_renderer: bool,
+) -> str:
+    """Render a module's Track-B launcher with the shared dimension merge.
+
+    The same sample, HIR, anchor, selector, and alias dimensions feed the
+    runner and the Stage-0 gate, so both compile the bytes a regime really
+    launches. A module without a renderer keeps its raw translation unit
+    unless *require_renderer* marks the cold-start ABI as mandatory.
+    """
+    tree = ast.parse(module_source)
+    if _find_top_level_func(tree, ("_render_trackb_tu",)) is None:
+        if require_renderer:
+            raise ValueError(
+                "Track-B seed must declare def _render_trackb_tu(**dims: object) -> str"
+            )
+        return cpp_source
+    dims: dict[str, object] = {
+        **regime_spec.sample_builder_kwargs,
+        **regime_spec.representative_hir_dims,
+        **regime_spec.representative_anchor_dims,
+    }
+    try:
+        resolved = resolve_regime_config(module_source, regime_spec, dims=dims)
+        alias_sources = {
+            target: source for source, target in _HIR_DIM_ALIASES.items()
+        }
+        for key, value in resolved.builder_kwargs.items():
+            source = alias_sources.get(key)
+            if source is not None and source in dims and dims[source] != value:
+                continue
+            dims.setdefault(key, value)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        pass
+    dims["trackb_src"] = cpp_source
+    with tempfile.TemporaryDirectory(prefix="tf_trackb_inst_") as tmp_dir:
+        module_file = Path(tmp_dir) / "candidate_mod.py"
+        module_file.write_text(module_source, encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("_tf_trackb_render", str(module_file))
+        if spec is None or spec.loader is None:
+            if require_renderer:
+                raise RuntimeError("cannot import the seed module to render its Track-B TU")
+            return cpp_source
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        render = getattr(module, "_render_trackb_tu", None)
+        if not callable(render):
+            if require_renderer:
+                raise ValueError(
+                    "Track-B seed must declare def _render_trackb_tu(**dims: object) -> str"
+                )
+            return cpp_source
+        rendered = render(**dims)
+    if not isinstance(rendered, str) or not rendered.strip():
+        if require_renderer:
+            raise ValueError("_render_trackb_tu returned an empty C++ translation unit")
+        return cpp_source
+    return rendered
+
+
+def _active_trackb_kernel(
+    instantiated_tu: str,
+    raw_cpp_source: str,
+    *,
+    regime_tag: str,
+) -> str:
+    """Resolve the launched kernel from instantiation truth, never from name heuristics."""
+    resolved = resolve_instantiated_trackb_kernel(instantiated_tu, raw_cpp_source)
+    if resolved is not None:
+        return resolved
+    kernels = sorted(_trackb_kernel_names(raw_cpp_source))
+    if len(kernels) == 1:
+        return kernels[0]
+    if not kernels:
+        raise ValueError(
+            f"Track-B instantiation for regime {regime_tag!r} contains no __global__ kernel"
+        )
+    launched, primary = _launched_trackb_kernels(
+        instantiated_tu,
+        raw_cpp_source,
+        set(kernels),
+    )
+    if len(primary) == 1:
+        return next(iter(primary))
+    if not launched:
+        raise ValueError(
+            f"Track-B instantiation for regime {regime_tag!r} contains multiple kernels "
+            f"{kernels} and no launcher stub; the instantiated translation unit must launch "
+            "exactly one primary kernel"
+        )
+    raise ValueError(
+        f"Track-B instantiation for regime {regime_tag!r} launches kernels {sorted(launched)} "
+        f"with no unique top-level launch target among {sorted(primary)}; the launcher stub must "
+        "launch exactly one primary kernel outside conditional branches"
+    )
+
+
+def _launched_trackb_kernels(
+    instantiated_tu: str,
+    raw_cpp_source: str,
+    kernels: set[str],
+) -> tuple[set[str], set[str]]:
+    """Return all launched kernels and those launched at the launcher's top level."""
+    masked = strip_cpp_comments_and_strings(instantiated_tu)
+    launch_region = (
+        masked[len(raw_cpp_source) :]
+        if instantiated_tu.startswith(raw_cpp_source)
+        else masked
+    )
+    launches: list[tuple[int, str]] = []
+    depth = 0
+    scanned = 0
+    for match in _LAUNCH_CONFIG_RE.finditer(launch_region):
+        depth += launch_region.count("{", scanned, match.start()) - launch_region.count(
+            "}", scanned, match.start()
+        )
+        scanned = match.start()
+        name = match.group(1)
+        if name in kernels:
+            launches.append((depth, name))
+    if not launches:
+        return set(), set()
+    shallowest = min(depth for depth, _name in launches)
+    return (
+        {name for _depth, name in launches},
+        {name for depth, name in launches if depth == shallowest},
+    )
+
+
+def _trackb_kernel_names(cpp_source: str) -> set[str]:
+    _, units = _split_cpp_units(cpp_source)
+    return {unit.name for unit in units if unit.kind == "kernel" and unit.name}
+
+
+def _trackb_units_by_name(cpp_source: str) -> dict[str, str]:
+    """Return named top-level Track-B unit text keyed by symbol name."""
+    _, units = _split_cpp_units(cpp_source)
+    return {unit.name: unit.text for unit in units if unit.name}
+
+
+def _normalized_trackb_unit(text: str) -> str:
+    """Collapse whitespace so pure reformatting is not treated as a unit edit."""
+    return " ".join(text.split())
+
+
+def _assert_trackb_replacement_scoped(
+    orig_cpp: str,
+    new_cpp: str,
+    regime_spec: RegimeTargetSpec,
+    *,
+    module_source: str,
+    active_kernel: str | None,
+) -> None:
+    """Reject a full-TU replacement that edits frozen siblings or shared helpers."""
+    orig_units = _trackb_units_by_name(orig_cpp)
+    new_units = _trackb_units_by_name(new_cpp)
+    if active_kernel is None:
+        active_kernel = select_active_trackb_kernel(
+            orig_cpp,
+            regime_tag=regime_spec.regime_tag,
+            module_source=module_source,
+        )
+    if active_kernel is None:
+        raise ValueError(
+            f"Track-B full replacement for regime {regime_spec.regime_tag!r} has no resolvable "
+            "active kernel; reply with SEARCH/REPLACE hunks or one bare C++ unit"
+        )
+    editable = {
+        unit.name
+        for unit in _scoped_editable_units(
+            orig_cpp,
+            active_kernel,
+            allow_exclusive_helpers=True,
+        )
+    }
+    dropped = sorted(set(orig_units) - set(new_units))
+    if dropped:
+        raise ValueError(
+            f"Track-B replacement for regime {regime_spec.regime_tag!r} drops units {dropped}; "
+            "reply with SEARCH/REPLACE hunks or one bare C++ unit per changed function"
+        )
+    added = sorted(set(new_units) - set(orig_units))
+    if added:
+        raise ValueError(
+            f"Track-B replacement for regime {regime_spec.regime_tag!r} adds units {added}; "
+            "reply with SEARCH/REPLACE hunks or one bare C++ unit per changed function"
+        )
+    changed = sorted(
+        name
+        for name in orig_units
+        if _normalized_trackb_unit(orig_units[name])
+        != _normalized_trackb_unit(new_units[name])
+    )
+    frozen = sorted(name for name in changed if name not in editable)
+    if frozen:
+        raise ValueError(
+            f"Track-B replacement for regime {regime_spec.regime_tag!r} edits frozen sibling "
+            f"kernels or shared helpers {frozen}; only active kernel {active_kernel!r} and its "
+            "exclusive helpers may change"
+        )
+
+
+def _case_ratio_predicate_entries(ratios: CasePhysicsRatios | None) -> dict[str, object]:
+    """Return collision-free dimensionless predicate keys for the representative case."""
+    if ratios is None:
+        return {}
+    return {
+        f"case_{key.removeprefix('case_')}": value for key, value in ratios.to_dict().items()
+    }
+
+
 def _detect_trackb_dead_code_edit(
     parent_source: str,
     candidate_source: str,
     regime_spec: RegimeTargetSpec,
 ) -> str | None:
-    """Reject candidates that edit only inactive TileLang fallbacks in an ascendc_trackb regime."""
-    if regime_spec.runtime_backend != "ascendc_trackb" or not regime_spec.trackb_symbols:
+    """Reject candidates that edit only inactive TileLang fallbacks in a Track-B regime."""
+    if (
+        regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb")
+        or not regime_spec.trackb_symbols
+    ):
         return None
     parent_syms = _top_level_symbol_sources(parent_source)
     cand_syms = _top_level_symbol_sources(candidate_source)
@@ -753,7 +1046,7 @@ def _detect_trackb_dead_code_edit(
     if not (changed & active_syms):
         return (
             f"DEAD_CODE_TRACKB_EDIT: regime {regime_spec.regime_tag!r} executes "
-            f"runtime_backend=ascendc_trackb via {list(regime_spec.trackb_symbols)}; "
+            f"runtime_backend={regime_spec.runtime_backend} via {list(regime_spec.trackb_symbols)}; "
             f"candidate modified only inactive fallback symbols {sorted(changed)}."
         )
     return None
@@ -1072,10 +1365,29 @@ def _find_top_level_str_assign_span(
     return hits
 
 
+def _replace_trackb_constant(module_source: str, sym_name: str, cpp_source: str) -> str:
+    """Rewrite one top-level Track-B C++ string constant in *module_source*."""
+    orig_tree = ast.parse(module_source)
+    lines = module_source.splitlines(keepends=True)
+    hits = _find_top_level_str_assign_span(orig_tree, lines, {sym_name})
+    if not hits:
+        raise ValueError(f"Track-B symbol {sym_name!r} assignment not found in module_source.")
+    _, _, start_pos, end_pos = hits[0]
+    patched = (
+        module_source[:start_pos]
+        + _format_raw_cpp_literal(cpp_source)
+        + module_source[end_pos:]
+    )
+    ast.parse(patched)
+    return patched
+
+
 def _apply_scoped_trackb_patch_to_module(
     module_source: str,
     regime_spec: RegimeTargetSpec,
     patch_text: str,
+    *,
+    active_kernel: str | None = None,
 ) -> str:
     extracted = _extract_trackb_cpp_source(module_source, regime_spec)
     if extracted is None:
@@ -1083,7 +1395,7 @@ def _apply_scoped_trackb_patch_to_module(
             f"Original module missing Track-B C++ constant in {regime_spec.trackb_symbols}."
         )
     sym_name, orig_cpp = extracted
-    active_kernel = select_active_trackb_kernel(
+    resolved_kernel = active_kernel or select_active_trackb_kernel(
         orig_cpp,
         regime_tag=regime_spec.regime_tag,
         module_source=module_source,
@@ -1091,17 +1403,48 @@ def _apply_scoped_trackb_patch_to_module(
     updated_cpp, _applied = apply_scoped_trackb_patch(
         orig_cpp,
         patch_text,
-        active_kernel=active_kernel,
+        active_kernel=resolved_kernel,
     )
-    orig_tree = ast.parse(module_source)
-    lines = module_source.splitlines(keepends=True)
-    hits = _find_top_level_str_assign_span(orig_tree, lines, {sym_name})
-    if not hits:
-        raise ValueError(f"Track-B symbol {sym_name!r} assignment not found in module_source.")
-    _, _, start_pos, end_pos = hits[0]
-    patched = module_source[:start_pos] + _format_raw_cpp_literal(updated_cpp) + module_source[end_pos:]
-    ast.parse(patched)
-    return patched
+    return _replace_trackb_constant(module_source, sym_name, updated_cpp)
+
+
+def _apply_spliced_trackb_units_to_module(
+    module_source: str,
+    regime_spec: RegimeTargetSpec,
+    candidate_cpp: str,
+    *,
+    active_kernel: str | None = None,
+) -> str:
+    """Replace same-name bare C++ units of the active kernel without touching siblings."""
+    extracted = _extract_trackb_cpp_source(module_source, regime_spec)
+    if extracted is None:
+        raise ValueError(
+            f"Original module missing Track-B C++ constant in {regime_spec.trackb_symbols}."
+        )
+    sym_name, orig_cpp = extracted
+    resolved_kernel = active_kernel or select_active_trackb_kernel(
+        orig_cpp,
+        regime_tag=regime_spec.regime_tag,
+        module_source=module_source,
+    )
+    updated_cpp, _applied = splice_cpp_units_into_tu(
+        orig_cpp,
+        candidate_cpp,
+        active_kernel=resolved_kernel,
+    )
+    return _replace_trackb_constant(module_source, sym_name, updated_cpp)
+
+
+def _trackb_python_residual(patch_text: str) -> str:
+    """Return the valid Python snippet outside SEARCH/REPLACE blocks, else empty string."""
+    residual = _strip_trackb_patch_hunks(patch_text)
+    if not residual:
+        return ""
+    try:
+        ast.parse(residual)
+    except SyntaxError:
+        return ""
+    return residual
 
 
 def _compact_trackb_snippet_source(
@@ -1110,6 +1453,7 @@ def _compact_trackb_snippet_source(
     *,
     incumbent_source: str = "",
     max_bytes: int = 14800,
+    active_kernel: str | None = None,
 ) -> str:
     if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
         return snippet_source
@@ -1131,6 +1475,7 @@ def _compact_trackb_snippet_source(
             module_source=incumbent_source or snippet_source,
             trackb_symbol=sym_name,
             max_bytes=max_bytes,
+            active_kernel=active_kernel,
         )
         wrapped = view if view.startswith("\n") else f"\n{view}\n"
         replacements.append((start_pos, end_pos, _format_raw_cpp_literal(wrapped)))
@@ -1164,25 +1509,44 @@ def patch_regime_into_module(
     *,
     operator_entrypoint: str = "",
     sibling_specs: Sequence[RegimeTargetSpec] = (),
+    active_kernel: str | None = None,
 ) -> str:
-    """Splice single-function or partial/full multi-symbol regime slice into module_source."""
+    """Merge a scoped or Python regime slice into module_source without losing siblings.
+
+    Track-B replies route by shape: SEARCH/REPLACE hunks patch the launched C++ kernel
+    and only the helpers it reaches, bare C++ units replace same-name units in place,
+    and a full tuple is only accepted from a parseable Python assignment that keeps
+    every sibling kernel. Any parseable Python beside patch hunks is merged by symbol.
+    """
     candidate_dsl = extract_python_dsl(candidate_raw_source)
     if isinstance(regime_or_func, str):
         return apply_ast_patch(module_source, regime_or_func, candidate_dsl)
 
     regime_spec = regime_or_func
+    python_snippet = candidate_dsl
     if (
         regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
         and regime_spec.trackb_symbols
-        and parse_scoped_search_replace_blocks(candidate_dsl)
     ):
-        try:
-            ast.parse(candidate_dsl)
-        except SyntaxError:
-            return _apply_scoped_trackb_patch_to_module(
+        _reject_trackb_folding_markers(candidate_dsl, regime_spec.regime_tag)
+        if parse_scoped_search_replace_blocks(candidate_dsl):
+            module_source = _apply_scoped_trackb_patch_to_module(
                 module_source,
                 regime_spec,
                 candidate_dsl,
+                active_kernel=active_kernel,
+            )
+            python_snippet = _trackb_python_residual(candidate_dsl)
+            if not python_snippet:
+                return module_source
+        elif not _parses_as_python(candidate_dsl) and _looks_like_bare_trackb_cpp(
+            candidate_dsl
+        ):
+            return _apply_spliced_trackb_units_to_module(
+                module_source,
+                regime_spec,
+                candidate_dsl,
+                active_kernel=active_kernel,
             )
     orig_tree = ast.parse(module_source)
     if not regime_spec.editable_symbols:
@@ -1191,7 +1555,7 @@ def patch_regime_into_module(
             raise ValueError(
                 f"Original module missing builder in {regime_spec.builder_candidates}."
             )
-        return apply_ast_patch(module_source, orig_node.name, candidate_dsl)
+        return apply_ast_patch(module_source, orig_node.name, python_snippet)
 
     orig_symbols = _collect_top_level_symbols(orig_tree)
     orig_by_name = {sym.name: sym for sym in orig_symbols}
@@ -1205,9 +1569,9 @@ def patch_regime_into_module(
             raise ValueError(
                 f"Original module missing regime symbols {regime_spec.editable_symbols}."
             )
-        return apply_ast_patch(module_source, orig_node.name, candidate_dsl)
+        return apply_ast_patch(module_source, orig_node.name, python_snippet)
 
-    cand_tree = ast.parse(candidate_dsl)
+    cand_tree = ast.parse(python_snippet)
     cand_symbols: list[_TopLevelSymbol] = []
     cand_ast_by_name: dict[str, ast.stmt] = {}
     seen_cand: set[str] = set()
@@ -1263,7 +1627,7 @@ def patch_regime_into_module(
             "Candidate snippet must define at least one authorized regime symbol."
         )
 
-    cand_lines = candidate_dsl.splitlines(keepends=True)
+    cand_lines = python_snippet.splitlines(keepends=True)
     cand_slices = {
         sym.name: "".join(cand_lines[sym.start - 1 : sym.end]).rstrip() + "\n"
         for sym in cand_symbols
@@ -1320,6 +1684,21 @@ def patch_regime_into_module(
 
     patched = "".join(orig_lines)
     ast.parse(patched)
+    if set(cand_slices) & set(regime_spec.trackb_symbols):
+        orig_trackb = _extract_trackb_cpp_source(module_source, regime_spec)
+        new_trackb = _extract_trackb_cpp_source(patched, regime_spec)
+        if orig_trackb is None or new_trackb is None:
+            raise ValueError(
+                f"Track-B symbols {sorted(set(cand_slices) & set(regime_spec.trackb_symbols))} "
+                "must be assigned a raw C++ string literal."
+            )
+        _assert_trackb_replacement_scoped(
+            orig_trackb[1],
+            new_trackb[1],
+            regime_spec,
+            module_source=module_source,
+            active_kernel=active_kernel,
+        )
     return patched
 
 
@@ -1401,6 +1780,7 @@ class PerfTargetCampaignRunner:
         clock: Callable[[], float] = time.monotonic,
         sil_advisory: object | None = None,
         topology_axes: TopologyAxes | Mapping[str, object] | None = None,
+        regime_blueprints: Mapping[str, HirBlueprintPacket] | None = None,
         cost_calibration_path: str | Path | None = None,
         experience_lake_dir: str | Path | None = None,
     ) -> None:
@@ -1430,6 +1810,13 @@ class PerfTargetCampaignRunner:
             if regime_specs is not None
             else get_default_regime_specs(config.operator_name)
         )
+        known_regime_tags = {spec.regime_tag for spec in self._regime_specs}
+        for forced_tag in config.round_regime_tags:
+            if forced_tag not in known_regime_tags:
+                raise ValueError(
+                    f"round regime tag {forced_tag!r} is not configured; "
+                    f"available regimes: {sorted(known_regime_tags)}"
+                )
         self._backend = llm_backend
         self._tracker = tracker or BayesianRuleTracker.from_seed_yaml()
         base_ew = beam.exploit_width if beam is not None else 2
@@ -1524,11 +1911,7 @@ class PerfTargetCampaignRunner:
         else:
             self._sil_advisory = None
             try:
-                ops_root = (
-                    resolve_cannbench_tasks_root(self._cannbench_repo)
-                    if self._cannbench_repo is not None
-                    else None
-                )
+                ops_root = self._resolve_cannbench_tasks_root()
                 extractor = (
                     OpAdvisoryExtractor(ops_root)
                     if ops_root is not None
@@ -1558,8 +1941,10 @@ class PerfTargetCampaignRunner:
             self._scheduled_hir_path = sibling_sched.resolve() if sibling_sched.is_file() else None
 
         self._regime_blueprints: dict[str, HirBlueprintPacket] = (
-            self._compile_regime_blueprints()
+            self._validated_regime_blueprints(regime_blueprints)
         )
+        self._l1_summary_cache: dict[tuple[str, str], BishengResourceSummary | None] = {}
+        self._active_kernel_cache: dict[tuple[str, str], str | None] = {}
         self._active_incumbent_source: str = ""
         self._pending_promotion: PendingPromotion | None = None
         self._active_promotion: PendingPromotion | None = None
@@ -1673,6 +2058,64 @@ class PerfTargetCampaignRunner:
         _atomic_write_text(
             self._checkpoint_path,
             json.dumps(payload, indent=2) + "\n",
+        )
+
+    def _round_candidate_artifact_dir(self) -> Path | None:
+        """Return the checkpoint-adjacent candidates directory for audit artifacts."""
+        if self._checkpoint_path is None:
+            return None
+        return self._checkpoint_path.parent / "candidates"
+
+    def _persist_round_candidate_artifact(
+        self,
+        check: L0L1CandidateCheck,
+        *,
+        round_idx: int,
+    ) -> None:
+        """Write generated source and untruncated L0/L1 diagnostics beside the checkpoint."""
+        artifact_dir = self._round_candidate_artifact_dir()
+        if artifact_dir is None:
+            return
+        stem = f"r{round_idx}_{check.candidate_id.removeprefix(f'r{round_idx}_')}"
+        _atomic_write_text(
+            artifact_dir / f"{stem}.py",
+            check.patched_module_source or check.snippet_source,
+        )
+        diag_lines = [
+            f"candidate_id: {check.candidate_id}",
+            f"round: {round_idx}",
+            f"passed: {check.passed}",
+            f"failed_tier: {check.failed_tier or ''}",
+            f"repaired: {check.repaired}",
+            f"error_message: {check.error_message}",
+        ]
+        if check.stage_a is not None:
+            diag_lines.extend(
+                [
+                    f"stage_a_passed: {check.stage_a.passed}",
+                    f"stage_a_backend_kind: {check.stage_a.backend_kind}",
+                    f"stage_a_error: {check.stage_a.error_message}",
+                ]
+            )
+        if check.stage_b is not None:
+            diag_lines.extend(
+                [
+                    f"stage_b_passed: {check.stage_b.passed}",
+                    f"stage_b_error: {check.stage_b.error_message}",
+                    f"stage_b_spill_bytes: {check.stage_b.spill_bytes}",
+                    f"stage_b_vloopv2_hit: {check.stage_b.vloopv2_hit}",
+                ]
+            )
+            if check.stage_b.full_diagnostic:
+                diag_lines.extend(
+                    [
+                        "stage_b_full_diagnostic:",
+                        check.stage_b.full_diagnostic,
+                    ]
+                )
+        _atomic_write_text(
+            artifact_dir / f"{stem}.diag.txt",
+            "\n".join(diag_lines) + "\n",
         )
 
     @staticmethod
@@ -1793,16 +2236,45 @@ class PerfTargetCampaignRunner:
                 if clean:
                     self._msprof_cache[(sha, str(tag))] = clean
 
-    def _resolve_operator_spec(self) -> CannbenchOpSpec | None:
-        """Resolve the official cann-bench task spec for the campaign operator."""
+    def _resolve_cannbench_tasks_root(self) -> Path | None:
+        """Resolve the cann-bench tasks root, falling back to the in-repo mirror."""
         try:
             repo = resolve_cannbench_repo(
                 cannbench_repo=self._cannbench_repo,
                 env_file=self._env_file,
             )
         except FileNotFoundError:
+            repo = None
+        if repo is not None:
+            return resolve_cannbench_tasks_root(repo)
+        in_repo = self._source_root / "tests" / "ascend" / "benchmarks"
+        if _has_flat_operator_layout(in_repo):
+            return in_repo
+        return None
+
+    def _validated_regime_blueprints(
+        self,
+        provided: Mapping[str, HirBlueprintPacket] | None,
+    ) -> dict[str, HirBlueprintPacket]:
+        """Validate caller-supplied per-regime blueprints or compile them in-process."""
+        if provided is None:
+            return self._compile_regime_blueprints()
+        missing = sorted(
+            spec.regime_tag for spec in self._regime_specs if spec.regime_tag not in provided
+        )
+        if missing:
+            raise ValueError(
+                f"regime_blueprints missing regime tags {missing}; "
+                f"got {sorted(provided)}"
+            )
+        return dict(provided)
+
+    def _resolve_operator_spec(self) -> CannbenchOpSpec | None:
+        """Resolve the official cann-bench task spec for the campaign operator."""
+        tasks_root = self._resolve_cannbench_tasks_root()
+        if tasks_root is None:
             return None
-        registry = CannbenchOpsRegistry(tasks_root=repo, source_root=self._source_root)
+        registry = CannbenchOpsRegistry(tasks_root=tasks_root, source_root=self._source_root)
         if not registry.has_operator(self._config.operator_name):
             return None
         return registry.resolve(self._config.operator_name)
@@ -1966,35 +2438,51 @@ class PerfTargetCampaignRunner:
         regime_spec: RegimeTargetSpec,
     ) -> str:
         """Instantiate Track-B C++20 TU via module _render_trackb_tu if present."""
-        tree = ast.parse(module_source)
-        if _find_top_level_func(tree, ("_render_trackb_tu",)) is None:
-            return cpp_source
-        dims: dict[str, object] = dict(
-            regime_spec.representative_anchor_dims
-            or regime_spec.representative_hir_dims
-            or regime_spec.sample_builder_kwargs
-            or {}
+        return _render_trackb_tu_from_module(
+            module_source,
+            cpp_source,
+            regime_spec,
+            require_renderer=False,
         )
-        try:
-            resolved = resolve_regime_config(module_source, regime_spec, dims=dims)
-            for k, v in resolved.builder_kwargs.items():
-                dims.setdefault(k, v)
-        except (AttributeError, KeyError, TypeError, ValueError):
-            pass
-        dims["trackb_src"] = cpp_source
-        with tempfile.TemporaryDirectory(prefix="tf_trackb_inst_") as tmp_dir:
-            mod_file = Path(tmp_dir) / "candidate_mod.py"
-            mod_file.write_text(module_source, encoding="utf-8")
-            spec = importlib.util.spec_from_file_location("_tf_trackb_render", str(mod_file))
-            if spec is None or spec.loader is None:
-                return cpp_source
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            fn = getattr(mod, "_render_trackb_tu", None)
-            if not callable(fn):
-                return cpp_source
-            rendered = fn(**dims)
-        return str(rendered) if isinstance(rendered, str) and rendered.strip() else cpp_source
+
+    def _resolve_active_trackb_kernel(
+        self,
+        module_source: str,
+        regime_spec: RegimeTargetSpec,
+    ) -> str | None:
+        """Resolve the launched Track-B kernel from instantiation truth, else the raw TU.
+
+        A pass-through renderer leaves the launcher inside Python, so the raw
+        translation unit is scanned for the kernel the module starts instead of
+        demanding a C++ launcher stub it never had.
+        """
+        if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
+            return None
+        extracted = _extract_trackb_cpp_source(module_source, regime_spec)
+        if extracted is None:
+            return None
+        cache_key = (self._source_sha256(module_source), regime_spec.regime_tag)
+        if cache_key not in self._active_kernel_cache:
+            rendered = self._instantiate_trackb_tu(module_source, extracted[1], regime_spec)
+            if rendered == extracted[1]:
+                fallback = select_active_trackb_kernel(
+                    extracted[1],
+                    regime_tag=regime_spec.regime_tag,
+                    module_source=module_source,
+                )
+                if fallback is None:
+                    raise ValueError(
+                        f"Track-B source for regime {regime_spec.regime_tag!r} "
+                        "contains no __global__ kernel"
+                    )
+                self._active_kernel_cache[cache_key] = fallback
+            else:
+                self._active_kernel_cache[cache_key] = _active_trackb_kernel(
+                    rendered,
+                    extracted[1],
+                    regime_tag=regime_spec.regime_tag,
+                )
+        return self._active_kernel_cache[cache_key]
 
     def _resolve_trackb_freedom_mask(
         self,
@@ -2147,16 +2635,15 @@ class PerfTargetCampaignRunner:
                 case_ratios=regime_spec.representative_case_ratios,
             )
             if not tb_res.passed:
-                return StageAResult(
-                    passed=False,
-                    prim_func=primary_res.prim_func,
-                    ledger=primary_res.ledger,
-                    features=primary_res.features,
-                    route=primary_res.route,
+                return replace(
+                    tb_res,
                     error_message=f"trackb_ascendc({tb_sym}): {tb_res.error_message}",
                     elapsed_ms=primary_res.elapsed_ms + tb_res.elapsed_ms,
-                    backend_kind="ascendc",
                 )
+            return replace(
+                tb_res,
+                elapsed_ms=primary_res.elapsed_ms + tb_res.elapsed_ms,
+            )
         return primary_res
 
     def _run_l0(self, module_source: str, regime_spec: RegimeTargetSpec) -> StageAResult:
@@ -2210,6 +2697,7 @@ class PerfTargetCampaignRunner:
         if not primary_b.passed:
             return primary_b
         final_b = primary_b
+        combine_elapsed_sec = 0.0
         combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
         if combine_spec is not None:
             combine_fn, combine_kwargs = combine_spec
@@ -2227,28 +2715,52 @@ class PerfTargetCampaignRunner:
                 return StageBResult(
                     passed=False,
                     error_message=f"combine_kernel({combine_fn}): {combine_b.error_message}",
+                    full_diagnostic=combine_b.full_diagnostic,
                     elapsed_sec=primary_b.elapsed_sec + combine_b.elapsed_sec,
                 )
+            combine_elapsed_sec = combine_b.elapsed_sec
         if regime_spec.runtime_backend == "hybrid_trackb" and tb_extracted is not None:
             tb_sym, tb_cpp = tb_extracted
             instantiated_tu = self._instantiate_trackb_tu(module_source, tb_cpp, regime_spec)
             tb_b = self._compile_trackb_stage_b(instantiated_tu)
+            total_elapsed_sec = final_b.elapsed_sec + combine_elapsed_sec + tb_b.elapsed_sec
             if not tb_b.passed:
-                return StageBResult(
-                    passed=False,
+                return replace(
+                    tb_b,
                     error_message=f"trackb_ascendc({tb_sym}): {tb_b.error_message}",
-                    elapsed_sec=final_b.elapsed_sec + tb_b.elapsed_sec,
+                    elapsed_sec=total_elapsed_sec,
                 )
+            return replace(tb_b, elapsed_sec=total_elapsed_sec)
         return final_b
+
+    def _l1_summary_for_first_round(
+        self,
+        module_source: str,
+        regime_spec: RegimeTargetSpec,
+    ) -> BishengResourceSummary | None:
+        """Compile the parent once per source when no promoted stone carries L1 data."""
+        cache_key = (self._source_sha256(module_source), regime_spec.regime_tag)
+        if cache_key not in self._l1_summary_cache:
+            result = self._run_l1(module_source, regime_spec)
+            if not result.passed:
+                logger.warning(
+                    "First-round parent L1 for regime %s failed: %s",
+                    regime_spec.regime_tag,
+                    result.error_message,
+                )
+            self._l1_summary_cache[cache_key] = (
+                result.compiler_summary if result.passed else None
+            )
+        return self._l1_summary_cache[cache_key]
 
     def _run_l2_batch(
         self,
         candidates: Sequence[tuple[str, Path]],
         active_anchors: Sequence[AnchorCaseSpec],
-    ) -> dict[str, CandidateSurrogateResult]:
+    ) -> tuple[dict[str, CandidateSurrogateResult], str]:
         if self._l2_batch_evaluator is not None:
-            return dict(self._l2_batch_evaluator(candidates, active_anchors))
-        results, _run_id, _receipt = run_surrogate_batch_via_agent_gates(
+            return dict(self._l2_batch_evaluator(candidates, active_anchors)), ""
+        results, run_id, _receipt = run_surrogate_batch_via_agent_gates(
             self._config.operator_name,
             candidates,
             active_anchors,
@@ -2259,7 +2771,7 @@ class PerfTargetCampaignRunner:
             repeat=self._config.repeat,
             require_all_passed=False,
         )
-        return results
+        return results, run_id
 
     def _run_l3_contract(
         self,
@@ -2374,6 +2886,15 @@ class PerfTargetCampaignRunner:
         if self._config.disable_early_goal_stop:
             return False
         return rounds_completed > 0 and rounds_completed >= self._perf_target.min_optimization_rounds
+
+    def _round_regime_override(self, round_idx: int) -> RegimeTargetSpec | None:
+        """Return the configured regime for *round_idx*, or None for adaptive rotation."""
+        if round_idx > len(self._config.round_regime_tags):
+            return None
+        tag = self._config.round_regime_tags[round_idx - 1]
+        if not tag:
+            return None
+        return next(spec for spec in self._regime_specs if spec.regime_tag == tag)
 
     def _select_active_regime(
         self,
@@ -2986,7 +3507,11 @@ class PerfTargetCampaignRunner:
             other_beam.stepping_stone_beam = kept_stones
 
     @staticmethod
-    def _format_trackb_hotpath_section(regime_spec: RegimeTargetSpec) -> tuple[str, str]:
+    @staticmethod
+    def _format_trackb_hotpath_section(
+        regime_spec: RegimeTargetSpec,
+        active_kernel: str | None = None,
+    ) -> tuple[str, str]:
         """Return `(escalation_tier, hotpath_prompt_section)` for *regime_spec*."""
         backend = normalize_runtime_backend(regime_spec.runtime_backend)
         esc_tier = (
@@ -2996,13 +3521,39 @@ class PerfTargetCampaignRunner:
         )
         if not regime_spec.trackb_symbols:
             return esc_tier, ""
+        active_line = f"- active_kernel: {active_kernel}\n" if active_kernel else ""
+        if "_render_trackb_tu" in regime_spec.editable_symbols:
+            signature_rule = (
+                "- _render_trackb_tu is editable: keep its callable ABI ``_render_trackb_tu(**dims)`` "
+                "and the launcher dims it receives consistent with the launched kernel.\n"
+            )
+        else:
+            signature_rule = (
+                "- _render_trackb_tu is immutable: keep the launched kernel's ``template <...>`` "
+                "and parameter signature unchanged so instantiation still binds.\n"
+            )
         section = (
             "### ACTIVE RUNTIME HOT PATH\n"
             f"- runtime_backend: {regime_spec.runtime_backend}\n"
             f"- active_trackb_symbols: {list(regime_spec.trackb_symbols)}\n"
+            f"{active_line}"
             "- CRITICAL: On NPU this regime executes the Track-B CCE (C++20) kernel string "
             "and config selector shown in TARGET FUNCTION SNIPPET, NOT dead TileLang fallback "
             "builders. Edit the active Track-B CCE (C++20) kernel string / selector directly.\n\n"
+            "### TRACK-B REPLY CONTRACT\n"
+            "- Reply with exactly one fenced block in one of these forms:\n"
+            "  1. SEARCH/REPLACE hunks against the launched kernel and the helpers it calls "
+            "(preferred); hunks outside that closed set are rejected.\n"
+            "  2. One complete bare C++ unit per changed function: either the ``__global__`` "
+            "kernel or one ``__simd_vf__`` helper, keeping its exact name and signature.\n"
+            "  3. A Python slice that reassigns one authorized Track-B C++ constant in full.\n"
+            "- Never echo context folding markers ``READ-ONLY SIBLING KERNEL``, "
+            "``READ-ONLY HELPER``, or ``MIDDLE BODY OMITTED``.\n"
+            "- A full C++ constant must still contain every sibling ``__global__`` kernel "
+            "present in the original string; a replacement that drops one is rejected.\n"
+            f"{signature_rule}"
+            "- Put any selector change outside the hunks as a Python ``_select_*_config`` "
+            "definition in the same fenced block.\n\n"
         )
         return esc_tier, section
 
@@ -3022,19 +3573,33 @@ class PerfTargetCampaignRunner:
         sil_policy_section: str = "",
         effort: str | None = None,
     ) -> GenerationRequest:
+        module_source = incumbent_source or snippet_source
+        active_kernel = self._resolve_active_trackb_kernel(module_source, regime_spec)
         snippet_source = _compact_trackb_snippet_source(
             snippet_source,
             regime_spec,
             incumbent_source=incumbent_source,
             max_bytes=14800,
+            active_kernel=active_kernel,
         )
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
-        esc_tier, hotpath_section = self._format_trackb_hotpath_section(regime_spec)
-        sys_prompt = (
-            "You are an Ascend 950PR kernel performance engineer. Apply the selected causal "
-            f"optimization rule cleanly while preserving exact numerical semantics, dynamic shape "
-            f"compatibility, and {slice_desc}. Output ONLY Python code for this regime slice."
+        esc_tier, hotpath_section = self._format_trackb_hotpath_section(
+            regime_spec,
+            active_kernel=active_kernel,
         )
+        if regime_spec.trackb_symbols:
+            sys_prompt = (
+                "You are an Ascend 950PR kernel performance engineer. Apply the selected causal "
+                "optimization rule cleanly while preserving exact numerical semantics, dynamic shape "
+                f"compatibility, and {slice_desc}. Output ONLY the reply form required by the "
+                "TRACK-B REPLY CONTRACT."
+            )
+        else:
+            sys_prompt = (
+                "You are an Ascend 950PR kernel performance engineer. Apply the selected causal "
+                f"optimization rule cleanly while preserving exact numerical semantics, dynamic shape "
+                f"compatibility, and {slice_desc}. Output ONLY Python code for this regime slice."
+            )
         constraint_text = build_progressive_llm_constraints(
             escalation_tier=esc_tier,
             track=track,
@@ -3113,22 +3678,35 @@ class PerfTargetCampaignRunner:
         parent_hypothesis: str = "",
         sil_policy_section: str = "",
     ) -> GenerationRequest:
+        module_source = incumbent_source or snippet_source
+        active_kernel = self._resolve_active_trackb_kernel(module_source, regime_spec)
         snippet_source = _compact_trackb_snippet_source(
             snippet_source,
             regime_spec,
             incumbent_source=incumbent_source,
             max_bytes=14800,
+            active_kernel=active_kernel,
         )
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
-        esc_tier, hotpath_section = self._format_trackb_hotpath_section(regime_spec)
+        esc_tier, hotpath_section = self._format_trackb_hotpath_section(
+            regime_spec,
+            active_kernel=active_kernel,
+        )
+        if regime_spec.trackb_symbols:
+            reply_desc = (
+                'the TRACK-B REPLY CONTRACT form (SEARCH/REPLACE hunks, one bare C++ unit per '
+                "changed function, or a Python slice reassigning one authorized constant)"
+            )
+        else:
+            reply_desc = "Python code for this regime slice only"
         sys_prompt = (
             "You are an Ascend 950PR (dav-3510) systems architect. Propose an architectural "
             f"optimization grounded in Roofline limits (56 AIV / 28 MixCore blocks, 3 KiB SSBUF, "
             "L0C->UB direct path, UB->L1 direct path, 64-elem UB alignment, Split-KV parallelism). "
             f"Preserve exact numerical semantics, signatures, and {slice_desc}. Return ONLY a "
             'raw JSON object with exact keys "physical_hypothesis" (string), '
-            '"target_local_metric" (string), and "dsl_source" (Python code string for this '
-            "regime slice only; no prose outside JSON)."
+            '"target_local_metric" (string), and "dsl_source" (string containing '
+            f"{reply_desc}; no prose outside JSON)."
         )
         if excluded_mechanisms:
             constraint_lines = "\n".join(f"- {item}" for item in excluded_mechanisms)
@@ -3211,7 +3789,9 @@ class PerfTargetCampaignRunner:
         with tempfile.TemporaryDirectory(prefix="tf_camp_base_") as tmp_dir:
             mod_path = Path(tmp_dir) / "incumbent.py"
             mod_path.write_text(incumbent_source, encoding="utf-8")
-            results = self._run_l2_batch([("incumbent_baseline", mod_path)], active_anchors)
+            results, _run_id = self._run_l2_batch(
+                [("incumbent_baseline", mod_path)], active_anchors
+            )
         if "incumbent_baseline" not in results:
             raise RuntimeError("Baseline evaluation missing incumbent_baseline result.")
         return results["incumbent_baseline"]
@@ -3443,6 +4023,10 @@ class PerfTargetCampaignRunner:
                         self._config.operator_name
                     ),
                     sibling_specs=self._regime_specs,
+                    active_kernel=self._resolve_active_trackb_kernel(
+                        incumbent_source,
+                        regime_spec,
+                    ),
                 )
                 l0_probe = self._run_l0(stone_patched, regime_spec)
                 if not l0_probe.passed:
@@ -3587,7 +4171,7 @@ class PerfTargetCampaignRunner:
                     cpath.write_text(ablated_src, encoding="utf-8")
                     cand_files.append((chunk_id, cpath))
                 try:
-                    batch_res = self._run_l2_batch(cand_files, regime_anchors)
+                    batch_res, _run_id = self._run_l2_batch(cand_files, regime_anchors)
                 except (OSError, subprocess.SubprocessError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
                     logger.debug("Flywheel batched ablation timing skipped: %s", exc)
                     return {}
@@ -4132,6 +4716,84 @@ class PerfTargetCampaignRunner:
                 return _finish(retry_result)
             return _keep(retry_result, retry_used=True)
 
+        def _same_card_retry(
+            result: L4CannbenchResult,
+        ) -> tuple[L4CannbenchResult, PendingL4 | None]:
+            nonlocal current
+            limit = (
+                current.same_card_retry_limit
+                if current.same_card_retry_limit > 0
+                else max(0, self._config.l4_blocked_env_max_retries)
+            )
+            while (
+                result.execution_terminal
+                and _is_blocked_env_failure(
+                    result.failure_kind,
+                    result.error_message,
+                    result.state,
+                )
+                and current.same_card_retries_used < limit
+            ):
+                current = self._pending_l4_after(
+                    current,
+                    result,
+                    tuple(attempts),
+                    retry_used=current.retry_used,
+                )
+                current = replace(current, same_card_retry_limit=limit)
+                self._pending_l4 = current
+                self._persist_runtime_state("pending_l4", current.to_dict())
+                next_attempt = current.same_card_retries_used + 1
+                delay = max(0.0, self._config.l4_retry_backoff_sec) * next_attempt
+                if delay > 0.0:
+                    time.sleep(delay)
+                current = replace(
+                    current,
+                    execution_id="",
+                    run_id="",
+                    receipt_path="",
+                    state="SUBMITTED",
+                    execution_terminal=False,
+                    same_card_retries_used=next_attempt,
+                )
+                self._pending_l4 = current
+                self._persist_runtime_state("pending_l4", current.to_dict())
+                result = self._run_l4_cannbench(
+                    self._target_module_path,
+                    device_id=current.device_id or self._config.device_id,
+                    on_execution_started=_record_started,
+                )
+                attempts.append(self._l4_attempt(result))
+                current = replace(
+                    self._pending_l4_after(
+                        current,
+                        result,
+                        tuple(attempts),
+                        retry_used=current.retry_used,
+                    ),
+                    same_card_retry_limit=limit,
+                )
+                self._pending_l4 = current
+                self._persist_runtime_state("pending_l4", current.to_dict())
+            if result.passed or result.failure_kind == FAILURE_KIND_CANDIDATE:
+                return _finish(result)
+            return _keep(result, retry_used=current.retry_used)
+
+        def _after_infrastructure(
+            result: L4CannbenchResult,
+        ) -> tuple[L4CannbenchResult, PendingL4 | None]:
+            if _is_blocked_env_failure(
+                result.failure_kind,
+                result.error_message,
+                result.state,
+            ):
+                result, resolved = _same_card_retry(result)
+                if resolved is None:
+                    return result, None
+            if self._can_retry_l4_on_alt_card(current, result.device_id):
+                return _retry_whole_l4()
+            return _keep(result, retry_used=current.retry_used)
+
         if pending.execution_id and (not pending.execution_terminal or pending.run_id):
             result = self._run_l4_cannbench(
                 self._target_module_path,
@@ -4159,9 +4821,62 @@ class PerfTargetCampaignRunner:
                 return _finish(result)
             if not result.execution_terminal:
                 return _keep(result, retry_used=False)
-            if self._can_retry_l4_on_alt_card(current, result.device_id):
-                return _retry_whole_l4()
-            return _keep(result, retry_used=False)
+            return _after_infrastructure(result)
+
+        blocked_env_pending = _is_blocked_env_failure(
+            pending.failure_kind,
+            pending.error_message,
+            pending.state,
+        )
+        interrupted_submission = (
+            not pending.execution_terminal
+            and not pending.execution_id
+            and not pending.run_id
+            and pending.state == "SUBMITTED"
+        )
+        if (
+            (blocked_env_pending and pending.execution_terminal)
+            or (
+                interrupted_submission
+                and pending.same_card_retry_limit > 0
+                and pending.same_card_retries_used <= pending.same_card_retry_limit
+            )
+        ):
+            if interrupted_submission:
+                result = self._run_l4_cannbench(
+                    self._target_module_path,
+                    device_id=pending.device_id or self._config.device_id,
+                    on_execution_started=_record_started,
+                )
+                attempts.append(self._l4_attempt(result))
+                current = self._pending_l4_after(
+                    current,
+                    result,
+                    tuple(attempts),
+                    retry_used=current.retry_used,
+                )
+                self._pending_l4 = current
+                self._persist_runtime_state("pending_l4", current.to_dict())
+            else:
+                result = L4CannbenchResult(
+                    passed=False,
+                    error_message=pending.error_message,
+                    failure_kind=pending.failure_kind,
+                    execution_id=pending.execution_id,
+                    run_id=pending.run_id,
+                    receipt_path=pending.receipt_path,
+                    device_id=pending.device_id,
+                    state=pending.state,
+                    execution_terminal=pending.execution_terminal,
+                    target_path=pending.target_path,
+                    candidate_sha256=expected,
+                    attempts=pending.attempts,
+                )
+            if result.passed or result.failure_kind == FAILURE_KIND_CANDIDATE:
+                return _finish(result)
+            if not result.execution_terminal:
+                return _keep(result, retry_used=current.retry_used)
+            return _after_infrastructure(result)
 
         if self._can_retry_l4_on_alt_card(pending, pending.device_id):
             return _retry_whole_l4()
@@ -4194,6 +4909,15 @@ class PerfTargetCampaignRunner:
         except (OSError, ValueError):
             return self._target_module_path.name
 
+    @staticmethod
+    def _is_blocked_env_l4(result: L4CannbenchResult) -> bool:
+        """Return True when L4 was preempted by an external process (exit 75)."""
+        return _is_blocked_env_failure(
+            result.failure_kind,
+            result.error_message,
+            result.state,
+        )
+
     def _run_final_l4_tracked(
         self,
         *,
@@ -4203,45 +4927,85 @@ class PerfTargetCampaignRunner:
         """Submit the official L4 run and persist its identity before waiting."""
         candidate_sha = self._source_sha256(incumbent_source)
         candidate_relative = self._l4_candidate_relative()
+        attempts: list[dict[str, str]] = []
+        retry_idx = 0
+        retry_limit = max(0, self._config.l4_blocked_env_max_retries)
 
-        def _record_started(execution_id: str, device: str) -> None:
-            provisional = PendingL4(
-                target_path=str(self._target_module_path),
+        def _pending_for(result: L4CannbenchResult) -> PendingL4:
+            return PendingL4(
+                target_path=result.target_path or str(self._target_module_path),
                 candidate_relative=candidate_relative,
-                candidate_sha256=candidate_sha,
-                execution_id=execution_id,
-                device_id=device,
-                state="SUBMITTED",
-                execution_terminal=False,
+                candidate_sha256=result.candidate_sha256 or candidate_sha,
+                execution_id=result.execution_id,
+                run_id=result.run_id,
+                receipt_path=result.receipt_path,
+                device_id=result.device_id or self._config.device_id,
+                state=result.state,
+                error_message=result.error_message,
+                failure_kind=result.failure_kind or FAILURE_KIND_INFRASTRUCTURE,
+                execution_terminal=result.execution_terminal,
+                retry_used=bool(
+                    self._config.retry_device_id
+                    and (result.device_id or self._config.device_id)
+                    == self._config.retry_device_id
+                ),
+                same_card_retries_used=retry_idx,
+                same_card_retry_limit=retry_limit,
+                attempts=tuple(attempts),
                 prior_stop_reason=prior_stop_reason,
             )
-            self._pending_l4 = provisional
-            self._persist_runtime_state("pending_l4", provisional.to_dict())
+
+        def _record_started(execution_id: str, device: str) -> None:
+            started = replace(
+                _pending_for(
+                    L4CannbenchResult(
+                        passed=False,
+                        execution_id=execution_id,
+                        device_id=device,
+                        state="SUBMITTED",
+                        execution_terminal=False,
+                        failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+                    )
+                ),
+                candidate_sha256=candidate_sha,
+                candidate_relative=candidate_relative,
+            )
+            self._pending_l4 = started
+            self._persist_runtime_state("pending_l4", started.to_dict())
 
         result = self._run_l4_cannbench(
             self._target_module_path,
             device_id=self._config.device_id,
             on_execution_started=_record_started,
         )
+        attempts.append(self._l4_attempt(result))
+        while self._is_blocked_env_l4(result) and retry_idx < retry_limit:
+            self._pending_l4 = _pending_for(result)
+            self._persist_runtime_state("pending_l4", self._pending_l4.to_dict())
+            delay = max(0.0, self._config.l4_retry_backoff_sec) * (retry_idx + 1)
+            if delay > 0.0:
+                time.sleep(delay)
+            retry_idx += 1
+            self._pending_l4 = replace(
+                _pending_for(result),
+                execution_id="",
+                run_id="",
+                receipt_path="",
+                state="SUBMITTED",
+                execution_terminal=False,
+            )
+            self._persist_runtime_state("pending_l4", self._pending_l4.to_dict())
+            result = self._run_l4_cannbench(
+                self._target_module_path,
+                device_id=self._config.device_id,
+                on_execution_started=_record_started,
+            )
+            attempts.append(self._l4_attempt(result))
         if result.passed or result.failure_kind == FAILURE_KIND_CANDIDATE:
             self._pending_l4 = None
             self._persist_runtime_state("pending_l4", None)
             return result
-        pending = PendingL4(
-            target_path=result.target_path or str(self._target_module_path),
-            candidate_relative=candidate_relative,
-            candidate_sha256=result.candidate_sha256 or candidate_sha,
-            execution_id=result.execution_id,
-            run_id=result.run_id,
-            receipt_path=result.receipt_path,
-            device_id=result.device_id or self._config.device_id,
-            state=result.state,
-            error_message=result.error_message,
-            failure_kind=result.failure_kind or FAILURE_KIND_INFRASTRUCTURE,
-            execution_terminal=result.execution_terminal,
-            attempts=(self._l4_attempt(result),),
-            prior_stop_reason=prior_stop_reason,
-        )
+        pending = _pending_for(result)
         self._pending_l4 = pending
         self._persist_runtime_state("pending_l4", pending.to_dict())
         return result
@@ -4256,6 +5020,11 @@ class PerfTargetCampaignRunner:
         active_mask: ConstraintRelaxationMask,
         checks: Sequence[L0L1CandidateCheck],
         l2_results: Mapping[str, CandidateSurrogateResult],
+        active_kernel: str,
+        l2_run_id: str,
+        parent_sha256: str,
+        parent_l1_summary: BishengResourceSummary | None,
+        parent_l1_summary_source: str,
     ) -> tuple[dict[str, object], ...]:
         """Record per-candidate Track-B blueprint, 5D observation, residual, and provenance."""
         if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
@@ -4264,6 +5033,24 @@ class PerfTargetCampaignRunner:
             return ()
         policy = live_plan.policy if live_plan is not None else {}
         solver_backend_tier = str(policy.get("backend_tier", ""))
+        case_entry = regime_spec.representative_case_entry
+        raw_case_id = case_entry.get("case_id", 0)
+        representative_case_id = (
+            raw_case_id
+            if isinstance(raw_case_id, int) and not isinstance(raw_case_id, bool)
+            else 0
+        )
+        raw_dtype = case_entry.get("dtype", "")
+        representative_input_dtype: str | list[str]
+        if isinstance(raw_dtype, str):
+            representative_input_dtype = raw_dtype
+        elif isinstance(raw_dtype, (list, tuple)):
+            representative_input_dtype = [str(item) for item in raw_dtype]
+        else:
+            representative_input_dtype = ""
+        parent_summary_payload = (
+            parent_l1_summary.to_dict() if parent_l1_summary is not None else None
+        )
         roofline = blueprint.roofline
         blueprint_summary: dict[str, object] = {
             "entry_name": blueprint.entry_name,
@@ -4327,6 +5114,17 @@ class PerfTargetCampaignRunner:
                     "regime_tag": regime_spec.regime_tag,
                     "candidate_id": chk.candidate_id,
                     "candidate_sha256": cand_sha,
+                    "active_kernel": active_kernel,
+                    "l2_run_id": l2_run_id if l2_result is not None else "",
+                    "parent_candidate_sha256": parent_sha256,
+                    "parent_compiler_summary": (
+                        dict(parent_summary_payload)
+                        if parent_summary_payload is not None
+                        else None
+                    ),
+                    "parent_compiler_summary_source": parent_l1_summary_source,
+                    "representative_case_id": representative_case_id,
+                    "representative_input_dtype": representative_input_dtype,
                     "runtime_backend": regime_spec.runtime_backend,
                     "backend_tier": "ascendc_template",
                     "solver_backend_tier": solver_backend_tier,
@@ -4357,10 +5155,11 @@ class PerfTargetCampaignRunner:
                         "has_l1_compiler_summary": observation.has_l1_compiler_summary,
                         "has_l2_telemetry": observation.has_l2_telemetry,
                         "measured_l2_fields": list(observation.measured_l2_fields),
-                        "latency_source": (
+                        "latency_source": "l2_batch_mean" if has_latency else "none",
+                        "observation_source": (
                             "msprof_l2"
                             if msprof
-                            else ("surrogate_l2" if has_latency else "none")
+                            else ("l2_batch" if has_latency else "roofline_static")
                         ),
                         "compiler_summary_source": (
                             "bisheng_l1" if compiler_summary is not None else "absent"
@@ -4522,7 +5321,12 @@ class PerfTargetCampaignRunner:
         parent_l1_summary = (
             compiler_summary_from_residual(selected_stone.residual)
             if selected_stone is not None
-            else None
+            else self._l1_summary_for_first_round(parent_module_source, regime_spec)
+        )
+        parent_l1_summary_source = (
+            "stepping_stone_residual"
+            if selected_stone is not None and parent_l1_summary is not None
+            else ("bisheng_l1" if parent_l1_summary is not None else "absent")
         )
         if cached_parent_msprof:
             telemetry_payload: dict[str, object] = {
@@ -4566,7 +5370,10 @@ class PerfTargetCampaignRunner:
             parent_ledger,
             features=parent_features,
             residual=parent_residual,
-            extra={"topology_axes": parent_axes},
+            extra={
+                "topology_axes": parent_axes,
+                **_case_ratio_predicate_entries(regime_spec.representative_case_ratios),
+            },
         )
         parent_comp_summary = compiler_summary_from_residual(parent_residual)
         parent_waterlines = getattr(parent_ledger, "waterlines", {}) or {}
@@ -4664,6 +5471,11 @@ class PerfTargetCampaignRunner:
                             regime_tag=regime_spec.regime_tag,
                             module_source=parent_module_source,
                             max_bytes=8192,
+                            active_kernel=_active_trackb_kernel(
+                                raw_tu,
+                                raw_tu,
+                                regime_tag=regime_spec.regime_tag,
+                            ),
                         )
                     else:
                         escalated_trackb_tu = raw_tu
@@ -4839,7 +5651,7 @@ class PerfTargetCampaignRunner:
             meta_by_id[wid] = (wkind, rule, cand_hypothesis)
             if snippet is None:
                 stage_tag = "llm_transport" if is_transport_error else "llm_generate"
-                failed_entries.append((wid, stage_tag, err[:200]))
+                failed_entries.append((wid, stage_tag, err[:1500]))
                 if rule is not None and not is_transport_error:
                     self._tracker.record_outcome(
                         rule.rule_id,
@@ -4856,6 +5668,7 @@ class PerfTargetCampaignRunner:
                 raw_candidates.append((wid, snippet))
 
         l0_l1_checks: list[L0L1CandidateCheck] = []
+        round_active_kernel = ""
         if raw_candidates:
             prescreen_top_k = (
                 int(self._config.cost_prescreen_top_k)
@@ -4898,6 +5711,13 @@ class PerfTargetCampaignRunner:
                     )
                 return self._run_l0(mod_src, regime_spec)
 
+            round_active_kernel = (
+                self._resolve_active_trackb_kernel(
+                    parent_module_source,
+                    regime_spec,
+                )
+                or ""
+            )
             l0_l1_checks = await run_l0_l1_round_filter(
                 raw_candidates,
                 patch_fn=lambda snip: patch_regime_into_module(
@@ -4908,6 +5728,7 @@ class PerfTargetCampaignRunner:
                         self._config.operator_name
                     ),
                     sibling_specs=self._regime_specs,
+                    active_kernel=round_active_kernel,
                 ),
                 l0_checker=_candidate_l0_check,
                 l1_compiler=lambda mod_src: self._run_l1(mod_src, regime_spec),
@@ -4921,12 +5742,18 @@ class PerfTargetCampaignRunner:
 
         passed_checks = [chk for chk in l0_l1_checks if chk.passed]
         for chk in l0_l1_checks:
+            self._persist_round_candidate_artifact(chk, round_idx=round_idx)
+        for chk in l0_l1_checks:
             if not chk.passed:
                 failed_entries.append(
-                    (chk.candidate_id, chk.failed_tier or "l0_l1", chk.error_message[:200])
+                    (chk.candidate_id, chk.failed_tier or "l0_l1", chk.error_message[:1500])
                 )
                 _wkind, rule, _hyp = meta_by_id[chk.candidate_id]
-                if rule is not None and chk.failed_tier not in ("llm_transport", "cost_prescreen"):
+                if (
+                    rule is not None
+                    and chk.failed_tier not in ("llm_transport", "cost_prescreen")
+                    and "[repair_timeout]" not in chk.error_message
+                ):
                     self._tracker.record_outcome(
                         rule.rule_id,
                         postcondition_realized=False,
@@ -4940,6 +5767,7 @@ class PerfTargetCampaignRunner:
                     )
 
         l2_results: dict[str, CandidateSurrogateResult] = {}
+        l2_run_id = ""
         if passed_checks:
             with tempfile.TemporaryDirectory(prefix=f"tf_camp_r{round_idx}_") as tmp_dir:
                 cand_paths: list[tuple[str, Path]] = []
@@ -4948,7 +5776,7 @@ class PerfTargetCampaignRunner:
                     cand_file.write_text(chk.patched_module_source, encoding="utf-8")
                     cand_paths.append((chk.candidate_id, cand_file))
                 try:
-                    l2_results = self._run_l2_batch(cand_paths, active_anchors)
+                    l2_results, l2_run_id = self._run_l2_batch(cand_paths, active_anchors)
                 except (OSError, subprocess.SubprocessError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
                     logger.warning(
                         "Round %d L2 batch failed after retries: %s",
@@ -4957,7 +5785,7 @@ class PerfTargetCampaignRunner:
                     )
                     l2_results = {}
                     for chk in passed_checks:
-                        failed_entries.append((chk.candidate_id, "l2_error", str(exc)[:200]))
+                        failed_entries.append((chk.candidate_id, "l2_error", str(exc)[:1500]))
 
         passing_candidates: list[tuple[L0L1CandidateCheck, CandidateSurrogateResult]] = [
             (chk, l2_results[chk.candidate_id])
@@ -5369,6 +6197,11 @@ class PerfTargetCampaignRunner:
             active_mask=active_mask,
             checks=l0_l1_checks,
             l2_results=l2_results,
+            active_kernel=round_active_kernel,
+            l2_run_id=l2_run_id,
+            parent_sha256=parent_sha,
+            parent_l1_summary=parent_l1_summary,
+            parent_l1_summary_source=parent_l1_summary_source,
         )
         record = CampaignRoundRecord(
             round_idx=round_idx,
@@ -5573,14 +6406,16 @@ class PerfTargetCampaignRunner:
             if current_regime and current_regime in frozen_regimes:
                 current_regime = None
 
-            active_regime = self._select_active_regime(
-                current_regime,
-                frozen_regimes,
-                best_result,
-                active_anchors,
-                allow_satisfied_fallback=not self._allow_early_stop(len(rounds)),
-                exclude_regime=last_unpromoted_regime,
-            )
+            active_regime = self._round_regime_override(round_idx)
+            if active_regime is None:
+                active_regime = self._select_active_regime(
+                    current_regime,
+                    frozen_regimes,
+                    best_result,
+                    active_anchors,
+                    allow_satisfied_fallback=not self._allow_early_stop(len(rounds)),
+                    exclude_regime=last_unpromoted_regime,
+                )
             if active_regime is None:
                 stop_reason = "all_regimes_converged"
                 break

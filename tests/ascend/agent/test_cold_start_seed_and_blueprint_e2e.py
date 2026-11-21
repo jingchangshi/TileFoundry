@@ -16,6 +16,7 @@ import yaml
 from tilefoundry_ascend.agent import (
     AnchorCaseSpec,
     CampaignConfig,
+    MockLLMBackend,
     PerfTargetCampaignRunner,
     PerfTargetSpec,
     RegimeTargetSpec,
@@ -38,9 +39,11 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     build_arg_parser as build_campaign_arg_parser,
 )
 from tilefoundry_ascend.agent.campaign.marathon import (
+    MarathonConfig,
     build_marathon_arg_parser,
     build_stage0_static_validator,
     prepare_marathon_seed,
+    run_operator_marathon,
 )
 from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
     OracleAccuracyResult,
@@ -65,6 +68,7 @@ from tilefoundry_ascend.agent.router.capability_gate import RouteDecision, Struc
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirBlueprintPacket
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger, ScopeWaterline
+from tilefoundry_ascend.ascend.sil import CasePhysicsRatios
 from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
     PyTorchSemanticAnalyzer,
     RepresentativeCase,
@@ -1652,6 +1656,35 @@ def test_trackb_round_evidence_persists_blueprint_observation_and_provenance(
         stage_b=StageBResult(passed=True, compiler_summary=compiler_summary),
     )
     candidate_sha = runner._source_sha256(check.patched_module_source)
+    unsubmitted_check = L0L1CandidateCheck(
+        candidate_id="r2_trackb_l1_failed",
+        passed=False,
+        failed_tier="stage_b",
+        patched_module_source=_TRACKB_SEED_MODULE + "\n# rejected before fast eval\n",
+        snippet_source="",
+        stage_a=StageAResult(
+            passed=True,
+            prim_func=None,
+            ledger=_evidence_ledger(),
+            features=route.features,
+            route=route,
+            backend_kind="ascendc",
+        ),
+        stage_b=StageBResult(passed=False, error_message="bisheng compile failed"),
+        error_message="bisheng compile failed",
+    )
+    parent_sha = runner._source_sha256(_SEED_MODULE)
+    case_entry = regime.representative_case_entry
+    raw_case_id = case_entry.get("case_id")
+    assert isinstance(raw_case_id, int)
+    raw_dtype = case_entry.get("dtype")
+    expected_dtype: str | list[str]
+    if isinstance(raw_dtype, str):
+        expected_dtype = raw_dtype
+    elif isinstance(raw_dtype, (list, tuple)):
+        expected_dtype = [str(item) for item in raw_dtype]
+    else:
+        expected_dtype = ""
     runner._msprof_cache[(candidate_sha, regime.regime_tag)] = {
         "dur_us": 41.5,
         "aiv_vec_ratio": 0.62,
@@ -1664,10 +1697,15 @@ def test_trackb_round_evidence_persists_blueprint_observation_and_provenance(
         blueprint=blueprint,
         live_plan=None,
         active_mask=runner._resolve_trackb_freedom_mask(regime),
-        checks=(check,),
-        l2_results={},
+        checks=(check, unsubmitted_check),
+        l2_results={"r2_trackb": _surrogate_result("exp")},
+        active_kernel="gather_kernel",
+        l2_run_id="run-fast-42",
+        parent_sha256=parent_sha,
+        parent_l1_summary=compiler_summary,
+        parent_l1_summary_source="bisheng_l1",
     )
-    assert len(evidence) == 1
+    assert len(evidence) == 2
     item = evidence[0]
     assert item["round_idx"] == 2
     assert item["regime_tag"] == regime.regime_tag
@@ -1676,6 +1714,26 @@ def test_trackb_round_evidence_persists_blueprint_observation_and_provenance(
     assert item["runtime_backend"] == "ascendc_trackb"
     assert item["backend_tier"] == "ascendc_template"
     assert item["track"] == "developer"
+    assert item["active_kernel"] == "gather_kernel"
+    assert item["l2_evaluated"] is True
+    assert item["l2_run_id"] == "run-fast-42"
+    assert item["parent_candidate_sha256"] == parent_sha
+    parent_summary = item["parent_compiler_summary"]
+    assert isinstance(parent_summary, Mapping)
+    assert parent_summary == compiler_summary.to_dict()
+    assert item["parent_compiler_summary_source"] == "bisheng_l1"
+    assert item["representative_case_id"] == raw_case_id
+    assert item["representative_input_dtype"] == expected_dtype
+    unsubmitted = evidence[1]
+    assert unsubmitted["candidate_id"] == "r2_trackb_l1_failed"
+    assert unsubmitted["active_kernel"] == "gather_kernel"
+    assert unsubmitted["l2_evaluated"] is False
+    assert unsubmitted["l2_run_id"] == ""
+    assert unsubmitted["latency_us"] == 0.0
+    unsubmitted_provenance = unsubmitted["field_provenance"]
+    assert isinstance(unsubmitted_provenance, Mapping)
+    assert unsubmitted_provenance["latency_source"] == "none"
+    assert unsubmitted_provenance["observation_source"] == "roofline_static"
     blueprint_summary = item["blueprint"]
     assert isinstance(blueprint_summary, Mapping)
     assert blueprint_summary["ideal_roofline_us"] == blueprint.roofline.ideal_roofline_us
@@ -1691,7 +1749,8 @@ def test_trackb_round_evidence_persists_blueprint_observation_and_provenance(
     assert "exec_mode_and_spr" in unlocked
     provenance = item["field_provenance"]
     assert isinstance(provenance, Mapping)
-    assert provenance["latency_source"] == "msprof_l2"
+    assert provenance["latency_source"] == "none"
+    assert provenance["observation_source"] == "msprof_l2"
     assert provenance["compiler_summary_source"] == "bisheng_l1"
     assert provenance["has_l1_compiler_summary"] is True
     measured_fields = provenance["measured_l2_fields"]
@@ -1747,3 +1806,258 @@ def test_trackb_round_evidence_persists_blueprint_observation_and_provenance(
     assert persisted_provenance["has_l2_telemetry"] is True
     restored_record = CampaignRoundRecord.from_dict(round_payload)
     assert restored_record.trackb_evidence == record.trackb_evidence
+
+
+_RENDER_TRACKB_SEED_MODULE = '''
+EXP_TRACKB_CU = """
+#include <tl_templates/ascend/kernel_entry.h>
+__global__ void gather_kernel() {}
+"""
+
+
+def _select_exp_config(M: int = 1024, D: int = 1024, tl_dtype: str = "float16") -> dict[str, object]:
+    """Select the Track-B translation unit for one regime."""
+    return {"pass_configs": {}, "compile_flags": [], "trackb_symbol": "EXP_TRACKB_CU"}
+
+
+def _render_trackb_tu(**dims: object) -> str:
+    """Append a launcher comment exposing the representative dimensions."""
+    base = str(dims.get("trackb_src", ""))
+    rows = int(dims.get("M", 0))
+    width = int(dims.get("D", 0))
+    return base + "\\n// launch M=" + str(rows) + " D=" + str(width) + "\\n"
+
+
+def exp(x, index):
+    """Dispatch gather through the bisheng-compiled Track-B library."""
+    raise RuntimeError("offline test fixture has no compiled Track-B library")
+
+
+kernel = exp
+'''
+
+
+def _trackb_render_regime_specs() -> tuple[RegimeTargetSpec, ...]:
+    """Two Track-B regimes whose representative dims must render distinct launchers."""
+    ratio = CasePhysicsRatios(
+        case_id=1,
+        stride_ratio=1.0,
+        contig_atom_ratio=1.0,
+        is_atom_aligned=True,
+        working_set_sram_ratio=0.5,
+        working_set_vreg_ratio=0.25,
+        wave_occupancy_ratio=1.0,
+        oi_ridge_ratio=0.5,
+        inner_contiguous_bytes=512,
+    )
+    return (
+        RegimeTargetSpec(
+            regime_tag="vector",
+            builder_candidates=("_select_exp_config",),
+            sample_builder_kwargs={"M": 1024, "D": 1024},
+            representative_hir_dims={"M": 1024, "D": 1024},
+            config_selector_fn="_select_exp_config",
+            editable_symbols=("_select_exp_config", "EXP_TRACKB_CU"),
+            runtime_backend="ascendc_trackb",
+            trackb_symbols=("EXP_TRACKB_CU",),
+            representative_case_ratios=ratio,
+        ),
+        RegimeTargetSpec(
+            regime_tag="vector_twopass",
+            builder_candidates=("_select_exp_config",),
+            sample_builder_kwargs={"M": 8192, "D": 8192},
+            representative_hir_dims={"M": 8192, "D": 8192},
+            config_selector_fn="_select_exp_config",
+            editable_symbols=("_select_exp_config", "EXP_TRACKB_CU"),
+            runtime_backend="ascendc_trackb",
+            trackb_symbols=("EXP_TRACKB_CU",),
+        ),
+    )
+
+
+def test_stage0_trackb_validator_requires_renderer_abi(tmp_path: Path) -> None:
+    """Reject a Track-B seed that cannot render per-regime launchers."""
+    validator = build_stage0_static_validator(
+        _trackb_render_regime_specs(),
+        entrypoint="exp",
+        worktree=tmp_path,
+        env_file=None,
+    )
+    passed, error = validator(_TRACKB_SEED_MODULE, "cce_trackb")
+    assert passed is False
+    assert error.count("Track-B seed must declare def _render_trackb_tu") == 2
+    assert "[vector]" in error
+    assert "[vector_twopass]" in error
+
+
+def test_stage0_trackb_validator_instantiates_each_regime_before_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gate each regime's rendered launcher instead of the raw translation unit."""
+    evaluated: list[tuple[str, CasePhysicsRatios | None]] = []
+    compiled: list[str] = []
+
+    def _evaluate(cpp_source: str, *, case_ratios: CasePhysicsRatios | None) -> StageAResult:
+        evaluated.append((cpp_source, case_ratios))
+        return StageAResult(passed=True, prim_func=None, ledger=None)
+
+    def _compile(
+        cpp_source: str,
+        *,
+        compile_flags: Sequence[str],
+        bisheng_bin: str | None,
+        cann_root: Path | None,
+    ) -> StageBResult:
+        compiled.append(cpp_source)
+        return StageBResult(passed=True)
+
+    monkeypatch.setattr(marathon, "evaluate_ascendc_candidate", _evaluate)
+    monkeypatch.setattr(marathon, "run_stage_b_ascendc_compile", _compile)
+    specs = _trackb_render_regime_specs()
+    validator = build_stage0_static_validator(
+        specs,
+        entrypoint="exp",
+        worktree=tmp_path,
+        env_file=None,
+    )
+    passed, error = validator(_RENDER_TRACKB_SEED_MODULE, "cce_trackb")
+    assert passed is True
+    assert error == ""
+    assert len(evaluated) == 2
+    assert compiled == [tu for tu, _ratios in evaluated]
+    assert "// launch M=1024 D=1024" in evaluated[0][0]
+    assert "// launch M=8192 D=8192" in evaluated[1][0]
+    assert evaluated[0][0] != evaluated[1][0]
+    assert "gather_kernel" in evaluated[0][0]
+    assert evaluated[0][1] is specs[0].representative_case_ratios
+    assert evaluated[1][1] is None
+
+
+def test_stage0_trackb_validator_aggregates_every_regime_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Report every regime's Track-B L0 failure without compiling any translation unit."""
+    compiled: list[str] = []
+
+    def _evaluate(cpp_source: str, *, case_ratios: CasePhysicsRatios | None) -> StageAResult:
+        return StageAResult(
+            passed=False,
+            prim_func=None,
+            ledger=None,
+            error_message="token purity",
+        )
+
+    def _compile(*_args: object, **_kwargs: object) -> StageBResult:
+        compiled.append("called")
+        return StageBResult(passed=True)
+
+    monkeypatch.setattr(marathon, "evaluate_ascendc_candidate", _evaluate)
+    monkeypatch.setattr(marathon, "run_stage_b_ascendc_compile", _compile)
+    validator = build_stage0_static_validator(
+        _trackb_render_regime_specs(),
+        entrypoint="exp",
+        worktree=tmp_path,
+        env_file=None,
+    )
+    passed, error = validator(_RENDER_TRACKB_SEED_MODULE, "cce_trackb")
+    assert passed is False
+    assert error == (
+        "[vector] Track-B L0 token purity (EXP_TRACKB_CU): token purity; "
+        "[vector_twopass] Track-B L0 token purity (EXP_TRACKB_CU): token purity"
+    )
+    assert compiled == []
+
+
+def test_marathon_passes_seed_blueprints_and_topology_axes_to_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forward Stage-0 blueprints and topology axes into the campaign runner."""
+    monkeypatch.delenv("TILEFOUNDRY_NPU_CANNBENCH_REPO", raising=False)
+    analyzer = PyTorchSemanticAnalyzer()
+    semantics = analyzer.analyze_source(_EXP_GOLDEN, entry_name="exp", proto=_EXP_PROTO)
+    specs = _legacy_regime_specs()
+    packets = {
+        spec.regime_tag: analyzer.build_universal_blueprint(
+            semantics,
+            spec.representative_hir_dims,
+        )
+        for spec in specs
+    }
+    seed_outcome = SeedSynthesisOutcome(
+        mode="cold_start",
+        initial_track="tilelang_dsl",
+        module_source=_SEED_MODULE,
+        semantics=semantics,
+        case_ratios=(),
+        regime_specs=specs,
+        blueprints_by_regime=packets,
+        attempts_used=1,
+        verification_state="l3_verified",
+        l0_l1_passed=True,
+        oracle_accuracy_passed=True,
+        candidate_sha256=_sha256(_SEED_MODULE),
+        l3_run_id="run-stage0-0001",
+        l3_receipt_path="/tmp/tilefoundry-l3-receipt.json",
+        l3_state="passed",
+        l3_elapsed_sec=1.5,
+    )
+    captured: dict[str, object] = {}
+
+    class _CapturingRunner:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        async def run(self, *, resume: bool) -> object:
+            return _StubReport()
+
+    class _StubReport:
+        def to_dict(self) -> dict[str, object]:
+            return {"status": "stubbed"}
+
+    monkeypatch.setattr(marathon, "_resolve_worktree", lambda _cfg: (tmp_path, tmp_path))
+    monkeypatch.setattr(marathon, "_ensure_sys_paths", lambda _worktree: None)
+    monkeypatch.setattr(marathon, "_configure_marathon_logging", lambda _path: None)
+    monkeypatch.setattr(
+        marathon,
+        "ensure_marathon_env_file",
+        lambda **_kw: tmp_path / "env.sh",
+    )
+    monkeypatch.setattr(marathon, "configure_marathon_process_env", lambda **_kw: {})
+    monkeypatch.setattr(
+        marathon,
+        "create_llm_backend_from_env",
+        lambda **_kw: MockLLMBackend(),
+    )
+    monkeypatch.setattr(marathon, "prepare_marathon_seed", lambda **_kw: seed_outcome)
+    monkeypatch.setattr(
+        marathon,
+        "build_resilient_l2_evaluator",
+        lambda **_kw: (lambda cands, anchors: {}),
+    )
+    monkeypatch.setattr(
+        marathon,
+        "build_prewarmed_l3_runner",
+        lambda **_kw: (lambda _path: L3AcceptanceResult(passed=True)),
+    )
+    monkeypatch.setattr(
+        marathon,
+        "resolve_default_experience_lake_dir",
+        lambda **_kw: None,
+    )
+    monkeypatch.setattr(marathon, "ExtremeCampaignRunner", _CapturingRunner)
+
+    exit_code = run_operator_marathon(
+        MarathonConfig(
+            operator_name="exp",
+            state_dir=tmp_path / "state",
+            target_module_path=tmp_path / "kernels.py",
+            salvage_beam_candidates=False,
+        )
+    )
+    assert exit_code == 0
+    assert captured["regime_blueprints"] == packets
+    assert captured["topology_axes"] == seed_outcome.semantics.base_axes
+    assert captured["regime_specs"] == seed_outcome.regime_specs

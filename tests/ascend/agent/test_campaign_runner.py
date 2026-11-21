@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import json
 import subprocess
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -38,11 +40,27 @@ from tilefoundry_ascend.agent.campaign import (
     patch_regime_into_module,
     surrogate_cannbench,
 )
-from tilefoundry_ascend.agent.campaign.anchor_specs import DEFAULT_REGIME_SPECS
-from tilefoundry_ascend.agent.campaign.campaign_runner import _extract_regime_abi_context
+from tilefoundry_ascend.agent.campaign.anchor_specs import (
+    DEFAULT_REGIME_SPECS,
+    CannbenchOpsRegistry,
+)
+from tilefoundry_ascend.agent.campaign.campaign_runner import (
+    _active_trackb_kernel,
+    _case_ratio_predicate_entries,
+    _detect_trackb_dead_code_edit,
+    _extract_regime_abi_context,
+)
+from tilefoundry_ascend.agent.campaign.marathon import build_marathon_arg_parser
+from tilefoundry_ascend.agent.kb import build_predicate_context
 from tilefoundry_ascend.agent.orchestrator import StageAResult, StageBResult, TwoLaneBeamSearch
 from tilefoundry_ascend.agent.router import extract_structural_features, route_execution_track
-from tilefoundry_ascend.ascend.passes import build_objective_physical_ledger
+from tilefoundry_ascend.ascend.cost_model import BishengResourceSummary
+from tilefoundry_ascend.ascend.passes import (
+    HirBlueprintPacket,
+    HirRooflineSummary,
+    build_objective_physical_ledger,
+)
+from tilefoundry_ascend.ascend.sil import CasePhysicsRatios, TopologyAxes
 
 
 @pytest.fixture(autouse=True)
@@ -182,6 +200,11 @@ def _single_round_promotion_runner(
     run_final_l4: bool = False,
     retry_device_id: str = "",
     backend: MockLLMBackend | None = None,
+    l0_checker: Callable[[str, RegimeTargetSpec], StageAResult] | None = None,
+    max_syntax_repairs: int = 1,
+    device_id: str = "1",
+    l4_blocked_env_max_retries: int = 2,
+    l4_retry_backoff_sec: float = 45.0,
 ) -> PerfTargetCampaignRunner:
     """Build a one-regime campaign with injected L3/L4 transports."""
     anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 3.0),)
@@ -222,13 +245,18 @@ def _single_round_promotion_runner(
             max_rounds=max_rounds,
             run_final_l4=run_final_l4,
             retry_device_id=retry_device_id,
+            max_syntax_repairs=max_syntax_repairs,
+            device_id=device_id,
+            l4_blocked_env_max_retries=l4_blocked_env_max_retries,
+            l4_retry_backoff_sec=l4_retry_backoff_sec,
         ),
         target_module_path=target_path,
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints={"regime_a": _blueprint_packet()},
         llm_backend=backend,
-        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l0_checker=l0_checker or (lambda src, _reg: _make_stage_a(src)),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
         l2_batch_evaluator=_l2_fast,
         l3_contract_runner=l3_runner,
@@ -443,6 +471,7 @@ def test_campaign_early_stop_on_goal_met_and_roofline_saturated(tmp_path: Path) 
         ),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         tracker=tracker,
         flywheel_distiller=flywheel,
@@ -498,6 +527,7 @@ def test_campaign_early_stop_on_goal_met_and_roofline_saturated(tmp_path: Path) 
         ),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend_sat,
         l0_checker=lambda src, _reg: _make_stage_a(src),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -580,6 +610,7 @@ def test_campaign_patience_escalation_xhigh_stepping_stone_and_regime_rotation(
         perf_target=PerfTargetSpec("attention_residual", 2.0, 1.5, 0.85),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         tracker=tracker,
         l0_checker=lambda src, _reg: _make_stage_a(src),
@@ -610,6 +641,197 @@ def test_campaign_patience_escalation_xhigh_stepping_stone_and_regime_rotation(
         assert "### NEGATIVE CONSTRAINTS (ALREADY EXPLORED BY PARALLEL WORKERS)" in joined
         for rule in tracker.active_rules():
             assert rule.rule_id not in joined
+
+
+def test_explicit_round_regime_sequence_survives_promotion_and_headroom_ranking(
+    tmp_path: Path,
+) -> None:
+    """Repeatable --round-regime forces coverage order over promotion and headroom."""
+    parsed = build_marathon_arg_parser().parse_args(
+        [
+            "run",
+            "--operator",
+            "attention_residual",
+            "--round-regime",
+            "regime_a",
+            "--round-regime",
+            "tail_axis",
+        ]
+    )
+    assert parsed.round_regime == ["regime_a", "tail_axis"]
+
+    anchors = (
+        AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 4.0),
+        AnchorCaseSpec("level4/attention_residual", 4, "tail_axis", 20.0, 2.0),
+    )
+    regimes = (
+        RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),
+        RegimeTargetSpec("tail_axis", ("_build_regime_b",), {}),
+    )
+    incumbent = _make_surrogate_result(
+        "incumbent", "attention_residual", anchors, {2: 12.0, 4: 20.0}
+    )
+    assert incumbent.regime_headroom("tail_axis") > incumbent.regime_headroom("regime_a")
+
+    class _RegimeDispatchBackend:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def generate(self, req, *, effort_override=None):
+            _ = effort_override
+            self.calls.append(req)
+            source = _IMPROVED_REGIME_A if "regime_a:" in req.user_prompt else _IMPROVED_REGIME_B
+            if req.role == "explore_creative":
+                return json.dumps(
+                    {
+                        "physical_hypothesis": "Explicit round schedule probe",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": source,
+                    }
+                )
+            return source
+
+    def _l2_sequence(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            regime_a_us = 5.0 if "T.Kernel(2)" in src else 12.0
+            out[cid] = _make_surrogate_result(
+                cid,
+                "attention_residual",
+                tuple(active_anchors),
+                {2: regime_a_us, 4: 20.0},
+            )
+        return out
+
+    target_path = tmp_path / "kernels_explicit_rounds.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    backend = _RegimeDispatchBackend()
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=2,
+            disable_early_goal_stop=True,
+            round_regime_tags=("regime_a", "tail_axis"),
+        ),
+        target_module_path=target_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=anchors,
+        regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
+        llm_backend=backend,
+        l0_checker=lambda src, _reg: _make_stage_a(src),
+        l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+        l2_batch_evaluator=_l2_sequence,
+        l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+        checkpoint_path=tmp_path / "ckpt_explicit_rounds.json",
+    )
+    forced_first = runner._round_regime_override(1)
+    assert forced_first is not None and forced_first.regime_tag == "regime_a"
+    forced_second = runner._round_regime_override(2)
+    assert forced_second is not None and forced_second.regime_tag == "tail_axis"
+    assert runner._round_regime_override(3) is None
+    report = asyncio.run(runner.run())
+    assert report.stop_reason == "budget_exhausted"
+    assert report.total_rounds == 2
+    assert 1 in report.promoted_rounds
+    assert [record.regime_tag for record in report.rounds] == ["regime_a", "tail_axis"]
+
+
+def test_round_regime_override_rejects_unknown_tag(tmp_path: Path) -> None:
+    """A forced round regime must name a configured regime."""
+    regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),)
+    with pytest.raises(ValueError, match="round regime tag 'missing' is not configured"):
+        PerfTargetCampaignRunner(
+            config=CampaignConfig(
+                operator_name="attention_residual",
+                round_regime_tags=("missing",),
+            ),
+            target_module_path=tmp_path / "kernels.py",
+            anchors=(AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 4.0),),
+            regime_specs=regimes,
+            regime_blueprints=_regime_blueprints(regimes),
+        )
+
+
+def test_round_regime_override_resume_maps_absolute_round_index(tmp_path: Path) -> None:
+    """A resumed campaign keeps the forced regime at the restored round position."""
+    anchors = (
+        AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 4.0),
+        AnchorCaseSpec("level4/attention_residual", 4, "tail_axis", 20.0, 2.0),
+    )
+    regimes = (
+        RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),
+        RegimeTargetSpec("tail_axis", ("_build_regime_b",), {}),
+    )
+
+    class _ResumeBackend:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def generate(self, req, *, effort_override=None):
+            _ = effort_override
+            self.calls.append(req)
+            source = _IMPROVED_REGIME_A if "regime_a:" in req.user_prompt else _IMPROVED_REGIME_B
+            if req.role == "explore_creative":
+                return json.dumps(
+                    {
+                        "physical_hypothesis": "Resumed forced round probe",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": source,
+                    }
+                )
+            return source
+
+    def _l2_sequence(cands, active_anchors):
+        out = {}
+        for cid, mod_path in cands:
+            src = mod_path.read_text(encoding="utf-8")
+            regime_a_us = 5.0 if "T.Kernel(2)" in src else 12.0
+            out[cid] = _make_surrogate_result(
+                cid,
+                "attention_residual",
+                tuple(active_anchors),
+                {2: regime_a_us, 4: 20.0},
+            )
+        return out
+
+    target_path = tmp_path / "kernels_round_regime_resume.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    checkpoint_path = tmp_path / "ckpt_round_regime_resume.json"
+
+    def _runner(
+        *, max_rounds: int, round_regime_tags: tuple[str, ...]
+    ) -> PerfTargetCampaignRunner:
+        return PerfTargetCampaignRunner(
+            config=CampaignConfig(
+                operator_name="attention_residual",
+                max_rounds=max_rounds,
+                disable_early_goal_stop=True,
+                round_regime_tags=round_regime_tags,
+            ),
+            target_module_path=target_path,
+            perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+            anchors=anchors,
+            regime_specs=regimes,
+            regime_blueprints=_regime_blueprints(regimes),
+            llm_backend=_ResumeBackend(),
+            l0_checker=lambda src, _reg: _make_stage_a(src),
+            l1_compiler=lambda _src, _reg: StageBResult(passed=True),
+            l2_batch_evaluator=_l2_sequence,
+            l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
+            checkpoint_path=checkpoint_path,
+        )
+
+    first_report = asyncio.run(_runner(max_rounds=1, round_regime_tags=("regime_a",)).run())
+    assert [record.regime_tag for record in first_report.rounds] == ["regime_a"]
+    assert first_report.promoted_rounds == (1,)
+
+    resumed_report = asyncio.run(
+        _runner(max_rounds=2, round_regime_tags=("regime_a", "tail_axis")).run(resume=True)
+    )
+    assert resumed_report.total_rounds == 2
+    assert [record.regime_tag for record in resumed_report.rounds] == ["regime_a", "tail_axis"]
 
 
 def test_campaign_l3_contract_failure_atomic_rollback_and_budget_exhausted(
@@ -653,6 +875,7 @@ def test_campaign_l3_contract_failure_atomic_rollback_and_budget_exhausted(
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         l0_checker=lambda src, _reg: _make_stage_a(src),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -717,6 +940,7 @@ def test_campaign_l3_infrastructure_failure_preserves_pending_promotion(
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         l0_checker=lambda src, _reg: _make_stage_a(src),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -809,6 +1033,7 @@ def test_campaign_l3_candidate_failure_clears_pending_and_counts_stagnation(
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         l0_checker=lambda src, _reg: _make_stage_a(src),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -1189,6 +1414,7 @@ def test_campaign_resume_retries_pending_candidate_before_new_rounds(
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         l0_checker=lambda src, _reg: _make_stage_a(src),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -1241,6 +1467,7 @@ def test_campaign_resume_retries_pending_candidate_before_new_rounds(
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=MockLLMBackend(responses={}),
         l0_checker=lambda src, _reg: _make_stage_a(src),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -1314,6 +1541,7 @@ def test_campaign_failed_final_l4_does_not_catch_up(tmp_path: Path) -> None:
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         l0_checker=lambda src, _reg: _make_stage_a(src),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -1416,6 +1644,57 @@ def test_campaign_pending_l4_resumes_same_execution_and_card(tmp_path: Path) -> 
     assert resumed_report.l4_result.passed is True
     assert resumed_report.l4_result.device_id == "5"
     assert "T.Kernel(2)" in target_path.read_text(encoding="utf-8")
+
+
+def test_pending_l4_digest_mismatch_refuses_resume_without_submitting(
+    tmp_path: Path,
+) -> None:
+    """Refuse to continue a pending L4 when the on-disk candidate was replaced."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    submitted_digest = hashlib.sha256(b"submitted candidate").hexdigest()
+
+    def _l4_must_not_run(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        raise AssertionError(
+            f"pending L4 must not run for {module_path} "
+            f"({resume_execution_id}, {resume_run_id}, {device_id}, {on_execution_started})"
+        )
+
+    runner = _l4_campaign_runner(tmp_path, _l4_must_not_run)
+    pending = campaign_runner.PendingL4(
+        target_path=str(target_path),
+        candidate_relative=target_path.name,
+        candidate_sha256=submitted_digest,
+        execution_id="exec-pending",
+        device_id="3",
+        state="RUNNING",
+        execution_terminal=False,
+        attempts=({"execution_id": "exec-pending", "device_id": "3"},),
+        prior_stop_reason="final",
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert result.passed is False
+    assert result.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    assert "refusing to resume or replace it" in result.error_message
+    assert result.execution_id == "exec-pending"
+    assert result.device_id == "3"
+    assert result.candidate_sha256 == submitted_digest
+    assert updated is not None
+    assert updated.candidate_sha256 == submitted_digest
+    assert updated.prior_stop_reason == "final"
+    assert "refusing to resume or replace it" in updated.error_message
+    assert updated.attempts == pending.attempts
+    assert runner._pending_l4 == updated
 
 
 def test_campaign_terminal_l4_infrastructure_retries_fresh_whole_run(tmp_path: Path) -> None:
@@ -1681,6 +1960,7 @@ def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend1,
         beam=beam1,
         l0_checker=lambda src, _reg: _make_stage_a(src),
@@ -1723,6 +2003,7 @@ def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=fail_backend,
         tracker=fail_tracker,
         beam=beam2,
@@ -2035,6 +2316,7 @@ def test_no_round0_premature_stop_and_disable_early_goal_stop(tmp_path: Path) ->
         perf_target=strong_target,
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend_min_rounds,
         l0_checker=lambda src, _reg: _make_stage_a(src),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -2073,6 +2355,7 @@ def test_no_round0_premature_stop_and_disable_early_goal_stop(tmp_path: Path) ->
         perf_target=strong_target,
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend_full,
         l0_checker=lambda src, _reg: _make_stage_a(src),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -2168,6 +2451,7 @@ def test_surrogate_dual_criterion_tail_guard_and_meets_perf_target(tmp_path: Pat
         ),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         l0_checker=lambda src, _reg: _make_stage_a(src),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -2369,6 +2653,7 @@ def test_scoped_multi_symbol_regime_slice_extract_and_patch(tmp_path: Path) -> N
         regime_spec=split_spec,
         rule=rule,
         best_result=baseline,
+        incumbent_source=mla_src,
     )
     cre_req = runner._build_creative_regime_request(
         snippet_source=snippet,
@@ -2376,6 +2661,7 @@ def test_scoped_multi_symbol_regime_slice_extract_and_patch(tmp_path: Path) -> N
         regime_spec=split_spec,
         best_result=baseline,
         effort="high",
+        incumbent_source=mla_src,
     )
     for req in (exp_req, cre_req):
         assert "_select_mla_decode_config" in req.system_prompt
@@ -2671,6 +2957,7 @@ def test_per_regime_beam_isolation_objective_ranking_and_checkpoint(tmp_path: Pa
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         beam=TwoLaneBeamSearch(exploit_width=1, stepping_stone_width=1),
         l0_checker=lambda src, _reg: _make_stage_a(src),
@@ -2698,6 +2985,7 @@ def test_per_regime_beam_isolation_objective_ranking_and_checkpoint(tmp_path: Pa
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         l0_checker=lambda src, _reg: _make_stage_a(src),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -2757,6 +3045,7 @@ def test_campaign_axis_pruning_and_cross_topology_isolation(tmp_path: Path) -> N
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         tracker=tracker,
         l0_checker=lambda src, _reg: _make_stage_a(src),
@@ -3066,6 +3355,7 @@ def test_for_regime_and_msprof_collector_caching_wakes_r05_and_r11(tmp_path: Pat
         perf_target=PerfTargetSpec("attention_residual", 5.0, 3.0, 0.95),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         l0_checker=_l0_r05_r11,
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -3095,6 +3385,7 @@ def test_for_regime_and_msprof_collector_caching_wakes_r05_and_r11(tmp_path: Pat
         perf_target=PerfTargetSpec("attention_residual", 5.0, 3.0, 0.95),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         l0_checker=_l0_r05_r11,
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -3952,6 +4243,7 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
         perf_target=PerfTargetSpec("attention_residual", 5.0, 5.0, 0.99, target_surrogate_score=99.0),
         anchors=six_anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend_win,
         l0_checker=lambda src, _reg: _make_stage_a(src),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -3990,6 +4282,7 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
         perf_target=PerfTargetSpec("attention_residual", 5.0, 5.0, 0.99, target_surrogate_score=99.0),
         anchors=six_anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend_reg,
         l0_checker=lambda src, _reg: _make_stage_a(src),
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
@@ -4212,6 +4505,7 @@ def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
             perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
             anchors=anchors,
             regime_specs=regimes,
+            regime_blueprints=_regime_blueprints(regimes),
             llm_backend=backend,
             beam=beam,
             l0_checker=lambda src, _reg: _make_stage_a(src),
@@ -4378,8 +4672,9 @@ def test_run_l0_l1_round_filter_isolates_syntax_repair_timeout(tmp_path: Path) -
     by_id = {c.candidate_id: c for c in checks}
     assert by_id["cand_ok"].passed is True
     assert by_id["cand_timeout"].passed is False
-    assert by_id["cand_timeout"].failed_tier == "llm_transport"
+    assert by_id["cand_timeout"].failed_tier == "stage_a"
     assert "TimeoutError" in by_id["cand_timeout"].error_message
+    assert "[repair_timeout]" in by_id["cand_timeout"].error_message
     assert any("Authorized target: authorized slice symbols" in c.system_prompt for c in backend.calls)
 
     anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 2.0),)
@@ -4394,6 +4689,7 @@ def test_run_l0_l1_round_filter_isolates_syntax_repair_timeout(tmp_path: Path) -
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=_RepairTimeoutBackend(),
         tracker=tracker,
         l0_checker=lambda src, _reg: (
@@ -4410,7 +4706,10 @@ def test_run_l0_l1_round_filter_isolates_syntax_repair_timeout(tmp_path: Path) -
     )
     report = asyncio.run(runner.run())
     assert report.total_rounds == 1
-    assert any(tier == "llm_transport" for _wid, tier, _msg in report.rounds[0].l0_l1_failed)
+    assert any(
+        tier == "stage_a" and "[repair_timeout]" in msg
+        for _wid, tier, msg in report.rounds[0].l0_l1_failed
+    )
     for rid, st in tracker.posteriors.items():
         assert st.trials == before_trials[rid]
 
@@ -4613,6 +4912,7 @@ def _build_reg_a(tile_m=1):
         perf_target=PerfTargetSpec("attention_residual", 2.8, 1.5, 0.95),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints=_regime_blueprints(regimes),
         llm_backend=backend,
         tracker=tracker,
         beam=TwoLaneBeamSearch(exploit_width=1, stepping_stone_width=1),
@@ -4637,31 +4937,83 @@ def _build_reg_a(tile_m=1):
     assert kb_out.is_file()
 
     env_f = tmp_path / "env.sh"
-    env_f.write_text("TILEFOUNDRY_NPU_CANNBENCH_REPO=" + str(tmp_path) + "\n", encoding="utf-8")
+    work_root = tmp_path.parent / f"{tmp_path.name}_work"
+    work_root.mkdir()
+    env_f.write_text(
+        f"TILEFOUNDRY_NPU_CANNBENCH_REPO={tmp_path}\n"
+        f"TILEFOUNDRY_NPU_WORK_ROOT={work_root}\n",
+        encoding="utf-8",
+    )
     fake_ag = tmp_path / "agent-gates"
     fake_ag.write_text("#!/bin/sh\n", encoding="utf-8")
     monkeypatch.setenv("TILEFOUNDRY_NPU_AGENT_GATES_BIN", str(fake_ag))
+    evidence_dir = tmp_path.parent / f"{tmp_path.name}_evidence"
+    evidence_dir.mkdir()
+    monkeypatch.setattr(
+        surrogate_cannbench, "_agent_gates_workspace_name", lambda _root: "tilefoundry"
+    )
+    monkeypatch.setattr(surrogate_cannbench, "_agent_gates_evidence_root", lambda: evidence_dir)
     seen_req_files: list[str] = []
 
-    def _fake_ag_cmd(cmd, *, cwd, env, timeout_sec, **kwargs):
-        req_file = Path(env["TF_MICRO_PROBE_REQUEST"])
-        seen_req_files.append(str(req_file))
-        req_json = json.loads(req_file.read_text(encoding="utf-8"))
-        Path(req_json["response_path"]).write_text(
-            json.dumps({"passed": True, "metrics": {"baseline_dur_us": 50.0, "optimized_dur_us": 20.0, "speedup": 2.5, "numerical_ok": 1.0}}),
-            encoding="utf-8",
-        )
-        return subprocess.CompletedProcess(cmd, 0, "{}", ""), {
-            "status": "PASS",
-            "runId": "r_micro",
-        }
+    def _fake_v2_cmd(cmd, *, root, timeout_sec):
+        _ = timeout_sec
+        argv = [str(part) for part in cmd]
+        verb = argv[1]
+        if verb == "doctor":
+            body = {"status": "PASS"}
+        elif verb == "submit":
+            request_path = root / argv[argv.index("--candidate") + 1]
+            payload = json.loads(request_path.read_text(encoding="utf-8"))
+            seen_req_files.append(str(request_path))
+            bindings = {
+                item["candidate_id"]: {
+                    "module_path": item["module_path"],
+                    "sha256": item["sha256"],
+                    "post_sha256": item["sha256"],
+                }
+                for item in payload["candidates"]
+            }
+            response = {
+                "schema": surrogate_cannbench.FAST_RESPONSE_SCHEMA,
+                "request_id": payload["request_id"],
+                "request_sha256": hashlib.sha256(request_path.read_bytes()).hexdigest(),
+                "mode": payload["mode"],
+                "status": surrogate_cannbench.FAST_STATUS_OK,
+                "candidates": {"micro_probe": bindings},
+                "coverage": {
+                    "expected_candidates": 2,
+                    "evaluated_candidates": 2,
+                    "expected_msprof_targets": 0,
+                    "observed_msprof_targets": 0,
+                },
+                "micro_probe": {
+                    "probe_id": payload["probe"]["probe_id"],
+                    "metrics": {
+                        "baseline_dur_us": 50.0,
+                        "optimized_dur_us": 20.0,
+                        "speedup": 2.5,
+                        "numerical_ok": 1.0,
+                    },
+                },
+            }
+            response_path = root / payload["response_path"]
+            response_path.parent.mkdir(parents=True, exist_ok=True)
+            response_path.write_text(json.dumps(response), encoding="utf-8")
+            body = {"execution_id": "exec-micro"}
+        elif verb == "wait":
+            body = {"status": {"state": "FINISHED", "run_id": "r_micro"}}
+        elif verb == "report":
+            body = {"receiptPath": str(evidence_dir / "r_micro.receipt.json")}
+        elif verb == "verify-requirements":
+            body = {
+                "satisfied": True,
+                "current_source_identity": {"root": str(tmp_path.resolve())},
+            }
+        else:
+            raise AssertionError(f"unexpected V2 command {argv}")
+        return subprocess.CompletedProcess(argv, 0, json.dumps(body), ""), body
 
-    monkeypatch.setattr(surrogate_cannbench, "_run_agent_gates_cmd", _fake_ag_cmd)
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "verify_agent_gates_receipt",
-        lambda *_a, **_kw: (True, ""),
-    )
+    monkeypatch.setattr(surrogate_cannbench, "_run_agent_gates_v2_cmd", _fake_v2_cmd)
     probe_metrics = surrogate_cannbench.run_micro_probe_via_agent_gates(
         MicroProbeSpec(
             probe_id="p_test",
@@ -4731,6 +5083,1095 @@ def test_default_anchors_hydrate_live_metadata_from_cannbench_repo(tmp_path: Pat
     assert abs(by_case[11].t_hw_us - 22.878) < 1e-6
     assert abs(by_case[13].ref_perf_us - 39.0) < 1e-6
     assert abs(by_case[13].t_hw_us - 12.5) < 1e-6
+
+
+_TRACKB_MODULE = """
+_TU = r'''
+extern "C" __global__ __vector__ void kernel_active(__gm__ float* x) {
+  active_tail(x);
+  x[0] = 1.0f;
+}
+
+extern "C" __global__ __vector__ void kernel_sibling(__gm__ float* x) {
+  x[0] = 2.0f;
+}
+
+__attribute__((always_inline)) inline void active_tail(__gm__ float* x) {
+  x[1] = 3.0f;
+}
+'''
+
+def _select_trackb_config(D: int = 128) -> dict[str, object]:
+    return {"D": D}
+
+def _build_regime_a(tile_m: int = 1) -> int:
+    return tile_m
+"""
+
+
+def _trackb_regime_spec(*, runtime_backend: str = "hybrid_trackb") -> RegimeTargetSpec:
+    """Bind one synthetic regime to the active Track-B kernel of _TRACKB_MODULE."""
+    return RegimeTargetSpec(
+        regime_tag="reduce_tail",
+        builder_candidates=("_build_regime_a",),
+        sample_builder_kwargs={"D": 128},
+        representative_hir_dims={"D": 128},
+        config_selector_fn="_select_trackb_config",
+        editable_symbols=("_TU", "_select_trackb_config"),
+        runtime_backend=runtime_backend,
+        trackb_symbols=("_TU",),
+    )
+
+
+def _blueprint_packet(entry_name: str = "exp") -> HirBlueprintPacket:
+    """Minimal blueprint packet that satisfies per-regime campaign validation."""
+    roofline = HirRooflineSummary(
+        anchor_dims={"M": 1024, "D": 1024},
+        compute_flops=1,
+        min_gm_bytes=1,
+        arithmetic_intensity=1.0,
+        compute_floor_us=1.0,
+        memory_floor_us=1.0,
+        ideal_roofline_us=1.0,
+        dominant_bound="vector",
+    )
+    return HirBlueprintPacket(
+        entry_name=entry_name,
+        roofline=roofline,
+        z3_pipeline_summary={},
+        reference_ledger=None,
+        lowering_diagnostics=(),
+    )
+
+
+def _regime_blueprints(
+    regimes: Sequence[RegimeTargetSpec],
+) -> dict[str, HirBlueprintPacket]:
+    """Build explicit per-regime packets for campaigns that bypass HIR synthesis."""
+    return {spec.regime_tag: _blueprint_packet() for spec in regimes}
+
+
+def _trackb_campaign_runner(tmp_path: Path) -> PerfTargetCampaignRunner:
+    """Build a one-regime hybrid Track-B campaign with explicit blueprints."""
+    spec = _trackb_regime_spec()
+    module_path = tmp_path / "kernels.py"
+    module_path.write_text(_TRACKB_MODULE, encoding="utf-8")
+    return PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="attention_residual", max_rounds=1),
+        target_module_path=module_path,
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=(),
+        regime_specs=(spec,),
+        regime_blueprints={spec.regime_tag: _blueprint_packet()},
+        llm_backend=MockLLMBackend(responses={}),
+        l2_batch_evaluator=lambda cands, active_anchors: {},
+    )
+
+
+def _resolved_trackb_config(*_args: object, **_kwargs: object) -> object:
+    return campaign_runner.ResolvedRegimeConfig(
+        builder_name="_build_regime_a",
+        builder_kwargs={},
+        pass_configs={},
+        compile_flags=(),
+    )
+
+
+def _stub_hybrid_l0_gates(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    passed: bool = True,
+    elapsed_ms: float = 7.0,
+    error_message: str = "",
+) -> list[str]:
+    """Capture the instantiated Track-B TU handed to the hybrid L0 verifier."""
+    seen: list[str] = []
+
+    def _evaluate(cpp_source: str, **_kwargs: object) -> StageAResult:
+        seen.append(cpp_source)
+        return StageAResult(
+            passed=passed,
+            prim_func=None,
+            ledger=None,
+            error_message=error_message,
+            elapsed_ms=elapsed_ms,
+            backend_kind="ascendc",
+        )
+
+    def _static(dsl_source: str, **_kwargs: object) -> StageAResult:
+        return replace(_make_stage_a(dsl_source), elapsed_ms=11.0)
+
+    monkeypatch.setattr(campaign_runner, "evaluate_ascendc_candidate", _evaluate)
+    monkeypatch.setattr(campaign_runner, "run_stage_a_static", _static)
+    monkeypatch.setattr(campaign_runner, "resolve_regime_config", _resolved_trackb_config)
+    return seen
+
+
+def test_runner_resolves_instantiated_trackb_kernel_per_softmax_regime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolve each softmax regime's launched kernel from one instantiation per source."""
+    softmax_path = (
+        Path(__file__).resolve().parents[3]
+        / "examples"
+        / "ascend950pr_ops"
+        / "softmax"
+        / "kernels.py"
+    )
+    specs = CannbenchOpsRegistry.default().get_regime_specs("softmax")
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="softmax", max_rounds=1),
+        target_module_path=softmax_path,
+        perf_target=PerfTargetSpec("softmax", 3.0, 2.0, 0.90),
+        anchors=(),
+        regime_specs=specs,
+        regime_blueprints={spec.regime_tag: _blueprint_packet("softmax") for spec in specs},
+        llm_backend=MockLLMBackend(responses={}),
+        l2_batch_evaluator=lambda cands, active_anchors: {},
+    )
+    calls: list[str] = []
+    real_instantiate = runner._instantiate_trackb_tu
+
+    def _counting_instantiate(module_source: str, cpp_source: str, regime_spec: RegimeTargetSpec):
+        calls.append(regime_spec.regime_tag)
+        return real_instantiate(module_source, cpp_source, regime_spec)
+
+    monkeypatch.setattr(runner, "_instantiate_trackb_tu", _counting_instantiate)
+    expected = {
+        "reduce_tail": "softmax_last_axis_kernel",
+        "reduce_strided_twopass": "softmax_inner_2pass_kernel",
+        "reduce_strided": "softmax_inner_1pass_kernel",
+    }
+    module_source = softmax_path.read_text(encoding="utf-8")
+    for spec in specs:
+        assert runner._resolve_active_trackb_kernel(module_source, spec) == expected[spec.regime_tag]
+        assert runner._resolve_active_trackb_kernel(module_source, spec) == expected[spec.regime_tag]
+    assert len(calls) == len(specs)
+    assert len(runner._active_kernel_cache) == len(specs)
+
+
+def test_active_trackb_kernel_uses_instantiated_launch_truth() -> None:
+    """Resolve the launched kernel from the launcher stub, never from kernel-name heuristics."""
+    raw_tu = (
+        "extern \"C\" __global__ __vector__ void kernel_first(__gm__ float* x) {\n"
+        "  x[0] = 1.0f;\n"
+        "}\n"
+        "\n"
+        "extern \"C\" __global__ __vector__ void kernel_second(__gm__ float* x) {\n"
+        "  x[0] = 2.0f;\n"
+        "}\n"
+    )
+    launcher = (
+        'extern "C" int launch(void* stream) {\n'
+        "  kernel_second<<<1, nullptr, stream>>>(nullptr);\n"
+        "  return 0;\n"
+        "}\n"
+    )
+    assert (
+        _active_trackb_kernel(raw_tu + launcher, raw_tu, regime_tag="reduce_tail")
+        == "kernel_second"
+    )
+
+    sole_kernel = (
+        "extern \"C\" __global__ __vector__ void only_kernel(__gm__ float* x) {\n"
+        "  x[0] = 1.0f;\n"
+        "}\n"
+    )
+    assert (
+        _active_trackb_kernel(sole_kernel, sole_kernel, regime_tag="reduce_tail")
+        == "only_kernel"
+    )
+
+    conditional_launcher = (
+        'extern "C" int launch(void* stream, int splits) {\n'
+        "  kernel_second<<<1, nullptr, stream>>>(nullptr);\n"
+        "  if (splits > 1) {\n"
+        "    kernel_first<<<1, nullptr, stream>>>(nullptr);\n"
+        "  }\n"
+        "  return 0;\n"
+        "}\n"
+    )
+    assert (
+        _active_trackb_kernel(raw_tu + conditional_launcher, raw_tu, regime_tag="reduce_tail")
+        == "kernel_second"
+    )
+
+    ambiguous_launcher = (
+        'extern "C" int launch(void* stream) {\n'
+        "  kernel_first<<<1, nullptr, stream>>>(nullptr);\n"
+        "  kernel_second<<<1, nullptr, stream>>>(nullptr);\n"
+        "  return 0;\n"
+        "}\n"
+    )
+    with pytest.raises(ValueError, match="no unique top-level launch target"):
+        _active_trackb_kernel(raw_tu + ambiguous_launcher, raw_tu, regime_tag="reduce_tail")
+
+    with pytest.raises(ValueError, match="no launcher stub"):
+        _active_trackb_kernel(raw_tu, raw_tu, regime_tag="reduce_tail")
+
+
+def test_trackb_patch_protocol_accepts_scoped_hunks_bare_units_and_full_tu() -> None:
+    """Route Track-B replies by shape while preserving the read-only sibling kernel."""
+    spec = _trackb_regime_spec()
+    scoped = (
+        "<<<<<<< SEARCH\n"
+        "  x[0] = 1.0f;\n"
+        "=======\n"
+        "  x[0] = 4.0f;\n"
+        ">>>>>>> REPLACE\n"
+        "\n"
+        "def _select_trackb_config(D: int = 256) -> dict[str, object]:\n"
+        "    return {\"D\": D}\n"
+    )
+    scoped_patched = patch_regime_into_module(
+        _TRACKB_MODULE,
+        spec,
+        scoped,
+        active_kernel="kernel_active",
+    )
+    assert "x[0] = 4.0f;" in scoped_patched
+    assert "x[0] = 2.0f;" in scoped_patched
+    assert "kernel_sibling" in scoped_patched
+    assert "def _select_trackb_config(D: int = 256)" in scoped_patched
+
+    bare_unit = (
+        "extern \"C\" __global__ __vector__ void kernel_active(__gm__ float* x) {\n"
+        "  active_tail(x);\n"
+        "  x[0] = 9.0f;\n"
+        "}\n"
+    )
+    spliced = patch_regime_into_module(
+        _TRACKB_MODULE,
+        spec,
+        bare_unit,
+        active_kernel="kernel_active",
+    )
+    assert "x[0] = 9.0f;" in spliced
+    assert "x[0] = 2.0f;" in spliced
+    assert "x[1] = 3.0f;" in spliced
+
+    full_tu = (
+        "_TU = r'''\n"
+        "extern \"C\" __global__ __vector__ void kernel_active(__gm__ float* x) {\n"
+        "  active_tail(x);\n"
+        "  x[0] = 5.0f;\n"
+        "}\n"
+        "\n"
+        "extern \"C\" __global__ __vector__ void kernel_sibling(__gm__ float* x) {\n"
+        "  x[0] = 2.0f;\n"
+        "}\n"
+        "\n"
+        "__attribute__((always_inline)) inline void active_tail(__gm__ float* x) {\n"
+        "  x[1] = 3.0f;\n"
+        "}\n"
+        "'''\n"
+    )
+    full_patched = patch_regime_into_module(
+        _TRACKB_MODULE,
+        spec,
+        full_tu,
+        active_kernel="kernel_active",
+    )
+    assert "x[0] = 5.0f;" in full_patched
+
+    dropped_sibling = full_tu.replace(
+        "extern \"C\" __global__ __vector__ void kernel_sibling(__gm__ float* x) {\n"
+        "  x[0] = 2.0f;\n"
+        "}\n"
+        "\n",
+        "",
+    )
+    with pytest.raises(ValueError, match="drops units"):
+        patch_regime_into_module(
+            _TRACKB_MODULE,
+            spec,
+            dropped_sibling,
+            active_kernel="kernel_active",
+        )
+
+    sibling_body_edit = full_tu.replace("x[0] = 2.0f;", "x[0] = 7.0f;", 1)
+    with pytest.raises(ValueError, match="edits frozen sibling kernels"):
+        patch_regime_into_module(
+            _TRACKB_MODULE,
+            spec,
+            sibling_body_edit,
+            active_kernel="kernel_active",
+        )
+
+    sibling_emptied = full_tu.replace(
+        "extern \"C\" __global__ __vector__ void kernel_sibling(__gm__ float* x) {\n"
+        "  x[0] = 2.0f;\n"
+        "}\n",
+        "extern \"C\" __global__ __vector__ void kernel_sibling(__gm__ float* x) {\n"
+        "}\n",
+    )
+    with pytest.raises(ValueError, match="edits frozen sibling kernels"):
+        patch_regime_into_module(
+            _TRACKB_MODULE,
+            spec,
+            sibling_emptied,
+            active_kernel="kernel_active",
+        )
+
+    exclusive_helper_edit = full_tu.replace("x[1] = 3.0f;", "x[1] = 6.0f;")
+    exclusive_patched = patch_regime_into_module(
+        _TRACKB_MODULE,
+        spec,
+        exclusive_helper_edit,
+        active_kernel="kernel_active",
+    )
+    assert "x[1] = 6.0f;" in exclusive_patched
+
+    shared_module = _TRACKB_MODULE.replace(
+        "  active_tail(x);\n", "  shared_scale(x);\n"
+    ).replace(
+        "extern \"C\" __global__ __vector__ void kernel_sibling(__gm__ float* x) {\n"
+        "  x[0] = 2.0f;\n"
+        "}\n"
+        "\n"
+        "__attribute__((always_inline)) inline void active_tail(__gm__ float* x) {\n"
+        "  x[1] = 3.0f;\n"
+        "}\n",
+        "extern \"C\" __global__ __vector__ void kernel_sibling(__gm__ float* x) {\n"
+        "  shared_scale(x);\n"
+        "  x[0] = 2.0f;\n"
+        "}\n"
+        "\n"
+        "__attribute__((always_inline)) inline void shared_scale(__gm__ float* x) {\n"
+        "  x[1] = 3.0f;\n"
+        "}\n",
+    )
+    shared_full_tu = (
+        "_TU = r'''\n"
+        "extern \"C\" __global__ __vector__ void kernel_active(__gm__ float* x) {\n"
+        "  shared_scale(x);\n"
+        "  x[0] = 5.0f;\n"
+        "}\n"
+        "\n"
+        "extern \"C\" __global__ __vector__ void kernel_sibling(__gm__ float* x) {\n"
+        "  shared_scale(x);\n"
+        "  x[0] = 2.0f;\n"
+        "}\n"
+        "\n"
+        "__attribute__((always_inline)) inline void shared_scale(__gm__ float* x) {\n"
+        "  x[1] = 6.0f;\n"
+        "}\n"
+        "'''\n"
+    )
+    with pytest.raises(ValueError, match="edits frozen sibling kernels or shared helpers"):
+        patch_regime_into_module(
+            shared_module,
+            spec,
+            shared_full_tu,
+            active_kernel="kernel_active",
+        )
+
+    added_unit = full_tu.replace(
+        "}\n'''\n",
+        "}\n"
+        "\n"
+        "extern \"C\" __global__ __vector__ void kernel_extra(__gm__ float* x) {\n"
+        "  x[0] = 0.0f;\n"
+        "}\n"
+        "'''\n",
+    )
+    with pytest.raises(ValueError, match="adds units"):
+        patch_regime_into_module(
+            _TRACKB_MODULE,
+            spec,
+            added_unit,
+            active_kernel="kernel_active",
+        )
+
+    implicit_active = patch_regime_into_module(_TRACKB_MODULE, spec, full_tu)
+    assert "x[0] = 5.0f;" in implicit_active
+    with pytest.raises(ValueError, match="edits frozen sibling kernels"):
+        patch_regime_into_module(_TRACKB_MODULE, spec, sibling_body_edit)
+
+    folded = full_tu.replace(
+        "extern \"C\" __global__ __vector__ void kernel_sibling",
+        "/* [READ-ONLY SIBLING KERNEL: kernel_sibling] */\n"
+        "extern \"C\" __global__ __vector__ void kernel_sibling",
+    )
+    with pytest.raises(ValueError, match="echoes truncated context markers"):
+        patch_regime_into_module(_TRACKB_MODULE, spec, folded)
+
+    selector_only = (
+        "def _select_trackb_config(D: int = 64) -> dict[str, object]:\n"
+        "    return {\"D\": D}\n"
+    )
+    selector_patched = patch_regime_into_module(_TRACKB_MODULE, spec, selector_only)
+    assert "def _select_trackb_config(D: int = 64)" in selector_patched
+    assert "x[0] = 1.0f;" in selector_patched
+
+    sibling_edit = (
+        "<<<<<<< SEARCH\n"
+        "  x[0] = 2.0f;\n"
+        "=======\n"
+        "  x[0] = 8.0f;\n"
+        ">>>>>>> REPLACE\n"
+    )
+    with pytest.raises(ValueError, match="read-only code outside active kernel"):
+        patch_regime_into_module(
+            _TRACKB_MODULE,
+            spec,
+            sibling_edit,
+            active_kernel="kernel_active",
+        )
+
+
+def test_default_l0_hybrid_gate_returns_trackb_verdict_and_sums_elapsed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Require the hybrid Track-B L0 verdict and report combined gate latency."""
+    runner = _trackb_campaign_runner(tmp_path)
+    spec = runner._regime_specs[0]
+    monkeypatch.setattr(runner, "_resolve_combine_gate_spec", lambda *_a: None)
+    seen = _stub_hybrid_l0_gates(monkeypatch)
+    passed = runner._default_l0_checker(_TRACKB_MODULE, spec)
+    assert passed.passed is True
+    assert passed.backend_kind == "ascendc"
+    assert passed.elapsed_ms == 18.0
+    assert len(seen) == 1
+    assert "kernel_active" in seen[0]
+
+    monkeypatch.setattr(runner, "_resolve_combine_gate_spec", lambda *_a: None)
+    _stub_hybrid_l0_gates(monkeypatch, passed=False, elapsed_ms=3.0, error_message="spill")
+    failed = runner._default_l0_checker(_TRACKB_MODULE, spec)
+    assert failed.passed is False
+    assert failed.error_message == "trackb_ascendc(_TU): spill"
+    assert failed.elapsed_ms == 14.0
+
+
+def test_default_l1_hybrid_gate_compiles_trackb_and_sums_elapsed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Return the Track-B compile verdict for hybrid regimes with summed latency."""
+    runner = _trackb_campaign_runner(tmp_path)
+    spec = runner._regime_specs[0]
+    summary = BishengResourceSummary(vec_regs=77)
+    monkeypatch.setattr(campaign_runner, "resolve_regime_config", _resolved_trackb_config)
+    monkeypatch.setattr(runner, "_resolve_combine_gate_spec", lambda *_a: None)
+    monkeypatch.setattr(
+        campaign_runner,
+        "run_l1_compile_check",
+        lambda *_a, **_kw: StageBResult(passed=True, elapsed_sec=2.0),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_compile_trackb_stage_b",
+        lambda _cpp: StageBResult(passed=True, elapsed_sec=5.0, compiler_summary=summary),
+    )
+    passed = runner._run_l1(_TRACKB_MODULE, spec)
+    assert passed.passed is True
+    assert passed.compiler_summary is summary
+    assert passed.elapsed_sec == 7.0
+
+    monkeypatch.setattr(
+        runner,
+        "_compile_trackb_stage_b",
+        lambda _cpp: StageBResult(
+            passed=False,
+            error_message="bisheng: spill",
+            elapsed_sec=5.0,
+        ),
+    )
+    failed = runner._run_l1(_TRACKB_MODULE, spec)
+    assert failed.passed is False
+    assert failed.error_message == "trackb_ascendc(_TU): bisheng: spill"
+    assert failed.elapsed_sec == 7.0
+
+
+def test_detect_trackb_dead_code_edit_rejects_inactive_fallback_only() -> None:
+    """Flag candidates that only modify an inactive TileLang fallback beside Track-B code."""
+    spec = _trackb_regime_spec()
+    assert _detect_trackb_dead_code_edit(_TRACKB_MODULE, _TRACKB_MODULE, spec) is None
+
+    fallback_edit = _TRACKB_MODULE.replace("    return tile_m\n", "    return tile_m + 1\n")
+    error = _detect_trackb_dead_code_edit(_TRACKB_MODULE, fallback_edit, spec)
+    assert error is not None
+    assert error.startswith("DEAD_CODE_TRACKB_EDIT")
+    assert "_build_regime_a" in error
+
+    active_edit = _TRACKB_MODULE.replace("x[1] = 3.0f;", "x[1] = 4.0f;")
+    assert _detect_trackb_dead_code_edit(_TRACKB_MODULE, active_edit, spec) is None
+
+    selector_edit = _TRACKB_MODULE.replace('return {"D": D}', 'return {"D": D + 1}')
+    assert _detect_trackb_dead_code_edit(_TRACKB_MODULE, selector_edit, spec) is None
+
+    tilelang_spec = _trackb_regime_spec(runtime_backend="tilelang_dsl")
+    assert _detect_trackb_dead_code_edit(_TRACKB_MODULE, fallback_edit, tilelang_spec) is None
+
+
+def test_first_round_l1_summary_caches_per_source_and_regime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compile the first-round parent once per source and reuse its summary."""
+    runner = _trackb_campaign_runner(tmp_path)
+    spec = runner._regime_specs[0]
+    summary = BishengResourceSummary(vec_regs=64)
+    calls: list[str] = []
+
+    def _passing_l1(module_source: str, regime_spec: RegimeTargetSpec) -> StageBResult:
+        calls.append(regime_spec.regime_tag)
+        return StageBResult(passed=True, compiler_summary=summary)
+
+    monkeypatch.setattr(runner, "_run_l1", _passing_l1)
+    assert runner._l1_summary_for_first_round(_TRACKB_MODULE, spec) is summary
+    assert runner._l1_summary_for_first_round(_TRACKB_MODULE, spec) is summary
+    assert runner._l1_summary_for_first_round(_TRACKB_MODULE + "\n_PAD = 1\n", spec) is summary
+    assert len(calls) == 2
+
+    runner._l1_summary_cache.clear()
+    failed_calls: list[str] = []
+
+    def _failing_l1(module_source: str, regime_spec: RegimeTargetSpec) -> StageBResult:
+        failed_calls.append(regime_spec.regime_tag)
+        return StageBResult(passed=False, error_message="bisheng unavailable")
+
+    monkeypatch.setattr(runner, "_run_l1", _failing_l1)
+    assert runner._l1_summary_for_first_round(_TRACKB_MODULE, spec) is None
+    assert runner._l1_summary_for_first_round(_TRACKB_MODULE, spec) is None
+    assert len(failed_calls) == 1
+
+
+def test_case_ratio_predicate_entries_are_collision_free() -> None:
+    """Expose representative case physics as case_-prefixed predicate keys."""
+    ratios = CasePhysicsRatios(
+        case_id=7,
+        stride_ratio=1.0,
+        contig_atom_ratio=0.5,
+        is_atom_aligned=False,
+        working_set_sram_ratio=0.75,
+        working_set_vreg_ratio=0.25,
+        wave_occupancy_ratio=0.5,
+        oi_ridge_ratio=2.0,
+        inner_contiguous_bytes=256,
+        has_empty_group=False,
+    )
+    entries = _case_ratio_predicate_entries(ratios)
+    assert set(entries) == {
+        "case_id",
+        "case_stride_ratio",
+        "case_contig_atom_ratio",
+        "case_is_atom_aligned",
+        "case_working_set_sram_ratio",
+        "case_working_set_vreg_ratio",
+        "case_wave_occupancy_ratio",
+        "case_oi_ridge_ratio",
+        "case_inner_contiguous_bytes",
+        "case_has_empty_group",
+    }
+    assert entries["case_stride_ratio"] == 1.0
+    assert entries["case_is_atom_aligned"] is False
+    assert _case_ratio_predicate_entries(None) == {}
+
+    ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=80,
+        pipe_cycles={},
+        waterlines={},
+    )
+    context = build_predicate_context(ledger, extra=entries)
+    assert context["case_id"] == 7
+    assert context["case_inner_contiguous_bytes"] == 256
+    assert context["case_wave_occupancy_ratio"] == 0.5
+
+
+def test_runner_requires_complete_regime_blueprints_and_normalizes_topology_axes(
+    tmp_path: Path,
+) -> None:
+    """Reject partial blueprint maps and accept mapping-form topology axes."""
+    spec = _trackb_regime_spec()
+    packet = _blueprint_packet()
+
+    def _build(**kwargs: object) -> PerfTargetCampaignRunner:
+        return PerfTargetCampaignRunner(
+            config=CampaignConfig(operator_name="attention_residual", max_rounds=1),
+            target_module_path=tmp_path / "missing_kernels.py",
+            perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+            anchors=(),
+            regime_specs=(spec,),
+            llm_backend=MockLLMBackend(responses={}),
+            l2_batch_evaluator=lambda cands, active_anchors: {},
+            **kwargs,
+        )
+
+    with pytest.raises(ValueError, match="missing regime tags"):
+        _build(regime_blueprints={})
+    runner = _build(
+        regime_blueprints={spec.regime_tag: packet},
+        topology_axes={
+            "compute_engine": "aiv_only",
+            "memory_ring": "gm_ub_stream",
+            "iteration_regularity": "affine_simd",
+        },
+    )
+    assert runner._regime_blueprints == {spec.regime_tag: packet}
+    assert runner._topology_axes == TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
+
+
+def test_runner_falls_back_to_in_repo_benchmarks_tasks_root(tmp_path: Path) -> None:
+    """Resolve flat in-repo benchmark fixtures when no cann-bench checkout is configured."""
+    regimes = DEFAULT_REGIME_SPECS["attention_residual"]
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="attention_residual", max_rounds=1),
+        target_module_path=tmp_path / "missing_kernels.py",
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=(),
+        regime_specs=regimes,
+        llm_backend=MockLLMBackend(responses={}),
+        l2_batch_evaluator=lambda cands, active_anchors: {},
+    )
+    tasks_root = runner._resolve_cannbench_tasks_root()
+    assert tasks_root is not None
+    assert tasks_root.as_posix().endswith("tests/ascend/benchmarks")
+    assert set(runner._regime_blueprints) == {spec.regime_tag for spec in regimes}
+
+
+def test_round_failure_truncation_preserves_full_diagnostics_in_candidates(
+    tmp_path: Path,
+) -> None:
+    """Truncate round failure summaries while persisting the untruncated artifact diagnostics."""
+    target_path = tmp_path / "kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    checkpoint_path = tmp_path / "checkpoint.json"
+    long_error = "L0SIM:" + "x" * 3000
+
+    def _incumbent_passes_candidates_fail(
+        source: str,
+        _regime: RegimeTargetSpec,
+    ) -> StageAResult:
+        if source == _MULTI_REGIME_MODULE:
+            return _make_stage_a(source)
+        return StageAResult(
+            passed=False,
+            prim_func=None,
+            ledger=None,
+            error_message=long_error,
+        )
+
+    runner = _single_round_promotion_runner(
+        tmp_path,
+        target_path=target_path,
+        checkpoint_path=checkpoint_path,
+        l3_runner=lambda _p: L3AcceptanceResult(passed=True),
+        max_syntax_repairs=0,
+        l0_checker=_incumbent_passes_candidates_fail,
+    )
+    report = asyncio.run(runner.run())
+    failures = report.rounds[0].l0_l1_failed
+    stage_a_messages = [msg for _cid, tier, msg in failures if tier == "stage_a"]
+    assert stage_a_messages
+    assert all(len(msg) <= 1500 for _cid, _tier, msg in failures)
+    assert all(msg == long_error[:1500] for msg in stage_a_messages)
+
+    artifact_dir = checkpoint_path.parent / "candidates"
+    round_idx = report.rounds[0].round_idx
+    py_files = sorted(artifact_dir.glob(f"r{round_idx}_*.py"))
+    diag_files = sorted(artifact_dir.glob(f"r{round_idx}_*.diag.txt"))
+    assert py_files
+    assert len(py_files) == len(diag_files)
+    assert all("T.Kernel(2)" in path.read_text(encoding="utf-8") for path in py_files)
+    diags = [path.read_text(encoding="utf-8") for path in diag_files]
+    assert all(long_error in diag for diag in diags)
+    assert all("failed_tier: stage_a" in diag for diag in diags)
+
+
+def _l4_campaign_runner(
+    tmp_path: Path,
+    l4_runner,
+    *,
+    device_id: str = "3",
+    retries: int = 2,
+) -> PerfTargetCampaignRunner:
+    """Build a campaign whose only configured device is *device_id*."""
+    spec = _trackb_regime_spec()
+    return PerfTargetCampaignRunner(
+        config=CampaignConfig(
+            operator_name="attention_residual",
+            max_rounds=1,
+            device_id=device_id,
+            l4_blocked_env_max_retries=retries,
+            l4_retry_backoff_sec=0.0,
+        ),
+        target_module_path=tmp_path / "missing_kernels.py",
+        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        anchors=(),
+        regime_specs=(spec,),
+        regime_blueprints={spec.regime_tag: _blueprint_packet()},
+        llm_backend=MockLLMBackend(responses={}),
+        l2_batch_evaluator=lambda cands, active_anchors: {},
+        l4_cannbench_runner=l4_runner,
+        checkpoint_path=tmp_path / "checkpoint.json",
+    )
+
+
+def _blocked_env_l4(device_id: str) -> L4CannbenchResult:
+    return L4CannbenchResult(
+        passed=False,
+        failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+        error_message="blocked_env: msprof lock held by external process",
+        device_id=device_id,
+        state="BLOCKED",
+        execution_id="exec-blocked",
+    )
+
+
+def test_final_l4_retries_blocked_env_on_same_device_until_pass(tmp_path: Path) -> None:
+    """Retry a blocked_env L4 on the configured card and clear pending on success."""
+    calls: list[str] = []
+    outcomes = iter(
+        [
+            _blocked_env_l4("3"),
+            _blocked_env_l4("3"),
+            L4CannbenchResult(passed=True, device_id="3", execution_id="exec-ok"),
+        ]
+    )
+
+    def _fake_l4(module_path: Path, *, device_id: str = "") -> L4CannbenchResult:
+        calls.append(device_id)
+        return next(outcomes)
+
+    runner = _l4_campaign_runner(tmp_path, _fake_l4)
+    result = runner._run_final_l4_tracked(
+        incumbent_source="candidate",
+        prior_stop_reason="final",
+    )
+    assert result.passed is True
+    assert calls == ["3", "3", "3"]
+    assert runner._pending_l4 is None
+    payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    assert payload["pending_l4"] is None
+
+
+def test_final_l4_bounds_blocked_env_retries_and_persists_attempts(tmp_path: Path) -> None:
+    """Stop after the configured blocked_env retries and persist every attempt."""
+    calls: list[str] = []
+
+    def _fake_l4(module_path: Path, *, device_id: str = "") -> L4CannbenchResult:
+        calls.append(device_id)
+        return _blocked_env_l4(device_id)
+
+    runner = _l4_campaign_runner(tmp_path, _fake_l4)
+    result = runner._run_final_l4_tracked(
+        incumbent_source="candidate",
+        prior_stop_reason="final",
+    )
+    assert result.passed is False
+    assert calls == ["3", "3", "3"]
+    pending = runner._pending_l4
+    assert pending is not None
+    assert len(pending.attempts) == 3
+    assert {attempt["device_id"] for attempt in pending.attempts} == {"3"}
+    assert {attempt["execution_id"] for attempt in pending.attempts} == {"exec-blocked"}
+    assert {attempt["state"] for attempt in pending.attempts} == {"BLOCKED"}
+    assert {attempt["execution_terminal"] for attempt in pending.attempts} == {"true"}
+    assert {attempt["failure_kind"] for attempt in pending.attempts} == {
+        surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    }
+    assert pending.same_card_retries_used == 2
+    assert pending.same_card_retry_limit == 2
+    payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    assert len(payload["pending_l4"]["attempts"]) == 3
+    assert all(attempt["device_id"] == "3" for attempt in payload["pending_l4"]["attempts"])
+    assert payload["pending_l4"]["same_card_retries_used"] == 2
+    assert payload["pending_l4"]["same_card_retry_limit"] == 2
+
+
+def test_final_l4_candidate_failure_is_not_retried_as_blocked_env(tmp_path: Path) -> None:
+    """Treat candidate failures as terminal even when their text mentions blocked_env."""
+    calls: list[str] = []
+
+    def _fake_l4(module_path: Path, *, device_id: str = "") -> L4CannbenchResult:
+        calls.append(device_id)
+        return L4CannbenchResult(
+            passed=False,
+            failure_kind=surrogate_cannbench.FAILURE_KIND_CANDIDATE,
+            error_message="blocked_env candidate numeric mismatch",
+            device_id=device_id,
+            state="BLOCKED",
+        )
+
+    runner = _l4_campaign_runner(tmp_path, _fake_l4)
+    result = runner._run_final_l4_tracked(
+        incumbent_source="candidate",
+        prior_stop_reason="final",
+    )
+    assert result.passed is False
+    assert calls == ["3"]
+    assert runner._pending_l4 is None
+    payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    assert payload["pending_l4"] is None
+
+
+def _pending_l4_checkpoint(
+    target_path: Path,
+    *,
+    digest: str,
+    same_card_retries_used: int,
+    same_card_retry_limit: int,
+    execution_id: str = "",
+    run_id: str = "",
+    state: str = "",
+    execution_terminal: bool = True,
+    failure_kind: str = surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+    error_message: str = "blocked_env: msprof lock held by external process",
+) -> campaign_runner.PendingL4:
+    """Build one resumable pending-L4 record whose candidate digest matches disk."""
+    return campaign_runner.PendingL4(
+        target_path=str(target_path),
+        candidate_relative=target_path.name,
+        candidate_sha256=digest,
+        execution_id=execution_id,
+        run_id=run_id,
+        device_id="3",
+        state=state,
+        error_message=error_message,
+        failure_kind=failure_kind,
+        execution_terminal=execution_terminal,
+        same_card_retries_used=same_card_retries_used,
+        same_card_retry_limit=same_card_retry_limit,
+        prior_stop_reason="final",
+    )
+
+
+def test_pending_l4_resume_counts_in_flight_attempt_against_same_card_quota(
+    tmp_path: Path,
+) -> None:
+    """Resume a live execution by id, then spend only the remaining same-card budget."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+    calls: list[tuple[str, str, str]] = []
+
+    def _l4(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        assert module_path == target_path
+        calls.append((resume_execution_id, resume_run_id, device_id))
+        assert on_execution_started is not None
+        on_execution_started(resume_execution_id or "exec-fresh", device_id)
+        return _blocked_env_l4(device_id)
+
+    runner = _l4_campaign_runner(tmp_path, _l4)
+    pending = _pending_l4_checkpoint(
+        target_path,
+        digest=digest,
+        same_card_retries_used=1,
+        same_card_retry_limit=2,
+        execution_id="exec-live",
+        state="RUNNING",
+        execution_terminal=False,
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert calls == [("exec-live", "", "3"), ("", "", "3")]
+    assert result.passed is False
+    assert updated is not None
+    assert updated.same_card_retries_used == 2
+    assert updated.same_card_retry_limit == 2
+    assert len(updated.attempts) == 2
+    assert runner._pending_l4 == updated
+
+
+def test_pending_l4_resume_at_quota_limit_only_polls_same_execution(
+    tmp_path: Path,
+) -> None:
+    """A crash after the last retry intent resumes that execution and submits nothing new."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+    calls: list[tuple[str, str, str]] = []
+
+    def _l4(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        assert module_path == target_path
+        calls.append((resume_execution_id, resume_run_id, device_id))
+        assert on_execution_started is not None
+        on_execution_started(resume_execution_id, device_id)
+        return _blocked_env_l4(device_id)
+
+    runner = _l4_campaign_runner(tmp_path, _l4)
+    pending = _pending_l4_checkpoint(
+        target_path,
+        digest=digest,
+        same_card_retries_used=2,
+        same_card_retry_limit=2,
+        execution_id="exec-backoff",
+        state="SUBMITTED",
+        execution_terminal=False,
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert calls == [("exec-backoff", "", "3")]
+    assert result.passed is False
+    assert updated is not None
+    assert updated.same_card_retries_used == 2
+    assert updated.same_card_retry_limit == 2
+    assert len(updated.attempts) == 1
+    assert runner._pending_l4 == updated
+
+
+def test_pending_l4_interrupted_submission_resubmits_without_double_counting(
+    tmp_path: Path,
+) -> None:
+    """A crashed submit intent is resubmitted once and its quota counted only once."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+    calls: list[str] = []
+
+    def _l4(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        assert module_path == target_path
+        assert (resume_execution_id, resume_run_id) == ("", "")
+        calls.append(device_id)
+        assert on_execution_started is not None
+        on_execution_started("exec-resubmit", device_id)
+        return _blocked_env_l4(device_id)
+
+    runner = _l4_campaign_runner(tmp_path, _l4)
+    pending = _pending_l4_checkpoint(
+        target_path,
+        digest=digest,
+        same_card_retries_used=1,
+        same_card_retry_limit=2,
+        state="SUBMITTED",
+        execution_terminal=False,
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert calls == ["3", "3"]
+    assert result.passed is False
+    assert updated is not None
+    assert updated.same_card_retries_used == 2
+    assert len(updated.attempts) == 2
+
+
+def test_pending_l4_exhausted_quota_does_not_resubmit(tmp_path: Path) -> None:
+    """A blocked_env pending with no remaining same-card budget stays put."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+
+    def _l4_must_not_run(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        raise AssertionError(
+            f"exhausted pending L4 must not run for {module_path} "
+            f"({resume_execution_id}, {resume_run_id}, {device_id}, {on_execution_started})"
+        )
+
+    runner = _l4_campaign_runner(tmp_path, _l4_must_not_run)
+    pending = _pending_l4_checkpoint(
+        target_path,
+        digest=digest,
+        same_card_retries_used=2,
+        same_card_retry_limit=2,
+        state="BLOCKED",
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert result.passed is False
+    assert "blocked_env" in result.error_message
+    assert updated is not None
+    assert updated.same_card_retries_used == 2
+    assert updated.same_card_retry_limit == 2
+    assert updated.attempts == pending.attempts
+    assert runner._pending_l4 == updated
+
+
+def test_pending_l4_non_blocked_env_resume_does_not_spend_same_card_quota(
+    tmp_path: Path,
+) -> None:
+    """A terminal non-blocked infrastructure fault is re-read, never resubmitted."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+    calls: list[tuple[str, str, str]] = []
+
+    def _l4(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        assert module_path == target_path
+        calls.append((resume_execution_id, resume_run_id, device_id))
+        assert on_execution_started is not None
+        on_execution_started(resume_execution_id, device_id)
+        return L4CannbenchResult(
+            passed=False,
+            failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+            error_message="device lost",
+            execution_id=resume_execution_id,
+            run_id=resume_run_id,
+            device_id=device_id,
+            state="INTERRUPTED",
+            execution_terminal=True,
+        )
+
+    runner = _l4_campaign_runner(tmp_path, _l4)
+    pending = _pending_l4_checkpoint(
+        target_path,
+        digest=digest,
+        same_card_retries_used=0,
+        same_card_retry_limit=2,
+        execution_id="exec-x",
+        run_id="run-x",
+        state="FINISHED",
+        error_message="device lost",
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert calls == [("exec-x", "run-x", "3")]
+    assert result.passed is False
+    assert result.error_message == "device lost"
+    assert updated is not None
+    assert updated.same_card_retries_used == 0
+    assert updated.same_card_retry_limit == 2
+    assert len(updated.attempts) == 1
+    assert runner._pending_l4 == updated
 
 
 
