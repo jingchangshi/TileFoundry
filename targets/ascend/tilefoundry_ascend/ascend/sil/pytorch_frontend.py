@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -71,6 +71,17 @@ _REDUCTION_CALL_NAMES = frozenset(
         "var",
     }
 )
+_SHAPE_PRESERVING_CALL_NAMES = frozenset(
+    {
+        "cumprod",
+        "cumsum",
+        "group_norm",
+        "layer_norm",
+        "log_softmax",
+        "rms_norm",
+        "softmax",
+    }
+)
 _EXP_CALL_NAMES = frozenset({"exp", "exp2", "expm1"})
 _MAX_CALL_NAMES = frozenset(
     {"amax", "clamp", "clamp_", "log_softmax", "max", "maximum", "min", "minimum", "softmax"}
@@ -124,6 +135,25 @@ _DIM_KEYWORDS = frozenset({"dim", "axis"})
 _TRANSCENDENTAL_OP_EQUIV = 8
 TrafficBasis = Literal["provable_lower_bound", "estimated"]
 ComputeBasis = Literal["exact_work_count", "estimated"]
+_ProvenanceFlag = Literal["input", "reduction"]
+_PROVENANCE_INPUT: _ProvenanceFlag = "input"
+_PROVENANCE_REDUCTION: _ProvenanceFlag = "reduction"
+_SHAPE_TRANSPARENT_METHODS = frozenset(
+    {
+        "bfloat16",
+        "clone",
+        "contiguous",
+        "cpu",
+        "cuda",
+        "detach",
+        "double",
+        "float",
+        "half",
+        "npu",
+        "to",
+        "type",
+    }
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -139,6 +169,7 @@ class PyTorchOpSemantics:
     has_subbyte_or_block_quant: bool
     has_recurrent_loop: bool
     mutates_inputs: bool
+    preserves_input_shape: bool = False
 
     def __post_init__(self) -> None:
         if not self.entry_name.strip():
@@ -270,6 +301,7 @@ def _call_leaf_name(func: ast.expr) -> str | None:
 
 
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
+_CallResolver = Callable[[str, _FunctionNode], _FunctionNode | None]
 
 
 def _entry_parameters(entry: _FunctionNode) -> frozenset[str]:
@@ -411,6 +443,249 @@ def _detect_input_mutation(
                 if target.value.id in input_names:
                     return True
     return False
+
+
+def _has_keepdim_true(node: ast.Call) -> bool:
+    for keyword in node.keywords:
+        if keyword.arg == "keepdim":
+            return isinstance(keyword.value, ast.Constant) and keyword.value.value is True
+    return False
+
+
+def _expression_provenance(
+    node: ast.expr | ast.keyword,
+    assignments: Mapping[str, frozenset[_ProvenanceFlag]],
+) -> frozenset[_ProvenanceFlag]:
+    """Propagate entry-input and keepdim-reduction provenance through one expression."""
+    if isinstance(node, ast.keyword):
+        return _expression_provenance(node.value, assignments)
+    if isinstance(node, ast.Name):
+        return assignments.get(node.id, frozenset())
+    if isinstance(node, ast.Call):
+        leaf = _call_leaf_name(node.func)
+        if leaf in _REDUCTION_CALL_NAMES and _has_keepdim_true(node):
+            return frozenset({_PROVENANCE_REDUCTION})
+    if isinstance(node, ast.Lambda):
+        return frozenset()
+    flags: set[_ProvenanceFlag] = set()
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.expr, ast.keyword)):
+            flags |= _expression_provenance(child, assignments)
+    return frozenset(flags)
+
+
+def _returned_expressions(function: _FunctionNode) -> tuple[ast.expr, ...]:
+    """Return the value expressions of every executed return statement in *function*."""
+    return tuple(
+        node.value
+        for node in _walk_executed_nodes(function)
+        if isinstance(node, ast.Return) and node.value is not None
+    )
+
+
+def _assignment_target_names(target: ast.expr) -> frozenset[str]:
+    """Collect the local names one assignment target binds or writes."""
+    if isinstance(target, ast.Name):
+        return frozenset({target.id})
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for element in target.elts:
+            names |= _assignment_target_names(element)
+        return frozenset(names)
+    if isinstance(target, (ast.Subscript, ast.Attribute)) and isinstance(target.value, ast.Name):
+        return frozenset({target.value.id})
+    return frozenset()
+
+
+def _function_assignments(function: _FunctionNode) -> dict[str, tuple[ast.expr, ...]]:
+    """Map every locally assigned name to the values written to it."""
+    definitions: dict[str, list[ast.expr]] = {}
+    for node in _walk_executed_nodes(function):
+        targets: Sequence[ast.expr]
+        value: ast.expr
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.value is not None:
+            targets = (node.target,)
+            value = node.value
+        else:
+            continue
+        for target in targets:
+            for name in _assignment_target_names(target):
+                definitions.setdefault(name, []).append(value)
+    return {name: tuple(values) for name, values in definitions.items()}
+
+
+def _shape_transparent_base(node: ast.expr) -> ast.expr:
+    """Peel dtype and storage-view methods that never change tensor shape."""
+    current = node
+    while isinstance(current, ast.Call) and isinstance(current.func, ast.Attribute):
+        if current.func.attr not in _SHAPE_TRANSPARENT_METHODS:
+            break
+        current = current.func.value
+    return current
+
+
+def _resolved_return_head(
+    node: ast.expr,
+    definitions: Mapping[str, tuple[ast.expr, ...]],
+    seen: set[str],
+) -> ast.expr:
+    """Resolve single-assignment names on the return path down to the defining expression."""
+    current = _shape_transparent_base(node)
+    while isinstance(current, ast.Name):
+        values = definitions.get(current.id, ())
+        if len(values) != 1 or current.id in seen:
+            break
+        seen.add(current.id)
+        current = _shape_transparent_base(values[0])
+    return current
+
+
+def _return_value_is_shape_reduced(
+    node: ast.expr,
+    definitions: Mapping[str, tuple[ast.expr, ...]],
+    seen: set[str],
+) -> bool:
+    """Return True when evaluating *node* ends in a non-keepdim reduction."""
+    if isinstance(node, (ast.Tuple, ast.List)):
+        elements = tuple(
+            element for element in node.elts if not isinstance(element, ast.Starred)
+        )
+        return bool(elements) and all(
+            _return_value_is_shape_reduced(element, definitions, set(seen))
+            for element in elements
+        )
+    head = _resolved_return_head(node, definitions, set(seen))
+    if isinstance(head, ast.BinOp):
+        return _return_value_is_shape_reduced(
+            head.left, definitions, set(seen)
+        ) or _return_value_is_shape_reduced(head.right, definitions, set(seen))
+    if not isinstance(head, ast.Call):
+        return False
+    leaf = _call_leaf_name(head.func)
+    if (
+        leaf in _REDUCTION_CALL_NAMES
+        and leaf not in _SHAPE_PRESERVING_CALL_NAMES
+        and not _has_keepdim_true(head)
+    ):
+        return True
+    children: list[ast.expr] = [
+        *head.args,
+        *(keyword.value for keyword in head.keywords),
+    ]
+    if isinstance(head.func, ast.Attribute):
+        children.append(head.func.value)
+    return any(
+        _return_value_is_shape_reduced(child, definitions, set(seen))
+        for child in children
+    )
+
+
+def _return_path_groups(
+    function: _FunctionNode,
+    resolve: _CallResolver,
+    seen_functions: set[int],
+) -> dict[int, tuple[_FunctionNode, list[ast.AST]]]:
+    """Collect return-path AST nodes per function, following local helper calls."""
+    groups: dict[int, tuple[_FunctionNode, list[ast.AST]]] = {}
+    if id(function) in seen_functions:
+        return groups
+    seen_functions.add(id(function))
+    definitions = _function_assignments(function)
+    expanded: set[str] = set()
+    nodes: list[ast.AST] = []
+    pending: list[ast.expr] = list(_returned_expressions(function))
+    while pending:
+        expression = pending.pop()
+        for node in ast.walk(expression):
+            nodes.append(node)
+            if (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id not in expanded
+            ):
+                expanded.add(node.id)
+                pending.extend(definitions.get(node.id, ()))
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                target = resolve(node.func.id, function)
+                if target is not None:
+                    for key, value in _return_path_groups(
+                        target, resolve, seen_functions
+                    ).items():
+                        groups[key] = value
+    groups[id(function)] = (function, nodes)
+    return groups
+
+
+def _closure_has_keepdim_broadcast(
+    function: _FunctionNode,
+    nodes: Sequence[ast.AST],
+) -> bool:
+    """Detect input-shaped data combined with a keepdim reduction of input data."""
+    definitions = _function_assignments(function)
+    assignments: dict[str, frozenset[_ProvenanceFlag]] = {
+        name: frozenset({_PROVENANCE_INPUT})
+        for name in _entry_parameters(function)
+    }
+    changed = True
+    while changed:
+        changed = False
+        for name, values in definitions.items():
+            flags: frozenset[_ProvenanceFlag] = frozenset()
+            for value in values:
+                flags |= _expression_provenance(value, assignments)
+            current = assignments.get(name, frozenset())
+            merged = current | flags
+            if merged != current:
+                assignments[name] = merged
+                changed = True
+    for node in nodes:
+        if not isinstance(node, ast.BinOp):
+            continue
+        left = _expression_provenance(node.left, assignments)
+        right = _expression_provenance(node.right, assignments)
+        if _PROVENANCE_INPUT in left and _PROVENANCE_REDUCTION in right:
+            return True
+        if _PROVENANCE_REDUCTION in left and _PROVENANCE_INPUT in right:
+            return True
+    return False
+
+
+def _detect_return_shape_preservation(
+    entry: _FunctionNode,
+    resolve: _CallResolver,
+) -> bool:
+    """Decide shape preservation from the values the entry function actually returns."""
+    groups = tuple(_return_path_groups(entry, resolve, set()).values())
+    returns = _returned_expressions(entry)
+    definitions = _function_assignments(entry)
+    if not returns or all(
+        _return_value_is_shape_reduced(value, definitions, set()) for value in returns
+    ):
+        return False
+    node_groups = tuple(group[1] for group in groups)
+    for nodes in node_groups:
+        for node in nodes:
+            if (
+                isinstance(node, ast.Call)
+                and _call_leaf_name(node.func) in _SHAPE_PRESERVING_CALL_NAMES
+            ):
+                return True
+    reductions_keepdim = all(
+        _has_keepdim_true(node)
+        for nodes in node_groups
+        for node in nodes
+        if isinstance(node, ast.Call)
+        and _call_leaf_name(node.func) in _REDUCTION_CALL_NAMES
+        and _call_leaf_name(node.func) not in _SHAPE_PRESERVING_CALL_NAMES
+    )
+    if not reductions_keepdim:
+        return False
+    return any(
+        _closure_has_keepdim_broadcast(function, nodes) for function, nodes in groups
+    )
 
 
 def _constant_int(node: ast.expr) -> int | None:
@@ -634,6 +909,11 @@ class PyTorchSemanticAnalyzer:
         has_online_normalization = bool(call_names & {"log_softmax", "softmax"})
         has_exp = bool(call_names & _EXP_CALL_NAMES) or has_online_normalization
         has_max = bool(call_names & _MAX_CALL_NAMES)
+
+        def resolve_call(name: str, scope: _FunctionNode) -> _FunctionNode | None:
+            return _resolve_function(name, scope, top_level, parents, nested)
+
+        preserves_input_shape = _detect_return_shape_preservation(entry, resolve_call)
         return PyTorchOpSemantics(
             entry_name=entry_name,
             has_matmul=has_matmult or bool(call_names & _MATMUL_CALL_NAMES),
@@ -644,6 +924,7 @@ class PyTorchSemanticAnalyzer:
             has_subbyte_or_block_quant=_has_quant_evidence(nodes, call_names),
             has_recurrent_loop=has_loop,
             mutates_inputs=_detect_input_mutation(nodes, _entry_parameters(entry)),
+            preserves_input_shape=preserves_input_shape,
         )
 
     def compute_case_ratios(
@@ -1014,6 +1295,48 @@ def _matmul_work(
     )
 
 
+def _reduction_extent(
+    reduction_axes: Sequence[int],
+    dims: Mapping[str, int],
+    representative_case: RepresentativeCase | None,
+) -> int | None:
+    """Return the product of reduced-axis extents, or None for a full-tensor reduction."""
+    if not reduction_axes:
+        return None
+    if representative_case is not None:
+        for shape in representative_case.input_shapes:
+            normalized: list[int] = []
+            valid = True
+            for axis in reduction_axes:
+                index = axis + len(shape) if axis < 0 else axis
+                if index < 0 or index >= len(shape):
+                    valid = False
+                    break
+                normalized.append(index)
+            if not valid:
+                continue
+            extent = math.prod(shape[index] for index in sorted(set(normalized)))
+            if extent > 0:
+                return extent
+    return _positive_dim(dims, ("d_dim", "D", "cols", "inner"))
+
+
+def _stream_output_elements(
+    semantics: PyTorchOpSemantics,
+    elements: int,
+    kind: CasePhysicsKind,
+    dims: Mapping[str, int],
+    representative_case: RepresentativeCase | None,
+) -> int:
+    """Price the result tensor written back by a stream or reduction work model."""
+    if kind != "reduction" or semantics.preserves_input_shape:
+        return elements
+    extent = _reduction_extent(semantics.reduction_axes, dims, representative_case)
+    if extent is None:
+        return 1
+    return max(1, elements // extent)
+
+
 def _stream_work(
     semantics: PyTorchOpSemantics,
     dims: Mapping[str, int],
@@ -1040,23 +1363,23 @@ def _stream_work(
     ops_per_element = 3 if kind == "reduction" else 1
     special_ops = elements if semantics.has_online_exp_max else 0
     vector_flops = ops_per_element * elements + special_ops * _TRANSCENDENTAL_OP_EQUIV
+    output_elements = _stream_output_elements(
+        semantics, elements, kind, dims, representative_case
+    )
     if representative_case is None:
-        legacy_factor = 1 if kind == "reduction" else 2
         charges = [
             _TrafficCharge(
-                element_count=elements * legacy_factor,
+                element_count=elements + output_elements,
                 element_bytes=dtype_bytes,
                 dtype_declared=False,
             )
         ]
-    elif kind == "reduction":
-        charges = _declared_input_charges(representative_case, dtype_bytes)
     else:
         charges = _declared_input_charges(representative_case, dtype_bytes)
         charges.append(
             _declared_output_charge(
                 representative_case,
-                element_count=elements,
+                element_count=output_elements,
                 fallback_dtype_bytes=dtype_bytes,
             )
         )

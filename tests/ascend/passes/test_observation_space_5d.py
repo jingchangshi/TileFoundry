@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from tilefoundry_ascend.agent.kb.schema import build_predicate_context
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     evaluate_ascendc_candidate,
     run_stage_a_static,
@@ -111,6 +112,16 @@ def _rich_telemetry() -> dict[str, object]:
         "sync_stall_ratio": 0.22,
         "pseudo_double_buffer_serialized": True,
     }
+
+
+def _quiet_ledger() -> ObjectivePhysicalLedger:
+    return build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 10},
+        waterlines={},
+    )
 
 
 def test_from_tiers_aligns_all_three_telemetry_tiers() -> None:
@@ -253,6 +264,121 @@ def test_compute_axis_residuals_uses_same_coaxial_thresholds() -> None:
         "pipeline_sync_gap": 0.6,
         "grid_wave_gap": 0.2,
     }
+
+
+def test_grid_wave_gap_charges_tail_wave_of_multi_wave_grids() -> None:
+    """A partially filled final wave wastes occupancy even when the grid spans whole waves."""
+
+    def gap(wave_occupancy: float) -> float:
+        ledger = build_objective_physical_ledger(
+            analysis_mode="exact_modulo_z3",
+            is_legal=True,
+            steady_state_ii=2,
+            pipe_cycles={"AIC.PIPE_M": 10},
+            waterlines={},
+            wave_occupancy=wave_occupancy,
+        )
+        return ledger.to_observation_5d().compute_axis_residuals().grid_wave_gap
+
+    assert gap(1.07) == pytest.approx(0.465)
+    assert gap(2.0) == 0.0
+    assert gap(1.5) == pytest.approx(0.25)
+    assert gap(0.8) == pytest.approx(0.2)
+    assert gap(0.0) == 0.0
+
+
+def test_compute_issue_gap_activates_for_compute_limited_low_roofline_eta() -> None:
+    """Compute-bound kernels with poor Roofline efficiency expose the compute gap."""
+    ledger = _quiet_ledger()
+
+    def gap(telemetry: dict[str, object]) -> float:
+        observation = ledger.to_observation_5d(telemetry=telemetry)
+        return observation.compute_axis_residuals().compute_issue_gap
+
+    assert gap({"aic_mac_ratio": 0.8, "aiv_vec_ratio": 0.1, "roofline_eta": 0.4}) == (
+        pytest.approx(0.6)
+    )
+    assert gap({"aic_mac_ratio": 0.1, "aiv_vec_ratio": 0.1, "roofline_eta": 0.4}) == 0.0
+    assert gap({"aic_mac_ratio": 0.8, "aiv_vec_ratio": 0.1, "roofline_eta": 0.7}) == 0.0
+    assert gap({"aic_mac_ratio": 0.8, "aiv_vec_ratio": 0.1, "roofline_eta": 0.0}) == 0.0
+
+
+def test_registry_merges_dominant_bound_and_overflow_fallback_when_5d_is_quiet() -> None:
+    """A quiet 5D residual still merges dominant-bound and overflow fallback facets."""
+    quiet = compute_static_dynamic_residual(_quiet_ledger(), {})
+    assert quiet.observation is not None
+    assert quiet.observation.compute_axis_residuals() == AxisResidual5D(0.0, 0.0, 0.0, 0.0, 0.0)
+    bottom = ConstraintRelaxationMask.bottom()
+    assert relax_facets_for_bottleneck(
+        bottom,
+        dominant_bound="hbm",
+        residual=quiet,
+    ).unlocked_facets() == (
+        "alg_compute_and_monoid",
+        "tile_and_stage_knobs",
+        "dma_and_cache_hierarchy",
+    )
+    assert relax_facets_for_bottleneck(
+        bottom,
+        residual=quiet,
+        l1_overflow=True,
+    ).unlocked_facets() == (
+        "alg_compute_and_monoid",
+        "tile_and_stage_knobs",
+        "sram_layout_and_aliasing",
+    )
+    assert relax_facets_for_bottleneck(
+        bottom,
+        residual=quiet,
+        ub_overflow=True,
+    ).unlocked_facets() == (
+        "alg_compute_and_monoid",
+        "tile_and_stage_knobs",
+        "sram_layout_and_aliasing",
+    )
+    assert relax_facets_for_bottleneck(bottom, residual=quiet).unlocked_facets() == (
+        "alg_compute_and_monoid",
+        "tile_and_stage_knobs",
+    )
+
+
+def test_predicate_context_exports_axis_gaps_at_current_and_prev_levels() -> None:
+    """Rules read all five axis gaps and the dominant axis on both context levels."""
+    ledger = _rich_ledger()
+    residual = compute_static_dynamic_residual(
+        ledger,
+        _rich_telemetry(),
+        compiler_summary=_rich_compiler_summary(),
+    )
+    ctx = build_predicate_context(ledger, residual=residual)
+    expected: dict[str, float | str] = {
+        "compute_issue_gap": 0.5,
+        "offchip_dma_gap": 0.4,
+        "onchip_sram_reg_gap": 1.0,
+        "pipeline_sync_gap": 0.6,
+        "grid_wave_gap": 0.2,
+        "dominant_axis": "onchip_sram_reg",
+    }
+    prev_ctx = ctx["prev"]
+    assert isinstance(prev_ctx, dict)
+    for key, value in expected.items():
+        assert ctx[key] == value
+        assert prev_ctx[key] == value
+    with_prev = build_predicate_context(
+        ledger,
+        residual=residual,
+        prev_ledger=_rich_ledger(),
+    )
+    parent_ctx = with_prev["prev"]
+    assert isinstance(parent_ctx, dict)
+    assert parent_ctx["onchip_sram_reg_gap"] == 1.0
+    assert parent_ctx["grid_wave_gap"] == 0.2
+    assert parent_ctx["dominant_axis"] == "onchip_sram_reg"
+    static_ctx = build_predicate_context(_quiet_ledger())
+    assert static_ctx["dominant_axis"] == "compute_issue"
+    static_prev = static_ctx["prev"]
+    assert isinstance(static_prev, dict)
+    assert static_prev["compute_issue_gap"] == 0.0
 
 
 def test_axis_residual_thresholds_unlock_exactly_one_facet_each() -> None:
@@ -589,7 +715,7 @@ def test_router_tier_aliases_normalize_to_internal_ids_at_the_boundary() -> None
 
 _TRACKB_VECTOR_SNIPPET = """
 constexpr int TILE_ELEMENTS = 64;
-AscendC::Exp(dst, src, mask);
+Exp(dst, src, mask);
 """
 
 _STATIC_COPY_DSL = """

@@ -53,6 +53,45 @@ def _observation_from_residual(residual: object | None) -> ObservationVector5D |
     return None
 
 
+_DOMINANT_BOUND_FACET_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "exec_mode_and_spr",
+        ("spill", "vloopv2", "exec_mode", "regbase", "simt", "spr"),
+    ),
+    (
+        "sram_layout_and_aliasing",
+        ("l1_overflow", "ub_overflow", "capacity_overflow", "bank", "sram"),
+    ),
+    ("dma_and_cache_hierarchy", ("dma", "mte2", "hbm", "l2", "cache")),
+    (
+        "pipeline_and_sync_graph",
+        (
+            "sync",
+            "crosscore",
+            "ring_sync",
+            "stage_dag",
+            "pipeline",
+            "multi_mmad",
+            "mmad",
+            "alias",
+        ),
+    ),
+    (
+        "grid_and_workspace_topology",
+        ("grid", "wave", "swat", "streamk", "workspace", "gm_atomic"),
+    ),
+)
+
+
+def _dominant_bound_facets(dominant_bound: str) -> frozenset[str]:
+    """Map a free-form dominant-bound label onto the causal facets its tokens imply."""
+    return frozenset(
+        facet
+        for facet, tokens in _DOMINANT_BOUND_FACET_TOKENS
+        if any(token in dominant_bound for token in tokens)
+    )
+
+
 def coerce_topology_axes(axes_or_mapping: TopologyAxes | Mapping[str, Any]) -> TopologyAxes:
     """Coerce TopologyAxes or axis-dict into a validated TopologyAxes instance."""
     if isinstance(axes_or_mapping, TopologyAxes):
@@ -108,10 +147,17 @@ def relax_facets_for_bottleneck(
     l1_overflow: bool = False,
     ub_overflow: bool = False,
 ) -> ConstraintRelaxationMask:
-    """Unlock ONLY minimal causal MECE facet(s) matching the observed bottleneck."""
+    """Unlock minimal causal MECE facets, with dominant-bound fallback when 5D is quiet."""
+    dom = str(dominant_bound or "").strip().lower()
     observation = _observation_from_residual(residual)
     if observation is not None:
-        return observation.compute_axis_residuals().unlock_causal_facets(mask)
+        relaxed = observation.compute_axis_residuals().unlock_causal_facets(mask)
+        if relaxed != mask:
+            return relaxed
+        fallback = _dominant_bound_facets(dom)
+        if l1_overflow or ub_overflow:
+            fallback |= frozenset({"sram_layout_and_aliasing"})
+        return relaxed.unlock(*sorted(fallback)) if fallback else relaxed
 
     unlock_exec_mode_and_spr = mask.exec_mode_and_spr
     unlock_sram_layout = mask.sram_layout_and_aliasing
@@ -119,7 +165,7 @@ def relax_facets_for_bottleneck(
     unlock_pipeline_sync = mask.pipeline_and_sync_graph
     unlock_grid_workspace = mask.grid_and_workspace_topology
 
-    dom = str(dominant_bound or "").strip().lower()
+    dom_facets = _dominant_bound_facets(dom)
 
     sync_stall = float(_read_attr_or_key(residual, "measured_sync_stall_ratio", 0.0) or 0.0)
     mte2_wait = float(_read_attr_or_key(residual, "measured_mte2_wait_ratio", 0.0) or 0.0)
@@ -165,10 +211,7 @@ def relax_facets_for_bottleneck(
         spill_bytes > 0
         or (software_loops > 0 and vloopv2_loops == 0)
         or dual_issue_collapse >= 0.4
-        or any(
-            tok in dom
-            for tok in ("spill", "vloopv2", "exec_mode", "regbase", "simt", "spr")
-        )
+        or "exec_mode_and_spr" in dom_facets
     ):
         unlock_exec_mode_and_spr = True
 
@@ -176,10 +219,7 @@ def relax_facets_for_bottleneck(
         l1_overflow
         or ub_overflow
         or bank_conflict > 0.10
-        or any(
-            tok in dom
-            for tok in ("l1_overflow", "ub_overflow", "capacity_overflow", "bank", "sram")
-        )
+        or "sram_layout_and_aliasing" in dom_facets
     ):
         unlock_sram_layout = True
 
@@ -187,7 +227,7 @@ def relax_facets_for_bottleneck(
         mte2_wait > 0.30
         or l2_hit < 0.70
         or dcci_flushes > 0
-        or any(tok in dom for tok in ("dma", "mte2", "hbm", "l2", "cache"))
+        or "dma_and_cache_hierarchy" in dom_facets
     ):
         unlock_dma_cache = True
 
@@ -197,25 +237,11 @@ def relax_facets_for_bottleneck(
         or alias_ser > 0
         or vf_breaks > 0
         or pseudo_ser
-        or any(
-            tok in dom
-            for tok in (
-                "sync",
-                "crosscore",
-                "ring_sync",
-                "stage_dag",
-                "pipeline",
-                "multi_mmad",
-                "mmad",
-                "alias",
-            )
-        )
+        or "pipeline_and_sync_graph" in dom_facets
     ):
         unlock_pipeline_sync = True
 
-    if wave_ratio > 1.25 or any(
-        tok in dom for tok in ("grid", "wave", "swat", "streamk", "workspace", "gm_atomic")
-    ):
+    if wave_ratio > 1.25 or "grid_and_workspace_topology" in dom_facets:
         unlock_grid_workspace = True
 
     return ConstraintRelaxationMask(

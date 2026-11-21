@@ -62,22 +62,24 @@ _STOCK_OPS: tuple[tuple[str, str], ...] = (
 )
 _STOCK_IDS = tuple(name for _, name in _STOCK_OPS)
 
-_EXPECTED_SEMANTICS: dict[str, tuple[bool, bool, tuple[int, ...], bool, bool, bool, bool, bool]] = {
-    "swi_glu": (False, False, (), False, False, False, False, False),
-    "rms_norm": (False, True, (), False, False, False, False, False),
-    "softmax": (False, True, (), True, False, False, False, False),
-    "apply_rotary_pos_emb": (False, False, (), False, False, False, False, True),
-    "add_rms_norm_dynamic_quant": (False, True, (-1,), False, False, True, False, True),
-    "mhc_sinkhorn": (False, True, (-2, -1), True, False, False, True, True),
-    "grouped_matmul": (True, False, (), False, False, False, True, False),
-    "q4_0_dequant_matmul": (True, False, (), False, False, True, False, False),
-    "attention_residual": (True, True, (-1, 0), True, False, False, False, False),
-    "mla": (True, True, (-1,), True, False, False, True, False),
-    "gqa": (True, True, (-1,), True, False, False, True, False),
-    "dynamic_mx_quant": (False, True, (-1,), False, False, True, False, True),
-    "sparse_flash_attention": (True, True, (), False, True, False, True, False),
-    "kimi_delta_attention": (False, True, (-2, -1), True, False, False, True, False),
-    "tensor_program_vm": (False, True, (), False, False, False, True, False),
+_EXPECTED_SEMANTICS: dict[
+    str, tuple[bool, bool, tuple[int, ...], bool, bool, bool, bool, bool, bool]
+] = {
+    "swi_glu": (False, False, (), False, False, False, False, False, False),
+    "rms_norm": (False, True, (), False, False, False, False, False, True),
+    "softmax": (False, True, (), True, False, False, False, False, True),
+    "apply_rotary_pos_emb": (False, False, (), False, False, False, False, True, False),
+    "add_rms_norm_dynamic_quant": (False, True, (-1,), False, False, True, False, True, True),
+    "mhc_sinkhorn": (False, True, (-2, -1), True, False, False, True, True, True),
+    "grouped_matmul": (True, False, (), False, False, False, True, False, False),
+    "q4_0_dequant_matmul": (True, False, (), False, False, True, False, False, False),
+    "attention_residual": (True, True, (-1, 0), True, False, False, False, False, True),
+    "mla": (True, True, (-1,), True, False, False, True, False, True),
+    "gqa": (True, True, (-1,), True, False, False, True, False, True),
+    "dynamic_mx_quant": (False, True, (-1,), False, False, True, False, True, False),
+    "sparse_flash_attention": (True, True, (), False, True, False, True, False, False),
+    "kimi_delta_attention": (False, True, (-2, -1), True, False, False, True, False, False),
+    "tensor_program_vm": (False, True, (), False, False, False, True, False, False),
 }
 
 _EXPECTED_AXES: dict[str, str] = {
@@ -241,6 +243,7 @@ def test_stock_operator_semantics_and_base_axes(
         semantics.has_subbyte_or_block_quant,
         semantics.has_recurrent_loop,
         semantics.mutates_inputs,
+        semantics.preserves_input_shape,
     )
     assert observed == _EXPECTED_SEMANTICS[op_name]
     assert semantics.entry_name == op_name
@@ -525,6 +528,171 @@ def test_attention_blueprint_prices_declared_qkv_dtypes(
     )
 
 
+def test_preserves_input_shape_follows_keepdim_broadcast_provenance(
+    analyzer: PyTorchSemanticAnalyzer,
+) -> None:
+    """Only binary combination of entry data with keepdim-reduced data preserves the input shape."""
+    combined = analyzer.analyze_source(
+        dedent(
+            """
+            import torch
+
+            def normalized(x):
+                mean = x.mean(dim=-1, keepdim=True)
+                centered = x - mean
+                variance = (centered * centered).mean(dim=-1, keepdim=True)
+                return centered / torch.sqrt(variance + 1e-5)
+            """
+        ),
+        entry_name="normalized",
+    )
+    assert combined.preserves_input_shape is True
+    isolated = analyzer.analyze_source(
+        dedent(
+            """
+            import torch
+
+            def isolated(x):
+                return x.mean(dim=-1, keepdim=True) + 1.0
+            """
+        ),
+        entry_name="isolated",
+    )
+    assert isolated.preserves_input_shape is False
+    shrinking = analyzer.analyze_source(
+        dedent(
+            """
+            import torch
+
+            def shrunk(x):
+                return x - x.mean(dim=-1, keepdim=False)
+            """
+        ),
+        entry_name="shrunk",
+    )
+    assert shrinking.preserves_input_shape is False
+
+
+def test_softmax_shape_preservation_requires_a_shape_preserving_return_path(
+    analyzer: PyTorchSemanticAnalyzer,
+) -> None:
+    """A softmax that is reduced or left out of the returned value must not count."""
+    reduced = analyzer.analyze_source(
+        dedent(
+            """
+            import torch
+
+            def reduced(x):
+                return torch.softmax(x, dim=-1).sum(dim=-1)
+            """
+        ),
+        entry_name="reduced",
+    )
+    assert reduced.preserves_input_shape is False
+    staged = analyzer.analyze_source(
+        dedent(
+            """
+            import torch
+
+            def staged(x):
+                probabilities = torch.softmax(x, dim=-1)
+                return torch.sum(probabilities, dim=-1)
+            """
+        ),
+        entry_name="staged",
+    )
+    assert staged.preserves_input_shape is False
+    unrelated = analyzer.analyze_source(
+        dedent(
+            """
+            import torch
+
+            def unrelated(x):
+                torch.softmax(x, dim=-1)
+                return torch.sum(x, dim=-1)
+            """
+        ),
+        entry_name="unrelated",
+    )
+    assert unrelated.preserves_input_shape is False
+    helper = analyzer.analyze_source(
+        dedent(
+            """
+            import torch
+
+            def _normalize(x):
+                return torch.softmax(x, dim=-1)
+
+            def through_helper(x):
+                return _normalize(x)
+            """
+        ),
+        entry_name="through_helper",
+    )
+    assert helper.preserves_input_shape is True
+
+
+def test_obfuscated_softmax_and_shrinking_sum_price_output_write_back(
+    analyzer: PyTorchSemanticAnalyzer,
+) -> None:
+    """Shape-preserving ops charge a full write-back while reducing ops charge one output row."""
+    source, proto, _cases = _load_op("softmax")
+    obfuscated_source, replacements = re.subn(
+        r"^def\s+softmax\s*\(",
+        "def anon_entry(",
+        source,
+        flags=re.MULTILINE,
+    )
+    assert replacements == 1
+    semantics = analyzer.analyze_source(
+        obfuscated_source,
+        entry_name="anon_entry",
+        proto=_scrub_proto_identity(proto, "anon_entry"),
+    )
+    assert semantics.preserves_input_shape is True
+    wide = RepresentativeCase(
+        case_id=1,
+        input_shapes=((8192, 8192),),
+        input_dtypes=("bfloat16",),
+    )
+    wide_packet = analyzer.build_universal_blueprint(
+        semantics,
+        {"total_elements": 8192 * 8192},
+        representative_case=wide,
+    )
+    assert wide_packet.roofline.min_gm_bytes == 268_435_456
+    narrow = RepresentativeCase(
+        case_id=2,
+        input_shapes=((4096, 1024),),
+        input_dtypes=("float16",),
+    )
+    narrow_packet = analyzer.build_universal_blueprint(
+        semantics,
+        {"total_elements": 4096 * 1024},
+        representative_case=narrow,
+    )
+    assert narrow_packet.roofline.min_gm_bytes == 16_777_216
+
+    shrinking = analyzer.analyze_source(
+        dedent(
+            """
+            import torch
+
+            def anon_sum(x):
+                return torch.sum(x, dim=-1)
+            """
+        ),
+        entry_name="anon_sum",
+    )
+    assert shrinking.preserves_input_shape is False
+    shrink_packet = analyzer.build_universal_blueprint(
+        shrinking,
+        {"total_elements": 4096 * 1024},
+        representative_case=narrow,
+    )
+    assert shrink_packet.roofline.min_gm_bytes == 8_396_800
+
+
 @pytest.mark.parametrize("op_name", _STOCK_IDS)
 def test_entry_and_proto_obfuscation_preserves_semantics_and_ratios(
     analyzer: PyTorchSemanticAnalyzer,
@@ -555,6 +723,7 @@ def test_entry_and_proto_obfuscation_preserves_semantics_and_ratios(
     assert obfuscated.has_subbyte_or_block_quant == semantics.has_subbyte_or_block_quant
     assert obfuscated.has_recurrent_loop == semantics.has_recurrent_loop
     assert obfuscated.mutates_inputs == semantics.mutates_inputs
+    assert obfuscated.preserves_input_shape == semantics.preserves_input_shape
     assert obfuscated.base_axes == semantics.base_axes
     for case in cases:
         original = analyzer.compute_case_ratios(semantics, case)

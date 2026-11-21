@@ -10,6 +10,10 @@ from pathlib import Path
 
 import yaml
 
+from tilefoundry_ascend.ascend.passes.observation_space import (
+    AxisResidual5D,
+    ObservationVector5D,
+)
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 
 _BIN_OPS = {
@@ -526,6 +530,50 @@ def _extract_typed_defaults(
     return resolved
 
 
+def _embedded_observation(
+    residual: Mapping[str, object] | object | None,
+) -> ObservationVector5D | None:
+    """Recover the 5D observation carried by a residual object or serialized mapping."""
+    if residual is None:
+        return None
+    if isinstance(residual, ObservationVector5D):
+        return residual
+    raw_observation: object = (
+        residual.get("observation")
+        if isinstance(residual, Mapping)
+        else getattr(residual, "observation", None)
+    )
+    if isinstance(raw_observation, ObservationVector5D):
+        return raw_observation
+    if isinstance(raw_observation, Mapping):
+        return ObservationVector5D.from_dict(raw_observation)
+    return None
+
+
+def _axis_residuals(
+    ledger: ObjectivePhysicalLedger,
+    residual: Mapping[str, object] | object | None,
+) -> AxisResidual5D:
+    """Compute axis residuals from the measured observation, else the ledger's static L0 view."""
+    observation = _embedded_observation(residual)
+    if observation is None:
+        observation = ledger.to_observation_5d()
+    return observation.compute_axis_residuals()
+
+
+def _axis_gap_context(residuals: AxisResidual5D) -> dict[str, float | str]:
+    """Flatten the five axis gaps plus the dominant axis into predicate-context keys."""
+    context: dict[str, float | str] = {
+        "compute_issue_gap": residuals.compute_issue_gap,
+        "offchip_dma_gap": residuals.offchip_dma_gap,
+        "onchip_sram_reg_gap": residuals.onchip_sram_reg_gap,
+        "pipeline_sync_gap": residuals.pipeline_sync_gap,
+        "grid_wave_gap": residuals.grid_wave_gap,
+        "dominant_axis": residuals.dominant_axis,
+    }
+    return context
+
+
 def build_predicate_context(
     ledger: ObjectivePhysicalLedger,
     *,
@@ -536,7 +584,10 @@ def build_predicate_context(
     extra: Mapping[str, object] | None = None,
     target: object | None = None,
 ) -> dict[str, object]:
-    """Assemble a flat and dotted-path dictionary for safe rule predicate evaluation."""
+    """Assemble a flat and dotted-path dictionary for safe rule predicate evaluation.
+
+    Both the current and previous levels expose the five 5D axis gaps and dominant_axis.
+    """
     ctx = _ledger_to_namespace(ledger)
     if features is not None:
         if hasattr(features, "to_dict"):
@@ -585,6 +636,7 @@ def build_predicate_context(
         res_defaults.update(_extract_typed_defaults(residual, _RESIDUAL_DEFAULTS))
         ctx.update(_extract_typed_defaults(residual, _TELEMETRY_CONTEXT_DEFAULTS))
     ctx.update(res_defaults)
+    ctx.update(_axis_gap_context(_axis_residuals(ledger, residual)))
 
     if (
         float(ctx.get("ub_bank_conflict_risk", 0.0)) == 0.0
@@ -594,6 +646,7 @@ def build_predicate_context(
 
     if prev_ledger is not None:
         prev_ns = _ledger_to_namespace(prev_ledger)
+        prev_ns.update(_axis_gap_context(_axis_residuals(prev_ledger, None)))
         for key, val in _RESIDUAL_DEFAULTS.items():
             prev_ns.setdefault(key, val)
         for key, val in _TELEMETRY_CONTEXT_DEFAULTS.items():

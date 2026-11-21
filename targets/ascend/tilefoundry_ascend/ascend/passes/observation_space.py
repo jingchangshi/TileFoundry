@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from typing import Protocol
@@ -437,12 +438,23 @@ class ObservationVector5D:
             and self.compute_issue.l1_vloopv2_loops == 0
         )
         sw_loop_penalty = 0.5 if has_sw_loop else 0.0
+        compute_utilization = max(
+            self.compute_issue.l2_aic_mac_ratio,
+            self.compute_issue.l2_aiv_vec_ratio,
+        )
+        roofline_eta = self.compute_issue.l2_roofline_eta
+        roofline_gap = (
+            1.0 - roofline_eta
+            if compute_utilization >= 0.5 and 0.0 < roofline_eta < 0.5
+            else 0.0
+        )
         compute_gap = min(
             1.0,
             max(
                 sw_loop_penalty,
                 self.compute_issue.l1_dual_issue_collapse,
                 0.25 * min(4, self.compute_issue.l1_vf_fusion_breaks),
+                roofline_gap,
             ),
         )
         dma_gap = min(
@@ -473,7 +485,11 @@ class ObservationVector5D:
             ),
         )
         wave_occupancy = self.grid_irregularity.l0_wave_occupancy
-        wave_waste = (1.0 - wave_occupancy) if 0.0 < wave_occupancy < 1.0 else 0.0
+        wave_waste = (
+            1.0 - wave_occupancy / math.ceil(wave_occupancy)
+            if wave_occupancy > 0.0
+            else 0.0
+        )
         grid_gap = min(1.0, max(0.0, wave_waste))
         return AxisResidual5D(
             compute_issue_gap=round(compute_gap, 4),
