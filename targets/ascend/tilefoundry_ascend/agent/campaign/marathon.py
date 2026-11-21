@@ -1805,6 +1805,7 @@ def run_operator_marathon(
         cost_prescreen_top_k=cfg.cost_prescreen_top_k,
         exploit_effort=cfg.exploit_effort,
         round_regime_tags=tuple(cfg.round_regime_tags),
+        pure_golden=cfg.pure_golden,
     )
     tracker = BayesianRuleTracker.from_experience_lake(lake_dir)
     flywheel = FlywheelDistiller(

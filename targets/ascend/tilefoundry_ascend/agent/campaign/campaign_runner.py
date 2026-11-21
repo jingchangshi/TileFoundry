@@ -47,16 +47,23 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     resolve_cannbench_tasks_root,
     resolve_regime_for_case,
 )
+from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
+    extract_golden_entrypoint_contract,
+    format_golden_entrypoint_prompt_block,
+)
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     FAILURE_KIND_CANDIDATE,
     FAILURE_KIND_INFRASTRUCTURE,
+    AnchorEvalMetrics,
     CandidateSurrogateResult,
     L0L1CandidateCheck,
     L2BatchResults,
     L3AcceptanceResult,
     L4CannbenchResult,
+    aggregate_surrogate_result,
     bottleneck_anchor_for_regime,
     collect_bottleneck_msprof_via_agent_gates,
+    collect_p2_deep_dive_via_agent_gates,
     run_l0_l1_round_filter,
     run_l1_compile_check,
     run_l3_full_contract_via_agent_gates,
@@ -74,6 +81,7 @@ from tilefoundry_ascend.agent.kb.bayesian_tracker import (
     save_staging_candidate_rule,
 )
 from tilefoundry_ascend.agent.kb.schema import (
+    SYMPTOM_FAMILY_TO_FACETS,
     AscendCausalRule,
     SymptomFamily,
     build_predicate_context,
@@ -227,6 +235,7 @@ class CampaignConfig:
     exploit_effort: str = "medium"
     round_regime_tags: tuple[str, ...] = ()
     allow_unreviewed_distilled_rules: bool = False
+    pure_golden: bool = False
 
 
 def _should_trigger_p2_deep_dive(
@@ -648,6 +657,9 @@ class CampaignReport:
     pending_promotion: PendingPromotion | None = None
     pending_l4: PendingL4 | None = None
     promotion_blocked: bool = False
+    pure_golden_mode: bool = False
+    blueprint_provenance: dict[str, object] = field(default_factory=dict)
+    stagnation_diagnosis: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         """Serialize CampaignReport into a JSON-compatible dictionary."""
@@ -670,6 +682,9 @@ class CampaignReport:
             ),
             "pending_l4": self.pending_l4.to_dict() if self.pending_l4 else None,
             "promotion_blocked": self.promotion_blocked,
+            "pure_golden_mode": self.pure_golden_mode,
+            "blueprint_provenance": dict(self.blueprint_provenance),
+            "stagnation_diagnosis": dict(self.stagnation_diagnosis),
         }
 
 
@@ -1341,7 +1356,12 @@ def _extract_func_signature_header(lines: Sequence[str], node: ast.FunctionDef) 
     return textwrap.dedent(raw).strip()
 
 
-def _extract_regime_abi_context(module_source: str, regime_spec: RegimeTargetSpec) -> str:
+def _extract_regime_abi_context(
+    module_source: str,
+    regime_spec: RegimeTargetSpec,
+    *,
+    golden_abi_block: str = "",
+) -> str:
     """Extract slice, helper builder, and @T.prim_func ABI signatures for the target regime."""
     tree = ast.parse(module_source)
     lines = module_source.splitlines(keepends=True)
@@ -1363,7 +1383,7 @@ def _extract_regime_abi_context(module_source: str, regime_spec: RegimeTargetSpe
         )
     ]
     if not seed_names:
-        return ""
+        return golden_abi_block
 
     visited: set[str] = set()
     ordered_slice_funcs: list[ast.FunctionDef] = []
@@ -1403,9 +1423,9 @@ def _extract_regime_abi_context(module_source: str, regime_spec: RegimeTargetSpe
         blocks.append(_extract_func_signature_header(lines, snode))
     blocks.extend(prim_func_sigs)
     if not blocks:
-        return ""
+        return golden_abi_block
     sigs_text = "\n\n".join(blocks)
-    return (
+    primfunc_abi = (
         "### IMMUTABLE HOST / PRIMFUNC ABI CONTRACT\n"
         f"```python\n{sigs_text}\n```\n"
         "Any custom @T.prim_func returned for this slice MUST keep the exact tensor/scalar "
@@ -1414,6 +1434,7 @@ def _extract_regime_abi_context(module_source: str, regime_spec: RegimeTargetSpe
         "T.Scope). _select_*_config() may return optional 'builder_kwargs': {...} forwarded to "
         "custom builders for compile-time constexpr specialization.\n\n"
     )
+    return f"{golden_abi_block}{primfunc_abi}"
 
 
 def apply_ast_patch(
@@ -1932,6 +1953,11 @@ class PerfTargetCampaignRunner:
             Mapping[str, Mapping[str, float]],
         ]
         | None = None,
+        p2_deep_dive_collector: Callable[
+            [str, str, Sequence[AnchorCaseSpec]],
+            Mapping[str, object],
+        ]
+        | None = None,
         checkpoint_path: str | Path | None = None,
         campaign_kb_path: str | Path | None = None,
         source_root: str | Path | None = None,
@@ -2035,6 +2061,24 @@ class PerfTargetCampaignRunner:
         else:
             self._msprof_collector = None
         self._msprof_cache: dict[tuple[str, str], dict[str, float]] = {}
+        if p2_deep_dive_collector is not None:
+            self._p2_deep_dive_collector: (
+                Callable[[str, str, Sequence[AnchorCaseSpec]], Mapping[str, object]] | None
+            ) = p2_deep_dive_collector
+        elif l2_batch_evaluator is None and self._env_file is not None:
+            self._p2_deep_dive_collector = (
+                lambda op_name, cand_path, anc_seq: collect_p2_deep_dive_via_agent_gates(
+                    op_name,
+                    cand_path,
+                    anc_seq,
+                    source_root=self._source_root,
+                    env_file=self._env_file,
+                    device_id=self._config.device_id,
+                )
+            )
+        else:
+            self._p2_deep_dive_collector = None
+        self._p2_cache: dict[tuple[str, str], dict[str, object]] = {}
         self._checkpoint_path = Path(checkpoint_path).resolve() if checkpoint_path else None
         self._campaign_kb_path = Path(campaign_kb_path).resolve() if campaign_kb_path else None
         self._enable_track_router = bool(enable_track_router)
@@ -2071,11 +2115,15 @@ class PerfTargetCampaignRunner:
         self._case_dims_cache: dict[int, dict[str, object]] = {}
         if self._experience_lake_dir is not None and self._experience_lake_dir.exists():
             try:
-                self._cost_model.replay_experience_lake(self._experience_lake_dir)
+                self._cost_model.replay_experience_lake(
+                    self._experience_lake_dir,
+                    exclude_run_id=self._run_id,
+                )
             except (OSError, json.JSONDecodeError) as exc:
                 logger.debug("ExperienceLake startup replay skipped: %s", exc)
         self._freedom_masks: dict[str, ConstraintRelaxationMask] = {}
         self._live_regime_plans: dict[str, RegimePlanResult] = {}
+        self._regime_diag_stats: dict[str, dict[str, object]] = {}
         self._clock = clock
         self._sil_advisory = sil_advisory
         self._semantic_topology_axes: TopologyAxes | None = None
@@ -2086,18 +2134,29 @@ class PerfTargetCampaignRunner:
         else:
             self._topology_axes = None
 
-        if authored_hir_path is not None:
-            self._authored_hir_path: Path | None = Path(authored_hir_path).resolve()
+        if bool(self._config.pure_golden):
+            self._authored_hir_path: Path | None = None
+            self._scheduled_hir_path: Path | None = None
         else:
-            sibling_model = self._target_module_path.parent / "model.py"
-            self._authored_hir_path = sibling_model.resolve() if sibling_model.is_file() else None
+            if authored_hir_path is not None:
+                self._authored_hir_path = Path(authored_hir_path).resolve()
+            else:
+                sibling_model = self._target_module_path.parent / "model.py"
+                self._authored_hir_path = (
+                    sibling_model.resolve() if sibling_model.is_file() else None
+                )
 
-        if scheduled_hir_path is not None:
-            self._scheduled_hir_path: Path | None = Path(scheduled_hir_path).resolve()
-        else:
-            sibling_sched = self._target_module_path.parent / "scheduled.py"
-            self._scheduled_hir_path = sibling_sched.resolve() if sibling_sched.is_file() else None
+            if scheduled_hir_path is not None:
+                self._scheduled_hir_path = Path(scheduled_hir_path).resolve()
+            else:
+                sibling_sched = self._target_module_path.parent / "scheduled.py"
+                self._scheduled_hir_path = (
+                    sibling_sched.resolve() if sibling_sched.is_file() else None
+                )
 
+        self._golden_abi_block_cache: str | None = None
+        self._blueprint_provenance: dict[str, object] = {}
+        self._update_blueprint_provenance(None)
         self._regime_blueprints: dict[str, HirBlueprintPacket] = (
             self._validated_regime_blueprints(regime_blueprints)
         )
@@ -2412,6 +2471,98 @@ class PerfTargetCampaignRunner:
             return in_repo
         return None
 
+    def _collect_p2_deep_dive_for_regime(
+        self,
+        source: str,
+        result: CandidateSurrogateResult,
+        active_anchors: Sequence[AnchorCaseSpec],
+        regime_spec: RegimeTargetSpec,
+    ) -> dict[str, object] | None:
+        sha = self._source_sha256(source)
+        cache_key = (sha, regime_spec.regime_tag)
+        if cache_key in self._p2_cache:
+            return self._p2_cache[cache_key]
+        if self._p2_deep_dive_collector is None:
+            return None
+        by_case_and_tag = {(int(a.case_num), a.regime_tag): a for a in active_anchors}
+        by_case = {int(a.case_num): a for a in active_anchors}
+        bn = bottleneck_anchor_for_regime(result, regime_spec.regime_tag)
+        spec: AnchorCaseSpec | None = None
+        if bn is not None:
+            spec = by_case_and_tag.get((int(bn.case_num), regime_spec.regime_tag)) or by_case.get(
+                int(bn.case_num)
+            )
+        if spec is None:
+            for anc in active_anchors:
+                if anc.regime_tag == regime_spec.regime_tag:
+                    spec = anc
+                    break
+        if spec is None and active_anchors:
+            spec = active_anchors[0]
+        if spec is None:
+            return None
+        if spec.regime_tag != regime_spec.regime_tag:
+            spec = AnchorCaseSpec(
+                spec.task,
+                spec.case_num,
+                regime_spec.regime_tag,
+                spec.ref_perf_us,
+                spec.t_hw_us,
+            )
+        try:
+            with tempfile.TemporaryDirectory(prefix="tf_p2_cand_") as tmp_dir:
+                cand_path = Path(tmp_dir) / "candidate.py"
+                cand_path.write_text(source, encoding="utf-8")
+                collected = self._p2_deep_dive_collector(
+                    self._config.operator_name,
+                    str(cand_path),
+                    [spec],
+                )
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            TimeoutError,
+            json.JSONDecodeError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            logger.warning("On-demand P2 deep-dive collection failed: %s", exc)
+            return None
+        if not isinstance(collected, Mapping) or not collected:
+            return None
+        raw_payload = collected.get(regime_spec.regime_tag)
+        if not isinstance(raw_payload, Mapping):
+            raw_payload = next(iter(collected.values()), None)
+        if not isinstance(raw_payload, Mapping) or not raw_payload:
+            return None
+        clean_payload = {str(k): v for k, v in raw_payload.items()}
+        self._p2_cache[cache_key] = clean_payload
+        return clean_payload
+
+    def _update_blueprint_provenance(self, spec: CannbenchOpSpec | None) -> None:
+        pure_mode = bool(self._config.pure_golden)
+        has_hir = self._authored_hir_path is not None or self._scheduled_hir_path is not None
+        if pure_mode:
+            source_mode = "pure_golden"
+        elif spec is not None and has_hir:
+            source_mode = "mixed"
+        elif has_hir:
+            source_mode = "authored_hir"
+        else:
+            source_mode = "pure_golden"
+        self._blueprint_provenance = {
+            "pure_golden_mode": pure_mode,
+            "operator_name": self._config.operator_name,
+            "golden_path": str(spec.golden_path) if spec is not None else "",
+            "authored_hir_path": (
+                str(self._authored_hir_path) if self._authored_hir_path is not None else None
+            ),
+            "scheduled_hir_path": (
+                str(self._scheduled_hir_path) if self._scheduled_hir_path is not None else None
+            ),
+            "source_mode": source_mode,
+        }
+
     def _validated_regime_blueprints(
         self,
         provided: Mapping[str, HirBlueprintPacket] | None,
@@ -2427,6 +2578,11 @@ class PerfTargetCampaignRunner:
                 f"regime_blueprints missing regime tags {missing}; "
                 f"got {sorted(provided)}"
             )
+        try:
+            spec = self._resolve_operator_spec()
+        except (FileNotFoundError, OSError, ValueError, KeyError, RuntimeError):
+            spec = None
+        self._update_blueprint_provenance(spec)
         return dict(provided)
 
     def _resolve_operator_spec(self) -> CannbenchOpSpec | None:
@@ -2434,10 +2590,42 @@ class PerfTargetCampaignRunner:
         tasks_root = self._resolve_cannbench_tasks_root()
         if tasks_root is None:
             return None
-        registry = CannbenchOpsRegistry(tasks_root=tasks_root, source_root=self._source_root)
+        registry = CannbenchOpsRegistry(
+            tasks_root=tasks_root,
+            source_root=self._source_root,
+            pure_golden=bool(self._config.pure_golden),
+        )
         if not registry.has_operator(self._config.operator_name):
             return None
         return registry.resolve(self._config.operator_name)
+
+    def _build_golden_entrypoint_abi_block(self) -> str:
+        """Resolve and cache the ParamBuilder-checked golden entrypoint ABI prompt block."""
+        if self._golden_abi_block_cache is not None:
+            return self._golden_abi_block_cache
+        try:
+            spec = self._resolve_operator_spec()
+        except (FileNotFoundError, OSError, ValueError, KeyError, RuntimeError):
+            spec = None
+        if spec is None or not spec.golden_path.is_file():
+            self._golden_abi_block_cache = ""
+            return ""
+        try:
+            golden_source = spec.golden_path.read_text(encoding="utf-8")
+            desc_text = (
+                spec.desc_path.read_text(encoding="utf-8") if spec.desc_path.is_file() else ""
+            )
+            contract = extract_golden_entrypoint_contract(
+                golden_source,
+                spec.entrypoint,
+                proto=spec.proto,
+                desc_text=desc_text,
+            )
+            block = format_golden_entrypoint_prompt_block(contract)
+        except (OSError, SyntaxError, ValueError, KeyError, TypeError):
+            block = ""
+        self._golden_abi_block_cache = block
+        return block
 
     def _build_semantic_first_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
         """Build per-regime blueprints from PyTorch golden semantics and anchor dims.
@@ -2463,6 +2651,7 @@ class PerfTargetCampaignRunner:
                 ) from exc
 
         spec = self._resolve_operator_spec()
+        self._update_blueprint_provenance(spec)
         if spec is not None:
             if not spec.golden_path.is_file():
                 raise FileNotFoundError(
@@ -2494,7 +2683,10 @@ class PerfTargetCampaignRunner:
                     regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
                 )
                 rep_case = (
-                    RepresentativeCase.from_case_entry(regime_spec.representative_case_entry)
+                    RepresentativeCase.from_case_entry(
+                        regime_spec.representative_case_entry,
+                        proto=spec.proto,
+                    )
                     if regime_spec.representative_case_entry
                     else None
                 )
@@ -3189,28 +3381,93 @@ class PerfTargetCampaignRunner:
         )
 
     @staticmethod
-    def _format_msprof_section(residual: StaticDynamicResidual | None) -> str:
-        if residual is None:
-            return ""
-        has_pmu = (
-            residual.measured_aic_mac_ratio > 0.0
-            or residual.measured_aiv_vec_ratio > 0.0
-            or residual.measured_mte2_wait_ratio > 0.0
-            or residual.measured_sync_stall_ratio > 0.0
+    def _format_msprof_section(
+        residual: StaticDynamicResidual | None,
+        *,
+        p2_diag: Mapping[str, object] | None = None,
+    ) -> str:
+        has_pmu = bool(
+            residual is not None
+            and (
+                residual.measured_aic_mac_ratio > 0.0
+                or residual.measured_aiv_vec_ratio > 0.0
+                or residual.measured_mte2_wait_ratio > 0.0
+                or residual.measured_sync_stall_ratio > 0.0
+            )
         )
-        has_compiler_hazard = (
-            residual.spill_bytes > 0
-            or (not residual.vloopv2_hit)
-            or residual.vf_fusion_breaks > 0
-            or residual.alias_serialized_buffers > 0
-            or residual.dual_issue_ipc_collapse > 0.0
-            or residual.dcache_dcci_flushes > 0
-            or bool(residual.has_local_membar_in_vf_call)
+        has_compiler_hazard = bool(
+            residual is not None
+            and (
+                residual.spill_bytes > 0
+                or (not residual.vloopv2_hit)
+                or residual.vf_fusion_breaks > 0
+                or residual.alias_serialized_buffers > 0
+                or residual.dual_issue_ipc_collapse > 0.0
+                or residual.dcache_dcci_flushes > 0
+                or bool(residual.has_local_membar_in_vf_call)
+            )
         )
-        if not has_pmu and not has_compiler_hazard:
+        p2_lines: list[str] = []
+        if p2_diag:
+            raw_hotspots = p2_diag.get("p2_hotspots") or p2_diag.get("source_line_hotspots") or ()
+            if isinstance(raw_hotspots, Sequence) and not isinstance(raw_hotspots, (str, bytes)):
+                formatted_spots: list[str] = []
+                for spot in list(raw_hotspots)[:3]:
+                    if isinstance(spot, Mapping):
+                        loc = str(spot.get("source_location") or "?")
+                        cnt = spot.get("instruction_count", 0)
+                        share = spot.get("instruction_share")
+                        if isinstance(share, (int, float)) and not isinstance(share, bool):
+                            formatted_spots.append(
+                                f"{loc} (instrs={cnt}, share={float(share):.3f})"
+                            )
+                        else:
+                            formatted_spots.append(f"{loc} (instrs={cnt})")
+                    elif hasattr(spot, "source_location"):
+                        loc = str(getattr(spot, "source_location", "?"))
+                        cnt = getattr(spot, "instruction_count", 0)
+                        share = getattr(spot, "instruction_share", None)
+                        if isinstance(share, (int, float)) and not isinstance(share, bool):
+                            formatted_spots.append(
+                                f"{loc} (instrs={cnt}, share={float(share):.3f})"
+                            )
+                        else:
+                            formatted_spots.append(f"{loc} (instrs={cnt})")
+                    else:
+                        formatted_spots.append(str(spot))
+                if formatted_spots:
+                    p2_lines.append("p2_top_hotspots: " + "; ".join(formatted_spots))
+            raw_waitflag = p2_diag.get("p2_mte_waitflag_share")
+            if raw_waitflag is None:
+                raw_waitflag = p2_diag.get("mte_waitflag_share")
+            if isinstance(raw_waitflag, (int, float)) and not isinstance(raw_waitflag, bool):
+                p2_lines.append(f"p2_mte_waitflag_share: {float(raw_waitflag):.4f}")
+            raw_issue = p2_diag.get("p2_issue_interval_us")
+            if raw_issue is None:
+                raw_issue = p2_diag.get("issue_interval_us")
+            if isinstance(raw_issue, Mapping) and raw_issue:
+                parts: list[str] = []
+                for pipe in sorted(raw_issue):
+                    stats = raw_issue[pipe]
+                    if isinstance(stats, Mapping):
+                        p50 = float(stats.get("p50_us", 0.0) or 0.0)
+                        p90 = float(stats.get("p90_us", 0.0) or 0.0)
+                        parts.append(f"{pipe}(p50={p50:.3f}us, p90={p90:.3f}us)")
+                    elif hasattr(stats, "p50_us") and hasattr(stats, "p90_us"):
+                        p50 = float(getattr(stats, "p50_us", 0.0) or 0.0)
+                        p90 = float(getattr(stats, "p90_us", 0.0) or 0.0)
+                        parts.append(f"{pipe}(p50={p50:.3f}us, p90={p90:.3f}us)")
+                    elif isinstance(stats, (int, float)) and not isinstance(stats, bool):
+                        parts.append(f"{pipe}={float(stats):.4f}us")
+                if parts:
+                    p2_lines.append("p2_issue_interval_us: " + ", ".join(parts))
+            elif isinstance(raw_issue, (int, float)) and not isinstance(raw_issue, bool):
+                p2_lines.append(f"p2_issue_interval_us: {float(raw_issue):.4f}")
+        has_p2 = bool(p2_lines)
+        if not has_pmu and not has_compiler_hazard and not has_p2:
             return ""
         lines = ["### HARDWARE MSPROF TELEMETRY"]
-        if has_pmu:
+        if has_pmu and residual is not None:
             res_map = residual.to_dict()
             lines.extend(
                 [
@@ -3227,7 +3484,7 @@ class PerfTargetCampaignRunner:
             raw_eta = res_map.get("effective_compute_eta")
             if isinstance(raw_eta, (int, float)) and not isinstance(raw_eta, bool):
                 lines.append(f"effective_compute_eta: {float(raw_eta):.4f}")
-        if has_compiler_hazard:
+        if has_compiler_hazard and residual is not None:
             lines.extend(
                 [
                     f"spill_bytes: {residual.spill_bytes}",
@@ -3239,6 +3496,8 @@ class PerfTargetCampaignRunner:
                     f"has_local_membar_in_vf_call: {residual.has_local_membar_in_vf_call}",
                 ]
             )
+        if p2_lines:
+            lines.extend(p2_lines)
         return "\n".join(lines) + "\n\n"
 
     @staticmethod
@@ -3392,6 +3651,7 @@ class PerfTargetCampaignRunner:
         stage_b_profile: Mapping[str, object] | None = None,
         axes: TopologyAxes | None = None,
         policy: Mapping[str, object] | None = None,
+        parent_policy: Mapping[str, object] | None = None,
         worker_kind: str = "",
         rule_id: str | None = None,
         backend_track: str = "tilelang_dsl",
@@ -3537,6 +3797,14 @@ class PerfTargetCampaignRunner:
                     persist=False,
                     refit=False,
                 )
+                self._cost_model.mark_online_observation_key(
+                    cand_sha=cand_sha,
+                    operator=self._config.operator_name,
+                    regime_tag=anc.regime_tag,
+                    case_num=int(anc.case_num),
+                    eval_tier=eval_tier,
+                    measured_us=float(anc.cand_us),
+                )
                 observed_count += 1
                 p_anc = parent_by_case.get(int(anc.case_num))
                 if (
@@ -3549,7 +3817,7 @@ class PerfTargetCampaignRunner:
                         parent_ledger.to_dict() if parent_ledger is not None else ledger_dict,
                         microarch_profile=(parent_prof.to_dict() if parent_prof is not None and not parent_prof.is_empty else prof_dict),
                         case_dims=dims,
-                        policy=pol_dict,
+                        policy=(dict(parent_policy) if parent_policy is not None else pol_dict),
                         t_hw_us=p_anc.t_hw_us,
                         axes=parent_axes or axes,
                         target=self._target,
@@ -3562,6 +3830,13 @@ class PerfTargetCampaignRunner:
                         cand_bisheng_res=bisheng_summary,
                         parent_bisheng_res=parent_bisheng_res,
                         refit=False,
+                    )
+                    self._cost_model.mark_online_pair_key(
+                        cand_sha=cand_sha,
+                        parent_sha=parent_sha,
+                        operator=self._config.operator_name,
+                        regime_tag=anc.regime_tag,
+                        case_num=int(anc.case_num),
                     )
                     delta_count += 1
             except (OSError, ValueError) as exc:
@@ -3693,6 +3968,14 @@ class PerfTargetCampaignRunner:
                     persist=False,
                     refit=False,
                 )
+                self._cost_model.mark_online_observation_key(
+                    cand_sha=cand_sha,
+                    operator=self._config.operator_name,
+                    regime_tag=rtag,
+                    case_num=cnum,
+                    eval_tier="l4_official",
+                    measured_us=elapsed_us,
+                )
                 observed += 1
             except (OSError, ValueError) as exc:
                 logger.debug("Cost model L4 observe skipped: %s", exc)
@@ -3821,6 +4104,7 @@ class PerfTargetCampaignRunner:
         incumbent_source: str = "",
         sil_policy_section: str = "",
         effort: str | None = None,
+        p2_diag: Mapping[str, object] | None = None,
     ) -> GenerationRequest:
         module_source = incumbent_source or snippet_source
         active_kernel = self._resolve_active_trackb_kernel(module_source, regime_spec)
@@ -3861,7 +4145,7 @@ class PerfTargetCampaignRunner:
         )
         track_section = f"{constraint_text}\n\n"
         nav_section = ""
-        msprof_section = self._format_msprof_section(parent_residual)
+        msprof_section = self._format_msprof_section(parent_residual, p2_diag=p2_diag)
         cfg_obj = getattr(self, "_config", None)
         op_name = str(
             getattr(cfg_obj, "operator_name", "") or getattr(cfg_obj, "operator", "") or ""
@@ -3870,10 +4154,15 @@ class PerfTargetCampaignRunner:
         domain_section = (
             f"{domain_env.format_prompt_block()}\n\n" if domain_env is not None else ""
         )
+        golden_abi_block = self._build_golden_entrypoint_abi_block()
         abi_section = (
-            _extract_regime_abi_context(incumbent_source, regime_spec)
+            _extract_regime_abi_context(
+                incumbent_source,
+                regime_spec,
+                golden_abi_block=golden_abi_block,
+            )
             if incumbent_source
-            else ""
+            else golden_abi_block
         )
         eff_rule = (
             rule.render_for_backend(regime_spec.runtime_backend)
@@ -3926,6 +4215,7 @@ class PerfTargetCampaignRunner:
         incumbent_source: str = "",
         parent_hypothesis: str = "",
         sil_policy_section: str = "",
+        p2_diag: Mapping[str, object] | None = None,
     ) -> GenerationRequest:
         module_source = incumbent_source or snippet_source
         active_kernel = self._resolve_active_trackb_kernel(module_source, regime_spec)
@@ -3991,7 +4281,7 @@ class PerfTargetCampaignRunner:
             if prescreen_summary
             else ""
         )
-        msprof_section = self._format_msprof_section(parent_residual)
+        msprof_section = self._format_msprof_section(parent_residual, p2_diag=p2_diag)
         cfg_obj = getattr(self, "_config", None)
         op_name = str(
             getattr(cfg_obj, "operator_name", "") or getattr(cfg_obj, "operator", "") or ""
@@ -4000,10 +4290,15 @@ class PerfTargetCampaignRunner:
         domain_section = (
             f"{domain_env.format_prompt_block()}\n\n" if domain_env is not None else ""
         )
+        golden_abi_block = self._build_golden_entrypoint_abi_block()
         abi_section = (
-            _extract_regime_abi_context(incumbent_source, regime_spec)
+            _extract_regime_abi_context(
+                incumbent_source,
+                regime_spec,
+                golden_abi_block=golden_abi_block,
+            )
             if incumbent_source
-            else ""
+            else golden_abi_block
         )
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
@@ -4100,6 +4395,7 @@ class PerfTargetCampaignRunner:
                 f"{sha}:{tag}": dict(metrics)
                 for (sha, tag), metrics in sorted(self._msprof_cache.items())
             },
+            "stagnation_diagnosis_stats": self._serialize_diag_stats(),
             "stop_reason": stop_reason,
             "l4_result": l4_result.to_dict() if l4_result else None,
             "pending_promotion": promotion.to_dict() if promotion is not None else None,
@@ -4184,6 +4480,7 @@ class PerfTargetCampaignRunner:
                     for k, v in raw_metrics.items()
                     if isinstance(v, (int, float)) and not isinstance(v, bool)
                 }
+        self._restore_diag_stats(payload.get("stagnation_diagnosis_stats"))
         rounds = [CampaignRoundRecord.from_dict(r) for r in payload.get("rounds", ())]
         raw_stag_map = payload.get("stagnation_by_regime")
         if isinstance(raw_stag_map, Mapping):
@@ -4253,6 +4550,235 @@ class PerfTargetCampaignRunner:
             pending_promotion,
             pending_l4,
         )
+
+    def _ensure_regime_diag_entry(self, regime_tag: str) -> dict[str, object]:
+        entry = self._regime_diag_stats.get(regime_tag)
+        if entry is None:
+            entry = {
+                "rule_starvation_rounds": 0,
+                "cost_prescreen_filtered_count": 0,
+                "l0_reject_reasons": {},
+                "l1_compiler_penalty_rejects": 0,
+                "l2_no_gain_rounds": 0,
+                "l3_rollback_count": 0,
+                "top_symptom_families": [],
+            }
+            self._regime_diag_stats[regime_tag] = entry
+        return entry
+
+    def _serialize_diag_stats(self) -> dict[str, dict[str, object]]:
+        out: dict[str, dict[str, object]] = {}
+        for rtag, raw in sorted(self._regime_diag_stats.items()):
+            reasons = raw.get("l0_reject_reasons")
+            clean_reasons = (
+                {str(k): int(v) for k, v in sorted(reasons.items())}
+                if isinstance(reasons, Mapping)
+                else {}
+            )
+            top_fams = raw.get("top_symptom_families")
+            clean_fams = list(top_fams) if isinstance(top_fams, list) else []
+            out[str(rtag)] = {
+                "rule_starvation_rounds": int(raw.get("rule_starvation_rounds", 0) or 0),
+                "cost_prescreen_filtered_count": int(
+                    raw.get("cost_prescreen_filtered_count", 0) or 0
+                ),
+                "l0_reject_reasons": clean_reasons,
+                "l1_compiler_penalty_rejects": int(
+                    raw.get("l1_compiler_penalty_rejects", 0) or 0
+                ),
+                "l2_no_gain_rounds": int(raw.get("l2_no_gain_rounds", 0) or 0),
+                "l3_rollback_count": int(raw.get("l3_rollback_count", 0) or 0),
+                "top_symptom_families": clean_fams,
+            }
+        return out
+
+    def _restore_diag_stats(self, raw_stats: object) -> None:
+        self._regime_diag_stats = {}
+        if not isinstance(raw_stats, Mapping):
+            return
+        for rtag, raw in raw_stats.items():
+            if not isinstance(raw, Mapping):
+                continue
+            reasons_raw = raw.get("l0_reject_reasons")
+            reasons = (
+                {
+                    str(k): int(v)
+                    for k, v in reasons_raw.items()
+                    if isinstance(v, (int, float)) and not isinstance(v, bool)
+                }
+                if isinstance(reasons_raw, Mapping)
+                else {}
+            )
+            top_raw = raw.get("top_symptom_families")
+            top_fams: list[dict[str, object]] = []
+            if isinstance(top_raw, list):
+                for item in top_raw:
+                    if isinstance(item, Mapping):
+                        top_fams.append({str(k): v for k, v in item.items()})
+                    elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                        top_fams.append(
+                            {
+                                "symptom_family": str(item[0]),
+                                "severity": float(item[1]),
+                            }
+                        )
+            self._regime_diag_stats[str(rtag)] = {
+                "rule_starvation_rounds": int(raw.get("rule_starvation_rounds", 0) or 0),
+                "cost_prescreen_filtered_count": int(
+                    raw.get("cost_prescreen_filtered_count", 0) or 0
+                ),
+                "l0_reject_reasons": reasons,
+                "l1_compiler_penalty_rejects": int(
+                    raw.get("l1_compiler_penalty_rejects", 0) or 0
+                ),
+                "l2_no_gain_rounds": int(raw.get("l2_no_gain_rounds", 0) or 0),
+                "l3_rollback_count": int(raw.get("l3_rollback_count", 0) or 0),
+                "top_symptom_families": top_fams,
+            }
+
+    @staticmethod
+    def _categorize_l0_reject_reason(error_message: str) -> str:
+        msg = str(error_message or "")
+        low = msg.lower()
+        if "ast_patch_error" in msg:
+            return "ast_patch_error"
+        if "[repair_timeout]" in msg or "repair_transport" in msg:
+            return "repair_timeout"
+        if "dead_code" in low or "inactive" in low:
+            return "dead_code"
+        if "stage_a_config_resolve_error" in msg:
+            return "config_resolve_error"
+        if "ub" in low and "overflow" in low:
+            return "ub_overflow"
+        if "l1" in low and "overflow" in low:
+            return "l1_overflow"
+        if "freedom" in low or "facet" in low or "lock" in low:
+            return "facet_lock"
+        if "illegal" in low or "ledger" in low:
+            return "illegal_ledger"
+        return "l0_other"
+
+    @staticmethod
+    def _classify_primary_stagnation_cause(
+        *,
+        rule_starvation_rounds: int,
+        cost_prescreen_filtered_count: int,
+        l0_rejects: int,
+        l1_rejects: int,
+        l2_no_gain_rounds: int,
+        l3_rollback_count: int,
+        final_roofline_eta: float,
+        target_roofline_eta: float,
+        stop_reason: str = "",
+    ) -> str:
+        compile_rejects = l0_rejects + l1_rejects
+        if stop_reason == "roofline_saturated" or (
+            target_roofline_eta > 0.0 and final_roofline_eta >= target_roofline_eta
+        ):
+            return "roofline_saturated"
+        if l3_rollback_count > 0 and l3_rollback_count >= max(1, l2_no_gain_rounds // 2):
+            return "l3_accuracy_instability"
+        if (
+            cost_prescreen_filtered_count > 0
+            and cost_prescreen_filtered_count >= compile_rejects
+            and (l2_no_gain_rounds > 0 or cost_prescreen_filtered_count >= 2)
+        ):
+            return "cost_prescreen_mismatch"
+        if compile_rejects > 0 and compile_rejects >= max(
+            rule_starvation_rounds, l2_no_gain_rounds
+        ):
+            return "l0_l1_compile_wall"
+        if rule_starvation_rounds > 0 and rule_starvation_rounds >= l2_no_gain_rounds:
+            return "rule_starvation"
+        if l2_no_gain_rounds > 0:
+            return "hardware_unmodeled_stall"
+        if cost_prescreen_filtered_count > 0:
+            return "cost_prescreen_mismatch"
+        return "hardware_unmodeled_stall"
+
+    def _build_stagnation_diagnosis(
+        self,
+        *,
+        best_result: CandidateSurrogateResult,
+        stop_reason: str,
+    ) -> dict[str, object]:
+        target_eta = float(self._perf_target.target_roofline_eta)
+        all_tags = sorted(
+            set(self._regime_diag_stats.keys())
+            | {spec.regime_tag for spec in self._regime_specs}
+        )
+        regimes_payload: dict[str, dict[str, object]] = {}
+        tot_starv = 0
+        tot_prescreen = 0
+        tot_l0 = 0
+        tot_l1 = 0
+        tot_l2_nogain = 0
+        tot_l3_rb = 0
+        for rtag in all_tags:
+            raw = self._regime_diag_stats.get(rtag) or {}
+            reasons_raw = raw.get("l0_reject_reasons")
+            reasons = (
+                {str(k): int(v) for k, v in sorted(reasons_raw.items())}
+                if isinstance(reasons_raw, Mapping)
+                else {}
+            )
+            starv = int(raw.get("rule_starvation_rounds", 0) or 0)
+            prescreen = int(raw.get("cost_prescreen_filtered_count", 0) or 0)
+            l0_count = sum(reasons.values())
+            l1_count = int(raw.get("l1_compiler_penalty_rejects", 0) or 0)
+            l2_nogain = int(raw.get("l2_no_gain_rounds", 0) or 0)
+            l3_rb = int(raw.get("l3_rollback_count", 0) or 0)
+            top_fams_raw = raw.get("top_symptom_families")
+            top_fams = list(top_fams_raw) if isinstance(top_fams_raw, list) else []
+            reg_res = best_result.for_regime(rtag)
+            reg_eta = float(
+                reg_res.avg_roofline_eta if reg_res.anchors else best_result.avg_roofline_eta
+            )
+            cause = self._classify_primary_stagnation_cause(
+                rule_starvation_rounds=starv,
+                cost_prescreen_filtered_count=prescreen,
+                l0_rejects=l0_count,
+                l1_rejects=l1_count,
+                l2_no_gain_rounds=l2_nogain,
+                l3_rollback_count=l3_rb,
+                final_roofline_eta=reg_eta,
+                target_roofline_eta=target_eta,
+                stop_reason=(stop_reason if len(all_tags) <= 1 else ""),
+            )
+            regimes_payload[rtag] = {
+                "rule_starvation_rounds": starv,
+                "cost_prescreen_filtered_count": prescreen,
+                "l0_reject_reasons": reasons,
+                "l1_compiler_penalty_rejects": l1_count,
+                "l2_no_gain_rounds": l2_nogain,
+                "l3_rollback_count": l3_rb,
+                "top_symptom_families": top_fams,
+                "final_roofline_eta": round(reg_eta, 6),
+                "primary_stagnation_cause": cause,
+            }
+            tot_starv += starv
+            tot_prescreen += prescreen
+            tot_l0 += l0_count
+            tot_l1 += l1_count
+            tot_l2_nogain += l2_nogain
+            tot_l3_rb += l3_rb
+        overall_eta = float(best_result.avg_roofline_eta)
+        overall_cause = self._classify_primary_stagnation_cause(
+            rule_starvation_rounds=tot_starv,
+            cost_prescreen_filtered_count=tot_prescreen,
+            l0_rejects=tot_l0,
+            l1_rejects=tot_l1,
+            l2_no_gain_rounds=tot_l2_nogain,
+            l3_rollback_count=tot_l3_rb,
+            final_roofline_eta=overall_eta,
+            target_roofline_eta=target_eta,
+            stop_reason=stop_reason,
+        )
+        return {
+            "primary_stagnation_cause": overall_cause,
+            "final_roofline_eta": round(overall_eta, 6),
+            "regimes": regimes_payload,
+        }
 
     def _resolve_round_parent(
         self,
@@ -5809,6 +6335,7 @@ class PerfTargetCampaignRunner:
             },
         )
         ranked_families = rank_symptom_families(ctx)
+        parent_p2_diag: dict[str, object] | None = None
         if _should_trigger_p2_deep_dive(stagnation_rounds, ranked_families):
             top_pair = [(fam.value, score) for fam, score in ranked_families[:2]]
             logger.info(
@@ -5817,6 +6344,12 @@ class PerfTargetCampaignRunner:
                 regime_spec.regime_tag,
                 stagnation_rounds,
                 top_pair,
+            )
+            parent_p2_diag = self._collect_p2_deep_dive_for_regime(
+                parent_module_source,
+                best_result,
+                active_anchors,
+                regime_spec,
             )
         parent_comp_summary = compiler_summary_from_residual(parent_residual)
         parent_waterlines = getattr(parent_ledger, "waterlines", {}) or {}
@@ -5842,7 +6375,10 @@ class PerfTargetCampaignRunner:
             except (OSError, json.JSONDecodeError) as exc:
                 logger.debug("ExperienceLake per-round KB sync skipped: %s", exc)
             try:
-                self._cost_model.replay_experience_lake(self._experience_lake_dir)
+                self._cost_model.replay_experience_lake(
+                    self._experience_lake_dir,
+                    exclude_run_id=self._run_id,
+                )
             except (OSError, json.JSONDecodeError) as exc:
                 logger.debug("ExperienceLake per-round cost replay skipped: %s", exc)
         parent_cost_pred = self._cost_model.predict(
@@ -5862,6 +6398,17 @@ class PerfTargetCampaignRunner:
                 l1_overflow=l1_overflow,
                 ub_overflow=ub_overflow,
             )
+            for fam, _score in ranked_families:
+                if not self._tracker.is_family_tabued(
+                    regime_tag=regime_spec.regime_tag,
+                    symptom_family=fam,
+                    parent_sha=parent_sha,
+                    current_round=round_idx,
+                ):
+                    fam_facets = SYMPTOM_FAMILY_TO_FACETS.get(fam, ())
+                    if fam_facets:
+                        active_mask = active_mask.unlock(*fam_facets)
+                    break
             self._freedom_masks[regime_spec.regime_tag] = active_mask
             if normalize_runtime_backend(regime_spec.runtime_backend) in (
                 "ascendc_trackb",
@@ -5947,6 +6494,7 @@ class PerfTargetCampaignRunner:
                 regime_tag=regime_spec.regime_tag,
                 parent_sha=parent_sha,
                 current_round=round_idx,
+                symptom_ranking=ranked_families,
             )
         )
 
@@ -5970,6 +6518,7 @@ class PerfTargetCampaignRunner:
                         incumbent_source=parent_module_source,
                         sil_policy_section=sil_policy_section,
                         effort=self._config.exploit_effort,
+                        p2_diag=parent_p2_diag,
                     ),
                 )
             )
@@ -6057,6 +6606,7 @@ class PerfTargetCampaignRunner:
                         incumbent_source=parent_module_source,
                         parent_hypothesis=selected_stone_hypothesis,
                         sil_policy_section=sil_policy_section,
+                        p2_diag=parent_p2_diag,
                     ),
                 )
             )
@@ -6497,12 +7047,50 @@ class PerfTargetCampaignRunner:
                 features=chk.stage_a.features if chk.stage_a else None,
                 route=chk.stage_a.route if chk.stage_a else None,
             )
+            stone_parent_result: CandidateSurrogateResult | None = None
+            if parent_module_source == incumbent_source:
+                stone_parent_result = best_result
+            elif selected_stone is not None and selected_stone.case_latencies_us:
+                stone_anchors = tuple(
+                    AnchorEvalMetrics(
+                        case_num=int(anc.case_num),
+                        regime_tag=anc.regime_tag,
+                        accuracy_passed=True,
+                        cand_us=float(selected_stone.case_latencies_us[int(anc.case_num)]),
+                        ref_perf_us=float(anc.ref_perf_us),
+                        t_hw_us=float(anc.t_hw_us),
+                        speedup=(
+                            float(anc.ref_perf_us)
+                            / float(selected_stone.case_latencies_us[int(anc.case_num)])
+                            if anc.ref_perf_us > 0.0
+                            and selected_stone.case_latencies_us[int(anc.case_num)] > 0.0
+                            else 0.0
+                        ),
+                        roofline_eta=(
+                            float(anc.t_hw_us)
+                            / float(selected_stone.case_latencies_us[int(anc.case_num)])
+                            if anc.t_hw_us > 0.0
+                            and selected_stone.case_latencies_us[int(anc.case_num)] > 0.0
+                            else 0.0
+                        ),
+                        eq3_score=0.0,
+                    )
+                    for anc in res.anchors
+                    if int(anc.case_num) in selected_stone.case_latencies_us
+                    and selected_stone.case_latencies_us[int(anc.case_num)] > 0.0
+                )
+                if stone_anchors:
+                    stone_parent_result = aggregate_surrogate_result(
+                        selected_stone.candidate_id,
+                        self._config.operator_name,
+                        stone_anchors,
+                    )
             self._record_surrogate_observations(
                 source=chk.patched_module_source,
                 result=res,
                 active_anchors=active_anchors,
                 parent_source=parent_module_source,
-                parent_result=(best_result if parent_module_source == incumbent_source else None),
+                parent_result=stone_parent_result,
                 parent_ledger=parent_ledger,
                 parent_bisheng_res=parent_comp_summary,
                 parent_axes=parent_axes,
@@ -6511,6 +7099,11 @@ class PerfTargetCampaignRunner:
                 stage_b_profile=cand_stage_b_prof,
                 axes=cand_axes,
                 policy=getattr(live_plan, "policy", None),
+                parent_policy=(
+                    selected_stone.policy or None
+                    if (selected_stone is not None and parent_module_source != incumbent_source)
+                    else None
+                ),
                 worker_kind=wkind,
                 rule_id=rule.rule_id if rule else None,
                 backend_track=track,
@@ -6547,6 +7140,12 @@ class PerfTargetCampaignRunner:
                         else None
                     ),
                     objective_score=obj_score,
+                    case_latencies_us={
+                        int(a.case_num): float(a.cand_us)
+                        for a in (res.anchors or local_res.anchors)
+                        if a.cand_us > 0.0
+                    },
+                    policy=dict(getattr(live_plan, "policy", {}) or {}),
                 )
             )
             if rule is not None:
@@ -6768,6 +7367,48 @@ class PerfTargetCampaignRunner:
                         except (OSError, ValueError) as exc:
                             logger.debug("Persisting promoted rule %s skipped: %s", rid, exc)
 
+        diag_entry = self._ensure_regime_diag_entry(regime_spec.regime_tag)
+        if len(ranked_rules) == 0:
+            diag_entry["rule_starvation_rounds"] = int(
+                diag_entry.get("rule_starvation_rounds", 0) or 0
+            ) + 1
+        l0_reasons_raw = diag_entry.get("l0_reject_reasons")
+        l0_reasons: dict[str, int] = (
+            dict(l0_reasons_raw) if isinstance(l0_reasons_raw, Mapping) else {}
+        )
+        for chk in l0_l1_checks:
+            if chk.passed:
+                continue
+            if chk.failed_tier == "cost_prescreen":
+                diag_entry["cost_prescreen_filtered_count"] = int(
+                    diag_entry.get("cost_prescreen_filtered_count", 0) or 0
+                ) + 1
+            elif chk.failed_tier == "stage_b":
+                diag_entry["l1_compiler_penalty_rejects"] = int(
+                    diag_entry.get("l1_compiler_penalty_rejects", 0) or 0
+                ) + 1
+            else:
+                reason = self._categorize_l0_reject_reason(chk.error_message)
+                l0_reasons[reason] = int(l0_reasons.get(reason, 0)) + 1
+        diag_entry["l0_reject_reasons"] = l0_reasons
+        if bool(l2_results) and not promoted:
+            diag_entry["l2_no_gain_rounds"] = int(
+                diag_entry.get("l2_no_gain_rounds", 0) or 0
+            ) + 1
+        if rolled_back_l3:
+            diag_entry["l3_rollback_count"] = int(
+                diag_entry.get("l3_rollback_count", 0) or 0
+            ) + 1
+        diag_entry["top_symptom_families"] = [
+            {
+                "symptom_family": (
+                    fam.value if isinstance(fam, SymptomFamily) else str(fam)
+                ),
+                "severity": round(float(score), 4),
+            }
+            for fam, score in ranked_families[:3]
+        ]
+
         trackb_evidence = self._collect_trackb_round_evidence(
             round_idx=round_idx,
             regime_spec=regime_spec,
@@ -6842,6 +7483,7 @@ class PerfTargetCampaignRunner:
                 pending_l4,
             ) = self._restore_from_checkpoint()
         else:
+            self._regime_diag_stats = {}
             incumbent_source = self._target_module_path.read_text(encoding="utf-8")
             active_anchors = list(self._initial_anchors)
             baseline_result = self._evaluate_single_baseline(incumbent_source, active_anchors)
@@ -6851,32 +7493,61 @@ class PerfTargetCampaignRunner:
                 active_anchors,
                 self._regime_specs,
             )
-            base_sa = None
             if self._regime_specs:
-                try:
-                    base_sa = self._run_l0(incumbent_source, self._regime_specs[0])
-                except (SyntaxError, RuntimeError, ValueError, TypeError, OSError):
+                matched_any_regime = any(
+                    baseline_result.for_regime(r.regime_tag).anchors for r in self._regime_specs
+                )
+                for idx, rspec in enumerate(self._regime_specs):
                     base_sa = None
-            base_ledger = base_sa.ledger if base_sa is not None else None
-            base_axes = self._derive_topology_axes(
-                base_ledger,
-                features=base_sa.features if base_sa is not None else None,
-                route=base_sa.route if base_sa is not None else None,
-            )
-            self._record_surrogate_observations(
-                source=incumbent_source,
-                result=baseline_result,
-                active_anchors=active_anchors,
-                eval_tier_override="baseline",
-                ledger=base_ledger,
-                axes=base_axes,
-                worker_kind="baseline",
-                backend_track=(
-                    base_sa.route.track
-                    if self._enable_track_router and base_sa is not None and base_sa.route is not None
-                    else "tilelang_dsl"
-                ),
-            )
+                    try:
+                        base_sa = self._run_l0(incumbent_source, rspec)
+                    except (SyntaxError, RuntimeError, ValueError, TypeError, OSError):
+                        base_sa = None
+                    base_l1 = None
+                    try:
+                        base_l1 = self._l1_summary_for_first_round(incumbent_source, rspec)
+                    except (SyntaxError, RuntimeError, ValueError, TypeError, OSError):
+                        base_l1 = None
+                    base_ledger = base_sa.ledger if base_sa is not None else None
+                    base_axes = self._derive_topology_axes(
+                        base_ledger,
+                        features=base_sa.features if base_sa is not None else None,
+                        route=base_sa.route if base_sa is not None else None,
+                    )
+                    regime_res = baseline_result.for_regime(rspec.regime_tag)
+                    if not regime_res.anchors and (
+                        len(self._regime_specs) == 1 or (not matched_any_regime and idx == 0)
+                    ):
+                        regime_res = baseline_result
+                    self._record_surrogate_observations(
+                        source=incumbent_source,
+                        result=regime_res,
+                        active_anchors=active_anchors,
+                        eval_tier_override="baseline",
+                        ledger=base_ledger,
+                        bisheng_summary=base_l1,
+                        axes=base_axes,
+                        worker_kind="baseline",
+                        backend_track=(
+                            base_sa.route.track
+                            if self._enable_track_router
+                            and base_sa is not None
+                            and base_sa.route is not None
+                            else "tilelang_dsl"
+                        ),
+                        regime_tag=rspec.regime_tag,
+                    )
+            else:
+                self._record_surrogate_observations(
+                    source=incumbent_source,
+                    result=baseline_result,
+                    active_anchors=active_anchors,
+                    eval_tier_override="baseline",
+                    ledger=None,
+                    axes=None,
+                    worker_kind="baseline",
+                    backend_track="tilelang_dsl",
+                )
             best_result = baseline_result
             frozen_regimes = set()
             current_regime = None
@@ -7205,6 +7876,10 @@ class PerfTargetCampaignRunner:
             pending_l4=self._pending_l4,
         )
 
+        stagnation_diagnosis = self._build_stagnation_diagnosis(
+            best_result=best_result,
+            stop_reason=stop_reason,
+        )
         return CampaignReport(
             operator_name=self._config.operator_name,
             stop_reason=stop_reason,
@@ -7222,6 +7897,9 @@ class PerfTargetCampaignRunner:
             pending_promotion=pending_promotion,
             pending_l4=self._pending_l4,
             promotion_blocked=promotion_blocked,
+            pure_golden_mode=bool(self._config.pure_golden),
+            blueprint_provenance=dict(self._blueprint_provenance),
+            stagnation_diagnosis=stagnation_diagnosis,
         )
 
 
@@ -7291,6 +7969,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Keep only the top-K cost-model candidates during creative prescreen.",
     )
+    parser.add_argument(
+        "--pure-golden",
+        action="store_true",
+        help="Disable authored/scheduled HIR paths and synthesize blueprints strictly from golden.py.",
+    )
     return parser
 
 
@@ -7312,6 +7995,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cost_prescreen_top_k=(
             int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
         ),
+        pure_golden=bool(args.pure_golden),
     )
     tracker = BayesianRuleTracker.from_seed_yaml()
     flywheel = FlywheelDistiller(
