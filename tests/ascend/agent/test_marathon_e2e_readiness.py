@@ -137,7 +137,14 @@ def _get_kernel(total_elements: int, tl_dtype: str):
     return _KERNEL_CACHE[key]
 
 
-def apply_rotary_pos_emb(query, key, cos, sin, layout=0, rotaryMode="half"):
+def apply_rotary_pos_emb(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    layout: int = 0,
+    rotaryMode: str = "half",
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute the pure TileLang NPU seed kernel for apply_rotary_pos_emb."""
     orig_shape = query.shape
     flat = query.contiguous().view(-1)
@@ -653,7 +660,8 @@ def test_prepare_marathon_seed_cold_start_rope_semantic_regimes_pass_l0_and_take
     assert "def _select_apply_rotary_pos_emb_config(" in system_prompt
     assert "def _build_apply_rotary_pos_emb_prim_func(" in system_prompt
     assert "def _get_kernel(" in system_prompt
-    assert "def apply_rotary_pos_emb(...) -> object:" in system_prompt
+    assert "def apply_rotary_pos_emb(query: torch.Tensor," in system_prompt
+    assert "-> tuple[torch.Tensor, torch.Tensor]:" in system_prompt
     assert "kernel = apply_rotary_pos_emb" in system_prompt
     assert "layout: int =" in system_prompt
     assert "rotaryMode: str =" in system_prompt
