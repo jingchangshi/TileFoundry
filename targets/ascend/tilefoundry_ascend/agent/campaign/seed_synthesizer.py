@@ -240,10 +240,33 @@ def _official_contract_section(
     return "\n".join(lines) + "\n\n"
 
 
-def _seed_feedback_section(last_error: str) -> str:
+def _seed_feedback_section(
+    last_error: str,
+    rejected_source: str | None,
+    rejected_error: str,
+) -> str:
     if not last_error:
         return ""
-    return f"### PREVIOUS ATTEMPT FAILURE DIAGNOSTIC\n{last_error}\n\n"
+    sections = ["### PREVIOUS ATTEMPT FAILURE DIAGNOSTIC", last_error, ""]
+    if rejected_source is not None:
+        sections.extend(
+            [
+                "### LAST REJECTED CANDIDATE SOURCE",
+                "```python",
+                rejected_source,
+                "```",
+                "",
+            ]
+        )
+        if rejected_error and rejected_error != last_error:
+            sections.extend(
+                [
+                    "### LAST REJECTED CANDIDATE DIAGNOSTIC",
+                    rejected_error,
+                    "",
+                ]
+            )
+    return "\n".join(sections) + "\n"
 
 
 def _build_blueprints(
@@ -401,6 +424,8 @@ async def prepare_operator_seed_or_takeover(
     contract_block = _official_contract_section(proto, cases, regime_specs)
 
     last_error = ""
+    last_rejected_source: str | None = None
+    last_rejected_error = ""
     for attempt in range(1, max(1, max_seed_attempts) + 1):
         request = GenerationRequest(
             role="explore_creative" if attempt == 1 else "syntax_repair",
@@ -409,7 +434,7 @@ async def prepare_operator_seed_or_takeover(
                 f"{constraint_block}\n\n"
                 f"{golden_block}"
                 f"{contract_block}"
-                f"{_seed_feedback_section(last_error)}"
+                f"{_seed_feedback_section(last_error, last_rejected_source, last_rejected_error)}"
                 "Output ONLY valid Python module source code."
             ),
             effort="high",
@@ -424,6 +449,8 @@ async def prepare_operator_seed_or_takeover(
         ok_static, static_err = l0_l1_validator(synthesized_src, initial_track)
         if not ok_static:
             last_error = f"L0/L1 static or compiler rejection:\n{static_err}"
+            last_rejected_source = synthesized_src
+            last_rejected_error = last_error
             continue
 
         evidence = oracle_accuracy_validator(synthesized_src)
@@ -465,6 +492,8 @@ async def prepare_operator_seed_or_takeover(
             "NPU numerical mismatch against PyTorch golden:\n"
             f"{evidence.error_message or f'L3 promotion state={evidence.l3_state}'}"
         )
+        last_rejected_source = synthesized_src
+        last_rejected_error = last_error
 
     raise RuntimeError(
         f"Stage-0 cold-start seed synthesis failed for {operator_name} after "

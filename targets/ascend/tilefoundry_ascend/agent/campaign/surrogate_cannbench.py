@@ -40,6 +40,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
+    _bounded_compile_diagnostic,
     _parse_cce_res_usage_with_summary,
     build_stage_b_driver_source,
     run_stage_a_static,
@@ -653,7 +654,7 @@ def run_l1_compile_check(
         else None
     )
     if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()[-1500:]
+        detail = _bounded_compile_diagnostic(proc.stderr or proc.stdout or "")
         return StageBResult(
             passed=False,
             error_message=f"l1_compile_failed (rc={proc.returncode}): {detail}",

@@ -330,6 +330,33 @@ _VLOOPV2_MISS_RE = re.compile(
     re.IGNORECASE,
 )
 
+_COMPILE_DIAGNOSTIC_LIMIT = 1500
+_COMPILE_ERROR_RE = re.compile(
+    r"(?i)(?:\[error\]|(?:^|[\s:\[(])(?:fatal\s+)?error:)"
+)
+
+
+def _bounded_compile_diagnostic(
+    output_text: str,
+    *,
+    limit: int = _COMPILE_DIAGNOSTIC_LIMIT,
+) -> str:
+    """Keep the primary compiler error line and a bounded tail of its output."""
+    text = output_text.strip()
+    if len(text) <= limit:
+        return text
+    error_line = next(
+        (line.strip() for line in text.splitlines() if _COMPILE_ERROR_RE.search(line)),
+        "",
+    )
+    tail = text[-limit:]
+    if not error_line or error_line in tail:
+        return tail
+    prefix = f"{error_line}\n[... compiler output truncated ...]\n"
+    if len(prefix) >= limit:
+        return error_line[:limit]
+    return prefix + text[-(limit - len(prefix)) :]
+
 
 def _parse_cce_res_usage_with_summary(
     output_text: str,
@@ -1618,7 +1645,7 @@ def run_stage_b_compile(
         else None
     )
     if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()[-1500:]
+        detail = _bounded_compile_diagnostic(proc.stderr or proc.stdout or "")
         return StageBResult(
             passed=False,
             error_message=f"stage_b_compile_failed (rc={proc.returncode}): {detail}",
@@ -2222,9 +2249,9 @@ def run_stage_b_ascendc_compile(
                 if cpp_source.strip()
                 else None
             )
-            detail = (proc.stderr or proc.stdout or "bisheng failed without diagnostics").strip()[
-                -1500:
-            ]
+            detail = _bounded_compile_diagnostic(
+                proc.stderr or proc.stdout or "bisheng failed without diagnostics"
+            )
             return StageBResult(
                 passed=False,
                 error_message=f"stage_b_ascendc_compile_failed (rc={proc.returncode}): {detail}",

@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from tilefoundry_ascend.agent.campaign import surrogate_cannbench
+from tilefoundry_ascend.agent.campaign.surrogate_cannbench import run_l1_compile_check
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
     StageBResult,
     StageCResult,
+    _bounded_compile_diagnostic,
     parse_cce_res_usage,
     run_stage_a_static,
     run_stage_b_compile,
@@ -121,3 +129,73 @@ def test_gate_funnel_python_kernel_module_and_cce_res_usage_parsing() -> None:
     assert "hw:register_spill" in sig
     assert "hw:low_l2_hit" in sig
     assert "hw:vloopv2_miss" in sig
+
+
+def test_bounded_compile_diagnostic_keeps_primary_error_and_source_tail() -> None:
+    primary = "/tmp/candidate_dsl.py:42:7: error: use of undeclared identifier 'tile_buf'"
+    source_tail = "Source:\n" + "".join(
+        f"    {index}: T.copy(X[{index}], x_ub)\n" for index in range(120)
+    )
+    output = (
+        "note: lowering candidate kernel\n"
+        f"{primary}\n"
+        "note: CCE codegen failed\n"
+        "owner: bisheng\n"
+        f"{source_tail}"
+    )
+    assert len(output) > 1500
+
+    diagnostic = _bounded_compile_diagnostic(output)
+    assert len(diagnostic) <= 1500
+    assert diagnostic.startswith(primary)
+    assert "[... compiler output truncated ...]" in diagnostic
+    assert source_tail.rstrip()[-1200:] in diagnostic
+    assert "T.copy(X[119], x_ub)" in diagnostic
+
+    short = "kernel.cce:7:1: error: expected ';'"
+    assert _bounded_compile_diagnostic(short) == short
+
+    tail_with_error = "Source:\n" + "x" * 2000 + f"\n{primary}"
+    assert _bounded_compile_diagnostic(tail_with_error) == tail_with_error[-1500:]
+
+    no_error = "Source:\n" + "y" * 2000
+    assert _bounded_compile_diagnostic(no_error) == no_error[-1500:]
+
+    bracket_error = "[ERROR] bisheng crashed\n" + "z" * 2000
+    assert _bounded_compile_diagnostic(bracket_error).startswith("[ERROR] bisheng crashed")
+
+
+def test_run_l1_compile_check_keeps_primary_error_before_source_tail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = tmp_path / "env.sh"
+    env_file.write_text("TILEFOUNDRY_NPU_TILELANG_SOURCE=/opt/tilelang\n", encoding="utf-8")
+    primary = "/tmp/candidate_dsl.py:42:7: error: use of undeclared identifier 'tile_buf'"
+    stderr = f"{primary}\n" + "".join(f"Source: line {index}\n" for index in range(200))
+    completed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr=stderr)
+
+    def _fake_run(
+        argv: list[str],
+        *,
+        text: bool,
+        capture_output: bool,
+        cwd: str,
+        env: dict[str, str],
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        return completed
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
+    result = run_l1_compile_check(
+        "def _build_exp_prim_func():\n    return None\n",
+        builder_name="_build_exp_prim_func",
+        builder_kwargs={},
+        env_file=env_file,
+    )
+
+    assert result.passed is False
+    assert result.error_message.startswith("l1_compile_failed (rc=1): ")
+    assert primary in result.error_message
+    assert "Source: line 199" in result.error_message
+    assert len(result.error_message) <= len("l1_compile_failed (rc=1): ") + 1500

@@ -232,29 +232,16 @@ kernel = exp
 class _ScriptedBackend:
     """Deterministic async LLM backend replaying a fixed reply sequence."""
 
-    def __init__(self, replies: Sequence[str]) -> None:
+    def __init__(self, replies: Sequence[str | TimeoutError]) -> None:
         self._replies = list(replies)
         self.requests: list[GenerationRequest] = []
 
     async def generate(self, req: GenerationRequest) -> str:
         self.requests.append(req)
-        index = min(len(self.requests) - 1, len(self._replies) - 1)
-        return self._replies[index]
-
-
-class _TimeoutBackend:
-    """Async LLM backend that raises TimeoutError for an initial call budget."""
-
-    def __init__(self, timeout_calls: int, reply: str = "") -> None:
-        self._timeout_calls = timeout_calls
-        self._reply = reply
-        self.requests: list[GenerationRequest] = []
-
-    async def generate(self, req: GenerationRequest) -> str:
-        self.requests.append(req)
-        if len(self.requests) <= self._timeout_calls:
-            raise TimeoutError("LLM HTTP request timed out")
-        return self._reply
+        reply = self._replies[min(len(self.requests) - 1, len(self._replies) - 1)]
+        if isinstance(reply, TimeoutError):
+            raise reply
+        return reply
 
 
 def _sha256(source: str) -> str:
@@ -610,12 +597,16 @@ def test_prepare_seed_bounded_loop_reports_failed_attempts() -> None:
     assert diagnostics == ["tilelang_dsl", "tilelang_dsl"]
     assert len(backend.requests) == 2
     assert backend.requests[1].role == "syntax_repair"
-    assert "PREVIOUS ATTEMPT FAILURE DIAGNOSTIC" in backend.requests[1].user_prompt
-    assert "missing @T.prim_func entry" in backend.requests[1].user_prompt
+    prompt = backend.requests[1].user_prompt
+    assert "PREVIOUS ATTEMPT FAILURE DIAGNOSTIC" in prompt
+    assert "missing @T.prim_func entry" in prompt
+    assert "### LAST REJECTED CANDIDATE SOURCE" in prompt
+    assert _SEED_MODULE.strip() in prompt
+    assert "### LAST REJECTED CANDIDATE DIAGNOSTIC" not in prompt
 
 
 def test_prepare_seed_retries_after_transport_timeout() -> None:
-    backend = _TimeoutBackend(timeout_calls=1, reply=_SEED_MODULE)
+    backend = _ScriptedBackend([TimeoutError("LLM HTTP request timed out"), _SEED_MODULE])
     outcome = _prepare(golden_source=_EXP_GOLDEN, backend=backend)
     assert outcome.attempts_used == 2
     assert outcome.verification_state == "l3_verified"
@@ -623,18 +614,68 @@ def test_prepare_seed_retries_after_transport_timeout() -> None:
     assert len(backend.requests) == 2
     assert backend.requests[0].role == "explore_creative"
     assert backend.requests[1].role == "syntax_repair"
-    assert "LLM generation transport failure: TimeoutError" in backend.requests[1].user_prompt
-    assert "LLM HTTP request timed out" in backend.requests[1].user_prompt
+    prompt = backend.requests[1].user_prompt
+    assert "LLM generation transport failure: TimeoutError" in prompt
+    assert "LLM HTTP request timed out" in prompt
+    assert "### LAST REJECTED CANDIDATE SOURCE" not in prompt
 
 
 def test_prepare_seed_stops_after_transport_timeout_budget_exhausted() -> None:
-    backend = _TimeoutBackend(timeout_calls=2)
+    backend = _ScriptedBackend(
+        [
+            TimeoutError("LLM HTTP request timed out"),
+            TimeoutError("LLM HTTP request timed out"),
+        ]
+    )
     with pytest.raises(RuntimeError, match="after 2 attempts") as excinfo:
         _prepare(golden_source=_EXP_GOLDEN, backend=backend, max_seed_attempts=2)
     message = str(excinfo.value)
     assert "LLM generation transport failure: TimeoutError" in message
     assert "LLM HTTP request timed out" in message
     assert len(backend.requests) == 2
+
+
+def test_prepare_seed_timeout_after_rejection_keeps_last_candidate() -> None:
+    rejected_source = "def exp(x):\n    return x\n\nkernel = exp\n"
+    backend = _ScriptedBackend(
+        [
+            rejected_source,
+            TimeoutError("LLM HTTP request timed out"),
+            _SEED_MODULE,
+        ]
+    )
+
+    def _reject_once(module_source: str, track: str) -> tuple[bool, str]:
+        if module_source == rejected_source.strip():
+            return False, "missing @T.prim_func entry"
+        return True, ""
+
+    def _factory(
+        regime_specs: Sequence[RegimeTargetSpec],
+    ) -> Callable[[str, str], tuple[bool, str]]:
+        return _reject_once
+
+    outcome = _prepare(
+        golden_source=_EXP_GOLDEN,
+        backend=backend,
+        l0_l1_validator_factory=_factory,
+    )
+    assert outcome.attempts_used == 3
+    assert outcome.verification_state == "l3_verified"
+    prompt = backend.requests[2].user_prompt
+    timeout_index = prompt.index("LLM generation transport failure: TimeoutError")
+    source_header_index = prompt.index("### LAST REJECTED CANDIDATE SOURCE")
+    source_index = prompt.index(rejected_source.strip())
+    matched_header_index = prompt.index("### LAST REJECTED CANDIDATE DIAGNOSTIC")
+    rejection_index = prompt.index("missing @T.prim_func entry")
+    assert (
+        timeout_index
+        < source_header_index
+        < source_index
+        < matched_header_index
+        < rejection_index
+    )
+    assert _SEED_MODULE.strip() not in prompt
 
 
 def test_prepare_seed_retries_after_oracle_mismatch() -> None:
@@ -661,8 +702,12 @@ def test_prepare_seed_retries_after_oracle_mismatch() -> None:
     assert outcome.oracle_accuracy_passed is True
     assert outcome.l3_run_id == "run-stage0-0001"
     assert len(backend.requests) == 2
-    assert "NPU numerical mismatch" in backend.requests[1].user_prompt
-    assert "max_abs_err=0.0312" in backend.requests[1].user_prompt
+    prompt = backend.requests[1].user_prompt
+    assert "NPU numerical mismatch" in prompt
+    assert "max_abs_err=0.0312" in prompt
+    assert "### LAST REJECTED CANDIDATE SOURCE" in prompt
+    assert _SEED_MODULE.strip() in prompt
+    assert "### LAST REJECTED CANDIDATE DIAGNOSTIC" not in prompt
 
 
 def test_prepare_seed_rejects_oracle_evidence_for_a_different_candidate() -> None:
