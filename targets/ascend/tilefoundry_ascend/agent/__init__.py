@@ -58,6 +58,7 @@ from tilefoundry_ascend.agent.orchestrator import (
     prescreen_dsl_tile_kwargs,
     prescreen_tile_configs,
     run_e2e_evolution,
+    verify_reference_cpu_parity,
     verify_twin_cpu_reference,
 )
 from tilefoundry_ascend.agent.router import (
@@ -121,5 +122,6 @@ __all__ = [
     "safe_eval_predicate",
     "save_rules_yaml",
     "validate_rule_predicate",
+    "verify_reference_cpu_parity",
     "verify_twin_cpu_reference",
 ]

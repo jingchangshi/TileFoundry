@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Protocol, runtime_checkable
 
 from tilefoundry.ir.tir.stmts import For, Stmt
 from tilefoundry_ascend.ascend.schedule.pipeline_solver import (
@@ -19,6 +20,48 @@ from tilefoundry_ascend.ascend.sil.schema import (
     compute_critical_cube_tile_m,
 )
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
+
+SOLVER_MODE_ALGEBRAIC = "algebraic_piecewise"
+SOLVER_MODE_Z3 = "z3_smt"
+_LEGACY_ALGEBRAIC_MODES = frozenset({"analytical_piecewise"})
+_VALID_CALIPER_ACTIONS = frozenset({"none", "ub_halving", "l1_stage_backoff"})
+_MAX_CALIPER_STEPS = 3
+
+
+def normalize_solver_mode(mode: str) -> str:
+    """Normalize legacy solver mode names onto canonical solver identifiers."""
+    normalized = str(mode).strip()
+    if normalized in _LEGACY_ALGEBRAIC_MODES:
+        return SOLVER_MODE_ALGEBRAIC
+    return normalized
+
+
+@runtime_checkable
+class RooflineSummaryLike(Protocol):
+    """Structural protocol satisfied by HirRooflineSummary without import cycles."""
+
+    anchor_dims: dict[str, int]
+    min_gm_bytes: int
+    dominant_bound: str
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize the Roofline summary into a JSON-compatible dictionary."""
+        ...
+
+
+def _coerce_roofline_mapping(
+    raw: RooflineSummaryLike | Mapping[str, object] | None,
+) -> dict[str, object]:
+    """Convert a HirRooflineSummary or mapping into a string-keyed dictionary."""
+    if raw is None:
+        return {}
+    if isinstance(raw, Mapping):
+        return {str(key): value for key, value in raw.items()}
+    if isinstance(raw, RooflineSummaryLike):
+        return raw.to_dict()
+    raise TypeError(
+        f"roofline must be HirRooflineSummary, Mapping, or None, got {type(raw).__name__}"
+    )
 
 _DTYPE_BYTES: dict[str, int] = {
     "f4e2m1": 1,
@@ -185,7 +228,12 @@ def _extract_regime_fields(
         dims = _as_int_dims(regime.get("representative_dims") or regime.get("dims"))
         has_tail = bool(regime.get("has_unaligned_tail", False))
         has_empty = bool(regime.get("has_empty_group", False))
-        roofline = _as_str_object_mapping(regime.get("roofline"))
+        raw_rf = regime.get("roofline")
+        roofline = (
+            _coerce_roofline_mapping(raw_rf)
+            if isinstance(raw_rf, (Mapping, RooflineSummaryLike))
+            else {}
+        )
         reg_axes = _coerce_topology_axes(regime.get("topology_axes"))
         raw_case_id = regime.get("representative_case_id")
         representative_case_id = (
@@ -208,7 +256,12 @@ def _extract_regime_fields(
     dims = _as_int_dims(getattr(regime, "representative_dims", None))
     has_tail = bool(getattr(regime, "has_unaligned_tail", False))
     has_empty = bool(getattr(regime, "has_empty_group", False))
-    roofline = _as_str_object_mapping(getattr(regime, "roofline", None))
+    raw_obj_rf = getattr(regime, "roofline", None)
+    roofline = (
+        _coerce_roofline_mapping(raw_obj_rf)
+        if isinstance(raw_obj_rf, (Mapping, RooflineSummaryLike))
+        else {}
+    )
     reg_axes = _coerce_topology_axes(getattr(regime, "topology_axes", None))
     ratios = _as_case_ratios(getattr(regime, "case_ratios", None))
     representative_case_id = getattr(regime, "representative_case_id", None)
@@ -286,6 +339,21 @@ class RegimePlanResult:
     persistent_state_space: str = "none"
     persistent_state_bytes: int = 0
     notes: tuple[str, ...] = ()
+    caliper_steps: int = 0
+    caliper_action: str = "none"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "solver_mode", normalize_solver_mode(self.solver_mode))
+        steps = int(self.caliper_steps)
+        if steps < 0:
+            raise ValueError(f"caliper_steps must be non-negative, got {steps}")
+        object.__setattr__(self, "caliper_steps", steps)
+        action = str(self.caliper_action)
+        if action not in _VALID_CALIPER_ACTIONS:
+            raise ValueError(
+                f"caliper_action must be one of {sorted(_VALID_CALIPER_ACTIONS)}, got {action!r}"
+            )
+        object.__setattr__(self, "caliper_action", action)
 
     def to_dict(self) -> dict[str, object]:
         """Return a SIL SchedulePolicy-compatible dictionary."""
@@ -308,7 +376,72 @@ class RegimePlanResult:
             "persistent_state_space": self.persistent_state_space,
             "persistent_state_bytes": self.persistent_state_bytes,
             "notes": list(self.notes),
+            "caliper_steps": self.caliper_steps,
+            "caliper_action": self.caliper_action,
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> RegimePlanResult:
+        """Reconstruct a RegimePlanResult from serialized summary metadata."""
+        axes = _coerce_topology_axes(payload.get("topology_axes"))
+        if axes is None:
+            axes = resolve_canonical_topology_axes({})
+        raw_policy = payload.get("policy")
+        policy = (
+            {str(k): v for k, v in raw_policy.items()}
+            if isinstance(raw_policy, Mapping)
+            else {}
+        )
+        raw_ii = payload.get("ii")
+        ii_val = int(raw_ii) if isinstance(raw_ii, int) and not isinstance(raw_ii, bool) else None
+        raw_bv = payload.get("buffer_versions")
+        buffer_versions = (
+            {str(k): int(v) for k, v in raw_bv.items()}
+            if isinstance(raw_bv, Mapping)
+            else {}
+        )
+        raw_ts = payload.get("task_stages")
+        task_stages = (
+            {str(k): int(v) for k, v in raw_ts.items()}
+            if isinstance(raw_ts, Mapping)
+            else {}
+        )
+        raw_notes = payload.get("notes")
+        notes = (
+            tuple(str(item) for item in raw_notes)
+            if isinstance(raw_notes, (list, tuple))
+            else ()
+        )
+        raw_steps = payload.get("caliper_steps", 0)
+        caliper_steps = (
+            int(raw_steps) if isinstance(raw_steps, int) and not isinstance(raw_steps, bool) else 0
+        )
+        raw_state_bytes = payload.get("persistent_state_bytes", 0)
+        state_bytes = (
+            int(raw_state_bytes)
+            if isinstance(raw_state_bytes, int) and not isinstance(raw_state_bytes, bool)
+            else 0
+        )
+        return cls(
+            regime_tag=str(payload.get("regime_tag", "default")),
+            op_name=str(payload.get("op_name", "")),
+            topology_axes=axes,
+            solver_mode=normalize_solver_mode(
+                str(payload.get("solver_mode", SOLVER_MODE_ALGEBRAIC))
+            ),
+            policy=policy,
+            representative_dims=_as_int_dims(payload.get("representative_dims")),
+            ii=ii_val,
+            buffer_versions=buffer_versions,
+            task_stages=task_stages,
+            fallback_used=bool(payload.get("fallback_used", False)),
+            fallback_reason=str(payload.get("fallback_reason", "")),
+            persistent_state_space=str(payload.get("persistent_state_space", "none")),
+            persistent_state_bytes=state_bytes,
+            notes=notes,
+            caliper_steps=caliper_steps,
+            caliper_action=str(payload.get("caliper_action", "none")),
+        )
 
     def to_sil_policy(self) -> object:
         """Convert to ``ascend.sil.SchedulePolicy`` if available, else return dict."""
@@ -434,7 +567,7 @@ class RegimePiecewiseSolver:
         axes: TopologyAxes,
         explicit_axes: bool,
         dims: dict[str, int],
-        roofline: Mapping[str, object] | None,
+        roofline: RooflineSummaryLike | Mapping[str, object] | None,
         has_unaligned_tail: bool,
         has_empty_group: bool,
         input_dtypes: tuple[str, ...],
@@ -445,10 +578,13 @@ class RegimePiecewiseSolver:
         has_indirect_gather: bool = False,
         quant_mode: str | None = None,
         representative_ratios: CasePhysicsRatios | None = None,
-        solver_mode: str = "analytical_piecewise",
+        solver_mode: str = SOLVER_MODE_ALGEBRAIC,
         fallback_used: bool = False,
         fallback_reason: str = "",
     ) -> RegimePlanResult:
+        roofline_map = _coerce_roofline_mapping(roofline)
+        rf_anchor_dims = _as_int_dims(roofline_map.get("anchor_dims"))
+        merged_dims = {**rf_anchor_dims, **dims}
         elem_dtype = input_dtypes[0] if input_dtypes else "f16"
         elem_bytes = _dtype_bytes(elem_dtype)
 
@@ -504,8 +640,8 @@ class RegimePiecewiseSolver:
         )
 
         cube_bound = _is_cube_bound(
-            roofline,
-            dims,
+            roofline_map,
+            merged_dims,
             uses_cube=eff_uses_cube,
             axes=axes,
         )
@@ -806,11 +942,57 @@ class RegimePiecewiseSolver:
             notes.append("SIMT __launch_bounds__(512) + warp-privatized +8-padded UB accumulators")
 
         else:
-            tile_n = max(1, min(2048, dims.get("N", dims.get("D", dims.get("cols", 1024)))))
-            row_bytes = max(32, tile_n * elem_bytes)
-            pack = min(16, max(1, (16384 + row_bytes - 1) // row_bytes))
-            while pack > 1 and pack * (row_bytes + 32) * 4 > ub_simdvf:
-                pack //= 2
+            raw_tail_n = merged_dims.get(
+                "N",
+                merged_dims.get("D", merged_dims.get("cols", 1024)),
+            )
+            rf_bound = str(roofline_map.get("dominant_bound", "")).strip().lower()
+            rf_min_gm = int(_mapping_float(roofline_map, "min_gm_bytes"))
+            ub_half_bytes = ub_simdvf // 2
+            work_elem_bytes = max(4, elem_bytes)
+            twopass_switch_elems = max(
+                16, ((ub_half_bytes // work_elem_bytes) // 16) * 16
+            )
+            raw_ub_tile = min(
+                (ub_half_bytes - 32) // max(1, 2 * work_elem_bytes),
+                (ub_simdvf // 4 - 32) // max(1, elem_bytes),
+                self.facts.max_mmad_mnk,
+            )
+            if raw_ub_tile >= 16:
+                ub_tile_elems = 1 << (raw_ub_tile.bit_length() - 1)
+                ub_tile_elems = max(16, min(ub_tile_elems, raw_ub_tile))
+            else:
+                ub_tile_elems = 16
+            row_work_bytes = max(1, raw_tail_n) * work_elem_bytes
+            row_raw_bytes = max(1, raw_tail_n) * elem_bytes
+            is_memory_bound = rf_bound in ("memory", "memory_bandwidth")
+            exceeds_ub_half = (
+                raw_tail_n > twopass_switch_elems or row_raw_bytes > ub_half_bytes
+            )
+            if is_memory_bound and (
+                exceeds_ub_half
+                or (rf_min_gm > ub_simdvf and row_work_bytes > ub_half_bytes)
+            ):
+                tile_n = max(16, min(raw_tail_n, ub_tile_elems))
+                row_bytes = max(32, tile_n * elem_bytes)
+                pack = 1
+                policy["ub_tile_elems"] = tile_n
+                policy["twopass_switch_elems"] = twopass_switch_elems
+                policy["requires_twopass_reduction"] = True
+                notes.append(
+                    f"Algebraic UB twopass threshold={twopass_switch_elems} elems, "
+                    f"ub_tile_elems={tile_n}"
+                )
+            else:
+                tile_n = max(1, min(2048, raw_tail_n))
+                row_bytes = max(32, tile_n * elem_bytes)
+                pack = min(16, max(1, (16384 + row_bytes - 1) // row_bytes))
+                while pack > 1 and pack * (row_bytes + 32) * 4 > ub_simdvf:
+                    pack //= 2
+                if is_memory_bound:
+                    policy["ub_tile_elems"] = tile_n
+                    policy["twopass_switch_elems"] = twopass_switch_elems
+                    policy["requires_twopass_reduction"] = False
             policy["tile_mnk"] = [pack, tile_n, 1]
             policy["row_pack_factor"] = pack
             policy["multi_row_unroll"] = 2 if row_bytes <= 16384 else 1
@@ -858,7 +1040,7 @@ class RegimePiecewiseSolver:
         *,
         op_name: str = "",
         topology_axes: TopologyAxes | Mapping[str, object] | None = None,
-        roofline: Mapping[str, object] | None = None,
+        roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
         loop: For | None = None,
         fn_stmt: Stmt | None = None,
         input_dtypes: tuple[str, ...] = ("f16",),
@@ -871,7 +1053,7 @@ class RegimePiecewiseSolver:
         quant_mode: str | None = None,
         unreserved_ubuf: bool = False,
     ) -> RegimePlanResult:
-        """Solve one shape regime via Z3 projection or structural topology planning."""
+        """Solve one shape regime via Z3 projection or algebraic piecewise planning."""
         tag, dims, has_tail, has_empty, reg_roofline, reg_axes, representative_ratios = (
             _extract_regime_fields(regime)
         )
@@ -897,7 +1079,9 @@ class RegimePiecewiseSolver:
                 regime if isinstance(regime, Mapping) else {}
             )
 
-        resolved_roofline = roofline if roofline is not None else reg_roofline
+        resolved_roofline = (
+            _coerce_roofline_mapping(roofline) if roofline is not None else reg_roofline
+        )
 
         if not self._is_ragged_or_recurrent(
             axes=resolved_axes,
@@ -1002,7 +1186,7 @@ class RegimePiecewiseSolver:
             has_indirect_gather=has_indirect_gather,
             quant_mode=quant_mode,
             representative_ratios=representative_ratios,
-            solver_mode="analytical_piecewise",
+            solver_mode=SOLVER_MODE_ALGEBRAIC,
         )
 
     def solve_all_regimes(
@@ -1011,7 +1195,7 @@ class RegimePiecewiseSolver:
         *,
         op_name: str = "",
         topology_axes: TopologyAxes | Mapping[str, object] | None = None,
-        roofline: Mapping[str, object] | None = None,
+        roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
         loop: For | None = None,
         fn_stmt: Stmt | None = None,
         input_dtypes: tuple[str, ...] = ("f16",),
@@ -1081,14 +1265,41 @@ class RegimePiecewiseSolver:
         self,
         regime: Mapping[str, object] | object,
         live_buffers_or_ledger: object,
-        **kwargs: object,
+        *,
+        op_name: str = "",
+        topology_axes: TopologyAxes | Mapping[str, object] | None = None,
+        roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
+        loop: For | None = None,
+        fn_stmt: Stmt | None = None,
+        input_dtypes: tuple[str, ...] = ("f16",),
+        has_nan_inf_cases: bool = False,
+        has_indirect_gather: bool = False,
+        has_recurrence: bool = False,
+        uses_cube: bool | None = None,
+        has_persistent_state: bool | None = None,
+        has_dead_l1_slice: bool | None = None,
+        quant_mode: str | None = None,
+        unreserved_ubuf: bool = False,
     ) -> RegimePlanResult:
         """Re-solve tile sizes and stages for live buffer footprints."""
         return recompute_regime_for_live_buffers(
             self,
             regime,
             live_buffers_or_ledger,
-            **kwargs,
+            op_name=op_name,
+            topology_axes=topology_axes,
+            roofline=roofline,
+            loop=loop,
+            fn_stmt=fn_stmt,
+            input_dtypes=input_dtypes,
+            has_nan_inf_cases=has_nan_inf_cases,
+            has_indirect_gather=has_indirect_gather,
+            has_recurrence=has_recurrence,
+            uses_cube=uses_cube,
+            has_persistent_state=has_persistent_state,
+            has_dead_l1_slice=has_dead_l1_slice,
+            quant_mode=quant_mode,
+            unreserved_ubuf=unreserved_ubuf,
         )
 
 
@@ -1161,15 +1372,45 @@ def recompute_regime_for_live_buffers(
     solver: RegimePiecewiseSolver | None,
     regime: Mapping[str, object] | object,
     live_buffers_or_ledger: object,
-    **kwargs: object,
+    *,
+    op_name: str = "",
+    topology_axes: TopologyAxes | Mapping[str, object] | None = None,
+    roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
+    loop: For | None = None,
+    fn_stmt: Stmt | None = None,
+    input_dtypes: tuple[str, ...] = ("f16",),
+    has_nan_inf_cases: bool = False,
+    has_indirect_gather: bool = False,
+    has_recurrence: bool = False,
+    uses_cube: bool | None = None,
+    has_persistent_state: bool | None = None,
+    has_dead_l1_slice: bool | None = None,
+    quant_mode: str | None = None,
+    unreserved_ubuf: bool = False,
 ) -> RegimePlanResult:
-    """Bidirectionally re-solve tile_mnk / row_pack_factor / l1_stages for live UB/L1 footprints."""
+    """Apply monotone waterline caliper contraction or headroom expansion for live buffers."""
     active_solver = solver if solver is not None else RegimePiecewiseSolver()
     if isinstance(regime, RegimePlanResult):
         base_plan = regime
         dims = dict(regime.representative_dims)
     else:
-        base_plan = active_solver.solve_regime(regime, **kwargs)  # type: ignore[arg-type]
+        base_plan = active_solver.solve_regime(
+            regime,
+            op_name=op_name,
+            topology_axes=topology_axes,
+            roofline=roofline,
+            loop=loop,
+            fn_stmt=fn_stmt,
+            input_dtypes=input_dtypes,
+            has_nan_inf_cases=has_nan_inf_cases,
+            has_indirect_gather=has_indirect_gather,
+            has_recurrence=has_recurrence,
+            uses_cube=uses_cube,
+            has_persistent_state=has_persistent_state,
+            has_dead_l1_slice=has_dead_l1_slice,
+            quant_mode=quant_mode,
+            unreserved_ubuf=unreserved_ubuf,
+        )
         dims = dict(base_plan.representative_dims)
 
     live_ub, live_l1 = _extract_live_buffer_footprints(live_buffers_or_ledger)
@@ -1239,9 +1480,22 @@ def recompute_regime_for_live_buffers(
     ub_limit = _ub_limit(ub_256kb)
     cur_ub = _estimate_ub(tm, tn, row_pack)
     cur_l1 = _estimate_l1(tm, tn, tk, l1_stages)
-    shrank = False
+    if (
+        live_ub > 0
+        and cur_ub > ub_limit
+        and vector_mode == "simdvf"
+        and not is_coupled_simt
+        and not ub_256kb
+        and cur_ub <= int(facts.ub_nominal_bytes)
+    ):
+        ub_256kb = True
+        ub_limit = _ub_limit(True)
 
-    for _ in range(16):
+    shrank = False
+    caliper_steps = 0
+    caliper_action = "none"
+
+    for _ in range(_MAX_CALIPER_STEPS):
         ub_over = live_ub > 0 and cur_ub > ub_limit
         l1_over = live_l1 > 0 and (
             cur_l1 > l1_total_limit or not _half_bank_ok(cur_l1, l1_stages, l1_half_split)
@@ -1251,65 +1505,104 @@ def recompute_regime_for_live_buffers(
 
         progressed = False
         if ub_over:
-            if (
-                vector_mode == "simdvf"
-                and not is_coupled_simt
-                and not ub_256kb
-                and cur_ub <= int(facts.ub_nominal_bytes)
-            ):
-                ub_256kb = True
-                ub_limit = _ub_limit(True)
-                progressed = True
-            elif row_pack > 1:
+            if row_pack > 1:
                 new_rp = max(1, row_pack // 2)
                 if is_vector_only and tm > 1:
                     tm = max(1, (tm * new_rp) // max(1, row_pack))
                 row_pack = new_rp
                 shrank = True
                 progressed = True
-            elif tm > 16:
-                tm = max(16, (tm // 2 // 16) * 16) if tm >= 32 else 16
-                shrank = True
-                progressed = True
-            elif tm > 1 and is_vector_only:
-                tm = max(1, tm // 2)
-                shrank = True
-                progressed = True
-            elif tn > 32:
-                tn = max(16, (tn // 2 // 16) * 16)
-                shrank = True
-                progressed = True
+                caliper_steps += 1
+                caliper_action = "ub_halving"
+            elif is_vector_only:
+                if tn >= tm and tn > 32:
+                    tn = max(16, (tn // 2 // 16) * 16)
+                    shrank = True
+                    progressed = True
+                    caliper_steps += 1
+                    caliper_action = "ub_halving"
+                elif tm > 1:
+                    tm = max(1, tm // 2)
+                    shrank = True
+                    progressed = True
+                    caliper_steps += 1
+                    caliper_action = "ub_halving"
+                elif tn > 16:
+                    tn = max(16, tn // 2)
+                    shrank = True
+                    progressed = True
+                    caliper_steps += 1
+                    caliper_action = "ub_halving"
+            else:
+                if tm >= tn and tm > 16:
+                    tm = max(16, (tm // 2 // 16) * 16) if tm >= 32 else 16
+                    shrank = True
+                    progressed = True
+                    caliper_steps += 1
+                    caliper_action = "ub_halving"
+                elif tn > 32:
+                    tn = max(16, (tn // 2 // 16) * 16)
+                    shrank = True
+                    progressed = True
+                    caliper_steps += 1
+                    caliper_action = "ub_halving"
+                elif tm > 16:
+                    tm = max(16, (tm // 2 // 16) * 16) if tm >= 32 else 16
+                    shrank = True
+                    progressed = True
+                    caliper_steps += 1
+                    caliper_action = "ub_halving"
+                elif tn > 16:
+                    tn = 16
+                    shrank = True
+                    progressed = True
+                    caliper_steps += 1
+                    caliper_action = "ub_halving"
 
         if l1_over and not progressed:
             if l1_stages > 2:
                 l1_stages = 2
                 shrank = True
                 progressed = True
-            elif tk > 32:
-                tk = max(16, (tk // 2 // 16) * 16)
-                shrank = True
-                progressed = True
-            elif tm > 32:
-                tm = max(16, (tm // 2 // 16) * 16)
-                shrank = True
-                progressed = True
-            elif tn > 32:
-                tn = max(16, (tn // 2 // 16) * 16)
-                shrank = True
-                progressed = True
+                caliper_steps += 1
+                caliper_action = "l1_stage_backoff"
             elif l1_stages > 1:
                 l1_stages = 1
                 l1_half_split = False
                 shrank = True
                 progressed = True
+                caliper_steps += 1
+                caliper_action = "l1_stage_backoff"
+            elif tk > 32:
+                tk = max(16, (tk // 2 // 16) * 16)
+                shrank = True
+                progressed = True
+                caliper_steps += 1
+                caliper_action = "l1_stage_backoff"
             elif tk > 16:
                 tk = 16
                 shrank = True
                 progressed = True
+                caliper_steps += 1
+                caliper_action = "l1_stage_backoff"
+            elif tm >= tn and tm > 32:
+                tm = max(16, (tm // 2 // 16) * 16)
+                shrank = True
+                progressed = True
+                caliper_steps += 1
+                caliper_action = "l1_stage_backoff"
+            elif tn > 32:
+                tn = max(16, (tn // 2 // 16) * 16)
+                shrank = True
+                progressed = True
+                caliper_steps += 1
+                caliper_action = "l1_stage_backoff"
             elif tm > 16:
                 tm = 16
                 shrank = True
                 progressed = True
+                caliper_steps += 1
+                caliper_action = "l1_stage_backoff"
 
         if not progressed:
             break
@@ -1403,7 +1696,8 @@ def recompute_regime_for_live_buffers(
 
     action_tag = "shrunk" if shrank else ("expanded" if expanded else "unchanged")
     note = (
-        f"Fixed-point re-solved ({action_tag}) for live buffers: "
+        f"Fixed-point re-solved ({action_tag}, steps={caliper_steps}, "
+        f"action={caliper_action}) for live buffers: "
         f"UB={cur_ub}B, L1={cur_l1}B, tile_mnk={[tm, tn, tk]}, "
         f"row_pack={row_pack}, l1_stages={l1_stages}"
     )
@@ -1422,13 +1716,19 @@ def recompute_regime_for_live_buffers(
         persistent_state_space=base_plan.persistent_state_space,
         persistent_state_bytes=base_plan.persistent_state_bytes,
         notes=(*base_plan.notes, note),
+        caliper_steps=caliper_steps,
+        caliper_action=caliper_action,
     )
 
 
 __all__ = [
+    "SOLVER_MODE_ALGEBRAIC",
+    "SOLVER_MODE_Z3",
     "PiecewiseSchedulePlan",
     "RegimePiecewiseSolver",
     "RegimePlanResult",
+    "RooflineSummaryLike",
     "compute_critical_cube_tile_m",
+    "normalize_solver_mode",
     "recompute_regime_for_live_buffers",
 ]

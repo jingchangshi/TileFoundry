@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
+from typing import Literal
 
 from tilefoundry_ascend.ascend.passes.observation_space import (
     CompilerSummaryLike,
@@ -93,6 +94,7 @@ class ObjectivePhysicalLedger:
     ub_bank_conflict_risk: float = 0.0
     l1_bank_conflict_risk: float = 0.0
     microarch_profile: dict[str, object] = field(default_factory=dict)
+    gm_traffic_scope: Literal["per_tile", "full_grid"] = "per_tile"
 
     def __post_init__(self) -> None:
         if self.analysis_mode not in ("exact_modulo_z3", "readonly_envelope"):
@@ -100,11 +102,31 @@ class ObjectivePhysicalLedger:
                 f"analysis_mode must be 'exact_modulo_z3' or 'readonly_envelope', "
                 f"got {self.analysis_mode!r}"
             )
+        if self.gm_traffic_scope not in ("per_tile", "full_grid"):
+            raise ValueError(
+                f"gm_traffic_scope must be 'per_tile' or 'full_grid', "
+                f"got {self.gm_traffic_scope!r}"
+            )
 
     @property
     def max_overflow_bytes(self) -> int:
         """Return the maximum byte overflow across all tracked memory scopes."""
         return max((wl.overflow_bytes for wl in self.waterlines.values()), default=0)
+
+    def total_gm_bytes(self, grid_blocks: int | None = None) -> int:
+        """Return full-grid GM traffic bytes using explicit per-tile or full-grid scope."""
+        base_bytes = max(0, int(self.gm_roundtrip_bytes))
+        if self.gm_traffic_scope == "full_grid":
+            return base_bytes
+        blocks = max(
+            1,
+            int(
+                grid_blocks
+                if grid_blocks is not None
+                else (self.active_grid_blocks or self.grid_blocks or 1)
+            ),
+        )
+        return base_bytes * blocks
 
     def to_observation_5d(
         self,
@@ -145,6 +167,15 @@ class ObjectivePhysicalLedger:
             )
             for scope, wl in dict(raw_waterlines).items()
         }
+        raw_scope = str(payload.get("gm_traffic_scope", "per_tile"))
+        if raw_scope == "per_tile":
+            gm_traffic_scope: Literal["per_tile", "full_grid"] = "per_tile"
+        elif raw_scope == "full_grid":
+            gm_traffic_scope = "full_grid"
+        else:
+            raise ValueError(
+                f"gm_traffic_scope must be 'per_tile' or 'full_grid', got {raw_scope!r}"
+            )
         return cls(
             analysis_mode=str(payload["analysis_mode"]),
             is_legal=bool(payload["is_legal"]),
@@ -180,6 +211,7 @@ class ObjectivePhysicalLedger:
             ub_bank_conflict_risk=float(payload.get("ub_bank_conflict_risk", 0.0)),
             l1_bank_conflict_risk=float(payload.get("l1_bank_conflict_risk", 0.0)),
             microarch_profile=dict(payload.get("microarch_profile") or {}),
+            gm_traffic_scope=gm_traffic_scope,
         )
 
 
@@ -253,6 +285,7 @@ def build_objective_physical_ledger(
     ub_bank_conflict_risk: float = 0.0,
     l1_bank_conflict_risk: float = 0.0,
     microarch_profile: Mapping[str, object] | None = None,
+    gm_traffic_scope: Literal["per_tile", "full_grid"] = "per_tile",
 ) -> ObjectivePhysicalLedger:
     """Assemble an ObjectivePhysicalLedger and derive the dominant pipe."""
     cleaned_pipes = dict(sorted(pipe_cycles.items()))
@@ -291,6 +324,7 @@ def build_objective_physical_ledger(
         ub_bank_conflict_risk=min(1.0, max(0.0, float(ub_bank_conflict_risk))),
         l1_bank_conflict_risk=min(1.0, max(0.0, float(l1_bank_conflict_risk))),
         microarch_profile=dict(microarch_profile or {}),
+        gm_traffic_scope=gm_traffic_scope,
     )
 
 

@@ -68,13 +68,18 @@ from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistill
 from tilefoundry_ascend.agent.kb.bayesian_tracker import (
     BayesianRuleTracker,
     append_kb_event_shard,
+    append_rule_misapplication,
+    append_winning_edge,
     save_distilled_rule_file,
+    save_staging_candidate_rule,
 )
 from tilefoundry_ascend.agent.kb.schema import (
     AscendCausalRule,
+    SymptomFamily,
     build_predicate_context,
     load_seed_rules,
     normalize_runtime_backend,
+    rank_symptom_families,
 )
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     _LAUNCH_CONFIG_RE,
@@ -142,8 +147,10 @@ from tilefoundry_ascend.ascend.cost_model.experience_lake import (
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import merge_microarch_profiles
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
     HirBlueprintPacket,
+    HirRooflineSummary,
     compile_hir_blueprint,
 )
+from tilefoundry_ascend.ascend.passes.observation_space import ObservationVector5D
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
 )
@@ -152,10 +159,7 @@ from tilefoundry_ascend.ascend.schedule.regime_solver import (
     RegimePlanResult,
     recompute_regime_for_live_buffers,
 )
-from tilefoundry_ascend.ascend.sil.op_analyzer import (
-    OpAdvisoryExtractor,
-    resolve_canonical_topology_axes,
-)
+from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
 from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
     PyTorchSemanticAnalyzer,
     RepresentativeCase,
@@ -222,6 +226,18 @@ class CampaignConfig:
     cost_prescreen_top_k: int | None = None
     exploit_effort: str = "medium"
     round_regime_tags: tuple[str, ...] = ()
+    allow_unreviewed_distilled_rules: bool = False
+
+
+def _should_trigger_p2_deep_dive(
+    stagnation_rounds: int,
+    ranked_families: Sequence[tuple[SymptomFamily | str, float]],
+) -> bool:
+    """Return True iff stagnation is >= 2 rounds and top-2 symptom scores tie within 0.08."""
+    if int(stagnation_rounds) < 2 or len(ranked_families) < 2:
+        return False
+    scores = sorted((float(score) for _family, score in ranked_families), reverse=True)
+    return (scores[0] - scores[1]) < 0.08
 
 
 _DEVICE_ID_PATTERN = re.compile(r"[0-9]+")
@@ -2061,21 +2077,8 @@ class PerfTargetCampaignRunner:
         self._freedom_masks: dict[str, ConstraintRelaxationMask] = {}
         self._live_regime_plans: dict[str, RegimePlanResult] = {}
         self._clock = clock
-        if sil_advisory is not None:
-            self._sil_advisory = sil_advisory
-        else:
-            self._sil_advisory = None
-            try:
-                ops_root = self._resolve_cannbench_tasks_root()
-                extractor = (
-                    OpAdvisoryExtractor(ops_root)
-                    if ops_root is not None
-                    else OpAdvisoryExtractor()
-                )
-                short_op = self._config.operator_name.rsplit("/", 1)[-1]
-                self._sil_advisory = extractor.extract(short_op)
-            except (FileNotFoundError, OSError, KeyError):
-                self._sil_advisory = None
+        self._sil_advisory = sil_advisory
+        self._semantic_topology_axes: TopologyAxes | None = None
         if isinstance(topology_axes, TopologyAxes):
             self._topology_axes: TopologyAxes | None = topology_axes
         elif isinstance(topology_axes, Mapping):
@@ -2304,6 +2307,8 @@ class PerfTargetCampaignRunner:
     ) -> TopologyAxes:
         if self._topology_axes is not None:
             return self._topology_axes
+        if self._semantic_topology_axes is not None:
+            return self._semantic_topology_axes
         if self._sil_advisory is not None:
             return resolve_canonical_topology_axes(self._sil_advisory, features=features)
         if route is not None:
@@ -2411,9 +2416,9 @@ class PerfTargetCampaignRunner:
         self,
         provided: Mapping[str, HirBlueprintPacket] | None,
     ) -> dict[str, HirBlueprintPacket]:
-        """Validate caller-supplied per-regime blueprints or compile them in-process."""
+        """Validate caller-supplied per-regime blueprints or build semantic-first packets."""
         if provided is None:
-            return self._compile_regime_blueprints()
+            return self._build_semantic_first_regime_blueprints()
         missing = sorted(
             spec.regime_tag for spec in self._regime_specs if spec.regime_tag not in provided
         )
@@ -2434,56 +2439,12 @@ class PerfTargetCampaignRunner:
             return None
         return registry.resolve(self._config.operator_name)
 
-    def _synthesize_universal_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
-        """Synthesize per-regime blueprints from the PyTorch golden when model.py is absent."""
-        spec = self._resolve_operator_spec()
-        if spec is None:
-            return {}
-        if not spec.golden_path.is_file():
-            raise FileNotFoundError(
-                f"official PyTorch golden reference missing for {spec.op_id} at {spec.golden_path}"
-            )
-        try:
-            golden_source = spec.golden_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise RuntimeError(
-                f"cannot read PyTorch golden reference for {spec.op_id} at {spec.golden_path}: {exc}"
-            ) from exc
-        analyzer = PyTorchSemanticAnalyzer(self._target)
-        try:
-            semantics = analyzer.analyze_source(
-                golden_source,
-                entry_name=spec.entrypoint,
-                proto=spec.proto,
-            )
-        except (SyntaxError, ValueError) as exc:
-            raise RuntimeError(
-                f"cannot analyze PyTorch golden semantics for {spec.op_id}: {exc}"
-            ) from exc
-        packets: dict[str, HirBlueprintPacket] = {}
-        for regime_spec in self._regime_specs:
-            try:
-                packets[regime_spec.regime_tag] = analyzer.build_universal_blueprint(
-                    semantics,
-                    regime_spec.representative_hir_dims,
-                    representative_case=(
-                        RepresentativeCase.from_case_entry(
-                            regime_spec.representative_case_entry
-                        )
-                        if regime_spec.representative_case_entry
-                        else None
-                    ),
-                )
-            except (FileNotFoundError, OSError, SyntaxError, ValueError, KeyError) as exc:
-                raise RuntimeError(
-                    f"failed to synthesize universal HIR blueprint for {spec.op_id} regime "
-                    f"{regime_spec.regime_tag}: {type(exc).__name__}: {exc}"
-                ) from exc
-        assert set(packets) == {regime.regime_tag for regime in self._regime_specs}
-        return packets
+    def _build_semantic_first_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
+        """Build per-regime blueprints from PyTorch golden semantics and anchor dims.
 
-    def _compile_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
-        """Compile non-empty per-regime Layer-3 blueprints, preferring authored model.py."""
+        Optional authored or scheduled HIR sources are forwarded so schedule deltas attach
+        without overriding the authoritative semantic Roofline.
+        """
         authored_hir_source: str | None = None
         if self._authored_hir_path is not None and self._authored_hir_path.is_file():
             try:
@@ -2501,16 +2462,71 @@ class PerfTargetCampaignRunner:
                     f"cannot read scheduled HIR source at {self._scheduled_hir_path}: {exc}"
                 ) from exc
 
-        if authored_hir_source is None or not authored_hir_source.strip():
-            return self._synthesize_universal_regime_blueprints()
+        spec = self._resolve_operator_spec()
+        if spec is not None:
+            if not spec.golden_path.is_file():
+                raise FileNotFoundError(
+                    f"official PyTorch golden reference missing for {spec.op_id} at "
+                    f"{spec.golden_path}"
+                )
+            try:
+                golden_source = spec.golden_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise RuntimeError(
+                    f"cannot read PyTorch golden reference for {spec.op_id} at "
+                    f"{spec.golden_path}: {exc}"
+                ) from exc
+            analyzer = PyTorchSemanticAnalyzer(self._target)
+            try:
+                semantics = analyzer.analyze_source(
+                    golden_source,
+                    entry_name=spec.entrypoint,
+                    proto=spec.proto,
+                )
+            except (SyntaxError, ValueError) as exc:
+                raise RuntimeError(
+                    f"cannot analyze PyTorch golden semantics for {spec.op_id}: {exc}"
+                ) from exc
+            self._semantic_topology_axes = semantics.base_axes
+            packets: dict[str, HirBlueprintPacket] = {}
+            for regime_spec in self._regime_specs:
+                anchor_dims = (
+                    regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+                )
+                rep_case = (
+                    RepresentativeCase.from_case_entry(regime_spec.representative_case_entry)
+                    if regime_spec.representative_case_entry
+                    else None
+                )
+                try:
+                    packets[regime_spec.regime_tag] = analyzer.build_universal_blueprint(
+                        semantics,
+                        anchor_dims,
+                        authored_hir_source=authored_hir_source,
+                        scheduled_hir_source=scheduled_hir_source,
+                        representative_case=rep_case,
+                    )
+                except (FileNotFoundError, OSError, SyntaxError, ValueError, KeyError) as exc:
+                    raise RuntimeError(
+                        f"failed to synthesize semantic-first HIR blueprint for {spec.op_id} "
+                        f"regime {regime_spec.regime_tag}: {type(exc).__name__}: {exc}"
+                    ) from exc
+            assert set(packets) == {regime.regime_tag for regime in self._regime_specs}
+            return packets
 
-        packets: dict[str, HirBlueprintPacket] = {}
+        if authored_hir_source is None or not authored_hir_source.strip():
+            return {}
+
+        packets = {}
         for regime_spec in self._regime_specs:
+            anchor_dims = (
+                regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+            )
             try:
                 packets[regime_spec.regime_tag] = compile_hir_blueprint(
                     authored_hir_source,
                     scheduled_hir_source=scheduled_hir_source,
-                    anchor_dims=regime_spec.representative_hir_dims,
+                    anchor_dims=anchor_dims,
                     target=self._target,
                 )
             except (FileNotFoundError, OSError, SyntaxError, ValueError, KeyError) as exc:
@@ -2520,6 +2536,63 @@ class PerfTargetCampaignRunner:
                 ) from exc
         assert set(packets) == {regime.regime_tag for regime in self._regime_specs}
         return packets
+
+    def _synthesize_universal_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
+        """Delegate to the semantic-first per-regime blueprint builder."""
+        return self._build_semantic_first_regime_blueprints()
+
+    def _compile_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
+        """Delegate to the semantic-first per-regime blueprint builder."""
+        return self._build_semantic_first_regime_blueprints()
+
+    def _compute_residual_with_roofline(
+        self,
+        ledger: ObjectivePhysicalLedger,
+        telemetry: Mapping[str, object],
+        *,
+        compiler_summary: BishengResourceSummary | None = None,
+        roofline: HirRooflineSummary | None = None,
+    ) -> StaticDynamicResidual:
+        """Compute StaticDynamicResidual while forwarding blueprint Roofline when supported."""
+        result = self._invoke_with_optional_kwargs(
+            compute_static_dynamic_residual,
+            ledger,
+            telemetry,
+            compiler_summary=compiler_summary,
+            roofline=roofline,
+        )
+        assert isinstance(result, StaticDynamicResidual)
+        return result
+
+    def _observation_with_roofline(
+        self,
+        ledger: ObjectivePhysicalLedger,
+        *,
+        compiler_summary: BishengResourceSummary | None = None,
+        telemetry: Mapping[str, object] | None = None,
+        roofline: HirRooflineSummary | None = None,
+    ) -> ObservationVector5D:
+        """Build ObservationVector5D while forwarding blueprint Roofline when supported."""
+        obs = self._invoke_with_optional_kwargs(
+            ledger.to_observation_5d,
+            compiler_summary=compiler_summary,
+            telemetry=telemetry,
+            roofline=roofline,
+        )
+        assert isinstance(obs, ObservationVector5D)
+        return obs
+
+    def _roofline_arg_for_solver(
+        self,
+        roofline: HirRooflineSummary | None,
+    ) -> HirRooflineSummary | dict[str, object] | None:
+        """Forward HirRooflineSummary directly when accepted, else its mapping form."""
+        if roofline is None:
+            return None
+        param = inspect.signature(self._regime_solver.solve_regime).parameters.get("roofline")
+        if param is not None and "HirRooflineSummary" in str(param.annotation):
+            return roofline
+        return roofline.to_dict()
 
     def _get_backend(self) -> KernelLLMBackend:
         if self._backend is None:
@@ -3138,6 +3211,7 @@ class PerfTargetCampaignRunner:
             return ""
         lines = ["### HARDWARE MSPROF TELEMETRY"]
         if has_pmu:
+            res_map = residual.to_dict()
             lines.extend(
                 [
                     f"aic_mac_ratio: {residual.measured_aic_mac_ratio:.4f}",
@@ -3147,6 +3221,12 @@ class PerfTargetCampaignRunner:
                     f"unexplained_gap_ratio: {residual.unexplained_gap_ratio:.4f}",
                 ]
             )
+            raw_infl = res_map.get("transfer_inflation_ratio")
+            if isinstance(raw_infl, (int, float)) and not isinstance(raw_infl, bool):
+                lines.append(f"transfer_inflation_ratio: {float(raw_infl):.4f}")
+            raw_eta = res_map.get("effective_compute_eta")
+            if isinstance(raw_eta, (int, float)) and not isinstance(raw_eta, bool):
+                lines.append(f"effective_compute_eta: {float(raw_eta):.4f}")
         if has_compiler_hazard:
             lines.extend(
                 [
@@ -4064,7 +4144,11 @@ class PerfTargetCampaignRunner:
         if isinstance(saved_run_id, str) and saved_run_id.strip():
             self._run_id = saved_run_id.strip()
         incumbent_source = str(payload["incumbent_source"])
-        if self._campaign_kb_path is not None and self._campaign_kb_path.is_file():
+        if (
+            self._config.allow_unreviewed_distilled_rules
+            and self._campaign_kb_path is not None
+            and self._campaign_kb_path.is_file()
+        ):
             for rule in load_seed_rules(self._campaign_kb_path):
                 self._tracker.admit_rule(rule)
         if isinstance(payload.get("tracker_state"), Mapping):
@@ -4313,8 +4397,10 @@ class PerfTargetCampaignRunner:
         active_anchors: Sequence[AnchorCaseSpec],
         topology_axes: TopologyAxes,
         rel_gain: float = 0.0,
+        worker_kind: str = "",
+        round_idx: int = 0,
     ) -> list[str]:
-        """Distill and verify causal rules on hardware through AgentGates."""
+        """Distill counterfactual causal rules into offline staging without mutating frozen KB."""
         if self._flywheel is None:
             return []
         regime_anchors = [
@@ -4335,7 +4421,13 @@ class PerfTargetCampaignRunner:
                     cand_files.append((chunk_id, cpath))
                 try:
                     batch_res, _run_ids = self._run_l2_batch(cand_files, regime_anchors)
-                except (OSError, subprocess.SubprocessError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
+                except (
+                    OSError,
+                    subprocess.SubprocessError,
+                    TimeoutError,
+                    json.JSONDecodeError,
+                    RuntimeError,
+                ) as exc:
                     logger.debug("Flywheel batched ablation timing skipped: %s", exc)
                     return {}
             out: dict[str, float] = {}
@@ -4344,32 +4436,83 @@ class PerfTargetCampaignRunner:
                     out[cid] = res.mean_latency_us()
             return out
 
-        distill_rep = self._flywheel.distill_from_pair(
-            baseline_dsl=baseline_source,
-            winner_dsl=winner_source,
-            baseline_latency_us=baseline_latency_us,
-            winner_latency_us=winner_latency_us,
-            factory_name=func_name,
-            factory_kwargs=regime_spec.sample_builder_kwargs,
-            config_selector_name=regime_spec.config_selector_fn or None,
-            dims=anchor_dims or None,
-            batch_latency_evaluator=_batch_chunk_latencies,
-            topology_axes=topology_axes,
-            kb_output_path=self._campaign_kb_path,
-            rule_id_prefix="R_FLYWHEEL",
-            verify_on_candidate=(rel_gain >= 0.05 and self._l2_batch_evaluator is not None),
-            max_loo_chunks=3,
-            operator_name=self._config.operator_name,
-            rule_scope="operator_local",
+        allow_online = bool(self._config.allow_unreviewed_distilled_rules)
+        orig_tracker = self._flywheel._tracker
+        staging_tracker = (
+            orig_tracker
+            if allow_online
+            else BayesianRuleTracker.from_rules(self._tracker.rules.values())
         )
+        self._flywheel._tracker = staging_tracker
+        try:
+            distill_rep = self._flywheel.distill_from_pair(
+                baseline_dsl=baseline_source,
+                winner_dsl=winner_source,
+                baseline_latency_us=baseline_latency_us,
+                winner_latency_us=winner_latency_us,
+                factory_name=func_name,
+                factory_kwargs=regime_spec.sample_builder_kwargs,
+                config_selector_name=regime_spec.config_selector_fn or None,
+                dims=anchor_dims or None,
+                batch_latency_evaluator=_batch_chunk_latencies,
+                topology_axes=topology_axes,
+                kb_output_path=self._campaign_kb_path,
+                rule_id_prefix="R_FLYWHEEL",
+                verify_on_candidate=(rel_gain >= 0.05 and self._l2_batch_evaluator is not None),
+                max_loo_chunks=3,
+                operator_name=self._config.operator_name,
+                rule_scope="operator_local",
+            )
+        finally:
+            self._flywheel._tracker = orig_tracker
+
         if self._experience_lake_dir is not None:
-            for rid in distill_rep.admitted_rule_ids:
-                rule_obj = self._tracker.rules.get(rid)
-                if rule_obj is not None:
+            report_payload = distill_rep.to_dict()
+            for outcome in distill_rep.distilled_outcomes:
+                if outcome.rule is None or not outcome.admitted:
+                    continue
+                try:
+                    save_staging_candidate_rule(
+                        self._experience_lake_dir,
+                        outcome.rule,
+                        ablation_report=report_payload,
+                    )
+                except (OSError, ValueError) as exc:
+                    logger.debug(
+                        "Persisting staging candidate rule %s skipped: %s",
+                        outcome.rule.rule_id,
+                        exc,
+                    )
+                if allow_online:
                     try:
-                        save_distilled_rule_file(self._experience_lake_dir, rule_obj)
+                        save_distilled_rule_file(self._experience_lake_dir, outcome.rule)
                     except (OSError, ValueError) as exc:
-                        logger.debug("Persisting distilled rule %s skipped: %s", rid, exc)
+                        logger.debug(
+                            "Persisting distilled rule %s skipped: %s",
+                            outcome.rule.rule_id,
+                            exc,
+                        )
+            try:
+                append_winning_edge(
+                    self._experience_lake_dir,
+                    {
+                        "run_id": self._run_id,
+                        "operator": self._config.operator_name,
+                        "regime_tag": regime_spec.regime_tag,
+                        "round_idx": int(round_idx),
+                        "worker_kind": str(worker_kind),
+                        "parent_sha": self._source_sha256(baseline_source),
+                        "winner_sha": self._source_sha256(winner_source),
+                        "baseline_latency_us": float(baseline_latency_us),
+                        "winner_latency_us": float(winner_latency_us),
+                        "relative_gain": float(rel_gain),
+                        "loo_chunks": [m.to_dict() for m in distill_rep.kept_positive_chunks],
+                        "staged_rule_ids": list(distill_rep.admitted_rule_ids),
+                        "topology_axes": topology_axes.to_dict(),
+                    },
+                )
+            except (OSError, ValueError) as exc:
+                logger.debug("Appending winning edge skipped: %s", exc)
         return list(distill_rep.admitted_rule_ids)
 
     def _can_retry_on_alt_card(self, pending: PendingPromotion, attempted_device: str) -> bool:
@@ -5362,9 +5505,11 @@ class PerfTargetCampaignRunner:
             compiler_summary = (
                 chk.stage_b.compiler_summary if chk.stage_b is not None else None
             )
-            observation = ledger.to_observation_5d(
+            observation = self._observation_with_roofline(
+                ledger,
                 compiler_summary=compiler_summary,
                 telemetry=telemetry,
+                roofline=roofline,
             )
             residual = observation.compute_axis_residuals()
             unlocked = tuple(
@@ -5536,6 +5681,8 @@ class PerfTargetCampaignRunner:
             ).items()
             if isinstance(v, int) and not isinstance(v, bool)
         }
+        blueprint = self._regime_blueprints.get(regime_spec.regime_tag)
+        blueprint_roofline = blueprint.roofline if blueprint is not None else None
         sil_regime = None
         if self._sil_advisory is not None:
             for reg in getattr(self._sil_advisory, "regimes", ()) or ():
@@ -5552,6 +5699,14 @@ class PerfTargetCampaignRunner:
                 ),
             )
         adv_dtypes = tuple(getattr(self._sil_advisory, "input_dtypes", ()) or ())
+        if not adv_dtypes:
+            raw_case_dtype = regime_spec.representative_case_entry.get("dtype")
+            if isinstance(raw_case_dtype, str) and raw_case_dtype.strip():
+                adv_dtypes = (raw_case_dtype.strip(),)
+            elif isinstance(raw_case_dtype, (list, tuple)):
+                adv_dtypes = tuple(
+                    str(item).strip() for item in raw_case_dtype if str(item).strip()
+                )
         adv_nan_inf = bool(getattr(self._sil_advisory, "has_nan_inf_cases", False))
         live_plan = recompute_regime_for_live_buffers(
             self._regime_solver,
@@ -5559,6 +5714,7 @@ class PerfTargetCampaignRunner:
             parent_ledger,
             op_name=self._config.operator_name,
             topology_axes=parent_axes,
+            roofline=self._roofline_arg_for_solver(blueprint_roofline),
             input_dtypes=adv_dtypes or ("float16",),
             has_nan_inf_cases=adv_nan_inf,
             has_indirect_gather=(parent_axes.iteration_regularity == "irregular_simt"),
@@ -5606,10 +5762,11 @@ class PerfTargetCampaignRunner:
                 if k == "dur_us" and float(v) <= 0.0:
                     continue
                 telemetry_payload[k] = v
-            parent_residual = compute_static_dynamic_residual(
+            parent_residual = self._compute_residual_with_roofline(
                 parent_ledger,
                 telemetry_payload,
                 compiler_summary=parent_l1_summary,
+                roofline=blueprint_roofline,
             )
         elif selected_stone is not None and (
             selected_stone.residual.measured_aiv_vec_ratio > 0.0
@@ -5630,10 +5787,11 @@ class PerfTargetCampaignRunner:
                 "dur_us": parent_lat_us,
                 "roofline_eta": local_best.avg_roofline_eta,
             }
-            parent_residual = compute_static_dynamic_residual(
+            parent_residual = self._compute_residual_with_roofline(
                 parent_ledger,
                 telemetry_payload,
                 compiler_summary=parent_l1_summary,
+                roofline=blueprint_roofline,
             )
         ctx = build_predicate_context(
             parent_ledger,
@@ -5644,13 +5802,22 @@ class PerfTargetCampaignRunner:
                 **_case_ratio_predicate_entries(regime_spec.representative_case_ratios),
             },
         )
+        ranked_families = rank_symptom_families(ctx)
+        if _should_trigger_p2_deep_dive(stagnation_rounds, ranked_families):
+            top_pair = [(fam.value, score) for fam, score in ranked_families[:2]]
+            logger.info(
+                "Round %d regime %s triggers P2 deep-dive diagnostic (stagnation=%d, top2=%s)",
+                round_idx,
+                regime_spec.regime_tag,
+                stagnation_rounds,
+                top_pair,
+            )
         parent_comp_summary = compiler_summary_from_residual(parent_residual)
         parent_waterlines = getattr(parent_ledger, "waterlines", {}) or {}
         l1_wl = parent_waterlines.get("L1")
         ub_wl = parent_waterlines.get("UB")
         l1_overflow = bool(l1_wl is not None and int(getattr(l1_wl, "overflow_bytes", 0) or 0) > 0)
         ub_overflow = bool(ub_wl is not None and int(getattr(ub_wl, "overflow_bytes", 0) or 0) > 0)
-        blueprint = self._regime_blueprints.get(regime_spec.regime_tag)
         parent_workload = self._build_cost_workload(
             parent_ledger,
             live_plan=live_plan,
@@ -5662,6 +5829,9 @@ class PerfTargetCampaignRunner:
                 self._tracker.sync_from_experience_lake(
                     self._experience_lake_dir,
                     exclude_run_id=self._run_id,
+                    allow_unreviewed_distilled_rules=(
+                        self._config.allow_unreviewed_distilled_rules
+                    ),
                 )
             except (OSError, json.JSONDecodeError) as exc:
                 logger.debug("ExperienceLake per-round KB sync skipped: %s", exc)
@@ -5768,6 +5938,9 @@ class PerfTargetCampaignRunner:
                 topology_axes=parent_axes,
                 operator_name=self._config.operator_name,
                 runtime_backend=regime_spec.runtime_backend,
+                regime_tag=regime_spec.regime_tag,
+                parent_sha=parent_sha,
+                current_round=round_idx,
             )
         )
 
@@ -5927,6 +6100,13 @@ class PerfTargetCampaignRunner:
                         postcondition_realized=False,
                         topology_axes=parent_axes,
                     )
+                    self._tracker.record_scoped_failure(
+                        regime_tag=regime_spec.regime_tag,
+                        rule_id=rule.rule_id,
+                        parent_sha=parent_sha,
+                        current_round=round_idx,
+                        reason="llm_generate_parse_failed",
+                    )
                     self._record_kb_event(
                         rule_id=rule.rule_id,
                         postcondition_realized=False,
@@ -6028,6 +6208,13 @@ class PerfTargetCampaignRunner:
                         postcondition_realized=False,
                         topology_axes=parent_axes,
                     )
+                    self._tracker.record_scoped_failure(
+                        regime_tag=regime_spec.regime_tag,
+                        rule_id=rule.rule_id,
+                        parent_sha=parent_sha,
+                        current_round=round_idx,
+                        reason=f"l0_l1_failed:{chk.failed_tier or 'l0_l1'}",
+                    )
                     self._record_kb_event(
                         rule_id=rule.rule_id,
                         postcondition_realized=False,
@@ -6127,18 +6314,7 @@ class PerfTargetCampaignRunner:
                         else 0.0
                     ),
                 )
-            else:
-                top_local_lat = 0.0
             dual_criterion_ok = global_gain_ok or local_gain_ok
-            if (tail_guard_ok and dual_criterion_ok) or (
-                top_local_lat > 0.0 and top_local_lat < 0.98 * local_best.mean_latency_us()
-            ):
-                self._collect_msprof_for_regimes(
-                    top_chk.patched_module_source,
-                    top_res,
-                    active_anchors,
-                    [regime_spec],
-                )
             if tail_guard_ok and dual_criterion_ok:
                 _atomic_write_text(self._target_module_path, top_chk.patched_module_source)
                 candidate_sha = self._source_sha256(top_chk.patched_module_source)
@@ -6178,6 +6354,12 @@ class PerfTargetCampaignRunner:
                     self._pending_promotion = None
                     self._persist_runtime_state("active_promotion", None)
                     self._persist_runtime_state("pending_promotion", None)
+                    self._collect_msprof_for_regimes(
+                        top_chk.patched_module_source,
+                        top_res,
+                        active_anchors,
+                        [regime_spec],
+                    )
                 elif (
                     l3_res.failure_kind != FAILURE_KIND_CANDIDATE
                     or not l3_res.execution_terminal
@@ -6298,8 +6480,11 @@ class PerfTargetCampaignRunner:
                 if getattr(chk, "stage_b", None) is not None
                 else None
             )
-            cand_residual = compute_static_dynamic_residual(
-                ledger, cand_tel, compiler_summary=cand_comp_summary
+            cand_residual = self._compute_residual_with_roofline(
+                ledger,
+                cand_tel,
+                compiler_summary=cand_comp_summary,
+                roofline=blueprint_roofline,
             )
             cand_axes = self._derive_topology_axes(
                 ledger,
@@ -6385,6 +6570,92 @@ class PerfTargetCampaignRunner:
                     speed_gain=causal_gain,
                     topology_axes=cand_axes,
                 )
+                if realized:
+                    self._tracker.reset_scoped_family_streak(
+                        regime_tag=regime_spec.regime_tag,
+                        rule_id=rule.rule_id,
+                        parent_sha=parent_sha,
+                    )
+                else:
+                    no_net_speedup = (
+                        (not res.all_passed)
+                        or cand_rolled_back
+                        or parent_lat_us <= 0.0
+                        or lat_us >= parent_lat_us * 0.99
+                    )
+                    failure_reason = (
+                        "l3_rolled_back"
+                        if cand_rolled_back
+                        else (
+                            "l2_accuracy_failed"
+                            if not res.all_passed
+                            else "l2_postcondition_unrealized_no_speedup"
+                        )
+                    )
+                    if no_net_speedup:
+                        self._tracker.record_scoped_failure(
+                            regime_tag=regime_spec.regime_tag,
+                            rule_id=rule.rule_id,
+                            parent_sha=parent_sha,
+                            current_round=round_idx,
+                            reason=failure_reason,
+                        )
+                    regressed_over_3pct = bool(
+                        parent_lat_us > 0.0 and lat_us > parent_lat_us * 1.03
+                    )
+                    if self._experience_lake_dir is not None and (
+                        not realized or regressed_over_3pct
+                    ):
+                        try:
+                            append_rule_misapplication(
+                                self._experience_lake_dir,
+                                {
+                                    "run_id": self._run_id,
+                                    "operator": self._config.operator_name,
+                                    "regime_tag": regime_spec.regime_tag,
+                                    "round_idx": int(round_idx),
+                                    "rule_id": rule.rule_id,
+                                    "symptom_family": rule.symptom_family,
+                                    "parent_sha": parent_sha,
+                                    "cand_sha": cand_sha,
+                                    "parent_latency_us": float(parent_lat_us),
+                                    "cand_latency_us": float(lat_us),
+                                    "latency_ratio": (
+                                        round(float(lat_us) / float(parent_lat_us), 6)
+                                        if (parent_lat_us > 0.0 and lat_us > 0.0)
+                                        else 0.0
+                                    ),
+                                    "postcondition_realized": bool(realized),
+                                    "l2_all_passed": bool(res.all_passed),
+                                    "rolled_back_l3": bool(cand_rolled_back),
+                                    "reason": (
+                                        "latency_regression_gt_3pct"
+                                        if regressed_over_3pct
+                                        else failure_reason
+                                    ),
+                                    "transfer_inflation_ratio": float(
+                                        ctx.get("transfer_inflation_ratio", 1.0)
+                                    ),
+                                    "effective_compute_eta": float(
+                                        ctx.get("effective_compute_eta", 0.0)
+                                    ),
+                                    "ub_occupancy_ratio": float(
+                                        ctx.get("ub_occupancy_ratio", 0.0)
+                                    ),
+                                    "parent_observation": (
+                                        parent_residual.observation.to_dict()
+                                        if parent_residual.observation is not None
+                                        else None
+                                    ),
+                                    "cand_observation": (
+                                        cand_residual.observation.to_dict()
+                                        if cand_residual.observation is not None
+                                        else None
+                                    ),
+                                },
+                            )
+                        except (OSError, ValueError) as exc:
+                            logger.debug("Appending rule misapplication skipped: %s", exc)
                 self._record_kb_event(
                     rule_id=rule.rule_id,
                     postcondition_realized=realized,
@@ -6397,13 +6668,9 @@ class PerfTargetCampaignRunner:
         if promoted and top_chk is not None:
             self._prune_stale_sibling_stepping_stones(regime_spec, top_chk.snippet_source)
 
-        if (
-            promoted
-            and top_chk is not None
-            and top_res is not None
-            and max(rel_gain, local_rel_gain) >= self._config.min_flywheel_gain
-            and self._flywheel is not None
-        ):
+        if promoted and top_chk is not None and top_res is not None:
+            top_wkind = meta_by_id[top_chk.candidate_id][0]
+            eff_gain = max(rel_gain, local_rel_gain)
             top_local_eval = top_res.for_regime(regime_spec.regime_tag)
             best_local_eval = best_result.for_regime(regime_spec.regime_tag)
             fly_base_lat = (
@@ -6416,27 +6683,62 @@ class PerfTargetCampaignRunner:
                 if top_local_eval.anchors
                 else top_res.mean_latency_us()
             )
-            try:
-                round_admitted.extend(
-                    self._run_flywheel_distillation(
-                        baseline_source=incumbent_source,
-                        winner_source=new_incumbent,
-                        baseline_latency_us=fly_base_lat,
-                        winner_latency_us=fly_win_lat,
-                        func_name=func_name,
-                        regime_spec=regime_spec,
-                        active_anchors=active_anchors,
-                        topology_axes=parent_axes,
-                        rel_gain=max(rel_gain, local_rel_gain),
+            if eff_gain >= self._config.min_flywheel_gain and self._flywheel is not None:
+                try:
+                    round_admitted.extend(
+                        self._run_flywheel_distillation(
+                            baseline_source=incumbent_source,
+                            winner_source=new_incumbent,
+                            baseline_latency_us=fly_base_lat,
+                            winner_latency_us=fly_win_lat,
+                            func_name=func_name,
+                            regime_spec=regime_spec,
+                            active_anchors=active_anchors,
+                            topology_axes=parent_axes,
+                            rel_gain=eff_gain,
+                            worker_kind=top_wkind,
+                            round_idx=round_idx,
+                        )
                     )
-                )
-                admitted_rule_ids.extend(round_admitted)
-            except (OSError, subprocess.SubprocessError, TimeoutError, RuntimeError, ValueError) as exc:
-                logger.warning(
-                    "Flywheel distillation failed for regime %s: %s",
-                    regime_spec.regime_tag,
-                    exc,
-                )
+                    admitted_rule_ids.extend(round_admitted)
+                except (
+                    OSError,
+                    subprocess.SubprocessError,
+                    TimeoutError,
+                    RuntimeError,
+                    ValueError,
+                ) as exc:
+                    logger.warning(
+                        "Flywheel distillation failed for regime %s: %s",
+                        regime_spec.regime_tag,
+                        exc,
+                    )
+            elif (
+                top_wkind == "creative_explore"
+                and eff_gain >= 0.05
+                and self._experience_lake_dir is not None
+            ):
+                try:
+                    append_winning_edge(
+                        self._experience_lake_dir,
+                        {
+                            "run_id": self._run_id,
+                            "operator": self._config.operator_name,
+                            "regime_tag": regime_spec.regime_tag,
+                            "round_idx": int(round_idx),
+                            "worker_kind": top_wkind,
+                            "parent_sha": self._source_sha256(incumbent_source),
+                            "winner_sha": self._source_sha256(new_incumbent),
+                            "baseline_latency_us": float(fly_base_lat),
+                            "winner_latency_us": float(fly_win_lat),
+                            "relative_gain": float(eff_gain),
+                            "loo_chunks": [],
+                            "staged_rule_ids": [],
+                            "topology_axes": parent_axes.to_dict(),
+                        },
+                    )
+                except (OSError, ValueError) as exc:
+                    logger.debug("Appending explore winning edge skipped: %s", exc)
 
         pruned_rules = self._tracker.prune_underperforming(
             topology_axes=parent_axes,
@@ -6449,15 +6751,16 @@ class PerfTargetCampaignRunner:
             min_cooldown_rounds=10,
             decay_factor=0.99,
         )
-        promoted_local = self._tracker.promote_verified_local_rules()
-        if promoted_local and self._experience_lake_dir is not None:
-            for rid in promoted_local:
-                rule_obj = self._tracker.rules.get(rid)
-                if rule_obj is not None:
-                    try:
-                        save_distilled_rule_file(self._experience_lake_dir, rule_obj)
-                    except (OSError, ValueError) as exc:
-                        logger.debug("Persisting promoted rule %s skipped: %s", rid, exc)
+        if self._config.allow_unreviewed_distilled_rules:
+            promoted_local = self._tracker.promote_verified_local_rules()
+            if promoted_local and self._experience_lake_dir is not None:
+                for rid in promoted_local:
+                    rule_obj = self._tracker.rules.get(rid)
+                    if rule_obj is not None:
+                        try:
+                            save_distilled_rule_file(self._experience_lake_dir, rule_obj)
+                        except (OSError, ValueError) as exc:
+                            logger.debug("Persisting promoted rule %s skipped: %s", rid, exc)
 
         trackb_evidence = self._collect_trackb_round_evidence(
             round_idx=round_idx,
@@ -7032,6 +7335,7 @@ __all__ = [
     "CampaignRoundRecord",
     "PerfTargetCampaignRunner",
     "ResolvedRegimeConfig",
+    "_should_trigger_p2_deep_dive",
     "build_arg_parser",
     "extract_regime_snippet",
     "main",

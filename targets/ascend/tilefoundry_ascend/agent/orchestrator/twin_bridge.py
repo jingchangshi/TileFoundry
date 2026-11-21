@@ -396,6 +396,270 @@ def verify_twin_cpu_reference(
     return True, f"twin_cpu_reference_passed: entry={checked_fn.name}, {detail}{stress_suffix}"
 
 
+def _load_golden_callable(
+    golden_source: str,
+    entry_name: str | None = None,
+) -> tuple[Callable[..., object], str]:
+    """Load a CPU-callable PyTorch golden entrypoint from Python source text."""
+    with tempfile.TemporaryDirectory(prefix="tf_golden_ref_") as tmp_dir:
+        path = Path(tmp_dir) / "golden_ref.py"
+        path.write_text(golden_source, encoding="utf-8")
+        ns = runpy.run_path(str(path))
+    if entry_name:
+        target = ns.get(entry_name)
+        if callable(target):
+            return target, entry_name
+        raise ValueError(f"golden entrypoint {entry_name!r} not found in golden_source")
+    for name, obj in ns.items():
+        if name.startswith("_") or name == "get_input" or not callable(obj):
+            continue
+        if getattr(obj, "__module__", None) in (None, "<run_path>"):
+            return obj, name
+    raise ValueError("golden_source defines no top-level callable entrypoint")
+
+
+def _synthesize_reference_tensor(
+    shape: Sequence[int],
+    dtype: torch.dtype,
+    generator: torch.Generator,
+    *,
+    profile: str,
+) -> torch.Tensor:
+    """Create a deterministic CPU tensor for contract or stress parity checks."""
+    target_shape = tuple(int(dim) for dim in shape)
+    if dtype.is_floating_point:
+        scale = 0.5 if profile == "contract" else 1.5
+        vals = torch.randn(target_shape, generator=generator, dtype=torch.float32) * scale
+        return vals.to(dtype)
+    if dtype == torch.bool:
+        return torch.randint(0, 2, target_shape, generator=generator, dtype=torch.int64).to(
+            torch.bool
+        )
+    hi = 4 if profile == "contract" else 16
+    return torch.randint(0, hi, target_shape, generator=generator, dtype=dtype)
+
+
+def _default_shape_from_dims(test_dims: Mapping[str, int] | None) -> tuple[int, ...]:
+    if not test_dims:
+        return (4, 8)
+    m_val = test_dims.get("M", test_dims.get("rows", test_dims.get("S_q", test_dims.get("S"))))
+    n_val = test_dims.get("D", test_dims.get("cols", test_dims.get("N", test_dims.get("K"))))
+    if m_val is not None and n_val is not None and m_val > 0 and n_val > 0:
+        return (int(m_val), int(n_val))
+    positive = [int(v) for v in test_dims.values() if int(v) > 0]
+    if len(positive) >= 2:
+        return (positive[0], positive[1])
+    if len(positive) == 1:
+        return (positive[0],)
+    return (4, 8)
+
+
+def _build_reference_inputs(
+    ref_fn: Callable[..., object],
+    *,
+    profile: str,
+    run_seed: int,
+    sample_inputs: Sequence[torch.Tensor] | None,
+    input_specs: Sequence[tuple[Sequence[int], str]] | None,
+    attrs: Mapping[str, object],
+    test_dims: Mapping[str, int] | None,
+) -> list[torch.Tensor]:
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(run_seed)
+    if sample_inputs is not None:
+        if profile == "contract":
+            return [tensor.detach().cpu().clone() for tensor in sample_inputs]
+        return [
+            _synthesize_reference_tensor(
+                tuple(tensor.shape),
+                tensor.dtype,
+                generator,
+                profile="stress",
+            )
+            for tensor in sample_inputs
+        ]
+    if input_specs is not None:
+        return [
+            _synthesize_reference_tensor(
+                shape,
+                _str_to_torch_dtype(dtype_name),
+                generator,
+                profile=profile,
+            )
+            for shape, dtype_name in input_specs
+        ]
+    sig = inspect.signature(ref_fn)
+    tensor_param_count = sum(
+        1
+        for pname, param in sig.parameters.items()
+        if pname not in attrs
+        and param.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+        and param.default is inspect.Parameter.empty
+    )
+    count = max(1, tensor_param_count)
+    shape = _default_shape_from_dims(test_dims)
+    return [
+        _synthesize_reference_tensor(shape, torch.float32, generator, profile=profile)
+        for _ in range(count)
+    ]
+
+
+def _call_with_filtered_attrs(
+    fn: Callable[..., object],
+    inputs: Sequence[torch.Tensor],
+    attrs: Mapping[str, object],
+) -> object:
+    if not attrs:
+        return fn(*inputs)
+    sig = inspect.signature(fn)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return fn(*inputs, **attrs)
+    matched = {k: v for k, v in attrs.items() if k in sig.parameters}
+    return fn(*inputs, **matched)
+
+
+def _promote_floating_inputs(
+    inputs: Sequence[torch.Tensor],
+    dtype: torch.dtype,
+) -> list[torch.Tensor]:
+    return [
+        tensor.to(dtype=dtype) if tensor.is_floating_point() else tensor.clone()
+        for tensor in inputs
+    ]
+
+
+def _run_golden_cpu(
+    ref_fn: Callable[..., object],
+    inputs: Sequence[torch.Tensor],
+    attrs: Mapping[str, object],
+) -> object:
+    with torch.no_grad():
+        for precision in (torch.float64, torch.float32):
+            promoted = _promote_floating_inputs(inputs, precision)
+            try:
+                return _call_with_filtered_attrs(ref_fn, promoted, attrs)
+            except (RuntimeError, TypeError, ValueError):
+                continue
+        raw_clones = [tensor.detach().cpu().clone() for tensor in inputs]
+        return _call_with_filtered_attrs(ref_fn, raw_clones, attrs)
+
+
+def verify_reference_cpu_parity(
+    candidate_runner: Callable[..., object],
+    *,
+    golden_fn: Callable[..., object] | None = None,
+    golden_source: str | None = None,
+    entry_name: str | None = None,
+    input_specs: Sequence[tuple[Sequence[int], str]] | None = None,
+    sample_inputs: Sequence[torch.Tensor] | None = None,
+    attrs: Mapping[str, object] | None = None,
+    authored_hir_source: str | None = None,
+    test_dims: Mapping[str, int] | None = None,
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+    dual_profile: bool = True,
+    seed: int = 0,
+) -> tuple[bool, str]:
+    """Compare *candidate_runner* against PyTorch golden CPU reference without model.py.
+
+    Evaluates deterministic contract and optional stress inputs on CPU in float64/float32
+    reference precision, and optionally cross-checks the HIR Twin when *authored_hir_source*
+    is explicitly provided.
+    """
+    has_hir = bool(authored_hir_source is not None and authored_hir_source.strip())
+    if golden_fn is None and (golden_source is None or not golden_source.strip()):
+        if has_hir:
+            assert authored_hir_source is not None
+            return verify_twin_cpu_reference(
+                authored_hir_source,
+                candidate_runner,
+                test_dims=test_dims,
+                rtol=rtol,
+                atol=atol,
+                dual_profile=dual_profile,
+            )
+        return (
+            False,
+            "reference_parity_missing_golden: provide golden_fn, golden_source, "
+            "or authored_hir_source",
+        )
+
+    call_attrs = dict(attrs or {})
+    try:
+        if golden_fn is not None:
+            ref_fn = golden_fn
+            ref_name = entry_name or getattr(golden_fn, "__name__", "golden")
+        else:
+            assert golden_source is not None
+            ref_fn, ref_name = _load_golden_callable(golden_source, entry_name=entry_name)
+
+        contract_inputs = _build_reference_inputs(
+            ref_fn,
+            profile="contract",
+            run_seed=int(seed),
+            sample_inputs=sample_inputs,
+            input_specs=input_specs,
+            attrs=call_attrs,
+            test_dims=test_dims,
+        )
+        ref_out = _run_golden_cpu(ref_fn, contract_inputs, call_attrs)
+        cand_inputs = [tensor.detach().cpu().clone() for tensor in contract_inputs]
+        cand_out = _call_with_filtered_attrs(candidate_runner, cand_inputs, call_attrs)
+        ok, detail = _compare_outputs(ref_out, cand_out, rtol=rtol, atol=atol)
+        if not ok:
+            return False, f"reference_cpu_parity_mismatch(contract): {detail}"
+
+        stress_suffix = ""
+        if dual_profile:
+            stress_inputs = _build_reference_inputs(
+                ref_fn,
+                profile="stress",
+                run_seed=int(seed) + 17,
+                sample_inputs=sample_inputs,
+                input_specs=input_specs,
+                attrs=call_attrs,
+                test_dims=test_dims,
+            )
+            stress_ref = _run_golden_cpu(ref_fn, stress_inputs, call_attrs)
+            stress_cand_in = [tensor.detach().cpu().clone() for tensor in stress_inputs]
+            stress_cand = _call_with_filtered_attrs(
+                candidate_runner, stress_cand_in, call_attrs
+            )
+            stress_ok, stress_detail = _compare_outputs(
+                stress_ref, stress_cand, rtol=rtol, atol=atol
+            )
+            stress_err = _max_abs_diff(stress_ref, stress_cand)
+            if not stress_ok:
+                return False, f"reference_cpu_parity_mismatch(stress): {stress_detail}"
+            stress_suffix = f", stress_profile=ok(max_abs={stress_err:.3e})"
+
+        hir_suffix = ""
+        if has_hir:
+            assert authored_hir_source is not None
+            hir_ok, hir_detail = verify_twin_cpu_reference(
+                authored_hir_source,
+                candidate_runner,
+                test_dims=test_dims,
+                rtol=rtol,
+                atol=atol,
+                dual_profile=dual_profile,
+            )
+            if not hir_ok:
+                return False, f"hir_twin_crosscheck_failed: {hir_detail}"
+            hir_suffix = ", hir_twin=ok"
+    except Exception as exc:
+        return False, f"reference_parity_execution_error: {type(exc).__name__}: {exc}"
+
+    return (
+        True,
+        f"reference_cpu_parity_passed: entry={ref_name}, {detail}{stress_suffix}{hir_suffix}",
+    )
+
+
 @dataclass(frozen=True)
 class NumericalTwinResult:
     """Result of CPU numerical twin comparison between authored HIR and candidate source."""
@@ -1228,5 +1492,6 @@ __all__ = [
     "build_tilelang_runtime_twin",
     "compare_cannbench_tensor",
     "verify_numerical_twin",
+    "verify_reference_cpu_parity",
     "verify_twin_cpu_reference",
 ]

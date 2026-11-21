@@ -468,7 +468,13 @@ def test_kb_local_isolation_graduation_revival_and_loo_cap(tmp_path: Path) -> No
     vis_b_after = {r.rule_id for r in tracker.active_rules(topology_axes=axes, operator_name="level2/op_b")}
     assert "R_TEST_LOCAL_01" in vis_b_after
 
-    reloaded = BayesianRuleTracker.from_experience_lake(lake_dir)
+    frozen_reloaded = BayesianRuleTracker.from_experience_lake(lake_dir)
+    assert "R_TEST_LOCAL_01" not in frozen_reloaded.rules
+
+    reloaded = BayesianRuleTracker.from_experience_lake(
+        lake_dir,
+        allow_unreviewed_distilled_rules=True,
+    )
     assert "R_TEST_LOCAL_01" in reloaded.rules
     assert reloaded.rules["R_TEST_LOCAL_01"].scope == "cross_op"
     assert reloaded.posteriors["R_TEST_LOCAL_01"].successes == 2
@@ -579,7 +585,7 @@ def build_vec(tile_m=1):
         sample_builder_kwargs={},
         description="small test regime",
         representative_hir_dims={"M": 128, "D": 512},
-        representative_anchor_dims={"M": 128, "N": 512},
+        representative_anchor_dims={"M": 128, "D": 512},
     )
     anchors = [
         AnchorCaseSpec("level2/softmax", 1, "small", ref_perf_us=100.0, t_hw_us=20.0),
@@ -1087,7 +1093,13 @@ def test_bayesian_tracker_sync_from_experience_lake_incremental_and_excludes_sel
             round_idx=ridx,
         )
 
-    ingested_2 = tracker.sync_from_experience_lake(lake_dir, exclude_run_id="self_run_1")
+    assert "R_SYNC_LOCAL_99" not in BayesianRuleTracker.from_experience_lake(lake_dir).rules
+
+    ingested_2 = tracker.sync_from_experience_lake(
+        lake_dir,
+        exclude_run_id="self_run_1",
+        allow_unreviewed_distilled_rules=True,
+    )
     assert ingested_2 == 2
     assert "R_SYNC_LOCAL_99" in tracker.rules
     assert tracker.posteriors["R_SYNC_LOCAL_99"].successes == 2

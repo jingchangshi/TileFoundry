@@ -1277,15 +1277,25 @@ class PortfolioRunner:
         cost_model: HybridAscendCostModel | None = None,
         workload: Mapping[str, object] | None = None,
         case_ratios: CasePhysicsRatios | None = None,
+        blueprint: HirBlueprintPacket | None = None,
+        axes: TopologyAxes | None = None,
+        sil_advisory: object | None = None,
     ) -> RoundEscalationReport:
         """Run closed-loop track escalation and facet relaxation using HybridAscendCostModel."""
-        model = cost_model if cost_model is not None else HybridAscendCostModel(AscendTarget("ascend.950pr"))
+        model = (
+            cost_model
+            if cost_model is not None
+            else (self._cost_model or HybridAscendCostModel(AscendTarget("ascend.950pr")))
+        )
         eff_workload: CostFeatures | Mapping[str, object]
         if workload:
             eff_workload = dict(workload)
         else:
             eff_workload = build_cost_features_from_ledger(
                 candidate.ledger,
+                axes=axes,
+                blueprint=blueprint,
+                sil_advisory=sil_advisory,
                 target=model.target,
             )
 

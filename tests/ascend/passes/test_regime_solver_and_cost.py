@@ -19,7 +19,12 @@ from tilefoundry_ascend.ascend.cost_model import (
     predict_cannbench_eq3_score,
 )
 from tilefoundry_ascend.ascend.ir.tir.instructions import AscendGmToUb, AscendUbToGm
-from tilefoundry_ascend.ascend.schedule.regime_solver import RegimePiecewiseSolver
+from tilefoundry_ascend.ascend.schedule.regime_solver import (
+    SOLVER_MODE_ALGEBRAIC,
+    RegimePiecewiseSolver,
+    RegimePlanResult,
+    normalize_solver_mode,
+)
 from tilefoundry_ascend.ascend.sil import (
     AdvisoryEnvelope,
     HardwareLegalityBounds,
@@ -110,7 +115,13 @@ def test_regime_solver_ragged_recurrent_vm_and_sil_verifier():
         topology_axes=cv_ring_axes,
         roofline={"dominant_bound": "cube", "arithmetic_intensity": 256.0},
     )
-    assert sfa_res.solver_mode == "analytical_piecewise"
+    assert sfa_res.solver_mode == SOLVER_MODE_ALGEBRAIC
+    assert sfa_res.caliper_steps == 0
+    assert sfa_res.caliper_action == "none"
+    legacy_payload = dict(sfa_res.to_summary_dict(), solver_mode="analytical_piecewise")
+    rebuilt_sfa = RegimePlanResult.from_dict(legacy_payload)
+    assert rebuilt_sfa.solver_mode == SOLVER_MODE_ALGEBRAIC
+    assert normalize_solver_mode("analytical_piecewise") == SOLVER_MODE_ALGEBRAIC
     assert sfa_res.policy["tile_mnk"][0] >= 82
     assert sfa_res.policy["l1_half_bank_split"] is True
     assert "l0c_to_ub_split_m" in sfa_res.policy["cv_datapath"]

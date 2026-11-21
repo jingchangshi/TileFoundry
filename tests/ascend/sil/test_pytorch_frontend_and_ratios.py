@@ -1,4 +1,4 @@
-"""WP-1 tests for the PyTorch semantic frontend, physics ratios, and analytical blueprints."""
+"""Tests for the PyTorch semantic frontend, physics ratios, and analytical blueprints."""
 
 from __future__ import annotations
 
@@ -370,10 +370,13 @@ def test_blueprint_dtype_bytes_controls_traffic_basis(
     wide_packet = analyzer.build_universal_blueprint(quant, dims, dtype_bytes=2.0)
     assert byte_packet.roofline.min_gm_bytes == 160 + 512 + (160 * 512) // 2
     assert wide_packet.roofline.min_gm_bytes == 2 * (160 + 512) + (160 * 512) // 2
-    assert byte_packet.z3_pipeline_summary["dtype_bytes"] == 1.0
-    assert byte_packet.z3_pipeline_summary["representative_case_id"] is None
-    assert wide_packet.z3_pipeline_summary["traffic_basis"] == "estimated"
-    assert wide_packet.z3_pipeline_summary["roofline_class"] == "analytical_estimate"
+    assert byte_packet.provenance is not None
+    assert byte_packet.provenance.semantic_source == "pytorch_golden"
+    assert byte_packet.provenance.traffic_basis == "estimated_shape_dtype"
+    assert byte_packet.z3_pipeline_summary == {}
+    assert wide_packet.provenance is not None
+    assert wide_packet.provenance.traffic_basis == "estimated_shape_dtype"
+    assert "traffic_basis" not in wide_packet.z3_pipeline_summary
     grouped_source, grouped_proto, _ = _load_op("grouped_matmul")
     grouped = analyzer.analyze_source(
         grouped_source, entry_name="grouped_matmul", proto=grouped_proto
@@ -383,10 +386,12 @@ def test_blueprint_dtype_bytes_controls_traffic_basis(
     assert fallback.roofline.min_gm_bytes == 2 * (
         128 * 32 + 128 * 64 + 64 * 32
     )
-    assert fallback.z3_pipeline_summary["work_model"] == "analytical_matmul"
-    assert fallback.z3_pipeline_summary["traffic_basis"] == "estimated"
-    assert fallback.z3_pipeline_summary["compute_basis"] == "exact_work_count"
-    assert fallback.z3_pipeline_summary["roofline_class"] == "analytical_estimate"
+    assert fallback.roofline.cube_flops == 2 * 128 * 64 * 32
+    assert fallback.roofline.vector_flops == 0
+    assert fallback.provenance is not None
+    assert fallback.provenance.semantic_source == "pytorch_golden"
+    assert fallback.provenance.traffic_basis == "estimated_shape_dtype"
+    assert fallback.z3_pipeline_summary == {}
     with pytest.raises(ValueError, match="dtype_bytes must be finite and positive"):
         analyzer.build_universal_blueprint(grouped, matmul_dims, dtype_bytes=math.inf)
 
@@ -456,10 +461,11 @@ def test_blueprint_prices_each_declared_input_dtype(
     assert swapped_packet.roofline.min_gm_bytes == swapped_bytes
     assert half_bytes - swapped_bytes == 2 * (weight_elements - activation_elements)
     for packet in (half_packet, swapped_packet):
-        assert packet.z3_pipeline_summary["traffic_basis"] == "provable_lower_bound"
-        assert packet.z3_pipeline_summary["compute_basis"] == "exact_work_count"
-        assert packet.z3_pipeline_summary["roofline_class"] == "analytical_exact"
-        assert packet.z3_pipeline_summary["representative_case_id"] == 7
+        assert packet.provenance is not None
+        assert packet.provenance.semantic_source == "pytorch_golden"
+        assert packet.provenance.traffic_basis == "declared_io_exact"
+        assert packet.z3_pipeline_summary == {}
+        assert "traffic_basis" not in packet.z3_pipeline_summary
         assert packet.roofline.dominant_bound == "memory"
         assert packet.roofline.ideal_roofline_us == packet.roofline.memory_floor_us
         assert packet.roofline.memory_floor_us == pytest.approx(
@@ -476,8 +482,9 @@ def test_blueprint_prices_each_declared_input_dtype(
     assert undeclared_packet.roofline.min_gm_bytes == (
         2 * activation_elements + 4 * weight_elements + 2 * output_elements
     )
-    assert undeclared_packet.z3_pipeline_summary["traffic_basis"] == "estimated"
-    assert undeclared_packet.z3_pipeline_summary["roofline_class"] == "analytical_estimate"
+    assert undeclared_packet.provenance is not None
+    assert undeclared_packet.provenance.traffic_basis == "estimated_shape_dtype"
+    assert undeclared_packet.z3_pipeline_summary == {}
 
 
 def test_attention_blueprint_prices_declared_qkv_dtypes(
@@ -512,9 +519,11 @@ def test_attention_blueprint_prices_declared_qkv_dtypes(
     assert half_packet.roofline.min_gm_bytes == half_kv_bytes == 5_767_168
     assert wide_packet.roofline.min_gm_bytes == wide_kv_bytes == 7_864_320
     for packet in (half_packet, wide_packet):
-        assert packet.z3_pipeline_summary["work_model"] == "analytical_attention_online"
-        assert packet.z3_pipeline_summary["traffic_basis"] == "provable_lower_bound"
-        assert packet.z3_pipeline_summary["roofline_class"] == "analytical_lower_bound"
+        assert packet.provenance is not None
+        assert packet.provenance.semantic_source == "pytorch_golden"
+        assert packet.provenance.traffic_basis == "declared_io_exact"
+        assert packet.z3_pipeline_summary == {}
+        assert packet.roofline.special_ops > 0
         assert packet.roofline.memory_floor_us == pytest.approx(
             packet.roofline.min_gm_bytes / analyzer.hbm_bytes_per_second * 1e6
         )
@@ -1016,9 +1025,12 @@ def test_universal_blueprint_roofline_is_honest(
         assert packet.fallback_reason is None
         assert packet.reference_ledger is None
         assert packet.lowering_diagnostics == ("analytical_pytorch_frontend",)
-        assert packet.z3_pipeline_summary["source"] == "pytorch_semantic_frontend"
-        assert packet.z3_pipeline_summary["topology"] == semantics.base_axes.key()
-        assert packet.z3_pipeline_summary["work_model"] == _EXPECTED_WORK_MODEL[op_name]
+        assert packet.provenance is not None
+        assert packet.provenance.semantic_source == "pytorch_golden"
+        assert packet.provenance.traffic_basis == "estimated_shape_dtype"
+        assert packet.provenance.has_authored_hir is False
+        assert packet.provenance.has_scheduled_hir is False
+        assert packet.z3_pipeline_summary == {}
         assert roofline.compute_flops > 0
         assert roofline.compute_flops == roofline.cube_flops + roofline.vector_flops
         assert roofline.min_gm_bytes > 0
@@ -1075,7 +1087,9 @@ def test_sparse_attention_blueprint_uses_attention_work(
     packet = analyzer.build_universal_blueprint(semantics, dims)
     roofline = packet.roofline
     assert roofline is not None
-    assert packet.z3_pipeline_summary["work_model"] == "analytical_attention"
+    assert packet.provenance is not None
+    assert packet.provenance.semantic_source == "pytorch_golden"
+    assert packet.z3_pipeline_summary == {}
     assert roofline.resolved_hir_dims == {
         "B": 2,
         "S_q": 256,

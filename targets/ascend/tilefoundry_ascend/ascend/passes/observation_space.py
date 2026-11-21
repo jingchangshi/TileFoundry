@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask
 
@@ -14,17 +15,49 @@ _L2_FIELD_SOURCES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("l2_aic_mac_ratio", ("aic_mac_ratio", "aic_mad")),
     ("l2_aiv_vec_ratio", ("aiv_vec_ratio", "aiv_vec")),
     ("l2_roofline_eta", ("roofline_eta",)),
-    ("l2_mte2_wait_ratio", ("mte2_wait_ratio", "aiv_mte2")),
+    ("l2_mte2_wait_ratio", ("mte2_wait_ratio", "aiv_mte2", "aic_mte2")),
     ("l2_fixpipe_ratio", ("aic_fixpipe",)),
-    ("l2_cache_hit_rate", ("l2_hit_rate",)),
-    ("l2_bank_conflict_ratio", ("bank_conflict_ratio",)),
+    ("l2_cache_hit_rate", ("l2_hit_rate", "l2_cache_hit_rate")),
+    (
+        "l2_bank_conflict_ratio",
+        ("bank_conflict_ratio", "ub_bank_conflict_ratio", "resource_conflict_ratio"),
+    ),
     ("l2_sync_stall_ratio", ("sync_stall_ratio",)),
     ("l2_pseudo_double_buffer", ("pseudo_double_buffer_serialized",)),
 )
 
-_L2_TELEMETRY_KEYS: tuple[str, ...] = tuple(
-    dict.fromkeys(key for _field, keys in _L2_FIELD_SOURCES for key in keys)
-)
+
+class RooflineSummaryLike(Protocol):
+    """Structural view of analytical HIR Roofline bounds consumed by from_tiers."""
+
+    @property
+    def min_gm_bytes(self) -> int: ...
+
+    @property
+    def compute_floor_us(self) -> float: ...
+
+
+@runtime_checkable
+class _FullGridTrafficLedgerLike(Protocol):
+    """Optional ledger extension providing explicit full-grid GM traffic totals."""
+
+    def total_gm_bytes(self, grid_blocks: int | None = None) -> int: ...
+
+
+@runtime_checkable
+class _ScopedTrafficLedgerLike(Protocol):
+    """Optional ledger extension declaring single-tile versus full-grid GM traffic scope."""
+
+    @property
+    def gm_traffic_scope(self) -> str: ...
+
+
+@runtime_checkable
+class _ActiveGridLedgerLike(Protocol):
+    """Optional ledger extension reporting active launched grid blocks."""
+
+    @property
+    def active_grid_blocks(self) -> int: ...
 
 
 class ScopeWaterlineLike(Protocol):
@@ -175,14 +208,14 @@ def _require_mapping(value: object, field_name: str) -> Mapping[str, object]:
 
 
 def _telemetry_float(telemetry: Mapping[str, object], *keys: str, default: float = 0.0) -> float:
-    """Read the first present numeric telemetry key, otherwise return the neutral default."""
+    """Read the first present finite numeric telemetry key, otherwise return the default."""
     for key in keys:
         if key not in telemetry:
             continue
         value = telemetry[key]
         if isinstance(value, bool):
             continue
-        if isinstance(value, (int, float)):
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
             return float(value)
     return default
 
@@ -191,6 +224,104 @@ def _telemetry_bool(telemetry: Mapping[str, object], key: str, default: bool = F
     """Read a boolean L2 telemetry flag, otherwise return the neutral default."""
     value = telemetry.get(key)
     return value if isinstance(value, bool) else default
+
+
+def _has_measured_l2_field(
+    telemetry: Mapping[str, object], field_name: str, keys: tuple[str, ...]
+) -> bool:
+    """Return True only when telemetry carries a genuine non-null value for an L2 field."""
+    if field_name == "l2_pseudo_double_buffer":
+        return any(isinstance(telemetry.get(key), bool) for key in keys)
+    for key in keys:
+        if key not in telemetry:
+            continue
+        value = telemetry[key]
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return True
+    return False
+
+
+def _resolve_mte2_wait_ratio(telemetry: Mapping[str, object]) -> float:
+    """Resolve MTE2 wait ratio from explicit counter or max of AIV/AIC MTE2 counters."""
+    if _has_measured_l2_field(telemetry, "l2_mte2_wait_ratio", ("mte2_wait_ratio",)):
+        return _telemetry_float(telemetry, "mte2_wait_ratio")
+    candidates: list[float] = []
+    for key in ("aiv_mte2", "aic_mte2"):
+        if _has_measured_l2_field(telemetry, "l2_mte2_wait_ratio", (key,)):
+            candidates.append(_telemetry_float(telemetry, key))
+    return max(candidates) if candidates else 0.0
+
+
+def _resolve_static_ledger_gm_bytes(ledger: PhysicalLedgerLike) -> int:
+    """Resolve P0 full-grid GM traffic bytes from the static physical ledger."""
+    grid_count = (
+        ledger.active_grid_blocks
+        if isinstance(ledger, _ActiveGridLedgerLike) and ledger.active_grid_blocks > 0
+        else ledger.grid_blocks
+    )
+    effective_blocks = max(1, int(grid_count))
+    if isinstance(ledger, _FullGridTrafficLedgerLike):
+        total_fn = ledger.total_gm_bytes
+        if callable(total_fn):
+            sig = inspect.signature(total_fn)
+            positional = [
+                param
+                for param in sig.parameters.values()
+                if param.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            ]
+            if positional and positional[0].default is inspect.Parameter.empty:
+                return max(0, int(total_fn(effective_blocks)))
+            return max(0, int(total_fn()))
+        if isinstance(total_fn, int) and not isinstance(total_fn, bool):
+            return max(0, total_fn)
+    scope = (
+        ledger.gm_traffic_scope if isinstance(ledger, _ScopedTrafficLedgerLike) else "per_tile"
+    )
+    raw_bytes = max(0, int(ledger.gm_roundtrip_bytes))
+    if scope == "full_grid":
+        return raw_bytes
+    return raw_bytes * effective_blocks
+
+
+def _resolve_roofline_bounds(
+    roofline: RooflineSummaryLike | Mapping[str, object] | None,
+    telemetry: Mapping[str, object],
+) -> tuple[float, float]:
+    """Resolve blueprint minimum GM bytes and compute floor microseconds."""
+    min_gm = 0.0
+    compute_floor_us = 0.0
+    if roofline is not None:
+        if isinstance(roofline, Mapping):
+            min_gm = _as_float(roofline.get("min_gm_bytes"))
+            compute_floor_us = _as_float(roofline.get("compute_floor_us"))
+        else:
+            min_gm = float(roofline.min_gm_bytes)
+            compute_floor_us = float(roofline.compute_floor_us)
+    if min_gm <= 0.0:
+        min_gm = _telemetry_float(telemetry, "blueprint_min_gm_bytes")
+    if compute_floor_us <= 0.0:
+        compute_floor_us = _telemetry_float(telemetry, "blueprint_compute_floor_us")
+    return max(0.0, min_gm), max(0.0, compute_floor_us)
+
+
+def _resolve_actual_gm_bytes(
+    ledger: PhysicalLedgerLike, telemetry: Mapping[str, object]
+) -> float:
+    """Resolve actual GM traffic preferring P1 measured HBM bytes over P0 static ledger bytes."""
+    explicit_actual = _telemetry_float(telemetry, "actual_gm_bytes")
+    if explicit_actual > 0.0:
+        return explicit_actual
+    hbm_read = _telemetry_float(telemetry, "hbm_read_bytes")
+    hbm_write = _telemetry_float(telemetry, "hbm_write_bytes")
+    if hbm_read + hbm_write > 0.0:
+        return hbm_read + hbm_write
+    return float(_resolve_static_ledger_gm_bytes(ledger))
 
 
 @dataclass(frozen=True)
@@ -207,6 +338,7 @@ class ComputeIssueAxis:
     l2_aic_mac_ratio: float = 0.0
     l2_aiv_vec_ratio: float = 0.0
     l2_roofline_eta: float = 0.0
+    effective_compute_eta: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -223,6 +355,7 @@ class OffChipMemoryDmaAxis:
     l2_mte2_wait_ratio: float = 0.0
     l2_fixpipe_ratio: float = 0.0
     l2_cache_hit_rate: float = 1.0
+    transfer_inflation_ratio: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -319,6 +452,16 @@ class ObservationVector5D:
     has_l1_compiler_summary: bool = False
     measured_l2_fields: tuple[str, ...] = ()
 
+    @property
+    def transfer_inflation_ratio(self) -> float:
+        """Return actual GM bytes divided by the blueprint minimum GM bytes."""
+        return self.offchip_dma.transfer_inflation_ratio
+
+    @property
+    def effective_compute_eta(self) -> float:
+        """Return blueprint compute floor latency divided by measured kernel latency."""
+        return self.compute_issue.effective_compute_eta
+
     @classmethod
     def from_tiers(
         cls,
@@ -326,8 +469,9 @@ class ObservationVector5D:
         *,
         compiler_summary: CompilerSummaryLike | None = None,
         telemetry: Mapping[str, object] | None = None,
+        roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
     ) -> ObservationVector5D:
-        """Assemble the 5-axis vector directly from L0 ledger, L1 summary, and L2 telemetry."""
+        """Assemble the 5-axis vector from L0 ledger, L1 summary, L2 telemetry, and Roofline."""
         tel = telemetry if telemetry is not None else {}
         cube_cycles = _as_int(ledger.pipe_cycles.get("AIC.PIPE_M")) + _as_int(
             ledger.pipe_cycles.get("AIC.CUBE")
@@ -357,14 +501,29 @@ class ObservationVector5D:
         subkernel_count = max(1, _as_int(ledger.microarch_profile.get("subkernel_count"), 1))
         mte2_bytes_hint = _as_int(ledger.microarch_profile.get("mte2_bytes_hint"), 0)
         measured_latency_us = _telemetry_float(tel, "measured_latency_us", "dur_us")
-        has_l2_telemetry = any(key in tel for key in _L2_TELEMETRY_KEYS) and not _telemetry_bool(
+        measured_fields = tuple(
+            field_name
+            for field_name, keys in _L2_FIELD_SOURCES
+            if _has_measured_l2_field(tel, field_name, keys)
+        )
+        has_l2_telemetry = bool(measured_fields) and not _telemetry_bool(
             tel, "is_analytical_proxy"
         )
-        measured_l2_fields = (
-            tuple(field for field, keys in _L2_FIELD_SOURCES if any(key in tel for key in keys))
-            if has_l2_telemetry
-            else ()
+        measured_l2_fields = measured_fields if has_l2_telemetry else ()
+
+        blueprint_min_gm_bytes, blueprint_compute_floor_us = _resolve_roofline_bounds(
+            roofline, tel
         )
+        actual_gm_bytes = _resolve_actual_gm_bytes(ledger, tel)
+        if blueprint_min_gm_bytes > 0.0 and actual_gm_bytes > 0.0:
+            transfer_inflation_ratio = actual_gm_bytes / max(1.0, float(blueprint_min_gm_bytes))
+        else:
+            transfer_inflation_ratio = max(0.0, _telemetry_float(tel, "transfer_inflation_ratio"))
+
+        if blueprint_compute_floor_us > 0.0 and measured_latency_us > 0.0:
+            effective_compute_eta = blueprint_compute_floor_us / max(1e-3, measured_latency_us)
+        else:
+            effective_compute_eta = max(0.0, _telemetry_float(tel, "effective_compute_eta"))
 
         return cls(
             compute_issue=ComputeIssueAxis(
@@ -378,6 +537,7 @@ class ObservationVector5D:
                 l2_aic_mac_ratio=_telemetry_float(tel, "aic_mac_ratio", "aic_mad"),
                 l2_aiv_vec_ratio=_telemetry_float(tel, "aiv_vec_ratio", "aiv_vec"),
                 l2_roofline_eta=_telemetry_float(tel, "roofline_eta"),
+                effective_compute_eta=effective_compute_eta,
             ),
             offchip_dma=OffChipMemoryDmaAxis(
                 l0_gm_roundtrip_bytes=ledger.gm_roundtrip_bytes,
@@ -387,9 +547,12 @@ class ObservationVector5D:
                 l0_unaligned_padding_bytes=ledger.unaligned_dma_padding_bytes,
                 l1_dcache_dcci_flushes=dcci_flushes,
                 l1_objdump_mte2_bytes=mte2_bytes_hint,
-                l2_mte2_wait_ratio=_telemetry_float(tel, "mte2_wait_ratio", "aiv_mte2"),
+                l2_mte2_wait_ratio=_resolve_mte2_wait_ratio(tel),
                 l2_fixpipe_ratio=_telemetry_float(tel, "aic_fixpipe"),
-                l2_cache_hit_rate=_telemetry_float(tel, "l2_hit_rate", default=1.0),
+                l2_cache_hit_rate=_telemetry_float(
+                    tel, "l2_hit_rate", "l2_cache_hit_rate", default=1.0
+                ),
+                transfer_inflation_ratio=transfer_inflation_ratio,
             ),
             onchip_sram_reg=OnChipSramRegAxis(
                 l0_max_overflow_bytes=ledger.max_overflow_bytes,
@@ -406,7 +569,12 @@ class ObservationVector5D:
                 l1_scalar_regs=scalar_regs,
                 l1_spill_bytes=spill_bytes,
                 l1_stack_bytes=stack_bytes,
-                l2_bank_conflict_ratio=_telemetry_float(tel, "bank_conflict_ratio"),
+                l2_bank_conflict_ratio=_telemetry_float(
+                    tel,
+                    "bank_conflict_ratio",
+                    "ub_bank_conflict_ratio",
+                    "resource_conflict_ratio",
+                ),
             ),
             pipeline_sync=PipelineSyncAxis(
                 l0_steady_state_ii=int(ledger.steady_state_ii or 0),
@@ -442,10 +610,14 @@ class ObservationVector5D:
             self.compute_issue.l2_aic_mac_ratio,
             self.compute_issue.l2_aiv_vec_ratio,
         )
-        roofline_eta = self.compute_issue.l2_roofline_eta
+        eff_eta = (
+            self.compute_issue.l2_roofline_eta
+            if self.compute_issue.l2_roofline_eta > 0.0
+            else self.compute_issue.effective_compute_eta
+        )
         roofline_gap = (
-            1.0 - roofline_eta
-            if compute_utilization >= 0.5 and 0.0 < roofline_eta < 0.5
+            1.0 - eff_eta
+            if compute_utilization >= 0.5 and 0.0 < eff_eta < 0.5
             else 0.0
         )
         compute_gap = min(
@@ -457,6 +629,11 @@ class ObservationVector5D:
                 roofline_gap,
             ),
         )
+        inflation_gap = (
+            min(1.0, max(0.0, self.offchip_dma.transfer_inflation_ratio - 1.0))
+            if self.offchip_dma.transfer_inflation_ratio > 1.30
+            else 0.0
+        )
         dma_gap = min(
             1.0,
             max(
@@ -464,6 +641,7 @@ class ObservationVector5D:
                 1.0 - self.offchip_dma.l0_dma_burst_efficiency,
                 1.0 - self.offchip_dma.l2_cache_hit_rate,
                 0.35 if self.offchip_dma.l1_dcache_dcci_flushes > 0 else 0.0,
+                inflation_gap,
             ),
         )
         sram_gap = min(
@@ -500,13 +678,15 @@ class ObservationVector5D:
         )
 
     def to_dict(self) -> dict[str, object]:
-        """Serialize all 5 observation axes, residuals, and the L2 telemetry provenance flag."""
+        """Serialize all 5 observation axes, orthogonal ratios, residuals, and provenance."""
         return {
             "compute_issue": asdict(self.compute_issue),
             "offchip_dma": asdict(self.offchip_dma),
             "onchip_sram_reg": asdict(self.onchip_sram_reg),
             "pipeline_sync": asdict(self.pipeline_sync),
             "grid_irregularity": asdict(self.grid_irregularity),
+            "transfer_inflation_ratio": self.transfer_inflation_ratio,
+            "effective_compute_eta": self.effective_compute_eta,
             "has_l2_telemetry": self.has_l2_telemetry,
             "has_l1_compiler_summary": self.has_l1_compiler_summary,
             "measured_l2_fields": list(self.measured_l2_fields),
@@ -521,6 +701,12 @@ class ObservationVector5D:
         sram_payload = _require_mapping(payload.get("onchip_sram_reg"), "onchip_sram_reg")
         sync_payload = _require_mapping(payload.get("pipeline_sync"), "pipeline_sync")
         grid_payload = _require_mapping(payload.get("grid_irregularity"), "grid_irregularity")
+        raw_eff_eta = compute_payload.get("effective_compute_eta")
+        if raw_eff_eta is None:
+            raw_eff_eta = payload.get("effective_compute_eta")
+        raw_inflation = dma_payload.get("transfer_inflation_ratio")
+        if raw_inflation is None:
+            raw_inflation = payload.get("transfer_inflation_ratio")
         return cls(
             compute_issue=ComputeIssueAxis(
                 l0_cube_cycles=_as_int(compute_payload.get("l0_cube_cycles")),
@@ -533,6 +719,7 @@ class ObservationVector5D:
                 l2_aic_mac_ratio=_as_float(compute_payload.get("l2_aic_mac_ratio")),
                 l2_aiv_vec_ratio=_as_float(compute_payload.get("l2_aiv_vec_ratio")),
                 l2_roofline_eta=_as_float(compute_payload.get("l2_roofline_eta")),
+                effective_compute_eta=_as_float(raw_eff_eta),
             ),
             offchip_dma=OffChipMemoryDmaAxis(
                 l0_gm_roundtrip_bytes=_as_int(dma_payload.get("l0_gm_roundtrip_bytes")),
@@ -547,6 +734,7 @@ class ObservationVector5D:
                 l2_mte2_wait_ratio=_as_float(dma_payload.get("l2_mte2_wait_ratio")),
                 l2_fixpipe_ratio=_as_float(dma_payload.get("l2_fixpipe_ratio")),
                 l2_cache_hit_rate=_as_float(dma_payload.get("l2_cache_hit_rate"), 1.0),
+                transfer_inflation_ratio=_as_float(raw_inflation),
             ),
             onchip_sram_reg=OnChipSramRegAxis(
                 l0_max_overflow_bytes=_as_int(sram_payload.get("l0_max_overflow_bytes")),
@@ -603,5 +791,6 @@ __all__ = [
     "OnChipSramRegAxis",
     "PhysicalLedgerLike",
     "PipelineSyncAxis",
+    "RooflineSummaryLike",
     "ScopeWaterlineLike",
 ]

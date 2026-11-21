@@ -12,7 +12,6 @@ import time
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
 
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import MicroarchProfile
 from tilefoundry_ascend.ascend.cost_model.pipe_schedule_eval import resolve_cube_macs_safe
@@ -179,16 +178,18 @@ def project_case_workload(
     prof = MicroarchProfile.coerce(microarch_profile)
 
     if base_ledger is None:
-        ledger_map: dict[str, Any] = {}
+        ledger_map: dict[str, object] = {}
     elif isinstance(base_ledger, Mapping):
         ledger_map = dict(base_ledger)
-    elif hasattr(base_ledger, "to_dict") and callable(getattr(base_ledger, "to_dict")):
-        ledger_map = dict(base_ledger.to_dict())
+    elif hasattr(base_ledger, "to_dict") and callable(base_ledger.to_dict):
+        raw_ledger = base_ledger.to_dict()
+        ledger_map = dict(raw_ledger) if isinstance(raw_ledger, Mapping) else {}
     else:
         ledger_map = {
             "grid_blocks": getattr(base_ledger, "grid_blocks", 1),
             "pipe_cycles": getattr(base_ledger, "pipe_cycles", {}),
             "gm_roundtrip_bytes": getattr(base_ledger, "gm_roundtrip_bytes", 0),
+            "gm_traffic_scope": getattr(base_ledger, "gm_traffic_scope", "per_tile"),
             "dominant_contig_bytes": getattr(base_ledger, "dominant_contig_bytes", 32768),
             "steady_state_ii": getattr(base_ledger, "steady_state_ii", 0),
             "waterlines": getattr(base_ledger, "waterlines", {}),
@@ -240,9 +241,16 @@ def project_case_workload(
         width = max(k_dim, n_dim)
         case_gm = float(b_dim * g_dim * m_dim * width * 2 * elem_b)
 
-    base_gm_tile = float(ledger_map.get("gm_roundtrip_bytes", 0) or 0)
-    if base_gm_tile > 0.0:
-        case_gm = max(case_gm, base_gm_tile * float(proj_tiles))
+    base_gm_raw = float(ledger_map.get("gm_roundtrip_bytes", 0) or 0)
+    gm_scope = str(ledger_map.get("gm_traffic_scope", "per_tile") or "per_tile")
+    if base_gm_raw > 0.0:
+        if gm_scope == "full_grid":
+            scaled_gm = base_gm_raw * (float(proj_tiles) / float(base_grid))
+        elif gm_scope == "per_tile":
+            scaled_gm = base_gm_raw * float(proj_tiles)
+        else:
+            raise ValueError(f"Unsupported gm_traffic_scope: {gm_scope!r}")
+        case_gm = max(case_gm, scaled_gm)
     hbm_bw = float(facts.effective_hbm_bandwidth_bps(max(32, proj_contig)))
     if t_hw_us > 0.0:
         case_gm = max(case_gm, float(t_hw_us) * 1e-6 * hbm_bw)
@@ -276,6 +284,21 @@ def project_case_workload(
     else:
         fixpipe_bytes *= float(proj_tiles)
 
+    ub_occ_ratio = float(pol.get("ub_occupancy_ratio", 0.0) or 0.0)
+    raw_waterlines = ledger_map.get("waterlines")
+    if isinstance(raw_waterlines, Mapping):
+        ub_wl = raw_waterlines.get("UB")
+        if isinstance(ub_wl, Mapping):
+            ub_cap = int(ub_wl.get("capacity_bytes", 0) or 0)
+            ub_peak = int(ub_wl.get("peak_allocated_bytes", 0) or 0)
+            if ub_cap > 0 and ub_peak >= 0:
+                ub_occ_ratio = float(ub_peak) / float(ub_cap)
+        elif ub_wl is not None:
+            ub_cap = int(getattr(ub_wl, "capacity_bytes", 0) or 0)
+            ub_peak = int(getattr(ub_wl, "peak_allocated_bytes", 0) or 0)
+            if ub_cap > 0 and ub_peak >= 0:
+                ub_occ_ratio = float(ub_peak) / float(ub_cap)
+
     out: dict[str, object] = dict(pol)
     out.update(
         {
@@ -286,6 +309,7 @@ def project_case_workload(
             "contig_burst_bytes": proj_contig,
             "total_tiles": proj_tiles,
             "fixpipe_bytes": fixpipe_bytes,
+            "ub_occupancy_ratio": ub_occ_ratio,
             "steady_state_ii": int(ledger_map.get("steady_state_ii") or 0),
             "loop_trips": max(1, prof.inner_loop_trips),
             "pipeline_depth": max(1, prof.pipeline_depth),
@@ -376,13 +400,13 @@ class ExperienceLake:
             CaseObservationRecord,
         ]
     ]:
-        """Match same-(operator, case_num) candidate-vs-parent measurement pairs."""
+        """Match same-(operator, regime_tag, case_num) candidate-vs-parent measurement pairs."""
         candidates, observations = self.load_records()
-        latest_by_cand_case: dict[tuple[str, str, int], CaseObservationRecord] = {}
+        latest_by_cand_case: dict[tuple[str, str, str, int], CaseObservationRecord] = {}
         for obs in observations:
             if obs.measured_us <= 0.0:
                 continue
-            latest_by_cand_case[(obs.cand_sha, obs.operator, obs.case_num)] = obs
+            latest_by_cand_case[(obs.cand_sha, obs.operator, obs.regime_tag, obs.case_num)] = obs
 
         pairs: list[
             tuple[
@@ -392,19 +416,21 @@ class ExperienceLake:
                 CaseObservationRecord,
             ]
         ] = []
-        seen_pairs: set[tuple[str, str, str, int]] = set()
-        for (_csha, op, cnum), cand_obs in sorted(latest_by_cand_case.items()):
-            psha = cand_obs.parent_sha.strip()
+        seen_pairs: set[tuple[str, str, str, str, int]] = set()
+        for (_csha, op, rtag, cnum), cand_obs in sorted(latest_by_cand_case.items()):
+            cand_art = candidates.get(cand_obs.cand_sha)
+            psha = cand_obs.parent_sha.strip() or (
+                cand_art.parent_sha.strip() if cand_art is not None else ""
+            )
             if not psha or psha == cand_obs.cand_sha:
                 continue
-            parent_obs = latest_by_cand_case.get((psha, op, cnum))
+            parent_obs = latest_by_cand_case.get((psha, op, rtag, cnum))
             if parent_obs is None or parent_obs.measured_us <= 0.0:
                 continue
-            cand_art = candidates.get(cand_obs.cand_sha)
             parent_art = candidates.get(psha)
             if cand_art is None or parent_art is None:
                 continue
-            key = (cand_obs.cand_sha, psha, op, cnum)
+            key = (cand_obs.cand_sha, psha, op, rtag, cnum)
             if key in seen_pairs:
                 continue
             seen_pairs.add(key)

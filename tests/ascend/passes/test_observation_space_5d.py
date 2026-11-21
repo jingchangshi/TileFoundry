@@ -1,4 +1,4 @@
-"""WP-2 end-to-end tests for the 5-axis observation space and 1:1 facet unlocking."""
+"""End-to-end tests for the 5-axis observation space and 1:1 facet unlocking."""
 
 from __future__ import annotations
 
@@ -567,6 +567,30 @@ def test_observation_and_residual_serialization_round_trip() -> None:
     restored_legacy = StaticDynamicResidual.from_dict(legacy_payload)
     assert restored_legacy.observation is None
     assert restored_legacy.measured_sync_stall_ratio == residual.measured_sync_stall_ratio
+
+    roofline_map: dict[str, object] = {
+        "min_gm_bytes": 16384,
+        "compute_floor_us": 21.0,
+    }
+    ratio_obs = ObservationVector5D.from_tiers(
+        ledger,
+        compiler_summary=_rich_compiler_summary(),
+        telemetry=_rich_telemetry(),
+        roofline=roofline_map,
+    )
+    assert ratio_obs.transfer_inflation_ratio == pytest.approx(2.0)
+    assert ratio_obs.effective_compute_eta == pytest.approx(0.5)
+    assert ObservationVector5D.from_dict(ratio_obs.to_dict()) == ratio_obs
+
+    ratio_res = compute_static_dynamic_residual(
+        ledger,
+        _rich_telemetry(),
+        compiler_summary=_rich_compiler_summary(),
+        roofline=roofline_map,
+    )
+    assert ratio_res.transfer_inflation_ratio == pytest.approx(2.0)
+    assert ratio_res.effective_compute_eta == pytest.approx(0.5)
+    assert StaticDynamicResidual.from_dict(ratio_res.to_dict()) == ratio_res
 
 
 _PROTO: dict[str, object] = {

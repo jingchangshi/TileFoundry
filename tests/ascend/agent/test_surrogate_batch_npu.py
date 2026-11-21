@@ -17,6 +17,7 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -50,6 +51,7 @@ from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
     MicroProbeSpec,
     verify_micro_probe_hardware,
 )
+from tilefoundry_ascend.ascend.passes.physical_ledger import build_objective_physical_ledger
 
 _ENV_SHIM_DIR = os.environ.get("TF_SURROGATE_SHIM_DIR", "").strip()
 if (
@@ -136,68 +138,117 @@ def _measure_npu_latency_us(fn_call, *, warmup: int, repeat: int) -> float:
         return float(statistics.median(samples_ms)) * 1000.0
 
 
-def _normalize_pmu_ratio(raw_val: object) -> float:
+def _normalize_pmu_ratio(raw_val: int | float) -> float:
+    """Normalize a PMU ratio in [0, 1] or percentage in [0, 100] onto [0.0, 1.0]."""
     val = float(raw_val)
     if val > 1.05:
         val /= 100.0
     return max(0.0, min(1.0, val))
 
 
-def _extract_msprof_metrics(prof: object) -> dict[str, float | int]:
-    aic_mad = _normalize_pmu_ratio(getattr(prof, "aic_mad", 0.0))
-    aic_scalar = _normalize_pmu_ratio(getattr(prof, "aic_scalar", 0.0))
-    aic_mte1 = _normalize_pmu_ratio(getattr(prof, "aic_mte1", 0.0))
-    aic_mte2 = _normalize_pmu_ratio(getattr(prof, "aic_mte2", 0.0))
-    aic_mte3 = _normalize_pmu_ratio(getattr(prof, "aic_mte3", 0.0))
-    aic_fixpipe = _normalize_pmu_ratio(getattr(prof, "aic_fixpipe", 0.0))
-    aic_total_cycles = int(getattr(prof, "aic_total_cycles", 0))
-
-    aiv_vec = _normalize_pmu_ratio(getattr(prof, "aiv_vec", 0.0))
-    aiv_scalar = _normalize_pmu_ratio(getattr(prof, "aiv_scalar", 0.0))
-    aiv_mte2 = _normalize_pmu_ratio(getattr(prof, "aiv_mte2", 0.0))
-    aiv_mte3 = _normalize_pmu_ratio(getattr(prof, "aiv_mte3", 0.0))
-    aiv_total_cycles = int(getattr(prof, "aiv_total_cycles", 0))
-
-    raw_dur_us = getattr(prof, "dur_us", None)
-    if raw_dur_us is None:
-        dur_us = float(getattr(prof, "dur_ns", 0.0)) / 1000.0
-    else:
-        dur_us = float(raw_dur_us)
-
-    explicit_sync = getattr(prof, "sync_stall_ratio", None)
-    if explicit_sync is not None:
-        sync_stall_ratio = _normalize_pmu_ratio(explicit_sync)
-    else:
-        has_aic = (aic_total_cycles > 0) or any(
-            v > 0.0 for v in (aic_mad, aic_scalar, aic_mte1, aic_mte2, aic_mte3, aic_fixpipe)
-        )
-        has_aiv = (aiv_total_cycles > 0) or any(
-            v > 0.0 for v in (aiv_vec, aiv_scalar, aiv_mte2, aiv_mte3)
-        )
-        aic_active = (
-            max(aic_mad, aic_mte1, aic_mte2, aic_mte3, aic_fixpipe, aic_scalar) if has_aic else 0.0
-        )
-        aiv_active = max(aiv_vec, aiv_mte2, aiv_mte3, aiv_scalar) if has_aiv else 0.0
-        dominant_active = max(aic_active, aiv_active)
-        if has_aic or has_aiv:
-            sync_stall_ratio = max(0.0, 1.0 - min(1.0, dominant_active + 0.15))
+def _read_prof_number(prof: object, *names: str) -> int | float | None:
+    """Return the first present finite non-boolean numeric counter on a profiler object."""
+    for name in names:
+        raw: object | None
+        if isinstance(prof, Mapping):
+            raw = prof.get(name)
         else:
-            sync_stall_ratio = 0.0
+            raw = getattr(prof, name, None)
+        if raw is None or isinstance(raw, bool):
+            continue
+        if isinstance(raw, (int, float)) and math.isfinite(float(raw)):
+            return raw
+    return None
 
-    return {
-        "aic_mac_ratio": aic_mad,
-        "aiv_vec_ratio": aiv_vec,
-        "mte2_wait_ratio": max(aiv_mte2, aic_mte2),
-        "sync_stall_ratio": sync_stall_ratio,
-        "aic_mad": aic_mad,
-        "aic_fixpipe": aic_fixpipe,
-        "aiv_vec": aiv_vec,
-        "aiv_mte2": aiv_mte2,
-        "aic_mte2": aic_mte2,
-        "aic_total_cycles": aic_total_cycles,
-        "aiv_total_cycles": aiv_total_cycles,
-        "dur_us": dur_us,
-    }
+
+def _extract_msprof_metrics(prof: object) -> dict[str, float | int]:
+    """Extract only genuinely measured non-null PMU counters from a profiler result."""
+    metrics: dict[str, float | int] = {}
+
+    aic_mad_raw = _read_prof_number(prof, "aic_mad", "aic_mac_ratio")
+    if aic_mad_raw is not None:
+        aic_mad = _normalize_pmu_ratio(aic_mad_raw)
+        metrics["aic_mac_ratio"] = aic_mad
+        metrics["aic_mad"] = aic_mad
+
+    for key in ("aic_scalar", "aic_mte1", "aic_mte3", "aic_fixpipe", "aiv_scalar", "aiv_mte3"):
+        raw = _read_prof_number(prof, key)
+        if raw is not None:
+            metrics[key] = _normalize_pmu_ratio(raw)
+
+    aiv_vec_raw = _read_prof_number(prof, "aiv_vec", "aiv_vec_ratio")
+    if aiv_vec_raw is not None:
+        aiv_vec = _normalize_pmu_ratio(aiv_vec_raw)
+        metrics["aiv_vec_ratio"] = aiv_vec
+        metrics["aiv_vec"] = aiv_vec
+
+    aiv0_raw = _read_prof_number(prof, "aiv0_vec_ratio", "aiv0_vec")
+    if aiv0_raw is not None:
+        metrics["aiv0_vec_ratio"] = _normalize_pmu_ratio(aiv0_raw)
+    aiv1_raw = _read_prof_number(prof, "aiv1_vec_ratio", "aiv1_vec")
+    if aiv1_raw is not None:
+        metrics["aiv1_vec_ratio"] = _normalize_pmu_ratio(aiv1_raw)
+
+    aic_mte2_raw = _read_prof_number(prof, "aic_mte2")
+    norm_aic_mte2: float | None = None
+    if aic_mte2_raw is not None:
+        norm_aic_mte2 = _normalize_pmu_ratio(aic_mte2_raw)
+        metrics["aic_mte2"] = norm_aic_mte2
+
+    aiv_mte2_raw = _read_prof_number(prof, "aiv_mte2")
+    norm_aiv_mte2: float | None = None
+    if aiv_mte2_raw is not None:
+        norm_aiv_mte2 = _normalize_pmu_ratio(aiv_mte2_raw)
+        metrics["aiv_mte2"] = norm_aiv_mte2
+
+    explicit_mte2_wait = _read_prof_number(prof, "mte2_wait_ratio")
+    if explicit_mte2_wait is not None:
+        metrics["mte2_wait_ratio"] = _normalize_pmu_ratio(explicit_mte2_wait)
+    elif norm_aiv_mte2 is not None or norm_aic_mte2 is not None:
+        metrics["mte2_wait_ratio"] = max(
+            val for val in (norm_aiv_mte2, norm_aic_mte2) if val is not None
+        )
+
+    explicit_sync = _read_prof_number(prof, "sync_stall_ratio")
+    if explicit_sync is not None:
+        metrics["sync_stall_ratio"] = _normalize_pmu_ratio(explicit_sync)
+
+    l2_hit_raw = _read_prof_number(prof, "l2_hit_rate", "l2_cache_hit_rate")
+    if l2_hit_raw is not None:
+        metrics["l2_hit_rate"] = _normalize_pmu_ratio(l2_hit_raw)
+
+    bank_conflict_raw = _read_prof_number(
+        prof, "bank_conflict_ratio", "ub_bank_conflict_ratio", "resource_conflict_ratio"
+    )
+    if bank_conflict_raw is not None:
+        metrics["bank_conflict_ratio"] = _normalize_pmu_ratio(bank_conflict_raw)
+
+    for int_key in ("aic_total_cycles", "aiv_total_cycles"):
+        raw_int = _read_prof_number(prof, int_key)
+        if raw_int is not None:
+            metrics[int_key] = int(raw_int)
+
+    hbm_read_raw = _read_prof_number(prof, "hbm_read_bytes")
+    if hbm_read_raw is not None:
+        metrics["hbm_read_bytes"] = int(hbm_read_raw)
+    hbm_write_raw = _read_prof_number(prof, "hbm_write_bytes")
+    if hbm_write_raw is not None:
+        metrics["hbm_write_bytes"] = int(hbm_write_raw)
+    actual_gm_raw = _read_prof_number(prof, "actual_gm_bytes")
+    if actual_gm_raw is not None:
+        metrics["actual_gm_bytes"] = int(actual_gm_raw)
+    elif hbm_read_raw is not None or hbm_write_raw is not None:
+        metrics["actual_gm_bytes"] = int(hbm_read_raw or 0) + int(hbm_write_raw or 0)
+
+    raw_dur_us = _read_prof_number(prof, "dur_us", "measured_latency_us")
+    if raw_dur_us is not None:
+        metrics["dur_us"] = float(raw_dur_us)
+    else:
+        raw_dur_ns = _read_prof_number(prof, "dur_ns")
+        if raw_dur_ns is not None:
+            metrics["dur_us"] = float(raw_dur_ns) / 1000.0
+
+    return metrics
 
 
 def _measure_msprof_detail_metrics(
@@ -1020,6 +1071,63 @@ def _configure_tilelang_cache(tl_cache_dir: str) -> None:
     kc_mod.KernelCache._get_cache_namespace.cache_clear()
     kc_mod.KernelCache._get_tilelang_lib_stamp.cache_clear()
     kc_mod.KernelCache._create_dirs()
+
+
+def test_extract_msprof_metrics_omits_unmeasured_counters() -> None:
+    """Profiler extraction never fabricates sync_stall_ratio or absent PMU keys."""
+    prof = SimpleNamespace(
+        aic_mad=85.0,
+        aiv_vec=25.0,
+        aiv_mte2=40.0,
+        aic_total_cycles=2000,
+        aiv_total_cycles=4000,
+        hbm_read_bytes=1048576,
+        hbm_write_bytes=524288,
+        dur_us=18.5,
+    )
+    metrics = _extract_msprof_metrics(prof)
+    assert "sync_stall_ratio" not in metrics
+    assert "l2_hit_rate" not in metrics
+    assert "bank_conflict_ratio" not in metrics
+    assert "aic_fixpipe" not in metrics
+    assert metrics["aic_mac_ratio"] == pytest.approx(0.85)
+    assert metrics["aiv_vec_ratio"] == pytest.approx(0.25)
+    assert metrics["mte2_wait_ratio"] == pytest.approx(0.40)
+    assert metrics["hbm_read_bytes"] == 1048576
+    assert metrics["hbm_write_bytes"] == 524288
+    assert metrics["actual_gm_bytes"] == 1572864
+    assert metrics["dur_us"] == pytest.approx(18.5)
+
+    explicit_prof = SimpleNamespace(
+        aiv_vec=0.60,
+        sync_stall_ratio=22.0,
+        l2_hit_rate=78.5,
+        dur_ns=12000.0,
+    )
+    explicit_metrics = _extract_msprof_metrics(explicit_prof)
+    assert explicit_metrics["sync_stall_ratio"] == pytest.approx(0.22)
+    assert explicit_metrics["l2_hit_rate"] == pytest.approx(0.785)
+    assert explicit_metrics["dur_us"] == pytest.approx(12.0)
+    assert "aic_mac_ratio" not in explicit_metrics
+    assert "mte2_wait_ratio" not in explicit_metrics
+
+    ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 100},
+        waterlines={},
+    )
+    obs = ledger.to_observation_5d(telemetry=metrics)
+    assert "l2_sync_stall_ratio" not in obs.measured_l2_fields
+    assert "l2_cache_hit_rate" not in obs.measured_l2_fields
+    assert "l2_fixpipe_ratio" not in obs.measured_l2_fields
+    assert obs.measured_l2_fields == (
+        "l2_measured_latency_us",
+        "l2_aic_mac_ratio",
+        "l2_aiv_vec_ratio",
+        "l2_mte2_wait_ratio",
+    )
 
 
 def test_fast_bindings_treat_candidate_change_as_infrastructure(tmp_path: Path) -> None:

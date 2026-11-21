@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Protocol, runtime_checkable
 
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
     DEFAULT_COMPILER_BEHAVIOR_REGISTRY,
@@ -15,6 +15,7 @@ from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
     CompilerBehaviorRegistry,
 )
 from tilefoundry_ascend.ascend.cost_model.experience_lake import (
+    CaseObservationRecord,
     ExperienceLake,
     project_case_workload,
 )
@@ -24,6 +25,10 @@ from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
 )
 from tilefoundry_ascend.ascend.cost_model.pipe_schedule_eval import (
     Ascend950PipeScheduleEvaluator,
+)
+from tilefoundry_ascend.ascend.passes.physical_ledger import (
+    ObjectivePhysicalLedger,
+    ScopeWaterline,
 )
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
@@ -187,6 +192,7 @@ class CostFeatures:
     steady_state_ii: int = 0
     loop_trips: int = 1
     pipeline_depth: int = 1
+    ub_occupancy_ratio: float = 0.0
 
     @classmethod
     def coerce(
@@ -275,39 +281,317 @@ class CostPrediction:
     fixpipe_floor_us: float = 0.0
     cv_sync_us: float = 0.0
     topology_bucket: str = "global"
+    named_features: dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         """Serialize prediction breakdown to JSON-safe dictionary."""
         out = asdict(self)
         out["feature_vector"] = list(self.feature_vector)
+        out["named_features"] = dict(self.named_features)
         return out
 
 
 @dataclass(frozen=True)
-class CalibrationSample:
-    """Persisted calibration observation."""
+class ResidualBasisContext:
+    """Normalized physical inputs supplied to Tier-2 named basis extractors."""
 
-    feature_vector: tuple[float, ...]
+    tier0_us: float
+    cube_floor_us: float
+    vec_floor_us: float
+    hbm_floor_us: float
+    tier1_penalty_us: float
+    launch_us: float
+    wave_ratio: float
+    l2_hit_rate: float
+    contig_burst_bytes: int
+    ub_occupancy_ratio: float
+    axes: TopologyAxes | None
+
+
+@dataclass(frozen=True)
+class ResidualBasisSpec:
+    """Declarative specification for a single dimensionless Tier-2 basis function."""
+
+    name: str
+    varies_within_case: bool
+    min_bucket_samples: int
+    extractor: Callable[[ResidualBasisContext], float]
+
+    def __post_init__(self) -> None:
+        if not self.name.strip():
+            raise ValueError("ResidualBasisSpec.name must be non-empty")
+        if self.min_bucket_samples < 1:
+            raise ValueError(
+                f"ResidualBasisSpec.min_bucket_samples must be >= 1, got {self.min_bucket_samples}"
+            )
+
+
+def _floor_denom(ctx: ResidualBasisContext) -> float:
+    return max(1e-6, ctx.cube_floor_us + ctx.vec_floor_us + ctx.hbm_floor_us)
+
+
+def _is_coupled_1c2v(ctx: ResidualBasisContext) -> float:
+    return 1.0 if (ctx.axes is not None and ctx.axes.compute_engine == "coupled_1c2v") else 0.0
+
+
+def _is_aic_only(ctx: ResidualBasisContext) -> float:
+    return 1.0 if (ctx.axes is not None and ctx.axes.compute_engine == "aic_only") else 0.0
+
+
+def _is_irregular_simt(ctx: ResidualBasisContext) -> float:
+    if ctx.axes is None:
+        return 0.0
+    return (
+        1.0
+        if ctx.axes.iteration_regularity
+        in ("irregular_simt", "ragged_group", "dynamic_opcode_stream")
+        else 0.0
+    )
+
+
+DEFAULT_RESIDUAL_BASIS_SPECS: tuple[ResidualBasisSpec, ...] = (
+    ResidualBasisSpec(
+        name="intercept",
+        varies_within_case=False,
+        min_bucket_samples=2,
+        extractor=lambda _ctx: 1.0,
+    ),
+    ResidualBasisSpec(
+        name="log_tier0_scale",
+        varies_within_case=True,
+        min_bucket_samples=6,
+        extractor=lambda ctx: math.log1p(max(0.0, ctx.tier0_us)) / 10.0,
+    ),
+    ResidualBasisSpec(
+        name="cube_bound_share",
+        varies_within_case=True,
+        min_bucket_samples=6,
+        extractor=lambda ctx: ctx.cube_floor_us / _floor_denom(ctx),
+    ),
+    ResidualBasisSpec(
+        name="vec_bound_share",
+        varies_within_case=True,
+        min_bucket_samples=6,
+        extractor=lambda ctx: ctx.vec_floor_us / _floor_denom(ctx),
+    ),
+    ResidualBasisSpec(
+        name="wave_tail_waste",
+        varies_within_case=True,
+        min_bucket_samples=4,
+        extractor=lambda ctx: max(0.0, ctx.wave_ratio - 1.0),
+    ),
+    ResidualBasisSpec(
+        name="l2_miss_ratio",
+        varies_within_case=True,
+        min_bucket_samples=6,
+        extractor=lambda ctx: 1.0 - max(0.0, min(1.0, ctx.l2_hit_rate)),
+    ),
+    ResidualBasisSpec(
+        name="short_dma_burst_ind",
+        varies_within_case=True,
+        min_bucket_samples=4,
+        extractor=lambda ctx: 1.0 if ctx.contig_burst_bytes < 16384 else 0.0,
+    ),
+    ResidualBasisSpec(
+        name="tier1_penalty_ratio",
+        varies_within_case=True,
+        min_bucket_samples=4,
+        extractor=lambda ctx: min(2.0, max(0.0, ctx.tier1_penalty_us) / max(1e-3, ctx.tier0_us)),
+    ),
+    ResidualBasisSpec(
+        name="launch_overhead_ratio",
+        varies_within_case=True,
+        min_bucket_samples=6,
+        extractor=lambda ctx: min(1.0, max(0.0, ctx.launch_us) / max(1e-3, ctx.tier0_us)),
+    ),
+    ResidualBasisSpec(
+        name="is_coupled_1c2v",
+        varies_within_case=False,
+        min_bucket_samples=8,
+        extractor=_is_coupled_1c2v,
+    ),
+    ResidualBasisSpec(
+        name="is_aic_only",
+        varies_within_case=False,
+        min_bucket_samples=8,
+        extractor=_is_aic_only,
+    ),
+    ResidualBasisSpec(
+        name="is_irregular_simt",
+        varies_within_case=False,
+        min_bucket_samples=8,
+        extractor=_is_irregular_simt,
+    ),
+)
+
+_LEGACY_13D_INDEX_TO_NAME: tuple[tuple[int, str], ...] = (
+    (0, "intercept"),
+    (1, "log_tier0_scale"),
+    (2, "cube_bound_share"),
+    (3, "vec_bound_share"),
+    (5, "wave_tail_waste"),
+    (6, "l2_miss_ratio"),
+    (7, "short_dma_burst_ind"),
+    (8, "tier1_penalty_ratio"),
+    (9, "launch_overhead_ratio"),
+    (10, "is_coupled_1c2v"),
+    (11, "is_aic_only"),
+    (12, "is_irregular_simt"),
+)
+
+
+def _upgrade_legacy_13d_vector(vec: Sequence[float]) -> dict[str, float]:
+    """Upgrade a legacy 13-element feature vector into the 12 full-rank named features."""
+    vals = [float(x) for x in vec]
+    if len(vals) < 13:
+        vals.extend([0.0] * (13 - len(vals)))
+    return {name: vals[idx] for idx, name in _LEGACY_13D_INDEX_TO_NAME}
+
+
+class ResidualBasisRegistry:
+    """Ordered declarative registry of dimensionless Tier-2 residual basis functions."""
+
+    def __init__(self, specs: Sequence[ResidualBasisSpec] | None = None) -> None:
+        self._specs: dict[str, ResidualBasisSpec] = {}
+        initial = DEFAULT_RESIDUAL_BASIS_SPECS if specs is None else specs
+        for spec in initial:
+            self.register(spec)
+
+    def register(
+        self,
+        spec: ResidualBasisSpec,
+        *,
+        overwrite: bool = True,
+    ) -> ResidualBasisSpec:
+        """Register *spec* in deterministic insertion order."""
+        if not overwrite and spec.name in self._specs:
+            raise ValueError(f"ResidualBasisSpec already registered: {spec.name!r}")
+        self._specs[spec.name] = spec
+        return spec
+
+    def clone(self) -> ResidualBasisRegistry:
+        """Return an independent shallow copy of this registry."""
+        return ResidualBasisRegistry(tuple(self._specs.values()))
+
+    def head0_specs(self) -> tuple[ResidualBasisSpec, ...]:
+        """Return ordered basis specs for Head-0 global and bucket log-residual fitting."""
+        return tuple(self._specs.values())
+
+    def head2_specs(self) -> tuple[ResidualBasisSpec, ...]:
+        """Return ordered within-case varying basis specs for Head-2 pairwise deltas."""
+        return tuple(spec for spec in self._specs.values() if spec.varies_within_case)
+
+    def spec_names(self, *, head2_only: bool = False) -> tuple[str, ...]:
+        """Return ordered basis spec names for Head-0 or Head-2."""
+        active = self.head2_specs() if head2_only else self.head0_specs()
+        return tuple(spec.name for spec in active)
+
+    def extract_named(self, ctx: ResidualBasisContext) -> dict[str, float]:
+        """Evaluate all registered basis functions against *ctx* into a named mapping."""
+        return {spec.name: float(spec.extractor(ctx)) for spec in self._specs.values()}
+
+    @staticmethod
+    def vectorize(
+        named_features: Mapping[str, float],
+        specs: Sequence[ResidualBasisSpec],
+    ) -> tuple[float, ...]:
+        """Project *named_features* onto an ordered tuple matching *specs*."""
+        return tuple(float(named_features.get(spec.name, 0.0)) for spec in specs)
+
+
+def _effective_sample_count(sample_count: int, forgetting_factor: float) -> float:
+    """Compute exponential-forgetting effective sample weight ``sum(gamma ** age)``."""
+    if sample_count <= 0:
+        return 0.0
+    return sum(forgetting_factor ** float(age) for age in range(sample_count))
+
+
+def _sample_gate_threshold(min_samples: int, forgetting_factor: float) -> float:
+    """Return the discounted weight threshold matching *min_samples* unit observations."""
+    if min_samples <= 0:
+        return 0.0
+    if forgetting_factor >= 1.0:
+        return float(min_samples)
+    return ((1.0 - (forgetting_factor ** float(min_samples))) / (1.0 - forgetting_factor)) - 1e-9
+
+
+@dataclass(frozen=True)
+class CalibrationSample:
+    """Persisted calibration observation keyed by named dimensionless basis features."""
+
+    named_features: dict[str, float]
     measured_us: float
     analytical_us: float
     topology_bucket: str = "global"
+    basis_schema_version: int = 2
+
+    def __post_init__(self) -> None:
+        normalized = {str(k): float(v) for k, v in self.named_features.items()}
+        object.__setattr__(self, "named_features", normalized)
+
+    @property
+    def feature_vector(self) -> tuple[float, ...]:
+        """Return ordered vector view aligned with ``DEFAULT_RESIDUAL_BASIS_SPECS``."""
+        return ResidualBasisRegistry.vectorize(self.named_features, DEFAULT_RESIDUAL_BASIS_SPECS)
 
     def to_dict(self) -> dict[str, object]:
+        """Serialize calibration observation with named basis features and schema version."""
         return {
+            "named_features": dict(self.named_features),
             "feature_vector": list(self.feature_vector),
             "measured_us": self.measured_us,
             "analytical_us": self.analytical_us,
             "topology_bucket": self.topology_bucket,
+            "basis_schema_version": int(self.basis_schema_version),
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> CalibrationSample:
+        """Deserialize a calibration observation, upgrading legacy 13-element vectors."""
+        raw_named = payload.get("named_features")
+        raw_ver = payload.get("basis_schema_version")
+        if isinstance(raw_named, Mapping) and raw_named:
+            named = {str(k): float(v) for k, v in raw_named.items()}
+            schema_ver = int(raw_ver) if isinstance(raw_ver, (int, float)) else 2
+        else:
+            raw_vec = payload.get("feature_vector") or ()
+            vec = [float(x) for x in raw_vec] if isinstance(raw_vec, Sequence) else []
+            if len(vec) == len(DEFAULT_RESIDUAL_BASIS_SPECS) and raw_ver == 2:
+                named = {
+                    spec.name: vec[idx]
+                    for idx, spec in enumerate(DEFAULT_RESIDUAL_BASIS_SPECS)
+                }
+            else:
+                named = _upgrade_legacy_13d_vector(vec)
+            schema_ver = 2
         return cls(
-            feature_vector=tuple(float(x) for x in (payload.get("feature_vector") or ())),
+            named_features=named,
             measured_us=float(payload["measured_us"]),
             analytical_us=float(payload["analytical_us"]),
             topology_bucket=str(payload.get("topology_bucket") or "global"),
+            basis_schema_version=schema_ver,
         )
+
+
+@dataclass(frozen=True)
+class _Tier01Result:
+    """Internal Tier-0 physics and Tier-1 compiler penalty evaluation bundle."""
+
+    tier0_us: float
+    tier1_penalty_us: float
+    cube_floor_us: float
+    vec_floor_us: float
+    hbm_floor_us: float
+    l2_hit_rate: float
+    wave_ratio: float
+    bank_conflict_us: float
+    eff_hbm_bw: float
+    launch_us: float
+    fixpipe_floor_us: float
+    cv_sync_us: float
+    dominant: str
+    basis_context: ResidualBasisContext
+    named_features: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -438,37 +722,59 @@ def evaluate_cost_model_ranking(
 class HybridAscendCostModel:
     """3-Tier Hybrid Ascend 950 Cost Model (Roofline Floor, Compiler Penalties, Ridge)."""
 
-    FEATURE_DIM = 13
-
     def __init__(
         self,
         target: AscendTarget | None = None,
         *,
         clock_ghz: float = DEFAULT_CLOCK_GHZ,
         ridge_alpha: float = 1.0,
+        forgetting_factor: float = 0.985,
         calibration_path: str | Path | None = None,
         behavior_registry: CompilerBehaviorRegistry | None = None,
+        basis_registry: ResidualBasisRegistry | None = None,
     ) -> None:
+        if not (0.0 < forgetting_factor <= 1.0):
+            raise ValueError(
+                f"forgetting_factor must be in (0.0, 1.0], got {forgetting_factor!r}"
+            )
         self.target = target or AscendTarget("ascend.950pr")
         self.facts = self.target.get_facts(AscendSpaceFacts)
         self.clock_ghz = float(getattr(self.facts, "clock_ghz", clock_ghz))
         self.ridge_alpha = float(max(1e-6, ridge_alpha))
+        self._forgetting_factor = float(forgetting_factor)
         self.calibration_path = Path(calibration_path) if calibration_path is not None else None
         self.behavior_registry: CompilerBehaviorRegistry = (
-            behavior_registry if behavior_registry is not None else DEFAULT_COMPILER_BEHAVIOR_REGISTRY
+            behavior_registry
+            if behavior_registry is not None
+            else DEFAULT_COMPILER_BEHAVIOR_REGISTRY
+        )
+        self._basis_registry: ResidualBasisRegistry = (
+            basis_registry if basis_registry is not None else ResidualBasisRegistry()
         )
         self._samples: list[CalibrationSample] = []
-        self._weights: list[float] = [0.0] * self.FEATURE_DIM
-        self._bucket_weights: dict[str, list[float]] = {}
+        self._weights_by_name: dict[str, float] = {
+            spec.name: 0.0 for spec in self._basis_registry.head0_specs()
+        }
+        self._bucket_weights_by_name: dict[str, dict[str, float]] = {}
+        self._active_global_specs: tuple[str, ...] = ()
+        self._active_bucket_specs: dict[str, tuple[str, ...]] = {}
         self._pipe_evaluator = Ascend950PipeScheduleEvaluator(self.target)
         self._msprof_pipe_scales: dict[str, dict[str, tuple[float, float]]] = {}
         self._msprof_event_count: int = 0
-        self._pair_deltas: list[tuple[tuple[float, ...], float]] = []
-        self._delta_weights: list[float] = [0.0] * self.FEATURE_DIM
-        self._replayed_obs_keys: set[tuple[str, int, str, float]] = set()
-        self._replayed_pair_keys: set[tuple[str, str, int]] = set()
+        self._pair_deltas: list[tuple[dict[str, float], float]] = []
+        self._delta_weights_by_name: dict[str, float] = {
+            spec.name: 0.0 for spec in self._basis_registry.head2_specs()
+        }
+        self._active_head2_specs: tuple[str, ...] = ()
+        self._replayed_obs_keys: set[tuple[str, str, str, int, str, float]] = set()
+        self._replayed_pair_keys: set[tuple[str, str, str, str, int]] = set()
         if self.calibration_path is not None and self.calibration_path.exists():
             self.load_calibration(self.calibration_path)
+
+    @property
+    def basis_registry(self) -> ResidualBasisRegistry:
+        """Return active Tier-2 declarative residual basis registry."""
+        return self._basis_registry
 
     @property
     def sample_count(self) -> int:
@@ -476,15 +782,49 @@ class HybridAscendCostModel:
 
     @property
     def weights(self) -> tuple[float, ...]:
-        return tuple(self._weights)
+        specs = self._basis_registry.head0_specs()
+        return tuple(self._weights_by_name.get(spec.name, 0.0) for spec in specs)
+
+    @property
+    def weights_by_name(self) -> dict[str, float]:
+        specs = self._basis_registry.head0_specs()
+        return {spec.name: self._weights_by_name.get(spec.name, 0.0) for spec in specs}
 
     @property
     def bucket_weights(self) -> dict[str, tuple[float, ...]]:
-        return {k: tuple(v) for k, v in self._bucket_weights.items()}
+        specs = self._basis_registry.head0_specs()
+        return {
+            bucket: tuple(wmap.get(spec.name, 0.0) for spec in specs)
+            for bucket, wmap in self._bucket_weights_by_name.items()
+        }
+
+    @property
+    def bucket_weights_by_name(self) -> dict[str, dict[str, float]]:
+        specs = self._basis_registry.head0_specs()
+        return {
+            bucket: {spec.name: wmap.get(spec.name, 0.0) for spec in specs}
+            for bucket, wmap in self._bucket_weights_by_name.items()
+        }
 
     @property
     def delta_weights(self) -> tuple[float, ...]:
-        return tuple(self._delta_weights)
+        specs = self._basis_registry.head2_specs()
+        return tuple(self._delta_weights_by_name.get(spec.name, 0.0) for spec in specs)
+
+    @property
+    def delta_weights_by_name(self) -> dict[str, float]:
+        specs = self._basis_registry.head2_specs()
+        return {spec.name: self._delta_weights_by_name.get(spec.name, 0.0) for spec in specs}
+
+    def active_head0_spec_names(self, bucket: str = "global") -> tuple[str, ...]:
+        """Return active basis spec names for *bucket* (or global if *bucket* is global)."""
+        if bucket == "global":
+            return self._active_global_specs
+        return self._active_bucket_specs.get(bucket, ())
+
+    def active_head2_spec_names(self) -> tuple[str, ...]:
+        """Return active Head-2 within-case basis spec names under sample gating."""
+        return self._active_head2_specs
 
     @property
     def pair_delta_count(self) -> int:
@@ -509,75 +849,12 @@ class HybridAscendCostModel:
             out[pipe] = max(0.5, min(2.0, scale))
         return out
 
-    def _pad_feature_vector(self, vec: Sequence[float]) -> tuple[float, ...]:
-        vals = [float(x) for x in vec[: self.FEATURE_DIM]]
-        if len(vals) < self.FEATURE_DIM:
-            vals.extend([0.0] * (self.FEATURE_DIM - len(vals)))
-        return tuple(vals)
-
-    def _extract_surrogate_features(
-        self,
-        cf: CostFeatures,
-        *,
-        cube_floor_us: float,
-        vec_floor_us: float,
-        hbm_floor_us: float,
-        wave_ratio: float,
-        l2_hit_rate: float,
-        tier1_penalty_us: float,
-        tier0_us: float,
-        launch_us: float,
-    ) -> tuple[float, ...]:
-        total_floor = max(1e-6, cube_floor_us + vec_floor_us + hbm_floor_us)
-        axes = cf.topology_axes
-        is_coupled = 1.0 if (axes is not None and axes.compute_engine == "coupled_1c2v") else 0.0
-        is_aic = 1.0 if (axes is not None and axes.compute_engine == "aic_only") else 0.0
-        is_irreg = (
-            1.0
-            if (
-                axes is not None
-                and axes.iteration_regularity
-                in ("irregular_simt", "ragged_group", "dynamic_opcode_stream")
-            )
-            else 0.0
-        )
-        return (
-            1.0,
-            math.log1p(max(0.0, tier0_us)) / 10.0,
-            cube_floor_us / total_floor,
-            vec_floor_us / total_floor,
-            hbm_floor_us / total_floor,
-            max(0.0, wave_ratio - 1.0),
-            1.0 - max(0.0, min(1.0, l2_hit_rate)),
-            1.0 if cf.contig_burst_bytes < 16384 else 0.0,
-            min(2.0, tier1_penalty_us / max(1e-3, tier0_us)),
-            launch_us / max(1e-3, tier0_us),
-            is_coupled,
-            is_aic,
-            is_irreg,
-        )
-
     def _compute_tier0_and_tier1(
         self,
         cf: CostFeatures,
         *,
         use_pipe_scales: bool = True,
-    ) -> tuple[
-        float,
-        float,
-        float,
-        float,
-        float,
-        float,
-        float,
-        float,
-        float,
-        float,
-        float,
-        float,
-        str,
-        tuple[float, ...],
-    ]:
+    ) -> _Tier01Result:
         aic_cores = max(1, cf.active_aic_cores or self.facts.num_aic_cores)
         aiv_cores = max(1, cf.active_aiv_cores or self.facts.num_aiv_cores)
         clock_hz = self.clock_ghz * 1e9
@@ -628,10 +905,21 @@ class HybridAscendCostModel:
         effective_gm_bytes = float(cf.gm_bytes) * (1.0 - l2_hit_rate)
         hbm_floor_us = (effective_gm_bytes / eff_hbm_bw) * 1e6 if effective_gm_bytes > 0 else 0.0
 
-        l2_bw_bps = float(aic_cores) * float(getattr(self.facts, "l2_bytes_per_cycle_per_aic", DEFAULT_L2_BYTES_PER_CYCLE_PER_AIC)) * clock_hz
-        l2_floor_us = ((float(cf.gm_bytes) * l2_hit_rate) / max(1.0, l2_bw_bps)) * 1e6 if l2_hit_rate > 0 else 0.0
+        l2_bw_bps = (
+            float(aic_cores)
+            * float(getattr(self.facts, "l2_bytes_per_cycle_per_aic", DEFAULT_L2_BYTES_PER_CYCLE_PER_AIC))
+            * clock_hz
+        )
+        l2_floor_us = (
+            ((float(cf.gm_bytes) * l2_hit_rate) / max(1.0, l2_bw_bps)) * 1e6
+            if l2_hit_rate > 0
+            else 0.0
+        )
 
-        fixpipe_bpc = float(getattr(self.facts, "fixpipe_bytes_per_cycle", DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC) or DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC)
+        fixpipe_bpc = float(
+            getattr(self.facts, "fixpipe_bytes_per_cycle", DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC)
+            or DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC
+        )
         fixpipe_bw_bps = float(aic_cores) * fixpipe_bpc * clock_hz
         fixpipe_floor_us = (
             (float(cf.fixpipe_bytes) / max(1.0, fixpipe_bw_bps)) * 1e6
@@ -664,7 +952,11 @@ class HybridAscendCostModel:
             or cf.fixpipe_bytes > 0.0
             or (not prof.is_empty)
         )
-        eff_launches = max(cf.kernel_launches, prof.subkernel_count) if (cf.kernel_launches > 0 and not prof.is_empty) else cf.kernel_launches
+        eff_launches = (
+            max(cf.kernel_launches, prof.subkernel_count)
+            if (cf.kernel_launches > 0 and not prof.is_empty)
+            else cf.kernel_launches
+        )
         if has_work and eff_launches > 0:
             launch_unit = (
                 float(cf.launch_overhead_us)
@@ -794,32 +1086,36 @@ class HybridAscendCostModel:
         else:
             dominant = "vector"
 
-        feat_vec = self._extract_surrogate_features(
-            cf,
+        basis_ctx = ResidualBasisContext(
+            tier0_us=tier0_us,
             cube_floor_us=cube_floor_us,
             vec_floor_us=vec_floor_us,
             hbm_floor_us=hbm_floor_us,
+            tier1_penalty_us=tier1_penalty_us,
+            launch_us=launch_us,
             wave_ratio=wave_ratio,
             l2_hit_rate=l2_hit_rate,
-            tier1_penalty_us=tier1_penalty_us,
-            tier0_us=tier0_us,
-            launch_us=launch_us,
+            contig_burst_bytes=int(cf.contig_burst_bytes),
+            ub_occupancy_ratio=max(0.0, float(cf.ub_occupancy_ratio)),
+            axes=cf.topology_axes,
         )
-        return (
-            tier0_us,
-            tier1_penalty_us,
-            cube_floor_us,
-            vec_floor_us,
-            hbm_floor_us,
-            l2_hit_rate,
-            wave_ratio,
-            bank_conflict_us,
-            eff_hbm_bw,
-            launch_us,
-            fixpipe_floor_us,
-            cv_sync_us,
-            dominant,
-            feat_vec,
+        named_features = self._basis_registry.extract_named(basis_ctx)
+        return _Tier01Result(
+            tier0_us=tier0_us,
+            tier1_penalty_us=tier1_penalty_us,
+            cube_floor_us=cube_floor_us,
+            vec_floor_us=vec_floor_us,
+            hbm_floor_us=hbm_floor_us,
+            l2_hit_rate=l2_hit_rate,
+            wave_ratio=wave_ratio,
+            bank_conflict_us=bank_conflict_us,
+            eff_hbm_bw=eff_hbm_bw,
+            launch_us=launch_us,
+            fixpipe_floor_us=fixpipe_floor_us,
+            cv_sync_us=cv_sync_us,
+            dominant=dominant,
+            basis_context=basis_ctx,
+            named_features=named_features,
         )
 
     def predict(
@@ -830,47 +1126,38 @@ class HybridAscendCostModel:
     ) -> CostPrediction:
         """Predict kernel latency (us) across Tier 0 physics, Tier 1 penalties, and Tier 2."""
         cf = CostFeatures.coerce(workload, bisheng_res=bisheng_res)
-        (
-            tier0_us,
-            tier1_us,
-            cube_us,
-            vec_us,
-            hbm_us,
-            l2_hit,
-            wave_ratio,
-            bank_us,
-            eff_bw,
-            launch_us,
-            fixpipe_us,
-            cv_sync_us,
-            dominant,
-            feat_vec,
-        ) = self._compute_tier0_and_tier1(cf)
-        base_us = max(1e-6, tier0_us + tier1_us)
+        t01 = self._compute_tier0_and_tier1(cf)
+        base_us = max(1e-6, t01.tier0_us + t01.tier1_penalty_us)
         bucket = topology_bucket_for_axes(cf.topology_axes)
-        weights = self._bucket_weights.get(bucket, self._weights)
-        log_res = sum(w * x for w, x in zip(weights, feat_vec))
+        head0_specs = self._basis_registry.head0_specs()
+        feat_vec = self._basis_registry.vectorize(t01.named_features, head0_specs)
+        weight_map = self._bucket_weights_by_name.get(bucket, self._weights_by_name)
+        log_res = sum(
+            weight_map.get(spec.name, 0.0) * t01.named_features.get(spec.name, 0.0)
+            for spec in head0_specs
+        )
         log_res = max(-2.5, min(2.5, log_res))
         residual_factor = math.exp(log_res)
-        pred_us = base_us * residual_factor if (tier0_us > 0.0 or tier1_us > 0.0) else 0.0
+        pred_us = base_us * residual_factor if (t01.tier0_us > 0.0 or t01.tier1_penalty_us > 0.0) else 0.0
         return CostPrediction(
             pred_us=pred_us,
-            tier0_physics_us=tier0_us,
-            tier1_penalty_us=tier1_us,
+            tier0_physics_us=t01.tier0_us,
+            tier1_penalty_us=t01.tier1_penalty_us,
             tier2_residual_factor=residual_factor,
-            cube_floor_us=cube_us,
-            vec_floor_us=vec_us,
-            hbm_floor_us=hbm_us,
-            l2_hit_rate=l2_hit,
-            wave_quantization_ratio=wave_ratio,
-            bank_conflict_us=bank_us,
-            effective_hbm_bw_bps=eff_bw,
-            dominant_bound=dominant,
+            cube_floor_us=t01.cube_floor_us,
+            vec_floor_us=t01.vec_floor_us,
+            hbm_floor_us=t01.hbm_floor_us,
+            l2_hit_rate=t01.l2_hit_rate,
+            wave_quantization_ratio=t01.wave_ratio,
+            bank_conflict_us=t01.bank_conflict_us,
+            effective_hbm_bw_bps=t01.eff_hbm_bw,
+            dominant_bound=t01.dominant,
             feature_vector=feat_vec,
-            launch_overhead_us=launch_us,
-            fixpipe_floor_us=fixpipe_us,
-            cv_sync_us=cv_sync_us,
+            launch_overhead_us=t01.launch_us,
+            fixpipe_floor_us=t01.fixpipe_floor_us,
+            cv_sync_us=t01.cv_sync_us,
             topology_bucket=bucket,
+            named_features=dict(t01.named_features),
         )
 
     def observe(
@@ -882,18 +1169,19 @@ class HybridAscendCostModel:
         persist: bool = True,
         refit: bool = True,
     ) -> float:
-        """Record an empirical measurement and refit hierarchical Ridge residual weights."""
+        """Record an empirical measurement and refit sample-gated hierarchical Ridge weights."""
         if measured_us <= 0.0:
             raise ValueError(f"measured_us must be positive, got {measured_us!r}")
         cf = CostFeatures.coerce(workload, bisheng_res=bisheng_res)
-        tier0_us, tier1_us, *_rest, feat_vec = self._compute_tier0_and_tier1(cf)
-        analytical_us = max(1e-6, tier0_us + tier1_us)
+        t01 = self._compute_tier0_and_tier1(cf)
+        analytical_us = max(1e-6, t01.tier0_us + t01.tier1_penalty_us)
         bucket = topology_bucket_for_axes(cf.topology_axes)
         sample = CalibrationSample(
-            feature_vector=feat_vec,
+            named_features=dict(t01.named_features),
             measured_us=float(measured_us),
             analytical_us=analytical_us,
             topology_bucket=bucket,
+            basis_schema_version=2,
         )
         self._samples.append(sample)
         if refit:
@@ -940,65 +1228,115 @@ class HybridAscendCostModel:
                 self.save_calibration(self.calibration_path)
         return analytical_list
 
+    def _solve_gated_ridge(
+        self,
+        rows: Sequence[tuple[Mapping[str, float], float]],
+        specs: Sequence[ResidualBasisSpec],
+        *,
+        alpha: float,
+        prior_weights: Mapping[str, float] | None = None,
+    ) -> tuple[dict[str, float], tuple[str, ...]]:
+        """Solve closed-form Ridge on the sample-gated active subspace only."""
+        weights: dict[str, float] = {spec.name: 0.0 for spec in specs}
+        n_total = len(rows)
+        if n_total == 0:
+            return weights, ()
+        n_eff = _effective_sample_count(n_total, self._forgetting_factor)
+        active_specs = tuple(
+            spec
+            for spec in specs
+            if n_eff >= _sample_gate_threshold(spec.min_bucket_samples, self._forgetting_factor)
+        )
+        if not active_specs:
+            return weights, ()
+        k = len(active_specs)
+        xtx = [[alpha if i == j else 0.0 for j in range(k)] for i in range(k)]
+        xty = [
+            (alpha * float(prior_weights.get(spec.name, 0.0)))
+            if prior_weights is not None
+            else 0.0
+            for spec in active_specs
+        ]
+        for idx, (named_x, y_raw) in enumerate(rows):
+            y = max(-2.5, min(2.5, float(y_raw)))
+            w = self._forgetting_factor ** float(n_total - 1 - idx)
+            x_active = [float(named_x.get(spec.name, 0.0)) for spec in active_specs]
+            for i in range(k):
+                xi = x_active[i]
+                xty[i] += w * xi * y
+                for j in range(k):
+                    xtx[i][j] += w * xi * x_active[j]
+        solved = _solve_linear_system(xtx, xty)
+        for spec, val in zip(active_specs, solved):
+            weights[spec.name] = float(val)
+        return weights, tuple(spec.name for spec in active_specs)
+
     def _refit_ridge(self) -> None:
-        d = self.FEATURE_DIM
+        head0_specs = self._basis_registry.head0_specs()
         if not self._samples:
-            self._weights = [0.0] * d
-            self._bucket_weights = {}
+            self._weights_by_name = {spec.name: 0.0 for spec in head0_specs}
+            self._bucket_weights_by_name = {}
+            self._active_global_specs = ()
+            self._active_bucket_specs = {}
             return
-        decay = 0.985
-        n_total = len(self._samples)
-        xtx = [[self.ridge_alpha if i == j else 0.0 for j in range(d)] for i in range(d)]
-        xty = [0.0] * d
-        by_bucket: dict[str, list[CalibrationSample]] = {}
-        for idx, s in enumerate(self._samples):
-            x = self._pad_feature_vector(s.feature_vector)
-            y = math.log(max(1e-6, s.measured_us) / max(1e-6, s.analytical_us))
-            y = max(-2.5, min(2.5, y))
-            w = decay ** float(n_total - 1 - idx)
-            for i in range(d):
-                xty[i] += w * x[i] * y
-                for j in range(d):
-                    xtx[i][j] += w * x[i] * x[j]
-            if s.topology_bucket and s.topology_bucket != "global":
-                by_bucket.setdefault(s.topology_bucket, []).append(s)
-        self._weights = _solve_linear_system(xtx, xty)
+        global_rows: list[tuple[Mapping[str, float], float]] = []
+        by_bucket: dict[str, list[tuple[Mapping[str, float], float]]] = {}
+        for sample in self._samples:
+            y = math.log(max(1e-6, sample.measured_us) / max(1e-6, sample.analytical_us))
+            row = (sample.named_features, y)
+            global_rows.append(row)
+            if sample.topology_bucket and sample.topology_bucket != "global":
+                by_bucket.setdefault(sample.topology_bucket, []).append(row)
+
+        self._weights_by_name, self._active_global_specs = self._solve_gated_ridge(
+            global_rows,
+            head0_specs,
+            alpha=self.ridge_alpha,
+        )
 
         shrink_alpha = max(2.0, self.ridge_alpha * 2.0)
-        new_bucket_weights: dict[str, list[float]] = {}
-        for bucket, b_samples in by_bucket.items():
-            if len(b_samples) < 2:
+        new_bucket_weights: dict[str, dict[str, float]] = {}
+        new_active_bucket_specs: dict[str, tuple[str, ...]] = {}
+        for bucket, b_rows in by_bucket.items():
+            b_weights, b_active = self._solve_gated_ridge(
+                b_rows,
+                head0_specs,
+                alpha=shrink_alpha,
+                prior_weights=self._weights_by_name,
+            )
+            if not b_active:
                 continue
-            nb = len(b_samples)
-            bxtx = [[shrink_alpha if i == j else 0.0 for j in range(d)] for i in range(d)]
-            bxty = [shrink_alpha * self._weights[i] for i in range(d)]
-            for b_idx, s in enumerate(b_samples):
-                x = self._pad_feature_vector(s.feature_vector)
-                y = math.log(max(1e-6, s.measured_us) / max(1e-6, s.analytical_us))
-                y = max(-2.5, min(2.5, y))
-                bw = decay ** float(nb - 1 - b_idx)
-                for i in range(d):
-                    bxty[i] += bw * x[i] * y
-                    for j in range(d):
-                        bxtx[i][j] += bw * x[i] * x[j]
-            new_bucket_weights[bucket] = _solve_linear_system(bxtx, bxty)
-        self._bucket_weights = new_bucket_weights
+            new_bucket_weights[bucket] = b_weights
+            new_active_bucket_specs[bucket] = b_active
+        self._bucket_weights_by_name = new_bucket_weights
+        self._active_bucket_specs = new_active_bucket_specs
 
     def save_calibration(self, path: str | Path) -> None:
-        """Persist calibration samples (and JSON Two-Head state) to JSONL or JSON."""
+        """Persist calibration samples and Two-Head named state to JSONL or JSON."""
         target_path = Path(path)
         target_path.parent.mkdir(parents=True, exist_ok=True)
         if target_path.suffix == ".jsonl":
             lines = [json.dumps(s.to_dict(), sort_keys=True) for s in self._samples]
             target_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
         else:
+            head0_specs = self._basis_registry.head0_specs()
+            head2_specs = self._basis_registry.head2_specs()
             payload = {
+                "basis_schema_version": 2,
+                "head0_spec_names": [spec.name for spec in head0_specs],
+                "head2_spec_names": [spec.name for spec in head2_specs],
                 "samples": [s.to_dict() for s in self._samples],
-                "weights": list(self._weights),
-                "delta_weights": list(self._delta_weights),
+                "weights": list(self.weights),
+                "weights_by_name": self.weights_by_name,
+                "delta_weights": list(self.delta_weights),
+                "delta_weights_by_name": self.delta_weights_by_name,
                 "pair_deltas": [
-                    {"delta_x": list(dx), "delta_y": float(dy)}
-                    for dx, dy in self._pair_deltas
+                    {
+                        "named_delta": dict(named_dx),
+                        "delta_x": list(self._basis_registry.vectorize(named_dx, head2_specs)),
+                        "delta_y": float(dy),
+                    }
+                    for named_dx, dy in self._pair_deltas
                 ],
                 "msprof_pipe_scales": {
                     bkt: {p: [float(sl), float(sw)] for p, (sl, sw) in pmap.items()}
@@ -1016,9 +1354,12 @@ class HybridAscendCostModel:
         raw = src.read_text(encoding="utf-8").strip()
         if not raw:
             self._samples = []
+            self._pair_deltas = []
             self._refit_ridge()
+            self._refit_delta_ridge()
             return 0
         samples: list[CalibrationSample] = []
+        head2_specs = self._basis_registry.head2_specs()
         if src.suffix == ".jsonl" or not raw.startswith("{"):
             for line in raw.splitlines():
                 line = line.strip()
@@ -1042,14 +1383,27 @@ class HybridAscendCostModel:
             self._msprof_event_count = int(payload.get("msprof_event_count", 0) or 0)
             raw_deltas = payload.get("pair_deltas")
             if isinstance(raw_deltas, list):
-                self._pair_deltas = [
-                    (
-                        tuple(float(v) for v in (item.get("delta_x") or ())),
-                        float(item.get("delta_y", 0.0)),
-                    )
-                    for item in raw_deltas
-                    if isinstance(item, Mapping)
-                ]
+                loaded_deltas: list[tuple[dict[str, float], float]] = []
+                for item in raw_deltas:
+                    if not isinstance(item, Mapping):
+                        continue
+                    raw_nd = item.get("named_delta")
+                    if isinstance(raw_nd, Mapping) and raw_nd:
+                        named_dx = {str(k): float(v) for k, v in raw_nd.items()}
+                    else:
+                        raw_dx = item.get("delta_x") or ()
+                        dx_vals = [float(v) for v in raw_dx] if isinstance(raw_dx, Sequence) else []
+                        if len(dx_vals) == len(head2_specs):
+                            named_dx = {
+                                spec.name: dx_vals[idx] for idx, spec in enumerate(head2_specs)
+                            }
+                        else:
+                            upgraded = _upgrade_legacy_13d_vector(dx_vals)
+                            named_dx = {
+                                spec.name: upgraded.get(spec.name, 0.0) for spec in head2_specs
+                            }
+                    loaded_deltas.append((named_dx, float(item.get("delta_y", 0.0))))
+                self._pair_deltas = loaded_deltas
         self._samples = samples
         self._refit_ridge()
         self._refit_delta_ridge()
@@ -1070,7 +1424,11 @@ class HybridAscendCostModel:
         if not isinstance(msprof_pmu, Mapping) or not msprof_pmu:
             return self.pipe_scale_multipliers(bucket)
 
-        raw_dur = measured_us if (measured_us is not None and float(measured_us) > 0.0) else msprof_pmu.get("dur_us", 0.0)
+        raw_dur = (
+            measured_us
+            if (measured_us is not None and float(measured_us) > 0.0)
+            else msprof_pmu.get("dur_us", 0.0)
+        )
         try:
             dur_us = float(raw_dur or 0.0)
         except Exception:
@@ -1078,11 +1436,7 @@ class HybridAscendCostModel:
         if dur_us <= 0.0:
             return self.pipe_scale_multipliers(bucket)
 
-        res = self._compute_tier0_and_tier1(cf, use_pipe_scales=False)
-        raw_cube_us = float(res[2])
-        raw_vec_us = float(res[3])
-        raw_hbm_us = float(res[4])
-        raw_fixpipe_us = float(res[10])
+        t01 = self._compute_tier0_and_tier1(cf, use_pipe_scales=False)
 
         def _pmu_ratio(*keys: str) -> float:
             best = 0.0
@@ -1102,10 +1456,10 @@ class HybridAscendCostModel:
             return best
 
         pipe_observations = (
-            ("CUBE", _pmu_ratio("aic_mad", "aic_mac_ratio"), raw_cube_us),
-            ("VECTOR", _pmu_ratio("aiv_vec", "aiv_vec_ratio"), raw_vec_us),
-            ("FIXPIPE", _pmu_ratio("aic_fixpipe"), raw_fixpipe_us),
-            ("MTE2", _pmu_ratio("aiv_mte2", "aic_mte2", "mte2_wait_ratio"), raw_hbm_us),
+            ("CUBE", _pmu_ratio("aic_mad", "aic_mac_ratio"), t01.cube_floor_us),
+            ("VECTOR", _pmu_ratio("aiv_vec", "aiv_vec_ratio"), t01.vec_floor_us),
+            ("FIXPIPE", _pmu_ratio("aic_fixpipe"), t01.fixpipe_floor_us),
+            ("MTE2", _pmu_ratio("aiv_mte2", "aic_mte2", "mte2_wait_ratio"), t01.hbm_floor_us),
         )
         max_log = math.log(2.0)
         updated = False
@@ -1131,25 +1485,13 @@ class HybridAscendCostModel:
         return self.pipe_scale_multipliers(bucket)
 
     def _refit_delta_ridge(self) -> None:
-        """Fit Head-2 Ridge regression over paired same-case feature differences."""
-        d = self.FEATURE_DIM
-        if not self._pair_deltas:
-            self._delta_weights = [0.0] * d
-            return
-        decay = 0.985
-        n_total = len(self._pair_deltas)
-        alpha = max(1.0, self.ridge_alpha)
-        xtx = [[alpha if i == j else 0.0 for j in range(d)] for i in range(d)]
-        xty = [0.0] * d
-        for idx, (dx, dy) in enumerate(self._pair_deltas):
-            x = self._pad_feature_vector(dx)
-            y = max(-2.5, min(2.5, float(dy)))
-            w = decay ** float(n_total - 1 - idx)
-            for i in range(d):
-                xty[i] += w * x[i] * y
-                for j in range(d):
-                    xtx[i][j] += w * x[i] * x[j]
-        self._delta_weights = _solve_linear_system(xtx, xty)
+        """Fit Head-2 sample-gated Ridge over within-case varying feature differences."""
+        head2_specs = self._basis_registry.head2_specs()
+        self._delta_weights_by_name, self._active_head2_specs = self._solve_gated_ridge(
+            self._pair_deltas,
+            head2_specs,
+            alpha=max(1.0, self.ridge_alpha),
+        )
 
     def observe_pair_delta(
         self,
@@ -1162,22 +1504,27 @@ class HybridAscendCostModel:
         parent_bisheng_res: BishengResourceSummary | Mapping[str, object] | None = None,
         refit: bool = True,
     ) -> float:
-        """Head-2 calibration: learn residual log-ratio from same-(op, case) candidate vs parent."""
+        """Head-2 calibration: learn residual log-ratio on within-case varying basis diffs."""
         if cand_us <= 0.0 or parent_us <= 0.0:
-            raise ValueError(f"Both cand_us and parent_us must be positive, got {cand_us!r}, {parent_us!r}")
+            raise ValueError(
+                f"Both cand_us and parent_us must be positive, got {cand_us!r}, {parent_us!r}"
+            )
         cf_c = CostFeatures.coerce(cand_workload, bisheng_res=cand_bisheng_res)
         cf_p = CostFeatures.coerce(parent_workload, bisheng_res=parent_bisheng_res)
-        res_c = self._compute_tier0_and_tier1(cf_c)
-        res_p = self._compute_tier0_and_tier1(cf_p)
-        base_c = max(1e-6, float(res_c[0]) + float(res_c[1]))
-        base_p = max(1e-6, float(res_p[0]) + float(res_p[1]))
-        x_c = self._pad_feature_vector(res_c[-1])
-        x_p = self._pad_feature_vector(res_p[-1])
-        delta_x = tuple(float(a) - float(b) for a, b in zip(x_c, x_p))
+        t01_c = self._compute_tier0_and_tier1(cf_c)
+        t01_p = self._compute_tier0_and_tier1(cf_p)
+        base_c = max(1e-6, t01_c.tier0_us + t01_c.tier1_penalty_us)
+        base_p = max(1e-6, t01_p.tier0_us + t01_p.tier1_penalty_us)
+        head2_specs = self._basis_registry.head2_specs()
+        named_delta = {
+            spec.name: t01_c.named_features.get(spec.name, 0.0)
+            - t01_p.named_features.get(spec.name, 0.0)
+            for spec in head2_specs
+        }
         actual_log_ratio = math.log(float(cand_us) / float(parent_us))
         analytical_log_ratio = math.log(base_c / base_p)
         delta_y = max(-2.5, min(2.5, actual_log_ratio - analytical_log_ratio))
-        self._pair_deltas.append((delta_x, delta_y))
+        self._pair_deltas.append((named_delta, delta_y))
         if refit:
             self._refit_delta_ridge()
         return delta_y
@@ -1197,30 +1544,39 @@ class HybridAscendCostModel:
             pred_c = max(1e-6, self.predict(cf_c).pred_us)
             pred_p = max(1e-6, self.predict(cf_p).pred_us)
             return pred_c / pred_p
-        res_c = self._compute_tier0_and_tier1(cf_c)
-        res_p = self._compute_tier0_and_tier1(cf_p)
-        base_c = max(1e-6, float(res_c[0]) + float(res_c[1]))
-        base_p = max(1e-6, float(res_p[0]) + float(res_p[1]))
-        x_c = self._pad_feature_vector(res_c[-1])
-        x_p = self._pad_feature_vector(res_p[-1])
-        delta_x = tuple(float(a) - float(b) for a, b in zip(x_c, x_p))
-        log_res = max(-2.5, min(2.5, sum(w * dx for w, dx in zip(self._delta_weights, delta_x))))
+        t01_c = self._compute_tier0_and_tier1(cf_c)
+        t01_p = self._compute_tier0_and_tier1(cf_p)
+        base_c = max(1e-6, t01_c.tier0_us + t01_c.tier1_penalty_us)
+        base_p = max(1e-6, t01_p.tier0_us + t01_p.tier1_penalty_us)
+        head2_specs = self._basis_registry.head2_specs()
+        log_res = sum(
+            self._delta_weights_by_name.get(spec.name, 0.0)
+            * (
+                t01_c.named_features.get(spec.name, 0.0)
+                - t01_p.named_features.get(spec.name, 0.0)
+            )
+            for spec in head2_specs
+        )
+        log_res = max(-2.5, min(2.5, log_res))
         return max(1e-4, (base_c / base_p) * math.exp(log_res))
 
     def replay_experience_lake(
         self,
-        lake_dir: str | Path,
+        lake_dir: ExperienceLake | str | Path,
         *,
         persist_calibration: bool = False,
     ) -> dict[str, int]:
         """Idempotently replay candidates, case observations, MSProf PMU, and pairwise deltas."""
-        lake = ExperienceLake(lake_dir)
+        lake = lake_dir if isinstance(lake_dir, ExperienceLake) else ExperienceLake(lake_dir)
         candidates, observations = lake.load_records()
         n_obs = 0
         n_msprof = 0
         n_pairs = 0
 
-        def _project_for(art_sha: str, obs_rec: Any) -> tuple[dict[str, object], dict[str, object] | None]:
+        def _project_for(
+            art_sha: str,
+            obs_rec: CaseObservationRecord,
+        ) -> tuple[dict[str, object], dict[str, object] | None]:
             art = candidates.get(art_sha)
             if art is None:
                 proj = project_case_workload(
@@ -1229,6 +1585,15 @@ class HybridAscendCostModel:
                     t_hw_us=obs_rec.t_hw_us,
                     target=self.target,
                 )
+                if obs_rec.projected_gm_bytes > 0.0:
+                    proj["gm_bytes"] = max(
+                        float(proj["gm_bytes"]),
+                        float(obs_rec.projected_gm_bytes),
+                    )
+                if obs_rec.projected_tiles > 0:
+                    proj["total_tiles"] = int(obs_rec.projected_tiles)
+                if obs_rec.projected_contig_bytes > 0:
+                    proj["contig_burst_bytes"] = int(obs_rec.projected_contig_bytes)
                 return proj, None
             axes_obj = TopologyAxes.from_dict(art.topology_axes) if art.topology_axes else None
             proj = project_case_workload(
@@ -1246,7 +1611,14 @@ class HybridAscendCostModel:
         for obs in observations:
             if obs.measured_us <= 0.0:
                 continue
-            obs_key = (obs.cand_sha, int(obs.case_num), obs.eval_tier, round(float(obs.measured_us), 6))
+            obs_key = (
+                obs.cand_sha,
+                obs.operator,
+                obs.regime_tag,
+                int(obs.case_num),
+                obs.eval_tier,
+                round(float(obs.measured_us), 6),
+            )
             if obs_key in self._replayed_obs_keys:
                 continue
             self._replayed_obs_keys.add(obs_key)
@@ -1267,7 +1639,13 @@ class HybridAscendCostModel:
             n_obs += 1
 
         for cand_art, cand_obs, parent_art, parent_obs in lake.extract_pairwise_deltas():
-            pkey = (cand_obs.cand_sha, parent_obs.cand_sha, int(cand_obs.case_num))
+            pkey = (
+                cand_obs.cand_sha,
+                parent_obs.cand_sha,
+                cand_obs.operator,
+                cand_obs.regime_tag,
+                int(cand_obs.case_num),
+            )
             if pkey in self._replayed_pair_keys:
                 continue
             self._replayed_pair_keys.add(pkey)
@@ -1288,9 +1666,38 @@ class HybridAscendCostModel:
             self._refit_ridge()
         if n_pairs > 0:
             self._refit_delta_ridge()
-        if persist_calibration and self.calibration_path is not None and (n_obs > 0 or n_msprof > 0 or n_pairs > 0):
+        if (
+            persist_calibration
+            and self.calibration_path is not None
+            and (n_obs > 0 or n_msprof > 0 or n_pairs > 0)
+        ):
             self.save_calibration(self.calibration_path)
         return {"observations": n_obs, "msprof_events": n_msprof, "pair_deltas": n_pairs}
+
+    def rebuild_from_experience_lake(
+        self,
+        lake: ExperienceLake | str | Path,
+        *,
+        persist_calibration: bool = False,
+    ) -> int:
+        """Reset online state and recompute all named features and weights from *lake*."""
+        lake_obj = lake if isinstance(lake, ExperienceLake) else ExperienceLake(lake)
+        head0_specs = self._basis_registry.head0_specs()
+        head2_specs = self._basis_registry.head2_specs()
+        self._samples = []
+        self._weights_by_name = {spec.name: 0.0 for spec in head0_specs}
+        self._bucket_weights_by_name = {}
+        self._active_global_specs = ()
+        self._active_bucket_specs = {}
+        self._msprof_pipe_scales = {}
+        self._msprof_event_count = 0
+        self._pair_deltas = []
+        self._delta_weights_by_name = {spec.name: 0.0 for spec in head2_specs}
+        self._active_head2_specs = ()
+        self._replayed_obs_keys = set()
+        self._replayed_pair_keys = set()
+        stats = self.replay_experience_lake(lake_obj, persist_calibration=persist_calibration)
+        return int(stats["observations"])
 
     def predict_cannbench_eq3_score(
         self,
@@ -1302,12 +1709,78 @@ class HybridAscendCostModel:
         return predict_cannbench_eq3_score(pred_us, ref_perf_us, t_hw_us)
 
 
-def _read_attr_or_key(obj: object | None, key: str, default: Any = None) -> Any:
+def _read_attr_or_key(obj: object | None, key: str, default: object = None) -> object:
     if obj is None:
         return default
     if isinstance(obj, Mapping):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+@runtime_checkable
+class _TotalGmBytesLedger(Protocol):
+    def total_gm_bytes(self, grid_blocks: int | None = None) -> int: ...
+
+
+@runtime_checkable
+class _ScopedGmLedger(Protocol):
+    gm_roundtrip_bytes: int
+    gm_traffic_scope: str
+
+
+@runtime_checkable
+class _RawGmLedger(Protocol):
+    gm_roundtrip_bytes: int
+
+
+def _resolve_ledger_total_gm_bytes(ledger: object | None, total_tiles: int) -> int:
+    """Resolve full-grid GM traffic bytes using explicit ledger scope without heuristics."""
+    if ledger is None:
+        return 0
+    if isinstance(ledger, _TotalGmBytesLedger):
+        return max(0, int(ledger.total_gm_bytes(total_tiles)))
+    if isinstance(ledger, Mapping):
+        raw_gm = int(ledger.get("gm_roundtrip_bytes", 0) or 0)
+        if raw_gm <= 0:
+            return 0
+        scope = str(ledger.get("gm_traffic_scope", "per_tile") or "per_tile")
+        if scope == "full_grid":
+            return raw_gm
+        if scope == "per_tile":
+            return raw_gm * max(1, int(total_tiles))
+        raise ValueError(f"Unsupported gm_traffic_scope: {scope!r}")
+    if isinstance(ledger, _ScopedGmLedger):
+        raw_gm = int(ledger.gm_roundtrip_bytes or 0)
+        if raw_gm <= 0:
+            return 0
+        scope = str(ledger.gm_traffic_scope or "per_tile")
+        if scope == "full_grid":
+            return raw_gm
+        if scope == "per_tile":
+            return raw_gm * max(1, int(total_tiles))
+        raise ValueError(f"Unsupported gm_traffic_scope: {scope!r}")
+    if isinstance(ledger, ObjectivePhysicalLedger):
+        return max(0, int(ledger.gm_roundtrip_bytes) * max(1, int(total_tiles)))
+    if isinstance(ledger, _RawGmLedger):
+        return max(0, int(ledger.gm_roundtrip_bytes or 0) * max(1, int(total_tiles)))
+    return 0
+
+
+def _extract_ub_occupancy_ratio(ledger: object | None) -> float:
+    """Compute UB peak/capacity occupancy ratio from *ledger* waterlines when present."""
+    raw_waterlines = _read_attr_or_key(ledger, "waterlines", None)
+    if not isinstance(raw_waterlines, Mapping):
+        return 0.0
+    ub_wl = raw_waterlines.get("UB")
+    if isinstance(ub_wl, ScopeWaterline):
+        if ub_wl.capacity_bytes > 0 and ub_wl.peak_allocated_bytes >= 0:
+            return float(ub_wl.peak_allocated_bytes) / float(ub_wl.capacity_bytes)
+        return 0.0
+    if isinstance(ub_wl, Mapping):
+        cap = int(ub_wl.get("capacity_bytes", 0) or 0)
+        peak = int(ub_wl.get("peak_allocated_bytes", 0) or 0)
+        return (float(peak) / float(cap)) if (cap > 0 and peak >= 0) else 0.0
+    return 0.0
 
 
 def build_cost_features_from_ledger(
@@ -1323,10 +1796,11 @@ def build_cost_features_from_ledger(
 ) -> CostFeatures:
     """Convert ObjectivePhysicalLedger, HIR blueprint, and SIL advisory into CostFeatures."""
     facts = (target or AscendTarget("ascend.950pr")).get_facts(AscendSpaceFacts)
-    policy: dict[str, Any] = {}
+    policy: dict[str, object] = {}
     plan_axes: TopologyAxes | None = None
     if isinstance(live_plan, Mapping):
-        policy = dict(live_plan)
+        raw_inner_pol = live_plan.get("policy")
+        policy = dict(raw_inner_pol) if isinstance(raw_inner_pol, Mapping) else dict(live_plan)
     elif live_plan is not None:
         raw_pol = getattr(live_plan, "policy", None)
         if isinstance(raw_pol, Mapping):
@@ -1337,11 +1811,11 @@ def build_cost_features_from_ledger(
 
     eff_axes = axes if isinstance(axes, TopologyAxes) else plan_axes
     if eff_axes is None and sil_advisory is not None:
-        adv_axes = getattr(sil_advisory, "topology_axes", None)
+        adv_axes = _read_attr_or_key(sil_advisory, "topology_axes", None)
         if isinstance(adv_axes, TopologyAxes):
             eff_axes = adv_axes
 
-    grid_blocks = int(getattr(ledger, "grid_blocks", 0) or 0) if ledger is not None else 0
+    grid_blocks = int(_read_attr_or_key(ledger, "grid_blocks", 0) or 0)
     if grid_blocks <= 0:
         grid_blocks = int(policy.get("grid_blocks") or 0)
     total_tiles = grid_blocks if grid_blocks > 0 else 56
@@ -1350,14 +1824,15 @@ def build_cost_features_from_ledger(
         policy.get("cube_operand_dtype") or policy.get("dtype") or ""
     ).strip()
     if not raw_dtype and sil_advisory is not None:
-        in_dtypes = getattr(sil_advisory, "input_dtypes", ()) or ()
-        if in_dtypes:
+        in_dtypes = _read_attr_or_key(sil_advisory, "input_dtypes", ()) or ()
+        if isinstance(in_dtypes, Sequence) and in_dtypes:
             raw_dtype = str(in_dtypes[0]).strip()
     cube_dtype = raw_dtype or "f16"
     hf32 = bool(policy.get("hf32", policy.get("hf32_allowed", False)))
     macs_per_cycle = _cube_macs_for_dtype(facts, cube_dtype, hf32=hf32)
 
-    pipes = (getattr(ledger, "pipe_cycles", None) or {}) if ledger is not None else {}
+    raw_pipes = _read_attr_or_key(ledger, "pipe_cycles", None)
+    pipes = raw_pipes if isinstance(raw_pipes, Mapping) else {}
     cube_c = int(pipes.get("AIC.PIPE_M", 0)) + int(pipes.get("AIC.CUBE", 0))
     vec_c = int(pipes.get("AIV0.PIPE_V", 0)) + int(pipes.get("AIV1.PIPE_V", 0))
     ledger_cube_flops = float(max(0, cube_c)) * float(macs_per_cycle) * 2.0 * float(total_tiles)
@@ -1365,7 +1840,7 @@ def build_cost_features_from_ledger(
         float(max(0, vec_c)) * float(DEFAULT_AIV_VEC_FLOPS_PER_CYCLE) * float(total_tiles)
     )
 
-    nav_roofline = getattr(blueprint, "roofline", None) if blueprint is not None else None
+    nav_roofline = _read_attr_or_key(blueprint, "roofline", None)
     nav_cube_flops = float(_read_attr_or_key(nav_roofline, "cube_flops", 0.0) or 0.0)
     nav_vec_flops = float(_read_attr_or_key(nav_roofline, "vector_flops", 0.0) or 0.0)
     nav_min_gm = float(_read_attr_or_key(nav_roofline, "min_gm_bytes", 0.0) or 0.0)
@@ -1373,17 +1848,12 @@ def build_cost_features_from_ledger(
     cube_flops = max(ledger_cube_flops, nav_cube_flops) if nav_cube_flops > 0.0 else ledger_cube_flops
     vec_flops = max(ledger_vec_flops, nav_vec_flops) if nav_vec_flops > 0.0 else ledger_vec_flops
 
-    adv_roofline = getattr(sil_advisory, "roofline", None) if sil_advisory is not None else None
+    adv_roofline = _read_attr_or_key(sil_advisory, "roofline", None)
     adv_median_gm = float(_read_attr_or_key(adv_roofline, "median_gm_bytes", 0.0) or 0.0)
 
-    ledger_gm_per_tile = (
-        float(getattr(ledger, "gm_roundtrip_bytes", 0) or 0) if ledger is not None else 0.0
-    )
-    if ledger_gm_per_tile > 0.0:
-        if nav_min_gm <= 0.0 or ledger_gm_per_tile < nav_min_gm * 0.5:
-            gm_bytes = max(ledger_gm_per_tile * float(total_tiles), nav_min_gm)
-        else:
-            gm_bytes = max(ledger_gm_per_tile, nav_min_gm)
+    actual_gm_bytes = float(_resolve_ledger_total_gm_bytes(ledger, total_tiles))
+    if actual_gm_bytes > 0.0:
+        gm_bytes = max(actual_gm_bytes, nav_min_gm)
     elif nav_min_gm > 0.0:
         gm_bytes = nav_min_gm
     elif adv_median_gm > 0.0:
@@ -1406,22 +1876,30 @@ def build_cost_features_from_ledger(
 
     if eff_axes is not None and eff_axes.compute_engine == "coupled_1c2v":
         raw_cv = policy.get("cv_sync_events")
-        cv_sync_events = int(raw_cv) if raw_cv is not None else max(2, int(policy.get("l1_stages", 2) or 2) * 2)
+        cv_sync_events = (
+            int(raw_cv)
+            if raw_cv is not None
+            else max(2, int(policy.get("l1_stages", 2) or 2) * 2)
+        )
     else:
         cv_sync_events = 0
 
-    contig_burst = int(getattr(ledger, "dominant_contig_bytes", 0) or 0) if ledger is not None else 0
+    contig_burst = int(_read_attr_or_key(ledger, "dominant_contig_bytes", 0) or 0)
     if contig_burst <= 0:
         contig_burst = int(policy.get("contig_burst_bytes") or 32768)
 
-    raw_stage_a_prof = getattr(ledger, "microarch_profile", None) if ledger is not None else None
+    raw_stage_a_prof = _read_attr_or_key(ledger, "microarch_profile", None)
     merged_prof = merge_microarch_profiles(raw_stage_a_prof, stage_b_profile)
-    steady_ii = int(getattr(ledger, "steady_state_ii", 0) or 0) if ledger is not None else 0
+    steady_ii = int(_read_attr_or_key(ledger, "steady_state_ii", 0) or 0)
     eff_launches = max(0, int(kernel_launches))
     if eff_launches == 1 and not merged_prof.is_empty:
         eff_launches = max(eff_launches, merged_prof.subkernel_count)
 
-    merged: dict[str, Any] = dict(policy)
+    ub_occ_ratio = _extract_ub_occupancy_ratio(ledger)
+    if ub_occ_ratio <= 0.0:
+        ub_occ_ratio = float(policy.get("ub_occupancy_ratio", 0.0) or 0.0)
+
+    merged: dict[str, object] = dict(policy)
     merged.update(
         {
             "cube_flops": cube_flops,
@@ -1437,6 +1915,7 @@ def build_cost_features_from_ledger(
             "steady_state_ii": steady_ii,
             "loop_trips": max(1, merged_prof.inner_loop_trips) if not merged_prof.is_empty else 1,
             "pipeline_depth": max(1, merged_prof.pipeline_depth) if not merged_prof.is_empty else 1,
+            "ub_occupancy_ratio": ub_occ_ratio,
             "microarch_profile": merged_prof.to_dict() if not merged_prof.is_empty else {},
         }
     )
@@ -1450,12 +1929,16 @@ __all__ = [
     "DEFAULT_CV_SYNC_EVENT_US",
     "DEFAULT_FIXPIPE_BYTES_PER_CYCLE_PER_AIC",
     "DEFAULT_LAUNCH_OVERHEAD_US",
+    "DEFAULT_RESIDUAL_BASIS_SPECS",
     "CalibrationSample",
     "CannbenchScorePrediction",
     "CostFeatures",
     "CostModelEvalReport",
     "CostPrediction",
     "HybridAscendCostModel",
+    "ResidualBasisContext",
+    "ResidualBasisRegistry",
+    "ResidualBasisSpec",
     "build_cost_features_from_ledger",
     "evaluate_cost_model_ranking",
     "predict_cannbench_eq3_score",

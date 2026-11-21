@@ -70,6 +70,7 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
 )
 from tilefoundry_ascend.agent.orchestrator.twin_bridge import (
     build_tilelang_runtime_twin,
+    verify_reference_cpu_parity,
     verify_twin_cpu_reference,
 )
 
@@ -129,5 +130,6 @@ __all__ = [
     "run_stage_c_agent_gates",
     "synthesize_pybind_extension_wrapper",
     "synthesize_initial_dsl",
+    "verify_reference_cpu_parity",
     "verify_twin_cpu_reference",
 ]

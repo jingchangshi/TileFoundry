@@ -11,7 +11,6 @@ import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
 
 import yaml
 
@@ -22,13 +21,19 @@ from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
     _cube_macs_for_dtype,
     evaluate_cost_model_ranking,
 )
-from tilefoundry_ascend.ascend.sil.op_analyzer import OpAdvisoryExtractor
+from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirRooflineSummary
+from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
+    PyTorchOpSemantics,
+    PyTorchSemanticAnalyzer,
+    RepresentativeCase,
+)
 from tilefoundry_ascend.ascend.sil.schema import (
     DTYPE_BYTES,
     TopologyAxes,
     flatten_int_shapes,
     flatten_str_values,
     has_unaligned_tail_for_case,
+    infer_case_dims_structural,
     shape_numel,
 )
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
@@ -247,22 +252,284 @@ def _normalize_cube_dtype(raw: str) -> str:
     return "f16"
 
 
-def _try_resolve_extractor(ops_root: str | Path | None) -> OpAdvisoryExtractor | None:
+@dataclass(frozen=True)
+class _CachedOperatorMetadata:
+    """Cached semantic topology and case metadata resolved from cann-bench tasks."""
+
+    entry_name: str
+    proto: dict[str, object]
+    cases_by_id: dict[int, dict[str, object]]
+    input_dtypes: tuple[str, ...]
+    semantics: PyTorchOpSemantics | None
+    axes: TopologyAxes
+    fallback_dominant_bound: str
+
+
+def _has_task_entries(root: Path) -> bool:
+    if (root / "suite_manifest.json").is_file():
+        return True
+    if any(p.is_dir() for p in root.glob("level*")):
+        return True
+    return any((child / "cases.yaml").is_file() for child in root.iterdir() if child.is_dir())
+
+
+def _try_resolve_tasks_root(ops_root: str | Path | None) -> Path | None:
+    """Resolve cann-bench tasks directory using pure filesystem discovery."""
     if ops_root is not None:
         p = Path(ops_root).expanduser().resolve()
         if not p.is_dir():
             raise ValueError(f"Canonical ops_root does not exist: {p}")
-        return OpAdvisoryExtractor(p)
+        sub_tasks = p / "tasks"
+        if sub_tasks.is_dir() and not _has_task_entries(p):
+            return sub_tasks.resolve()
+        return p
+
+    candidates: list[Path] = []
     env_root = os.environ.get("TILEFOUNDRY_CANNBENCH_ROOT", "").strip()
     if env_root:
         cand = Path(env_root).expanduser().resolve()
-        for sub in (cand / "tasks", cand):
-            if sub.is_dir():
-                return OpAdvisoryExtractor(sub)
-    default_ext = OpAdvisoryExtractor()
-    if default_ext.ops_root.is_dir():
-        return default_ext
+        candidates.extend((cand / "tasks", cand))
+    repo_root = Path(__file__).resolve().parents[5]
+    candidates.extend(
+        (
+            repo_root.parent / "cann-bench" / "tasks",
+            Path.home() / "workspace" / "cann-bench" / "tasks",
+            repo_root / "tests" / "ascend" / "benchmarks",
+        )
+    )
+    for cand in candidates:
+        if cand.is_dir() and _has_task_entries(cand):
+            return cand.resolve()
+    for cand in candidates:
+        if cand.is_dir():
+            return cand.resolve()
     return None
+
+
+def _resolve_operator_dir(tasks_root: Path, rel_path: str) -> tuple[str, Path]:
+    """Locate one operator directory under *tasks_root* across nested or flat layouts."""
+    cleaned = str(rel_path).strip().removeprefix("tasks/").strip("/")
+    tail = cleaned.rsplit("/", 1)[-1] if "/" in cleaned else cleaned
+
+    manifest_path = tasks_root / "suite_manifest.json"
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for row in manifest.get("operators", ()) or ():
+            if not isinstance(row, Mapping):
+                continue
+            row_id = str(row.get("id") or "").strip()
+            raw_row_path = str(row.get("path") or "").strip().removeprefix("tasks/").strip("/")
+            if cleaned in (row_id, raw_row_path) or tail == row_id:
+                cand = tasks_root / raw_row_path
+                if cand.is_dir():
+                    return row_id or tail, cand
+
+    for cand in (
+        tasks_root / cleaned,
+        tasks_root / "tasks" / cleaned,
+        tasks_root / tail,
+    ):
+        if cand.is_dir() and (
+            (cand / "cases.yaml").is_file()
+            or (cand / "proto.yaml").is_file()
+            or (cand / "golden.py").is_file()
+        ):
+            return tail, cand
+
+    for level_dir in sorted(tasks_root.glob("level*")):
+        if not level_dir.is_dir():
+            continue
+        cand = level_dir / tail
+        if cand.is_dir():
+            return tail, cand
+
+    raise KeyError(f"Operator task directory for {rel_path!r} not found under {tasks_root}")
+
+
+def _infer_axes_from_proto(proto: Mapping[str, object]) -> tuple[TopologyAxes, str]:
+    """Derive structural TopologyAxes and dominant bound from proto metadata without model.py."""
+    category = str(proto.get("category") or "").strip().lower()
+    formula = str(proto.get("formula") or "").strip().lower()
+    combined = f"{category} {formula}"
+    has_matmul = any(
+        tok in combined
+        for tok in ("contraction", "matmul", "gemm", "bmm", "linear", "@")
+    )
+    has_softmax_or_attn = any(tok in combined for tok in ("attention", "softmax"))
+    has_indirect = any(
+        tok in combined for tok in ("gather", "scatter", "index", "embedding", "topk")
+    )
+    if has_matmul and has_softmax_or_attn:
+        return (
+            TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "affine_simd"),
+            "compute",
+        )
+    if has_matmul:
+        return (
+            TopologyAxes("aic_only", "gm_l1_l0_fixpipe", "affine_simd"),
+            "compute",
+        )
+    if has_indirect:
+        return (
+            TopologyAxes("aiv_only", "ub_random_atomic", "irregular_simt"),
+            "memory",
+        )
+    return (
+        TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd"),
+        "memory",
+    )
+
+
+def _proto_input_dtypes(proto: Mapping[str, object]) -> tuple[str, ...]:
+    raw_inputs = proto.get("inputs")
+    if not isinstance(raw_inputs, Sequence) or isinstance(raw_inputs, (str, bytes)):
+        return ()
+    dtypes: list[str] = []
+    for item in raw_inputs:
+        if not isinstance(item, Mapping):
+            continue
+        raw_dt = item.get("dtype")
+        values = flatten_str_values(raw_dt)
+        if values:
+            dtypes.append(values[0])
+    return tuple(dtypes)
+
+
+def _load_cached_operator(
+    rel_path: str,
+    *,
+    tasks_root: Path | None,
+    analyzer: PyTorchSemanticAnalyzer,
+    operator_cache: dict[str, _CachedOperatorMetadata],
+) -> _CachedOperatorMetadata:
+    if rel_path in operator_cache:
+        return operator_cache[rel_path]
+    if tasks_root is None:
+        raise ValueError(
+            f"Canonical tasks root unavailable to resolve topology_axes for {rel_path!r}"
+        )
+    op_id, op_dir = _resolve_operator_dir(tasks_root, rel_path)
+
+    proto_path = op_dir / "proto.yaml"
+    proto_raw = (
+        yaml.safe_load(proto_path.read_text(encoding="utf-8"))
+        if proto_path.is_file()
+        else {}
+    )
+    proto_block = (
+        proto_raw.get("operator")
+        if isinstance(proto_raw, Mapping) and isinstance(proto_raw.get("operator"), Mapping)
+        else (proto_raw if isinstance(proto_raw, Mapping) else {})
+    )
+    proto: dict[str, object] = {str(k): v for k, v in proto_block.items()}
+
+    cases_path = op_dir / "cases.yaml"
+    cases_raw = (
+        yaml.safe_load(cases_path.read_text(encoding="utf-8"))
+        if cases_path.is_file()
+        else {}
+    )
+    raw_cases = cases_raw.get("cases") if isinstance(cases_raw, Mapping) else ()
+    cases_by_id: dict[int, dict[str, object]] = {}
+    if isinstance(raw_cases, Sequence) and not isinstance(raw_cases, (str, bytes)):
+        for idx, entry in enumerate(raw_cases):
+            if not isinstance(entry, Mapping):
+                continue
+            raw_cid = entry.get("case_id", idx + 1)
+            cid = (
+                int(raw_cid)
+                if isinstance(raw_cid, int) and not isinstance(raw_cid, bool)
+                else idx + 1
+            )
+            cases_by_id[cid] = {str(k): v for k, v in entry.items()}
+
+    entry_name = str(proto.get("name") or op_id).strip() or op_id
+    semantics: PyTorchOpSemantics | None = None
+    golden_path = op_dir / "golden.py"
+    if golden_path.is_file():
+        golden_source = golden_path.read_text(encoding="utf-8")
+        semantics = analyzer.analyze_source(
+            golden_source,
+            entry_name=entry_name,
+            proto=proto,
+        )
+        axes = semantics.base_axes
+        fallback_bound = "compute" if axes.uses_cube else "memory"
+    else:
+        axes, fallback_bound = _infer_axes_from_proto(proto)
+    cached = _CachedOperatorMetadata(
+        entry_name=entry_name,
+        proto=proto,
+        cases_by_id=cases_by_id,
+        input_dtypes=_proto_input_dtypes(proto),
+        semantics=semantics,
+        axes=axes,
+        fallback_dominant_bound=fallback_bound,
+    )
+    operator_cache[rel_path] = cached
+    return cached
+
+
+def _extract_case_dims_for_blueprint(
+    case_entry: Mapping[str, object],
+    axes: TopologyAxes,
+) -> dict[str, int]:
+    """Derive structural anchor dims for one case entry using ascend.sil.schema helpers."""
+    shapes = flatten_int_shapes(case_entry.get("input_shape"))
+    raw_attrs = case_entry.get("attrs")
+    attrs: Mapping[str, object] = raw_attrs if isinstance(raw_attrs, Mapping) else {}
+    dims = dict(
+        infer_case_dims_structural(
+            shapes,
+            attrs,
+            axes=axes,
+            uses_cube=axes.uses_cube,
+        )
+    )
+    for shape_idx, shape in enumerate(shapes):
+        for axis_idx, extent in enumerate(shape):
+            if extent > 0:
+                dims.setdefault(f"shape_{shape_idx}_dim_{axis_idx}", int(extent))
+    if shapes and shapes[0]:
+        first = shapes[0]
+        dims.setdefault("total_elements", shape_numel(first))
+        if len(first) >= 2:
+            dims.setdefault("M", shape_numel(first[:-1]))
+            dims.setdefault("D", int(first[-1]))
+            dims.setdefault("K", int(first[-1]))
+    if len(shapes) >= 2 and shapes[1]:
+        second = shapes[1]
+        if len(second) >= 2:
+            dims.setdefault("N", int(second[-1]))
+            if len(second) == 3:
+                dims.setdefault("E", int(second[0]))
+    return dims
+
+
+def _case_roofline_from_semantics(
+    cached: _CachedOperatorMetadata,
+    case_entry: Mapping[str, object],
+    *,
+    analyzer: PyTorchSemanticAnalyzer,
+    fallback_dtype_bytes: float,
+) -> HirRooflineSummary | None:
+    if cached.semantics is None or not case_entry:
+        return None
+    int_dims = _extract_case_dims_for_blueprint(case_entry, cached.axes)
+    try:
+        rep_case = RepresentativeCase.from_case_entry(case_entry)
+    except ValueError:
+        rep_case = None
+    try:
+        packet = analyzer.build_universal_blueprint(
+            cached.semantics,
+            int_dims,
+            dtype_bytes=fallback_dtype_bytes,
+            representative_case=rep_case,
+        )
+    except ValueError:
+        return None
+    return packet.roofline
 
 
 def _build_static_case_features(
@@ -271,32 +538,22 @@ def _build_static_case_features(
     t_hw_us: float,
     *,
     facts: AscendSpaceFacts,
-    advisory_cache: dict[str, tuple[Any, dict[int, dict[str, Any]]]],
-    extractor: OpAdvisoryExtractor | None,
-) -> tuple[CostFeatures, CostFeatures]:
-    """Construct leak-free P0+P1 and legacy baseline CostFeatures from static metadata only."""
-    op_adv = None
-    case_map: dict[int, dict[str, Any]] = {}
-    if extractor is not None:
-        if rel_path not in advisory_cache:
-            lvl_part, _, op_id = rel_path.partition("/")
-            if not op_id:
-                op_id, lvl_part = rel_path, ""
-            adv = extractor.extract(op_id, level=lvl_part or None)
-            _lvl, op_dir = extractor._find_op_entry(op_id, level=lvl_part or None)
-            cases_raw = yaml.safe_load((op_dir / "cases.yaml").read_text(encoding="utf-8"))
-            cmap: dict[int, dict[str, Any]] = {}
-            for idx, entry in enumerate(cases_raw.get("cases", []) or []):
-                cid = int(entry.get("case_id", idx + 1))
-                cmap[cid] = dict(entry)
-            advisory_cache[rel_path] = (adv, cmap)
-        op_adv, case_map = advisory_cache[rel_path]
-
-    case_entry = case_map.get(case_num, {})
+    analyzer: PyTorchSemanticAnalyzer,
+    operator_cache: dict[str, _CachedOperatorMetadata],
+    tasks_root: Path | None,
+) -> tuple[CostFeatures, CostFeatures, float]:
+    """Construct leak-free P0+P1 and legacy baseline CostFeatures from semantic metadata."""
+    cached = _load_cached_operator(
+        rel_path,
+        tasks_root=tasks_root,
+        analyzer=analyzer,
+        operator_cache=operator_cache,
+    )
+    case_entry = cached.cases_by_id.get(case_num, {})
     shapes = flatten_int_shapes(case_entry.get("input_shape")) if case_entry else ()
     dtypes = list(flatten_str_values(case_entry.get("dtype"))) if case_entry else []
-    if not dtypes and op_adv is not None:
-        dtypes = list(op_adv.input_dtypes)
+    if not dtypes:
+        dtypes = list(cached.input_dtypes)
 
     raw_dtype = dtypes[0] if dtypes else "float16"
     cube_dtype = _normalize_cube_dtype(raw_dtype)
@@ -307,14 +564,18 @@ def _build_static_case_features(
         dt = dtypes[idx] if idx < len(dtypes) else raw_dtype
         input_bytes += float(shape_numel(shp)) * float(DTYPE_BYTES.get(dt, elem_bytes))
 
-    if op_adv is None:
-        raise ValueError(
-            f"Canonical OpAdvisoryExtractor failed to resolve topology_axes for {rel_path!r}"
-        )
-    axes: TopologyAxes = op_adv.topology_axes
+    axes = cached.axes
+    roofline = _case_roofline_from_semantics(
+        cached,
+        case_entry,
+        analyzer=analyzer,
+        fallback_dtype_bytes=elem_bytes,
+    )
     uses_cube = axes.compute_engine in ("aic_only", "coupled_1c2v")
     is_coupled = axes.compute_engine == "coupled_1c2v"
-    dom_bound = str(op_adv.roofline.get("dominant_bound", "memory_bandwidth"))
+    dom_bound = (
+        roofline.dominant_bound if roofline is not None else cached.fallback_dominant_bound
+    )
     unaligned_tail = has_unaligned_tail_for_case(shapes, dtypes, uses_cube) if shapes else False
 
     if shapes and shapes[0]:
@@ -324,38 +585,54 @@ def _build_static_case_features(
         contig_burst = 32768
     total_tiles = 0
 
-    clock_hz = float(getattr(facts, "clock_ghz", 1.65)) * 1e9
-    if callable(getattr(facts, "effective_hbm_bandwidth_bps", None)):
-        hbm_bw = float(facts.effective_hbm_bandwidth_bps(contig_burst))
-    else:
-        hbm_bw = float(getattr(facts, "hbm_peak_bandwidth_bps", 1.6e12))
+    resolved_t_hw = float(t_hw_us)
+    if resolved_t_hw <= 0.0:
+        if roofline is not None and roofline.ideal_roofline_us > 0.0:
+            resolved_t_hw = float(roofline.ideal_roofline_us)
+        else:
+            resolved_t_hw = 0.5
+
+    clock_hz = float(facts.clock_ghz) * 1e9
+    hbm_bw = float(facts.effective_hbm_bandwidth_bps(contig_burst))
     macs_per_cycle = float(_cube_macs_for_dtype(facts, cube_dtype, hf32=False))
     cube_peak_flops = float(facts.num_aic_cores) * macs_per_cycle * 2.0 * clock_hz
     vec_peak_flops = float(facts.num_aiv_cores) * float(DEFAULT_AIV_VEC_FLOPS_PER_CYCLE) * clock_hz
 
-    safe_t_hw = max(0.05, float(t_hw_us))
-    static_gm = max(4096.0, input_bytes * 1.25) if input_bytes > 0.0 else max(
-        4096.0, safe_t_hw * 1e-6 * hbm_bw
-    )
-
-    if uses_cube:
-        cube_flops = safe_t_hw * 1e-6 * cube_peak_flops
-        vec_flops = (0.25 * safe_t_hw * 1e-6 * vec_peak_flops) if is_coupled else 0.0
-        fixpipe_bytes = (0.25 * static_gm) if is_coupled else (0.15 * static_gm)
-        cv_sync_events = 4 if is_coupled else 0
-    elif dom_bound == "vector_compute" or (
-        axes is not None and axes.memory_ring == "persistent_onchip_state"
-    ):
-        cube_flops = 0.0
-        vec_flops = safe_t_hw * 1e-6 * vec_peak_flops
-        fixpipe_bytes = 0.0
-        cv_sync_events = 0
+    safe_t_hw = max(0.05, resolved_t_hw)
+    if roofline is not None:
+        static_gm = max(4096.0, float(roofline.min_gm_bytes))
+        cube_flops = float(roofline.cube_flops)
+        vec_flops = float(roofline.vector_flops)
+        if uses_cube:
+            fixpipe_bytes = (0.25 * static_gm) if is_coupled else (0.15 * static_gm)
+            cv_sync_events = 4 if is_coupled else 0
+        else:
+            fixpipe_bytes = 0.0
+            cv_sync_events = 0
     else:
-        cube_flops = 0.0
-        static_gm = max(static_gm, safe_t_hw * 1e-6 * hbm_bw)
-        vec_flops = 0.35 * safe_t_hw * 1e-6 * vec_peak_flops
-        fixpipe_bytes = 0.0
-        cv_sync_events = 0
+        static_gm = (
+            max(4096.0, input_bytes * 1.25)
+            if input_bytes > 0.0
+            else max(4096.0, safe_t_hw * 1e-6 * hbm_bw)
+        )
+        if uses_cube:
+            cube_flops = safe_t_hw * 1e-6 * cube_peak_flops
+            vec_flops = (0.25 * safe_t_hw * 1e-6 * vec_peak_flops) if is_coupled else 0.0
+            fixpipe_bytes = (0.25 * static_gm) if is_coupled else (0.15 * static_gm)
+            cv_sync_events = 4 if is_coupled else 0
+        elif dom_bound in ("vector_compute", "compute") or (
+            axes.memory_ring == "persistent_onchip_state"
+        ):
+            cube_flops = 0.0
+            vec_flops = safe_t_hw * 1e-6 * vec_peak_flops
+            fixpipe_bytes = 0.0
+            cv_sync_events = 0
+        else:
+            cube_flops = 0.0
+            static_gm = max(static_gm, safe_t_hw * 1e-6 * hbm_bw)
+            vec_flops = 0.35 * safe_t_hw * 1e-6 * vec_peak_flops
+            fixpipe_bytes = 0.0
+            cv_sync_events = 0
 
     modern = CostFeatures(
         cube_flops=cube_flops,
@@ -384,7 +661,7 @@ def _build_static_case_features(
         cv_sync_events=0,
         topology_axes=None,
     )
-    return modern, legacy
+    return modern, legacy, resolved_t_hw
 
 
 def load_official_reports(
@@ -396,8 +673,11 @@ def load_official_reports(
     """Scan report roots for official_final.json, deduplicate copies, and build case records."""
     eff_target = target or AscendTarget("ascend.950pr")
     facts = eff_target.get_facts(AscendSpaceFacts)
-    extractor = _try_resolve_extractor(ops_root)
-    advisory_cache: dict[str, tuple[Any, dict[int, dict[str, Any]]]] = {}
+    if not isinstance(facts, AscendSpaceFacts):
+        raise RuntimeError(f"Expected AscendSpaceFacts, got {type(facts).__name__}")
+    tasks_root = _try_resolve_tasks_root(ops_root)
+    analyzer = PyTorchSemanticAnalyzer(eff_target)
+    operator_cache: dict[str, _CachedOperatorMetadata] = {}
 
     report_files: list[Path] = []
     for raw_root in report_roots:
@@ -423,11 +703,16 @@ def load_official_reports(
             operator = str(op_entry.get("operator") or rel_path).strip()
             op_score = float(op_entry.get("score") or 0.0)
             cases = [c for c in (op_entry.get("cases") or []) if isinstance(c, Mapping)]
-            passed_cases: list[Mapping[str, Any]] = []
+            passed_cases: list[Mapping[str, object]] = []
             for c in cases:
                 acc = c.get("accuracy")
                 acc_ok = bool(acc.get("passed")) if isinstance(acc, Mapping) else False
-                elapsed = float(c.get("elapsed_us") or 0.0)
+                raw_elapsed = c.get("elapsed_us")
+                elapsed = (
+                    float(raw_elapsed)
+                    if isinstance(raw_elapsed, (int, float)) and not isinstance(raw_elapsed, bool)
+                    else 0.0
+                )
                 if acc_ok and math.isfinite(elapsed) and elapsed > 0.0:
                     passed_cases.append(c)
             if not passed_cases:
@@ -450,20 +735,24 @@ def load_official_reports(
                 case_id = str(c.get("case_id") or f"{rel_path}_{idx + 1}")
                 case_num = _parse_case_num(case_id, idx)
                 measured_us = float(c["elapsed_us"])
-                t_hw_us = float(c.get("t_hw_us") or 0.0)
-                if t_hw_us <= 0.0:
-                    t_hw_us = 0.5
+                raw_t_hw = c.get("t_hw_us")
+                t_hw_us = (
+                    float(raw_t_hw)
+                    if isinstance(raw_t_hw, (int, float)) and not isinstance(raw_t_hw, bool)
+                    else 0.0
+                )
                 ref_perf_us = float(c.get("baseline_perf_us") or 0.0)
                 speedup = float(c.get("speedup") or 0.0)
                 perf_score = float(c.get("perf_score") or 0.0)
 
-                feat, leg_feat = _build_static_case_features(
+                feat, leg_feat, resolved_t_hw = _build_static_case_features(
                     rel_path,
                     case_num,
                     t_hw_us,
                     facts=facts,
-                    advisory_cache=advisory_cache,
-                    extractor=extractor,
+                    analyzer=analyzer,
+                    operator_cache=operator_cache,
+                    tasks_root=tasks_root,
                 )
                 records.append(
                     OfficialCaseRecord(
@@ -474,7 +763,7 @@ def load_official_reports(
                         case_id=case_id,
                         case_num=case_num,
                         measured_us=measured_us,
-                        t_hw_us=t_hw_us,
+                        t_hw_us=resolved_t_hw,
                         ref_perf_us=ref_perf_us,
                         speedup=speedup,
                         perf_score=perf_score,

@@ -775,8 +775,11 @@ def test_prepare_seed_blueprints_cover_every_semantic_regime() -> None:
         assert packet.entry_name == "exp"
         assert packet.roofline.min_gm_bytes > 0
         assert packet.roofline.ideal_roofline_us > 0.0
-        assert packet.z3_pipeline_summary["source"] == "pytorch_semantic_frontend"
-        assert packet.requested_anchor_dims == regime.representative_hir_dims
+        assert packet.provenance.semantic_source == "pytorch_golden"
+        assert packet.z3_pipeline_summary == {}
+        assert packet.requested_anchor_dims == (
+            regime.representative_anchor_dims or regime.representative_hir_dims
+        )
 
 
 def test_stage0_static_validator_rejects_missing_public_entrypoint(tmp_path: Path) -> None:
@@ -1129,7 +1132,8 @@ def test_campaign_runner_synthesizes_blueprints_without_authored_model(
         assert packet.entry_name == "exp"
         assert packet.roofline.min_gm_bytes > 0
         assert packet.roofline.ideal_roofline_us > 0.0
-        assert packet.z3_pipeline_summary["source"] == "pytorch_semantic_frontend"
+        assert packet.provenance.semantic_source == "pytorch_golden"
+        assert packet.z3_pipeline_summary == {}
 
 
 def test_campaign_runner_raises_when_official_golden_is_missing(tmp_path: Path) -> None:
@@ -1181,12 +1185,16 @@ def test_campaign_runner_raises_when_one_regime_blueprint_fails(
     authored_hir = tmp_path / "model.py"
     authored_hir.write_text("# authored HIR\n", encoding="utf-8")
 
-    def _fail_compile(*args: object, **kwargs: object) -> HirBlueprintPacket:
+    def _fail_blueprint(*args: object, **kwargs: object) -> HirBlueprintPacket:
         raise ValueError("unsupported operator construct")
 
-    monkeypatch.setattr(campaign_runner_module, "compile_hir_blueprint", _fail_compile)
+    monkeypatch.setattr(
+        PyTorchSemanticAnalyzer,
+        "build_universal_blueprint",
+        _fail_blueprint,
+    )
     with pytest.raises(
-        RuntimeError, match="failed to compile authored HIR blueprint for regime vector"
+        RuntimeError, match="failed to synthesize semantic-first HIR blueprint for exp regime vector"
     ):
         PerfTargetCampaignRunner(
             config=CampaignConfig(operator_name="exp", max_rounds=1),
@@ -1325,7 +1333,7 @@ def test_every_level12_task_generates_every_semantic_regime_blueprint() -> None:
             )
             assert packet.entry_name == spec.entrypoint, (operator_name, regime.regime_tag)
             assert packet.roofline.ideal_roofline_us > 0.0, (operator_name, regime.regime_tag)
-            assert packet.z3_pipeline_summary["source"] == "pytorch_semantic_frontend", (
+            assert packet.provenance.semantic_source == "pytorch_golden", (
                 operator_name,
                 regime.regime_tag,
             )
@@ -1400,7 +1408,7 @@ def test_fifteen_production_operators_use_capped_wp1_campaign_partitions() -> No
             )
             assert packet.entry_name == spec.entrypoint, (operator_name, regime.regime_tag)
             assert packet.roofline.ideal_roofline_us > 0.0, (operator_name, regime.regime_tag)
-            assert packet.z3_pipeline_summary["source"] == "pytorch_semantic_frontend", (
+            assert packet.provenance.semantic_source == "pytorch_golden", (
                 operator_name,
                 regime.regime_tag,
             )
@@ -1563,15 +1571,26 @@ def test_cold_start_blueprints_use_each_regimes_official_representative_case(
     outcome = _prepare(golden_source=_EXP_GOLDEN, backend=backend)
     cases_by_id = {int(case["case_id"]): case for case in _EXP_CASES}
     assert outcome.regime_specs
+    from tilefoundry_ascend.ascend.sil.schema import dtype_bytes_for, shape_numel  # noqa: PLC0415
+
+    proto_outputs = _EXP_PROTO["outputs"]
+    assert isinstance(proto_outputs, list)
+    out_dtype = str(proto_outputs[0]["dtype"][0])
+    out_bytes_per_elem = dtype_bytes_for(out_dtype)
     for regime in outcome.regime_specs:
         packet = outcome.blueprints_by_regime[regime.regime_tag]
         case_id = int(regime.representative_case_entry["case_id"])
-        assert packet.z3_pipeline_summary["representative_case_id"] == case_id
         representative = RepresentativeCase.from_case_entry(cases_by_id[case_id])
+        assert packet.provenance.semantic_source == "pytorch_golden"
+        assert packet.provenance.traffic_basis in ("declared_io_exact", "estimated_shape_dtype")
         assert representative.input_shapes
         raw_dtypes = cases_by_id[case_id]["dtype"]
         assert isinstance(raw_dtypes, list)
         assert representative.input_dtypes == tuple(str(dtype) for dtype in raw_dtypes)
+        numel = shape_numel(representative.input_shapes[0])
+        in_bytes_per_elem = dtype_bytes_for(representative.input_dtypes[0])
+        expected_min_gm = int(numel * (in_bytes_per_elem + out_bytes_per_elem))
+        assert packet.roofline.min_gm_bytes == expected_min_gm
 
 
 def test_campaign_runner_passes_representative_case_ratios_to_static_gates(

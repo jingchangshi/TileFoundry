@@ -34,6 +34,7 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
 )
 from tilefoundry_ascend.ascend.cost_model import (
     DEFAULT_LAUNCH_OVERHEAD_US,
+    DEFAULT_RESIDUAL_BASIS_SPECS,
     CostFeatures,
     HybridAscendCostModel,
     build_cost_features_from_ledger,
@@ -101,7 +102,8 @@ def test_p0_chip_scaling_floors_persistence_and_observe_batch(tmp_path: Path) ->
         m_seq.observe(feat, lat, persist=True)
     m_batch.observe_batch(observations, persist=True)
 
-    assert len(m_seq.weights) == 13
+    assert len(m_seq.weights) == len(DEFAULT_RESIDUAL_BASIS_SPECS)
+    assert len(m_seq.weights) == 12
     assert math.isclose(m_seq.predict(cf).pred_us, m_batch.predict(cf).pred_us, rel_tol=1e-9)
     reloaded = HybridAscendCostModel(target, calibration_path=batch_path)
     assert reloaded.sample_count == 3
@@ -357,7 +359,7 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
                 sample_builder_kwargs={"m_dim": 64},
                 editable_symbols=("kernel",),
                 representative_hir_dims={"total_elements": 32768, "M": 64, "D": 512},
-                representative_anchor_dims={"M": 64},
+                representative_anchor_dims={"M": 64, "D": 512},
             ),
         ),
         llm_backend=_StubBackend(),

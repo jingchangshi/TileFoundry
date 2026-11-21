@@ -12,6 +12,7 @@ from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResou
 from tilefoundry_ascend.ascend.passes.observation_space import (
     CompilerSummaryLike,
     ObservationVector5D,
+    RooflineSummaryLike,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 
@@ -88,6 +89,8 @@ class StaticDynamicResidual:
     has_local_membar_in_vf_call: bool = False
     vloopv2_hit: bool = True
     observation: ObservationVector5D | None = None
+    transfer_inflation_ratio: float = 0.0
+    effective_compute_eta: float = 0.0
 
     @property
     def has_l1_compiler_summary(self) -> bool:
@@ -119,6 +122,8 @@ class StaticDynamicResidual:
             "dcache_dcci_flushes": self.dcache_dcci_flushes,
             "has_local_membar_in_vf_call": self.has_local_membar_in_vf_call,
             "vloopv2_hit": self.vloopv2_hit,
+            "transfer_inflation_ratio": self.transfer_inflation_ratio,
+            "effective_compute_eta": self.effective_compute_eta,
             "observation": (
                 self.observation.to_dict() if self.observation is not None else None
             ),
@@ -139,6 +144,10 @@ class StaticDynamicResidual:
                 f"residual field 'observation' must be a mapping, got "
                 f"{type(raw_observation).__name__}"
             )
+        default_inflation = (
+            observation.transfer_inflation_ratio if observation is not None else 0.0
+        )
+        default_eff_eta = observation.effective_compute_eta if observation is not None else 0.0
         return cls(
             measured_latency_us=float(payload.get("measured_latency_us", 0.0)),
             predicted_bottleneck_util=float(payload.get("predicted_bottleneck_util", 0.0)),
@@ -162,6 +171,12 @@ class StaticDynamicResidual:
             has_local_membar_in_vf_call=bool(payload.get("has_local_membar_in_vf_call", False)),
             vloopv2_hit=bool(payload.get("vloopv2_hit", True)),
             observation=observation,
+            transfer_inflation_ratio=max(
+                0.0, _read_float(payload, "transfer_inflation_ratio", default=default_inflation)
+            ),
+            effective_compute_eta=max(
+                0.0, _read_float(payload, "effective_compute_eta", default=default_eff_eta)
+            ),
         )
 
 
@@ -170,12 +185,13 @@ def compute_static_dynamic_residual(
     telemetry: Mapping[str, object],
     *,
     compiler_summary: CompilerSummaryLike | None = None,
+    roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
 ) -> StaticDynamicResidual:
-    """Compute StaticDynamicResidual from static ledger, msprof telemetry, and compiler summary."""
+    """Compute StaticDynamicResidual from ledger, msprof telemetry, compiler, and Roofline."""
     measured_us = _read_float(telemetry, "measured_latency_us", "dur_us")
     aic_mac = _read_float(telemetry, "aic_mac_ratio", "aic_mad")
     aiv_vec = _read_float(telemetry, "aiv_vec_ratio", "aiv_vec")
-    mte2_wait = _read_float(telemetry, "mte2_wait_ratio", "aiv_mte2")
+    mte2_wait = _read_float(telemetry, "mte2_wait_ratio", "aiv_mte2", "aic_mte2")
     sync_stall = _read_float(telemetry, "sync_stall_ratio")
 
     positive_cycles = [v for v in ledger.pipe_cycles.values() if v > 0]
@@ -289,6 +305,7 @@ def compute_static_dynamic_residual(
         ledger,
         compiler_summary=compiler_summary,
         telemetry=telemetry,
+        roofline=roofline,
     )
     return StaticDynamicResidual(
         measured_latency_us=measured_us,
@@ -309,6 +326,8 @@ def compute_static_dynamic_residual(
         has_local_membar_in_vf_call=has_local_membar_in_vf_call,
         vloopv2_hit=vloopv2_hit,
         observation=observation,
+        transfer_inflation_ratio=observation.transfer_inflation_ratio,
+        effective_compute_eta=observation.effective_compute_eta,
     )
 
 

@@ -1415,10 +1415,14 @@ def test_dual_track_kb_backend_filtering_and_cpp20_rendering(tmp_path: Path) -> 
     assert "T.dual_copy" in r02_hyb.transform_template
     assert "asc_copy_l0c2ub" in r02_hyb.transform_template
 
+    from tilefoundry_ascend.agent.kb import SymptomFamily  # noqa: PLC0415
+
     custom = AscendCausalRule(
         rule_id="R_TB_CUSTOM",
+        symptom_family=SymptomFamily.COMPUTE_VECTOR_LOOP_DEGRADED.value,
         regime_guard="is_legal",
         precondition="PIPE_V > 0",
+        anti_precondition="effective_compute_eta >= 0.60",
         transform_template="Optimize generic vector stage.",
         expected_postcondition="PIPE_V <= prev.PIPE_V",
         source_provenance="flywheel:ablation",
@@ -1430,6 +1434,8 @@ def test_dual_track_kb_backend_filtering_and_cpp20_rendering(tmp_path: Path) -> 
     reloaded = load_seed_rules(yaml_path)
     assert reloaded[0].compatible_backends == ("ascendc_trackb", "hybrid_trackb")
     assert reloaded[0].cpp20_transform_template == custom.cpp20_transform_template
+    assert reloaded[0].symptom_family == SymptomFamily.COMPUTE_VECTOR_LOOP_DEGRADED.value
+    assert reloaded[0].anti_precondition == "effective_compute_eta >= 0.60"
 
 
 def test_residual_beam_syntax_error_fail_closed_and_trackb_cpp_signatures() -> None:

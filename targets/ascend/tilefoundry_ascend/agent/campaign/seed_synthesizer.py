@@ -78,15 +78,109 @@ def _sha256_text(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
+def _blueprint_packets_from(
+    blueprints: Mapping[str, HirBlueprintPacket] | Sequence[HirBlueprintPacket] | None,
+) -> tuple[HirBlueprintPacket, ...]:
+    if blueprints is None:
+        return ()
+    if isinstance(blueprints, Mapping):
+        return tuple(blueprints.values())
+    return tuple(blueprints)
+
+
+def _schedule_delta_from_packet(packet: HirBlueprintPacket) -> Mapping[str, object] | None:
+    payload = packet.to_dict()
+    raw_delta = payload.get("schedule_delta")
+    return raw_delta if isinstance(raw_delta, Mapping) else None
+
+
+def _delta_has_sram_or_roundtrip_pressure(delta: Mapping[str, object]) -> bool:
+    for key in ("scheduled_ledger", "unscheduled_ledger"):
+        raw_ledger = delta.get(key)
+        if not isinstance(raw_ledger, Mapping):
+            continue
+        gm_roundtrip = raw_ledger.get("gm_roundtrip_bytes", 0)
+        max_overflow = raw_ledger.get("max_overflow_bytes", 0)
+        if (
+            isinstance(gm_roundtrip, int)
+            and not isinstance(gm_roundtrip, bool)
+            and gm_roundtrip > 0
+        ) or (
+            isinstance(max_overflow, int)
+            and not isinstance(max_overflow, bool)
+            and max_overflow > 0
+        ):
+            return True
+    return False
+
+
+def _delta_recommends_facets(delta: Mapping[str, object], required: tuple[str, ...]) -> bool:
+    raw_facets = delta.get("recommended_facets")
+    if not isinstance(raw_facets, Sequence) or isinstance(raw_facets, (str, bytes)):
+        return False
+    present = {str(item) for item in raw_facets}
+    return all(facet in present for facet in required)
+
+
 def select_initial_track_from_semantics(
     semantics: PyTorchOpSemantics,
     ratios: Sequence[CasePhysicsRatios],
+    *,
+    blueprints: Mapping[str, HirBlueprintPacket] | Sequence[HirBlueprintPacket] | None = None,
 ) -> str:
-    """Select Track-A TileLang DSL vs Track-B CCE C++20 purely from mathematical workload."""
+    """Select Track-A TileLang DSL vs Track-B CCE C++20 from workload and Roofline physics."""
     if semantics.has_subbyte_or_block_quant or semantics.has_indirect_index:
         return "cce_trackb"
     if any(r.working_set_sram_ratio > 1.0 and r.stride_ratio > 1.0 for r in ratios):
         return "cce_trackb"
+
+    packets = _blueprint_packets_from(blueprints)
+    if not packets:
+        return "tilelang_dsl"
+
+    axes = semantics.base_axes
+    if axes.compute_engine == "coupled_1c2v":
+        for packet in packets:
+            roofline = packet.roofline
+            in_l0c_ub_zone = (
+                roofline.cube_flops > 0
+                and roofline.vector_flops > 0
+                and 8.0 <= float(roofline.arithmetic_intensity) <= 128.0
+                and (
+                    axes.memory_ring
+                    in ("bidirectional_cv_ring", "l0c_ub_epilogue", "persistent_onchip_state")
+                    or float(roofline.vec_floor_us)
+                    >= 0.25 * max(1e-9, float(roofline.cube_floor_us))
+                )
+            )
+            if in_l0c_ub_zone:
+                return "hybrid_trackb"
+            delta = _schedule_delta_from_packet(packet)
+            if delta is not None and (
+                _delta_has_sram_or_roundtrip_pressure(delta)
+                or _delta_recommends_facets(
+                    delta, ("pipeline_and_sync_graph", "sram_layout_and_aliasing")
+                )
+            ):
+                return "hybrid_trackb"
+
+    if semantics.has_reduction and not axes.uses_cube:
+        has_unaligned_tail = any(
+            (not r.is_atom_aligned) and (r.inner_contiguous_bytes % 32 != 0)
+            for r in ratios
+        )
+        for packet in packets:
+            roofline = packet.roofline
+            if has_unaligned_tail and (
+                roofline.dominant_bound == "memory" or roofline.vector_flops > 0
+            ):
+                return "cce_trackb"
+            delta = _schedule_delta_from_packet(packet)
+            if delta is not None and _delta_recommends_facets(
+                delta, ("exec_mode_and_spr", "pipeline_and_sync_graph")
+            ):
+                return "cce_trackb"
+
     return "tilelang_dsl"
 
 
@@ -153,7 +247,7 @@ def _seed_module_abi(
     render_tu = "def _render_trackb_tu(**dims: object) -> str:"
     dispatch = f"def {entrypoint}(...) -> object:"
     forbidden = ", ".join(f"`{token}`" for token in surface.forbidden_tokens)
-    if track == "cce_trackb":
+    if track in ("cce_trackb", "hybrid_trackb"):
         return (
             "Required module symbols and exact Stage-0 instantiations:\n"
             "```python\n"
@@ -317,7 +411,7 @@ def _build_blueprints(
     return {
         regime.regime_tag: analyzer.build_universal_blueprint(
             semantics,
-            regime.representative_hir_dims,
+            regime.representative_anchor_dims or regime.representative_hir_dims,
             authored_hir_source=authored_hir_source,
             scheduled_hir_source=scheduled_hir_source,
             representative_case=(
@@ -420,9 +514,7 @@ async def prepare_operator_seed_or_takeover(
             l3_elapsed_sec=0.0,
         )
 
-    initial_track = select_initial_track_from_semantics(semantics, ratios)
-    runtime_backend, tier_name = _canonical_seed_track(initial_track)
-    regime_specs = build_semantic_regime_specs(
+    provisional_regimes = build_semantic_regime_specs(
         operator_name=operator_name,
         entrypoint=entrypoint,
         cases=cases,
@@ -430,16 +522,35 @@ async def prepare_operator_seed_or_takeover(
         base_axes=semantics.base_axes,
         has_reduction=semantics.has_reduction,
         case_ratios=ratios,
-        runtime_backend=runtime_backend,
+        runtime_backend="tilelang_dsl",
     )
-    l0_l1_validator = l0_l1_validator_factory(regime_specs)
     blueprints = _build_blueprints(
         analyzer,
         semantics,
-        regime_specs,
+        provisional_regimes,
         authored_hir_source=authored_hir_source,
         scheduled_hir_source=scheduled_hir_source,
     )
+    initial_track = select_initial_track_from_semantics(
+        semantics,
+        ratios,
+        blueprints=blueprints,
+    )
+    runtime_backend, tier_name = _canonical_seed_track(initial_track)
+    if runtime_backend == "tilelang_dsl":
+        regime_specs = provisional_regimes
+    else:
+        regime_specs = build_semantic_regime_specs(
+            operator_name=operator_name,
+            entrypoint=entrypoint,
+            cases=cases,
+            proto=proto,
+            base_axes=semantics.base_axes,
+            has_reduction=semantics.has_reduction,
+            case_ratios=ratios,
+            runtime_backend=runtime_backend,
+        )
+    l0_l1_validator = l0_l1_validator_factory(regime_specs)
     surface = get_dialect_surface(tier_name)
     first_bp = next(iter(blueprints.values()), None)
     constraint_block = build_progressive_llm_constraints(

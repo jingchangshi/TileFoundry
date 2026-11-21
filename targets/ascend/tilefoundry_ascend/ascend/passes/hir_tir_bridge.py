@@ -10,6 +10,7 @@ import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from tilefoundry.analysis import AnalysisError, ComputeCostMetadata, analyze, check_program
 from tilefoundry.analysis.check import program_dim_vars
@@ -146,19 +147,249 @@ class HirRooflineSummary:
         )
 
 
+_Z3_LOOP_SUMMARY_KEYS = frozenset({"ii", "stages", "phases", "versions"})
+
+
+def _filter_z3_pipeline_summary(raw: Mapping[str, object] | None) -> dict[str, object]:
+    """Retain only genuine Z3 per-loop stage summary mappings."""
+    if not isinstance(raw, Mapping):
+        return {}
+    cleaned: dict[str, object] = {}
+    for key, val in raw.items():
+        if isinstance(val, Mapping) and bool(_Z3_LOOP_SUMMARY_KEYS & set(val.keys())):
+            cleaned[str(key)] = dict(val)
+    return cleaned
+
+
+def _parse_semantic_source(raw: object) -> Literal["pytorch_golden", "pytorch_golden_plus_hir"]:
+    value = str(raw)
+    if value == "pytorch_golden":
+        return "pytorch_golden"
+    if value == "pytorch_golden_plus_hir":
+        return "pytorch_golden_plus_hir"
+    raise ValueError(
+        "semantic_source must be 'pytorch_golden' or 'pytorch_golden_plus_hir', "
+        f"got {value!r}"
+    )
+
+
+def _parse_traffic_basis(raw: object) -> Literal["declared_io_exact", "estimated_shape_dtype"]:
+    value = str(raw)
+    if value in ("declared_io_exact", "provable_lower_bound"):
+        return "declared_io_exact"
+    if value in ("estimated_shape_dtype", "estimated"):
+        return "estimated_shape_dtype"
+    raise ValueError(
+        "traffic_basis must be 'declared_io_exact' or 'estimated_shape_dtype', "
+        f"got {value!r}"
+    )
+
+
+def _parse_coordinate_scope(raw: object) -> Literal["representative_anchor"]:
+    value = str(raw)
+    if value == "representative_anchor":
+        return "representative_anchor"
+    raise ValueError(f"coordinate_scope must be 'representative_anchor', got {value!r}")
+
+
 @dataclass(frozen=True)
+class BlueprintProvenance:
+    """Provenance metadata for unified semantic-first operator blueprints."""
+
+    semantic_source: Literal["pytorch_golden", "pytorch_golden_plus_hir"]
+    traffic_basis: Literal["declared_io_exact", "estimated_shape_dtype"]
+    coordinate_scope: Literal["representative_anchor"] = "representative_anchor"
+    has_authored_hir: bool = False
+    has_scheduled_hir: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "semantic_source", _parse_semantic_source(self.semantic_source)
+        )
+        object.__setattr__(self, "traffic_basis", _parse_traffic_basis(self.traffic_basis))
+        object.__setattr__(
+            self, "coordinate_scope", _parse_coordinate_scope(self.coordinate_scope)
+        )
+        object.__setattr__(self, "has_authored_hir", bool(self.has_authored_hir))
+        object.__setattr__(self, "has_scheduled_hir", bool(self.has_scheduled_hir))
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize provenance metadata to a JSON-compatible mapping."""
+        return {
+            "semantic_source": self.semantic_source,
+            "traffic_basis": self.traffic_basis,
+            "coordinate_scope": self.coordinate_scope,
+            "has_authored_hir": self.has_authored_hir,
+            "has_scheduled_hir": self.has_scheduled_hir,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> BlueprintProvenance:
+        """Reconstruct a BlueprintProvenance from a serialized dictionary."""
+        return cls(
+            semantic_source=_parse_semantic_source(payload["semantic_source"]),
+            traffic_basis=_parse_traffic_basis(payload["traffic_basis"]),
+            coordinate_scope=_parse_coordinate_scope(
+                payload.get("coordinate_scope", "representative_anchor")
+            ),
+            has_authored_hir=bool(payload.get("has_authored_hir", False)),
+            has_scheduled_hir=bool(payload.get("has_scheduled_hir", False)),
+        )
+
+
+@dataclass(frozen=True)
+class BlueprintScheduleDelta:
+    """Optional schedule enrichment extracted when authored or scheduled HIR exists."""
+
+    unscheduled_ledger: ObjectivePhysicalLedger | None = None
+    scheduled_ledger: ObjectivePhysicalLedger | None = None
+    z3_stage_summary: dict[str, object] = field(default_factory=dict)
+    recommended_facets: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "z3_stage_summary",
+            _filter_z3_pipeline_summary(self.z3_stage_summary),
+        )
+        object.__setattr__(
+            self,
+            "recommended_facets",
+            tuple(str(item) for item in self.recommended_facets),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize optional HIR schedule enrichment to a JSON-compatible mapping."""
+        return {
+            "unscheduled_ledger": (
+                self.unscheduled_ledger.to_dict()
+                if self.unscheduled_ledger is not None
+                else None
+            ),
+            "scheduled_ledger": (
+                self.scheduled_ledger.to_dict()
+                if self.scheduled_ledger is not None
+                else None
+            ),
+            "z3_stage_summary": dict(self.z3_stage_summary),
+            "recommended_facets": list(self.recommended_facets),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> BlueprintScheduleDelta:
+        """Reconstruct a BlueprintScheduleDelta from a serialized dictionary."""
+        raw_unsched = payload.get("unscheduled_ledger")
+        raw_sched = payload.get("scheduled_ledger")
+        raw_z3 = payload.get("z3_stage_summary")
+        raw_facets = payload.get("recommended_facets")
+        if raw_unsched is None or isinstance(raw_unsched, ObjectivePhysicalLedger):
+            unsched = raw_unsched
+        elif isinstance(raw_unsched, Mapping):
+            unsched = ObjectivePhysicalLedger.from_dict(raw_unsched)
+        else:
+            raise TypeError(
+                f"unscheduled_ledger must be Mapping or None, got {type(raw_unsched).__name__}"
+            )
+        if raw_sched is None or isinstance(raw_sched, ObjectivePhysicalLedger):
+            sched = raw_sched
+        elif isinstance(raw_sched, Mapping):
+            sched = ObjectivePhysicalLedger.from_dict(raw_sched)
+        else:
+            raise TypeError(
+                f"scheduled_ledger must be Mapping or None, got {type(raw_sched).__name__}"
+            )
+        z3_map = _filter_z3_pipeline_summary(raw_z3 if isinstance(raw_z3, Mapping) else None)
+        facets = (
+            tuple(str(item) for item in raw_facets)
+            if isinstance(raw_facets, (list, tuple))
+            else ()
+        )
+        return cls(
+            unscheduled_ledger=unsched,
+            scheduled_ledger=sched,
+            z3_stage_summary=z3_map,
+            recommended_facets=facets,
+        )
+
+
+@dataclass(frozen=True, init=False)
 class HirBlueprintPacket:
-    """Dialect-neutral HIR Roofline, Z3 pipeline schedule, and reference physical ledger."""
+    """Dialect-neutral semantic Roofline, optional HIR schedule delta, and physical ledger."""
 
     entry_name: str
     roofline: HirRooflineSummary
-    z3_pipeline_summary: dict[str, object]
-    reference_ledger: ObjectivePhysicalLedger | None
-    lowering_diagnostics: tuple[str, ...]
+    reference_ledger: ObjectivePhysicalLedger | None = None
+    lowering_diagnostics: tuple[str, ...] = ()
     requested_anchor_dims: dict[str, int] = field(default_factory=dict)
     resolved_hir_dims: dict[str, int] = field(default_factory=dict)
     shape_exact_match: bool = True
     fallback_reason: str | None = None
+    provenance: BlueprintProvenance | None = None
+    schedule_delta: BlueprintScheduleDelta | None = None
+    _z3_pipeline_summary: dict[str, object] = field(default_factory=dict, repr=False)
+
+    def __init__(
+        self,
+        entry_name: str,
+        roofline: HirRooflineSummary,
+        z3_pipeline_summary: Mapping[str, object] | None = None,
+        reference_ledger: ObjectivePhysicalLedger | None = None,
+        lowering_diagnostics: tuple[str, ...] = (),
+        requested_anchor_dims: Mapping[str, int] | None = None,
+        resolved_hir_dims: Mapping[str, int] | None = None,
+        shape_exact_match: bool = True,
+        fallback_reason: str | None = None,
+        provenance: BlueprintProvenance | None = None,
+        schedule_delta: BlueprintScheduleDelta | None = None,
+        *,
+        _z3_pipeline_summary: Mapping[str, object] | None = None,
+    ) -> None:
+        raw_z3 = (
+            _z3_pipeline_summary
+            if _z3_pipeline_summary is not None
+            else z3_pipeline_summary
+        )
+        stored_z3 = (
+            dict(schedule_delta.z3_stage_summary)
+            if schedule_delta is not None
+            else _filter_z3_pipeline_summary(raw_z3)
+        )
+        req_dims = (
+            {str(k): int(v) for k, v in requested_anchor_dims.items()}
+            if requested_anchor_dims is not None
+            else {}
+        )
+        res_dims = (
+            {str(k): int(v) for k, v in resolved_hir_dims.items()}
+            if resolved_hir_dims is not None
+            else {}
+        )
+        object.__setattr__(self, "entry_name", str(entry_name))
+        object.__setattr__(self, "roofline", roofline)
+        object.__setattr__(self, "reference_ledger", reference_ledger)
+        object.__setattr__(
+            self,
+            "lowering_diagnostics",
+            tuple(str(item) for item in lowering_diagnostics),
+        )
+        object.__setattr__(self, "requested_anchor_dims", req_dims)
+        object.__setattr__(self, "resolved_hir_dims", res_dims)
+        object.__setattr__(self, "shape_exact_match", bool(shape_exact_match))
+        object.__setattr__(
+            self,
+            "fallback_reason",
+            str(fallback_reason) if fallback_reason is not None else None,
+        )
+        object.__setattr__(self, "provenance", provenance)
+        object.__setattr__(self, "schedule_delta", schedule_delta)
+        object.__setattr__(self, "_z3_pipeline_summary", stored_z3)
+
+    @property
+    def z3_pipeline_summary(self) -> dict[str, object]:
+        """Return genuine Z3 stage summaries without non-Z3 metadata keys."""
+        if self.schedule_delta is not None:
+            return dict(self.schedule_delta.z3_stage_summary)
+        return dict(self._z3_pipeline_summary)
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable dictionary representation."""
@@ -176,25 +407,39 @@ class HirBlueprintPacket:
             "resolved_hir_dims": {str(k): int(v) for k, v in self.resolved_hir_dims.items()},
             "shape_exact_match": bool(self.shape_exact_match),
             "fallback_reason": self.fallback_reason,
+            "provenance": self.provenance.to_dict() if self.provenance is not None else None,
+            "schedule_delta": (
+                self.schedule_delta.to_dict() if self.schedule_delta is not None else None
+            ),
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> HirBlueprintPacket:
         """Reconstruct a HirBlueprintPacket from a serialized dictionary."""
-        roofline = HirRooflineSummary.from_dict(payload["roofline"])
+        raw_roofline = payload["roofline"]
+        if isinstance(raw_roofline, HirRooflineSummary):
+            roofline = raw_roofline
+        elif isinstance(raw_roofline, Mapping):
+            roofline = HirRooflineSummary.from_dict(raw_roofline)
+        else:
+            raise TypeError(
+                f"roofline must be HirRooflineSummary or Mapping, got {type(raw_roofline).__name__}"
+            )
         raw_ledger = payload.get("reference_ledger")
-        raw_z3 = payload.get("z3_pipeline_summary") or {}
+        raw_z3 = payload.get("z3_pipeline_summary")
         raw_diags = payload.get("lowering_diagnostics") or ()
         raw_req = payload.get("requested_anchor_dims")
         raw_res = payload.get("resolved_hir_dims")
+        raw_prov = payload.get("provenance")
+        raw_delta = payload.get("schedule_delta")
         requested_dims = (
             {str(k): int(v) for k, v in dict(raw_req).items()}
-            if raw_req is not None
+            if isinstance(raw_req, Mapping)
             else dict(roofline.requested_anchor_dims)
         )
         resolved_dims = (
             {str(k): int(v) for k, v in dict(raw_res).items()}
-            if raw_res is not None
+            if isinstance(raw_res, Mapping)
             else dict(roofline.resolved_hir_dims)
         )
         shape_exact = (
@@ -207,20 +452,46 @@ class HirBlueprintPacket:
             fallback_reason = str(raw_fb) if raw_fb is not None else None
         else:
             fallback_reason = roofline.fallback_reason
+        if raw_prov is None or isinstance(raw_prov, BlueprintProvenance):
+            provenance = raw_prov
+        elif isinstance(raw_prov, Mapping):
+            provenance = BlueprintProvenance.from_dict(raw_prov)
+        else:
+            raise TypeError(
+                f"provenance must be BlueprintProvenance, Mapping, or None, "
+                f"got {type(raw_prov).__name__}"
+            )
+        if raw_delta is None or isinstance(raw_delta, BlueprintScheduleDelta):
+            schedule_delta = raw_delta
+        elif isinstance(raw_delta, Mapping):
+            schedule_delta = BlueprintScheduleDelta.from_dict(raw_delta)
+        else:
+            raise TypeError(
+                f"schedule_delta must be BlueprintScheduleDelta, Mapping, or None, "
+                f"got {type(raw_delta).__name__}"
+            )
+        if raw_ledger is None or isinstance(raw_ledger, ObjectivePhysicalLedger):
+            ref_ledger = raw_ledger
+        elif isinstance(raw_ledger, Mapping):
+            ref_ledger = ObjectivePhysicalLedger.from_dict(raw_ledger)
+        else:
+            raise TypeError(
+                f"reference_ledger must be ObjectivePhysicalLedger, Mapping, or None, "
+                f"got {type(raw_ledger).__name__}"
+            )
+        z3_map = _filter_z3_pipeline_summary(raw_z3 if isinstance(raw_z3, Mapping) else None)
         return cls(
             entry_name=str(payload["entry_name"]),
             roofline=roofline,
-            z3_pipeline_summary=dict(raw_z3),
-            reference_ledger=(
-                raw_ledger
-                if isinstance(raw_ledger, ObjectivePhysicalLedger) or raw_ledger is None
-                else ObjectivePhysicalLedger.from_dict(raw_ledger)
-            ),
+            z3_pipeline_summary=z3_map,
+            reference_ledger=ref_ledger,
             lowering_diagnostics=tuple(str(item) for item in raw_diags),
             requested_anchor_dims=requested_dims,
             resolved_hir_dims=resolved_dims,
             shape_exact_match=shape_exact,
             fallback_reason=fallback_reason,
+            provenance=provenance,
+            schedule_delta=schedule_delta,
         )
 
     def format_for_prompt(self) -> str:
@@ -229,6 +500,13 @@ class HirBlueprintPacket:
             f"Entry: {self.entry_name}",
             self.roofline.format_for_prompt(),
         ]
+        if self.provenance is not None:
+            lines.append(
+                f"Provenance: semantic_source={self.provenance.semantic_source}, "
+                f"traffic_basis={self.provenance.traffic_basis}, "
+                f"has_authored_hir={self.provenance.has_authored_hir}, "
+                f"has_scheduled_hir={self.provenance.has_scheduled_hir}"
+            )
         if not self.shape_exact_match or self.fallback_reason is not None:
             lines.append(
                 f"Shape Provenance: shape_exact_match={self.shape_exact_match}, "
@@ -789,6 +1067,111 @@ def _lower_scheduled_module(
     )
 
 
+def _derive_recommended_facets(
+    ledger: ObjectivePhysicalLedger | None,
+    z3_stage_summary: Mapping[str, object],
+) -> tuple[str, ...]:
+    """Derive 7-facet relaxation hints directly from HIR schedule telemetry."""
+    facets: list[str] = []
+
+    def _add(facet: str) -> None:
+        if facet not in facets:
+            facets.append(facet)
+
+    if z3_stage_summary:
+        _add("sync_skeleton")
+        _add("loop_nesting")
+    if ledger is not None:
+        if ledger.gm_roundtrip_bytes > 0:
+            _add("memory_space")
+            _add("sync_skeleton")
+        if ledger.unaligned_dma_padding_bytes > 0 or 0 < ledger.dominant_contig_bytes < 16384:
+            _add("tile_shape")
+            _add("layout_cast")
+        if ledger.in_loop_pipe_all_barriers > 0:
+            _add("sync_skeleton")
+            _add("loop_nesting")
+        if ledger.has_online_rescale_loop:
+            _add("loop_nesting")
+        if ledger.ub_bank_conflict_risk > 0.08 or ledger.l1_bank_conflict_risk > 0.08:
+            _add("layout_cast")
+    return tuple(facets)
+
+
+def compile_hir_schedule_delta(
+    authored_hir_source: str,
+    *,
+    scheduled_hir_source: str | None = None,
+    anchor_dims: Mapping[str, int] | None = None,
+    target: AscendTarget | None = None,
+) -> tuple[BlueprintScheduleDelta, ObjectivePhysicalLedger | None, tuple[str, ...]]:
+    """Extract optional HIR ledgers and Z3 stage summaries without computing Roofline."""
+    unscheduled_ledger: ObjectivePhysicalLedger | None = None
+    scheduled_ledger: ObjectivePhysicalLedger | None = None
+    z3_stage_summary: dict[str, object] = {}
+    diagnostics: list[str] = []
+
+    def _load_resilient(
+        source: str,
+        tmpdir: Path,
+        filename: str,
+    ) -> tuple[_LoadedModuleInfo, Mapping[str, int] | None]:
+        try:
+            return (
+                _load_module_from_source(source, tmpdir, filename, anchor_dims=anchor_dims),
+                anchor_dims,
+            )
+        except (VerifyError, ValueError, AssertionError, TypeError) as exc:
+            diagnostics.append(f"hir_default_dims_fallback({filename}): {type(exc).__name__}: {exc}")
+            return (
+                _load_module_from_source(source, tmpdir, filename, anchor_dims=None),
+                None,
+            )
+
+    with tempfile.TemporaryDirectory() as tmp_str:
+        tmpdir = Path(tmp_str)
+        authored_info, authored_dims = _load_resilient(
+            authored_hir_source, tmpdir, "authored_hir.py"
+        )
+        resolved_target = target or authored_info.module.resolve_target()
+        if not isinstance(resolved_target, AscendTarget):
+            resolved_target = AscendTarget("ascend.950pr")
+
+        try:
+            unsched_led, unsched_z3, _name, _dims, _decl = _lower_scheduled_module(
+                authored_info, anchor_dims=authored_dims, resolved_target=resolved_target
+            )
+            unscheduled_ledger = unsched_led
+            if scheduled_hir_source is None:
+                z3_stage_summary = unsched_z3
+        except _LOWERING_ERRORS as exc:
+            if scheduled_hir_source is None:
+                diagnostics.append(f"{type(exc).__name__}: {exc}")
+
+        if scheduled_hir_source is not None and scheduled_hir_source.strip():
+            sched_info, sched_dims = _load_resilient(
+                scheduled_hir_source, tmpdir, "scheduled_hir.py"
+            )
+            try:
+                sched_led, sched_z3, _name, _dims, _decl = _lower_scheduled_module(
+                    sched_info, anchor_dims=sched_dims, resolved_target=resolved_target
+                )
+                scheduled_ledger = sched_led
+                z3_stage_summary = sched_z3
+            except _LOWERING_ERRORS as exc:
+                diagnostics.append(f"scheduled_hir_lowering: {type(exc).__name__}: {exc}")
+
+    primary_ledger = scheduled_ledger if scheduled_ledger is not None else unscheduled_ledger
+    recommended_facets = _derive_recommended_facets(primary_ledger, z3_stage_summary)
+    delta = BlueprintScheduleDelta(
+        unscheduled_ledger=unscheduled_ledger,
+        scheduled_ledger=scheduled_ledger,
+        z3_stage_summary=z3_stage_summary,
+        recommended_facets=recommended_facets,
+    )
+    return delta, primary_ledger, tuple(diagnostics)
+
+
 def compile_hir_blueprint(
     authored_hir_source: str,
     *,
@@ -889,22 +1272,40 @@ def compile_hir_blueprint(
         fallback_reason=combined_fallback,
         target=resolved_target,
     )
+    has_scheduled = scheduled_hir_source is not None
+    schedule_delta = BlueprintScheduleDelta(
+        unscheduled_ledger=None if has_scheduled else ref_ledger,
+        scheduled_ledger=ref_ledger if has_scheduled else None,
+        z3_stage_summary=z3_summary,
+        recommended_facets=_derive_recommended_facets(ref_ledger, z3_summary),
+    )
+    provenance = BlueprintProvenance(
+        semantic_source="pytorch_golden_plus_hir",
+        traffic_basis="declared_io_exact",
+        coordinate_scope="representative_anchor",
+        has_authored_hir=True,
+        has_scheduled_hir=has_scheduled,
+    )
 
     return HirBlueprintPacket(
         entry_name=entry_name,
         roofline=roofline,
-        z3_pipeline_summary=z3_summary,
         reference_ledger=ref_ledger,
         lowering_diagnostics=tuple(diagnostics),
         requested_anchor_dims=requested_dims,
         resolved_hir_dims=dict(packet_resolved_dims),
         shape_exact_match=packet_exact,
         fallback_reason=combined_fallback,
+        provenance=provenance,
+        schedule_delta=schedule_delta,
     )
 
 
 __all__ = [
+    "BlueprintProvenance",
+    "BlueprintScheduleDelta",
     "HirBlueprintPacket",
     "HirRooflineSummary",
     "compile_hir_blueprint",
+    "compile_hir_schedule_delta",
 ]

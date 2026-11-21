@@ -409,7 +409,7 @@ def test_sil_verifier_catches_invalid_policies_and_solvers_fallback_cleanly() ->
         topology_axes=ax_simd,
         loop=None,
     )
-    assert analytical_reg.solver_mode == "analytical_piecewise"
+    assert analytical_reg.solver_mode == "algebraic_piecewise"
     assert verifier.verify_policy(
         SchedulePolicy.from_dict(analytical_reg.to_dict()),
         AdvisoryEnvelope(

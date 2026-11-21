@@ -916,7 +916,7 @@ def test_campaign_l3_contract_failure_atomic_rollback_and_budget_exhausted(
                     }
                 )
             ]
-            * 2,
+            * 6,
         }
     )
 
@@ -1920,7 +1920,7 @@ def test_campaign_atomic_checkpoint_and_exact_resume_plus_l4_catch(
                     }
                 )
             ]
-            * 6,
+            * 10,
         }
     )
     l4_calls = [0]
@@ -3074,7 +3074,14 @@ def test_campaign_axis_pruning_and_cross_topology_isolation(tmp_path: Path) -> N
     target_path = tmp_path / "kernels.py"
     target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
 
+    vec_axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
     tracker = BayesianRuleTracker.from_seed_yaml()
+    for _ in range(6):
+        tracker.record_outcome(
+            "R01_DUAL_COPY_1C2V_SPLIT",
+            postcondition_realized=False,
+            topology_axes=vec_axes,
+        )
     backend = MockLLMBackend(
         responses={
             "exploit_rule": [_IMPROVED_REGIME_A] * 24,
@@ -3087,7 +3094,7 @@ def test_campaign_axis_pruning_and_cross_topology_isolation(tmp_path: Path) -> N
                     }
                 )
             ]
-            * 12,
+            * 30,
         }
     )
 
@@ -4678,7 +4685,7 @@ def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
     pct_metrics = _extract_msprof_metrics(pct_prof)
     assert abs(float(pct_metrics["aic_mac_ratio"]) - 0.90) < 1e-6
     assert abs(float(pct_metrics["aiv_vec_ratio"]) - 0.20) < 1e-6
-    assert abs(float(pct_metrics["sync_stall_ratio"]) - 0.0) < 1e-6
+    assert "sync_stall_ratio" not in pct_metrics
 
     stall_prof = SimpleNamespace(
         aic_mad=0.20,
@@ -4690,7 +4697,7 @@ def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
         dur_us=25.0,
     )
     stall_metrics = _extract_msprof_metrics(stall_prof)
-    assert abs(float(stall_metrics["sync_stall_ratio"]) - 0.65) < 1e-6
+    assert "sync_stall_ratio" not in stall_metrics
 
 
 def test_run_l0_l1_round_filter_isolates_syntax_repair_timeout(tmp_path: Path) -> None:

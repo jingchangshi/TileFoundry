@@ -74,13 +74,15 @@ def append_kb_event_shard(
     return shard
 
 
-def save_distilled_rule_file(lake_dir: str | Path, rule: AscendCausalRule) -> Path:
-    """Atomically write or update one distilled causal rule JSON inside the shared KB lake."""
-    rules_dir = Path(lake_dir) / "kb" / "distilled_rules"
-    rules_dir.mkdir(parents=True, exist_ok=True)
-    target = rules_dir / f"{_safe_kb_slug(rule.rule_id, 'rule')}.json"
-    raw = json.dumps(rule.to_dict(), indent=2, sort_keys=True) + "\n"
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{_safe_kb_slug(rule.rule_id, 'rule')}_", suffix=".json", dir=str(rules_dir))
+def _atomic_write_json(target: Path, payload: Mapping[str, object]) -> Path:
+    """Atomically write a JSON object to *target* via same-directory temp file replace."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    raw = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.stem}_",
+        suffix=".json",
+        dir=str(target.parent),
+    )
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -90,6 +92,126 @@ def save_distilled_rule_file(lake_dir: str | Path, rule: AscendCausalRule) -> Pa
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
     return target
+
+
+def save_distilled_rule_file(lake_dir: str | Path, rule: AscendCausalRule) -> Path:
+    """Atomically write or update one distilled causal rule JSON inside the shared KB lake."""
+    rules_dir = Path(lake_dir) / "kb" / "distilled_rules"
+    target = rules_dir / f"{_safe_kb_slug(rule.rule_id, 'rule')}.json"
+    return _atomic_write_json(target, rule.to_dict())
+
+
+def save_staging_candidate_rule(
+    lake_dir: str | Path,
+    rule: AscendCausalRule,
+    *,
+    ablation_report: Mapping[str, object] | None = None,
+) -> Path:
+    """Atomically write an unreviewed candidate rule draft to offline curation staging."""
+    staging_dir = Path(lake_dir) / "kb" / "staging_candidates"
+    target = staging_dir / f"{_safe_kb_slug(rule.rule_id, 'rule')}.json"
+    payload: dict[str, object] = {
+        "timestamp": time.time(),
+        "status": "pending_review",
+        "rule": rule.to_dict(),
+    }
+    if ablation_report is not None:
+        payload["ablation_report"] = dict(ablation_report)
+    return _atomic_write_json(target, payload)
+
+
+def append_winning_edge(
+    lake_dir: str | Path,
+    record: Mapping[str, object],
+) -> Path:
+    """Append one winning optimization edge record to ``kb/evidence/winning_edges.jsonl``."""
+    evidence_dir = Path(lake_dir) / "kb" / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    target = evidence_dir / "winning_edges.jsonl"
+    payload = dict(record)
+    payload.setdefault("timestamp", time.time())
+    with target.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, sort_keys=True) + "\n")
+    return target
+
+
+def append_rule_misapplication(
+    lake_dir: str | Path,
+    record: Mapping[str, object],
+) -> Path:
+    """Append one rule misapplication record to ``kb/evidence/rule_misapplications.jsonl``."""
+    evidence_dir = Path(lake_dir) / "kb" / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    target = evidence_dir / "rule_misapplications.jsonl"
+    payload = dict(record)
+    payload.setdefault("timestamp", time.time())
+    with target.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, sort_keys=True) + "\n")
+    return target
+
+
+@dataclass(frozen=True)
+class TabuEntry:
+    """Intra-campaign rule cooldown scoped to one regime and parent source digest."""
+
+    regime_tag: str
+    rule_id: str
+    parent_sha: str
+    expire_round: int
+    reason: str
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize TabuEntry to a JSON-compatible dictionary."""
+        return {
+            "regime_tag": self.regime_tag,
+            "rule_id": self.rule_id,
+            "parent_sha": self.parent_sha,
+            "expire_round": self.expire_round,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> TabuEntry:
+        """Reconstruct TabuEntry from a serialized dictionary."""
+        return cls(
+            regime_tag=str(payload["regime_tag"]),
+            rule_id=str(payload["rule_id"]),
+            parent_sha=str(payload["parent_sha"]),
+            expire_round=int(payload["expire_round"]),
+            reason=str(payload.get("reason", "")),
+        )
+
+
+@dataclass(frozen=True)
+class FamilyTabuEntry:
+    """Intra-campaign symptom-family cooldown scoped to one regime and parent digest."""
+
+    regime_tag: str
+    symptom_family: str
+    parent_sha: str
+    expire_round: int
+    reason: str
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize FamilyTabuEntry to a JSON-compatible dictionary."""
+        return {
+            "regime_tag": self.regime_tag,
+            "symptom_family": self.symptom_family,
+            "parent_sha": self.parent_sha,
+            "expire_round": self.expire_round,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> FamilyTabuEntry:
+        """Reconstruct FamilyTabuEntry from a serialized dictionary."""
+        return cls(
+            regime_tag=str(payload["regime_tag"]),
+            symptom_family=str(payload["symptom_family"]),
+            parent_sha=str(payload["parent_sha"]),
+            expire_round=int(payload["expire_round"]),
+            reason=str(payload.get("reason", "")),
+        )
 
 
 @dataclass
@@ -151,11 +273,14 @@ class RulePosterior:
 
 @dataclass
 class BayesianRuleTracker:
-    """Tracks factorized 3-axis causal rule efficacy and prunes persistently unrealized rules."""
+    """Tracks factorized 3-axis causal rule efficacy, scoped tabu cooldowns, and pruning."""
 
     rules: dict[str, AscendCausalRule] = field(default_factory=dict)
     posteriors: dict[str, RulePosterior] = field(default_factory=dict)
     axis_posteriors: dict[str, dict[str, RulePosterior]] = field(default_factory=dict)
+    tabu_entries: list[TabuEntry] = field(default_factory=list)
+    family_tabu_entries: list[FamilyTabuEntry] = field(default_factory=list)
+    family_failure_streaks: dict[tuple[str, str, str], int] = field(default_factory=dict)
     _round_counter: int = field(default=0, init=False, repr=False)
     _synced_event_counts: dict[str, int] = field(default_factory=dict, init=False, repr=False)
 
@@ -177,13 +302,18 @@ class BayesianRuleTracker:
         lake_dir: str | Path | None,
         *,
         exclude_run_id: str | None = None,
+        allow_unreviewed_distilled_rules: bool = False,
     ) -> int:
-        """Incrementally ingest shared distilled rules and peer KB events from Experience Lake."""
+        """Incrementally ingest peer KB posterior events from Experience Lake.
+
+        Unreviewed distilled rules under ``kb/distilled_rules`` remain excluded from
+        online active rules unless *allow_unreviewed_distilled_rules* is explicitly True.
+        """
         if lake_dir is None or not str(lake_dir).strip():
             return 0
         kb_root = Path(lake_dir) / "kb"
         distilled_dir = kb_root / "distilled_rules"
-        if distilled_dir.is_dir():
+        if allow_unreviewed_distilled_rules and distilled_dir.is_dir():
             for rpath in sorted(distilled_dir.glob("*.json")):
                 try:
                     raw = json.loads(rpath.read_text(encoding="utf-8"))
@@ -194,7 +324,7 @@ class BayesianRuleTracker:
                             self.admit_rule(rule)
                         elif rule.scope == "cross_op" and existing.scope == "operator_local":
                             self.rules[rule.rule_id] = rule
-                except Exception:
+                except (OSError, ValueError, KeyError, json.JSONDecodeError):
                     continue
 
         events_dir = kb_root / "events"
@@ -216,7 +346,7 @@ class BayesianRuleTracker:
                             continue
                         if isinstance(obj, Mapping):
                             valid_objs.append(obj)
-                except Exception:
+                except OSError:
                     continue
                 prev = self._synced_event_counts.get(epath.name, 0)
                 if len(valid_objs) <= prev:
@@ -241,7 +371,8 @@ class BayesianRuleTracker:
                 topology_axes=axes_raw if isinstance(axes_raw, Mapping) else None,
                 round_idx=ridx,
             )
-        self.promote_verified_local_rules()
+        if allow_unreviewed_distilled_rules:
+            self.promote_verified_local_rules()
         return len(new_events)
 
     @classmethod
@@ -250,11 +381,135 @@ class BayesianRuleTracker:
         lake_dir: str | Path | None = None,
         *,
         seed_path: str | Path | None = None,
+        allow_unreviewed_distilled_rules: bool = False,
     ) -> BayesianRuleTracker:
-        """Initialize from seed rules, then replay shared distilled rules and KB event shards."""
+        """Initialize from seed rules, then replay Experience Lake KB event shards."""
         tracker = cls.from_seed_yaml(seed_path)
-        tracker.sync_from_experience_lake(lake_dir)
+        tracker.sync_from_experience_lake(
+            lake_dir,
+            allow_unreviewed_distilled_rules=allow_unreviewed_distilled_rules,
+        )
         return tracker
+
+    def record_scoped_failure(
+        self,
+        *,
+        regime_tag: str,
+        rule_id: str,
+        parent_sha: str,
+        current_round: int,
+        reason: str,
+        cooldown_rounds: int = 2,
+        family_cooldown_rounds: int = 1,
+    ) -> None:
+        """Record a scoped rule failure and escalate to family cooldown on streak >= 2."""
+        reg = str(regime_tag).strip()
+        rid = str(rule_id).strip()
+        sha = str(parent_sha).strip()
+        if not reg or not rid or not sha:
+            return
+        cur_round = int(current_round)
+        rule_expire = cur_round + max(0, int(cooldown_rounds))
+        updated_entries = [
+            entry
+            for entry in self.tabu_entries
+            if not (
+                entry.regime_tag == reg
+                and entry.rule_id == rid
+                and entry.parent_sha == sha
+            )
+        ]
+        updated_entries.append(
+            TabuEntry(
+                regime_tag=reg,
+                rule_id=rid,
+                parent_sha=sha,
+                expire_round=rule_expire,
+                reason=str(reason),
+            )
+        )
+        self.tabu_entries = updated_entries
+
+        rule = self.rules.get(rid)
+        family = rule.symptom_family if rule is not None else ""
+        if not family:
+            return
+        streak_key = (reg, family, sha)
+        streak = self.family_failure_streaks.get(streak_key, 0) + 1
+        self.family_failure_streaks[streak_key] = streak
+        if streak >= 2:
+            fam_expire = cur_round + max(0, int(family_cooldown_rounds))
+            updated_fam = [
+                entry
+                for entry in self.family_tabu_entries
+                if not (
+                    entry.regime_tag == reg
+                    and entry.symptom_family == family
+                    and entry.parent_sha == sha
+                )
+            ]
+            updated_fam.append(
+                FamilyTabuEntry(
+                    regime_tag=reg,
+                    symptom_family=family,
+                    parent_sha=sha,
+                    expire_round=fam_expire,
+                    reason=f"consecutive_family_failures:{streak}:{reason}",
+                )
+            )
+            self.family_tabu_entries = updated_fam
+
+    def reset_scoped_family_streak(
+        self,
+        *,
+        regime_tag: str,
+        rule_id: str,
+        parent_sha: str,
+    ) -> None:
+        """Clear consecutive failure streak for the rule's symptom family on success."""
+        rule = self.rules.get(str(rule_id).strip())
+        if rule is None or not rule.symptom_family:
+            return
+        self.family_failure_streaks.pop(
+            (str(regime_tag).strip(), rule.symptom_family, str(parent_sha).strip()),
+            None,
+        )
+
+    def is_rule_tabued(
+        self,
+        *,
+        regime_tag: str,
+        rule_id: str,
+        parent_sha: str,
+        current_round: int,
+    ) -> bool:
+        """Return whether rule_id or its symptom family is under active scoped cooldown."""
+        reg = str(regime_tag).strip()
+        rid = str(rule_id).strip()
+        sha = str(parent_sha).strip()
+        if not reg or not rid or not sha:
+            return False
+        cur_round = int(current_round)
+        for entry in self.tabu_entries:
+            if (
+                entry.regime_tag == reg
+                and entry.rule_id == rid
+                and entry.parent_sha == sha
+                and cur_round <= entry.expire_round
+            ):
+                return True
+        rule = self.rules.get(rid)
+        family = rule.symptom_family if rule is not None else ""
+        if family:
+            for fam_entry in self.family_tabu_entries:
+                if (
+                    fam_entry.regime_tag == reg
+                    and fam_entry.symptom_family == family
+                    and fam_entry.parent_sha == sha
+                    and cur_round <= fam_entry.expire_round
+                ):
+                    return True
+        return False
 
     @staticmethod
     def _apply_outcome(
@@ -539,8 +794,11 @@ class BayesianRuleTracker:
         topology_axes: object | None = None,
         operator_name: str = "",
         runtime_backend: str | None = None,
+        regime_tag: str = "",
+        parent_sha: str = "",
+        current_round: int | None = None,
     ) -> tuple[AscendCausalRule, ...]:
-        """Filter matching rules by backend and rank by 3-axis posterior rate and priority."""
+        """Filter matching rules by backend and scoped tabu, then rank by 3-axis posterior."""
         eff_op = str(operator_name or "").strip() or str(context.get("operator_name") or "").strip()
         raw_backend = (
             runtime_backend
@@ -554,6 +812,18 @@ class BayesianRuleTracker:
             operator_name=eff_op,
             runtime_backend=eff_backend,
         ):
+            if (
+                regime_tag
+                and parent_sha
+                and current_round is not None
+                and self.is_rule_tabued(
+                    regime_tag=regime_tag,
+                    rule_id=rule.rule_id,
+                    parent_sha=parent_sha,
+                    current_round=current_round,
+                )
+            ):
+                continue
             if not rule.matches(context):
                 continue
             if topology_axes is not None:
@@ -577,8 +847,56 @@ class BayesianRuleTracker:
             selected = selected[:top_k]
         return tuple(selected)
 
+    def select_top_rules(
+        self,
+        context: Mapping[str, object],
+        *,
+        top_k: int | None = None,
+        topology_axes: object | None = None,
+        operator_name: str = "",
+        runtime_backend: str | None = None,
+        regime_tag: str = "",
+        parent_sha: str = "",
+        current_round: int | None = None,
+    ) -> tuple[AscendCausalRule, ...]:
+        """Select the highest-ranked matching rules after scoped tabu filtering."""
+        return self.rank_applicable_rules(
+            context,
+            top_k=top_k,
+            topology_axes=topology_axes,
+            operator_name=operator_name,
+            runtime_backend=runtime_backend,
+            regime_tag=regime_tag,
+            parent_sha=parent_sha,
+            current_round=current_round,
+        )
+
+    def rank_matching_rules(
+        self,
+        context: Mapping[str, object],
+        *,
+        top_k: int | None = None,
+        topology_axes: object | None = None,
+        operator_name: str = "",
+        runtime_backend: str | None = None,
+        regime_tag: str = "",
+        parent_sha: str = "",
+        current_round: int | None = None,
+    ) -> tuple[AscendCausalRule, ...]:
+        """Rank all matching rules after backend and scoped tabu filtering."""
+        return self.rank_applicable_rules(
+            context,
+            top_k=top_k,
+            topology_axes=topology_axes,
+            operator_name=operator_name,
+            runtime_backend=runtime_backend,
+            regime_tag=regime_tag,
+            parent_sha=parent_sha,
+            current_round=current_round,
+        )
+
     def to_dict(self) -> dict[str, object]:
-        """Serialize global and factorized 3-axis tracker posteriors into JSON-safe dict."""
+        """Serialize global, 3-axis posteriors, and scoped tabu state into JSON-safe dict."""
         payload: dict[str, object] = {
             "posteriors": {
                 rid: state.to_dict() for rid, state in sorted(self.posteriors.items())
@@ -596,17 +914,33 @@ class BayesianRuleTracker:
                 str(fname): int(count)
                 for fname, count in sorted(self._synced_event_counts.items())
             }
+        if self.tabu_entries:
+            payload["tabu_entries"] = [entry.to_dict() for entry in self.tabu_entries]
+        if self.family_tabu_entries:
+            payload["family_tabu_entries"] = [
+                entry.to_dict() for entry in self.family_tabu_entries
+            ]
+        if self.family_failure_streaks:
+            payload["family_failure_streaks"] = [
+                {
+                    "regime_tag": reg,
+                    "symptom_family": fam,
+                    "parent_sha": sha,
+                    "count": int(count),
+                }
+                for (reg, fam, sha), count in sorted(self.family_failure_streaks.items())
+            ]
         return payload
 
     def save_json(self, path: str | Path) -> None:
-        """Write tracker posteriors to disk as JSON."""
+        """Write tracker posteriors and scoped tabu state to disk as JSON."""
         Path(path).write_text(
             json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
 
     def load_posteriors_dict(self, payload: Mapping[str, object]) -> None:
-        """Restore global and factorized 3-axis posteriors from a serialized mapping."""
+        """Restore global posteriors, 3-axis posteriors, and scoped tabu state from mapping."""
         saved = payload.get("posteriors", {})
         if isinstance(saved, Mapping):
             for rid, raw in saved.items():
@@ -628,9 +962,47 @@ class BayesianRuleTracker:
                     self._synced_event_counts.get(str(fname), 0),
                     int(count),
                 )
+        raw_tabu = payload.get("tabu_entries")
+        if isinstance(raw_tabu, list):
+            self.tabu_entries = [
+                TabuEntry.from_dict(item) for item in raw_tabu if isinstance(item, Mapping)
+            ]
+        raw_family_tabu = payload.get("family_tabu_entries")
+        if isinstance(raw_family_tabu, list):
+            self.family_tabu_entries = [
+                FamilyTabuEntry.from_dict(item)
+                for item in raw_family_tabu
+                if isinstance(item, Mapping)
+            ]
+        raw_streaks = payload.get("family_failure_streaks")
+        if isinstance(raw_streaks, list):
+            restored_streaks: dict[tuple[str, str, str], int] = {}
+            for item in raw_streaks:
+                if not isinstance(item, Mapping):
+                    continue
+                reg = str(item.get("regime_tag", "")).strip()
+                fam = str(item.get("symptom_family", "")).strip()
+                sha = str(item.get("parent_sha", "")).strip()
+                count = int(item.get("count", 0))
+                if reg and fam and sha and count > 0:
+                    restored_streaks[(reg, fam, sha)] = count
+            self.family_failure_streaks = restored_streaks
+
+    @classmethod
+    def from_dict(
+        cls,
+        payload: Mapping[str, object],
+        *,
+        rules: Iterable[AscendCausalRule] | None = None,
+        seed_path: str | Path | None = None,
+    ) -> BayesianRuleTracker:
+        """Reconstruct a BayesianRuleTracker including posteriors and scoped tabu state."""
+        tracker = cls.from_rules(rules) if rules is not None else cls.from_seed_yaml(seed_path)
+        tracker.load_posteriors_dict(payload)
+        return tracker
 
     def load_posteriors_json(self, path: str | Path) -> None:
-        """Restore tracked posteriors from disk for matching rule IDs."""
+        """Restore tracked posteriors and scoped tabu state from disk for matching rule IDs."""
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         if isinstance(payload, Mapping):
             self.load_posteriors_dict(payload)
@@ -638,7 +1010,12 @@ class BayesianRuleTracker:
 
 __all__ = [
     "BayesianRuleTracker",
+    "FamilyTabuEntry",
     "RulePosterior",
+    "TabuEntry",
     "append_kb_event_shard",
+    "append_rule_misapplication",
+    "append_winning_edge",
     "save_distilled_rule_file",
+    "save_staging_candidate_rule",
 ]

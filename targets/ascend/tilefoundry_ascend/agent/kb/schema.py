@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import ast
+import math
 import operator
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 
 import yaml
@@ -15,6 +17,88 @@ from tilefoundry_ascend.ascend.passes.observation_space import (
     ObservationVector5D,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
+
+
+class SymptomFamily(str, Enum):
+    """Fixed 12-family hardware waste taxonomy shared across diagnosis and rule routing."""
+
+    DMA_REDUNDANT_GM_ROUNDTRIP = "DMA_REDUNDANT_GM_ROUNDTRIP"
+    DMA_UNALIGNED_SHORT_BURST = "DMA_UNALIGNED_SHORT_BURST"
+    DMA_L2_THRASH_REUSE_MISS = "DMA_L2_THRASH_REUSE_MISS"
+    COMPUTE_VECTOR_LOOP_DEGRADED = "COMPUTE_VECTOR_LOOP_DEGRADED"
+    COMPUTE_INEFFECTIVE_THROUGHPUT = "COMPUTE_INEFFECTIVE_THROUGHPUT"
+    COMPUTE_FIXPIPE_ACCUM_IMBALANCE = "COMPUTE_FIXPIPE_ACCUM_IMBALANCE"
+    COMPUTE_1C2V_SUBCORE_IMBALANCE = "COMPUTE_1C2V_SUBCORE_IMBALANCE"
+    SRAM_REGISTER_SPILL_STACK = "SRAM_REGISTER_SPILL_STACK"
+    SRAM_UB_L1_BANK_CONFLICT = "SRAM_UB_L1_BANK_CONFLICT"
+    SYNC_PSEUDO_DOUBLE_BUFFER = "SYNC_PSEUDO_DOUBLE_BUFFER"
+    SYNC_BARRIER_SERIALIZATION = "SYNC_BARRIER_SERIALIZATION"
+    GRID_TAIL_WAVE_UNDERUTIL = "GRID_TAIL_WAVE_UNDERUTIL"
+
+
+SYMPTOM_FAMILY_TO_AXIS: dict[SymptomFamily, str] = {
+    SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP: "offchip_dma",
+    SymptomFamily.DMA_UNALIGNED_SHORT_BURST: "offchip_dma",
+    SymptomFamily.DMA_L2_THRASH_REUSE_MISS: "offchip_dma",
+    SymptomFamily.COMPUTE_VECTOR_LOOP_DEGRADED: "compute_issue",
+    SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT: "compute_issue",
+    SymptomFamily.COMPUTE_FIXPIPE_ACCUM_IMBALANCE: "compute_issue",
+    SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE: "compute_issue",
+    SymptomFamily.SRAM_REGISTER_SPILL_STACK: "onchip_sram_reg",
+    SymptomFamily.SRAM_UB_L1_BANK_CONFLICT: "onchip_sram_reg",
+    SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER: "pipeline_sync",
+    SymptomFamily.SYNC_BARRIER_SERIALIZATION: "pipeline_sync",
+    SymptomFamily.GRID_TAIL_WAVE_UNDERUTIL: "grid_wave",
+}
+
+SYMPTOM_FAMILY_TO_FACETS: dict[SymptomFamily, tuple[str, ...]] = {
+    SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP: (
+        "dma_and_cache_hierarchy",
+        "sram_layout_and_aliasing",
+        "pipeline_and_sync_graph",
+    ),
+    SymptomFamily.DMA_UNALIGNED_SHORT_BURST: (
+        "tile_and_stage_knobs",
+        "dma_and_cache_hierarchy",
+    ),
+    SymptomFamily.DMA_L2_THRASH_REUSE_MISS: (
+        "grid_and_workspace_topology",
+        "dma_and_cache_hierarchy",
+    ),
+    SymptomFamily.COMPUTE_VECTOR_LOOP_DEGRADED: (
+        "exec_mode_and_spr",
+        "alg_compute_and_monoid",
+    ),
+    SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT: (
+        "exec_mode_and_spr",
+        "tile_and_stage_knobs",
+    ),
+    SymptomFamily.COMPUTE_FIXPIPE_ACCUM_IMBALANCE: (
+        "tile_and_stage_knobs",
+        "sram_layout_and_aliasing",
+    ),
+    SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE: (
+        "grid_and_workspace_topology",
+        "pipeline_and_sync_graph",
+    ),
+    SymptomFamily.SRAM_REGISTER_SPILL_STACK: (
+        "tile_and_stage_knobs",
+        "exec_mode_and_spr",
+    ),
+    SymptomFamily.SRAM_UB_L1_BANK_CONFLICT: ("sram_layout_and_aliasing",),
+    SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER: (
+        "pipeline_and_sync_graph",
+        "sram_layout_and_aliasing",
+    ),
+    SymptomFamily.SYNC_BARRIER_SERIALIZATION: (
+        "pipeline_and_sync_graph",
+        "tile_and_stage_knobs",
+    ),
+    SymptomFamily.GRID_TAIL_WAVE_UNDERUTIL: (
+        "grid_and_workspace_topology",
+        "tile_and_stage_knobs",
+    ),
+}
 
 _BIN_OPS = {
     ast.Add: operator.add,
@@ -236,6 +320,8 @@ class AscendCausalRule:
     origin_operator: str = ""
     compatible_backends: tuple[str, ...] = ("tilelang_dsl", "ascendc_trackb", "hybrid_trackb")
     cpp20_transform_template: str = ""
+    symptom_family: str = ""
+    anti_precondition: str = "False"
 
     def __post_init__(self) -> None:
         if not self.rule_id or not self.transform_template.strip():
@@ -252,8 +338,21 @@ class AscendCausalRule:
         if not normalized_backends:
             raise ValueError("compatible_backends must contain at least one backend")
         object.__setattr__(self, "compatible_backends", normalized_backends)
+        cleaned_family = str(self.symptom_family or "").strip()
+        if cleaned_family:
+            try:
+                SymptomFamily(cleaned_family)
+            except ValueError as exc:
+                valid = tuple(fam.value for fam in SymptomFamily)
+                raise ValueError(
+                    f"invalid symptom_family {cleaned_family!r}; expected one of {valid}"
+                ) from exc
+        object.__setattr__(self, "symptom_family", cleaned_family)
+        anti_expr = str(self.anti_precondition or "False").strip() or "False"
+        object.__setattr__(self, "anti_precondition", anti_expr)
         validate_rule_predicate(self.regime_guard)
         validate_rule_predicate(self.precondition)
+        validate_rule_predicate(self.anti_precondition)
         validate_rule_predicate(self.expected_postcondition)
 
     def supports_backend(self, runtime_backend: str | None) -> bool:
@@ -291,9 +390,11 @@ class AscendCausalRule:
         )
 
     def matches(self, context: Mapping[str, object]) -> bool:
-        """Return whether both regime_guard and precondition hold in context."""
-        return safe_eval_predicate(self.regime_guard, context) and safe_eval_predicate(
-            self.precondition, context
+        """Return whether regime_guard and precondition hold while anti_precondition is false."""
+        return (
+            safe_eval_predicate(self.regime_guard, context)
+            and safe_eval_predicate(self.precondition, context)
+            and not safe_eval_predicate(self.anti_precondition, context)
         )
 
     def postcondition_realized(self, context: Mapping[str, object]) -> bool:
@@ -306,6 +407,8 @@ class AscendCausalRule:
             "rule_id": self.rule_id,
             "regime_guard": self.regime_guard,
             "precondition": self.precondition,
+            "anti_precondition": self.anti_precondition,
+            "symptom_family": self.symptom_family,
             "transform_template": self.transform_template,
             "expected_postcondition": self.expected_postcondition,
             "source_provenance": self.source_provenance,
@@ -345,6 +448,8 @@ class AscendCausalRule:
             origin_operator=str(entry.get("origin_operator", "") or ""),
             compatible_backends=backends,
             cpp20_transform_template=str(entry.get("cpp20_transform_template", "") or ""),
+            symptom_family=str(entry.get("symptom_family", "") or ""),
+            anti_precondition=str(entry.get("anti_precondition", "False") or "False"),
         )
 
 
@@ -377,6 +482,8 @@ _RESIDUAL_DEFAULTS: dict[str, int | float | bool | str] = {
     "measured_mte2_wait_ratio": 0.0,
     "measured_sync_stall_ratio": 0.0,
     "unexplained_gap_ratio": 0.0,
+    "transfer_inflation_ratio": 1.0,
+    "effective_compute_eta": 0.0,
     "pseudo_double_buffer_serialized": False,
     "spill_bytes": 0,
     "vloopv2_hit": True,
@@ -500,7 +607,9 @@ def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
     assert isinstance(ub_ns, dict)
     ub_peak = int(ub_ns["peak_allocated_bytes"])
     ub_cap = int(ub_ns["capacity_bytes"])
-    ns["ub_utilization_ratio"] = round(float(ub_peak) / float(max(1, ub_cap)), 6)
+    ub_ratio = round(float(ub_peak) / float(max(1, ub_cap)), 6) if ub_cap > 0 else 0.0
+    ns["ub_utilization_ratio"] = ub_ratio
+    ns["ub_occupancy_ratio"] = ub_ratio
     ns["implicit_bloat_bytes"] = total_bloat
     ns["degraded_buffer_count"] = degraded_total
     ns["any_overflow_bytes"] = any_overflow
@@ -635,6 +744,27 @@ def build_predicate_context(
     if residual is not None:
         res_defaults.update(_extract_typed_defaults(residual, _RESIDUAL_DEFAULTS))
         ctx.update(_extract_typed_defaults(residual, _TELEMETRY_CONTEXT_DEFAULTS))
+        embedded_obs = _embedded_observation(residual)
+        if embedded_obs is not None:
+            obs_payload = embedded_obs.to_dict()
+            dma_payload = obs_payload.get("offchip_dma")
+            compute_payload = obs_payload.get("compute_issue")
+            for key, axis_payload in (
+                ("transfer_inflation_ratio", dma_payload),
+                ("effective_compute_eta", compute_payload),
+            ):
+                if (
+                    isinstance(residual, Mapping)
+                    and key in residual
+                ) or (not isinstance(residual, Mapping) and hasattr(residual, key)):
+                    continue
+                raw_val = obs_payload.get(key)
+                if raw_val is None and isinstance(axis_payload, Mapping):
+                    raw_val = axis_payload.get(key)
+                    if raw_val is None:
+                        raw_val = axis_payload.get(f"l2_{key}")
+                if isinstance(raw_val, (int, float)) and not isinstance(raw_val, bool):
+                    res_defaults[key] = float(raw_val)
     ctx.update(res_defaults)
     ctx.update(_axis_gap_context(_axis_residuals(ledger, residual)))
 
@@ -657,6 +787,10 @@ def build_predicate_context(
 
     if extra:
         ctx.update(extra)
+        if "ub_occupancy_ratio" in extra and "ub_utilization_ratio" not in extra:
+            ctx["ub_utilization_ratio"] = float(extra["ub_occupancy_ratio"])
+        elif "ub_utilization_ratio" in extra and "ub_occupancy_ratio" not in extra:
+            ctx["ub_occupancy_ratio"] = float(extra["ub_utilization_ratio"])
         extra_axes = extra.get("topology_axes")
         if isinstance(extra_axes, Mapping):
             for ak in ("compute_engine", "memory_ring", "iteration_regularity"):
@@ -669,14 +803,332 @@ def build_predicate_context(
     return ctx
 
 
+def _read_signal_float(
+    mapping: Mapping[str, object],
+    *keys: str,
+    default: float = 0.0,
+) -> float:
+    for key in keys:
+        if key not in mapping:
+            continue
+        raw = mapping[key]
+        if isinstance(raw, bool):
+            continue
+        if isinstance(raw, (int, float)):
+            return float(raw)
+    return default
+
+
+def _read_signal_int(
+    mapping: Mapping[str, object],
+    *keys: str,
+    default: int = 0,
+) -> int:
+    for key in keys:
+        if key not in mapping:
+            continue
+        raw = mapping[key]
+        if isinstance(raw, bool):
+            continue
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, float):
+            return int(raw)
+    return default
+
+
+def _read_signal_bool(
+    mapping: Mapping[str, object],
+    *keys: str,
+    default: bool = False,
+) -> bool:
+    for key in keys:
+        if key not in mapping:
+            continue
+        return bool(mapping[key])
+    return default
+
+
+def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
+    payload = obs.to_dict()
+    compute = payload.get("compute_issue")
+    dma = payload.get("offchip_dma")
+    sram = payload.get("onchip_sram_reg")
+    sync = payload.get("pipeline_sync")
+    grid = payload.get("grid_irregularity")
+    compute_map = compute if isinstance(compute, Mapping) else {}
+    dma_map = dma if isinstance(dma, Mapping) else {}
+    sram_map = sram if isinstance(sram, Mapping) else {}
+    sync_map = sync if isinstance(sync, Mapping) else {}
+    grid_map = grid if isinstance(grid, Mapping) else {}
+
+    transfer_inflation = _read_signal_float(
+        payload,
+        "transfer_inflation_ratio",
+        default=_read_signal_float(
+            dma_map,
+            "transfer_inflation_ratio",
+            "l2_transfer_inflation_ratio",
+            default=1.0,
+        ),
+    )
+    effective_eta = _read_signal_float(
+        payload,
+        "effective_compute_eta",
+        default=_read_signal_float(
+            compute_map,
+            "effective_compute_eta",
+            "l2_effective_compute_eta",
+            default=0.0,
+        ),
+    )
+    sw_loops = _read_signal_int(compute_map, "l1_software_loops")
+    vl_loops = _read_signal_int(compute_map, "l1_vloopv2_loops")
+    return {
+        "transfer_inflation_ratio": transfer_inflation,
+        "effective_compute_eta": effective_eta,
+        "roofline_eta": _read_signal_float(compute_map, "l2_roofline_eta"),
+        "gm_roundtrip_bytes": _read_signal_int(dma_map, "l0_gm_roundtrip_bytes"),
+        "cube_to_vector_ratio": _read_signal_float(compute_map, "l0_cube_to_vec_ratio"),
+        "dominant_contig_bytes": _read_signal_int(dma_map, "l0_dominant_contig_bytes"),
+        "dma_burst_efficiency_ratio": _read_signal_float(
+            dma_map, "l0_dma_burst_efficiency", default=1.0
+        ),
+        "unaligned_dma_padding_bytes": _read_signal_int(dma_map, "l0_unaligned_padding_bytes"),
+        "mte2_inflight_per_aiv": _read_signal_int(dma_map, "l0_mte2_inflight_per_aiv"),
+        "l2_hit_rate": _read_signal_float(dma_map, "l2_cache_hit_rate", default=1.0),
+        "measured_mte2_wait_ratio": _read_signal_float(dma_map, "l2_mte2_wait_ratio"),
+        "vloopv2_hit": not (sw_loops > 0 and vl_loops == 0),
+        "vf_fusion_breaks": _read_signal_int(compute_map, "l1_vf_fusion_breaks"),
+        "dual_issue_ipc_collapse": _read_signal_float(compute_map, "l1_dual_issue_collapse"),
+        "measured_aiv_vec_ratio": _read_signal_float(compute_map, "l2_aiv_vec_ratio"),
+        "measured_aic_mac_ratio": _read_signal_float(compute_map, "l2_aic_mac_ratio"),
+        "aic_fixpipe_ratio": _read_signal_float(dma_map, "l2_fixpipe_ratio"),
+        "AIC.PIPE_M": _read_signal_int(compute_map, "l0_cube_cycles"),
+        "AIC.PIPE_FIX": 0,
+        "AIV0.PIPE_V": _read_signal_int(compute_map, "l0_vec_cycles"),
+        "AIV1.PIPE_V": _read_signal_int(compute_map, "l0_vec_cycles"),
+        "spill_bytes": _read_signal_int(sram_map, "l1_spill_bytes"),
+        "stack_bytes": _read_signal_int(sram_map, "l1_stack_bytes"),
+        "max_overflow_bytes": _read_signal_int(sram_map, "l0_max_overflow_bytes"),
+        "degraded_buffer_count": _read_signal_int(sram_map, "l0_degraded_single_buffers"),
+        "bank_conflict_ratio": _read_signal_float(sram_map, "l2_bank_conflict_ratio"),
+        "ub_bank_conflict_risk": _read_signal_float(sram_map, "l0_ub_bank_conflict_risk"),
+        "l1_bank_conflict_risk": _read_signal_float(sram_map, "l0_l1_bank_conflict_risk"),
+        "pseudo_double_buffer_serialized": _read_signal_bool(sync_map, "l2_pseudo_double_buffer"),
+        "alias_serialized_buffers": _read_signal_int(sync_map, "l1_alias_serialized_buffers"),
+        "measured_sync_stall_ratio": _read_signal_float(sync_map, "l2_sync_stall_ratio"),
+        "in_loop_pipe_all_barriers": _read_signal_int(sync_map, "l0_in_loop_pipe_all_barriers"),
+        "has_local_membar_in_vf_call": _read_signal_bool(sync_map, "l1_local_membar_in_vf"),
+        "wave_occupancy": _read_signal_float(grid_map, "l0_wave_occupancy", default=1.0),
+        "grid_blocks": _read_signal_int(grid_map, "l0_grid_blocks", default=0),
+        "num_aic_cores": 28,
+        "num_aiv_cores": 56,
+        "grid_is_symbolic": False,
+    }
+
+
+def rank_symptom_families(
+    obs_or_context: ObservationVector5D | Mapping[str, object],
+) -> list[tuple[SymptomFamily, float]]:
+    """Score and rank all 12 hardware SymptomFamily categories in descending severity."""
+    sig: Mapping[str, object] = (
+        _observation_to_signal_dict(obs_or_context)
+        if isinstance(obs_or_context, ObservationVector5D)
+        else obs_or_context
+    )
+
+    transfer_inflation = _read_signal_float(sig, "transfer_inflation_ratio", default=1.0)
+    effective_eta = _read_signal_float(sig, "effective_compute_eta", default=0.0)
+    roofline_eta = _read_signal_float(sig, "roofline_eta", default=0.0)
+    gm_roundtrip = _read_signal_int(sig, "gm_roundtrip_bytes")
+    cube_ratio = _read_signal_float(sig, "cube_to_vector_ratio")
+    contig_bytes = _read_signal_int(sig, "dominant_contig_bytes")
+    burst_eff = _read_signal_float(sig, "dma_burst_efficiency_ratio", default=1.0)
+    unaligned_pad = _read_signal_int(sig, "unaligned_dma_padding_bytes")
+    mte2_inflight = _read_signal_int(sig, "mte2_inflight_per_aiv")
+    l2_hit = _read_signal_float(sig, "l2_hit_rate", default=1.0)
+    mte2_wait = _read_signal_float(sig, "measured_mte2_wait_ratio", "mte2_wait_ratio")
+
+    vloopv2_hit = _read_signal_bool(sig, "vloopv2_hit", default=True)
+    vf_breaks = _read_signal_int(sig, "vf_fusion_breaks")
+    dual_collapse = _read_signal_float(sig, "dual_issue_ipc_collapse")
+    aiv_vec = _read_signal_float(sig, "measured_aiv_vec_ratio", "aiv_vec_ratio")
+    aic_mac = _read_signal_float(sig, "measured_aic_mac_ratio", "aic_mac_ratio")
+    fixpipe_ratio = _read_signal_float(sig, "aic_fixpipe_ratio", "aic_fixpipe")
+    pipe_m = _read_signal_int(sig, "AIC.PIPE_M", "PIPE_M")
+    pipe_fix = _read_signal_int(sig, "AIC.PIPE_FIX", "PIPE_FIX")
+    aiv0_v = _read_signal_int(sig, "AIV0.PIPE_V")
+    aiv1_v = _read_signal_int(sig, "AIV1.PIPE_V")
+
+    spill_bytes = _read_signal_int(sig, "spill_bytes")
+    stack_bytes = _read_signal_int(sig, "stack_bytes", "l1_stack_bytes")
+    max_overflow = _read_signal_int(sig, "max_overflow_bytes", "any_overflow_bytes")
+    degraded_bufs = _read_signal_int(sig, "degraded_buffer_count")
+    bank_conflict = _read_signal_float(sig, "bank_conflict_ratio")
+    ub_bank_risk = _read_signal_float(sig, "ub_bank_conflict_risk")
+    l1_bank_risk = _read_signal_float(sig, "l1_bank_conflict_risk")
+
+    pseudo_db = _read_signal_bool(sig, "pseudo_double_buffer_serialized")
+    alias_ser = _read_signal_int(sig, "alias_serialized_buffers")
+    sync_stall = _read_signal_float(sig, "measured_sync_stall_ratio", "sync_stall_ratio")
+    pipe_all = _read_signal_int(sig, "in_loop_pipe_all_barriers")
+    local_membar = _read_signal_bool(sig, "has_local_membar_in_vf_call")
+
+    wave_occ = _read_signal_float(sig, "wave_occupancy", default=1.0)
+    grid_blocks = _read_signal_int(sig, "grid_blocks")
+    num_aic = max(1, _read_signal_int(sig, "num_aic_cores", default=28))
+    num_aiv = max(1, _read_signal_int(sig, "num_aiv_cores", default=56))
+    grid_symbolic = _read_signal_bool(sig, "grid_is_symbolic")
+
+    inflation_score = (
+        min(1.0, 0.35 + 0.65 * min(1.0, (transfer_inflation - 1.30) / 1.70))
+        if transfer_inflation > 1.30
+        else 0.0
+    )
+    roundtrip_score = (
+        0.65 if (gm_roundtrip > 0 and cube_ratio > 0.0) else (0.45 if gm_roundtrip > 0 else 0.0)
+    )
+    dma_roundtrip_score = min(1.0, max(inflation_score, roundtrip_score))
+
+    short_burst_score = min(
+        1.0,
+        max(
+            max(0.0, 1.0 - burst_eff),
+            0.55 if (0 < contig_bytes < 16384) else 0.0,
+            0.65 if unaligned_pad > 0 else 0.0,
+            0.70 if mte2_inflight > 16 else 0.0,
+        ),
+    )
+
+    l2_thrash_score = 0.0
+    if transfer_inflation <= 1.30:
+        if l2_hit < 0.65:
+            l2_thrash_score = min(1.0, (1.0 - l2_hit) * (1.0 if mte2_wait >= 0.15 else 0.85))
+        elif l2_hit < 0.80 and mte2_wait > 0.20:
+            l2_thrash_score = min(1.0, max(1.0 - l2_hit, mte2_wait * 0.8))
+
+    vec_loop_score = min(
+        1.0,
+        max(
+            0.65 if not vloopv2_hit else 0.0,
+            min(1.0, 0.30 * float(vf_breaks)),
+            dual_collapse if dual_collapse > 0.25 else 0.0,
+        ),
+    )
+
+    compute_util = max(aiv_vec, aic_mac)
+    eff_eta_obs = effective_eta if effective_eta > 0.0 else roofline_eta
+    ineffective_compute_score = (
+        min(1.0, (1.0 - eff_eta_obs) * compute_util)
+        if (compute_util > 0.55 and 0.0 < eff_eta_obs < 0.30)
+        else 0.0
+    )
+
+    fixpipe_score = 0.0
+    if pipe_m > 0 and pipe_fix > 1.15 * float(pipe_m):
+        fixpipe_score = min(1.0, max(0.35, (float(pipe_fix) / float(pipe_m)) - 1.0))
+    elif fixpipe_ratio > 0.45 and aic_mac < 0.45:
+        fixpipe_score = min(1.0, fixpipe_ratio)
+
+    subcore_imbalance_score = 0.0
+    if aiv0_v > 0 and aiv1_v == 0:
+        subcore_imbalance_score = 0.80 if cube_ratio > 0.0 else 0.70
+
+    sram_spill_score = min(
+        1.0,
+        max(
+            min(1.0, float(spill_bytes) / 256.0) if spill_bytes > 0 else 0.0,
+            0.55 if stack_bytes > 0 else 0.0,
+            0.85 if max_overflow > 0 else 0.0,
+            0.65 if degraded_bufs > 0 else 0.0,
+        ),
+    )
+
+    bank_conflict_score = (
+        min(
+            1.0,
+            max(
+                bank_conflict if bank_conflict > 0.08 else 0.0,
+                ub_bank_risk,
+                l1_bank_risk,
+            ),
+        )
+        if spill_bytes == 0
+        else 0.0
+    )
+
+    pseudo_db_score = min(
+        1.0,
+        max(
+            0.75 if pseudo_db else 0.0,
+            min(1.0, 0.30 * float(alias_ser)),
+        ),
+    )
+
+    barrier_score = (
+        min(
+            1.0,
+            max(
+                sync_stall if sync_stall > 0.20 else 0.0,
+                0.65 if local_membar else 0.0,
+                0.55 if pipe_all > 0 else 0.0,
+            ),
+        )
+        if (not pseudo_db and alias_ser == 0)
+        else 0.0
+    )
+
+    wave_waste = (
+        (1.0 - wave_occ / float(math.ceil(wave_occ))) if wave_occ > 0.0 else 0.0
+    )
+    active_cores = num_aic if cube_ratio > 0.0 else num_aiv
+    underfill_score = (
+        max(0.0, 1.0 - float(grid_blocks) / float(active_cores))
+        if (not grid_symbolic and wave_occ > 0.0 and 0 < grid_blocks < active_cores)
+        else 0.0
+    )
+    grid_wave_score = min(
+        1.0,
+        max(
+            wave_waste if wave_waste > 0.18 else 0.0,
+            underfill_score if underfill_score > 0.18 else 0.0,
+        ),
+    )
+
+    scored: list[tuple[SymptomFamily, float]] = [
+        (SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP, round(dma_roundtrip_score, 6)),
+        (SymptomFamily.DMA_UNALIGNED_SHORT_BURST, round(short_burst_score, 6)),
+        (SymptomFamily.DMA_L2_THRASH_REUSE_MISS, round(l2_thrash_score, 6)),
+        (SymptomFamily.COMPUTE_VECTOR_LOOP_DEGRADED, round(vec_loop_score, 6)),
+        (SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT, round(ineffective_compute_score, 6)),
+        (SymptomFamily.COMPUTE_FIXPIPE_ACCUM_IMBALANCE, round(fixpipe_score, 6)),
+        (SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE, round(subcore_imbalance_score, 6)),
+        (SymptomFamily.SRAM_REGISTER_SPILL_STACK, round(sram_spill_score, 6)),
+        (SymptomFamily.SRAM_UB_L1_BANK_CONFLICT, round(bank_conflict_score, 6)),
+        (SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER, round(pseudo_db_score, 6)),
+        (SymptomFamily.SYNC_BARRIER_SERIALIZATION, round(barrier_score, 6)),
+        (SymptomFamily.GRID_TAIL_WAVE_UNDERUTIL, round(grid_wave_score, 6)),
+    ]
+    scored.sort(key=lambda item: (-item[1], item[0].value))
+    return scored
+
+
 def default_seed_rules_path() -> Path:
     """Return path to the bundled pure-English causal seed rule library."""
     return Path(__file__).resolve().with_name("seed_rules.yaml")
 
 
-def load_seed_rules(path: str | Path | None = None) -> tuple[AscendCausalRule, ...]:
+def load_seed_rules(
+    path: str | Path | None = None,
+    *,
+    require_symptom_family: bool | None = None,
+) -> tuple[AscendCausalRule, ...]:
     """Load and validate AscendCausalRule entries from YAML."""
     target_path = Path(path) if path is not None else default_seed_rules_path()
+    is_bundled_seed = (
+        path is None or target_path.resolve() == default_seed_rules_path().resolve()
+    )
     raw = yaml.safe_load(target_path.read_text(encoding="utf-8"))
     if isinstance(raw, Mapping) and "rules" in raw:
         items = raw["rules"]
@@ -686,7 +1138,18 @@ def load_seed_rules(path: str | Path | None = None) -> tuple[AscendCausalRule, .
         raise ValueError(f"invalid rules YAML root in {target_path}")
     rules: list[AscendCausalRule] = []
     for entry in items:
-        rules.append(AscendCausalRule.from_dict(entry))
+        rule = AscendCausalRule.from_dict(entry)
+        enforce_family = (
+            require_symptom_family
+            if require_symptom_family is not None
+            else (is_bundled_seed or not rule.source_provenance.startswith("flywheel:"))
+        )
+        if enforce_family and not rule.symptom_family:
+            raise ValueError(
+                f"seed rule {rule.rule_id!r} in {target_path} must declare a valid "
+                "non-empty symptom_family"
+            )
+        rules.append(rule)
     return tuple(rules)
 
 
@@ -701,11 +1164,15 @@ def save_rules_yaml(rules: tuple[AscendCausalRule, ...] | list[AscendCausalRule]
 
 __all__ = [
     "AscendCausalRule",
+    "SYMPTOM_FAMILY_TO_AXIS",
+    "SYMPTOM_FAMILY_TO_FACETS",
+    "SymptomFamily",
     "UnsafePredicateError",
     "build_predicate_context",
     "default_seed_rules_path",
     "load_seed_rules",
     "normalize_runtime_backend",
+    "rank_symptom_families",
     "safe_eval_predicate",
     "save_rules_yaml",
     "validate_rule_predicate",

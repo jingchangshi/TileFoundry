@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -37,6 +39,10 @@ from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
     compile_hir_blueprint,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
+from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
+    PyTorchSemanticAnalyzer,
+    RepresentativeCase,
+)
 from tilefoundry_ascend.ascend.target import AscendTarget
 
 
@@ -166,24 +172,124 @@ def _sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def _resolve_golden_entry_name(
+    source: str,
+    *,
+    entry_name: str | None,
+    proto: Mapping[str, object] | None,
+) -> str | None:
+    """Resolve the PyTorch golden entry function name from explicit args, proto, or AST."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    top_defs = [
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    if not top_defs:
+        return None
+    if entry_name and entry_name in top_defs:
+        return entry_name
+    if proto is not None:
+        raw_op = proto.get("operator")
+        proto_block = raw_op if isinstance(raw_op, Mapping) else proto
+        raw_name = proto_block.get("name")
+        if isinstance(raw_name, str) and raw_name in top_defs:
+            return raw_name
+    for name in top_defs:
+        if not name.startswith("_") and name != "get_input":
+            return name
+    return top_defs[0]
+
+
+def _derive_anchor_dims_from_case(
+    anchor_dims: Mapping[str, int] | None,
+    representative_case: RepresentativeCase | None,
+) -> dict[str, int]:
+    """Populate positive anchor dims from explicit dims or representative case shapes."""
+    dims = {str(k): int(v) for k, v in (anchor_dims or {}).items()}
+    if dims or representative_case is None or not representative_case.input_shapes:
+        return dims
+    shapes = representative_case.input_shapes
+    first = shapes[0]
+    if first:
+        dims["total_elements"] = math.prod(max(1, dim) for dim in first)
+        if len(first) >= 2:
+            dims["M"] = math.prod(max(1, dim) for dim in first[:-1])
+            dims["D"] = max(1, first[-1])
+            dims["rows"] = dims["M"]
+            dims["cols"] = dims["D"]
+            dims["K"] = max(1, first[-1])
+    if len(shapes) >= 2 and shapes[1]:
+        second = shapes[1]
+        if len(second) >= 2:
+            dims["N"] = max(1, second[-1])
+            if len(second) == 3:
+                dims["E"] = max(1, second[0])
+    return dims
+
+
 def _compile_blueprint_safe(
     hir_source: str,
     *,
     scheduled_hir_source: str | None = None,
     anchor_dims: Mapping[str, int] | None = None,
     target: AscendTarget | None = None,
+    entry_name: str | None = None,
+    proto: Mapping[str, object] | None = None,
+    representative_case: RepresentativeCase | Mapping[str, object] | None = None,
+    authored_hir_source: str | None = None,
+    dtype_bytes: float = 2.0,
 ) -> HirBlueprintPacket | None:
-    """Compile authored HIR and optional scheduled HIR into a dialect-neutral blueprint."""
-    if "@module" not in hir_source:
+    """Compile authored HIR or PyTorch golden source into a unified blueprint packet."""
+    if not hir_source.strip():
+        return None
+    if "@module" in hir_source:
+        try:
+            return compile_hir_blueprint(
+                hir_source,
+                scheduled_hir_source=scheduled_hir_source,
+                anchor_dims=anchor_dims,
+                target=target,
+            )
+        except (FileNotFoundError, OSError):
+            return None
+
+    resolved_entry = _resolve_golden_entry_name(
+        hir_source,
+        entry_name=entry_name,
+        proto=proto,
+    )
+    if resolved_entry is None:
         return None
     try:
-        return compile_hir_blueprint(
+        rep_case: RepresentativeCase | None
+        if isinstance(representative_case, RepresentativeCase):
+            rep_case = representative_case
+        elif isinstance(representative_case, Mapping):
+            rep_case = RepresentativeCase.from_case_entry(representative_case)
+        else:
+            rep_case = None
+        eff_dims = _derive_anchor_dims_from_case(anchor_dims, rep_case)
+        if not eff_dims:
+            return None
+        analyzer = PyTorchSemanticAnalyzer(target)
+        semantics = analyzer.analyze_source(
             hir_source,
-            scheduled_hir_source=scheduled_hir_source,
-            anchor_dims=anchor_dims,
-            target=target,
+            entry_name=resolved_entry,
+            proto=proto,
         )
-    except (FileNotFoundError, OSError):
+        return analyzer.build_universal_blueprint(
+            semantics,
+            eff_dims,
+            authored_hir_source=authored_hir_source,
+            scheduled_hir_source=scheduled_hir_source,
+            dtype_bytes=dtype_bytes,
+            representative_case=rep_case,
+        )
+    except (FileNotFoundError, OSError, SyntaxError, ValueError):
         return None
 
 
@@ -199,6 +305,10 @@ def _summarize_blueprint(packet: HirBlueprintPacket | None) -> dict[str, object]
             packet.reference_ledger.to_dict() if packet.reference_ledger is not None else None
         ),
         "lowering_diagnostics": list(packet.lowering_diagnostics),
+        "provenance": packet.provenance.to_dict() if packet.provenance is not None else None,
+        "schedule_delta": (
+            packet.schedule_delta.to_dict() if packet.schedule_delta is not None else None
+        ),
     }
 
 
@@ -251,13 +361,19 @@ async def synthesize_initial_dsl(
     scheduled_hir_source: str | None = None,
     anchor_dims: Mapping[str, int] | None = None,
     blueprint: HirBlueprintPacket | None = None,
+    proto: Mapping[str, object] | None = None,
+    representative_case: RepresentativeCase | Mapping[str, object] | None = None,
+    authored_hir_source: str | None = None,
 ) -> tuple[str, FunnelEvaluation]:
-    """Synthesize and funnel-validate an initial @T.prim_func seed from HIR source."""
+    """Synthesize and funnel-validate an initial @T.prim_func seed from HIR or golden source."""
     active_packet = blueprint or _compile_blueprint_safe(
         hir_source,
         scheduled_hir_source=scheduled_hir_source,
         anchor_dims=anchor_dims,
         target=target,
+        proto=proto,
+        representative_case=representative_case,
+        authored_hir_source=authored_hir_source,
     )
     eval_funnel = (
         GateFunnel(
@@ -477,8 +593,11 @@ async def run_e2e_evolution(
     enable_track_router: bool = False,
     scheduled_hir_source: str | None = None,
     anchor_dims: Mapping[str, int] | None = None,
+    proto: Mapping[str, object] | None = None,
+    representative_case: RepresentativeCase | Mapping[str, object] | None = None,
+    authored_hir_source: str | None = None,
 ) -> EvolutionTrajectory:
-    """Drive dual-loop causal + creative evolution from unscheduled HIR to converged DSL."""
+    """Drive dual-loop causal + creative evolution from golden or HIR to converged DSL."""
     active_tracker = tracker or BayesianRuleTracker.from_seed_yaml()
     active_beam = beam or TwoLaneBeamSearch()
     blueprint = _compile_blueprint_safe(
@@ -486,6 +605,10 @@ async def run_e2e_evolution(
         scheduled_hir_source=scheduled_hir_source,
         anchor_dims=anchor_dims,
         target=target,
+        entry_name=problem_name,
+        proto=proto,
+        representative_case=representative_case,
+        authored_hir_source=authored_hir_source,
     )
     ideal_roofline_us = blueprint.roofline.ideal_roofline_us if blueprint is not None else 0.0
     active_funnel = _wrap_funnel_with_proxy(

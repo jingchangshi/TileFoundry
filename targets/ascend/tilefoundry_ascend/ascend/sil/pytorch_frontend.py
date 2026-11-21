@@ -10,10 +10,13 @@ from typing import Literal
 
 from tilefoundry.ir.types import DType
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
+    BlueprintProvenance,
+    BlueprintScheduleDelta,
     HirBlueprintPacket,
     HirRooflineSummary,
-    compile_hir_blueprint,
+    compile_hir_schedule_delta,
 )
+from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.sil.schema import (
     CasePhysicsKind,
     CasePhysicsRatios,
@@ -133,7 +136,7 @@ _LOW_PRECISION_DTYPE_ATTRS = frozenset(
 )
 _DIM_KEYWORDS = frozenset({"dim", "axis"})
 _TRANSCENDENTAL_OP_EQUIV = 8
-TrafficBasis = Literal["provable_lower_bound", "estimated"]
+TrafficBasis = Literal["declared_io_exact", "estimated_shape_dtype"]
 ComputeBasis = Literal["exact_work_count", "estimated"]
 _ProvenanceFlag = Literal["input", "reduction"]
 _PROVENANCE_INPUT: _ProvenanceFlag = "input"
@@ -814,9 +817,9 @@ def _priced_traffic(
         math.ceil(sum(charge.element_count * charge.element_bytes for charge in charges))
     )
     traffic_basis: TrafficBasis = (
-        "provable_lower_bound"
+        "declared_io_exact"
         if not packed and all(charge.dtype_declared for charge in charges)
-        else "estimated"
+        else "estimated_shape_dtype"
     )
     return total_bytes, traffic_basis
 
@@ -983,23 +986,14 @@ class PyTorchSemanticAnalyzer:
         dtype_bytes: float = 2.0,
         representative_case: RepresentativeCase | None = None,
     ) -> HirBlueprintPacket:
-        """Build an HIR blueprint packet from authored HIR or honest analytical Roofline work.
+        """Build a semantic-first blueprint anchored to real dimensions and optional HIR delta.
 
-        With ``representative_case``, analytical traffic sums every declared input shape at its
-        own dtype and prices the output at its declared dtype. Absent or unknown input dtypes,
-        sub-byte packing, block quantization, and undeclared output dtypes force an estimated
-        traffic basis; only fully declared traffic is a provable lower bound. Authored HIR keeps
-        its own ledger and ignores the representative case.
+        Authoritative Roofline floors always derive from *semantics*, *anchor_dims*, and
+        *representative_case*. When *authored_hir_source* is supplied, optional schedule
+        enrichment attaches via ``schedule_delta`` without overwriting ``roofline``.
         """
         element_bytes = _validated_dtype_bytes(dtype_bytes)
         dims = {str(key): int(value) for key, value in anchor_dims.items()}
-        if authored_hir_source is not None and authored_hir_source.strip():
-            return compile_hir_blueprint(
-                authored_hir_source,
-                scheduled_hir_source=scheduled_hir_source,
-                anchor_dims=dims,
-                target=self.target,
-            )
         work = self._estimate_analytical_work(
             semantics, dims, element_bytes, representative_case
         )
@@ -1049,37 +1043,48 @@ class PyTorchSemanticAnalyzer:
             cube_floor_us=cube_floor_us,
             vec_floor_us=vec_floor_us,
         )
-        if work.traffic_basis == "estimated":
-            roofline_class = "analytical_estimate"
-        elif work.compute_basis == "exact_work_count":
-            roofline_class = "analytical_exact"
-        else:
-            roofline_class = "analytical_lower_bound"
+        has_authored_hir = bool(authored_hir_source is not None and authored_hir_source.strip())
+        has_scheduled_hir = bool(
+            has_authored_hir
+            and scheduled_hir_source is not None
+            and scheduled_hir_source.strip()
+        )
+        schedule_delta: BlueprintScheduleDelta | None = None
+        reference_ledger: ObjectivePhysicalLedger | None = None
+        diagnostics: tuple[str, ...] = ("analytical_pytorch_frontend",)
+        if has_authored_hir:
+            assert authored_hir_source is not None
+            schedule_delta, reference_ledger, hir_diags = compile_hir_schedule_delta(
+                authored_hir_source,
+                scheduled_hir_source=scheduled_hir_source if has_scheduled_hir else None,
+                anchor_dims=dims,
+                target=self.target,
+            )
+            if hir_diags:
+                diagnostics = (*diagnostics, *hir_diags)
+        provenance = BlueprintProvenance(
+            semantic_source=(
+                "pytorch_golden_plus_hir" if has_authored_hir else "pytorch_golden"
+            ),
+            traffic_basis=work.traffic_basis,
+            coordinate_scope="representative_anchor",
+            has_authored_hir=has_authored_hir,
+            has_scheduled_hir=has_scheduled_hir,
+        )
         return HirBlueprintPacket(
             entry_name=semantics.entry_name,
             roofline=roofline,
-            z3_pipeline_summary={
-                "source": "pytorch_semantic_frontend",
-                "topology": semantics.base_axes.key(),
-                "work_model": work.work_model,
-                "dtype_bytes": element_bytes,
-                "representative_case_id": (
-                    representative_case.case_id if representative_case is not None else None
-                ),
-                "roofline_class": roofline_class,
-                "traffic_basis": work.traffic_basis,
-                "compute_basis": work.compute_basis,
-                "has_online_exp_max": semantics.has_online_exp_max,
-                "has_indirect_index": semantics.has_indirect_index,
-                "has_subbyte_or_block_quant": semantics.has_subbyte_or_block_quant,
-            },
-            reference_ledger=None,
-            lowering_diagnostics=("analytical_pytorch_frontend",),
+            reference_ledger=reference_ledger,
+            lowering_diagnostics=diagnostics,
             requested_anchor_dims=dict(dims),
             resolved_hir_dims=dict(work.resolved_dims),
             shape_exact_match=True,
             fallback_reason=None,
+            provenance=provenance,
+            schedule_delta=schedule_delta,
         )
+
+    build_blueprint = build_universal_blueprint
 
     def _estimate_analytical_work(
         self,
@@ -1359,7 +1364,18 @@ def _stream_work(
         raise ValueError(
             "analytical Roofline requires total_elements, M x D, or rows x cols anchor dims"
         )
-    resolved_dims = {"elements": elements}
+    resolved_dims: dict[str, int] = {"elements": elements}
+    if "M" in dims and "D" in dims and dims["M"] > 0 and dims["D"] > 0:
+        resolved_dims["M"] = dims["M"]
+        resolved_dims["D"] = dims["D"]
+    elif "rows" in dims and "cols" in dims and dims["rows"] > 0 and dims["cols"] > 0:
+        resolved_dims["rows"] = dims["rows"]
+        resolved_dims["cols"] = dims["cols"]
+    elif representative_case is not None and representative_case.input_shapes:
+        first_shape = representative_case.input_shapes[0]
+        if len(first_shape) >= 2 and all(dim > 0 for dim in first_shape):
+            resolved_dims["rows"] = math.prod(first_shape[:-1])
+            resolved_dims["cols"] = first_shape[-1]
     ops_per_element = 3 if kind == "reduction" else 1
     special_ops = elements if semantics.has_online_exp_max else 0
     vector_flops = ops_per_element * elements + special_ops * _TRANSCENDENTAL_OP_EQUIV
