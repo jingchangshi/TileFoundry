@@ -245,3 +245,4 @@ examples/*
 examples/ascend950pr_ops/**/__pycache__/
 CLAUDE.local.md
 AGENTS.md
+.gemini/

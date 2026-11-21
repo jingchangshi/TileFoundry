@@ -22,6 +22,7 @@ MAX_PROSE_LINES = 8
 MAX_COLUMNS = 100
 MAX_ASSERT_MESSAGE = 100
 EXEMPT_PREFIXES = (
+    "tests/ascend/benchmarks/",
     "tests/nvidia/cuda/models/",
     "tests/core/models/decode_oracle.py",
     "tests/core/models/dense_decode.py",

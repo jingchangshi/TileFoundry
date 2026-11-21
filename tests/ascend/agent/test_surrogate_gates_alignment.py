@@ -412,7 +412,7 @@ def _v2_handler(
     doctor_payload = dict(doctor or {"status": "PASS"})
 
     def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
-        _ = (cwd, timeout, kwargs)
+        _ = (cwd, env, timeout, kwargs)
         cmd_list = [str(part) for part in cmd]
         calls.append(cmd_list)
         command = cmd_list[1]
@@ -440,6 +440,47 @@ def _fast_response(
     request_sha256: str,
     tamper: str = "",
 ) -> dict[str, object]:
+    if request.get("mode") == "micro_probe":
+        probe = request["probe"]
+        staged = request["candidates"]
+        assert isinstance(probe, Mapping)
+        assert isinstance(staged, list)
+        probe_bindings: dict[str, dict[str, str]] = {}
+        for row in staged:
+            assert isinstance(row, Mapping)
+            candidate_id = str(row["candidate_id"])
+            probe_bindings[candidate_id] = {
+                "module_path": str(row["module_path"]),
+                "sha256": str(row["sha256"]),
+                "post_sha256": str(row["sha256"]),
+            }
+        assert set(probe_bindings) == {"baseline", "optimized"}
+        return {
+            "schema": surrogate_cannbench.FAST_RESPONSE_SCHEMA,
+            "request_id": request["request_id"],
+            "request_sha256": request_sha256,
+            "mode": "micro_probe",
+            "status": "ok",
+            "error": "",
+            "operators": {},
+            "msprof_telemetry": {},
+            "candidates": {"micro_probe": probe_bindings},
+            "coverage": {
+                "expected_candidates": 2,
+                "evaluated_candidates": 2,
+                "expected_msprof_targets": 0,
+                "observed_msprof_targets": 0,
+            },
+            "micro_probe": {
+                "probe_id": str(probe["probe_id"]),
+                "metrics": {
+                    "baseline_dur_us": 10.0,
+                    "optimized_dur_us": 8.0,
+                    "speedup": 1.25,
+                    "numerical_ok": 1.0,
+                },
+            },
+        }
     batches = request.get("batches") or []
     targets = request.get("msprof_targets") or []
     assert isinstance(batches, list)
@@ -531,7 +572,7 @@ def _fast_gate_run(
     *,
     tamper: str = "",
     satisfied: bool = True,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     monkeypatch.setenv("AGENT_GATES_CONFIG", str(_agent_gates_config(root)))
     monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
     monkeypatch.setattr(
@@ -539,17 +580,11 @@ def _fast_gate_run(
         "_agent_gates_evidence_root",
         lambda: root / "v2-evidence",
     )
-    monkeypatch.setattr(
-        surrogate_cannbench,
-        "verify_agent_gates_receipt",
-        lambda *_a, **_kw: (True, ""),
-    )
     calls: list[dict[str, Any]] = []
     requests: list[dict[str, Any]] = []
-    env_texts: list[str] = []
 
     def _fake_run(cmd, *, cwd, env, timeout, **kwargs):
-        _ = (cwd, timeout, kwargs)
+        _ = (cwd, env, timeout, kwargs)
         cmd_list = [str(part) for part in cmd]
         calls.append({"cmd": cmd_list, "env": dict(env)})
         command = cmd_list[1]
@@ -599,26 +634,10 @@ def _fast_gate_run(
             )
         if command == "verify-requirements":
             return _completed(cmd_list, _verified(root, satisfied=satisfied))
-        if command == "run":
-            env_file = Path(cmd_list[cmd_list.index("--env-file") + 1])
-            env_texts.append(env_file.read_text(encoding="utf-8"))
-            request_path = Path(str(env["TF_MICRO_PROBE_REQUEST"]))
-            request = json.loads(request_path.read_text(encoding="utf-8"))
-            Path(str(request["response_path"])).write_text(
-                '{"metrics": {"speedup": 1.25}}', encoding="utf-8"
-            )
-            return _completed(
-                cmd_list,
-                {
-                    "status": "PASS",
-                    "runId": "run-probe",
-                    "receiptPath": "/receipt-probe.json",
-                },
-            )
         raise AssertionError(cmd_list)
 
     monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_run)
-    return calls, requests, env_texts
+    return calls, requests
 
 
 class _JumpClock:
@@ -655,7 +674,7 @@ def test_l2_fast_contract_is_workspace_relative_and_sha_bound(
     monkeypatch.setattr(
         surrogate_cannbench, "prewarm_surrogate_tilelang_cache", _record_tilelang
     )
-    calls, requests, env_texts = _fast_gate_run(tmp_path, monkeypatch)
+    calls, requests = _fast_gate_run(tmp_path, monkeypatch)
     candidate = tmp_path / "candidate.py"
     candidate.write_text("x = 1\n", encoding="utf-8")
     anchors = [_anchor(), _anchor(case_num=3)]
@@ -692,6 +711,8 @@ def test_l2_fast_contract_is_workspace_relative_and_sha_bound(
         factory_name="entry",
         baseline_probe_source="x = 1\n",
         optimized_probe_source="x = 2\n",
+        line_count_baseline=1,
+        line_count_optimized=1,
         tensor_shape=(16, 128),
         tensor_dtype="float32",
     )
@@ -706,32 +727,25 @@ def test_l2_fast_contract_is_workspace_relative_and_sha_bound(
     batch_commands = calls[:5]
     profile_commands = calls[5:10]
     probe_commands = calls[10:]
-    assert [call["cmd"][1] for call in batch_commands] == [
-        "doctor",
-        "submit",
-        "wait",
-        "report",
-        "verify-requirements",
-    ]
-    for group in (batch_commands, profile_commands):
+    for group in (batch_commands, profile_commands, probe_commands):
+        assert [call["cmd"][1] for call in group] == [
+            "doctor",
+            "submit",
+            "wait",
+            "report",
+            "verify-requirements",
+        ]
         for call in group:
             assert "--env-file" not in call["cmd"]
             assert surrogate_cannbench.FAST_REQUEST_ENV not in call["env"]
             assert "TF_SURROGATE_BATCH_REQUEST" not in call["env"]
+            assert "TF_MICRO_PROBE_REQUEST" not in call["env"]
             assert "TILEFOUNDRY_NPU_MSPROF_LOCK" not in call["env"]
         for index in (0, 1, 4):
             cmd = group[index]["cmd"]
             assert cmd[cmd.index("--gate") + 1] == _FAST_GATE
-    assert len(probe_commands) == 1
-    probe_cmd = probe_commands[0]["cmd"]
-    assert probe_cmd[1] == "run"
-    assert probe_cmd[probe_cmd.index("--gate") + 1] == _FAST_GATE
-    assert "TF_MICRO_PROBE_REQUEST" in probe_commands[0]["env"]
-    assert len(env_texts) == 1
-    assert "TILEFOUNDRY_NPU_DEVICE_TESTS" in env_texts[0]
-    assert "TILEFOUNDRY_NPU_CPU_TESTS" not in env_texts[0]
 
-    batch_request, profile_request = requests
+    batch_request, profile_request, probe_request = requests
     request_root = tmp_path / "build" / "agent_gates" / "fast"
     batch_id = str(batch_request["request_id"])
     batch_submit = batch_commands[1]["cmd"]
@@ -816,6 +830,40 @@ def test_l2_fast_contract_is_workspace_relative_and_sha_bound(
         assert not Path(str(row["module_path"])).is_absolute()
         assert row["sha256"] == hashlib.sha256(
             (tmp_path / str(row["module_path"])).read_bytes()
+        ).hexdigest()
+
+    probe_request_id = str(probe_request["request_id"])
+    probe_submit = probe_commands[1]["cmd"]
+    assert probe_submit[probe_submit.index("--target") + 1] == f"fast/{probe_request_id}"
+    assert probe_request["mode"] == "micro_probe"
+    assert probe_request["probe"] == {
+        "probe_id": "probe",
+        "probe_kind": "vector",
+        "factory_name": "entry",
+        "line_count_baseline": 1,
+        "line_count_optimized": 1,
+        "tensor_shape": [16, 128],
+        "tensor_dtype": "float32",
+        "min_speedup": 1.08,
+    }
+    probe_entries = {
+        str(entry["candidate_id"]): entry for entry in probe_request["candidates"]
+    }
+    assert set(probe_entries) == {"baseline", "optimized"}
+    for candidate_id, expected_source in (
+        ("baseline", "x = 1\n"),
+        ("optimized", "x = 2\n"),
+    ):
+        entry = probe_entries[candidate_id]
+        assert not Path(str(entry["module_path"])).is_absolute()
+        assert str(entry["module_path"]).startswith(
+            f"build/agent_gates/fast/{probe_request_id}/candidates/micro_probe/"
+        )
+        staged_probe = tmp_path / str(entry["module_path"])
+        assert staged_probe.read_text(encoding="utf-8") == expected_source
+        assert staged_probe.stat().st_mode & 0o777 == 0o444
+        assert entry["sha256"] == hashlib.sha256(
+            staged_probe.read_bytes()
         ).hexdigest()
 
     env_file.write_text(

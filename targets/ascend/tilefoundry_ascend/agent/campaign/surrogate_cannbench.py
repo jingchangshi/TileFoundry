@@ -20,6 +20,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 import yaml
 
@@ -45,7 +46,6 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     build_stage_b_driver_source,
     run_stage_a_static,
     run_stage_b_compile,
-    verify_agent_gates_receipt,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     KernelLLMBackend,
@@ -632,11 +632,15 @@ def run_l1_compile_check(
                 env=run_env,
                 timeout=timeout_sec,
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            captured = "".join(
+                part for part in (exc.stdout, exc.stderr) if isinstance(part, str)
+            )
             return StageBResult(
                 passed=False,
                 error_message=f"l1_compile_timeout:{timeout_sec}s",
                 elapsed_sec=time.monotonic() - t0,
+                full_diagnostic=captured,
             )
         lowered_dump = (
             kernel_dump_path.read_text(encoding="utf-8", errors="ignore")
@@ -654,7 +658,8 @@ def run_l1_compile_check(
         else None
     )
     if proc.returncode != 0:
-        detail = _bounded_compile_diagnostic(proc.stderr or proc.stdout or "")
+        raw_diagnostic = proc.stderr or proc.stdout or ""
+        detail = _bounded_compile_diagnostic(raw_diagnostic)
         return StageBResult(
             passed=False,
             error_message=f"l1_compile_failed (rc={proc.returncode}): {detail}",
@@ -663,6 +668,7 @@ def run_l1_compile_check(
             vloopv2_hit=vloopv2_hit,
             compiler_summary=summary,
             microarch_profile=ma_profile,
+            full_diagnostic=raw_diagnostic,
         )
     return StageBResult(
         passed=True,
@@ -672,6 +678,11 @@ def run_l1_compile_check(
         compiler_summary=summary,
         microarch_profile=ma_profile,
     )
+
+
+def _repair_timeout_message(error_message: str, is_transport: bool) -> str:
+    """Append the repair timeout marker while preserving the original failure tier."""
+    return f"{error_message} [repair_timeout]" if is_transport else error_message
 
 
 async def run_l0_l1_round_filter(
@@ -744,11 +755,11 @@ async def run_l0_l1_round_filter(
                         L0L1CandidateCheck(
                             candidate_id=cand_id,
                             passed=False,
-                            failed_tier="llm_transport" if is_transport else "stage_a",
+                            failed_tier="stage_a",
                             patched_module_source="",
                             snippet_source=snippet,
                             repaired=is_repaired,
-                            error_message=rep_err,
+                            error_message=_repair_timeout_message(rep_err, is_transport),
                         ),
                         None,
                     )
@@ -779,12 +790,12 @@ async def run_l0_l1_round_filter(
                         L0L1CandidateCheck(
                             candidate_id=cand_id,
                             passed=False,
-                            failed_tier="llm_transport" if is_transport else "stage_a",
+                            failed_tier="stage_a",
                             patched_module_source=patched,
                             snippet_source=snippet,
                             repaired=is_repaired,
                             stage_a=stage_a,
-                            error_message=rep_err,
+                            error_message=_repair_timeout_message(rep_err, is_transport),
                         ),
                         None,
                     )
@@ -838,13 +849,13 @@ async def run_l0_l1_round_filter(
                 return L0L1CandidateCheck(
                     candidate_id=cand_id,
                     passed=False,
-                    failed_tier="llm_transport" if is_transport else "stage_b",
+                    failed_tier="stage_b",
                     patched_module_source=cur_patched,
                     snippet_source=cur_snippet,
                     repaired=cur_repaired,
                     stage_a=cur_stage_a,
                     stage_b=stage_b,
-                    error_message=rep_err,
+                    error_message=_repair_timeout_message(rep_err, is_transport),
                 )
             failed_chk, passed_state = await _run_stage_a_phase(
                 cand_id,
@@ -2976,8 +2987,22 @@ def run_l3_full_contract_via_agent_gates(
     )
 
 
+class MicroProbeSources(Protocol):
+    """Metadata and the two probe source texts a hardware request carries."""
+
+    probe_id: str
+    probe_kind: str
+    factory_name: str
+    baseline_probe_source: str
+    optimized_probe_source: str
+    line_count_baseline: int
+    line_count_optimized: int
+    tensor_shape: tuple[int, ...]
+    tensor_dtype: str
+
+
 def _prewarm_micro_probe_cache(
-    spec: object,
+    spec: MicroProbeSources,
     *,
     source_root: Path,
     env_file: Path,
@@ -3006,10 +3031,10 @@ def _prewarm_micro_probe_cache(
         pp_parts.insert(0, tl_source)
     run_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
 
-    factory_name = str(getattr(spec, "factory_name"))
+    factory_name = spec.factory_name
     sources = (
-        ("base", str(getattr(spec, "baseline_probe_source"))),
-        ("opt", str(getattr(spec, "optimized_probe_source"))),
+        ("base", spec.baseline_probe_source),
+        ("opt", spec.optimized_probe_source),
     )
     script = (
         "import importlib, importlib.util, os, sys, tempfile\n"
@@ -3061,7 +3086,7 @@ def _prewarm_micro_probe_cache(
 
 
 def run_micro_probe_via_agent_gates(
-    spec: object,
+    spec: MicroProbeSources,
     *,
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
@@ -3070,11 +3095,12 @@ def run_micro_probe_via_agent_gates(
     timeout_sec: int = 360,
     prewarm_cache: bool = True,
 ) -> dict[str, float]:
-    """Run hardware micro-probe verification strictly through AgentGates NPU lease."""
+    """Run hardware micro-probe verification through a typed AgentGates fast request."""
     root = Path(source_root).resolve() if source_root is not None else default_source_root()
     resolved_env = _resolve_env_file_path(env_file)
     ag_bin = _resolve_agent_gates_bin(root)
-    tl_cache_dir = _default_surrogate_tl_cache_dir()
+    env_vals = parse_simple_env_file(resolved_env)
+    _reference_cache_dir, tl_cache_dir = _fast_cache_roots(root, env_vals)
 
     if prewarm_cache:
         _prewarm_micro_probe_cache(
@@ -3084,93 +3110,89 @@ def run_micro_probe_via_agent_gates(
             tl_cache_dir=tl_cache_dir,
         )
 
-    fail_closed = {
-        "baseline_dur_us": 0.0,
-        "optimized_dur_us": 0.0,
-        "speedup": 0.0,
-        "numerical_ok": 0.0,
-    }
-    with tempfile.TemporaryDirectory(prefix="tf_probe_gate_") as tmp_dir:
-        tmp = Path(tmp_dir)
-        request_path = tmp / "micro_probe_request.json"
-        response_path = tmp / "micro_probe_response.json"
-        tmp_env = _write_temp_env_file(
-            resolved_env,
-            tmp / "env.sh",
-            {
-                "TILEFOUNDRY_NPU_DEVICE_TESTS": "tests/ascend/agent/test_surrogate_batch_npu.py",
-            },
+    request_root = _fast_request_root(root, env_vals)
+    request_id = uuid.uuid4().hex
+    request_dir = request_root / request_id
+    request_path = request_root / f"{request_id}.request.json"
+    response_path = request_root / f"{request_id}.response.json"
+
+    staged: dict[str, dict[str, dict[str, str]]] = {"micro_probe": {}}
+    entries: list[dict[str, str]] = []
+    for index, (candidate_id, source_text) in enumerate(
+        (
+            ("baseline", spec.baseline_probe_source),
+            ("optimized", spec.optimized_probe_source),
         )
-        payload = {
-            "probe_id": str(getattr(spec, "probe_id")),
-            "probe_kind": str(getattr(spec, "probe_kind")),
-            "factory_name": str(getattr(spec, "factory_name")),
-            "baseline_probe_source": str(getattr(spec, "baseline_probe_source")),
-            "optimized_probe_source": str(getattr(spec, "optimized_probe_source")),
-            "line_count_baseline": int(getattr(spec, "line_count_baseline", 0)),
-            "line_count_optimized": int(getattr(spec, "line_count_optimized", 0)),
-            "tensor_shape": [int(x) for x in getattr(spec, "tensor_shape", (16, 128))],
-            "tensor_dtype": str(getattr(spec, "tensor_dtype", "float32")),
-            "min_speedup": float(min_speedup),
-            "tilelang_cache_dir": str(tl_cache_dir),
-            "response_path": str(response_path),
+    ):
+        staged_path = (
+            request_dir / "candidates" / "micro_probe" / f"{index:03d}_{candidate_id}.py"
+        )
+        staged_path.parent.mkdir(parents=True, exist_ok=True)
+        staged_path.write_text(source_text, encoding="utf-8")
+        staged_path.chmod(0o444)
+        relative = staged_path.relative_to(root).as_posix()
+        digest = _sha256_file(staged_path)
+        staged["micro_probe"][candidate_id] = {
+            "module_path": relative,
+            "sha256": digest,
         }
-        request_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        cmd = [
-            ag_bin,
-            "run",
-            "--adapter",
-            "tilefoundry-npu",
-            "--source",
-            str(root),
-            "--env-file",
-            str(tmp_env),
-            "--device-id",
-            str(device_id),
-            "--gate",
-            "tilefoundry-npu-device-fast",
-            "--json",
-        ]
-        sub_env = _clean_agent_gates_subprocess_env(
-            {
-                "TF_MICRO_PROBE_REQUEST": str(request_path),
-                "TF_SURROGATE_TL_CACHE_DIR": str(tl_cache_dir),
-            }
+        entries.append(
+            {"candidate_id": candidate_id, "module_path": relative, "sha256": digest}
         )
-        proc, parsed = _run_agent_gates_cmd(
-            cmd,
-            cwd=str(root),
-            env=sub_env,
-            timeout_sec=timeout_sec,
+
+    payload: dict[str, object] = {
+        "schema": FAST_REQUEST_SCHEMA,
+        "request_id": request_id,
+        "mode": "micro_probe",
+        "warmup": 1,
+        "repeat": 1,
+        "require_all_passed": False,
+        "response_path": response_path.relative_to(root).as_posix(),
+        "probe": {
+            "probe_id": spec.probe_id,
+            "probe_kind": spec.probe_kind,
+            "factory_name": spec.factory_name,
+            "line_count_baseline": int(spec.line_count_baseline),
+            "line_count_optimized": int(spec.line_count_optimized),
+            "tensor_shape": [int(dim) for dim in spec.tensor_shape],
+            "tensor_dtype": spec.tensor_dtype,
+            "min_speedup": float(min_speedup),
+        },
+        "candidates": entries,
+    }
+    request_sha256 = _write_fast_request(request_path, payload)
+    raw_resp, _execution = _submit_fast_gate(
+        agent_gates_bin=ag_bin,
+        root=root,
+        workspace=_agent_gates_workspace_name(root),
+        request_id=request_id,
+        request_relative_path=request_path.relative_to(root).as_posix(),
+        request_path=request_path,
+        response_path=response_path,
+        request_sha256=request_sha256,
+        mode="micro_probe",
+        timeout_sec=float(timeout_sec),
+        device_id=str(device_id),
+    )
+    _verify_fast_bindings(raw_resp, staged)
+    _verify_fast_coverage(raw_resp, expected_candidates=2, expected_msprof_targets=0)
+    probe_row = _fast_response_mapping(raw_resp, "micro_probe")
+    if probe_row.get("probe_id") != spec.probe_id:
+        raise RuntimeError(
+            "fast micro-probe response probe_id "
+            f"{probe_row.get('probe_id')!r} != {spec.probe_id!r}"
         )
-        run_id = str(parsed.get("runId", ""))
-        run_passed = proc.returncode == 0 and parsed.get("status") == "PASS"
-        if run_passed:
-            verified, verify_error = (
-                verify_agent_gates_receipt(ag_bin, run_id, source_root=root)
-                if run_id
-                else (False, "AgentGates micro-probe reported PASS without a runId")
-            )
-            if not verified:
-                logger.warning(
-                    "AgentGates micro-probe receipt verification failed: %s",
-                    verify_error or "unknown failure",
-                )
-                return fail_closed
-        if not response_path.is_file():
-            logger.warning(
-                "AgentGates micro-probe missing response (rc=%s): %s",
-                proc.returncode,
-                (proc.stderr or proc.stdout or "")[-400:],
-            )
-            return fail_closed
-        raw_resp = json.loads(response_path.read_text(encoding="utf-8"))
-        metrics_raw = raw_resp.get("metrics") or {}
-        return {
-            str(k): float(v)
-            for k, v in metrics_raw.items()
-            if isinstance(v, (int, float)) and not isinstance(v, bool)
-        } or fail_closed
+    metrics_raw = probe_row.get("metrics")
+    if not isinstance(metrics_raw, Mapping):
+        raise RuntimeError("fast micro-probe response metrics must be a mapping")
+    metrics = {
+        str(key): float(value)
+        for key, value in metrics_raw.items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    }
+    if not metrics:
+        raise RuntimeError("fast micro-probe response carried no numeric metrics")
+    return metrics
 
 
 def _agent_gates_evidence_root() -> Path:

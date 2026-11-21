@@ -7,6 +7,7 @@ import hashlib
 import importlib
 import importlib.util
 import json
+import math
 import os
 import re
 import statistics
@@ -597,8 +598,9 @@ def _fast_response_payload(
     msprof_telemetry: Mapping[str, object] | None = None,
     candidates: Mapping[str, object] | None = None,
     coverage: Mapping[str, int] | None = None,
+    micro_probe: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "schema": FAST_RESPONSE_SCHEMA,
         "request_id": request_id,
         "request_sha256": request_sha256,
@@ -618,6 +620,9 @@ def _fast_response_payload(
             }
         ),
     }
+    if micro_probe is not None:
+        payload["micro_probe"] = dict(micro_probe)
+    return payload
 
 
 def _run_fast_batch(
@@ -810,6 +815,109 @@ def _run_fast_profile(
     print(json.dumps(payload, sort_keys=True), flush=True)
 
 
+def _run_fast_micro_probe(
+    req: Mapping[str, object],
+    *,
+    source_root: Path,
+    response_path: Path,
+    request_id: str,
+    request_sha256: str,
+) -> None:
+    raw_probe = req.get("probe")
+    if not isinstance(raw_probe, Mapping):
+        raise _FastRequestError("fast micro_probe request requires a probe object")
+    probe_id = str(raw_probe.get("probe_id", "")).strip()
+    probe_kind = str(raw_probe.get("probe_kind", "")).strip()
+    factory_name = str(raw_probe.get("factory_name", "")).strip()
+    tensor_dtype = str(raw_probe.get("tensor_dtype", "")).strip()
+    if not probe_id or not probe_kind or not factory_name or not tensor_dtype:
+        raise _FastRequestError(
+            "fast micro_probe request probe requires probe_id, probe_kind, "
+            "factory_name, and tensor_dtype"
+        )
+    line_counts: dict[str, int] = {}
+    for field in ("line_count_baseline", "line_count_optimized"):
+        value = raw_probe.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise _FastRequestError(
+                f"fast request field 'probe.{field}' must be a non-negative integer"
+            )
+        line_counts[field] = value
+    raw_shape = raw_probe.get("tensor_shape")
+    if (
+        not isinstance(raw_shape, list)
+        or not 1 <= len(raw_shape) <= 8
+        or any(
+            isinstance(dim, bool) or not isinstance(dim, int) or dim <= 0
+            for dim in raw_shape
+        )
+    ):
+        raise _FastRequestError(
+            "fast request field 'probe.tensor_shape' must list 1 to 8 positive integers"
+        )
+    min_speedup = raw_probe.get("min_speedup")
+    if (
+        isinstance(min_speedup, bool)
+        or not isinstance(min_speedup, (int, float))
+        or not math.isfinite(min_speedup)
+        or min_speedup <= 0.0
+    ):
+        raise _FastRequestError(
+            "fast request field 'probe.min_speedup' must be a finite positive number"
+        )
+
+    raw_candidates = req.get("candidates")
+    if not isinstance(raw_candidates, list) or len(raw_candidates) != 2:
+        raise _FastRequestError(
+            "fast micro_probe request requires baseline and optimized candidates"
+        )
+    used_candidates: set[tuple[str, str]] = set()
+    candidates = [
+        _fast_candidate(source_root, "micro_probe", row, used_candidates)
+        for row in raw_candidates
+        if isinstance(row, Mapping)
+    ]
+    by_id = {candidate.candidate_id: candidate for candidate in candidates}
+    if len(candidates) != 2 or set(by_id) != {"baseline", "optimized"}:
+        raise _FastRequestError(
+            "fast micro_probe request requires baseline and optimized candidates"
+        )
+    spec = MicroProbeSpec(
+        probe_id=probe_id,
+        probe_kind=probe_kind,
+        factory_name=factory_name,
+        baseline_probe_source=by_id["baseline"].module_path.read_text(encoding="utf-8"),
+        optimized_probe_source=by_id["optimized"].module_path.read_text(encoding="utf-8"),
+        line_count_baseline=line_counts["line_count_baseline"],
+        line_count_optimized=line_counts["line_count_optimized"],
+        tensor_shape=tuple(raw_shape),
+        tensor_dtype=tensor_dtype,
+    )
+    passed, metrics = verify_micro_probe_hardware(
+        spec,
+        min_speedup=float(min_speedup),
+    )
+    payload = _fast_response_payload(
+        request_id=request_id,
+        request_sha256=request_sha256,
+        mode="micro_probe",
+        status=FAST_STATUS_OK if passed else FAST_STATUS_CANDIDATE_FAILURE,
+        candidates=_fast_bindings(candidates),
+        coverage={
+            "expected_candidates": len(candidates),
+            "evaluated_candidates": len(candidates),
+            "expected_msprof_targets": 0,
+            "observed_msprof_targets": 0,
+        },
+        micro_probe={
+            "probe_id": probe_id,
+            "metrics": {str(key): float(value) for key, value in metrics.items()},
+        },
+    )
+    _atomic_write_json(response_path, payload)
+    print(json.dumps(payload, sort_keys=True), flush=True)
+
+
 def _handle_fast_request(request_path_raw: str, source_root_raw: str, shim_dir: Path) -> None:
     request_path = Path(request_path_raw)
     if not request_path.is_file():
@@ -846,8 +954,20 @@ def _handle_fast_request(request_path_raw: str, source_root_raw: str, shim_dir: 
             )
         if not request_id:
             raise _FastRequestError("fast request has no request_id")
-        if mode not in ("batch", "profile"):
+        if mode not in ("batch", "profile", "micro_probe"):
             raise _FastRequestError(f"fast request mode {mode!r} is not recognized")
+        if mode == "micro_probe":
+            tl_cache_raw = os.environ.get("TILELANG_CACHE_DIR", "").strip()
+            if tl_cache_raw:
+                _configure_tilelang_cache(tl_cache_raw)
+            _run_fast_micro_probe(
+                req,
+                source_root=source_root,
+                response_path=response_path,
+                request_id=request_id,
+                request_sha256=request_sha256,
+            )
+            return
         cannbench_repo = _fast_env_dir(
             "TILEFOUNDRY_NPU_CANNBENCH_REPO", create=False
         )
@@ -902,50 +1022,6 @@ def _configure_tilelang_cache(tl_cache_dir: str) -> None:
     kc_mod.KernelCache._create_dirs()
 
 
-def _handle_micro_probe_request(probe_req_path: str) -> None:
-    payload = json.loads(Path(probe_req_path).read_text(encoding="utf-8"))
-    tl_cache_dir = str(payload.get("tilelang_cache_dir", "")).strip()
-    if tl_cache_dir:
-        _configure_tilelang_cache(tl_cache_dir)
-    spec = MicroProbeSpec(
-        probe_id=str(payload["probe_id"]),
-        probe_kind=str(payload["probe_kind"]),
-        factory_name=str(payload["factory_name"]),
-        baseline_probe_source=str(payload["baseline_probe_source"]),
-        optimized_probe_source=str(payload["optimized_probe_source"]),
-        line_count_baseline=int(payload.get("line_count_baseline", 0)),
-        line_count_optimized=int(payload.get("line_count_optimized", 0)),
-        tensor_shape=tuple(int(x) for x in payload.get("tensor_shape", (16, 128))),
-        tensor_dtype=str(payload.get("tensor_dtype", "float32")),
-    )
-    min_speedup = float(payload.get("min_speedup", 1.08))
-    resp_raw = str(payload.get("response_path", "")).strip()
-    try:
-        ok, metrics = verify_micro_probe_hardware(
-            spec,
-            probe_runner=None,
-            min_speedup=min_speedup,
-        )
-        out_payload: dict[str, object] = {
-            "passed": bool(ok),
-            "metrics": {str(k): float(v) for k, v in metrics.items()},
-        }
-    except Exception as exc:
-        out_payload = {
-            "passed": False,
-            "metrics": {
-                "baseline_dur_us": 0.0,
-                "optimized_dur_us": 0.0,
-                "speedup": 0.0,
-                "numerical_ok": 0.0,
-            },
-            "error": f"{type(exc).__name__}: {exc}",
-        }
-    if resp_raw:
-        _atomic_write_json(Path(resp_raw), out_payload)
-    print(json.dumps(out_payload, sort_keys=True), flush=True)
-
-
 def test_fast_bindings_treat_candidate_change_as_infrastructure(tmp_path: Path) -> None:
     """A candidate rewritten after evaluation invalidates the run without blaming the request."""
     module = tmp_path / "kernel.py"
@@ -969,11 +1045,6 @@ def test_surrogate_anchor_batch_npu() -> None:
     """Evaluate configured or baseline 10-anchor surrogate batch inside AgentGates lease."""
     _require_npu_env()
     torch.npu.set_device(0)
-
-    probe_req_env = os.environ.get("TF_MICRO_PROBE_REQUEST", "").strip()
-    if probe_req_env and Path(probe_req_env).is_file():
-        _handle_micro_probe_request(probe_req_env)
-        return
 
     fast_req_env = os.environ.get(FAST_REQUEST_ENV, "").strip()
     req_env = os.environ.get("TF_SURROGATE_BATCH_REQUEST", "").strip()

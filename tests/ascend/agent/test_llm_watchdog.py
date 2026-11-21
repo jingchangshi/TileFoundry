@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import time
@@ -19,6 +20,8 @@ from tilefoundry_ascend.agent import (
 )
 from tilefoundry_ascend.agent.orchestrator import (
     CREATIVE_RESPONSE_SCHEMA,
+    RoleRoutingConfig,
+    SubprocessCliTemplateBackend,
 )
 from tilefoundry_ascend.agent.orchestrator import (
     StreamWatchdogConfig as OrchestratorStreamWatchdogConfig,
@@ -710,5 +713,360 @@ def test_build_command_reconciles_model_effort_tier_suffix() -> None:
     assert cmd[model_idx + 1] == "gemini-4-hydrogen-medium"
     assert "--effort=medium" in cmd
     assert "--effort=high" not in cmd
+
+
+_FAKE_CLAUDE_BODY = """
+import json
+import os
+from pathlib import Path
+import sys
+import time
+
+
+def _emit(payload):
+    print(json.dumps(payload), flush=True)
+
+
+def main():
+    state_dir = Path(os.environ["TF_FAKE_CLAUDE_STATE_DIR"])
+    scenario = os.environ["TF_FAKE_CLAUDE_SCENARIO"]
+    counter = state_dir / "attempt.txt"
+    attempt = int(counter.read_text(encoding="utf-8")) + 1 if counter.exists() else 1
+    counter.write_text(str(attempt), encoding="utf-8")
+    record = {
+        "attempt": attempt,
+        "args": sys.argv[1:],
+        "stdin": sys.stdin.read(),
+        "https_proxy": os.environ.get("HTTPS_PROXY", ""),
+        "https_proxy_lower": os.environ.get("https_proxy", ""),
+        "http_proxy_lower": os.environ.get("http_proxy", ""),
+    }
+    (state_dir / f"record_{attempt}.json").write_text(json.dumps(record), encoding="utf-8")
+
+    def _stream_ok():
+        _emit({"type": "system", "subtype": "init"})
+        _emit(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "def ok():\\n    return 1"}]},
+            }
+        )
+        _emit(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "def ok():\\n    return 1",
+            }
+        )
+
+    if scenario == "stream_ok":
+        _stream_ok()
+        return 0
+    if scenario == "startup_stall_once_then_ok":
+        if attempt == 1:
+            time.sleep(30.0)
+        _stream_ok()
+        return 0
+    if scenario == "idle_stall_once_then_ok":
+        if attempt == 1:
+            _emit({"type": "system", "subtype": "init"})
+            time.sleep(30.0)
+        _stream_ok()
+        return 0
+    if scenario == "stderr_exit":
+        print(
+            "fatal: token=hunter2 api_key=abc123 "
+            "Authorization: Bearer bearer-secret-123",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
+    if scenario == "result_error":
+        _emit(
+            {
+                "type": "result",
+                "subtype": "error_max_turns",
+                "is_error": True,
+                "result": "turn limit reached token=hunter2",
+            }
+        )
+        return 0
+    if scenario == "plain_text":
+        print("plain fallback text", flush=True)
+        return 0
+    if scenario == "structured_no_text":
+        _emit({"type": "system", "subtype": "init"})
+        _emit(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": "",
+            }
+        )
+        return 0
+    if scenario == "corrupt_stream":
+        print('{"type": "assis', flush=True)
+        return 0
+    if scenario == "eof_hang":
+        _emit({"type": "system", "subtype": "init"})
+        sys.stdout.close()
+        sys.stderr.close()
+        time.sleep(30.0)
+        return 0
+    if scenario == "proxy_echo":
+        payload = {
+            "https": os.environ.get("HTTPS_PROXY", ""),
+            "https_lower": os.environ.get("https_proxy", ""),
+            "http_lower": os.environ.get("http_proxy", ""),
+        }
+        _emit(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": json.dumps(payload),
+            }
+        )
+        return 0
+    raise SystemExit(f"unknown scenario {scenario}")
+
+
+sys.exit(main())
+"""
+
+
+def _write_fake_claude(tmp_path: Path) -> tuple[Path, Path]:
+    bin_path = tmp_path / "fake_claude"
+    bin_path.write_text(f"#!{sys.executable}\n{_FAKE_CLAUDE_BODY.lstrip()}", encoding="utf-8")
+    bin_path.chmod(0o755)
+    state_dir = tmp_path / "claude_state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    return bin_path, state_dir
+
+
+def _claude_backend(
+    bin_path: Path,
+    *,
+    startup: float = 0.3,
+    idle: float = 3.0,
+    ceiling: float = 5.0,
+    max_retries: int = 1,
+) -> SubprocessCliTemplateBackend:
+    routing = RoleRoutingConfig(
+        "exploit-model",
+        "explore-model",
+        "escalate-model",
+        "repair-model",
+        exploit_timeout_sec=ceiling,
+        reasoning_timeout_sec=ceiling,
+    )
+    return SubprocessCliTemplateBackend(
+        "claude_cli",
+        routing,
+        bin_path=str(bin_path),
+        watchdog=StreamWatchdogConfig(
+            startup_timeout_sec=startup,
+            idle_stall_timeout_sec=idle,
+            active_ceiling_timeout_sec=ceiling,
+            max_retries=max_retries,
+            retry_backoff_sec=0.02,
+        ),
+    )
+
+
+def test_claude_stream_json_startup_retry_and_telemetry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify stream-json parsing, startup-stall retry, and single-line telemetry."""
+    bin_path, state_dir = _write_fake_claude(tmp_path)
+    monkeypatch.setenv("TF_FAKE_CLAUDE_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("TF_FAKE_CLAUDE_SCENARIO", "startup_stall_once_then_ok")
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("TILEFOUNDRY_NPU_LLM_HTTPS_PROXY", raising=False)
+    backend = _claude_backend(bin_path)
+    caplog.set_level(logging.INFO)
+
+    t0 = time.monotonic()
+    reply = asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
+    assert reply == "def ok():\n    return 1"
+    assert time.monotonic() - t0 < 3.0
+    assert (state_dir / "attempt.txt").read_text(encoding="utf-8") == "2"
+    record = json.loads((state_dir / "record_2.json").read_text(encoding="utf-8"))
+    assert "--output-format" in record["args"]
+    assert record["args"][record["args"].index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in record["args"]
+    assert "--include-partial-messages" in record["args"]
+    assert "### USER INPUT" in record["stdin"]
+
+    telemetry = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("LLM_CALL_TELEMETRY")
+    ]
+    assert len(telemetry) == 2
+    assert "role=exploit_rule" in telemetry[0]
+    assert "model=exploit-model" in telemetry[0]
+    assert "status=timeout" in telemetry[0]
+    assert "proxy_configured=false" in telemetry[0]
+    assert "status=ok" in telemetry[1]
+
+
+def test_claude_idle_stall_interrupts_and_recovers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify a silent stream is interrupted at the idle threshold and retried once."""
+    bin_path, state_dir = _write_fake_claude(tmp_path)
+    monkeypatch.setenv("TF_FAKE_CLAUDE_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("TF_FAKE_CLAUDE_SCENARIO", "idle_stall_once_then_ok")
+    backend = _claude_backend(bin_path, startup=3.0, idle=0.3)
+
+    t0 = time.monotonic()
+    reply = asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
+    assert reply == "def ok():\n    return 1"
+    assert time.monotonic() - t0 < 3.0
+    assert (state_dir / "attempt.txt").read_text(encoding="utf-8") == "2"
+
+
+def test_claude_stderr_redacted_and_result_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify non-zero exits and stream-json result errors expose only redacted diagnostics."""
+    bin_path, state_dir = _write_fake_claude(tmp_path)
+    monkeypatch.setenv("TF_FAKE_CLAUDE_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("TF_FAKE_CLAUDE_SCENARIO", "stderr_exit")
+    backend = _claude_backend(bin_path, max_retries=0)
+
+    with pytest.raises(RuntimeError, match="exit status 2") as exit_error:
+        asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
+    message = str(exit_error.value)
+    assert "token=[redacted]" in message
+    assert "api_key=[redacted]" in message
+    assert "Authorization: [redacted]" in message
+    assert "hunter2" not in message
+    assert "abc123" not in message
+    assert "bearer-secret-123" not in message
+
+    monkeypatch.setenv("TF_FAKE_CLAUDE_SCENARIO", "result_error")
+    (state_dir / "attempt.txt").unlink(missing_ok=True)
+    with pytest.raises(RuntimeError, match="error_max_turns|turn limit") as result_error:
+        asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
+    result_message = str(result_error.value)
+    assert "[redacted]" in result_message
+    assert "hunter2" not in result_message
+
+
+def test_claude_proxy_injection_and_plain_text_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Verify scoped proxy injection into both cases and plain-text output fallback."""
+    bin_path, state_dir = _write_fake_claude(tmp_path)
+    monkeypatch.setenv("TF_FAKE_CLAUDE_STATE_DIR", str(state_dir))
+    for key in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "TILEFOUNDRY_NPU_LLM_HTTP_PROXY",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TILEFOUNDRY_NPU_LLM_HTTPS_PROXY", "http://127.0.0.1:17890")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:8080")
+    monkeypatch.setenv("TF_FAKE_CLAUDE_SCENARIO", "proxy_echo")
+    backend = _claude_backend(bin_path, max_retries=0)
+    caplog.set_level(logging.INFO)
+
+    reply = asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
+    proxies = json.loads(reply)
+    assert proxies["https"] == "http://127.0.0.1:17890"
+    assert proxies["https_lower"] == "http://127.0.0.1:17890"
+    assert proxies["http_lower"] == "http://127.0.0.1:8080"
+    telemetry = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("LLM_CALL_TELEMETRY")
+    ]
+    assert telemetry and "proxy_configured=true" in telemetry[-1]
+
+    monkeypatch.setenv("TF_FAKE_CLAUDE_SCENARIO", "plain_text")
+    (state_dir / "attempt.txt").unlink(missing_ok=True)
+    reply_text = asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
+    assert reply_text == "plain fallback text"
+
+
+def test_claude_structured_metadata_never_returns_as_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify system-only and truncated stream-json output raise instead of echoing JSON."""
+    bin_path, state_dir = _write_fake_claude(tmp_path)
+    monkeypatch.setenv("TF_FAKE_CLAUDE_STATE_DIR", str(state_dir))
+    backend = _claude_backend(bin_path, max_retries=0)
+
+    monkeypatch.setenv("TF_FAKE_CLAUDE_SCENARIO", "structured_no_text")
+    with pytest.raises(RuntimeError, match="no assistant text") as empty_error:
+        asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
+    assert '"type"' not in str(empty_error.value)
+    assert '"result"' not in str(empty_error.value)
+
+    monkeypatch.setenv("TF_FAKE_CLAUDE_SCENARIO", "corrupt_stream")
+    (state_dir / "attempt.txt").unlink(missing_ok=True)
+    with pytest.raises(RuntimeError, match="no assistant text"):
+        asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
+
+
+def test_claude_stream_eof_with_live_child_is_bounded_by_ceiling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify a child that closes both pipes but keeps running is killed at the ceiling."""
+    bin_path, state_dir = _write_fake_claude(tmp_path)
+    monkeypatch.setenv("TF_FAKE_CLAUDE_STATE_DIR", str(state_dir))
+    monkeypatch.setenv("TF_FAKE_CLAUDE_SCENARIO", "eof_hang")
+    backend = _claude_backend(bin_path, startup=5.0, idle=5.0, ceiling=0.6, max_retries=0)
+
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError, match="active_ceiling_timeout"):
+        asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
+    assert time.monotonic() - t0 < 3.0
+    assert (state_dir / "attempt.txt").read_text(encoding="utf-8") == "1"
+
+
+def test_claude_watchdog_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify startup and idle watchdog thresholds come from explicit environment settings."""
+    monkeypatch.setenv("TILEFOUNDRY_NPU_LLM_STARTUP_TIMEOUT_SEC", "0.5")
+    monkeypatch.setenv("TILEFOUNDRY_NPU_LLM_IDLE_STALL_TIMEOUT_SEC", "2.5")
+    backend = SubprocessCliTemplateBackend(
+        "claude_cli",
+        RoleRoutingConfig(
+            "e",
+            "c",
+            "b",
+            "r",
+            exploit_timeout_sec=30.0,
+            reasoning_timeout_sec=60.0,
+        ),
+        bin_path=sys.executable,
+    )
+    cfg = backend.watchdog_for_role("explore_creative")
+    assert cfg.startup_timeout_sec == 0.5
+    assert cfg.idle_stall_timeout_sec == 2.5
+    assert cfg.active_ceiling_timeout_sec == 60.0
+
+    monkeypatch.setenv("TILEFOUNDRY_NPU_LLM_STARTUP_TIMEOUT_SEC", "not-a-number")
+    with pytest.raises(ValueError, match="watchdog timeouts"):
+        backend.watchdog_for_role("exploit_rule")
 
 

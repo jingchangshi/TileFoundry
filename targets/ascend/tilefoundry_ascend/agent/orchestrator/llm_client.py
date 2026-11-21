@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import re
@@ -33,6 +34,8 @@ RE_STREAM_IDLE_LOG = re.compile(
     re.IGNORECASE,
 )
 RE_SSE_DISPATCH = re.compile(r"streamGenerateContent\?alt=sse", re.IGNORECASE)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -352,10 +355,17 @@ class _AgyLogTailer:
 class _AttemptFailure(Exception):
     """Internal wrapper pairing a worker failure with retry eligibility."""
 
-    def __init__(self, exc: Exception, *, retriable: bool) -> None:
+    def __init__(
+        self,
+        exc: Exception,
+        *,
+        retriable: bool,
+        ttft_sec: float | None = None,
+    ) -> None:
         super().__init__(str(exc))
         self.exc = exc
         self.retriable = retriable
+        self.ttft_sec = ttft_sec
 
 
 async def _terminate_process_group(proc: asyncio.subprocess.Process) -> None:
@@ -1055,6 +1065,84 @@ class OpenAICompatHTTPBackend:
             cancelled.set()
 
 
+_CLI_PROXY_KEYS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
+_CLI_TELEMETRY_FORMAT = (
+    "LLM_CALL_TELEMETRY backend=%s role=%s model=%s ttft_sec=%.3f "
+    "elapsed_sec=%.3f status=%s proxy_configured=%s"
+)
+
+
+def _proxy_env(environ: Mapping[str, str]) -> dict[str, str]:
+    """Resolve explicit proxy settings into uppercase and lowercase variables."""
+    resolved: dict[str, str] = {}
+    for key in _CLI_PROXY_KEYS:
+        scoped = environ.get(f"{_LLM_ENV_PREFIX}{key}", "").strip()
+        plain = environ.get(key, "").strip() or environ.get(key.lower(), "").strip()
+        value = scoped or plain
+        if value:
+            resolved[key] = value
+            resolved[key.lower()] = value
+    return resolved
+
+
+def _redact_secrets(text: str) -> str:
+    """Mask credential-shaped substrings in captured diagnostic text."""
+    redacted = re.sub(
+        r"(?i)\b((?:proxy-)?authorization\s*[=:]\s*)"
+        r"(?:bearer|basic|digest|token)\s+\S+",
+        r"\1[redacted]",
+        text,
+    )
+    redacted = re.sub(r"(?i)\b(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[redacted]", redacted)
+    redacted = re.sub(
+        r"(?i)\b((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*)\S+",
+        r"\1[redacted]",
+        redacted,
+    )
+    redacted = re.sub(r"(?i)\b(sk-[A-Za-z0-9_\-]{6,})\b", "[redacted]", redacted)
+    return re.sub(r"(https?://[^:/\s]+:)[^@\s]+@", r"\1[redacted]@", redacted)
+
+
+def _cli_watchdog_from_env() -> StreamWatchdogConfig:
+    """Build CLI streaming watchdog settings from explicit environment overrides."""
+    startup_raw = _config_value(None, f"{_LLM_ENV_PREFIX}STARTUP_TIMEOUT_SEC", default="90")
+    idle_raw = _config_value(None, f"{_LLM_ENV_PREFIX}IDLE_STALL_TIMEOUT_SEC", default="120")
+    try:
+        startup_sec = float(startup_raw)
+        idle_sec = float(idle_raw)
+    except ValueError:
+        raise ValueError("LLM CLI watchdog timeouts must be numeric") from None
+    if not all(math.isfinite(value) and value > 0 for value in (startup_sec, idle_sec)):
+        raise ValueError("LLM CLI watchdog timeouts must be finite and positive")
+    return StreamWatchdogConfig(
+        startup_timeout_sec=startup_sec,
+        idle_stall_timeout_sec=idle_sec,
+    )
+
+
+def _claude_stream_text(
+    event: Mapping[str, object],
+    assistant_text: list[str],
+) -> str | None:
+    """Accumulate assistant text from a claude stream-json event."""
+    event_type = event.get("type")
+    if event_type == "assistant":
+        message = event.get("message")
+        if isinstance(message, Mapping):
+            content = message.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, Mapping) and block.get("type") == "text":
+                        text = block.get("text")
+                        if isinstance(text, str):
+                            assistant_text.append(text)
+        return None
+    if event_type == "result":
+        result = event.get("result")
+        return result if isinstance(result, str) else None
+    return None
+
+
 class SubprocessCliTemplateBackend:
     """Run a single generation in an empty working directory using an argument vector."""
 
@@ -1066,11 +1154,13 @@ class SubprocessCliTemplateBackend:
         bin_path: str | None = None,
         template: str | None = None,
         max_concurrency: int = 2,
+        watchdog: StreamWatchdogConfig | None = None,
     ) -> None:
         if kind not in ("claude_cli", "codex_cli", "custom_cli"):
             raise ValueError("Unknown LLM CLI profile")
         self._kind = kind
         self._routing = routing
+        self._watchdog = watchdog
         self._template: list[str] = []
         self._template_fields: set[str] = set()
         configured_bin = bin_path or _config_value(None, f"{_LLM_ENV_PREFIX}CLI_BIN")
@@ -1117,7 +1207,9 @@ class SubprocessCliTemplateBackend:
                 self._bin,
                 "--print",
                 "--output-format",
-                "text",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
                 "--tools",
                 "",
                 "--strict-mcp-config",
@@ -1194,19 +1286,44 @@ class SubprocessCliTemplateBackend:
                         text = value
         return text.strip()
 
-    async def _run(self, argv: list[str], stdin: bytes | None, timeout: float) -> bytes:
+    def watchdog_for_role(self, role: str) -> StreamWatchdogConfig:
+        """Return streaming watchdog settings bounded by the role timeout."""
+        base = self._watchdog or _cli_watchdog_from_env()
+        ceiling = self._routing.timeout_for_role(role)
+        return StreamWatchdogConfig(
+            startup_timeout_sec=min(base.startup_timeout_sec, ceiling),
+            idle_stall_timeout_sec=min(base.idle_stall_timeout_sec, ceiling),
+            active_ceiling_timeout_sec=ceiling,
+            max_503_hits=base.max_503_hits,
+            max_sandbox_tool_calls=base.max_sandbox_tool_calls,
+            max_retries=base.max_retries,
+            retry_backoff_sec=base.retry_backoff_sec,
+        )
+
+    async def _run_streaming(
+        self,
+        argv: list[str],
+        stdin: bytes | None,
+        cfg: StreamWatchdogConfig,
+        *,
+        role: str,
+        model: str,
+    ) -> tuple[str, float | None]:
+        """Run the CLI with dual-pipe heartbeat watchdogs and redacted diagnostics."""
         with tempfile.TemporaryDirectory(prefix="tf_llm_worker_") as sandbox_dir:
             env = {**os.environ, "PWD": sandbox_dir}
             env.pop("CLAUDECODE", None)
+            env.update(_proxy_env(os.environ))
             spawn = asyncio.create_task(
                 asyncio.create_subprocess_exec(
                     *argv,
                     stdin=asyncio.subprocess.DEVNULL if stdin is None else asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
                     cwd=sandbox_dir,
                     env=env,
                     start_new_session=True,
+                    limit=16 * 1024 * 1024,
                 )
             )
             try:
@@ -1218,18 +1335,212 @@ class SubprocessCliTemplateBackend:
                 raise
             except (OSError, ValueError):
                 raise RuntimeError("Could not start the configured LLM CLI") from None
+            assert proc.stdout is not None
+            assert proc.stderr is not None
 
-            communication = asyncio.create_task(proc.communicate(stdin))
+            queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
+
+            async def _pump(stream: asyncio.StreamReader, tag: str) -> None:
+                try:
+                    while True:
+                        raw = await stream.readline()
+                        if not raw:
+                            break
+                        await queue.put((tag, raw.decode("utf-8", errors="replace")))
+                except asyncio.CancelledError:
+                    raise
+                finally:
+                    await queue.put((tag, None))
+
+            async def _feed_stdin() -> None:
+                assert stdin is not None
+                assert proc.stdin is not None
+                with suppress(BrokenPipeError, ConnectionResetError):
+                    proc.stdin.write(stdin)
+                    await proc.stdin.drain()
+                    proc.stdin.close()
+
+            pump_out = asyncio.create_task(_pump(proc.stdout, "stdout"))
+            pump_err = asyncio.create_task(_pump(proc.stderr, "stderr"))
+            stdin_task = asyncio.create_task(_feed_stdin()) if stdin is not None else None
+
+            start_ts = time.monotonic()
+            last_activity_ts = start_ts
+            ttft_sec: float | None = None
+            stdout_chunks: list[str] = []
+            assistant_text: list[str] = []
+            result_text: str | None = None
+            stream_error: str | None = None
+            stderr_lines: list[str] = []
+            stdout_eof = False
+            stderr_eof = False
+            stream_events_seen = False
+            corrupt_stream = False
+            poll_interval = max(
+                0.01,
+                min(
+                    0.05,
+                    cfg.startup_timeout_sec / 4.0,
+                    cfg.idle_stall_timeout_sec / 4.0,
+                    cfg.active_ceiling_timeout_sec / 4.0,
+                ),
+            )
+
             try:
-                output, _ = await asyncio.wait_for(asyncio.shield(communication), timeout)
-            except TimeoutError:
-                raise TimeoutError("LLM CLI generation timed out") from None
+                while not (stdout_eof and stderr_eof):
+                    tag = ""
+                    line: str | None = None
+                    try:
+                        tag, line = await asyncio.wait_for(queue.get(), timeout=poll_interval)
+                    except asyncio.TimeoutError:
+                        pass
+
+                    if tag == "stdout":
+                        if line is None:
+                            stdout_eof = True
+                        else:
+                            if line.strip():
+                                now_line = time.monotonic()
+                                if ttft_sec is None:
+                                    ttft_sec = now_line - start_ts
+                                last_activity_ts = now_line
+                                stdout_chunks.append(line)
+                                if self._kind == "claude_cli":
+                                    stripped = line.strip()
+                                    try:
+                                        event: object = json.loads(stripped)
+                                    except json.JSONDecodeError:
+                                        if stripped.startswith(("{", "[")):
+                                            corrupt_stream = True
+                                    else:
+                                        if isinstance(event, Mapping) and isinstance(
+                                            event.get("type"), str
+                                        ):
+                                            stream_events_seen = True
+                                            extracted = _claude_stream_text(
+                                                event, assistant_text
+                                            )
+                                            if extracted is not None:
+                                                result_text = extracted
+                                            if (
+                                                event.get("type") == "result"
+                                                and event.get("is_error") is True
+                                            ):
+                                                stream_error = str(
+                                                    event.get("result")
+                                                    or event.get("subtype")
+                                                    or "error"
+                                                )
+                    elif tag == "stderr":
+                        if line is None:
+                            stderr_eof = True
+                        else:
+                            cleaned = line.rstrip("\r\n")
+                            if cleaned:
+                                stderr_lines = [*stderr_lines, cleaned][-40:]
+
+                    now = time.monotonic()
+                    if (now - start_ts) > cfg.active_ceiling_timeout_sec:
+                        await _terminate_process_group(proc)
+                        raise _AttemptFailure(
+                            TimeoutError(
+                                "LLM CLI generation timed out: active_ceiling_timeout "
+                                f"({cfg.active_ceiling_timeout_sec}s) exceeded "
+                                f"(role={role}, model={model})"
+                            ),
+                            retriable=True,
+                            ttft_sec=ttft_sec,
+                        )
+                    if (
+                        proc.returncode is None
+                        and ttft_sec is None
+                        and (now - start_ts) > cfg.startup_timeout_sec
+                    ):
+                        await _terminate_process_group(proc)
+                        raise _AttemptFailure(
+                            TimeoutError(
+                                "LLM CLI generation timed out: startup_timeout "
+                                f"({cfg.startup_timeout_sec}s) exceeded "
+                                f"(role={role}, model={model})"
+                            ),
+                            retriable=True,
+                            ttft_sec=ttft_sec,
+                        )
+                    if (
+                        proc.returncode is None
+                        and (now - last_activity_ts) > cfg.idle_stall_timeout_sec
+                    ):
+                        await _terminate_process_group(proc)
+                        raise _AttemptFailure(
+                            TimeoutError(
+                                "LLM CLI generation timed out: idle_stall_timeout "
+                                f"({cfg.idle_stall_timeout_sec}s) exceeded "
+                                f"(role={role}, model={model})"
+                            ),
+                            retriable=True,
+                            ttft_sec=ttft_sec,
+                        )
+
+                remaining_budget = cfg.active_ceiling_timeout_sec - (
+                    time.monotonic() - start_ts
+                )
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=max(0.0, remaining_budget))
+                except asyncio.TimeoutError:
+                    await _terminate_process_group(proc)
+                    raise _AttemptFailure(
+                        TimeoutError(
+                            "LLM CLI generation timed out: active_ceiling_timeout "
+                            f"({cfg.active_ceiling_timeout_sec}s) exceeded after "
+                            f"stream EOF (role={role}, model={model})"
+                        ),
+                        retriable=True,
+                        ttft_sec=ttft_sec,
+                    ) from None
+                stderr_tail = _redact_secrets("\n".join(stderr_lines))[-2000:]
+                if proc.returncode:
+                    detail = f"LLM CLI generation failed with exit status {proc.returncode}"
+                    if stderr_tail:
+                        detail = f"{detail}: {stderr_tail}"
+                    raise _AttemptFailure(
+                        RuntimeError(detail),
+                        retriable=False,
+                        ttft_sec=ttft_sec,
+                    )
+                if stream_error is not None:
+                    detail = f"LLM CLI generation failed: {_redact_secrets(stream_error)[:500]}"
+                    if stderr_tail:
+                        detail = f"{detail}: {stderr_tail}"
+                    raise _AttemptFailure(
+                        RuntimeError(detail),
+                        retriable=False,
+                        ttft_sec=ttft_sec,
+                    )
+                raw_output = "".join(stdout_chunks)
+                if self._kind != "claude_cli":
+                    return raw_output.strip(), ttft_sec
+                output = (result_text or "".join(assistant_text)).strip()
+                if output:
+                    return output, ttft_sec
+                if stream_events_seen or corrupt_stream:
+                    detail = "LLM CLI returned no assistant text"
+                    if stderr_tail:
+                        detail = f"{detail}: {stderr_tail}"
+                    raise _AttemptFailure(
+                        RuntimeError(detail),
+                        retriable=True,
+                        ttft_sec=ttft_sec,
+                    )
+                return raw_output.strip(), ttft_sec
             finally:
                 await _terminate_process_group(proc)
-                await asyncio.gather(communication, return_exceptions=True)
-            if proc.returncode:
-                raise RuntimeError(f"LLM CLI generation failed with exit status {proc.returncode}")
-            return output
+                pending = [pump_out, pump_err]
+                if stdin_task is not None:
+                    pending.append(stdin_task)
+                for task in pending:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def generate(self, req: GenerationRequest, *, effort_override: str | None = None) -> str:
         """Route a generation request to the CLI and return its final response text."""
@@ -1240,14 +1551,62 @@ class SubprocessCliTemplateBackend:
             f"### USER INPUT\n{req.user_prompt}\n"
         )
         argv, stdin = self._command(model, effort, prompt)
+        cfg = self.watchdog_for_role(req.role)
+        max_retries = max(0, cfg.max_retries)
+        proxy_configured = "true" if _proxy_env(os.environ) else "false"
         async with self._sem:
-            output = await self._run(argv, stdin, self._routing.timeout_for_role(req.role))
-        text = output.decode("utf-8", errors="replace").strip()
-        if self._kind == "codex_cli":
-            text = self._codex_text(text)
-        if not text:
-            raise RuntimeError("LLM CLI returned no text completion")
-        return text
+            for attempt_idx in range(max_retries + 1):
+                start_ts = time.monotonic()
+                try:
+                    output, ttft_sec = await self._run_streaming(
+                        argv,
+                        stdin,
+                        cfg,
+                        role=req.role,
+                        model=model,
+                    )
+                    text = output.strip()
+                    if self._kind == "codex_cli":
+                        text = self._codex_text(text)
+                    if not text:
+                        raise _AttemptFailure(
+                            RuntimeError("LLM CLI returned no text completion"),
+                            retriable=False,
+                            ttft_sec=ttft_sec,
+                        )
+                except _AttemptFailure as failure:
+                    elapsed = time.monotonic() - start_ts
+                    status = "timeout" if isinstance(failure.exc, TimeoutError) else "error"
+                    ttft = failure.ttft_sec if failure.ttft_sec is not None else -1.0
+                    logger.info(
+                        _CLI_TELEMETRY_FORMAT,
+                        self._kind,
+                        req.role,
+                        model,
+                        ttft,
+                        elapsed,
+                        status,
+                        proxy_configured,
+                    )
+                    if failure.retriable and attempt_idx < max_retries:
+                        if cfg.retry_backoff_sec > 0.0:
+                            await asyncio.sleep(cfg.retry_backoff_sec)
+                        continue
+                    raise failure.exc from None
+                elapsed = time.monotonic() - start_ts
+                ttft = ttft_sec if ttft_sec is not None else elapsed
+                logger.info(
+                    _CLI_TELEMETRY_FORMAT,
+                    self._kind,
+                    req.role,
+                    model,
+                    ttft,
+                    elapsed,
+                    "ok",
+                    proxy_configured,
+                )
+                return text
+        raise RuntimeError("unreachable retry termination")
 
 
 @dataclass
