@@ -1614,13 +1614,29 @@ def run_operator_marathon(
         else (worktree / ".tilefoundry-marathon" / cfg.operator_name).resolve()
     )
     state_dir.mkdir(parents=True, exist_ok=True)
-    staging_dir = (state_dir / "stage0_candidates").resolve()
+    op_tag = cfg.operator_name.rsplit("/", 1)[-1]
+    external_pure_golden_mirror: Path | None = None
+    if state_dir.is_relative_to(worktree):
+        staging_dir = (state_dir / "stage0_candidates").resolve()
+    else:
+        state_key = hashlib.sha256(str(state_dir).encode("utf-8")).hexdigest()[:12]
+        staging_dir = (
+            worktree / ".tilefoundry-marathon" / "_stage0_staging" / state_key / short_op
+        ).resolve()
 
     if cfg.target_module_path is not None:
         target_module = Path(cfg.target_module_path).expanduser().resolve()
     elif cfg.pure_golden:
-        op_tag = cfg.operator_name.rsplit("/", 1)[-1]
-        target_module = (state_dir / "pure_golden_ops" / op_tag / "kernels.py").resolve()
+        if state_dir.is_relative_to(worktree):
+            target_module = (state_dir / "pure_golden_ops" / op_tag / "kernels.py").resolve()
+        else:
+            state_key = hashlib.sha256(str(state_dir).encode("utf-8")).hexdigest()[:12]
+            target_module = (
+                worktree / ".tilefoundry-marathon" / "pure_golden_ops" / state_key / op_tag / "kernels.py"
+            ).resolve()
+            external_pure_golden_mirror = (
+                state_dir / "pure_golden_ops" / op_tag / "kernels.py"
+            ).resolve()
     else:
         target_module = (worktree / get_operator_module_relpath(cfg.operator_name)).resolve()
     checkpoint_path = (
@@ -1933,6 +1949,15 @@ def run_operator_marathon(
         worktree,
     )
     report = asyncio.run(runner.run(resume=resume_flag))
+    if external_pure_golden_mirror is not None and target_module.is_file():
+        external_pure_golden_mirror.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(external_pure_golden_mirror, target_module.read_text(encoding="utf-8"))
+        src_init = target_module.parent / "__init__.py"
+        if src_init.is_file():
+            atomic_write_text(
+                external_pure_golden_mirror.parent / "__init__.py",
+                src_init.read_text(encoding="utf-8"),
+            )
     rendered = json.dumps(report.to_dict(), indent=2)
     atomic_write_text(report_path, rendered + "\n")
     print(rendered)

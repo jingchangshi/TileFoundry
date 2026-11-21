@@ -591,6 +591,9 @@ def test_pure_golden_registry_ast_check_and_marathon_isolation(
             captured.update(kwargs)
 
         async def run(self, *, resume: bool) -> object:
+            target_p = Path(str(captured["target_module_path"]))
+            target_p.parent.mkdir(parents=True, exist_ok=True)
+            target_p.write_text("kernel = object()\n", encoding="utf-8")
             return _StubReport()
 
     class _StubReport:
@@ -616,7 +619,7 @@ def test_pure_golden_registry_ast_check_and_marathon_isolation(
         return real_read_text(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", _guarded_read)
-    state_dir = tmp_path / "state"
+    state_dir = worktree / ".tilefoundry-marathon" / "state"
     rc = run_operator_marathon(
         MarathonConfig(
             operator_name="mla",
@@ -630,6 +633,23 @@ def test_pure_golden_registry_ast_check_and_marathon_isolation(
     assert captured["target_module_path"] == (state_dir / "pure_golden_ops" / "mla" / "kernels.py").resolve()
     assert captured["authored_hir_path"] is None
     assert captured["scheduled_hir_path"] is None
+
+    ext_state_dir = tmp_path / "external_state"
+    captured.clear()
+    ext_rc = run_operator_marathon(
+        MarathonConfig(
+            operator_name="mla",
+            state_dir=ext_state_dir,
+            auto_bootstrap_seed=False,
+            salvage_beam_candidates=False,
+            pure_golden=True,
+        )
+    )
+    assert ext_rc == 0
+    ext_target = Path(str(captured["target_module_path"]))
+    assert ext_target.is_relative_to(worktree / ".tilefoundry-marathon" / "pure_golden_ops")
+    assert "ascend950pr_ops" not in str(ext_target)
+    assert (ext_state_dir / "pure_golden_ops" / "mla" / "kernels.py").is_file()
 
 
 @pytest.mark.skipif(
