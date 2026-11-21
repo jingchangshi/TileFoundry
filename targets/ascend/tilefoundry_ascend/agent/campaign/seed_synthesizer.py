@@ -150,6 +150,7 @@ def _seed_module_abi(
     selector = _render_signature(f"_select_{entrypoint}_config", parameters, "dict[str, object]")
     builder = _render_signature(f"_build_{entrypoint}_prim_func", parameters, "object")
     get_kernel = _render_signature("_get_kernel", parameters, "object")
+    render_tu = "def _render_trackb_tu(**dims: object) -> str:"
     dispatch = f"def {entrypoint}(...) -> object:"
     forbidden = ", ".join(f"`{token}`" for token in surface.forbidden_tokens)
     if track == "cce_trackb":
@@ -159,6 +160,7 @@ def _seed_module_abi(
             f"{selector}\n"
             f"{builder}\n"
             f"{get_kernel}\n"
+            f"{render_tu}\n"
             f"{dispatch}\n"
             f"{entrypoint.upper()}_TRACKB_CU: str  # top-level C++20 translation unit\n"
             f"kernel = {entrypoint}\n"
@@ -166,6 +168,11 @@ def _seed_module_abi(
             f"- `{entrypoint.upper()}_TRACKB_CU` is a top-level C++20 translation-unit string "
             "constant starting with `#include <tl_templates/ascend/...>` that bisheng compiles "
             "standalone.\n"
+            "- `_render_trackb_tu` accepts the regime keyword arguments (plus `trackb_src`) as "
+            "`**dims`, substitutes every shape/constexpr dimension into the C++20 source, and "
+            "returns the complete instantiated top-level translation unit for those dims. It is "
+            "called once per campaign regime before L0/L1, so every returned TU must compile "
+            "standalone and contain exactly one launcher `<<<...>>>` call per active kernel.\n"
             f"- `_select_{entrypoint}_config` is called with the regime keyword arguments above "
             "and returns `pass_configs`, `compile_flags`, or `builder_kwargs` overrides.\n"
             f"- `_build_{entrypoint}_prim_func` is called with the same keyword arguments plus "
@@ -236,6 +243,36 @@ def _official_contract_section(
         lines.append(
             f"- regime `{regime.regime_tag}`: call `{regime.config_selector_fn}({kwargs})`, "
             f"then a builder from {list(regime.builder_candidates)} with those keyword arguments"
+        )
+    return "\n".join(lines) + "\n\n"
+
+
+def _blueprint_summary_section(
+    blueprints: Mapping[str, HirBlueprintPacket],
+    regime_specs: Sequence[RegimeTargetSpec],
+) -> str:
+    """Render every regime's HIR Roofline blueprint so Stage-0 sizes all partitions."""
+    lines = ["### PER-REGIME HIR BLUEPRINT SUMMARIES (all partitions must instantiate)"]
+    for regime in regime_specs:
+        packet = blueprints.get(regime.regime_tag)
+        if packet is None:
+            raise ValueError(
+                f"Stage-0 blueprint synthesis missing regime {regime.regime_tag!r}"
+            )
+        roofline = packet.roofline
+        kwargs = ", ".join(
+            f"{key}={value!r}" for key, value in sorted(regime.sample_builder_kwargs.items())
+        )
+        lines.append(
+            f"- regime `{regime.regime_tag}`: kwargs({kwargs}); entry={packet.entry_name}; "
+            f"anchor_dims={packet.requested_anchor_dims}; "
+            f"resolved_hir_dims={packet.resolved_hir_dims}; "
+            f"ideal_roofline_us={float(roofline.ideal_roofline_us):.4f}; "
+            f"compute_floor_us={float(roofline.compute_floor_us):.4f}; "
+            f"memory_floor_us={float(roofline.memory_floor_us):.4f}; "
+            f"dominant_bound={roofline.dominant_bound}; "
+            f"shape_exact_match={packet.shape_exact_match}; "
+            f"fallback_reason={packet.fallback_reason or 'none'}"
         )
     return "\n".join(lines) + "\n\n"
 
@@ -334,6 +371,7 @@ async def prepare_operator_seed_or_takeover(
     scheduled_hir_source: str | None = None,
     force_cold_start: bool = False,
     max_seed_attempts: int = 4,
+    max_transport_retries: int = 2,
 ) -> SeedSynthesisOutcome:
     """Execute unified Stage-0 preparation: pure PyTorch cold start or incumbent takeover."""
     analyzer = PyTorchSemanticAnalyzer()
@@ -422,16 +460,26 @@ async def prepare_operator_seed_or_takeover(
         f"```python\n{pytorch_golden_source.strip()}\n```\n\n"
     )
     contract_block = _official_contract_section(proto, cases, regime_specs)
+    blueprint_block = _blueprint_summary_section(blueprints, regime_specs)
 
     last_error = ""
     last_rejected_source: str | None = None
     last_rejected_error = ""
-    for attempt in range(1, max(1, max_seed_attempts) + 1):
+    attempt = 1
+    attempts_used = 0
+    transport_retries = 0
+    while attempt <= max(1, max_seed_attempts):
+        attempts_used = attempt
         request = GenerationRequest(
-            role="explore_creative" if attempt == 1 else "syntax_repair",
+            role=(
+                "syntax_repair"
+                if last_rejected_source is not None
+                else "explore_creative"
+            ),
             system_prompt=system_prompt,
             user_prompt=(
                 f"{constraint_block}\n\n"
+                f"{blueprint_block}"
                 f"{golden_block}"
                 f"{contract_block}"
                 f"{_seed_feedback_section(last_error, last_rejected_source, last_rejected_error)}"
@@ -444,13 +492,21 @@ async def prepare_operator_seed_or_takeover(
             synthesized_src = extract_python_dsl(raw_reply)
         except (RuntimeError, ValueError, TimeoutError) as exc:
             last_error = f"LLM generation transport failure: {type(exc).__name__}: {exc}"
+            if transport_retries >= max(0, max_transport_retries):
+                raise RuntimeError(
+                    f"Stage-0 cold-start seed transport failed for {operator_name} on semantic "
+                    f"attempt {attempt} after {transport_retries} retries: {last_error}"
+                ) from exc
+            transport_retries += 1
             continue
 
+        transport_retries = 0
         ok_static, static_err = l0_l1_validator(synthesized_src, initial_track)
         if not ok_static:
             last_error = f"L0/L1 static or compiler rejection:\n{static_err}"
             last_rejected_source = synthesized_src
             last_rejected_error = last_error
+            attempt += 1
             continue
 
         evidence = oracle_accuracy_validator(synthesized_src)
@@ -494,10 +550,11 @@ async def prepare_operator_seed_or_takeover(
         )
         last_rejected_source = synthesized_src
         last_rejected_error = last_error
+        attempt += 1
 
     raise RuntimeError(
         f"Stage-0 cold-start seed synthesis failed for {operator_name} after "
-        f"{max_seed_attempts} attempts: {last_error}"
+        f"{attempts_used} attempts: {last_error}"
     )
 
 

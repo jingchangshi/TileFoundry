@@ -605,34 +605,34 @@ def test_prepare_seed_bounded_loop_reports_failed_attempts() -> None:
     assert "### LAST REJECTED CANDIDATE DIAGNOSTIC" not in prompt
 
 
-def test_prepare_seed_retries_after_transport_timeout() -> None:
+def test_prepare_seed_retries_transport_timeout_without_consuming_attempt() -> None:
     backend = _ScriptedBackend([TimeoutError("LLM HTTP request timed out"), _SEED_MODULE])
     outcome = _prepare(golden_source=_EXP_GOLDEN, backend=backend)
-    assert outcome.attempts_used == 2
+    assert outcome.attempts_used == 1
     assert outcome.verification_state == "l3_verified"
     assert outcome.module_source.strip() == _SEED_MODULE.strip()
     assert len(backend.requests) == 2
     assert backend.requests[0].role == "explore_creative"
-    assert backend.requests[1].role == "syntax_repair"
+    assert backend.requests[1].role == "explore_creative"
     prompt = backend.requests[1].user_prompt
     assert "LLM generation transport failure: TimeoutError" in prompt
     assert "LLM HTTP request timed out" in prompt
     assert "### LAST REJECTED CANDIDATE SOURCE" not in prompt
 
 
-def test_prepare_seed_stops_after_transport_timeout_budget_exhausted() -> None:
+def test_prepare_seed_stops_after_transport_retry_budget_exhausted() -> None:
     backend = _ScriptedBackend(
         [
             TimeoutError("LLM HTTP request timed out"),
             TimeoutError("LLM HTTP request timed out"),
         ]
     )
-    with pytest.raises(RuntimeError, match="after 2 attempts") as excinfo:
+    with pytest.raises(RuntimeError, match="after 2 retries") as excinfo:
         _prepare(golden_source=_EXP_GOLDEN, backend=backend, max_seed_attempts=2)
     message = str(excinfo.value)
     assert "LLM generation transport failure: TimeoutError" in message
     assert "LLM HTTP request timed out" in message
-    assert len(backend.requests) == 2
+    assert len(backend.requests) == 3
 
 
 def test_prepare_seed_timeout_after_rejection_keeps_last_candidate() -> None:
@@ -660,7 +660,7 @@ def test_prepare_seed_timeout_after_rejection_keeps_last_candidate() -> None:
         backend=backend,
         l0_l1_validator_factory=_factory,
     )
-    assert outcome.attempts_used == 3
+    assert outcome.attempts_used == 2
     assert outcome.verification_state == "l3_verified"
     prompt = backend.requests[2].user_prompt
     timeout_index = prompt.index("LLM generation transport failure: TimeoutError")
