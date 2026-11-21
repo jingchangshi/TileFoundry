@@ -417,7 +417,7 @@ async def prepare_operator_seed_or_takeover(
         try:
             raw_reply = await llm_backend.generate(request)
             synthesized_src = extract_python_dsl(raw_reply)
-        except (RuntimeError, ValueError) as exc:
+        except (RuntimeError, ValueError, TimeoutError) as exc:
             last_error = f"LLM generation transport failure: {type(exc).__name__}: {exc}"
             continue
 

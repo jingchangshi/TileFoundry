@@ -242,6 +242,21 @@ class _ScriptedBackend:
         return self._replies[index]
 
 
+class _TimeoutBackend:
+    """Async LLM backend that raises TimeoutError for an initial call budget."""
+
+    def __init__(self, timeout_calls: int, reply: str = "") -> None:
+        self._timeout_calls = timeout_calls
+        self._reply = reply
+        self.requests: list[GenerationRequest] = []
+
+    async def generate(self, req: GenerationRequest) -> str:
+        self.requests.append(req)
+        if len(self.requests) <= self._timeout_calls:
+            raise TimeoutError("LLM HTTP request timed out")
+        return self._reply
+
+
 def _sha256(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
@@ -597,6 +612,29 @@ def test_prepare_seed_bounded_loop_reports_failed_attempts() -> None:
     assert backend.requests[1].role == "syntax_repair"
     assert "PREVIOUS ATTEMPT FAILURE DIAGNOSTIC" in backend.requests[1].user_prompt
     assert "missing @T.prim_func entry" in backend.requests[1].user_prompt
+
+
+def test_prepare_seed_retries_after_transport_timeout() -> None:
+    backend = _TimeoutBackend(timeout_calls=1, reply=_SEED_MODULE)
+    outcome = _prepare(golden_source=_EXP_GOLDEN, backend=backend)
+    assert outcome.attempts_used == 2
+    assert outcome.verification_state == "l3_verified"
+    assert outcome.module_source.strip() == _SEED_MODULE.strip()
+    assert len(backend.requests) == 2
+    assert backend.requests[0].role == "explore_creative"
+    assert backend.requests[1].role == "syntax_repair"
+    assert "LLM generation transport failure: TimeoutError" in backend.requests[1].user_prompt
+    assert "LLM HTTP request timed out" in backend.requests[1].user_prompt
+
+
+def test_prepare_seed_stops_after_transport_timeout_budget_exhausted() -> None:
+    backend = _TimeoutBackend(timeout_calls=2)
+    with pytest.raises(RuntimeError, match="after 2 attempts") as excinfo:
+        _prepare(golden_source=_EXP_GOLDEN, backend=backend, max_seed_attempts=2)
+    message = str(excinfo.value)
+    assert "LLM generation transport failure: TimeoutError" in message
+    assert "LLM HTTP request timed out" in message
+    assert len(backend.requests) == 2
 
 
 def test_prepare_seed_retries_after_oracle_mismatch() -> None:
@@ -1664,4 +1702,3 @@ def test_trackb_round_evidence_persists_blueprint_observation_and_provenance(
     assert persisted_provenance["has_l2_telemetry"] is True
     restored_record = CampaignRoundRecord.from_dict(round_payload)
     assert restored_record.trackb_evidence == record.trackb_evidence
-
