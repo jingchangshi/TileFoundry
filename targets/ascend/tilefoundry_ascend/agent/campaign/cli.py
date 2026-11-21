@@ -11,9 +11,11 @@ from pathlib import Path
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import parse_simple_env_file
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
+    CAMPAIGN_DEVICE_IDS_ENV_KEY,
     CampaignConfig,
     PerfTargetCampaignRunner,
     parse_device_ids,
+    resolve_campaign_device_plan,
 )
 from tilefoundry_ascend.agent.campaign.marathon import (
     MarathonConfig,
@@ -51,15 +53,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", default=None, help="Atomic checkpoint JSON path.")
     parser.add_argument("--resume", action="store_true", help="Resume from existing checkpoint.")
     parser.add_argument("--run-final-l4", action="store_true", help="Run final official L4 gate.")
-    parser.add_argument("--device-id", default="1", help="Authorized NPU device ID.")
+    parser.add_argument(
+        "--device-id",
+        default="",
+        help=(
+            "Authorized NPU device ID; defaults to the first card declared by "
+            "TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS, else 1."
+        ),
+    )
     parser.add_argument(
         "--device-ids",
         type=parse_device_ids,
         default=(),
         help=(
-            "Extra explicitly authorized NPU cards for whole-L4 attempts, "
-            "comma-separated; a blocked-env preemption moves to the next "
-            "untried pool card."
+            "Additional authorized NPU cards for whole-L4 attempts, "
+            "comma-separated; overrides TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS. "
+            "A blocked-env preemption moves to the next untried pool card."
         ),
     )
     parser.add_argument("--env-file", default=None, help="Path to tilefoundry-npu env.sh.")
@@ -107,6 +116,13 @@ def main(argv: list[str] | None = None) -> int:
 
     env_hint = args.env_file or os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
     env_values = parse_simple_env_file(Path(env_hint).expanduser()) if env_hint else {}
+    primary_device_id, device_pool = resolve_campaign_device_plan(
+        device_id=str(args.device_id),
+        device_ids=tuple(args.device_ids),
+        env_device_ids=parse_device_ids(
+            env_values.get(CAMPAIGN_DEVICE_IDS_ENV_KEY, "")
+        ),
+    )
     llm_backend = create_llm_backend_from_env(overrides=_llm_backend_overrides(env_values, args))
 
     max_rounds = int(args.max_rounds) if args.max_rounds is not None else 12
@@ -119,8 +135,8 @@ def main(argv: list[str] | None = None) -> int:
         max_wall_clock_min=max_wall_clock_min,
         k_rule_workers=args.k_rule_workers,
         run_final_l4=bool(args.run_final_l4),
-        device_id=str(args.device_id),
-        device_ids=tuple(args.device_ids),
+        device_id=primary_device_id,
+        device_ids=tuple(device for device in device_pool if device != primary_device_id),
     )
     tracker = BayesianRuleTracker.from_seed_yaml()
     flywheel = FlywheelDistiller(
@@ -131,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
                 spec,
                 source_root=args.source_root,
                 env_file=args.env_file,
-                device_id=str(args.device_id),
+                device_id=primary_device_id,
             )
         )
         if args.env_file

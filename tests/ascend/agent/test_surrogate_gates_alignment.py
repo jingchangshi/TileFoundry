@@ -343,7 +343,11 @@ def _l3_report(
 
 
 def _l4_report(
-    *, candidate: str, flags: Mapping[str, object] | None = None
+    *,
+    candidate: str,
+    flags: Mapping[str, object] | None = None,
+    status: str = "PASS",
+    failure: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     observations: dict[str, object] = {
         "avgSpeedup": 4.25,
@@ -371,20 +375,25 @@ def _l4_report(
         ],
     }
     observations.update(flags or {})
-    return {
-        "status": "PASS",
+    gate: dict[str, object] = {
+        "gateId": _L4_GATE,
+        "status": status,
+        "recordedStatus": status,
+        "observations": observations,
+    }
+    if failure is not None:
+        gate["failures"] = [dict(failure)]
+    report: dict[str, object] = {
+        "status": status,
         "runId": "run-l4",
         "receiptPath": "/receipt-l4.json",
-        "recordedStatus": "PASS",
-        "gates": [
-            {
-                "gateId": _L4_GATE,
-                "status": "PASS",
-                "recordedStatus": "PASS",
-                "observations": observations,
-            }
-        ],
+        "recordedStatus": status,
+        "gates": [gate],
     }
+    if failure is not None:
+        report["failure"] = dict(failure)
+        report["failures"] = [dict(failure)]
+    return report
 
 
 def _v2_handler(
@@ -1886,6 +1895,47 @@ def test_l4_doctor_blocks_submit_when_route_is_not_ready(
     assert result.execution_terminal is True
     assert "CONFIG_CHECK_FAILED: device" in result.error_message
     assert [cmd[1] for cmd in calls] == ["doctor"]
+
+
+@pytest.mark.parametrize(
+    ("error_category", "expected_category"),
+    [
+        ("occupancy", "occupancy"),
+        ("environment", "environment"),
+        (None, ""),
+    ],
+)
+def test_l4_blocked_env_receipt_carries_occupancy_category(
+    tmp_path: Path, monkeypatch, error_category: str | None, expected_category: str
+) -> None:
+    """Only the signed receipt's errorCategory marks a card-local preemption."""
+    flags = {} if error_category is None else {"errorCategory": error_category}
+    report = _l4_report(
+        candidate="kernels.py",
+        status="BLOCKED_ENV",
+        failure={"message": "BLOCKED_EXIT_CODE: 75"},
+        flags=flags,
+    )
+    result, _calls, _envs = _v2_l4_run(tmp_path, monkeypatch, report=report)
+    assert result.passed is False
+    assert result.failure_kind == surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
+    assert result.blocked_env_category == expected_category
+
+
+def test_l4_candidate_failure_never_carries_blocked_env_category(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A candidate verdict is not a preemption even if the receipt mentions occupancy."""
+    report = _l4_report(
+        candidate="kernels.py",
+        status="FAIL",
+        failure={"message": "candidate numeric mismatch"},
+        flags={"errorCategory": "occupancy"},
+    )
+    result, _calls, _envs = _v2_l4_run(tmp_path, monkeypatch, report=report)
+    assert result.passed is False
+    assert result.failure_kind == surrogate_cannbench.FAILURE_KIND_CANDIDATE
+    assert result.blocked_env_category == ""
 
 
 def test_l4_default_wait_covers_queue_prep_and_official_run() -> None:

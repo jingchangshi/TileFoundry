@@ -341,6 +341,7 @@ class L4CannbenchResult:
     device_id: str = ""
     state: str = ""
     execution_terminal: bool = True
+    blocked_env_category: str = ""
     target_path: str = ""
     candidate_sha256: str = ""
     attempts: tuple[dict[str, str], ...] = ()
@@ -367,6 +368,7 @@ class L4CannbenchResult:
             "device_id": self.device_id,
             "state": self.state,
             "execution_terminal": self.execution_terminal,
+            "blocked_env_category": self.blocked_env_category,
             "target_path": self.target_path,
             "candidate_sha256": self.candidate_sha256,
             "attempts": [dict(item) for item in self.attempts],
@@ -2007,6 +2009,31 @@ def _gate_recorded_status(row: Mapping[str, object] | None) -> str:
     return str(row.get("recordedStatus") or row.get("status") or "")
 
 
+def _blocked_env_category(
+    row: Mapping[str, object] | None,
+    observation: Mapping[str, object],
+) -> str:
+    """Return the signed BLOCKED_ENV category; only occupancy is card-local.
+
+    A shared build lock also ends as BLOCKED_ENV, so the receipt's
+    ``errorCategory`` distinguishes an occupied card from a machine-wide
+    environment fault. Missing or unparsable categories stay unclassified and
+    never trigger card rotation.
+    """
+    if row is None:
+        return ""
+    raw_failures = row.get("failures")
+    failures = (
+        " ".join(str(item) for item in raw_failures)
+        if isinstance(raw_failures, Sequence) and not isinstance(raw_failures, (str, bytes))
+        else str(raw_failures or "")
+    )
+    blocked = _gate_recorded_status(row).upper() == "BLOCKED_ENV"
+    if not blocked and "BLOCKED_EXIT_CODE: 75" not in failures:
+        return ""
+    return str(observation.get("errorCategory") or "").strip().lower()
+
+
 def _as_positive_int(value: object) -> int:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0
@@ -3288,6 +3315,7 @@ def _l4_failure(
     device_id: str = "",
     state: str = "",
     execution_terminal: bool = True,
+    blocked_env_category: str = "",
     target_path: str = "",
     candidate_sha256: str = "",
     attempts: tuple[dict[str, str], ...] = (),
@@ -3309,6 +3337,7 @@ def _l4_failure(
         device_id=device_id,
         state=state,
         execution_terminal=execution_terminal,
+        blocked_env_category=blocked_env_category,
         target_path=target_path,
         candidate_sha256=candidate_sha256,
         attempts=attempts,
@@ -3494,6 +3523,8 @@ def run_l4_official_cannbench_via_agent_gates(
         resume_run_id=resume_run_id,
         on_execution_started=on_execution_started,
     )
+    row, observation = _gate_observation(execution.report, AGENT_GATES_L4_CANNBENCH_GATE)
+    blocked_env_category = _blocked_env_category(row, observation)
     if execution.transport_error:
         return _l4_failure(
             execution.transport_error,
@@ -3503,10 +3534,10 @@ def run_l4_official_cannbench_via_agent_gates(
             device_id=execution.device_id or result_device,
             state=execution.state,
             execution_terminal=execution.execution_terminal,
+            blocked_env_category=blocked_env_category,
             target_path=str(expected_path),
             candidate_sha256=candidate_digest,
         )
-    _, observation = _gate_observation(execution.report, AGENT_GATES_L4_CANNBENCH_GATE)
     error, failure_kind = _validate_l4_report(
         execution,
         root=root,
@@ -3524,6 +3555,7 @@ def run_l4_official_cannbench_via_agent_gates(
             device_id=execution.device_id or result_device,
             state=execution.state,
             execution_terminal=execution.execution_terminal,
+            blocked_env_category=blocked_env_category,
             target_path=str(expected_path),
             candidate_sha256=candidate_digest,
         )

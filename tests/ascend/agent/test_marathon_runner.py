@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,7 @@ from tilefoundry_ascend.agent.campaign.marathon import (
     build_resilient_l2_evaluator,
     discover_marathon_environment,
     ensure_marathon_env_file,
+    salvage_unpromoted_beam_winner,
     watch_marathon_rounds,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
@@ -92,7 +94,9 @@ def test_zero_config_env_discovery_and_existing_env_preservation(tmp_path: Path,
     assert "# keep-existing-env" in reused.read_text(encoding="utf-8")
 
     env_path.write_text(
-        content + "TILEFOUNDRY_NPU_AGENT_GATES_BIN=/tmp/fake_agent_gates\n",
+        content
+        + "TILEFOUNDRY_NPU_AGENT_GATES_BIN=/tmp/fake_agent_gates\n"
+        + "TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS=0,2\n",
         encoding="utf-8",
     )
     sanitized = ensure_marathon_env_file(
@@ -104,6 +108,7 @@ def test_zero_config_env_discovery_and_existing_env_preservation(tmp_path: Path,
     sanitized_text = sanitized.read_text(encoding="utf-8")
     assert "TILEFOUNDRY_NPU_AGENT_GATES_BIN" not in sanitized_text
     assert "TILEFOUNDRY_NPU_AGY_" not in sanitized_text
+    assert "TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS=0,2" in sanitized_text
 
 
 def test_extreme_runner_rotation_and_resilient_l2(tmp_path: Path) -> None:
@@ -327,6 +332,8 @@ def test_marathon_env_provider_values_round_trip(tmp_path, monkeypatch) -> None:
 def test_marathon_cli_and_watch_round_detection(tmp_path: Path, monkeypatch) -> None:
     """Verify CLI parser defaults, shorthand, and watch events."""
     parser = build_marathon_arg_parser()
+    parsed_default = parser.parse_args(["run", "--operator", "mla"])
+    assert parsed_default.device_id == ""
     parsed_run = parser.parse_args(
         ["run", "--operator", "mla", "--device-id", "2", "--device-ids", "0, 3"]
     )
@@ -519,3 +526,104 @@ def test_cann_opp_integrity_preference_and_source_root_sibling_lookup(
     assert discovered["TILEFOUNDRY_NPU_CANNBENCH_REPO"] == str((ws / "cann-bench").resolve())
     assert discovered["TILEFOUNDRY_NPU_TILELANG_SOURCE"] == str((ws / "tilelang").resolve())
     assert discovered["TILEFOUNDRY_NPU_AGENT_GATES_BIN"] == str(ag_bin.resolve())
+
+
+def test_marathon_entrypoint_resolves_managed_device_pool(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The managed env pool names the primary card; the old default 1 is not injected."""
+    monkeypatch.setattr(os, "environ", os.environ.copy())
+    monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
+    monkeypatch.delenv("TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS", raising=False)
+    seen_configs: list[CampaignConfig] = []
+    env_path = tmp_path / "env.sh"
+    env_path.write_text(
+        "TILEFOUNDRY_NPU_LLM_BACKEND=mock\n"
+        "TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS=0,2\n",
+        encoding="utf-8",
+    )
+
+    class Report:
+        def to_dict(self):
+            return {"status": "ok"}
+
+    class Runner:
+        def __init__(self, *, llm_backend, **kwargs):
+            assert isinstance(llm_backend, MockLLMBackend)
+            seen_configs.append(kwargs["config"])
+
+        async def run(self, *, resume):
+            return Report()
+
+    monkeypatch.setattr(marathon, "ExtremeCampaignRunner", Runner)
+    monkeypatch.setattr(marathon, "_ensure_sys_paths", lambda _: None)
+    monkeypatch.setattr(marathon, "build_resilient_l2_evaluator", lambda **_: None)
+    monkeypatch.setattr(marathon, "build_prewarmed_l3_runner", lambda **_: None)
+    monkeypatch.setattr(marathon, "salvage_unpromoted_beam_winner", lambda **_: None)
+    target = tmp_path / "kernels.py"
+    target.touch()
+    assert (
+        marathon.main(
+            [
+                "run",
+                "--operator",
+                "mla",
+                "--source-root",
+                str(tmp_path),
+                "--target-file",
+                str(target),
+                "--checkpoint",
+                str(tmp_path / "checkpoint.json"),
+                "--env-file",
+                str(env_path),
+            ]
+        )
+        == 0
+    )
+    assert seen_configs[0].device_id == "0"
+    assert seen_configs[0].device_ids == ("2",)
+
+
+def test_salvage_skips_pending_l4_checkpoint_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    """A pending L4 keeps its submitted candidate; salvage never rewrites it first."""
+    target = tmp_path / "kernels.py"
+    original = "def incumbent():\n    return 1\n"
+    target.write_text(original, encoding="utf-8")
+    checkpoint = tmp_path / "checkpoint.json"
+    checkpoint.write_text(
+        json.dumps(
+            {
+                "incumbent_source": original,
+                "pending_l4": {
+                    "target_path": str(target),
+                    "candidate_relative": target.name,
+                    "candidate_sha256": hashlib.sha256(original.encode("utf-8")).hexdigest(),
+                    "device_id": "1",
+                    "state": "BLOCKED",
+                    "blocked_env_category": "occupancy",
+                },
+                "best_result": {},
+                "beam_states": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _must_not_evaluate(*_args, **_kwargs):
+        raise AssertionError("salvage must not evaluate a pending-L4 checkpoint")
+
+    promoted = salvage_unpromoted_beam_winner(
+        operator_name="attention_residual",
+        checkpoint_path=checkpoint,
+        target_module_path=target,
+        worktree=tmp_path,
+        env_file=tmp_path / "env.sh",
+        device_id="1",
+        min_surrogate_gain=0.1,
+        l2_evaluator=_must_not_evaluate,
+        l3_runner=_must_not_evaluate,
+    )
+    assert promoted is False
+    assert target.read_text(encoding="utf-8") == original

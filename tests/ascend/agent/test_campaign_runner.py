@@ -51,6 +51,7 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     _extract_regime_abi_context,
     _resolve_l4_device_pool,
     parse_device_ids,
+    resolve_campaign_device_plan,
 )
 from tilefoundry_ascend.agent.campaign.marathon import build_marathon_arg_parser
 from tilefoundry_ascend.agent.kb import build_predicate_context
@@ -5881,7 +5882,7 @@ def _l4_campaign_runner(
     )
 
 
-def _blocked_env_l4(device_id: str) -> L4CannbenchResult:
+def _blocked_env_l4(device_id: str, *, category: str = "occupancy") -> L4CannbenchResult:
     return L4CannbenchResult(
         passed=False,
         failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
@@ -5889,6 +5890,7 @@ def _blocked_env_l4(device_id: str) -> L4CannbenchResult:
         device_id=device_id,
         state="BLOCKED",
         execution_id="exec-blocked",
+        blocked_env_category=category,
     )
 
 
@@ -5984,7 +5986,7 @@ def _pending_l4_checkpoint(
     *,
     digest: str,
     blocked_env_rounds_used: int,
-    blocked_env_round_limit: int,
+    blocked_env_round_limit: int | None,
     execution_id: str = "",
     run_id: str = "",
     state: str = "",
@@ -5994,6 +5996,7 @@ def _pending_l4_checkpoint(
     device_id: str = "3",
     device_pool: tuple[str, ...] = (),
     blocked_env_round_attempted_device_ids: tuple[str, ...] = (),
+    blocked_env_category: str = "occupancy",
     retry_used: bool = False,
 ) -> campaign_runner.PendingL4:
     """Build one resumable pending-L4 record whose candidate digest matches disk."""
@@ -6013,6 +6016,7 @@ def _pending_l4_checkpoint(
         blocked_env_round_attempted_device_ids=blocked_env_round_attempted_device_ids,
         blocked_env_rounds_used=blocked_env_rounds_used,
         blocked_env_round_limit=blocked_env_round_limit,
+        blocked_env_category=blocked_env_category,
         prior_stop_reason="final",
     )
 
@@ -6538,3 +6542,224 @@ def test_pending_l4_from_dict_reads_legacy_same_card_quota(tmp_path: Path) -> No
     assert pending.blocked_env_round_limit == 2
     assert pending.device_pool == ()
     assert pending.blocked_env_round_attempted_device_ids == ()
+
+
+def test_resolve_campaign_device_plan_never_injects_default_card() -> None:
+    """The env-file pool is the source, and the old ``1`` default joins no declared pool."""
+    assert resolve_campaign_device_plan(
+        device_id="",
+        device_ids=(),
+        env_device_ids=("0", "2"),
+    ) == ("0", ("0", "2"))
+    assert resolve_campaign_device_plan(
+        device_id="",
+        device_ids=(),
+        env_device_ids=(),
+    ) == ("1", ("1",))
+    assert resolve_campaign_device_plan(
+        device_id="1",
+        device_ids=(),
+        env_device_ids=("0", "2"),
+    ) == ("1", ("1", "0", "2"))
+    assert resolve_campaign_device_plan(
+        device_id="",
+        device_ids=("2", "0"),
+        env_device_ids=("0", "1"),
+    ) == ("2", ("2", "0"))
+    assert resolve_campaign_device_plan(
+        device_id="07",
+        device_ids=("2",),
+        env_device_ids=(),
+    ) == ("7", ("7", "2"))
+
+
+@pytest.mark.parametrize("category", ["", "environment", "config"])
+def test_final_l4_non_occupancy_blocked_env_does_not_sweep_pool(
+    tmp_path: Path, monkeypatch, category: str
+) -> None:
+    """A build lock or machine fault never moves a complete L4 run to another card."""
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    def _fake_l4(module_path: Path, *, device_id: str = "") -> L4CannbenchResult:
+        calls.append(device_id)
+        return _blocked_env_l4(device_id, category=category)
+
+    monkeypatch.setattr(campaign_runner.time, "sleep", sleeps.append)
+    runner = _l4_campaign_runner(
+        tmp_path,
+        _fake_l4,
+        device_id="0",
+        device_ids=("1", "2"),
+        backoff_sec=3.0,
+    )
+    result = runner._run_final_l4_tracked(
+        incumbent_source="candidate",
+        prior_stop_reason="final",
+    )
+    assert result.passed is False
+    assert result.blocked_env_category == category
+    assert calls == ["0"]
+    assert sleeps == []
+    pending = runner._pending_l4
+    assert pending is not None
+    assert pending.device_pool == ("0", "1", "2")
+    assert pending.blocked_env_rounds_used == 0
+    assert pending.blocked_env_round_attempted_device_ids == ("0",)
+
+
+def test_pending_l4_explicit_zero_limit_is_not_raised_by_current_config(
+    tmp_path: Path,
+) -> None:
+    """An explicit zero round budget forbids backoff even when config now allows rounds."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+
+    def _l4_must_not_run(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        raise AssertionError(
+            f"zero-budget pending L4 must not run for {module_path} "
+            f"({resume_execution_id}, {resume_run_id}, {device_id}, {on_execution_started})"
+        )
+
+    runner = _l4_campaign_runner(
+        tmp_path,
+        _l4_must_not_run,
+        device_id="0",
+        device_ids=("1",),
+        retries=5,
+    )
+    pending = _pending_l4_checkpoint(
+        target_path,
+        digest=digest,
+        blocked_env_rounds_used=0,
+        blocked_env_round_limit=0,
+        state="BLOCKED",
+        device_id="1",
+        device_pool=("0", "1"),
+        blocked_env_round_attempted_device_ids=("0", "1"),
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert result.passed is False
+    assert updated is not None
+    assert updated.blocked_env_rounds_used == 0
+    assert updated.blocked_env_round_limit == 0
+    assert updated.attempts == pending.attempts
+    assert runner._pending_l4 == updated
+
+
+def test_pending_l4_interrupted_backoff_resumes_saved_card_once(tmp_path: Path) -> None:
+    """A crashed submit intent resumes its saved card without spending another round."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+    calls: list[str] = []
+
+    def _l4(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        assert module_path == target_path
+        assert (resume_execution_id, resume_run_id) == ("", "")
+        calls.append(device_id)
+        assert on_execution_started is not None
+        on_execution_started("exec-backoff-resumed", device_id)
+        return _blocked_env_l4(device_id)
+
+    runner = _l4_campaign_runner(
+        tmp_path,
+        _l4,
+        device_id="0",
+        device_ids=("1",),
+        retries=1,
+    )
+    pending = _pending_l4_checkpoint(
+        target_path,
+        digest=digest,
+        blocked_env_rounds_used=1,
+        blocked_env_round_limit=1,
+        state="SUBMITTED",
+        execution_id="",
+        execution_terminal=False,
+        device_id="1",
+        device_pool=("0", "1"),
+        blocked_env_round_attempted_device_ids=("0", "1"),
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert calls == ["1"]
+    assert result.passed is False
+    assert updated is not None
+    assert updated.execution_id == "exec-blocked"
+    assert updated.blocked_env_rounds_used == 1
+    assert updated.blocked_env_round_limit == 1
+    assert len(updated.attempts) == 1
+    assert runner._pending_l4 == updated
+
+
+def test_pending_l4_resume_intersects_saved_pool_with_current_authorization(
+    tmp_path: Path,
+) -> None:
+    """A narrowed current pool never submits to a card the config no longer authorizes."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+    calls: list[str] = []
+
+    def _l4(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        assert module_path == target_path
+        calls.append(device_id)
+        assert on_execution_started is not None
+        on_execution_started(f"exec-{device_id}", device_id)
+        return _blocked_env_l4(device_id)
+
+    runner = _l4_campaign_runner(
+        tmp_path,
+        _l4,
+        device_id="0",
+        device_ids=("1",),
+        retries=1,
+    )
+    pending = _pending_l4_checkpoint(
+        target_path,
+        digest=digest,
+        blocked_env_rounds_used=0,
+        blocked_env_round_limit=1,
+        state="BLOCKED",
+        device_id="0",
+        device_pool=("0", "1", "2"),
+        blocked_env_round_attempted_device_ids=("0",),
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert calls == ["1", "0", "1"]
+    assert result.passed is False
+    assert updated is not None
+    assert updated.device_pool == ("0", "1")
+    assert updated.blocked_env_rounds_used == 1
+    assert updated.blocked_env_round_limit == 1

@@ -35,11 +35,13 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     parse_simple_env_file,
 )
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
+    CAMPAIGN_DEVICE_IDS_ENV_KEY,
     CampaignConfig,
     PerfTargetCampaignRunner,
     _render_trackb_tu_from_module,
     parse_device_ids,
     patch_regime_into_module,
+    resolve_campaign_device_plan,
     resolve_regime_config,
 )
 from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
@@ -113,6 +115,7 @@ _LEGACY_AGY_ENV_KEYS = frozenset(
 _SUPPORTED_OPERATORS: tuple[str, ...] = ()
 _AGENT_GATES_ALLOWED_ENV_KEYS = frozenset(
     {
+        "TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS",
         "TILEFOUNDRY_NPU_CANN_SETUP",
         "TILEFOUNDRY_NPU_CONDA_SH",
         "TILEFOUNDRY_NPU_CONDA_ENV",
@@ -184,7 +187,7 @@ class MarathonConfig:
     """Configuration for a zero-config score-sprint marathon campaign."""
 
     operator_name: str
-    device_id: str = "1"
+    device_id: str = ""
     retry_device_id: str = ""
     device_ids: tuple[str, ...] = ()
     source_root: Path | None = None
@@ -1208,6 +1211,11 @@ def salvage_unpromoted_beam_winner(
         return False
     log = op_logger or logger
     payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    if isinstance(payload.get("pending_l4"), Mapping):
+        log.info(
+            "SALVAGE_SKIPPED pending L4 checkpoint must resume before any target mutation"
+        )
+        return False
     best_dict = payload.get("best_result") or {}
     best_res = CandidateSurrogateResult.from_dict(best_dict)
     if not payload.get("incumbent_source"):
@@ -1509,6 +1517,13 @@ def run_operator_marathon(
         worktree=worktree,
         source_root=_source_root,
     )
+    primary_device_id, device_pool = resolve_campaign_device_plan(
+        device_id=str(cfg.device_id),
+        device_ids=tuple(cfg.device_ids),
+        env_device_ids=parse_device_ids(
+            env_values.get(CAMPAIGN_DEVICE_IDS_ENV_KEY, "")
+        ),
+    )
     llm_backend = create_llm_backend_from_env(overrides=_llm_backend_overrides(env_values, cfg))
     raw_cannbench_repo = (
         env_values.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
@@ -1516,9 +1531,10 @@ def run_operator_marathon(
     )
     cannbench_repo = Path(raw_cannbench_repo) if raw_cannbench_repo else None
     op_logger.info(
-        "MARATHON_BOOT op=%s device=%s worktree=%s env_file=%s",
+        "MARATHON_BOOT op=%s device=%s pool=%s worktree=%s env_file=%s",
         cfg.operator_name,
-        cfg.device_id,
+        primary_device_id,
+        ",".join(device_pool),
         worktree,
         env_file,
     )
@@ -1535,7 +1551,7 @@ def run_operator_marathon(
                 cannbench_repo=cannbench_repo,
                 llm_backend=llm_backend,
                 cold_start=cfg.cold_start,
-                device_id=str(cfg.device_id),
+                device_id=primary_device_id,
                 op_logger=op_logger,
             )
         except (OSError, RuntimeError, ValueError) as exc:
@@ -1561,7 +1577,7 @@ def run_operator_marathon(
         operator_name=cfg.operator_name,
         worktree=worktree,
         env_file=env_file,
-        device_id=str(cfg.device_id),
+        device_id=primary_device_id,
         warmup=cfg.warmup,
         repeat=cfg.repeat,
         op_logger=op_logger,
@@ -1570,7 +1586,7 @@ def run_operator_marathon(
         operator_name=cfg.operator_name,
         worktree=worktree,
         env_file=env_file,
-        device_id=str(cfg.device_id),
+        device_id=primary_device_id,
         prewarm_l3=cfg.prewarm_l3,
         op_logger=op_logger,
     )
@@ -1588,7 +1604,7 @@ def run_operator_marathon(
             target_module_path=target_module,
             worktree=worktree,
             env_file=env_file,
-            device_id=str(cfg.device_id),
+            device_id=primary_device_id,
             min_surrogate_gain=cfg.min_surrogate_gain,
             l2_evaluator=l2_evaluator,
             l3_runner=l3_runner,
@@ -1620,9 +1636,9 @@ def run_operator_marathon(
         disable_early_goal_stop=cfg.disable_early_goal_stop,
         run_final_l4=cfg.run_final_l4,
         l4_regression_ratio=cfg.l4_regression_ratio,
-        device_id=str(cfg.device_id),
+        device_id=primary_device_id,
         retry_device_id=str(cfg.retry_device_id),
-        device_ids=tuple(cfg.device_ids),
+        device_ids=tuple(device for device in device_pool if device != primary_device_id),
         warmup=cfg.warmup,
         repeat=cfg.repeat,
         enable_tilesize_prescreen=cfg.enable_tilesize_prescreen,
@@ -1638,7 +1654,7 @@ def run_operator_marathon(
             spec,
             source_root=worktree,
             env_file=env_file,
-            device_id=str(cfg.device_id),
+            device_id=primary_device_id,
             min_speedup=1.08,
             timeout_sec=360,
         ),
@@ -1658,7 +1674,7 @@ def run_operator_marathon(
             anc_seq,
             source_root=worktree,
             env_file=env_file,
-            device_id=str(cfg.device_id),
+            device_id=primary_device_id,
             timeout_sec=600,
         ),
         l3_contract_runner=l3_runner,
@@ -1666,7 +1682,7 @@ def run_operator_marathon(
             operator_name=cfg.operator_name,
             candidate_module_path=mod_path,
             source_root=worktree,
-            device_id=str(kwargs.get("device_id") or cfg.device_id),
+            device_id=str(kwargs.get("device_id") or primary_device_id),
             timeout_sec=DEFAULT_L4_CANNBENCH_WAIT_SEC,
             resume_execution_id=str(kwargs.get("resume_execution_id") or ""),
             resume_run_id=str(kwargs.get("resume_run_id") or ""),
@@ -1693,7 +1709,7 @@ def run_operator_marathon(
         "Launching ExtremeCampaignRunner op=%s device=%s resume=%s max_rounds=%d "
         "max_wall_min=%.1f target_score=%.1f target_eta=%.3f worktree=%s",
         cfg.operator_name,
-        cfg.device_id,
+        primary_device_id,
         resume_flag,
         campaign_cfg.max_rounds,
         campaign_cfg.max_wall_clock_min,
@@ -2116,7 +2132,14 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         required=True,
         help="Target operator to optimize (short name e.g. rms_norm or task id e.g. level2/rms_norm).",
     )
-    parser.add_argument("--device-id", default="1", help="Authorized NPU device ID.")
+    parser.add_argument(
+        "--device-id",
+        default="",
+        help=(
+            "Authorized NPU device ID; defaults to the first card declared by "
+            "TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS, else 1."
+        ),
+    )
     parser.add_argument(
         "--device-ids",
         type=parse_device_ids,

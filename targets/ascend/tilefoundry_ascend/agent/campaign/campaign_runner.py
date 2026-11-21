@@ -172,16 +172,17 @@ from tilefoundry_ascend.ascend.templates.registry import relax_facets_for_bottle
 logger = logging.getLogger(__name__)
 
 
-def _is_blocked_env_failure(
-    failure_kind: str,
-    error_message: str,
-    state: str,
-) -> bool:
-    """Return True when an L4 attempt was preempted by an external process (exit 75)."""
-    if failure_kind != FAILURE_KIND_INFRASTRUCTURE:
-        return False
-    message = " ".join((error_message, state)).lower()
-    return "blocked_env" in message or "blocked_exit_code: 75" in message
+def _is_occupancy_blocked_env(failure_kind: str, blocked_env_category: str) -> bool:
+    """Return True only for a signed occupancy BLOCKED_ENV preemption.
+
+    A shared build lock or a machine-wide environment fault also ends as
+    BLOCKED_ENV; rotating every card on those would only repeat the same
+    failure. The receipt's ``errorCategory`` must say ``occupancy``.
+    """
+    return (
+        failure_kind == FAILURE_KIND_INFRASTRUCTURE
+        and blocked_env_category == "occupancy"
+    )
 
 
 @dataclass(frozen=True)
@@ -195,7 +196,10 @@ class CampaignConfig:
     while only a fully blocked round waits the bounded linear retry. The legacy
     ``retry_device_id`` keeps its single whole-run retry after a proven-terminal
     infrastructure failure and also joins the blocked-env pool. An empty pool
-    therefore keeps the single-card bounded backoff. ``round_regime_tags``
+    therefore keeps the single-card bounded backoff. The pool may also be
+    declared once in the managed env file under
+    ``TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS``; entry points resolve that file into
+    ``device_ids`` before constructing this config. ``round_regime_tags``
     forces one regime per 1-based round position and falls back to adaptive
     rotation for later rounds.
     """
@@ -227,6 +231,7 @@ class CampaignConfig:
 
 
 _DEVICE_ID_PATTERN = re.compile(r"[0-9]+")
+CAMPAIGN_DEVICE_IDS_ENV_KEY = "TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS"
 
 
 def parse_device_ids(raw: str) -> tuple[str, ...]:
@@ -245,6 +250,35 @@ def _canonical_device_id(value: str, *, field: str) -> str:
     if not _DEVICE_ID_PATTERN.fullmatch(text):
         raise ValueError(f"{field} must be a nonnegative decimal device ID, got {value!r}")
     return str(int(text))
+
+
+def resolve_campaign_device_plan(
+    *,
+    device_id: str,
+    device_ids: tuple[str, ...],
+    env_device_ids: tuple[str, ...],
+) -> tuple[str, tuple[str, ...]]:
+    """Resolve the primary card and ordered pool from CLI and managed env declarations.
+
+    Explicit ``--device-ids`` cards override the env-file pool; otherwise the
+    env-file pool is the declaration source. The primary is an explicitly
+    supplied ``--device-id``, otherwise the first configured pool card, and only
+    then the legacy ``"1"``. A CLI default therefore never injects a card that
+    the managed pool did not declare.
+    """
+    configured = device_ids or env_device_ids
+    canonical_configured = tuple(
+        _canonical_device_id(value, field=f"configured_device_ids[{index}]")
+        for index, value in enumerate(configured)
+    )
+    primary = _canonical_device_id(device_id, field="device_id") if device_id.strip() else ""
+    if not primary:
+        primary = canonical_configured[0] if canonical_configured else "1"
+    pool = [primary]
+    for canonical in canonical_configured:
+        if canonical not in pool:
+            pool.append(canonical)
+    return primary, tuple(pool)
 
 
 def _resolve_l4_device_pool(config: CampaignConfig) -> tuple[str, ...]:
@@ -450,7 +484,10 @@ class PendingL4:
     records which cards the current blocked-env round already tried, and
     ``blocked_env_rounds_used``/``blocked_env_round_limit`` bound the number of
     complete blocked rounds, so a restart continues at the next untried card
-    instead of spending a recorded round or retry twice.
+    instead of spending a recorded round or retry twice. A ``None`` limit marks
+    a legacy record without a stored quota; an explicit ``0`` forbids every
+    additional round. ``blocked_env_category`` keeps the signed occupancy
+    classification so a build-lock BLOCKED_ENV never rotates cards.
     """
 
     target_path: str
@@ -468,7 +505,8 @@ class PendingL4:
     device_pool: tuple[str, ...] = ()
     blocked_env_round_attempted_device_ids: tuple[str, ...] = ()
     blocked_env_rounds_used: int = 0
-    blocked_env_round_limit: int = 0
+    blocked_env_round_limit: int | None = None
+    blocked_env_category: str = ""
     attempts: tuple[dict[str, str], ...] = ()
     prior_stop_reason: str = ""
 
@@ -493,6 +531,7 @@ class PendingL4:
             ),
             "blocked_env_rounds_used": self.blocked_env_rounds_used,
             "blocked_env_round_limit": self.blocked_env_round_limit,
+            "blocked_env_category": self.blocked_env_category,
             "attempts": [dict(item) for item in self.attempts],
             "prior_stop_reason": self.prior_stop_reason,
         }
@@ -538,16 +577,16 @@ class PendingL4:
                     or 0
                 ),
             ),
-            blocked_env_round_limit=max(
-                0,
-                int(
-                    payload.get(
-                        "blocked_env_round_limit",
-                        payload.get("same_card_retry_limit", 0),
-                    )
-                    or 0
-                ),
+            blocked_env_round_limit=(
+                max(0, int(payload["blocked_env_round_limit"]))
+                if payload.get("blocked_env_round_limit") is not None
+                else (
+                    max(0, int(payload["same_card_retry_limit"]))
+                    if payload.get("same_card_retry_limit") is not None
+                    else None
+                )
             ),
+            blocked_env_category=str(payload.get("blocked_env_category", "")),
             attempts=attempts,
             prior_stop_reason=str(payload.get("prior_stop_reason", "")),
         )
@@ -4633,6 +4672,7 @@ class PerfTargetCampaignRunner:
             "device_id": result.device_id,
             "state": result.state,
             "execution_terminal": str(result.execution_terminal).lower(),
+            "blocked_env_category": result.blocked_env_category,
             "official_report_valid": str(result.official_report_valid).lower(),
             "all_cases_passed": str(result.all_cases_passed).lower(),
             "all_timings_valid": str(result.all_timings_valid).lower(),
@@ -4665,13 +4705,27 @@ class PerfTargetCampaignRunner:
             return pending.blocked_env_round_attempted_device_ids
         return (pending.device_id,) if pending.device_id else ()
 
+    def _effective_l4_round_limit(self, pending: PendingL4) -> int:
+        """Return the stored quota, or the current config for legacy records."""
+        if pending.blocked_env_round_limit is not None:
+            return max(0, pending.blocked_env_round_limit)
+        return max(0, self._config.l4_blocked_env_max_retries)
+
+    def _effective_l4_pool(self, pending: PendingL4) -> tuple[str, ...]:
+        """Intersect a saved pool with the pool the current config authorizes."""
+        if not pending.device_pool:
+            return self._l4_device_pool
+        allowed = set(self._l4_device_pool)
+        narrowed = tuple(device for device in pending.device_pool if device in allowed)
+        return narrowed or self._l4_device_pool
+
     def _advance_blocked_env_l4(
         self,
         pending: PendingL4,
         result: L4CannbenchResult,
         attempts: list[dict[str, str]],
     ) -> tuple[L4CannbenchResult, PendingL4]:
-        """Move a terminal BLOCKED_ENV run across the configured card pool.
+        """Move a terminal occupancy-blocked L4 run across the configured card pool.
 
         Another untried card in the same round is submitted immediately: the
         complete official L4 restarts there for the same candidate SHA, and no
@@ -4681,12 +4735,8 @@ class PerfTargetCampaignRunner:
         intent is persisted before its long wait, so a restart continues on the
         next untried card instead of spending a recorded round twice.
         """
-        pool = pending.device_pool or self._l4_device_pool
-        limit = (
-            pending.blocked_env_round_limit
-            if pending.blocked_env_round_limit > 0
-            else max(0, self._config.l4_blocked_env_max_retries)
-        )
+        pool = self._effective_l4_pool(pending)
+        limit = self._effective_l4_round_limit(pending)
         current = replace(
             self._pending_l4_after(
                 pending,
@@ -4710,10 +4760,9 @@ class PerfTargetCampaignRunner:
             self._pending_l4 = current
             self._persist_runtime_state("pending_l4", current.to_dict())
 
-        while result.execution_terminal and _is_blocked_env_failure(
+        while result.execution_terminal and _is_occupancy_blocked_env(
             result.failure_kind,
-            result.error_message,
-            result.state,
+            result.blocked_env_category,
         ):
             attempted = self._l4_round_attempted_devices(current)
             untried = tuple(device for device in pool if device not in attempted)
@@ -4741,6 +4790,7 @@ class PerfTargetCampaignRunner:
                 execution_terminal=False,
                 blocked_env_rounds_used=next_rounds,
                 blocked_env_round_attempted_device_ids=next_attempted,
+                blocked_env_category="",
             )
             self._pending_l4 = current
             self._persist_runtime_state("pending_l4", current.to_dict())
@@ -4772,6 +4822,7 @@ class PerfTargetCampaignRunner:
             target_path=result.target_path or pending.target_path,
             candidate_sha256=result.candidate_sha256 or pending.candidate_sha256,
             device_id=result.device_id or pending.device_id,
+            blocked_env_category=result.blocked_env_category or pending.blocked_env_category,
             attempts=pending.attempts or result.attempts,
         )
 
@@ -4796,6 +4847,7 @@ class PerfTargetCampaignRunner:
             failure_kind=result.failure_kind or pending.failure_kind,
             execution_terminal=result.execution_terminal,
             retry_used=retry_used,
+            blocked_env_category=result.blocked_env_category,
             attempts=attempts,
         )
 
@@ -4858,7 +4910,13 @@ class PerfTargetCampaignRunner:
             return failed, updated
 
         attempts = list(pending.attempts)
-        current = pending
+        effective_pool = self._effective_l4_pool(pending)
+        effective_limit = self._effective_l4_round_limit(pending)
+        current = replace(
+            pending,
+            device_pool=effective_pool,
+            blocked_env_round_limit=effective_limit,
+        )
 
         def _record_started(execution_id: str, device: str) -> None:
             nonlocal current
@@ -4910,6 +4968,7 @@ class PerfTargetCampaignRunner:
                 failure_kind=FAILURE_KIND_INFRASTRUCTURE,
                 execution_terminal=False,
                 retry_used=True,
+                blocked_env_category="",
             )
             retry_result = self._run_l4_cannbench(
                 self._target_module_path,
@@ -4939,10 +4998,9 @@ class PerfTargetCampaignRunner:
             result: L4CannbenchResult,
         ) -> tuple[L4CannbenchResult, PendingL4 | None]:
             nonlocal current
-            if _is_blocked_env_failure(
+            if _is_occupancy_blocked_env(
                 result.failure_kind,
-                result.error_message,
-                result.state,
+                result.blocked_env_category,
             ):
                 result, current = self._advance_blocked_env_l4(
                     current,
@@ -4976,10 +5034,9 @@ class PerfTargetCampaignRunner:
             self._persist_runtime_state("pending_l4", current.to_dict())
             return _after_infrastructure(result)
 
-        blocked_env_pending = _is_blocked_env_failure(
+        blocked_env_pending = _is_occupancy_blocked_env(
             pending.failure_kind,
-            pending.error_message,
-            pending.state,
+            pending.blocked_env_category,
         )
         interrupted_submission = (
             not pending.execution_terminal
@@ -4991,14 +5048,19 @@ class PerfTargetCampaignRunner:
             (blocked_env_pending and pending.execution_terminal)
             or (
                 interrupted_submission
-                and pending.blocked_env_round_limit > 0
-                and pending.blocked_env_rounds_used <= pending.blocked_env_round_limit
+                and current.blocked_env_rounds_used <= effective_limit
             )
         ):
             if interrupted_submission:
+                interrupted_device = (
+                    current.device_id
+                    if current.device_id in effective_pool
+                    else effective_pool[0]
+                )
+                current = replace(current, device_id=interrupted_device)
                 result = self._run_l4_cannbench(
                     self._target_module_path,
-                    device_id=pending.device_id or self._config.device_id,
+                    device_id=interrupted_device,
                     on_execution_started=_record_started,
                 )
                 attempts.append(self._l4_attempt(result))
@@ -5021,6 +5083,7 @@ class PerfTargetCampaignRunner:
                     device_id=pending.device_id,
                     state=pending.state,
                     execution_terminal=pending.execution_terminal,
+                    blocked_env_category=pending.blocked_env_category,
                     target_path=pending.target_path,
                     candidate_sha256=expected,
                     attempts=pending.attempts,
@@ -5044,6 +5107,7 @@ class PerfTargetCampaignRunner:
             device_id=pending.device_id,
             state=pending.state,
             execution_terminal=pending.execution_terminal,
+            blocked_env_category=pending.blocked_env_category,
             target_path=pending.target_path,
             candidate_sha256=expected,
             attempts=pending.attempts,
@@ -5060,11 +5124,10 @@ class PerfTargetCampaignRunner:
 
     @staticmethod
     def _is_blocked_env_l4(result: L4CannbenchResult) -> bool:
-        """Return True when L4 was preempted by an external process (exit 75)."""
-        return _is_blocked_env_failure(
+        """Return True only for an occupancy-classified BLOCKED_ENV receipt."""
+        return _is_occupancy_blocked_env(
             result.failure_kind,
-            result.error_message,
-            result.state,
+            result.blocked_env_category,
         )
 
     def _run_final_l4_tracked(
