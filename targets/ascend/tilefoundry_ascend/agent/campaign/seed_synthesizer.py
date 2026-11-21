@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -22,6 +23,8 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     KernelLLMBackend,
     extract_python_dsl,
 )
+
+logger = logging.getLogger(__name__)
 from tilefoundry_ascend.agent.orchestrator.llm_constraints import (
     build_progressive_llm_constraints,
 )
@@ -1120,6 +1123,13 @@ async def prepare_operator_seed_or_takeover(
         transport_retries = 0
         ok_static, static_err = l0_l1_validator(synthesized_src, initial_track)
         if not ok_static:
+            logger.info(
+                "STAGE0_ATTEMPT op=%s attempt=%d track=%s stage=static_l0_l1 detail=%s",
+                operator_name,
+                attempt,
+                initial_track,
+                static_err.replace("\n", " ")[:500],
+            )
             last_error = f"L0/L1 static or compiler rejection:\n{static_err}"
             last_rejected_source = synthesized_src
             last_rejected_error = last_error
@@ -1161,10 +1171,15 @@ async def prepare_operator_seed_or_takeover(
                 l3_state=evidence.l3_state,
                 l3_elapsed_sec=evidence.elapsed_sec,
             )
-        last_error = (
-            "NPU numerical mismatch against PyTorch golden:\n"
-            f"{evidence.error_message or f'L3 promotion state={evidence.l3_state}'}"
+        oracle_detail = evidence.error_message or f"L3 promotion state={evidence.l3_state}"
+        logger.info(
+            "STAGE0_ATTEMPT op=%s attempt=%d track=%s stage=oracle_l3 detail=%s",
+            operator_name,
+            attempt,
+            initial_track,
+            oracle_detail.replace("\n", " ")[:500],
         )
+        last_error = f"NPU numerical mismatch against PyTorch golden:\n{oracle_detail}"
         last_rejected_source = synthesized_src
         last_rejected_error = last_error
         attempt += 1

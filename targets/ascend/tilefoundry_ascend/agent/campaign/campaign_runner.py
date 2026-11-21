@@ -1347,6 +1347,28 @@ def _is_prim_func_decorator(dec: ast.expr) -> bool:
     return False
 
 
+def _has_prim_func_builder(
+    module_source: str,
+    builder_candidates: Sequence[str],
+) -> bool:
+    if not builder_candidates:
+        return False
+    try:
+        tree = ast.parse(module_source)
+    except SyntaxError:
+        return False
+    candidate_set = set(builder_candidates)
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name not in candidate_set:
+            continue
+        for sub in ast.walk(node):
+            if not isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) or sub is node:
+                continue
+            if any(_is_prim_func_decorator(dec) for dec in sub.decorator_list):
+                return True
+    return False
+
+
 def _extract_func_signature_header(lines: Sequence[str], node: ast.FunctionDef) -> str:
     if node.body and node.body[0].lineno > node.lineno:
         end_idx = node.body[0].lineno - 1
@@ -2923,7 +2945,7 @@ class PerfTargetCampaignRunner:
                 fixes = rep.suggested_fixes
                 if not rep.passed and fixes:
                     return ConstraintRelaxationMask(
-                        alg_compute_and_monoid=not bool(fixes.get("unlock_alg_compute_and_monoid")),
+                        alg_compute_and_monoid=True,
                         tile_and_stage_knobs=True,
                         exec_mode_and_spr=bool(fixes.get("unlock_exec_mode_and_spr", False)),
                         sram_layout_and_aliasing=bool(
@@ -2968,7 +2990,13 @@ class PerfTargetCampaignRunner:
             if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
             else None
         )
-        if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
+        is_trackb_only_hybrid = (
+            regime_spec.runtime_backend == "hybrid_trackb"
+            and not _has_prim_func_builder(module_source, regime_spec.builder_candidates)
+        )
+        if tb_extracted is not None and (
+            regime_spec.runtime_backend == "ascendc_trackb" or is_trackb_only_hybrid
+        ):
             active_mask = self._resolve_trackb_freedom_mask(regime_spec)
             instantiated_tu = self._instantiate_trackb_tu(
                 module_source, tb_extracted[1], regime_spec
@@ -3079,7 +3107,13 @@ class PerfTargetCampaignRunner:
             if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
             else None
         )
-        if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
+        is_trackb_only_hybrid = (
+            regime_spec.runtime_backend == "hybrid_trackb"
+            and not _has_prim_func_builder(module_source, regime_spec.builder_candidates)
+        )
+        if tb_extracted is not None and (
+            regime_spec.runtime_backend == "ascendc_trackb" or is_trackb_only_hybrid
+        ):
             instantiated_tu = self._instantiate_trackb_tu(
                 module_source, tb_extracted[1], regime_spec
             )

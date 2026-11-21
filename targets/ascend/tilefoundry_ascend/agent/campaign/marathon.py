@@ -90,6 +90,7 @@ from tilefoundry_ascend.ascend.cost_model.experience_lake import (
     compute_source_sha256,
     resolve_default_experience_lake_dir,
 )
+from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask
 from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
 from tilefoundry_ascend.ascend.target.dialect_surface import CCE_CPP20_SURFACE
 
@@ -466,6 +467,7 @@ def _validate_stage0_track_b(
         return False, f"Track-B _render_trackb_tu instantiation failed ({symbol}): {exc}"
     verdict = evaluate_ascendc_candidate(
         instantiated_tu,
+        freedom_mask=ConstraintRelaxationMask.top(),
         case_ratios=regime_spec.representative_case_ratios,
     )
     if not verdict.passed:

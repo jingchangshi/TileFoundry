@@ -1298,3 +1298,90 @@ def test_stagnation_diagnosis_six_taxonomy_and_checkpoint_roundtrip(
         resume=True,
     )
     assert resumed_legacy.stagnation_diagnosis["regimes"]["reg_a"]["l2_no_gain_rounds"] == 1
+
+
+def test_hybrid_trackb_without_prim_func_and_freedom_mask_preserves_alg_monoid(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Track-B-only hybrid regimes run L0/L1 via bisheng and keep alg facet unlocked."""
+    hyb_file = tmp_path / "hyb_op.py"
+    hyb_src = dedent(
+        '''
+        import torch
+
+        HYB_TRACKB_CU = """
+        #include <tl_templates/ascend/kernel_entry.h>
+        __global__ void hyb_k(__gm__ float* q, __gm__ float* y) {
+            __simd_vf__ void (*fn)() = nullptr;
+            asc_copy_gm2ub_align(nullptr, nullptr, 64);
+        }
+        """
+
+        def _select_hyb_config(**kwargs) -> dict[str, object]:
+            return {"pass_configs": {}, "compile_flags": []}
+
+        def _build_hyb_prim_func(**kwargs) -> str:
+            return HYB_TRACKB_CU
+
+        def _render_trackb_tu(trackb_src: str = HYB_TRACKB_CU, **dims: object) -> str:
+            return trackb_src + "\\nvoid launch() { hyb_k<<<1, 1, 1>>>(nullptr, nullptr); }\\n"
+
+        def _get_kernel(**kwargs) -> object:
+            return object()
+
+        def hyb_op(q: torch.Tensor) -> torch.Tensor:
+            return q
+
+        kernel = hyb_op
+        '''
+    )
+    hyb_file.write_text(hyb_src, encoding="utf-8")
+    regime = RegimeTargetSpec(
+        regime_tag="hyb_reg",
+        description="hybrid track-b only",
+        builder_candidates=("_build_hyb_prim_func",),
+        config_selector_fn="_select_hyb_config",
+        representative_hir_dims={"total_elements": 64},
+        sample_builder_kwargs={"total_elements": 64},
+        editable_symbols=("HYB_TRACKB_CU", "_select_hyb_config"),
+        runtime_backend="hybrid_trackb",
+        trackb_symbols=("HYB_TRACKB_CU",),
+    )
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="hyb_op", max_rounds=1, pure_golden=True),
+        target_module_path=hyb_file,
+        anchors=(
+            AnchorCaseSpec(
+                task="hyb_op",
+                case_num=1,
+                regime_tag="hyb_reg",
+                ref_perf_us=10.0,
+                t_hw_us=1.0,
+            ),
+        ),
+        regime_specs=(regime,),
+        perf_target=PerfTargetSpec(
+            operator_name="hyb_op",
+            target_avg_speedup=1.0,
+            target_min_case_speedup=1.0,
+            target_roofline_eta=0.5,
+        ),
+        source_root=tmp_path,
+        l2_batch_evaluator=lambda _c, _a: {},
+    )
+    mask = runner._resolve_trackb_freedom_mask(regime)
+    assert mask.alg_compute_and_monoid is True
+    assert mask.exec_mode_and_spr is True
+    assert mask.dma_and_cache_hierarchy is True
+
+    stage_a = runner._run_l0(hyb_src, regime)
+    assert stage_a.passed is True, stage_a.error_message
+
+    monkeypatch.setattr(
+        runner,
+        "_compile_trackb_stage_b",
+        lambda _cpp: StageBResult(passed=True),
+    )
+    stage_b = runner._run_l1(hyb_src, regime)
+    assert stage_b.passed is True, stage_b.error_message

@@ -782,3 +782,78 @@ def test_seed_synthesizer_preserves_hybrid_trackb_and_typed_signature(
     assert "def attn_like(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:" in backend.requests[0].system_prompt
     assert "def _select_attn_like_" in backend.requests[0].system_prompt
     assert "hybrid_trackb" in backend.requests[0].system_prompt
+
+
+def test_stage0_trackb_allows_ascendc_primitives_without_facet_locks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Stage-0 Track-B validates hardware legality without incremental facet locks."""
+    regime = RegimeTargetSpec(
+        regime_tag="reduce_tail",
+        description="tail reduction",
+        builder_candidates=("_build_sm_prim_func",),
+        config_selector_fn="_select_sm_config",
+        representative_hir_dims={"total_elements": 128},
+        sample_builder_kwargs={"total_elements": 128},
+        editable_symbols=("SM_TRACKB_CU", "_select_sm_config"),
+        runtime_backend="ascendc_trackb",
+        trackb_symbols=("SM_TRACKB_CU",),
+    )
+    compiled_sources: list[str] = []
+
+    def _fake_compile(cpp_source: str, **_kw: object) -> StageBResult:
+        compiled_sources.append(cpp_source)
+        return StageBResult(passed=True)
+
+    monkeypatch.setattr(marathon, "run_stage_b_ascendc_compile", _fake_compile)
+    validator = build_stage0_static_validator(
+        [regime],
+        entrypoint="sm_op",
+        worktree=tmp_path,
+        env_file=None,
+    )
+    seed_src = dedent(
+        '''
+        import torch
+
+        SM_TRACKB_CU = """
+        #include <tl_templates/ascend/kernel_entry.h>
+        __launch_bounds__(512)
+        __global__ void sm_k(__gm__ float* x, __gm__ float* y) {
+            __simd_vf__ void (*fn)() = nullptr;
+            asc_copy_gm2ub_align(nullptr, nullptr, 64);
+            asc_sync_notify(0, 1);
+            asc_sync_wait(0, 1);
+        }
+        """
+
+        def _select_sm_config(**kwargs) -> dict[str, object]:
+            return {"pass_configs": {}, "compile_flags": []}
+
+        def _build_sm_prim_func(**kwargs) -> str:
+            return SM_TRACKB_CU
+
+        def _render_trackb_tu(trackb_src: str = SM_TRACKB_CU, **dims: object) -> str:
+            return trackb_src + "\\nvoid launch() { sm_k<<<1, 1, 1>>>(nullptr, nullptr); }\\n"
+
+        def _get_kernel(**kwargs) -> object:
+            return object()
+
+        def sm_op(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        kernel = sm_op
+        '''
+    )
+    passed, err = validator(seed_src, "cce_trackb")
+    assert passed is True, err
+    assert len(compiled_sources) == 1
+
+    bad_src = seed_src.replace(
+        "asc_sync_wait(0, 1);",
+        "asc_sync_wait(0, 1);\n            using namespace AscendC;",
+    )
+    bad_ok, bad_err = validator(bad_src, "cce_trackb")
+    assert bad_ok is False
+    assert "AscendC" in bad_err
