@@ -1761,19 +1761,20 @@ def bottleneck_anchor_for_regime(
     return min(matched, key=lambda a: (a.eq3_score, -a.cand_us, a.case_num))
 
 
-def collect_bottleneck_msprof_via_agent_gates(
+def _collect_profile_via_agent_gates(
     operator_name: str,
     candidate_path: str | Path,
     anchors_by_regime: Sequence[AnchorCaseSpec] | Mapping[str, AnchorCaseSpec],
     *,
+    candidate_id: str,
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     device_id: str = "1",
     warmup: int = 1,
     repeat: int = 3,
     timeout_sec: int = 300,
-) -> dict[str, dict[str, float]]:
-    """Collect msprof_detail telemetry for bottleneck anchors inside an AgentGates lease."""
+) -> dict[str, dict[str, object]]:
+    """Collect mode='profile' msprof telemetry inside an AgentGates lease."""
     if isinstance(anchors_by_regime, Mapping):
         regime_items = [(str(tag), spec) for tag, spec in anchors_by_regime.items()]
     else:
@@ -1814,7 +1815,7 @@ def collect_bottleneck_msprof_via_agent_gates(
     )
     prewarm_surrogate_tilelang_cache(
         operator_name,
-        [("bottleneck_probe", cand_resolved)],
+        [(candidate_id, cand_resolved)],
         unique_specs,
         cannbench_repo=cann_repo,
         env_file=resolved_env,
@@ -1833,7 +1834,7 @@ def collect_bottleneck_msprof_via_agent_gates(
         root,
         operator_name,
         0,
-        "bottleneck_probe",
+        candidate_id,
         cand_resolved,
     )
     payload: dict[str, object] = {
@@ -1848,7 +1849,7 @@ def collect_bottleneck_msprof_via_agent_gates(
         "msprof_targets": [
             {
                 "operator_name": operator_name,
-                "candidate_id": "bottleneck_probe",
+                "candidate_id": candidate_id,
                 "module_path": relative,
                 "sha256": digest,
                 "case_num": cnum,
@@ -1875,7 +1876,7 @@ def collect_bottleneck_msprof_via_agent_gates(
     )
     _verify_fast_bindings(
         raw_resp,
-        {operator_name: {"bottleneck_probe": {"module_path": relative, "sha256": digest}}},
+        {operator_name: {candidate_id: {"module_path": relative, "sha256": digest}}},
     )
     _verify_fast_coverage(
         raw_resp,
@@ -1884,22 +1885,83 @@ def collect_bottleneck_msprof_via_agent_gates(
     )
     telemetry_raw = _fast_response_mapping(raw_resp, "msprof_telemetry").get(operator_name)
     by_case = (
-        telemetry_raw.get("bottleneck_probe") if isinstance(telemetry_raw, Mapping) else None
+        telemetry_raw.get(candidate_id) if isinstance(telemetry_raw, Mapping) else None
     )
     if not isinstance(by_case, Mapping):
         raise RuntimeError(
             f"fast profile response has no msprof telemetry for {operator_name!r}"
         )
-    out: dict[str, dict[str, float]] = {}
+    out: dict[str, dict[str, object]] = {}
     for tag, spec in regime_items:
         raw_metrics = by_case.get(str(int(spec.case_num)))
         if isinstance(raw_metrics, Mapping) and "error" not in raw_metrics:
-            out[tag] = {
-                str(k): float(v)
-                for k, v in raw_metrics.items()
-                if isinstance(v, (int, float)) and not isinstance(v, bool)
-            }
+            out[tag] = {str(k): v for k, v in raw_metrics.items()}
     return out
+
+
+def collect_bottleneck_msprof_via_agent_gates(
+    operator_name: str,
+    candidate_path: str | Path,
+    anchors_by_regime: Sequence[AnchorCaseSpec] | Mapping[str, AnchorCaseSpec],
+    *,
+    source_root: str | Path | None = None,
+    env_file: str | Path | None = None,
+    device_id: str = "1",
+    warmup: int = 1,
+    repeat: int = 3,
+    timeout_sec: int = 300,
+) -> dict[str, dict[str, float]]:
+    """Collect numeric msprof telemetry for bottleneck anchors inside an AgentGates lease."""
+    raw_by_regime = _collect_profile_via_agent_gates(
+        operator_name,
+        candidate_path,
+        anchors_by_regime,
+        candidate_id="bottleneck_probe",
+        source_root=source_root,
+        env_file=env_file,
+        device_id=device_id,
+        warmup=warmup,
+        repeat=repeat,
+        timeout_sec=timeout_sec,
+    )
+    out: dict[str, dict[str, float]] = {}
+    for tag, raw_metrics in raw_by_regime.items():
+        out[tag] = {
+            str(k): float(v)
+            for k, v in raw_metrics.items()
+            if isinstance(v, (int, float))
+            and not isinstance(v, bool)
+            and math.isfinite(float(v))
+        }
+    return out
+
+
+def collect_p2_deep_dive_via_agent_gates(
+    operator_name: str,
+    candidate_path: str | Path,
+    anchors_by_regime: Sequence[AnchorCaseSpec] | Mapping[str, AnchorCaseSpec],
+    *,
+    source_root: str | Path | None = None,
+    env_file: str | Path | None = None,
+    device_id: str = "1",
+    warmup: int = 1,
+    repeat: int = 3,
+    timeout_sec: int = 300,
+) -> dict[str, object]:
+    """Collect instruction-level deep-dive telemetry and DWARF hotspots via AgentGates."""
+    raw_by_regime = _collect_profile_via_agent_gates(
+        operator_name,
+        candidate_path,
+        anchors_by_regime,
+        candidate_id="bottleneck_p2_deep_dive",
+        source_root=source_root,
+        env_file=env_file,
+        device_id=device_id,
+        warmup=warmup,
+        repeat=repeat,
+        timeout_sec=timeout_sec,
+    )
+    return dict(raw_by_regime)
 
 
 _AGENT_GATES_CONFIG_ENV = "AGENT_GATES_CONFIG"
@@ -3645,6 +3707,7 @@ __all__ = [
     "bottleneck_anchor_for_regime",
     "build_anchor_metrics",
     "collect_bottleneck_msprof_via_agent_gates",
+    "collect_p2_deep_dive_via_agent_gates",
     "ensure_npu_compare_shim_dir",
     "lookup_case_static_spec",
     "prewarm_anchor_reference_cache",

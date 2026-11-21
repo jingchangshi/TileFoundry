@@ -7,17 +7,25 @@ import os
 import re
 import tempfile
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from tilefoundry_ascend.agent.kb.schema import (
     AscendCausalRule,
+    SymptomFamily,
     load_seed_rules,
     normalize_runtime_backend,
 )
 
 _SAFE_KB_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _normalize_symptom_family(raw_family: str | SymptomFamily) -> str:
+    """Normalize a SymptomFamily enum or raw string to its lowercase canonical identifier."""
+    if isinstance(raw_family, SymptomFamily):
+        return raw_family.value.strip().lower()
+    return str(raw_family or "").strip().lower()
 
 
 def _safe_kb_slug(raw: str, default: str = "default") -> str:
@@ -475,6 +483,31 @@ class BayesianRuleTracker:
             None,
         )
 
+    def is_family_tabued(
+        self,
+        *,
+        regime_tag: str,
+        symptom_family: str | SymptomFamily,
+        parent_sha: str,
+        current_round: int,
+    ) -> bool:
+        """Return whether symptom_family is under active scoped cooldown."""
+        reg = str(regime_tag).strip()
+        fam = _normalize_symptom_family(symptom_family)
+        sha = str(parent_sha).strip()
+        if not reg or not fam or not sha:
+            return False
+        cur_round = int(current_round)
+        for fam_entry in self.family_tabu_entries:
+            if (
+                fam_entry.regime_tag == reg
+                and _normalize_symptom_family(fam_entry.symptom_family) == fam
+                and fam_entry.parent_sha == sha
+                and cur_round <= fam_entry.expire_round
+            ):
+                return True
+        return False
+
     def is_rule_tabued(
         self,
         *,
@@ -500,15 +533,13 @@ class BayesianRuleTracker:
                 return True
         rule = self.rules.get(rid)
         family = rule.symptom_family if rule is not None else ""
-        if family:
-            for fam_entry in self.family_tabu_entries:
-                if (
-                    fam_entry.regime_tag == reg
-                    and fam_entry.symptom_family == family
-                    and fam_entry.parent_sha == sha
-                    and cur_round <= fam_entry.expire_round
-                ):
-                    return True
+        if family and self.is_family_tabued(
+            regime_tag=reg,
+            symptom_family=family,
+            parent_sha=sha,
+            current_round=cur_round,
+        ):
+            return True
         return False
 
     @staticmethod
@@ -797,8 +828,9 @@ class BayesianRuleTracker:
         regime_tag: str = "",
         parent_sha: str = "",
         current_round: int | None = None,
+        symptom_ranking: Sequence[tuple[str | SymptomFamily, float]] = (),
     ) -> tuple[AscendCausalRule, ...]:
-        """Filter matching rules by backend and scoped tabu, then rank by 3-axis posterior."""
+        """Filter matching rules by backend and scoped tabu, then rank by symptom and posterior."""
         eff_op = str(operator_name or "").strip() or str(context.get("operator_name") or "").strip()
         raw_backend = (
             runtime_backend
@@ -806,22 +838,34 @@ class BayesianRuleTracker:
             else (context.get("runtime_backend") or context.get("backend_kind"))
         )
         eff_backend = normalize_runtime_backend(str(raw_backend)) if raw_backend else None
-        candidates: list[tuple[tuple[float, float, int, str], AscendCausalRule]] = []
+        severity_by_family: dict[str, float] = {}
+        has_scope = bool(regime_tag and parent_sha and current_round is not None)
+        for raw_fam, raw_sev in symptom_ranking:
+            fam_key = _normalize_symptom_family(raw_fam)
+            if not fam_key:
+                continue
+            if has_scope and self.is_family_tabued(
+                regime_tag=regime_tag,
+                symptom_family=fam_key,
+                parent_sha=parent_sha,
+                current_round=int(current_round),
+            ):
+                continue
+            sev = float(raw_sev)
+            if sev > severity_by_family.get(fam_key, float("-inf")):
+                severity_by_family[fam_key] = sev
+
+        candidates: list[tuple[tuple[int, float, float, float, int, str], AscendCausalRule]] = []
         for rule in self.active_rules(
             topology_axes=topology_axes,
             operator_name=eff_op,
             runtime_backend=eff_backend,
         ):
-            if (
-                regime_tag
-                and parent_sha
-                and current_round is not None
-                and self.is_rule_tabued(
-                    regime_tag=regime_tag,
-                    rule_id=rule.rule_id,
-                    parent_sha=parent_sha,
-                    current_round=current_round,
-                )
+            if has_scope and self.is_rule_tabued(
+                regime_tag=regime_tag,
+                rule_id=rule.rule_id,
+                parent_sha=parent_sha,
+                current_round=int(current_round),
             ):
                 continue
             if not rule.matches(context):
@@ -834,7 +878,17 @@ class BayesianRuleTracker:
                 state = self.posteriors[rule.rule_id]
                 expected_rate = state.expected_rate
                 mean_speedup = state.mean_speedup
+            fam_key = _normalize_symptom_family(rule.symptom_family)
+            fam_severity = severity_by_family.get(fam_key, 0.0) if fam_key else 0.0
+            if fam_severity > 0.15:
+                boost_tier = 1
+                boost_sev = round(fam_severity, 6)
+            else:
+                boost_tier = 0
+                boost_sev = 0.0
             score_key = (
+                boost_tier,
+                boost_sev,
                 round(expected_rate, 6),
                 round(mean_speedup, 6),
                 -int(rule.priority),
@@ -858,6 +912,7 @@ class BayesianRuleTracker:
         regime_tag: str = "",
         parent_sha: str = "",
         current_round: int | None = None,
+        symptom_ranking: Sequence[tuple[str | SymptomFamily, float]] = (),
     ) -> tuple[AscendCausalRule, ...]:
         """Select the highest-ranked matching rules after scoped tabu filtering."""
         return self.rank_applicable_rules(
@@ -869,6 +924,7 @@ class BayesianRuleTracker:
             regime_tag=regime_tag,
             parent_sha=parent_sha,
             current_round=current_round,
+            symptom_ranking=symptom_ranking,
         )
 
     def rank_matching_rules(
@@ -882,6 +938,7 @@ class BayesianRuleTracker:
         regime_tag: str = "",
         parent_sha: str = "",
         current_round: int | None = None,
+        symptom_ranking: Sequence[tuple[str | SymptomFamily, float]] = (),
     ) -> tuple[AscendCausalRule, ...]:
         """Rank all matching rules after backend and scoped tabu filtering."""
         return self.rank_applicable_rules(
@@ -893,6 +950,7 @@ class BayesianRuleTracker:
             regime_tag=regime_tag,
             parent_sha=parent_sha,
             current_round=current_round,
+            symptom_ranking=symptom_ranking,
         )
 
     def to_dict(self) -> dict[str, object]:

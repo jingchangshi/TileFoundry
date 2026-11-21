@@ -6,6 +6,8 @@ import csv
 import json
 import math
 import re
+import shutil
+import subprocess
 from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -53,6 +55,30 @@ _SYNC_OPCODE_RE = re.compile(
     r"(?:wait_?flag|set_?flag|pipe_?barrier|barrier|sync|event)", re.IGNORECASE
 )
 _DEFAULT_CYCLE_TO_US = 1.0 / 1800.0
+_P1_SUMMARY_CSV_STEMS = frozenset(
+    {
+        "opbasicinfo",
+        "pipeutilization",
+        "memoryl0",
+        "memory",
+        "resourceconflictratio",
+        "l2cache",
+        "arithmeticutilization",
+        "memoryub",
+        "roofline",
+        "occupancy",
+        "kernelscale",
+        "memorydetail",
+        "basicinfo",
+    }
+)
+_OBJDUMP_DWARF_LINE_RE = re.compile(
+    r"^\s*[;#]\s*(?P<loc>(?:[A-Za-z]:)?[^\s:;][^:]*:\d+(?::\d+)?)\s*$"
+)
+_OBJDUMP_SYMBOL_RE = re.compile(r"^[0-9a-fA-F]+\s+<(?P<symbol>[^>]+)>:\s*$")
+_OBJDUMP_INSTR_RE = re.compile(
+    r"^\s*(?P<pc>[0-9a-fA-F]+):\s+(?:[0-9a-fA-F]{2}(?:\s+[0-9a-fA-F]{2})+|[0-9a-fA-F]{4,16})\s+(?P<body>.+?)\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -1407,6 +1433,181 @@ def parse_p2_instruction_trace(
     )
 
 
+def find_p2_trace_files(report_dir: Path | str) -> tuple[Path, ...]:
+    """Locate instruction-level trace files while excluding summary metric CSV tables."""
+    root = Path(report_dir)
+    if not root.is_dir():
+        return ()
+    found: list[Path] = []
+    for candidate in sorted(root.rglob("*")):
+        if not candidate.is_file():
+            continue
+        suffix = candidate.suffix.lower()
+        if suffix not in (".json", ".jsonl", ".csv"):
+            continue
+        if candidate.name.lower() == "pc_start_addr.txt":
+            continue
+        stem_compact = re.sub(r"[^a-z0-9]", "", candidate.stem.lower())
+        if suffix == ".csv" and any(
+            stem_compact == token or stem_compact.endswith(token)
+            for token in _P1_SUMMARY_CSV_STEMS
+        ):
+            continue
+        found.append(candidate)
+    return tuple(found)
+
+
+def _infer_objdump_pipe_and_opcode(body: str) -> tuple[str, str]:
+    """Extract hardware pipe and instruction mnemonic from an objdump disassembly line."""
+    cleaned = body.split("//", 1)[0].split(";", 1)[0].strip()
+    if not cleaned:
+        return "UNKNOWN", ""
+    tokens = re.split(r"[\s,()\[\]]+", cleaned)
+    opcode = tokens[0] if tokens else ""
+    upper = cleaned.upper()
+    for pipe_name in ("PIPE_M", "PIPE_FIX", "PIPE_MTE1", "PIPE_MTE2", "PIPE_MTE3", "PIPE_V", "PIPE_S"):
+        if pipe_name in upper:
+            return pipe_name, opcode
+    if _SYNC_OPCODE_RE.search(opcode):
+        return "SYNC", opcode
+    return "UNKNOWN", opcode
+
+
+def parse_objdump_dwarf_hotspots(
+    objdump_text: str,
+    *,
+    top_k_hotspots: int = 10,
+) -> P2InstructionDiveSummary:
+    """Summarize instruction mix, waitflag density, and DWARF hotspots from objdump -d -l."""
+    total = 0
+    mte_waitflag_count = 0
+    class_counts: dict[str, int] = {}
+    pipe_instr_counts: dict[str, int] = {}
+    hotspot_counts: dict[str, int] = {}
+    hotspot_pipes: dict[str, set[str]] = {}
+    hotspot_pc_bounds: dict[str, tuple[int, int]] = {}
+    attributed_count = 0
+
+    current_location = ""
+    current_symbol = ""
+
+    for raw_line in objdump_text.splitlines():
+        dwarf_match = _OBJDUMP_DWARF_LINE_RE.match(raw_line)
+        if dwarf_match is not None:
+            current_location = dwarf_match.group("loc").strip()
+            continue
+        sym_match = _OBJDUMP_SYMBOL_RE.match(raw_line)
+        if sym_match is not None:
+            current_symbol = sym_match.group("symbol").strip()
+            continue
+        instr_match = _OBJDUMP_INSTR_RE.match(raw_line)
+        if instr_match is None:
+            continue
+        pc_val = int(instr_match.group("pc"), 16)
+        pipe_hint, opcode = _infer_objdump_pipe_and_opcode(instr_match.group("body"))
+        if not opcode:
+            continue
+        total += 1
+        instr_class = _classify_instruction(pipe_hint, opcode)
+        pipe_label = pipe_hint if pipe_hint != "UNKNOWN" else instr_class.upper()
+        class_counts[instr_class] = class_counts.get(instr_class, 0) + 1
+        pipe_instr_counts[pipe_label] = pipe_instr_counts.get(pipe_label, 0) + 1
+        if _WAITFLAG_RE.search(opcode) or _WAITFLAG_RE.search(instr_match.group("body")):
+            mte_waitflag_count += 1
+
+        location = current_location or current_symbol
+        if location:
+            attributed_count += 1
+            hotspot_counts[location] = hotspot_counts.get(location, 0) + 1
+            hotspot_pipes.setdefault(location, set()).add(pipe_label)
+            if location in hotspot_pc_bounds:
+                lo_pc, hi_pc = hotspot_pc_bounds[location]
+                hotspot_pc_bounds[location] = (min(lo_pc, pc_val), max(hi_pc, pc_val))
+            else:
+                hotspot_pc_bounds[location] = (pc_val, pc_val)
+
+    instruction_mix = (
+        {cls_name: count / float(total) for cls_name, count in sorted(class_counts.items())}
+        if total > 0
+        else {}
+    )
+    mte_waitflag_share = mte_waitflag_count / float(total) if total > 0 else 0.0
+    interval_stats = {
+        pipe: PipeIssueIntervalStats(
+            pipe=pipe,
+            instruction_count=count,
+            interval_count=0,
+            p10_us=0.0,
+            p50_us=0.0,
+            p90_us=0.0,
+        )
+        for pipe, count in sorted(pipe_instr_counts.items())
+    }
+    ranked_locations = sorted(
+        hotspot_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    )[: max(0, int(top_k_hotspots))]
+    hotspots = tuple(
+        DwarfLineHotspot(
+            source_location=loc,
+            instruction_count=cnt,
+            instruction_share=cnt / float(total) if total > 0 else 0.0,
+            pipes=tuple(sorted(hotspot_pipes[loc])),
+            pc_range_start=hotspot_pc_bounds[loc][0],
+            pc_range_end=hotspot_pc_bounds[loc][1],
+        )
+        for loc, cnt in ranked_locations
+    )
+    return P2InstructionDiveSummary(
+        total_instructions=total,
+        instruction_mix=instruction_mix,
+        mte_waitflag_count=mte_waitflag_count,
+        mte_waitflag_share=mte_waitflag_share,
+        issue_interval_us=interval_stats,
+        source_line_hotspots=hotspots,
+        attributed_instruction_share=attributed_count / float(total) if total > 0 else 0.0,
+    )
+
+
+def extract_p2_from_objdump(
+    object_paths: Sequence[Path | str],
+    *,
+    objdump_bin: str | Path | None = None,
+    top_k_hotspots: int = 10,
+) -> P2InstructionDiveSummary:
+    """Disassemble compiled Ascend objects with llvm-objdump -d -l for DWARF hotspot fallback."""
+    resolved_bin = str(objdump_bin).strip() if objdump_bin is not None else ""
+    if not resolved_bin:
+        resolved_bin = shutil.which("llvm-objdump") or shutil.which("objdump") or ""
+    if not resolved_bin:
+        return parse_objdump_dwarf_hotspots("", top_k_hotspots=top_k_hotspots)
+
+    chunks: list[str] = []
+    for raw_path in object_paths:
+        obj_path = Path(raw_path)
+        if not obj_path.is_file():
+            continue
+        proc = subprocess.run(
+            [resolved_bin, "-d", "-l", str(obj_path)],
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            proc = subprocess.run(
+                [resolved_bin, "-d", str(obj_path)],
+                text=True,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        if proc.returncode == 0 and proc.stdout.strip():
+            chunks.append(proc.stdout)
+
+    return parse_objdump_dwarf_hotspots("\n".join(chunks), top_k_hotspots=top_k_hotspots)
+
+
 __all__ = [
     "AggregatedMsprofReport",
     "DwarfLineHotspot",
@@ -1414,7 +1615,10 @@ __all__ = [
     "PipeIssueIntervalStats",
     "SubkernelMsprofMetrics",
     "aggregate_subkernel_msprof",
+    "extract_p2_from_objdump",
+    "find_p2_trace_files",
     "parse_msprof_op_report",
+    "parse_objdump_dwarf_hotspots",
     "parse_p2_instruction_trace",
     "parse_pc_start_addr",
 ]
