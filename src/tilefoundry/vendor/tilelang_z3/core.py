@@ -11,6 +11,7 @@ on one capacity-1 resource must each fit ahead of the other, never a disjunction
 from __future__ import annotations
 
 import hashlib
+import threading
 from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
@@ -18,6 +19,7 @@ from pathlib import Path
 SAT = "SAT"
 UNSAT = "UNSAT"
 UNKNOWN = "UNKNOWN"
+_Z3_LOCK = threading.Lock()
 
 __all__ = [
     "Assignment", "Buffer", "Capacity", "Edge", "Problem", "Resource", "Reuse",
@@ -264,42 +266,20 @@ def _issue_order(problem, phases, by_name):
     return tuple(order) if len(order) == len(problem.tasks) else None
 
 
-def solve(problem, ii, timeout_ms=None):
-    """Decide one fixed II. Returns (status, Assignment | None, detail).
-
-    A manual list pins unannotated siblings to stage 0 rather than letting them
-    drift. Within one cycle, issue order is physical: an earlier-issued task may
-    not sit at a later phase, and same-phase ties follow ``_issue_order``.
-    Capacity constraints exist only for a space that publishes a usable size; a
-    space without a fact stays unconstrained here and must stay UNRESOLVED in the
-    storage plan, never treated as infinite.
-    """
-    if not isinstance(ii, int) or ii < 1:
-        raise SolverError("SOLVER_II", "II must be a positive int")
-    by_name = _task_map(problem)
-    _buffer_map(problem)
-    for edge in problem.edges:
-        if edge.src == edge.dst and edge.distance == 0 and edge.latency > 0:
-            return UNSAT, None, "SELF_EDGE_INFEASIBLE: %r needs latency %d with no distance" % (
-                edge.src, edge.latency)
-    if not problem.manual:
-        for task in problem.tasks:
-            if task.stage not in (None, 0):
-                return UNSAT, None, "NO_OFFSET_AUTHORED_STAGE: %r has stage %r" % (task.name, task.stage)
-    if not problem.tasks:
-        return SAT, Assignment(ii=ii, starts={}, stages={}, phases={}, versions={},
-                               issue_order=(), detail="EMPTY_PROBLEM"), "EMPTY_PROBLEM"
+def _solve_with_z3(problem, ii, timeout_ms):
+    """Solve fixed-II constraints using a dedicated Z3 context."""
     try:
         import z3  # noqa: PLC0415
     except ImportError:
         return UNKNOWN, None, "Z3_UNAVAILABLE"
-    solver = z3.Solver()
+    ctx = z3.Context()
+    solver = z3.Solver(ctx=ctx)
     if timeout_ms is not None:
         solver.set("timeout", max(1, int(timeout_ms)))
     stage, phase = {}, {}
     for task in problem.tasks:
-        stage[task.name] = z3.Int("stage_%s" % task.name)
-        phase[task.name] = z3.Int("phase_%s" % task.name)
+        stage[task.name] = z3.Int("stage_%s" % task.name, ctx=ctx)
+        phase[task.name] = z3.Int("phase_%s" % task.name, ctx=ctx)
         solver.add(phase[task.name] >= 0, phase[task.name] < ii)
         if task.stage is not None and task.stage > problem.max_stage:
             return UNSAT, None, "AUTHORED_STAGE_EXCEEDS_MAX: %r" % (task.name,)
@@ -317,7 +297,7 @@ def solve(problem, ii, timeout_ms=None):
         solver.add(start(edge.dst) + edge.distance * ii >= start(edge.src) + edge.latency)
     version = {}
     for buffer in problem.buffers:
-        version[buffer.name] = z3.Int("version_%s" % buffer.name)
+        version[buffer.name] = z3.Int("version_%s" % buffer.name, ctx=ctx)
         if buffer.fixed is not None:
             solver.add(version[buffer.name] == buffer.fixed)
         else:
@@ -348,7 +328,7 @@ def solve(problem, ii, timeout_ms=None):
         terms = [version[buffer.name] * buffer.slot_bytes for buffer in problem.buffers
                  if buffer.space == capacity.space and buffer.owner == capacity.owner]
         if terms:
-            solver.add(sum(terms) <= capacity.bytes)
+            solver.add(z3.Sum(terms) <= capacity.bytes)
     result = solver.check()
     if result == z3.unsat:
         return UNSAT, None, "UNSAT_FOR_II"
@@ -361,6 +341,39 @@ def solve(problem, ii, timeout_ms=None):
               for task in problem.tasks}
     versions = {buffer.name: model.eval(version[buffer.name], model_completion=True).as_long()
                 for buffer in problem.buffers}
+    return SAT, (stages, phases, versions), "SAT"
+
+
+def solve(problem, ii, timeout_ms=None):
+    """Decide one fixed II. Returns (status, Assignment | None, detail).
+
+    A manual list pins unannotated siblings to stage 0 rather than letting them
+    drift. Within one cycle, issue order is physical: an earlier-issued task may
+    not sit at a later phase, and same-phase ties follow ``_issue_order``.
+    Capacity constraints exist only for a space that publishes a usable size; a
+    space without a fact stays unconstrained here and must stay UNRESOLVED in the
+    storage plan, never treated as infinite.
+    """
+    if not isinstance(ii, int) or ii < 1:
+        raise SolverError("SOLVER_II", "II must be a positive int")
+    by_name = _task_map(problem)
+    _buffer_map(problem)
+    for edge in problem.edges:
+        if edge.src == edge.dst and edge.distance == 0 and edge.latency > 0:
+            return UNSAT, None, "SELF_EDGE_INFEASIBLE: %r needs latency %d with no distance" % (
+                edge.src, edge.latency)
+    if not problem.manual:
+        for task in problem.tasks:
+            if task.stage not in (None, 0):
+                return UNSAT, None, "NO_OFFSET_AUTHORED_STAGE: %r has stage %r" % (task.name, task.stage)
+    if not problem.tasks:
+        return SAT, Assignment(ii=ii, starts={}, stages={}, phases={}, versions={},
+                               issue_order=(), detail="EMPTY_PROBLEM"), "EMPTY_PROBLEM"
+    with _Z3_LOCK:
+        status, solved_maps, detail = _solve_with_z3(problem, ii, timeout_ms)
+    if status != SAT or solved_maps is None:
+        return status, None, detail
+    stages, phases, versions = solved_maps
     starts = {name: ii * stages[name] + phases[name] for name in stages}
     order = _issue_order(problem, phases, by_name)
     if order is None:

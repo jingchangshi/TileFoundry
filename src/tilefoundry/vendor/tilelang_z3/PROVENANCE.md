@@ -70,8 +70,9 @@ What this means for the rules above:
 - Rule 3 still holds: importing this package imports no torch/torch_npu/tilelang/tvm_ffi.
 
 Current content identity (compute with `core.core_source_sha256()`): the value at the
-time of this record is `ea900772` (16 hex prefix); refresh it here whenever core.py
-changes shape, and never as a silent edit.
+time of this record is `b1880c037ad95fd1` (16 hex prefix); refresh it here whenever core.py
+changes shape, and never as a silent edit. Note that `core.solve` isolates per-call
+`z3.Context()` instances under `_Z3_LOCK` for concurrent worker-thread safety.
 
 The 04-07/08 extension notes below are kept for history: the fixed-buffer-version
 equality requirement they describe is met by the new core's `Buffer.fixed` constraint.

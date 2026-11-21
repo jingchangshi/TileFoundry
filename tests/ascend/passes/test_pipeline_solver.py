@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import pathlib
 
 import pytest
@@ -762,3 +763,43 @@ def test_solve_pipeline_with_monotone_backoff_and_strict_read_from_sil(
     )
     with pytest.raises(PipelineError):
         solve_pipeline_with_monotone_backoff(impossible_problem, max_retries=4)
+
+
+def test_solve_ascend_pipeline_thread_safe_concurrent_workers() -> None:
+    """Verify concurrent thread-pool pipeline solves isolate Z3 contexts without crashing."""
+    facts = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
+    problem = Problem(
+        tasks=(
+            Task(name="load", resources=(("aiv", "aiv0", "mte2", 1),), latency=1, stage=0),
+            Task(name="vec", resources=(("aiv", "aiv0", "vector", 1),), latency=2, stage=1),
+            Task(name="store", resources=(("aiv", "aiv0", "mte3", 1),), latency=1, stage=2),
+        ),
+        edges=(
+            Edge(src="load", dst="vec", distance=0, latency=1),
+            Edge(src="vec", dst="store", distance=0, latency=2),
+        ),
+        buffers=(
+            Buffer(name="b_in", slot_bytes=4096, space="UB", owner="aiv", auto_min=1, auto_max=2),
+            Buffer(name="b_out", slot_bytes=4096, space="UB", owner="aiv", auto_min=1, auto_max=2),
+        ),
+        reuses=(
+            Reuse(buffer="b_in", last_reader="vec", next_writer="load", delta=0, read_latency=1),
+            Reuse(buffer="b_out", last_reader="store", next_writer="vec", delta=0, read_latency=1),
+        ),
+        resources=_vector_resources(),
+        capacities=(Capacity(space="UB", owner="aiv", bytes=facts.ub_simdvf_usable_bytes),),
+        max_stage=2,
+        manual=True,
+    )
+
+    def _run_once(_idx: int) -> tuple[int, list[str]]:
+        res = solve_ascend_pipeline(problem)
+        return res.assignment.ii, verify_assignment(res.problem, res.assignment)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        outcomes = list(executor.map(_run_once, range(16)))
+
+    assert len(outcomes) == 16
+    for ii, problems in outcomes:
+        assert ii >= 1
+        assert problems == []
