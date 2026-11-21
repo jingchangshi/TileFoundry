@@ -149,6 +149,16 @@ _AGENT_GATES_ALLOWED_ENV_KEYS = frozenset(
         "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
     }
 )
+_ADAPTER_TOOLCHAIN_ENV_KEYS: tuple[str, ...] = (
+    "TILEFOUNDRY_NPU_CANN_SETUP",
+    "TILEFOUNDRY_NPU_CONDA_SH",
+    "TILEFOUNDRY_NPU_CONDA_ENV",
+    "TILEFOUNDRY_NPU_CONDA_ENVS_PATH",
+    "TILEFOUNDRY_NPU_CANNBENCH_ARCH",
+)
+_ADAPTER_PATH_ENV_KEYS: frozenset[str] = frozenset(
+    {"TILEFOUNDRY_NPU_CANN_SETUP", "TILEFOUNDRY_NPU_CONDA_SH"}
+)
 
 
 def _is_llm_env_key(key: str) -> bool:
@@ -319,7 +329,7 @@ def _stage0_entrypoint_contract_error(
         sig_error = validate_entrypoint_signature_compatibility(module_source, contract)
         if sig_error:
             return sig_error
-    purity_errors = check_npu_entrypoint_purity(module_source, entrypoint)
+    purity_errors = check_npu_entrypoint_purity(module_source, entrypoint, track=track)
     if purity_errors:
         return "entrypoint purity rejection: " + "; ".join(purity_errors)
     if track in ("cce_trackb", "hybrid_trackb"):
@@ -899,6 +909,24 @@ def discover_marathon_environment(
         src_parent = source_root.resolve().parent
         if src_parent not in ws_parents:
             ws_parents.append(src_parent)
+
+    if env_path is None:
+        for parent in ws_parents:
+            adapter_env = (
+                parent / "AgentGates" / "agent_gates" / "adapters" / "tilefoundry-npu" / "env.sh"
+            )
+            if adapter_env.is_file():
+                adapter_values = parse_simple_env_file(adapter_env)
+                for key in _ADAPTER_TOOLCHAIN_ENV_KEYS:
+                    if key in seeded:
+                        continue
+                    val = adapter_values.get(key, "").strip()
+                    if not val:
+                        continue
+                    if key in _ADAPTER_PATH_ENV_KEYS and not Path(val).expanduser().is_file():
+                        continue
+                    seeded[key] = val
+                break
 
     python_bin = (
         seeded.get("TILEFOUNDRY_NPU_PYTHON")

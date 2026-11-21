@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shlex
+import textwrap
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -846,11 +847,53 @@ class CannbenchOpSpec:
 _TRACKB_CPP_MARKERS: tuple[str, ...] = (
     "tl_templates/ascend/",
     "__global__",
+    "__aicore__",
+    "__vector__",
+    "__cube__",
+    "__mix__",
+    "__simd_vf__",
+    "__simd_callee__",
     "__simt_vf__",
+    "__ubuf__",
+    "__gm__",
     "SimdVF",
     "kernel_entry",
     "AscendC::",
 )
+
+
+def _extract_static_cpp_string(node: ast.AST | None) -> str | None:
+    """Resolve static string literal, concatenation, dedent, or strip expressions."""
+    if node is None:
+        return None
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _extract_static_cpp_string(node.left)
+        right = _extract_static_cpp_string(node.right)
+        if left is not None and right is not None:
+            return left + right
+        return None
+    if isinstance(node, ast.Call):
+        func = node.func
+        if not node.keywords and len(node.args) == 1:
+            is_dedent = (isinstance(func, ast.Name) and func.id == "dedent") or (
+                isinstance(func, ast.Attribute) and func.attr == "dedent"
+            )
+            if is_dedent:
+                inner = _extract_static_cpp_string(node.args[0])
+                return textwrap.dedent(inner) if inner is not None else None
+        if not node.keywords and not node.args and isinstance(func, ast.Attribute):
+            if func.attr in ("strip", "lstrip", "rstrip"):
+                inner = _extract_static_cpp_string(func.value)
+                if inner is None:
+                    return None
+                if func.attr == "strip":
+                    return inner.strip()
+                if func.attr == "lstrip":
+                    return inner.lstrip()
+                return inner.rstrip()
+    return None
 
 
 def discover_module_trackb_symbols(module_text: str) -> tuple[str, ...]:
@@ -874,13 +917,12 @@ def discover_module_trackb_symbols(module_text: str) -> tuple[str, ...]:
             name, val = node.targets[0].id, node.value
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             name, val = node.target.id, node.value
+        cpp_text = _extract_static_cpp_string(val) if (has_include and name) else None
         if (
-            has_include
-            and name
-            and isinstance(val, ast.Constant)
-            and isinstance(val.value, str)
-            and "#include" in val.value
-            and any(marker in val.value for marker in _TRACKB_CPP_MARKERS)
+            name
+            and cpp_text is not None
+            and "#include" in cpp_text
+            and any(marker in cpp_text for marker in _TRACKB_CPP_MARKERS)
         ):
             cpp_symbols.append(name)
         elif isinstance(node, ast.FunctionDef):
@@ -917,8 +959,9 @@ def extract_trackb_cpp_source(
             name, value = node.targets[0].id, node.value
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             name, value = node.target.id, node.value
-        if name and isinstance(value, ast.Constant) and isinstance(value.value, str):
-            constants[name] = value.value
+        cpp_text = _extract_static_cpp_string(value) if name else None
+        if name and cpp_text is not None:
+            constants[name] = cpp_text
     for symbol in trackb_symbols:
         cpp_source = constants.get(symbol)
         if cpp_source and cpp_source.strip():

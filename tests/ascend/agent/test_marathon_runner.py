@@ -686,3 +686,54 @@ def test_salvage_skips_pending_l4_checkpoint_without_touching_target(
     )
     assert promoted is False
     assert target.read_text(encoding="utf-8") == original
+
+
+def test_discover_marathon_env_seeds_adapter_toolchain_without_leaking_llm_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify sibling AgentGates adapter env.sh seeds CANN/Conda paths without LLM keys."""
+    for env_key in list(os.environ):
+        if env_key.startswith(("TILEFOUNDRY_NPU_", "ASCEND_", "CONDA_")):
+            monkeypatch.delenv(env_key, raising=False)
+    monkeypatch.setenv("PATH", "")
+
+    ws = tmp_path / "ws"
+    worktree = ws / "TileFoundry"
+    worktree.mkdir(parents=True)
+    cann_setup = tmp_path / "cann" / "set_env.sh"
+    cann_setup.parent.mkdir(parents=True)
+    cann_setup.write_text("#!/bin/sh\n", encoding="utf-8")
+    conda_sh = tmp_path / "conda" / "conda.sh"
+    conda_sh.parent.mkdir(parents=True)
+    conda_sh.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    adapter_env = ws / "AgentGates" / "agent_gates" / "adapters" / "tilefoundry-npu" / "env.sh"
+    adapter_env.parent.mkdir(parents=True)
+    adapter_env.write_text(
+        f"TILEFOUNDRY_NPU_CANN_SETUP={cann_setup}\n"
+        f"TILEFOUNDRY_NPU_CONDA_SH={conda_sh}\n"
+        "TILEFOUNDRY_NPU_CONDA_ENV=tilefoundry-npu\n"
+        "TILEFOUNDRY_NPU_CANNBENCH_ARCH=ascend950\n"
+        "TILEFOUNDRY_NPU_LLM_BACKEND=agy_cli\n"
+        "TILEFOUNDRY_NPU_AGY_BIN=/usr/bin/agy\n"
+        "TILEFOUNDRY_NPU_WORK_ROOT=/tmp/wrong_work_root\n"
+        "TILEFOUNDRY_NPU_CANNBENCH_TARGETS=wrong/op:kernels.py\n",
+        encoding="utf-8",
+    )
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    discovered = discover_marathon_environment(
+        operator_name="rms_norm",
+        worktree=worktree,
+        state_dir=state_dir,
+    )
+    assert discovered["TILEFOUNDRY_NPU_CANN_SETUP"] == str(cann_setup.resolve())
+    assert discovered["TILEFOUNDRY_NPU_CONDA_SH"] == str(conda_sh.resolve())
+    assert discovered["TILEFOUNDRY_NPU_CONDA_ENV"] == "tilefoundry-npu"
+    assert discovered["TILEFOUNDRY_NPU_CANNBENCH_ARCH"] == "ascend950"
+    assert "TILEFOUNDRY_NPU_LLM_BACKEND" not in discovered
+    assert "TILEFOUNDRY_NPU_AGY_BIN" not in discovered
+    assert discovered["TILEFOUNDRY_NPU_WORK_ROOT"] == str((state_dir / "cannbench-work").resolve())
+    assert discovered["TILEFOUNDRY_NPU_CANNBENCH_TARGETS"] != "wrong/op:kernels.py"

@@ -18,10 +18,13 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     CannbenchOpsRegistry,
     RegimeTargetSpec,
     build_semantic_regime_specs,
+    discover_module_trackb_symbols,
     extract_schema_driven_case_dims,
+    extract_trackb_cpp_source,
 )
 from tilefoundry_ascend.agent.campaign.marathon import (
     MarathonConfig,
+    _stage0_entrypoint_contract_error,
     build_marathon_arg_parser,
     build_stage0_static_validator,
     run_operator_marathon,
@@ -29,18 +32,24 @@ from tilefoundry_ascend.agent.campaign.marathon import (
 from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
     OracleAccuracyResult,
     _canonical_seed_track,
+    _seed_module_abi,
     _seed_parameter_specs,
     extract_golden_entrypoint_contract,
     format_golden_entrypoint_prompt_block,
     prepare_operator_seed_or_takeover,
     validate_entrypoint_signature_compatibility,
 )
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import StageAResult, StageBResult
+from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    StageAResult,
+    StageBResult,
+    check_npu_entrypoint_purity,
+)
 from tilefoundry_ascend.agent.orchestrator.llm_client import GenerationRequest, MockLLMBackend
 from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
     PyTorchSemanticAnalyzer,
     RepresentativeCase,
 )
+from tilefoundry_ascend.ascend.target.dialect_surface import get_dialect_surface
 
 
 def _real_cannbench_repo() -> Path | None:
@@ -857,3 +866,106 @@ def test_stage0_trackb_allows_ascendc_primitives_without_facet_locks(
     bad_ok, bad_err = validator(bad_src, "cce_trackb")
     assert bad_ok is False
     assert "AscendC" in bad_err
+
+
+def test_trackb_static_cpp_string_discovery_and_extraction() -> None:
+    """Verify dedent, string concatenation, strip, and vector/simd markers are resolved."""
+    src_dedent = dedent(
+        '''
+        from textwrap import dedent
+        OP_A_TRACKB_CU = dedent("""
+            #include <tl_templates/ascend/common.h>
+            __global__ __vector__ void k() {}
+        """).strip()
+        '''
+    )
+    syms = discover_module_trackb_symbols(src_dedent)
+    assert syms == ("OP_A_TRACKB_CU",)
+    extracted = extract_trackb_cpp_source(src_dedent, syms)
+    assert extracted is not None
+    assert extracted[0] == "OP_A_TRACKB_CU"
+    assert "__global__ __vector__" in extracted[1]
+
+    src_concat = dedent(
+        '''
+        import textwrap
+        OP_B_TRACKB_CU = (
+            textwrap.dedent("""
+                #include "custom.h"
+                __simd_vf__ void vf() {}
+            """)
+            + "\\n__global__ __aicore__ __vector__ void run() {}\\n"
+        )
+        '''
+    )
+    syms_b = discover_module_trackb_symbols(src_concat)
+    assert syms_b == ("OP_B_TRACKB_CU",)
+    extracted_b = extract_trackb_cpp_source(src_concat, syms_b)
+    assert extracted_b is not None
+    assert "__simd_vf__" in extracted_b[1]
+    assert "__vector__" in extracted_b[1]
+
+
+def test_trackb_entrypoint_purity_and_stage0_contract_with_compile_ascend() -> None:
+    """Verify Track-B purity skips tilelang.compile while guarding fallbacks and missing TU."""
+    src_trackb = dedent(
+        '''
+        from textwrap import dedent
+        import torch
+        from tilelang.contrib.bisheng import compile_ascend
+
+        VEC_OP_TRACKB_CU = dedent("""
+            #include <tl_templates/ascend/common.h>
+            __global__ __aicore__ __vector__ void k(__gm__ float* x) {}
+        """)
+
+        def _get_kernel() -> object:
+            return compile_ascend(VEC_OP_TRACKB_CU, target_format="so")
+
+        def vec_op(x: torch.Tensor) -> torch.Tensor:
+            if x.device.type != "npu":
+                return x * 2
+            _get_kernel()
+            return x
+
+        kernel = vec_op
+        '''
+    )
+    assert check_npu_entrypoint_purity(src_trackb, "vec_op", track="cce_trackb") == []
+    assert _stage0_entrypoint_contract_error(src_trackb, "vec_op", "hybrid_trackb") == ""
+
+    src_fallback = src_trackb.replace(
+        "_get_kernel()\n    return x",
+        "_get_kernel()\n    return torch.softmax(x, dim=-1)",
+    )
+    errs_fb = check_npu_entrypoint_purity(src_fallback, "vec_op", track="cce_trackb")
+    assert any("npu_host_fallback_forbidden" in e for e in errs_fb)
+
+    src_missing = dedent(
+        '''
+        import torch
+
+        def vec_op(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        kernel = vec_op
+        '''
+    )
+    errs_miss = check_npu_entrypoint_purity(src_missing, "vec_op", track="cce_trackb")
+    assert any("missing_trackb_dispatch" in e for e in errs_miss)
+
+
+def test_seed_module_abi_trackb_prompt_includes_compile_ascend_recipe() -> None:
+    """Verify Track-B prompt specifies raw TU literal, __vector__ attr, and compile_ascend."""
+    prompt = _seed_module_abi(
+        "softmax",
+        (("d_dim", 128),),
+        get_dialect_surface("cce_cpp20"),
+        "cce_trackb",
+    )
+    assert "compile_ascend" in prompt
+    assert "PURE_SIMDVF_UBUF_FLAGS" in prompt
+    assert "__global__ __aicore__ __vector__" in prompt
+    assert '__mix__(1, 2)' in prompt
+    assert 'SOFTMAX_TRACKB_CU = r"""' in prompt
+    assert "torch.npu.current_stream().npu_stream" in prompt

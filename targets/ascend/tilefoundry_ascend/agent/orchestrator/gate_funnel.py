@@ -178,7 +178,12 @@ def _detect_module_entrypoint(tree: ast.Module) -> str:
     return ""
 
 
-def check_npu_entrypoint_purity(module_source: str, entrypoint: str) -> list[str]:
+def check_npu_entrypoint_purity(
+    module_source: str,
+    entrypoint: str,
+    *,
+    track: str | None = None,
+) -> list[str]:
     """Reject detached decoy @T.prim_func scaffolds and NPU-side PyTorch/golden fallbacks."""
     try:
         tree = ast.parse(module_source)
@@ -236,7 +241,22 @@ def check_npu_entrypoint_purity(module_source: str, entrypoint: str) -> list[str
             errors.append(
                 f"unreachable_decoy_primfunc:{fname} is never reachable from {entrypoint}"
             )
-    if backend == "tilelang_dsl" and "tilelang.compile(" not in "\n".join(reachable_src):
+    reachable_text = "\n".join(reachable_src)
+    if track in ("cce_trackb", "ascendc_trackb", "hybrid_trackb"):
+        has_trackb_dispatch = (
+            backend != "tilelang_dsl"
+            or "compile_ascend" in reachable_text
+            or "ctypes.CDLL" in reachable_text
+            or "_render_trackb_tu" in reachable_text
+            or "_get_track_b_lib" in reachable_text
+            or "tilelang.compile(" in reachable_text
+        )
+        if not has_trackb_dispatch:
+            errors.append(
+                f"missing_trackb_dispatch:{entrypoint} exposes no reachable Track-B C++20 "
+                "translation unit or compile_ascend dispatch"
+            )
+    elif backend == "tilelang_dsl" and "tilelang.compile(" not in reachable_text:
         errors.append(
             f"detached_decoy_primfunc:{entrypoint} never invokes tilelang.compile"
         )
