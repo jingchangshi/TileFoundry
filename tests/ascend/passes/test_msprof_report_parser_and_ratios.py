@@ -352,7 +352,7 @@ def test_orthogonal_hbm_bound_vs_redundant_gm_roundtrip_in_p0_and_p1() -> None:
     """Verify transfer_inflation_ratio separates HBM saturation from redundant GM traffic."""
     roofline = _sample_roofline(min_gm_bytes=1_000_000, compute_floor_us=10.0)
 
-    p0_true_hbm_ledger = _sample_ledger(gm_roundtrip_bytes=65_000, grid_blocks=16)
+    p0_true_hbm_ledger = _sample_ledger(gm_roundtrip_bytes=2_500, grid_blocks=16)
     p0_true_obs = ObservationVector5D.from_tiers(
         p0_true_hbm_ledger,
         telemetry={"dur_us": 25.0, "mte2_wait_ratio": 0.72, "l2_hit_rate": 0.85},
@@ -369,7 +369,7 @@ def test_orthogonal_hbm_bound_vs_redundant_gm_roundtrip_in_p0_and_p1() -> None:
         telemetry={"dur_us": 45.0, "mte2_wait_ratio": 0.62, "l2_hit_rate": 0.85},
         roofline=roofline,
     )
-    assert p0_redundant_obs.transfer_inflation_ratio == pytest.approx(1.92)
+    assert p0_redundant_obs.transfer_inflation_ratio == pytest.approx(2.92)
     assert p0_redundant_obs.transfer_inflation_ratio > 1.35
     assert p0_redundant_obs.offchip_dma.l2_mte2_wait_ratio > 0.55
 
@@ -406,7 +406,7 @@ def test_orthogonal_hbm_bound_vs_redundant_gm_roundtrip_in_p0_and_p1() -> None:
         telemetry={"dur_us": 30.0},
         roofline=roofline,
     )
-    assert method_obs.transfer_inflation_ratio == pytest.approx(1.50)
+    assert method_obs.transfer_inflation_ratio == pytest.approx(2.50)
 
     scoped_obs = ObservationVector5D.from_tiers(
         _ScopedFullGridLedger(
@@ -417,7 +417,7 @@ def test_orthogonal_hbm_bound_vs_redundant_gm_roundtrip_in_p0_and_p1() -> None:
         telemetry={"dur_us": 30.0},
         roofline=roofline,
     )
-    assert scoped_obs.transfer_inflation_ratio == pytest.approx(1.10)
+    assert scoped_obs.transfer_inflation_ratio == pytest.approx(2.10)
 
 
 def test_orthogonal_compute_ceiling_vs_degraded_vector_execution_and_roundtrip() -> None:

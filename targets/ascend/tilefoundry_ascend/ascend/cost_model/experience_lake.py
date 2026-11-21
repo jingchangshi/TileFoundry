@@ -322,6 +322,49 @@ def project_case_workload(
     return out
 
 
+def _prefer_richer_candidate(
+    existing: CandidateArtifactRecord | None,
+    candidate: CandidateArtifactRecord,
+) -> CandidateArtifactRecord:
+    """Prefer the candidate snapshot carrying compiler summary and base ledger data."""
+    if existing is None:
+        return candidate
+    if not existing.bisheng_summary and candidate.bisheng_summary:
+        return candidate
+    if not existing.base_ledger and candidate.base_ledger:
+        return candidate
+    return existing
+
+
+def _flatten_candidates_by_sha(
+    by_regime: Mapping[tuple[str, str], CandidateArtifactRecord],
+) -> dict[str, CandidateArtifactRecord]:
+    """Collapse regime-keyed candidate snapshots into a deterministic flat map."""
+    flat: dict[str, CandidateArtifactRecord] = {}
+    for (_sha, _rtag), rec in sorted(by_regime.items()):
+        flat[rec.cand_sha] = _prefer_richer_candidate(flat.get(rec.cand_sha), rec)
+    return flat
+
+
+def resolve_candidate_for_regime(
+    by_regime: Mapping[tuple[str, str], CandidateArtifactRecord],
+    flat: Mapping[str, CandidateArtifactRecord],
+    cand_sha: str,
+    regime_tag: str = "",
+) -> CandidateArtifactRecord | None:
+    """Resolve candidate snapshot by (cand_sha, regime_tag), empty-regime, or flat fallback."""
+    clean_sha = cand_sha.strip()
+    clean_regime = regime_tag.strip()
+    if clean_regime:
+        hit = by_regime.get((clean_sha, clean_regime))
+        if hit is not None:
+            return hit
+    default_hit = by_regime.get((clean_sha, ""))
+    if default_hit is not None:
+        return default_hit
+    return flat.get(clean_sha)
+
+
 class ExperienceLake:
     """Thread/process-safe content-addressed candidate + sharded append-only observation store."""
 
@@ -330,14 +373,53 @@ class ExperienceLake:
         self.candidates_dir = self.root_dir / "candidates"
         self.runs_dir = self.root_dir / "runs"
 
+    def _candidate_path(self, cand_sha: str, regime_tag: str) -> Path:
+        sha = _safe_slug(cand_sha, "unknown")
+        clean_regime = regime_tag.strip()
+        if clean_regime:
+            return self.candidates_dir / f"{sha}_{_safe_slug(clean_regime)}.json"
+        return self.candidates_dir / f"{sha}.json"
+
     def register_candidate(self, record: CandidateArtifactRecord) -> Path:
-        """Persist candidate static artifact atomically once per cand_sha."""
+        """Persist candidate static artifact atomically per (cand_sha, regime_tag)."""
         self.candidates_dir.mkdir(parents=True, exist_ok=True)
         sha = _safe_slug(record.cand_sha, "unknown")
-        target = self.candidates_dir / f"{sha}.json"
+        target = self._candidate_path(record.cand_sha, record.regime_tag)
+        record_to_write = record
         if target.is_file():
-            return target
-        payload = json.dumps(record.to_dict(), indent=2, sort_keys=True) + "\n"
+            try:
+                existing = CandidateArtifactRecord.from_dict(
+                    json.loads(target.read_text(encoding="utf-8"))
+                )
+            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+                existing = None
+            if existing is not None:
+                needs_bisheng_upgrade = (
+                    not existing.bisheng_summary and bool(record.bisheng_summary)
+                )
+                needs_ledger_upgrade = not existing.base_ledger and bool(record.base_ledger)
+                if not needs_bisheng_upgrade and not needs_ledger_upgrade:
+                    return target
+                record_to_write = CandidateArtifactRecord(
+                    cand_sha=record.cand_sha,
+                    operator=record.operator or existing.operator,
+                    regime_tag=record.regime_tag or existing.regime_tag,
+                    backend_track=record.backend_track or existing.backend_track,
+                    parent_sha=record.parent_sha or existing.parent_sha,
+                    worker_kind=record.worker_kind or existing.worker_kind,
+                    rule_id=record.rule_id if record.rule_id is not None else existing.rule_id,
+                    config_knobs=dict(record.config_knobs or existing.config_knobs),
+                    topology_axes=dict(record.topology_axes or existing.topology_axes),
+                    base_ledger=dict(record.base_ledger or existing.base_ledger),
+                    microarch_profile=dict(
+                        record.microarch_profile or existing.microarch_profile
+                    ),
+                    bisheng_summary=dict(record.bisheng_summary or existing.bisheng_summary),
+                    dsl_line_count=record.dsl_line_count or existing.dsl_line_count,
+                    subkernel_count=max(record.subkernel_count, existing.subkernel_count),
+                    schema_version=max(record.schema_version, existing.schema_version),
+                )
+        payload = json.dumps(record_to_write.to_dict(), indent=2, sort_keys=True) + "\n"
         fd, tmp_name = tempfile.mkstemp(dir=str(self.candidates_dir), prefix=f".{sha}.")
         tmp_path = Path(tmp_name)
         try:
@@ -358,18 +440,7 @@ class ExperienceLake:
             fh.write(line)
         return shard
 
-    def load_records(self) -> tuple[dict[str, CandidateArtifactRecord], list[CaseObservationRecord]]:
-        """Load all deduplicated candidates and sharded case observations."""
-        candidates: dict[str, CandidateArtifactRecord] = {}
-        if self.candidates_dir.is_dir():
-            for cpath in sorted(self.candidates_dir.glob("*.json")):
-                try:
-                    data = json.loads(cpath.read_text(encoding="utf-8"))
-                    rec = CandidateArtifactRecord.from_dict(data)
-                    candidates[rec.cand_sha] = rec
-                except Exception:
-                    continue
-
+    def _load_observations(self) -> list[CaseObservationRecord]:
         observations: list[CaseObservationRecord] = []
         if self.runs_dir.is_dir():
             for rpath in sorted(self.runs_dir.glob("*.jsonl")):
@@ -388,10 +459,33 @@ class ExperienceLake:
                     except Exception:
                         continue
         observations.sort(key=lambda o: (o.timestamp, o.operator, o.case_num, o.cand_sha))
-        return candidates, observations
+        return observations
+
+    def load_records_by_regime(
+        self,
+    ) -> tuple[dict[tuple[str, str], CandidateArtifactRecord], list[CaseObservationRecord]]:
+        """Load candidates keyed by (cand_sha, regime_tag) and sharded case observations."""
+        candidates: dict[tuple[str, str], CandidateArtifactRecord] = {}
+        if self.candidates_dir.is_dir():
+            for cpath in sorted(self.candidates_dir.glob("*.json")):
+                try:
+                    data = json.loads(cpath.read_text(encoding="utf-8"))
+                    rec = CandidateArtifactRecord.from_dict(data)
+                    key = (rec.cand_sha, rec.regime_tag.strip())
+                    candidates[key] = _prefer_richer_candidate(candidates.get(key), rec)
+                except Exception:
+                    continue
+        return candidates, self._load_observations()
+
+    def load_records(self) -> tuple[dict[str, CandidateArtifactRecord], list[CaseObservationRecord]]:
+        """Load all deduplicated candidates and sharded case observations."""
+        by_regime, observations = self.load_records_by_regime()
+        return _flatten_candidates_by_sha(by_regime), observations
 
     def extract_pairwise_deltas(
         self,
+        *,
+        exclude_run_id: str | None = None,
     ) -> list[
         tuple[
             CandidateArtifactRecord,
@@ -401,10 +495,13 @@ class ExperienceLake:
         ]
     ]:
         """Match same-(operator, regime_tag, case_num) candidate-vs-parent measurement pairs."""
-        candidates, observations = self.load_records()
+        by_regime, observations = self.load_records_by_regime()
+        flat_candidates = _flatten_candidates_by_sha(by_regime)
         latest_by_cand_case: dict[tuple[str, str, str, int], CaseObservationRecord] = {}
         for obs in observations:
             if obs.measured_us <= 0.0:
+                continue
+            if exclude_run_id and obs.run_id == exclude_run_id:
                 continue
             latest_by_cand_case[(obs.cand_sha, obs.operator, obs.regime_tag, obs.case_num)] = obs
 
@@ -418,7 +515,9 @@ class ExperienceLake:
         ] = []
         seen_pairs: set[tuple[str, str, str, str, int]] = set()
         for (_csha, op, rtag, cnum), cand_obs in sorted(latest_by_cand_case.items()):
-            cand_art = candidates.get(cand_obs.cand_sha)
+            cand_art = resolve_candidate_for_regime(
+                by_regime, flat_candidates, cand_obs.cand_sha, cand_obs.regime_tag
+            )
             psha = cand_obs.parent_sha.strip() or (
                 cand_art.parent_sha.strip() if cand_art is not None else ""
             )
@@ -427,7 +526,9 @@ class ExperienceLake:
             parent_obs = latest_by_cand_case.get((psha, op, rtag, cnum))
             if parent_obs is None or parent_obs.measured_us <= 0.0:
                 continue
-            parent_art = candidates.get(psha)
+            parent_art = resolve_candidate_for_regime(
+                by_regime, flat_candidates, psha, parent_obs.regime_tag
+            )
             if cand_art is None or parent_art is None:
                 continue
             key = (cand_obs.cand_sha, psha, op, rtag, cnum)
@@ -444,5 +545,6 @@ __all__ = [
     "ExperienceLake",
     "compute_source_sha256",
     "project_case_workload",
+    "resolve_candidate_for_regime",
     "resolve_default_experience_lake_dir",
 ]

@@ -311,10 +311,10 @@ def test_experience_lake_dedup_replay_and_two_head_calibrator(tmp_path: Path) ->
         )
     )
     p2 = lake.register_candidate(
-        CandidateArtifactRecord(cand_sha=parent_sha, operator="level2/softmax")
+        CandidateArtifactRecord(cand_sha=parent_sha, operator="level2/softmax", regime_tag="large_row")
     )
     assert p1 == p2
-    assert (lake.candidates_dir / f"{parent_sha}.json").is_file()
+    assert (lake.candidates_dir / f"{parent_sha}_large_row.json").is_file()
 
     lake.register_candidate(
         CandidateArtifactRecord(

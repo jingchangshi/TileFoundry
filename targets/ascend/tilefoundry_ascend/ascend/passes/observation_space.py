@@ -310,10 +310,8 @@ def _resolve_roofline_bounds(
     return max(0.0, min_gm), max(0.0, compute_floor_us)
 
 
-def _resolve_actual_gm_bytes(
-    ledger: PhysicalLedgerLike, telemetry: Mapping[str, object]
-) -> float:
-    """Resolve actual GM traffic preferring P1 measured HBM bytes over P0 static ledger bytes."""
+def _resolve_measured_hbm_bytes(telemetry: Mapping[str, object]) -> float:
+    """Resolve measured HBM traffic bytes when explicitly present and positive."""
     explicit_actual = _telemetry_float(telemetry, "actual_gm_bytes")
     if explicit_actual > 0.0:
         return explicit_actual
@@ -321,7 +319,27 @@ def _resolve_actual_gm_bytes(
     hbm_write = _telemetry_float(telemetry, "hbm_write_bytes")
     if hbm_read + hbm_write > 0.0:
         return hbm_read + hbm_write
-    return float(_resolve_static_ledger_gm_bytes(ledger))
+    return 0.0
+
+
+def compute_transfer_inflation_ratio(
+    ledger: PhysicalLedgerLike,
+    *,
+    telemetry: Mapping[str, object] | None = None,
+    roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
+) -> float:
+    """Compute HBM transfer inflation from measured HBM traffic or static roundtrip bytes."""
+    tel = telemetry if telemetry is not None else {}
+    blueprint_min_gm_bytes, _ = _resolve_roofline_bounds(roofline, tel)
+    if blueprint_min_gm_bytes <= 0.0:
+        return max(0.0, _telemetry_float(tel, "transfer_inflation_ratio"))
+    measured_hbm_bytes = _resolve_measured_hbm_bytes(tel)
+    if measured_hbm_bytes > 0.0:
+        return measured_hbm_bytes / max(1.0, float(blueprint_min_gm_bytes))
+    extra_roundtrip_bytes = float(_resolve_static_ledger_gm_bytes(ledger))
+    return (float(blueprint_min_gm_bytes) + extra_roundtrip_bytes) / max(
+        1.0, float(blueprint_min_gm_bytes)
+    )
 
 
 @dataclass(frozen=True)
@@ -511,14 +529,14 @@ class ObservationVector5D:
         )
         measured_l2_fields = measured_fields if has_l2_telemetry else ()
 
-        blueprint_min_gm_bytes, blueprint_compute_floor_us = _resolve_roofline_bounds(
+        _blueprint_min_gm_bytes, blueprint_compute_floor_us = _resolve_roofline_bounds(
             roofline, tel
         )
-        actual_gm_bytes = _resolve_actual_gm_bytes(ledger, tel)
-        if blueprint_min_gm_bytes > 0.0 and actual_gm_bytes > 0.0:
-            transfer_inflation_ratio = actual_gm_bytes / max(1.0, float(blueprint_min_gm_bytes))
-        else:
-            transfer_inflation_ratio = max(0.0, _telemetry_float(tel, "transfer_inflation_ratio"))
+        transfer_inflation_ratio = compute_transfer_inflation_ratio(
+            ledger,
+            telemetry=tel,
+            roofline=roofline,
+        )
 
         if blueprint_compute_floor_us > 0.0 and measured_latency_us > 0.0:
             effective_compute_eta = blueprint_compute_floor_us / max(1e-3, measured_latency_us)
@@ -793,4 +811,5 @@ __all__ = [
     "PipelineSyncAxis",
     "RooflineSummaryLike",
     "ScopeWaterlineLike",
+    "compute_transfer_inflation_ratio",
 ]

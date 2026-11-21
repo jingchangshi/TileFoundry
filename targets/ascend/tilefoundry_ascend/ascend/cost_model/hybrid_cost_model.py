@@ -15,9 +15,11 @@ from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
     CompilerBehaviorRegistry,
 )
 from tilefoundry_ascend.ascend.cost_model.experience_lake import (
+    CandidateArtifactRecord,
     CaseObservationRecord,
     ExperienceLake,
     project_case_workload,
+    resolve_candidate_for_regime,
 )
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
     MicroarchProfile,
@@ -1560,15 +1562,99 @@ class HybridAscendCostModel:
         log_res = max(-2.5, min(2.5, log_res))
         return max(1e-4, (base_c / base_p) * math.exp(log_res))
 
+    @staticmethod
+    def _obs_dedup_key(
+        cand_sha: str,
+        operator: str,
+        regime_tag: str,
+        case_num: int,
+        eval_tier: str,
+        measured_us: float,
+    ) -> tuple[str, str, str, int, str, float]:
+        return (
+            str(cand_sha),
+            str(operator),
+            str(regime_tag),
+            int(case_num),
+            str(eval_tier),
+            round(float(measured_us), 6),
+        )
+
+    @staticmethod
+    def _pair_dedup_key(
+        cand_sha: str,
+        parent_sha: str,
+        operator: str,
+        regime_tag: str,
+        case_num: int,
+    ) -> tuple[str, str, str, str, int]:
+        return (
+            str(cand_sha),
+            str(parent_sha),
+            str(operator),
+            str(regime_tag),
+            int(case_num),
+        )
+
+    def mark_online_observation_key(
+        self,
+        *,
+        cand_sha: str,
+        operator: str,
+        regime_tag: str,
+        case_num: int,
+        eval_tier: str,
+        measured_us: float,
+    ) -> None:
+        """Record an online observation dedup key matching replay_experience_lake."""
+        self._replayed_obs_keys.add(
+            self._obs_dedup_key(
+                cand_sha,
+                operator,
+                regime_tag,
+                case_num,
+                eval_tier,
+                measured_us,
+            )
+        )
+
+    def mark_online_pair_key(
+        self,
+        *,
+        cand_sha: str,
+        parent_sha: str,
+        operator: str,
+        regime_tag: str,
+        case_num: int,
+    ) -> None:
+        """Record an online pairwise-delta dedup key matching replay_experience_lake."""
+        self._replayed_pair_keys.add(
+            self._pair_dedup_key(
+                cand_sha,
+                parent_sha,
+                operator,
+                regime_tag,
+                case_num,
+            )
+        )
+
     def replay_experience_lake(
         self,
         lake_dir: ExperienceLake | str | Path,
         *,
         persist_calibration: bool = False,
+        exclude_run_id: str | None = None,
     ) -> dict[str, int]:
         """Idempotently replay candidates, case observations, MSProf PMU, and pairwise deltas."""
         lake = lake_dir if isinstance(lake_dir, ExperienceLake) else ExperienceLake(lake_dir)
-        candidates, observations = lake.load_records()
+        candidates_by_regime, observations = lake.load_records_by_regime()
+        flat_candidates: dict[str, CandidateArtifactRecord] = {}
+        for (_sha, _rtag), art in sorted(candidates_by_regime.items()):
+            prev = flat_candidates.get(art.cand_sha)
+            if prev is None or (not prev.bisheng_summary and art.bisheng_summary) or (
+                not prev.base_ledger and art.base_ledger
+            ):
+                flat_candidates[art.cand_sha] = art
         n_obs = 0
         n_msprof = 0
         n_pairs = 0
@@ -1576,8 +1662,14 @@ class HybridAscendCostModel:
         def _project_for(
             art_sha: str,
             obs_rec: CaseObservationRecord,
+            resolved_art: CandidateArtifactRecord | None = None,
         ) -> tuple[dict[str, object], dict[str, object] | None]:
-            art = candidates.get(art_sha)
+            art = resolved_art or resolve_candidate_for_regime(
+                candidates_by_regime,
+                flat_candidates,
+                art_sha,
+                obs_rec.regime_tag,
+            )
             if art is None:
                 proj = project_case_workload(
                     None,
@@ -1611,13 +1703,15 @@ class HybridAscendCostModel:
         for obs in observations:
             if obs.measured_us <= 0.0:
                 continue
-            obs_key = (
+            if exclude_run_id and obs.run_id == exclude_run_id:
+                continue
+            obs_key = self._obs_dedup_key(
                 obs.cand_sha,
                 obs.operator,
                 obs.regime_tag,
                 int(obs.case_num),
                 obs.eval_tier,
-                round(float(obs.measured_us), 6),
+                float(obs.measured_us),
             )
             if obs_key in self._replayed_obs_keys:
                 continue
@@ -1638,8 +1732,10 @@ class HybridAscendCostModel:
             self.observe(wl, measured_us, bisheng_res=bres, persist=False, refit=False)
             n_obs += 1
 
-        for cand_art, cand_obs, parent_art, parent_obs in lake.extract_pairwise_deltas():
-            pkey = (
+        for cand_art, cand_obs, parent_art, parent_obs in lake.extract_pairwise_deltas(
+            exclude_run_id=exclude_run_id
+        ):
+            pkey = self._pair_dedup_key(
                 cand_obs.cand_sha,
                 parent_obs.cand_sha,
                 cand_obs.operator,
@@ -1649,8 +1745,8 @@ class HybridAscendCostModel:
             if pkey in self._replayed_pair_keys:
                 continue
             self._replayed_pair_keys.add(pkey)
-            wl_c, bres_c = _project_for(cand_art.cand_sha, cand_obs)
-            wl_p, bres_p = _project_for(parent_art.cand_sha, parent_obs)
+            wl_c, bres_c = _project_for(cand_art.cand_sha, cand_obs, cand_art)
+            wl_p, bres_p = _project_for(parent_art.cand_sha, parent_obs, parent_art)
             self.observe_pair_delta(
                 wl_c,
                 cand_obs.measured_us,

@@ -13,6 +13,7 @@ from tilefoundry_ascend.ascend.passes.observation_space import (
     CompilerSummaryLike,
     ObservationVector5D,
     RooflineSummaryLike,
+    compute_transfer_inflation_ratio,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 
@@ -307,6 +308,11 @@ def compute_static_dynamic_residual(
         telemetry=telemetry,
         roofline=roofline,
     )
+    transfer_inflation_ratio = compute_transfer_inflation_ratio(
+        ledger,
+        telemetry=telemetry,
+        roofline=roofline,
+    )
     return StaticDynamicResidual(
         measured_latency_us=measured_us,
         predicted_bottleneck_util=round(predicted_util, 6),
@@ -326,7 +332,7 @@ def compute_static_dynamic_residual(
         has_local_membar_in_vf_call=has_local_membar_in_vf_call,
         vloopv2_hit=vloopv2_hit,
         observation=observation,
-        transfer_inflation_ratio=observation.transfer_inflation_ratio,
+        transfer_inflation_ratio=transfer_inflation_ratio,
         effective_compute_eta=observation.effective_compute_eta,
     )
 
@@ -668,6 +674,8 @@ class BeamCandidate:
     parent_id: str | None = None
     features: StructuralFeatures | None = None
     objective_score: float | None = None
+    case_latencies_us: dict[int, float] = field(default_factory=dict)
+    policy: dict[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.track:
@@ -691,6 +699,10 @@ class BeamCandidate:
             "parent_id": self.parent_id,
             "features": self.features.to_dict() if self.features is not None else None,
             "objective_score": self.objective_score,
+            "case_latencies_us": {
+                int(case_id): float(lat) for case_id, lat in self.case_latencies_us.items()
+            },
+            "policy": dict(self.policy),
         }
 
     @classmethod
@@ -719,6 +731,20 @@ class BeamCandidate:
         raw_parent = payload.get("parent_id")
         raw_sig = payload.get("structural_signature") or ()
         raw_obj = payload.get("objective_score")
+        raw_case_latencies = payload.get("case_latencies_us")
+        case_latencies_us: dict[int, float] = {}
+        if isinstance(raw_case_latencies, Mapping):
+            for k, v in raw_case_latencies.items():
+                if isinstance(k, bool) or isinstance(v, bool):
+                    continue
+                try:
+                    case_latencies_us[int(k)] = float(v)
+                except (TypeError, ValueError):
+                    continue
+        raw_policy = payload.get("policy")
+        policy = (
+            {str(k): v for k, v in raw_policy.items()} if isinstance(raw_policy, Mapping) else {}
+        )
         return cls(
             candidate_id=str(payload["candidate_id"]),
             round_idx=int(payload["round_idx"]),
@@ -735,6 +761,8 @@ class BeamCandidate:
             parent_id=str(raw_parent) if raw_parent is not None else None,
             features=features,
             objective_score=float(raw_obj) if raw_obj is not None else None,
+            case_latencies_us=case_latencies_us,
+            policy=policy,
         )
 
 

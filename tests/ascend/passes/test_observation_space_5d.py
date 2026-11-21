@@ -578,7 +578,7 @@ def test_observation_and_residual_serialization_round_trip() -> None:
         telemetry=_rich_telemetry(),
         roofline=roofline_map,
     )
-    assert ratio_obs.transfer_inflation_ratio == pytest.approx(2.0)
+    assert ratio_obs.transfer_inflation_ratio == pytest.approx(3.0)
     assert ratio_obs.effective_compute_eta == pytest.approx(0.5)
     assert ObservationVector5D.from_dict(ratio_obs.to_dict()) == ratio_obs
 
@@ -588,7 +588,7 @@ def test_observation_and_residual_serialization_round_trip() -> None:
         compiler_summary=_rich_compiler_summary(),
         roofline=roofline_map,
     )
-    assert ratio_res.transfer_inflation_ratio == pytest.approx(2.0)
+    assert ratio_res.transfer_inflation_ratio == pytest.approx(3.0)
     assert ratio_res.effective_compute_eta == pytest.approx(0.5)
     assert StaticDynamicResidual.from_dict(ratio_res.to_dict()) == ratio_res
 
