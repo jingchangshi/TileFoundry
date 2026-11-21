@@ -403,7 +403,9 @@ def test_marathon_l3_runner_forwards_resume_and_authorized_card(
         device_id="1",
         prewarm_l3=False,
     )
-    callback = lambda *_args: None
+    def callback(*_args) -> None:
+        return None
+
     result = runner(
         tmp_path / "kernels.py",
         resume_execution_id="exec-saved",

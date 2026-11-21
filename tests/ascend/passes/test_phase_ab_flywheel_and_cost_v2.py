@@ -1,4 +1,7 @@
-"""Comprehensive tests for Phase A' (Experience Lake & Flywheel) and Phase B' (Ascend 950 Cost v2)."""
+"""Comprehensive tests for Phase A' (Experience Lake & Flywheel) and Phase B'.
+
+Phase B' covers Ascend 950 Cost v2.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +18,11 @@ from tilefoundry.ir.tir.memory import AllocTensor
 from tilefoundry.ir.tir.stmts import Evaluate, For, LetStmt, Sequential
 from tilefoundry.ir.types import DType, StorageKind, TensorType
 from tilefoundry.ir.types.dim import DimVar
-from tilefoundry_ascend.agent.campaign.anchor_specs import AnchorCaseSpec, PerfTargetSpec, RegimeTargetSpec
+from tilefoundry_ascend.agent.campaign.anchor_specs import (
+    AnchorCaseSpec,
+    PerfTargetSpec,
+    RegimeTargetSpec,
+)
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
     PerfTargetCampaignRunner,
@@ -69,7 +76,12 @@ from tilefoundry_ascend.ascend.target import AscendTarget
 
 
 def test_microarch_profile_tir_cce_extraction_and_merge() -> None:
-    """Verify TIR + CCE MicroarchProfile extractors capture AVE, DMA, loops, and Track-B merge."""
+    """Verify TIR + CCE MicroarchProfile extractors capture AVE, DMA, loops, and Track-B merge.
+
+    Note:
+        - Preserves exact TIR byte volumes over CCE approximations for populated edges
+        - Fills missing Track-B / post-codegen signals from CCE
+    """
 
     @T.prim_func
     def _vec_f16_kernel(X: T.Tensor((128, 128), "float16"), Y: T.Tensor((128, 128), "float16")):
@@ -125,10 +137,8 @@ def test_microarch_profile_tir_cce_extraction_and_merge() -> None:
 
     merged = merge_microarch_profiles(tir_prof, cce_prof)
     assert merged.source_kind == "merged"
-    # Preserves exact TIR byte volumes over CCE approximations for populated edges
     assert merged.gm_to_ub_bytes == tir_prof.gm_to_ub_bytes
     assert merged.ub_to_gm_bytes == tir_prof.ub_to_gm_bytes
-    # Fills missing Track-B / post-codegen signals from CCE
     assert merged.subkernel_count == 2
     assert merged.cv_sync_barriers == 2
     assert merged.pipe_all_barriers == 1
@@ -136,10 +146,18 @@ def test_microarch_profile_tir_cce_extraction_and_merge() -> None:
 
 
 def test_pipe_schedule_evaluator_ascend950_physics_and_z3_ticks() -> None:
-    """Verify SFU F16>F32, 2L/1S UB ports, UB->L1/L0C->UB slopes, drain bubble, and Z3 solve."""
+    """Verify SFU F16>F32, 2L/1S UB ports, UB->L1/L0C->UB slopes, drain bubble, and Z3 solve.
+
+    Note:
+        - 1. SFU F16 vs F32 penalty (SFU F16 weight 4.0 vs SFU F32 weight 2.0)
+        - 2. 2-Load / 1-Store UB asymmetry
+        - 3. Directional MTE3 (UB->L1 0.5x) and FixPipe (L0C->UB 0.877x)
+        - 4. Pipeline depth=2 reduces drain bubble / loop_total_ns compared to depth=1
+        - 5. Wire through HybridAscendCostModel.predict
+        - 6. Continuous ns estimation + Z3 normalization + solver execution
+    """
     ev = Ascend950PipeScheduleEvaluator(AscendTarget("ascend.950pr"))
 
-    # 1. SFU F16 vs F32 penalty (SFU F16 weight 4.0 vs SFU F32 weight 2.0)
     p_f16 = MicroarchProfile(sfu_f16_ops=512, ub_load_bytes=65536, ub_store_bytes=65536, source_kind="tirx")
     p_f32 = MicroarchProfile(sfu_f32_ops=512, ub_load_bytes=65536, ub_store_bytes=65536, source_kind="tirx")
     r_f16 = ev.evaluate_profile(p_f16)
@@ -147,12 +165,10 @@ def test_pipe_schedule_evaluator_ascend950_physics_and_z3_ticks() -> None:
     assert r_f16.ave_compute_ns > r_f32.ave_compute_ns
     assert r_f16.total_ns > r_f32.total_ns
 
-    # 2. 2-Load / 1-Store UB asymmetry
     p_store_heavy = MicroarchProfile(ub_load_bytes=32768, ub_store_bytes=32768, source_kind="tirx")
     p_load_only = MicroarchProfile(ub_load_bytes=65536, ub_store_bytes=0, source_kind="tirx")
     assert ev.evaluate_profile(p_store_heavy).ave_io_ns > ev.evaluate_profile(p_load_only).ave_io_ns
 
-    # 3. Directional MTE3 (UB->L1 0.5x) and FixPipe (L0C->UB 0.877x)
     assert DIRECTION_SLOPE_MULT["ub_to_l1"] == pytest.approx(0.50)
     assert DIRECTION_SLOPE_MULT["l0c_to_ub"] == pytest.approx(0.877)
     r_ub_l1 = ev.evaluate_profile(MicroarchProfile(ub_to_l1_bytes=131072, source_kind="tirx"))
@@ -163,7 +179,6 @@ def test_pipe_schedule_evaluator_ascend950_physics_and_z3_ticks() -> None:
     r_l0c_gm = ev.evaluate_profile(MicroarchProfile(l0c_to_gm_bytes=131072, source_kind="tirx"))
     assert r_l0c_ub.pipe_ns["FIXPIPE"] < r_l0c_gm.pipe_ns["FIXPIPE"]
 
-    # 4. Pipeline depth=2 reduces drain bubble / loop_total_ns compared to depth=1
     base_pipe_prof = dict(
         gm_to_ub_bytes=262144,
         ub_load_bytes=65536,
@@ -176,7 +191,6 @@ def test_pipe_schedule_evaluator_ascend950_physics_and_z3_ticks() -> None:
     r_d2 = ev.evaluate_profile(MicroarchProfile(pipeline_depth=2, **base_pipe_prof))
     assert r_d2.loop_total_ns < r_d1.loop_total_ns
 
-    # 5. Wire through HybridAscendCostModel.predict
     model = HybridAscendCostModel(AscendTarget("ascend.950pr"))
     assert model.predict(CostFeatures(microarch_profile=p_f16.to_dict())).pred_us > model.predict(
         CostFeatures(microarch_profile=p_f32.to_dict())
@@ -185,7 +199,6 @@ def test_pipe_schedule_evaluator_ascend950_physics_and_z3_ticks() -> None:
         CostFeatures(microarch_profile=MicroarchProfile(pipeline_depth=1, **base_pipe_prof).to_dict())
     ).pred_us
 
-    # 6. Continuous ns estimation + Z3 normalization + solver execution
     ticks = normalize_ns_to_z3_ticks([12.5, 450.0, 2400.0], max_ticks=12)
     assert len(ticks) == 3
     assert all(1 <= t <= 12 for t in ticks)
@@ -227,7 +240,22 @@ def test_pipe_schedule_evaluator_ascend950_physics_and_z3_ticks() -> None:
 
 
 def test_experience_lake_dedup_replay_and_two_head_calibrator(tmp_path: Path) -> None:
-    """Verify sharded ExperienceLake dedup, idempotent replay, Head-1 MSProf bounds, Head-2 delta ranking."""
+    """Verify sharded ExperienceLake dedup, idempotent replay, Head-1 MSProf bounds.
+
+    Head-2 delta ranking is verified as well.
+
+    Note:
+        - Second write is deduplicated (same sha)
+        - Two run shards append without collision
+        - Replay into CostModel idempotently
+        - Check parametric projection handles varying case_dims cleanly
+        - Head-1 msprof pipe scale multipliers remain Bayes-shrunk and strictly bounded in
+          [0.5, 2.0]
+        - 2e9 vec_flops -> ~169us analytical VECTOR floor vs measured 5000us * 0.95 ->
+          upward scaling clamped <= 2.0
+        - Head-2 delta head learns faster vs slower candidate ratios on compiler/spill
+          signals
+    """
     lake_dir = tmp_path / "exp_lake"
     lake = ExperienceLake(lake_dir)
     axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
@@ -282,7 +310,6 @@ def test_experience_lake_dedup_replay_and_two_head_calibrator(tmp_path: Path) ->
             microarch_profile=dict(parent_ledger.microarch_profile),
         )
     )
-    # Second write is deduplicated (same sha)
     p2 = lake.register_candidate(
         CandidateArtifactRecord(cand_sha=parent_sha, operator="level2/softmax")
     )
@@ -300,7 +327,6 @@ def test_experience_lake_dedup_replay_and_two_head_calibrator(tmp_path: Path) ->
             microarch_profile=dict(fast_ledger.microarch_profile),
         )
     )
-    # Two run shards append without collision
     lake.append_observation(
         CaseObservationRecord(
             run_id="run_a",
@@ -336,7 +362,6 @@ def test_experience_lake_dedup_replay_and_two_head_calibrator(tmp_path: Path) ->
     pairs = lake.extract_pairwise_deltas()
     assert len(pairs) == 1
 
-    # Replay into CostModel idempotently
     cm = HybridAscendCostModel(AscendTarget("ascend.950pr"))
     stats1 = cm.replay_experience_lake(lake_dir)
     assert stats1 == {"observations": 2, "msprof_events": 2, "pair_deltas": 1}
@@ -346,15 +371,12 @@ def test_experience_lake_dedup_replay_and_two_head_calibrator(tmp_path: Path) ->
     assert cm.pair_delta_count == 1
     assert cm.msprof_event_count == 2
 
-    # Check parametric projection handles varying case_dims cleanly
     w_small = project_case_workload(fast_ledger, case_dims={"M": 128, "N": 128}, axes=axes)
     w_large = project_case_workload(fast_ledger, case_dims={"M": 4096, "N": 4096}, axes=axes)
     assert float(w_large["gm_bytes"]) > float(w_small["gm_bytes"])
     assert int(w_large["total_tiles"]) >= int(w_small["total_tiles"])
 
-    # Head-1 msprof pipe scale multipliers remain Bayes-shrunk and strictly bounded in [0.5, 2.0]
     cm_ms = HybridAscendCostModel(AscendTarget("ascend.950pr"))
-    # 2e9 vec_flops -> ~169us analytical VECTOR floor vs measured 5000us * 0.95 -> upward scaling clamped <= 2.0
     vec_wl_lo_floor = CostFeatures(vec_flops=2e9, gm_bytes=1e6, total_tiles=56, topology_axes=axes)
     for _ in range(40):
         mults_hi = cm_ms.observe_msprof(vec_wl_lo_floor, {"aiv_vec": 0.95}, measured_us=5000.0)
@@ -368,7 +390,6 @@ def test_experience_lake_dedup_replay_and_two_head_calibrator(tmp_path: Path) ->
         assert all(0.5 <= v <= 2.0 for v in mults_lo.values())
     assert mults_lo["VECTOR"] >= 0.5 and mults_lo["VECTOR"] < 0.9
 
-    # Head-2 delta head learns faster vs slower candidate ratios on compiler/spill signals
     cm_delta = HybridAscendCostModel(AscendTarget("ascend.950pr"))
     wl_p = build_cost_features_from_ledger(parent_ledger, axes=axes)
     wl_fast = CostFeatures.coerce(
@@ -386,7 +407,18 @@ def test_experience_lake_dedup_replay_and_two_head_calibrator(tmp_path: Path) ->
 
 
 def test_kb_local_isolation_graduation_revival_and_loo_cap(tmp_path: Path) -> None:
-    """Verify operator_local isolation, cross_op promotion, cooldown revival, and LOO max_loo_chunks cap."""
+    """Verify operator_local isolation, cross_op promotion, cooldown revival, and LOO cap.
+
+    Note:
+        - Visible to op_a, isolated from op_b while operator_local
+        - Record >=2 successes with high expected_rate and graduate -> cross_op
+        - Verify cross-process reload from ExperienceLake replays rules + posteriors +
+          graduation
+        - Prune at round 2 -> revived after 10 rounds cooldown (at round 12)
+        - Also verify LOO max_loo_chunks cap on real source diff
+        - Use custom stage_a ledger stub via monkeypatching run_stage_a_static or
+          distill_leave_one_out directly
+    """
     lake_dir = tmp_path / "kb_lake"
     tracker = BayesianRuleTracker.from_seed_yaml()
     axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
@@ -406,13 +438,11 @@ def test_kb_local_isolation_graduation_revival_and_loo_cap(tmp_path: Path) -> No
     tracker.admit_rule(local_rule)
     save_distilled_rule_file(lake_dir, local_rule)
 
-    # Visible to op_a, isolated from op_b while operator_local
     vis_a = {r.rule_id for r in tracker.active_rules(topology_axes=axes, operator_name="level2/op_a")}
     vis_b = {r.rule_id for r in tracker.active_rules(topology_axes=axes, operator_name="level2/op_b")}
     assert "R_TEST_LOCAL_01" in vis_a
     assert "R_TEST_LOCAL_01" not in vis_b
 
-    # Record >=2 successes with high expected_rate and graduate -> cross_op
     for ridx in (1, 2):
         tracker.record_outcome(
             "R_TEST_LOCAL_01",
@@ -438,13 +468,11 @@ def test_kb_local_isolation_graduation_revival_and_loo_cap(tmp_path: Path) -> No
     vis_b_after = {r.rule_id for r in tracker.active_rules(topology_axes=axes, operator_name="level2/op_b")}
     assert "R_TEST_LOCAL_01" in vis_b_after
 
-    # Verify cross-process reload from ExperienceLake replays rules + posteriors + graduation
     reloaded = BayesianRuleTracker.from_experience_lake(lake_dir)
     assert "R_TEST_LOCAL_01" in reloaded.rules
     assert reloaded.rules["R_TEST_LOCAL_01"].scope == "cross_op"
     assert reloaded.posteriors["R_TEST_LOCAL_01"].successes == 2
 
-    # Prune at round 2 -> revived after 10 rounds cooldown (at round 12)
     bad_rule = AscendCausalRule(
         rule_id="R_TEST_REVIVE_02",
         regime_guard="is_legal",
@@ -468,7 +496,6 @@ def test_kb_local_isolation_graduation_revival_and_loo_cap(tmp_path: Path) -> No
     assert "R_TEST_REVIVE_02" in revived
     assert tracker.posteriors["R_TEST_REVIVE_02"].pruned is False
 
-    # Also verify LOO max_loo_chunks cap on real source diff
     chunk_test = distill_causal_rule(
         AstEditChunk(
             chunk_id="c1",
@@ -506,7 +533,6 @@ def test_kb_local_isolation_graduation_revival_and_loo_cap(tmp_path: Path) -> No
         waterlines={},
     )
     funnel = GateFunnel(skip_stage_b=True)
-    # Use custom stage_a ledger stub via monkeypatching run_stage_a_static or distill_leave_one_out directly
     distiller = FlywheelDistiller(funnel=funnel, tracker=tracker)
     _ = ledger
     rep = distiller.distill_leave_one_out(
@@ -522,8 +548,16 @@ def test_kb_local_isolation_graduation_revival_and_loo_cap(tmp_path: Path) -> No
 
 
 def test_campaign_runner_logs_all_tiers_and_keeps_prescreen_off(tmp_path: Path) -> None:
-    """End-to-end offline runner check: Baseline + L2 pass/fail + L4 logged; prescreen strictly OFF."""
-    # 1. Verify hard defaults stay OFF
+    """End-to-end offline runner check: Baseline + L2 pass/fail + L4 logged; prescreen strictly OFF.
+
+    Note:
+        - 1. Verify hard defaults stay OFF
+        - L2 compiled & timed, but accuracy failed -> still valuable for CostModel!
+        - Candidate that failed accuracy without msprof collection must NOT inherit parent
+          msprof
+        - Promoted candidate has merged Stage-B sfu_f16_ops in candidate artifact
+        - Experience lake has pairwise delta for same-case fast vs baseline
+    """
     assert MarathonConfig("level2/softmax").enable_tilesize_prescreen is False
     assert MarathonConfig("level2/softmax").cost_prescreen_top_k is None
     assert CampaignConfig(operator_name="level2/softmax").enable_tilesize_prescreen is False
@@ -544,6 +578,7 @@ def build_vec(tile_m=1):
         builder_candidates=("build_vec",),
         sample_builder_kwargs={},
         description="small test regime",
+        representative_hir_dims={"M": 128, "D": 512},
         representative_anchor_dims={"M": 128, "N": 512},
     )
     anchors = [
@@ -664,7 +699,6 @@ def build_vec(tile_m=1):
                     anchors=tuple(metrics),
                 )
             else:
-                # L2 compiled & timed, but accuracy failed -> still valuable for CostModel!
                 metrics = [
                     AnchorEvalMetrics(
                         case_num=anc_seq[0].case_num,
@@ -738,12 +772,9 @@ def build_vec(tile_m=1):
     cands, obs = lake.load_records()
     tiers = {o.eval_tier for o in obs}
     assert {"baseline", "l2_pass", "l2_acc_fail", "l4_official"}.issubset(tiers)
-    # Candidate that failed accuracy without msprof collection must NOT inherit parent msprof
     acc_fail_obs = [o for o in obs if o.eval_tier == "l2_acc_fail"]
     assert acc_fail_obs and acc_fail_obs[0].msprof_pmu == {}
-    # Promoted candidate has merged Stage-B sfu_f16_ops in candidate artifact
     assert any(int(c.microarch_profile.get("sfu_f16_ops", 0) or 0) >= 8 for c in cands.values())
-    # Experience lake has pairwise delta for same-case fast vs baseline
     assert lake.extract_pairwise_deltas()
 
 
@@ -757,6 +788,10 @@ def test_record_l4_observations_hydrates_non_anchor_metadata_from_cannbench(
     op_dir.mkdir(parents=True, exist_ok=True)
     meta_dir.mkdir(parents=True, exist_ok=True)
     (op_dir / "proto.yaml").write_text("operator:\n  name: Softmax\n", encoding="utf-8")
+    (op_dir / "golden.py").write_text(
+        "import torch\n\n\ndef softmax(x):\n    return torch.softmax(x, dim=-1)\n",
+        encoding="utf-8",
+    )
     (op_dir / "cases.yaml").write_text(
         "cases:\n"
         "- case_id: 1\n  input_shape: [[32, 128]]\n  dtype: [float16]\n"
@@ -783,7 +818,13 @@ def test_record_l4_observations_hydrates_non_anchor_metadata_from_cannbench(
     mod_src = "def build_vec(tile_m=1):\n    return tile_m\n"
     mod_path.write_text(mod_src, encoding="utf-8")
     lake_dir = tmp_path / "experience_lake"
-    reg = RegimeTargetSpec("small", ("build_vec",), {}, representative_anchor_dims={"M": 32, "D": 128})
+    reg = RegimeTargetSpec(
+        "small",
+        ("build_vec",),
+        {},
+        representative_hir_dims={"M": 32, "D": 128},
+        representative_anchor_dims={"M": 32, "D": 128},
+    )
     anchors = (AnchorCaseSpec("level2/softmax", 1, "small", ref_perf_us=100.0, t_hw_us=20.0),)
 
     class _DummyBackend:
@@ -841,7 +882,15 @@ def test_record_l4_observations_hydrates_non_anchor_metadata_from_cannbench(
 
 
 def test_evaluate_causal_rule_outcome_rejects_zero_gain_and_global_regression() -> None:
-    """Verify causal rule realization requires real non-regressive local/global gain."""
+    """Verify causal rule realization requires real non-regressive local/global gain.
+
+    Note:
+        - Case 1: Zero/negative speedup must return (False, 0.0)
+        - Case 2: Noise-level gain (+0.85% < 1%) must return (False, 0.0)
+        - Case 3: Local speedup (+5%) WITH global regression must return (False, 0.0)
+        - Case 4: Genuine non-regressive improvement (+5%, global >= parent) returns
+          (True, 0.05)
+    """
     rule = AscendCausalRule(
         rule_id="R_TEST_REAL_GAIN",
         regime_guard="is_legal",
@@ -877,7 +926,6 @@ def test_evaluate_causal_rule_outcome_rejects_zero_gain_and_global_regression() 
         measured_sync_stall_ratio=0.1,
         unexplained_gap_ratio=0.1,
     )
-    # Case 1: Zero/negative speedup must return (False, 0.0)
     ok_zero, gain_zero = PerfTargetCampaignRunner._evaluate_causal_rule_outcome(
         rule=rule,
         res_all_passed=True,
@@ -895,7 +943,6 @@ def test_evaluate_causal_rule_outcome_rejects_zero_gain_and_global_regression() 
     )
     assert (ok_zero, gain_zero) == (False, 0.0)
 
-    # Case 2: Noise-level gain (+0.85% < 1%) must return (False, 0.0)
     cand_res_noise = StaticDynamicResidual(
         measured_latency_us=11.61,
         predicted_bottleneck_util=0.5,
@@ -922,7 +969,6 @@ def test_evaluate_causal_rule_outcome_rejects_zero_gain_and_global_regression() 
     )
     assert (ok_noise, gain_noise) == (False, 0.0)
 
-    # Case 3: Local speedup (+5%) WITH global regression must return (False, 0.0)
     cand_res_fast = StaticDynamicResidual(
         measured_latency_us=95.0,
         predicted_bottleneck_util=0.5,
@@ -951,7 +997,6 @@ def test_evaluate_causal_rule_outcome_rejects_zero_gain_and_global_regression() 
     )
     assert (ok_glob_reg, gain_glob_reg) == (False, 0.0)
 
-    # Case 4: Genuine non-regressive improvement (+5%, global >= parent) returns (True, 0.05)
     ok_good, gain_good = PerfTargetCampaignRunner._evaluate_causal_rule_outcome(
         rule=rule,
         res_all_passed=True,
@@ -976,12 +1021,19 @@ def test_evaluate_causal_rule_outcome_rejects_zero_gain_and_global_regression() 
 def test_bayesian_tracker_sync_from_experience_lake_incremental_and_excludes_self(
     tmp_path: Path,
 ) -> None:
-    """Verify incremental peer KB event sync, self-shard exclusion, idempotency, and graduation."""
+    """Verify incremental peer KB event sync, self-shard exclusion, idempotency, and graduation.
+
+    Note:
+        - Self shard writes 1 outcome; must be skipped when exclude_run_id="self_run_1"
+        - Peer shard writes 1 success
+        - Repeating sync without new events is a no-op
+        - Distill an operator_local rule on disk + emit 2 peer successes -> admitted &
+          promoted
+    """
     lake_dir = tmp_path / "sync_lake"
     axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
 
     tracker = BayesianRuleTracker.from_experience_lake(lake_dir)
-    # Self shard writes 1 outcome; must be skipped when exclude_run_id="self_run_1"
     append_kb_event_shard(
         lake_dir,
         run_id="self_run_1",
@@ -992,7 +1044,6 @@ def test_bayesian_tracker_sync_from_experience_lake_incremental_and_excludes_sel
         operator_name="level2/softmax",
         round_idx=1,
     )
-    # Peer shard writes 1 success
     append_kb_event_shard(
         lake_dir,
         run_id="peer_run_2",
@@ -1009,10 +1060,8 @@ def test_bayesian_tracker_sync_from_experience_lake_incremental_and_excludes_sel
     assert tracker.posteriors["R01_DUAL_COPY_1C2V_SPLIT"].successes == 1
     assert tracker.posteriors["R01_DUAL_COPY_1C2V_SPLIT"].failures == 0
 
-    # Repeating sync without new events is a no-op
     assert tracker.sync_from_experience_lake(lake_dir, exclude_run_id="self_run_1") == 0
 
-    # Distill an operator_local rule on disk + emit 2 peer successes -> admitted & promoted
     local_rule = AscendCausalRule(
         rule_id="R_SYNC_LOCAL_99",
         regime_guard="is_legal",

@@ -370,6 +370,7 @@ def test_m4_hub_glue_kb_backend_rendering_and_syntax_fail_closed(tmp_path: Path)
         regime_tag="main",
         builder_candidates=("_build_demo",),
         sample_builder_kwargs={},
+        representative_hir_dims={"total_elements": 16384, "M": 16, "D": 64},
         editable_symbols=("_DEMO_TRACKB_SRC", "_select_demo"),
         runtime_backend="ascendc_trackb",
         trackb_symbols=("_DEMO_TRACKB_SRC",),

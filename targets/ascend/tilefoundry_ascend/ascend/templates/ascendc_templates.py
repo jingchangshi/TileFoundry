@@ -1,4 +1,4 @@
-"""AscendC C++20 parameterized templates for canonical Ascend 950 (dav-3510) 3-axis shells."""
+"""Track-B CCE (C++20) parameterized templates for canonical Ascend 950 (dav-3510) 3-axis shells."""
 
 from __future__ import annotations
 
@@ -319,29 +319,29 @@ def render_persistent_chunk_state_cpp(policy: dict[str, Any] | None = None) -> s
     """
     p = normalize_schedule_policy(SHELL_CV_PERSISTENT_STATE, policy)
     bm, bn, bk = p["tile_mnk"]
-    return f"""// Ascend 950 (dav-3510) Paradigm 6: Persistent (B, H) Chunk State (KDA / Sinkhorn / LaCT-TTT)
+    return """// Ascend 950 (dav-3510) Paradigm 6: Persistent (B, H) Chunk State (KDA / Sinkhorn / LaCT-TTT)
 #include "kernel_operator.h"
 using namespace AscendC;
 
 __aicore__ inline void PersistentChunkStateLoop(
     __ubuf__ float* stateUb, LocalTensor<float>& l0cH, LocalTensor<half>& l1A, LocalTensor<half>& l1B,
-    uint32_t numChunks, float gTail) {{
+    uint32_t numChunks, float gTail) {
     // Exp range halving: anchor = G_tail / 2 splits exp(g_t) -> exp(g_t - anchor) * exp(anchor)
     const float anchor = 0.5f * gTail;
     (void)anchor;
-    for (uint32_t ch = 0U; ch < numChunks; ++ch) {{
+    for (uint32_t ch = 0U; ch < numChunks; ++ch) {
         // Zero intermediate GM state roundtrips: FP32 state remains UB/L1/L0C resident
         MmadParams mmad;
         mmad.isBias = false;
         mmad.cmatrixInitVal = false;  // initC=false in-place L0C accumulation (history + local)
         Mmad(l0cH, l1A, l1B, mmad);
-    }}
+    }
     // 5-step Newton-Schulz on-chip loop for Muon/LaCT-TTT orthogonalization
-    for (uint32_t ns = 0U; ns < 5U; ++ns) {{
+    for (uint32_t ns = 0U; ns < 5U; ++ns) {
         PipeBarrier<PIPE_V>();
-    }}
+    }
     (void)stateUb;
-}}
+}
 """
 
 

@@ -25,8 +25,9 @@ from tilefoundry_ascend.ascend.sil import (
     HardwareLegalityBounds,
     PolicyEnvelope,
     RegimeSlice,
-    SILVerifier,
     SchedulePolicy,
+    SILVerifier,
+    TopologyAxes,
 )
 from tilefoundry_ascend.ascend.target import AscendTarget
 
@@ -57,8 +58,6 @@ def test_regime_solver_static_affine_loop_projects_to_z3():
         pipeline=PipelineSpec(max_stage=1, max_buffer_versions=2, enable_offset=True),
     )
 
-    from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
-
     solver = RegimePiecewiseSolver()
     simd_axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
     res = solver.solve_regime(
@@ -79,9 +78,18 @@ def test_regime_solver_static_affine_loop_projects_to_z3():
 
 
 def test_regime_solver_ragged_recurrent_vm_and_sil_verifier():
-    """Verify analytical piecewise planning for all 5 ragged/recurrent/VM ops passes SILVerifier."""
-    from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
+    """Verify analytical piecewise planning for all 5 ragged/recurrent/VM ops passes SILVerifier.
 
+    Note:
+        - 1. sparse_flash_attention (bidirectional_cv_ring, Cube-bound -> M >= 82,
+          Half-L1, L0C->UB, UB->L1)
+        - 2. grouped_matmul (l0c_ub_epilogue, empty group + unaligned tail)
+        - 3. kimi_delta_attention (persistent_onchip_state -> L1/UB state residency)
+        - 4. mhc_sinkhorn (persistent FP32 UB state residency, inf/nan safe shifted exp)
+        - 5. tensor_program_vm (dynamic_opcode_stream -> horizontal W-slice, zero sync)
+        - Verify full SIL PolicyEnvelope roundtrip and SILVerifier pass for
+          sparse_flash_attention
+    """
     solver = RegimePiecewiseSolver()
     verifier = SILVerifier()
     cv_ring_axes = TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "irregular_simt")
@@ -90,7 +98,6 @@ def test_regime_solver_ragged_recurrent_vm_and_sil_verifier():
     sinkhorn_axes = TopologyAxes("aiv_only", "persistent_onchip_state", "affine_simd")
     vm_axes = TopologyAxes("aiv_only", "persistent_onchip_state", "dynamic_opcode_stream")
 
-    # 1. sparse_flash_attention (bidirectional_cv_ring, Cube-bound -> M >= 82, Half-L1, L0C->UB, UB->L1)
     sfa_reg = RegimeSlice(
         regime_tag="prefill_sparse",
         case_nums=(1, 2),
@@ -111,7 +118,6 @@ def test_regime_solver_ragged_recurrent_vm_and_sil_verifier():
     assert sfa_res.policy["ub_bank_pad_datablocks"] >= 1
     assert sfa_res.policy["simt_threads"] == 512
 
-    # 2. grouped_matmul (l0c_ub_epilogue, empty group + unaligned tail)
     gmm_reg = RegimeSlice(
         regime_tag="ragged_empty",
         case_nums=(3,),
@@ -129,7 +135,6 @@ def test_regime_solver_ragged_recurrent_vm_and_sil_verifier():
     assert gmm_res.policy["l1_half_bank_split"] is True
     assert gmm_res.policy["tile_mnk"][0] >= 82
 
-    # 3. kimi_delta_attention (persistent_onchip_state -> L1/UB state residency)
     kda_reg = RegimeSlice(
         regime_tag="chunk_64",
         case_nums=(4,),
@@ -145,7 +150,6 @@ def test_regime_solver_ragged_recurrent_vm_and_sil_verifier():
     assert kda_res.persistent_state_space in ("L1", "UB")
     assert kda_res.persistent_state_bytes == 128 * 128 * 4
 
-    # 4. mhc_sinkhorn (persistent FP32 UB state residency, inf/nan safe shifted exp)
     sink_reg = RegimeSlice(
         regime_tag="sinkhorn_4x4",
         case_nums=(5,),
@@ -161,7 +165,6 @@ def test_regime_solver_ragged_recurrent_vm_and_sil_verifier():
     assert sink_res.persistent_state_space == "UB"
     assert sink_res.policy["fast_unshifted_exp"] is False
 
-    # 5. tensor_program_vm (dynamic_opcode_stream -> horizontal W-slice, zero sync)
     vm_reg = RegimeSlice(
         regime_tag="vm_striped",
         case_nums=(6,),
@@ -177,7 +180,6 @@ def test_regime_solver_ragged_recurrent_vm_and_sil_verifier():
     assert vm_res.policy["sync_mode"] == "none"
     assert vm_res.policy["direct_no_fusion_vf"] is True
 
-    # Verify full SIL PolicyEnvelope roundtrip and SILVerifier pass for sparse_flash_attention
     plan = solver.solve_all_regimes(
         [sfa_reg],
         op_name="sparse_flash_attention",
@@ -244,10 +246,17 @@ def test_bisheng_res_parser_extracts_regs_spills_loops_and_membar():
 
 
 def test_hybrid_cost_model_physics_penalties_calibration_and_ranking(tmp_path: pathlib.Path):
-    """Verify Tier 0 physics, Tier 1 penalties, Tier 2 Ridge calibration + Eq.3/Eq.4, and ranking."""
+    """Verify Tier 0 physics, Tier 1 penalties, Tier 2 Ridge calibration + Eq.3/Eq.4, and ranking.
+
+    Note:
+        - Tier 0: per-dtype Cube MAC scaling (FP4 > FP8 > FP16 > FP32)
+        - Tier 0: Wave quantization (29 tiles on 28 AICs takes 2 waves vs 28 tiles 1 wave)
+        - Tier 0: Segmented HBM burst curve + SWAT L2 reuse
+        - Tier 0 & Tier 1: Bank conflict + compiler spill + software loop ranking
+        - Tier 2: Online Ridge calibration + JSONL persistence + Eq.3/HAP scoring
+    """
     model = HybridAscendCostModel(AscendTarget("ascend.950pr"))
 
-    # Tier 0: per-dtype Cube MAC scaling (FP4 > FP8 > FP16 > FP32)
     fp4_pred = model.predict({"cube_flops": 1e12, "cube_dtype": "f4e2m1", "total_tiles": 28})
     fp8_pred = model.predict({"cube_flops": 1e12, "cube_dtype": "fp8e4m3", "total_tiles": 28})
     fp16_pred = model.predict({"cube_flops": 1e12, "cube_dtype": "f16", "total_tiles": 28})
@@ -255,13 +264,11 @@ def test_hybrid_cost_model_physics_penalties_calibration_and_ranking(tmp_path: p
     assert fp4_pred.cube_floor_us < fp8_pred.cube_floor_us < fp16_pred.cube_floor_us < fp32_pred.cube_floor_us
     assert fp4_pred.tier2_residual_factor == pytest.approx(1.0)
 
-    # Tier 0: Wave quantization (29 tiles on 28 AICs takes 2 waves vs 28 tiles 1 wave)
     wave1 = model.predict({"cube_flops": 1e11, "cube_dtype": "f16", "total_tiles": 28})
     wave2 = model.predict({"cube_flops": 1e11, "cube_dtype": "f16", "total_tiles": 29})
     assert wave2.wave_quantization_ratio > 1.8
     assert wave2.pred_us > wave1.pred_us * 1.5
 
-    # Tier 0: Segmented HBM burst curve + SWAT L2 reuse
     small_burst = model.predict({"gm_bytes": 64 * 1024 * 1024, "contig_burst_bytes": 4096, "swizzle_window": 1})
     large_burst = model.predict({"gm_bytes": 64 * 1024 * 1024, "contig_burst_bytes": 32768, "swizzle_window": 1})
     swat_reuse = model.predict({"gm_bytes": 64 * 1024 * 1024, "contig_burst_bytes": 32768, "swizzle_window": 4, "l2_working_set_bytes": 32 * 1024 * 1024})
@@ -269,7 +276,6 @@ def test_hybrid_cost_model_physics_penalties_calibration_and_ranking(tmp_path: p
     assert swat_reuse.l2_hit_rate > 0.0
     assert swat_reuse.hbm_floor_us < large_burst.hbm_floor_us
 
-    # Tier 0 & Tier 1: Bank conflict + compiler spill + software loop ranking
     optimal = {
         "vec_flops": 1e10,
         "gm_bytes": 32 * 1024 * 1024,
@@ -292,7 +298,6 @@ def test_hybrid_cost_model_physics_penalties_calibration_and_ranking(tmp_path: p
     assert p_opt.pred_us < p_spill.pred_us
     assert p_opt.pred_us < p_sw.pred_us
 
-    # Tier 2: Online Ridge calibration + JSONL persistence + Eq.3/HAP scoring
     cal_path = tmp_path / "cal.jsonl"
     cal_model = HybridAscendCostModel(calibration_path=cal_path)
     base_pred = cal_model.predict(optimal).pred_us

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import math
 
-import pytest
 import torch
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
@@ -41,6 +40,7 @@ from tilefoundry_ascend.agent.orchestrator.twin_bridge import (
     CannbenchContractOracle,
     compare_cannbench_tensor,
 )
+from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 
 
 def test_cannbench_ops_registry_discovers_all_60_ops_and_stratifies() -> None:
@@ -61,7 +61,6 @@ def test_cannbench_ops_registry_discovers_all_60_ops_and_stratifies() -> None:
         assert spec.perf_target.target_surrogate_score >= 95.0
         assert spec.perf_target.per_anchor_max_us
 
-    # Short name & task ID equivalence
     assert get_operator_task("rms_norm") == "level2/rms_norm"
     assert get_operator_task("level2/rms_norm") == "level2/rms_norm"
     assert get_operator_entrypoint("level2/rms_norm") == "rms_norm"
@@ -69,7 +68,6 @@ def test_cannbench_ops_registry_discovers_all_60_ops_and_stratifies() -> None:
     assert len(get_default_anchors("level2/rms_norm")) == 5
     assert get_default_perf_target("rms_norm").target_surrogate_score >= 95.0
 
-    # CLI parsers accept arbitrary operators without 2-op lock-in
     cli_args = build_cli_arg_parser().parse_args(["--operator", "rms_norm", "--checkpoint", "ckpt.json"])
     assert cli_args.operator == "rms_norm"
     cr_args = build_campaign_arg_parser().parse_args(["--operator", "level3/q4_0_dequant_matmul"])
@@ -79,34 +77,29 @@ def test_cannbench_ops_registry_discovers_all_60_ops_and_stratifies() -> None:
 
 
 def test_cannbench_contract_oracle_synthesis_and_mere_mare_bit_exact() -> None:
-    """Verify CannbenchContractOracle faithful synthesis (inf/nan/unique/q4_0/group_list/inplace)."""
-    # 1. Bit-exact threshold==0 semantics (+0.0 vs -0.0)
+    """Verify CannbenchContractOracle synthesis for special and grouped cases."""
     pos_zero = torch.tensor([0.0], dtype=torch.float32)
     neg_zero = torch.tensor([-0.0], dtype=torch.float32)
     assert compare_cannbench_tensor(pos_zero, pos_zero, threshold=0.0)["passed"] is True
     assert compare_cannbench_tensor(neg_zero, pos_zero, threshold=0.0)["passed"] is False
 
-    # 2. MERE/MARE pass and fail
     gold = torch.tensor([1.0, 2.0, 4.0], dtype=torch.float32)
     close = torch.tensor([1.0001, 2.0001, 4.0001], dtype=torch.float32)
     far = torch.tensor([1.5, 2.0, 4.0], dtype=torch.float32)
     assert compare_cannbench_tensor(close, gold, threshold=1e-3)["passed"] is True
     assert compare_cannbench_tensor(far, gold, threshold=1e-3)["passed"] is False
 
-    # 3. Special ranges: [-inf, inf] and [nan, nan] on exp
     exp_oracle = CannbenchContractOracle("level1/exp")
     t_inf, _ = exp_oracle.synthesize_case_inputs(12)
     assert bool(torch.isinf(t_inf[0]).any().item())
     t_nan, _ = exp_oracle.synthesize_case_inputs(13)
     assert bool(torch.isnan(t_nan[0]).any().item())
 
-    # 4. Unique integer synthesis
     unique_oracle = CannbenchContractOracle("level3/unique")
-    # Pick a case from unique or test unique range directly
     assert unique_oracle.cases
     rms_oracle = CannbenchContractOracle("rms_norm")
     tensors, kwargs = rms_oracle.synthesize_case_inputs(1)
-    assert bool((kwargs["gamma"] != 0).any().item())  # Non-zero weights!
+    assert bool((kwargs["gamma"] != 0).any().item())
 
     def _rms_norm_cand(x: torch.Tensor, gamma: torch.Tensor, epsilon: float = 1e-6) -> torch.Tensor:
         xf = x.to(torch.float32)
@@ -116,20 +109,17 @@ def test_cannbench_contract_oracle_synthesis_and_mere_mare_bit_exact() -> None:
     ok, reports = rms_oracle.verify_candidate(_rms_norm_cand, case_nums=[1, 7])
     assert ok is True, reports
 
-    # 5. Q4_0 packed uint8 nibbles + positive scales
     q4_oracle = CannbenchContractOracle("q4_0_dequant_matmul")
     q4_tensors, q4_kw = q4_oracle.synthesize_case_inputs(2)
     assert q4_kw["qweight"].dtype == torch.uint8
     assert bool((q4_kw["scales"] > 0).all().item())
     assert q4_tensors
 
-    # 6. Cumsum group_list with empty groups
     gmm_oracle = CannbenchContractOracle("grouped_matmul_swiglu_quant")
     _gmm_t, gmm_kw = gmm_oracle.synthesize_case_inputs(7)
     glist = gmm_kw["group_list"]
     assert len(glist) >= 2 and any(glist[i] == glist[i - 1] for i in range(1, len(glist)))
 
-    # 7. In-place buffer aliasing clone protection
     kv_oracle = CannbenchContractOracle("kv_cache_append")
     small_kv_case = min(kv_oracle.cases, key=lambda c: sum(math.prod(s) for s in c["input_shape"]))
     cid = int(small_kv_case["case_id"])
@@ -193,7 +183,6 @@ def make_kernel():
     for rid, post in tracker.posteriors.items():
         post.failures = 10
         post.beta = 20.0
-    # Also seed axis posteriors with high failure counts to prove proxy won't prune
     for axis_key in ("ce:aic_only", "mr:gm_ub_stream"):
         for rid in list(tracker.rules)[:3]:
             st = tracker._ensure_axis_posterior(axis_key, rid)
@@ -282,16 +271,13 @@ def make_kernel():
     def _batch_eval(items):
         out = {}
         for cid, dsl in items:
-            # Reverting T.Kernel(4) -> T.Kernel(1) or swizzle_window=4 -> 1 hurts latency
             if "T.Kernel(1)" in dsl:
                 out[cid] = 80.0
             elif "'swizzle_window': 1" in dsl or '"swizzle_window": 1' in dsl:
                 out[cid] = 50.0
             else:
-                out[cid] = 20.0  # Reverting decoy hurts nothing
+                out[cid] = 20.0
         return out
-
-    from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 
     gemm_axes = TopologyAxes("aic_only", "gm_l1_l0_fixpipe", "affine_simd")
     tracker = BayesianRuleTracker.from_seed_yaml()

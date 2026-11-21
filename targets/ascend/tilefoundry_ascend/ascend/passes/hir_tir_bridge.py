@@ -139,9 +139,9 @@ class HirRooflineSummary:
             f"Roofline[{dims}]: flops={self.compute_flops} "
             f"(cube={self.cube_flops}, vec={self.vector_flops}, special={self.special_ops}), "
             f"min_gm_bytes={self.min_gm_bytes}, AI={self.arithmetic_intensity:.4f}, "
-            f"compute_floor_us={self.compute_floor_us:.4f}, "
-            f"memory_floor_us={self.memory_floor_us:.4f}, "
-            f"ideal_roofline_us={self.ideal_roofline_us:.4f}, "
+            f"compute_floor_us={self.compute_floor_us!r}, "
+            f"memory_floor_us={self.memory_floor_us!r}, "
+            f"ideal_roofline_us={self.ideal_roofline_us!r}, "
             f"dominant_bound={self.dominant_bound}{mismatch}"
         )
 

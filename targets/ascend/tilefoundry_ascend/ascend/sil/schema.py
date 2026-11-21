@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, field
 import json
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from tilefoundry_ascend.ascend.target.facts import AscendSpaceFacts, cube_macs_per_cycle
 
 VALID_BACKEND_TIERS: tuple[str, ...] = (
     "tilelang_dsl",
@@ -165,6 +168,1211 @@ class TopologyAxes:
         return cls.from_dict(json.loads(raw))
 
 
+CasePhysicsKind = Literal["reduction", "matmul", "attention", "elementwise"]
+LayoutPhase = Literal["contiguous", "strided_or_gather"]
+ResidencyBand = Literal["vreg_resident", "sram_1pass", "gm_multipass"]
+AlignmentBand = Literal["sub_atom_simt", "aligned_vector", "unaligned_predicated"]
+WaveBand = Literal["under_occupied_split", "balanced_waves", "ragged_groups"]
+EnginePhase = Literal["aiv_vector_or_gemv", "aic_cube", "coupled_1c2v"]
+PhaseSignature = tuple[EnginePhase, LayoutPhase, ResidencyBand, AlignmentBand, WaveBand]
+
+VREG_CAPACITY_BYTES: int = 4096
+
+DTYPE_BYTES: dict[str, float] = {
+    "bool": 1.0,
+    "uint8": 1.0,
+    "u8": 1.0,
+    "int8": 1.0,
+    "i8": 1.0,
+    "float8_e4m3fn": 1.0,
+    "float8_e5m2": 1.0,
+    "float8_e8m0fnu": 1.0,
+    "fp8": 1.0,
+    "fp8e4m3": 1.0,
+    "fp8e5m2": 1.0,
+    "f8e4m3": 1.0,
+    "f8e5m2": 1.0,
+    "hif8": 1.0,
+    "float4_e2m1": 0.5,
+    "float4_e1m2": 0.5,
+    "float4_e2m1fn": 0.5,
+    "float4_e2m1fnx2": 0.5,
+    "fp4": 0.5,
+    "f4e2m1": 0.5,
+    "f4e1m2": 0.5,
+    "int16": 2.0,
+    "float16": 2.0,
+    "half": 2.0,
+    "f16": 2.0,
+    "bfloat16": 2.0,
+    "bf16": 2.0,
+    "int32": 4.0,
+    "float32": 4.0,
+    "float": 4.0,
+    "f32": 4.0,
+    "int64": 8.0,
+    "float64": 8.0,
+}
+
+_CUBE_DTYPE_CANON_AND_BYTES: dict[str, tuple[str, float]] = {
+    "f4e2m1": ("f4e2m1", 0.5),
+    "float4_e2m1": ("f4e2m1", 0.5),
+    "float4_e2m1fn": ("f4e2m1", 0.5),
+    "float4_e2m1fnx2": ("f4e2m1", 0.5),
+    "fp4e2m1": ("f4e2m1", 0.5),
+    "fp4": ("f4e2m1", 0.5),
+    "f4": ("f4e2m1", 0.5),
+    "f4e1m2": ("f4e1m2", 0.5),
+    "float4_e1m2": ("f4e1m2", 0.5),
+    "fp4e1m2": ("f4e1m2", 0.5),
+    "fp8e4m3": ("fp8e4m3", 1.0),
+    "float8_e4m3fn": ("fp8e4m3", 1.0),
+    "fp8_e4m3": ("fp8e4m3", 1.0),
+    "f8e4m3": ("fp8e4m3", 1.0),
+    "fp8": ("fp8e4m3", 1.0),
+    "fp8e5m2": ("fp8e5m2", 1.0),
+    "float8_e5m2": ("fp8e5m2", 1.0),
+    "fp8_e5m2": ("fp8e5m2", 1.0),
+    "f8e5m2": ("fp8e5m2", 1.0),
+    "float8_e8m0fnu": ("fp8e4m3", 1.0),
+    "f8e8m0": ("fp8e4m3", 1.0),
+    "hif8": ("hif8", 1.0),
+    "i8": ("i8", 1.0),
+    "int8": ("i8", 1.0),
+    "u8": ("u8", 1.0),
+    "uint8": ("u8", 1.0),
+    "f16": ("f16", 2.0),
+    "float16": ("f16", 2.0),
+    "half": ("f16", 2.0),
+    "bf16": ("bf16", 2.0),
+    "bfloat16": ("bf16", 2.0),
+    "hf32": ("hf32", 4.0),
+    "f32": ("f32", 4.0),
+    "float32": ("f32", 4.0),
+    "float": ("f32", 4.0),
+}
+
+
+def dtype_bytes_for(dtype_name: str) -> float:
+    """Return physical storage bytes per element for a known dtype name."""
+    key = dtype_name.strip().lower()
+    if key not in DTYPE_BYTES:
+        raise ValueError(f"unsupported dtype {dtype_name!r} for physics ratio computation")
+    return DTYPE_BYTES[key]
+
+
+def shape_numel(shape: Sequence[int]) -> int:
+    """Return the positive element count of a shape, treating non-positive axes as one."""
+    numel = 1
+    for dim in shape:
+        numel *= max(int(dim), 1)
+    return numel
+
+
+def _is_shape_dim(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def flatten_int_shapes(raw: object) -> tuple[tuple[int, ...], ...]:
+    """Normalize a cann-bench input_shape payload into concrete integer shape tuples."""
+    shapes: list[tuple[int, ...]] = []
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    for entry in raw:
+        if not isinstance(entry, (list, tuple)):
+            continue
+        if entry and isinstance(entry[0], (list, tuple)):
+            for sub in entry:
+                if isinstance(sub, (list, tuple)) and all(_is_shape_dim(dim) for dim in sub):
+                    shapes.append(tuple(int(dim) for dim in sub))
+        elif all(_is_shape_dim(dim) for dim in entry):
+            shapes.append(tuple(int(dim) for dim in entry))
+    return tuple(shapes)
+
+
+def flatten_str_values(raw: object) -> tuple[str, ...]:
+    """Normalize a nested dtype or tag payload into a flat tuple of strings."""
+    values: list[str] = []
+    if isinstance(raw, (list, tuple)):
+        for item in raw:
+            values.extend(flatten_str_values(item))
+    elif raw is not None:
+        values.append(str(raw))
+    return tuple(values)
+
+
+def has_unaligned_tail_for_case(
+    shapes: Sequence[Sequence[int]],
+    dtypes: Sequence[str],
+    uses_cube: bool,
+) -> bool:
+    """Return whether any tensor tail or cube operand violates 32-byte or 16-element alignment."""
+    if not shapes:
+        return False
+    first_dtype = dtypes[0] if dtypes else "float16"
+    elem_bytes = max(dtype_bytes_for(first_dtype), 1.0)
+    align_elems = max(1, int(32 // elem_bytes))
+    cube_align = 16 if uses_cube else align_elems
+    for shape in shapes:
+        if not shape:
+            continue
+        last = shape[-1]
+        if last > 1 and last % align_elems != 0:
+            return True
+        if uses_cube:
+            for dim in shape[-2:]:
+                if dim > 1 and dim % cube_align != 0:
+                    return True
+        if len(shape) >= 2 and shape[0] > 15 and shape[0] % 2 == 1:
+            return True
+    return False
+
+
+def compute_critical_cube_tile_m(
+    facts: AscendSpaceFacts | None,
+    elem_dtype: str,
+    *,
+    l2_bytes_per_cycle_per_aic: float = 100.0,
+    dual_operand_miss: bool = False,
+) -> int:
+    """Compute the analytical Cube tile-M waterline from MAC rate, dtype width and L2 bandwidth."""
+    bandwidth = float(l2_bytes_per_cycle_per_aic)
+    if bandwidth <= 0.0:
+        raise ValueError(
+            f"l2_bytes_per_cycle_per_aic must be > 0, got {l2_bytes_per_cycle_per_aic}"
+        )
+    key = elem_dtype.strip().lower()
+    canon_dtype, dtype_bytes = _CUBE_DTYPE_CANON_AND_BYTES.get(key, ("f16", 2.0))
+    macs = (
+        facts.cube_macs_per_cycle(canon_dtype)
+        if facts is not None
+        else cube_macs_per_cycle(canon_dtype)
+    )
+    miss_factor = 2.0 if dual_operand_miss else 1.0
+    return max(1, int(math.ceil(float(macs) * dtype_bytes * miss_factor / bandwidth)))
+
+
+def _payload_float(payload: Mapping[str, object], key: str) -> float:
+    raw = payload.get(key)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError(f"CasePhysicsRatios.{key} must be numeric")
+    return float(raw)
+
+
+def _payload_int(payload: Mapping[str, object], key: str) -> int:
+    raw = payload.get(key)
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError(f"CasePhysicsRatios.{key} must be an int")
+    return raw
+
+
+def _payload_bool(payload: Mapping[str, object], key: str) -> bool:
+    raw = payload.get(key)
+    if not isinstance(raw, bool):
+        raise ValueError(f"CasePhysicsRatios.{key} must be a bool")
+    return raw
+
+
+@dataclass(frozen=True, kw_only=True)
+class CasePhysicsRatios:
+    """Dimensionless physical ratios and derived phase bands for one operator case."""
+
+    case_id: int
+    stride_ratio: float
+    contig_atom_ratio: float
+    is_atom_aligned: bool
+    working_set_sram_ratio: float
+    working_set_vreg_ratio: float
+    wave_occupancy_ratio: float
+    oi_ridge_ratio: float
+    inner_contiguous_bytes: int
+    has_empty_group: bool = False
+
+    def __post_init__(self) -> None:
+        if isinstance(self.case_id, bool) or not isinstance(self.case_id, int):
+            raise ValueError("CasePhysicsRatios.case_id must be an int")
+        if self.case_id < 1:
+            raise ValueError("CasePhysicsRatios.case_id must be positive")
+        for name, raw_value in (
+            ("stride_ratio", self.stride_ratio),
+            ("contig_atom_ratio", self.contig_atom_ratio),
+            ("working_set_sram_ratio", self.working_set_sram_ratio),
+            ("working_set_vreg_ratio", self.working_set_vreg_ratio),
+            ("wave_occupancy_ratio", self.wave_occupancy_ratio),
+            ("oi_ridge_ratio", self.oi_ridge_ratio),
+        ):
+            value = float(raw_value)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"CasePhysicsRatios.{name} must be finite and non-negative")
+            object.__setattr__(self, name, value)
+        if self.stride_ratio < 1.0:
+            raise ValueError("CasePhysicsRatios.stride_ratio must be >= 1.0")
+        if self.contig_atom_ratio <= 0.0:
+            raise ValueError("CasePhysicsRatios.contig_atom_ratio must be > 0.0")
+        if isinstance(self.inner_contiguous_bytes, bool) or not isinstance(
+            self.inner_contiguous_bytes, int
+        ):
+            raise ValueError("CasePhysicsRatios.inner_contiguous_bytes must be an int")
+        if self.inner_contiguous_bytes < 1:
+            raise ValueError("CasePhysicsRatios.inner_contiguous_bytes must be positive")
+        object.__setattr__(self, "is_atom_aligned", bool(self.is_atom_aligned))
+        object.__setattr__(self, "has_empty_group", bool(self.has_empty_group))
+
+    def phase_signature(
+        self,
+        base_axes: TopologyAxes,
+    ) -> tuple[EnginePhase, LayoutPhase, ResidencyBand, AlignmentBand, WaveBand]:
+        """Return the (engine, layout, residency, alignment, wave) phase coordinate."""
+        layout: LayoutPhase = "contiguous" if self.stride_ratio <= 1.0 else "strided_or_gather"
+        residency: ResidencyBand
+        if self.working_set_vreg_ratio <= 1.0:
+            residency = "vreg_resident"
+        elif self.working_set_sram_ratio <= 1.0:
+            residency = "sram_1pass"
+        else:
+            residency = "gm_multipass"
+        alignment: AlignmentBand
+        if self.contig_atom_ratio < 1.0:
+            alignment = "sub_atom_simt"
+        elif self.is_atom_aligned:
+            alignment = "aligned_vector"
+        else:
+            alignment = "unaligned_predicated"
+        wave: WaveBand
+        if self.has_empty_group:
+            wave = "ragged_groups"
+        elif self.wave_occupancy_ratio < 0.5:
+            wave = "under_occupied_split"
+        else:
+            wave = "balanced_waves"
+        engine: EnginePhase
+        if base_axes.uses_cube:
+            if self.oi_ridge_ratio < 0.25:
+                engine = "aiv_vector_or_gemv"
+            elif base_axes.compute_engine == "coupled_1c2v":
+                engine = "coupled_1c2v"
+            else:
+                engine = "aic_cube"
+        else:
+            engine = "aiv_vector_or_gemv"
+        return engine, layout, residency, alignment, wave
+
+    def effective_axes(self, base_axes: TopologyAxes) -> TopologyAxes:
+        """Return the post-phase-transition topology axes implied by these ratios."""
+        engine, _, residency, _, wave = self.phase_signature(base_axes)
+        compute_engine = base_axes.compute_engine
+        memory_ring = base_axes.memory_ring
+        iteration_regularity = base_axes.iteration_regularity
+        if base_axes.uses_cube and engine == "aiv_vector_or_gemv":
+            compute_engine = "aiv_only"
+            memory_ring = "gm_ub_stream"
+        if (
+            residency == "gm_multipass"
+            and base_axes.memory_ring == "persistent_onchip_state"
+        ):
+            memory_ring = (
+                "l0c_ub_epilogue"
+                if base_axes.compute_engine == "coupled_1c2v"
+                else "gm_ub_stream"
+            )
+        if wave == "ragged_groups":
+            iteration_regularity = "ragged_group"
+        if self.contig_atom_ratio < 1.0 and compute_engine == "aiv_only":
+            iteration_regularity = "irregular_simt"
+        return TopologyAxes(
+            compute_engine=compute_engine,
+            memory_ring=memory_ring,
+            iteration_regularity=iteration_regularity,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "case_id": self.case_id,
+            "stride_ratio": self.stride_ratio,
+            "contig_atom_ratio": self.contig_atom_ratio,
+            "is_atom_aligned": self.is_atom_aligned,
+            "working_set_sram_ratio": self.working_set_sram_ratio,
+            "working_set_vreg_ratio": self.working_set_vreg_ratio,
+            "wave_occupancy_ratio": self.wave_occupancy_ratio,
+            "oi_ridge_ratio": self.oi_ridge_ratio,
+            "has_empty_group": self.has_empty_group,
+            "inner_contiguous_bytes": self.inner_contiguous_bytes,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> CasePhysicsRatios:
+        raw_empty_group = payload.get("has_empty_group", False)
+        if not isinstance(raw_empty_group, bool):
+            raise ValueError("CasePhysicsRatios.has_empty_group must be a bool")
+        return cls(
+            case_id=_payload_int(payload, "case_id"),
+            stride_ratio=_payload_float(payload, "stride_ratio"),
+            contig_atom_ratio=_payload_float(payload, "contig_atom_ratio"),
+            is_atom_aligned=_payload_bool(payload, "is_atom_aligned"),
+            working_set_sram_ratio=_payload_float(payload, "working_set_sram_ratio"),
+            working_set_vreg_ratio=_payload_float(payload, "working_set_vreg_ratio"),
+            wave_occupancy_ratio=_payload_float(payload, "wave_occupancy_ratio"),
+            oi_ridge_ratio=_payload_float(payload, "oi_ridge_ratio"),
+            inner_contiguous_bytes=_payload_int(payload, "inner_contiguous_bytes"),
+            has_empty_group=raw_empty_group,
+        )
+
+
+def classify_case_regime(
+    ratios: CasePhysicsRatios,
+    *,
+    kind: CasePhysicsKind,
+    axes: TopologyAxes,
+    dims: Mapping[str, int],
+) -> str:
+    """Derive a stable regime tag from physics phase bands rather than operator names."""
+    if ratios.has_empty_group:
+        return "empty_group"
+    engine, layout, residency, _, wave = ratios.phase_signature(axes)
+    parts: list[str] = []
+    if kind == "attention":
+        is_decode = dims.get("S_q", dims.get("M", 0)) <= 2
+        parts.append("decode" if is_decode else "prefill")
+        if wave == "under_occupied_split":
+            parts.append("split")
+    elif kind == "matmul":
+        if engine == "aiv_vector_or_gemv":
+            parts.append("gemv")
+        elif engine == "coupled_1c2v":
+            parts.append("mixcore")
+        else:
+            parts.append("cube")
+        if residency == "gm_multipass":
+            parts.append("multipass")
+        if wave == "under_occupied_split":
+            parts.append("small")
+    elif kind == "reduction":
+        parts.append("reduce")
+        parts.append("strided" if layout == "strided_or_gather" else "tail")
+        if residency == "gm_multipass":
+            parts.append("twopass")
+    else:
+        parts.append("vector")
+        if layout == "strided_or_gather":
+            parts.append("strided")
+        if residency == "gm_multipass":
+            parts.append("twopass")
+        if ratios.contig_atom_ratio < 1.0:
+            parts.append("subatom")
+    return "_".join(parts)
+
+
+def group_case_regime_tags(
+    ratios_by_case: Mapping[int, CasePhysicsRatios],
+    dims_by_case: Mapping[int, Mapping[str, int]],
+    *,
+    kind: CasePhysicsKind,
+    axes: TopologyAxes,
+) -> dict[str, tuple[int, ...]]:
+    """Partition per-case ratios into shared stable phase tags.
+
+    The extractor and the campaign use the same tags.
+    """
+    grouped: dict[str, list[int]] = {}
+    for case_id in sorted(ratios_by_case):
+        dims = dims_by_case.get(case_id)
+        if dims is None:
+            raise ValueError(f"missing structural dims for case {case_id}")
+        tag = classify_case_regime(
+            ratios_by_case[case_id],
+            kind=kind,
+            axes=axes,
+            dims=dims,
+        )
+        grouped.setdefault(tag, []).append(case_id)
+    return {tag: tuple(case_ids) for tag, case_ids in grouped.items()}
+
+
+_PHASE_AXIS_INDEX: dict[str, int] = {
+    "engine": 0,
+    "layout": 1,
+    "residency": 2,
+    "alignment": 3,
+    "wave": 4,
+}
+
+_PHASE_BAND_ALIASES: dict[str, dict[str, str]] = {
+    "engine": {"aiv_vector_or_gemv": "vec", "aic_cube": "cube", "coupled_1c2v": "cv"},
+    "layout": {"contiguous": "contig", "strided_or_gather": "strided"},
+    "residency": {"vreg_resident": "vreg", "sram_1pass": "sram", "gm_multipass": "gmpass"},
+    "alignment": {
+        "sub_atom_simt": "subatom",
+        "aligned_vector": "aligned",
+        "unaligned_predicated": "unaligned",
+    },
+    "wave": {
+        "ragged_groups": "ragged",
+        "under_occupied_split": "underfill",
+        "balanced_waves": "filled",
+    },
+}
+
+_PHASE_SPLIT_AXES: tuple[str, ...] = ("wave", "residency", "alignment", "layout", "engine")
+
+
+def _phase_band_alias(signature: PhaseSignature, axis_name: str) -> str:
+    return _PHASE_BAND_ALIASES[axis_name][signature[_PHASE_AXIS_INDEX[axis_name]]]
+
+
+def case_workload_bytes(
+    shapes: Sequence[Sequence[int]],
+    dtypes: Sequence[str],
+) -> int:
+    """Return dtype-aware total input bytes for one official case."""
+    default_dtype = dtypes[0] if dtypes else "float16"
+    total = 0.0
+    for index, shape in enumerate(shapes):
+        dtype_name = dtypes[index] if index < len(dtypes) else default_dtype
+        total += shape_numel(shape) * dtype_bytes_for(dtype_name)
+    return int(total)
+
+
+def case_primary_dtype_bytes(case_entry: Mapping[str, object]) -> float:
+    """Return the declared element width of one official case's first dtype."""
+    dtypes = flatten_str_values(case_entry.get("dtype"))
+    if not dtypes:
+        raise ValueError("case entry requires at least one declared dtype")
+    return dtype_bytes_for(dtypes[0])
+
+
+def case_workload_scale(workload_bytes: int, dims: Mapping[str, int]) -> tuple[int, int, int]:
+    """Return the shared representative key: bytes, element count, largest dimension."""
+    if isinstance(workload_bytes, bool) or not isinstance(workload_bytes, int):
+        raise ValueError("workload_bytes must be an int")
+    if workload_bytes < 0:
+        raise ValueError("workload_bytes must be non-negative")
+    total_elements = max(
+        0,
+        int(dims.get("total_elements", dims.get("total_elems", 0))),
+    )
+    largest_dim = max((int(value) for value in dims.values() if value > 0), default=0)
+    return workload_bytes, total_elements, largest_dim
+
+
+@dataclass(frozen=True, kw_only=True)
+class CasePhysicsRegimeCase:
+    """One official case inside a physical regime with its raw 5D phase coordinate."""
+
+    case_id: int
+    dims: dict[str, int]
+    phase_signature: PhaseSignature
+    workload_bytes: int
+
+    def __post_init__(self) -> None:
+        if isinstance(self.case_id, bool) or not isinstance(self.case_id, int):
+            raise ValueError("CasePhysicsRegimeCase.case_id must be an int")
+        if self.case_id < 1:
+            raise ValueError("CasePhysicsRegimeCase.case_id must be positive")
+        object.__setattr__(self, "dims", _as_int_dict(self.dims, "dims"))
+        if isinstance(self.workload_bytes, bool) or not isinstance(self.workload_bytes, int):
+            raise ValueError("CasePhysicsRegimeCase.workload_bytes must be an int")
+        if self.workload_bytes < 0:
+            raise ValueError("CasePhysicsRegimeCase.workload_bytes must be non-negative")
+
+
+def select_case_regime_representative(
+    cases: Sequence[CasePhysicsRegimeCase],
+) -> CasePhysicsRegimeCase:
+    """Return the highest-workload case, breaking ties by case id."""
+    if not cases:
+        raise ValueError("select_case_regime_representative needs at least one case")
+    return max(
+        cases,
+        key=lambda case: (
+            *case_workload_scale(case.workload_bytes, case.dims),
+            case.case_id,
+        ),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class CasePhysicsRegimeGroup:
+    """One regime of the public 2-4 physical partition mapping."""
+
+    regime_tag: str
+    cases: tuple[CasePhysicsRegimeCase, ...]
+    rationale: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.regime_tag, str) or not self.regime_tag.strip():
+            raise ValueError("CasePhysicsRegimeGroup.regime_tag must be a non-empty string")
+        cases = tuple(self.cases)
+        if not cases:
+            raise ValueError("CasePhysicsRegimeGroup.cases must not be empty")
+        for case in cases:
+            if not isinstance(case, CasePhysicsRegimeCase):
+                raise ValueError(
+                    "CasePhysicsRegimeGroup.cases must contain CasePhysicsRegimeCase values"
+                )
+        unique_ids = {case.case_id for case in cases}
+        if len(unique_ids) != len(cases):
+            raise ValueError("CasePhysicsRegimeGroup.cases must have unique case ids")
+        object.__setattr__(self, "cases", cases)
+        object.__setattr__(self, "rationale", str(self.rationale))
+
+    @property
+    def case_ids(self) -> tuple[int, ...]:
+        """Return the covered official case ids in ascending order."""
+        return tuple(sorted(case.case_id for case in self.cases))
+
+    @property
+    def phase_coordinates(self) -> tuple[str, ...]:
+        """Return every raw 5D phase coordinate covered by this regime."""
+        return tuple(sorted({"/".join(case.phase_signature) for case in self.cases}))
+
+    @property
+    def representative_case(self) -> CasePhysicsRegimeCase:
+        """Return the highest-workload case that supplies Stage-0 dimensions."""
+        return select_case_regime_representative(self.cases)
+
+    @property
+    def description(self) -> str:
+        """Return an explainable description that preserves every raw coordinate."""
+        coordinates = "; ".join(self.phase_coordinates)
+        rationale = self.rationale.strip()
+        reason = f"{rationale} " if rationale else ""
+        return (
+            f"Physical regime {self.regime_tag} covering official cases {list(self.case_ids)} "
+            f"at 5D coordinates: {coordinates}. {reason}Representative case "
+            f"{self.representative_case.case_id} supplies the Stage-0 dimensions."
+        )
+
+
+def _split_case_regime_group(
+    group: CasePhysicsRegimeGroup,
+    *,
+    max_new_groups: int,
+) -> tuple[CasePhysicsRegimeGroup, ...]:
+    ordered = sorted(group.cases, key=lambda case: case.case_id)
+    for axis_name in _PHASE_SPLIT_AXES:
+        buckets: dict[str, list[CasePhysicsRegimeCase]] = {}
+        for case in ordered:
+            alias = _phase_band_alias(case.phase_signature, axis_name)
+            buckets.setdefault(alias, []).append(case)
+        if 1 < len(buckets) <= max_new_groups:
+            reason = (
+                f"{group.rationale.strip()} Cases sharing regime {group.regime_tag} split by "
+                f"{axis_name} band to meet the partition floor. "
+            ).strip()
+            return tuple(
+                CasePhysicsRegimeGroup(
+                    regime_tag=f"{group.regime_tag}_{axis_name}_{alias}",
+                    cases=tuple(entries),
+                    rationale=reason,
+                )
+                for alias, entries in buckets.items()
+            )
+    workload_order = sorted(
+        ordered,
+        key=lambda case: (
+            *case_workload_scale(case.workload_bytes, case.dims),
+            case.case_id,
+        ),
+    )
+    midpoint = len(workload_order) // 2
+    if midpoint == 0:
+        raise ValueError(f"regime {group.regime_tag!r} has too few cases to split")
+    reason = (
+        f"{group.rationale.strip()} Cases sharing every phase coordinate under regime "
+        f"{group.regime_tag} split by dtype-aware workload scale to meet the partition floor."
+    ).strip()
+    return (
+        CasePhysicsRegimeGroup(
+            regime_tag=f"{group.regime_tag}_latency",
+            cases=tuple(workload_order[:midpoint]),
+            rationale=reason,
+        ),
+        CasePhysicsRegimeGroup(
+            regime_tag=f"{group.regime_tag}_throughput",
+            cases=tuple(workload_order[midpoint:]),
+            rationale=reason,
+        ),
+    )
+
+
+def _merge_nearest_regimes(
+    entries_by_tag: dict[str, list[CasePhysicsRegimeCase]],
+) -> tuple[str, str, int]:
+    tags = sorted(entries_by_tag)
+    best: tuple[int, str, str] | None = None
+    for left_index, left in enumerate(tags):
+        for right in tags[left_index + 1 :]:
+            distance = min(
+                sum(
+                    left_band != right_band
+                    for left_band, right_band in zip(
+                        left_case.phase_signature, right_case.phase_signature
+                    )
+                )
+                for left_case in entries_by_tag[left]
+                for right_case in entries_by_tag[right]
+            )
+            candidate = (distance, left, right)
+            if best is None or candidate < best:
+                best = candidate
+    assert best is not None, "nearest-regime merge needs at least two regimes"
+    return best[1], best[2], best[0]
+
+
+def partition_case_regimes(
+    ratios_by_case: Mapping[int, CasePhysicsRatios],
+    dims_by_case: Mapping[int, Mapping[str, int]],
+    workload_bytes_by_case: Mapping[int, int],
+    *,
+    kind: CasePhysicsKind,
+    axes: TopologyAxes,
+    min_partitions: int = 2,
+    max_partitions: int = 4,
+) -> tuple[CasePhysicsRegimeGroup, ...]:
+    """Partition official cases into 2-4 physical regimes while preserving raw phase evidence.
+
+    Cases group by ``classify_case_regime``. Above the cap, wave-occupancy ``_split``
+    variants fold into their base mechanism and remaining regimes merge at the nearest 5D
+    phase distance. A single regime splits on the first differing phase band, or by
+    dtype-aware workload scale when every coordinate coincides. No operator name or case id
+    selects a partition.
+    """
+    if not ratios_by_case:
+        raise ValueError("partition_case_regimes needs at least one official case")
+    if not 1 <= min_partitions <= max_partitions:
+        raise ValueError("partition bounds must satisfy 1 <= min_partitions <= max_partitions")
+    case_ids = set(ratios_by_case)
+    for name, mapping in (
+        ("dims", dims_by_case),
+        ("workload bytes", workload_bytes_by_case),
+    ):
+        if set(mapping) != case_ids:
+            missing = sorted(case_ids - set(mapping))
+            extra = sorted(set(mapping) - case_ids)
+            raise ValueError(f"case {name} mismatch: missing={missing}, extra={extra}")
+    entries_by_tag: dict[str, list[CasePhysicsRegimeCase]] = {}
+    for case_id in sorted(case_ids):
+        ratios = ratios_by_case[case_id]
+        if ratios.case_id != case_id:
+            raise ValueError(f"case {case_id} ratios carry case_id {ratios.case_id}")
+        dims = {str(key): int(value) for key, value in dims_by_case[case_id].items()}
+        workload_bytes = workload_bytes_by_case[case_id]
+        if isinstance(workload_bytes, bool) or not isinstance(workload_bytes, int):
+            raise ValueError(f"case {case_id} workload_bytes must be an int")
+        if workload_bytes < 0:
+            raise ValueError(f"case {case_id} workload_bytes must be non-negative")
+        tag = classify_case_regime(ratios, kind=kind, axes=axes, dims=dims)
+        entries_by_tag.setdefault(tag, []).append(
+            CasePhysicsRegimeCase(
+                case_id=case_id,
+                dims=dims,
+                phase_signature=ratios.phase_signature(axes),
+                workload_bytes=workload_bytes,
+            )
+        )
+    rationale_parts: list[str] = []
+    if len(entries_by_tag) > max_partitions:
+        folded: dict[str, list[CasePhysicsRegimeCase]] = {}
+        for tag, entries in entries_by_tag.items():
+            folded.setdefault(tag.removesuffix("_split"), []).extend(entries)
+        if set(folded) != set(entries_by_tag):
+            rationale_parts.append(
+                "Wave-occupancy _split variants folded into their base mechanism. "
+            )
+        entries_by_tag = folded
+    while len(entries_by_tag) > max_partitions:
+        left, right, distance = _merge_nearest_regimes(entries_by_tag)
+        left_entries = entries_by_tag.pop(left)
+        right_entries = entries_by_tag.pop(right)
+        if len(left_entries) != len(right_entries):
+            merged_tag = left if len(left_entries) > len(right_entries) else right
+        else:
+            merged_tag = min(left, right)
+        entries_by_tag[merged_tag] = sorted(
+            (*left_entries, *right_entries),
+            key=lambda case: case.case_id,
+        )
+        rationale_parts.append(
+            f"Regimes {left} and {right} merged at 5D phase distance {distance} to stay "
+            f"within the {max_partitions}-partition cap. "
+        )
+    groups = [
+        CasePhysicsRegimeGroup(
+            regime_tag=tag,
+            cases=tuple(entries),
+            rationale="".join(rationale_parts),
+        )
+        for tag, entries in entries_by_tag.items()
+    ]
+    while len(groups) < min_partitions:
+        candidates = [group for group in groups if len(group.cases) >= 2]
+        if not candidates:
+            break
+        chosen = sorted(candidates, key=lambda group: (-len(group.cases), group.regime_tag))[0]
+        position = groups.index(chosen)
+        replacement = _split_case_regime_group(
+            chosen,
+            max_new_groups=max_partitions - len(groups) + 1,
+        )
+        groups = [*groups[:position], *replacement, *groups[position + 1 :]]
+    groups.sort(key=lambda group: group.case_ids[0])
+    return tuple(groups)
+
+
+@dataclass(frozen=True, kw_only=True)
+class CasePhysicsInput:
+    """Raw physical quantities for one case before ratio normalization."""
+
+    case_id: int
+    kind: CasePhysicsKind
+    stride_ratio: float
+    atom_bytes: int
+    sram_capacity_bytes: int
+    inner_contiguous_bytes: int
+    working_set_bytes: float
+    vreg_extent_elements: int
+    outer_tiles: int
+    physical_cores: int
+    oi_ridge_ratio: float
+    has_empty_group: bool = False
+
+    def __post_init__(self) -> None:
+        if self.case_id < 1 or self.outer_tiles < 1 or self.physical_cores < 1:
+            raise ValueError("CasePhysicsInput requires positive case_id, tiles and cores")
+        if self.atom_bytes < 1 or self.sram_capacity_bytes < 1:
+            raise ValueError("CasePhysicsInput requires positive atom and SRAM capacities")
+        if self.inner_contiguous_bytes < 1 or self.vreg_extent_elements < 1:
+            raise ValueError("CasePhysicsInput requires positive contiguous and VREG extents")
+        if self.stride_ratio < 1.0 or self.oi_ridge_ratio <= 0.0:
+            raise ValueError("CasePhysicsInput requires stride_ratio >= 1 and oi_ridge_ratio > 0")
+        if not math.isfinite(self.working_set_bytes) or self.working_set_bytes < 0.0:
+            raise ValueError("CasePhysicsInput.working_set_bytes must be finite and non-negative")
+
+    def to_ratios(self) -> CasePhysicsRatios:
+        """Normalize raw quantities into the dimensionless public ratio contract."""
+        return compute_case_physics_ratios(self)
+
+
+@dataclass(frozen=True, kw_only=True)
+class CasePhysicsContext:
+    """Physical environment and semantic class used to derive one case's ratios."""
+
+    kind: CasePhysicsKind
+    dtype_bytes: float
+    facts: AscendSpaceFacts
+    sram_capacity_bytes: int
+    physical_cores: int
+    atom_bytes: int
+    reduction_axis: int = -1
+    strided_gather: bool = False
+    has_empty_group: bool = False
+
+
+def build_case_physics_context(
+    kind: CasePhysicsKind,
+    dtype_bytes: float,
+    facts: AscendSpaceFacts,
+    *,
+    reduction_axis: int = -1,
+    strided_gather: bool = False,
+    has_empty_group: bool = False,
+) -> CasePhysicsContext:
+    """Select SRAM capacity, core count and atom width for one semantic case class."""
+    if dtype_bytes <= 0.0:
+        raise ValueError(f"dtype_bytes must be > 0, got {dtype_bytes}")
+    if kind in ("matmul", "attention"):
+        sram_capacity_bytes = facts.l1_bytes
+        physical_cores = facts.num_aic_cores
+    else:
+        sram_capacity_bytes = facts.ub_simdvf_usable_bytes
+        physical_cores = facts.num_aiv_cores
+    atom_bytes = (
+        max(1, int(16.0 * dtype_bytes)) if kind == "matmul" else facts.ub_datablock_bytes
+    )
+    return CasePhysicsContext(
+        kind=kind,
+        dtype_bytes=dtype_bytes,
+        facts=facts,
+        sram_capacity_bytes=sram_capacity_bytes,
+        physical_cores=physical_cores,
+        atom_bytes=atom_bytes,
+        reduction_axis=reduction_axis,
+        strided_gather=strided_gather,
+        has_empty_group=has_empty_group,
+    )
+
+
+def compute_case_physics_ratios(raw: CasePhysicsInput) -> CasePhysicsRatios:
+    """Normalize raw case quantities into the six public dimensionless physics ratios."""
+    return CasePhysicsRatios(
+        case_id=raw.case_id,
+        stride_ratio=raw.stride_ratio,
+        contig_atom_ratio=raw.inner_contiguous_bytes / raw.atom_bytes,
+        is_atom_aligned=raw.inner_contiguous_bytes % raw.atom_bytes == 0,
+        working_set_sram_ratio=raw.working_set_bytes / raw.sram_capacity_bytes,
+        working_set_vreg_ratio=raw.vreg_extent_elements * 4.0 / VREG_CAPACITY_BYTES,
+        wave_occupancy_ratio=raw.outer_tiles / raw.physical_cores,
+        oi_ridge_ratio=raw.oi_ridge_ratio,
+        has_empty_group=raw.has_empty_group,
+        inner_contiguous_bytes=raw.inner_contiguous_bytes,
+    )
+
+
+def _int_attr(attrs: Mapping[str, object], key: str) -> int | None:
+    raw = attrs.get(key)
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError(f"case attr {key!r} must be an int, got {type(raw).__name__}")
+    return raw
+
+
+def _int_list_attr(attrs: Mapping[str, object], key: str) -> tuple[int, ...]:
+    raw = attrs.get(key)
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    values: list[int] = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValueError(f"case attr {key!r} must contain only ints")
+        values.append(item)
+    return tuple(values)
+
+
+def has_empty_group_attrs(attrs: Mapping[str, object] | None) -> bool:
+    """Return whether cumulative group offsets contain a zero-width group."""
+    if attrs is None:
+        return False
+    group_list = attrs.get("group_list")
+    if not isinstance(group_list, (list, tuple)) or not group_list:
+        return False
+    previous = 0
+    for raw in group_list:
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            continue
+        if raw <= previous:
+            return True
+        previous = raw
+    return False
+
+
+def _case_layout(attrs: Mapping[str, object]) -> str:
+    raw = attrs.get("inputLayout", attrs.get("input_layout", attrs.get("layout", "BSND")))
+    return str(raw).strip().upper()
+
+
+def _sequence_length(shape: Sequence[int], layout: str) -> int | None:
+    if not shape:
+        return None
+    if len(shape) == 4:
+        index = 2 if layout == "BNSD" else 1
+    else:
+        index = 0
+    value = int(shape[index])
+    return value if value > 0 else None
+
+
+def _attention_kv_length(shapes: Sequence[Sequence[int]], layout: str) -> int | None:
+    lengths = [
+        length
+        for shape in shapes[1:3]
+        if (length := _sequence_length(shape, layout)) is not None
+    ]
+    return max(lengths) if lengths else None
+
+
+def infer_case_dims_structural(
+    shapes: Sequence[Sequence[int]],
+    attrs: Mapping[str, object],
+    *,
+    axes: TopologyAxes,
+    uses_cube: bool,
+) -> dict[str, int]:
+    """Extract canonical M/N/K/E and sequence dims structurally without operator names."""
+    if not shapes or not shapes[0]:
+        return {"M": 1, "N": 1, "K": 1}
+    primary = [int(dim) for dim in shapes[0]]
+    dims: dict[str, int] = {}
+
+    if (axes.iteration_regularity == "ragged_group" or "group_list" in attrs) and len(shapes) >= 2:
+        weight = shapes[1]
+        dims["M"] = primary[0]
+        dims["K"] = primary[-1]
+        dims["E"] = int(weight[0]) if len(weight) >= 3 else 1
+        dims["N"] = int(weight[-1]) if len(weight) >= 2 else 1
+        return dims
+
+    in_features = _int_attr(attrs, "in_features")
+    out_features = _int_attr(attrs, "out_features")
+    if (in_features is not None or out_features is not None) and len(shapes) >= 2:
+        dims["M"] = 1 if len(primary) == 1 else shape_numel(primary[:-1])
+        dims["K"] = in_features if in_features is not None else primary[-1]
+        final_shape = shapes[-1]
+        fallback_n = int(final_shape[0]) if final_shape else 1
+        dims["N"] = out_features if out_features is not None else fallback_n
+        return dims
+
+    if axes.memory_ring == "bidirectional_cv_ring" and len(shapes) >= 2:
+        layout = _case_layout(attrs)
+        if len(primary) == 4:
+            dims["B"] = primary[0]
+            dims["S_q"] = primary[2] if layout == "BNSD" else primary[1]
+            dims["H_q"] = primary[1] if layout == "BNSD" else primary[2]
+            dims["D"] = primary[3]
+            dims["M"] = dims["B"] * dims["S_q"]
+        elif len(primary) == 3:
+            dims["T"] = primary[0]
+            dims["H_q"] = primary[1]
+            dims["D"] = primary[2]
+            query_lengths = _int_list_attr(attrs, "actual_seq_qlen")
+            dims["S_q"] = max(query_lengths) if query_lengths else primary[0]
+            dims["M"] = dims["S_q"]
+        else:
+            dims["M"] = shape_numel(primary[:-1])
+            dims["K"] = primary[-1]
+            secondary = [int(dim) for dim in shapes[1]]
+            if (
+                len(secondary) == 2
+                and secondary[-1] == dims["K"]
+                and secondary[0] != dims["K"]
+            ):
+                dims["N"] = secondary[0]
+            else:
+                dims["N"] = secondary[-1] if secondary else primary[-1]
+        kv_length = _attention_kv_length(shapes, layout)
+        dims["S_kv"] = kv_length if kv_length is not None else dims.get("S_q", dims["M"])
+        if len(primary) != 2:
+            dims["K"] = primary[-1]
+            dims["N"] = int(shapes[2][-1]) if len(shapes) >= 3 and shapes[2] else primary[-1]
+        return dims
+
+    if uses_cube and len(shapes) >= 2 and shapes[1] and len(primary) <= 3 and len(shapes[1]) <= 3:
+        dims["M"] = shape_numel(primary[:-1])
+        dims["K"] = primary[-1]
+        rhs = shapes[1]
+        if len(rhs) == 2 and rhs[-1] == dims["K"] and rhs[0] != dims["K"]:
+            dims["N"] = int(rhs[0])
+        else:
+            dims["N"] = int(rhs[-1]) if rhs else 1
+        return dims
+
+    if len(primary) >= 2:
+        dims["rows"] = shape_numel(primary[:-1])
+        dims["cols"] = primary[-1]
+        dims["M"] = dims["rows"]
+        dims["N"] = dims["cols"]
+    else:
+        dims["rows"] = 1
+        dims["cols"] = primary[0]
+        dims["M"] = 1
+        dims["N"] = primary[0]
+    if uses_cube:
+        dims["K"] = primary[-1]
+        if len(shapes) >= 2 and shapes[1]:
+            dims["N"] = int(shapes[1][-1])
+    dims["total_elems"] = shape_numel(primary)
+    return dims
+
+
+def infer_case_physics_kind(axes: TopologyAxes, *, has_reduction: bool) -> CasePhysicsKind:
+    """Classify a case from topology axes and an explicit reduction signal."""
+    if axes.memory_ring == "bidirectional_cv_ring" and axes.uses_cube:
+        return "attention"
+    if axes.uses_cube:
+        return "matmul"
+    return "reduction" if has_reduction else "elementwise"
+
+
+def _optional_dim(dims: Mapping[str, int], names: Sequence[str]) -> int | None:
+    for name in names:
+        value = dims.get(name)
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _require_dim(dims: Mapping[str, int], names: Sequence[str], what: str) -> int:
+    value = _optional_dim(dims, names)
+    if value is None:
+        raise ValueError(f"{what} requires one of dims {tuple(names)} to be positive")
+    return value
+
+
+def _reduction_axis(attrs: Mapping[str, object], default_axis: int) -> int:
+    raw = attrs.get("dim", attrs.get("axis", default_axis))
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ValueError(f"reduction axis must be an int, got {type(raw).__name__}")
+    return raw
+
+
+def _cube_dtype_name(dtype_bytes: float) -> str:
+    if dtype_bytes <= 0.5:
+        return "f4"
+    if dtype_bytes <= 1.0:
+        return "fp8e4m3"
+    if dtype_bytes <= 2.0:
+        return "f16"
+    return "f32"
+
+
+def _derive_reduction_input(
+    case_id: int,
+    primary: Sequence[int],
+    attrs: Mapping[str, object],
+    context: CasePhysicsContext,
+) -> CasePhysicsInput:
+    axis = _reduction_axis(attrs, context.reduction_axis)
+    if axis < 0:
+        axis += len(primary)
+    if axis < 0 or axis >= len(primary):
+        raise ValueError(f"reduction axis {axis} out of range for shape {tuple(primary)}")
+    active = primary[axis]
+    if active < 1:
+        raise ValueError(f"reduction axis {axis} has non-positive extent {active}")
+    inner = shape_numel(primary[axis + 1 :])
+    rows = shape_numel(primary[:axis])
+    contiguous_elements = inner if inner > 1 else active
+    return CasePhysicsInput(
+        case_id=case_id,
+        kind="reduction",
+        stride_ratio=float(max(1, inner)),
+        atom_bytes=context.atom_bytes,
+        sram_capacity_bytes=context.sram_capacity_bytes,
+        inner_contiguous_bytes=max(1, int(round(contiguous_elements * context.dtype_bytes))),
+        working_set_bytes=active * min(inner, 64) * max(2.0 * context.dtype_bytes, 4.0),
+        vreg_extent_elements=active,
+        outer_tiles=rows,
+        physical_cores=context.physical_cores,
+        oi_ridge_ratio=1.0,
+        has_empty_group=context.has_empty_group,
+    )
+
+
+def _derive_elementwise_input(
+    case_id: int,
+    primary: Sequence[int],
+    context: CasePhysicsContext,
+) -> CasePhysicsInput:
+    width = primary[-1]
+    rows = shape_numel(primary[:-1])
+    if width < 1:
+        raise ValueError(f"elementwise input shape {tuple(primary)} has a non-positive width")
+    return CasePhysicsInput(
+        case_id=case_id,
+        kind="elementwise",
+        stride_ratio=1.0,
+        atom_bytes=context.atom_bytes,
+        sram_capacity_bytes=context.sram_capacity_bytes,
+        inner_contiguous_bytes=max(1, int(round(width * context.dtype_bytes))),
+        working_set_bytes=min(rows, 64) * width * max(2.0 * context.dtype_bytes, 4.0),
+        vreg_extent_elements=width,
+        outer_tiles=rows,
+        physical_cores=context.physical_cores,
+        oi_ridge_ratio=1.0,
+        has_empty_group=context.has_empty_group,
+    )
+
+
+def _derive_matmul_input(
+    case_id: int,
+    dims: Mapping[str, int],
+    context: CasePhysicsContext,
+) -> CasePhysicsInput:
+    m_dim = _require_dim(dims, ("M", "m_rows", "rows"), "matmul")
+    k_dim = _require_dim(dims, ("K", "in_features", "k_dim"), "matmul")
+    n_dim = _require_dim(dims, ("N", "out_features", "n_dim", "cols"), "matmul")
+    batch = _optional_dim(dims, ("B", "b_dim")) or 1
+    critical_m = compute_critical_cube_tile_m(
+        context.facts,
+        _cube_dtype_name(context.dtype_bytes),
+    )
+    working_set = (
+        min(m_dim, 128) * min(k_dim, 64) + min(k_dim, 64) * min(n_dim, 128)
+    ) * context.dtype_bytes
+    return CasePhysicsInput(
+        case_id=case_id,
+        kind="matmul",
+        stride_ratio=1.0,
+        atom_bytes=context.atom_bytes,
+        sram_capacity_bytes=context.sram_capacity_bytes,
+        inner_contiguous_bytes=max(1, int(round(k_dim * context.dtype_bytes))),
+        working_set_bytes=working_set,
+        vreg_extent_elements=k_dim,
+        outer_tiles=m_dim * batch,
+        physical_cores=context.physical_cores,
+        oi_ridge_ratio=m_dim / float(critical_m),
+        has_empty_group=context.has_empty_group,
+    )
+
+
+def _derive_attention_input(
+    case_id: int,
+    shapes: Sequence[Sequence[int]],
+    attrs: Mapping[str, object],
+    dims: Mapping[str, int],
+    context: CasePhysicsContext,
+) -> CasePhysicsInput:
+    layout = _case_layout(attrs)
+    s_q = _require_dim(dims, ("S_q", "S", "M", "m_rows"), "attention")
+    s_kv = _optional_dim(dims, ("S_kv", "s_kv"))
+    if s_kv is None:
+        s_kv = _attention_kv_length(shapes, layout)
+    if s_kv is None:
+        s_kv = s_q
+    d_nope = _optional_dim(dims, ("D_nope", "d_nope"))
+    d_rope = _optional_dim(dims, ("D_rope", "d_rope"))
+    d_qk = _optional_dim(dims, ("D_qk", "D", "d_dim", "dk"))
+    if d_qk is None and d_nope is not None and d_rope is not None:
+        d_qk = d_nope + d_rope
+    if d_qk is None:
+        d_qk = int(shapes[0][-1]) if shapes[0] else 0
+    d_v = _optional_dim(dims, ("D_v", "dv")) or d_nope or d_qk
+    segments = [value for value in (d_nope, d_rope, d_qk, d_v) if value is not None and value > 0]
+    if not segments:
+        raise ValueError("attention requires a positive head dimension")
+    segment = min(segments)
+    stride_ratio = 4.0 if context.strided_gather else (2.0 if layout == "BNSD" else 1.0)
+    batch = _optional_dim(dims, ("B", "b_dim")) or 1
+    critical_m = compute_critical_cube_tile_m(
+        context.facts,
+        _cube_dtype_name(context.dtype_bytes),
+    )
+    return CasePhysicsInput(
+        case_id=case_id,
+        kind="attention",
+        stride_ratio=stride_ratio,
+        atom_bytes=context.atom_bytes,
+        sram_capacity_bytes=context.sram_capacity_bytes,
+        inner_contiguous_bytes=max(1, int(round(segment * context.dtype_bytes))),
+        working_set_bytes=min(s_q, 64) * s_kv * 4.0,
+        vreg_extent_elements=s_kv,
+        outer_tiles=batch * max(1, math.ceil(s_q / 16)),
+        physical_cores=context.physical_cores,
+        oi_ridge_ratio=s_q / float(critical_m),
+        has_empty_group=context.has_empty_group,
+    )
+
+
+def derive_case_physics_input(
+    case_id: int,
+    shapes: Sequence[Sequence[int]],
+    attrs: Mapping[str, object],
+    dims: Mapping[str, int],
+    context: CasePhysicsContext,
+) -> CasePhysicsInput:
+    """Derive raw physical quantities for one case from structural dims and input shapes."""
+    if not shapes or not shapes[0]:
+        raise ValueError("case physics require at least one non-empty input shape")
+    primary = [int(dim) for dim in shapes[0]]
+    if context.kind == "attention":
+        return _derive_attention_input(case_id, shapes, attrs, dims, context)
+    if context.kind == "matmul":
+        return _derive_matmul_input(case_id, dims, context)
+    if context.kind == "reduction":
+        return _derive_reduction_input(case_id, primary, attrs, context)
+    return _derive_elementwise_input(case_id, primary, context)
+
+
 @dataclass(frozen=True)
 class ConstraintRelaxationMask:
     """Provably complete MECE 7-facet target-AST partition relaxation lattice."""
@@ -279,6 +1487,10 @@ class RegimeSlice:
     has_empty_group: bool = False
     ref_perf_us: float = 0.0
     t_hw_us: float = 0.0
+    case_ratios: tuple[CasePhysicsRatios, ...] = ()
+    representative_case_id: int | None = None
+    phase_coordinates: tuple[str, ...] = ()
+    rationale: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.regime_tag, str) or not self.regime_tag.strip():
@@ -297,6 +1509,37 @@ class RegimeSlice:
             raise ValueError("RegimeSlice timings ref_perf_us and t_hw_us must be non-negative")
         object.__setattr__(self, "ref_perf_us", ref_perf)
         object.__setattr__(self, "t_hw_us", t_hw)
+        ratios = tuple(self.case_ratios)
+        for ratio in ratios:
+            if not isinstance(ratio, CasePhysicsRatios):
+                raise ValueError("RegimeSlice.case_ratios must contain CasePhysicsRatios values")
+        object.__setattr__(self, "case_ratios", ratios)
+        if self.representative_case_id is not None:
+            if isinstance(self.representative_case_id, bool) or not isinstance(
+                self.representative_case_id, int
+            ):
+                raise ValueError("RegimeSlice.representative_case_id must be an int")
+            if self.representative_case_id not in self.case_nums:
+                raise ValueError(
+                    "RegimeSlice.representative_case_id must belong to case_nums"
+                )
+        object.__setattr__(
+            self,
+            "phase_coordinates",
+            _as_str_tuple(self.phase_coordinates, "phase_coordinates"),
+        )
+        object.__setattr__(self, "rationale", str(self.rationale))
+
+    def representative_ratios(self) -> CasePhysicsRatios | None:
+        """Return the physics ratios of the representative case."""
+        if not self.case_ratios:
+            return None
+        if self.representative_case_id is not None:
+            for ratio in self.case_ratios:
+                if ratio.case_id == self.representative_case_id:
+                    return ratio
+            return None
+        return self.case_ratios[len(self.case_ratios) // 2]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -307,10 +1550,18 @@ class RegimeSlice:
             "has_empty_group": self.has_empty_group,
             "ref_perf_us": self.ref_perf_us,
             "t_hw_us": self.t_hw_us,
+            "case_ratios": [ratio.to_dict() for ratio in self.case_ratios],
+            "representative_case_id": self.representative_case_id,
+            "phase_coordinates": list(self.phase_coordinates),
+            "rationale": self.rationale,
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> RegimeSlice:
+        raw_ratios = payload.get("case_ratios") or ()
+        if isinstance(raw_ratios, (str, bytes)) or not isinstance(raw_ratios, Sequence):
+            raise ValueError("RegimeSlice.case_ratios must be a sequence")
+        raw_representative = payload.get("representative_case_id")
         return cls(
             regime_tag=str(payload["regime_tag"]),
             case_nums=tuple(int(x) for x in payload.get("case_nums", ())),
@@ -321,6 +1572,18 @@ class RegimeSlice:
             has_empty_group=bool(payload.get("has_empty_group", False)),
             ref_perf_us=float(payload.get("ref_perf_us", 0.0)),
             t_hw_us=float(payload.get("t_hw_us", 0.0)),
+            case_ratios=tuple(
+                CasePhysicsRatios.from_dict(item)
+                for item in raw_ratios
+                if isinstance(item, Mapping)
+            ),
+            representative_case_id=(
+                int(raw_representative) if raw_representative is not None else None
+            ),
+            phase_coordinates=tuple(
+                str(item) for item in (payload.get("phase_coordinates") or ())
+            ),
+            rationale=str(payload.get("rationale", "")),
         )
 
     def to_json(self, *, indent: int | None = 2) -> str:

@@ -22,12 +22,15 @@ from pathlib import Path
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
+    CannbenchOpSpec,
+    CannbenchOpsRegistry,
     PerfTargetSpec,
     RegimeTargetSpec,
     append_dynamic_anchor,
     build_anchor_var_bindings,
     compute_case_eq3_score,
     default_source_root,
+    extract_trackb_cpp_source,
     get_default_anchors,
     get_default_perf_target,
     get_default_regime_specs,
@@ -37,6 +40,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     lookup_case_dims,
     lookup_case_metadata,
     parse_simple_env_file,
+    resolve_cannbench_repo,
     resolve_cannbench_tasks_root,
     resolve_regime_for_case,
 )
@@ -66,6 +70,7 @@ from tilefoundry_ascend.agent.kb.schema import (
     AscendCausalRule,
     build_predicate_context,
     load_seed_rules,
+    normalize_runtime_backend,
 )
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     apply_scoped_trackb_patch,
@@ -100,6 +105,7 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate,
     StaticDynamicResidual,
     TwoLaneBeamSearch,
+    compiler_summary_from_residual,
     compute_static_dynamic_residual,
     extract_structural_signature,
 )
@@ -138,6 +144,10 @@ from tilefoundry_ascend.ascend.schedule.regime_solver import (
 from tilefoundry_ascend.ascend.sil.op_analyzer import (
     OpAdvisoryExtractor,
     resolve_canonical_topology_axes,
+)
+from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
+    PyTorchSemanticAnalyzer,
+    RepresentativeCase,
 )
 from tilefoundry_ascend.ascend.sil.schema import (
     ConstraintRelaxationMask,
@@ -204,6 +214,7 @@ class CampaignRoundRecord:
     best_so_far_surrogate_score: float = 0.0
     pruned_rule_ids: tuple[str, ...] = ()
     promotion_attempts: tuple[dict[str, str], ...] = ()
+    trackb_evidence: tuple[dict[str, object], ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """Serialize CampaignRoundRecord into a JSON-compatible dictionary."""
@@ -225,6 +236,7 @@ class CampaignRoundRecord:
             "admitted_rule_ids": list(self.admitted_rule_ids),
             "pruned_rule_ids": list(self.pruned_rule_ids),
             "promotion_attempts": [dict(item) for item in self.promotion_attempts],
+            "trackb_evidence": [dict(item) for item in self.trackb_evidence],
         }
 
     @classmethod
@@ -256,6 +268,11 @@ class CampaignRoundRecord:
             promotion_attempts=tuple(
                 {str(k): str(v) for k, v in item.items()}
                 for item in payload.get("promotion_attempts", ())
+                if isinstance(item, Mapping)
+            ),
+            trackb_evidence=tuple(
+                dict(item)
+                for item in payload.get("trackb_evidence", ())
                 if isinstance(item, Mapping)
             ),
         )
@@ -699,30 +716,7 @@ def _extract_trackb_cpp_source(
     regime_spec: RegimeTargetSpec,
 ) -> tuple[str, str] | None:
     """Return `(symbol_name, cpp_source)` for the first Track-B C++20 string constant."""
-    if not regime_spec.trackb_symbols:
-        return None
-    tree = ast.parse(module_source)
-
-    constants: dict[str, str] = {}
-    for node in tree.body:
-        name: str | None = None
-        val: ast.AST | None = None
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-        ):
-            name, val = node.targets[0].id, node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            name, val = node.target.id, node.value
-        if name and isinstance(val, ast.Constant) and isinstance(val.value, str):
-            constants[name] = val.value
-
-    for sym in regime_spec.trackb_symbols:
-        cpp = constants.get(sym)
-        if isinstance(cpp, str) and cpp.strip():
-            return sym, cpp
-    return None
+    return extract_trackb_cpp_source(module_source, regime_spec.trackb_symbols)
 
 
 def _top_level_symbol_sources(module_source: str) -> dict[str, str]:
@@ -1799,19 +1793,89 @@ class PerfTargetCampaignRunner:
                 if clean:
                     self._msprof_cache[(sha, str(tag))] = clean
 
-    def _compile_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
-        if self._authored_hir_path is None or not self._authored_hir_path.is_file():
-            return {}
+    def _resolve_operator_spec(self) -> CannbenchOpSpec | None:
+        """Resolve the official cann-bench task spec for the campaign operator."""
         try:
-            authored_hir_source = self._authored_hir_path.read_text(encoding="utf-8")
-        except OSError:
+            repo = resolve_cannbench_repo(
+                cannbench_repo=self._cannbench_repo,
+                env_file=self._env_file,
+            )
+        except FileNotFoundError:
+            return None
+        registry = CannbenchOpsRegistry(tasks_root=repo, source_root=self._source_root)
+        if not registry.has_operator(self._config.operator_name):
+            return None
+        return registry.resolve(self._config.operator_name)
+
+    def _synthesize_universal_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
+        """Synthesize per-regime blueprints from the PyTorch golden when model.py is absent."""
+        spec = self._resolve_operator_spec()
+        if spec is None:
             return {}
+        if not spec.golden_path.is_file():
+            raise FileNotFoundError(
+                f"official PyTorch golden reference missing for {spec.op_id} at {spec.golden_path}"
+            )
+        try:
+            golden_source = spec.golden_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot read PyTorch golden reference for {spec.op_id} at {spec.golden_path}: {exc}"
+            ) from exc
+        analyzer = PyTorchSemanticAnalyzer(self._target)
+        try:
+            semantics = analyzer.analyze_source(
+                golden_source,
+                entry_name=spec.entrypoint,
+                proto=spec.proto,
+            )
+        except (SyntaxError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot analyze PyTorch golden semantics for {spec.op_id}: {exc}"
+            ) from exc
+        packets: dict[str, HirBlueprintPacket] = {}
+        for regime_spec in self._regime_specs:
+            try:
+                packets[regime_spec.regime_tag] = analyzer.build_universal_blueprint(
+                    semantics,
+                    regime_spec.representative_hir_dims,
+                    representative_case=(
+                        RepresentativeCase.from_case_entry(
+                            regime_spec.representative_case_entry
+                        )
+                        if regime_spec.representative_case_entry
+                        else None
+                    ),
+                )
+            except (FileNotFoundError, OSError, SyntaxError, ValueError, KeyError) as exc:
+                raise RuntimeError(
+                    f"failed to synthesize universal HIR blueprint for {spec.op_id} regime "
+                    f"{regime_spec.regime_tag}: {type(exc).__name__}: {exc}"
+                ) from exc
+        assert set(packets) == {regime.regime_tag for regime in self._regime_specs}
+        return packets
+
+    def _compile_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
+        """Compile non-empty per-regime Layer-3 blueprints, preferring authored model.py."""
+        authored_hir_source: str | None = None
+        if self._authored_hir_path is not None and self._authored_hir_path.is_file():
+            try:
+                authored_hir_source = self._authored_hir_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise RuntimeError(
+                    f"cannot read authored HIR source at {self._authored_hir_path}: {exc}"
+                ) from exc
         scheduled_hir_source: str | None = None
         if self._scheduled_hir_path is not None and self._scheduled_hir_path.is_file():
             try:
                 scheduled_hir_source = self._scheduled_hir_path.read_text(encoding="utf-8")
-            except OSError:
-                scheduled_hir_source = None
+            except OSError as exc:
+                raise RuntimeError(
+                    f"cannot read scheduled HIR source at {self._scheduled_hir_path}: {exc}"
+                ) from exc
+
+        if authored_hir_source is None or not authored_hir_source.strip():
+            return self._synthesize_universal_regime_blueprints()
 
         packets: dict[str, HirBlueprintPacket] = {}
         for regime_spec in self._regime_specs:
@@ -1822,13 +1886,12 @@ class PerfTargetCampaignRunner:
                     anchor_dims=regime_spec.representative_hir_dims,
                     target=self._target,
                 )
-            except (FileNotFoundError, OSError) as exc:
-                logger.warning(
-                    "Failed to compile HIR navigation packet for regime %s: %s",
-                    regime_spec.regime_tag,
-                    exc,
-                )
-                continue
+            except (FileNotFoundError, OSError, SyntaxError, ValueError, KeyError) as exc:
+                raise RuntimeError(
+                    f"failed to compile authored HIR blueprint for regime "
+                    f"{regime_spec.regime_tag}: {type(exc).__name__}: {exc}"
+                ) from exc
+        assert set(packets) == {regime.regime_tag for regime in self._regime_specs}
         return packets
 
     def _get_backend(self) -> KernelLLMBackend:
@@ -2007,6 +2070,7 @@ class PerfTargetCampaignRunner:
                 freedom_mask=active_mask,
                 target=self._target,
                 enable_track_router=self._enable_track_router,
+                case_ratios=regime_spec.representative_case_ratios,
             )
 
         anchor_dims = (
@@ -2043,6 +2107,7 @@ class PerfTargetCampaignRunner:
             target=self._target,
             var_bindings=var_bindings or None,
             enable_track_router=self._enable_track_router,
+            case_ratios=regime_spec.representative_case_ratios,
         )
         if not primary_res.passed:
             return primary_res
@@ -2058,6 +2123,7 @@ class PerfTargetCampaignRunner:
                 target=self._target,
                 var_bindings=var_bindings or None,
                 enable_track_router=self._enable_track_router,
+                case_ratios=regime_spec.representative_case_ratios,
             )
             if not combine_res.passed:
                 return StageAResult(
@@ -2078,6 +2144,7 @@ class PerfTargetCampaignRunner:
                 freedom_mask=active_mask,
                 target=self._target,
                 enable_track_router=self._enable_track_router,
+                case_ratios=regime_spec.representative_case_ratios,
             )
             if not tb_res.passed:
                 return StageAResult(
@@ -2921,9 +2988,10 @@ class PerfTargetCampaignRunner:
     @staticmethod
     def _format_trackb_hotpath_section(regime_spec: RegimeTargetSpec) -> tuple[str, str]:
         """Return `(escalation_tier, hotpath_prompt_section)` for *regime_spec*."""
+        backend = normalize_runtime_backend(regime_spec.runtime_backend)
         esc_tier = (
             "ascendc_template"
-            if regime_spec.runtime_backend == "ascendc_trackb"
+            if backend in ("ascendc_trackb", "hybrid_trackb")
             else "tilelang_dsl"
         )
         if not regime_spec.trackb_symbols:
@@ -2932,9 +3000,9 @@ class PerfTargetCampaignRunner:
             "### ACTIVE RUNTIME HOT PATH\n"
             f"- runtime_backend: {regime_spec.runtime_backend}\n"
             f"- active_trackb_symbols: {list(regime_spec.trackb_symbols)}\n"
-            "- CRITICAL: On NPU this regime executes the Track-B AscendC/C++20 kernel string "
+            "- CRITICAL: On NPU this regime executes the Track-B CCE (C++20) kernel string "
             "and config selector shown in TARGET FUNCTION SNIPPET, NOT dead TileLang fallback "
-            "builders. Edit the active Track-B C++20 string / selector directly.\n\n"
+            "builders. Edit the active Track-B CCE (C++20) kernel string / selector directly.\n\n"
         )
         return esc_tier, section
 
@@ -4178,6 +4246,130 @@ class PerfTargetCampaignRunner:
         self._persist_runtime_state("pending_l4", pending.to_dict())
         return result
 
+    def _collect_trackb_round_evidence(
+        self,
+        *,
+        round_idx: int,
+        regime_spec: RegimeTargetSpec,
+        blueprint: HirBlueprintPacket | None,
+        live_plan: RegimePlanResult | None,
+        active_mask: ConstraintRelaxationMask,
+        checks: Sequence[L0L1CandidateCheck],
+        l2_results: Mapping[str, CandidateSurrogateResult],
+    ) -> tuple[dict[str, object], ...]:
+        """Record per-candidate Track-B blueprint, 5D observation, residual, and provenance."""
+        if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
+            return ()
+        if blueprint is None:
+            return ()
+        policy = live_plan.policy if live_plan is not None else {}
+        solver_backend_tier = str(policy.get("backend_tier", ""))
+        roofline = blueprint.roofline
+        blueprint_summary: dict[str, object] = {
+            "entry_name": blueprint.entry_name,
+            "ideal_roofline_us": float(roofline.ideal_roofline_us),
+            "compute_floor_us": float(roofline.compute_floor_us),
+            "memory_floor_us": float(roofline.memory_floor_us),
+            "dominant_bound": roofline.dominant_bound,
+            "anchor_dims": {str(k): int(v) for k, v in roofline.anchor_dims.items()},
+            "requested_anchor_dims": {
+                str(k): int(v) for k, v in roofline.requested_anchor_dims.items()
+            },
+            "resolved_hir_dims": {
+                str(k): int(v) for k, v in roofline.resolved_hir_dims.items()
+            },
+            "shape_exact_match": bool(roofline.shape_exact_match),
+            "fallback_reason": roofline.fallback_reason,
+        }
+        active_unlocked = active_mask.unlocked_facets()
+        evidence: list[dict[str, object]] = []
+        for chk in checks:
+            stage_a = chk.stage_a
+            ledger = stage_a.ledger if stage_a is not None else None
+            if ledger is None:
+                continue
+            l2_result = l2_results.get(chk.candidate_id)
+            local = (
+                l2_result.for_regime(regime_spec.regime_tag)
+                if l2_result is not None
+                else None
+            )
+            has_latency = local is not None and bool(local.anchors)
+            latency_us = local.mean_latency_us() if has_latency else 0.0
+            cand_sha = self._source_sha256(chk.patched_module_source)
+            telemetry: dict[str, object] = {
+                "dur_us": latency_us,
+                "roofline_eta": local.avg_roofline_eta if has_latency else 0.0,
+            }
+            msprof = self._msprof_cache.get((cand_sha, regime_spec.regime_tag))
+            if msprof:
+                telemetry.update(msprof)
+            else:
+                telemetry["measured_latency_us"] = latency_us
+                telemetry["is_analytical_proxy"] = True
+            compiler_summary = (
+                chk.stage_b.compiler_summary if chk.stage_b is not None else None
+            )
+            observation = ledger.to_observation_5d(
+                compiler_summary=compiler_summary,
+                telemetry=telemetry,
+            )
+            residual = observation.compute_axis_residuals()
+            unlocked = tuple(
+                facet
+                for facet in residual.unlock_causal_facets(active_mask).unlocked_facets()
+                if facet not in active_unlocked
+            )
+            route = stage_a.route if stage_a is not None else None
+            evidence.append(
+                {
+                    "round_idx": round_idx,
+                    "regime_tag": regime_spec.regime_tag,
+                    "candidate_id": chk.candidate_id,
+                    "candidate_sha256": cand_sha,
+                    "runtime_backend": regime_spec.runtime_backend,
+                    "backend_tier": "ascendc_template",
+                    "solver_backend_tier": solver_backend_tier,
+                    "track": (
+                        route.track
+                        if self._enable_track_router and route is not None
+                        else "unconstrained"
+                    ),
+                    "stage_a_backend_kind": stage_a.backend_kind,
+                    "l0_l1_passed": chk.passed,
+                    "l1_compiler_passed": bool(chk.stage_b.passed) if chk.stage_b else False,
+                    "l2_evaluated": l2_result is not None,
+                    "l2_all_passed": bool(l2_result.all_passed) if l2_result is not None else False,
+                    "latency_us": float(latency_us),
+                    "blueprint": dict(blueprint_summary),
+                    "observation": observation.to_dict(),
+                    "axis_residual": {
+                        "compute_issue_gap": residual.compute_issue_gap,
+                        "offchip_dma_gap": residual.offchip_dma_gap,
+                        "onchip_sram_reg_gap": residual.onchip_sram_reg_gap,
+                        "pipeline_sync_gap": residual.pipeline_sync_gap,
+                        "grid_wave_gap": residual.grid_wave_gap,
+                    },
+                    "dominant_axis": residual.dominant_axis,
+                    "unlocked_facets": list(unlocked),
+                    "active_unlocked_facets": list(active_unlocked),
+                    "field_provenance": {
+                        "has_l1_compiler_summary": observation.has_l1_compiler_summary,
+                        "has_l2_telemetry": observation.has_l2_telemetry,
+                        "measured_l2_fields": list(observation.measured_l2_fields),
+                        "latency_source": (
+                            "msprof_l2"
+                            if msprof
+                            else ("surrogate_l2" if has_latency else "none")
+                        ),
+                        "compiler_summary_source": (
+                            "bisheng_l1" if compiler_summary is not None else "absent"
+                        ),
+                    },
+                }
+            )
+        return tuple(evidence)
+
     async def _execute_single_round(
         self,
         *,
@@ -4327,6 +4519,11 @@ class PerfTargetCampaignRunner:
             if (selected_stone is not None and selected_stone.objective_score is not None)
             else local_best.surrogate_score
         )
+        parent_l1_summary = (
+            compiler_summary_from_residual(selected_stone.residual)
+            if selected_stone is not None
+            else None
+        )
         if cached_parent_msprof:
             telemetry_payload: dict[str, object] = {
                 "dur_us": parent_lat_us,
@@ -4336,7 +4533,11 @@ class PerfTargetCampaignRunner:
                 if k == "dur_us" and float(v) <= 0.0:
                     continue
                 telemetry_payload[k] = v
-            parent_residual = compute_static_dynamic_residual(parent_ledger, telemetry_payload)
+            parent_residual = compute_static_dynamic_residual(
+                parent_ledger,
+                telemetry_payload,
+                compiler_summary=parent_l1_summary,
+            )
         elif selected_stone is not None and (
             selected_stone.residual.measured_aiv_vec_ratio > 0.0
             or selected_stone.residual.measured_aic_mac_ratio > 0.0
@@ -4356,23 +4557,18 @@ class PerfTargetCampaignRunner:
                 "dur_us": parent_lat_us,
                 "roofline_eta": local_best.avg_roofline_eta,
             }
-            parent_residual = compute_static_dynamic_residual(parent_ledger, telemetry_payload)
+            parent_residual = compute_static_dynamic_residual(
+                parent_ledger,
+                telemetry_payload,
+                compiler_summary=parent_l1_summary,
+            )
         ctx = build_predicate_context(
             parent_ledger,
             features=parent_features,
             residual=parent_residual,
             extra={"topology_axes": parent_axes},
         )
-        parent_comp_summary = BishengResourceSummary(
-            spill_bytes=int(parent_residual.spill_bytes),
-            vloopv2_loops=1 if parent_residual.vloopv2_hit else 0,
-            software_loops=0 if parent_residual.vloopv2_hit else 1,
-            has_local_membar_in_vf_call=bool(parent_residual.has_local_membar_in_vf_call),
-            vf_fusion_breaks=int(parent_residual.vf_fusion_breaks),
-            alias_serialized_buffers=int(parent_residual.alias_serialized_buffers),
-            dual_issue_ipc_collapse=float(parent_residual.dual_issue_ipc_collapse),
-            dcache_dcci_flushes=int(parent_residual.dcache_dcci_flushes),
-        )
+        parent_comp_summary = compiler_summary_from_residual(parent_residual)
         parent_waterlines = getattr(parent_ledger, "waterlines", {}) or {}
         l1_wl = parent_waterlines.get("L1")
         ub_wl = parent_waterlines.get("UB")
@@ -4415,12 +4611,19 @@ class PerfTargetCampaignRunner:
                 ub_overflow=ub_overflow,
             )
             self._freedom_masks[regime_spec.regime_tag] = active_mask
-            if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb"):
+            if normalize_runtime_backend(regime_spec.runtime_backend) in (
+                "ascendc_trackb",
+                "hybrid_trackb",
+            ):
                 current_tier = "ascendc_template"
             else:
-                current_tier = str(live_plan.policy.get("backend_tier", "tilelang_dsl"))
-            if current_tier not in ("tilelang_dsl", "inline_ascendc_vf", "ascendc_template"):
-                current_tier = "tilelang_dsl"
+                current_tier = normalize_runtime_backend(
+                    str(live_plan.policy.get("backend_tier", "tilelang_dsl"))
+                )
+                if current_tier not in ("tilelang_dsl", "ascendc_trackb", "hybrid_trackb"):
+                    current_tier = "tilelang_dsl"
+                elif current_tier in ("ascendc_trackb", "hybrid_trackb"):
+                    current_tier = "ascendc_template"
             sf_ctx = (
                 parent_features.to_dict()
                 if hasattr(parent_features, "to_dict")
@@ -4430,6 +4633,13 @@ class PerfTargetCampaignRunner:
             sf_ctx["ub_overflow"] = ub_overflow
             sf_ctx["freedom_mask"] = active_mask
             sf_ctx.setdefault("uses_cube", parent_axes.uses_cube)
+            case_ratios = regime_spec.representative_case_ratios
+            if case_ratios is not None:
+                sf_ctx["representative_case_id"] = case_ratios.case_id
+                sf_ctx["phi_7"] = case_ratios.inner_contiguous_bytes
+                sf_ctx["inner_contiguous_bytes"] = case_ratios.inner_contiguous_bytes
+                sf_ctx["phi_8"] = case_ratios.wave_occupancy_ratio
+                sf_ctx["persistent_wave_occupancy"] = case_ratios.wave_occupancy_ratio
             escalation_decision = evaluate_track_escalation(
                 current_tier=current_tier,
                 roofline_eta=float(local_best.avg_roofline_eta),
@@ -5151,6 +5361,15 @@ class PerfTargetCampaignRunner:
                     except (OSError, ValueError) as exc:
                         logger.debug("Persisting promoted rule %s skipped: %s", rid, exc)
 
+        trackb_evidence = self._collect_trackb_round_evidence(
+            round_idx=round_idx,
+            regime_spec=regime_spec,
+            blueprint=blueprint,
+            live_plan=live_plan,
+            active_mask=active_mask,
+            checks=l0_l1_checks,
+            l2_results=l2_results,
+        )
         record = CampaignRoundRecord(
             round_idx=round_idx,
             regime_tag=regime_spec.regime_tag,
@@ -5169,6 +5388,7 @@ class PerfTargetCampaignRunner:
             best_so_far_surrogate_score=new_best.surrogate_score,
             pruned_rule_ids=pruned_rules,
             promotion_attempts=promotion_attempts,
+            trackb_evidence=trackb_evidence,
         )
         return (
             record,
@@ -5641,6 +5861,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable tile-size prescreen guidance table in creative prompts.",
     )
+    parser.add_argument(
+        "--cost-prescreen-top-k",
+        type=int,
+        default=None,
+        help="Keep only the top-K cost-model candidates during creative prescreen.",
+    )
     return parser
 
 
@@ -5658,6 +5884,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         device_id=str(args.device_id),
         retry_device_id=str(args.retry_device_id),
         enable_tilesize_prescreen=bool(args.enable_tilesize_prescreen),
+        cost_prescreen_top_k=(
+            int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
+        ),
     )
     tracker = BayesianRuleTracker.from_seed_yaml()
     flywheel = FlywheelDistiller(

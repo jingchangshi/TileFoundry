@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from tilefoundry.ir.core.expr import Call, Constant, Expr
 from tilefoundry.ir.core.expr import Tuple as IrTuple
@@ -30,7 +30,11 @@ from tilefoundry.ir.types.utils import static_dim_value
 from tilefoundry_ascend.ascend.ir.execution import SIMDVF_KIND, SIMTVF_KIND
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
-from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask, TopologyAxes
+from tilefoundry_ascend.ascend.sil.schema import (
+    CasePhysicsRatios,
+    ConstraintRelaxationMask,
+    TopologyAxes,
+)
 from tilefoundry_ascend.ascend.target import AscendTarget
 
 VALID_QUANT_GRANULARITIES = (
@@ -51,6 +55,28 @@ VALID_TRACKS = ("developer", "simt_vf", "manual_ssbuf")
 VALID_BACKEND_TIERS = ("tilelang_dsl", "ascendc_template")
 
 VALID_ESCALATION_TIERS = ("tilelang_dsl", "inline_ascendc_vf", "ascendc_template")
+
+_ROUTER_TIER_ALIASES: dict[str, str] = {
+    "tilelang_dsl": "tilelang_dsl",
+    "cce_cpp20": "ascendc_template",
+    "cce_trackb": "ascendc_template",
+    "hybrid_trackb": "ascendc_template",
+    "tl_templates_cpp20": "ascendc_template",
+    "ascendc_trackb": "ascendc_template",
+    "ascendc_template": "ascendc_template",
+    "inline_cce_vf": "inline_ascendc_vf",
+    "inline_ascendc_vf": "inline_ascendc_vf",
+}
+
+
+def normalize_router_tier(value: str) -> str:
+    """Normalize a canonical dialect id or legacy alias to the router's internal tier id."""
+    normalized = _ROUTER_TIER_ALIASES.get(str(value).strip().lower())
+    if normalized is None:
+        raise ValueError(
+            f"unsupported router tier {value!r}; expected one of {tuple(_ROUTER_TIER_ALIASES)}"
+        )
+    return normalized
 
 _SUBBYTE_DTYPE_TOKENS: tuple[str, ...] = (
     "float4",
@@ -167,6 +193,30 @@ class StructuralFeatures:
             ),
         )
 
+    @classmethod
+    def from_case_ratios(
+        cls,
+        ratios: CasePhysicsRatios,
+        *,
+        static_affine_bounds: bool,
+        cube_to_vector_ratio: float,
+        quant_granularity: str,
+        indirect_sparse_gather: bool,
+        cross_iter_recurrence: str,
+        dynamic_cross_core_handoff: bool,
+    ) -> StructuralFeatures:
+        """Project real per-case physics ratios into the compatibility phi_1..phi_8 view."""
+        return cls(
+            phi_1_static_affine_bounds=static_affine_bounds,
+            phi_2_cube_to_vector_ratio=cube_to_vector_ratio,
+            phi_3_quant_granularity=quant_granularity,
+            phi_4_indirect_sparse_gather=indirect_sparse_gather,
+            phi_5_cross_iter_recurrence=cross_iter_recurrence,
+            phi_6_dynamic_cross_core_handoff=dynamic_cross_core_handoff,
+            phi_7_inner_contiguous_bytes=ratios.inner_contiguous_bytes,
+            phi_8_persistent_wave_occupancy=ratios.wave_occupancy_ratio,
+        )
+
 
 @dataclass(frozen=True)
 class RouteDecision:
@@ -188,10 +238,12 @@ class RouteDecision:
             raise TypeError(
                 f"RouteDecision.topology_axes must be TopologyAxes, got {type(self.topology_axes).__name__}"
             )
-        if self.recommended_backend_tier not in VALID_BACKEND_TIERS:
+        normalized_tier = normalize_router_tier(self.recommended_backend_tier)
+        if normalized_tier not in VALID_BACKEND_TIERS:
             raise ValueError(
                 f"unsupported backend tier {self.recommended_backend_tier!r}"
             )
+        object.__setattr__(self, "recommended_backend_tier", normalized_tier)
 
 
 @dataclass(frozen=True)
@@ -206,10 +258,14 @@ class EscalationDecision:
     suggested_primitives: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.from_tier not in VALID_ESCALATION_TIERS:
+        normalized_from = normalize_router_tier(self.from_tier)
+        normalized_to = normalize_router_tier(self.to_tier)
+        if normalized_from not in VALID_ESCALATION_TIERS:
             raise ValueError(f"unsupported from_tier {self.from_tier!r}")
-        if self.to_tier not in VALID_ESCALATION_TIERS:
+        if normalized_to not in VALID_ESCALATION_TIERS:
             raise ValueError(f"unsupported to_tier {self.to_tier!r}")
+        object.__setattr__(self, "from_tier", normalized_from)
+        object.__setattr__(self, "to_tier", normalized_to)
         if isinstance(self.freedom_mask, Mapping):
             object.__setattr__(
                 self, "freedom_mask", ConstraintRelaxationMask.from_dict(self.freedom_mask)
@@ -1100,7 +1156,11 @@ def _extract_op_name_and_dtypes(proto_or_advisory: Mapping[str, object]) -> tupl
     return op_name, dtypes, desc_text
 
 
-def route_from_op_spec(proto_or_advisory: Mapping[str, object]) -> RouteDecision:
+def route_from_op_spec(
+    proto_or_advisory: Mapping[str, object],
+    *,
+    case_ratios: CasePhysicsRatios | None = None,
+) -> RouteDecision:
     """Route a cann-bench proto.yaml or AdvisoryEnvelope dict to 3-axis TopologyAxes & 3 tracks."""
     _op_name, dtypes, desc_text = _extract_op_name_and_dtypes(proto_or_advisory)
     raw_axes = proto_or_advisory.get("topology_axes")
@@ -1161,11 +1221,15 @@ def route_from_op_spec(proto_or_advisory: Mapping[str, object]) -> RouteDecision
             ),
             phi_6_dynamic_cross_core_handoff=axes.memory_ring
             in ("l0c_ub_epilogue", "bidirectional_cv_ring"),
-            phi_7_inner_contiguous_bytes=int(proto_or_advisory.get("inner_contiguous_bytes", 128)),
-            phi_8_persistent_wave_occupancy=float(proto_or_advisory.get("wave_occupancy", 1.0)),
+            phi_7_inner_contiguous_bytes=int(
+                proto_or_advisory.get("inner_contiguous_bytes", 0)
+            ),
+            phi_8_persistent_wave_occupancy=float(
+                proto_or_advisory.get("wave_occupancy", 0.0)
+            ),
         )
     decision = route_execution_track(base_features)
-    return RouteDecision(
+    routed = RouteDecision(
         track=decision.track,
         features=base_features,
         rationale=(f"structural op_spec route -> {axes.key()}",),
@@ -1173,6 +1237,9 @@ def route_from_op_spec(proto_or_advisory: Mapping[str, object]) -> RouteDecision
         topology_axes=axes,
         recommended_backend_tier=_backend_tier_for_axes(axes, base_features),
     )
+    if case_ratios is None:
+        return routed
+    return apply_case_ratios(routed, case_ratios)
 
 
 def _is_subbyte_dtype(dtype_str: str) -> bool:
@@ -1184,6 +1251,8 @@ def _is_subbyte_dtype(dtype_str: str) -> bool:
 
 def route_initial_by_input_contract(
     features_or_spec: StructuralFeatures | Mapping[str, object] | object,
+    *,
+    case_ratios: CasePhysicsRatios | None = None,
 ) -> RouteDecision:
     """Causal t=0 router: escalate to ascendc_template ONLY for DSL-unrepresentable input contracts.
 
@@ -1201,10 +1270,20 @@ def route_initial_by_input_contract(
         features = features_or_spec
         if features.phi_3_quant_granularity == "mixed_fp8_fp4":
             subbyte_reasons.append("input_contract: sub-byte FP4 mixed_fp8_fp4 dtype")
+        if case_ratios is not None:
+            features = _project_ratio_features(features, case_ratios)
         decision = route_execution_track(features)
-        axes = decision.topology_axes
+        axes = (
+            case_ratios.effective_axes(decision.topology_axes)
+            if case_ratios is not None
+            else decision.topology_axes
+        )
         track = decision.track
-        prims = decision.recommended_primitives
+        prims = (
+            _primitives_for_axes(axes)
+            if case_ratios is not None
+            else decision.recommended_primitives
+        )
     else:
         if isinstance(features_or_spec, Mapping):
             spec_map: Mapping[str, object] = features_or_spec
@@ -1318,10 +1397,12 @@ def route_initial_by_input_contract(
                 phi_6_dynamic_cross_core_handoff=bool(
                     spec_map.get("has_dead_l1_slice", False)
                 ),
-                phi_7_inner_contiguous_bytes=int(spec_map.get("inner_contiguous_bytes", 128)),
-                phi_8_persistent_wave_occupancy=float(spec_map.get("wave_occupancy", 1.0)),
+                phi_7_inner_contiguous_bytes=int(spec_map.get("inner_contiguous_bytes", 0)),
+                phi_8_persistent_wave_occupancy=float(spec_map.get("wave_occupancy", 0.0)),
             )
 
+        if case_ratios is not None:
+            features = _project_ratio_features(features, case_ratios)
         if isinstance(raw_axes, TopologyAxes):
             axes = raw_axes
         elif isinstance(raw_axes, Mapping) and all(
@@ -1330,6 +1411,8 @@ def route_initial_by_input_contract(
             axes = TopologyAxes.from_dict(raw_axes)
         else:
             axes = resolve_canonical_topology_axes(spec_map, features=features)
+        if case_ratios is not None:
+            axes = case_ratios.effective_axes(axes)
         if opcode_reasons and axes.iteration_regularity != "dynamic_opcode_stream":
             axes = TopologyAxes(
                 compute_engine=axes.compute_engine,
@@ -1360,6 +1443,41 @@ def route_initial_by_input_contract(
     )
 
 
+def _project_ratio_features(
+    features: StructuralFeatures,
+    ratios: CasePhysicsRatios,
+) -> StructuralFeatures:
+    return replace(
+        features,
+        phi_7_inner_contiguous_bytes=ratios.inner_contiguous_bytes,
+        phi_8_persistent_wave_occupancy=ratios.wave_occupancy_ratio,
+    )
+
+
+def apply_case_ratios(
+    decision: RouteDecision,
+    ratios: CasePhysicsRatios,
+) -> RouteDecision:
+    """Project real per-case physics ratios onto a route's compatibility feature view."""
+    features = _project_ratio_features(decision.features, ratios)
+    axes = ratios.effective_axes(decision.topology_axes)
+    backend_tier = _backend_tier_for_axes(axes, features)
+    if decision.recommended_backend_tier == "ascendc_template":
+        backend_tier = "ascendc_template"
+    return RouteDecision(
+        track=route_execution_track(features).track,
+        features=features,
+        rationale=(
+            *decision.rationale,
+            f"case ratios phi_7={ratios.inner_contiguous_bytes}B "
+            f"phi_8={ratios.wave_occupancy_ratio:.3f} -> {axes.key()}",
+        ),
+        recommended_primitives=_primitives_for_axes(axes),
+        topology_axes=axes,
+        recommended_backend_tier=backend_tier,
+    )
+
+
 def evaluate_track_escalation(
     *,
     current_tier: str,
@@ -1371,7 +1489,7 @@ def evaluate_track_escalation(
     structural_features: StructuralFeatures | Mapping[str, object] | None = None,
 ) -> EscalationDecision:
     """Closed-loop t>0 escalation from tilelang_dsl -> inline_ascendc_vf or ascendc_template."""
-    tier = str(current_tier).strip().lower()
+    tier = normalize_router_tier(current_tier)
     if tier not in VALID_ESCALATION_TIERS:
         raise ValueError(f"Unsupported current_tier {current_tier!r}; expected one of {VALID_ESCALATION_TIERS}")
 
@@ -1586,8 +1704,10 @@ __all__ = [
     "VALID_QUANT_GRANULARITIES",
     "VALID_RECURRENCES",
     "VALID_TRACKS",
+    "apply_case_ratios",
     "extract_structural_features",
     "evaluate_track_escalation",
+    "normalize_router_tier",
     "resolve_canonical_topology_axes",
     "route_execution_track",
     "route_from_op_spec",

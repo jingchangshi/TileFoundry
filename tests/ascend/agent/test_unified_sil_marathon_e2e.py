@@ -164,9 +164,12 @@ def test_all_10_implemented_ops_resolve_metadata_and_regime_selectors() -> None:
         assert get_operator_entrypoint(op_name) == op_name
 
         anchors = get_default_anchors(op_name)
-        assert 4 <= len(anchors) <= 5
         regime_specs = get_default_regime_specs(op_name)
         assert regime_specs
+        assert 4 <= len(anchors) <= 6
+        assert {anchor.regime_tag for anchor in anchors} >= {
+            regime.regime_tag for regime in regime_specs
+        }
 
         if op_name not in ("attention_residual", "mla"):
             resolved = resolve_regime_config(

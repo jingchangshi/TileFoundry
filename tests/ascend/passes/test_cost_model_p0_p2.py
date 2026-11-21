@@ -356,6 +356,7 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
                 builder_candidates=("kernel",),
                 sample_builder_kwargs={"m_dim": 64},
                 editable_symbols=("kernel",),
+                representative_hir_dims={"total_elements": 32768, "M": 64, "D": 512},
                 representative_anchor_dims={"M": 64},
             ),
         ),

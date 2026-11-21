@@ -512,6 +512,7 @@ def test_fp1_physical_ledger_from_dict_roundtrip() -> None:
 def test_symbolic_grid_var_bindings_and_r13_guard(tmp_path: pathlib.Path) -> None:
     """Verify symbolic grid resolution via var_bindings and R13 guard on unbound grids."""
     import importlib.util  # noqa: PLC0415
+
     from tilefoundry_ascend.agent.kb import (  # noqa: PLC0415
         build_predicate_context,
         load_seed_rules,
@@ -725,6 +726,7 @@ def test_dav3510_calibrated_cycles_bank_conflicts_and_dynamic_pipelined_fallback
 ) -> None:
     """Verify dav-3510 Cube/Vector cycles, bank conflicts, var_bindings, and analytical II."""
     import importlib.util  # noqa: PLC0415
+
     import tilelang.ascend.language as T  # noqa: PLC0415
     from tilelang.utils.language import DataType as TLDataType  # noqa: PLC0415
     from tvm import tirx  # noqa: PLC0415

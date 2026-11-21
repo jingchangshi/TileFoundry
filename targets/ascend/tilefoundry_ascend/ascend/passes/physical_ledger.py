@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-import json
+
+from tilefoundry_ascend.ascend.passes.observation_space import (
+    CompilerSummaryLike,
+    ObservationVector5D,
+)
 
 
 @dataclass(frozen=True)
@@ -100,6 +105,19 @@ class ObjectivePhysicalLedger:
     def max_overflow_bytes(self) -> int:
         """Return the maximum byte overflow across all tracked memory scopes."""
         return max((wl.overflow_bytes for wl in self.waterlines.values()), default=0)
+
+    def to_observation_5d(
+        self,
+        *,
+        compiler_summary: CompilerSummaryLike | None = None,
+        telemetry: Mapping[str, object] | None = None,
+    ) -> ObservationVector5D:
+        """Project this L0 ledger plus L1/L2 telemetry onto the 5-axis observation space."""
+        return ObservationVector5D.from_tiers(
+            self,
+            compiler_summary=compiler_summary,
+            telemetry=telemetry,
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable dictionary representation."""

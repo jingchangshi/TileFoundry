@@ -22,15 +22,15 @@ from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
     _cube_macs_for_dtype,
     evaluate_cost_model_ranking,
 )
-from tilefoundry_ascend.ascend.sil.op_analyzer import (
-    _DTYPE_BYTES,
-    OpAdvisoryExtractor,
-    _flatten_shapes,
-    _flatten_strs,
-    _has_unaligned_tail_for_case,
-    _shape_numel,
+from tilefoundry_ascend.ascend.sil.op_analyzer import OpAdvisoryExtractor
+from tilefoundry_ascend.ascend.sil.schema import (
+    DTYPE_BYTES,
+    TopologyAxes,
+    flatten_int_shapes,
+    flatten_str_values,
+    has_unaligned_tail_for_case,
+    shape_numel,
 )
-from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
 _CASE_NUM_RE = re.compile(r"_(\d+)$")
@@ -293,19 +293,19 @@ def _build_static_case_features(
         op_adv, case_map = advisory_cache[rel_path]
 
     case_entry = case_map.get(case_num, {})
-    shapes = _flatten_shapes(case_entry.get("input_shape")) if case_entry else []
-    dtypes = list(_flatten_strs(case_entry.get("dtype"))) if case_entry else []
+    shapes = flatten_int_shapes(case_entry.get("input_shape")) if case_entry else ()
+    dtypes = list(flatten_str_values(case_entry.get("dtype"))) if case_entry else []
     if not dtypes and op_adv is not None:
         dtypes = list(op_adv.input_dtypes)
 
     raw_dtype = dtypes[0] if dtypes else "float16"
     cube_dtype = _normalize_cube_dtype(raw_dtype)
-    elem_bytes = float(_DTYPE_BYTES.get(raw_dtype, 2.0))
+    elem_bytes = float(DTYPE_BYTES.get(raw_dtype, 2.0))
 
     input_bytes = 0.0
     for idx, shp in enumerate(shapes):
         dt = dtypes[idx] if idx < len(dtypes) else raw_dtype
-        input_bytes += float(_shape_numel(shp)) * float(_DTYPE_BYTES.get(dt, elem_bytes))
+        input_bytes += float(shape_numel(shp)) * float(DTYPE_BYTES.get(dt, elem_bytes))
 
     if op_adv is None:
         raise ValueError(
@@ -315,7 +315,7 @@ def _build_static_case_features(
     uses_cube = axes.compute_engine in ("aic_only", "coupled_1c2v")
     is_coupled = axes.compute_engine == "coupled_1c2v"
     dom_bound = str(op_adv.roofline.get("dominant_bound", "memory_bandwidth"))
-    unaligned_tail = _has_unaligned_tail_for_case(shapes, dtypes, uses_cube) if shapes else False
+    unaligned_tail = has_unaligned_tail_for_case(shapes, dtypes, uses_cube) if shapes else False
 
     if shapes and shapes[0]:
         inner_dim = int(shapes[0][-1] or 1)

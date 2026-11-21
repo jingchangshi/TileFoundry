@@ -61,7 +61,7 @@ _BACKTEST_EXPORTS = frozenset(
 
 def __getattr__(name: str) -> object:
     if name in _BACKTEST_EXPORTS:
-        from tilefoundry_ascend.ascend.cost_model import calibration_backtest
+        from tilefoundry_ascend.ascend.cost_model import calibration_backtest  # noqa: PLC0415
 
         return getattr(calibration_backtest, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

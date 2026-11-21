@@ -9,6 +9,14 @@ from pathlib import Path
 import pytest
 import torch
 
+from examples.ascend950pr_ops.add_rms_norm_dynamic_quant import kernel as armdq_kernel
+from examples.ascend950pr_ops.gqa import kernel as gqa_kernel
+from examples.ascend950pr_ops.kimi_delta_attention import kernel as kda_kernel
+from examples.ascend950pr_ops.mhc_sinkhorn import kernel as sinkhorn_kernel
+from examples.ascend950pr_ops.rms_norm import kernel as rms_norm_kernel
+from examples.ascend950pr_ops.softmax import kernel as softmax_kernel
+from examples.ascend950pr_ops.swi_glu import kernel as swi_glu_kernel
+from examples.ascend950pr_ops.tensor_program_vm import kernel as vm_kernel
 from tilefoundry_ascend.ascend.schedule.envelope_inspector import (
     inspect_tilelang_primfunc,
 )
@@ -27,6 +35,7 @@ from tilefoundry_ascend.ascend.templates import (
     normalize_schedule_policy,
     render_template,
 )
+
 
 def _resolve_cannbench_tasks_root() -> Path:
     env_repo = os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
@@ -218,8 +227,6 @@ def test_operator_prim_funcs_lower_cleanly_stage_a(op_module, cfg_name, builder_
 
 
 def test_swi_glu_parity_with_golden():
-    from examples.ascend950pr_ops.swi_glu import kernel as swi_glu_kernel
-
     golden = _load_golden("level1", "swi_glu")
     for shape, dtype, dim in [
         ((16, 2048), torch.float16, -1),
@@ -233,7 +240,6 @@ def test_swi_glu_parity_with_golden():
         assert out.dtype == ref.dtype and out.shape == ref.shape
         torch.testing.assert_close(out.float(), ref.float(), rtol=1e-3, atol=1e-3)
 
-    # inf and nan edge cases
     x_inf = torch.tensor([[float("inf"), float("-inf")], [float("-inf"), 2.0]], dtype=torch.bfloat16)
     torch.testing.assert_close(swi_glu_kernel(x_inf), golden(x_inf), equal_nan=True)
     x_nan = torch.full((4, 8), float("nan"), dtype=torch.float32)
@@ -241,8 +247,6 @@ def test_swi_glu_parity_with_golden():
 
 
 def test_rms_norm_parity_with_golden():
-    from examples.ascend950pr_ops.rms_norm import kernel as rms_norm_kernel
-
     golden = _load_golden("level2", "rms_norm")
     for shape, dtype, eps in [
         ((4, 17, 769), torch.float16, 1e-6),
@@ -258,8 +262,6 @@ def test_rms_norm_parity_with_golden():
 
 
 def test_softmax_parity_with_golden():
-    from examples.ascend950pr_ops.softmax import kernel as softmax_kernel
-
     golden = _load_golden("level2", "softmax")
     for shape, dtype, dim in [
         ((17, 1009), torch.float16, -1),
@@ -277,10 +279,6 @@ def test_softmax_parity_with_golden():
 
 
 def test_add_rms_norm_dynamic_quant_parity_with_golden():
-    from examples.ascend950pr_ops.add_rms_norm_dynamic_quant import (
-        kernel as armdq_kernel,
-    )
-
     golden = _load_golden("level3", "add_rms_norm_dynamic_quant")
     for shape, dtype, eps in [
         ((17, 2053), torch.float16, 1e-5),
@@ -300,8 +298,6 @@ def test_add_rms_norm_dynamic_quant_parity_with_golden():
 
 
 def test_mhc_sinkhorn_parity_with_golden():
-    from examples.ascend950pr_ops.mhc_sinkhorn import kernel as sinkhorn_kernel
-
     golden = _load_golden("level3", "mhc_sinkhorn")
     for b, hc, steps, eps in [(8, 4, 20, 1e-6), (13, 3, 5, 1e-7), (4, 16, 1, 1e-8)]:
         comb = torch.randn(b, hc, hc, dtype=torch.float32)
@@ -312,8 +308,6 @@ def test_mhc_sinkhorn_parity_with_golden():
 
 
 def test_gqa_parity_with_golden():
-    from examples.ascend950pr_ops.gqa import kernel as gqa_kernel
-
     golden = _load_golden("level4", "gqa")
     for (b, s, s_kv, n_q, n_kv, d), dtype, causal, scale in [
         ((2, 16, 16, 8, 2, 64), torch.float16, True, -1.0),
@@ -330,8 +324,6 @@ def test_gqa_parity_with_golden():
 
 
 def test_kimi_delta_attention_parity_with_golden():
-    from examples.ascend950pr_ops.kimi_delta_attention import kernel as kda_kernel
-
     golden = _load_golden("level5", "kimi_delta_attention")
     for (b, t, h, dk, dv), dtype, l2norm, scale in [
         ((1, 17, 3, 33, 31), torch.float32, True, -1.0),
@@ -348,7 +340,6 @@ def test_kimi_delta_attention_parity_with_golden():
 
         ref_y, ref_s = golden(q, k, v, g, beta, init_state, use_qk_l2norm=l2norm, scaleValue=scale)
         out_y, out_s = kda_kernel(q, k, v, g, beta, init_state, use_qk_l2norm=l2norm, scaleValue=scale)
-        # initial_state must not be modified in place
         torch.testing.assert_close(init_state, init_copy)
         assert out_y.dtype == ref_y.dtype and out_s.dtype == ref_s.dtype
         torch.testing.assert_close(out_y.float(), ref_y.float(), rtol=2e-2, atol=2e-2)
@@ -356,8 +347,6 @@ def test_kimi_delta_attention_parity_with_golden():
 
 
 def test_tensor_program_vm_parity_with_golden():
-    from examples.ascend950pr_ops.tensor_program_vm import kernel as vm_kernel
-
     golden = _load_golden("level5", "tensor_program_vm")
     for p_len, r_cnt, w_dim, dtype in [
         (64, 8, 17, torch.float32),

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from tilefoundry_ascend.agent.kb import AscendCausalRule, BayesianRuleTracker
 from tilefoundry_ascend.agent.router import (
     ASCEND_DEVKIT_ISA_CATALOG,
@@ -22,8 +20,8 @@ from tilefoundry_ascend.ascend.sil import (
     HardwareLegalityBounds,
     OpAdvisoryExtractor,
     RegimeSlice,
-    SILVerifier,
     SchedulePolicy,
+    SILVerifier,
     TopologyAxes,
     synthesize_default_policy,
     verify_policy_envelope,
@@ -36,7 +34,10 @@ from tilefoundry_ascend.ascend.templates import (
 
 
 def test_compute_critical_cube_tile_m_and_fp32_regime_sizing() -> None:
-    """Verify exact Roofline waterline formula across FP16/BF16/FP8/INT8/FP4/FP32 and solver integration."""
+    """Verify the exact Roofline waterline formula across dtypes.
+
+    Covers FP16/BF16/FP8/INT8/FP4/FP32 and solver integration.
+    """
     facts = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
 
     for dt in ("f16", "float16", "bf16", "bfloat16"):
@@ -56,7 +57,6 @@ def test_compute_critical_cube_tile_m_and_fp32_regime_sizing() -> None:
     gemm_axes = TopologyAxes("aic_only", "gm_l1_l0_fixpipe", "affine_simd")
     cv_axes = TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "affine_simd")
 
-    # FP32 small-M Cube-bound regime must NOT over-tile to 96
     reg_small = RegimeSlice(
         regime_tag="fp32_small_m",
         case_nums=(1,),
@@ -89,7 +89,6 @@ def test_compute_critical_cube_tile_m_and_fp32_regime_sizing() -> None:
     )
     assert fp32_m16.policy["tile_mnk"][0] == 16
 
-    # FP16/BF16/FP8/INT8 preserve 82 -> 96/128
     for dt in ("f16", "bf16", "fp8e4m3", "i8"):
         reg_m64 = RegimeSlice(
             regime_tag=f"{dt}_m64",
@@ -109,7 +108,10 @@ def test_compute_critical_cube_tile_m_and_fp32_regime_sizing() -> None:
 
 
 def test_end_to_end_topology_axes_extractor_verifier_and_bayesian_transfer() -> None:
-    """Verify TopologyAxes on OpAdvisoryExtractor/SchedulePolicy, SILVerifier cross-axis rules, and zero-shot Bayesian transfer."""
+    """Verify topology axes across extractor, policy, verifier, and tracker.
+
+    Covers SILVerifier cross-axis rules and zero-shot Bayesian transfer.
+    """
     if DEFAULT_OPS_ROOT.exists():
         extractor = OpAdvisoryExtractor(DEFAULT_OPS_ROOT)
         for op_name in ("gqa", "grouped_matmul", "kimi_delta_attention", "mhc_sinkhorn", "sparse_flash_attention"):
@@ -134,7 +136,6 @@ def test_end_to_end_topology_axes_extractor_verifier_and_bayesian_transfer() -> 
             iteration_regularity="affine_simd",
         )
 
-    # SILVerifier axis-level & cross-axis coupling checks
     verifier = SILVerifier()
     reg = RegimeSlice(
         regime_tag="main",
@@ -143,7 +144,6 @@ def test_end_to_end_topology_axes_extractor_verifier_and_bayesian_transfer() -> 
         has_unaligned_tail=True,
     )
 
-    # 1. coupled_1c2v enforces max_crosscore_depth even without legacy sync_mode
     coupled_axes = TopologyAxes("coupled_1c2v", "persistent_onchip_state", "affine_simd")
     adv_coupled = AdvisoryEnvelope(
         op_name="coupled_test",
@@ -169,7 +169,6 @@ def test_end_to_end_topology_axes_extractor_verifier_and_bayesian_transfer() -> 
     assert rep_depth.passed is False
     assert any("max_crosscore_depth=15" in e for e in rep_depth.errors)
 
-    # 2. ragged_group enforces ensure_empty_subblock_sync even when cv_datapath == "none"
     ragged_axes = TopologyAxes("coupled_1c2v", "l0c_ub_epilogue", "ragged_group")
     rep_ragged = verifier.verify_policy(
         SchedulePolicy(
@@ -184,7 +183,6 @@ def test_end_to_end_topology_axes_extractor_verifier_and_bayesian_transfer() -> 
     assert rep_ragged.passed is False
     assert any("ragged_group" in e for e in rep_ragged.errors)
 
-    # 3. Cross-axis coupling: coupled_1c2v + irregular_simt enforces 216KB ub_simtvf_bytes cap
     coupled_simt_axes = TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "irregular_simt")
     adv_cs = AdvisoryEnvelope(
         op_name="coupled_simt_test",
@@ -203,7 +201,7 @@ def test_end_to_end_topology_axes_extractor_verifier_and_bayesian_transfer() -> 
             topology_axes=coupled_simt_axes,
             vector_mode="simdvf",
             ub_256kb_unlock=False,
-            ub_estimated_bytes=240000,  # > 221184 ub_simtvf_bytes, though <= 253952 simdvf
+            ub_estimated_bytes=240000,
         ),
         adv_cs,
         regime=reg,
@@ -238,7 +236,6 @@ def test_end_to_end_topology_axes_extractor_verifier_and_bayesian_transfer() -> 
     )
     assert rep_ub_ok.passed is True, rep_ub_ok.errors
 
-    # BayesianRuleTracker: factorized axis posteriors + zero-shot transfer to unseen hybrid TopologyAxes
     r_ragged = AscendCausalRule(
         rule_id="R_TEST_RAGGED",
         regime_guard="True",
@@ -312,7 +309,6 @@ def test_end_to_end_topology_axes_extractor_verifier_and_bayesian_transfer() -> 
     assert "ir:ragged_group" in tracker.axis_posteriors
     assert "mr:persistent_onchip_state" in tracker.axis_posteriors
 
-    # Zero-shot transfer to unseen hybrid axes
     hybrid_axes = TopologyAxes(
         compute_engine="coupled_1c2v",
         memory_ring="persistent_onchip_state",
@@ -327,12 +323,10 @@ def test_end_to_end_topology_axes_extractor_verifier_and_bayesian_transfer() -> 
     assert ranked_ids.index("R_TEST_NEUTRAL") > 1
     assert ranked_ids[-1] == "R_TEST_BAD"
 
-    # Serialization roundtrip preserves axis_posteriors
     restored = BayesianRuleTracker.from_rules([r_ragged, r_persist, r_neutral, r_bad])
     restored.load_posteriors_dict(tracker.to_dict())
     assert [r.rule_id for r in restored.rank_applicable_rules({}, topology_axes=hybrid_axes)] == ranked_ids
 
-    # Passing topology_axes=None reads cold global priors
     ranked_no_axes = tracker.rank_applicable_rules({})
     assert len(ranked_no_axes) == 4
 
@@ -358,7 +352,6 @@ def test_orthogonal_7_hardware_pipes_taxonomy_and_gap_scanner() -> None:
     for pipe in VALID_HARDWARE_PIPES:
         assert pipe_report.pipes[pipe].total_capabilities >= 1
 
-    # Verify newly covered missing-pipe primitives appear in their exact pipes
     assert "mte1_load_2d_3d" in (
         pipe_report.pipes["pipe_mte1_l1_to_l0"].supported_primitives
         + pipe_report.pipes["pipe_mte1_l1_to_l0"].missing_primitives
@@ -393,7 +386,10 @@ def test_orthogonal_7_hardware_pipes_taxonomy_and_gap_scanner() -> None:
 
 
 def test_mece_7_facet_source_verification_and_cfg_flag_symmetry_gate() -> None:
-    """Verify MECE 7-facet lattice source safety (bottom -> top) and static CFG flag-symmetry verification."""
+    """Verify MECE 7-facet lattice source safety and CFG flag symmetry.
+
+    The lattice is checked from bottom to top.
+    """
     m_bot = ConstraintRelaxationMask.bottom()
     m_dma = m_bot.unlock("dma_and_cache_hierarchy")
     m_sync = m_bot.unlock("pipeline_and_sync_graph")
@@ -444,7 +440,6 @@ def test_mece_7_facet_source_verification_and_cfg_flag_symmetry_gate() -> None:
         ).passed
         is True
     )
-    # top() unlocks ALL syntax facets; balanced CrossCore + aliasing + Nd2Nz pass
     assert (
         verify_source_against_facets(
             "STAGE_DMA_LOAD(a, b); l1_slot_aliasing(p, k); Nd2NzParams p; CrossCoreSetFlag<0x2, PIPE_FIX>(0); CrossCoreWaitFlag(0);",
@@ -453,7 +448,6 @@ def test_mece_7_facet_source_verification_and_cfg_flag_symmetry_gate() -> None:
         is True
     )
 
-    # Static CFG branch-balance hardware invariants ALWAYS enforced even at top()!
     balanced_early_skip = """
     void KernelFn(int m) {
         for (int g = 0; g < 4; ++g) {
@@ -481,7 +475,6 @@ def test_mece_7_facet_source_verification_and_cfg_flag_symmetry_gate() -> None:
     """
     assert verify_source_against_facets(balanced_if_else, m_top).passed is True
 
-    # Global count == 1 Set + 1 Wait, but asymmetric across branches -> MUST FAIL
     unbalanced_separate_ifs = """
     void KernelFn(bool a, bool b) {
         if (a) {
@@ -495,7 +488,6 @@ def test_mece_7_facet_source_verification_and_cfg_flag_symmetry_gate() -> None:
     rep_sep = verify_source_against_facets(unbalanced_separate_ifs, m_top)
     assert rep_sep.passed is False
 
-    # Unbalanced single-branch SetFlag
     unbalanced_single = """
     void KernelFn(bool cond) {
         if (cond) {
@@ -506,25 +498,21 @@ def test_mece_7_facet_source_verification_and_cfg_flag_symmetry_gate() -> None:
     """
     assert verify_source_against_facets(unbalanced_single, m_top).passed is False
 
-    # Mismatched flag IDs
     mismatched_ids = """
     CrossCoreSetFlag<0x2, PIPE_FIX>(0);
     CrossCoreWaitFlag(1);
     """
     assert verify_source_against_facets(mismatched_ids, m_top).passed is False
 
-    # Exceeds max_flag_depth=15 (flag ID 16)
     over_id = """
     CrossCoreSetFlag<0x2, PIPE_FIX>(16);
     CrossCoreWaitFlag(16);
     """
     assert verify_source_against_facets(over_id, m_top, max_flag_depth=15).passed is False
 
-    # Exceeds max_flag_depth=15 via 16 unwaited in-flight SetFlags
     over_inflight = "\n".join(["CrossCoreSetFlag<0x2, PIPE_FIX>(0);"] * 16 + ["CrossCoreWaitFlag(0);"] * 16)
     assert verify_source_against_facets(over_inflight, m_top, max_flag_depth=15).passed is False
 
-    # Unbalanced loop body
     unbalanced_loop = """
     for (int i = 0; i < 4; ++i) {
         CrossCoreSetFlag<0x2, PIPE_FIX>(0);
@@ -532,6 +520,5 @@ def test_mece_7_facet_source_verification_and_cfg_flag_symmetry_gate() -> None:
     """
     assert verify_source_against_facets(unbalanced_loop, m_top).passed is False
 
-    # Hardware mutex >= 28 fails even at top()
     bad_mutex = "HwMutexLock(28); HwMutexUnlock(28);"
     assert verify_source_against_facets(bad_mutex, m_top).passed is False

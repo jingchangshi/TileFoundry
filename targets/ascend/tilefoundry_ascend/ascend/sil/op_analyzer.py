@@ -3,25 +3,38 @@
 from __future__ import annotations
 
 import json
-import math
 import os
-import re
 import statistics
 from collections.abc import Iterable, Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 import yaml
 
 from tilefoundry_ascend.ascend.sil.schema import (
     AdvisoryEnvelope,
+    CasePhysicsKind,
+    CasePhysicsRatios,
     HardwareLegalityBounds,
     PolicyEnvelope,
     RegimeSlice,
     SchedulePolicy,
     TopologyAxes,
+    build_case_physics_context,
+    case_primary_dtype_bytes,
+    case_workload_bytes,
+    compute_case_physics_ratios,
+    derive_case_physics_input,
+    flatten_int_shapes,
+    flatten_str_values,
+    has_empty_group_attrs,
+    has_unaligned_tail_for_case,
+    infer_case_dims_structural,
+    infer_case_physics_kind,
+    partition_case_regimes,
 )
+from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
 
 def _resolve_ops_root_path(path: str | Path) -> Path:
@@ -50,224 +63,20 @@ _CANNBENCH_DEFAULT_THRESHOLDS: dict[str, float] = {
     "float8_e5m2": 2.0**-2,
 }
 
-_DTYPE_BYTES: dict[str, float] = {
-    "float32": 4.0,
-    "int32": 4.0,
-    "int64": 8.0,
-    "float16": 2.0,
-    "bfloat16": 2.0,
-    "int16": 2.0,
-    "int8": 1.0,
-    "uint8": 1.0,
-    "bool": 1.0,
-    "float8_e4m3fn": 1.0,
-    "float8_e5m2": 1.0,
-    "float8_e8m0fnu": 1.0,
-    "float4_e2m1": 0.5,
-    "float4_e1m2": 0.5,
-}
-
-
-def _flatten_strs(value: Any) -> Iterable[str]:
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            yield from _flatten_strs(item)
-    elif value is not None:
-        yield str(value)
-
-
-def _flatten_shapes(raw_shapes: Any) -> list[list[int]]:
-    shapes: list[list[int]] = []
-    if not isinstance(raw_shapes, list):
-        return shapes
-    for entry in raw_shapes:
-        if entry is None:
-            continue
-        if isinstance(entry, list):
-            if entry and isinstance(entry[0], list):
-                for sub in entry:
-                    if isinstance(sub, list) and all(isinstance(d, int) for d in sub):
-                        shapes.append([int(d) for d in sub])
-            elif all(isinstance(d, int) for d in entry):
-                shapes.append([int(d) for d in entry])
-    return shapes
-
-
-def _shape_numel(shape: list[int]) -> int:
-    if not shape:
-        return 1
-    prod = 1
-    for d in shape:
-        prod *= max(int(d), 1)
-    return prod
-
 
 def _is_prime_or_odd(n: int) -> bool:
     return n > 1 and (n % 2 == 1)
 
 
-def _has_empty_group_in_attrs(attrs: Mapping[str, Any] | None) -> bool:
-    if not isinstance(attrs, Mapping):
-        return False
-    group_list = attrs.get("group_list")
-    if not isinstance(group_list, list) or not group_list:
-        return False
-    prev = 0
-    for val in group_list:
-        if not isinstance(val, int):
-            continue
-        if val <= prev:
-            return True
-        prev = val
-    return False
-
-
-def _has_unaligned_tail_for_case(
-    shapes: list[list[int]],
-    dtypes: list[str],
-    uses_cube: bool,
-) -> bool:
-    if not shapes:
-        return False
-    first_dtype = dtypes[0] if dtypes else "float16"
-    elem_bytes = max(_DTYPE_BYTES.get(first_dtype, 2.0), 1.0)
-    align_elems = max(1, int(32 // elem_bytes))
-    cube_align = 16 if uses_cube else align_elems
-
-    for shp in shapes:
-        if not shp:
-            continue
-        last = shp[-1]
-        if last > 1 and (last % align_elems != 0):
-            return True
-        if uses_cube:
-            for d in shp[-2:]:
-                if d > 1 and (d % cube_align != 0):
-                    return True
-        if len(shp) >= 2 and shp[0] > 1 and _is_prime_or_odd(shp[0]) and shp[0] not in (1, 3, 5, 7):
-            if shp[0] % 2 == 1 and shp[0] > 15:
-                return True
-    return False
-
-
-def _infer_case_dims_structural(
-    shapes: list[list[int]],
-    attrs: Mapping[str, Any],
-    *,
+def _case_physics_kind(
+    proto: Mapping[str, Any],
     axes: TopologyAxes,
-    uses_cube: bool,
-) -> dict[str, int]:
-    """Extract canonical (M, N, K, E) and sequence dims structurally without op names."""
-    if not shapes or not shapes[0]:
-        return {"M": 1, "N": 1, "K": 1}
-    primary = shapes[0]
-    dims: dict[str, int] = {}
-
-    if (axes.iteration_regularity == "ragged_group" or "group_list" in attrs) and len(shapes) >= 2:
-        dims["M"] = primary[0] if len(primary) >= 1 else 1
-        dims["K"] = primary[-1] if len(primary) >= 1 else 1
-        weight = shapes[1]
-        dims["E"] = weight[0] if len(weight) >= 3 else 1
-        dims["N"] = weight[-1] if len(weight) >= 2 else 1
-        return dims
-
-    if ("in_features" in attrs or "out_features" in attrs) and len(shapes) >= 2:
-        dims["M"] = primary[0] if len(primary) == 1 else int(math.prod(primary[:-1]))
-        dims["K"] = int(attrs.get("in_features", primary[-1]))
-        dims["N"] = int(attrs.get("out_features", shapes[-1][0] if shapes[-1] else 1))
-        return dims
-
-    if axes.memory_ring == "bidirectional_cv_ring" and len(shapes) >= 2:
-        if len(primary) == 4:
-            layout = str(attrs.get("inputLayout", attrs.get("layout", "BSND"))).upper()
-            b_dim = primary[0]
-            s_q = primary[2] if layout == "BNSD" else primary[1]
-            h_q = primary[1] if layout == "BNSD" else primary[2]
-            dims["B"] = b_dim
-            dims["S_q"] = s_q
-            dims["H_q"] = h_q
-            dims["D"] = primary[3]
-            dims["M"] = b_dim * s_q
-        elif len(primary) == 3:
-            dims["T"] = primary[0]
-            dims["H_q"] = primary[1]
-            dims["D"] = primary[2]
-            q_lens = attrs.get("actual_seq_qlen")
-            dims["S_q"] = (
-                max(int(x) for x in q_lens)
-                if isinstance(q_lens, list) and q_lens
-                else primary[0]
-            )
-            dims["M"] = dims["S_q"]
-        else:
-            dims["M"] = int(math.prod(primary[:-1])) if len(primary) >= 2 else primary[0]
-            dims["K"] = primary[-1]
-            sec_shape = shapes[1]
-            if len(sec_shape) == 2 and sec_shape[-1] == dims["K"] and sec_shape[0] != dims["K"]:
-                dims["N"] = sec_shape[0]
-            else:
-                dims["N"] = sec_shape[-1] if sec_shape else primary[-1]
-            return dims
-        sec = shapes[1]
-        if len(sec) >= 2:
-            layout = str(attrs.get("inputLayout", attrs.get("layout", "BSND"))).upper()
-            if len(sec) == 4:
-                dims["S_kv"] = sec[2] if layout == "BNSD" else sec[1]
-            else:
-                dims["S_kv"] = sec[0]
-        dims["K"] = primary[-1]
-        dims["N"] = shapes[2][-1] if len(shapes) >= 3 and shapes[2] else primary[-1]
-        return dims
-
-    if uses_cube and len(shapes) >= 2 and shapes[1] and len(primary) <= 3 and len(shapes[1]) <= 3:
-        dims["M"] = int(math.prod(primary[:-1])) if len(primary) >= 2 else 1
-        dims["K"] = primary[-1]
-        rhs = shapes[1]
-        if len(rhs) == 2 and rhs[-1] == dims["K"] and rhs[0] != dims["K"]:
-            dims["N"] = rhs[0]
-        else:
-            dims["N"] = rhs[-1] if len(rhs) >= 1 else 1
-        return dims
-
-    if len(primary) >= 2:
-        dims["rows"] = int(math.prod(primary[:-1]))
-        dims["cols"] = primary[-1]
-        dims["M"] = dims["rows"]
-        dims["N"] = dims["cols"]
-    else:
-        dims["rows"] = 1
-        dims["cols"] = primary[0]
-        dims["M"] = 1
-        dims["N"] = primary[0]
-    dims["total_elems"] = _shape_numel(primary)
-    return dims
-
-
-def _classify_case_regime(
-    memory_ring: str,
-    uses_cube: bool,
-    case: Mapping[str, Any],
-    shapes: list[list[int]],
-    dtypes: list[str],
-    dims: dict[str, int],
-) -> str:
-    attrs = case.get("attrs") or {}
-    if _has_empty_group_in_attrs(attrs):
-        return "empty_group"
-
-    unaligned = _has_unaligned_tail_for_case(shapes, dtypes, uses_cube)
-    if memory_ring == "bidirectional_cv_ring":
-        if "S_q" not in dims and "B" not in dims:
-            return "unaligned_tail" if unaligned else "aligned_main"
-        s_q = dims.get("S_q", dims.get("M", 0))
-        if s_q < 82:
-            return "decode_small_m"
-        return "prefill_unaligned" if unaligned else "prefill_aligned"
-
-    total_elems = sum(_shape_numel(s) for s in shapes[:2])
-    if total_elems <= 8192:
-        return "small_unaligned" if unaligned else "small"
-    return "unaligned_tail" if unaligned else "aligned_main"
+) -> CasePhysicsKind:
+    category = str(proto.get("category", "")).strip().lower()
+    return infer_case_physics_kind(
+        axes,
+        has_reduction=category in ("normalization", "reduction"),
+    )
 
 
 def _extract_attr_names(raw_attrs: object) -> set[str]:
@@ -303,13 +112,13 @@ def infer_contraction_and_axes_from_proto(
     outputs = list(proto_map.get("outputs") or ())
     for item in (*inputs, *outputs):
         if isinstance(item, Mapping):
-            for dt in _flatten_strs(item.get("dtype")):
+            for dt in flatten_str_values(item.get("dtype")):
                 val = dt.strip().lower()
                 if val and val not in dtype_strs:
                     dtype_strs.append(val)
     for case in cases:
         if isinstance(case, Mapping):
-            for dt in _flatten_strs(case.get("dtype")):
+            for dt in flatten_str_values(case.get("dtype")):
                 val = dt.strip().lower()
                 if val and val not in dtype_strs:
                     dtype_strs.append(val)
@@ -325,7 +134,7 @@ def infer_contraction_and_axes_from_proto(
         if isinstance(case, Mapping):
             c_attrs = case.get("attrs") or {}
             attrs_keys.update(_extract_attr_names(c_attrs))
-            if _has_empty_group_in_attrs(c_attrs):
+            if has_empty_group_attrs(c_attrs):
                 any_empty_group = True
     if not any_empty_group and isinstance(regimes, (list, tuple)):
         for reg in regimes:
@@ -473,7 +282,7 @@ def infer_contraction_and_axes_from_proto(
         idx > 0 and any(tok in dt for tok in ("int32", "int64"))
         for idx, item in enumerate(inputs)
         if isinstance(item, Mapping)
-        for dt in _flatten_strs(item.get("dtype"))
+        for dt in flatten_str_values(item.get("dtype"))
     )
     has_sparse_gather = (
         any(
@@ -570,18 +379,6 @@ def infer_contraction_and_axes_from_proto(
     return axes, flags
 
 
-def _to_snake_op_name(raw: str) -> str:
-    text = str(raw).strip()
-    if "/" in text:
-        text = text.rsplit("/", 1)[-1]
-    if "(" in text:
-        text = text.split("(", 1)[0].strip()
-    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", text)
-    text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", text)
-    text = text.replace("-", "_").replace(" ", "_").lower()
-    return re.sub(r"_+", "_", text).strip("_")
-
-
 def _extract_feature_flags(features: object | None) -> dict[str, Any]:
     if features is None:
         return {}
@@ -649,7 +446,7 @@ def resolve_canonical_topology_axes(
             if isinstance(entries, (list, tuple)):
                 for entry in entries:
                     if isinstance(entry, Mapping):
-                        dtypes.extend(_flatten_strs(entry.get("dtype")))
+                        dtypes.extend(flatten_str_values(entry.get("dtype")))
     elif spec_or_name is not None and not isinstance(spec_or_name, str):
         raw_sf = getattr(spec_or_name, "structural_features", None)
         if isinstance(raw_sf, Mapping):
@@ -674,6 +471,18 @@ def resolve_canonical_topology_axes(
     return axes
 
 
+class _CasePhysicsRecord(TypedDict):
+    """One official case's ratios, tail flags, timings, and dtype-aware workload."""
+
+    case_id: int
+    ratios: CasePhysicsRatios
+    unaligned: bool
+    empty_group: bool
+    t_hw_us: float
+    ref_perf_us: float
+    workload_bytes: int
+
+
 class OpAdvisoryExtractor:
     """Extracts SIL AdvisoryEnvelopes from cann-bench operator definitions and 950PR metadata."""
 
@@ -681,6 +490,11 @@ class OpAdvisoryExtractor:
         self.ops_root = _resolve_ops_root_path(ops_root)
         self._manifest_cache: dict[str, Any] | None = None
         self._perf_cache: dict[str, Any] | None = None
+        target = AscendTarget("ascend.950pr")
+        facts = target.get_facts(AscendSpaceFacts)
+        if not isinstance(facts, AscendSpaceFacts):
+            raise RuntimeError("ascend.950pr target did not provide AscendSpaceFacts")
+        self.facts = facts
 
     @property
     def manifest(self) -> dict[str, Any]:
@@ -743,17 +557,17 @@ class OpAdvisoryExtractor:
 
         in_dtypes_set: list[str] = []
         for item in proto.get("inputs") or []:
-            for dt in _flatten_strs(item.get("dtype")):
+            for dt in flatten_str_values(item.get("dtype")):
                 if dt not in in_dtypes_set:
                     in_dtypes_set.append(dt)
         for case in cases:
-            for dt in _flatten_strs(case.get("dtype")):
+            for dt in flatten_str_values(case.get("dtype")):
                 if dt not in in_dtypes_set:
                     in_dtypes_set.append(dt)
 
         out_dtypes_set: list[str] = []
         for item in proto.get("outputs") or []:
-            for dt in _flatten_strs(item.get("dtype")):
+            for dt in flatten_str_values(item.get("dtype")):
                 if dt not in out_dtypes_set:
                     out_dtypes_set.append(dt)
 
@@ -763,7 +577,7 @@ class OpAdvisoryExtractor:
             attrs = case.get("attrs") or {}
             if isinstance(attrs, Mapping):
                 attrs_keys.update(str(k) for k in attrs.keys())
-            if _has_empty_group_in_attrs(attrs):
+            if has_empty_group_attrs(attrs):
                 any_empty_group = True
 
         topology_axes, flags = infer_contraction_and_axes_from_proto(
@@ -805,30 +619,46 @@ class OpAdvisoryExtractor:
             or "inplace" in attrs_keys
         )
 
-        grouped_cases: dict[str, list[dict[str, Any]]] = {}
+        case_kind = _case_physics_kind(proto, topology_axes)
+        case_records: dict[int, _CasePhysicsRecord] = {}
+        ratios_by_case: dict[int, CasePhysicsRatios] = {}
+        dims_by_case: dict[int, dict[str, int]] = {}
+        workload_bytes_by_case: dict[int, int] = {}
         has_prime_or_odd = False
         any_unaligned = False
         total_gm_bytes_samples: list[int] = []
         t_hw_samples: list[float] = []
         ref_perf_samples: list[float] = []
+        case_ratio_payloads: list[dict[str, object]] = []
 
         for case in cases:
             cid = int(case["case_id"])
-            shapes = _flatten_shapes(case.get("input_shape"))
-            dtypes = list(_flatten_strs(case.get("dtype")))
+            shapes = flatten_int_shapes(case.get("input_shape"))
+            dtypes = list(flatten_str_values(case.get("dtype")))
             attrs = case.get("attrs") or {}
 
-            dims = _infer_case_dims_structural(
+            dims = infer_case_dims_structural(
                 shapes,
                 attrs,
                 axes=topology_axes,
                 uses_cube=uses_cube,
             )
-            tag = _classify_case_regime(
-                topology_axes.memory_ring, uses_cube, case, shapes, dtypes, dims
+            empty_grp = has_empty_group_attrs(attrs)
+            case_context = build_case_physics_context(
+                case_kind,
+                case_primary_dtype_bytes(case),
+                self.facts,
+                strided_gather=(
+                    case_kind == "attention"
+                    and topology_axes.iteration_regularity == "irregular_simt"
+                ),
+                has_empty_group=empty_grp,
             )
-            unaligned = _has_unaligned_tail_for_case(shapes, dtypes, uses_cube)
-            empty_grp = _has_empty_group_in_attrs(attrs)
+            ratios = compute_case_physics_ratios(
+                derive_case_physics_input(cid, shapes, attrs, dims, case_context)
+            )
+            case_ratio_payloads.append(ratios.to_dict())
+            unaligned = has_unaligned_tail_for_case(shapes, dtypes, uses_cube)
             any_unaligned = any_unaligned or unaligned
             if any(_is_prime_or_odd(d) and d > 7 for shp in shapes for d in shp):
                 has_prime_or_odd = True
@@ -839,37 +669,50 @@ class OpAdvisoryExtractor:
             t_hw_samples.append(t_hw)
             ref_perf_samples.append(b_perf)
 
-            case_bytes = 0
-            for idx, shp in enumerate(shapes):
-                dt = dtypes[idx] if idx < len(dtypes) else (dtypes[0] if dtypes else "float16")
-                case_bytes += int(_shape_numel(shp) * _DTYPE_BYTES.get(dt, 2.0))
+            case_bytes = case_workload_bytes(shapes, dtypes)
             total_gm_bytes_samples.append(case_bytes)
 
-            grouped_cases.setdefault(tag, []).append(
-                {
-                    "case_id": cid,
-                    "dims": dims,
-                    "unaligned": unaligned,
-                    "empty_group": empty_grp,
-                    "t_hw_us": t_hw,
-                    "ref_perf_us": b_perf,
-                    "gm_bytes": case_bytes,
-                }
-            )
+            ratios_by_case[cid] = ratios
+            dims_by_case[cid] = dims
+            workload_bytes_by_case[cid] = case_bytes
+            case_records[cid] = {
+                "case_id": cid,
+                "ratios": ratios,
+                "unaligned": unaligned,
+                "empty_group": empty_grp,
+                "t_hw_us": t_hw,
+                "ref_perf_us": b_perf,
+                "workload_bytes": case_bytes,
+            }
 
         regimes: list[RegimeSlice] = []
-        for tag, items in grouped_cases.items():
-            items_sorted = sorted(items, key=lambda x: x["gm_bytes"])
-            rep = items_sorted[len(items_sorted) // 2]
+        groups = partition_case_regimes(
+            ratios_by_case,
+            dims_by_case,
+            workload_bytes_by_case,
+            kind=case_kind,
+            axes=topology_axes,
+        )
+        for group in groups:
+            items = [case_records[cid] for cid in group.case_ids]
+            items_sorted = sorted(
+                items,
+                key=lambda x: (x["workload_bytes"], x["case_id"]),
+            )
+            representative = group.representative_case
             regimes.append(
                 RegimeSlice(
-                    regime_tag=tag,
-                    case_nums=tuple(int(x["case_id"]) for x in items),
-                    representative_dims=dict(rep["dims"]),
+                    regime_tag=group.regime_tag,
+                    case_nums=group.case_ids,
+                    representative_dims=dict(representative.dims),
                     has_unaligned_tail=any(x["unaligned"] for x in items),
                     has_empty_group=any(x["empty_group"] for x in items),
                     ref_perf_us=round(statistics.fmean(x["ref_perf_us"] for x in items), 4),
                     t_hw_us=round(statistics.fmean(x["t_hw_us"] for x in items), 4),
+                    case_ratios=tuple(x["ratios"] for x in items_sorted),
+                    representative_case_id=representative.case_id,
+                    phase_coordinates=group.phase_coordinates,
+                    rationale=group.rationale,
                 )
             )
 
@@ -914,6 +757,7 @@ class OpAdvisoryExtractor:
             "has_dead_l1_slice": has_dead_l1_slice,
             "uses_mutex_atomic": uses_mutex_atomic,
             "attrs_keys": sorted(attrs_keys),
+            "case_physics_ratios": case_ratio_payloads,
         }
 
         return AdvisoryEnvelope(

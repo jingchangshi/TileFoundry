@@ -1,11 +1,20 @@
-"""Single source of truth for Ascend TileLang DSL and tl_templates C++20 surfaces."""
+"""Single source of truth for Ascend TileLang DSL and Track-B CCE C++20 surfaces."""
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Literal
 
-DialectId = Literal["tilelang_dsl", "inline_ascendc_vf", "tl_templates_cpp20"]
+DialectId = Literal["tilelang_dsl", "inline_cce_vf", "cce_cpp20"]
+
+_IDENTIFIER_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+
+
+def _forbidden_token_pattern(token: str) -> str:
+    prefix = r"(?<![A-Za-z0-9_:.>])"
+    suffix = r"(?![A-Za-z0-9_])" if token and token[-1] in _IDENTIFIER_CHARS else ""
+    return f"{prefix}{re.escape(token)}{suffix}"
 
 
 @dataclass(frozen=True)
@@ -23,6 +32,7 @@ class DialectSurfaceSpec:
     """Verified dialect surface contract used by prompt generation, repair, and verifiers."""
 
     dialect_id: DialectId
+    display_label: str
     required_headers_or_imports: tuple[str, ...]
     primitives: tuple[PrimitiveEntry, ...]
     forbidden_tokens: tuple[str, ...]
@@ -31,7 +41,7 @@ class DialectSurfaceSpec:
     def render_prompt_reference(self) -> str:
         """Render markdown bullet list of callable APIs, headers, and forbidden tokens."""
         lines = [
-            f"Verified `{self.dialect_id}` callable surface:",
+            f"Verified `{self.display_label}` (`{self.dialect_id}`) callable surface:",
             f"- Imports / Headers: {', '.join(self.required_headers_or_imports)}",
         ]
         for entry in self.primitives:
@@ -43,9 +53,27 @@ class DialectSurfaceSpec:
             lines.append(f"- {note}")
         return "\n".join(lines)
 
+    def count_forbidden_tokens(self, text: str) -> dict[str, int]:
+        """Count boundary-delimited occurrences of each forbidden token in *text*."""
+        counts: dict[str, int] = {}
+        for token in self.forbidden_tokens:
+            counts[token] = len(re.findall(_forbidden_token_pattern(token), text))
+        return counts
+
+    def introduced_forbidden_tokens(self, before: str, after: str) -> tuple[str, ...]:
+        """Return forbidden tokens whose boundary-delimited count grows from *before* to *after*."""
+        before_counts = self.count_forbidden_tokens(before)
+        after_counts = self.count_forbidden_tokens(after)
+        return tuple(
+            token
+            for token in self.forbidden_tokens
+            if after_counts[token] > before_counts[token]
+        )
+
 
 TILELANG_DSL_SURFACE = DialectSurfaceSpec(
     dialect_id="tilelang_dsl",
+    display_label="TileLang DSL",
     required_headers_or_imports=(
         "import tilelang",
         "import tilelang.ascend.language as T",
@@ -196,8 +224,9 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
     ),
 )
 
-INLINE_ASCENDC_VF_SURFACE = DialectSurfaceSpec(
-    dialect_id="inline_ascendc_vf",
+INLINE_CCE_VF_SURFACE = DialectSurfaceSpec(
+    dialect_id="inline_cce_vf",
+    display_label="Inline CCE VF (tilelang.ascend.language)",
     required_headers_or_imports=(
         "import tilelang",
         "import tilelang.ascend.language as T",
@@ -246,12 +275,13 @@ INLINE_ASCENDC_VF_SURFACE = DialectSurfaceSpec(
     ),
 )
 
-TL_TEMPLATES_CPP20_SURFACE = DialectSurfaceSpec(
-    dialect_id="tl_templates_cpp20",
+CCE_CPP20_SURFACE = DialectSurfaceSpec(
+    dialect_id="cce_cpp20",
+    display_label="CCE C++20 (tl_templates/ascend)",
     required_headers_or_imports=(
-        '#include "tl_templates/ascend/common.h"',
-        '#include "tl_templates/ascend/gemm.h"',
-        '#include "tl_templates/ascend/simd_inst.h"',
+        "#include <tl_templates/ascend/common.h>",
+        "#include <tl_templates/ascend/gemm.h>",
+        "#include <tl_templates/ascend/simd_inst.h>",
     ),
     primitives=(
         PrimitiveEntry(
@@ -354,32 +384,63 @@ TL_TEMPLATES_CPP20_SURFACE = DialectSurfaceSpec(
     forbidden_tokens=(
         "kernel_operator.h",
         "using namespace AscendC;",
-        "AscendC::DataCopyPad",
+        "AscendC::",
+        "TPipe",
+        "TQue",
+        "DataCopyPad",
         "FixpipeParamsArch3510",
+        "copy_gm_to_ubuf",
+        "copy_ubuf_to_gm",
+        "set_flag(",
+        "wait_flag(",
     ),
     prompt_notes=(
-        "Compile target is C++20 (-std=c++20 --npu-arch=dav-3510) against tl_templates/ascend.",
+        "Compile target is Track-B CCE C++20 (-std=c++20 --npu-arch=dav-3510) via tl_templates.",
+        "Do NOT emit high-level AscendC classes or legacy 910B raw CCE intrinsics.",
         "Every asc_sync_notify and asc_lock MUST pair symmetrically across all CFG paths.",
     ),
 )
+
+TL_TEMPLATES_CPP20_SURFACE = CCE_CPP20_SURFACE
+INLINE_ASCENDC_VF_SURFACE = INLINE_CCE_VF_SURFACE
+
+_TRACKB_CCE_ALIASES = (
+    "cce_cpp20",
+    "cce_trackb",
+    "hybrid_trackb",
+    "tl_templates_cpp20",
+    "ascendc_trackb",
+    "ascendc_template",
+)
+
+
+def resolve_trackb_cce_surface(backend_or_tier: str) -> DialectSurfaceSpec:
+    """Resolve the verified CCE C++20 surface while keeping legacy aliases compatible."""
+    norm = str(backend_or_tier or "cce_cpp20").strip().lower()
+    if norm in _TRACKB_CCE_ALIASES:
+        return CCE_CPP20_SURFACE
+    raise ValueError(f"Unsupported Track-B CCE dialect identifier: {backend_or_tier!r}")
 
 
 def get_dialect_surface(backend_or_tier: str) -> DialectSurfaceSpec:
     """Resolve the verified DialectSurfaceSpec for a backend or escalation tier."""
     norm = str(backend_or_tier or "tilelang_dsl").strip().lower()
-    if norm in ("ascendc_template", "ascendc_trackb", "hybrid_trackb", "tl_templates_cpp20"):
-        return TL_TEMPLATES_CPP20_SURFACE
-    if norm == "inline_ascendc_vf":
-        return INLINE_ASCENDC_VF_SURFACE
+    if norm in _TRACKB_CCE_ALIASES or norm == "ascendc":
+        return CCE_CPP20_SURFACE
+    if norm in ("inline_cce_vf", "inline_ascendc_vf"):
+        return INLINE_CCE_VF_SURFACE
     return TILELANG_DSL_SURFACE
 
 
 __all__ = [
+    "CCE_CPP20_SURFACE",
     "DialectId",
     "DialectSurfaceSpec",
     "INLINE_ASCENDC_VF_SURFACE",
+    "INLINE_CCE_VF_SURFACE",
     "PrimitiveEntry",
     "TILELANG_DSL_SURFACE",
     "TL_TEMPLATES_CPP20_SURFACE",
     "get_dialect_surface",
+    "resolve_trackb_cce_surface",
 ]

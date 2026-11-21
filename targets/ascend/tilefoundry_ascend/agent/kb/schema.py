@@ -197,6 +197,9 @@ _BACKEND_ALIASES = {
     "tilelang": "tilelang_dsl",
     "ascendc": "ascendc_trackb",
     "ascendc_template": "ascendc_trackb",
+    "cce_cpp20": "ascendc_trackb",
+    "cce_trackb": "ascendc_trackb",
+    "tl_templates_cpp20": "ascendc_trackb",
     "hybrid": "hybrid_trackb",
 }
 
@@ -257,7 +260,7 @@ class AscendCausalRule:
         return norm in self.compatible_backends
 
     def render_for_backend(self, runtime_backend: str | None = None) -> AscendCausalRule:
-        """Return rule rendered with Track-B C++20 guidance when targeting C++20 backends."""
+        """Return rule rendered with Track-B CCE (C++20) guidance on C++20 backends."""
         norm = normalize_runtime_backend(runtime_backend)
         cpp_guide = self.cpp20_transform_template.strip()
         if not cpp_guide:
@@ -267,7 +270,7 @@ class AscendCausalRule:
         if norm == "hybrid_trackb" and cpp_guide not in self.transform_template:
             combined = (
                 f"{self.transform_template.strip()}\n\n"
-                f"Track-B C++20 (tl_templates/ascend):\n{cpp_guide}"
+                f"Track-B CCE (C++20):\n{cpp_guide}"
             )
             return replace(self, transform_template=combined)
         return self

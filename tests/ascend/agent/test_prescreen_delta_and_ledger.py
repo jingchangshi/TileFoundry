@@ -276,7 +276,7 @@ def test_static_ledger_sizes_grouped_matmul_tail_by_its_stage_stride() -> None:
 
 
 def test_static_ledger_reads_rendered_grouped_trackb_layout() -> None:
-    from examples.ascend950pr_ops.grouped_matmul.kernels import _render_trackb_tu
+    from examples.ascend950pr_ops.grouped_matmul.kernels import _render_trackb_tu  # noqa: PLC0415
 
     source = _render_trackb_tu(
         bm=64,

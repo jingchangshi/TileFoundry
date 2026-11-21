@@ -97,6 +97,26 @@ def test_compile_hir_blueprint_mla_without_virtual_tir_leakage() -> None:
     assert "T.ascend_mmad" not in constraint_block
 
 
+def test_roofline_summary_sub_microsecond_floors_round_trip() -> None:
+    """Verify positive floors below 1e-4 us stay nonzero in prompt and serialization."""
+    summary = HirRooflineSummary(
+        anchor_dims={"M": 1},
+        compute_flops=1,
+        min_gm_bytes=1,
+        arithmetic_intensity=0.5,
+        compute_floor_us=1.7e-05,
+        memory_floor_us=2.3e-05,
+        ideal_roofline_us=2.3e-05,
+        dominant_bound="memory",
+    )
+    prompt_text = summary.format_for_prompt()
+    assert "compute_floor_us=1.7e-05" in prompt_text
+    assert "memory_floor_us=2.3e-05" in prompt_text
+    assert "ideal_roofline_us=2.3e-05" in prompt_text
+    rebuilt = HirRooflineSummary.from_dict(json.loads(json.dumps(summary.to_dict())))
+    assert rebuilt == summary
+
+
 def test_compile_hir_blueprint_attention_residual_scheduled_and_unscheduled() -> None:
     """Verify AttentionResidual scheduled blueprint and graceful unscheduled Roofline."""
     authored_src = (AR_DIR / "model.py").read_text(encoding="utf-8")

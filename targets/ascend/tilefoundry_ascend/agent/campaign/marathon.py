@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import ctypes
 import hashlib
@@ -10,7 +11,6 @@ import json
 import logging
 import os
 import select
-import shlex
 import shutil
 import subprocess
 import sys
@@ -26,18 +26,24 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     PerfTargetSpec,
     RegimeTargetSpec,
     default_source_root,
+    discover_module_trackb_symbols,
+    extract_trackb_cpp_source,
     get_default_anchors,
     get_default_regime_specs,
     get_operator_module_relpath,
     get_operator_task,
     parse_simple_env_file,
-    resolve_cannbench_repo,
-    resolve_cannbench_tasks_root,
 )
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
     PerfTargetCampaignRunner,
     patch_regime_into_module,
+    resolve_regime_config,
+)
+from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
+    OracleAccuracyResult,
+    SeedSynthesisOutcome,
+    prepare_operator_seed_or_takeover,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     _LLM_API_KEY_ENV,
@@ -46,9 +52,9 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     CandidateSurrogateResult,
     L3AcceptanceResult,
     _format_env_line,
-    _resolve_env_file_path,
     _validate_llm_api_key_env,
     collect_bottleneck_msprof_via_agent_gates,
+    run_l1_compile_check,
     run_l3_full_contract_via_agent_gates,
     run_l4_official_cannbench_via_agent_gates,
     run_micro_probe_via_agent_gates,
@@ -56,9 +62,16 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
 )
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import FlywheelDistiller
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import GateFunnel
+from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    GateFunnel,
+    check_npu_entrypoint_purity,
+    evaluate_ascendc_candidate,
+    run_stage_a_static,
+    run_stage_b_ascendc_compile,
+)
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     AgyCliLLMBackend,
+    KernelLLMBackend,
     create_llm_backend_from_env,
 )
 from tilefoundry_ascend.ascend.cost_model.experience_lake import (
@@ -68,6 +81,8 @@ from tilefoundry_ascend.ascend.cost_model.experience_lake import (
     compute_source_sha256,
     resolve_default_experience_lake_dir,
 )
+from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
+from tilefoundry_ascend.ascend.target.dialect_surface import CCE_CPP20_SURFACE
 
 logger = logging.getLogger("tilefoundry_ascend.marathon")
 
@@ -207,6 +222,7 @@ class MarathonConfig:
     escalate_model: str | None = None
     exploit_effort: str = "high"
     auto_bootstrap_seed: bool = True
+    cold_start: bool = False
     llm_backend: str | None = None
     exploit_model: str | None = None
     explore_model: str | None = None
@@ -235,146 +251,320 @@ def atomic_write_text(path: Path, text: str) -> None:
             tmp_path.unlink(missing_ok=True)
 
 
-def render_direct_tilelang_seed_module(
-    op_id: str,
+def _resolve_cann_root_from_env(env_file: Path | None) -> Path | None:
+    """Return the CANN install root derived from the adapter env file setup script."""
+    if env_file is None or not env_file.is_file():
+        return None
+    setup_raw = parse_simple_env_file(env_file).get("TILEFOUNDRY_NPU_CANN_SETUP", "").strip()
+    if not setup_raw:
+        return None
+    root = Path(setup_raw).expanduser().parent
+    return root if root.is_dir() else None
+
+
+def _module_binds_kernel_alias(tree: ast.Module, entrypoint: str) -> bool:
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        if (
+            any(isinstance(target, ast.Name) and target.id == "kernel" for target in targets)
+            and isinstance(value, ast.Name)
+            and value.id == entrypoint
+        ):
+            return True
+    return False
+
+
+def _stage0_entrypoint_contract_error(module_source: str, entrypoint: str, track: str) -> str:
+    """Return a rejection reason when the public entrypoint or its dispatch chain is absent."""
+    if track not in ("cce_trackb", "tilelang_dsl"):
+        return f"unknown Stage-0 track {track!r}"
+    try:
+        tree = ast.parse(module_source)
+    except SyntaxError as exc:
+        return f"seed module syntax error: {exc}"
+    if not any(
+        isinstance(node, ast.FunctionDef) and node.name == entrypoint for node in tree.body
+    ):
+        return f"seed module does not define the public entrypoint {entrypoint}"
+    if not _module_binds_kernel_alias(tree, entrypoint):
+        return f"seed module does not bind `kernel = {entrypoint}`"
+    purity_errors = check_npu_entrypoint_purity(module_source, entrypoint)
+    if purity_errors:
+        return "entrypoint purity rejection: " + "; ".join(purity_errors)
+    if track == "cce_trackb":
+        offending = {
+            token: count
+            for token, count in CCE_CPP20_SURFACE.count_forbidden_tokens(module_source).items()
+            if count
+        }
+        if offending:
+            rendered = ", ".join(f"{token}={count}" for token, count in offending.items())
+            return f"CCE C++20 seed references forbidden tokens: {rendered}"
+    return ""
+
+
+def _validate_stage0_track_a(
+    module_source: str,
+    regime_spec: RegimeTargetSpec,
+    *,
     entrypoint: str,
-    default_dtype: str,
-) -> str:
-    """Emit a golden-free TileLang seed module where entrypoint invokes _get_kernel."""
+    worktree: Path,
+    env_file: Path | None,
+) -> tuple[bool, str]:
+    """Run L0 static purity/waterline and L1 device compilation for a Track-A seed."""
+    contract_error = _stage0_entrypoint_contract_error(module_source, entrypoint, "tilelang_dsl")
+    if contract_error:
+        return False, contract_error
+    dims = dict(regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims)
+    try:
+        resolved = resolve_regime_config(module_source, regime_spec, dims=dims)
+    except (
+        SyntaxError,
+        ImportError,
+        KeyError,
+        NameError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        return False, f"seed config resolution failed: {type(exc).__name__}: {exc}"
+    static = run_stage_a_static(
+        module_source,
+        factory_name=resolved.builder_name,
+        factory_kwargs=resolved.builder_kwargs,
+        pass_configs=resolved.pass_configs or None,
+        compile_flags=resolved.compile_flags or None,
+    )
+    if not static.passed:
+        return False, f"L0 static/waterline rejection: {static.error_message}"
+    compiled = run_l1_compile_check(
+        module_source,
+        builder_name=resolved.builder_name,
+        builder_kwargs=resolved.builder_kwargs,
+        config_selector_name=resolved.selector_name or None,
+        pass_configs=resolved.pass_configs or None,
+        compile_flags=resolved.compile_flags or None,
+        source_root=worktree,
+        env_file=env_file,
+    )
+    if not compiled.passed:
+        return False, f"L1 device compilation rejection: {compiled.error_message}"
+    return True, ""
+
+
+def _validate_stage0_track_b(
+    module_source: str,
+    regime_spec: RegimeTargetSpec,
+    *,
+    entrypoint: str,
+    env_file: Path | None,
+) -> tuple[bool, str]:
+    """Run L0 token purity and L1 bisheng compilation for a Track-B CCE seed."""
+    contract_error = _stage0_entrypoint_contract_error(module_source, entrypoint, "cce_trackb")
+    if contract_error:
+        return False, contract_error
+    trackb_symbols = regime_spec.trackb_symbols or discover_module_trackb_symbols(module_source)
+    extracted = extract_trackb_cpp_source(module_source, trackb_symbols)
+    if extracted is None:
+        return False, "seed exposes no Track-B C++20 translation-unit string constant"
+    symbol, cpp_source = extracted
+    verdict = evaluate_ascendc_candidate(cpp_source)
+    if not verdict.passed:
+        return False, f"Track-B L0 token purity ({symbol}): {verdict.error_message}"
+    cann_root = _resolve_cann_root_from_env(env_file)
+    flags = list(PURE_SIMDVF_UBUF_FLAGS)
+    bisheng_bin: str | None = None
+    if cann_root is not None:
+        candidate_bin = cann_root / "bin" / "bisheng"
+        if candidate_bin.is_file():
+            bisheng_bin = str(candidate_bin)
+        if (cann_root / "include").is_dir():
+            flags.append(f"-I{cann_root / 'include'}")
+    compiled = run_stage_b_ascendc_compile(
+        cpp_source,
+        compile_flags=flags,
+        bisheng_bin=bisheng_bin,
+        cann_root=cann_root,
+    )
+    if not compiled.passed:
+        return False, f"Track-B L1 bisheng compilation ({symbol}): {compiled.error_message}"
+    return True, ""
+
+
+def build_stage0_static_validator(
+    regime_specs: Sequence[RegimeTargetSpec],
+    *,
+    entrypoint: str,
+    worktree: Path,
+    env_file: Path | None,
+) -> Callable[[str, str], tuple[bool, str]]:
+    """Build the L0/L1 gate pair the bounded Stage-0 seed loop invokes per attempt."""
+    assert regime_specs, "Stage-0 seed synthesis requires at least one regime specification"
+    primary = regime_specs[0]
+
+    def _validate(module_source: str, track: str) -> tuple[bool, str]:
+        if track == "cce_trackb":
+            return _validate_stage0_track_b(
+                module_source,
+                primary,
+                entrypoint=entrypoint,
+                env_file=env_file,
+            )
+        return _validate_stage0_track_a(
+            module_source,
+            primary,
+            entrypoint=entrypoint,
+            worktree=worktree,
+            env_file=env_file,
+        )
+
+    return _validate
+
+
+def build_stage0_oracle_validator(
+    *,
+    operator_name: str,
+    staging_dir: Path,
+    worktree: Path,
+    device_id: str,
+    op_logger: logging.Logger,
+) -> Callable[[str], OracleAccuracyResult]:
+    """Build the NPU accuracy validator that stages seed bytes by digest before L3 verification."""
+
+    def _validate(module_source: str) -> OracleAccuracyResult:
+        digest = hashlib.sha256(module_source.encode("utf-8")).hexdigest()
+        staged_module = staging_dir / f"{digest}.py"
+        atomic_write_text(staged_module, module_source)
+        result = run_l3_full_contract_via_agent_gates(
+            operator_name=operator_name,
+            candidate_module_path=staged_module,
+            source_root=worktree,
+            device_id=str(device_id),
+        )
+        op_logger.info(
+            "STAGE0_ORACLE op=%s sha256=%s passed=%s run_id=%s state=%s elapsed=%.1fs",
+            operator_name,
+            digest,
+            result.passed,
+            result.run_id,
+            result.state,
+            result.elapsed_sec,
+        )
+        return OracleAccuracyResult(
+            passed=result.passed,
+            error_message=result.error_message,
+            candidate_sha256=result.candidate_sha256,
+            l3_run_id=result.run_id,
+            l3_receipt_path=result.receipt_path,
+            l3_state=result.state,
+            elapsed_sec=result.elapsed_sec,
+        )
+
+    return _validate
+
+
+def _render_seed_package_init(op_id: str, entrypoint: str) -> str:
+    """Render the package initializer for a freshly cold-started operator directory."""
     return (
-        f'"""TileLang Ascend950PR seed module for {op_id} (zero golden fallback)."""\n\n'
-        "import contextlib\n"
-        "import tilelang\n"
-        "import tilelang.ascend.language as T\n"
-        "import torch\n\n"
-        "_KERNEL_CACHE: dict[tuple[object, ...], object] = {}\n\n\n"
-        "def _ascend_target_ctx():\n"
-        "    from tilelang import tvm\n"
-        "    from tilelang.backend.module import create_backend_context\n\n"
-        "    if tvm.target.Target.current(allow_none=True) is None:\n"
-        '        return create_backend_context("ascend").target\n'
-        "    return contextlib.nullcontext()\n\n\n"
-        f"def _select_{op_id}_config(**kwargs) -> dict[str, object]:\n"
-        f'    """Select initial TileLang config for {op_id}."""\n'
-        f'    raw_dt = str(kwargs.get("tl_dtype", {default_dtype!r})).strip()\n'
-        '    tl_dtype = raw_dt if raw_dt in ("float16", "bfloat16", "float32") else "float16"\n'
-        "    return {\n"
-        '        "tile_elems": int(kwargs.get("tile_elems", 1024)),\n'
-        '        "tl_dtype": tl_dtype,\n'
-        '        "pass_configs": {},\n'
-        '        "compile_flags": [],\n'
-        "    }\n\n\n"
-        f"def _build_{op_id}_prim_func(\n"
-        "    total_elems: int = 1024,\n"
-        "    tile_elems: int = 1024,\n"
-        f"    tl_dtype: str = {default_dtype!r},\n"
-        "    **_extra_kwargs,\n"
-        "):\n"
-        f'    """Build Stage-A-valid TileLang @T.prim_func scaffold for {op_id}."""\n'
-        "    blk = max(32, min(4096, ((int(tile_elems) + 31) // 32) * 32))\n"
-        "    tot = max(blk, ((int(total_elems) + blk - 1) // blk) * blk)\n"
-        "    blocks = tot // blk\n"
-        '    dt = tl_dtype if tl_dtype in ("float16", "bfloat16", "float32") else "float16"\n'
-        "    with _ascend_target_ctx():\n\n"
-        "        @T.prim_func\n"
-        "        def main(X: T.Tensor((tot,), dt), Y: T.Tensor((tot,), dt)):\n"
-        "            with T.Kernel(blocks) as cid:\n"
-        "                ub = T.alloc_shared((blk,), dt)\n"
-        "                T.copy(X[cid * blk : (cid + 1) * blk], ub)\n"
-        "                T.copy(ub, Y[cid * blk : (cid + 1) * blk])\n\n"
-        "    return main\n\n\n"
-        "def _get_kernel(total_elems: int, tl_dtype: str):\n"
-        f"    cfg = _select_{op_id}_config(tl_dtype=tl_dtype)\n"
-        '    key = (int(total_elems), int(cfg["tile_elems"]), tl_dtype)\n'
-        "    if key not in _KERNEL_CACHE:\n"
-        "        with _ascend_target_ctx():\n"
-        f"            prog = _build_{op_id}_prim_func(\n"
-        "                total_elems=total_elems,\n"
-        '                tile_elems=int(cfg["tile_elems"]),\n'
-        "                tl_dtype=tl_dtype,\n"
-        "            )\n"
-        '        _KERNEL_CACHE[key] = tilelang.compile(prog, target="ascend", out_idx=[1])\n'
-        "    return _KERNEL_CACHE[key]\n\n\n"
-        f"def {entrypoint}(x: torch.Tensor, *args, **kwargs) -> torch.Tensor:\n"
-        f'    """Execute pure TileLang NPU seed kernel for {op_id}."""\n'
-        "    orig_shape = x.shape\n"
-        "    flat = x.contiguous().view(-1)\n"
-        "    blk = 1024\n"
-        "    pad = (blk - (flat.numel() % blk)) % blk\n"
-        "    work = torch.nn.functional.pad(flat, (0, pad)) if pad else flat\n"
-        '    dt_map = {torch.float16: "float16", torch.bfloat16: "bfloat16", '
-        'torch.float32: "float32"}\n'
-        "    fn = _get_kernel(work.numel(), dt_map[work.dtype])\n"
-        "    out = fn(work)\n"
-        "    return out[: flat.numel()].view(orig_shape)\n\n\n"
-        f"kernel = {entrypoint}\n\n"
-        "__all__ = [\n"
-        f'    "_build_{op_id}_prim_func",\n'
-        f'    "_select_{op_id}_config",\n'
-        f"    {entrypoint!r},\n"
-        '    "kernel",\n'
-        "]\n"
+        f'"""Cold-start Ascend 950PR operator package for {op_id}."""\n\n'
+        f"from .kernels import {entrypoint}, kernel\n\n"
+        f'__all__ = [{entrypoint!r}, "kernel"]\n'
     )
 
 
-def ensure_operator_seed_module(
-    operator_name: str,
-    target_module_path: Path,
+def prepare_marathon_seed(
     *,
-    cannbench_repo: Path | None = None,
-) -> bool:
-    """Bootstrap a pure Stage-A-valid TileLang seed module without golden fallbacks."""
-    target_path = Path(target_module_path).resolve()
-    if target_path.is_file():
-        return False
-
-    ops_root: Path | None = None
-    if cannbench_repo is not None:
-        cand = Path(cannbench_repo).expanduser().resolve()
-        try:
-            ops_root = resolve_cannbench_tasks_root(cand)
-        except FileNotFoundError:
-            ops_root = cand
-    try:
-        registry = (
-            CannbenchOpsRegistry(tasks_root=ops_root)
-            if ops_root is not None
-            else CannbenchOpsRegistry.default()
-        )
-    except FileNotFoundError:
-        return False
-    if not registry.has_operator(operator_name):
-        return False
-
+    operator_name: str,
+    target_module: Path,
+    staging_dir: Path,
+    worktree: Path,
+    env_file: Path | None,
+    cannbench_repo: Path | None,
+    llm_backend: KernelLLMBackend,
+    cold_start: bool,
+    device_id: str,
+    op_logger: logging.Logger,
+) -> SeedSynthesisOutcome:
+    """Run bounded Stage-0 seed synthesis or explicit incumbent takeover before the campaign."""
+    registry = CannbenchOpsRegistry(
+        tasks_root=cannbench_repo,
+        source_root=worktree,
+    )
     spec = registry.resolve(operator_name)
-    op_id = spec.op_id
-    entrypoint = spec.entrypoint
-    default_dtype = "float16"
-    for case in spec.cases:
-        raw_dt = case.get("dtype")
-        if isinstance(raw_dt, (list, tuple)) and raw_dt:
-            cand_dt = str(raw_dt[0]).strip()
-        elif isinstance(raw_dt, str):
-            cand_dt = raw_dt.strip()
-        else:
-            cand_dt = ""
-        if cand_dt in ("float16", "bfloat16", "float32"):
-            default_dtype = cand_dt
-            break
-
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    init_path = target_path.parent / "__init__.py"
-    if not init_path.exists():
-        init_src = (
-            f'"""Auto-seeded Ascend 950PR operator package for {op_id}."""\n\n'
-            f"from .{target_path.stem} import {entrypoint}, kernel\n\n"
-            f'__all__ = [{entrypoint!r}, "kernel"]\n'
+    if not spec.golden_path.is_file():
+        raise FileNotFoundError(
+            f"operator {operator_name} has no PyTorch golden reference at {spec.golden_path}"
         )
-        atomic_write_text(init_path, init_src)
+    take_over_incumbent = not cold_start and target_module.is_file()
+    legacy_regime_specs = (
+        registry.get_regime_specs(operator_name) if take_over_incumbent else None
+    )
 
-    seed_src = render_direct_tilelang_seed_module(op_id, entrypoint, default_dtype)
-    atomic_write_text(target_path, seed_src)
-    return True
+    def _stage0_static_validator_factory(
+        regime_specs: tuple[RegimeTargetSpec, ...],
+    ) -> Callable[[str, str], tuple[bool, str]]:
+        return build_stage0_static_validator(
+            regime_specs,
+            entrypoint=spec.entrypoint,
+            worktree=worktree,
+            env_file=env_file,
+        )
+
+    init_path = target_module.parent / "__init__.py"
+    created_init = not take_over_incumbent and not init_path.exists()
+    if created_init:
+        target_module.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(init_path, _render_seed_package_init(spec.op_id, spec.entrypoint))
+    try:
+        outcome = asyncio.run(
+            prepare_operator_seed_or_takeover(
+                operator_name=operator_name,
+                entrypoint=spec.entrypoint,
+                pytorch_golden_source=spec.golden_path.read_text(encoding="utf-8"),
+                proto=spec.proto,
+                cases=spec.cases,
+                legacy_regime_specs=legacy_regime_specs,
+                llm_backend=llm_backend,
+                l0_l1_validator_factory=_stage0_static_validator_factory,
+                oracle_accuracy_validator=build_stage0_oracle_validator(
+                    operator_name=operator_name,
+                    staging_dir=staging_dir,
+                    worktree=worktree,
+                    device_id=device_id,
+                    op_logger=op_logger,
+                ),
+                existing_module_path=None if cold_start else target_module,
+                force_cold_start=cold_start,
+            )
+        )
+    except (OSError, RuntimeError, ValueError):
+        if created_init:
+            init_path.unlink(missing_ok=True)
+        raise
+    if outcome.mode == "cold_start":
+        digest = hashlib.sha256(outcome.module_source.encode("utf-8")).hexdigest()
+        assert outcome.verification_state == "l3_verified"
+        if outcome.candidate_sha256 != digest:
+            raise RuntimeError(
+                f"Stage-0 seed digest mismatch for {operator_name}: outcome carries "
+                f"{outcome.candidate_sha256!r}, module source hashes to {digest}"
+            )
+        atomic_write_text(target_module, outcome.module_source)
+        op_logger.info(
+            "STAGE0_SEED_PUBLISH op=%s sha256=%s run_id=%s receipt=%s",
+            operator_name,
+            digest,
+            outcome.l3_run_id,
+            outcome.l3_receipt_path,
+        )
+    return outcome
 
 
 def _ensure_sys_paths(worktree: Path) -> None:
@@ -963,6 +1153,7 @@ def salvage_unpromoted_beam_winner(
         dict[str, CandidateSurrogateResult],
     ],
     l3_runner: Callable[[Path], L3AcceptanceResult],
+    regime_specs: Sequence[RegimeTargetSpec] | None = None,
     op_logger: logging.Logger | None = None,
     experience_lake_dir: str | Path | None = None,
 ) -> bool:
@@ -986,7 +1177,14 @@ def salvage_unpromoted_beam_winner(
             tried_keys = set()
 
     beam_states = payload.get("beam_states") or {}
-    specs_by_tag = {s.regime_tag: s for s in get_default_regime_specs(operator_name)}
+    specs_by_tag = {
+        spec.regime_tag: spec
+        for spec in (
+            regime_specs
+            if regime_specs is not None
+            else get_default_regime_specs(operator_name)
+        )
+    }
     candidates: list[tuple[float, str, dict[str, object], RegimeTargetSpec]] = []
     for rtag, bmap in beam_states.items():
         spec = specs_by_tag.get(str(rtag))
@@ -1226,6 +1424,7 @@ def run_operator_marathon(
         else (worktree / ".tilefoundry-marathon" / cfg.operator_name).resolve()
     )
     state_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = (state_dir / "stage0_candidates").resolve()
 
     target_module = (
         Path(cfg.target_module_path).expanduser().resolve()
@@ -1265,6 +1464,11 @@ def run_operator_marathon(
         source_root=_source_root,
     )
     llm_backend = create_llm_backend_from_env(overrides=_llm_backend_overrides(env_values, cfg))
+    raw_cannbench_repo = (
+        env_values.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
+        or os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
+    )
+    cannbench_repo = Path(raw_cannbench_repo) if raw_cannbench_repo else None
     op_logger.info(
         "MARATHON_BOOT op=%s device=%s worktree=%s env_file=%s",
         cfg.operator_name,
@@ -1272,21 +1476,39 @@ def run_operator_marathon(
         worktree,
         env_file,
     )
-    if cfg.auto_bootstrap_seed and not target_module.is_file():
-        raw_cb = (
-            env_values.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
-            or os.environ.get("TILEFOUNDRY_NPU_CANNBENCH_REPO", "").strip()
-        )
-        if ensure_operator_seed_module(
-            cfg.operator_name,
-            target_module,
-            cannbench_repo=Path(raw_cb) if raw_cb else None,
-        ):
-            op_logger.info(
-                "AUTO_BOOTSTRAP_SEED op=%s target=%s",
-                cfg.operator_name,
-                target_module,
+    seeded_regime_specs: Sequence[RegimeTargetSpec] | None = None
+    if cfg.auto_bootstrap_seed:
+        try:
+            seed_outcome = prepare_marathon_seed(
+                operator_name=cfg.operator_name,
+                target_module=target_module,
+                staging_dir=staging_dir,
+                worktree=worktree,
+                env_file=env_file,
+                cannbench_repo=cannbench_repo,
+                llm_backend=llm_backend,
+                cold_start=cfg.cold_start,
+                device_id=str(cfg.device_id),
+                op_logger=op_logger,
             )
+        except (OSError, RuntimeError, ValueError) as exc:
+            op_logger.error("STAGE0_SEED_FAILED op=%s error=%s", cfg.operator_name, exc)
+            return 2
+        seeded_regime_specs = seed_outcome.regime_specs
+        op_logger.info(
+            "STAGE0_SEED op=%s mode=%s track=%s attempts=%d verification=%s sha256=%s "
+            "run_id=%s receipt=%s l0_l1=%s oracle_accuracy=%s",
+            cfg.operator_name,
+            seed_outcome.mode,
+            seed_outcome.initial_track,
+            seed_outcome.attempts_used,
+            seed_outcome.verification_state,
+            seed_outcome.candidate_sha256,
+            seed_outcome.l3_run_id,
+            seed_outcome.l3_receipt_path,
+            seed_outcome.l0_l1_passed,
+            seed_outcome.oracle_accuracy_passed,
+        )
 
     l2_evaluator = build_resilient_l2_evaluator(
         operator_name=cfg.operator_name,
@@ -1323,6 +1545,7 @@ def run_operator_marathon(
             min_surrogate_gain=cfg.min_surrogate_gain,
             l2_evaluator=l2_evaluator,
             l3_runner=l3_runner,
+            regime_specs=seeded_regime_specs,
             op_logger=op_logger,
             experience_lake_dir=lake_dir,
         )
@@ -1374,6 +1597,7 @@ def run_operator_marathon(
     runner = ExtremeCampaignRunner(
         config=campaign_cfg,
         target_module_path=target_module,
+        regime_specs=seeded_regime_specs,
         perf_target=perf_target,
         llm_backend=llm_backend,
         tracker=tracker,
@@ -1405,6 +1629,7 @@ def run_operator_marathon(
         experience_lake_dir=lake_dir,
         source_root=worktree,
         env_file=env_file,
+        cannbench_repo=cannbench_repo,
         stagnation_discount=cfg.stagnation_discount,
         op_logger=op_logger,
     )
@@ -1866,6 +2091,22 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-final-l4", action="store_true", help="Skip final L4 CANNBench gate.")
     parser.add_argument("--fresh", action="store_true", help="Ignore prior checkpoint and restart.")
     parser.add_argument("--no-salvage", action="store_true", help="Disable beam salvage check.")
+    parser.add_argument(
+        "--cold-start",
+        action="store_true",
+        help="Force bounded Stage-0 cold-start seed synthesis over an existing kernels.py.",
+    )
+    parser.add_argument(
+        "--enable-tilesize-prescreen",
+        action="store_true",
+        help="Enable tile-size prescreen guidance table in creative prompts.",
+    )
+    parser.add_argument(
+        "--cost-prescreen-top-k",
+        type=int,
+        default=None,
+        help="Keep only the top-K cost-model candidates during creative prescreen.",
+    )
 
 
 def build_marathon_arg_parser() -> argparse.ArgumentParser:
@@ -1938,6 +2179,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_final_l4=not bool(args.no_final_l4),
         resume=False if args.fresh else None,
         salvage_beam_candidates=not bool(args.no_salvage),
+        cold_start=bool(args.cold_start),
+        enable_tilesize_prescreen=bool(args.enable_tilesize_prescreen),
+        cost_prescreen_top_k=(
+            int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
+        ),
         llm_backend=args.llm_backend,
         exploit_model=args.exploit_model,
         explore_model=args.explore_model,
@@ -1955,12 +2201,13 @@ __all__ = [
     "build_marathon_arg_parser",
     "build_prewarmed_l3_runner",
     "build_resilient_l2_evaluator",
+    "build_stage0_oracle_validator",
+    "build_stage0_static_validator",
     "configure_marathon_process_env",
     "discover_marathon_environment",
     "ensure_marathon_env_file",
-    "ensure_operator_seed_module",
     "main",
-    "render_direct_tilelang_seed_module",
+    "prepare_marathon_seed",
     "run_operator_marathon",
     "salvage_unpromoted_beam_winner",
     "short_operator_tag",

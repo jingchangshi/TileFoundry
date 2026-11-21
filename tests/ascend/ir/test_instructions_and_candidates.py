@@ -5,6 +5,7 @@ from __future__ import annotations
 import pathlib
 
 import pytest
+import torch
 
 from tilefoundry.analysis import analyze, check_program
 from tilefoundry.cli.source import load_authored_ir
@@ -56,7 +57,6 @@ from tilefoundry_ascend.ascend.ir.tir.instructions import (
     AscendVwhere,
 )
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts
-import torch
 
 HEADER = (
     "from __future__ import annotations\n\n"

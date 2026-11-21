@@ -38,6 +38,7 @@ from tilefoundry_ascend.ascend.schedule.envelope_inspector import (
     EnvelopeInspectionResult,
     inspect_tilelang_primfunc,
 )
+from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios
 from tilefoundry_ascend.ascend.target import AscendTarget
 
 
@@ -1063,6 +1064,7 @@ def evaluate_ascendc_candidate(
     target: AscendTarget | None = None,
     max_flag_depth: int = 15,
     enable_track_router: bool = False,
+    case_ratios: CasePhysicsRatios | None = None,
 ) -> StageAResult:
     """Validate a Track-B AscendC C++ candidate via 7-facet checks and static ledger."""
     t0 = time.monotonic()
@@ -1112,15 +1114,30 @@ def evaluate_ascendc_candidate(
         uses_cube = "mmad" in lower or "l0c" in lower
         uses_simt = "__simt_vf__" in cpp_source or "Simt::" in cpp_source
         uses_ssbuf = "ssbuf" in lower or "crosscore" in lower
-        features = StructuralFeatures(
-            phi_1_static_affine_bounds=not uses_simt,
-            phi_2_cube_to_vector_ratio=1.0 if uses_cube else 0.0,
-            phi_3_quant_granularity="per_token_or_block" if "deq_scale" in lower else "none",
-            phi_4_indirect_sparse_gather=uses_simt,
-            phi_5_cross_iter_recurrence="none",
-            phi_6_dynamic_cross_core_handoff=uses_ssbuf,
-            phi_7_inner_contiguous_bytes=128,
-            phi_8_persistent_wave_occupancy=1.0,
+        static_affine_bounds = not uses_simt
+        cube_to_vector_ratio = 1.0 if uses_cube else 0.0
+        quant_granularity = "per_token_or_block" if "deq_scale" in lower else "none"
+        features = (
+            StructuralFeatures.from_case_ratios(
+                case_ratios,
+                static_affine_bounds=static_affine_bounds,
+                cube_to_vector_ratio=cube_to_vector_ratio,
+                quant_granularity=quant_granularity,
+                indirect_sparse_gather=uses_simt,
+                cross_iter_recurrence="none",
+                dynamic_cross_core_handoff=uses_ssbuf,
+            )
+            if case_ratios is not None
+            else StructuralFeatures(
+                phi_1_static_affine_bounds=static_affine_bounds,
+                phi_2_cube_to_vector_ratio=cube_to_vector_ratio,
+                phi_3_quant_granularity=quant_granularity,
+                phi_4_indirect_sparse_gather=uses_simt,
+                phi_5_cross_iter_recurrence="none",
+                phi_6_dynamic_cross_core_handoff=uses_ssbuf,
+                phi_7_inner_contiguous_bytes=0,
+                phi_8_persistent_wave_occupancy=0.0,
+            )
         )
         route = route_execution_track(features, simt_dominant=uses_simt)
 
@@ -1276,6 +1293,7 @@ def run_stage_a_static(
     dims: Mapping[str, object] | None = None,
     var_bindings: Mapping[str, int] | None = None,
     enable_track_router: bool = False,
+    case_ratios: CasePhysicsRatios | None = None,
 ) -> StageAResult:
     """Run millisecond Stage A AST, Two-Snapshot IR Diff, and optional track routing."""
     t0 = time.monotonic()
@@ -1352,8 +1370,15 @@ def run_stage_a_static(
             route_execution_track,
         )
 
-        features = extract_structural_features(prim_func, ledger=ledger, target=target)
-        route = route_execution_track(features)
+        structural = extract_structural_features(prim_func, ledger=ledger, target=target)
+        if case_ratios is not None:
+            structural = replace(
+                structural,
+                phi_7_inner_contiguous_bytes=case_ratios.inner_contiguous_bytes,
+                phi_8_persistent_wave_occupancy=case_ratios.wave_occupancy_ratio,
+            )
+        features = structural
+        route = route_execution_track(structural)
     if not ledger.is_legal:
         reasons: list[str] = []
         if ledger.max_overflow_bytes > 0:
@@ -2584,7 +2609,7 @@ class GateFunnel:
 
         comp_summary = stage_b.compiler_summary
         if self._device_runner is None:
-            fallback_telemetry = {"dur_us": 0.0}
+            fallback_telemetry: dict[str, object] = {}
             residual = compute_static_dynamic_residual(
                 stage_a.ledger,
                 fallback_telemetry,
@@ -2602,8 +2627,8 @@ class GateFunnel:
             stage_c = self._device_runner(dsl_source, stage_a)
             if comp_summary is not None and stage_c.residual is not None:
                 res = stage_c.residual
-                sw_loops = int(getattr(comp_summary, "software_loops", 0) or 0)
-                vl_loops = int(getattr(comp_summary, "vloopv2_loops", 0) or 0)
+                sw_loops = comp_summary.software_loops
+                vl_loops = comp_summary.vloopv2_loops
                 comp_vloop_hit = bool(stage_b.vloopv2_hit) and vl_loops > 0 and sw_loops == 0
                 merged_res = replace(
                     res,
@@ -2623,6 +2648,10 @@ class GateFunnel:
                         or bool(comp_summary.has_local_membar_in_vf_call)
                     ),
                     vloopv2_hit=(res.vloopv2_hit and comp_vloop_hit),
+                    observation=stage_a.ledger.to_observation_5d(
+                        compiler_summary=comp_summary,
+                        telemetry=stage_c.telemetry,
+                    ),
                 )
                 stage_c = replace(stage_c, residual=merged_res)
 

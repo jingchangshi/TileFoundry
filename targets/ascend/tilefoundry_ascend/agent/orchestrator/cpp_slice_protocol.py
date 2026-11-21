@@ -7,6 +7,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from tilefoundry_ascend.ascend.target.dialect_surface import CCE_CPP20_SURFACE
+
 _SEARCH_REPLACE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"<<<<<<<\s*SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>>\s*REPLACE",
@@ -410,6 +412,14 @@ def parse_scoped_search_replace_blocks(patch_text: str) -> list[tuple[str, str]]
     return []
 
 
+def _reject_introduced_forbidden_tokens(search_block: str, replace_block: str) -> None:
+    """Reject a Track-B replacement that increases boundary-delimited forbidden token counts."""
+    introduced = CCE_CPP20_SURFACE.introduced_forbidden_tokens(search_block, replace_block)
+    if introduced:
+        joined = ", ".join(introduced)
+        raise ValueError(f"Track-B CCE patch introduces forbidden symbols: {joined}")
+
+
 def apply_scoped_trackb_patch(
     cpp_source: str,
     patch_text: str,
@@ -423,6 +433,8 @@ def apply_scoped_trackb_patch(
     hunks = parse_scoped_search_replace_blocks(patch_text)
     if not hunks:
         raise ValueError("patch_text must contain at least one valid SEARCH/REPLACE block")
+    for search_block, replace_block in hunks:
+        _reject_introduced_forbidden_tokens(search_block, replace_block)
 
     updated = cpp_source
     applied = 0

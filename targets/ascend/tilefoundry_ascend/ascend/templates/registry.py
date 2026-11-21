@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypedDict
 
+from tilefoundry_ascend.ascend.passes.observation_space import ObservationVector5D
 from tilefoundry_ascend.ascend.sil.schema import (
     VALID_FREEDOM_FACETS,
     ConstraintRelaxationMask,
@@ -40,6 +41,16 @@ def _read_attr_or_key(obj: object | None, key: str, default: Any = None) -> Any:
     if isinstance(obj, Mapping):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def _observation_from_residual(residual: object | None) -> ObservationVector5D | None:
+    """Extract an embedded 5D observation from a residual dataclass or serialized mapping."""
+    raw_observation = _read_attr_or_key(residual, "observation", None)
+    if isinstance(raw_observation, ObservationVector5D):
+        return raw_observation
+    if isinstance(raw_observation, Mapping):
+        return ObservationVector5D.from_dict(raw_observation)
+    return None
 
 
 def coerce_topology_axes(axes_or_mapping: TopologyAxes | Mapping[str, Any]) -> TopologyAxes:
@@ -98,6 +109,10 @@ def relax_facets_for_bottleneck(
     ub_overflow: bool = False,
 ) -> ConstraintRelaxationMask:
     """Unlock ONLY minimal causal MECE facet(s) matching the observed bottleneck."""
+    observation = _observation_from_residual(residual)
+    if observation is not None:
+        return observation.compute_axis_residuals().unlock_causal_facets(mask)
+
     unlock_exec_mode_and_spr = mask.exec_mode_and_spr
     unlock_sram_layout = mask.sram_layout_and_aliasing
     unlock_dma_cache = mask.dma_and_cache_hierarchy

@@ -8,6 +8,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from tilefoundry_ascend.agent.router.capability_gate import StructuralFeatures
+from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
+from tilefoundry_ascend.ascend.passes.observation_space import (
+    CompilerSummaryLike,
+    ObservationVector5D,
+)
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 
 _NOVELTY_TOKENS = (
@@ -24,6 +29,41 @@ _NOVELTY_TOKENS = (
     "PURE_SIMDVF_UBUF_FLAGS",
     "T.set_atomic",
 )
+
+
+def _read_float(payload: Mapping[str, object], *keys: str, default: float = 0.0) -> float:
+    """Read the first present numeric telemetry key, otherwise return the neutral default."""
+    for key in keys:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+    return default
+
+
+def _read_int(payload: Mapping[str, object], *keys: str, default: int = 0) -> int:
+    """Read the first present integral telemetry key, otherwise return the neutral default."""
+    for key in keys:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+    return default
+
+
+def _read_bool(payload: Mapping[str, object], key: str, default: bool = False) -> bool:
+    """Read a boolean telemetry flag with Python truthiness, otherwise return the default."""
+    if key not in payload:
+        return default
+    return bool(payload[key])
 
 
 @dataclass(frozen=True)
@@ -47,9 +87,20 @@ class StaticDynamicResidual:
     dcache_dcci_flushes: int = 0
     has_local_membar_in_vf_call: bool = False
     vloopv2_hit: bool = True
+    observation: ObservationVector5D | None = None
 
-    def to_dict(self) -> dict[str, float | int | bool]:
-        """Return float, int, and flag dictionary representation."""
+    @property
+    def has_l1_compiler_summary(self) -> bool:
+        """Report whether L1 penalties came from a real bisheng compiler summary."""
+        return self.observation is not None and self.observation.has_l1_compiler_summary
+
+    @property
+    def measured_l2_fields(self) -> tuple[str, ...]:
+        """Report which L2 fields were actually observed in msprof telemetry."""
+        return self.observation.measured_l2_fields if self.observation is not None else ()
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable dictionary representation including the 5D observation."""
         return {
             "measured_latency_us": self.measured_latency_us,
             "predicted_bottleneck_util": self.predicted_bottleneck_util,
@@ -68,11 +119,26 @@ class StaticDynamicResidual:
             "dcache_dcci_flushes": self.dcache_dcci_flushes,
             "has_local_membar_in_vf_call": self.has_local_membar_in_vf_call,
             "vloopv2_hit": self.vloopv2_hit,
+            "observation": (
+                self.observation.to_dict() if self.observation is not None else None
+            ),
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> StaticDynamicResidual:
         """Reconstruct StaticDynamicResidual from a serialized dictionary."""
+        raw_observation = payload.get("observation")
+        if raw_observation is None:
+            observation = None
+        elif isinstance(raw_observation, ObservationVector5D):
+            observation = raw_observation
+        elif isinstance(raw_observation, Mapping):
+            observation = ObservationVector5D.from_dict(raw_observation)
+        else:
+            raise ValueError(
+                f"residual field 'observation' must be a mapping, got "
+                f"{type(raw_observation).__name__}"
+            )
         return cls(
             measured_latency_us=float(payload.get("measured_latency_us", 0.0)),
             predicted_bottleneck_util=float(payload.get("predicted_bottleneck_util", 0.0)),
@@ -95,6 +161,7 @@ class StaticDynamicResidual:
             dcache_dcci_flushes=max(0, int(payload.get("dcache_dcci_flushes", 0) or 0)),
             has_local_membar_in_vf_call=bool(payload.get("has_local_membar_in_vf_call", False)),
             vloopv2_hit=bool(payload.get("vloopv2_hit", True)),
+            observation=observation,
         )
 
 
@@ -102,14 +169,14 @@ def compute_static_dynamic_residual(
     ledger: ObjectivePhysicalLedger,
     telemetry: Mapping[str, object],
     *,
-    compiler_summary: object | None = None,
+    compiler_summary: CompilerSummaryLike | None = None,
 ) -> StaticDynamicResidual:
-    """Compute StaticDynamicResidual from static ledger and msprof telemetry counters."""
-    measured_us = float(telemetry.get("measured_latency_us", telemetry.get("dur_us", 0.0)))
-    aic_mac = float(telemetry.get("aic_mac_ratio", telemetry.get("aic_mad", 0.0)))
-    aiv_vec = float(telemetry.get("aiv_vec_ratio", telemetry.get("aiv_vec", 0.0)))
-    mte2_wait = float(telemetry.get("mte2_wait_ratio", telemetry.get("aiv_mte2", 0.0)))
-    sync_stall = float(telemetry.get("sync_stall_ratio", 0.0))
+    """Compute StaticDynamicResidual from static ledger, msprof telemetry, and compiler summary."""
+    measured_us = _read_float(telemetry, "measured_latency_us", "dur_us")
+    aic_mac = _read_float(telemetry, "aic_mac_ratio", "aic_mad")
+    aiv_vec = _read_float(telemetry, "aiv_vec_ratio", "aiv_vec")
+    mte2_wait = _read_float(telemetry, "mte2_wait_ratio", "aiv_mte2")
+    sync_stall = _read_float(telemetry, "sync_stall_ratio")
 
     positive_cycles = [v for v in ledger.pipe_cycles.values() if v > 0]
     if positive_cycles and ledger.steady_state_ii is not None and ledger.steady_state_ii > 0:
@@ -132,82 +199,97 @@ def compute_static_dynamic_residual(
         "aic_fixpipe",
     )
     if any(key in telemetry for key in pmu_keys):
-        aic_fix = float(telemetry.get("aic_fixpipe", 0.0))
+        aic_fix = _read_float(telemetry, "aic_fixpipe")
         observed_util = max(aic_mac, aiv_vec, mte2_wait, aic_fix)
         unexplained = min(
             1.0,
             max(max(0.0, predicted_util - observed_util), sync_stall * 0.5),
         )
     elif "roofline_eta" in telemetry:
-        eta = min(1.0, max(0.0, float(telemetry["roofline_eta"])))
+        eta = min(1.0, max(0.0, _read_float(telemetry, "roofline_eta")))
         unexplained = min(1.0, max(max(0.0, predicted_util - eta), sync_stall * 0.5))
     else:
         unexplained = min(1.0, sync_stall * 0.5)
 
-    steady_ii = getattr(ledger, "steady_state_ii", None)
-    ii_looks_pipelined = steady_ii is None or int(steady_ii) <= 2
+    steady_ii = ledger.steady_state_ii
+    ii_looks_pipelined = steady_ii is None or steady_ii <= 2
     pseudo_serialized = bool(
-        getattr(ledger, "uses_dynamic_offset_pipelining", False)
+        ledger.uses_dynamic_offset_pipelining
         and ii_looks_pipelined
         and (mte2_wait >= 0.32 or unexplained >= 0.25 or sync_stall >= 0.20)
     )
-    comp_spill = (
-        int(getattr(compiler_summary, "spill_bytes", 0) or 0)
-        if compiler_summary is not None
-        else 0
+    comp_spill = compiler_summary.spill_bytes if compiler_summary is not None else 0
+    spill_bytes = max(0, comp_spill, _read_int(telemetry, "spill_bytes"))
+    bank_conflict_ratio = max(
+        0.0,
+        min(
+            1.0,
+            _read_float(
+                telemetry,
+                "bank_conflict_ratio",
+                "ub_bank_conflict_ratio",
+                "resource_conflict_ratio",
+            ),
+        ),
     )
-    spill_bytes = max(
+    l2_hit_rate = max(
+        0.0,
+        min(
+            1.0,
+            _read_float(telemetry, "l2_hit_rate", "l2_cache_hit_rate", default=1.0),
+        ),
+    )
+
+    vf_fusion_breaks = max(
         0,
-        comp_spill,
-        int(telemetry.get("spill_bytes", getattr(ledger, "spill_bytes", 0)) or 0),
+        _read_int(telemetry, "vf_fusion_breaks"),
+        compiler_summary.vf_fusion_breaks if compiler_summary is not None else 0,
     )
-    raw_bank = telemetry.get(
-        "bank_conflict_ratio",
-        telemetry.get("ub_bank_conflict_ratio", telemetry.get("resource_conflict_ratio", 0.0)),
+    alias_serialized_buffers = max(
+        0,
+        _read_int(telemetry, "alias_serialized_buffers"),
+        compiler_summary.alias_serialized_buffers if compiler_summary is not None else 0,
     )
-    bank_conflict_ratio = max(0.0, min(1.0, float(raw_bank or 0.0)))
-    raw_l2 = telemetry.get("l2_hit_rate", telemetry.get("l2_cache_hit_rate", 1.0))
-    l2_hit_rate = max(0.0, min(1.0, float(1.0 if raw_l2 is None else raw_l2)))
-
-    def _pick_comp_int(key: str) -> int:
-        t_val = telemetry.get(key)
-        c_val = getattr(compiler_summary, key, 0) if compiler_summary is not None else 0
-        return max(0, int(t_val if t_val is not None else 0), int(c_val or 0))
-
-    vf_fusion_breaks = _pick_comp_int("vf_fusion_breaks")
-    alias_serialized_buffers = _pick_comp_int("alias_serialized_buffers")
-    dcache_dcci_flushes = _pick_comp_int("dcache_dcci_flushes")
+    dcache_dcci_flushes = max(
+        0,
+        _read_int(telemetry, "dcache_dcci_flushes"),
+        compiler_summary.dcache_dcci_flushes if compiler_summary is not None else 0,
+    )
     dual_issue_ipc_collapse = max(
         0.0,
         min(
             1.0,
             max(
-                float(telemetry.get("dual_issue_ipc_collapse", 0.0) or 0.0),
-                float(
-                    getattr(compiler_summary, "dual_issue_ipc_collapse", 0.0)
+                _read_float(telemetry, "dual_issue_ipc_collapse"),
+                (
+                    compiler_summary.dual_issue_ipc_collapse
                     if compiler_summary is not None
                     else 0.0
                 ),
             ),
         ),
     )
-    has_local_membar_in_vf_call = bool(
-        telemetry.get("has_local_membar_in_vf_call", False)
-        or (
-            getattr(compiler_summary, "has_local_membar_in_vf_call", False)
-            if compiler_summary is not None
-            else False
-        )
+    has_local_membar_in_vf_call = _read_bool(
+        telemetry, "has_local_membar_in_vf_call"
+    ) or (
+        compiler_summary.has_local_membar_in_vf_call
+        if compiler_summary is not None
+        else False
     )
     if "vloopv2_hit" in telemetry:
-        vloopv2_hit = bool(telemetry["vloopv2_hit"])
+        vloopv2_hit = _read_bool(telemetry, "vloopv2_hit")
     elif compiler_summary is not None:
-        sw_loops = int(getattr(compiler_summary, "software_loops", 0) or 0)
-        vl_loops = int(getattr(compiler_summary, "vloopv2_loops", 0) or 0)
-        vloopv2_hit = not (sw_loops > 0 and vl_loops == 0)
+        vloopv2_hit = not (
+            compiler_summary.software_loops > 0 and compiler_summary.vloopv2_loops == 0
+        )
     else:
         vloopv2_hit = True
 
+    observation = ObservationVector5D.from_tiers(
+        ledger,
+        compiler_summary=compiler_summary,
+        telemetry=telemetry,
+    )
     return StaticDynamicResidual(
         measured_latency_us=measured_us,
         predicted_bottleneck_util=round(predicted_util, 6),
@@ -226,6 +308,33 @@ def compute_static_dynamic_residual(
         dcache_dcci_flushes=dcache_dcci_flushes,
         has_local_membar_in_vf_call=has_local_membar_in_vf_call,
         vloopv2_hit=vloopv2_hit,
+        observation=observation,
+    )
+
+
+def compiler_summary_from_residual(
+    residual: StaticDynamicResidual,
+) -> BishengResourceSummary | None:
+    """Recover the genuine L1 compiler summary captured in a residual's observation.
+
+    Returns ``None`` when the residual was built without a real bisheng summary so that
+    callers rebuilding a residual from cached L2 telemetry never fabricate zero penalties.
+    """
+    observation = residual.observation
+    if observation is None or not observation.has_l1_compiler_summary:
+        return None
+    return BishengResourceSummary(
+        vec_regs=observation.onchip_sram_reg.l1_vec_regs,
+        scalar_regs=observation.onchip_sram_reg.l1_scalar_regs,
+        spill_bytes=observation.onchip_sram_reg.l1_spill_bytes,
+        stack_bytes=observation.onchip_sram_reg.l1_stack_bytes,
+        vloopv2_loops=observation.compute_issue.l1_vloopv2_loops,
+        software_loops=observation.compute_issue.l1_software_loops,
+        has_local_membar_in_vf_call=observation.pipeline_sync.l1_local_membar_in_vf,
+        vf_fusion_breaks=observation.compute_issue.l1_vf_fusion_breaks,
+        alias_serialized_buffers=observation.pipeline_sync.l1_alias_serialized_buffers,
+        dual_issue_ipc_collapse=observation.compute_issue.l1_dual_issue_collapse,
+        dcache_dcci_flushes=observation.offchip_dma.l1_dcache_dcci_flushes,
     )
 
 
@@ -727,6 +836,7 @@ __all__ = [
     "TwoLaneBeamSearch",
     "compute_eq3_hap_objective",
     "compute_static_dynamic_residual",
+    "compiler_summary_from_residual",
     "extract_cpp_trackb_signature_tags",
     "extract_structural_signature",
 ]

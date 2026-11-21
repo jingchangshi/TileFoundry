@@ -12,11 +12,13 @@ from tilefoundry_ascend.ascend.schedule.pipeline_solver import (
     solve_pipeline_with_monotone_backoff,
 )
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
-from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
-from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
-from tilefoundry_ascend.ascend.target.facts import (
-    cube_macs_per_cycle as _default_cube_macs_per_cycle,
+from tilefoundry_ascend.ascend.sil.schema import (
+    CasePhysicsRatios,
+    TopologyAxes,
+    WaveBand,
+    compute_critical_cube_tile_m,
 )
+from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
 _DTYPE_BYTES: dict[str, int] = {
     "f4e2m1": 1,
@@ -60,79 +62,14 @@ def _dtype_bytes(dtype_name: str) -> int:
     return _DTYPE_BYTES.get(dtype_name.strip().lower(), 2)
 
 
-_CUBE_DTYPE_CANON_AND_BYTES: dict[str, tuple[str, float]] = {
-    "f4e2m1": ("f4e2m1", 0.5),
-    "float4_e2m1": ("f4e2m1", 0.5),
-    "float4_e2m1fn": ("f4e2m1", 0.5),
-    "float4_e2m1fnx2": ("f4e2m1", 0.5),
-    "fp4e2m1": ("f4e2m1", 0.5),
-    "fp4": ("f4e2m1", 0.5),
-    "f4": ("f4e2m1", 0.5),
-    "f4e1m2": ("f4e1m2", 0.5),
-    "float4_e1m2": ("f4e1m2", 0.5),
-    "fp4e1m2": ("f4e1m2", 0.5),
-    "fp8e4m3": ("fp8e4m3", 1.0),
-    "float8_e4m3fn": ("fp8e4m3", 1.0),
-    "fp8_e4m3": ("fp8e4m3", 1.0),
-    "f8e4m3": ("fp8e4m3", 1.0),
-    "fp8": ("fp8e4m3", 1.0),
-    "fp8e5m2": ("fp8e5m2", 1.0),
-    "float8_e5m2": ("fp8e5m2", 1.0),
-    "fp8_e5m2": ("fp8e5m2", 1.0),
-    "f8e5m2": ("fp8e5m2", 1.0),
-    "float8_e8m0fnu": ("fp8e4m3", 1.0),
-    "f8e8m0": ("fp8e4m3", 1.0),
-    "hif8": ("hif8", 1.0),
-    "i8": ("i8", 1.0),
-    "int8": ("i8", 1.0),
-    "u8": ("u8", 1.0),
-    "uint8": ("u8", 1.0),
-    "f16": ("f16", 2.0),
-    "float16": ("f16", 2.0),
-    "half": ("f16", 2.0),
-    "bf16": ("bf16", 2.0),
-    "bfloat16": ("bf16", 2.0),
-    "hf32": ("hf32", 4.0),
-    "f32": ("f32", 4.0),
-    "float32": ("f32", 4.0),
-    "float": ("f32", 4.0),
-}
-
-
-def compute_critical_cube_tile_m(
-    facts: AscendSpaceFacts | None,
-    elem_dtype: str,
-    *,
-    l2_bytes_per_cycle_per_aic: float = 100.0,
-    dual_operand_miss: bool = False,
-) -> int:
-    """Compute analytical Cube tile M waterline: ceil(MACs/cycle * dtype_bytes * miss / L2_BW)."""
-    bw = float(l2_bytes_per_cycle_per_aic)
-    if bw <= 0.0:
-        raise ValueError(
-            f"l2_bytes_per_cycle_per_aic must be > 0, got {l2_bytes_per_cycle_per_aic}"
-        )
-    key = str(elem_dtype).strip().lower()
-    canon_dtype, dbytes = _CUBE_DTYPE_CANON_AND_BYTES.get(key, ("f16", 2.0))
-    macs: int | None = None
-    if facts is not None and hasattr(facts, "cube_macs_per_cycle"):
-        try:
-            macs = int(facts.cube_macs_per_cycle(canon_dtype))
-        except Exception:
-            macs = None
-    if macs is None:
-        macs = int(_default_cube_macs_per_cycle(canon_dtype))
-    miss_factor = 2.0 if dual_operand_miss else 1.0
-    return max(1, int(math.ceil((float(macs) * dbytes * miss_factor) / bw)))
-
-
-def _coerce_topology_axes(raw: TopologyAxes | Mapping[str, object] | None) -> TopologyAxes | None:
+def _coerce_topology_axes(raw: object) -> TopologyAxes | None:
     if raw is None:
         return None
     if isinstance(raw, TopologyAxes):
         return raw
     if isinstance(raw, Mapping):
-        return TopologyAxes.from_dict(raw)
+        fields = {str(key): str(value) for key, value in raw.items()}
+        return TopologyAxes.from_dict(fields)
     raise TypeError(f"topology_axes must be TopologyAxes or Mapping, got {type(raw).__name__}")
 
 
@@ -183,27 +120,121 @@ def _synthesize_axes_from_flags(
     )
 
 
+def _as_int_dims(raw: object) -> dict[str, int]:
+    if not isinstance(raw, Mapping):
+        return {}
+    dims: dict[str, int] = {}
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
+            raise ValueError(f"regime dim {key!r} must be an int or decimal string")
+        dims[str(key)] = int(value)
+    return dims
+
+
+def _as_str_object_mapping(raw: object) -> dict[str, object]:
+    if not isinstance(raw, Mapping):
+        return {}
+    return {str(key): value for key, value in raw.items()}
+
+
+def _as_case_ratios(raw: object) -> tuple[CasePhysicsRatios, ...]:
+    if raw is None:
+        return ()
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise ValueError("case_ratios must be a sequence of CasePhysicsRatios or mappings")
+    ratios: list[CasePhysicsRatios] = []
+    for item in raw:
+        if isinstance(item, CasePhysicsRatios):
+            ratios.append(item)
+        elif isinstance(item, Mapping):
+            ratios.append(
+                CasePhysicsRatios.from_dict({str(key): value for key, value in item.items()})
+            )
+        else:
+            raise ValueError("case_ratios entries must be CasePhysicsRatios or mappings")
+    return tuple(ratios)
+
+
+def _select_representative_ratio(
+    ratios: tuple[CasePhysicsRatios, ...],
+    representative_case_id: int | None,
+) -> CasePhysicsRatios | None:
+    if not ratios:
+        return None
+    if representative_case_id is None:
+        return ratios[len(ratios) // 2]
+    for ratio in ratios:
+        if ratio.case_id == representative_case_id:
+            return ratio
+    return None
+
+
 def _extract_regime_fields(
     regime: Mapping[str, object] | object,
-) -> tuple[str, dict[str, int], bool, bool, dict[str, object], TopologyAxes | None]:
+) -> tuple[
+    str,
+    dict[str, int],
+    bool,
+    bool,
+    dict[str, object],
+    TopologyAxes | None,
+    CasePhysicsRatios | None,
+]:
     if isinstance(regime, Mapping):
         tag = str(regime.get("regime_tag", "default"))
-        raw_dims = regime.get("representative_dims") or regime.get("dims") or {}
-        dims = {str(k): int(v) for k, v in dict(raw_dims).items()}
+        dims = _as_int_dims(regime.get("representative_dims") or regime.get("dims"))
         has_tail = bool(regime.get("has_unaligned_tail", False))
         has_empty = bool(regime.get("has_empty_group", False))
-        roofline = dict(regime.get("roofline") or {})
-        reg_axes = _coerce_topology_axes(regime.get("topology_axes"))  # type: ignore[arg-type]
-        return tag, dims, has_tail, has_empty, roofline, reg_axes
+        roofline = _as_str_object_mapping(regime.get("roofline"))
+        reg_axes = _coerce_topology_axes(regime.get("topology_axes"))
+        raw_case_id = regime.get("representative_case_id")
+        representative_case_id = (
+            int(raw_case_id)
+            if isinstance(raw_case_id, int) and not isinstance(raw_case_id, bool)
+            else None
+        )
+        ratios = _as_case_ratios(regime.get("case_ratios"))
+        return (
+            tag,
+            dims,
+            has_tail,
+            has_empty,
+            roofline,
+            reg_axes,
+            _select_representative_ratio(ratios, representative_case_id),
+        )
 
     tag = str(getattr(regime, "regime_tag", "default"))
-    raw_dims = getattr(regime, "representative_dims", None) or {}
-    dims = {str(k): int(v) for k, v in dict(raw_dims).items()}
+    dims = _as_int_dims(getattr(regime, "representative_dims", None))
     has_tail = bool(getattr(regime, "has_unaligned_tail", False))
     has_empty = bool(getattr(regime, "has_empty_group", False))
-    roofline = dict(getattr(regime, "roofline", None) or {})
+    roofline = _as_str_object_mapping(getattr(regime, "roofline", None))
     reg_axes = _coerce_topology_axes(getattr(regime, "topology_axes", None))
-    return tag, dims, has_tail, has_empty, roofline, reg_axes
+    ratios = _as_case_ratios(getattr(regime, "case_ratios", None))
+    representative_case_id = getattr(regime, "representative_case_id", None)
+    if representative_case_id is not None and (
+        isinstance(representative_case_id, bool)
+        or not isinstance(representative_case_id, int)
+    ):
+        raise ValueError("representative_case_id must be an int")
+    return (
+        tag,
+        dims,
+        has_tail,
+        has_empty,
+        roofline,
+        reg_axes,
+        _select_representative_ratio(ratios, representative_case_id),
+    )
+
+
+def _mapping_float(payload: Mapping[str, object], key: str, default: float = 0.0) -> float:
+    raw = payload.get(key)
+    if raw is None:
+        return default
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        raise ValueError(f"roofline field {key!r} must be numeric, got {type(raw).__name__}")
+    return float(raw)
 
 
 def _is_cube_bound(
@@ -217,13 +248,12 @@ def _is_cube_bound(
         bound = str(roofline.get("dominant_bound", "")).lower()
         if any(k in bound for k in ("cube", "compute", "aic")):
             return True
-        cube_us = float(roofline.get("cube_floor_us", 0.0) or 0.0)
-        mem_us = float(roofline.get("memory_floor_us", 0.0) or 0.0)
-        vec_us = float(roofline.get("vec_floor_us", 0.0) or 0.0)
+        cube_us = _mapping_float(roofline, "cube_floor_us")
+        mem_us = _mapping_float(roofline, "memory_floor_us")
+        vec_us = _mapping_float(roofline, "vec_floor_us")
         if cube_us > 0.0 and cube_us >= max(mem_us, vec_us):
             return True
-        ai = float(roofline.get("arithmetic_intensity", 0.0) or 0.0)
-        if ai >= 128.0:
+        if _mapping_float(roofline, "arithmetic_intensity") >= 128.0:
             return True
     m_val = dims.get("M", dims.get("S_q", dims.get("S", dims.get("m", 0))))
     if uses_cube is True or (axes is not None and axes.uses_cube):
@@ -324,7 +354,12 @@ class RegimePiecewiseSolver:
 
     def __init__(self, target: AscendTarget | None = None) -> None:
         self.target = target or AscendTarget("ascend.950pr")
-        self.facts = self.target.get_facts(AscendSpaceFacts)
+        facts = self.target.get_facts(AscendSpaceFacts)
+        if not isinstance(facts, AscendSpaceFacts):
+            raise RuntimeError(
+                f"target {self.target.identity!r} did not provide AscendSpaceFacts"
+            )
+        self.facts = facts
 
     def _is_ragged_or_recurrent(
         self,
@@ -409,6 +444,7 @@ class RegimePiecewiseSolver:
         has_dead_l1_slice: bool | None = None,
         has_indirect_gather: bool = False,
         quant_mode: str | None = None,
+        representative_ratios: CasePhysicsRatios | None = None,
         solver_mode: str = "analytical_piecewise",
         fallback_used: bool = False,
         fallback_reason: str = "",
@@ -476,6 +512,17 @@ class RegimePiecewiseSolver:
         notes: list[str] = []
         state_space = "none"
         state_bytes = 0
+
+        physics_wave: WaveBand | None = None
+        if representative_ratios is not None:
+            engine_phase, layout_phase, residency_phase, alignment_phase, physics_wave = (
+                representative_ratios.phase_signature(axes)
+            )
+            notes.append(
+                "Physics phase "
+                f"{engine_phase}/{layout_phase}/{residency_phase}/"
+                f"{alignment_phase}/{physics_wave}"
+            )
 
         l1_half = self.facts.l1_bytes // 2
         ub_simdvf = self.facts.ub_simdvf_usable_bytes
@@ -783,6 +830,11 @@ class RegimePiecewiseSolver:
         if has_unaligned_tail:
             notes.append("Predicated / DataCopyPad unaligned tail handling enabled")
 
+        if physics_wave is not None:
+            policy["tail_wave_split"] = (
+                physics_wave != "balanced_waves" or has_unaligned_tail
+            )
+
         return RegimePlanResult(
             regime_tag=regime_tag,
             op_name=op_name,
@@ -820,8 +872,8 @@ class RegimePiecewiseSolver:
         unreserved_ubuf: bool = False,
     ) -> RegimePlanResult:
         """Solve one shape regime via Z3 projection or structural topology planning."""
-        tag, dims, has_tail, has_empty, reg_roofline, reg_axes = _extract_regime_fields(
-            regime
+        tag, dims, has_tail, has_empty, reg_roofline, reg_axes, representative_ratios = (
+            _extract_regime_fields(regime)
         )
         explicit_axes_obj = _coerce_topology_axes(topology_axes) or reg_axes
         has_explicit_flags = any(
@@ -881,6 +933,7 @@ class RegimePiecewiseSolver:
                 has_dead_l1_slice=has_dead_l1_slice,
                 has_indirect_gather=has_indirect_gather,
                 quant_mode=quant_mode,
+                representative_ratios=representative_ratios,
                 solver_mode="z3_projected",
             )
             policy = dict(base_plan.policy)
@@ -948,6 +1001,7 @@ class RegimePiecewiseSolver:
             has_dead_l1_slice=has_dead_l1_slice,
             has_indirect_gather=has_indirect_gather,
             quant_mode=quant_mode,
+            representative_ratios=representative_ratios,
             solver_mode="analytical_piecewise",
         )
 

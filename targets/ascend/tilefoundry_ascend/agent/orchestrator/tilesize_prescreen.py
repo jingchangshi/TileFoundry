@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import ast
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import product
-import math
+
 from tilefoundry_ascend.ascend.cost_model.calibration_backtest import (
     PrescreenAblationReport,
     PrescreenAblationSample,
@@ -20,7 +21,10 @@ from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
 )
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
-from tilefoundry_ascend.ascend.target.facts import ascend_space_facts, cube_macs_per_cycle as _default_cube_macs_per_cycle
+from tilefoundry_ascend.ascend.target.facts import ascend_space_facts
+from tilefoundry_ascend.ascend.target.facts import (
+    cube_macs_per_cycle as _default_cube_macs_per_cycle,
+)
 
 
 def _align512(nbytes: int) -> int:

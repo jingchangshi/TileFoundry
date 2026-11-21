@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from tilefoundry.analysis.facts import (
     MemoryHierarchyFacts,
     MemoryRelationKind,
@@ -9,6 +11,7 @@ from tilefoundry.analysis.facts import (
 )
 from tilefoundry.target import TopologyFacts, TopologyLevelFacts
 from tilefoundry_ascend import AscendTarget
+from tilefoundry_ascend.ascend.target.facts import ascend_space_facts
 
 
 def test_ascend_target_owns_memory_hierarchy_and_throughput_facts():
@@ -46,9 +49,6 @@ def test_ascend_topology_facts():
 
 
 def test_ascend_hbm_burst_bandwidth_curve():
-    import pytest
-    from tilefoundry_ascend.ascend.target.facts import ascend_space_facts
-
     target = AscendTarget()
     facts = ascend_space_facts(target)
     assert facts.hbm_burst_bandwidth_table[0][0] == 4096

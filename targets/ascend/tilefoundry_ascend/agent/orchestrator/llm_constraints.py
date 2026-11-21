@@ -16,6 +16,7 @@ from tilefoundry_ascend.ascend.passes.physical_ledger import (
 )
 from tilefoundry_ascend.ascend.sil.schema import (
     VALID_FREEDOM_FACETS,
+    AdvisoryEnvelope,
     ConstraintRelaxationMask,
     HardwareLegalityBounds,
 )
@@ -43,6 +44,27 @@ def _format_scope_pct(waterline: ScopeWaterline | None) -> str:
         return "n/a"
     pct = 100.0 * float(waterline.peak_allocated_bytes) / float(waterline.capacity_bytes)
     return f"{pct:.2f}%"
+
+
+def _format_regime_ratios(sil_advisory: object | None) -> list[str]:
+    """Render each regime's representative real CasePhysicsRatios for prompt grounding."""
+    if not isinstance(sil_advisory, AdvisoryEnvelope):
+        return []
+    lines: list[str] = []
+    for regime in sil_advisory.regimes:
+        ratios = regime.representative_ratios()
+        if ratios is None:
+            lines.append(
+                f"- Regime {regime.regime_tag} cases={list(regime.case_nums)} "
+                "CasePhysicsRatios: unavailable"
+            )
+            continue
+        lines.append(
+            f"- Regime {regime.regime_tag} cases={list(regime.case_nums)} "
+            f"representative_case={ratios.case_id} "
+            f"CasePhysicsRatios: {json.dumps(ratios.to_dict(), sort_keys=True)}"
+        )
+    return lines
 
 
 def format_hardware_and_sil_layer(
@@ -98,6 +120,7 @@ def format_hardware_and_sil_layer(
         lines.append(f"- TopologyAxes: {json.dumps(axes_dict, sort_keys=True)}")
         if roofline:
             lines.append(f"- Advisory Roofline: {json.dumps(dict(roofline), sort_keys=True)}")
+        lines.extend(_format_regime_ratios(sil_advisory))
         if getattr(sil_advisory, "has_nan_inf_cases", False):
             lines.append("- Guard: has_nan_inf_cases=True (avoid unshifted fast exp overflow)")
 
@@ -160,7 +183,11 @@ def format_blueprint_delta_section(
     *,
     current_ledger: ObjectivePhysicalLedger | None = None,
 ) -> str:
-    """Render Layer 3 dialect-neutral Roofline, Z3 floor, and physical ledger deltas."""
+    """Render Layer 3 dialect-neutral Roofline, Z3 floor, and physical ledger deltas.
+
+    Microsecond floors render through repr so a positive value below 1e-4
+    stays nonzero and round-trips.
+    """
     rf = blueprint.roofline
     display_dims = rf.resolved_hir_dims or rf.anchor_dims
     dims_text = ", ".join(f"{k}={v}" for k, v in sorted(display_dims.items())) or "default"
@@ -176,9 +203,9 @@ def format_blueprint_delta_section(
             f"arithmetic_intensity: {rf.arithmetic_intensity:.4f}"
         ),
         (
-            f"- compute_floor_us: {rf.compute_floor_us:.4f}, "
-            f"memory_floor_us: {rf.memory_floor_us:.4f}, "
-            f"ideal_roofline_us: {rf.ideal_roofline_us:.4f}, "
+            f"- compute_floor_us: {rf.compute_floor_us!r}, "
+            f"memory_floor_us: {rf.memory_floor_us!r}, "
+            f"ideal_roofline_us: {rf.ideal_roofline_us!r}, "
             f"dominant_bound: {rf.dominant_bound}"
         ),
     ]

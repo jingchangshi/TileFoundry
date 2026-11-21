@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import re
 import tempfile
 import time
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import MicroarchProfile

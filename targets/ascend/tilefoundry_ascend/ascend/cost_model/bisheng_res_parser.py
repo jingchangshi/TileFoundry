@@ -1,13 +1,14 @@
-"""Parse ``bisheng --cce-res-usage`` output, CCE assembly/IR dumps, and Tier-1
-behavior registry.
+"""Parse ``bisheng --cce-res-usage`` output and CCE assembly dumps.
+
+Also covers the Tier-1 behavior registry.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, field
 import inspect
 import re
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 _UNIT_MULTIPLIER: dict[str, int] = {

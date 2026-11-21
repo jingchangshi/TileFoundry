@@ -44,6 +44,32 @@ from tilefoundry_ascend.agent.orchestrator import StageAResult, StageBResult, Tw
 from tilefoundry_ascend.agent.router import extract_structural_features, route_execution_track
 from tilefoundry_ascend.ascend.passes import build_objective_physical_ledger
 
+
+@pytest.fixture(autouse=True)
+def _isolate_synthetic_campaign_from_real_cannbench(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep synthetic campaign runners from resolving the machine's real cann-bench checkout.
+
+    Production runners synthesize one universal blueprint per regime from the official PyTorch
+    golden. These unit tests build synthetic target modules under a real operator name, so an
+    unrelated local cann-bench checkout would inject authoritative semantics that the fixtures
+    never declared. Tests that need the official operator pass ``cannbench_repo`` explicitly and
+    still resolve it through the real implementation.
+    """
+    real_resolve = campaign_runner.resolve_cannbench_repo
+
+    def _resolve(
+        cannbench_repo: str | Path | None = None,
+        env_file: str | Path | None = None,
+    ) -> Path:
+        if cannbench_repo is None:
+            raise FileNotFoundError("synthetic campaign unit test has no cann-bench repository")
+        return real_resolve(cannbench_repo=cannbench_repo, env_file=env_file)
+
+    monkeypatch.setattr(campaign_runner, "resolve_cannbench_repo", _resolve)
+
+
 _MULTI_REGIME_MODULE = """
 import tilelang.ascend.language as T
 
@@ -2232,6 +2258,7 @@ def test_campaign_runner_cli_arg_parser() -> None:
 def test_scoped_multi_symbol_regime_slice_extract_and_patch(tmp_path: Path) -> None:
     """Verify multi-symbol extraction, patching, helper lifecycle, and guardrails."""
     import pytest  # noqa: PLC0415
+
     from tilefoundry_ascend.agent.campaign import (  # noqa: PLC0415
         RegimeSpec,
         get_default_regime_specs,
@@ -2359,6 +2386,7 @@ def test_scoped_multi_symbol_regime_slice_extract_and_patch(tmp_path: Path) -> N
 def test_config_selector_pass_configs_and_kernel_cache_plumbing(monkeypatch) -> None:
     """Verify _select_*_config, PrimFunc.attrs, Stage A 256 KiB UB, and _KERNEL_CACHE."""
     import tilelang  # noqa: PLC0415
+
     from tilefoundry_ascend.agent.campaign import resolve_regime_config  # noqa: PLC0415
     from tilefoundry_ascend.agent.orchestrator import run_stage_a_static  # noqa: PLC0415
     from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS  # noqa: PLC0415
@@ -2752,6 +2780,7 @@ def test_campaign_axis_pruning_and_cross_topology_isolation(tmp_path: Path) -> N
 def test_resolve_regime_for_case_and_dynamic_l4_regression_routing(tmp_path: Path) -> None:
     """Verify lookup_case_dims, resolve_regime_for_case, and L4 routing to non-zero regime."""
     import yaml  # noqa: PLC0415
+
     from tilefoundry_ascend.agent.campaign import (  # noqa: PLC0415
         get_default_regime_specs,
         lookup_case_dims,
@@ -2785,6 +2814,18 @@ def test_resolve_regime_for_case_and_dynamic_l4_regression_routing(tmp_path: Pat
         ]
     }
     (ar_dir / "cases.yaml").write_text(yaml.safe_dump(cases_payload), encoding="utf-8")
+    (ar_dir / "golden.py").write_text(
+        "import torch\n\n"
+        "def attention_residual(v_stack, x, w, gamma, alpha, epsilon=1e-6):\n"
+        "    v = v_stack.to(torch.float32)\n"
+        "    rms = torch.sqrt(v.pow(2).mean(dim=-1, keepdim=True) + float(epsilon))\n"
+        "    k = v / rms * gamma.to(torch.float32)\n"
+        "    s = torch.einsum('nbtd,d->nbt', k, w.to(torch.float32))\n"
+        "    p = torch.softmax(s, dim=0)\n"
+        "    agg = torch.einsum('nbt,nbtd->btd', p, v)\n"
+        "    return ((1.0 - float(alpha)) * x.to(torch.float32) + float(alpha) * agg).to(x.dtype)\n",
+        encoding="utf-8",
+    )
     dims_5 = lookup_case_dims("attention_residual", 5, cannbench_repo=repo)
     assert dims_5["N"] == 8 and dims_5["B"] == 1 and dims_5["S"] == 512 and dims_5["D"] == 1024
 
@@ -2812,8 +2853,18 @@ def test_resolve_regime_for_case_and_dynamic_l4_regression_routing(tmp_path: Pat
     assert dims_14["S_kv"] == 512 and dims_14["N_kv"] == 1 and dims_14["inputLayout"] == "BNSD"
 
     regimes = (
-        RegimeTargetSpec("small_decode", ("_build_regime_a",), {}),
-        RegimeTargetSpec("aligned_prefill", ("_build_regime_b",), {}),
+        RegimeTargetSpec(
+            "small_decode",
+            ("_build_regime_a",),
+            {},
+            representative_hir_dims={"B": 1, "N": 8, "S": 512, "D": 1024},
+        ),
+        RegimeTargetSpec(
+            "aligned_prefill",
+            ("_build_regime_b",),
+            {},
+            representative_hir_dims={"B": 1, "N": 4, "S": 4096, "D": 2560},
+        ),
     )
     anchors = (AnchorCaseSpec("level4/attention_residual", 2, "small_decode", 10.0, 2.0),)
     target_path = tmp_path / "kernels_l4.py"
@@ -3062,6 +3113,7 @@ def test_prewarm_surrogate_tilelang_cache_pure_cpu_without_harness_prepare(
 ) -> None:
     """Verify prewarm compiles via cases.yaml without calling Harness.prepare."""
     import yaml  # noqa: PLC0415
+
     from tilefoundry_ascend.agent.campaign import prewarm_surrogate_tilelang_cache  # noqa: PLC0415
 
     repo_root = Path(__file__).resolve().parents[3]
@@ -3344,6 +3396,7 @@ def test_extract_regime_abi_context_covers_ar_and_mla_signatures() -> None:
 def test_is_transient_blocked_env_retries_dependency_flake_not_device_fail():
     """Verify DEPENDENCY_NOT_PASSED triggers retry while real device FAIL does not."""
     import subprocess  # noqa: PLC0415
+
     from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (  # noqa: PLC0415
         _is_transient_blocked_env,
     )
@@ -3375,6 +3428,7 @@ def test_is_transient_blocked_env_retries_dependency_flake_not_device_fail():
 def test_up3_domain_envelope_prompt_and_host_dispatch_cache(tmp_path: Path, monkeypatch) -> None:
     """Verify InputDomainEnvelope prompts, builder_kwargs unpacking, and _DISPATCH_CACHE."""
     import torch  # noqa: PLC0415
+
     from examples.ascend950pr_ops.attention_residual import kernels as ar_kernels  # noqa: PLC0415
     from examples.ascend950pr_ops.mla import kernels as mla_kernels  # noqa: PLC0415
     from tilefoundry_ascend.agent import (  # noqa: PLC0415
@@ -3520,6 +3574,7 @@ def test_wp_final1_pruned_inline_regimes_partial_override_and_mla_combine_gate(
     """Verify inline pruned kernels, partial override + orphan GC, cache, and combine gate."""
     import pytest  # noqa: PLC0415
     import torch  # noqa: PLC0415
+
     from examples.ascend950pr_ops.mla import kernels as mla_kernels  # noqa: PLC0415
     from tilefoundry_ascend.agent.campaign import campaign_runner as cr_mod  # noqa: PLC0415
     from tilefoundry_ascend.agent.campaign import resolve_regime_config  # noqa: PLC0415
@@ -3711,6 +3766,7 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
 ) -> None:
     """Verify prewarm extra builder/combine kwargs forwarding and local regime L3 promotion."""
     import yaml  # noqa: PLC0415
+
     from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (  # noqa: PLC0415
         prewarm_surrogate_tilelang_cache,
     )
@@ -3949,6 +4005,7 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
 def test_wp_final3_persistent_wave_occupancy_weighted_burst_pipe_all_and_r21() -> None:
     """Verify persistent active wave occupancy, byte-weighted burst, PIPE_ALL, and R21."""
     import tilelang.ascend.language as T  # noqa: PLC0415
+
     from tilefoundry_ascend.agent.campaign import build_anchor_var_bindings  # noqa: PLC0415
     from tilefoundry_ascend.agent.kb import (  # noqa: PLC0415
         build_predicate_context,
@@ -4364,6 +4421,7 @@ def test_stepping_stone_splicing_causal_credit_and_live_flywheel_wiring(
 ) -> None:
     """Verify stepping-stone parent splicing, causal PMU credit, and AgentGates probe wiring."""
     import ast  # noqa: PLC0415
+
     from tilefoundry_ascend.agent.flywheel.ablation_distiller import MicroProbeSpec  # noqa: PLC0415
     from tilefoundry_ascend.agent.kb.schema import AscendCausalRule  # noqa: PLC0415
 

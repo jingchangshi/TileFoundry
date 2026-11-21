@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, build_predicate_context
@@ -35,6 +35,7 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
 )
 from tilefoundry_ascend.agent.router.capability_gate import (
     EscalationDecision,
+    StructuralFeatures,
     evaluate_track_escalation,
 )
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
@@ -46,7 +47,7 @@ from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
 )
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirBlueprintPacket
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
-from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
+from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios, TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 from tilefoundry_ascend.ascend.target.dialect_surface import get_dialect_surface
 from tilefoundry_ascend.ascend.templates.registry import (
@@ -457,6 +458,20 @@ def _coerce_topology_axes_opt(raw: object | None) -> TopologyAxes | None:
     return None
 
 
+def _project_features_with_ratios(
+    features: StructuralFeatures | None,
+    case_ratios: CasePhysicsRatios | None,
+) -> StructuralFeatures | None:
+    """Project real per-case physics ratios onto the compatibility phi_7/phi_8 view."""
+    if features is None or case_ratios is None:
+        return features
+    return replace(
+        features,
+        phi_7_inner_contiguous_bytes=case_ratios.inner_contiguous_bytes,
+        phi_8_persistent_wave_occupancy=case_ratios.wave_occupancy_ratio,
+    )
+
+
 def _derive_active_topology_axes(
     ledger: object | None,
     *,
@@ -464,44 +479,72 @@ def _derive_active_topology_axes(
     sil_advisory: object | None = None,
     route: object | None = None,
     topology_axes: object | None = None,
+    case_ratios: CasePhysicsRatios | None = None,
 ) -> TopologyAxes:
-    explicit = _coerce_topology_axes_opt(topology_axes)
-    if explicit is not None:
-        return explicit
-    if sil_advisory is not None:
+    axes = _coerce_topology_axes_opt(topology_axes)
+    if axes is None and sil_advisory is not None:
         adv_axes = (
             sil_advisory.get("topology_axes")
             if isinstance(sil_advisory, Mapping)
             else getattr(sil_advisory, "topology_axes", None)
         )
-        coerced = _coerce_topology_axes_opt(adv_axes)
-        if coerced is not None:
-            return coerced
-    if route is not None:
+        axes = _coerce_topology_axes_opt(adv_axes)
+    if axes is None and route is not None:
         r_axes = (
             route.get("topology_axes")
             if isinstance(route, Mapping)
             else getattr(route, "topology_axes", None)
         )
-        coerced = _coerce_topology_axes_opt(r_axes)
-        if coerced is not None:
-            return coerced
-    if sil_advisory is not None or features is not None:
-        return resolve_canonical_topology_axes(sil_advisory, features=features)
+        axes = _coerce_topology_axes_opt(r_axes)
+    if axes is None:
+        if sil_advisory is not None or features is not None:
+            axes = resolve_canonical_topology_axes(sil_advisory, features=features)
+        else:
+            pipe_cycles = getattr(ledger, "pipe_cycles", None) or {}
+            if isinstance(pipe_cycles, Mapping) and (
+                pipe_cycles.get("AIC.PIPE_M", 0) > 0
+                or pipe_cycles.get("AIC.CUBE", 0) > 0
+            ):
+                axes = TopologyAxes(
+                    compute_engine="aic_only",
+                    memory_ring="gm_l1_l0_fixpipe",
+                    iteration_regularity="affine_simd",
+                )
+            else:
+                axes = TopologyAxes(
+                    compute_engine="aiv_only",
+                    memory_ring="gm_ub_stream",
+                    iteration_regularity="affine_simd",
+                )
+    return case_ratios.effective_axes(axes) if case_ratios is not None else axes
 
-    pipe_cycles = getattr(ledger, "pipe_cycles", None) or {}
-    if isinstance(pipe_cycles, Mapping) and (
-        pipe_cycles.get("AIC.PIPE_M", 0) > 0 or pipe_cycles.get("AIC.CUBE", 0) > 0
-    ):
-        return TopologyAxes(
-            compute_engine="aic_only",
-            memory_ring="gm_l1_l0_fixpipe",
-            iteration_regularity="affine_simd",
+
+def _format_regime_ratio_line(regime: Mapping[str, object]) -> str:
+    """Render one regime's representative real CasePhysicsRatios from its serialized form."""
+    tag = str(regime.get("regime_tag", ""))
+    raw_cases = regime.get("case_nums") or ()
+    case_nums = [int(case) for case in raw_cases] if isinstance(raw_cases, (list, tuple)) else []
+    raw_ratios = regime.get("case_ratios") or ()
+    ratios = (
+        tuple(item for item in raw_ratios if isinstance(item, Mapping))
+        if isinstance(raw_ratios, (list, tuple))
+        else ()
+    )
+    if not ratios:
+        return f"- regime {tag} cases={case_nums} CasePhysicsRatios: unavailable"
+    representative_id = regime.get("representative_case_id")
+    if isinstance(representative_id, int) and not isinstance(representative_id, bool):
+        selected = next(
+            (ratio for ratio in ratios if ratio.get("case_id") == representative_id),
+            None,
         )
-    return TopologyAxes(
-        compute_engine="aiv_only",
-        memory_ring="gm_ub_stream",
-        iteration_regularity="affine_simd",
+        if selected is None:
+            return f"- regime {tag} cases={case_nums} CasePhysicsRatios: unavailable"
+    else:
+        selected = ratios[len(ratios) // 2]
+    return (
+        f"- regime {tag} cases={case_nums} "
+        f"CasePhysicsRatios: {json.dumps(dict(selected), sort_keys=True)}"
     )
 
 
@@ -542,6 +585,9 @@ def format_sil_diagnostics_section(
         regimes = adv.get("regimes")
         if isinstance(regimes, (list, tuple)) and regimes:
             lines.append(f"- stratified_regimes: {len(regimes)}")
+            for regime in regimes:
+                if isinstance(regime, Mapping):
+                    lines.append(_format_regime_ratio_line(regime))
         sections.append("\n".join(lines))
 
     if sil_verification is not None:
@@ -700,7 +746,7 @@ def build_creative_request(
         f"### STATIC-DYNAMIC RESIDUAL\n{json.dumps(parent.residual.to_dict(), indent=2)}\n\n"
         f"### CURRENT KERNEL SOURCE\n```python\n{parent.dsl_source}\n```\n"
     )
-    is_trackb = get_dialect_surface(escalation_tier).dialect_id == "tl_templates_cpp20"
+    is_trackb = get_dialect_surface(escalation_tier).dialect_id == "cce_cpp20"
     return GenerationRequest(
         role="escalate_trackb" if is_trackb else "explore_creative",
         system_prompt=sys_prompt,
@@ -715,20 +761,23 @@ def build_syntax_repair_request(
     error_message: str,
     *,
     slice_hint: str = "",
+    sil_advisory: object | None = None,
     sil_verification: object | None = None,
     backend_kind: str = "tilelang_dsl",
 ) -> GenerationRequest:
     """Build bounded syntax/compile repair request routed to the active backend dialect."""
     hint_sentence = f" Authorized target: {slice_hint}." if slice_hint else ""
     surface = get_dialect_surface(backend_kind)
-    is_cpp = surface.dialect_id == "tl_templates_cpp20"
+    is_cpp = surface.dialect_id == "cce_cpp20"
     fence_lang = "cpp" if is_cpp else "python"
     if is_cpp:
         sys_prompt = (
-            "You are an AscendC C++20 (tl_templates/ascend) kernel repair engineer. Fix the "
-            "syntax, API, sync-pairing, or SRAM-capacity failure reported below without altering "
-            "tensor semantics. Output ONLY valid C++20 SEARCH/REPLACE hunks or authorized "
-            f"kernel code matching the target regime contract.{hint_sentence}"
+            "You are a Track-B CCE (C++20) kernel repair engineer for the tl_templates/ascend "
+            "surface. Fix the syntax, API, sync-pairing, or SRAM-capacity failure reported "
+            "below without altering tensor semantics. Output ONLY valid C++20 SEARCH/REPLACE "
+            "hunks or authorized kernel code matching the target regime contract. "
+            "Do NOT emit high-level AscendC classes or legacy 910B raw CCE intrinsics."
+            f"{hint_sentence}"
         )
     else:
         sys_prompt = (
@@ -741,7 +790,10 @@ def build_syntax_repair_request(
             f"BROKEN KERNEL SOURCE (do NOT add unprefixed or out-of-regime functions)."
             f"{hint_sentence}"
         )
-    sil_text = format_sil_diagnostics_section(sil_verification=sil_verification)
+    sil_text = format_sil_diagnostics_section(
+        sil_advisory=sil_advisory,
+        sil_verification=sil_verification,
+    )
     sil_block = f"{sil_text}\n\n" if sil_text else ""
     user_prompt = (
         f"### VALID TARGET DIALECT PRIMITIVES ({surface.dialect_id})\n"
@@ -806,19 +858,22 @@ class PortfolioRunner:
         sil_advisory: object | None = None,
         sil_verification: object | None = None,
         topology_axes: object | None = None,
+        case_ratios: CasePhysicsRatios | None = None,
         cost_model: HybridAscendCostModel | None = None,
         escalation_tier: str = "tilelang_dsl",
     ) -> tuple[WorkerSpec, ...]:
         """Select matching causal rules and fill remaining slots with creative explorers."""
+        parent_features = _project_features_with_ratios(parent.features, case_ratios)
         active_axes = _derive_active_topology_axes(
             parent.ledger,
-            features=parent.features,
+            features=parent_features,
             sil_advisory=sil_advisory,
             topology_axes=topology_axes,
+            case_ratios=case_ratios,
         )
         ctx = build_predicate_context(
             parent.ledger,
-            features=parent.features,
+            features=parent_features,
             residual=parent.residual,
             extra={"topology_axes": active_axes},
         )
@@ -922,13 +977,18 @@ class PortfolioRunner:
         sil_advisory: object | None = None,
         sil_verification: object | None = None,
         topology_axes: object | None = None,
+        case_ratios: CasePhysicsRatios | None = None,
         escalation_tier: str = "tilelang_dsl",
     ) -> tuple[BeamCandidate | None, bool, tuple[str, str, str] | None, bool]:
         active_axes = _derive_active_topology_axes(
             spec.parent_candidate.ledger,
-            features=spec.parent_candidate.features,
+            features=_project_features_with_ratios(
+                spec.parent_candidate.features,
+                case_ratios,
+            ),
             sil_advisory=sil_advisory,
             topology_axes=topology_axes,
+            case_ratios=case_ratios,
         )
         try:
             raw_reply = await self._backend.generate(spec.request)
@@ -966,6 +1026,7 @@ class PortfolioRunner:
                 repair_req = build_syntax_repair_request(
                     dsl_source,
                     evaluation.error_message,
+                    sil_advisory=sil_advisory,
                     sil_verification=sil_verification,
                     backend_kind=escalation_tier,
                 )
@@ -1007,12 +1068,20 @@ class PortfolioRunner:
 
         ledger = evaluation.stage_a.ledger
         comp_summary = evaluation.stage_b.compiler_summary if evaluation.stage_b else None
+        stage_features = evaluation.stage_a.features
+        worker_features = _project_features_with_ratios(
+            stage_features
+            if isinstance(stage_features, StructuralFeatures)
+            else spec.parent_candidate.features,
+            case_ratios,
+        )
         cand_axes = _derive_active_topology_axes(
             ledger,
-            features=evaluation.stage_a.features or spec.parent_candidate.features,
+            features=worker_features,
             sil_advisory=sil_advisory,
             route=evaluation.stage_a.route,
             topology_axes=topology_axes,
+            case_ratios=case_ratios,
         )
         track = (
             evaluation.stage_a.route.track
@@ -1057,7 +1126,7 @@ class PortfolioRunner:
         if spec.rule is not None:
             post_ctx = build_predicate_context(
                 ledger,
-                features=evaluation.stage_a.features,
+                features=worker_features,
                 residual=residual,
                 compiler_summary=comp_summary,
                 prev_ledger=spec.parent_candidate.ledger,
@@ -1099,7 +1168,7 @@ class PortfolioRunner:
             ),
             hypothesis=hypothesis,
             parent_id=spec.parent_candidate.candidate_id,
-            features=evaluation.stage_a.features or spec.parent_candidate.features,
+            features=worker_features,
         )
         return cand, repaired, None, is_analytical_proxy
 
@@ -1120,14 +1189,16 @@ class PortfolioRunner:
         sil_advisory: object | None = None,
         sil_verification: object | None = None,
         topology_axes: object | None = None,
+        case_ratios: CasePhysicsRatios | None = None,
         escalation_tier: str = "tilelang_dsl",
     ) -> PortfolioRoundReport:
         """Execute one parallel portfolio round across Rule and Creative workers."""
         active_axes = _derive_active_topology_axes(
             parent.ledger,
-            features=parent.features,
+            features=_project_features_with_ratios(parent.features, case_ratios),
             sil_advisory=sil_advisory,
             topology_axes=topology_axes,
+            case_ratios=case_ratios,
         )
         specs = self.plan_workers(
             parent,
@@ -1144,6 +1215,7 @@ class PortfolioRunner:
             sil_advisory=sil_advisory,
             sil_verification=sil_verification,
             topology_axes=active_axes,
+            case_ratios=case_ratios,
             escalation_tier=escalation_tier,
         )
         tasks = [
@@ -1158,6 +1230,7 @@ class PortfolioRunner:
                 sil_advisory=sil_advisory,
                 sil_verification=sil_verification,
                 topology_axes=active_axes,
+                case_ratios=case_ratios,
                 escalation_tier=escalation_tier,
             )
             for spec in specs
@@ -1203,6 +1276,7 @@ class PortfolioRunner:
         current_mask: ConstraintRelaxationMask | None = None,
         cost_model: HybridAscendCostModel | None = None,
         workload: Mapping[str, object] | None = None,
+        case_ratios: CasePhysicsRatios | None = None,
     ) -> RoundEscalationReport:
         """Run closed-loop track escalation and facet relaxation using HybridAscendCostModel."""
         model = cost_model if cost_model is not None else HybridAscendCostModel(AscendTarget("ascend.950pr"))
@@ -1249,7 +1323,7 @@ class PortfolioRunner:
             stagnation_rounds=stagnation_rounds,
             dominant_bound=eff_bound,
             compiler_summary=eff_summary,
-            structural_features=candidate.features,
+            structural_features=_project_features_with_ratios(candidate.features, case_ratios),
         )
 
         waterlines = getattr(candidate.ledger, "waterlines", {}) or {}

@@ -10,10 +10,29 @@ import os
 import re
 import shlex
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import yaml
+
+from tilefoundry_ascend.ascend.sil.pytorch_frontend import PyTorchSemanticAnalyzer
+from tilefoundry_ascend.ascend.sil.schema import (
+    AlignmentBand,
+    CasePhysicsRatios,
+    CasePhysicsRegimeGroup,
+    EnginePhase,
+    LayoutPhase,
+    ResidencyBand,
+    TopologyAxes,
+    WaveBand,
+    case_workload_bytes,
+    classify_case_regime,
+    flatten_int_shapes,
+    flatten_str_values,
+    infer_case_dims_structural,
+    infer_case_physics_kind,
+    partition_case_regimes,
+)
 
 
 @dataclass(frozen=True)
@@ -92,6 +111,57 @@ class PerfTargetSpec:
         )
 
 
+def _case_ratios_to_dict(ratios: CasePhysicsRatios) -> dict[str, object]:
+    return {
+        "case_id": ratios.case_id,
+        "stride_ratio": ratios.stride_ratio,
+        "contig_atom_ratio": ratios.contig_atom_ratio,
+        "is_atom_aligned": ratios.is_atom_aligned,
+        "working_set_sram_ratio": ratios.working_set_sram_ratio,
+        "working_set_vreg_ratio": ratios.working_set_vreg_ratio,
+        "wave_occupancy_ratio": ratios.wave_occupancy_ratio,
+        "oi_ridge_ratio": ratios.oi_ridge_ratio,
+        "inner_contiguous_bytes": ratios.inner_contiguous_bytes,
+        "has_empty_group": ratios.has_empty_group,
+    }
+
+
+def _ratios_int(payload: Mapping[str, object], key: str) -> int:
+    value = payload[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"CasePhysicsRatios.{key} must be an int")
+    return value
+
+
+def _ratios_float(payload: Mapping[str, object], key: str) -> float:
+    value = payload[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"CasePhysicsRatios.{key} must be a number")
+    return float(value)
+
+
+def _ratios_bool(payload: Mapping[str, object], key: str, default: bool = False) -> bool:
+    value = payload.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"CasePhysicsRatios.{key} must be a bool")
+    return value
+
+
+def _case_ratios_from_dict(payload: Mapping[str, object]) -> CasePhysicsRatios:
+    return CasePhysicsRatios(
+        case_id=_ratios_int(payload, "case_id"),
+        stride_ratio=_ratios_float(payload, "stride_ratio"),
+        contig_atom_ratio=_ratios_float(payload, "contig_atom_ratio"),
+        is_atom_aligned=_ratios_bool(payload, "is_atom_aligned"),
+        working_set_sram_ratio=_ratios_float(payload, "working_set_sram_ratio"),
+        working_set_vreg_ratio=_ratios_float(payload, "working_set_vreg_ratio"),
+        wave_occupancy_ratio=_ratios_float(payload, "wave_occupancy_ratio"),
+        oi_ridge_ratio=_ratios_float(payload, "oi_ridge_ratio"),
+        inner_contiguous_bytes=_ratios_int(payload, "inner_contiguous_bytes"),
+        has_empty_group=_ratios_bool(payload, "has_empty_group"),
+    )
+
+
 @dataclass(frozen=True)
 class RegimeTargetSpec:
     """Target dispatch regime inside an operator kernel module."""
@@ -107,6 +177,8 @@ class RegimeTargetSpec:
     allowed_helper_prefix: str = ""
     runtime_backend: str = "tilelang_dsl"
     trackb_symbols: tuple[str, ...] = ()
+    representative_case_entry: dict[str, object] = field(default_factory=dict)
+    representative_case_ratios: CasePhysicsRatios | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Serialize regime target specification to a JSON-compatible dictionary."""
@@ -126,6 +198,12 @@ class RegimeTargetSpec:
             "allowed_helper_prefix": self.allowed_helper_prefix,
             "runtime_backend": self.runtime_backend,
             "trackb_symbols": list(self.trackb_symbols),
+            "representative_case_entry": dict(self.representative_case_entry),
+            "representative_case_ratios": (
+                _case_ratios_to_dict(self.representative_case_ratios)
+                if self.representative_case_ratios is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -134,6 +212,8 @@ class RegimeTargetSpec:
         raw_kwargs = payload.get("sample_builder_kwargs") or {}
         raw_dims = payload.get("representative_hir_dims") or {}
         raw_anchor_dims = payload.get("representative_anchor_dims") or {}
+        raw_case_entry = payload.get("representative_case_entry") or {}
+        raw_case_ratios = payload.get("representative_case_ratios")
         return cls(
             regime_tag=str(payload["regime_tag"]),
             builder_candidates=tuple(str(x) for x in payload.get("builder_candidates", ())),
@@ -156,6 +236,14 @@ class RegimeTargetSpec:
                 payload.get("runtime_backend", "tilelang_dsl") or "tilelang_dsl"
             ),
             trackb_symbols=tuple(str(x) for x in (payload.get("trackb_symbols", ()) or ())),
+            representative_case_entry=(
+                dict(raw_case_entry) if isinstance(raw_case_entry, Mapping) else {}
+            ),
+            representative_case_ratios=(
+                _case_ratios_from_dict(raw_case_ratios)
+                if isinstance(raw_case_ratios, Mapping)
+                else None
+            ),
         )
 
 
@@ -743,6 +831,11 @@ class CannbenchOpSpec:
     module_relpath: str
     entrypoint: str
 
+    @property
+    def golden_path(self) -> Path:
+        """Return the PyTorch golden reference path inside the task directory."""
+        return self.op_dir / "golden.py"
+
 
 _TRACKB_CPP_MARKERS: tuple[str, ...] = (
     "tl_templates/ascend/",
@@ -796,6 +889,35 @@ def discover_module_trackb_symbols(module_text: str) -> tuple[str, ...]:
     if not cpp_symbols:
         return ()
     return tuple(dict.fromkeys([*cpp_symbols, *plan_symbols]))
+
+
+def extract_trackb_cpp_source(
+    module_source: str,
+    trackb_symbols: Sequence[str],
+) -> tuple[str, str] | None:
+    """Return the first Track-B C++20 translation-unit constant among trackb_symbols."""
+    if not trackb_symbols:
+        return None
+    tree = ast.parse(module_source)
+    constants: dict[str, str] = {}
+    for node in tree.body:
+        name: str | None = None
+        value: ast.AST | None = None
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            name, value = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, value = node.target.id, node.value
+        if name and isinstance(value, ast.Constant) and isinstance(value.value, str):
+            constants[name] = value.value
+    for symbol in trackb_symbols:
+        cpp_source = constants.get(symbol)
+        if cpp_source and cpp_source.strip():
+            return symbol, cpp_source
+    return None
 
 
 def _coerce_positive_int(val: object, default: int = 0) -> int:
@@ -853,6 +975,15 @@ def infer_module_runtime_backend(
     return "tilelang_dsl", ()
 
 
+@dataclass(frozen=True, kw_only=True)
+class _SemanticCasePartition:
+    """PyTorch-derived operator semantics and per-case physical ratios for one operator."""
+
+    base_axes: TopologyAxes
+    has_reduction: bool
+    ratios: tuple[CasePhysicsRatios, ...]
+
+
 class CannbenchOpsRegistry:
     """Dynamic registry discovering all 60+ operators in cann-bench/tasks."""
 
@@ -875,6 +1006,8 @@ class CannbenchOpsRegistry:
         self._entries: dict[str, dict[str, object]] = {}
         self._task_to_op: dict[str, str] = {}
         self._cache: dict[str, CannbenchOpSpec] = {}
+        self._semantic_partitions: dict[str, _SemanticCasePartition] = {}
+        self._semantic_groups: dict[str, tuple[SemanticRegimeGroup, ...]] = {}
         self._discover_manifest()
 
     @classmethod
@@ -1082,94 +1215,447 @@ class CannbenchOpsRegistry:
         self._cache[op_id] = spec
         return spec
 
+    def _module_path(self, spec: CannbenchOpSpec) -> Path:
+        return self._source_root / spec.module_relpath
+
+    def _module_source(self, spec: CannbenchOpSpec) -> str:
+        mod_file = self._module_path(spec)
+        return mod_file.read_text(encoding="utf-8") if mod_file.is_file() else ""
+
+    def _semantic_partition(self, spec: CannbenchOpSpec) -> _SemanticCasePartition:
+        cached = self._semantic_partitions.get(spec.op_id)
+        if cached is not None:
+            return cached
+        if not spec.golden_path.is_file():
+            raise FileNotFoundError(
+                f"operator {spec.op_id!r} has no PyTorch golden reference at "
+                f"{spec.golden_path} for semantic regime partitioning"
+            )
+        analyzer = PyTorchSemanticAnalyzer()
+        semantics = analyzer.analyze_source(
+            spec.golden_path.read_text(encoding="utf-8"),
+            entry_name=spec.entrypoint,
+            proto=spec.proto,
+        )
+        ratios = tuple(analyzer.compute_case_ratios(semantics, case) for case in spec.cases)
+        partition = _SemanticCasePartition(
+            base_axes=semantics.base_axes,
+            has_reduction=semantics.has_reduction,
+            ratios=ratios,
+        )
+        self._semantic_partitions[spec.op_id] = partition
+        return partition
+
+    def _semantic_regime_groups(
+        self,
+        spec: CannbenchOpSpec,
+    ) -> tuple[SemanticRegimeGroup, ...]:
+        cached = self._semantic_groups.get(spec.op_id)
+        if cached is not None:
+            return cached
+        partition = self._semantic_partition(spec)
+        groups = build_semantic_regime_groups(
+            operator_name=spec.op_id,
+            cases=spec.cases,
+            proto=spec.proto,
+            base_axes=partition.base_axes,
+            has_reduction=partition.has_reduction,
+            case_ratios=partition.ratios,
+        )
+        self._semantic_groups[spec.op_id] = groups
+        return groups
+
     def get_anchors(self, name_or_task: str) -> tuple[AnchorCaseSpec, ...]:
-        """Return stratified AnchorCaseSpecs for any operator."""
-        return self.resolve(name_or_task).anchors
+        """Return anchor cases tagged with this operator's campaign regimes.
+
+        Authored incumbents keep their curated dispatch tags so takeover selectors and anchor
+        routing stay on the module's real ABI. Every other operator, including cold starts, uses
+        WP1's case-to-regime mapping and gains one representative anchor for any regime that the
+        legacy anchor stratification did not cover.
+        """
+        op_id = self._normalize_key(name_or_task)
+        spec = self.resolve(op_id)
+        if op_id in DEFAULT_REGIME_SPECS and self._module_path(spec).is_file():
+            return spec.anchors
+        groups = self._semantic_regime_groups(spec)
+        tag_by_case = {
+            case_id: group.regime_tag
+            for group in groups
+            for case_id, _, _ in group.entries
+        }
+        retagged = tuple(
+            replace(anchor, regime_tag=tag_by_case[anchor.case_num])
+            for anchor in spec.anchors
+            if anchor.case_num in tag_by_case
+        )
+        covered = {anchor.regime_tag for anchor in retagged}
+        additions: list[AnchorCaseSpec] = []
+        for group in groups:
+            if group.regime_tag in covered:
+                continue
+            case_id, _, _ = semantic_regime_representative(group)
+            ref_perf_us, t_hw_us = spec.metadata_950pr.get(case_id, (0.0, 0.0))
+            additions.append(
+                AnchorCaseSpec(
+                    task=spec.task,
+                    case_num=case_id,
+                    regime_tag=group.regime_tag,
+                    ref_perf_us=ref_perf_us,
+                    t_hw_us=t_hw_us,
+                )
+            )
+        return tuple(sorted((*retagged, *additions), key=lambda anchor: anchor.case_num))
 
     def get_perf_target(self, name_or_task: str) -> PerfTargetSpec:
         """Return PerfTargetSpec targeting t_hw_us and HAP >= 95 for any operator."""
         return self.resolve(name_or_task).perf_target
 
-    def get_regime_specs(self, name_or_task: str) -> tuple[RegimeTargetSpec, ...]:
-        """Return RegimeTargetSpecs for any operator (preserving legacy 2-op specs)."""
+    def get_case_regime_tag(self, name_or_task: str, case_num: int) -> str | None:
+        """Return the campaign regime tag for one official case.
+
+        Authored incumbents keep their curated dispatch partitions, where routing depends on
+        layout and alignment rather than WP1's current phase tags, so they return ``None`` and
+        callers retain the authored selector routing.
+        """
         op_id = self._normalize_key(name_or_task)
-        if op_id in DEFAULT_REGIME_SPECS:
-            return DEFAULT_REGIME_SPECS[op_id]
         spec = self.resolve(op_id)
-        mod_file = self._source_root / spec.module_relpath
-        mod_text = mod_file.read_text(encoding="utf-8") if mod_file.is_file() else ""
+        if op_id in DEFAULT_REGIME_SPECS and self._module_path(spec).is_file():
+            return None
+        groups = self._semantic_regime_groups(spec)
+        target_case = int(case_num)
+        for group in groups:
+            if any(entry_case == target_case for entry_case, _, _ in group.entries):
+                return group.regime_tag
+        raise KeyError(
+            f"case_num={target_case} missing from semantic regime partition of {op_id!r}"
+        )
+
+    def get_regime_specs(self, name_or_task: str) -> tuple[RegimeTargetSpec, ...]:
+        """Return RegimeTargetSpecs partitioned by WP1's physical case mapping.
+
+        Authored incumbent partitions remain authoritative while their module is present because
+        their public entrypoints dispatch through per-regime selectors that WP1 phase tags do not
+        reproduce (MLA layout branches and attention-residual D-alignment branches). Cold starts
+        for those operators, and all other operators, derive 2-4 regimes from golden semantics.
+        """
+        op_id = self._normalize_key(name_or_task)
+        spec = self.resolve(op_id)
+        mod_file = self._module_path(spec)
+        mod_text = self._module_source(spec)
+        if op_id in DEFAULT_REGIME_SPECS and mod_file.is_file():
+            return DEFAULT_REGIME_SPECS[op_id]
+        partition = self._semantic_partition(spec)
         runtime_backend, discovered_tb = infer_module_runtime_backend(
             mod_text,
             spec.entrypoint,
         )
-        proto_inputs = (
-            spec.proto.get("inputs")
-            if isinstance(spec.proto.get("inputs"), (list, tuple))
-            else ()
+        regimes = build_semantic_regime_specs(
+            operator_name=op_id,
+            entrypoint=spec.entrypoint,
+            cases=spec.cases,
+            proto=spec.proto,
+            base_axes=partition.base_axes,
+            has_reduction=partition.has_reduction,
+            case_ratios=partition.ratios,
+            runtime_backend=runtime_backend,
+            trackb_symbols=discovered_tb,
         )
-        has_shared_selector = f"def _select_{op_id}_config(" in mod_text
-        case_by_id = {int(c.get("case_id", -1)): c for c in spec.cases}
-        seen_tags: set[str] = set()
-        regimes: list[RegimeTargetSpec] = []
-        for anchor in spec.anchors:
-            if anchor.regime_tag in seen_tags:
-                continue
-            seen_tags.add(anchor.regime_tag)
-            case_entry = case_by_id.get(int(anchor.case_num), {})
-            dims = extract_schema_driven_case_dims(case_entry, proto_inputs=proto_inputs)
-            safe_tag = anchor.regime_tag
-            per_regime_sel = f"_select_{op_id}_{safe_tag}_config"
-            shared_sel = f"_select_{op_id}_config"
-            has_per_regime_sel = f"def {per_regime_sel}(" in mod_text
-            selector_fn = (
-                per_regime_sel
-                if (has_per_regime_sel or not has_shared_selector)
-                else shared_sel
-            )
-            regime_tb = (
-                discovered_tb
-                if runtime_backend in ("ascendc_trackb", "hybrid_trackb")
-                else ()
-            )
-            base_editable = (
-                per_regime_sel,
-                shared_sel,
-                f"_build_{op_id}_{safe_tag}_func",
-                f"_build_{op_id}_prim_func",
-            )
-            editable = (
-                tuple(dict.fromkeys([*base_editable, *regime_tb]))
-                if regime_tb
-                else base_editable
-            )
-            regimes.append(
-                RegimeTargetSpec(
-                    regime_tag=safe_tag,
-                    builder_candidates=(
-                        f"_build_{op_id}_{safe_tag}_func",
-                        f"_build_{op_id}_prim_func",
-                        "make_kernel",
-                    ),
-                    sample_builder_kwargs=dict(dims),
-                    description=f"Auto-stratified regime {safe_tag} for {spec.task}.",
-                    representative_hir_dims={
-                        k: int(v)
-                        for k, v in dims.items()
-                        if isinstance(v, int) and not isinstance(v, bool)
-                    },
-                    representative_anchor_dims={
-                        k: int(v)
-                        for k, v in dims.items()
-                        if isinstance(v, int) and not isinstance(v, bool)
-                    },
-                    config_selector_fn=selector_fn,
-                    editable_symbols=editable,
-                    allowed_helper_prefix=f"_{op_id}_{safe_tag}_",
-                    runtime_backend=runtime_backend,
-                    trackb_symbols=regime_tb,
+        if mod_text and f"def _select_{op_id}_config(" not in mod_text:
+            regimes = tuple(
+                replace(
+                    regime,
+                    config_selector_fn=f"_select_{op_id}_{regime.regime_tag}_config",
                 )
+                if f"def _select_{op_id}_{regime.regime_tag}_config(" in mod_text
+                else regime
+                for regime in regimes
             )
-        return tuple(regimes)
+        return regimes
+
+
+_ENGINE_PHASE_TAGS: dict[EnginePhase, str] = {
+    "aiv_vector_or_gemv": "vec",
+    "aic_cube": "cube",
+    "coupled_1c2v": "cv",
+}
+_LAYOUT_PHASE_TAGS: dict[LayoutPhase, str] = {
+    "contiguous": "contig",
+    "strided_or_gather": "strided",
+}
+_RESIDENCY_BAND_TAGS: dict[ResidencyBand, str] = {
+    "vreg_resident": "vreg",
+    "sram_1pass": "sram",
+    "gm_multipass": "gmpass",
+}
+_ALIGNMENT_BAND_TAGS: dict[AlignmentBand, str] = {
+    "sub_atom_simt": "subatom",
+    "aligned_vector": "aligned",
+    "unaligned_predicated": "unaligned",
+}
+_WAVE_BAND_TAGS: dict[WaveBand, str] = {
+    "ragged_groups": "ragged",
+    "under_occupied_split": "underfill",
+    "balanced_waves": "filled",
+}
+
+PhaseSignature = tuple[EnginePhase, LayoutPhase, ResidencyBand, AlignmentBand, WaveBand]
+
+
+def semantic_regime_tag(signature: PhaseSignature) -> str:
+    """Return the stable regime tag for one 5D physical phase coordinate."""
+    engine, layout, residency, alignment, wave = signature
+    return "_".join(
+        (
+            _ENGINE_PHASE_TAGS[engine],
+            _LAYOUT_PHASE_TAGS[layout],
+            _RESIDENCY_BAND_TAGS[residency],
+            _ALIGNMENT_BAND_TAGS[alignment],
+            _WAVE_BAND_TAGS[wave],
+        )
+    )
+
+
+_CAMPAIGN_REGIME_PARTITION_CAP = 4
+
+
+def campaign_case_regime_tag(
+    ratios: CasePhysicsRatios,
+    raw_case: Mapping[str, object],
+    *,
+    base_axes: TopologyAxes,
+    has_reduction: bool,
+) -> str:
+    """Map one official case onto WP1's shared physical regime tag.
+
+    SIL advisories and campaign partitions must classify the same case identically, so both
+    call ``classify_case_regime`` with structurally recovered dims from the same helper.
+    """
+    raw_attrs = raw_case.get("attrs")
+    attrs = raw_attrs if isinstance(raw_attrs, Mapping) else {}
+    dims = infer_case_dims_structural(
+        flatten_int_shapes(raw_case.get("input_shape")),
+        attrs,
+        axes=base_axes,
+        uses_cube=base_axes.uses_cube,
+    )
+    return classify_case_regime(
+        ratios,
+        kind=infer_case_physics_kind(base_axes, has_reduction=has_reduction),
+        axes=base_axes,
+        dims=dims,
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class SemanticRegimeGroup:
+    """One campaign regime with the official cases and raw coordinates it merges."""
+
+    regime_tag: str
+    entries: tuple[tuple[int, dict[str, object], PhaseSignature], ...]
+    representative_case_id: int
+    description: str
+    representative_case_entry: dict[str, object]
+    representative_case_ratios: CasePhysicsRatios
+
+
+def _semantic_group_description(group: CasePhysicsRegimeGroup) -> str:
+    rationale = f"{group.rationale.strip()} " if group.rationale.strip() else ""
+    return (
+        f"WP1 physical regime {group.regime_tag} covering official cases "
+        f"{list(group.case_ids)} at 5D coordinates: "
+        f"{'; '.join(group.phase_coordinates)}. {rationale}Representative case "
+        f"{group.representative_case.case_id} supplies the Stage-0 dimensions."
+    )
+
+
+def build_semantic_regime_groups(
+    *,
+    operator_name: str,
+    cases: Sequence[Mapping[str, object]],
+    proto: Mapping[str, object],
+    base_axes: TopologyAxes,
+    has_reduction: bool,
+    case_ratios: Sequence[CasePhysicsRatios],
+) -> tuple[SemanticRegimeGroup, ...]:
+    """Partition official cases through WP1's shared 2-4 physical regime mapping.
+
+    ``partition_case_regimes`` owns every grouping decision: cases group by the same
+    ``classify_case_regime`` physics tags SIL advisories use, wave-occupancy ``_split``
+    variants fold into their base mechanism above the four-partition cap, and the
+    two-partition floor splits on the first differing phase band or by dtype-aware
+    workload scale. The raw 5D coordinates stay in each group description. Stage-0
+    instantiation keeps the richer schema-driven case dimensions for the representative
+    case selected by that same mapping.
+    """
+    if not cases:
+        raise ValueError(
+            f"operator {operator_name!r} has no official cases.yaml entries to partition"
+        )
+    if len(cases) != len(case_ratios):
+        raise ValueError(
+            f"operator {operator_name!r} has {len(cases)} cases but "
+            f"{len(case_ratios)} computed CasePhysicsRatios"
+        )
+    raw_proto_inputs = proto.get("inputs")
+    proto_inputs = (
+        tuple(row for row in raw_proto_inputs if isinstance(row, Mapping))
+        if isinstance(raw_proto_inputs, (list, tuple))
+        else ()
+    )
+    ratios_by_case: dict[int, CasePhysicsRatios] = {}
+    raw_case_by_case_id: dict[int, dict[str, object]] = {}
+    wp1_dims_by_case: dict[int, dict[str, int]] = {}
+    staged_dims_by_case: dict[int, dict[str, object]] = {}
+    workload_bytes_by_case: dict[int, int] = {}
+    for raw_case, ratios in zip(cases, case_ratios):
+        raw_case_id = raw_case.get("case_id")
+        if isinstance(raw_case_id, bool) or not isinstance(raw_case_id, int):
+            raise ValueError(
+                f"operator {operator_name!r} case entry requires a positive integer case_id"
+            )
+        if raw_case_id != ratios.case_id:
+            raise ValueError(
+                f"operator {operator_name!r} case order mismatch: CasePhysicsRatios carry "
+                f"{ratios.case_id}, cases.yaml row carries {raw_case_id}"
+            )
+        if ratios.case_id in ratios_by_case:
+            raise ValueError(f"operator {operator_name!r} repeats case id {ratios.case_id}")
+        raw_attrs = raw_case.get("attrs")
+        attrs = raw_attrs if isinstance(raw_attrs, Mapping) else {}
+        shapes = flatten_int_shapes(raw_case.get("input_shape"))
+        ratios_by_case[ratios.case_id] = ratios
+        raw_case_by_case_id[ratios.case_id] = dict(raw_case)
+        wp1_dims_by_case[ratios.case_id] = infer_case_dims_structural(
+            shapes,
+            attrs,
+            axes=base_axes,
+            uses_cube=base_axes.uses_cube,
+        )
+        staged_dims_by_case[ratios.case_id] = extract_schema_driven_case_dims(
+            raw_case, proto_inputs=proto_inputs
+        )
+        workload_bytes_by_case[ratios.case_id] = case_workload_bytes(
+            shapes, flatten_str_values(raw_case.get("dtype"))
+        )
+    groups = partition_case_regimes(
+        ratios_by_case,
+        wp1_dims_by_case,
+        workload_bytes_by_case,
+        kind=infer_case_physics_kind(base_axes, has_reduction=has_reduction),
+        axes=base_axes,
+        min_partitions=2,
+        max_partitions=_CAMPAIGN_REGIME_PARTITION_CAP,
+    )
+    return tuple(
+        SemanticRegimeGroup(
+            regime_tag=group.regime_tag,
+            entries=tuple(
+                (
+                    case.case_id,
+                    dict(staged_dims_by_case[case.case_id]),
+                    case.phase_signature,
+                )
+                for case in group.cases
+            ),
+            representative_case_id=group.representative_case.case_id,
+            description=_semantic_group_description(group),
+            representative_case_entry=raw_case_by_case_id[group.representative_case.case_id],
+            representative_case_ratios=ratios_by_case[group.representative_case.case_id],
+        )
+        for group in groups
+    )
+
+
+def semantic_regime_representative(
+    group: SemanticRegimeGroup,
+) -> tuple[int, dict[str, object], PhaseSignature]:
+    """Return WP1's representative case entry for one semantic regime group."""
+    for entry in group.entries:
+        if entry[0] == group.representative_case_id:
+            return entry
+    raise AssertionError(
+        f"semantic regime {group.regime_tag!r} lacks representative case "
+        f"{group.representative_case_id}"
+    )
+
+
+def build_semantic_regime_specs(
+    *,
+    operator_name: str,
+    entrypoint: str,
+    cases: Sequence[Mapping[str, object]],
+    proto: Mapping[str, object],
+    base_axes: TopologyAxes,
+    has_reduction: bool,
+    case_ratios: Sequence[CasePhysicsRatios],
+    runtime_backend: str,
+    trackb_symbols: Sequence[str] = (),
+) -> tuple[RegimeTargetSpec, ...]:
+    """Partition official cases into campaign regime specs through WP1's mapping.
+
+    ``build_semantic_regime_groups`` owns the case-to-regime decisions, including the
+    four-partition cap and the two-partition floor, so cold starts and takeover registries
+    always see the same partition for the same operator semantics.
+    """
+    if runtime_backend not in ("tilelang_dsl", "ascendc_trackb", "hybrid_trackb"):
+        raise ValueError(
+            f"semantic regime backend {runtime_backend!r} must be 'tilelang_dsl', "
+            "'ascendc_trackb', or 'hybrid_trackb'"
+        )
+    groups = build_semantic_regime_groups(
+        operator_name=operator_name,
+        cases=cases,
+        proto=proto,
+        base_axes=base_axes,
+        has_reduction=has_reduction,
+        case_ratios=case_ratios,
+    )
+    shared_selector = f"_select_{entrypoint}_config"
+    shared_builder = f"_build_{entrypoint}_prim_func"
+    regimes: list[RegimeTargetSpec] = []
+    for group in groups:
+        tag = group.regime_tag
+        case_id, representative_dims, _ = semantic_regime_representative(group)
+        int_dims = {
+            str(key): int(val)
+            for key, val in representative_dims.items()
+            if isinstance(val, int) and not isinstance(val, bool)
+        }
+        if not int_dims:
+            raise ValueError(
+                f"semantic regime {tag!r} for {operator_name!r} case {case_id} has no "
+                "concrete integer dimensions for Stage-0 instantiation"
+            )
+        per_regime_selector = f"_select_{entrypoint}_{tag}_config"
+        per_regime_builder = f"_build_{entrypoint}_{tag}_func"
+        regimes.append(
+            RegimeTargetSpec(
+                regime_tag=tag,
+                builder_candidates=(per_regime_builder, shared_builder, "make_kernel"),
+                sample_builder_kwargs=dict(representative_dims),
+                description=group.description,
+                representative_hir_dims=dict(int_dims),
+                representative_anchor_dims=dict(int_dims),
+                config_selector_fn=shared_selector,
+                editable_symbols=tuple(
+                    dict.fromkeys(
+                        (
+                            per_regime_selector,
+                            shared_selector,
+                            per_regime_builder,
+                            shared_builder,
+                            *trackb_symbols,
+                        )
+                    )
+                ),
+                allowed_helper_prefix=f"_{operator_name}_{tag}_",
+                runtime_backend=runtime_backend,
+                trackb_symbols=tuple(trackb_symbols),
+                representative_case_entry=dict(group.representative_case_entry),
+                representative_case_ratios=group.representative_case_ratios,
+            )
+        )
+    return tuple(regimes)
 
 
 def _parse_proto_shape_axes(shape_spec: object, layout: str) -> list[str]:
@@ -1411,9 +1897,13 @@ def get_default_perf_target(operator_name: str) -> PerfTargetSpec:
 
 
 def get_default_regime_specs(operator_name: str) -> tuple[RegimeTargetSpec, ...]:
-    """Return ordered optimization regime specifications for any operator."""
-    if operator_name in DEFAULT_REGIME_SPECS:
-        return DEFAULT_REGIME_SPECS[operator_name]
+    """Return the registry's campaign regimes for any operator.
+
+    The registry is the single source of partition truth: authored incumbent partitions
+    remain while their module exists, and every other case uses WP1's physical mapping.
+    Delegating unconditionally keeps cold starts from reading the authored incumbent
+    partitions through this convenience helper.
+    """
     return CannbenchOpsRegistry.default().get_regime_specs(operator_name)
 
 
@@ -1604,7 +2094,14 @@ def lookup_case_dims(
         op_block = proto_raw.get("operator", proto_raw)
         if isinstance(op_block, Mapping) and isinstance(op_block.get("inputs"), (list, tuple)):
             proto_inputs = op_block["inputs"]
-    return extract_schema_driven_case_dims(entry, proto_inputs=proto_inputs)
+    dims = extract_schema_driven_case_dims(entry, proto_inputs=proto_inputs)
+    tasks_root = resolve_cannbench_tasks_root(repo)
+    registry = CannbenchOpsRegistry(tasks_root=tasks_root)
+    if registry.has_operator(operator_name):
+        regime_tag = registry.get_case_regime_tag(operator_name, target_id)
+        if regime_tag is not None:
+            dims["regime_tag"] = regime_tag
+    return dims
 
 
 def resolve_regime_for_case(
@@ -1874,8 +2371,12 @@ __all__ = [
     "PerfTargetSpec",
     "RegimeSpec",
     "RegimeTargetSpec",
+    "SemanticRegimeGroup",
     "append_dynamic_anchor",
     "build_anchor_var_bindings",
+    "build_semantic_regime_groups",
+    "build_semantic_regime_specs",
+    "campaign_case_regime_tag",
     "compute_case_eq3_score",
     "default_source_root",
     "discover_module_trackb_symbols",
@@ -1896,4 +2397,6 @@ __all__ = [
     "resolve_cannbench_repo",
     "resolve_cannbench_tasks_root",
     "resolve_regime_for_case",
+    "semantic_regime_representative",
+    "semantic_regime_tag",
 ]

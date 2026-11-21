@@ -18,15 +18,15 @@ from tilefoundry_ascend.ascend.templates.registry import (
 
 def _get_tl_ascend() -> Any:
     """Import tilelang.ascend.language lazily so package import works without full tilelang."""
-    import tilelang.ascend.language as tl_ascend
+    import tilelang.ascend.language as tl_ascend  # noqa: PLC0415
 
     return tl_ascend
 
 
 def _ascend_target_ctx():
     try:
-        from tilelang import tvm
-        from tilelang.backend.module import create_backend_context
+        from tilelang import tvm  # noqa: PLC0415
+        from tilelang.backend.module import create_backend_context  # noqa: PLC0415
 
         if tvm.target.Target.current(allow_none=True) is None:
             return create_backend_context("ascend").target
@@ -350,7 +350,6 @@ def build_grouped_gemm_epilogue_template(policy: dict[str, Any] | None = None) -
     num_cores = 28
 
     total_m = T.dynamic("total_m")
-    n_dim = T.dynamic("n_dim")
     k_dim = T.dynamic("k_dim")
     num_groups = T.dynamic("num_groups")
 

@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, field, replace
 import json
 import math
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
+    DEFAULT_COMPILER_BEHAVIOR_REGISTRY,
     BishengResourceSummary,
     CompilerBehaviorRegistry,
-    DEFAULT_COMPILER_BEHAVIOR_REGISTRY,
 )
 from tilefoundry_ascend.ascend.cost_model.experience_lake import (
     ExperienceLake,
