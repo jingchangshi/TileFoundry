@@ -38,6 +38,7 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
     PerfTargetCampaignRunner,
     _render_trackb_tu_from_module,
+    parse_device_ids,
     patch_regime_into_module,
     resolve_regime_config,
 )
@@ -185,6 +186,7 @@ class MarathonConfig:
     operator_name: str
     device_id: str = "1"
     retry_device_id: str = ""
+    device_ids: tuple[str, ...] = ()
     source_root: Path | None = None
     worktree: Path | None = None
     isolate_worktree: bool = False
@@ -1620,6 +1622,7 @@ def run_operator_marathon(
         l4_regression_ratio=cfg.l4_regression_ratio,
         device_id=str(cfg.device_id),
         retry_device_id=str(cfg.retry_device_id),
+        device_ids=tuple(cfg.device_ids),
         warmup=cfg.warmup,
         repeat=cfg.repeat,
         enable_tilesize_prescreen=cfg.enable_tilesize_prescreen,
@@ -2115,6 +2118,16 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--device-id", default="1", help="Authorized NPU device ID.")
     parser.add_argument(
+        "--device-ids",
+        type=parse_device_ids,
+        default=(),
+        help=(
+            "Extra explicitly authorized NPU cards for whole-L4 attempts, "
+            "comma-separated; a blocked-env preemption moves to the next "
+            "untried pool card."
+        ),
+    )
+    parser.add_argument(
         "--retry-device-id",
         default="",
         help=(
@@ -2225,6 +2238,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         operator_name=str(args.operator),
         device_id=str(args.device_id),
         retry_device_id=str(args.retry_device_id),
+        device_ids=tuple(args.device_ids),
         source_root=Path(args.source_root) if args.source_root else None,
         worktree=Path(args.worktree) if args.worktree else None,
         isolate_worktree=bool(args.isolate_worktree),

@@ -188,11 +188,16 @@ def _is_blocked_env_failure(
 class CampaignConfig:
     """Configuration controlling stopping policy, escalation, and gate thresholds.
 
-    ``retry_device_id`` names an explicitly authorized, healthy alternate card.
-    A terminal infrastructure failure may be retried there at most once; an
-    empty value keeps the run recoverable for an operator instead of silently
-    changing hardware. ``round_regime_tags`` forces one regime per 1-based round
-    position and falls back to adaptive rotation for later rounds.
+    ``device_id`` is the campaign's primary card and the first whole-L4
+    candidate. ``device_ids`` names additional explicitly authorized physical
+    cards for whole-L4 attempts: a terminal BLOCKED_ENV (exit 75) moves the
+    complete official run to the next untried pool card before any backoff,
+    while only a fully blocked round waits the bounded linear retry. The legacy
+    ``retry_device_id`` keeps its single whole-run retry after a proven-terminal
+    infrastructure failure and also joins the blocked-env pool. An empty pool
+    therefore keeps the single-card bounded backoff. ``round_regime_tags``
+    forces one regime per 1-based round position and falls back to adaptive
+    rotation for later rounds.
     """
 
     operator_name: str
@@ -210,6 +215,7 @@ class CampaignConfig:
     l4_regression_ratio: float = 0.95
     device_id: str = "1"
     retry_device_id: str = ""
+    device_ids: tuple[str, ...] = ()
     l4_blocked_env_max_retries: int = 2
     l4_retry_backoff_sec: float = 45.0
     warmup: int = 3
@@ -218,6 +224,49 @@ class CampaignConfig:
     cost_prescreen_top_k: int | None = None
     exploit_effort: str = "medium"
     round_regime_tags: tuple[str, ...] = ()
+
+
+_DEVICE_ID_PATTERN = re.compile(r"[0-9]+")
+
+
+def parse_device_ids(raw: str) -> tuple[str, ...]:
+    """Parse one comma-separated ``--device-ids`` value into physical card IDs."""
+    if not raw.strip():
+        return ()
+    parts = [part.strip() for part in raw.split(",")]
+    if any(not part for part in parts):
+        raise ValueError(f"device list contains an empty entry: {raw!r}")
+    return tuple(parts)
+
+
+def _canonical_device_id(value: str, *, field: str) -> str:
+    """Canonicalize one physical NPU ID exactly as AgentGates records it."""
+    text = value.strip()
+    if not _DEVICE_ID_PATTERN.fullmatch(text):
+        raise ValueError(f"{field} must be a nonnegative decimal device ID, got {value!r}")
+    return str(int(text))
+
+
+def _resolve_l4_device_pool(config: CampaignConfig) -> tuple[str, ...]:
+    """Return the ordered physical-card pool for whole-L4 attempts.
+
+    The campaign's primary card is always first; configured extra cards follow
+    in declaration order and the legacy single-retry card is appended. The pool
+    only narrows what AgentGates authorizes: every attempt is still a V2
+    submission on that card, so the adapter keeps ownership of the lease and
+    the idle preflight.
+    """
+    pool = [_canonical_device_id(config.device_id, field="device_id")]
+    for index, value in enumerate(config.device_ids):
+        device_id = _canonical_device_id(value, field=f"device_ids[{index}]")
+        if device_id not in pool:
+            pool.append(device_id)
+    retry_device_id = config.retry_device_id.strip()
+    if retry_device_id:
+        retry_device = _canonical_device_id(retry_device_id, field="retry_device_id")
+        if retry_device not in pool:
+            pool.append(retry_device)
+    return tuple(pool)
 
 
 @dataclass(frozen=True)
@@ -396,7 +445,12 @@ class PendingL4:
 
     L4 is never split across cards: a retry on another card is a fresh, complete
     run. The original execution/run IDs, receipt, card and candidate digest stay
-    attached so an operator can prove what happened.
+    attached so an operator can prove what happened. ``device_pool`` snapshots
+    the cards this run may use, ``blocked_env_round_attempted_device_ids``
+    records which cards the current blocked-env round already tried, and
+    ``blocked_env_rounds_used``/``blocked_env_round_limit`` bound the number of
+    complete blocked rounds, so a restart continues at the next untried card
+    instead of spending a recorded round or retry twice.
     """
 
     target_path: str
@@ -411,8 +465,10 @@ class PendingL4:
     failure_kind: str = FAILURE_KIND_INFRASTRUCTURE
     execution_terminal: bool = True
     retry_used: bool = False
-    same_card_retries_used: int = 0
-    same_card_retry_limit: int = 0
+    device_pool: tuple[str, ...] = ()
+    blocked_env_round_attempted_device_ids: tuple[str, ...] = ()
+    blocked_env_rounds_used: int = 0
+    blocked_env_round_limit: int = 0
     attempts: tuple[dict[str, str], ...] = ()
     prior_stop_reason: str = ""
 
@@ -431,8 +487,12 @@ class PendingL4:
             "failure_kind": self.failure_kind,
             "execution_terminal": self.execution_terminal,
             "retry_used": self.retry_used,
-            "same_card_retries_used": self.same_card_retries_used,
-            "same_card_retry_limit": self.same_card_retry_limit,
+            "device_pool": list(self.device_pool),
+            "blocked_env_round_attempted_device_ids": list(
+                self.blocked_env_round_attempted_device_ids
+            ),
+            "blocked_env_rounds_used": self.blocked_env_rounds_used,
+            "blocked_env_round_limit": self.blocked_env_round_limit,
             "attempts": [dict(item) for item in self.attempts],
             "prior_stop_reason": self.prior_stop_reason,
         }
@@ -458,8 +518,36 @@ class PendingL4:
             failure_kind=str(payload.get("failure_kind", FAILURE_KIND_INFRASTRUCTURE)),
             execution_terminal=bool(payload.get("execution_terminal", True)),
             retry_used=bool(payload.get("retry_used", False)),
-            same_card_retries_used=max(0, int(payload.get("same_card_retries_used", 0) or 0)),
-            same_card_retry_limit=max(0, int(payload.get("same_card_retry_limit", 0) or 0)),
+            device_pool=tuple(str(item) for item in payload.get("device_pool", ())),
+            blocked_env_round_attempted_device_ids=tuple(
+                str(item)
+                for item in payload.get(
+                    "blocked_env_round_attempted_device_ids",
+                    (),
+                )
+            ),
+            # Checkpoints written before the pool existed counted same-card
+            # retries, which are exactly single-card blocked-env rounds.
+            blocked_env_rounds_used=max(
+                0,
+                int(
+                    payload.get(
+                        "blocked_env_rounds_used",
+                        payload.get("same_card_retries_used", 0),
+                    )
+                    or 0
+                ),
+            ),
+            blocked_env_round_limit=max(
+                0,
+                int(
+                    payload.get(
+                        "blocked_env_round_limit",
+                        payload.get("same_card_retry_limit", 0),
+                    )
+                    or 0
+                ),
+            ),
             attempts=attempts,
             prior_stop_reason=str(payload.get("prior_stop_reason", "")),
         )
@@ -1786,6 +1874,13 @@ class PerfTargetCampaignRunner:
         experience_lake_dir: str | Path | None = None,
     ) -> None:
         self._config = config
+        self._l4_device_pool = _resolve_l4_device_pool(config)
+        retry_device_id = config.retry_device_id.strip()
+        self._retry_device_id = (
+            _canonical_device_id(retry_device_id, field="retry_device_id")
+            if retry_device_id
+            else ""
+        )
         self._source_root = (
             Path(source_root).resolve() if source_root is not None else default_source_root()
         )
@@ -4219,7 +4314,7 @@ class PerfTargetCampaignRunner:
         return list(distill_rep.admitted_rule_ids)
 
     def _can_retry_on_alt_card(self, pending: PendingPromotion, attempted_device: str) -> bool:
-        retry_device = self._config.retry_device_id.strip()
+        retry_device = self._retry_device_id
         return bool(
             retry_device
             and not pending.retry_used
@@ -4253,7 +4348,8 @@ class PerfTargetCampaignRunner:
         attempts: tuple[dict[str, str], ...],
     ) -> L3AcceptanceResult:
         """Start one fresh L3 execution on the explicitly authorized alternate card."""
-        retry_device = self._config.retry_device_id.strip()
+        retry_device = self._retry_device_id
+        assert retry_device
         retry_pending = replace(
             pending,
             execution_id="",
@@ -4549,12 +4645,122 @@ class PerfTargetCampaignRunner:
         pending: PendingL4,
         attempted_device: str,
     ) -> bool:
-        retry_device = self._config.retry_device_id.strip()
+        retry_device = self._retry_device_id
+        attempted = attempted_device or pending.device_id
         return bool(
             retry_device
             and not pending.retry_used
-            and retry_device != (attempted_device or pending.device_id)
+            and retry_device != attempted
+            and retry_device not in self._l4_round_attempted_devices(pending)
         )
+
+    @staticmethod
+    def _l4_round_attempted_devices(pending: PendingL4) -> tuple[str, ...]:
+        """Cards already tried in the current blocked-env round.
+
+        Checkpoints written before the pool existed have no explicit round
+        list; their current card is the same-card attempt that record describes.
+        """
+        if pending.blocked_env_round_attempted_device_ids:
+            return pending.blocked_env_round_attempted_device_ids
+        return (pending.device_id,) if pending.device_id else ()
+
+    def _advance_blocked_env_l4(
+        self,
+        pending: PendingL4,
+        result: L4CannbenchResult,
+        attempts: list[dict[str, str]],
+    ) -> tuple[L4CannbenchResult, PendingL4]:
+        """Move a terminal BLOCKED_ENV run across the configured card pool.
+
+        Another untried card in the same round is submitted immediately: the
+        complete official L4 restarts there for the same candidate SHA, and no
+        timings are stitched. Only after every pool card was blocked does one
+        bounded linear backoff run before the next round. A candidate verdict,
+        a live execution or exhausted rounds leave the loop. Each submission
+        intent is persisted before its long wait, so a restart continues on the
+        next untried card instead of spending a recorded round twice.
+        """
+        pool = pending.device_pool or self._l4_device_pool
+        limit = (
+            pending.blocked_env_round_limit
+            if pending.blocked_env_round_limit > 0
+            else max(0, self._config.l4_blocked_env_max_retries)
+        )
+        current = replace(
+            self._pending_l4_after(
+                pending,
+                result,
+                tuple(attempts),
+                retry_used=pending.retry_used,
+            ),
+            device_pool=pool,
+            blocked_env_round_limit=limit,
+        )
+
+        def _record_started(execution_id: str, device: str) -> None:
+            nonlocal current
+            current = replace(
+                current,
+                execution_id=execution_id or current.execution_id,
+                device_id=device or current.device_id,
+                state="SUBMITTED",
+                execution_terminal=False,
+            )
+            self._pending_l4 = current
+            self._persist_runtime_state("pending_l4", current.to_dict())
+
+        while result.execution_terminal and _is_blocked_env_failure(
+            result.failure_kind,
+            result.error_message,
+            result.state,
+        ):
+            attempted = self._l4_round_attempted_devices(current)
+            untried = tuple(device for device in pool if device not in attempted)
+            if untried:
+                next_device = untried[0]
+                next_rounds = current.blocked_env_rounds_used
+                next_attempted = (*attempted, next_device)
+                delay = 0.0
+            elif current.blocked_env_rounds_used < limit:
+                next_rounds = current.blocked_env_rounds_used + 1
+                next_device = pool[0]
+                next_attempted = (next_device,)
+                delay = max(0.0, self._config.l4_retry_backoff_sec) * next_rounds
+            else:
+                break
+            current = replace(
+                current,
+                execution_id="",
+                run_id="",
+                receipt_path="",
+                device_id=next_device,
+                state="SUBMITTED",
+                error_message=result.error_message,
+                failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+                execution_terminal=False,
+                blocked_env_rounds_used=next_rounds,
+                blocked_env_round_attempted_device_ids=next_attempted,
+            )
+            self._pending_l4 = current
+            self._persist_runtime_state("pending_l4", current.to_dict())
+            if delay > 0.0:
+                time.sleep(delay)
+            result = self._run_l4_cannbench(
+                self._target_module_path,
+                device_id=next_device,
+                on_execution_started=_record_started,
+            )
+            attempts.append(self._l4_attempt(result))
+            current = self._pending_l4_after(
+                current,
+                result,
+                tuple(attempts),
+                retry_used=current.retry_used,
+            )
+            self._pending_l4 = current
+            self._persist_runtime_state("pending_l4", current.to_dict())
+        return result, current
 
     @staticmethod
     def _merge_l4_identity(
@@ -4566,6 +4772,7 @@ class PerfTargetCampaignRunner:
             target_path=result.target_path or pending.target_path,
             candidate_sha256=result.candidate_sha256 or pending.candidate_sha256,
             device_id=result.device_id or pending.device_id,
+            attempts=pending.attempts or result.attempts,
         )
 
     @staticmethod
@@ -4598,15 +4805,17 @@ class PerfTargetCampaignRunner:
         *,
         incumbent_source: str,
     ) -> tuple[L4CannbenchResult, PendingL4 | None]:
-        """Continue the saved L4 execution, or retry one whole run on another card.
+        """Continue the saved L4 execution, or move the complete run to another card.
 
         A live execution has no run id and a terminal one with a run id can have
         its signed receipt re-read; neither path submits again. A bounded wait
         that expired is not a failure: the same execution ID is polled again on
-        the original card. Only a proven-terminal infrastructure failure may
-        start one complete L4 run on an explicitly authorized other card, and
-        its identity is persisted before the wait. Numeric/official-validation
-        failures are verdicts and never retry; timings are never stitched.
+        the original card. A terminal BLOCKED_ENV preemption continues on the
+        next untried card of the saved pool before any bounded round backoff.
+        Any other proven-terminal infrastructure failure may start one complete
+        L4 run on the explicitly authorized alternate card, and its identity is
+        persisted before the wait. Numeric/official-validation failures are
+        verdicts and never retry; timings are never stitched.
         """
         expected = pending.candidate_sha256 or self._source_sha256(incumbent_source)
         digest_error = ""
@@ -4688,7 +4897,8 @@ class PerfTargetCampaignRunner:
 
         def _retry_whole_l4() -> tuple[L4CannbenchResult, PendingL4 | None]:
             nonlocal current
-            retry_device = self._config.retry_device_id.strip()
+            retry_device = self._retry_device_id
+            assert retry_device
             current = replace(
                 current,
                 execution_id="",
@@ -4725,80 +4935,24 @@ class PerfTargetCampaignRunner:
                 return _finish(retry_result)
             return _keep(retry_result, retry_used=True)
 
-        def _same_card_retry(
-            result: L4CannbenchResult,
-        ) -> tuple[L4CannbenchResult, PendingL4 | None]:
-            nonlocal current
-            limit = (
-                current.same_card_retry_limit
-                if current.same_card_retry_limit > 0
-                else max(0, self._config.l4_blocked_env_max_retries)
-            )
-            while (
-                result.execution_terminal
-                and _is_blocked_env_failure(
-                    result.failure_kind,
-                    result.error_message,
-                    result.state,
-                )
-                and current.same_card_retries_used < limit
-            ):
-                current = self._pending_l4_after(
-                    current,
-                    result,
-                    tuple(attempts),
-                    retry_used=current.retry_used,
-                )
-                current = replace(current, same_card_retry_limit=limit)
-                self._pending_l4 = current
-                self._persist_runtime_state("pending_l4", current.to_dict())
-                next_attempt = current.same_card_retries_used + 1
-                delay = max(0.0, self._config.l4_retry_backoff_sec) * next_attempt
-                if delay > 0.0:
-                    time.sleep(delay)
-                current = replace(
-                    current,
-                    execution_id="",
-                    run_id="",
-                    receipt_path="",
-                    state="SUBMITTED",
-                    execution_terminal=False,
-                    same_card_retries_used=next_attempt,
-                )
-                self._pending_l4 = current
-                self._persist_runtime_state("pending_l4", current.to_dict())
-                result = self._run_l4_cannbench(
-                    self._target_module_path,
-                    device_id=current.device_id or self._config.device_id,
-                    on_execution_started=_record_started,
-                )
-                attempts.append(self._l4_attempt(result))
-                current = replace(
-                    self._pending_l4_after(
-                        current,
-                        result,
-                        tuple(attempts),
-                        retry_used=current.retry_used,
-                    ),
-                    same_card_retry_limit=limit,
-                )
-                self._pending_l4 = current
-                self._persist_runtime_state("pending_l4", current.to_dict())
-            if result.passed or result.failure_kind == FAILURE_KIND_CANDIDATE:
-                return _finish(result)
-            return _keep(result, retry_used=current.retry_used)
-
         def _after_infrastructure(
             result: L4CannbenchResult,
         ) -> tuple[L4CannbenchResult, PendingL4 | None]:
+            nonlocal current
             if _is_blocked_env_failure(
                 result.failure_kind,
                 result.error_message,
                 result.state,
             ):
-                result, resolved = _same_card_retry(result)
-                if resolved is None:
-                    return result, None
+                result, current = self._advance_blocked_env_l4(
+                    current,
+                    result,
+                    attempts,
+                )
+            if result.passed or result.failure_kind == FAILURE_KIND_CANDIDATE:
+                return _finish(result)
+            if not result.execution_terminal:
+                return _keep(result, retry_used=current.retry_used)
             if self._can_retry_l4_on_alt_card(current, result.device_id):
                 return _retry_whole_l4()
             return _keep(result, retry_used=current.retry_used)
@@ -4812,24 +4966,14 @@ class PerfTargetCampaignRunner:
                 on_execution_started=_record_started,
             )
             attempts.append(self._l4_attempt(result))
-            current = replace(
+            current = self._pending_l4_after(
                 current,
-                execution_id=result.execution_id or current.execution_id,
-                run_id=result.run_id or current.run_id,
-                receipt_path=result.receipt_path or current.receipt_path,
-                device_id=result.device_id or current.device_id,
-                state=result.state or current.state,
-                error_message=result.error_message or current.error_message,
-                failure_kind=result.failure_kind or current.failure_kind,
-                execution_terminal=result.execution_terminal,
-                attempts=tuple(attempts),
+                result,
+                tuple(attempts),
+                retry_used=current.retry_used,
             )
-            if result.passed:
-                return _finish(result)
-            if result.failure_kind == FAILURE_KIND_CANDIDATE:
-                return _finish(result)
-            if not result.execution_terminal:
-                return _keep(result, retry_used=False)
+            self._pending_l4 = current
+            self._persist_runtime_state("pending_l4", current.to_dict())
             return _after_infrastructure(result)
 
         blocked_env_pending = _is_blocked_env_failure(
@@ -4847,8 +4991,8 @@ class PerfTargetCampaignRunner:
             (blocked_env_pending and pending.execution_terminal)
             or (
                 interrupted_submission
-                and pending.same_card_retry_limit > 0
-                and pending.same_card_retries_used <= pending.same_card_retry_limit
+                and pending.blocked_env_round_limit > 0
+                and pending.blocked_env_rounds_used <= pending.blocked_env_round_limit
             )
         ):
             if interrupted_submission:
@@ -4881,10 +5025,6 @@ class PerfTargetCampaignRunner:
                     candidate_sha256=expected,
                     attempts=pending.attempts,
                 )
-            if result.passed or result.failure_kind == FAILURE_KIND_CANDIDATE:
-                return _finish(result)
-            if not result.execution_terminal:
-                return _keep(result, retry_used=current.retry_used)
             return _after_infrastructure(result)
 
         if self._can_retry_l4_on_alt_card(pending, pending.device_id):
@@ -4933,91 +5073,66 @@ class PerfTargetCampaignRunner:
         incumbent_source: str,
         prior_stop_reason: str,
     ) -> L4CannbenchResult:
-        """Submit the official L4 run and persist its identity before waiting."""
+        """Submit the official L4 run and persist its identity before waiting.
+
+        The first submission uses the first configured pool card. A terminal
+        BLOCKED_ENV preemption advances through the remaining pool cards with a
+        complete run on each; a candidate verdict ends the gate, and any other
+        infrastructure failure stays pending for the next invocation. No other
+        terminal failure is retried here, so a fresh failure is never re-spent
+        before its saved identity has been examined.
+        """
         candidate_sha = self._source_sha256(incumbent_source)
         candidate_relative = self._l4_candidate_relative()
+        pool = self._l4_device_pool
         attempts: list[dict[str, str]] = []
-        retry_idx = 0
-        retry_limit = max(0, self._config.l4_blocked_env_max_retries)
-
-        def _pending_for(result: L4CannbenchResult) -> PendingL4:
-            return PendingL4(
-                target_path=result.target_path or str(self._target_module_path),
-                candidate_relative=candidate_relative,
-                candidate_sha256=result.candidate_sha256 or candidate_sha,
-                execution_id=result.execution_id,
-                run_id=result.run_id,
-                receipt_path=result.receipt_path,
-                device_id=result.device_id or self._config.device_id,
-                state=result.state,
-                error_message=result.error_message,
-                failure_kind=result.failure_kind or FAILURE_KIND_INFRASTRUCTURE,
-                execution_terminal=result.execution_terminal,
-                retry_used=bool(
-                    self._config.retry_device_id
-                    and (result.device_id or self._config.device_id)
-                    == self._config.retry_device_id
-                ),
-                same_card_retries_used=retry_idx,
-                same_card_retry_limit=retry_limit,
-                attempts=tuple(attempts),
-                prior_stop_reason=prior_stop_reason,
-            )
+        current = PendingL4(
+            target_path=str(self._target_module_path),
+            candidate_relative=candidate_relative,
+            candidate_sha256=candidate_sha,
+            device_id=pool[0],
+            state="SUBMITTED",
+            failure_kind=FAILURE_KIND_INFRASTRUCTURE,
+            execution_terminal=False,
+            device_pool=pool,
+            blocked_env_round_attempted_device_ids=(pool[0],),
+            blocked_env_round_limit=max(0, self._config.l4_blocked_env_max_retries),
+            prior_stop_reason=prior_stop_reason,
+        )
 
         def _record_started(execution_id: str, device: str) -> None:
-            started = replace(
-                _pending_for(
-                    L4CannbenchResult(
-                        passed=False,
-                        execution_id=execution_id,
-                        device_id=device,
-                        state="SUBMITTED",
-                        execution_terminal=False,
-                        failure_kind=FAILURE_KIND_INFRASTRUCTURE,
-                    )
-                ),
-                candidate_sha256=candidate_sha,
-                candidate_relative=candidate_relative,
-            )
-            self._pending_l4 = started
-            self._persist_runtime_state("pending_l4", started.to_dict())
-
-        result = self._run_l4_cannbench(
-            self._target_module_path,
-            device_id=self._config.device_id,
-            on_execution_started=_record_started,
-        )
-        attempts.append(self._l4_attempt(result))
-        while self._is_blocked_env_l4(result) and retry_idx < retry_limit:
-            self._pending_l4 = _pending_for(result)
-            self._persist_runtime_state("pending_l4", self._pending_l4.to_dict())
-            delay = max(0.0, self._config.l4_retry_backoff_sec) * (retry_idx + 1)
-            if delay > 0.0:
-                time.sleep(delay)
-            retry_idx += 1
-            self._pending_l4 = replace(
-                _pending_for(result),
-                execution_id="",
-                run_id="",
-                receipt_path="",
+            nonlocal current
+            current = replace(
+                current,
+                execution_id=execution_id or current.execution_id,
+                device_id=device or current.device_id,
                 state="SUBMITTED",
                 execution_terminal=False,
             )
-            self._persist_runtime_state("pending_l4", self._pending_l4.to_dict())
-            result = self._run_l4_cannbench(
-                self._target_module_path,
-                device_id=self._config.device_id,
-                on_execution_started=_record_started,
-            )
-            attempts.append(self._l4_attempt(result))
+            self._pending_l4 = current
+            self._persist_runtime_state("pending_l4", current.to_dict())
+
+        result = self._run_l4_cannbench(
+            self._target_module_path,
+            device_id=pool[0],
+            on_execution_started=_record_started,
+        )
+        attempts.append(self._l4_attempt(result))
+        current = self._pending_l4_after(
+            current,
+            result,
+            tuple(attempts),
+            retry_used=False,
+        )
+        if self._is_blocked_env_l4(result):
+            result, current = self._advance_blocked_env_l4(current, result, attempts)
         if result.passed or result.failure_kind == FAILURE_KIND_CANDIDATE:
             self._pending_l4 = None
             self._persist_runtime_state("pending_l4", None)
-            return result
-        pending = _pending_for(result)
-        self._pending_l4 = pending
-        self._persist_runtime_state("pending_l4", pending.to_dict())
-        return result
+            return self._merge_l4_identity(result, current)
+        self._pending_l4 = current
+        self._persist_runtime_state("pending_l4", current.to_dict())
+        return self._merge_l4_identity(result, current)
 
     def _collect_trackb_round_evidence(
         self,
@@ -6675,6 +6790,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-wall-clock-min", type=float, default=180.0)
     parser.add_argument("--device-id", default="1", help="Authorized NPU device ID.")
     parser.add_argument(
+        "--device-ids",
+        type=parse_device_ids,
+        default=(),
+        help=(
+            "Extra explicitly authorized NPU cards for whole-L4 attempts, "
+            "comma-separated; a blocked-env preemption moves to the next "
+            "untried pool card."
+        ),
+    )
+    parser.add_argument(
         "--retry-device-id",
         default="",
         help=(
@@ -6732,6 +6857,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_final_l4=bool(args.run_final_l4),
         device_id=str(args.device_id),
         retry_device_id=str(args.retry_device_id),
+        device_ids=tuple(args.device_ids),
         enable_tilesize_prescreen=bool(args.enable_tilesize_prescreen),
         cost_prescreen_top_k=(
             int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
@@ -6768,6 +6894,7 @@ __all__ = [
     "build_arg_parser",
     "extract_regime_snippet",
     "main",
+    "parse_device_ids",
     "patch_regime_into_module",
     "resolve_regime_config",
 ]

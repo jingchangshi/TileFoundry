@@ -13,6 +13,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import parse_simple_env_file
 from tilefoundry_ascend.agent.campaign.campaign_runner import (
     CampaignConfig,
     PerfTargetCampaignRunner,
+    parse_device_ids,
 )
 from tilefoundry_ascend.agent.campaign.marathon import (
     MarathonConfig,
@@ -51,6 +52,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true", help="Resume from existing checkpoint.")
     parser.add_argument("--run-final-l4", action="store_true", help="Run final official L4 gate.")
     parser.add_argument("--device-id", default="1", help="Authorized NPU device ID.")
+    parser.add_argument(
+        "--device-ids",
+        type=parse_device_ids,
+        default=(),
+        help=(
+            "Extra explicitly authorized NPU cards for whole-L4 attempts, "
+            "comma-separated; a blocked-env preemption moves to the next "
+            "untried pool card."
+        ),
+    )
     parser.add_argument("--env-file", default=None, help="Path to tilefoundry-npu env.sh.")
     _add_llm_arguments(parser)
     parser.add_argument("--source-root", default=None, help="TileFoundry workspace root.")
@@ -68,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         m_cfg = MarathonConfig(
             operator_name=args.operator,
             device_id=str(args.device_id),
+            device_ids=tuple(args.device_ids),
             source_root=Path(args.source_root) if args.source_root else None,
             target_module_path=Path(args.target_file) if args.target_file else None,
             env_file=Path(args.env_file) if args.env_file else None,
@@ -108,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
         k_rule_workers=args.k_rule_workers,
         run_final_l4=bool(args.run_final_l4),
         device_id=str(args.device_id),
+        device_ids=tuple(args.device_ids),
     )
     tracker = BayesianRuleTracker.from_seed_yaml()
     flywheel = FlywheelDistiller(

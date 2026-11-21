@@ -49,6 +49,8 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     _case_ratio_predicate_entries,
     _detect_trackb_dead_code_edit,
     _extract_regime_abi_context,
+    _resolve_l4_device_pool,
+    parse_device_ids,
 )
 from tilefoundry_ascend.agent.campaign.marathon import build_marathon_arg_parser
 from tilefoundry_ascend.agent.kb import build_predicate_context
@@ -2557,6 +2559,8 @@ def test_campaign_runner_cli_arg_parser() -> None:
             "45",
             "--device-id",
             "2",
+            "--device-ids",
+            "0, 3",
             "--disable-early-goal-stop",
             "--min-surrogate-gain",
             "0.5",
@@ -2580,6 +2584,7 @@ def test_campaign_runner_cli_arg_parser() -> None:
     assert parsed.max_rounds == 6
     assert parsed.max_wall_clock_min == 45.0
     assert parsed.device_id == "2"
+    assert parsed.device_ids == ("0", "3")
     assert parsed.disable_early_goal_stop is True
     assert parsed.min_surrogate_gain == 0.5
     assert parsed.checkpoint == "ckpt.json"
@@ -2594,6 +2599,7 @@ def test_campaign_runner_cli_arg_parser() -> None:
     defaults = parser.parse_args(["--operator", "attention_residual"])
     assert defaults.disable_early_goal_stop is False
     assert defaults.min_surrogate_gain == 0.25
+    assert defaults.device_ids == ()
     assert defaults.target_module is None
 
 
@@ -5846,17 +5852,22 @@ def _l4_campaign_runner(
     l4_runner,
     *,
     device_id: str = "3",
+    device_ids: tuple[str, ...] = (),
+    retry_device_id: str = "",
     retries: int = 2,
+    backoff_sec: float = 0.0,
 ) -> PerfTargetCampaignRunner:
-    """Build a campaign whose only configured device is *device_id*."""
+    """Build a campaign whose whole-L4 pool is *device_id* plus extra cards."""
     spec = _trackb_regime_spec()
     return PerfTargetCampaignRunner(
         config=CampaignConfig(
             operator_name="attention_residual",
             max_rounds=1,
             device_id=device_id,
+            device_ids=device_ids,
+            retry_device_id=retry_device_id,
             l4_blocked_env_max_retries=retries,
-            l4_retry_backoff_sec=0.0,
+            l4_retry_backoff_sec=backoff_sec,
         ),
         target_module_path=tmp_path / "missing_kernels.py",
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
@@ -5933,13 +5944,13 @@ def test_final_l4_bounds_blocked_env_retries_and_persists_attempts(tmp_path: Pat
     assert {attempt["failure_kind"] for attempt in pending.attempts} == {
         surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE
     }
-    assert pending.same_card_retries_used == 2
-    assert pending.same_card_retry_limit == 2
+    assert pending.blocked_env_rounds_used == 2
+    assert pending.blocked_env_round_limit == 2
     payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
     assert len(payload["pending_l4"]["attempts"]) == 3
     assert all(attempt["device_id"] == "3" for attempt in payload["pending_l4"]["attempts"])
-    assert payload["pending_l4"]["same_card_retries_used"] == 2
-    assert payload["pending_l4"]["same_card_retry_limit"] == 2
+    assert payload["pending_l4"]["blocked_env_rounds_used"] == 2
+    assert payload["pending_l4"]["blocked_env_round_limit"] == 2
 
 
 def test_final_l4_candidate_failure_is_not_retried_as_blocked_env(tmp_path: Path) -> None:
@@ -5972,14 +5983,18 @@ def _pending_l4_checkpoint(
     target_path: Path,
     *,
     digest: str,
-    same_card_retries_used: int,
-    same_card_retry_limit: int,
+    blocked_env_rounds_used: int,
+    blocked_env_round_limit: int,
     execution_id: str = "",
     run_id: str = "",
     state: str = "",
     execution_terminal: bool = True,
     failure_kind: str = surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
     error_message: str = "blocked_env: msprof lock held by external process",
+    device_id: str = "3",
+    device_pool: tuple[str, ...] = (),
+    blocked_env_round_attempted_device_ids: tuple[str, ...] = (),
+    retry_used: bool = False,
 ) -> campaign_runner.PendingL4:
     """Build one resumable pending-L4 record whose candidate digest matches disk."""
     return campaign_runner.PendingL4(
@@ -5988,21 +6003,24 @@ def _pending_l4_checkpoint(
         candidate_sha256=digest,
         execution_id=execution_id,
         run_id=run_id,
-        device_id="3",
+        device_id=device_id,
         state=state,
         error_message=error_message,
         failure_kind=failure_kind,
         execution_terminal=execution_terminal,
-        same_card_retries_used=same_card_retries_used,
-        same_card_retry_limit=same_card_retry_limit,
+        retry_used=retry_used,
+        device_pool=device_pool,
+        blocked_env_round_attempted_device_ids=blocked_env_round_attempted_device_ids,
+        blocked_env_rounds_used=blocked_env_rounds_used,
+        blocked_env_round_limit=blocked_env_round_limit,
         prior_stop_reason="final",
     )
 
 
-def test_pending_l4_resume_counts_in_flight_attempt_against_same_card_quota(
+def test_pending_l4_resume_counts_in_flight_attempt_against_blocked_env_quota(
     tmp_path: Path,
 ) -> None:
-    """Resume a live execution by id, then spend only the remaining same-card budget."""
+    """Resume a live execution by id, then spend only the remaining blocked-env budget."""
     target_path = tmp_path / "missing_kernels.py"
     target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
     digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
@@ -6026,8 +6044,8 @@ def test_pending_l4_resume_counts_in_flight_attempt_against_same_card_quota(
     pending = _pending_l4_checkpoint(
         target_path,
         digest=digest,
-        same_card_retries_used=1,
-        same_card_retry_limit=2,
+        blocked_env_rounds_used=1,
+        blocked_env_round_limit=2,
         execution_id="exec-live",
         state="RUNNING",
         execution_terminal=False,
@@ -6039,8 +6057,8 @@ def test_pending_l4_resume_counts_in_flight_attempt_against_same_card_quota(
     assert calls == [("exec-live", "", "3"), ("", "", "3")]
     assert result.passed is False
     assert updated is not None
-    assert updated.same_card_retries_used == 2
-    assert updated.same_card_retry_limit == 2
+    assert updated.blocked_env_rounds_used == 2
+    assert updated.blocked_env_round_limit == 2
     assert len(updated.attempts) == 2
     assert runner._pending_l4 == updated
 
@@ -6072,8 +6090,8 @@ def test_pending_l4_resume_at_quota_limit_only_polls_same_execution(
     pending = _pending_l4_checkpoint(
         target_path,
         digest=digest,
-        same_card_retries_used=2,
-        same_card_retry_limit=2,
+        blocked_env_rounds_used=2,
+        blocked_env_round_limit=2,
         execution_id="exec-backoff",
         state="SUBMITTED",
         execution_terminal=False,
@@ -6085,8 +6103,8 @@ def test_pending_l4_resume_at_quota_limit_only_polls_same_execution(
     assert calls == [("exec-backoff", "", "3")]
     assert result.passed is False
     assert updated is not None
-    assert updated.same_card_retries_used == 2
-    assert updated.same_card_retry_limit == 2
+    assert updated.blocked_env_rounds_used == 2
+    assert updated.blocked_env_round_limit == 2
     assert len(updated.attempts) == 1
     assert runner._pending_l4 == updated
 
@@ -6119,8 +6137,8 @@ def test_pending_l4_interrupted_submission_resubmits_without_double_counting(
     pending = _pending_l4_checkpoint(
         target_path,
         digest=digest,
-        same_card_retries_used=1,
-        same_card_retry_limit=2,
+        blocked_env_rounds_used=1,
+        blocked_env_round_limit=2,
         state="SUBMITTED",
         execution_terminal=False,
     )
@@ -6131,12 +6149,12 @@ def test_pending_l4_interrupted_submission_resubmits_without_double_counting(
     assert calls == ["3", "3"]
     assert result.passed is False
     assert updated is not None
-    assert updated.same_card_retries_used == 2
+    assert updated.blocked_env_rounds_used == 2
     assert len(updated.attempts) == 2
 
 
 def test_pending_l4_exhausted_quota_does_not_resubmit(tmp_path: Path) -> None:
-    """A blocked_env pending with no remaining same-card budget stays put."""
+    """A blocked_env pending with no remaining round budget stays put."""
     target_path = tmp_path / "missing_kernels.py"
     target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
     digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
@@ -6158,8 +6176,8 @@ def test_pending_l4_exhausted_quota_does_not_resubmit(tmp_path: Path) -> None:
     pending = _pending_l4_checkpoint(
         target_path,
         digest=digest,
-        same_card_retries_used=2,
-        same_card_retry_limit=2,
+        blocked_env_rounds_used=2,
+        blocked_env_round_limit=2,
         state="BLOCKED",
     )
     result, updated = runner._resolve_pending_l4(
@@ -6169,13 +6187,13 @@ def test_pending_l4_exhausted_quota_does_not_resubmit(tmp_path: Path) -> None:
     assert result.passed is False
     assert "blocked_env" in result.error_message
     assert updated is not None
-    assert updated.same_card_retries_used == 2
-    assert updated.same_card_retry_limit == 2
+    assert updated.blocked_env_rounds_used == 2
+    assert updated.blocked_env_round_limit == 2
     assert updated.attempts == pending.attempts
     assert runner._pending_l4 == updated
 
 
-def test_pending_l4_non_blocked_env_resume_does_not_spend_same_card_quota(
+def test_pending_l4_non_blocked_env_resume_does_not_spend_blocked_env_quota(
     tmp_path: Path,
 ) -> None:
     """A terminal non-blocked infrastructure fault is re-read, never resubmitted."""
@@ -6211,8 +6229,8 @@ def test_pending_l4_non_blocked_env_resume_does_not_spend_same_card_quota(
     pending = _pending_l4_checkpoint(
         target_path,
         digest=digest,
-        same_card_retries_used=0,
-        same_card_retry_limit=2,
+        blocked_env_rounds_used=0,
+        blocked_env_round_limit=2,
         execution_id="exec-x",
         run_id="run-x",
         state="FINISHED",
@@ -6226,8 +6244,8 @@ def test_pending_l4_non_blocked_env_resume_does_not_spend_same_card_quota(
     assert result.passed is False
     assert result.error_message == "device lost"
     assert updated is not None
-    assert updated.same_card_retries_used == 0
-    assert updated.same_card_retry_limit == 2
+    assert updated.blocked_env_rounds_used == 0
+    assert updated.blocked_env_round_limit == 2
     assert len(updated.attempts) == 1
     assert runner._pending_l4 == updated
 
@@ -6237,3 +6255,286 @@ def test_pending_l4_non_blocked_env_resume_does_not_spend_same_card_quota(
 
 
 
+
+
+def test_l4_device_pool_order_dedup_and_canonicalization() -> None:
+    """The primary card leads; extras keep order and AgentGates spelling is canonical."""
+    config = CampaignConfig(
+        operator_name="mla",
+        device_id="07",
+        device_ids=("2", "07", "10"),
+        retry_device_id="2",
+    )
+    assert _resolve_l4_device_pool(config) == ("7", "2", "10")
+    assert parse_device_ids("0, 1,2") == ("0", "1", "2")
+    assert parse_device_ids("") == ()
+    with pytest.raises(ValueError, match="empty entry"):
+        parse_device_ids("0,,2")
+    with pytest.raises(ValueError, match="decimal device ID"):
+        _resolve_l4_device_pool(CampaignConfig(operator_name="mla", device_id="npu0"))
+    with pytest.raises(ValueError, match="retry_device_id"):
+        _resolve_l4_device_pool(
+            CampaignConfig(operator_name="mla", device_id="0", retry_device_id="-1")
+        )
+
+
+def test_final_l4_blocked_env_switches_cards_before_any_backoff(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Each untried pool card takes a complete L4 run before the first bounded sleep."""
+    calls: list[str] = []
+    sleeps: list[float] = []
+    outcomes = iter(
+        [
+            _blocked_env_l4("0"),
+            _blocked_env_l4("1"),
+            L4CannbenchResult(passed=True, device_id="2", execution_id="exec-ok"),
+        ]
+    )
+
+    def _fake_l4(module_path: Path, *, device_id: str = "") -> L4CannbenchResult:
+        calls.append(device_id)
+        return next(outcomes)
+
+    monkeypatch.setattr(campaign_runner.time, "sleep", sleeps.append)
+    runner = _l4_campaign_runner(
+        tmp_path,
+        _fake_l4,
+        device_id="0",
+        device_ids=("1", "2"),
+        backoff_sec=7.0,
+    )
+    result = runner._run_final_l4_tracked(
+        incumbent_source="candidate",
+        prior_stop_reason="final",
+    )
+    assert result.passed is True
+    assert result.device_id == "2"
+    assert result.candidate_sha256 == hashlib.sha256(b"candidate").hexdigest()
+    assert [attempt["device_id"] for attempt in result.attempts] == ["0", "1", "2"]
+    assert [attempt["execution_id"] for attempt in result.attempts] == [
+        "exec-blocked",
+        "exec-blocked",
+        "exec-ok",
+    ]
+    assert calls == ["0", "1", "2"]
+    assert sleeps == []
+    assert runner._pending_l4 is None
+    payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    assert payload["pending_l4"] is None
+
+
+def test_final_l4_blocked_env_bounds_every_full_pool_round(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A fully blocked round sleeps once, and rounds remain bounded by the retry limit."""
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    def _fake_l4(module_path: Path, *, device_id: str = "") -> L4CannbenchResult:
+        calls.append(device_id)
+        return _blocked_env_l4(device_id)
+
+    monkeypatch.setattr(campaign_runner.time, "sleep", sleeps.append)
+    runner = _l4_campaign_runner(
+        tmp_path,
+        _fake_l4,
+        device_id="0",
+        device_ids=("1", "2"),
+        retries=2,
+        backoff_sec=7.0,
+    )
+    result = runner._run_final_l4_tracked(
+        incumbent_source="candidate",
+        prior_stop_reason="final",
+    )
+    assert result.passed is False
+    assert calls == ["0", "1", "2"] * 3
+    assert [attempt["device_id"] for attempt in result.attempts] == ["0", "1", "2"] * 3
+    assert sleeps == [7.0, 14.0]
+    pending = runner._pending_l4
+    assert pending is not None
+    assert pending.device_pool == ("0", "1", "2")
+    assert pending.blocked_env_rounds_used == 2
+    assert pending.blocked_env_round_limit == 2
+    assert pending.blocked_env_round_attempted_device_ids == ("0", "1", "2")
+    assert pending.candidate_sha256 == hashlib.sha256(b"candidate").hexdigest()
+    assert len(pending.attempts) == 9
+    assert [attempt["device_id"] for attempt in pending.attempts] == [
+        "0",
+        "1",
+        "2",
+    ] * 3
+    payload = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    assert payload["pending_l4"]["device_pool"] == ["0", "1", "2"]
+    assert payload["pending_l4"]["blocked_env_round_attempted_device_ids"] == [
+        "0",
+        "1",
+        "2",
+    ]
+    assert payload["pending_l4"]["blocked_env_rounds_used"] == 2
+    assert payload["pending_l4"]["blocked_env_round_limit"] == 2
+
+
+def test_final_l4_non_blocked_terminal_failure_is_not_retried_inline(
+    tmp_path: Path,
+) -> None:
+    """A terminal non-blocked infrastructure fault stays pending instead of spending the pool."""
+    calls: list[str] = []
+
+    def _fake_l4(module_path: Path, *, device_id: str = "") -> L4CannbenchResult:
+        calls.append(device_id)
+        return L4CannbenchResult(
+            passed=False,
+            failure_kind=surrogate_cannbench.FAILURE_KIND_INFRASTRUCTURE,
+            error_message="device lost",
+            execution_id="exec-x",
+            run_id="run-x",
+            device_id=device_id,
+            state="FAILED",
+            execution_terminal=True,
+        )
+
+    runner = _l4_campaign_runner(
+        tmp_path,
+        _fake_l4,
+        device_id="0",
+        device_ids=("1",),
+        retry_device_id="2",
+    )
+    result = runner._run_final_l4_tracked(
+        incumbent_source="candidate",
+        prior_stop_reason="final",
+    )
+    assert result.passed is False
+    assert calls == ["0"]
+    pending = runner._pending_l4
+    assert pending is not None
+    assert pending.device_pool == ("0", "1", "2")
+    assert pending.blocked_env_round_attempted_device_ids == ("0",)
+    assert pending.retry_used is False
+
+
+def test_pending_l4_resume_continues_mid_round_without_respending_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A blocked pending resumes the next untried card before starting a paid round."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+    calls: list[tuple[str, str]] = []
+    sleeps: list[float] = []
+
+    def _l4(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        assert module_path == target_path
+        calls.append((resume_execution_id, device_id))
+        assert on_execution_started is not None
+        on_execution_started("exec-next", device_id)
+        return _blocked_env_l4(device_id)
+
+    monkeypatch.setattr(campaign_runner.time, "sleep", sleeps.append)
+    runner = _l4_campaign_runner(
+        tmp_path,
+        _l4,
+        device_id="0",
+        device_ids=("1",),
+        retries=1,
+        backoff_sec=5.0,
+    )
+    pending = _pending_l4_checkpoint(
+        target_path,
+        digest=digest,
+        blocked_env_rounds_used=0,
+        blocked_env_round_limit=1,
+        execution_id="exec-blocked",
+        state="BLOCKED",
+        device_id="0",
+        device_pool=("0", "1"),
+        blocked_env_round_attempted_device_ids=("0",),
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert calls == [("", "1"), ("", "0"), ("", "1")]
+    assert sleeps == [5.0]
+    assert result.passed is False
+    assert updated is not None
+    assert updated.blocked_env_rounds_used == 1
+    assert updated.blocked_env_round_attempted_device_ids == ("0", "1")
+    assert len(updated.attempts) == 3
+    assert runner._pending_l4 == updated
+
+
+def test_pending_l4_exhausted_pool_rounds_do_not_resubmit(tmp_path: Path) -> None:
+    """A blocked pending whose pool and rounds are spent never submits again."""
+    target_path = tmp_path / "missing_kernels.py"
+    target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
+    digest = hashlib.sha256(target_path.read_bytes()).hexdigest()
+
+    def _l4_must_not_run(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started=None,
+    ) -> L4CannbenchResult:
+        raise AssertionError(
+            f"exhausted pool L4 must not run for {module_path} "
+            f"({resume_execution_id}, {resume_run_id}, {device_id}, {on_execution_started})"
+        )
+
+    runner = _l4_campaign_runner(
+        tmp_path,
+        _l4_must_not_run,
+        device_id="0",
+        device_ids=("1",),
+        retries=1,
+    )
+    pending = _pending_l4_checkpoint(
+        target_path,
+        digest=digest,
+        blocked_env_rounds_used=1,
+        blocked_env_round_limit=1,
+        state="BLOCKED",
+        device_id="1",
+        device_pool=("0", "1"),
+        blocked_env_round_attempted_device_ids=("0", "1"),
+    )
+    result, updated = runner._resolve_pending_l4(
+        pending,
+        incumbent_source=_MULTI_REGIME_MODULE,
+    )
+    assert result.passed is False
+    assert "blocked_env" in result.error_message
+    assert updated is not None
+    assert updated.blocked_env_rounds_used == 1
+    assert updated.blocked_env_round_limit == 1
+    assert updated.attempts == pending.attempts
+    assert runner._pending_l4 == updated
+
+
+def test_pending_l4_from_dict_reads_legacy_same_card_quota(tmp_path: Path) -> None:
+    """Checkpoints written before the pool existed map same-card retries to rounds."""
+    pending = campaign_runner.PendingL4.from_dict(
+        {
+            "target_path": str(tmp_path / "kernels.py"),
+            "candidate_relative": "kernels.py",
+            "candidate_sha256": "0" * 64,
+            "device_id": "3",
+            "same_card_retries_used": 1,
+            "same_card_retry_limit": 2,
+        }
+    )
+    assert pending.blocked_env_rounds_used == 1
+    assert pending.blocked_env_round_limit == 2
+    assert pending.device_pool == ()
+    assert pending.blocked_env_round_attempted_device_ids == ()

@@ -14,6 +14,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     RegimeTargetSpec,
     parse_simple_env_file,
 )
+from tilefoundry_ascend.agent.campaign.campaign_runner import CampaignConfig
 from tilefoundry_ascend.agent.campaign.marathon import (
     ExtremeCampaignRunner,
     MarathonConfig,
@@ -237,6 +238,7 @@ def test_campaign_entrypoints_inject_selected_provider(
     )
     os.environ["TILEFOUNDRY_NPU_ENV_FILE"] = str(env_path)
     seen_overrides = []
+    seen_configs: list[CampaignConfig] = []
 
     def make_backend(overrides):
         seen_overrides.append(overrides)
@@ -250,6 +252,7 @@ def test_campaign_entrypoints_inject_selected_provider(
         def __init__(self, *, llm_backend, **kwargs):
             assert isinstance(llm_backend, MockLLMBackend)
             self.backend = llm_backend
+            seen_configs.append(kwargs["config"])
 
         async def run(self, *, resume):
             for role in ("exploit_rule", "explore_creative", "escalate_trackb"):
@@ -274,6 +277,8 @@ def test_campaign_entrypoints_inject_selected_provider(
         "--source-root", str(tmp_path),
         "--target-file", str(target),
         "--checkpoint", str(tmp_path / "checkpoint.json"),
+        "--device-id", "0",
+        "--device-ids", "1,2",
         "--exploit-model", "cli-exploit",
         "--escalate-model", "cli-escalate",
         "--llm-api-base", "https://provider.example/v1",
@@ -288,6 +293,8 @@ def test_campaign_entrypoints_inject_selected_provider(
         assert cli.main(args) == 0
     assert len(seen_overrides) == 1
     assert seen_overrides[0]["TILEFOUNDRY_NPU_LLM_API_BASE"] == "https://provider.example/v1"
+    assert [config.device_ids for config in seen_configs] == [("1", "2")]
+    assert seen_configs[0].device_id == "0"
     assert all(os.environ[key] == value for key, value in ambient.items())
 
 
@@ -320,10 +327,13 @@ def test_marathon_env_provider_values_round_trip(tmp_path, monkeypatch) -> None:
 def test_marathon_cli_and_watch_round_detection(tmp_path: Path, monkeypatch) -> None:
     """Verify CLI parser defaults, shorthand, and watch events."""
     parser = build_marathon_arg_parser()
-    parsed_run = parser.parse_args(["run", "--operator", "mla", "--device-id", "2"])
+    parsed_run = parser.parse_args(
+        ["run", "--operator", "mla", "--device-id", "2", "--device-ids", "0, 3"]
+    )
     assert parsed_run.command == "run"
     assert parsed_run.operator == "mla"
     assert parsed_run.device_id == "2"
+    assert parsed_run.device_ids == ("0", "3")
     assert parsed_run.retry_device_id == ""
 
     seen_cfgs: list[MarathonConfig] = []
@@ -336,6 +346,8 @@ def test_marathon_cli_and_watch_round_detection(tmp_path: Path, monkeypatch) -> 
                 "attention_residual",
                 "--device-id",
                 "1",
+                "--device-ids",
+                "0,1,2",
                 "--retry-device-id",
                 "6",
             ]
@@ -345,8 +357,10 @@ def test_marathon_cli_and_watch_round_detection(tmp_path: Path, monkeypatch) -> 
     assert cli.main(["--operator", "mla", "--marathon", "--device-id", "2"]) == 0
     assert [c.operator_name for c in seen_cfgs] == ["attention_residual", "mla"]
     assert seen_cfgs[0].device_id == "1"
+    assert seen_cfgs[0].device_ids == ("0", "1", "2")
     assert seen_cfgs[0].retry_device_id == "6"
     assert seen_cfgs[1].device_id == "2"
+    assert seen_cfgs[1].device_ids == ()
 
     parsed_watch = parser.parse_args(
         ["watch", "--base-dir", str(tmp_path), "--once"]
