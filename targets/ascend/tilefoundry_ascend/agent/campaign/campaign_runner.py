@@ -2990,13 +2990,7 @@ class PerfTargetCampaignRunner:
             if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
             else None
         )
-        is_trackb_only_hybrid = (
-            regime_spec.runtime_backend == "hybrid_trackb"
-            and not _has_prim_func_builder(module_source, regime_spec.builder_candidates)
-        )
-        if tb_extracted is not None and (
-            regime_spec.runtime_backend == "ascendc_trackb" or is_trackb_only_hybrid
-        ):
+        if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
             active_mask = self._resolve_trackb_freedom_mask(regime_spec)
             instantiated_tu = self._instantiate_trackb_tu(
                 module_source, tb_extracted[1], regime_spec
@@ -3046,6 +3040,22 @@ class PerfTargetCampaignRunner:
             case_ratios=regime_spec.representative_case_ratios,
         )
         if not primary_res.passed:
+            if (
+                regime_spec.runtime_backend == "hybrid_trackb"
+                and tb_extracted is not None
+                and not _has_prim_func_builder(module_source, regime_spec.builder_candidates)
+            ):
+                active_mask = self._resolve_trackb_freedom_mask(regime_spec)
+                instantiated_tu = self._instantiate_trackb_tu(
+                    module_source, tb_extracted[1], regime_spec
+                )
+                return evaluate_ascendc_candidate(
+                    instantiated_tu,
+                    freedom_mask=active_mask,
+                    target=self._target,
+                    enable_track_router=self._enable_track_router,
+                    case_ratios=regime_spec.representative_case_ratios,
+                )
             return primary_res
         combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
         if combine_spec is not None:
@@ -3107,13 +3117,7 @@ class PerfTargetCampaignRunner:
             if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
             else None
         )
-        is_trackb_only_hybrid = (
-            regime_spec.runtime_backend == "hybrid_trackb"
-            and not _has_prim_func_builder(module_source, regime_spec.builder_candidates)
-        )
-        if tb_extracted is not None and (
-            regime_spec.runtime_backend == "ascendc_trackb" or is_trackb_only_hybrid
-        ):
+        if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
             instantiated_tu = self._instantiate_trackb_tu(
                 module_source, tb_extracted[1], regime_spec
             )
@@ -3149,6 +3153,15 @@ class PerfTargetCampaignRunner:
             env_file=self._env_file,
         )
         if not primary_b.passed:
+            if (
+                regime_spec.runtime_backend == "hybrid_trackb"
+                and tb_extracted is not None
+                and not _has_prim_func_builder(module_source, regime_spec.builder_candidates)
+            ):
+                instantiated_tu = self._instantiate_trackb_tu(
+                    module_source, tb_extracted[1], regime_spec
+                )
+                return self._compile_trackb_stage_b(instantiated_tu)
             return primary_b
         final_b = primary_b
         combine_elapsed_sec = 0.0

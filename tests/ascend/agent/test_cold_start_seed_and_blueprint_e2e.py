@@ -1933,7 +1933,13 @@ def test_stage0_trackb_validator_instantiates_each_regime_before_gates(
     evaluated: list[tuple[str, CasePhysicsRatios | None]] = []
     compiled: list[str] = []
 
-    def _evaluate(cpp_source: str, *, case_ratios: CasePhysicsRatios | None) -> StageAResult:
+    def _evaluate(
+        cpp_source: str,
+        *,
+        case_ratios: CasePhysicsRatios | None,
+        freedom_mask: object | None = None,
+    ) -> StageAResult:
+        _ = freedom_mask
         evaluated.append((cpp_source, case_ratios))
         return StageAResult(passed=True, prim_func=None, ledger=None)
 
@@ -1976,7 +1982,13 @@ def test_stage0_trackb_validator_aggregates_every_regime_failure(
     """Report every regime's Track-B L0 failure without compiling any translation unit."""
     compiled: list[str] = []
 
-    def _evaluate(cpp_source: str, *, case_ratios: CasePhysicsRatios | None) -> StageAResult:
+    def _evaluate(
+        cpp_source: str,
+        *,
+        case_ratios: CasePhysicsRatios | None,
+        freedom_mask: object | None = None,
+    ) -> StageAResult:
+        _ = (cpp_source, case_ratios, freedom_mask)
         return StageAResult(
             passed=False,
             prim_func=None,
