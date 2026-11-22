@@ -738,3 +738,97 @@ def test_prune_stale_sibling_stepping_stones_handles_bare_fenced_trackb_cpp(
 
     with pytest.raises(SyntaxError):
         runner._prune_stale_sibling_stepping_stones(promoted_spec, "def broken(:")
+
+
+def test_template_arg_callee_closure_view_patch_and_splice() -> None:
+    """Discover template-launched VF helpers and transitive __simt_callee__ helpers."""
+    cpp = (
+        "#include <tl_templates/ascend/common.h>\n"
+        "__simt_callee__ inline float inner_simt_helper(float v) {\n"
+        "    return v + 1.0f;\n"
+        "}\n"
+        "__simt_vf__ void vf_worker(__gm__ float* x) {\n"
+        "    x[0] = inner_simt_helper(x[0]);\n"
+        "}\n"
+        "__simt_callee__ inline float shared_simt_helper(float v) {\n"
+        "    return v * 2.0f;\n"
+        "}\n"
+        "__simt_vf__ void vf_sibling_only(__gm__ float* y) {\n"
+        "    y[0] = shared_simt_helper(y[0]);\n"
+        "}\n"
+        'extern "C" __global__ __vector__ void kernel_active(__gm__ float* x) {\n'
+        "    asc_vf_call<vf_worker>(dim3(64, 1, 1), x);\n"
+        "    x[1] = shared_simt_helper(x[1]);\n"
+        "}\n"
+        'extern "C" __global__ __vector__ void kernel_sibling(__gm__ float* y) {\n'
+        "    async_invoke<vf_sibling_only>(y);\n"
+        "}\n"
+    )
+    view = build_trackb_context_view(
+        cpp,
+        active_kernel="kernel_active",
+        regime_tag="stream",
+        max_bytes=14800,
+    )
+    assert "vf_worker(__gm__ float* x)" in view
+    assert "inner_simt_helper(float v)" in view
+    assert "shared_simt_helper(float v)" in view
+    assert "/* [READ-ONLY HELPER] */ __simt_vf__ void vf_sibling_only" in view
+
+    patch_worker_and_callee = (
+        _hunk("    x[0] = inner_simt_helper(x[0]);", "    x[0] = inner_simt_helper(x[0]) + 3.0f;")
+        + "\n"
+        + _hunk("    return v + 1.0f;", "    return v + 4.0f;")
+    )
+    updated, applied = apply_scoped_trackb_patch(
+        cpp,
+        patch_worker_and_callee,
+        active_kernel="kernel_active",
+    )
+    assert applied == 2
+    assert "inner_simt_helper(x[0]) + 3.0f" in updated
+    assert "return v + 4.0f;" in updated
+
+    with pytest.raises(ValueError, match="read-only code outside active kernel"):
+        apply_scoped_trackb_patch(
+            cpp,
+            _hunk("    return v * 2.0f;", "    return v * 5.0f;"),
+            active_kernel="kernel_active",
+        )
+    with pytest.raises(ValueError, match="read-only code outside active kernel"):
+        apply_scoped_trackb_patch(
+            cpp,
+            _hunk("    y[0] = shared_simt_helper(y[0]);", "    y[0] = 0.0f;"),
+            active_kernel="kernel_active",
+        )
+
+    splice_with_new_helper = (
+        "__simt_callee__ inline float brand_new_helper(float v) {\n"
+        "    return v + 9.0f;\n"
+        "}\n"
+        'extern "C" __global__ __vector__ void kernel_active(__gm__ float* x) {\n'
+        "    asc_vf_call<vf_worker>(dim3(64, 1, 1), x);\n"
+        "    x[1] = brand_new_helper(x[1]);\n"
+        "}\n"
+    )
+    spliced, count = splice_cpp_units_into_tu(
+        cpp,
+        splice_with_new_helper,
+        active_kernel="kernel_active",
+    )
+    assert count == 2
+    assert "brand_new_helper" in spliced
+    assert spliced.index("brand_new_helper") < spliced.index("kernel_active(__gm__ float* x)")
+
+    with pytest.raises(ValueError, match="outside the editable scope"):
+        splice_cpp_units_into_tu(
+            cpp,
+            "__simt_callee__ inline float unreferenced_helper(float v) {\n    return v;\n}\n",
+            active_kernel="kernel_active",
+        )
+    with pytest.raises(ValueError, match="outside the editable scope"):
+        splice_cpp_units_into_tu(
+            cpp,
+            "__simt_vf__ void vf_sibling_only(__gm__ float* y) {\n    y[0] = 0.0f;\n}\n",
+            active_kernel="kernel_active",
+        )

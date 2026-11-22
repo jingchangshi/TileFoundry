@@ -1638,7 +1638,12 @@ class SubprocessCliTemplateBackend:
         argv, stdin = self._command(model, effort, prompt)
         cfg = self.watchdog_for_role(req.role)
         max_retries = max(0, cfg.max_retries)
-        proxy_configured = "true" if _proxy_env(os.environ) else "false"
+        proxy_env = _proxy_env(os.environ)
+        proxy_configured = (
+            "true"
+            if any(k in proxy_env for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"))
+            else "false"
+        )
         async with self._sem:
             for attempt_idx in range(max_retries + 1):
                 start_ts = time.monotonic()

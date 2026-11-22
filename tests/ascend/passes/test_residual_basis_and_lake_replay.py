@@ -699,3 +699,57 @@ def test_residual_basis_context_and_registry_validation() -> None:
     assert named["is_aic_only"] == pytest.approx(0.0)
     assert named["is_irregular_simt"] == pytest.approx(0.0)
     assert math.isclose(named["log_tier0_scale"], math.log1p(100.0) / 10.0)
+
+
+def test_unpenalized_intercept_and_widened_head0_cap_capture_cold_start_headroom() -> None:
+    """Capture large cold-start residuals while keeping Head-2 pairwise deltas bounded in +-2.5."""
+    target = AscendTarget("ascend.950pr")
+    model = HybridAscendCostModel(target, ridge_alpha=1.0)
+    axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
+    wl = CostFeatures(
+        vec_flops=2e10,
+        gm_bytes=16e6,
+        total_tiles=56,
+        contig_burst_bytes=32768,
+        topology_axes=axes,
+    )
+    t0_us = model.predict(wl).tier0_physics_us
+    assert t0_us > 0.0
+    for _ in range(10):
+        model.observe(wl, 100.0 * t0_us, persist=False, refit=False)
+    model._refit_ridge()
+
+    pred = model.predict(wl)
+    assert pred.tier2_residual_factor > 20.0
+
+    wl_faster = CostFeatures(
+        vec_flops=2e10,
+        gm_bytes=16e6,
+        total_tiles=56,
+        contig_burst_bytes=32768,
+        vloopv2_loops=2,
+        software_loops=0,
+        topology_axes=axes,
+    )
+    wl_slower = CostFeatures(
+        vec_flops=2e10,
+        gm_bytes=16e6,
+        total_tiles=60,
+        contig_burst_bytes=4096,
+        vloopv2_loops=0,
+        software_loops=3,
+        topology_axes=axes,
+    )
+    for _ in range(8):
+        model.observe_pair_delta(wl_slower, 5000.0, wl_faster, 5.0)
+    ratio = model.predict_delta_ratio(wl_slower, wl_faster)
+    analytical_ratio = (
+        model._compute_tier0_and_tier1(wl_slower).tier0_us
+        + model._compute_tier0_and_tier1(wl_slower).tier1_penalty_us
+    ) / max(
+        1e-6,
+        model._compute_tier0_and_tier1(wl_faster).tier0_us
+        + model._compute_tier0_and_tier1(wl_faster).tier1_penalty_us,
+    )
+    residual_multiplier = ratio / max(1e-6, analytical_ratio)
+    assert residual_multiplier <= math.exp(2.5) + 1e-6

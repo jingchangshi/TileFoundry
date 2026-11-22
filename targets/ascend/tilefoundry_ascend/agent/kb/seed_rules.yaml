@@ -3,7 +3,7 @@ rules:
     symptom_family: COMPUTE_1C2V_SUBCORE_IMBALANCE
     regime_guard: "AIV0.PIPE_V > 0 or cube_to_vector_ratio > 0.0"
     precondition: "AIV0.PIPE_V > 0 and AIV1.PIPE_V == 0"
-    anti_precondition: "any_overflow_bytes > 0"
+    anti_precondition: "any_overflow_bytes > 0 or (has_simtvf and cube_to_vector_ratio == 0.0)"
     transform_template: |
       Partition the dominant output-row tile extent evenly across the two paired vector sub-cores
       (half_rows = row_tile // 2) via T.dual_copy on coupled AIC->AIV L0C->UB writeout or
@@ -602,14 +602,15 @@ rules:
 
   - rule_id: R31_SIMT_UB_PRIVATIZED_ATOMICS
     symptom_family: SYNC_BARRIER_SERIALIZATION
-    regime_guard: "has_indirect_gather or has_simtvf"
-    precondition: "(has_indirect_gather or has_simtvf) and (spill_bytes > 0 or measured_sync_stall_ratio > 0.10 or PIPE_V > 0)"
+    regime_guard: "has_indirect_gather"
+    precondition: "has_indirect_gather and (spill_bytes > 0 or measured_sync_stall_ratio > 0.10 or PIPE_V > 0)"
     anti_precondition: "pseudo_double_buffer_serialized or UB.overflow_bytes > 0"
     transform_template: |
-      For irregular gather/scatter/hash/histogram ops, allocate warp-privatized +8-padded UB
-      accumulators (__ubuf__ T warpBuf[WARPS][BINS+8]) with asc_atomic_add or leader-only
-      asc_atomic_cas + __shfl broadcast, enforce __launch_bounds__(512) for 0-byte spill, and
-      use Simt::UintDiv for fast integer index decomposition.
+      For irregular gather/scatter/hash/histogram ops, allocate contention-free privatized
+      accumulators in GM or caller-managed scratch with asc_atomic_add or leader-only
+      asc_atomic_cas, enforce __launch_bounds__(512) for 0-byte spill, and use Simt::UintDiv
+      for fast integer index decomposition (never emit CUDA __shfl* intrinsics or unsafe
+      raw integer __ubuf__ offset casts inside __simt_vf__).
     expected_postcondition: "spill_bytes <= prev.spill_bytes and (PIPE_V <= prev.PIPE_V or measured_sync_stall_ratio <= prev.measured_sync_stall_ratio)"
     source_provenance: "ref:cann_samples"
     alpha_prior: 2.8
@@ -617,9 +618,10 @@ rules:
     priority: 14
     compatible_backends: ["tilelang_dsl", "cce_trackb", "hybrid_trackb"]
     cpp20_transform_template: |
-      Allocate warp-privatized +8-padded __ubuf__ accumulators inside __simt_vf__ with
-      __launch_bounds__(512) and asc_atomic_add / __shfl reduction to prevent spills and contention.
-    rationale: "Warp-privatized +8-padded UB atomics and 512-thread launch bounds eliminate global atomic contention and spills."
+      Enforce __launch_bounds__(512) and Simt::UintDiv inside __simt_vf__ with contention-free
+      privatized accumulation using explicit scratch pointers and asc_atomic_add / asc_atomic_cas;
+      never emit CUDA __shfl* intrinsics or raw integer __ubuf__ offset casts inside __simt_vf__.
+    rationale: "Privatized accumulation, 512-thread launch bounds, and Simt::UintDiv eliminate global atomic contention and spills."
 
   - rule_id: R32_GROUPED_ROLLING_CORE_AND_EMPTY_SKIP
     symptom_family: GRID_TAIL_WAVE_UNDERUTIL

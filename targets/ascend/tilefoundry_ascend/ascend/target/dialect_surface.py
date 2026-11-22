@@ -488,6 +488,10 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
         "copy_ubuf_to_gm",
         "set_flag(",
         "wait_flag(",
+        "__shfl_down_sync",
+        "__shfl_sync",
+        "__shfl_xor_sync",
+        "__ballot_sync",
     ),
     prompt_notes=(
         "Compile target is Track-B CCE C++20 (-std=c++20 --npu-arch=dav-3510) via tl_templates.",
@@ -528,6 +532,11 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
             "thread stack/data cache in UB and triggers vector core exception 507035); "
             "operate directly on __gm__ pointers or pass an explicit __gm__ scratch "
             "tensor allocated from Python instead."
+        ),
+        (
+            "CUDA warp intrinsics (__shfl_down_sync, __shfl_sync, __shfl_xor_sync, "
+            "__ballot_sync, warpSize) do not exist on Ascend dav-3510; use explicit "
+            "shared scratch or __simd_vf__ vector reductions instead."
         ),
     ),
 )

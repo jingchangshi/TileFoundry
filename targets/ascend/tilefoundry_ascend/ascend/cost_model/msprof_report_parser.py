@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -697,6 +698,7 @@ def _apply_memory(slot: _MutableSubkernelRow, row: Mapping[str, tuple[str, str]]
         "hbm_read_bytes",
         "gm_read_bytes",
         "read_main_memory_bytes",
+        "read_main_memory_datas",
         "read_main_memory_datasize",
         "read_main_memory",
         "hbm_read_datasize",
@@ -713,6 +715,7 @@ def _apply_memory(slot: _MutableSubkernelRow, row: Mapping[str, tuple[str, str]]
         "hbm_write_bytes",
         "gm_write_bytes",
         "write_main_memory_bytes",
+        "write_main_memory_datas",
         "write_main_memory_datasize",
         "write_main_memory",
         "hbm_write_datasize",
@@ -778,6 +781,9 @@ def _apply_resource_conflict(
         "vec_bankgroup_cflt_ratio",
         "vec_bank_cflt_ratio",
         "vec_resc_cflt_ratio",
+        "aiv_vec_stu_cflt_ratio",
+        "aiv_vec_ldu_cflt_ratio",
+        "aiv_vec_sfu_cflt_ratio",
         "aic_resource_conflict_ratio",
         "aiv_resource_conflict_ratio",
         "bank_conflict",
@@ -790,6 +796,23 @@ def _apply_resource_conflict(
             values.append(_to_ratio(parsed[0], parsed[1]))
     if values:
         slot.bank_conflict_ratio = max(values)
+    if slot.sync_stall_ratio is None:
+        wait_keys = (
+            "aiv_vec_wait_ratio",
+            "aiv_mte2_wait_ratio",
+            "aiv_mte3_wait_ratio",
+            "aic_cube_wait_ratio",
+            "aic_mte1_wait_ratio",
+            "aic_mte2_wait_ratio",
+            "aic_mte3_wait_ratio",
+        )
+        wait_vals: list[float] = []
+        for key in wait_keys:
+            parsed = _first_numeric(row, key)
+            if parsed is not None:
+                wait_vals.append(_to_ratio(parsed[0], parsed[1]))
+        if wait_vals:
+            slot.sync_stall_ratio = max(wait_vals)
 
 
 def _apply_l2_cache(slot: _MutableSubkernelRow, row: Mapping[str, tuple[str, str]]) -> None:
@@ -818,11 +841,270 @@ def _apply_l2_cache(slot: _MutableSubkernelRow, row: Mapping[str, tuple[str, str
     if (hits_r is not None or hits_w is not None) and (total_hits + total_miss) > 0.0:
         slot.l2_hit_rate = max(0.0, min(1.0, total_hits / (total_hits + total_miss)))
         return
-    read_rate = _first_numeric(row, "read_hit_rate")
-    write_rate = _first_numeric(row, "write_hit_rate")
-    rates = [_to_ratio(r[0], r[1]) for r in (read_rate, write_rate) if r is not None]
+    cf_hit_keys = (
+        "aic_read_close_hit",
+        "aic_read_far_hit",
+        "aic_write_close_hit",
+        "aic_write_far_hit",
+        "aiv_read_close_hit",
+        "aiv_read_far_hit",
+        "aiv_write_close_hit",
+        "aiv_write_far_hit",
+    )
+    cf_miss_keys = (
+        "aic_read_close_miss",
+        "aic_read_far_miss",
+        "aic_write_close_miss",
+        "aic_write_far_miss",
+        "aiv_read_close_miss",
+        "aiv_read_far_miss",
+        "aiv_write_close_miss",
+        "aiv_write_far_miss",
+    )
+    cf_hits = 0.0
+    cf_misses = 0.0
+    cf_seen = False
+    for key in cf_hit_keys:
+        parsed = _first_numeric(row, key)
+        if parsed is not None:
+            cf_hits += max(0.0, parsed[0])
+            cf_seen = True
+    for key in cf_miss_keys:
+        parsed = _first_numeric(row, key)
+        if parsed is not None:
+            cf_misses += max(0.0, parsed[0])
+            cf_seen = True
+    if cf_seen and (cf_hits + cf_misses) > 0.0:
+        slot.l2_hit_rate = max(0.0, min(1.0, cf_hits / (cf_hits + cf_misses)))
+        return
+    rate_keys = (
+        "read_hit_rate",
+        "write_hit_rate",
+        "aiv_read_hit_rate",
+        "aiv_write_hit_rate",
+        "aic_read_hit_rate",
+        "aic_write_hit_rate",
+    )
+    rates: list[float] = []
+    for key in rate_keys:
+        parsed = _first_numeric(row, key)
+        if parsed is not None:
+            rates.append(_to_ratio(parsed[0], parsed[1]))
     if rates:
         slot.l2_hit_rate = sum(rates) / float(len(rates))
+
+
+_SUBKERNEL_ID_KEYS = frozenset({"op_name", "kernel_name", "task_name", "task_id"})
+_PER_BLOCK_SKIP_KEYS = frozenset(
+    {"block_id", "sub_block_id", "op_name", "kernel_name", "task_name", "task_id"}
+)
+_PER_BLOCK_ADDITIVE_SUFFIXES = (
+    "_datas",
+    "_datasize",
+    "_bytes",
+    "_cycles",
+    "_hit",
+    "_miss",
+    "_victim",
+    "_instructions",
+    "_count",
+)
+_PER_BLOCK_RATE_SUFFIXES = ("_ratio", "_rate", "_bw")
+_PER_BLOCK_TIME_KEYS = frozenset(
+    {"aiv_time", "aic_time", "task_duration", "duration", "dur_us", "total_time"}
+)
+
+
+def _is_per_block_metric_table(
+    rows: Sequence[tuple[list[tuple[str, str]], dict[str, tuple[str, str]]]],
+) -> bool:
+    """Return True when rows enumerate block_id slices without per-subkernel identifiers."""
+    if not rows:
+        return False
+    first_map = rows[0][1]
+    if "block_id" not in first_map:
+        return False
+    return not any(
+        key in row and _first_text(row, key)
+        for _headers, row in rows
+        for key in _SUBKERNEL_ID_KEYS
+    )
+
+
+def _collapse_per_block_rows(
+    canonical_name: str,
+    rows: Sequence[tuple[list[tuple[str, str]], dict[str, tuple[str, str]]]],
+) -> list[dict[str, tuple[str, str]]]:
+    """Collapse per-block hardware rows of one subkernel into a single aggregated row."""
+    if not rows:
+        return []
+    ordered_keys: list[str] = []
+    header_units: dict[str, str] = {}
+    seen_keys: set[str] = set()
+    for headers, _row in rows:
+        for key_base, key_unit in headers:
+            if not key_base or key_base in _PER_BLOCK_SKIP_KEYS:
+                continue
+            if key_base not in seen_keys:
+                seen_keys.add(key_base)
+                ordered_keys.append(key_base)
+            if key_unit and key_base not in header_units:
+                header_units[key_base] = key_unit
+    for _headers, row in rows:
+        for key_base, (_val, unit) in row.items():
+            if not key_base or key_base in _PER_BLOCK_SKIP_KEYS:
+                continue
+            if key_base not in seen_keys:
+                seen_keys.add(key_base)
+                ordered_keys.append(key_base)
+            if unit and key_base not in header_units:
+                header_units[key_base] = unit
+
+    collapsed: dict[str, tuple[str, str]] = {}
+    for key in ordered_keys:
+        unit = header_units.get(key, "")
+        is_rate = key.endswith(_PER_BLOCK_RATE_SUFFIXES)
+        is_additive = (not is_rate) and key.endswith(_PER_BLOCK_ADDITIVE_SUFFIXES)
+        is_byte_sum = is_additive and key.endswith(("_datas", "_datasize", "_bytes"))
+        is_time = key in _PER_BLOCK_TIME_KEYS or unit in _TIME_UNIT_TO_US
+
+        if is_byte_sum:
+            total_bytes = 0.0
+            found = False
+            for _headers, row in rows:
+                entry = row.get(key)
+                if entry is None:
+                    continue
+                parsed = _parse_numeric_cell(entry[0])
+                if parsed is None:
+                    continue
+                val, cell_unit = parsed
+                eff_unit = cell_unit or entry[1] or unit
+                mult = _BYTE_UNIT_MULTIPLIERS.get(eff_unit, 1)
+                total_bytes += val * float(mult)
+                found = True
+            if found:
+                collapsed[key] = (f"{total_bytes:.6f}", "b")
+            continue
+
+        if is_additive:
+            total_val = 0.0
+            found = False
+            for _headers, row in rows:
+                entry = row.get(key)
+                if entry is None:
+                    continue
+                parsed = _parse_numeric_cell(entry[0])
+                if parsed is None:
+                    continue
+                total_val += parsed[0]
+                found = True
+            if found:
+                collapsed[key] = (f"{total_val:.6f}", unit)
+            continue
+
+        if is_rate:
+            weighted_sum = 0.0
+            weight_total = 0.0
+            plain_sum = 0.0
+            plain_count = 0
+            out_unit = unit
+            for _headers, row in rows:
+                entry = row.get(key)
+                if entry is None:
+                    continue
+                parsed = _parse_numeric_cell(entry[0])
+                if parsed is None:
+                    continue
+                val, cell_unit = parsed
+                eff_unit = cell_unit or entry[1] or unit
+                if not out_unit and eff_unit:
+                    out_unit = eff_unit
+                weight_val = 0.0
+                if key.startswith("aiv_") and "aiv_time" in row:
+                    w_parsed = _parse_numeric_cell(row["aiv_time"][0])
+                    if w_parsed is not None and w_parsed[0] > 0.0:
+                        weight_val = w_parsed[0]
+                elif key.startswith("aic_") and "aic_time" in row:
+                    w_parsed = _parse_numeric_cell(row["aic_time"][0])
+                    if w_parsed is not None and w_parsed[0] > 0.0:
+                        weight_val = w_parsed[0]
+                else:
+                    for t_key in ("aiv_time", "aic_time"):
+                        if t_key in row:
+                            w_parsed = _parse_numeric_cell(row[t_key][0])
+                            if w_parsed is not None and w_parsed[0] > weight_val:
+                                weight_val = w_parsed[0]
+                plain_sum += val
+                plain_count += 1
+                if weight_val > 0.0:
+                    weighted_sum += val * weight_val
+                    weight_total += weight_val
+            if plain_count > 0:
+                agg_val = (
+                    weighted_sum / weight_total
+                    if weight_total > 0.0
+                    else (plain_sum / float(plain_count))
+                )
+                collapsed[key] = (f"{agg_val:.6f}", out_unit)
+            continue
+
+        if is_time:
+            time_vals: list[float] = []
+            out_unit = unit
+            for _headers, row in rows:
+                entry = row.get(key)
+                if entry is None:
+                    continue
+                parsed = _parse_numeric_cell(entry[0])
+                if parsed is None:
+                    continue
+                time_vals.append(parsed[0])
+                if not out_unit and (parsed[1] or entry[1]):
+                    out_unit = parsed[1] or entry[1]
+            if time_vals:
+                collapsed[key] = (f"{max(time_vals):.6f}", out_unit)
+            continue
+
+        plain_vals: list[float] = []
+        for _headers, row in rows:
+            entry = row.get(key)
+            if entry is None:
+                continue
+            parsed = _parse_numeric_cell(entry[0])
+            if parsed is not None:
+                plain_vals.append(parsed[0])
+        if plain_vals:
+            collapsed[key] = (f"{sum(plain_vals) / float(len(plain_vals)):.6f}", unit)
+
+    if canonical_name == "PipeUtilization.csv":
+        vec0_vals: list[tuple[float, str]] = []
+        vec1_vals: list[tuple[float, str]] = []
+        for _headers, row in rows:
+            sub_id = _first_text(row, "sub_block_id").lower()
+            entry = row.get("aiv_vec_ratio")
+            if entry is None:
+                continue
+            parsed = _parse_numeric_cell(entry[0])
+            if parsed is None:
+                continue
+            eff_unit = parsed[1] or entry[1]
+            if sub_id == "vector0":
+                vec0_vals.append((parsed[0], eff_unit))
+            elif sub_id == "vector1":
+                vec1_vals.append((parsed[0], eff_unit))
+        if (
+            vec0_vals
+            and vec1_vals
+            and "aiv0_vec_ratio" not in collapsed
+            and "aiv1_vec_ratio" not in collapsed
+        ):
+            mean0 = sum(v for v, _ in vec0_vals) / float(len(vec0_vals))
+            mean1 = sum(v for v, _ in vec1_vals) / float(len(vec1_vals))
+            collapsed["aiv0_vec_ratio"] = (f"{mean0:.6f}", vec0_vals[0][1])
+            collapsed["aiv1_vec_ratio"] = (f"{mean1:.6f}", vec1_vals[0][1])
+
+    return [collapsed] if collapsed else [row for _headers, row in rows]
 
 
 def _normalize_table_rows(
@@ -904,6 +1186,8 @@ def _normalize_table_rows(
                 label_keys=("metric", "item", "cache_metric", "name"),
                 value_keys=("ratio", "hit_rate", "value"),
             )
+    if _is_per_block_metric_table(raw_rows):
+        return _collapse_per_block_rows(canonical_name, raw_rows)
     return [row for _headers, row in raw_rows]
 
 
@@ -1569,6 +1853,31 @@ def parse_objdump_dwarf_hotspots(
     )
 
 
+def _resolve_ascend_objdump_bin() -> str:
+    """Locate llvm-objdump preferring active Ascend toolchain installations."""
+    candidates: list[Path] = []
+    bisheng_bin = shutil.which("bisheng")
+    if bisheng_bin:
+        candidates.append(Path(bisheng_bin).resolve().parent / "llvm-objdump")
+        candidates.append(Path(bisheng_bin).parent / "llvm-objdump")
+    for env_var in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME"):
+        raw_root = os.environ.get(env_var, "").strip()
+        if not raw_root:
+            continue
+        root = Path(raw_root)
+        for rel in (
+            "tools/bisheng_compiler/bin/llvm-objdump",
+            "x86_64-linux/bin/llvm-objdump",
+            "aarch64-linux/bin/llvm-objdump",
+            "compiler/ccec_compiler/bin/llvm-objdump",
+        ):
+            candidates.append(root / rel)
+    for cand in candidates:
+        if cand.is_file():
+            return str(cand)
+    return shutil.which("llvm-objdump") or shutil.which("objdump") or ""
+
+
 def extract_p2_from_objdump(
     object_paths: Sequence[Path | str],
     *,
@@ -1578,7 +1887,7 @@ def extract_p2_from_objdump(
     """Disassemble compiled Ascend objects with llvm-objdump -d -l for DWARF hotspot fallback."""
     resolved_bin = str(objdump_bin).strip() if objdump_bin is not None else ""
     if not resolved_bin:
-        resolved_bin = shutil.which("llvm-objdump") or shutil.which("objdump") or ""
+        resolved_bin = _resolve_ascend_objdump_bin()
     if not resolved_bin:
         return parse_objdump_dwarf_hotspots("", top_k_hotspots=top_k_hotspots)
 

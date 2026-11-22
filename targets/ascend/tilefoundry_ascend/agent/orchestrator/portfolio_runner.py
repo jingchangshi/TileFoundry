@@ -764,6 +764,7 @@ def build_syntax_repair_request(
     sil_advisory: object | None = None,
     sil_verification: object | None = None,
     backend_kind: str = "tilelang_dsl",
+    parent_source: str = "",
 ) -> GenerationRequest:
     """Build bounded syntax/compile repair request routed to the active backend dialect."""
     hint_sentence = f" Authorized target: {slice_hint}." if slice_hint else ""
@@ -795,10 +796,23 @@ def build_syntax_repair_request(
         sil_verification=sil_verification,
     )
     sil_block = f"{sil_text}\n\n" if sil_text else ""
+    parent_block = ""
+    stripped_parent = parent_source.strip()
+    if stripped_parent:
+        if len(stripped_parent) > 16000:
+            trunc_marker = "\n/* ... parent source truncated ... */" if is_cpp else "\n..."
+            keep_len = max(0, 16000 - len(trunc_marker))
+            bounded_parent = stripped_parent[:keep_len].rstrip() + trunc_marker
+        else:
+            bounded_parent = stripped_parent
+        parent_block = (
+            f"### PARENT AUTHORIZED SOURCE\n```{fence_lang}\n{bounded_parent}\n```\n\n"
+        )
     user_prompt = (
         f"### VALID TARGET DIALECT PRIMITIVES ({surface.dialect_id})\n"
         f"{surface.render_prompt_reference()}\n\n"
         f"{sil_block}"
+        f"{parent_block}"
         f"### COMPILER / GATE DIAGNOSTIC\n{error_message}\n\n"
         f"### BROKEN KERNEL SOURCE\n```{fence_lang}\n{dsl_source}\n```\n"
     )

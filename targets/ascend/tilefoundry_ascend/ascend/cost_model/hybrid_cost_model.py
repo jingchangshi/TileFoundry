@@ -1138,7 +1138,7 @@ class HybridAscendCostModel:
             weight_map.get(spec.name, 0.0) * t01.named_features.get(spec.name, 0.0)
             for spec in head0_specs
         )
-        log_res = max(-2.5, min(2.5, log_res))
+        log_res = max(-6.0, min(6.0, log_res))
         residual_factor = math.exp(log_res)
         pred_us = base_us * residual_factor if (t01.tier0_us > 0.0 or t01.tier1_penalty_us > 0.0) else 0.0
         return CostPrediction(
@@ -1237,6 +1237,7 @@ class HybridAscendCostModel:
         *,
         alpha: float,
         prior_weights: Mapping[str, float] | None = None,
+        y_cap: float = 6.0,
     ) -> tuple[dict[str, float], tuple[str, ...]]:
         """Solve closed-form Ridge on the sample-gated active subspace only."""
         weights: dict[str, float] = {spec.name: 0.0 for spec in specs}
@@ -1252,7 +1253,19 @@ class HybridAscendCostModel:
         if not active_specs:
             return weights, ()
         k = len(active_specs)
-        xtx = [[alpha if i == j else 0.0 for j in range(k)] for i in range(k)]
+        xtx = [
+            [
+                (
+                    1e-4
+                    if (prior_weights is None and active_specs[i].name == "intercept")
+                    else alpha
+                )
+                if i == j
+                else 0.0
+                for j in range(k)
+            ]
+            for i in range(k)
+        ]
         xty = [
             (alpha * float(prior_weights.get(spec.name, 0.0)))
             if prior_weights is not None
@@ -1260,7 +1273,7 @@ class HybridAscendCostModel:
             for spec in active_specs
         ]
         for idx, (named_x, y_raw) in enumerate(rows):
-            y = max(-2.5, min(2.5, float(y_raw)))
+            y = max(-y_cap, min(y_cap, float(y_raw)))
             w = self._forgetting_factor ** float(n_total - 1 - idx)
             x_active = [float(named_x.get(spec.name, 0.0)) for spec in active_specs]
             for i in range(k):
@@ -1493,6 +1506,7 @@ class HybridAscendCostModel:
             self._pair_deltas,
             head2_specs,
             alpha=max(1.0, self.ridge_alpha),
+            y_cap=2.5,
         )
 
     def observe_pair_delta(

@@ -45,6 +45,10 @@ FORBIDDEN_CCE_TOKENS = (
     "copy_ubuf_to_gm",
     "set_flag(",
     "wait_flag(",
+    "__shfl_down_sync",
+    "__shfl_sync",
+    "__shfl_xor_sync",
+    "__ballot_sync",
 )
 
 CLEAN_TRACKB_SOURCE = (

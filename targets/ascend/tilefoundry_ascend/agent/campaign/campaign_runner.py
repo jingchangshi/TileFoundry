@@ -6770,6 +6770,12 @@ class PerfTargetCampaignRunner:
                 )
                 or ""
             )
+            repair_parent_source = _compact_trackb_snippet_source(
+                parent_snippet,
+                regime_spec,
+                incumbent_source=parent_module_source,
+                active_kernel=round_active_kernel,
+            )
             l0_l1_checks = await run_l0_l1_round_filter(
                 raw_candidates,
                 patch_fn=lambda snip: patch_regime_into_module(
@@ -6788,6 +6794,7 @@ class PerfTargetCampaignRunner:
                 max_syntax_repairs=self._config.max_syntax_repairs,
                 slice_hint=self._slice_contract_instruction(func_name, regime_spec),
                 backend_kind=regime_spec.runtime_backend,
+                parent_source=repair_parent_source,
                 stage_a_cost_ranker=stage_a_ranker,
                 cost_prescreen_top_k=prescreen_top_k,
             )

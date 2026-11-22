@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from tests.ascend.agent import test_surrogate_batch_npu
 from tests.ascend.agent.test_surrogate_batch_npu import _extract_msprof_metrics
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     StaticDynamicResidual,
@@ -19,6 +21,7 @@ from tilefoundry_ascend.ascend.cost_model.msprof_report_parser import (
     P2InstructionDiveSummary,
     SubkernelMsprofMetrics,
     aggregate_subkernel_msprof,
+    extract_p2_from_objdump,
     parse_msprof_op_report,
     parse_p2_instruction_trace,
     parse_pc_start_addr,
@@ -506,3 +509,114 @@ def test_surrogate_extract_msprof_honest_telemetry_end_to_end() -> None:
     obs = ObservationVector5D.from_tiers(_sample_ledger(), telemetry=metrics)
     assert "l2_sync_stall_ratio" not in obs.measured_l2_fields
     assert obs.pipeline_sync.l2_sync_stall_ratio == 0.0
+
+
+def test_parse_msprof_per_block_cann93_tables_and_p2_timeout_objdump_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Collapse per-block CANN 9.3.0 CSV tables into one subkernel and handle P2 fallback."""
+    opprof = tmp_path / "OPPROF_block_fixture"
+    opprof.mkdir()
+    (opprof / "OpBasicInfo.csv").write_text(
+        "Op Name,Op Type,Task Duration(us),Block Dim,\n"
+        "rms_norm_k,vector,600.0,2,\n",
+        encoding="utf-8",
+    )
+    (opprof / "PipeUtilization.csv").write_text(
+        "block_id,sub_block_id,aic_time(us),aic_total_cycles,aiv_time(us),aiv_total_cycles,aiv_vec_ratio,aiv_mte2_ratio,\n"
+        "0,vector0,NA,NA,100.0,1000,0.80,0.10,\n"
+        "0,vector1,NA,NA,300.0,3000,0.40,0.20,\n",
+        encoding="utf-8",
+    )
+    (opprof / "Memory.csv").write_text(
+        "block_id,sub_block_id,read_main_memory_datas(KB),write_main_memory_datas(KB),\n"
+        "0,vector0,100.0,200.0,\n"
+        "0,vector1,50.0,100.0,\n",
+        encoding="utf-8",
+    )
+    (opprof / "ResourceConflictRatio.csv").write_text(
+        "block_id,sub_block_id,aiv_vec_stu_cflt_ratio,aiv_vec_ldu_cflt_ratio,aiv_vec_sfu_cflt_ratio,aiv_vec_wait_ratio,\n"
+        "0,vector0,0.02,0.05,0.01,0.15,\n"
+        "0,vector1,0.06,0.03,0.01,0.25,\n",
+        encoding="utf-8",
+    )
+    (opprof / "L2Cache.csv").write_text(
+        "block_id,sub_block_id,aiv_read_close_hit,aiv_read_far_hit,aiv_write_close_hit,aiv_write_far_hit,"
+        "aiv_read_close_miss,aiv_read_far_miss,aiv_write_close_miss,aiv_write_far_miss,\n"
+        "0,vector0,40,10,30,10,5,5,0,0,\n"
+        "0,vector1,20,10,20,10,20,10,5,5,\n",
+        encoding="utf-8",
+    )
+
+    report = parse_msprof_op_report(opprof)
+    assert len(report.subkernels) == 1
+    assert report.dominant_subkernel_name == "rms_norm_k"
+    assert report.total_duration_us == pytest.approx(600.0)
+    assert report.aiv_total_cycles == 4000
+    assert report.aiv_vec_ratio == pytest.approx(0.50)
+    assert report.aiv0_vec_ratio == pytest.approx(0.80)
+    assert report.aiv1_vec_ratio == pytest.approx(0.40)
+    assert report.hbm_read_bytes == 150 * 1024
+    assert report.hbm_write_bytes == 300 * 1024
+    assert report.actual_gm_bytes == 450 * 1024
+    assert report.bank_conflict_ratio == pytest.approx(0.04)
+    assert report.sync_stall_ratio == pytest.approx(0.20)
+    assert report.l2_hit_rate == pytest.approx(150.0 / 200.0)
+
+    seen_metrics: list[str] = []
+    seen_objs: list[list[Path | str]] = []
+
+    def _fake_subprocess(
+        *,
+        msprof_bin: str | None,
+        output_dir: Path,
+        aic_metrics: str,
+        warmup: int,
+        repeat: int,
+        app_argv: list[str] | tuple[str, ...],
+        msprof_op_command: object | None = None,
+        timeout_sec: int = 180,
+    ) -> subprocess.CompletedProcess[str]:
+        _ = (msprof_bin, warmup, repeat, app_argv, msprof_op_command, timeout_sec)
+        seen_metrics.append(aic_metrics)
+        if len(seen_metrics) == 1:
+            raise subprocess.TimeoutExpired(cmd="msprof", timeout=120)
+        p1_dir = output_dir / "OPPROF_fallback" / "dump"
+        p1_dir.mkdir(parents=True, exist_ok=True)
+        (p1_dir / "aicore_binary.o").write_bytes(b"\x7fELF")
+        (p1_dir.parent / "OpBasicInfo.csv").write_text(
+            "Op Name,Task Duration(us)\nfallback_k,42.0\n",
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+    def _fake_objdump(object_paths: list[Path | str] | tuple[Path | str, ...], **_kw: object) -> P2InstructionDiveSummary:
+        seen_objs.append(list(object_paths))
+        return P2InstructionDiveSummary(
+            total_instructions=12,
+            instruction_mix={"vector": 1.0},
+            mte_waitflag_count=0,
+            mte_waitflag_share=0.0,
+            issue_interval_us={},
+            source_line_hotspots=(),
+            attributed_instruction_share=1.0,
+        )
+
+    monkeypatch.setattr(test_surrogate_batch_npu.shutil, "which", lambda _name: "/usr/bin/msprof")
+    monkeypatch.setattr(test_surrogate_batch_npu, "_run_msprof_op_subprocess", _fake_subprocess)
+    monkeypatch.setattr(test_surrogate_batch_npu, "extract_p2_from_objdump", _fake_objdump)
+
+    tel = test_surrogate_batch_npu._measure_msprof_op_metrics(
+        operator_name="level2/rms_norm",
+        candidate_id="bottleneck_p2_0",
+        case_runner_argv=["python3", "-c", "pass"],
+    )
+    assert tel is not None
+    assert len(seen_metrics) == 2
+    assert "PipeTimeline" in seen_metrics[0]
+    assert seen_metrics[1] == test_surrogate_batch_npu._P1_AIC_METRICS
+    assert tel["p2_source"] == "llvm_objdump_dwarf"
+    assert tel["p2_total_instructions"] == 12
+    assert any(Path(p).name == "aicore_binary.o" for p in seen_objs[0])
+    _ = extract_p2_from_objdump

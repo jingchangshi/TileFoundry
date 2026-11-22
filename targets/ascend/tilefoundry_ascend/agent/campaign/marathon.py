@@ -1769,58 +1769,67 @@ def run_operator_marathon(
         worktree,
         env_file,
     )
+    resume_flag = checkpoint_path.is_file() if cfg.resume is None else bool(cfg.resume)
     seeded_regime_specs: Sequence[RegimeTargetSpec] | None = None
     seed_outcome: SeedSynthesisOutcome | None = None
     if cfg.auto_bootstrap_seed:
-        try:
-            if (
-                cfg.pure_golden
-                and "pure_golden" in inspect.signature(prepare_marathon_seed).parameters
-            ):
-                seed_outcome = prepare_marathon_seed(
-                    operator_name=cfg.operator_name,
-                    target_module=target_module,
-                    staging_dir=staging_dir,
-                    worktree=worktree,
-                    env_file=env_file,
-                    cannbench_repo=cannbench_repo,
-                    llm_backend=llm_backend,
-                    cold_start=cfg.cold_start,
-                    device_id=primary_device_id,
-                    op_logger=op_logger,
-                    pure_golden=True,
-                )
-            else:
-                seed_outcome = prepare_marathon_seed(
-                    operator_name=cfg.operator_name,
-                    target_module=target_module,
-                    staging_dir=staging_dir,
-                    worktree=worktree,
-                    env_file=env_file,
-                    cannbench_repo=cannbench_repo,
-                    llm_backend=llm_backend,
-                    cold_start=cfg.cold_start,
-                    device_id=primary_device_id,
-                    op_logger=op_logger,
-                )
-        except (OSError, RuntimeError, ValueError) as exc:
-            op_logger.error("STAGE0_SEED_FAILED op=%s error=%s", cfg.operator_name, exc)
-            return 2
-        seeded_regime_specs = seed_outcome.regime_specs
-        op_logger.info(
-            "STAGE0_SEED op=%s mode=%s track=%s attempts=%d verification=%s sha256=%s "
-            "run_id=%s receipt=%s l0_l1=%s oracle_accuracy=%s",
-            cfg.operator_name,
-            seed_outcome.mode,
-            seed_outcome.initial_track,
-            seed_outcome.attempts_used,
-            seed_outcome.verification_state,
-            seed_outcome.candidate_sha256,
-            seed_outcome.l3_run_id,
-            seed_outcome.l3_receipt_path,
-            seed_outcome.l0_l1_passed,
-            seed_outcome.oracle_accuracy_passed,
-        )
+        if resume_flag and checkpoint_path.is_file() and target_module.is_file():
+            op_logger.info(
+                "STAGE0_SEED_SKIPPED_RESUME op=%s checkpoint=%s target=%s",
+                cfg.operator_name,
+                checkpoint_path,
+                target_module,
+            )
+        else:
+            try:
+                if (
+                    cfg.pure_golden
+                    and "pure_golden" in inspect.signature(prepare_marathon_seed).parameters
+                ):
+                    seed_outcome = prepare_marathon_seed(
+                        operator_name=cfg.operator_name,
+                        target_module=target_module,
+                        staging_dir=staging_dir,
+                        worktree=worktree,
+                        env_file=env_file,
+                        cannbench_repo=cannbench_repo,
+                        llm_backend=llm_backend,
+                        cold_start=cfg.cold_start,
+                        device_id=primary_device_id,
+                        op_logger=op_logger,
+                        pure_golden=True,
+                    )
+                else:
+                    seed_outcome = prepare_marathon_seed(
+                        operator_name=cfg.operator_name,
+                        target_module=target_module,
+                        staging_dir=staging_dir,
+                        worktree=worktree,
+                        env_file=env_file,
+                        cannbench_repo=cannbench_repo,
+                        llm_backend=llm_backend,
+                        cold_start=cfg.cold_start,
+                        device_id=primary_device_id,
+                        op_logger=op_logger,
+                    )
+            except (OSError, RuntimeError, ValueError) as exc:
+                op_logger.error("STAGE0_SEED_FAILED op=%s error=%s", cfg.operator_name, exc)
+                return 2
+            seeded_regime_specs = seed_outcome.regime_specs
+            op_logger.info(
+                "STAGE0_SEED op=%s mode=%s track=%s attempts=%d verification=%s sha256=%s "
+                "run_id=%s receipt=%s l0_l1=%s oracle_accuracy=%s",
+                cfg.operator_name,
+                seed_outcome.mode,
+                seed_outcome.initial_track,
+                seed_outcome.attempts_used,
+                seed_outcome.verification_state,
+                seed_outcome.candidate_sha256,
+                seed_outcome.l3_run_id,
+                seed_outcome.l3_receipt_path,
+                seed_outcome.l0_l1_passed,
+                seed_outcome.oracle_accuracy_passed,
+            )
 
     l2_evaluator = build_resilient_l2_evaluator(
         operator_name=cfg.operator_name,
@@ -2008,7 +2017,6 @@ def run_operator_marathon(
             stagnation_discount=cfg.stagnation_discount,
             op_logger=op_logger,
         )
-    resume_flag = checkpoint_path.is_file() if cfg.resume is None else bool(cfg.resume)
     op_logger.info(
         "Launching ExtremeCampaignRunner op=%s device=%s resume=%s max_rounds=%d "
         "max_wall_min=%.1f target_score=%.1f target_eta=%.3f worktree=%s",

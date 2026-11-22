@@ -340,7 +340,7 @@ def test_p2_deep_dive_hook_trace_and_simulator_dwarf_fallback(
         "args = sys.argv[1:]\n"
         "out_dir = Path(next(a.split('=', 1)[1] for a in args if a.startswith('--output=')))\n"
         "aic = next(a.split('=', 1)[1] for a in args if a.startswith('--aic-metrics='))\n"
-        "assert 'InstrTimeline' in aic and 'PCSampling' in aic and 'Source' in aic\n"
+        "assert 'PipeTimeline' in aic\n"
         "opprof = out_dir / 'OPPROF_TRACE'\n"
         "opprof.mkdir(parents=True, exist_ok=True)\n"
         "(opprof / 'OpBasicInfo.csv').write_text(\n"
@@ -392,8 +392,8 @@ def test_p2_deep_dive_hook_trace_and_simulator_dwarf_fallback(
         "aic = next(a.split('=', 1)[1] for a in args if a.startswith('--aic-metrics='))\n"
         f"with Path({str(sim_log)!r}).open('a', encoding='utf-8') as fh:\n"
         "    fh.write(aic + '\\n')\n"
-        "if 'InstrTimeline' in aic:\n"
-        "    sys.stderr.write('unsupported metric InstrTimeline in simulator\\n')\n"
+        "if 'PipeTimeline' in aic:\n"
+        "    sys.stderr.write('unsupported metric PipeTimeline in simulator\\n')\n"
         "    sys.exit(2)\n"
         "opprof = out_dir / 'OPPROF_RETRY'\n"
         "opprof.mkdir(parents=True, exist_ok=True)\n"
@@ -431,8 +431,8 @@ def test_p2_deep_dive_hook_trace_and_simulator_dwarf_fallback(
     )
     calls = sim_log.read_text(encoding="utf-8").splitlines()
     assert len(calls) == 2
-    assert "InstrTimeline" in calls[0]
-    assert "InstrTimeline" not in calls[1]
+    assert "PipeTimeline" in calls[0]
+    assert "PipeTimeline" not in calls[1]
     assert p2_dwarf_tel["dur_us"] == pytest.approx(15.0)
     assert p2_dwarf_tel["aiv_vec_ratio"] == pytest.approx(0.50)
     assert p2_dwarf_tel["p2_source"] == "llvm_objdump_dwarf"

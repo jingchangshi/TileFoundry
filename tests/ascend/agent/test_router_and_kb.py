@@ -1490,3 +1490,47 @@ def test_residual_beam_syntax_error_fail_closed_and_trackb_cpp_signatures() -> N
         "asc_sync_notify(PIPE_V, PIPE_MTE2, (event_t)1);\n"
     )
     assert "cpp:pingpong_event_parity" in dual_event_tags
+
+
+def test_r01_and_r31_guards_reject_pure_vector_dense_simtvf() -> None:
+    """Reject R01 on pure-vector __simt_vf__ and require has_indirect_gather for R31."""
+    rules = {r.rule_id: r for r in load_seed_rules()}
+
+    dense_simtvf_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 120, "AIV0.PIPE_MTE2": 80},
+        waterlines={},
+        has_indirect_gather=False,
+        opaque_dynamic_regions=("simt_vf",),
+    )
+    dense_simtvf_ctx = build_predicate_context(dense_simtvf_ledger)
+    assert rules["R01_DUAL_COPY_1C2V_SPLIT"].matches(dense_simtvf_ctx) is False
+    assert rules["R31_SIMT_UB_PRIVATIZED_ATOMICS"].matches(dense_simtvf_ctx) is False
+
+    coupled_simtvf_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 80},
+        waterlines={},
+        has_indirect_gather=False,
+        opaque_dynamic_regions=("simt_vf",),
+    )
+    assert rules["R01_DUAL_COPY_1C2V_SPLIT"].matches(
+        build_predicate_context(coupled_simtvf_ledger)
+    ) is True
+
+    indirect_simtvf_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 120, "AIV0.PIPE_MTE2": 40},
+        waterlines={},
+        has_indirect_gather=True,
+        opaque_dynamic_regions=("simt_vf",),
+    )
+    assert rules["R31_SIMT_UB_PRIVATIZED_ATOMICS"].matches(
+        build_predicate_context(indirect_simtvf_ledger)
+    ) is True

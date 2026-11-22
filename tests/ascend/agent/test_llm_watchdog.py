@@ -898,9 +898,21 @@ def test_claude_stream_json_startup_retry_and_telemetry(
     bin_path, state_dir = _write_fake_claude(tmp_path)
     monkeypatch.setenv("TF_FAKE_CLAUDE_STATE_DIR", str(state_dir))
     monkeypatch.setenv("TF_FAKE_CLAUDE_SCENARIO", "startup_stall_once_then_ok")
-    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+    for key in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+        "TILEFOUNDRY_NPU_LLM_HTTP_PROXY",
+        "TILEFOUNDRY_NPU_LLM_HTTPS_PROXY",
+        "TILEFOUNDRY_NPU_LLM_ALL_PROXY",
+        "TILEFOUNDRY_NPU_LLM_NO_PROXY",
+    ):
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.delenv("TILEFOUNDRY_NPU_LLM_HTTPS_PROXY", raising=False)
     backend = _claude_backend(bin_path)
     caplog.set_level(logging.INFO)
 

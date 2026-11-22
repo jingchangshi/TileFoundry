@@ -53,6 +53,8 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     _fast_wire_operator_name,
     _format_l3_failure_detail,
     _submit_fast_gate,
+    run_l0_l1_round_filter,
+    run_l4_official_cannbench_via_agent_gates,
     run_multi_operator_surrogate_batch_via_agent_gates,
 )
 from tilefoundry_ascend.agent.orchestrator import gate_funnel
@@ -63,6 +65,7 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     run_stage_b_ascendc_compile,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import GenerationRequest, MockLLMBackend
+from tilefoundry_ascend.agent.orchestrator.portfolio_runner import build_syntax_repair_request
 from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
     PyTorchSemanticAnalyzer,
     RepresentativeCase,
@@ -1192,7 +1195,279 @@ def test_stage0_oracle_validator_retries_transient_blocked_env(
     assert sleeps == [10.0, 15.0]
 
 
-def test_cce_cpp20_surface_prompt_includes_dav3510_compiler_rules() -> None:
+def test_cce_cpp20_surface_warns_against_simtvf_ubuf_flags_and_raw_ub_casts() -> None:
+    """Verify CCE C++20 reference forbids PURE_SIMDVF_UBUF_FLAGS and raw __ubuf__ casts in __simt_vf__."""
+    rendered = CCE_CPP20_SURFACE.render_prompt_reference()
+    assert "PURE_SIMDVF_UBUF_FLAGS" in rendered
+    assert "__simt_vf__" in rendered
+    assert "(__ubuf__" in rendered
+    assert "507035" in rendered
+    assert "__shfl_down_sync" in rendered
+    assert "__shfl_sync" in rendered
+    introduced = CCE_CPP20_SURFACE.introduced_forbidden_tokens(
+        "float x = 1.0f;",
+        "float y = __shfl_down_sync(0xffffffff, x, 1) + __shfl_sync(0xffffffff, x, 0);",
+    )
+    assert "__shfl_down_sync" in introduced
+    assert "__shfl_sync" in introduced
+
+
+def test_syntax_repair_includes_bounded_parent_source_and_round_filter_forwards_it() -> None:
+    """Include bounded parent source in repair prompts and forward on ast_patch_error."""
+    huge_parent = ("__global__ void k() {}\n" * 1000).strip()
+    req = build_syntax_repair_request(
+        "<<<<<<< SEARCH\nmissing\n=======\nrep\n>>>>>>> REPLACE",
+        "ast_patch_error: ValueError: did not match",
+        backend_kind="cce_trackb",
+        parent_source=huge_parent,
+    )
+    assert "### PARENT AUTHORIZED SOURCE" in req.user_prompt
+    assert "/* ... parent source truncated ... */" in req.user_prompt
+    parent_section = (
+        req.user_prompt.split("### PARENT AUTHORIZED SOURCE", 1)[1]
+        .split("### COMPILER / GATE DIAGNOSTIC", 1)[0]
+    )
+    assert len(parent_section) < 16200
+
+    backend = _ScriptedBackend(["repaired_snippet"])
+
+    def _patch_fn(snip: str) -> str:
+        if snip != "repaired_snippet":
+            raise ValueError("SEARCH block did not match target C++ source")
+        return "patched_module"
+
+    checks = asyncio.run(
+        run_l0_l1_round_filter(
+            [("w1", "bad_hunk")],
+            patch_fn=_patch_fn,
+            l0_checker=lambda _mod: StageAResult(passed=True, prim_func=None, ledger=None),
+            l1_compiler=lambda _mod: StageBResult(passed=True),
+            repair_backend=backend,
+            max_syntax_repairs=1,
+            backend_kind="cce_trackb",
+            parent_source="PARENT_MARKER_CODE",
+        )
+    )
+    assert len(checks) == 1
+    assert checks[0].passed is True
+    assert checks[0].repaired is True
+    assert len(backend.requests) == 1
+    assert "### PARENT AUTHORIZED SOURCE" in backend.requests[0].user_prompt
+    assert "PARENT_MARKER_CODE" in backend.requests[0].user_prompt
+
+
+def test_l4_official_cannbench_retries_transient_build_lock_unless_resuming(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry BLOCKED_ENV resource busy build lock on fresh L4 submissions, never on resume."""
+    cand_file = tmp_path / "cand.py"
+    cand_file.write_text("def kernel(x):\n    return x\n", encoding="utf-8")
+
+    executions = [
+        _V2GateExecution(
+            execution_id="exec-busy",
+            report={
+                "status": "BLOCKED_ENV",
+                "gates": [
+                    {
+                        "gateId": "tilefoundry-npu-cannbench",
+                        "status": "BLOCKED_ENV",
+                        "failures": ["resource busy: build:/repo/build (waited 0.0s)"],
+                        "observations": {},
+                    }
+                ],
+            },
+            verification={"satisfied": False, "failures": ["resource busy: build:/repo/build"]},
+            run_id="run-busy",
+        ),
+        _V2GateExecution(
+            execution_id="exec-ok",
+            report={
+                "status": "PASS",
+                "gates": [
+                    {
+                        "gateId": "tilefoundry-npu-cannbench",
+                        "status": "PASS",
+                        "observations": {
+                            "results": {
+                                "level2/softmax": {
+                                    "passed": True,
+                                    "avgSpeedup": 1.25,
+                                    "score": 80.0,
+                                    "caseCount": 20,
+                                    "passedCases": 20,
+                                }
+                            },
+                            "caseCount": 20,
+                            "passedCases": 20,
+                            "reportDir": str(tmp_path / "rep"),
+                        },
+                    }
+                ],
+            },
+            verification={"satisfied": True},
+            run_id="run-ok",
+            device_id="2",
+            state="FINISHED",
+            execution_terminal=True,
+        ),
+    ]
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    def _fake_v2(**kwargs: object) -> _V2GateExecution:
+        calls.append(str(kwargs.get("resume_execution_id") or ""))
+        return executions[min(len(calls) - 1, len(executions) - 1)]
+
+    monkeypatch.setattr(surrogate_cannbench, "get_operator_task", lambda _op: "level2/softmax")
+    monkeypatch.setattr(surrogate_cannbench, "_workspace_relative_candidate", lambda _r, _p: "cand.py")
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: "agent-gates")
+    monkeypatch.setattr(surrogate_cannbench, "_agent_gates_workspace_name", lambda _r: "tilefoundry")
+    monkeypatch.setattr(surrogate_cannbench, "_run_v2_gate", _fake_v2)
+    monkeypatch.setattr(surrogate_cannbench, "_validate_l4_report", lambda *_a, **_kw: ("", ""))
+    monkeypatch.setattr(surrogate_cannbench.time, "sleep", lambda sec: sleeps.append(float(sec)))
+
+    fresh_res = run_l4_official_cannbench_via_agent_gates(
+        operator_name="level2/softmax",
+        candidate_module_path=cand_file,
+        source_root=tmp_path,
+        device_id="2",
+    )
+    assert fresh_res.passed is True
+    assert fresh_res.run_id == "run-ok"
+    assert len(calls) == 2
+    assert sleeps == [10.0]
+
+    calls.clear()
+    sleeps.clear()
+    resume_executions = [executions[0]]
+
+    def _fake_v2_resume(**kwargs: object) -> _V2GateExecution:
+        calls.append(str(kwargs.get("resume_execution_id") or ""))
+        return resume_executions[0]
+
+    monkeypatch.setattr(surrogate_cannbench, "_run_v2_gate", _fake_v2_resume)
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "_validate_l4_report",
+        lambda *_a, **_kw: ("blocked_env_build", "environment"),
+    )
+    resumed_res = run_l4_official_cannbench_via_agent_gates(
+        operator_name="level2/softmax",
+        candidate_module_path=cand_file,
+        source_root=tmp_path,
+        device_id="2",
+        resume_execution_id="exec-prior",
+    )
+    assert resumed_res.passed is False
+    assert calls == ["exec-prior"]
+    assert sleeps == []
+
+
+def test_marathon_auto_resume_skips_stage0_prepare_seed_unless_fresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Skip prepare_marathon_seed on auto-resume when checkpoint and module exist."""
+    worktree = tmp_path / "repo"
+    state_dir = worktree / ".tilefoundry-marathon" / "state"
+    state_dir.mkdir(parents=True)
+    target_mod = state_dir / "pure_golden_ops" / "softmax" / "kernels.py"
+    target_mod.parent.mkdir(parents=True)
+    target_mod.write_text("def softmax(x):\n    return x\nkernel = softmax\n", encoding="utf-8")
+    (state_dir / "checkpoint.json").write_text('{"round_idx": 3}\n', encoding="utf-8")
+
+    seed_calls: list[bool] = []
+    resume_args: list[bool] = []
+
+    class _FakeRunner:
+        def __init__(self, **kwargs: object) -> None:
+            _ = kwargs
+
+        async def run(self, *, resume: bool) -> object:
+            resume_args.append(bool(resume))
+            return type("_Rep", (), {"to_dict": lambda self: {"status": "ok"}})()
+
+    class _FakeRegistry:
+        def __init__(self, **_kw: object) -> None:
+            pass
+
+        def get_anchors(self, _op: str) -> tuple[AnchorCaseSpec, ...]:
+            return (AnchorCaseSpec("main", 1, "", 1.0, 1.0),)
+
+        def get_regime_specs(self, _op: str) -> tuple[RegimeTargetSpec, ...]:
+            return (
+                RegimeTargetSpec(
+                    regime_tag="main",
+                    builder_candidates=("_build_softmax_prim_func",),
+                    sample_builder_kwargs={},
+                    representative_hir_dims={"M": 16, "D": 64},
+                ),
+            )
+
+    monkeypatch.setattr(marathon, "_resolve_worktree", lambda _cfg: (worktree, worktree))
+    monkeypatch.setattr(marathon, "_ensure_sys_paths", lambda _w: None)
+    monkeypatch.setattr(marathon, "_configure_marathon_logging", lambda _p: None)
+    monkeypatch.setattr(marathon, "ensure_marathon_env_file", lambda **_kw: worktree / "env.sh")
+    monkeypatch.setattr(marathon, "configure_marathon_process_env", lambda **_kw: {})
+    monkeypatch.setattr(marathon, "create_llm_backend_from_env", lambda **_kw: MockLLMBackend())
+    monkeypatch.setattr(marathon, "build_resilient_l2_evaluator", lambda **_kw: (lambda c, a: {}))
+    monkeypatch.setattr(marathon, "build_prewarmed_l3_runner", lambda **_kw: (lambda _p: None))
+    monkeypatch.setattr(marathon, "resolve_default_experience_lake_dir", lambda **_kw: None)
+    monkeypatch.setattr(marathon, "CannbenchOpsRegistry", _FakeRegistry)
+    monkeypatch.setattr(marathon, "ExtremeCampaignRunner", _FakeRunner)
+
+    def _fake_prepare(**_kw: object) -> object:
+        seed_calls.append(True)
+        return type(
+            "_SeedOut",
+            (),
+            {
+                "regime_specs": (),
+                "blueprints_by_regime": None,
+                "semantics": type("_Sem", (), {"base_axes": None})(),
+                "mode": "cold_start",
+                "initial_track": "cce_trackb",
+                "attempts_used": 1,
+                "verification_state": "l3_verified",
+                "candidate_sha256": "abc",
+                "l3_run_id": "r1",
+                "l3_receipt_path": "rec",
+                "l0_l1_passed": True,
+                "oracle_accuracy_passed": True,
+            },
+        )()
+
+    monkeypatch.setattr(marathon, "prepare_marathon_seed", _fake_prepare)
+
+    rc_resume = run_operator_marathon(
+        MarathonConfig(
+            operator_name="level2/softmax",
+            state_dir=state_dir,
+            auto_bootstrap_seed=True,
+            salvage_beam_candidates=False,
+            pure_golden=True,
+            resume=None,
+        )
+    )
+    assert rc_resume == 0
+    assert seed_calls == []
+    assert resume_args == [True]
+
+    rc_fresh = run_operator_marathon(
+        MarathonConfig(
+            operator_name="level2/softmax",
+            state_dir=state_dir,
+            auto_bootstrap_seed=True,
+            salvage_beam_candidates=False,
+            pure_golden=True,
+            resume=False,
+        )
+    )
+    assert rc_fresh == 0
+    assert seed_calls == [True]
+    assert resume_args == [True, False]
     """Verify CCE C++20 surface reference teaches dav-3510 GM qualifiers, math, and callee rules."""
     rendered = CCE_CPP20_SURFACE.render_prompt_reference()
     assert "__gm__ T*" in rendered

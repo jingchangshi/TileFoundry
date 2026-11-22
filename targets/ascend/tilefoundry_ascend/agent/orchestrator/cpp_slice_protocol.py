@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,11 +22,13 @@ _SEARCH_REPLACE_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _UNIT_START_RE = re.compile(
-    r"^\s*(?:template\s*<|__(?:global|aicore|simd_vf|simt_vf|simd_callee)__\b|"
+    r"^\s*(?:template\s*<|__(?:global|aicore|simd_vf|simt_vf|simd_callee|simt_callee)__\b|"
     r"extern\s+\"C\"|struct\s+\w+|(?:static\s+)?constexpr\b|using\s+\w+|inline\s+)"
 )
 _FUNC_NAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 _CALL_NAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{}()]*>)?\s*\(")
+_TEMPLATE_CALL_ARGS_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\s*<([^;{}()]+)>\s*\(")
+_IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
 _C_CONTROL_KEYWORDS = frozenset({"if", "for", "while", "switch", "return", "sizeof", "alignof"})
 _SIBLING_MARKER_RE = re.compile(r"/\*\s*\[READ-ONLY SIBLING KERNEL:")
 _LAUNCH_CONFIG_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{}]*>)?\s*<<<")
@@ -386,9 +388,10 @@ def build_trackb_context_view(
     if sibling_summaries:
         prefix_parts.append("\n\n".join(sibling_summaries))
 
+    helpers_by_name = {h.name: h for h in helpers if h.name}
     helper_calls: set[str] = set()
     if target_unit is not None:
-        helper_calls = {m.group(1) for m in _CALL_NAME_RE.finditer(target_unit.text)}
+        helper_calls = _helper_call_closure(target_unit, helpers_by_name)
     ref_helpers = [h for h in helpers if h.name and h.name in helper_calls]
     other_helpers = [h for h in helpers if h not in ref_helpers]
 
@@ -508,15 +511,34 @@ def _reindent_replacement(replace_block: str, search_block: str, window_indent: 
     return "\n".join(lines)
 
 
-def _helper_call_closure(unit: _CppUnit, helpers_by_name: dict[str, _CppUnit]) -> set[str]:
+def _referenced_helpers_in_text(
+    text: str, helpers_by_name: Mapping[str, _CppUnit]
+) -> set[str]:
+    masked = strip_cpp_comments_and_strings(text)
+    refs: set[str] = set()
+    for match in _CALL_NAME_RE.finditer(masked):
+        name = match.group(1)
+        if name in helpers_by_name:
+            refs.add(name)
+    for match in _TEMPLATE_CALL_ARGS_RE.finditer(masked):
+        for ident in _IDENT_RE.finditer(match.group(1)):
+            name = ident.group(1)
+            if name in helpers_by_name:
+                refs.add(name)
+    for match in _LAUNCH_CONFIG_RE.finditer(masked):
+        name = match.group(1)
+        if name in helpers_by_name:
+            refs.add(name)
+    return refs
+
+
+def _helper_call_closure(unit: _CppUnit, helpers_by_name: Mapping[str, _CppUnit]) -> set[str]:
     reached: set[str] = set()
     pending: list[_CppUnit] = [unit]
     while pending:
         current = pending.pop()
-        masked = strip_cpp_comments_and_strings(current.text)
-        for match in _CALL_NAME_RE.finditer(masked):
-            name = match.group(1)
-            if name in helpers_by_name and name not in reached:
+        for name in _referenced_helpers_in_text(current.text, helpers_by_name):
+            if name not in reached:
                 reached.add(name)
                 pending.append(helpers_by_name[name])
     return reached
@@ -653,6 +675,7 @@ def splice_cpp_units_into_tu(
         replacement_names.add(unit.name)
 
     _, units = _split_cpp_units(cpp_source)
+    all_existing_names = {u.name for u in units if u.name}
     if active_kernel is not None:
         editable = _scoped_editable_units(
             cpp_source,
@@ -664,21 +687,51 @@ def splice_cpp_units_into_tu(
     editable_by_name = {u.name: u for u in editable}
 
     targets: list[tuple[int, int, str]] = []
+    replaced_units: list[_CppUnit] = []
+    new_helpers: list[_CppUnit] = []
     for unit in replacements:
         target = editable_by_name.get(unit.name)
-        if target is None:
+        if target is not None:
+            _reject_introduced_forbidden_tokens(target.text, unit.text)
+            targets.append((target.start_char, target.end_char, unit.text))
+            replaced_units.append(unit)
+            continue
+        if unit.kind == "helper" and unit.name not in all_existing_names:
+            new_helpers.append(unit)
+            continue
+        if active_kernel is not None:
+            raise ValueError(
+                f"Candidate C++ unit {unit.name!r} is outside the editable scope "
+                f"of active kernel {active_kernel!r}"
+            )
+        raise ValueError(f"Candidate C++ unit {unit.name!r} not found in C++ source")
+
+    if new_helpers:
+        new_helpers_by_name = {h.name: h for h in new_helpers}
+        reached_new: set[str] = set()
+        for seed_unit in replaced_units:
+            reached_new |= _helper_call_closure(seed_unit, new_helpers_by_name)
+        unreached = [h.name for h in new_helpers if h.name not in reached_new]
+        if not targets or unreached:
+            bad_name = unreached[0] if unreached else new_helpers[0].name
             if active_kernel is not None:
                 raise ValueError(
-                    f"Candidate C++ unit {unit.name!r} is outside the editable scope "
+                    f"Candidate C++ unit {bad_name!r} is outside the editable scope "
                     f"of active kernel {active_kernel!r}"
                 )
-            raise ValueError(f"Candidate C++ unit {unit.name!r} not found in C++ source")
-        targets.append((target.start_char, target.end_char, unit.text))
+            raise ValueError(f"Candidate C++ unit {bad_name!r} not found in C++ source")
+        for helper_unit in new_helpers:
+            _reject_introduced_forbidden_tokens("", helper_unit.text)
 
     updated = cpp_source
     for start_char, end_char, replacement_text in sorted(targets, reverse=True):
         updated = updated[:start_char] + replacement_text + updated[end_char:]
-    return updated, len(targets)
+    if new_helpers:
+        min_start = min(start for start, _, _ in targets)
+        helper_blob = "\n\n".join(h.text.strip() for h in new_helpers)
+        prefix = "" if (min_start == 0 or updated[min_start - 1] == "\n") else "\n"
+        updated = updated[:min_start] + prefix + helper_blob + "\n\n" + updated[min_start:]
+    return updated, len(targets) + len(new_helpers)
 
 
 def escalate_primfunc_to_trackb_tu(prim_func: Any) -> str:

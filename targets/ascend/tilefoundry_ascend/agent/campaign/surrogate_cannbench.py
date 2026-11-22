@@ -717,6 +717,7 @@ async def run_l0_l1_round_filter(
     max_syntax_repairs: int = 1,
     slice_hint: str = "",
     backend_kind: str = "tilelang_dsl",
+    parent_source: str = "",
     stage_a_cost_ranker: Callable[
         [Sequence[tuple[str, str, StageAResult]]], Sequence[tuple[str, float]]
     ]
@@ -733,6 +734,7 @@ async def run_l0_l1_round_filter(
             diag,
             slice_hint=slice_hint,
             backend_kind=backend_kind,
+            parent_source=parent_source,
         )
         try:
             raw_reply = await repair_backend.generate(req)
@@ -3770,19 +3772,51 @@ def run_l4_official_cannbench_via_agent_gates(
     except (OSError, ValueError) as exc:
         return _l4_failure(str(exc), device_id=result_device)
 
-    execution = _run_v2_gate(
-        agent_gates_bin=agent_gates_bin,
-        root=root,
-        workspace=resolved_workspace,
-        gate_id=AGENT_GATES_L4_CANNBENCH_GATE,
-        target=target_task,
-        candidate_path=relative,
-        timeout_sec=timeout_sec,
-        device_id=result_device,
-        resume_execution_id=resume_execution_id,
-        resume_run_id=resume_run_id,
-        on_execution_started=on_execution_started,
-    )
+    if resume_execution_id or resume_run_id:
+        execution = _run_v2_gate(
+            agent_gates_bin=agent_gates_bin,
+            root=root,
+            workspace=resolved_workspace,
+            gate_id=AGENT_GATES_L4_CANNBENCH_GATE,
+            target=target_task,
+            candidate_path=relative,
+            timeout_sec=timeout_sec,
+            device_id=result_device,
+            resume_execution_id=resume_execution_id,
+            resume_run_id=resume_run_id,
+            on_execution_started=on_execution_started,
+        )
+    else:
+        backoff = (10.0, 15.0, 20.0, 25.0, 30.0)
+        max_retries = 12
+        execution_opt: _V2GateExecution | None = None
+        for retry_idx in range(max_retries + 1):
+            execution_opt = _run_v2_gate(
+                agent_gates_bin=agent_gates_bin,
+                root=root,
+                workspace=resolved_workspace,
+                gate_id=AGENT_GATES_L4_CANNBENCH_GATE,
+                target=target_task,
+                candidate_path=relative,
+                timeout_sec=timeout_sec,
+                device_id=result_device,
+                resume_execution_id=resume_execution_id,
+                resume_run_id=resume_run_id,
+                on_execution_started=on_execution_started,
+            )
+            if not _is_fast_transient_build_lock(execution_opt) or retry_idx >= max_retries:
+                break
+            wait_sec = backoff[min(retry_idx, len(backoff) - 1)]
+            logger.info(
+                "L4_GATE_RETRY_BUILD_LOCK op=%s retry=%d/%d wait=%.1fs",
+                operator_name,
+                retry_idx + 1,
+                max_retries,
+                wait_sec,
+            )
+            time.sleep(wait_sec)
+        assert execution_opt is not None
+        execution = execution_opt
     _row, observation = _gate_observation(execution.report, AGENT_GATES_L4_CANNBENCH_GATE)
     blocked_env_category = _blocked_env_category(execution.report)
     if execution.transport_error:

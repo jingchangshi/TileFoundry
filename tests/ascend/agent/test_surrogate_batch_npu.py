@@ -263,7 +263,7 @@ def _extract_msprof_metrics(prof: object) -> dict[str, float | int]:
 
 _P1_AIC_METRICS = "PipeUtilization,Memory,MemoryL0,L2Cache,ResourceConflictRatio"
 _P2_AIC_METRICS = (
-    "PipeUtilization,Memory,MemoryL0,L2Cache,ResourceConflictRatio,Source,PCSampling,InstrTimeline"
+    "PipeUtilization,Memory,MemoryL0,L2Cache,ResourceConflictRatio,PipeTimeline"
 )
 
 
@@ -460,6 +460,7 @@ def _run_msprof_op_subprocess(
     repeat: int,
     app_argv: Sequence[str],
     msprof_op_command: Sequence[str] | None = None,
+    timeout_sec: int = 180,
 ) -> subprocess.CompletedProcess[str]:
     """Execute msprof op (or an explicit custom wrapper command) into output_dir."""
     if msprof_op_command is not None:
@@ -485,7 +486,7 @@ def _run_msprof_op_subprocess(
         cmd,
         text=True,
         capture_output=True,
-        timeout=180,
+        timeout=max(10, int(timeout_sec)),
         check=False,
     )
 
@@ -568,27 +569,53 @@ def _measure_msprof_op_metrics(
             app_argv = []
 
         requested_metrics = _P2_AIC_METRICS if is_p2_deep_dive else _P1_AIC_METRICS
-        proc = _run_msprof_op_subprocess(
-            msprof_bin=msprof_bin,
-            output_dir=output_dir,
-            aic_metrics=requested_metrics,
-            warmup=warmup,
-            repeat=repeat,
-            app_argv=app_argv,
-            msprof_op_command=msprof_op_command,
-        )
-        opprof_dirs = _locate_opprof_dirs(output_dir)
-        if is_p2_deep_dive and (proc.returncode != 0 or not opprof_dirs):
+        try:
             proc = _run_msprof_op_subprocess(
                 msprof_bin=msprof_bin,
                 output_dir=output_dir,
-                aic_metrics=_P1_AIC_METRICS,
+                aic_metrics=requested_metrics,
                 warmup=warmup,
                 repeat=repeat,
                 app_argv=app_argv,
                 msprof_op_command=msprof_op_command,
+                timeout_sec=120 if is_p2_deep_dive else 180,
             )
+        except subprocess.TimeoutExpired:
+            proc = subprocess.CompletedProcess(
+                args=[],
+                returncode=124,
+                stdout="",
+                stderr="msprof_op_timeout",
+            )
+        opprof_dirs = _locate_opprof_dirs(output_dir)
+        if is_p2_deep_dive and (proc.returncode != 0 or not opprof_dirs):
+            try:
+                proc = _run_msprof_op_subprocess(
+                    msprof_bin=msprof_bin,
+                    output_dir=output_dir,
+                    aic_metrics=_P1_AIC_METRICS,
+                    warmup=warmup,
+                    repeat=repeat,
+                    app_argv=app_argv,
+                    msprof_op_command=msprof_op_command,
+                    timeout_sec=180,
+                )
+            except subprocess.TimeoutExpired:
+                proc = subprocess.CompletedProcess(
+                    args=[],
+                    returncode=124,
+                    stdout="",
+                    stderr="msprof_op_timeout",
+                )
             opprof_dirs = _locate_opprof_dirs(output_dir)
+
+        merged_obj_paths: list[Path | str] = list(compiled_obj_paths)
+        if is_p2_deep_dive and opprof_dirs:
+            seen_objs = {str(Path(p)) for p in merged_obj_paths}
+            for discovered in _discover_compiled_objects(None, None, opprof_dirs[-1]):
+                if str(discovered) not in seen_objs:
+                    seen_objs.add(str(discovered))
+                    merged_obj_paths.append(discovered)
 
         telemetry: dict[str, object] = {}
         if opprof_dirs:
@@ -602,11 +629,11 @@ def _measure_msprof_op_metrics(
                 telemetry.update(
                     _parse_p2_from_report_dir(
                         opprof_dirs[-1],
-                        compiled_obj_paths=compiled_obj_paths,
+                        compiled_obj_paths=merged_obj_paths,
                     )
                 )
-        elif is_p2_deep_dive and compiled_obj_paths:
-            summary = extract_p2_from_objdump(compiled_obj_paths)
+        elif is_p2_deep_dive and merged_obj_paths:
+            summary = extract_p2_from_objdump(merged_obj_paths)
             if summary.total_instructions > 0:
                 telemetry.update(
                     _format_p2_summary_fields(summary, p2_source="llvm_objdump_dwarf")
