@@ -25,6 +25,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
 )
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, load_seed_rules
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+    _split_cpp_units,
     apply_scoped_trackb_patch,
     build_trackb_context_view,
     escalate_primfunc_to_trackb_tu,
@@ -832,3 +833,52 @@ def test_template_arg_callee_closure_view_patch_and_splice() -> None:
             "__simt_vf__ void vf_sibling_only(__gm__ float* y) {\n    y[0] = 0.0f;\n}\n",
             active_kernel="kernel_active",
         )
+
+
+def test_split_and_splice_recognize_static_inline_aicore_and_bare_helpers() -> None:
+    """Parse static inline, static __aicore__, and bare multi-line helpers in splicing."""
+    cpp = (
+        "#include <tl_templates/ascend/common.h>\n"
+        "static inline float helper_si(float v) {\n"
+        "    return v + 1.0f;\n"
+        "}\n"
+        "static __aicore__ void helper_sa(__gm__ float* p) {\n"
+        "    p[0] = helper_si(p[0]);\n"
+        "}\n"
+        "float\n"
+        "bare_multiline_helper(\n"
+        "    float a,\n"
+        "    float b\n"
+        ") {\n"
+        "    return a + b;\n"
+        "}\n"
+        'extern "C" __global__ __vector__ void kernel_active(__gm__ float* x) {\n'
+        "    helper_sa(x);\n"
+        "    x[1] = bare_multiline_helper(x[0], 1.0f);\n"
+        "}\n"
+        'extern "C" __global__ __vector__ void kernel_sibling(__gm__ float* y) {\n'
+        "    y[0] = 2.0f;\n"
+        "}\n"
+    )
+    _, units = _split_cpp_units(cpp)
+    helper_names = [u.name for u in units if u.kind == "helper"]
+    assert helper_names == ["helper_si", "helper_sa", "bare_multiline_helper"]
+
+    cand = (
+        "static inline float brand_new_si(float v) {\n"
+        "    return v * 3.0f;\n"
+        "}\n"
+        "static __aicore__ void brand_new_sa(__gm__ float* p) {\n"
+        "    p[2] = brand_new_si(p[1]);\n"
+        "}\n"
+        'extern "C" __global__ __vector__ void kernel_active(__gm__ float* x) {\n'
+        "    helper_sa(x);\n"
+        "    brand_new_sa(x);\n"
+        "    x[1] = bare_multiline_helper(x[0], 1.0f);\n"
+        "}\n"
+    )
+    spliced, count = splice_cpp_units_into_tu(cpp, cand, active_kernel="kernel_active")
+    assert count == 3
+    assert "brand_new_si" in spliced
+    assert "brand_new_sa" in spliced
+    assert "kernel_sibling" in spliced

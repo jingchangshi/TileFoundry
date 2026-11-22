@@ -550,7 +550,9 @@ def test_fp3_unmatched_rules_not_padded_and_transport_error_exempt() -> None:
     for rule in tracker.active_rules():
         assert rule.rule_id not in creative_text
 
-    sparse_ledger = _make_legal_ledger(ii=None, pipe_cycles={"AIV0.PIPE_S": 1})
+    sparse_ledger = _make_legal_ledger(
+        ii=None, pipe_cycles={"AIV0.PIPE_V": 120, "AIV1.PIPE_V": 120}
+    )
     sparse_parent = BeamCandidate(
         candidate_id="sparse_seed",
         round_idx=0,
@@ -1012,6 +1014,114 @@ def test_up2_pseudo_double_buffer_residual_and_wave_burst_prescreen() -> None:
     assert "wave_burst_score=" in summary
     rank_1_line = next(line for line in summary.splitlines() if line.strip().startswith("1."))
     assert "tile_m=32" in rank_1_line
+
+
+def test_portfolio_runner_threads_roofline_and_symptom_ranking() -> None:
+    """Thread roofline into WorkerSpec and refresh residual even with precomputed roofline_eta."""
+    from types import SimpleNamespace  # noqa: PLC0415
+
+    import pytest  # noqa: PLC0415
+
+    roofline_obj = SimpleNamespace(
+        min_gm_bytes=16384,
+        compute_floor_us=10.0,
+        ideal_roofline_us=10.0,
+    )
+    seed_stage_a = run_stage_a_static(_SEED_DSL, factory_name="make_kernel")
+    assert seed_stage_a.passed and seed_stage_a.ledger is not None
+    seed_ledger = build_objective_physical_ledger(
+        analysis_mode=seed_stage_a.ledger.analysis_mode,
+        is_legal=True,
+        steady_state_ii=seed_stage_a.ledger.steady_state_ii,
+        pipe_cycles=dict(seed_stage_a.ledger.pipe_cycles),
+        waterlines=dict(seed_stage_a.ledger.waterlines),
+        gm_roundtrip_bytes=16384,
+        gm_traffic_scope="full_grid",
+    )
+    parent = BeamCandidate(
+        candidate_id="roof_seed",
+        round_idx=0,
+        worker_kind="seed",
+        rule_id=None,
+        dsl_source=_SEED_DSL,
+        track="developer",
+        ledger=seed_ledger,
+        residual=compute_static_dynamic_residual(
+            seed_ledger, {"dur_us": 40.0}, roofline=roofline_obj
+        ),
+        latency_us=40.0,
+        accuracy_passed=True,
+        features=seed_stage_a.features,
+    )
+    class _SpyTracker(BayesianRuleTracker):
+        def rank_applicable_rules(
+            self,
+            context,
+            *,
+            top_k: int = 2,
+            topology_axes: object = None,
+            runtime_backend: str | None = None,
+            symptom_ranking=(),
+        ):
+            seen_rankings.append(tuple((str(f), float(s)) for f, s in symptom_ranking))
+            return super().rank_applicable_rules(
+                context,
+                top_k=top_k,
+                topology_axes=topology_axes,
+                runtime_backend=runtime_backend,
+                symptom_ranking=symptom_ranking,
+            )
+
+    tracker = _SpyTracker.from_seed_yaml()
+    seen_rankings: list[tuple[tuple[str, float], ...]] = []
+    creative_json = json.dumps(
+        {
+            "physical_hypothesis": "Keep roofline fresh",
+            "target_local_metric": "aic_mac",
+            "dsl_source": _SEED_DSL,
+        }
+    )
+    backend = MockLLMBackend(
+        responses={
+            "apply_rule": [_SEED_DSL, _SEED_DSL],
+            "explore_creative": [creative_json],
+        }
+    )
+    funnel = GateFunnel(
+        compile_runner=lambda _dsl: StageBResult(passed=True),
+        device_runner=lambda _dsl, st_a: StageCResult(
+            passed=True,
+            accuracy_passed=True,
+            measured_latency_us=20.0,
+            residual=compute_static_dynamic_residual(
+                st_a.ledger, {"dur_us": 20.0, "roofline_eta": 0.5}
+            ),
+            telemetry={"dur_us": 20.0, "roofline_eta": 0.5},
+        ),
+    )
+    runner = PortfolioRunner(
+        backend=backend,
+        funnel=funnel,
+        tracker=tracker,
+        k_rule_workers=2,
+    )
+    report = asyncio.run(
+        runner.run_round(
+            parent,
+            round_idx=1,
+            factory_name="make_kernel",
+            ideal_roofline_us=10.0,
+            roofline=roofline_obj,
+        )
+    )
+    assert seen_rankings and len(seen_rankings[0]) > 0
+    assert report.spawned_workers
+    assert all(spec.roofline is roofline_obj for spec in report.spawned_workers)
+    assert report.evaluated_candidates
+    cand_res = report.evaluated_candidates[0].residual
+    assert cand_res.effective_compute_eta == pytest.approx(0.5)
+    assert cand_res.observation is not None
+    assert cand_res.observation.transfer_inflation_ratio > 0.0
 
 
 

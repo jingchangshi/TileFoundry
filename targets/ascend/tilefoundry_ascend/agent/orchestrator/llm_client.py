@@ -7,15 +7,16 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shlex
 import shutil
 import signal
 import tempfile
 import time
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.client import HTTPException, HTTPResponse
 from pathlib import Path
 from string import Formatter
@@ -49,6 +50,44 @@ class StreamWatchdogConfig:
     max_sandbox_tool_calls: int = 2
     max_retries: int = 1
     retry_backoff_sec: float = 1.0
+    capacity_503_max_retries: int | None = None
+    capacity_503_backoff_sec: tuple[float, ...] = ()
+    capacity_503_jitter_sec: float = 0.0
+
+
+def _capacity_503_policy_from_env(
+    overrides: Mapping[str, str] | None = None,
+) -> tuple[int, tuple[float, ...], float]:
+    """Read 503 capacity retry count, backoff schedule, and jitter from environment."""
+    raw_retries = _config_value(overrides, f"{_LLM_ENV_PREFIX}MAX_503_RETRIES", default="4")
+    try:
+        max_503_retries = int(raw_retries)
+    except ValueError:
+        raise ValueError("TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES must be an integer") from None
+    if max_503_retries < 0:
+        raise ValueError("TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES must be non-negative")
+    raw_sched = _config_value(
+        overrides,
+        f"{_LLM_ENV_PREFIX}503_BACKOFF_SEC",
+        default="5.0,15.0,35.0,60.0",
+    )
+    backoff_vals: list[float] = []
+    for part in raw_sched.split(","):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        try:
+            val = float(cleaned)
+        except ValueError:
+            raise ValueError(
+                "TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC entries must be numeric"
+            ) from None
+        if not math.isfinite(val) or val < 0.0:
+            raise ValueError("TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC entries must be non-negative")
+        backoff_vals.append(val)
+    if not backoff_vals:
+        backoff_vals = [5.0, 15.0, 35.0, 60.0]
+    return max_503_retries, tuple(backoff_vals), 3.0
 
 
 _LLM_ENV_PREFIX = "TILEFOUNDRY_NPU_LLM_"
@@ -407,6 +446,7 @@ class _AttemptFailure(Exception):
         ttft_sec: float | None = None,
         timeout_stage: _TimeoutStage | None = None,
         since_last_activity_sec: float | None = None,
+        is_503: bool = False,
     ) -> None:
         super().__init__(str(exc))
         self.exc = exc
@@ -414,6 +454,7 @@ class _AttemptFailure(Exception):
         self.ttft_sec = ttft_sec
         self.timeout_stage = timeout_stage
         self.since_last_activity_sec = since_last_activity_sec
+        self.is_503 = is_503
 
 
 async def _terminate_process_group(proc: asyncio.subprocess.Process) -> None:
@@ -453,7 +494,10 @@ class AgyCliLLMBackend:
         repair_model: str | None = None,
         *,
         routing: RoleRoutingConfig | None = None,
+        fallback_model: str | None = None,
+        overrides: Mapping[str, str] | None = None,
     ) -> None:
+        self._overrides = dict(overrides) if overrides else None
         self._bin = _resolve_agy_binary(bin_path)
         model_overrides = {
             f"{_LLM_ENV_PREFIX}{role}_MODEL": model
@@ -466,6 +510,12 @@ class AgyCliLLMBackend:
             if model is not None
         }
         self._routing = routing or RoleRoutingConfig.from_env(model_overrides, backend="agy_cli")
+        raw_fallback = (
+            fallback_model
+            if fallback_model is not None
+            else _config_value(self._overrides, f"{_LLM_ENV_PREFIX}FALLBACK_MODEL")
+        ).strip()
+        self._fallback_model = self._agy_model_id(raw_fallback) if raw_fallback else ""
 
         raw_common = (
             common_args
@@ -480,13 +530,26 @@ class AgyCliLLMBackend:
 
         self._explicit_watchdog = watchdog is not None or hard_timeout_sec is not None
         if watchdog is not None:
-            self._watchdog = watchdog
+            if watchdog.capacity_503_max_retries is None and watchdog.max_retries > 0:
+                max_503, backoff_503, jitter_503 = _capacity_503_policy_from_env(self._overrides)
+                self._watchdog = replace(
+                    watchdog,
+                    capacity_503_max_retries=max_503,
+                    capacity_503_backoff_sec=backoff_503,
+                    capacity_503_jitter_sec=jitter_503,
+                )
+            else:
+                self._watchdog = watchdog
         elif hard_timeout_sec is not None:
             ceiling = float(hard_timeout_sec)
+            max_503, backoff_503, jitter_503 = _capacity_503_policy_from_env(self._overrides)
             self._watchdog = StreamWatchdogConfig(
                 startup_timeout_sec=min(60.0, ceiling),
                 idle_stall_timeout_sec=min(60.0, ceiling),
                 active_ceiling_timeout_sec=ceiling,
+                capacity_503_max_retries=max_503,
+                capacity_503_backoff_sec=backoff_503,
+                capacity_503_jitter_sec=jitter_503,
             )
         else:
             self._watchdog = self.watchdog_for_role("exploit_rule")
@@ -518,10 +581,14 @@ class AgyCliLLMBackend:
         if self._explicit_watchdog:
             return self._watchdog
         ceiling = self._routing.timeout_for_role(role)
+        max_503_retries, backoff_503, jitter_503 = _capacity_503_policy_from_env(self._overrides)
         return StreamWatchdogConfig(
             startup_timeout_sec=min(60.0, ceiling),
             idle_stall_timeout_sec=min(180.0 if role in _REASONING_ROLES else 120.0, ceiling),
             active_ceiling_timeout_sec=ceiling,
+            capacity_503_max_retries=max_503_retries,
+            capacity_503_backoff_sec=backoff_503,
+            capacity_503_jitter_sec=jitter_503,
         )
 
     def select_effort(
@@ -559,10 +626,15 @@ class AgyCliLLMBackend:
         *,
         log_file: str | Path | None = None,
         effort_override: str | None = None,
+        model_override: str | None = None,
     ) -> list[str]:
         """Build isolated agy stream-json CLI argument list without workspace mounts."""
         effort = self.select_effort(req, effort_override=effort_override)
-        model_id = self.select_model(req.role, effort=effort)
+        model_id = (
+            self._agy_model_id(model_override)
+            if model_override
+            else self.select_model(req.role, effort=effort)
+        )
         for tier_suffix in ("-low", "-medium", "-high"):
             if model_id.endswith(tier_suffix):
                 effort = tier_suffix[1:]
@@ -619,29 +691,34 @@ class AgyCliLLMBackend:
             err_detail = str(result_payload.get("error") or status or f"exit_{exit_code}")
             if stderr_text:
                 err_detail = f"{err_detail}: {stderr_text}"
+            delta_joined = "".join(text_deltas)
+            combined_out = f"{err_detail}\n{delta_joined}"
+            is_503_err = tailer.count_503 > 0 or bool(RE_503_CAPACITY.search(combined_out))
             is_retriable = (
-                tailer.count_503 > 0
+                is_503_err
                 or tailer.count_idle_timeout > 0
-                or bool(RE_503_CAPACITY.search(err_detail))
-                or bool(RE_STREAM_IDLE_LOG.search(err_detail))
+                or bool(RE_STREAM_IDLE_LOG.search(combined_out))
             )
             raise _AttemptFailure(
                 RuntimeError(f"Agy generation failed with exit status {exit_code}"),
                 retriable=is_retriable,
+                is_503=is_503_err,
             )
 
         if exit_code == 0 and text_deltas:
             return "".join(text_deltas).strip()
 
+        combined_out = f"{stderr_text}\n{''.join(text_deltas)}"
+        is_503_err = tailer.count_503 > 0 or bool(RE_503_CAPACITY.search(combined_out))
         is_retriable = (
-            tailer.count_503 > 0
+            is_503_err
             or tailer.count_idle_timeout > 0
-            or bool(RE_503_CAPACITY.search(stderr_text))
-            or bool(RE_STREAM_IDLE_LOG.search(stderr_text))
+            or bool(RE_STREAM_IDLE_LOG.search(combined_out))
         )
         raise _AttemptFailure(
             RuntimeError(f"Agy generation failed with exit status {exit_code}"),
             retriable=is_retriable,
+            is_503=is_503_err,
         )
 
     async def _run_single_attempt(
@@ -650,9 +727,14 @@ class AgyCliLLMBackend:
         full_prompt: str,
         *,
         effort_override: str | None = None,
+        model_override: str | None = None,
     ) -> str:
         effort = self.select_effort(req, effort_override=effort_override)
-        model_id = self.select_model(req.role, effort=effort)
+        model_id = (
+            self._agy_model_id(model_override)
+            if model_override
+            else self.select_model(req.role, effort=effort)
+        )
         cfg = self.watchdog_for_role(req.role)
         with (
             tempfile.TemporaryDirectory(prefix="tf_agy_worker_") as sandbox_dir,
@@ -664,6 +746,7 @@ class AgyCliLLMBackend:
                 full_prompt,
                 log_file=log_file,
                 effort_override=effort_override,
+                model_override=model_override,
             )
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -797,6 +880,7 @@ class AgyCliLLMBackend:
                         raise _AttemptFailure(
                             RuntimeError(f"agy_503_no_capacity_x{tailer.count_503}"),
                             retriable=True,
+                            is_503=True,
                         )
 
                     if proc.returncode is None and result_payload is None:
@@ -867,22 +951,69 @@ class AgyCliLLMBackend:
             f"### USER INPUT\n{req.user_prompt}\n"
         )
         cfg = self.watchdog_for_role(req.role)
-        max_retries = max(0, cfg.max_retries)
-        async with self._sem:
-            for attempt_idx in range(max_retries + 1):
-                try:
-                    return await self._run_single_attempt(
-                        req,
-                        full_prompt,
-                        effort_override=effort_override,
-                    )
-                except _AttemptFailure as failure:
-                    if failure.retriable and attempt_idx < max_retries:
-                        if cfg.retry_backoff_sec > 0.0:
-                            await asyncio.sleep(cfg.retry_backoff_sec)
-                        continue
+        return await _run_with_503_retry(
+            sem=self._sem,
+            cfg=cfg,
+            fallback_model=self._fallback_model,
+            attempt_fn=lambda model_override: self._run_single_attempt(
+                req,
+                full_prompt,
+                effort_override=effort_override,
+                model_override=model_override,
+            ),
+        )
+
+
+async def _run_with_503_retry(
+    *,
+    sem: asyncio.Semaphore,
+    cfg: StreamWatchdogConfig,
+    fallback_model: str,
+    attempt_fn: Callable[[str | None], Awaitable[str]],
+) -> str:
+    """Execute *attempt_fn* with 503 exponential backoff, early fallback, and standard retries."""
+    max_retries = max(0, cfg.max_retries)
+    max_503_retries = (
+        max_retries
+        if cfg.capacity_503_max_retries is None
+        else max(0, cfg.capacity_503_max_retries)
+    )
+    retries_503 = 0
+    retries_other = 0
+    next_model_override: str | None = None
+    async with sem:
+        while True:
+            try:
+                return await attempt_fn(next_model_override)
+            except _AttemptFailure as failure:
+                if not failure.retriable:
                     raise failure.exc from None
-        raise RuntimeError("unreachable retry termination")
+                if failure.is_503 and cfg.capacity_503_max_retries is not None:
+                    if retries_503 >= max_503_retries:
+                        raise failure.exc from None
+                    sched = cfg.capacity_503_backoff_sec
+                    base_wait = (
+                        sched[min(retries_503, len(sched) - 1)]
+                        if sched
+                        else cfg.retry_backoff_sec
+                    )
+                    jitter = (
+                        random.uniform(0.0, cfg.capacity_503_jitter_sec)
+                        if cfg.capacity_503_jitter_sec > 0.0
+                        else 0.0
+                    )
+                    retries_503 += 1
+                    if retries_503 >= min(2, max_503_retries) and fallback_model:
+                        next_model_override = fallback_model
+                    if base_wait + jitter > 0.0:
+                        await asyncio.sleep(base_wait + jitter)
+                    continue
+                if retries_other < max_retries:
+                    retries_other += 1
+                    if cfg.retry_backoff_sec > 0.0:
+                        await asyncio.sleep(cfg.retry_backoff_sec)
+                    continue
+                raise failure.exc from None
 
 
 _STATELESS_INSTRUCTION = (
@@ -1179,10 +1310,12 @@ def _redact_secrets(text: str) -> str:
     return re.sub(r"(https?://[^:/\s]+:)[^@\s]+@", r"\1[redacted]@", redacted)
 
 
-def _cli_watchdog_from_env() -> StreamWatchdogConfig:
+def _cli_watchdog_from_env(
+    overrides: Mapping[str, str] | None = None,
+) -> StreamWatchdogConfig:
     """Build CLI streaming watchdog settings from explicit environment overrides."""
-    startup_raw = _config_value(None, f"{_LLM_ENV_PREFIX}STARTUP_TIMEOUT_SEC", default="90")
-    idle_raw = _config_value(None, f"{_LLM_ENV_PREFIX}IDLE_STALL_TIMEOUT_SEC", default="120")
+    startup_raw = _config_value(overrides, f"{_LLM_ENV_PREFIX}STARTUP_TIMEOUT_SEC", default="90")
+    idle_raw = _config_value(overrides, f"{_LLM_ENV_PREFIX}IDLE_STALL_TIMEOUT_SEC", default="120")
     try:
         startup_sec = float(startup_raw)
         idle_sec = float(idle_raw)
@@ -1190,9 +1323,13 @@ def _cli_watchdog_from_env() -> StreamWatchdogConfig:
         raise ValueError("LLM CLI watchdog timeouts must be numeric") from None
     if not all(math.isfinite(value) and value > 0 for value in (startup_sec, idle_sec)):
         raise ValueError("LLM CLI watchdog timeouts must be finite and positive")
+    max_503_retries, backoff_503, jitter_503 = _capacity_503_policy_from_env(overrides)
     return StreamWatchdogConfig(
         startup_timeout_sec=startup_sec,
         idle_stall_timeout_sec=idle_sec,
+        capacity_503_max_retries=max_503_retries,
+        capacity_503_backoff_sec=backoff_503,
+        capacity_503_jitter_sec=jitter_503,
     )
 
 
@@ -1231,17 +1368,41 @@ class SubprocessCliTemplateBackend:
         template: str | None = None,
         max_concurrency: int = 2,
         watchdog: StreamWatchdogConfig | None = None,
+        fallback_model: str | None = None,
+        overrides: Mapping[str, str] | None = None,
     ) -> None:
         if kind not in ("claude_cli", "codex_cli", "custom_cli"):
             raise ValueError("Unknown LLM CLI profile")
         self._kind = kind
         self._routing = routing
-        self._watchdog = watchdog
+        self._overrides = dict(overrides) if overrides else None
+        raw_fallback = (
+            fallback_model
+            if fallback_model is not None
+            else _config_value(self._overrides, f"{_LLM_ENV_PREFIX}FALLBACK_MODEL")
+        ).strip()
+        self._fallback_model = raw_fallback
+        if (
+            watchdog is not None
+            and watchdog.capacity_503_max_retries is None
+            and watchdog.max_retries > 0
+        ):
+            max_503, backoff_503, jitter_503 = _capacity_503_policy_from_env(self._overrides)
+            self._watchdog: StreamWatchdogConfig | None = replace(
+                watchdog,
+                capacity_503_max_retries=max_503,
+                capacity_503_backoff_sec=backoff_503,
+                capacity_503_jitter_sec=jitter_503,
+            )
+        else:
+            self._watchdog = watchdog
         self._template: list[str] = []
         self._template_fields: set[str] = set()
-        configured_bin = bin_path or _config_value(None, f"{_LLM_ENV_PREFIX}CLI_BIN")
+        configured_bin = bin_path or _config_value(self._overrides, f"{_LLM_ENV_PREFIX}CLI_BIN")
         if kind == "custom_cli":
-            raw_template = template or _config_value(None, f"{_LLM_ENV_PREFIX}CLI_TEMPLATE")
+            raw_template = template or _config_value(
+                self._overrides, f"{_LLM_ENV_PREFIX}CLI_TEMPLATE"
+            )
             try:
                 self._template = shlex.split(raw_template)
                 fields = {"bin", "model", "prompt", "effort"}
@@ -1364,7 +1525,7 @@ class SubprocessCliTemplateBackend:
 
     def watchdog_for_role(self, role: str) -> StreamWatchdogConfig:
         """Return streaming watchdog settings bounded by the role timeout."""
-        base = self._watchdog or _cli_watchdog_from_env()
+        base = self._watchdog or _cli_watchdog_from_env(self._overrides)
         ceiling = self._routing.timeout_for_role(role)
         return StreamWatchdogConfig(
             startup_timeout_sec=min(base.startup_timeout_sec, ceiling),
@@ -1374,6 +1535,9 @@ class SubprocessCliTemplateBackend:
             max_sandbox_tool_calls=base.max_sandbox_tool_calls,
             max_retries=base.max_retries,
             retry_backoff_sec=base.retry_backoff_sec,
+            capacity_503_max_retries=base.capacity_503_max_retries,
+            capacity_503_backoff_sec=base.capacity_503_backoff_sec,
+            capacity_503_jitter_sec=base.capacity_503_jitter_sec,
         )
 
     async def _run_streaming(
@@ -1583,25 +1747,33 @@ class SubprocessCliTemplateBackend:
                         since_last_activity_sec=timed_out_at - last_activity_ts,
                     ) from None
                 stderr_tail = _redact_secrets("\n".join(stderr_lines))[-2000:]
+                raw_output = "".join(stdout_chunks)
+                combined_diag = f"{stderr_tail}\n{raw_output}"
                 if proc.returncode:
                     detail = f"LLM CLI generation failed with exit status {proc.returncode}"
                     if stderr_tail:
                         detail = f"{detail}: {stderr_tail}"
+                    is_503_err = bool(RE_503_CAPACITY.search(combined_diag))
+                    is_retriable = is_503_err or bool(RE_STREAM_IDLE_LOG.search(combined_diag))
                     raise _AttemptFailure(
                         RuntimeError(detail),
-                        retriable=False,
+                        retriable=is_retriable,
+                        is_503=is_503_err,
                         ttft_sec=ttft_sec,
                     )
                 if stream_error is not None:
                     detail = f"LLM CLI generation failed: {_redact_secrets(stream_error)[:500]}"
                     if stderr_tail:
                         detail = f"{detail}: {stderr_tail}"
+                    err_blob = f"{stream_error}\n{combined_diag}"
+                    is_503_err = bool(RE_503_CAPACITY.search(err_blob))
+                    is_retriable = is_503_err or bool(RE_STREAM_IDLE_LOG.search(err_blob))
                     raise _AttemptFailure(
                         RuntimeError(detail),
-                        retriable=False,
+                        retriable=is_retriable,
+                        is_503=is_503_err,
                         ttft_sec=ttft_sec,
                     )
-                raw_output = "".join(stdout_chunks)
                 if self._kind != "claude_cli":
                     return raw_output.strip(), ttft_sec
                 output = (result_text or "".join(assistant_text)).strip()
@@ -1635,70 +1807,72 @@ class SubprocessCliTemplateBackend:
             f"{_STATELESS_INSTRUCTION}\n\n### SYSTEM INSTRUCTIONS\n{_system_prompt(req)}\n\n"
             f"### USER INPUT\n{req.user_prompt}\n"
         )
-        argv, stdin = self._command(model, effort, prompt)
         cfg = self.watchdog_for_role(req.role)
-        max_retries = max(0, cfg.max_retries)
         proxy_env = _proxy_env(os.environ)
         proxy_configured = (
             "true"
             if any(k in proxy_env for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"))
             else "false"
         )
-        async with self._sem:
-            for attempt_idx in range(max_retries + 1):
-                start_ts = time.monotonic()
-                try:
-                    output, ttft_sec = await self._run_streaming(
-                        argv,
-                        stdin,
-                        cfg,
-                        role=req.role,
-                        model=model,
+
+        async def _attempt(model_override: str | None) -> str:
+            active_model = model_override or model
+            argv, stdin = self._command(active_model, effort, prompt)
+            start_ts = time.monotonic()
+            try:
+                output, ttft_sec = await self._run_streaming(
+                    argv,
+                    stdin,
+                    cfg,
+                    role=req.role,
+                    model=active_model,
+                )
+                text = output.strip()
+                if self._kind == "codex_cli":
+                    text = self._codex_text(text)
+                if not text:
+                    raise _AttemptFailure(
+                        RuntimeError("LLM CLI returned no text completion"),
+                        retriable=False,
+                        ttft_sec=ttft_sec,
                     )
-                    text = output.strip()
-                    if self._kind == "codex_cli":
-                        text = self._codex_text(text)
-                    if not text:
-                        raise _AttemptFailure(
-                            RuntimeError("LLM CLI returned no text completion"),
-                            retriable=False,
-                            ttft_sec=ttft_sec,
-                        )
-                except _AttemptFailure as failure:
-                    elapsed = time.monotonic() - start_ts
-                    status = "timeout" if isinstance(failure.exc, TimeoutError) else "error"
-                    ttft = failure.ttft_sec if failure.ttft_sec is not None else -1.0
-                    _log_cli_telemetry(
-                        backend=self._kind,
-                        role=req.role,
-                        model=model,
-                        ttft_sec=ttft,
-                        elapsed_sec=elapsed,
-                        status=status,
-                        proxy_configured=proxy_configured,
-                        timeout_stage=failure.timeout_stage,
-                        since_last_activity_sec=failure.since_last_activity_sec,
-                    )
-                    if failure.retriable and attempt_idx < max_retries:
-                        if cfg.retry_backoff_sec > 0.0:
-                            await asyncio.sleep(cfg.retry_backoff_sec)
-                        continue
-                    raise failure.exc from None
+            except _AttemptFailure as failure:
                 elapsed = time.monotonic() - start_ts
-                ttft = ttft_sec if ttft_sec is not None else elapsed
+                status = "timeout" if isinstance(failure.exc, TimeoutError) else "error"
+                ttft = failure.ttft_sec if failure.ttft_sec is not None else -1.0
                 _log_cli_telemetry(
                     backend=self._kind,
                     role=req.role,
-                    model=model,
+                    model=active_model,
                     ttft_sec=ttft,
                     elapsed_sec=elapsed,
-                    status="ok",
+                    status=status,
                     proxy_configured=proxy_configured,
-                    timeout_stage=None,
-                    since_last_activity_sec=None,
+                    timeout_stage=failure.timeout_stage,
+                    since_last_activity_sec=failure.since_last_activity_sec,
                 )
-                return text
-        raise RuntimeError("unreachable retry termination")
+                raise
+            elapsed = time.monotonic() - start_ts
+            ttft = ttft_sec if ttft_sec is not None else elapsed
+            _log_cli_telemetry(
+                backend=self._kind,
+                role=req.role,
+                model=active_model,
+                ttft_sec=ttft,
+                elapsed_sec=elapsed,
+                status="ok",
+                proxy_configured=proxy_configured,
+                timeout_stage=None,
+                since_last_activity_sec=None,
+            )
+            return text
+
+        return await _run_with_503_retry(
+            sem=self._sem,
+            cfg=cfg,
+            fallback_model=self._fallback_model,
+            attempt_fn=_attempt,
+        )
 
 
 @dataclass
@@ -1754,6 +1928,8 @@ def create_llm_backend_from_env(overrides: Mapping[str, str] | None = None) -> K
             routing=routing,
             common_args=_config_value(overrides, f"{_AGY_ENV_PREFIX}COMMON_ARGS") or None,
             max_concurrency=int(pick("MAX_CONCURRENCY", "3", legacy="MAX_CONCURRENCY")),
+            fallback_model=pick("FALLBACK_MODEL") or None,
+            overrides=overrides,
         )
     if kind == "mock":
         return MockLLMBackend(routing=routing)
@@ -1773,6 +1949,8 @@ def create_llm_backend_from_env(overrides: Mapping[str, str] | None = None) -> K
             bin_path=pick("CLI_BIN") or None,
             template=pick("CLI_TEMPLATE") or None,
             max_concurrency=int(pick("MAX_CONCURRENCY", "2")),
+            fallback_model=pick("FALLBACK_MODEL") or None,
+            overrides=overrides,
         )
     raise ValueError("Unsupported TILEFOUNDRY_NPU_LLM_BACKEND value")
 

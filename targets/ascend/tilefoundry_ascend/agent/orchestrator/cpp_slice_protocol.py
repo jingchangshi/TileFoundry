@@ -6,7 +6,6 @@ import ast
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
 
 from tilefoundry_ascend.ascend.target.dialect_surface import CCE_CPP20_SURFACE
 
@@ -23,7 +22,9 @@ _SEARCH_REPLACE_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 _UNIT_START_RE = re.compile(
     r"^\s*(?:template\s*<|__(?:global|aicore|simd_vf|simt_vf|simd_callee|simt_callee)__\b|"
-    r"extern\s+\"C\"|struct\s+\w+|(?:static\s+)?constexpr\b|using\s+\w+|inline\s+)"
+    r"extern\s+\"C\"|struct\s+\w+|(?:static\s+)?constexpr\b|using\s+\w+|"
+    r"(?:static\s+)?(?:inline\s+|"
+    r"__(?:global|aicore|simd_vf|simt_vf|simd_callee|simt_callee)__\b))"
 )
 _FUNC_NAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 _CALL_NAME_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{}()]*>)?\s*\(")
@@ -104,6 +105,23 @@ def _extract_unit_name(header_text: str, *, is_struct: bool = False) -> str:
     return ""
 
 
+def _looks_like_cpp_def_start(masked_lines: Sequence[str], idx: int) -> bool:
+    """Return True when a top-level statement opens a brace before terminating with ';'."""
+    if not masked_lines[idx].strip():
+        return False
+    for k in range(idx, len(masked_lines)):
+        mln = masked_lines[k]
+        if mln.lstrip().startswith("#"):
+            return False
+        brace_pos = mln.find("{")
+        semi_pos = mln.find(";")
+        if brace_pos >= 0 and (semi_pos < 0 or brace_pos < semi_pos):
+            return True
+        if semi_pos >= 0:
+            return False
+    return False
+
+
 def _split_cpp_units(cpp_source: str) -> tuple[list[str], list[_CppUnit]]:
     lines = cpp_source.splitlines(keepends=True)
     masked_lines = strip_cpp_comments_and_strings(cpp_source).splitlines(keepends=True)
@@ -127,7 +145,11 @@ def _split_cpp_units(cpp_source: str) -> tuple[list[str], list[_CppUnit]]:
             header_directives.append(raw_ln.rstrip("\r\n"))
             i += 1
             continue
-        if _UNIT_START_RE.match(stripped) or "{" in masked_lines[i]:
+        if (
+            _UNIT_START_RE.match(stripped)
+            or "{" in masked_lines[i]
+            or _looks_like_cpp_def_start(masked_lines, i)
+        ):
             start_i = i
             start_char = line_offsets[start_i]
             depth = 0
@@ -149,7 +171,11 @@ def _split_cpp_units(cpp_source: str) -> tuple[list[str], list[_CppUnit]]:
             block_text = cpp_source[start_char:end_char]
             sig_head = block_text.split("{", 1)[0].strip()
             is_struct = bool(
-                re.match(r"^(?:struct|enum|using|typedef|(?:static\s+)?constexpr)\b", sig_head)
+                re.match(r"^(?:struct|enum|using|typedef)\b", sig_head)
+                or (
+                    re.match(r"^(?:static\s+)?constexpr\b", sig_head)
+                    and ("(" not in sig_head or "=" in sig_head.split("(", 1)[0])
+                )
             )
             if is_struct or (not seen_brace and block_text.rstrip().endswith(";")):
                 kind = "global_decl"
@@ -734,7 +760,7 @@ def splice_cpp_units_into_tu(
     return updated, len(targets) + len(new_helpers)
 
 
-def escalate_primfunc_to_trackb_tu(prim_func: Any) -> str:
+def escalate_primfunc_to_trackb_tu(prim_func: object) -> str:
     """Lower an incumbent TileLang @T.prim_func into an operator-specific C++20 TU."""
     import tilelang  # noqa: PLC0415
 

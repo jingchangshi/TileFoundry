@@ -8,12 +8,19 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
-from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, build_predicate_context
+from tilefoundry_ascend.agent.kb.schema import (
+    AscendCausalRule,
+    build_predicate_context,
+    rank_symptom_families,
+)
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import FunnelEvaluation, GateFunnel
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     CREATIVE_RESPONSE_SCHEMA,
+    AgyCliLLMBackend,
     GenerationRequest,
     KernelLLMBackend,
+    OpenAICompatHTTPBackend,
+    SubprocessCliTemplateBackend,
     extract_creative_payload,
     extract_python_dsl,
 )
@@ -46,6 +53,7 @@ from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
     build_cost_features_from_ledger,
 )
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirBlueprintPacket
+from tilefoundry_ascend.ascend.passes.observation_space import RooflineSummaryLike
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
 from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios, TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
@@ -211,6 +219,12 @@ _RULE_CONCEPT_DESCRIPTIONS: dict[str, str] = {
     ),
     "R33_PERSISTENT_STATE_RESIDENCY": (
         "Persistent on-chip UB/L1 FP32 state residency across chunks/iterations with initC=false accumulation"
+    ),
+    "R34_SCALAR_LOOP_TO_VECTOR_DMA_PIPELINE": (
+        "Refactor raw scalar global-memory loops into UB/L1 DMA staging plus SIMD vector or Cube pipelines"
+    ),
+    "R35_PURE_VECTOR_DUAL_SUBCORE_SPLIT": (
+        "Pure-vector dual-subcore split via T.MixedKernel(blocks, sids=2) across paired AIVs"
     ),
 }
 
@@ -400,6 +414,7 @@ class WorkerSpec:
     request: GenerationRequest
     parent_candidate: BeamCandidate
     ideal_roofline_us: float = 0.0
+    roofline: RooflineSummaryLike | Mapping[str, object] | None = None
 
 
 @dataclass
@@ -875,8 +890,14 @@ class PortfolioRunner:
         case_ratios: CasePhysicsRatios | None = None,
         cost_model: HybridAscendCostModel | None = None,
         escalation_tier: str = "tilelang_dsl",
+        roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
     ) -> tuple[WorkerSpec, ...]:
         """Select matching causal rules and fill remaining slots with creative explorers."""
+        eff_roofline_obj = (
+            roofline
+            if roofline is not None
+            else (blueprint.roofline if blueprint is not None else None)
+        )
         parent_features = _project_features_with_ratios(parent.features, case_ratios)
         active_axes = _derive_active_topology_axes(
             parent.ledger,
@@ -890,12 +911,15 @@ class PortfolioRunner:
             features=parent_features,
             residual=parent.residual,
             extra={"topology_axes": active_axes},
+            roofline=eff_roofline_obj,
         )
+        symptom_ranking = rank_symptom_families(ctx)
         matched_rules = list(
             self._tracker.rank_applicable_rules(
                 ctx,
                 top_k=self._k_rules,
                 topology_axes=active_axes,
+                symptom_ranking=symptom_ranking,
             )
         )
         eff_roofline = (
@@ -923,6 +947,7 @@ class PortfolioRunner:
                     ),
                     parent_candidate=parent,
                     ideal_roofline_us=eff_roofline,
+                    roofline=eff_roofline_obj,
                 )
             )
 
@@ -974,6 +999,7 @@ class PortfolioRunner:
                     ),
                     parent_candidate=parent,
                     ideal_roofline_us=eff_roofline,
+                    roofline=eff_roofline_obj,
                 )
             )
         return tuple(specs)
@@ -1034,6 +1060,7 @@ class PortfolioRunner:
             config_selector_name=config_selector_name,
             dims=dims,
             var_bindings=var_bindings,
+            roofline=spec.roofline,
         )
         if not evaluation.passed and evaluation.failed_stage in ("stage_a", "stage_b"):
             for _ in range(self._max_repairs):
@@ -1066,6 +1093,7 @@ class PortfolioRunner:
                     config_selector_name=config_selector_name,
                     dims=dims,
                     var_bindings=var_bindings,
+                    roofline=spec.roofline,
                 )
                 if evaluation.passed:
                     break
@@ -1114,6 +1142,7 @@ class PortfolioRunner:
             tel = dict(stage_c.telemetry)
             is_analytical_proxy = bool(tel.get("is_analytical_proxy", False))
             dur_us = float(tel.get("dur_us", latency_us))
+            needs_refresh = spec.roofline is not None
             if (
                 spec.ideal_roofline_us > 0.0
                 and dur_us > 0.0
@@ -1123,8 +1152,13 @@ class PortfolioRunner:
                 tel["roofline_eta"] = eta
                 if isinstance(stage_c.telemetry, dict):
                     stage_c.telemetry["roofline_eta"] = eta
+                needs_refresh = True
+            if needs_refresh:
                 residual = compute_static_dynamic_residual(
-                    ledger, tel, compiler_summary=comp_summary
+                    ledger,
+                    tel,
+                    compiler_summary=comp_summary,
+                    roofline=spec.roofline,
                 )
             else:
                 residual = (
@@ -1144,6 +1178,7 @@ class PortfolioRunner:
                 residual=residual,
                 compiler_summary=comp_summary,
                 prev_ledger=spec.parent_candidate.ledger,
+                roofline=spec.roofline,
             )
             prev_ns = post_ctx.get("prev")
             if isinstance(prev_ns, dict):
@@ -1205,6 +1240,7 @@ class PortfolioRunner:
         topology_axes: object | None = None,
         case_ratios: CasePhysicsRatios | None = None,
         escalation_tier: str = "tilelang_dsl",
+        roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
     ) -> PortfolioRoundReport:
         """Execute one parallel portfolio round across Rule and Creative workers."""
         active_axes = _derive_active_topology_axes(
@@ -1231,9 +1267,24 @@ class PortfolioRunner:
             topology_axes=active_axes,
             case_ratios=case_ratios,
             escalation_tier=escalation_tier,
+            roofline=roofline,
         )
-        tasks = [
-            self._run_single_worker(
+        stagger_sec = (
+            1.5
+            if isinstance(
+                self._backend,
+                (AgyCliLLMBackend, OpenAICompatHTTPBackend, SubprocessCliTemplateBackend),
+            )
+            else 0.0
+        )
+
+        async def _staggered_worker(
+            slot_idx: int,
+            spec: WorkerSpec,
+        ) -> tuple[BeamCandidate | None, bool, tuple[str, str, str] | None, bool]:
+            if stagger_sec > 0.0 and slot_idx > 0:
+                await asyncio.sleep(float(slot_idx) * stagger_sec)
+            return await self._run_single_worker(
                 spec,
                 round_idx=round_idx,
                 factory_name=factory_name,
@@ -1247,9 +1298,10 @@ class PortfolioRunner:
                 case_ratios=case_ratios,
                 escalation_tier=escalation_tier,
             )
-            for spec in specs
-        ]
-        outcomes = await asyncio.gather(*tasks)
+
+        outcomes = await asyncio.gather(
+            *(_staggered_worker(idx, spec) for idx, spec in enumerate(specs))
+        )
 
         report = PortfolioRoundReport(round_idx=round_idx, spawned_workers=specs)
         saw_proxy = False

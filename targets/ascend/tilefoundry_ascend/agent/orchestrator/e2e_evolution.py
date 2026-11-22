@@ -36,6 +36,7 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
 from tilefoundry_ascend.agent.orchestrator.twin_bridge import verify_numerical_twin
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
     HirBlueprintPacket,
+    HirRooflineSummary,
     compile_hir_blueprint,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
@@ -519,6 +520,7 @@ def _wrap_funnel_with_proxy(
     anchor_dims: Mapping[str, int] | None = None,
     enable_track_router: bool = False,
     ideal_roofline_us: float = 0.0,
+    roofline: HirRooflineSummary | None = None,
 ) -> GateFunnel:
     def _proxy_device(dsl_src: str, stage_a: StageAResult) -> StageCResult:
         assert stage_a.ledger is not None
@@ -547,7 +549,11 @@ def _wrap_funnel_with_proxy(
             passed=acc_ok,
             accuracy_passed=acc_ok,
             measured_latency_us=lat,
-            residual=compute_static_dynamic_residual(stage_a.ledger, telemetry),
+            residual=compute_static_dynamic_residual(
+                stage_a.ledger,
+                telemetry,
+                roofline=roofline,
+            ),
             telemetry=telemetry,
             error_message=err_msg,
         )
@@ -610,7 +616,10 @@ async def run_e2e_evolution(
         representative_case=representative_case,
         authored_hir_source=authored_hir_source,
     )
-    ideal_roofline_us = blueprint.roofline.ideal_roofline_us if blueprint is not None else 0.0
+    blueprint_roofline = blueprint.roofline if blueprint is not None else None
+    ideal_roofline_us = (
+        blueprint_roofline.ideal_roofline_us if blueprint_roofline is not None else 0.0
+    )
     active_funnel = _wrap_funnel_with_proxy(
         funnel,
         target,
@@ -618,6 +627,7 @@ async def run_e2e_evolution(
         anchor_dims=anchor_dims,
         enable_track_router=enable_track_router,
         ideal_roofline_us=ideal_roofline_us,
+        roofline=blueprint_roofline,
     )
 
     if initial_dsl_source is not None:
@@ -626,6 +636,7 @@ async def run_e2e_evolution(
             baseline_dsl,
             factory_name=factory_name,
             factory_kwargs=factory_kwargs,
+            roofline=blueprint_roofline,
         )
     else:
         baseline_dsl, base_eval = await synthesize_initial_dsl(
@@ -666,7 +677,20 @@ async def run_e2e_evolution(
         base_dur = float(base_tel.get("dur_us", base_eval.stage_c.measured_latency_us))
         if ideal_roofline_us > 0.0 and base_dur > 0.0 and "roofline_eta" not in base_tel:
             base_tel["roofline_eta"] = min(1.0, ideal_roofline_us / max(1e-6, base_dur))
-            base_residual = compute_static_dynamic_residual(base_ledger, base_tel)
+            base_residual = compute_static_dynamic_residual(
+                base_ledger,
+                base_tel,
+                roofline=blueprint_roofline,
+            )
+        elif (
+            blueprint_roofline is not None
+            and base_eval.stage_c.residual.transfer_inflation_ratio == 0.0
+        ):
+            base_residual = compute_static_dynamic_residual(
+                base_ledger,
+                base_tel,
+                roofline=blueprint_roofline,
+            )
         else:
             base_residual = base_eval.stage_c.residual
     else:
@@ -681,7 +705,11 @@ async def run_e2e_evolution(
         }
         if ideal_roofline_us > 0.0 and proxy_lat > 0.0:
             proxy_tel["roofline_eta"] = min(1.0, ideal_roofline_us / max(1e-6, proxy_lat))
-        base_residual = compute_static_dynamic_residual(base_ledger, proxy_tel)
+        base_residual = compute_static_dynamic_residual(
+            base_ledger,
+            proxy_tel,
+            roofline=blueprint_roofline,
+        )
     base_lat = (
         base_eval.stage_c.measured_latency_us
         if base_eval.stage_c and base_eval.stage_c.measured_latency_us > 0.0

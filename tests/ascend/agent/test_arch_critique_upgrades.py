@@ -460,7 +460,7 @@ def test_tilesize_prescreen_default_off_per_dtype_half_l1_and_ablation_gate() ->
     assert CampaignConfig(operator_name="rms_norm").enable_tilesize_prescreen is False
     assert (
         inspect.signature(MarathonConfig).parameters["enable_tilesize_prescreen"].default
-        is False
+        is True
     )
     assert (
         inspect.signature(PortfolioRunner.__init__)

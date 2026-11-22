@@ -28,7 +28,9 @@ from tilefoundry_ascend.agent.orchestrator import (
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     _AgyLogTailer,
+    _capacity_503_policy_from_env,
     _normalize_agy_common_args,
+    create_llm_backend_from_env,
     extract_creative_payload,
 )
 
@@ -1171,5 +1173,114 @@ def test_cli_watchdog_defaults_preserve_startup_idle_and_single_retry(
     assert exploit.max_retries == 1
     assert backend.watchdog_for_role("syntax_repair").active_ceiling_timeout_sec == 240.0
     assert backend.watchdog_for_role("explore_creative").active_ceiling_timeout_sec == 420.0
+
+
+def test_503_overrides_early_fallback_stdout_detection_and_cli_shared_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Forward overrides, trigger early fallback at min(2, max), and unify CLI 503 retries."""
+    monkeypatch.setenv("TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES", "1")
+    monkeypatch.setenv("TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC", "9.0")
+    policy = _capacity_503_policy_from_env(
+        {
+            "TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES": "4",
+            "TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC": "0.01,0.02",
+        }
+    )
+    assert policy == (4, (0.01, 0.02), 3.0)
+
+    monkeypatch.setattr(
+        "tilefoundry_ascend.agent.orchestrator.llm_client.random.uniform", lambda _a, _b: 0.0
+    )
+    state_file = tmp_path / "agy_models.json"
+    fake_agy = tmp_path / "fake_agy_stdout_503"
+    fake_agy.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, sys",
+                "from pathlib import Path",
+                "args = sys.argv[1:]",
+                "model = args[args.index('--model') + 1]",
+                f"sp = Path({str(state_file)!r})",
+                "seen = json.loads(sp.read_text()) if sp.is_file() else []",
+                "seen.append(model)",
+                "sp.write_text(json.dumps(seen))",
+                "if len(seen) <= 2:",
+                "    ev = {'event': 'step_update', 'step_update': {",
+                "        'step_type': 'agent_response',",
+                "        'text_delta': 'UNAVAILABLE (code 503): No capacity available'}}",
+                "    sys.stdout.write(json.dumps(ev) + '\\n')",
+                "    sys.exit(1)",
+                "res = {'event': 'result', 'result': {",
+                "    'status': 'SUCCESS', 'response': 'ok_after_early_fallback'}}",
+                "sys.stdout.write(json.dumps(res) + '\\n')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_agy.chmod(0o755)
+    backend = create_llm_backend_from_env(
+        overrides={
+            "TILEFOUNDRY_NPU_LLM_BACKEND": "agy_cli",
+            "TILEFOUNDRY_NPU_AGY_BIN": str(fake_agy),
+            "TILEFOUNDRY_NPU_LLM_EXPLOIT_MODEL": "gemini-4-hydrogen-high",
+            "TILEFOUNDRY_NPU_LLM_FALLBACK_MODEL": "gemini-4-hydrogen-medium",
+            "TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES": "4",
+            "TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC": "0.0,0.0",
+        }
+    )
+    assert backend.watchdog_for_role("exploit_rule").capacity_503_max_retries == 4
+    reply = asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
+    assert reply == "ok_after_early_fallback"
+    assert json.loads(state_file.read_text(encoding="utf-8")) == [
+        "gemini-4-hydrogen-high",
+        "gemini-4-hydrogen-high",
+        "gemini-4-hydrogen-medium",
+    ]
+
+    cli_state = tmp_path / "cli_models.json"
+    fake_cli = tmp_path / "fake_claude_503"
+    fake_cli.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, sys",
+                "from pathlib import Path",
+                "args = sys.argv[1:]",
+                "model = next(a.split('=', 1)[1] for a in args if a.startswith('--model='))",
+                f"sp = Path({str(cli_state)!r})",
+                "seen = json.loads(sp.read_text()) if sp.is_file() else []",
+                "seen.append(model)",
+                "sp.write_text(json.dumps(seen))",
+                "if len(seen) <= 2:",
+                "    sys.stderr.write('UNAVAILABLE (code 503): No capacity available\\n')",
+                "    sys.exit(1)",
+                "ok_ev = {'type': 'result', 'result': 'cli_ok_fallback'}",
+                "sys.stdout.write(json.dumps(ok_ev) + '\\n')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fake_cli.chmod(0o755)
+    cli_backend = create_llm_backend_from_env(
+        overrides={
+            "TILEFOUNDRY_NPU_LLM_BACKEND": "claude_cli",
+            "TILEFOUNDRY_NPU_LLM_CLI_BIN": str(fake_cli),
+            "TILEFOUNDRY_NPU_LLM_EXPLOIT_MODEL": "primary-cli",
+            "TILEFOUNDRY_NPU_LLM_FALLBACK_MODEL": "fallback-cli",
+            "TILEFOUNDRY_NPU_LLM_MAX_503_RETRIES": "4",
+            "TILEFOUNDRY_NPU_LLM_503_BACKOFF_SEC": "0.0,0.0",
+        }
+    )
+    assert cli_backend.watchdog_for_role("exploit_rule").capacity_503_max_retries == 4
+    cli_reply = asyncio.run(cli_backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
+    assert cli_reply == "cli_ok_fallback"
+    assert json.loads(cli_state.read_text(encoding="utf-8")) == [
+        "primary-cli",
+        "primary-cli",
+        "fallback-cli",
+    ]
 
 

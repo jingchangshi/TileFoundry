@@ -31,6 +31,7 @@ from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
     MicroarchProfile,
     extract_microarch_profile_from_cce,
 )
+from tilefoundry_ascend.ascend.passes.observation_space import RooflineSummaryLike
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
     ScopeWaterline,
@@ -42,7 +43,7 @@ from tilefoundry_ascend.ascend.schedule.envelope_inspector import (
     inspect_tilelang_primfunc,
 )
 from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios
-from tilefoundry_ascend.ascend.target import AscendTarget
+from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS, AscendTarget
 from tilefoundry_ascend.ascend.target.dialect_surface import CCE_CPP20_SURFACE
 
 
@@ -151,6 +152,24 @@ def _normalize_flag_list(raw_flags: object) -> list[str]:
     return [text] if text else []
 
 
+def resolve_trackb_compile_flags(
+    cpp_source: str,
+    selector_flags: Sequence[str] | str | None = None,
+) -> tuple[str, ...]:
+    """Resolve Track-B bisheng flags, stripping SIMD-VF UBUF flags on __simt_vf__."""
+    masked = strip_cpp_comments_and_strings(cpp_source)
+    has_simt_vf = bool(re.search(r"\b__simt_vf__\b", masked))
+    normalized = _normalize_flag_list(selector_flags)
+    if has_simt_vf:
+        simdvf_flags = frozenset(PURE_SIMDVF_UBUF_FLAGS)
+        return tuple(flag for flag in normalized if flag not in simdvf_flags)
+    flags = list(PURE_SIMDVF_UBUF_FLAGS)
+    for flag in normalized:
+        if flag not in flags:
+            flags.append(flag)
+    return tuple(flags)
+
+
 _FORBIDDEN_NPU_HOST_CALLS: frozenset[str] = frozenset(
     {
         "matmul",
@@ -222,11 +241,23 @@ def _detect_module_entrypoint(tree: ast.Module) -> str:
     return ""
 
 
+def _has_module_kernel_cache(tree: ast.Module) -> bool:
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and node.value is not None:
+            if any(isinstance(t, ast.Name) and t.id == "_KERNEL_CACHE" for t in node.targets):
+                return True
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            if isinstance(node.target, ast.Name) and node.target.id == "_KERNEL_CACHE":
+                return True
+    return False
+
+
 def check_npu_entrypoint_purity(
     module_source: str,
     entrypoint: str,
     *,
     track: str | None = None,
+    require_kernel_cache: bool = False,
 ) -> list[str]:
     """Reject detached decoy @T.prim_func scaffolds and NPU-side PyTorch/golden fallbacks."""
     try:
@@ -245,6 +276,8 @@ def check_npu_entrypoint_purity(
     backend, _tb_syms = infer_module_runtime_backend(module_source, entrypoint)
     reachable_src: list[str] = []
     visited: set[str] = set()
+    cache_loaded = False
+    cache_stored = False
     queue = [entrypoint]
     while queue:
         fn_name = queue.pop(0)
@@ -255,7 +288,24 @@ def check_npu_entrypoint_purity(
         reachable_src.append(ast.get_source_segment(module_source, fnode) or "")
         for node in _collect_npu_reachable_nodes(module_source, fnode.body):
             for sub in ast.walk(node):
+                if isinstance(sub, ast.Name) and sub.id == "_KERNEL_CACHE":
+                    if isinstance(sub.ctx, ast.Load):
+                        cache_loaded = True
+                elif (
+                    isinstance(sub, ast.Subscript)
+                    and isinstance(sub.ctx, ast.Store)
+                    and isinstance(sub.value, ast.Name)
+                    and sub.value.id == "_KERNEL_CACHE"
+                ):
+                    cache_stored = True
                 if isinstance(sub, ast.Call):
+                    if (
+                        isinstance(sub.func, ast.Attribute)
+                        and isinstance(sub.func.value, ast.Name)
+                        and sub.func.value.id == "_KERNEL_CACHE"
+                        and sub.func.attr in ("setdefault", "update")
+                    ):
+                        cache_stored = True
                     callee = (
                         sub.func.id
                         if isinstance(sub.func, ast.Name)
@@ -308,6 +358,63 @@ def check_npu_entrypoint_purity(
         errors.append(
             f"detached_decoy_primfunc:{entrypoint} never invokes tilelang.compile"
         )
+    if require_kernel_cache:
+        cache_fns = {
+            fname
+            for fname, fnode in funcs.items()
+            if fname in visited
+            or fname in ("_get_kernel", "_get_track_b_lib")
+            or any(
+                tok in (ast.get_source_segment(module_source, fnode) or "")
+                for tok in ("tilelang.compile", "compile_ascend", "ctypes.CDLL")
+            )
+        }
+        cache_nodes = [
+            sub
+            for fname in cache_fns
+            if fname in funcs
+            for sub in ast.walk(funcs[fname])
+        ]
+        any_cache_loaded = cache_loaded or any(
+            isinstance(sub, ast.Name)
+            and sub.id == "_KERNEL_CACHE"
+            and isinstance(sub.ctx, ast.Load)
+            for sub in cache_nodes
+        )
+        any_cache_stored = cache_stored or any(
+            (
+                isinstance(sub, ast.Subscript)
+                and isinstance(sub.ctx, ast.Store)
+                and isinstance(sub.value, ast.Name)
+                and sub.value.id == "_KERNEL_CACHE"
+            )
+            or (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Attribute)
+                and isinstance(sub.func.value, ast.Name)
+                and sub.func.value.id == "_KERNEL_CACHE"
+                and sub.func.attr in ("setdefault", "update")
+            )
+            for sub in cache_nodes
+        )
+        compile_path_text = "\n".join(
+            ast.get_source_segment(module_source, funcs[fname]) or ""
+            for fname in cache_fns
+            if fname in funcs
+        )
+        has_compile_call = any(
+            tok in compile_path_text
+            for tok in ("tilelang.compile", "compile_ascend", "ctypes.CDLL")
+        )
+        if not _has_module_kernel_cache(tree):
+            errors.append(
+                "missing_kernel_cache: module must define module-level _KERNEL_CACHE dict"
+            )
+        elif not any_cache_loaded or (has_compile_call and not any_cache_stored):
+            errors.append(
+                "unpopulated_kernel_cache: reachable compilation path must look up "
+                "and populate _KERNEL_CACHE"
+            )
     return errors
 
 
@@ -509,6 +616,363 @@ def _simdvf_function_bodies(cpp_source: str) -> list[str]:
     return bodies
 
 
+_ALIGNED_COPY_ARITIES: dict[str, tuple[tuple[int, ...], str]] = {
+    "asc_copy_gm2ub_align": (
+        (3, 8, 10),
+        "invalid_asc_copy_align_arity: expected 3/8/10 args for gm2ub_align",
+    ),
+    "asc_copy_ub2gm_align": (
+        (3, 7, 8),
+        "invalid_asc_copy_align_arity: expected 3/7/8 args for ub2gm_align",
+    ),
+}
+
+
+def _extract_balanced_paren_arg_list(text: str, open_paren_idx: int) -> str | None:
+    """Return the top-level text inside the balanced parentheses starting at *open_paren_idx*."""
+    depth = 0
+    for idx in range(open_paren_idx, len(text)):
+        ch = text[idx]
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+            if depth == 0:
+                return text[open_paren_idx + 1 : idx]
+    return None
+
+
+def _split_top_level_call_args(inner: str) -> list[str]:
+    """Split a function call argument string by top-level commas without mistaking '<'."""
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    for idx, ch in enumerate(inner):
+        if ch in "([":
+            depth += 1
+        elif ch in ")]" and depth > 0:
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(inner[start:idx].strip())
+            start = idx + 1
+    parts.append(inner[start:].strip())
+    return [part for part in parts if part]
+
+
+def _collect_global_kernel_names(masked_source: str) -> set[str]:
+    """Collect function identifiers declared or defined with the ``__global__`` qualifier."""
+    globals_set: set[str] = set()
+    for match in re.finditer(r"\b__global__\b", masked_source):
+        tail = masked_source[match.end() : match.end() + 512]
+        stmt_end = len(tail)
+        for sep in ("{", ";"):
+            pos = tail.find(sep)
+            if pos >= 0:
+                stmt_end = min(stmt_end, pos)
+        header = tail[:stmt_end]
+        paren_depth = 0
+        for idx, ch in enumerate(header):
+            if ch == "(":
+                if paren_depth == 0:
+                    prefix = header[:idx].rstrip()
+                    ident = re.search(r"([A-Za-z_]\w*)\s*$", prefix)
+                    if ident is not None:
+                        name = ident.group(1)
+                        if name not in ("__mix__", "__launch_bounds__", "decltype"):
+                            globals_set.add(name)
+                            break
+                paren_depth += 1
+            elif ch == ")" and paren_depth > 0:
+                paren_depth -= 1
+    return globals_set
+
+
+def _strip_cpp_cast_and_parens(expr: str) -> str:
+    text = expr.strip()
+    while text:
+        if text.startswith("("):
+            close_idx = -1
+            depth = 0
+            for idx, ch in enumerate(text):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        close_idx = idx
+                        break
+            if close_idx > 0:
+                inner = text[1:close_idx].strip()
+                rest = text[close_idx + 1 :].strip()
+                if not rest:
+                    text = inner
+                    continue
+                if "*" in inner or "__gm__" in inner or re.fullmatch(
+                    r"(?:const\s+|volatile\s+)*(?:[A-Za-z_]\w*::)*[A-Za-z_]\w*",
+                    inner,
+                ):
+                    text = rest
+                    continue
+        cast_m = re.match(r"^(?:static|reinterpret|const)_cast\s*<[^>]+>\s*\(", text)
+        if cast_m is not None:
+            inner_cast = _extract_balanced_paren_arg_list(text, cast_m.end() - 1)
+            if inner_cast is not None:
+                after = text[cast_m.end() + len(inner_cast) + 1 :].strip()
+                if not after:
+                    text = inner_cast.strip()
+                    continue
+                if after[0] in ("+", "-"):
+                    text = f"{inner_cast} {after}".strip()
+                    continue
+        break
+    return text
+
+
+def _extract_base_ptr_name(expr: str) -> str | None:
+    text = _strip_cpp_cast_and_parens(expr)
+    if not text:
+        return None
+    depth = 0
+    for idx, ch in enumerate(text):
+        if ch in "([<":
+            depth += 1
+        elif ch in ")]>" and depth > 0:
+            depth -= 1
+        elif depth == 0 and ch in ("+", "-"):
+            text = _strip_cpp_cast_and_parens(text[:idx])
+            break
+    ident_m = re.match(r"^([A-Za-z_]\w*)\b", text)
+    return ident_m.group(1) if ident_m is not None else None
+
+
+def _extract_func_name_from_header(header: str) -> str:
+    cleaned = re.sub(r"\b(?:const|noexcept|override|final)\s*$", "", header.strip()).rstrip()
+    if not cleaned.endswith(")"):
+        return ""
+    depth = 0
+    open_idx = -1
+    for idx in range(len(cleaned) - 1, -1, -1):
+        ch = cleaned[idx]
+        if ch == ")":
+            depth += 1
+        elif ch == "(":
+            depth -= 1
+            if depth == 0:
+                open_idx = idx
+                break
+    if open_idx <= 0:
+        return ""
+    prefix = cleaned[:open_idx].rstrip()
+    ident = re.search(r"([A-Za-z_]\w*)\s*$", prefix)
+    if ident is None:
+        return ""
+    name = ident.group(1)
+    if name in ("if", "for", "while", "switch", "decltype", "__launch_bounds__", "__mix__"):
+        return ""
+    return name
+
+
+def _extract_masked_functions(masked_source: str) -> list[tuple[str, str, str]]:
+    """Return ``(fn_name, sig_head, body)`` tuples for top-level functions in *masked_source*."""
+    funcs: list[tuple[str, str, str]] = []
+    depth = 0
+    stmt_start = 0
+    i = 0
+    n = len(masked_source)
+    while i < n:
+        ch = masked_source[i]
+        if ch == ";" and depth == 0:
+            stmt_start = i + 1
+        elif ch == "{":
+            if depth == 0:
+                sig_head = masked_source[stmt_start:i].strip()
+                fn_name = _extract_func_name_from_header(sig_head)
+                brace_depth = 1
+                j = i + 1
+                while j < n and brace_depth > 0:
+                    if masked_source[j] == "{":
+                        brace_depth += 1
+                    elif masked_source[j] == "}":
+                        brace_depth -= 1
+                    j += 1
+                if fn_name:
+                    funcs.append((fn_name, sig_head, masked_source[i + 1 : max(i + 1, j - 1)]))
+                stmt_start = j
+                i = j
+                continue
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+            if depth == 0:
+                stmt_start = i + 1
+        i += 1
+    return funcs
+
+
+def _split_func_param_names(sig_head: str) -> list[str]:
+    cleaned = re.sub(r"\b(?:const|noexcept|override|final)\s*$", "", sig_head.strip()).rstrip()
+    if not cleaned.endswith(")"):
+        return []
+    depth = 0
+    open_idx = -1
+    for idx in range(len(cleaned) - 1, -1, -1):
+        if cleaned[idx] == ")":
+            depth += 1
+        elif cleaned[idx] == "(":
+            depth -= 1
+            if depth == 0:
+                open_idx = idx
+                break
+    if open_idx < 0:
+        return []
+    params: list[str] = []
+    for raw_p in _split_top_level_call_args(cleaned[open_idx + 1 : -1]):
+        part = raw_p.split("=", 1)[0].strip()
+        m = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?$", part)
+        params.append(m.group(1) if m is not None else "")
+    return params
+
+
+_GM_PTR_DECL_RE = re.compile(
+    r"\b__gm__\s+(?:const\s+|volatile\s+)*[A-Za-z_]\w*"
+    r"(?:\s*\*+\s*(?:__restrict__\s+|restrict\s+|const\s+|volatile\s+)*|\s+)([A-Za-z_]\w*)"
+)
+_GM_ALIAS_RE = re.compile(
+    r"\b__gm__\s+(?:const\s+|volatile\s+)*[A-Za-z_]\w*\s*\*+\s*"
+    r"(?:__restrict__\s+|restrict\s+)?([A-Za-z_]\w*)\s*=\s*([^;]+);"
+)
+_AUTO_ALIAS_RE = re.compile(r"\bauto\s*\*?\s*([A-Za-z_]\w*)\s*=\s*([^;]+);")
+
+
+def _analyze_function_gm_stores(
+    sig_head: str,
+    body: str,
+) -> tuple[dict[str, set[str]], set[str], set[str]]:
+    scope_text = f"{sig_head}\n{body}"
+    gm_ptrs = set(_GM_PTR_DECL_RE.findall(scope_text))
+    alias_roots: dict[str, set[str]] = {ptr: {ptr} for ptr in gm_ptrs}
+    for _ in range(3):
+        changed = False
+        for alias_re in (_GM_ALIAS_RE, _AUTO_ALIAS_RE):
+            for match in alias_re.finditer(body):
+                alias_name, rhs_expr = match.group(1), match.group(2)
+                base_name = _extract_base_ptr_name(rhs_expr)
+                if base_name is not None and base_name in alias_roots:
+                    existing = alias_roots.setdefault(alias_name, {alias_name})
+                    before_len = len(existing)
+                    existing.update(alias_roots[base_name])
+                    existing.add(alias_name)
+                    if len(existing) != before_len:
+                        changed = True
+        if not changed:
+            break
+
+    mte3_roots: set[str] = set()
+    for match in re.finditer(r"\basc_copy_ub2gm\w*\s*\(", body):
+        inner = _extract_balanced_paren_arg_list(body, match.end() - 1)
+        if inner is None:
+            continue
+        args = _split_top_level_call_args(inner)
+        if not args:
+            continue
+        base_name = _extract_base_ptr_name(args[0])
+        if base_name is not None and base_name in alias_roots:
+            mte3_roots.update(alias_roots[base_name])
+
+    scalar_roots: set[str] = set()
+    for candidate_var, roots in alias_roots.items():
+        escaped = re.escape(candidate_var)
+        idx_store = rf"\b{escaped}\s*(?:\[[^\]]+\]\s*)+=(?!=)"
+        deref_store = rf"\*\s*\(\s*{escaped}\b[^)]*\)\s*=(?!=)"
+        ptr_store = rf"(?<![A-Za-z0-9_])\*\s*{escaped}\s*=(?!=)"
+        if (
+            re.search(idx_store, body)
+            or re.search(deref_store, body)
+            or re.search(ptr_store, body)
+        ):
+            scalar_roots.update(roots)
+    return alias_roots, mte3_roots, scalar_roots
+
+
+def _has_mixed_scalar_and_mte3_gm_store(masked_source: str) -> bool:
+    """Detect un-flushed PIPE_S scalar assignments mixed with PIPE_MTE3 stores on one GM ptr."""
+    parsed_funcs = _extract_masked_functions(masked_source)
+    if not parsed_funcs:
+        if re.search(r"\bdcci\b", masked_source):
+            return False
+        _, mte3_roots, scalar_roots = _analyze_function_gm_stores("", masked_source)
+        return bool(mte3_roots & scalar_roots)
+
+    by_name: dict[str, tuple[str, str]] = {name: (sig, body) for name, sig, body in parsed_funcs}
+    param_names: dict[str, list[str]] = {
+        name: _split_func_param_names(sig) for name, sig, _ in parsed_funcs
+    }
+    analysis: dict[str, tuple[dict[str, set[str]], set[str], set[str]]] = {
+        name: _analyze_function_gm_stores(sig, body) for name, sig, body in parsed_funcs
+    }
+    direct_dcci = {name for name, _, body in parsed_funcs if re.search(r"\bdcci\b", body)}
+
+    callees: dict[str, set[str]] = {name: set() for name in by_name}
+    for name, _, body in parsed_funcs:
+        for match in re.finditer(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}()]*>)?\s*\(", body):
+            callee = match.group(1)
+            if callee in by_name and callee != name:
+                callees[name].add(callee)
+
+    for _ in range(len(parsed_funcs)):
+        changed = False
+        for name, _, body in parsed_funcs:
+            alias_roots, mte3_roots, scalar_roots = analysis[name]
+            for match in re.finditer(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}()]*>)?\s*\(", body):
+                callee = match.group(1)
+                if callee not in by_name or callee == name:
+                    continue
+                if callee in direct_dcci:
+                    continue
+                inner = _extract_balanced_paren_arg_list(body, match.end() - 1)
+                if inner is None:
+                    continue
+                call_args = _split_top_level_call_args(inner)
+                c_params = param_names[callee]
+                _, c_mte3, c_scalar = analysis[callee]
+                for idx, arg_expr in enumerate(call_args):
+                    if idx >= len(c_params):
+                        break
+                    p_name = c_params[idx]
+                    base_arg = _extract_base_ptr_name(arg_expr)
+                    if not p_name or base_arg is None or base_arg not in alias_roots:
+                        continue
+                    if p_name in c_mte3 and not (alias_roots[base_arg] <= mte3_roots):
+                        mte3_roots.update(alias_roots[base_arg])
+                        changed = True
+                    if p_name in c_scalar and not (alias_roots[base_arg] <= scalar_roots):
+                        scalar_roots.update(alias_roots[base_arg])
+                        changed = True
+        if not changed:
+            break
+
+    for name, _, _ in parsed_funcs:
+        visited: set[str] = set()
+        stack = [name]
+        has_dcci = False
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            if cur in direct_dcci:
+                has_dcci = True
+                break
+            stack.extend(callees.get(cur, ()))
+        if has_dcci:
+            continue
+        _, mte3_roots, scalar_roots = analysis[name]
+        if mte3_roots & scalar_roots:
+            return True
+    return False
+
+
 def _check_custom_kernel_redlines(dsl_source: str) -> list[str]:
     errors: list[str] = []
     lower = dsl_source.lower()
@@ -520,6 +984,36 @@ def _check_custom_kernel_redlines(dsl_source: str) -> list[str]:
         errors.append(
             "simdvf_nonzero_stack_array: local array inside __simd_vf__ violates vf stack "
             "size (0); allocate in __ubuf__ workspace instead"
+        )
+
+    masked = strip_cpp_comments_and_strings(dsl_source)
+    for fn_name, (valid_arities, err_msg) in _ALIGNED_COPY_ARITIES.items():
+        for match in re.finditer(rf"\b{re.escape(fn_name)}\s*\(", masked):
+            inner = _extract_balanced_paren_arg_list(masked, match.end() - 1)
+            if inner is None:
+                continue
+            args = _split_top_level_call_args(inner)
+            if args and len(args) not in valid_arities:
+                if err_msg not in errors:
+                    errors.append(err_msg)
+                break
+
+    global_kernels = _collect_global_kernel_names(masked)
+    chevron_re = re.compile(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}]*?>)?\s*<<<")
+    for match in chevron_re.finditer(masked):
+        target_fn = match.group(1)
+        if target_fn not in global_kernels:
+            errors.append(
+                "non_global_chevron_launch: <<<...>>> is only valid on __global__ kernels; "
+                "use asc_vf_call<fn>(...) inside __aicore__ kernels"
+            )
+            break
+
+    if _has_mixed_scalar_and_mte3_gm_store(masked):
+        errors.append(
+            "mixed_scalar_and_mte3_gm_store: mixing un-flushed PIPE_S scalar stores "
+            "(64B DCache) with PIPE_MTE3 asc_copy_ub2gm* on the same __gm__ output corrupts "
+            "unaligned cachelines with stale NaN bits"
         )
     return errors
 
@@ -676,12 +1170,52 @@ _UB_STRIDED_ACCESS_RE = re.compile(
 )
 
 
+def _resolve_launcher_var_cap(
+    cpp_source: str, var_name: str, consts: Mapping[str, int]
+) -> int | None:
+    """Resolve constant core bounds when launch block_dim is a local host integer variable."""
+    ident = re.escape(var_name)
+    for match in re.finditer(
+        rf"\b(?:(?:const|constexpr)\s+)?(?:int|int32_t|int64_t|uint32_t|uint64_t|size_t|auto)"
+        rf"(?:\s+const)?\s+{ident}\s*=\s*([^;]+);",
+        cpp_source,
+    ):
+        expr = match.group(1).strip()
+        val = _safe_eval_cpp_int(expr, consts)
+        if val is not None and val > 0:
+            return val
+        min_match = re.search(r"std::min\s*(?:<[^>]+>)?\s*\(", expr)
+        if min_match is not None:
+            inner = _extract_balanced_paren_arg_list(expr, min_match.end() - 1)
+            if inner is not None:
+                min_vals = [
+                    capped
+                    for arg in _split_top_level_call_args(inner)
+                    if (capped := _safe_eval_cpp_int(arg, consts)) is not None and capped > 0
+                ]
+                if min_vals:
+                    return min(min_vals)
+        ternary_tail = _rewrite_cpp_ternary(expr)
+        if " else " in ternary_tail:
+            tail_expr = ternary_tail.rsplit(" else ", 1)[-1].strip("() ")
+            val_tail = _safe_eval_cpp_int(tail_expr, consts)
+            if val_tail is not None and val_tail > 0:
+                return val_tail
+    return None
+
+
 def _parse_cce_launch_block_dim(cpp_source: str, consts: Mapping[str, int]) -> int | None:
     """Resolve the first positive ``<<<block_dim, ...>>>`` launch dimension in C++ source."""
-    for match in _LAUNCH_BLOCK_DIM_RE.finditer(strip_cpp_comments_and_strings(cpp_source)):
-        block_dim = _safe_eval_cpp_int(match.group(1), consts)
+    stripped = strip_cpp_comments_and_strings(cpp_source)
+    for match in _LAUNCH_BLOCK_DIM_RE.finditer(stripped):
+        raw_expr = match.group(1).strip()
+        block_dim = _safe_eval_cpp_int(raw_expr, consts)
         if block_dim is not None and block_dim > 0:
             return block_dim
+        if re.fullmatch(r"[A-Za-z_]\w*", raw_expr):
+            capped = _resolve_launcher_var_cap(stripped, raw_expr, consts)
+            if capped is not None and capped > 0:
+                return capped
     return None
 
 
@@ -890,14 +1424,23 @@ def _template_bindings(
 
 
 def _resolve_cpp_consts(cpp_source: str) -> dict[str, int]:
-    """Fold constexpr integers with template arguments, aliases, and sizeof dtype widths."""
+    """Fold constexpr and #define integers with template args, aliases, and sizeof widths."""
+    stripped = strip_cpp_comments_and_strings(cpp_source)
+    define_source = re.sub(r"\\\r?\n", " ", stripped)
     declarations = [
         (m.group(1), m.group(2))
         for m in re.finditer(
-            r"\bconstexpr\s+(?:int|int32_t|uint32_t|size_t)\s+([A-Za-z_]\w*)\s*=\s*([^;]+);",
-            cpp_source,
+            r"\bconstexpr\s+(?:int|int32_t|int64_t|uint32_t|uint64_t|size_t)\s+"
+            r"([A-Za-z_]\w*)\s*=\s*([^;]+);",
+            stripped,
         )
     ]
+    for m in re.finditer(
+        r"^\s*#\s*define\s+([A-Za-z_]\w*)(?!\()\s+([^\r\n]+)",
+        define_source,
+        re.MULTILINE,
+    ):
+        declarations.append((m.group(1), m.group(2).strip()))
     consts: dict[str, int] = {}
     type_bytes: dict[str, int] = {}
     for _ in range(4):
@@ -1099,8 +1642,8 @@ def _build_ascendc_static_ledger(
         grid_blocks = block_dim
         wave_occupancy = block_dim / max(1, physical_cores)
     elif case_ratios is not None:
-        grid_blocks = 1
         wave_occupancy = float(case_ratios.wave_occupancy_ratio)
+        grid_blocks = max(1, int(round(wave_occupancy * physical_cores)))
     else:
         grid_blocks = 1
         wave_occupancy = 0.0
@@ -1218,7 +1761,7 @@ def _build_ascendc_static_ledger(
     mte2_src_cnt = len(re.findall(r"\basc_copy_gm2(?:ub|l1)\w*\s*\(", cpp_source))
     mte3_src_cnt = len(re.findall(r"\basc_copy_ub2gm\w*\s*\(", cpp_source))
     fix_src_cnt = len(re.findall(r"\basc_copy_l0c2\w*\s*\(", cpp_source))
-    mmad_src_cnt = len(re.findall(r"\basc_mmad\s*\(", cpp_source))
+    mmad_src_cnt = len(re.findall(r"\basc_mmad(?:_mx)?\s*\(", cpp_source))
     vf_src_cnt = len(re.findall(r"\b(?:simd_inst|Reg)::\w+\s*(?:<[^>]*>)?\s*\(", cpp_source))
 
     mte2_cnt = max(mte2_src_cnt, dis_counts["mte2"])
@@ -1231,18 +1774,18 @@ def _build_ascendc_static_ledger(
     sw_loop_mult = 2 if (compiler_summary and not compiler_summary.vloopv2_hit) else 1
 
     pipe_cycles: dict[str, int] = {}
-    if mte2_cnt > 0 or not uses_cube:
-        pipe_cycles["AIV0.PIPE_MTE2"] = max(1, mte2_cnt) * max(16, (tile_m * tile_n * 2) // 64)
+    if mte2_cnt > 0:
+        pipe_cycles["AIV0.PIPE_MTE2"] = mte2_cnt * max(16, (tile_m * tile_n * 2) // 64)
     if mte3_cnt > 0:
         pipe_cycles["AIV0.PIPE_MTE3"] = mte3_cnt * max(16, (tile_m * tile_n * 2) // 64)
-    if vf_cnt > 0 or not uses_cube:
+    if vf_cnt > 0:
         pipe_cycles["AIV0.PIPE_V"] = (
-            max(1, vf_cnt) * max(8, (tile_m * tile_n) // 64) * sw_loop_mult + spill_penalty
+            vf_cnt * max(8, (tile_m * tile_n) // 64) * sw_loop_mult + spill_penalty
         )
-    if mmad_cnt > 0 or uses_cube:
-        pipe_cycles["AIC.PIPE_M"] = max(1, mmad_cnt) * max(16, (tile_m * tile_n * tile_k) // 4096)
-    if fix_cnt > 0 or uses_cube:
-        pipe_cycles["AIC.PIPE_FIX"] = max(1, fix_cnt) * max(12, (tile_m * tile_n * 2) // 256)
+    if mmad_cnt > 0:
+        pipe_cycles["AIC.PIPE_M"] = mmad_cnt * max(16, (tile_m * tile_n * tile_k) // 4096)
+    if fix_cnt > 0:
+        pipe_cycles["AIC.PIPE_FIX"] = fix_cnt * max(12, (tile_m * tile_n * 2) // 256)
     if dis_counts["mte1"] > 0:
         pipe_cycles["AIC.PIPE_MTE1"] = dis_counts["mte1"] * max(8, (tile_m * tile_k) // 128)
 
@@ -1279,6 +1822,8 @@ def evaluate_ascendc_candidate(
     enable_track_router: bool = False,
     case_ratios: CasePhysicsRatios | None = None,
     baseline_cpp_source: str | None = None,
+    require_hardware_dma: bool = False,
+    require_cube_engine: bool = False,
 ) -> StageAResult:
     """Validate a Track-B AscendC C++ candidate via 7-facet checks and static ledger."""
     t0 = time.monotonic()
@@ -1323,6 +1868,24 @@ def evaluate_ascendc_candidate(
             if count > 0
         )
     errors = [*redline_errs, *facet_report.errors]
+    masked_src = strip_cpp_comments_and_strings(cpp_source)
+    if require_cube_engine:
+        mmad_hits = len(re.findall(r"\b(?:asc_mmad(?:_mx)?|ascend_gemm_l1)\s*\(", masked_src))
+        if mmad_hits == 0 and int(ledger.pipe_cycles.get("AIC.PIPE_M", 0)) == 0:
+            errors.append(
+                "missing_cube_engine_primitives: matmul/attention kernel contains zero "
+                "Cube MMAD instructions (scalar fallback trap)"
+            )
+    if require_hardware_dma:
+        mte2_hits = len(re.findall(r"\basc_copy_gm2(?:ub|l1)\w*\s*\(", masked_src))
+        has_mte2_pipe = any(
+            k.endswith(".PIPE_MTE2") and int(v) > 0 for k, v in ledger.pipe_cycles.items()
+        )
+        if mte2_hits == 0 and not has_mte2_pipe:
+            errors.append(
+                "missing_hardware_dma_staging: Track-B kernel performs raw scalar __gm__ "
+                "loops with zero GM->UB/L1 DMA transfers"
+            )
     if forbidden_tokens:
         errors.append(f"cce_forbidden_tokens: {', '.join(forbidden_tokens)}")
     if ledger.max_overflow_bytes > 0:
@@ -1543,6 +2106,27 @@ def _parallel_forbidden_math_calls(tree: ast.AST) -> list[str]:
     return sorted(found)
 
 
+def _kernel_threads_kwarg_calls(tree: ast.AST) -> list[int]:
+    """Return line numbers of T.Kernel/Kernel calls passing forbidden threads= kwargs."""
+    lines: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        is_kernel = (
+            isinstance(node.func, ast.Attribute) and node.func.attr == "Kernel"
+        ) or (isinstance(node.func, ast.Name) and node.func.id == "Kernel")
+        if is_kernel and any(kw.arg == "threads" for kw in node.keywords):
+            lines.append(node.lineno)
+    return sorted(set(lines))
+
+
+def _ast_has_dsl_call(tree: ast.AST, *attrs: str) -> bool:
+    for node in ast.walk(tree):
+        if any(_is_t_dsl_call(node, attr) for attr in attrs):
+            return True
+    return False
+
+
 def run_stage_a_static(
     dsl_source: str,
     *,
@@ -1556,11 +2140,26 @@ def run_stage_a_static(
     var_bindings: Mapping[str, int] | None = None,
     enable_track_router: bool = False,
     case_ratios: CasePhysicsRatios | None = None,
+    require_hardware_dma: bool = False,
+    require_cube_engine: bool = False,
 ) -> StageAResult:
     """Run millisecond Stage A AST, Two-Snapshot IR Diff, and optional track routing."""
     t0 = time.monotonic()
     try:
         parsed_tree = ast.parse(dsl_source)
+        kernel_threads_lines = _kernel_threads_kwarg_calls(parsed_tree)
+        if kernel_threads_lines:
+            line_list = ", ".join(str(ln) for ln in kernel_threads_lines)
+            return StageAResult(
+                passed=False,
+                prim_func=None,
+                ledger=None,
+                error_message=(
+                    "forbidden_kernel_threads_kwarg: T.Kernel(...) does not accept "
+                    f"threads= (lines {line_list}); pass threads= only to T.SimtVF(threads=128)"
+                ),
+                elapsed_ms=(time.monotonic() - t0) * 1000.0,
+            )
         parallel_math = _parallel_forbidden_math_calls(parsed_tree)
         if parallel_math:
             return StageAResult(
@@ -1670,6 +2269,35 @@ def run_stage_a_static(
             features=features,
             route=route,
             error_message="; ".join(reasons),
+            elapsed_ms=(time.monotonic() - t0) * 1000.0,
+        )
+    engine_reasons: list[str] = []
+    if require_cube_engine:
+        has_cube_pipe = int(ledger.pipe_cycles.get("AIC.PIPE_M", 0)) > 0
+        has_gemm_call = _ast_has_dsl_call(parsed_tree, "gemm", "gemm_v0")
+        if not (has_cube_pipe or has_gemm_call):
+            engine_reasons.append(
+                "missing_cube_engine_primitives: Track-A @T.prim_func contains zero "
+                "Cube MMAD/T.gemm operations (AIC.PIPE_M == 0)"
+            )
+    if require_hardware_dma:
+        uses_simt = bool(ledger.has_indirect_gather or _ast_has_dsl_call(parsed_tree, "SimtVF"))
+        has_mte2 = any(
+            k.endswith("PIPE_MTE2") and int(v) > 0 for k, v in ledger.pipe_cycles.items()
+        )
+        if not uses_simt and not has_mte2:
+            engine_reasons.append(
+                "missing_hardware_dma_staging: Track-A @T.prim_func performs zero "
+                "GM->UB/L1 DMA transfers (PIPE_MTE2 == 0)"
+            )
+    if engine_reasons:
+        return StageAResult(
+            passed=False,
+            prim_func=prim_func,
+            ledger=ledger,
+            features=features,
+            route=route,
+            error_message="; ".join(engine_reasons),
             elapsed_ms=(time.monotonic() - t0) * 1000.0,
         )
     return StageAResult(
@@ -2890,6 +3518,7 @@ class GateFunnel:
         var_bindings: Mapping[str, int] | None = None,
         backend_kind: str | None = None,
         freedom_mask: object | None = None,
+        roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
     ) -> FunnelEvaluation:
         """Run Stage A, Stage B, and Stage C sequentially with early rejection."""
         if backend_kind in ("ascendc", "ascendc_template"):
@@ -2955,6 +3584,7 @@ class GateFunnel:
                 stage_a.ledger,
                 fallback_telemetry,
                 compiler_summary=comp_summary,
+                roofline=roofline,
             )
             stage_c = StageCResult(
                 passed=True,
@@ -2992,9 +3622,20 @@ class GateFunnel:
                     observation=stage_a.ledger.to_observation_5d(
                         compiler_summary=comp_summary,
                         telemetry=stage_c.telemetry,
+                        roofline=roofline,
                     ),
                 )
                 stage_c = replace(stage_c, residual=merged_res)
+            elif stage_c.residual is not None and roofline is not None:
+                refreshed_res = replace(
+                    stage_c.residual,
+                    observation=stage_a.ledger.to_observation_5d(
+                        compiler_summary=comp_summary,
+                        telemetry=stage_c.telemetry,
+                        roofline=roofline,
+                    ),
+                )
+                stage_c = replace(stage_c, residual=refreshed_res)
 
         if not stage_c.passed or not stage_c.accuracy_passed:
             return FunnelEvaluation(
@@ -3106,6 +3747,7 @@ __all__ = [
     "ledger_to_json",
     "parse_cce_res_usage",
     "prescreen_dsl_tile_kwargs",
+    "resolve_trackb_compile_flags",
     "run_stage_a_static",
     "run_stage_b_ascendc_compile",
     "run_stage_b_compile",

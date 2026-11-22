@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from tilefoundry_ascend.agent.orchestrator import gate_funnel as gf
+from tilefoundry_ascend.agent.campaign import marathon
+from tilefoundry_ascend.agent.orchestrator import cpp_slice_protocol, gate_funnel as gf
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
     _build_ascendc_static_ledger,
@@ -285,3 +286,5 @@ void run() {
     assert ledger.pipe_cycles["AIV0.PIPE_MTE2"] > 0
     assert ledger.pipe_cycles["AIV0.PIPE_MTE3"] > 0
     assert ledger.pipe_cycles["AIV0.PIPE_V"] > 0
+    assert "Any" not in inspect.getsource(cpp_slice_protocol)
+    assert "resolve_trackb_compile_flags" in inspect.getsource(marathon)
