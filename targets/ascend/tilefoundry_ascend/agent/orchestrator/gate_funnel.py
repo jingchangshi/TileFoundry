@@ -513,8 +513,55 @@ _VLOOPV2_MISS_RE = re.compile(
 _COMPILE_DIAGNOSTIC_LIMIT = 1500
 _COMPILE_ERROR_CONTEXT_LINES = 6
 _COMPILE_ERROR_RE = re.compile(
-    r"(?i)(?:\[error\]|\btvm\s*error\b|\bfatal\s*:|(?:^|[\s:\[(])(?:fatal\s+)?error:)"
+    r"(?i)(?:\[error\]|\btvm\s*error\b|\bfatal\s*:|\bCheck\s+failed:|"
+    r"(?:^|[\s:(])(?:Assertion|Type|Value|Runtime|Internal|Key|Attribute|Name|Syntax)Error:|"
+    r"(?:^|[\s:\[(])(?:fatal\s+)?error:)"
 )
+_DEPRECATED_WARN_RE = re.compile(
+    r"(?:warning:\s+.*\[-Wdeprecated-declarations\]|"
+    r"note:\s+'[^']+'\s+has been explicitly marked deprecated here|"
+    r"note:\s+expanded from macro 'ASC_DEPRECATED')"
+)
+_NON_ERROR_DIAG_HEADER_RE = re.compile(
+    r"^(?:note:|warning:|in file included from|/\S+:\d+:\d+:\s*(?:warning|note):)",
+    re.IGNORECASE,
+)
+_TVM_BT_RE = re.compile(r"^\s*(?:\[bt\]\s*\(\d+\)|File \"<unknown>\", line 0, in )")
+
+
+def _strip_diagnostic_noise(lines: Sequence[str]) -> list[str]:
+    kept: list[str] = []
+    skip_cascade = False
+    skip_tvm_bt = False
+    for line in lines:
+        if _COMPILE_ERROR_RE.search(line):
+            skip_cascade = False
+            skip_tvm_bt = False
+            kept.append(line)
+            continue
+        if _DEPRECATED_WARN_RE.search(line):
+            skip_cascade = True
+            skip_tvm_bt = False
+            continue
+        if line.strip() == "Stack trace:":
+            skip_tvm_bt = True
+            skip_cascade = False
+            continue
+        if skip_tvm_bt:
+            if _TVM_BT_RE.search(line) or not line.strip():
+                continue
+            skip_tvm_bt = False
+        if skip_cascade:
+            stripped = line.strip()
+            if not stripped:
+                skip_cascade = False
+                continue
+            if _NON_ERROR_DIAG_HEADER_RE.match(stripped):
+                skip_cascade = False
+            else:
+                continue
+        kept.append(line)
+    return kept
 
 
 def _bounded_compile_diagnostic(
@@ -522,27 +569,52 @@ def _bounded_compile_diagnostic(
     *,
     limit: int = _COMPILE_DIAGNOSTIC_LIMIT,
 ) -> str:
-    """Keep the primary compiler error with adjacent context and a bounded output tail."""
+    """Keep primary compiler errors without deprecation cascades plus a bounded output tail."""
     text = output_text.strip()
     if len(text) <= limit:
         return text
-    lines = text.splitlines()
-    error_idx = next(
-        (idx for idx, line in enumerate(lines) if _COMPILE_ERROR_RE.search(line)),
-        None,
+    raw_lines = text.splitlines()
+    filtered_lines = _strip_diagnostic_noise(raw_lines)
+    use_filtered = bool(filtered_lines) and any(
+        _COMPILE_ERROR_RE.search(line) for line in filtered_lines
     )
-    tail = text[-limit:]
-    if error_idx is None:
+    lines = filtered_lines if use_filtered else raw_lines
+    effective_text = "\n".join(lines).strip()
+    if len(effective_text) <= limit:
+        return effective_text
+    error_indices = [
+        idx for idx, line in enumerate(lines) if _COMPILE_ERROR_RE.search(line)
+    ]
+    tail = effective_text[-limit:]
+    if not error_indices:
         return tail
+    error_idx = error_indices[0]
     error_line = lines[error_idx].strip()
-    if error_line in tail:
+    if error_line in tail and len(error_indices) == 1:
         return tail
     context_end = min(len(lines), error_idx + 1 + _COMPILE_ERROR_CONTEXT_LINES)
-    header = "\n".join([error_line, *(line.rstrip() for line in lines[error_idx + 1 : context_end])])
+    header_lines = [
+        error_line,
+        *(line.rstrip() for line in lines[error_idx + 1 : context_end]),
+    ]
+    seen_end = context_end
+    extra_blocks = 0
+    for other_idx in error_indices[1:]:
+        if other_idx < seen_end or extra_blocks >= 2:
+            continue
+        other_line = lines[other_idx].strip()
+        if other_line in tail or "clang frontend command failed" in other_line.lower():
+            continue
+        other_end = min(len(lines), other_idx + 3)
+        header_lines.append(other_line)
+        header_lines.extend(line.rstrip() for line in lines[other_idx + 1 : other_end])
+        seen_end = other_end
+        extra_blocks += 1
+    header = "\n".join(header_lines)
     prefix = f"{header}\n[... compiler output truncated ...]\n"
     if len(prefix) >= limit:
         return header[:limit]
-    return prefix + text[-(limit - len(prefix)) :]
+    return prefix + effective_text[-(limit - len(prefix)) :]
 
 
 def _parse_cce_res_usage_with_summary(
@@ -3079,6 +3151,11 @@ def run_stage_b_ascendc_compile(
                 if use_legacy_cce_flags
                 else [f"--npu-arch={arch}"]
             )
+            dep_flags = (
+                []
+                if any("Wdeprecated-declarations" in str(flag) for flag in extra_flags)
+                else ["-Wno-deprecated-declarations"]
+            )
             cmd = [
                 resolved_bisheng,
                 *arch_flags,
@@ -3087,6 +3164,7 @@ def run_stage_b_ascendc_compile(
                 "-O2",
                 *std_flags,
                 *include_flags,
+                *dep_flags,
                 *extra_flags,
                 "-c",
                 str(src_path),

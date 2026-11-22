@@ -183,7 +183,7 @@ def test_tilelang_surface_registers_simd_register_primitives_and_parallel_math_b
         "T.simd.pset": 'T.simd.pset(width, "PAT_ALL")',
         "T.simd.update_mask": "T.simd.update_mask(count, width=32)",
         "T.simd.vdup": "T.simd.vdup(value, dtype, mask=mask)",
-        "T.simd.vld": 'T.simd.vld(buf[offset], dist="NORM_B32")',
+        "T.simd.vld": 'T.simd.vld(buf[offset], dist="NORM_B32" | "US_B16" | "BRC_B32")',
         "T.simd.vcvt": "T.simd.vcvt(vec, dtype, mask=mask, part=0)",
         "T.simd.vexp": "T.simd.vexp(vec, mask=mask)",
         "T.simd.vln": "T.simd.vln(vec, mask=mask)",
@@ -200,7 +200,10 @@ def test_tilelang_surface_registers_simd_register_primitives_and_parallel_math_b
         "T.simd.vmaxs": "T.simd.vmaxs(vec, scalar, mask=mask)",
         "T.simd.vcadd": "T.simd.vcadd(vec, mask=mask)",
         "T.simd.vcmax": "T.simd.vcmax(vec, mask=mask)",
-        "T.simd.vsts": 'T.simd.vsts(buf[offset], vec, mask=mask, dist="PK_B32", extent=64)',
+        "T.simd.vsts": (
+            'T.simd.vsts(buf[offset], vec, mask=mask, '
+            'dist="NORM_B32" | "ONEPT_B32" | "PK_B32", extent=64)'
+        ),
         "T.annotate_buffer_versions": "T.annotate_buffer_versions({buf: stages})",
         "T.annotate_unlimit_memory": 'T.annotate_unlimit_memory("shared")',
     }

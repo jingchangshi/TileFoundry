@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -59,11 +60,13 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
     StageCResult,
+    _bounded_compile_diagnostic,
     _build_ascendc_static_ledger,
     _check_custom_kernel_redlines,
     _parse_cce_launch_block_dim,
     _resolve_cpp_consts,
     evaluate_ascendc_candidate,
+    run_stage_b_ascendc_compile,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     GenerationRequest,
@@ -1340,3 +1343,86 @@ def test_p1_r1_kernel_cache_bloat_classified_as_candidate_failure(tmp_path: Path
         )
         == surrogate_cannbench.FAILURE_KIND_CANDIDATE
     )
+
+
+def test_v441_surfaces_cover_simd_gemm_and_sync_contracts() -> None:
+    """Verify TileLang DSL and CCE C++20 surfaces include SIMD, GEMM NT, and event_t APIs."""
+    tl_rendered = TILELANG_DSL_SURFACE.render_prompt_reference()
+    for token in (
+        "T.simd.vdupv",
+        "T.simd.alloc_var",
+        "T.simd.alloc_local",
+        "T.simd.vmula",
+        "T.simd.vsel",
+        "T.simd.vcmps",
+        "T.simd.vci",
+        "ONEPT_B32",
+        "BRC_B32",
+        "transpose_B=True",
+        "T.copy(src, dst, transpose=True)",
+    ):
+        assert token in tl_rendered
+
+    cce_rendered = CCE_CPP20_SURFACE.render_prompt_reference()
+    for token in (
+        "EVENT_ID0",
+        "ascend_gemm_l1",
+        "asc_unit_flag_mode::DISABLE",
+        "simd_inst::vdupv",
+    ):
+        assert token in cce_rendered
+    positive_lines = [
+        line
+        for line in cce_rendered.splitlines()
+        if "AscendC" in line and "Strictly Forbidden" not in line and "Do NOT emit" not in line
+    ]
+    assert positive_lines == []
+
+
+def test_v441_bounded_compile_diagnostic_strips_deprecation_and_bt_noise(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Filter deprecation cascades and TVM backtrace frames, and silence bisheng warnings."""
+    deprecated_block = (
+        "/tmp/k.asc:22:5: warning: 'asc_mmad' is deprecated [-Wdeprecated-declarations]\n"
+        "    asc_mmad(c, a, b, 16, 16, 16, 0, true, false, true);\n"
+        "    ^\n"
+        "/inc/cube_compute.h:629:1: note: 'asc_mmad' has been explicitly marked deprecated here\n"
+        "ASC_DEPRECATED(9.2.0)\n"
+        "^\n"
+        "/inc/macro.h:15:7: note: expanded from macro 'ASC_DEPRECATED'\n"
+        "    [[deprecated]]\n"
+        "      ^\n"
+    )
+    real_err = "/tmp/k.asc:88:9: error: no matching function for call to 'asc_sync_notify'"
+    noisy = (deprecated_block * 12) + f"{real_err}\n    asc_sync_notify(PIPE_MTE2, PIPE_V, 1);\n"
+    diag = _bounded_compile_diagnostic(noisy)
+    assert real_err in diag
+    assert "marked deprecated" not in diag
+
+    tvm_noisy = (
+        "InternalError: Check failed: (pb->value != 0) is false: Divide by zero\n"
+        "Stack trace:\n"
+        + "".join(f"  [bt] ({i}) /lib/libtvm.so+0x{i:x} frame_{'x' * 60}\n" for i in range(40))
+    )
+    tvm_diag = _bounded_compile_diagnostic(tvm_noisy)
+    assert "Check failed: (pb->value != 0)" in tvm_diag
+    assert "[bt] (0)" not in tvm_diag
+
+    seen_cmds: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        seen_cmds.append(list(cmd))
+        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="err")
+
+    monkeypatch.setattr("tilefoundry_ascend.agent.orchestrator.gate_funnel.subprocess.run", _fake_run)
+    fake_bisheng = tmp_path / "bisheng"
+    fake_bisheng.write_text("", encoding="utf-8")
+    res = run_stage_b_ascendc_compile(
+        '#include <tl_templates/ascend/common.h>\n__global__ void k() {}',
+        bisheng_bin=fake_bisheng,
+        cann_root=tmp_path,
+    )
+    assert res.passed is False
+    assert seen_cmds and "-Wno-deprecated-declarations" in seen_cmds[0]

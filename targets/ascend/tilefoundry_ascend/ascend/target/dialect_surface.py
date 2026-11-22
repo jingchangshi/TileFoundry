@@ -116,6 +116,12 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.dynamic(name, dtype=\"int32\")",
         ),
         PrimitiveEntry(
+            "T.alloc_var",
+            "SCALAR",
+            "exec_mode_and_spr",
+            "T.alloc_var(\"float32\" | \"int32\")",
+        ),
+        PrimitiveEntry(
             "T.SimdVF",
             "PIPE_V",
             "exec_mode_and_spr",
@@ -167,7 +173,7 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.copy",
             "PIPE_MTE2",
             "dma_and_cache_hierarchy",
-            "T.copy(src, dst)",
+            "T.copy(src, dst) | T.copy(src, dst, transpose=True)",
         ),
         PrimitiveEntry(
             "T.dual_copy",
@@ -179,7 +185,10 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.gemm",
             "PIPE_M",
             "alg_compute_and_monoid",
-            "T.gemm(a_l1, b_l1, c_l0c, transpose_A=..., transpose_B=..., clear_accum=...)",
+            (
+                "T.gemm(a_l1, b_l1, c_l0c, transpose_B=True, clear_accum=True) "
+                "[NT only: trans_A=False, trans_B=True]"
+            ),
         ),
         PrimitiveEntry(
             "T.ascend_pipe_barrier",
@@ -218,6 +227,18 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.reduce_absmax(src, dst, dim=...)",
         ),
         PrimitiveEntry(
+            "T.simd.alloc_var",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.alloc_var(\"float32\")",
+        ),
+        PrimitiveEntry(
+            "T.simd.alloc_local",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.alloc_local(shape, \"float32\")",
+        ),
+        PrimitiveEntry(
             "T.simd.pset",
             "PIPE_V",
             "exec_mode_and_spr",
@@ -236,10 +257,16 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.simd.vdup(value, dtype, mask=mask)",
         ),
         PrimitiveEntry(
+            "T.simd.vdupv",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.vdupv(vec, mask=mask, pos=\"POS_LOWEST\")",
+        ),
+        PrimitiveEntry(
             "T.simd.vld",
             "PIPE_V",
             "exec_mode_and_spr",
-            "T.simd.vld(buf[offset], dist=\"NORM_B32\")",
+            "T.simd.vld(buf[offset], dist=\"NORM_B32\" | \"US_B16\" | \"BRC_B32\")",
         ),
         PrimitiveEntry(
             "T.simd.vcvt",
@@ -302,6 +329,12 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.simd.vmuls(vec, scalar, mask=mask)",
         ),
         PrimitiveEntry(
+            "T.simd.vmula",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vmula(acc, lhs, rhs, mask=mask, mode=\"MODE_MERGING\")",
+        ),
+        PrimitiveEntry(
             "T.simd.vdiv",
             "PIPE_V",
             "alg_compute_and_monoid",
@@ -326,6 +359,18 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.simd.vmaxs(vec, scalar, mask=mask)",
         ),
         PrimitiveEntry(
+            "T.simd.vmins",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vmins(vec, scalar, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vneg",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vneg(vec, mask=mask)",
+        ),
+        PrimitiveEntry(
             "T.simd.vcadd",
             "PIPE_V",
             "alg_compute_and_monoid",
@@ -338,10 +383,43 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.simd.vcmax(vec, mask=mask)",
         ),
         PrimitiveEntry(
+            "T.simd.vcmin",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vcmin(vec, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vsel",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.vsel(src0, src1, mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vcmp",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.vcmp(lhs, rhs, mask=mask, op=\"lt\"|\"le\"|\"gt\"|\"ge\"|\"eq\"|\"ne\")",
+        ),
+        PrimitiveEntry(
+            "T.simd.vcmps",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.vcmps(vec, scalar, mask=mask, op=\"lt\"|\"le\"|\"gt\"|\"ge\"|\"eq\"|\"ne\")",
+        ),
+        PrimitiveEntry(
+            "T.simd.vci",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.vci(base_idx, \"int32\")",
+        ),
+        PrimitiveEntry(
             "T.simd.vsts",
             "PIPE_V",
             "exec_mode_and_spr",
-            "T.simd.vsts(buf[offset], vec, mask=mask, dist=\"PK_B32\", extent=64)",
+            (
+                "T.simd.vsts(buf[offset], vec, mask=mask, "
+                "dist=\"NORM_B32\" | \"ONEPT_B32\" | \"PK_B32\", extent=64)"
+            ),
         ),
         PrimitiveEntry(
             "T.annotate_buffer_versions",
@@ -400,6 +478,36 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "(outer, reduce_extent, inner) on NPU, pad UB tiles to 64-element multiples with "
             "T.simd.update_mask(rem, width=32/16), and guard all -inf rows so (-inf)-(-inf) "
             "never yields spurious NaN."
+        ),
+        (
+            "Inside `with T.SimdVF():`, never apply Python +, -, *, / operators to SIMD vector "
+            "registers; always use T.simd.vadd/vsub/vmul/vdiv/vadds/vmuls/vmula."
+        ),
+        (
+            "T.simd.vcadd/vcmax/vcmin return a 64-lane vector (`float32x64`) whose lane 0 holds "
+            "the reduced value: never store them into a scalar buffer element (`buf[i] = ...`) "
+            "or pass them to scalar T.simd.vdup(...); broadcast lane 0 via "
+            "T.simd.vdupv(reduced, mask=m32, pos=\"POS_LOWEST\"), or store lane 0 via "
+            "T.simd.vsts(buf[off], reduced, mask=m32, dist=\"ONEPT_B32\") and reload via "
+            "T.simd.vld(buf[off], dist=\"BRC_B32\")."
+        ),
+        (
+            "Never reassign plain Python variables across `if`/`for` branches inside `@T.prim_func`; "
+            "declare mutable registers with T.simd.alloc_var(\"float32\") or "
+            "T.simd.alloc_local(N, \"float32\") (and mutable scalars with T.alloc_var(...)) "
+            "before the branch/loop, using mode=\"MODE_MERGING\" on masked tail updates."
+        ),
+        (
+            "For `rem < 64` fp16/bf16 tails loaded with US_B16 and converted via "
+            "T.simd.vcvt(..., mask=m16_t, part=0) or stored with PK_B32, use "
+            "`m16_t = T.simd.update_mask(rem * 2, width=16)` alongside "
+            "`m32_t = T.simd.update_mask(rem, width=32)`."
+        ),
+        (
+            "Ascend L1 T.gemm only supports transpose_A=False, transpose_B=True (NT); when operand "
+            "B is row-major (K, N) in GM, copy it transposed into (N, K) L1 with "
+            "T.copy(B_gm[...], b_l1, transpose=True) before T.gemm(a_l1, b_l1, c_l0c, "
+            "transpose_B=True, clear_accum=...)."
         ),
     ),
 )
@@ -548,22 +656,37 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
             "asc_copy_l0c2ub(dst_ub, src_l0c, ...)",
         ),
         PrimitiveEntry(
+            "ascend_gemm_l1",
+            "PIPE_M",
+            "alg_compute_and_monoid",
+            (
+                "ascend_gemm_l1<M, K, N, TILE_K_SUB, TRANS_B>(cc_ptr, cbuf_a_ptr, "
+                "cbuf_b_ptr, clear_accum) [gemm.h; pre-unlock PIPE_MTE1 0/1, drain PIPE_M 0/1]"
+            ),
+        ),
+        PrimitiveEntry(
             "asc_mmad",
             "PIPE_M",
             "alg_compute_and_monoid",
-            "asc_mmad(c_l0c, a_l0a, b_l0b, m, k, n, 0, true, false, init_c)",
+            "asc_mmad(c_l0c, a_l0a, b_l0b, m, k, n, asc_unit_flag_mode::DISABLE, true, false, init_c)",
         ),
         PrimitiveEntry(
             "asc_sync_notify",
             "SCALAR",
             "pipeline_and_sync_graph",
-            "asc_sync_notify(src_pipe, dst_pipe, event_id)",
+            (
+                "asc_sync_notify(src_pipe, dst_pipe, EVENT_ID0) "
+                "[3rd arg is event_t EVENT_ID0..EVENT_ID7, never raw int]"
+            ),
         ),
         PrimitiveEntry(
             "asc_sync_wait",
             "SCALAR",
             "pipeline_and_sync_graph",
-            "asc_sync_wait(src_pipe, dst_pipe, event_id)",
+            (
+                "asc_sync_wait(src_pipe, dst_pipe, EVENT_ID0) "
+                "[3rd arg is event_t EVENT_ID0..EVENT_ID7, never raw int]"
+            ),
         ),
         PrimitiveEntry(
             "asc_lock",
@@ -594,6 +717,12 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
             "PIPE_V",
             "exec_mode_and_spr",
             "simd_inst::vsts_pack_b32(vec, ub_ptr, offset, mask)",
+        ),
+        PrimitiveEntry(
+            "simd_inst::vdupv",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "simd_inst::vdupv(vec, mask, POS_LOWEST, MODE_ZEROING)",
         ),
         PrimitiveEntry(
             "__simd_vf__",
@@ -694,6 +823,18 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
             "asc_vf_call<fn>(...), never <<<...>>> (chevron syntax is valid only in Host "
             "extern \"C\" launchers calling __global__ kernels); query sub-cores with "
             "get_subblockdim() and get_subblockid(), not get_subblocknum()."
+        ),
+        (
+            "Pass event_t enum constants (EVENT_ID0..EVENT_ID7, never integer literals) to "
+            "asc_sync_notify/asc_sync_wait; prefer ascend_gemm_l1 from "
+            "<tl_templates/ascend/gemm.h> or asc_mmad(..., asc_unit_flag_mode::DISABLE, ...) "
+            "for Cube GEMM."
+        ),
+        (
+            "Inside __simd_vf__ loops on dav-3510, keep all floating-point arithmetic in "
+            "simd_inst::* intrinsics and avoid scalar float math, casts, or scalar UB "
+            "element accesses inside vector loops (`bisheng` rejects unsupported scalar "
+            "instructions in AIV loops)."
         ),
     ),
 )

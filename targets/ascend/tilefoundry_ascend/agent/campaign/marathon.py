@@ -905,7 +905,7 @@ def prepare_marathon_seed(
                 authored_hir_source=None,
                 scheduled_hir_source=None,
                 force_cold_start=effective_cold_start,
-                max_seed_attempts=6,
+                max_seed_attempts=8,
                 desc_text=desc_text,
                 golden_contract=golden_contract,
             )
