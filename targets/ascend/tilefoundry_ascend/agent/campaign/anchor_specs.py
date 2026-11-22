@@ -13,6 +13,7 @@ import textwrap
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import ModuleType
 
 import yaml
 
@@ -1245,7 +1246,8 @@ class CannbenchOpsRegistry:
             return self._cache[op_id]
 
         meta_entry = self._entries[op_id]
-        op_dir = Path(meta_entry["op_dir"])  # type: ignore[arg-type]
+        raw_op_dir = meta_entry["op_dir"]
+        op_dir = raw_op_dir if isinstance(raw_op_dir, Path) else Path(str(raw_op_dir))
         task = str(meta_entry["task"])
         level_dir = str(meta_entry["level_dir"])
         level = str(meta_entry["level"])
@@ -1529,11 +1531,18 @@ class CannbenchOpsRegistry:
         if not is_pure and mod_text:
             shared_sel = f"_select_{spec.entrypoint}_config"
             shared_bld = f"_build_{spec.entrypoint}_prim_func"
+            render_sym = ("_render_trackb_tu",) if discovered_tb and "def _render_trackb_tu(" in mod_text else ()
             adapted: list[RegimeTargetSpec] = []
             for regime in regimes:
                 per_sel = f"_select_{spec.entrypoint}_{regime.regime_tag}_config"
                 if f"def {per_sel}(" in mod_text:
-                    adapted.append(replace(regime, config_selector_fn=per_sel))
+                    adapted.append(
+                        replace(
+                            regime,
+                            config_selector_fn=per_sel,
+                            editable_symbols=tuple(dict.fromkeys((*regime.editable_symbols, *render_sym))),
+                        )
+                    )
                 elif f"def {shared_sel}(" in mod_text:
                     adapted.append(
                         replace(
@@ -1545,6 +1554,7 @@ class CannbenchOpsRegistry:
                                         *regime.editable_symbols,
                                         shared_sel,
                                         shared_bld,
+                                        *render_sym,
                                     )
                                 )
                             ),
@@ -1813,6 +1823,7 @@ def build_semantic_regime_specs(
         per_regime_selector = f"_select_{entrypoint}_{tag}_config"
         per_regime_builder = f"_build_{entrypoint}_{tag}_prim_func"
         legacy_per_regime_builder = f"_build_{entrypoint}_{tag}_func"
+        extra_trackb = ("_render_trackb_tu",) if trackb_symbols else ()
         if multi_regime:
             selector_fn = per_regime_selector
             builder_candidates = (
@@ -1826,6 +1837,7 @@ def build_semantic_regime_specs(
                 per_regime_builder,
                 legacy_per_regime_builder,
                 *trackb_symbols,
+                *extra_trackb,
             )
         else:
             selector_fn = shared_selector
@@ -1839,6 +1851,7 @@ def build_semantic_regime_specs(
                 shared_selector,
                 shared_builder,
                 *trackb_symbols,
+                *extra_trackb,
             )
         regimes.append(
             RegimeTargetSpec(
@@ -1928,6 +1941,80 @@ def extract_schema_driven_case_dims(
         return dims
 
     lead = [int(x) for x in shapes[0]]
+    layout = str(dims.get("inputLayout", dims.get("layout", "BSND"))).upper()
+    if "inputLayout" in dims or "input_layout" in dims:
+        dims.setdefault("inputLayout", layout)
+
+    proto_param_names = {
+        str(item.get("name", "")).strip().lower()
+        for item in proto_inputs
+        if isinstance(item, Mapping)
+    }
+    schema_axes_by_input = [
+        _parse_proto_shape_axes(item.get("shape"), layout)
+        if isinstance(item, Mapping)
+        else []
+        for item in proto_inputs
+    ]
+    all_schema_axes_lower = {ax.lower() for axes in schema_axes_by_input for ax in axes}
+    lower_dim_keys = {k.lower() for k in dims}
+    has_half_split_context = (
+        "rotarymode" in lower_dim_keys
+        or "rotary_mode" in lower_dim_keys
+        or "half_dim" in all_schema_axes_lower
+        or "2h" in all_schema_axes_lower
+        or bool({"cos", "sin"} & proto_param_names)
+        or (
+            len(shapes) >= 4
+            and len(lead) >= 3
+            and bool(shapes[2])
+            and bool(shapes[3])
+            and shapes[2][-1] * 2 == lead[-1]
+            and shapes[3][-1] * 2 == lead[-1]
+        )
+    )
+    has_matmul_k_context = "k" in all_schema_axes_lower or (
+        not proto_inputs
+        and (
+            bool({"transpose_a", "transpose_b", "transpose_weight", "group_list"} & lower_dim_keys)
+            or (
+                len(shapes) >= 2
+                and len(shapes[1]) in (2, 3)
+                and shapes[0] != shapes[1]
+                and lead[-1] in shapes[1][-2:]
+            )
+        )
+    )
+    has_hc_mult_context = "hc_mult" in all_schema_axes_lower or (
+        not proto_inputs
+        and len(lead) == 3
+        and len(shapes) == 1
+        and lead[1] == lead[2]
+        and "dim" not in dims
+    )
+    has_attention_4d_context = (
+        len(shapes) >= 3
+        and len(lead) >= 4
+        and len(shapes[1]) >= 4
+        and len(shapes[2]) >= 4
+        and (
+            bool(
+                {
+                    "inputlayout",
+                    "input_layout",
+                    "numkvheads",
+                    "is_causal",
+                    "scalevalue",
+                    "use_qk_l2norm",
+                }
+                & lower_dim_keys
+            )
+            or bool({"q", "query", "q_nope"} & proto_param_names)
+            or shapes[0][-1] != shapes[1][-1]
+        )
+    )
+
+    lead = [int(x) for x in shapes[0]]
     dims["total_elements"] = int(math.prod(max(1, d) for d in lead))
     if "dim" in dims and isinstance(dims["dim"], int) and lead:
         dim_ax = int(dims["dim"])
@@ -1940,11 +2027,8 @@ def extract_schema_driven_case_dims(
             for val in lead[norm_dim + 1 :]:
                 inner *= max(1, int(val))
             dims["inner"] = int(inner)
-            dims.setdefault("half_dim", max(1, int(lead[norm_dim]) // 2))
-
-    layout = str(dims.get("inputLayout", dims.get("layout", "BSND"))).upper()
-    if "inputLayout" in dims or "input_layout" in dims:
-        dims.setdefault("inputLayout", layout)
+            if has_half_split_context:
+                dims.setdefault("half_dim", max(1, int(lead[norm_dim]) // 2))
 
     if len(lead) == 1:
         dims.setdefault("D", lead[0])
@@ -1954,7 +2038,8 @@ def extract_schema_driven_case_dims(
         dims.setdefault("M", lead[0])
         dims.setdefault("m_rows", lead[0])
         dims.setdefault("D", lead[1])
-        dims.setdefault("K", lead[1])
+        if has_matmul_k_context:
+            dims.setdefault("K", lead[1])
     elif len(lead) == 3:
         dims.setdefault("B", lead[0])
         dims.setdefault("b_dim", lead[0])
@@ -1962,7 +2047,8 @@ def extract_schema_driven_case_dims(
         dims.setdefault("s_dim", lead[1])
         dims.setdefault("m_rows", lead[0] * lead[1])
         dims.setdefault("D", lead[2])
-        dims.setdefault("hc_mult", lead[2])
+        if has_hc_mult_context:
+            dims.setdefault("hc_mult", lead[2])
     elif len(lead) >= 4:
         has_stacked_prefix = (
             not proto_inputs
@@ -2024,17 +2110,13 @@ def extract_schema_driven_case_dims(
         dims.setdefault("n_kv", int(shapes[1][kv_idx]))
         dims.setdefault("N_kv", int(shapes[1][kv_idx]))
 
-    if len(shapes) >= 3 and shapes[2]:
+    if has_attention_4d_context:
         dims.setdefault("dv", int(shapes[2][-1]))
-    if lead:
-        dims.setdefault("half_dim", max(1, int(lead[-1]) // 2))
-        dims.setdefault("d_dim", int(lead[-1]))
         dims.setdefault("dk", int(lead[-1]))
-    proto_param_names = {
-        str(item.get("name", "")).strip().lower()
-        for item in proto_inputs
-        if isinstance(item, Mapping)
-    }
+    if lead:
+        dims.setdefault("d_dim", int(lead[-1]))
+        if has_half_split_context:
+            dims.setdefault("half_dim", max(1, int(lead[-1]) // 2))
     if (
         len(shapes) >= 2
         and len(shapes[1]) >= 2
@@ -2048,6 +2130,8 @@ def extract_schema_driven_case_dims(
     axis_aliases = {
         "d_nope": ("D_nope", "d_nope"),
         "d_rope": ("D_rope", "d_rope"),
+        "dk": ("D_qk", "dk"),
+        "dv": ("D_v", "dv"),
         "n_q": ("N_q", "n_q"),
         "n_kv": ("N_kv", "n_kv"),
         "s_kv": ("S_kv", "s_kv"),
@@ -2064,11 +2148,7 @@ def extract_schema_driven_case_dims(
             if idx < len(proto_inputs) and isinstance(proto_inputs[idx], Mapping)
             else f"in_{idx}"
         )
-        schema_axes = (
-            _parse_proto_shape_axes(proto_inputs[idx].get("shape"), layout)
-            if idx < len(proto_inputs) and isinstance(proto_inputs[idx], Mapping)
-            else []
-        )
+        schema_axes = schema_axes_by_input[idx] if idx < len(schema_axes_by_input) else []
         for ax, dval in enumerate(sh):
             iv = int(dval)
             dims[f"{pname}_dim_{ax}"] = iv
@@ -2249,7 +2329,7 @@ def default_source_root() -> Path:
     return Path(__file__).resolve().parents[5]
 
 
-def load_cannbench_contract_module(source_root: str | Path | None = None):
+def load_cannbench_contract_module(source_root: str | Path | None = None) -> ModuleType:
     """Dynamically load tests/ascend/benchmarks/cannbench_contract.py."""
     root = Path(source_root).resolve() if source_root is not None else default_source_root()
     contract_path = root / "tests" / "ascend" / "benchmarks" / "cannbench_contract.py"
@@ -2270,7 +2350,7 @@ def load_anchor_harness_and_cases(
     cannbench_repo: str | Path | None = None,
     env_file: str | Path | None = None,
     source_root: str | Path | None = None,
-):
+) -> tuple[object, list[object]]:
     """Instantiate cannbench_contract.Harness and filter active anchor Case objects."""
     task = get_operator_task(operator_name)
     repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)

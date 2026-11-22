@@ -246,7 +246,9 @@ def test_p1c_dead_code_guard_l0_l1_and_prompt_routing(monkeypatch) -> None:
     parent_src = (
         '_SOFTMAX_TRACKB_SRC = r"""\n'
         '#include <tl_templates/ascend/common.h>\n'
-        '__global__ __vector__ void k() {}\n'
+        '__global__ __vector__ void k(__gm__ half* inp, __ubuf__ half* u) {\n'
+        '  asc_copy_gm2ub_align(u, inp, 128);\n'
+        '}\n'
         '"""\n\n'
         "def _select_softmax_config(**_kw):\n"
         "    return {'bm': 64}\n\n"
@@ -257,7 +259,10 @@ def test_p1c_dead_code_guard_l0_l1_and_prompt_routing(monkeypatch) -> None:
     err = _detect_trackb_dead_code_edit(parent_src, dead_cand, spec)
     assert err is not None and "DEAD_CODE_TRACKB_EDIT" in err
 
-    live_cpp_cand = parent_src.replace("void k() {}", "void k() { int x = 1; }")
+    live_cpp_cand = parent_src.replace(
+        "  asc_copy_gm2ub_align(u, inp, 128);\n}",
+        "  asc_copy_gm2ub_align(u, inp, 128);\n  int x = 1;\n}",
+    )
     assert _detect_trackb_dead_code_edit(parent_src, live_cpp_cand, spec) is None
 
     live_sel_cand = parent_src.replace("return {'bm': 64}", "return {'bm': 128}")
@@ -290,7 +295,15 @@ def test_p1c_dead_code_guard_l0_l1_and_prompt_routing(monkeypatch) -> None:
     assert sa_pure_tb.passed is True
     assert sa_pure_tb.backend_kind == "ascendc"
 
-    illegal_src = parent_src.replace("void k() {}", "void k() { /* L1->GM */ }")
+    scalar_only_src = parent_src.replace("  asc_copy_gm2ub_align(u, inp, 128);\n", "")
+    sa_no_dma = runner._default_l0_checker(scalar_only_src, spec)
+    assert sa_no_dma.passed is False
+    assert "missing_hardware_dma_staging" in sa_no_dma.error_message
+
+    illegal_src = parent_src.replace(
+        "  asc_copy_gm2ub_align(u, inp, 128);\n",
+        "  /* L1->GM */\n  asc_copy_gm2ub_align(u, inp, 128);\n",
+    )
     sa_bad = runner._default_l0_checker(illegal_src, spec)
     assert sa_bad.passed is False
     assert "L1->GM" in sa_bad.error_message

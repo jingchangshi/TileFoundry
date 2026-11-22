@@ -666,7 +666,8 @@ def test_prepare_marathon_seed_cold_start_rope_semantic_regimes_pass_l0_and_take
     assert "layout: int =" in system_prompt
     assert "rotaryMode: str =" in system_prompt
     assert "tl_dtype: str =" in system_prompt
-    assert "total_elements: int =" in system_prompt
+    assert "total_elements: int =" not in system_prompt
+    assert "**extra_dims: object" in system_prompt
     assert "### OFFICIAL PROTO CONTRACT" in user_prompt
     assert "### OFFICIAL CASES" in user_prompt
     assert "### CAMPAIGN REGIME INSTANTIATIONS" in user_prompt
@@ -961,3 +962,29 @@ def test_marathon_env_preserves_cannbench_mcp_keys_and_prefers_cann_bench(
     assert parsed["TILEFOUNDRY_NPU_CANNBENCH_AGGREGATION_TOKEN"] == "agg-123"
     assert parsed["TILEFOUNDRY_NPU_CANNBENCH_INDEPENDENT_ENV_CONSENT"] == "1"
     assert parsed["TILEFOUNDRY_NPU_CANNBENCH_FUTURE_FLAG"] == "yes"
+
+
+def test_elementwise_8bit_quant_starts_on_tilelang_dsl() -> None:
+    """Standard 8-bit elementwise quant keeps Track-A tilelang_dsl as initial track."""
+    from tilefoundry_ascend.agent.campaign.seed_synthesizer import select_initial_track_from_semantics
+    from tilefoundry_ascend.ascend.sil.pytorch_frontend import PyTorchSemanticAnalyzer
+
+    analyzer = PyTorchSemanticAnalyzer()
+    src = (
+        "import torch\n\n"
+        "def norm_dyn_quant(x1: torch.Tensor, x2: torch.Tensor, gamma: torch.Tensor):\n"
+        "    x = x1.float() + x2.float()\n"
+        "    y_norm = x / torch.sqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * gamma.float()\n"
+        "    scale = (y_norm.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12) / 127.0)\n"
+        "    y = torch.clamp((y_norm / scale).round(), -128, 127).to(torch.int8)\n"
+        "    return y, x.to(x1.dtype), scale.squeeze(-1)\n"
+    )
+    semantics = analyzer.analyze_source(src, entry_name="norm_dyn_quant")
+    ratios = (
+        analyzer.compute_case_ratios(
+            semantics,
+            {"case_id": 1, "input_shape": [[4, 128], [4, 128], [128]], "dtype": "float16"},
+        ),
+    )
+    assert semantics.has_subbyte_or_block_quant is False
+    assert select_initial_track_from_semantics(semantics, ratios) == "tilelang_dsl"

@@ -19,10 +19,11 @@ import re
 import shutil
 import sys
 import tempfile
+from collections.abc import Mapping
 from inspect import Parameter, signature
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 import torch
 import yaml
@@ -1091,6 +1092,109 @@ def _resolve_cannbench_src():
     return None
 
 
+class _ComparisonResultLike(Protocol):
+    @property
+    def passed(self) -> bool: ...
+
+    @property
+    def message(self) -> str: ...
+
+
+class _CaseComparatorLike(Protocol):
+    def __call__(
+        self,
+        *,
+        case_id: str,
+        actual: object,
+        golden: object,
+        inputs: object = (),
+        compute: bool = True,
+        accuracy_mode: str | None = None,
+        native_ref_operator: Callable[[object], object] | None = None,
+        extra: Mapping[str, object] | None = None,
+    ) -> _ComparisonResultLike: ...
+
+
+def _format_nonfinite_diagnostic(actual: object, golden: object) -> str:
+    """Summarize non-finite NaN or Inf mismatches so callers never see empty 0.0 diffs."""
+    if not isinstance(actual, torch.Tensor) or not isinstance(golden, torch.Tensor):
+        return ""
+    if actual.shape != golden.shape or actual.numel() == 0:
+        return ""
+    if not actual.is_floating_point():
+        return ""
+    with torch.no_grad():
+        act = actual.detach().cpu()
+        gold = golden.detach().cpu()
+        nan_act = torch.isnan(act)
+        nan_gold = torch.isnan(gold)
+        nan_diff = nan_act != nan_gold
+        if bool(nan_diff.any().item()):
+            first_coord = torch.nonzero(nan_diff, as_tuple=False)[0].tolist()
+            act_nan_cnt = int(nan_act.sum().item())
+            gold_nan_cnt = int(nan_gold.sum().item())
+            return (
+                f"NaN position mismatch (actual_nan={act_nan_cnt}/{act.numel()}, "
+                f"golden_nan={gold_nan_cnt}/{gold.numel()}, first_coord={first_coord})"
+            )
+        inf_act = torch.isinf(act)
+        inf_gold = torch.isinf(gold)
+        inf_diff = inf_act != inf_gold
+        both_inf = inf_act & inf_gold
+        if bool(both_inf.any().item()):
+            inf_sign_diff = torch.sign(act[both_inf].float()) != torch.sign(
+                gold[both_inf].float()
+            )
+            if bool(inf_sign_diff.any().item()):
+                sign_mask = torch.zeros_like(both_inf)
+                sign_mask[both_inf] = inf_sign_diff
+                inf_diff = inf_diff | sign_mask
+        if bool(inf_diff.any().item()):
+            first_coord = torch.nonzero(inf_diff, as_tuple=False)[0].tolist()
+            act_inf_cnt = int(inf_act.sum().item())
+            gold_inf_cnt = int(inf_gold.sum().item())
+            return (
+                f"Inf mismatch (actual_inf={act_inf_cnt}/{act.numel()}, "
+                f"golden_inf={gold_inf_cnt}/{gold.numel()}, first_coord={first_coord})"
+            )
+    return ""
+
+
+def _wrap_comparator_with_nonfinite_diag(fn: _CaseComparatorLike) -> _CaseComparatorLike:
+    """Ensure failed comparisons include non-finite coordinate diagnostics when present."""
+
+    def _wrapped(
+        *,
+        case_id: str,
+        actual: object,
+        golden: object,
+        inputs: object = (),
+        compute: bool = True,
+        accuracy_mode: str | None = None,
+        native_ref_operator: Callable[[object], object] | None = None,
+        extra: Mapping[str, object] | None = None,
+    ) -> _ComparisonResultLike:
+        result = fn(
+            case_id=case_id,
+            actual=actual,
+            golden=golden,
+            inputs=inputs,
+            compute=compute,
+            accuracy_mode=accuracy_mode,
+            native_ref_operator=native_ref_operator,
+            extra=extra,
+        )
+        if not bool(result.passed):
+            diag = _format_nonfinite_diagnostic(actual, golden)
+            raw_msg = str(result.message or '')
+            if diag and diag not in raw_msg:
+                merged = f"{diag}; raw={raw_msg}" if raw_msg else diag
+                return SimpleNamespace(passed=False, message=merged)
+        return result
+
+    return _wrapped
+
+
 def _load_compare_case_result():
     """Load the official comparator, or adapt CANNBench ``compare_tensors``.
 
@@ -1104,8 +1208,9 @@ def _load_compare_case_result():
         return _COMPARE_CASE_RESULT
     try:
         official = importlib.import_module('npu_compare').compare_case_result
-        _COMPARE_CASE_RESULT = official
-        return official
+        wrapped_official = _wrap_comparator_with_nonfinite_diag(official)
+        _COMPARE_CASE_RESULT = wrapped_official
+        return wrapped_official
     except ImportError:
         pass
     src = _resolve_cannbench_src()
@@ -1136,8 +1241,9 @@ def _load_compare_case_result():
             f'MERE={res.mere:.6e}, MARE={res.mare:.6e}, max_diff={res.max_diff:.6e}')
         return SimpleNamespace(passed=bool(res.passed), message=msg)
 
-    _COMPARE_CASE_RESULT = compare_case_result
-    return compare_case_result
+    wrapped_fallback = _wrap_comparator_with_nonfinite_diag(compare_case_result)
+    _COMPARE_CASE_RESULT = wrapped_fallback
+    return wrapped_fallback
 
 
 def comparator_available():

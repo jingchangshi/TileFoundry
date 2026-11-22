@@ -10,30 +10,37 @@ from pathlib import Path
 
 import pytest
 
-from tilefoundry_ascend.agent.campaign import surrogate_cannbench
-from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
+from tilefoundry_ascend.agent.campaign import marathon, surrogate_cannbench
+from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry, RegimeTargetSpec
 from tilefoundry_ascend.agent.campaign.campaign_runner import _extract_trackb_cpp_source
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import run_l1_compile_check
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
+    StageAResult,
     StageBResult,
     StageCResult,
     _bounded_compile_diagnostic,
     _check_custom_kernel_redlines,
     _parallel_forbidden_math_calls,
+    _parse_cce_launch_block_dim,
+    _resolve_cpp_consts,
+    check_npu_entrypoint_purity,
     evaluate_ascendc_candidate,
     parse_cce_res_usage,
+    resolve_trackb_compile_flags,
     run_stage_a_static,
     run_stage_b_ascendc_compile,
     run_stage_b_compile,
 )
+from tilefoundry_ascend.ascend.sil.pytorch_frontend import PyTorchSemanticAnalyzer
+from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     compute_eq3_hap_objective,
     compute_static_dynamic_residual,
     extract_structural_signature,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import build_objective_physical_ledger
-from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios
+from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios, ConstraintRelaxationMask
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -384,7 +391,7 @@ def test_evaluate_ascendc_candidate_derives_wave_occupancy_and_ub_bank_risk() ->
     )
     fallback = evaluate_ascendc_candidate(unlaunched_cpp, case_ratios=ratios)
     assert fallback.ledger is not None
-    assert fallback.ledger.grid_blocks == 1
+    assert fallback.ledger.grid_blocks == 60
     assert fallback.ledger.wave_occupancy == 1.0714
     assert fallback.ledger.ub_bank_conflict_risk == 1.0
 
@@ -448,3 +455,302 @@ def test_run_l1_compile_check_keeps_primary_error_before_source_tail(
     assert primary in result.error_message
     assert "Source: line 199" in result.error_message
     assert len(result.error_message) <= len("l1_compile_failed (rc=1): ") + 1500
+
+
+def test_resolve_trackb_compile_flags_and_kernel_threads_ast_check() -> None:
+    """Strip SIMD-VF UBUF flags on __simt_vf__ and reject threads= only on T.Kernel."""
+    simt_cpp = (
+        "#include <tl_templates/ascend/common.h>\n"
+        "__simt_vf__ void vf(__gm__ float* x) {}\n"
+        'extern "C" __global__ __vector__ void k(__gm__ float* x) {}\n'
+    )
+    simt_flags = resolve_trackb_compile_flags(
+        simt_cpp,
+        [*PURE_SIMDVF_UBUF_FLAGS, "-O2", "-DKEEP_FLAG=1"],
+    )
+    assert simt_flags == ("-O2", "-DKEEP_FLAG=1")
+
+    simd_cpp = (
+        "#include <tl_templates/ascend/common.h>\n"
+        "// commented __simt_vf__ token must not strip flags\n"
+        "__simd_vf__ void vf(__ubuf__ float* x) {}\n"
+    )
+    simd_flags = resolve_trackb_compile_flags(simd_cpp, ["-DKEEP_FLAG=1"])
+    for flag in PURE_SIMDVF_UBUF_FLAGS:
+        assert flag in simd_flags
+    assert "-DKEEP_FLAG=1" in simd_flags
+
+    bad_kernel_threads = (
+        "import tilelang.ascend.language as T\n\n"
+        "@T.prim_func\n"
+        'def main(X: T.Tensor((1, 64), "float16")):\n'
+        "    with T.Kernel(1, threads=128) as cid:\n"
+        "        pass\n"
+    )
+    res_bad = run_stage_a_static(bad_kernel_threads)
+    assert res_bad.passed is False
+    assert "forbidden_kernel_threads_kwarg" in res_bad.error_message
+
+    simt_ok = _parallel_math_module("T.exp(x_ub[0, i])", simt_vf=True)
+    assert run_stage_a_static(simt_ok).passed is True
+
+
+def test_require_kernel_cache_gate_funnel_roofline_and_engine_gates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify _KERNEL_CACHE purity, GateFunnel roofline threading, and Cube/DMA gates."""
+    uncached_mod = (
+        "import tilelang\nimport tilelang.ascend.language as T\n\n"
+        "@T.prim_func\n"
+        'def _main(X: T.Tensor((1, 64), "float16")):\n    pass\n\n'
+        "def op_fn(x):\n"
+        '    return tilelang.compile(_main, target="ascend")(x)\n\n'
+        "kernel = op_fn\n"
+    )
+    assert check_npu_entrypoint_purity(uncached_mod, "op_fn") == []
+    assert any(
+        "missing_kernel_cache" in err
+        for err in check_npu_entrypoint_purity(
+            uncached_mod, "op_fn", require_kernel_cache=True
+        )
+    )
+
+    decoy_cached_mod = "_KERNEL_CACHE: dict[object, object] = {}\n" + uncached_mod
+    assert any(
+        "unpopulated_kernel_cache" in err
+        for err in check_npu_entrypoint_purity(
+            decoy_cached_mod, "op_fn", require_kernel_cache=True
+        )
+    )
+
+    readonly_cached_mod = (
+        "import tilelang\nimport tilelang.ascend.language as T\n\n"
+        "_KERNEL_CACHE: dict[object, object] = {}\n\n"
+        "@T.prim_func\n"
+        'def _main(X: T.Tensor((1, 64), "float16")):\n    pass\n\n'
+        "def op_fn(x):\n"
+        "    k = _KERNEL_CACHE.get(x.dtype)\n"
+        '    return (k or tilelang.compile(_main, target="ascend"))(x)\n\n'
+        "kernel = op_fn\n"
+    )
+    assert any(
+        "unpopulated_kernel_cache" in err
+        for err in check_npu_entrypoint_purity(
+            readonly_cached_mod, "op_fn", require_kernel_cache=True
+        )
+    )
+
+    populated_mod = (
+        "import tilelang\nimport tilelang.ascend.language as T\n\n"
+        "_KERNEL_CACHE: dict[object, object] = {}\n\n"
+        "@T.prim_func\n"
+        'def _main(X: T.Tensor((1, 64), "float16")):\n    pass\n\n'
+        "def op_fn(x):\n"
+        "    k = _KERNEL_CACHE.get(x.dtype)\n"
+        "    if k is None:\n"
+        '        k = tilelang.compile(_main, target="ascend")\n'
+        "        _KERNEL_CACHE[x.dtype] = k\n"
+        "    return k(x)\n\n"
+        "kernel = op_fn\n"
+    )
+    assert check_npu_entrypoint_purity(
+        populated_mod, "op_fn", require_kernel_cache=True
+    ) == []
+
+    funnel = GateFunnel(
+        skip_stage_b=False,
+        compile_runner=lambda _src: StageBResult(passed=True, spill_bytes=0, vloopv2_hit=True),
+    )
+    ev = funnel.evaluate(
+        _PRIM_FUNC_KERNEL_MODULE,
+        roofline={"min_gm_bytes": 16384, "compute_floor_us": 2.0},
+    )
+    assert ev.passed is True
+    assert ev.stage_c is not None and ev.stage_c.residual is not None
+    assert ev.stage_c.residual.observation is not None
+    assert ev.stage_c.residual.transfer_inflation_ratio > 0.0
+    assert ev.stage_c.residual.observation.transfer_inflation_ratio > 0.0
+
+    cube_req = run_stage_a_static(_PRIM_FUNC_KERNEL_MODULE, require_cube_engine=True)
+    assert cube_req.passed is False
+    assert "missing_cube_engine_primitives" in cube_req.error_message
+
+    mx_cpp = (
+        "#include <tl_templates/ascend/common.h>\n"
+        "#include <tl_templates/ascend/gemm.h>\n"
+        'extern "C" __global__ __aicore__ void mm(__gm__ half* a, __gm__ half* b) {\n'
+        "    asc_init();\n"
+        "    asc_copy_gm2l1_nd2nz();\n"
+        "    asc_mmad_mx();\n"
+        "}\n"
+    )
+    mx_res = evaluate_ascendc_candidate(
+        mx_cpp,
+        freedom_mask=ConstraintRelaxationMask.top(),
+        require_hardware_dma=True,
+        require_cube_engine=True,
+    )
+    assert mx_res.passed is True, mx_res.error_message
+
+    hybrid_mod = (
+        "import torch\n"
+        "import tilelang\n"
+        "import tilelang.ascend.language as T\n\n"
+        "_KERNEL_CACHE: dict[object, object] = {}\n"
+        'TB_CU = """\n'
+        "#include <tl_templates/ascend/common.h>\n"
+        'extern "C" __global__ __vector__ void k(__gm__ half* x) {\n'
+        "    asc_init();\n"
+        "    asc_copy_gm2ub_align(nullptr, x, 64);\n"
+        "}\n"
+        '"""\n'
+        "def _render_trackb_tu(**dims: object) -> str:\n"
+        '    return str(dims.get("trackb_src", ""))\n'
+        "def _select_cfg(**kw: object) -> dict[str, object]:\n"
+        '    return {"compile_flags": []}\n'
+        "def _build_fn(**kw: object):\n"
+        "    @T.prim_func\n"
+        '    def main(X: T.Tensor((1, 64), "float16")):\n        pass\n'
+        "    return main\n"
+        "def demo(x: torch.Tensor) -> torch.Tensor:\n"
+        '    k_fn = _KERNEL_CACHE.get("k")\n'
+        "    if k_fn is None:\n"
+        '        k_fn = tilelang.compile(_build_fn(), target="ascend")\n'
+        '        _KERNEL_CACHE["k"] = k_fn\n'
+        "    return k_fn(x)\n"
+        "kernel = demo\n"
+    )
+    spec = RegimeTargetSpec(
+        regime_tag="mm",
+        builder_candidates=("_build_fn",),
+        sample_builder_kwargs={},
+        representative_hir_dims={"M": 64},
+        config_selector_fn="_select_cfg",
+        runtime_backend="hybrid_trackb",
+        trackb_symbols=("TB_CU",),
+    )
+    vec_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=10,
+        pipe_cycles={"AIV0.PIPE_MTE2": 10},
+        waterlines={},
+    )
+    cube_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=10,
+        pipe_cycles={"AIC.PIPE_M": 10, "AIV0.PIPE_MTE2": 10},
+        waterlines={},
+    )
+    monkeypatch.setattr(
+        marathon,
+        "evaluate_ascendc_candidate",
+        lambda *_a, **_kw: StageAResult(passed=True, prim_func=None, ledger=vec_ledger),
+    )
+    monkeypatch.setattr(
+        marathon, "run_stage_b_ascendc_compile", lambda *_a, **_kw: StageBResult(passed=True)
+    )
+    monkeypatch.setattr(
+        marathon, "run_l1_compile_check", lambda *_a, **_kw: StageBResult(passed=True)
+    )
+    monkeypatch.setattr(
+        marathon,
+        "run_stage_a_static",
+        lambda *_a, **_kw: StageAResult(passed=True, prim_func=None, ledger=vec_ledger),
+    )
+    sem_mm = PyTorchSemanticAnalyzer().analyze_source(
+        "import torch\n"
+        "def demo(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:\n"
+        "    return torch.matmul(a, b)\n",
+        entry_name="demo",
+    )
+    ok_both_vec, err_both_vec = marathon._validate_stage0_hybrid_track_b(
+        hybrid_mod,
+        spec,
+        entrypoint="demo",
+        worktree=tmp_path,
+        env_file=None,
+        semantics=sem_mm,
+    )
+    assert ok_both_vec is False
+    assert "missing_cube_engine_primitives" in err_both_vec
+
+    monkeypatch.setattr(
+        marathon,
+        "run_stage_a_static",
+        lambda *_a, **_kw: StageAResult(passed=True, prim_func=None, ledger=cube_ledger),
+    )
+    ok_ta_cube, err_ta_cube = marathon._validate_stage0_hybrid_track_b(
+        hybrid_mod,
+        spec,
+        entrypoint="demo",
+        worktree=tmp_path,
+        env_file=None,
+        semantics=sem_mm,
+    )
+    assert ok_ta_cube is True, err_ta_cube
+
+
+def test_scoped_mixed_gm_store_multiline_define_and_launcher_min_caps() -> None:
+    """Scope mixed GM stores per function, unfold multiline #define, and parse std::min caps."""
+    sibling_safe = (
+        'extern "C" __global__ __vector__ void k1(\n'
+        "    __gm__ float* __restrict__ out, __ubuf__ float* u) {\n"
+        "    asc_copy_ub2gm_align(out, u, 128);\n"
+        "}\n"
+        'extern "C" __global__ __vector__ void k2(__gm__ float* out) {\n'
+        "    out[0] = 1.0f;\n"
+        "}\n"
+    )
+    assert _check_custom_kernel_redlines(sibling_safe) == []
+
+    stride_same_name = (
+        'extern "C" __global__ __vector__ void k_stride(\n'
+        "    __gm__ float* out, __gm__ float* idx, __ubuf__ float* u) {\n"
+        "    asc_copy_ub2gm_align(out + 1 * 4, u, 128);\n"
+        "    idx[0] = 2.0f;\n"
+        "}\n"
+    )
+    assert _check_custom_kernel_redlines(stride_same_name) == []
+
+    auto_alias_mixed = (
+        'extern "C" __global__ __vector__ void k_auto(\n'
+        "    __gm__ float* __restrict__ out, __ubuf__ float* u) {\n"
+        "    auto* p = out + 64;\n"
+        "    asc_copy_ub2gm_align(out, u, 128);\n"
+        "    p[0] = 0.0f;\n"
+        "}\n"
+        "void unrelated_flush(__gm__ float* q) { dcci(q); }\n"
+    )
+    assert any(
+        "mixed_scalar_and_mte3_gm_store" in err
+        for err in _check_custom_kernel_redlines(auto_alias_mixed)
+    )
+
+    callee_flushed = (
+        "void helper_flush(__gm__ float* q) { dcci(q); }\n"
+        'extern "C" __global__ __vector__ void k_ok(\n'
+        "    __gm__ float* __restrict__ out, __ubuf__ float* u) {\n"
+        "    auto* p = out + 64;\n"
+        "    asc_copy_ub2gm_align(out, u, 128);\n"
+        "    p[0] = 0.0f;\n"
+        "    helper_flush(out);\n"
+        "}\n"
+    )
+    assert _check_custom_kernel_redlines(callee_flushed) == []
+
+    macro_cpp = (
+        "#define BASE_W 32\n"
+        "#define WIDE_W \\\n"
+        "    (BASE_W + 16)\n"
+        'extern "C" __global__ __vector__ void k(__gm__ half* x) {}\n'
+        "void launch(__gm__ half* x, int rows, void* stream) {\n"
+        "    const auto blocks = std::min(WIDE_W, rows);\n"
+        "    k<<<blocks, nullptr, stream>>>(x);\n"
+        "}\n"
+    )
+    consts = _resolve_cpp_consts(macro_cpp)
+    assert consts["WIDE_W"] == 48
+    assert _parse_cce_launch_block_dim(macro_cpp, consts) == 48

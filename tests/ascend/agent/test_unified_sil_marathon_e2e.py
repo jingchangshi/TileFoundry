@@ -713,6 +713,8 @@ def test_multi_round_marathon_portfolio_kb_cost_oracle_non_ar_mla(
         steady_state_ii=24,
         pipe_cycles={"AIV0.PIPE_V": 48},
         waterlines={},
+        grid_blocks=4,
+        wave_occupancy=0.25,
     )
     parent = BeamCandidate(
         candidate_id=f"{op_name}_seed",

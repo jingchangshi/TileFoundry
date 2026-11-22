@@ -470,6 +470,53 @@ def _load_compare_tensors():
 _COMPARE_TENSORS = _load_compare_tensors()
 
 
+def _format_nonfinite_diagnostic(actual: object, golden: object) -> str:
+    """Summarize non-finite NaN or Inf mismatches when numerical diff metrics are zero."""
+    import torch
+
+    if not isinstance(actual, torch.Tensor) or not isinstance(golden, torch.Tensor):
+        return ""
+    if actual.shape != golden.shape or actual.numel() == 0:
+        return ""
+    if not actual.is_floating_point():
+        return ""
+    with torch.no_grad():
+        act = actual.detach().cpu()
+        gold = golden.detach().cpu()
+        nan_act = torch.isnan(act)
+        nan_gold = torch.isnan(gold)
+        nan_diff = nan_act != nan_gold
+        if bool(nan_diff.any().item()):
+            first_coord = torch.nonzero(nan_diff, as_tuple=False)[0].tolist()
+            act_nan_cnt = int(nan_act.sum().item())
+            gold_nan_cnt = int(nan_gold.sum().item())
+            return (
+                f"NaN position mismatch (actual_nan={{act_nan_cnt}}/{{act.numel()}}, "
+                f"golden_nan={{gold_nan_cnt}}/{{gold.numel()}}, first_coord={{first_coord}})"
+            )
+        inf_act = torch.isinf(act)
+        inf_gold = torch.isinf(gold)
+        inf_pos_diff = inf_act != inf_gold
+        both_inf = inf_act & inf_gold
+        if bool(both_inf.any().item()):
+            inf_sign_diff = both_inf.clone()
+            inf_sign_diff[both_inf] = torch.sign(act[both_inf].float()) != torch.sign(
+                gold[both_inf].float()
+            )
+            inf_diff = inf_pos_diff | inf_sign_diff
+        else:
+            inf_diff = inf_pos_diff
+        if bool(inf_diff.any().item()):
+            first_coord = torch.nonzero(inf_diff, as_tuple=False)[0].tolist()
+            act_inf_cnt = int(inf_act.sum().item())
+            gold_inf_cnt = int(inf_gold.sum().item())
+            return (
+                f"Inf mismatch (actual_inf={{act_inf_cnt}}/{{act.numel()}}, "
+                f"golden_inf={{gold_inf_cnt}}/{{gold.numel()}}, first_coord={{first_coord}})"
+            )
+    return ""
+
+
 def compare_case_result(
     *,
     case_id: str,
@@ -504,6 +551,10 @@ def compare_case_result(
     msg = res.error_msg or (
         f"MERE={{res.mere:.6e}}, MARE={{res.mare:.6e}}, max_diff={{res.max_diff:.6e}}"
     )
+    if not bool(res.passed):
+        diag = _format_nonfinite_diagnostic(actual, golden)
+        if diag and diag not in msg:
+            msg = f"{{diag}}; raw={{msg}}" if msg else diag
     return SimpleNamespace(passed=bool(res.passed), message=msg)
 '''
 
@@ -928,7 +979,9 @@ async def run_l0_l1_round_filter(
             passers.append((idx, cid, cur_snippet, patched, stage_a, repaired, attempt))
 
     if len(passers) > top_k:
-        rank_input = [(cid, patched, stage_a) for _idx, cid, _snip, patched, stage_a, _rep, _att in passers]
+        rank_input = [
+            (cid, patched, stage_a) for _idx, cid, _snip, patched, stage_a, _rep, _att in passers
+        ]
         ranked_pairs = list(stage_a_cost_ranker(rank_input))
         pred_by_id: dict[str, float] = {}
         order_by_id: dict[str, int] = {}
@@ -946,22 +999,13 @@ async def run_l0_l1_round_filter(
             ),
         )
         kept_passers = sorted_passers[:top_k]
-        for idx, cid, cur_snippet, patched, stage_a, repaired, _att in sorted_passers[top_k:]:
-            pred_us = pred_by_id.get(cid, float("inf"))
-            results_by_idx[idx] = L0L1CandidateCheck(
-                candidate_id=cid,
-                passed=False,
-                failed_tier="cost_prescreen",
-                patched_module_source=patched,
-                snippet_source=cur_snippet,
-                repaired=repaired,
-                stage_a=stage_a,
-                stage_b=None,
-                error_message=f"cost_prescreen_pruned:pred_us={pred_us:.2f}",
-            )
+        reserve_passers = sorted_passers[top_k:]
     else:
+        pred_by_id = {}
         kept_passers = passers
+        reserve_passers = []
 
+    passed_l1 = 0
     if kept_passers:
         stage_b_checks = await asyncio.gather(
             *(
@@ -971,6 +1015,36 @@ async def run_l0_l1_round_filter(
         )
         for (idx, *_rest), chk in zip(kept_passers, stage_b_checks):
             results_by_idx[idx] = chk
+            if chk.passed:
+                passed_l1 += 1
+
+    if reserve_passers:
+        for cursor, (idx, cid, cur_snippet, patched, stage_a, repaired, attempt) in enumerate(
+            reserve_passers
+        ):
+            if passed_l1 >= top_k:
+                for rem_idx, rem_cid, rem_snip, rem_patched, rem_sa, rem_rep, _ in reserve_passers[
+                    cursor:
+                ]:
+                    pred_us = pred_by_id.get(rem_cid, float("inf"))
+                    results_by_idx[rem_idx] = L0L1CandidateCheck(
+                        candidate_id=rem_cid,
+                        passed=False,
+                        failed_tier="cost_prescreen",
+                        patched_module_source=rem_patched,
+                        snippet_source=rem_snip,
+                        repaired=rem_rep,
+                        stage_a=rem_sa,
+                        stage_b=None,
+                        error_message=f"cost_prescreen_pruned:pred_us={pred_us:.2f}",
+                    )
+                break
+            chk = await _run_stage_b_and_repairs(
+                cid, cur_snippet, patched, stage_a, repaired, attempt
+            )
+            results_by_idx[idx] = chk
+            if chk.passed:
+                passed_l1 += 1
 
     return [results_by_idx[i] for i in range(len(candidates))]
 

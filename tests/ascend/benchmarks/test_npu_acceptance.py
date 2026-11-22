@@ -676,3 +676,30 @@ def test_target_operator_full_cannbench_contract() -> None:
             recorder,
             l3_contract.GENERIC_NODE,
         )
+        kernel_cache = getattr(mod, "_KERNEL_CACHE", None)
+        if len(harness.cases) >= 10 and isinstance(kernel_cache, dict):
+            max_expected_regimes = max(6, len(harness.cases) // 2)
+            if len(kernel_cache) > max_expected_regimes:
+                detail = (
+                    f"volatile _KERNEL_CACHE keys bloated cache to {len(kernel_cache)} "
+                    f"entries across {len(harness.cases)} cases "
+                    f"(limit={max_expected_regimes})"
+                )
+                last_case_id = str(harness.cases[-1].case_num)
+                failure = l3_contract.comparison_failure(
+                    node=l3_contract.GENERIC_NODE,
+                    case_id=last_case_id,
+                    role="candidate",
+                    comparator="kernel_cache_contract",
+                    references=("regime_budget",),
+                    comparisons=({"output": 0, "passed": False, "message": detail},),
+                    detail=detail,
+                )
+                recorder.case_finished(
+                    l3_contract.GENERIC_NODE,
+                    last_case_id,
+                    "failed",
+                    detail,
+                    failure=failure,
+                )
+                raise l3_contract.ClassifiedTestFailure(detail)

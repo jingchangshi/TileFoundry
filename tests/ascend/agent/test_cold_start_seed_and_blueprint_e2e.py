@@ -46,9 +46,12 @@ from tilefoundry_ascend.agent.campaign.marathon import (
     run_operator_marathon,
 )
 from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
+    GoldenEntrypointContract,
     OracleAccuracyResult,
     SeedSynthesisOutcome,
+    Stage0StaticValidatorFactory,
     prepare_operator_seed_or_takeover,
+    select_fallback_track_from_semantics,
     select_initial_track_from_semantics,
 )
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
@@ -70,6 +73,7 @@ from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirBlueprintPacket
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger, ScopeWaterline
 from tilefoundry_ascend.ascend.sil import CasePhysicsRatios
 from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
+    PyTorchOpSemantics,
     PyTorchSemanticAnalyzer,
     RepresentativeCase,
 )
@@ -204,8 +208,10 @@ kernel = exp
 _TRACKB_SEED_MODULE = '''
 """Synthesized Track-B CCE C++20 gather kernel."""
 
+_KERNEL_CACHE: dict[tuple[object, ...], object] = {}
+
 EXP_TRACKB_CU = """
-#include <tl_templates/ascend/kernel_entry.h>
+#include <tl_templates/ascend/common.h>
 __global__ void gather_kernel() {}
 """
 
@@ -213,6 +219,11 @@ __global__ void gather_kernel() {}
 def _select_exp_config(M: int = 1024, D: int = 1024, tl_dtype: str = "float16") -> dict[str, object]:
     """Select the Track-B translation unit for one regime."""
     return {"pass_configs": {}, "compile_flags": [], "trackb_symbol": "EXP_TRACKB_CU"}
+
+
+def _get_kernel(M: int = 1024, D: int = 1024) -> object:
+    key = (M, D)
+    return _KERNEL_CACHE.get(key)
 
 
 def exp(x, index):
@@ -269,7 +280,10 @@ def _always_accept(source: str, track: str) -> tuple[bool, str]:
 
 def _accept_any_stage0(
     regime_specs: Sequence[RegimeTargetSpec],
+    *,
+    semantics: object | None = None,
 ) -> Callable[[str, str], tuple[bool, str]]:
+    _ = (regime_specs, semantics)
     return _always_accept
 
 
@@ -308,9 +322,7 @@ def _prepare(
     existing_module_path: Path | None = None,
     force_cold_start: bool = False,
     max_seed_attempts: int = 4,
-    l0_l1_validator_factory: Callable[
-        [tuple[RegimeTargetSpec, ...]], Callable[[str, str], tuple[bool, str]]
-    ] = _accept_any_stage0,
+    l0_l1_validator_factory: Stage0StaticValidatorFactory = _accept_any_stage0,
     oracle_accuracy_validator: Callable[[str], OracleAccuracyResult] = _accept_oracle,
 ) -> SeedSynthesisOutcome:
     return asyncio.run(
@@ -365,9 +377,12 @@ def _install_accepting_gates(
         entrypoint: str,
         worktree: Path,
         env_file: Path | None,
+        entrypoint_contract: GoldenEntrypointContract | None = None,
+        semantics: PyTorchOpSemantics | None = None,
     ) -> Callable[[str, str], tuple[bool, str]]:
         assert regime_specs
         assert entrypoint == "exp"
+        _ = (worktree, env_file, entrypoint_contract, semantics)
 
         def _validate(module_source: str, track: str) -> tuple[bool, str]:
             return True, ""
@@ -422,7 +437,8 @@ def test_select_initial_track_prefers_trackb_for_wide_stride_reduction() -> None
     ratios = (analyzer.compute_case_ratios(semantics, case),)
     assert ratios[0].stride_ratio > 1.0
     assert ratios[0].working_set_sram_ratio > 1.0
-    assert select_initial_track_from_semantics(semantics, ratios) == "cce_trackb"
+    assert select_initial_track_from_semantics(semantics, ratios) == "tilelang_dsl"
+    assert select_fallback_track_from_semantics(semantics, ratios) == "cce_trackb"
 
 
 def test_select_initial_track_keeps_tilelang_for_elementwise_exp() -> None:
@@ -438,7 +454,10 @@ def test_prepare_seed_cold_start_synthesizes_validated_module() -> None:
 
     def _recording_factory(
         regime_specs: Sequence[RegimeTargetSpec],
+        *,
+        semantics: object | None = None,
     ) -> Callable[[str, str], tuple[bool, str]]:
+        _ = semantics
         factory_regime_tags.append({regime.regime_tag for regime in regime_specs})
         return _always_accept
 
@@ -530,7 +549,10 @@ def test_prepare_seed_incumbent_takeover_skips_generation(tmp_path: Path) -> Non
 
     def _forbid_static_factory(
         regime_specs: Sequence[RegimeTargetSpec],
+        *,
+        semantics: object | None = None,
     ) -> Callable[[str, str], tuple[bool, str]]:
+        _ = (regime_specs, semantics)
         raise AssertionError("incumbent takeover must not build Stage-0 gates")
 
     def _forbid_oracle(module_source: str) -> OracleAccuracyResult:
@@ -586,7 +608,10 @@ def test_prepare_seed_bounded_loop_reports_failed_attempts() -> None:
 
     def _reject_factory(
         regime_specs: Sequence[RegimeTargetSpec],
+        *,
+        semantics: object | None = None,
     ) -> Callable[[str, str], tuple[bool, str]]:
+        _ = semantics
         assert {regime.regime_tag for regime in regime_specs} == _EXP_SEMANTIC_REGIME_TAGS
         return _reject_static
 
@@ -656,7 +681,10 @@ def test_prepare_seed_timeout_after_rejection_keeps_last_candidate() -> None:
 
     def _factory(
         regime_specs: Sequence[RegimeTargetSpec],
+        *,
+        semantics: object | None = None,
     ) -> Callable[[str, str], tuple[bool, str]]:
+        _ = (regime_specs, semantics)
         return _reject_once
 
     outcome = _prepare(
@@ -830,8 +858,11 @@ def test_stage0_static_validator_rejects_cce_forbidden_tokens(tmp_path: Path) ->
         env_file=None,
     )
     source = (
-        '_TU = """\n#include <tl_templates/ascend/kernel_entry.h>\n__global__ void k() {}\n"""\n'
+        "_KERNEL_CACHE: dict[tuple[object, ...], object] = {}\n"
+        '_TU = """\n#include <tl_templates/ascend/common.h>\n__global__ void k() {}\n"""\n'
         "_DEAD = 'TPipe'\n\n"
+        "def _get_kernel(key: tuple[object, ...]) -> object:\n"
+        "    return _KERNEL_CACHE.get(key)\n\n"
         "def exp(x):\n"
         "    return x\n\n"
         "kernel = exp\n"
@@ -1268,9 +1299,14 @@ def test_marathon_cli_exposes_cold_start_prescreen_and_target_file_flags() -> No
 
     defaults = parser.parse_args(["run", "--operator", "exp"])
     assert defaults.cold_start is False
-    assert defaults.enable_tilesize_prescreen is False
+    assert defaults.enable_tilesize_prescreen is True
     assert defaults.cost_prescreen_top_k is None
     assert defaults.target_file is None
+
+    disabled = parser.parse_args(
+        ["run", "--operator", "exp", "--disable-tilesize-prescreen"]
+    )
+    assert disabled.enable_tilesize_prescreen is False
 
 
 def test_campaign_runner_cli_exposes_prescreen_top_k() -> None:
@@ -1844,8 +1880,10 @@ def test_trackb_round_evidence_persists_blueprint_observation_and_provenance(
 
 
 _RENDER_TRACKB_SEED_MODULE = '''
+_KERNEL_CACHE: dict[tuple[object, ...], object] = {}
+
 EXP_TRACKB_CU = """
-#include <tl_templates/ascend/kernel_entry.h>
+#include <tl_templates/ascend/common.h>
 __global__ void gather_kernel() {}
 """
 
@@ -1861,6 +1899,11 @@ def _render_trackb_tu(**dims: object) -> str:
     rows = int(dims.get("M", 0))
     width = int(dims.get("D", 0))
     return base + "\\n// launch M=" + str(rows) + " D=" + str(width) + "\\n"
+
+
+def _get_kernel(M: int = 1024, D: int = 1024) -> object:
+    key = (M, D)
+    return _KERNEL_CACHE.get(key)
 
 
 def exp(x, index):
@@ -1938,8 +1981,10 @@ def test_stage0_trackb_validator_instantiates_each_regime_before_gates(
         *,
         case_ratios: CasePhysicsRatios | None,
         freedom_mask: object | None = None,
+        require_hardware_dma: bool = False,
+        require_cube_engine: bool = False,
     ) -> StageAResult:
-        _ = freedom_mask
+        _ = (freedom_mask, require_hardware_dma, require_cube_engine)
         evaluated.append((cpp_source, case_ratios))
         return StageAResult(passed=True, prim_func=None, ledger=None)
 
@@ -1989,8 +2034,16 @@ def test_stage0_trackb_validator_aggregates_every_regime_failure(
         *,
         case_ratios: CasePhysicsRatios | None,
         freedom_mask: object | None = None,
+        require_hardware_dma: bool = False,
+        require_cube_engine: bool = False,
     ) -> StageAResult:
-        _ = (cpp_source, case_ratios, freedom_mask)
+        _ = (
+            cpp_source,
+            case_ratios,
+            freedom_mask,
+            require_hardware_dma,
+            require_cube_engine,
+        )
         return StageAResult(
             passed=False,
             prim_func=None,
@@ -2110,3 +2163,49 @@ def test_marathon_passes_seed_blueprints_and_topology_axes_to_runner(
     assert captured["regime_blueprints"] == packets
     assert captured["topology_axes"] == seed_outcome.semantics.base_axes
     assert captured["regime_specs"] == seed_outcome.regime_specs
+
+
+def test_prepare_seed_pivots_to_trackb_after_oracle_l3_failures() -> None:
+    """Oracle L3 candidate failures count toward Track-A budget and pivot cleanly."""
+    backend = _ScriptedBackend([_SEED_MODULE, _SEED_MODULE, _SEED_MODULE, _TRACKB_SEED_MODULE])
+    seen_tracks: list[str] = []
+
+    def _recording_static_factory(
+        regime_specs: Sequence[RegimeTargetSpec],
+        *,
+        semantics: object | None = None,
+    ) -> Callable[[str, str], tuple[bool, str]]:
+        _ = (regime_specs, semantics)
+
+        def _validate(src: str, track: str) -> tuple[bool, str]:
+            _ = src
+            seen_tracks.append(track)
+            return True, ""
+
+        return _validate
+
+    oracle_calls = 0
+
+    def _fail_tracka_then_pass(module_source: str) -> OracleAccuracyResult:
+        nonlocal oracle_calls
+        oracle_calls += 1
+        if oracle_calls <= 3:
+            return OracleAccuracyResult(
+                passed=False,
+                error_message=f"max_abs_err=0.5 on attempt {oracle_calls}",
+                l3_state="failed",
+                failure_kind="candidate",
+            )
+        return _accept_oracle(module_source)
+
+    outcome = _prepare(
+        golden_source=_EXP_GOLDEN,
+        backend=backend,
+        max_seed_attempts=6,
+        l0_l1_validator_factory=_recording_static_factory,
+        oracle_accuracy_validator=_fail_tracka_then_pass,
+    )
+    assert outcome.initial_track == "cce_trackb"
+    assert outcome.attempts_used == 4
+    assert seen_tracks == ["tilelang_dsl", "tilelang_dsl", "tilelang_dsl", "cce_trackb"]
+    assert "CCE C++20" in backend.requests[3].system_prompt

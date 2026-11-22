@@ -17,9 +17,10 @@ import sys
 import tempfile
 import textwrap
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import TypeVar
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
@@ -108,12 +109,16 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
     evaluate_ascendc_candidate,
+    resolve_trackb_compile_flags,
     run_stage_a_static,
     run_stage_b_ascendc_compile,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
+    AgyCliLLMBackend,
     GenerationRequest,
     KernelLLMBackend,
+    OpenAICompatHTTPBackend,
+    SubprocessCliTemplateBackend,
     create_llm_backend_from_env,
     extract_creative_payload,
     extract_python_dsl,
@@ -143,6 +148,7 @@ from tilefoundry_ascend.ascend.cost_model import (
     CostFeatures,
     HybridAscendCostModel,
     build_cost_features_from_ledger,
+    topology_bucket_for_axes,
 )
 from tilefoundry_ascend.ascend.cost_model.experience_lake import (
     CandidateArtifactRecord,
@@ -158,7 +164,10 @@ from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
     HirRooflineSummary,
     compile_hir_blueprint,
 )
-from tilefoundry_ascend.ascend.passes.observation_space import ObservationVector5D
+from tilefoundry_ascend.ascend.passes.observation_space import (
+    ObservationVector5D,
+    compute_transfer_inflation_ratio,
+)
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
 )
@@ -169,6 +178,7 @@ from tilefoundry_ascend.ascend.schedule.regime_solver import (
 )
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
 from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
+    PyTorchOpSemantics,
     PyTorchSemanticAnalyzer,
     RepresentativeCase,
 )
@@ -178,10 +188,11 @@ from tilefoundry_ascend.ascend.sil.schema import (
     TopologyAxes,
 )
 from tilefoundry_ascend.ascend.sil.verifier import verify_source_against_facets
-from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS, AscendTarget
+from tilefoundry_ascend.ascend.target import AscendTarget
 from tilefoundry_ascend.ascend.templates.registry import relax_facets_for_bottleneck
 
 logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 def _is_occupancy_blocked_env(failure_kind: str, blocked_env_category: str) -> bool:
@@ -775,6 +786,105 @@ def _norm_flag_seq(raw: object) -> list[str]:
     return [text] if text else []
 
 
+def _load_module_and_run_selector(
+    file_path: Path,
+    regime_spec: RegimeTargetSpec,
+    dims: Mapping[str, object] | None = None,
+) -> tuple[object, dict[str, object], dict[str, object], list[str], str, dict[str, object]]:
+    spec = importlib.util.spec_from_file_location("_tf_resolve_cfg", str(file_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load module spec from {file_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    context: dict[str, object] = dict(regime_spec.sample_builder_kwargs)
+    for h_key, h_val in regime_spec.representative_hir_dims.items():
+        mapped = _HIR_DIM_ALIASES.get(str(h_key), str(h_key))
+        if mapped not in context:
+            context[mapped] = h_val
+    if dims:
+        for d_key, d_val in dims.items():
+            mapped = _HIR_DIM_ALIASES.get(str(d_key), str(d_key))
+            context[mapped] = d_val
+    if "half_dim" not in context and isinstance(context.get("d_dim"), int):
+        context["half_dim"] = max(1, int(context["d_dim"]) // 2)
+
+    pass_configs: dict[str, object] = {}
+    compile_flags: list[str] = []
+    combine_kwargs: dict[str, object] = {}
+    selector_name = regime_spec.config_selector_fn
+    if not (selector_name and callable(getattr(mod, selector_name, None))):
+        for cand_sym in regime_spec.editable_symbols:
+            if cand_sym.startswith("_select_") and callable(getattr(mod, cand_sym, None)):
+                selector_name = cand_sym
+                break
+    if selector_name and callable(getattr(mod, selector_name, None)):
+        selector_fn = getattr(mod, selector_name)
+        sel_args = _filter_callable_kwargs(selector_fn, context)
+        sel_out = selector_fn(**sel_args)
+        if isinstance(sel_out, Mapping):
+            raw_pc = sel_out.get("pass_configs")
+            if isinstance(raw_pc, Mapping):
+                for k, v in raw_pc.items():
+                    if str(k) == "tl.device_compile_flags":
+                        for fl in _norm_flag_seq(v):
+                            if fl not in compile_flags:
+                                compile_flags.append(fl)
+                    else:
+                        pass_configs[str(k)] = v
+            elif raw_pc is not None:
+                for fl in _norm_flag_seq(raw_pc):
+                    if fl not in compile_flags:
+                        compile_flags.append(fl)
+            for fl in _norm_flag_seq(sel_out.get("compile_flags")):
+                if fl not in compile_flags:
+                    compile_flags.append(fl)
+            for k, v in sel_out.items():
+                if k not in (
+                    "pass_configs",
+                    "compile_flags",
+                    "builder_kwargs",
+                    "combine_kwargs",
+                ):
+                    context[str(k)] = v
+            raw_bk = sel_out.get("builder_kwargs")
+            if isinstance(raw_bk, Mapping):
+                for k, v in raw_bk.items():
+                    context[str(k)] = v
+            raw_ck = sel_out.get("combine_kwargs")
+            if isinstance(raw_ck, Mapping):
+                combine_kwargs = {str(k): v for k, v in raw_ck.items()}
+    return mod, context, pass_configs, compile_flags, selector_name, combine_kwargs
+
+
+def _resolve_selector_compile_flags(
+    module_source: str,
+    regime_spec: RegimeTargetSpec,
+    dims: Mapping[str, object] | None = None,
+) -> tuple[str, ...]:
+    """Invoke regime config selector if present and return its compile flags."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="tf_resolve_flags_") as tmp_dir:
+            tmp_file = Path(tmp_dir) / "module_src.py"
+            tmp_file.write_text(module_source, encoding="utf-8")
+            _, _, _, compile_flags, _, _ = _load_module_and_run_selector(
+                tmp_file, regime_spec, dims=dims
+            )
+            return tuple(compile_flags)
+    except (
+        SyntaxError,
+        AttributeError,
+        ImportError,
+        KeyError,
+        NameError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return ()
+
+
 def resolve_regime_config(
     module_source_or_path: str | Path,
     regime_spec: RegimeTargetSpec,
@@ -796,70 +906,9 @@ def resolve_regime_config(
             src_text = raw_str
 
     def _load_and_resolve(file_path: Path) -> ResolvedRegimeConfig:
-        spec = importlib.util.spec_from_file_location("_tf_resolve_cfg", str(file_path))
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"Failed to load module spec from {file_path}")
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-
-        context: dict[str, object] = dict(regime_spec.sample_builder_kwargs)
-        for h_key, h_val in regime_spec.representative_hir_dims.items():
-            mapped = _HIR_DIM_ALIASES.get(str(h_key), str(h_key))
-            if mapped not in context:
-                context[mapped] = h_val
-        if dims:
-            for d_key, d_val in dims.items():
-                mapped = _HIR_DIM_ALIASES.get(str(d_key), str(d_key))
-                context[mapped] = d_val
-        if "half_dim" not in context and isinstance(context.get("d_dim"), int):
-            context["half_dim"] = max(1, int(context["d_dim"]) // 2)
-
-        pass_configs: dict[str, object] = {}
-        compile_flags: list[str] = []
-        combine_kwargs: dict[str, object] = {}
-        selector_name = regime_spec.config_selector_fn
-        if not (selector_name and callable(getattr(mod, selector_name, None))):
-            for cand_sym in regime_spec.editable_symbols:
-                if cand_sym.startswith("_select_") and callable(getattr(mod, cand_sym, None)):
-                    selector_name = cand_sym
-                    break
-        if selector_name and callable(getattr(mod, selector_name, None)):
-            selector_fn = getattr(mod, selector_name)
-            sel_args = _filter_callable_kwargs(selector_fn, context)
-            sel_out = selector_fn(**sel_args)
-            if isinstance(sel_out, Mapping):
-                raw_pc = sel_out.get("pass_configs")
-                if isinstance(raw_pc, Mapping):
-                    for k, v in raw_pc.items():
-                        if str(k) == "tl.device_compile_flags":
-                            for fl in _norm_flag_seq(v):
-                                if fl not in compile_flags:
-                                    compile_flags.append(fl)
-                        else:
-                            pass_configs[str(k)] = v
-                elif raw_pc is not None:
-                    for fl in _norm_flag_seq(raw_pc):
-                        if fl not in compile_flags:
-                            compile_flags.append(fl)
-                for fl in _norm_flag_seq(sel_out.get("compile_flags")):
-                    if fl not in compile_flags:
-                        compile_flags.append(fl)
-                for k, v in sel_out.items():
-                    if k not in (
-                        "pass_configs",
-                        "compile_flags",
-                        "builder_kwargs",
-                        "combine_kwargs",
-                    ):
-                        context[str(k)] = v
-                raw_bk = sel_out.get("builder_kwargs")
-                if isinstance(raw_bk, Mapping):
-                    for k, v in raw_bk.items():
-                        context[str(k)] = v
-                raw_ck = sel_out.get("combine_kwargs")
-                if isinstance(raw_ck, Mapping):
-                    combine_kwargs = {str(k): v for k, v in raw_ck.items()}
-
+        mod, context, pass_configs, compile_flags, selector_name, combine_kwargs = (
+            _load_module_and_run_selector(file_path, regime_spec, dims=dims)
+        )
         builder_name = ""
         for cand in regime_spec.builder_candidates:
             if callable(getattr(mod, cand, None)):
@@ -1138,6 +1187,7 @@ def _assert_trackb_replacement_scoped(
     *,
     module_source: str,
     active_kernel: str | None,
+    allowed_added_units: Collection[str] = (),
 ) -> None:
     """Reject a full-TU replacement that edits frozen siblings or shared helpers."""
     orig_units = _trackb_units_by_name(orig_cpp)
@@ -1167,7 +1217,8 @@ def _assert_trackb_replacement_scoped(
             f"Track-B replacement for regime {regime_spec.regime_tag!r} drops units {dropped}; "
             "reply with SEARCH/REPLACE hunks or one bare C++ unit per changed function"
         )
-    added = sorted(set(new_units) - set(orig_units))
+    allowed_added = set(allowed_added_units)
+    added = sorted(set(new_units) - set(orig_units) - allowed_added)
     if added:
         raise ValueError(
             f"Track-B replacement for regime {regime_spec.regime_tag!r} adds units {added}; "
@@ -1892,20 +1943,58 @@ def patch_regime_into_module(
     patched = "".join(orig_lines)
     ast.parse(patched)
     if set(cand_slices) & set(regime_spec.trackb_symbols):
-        orig_trackb = _extract_trackb_cpp_source(module_source, regime_spec)
-        new_trackb = _extract_trackb_cpp_source(patched, regime_spec)
-        if orig_trackb is None or new_trackb is None:
-            raise ValueError(
-                f"Track-B symbols {sorted(set(cand_slices) & set(regime_spec.trackb_symbols))} "
-                "must be assigned a raw C++ string literal."
+        orig_lines_raw = module_source.splitlines(keepends=True)
+        for sym_name in sorted(set(cand_slices) & set(regime_spec.trackb_symbols)):
+            orig_hits = _find_top_level_str_assign_span(orig_tree, orig_lines_raw, {sym_name})
+            patched_tree = ast.parse(patched)
+            patched_lines = patched.splitlines(keepends=True)
+            new_hits = _find_top_level_str_assign_span(patched_tree, patched_lines, {sym_name})
+            if not orig_hits or not new_hits:
+                raise ValueError(
+                    f"Track-B symbols {sorted(set(cand_slices) & set(regime_spec.trackb_symbols))} "
+                    "must be assigned a raw C++ string literal."
+                )
+            orig_cpp = orig_hits[0][1]
+            cand_cpp = new_hits[0][1]
+            orig_units = _trackb_units_by_name(orig_cpp)
+            cand_units = _trackb_units_by_name(cand_cpp)
+            allowed_added_units: set[str] = set()
+            if cand_units and (set(orig_units) - set(cand_units)):
+                kernel_name = active_kernel or select_active_trackb_kernel(
+                    orig_cpp,
+                    regime_tag=regime_spec.regime_tag,
+                    module_source=module_source,
+                )
+                merged_cpp, _applied = splice_cpp_units_into_tu(
+                    orig_cpp,
+                    cand_cpp,
+                    active_kernel=kernel_name,
+                )
+                allowed_added_units = set(_trackb_units_by_name(merged_cpp)) - set(orig_units)
+                patched = _replace_trackb_constant(patched, sym_name, merged_cpp)
+                cand_cpp = merged_cpp
+            _assert_trackb_replacement_scoped(
+                orig_cpp,
+                cand_cpp,
+                regime_spec,
+                module_source=module_source,
+                active_kernel=active_kernel,
+                allowed_added_units=allowed_added_units,
             )
-        _assert_trackb_replacement_scoped(
-            orig_trackb[1],
-            new_trackb[1],
-            regime_spec,
-            module_source=module_source,
-            active_kernel=active_kernel,
-        )
+    if "_render_trackb_tu" in cand_slices:
+        seen_tags: set[str] = set()
+        for spec in (regime_spec, *sibling_specs):
+            if spec.regime_tag in seen_tags or not spec.trackb_symbols:
+                continue
+            seen_tags.add(spec.regime_tag)
+            spec_tb = _extract_trackb_cpp_source(patched, spec)
+            if spec_tb is not None:
+                _render_trackb_tu_from_module(
+                    patched,
+                    spec_tb[1],
+                    spec,
+                    require_renderer=True,
+                )
     return patched
 
 
@@ -2184,6 +2273,8 @@ class PerfTargetCampaignRunner:
         )
         self._l1_summary_cache: dict[tuple[str, str], BishengResourceSummary | None] = {}
         self._active_kernel_cache: dict[tuple[str, str], str | None] = {}
+        self._operator_semantics_cache: PyTorchOpSemantics | None = None
+        self._operator_semantics_loaded: bool = False
         self._active_incumbent_source: str = ""
         self._pending_promotion: PendingPromotion | None = None
         self._active_promotion: PendingPromotion | None = None
@@ -2359,10 +2450,10 @@ class PerfTargetCampaignRunner:
 
     @staticmethod
     def _invoke_with_optional_kwargs(
-        runner: Callable[..., object],
+        runner: Callable[..., _T],
         *args: object,
         **kwargs: object,
-    ) -> object:
+    ) -> _T:
         """Pass only the optional keywords an injected runner actually accepts."""
         try:
             signature = inspect.signature(runner)
@@ -2767,16 +2858,13 @@ class PerfTargetCampaignRunner:
         compiler_summary: BishengResourceSummary | None = None,
         roofline: HirRooflineSummary | None = None,
     ) -> StaticDynamicResidual:
-        """Compute StaticDynamicResidual while forwarding blueprint Roofline when supported."""
-        result = self._invoke_with_optional_kwargs(
-            compute_static_dynamic_residual,
+        """Compute StaticDynamicResidual while forwarding blueprint Roofline."""
+        return compute_static_dynamic_residual(
             ledger,
             telemetry,
             compiler_summary=compiler_summary,
             roofline=roofline,
         )
-        assert isinstance(result, StaticDynamicResidual)
-        return result
 
     def _observation_with_roofline(
         self,
@@ -2786,27 +2874,19 @@ class PerfTargetCampaignRunner:
         telemetry: Mapping[str, object] | None = None,
         roofline: HirRooflineSummary | None = None,
     ) -> ObservationVector5D:
-        """Build ObservationVector5D while forwarding blueprint Roofline when supported."""
-        obs = self._invoke_with_optional_kwargs(
-            ledger.to_observation_5d,
+        """Build ObservationVector5D while forwarding blueprint Roofline."""
+        return ledger.to_observation_5d(
             compiler_summary=compiler_summary,
             telemetry=telemetry,
             roofline=roofline,
         )
-        assert isinstance(obs, ObservationVector5D)
-        return obs
 
     def _roofline_arg_for_solver(
         self,
         roofline: HirRooflineSummary | None,
-    ) -> HirRooflineSummary | dict[str, object] | None:
-        """Forward HirRooflineSummary directly when accepted, else its mapping form."""
-        if roofline is None:
-            return None
-        param = inspect.signature(self._regime_solver.solve_regime).parameters.get("roofline")
-        if param is not None and "HirRooflineSummary" in str(param.annotation):
-            return roofline
-        return roofline.to_dict()
+    ) -> HirRooflineSummary | None:
+        """Forward HirRooflineSummary directly to the regime solver."""
+        return roofline
 
     def _get_backend(self) -> KernelLLMBackend:
         if self._backend is None:
@@ -2963,10 +3043,14 @@ class PerfTargetCampaignRunner:
                     )
         return ConstraintRelaxationMask.bottom()
 
-    def _compile_trackb_stage_b(self, cpp_source: str) -> StageBResult:
+    def _compile_trackb_stage_b(
+        self,
+        cpp_source: str,
+        selector_flags: Sequence[str] | str | None = None,
+    ) -> StageBResult:
         cann_root = _resolve_cann_root_from_env_file(self._env_file)
         bisheng_bin: str | None = None
-        flags = list(PURE_SIMDVF_UBUF_FLAGS)
+        flags = list(resolve_trackb_compile_flags(cpp_source, selector_flags))
         if cann_root is not None:
             cand_bin = cann_root / "bin" / "bisheng"
             if cand_bin.is_file():
@@ -2980,11 +3064,73 @@ class PerfTargetCampaignRunner:
             cann_root=cann_root,
         )
 
+    def _resolve_trackb_selector_flags(
+        self,
+        module_source: str,
+        regime_spec: RegimeTargetSpec,
+    ) -> tuple[str, ...]:
+        anchor_dims = (
+            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+        )
+        return _resolve_selector_compile_flags(module_source, regime_spec, dims=anchor_dims)
+
+    @staticmethod
+    def _ledger_has_cube_engine(ledger: ObjectivePhysicalLedger | None) -> bool:
+        if ledger is None:
+            return False
+        return (
+            int(ledger.pipe_cycles.get("AIC.PIPE_M", 0))
+            + int(ledger.pipe_cycles.get("AIC.CUBE", 0))
+        ) > 0
+
+    @staticmethod
+    def _ledger_has_hardware_dma(ledger: ObjectivePhysicalLedger | None) -> bool:
+        if ledger is None:
+            return False
+        return (
+            int(ledger.pipe_cycles.get("AIV0.PIPE_MTE2", 0))
+            + int(ledger.pipe_cycles.get("AIV1.PIPE_MTE2", 0))
+            + int(ledger.pipe_cycles.get("AIC.PIPE_MTE2", 0))
+        ) > 0
+
+    def _resolve_operator_semantics_for_gates(self) -> PyTorchOpSemantics | None:
+        if self._operator_semantics_loaded:
+            return self._operator_semantics_cache
+        self._operator_semantics_loaded = True
+        tasks_root = self._resolve_cannbench_tasks_root()
+        if tasks_root is None:
+            return None
+        try:
+            spec = CannbenchOpsRegistry(
+                tasks_root=tasks_root,
+                source_root=self._source_root,
+                pure_golden=bool(self._config.pure_golden),
+            ).resolve(self._config.operator_name)
+        except (FileNotFoundError, KeyError, ValueError):
+            return None
+        if not spec.golden_path.is_file():
+            return None
+        try:
+            golden_src = spec.golden_path.read_text(encoding="utf-8")
+            self._operator_semantics_cache = PyTorchSemanticAnalyzer().analyze_source(
+                golden_src,
+                entry_name=spec.entrypoint,
+                proto=spec.proto,
+            )
+        except (OSError, SyntaxError, ValueError):
+            self._operator_semantics_cache = None
+        return self._operator_semantics_cache
+
     def _default_l0_checker(
         self,
         module_source: str,
         regime_spec: RegimeTargetSpec,
     ) -> StageAResult:
+        op_semantics = self._resolve_operator_semantics_for_gates()
+        req_dma = bool(op_semantics is not None and not op_semantics.has_indirect_index)
+        req_cube = bool(op_semantics is not None and op_semantics.has_matmul)
+        is_hybrid = regime_spec.runtime_backend == "hybrid_trackb"
+        has_prim_func = _has_prim_func_builder(module_source, regime_spec.builder_candidates)
         tb_extracted = (
             _extract_trackb_cpp_source(module_source, regime_spec)
             if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
@@ -3001,6 +3147,8 @@ class PerfTargetCampaignRunner:
                 target=self._target,
                 enable_track_router=self._enable_track_router,
                 case_ratios=regime_spec.representative_case_ratios,
+                require_hardware_dma=req_dma,
+                require_cube_engine=req_cube,
             )
 
         anchor_dims = (
@@ -3038,13 +3186,11 @@ class PerfTargetCampaignRunner:
             var_bindings=var_bindings or None,
             enable_track_router=self._enable_track_router,
             case_ratios=regime_spec.representative_case_ratios,
+            require_hardware_dma=req_dma,
+            require_cube_engine=bool(req_cube and not (is_hybrid and tb_extracted is not None)),
         )
         if not primary_res.passed:
-            if (
-                regime_spec.runtime_backend == "hybrid_trackb"
-                and tb_extracted is not None
-                and not _has_prim_func_builder(module_source, regime_spec.builder_candidates)
-            ):
+            if is_hybrid and tb_extracted is not None and not has_prim_func:
                 active_mask = self._resolve_trackb_freedom_mask(regime_spec)
                 instantiated_tu = self._instantiate_trackb_tu(
                     module_source, tb_extracted[1], regime_spec
@@ -3055,6 +3201,8 @@ class PerfTargetCampaignRunner:
                     target=self._target,
                     enable_track_router=self._enable_track_router,
                     case_ratios=regime_spec.representative_case_ratios,
+                    require_hardware_dma=req_dma,
+                    require_cube_engine=req_cube,
                 )
             return primary_res
         combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
@@ -3070,6 +3218,8 @@ class PerfTargetCampaignRunner:
                 var_bindings=var_bindings or None,
                 enable_track_router=self._enable_track_router,
                 case_ratios=regime_spec.representative_case_ratios,
+                require_hardware_dma=req_dma,
+                require_cube_engine=False,
             )
             if not combine_res.passed:
                 return StageAResult(
@@ -3081,7 +3231,7 @@ class PerfTargetCampaignRunner:
                     error_message=f"combine_kernel({combine_fn}): {combine_res.error_message}",
                     elapsed_ms=primary_res.elapsed_ms + combine_res.elapsed_ms,
                 )
-        if regime_spec.runtime_backend == "hybrid_trackb" and tb_extracted is not None:
+        if is_hybrid and tb_extracted is not None:
             tb_sym, tb_cpp = tb_extracted
             active_mask = self._resolve_trackb_freedom_mask(regime_spec)
             instantiated_tu = self._instantiate_trackb_tu(module_source, tb_cpp, regime_spec)
@@ -3091,16 +3241,45 @@ class PerfTargetCampaignRunner:
                 target=self._target,
                 enable_track_router=self._enable_track_router,
                 case_ratios=regime_spec.representative_case_ratios,
+                require_hardware_dma=req_dma,
+                require_cube_engine=False,
             )
+            total_ms = primary_res.elapsed_ms + tb_res.elapsed_ms
             if not tb_res.passed:
                 return replace(
                     tb_res,
                     error_message=f"trackb_ascendc({tb_sym}): {tb_res.error_message}",
-                    elapsed_ms=primary_res.elapsed_ms + tb_res.elapsed_ms,
+                    elapsed_ms=total_ms,
+                )
+            if req_cube and not (
+                self._ledger_has_cube_engine(primary_res.ledger)
+                or self._ledger_has_cube_engine(tb_res.ledger)
+            ):
+                return replace(
+                    tb_res,
+                    passed=False,
+                    error_message=(
+                        f"trackb_ascendc({tb_sym}): missing_cube_engine_primitives: "
+                        "aggregate hybrid_trackb candidate has zero AIC.PIPE_M cycles"
+                    ),
+                    elapsed_ms=total_ms,
+                )
+            if req_dma and not (
+                self._ledger_has_hardware_dma(primary_res.ledger)
+                or self._ledger_has_hardware_dma(tb_res.ledger)
+            ):
+                return replace(
+                    tb_res,
+                    passed=False,
+                    error_message=(
+                        f"trackb_ascendc({tb_sym}): missing_hardware_dma_staging: "
+                        "aggregate hybrid_trackb candidate has zero PIPE_MTE2 cycles"
+                    ),
+                    elapsed_ms=total_ms,
                 )
             return replace(
                 tb_res,
-                elapsed_ms=primary_res.elapsed_ms + tb_res.elapsed_ms,
+                elapsed_ms=total_ms,
             )
         return primary_res
 
@@ -3121,6 +3300,9 @@ class PerfTargetCampaignRunner:
             instantiated_tu = self._instantiate_trackb_tu(
                 module_source, tb_extracted[1], regime_spec
             )
+            sel_flags = self._resolve_trackb_selector_flags(module_source, regime_spec)
+            if sel_flags:
+                return self._compile_trackb_stage_b(instantiated_tu, selector_flags=sel_flags)
             return self._compile_trackb_stage_b(instantiated_tu)
 
         anchor_dims = (
@@ -3161,6 +3343,11 @@ class PerfTargetCampaignRunner:
                 instantiated_tu = self._instantiate_trackb_tu(
                     module_source, tb_extracted[1], regime_spec
                 )
+                if resolved.compile_flags:
+                    return self._compile_trackb_stage_b(
+                        instantiated_tu,
+                        selector_flags=resolved.compile_flags,
+                    )
                 return self._compile_trackb_stage_b(instantiated_tu)
             return primary_b
         final_b = primary_b
@@ -3189,7 +3376,14 @@ class PerfTargetCampaignRunner:
         if regime_spec.runtime_backend == "hybrid_trackb" and tb_extracted is not None:
             tb_sym, tb_cpp = tb_extracted
             instantiated_tu = self._instantiate_trackb_tu(module_source, tb_cpp, regime_spec)
-            tb_b = self._compile_trackb_stage_b(instantiated_tu)
+            tb_b = (
+                self._compile_trackb_stage_b(
+                    instantiated_tu,
+                    selector_flags=resolved.compile_flags,
+                )
+                if resolved.compile_flags
+                else self._compile_trackb_stage_b(instantiated_tu)
+            )
             total_elapsed_sec = final_b.elapsed_sec + combine_elapsed_sec + tb_b.elapsed_sec
             if not tb_b.passed:
                 return replace(
@@ -3262,7 +3456,7 @@ class PerfTargetCampaignRunner:
                 module_path,
                 device_id=requested_device,
                 on_execution_started=on_execution_started,
-            )  # type: ignore[return-value]
+            )
         return self._invoke_with_optional_kwargs(
             run_l3_full_contract_via_agent_gates,
             operator_name=self._config.operator_name,
@@ -3271,7 +3465,7 @@ class PerfTargetCampaignRunner:
             env_file=self._env_file,
             device_id=requested_device,
             on_execution_started=on_execution_started,
-        )  # type: ignore[return-value]
+        )
 
     def _resume_l3_contract(
         self,
@@ -3289,7 +3483,7 @@ class PerfTargetCampaignRunner:
                 resume_run_id=pending.run_id,
                 device_id=pending.device_id or self._config.device_id,
                 on_execution_started=on_execution_started,
-            )  # type: ignore[return-value]
+            )
         return self._invoke_with_optional_kwargs(
             run_l3_full_contract_via_agent_gates,
             operator_name=self._config.operator_name,
@@ -3300,7 +3494,7 @@ class PerfTargetCampaignRunner:
             resume_execution_id=pending.execution_id,
             resume_run_id=pending.run_id,
             on_execution_started=on_execution_started,
-        )  # type: ignore[return-value]
+        )
 
     def _run_l4_cannbench(
         self,
@@ -3320,7 +3514,7 @@ class PerfTargetCampaignRunner:
                 resume_run_id=resume_run_id,
                 device_id=requested_device,
                 on_execution_started=on_execution_started,
-            )  # type: ignore[return-value]
+            )
         return self._invoke_with_optional_kwargs(
             run_l4_official_cannbench_via_agent_gates,
             operator_name=self._config.operator_name,
@@ -3331,7 +3525,7 @@ class PerfTargetCampaignRunner:
             resume_execution_id=resume_execution_id,
             resume_run_id=resume_run_id,
             on_execution_started=on_execution_started,
-        )  # type: ignore[return-value]
+        )
 
     def _is_regime_satisfied(
         self,
@@ -3680,6 +3874,28 @@ class PerfTargetCampaignRunner:
         except (OSError, ValueError) as exc:
             logger.debug("KB event shard append skipped: %s", exc)
 
+    def _resolve_case_roofline_metrics(
+        self,
+        regime_tag: str,
+        ledger: ObjectivePhysicalLedger | None,
+        telemetry: Mapping[str, object],
+    ) -> tuple[float, float, float]:
+        bp = self._regime_blueprints.get(regime_tag)
+        if bp is None:
+            return 0.0, 0.0, 0.0
+        roofline = bp.roofline
+        min_gm = float(roofline.min_gm_bytes)
+        comp_floor = float(roofline.compute_floor_us)
+        if ledger is not None and min_gm > 0.0:
+            inflation = compute_transfer_inflation_ratio(
+                ledger,
+                telemetry=telemetry,
+                roofline=roofline,
+            )
+        else:
+            inflation = 0.0
+        return min_gm, comp_floor, inflation
+
     def _record_surrogate_observations(
         self,
         *,
@@ -3800,6 +4016,15 @@ class PerfTargetCampaignRunner:
                 else {}
             )
             if self._experience_lake is not None:
+                bp_tag = anc.regime_tag if anc.regime_tag in self._regime_blueprints else eff_regime
+                obs_tel: dict[str, object] = {
+                    "dur_us": float(anc.cand_us),
+                    "measured_latency_us": float(anc.cand_us),
+                    **attach_msprof,
+                }
+                min_gm_bytes, compute_floor_us, transfer_inflation = (
+                    self._resolve_case_roofline_metrics(bp_tag, ledger, obs_tel)
+                )
                 try:
                     self._experience_lake.append_observation(
                         CaseObservationRecord(
@@ -3822,6 +4047,9 @@ class PerfTargetCampaignRunner:
                             projected_tiles=int(proj_wl.get("total_tiles", 0) or 0),
                             projected_gm_bytes=float(proj_wl.get("gm_bytes", 0.0) or 0.0),
                             projected_contig_bytes=int(proj_wl.get("contig_burst_bytes", 32768) or 32768),
+                            min_gm_bytes=min_gm_bytes,
+                            compute_floor_us=compute_floor_us,
+                            transfer_inflation_ratio=transfer_inflation,
                         )
                     )
                 except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -3984,6 +4212,13 @@ class PerfTargetCampaignRunner:
                 target=self._target,
             )
             if self._experience_lake is not None:
+                l4_tel: dict[str, object] = {
+                    "dur_us": elapsed_us,
+                    "measured_latency_us": elapsed_us,
+                }
+                min_gm_bytes, compute_floor_us, transfer_inflation = (
+                    self._resolve_case_roofline_metrics(rtag, ledger, l4_tel)
+                )
                 try:
                     self._experience_lake.append_observation(
                         CaseObservationRecord(
@@ -4004,6 +4239,9 @@ class PerfTargetCampaignRunner:
                             projected_tiles=int(proj_wl.get("total_tiles", 0) or 0),
                             projected_gm_bytes=float(proj_wl.get("gm_bytes", 0.0) or 0.0),
                             projected_contig_bytes=int(proj_wl.get("contig_burst_bytes", 32768) or 32768),
+                            min_gm_bytes=min_gm_bytes,
+                            compute_floor_us=compute_floor_us,
+                            transfer_inflation_ratio=transfer_inflation,
                         )
                     )
                 except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -4896,6 +5134,8 @@ class PerfTargetCampaignRunner:
         parent_global_score: float | None = None,
         min_speedup_gain: float = 0.01,
         min_score_gain: float = 0.05,
+        cand_compiler_summary: BishengResourceSummary | None = None,
+        roofline: HirRooflineSummary | None = None,
     ) -> tuple[bool, float]:
         """Evaluate whether a causal postcondition materialized with non-regressive gain."""
         if not res_all_passed or not ledger.is_legal or rolled_back:
@@ -4927,11 +5167,18 @@ class PerfTargetCampaignRunner:
         if not has_real_gain:
             return False, 0.0
 
+        resolved_comp = (
+            cand_compiler_summary
+            if cand_compiler_summary is not None
+            else compiler_summary_from_residual(cand_residual)
+        )
         post_ctx = build_predicate_context(
             ledger,
             features=features,
             residual=cand_residual,
+            compiler_summary=resolved_comp,
             prev_ledger=parent_ledger,
+            roofline=roofline,
         )
         prev_ns = post_ctx.setdefault("prev", {})
         if isinstance(prev_ns, dict):
@@ -6376,6 +6623,8 @@ class PerfTargetCampaignRunner:
             parent_ledger,
             features=parent_features,
             residual=parent_residual,
+            compiler_summary=parent_l1_summary,
+            roofline=blueprint_roofline,
             extra={
                 "topology_axes": parent_axes,
                 **_case_ratio_predicate_entries(regime_spec.representative_case_ratios),
@@ -6658,12 +6907,24 @@ class PerfTargetCampaignRunner:
                 )
             )
 
+        stagger_sec = (
+            1.5
+            if isinstance(
+                backend,
+                (AgyCliLLMBackend, OpenAICompatHTTPBackend, SubprocessCliTemplateBackend),
+            )
+            else 0.0
+        )
+
         async def _call_worker(
+            slot_idx: int,
             wid: str,
             wkind: str,
             rule: AscendCausalRule | None,
             req: GenerationRequest,
         ) -> tuple[str, str, AscendCausalRule | None, str | None, str, str, bool]:
+            if stagger_sec > 0.0 and slot_idx > 0:
+                await asyncio.sleep(float(slot_idx) * stagger_sec)
             try:
                 raw = await backend.generate(req)
             except (OSError, subprocess.SubprocessError, TimeoutError, RuntimeError, ConnectionError) as exc:
@@ -6686,7 +6947,10 @@ class PerfTargetCampaignRunner:
                 return wid, wkind, rule, None, "", f"llm_parse:{type(exc).__name__}:{exc}", False
 
         worker_replies = await asyncio.gather(
-            *(_call_worker(wid, wkind, rule, req) for wid, wkind, rule, req in worker_specs)
+            *(
+                _call_worker(slot_idx, wid, wkind, rule, req)
+                for slot_idx, (wid, wkind, rule, req) in enumerate(worker_specs)
+            )
         )
 
         raw_candidates: list[tuple[str, str]] = []
@@ -6722,15 +6986,20 @@ class PerfTargetCampaignRunner:
         l0_l1_checks: list[L0L1CandidateCheck] = []
         round_active_kernel = ""
         if raw_candidates:
-            prescreen_top_k = (
-                int(self._config.cost_prescreen_top_k)
+            prescreen_top_k: int | None = None
+            if self._config.enable_tilesize_prescreen:
                 if (
-                    self._config.enable_tilesize_prescreen
-                    and self._config.cost_prescreen_top_k is not None
+                    self._config.cost_prescreen_top_k is not None
                     and int(self._config.cost_prescreen_top_k) > 0
-                )
-                else None
-            )
+                ):
+                    prescreen_top_k = int(self._config.cost_prescreen_top_k)
+                elif self._config.cost_prescreen_top_k is None and len(raw_candidates) >= 3:
+                    active_bucket = topology_bucket_for_axes(parent_axes)
+                    if bool(
+                        self._cost_model.active_head0_spec_names(active_bucket)
+                        or self._cost_model.active_head0_spec_names("global")
+                    ):
+                        prescreen_top_k = 2
             stage_a_ranker = (
                 (
                     lambda passers: [
@@ -7222,6 +7491,8 @@ class PerfTargetCampaignRunner:
                     has_cand_msprof=bool(cached_cand_msprof),
                     cand_global_score=(res.surrogate_score if selected_stone is None else None),
                     parent_global_score=(best_result.surrogate_score if selected_stone is None else None),
+                    cand_compiler_summary=cand_comp_summary,
+                    roofline=blueprint_roofline,
                 )
                 self._tracker.record_outcome(
                     rule.rule_id,

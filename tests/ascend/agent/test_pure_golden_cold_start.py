@@ -409,8 +409,10 @@ def test_hybrid_trackb_stage0_validation_and_seed_synthesis(
         '''
         import torch
 
+        _KERNEL_CACHE: dict[tuple[object, ...], object] = {}
+
         OP_TRACKB_CU = """
-        #include <tl_templates/ascend/kernel_entry.h>
+        #include <tl_templates/ascend/common.h>
         __global__ void k() {}
         """
 
@@ -431,8 +433,11 @@ def test_hybrid_trackb_stage0_validation_and_seed_synthesis(
 
         def _get_kernel(M: int = 64, D: int = 128):
             import tilelang
-            prog = _build_gather_op_prim_func(M, D)
-            return tilelang.compile(prog, target="ascend"), OP_TRACKB_CU
+            key = (M, D)
+            if key not in _KERNEL_CACHE:
+                prog = _build_gather_op_prim_func(M, D)
+                _KERNEL_CACHE[key] = tilelang.compile(prog, target="ascend")
+            return _KERNEL_CACHE[key], OP_TRACKB_CU
 
         def gather_op(x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
             return _get_kernel(int(x.shape[0]), int(x.shape[1]))[0](x, index)
@@ -781,13 +786,23 @@ def test_seed_synthesizer_preserves_hybrid_trackb_and_typed_signature(
         kernel = attn_like
         '''
     )
-    backend = _ScriptedBackend([hybrid_seed])
+    backend = _ScriptedBackend(["def placeholder_a():\n    pass\n", "def placeholder_b():\n    pass\n", hybrid_seed])
     proto = {
         "inputs": [{"name": "q"}, {"name": "k"}, {"name": "v"}],
         "outputs": [{"name": "y", "dtype": ["float16"]}],
     }
 
     import hashlib
+
+    def _hybrid_only_validator(
+        rs: tuple[RegimeTargetSpec, ...],
+        *,
+        semantics: object | None = None,
+    ) -> Callable[[str, str], tuple[bool, str]]:
+        _ = semantics
+        if rs[0].runtime_backend == "tilelang_dsl":
+            return lambda _s, _t: (False, "Track-A static rejection forces hybrid fallback")
+        return lambda _s, _t: (True, "")
 
     outcome = asyncio.run(
         prepare_operator_seed_or_takeover(
@@ -798,7 +813,7 @@ def test_seed_synthesizer_preserves_hybrid_trackb_and_typed_signature(
             cases=cases,
             legacy_regime_specs=None,
             llm_backend=backend,
-            l0_l1_validator_factory=lambda _rs: (lambda _s, _t: (True, "")),
+            l0_l1_validator_factory=_hybrid_only_validator,
             oracle_accuracy_validator=lambda s: OracleAccuracyResult(
                 passed=True,
                 candidate_sha256=hashlib.sha256(s.encode("utf-8")).hexdigest(),
@@ -807,14 +822,15 @@ def test_seed_synthesizer_preserves_hybrid_trackb_and_typed_signature(
                 l3_state="passed",
             ),
             force_cold_start=True,
+            max_seed_attempts=4,
         )
     )
     assert outcome.mode == "cold_start"
     assert outcome.initial_track == "hybrid_trackb"
     assert all(r.runtime_backend == "hybrid_trackb" for r in outcome.regime_specs)
-    assert "def attn_like(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:" in backend.requests[0].system_prompt
-    assert "def _select_attn_like_" in backend.requests[0].system_prompt
-    assert "hybrid_trackb" in backend.requests[0].system_prompt
+    assert "def attn_like(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:" in backend.requests[2].system_prompt
+    assert "def _select_attn_like_" in backend.requests[2].system_prompt
+    assert "hybrid_trackb" in backend.requests[2].system_prompt
 
 
 def test_stage0_trackb_allows_ascendc_primitives_without_facet_locks(
@@ -850,8 +866,10 @@ def test_stage0_trackb_allows_ascendc_primitives_without_facet_locks(
         '''
         import torch
 
+        _KERNEL_CACHE: dict[tuple[object, ...], object] = {}
+
         SM_TRACKB_CU = """
-        #include <tl_templates/ascend/kernel_entry.h>
+        #include <tl_templates/ascend/common.h>
         __launch_bounds__(512)
         __global__ void sm_k(__gm__ float* x, __gm__ float* y) {
             __simd_vf__ void (*fn)() = nullptr;
@@ -871,7 +889,10 @@ def test_stage0_trackb_allows_ascendc_primitives_without_facet_locks(
             return trackb_src + "\\nvoid launch() { sm_k<<<1, 1, 1>>>(nullptr, nullptr); }\\n"
 
         def _get_kernel(**kwargs) -> object:
-            return object()
+            key = tuple(sorted(kwargs.items()))
+            if key not in _KERNEL_CACHE:
+                _KERNEL_CACHE[key] = object()
+            return _KERNEL_CACHE[key]
 
         def sm_op(x: torch.Tensor) -> torch.Tensor:
             return x
@@ -938,13 +959,17 @@ def test_trackb_entrypoint_purity_and_stage0_contract_with_compile_ascend() -> N
         import torch
         from tilelang.contrib.bisheng import compile_ascend
 
+        _KERNEL_CACHE: dict[tuple[object, ...], object] = {}
+
         VEC_OP_TRACKB_CU = dedent("""
             #include <tl_templates/ascend/common.h>
             __global__ __aicore__ __vector__ void k(__gm__ float* x) {}
         """)
 
         def _get_kernel() -> object:
-            return compile_ascend(VEC_OP_TRACKB_CU, target_format="so")
+            if "k" not in _KERNEL_CACHE:
+                _KERNEL_CACHE["k"] = compile_ascend(VEC_OP_TRACKB_CU, target_format="so")
+            return _KERNEL_CACHE["k"]
 
         def vec_op(x: torch.Tensor) -> torch.Tensor:
             if x.device.type != "npu":
@@ -980,7 +1005,7 @@ def test_trackb_entrypoint_purity_and_stage0_contract_with_compile_ascend() -> N
 
 
 def test_seed_module_abi_trackb_prompt_includes_compile_ascend_recipe() -> None:
-    """Verify Track-B prompt specifies raw TU literal, __vector__ attr, and compile_ascend."""
+    """Verify Track-B prompt specifies TU literal, headers, atomic cache, and compile_ascend."""
     prompt = _seed_module_abi(
         "softmax",
         (("d_dim", 128),),
@@ -993,6 +1018,99 @@ def test_seed_module_abi_trackb_prompt_includes_compile_ascend_recipe() -> None:
     assert '__mix__(1, 2)' in prompt
     assert 'SOFTMAX_TRACKB_CU = r"""' in prompt
     assert "torch.npu.current_stream().npu_stream" in prompt
+    assert "cube_inst.h" not in prompt
+    for hdr in CCE_CPP20_SURFACE.required_headers_or_imports:
+        assert hdr in prompt
+    assert "tf_ascend_so_cache" in prompt
+    assert "os.getpid()" in prompt
+    assert "os.replace(tmp_so, so_path)" in prompt
+
+
+def test_seed_module_abi_renders_per_regime_defaults_without_regime0_leak() -> None:
+    """Per-regime selectors and builders render their own defaults rather than regime-0."""
+    specs = (
+        RegimeTargetSpec(
+            regime_tag="small",
+            builder_candidates=("_build_norm_op_small_prim_func",),
+            sample_builder_kwargs={"M": 16, "D": 64, "tl_dtype": "float16"},
+            config_selector_fn="_select_norm_op_small_config",
+        ),
+        RegimeTargetSpec(
+            regime_tag="large",
+            builder_candidates=("_build_norm_op_large_prim_func",),
+            sample_builder_kwargs={"M": 4096, "D": 1024, "tl_dtype": "bfloat16"},
+            config_selector_fn="_select_norm_op_large_config",
+        ),
+    )
+    prompt = _seed_module_abi(
+        "norm_op",
+        _seed_parameter_specs(specs),
+        get_dialect_surface("tilelang_dsl"),
+        "tilelang_dsl",
+        regime_specs=specs,
+    )
+    assert (
+        "def _select_norm_op_small_config(D: int = 64, M: int = 16, tl_dtype: str = 'float16'"
+        in prompt
+    )
+    assert (
+        "def _select_norm_op_large_config(D: int = 1024, M: int = 4096, tl_dtype: str = 'bfloat16'"
+        in prompt
+    )
+    assert (
+        "def _build_norm_op_large_prim_func(D: int = 1024, M: int = 4096, tl_dtype: str = 'bfloat16'"
+        in prompt
+    )
+
+
+def test_extract_schema_driven_case_dims_gates_leaked_dims() -> None:
+    """Do not leak hc_mult, K, half_dim, dk, or dv onto unrelated 2D/3D cases."""
+    norm_dims = extract_schema_driven_case_dims(
+        {"case_id": 1, "input_shape": [[64, 128], [128]], "dtype": ["float16", "float16"]},
+        proto_inputs=[{"name": "x", "shape": "[M, D]"}, {"name": "gamma", "shape": "[D]"}],
+    )
+    for leaked in ("K", "half_dim", "dk", "dv", "hc_mult"):
+        assert leaked not in norm_dims
+
+    elem_3d_dims = extract_schema_driven_case_dims(
+        {
+            "case_id": 1,
+            "input_shape": [[2, 32, 128], [2, 32, 128], [128]],
+            "dtype": ["float16", "float16", "float16"],
+        },
+        proto_inputs=[{"name": "x1"}, {"name": "x2"}, {"name": "gamma"}],
+    )
+    for leaked in ("hc_mult", "K", "half_dim", "dk", "dv"):
+        assert leaked not in elem_3d_dims
+
+    mhc_dims = extract_schema_driven_case_dims(
+        {"case_id": 1, "input_shape": [[4, 8, 8]], "dtype": ["float32"]},
+        proto_inputs=[{"name": "comb", "shape": "[B, hc_mult, hc_mult]"}],
+    )
+    assert mhc_dims["hc_mult"] == 8
+
+    rope_dims = extract_schema_driven_case_dims(
+        {
+            "case_id": 1,
+            "input_shape": [[2, 16, 8, 64], [2, 16, 8, 64], [16, 32], [16, 32]],
+            "dtype": ["float16", "float16", "float16", "float16"],
+            "attrs": {"rotaryMode": "half"},
+        },
+        proto_inputs=[{"name": "query"}, {"name": "key"}, {"name": "cos"}, {"name": "sin"}],
+    )
+    assert rope_dims["half_dim"] == 32
+
+    gqa_dims = extract_schema_driven_case_dims(
+        {
+            "case_id": 1,
+            "input_shape": [[2, 16, 8, 64], [2, 32, 2, 64], [2, 32, 2, 64]],
+            "dtype": ["float16", "float16", "float16"],
+            "attrs": {"scaleValue": -1.0, "is_causal": False},
+        },
+        proto_inputs=[{"name": "query"}, {"name": "key"}, {"name": "value"}],
+    )
+    assert gqa_dims["dk"] == 64
+    assert gqa_dims["dv"] == 64
 
 
 def test_entrypoint_purity_allows_non_npu_guards_self_calls_and_ctypes_lib() -> None:
@@ -1196,7 +1314,7 @@ def test_stage0_oracle_validator_retries_transient_blocked_env(
 
 
 def test_cce_cpp20_surface_warns_against_simtvf_ubuf_flags_and_raw_ub_casts() -> None:
-    """Verify CCE C++20 reference forbids PURE_SIMDVF_UBUF_FLAGS and raw __ubuf__ casts in __simt_vf__."""
+    """Verify CCE C++20 reference forbids PURE_SIMDVF_UBUF_FLAGS in __simt_vf__."""
     rendered = CCE_CPP20_SURFACE.render_prompt_reference()
     assert "PURE_SIMDVF_UBUF_FLAGS" in rendered
     assert "__simt_vf__" in rendered
@@ -1808,7 +1926,7 @@ def test_prepare_seed_retries_same_candidate_on_environment_blockage(tmp_path: P
             cases=cases,
             legacy_regime_specs=None,
             llm_backend=backend,
-            l0_l1_validator_factory=lambda _regimes: (lambda _src, _track: (True, "")),
+            l0_l1_validator_factory=lambda _regimes, *, semantics=None: (lambda _src, _track: (True, "")),
             oracle_accuracy_validator=_blocked_then_ok,
             force_cold_start=True,
             max_seed_attempts=1,
@@ -1843,7 +1961,7 @@ def test_prepare_seed_retries_same_candidate_on_environment_blockage(tmp_path: P
                 cases=cases,
                 legacy_regime_specs=None,
                 llm_backend=backend_exhausted,
-                l0_l1_validator_factory=lambda _regimes: (lambda _src, _track: (True, "")),
+                l0_l1_validator_factory=lambda _regimes, *, semantics=None: (lambda _src, _track: (True, "")),
                 oracle_accuracy_validator=_always_blocked,
                 force_cold_start=True,
                 max_seed_attempts=2,
@@ -1890,6 +2008,8 @@ def test_validate_stage0_track_b_omits_simdvf_ubuf_flags_for_simtvf(
         import torch
         from tilelang.contrib.bisheng import compile_ascend
 
+        _KERNEL_CACHE: dict[tuple[object, ...], object] = {}
+
         VEC_OP_TRACKB_CU = r"""
         #include <tl_templates/ascend/common.h>
         __VF_ATTR__ void helper(__gm__ float* x) {}
@@ -1911,8 +2031,11 @@ def test_validate_stage0_track_b_omits_simdvf_ubuf_flags_for_simtvf(
             return VEC_OP_TRACKB_CU
 
         def _get_kernel(M: int = 64, D: int = 128) -> object:
-            compile_ascend(VEC_OP_TRACKB_CU, target_format="so", npu_arch="dav-3510")
-            return ctypes.CDLL("dummy.so")
+            key = (M, D)
+            if key not in _KERNEL_CACHE:
+                compile_ascend(VEC_OP_TRACKB_CU, target_format="so", npu_arch="dav-3510")
+                _KERNEL_CACHE[key] = ctypes.CDLL("dummy.so")
+            return _KERNEL_CACHE[key]
 
         def vec_op(x: torch.Tensor) -> torch.Tensor:
             if x.device.type != "npu":
@@ -1939,7 +2062,7 @@ def test_validate_stage0_track_b_omits_simdvf_ubuf_flags_for_simtvf(
 
 
 def test_cce_cpp20_surface_warns_against_simtvf_ubuf_flags_and_raw_ub_casts() -> None:
-    """Verify CCE C++20 reference forbids PURE_SIMDVF_UBUF_FLAGS and raw __ubuf__ casts in __simt_vf__."""
+    """Verify CCE C++20 reference forbids PURE_SIMDVF_UBUF_FLAGS in __simt_vf__."""
     rendered = CCE_CPP20_SURFACE.render_prompt_reference()
     assert "PURE_SIMDVF_UBUF_FLAGS" in rendered
     assert "__simt_vf__" in rendered

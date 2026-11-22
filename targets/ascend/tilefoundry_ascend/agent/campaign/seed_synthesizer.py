@@ -10,7 +10,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     RegimeTargetSpec,
@@ -23,8 +23,6 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     KernelLLMBackend,
     extract_python_dsl,
 )
-
-logger = logging.getLogger(__name__)
 from tilefoundry_ascend.agent.orchestrator.llm_constraints import (
     build_progressive_llm_constraints,
 )
@@ -39,6 +37,8 @@ from tilefoundry_ascend.ascend.target.dialect_surface import (
     DialectSurfaceSpec,
     get_dialect_surface,
 )
+
+logger = logging.getLogger(__name__)
 
 SeedMode = Literal["cold_start", "incumbent_takeover"]
 SeedVerificationState = Literal["l3_verified", "unverified_incumbent"]
@@ -84,109 +84,41 @@ def _sha256_text(source: str) -> str:
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
-def _blueprint_packets_from(
-    blueprints: Mapping[str, HirBlueprintPacket] | Sequence[HirBlueprintPacket] | None,
-) -> tuple[HirBlueprintPacket, ...]:
-    if blueprints is None:
-        return ()
-    if isinstance(blueprints, Mapping):
-        return tuple(blueprints.values())
-    return tuple(blueprints)
-
-
-def _schedule_delta_from_packet(packet: HirBlueprintPacket) -> Mapping[str, object] | None:
-    payload = packet.to_dict()
-    raw_delta = payload.get("schedule_delta")
-    return raw_delta if isinstance(raw_delta, Mapping) else None
-
-
-def _delta_has_sram_or_roundtrip_pressure(delta: Mapping[str, object]) -> bool:
-    for key in ("scheduled_ledger", "unscheduled_ledger"):
-        raw_ledger = delta.get(key)
-        if not isinstance(raw_ledger, Mapping):
-            continue
-        gm_roundtrip = raw_ledger.get("gm_roundtrip_bytes", 0)
-        max_overflow = raw_ledger.get("max_overflow_bytes", 0)
-        if (
-            isinstance(gm_roundtrip, int)
-            and not isinstance(gm_roundtrip, bool)
-            and gm_roundtrip > 0
-        ) or (
-            isinstance(max_overflow, int)
-            and not isinstance(max_overflow, bool)
-            and max_overflow > 0
-        ):
-            return True
-    return False
-
-
-def _delta_recommends_facets(delta: Mapping[str, object], required: tuple[str, ...]) -> bool:
-    raw_facets = delta.get("recommended_facets")
-    if not isinstance(raw_facets, Sequence) or isinstance(raw_facets, (str, bytes)):
-        return False
-    present = {str(item) for item in raw_facets}
-    return all(facet in present for facet in required)
+def select_fallback_track_from_semantics(
+    semantics: PyTorchOpSemantics,
+    ratios: Sequence[CasePhysicsRatios] = (),
+    *,
+    blueprints: Mapping[str, HirBlueprintPacket] | Sequence[HirBlueprintPacket] | None = None,
+) -> str:
+    """Select concrete Track-B CCE C++20 fallback track when Track-A lowering stalls."""
+    if any(ratio.case_id < 1 for ratio in ratios):
+        raise ValueError("case ratios must carry positive case_id")
+    axes = semantics.base_axes
+    if axes.uses_cube or axes.compute_engine == "coupled_1c2v":
+        return "hybrid_trackb"
+    if blueprints is not None:
+        packets = blueprints.values() if isinstance(blueprints, Mapping) else blueprints
+        if any(packet.roofline.cube_flops > 0 for packet in packets):
+            return "hybrid_trackb"
+    return "cce_trackb"
 
 
 def select_initial_track_from_semantics(
     semantics: PyTorchOpSemantics,
-    ratios: Sequence[CasePhysicsRatios],
+    ratios: Sequence[CasePhysicsRatios] = (),
     *,
     blueprints: Mapping[str, HirBlueprintPacket] | Sequence[HirBlueprintPacket] | None = None,
 ) -> str:
-    """Select Track-A TileLang DSL vs Track-B CCE C++20 from workload and Roofline physics."""
+    """Prefer Track-A TileLang DSL initially unless semantics require direct Track-B indexing."""
+    if any(ratio.case_id < 1 for ratio in ratios):
+        raise ValueError("case ratios must carry positive case_id")
+    if blueprints is not None:
+        packets = blueprints.values() if isinstance(blueprints, Mapping) else blueprints
+        for packet in packets:
+            if not packet.entry_name.strip():
+                raise ValueError("blueprint packet must carry a non-empty entry_name")
     if semantics.has_subbyte_or_block_quant or semantics.has_indirect_index:
         return "cce_trackb"
-    if any(r.working_set_sram_ratio > 1.0 and r.stride_ratio > 1.0 for r in ratios):
-        return "cce_trackb"
-
-    packets = _blueprint_packets_from(blueprints)
-    if not packets:
-        return "tilelang_dsl"
-
-    axes = semantics.base_axes
-    if axes.compute_engine == "coupled_1c2v":
-        for packet in packets:
-            roofline = packet.roofline
-            in_l0c_ub_zone = (
-                roofline.cube_flops > 0
-                and roofline.vector_flops > 0
-                and 8.0 <= float(roofline.arithmetic_intensity) <= 128.0
-                and (
-                    axes.memory_ring
-                    in ("bidirectional_cv_ring", "l0c_ub_epilogue", "persistent_onchip_state")
-                    or float(roofline.vec_floor_us)
-                    >= 0.25 * max(1e-9, float(roofline.cube_floor_us))
-                )
-            )
-            if in_l0c_ub_zone:
-                return "hybrid_trackb"
-            delta = _schedule_delta_from_packet(packet)
-            if delta is not None and (
-                _delta_has_sram_or_roundtrip_pressure(delta)
-                or _delta_recommends_facets(
-                    delta, ("pipeline_and_sync_graph", "sram_layout_and_aliasing")
-                )
-            ):
-                return "hybrid_trackb"
-
-    if semantics.has_reduction and not axes.uses_cube:
-        has_unaligned_tail = any(
-            (not r.is_atom_aligned) and (r.inner_contiguous_bytes % 32 != 0)
-            for r in ratios
-        )
-        for packet in packets:
-            roofline = packet.roofline
-            if has_unaligned_tail and (
-                roofline.dominant_bound == "memory" or roofline.vector_flops > 0
-            ):
-                return "cce_trackb"
-            delta = _schedule_delta_from_packet(packet)
-            if delta is not None and _delta_recommends_facets(
-                delta, ("exec_mode_and_spr", "pipeline_and_sync_graph")
-            ):
-                return "cce_trackb"
-
     return "tilelang_dsl"
 
 
@@ -624,18 +556,42 @@ def _prompt_type_name(value: object) -> str:
     raise ValueError(f"unsupported regime instantiation value {value!r} for the seed ABI prompt")
 
 
+_SYNTHETIC_DIM_ALIAS_RE = re.compile(r"^(?:total_elements|shape_\d+_dim_\d+|.+_dim_\d+)$")
+_REDUNDANT_CASE_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("d_dim", ("D",)),
+    ("dk", ("D", "d_dim")),
+    ("half_dim", ("D", "d_dim")),
+    ("b_dim", ("B",)),
+    ("s_dim", ("S",)),
+    ("m_rows", ("M",)),
+    ("n_q", ("N_q",)),
+    ("n_kv", ("N_kv",)),
+    ("s_kv", ("S_kv",)),
+    ("t_dim", ("S", "s_dim")),
+)
+
+
 def _seed_parameter_specs(
     regime_specs: Sequence[RegimeTargetSpec],
 ) -> tuple[tuple[str, object], ...]:
-    ordered: dict[str, object] = {}
+    merged: dict[str, object] = {}
     for regime in regime_specs:
         for key in sorted(regime.sample_builder_kwargs):
             val = regime.sample_builder_kwargs[key]
             if isinstance(val, (list, tuple)) and len(val) > 8:
                 continue
-            if key not in ordered:
-                ordered[key] = val
-    return tuple(ordered.items())
+            if key not in merged:
+                merged[key] = val
+    has_canonical = any(not _SYNTHETIC_DIM_ALIAS_RE.match(k) for k in merged)
+    filtered = (
+        {k: v for k, v in merged.items() if not _SYNTHETIC_DIM_ALIAS_RE.match(k)}
+        if has_canonical
+        else dict(merged)
+    )
+    for alias, parents in _REDUNDANT_CASE_ALIASES:
+        if alias in filtered and any(parent in filtered for parent in parents) and len(filtered) > 6:
+            filtered.pop(alias, None)
+    return tuple(filtered.items())
 
 
 def _render_signature(
@@ -643,9 +599,11 @@ def _render_signature(
     parameters: Sequence[tuple[str, object]],
     return_type: str,
 ) -> str:
-    rendered = ", ".join(
+    rendered_items = [
         f"{key}: {_prompt_type_name(value)} = {value!r}" for key, value in parameters
-    )
+    ]
+    rendered_items.append("**extra_dims: object")
+    rendered = ", ".join(rendered_items)
     return f"def {name}({rendered}) -> {return_type}:"
 
 
@@ -673,19 +631,22 @@ def _seed_module_abi(
     if len(regime_specs) > 1:
         for regime in regime_specs:
             tag = regime.regime_tag
+            regime_parameters = _seed_parameter_specs((regime,))
             r_sel = _render_signature(
                 f"_select_{entrypoint}_{tag}_config",
-                parameters,
+                regime_parameters,
                 "dict[str, object]",
             )
             r_bld = _render_signature(
                 f"_build_{entrypoint}_{tag}_prim_func",
-                parameters,
+                regime_parameters,
                 "object",
             )
             per_regime_lines.extend((r_sel, r_bld))
 
     if track in ("cce_trackb", "hybrid_trackb"):
+        header_list = ", ".join(f"`{hdr}`" for hdr in surface.required_headers_or_imports)
+        lead_header = surface.required_headers_or_imports[0]
         symbol_block = [
             *per_regime_lines,
             selector,
@@ -718,10 +679,8 @@ def _seed_module_abi(
             + "\n```\n"
             f"- `{entrypoint.upper()}_TRACKB_CU` is a top-level C++20 translation-unit string "
             f"constant (`{entrypoint.upper()}_TRACKB_CU = r\"\"\"...\"\"\"`, plain raw "
-            "triple-quoted literal rather than `dedent(...)`) starting with "
-            "`#include <tl_templates/ascend/common.h>` (plus `<tl_templates/ascend/simd_inst.h>` "
-            "and/or `<tl_templates/ascend/cube_inst.h>` as needed) that bisheng compiles "
-            "standalone.\n"
+            "triple-quoted literal rather than `dedent(...)`) using only verified headers from "
+            f"{header_list} (starting with `{lead_header}`) that bisheng compiles standalone.\n"
             "- Ascend 950PR (`dav-3510`) bisheng kernel attribute rule: explicitly annotate every "
             "`__global__` device kernel with `__vector__` (vector-only), `__cube__` (cube-only), "
             "or `__mix__(1, 2)` (mixed Cube+Vector), e.g. `__global__ __aicore__ __vector__ void "
@@ -749,15 +708,20 @@ def _seed_module_abi(
             "`PURE_SIMDVF_UBUF_FLAGS` and never cast raw integer offsets to `__ubuf__ T*`, "
             "which overwrites the SIMT stack/data cache; use `__gm__` pointers or a `__gm__` "
             "scratch tensor instead)\n"
-            "  - `compile_ascend(tu_src, target_format=\"so\", npu_arch=\"dav-3510\", "
-            "options=opts, path_target=so_path)` into a content-hashed persistent path under "
-            "`Path(os.environ.get(\"TILELANG_CACHE_DIR\") or tempfile.gettempdir()) / "
-            "\"tf_trackb_so\"` (reusing an existing `.so` if present rather than deleting it "
-            "in a `TemporaryDirectory`), append `str(so_path)` to a module-level "
-            "`_COMPILED_OBJ_PATHS: list[str] = []` list so profiling and subprocesses reuse it, "
-            "load with `lib = ctypes.CDLL(str(so_path))` (retain `lib` on the cached runner to "
-            "prevent GC), and pass `torch.npu.current_stream().npu_stream` alongside "
-            "contiguous tensor `data_ptr()` (`ctypes.c_void_p`) values.\n"
+            "  - atomic `.so` caching under `cache_dir = Path(os.environ.get(\"TILELANG_CACHE_DIR\") "
+            "or tempfile.gettempdir()) / \"tf_ascend_so_cache\"`: compute persistent "
+            "`(tu_sha256, compile_flags)` content-hashed `so_path = cache_dir / f\"...so\"`; if "
+            "`not so_path.exists()`, compile into PID-staged `tmp_so = cache_dir / "
+            "f\"{so_path.stem}.{os.getpid()}.tmp.so\"` via `compile_ascend(tu_src, "
+            "target_format=\"so\", npu_arch=\"dav-3510\", options=opts, path_target=tmp_so)` and "
+            "commit atomically with `os.replace(tmp_so, so_path)` (never key `_KERNEL_CACHE` or "
+            "`.so` filenames on volatile per-case runtime extents such as `total_elements`, "
+            "`m_rows`, `b_dim`, `s_dim`, `s_kv` unless quantized to a discrete bucket tag; reuse "
+            "any existing `.so` across L3 subprocesses), append `str(so_path)` to "
+            "`_COMPILED_OBJ_PATHS: list[str]`, load with `lib = ctypes.CDLL(str(so_path))` "
+            "(retain `lib` on the cached runner to prevent GC), and pass "
+            "`torch.npu.current_stream().npu_stream` alongside contiguous tensor `data_ptr()` "
+            "(`ctypes.c_void_p`) values.\n"
             "- Track-B architecture preference: for regular dense elementwise, reduction, "
             "norm, and softmax workloads prefer UB-staged vectorized `__simd_vf__` "
             "(`asc_copy_gm2ub_align` + `simd_inst::*` + `asc_copy_ub2gm_align`) over scalar "
@@ -796,7 +760,15 @@ def _seed_module_abi(
         f"- `_build_{entrypoint}_prim_func` is called with the same keyword arguments plus any "
         "selector `builder_kwargs`, and returns an inner `@T.prim_func`.\n"
         "- `_get_kernel` compiles that prim_func through "
-        '`tilelang.compile(prog, target="ascend")` and caches the compiled callable.\n'
+        '`tilelang.compile(prog, target="ascend")` and caches the compiled callable, strictly '
+        "excluding per-case volatile runtime extents (`total_elements`, `m_rows`, `b_dim`, "
+        "`s_dim`, `s_kv`) from `_KERNEL_CACHE` / disk keys unless bucketed to discrete tags "
+        "(use `T.dynamic(...)` inside `@T.prim_func` so all 20 cases share one compiled binary).\n"
+        "- For matmul or coupled Cube+Vector operators use `with T.MixedKernel(28, sids=2) as "
+        "(bx, sid):` with `T.alloc_l1`, `T.alloc_l0c`, `T.gemm`, `T.alloc_shared`, `T.SimdVF`.\n"
+        "- For non-last-axis or high-rank reductions reshape/view on NPU as 3D "
+        "`(outer, reduce_extent, inner)` and pad UB shared tiles to 64-element multiples "
+        "with `T.simd.update_mask(rem, width=32/16)` plus explicit `-inf`/`NaN` row guards.\n"
         f"- `{entrypoint}` performs the operator on NPU tensors through `_get_kernel`; no "
         "torch/CPU fallback may remain on the NPU path.\n"
         f"{multi_note}"
@@ -958,15 +930,28 @@ def _bind_trackb_symbols(
         raise RuntimeError(
             "Track-B Stage-0 seed has no discoverable C++20 translation-unit string constant"
         )
+    render_sym = ("_render_trackb_tu",) if "def _render_trackb_tu(" in module_source else ()
     return tuple(
         replace(
             regime,
             runtime_backend=runtime_backend,
             trackb_symbols=symbols,
-            editable_symbols=tuple(dict.fromkeys([*regime.editable_symbols, *symbols])),
+            editable_symbols=tuple(dict.fromkeys([*regime.editable_symbols, *symbols, *render_sym])),
         )
         for regime in regime_specs
     )
+
+
+class Stage0StaticValidatorFactory(Protocol):
+    """Typed factory building a static Stage-0 validator for campaign regimes."""
+
+    def __call__(
+        self,
+        regime_specs: tuple[RegimeTargetSpec, ...],
+        *,
+        semantics: PyTorchOpSemantics | None = None,
+    ) -> Callable[[str, str], tuple[bool, str]]:
+        ...
 
 
 async def prepare_operator_seed_or_takeover(
@@ -978,9 +963,7 @@ async def prepare_operator_seed_or_takeover(
     cases: Sequence[Mapping[str, object]],
     legacy_regime_specs: Sequence[RegimeTargetSpec] | None,
     llm_backend: KernelLLMBackend,
-    l0_l1_validator_factory: Callable[
-        [tuple[RegimeTargetSpec, ...]], Callable[[str, str], tuple[bool, str]]
-    ],
+    l0_l1_validator_factory: Stage0StaticValidatorFactory,
     oracle_accuracy_validator: Callable[[str], OracleAccuracyResult],
     existing_module_path: Path | None = None,
     authored_hir_source: str | None = None,
@@ -1058,33 +1041,6 @@ async def prepare_operator_seed_or_takeover(
         scheduled_hir_source=scheduled_hir_source,
         proto=proto,
     )
-    initial_track = select_initial_track_from_semantics(
-        semantics,
-        ratios,
-        blueprints=blueprints,
-    )
-    runtime_backend, tier_name = _canonical_seed_track(initial_track)
-    if runtime_backend == "tilelang_dsl":
-        regime_specs = provisional_regimes
-    else:
-        regime_specs = build_semantic_regime_specs(
-            operator_name=operator_name,
-            entrypoint=entrypoint,
-            cases=cases,
-            proto=proto,
-            base_axes=semantics.base_axes,
-            has_reduction=semantics.has_reduction,
-            case_ratios=ratios,
-            runtime_backend=runtime_backend,
-        )
-    l0_l1_validator = l0_l1_validator_factory(regime_specs)
-    surface = get_dialect_surface(tier_name)
-    first_bp = next(iter(blueprints.values()), None)
-    constraint_block = build_progressive_llm_constraints(
-        escalation_tier=tier_name,
-        freedom_mask=ConstraintRelaxationMask.top(),
-        blueprint=first_bp,
-    )
     contract = (
         golden_contract
         if golden_contract is not None
@@ -1095,28 +1051,78 @@ async def prepare_operator_seed_or_takeover(
             desc_text=desc_text,
         )
     )
-    parameters = _seed_parameter_specs(regime_specs)
-    system_prompt = _seed_system_prompt(
-        operator_name,
-        entrypoint,
-        surface,
-        initial_track,
-        parameters,
-        golden_contract=contract,
-        regime_specs=regime_specs,
-    )
     golden_abi_block = format_golden_entrypoint_prompt_block(contract)
     golden_block = (
         "### PYTORCH MATHEMATICAL REFERENCE (GOLDEN ORACLE)\n"
         f"```python\n{pytorch_golden_source.strip()}\n```\n\n"
     )
-    contract_block = _official_contract_section(
-        proto,
-        cases,
-        regime_specs,
-        entrypoint=entrypoint,
+    first_bp = next(iter(blueprints.values()), None)
+
+    def _prepare_track_state(
+        track_name: str,
+    ) -> tuple[
+        str,
+        tuple[RegimeTargetSpec, ...],
+        Callable[[str, str], tuple[bool, str]],
+        str,
+        str,
+        str,
+        str,
+    ]:
+        rt_backend, tier = _canonical_seed_track(track_name)
+        if rt_backend == "tilelang_dsl":
+            specs = provisional_regimes
+        else:
+            specs = build_semantic_regime_specs(
+                operator_name=operator_name,
+                entrypoint=entrypoint,
+                cases=cases,
+                proto=proto,
+                base_axes=semantics.base_axes,
+                has_reduction=semantics.has_reduction,
+                case_ratios=ratios,
+                runtime_backend=rt_backend,
+            )
+        validator = l0_l1_validator_factory(specs, semantics=semantics)
+        surface = get_dialect_surface(tier)
+        c_block = build_progressive_llm_constraints(
+            escalation_tier=tier,
+            freedom_mask=ConstraintRelaxationMask.top(),
+            blueprint=first_bp,
+        )
+        params = _seed_parameter_specs(specs)
+        s_prompt = _seed_system_prompt(
+            operator_name,
+            entrypoint,
+            surface,
+            track_name,
+            params,
+            golden_contract=contract,
+            regime_specs=specs,
+        )
+        k_block = _official_contract_section(
+            proto,
+            cases,
+            specs,
+            entrypoint=entrypoint,
+        )
+        bp_block = _blueprint_summary_section(blueprints, specs)
+        return rt_backend, specs, validator, c_block, s_prompt, k_block, bp_block
+
+    active_track = select_initial_track_from_semantics(
+        semantics,
+        ratios,
+        blueprints=blueprints,
     )
-    blueprint_block = _blueprint_summary_section(blueprints, regime_specs)
+    (
+        runtime_backend,
+        regime_specs,
+        l0_l1_validator,
+        constraint_block,
+        system_prompt,
+        contract_block,
+        blueprint_block,
+    ) = _prepare_track_state(active_track)
 
     last_error = ""
     last_rejected_source: str | None = None
@@ -1124,6 +1130,56 @@ async def prepare_operator_seed_or_takeover(
     attempt = 1
     attempts_used = 0
     transport_retries = 0
+    track_a_failures = 0
+    track_a_budget = (
+        max(2, max_seed_attempts // 2)
+        if active_track == "tilelang_dsl" and max_seed_attempts >= 4
+        else 0
+    )
+
+    def _record_candidate_failure(error_text: str, candidate_source: str) -> None:
+        nonlocal active_track, attempt, blueprint_block, constraint_block, contract_block
+        nonlocal l0_l1_validator, last_error, last_rejected_error, last_rejected_source
+        nonlocal runtime_backend, regime_specs, system_prompt, track_a_failures
+        last_error = error_text
+        last_rejected_source = candidate_source
+        last_rejected_error = error_text
+        if active_track == "tilelang_dsl":
+            track_a_failures += 1
+        attempt += 1
+        if (
+            active_track == "tilelang_dsl"
+            and track_a_budget > 0
+            and track_a_failures >= track_a_budget
+            and attempt <= max_seed_attempts
+        ):
+            fallback_track = select_fallback_track_from_semantics(
+                semantics,
+                ratios,
+                blueprints=blueprints,
+            )
+            if fallback_track != active_track:
+                logger.info(
+                    "STAGE0_TRACK_PIVOT op=%s attempt=%d from=%s to=%s failures=%d",
+                    operator_name,
+                    attempt,
+                    active_track,
+                    fallback_track,
+                    track_a_failures,
+                )
+                active_track = fallback_track
+                (
+                    runtime_backend,
+                    regime_specs,
+                    l0_l1_validator,
+                    constraint_block,
+                    system_prompt,
+                    contract_block,
+                    blueprint_block,
+                ) = _prepare_track_state(active_track)
+                last_rejected_source = None
+                last_rejected_error = ""
+
     while attempt <= max(1, max_seed_attempts):
         attempts_used = attempt
         request = GenerationRequest(
@@ -1158,19 +1214,19 @@ async def prepare_operator_seed_or_takeover(
             continue
 
         transport_retries = 0
-        ok_static, static_err = l0_l1_validator(synthesized_src, initial_track)
+        ok_static, static_err = l0_l1_validator(synthesized_src, active_track)
         if not ok_static:
             logger.info(
                 "STAGE0_ATTEMPT op=%s attempt=%d track=%s stage=static_l0_l1 detail=%s",
                 operator_name,
                 attempt,
-                initial_track,
+                active_track,
                 static_err.replace("\n", " ")[:500],
             )
-            last_error = f"L0/L1 static or compiler rejection:\n{static_err}"
-            last_rejected_source = synthesized_src
-            last_rejected_error = last_error
-            attempt += 1
+            _record_candidate_failure(
+                f"L0/L1 static or compiler rejection:\n{static_err}",
+                synthesized_src,
+            )
             continue
 
         evidence = oracle_accuracy_validator(synthesized_src)
@@ -1190,7 +1246,7 @@ async def prepare_operator_seed_or_takeover(
                 attempt,
                 env_retries,
                 max(0, max_env_retries),
-                initial_track,
+                active_track,
                 oracle_detail.replace("\n", " ")[:500],
             )
             evidence = oracle_accuracy_validator(synthesized_src)
@@ -1221,7 +1277,7 @@ async def prepare_operator_seed_or_takeover(
             )
             return SeedSynthesisOutcome(
                 mode="cold_start",
-                initial_track=initial_track,
+                initial_track=active_track,
                 module_source=synthesized_src,
                 semantics=semantics,
                 case_ratios=ratios,
@@ -1242,13 +1298,13 @@ async def prepare_operator_seed_or_takeover(
             "STAGE0_ATTEMPT op=%s attempt=%d track=%s stage=oracle_l3 detail=%s",
             operator_name,
             attempt,
-            initial_track,
+            active_track,
             oracle_detail.replace("\n", " ")[:500],
         )
-        last_error = f"NPU numerical mismatch against PyTorch golden:\n{oracle_detail}"
-        last_rejected_source = synthesized_src
-        last_rejected_error = last_error
-        attempt += 1
+        _record_candidate_failure(
+            f"NPU numerical mismatch against PyTorch golden:\n{oracle_detail}",
+            synthesized_src,
+        )
 
     raise RuntimeError(
         f"Stage-0 cold-start seed synthesis failed for {operator_name} after "
@@ -1263,9 +1319,11 @@ __all__ = [
     "SeedMode",
     "SeedSynthesisOutcome",
     "SeedVerificationState",
+    "Stage0StaticValidatorFactory",
     "extract_golden_entrypoint_contract",
     "format_golden_entrypoint_prompt_block",
     "prepare_operator_seed_or_takeover",
+    "select_fallback_track_from_semantics",
     "select_initial_track_from_semantics",
     "validate_entrypoint_signature_compatibility",
 ]

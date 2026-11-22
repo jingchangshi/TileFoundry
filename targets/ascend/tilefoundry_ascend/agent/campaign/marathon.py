@@ -7,7 +7,6 @@ import ast
 import asyncio
 import ctypes
 import hashlib
-import inspect
 import json
 import logging
 import os
@@ -75,6 +74,7 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
     check_npu_entrypoint_purity,
     evaluate_ascendc_candidate,
+    resolve_trackb_compile_flags,
     run_stage_a_static,
     run_stage_b_ascendc_compile,
 )
@@ -90,8 +90,9 @@ from tilefoundry_ascend.ascend.cost_model.experience_lake import (
     compute_source_sha256,
     resolve_default_experience_lake_dir,
 )
+from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
+from tilefoundry_ascend.ascend.sil.pytorch_frontend import PyTorchOpSemantics
 from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask
-from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS
 from tilefoundry_ascend.ascend.target.dialect_surface import CCE_CPP20_SURFACE
 
 logger = logging.getLogger("tilefoundry_ascend.marathon")
@@ -237,7 +238,7 @@ class MarathonConfig:
     l4_regression_ratio: float = 1.0
     warmup: int = 3
     repeat: int = 5
-    enable_tilesize_prescreen: bool = False
+    enable_tilesize_prescreen: bool = True
     cost_prescreen_top_k: int | None = None
     prewarm_l3: bool = True
     salvage_beam_candidates: bool = True
@@ -329,7 +330,12 @@ def _stage0_entrypoint_contract_error(
         sig_error = validate_entrypoint_signature_compatibility(module_source, contract)
         if sig_error:
             return sig_error
-    purity_errors = check_npu_entrypoint_purity(module_source, entrypoint, track=track)
+    purity_errors = check_npu_entrypoint_purity(
+        module_source,
+        entrypoint,
+        track=track,
+        require_kernel_cache=True,
+    )
     if purity_errors:
         return "entrypoint purity rejection: " + "; ".join(purity_errors)
     if track in ("cce_trackb", "hybrid_trackb"):
@@ -382,7 +388,38 @@ def _instantiate_stage0_trackb_tu(
     )
 
 
-def _validate_stage0_track_a(
+def _aggregate_hardware_engine_error(
+    ledgers: Sequence[ObjectivePhysicalLedger | None],
+    semantics: PyTorchOpSemantics | None,
+) -> str:
+    """Enforce aggregate Cube and DMA hardware-engine invariants across module ledgers."""
+    if semantics is None:
+        return ""
+    active_ledgers = [ledger for ledger in ledgers if ledger is not None]
+    if not active_ledgers:
+        return ""
+    if semantics.has_matmul:
+        has_cube = any(int(lg.pipe_cycles.get("AIC.PIPE_M", 0)) > 0 for lg in active_ledgers)
+        if not has_cube:
+            return (
+                "aggregate L0 hardware-engine rejection: missing_cube_engine_primitives "
+                "(module AIC.PIPE_M == 0 across Track-A and Track-B ledgers)"
+            )
+    if not semantics.has_indirect_index:
+        has_dma = any(
+            lg.has_indirect_gather
+            or any(k.endswith("PIPE_MTE2") and int(v) > 0 for k, v in lg.pipe_cycles.items())
+            for lg in active_ledgers
+        )
+        if not has_dma:
+            return (
+                "aggregate L0 hardware-engine rejection: missing_hardware_dma_staging "
+                "(module PIPE_MTE2 == 0 across Track-A and Track-B ledgers)"
+            )
+    return ""
+
+
+def _run_stage0_track_a_gates(
     module_source: str,
     regime_spec: RegimeTargetSpec,
     *,
@@ -390,8 +427,9 @@ def _validate_stage0_track_a(
     worktree: Path,
     env_file: Path | None,
     contract: GoldenEntrypointContract | None = None,
-) -> tuple[bool, str]:
-    """Run L0 static purity/waterline and L1 device compilation for a Track-A seed."""
+    semantics: PyTorchOpSemantics | None = None,
+    enforce_hardware_engines: bool = True,
+) -> tuple[bool, str, ObjectivePhysicalLedger | None]:
     contract_error = _stage0_entrypoint_contract_error(
         module_source,
         entrypoint,
@@ -399,7 +437,7 @@ def _validate_stage0_track_a(
         contract=contract,
     )
     if contract_error:
-        return False, contract_error
+        return False, contract_error, None
     dims = dict(regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims)
     try:
         resolved = resolve_regime_config(module_source, regime_spec, dims=dims)
@@ -412,7 +450,11 @@ def _validate_stage0_track_a(
         TypeError,
         ValueError,
     ) as exc:
-        return False, f"seed config resolution failed: {type(exc).__name__}: {exc}"
+        return False, f"seed config resolution failed: {type(exc).__name__}: {exc}", None
+    req_dma = bool(
+        enforce_hardware_engines and semantics is not None and not semantics.has_indirect_index
+    )
+    req_cube = bool(enforce_hardware_engines and semantics is not None and semantics.has_matmul)
     static = run_stage_a_static(
         module_source,
         factory_name=resolved.builder_name,
@@ -420,9 +462,11 @@ def _validate_stage0_track_a(
         pass_configs=resolved.pass_configs or None,
         compile_flags=resolved.compile_flags or None,
         case_ratios=regime_spec.representative_case_ratios,
+        require_hardware_dma=req_dma,
+        require_cube_engine=req_cube,
     )
     if not static.passed:
-        return False, f"L0 static/waterline rejection: {static.error_message}"
+        return False, f"L0 static/waterline rejection: {static.error_message}", static.ledger
     compiled = run_l1_compile_check(
         module_source,
         builder_name=resolved.builder_name,
@@ -434,11 +478,57 @@ def _validate_stage0_track_a(
         env_file=env_file,
     )
     if not compiled.passed:
-        return False, f"L1 device compilation rejection: {compiled.error_message}"
-    return True, ""
+        return False, f"L1 device compilation rejection: {compiled.error_message}", static.ledger
+    return True, "", static.ledger
 
 
-def _validate_stage0_track_b(
+def _validate_stage0_track_a(
+    module_source: str,
+    regime_spec: RegimeTargetSpec,
+    *,
+    entrypoint: str,
+    worktree: Path,
+    env_file: Path | None,
+    contract: GoldenEntrypointContract | None = None,
+    semantics: PyTorchOpSemantics | None = None,
+) -> tuple[bool, str]:
+    """Run L0 static purity/waterline and L1 device compilation for a Track-A seed."""
+    passed, err, _ = _run_stage0_track_a_gates(
+        module_source,
+        regime_spec,
+        entrypoint=entrypoint,
+        worktree=worktree,
+        env_file=env_file,
+        contract=contract,
+        semantics=semantics,
+        enforce_hardware_engines=True,
+    )
+    return passed, err
+
+
+def _resolve_stage0_trackb_selector_flags(
+    module_source: str,
+    regime_spec: RegimeTargetSpec,
+) -> tuple[str, ...]:
+    if not regime_spec.config_selector_fn:
+        return ()
+    dims = dict(regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims)
+    try:
+        resolved = resolve_regime_config(module_source, regime_spec, dims=dims)
+    except (
+        SyntaxError,
+        ImportError,
+        KeyError,
+        NameError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return ()
+    return tuple(resolved.compile_flags)
+
+
+def _run_stage0_track_b_gates(
     module_source: str,
     regime_spec: RegimeTargetSpec,
     *,
@@ -446,8 +536,9 @@ def _validate_stage0_track_b(
     env_file: Path | None,
     contract: GoldenEntrypointContract | None = None,
     track: str = "cce_trackb",
-) -> tuple[bool, str]:
-    """Run L0 token purity and L1 bisheng compilation for a Track-B CCE seed."""
+    semantics: PyTorchOpSemantics | None = None,
+    enforce_hardware_engines: bool = True,
+) -> tuple[bool, str, ObjectivePhysicalLedger | None]:
     contract_error = _stage0_entrypoint_contract_error(
         module_source,
         entrypoint,
@@ -455,11 +546,11 @@ def _validate_stage0_track_b(
         contract=contract,
     )
     if contract_error:
-        return False, contract_error
+        return False, contract_error, None
     trackb_symbols = regime_spec.trackb_symbols or discover_module_trackb_symbols(module_source)
     extracted = extract_trackb_cpp_source(module_source, trackb_symbols)
     if extracted is None:
-        return False, "seed exposes no Track-B C++20 translation-unit string constant"
+        return False, "seed exposes no Track-B C++20 translation-unit string constant", None
     symbol, cpp_source = extracted
     try:
         instantiated_tu = _instantiate_stage0_trackb_tu(module_source, cpp_source, regime_spec)
@@ -474,16 +565,23 @@ def _validate_stage0_track_b(
         TypeError,
         ValueError,
     ) as exc:
-        return False, f"Track-B _render_trackb_tu instantiation failed ({symbol}): {exc}"
+        return False, f"Track-B _render_trackb_tu instantiation failed ({symbol}): {exc}", None
+    req_dma = bool(
+        enforce_hardware_engines and semantics is not None and not semantics.has_indirect_index
+    )
+    req_cube = bool(enforce_hardware_engines and semantics is not None and semantics.has_matmul)
     verdict = evaluate_ascendc_candidate(
         instantiated_tu,
         freedom_mask=ConstraintRelaxationMask.top(),
         case_ratios=regime_spec.representative_case_ratios,
+        require_hardware_dma=req_dma,
+        require_cube_engine=req_cube,
     )
     if not verdict.passed:
-        return False, f"Track-B L0 token purity ({symbol}): {verdict.error_message}"
+        return False, f"Track-B L0 token purity ({symbol}): {verdict.error_message}", verdict.ledger
     cann_root = _resolve_cann_root_from_env(env_file)
-    flags = list(PURE_SIMDVF_UBUF_FLAGS) if "__simt_vf__" not in instantiated_tu else []
+    selector_flags = _resolve_stage0_trackb_selector_flags(module_source, regime_spec)
+    flags = list(resolve_trackb_compile_flags(instantiated_tu, selector_flags))
     bisheng_bin: str | None = None
     if cann_root is not None:
         candidate_bin = cann_root / "bin" / "bisheng"
@@ -499,8 +597,36 @@ def _validate_stage0_track_b(
         verify_shared_link=True,
     )
     if not compiled.passed:
-        return False, f"Track-B L1 bisheng compilation ({symbol}): {compiled.error_message}"
-    return True, ""
+        return (
+            False,
+            f"Track-B L1 bisheng compilation ({symbol}): {compiled.error_message}",
+            verdict.ledger,
+        )
+    return True, "", verdict.ledger
+
+
+def _validate_stage0_track_b(
+    module_source: str,
+    regime_spec: RegimeTargetSpec,
+    *,
+    entrypoint: str,
+    env_file: Path | None,
+    contract: GoldenEntrypointContract | None = None,
+    track: str = "cce_trackb",
+    semantics: PyTorchOpSemantics | None = None,
+) -> tuple[bool, str]:
+    """Run L0 token purity and L1 bisheng compilation for a Track-B CCE seed."""
+    passed, err, _ = _run_stage0_track_b_gates(
+        module_source,
+        regime_spec,
+        entrypoint=entrypoint,
+        env_file=env_file,
+        contract=contract,
+        track=track,
+        semantics=semantics,
+        enforce_hardware_engines=True,
+    )
+    return passed, err
 
 
 def _validate_stage0_hybrid_track_b(
@@ -511,27 +637,39 @@ def _validate_stage0_hybrid_track_b(
     worktree: Path,
     env_file: Path | None,
     contract: GoldenEntrypointContract | None = None,
+    semantics: PyTorchOpSemantics | None = None,
 ) -> tuple[bool, str]:
     """Validate hybrid Track-B TU and optional TileLang @T.prim_func builder."""
-    passed_tb, error_tb = _validate_stage0_track_b(
+    has_prim = _has_prim_func_builder(module_source, regime_spec.builder_candidates)
+    passed_tb, error_tb, ledger_tb = _run_stage0_track_b_gates(
         module_source,
         regime_spec,
         entrypoint=entrypoint,
         env_file=env_file,
         contract=contract,
         track="hybrid_trackb",
+        semantics=semantics,
+        enforce_hardware_engines=not has_prim,
     )
     if not passed_tb:
         return False, error_tb
-    if _has_prim_func_builder(module_source, regime_spec.builder_candidates):
-        return _validate_stage0_track_a(
-            module_source,
-            regime_spec,
-            entrypoint=entrypoint,
-            worktree=worktree,
-            env_file=env_file,
-            contract=contract,
-        )
+    if not has_prim:
+        return True, ""
+    passed_ta, error_ta, ledger_ta = _run_stage0_track_a_gates(
+        module_source,
+        regime_spec,
+        entrypoint=entrypoint,
+        worktree=worktree,
+        env_file=env_file,
+        contract=contract,
+        semantics=semantics,
+        enforce_hardware_engines=False,
+    )
+    if not passed_ta:
+        return False, error_ta
+    agg_err = _aggregate_hardware_engine_error((ledger_tb, ledger_ta), semantics)
+    if agg_err:
+        return False, agg_err
     return True, ""
 
 
@@ -542,6 +680,7 @@ def build_stage0_static_validator(
     worktree: Path,
     env_file: Path | None,
     entrypoint_contract: GoldenEntrypointContract | None = None,
+    semantics: PyTorchOpSemantics | None = None,
 ) -> Callable[[str, str], tuple[bool, str]]:
     """Build the L0/L1 gate pair the bounded Stage-0 seed loop invokes per attempt."""
     assert regime_specs, "Stage-0 seed synthesis requires at least one regime specification"
@@ -564,6 +703,7 @@ def build_stage0_static_validator(
                     entrypoint=entrypoint,
                     env_file=env_file,
                     contract=entrypoint_contract,
+                    semantics=semantics,
                 )
             elif track == "hybrid_trackb":
                 passed, error = _validate_stage0_hybrid_track_b(
@@ -573,6 +713,7 @@ def build_stage0_static_validator(
                     worktree=worktree,
                     env_file=env_file,
                     contract=entrypoint_contract,
+                    semantics=semantics,
                 )
             else:
                 passed, error = _validate_stage0_track_a(
@@ -582,6 +723,7 @@ def build_stage0_static_validator(
                     worktree=worktree,
                     env_file=env_file,
                     contract=entrypoint_contract,
+                    semantics=semantics,
                 )
             if not passed:
                 failures.append(f"[{regime_spec.regime_tag}] {error}")
@@ -724,21 +866,16 @@ def prepare_marathon_seed(
 
     def _stage0_static_validator_factory(
         regime_specs: tuple[RegimeTargetSpec, ...],
+        *,
+        semantics: PyTorchOpSemantics | None = None,
     ) -> Callable[[str, str], tuple[bool, str]]:
-        validator_params = inspect.signature(build_stage0_static_validator).parameters
-        if "entrypoint_contract" in validator_params:
-            return build_stage0_static_validator(
-                regime_specs,
-                entrypoint=spec.entrypoint,
-                worktree=worktree,
-                env_file=env_file,
-                entrypoint_contract=golden_contract,
-            )
         return build_stage0_static_validator(
             regime_specs,
             entrypoint=spec.entrypoint,
             worktree=worktree,
             env_file=env_file,
+            entrypoint_contract=golden_contract,
+            semantics=semantics,
         )
 
     init_path = target_module.parent / "__init__.py"
@@ -1782,36 +1919,19 @@ def run_operator_marathon(
             )
         else:
             try:
-                if (
-                    cfg.pure_golden
-                    and "pure_golden" in inspect.signature(prepare_marathon_seed).parameters
-                ):
-                    seed_outcome = prepare_marathon_seed(
-                        operator_name=cfg.operator_name,
-                        target_module=target_module,
-                        staging_dir=staging_dir,
-                        worktree=worktree,
-                        env_file=env_file,
-                        cannbench_repo=cannbench_repo,
-                        llm_backend=llm_backend,
-                        cold_start=cfg.cold_start,
-                        device_id=primary_device_id,
-                        op_logger=op_logger,
-                        pure_golden=True,
-                    )
-                else:
-                    seed_outcome = prepare_marathon_seed(
-                        operator_name=cfg.operator_name,
-                        target_module=target_module,
-                        staging_dir=staging_dir,
-                        worktree=worktree,
-                        env_file=env_file,
-                        cannbench_repo=cannbench_repo,
-                        llm_backend=llm_backend,
-                        cold_start=cfg.cold_start,
-                        device_id=primary_device_id,
-                        op_logger=op_logger,
-                    )
+                seed_outcome = prepare_marathon_seed(
+                    operator_name=cfg.operator_name,
+                    target_module=target_module,
+                    staging_dir=staging_dir,
+                    worktree=worktree,
+                    env_file=env_file,
+                    cannbench_repo=cannbench_repo,
+                    llm_backend=llm_backend,
+                    cold_start=cfg.cold_start,
+                    device_id=primary_device_id,
+                    op_logger=op_logger,
+                    pure_golden=cfg.pure_golden,
+                )
             except (OSError, RuntimeError, ValueError) as exc:
                 op_logger.error("STAGE0_SEED_FAILED op=%s error=%s", cfg.operator_name, exc)
                 return 2
@@ -2535,8 +2655,16 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--enable-tilesize-prescreen",
+        dest="enable_tilesize_prescreen",
         action="store_true",
-        help="Enable tile-size prescreen guidance table in creative prompts.",
+        default=True,
+        help="Enable tile-size prescreen guidance table in creative prompts (default: enabled).",
+    )
+    parser.add_argument(
+        "--disable-tilesize-prescreen",
+        dest="enable_tilesize_prescreen",
+        action="store_false",
+        help="Disable tile-size prescreen guidance table in creative prompts.",
     )
     parser.add_argument(
         "--cost-prescreen-top-k",

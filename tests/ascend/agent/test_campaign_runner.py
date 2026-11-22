@@ -161,6 +161,8 @@ def _make_stage_a(source: str) -> StageAResult:
         steady_state_ii=80 if "T.Kernel(2)" in source else 120,
         pipe_cycles={"AIV0.PIPE_V": 80 if "T.Kernel(2)" in source else 120},
         waterlines={},
+        grid_blocks=20,
+        wave_occupancy=0.60,
     )
     feats = extract_structural_features(None, ledger=ledger)
     route = route_execution_track(feats)
@@ -2208,9 +2210,9 @@ def _build_regime_a(tile_m=2):
         return out
 
     runner = PerfTargetCampaignRunner(
-        config=CampaignConfig(operator_name="attention_residual", max_rounds=2),
+        config=CampaignConfig(operator_name="synthetic_ar_op", max_rounds=2),
         target_module_path=target_path,
-        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        perf_target=PerfTargetSpec("synthetic_ar_op", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
         llm_backend=backend,
@@ -3078,7 +3080,7 @@ def test_campaign_axis_pruning_and_cross_topology_isolation(tmp_path: Path) -> N
     tracker = BayesianRuleTracker.from_seed_yaml()
     for _ in range(6):
         tracker.record_outcome(
-            "R01_DUAL_COPY_1C2V_SPLIT",
+            "R13_SPLIT_KV_WAVE_RECOVERY",
             postcondition_realized=False,
             topology_axes=vec_axes,
         )
@@ -4547,7 +4549,7 @@ def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
         out = {}
         for cid, mod_path in cands:
             src = mod_path.read_text(encoding="utf-8")
-            lat = 15.0 if "T.alloc_ss" in src else 12.0
+            lat = 15.0 if "T.alloc_ss" in src else (11.5 if cid.startswith("r2_") else 12.0)
             out[cid] = _make_surrogate_result(
                 cid,
                 "attention_residual",
@@ -5229,9 +5231,9 @@ def _trackb_campaign_runner(tmp_path: Path) -> PerfTargetCampaignRunner:
     module_path = tmp_path / "kernels.py"
     module_path.write_text(_TRACKB_MODULE, encoding="utf-8")
     return PerfTargetCampaignRunner(
-        config=CampaignConfig(operator_name="attention_residual", max_rounds=1),
+        config=CampaignConfig(operator_name="synthetic_hyb_op", max_rounds=1),
         target_module_path=module_path,
-        perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
+        perf_target=PerfTargetSpec("synthetic_hyb_op", 3.0, 2.0, 0.90),
         anchors=(),
         regime_specs=(spec,),
         regime_blueprints={spec.regime_tag: _blueprint_packet()},
@@ -5454,11 +5456,22 @@ def test_trackb_patch_protocol_accepts_scoped_hunks_bare_units_and_full_tu() -> 
         "\n",
         "",
     )
+    spliced_partial = patch_regime_into_module(
+        _TRACKB_MODULE,
+        spec,
+        dropped_sibling,
+        active_kernel="kernel_active",
+    )
+    assert "x[0] = 5.0f;" in spliced_partial
+    assert "kernel_sibling" in spliced_partial
+    assert "x[0] = 2.0f;" in spliced_partial
+
+    empty_tu_assign = "_TU = r'''// empty translation unit\n'''\n"
     with pytest.raises(ValueError, match="drops units"):
         patch_regime_into_module(
             _TRACKB_MODULE,
             spec,
-            dropped_sibling,
+            empty_tu_assign,
             active_kernel="kernel_active",
         )
 
