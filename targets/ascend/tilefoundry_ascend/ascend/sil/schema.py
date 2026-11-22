@@ -551,6 +551,8 @@ def classify_case_regime(
         parts.append("strided" if layout == "strided_or_gather" else "tail")
         if residency == "gm_multipass":
             parts.append("twopass")
+        if ratios.contig_atom_ratio < 1.0:
+            parts.append("subatom")
     else:
         parts.append("vector")
         if layout == "strided_or_gather":
@@ -795,6 +797,22 @@ def _split_case_regime_group(
     )
 
 
+def _phase_distance(left_sig: PhaseSignature, right_sig: PhaseSignature) -> int:
+    """Compute weighted lexicographic 5D phase distance."""
+    distance = 0
+    if left_sig[0] != right_sig[0]:
+        distance += 100
+    if left_sig[1] != right_sig[1]:
+        distance += 30
+    if left_sig[2] != right_sig[2]:
+        distance += 2
+    if left_sig[3] != right_sig[3]:
+        distance += 20 if "sub_atom_simt" in (left_sig[3], right_sig[3]) else 3
+    if left_sig[4] != right_sig[4]:
+        distance += 1
+    return distance
+
+
 def _merge_nearest_regimes(
     entries_by_tag: dict[str, list[CasePhysicsRegimeCase]],
 ) -> tuple[str, str, int]:
@@ -803,12 +821,7 @@ def _merge_nearest_regimes(
     for left_index, left in enumerate(tags):
         for right in tags[left_index + 1 :]:
             distance = min(
-                sum(
-                    left_band != right_band
-                    for left_band, right_band in zip(
-                        left_case.phase_signature, right_case.phase_signature
-                    )
-                )
+                _phase_distance(left_case.phase_signature, right_case.phase_signature)
                 for left_case in entries_by_tag[left]
                 for right_case in entries_by_tag[right]
             )

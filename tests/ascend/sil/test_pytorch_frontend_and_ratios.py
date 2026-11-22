@@ -869,7 +869,12 @@ def test_softmax_phase_bands_match_extractor_regimes(
     source, proto, cases = _load_op("softmax")
     semantics = analyzer.analyze_source(source, entry_name="softmax", proto=proto)
     tags = _extractor_regime_tags(extractor, "softmax")
-    assert set(tags.values()) == {"reduce_tail", "reduce_strided", "reduce_strided_twopass"}
+    assert set(tags.values()) == {
+        "reduce_tail",
+        "reduce_tail_subatom",
+        "reduce_strided",
+        "reduce_strided_twopass",
+    }
     signatures = {}
     for case in cases:
         ratios = analyzer.compute_case_ratios(semantics, case)
@@ -879,10 +884,15 @@ def test_softmax_phase_bands_match_extractor_regimes(
         tag = tags[case_id]
         if tag == "reduce_tail":
             assert signature[1] == "contiguous"
+            assert signature[3] != "sub_atom_simt"
+        elif tag == "reduce_tail_subatom":
+            assert signature[1] == "contiguous"
+            assert signature[3] == "sub_atom_simt"
         elif tag == "reduce_strided":
             assert signature[1] == "strided_or_gather"
             assert signature[2] != "gm_multipass"
         else:
+            assert tag == "reduce_strided_twopass"
             assert signature[1] == "strided_or_gather"
             assert signature[2] == "gm_multipass"
     case1, phase1 = signatures[1]

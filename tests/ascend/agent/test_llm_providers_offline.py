@@ -525,3 +525,52 @@ def test_cli_termination_reaps_worker(
     except FileNotFoundError:
         return
     assert stat.rsplit(")", 1)[1].split()[0] in ("Z", "X")
+
+
+@pytest.mark.parametrize("backend_kind", ["agy_cli", "claude_cli", "codex_cli"])
+def test_cli_backends_run_in_empty_isolated_temp_dir(
+    backend_kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify CLI workers execute in a clean temp cwd with zero repo markdown files."""
+    repo_root = Path(__file__).resolve().parents[3]
+    assert (repo_root / "AGENTS.md").is_file()
+    monkeypatch.chdir(repo_root)
+    executable = _write_cli(
+        tmp_path,
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "cwd = Path.cwd()\n"
+        "payload = json.dumps({\n"
+        "    'cwd': str(cwd),\n"
+        "    'pwd': os.environ.get('PWD', ''),\n"
+        "    'entries': os.listdir(cwd),\n"
+        "    'md_files': [str(p) for p in cwd.rglob('*.md')],\n"
+        "    'has_agents_md': (cwd / 'AGENTS.md').exists(),\n"
+        "    'has_claude_md': (cwd / 'CLAUDE.md').exists(),\n"
+        "})\n"
+        "if any(a.startswith('--print=') for a in sys.argv[1:]):\n"
+        "    print(json.dumps({'event': 'result', 'status': 'SUCCESS', 'response': payload}))\n"
+        "elif 'exec' in sys.argv:\n"
+        "    print(json.dumps({'type': 'item.completed',\n"
+        "                      'item': {'type': 'agent_message', 'text': payload}}))\n"
+        "else:\n"
+        "    print(payload)\n",
+    )
+    backend = create_llm_backend_from_env(
+        _settings(
+            BACKEND=backend_kind,
+            CLI_BIN=str(executable),
+            EXPLOIT_MODEL="isolated-worker",
+        )
+    )
+    raw = asyncio.run(backend.generate(GenerationRequest("exploit_rule", "sys", "usr")))
+    observed = json.loads(raw)
+    worker_cwd = Path(observed["cwd"]).resolve()
+    assert observed["pwd"] == observed["cwd"]
+    assert observed["entries"] == []
+    assert observed["md_files"] == []
+    assert observed["has_agents_md"] is False
+    assert observed["has_claude_md"] is False
+    assert worker_cwd != repo_root.resolve()
+    assert not worker_cwd.is_relative_to(repo_root.resolve())
+    assert not worker_cwd.exists()

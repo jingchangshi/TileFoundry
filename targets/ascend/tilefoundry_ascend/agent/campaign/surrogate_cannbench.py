@@ -17,7 +17,7 @@ import tempfile
 import time
 import tomllib
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -44,6 +44,7 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     _bounded_compile_diagnostic,
     _parse_cce_res_usage_with_summary,
     build_stage_b_driver_source,
+    check_repair_monotonicity,
     run_stage_a_static,
     run_stage_b_compile,
 )
@@ -55,6 +56,7 @@ from tilefoundry_ascend.agent.orchestrator.portfolio_runner import build_syntax_
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
     extract_microarch_profile_from_cce,
 )
+from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask
 
 logger = logging.getLogger(__name__)
 
@@ -774,6 +776,14 @@ async def run_l0_l1_round_filter(
     ]
     | None = None,
     cost_prescreen_top_k: int | None = None,
+    sil_advisory: object | None = None,
+    sil_verification: object | None = None,
+    freedom_mask: ConstraintRelaxationMask | None = None,
+    vector_mode: str = "simdvf",
+    ub_256kb_unlock: bool = False,
+    creative_candidate_ids: Collection[str] = (),
+    parent_analytical_us: float | None = None,
+    stage_a_analytical_scorer: Callable[[str, str, StageAResult], float] | None = None,
 ) -> list[L0L1CandidateCheck]:
     """Filter candidate snippets through L0 static, optional CostModel prescreen, and L1 compile."""
     max_attempts = max(0, max_syntax_repairs)
@@ -784,8 +794,13 @@ async def run_l0_l1_round_filter(
             cur_src,
             diag,
             slice_hint=slice_hint,
+            sil_advisory=sil_advisory,
+            sil_verification=sil_verification,
             backend_kind=backend_kind,
             parent_source=parent_source,
+            freedom_mask=freedom_mask,
+            vector_mode=vector_mode,
+            ub_256kb_unlock=ub_256kb_unlock,
         )
         try:
             raw_reply = await repair_backend.generate(req)
@@ -795,6 +810,18 @@ async def run_l0_l1_round_filter(
             repaired_src = extract_python_dsl(raw_reply)
         except Exception as exc:
             return None, f"{diag} | repair_parse: {type(exc).__name__}: {exc}", False
+        if parent_source.strip():
+            violations = check_repair_monotonicity(
+                parent_source,
+                repaired_src,
+                backend_kind=backend_kind,
+            )
+            if violations:
+                return (
+                    None,
+                    f"{diag} | repair_monotonicity_violation: {'; '.join(violations)}",
+                    False,
+                )
         return repaired_src, "", False
 
     async def _run_stage_a_phase(
@@ -1000,6 +1027,26 @@ async def run_l0_l1_round_filter(
         )
         kept_passers = sorted_passers[:top_k]
         reserve_passers = sorted_passers[top_k:]
+        creative_id_set = {str(cid) for cid in creative_candidate_ids}
+        if (
+            creative_id_set
+            and parent_analytical_us is not None
+            and float(parent_analytical_us) > 0.0
+            and not any(item[1] in creative_id_set for item in kept_passers)
+        ):
+            max_creative_us = 1.5 * float(parent_analytical_us)
+            for r_idx, item in enumerate(reserve_passers):
+                r_cid = item[1]
+                if r_cid not in creative_id_set:
+                    continue
+                analytical_us = (
+                    float(stage_a_analytical_scorer(r_cid, item[3], item[4]))
+                    if stage_a_analytical_scorer is not None
+                    else pred_by_id.get(r_cid, float("inf"))
+                )
+                if math.isfinite(analytical_us) and analytical_us <= max_creative_us:
+                    kept_passers.append(reserve_passers.pop(r_idx))
+                    break
     else:
         pred_by_id = {}
         kept_passers = passers

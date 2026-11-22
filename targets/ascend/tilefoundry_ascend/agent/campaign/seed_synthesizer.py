@@ -25,6 +25,7 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
 )
 from tilefoundry_ascend.agent.orchestrator.llm_constraints import (
     build_progressive_llm_constraints,
+    format_g5_parent_monotonicity_lock,
 )
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirBlueprintPacket
 from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
@@ -872,6 +873,8 @@ def _seed_feedback_section(
     if rejected_source is not None:
         sections.extend(
             [
+                format_g5_parent_monotonicity_lock(include_blueprint_retention=True),
+                "",
                 "### LAST REJECTED CANDIDATE SOURCE",
                 "```python",
                 rejected_source,

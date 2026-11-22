@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
+import copy
 import hashlib
 import importlib.util
 import inspect
@@ -148,7 +149,6 @@ from tilefoundry_ascend.ascend.cost_model import (
     CostFeatures,
     HybridAscendCostModel,
     build_cost_features_from_ledger,
-    topology_bucket_for_axes,
 )
 from tilefoundry_ascend.ascend.cost_model.experience_lake import (
     CandidateArtifactRecord,
@@ -1332,6 +1332,7 @@ def _other_regime_forbidden_symbols(
         forbidden.add(operator_entrypoint)
     forbidden.add("kernel")
     own_editable = set(regime_spec.editable_symbols)
+    own_builders = set(regime_spec.builder_candidates)
     for spec in sibling_specs:
         if spec.regime_tag == regime_spec.regime_tag:
             continue
@@ -1340,6 +1341,9 @@ def _other_regime_forbidden_symbols(
                 forbidden.add(sym)
         if spec.config_selector_fn and spec.config_selector_fn not in own_editable:
             forbidden.add(spec.config_selector_fn)
+        for cand in spec.builder_candidates:
+            if cand not in own_editable and cand not in own_builders:
+                forbidden.add(cand)
     forbidden.difference_update(own_editable)
     return forbidden
 
@@ -1347,45 +1351,83 @@ def _other_regime_forbidden_symbols(
 def extract_regime_snippet(
     module_source: str,
     regime_spec: RegimeTargetSpec,
+    *,
+    operator_entrypoint: str = "",
+    sibling_specs: Sequence[RegimeTargetSpec] = (),
 ) -> tuple[str, str]:
     """Extract target regime multi-symbol slice (selector, builders, helpers) cleanly."""
     tree = ast.parse(module_source)
     lines = module_source.splitlines(keepends=True)
+    symbols = _collect_top_level_symbols(tree)
+    ast_by_name = _collect_top_level_ast_nodes(tree)
+    editable_set = set(regime_spec.editable_symbols)
+    prefix = regime_spec.allowed_helper_prefix
 
-    if regime_spec.editable_symbols:
-        symbols = _collect_top_level_symbols(tree)
-        editable_set = set(regime_spec.editable_symbols)
-        prefix = regime_spec.allowed_helper_prefix
-        matched = [
+    seed_symbols: list[_TopLevelSymbol] = []
+    if editable_set:
+        seed_symbols = [
             sym
             for sym in symbols
             if sym.name in editable_set or (prefix and sym.name.startswith(prefix))
         ]
-        if matched:
-            func_names = {sym.name for sym in matched if sym.kind == "func"}
-            primary = ""
-            for cand in regime_spec.builder_candidates:
-                if cand in func_names:
-                    primary = cand
-                    break
-            if not primary:
-                primary = next(
-                    (sym.name for sym in matched if sym.kind == "func"),
-                    matched[0].name,
-                )
-            blocks = [
-                "".join(lines[sym.start - 1 : sym.end]).rstrip()
-                for sym in matched
-            ]
-            return primary, "\n\n".join(blocks).rstrip() + "\n"
+    if not seed_symbols:
+        node = _find_top_level_func(tree, regime_spec.builder_candidates)
+        if node is None:
+            raise ValueError(
+                f"No builder function matching {regime_spec.builder_candidates} found in module."
+            )
+        seed_symbols = [sym for sym in symbols if sym.name == node.name]
 
-    node = _find_top_level_func(tree, regime_spec.builder_candidates)
-    if node is None:
-        raise ValueError(
-            f"No builder function matching {regime_spec.builder_candidates} found in module."
+    seed_names = [sym.name for sym in seed_symbols]
+    seed_name_set = set(seed_names)
+    closure_helpers: set[str] = set()
+    if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
+        excluded = _other_regime_forbidden_symbols(
+            regime_spec,
+            operator_entrypoint=operator_entrypoint,
+            sibling_specs=sibling_specs,
         )
-    start, end = _func_line_span(node)
-    return node.name, "".join(lines[start - 1 : end]).rstrip() + "\n"
+        if editable_set:
+            for cand in regime_spec.builder_candidates:
+                if cand not in editable_set:
+                    excluded.add(cand)
+        private_func_candidates = {
+            sym.name
+            for sym in symbols
+            if sym.kind == "func"
+            and sym.name.startswith("_")
+            and sym.name not in excluded
+            and sym.name not in seed_name_set
+        }
+        closure_seed_names = [
+            name for name in seed_names if name != regime_spec.config_selector_fn
+        ] or seed_names
+        closure_helpers = _collect_referenced_helper_names(
+            ast_by_name,
+            helper_names=private_func_candidates,
+            seed_roots=closure_seed_names,
+        )
+    selected = [
+        sym
+        for sym in symbols
+        if sym.name in seed_name_set or sym.name in closure_helpers
+    ]
+    func_names = {sym.name for sym in selected if sym.kind == "func"}
+    primary = ""
+    for cand in regime_spec.builder_candidates:
+        if cand in func_names:
+            primary = cand
+            break
+    if not primary:
+        primary = next(
+            (sym.name for sym in selected if sym.kind == "func"),
+            selected[0].name,
+        )
+    blocks = [
+        "".join(lines[sym.start - 1 : sym.end]).rstrip()
+        for sym in selected
+    ]
+    return primary, "\n\n".join(blocks).rstrip() + "\n"
 
 
 def _is_prim_func_decorator(dec: ast.expr) -> bool:
@@ -1760,6 +1802,119 @@ def _is_real_tir_primfunc(obj: object) -> bool:
         return False
 
 
+def _cow_helper_name(regime_tag: str, helper_name: str) -> str:
+    """Return idempotent Copy-on-Write helper name scoped under regime_tag."""
+    cow_prefix = f"_{regime_tag}_"
+    if helper_name.startswith(cow_prefix):
+        return helper_name
+    return f"{cow_prefix}{helper_name.lstrip('_')}"
+
+
+class _CowHelperRenamer(ast.NodeTransformer):
+    """Rename CoW helper FunctionDefs and ast.Name references inside active symbols."""
+
+    def __init__(self, rename_map: Mapping[str, str]) -> None:
+        self._rename_map = dict(rename_map)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        if node.name in self._rename_map:
+            node.name = self._rename_map[node.name]
+        return self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        if node.name in self._rename_map:
+            node.name = self._rename_map[node.name]
+        return self.generic_visit(node)
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id in self._rename_map:
+            node.id = self._rename_map[node.id]
+        return node
+
+
+def _ast_references_any(node: ast.AST, names: Collection[str]) -> bool:
+    """Return True if *node* contains any ast.Name referencing a symbol in *names*."""
+    if not names:
+        return False
+    target_set = set(names)
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Name) and sub.id in target_set:
+            return True
+    return False
+
+
+def _render_with_cow_renames(
+    node: ast.stmt,
+    raw_source: str,
+    rename_map: Mapping[str, str],
+    *,
+    force_rename_self: str = "",
+) -> tuple[str, ast.stmt]:
+    """Apply _CowHelperRenamer when needed, preserving raw_source when unchanged."""
+    needs_rename = bool(
+        rename_map
+        and (
+            (force_rename_self and force_rename_self in rename_map)
+            or _ast_references_any(node, rename_map)
+        )
+    )
+    if not needs_rename:
+        return raw_source, node
+    transformed = _CowHelperRenamer(rename_map).visit(copy.deepcopy(node))
+    ast.fix_missing_locations(transformed)
+    return ast.unparse(transformed).rstrip() + "\n", transformed
+
+
+def _collect_shared_non_active_symbols(
+    orig_symbols: Sequence[_TopLevelSymbol],
+    orig_ast_by_name: Mapping[str, ast.stmt],
+    *,
+    active_own_symbols: set[str],
+    forbidden: set[str],
+) -> set[str]:
+    """Find top-level symbols reachable from sibling regimes or non-active roots."""
+    called_by_any: set[str] = set()
+    for caller_name, caller_node in orig_ast_by_name.items():
+        for sub in ast.walk(caller_node):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                ref = sub.id
+                if ref in orig_ast_by_name and ref != caller_name:
+                    called_by_any.add(ref)
+
+    non_active_roots = [
+        sym.name
+        for sym in orig_symbols
+        if sym.name not in active_own_symbols
+        and (
+            sym.name in forbidden
+            or not sym.name.startswith("_")
+            or sym.kind != "func"
+            or sym.name not in called_by_any
+        )
+    ]
+    shared_reachable: set[str] = set()
+    queue = list(non_active_roots)
+    visited: set[str] = set()
+    while queue:
+        cur = queue.pop(0)
+        if cur in visited:
+            continue
+        visited.add(cur)
+        if cur in active_own_symbols:
+            continue
+        node = orig_ast_by_name.get(cur)
+        if node is None:
+            continue
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                ref = sub.id
+                if ref in orig_ast_by_name and ref not in active_own_symbols:
+                    shared_reachable.add(ref)
+                    if ref not in visited:
+                        queue.append(ref)
+    return shared_reachable
+
+
 def patch_regime_into_module(
     module_source: str,
     regime_or_func: RegimeTargetSpec | str,
@@ -1807,27 +1962,32 @@ def patch_regime_into_module(
                 active_kernel=active_kernel,
             )
     orig_tree = ast.parse(module_source)
-    if not regime_spec.editable_symbols:
+    orig_symbols = _collect_top_level_symbols(orig_tree)
+    orig_by_name = {sym.name: sym for sym in orig_symbols}
+    orig_ast_by_name = _collect_top_level_ast_nodes(orig_tree)
+
+    if regime_spec.editable_symbols:
+        required_symbols = [sym for sym in regime_spec.editable_symbols if sym in orig_by_name]
+        if required_symbols:
+            effective_editable = tuple(regime_spec.editable_symbols)
+        else:
+            orig_node = _find_top_level_func(orig_tree, regime_spec.builder_candidates)
+            if orig_node is None:
+                raise ValueError(
+                    f"Original module missing regime symbols {regime_spec.editable_symbols}."
+                )
+            effective_editable = (orig_node.name,)
+    else:
         orig_node = _find_top_level_func(orig_tree, regime_spec.builder_candidates)
         if orig_node is None:
             raise ValueError(
                 f"Original module missing builder in {regime_spec.builder_candidates}."
             )
-        return apply_ast_patch(module_source, orig_node.name, python_snippet)
+        effective_editable = (orig_node.name,)
 
-    orig_symbols = _collect_top_level_symbols(orig_tree)
-    orig_by_name = {sym.name: sym for sym in orig_symbols}
-    editable_set = set(regime_spec.editable_symbols)
+    editable_set = set(effective_editable)
     prefix = regime_spec.allowed_helper_prefix
-
-    required_symbols = [sym for sym in regime_spec.editable_symbols if sym in orig_by_name]
-    if not required_symbols:
-        orig_node = _find_top_level_func(orig_tree, regime_spec.builder_candidates)
-        if orig_node is None:
-            raise ValueError(
-                f"Original module missing regime symbols {regime_spec.editable_symbols}."
-            )
-        return apply_ast_patch(module_source, orig_node.name, python_snippet)
+    cow_prefix = f"_{regime_spec.regime_tag}_"
 
     cand_tree = ast.parse(python_snippet)
     cand_symbols: list[_TopLevelSymbol] = []
@@ -1838,9 +1998,7 @@ def patch_regime_into_module(
         operator_entrypoint=operator_entrypoint,
         sibling_specs=sibling_specs,
     )
-    for sym_name in orig_by_name:
-        if sym_name not in editable_set and not (prefix and sym_name.startswith(prefix)):
-            forbidden.add(sym_name)
+    forbidden.difference_update(editable_set)
 
     for node in cand_tree.body:
         start, end = _stmt_line_span(node)
@@ -1868,15 +2026,6 @@ def patch_regime_into_module(
         if name in seen_cand:
             raise ValueError(f"Candidate snippet defines duplicate symbol {name!r}.")
         seen_cand.add(name)
-
-        if name in forbidden:
-            raise ValueError(f"Candidate cannot define or modify protected symbol {name!r}.")
-        if name not in editable_set:
-            if not prefix or not name.startswith(prefix):
-                raise ValueError(
-                    f"Unauthorized top-level symbol {name!r}; expected {editable_set} "
-                    f"or prefix {prefix!r}."
-                )
         cand_symbols.append(_TopLevelSymbol(name, kind, start, end))
         cand_ast_by_name[name] = node
 
@@ -1885,31 +2034,175 @@ def patch_regime_into_module(
             "Candidate snippet must define at least one authorized regime symbol."
         )
 
+    private_func_pool = {
+        sym.name
+        for sym in (*orig_symbols, *cand_symbols)
+        if sym.kind == "func"
+        and sym.name.startswith("_")
+        and sym.name not in forbidden
+        and sym.name not in editable_set
+    }
+    active_check_asts = {**orig_ast_by_name, **cand_ast_by_name}
+    active_seed_roots = [
+        name
+        for name in (
+            *effective_editable,
+            *(
+                sym.name
+                for sym in cand_symbols
+                if (prefix and sym.name.startswith(prefix))
+                or sym.name.startswith(cow_prefix)
+            ),
+        )
+        if name in active_check_asts
+    ]
+    referenced_private_funcs = _collect_referenced_helper_names(
+        active_check_asts,
+        helper_names=private_func_pool,
+        seed_roots=active_seed_roots,
+    )
+
+    for sym in cand_symbols:
+        name = sym.name
+        if name in forbidden:
+            raise ValueError(f"Candidate cannot define or modify protected symbol {name!r}.")
+        if name in editable_set:
+            continue
+        if (prefix and name.startswith(prefix)) or name.startswith(cow_prefix):
+            continue
+        is_referenced_private_func = (
+            sym.kind == "func"
+            and name.startswith("_")
+            and name in referenced_private_funcs
+        )
+        if name in orig_by_name:
+            if not is_referenced_private_func:
+                raise ValueError(f"Candidate cannot define or modify protected symbol {name!r}.")
+        elif not is_referenced_private_func:
+            raise ValueError(
+                f"Unauthorized top-level symbol {name!r}; expected {editable_set} "
+                f"or prefix {prefix!r}."
+            )
+
     cand_lines = python_snippet.splitlines(keepends=True)
     cand_slices = {
         sym.name: "".join(cand_lines[sym.start - 1 : sym.end]).rstrip() + "\n"
         for sym in cand_symbols
     }
 
-    orig_regime_items = [
-        sym
-        for sym in orig_symbols
-        if sym.name in editable_set or (prefix and sym.name.startswith(prefix))
-    ]
-    merged_ast_by_name = _collect_top_level_ast_nodes(orig_tree)
-    merged_ast_by_name.update(cand_ast_by_name)
-    parent_helper_names = {
+    active_own_symbols = set(editable_set) | {
         sym.name
-        for sym in orig_regime_items
-        if sym.name not in editable_set and prefix and sym.name.startswith(prefix)
+        for sym in orig_symbols
+        if (prefix and sym.name.startswith(prefix)) or sym.name.startswith(cow_prefix)
     }
-    all_helper_names = set(parent_helper_names) | {
-        sym.name for sym in cand_symbols if sym.name not in editable_set
+    shared_reachable = _collect_shared_non_active_symbols(
+        orig_symbols,
+        orig_ast_by_name,
+        active_own_symbols=active_own_symbols,
+        forbidden=forbidden,
+    )
+
+    edited_cand_helpers = {
+        sym.name
+        for sym in cand_symbols
+        if sym.kind == "func"
+        and sym.name not in editable_set
+        and (
+            sym.name not in orig_ast_by_name
+            or ast.dump(cand_ast_by_name[sym.name]) != ast.dump(orig_ast_by_name[sym.name])
+        )
     }
+    cow_targets = edited_cand_helpers & shared_reachable
+    if cow_targets:
+        changed_closure = True
+        while changed_closure:
+            changed_closure = False
+            for hname in list(shared_reachable):
+                if hname in cow_targets or hname in editable_set:
+                    continue
+                hnode = cand_ast_by_name.get(hname) or orig_ast_by_name.get(hname)
+                if hnode is not None and _ast_references_any(hnode, cow_targets):
+                    cow_targets.add(hname)
+                    changed_closure = True
+    rename_map = {
+        hname: _cow_helper_name(regime_spec.regime_tag, hname)
+        for hname in sorted(cow_targets)
+    }
+    rename_map = {k: v for k, v in rename_map.items() if k != v}
+
+    rendered_by_target: dict[str, str] = {}
+    rendered_ast_by_target: dict[str, ast.stmt] = {}
+    for sym in cand_symbols:
+        if (
+            sym.name in shared_reachable
+            and sym.name not in rename_map
+            and sym.name not in editable_set
+        ):
+            continue
+        target_name = rename_map.get(sym.name, sym.name)
+        rendered_src, rendered_node = _render_with_cow_renames(
+            cand_ast_by_name[sym.name],
+            cand_slices[sym.name],
+            rename_map,
+            force_rename_self=sym.name,
+        )
+        rendered_by_target[target_name] = rendered_src
+        rendered_ast_by_target[target_name] = rendered_node
+
+    orig_lines = module_source.splitlines(keepends=True)
+    if rename_map:
+        for ename in effective_editable:
+            if ename in orig_ast_by_name and ename not in cand_ast_by_name:
+                orig_sym = orig_by_name[ename]
+                orig_raw = "".join(orig_lines[orig_sym.start - 1 : orig_sym.end]).rstrip() + "\n"
+                rendered_src, rendered_node = _render_with_cow_renames(
+                    orig_ast_by_name[ename],
+                    orig_raw,
+                    rename_map,
+                )
+                if rendered_node is not orig_ast_by_name[ename]:
+                    rendered_by_target[ename] = rendered_src
+                    rendered_ast_by_target[ename] = rendered_node
+        for hname in referenced_private_funcs:
+            if (
+                hname in orig_ast_by_name
+                and hname not in cand_ast_by_name
+                and hname not in shared_reachable
+                and hname not in editable_set
+            ):
+                orig_sym = orig_by_name[hname]
+                orig_raw = "".join(orig_lines[orig_sym.start - 1 : orig_sym.end]).rstrip() + "\n"
+                rendered_src, rendered_node = _render_with_cow_renames(
+                    orig_ast_by_name[hname],
+                    orig_raw,
+                    rename_map,
+                )
+                if rendered_node is not orig_ast_by_name[hname]:
+                    rendered_by_target[hname] = rendered_src
+                    rendered_ast_by_target[hname] = rendered_node
+
+    merged_ast_by_name = dict(orig_ast_by_name)
+    merged_ast_by_name.update(rendered_ast_by_target)
+    prunable_orig_helpers = {
+        sym.name
+        for sym in orig_symbols
+        if sym.name not in editable_set
+        and sym.name not in shared_reachable
+        and ((prefix and sym.name.startswith(prefix)) or sym.name.startswith(cow_prefix))
+    }
+    prunable_cand_cow = {
+        name
+        for name in rendered_ast_by_target
+        if name not in editable_set and name.startswith(cow_prefix)
+    }
+    all_helper_names = (
+        prunable_orig_helpers
+        | {name for name in rendered_ast_by_target if name not in editable_set}
+    )
     seed_roots = [
         name
         for name in merged_ast_by_name
-        if name not in parent_helper_names or name in cand_slices
+        if name not in prunable_orig_helpers and name not in prunable_cand_cow
     ]
     live_helpers = _collect_referenced_helper_names(
         merged_ast_by_name,
@@ -1917,28 +2210,41 @@ def patch_regime_into_module(
         seed_roots=seed_roots,
     )
 
-    new_helpers = [
-        sym
-        for sym in cand_symbols
-        if sym.name not in editable_set and sym.name not in orig_by_name
+    new_helper_names = [
+        name
+        for name in rendered_by_target
+        if name not in editable_set
+        and name not in orig_by_name
+        and (name not in prunable_cand_cow or name in live_helpers)
     ]
-    insert_line_idx = orig_regime_items[0].start - 1
+    insert_anchor = next(
+        (
+            sym.name
+            for sym in orig_symbols
+            if sym.name in editable_set
+            or (prefix and sym.name.startswith(prefix))
+            or sym.name.startswith(cow_prefix)
+        ),
+        orig_symbols[0].name,
+    )
 
-    orig_lines = module_source.splitlines(keepends=True)
-    for item in reversed(orig_regime_items):
-        if item.name in cand_slices:
-            orig_lines[item.start - 1 : item.end] = [cand_slices[item.name]]
-        elif item.name in editable_set or item.name in live_helpers:
-            continue
-        else:
+    for item in reversed(orig_symbols):
+        if item.name in rendered_by_target:
+            if item.name in prunable_cand_cow and item.name not in live_helpers:
+                del_end = item.end
+                while del_end < len(orig_lines) and orig_lines[del_end].strip() == "":
+                    del_end += 1
+                del orig_lines[item.start - 1 : del_end]
+            else:
+                orig_lines[item.start - 1 : item.end] = [rendered_by_target[item.name]]
+        elif item.name in prunable_orig_helpers and item.name not in live_helpers:
             del_end = item.end
             while del_end < len(orig_lines) and orig_lines[del_end].strip() == "":
                 del_end += 1
             del orig_lines[item.start - 1 : del_end]
-
-    if new_helpers:
-        helper_block = "".join(cand_slices[h.name] + "\n" for h in new_helpers)
-        orig_lines[insert_line_idx:insert_line_idx] = [helper_block]
+        if item.name == insert_anchor and new_helper_names:
+            helper_block = "".join(rendered_by_target[hname] + "\n" for hname in new_helper_names)
+            orig_lines[item.start - 1 : item.start - 1] = [helper_block]
 
     patched = "".join(orig_lines)
     ast.parse(patched)
@@ -2207,10 +2513,6 @@ class PerfTargetCampaignRunner:
             )
         else:
             self._cost_calibration_path = None
-        self._cost_model = HybridAscendCostModel(
-            self._target,
-            calibration_path=self._cost_calibration_path,
-        )
         self._experience_lake_dir = resolve_default_experience_lake_dir(
             worktree=None,
             checkpoint_path=self._checkpoint_path or self._campaign_kb_path,
@@ -2220,6 +2522,11 @@ class PerfTargetCampaignRunner:
             ExperienceLake(self._experience_lake_dir)
             if self._experience_lake_dir is not None
             else None
+        )
+        self._cost_model = HybridAscendCostModel(
+            self._target,
+            calibration_path=self._cost_calibration_path,
+            anomaly_lake=self._experience_lake,
         )
         op_slug = self._config.operator_name.replace("/", "_")
         self._run_id = f"{op_slug}_{int(time.time())}_{os.getpid()}"
@@ -3441,6 +3748,152 @@ class PerfTargetCampaignRunner:
             require_all_passed=False,
         )
         return results, {candidate_id: run_id for candidate_id in results}
+
+    def _recheck_single_sibling_anchor(
+        self,
+        candidate_id: str,
+        candidate_source: str,
+        dipped_anchor: AnchorCaseSpec,
+    ) -> CandidateSurrogateResult | None:
+        """Re-evaluate one candidate on a single dipped sibling anchor."""
+        with tempfile.TemporaryDirectory(prefix="tf_camp_recheck_") as tmp_dir:
+            cand_file = Path(tmp_dir) / f"{candidate_id}.py"
+            cand_file.write_text(candidate_source, encoding="utf-8")
+            try:
+                l2_results, _ = self._run_l2_batch(
+                    [(candidate_id, cand_file)], [dipped_anchor]
+                )
+            except (
+                OSError,
+                subprocess.SubprocessError,
+                TimeoutError,
+                json.JSONDecodeError,
+                RuntimeError,
+            ) as exc:
+                logger.warning(
+                    "Single-point sibling recheck failed for %s case %d: %s",
+                    candidate_id,
+                    dipped_anchor.case_num,
+                    exc,
+                )
+                return None
+        return l2_results.get(candidate_id)
+
+    def _evaluate_dual_layer_tail_guard(
+        self,
+        *,
+        candidate_id: str,
+        candidate_source: str,
+        top_res: CandidateSurrogateResult,
+        best_result: CandidateSurrogateResult,
+        regime_spec: RegimeTargetSpec,
+        active_anchors: Sequence[AnchorCaseSpec],
+    ) -> tuple[bool, CandidateSurrogateResult]:
+        """Enforce active-regime tail floor and 0.98x untouched-sibling guard."""
+        top_local = top_res.for_regime(regime_spec.regime_tag)
+        best_local = best_result.for_regime(regime_spec.regime_tag)
+        if top_local.anchors and best_local.anchors:
+            active_tail_ok = (
+                top_local.min_case_speedup >= 0.97 * best_local.min_case_speedup
+            )
+        else:
+            active_tail_ok = top_res.min_case_speedup >= 0.97 * best_result.min_case_speedup
+        if not active_tail_ok:
+            return False, top_res
+
+        def _has_promotion_gain(cand_res: CandidateSurrogateResult) -> bool:
+            cand_local = cand_res.for_regime(regime_spec.regime_tag)
+            surrogate_gain = cand_res.surrogate_score - best_result.surrogate_score
+            global_gain_ok = (
+                surrogate_gain >= self._config.min_surrogate_gain
+                or (
+                    cand_res.min_case_speedup >= 1.03 * best_result.min_case_speedup
+                    and cand_res.surrogate_score >= best_result.surrogate_score - 1e-6
+                )
+            )
+            local_gain_ok = bool(
+                cand_local.anchors
+                and best_local.anchors
+                and (
+                    (cand_local.surrogate_score - best_local.surrogate_score)
+                    >= self._config.min_surrogate_gain
+                    or (
+                        cand_local.avg_speedup >= 1.02 * best_local.avg_speedup
+                        and cand_res.surrogate_score > best_result.surrogate_score + 1e-6
+                    )
+                )
+            )
+            return global_gain_ok or local_gain_ok
+
+        best_by_case = {int(a.case_num): a for a in best_result.anchors}
+        dipped_siblings: list[tuple[AnchorEvalMetrics, AnchorEvalMetrics]] = []
+        for cand_anchor in top_res.anchors:
+            if cand_anchor.regime_tag == regime_spec.regime_tag:
+                continue
+            best_anchor = best_by_case.get(int(cand_anchor.case_num))
+            if best_anchor is None:
+                continue
+            if cand_anchor.speedup < 0.98 * best_anchor.speedup:
+                dipped_siblings.append((cand_anchor, best_anchor))
+
+        if len(dipped_siblings) >= 2:
+            return False, top_res
+
+        updated_top_res = top_res
+        if len(dipped_siblings) == 1:
+            if not (
+                _has_promotion_gain(top_res)
+                or (
+                    top_local.anchors
+                    and best_local.anchors
+                    and top_local.avg_speedup >= 1.02 * best_local.avg_speedup
+                )
+            ):
+                return False, top_res
+            dipped_cand_anchor, dipped_best_anchor = dipped_siblings[0]
+            anchor_spec_by_case = {int(a.case_num): a for a in active_anchors}
+            dipped_spec = anchor_spec_by_case.get(int(dipped_cand_anchor.case_num))
+            if dipped_spec is None:
+                dipped_spec = AnchorCaseSpec(
+                    task=f"operator/{top_res.operator_name}",
+                    case_num=int(dipped_cand_anchor.case_num),
+                    regime_tag=dipped_cand_anchor.regime_tag,
+                    ref_perf_us=dipped_cand_anchor.ref_perf_us,
+                    t_hw_us=dipped_cand_anchor.t_hw_us,
+                )
+            recheck_res = self._recheck_single_sibling_anchor(
+                candidate_id, candidate_source, dipped_spec
+            )
+            if recheck_res is None or not recheck_res.all_passed:
+                return False, top_res
+            recheck_anchor = next(
+                (
+                    a
+                    for a in recheck_res.anchors
+                    if int(a.case_num) == int(dipped_cand_anchor.case_num)
+                ),
+                None,
+            )
+            if (
+                recheck_anchor is None
+                or not recheck_anchor.accuracy_passed
+                or recheck_anchor.speedup < 0.98 * dipped_best_anchor.speedup
+            ):
+                return False, top_res
+            merged_anchors = tuple(
+                recheck_anchor
+                if int(a.case_num) == int(dipped_cand_anchor.case_num)
+                else a
+                for a in top_res.anchors
+            )
+            updated_top_res = aggregate_surrogate_result(
+                top_res.candidate_id,
+                top_res.operator_name,
+                merged_anchors,
+                error_message=top_res.error_message,
+            )
+
+        return _has_promotion_gain(updated_top_res), updated_top_res
 
     def _run_l3_contract(
         self,
@@ -6994,12 +7447,7 @@ class PerfTargetCampaignRunner:
                 ):
                     prescreen_top_k = int(self._config.cost_prescreen_top_k)
                 elif self._config.cost_prescreen_top_k is None and len(raw_candidates) >= 3:
-                    active_bucket = topology_bucket_for_axes(parent_axes)
-                    if bool(
-                        self._cost_model.active_head0_spec_names(active_bucket)
-                        or self._cost_model.active_head0_spec_names("global")
-                    ):
-                        prescreen_top_k = 2
+                    prescreen_top_k = 2
             stage_a_ranker = (
                 (
                     lambda passers: [
@@ -7018,6 +7466,34 @@ class PerfTargetCampaignRunner:
                 if prescreen_top_k is not None
                 else None
             )
+            creative_candidate_ids = {
+                cid
+                for cid, _ in raw_candidates
+                if meta_by_id[cid][0] == "creative_explore"
+            }
+            raw_parent_analytical_us = float(parent_cost_pred.tier0_physics_us) + float(
+                parent_cost_pred.tier1_penalty_us
+            )
+            parent_analytical_us = (
+                raw_parent_analytical_us if raw_parent_analytical_us > 0.0 else None
+            )
+
+            def _score_stage_a_analytical(
+                _cid: str,
+                _patched_src: str,
+                stage_a: StageAResult,
+            ) -> float:
+                features = build_cost_features_from_ledger(
+                    stage_a.ledger,
+                    live_plan=live_plan,
+                    axes=parent_axes,
+                    blueprint=blueprint,
+                    sil_advisory=self._sil_advisory,
+                    target=self._cost_model.target,
+                )
+                pred = self._cost_model.predict(features)
+                return float(pred.tier0_physics_us) + float(pred.tier1_penalty_us)
+
             def _candidate_l0_check(mod_src: str) -> StageAResult:
                 dead_err = _detect_trackb_dead_code_edit(
                     parent_module_source, mod_src, regime_spec
@@ -7066,6 +7542,14 @@ class PerfTargetCampaignRunner:
                 parent_source=repair_parent_source,
                 stage_a_cost_ranker=stage_a_ranker,
                 cost_prescreen_top_k=prescreen_top_k,
+                sil_advisory=self._sil_advisory,
+                freedom_mask=active_mask,
+                ub_256kb_unlock=(
+                    bool(parent_ledger.uses_unreserved_ubuf) if parent_ledger else False
+                ),
+                creative_candidate_ids=creative_candidate_ids,
+                parent_analytical_us=parent_analytical_us,
+                stage_a_analytical_scorer=_score_stage_a_analytical,
             )
 
         passed_checks = [chk for chk in l0_l1_checks if chk.passed]
@@ -7149,38 +7633,22 @@ class PerfTargetCampaignRunner:
                 passing_candidates,
                 key=lambda item: _surrogate_rank_key(item[1]),
             )
+            tail_guard_ok, top_res = self._evaluate_dual_layer_tail_guard(
+                candidate_id=top_chk.candidate_id,
+                candidate_source=top_chk.patched_module_source,
+                top_res=top_res,
+                best_result=best_result,
+                regime_spec=regime_spec,
+                active_anchors=active_anchors,
+            )
             best_round_speedup = top_res.avg_speedup
             best_round_surrogate_score = top_res.surrogate_score
-            surrogate_gain = top_res.surrogate_score - best_result.surrogate_score
             rel_gain = (
                 (top_res.avg_speedup - best_result.avg_speedup)
                 / max(best_result.avg_speedup, 1e-6)
             )
-            tail_guard_ok = (
-                top_res.min_case_speedup >= 0.97 * best_result.min_case_speedup
-                and top_res.surrogate_score >= best_result.surrogate_score - 1e-6
-            )
-            global_gain_ok = (
-                surrogate_gain >= self._config.min_surrogate_gain
-                or (
-                    top_res.min_case_speedup >= 1.03 * best_result.min_case_speedup
-                    and top_res.surrogate_score >= best_result.surrogate_score - 1e-6
-                )
-            )
             top_local = top_res.for_regime(regime_spec.regime_tag)
             best_local = best_result.for_regime(regime_spec.regime_tag)
-            local_gain_ok = bool(
-                top_local.anchors
-                and best_local.anchors
-                and (
-                    (top_local.surrogate_score - best_local.surrogate_score)
-                    >= self._config.min_surrogate_gain
-                    or (
-                        top_local.avg_speedup >= 1.02 * best_local.avg_speedup
-                        and top_res.surrogate_score > best_result.surrogate_score + 1e-6
-                    )
-                )
-            )
             if top_local.anchors and best_local.anchors:
                 top_local_lat = top_local.mean_latency_us()
                 best_local_lat = best_local.mean_latency_us()
@@ -7193,8 +7661,7 @@ class PerfTargetCampaignRunner:
                         else 0.0
                     ),
                 )
-            dual_criterion_ok = global_gain_ok or local_gain_ok
-            if tail_guard_ok and dual_criterion_ok:
+            if tail_guard_ok:
                 _atomic_write_text(self._target_module_path, top_chk.patched_module_source)
                 candidate_sha = self._source_sha256(top_chk.patched_module_source)
 

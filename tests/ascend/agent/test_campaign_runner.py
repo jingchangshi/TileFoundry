@@ -5314,6 +5314,7 @@ def test_runner_resolves_instantiated_trackb_kernel_per_softmax_regime(
     monkeypatch.setattr(runner, "_instantiate_trackb_tu", _counting_instantiate)
     expected = {
         "reduce_tail": "softmax_last_axis_kernel",
+        "reduce_tail_subatom": "softmax_last_axis_kernel",
         "reduce_strided_twopass": "softmax_inner_2pass_kernel",
         "reduce_strided": "softmax_inner_1pass_kernel",
     }

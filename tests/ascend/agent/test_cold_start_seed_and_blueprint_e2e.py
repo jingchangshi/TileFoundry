@@ -1409,7 +1409,7 @@ def test_fifteen_production_operators_use_capped_wp1_campaign_partitions() -> No
         "exp": 2,
         "mla": 4,
         "q4_0_dequant_matmul": 3,
-        "softmax": 3,
+        "softmax": 4,
     }
     checked = 0
     for operator_name in operators:

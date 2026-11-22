@@ -15,6 +15,8 @@ from tilefoundry_ascend.ascend.sil import (
     VALID_ITERATION_REGULARITIES,
     VALID_MEMORY_RINGS,
     AdvisoryEnvelope,
+    CasePhysicsRatios,
+    CasePhysicsRegimeCase,
     ConstraintRelaxationMask,
     HardwareLegalityBounds,
     OpAdvisoryExtractor,
@@ -26,9 +28,12 @@ from tilefoundry_ascend.ascend.sil import (
     TelemetryFeedback,
     TopologyAxes,
     VerificationReport,
+    classify_case_regime,
+    partition_case_regimes,
     synthesize_default_policy,
     verify_policy_envelope,
 )
+from tilefoundry_ascend.ascend.sil.schema import _merge_nearest_regimes
 
 AXES_SIMD = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
 AXES_SIMT = TopologyAxes("aiv_only", "ub_random_atomic", "irregular_simt")
@@ -464,3 +469,187 @@ def test_all_60_cannbench_operators_extract_synthesize_and_verify(tmp_path: Path
     kda_env = SchedulingEnvelope(advisory=kda_adv, policy=kda_pol, verification=kda_rep)
     out_file = kda_env.save_json(tmp_path / "kda_sil.json")
     assert SchedulingEnvelope.load_json(out_file) == kda_env
+
+
+def _reduction_ratios(
+    *,
+    case_id: int,
+    stride_ratio: float = 1.0,
+    contig_atom_ratio: float = 4.0,
+    is_atom_aligned: bool = True,
+    working_set_sram_ratio: float = 0.5,
+    working_set_vreg_ratio: float = 0.5,
+    wave_occupancy_ratio: float = 1.0,
+    inner_contiguous_bytes: int = 128,
+    has_empty_group: bool = False,
+) -> CasePhysicsRatios:
+    return CasePhysicsRatios(
+        case_id=case_id,
+        stride_ratio=stride_ratio,
+        contig_atom_ratio=contig_atom_ratio,
+        is_atom_aligned=is_atom_aligned,
+        working_set_sram_ratio=working_set_sram_ratio,
+        working_set_vreg_ratio=working_set_vreg_ratio,
+        wave_occupancy_ratio=wave_occupancy_ratio,
+        oi_ridge_ratio=0.5,
+        inner_contiguous_bytes=inner_contiguous_bytes,
+        has_empty_group=has_empty_group,
+    )
+
+
+def test_reduction_subatom_regime_classification_and_partition() -> None:
+    subatom = _reduction_ratios(
+        case_id=1,
+        contig_atom_ratio=4.0 / 32.0,
+        is_atom_aligned=False,
+        inner_contiguous_bytes=4,
+    )
+    tail = _reduction_ratios(case_id=2)
+    strided = _reduction_ratios(case_id=3, stride_ratio=4.0)
+    twopass = _reduction_ratios(
+        case_id=4,
+        stride_ratio=4.0,
+        working_set_vreg_ratio=2.0,
+        working_set_sram_ratio=2.0,
+    )
+    dims = {"rows": 1000003, "cols": 2}
+    assert classify_case_regime(subatom, kind="reduction", axes=AXES_SIMD, dims=dims) == (
+        "reduce_tail_subatom"
+    )
+    assert classify_case_regime(tail, kind="reduction", axes=AXES_SIMD, dims=dims) == "reduce_tail"
+    assert classify_case_regime(strided, kind="reduction", axes=AXES_SIMD, dims=dims) == (
+        "reduce_strided"
+    )
+    assert classify_case_regime(twopass, kind="reduction", axes=AXES_SIMD, dims=dims) == (
+        "reduce_strided_twopass"
+    )
+
+    ratios_by_case = {1: subatom, 2: tail, 3: strided, 4: twopass}
+    dims_by_case = {cid: dims for cid in ratios_by_case}
+    workloads = {cid: 4096 * cid for cid in ratios_by_case}
+    groups = partition_case_regimes(
+        ratios_by_case,
+        dims_by_case,
+        workloads,
+        kind="reduction",
+        axes=AXES_SIMD,
+    )
+    assert 2 <= len(groups) <= 4
+    assert {group.regime_tag for group in groups} == {
+        "reduce_tail_subatom",
+        "reduce_tail",
+        "reduce_strided",
+        "reduce_strided_twopass",
+    }
+
+
+def test_weighted_lexicographic_merge_respects_hard_boundaries() -> None:
+    base_sig = (
+        "aiv_vector_or_gemv",
+        "contiguous",
+        "sram_1pass",
+        "aligned_vector",
+        "balanced_waves",
+    )
+    soft_diff_sig = (
+        "aiv_vector_or_gemv",
+        "contiguous",
+        "gm_multipass",
+        "unaligned_predicated",
+        "under_occupied_split",
+    )
+    subatom_sig = (
+        "aiv_vector_or_gemv",
+        "contiguous",
+        "sram_1pass",
+        "sub_atom_simt",
+        "balanced_waves",
+    )
+    layout_sig = (
+        "aiv_vector_or_gemv",
+        "strided_or_gather",
+        "sram_1pass",
+        "aligned_vector",
+        "balanced_waves",
+    )
+    engine_sig = (
+        "aic_cube",
+        "contiguous",
+        "sram_1pass",
+        "aligned_vector",
+        "balanced_waves",
+    )
+
+    def _entry(case_id: int, sig: tuple[str, str, str, str, str]) -> list[CasePhysicsRegimeCase]:
+        return [
+            CasePhysicsRegimeCase(
+                case_id=case_id,
+                dims={"M": 64, "N": 64},
+                phase_signature=sig,
+                workload_bytes=4096,
+            )
+        ]
+
+    left, right, dist = _merge_nearest_regimes(
+        {
+            "base": _entry(1, base_sig),
+            "soft": _entry(2, soft_diff_sig),
+            "subatom": _entry(3, subatom_sig),
+            "layout": _entry(4, layout_sig),
+            "engine": _entry(5, engine_sig),
+        }
+    )
+    assert (left, right, dist) == ("base", "soft", 6)
+
+    left_sub, right_sub, dist_sub = _merge_nearest_regimes(
+        {
+            "base": _entry(1, base_sig),
+            "subatom": _entry(3, subatom_sig),
+            "layout": _entry(4, layout_sig),
+            "engine": _entry(5, engine_sig),
+        }
+    )
+    assert (left_sub, right_sub, dist_sub) == ("base", "subatom", 20)
+
+    left_lay, right_lay, dist_lay = _merge_nearest_regimes(
+        {
+            "base": _entry(1, base_sig),
+            "layout": _entry(4, layout_sig),
+            "engine": _entry(5, engine_sig),
+        }
+    )
+    assert (left_lay, right_lay, dist_lay) == ("base", "layout", 30)
+
+    ratios_by_case = {
+        1: _reduction_ratios(
+            case_id=1,
+            contig_atom_ratio=0.125,
+            is_atom_aligned=False,
+            inner_contiguous_bytes=4,
+        ),
+        2: _reduction_ratios(case_id=2),
+        3: _reduction_ratios(
+            case_id=3,
+            working_set_vreg_ratio=2.0,
+            working_set_sram_ratio=2.0,
+        ),
+        4: _reduction_ratios(case_id=4, stride_ratio=4.0),
+        5: _reduction_ratios(
+            case_id=5,
+            stride_ratio=4.0,
+            working_set_vreg_ratio=2.0,
+            working_set_sram_ratio=2.0,
+        ),
+        6: _reduction_ratios(case_id=6, has_empty_group=True),
+    }
+    groups = partition_case_regimes(
+        ratios_by_case,
+        {cid: {"rows": 1024, "cols": 64} for cid in ratios_by_case},
+        {cid: 4096 * cid for cid in ratios_by_case},
+        kind="reduction",
+        axes=AXES_SIMD,
+    )
+    assert 2 <= len(groups) <= 4
+    subatom_groups = [g for g in groups if g.regime_tag == "reduce_tail_subatom"]
+    assert len(subatom_groups) == 1
+    assert subatom_groups[0].case_ids == (1,)

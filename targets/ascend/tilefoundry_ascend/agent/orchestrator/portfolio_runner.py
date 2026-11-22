@@ -13,7 +13,11 @@ from tilefoundry_ascend.agent.kb.schema import (
     build_predicate_context,
     rank_symptom_families,
 )
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import FunnelEvaluation, GateFunnel
+from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    FunnelEvaluation,
+    GateFunnel,
+    check_repair_monotonicity,
+)
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     CREATIVE_RESPONSE_SCHEMA,
     AgyCliLLMBackend,
@@ -24,7 +28,12 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     extract_creative_payload,
     extract_python_dsl,
 )
-from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
+from tilefoundry_ascend.agent.orchestrator.llm_constraints import (
+    build_progressive_llm_constraints,
+    format_g5_parent_monotonicity_lock,
+    format_hardware_and_sil_layer,
+    format_target_dialect_layer,
+)
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate,
     TwoLaneBeamSearch,
@@ -780,6 +789,9 @@ def build_syntax_repair_request(
     sil_verification: object | None = None,
     backend_kind: str = "tilelang_dsl",
     parent_source: str = "",
+    freedom_mask: ConstraintRelaxationMask | None = None,
+    vector_mode: str = "simdvf",
+    ub_256kb_unlock: bool = False,
 ) -> GenerationRequest:
     """Build bounded syntax/compile repair request routed to the active backend dialect."""
     hint_sentence = f" Authorized target: {slice_hint}." if slice_hint else ""
@@ -806,6 +818,15 @@ def build_syntax_repair_request(
             f"BROKEN KERNEL SOURCE (do NOT add unprefixed or out-of-regime functions)."
             f"{hint_sentence}"
         )
+    layer1_text = format_hardware_and_sil_layer(
+        sil_advisory=sil_advisory,
+        sil_verification=sil_verification,
+        freedom_mask=freedom_mask,
+        vector_mode=vector_mode,
+        ub_256kb_unlock=ub_256kb_unlock,
+    )
+    layer2_text = format_target_dialect_layer(escalation_tier=backend_kind)
+    g5_lock_text = format_g5_parent_monotonicity_lock()
     sil_text = format_sil_diagnostics_section(
         sil_advisory=sil_advisory,
         sil_verification=sil_verification,
@@ -824,8 +845,10 @@ def build_syntax_repair_request(
             f"### PARENT AUTHORIZED SOURCE\n```{fence_lang}\n{bounded_parent}\n```\n\n"
         )
     user_prompt = (
+        f"{layer1_text}\n\n"
         f"### VALID TARGET DIALECT PRIMITIVES ({surface.dialect_id})\n"
-        f"{surface.render_prompt_reference()}\n\n"
+        f"{layer2_text}\n\n"
+        f"{g5_lock_text}\n\n"
         f"{sil_block}"
         f"{parent_block}"
         f"### COMPILER / GATE DIAGNOSTIC\n{error_message}\n\n"
@@ -886,6 +909,7 @@ class PortfolioRunner:
         creative_effort: str = "high",
         sil_advisory: object | None = None,
         sil_verification: object | None = None,
+        freedom_mask: ConstraintRelaxationMask | None = None,
         topology_axes: object | None = None,
         case_ratios: CasePhysicsRatios | None = None,
         cost_model: HybridAscendCostModel | None = None,
@@ -944,6 +968,7 @@ class PortfolioRunner:
                         enable_track_router=self._enable_track_router,
                         sil_advisory=sil_advisory,
                         sil_verification=sil_verification,
+                        freedom_mask=freedom_mask,
                     ),
                     parent_candidate=parent,
                     ideal_roofline_us=eff_roofline,
@@ -996,6 +1021,7 @@ class PortfolioRunner:
                         enable_track_router=self._enable_track_router,
                         sil_advisory=sil_advisory,
                         sil_verification=sil_verification,
+                        freedom_mask=freedom_mask,
                     ),
                     parent_candidate=parent,
                     ideal_roofline_us=eff_roofline,
@@ -1016,6 +1042,7 @@ class PortfolioRunner:
         dims: Mapping[str, object] | None = None,
         sil_advisory: object | None = None,
         sil_verification: object | None = None,
+        freedom_mask: ConstraintRelaxationMask | None = None,
         topology_axes: object | None = None,
         case_ratios: CasePhysicsRatios | None = None,
         escalation_tier: str = "tilelang_dsl",
@@ -1070,6 +1097,8 @@ class PortfolioRunner:
                     sil_advisory=sil_advisory,
                     sil_verification=sil_verification,
                     backend_kind=escalation_tier,
+                    freedom_mask=freedom_mask,
+                    ub_256kb_unlock=bool(spec.parent_candidate.ledger.uses_unreserved_ubuf),
                 )
                 try:
                     repaired_raw = await self._backend.generate(repair_req)
@@ -1085,6 +1114,30 @@ class PortfolioRunner:
                             topology_axes=active_axes,
                         )
                     return None, repaired, (spec.worker_id, "llm_parse", str(exc)[-400:]), False
+                parent_dsl = spec.parent_candidate.dsl_source
+                if parent_dsl.strip():
+                    violations = check_repair_monotonicity(
+                        parent_dsl,
+                        dsl_source,
+                        backend_kind=escalation_tier,
+                    )
+                    if violations:
+                        if spec.rule is not None:
+                            self._tracker.record_outcome(
+                                spec.rule.rule_id,
+                                postcondition_realized=False,
+                                topology_axes=active_axes,
+                            )
+                        return (
+                            None,
+                            repaired,
+                            (
+                                spec.worker_id,
+                                "repair_monotonicity_violation",
+                                "; ".join(violations),
+                            ),
+                            False,
+                        )
                 repaired = True
                 evaluation = self._funnel.evaluate(
                     dsl_source,
@@ -1237,6 +1290,7 @@ class PortfolioRunner:
         creative_effort: str = "high",
         sil_advisory: object | None = None,
         sil_verification: object | None = None,
+        freedom_mask: ConstraintRelaxationMask | None = None,
         topology_axes: object | None = None,
         case_ratios: CasePhysicsRatios | None = None,
         escalation_tier: str = "tilelang_dsl",
@@ -1264,6 +1318,7 @@ class PortfolioRunner:
             creative_effort=creative_effort,
             sil_advisory=sil_advisory,
             sil_verification=sil_verification,
+            freedom_mask=freedom_mask,
             topology_axes=active_axes,
             case_ratios=case_ratios,
             escalation_tier=escalation_tier,
@@ -1294,6 +1349,7 @@ class PortfolioRunner:
                 dims=dims,
                 sil_advisory=sil_advisory,
                 sil_verification=sil_verification,
+                freedom_mask=freedom_mask,
                 topology_axes=active_axes,
                 case_ratios=case_ratios,
                 escalation_tier=escalation_tier,

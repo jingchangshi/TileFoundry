@@ -102,6 +102,28 @@ def format_hardware_and_sil_layer(
             f"crosscore_flag_depth<={bounds.max_crosscore_depth}, "
             f"forbid_cube_int4={bounds.forbid_cube_int4}"
         ),
+        "- Schedule Integrity Redlines (paired canonical escape paths):",
+        (
+            "  * G1 (No Scalar Compute Emulation): when vector/matrix semantics exist, never "
+            "emulate main compute with scalar C++ `for` loops or bit-level emulation -> "
+            "canonical path: `T.SimdVF` / `simd_inst::*` / `asc_mmad`."
+        ),
+        (
+            "  * G2 (No Dense-Loop Narrow DCache-Bypass Stores): never emit elementwise `< 32B` "
+            "GM stores triggering `write_gm_bypass_dcache` inside dense loops -> canonical path: "
+            "pack multiple `< 32B` rows into contiguous `>= 32B` atomic bursts."
+        ),
+        (
+            "  * G3 (No Cache-Key Pollution or Static Unrolled 2D Dynamic Copy): never put "
+            "dynamic batch/seq dims or float hyperparams in `_KERNEL_CACHE` keys and never split "
+            "2D dynamic `T.copy` with Python static loops -> canonical path: `T.dynamic` + 2D "
+            "`T.copy` + `T.float32` scalar params."
+        ),
+        (
+            "  * G4 (No Overlapping `coupled_1c2v` Dual-Subcore Writes): under `coupled_1c2v`, "
+            "never issue overlapping `MTE3` writes from `AIV0`/`AIV1` to the same GM slice -> "
+            "canonical path: disjointly bisect output slices by subcore index."
+        ),
     ]
 
     active_mask = freedom_mask or ConstraintRelaxationMask.bottom()
@@ -325,9 +347,34 @@ def build_progressive_llm_constraints(
     return "\n\n".join(s for s in sections if s)
 
 
+def format_g5_parent_monotonicity_lock(*, include_blueprint_retention: bool = False) -> str:
+    """Render G5 parent monotonicity lock rules for syntax repair and Stage-0 retries."""
+    lines = ["### G5 PARENT MONOTONICITY LOCK"]
+    if include_blueprint_retention:
+        lines.append(
+            "- Retain full Layer 1-3 blueprint architecture, HIR/Roofline floor targets, "
+            "and PyTorch golden semantics; never degrade into a bare blueprint-less syntax patch."
+        )
+    lines.extend(
+        [
+            (
+                "- Permitted edits: fix syntax, API arguments, or predicates, or halve tile "
+                "knobs by power-of-2 on SRAM overflow."
+            ),
+            (
+                "- Forbidden regressions: NEVER drop parent `T.Pipelined` stages, NEVER "
+                "revert to scalar loops, and NEVER downgrade execution domain (e.g. "
+                "`coupled_1c2v`/Cube or `T.SimdVF`/`__simd_vf__` down to scalar fallback)."
+            ),
+        ]
+    )
+    return "\n".join(lines)
+
+
 __all__ = [
     "build_progressive_llm_constraints",
     "format_blueprint_delta_section",
+    "format_g5_parent_monotonicity_lock",
     "format_hardware_and_sil_layer",
     "format_target_dialect_layer",
 ]

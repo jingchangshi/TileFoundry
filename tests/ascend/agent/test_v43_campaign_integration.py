@@ -1103,6 +1103,7 @@ def test_stagnation_diagnosis_six_taxonomy_and_checkpoint_roundtrip(
         l3_passed: bool,
         prescreen: bool = False,
         top_k: int | None = None,
+        k_rule_workers: int | None = None,
         max_rounds: int = 2,
         ckpt_path: Path | None = None,
         resume: bool = False,
@@ -1130,7 +1131,9 @@ def test_stagnation_diagnosis_six_taxonomy_and_checkpoint_roundtrip(
             config=CampaignConfig(
                 operator_name="synthetic/op",
                 max_rounds=max_rounds,
-                k_rule_workers=1 if rules else 2,
+                k_rule_workers=(
+                    k_rule_workers if k_rule_workers is not None else (1 if rules else 2)
+                ),
                 enable_tilesize_prescreen=prescreen,
                 cost_prescreen_top_k=top_k,
                 min_surrogate_gain=0.1,
@@ -1231,6 +1234,7 @@ def test_stagnation_diagnosis_six_taxonomy_and_checkpoint_roundtrip(
         l3_passed=True,
         prescreen=True,
         top_k=1,
+        k_rule_workers=2,
     )
     assert rep_prescreen.stagnation_diagnosis["primary_stagnation_cause"] == "cost_prescreen_mismatch"
     assert rep_prescreen.stagnation_diagnosis["regimes"]["reg_a"]["cost_prescreen_filtered_count"] >= 2

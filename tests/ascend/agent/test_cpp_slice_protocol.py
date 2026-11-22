@@ -325,6 +325,7 @@ def test_resolve_instantiated_trackb_kernel_reads_launcher_truth_per_regime() ->
     render = mod._render_trackb_tu
     expected = {
         "reduce_tail": "softmax_last_axis_kernel",
+        "reduce_tail_subatom": "softmax_last_axis_kernel",
         "reduce_strided_twopass": "softmax_inner_2pass_kernel",
         "reduce_strided": "softmax_inner_1pass_kernel",
     }
