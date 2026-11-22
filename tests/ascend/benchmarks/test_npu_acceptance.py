@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import sys
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
@@ -642,6 +643,102 @@ def _assert_single_kernel(kernel_cache: dict) -> None:
     assert len(kernel_cache) == 1, f"expected one compiled kernel, got {len(kernel_cache)}"
 
 
+def _collect_tensors(value: object) -> list[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        collected: list[torch.Tensor] = []
+        for item in value:
+            collected.extend(_collect_tensors(item))
+        return collected
+    if isinstance(value, dict):
+        collected = []
+        for item in value.values():
+            collected.extend(_collect_tensors(item))
+        return collected
+    return []
+
+
+def _perturb_outer_axis_tensors(
+    tensors: object,
+    attrs: Mapping[str, object],
+) -> object | None:
+    flat = _collect_tensors(tensors)
+    candidates = [
+        tensor
+        for tensor in flat
+        if tensor.ndim >= 2 and tensor.shape[0] >= 4 and tensor.is_floating_point()
+    ]
+    if not candidates:
+        return None
+    outer_dim = candidates[0].shape[0]
+    if any(outer_dim in tensor.shape[1:] for tensor in flat if tensor.ndim >= 2):
+        return None
+    if any(
+        isinstance(val, int) and not isinstance(val, bool) and val == outer_dim
+        for val in attrs.values()
+    ):
+        return None
+    return cannbench_contract.map_tensors(
+        tensors,
+        lambda t: t[:-1].contiguous()
+        if isinstance(t, torch.Tensor) and t.ndim >= 2 and t.shape[0] == outer_dim
+        else t,
+    )
+
+
+def _verify_generic_kernel_cache_idempotence(
+    harness: cannbench_contract.Harness,
+    operator_api: Callable[..., object],
+    kernel_cache: Mapping[object, object],
+    recorder: l3_contract.Recorder,
+) -> tuple[int, int]:
+    def _call_with_tensors(case: cannbench_contract.Case, host_tensors: object) -> None:
+        npu_tensors = cannbench_contract.map_tensors(
+            host_tensors,
+            lambda tensor: tensor.npu(),
+        )
+        params = harness.params(case, npu_tensors)
+        operator_api(**params)
+
+    def _replay_case(case: cannbench_contract.Case) -> None:
+        _call_with_tensors(case, harness.prepare(case))
+
+    def _perturb_case(case: cannbench_contract.Case) -> None:
+        tensors = harness.prepare(case)
+        perturbed = _perturb_outer_axis_tensors(tensors, case.attrs)
+        if perturbed is not None:
+            _call_with_tensors(case, perturbed)
+
+    try:
+        return l3_contract.verify_kernel_cache_idempotence(
+            harness.cases,
+            _replay_case,
+            kernel_cache,
+            perturb_case_fn=_perturb_case,
+        )
+    except l3_contract.ClassifiedTestFailure as exc:
+        detail = str(exc)
+        last_case_id = str(harness.cases[-1].case_num)
+        failure = l3_contract.comparison_failure(
+            node=l3_contract.GENERIC_NODE,
+            case_id=last_case_id,
+            role="candidate",
+            comparator="kernel_cache_idempotence",
+            references=("two_pass_idempotence",),
+            comparisons=({"output": 0, "passed": False, "message": detail},),
+            detail=detail,
+        )
+        recorder.case_finished(
+            l3_contract.GENERIC_NODE,
+            last_case_id,
+            "failed",
+            detail,
+            failure=failure,
+        )
+        raise
+
+
 def test_target_operator_full_cannbench_contract() -> None:
     """Verify full CANNBench contract for any scoped non-AR/MLA L3 target operator."""
     recorder = l3_contract.get_recorder()
@@ -677,29 +774,10 @@ def test_target_operator_full_cannbench_contract() -> None:
             l3_contract.GENERIC_NODE,
         )
         kernel_cache = getattr(mod, "_KERNEL_CACHE", None)
-        if len(harness.cases) >= 10 and isinstance(kernel_cache, dict):
-            max_expected_regimes = max(6, len(harness.cases) // 2)
-            if len(kernel_cache) > max_expected_regimes:
-                detail = (
-                    f"volatile _KERNEL_CACHE keys bloated cache to {len(kernel_cache)} "
-                    f"entries across {len(harness.cases)} cases "
-                    f"(limit={max_expected_regimes})"
-                )
-                last_case_id = str(harness.cases[-1].case_num)
-                failure = l3_contract.comparison_failure(
-                    node=l3_contract.GENERIC_NODE,
-                    case_id=last_case_id,
-                    role="candidate",
-                    comparator="kernel_cache_contract",
-                    references=("regime_budget",),
-                    comparisons=({"output": 0, "passed": False, "message": detail},),
-                    detail=detail,
-                )
-                recorder.case_finished(
-                    l3_contract.GENERIC_NODE,
-                    last_case_id,
-                    "failed",
-                    detail,
-                    failure=failure,
-                )
-                raise l3_contract.ClassifiedTestFailure(detail)
+        if isinstance(kernel_cache, dict) and harness.cases:
+            _verify_generic_kernel_cache_idempotence(
+                harness,
+                operator_api,
+                kernel_cache,
+                recorder,
+            )

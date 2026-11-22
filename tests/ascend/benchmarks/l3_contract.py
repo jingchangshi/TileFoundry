@@ -43,12 +43,13 @@ import os
 import signal
 import sys
 import tempfile
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
+from typing import TypeVar
 
 import yaml
 
@@ -131,6 +132,43 @@ class ClassifiedTestFailure(AssertionError):
     """Aggregate failure whose structured evidence was already recorded."""
 
     l3_failure_classified = True
+
+
+_CaseT = TypeVar("_CaseT")
+_CacheKeyT = TypeVar("_CacheKeyT")
+
+
+def verify_kernel_cache_idempotence(
+    cases: Sequence[_CaseT],
+    run_case_fn: Callable[[_CaseT], object],
+    kernel_cache: Mapping[_CacheKeyT, object],
+    *,
+    perturb_case_fn: Callable[[_CaseT], object] | None = None,
+) -> tuple[int, int]:
+    """Verify two-pass kernel cache idempotence across replay and outer-axis perturbation."""
+    c1 = len(kernel_cache)
+    keys1 = set(kernel_cache.keys())
+    circuit_breaker = max(1, len(cases)) * 2
+    if c1 > circuit_breaker:
+        raise ClassifiedTestFailure(
+            f"Pass 1 _KERNEL_CACHE runaway growth: {c1} entries across "
+            f"{len(cases)} cases (circuit_breaker={circuit_breaker})"
+        )
+    for case in cases:
+        run_case_fn(case)
+        if perturb_case_fn is not None:
+            perturb_case_fn(case)
+    c2 = len(kernel_cache)
+    keys2 = set(kernel_cache.keys())
+    pass2_delta = c2 - c1
+    if pass2_delta != 0 or keys2 != keys1:
+        added = len(keys2 - keys1)
+        evicted = len(keys1 - keys2)
+        raise ClassifiedTestFailure(
+            f"L3 cache idempotence violation (Delta|Cache|={pass2_delta}): "
+            f"pass1={c1}, pass2={c2}, added={added}, evicted={evicted}"
+        )
+    return (c1, pass2_delta)
 
 
 @dataclass(frozen=True, kw_only=True)

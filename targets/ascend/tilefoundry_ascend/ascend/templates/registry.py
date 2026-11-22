@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -1084,8 +1085,16 @@ def _extract_body_from_input(
 
     try:
         import tilelang  # noqa: PLC0415
+        from tilelang import tvm  # noqa: PLC0415
+        from tilelang.backend.module import create_backend_context  # noqa: PLC0415
 
-        art = tilelang.lower(source_or_slot, target="ascend")
+        target_ctx = (
+            create_backend_context("ascend").target
+            if tvm.target.Target.current(allow_none=True) is None
+            else contextlib.nullcontext()
+        )
+        with target_ctx:
+            art = tilelang.lower(source_or_slot, target="ascend")
         ks = getattr(art, "kernel_source", "")
         if ks:
             return str(ks), op_name, axes

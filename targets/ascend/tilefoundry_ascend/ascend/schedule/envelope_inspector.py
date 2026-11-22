@@ -1472,28 +1472,97 @@ def _diff_snapshots_by_scope(
     return waterlines
 
 
-def _region_bytes(arg, tirx, DataTypeCls) -> tuple[str | None, int, int]:
+def _upper_bound_tirx_int(
+    expr,
+    *,
+    tirx,
+    let_env: Mapping[object, object] | None = None,
+    _depth: int = 0,
+) -> int | None:
+    """Return a tight static upper bound for a TIR extent expression when provable."""
+    if expr is None or _depth > 12:
+        return None
+    cur = _substitute_let_env(expr, let_env, tirx=tirx) if let_env else expr
+    static_val = _static_tirx_int(cur)
+    if static_val is not None:
+        return static_val
+    if isinstance(cur, tirx.Min):
+        lhs = _upper_bound_tirx_int(cur.a, tirx=tirx, _depth=_depth + 1)
+        rhs = _upper_bound_tirx_int(cur.b, tirx=tirx, _depth=_depth + 1)
+        if lhs is not None and lhs > 0 and rhs is not None and rhs > 0:
+            return min(lhs, rhs)
+        if lhs is not None and lhs > 0:
+            return lhs
+        if rhs is not None and rhs > 0:
+            return rhs
+        return None
+    if isinstance(cur, tirx.Mul):
+        lhs = _upper_bound_tirx_int(cur.a, tirx=tirx, _depth=_depth + 1)
+        rhs = _upper_bound_tirx_int(cur.b, tirx=tirx, _depth=_depth + 1)
+        if lhs is not None and lhs > 0 and rhs is not None and rhs > 0:
+            return lhs * rhs
+        return None
+    if isinstance(cur, tirx.Add):
+        lhs = _upper_bound_tirx_int(cur.a, tirx=tirx, _depth=_depth + 1)
+        rhs = _upper_bound_tirx_int(cur.b, tirx=tirx, _depth=_depth + 1)
+        if lhs is not None and lhs >= 0 and rhs is not None and rhs >= 0:
+            return lhs + rhs
+        return None
+    return None
+
+
+def _region_bytes(
+    arg,
+    tirx,
+    DataTypeCls,
+    *,
+    let_env: Mapping[object, object] | None = None,
+) -> tuple[str | None, int, int]:
     """Return (mapped_scope, total_bytes, inner_contiguous_bytes) for copy args."""
     if isinstance(arg, tirx.Call) and "region" in str(getattr(arg.op, "name", arg.op)):
         if len(arg.args) >= 2 and isinstance(arg.args[0], tirx.BufferLoad):
             buf = arg.args[0].buffer
             scope = _map_tilelang_scope(buf.scope())
             elem_bytes = _dtype_bytes(buf.dtype, DataTypeCls)
-            extents = _static_shape_ints(arg.args[2:])
-            if extents is None or not extents:
+            raw_extents = list(arg.args[2:])
+            if not raw_extents:
                 return scope, 0, 0
-            total = int(math.ceil(math.prod(extents) * elem_bytes))
-            inner = int(math.ceil(extents[-1] * elem_bytes))
+            resolved = [
+                _upper_bound_tirx_int(ext, tirx=tirx, let_env=let_env)
+                for ext in raw_extents
+            ]
+            last_dim = resolved[-1]
+            inner = (
+                int(math.ceil(last_dim * elem_bytes))
+                if (last_dim is not None and last_dim > 0)
+                else 0
+            )
+            if any(v is None or v <= 0 for v in resolved):
+                return scope, 0, inner
+            ext_ints = [int(v) for v in resolved if v is not None]
+            total = int(math.ceil(math.prod(ext_ints) * elem_bytes))
             return scope, total, inner
     if isinstance(arg, tirx.BufferRegion):
         buf = arg.buffer
         scope = _map_tilelang_scope(buf.scope())
         elem_bytes = _dtype_bytes(buf.dtype, DataTypeCls)
-        extents = _static_shape_ints([r.extent for r in arg.region])
-        if extents is None or not extents:
+        raw_extents = [r.extent for r in arg.region]
+        if not raw_extents:
             return scope, 0, 0
-        total = int(math.ceil(math.prod(extents) * elem_bytes))
-        inner = int(math.ceil(extents[-1] * elem_bytes))
+        resolved = [
+            _upper_bound_tirx_int(ext, tirx=tirx, let_env=let_env)
+            for ext in raw_extents
+        ]
+        last_dim = resolved[-1]
+        inner = (
+            int(math.ceil(last_dim * elem_bytes))
+            if (last_dim is not None and last_dim > 0)
+            else 0
+        )
+        if any(v is None or v <= 0 for v in resolved):
+            return scope, 0, inner
+        ext_ints = [int(v) for v in resolved if v is not None]
+        total = int(math.ceil(math.prod(ext_ints) * elem_bytes))
         return scope, total, inner
     if isinstance(arg, tirx.BufferLoad):
         buf = arg.buffer
@@ -1636,41 +1705,64 @@ def _collect_gm_dma_payloads(
     """Collect GM<->UB/L1 copy byte payloads both inside loops and across the function."""
     loop_sizes: list[int] = []
     all_sizes: list[int] = []
+    let_stmt_cls = getattr(tirx, "LetStmt", None)
+    bind_cls = getattr(tirx, "Bind", None)
 
-    def _walk(node, *, in_loop: bool) -> None:
+    def _walk(node, *, in_loop: bool, let_env: dict[object, object]) -> None:
         if node is None:
             return
         if isinstance(node, tirx.SeqStmt):
+            seq_env = dict(let_env)
             for child in node.seq:
-                _walk(child, in_loop=in_loop)
+                if bind_cls is not None and isinstance(child, bind_cls):
+                    seq_env[child.var] = _substitute_let_env(child.value, seq_env, tirx=tirx)
+                    if hasattr(child, "body"):
+                        _walk(child.body, in_loop=in_loop, let_env=dict(seq_env))
+                else:
+                    _walk(child, in_loop=in_loop, let_env=seq_env)
+            return
+        if let_stmt_cls is not None and isinstance(node, let_stmt_cls):
+            next_env = dict(let_env)
+            next_env[node.var] = _substitute_let_env(node.value, let_env, tirx=tirx)
+            _walk(node.body, in_loop=in_loop, let_env=next_env)
+            return
+        if bind_cls is not None and isinstance(node, bind_cls):
+            next_env = dict(let_env)
+            next_env[node.var] = _substitute_let_env(node.value, let_env, tirx=tirx)
+            if hasattr(node, "body"):
+                _walk(node.body, in_loop=in_loop, let_env=next_env)
             return
         if isinstance(node, tirx.For):
             tb = getattr(node, "thread_binding", None)
             trip = _static_tirx_int(node.extent) if tb is None else None
             sub_loop = in_loop or (tb is None and (trip is None or trip > 1))
-            _walk(node.body, in_loop=sub_loop)
+            _walk(node.body, in_loop=sub_loop, let_env=let_env)
             return
         if isinstance(node, tirx.While):
-            _walk(node.body, in_loop=True)
+            _walk(node.body, in_loop=True, let_env=let_env)
             return
         if isinstance(node, tirx.IfThenElse):
-            _walk(node.then_case, in_loop=in_loop)
+            _walk(node.then_case, in_loop=in_loop, let_env=let_env)
             if node.else_case is not None:
-                _walk(node.else_case, in_loop=in_loop)
+                _walk(node.else_case, in_loop=in_loop, let_env=let_env)
             return
         if isinstance(node, tirx.SBlockRealize):
-            _walk(node.block, in_loop=in_loop)
+            _walk(node.block, in_loop=in_loop, let_env=let_env)
             return
-        if isinstance(node, (tirx.SBlock, tirx.AttrStmt, tirx.Bind, tirx.AllocBuffer, tirx.DeclBuffer)):
+        if isinstance(node, (tirx.SBlock, tirx.AttrStmt, tirx.AllocBuffer, tirx.DeclBuffer)):
             if hasattr(node, "body"):
-                _walk(node.body, in_loop=in_loop)
+                _walk(node.body, in_loop=in_loop, let_env=let_env)
             return
         if isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call):
             op_name = str(getattr(node.value.op, "name", node.value.op))
             args = list(node.value.args)
             if "copy" in op_name and len(args) >= 2:
-                src_s, xfer_b, _in1 = _region_bytes(args[0], tirx, DataTypeCls)
-                dst_s, dst_b, _in2 = _region_bytes(args[1], tirx, DataTypeCls)
+                src_s, xfer_b, _in1 = _region_bytes(
+                    args[0], tirx, DataTypeCls, let_env=let_env
+                )
+                dst_s, dst_b, _in2 = _region_bytes(
+                    args[1], tirx, DataTypeCls, let_env=let_env
+                )
                 if src_s is not None and dst_s is not None and src_s != dst_s and "GM" in (src_s, dst_s):
                     xfer = max(xfer_b, dst_b)
                     if xfer >= 128:
@@ -1678,7 +1770,7 @@ def _collect_gm_dma_payloads(
                         if in_loop:
                             loop_sizes.append(xfer)
 
-    _walk(stmt, in_loop=False)
+    _walk(stmt, in_loop=False, let_env={})
     return loop_sizes, all_sizes
 
 
@@ -2026,6 +2118,9 @@ def _scan_tilelang_ast(
             core = "AIV1" if guarded_aiv == "aiv1" else "AIV0"
             _add_pipe(f"{core}.{pipe_name}", cyc)
 
+    let_stmt_cls = getattr(tirx, "LetStmt", None)
+    bind_cls = getattr(tirx, "Bind", None)
+
     def _walk(
         stmt,
         *,
@@ -2033,22 +2128,43 @@ def _scan_tilelang_ast(
         mte2_run: list[int] | None = None,
         sid_vars: set[object] | None = None,
         guarded_aiv: str | None = None,
+        let_env: dict[object, object] | None = None,
     ) -> None:
         if mte2_run is None:
             mte2_run = [0]
         if sid_vars is None:
             sid_vars = set()
+        if let_env is None:
+            let_env = {}
         if stmt is None:
             return
         if isinstance(stmt, tirx.SeqStmt):
+            seq_env = dict(let_env)
             for child in stmt.seq:
+                if bind_cls is not None and isinstance(child, bind_cls):
+                    seq_env[child.var] = _substitute_let_env(
+                        child.value, seq_env, tirx=tirx
+                    )
                 _walk(
                     child,
                     repeat=repeat,
                     mte2_run=mte2_run,
                     sid_vars=sid_vars,
                     guarded_aiv=guarded_aiv,
+                    let_env=dict(seq_env),
                 )
+            return
+        if let_stmt_cls is not None and isinstance(stmt, let_stmt_cls):
+            next_env = dict(let_env)
+            next_env[stmt.var] = _substitute_let_env(stmt.value, let_env, tirx=tirx)
+            _walk(
+                stmt.body,
+                repeat=repeat,
+                mte2_run=mte2_run,
+                sid_vars=sid_vars,
+                guarded_aiv=guarded_aiv,
+                let_env=next_env,
+            )
             return
         if isinstance(stmt, tirx.While):
             if "while_loop" not in opaque_regions:
@@ -2062,6 +2178,7 @@ def _scan_tilelang_ast(
                 mte2_run=[0],
                 sid_vars=sid_vars,
                 guarded_aiv=guarded_aiv,
+                let_env=let_env,
             )
             return
         if isinstance(stmt, tirx.For):
@@ -2078,6 +2195,7 @@ def _scan_tilelang_ast(
                     mte2_run=mte2_run,
                     sid_vars=next_sids,
                     guarded_aiv=guarded_aiv,
+                    let_env=let_env,
                 )
                 return
             trip = _static_tirx_int(stmt.extent)
@@ -2091,6 +2209,7 @@ def _scan_tilelang_ast(
                     mte2_run=[0],
                     sid_vars=sid_vars,
                     guarded_aiv=guarded_aiv,
+                    let_env=let_env,
                 )
             elif trip > 0:
                 local_mte2 = [0]
@@ -2100,6 +2219,7 @@ def _scan_tilelang_ast(
                     mte2_run=local_mte2,
                     sid_vars=sid_vars,
                     guarded_aiv=guarded_aiv,
+                    let_env=let_env,
                 )
                 if local_mte2[0] > 0:
                     mte2_run[0] += local_mte2[0] * trip
@@ -2121,6 +2241,7 @@ def _scan_tilelang_ast(
                 mte2_run=b1,
                 sid_vars=sid_vars,
                 guarded_aiv=next_then,
+                let_env=let_env,
             )
             b2 = [mte2_run[0]]
             if stmt.else_case is not None:
@@ -2130,6 +2251,7 @@ def _scan_tilelang_ast(
                     mte2_run=b2,
                     sid_vars=sid_vars,
                     guarded_aiv=next_else,
+                    let_env=let_env,
                 )
             mte2_run[0] = max(b1[0], b2[0])
             return
@@ -2155,6 +2277,7 @@ def _scan_tilelang_ast(
                 mte2_run=mte2_run,
                 sid_vars=next_sids,
                 guarded_aiv=guarded_aiv,
+                let_env=let_env,
             )
             return
         if isinstance(stmt, (tirx.SBlockRealize,)):
@@ -2164,6 +2287,7 @@ def _scan_tilelang_ast(
                 mte2_run=mte2_run,
                 sid_vars=sid_vars,
                 guarded_aiv=guarded_aiv,
+                let_env=let_env,
             )
             return
         if isinstance(stmt, tirx.SBlock):
@@ -2173,9 +2297,16 @@ def _scan_tilelang_ast(
                 mte2_run=mte2_run,
                 sid_vars=sid_vars,
                 guarded_aiv=guarded_aiv,
+                let_env=let_env,
             )
             return
         if isinstance(stmt, (tirx.Bind, tirx.AllocBuffer, tirx.DeclBuffer)):
+            next_env = let_env
+            if isinstance(stmt, tirx.Bind):
+                next_env = dict(let_env)
+                next_env[stmt.var] = _substitute_let_env(
+                    stmt.value, let_env, tirx=tirx
+                )
             if isinstance(stmt, tirx.Bind) and isinstance(getattr(stmt, "value", None), tirx.Call):
                 b_op = str(getattr(stmt.value.op, "name", stmt.value.op)).lower()
                 if (
@@ -2195,6 +2326,7 @@ def _scan_tilelang_ast(
                     mte2_run=mte2_run,
                     sid_vars=sid_vars,
                     guarded_aiv=guarded_aiv,
+                    let_env=next_env,
                 )
             return
         if isinstance(stmt, tirx.BufferStore):
@@ -2207,14 +2339,21 @@ def _scan_tilelang_ast(
             op_name = str(getattr(stmt.value.op, "name", stmt.value.op))
             args = list(stmt.value.args)
             if "copy" in op_name and len(args) >= 2:
-                src_s, xfer_b, inner_b = _region_bytes(args[0], tirx, DataTypeCls)
-                dst_s, dst_b, _dst_in = _region_bytes(args[1], tirx, DataTypeCls)
+                src_s, xfer_b, inner_b = _region_bytes(
+                    args[0], tirx, DataTypeCls, let_env=let_env
+                )
+                dst_s, dst_b, dst_inner_b = _region_bytes(
+                    args[1], tirx, DataTypeCls, let_env=let_env
+                )
                 if src_s is not None and dst_s is not None:
+                    eff_inner_b = inner_b if inner_b > 0 else dst_inner_b
                     xfer = max(xfer_b, dst_b)
+                    if xfer == 0 and eff_inner_b > 0:
+                        xfer = eff_inner_b
                     if src_s != dst_s and not spaces.is_dma_path_legal(src_s, dst_s):
                         illegal_dma[0] = True
-                    if inner_b > 0 and src_s == "GM" and dst_s == "UB":
-                        rem = inner_b % spaces.ub_align_bytes
+                    if eff_inner_b > 0 and src_s == "GM" and dst_s == "UB":
+                        rem = eff_inner_b % spaces.ub_align_bytes
                         if rem != 0:
                             padding_bytes[0] += (spaces.ub_align_bytes - rem) * repeat
                         mte2_run[0] += 1
@@ -3026,6 +3165,121 @@ def _extract_primfunc_pass_configs_and_flags(
     return cfg, flags
 
 
+def _specialize_primfunc_for_anchors(
+    entry_fn,
+    mod_in,
+    var_bindings: Mapping[str, int] | None,
+    *,
+    tvm_mod,
+    tirx,
+):
+    """Specialize an isolated PrimFunc copy using concrete anchor var_bindings."""
+    if not var_bindings:
+        return entry_fn, mod_in
+
+    eff_bindings, var_obj_bindings = _augment_var_bindings_from_buffers(
+        entry_fn, var_bindings, tirx=tirx
+    )
+    if not eff_bindings and not var_obj_bindings:
+        return entry_fn, mod_in
+    lower_eff = {k.lower(): v for k, v in eff_bindings.items()}
+
+    buffer_map = getattr(entry_fn, "buffer_map", None) or {}
+    handle_vars = list(buffer_map.keys())
+    data_vars = [buf.data for buf in buffer_map.values() if getattr(buf, "data", None) is not None]
+
+    def _is_handle_or_data(var_obj) -> bool:
+        return any(
+            (hasattr(var_obj, "same_as") and var_obj.same_as(h)) or var_obj is h
+            for h in (*handle_vars, *data_vars)
+        )
+
+    spec_var_map: dict[object, object] = {}
+    recorded_vars: list[object] = []
+
+    def _maybe_bind(var_obj) -> None:
+        if not isinstance(var_obj, tirx.Var) or _is_handle_or_data(var_obj):
+            return
+        if any(
+            (hasattr(var_obj, "same_as") and var_obj.same_as(prev)) or var_obj is prev
+            for prev in recorded_vars
+        ):
+            return
+        bound: int | None = None
+        for v_obj, v_val in var_obj_bindings:
+            if (hasattr(var_obj, "same_as") and var_obj.same_as(v_obj)) or var_obj is v_obj:
+                bound = int(v_val)
+                break
+        if bound is None:
+            bound = _match_binding_for_var(var_obj, eff_bindings, lower_eff)
+        if bound is None:
+            return
+        dtype_str = str(getattr(var_obj, "dtype", "int32") or "int32")
+        if dtype_str == "handle":
+            return
+        recorded_vars.append(var_obj)
+        spec_var_map[var_obj] = tirx.IntImm(dtype_str, int(bound))
+
+    for param in getattr(entry_fn, "params", ()):
+        _maybe_bind(param)
+    for buf in buffer_map.values():
+        for expr in (*getattr(buf, "shape", ()), *(getattr(buf, "strides", ()) or ()), buf.elem_offset):
+            for fv in _free_tirx_vars(expr, tirx=tirx):
+                _maybe_bind(fv)
+    for fv in _free_tirx_vars(entry_fn.body, tirx=tirx):
+        _maybe_bind(fv)
+
+    if not spec_var_map:
+        return entry_fn, mod_in
+
+    params_list = list(getattr(entry_fn, "params", ()))
+    extra_params = [
+        v
+        for v in recorded_vars
+        if not any((hasattr(v, "same_as") and v.same_as(p)) or v is p for p in params_list)
+    ]
+    tmp_fn = (
+        tirx.PrimFunc(
+            [*params_list, *extra_params],
+            entry_fn.body,
+            ret_type=entry_fn.ret_type,
+            buffer_map=entry_fn.buffer_map,
+            attrs=entry_fn.attrs,
+        )
+        if extra_params
+        else entry_fn
+    )
+    spec_fn = tmp_fn.specialize(spec_var_map)
+
+    target_gvar = None
+    for gvar, fn in mod_in.functions.items():
+        if (hasattr(fn, "same_as") and fn.same_as(entry_fn)) or fn is entry_fn:
+            target_gvar = gvar
+            break
+    if target_gvar is None:
+        target_gvar = (
+            str(entry_fn.attrs.get("global_symbol", "main"))
+            if entry_fn.attrs
+            else "main"
+        )
+    updated_funcs = {
+        k: (spec_fn if k == target_gvar else v) for k, v in mod_in.functions.items()
+    }
+    if target_gvar not in updated_funcs:
+        updated_funcs[target_gvar] = spec_fn
+    spec_mod = tvm_mod.IRModule(updated_funcs, attrs=getattr(mod_in, "attrs", None))
+    if hasattr(tirx, "transform") and hasattr(tirx.transform, "Simplify"):
+        spec_mod = tirx.transform.Simplify()(spec_mod)
+        if target_gvar in spec_mod.functions:
+            spec_fn = spec_mod.functions[target_gvar]
+        else:
+            for fn in spec_mod.functions.values():
+                if isinstance(fn, tirx.PrimFunc):
+                    spec_fn = fn
+                    break
+    return spec_fn, spec_mod
+
+
 def inspect_tilelang_primfunc(
     prim_func,
     *,
@@ -3058,6 +3312,14 @@ def inspect_tilelang_primfunc(
         entry_fn = prim_func
         sym = str(entry_fn.attrs.get("global_symbol", "main")) if entry_fn.attrs else "main"
         mod_in = tvm.IRModule({sym: entry_fn})
+
+    entry_fn, mod_in = _specialize_primfunc_for_anchors(
+        entry_fn,
+        mod_in,
+        var_bindings,
+        tvm_mod=tvm,
+        tirx=tirx,
+    )
 
     cfg, merged_flags = _extract_primfunc_pass_configs_and_flags(
         entry_fn,
@@ -3129,9 +3391,11 @@ def inspect_tilelang_primfunc(
     lowering_error: str | None = None
     device_mod = None
     ctx = create_backend_context("ascend", None, "auto")
+    cur_target = tvm.target.Target.current(allow_none=True)
+    cur_kind = str(getattr(getattr(cur_target, "kind", None), "name", "") or "")
     target_ctx = (
         ctx.target
-        if tvm.target.Target.current(allow_none=True) is None
+        if (cur_target is None or cur_kind != "ascend")
         else contextlib.nullcontext()
     )
     try:

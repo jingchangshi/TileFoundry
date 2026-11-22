@@ -25,6 +25,7 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     _parse_cce_launch_block_dim,
     _resolve_cpp_consts,
     check_npu_entrypoint_purity,
+    check_repair_monotonicity,
     evaluate_ascendc_candidate,
     parse_cce_res_usage,
     resolve_trackb_compile_flags,
@@ -754,3 +755,119 @@ def test_scoped_mixed_gm_store_multiline_define_and_launcher_min_caps() -> None:
     consts = _resolve_cpp_consts(macro_cpp)
     assert consts["WIDE_W"] == 48
     assert _parse_cce_launch_block_dim(macro_cpp, consts) == 48
+
+
+def test_l0_kernel_cache_key_pollution_audit() -> None:
+    """Reject float hyperparameters and pointer/id values in _KERNEL_CACHE keys."""
+    def _wrap_cache_mod(key_stmt: str) -> str:
+        return (
+            "import ctypes\n"
+            "import tilelang\n"
+            "import tilelang.ascend.language as T\n\n"
+            "_KERNEL_CACHE: dict[object, object] = {}\n\n"
+            "@T.prim_func\n"
+            'def _main(X: T.Tensor((1, 64), "float16")):\n'
+            "    pass\n\n"
+            "def op_fn(x, eps: float = 1e-5, scale: float = 0.125):\n"
+            f"    {key_stmt}\n"
+            "    k = _KERNEL_CACHE.get(key)\n"
+            "    if k is None:\n"
+            '        k = tilelang.compile(_main, target="ascend")\n'
+            "        _KERNEL_CACHE[key] = k\n"
+            "    return k(x)\n\n"
+            "kernel = op_fn\n"
+        )
+
+    clean_src = _wrap_cache_mod('key = (x.shape[-1], str(x.dtype), "aligned")')
+    assert check_npu_entrypoint_purity(clean_src, "op_fn", require_kernel_cache=True) == []
+
+    for bad_stmt in (
+        "key = (x.shape[-1], str(x.dtype), eps)",
+        "key = (x.shape[-1], float(scale))",
+        "key = (x.shape[-1], 1e-6)",
+        "key = (id(x), str(x.dtype))",
+        "key = (x.data_ptr(), str(x.dtype))",
+        "key = (ctypes.addressof(x), str(x.dtype))",
+        "key = (x.storage_offset(), str(x.dtype))",
+    ):
+        bad_src = _wrap_cache_mod(bad_stmt)
+        errs = check_npu_entrypoint_purity(bad_src, "op_fn", require_kernel_cache=True)
+        assert any("polluted_kernel_cache_key" in err for err in errs), (bad_stmt, errs)
+
+    direct_get_src = (
+        "import tilelang\n"
+        "import tilelang.ascend.language as T\n\n"
+        "_KERNEL_CACHE: dict[object, object] = {}\n\n"
+        "@T.prim_func\n"
+        'def _main(X: T.Tensor((1, 64), "float16")):\n'
+        "    pass\n\n"
+        "def op_fn(x, sm_scale: float = 0.5):\n"
+        "    k = _KERNEL_CACHE.get((x.shape[-1], sm_scale))\n"
+        "    if k is None:\n"
+        '        k = tilelang.compile(_main, target="ascend")\n'
+        "        _KERNEL_CACHE[(x.shape[-1], sm_scale)] = k\n"
+        "    return k(x)\n\n"
+        "kernel = op_fn\n"
+    )
+    direct_errs = check_npu_entrypoint_purity(direct_get_src, "op_fn", require_kernel_cache=True)
+    assert any("polluted_kernel_cache_key" in err for err in direct_errs), direct_errs
+
+
+def test_check_repair_monotonicity_tracka_and_trackb() -> None:
+    """Reject repairs dropping T.Pipelined or vector/cube primitives while allowing valid fixes."""
+    parent_tracka = (
+        "import tilelang.ascend.language as T\n\n"
+        "@T.prim_func\n"
+        'def main(X: T.Tensor((128, 64), "float16"), Y: T.Tensor((128, 64), "float16")):\n'
+        "    with T.Kernel(1):\n"
+        '        a_ub = T.alloc_shared((64, 64), "float16")\n'
+        "        for ko in T.Pipelined(2, num_stages=2):\n"
+        "            T.copy(X[ko * 64 : (ko + 1) * 64, :], a_ub)\n"
+        "            with T.SimdVF():\n"
+        "                mask = T.simd.pset(32)\n"
+        "                v = T.simd.vld(a_ub[0])\n"
+        "                T.simd.vsts(a_ub[0], T.simd.vexp(v, mask), mask)\n"
+        "            T.copy(a_ub, Y[ko * 64 : (ko + 1) * 64, :])\n"
+    )
+    valid_halved = parent_tracka.replace("(64, 64)", "(32, 64)").replace(
+        "num_stages=2", "num_stages=1"
+    )
+    assert check_repair_monotonicity(parent_tracka, valid_halved) == []
+
+    dropped_pipe = parent_tracka.replace("T.Pipelined(2, num_stages=2)", "T.serial(2)")
+    pipe_errs = check_repair_monotonicity(parent_tracka, dropped_pipe)
+    assert any("monotonicity_regression_pipeline_dropped" in err for err in pipe_errs), pipe_errs
+
+    zero_pipe = parent_tracka.replace("num_stages=2", "num_stages=0")
+    zero_errs = check_repair_monotonicity(parent_tracka, zero_pipe)
+    assert any("monotonicity_regression_pipeline_disabled" in err for err in zero_errs), zero_errs
+
+    scalar_regressed = (
+        "import tilelang.ascend.language as T\n\n"
+        "@T.prim_func\n"
+        'def main(X: T.Tensor((128, 64), "float16"), Y: T.Tensor((128, 64), "float16")):\n'
+        "    with T.Kernel(1):\n"
+        '        a_ub = T.alloc_shared((64, 64), "float16")\n'
+        "        for ko in T.Pipelined(2, num_stages=2):\n"
+        "            T.copy(X[ko * 64 : (ko + 1) * 64, :], a_ub)\n"
+        "            for i in T.serial(64):\n"
+        "                a_ub[0, i] = a_ub[0, i]\n"
+        "            T.copy(a_ub, Y[ko * 64 : (ko + 1) * 64, :])\n"
+    )
+    scalar_errs = check_repair_monotonicity(parent_tracka, scalar_regressed)
+    assert any("monotonicity_regression_scalar_fallback" in err for err in scalar_errs), scalar_errs
+
+    parent_trackb = (
+        "__simd_vf__ void vf_step(__ubuf__ float* a) {\n"
+        "    simd_inst::vexp(a, a, 64);\n"
+        "}\n"
+    )
+    valid_trackb = (
+        "__simd_vf__ void vf_step(__ubuf__ float* a) {\n"
+        "    simd_inst::vadd(a, a, a, 64);\n"
+        "}\n"
+    )
+    bad_trackb = "void vf_step(__ubuf__ float* a) { for (int i = 0; i < 64; ++i) a[i] += 1.0f; }\n"
+    assert check_repair_monotonicity(parent_trackb, valid_trackb, backend_kind="ascendc_trackb") == []
+    tb_errs = check_repair_monotonicity(parent_trackb, bad_trackb, backend_kind="ascendc_trackb")
+    assert any("monotonicity_regression_trackb_scalar_fallback" in err for err in tb_errs), tb_errs

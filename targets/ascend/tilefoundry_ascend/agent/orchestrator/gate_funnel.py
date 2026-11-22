@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -185,6 +185,33 @@ _FORBIDDEN_NPU_HOST_CALLS: frozenset[str] = frozenset(
 _CTYPES_LIB_RECEIVERS: frozenset[str] = frozenset(
     {"lib", "_lib", "so_lib", "dll", "cdll", "handle"}
 )
+_POLLUTED_FLOAT_KEY_NAMES: frozenset[str] = frozenset(
+    {
+        "eps",
+        "epsilon",
+        "scale",
+        "softmax_scale",
+        "sm_scale",
+        "alpha",
+        "beta",
+        "dropout_p",
+        "inv_scale",
+        "temperature",
+    }
+)
+_POLLUTED_ADDR_ATTRS: frozenset[str] = frozenset({"data_ptr", "storage_offset"})
+_TRACKA_CORE_PRIMITIVES: frozenset[str] = frozenset(
+    {"SimdVF", "SimtVF", "gemm", "gemm_v0", "ascend_mmad", "ascend_gemm", "ascend_vec"}
+)
+_TRACKB_MONOTONICITY_BACKENDS: frozenset[str] = frozenset(
+    {"ascendc_trackb", "hybrid_trackb", "cce_trackb", "ascendc"}
+)
+_TRACKB_CORE_TOKENS: tuple[str, ...] = (
+    "simd_inst::",
+    "asc_mmad",
+    "__simd_vf__",
+    "__simt_vf__",
+)
 
 
 def _is_non_npu_guard(cond_txt: str) -> bool:
@@ -250,6 +277,215 @@ def _has_module_kernel_cache(tree: ast.Module) -> bool:
             if isinstance(node.target, ast.Name) and node.target.id == "_KERNEL_CACHE":
                 return True
     return False
+
+
+def _collect_local_var_assigns(fnode: ast.FunctionDef) -> dict[str, list[ast.expr]]:
+    assigns: dict[str, list[ast.expr]] = {}
+    for sub in ast.walk(fnode):
+        if isinstance(sub, ast.Assign) and sub.value is not None:
+            for tgt in sub.targets:
+                if isinstance(tgt, ast.Name):
+                    assigns.setdefault(tgt.id, []).append(sub.value)
+        elif isinstance(sub, ast.AnnAssign) and sub.value is not None:
+            if isinstance(sub.target, ast.Name):
+                assigns.setdefault(sub.target.id, []).append(sub.value)
+    return assigns
+
+
+def _extract_kernel_cache_key_exprs(fnode: ast.FunctionDef) -> list[ast.expr]:
+    exprs: list[ast.expr] = []
+    for sub in ast.walk(fnode):
+        if (
+            isinstance(sub, ast.Subscript)
+            and isinstance(sub.value, ast.Name)
+            and sub.value.id == "_KERNEL_CACHE"
+        ):
+            exprs.append(sub.slice)
+        elif (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and isinstance(sub.func.value, ast.Name)
+            and sub.func.value.id == "_KERNEL_CACHE"
+            and sub.func.attr in ("get", "setdefault", "pop")
+        ):
+            if sub.args:
+                exprs.append(sub.args[0])
+            else:
+                for kw in sub.keywords:
+                    if kw.arg == "key":
+                        exprs.append(kw.value)
+        elif isinstance(sub, ast.Compare):
+            for op, comp in zip(sub.ops, sub.comparators):
+                if (
+                    isinstance(op, (ast.In, ast.NotIn))
+                    and isinstance(comp, ast.Name)
+                    and comp.id == "_KERNEL_CACHE"
+                ):
+                    exprs.append(sub.left)
+    return exprs
+
+
+def _find_polluted_cache_key_reason(
+    expr: ast.expr,
+    local_assigns: Mapping[str, list[ast.expr]],
+    seen_vars: frozenset[str] = frozenset(),
+) -> str | None:
+    for node in ast.walk(expr):
+        if isinstance(node, ast.Constant) and isinstance(node.value, float):
+            return f"float_literal({node.value!r})"
+        if isinstance(node, ast.Name):
+            if node.id.lower() in _POLLUTED_FLOAT_KEY_NAMES:
+                return f"float_param({node.id})"
+            if node.id in local_assigns and node.id not in seen_vars:
+                next_seen = seen_vars | {node.id}
+                for rhs in local_assigns[node.id]:
+                    nested = _find_polluted_cache_key_reason(rhs, local_assigns, next_seen)
+                    if nested is not None:
+                        return nested
+        elif isinstance(node, ast.Attribute):
+            if node.attr.lower() in _POLLUTED_FLOAT_KEY_NAMES:
+                return f"float_attr({node.attr})"
+        elif isinstance(node, ast.Subscript):
+            slc = node.slice
+            if (
+                isinstance(slc, ast.Constant)
+                and isinstance(slc.value, str)
+                and slc.value.lower() in _POLLUTED_FLOAT_KEY_NAMES
+            ):
+                return f"float_key({slc.value!r})"
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id == "float":
+                    return "float_cast(float(...))"
+                if node.func.id == "id":
+                    return "object_identity(id(...))"
+                if node.func.id == "addressof":
+                    return "pointer_address(addressof(...))"
+            elif isinstance(node.func, ast.Attribute):
+                if node.func.attr in _POLLUTED_ADDR_ATTRS:
+                    return f"pointer_attr(.{node.func.attr}())"
+                if node.func.attr == "addressof":
+                    return "pointer_address(ctypes.addressof(...))"
+    return None
+
+
+def _check_kernel_cache_key_pollution(
+    funcs: Mapping[str, ast.FunctionDef],
+    cache_fns: set[str],
+) -> list[str]:
+    """Reject float hyperparameters or runtime pointer/id values in _KERNEL_CACHE keys."""
+    errors: list[str] = []
+    for fname in sorted(cache_fns):
+        if fname not in funcs:
+            continue
+        fnode = funcs[fname]
+        local_assigns = _collect_local_var_assigns(fnode)
+        for key_expr in _extract_kernel_cache_key_exprs(fnode):
+            reason = _find_polluted_cache_key_reason(key_expr, local_assigns)
+            if reason is None:
+                continue
+            msg = (
+                f"polluted_kernel_cache_key: {fname} key uses {reason} "
+                "(pass float hyperparameters as T.float32 scalar kernel params "
+                "and dynamic outer axes via T.dynamic)"
+            )
+            if msg not in errors:
+                errors.append(msg)
+    return errors
+
+
+def _has_tracka_core_primitives(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            val = node.value
+            if (
+                isinstance(val, ast.Name)
+                and val.id == "T"
+                and node.attr in _TRACKA_CORE_PRIMITIVES
+            ):
+                return True
+            if (
+                isinstance(val, ast.Attribute)
+                and isinstance(val.value, ast.Name)
+                and val.value.id == "T"
+                and val.attr == "simd"
+            ):
+                return True
+    return False
+
+
+def _extract_tracka_pipelined_stages(tree: ast.AST) -> list[int | None]:
+    stages: list[int | None] = []
+    for node in ast.walk(tree):
+        if not _is_t_dsl_call(node, "Pipelined"):
+            continue
+        assert isinstance(node, ast.Call)
+        stage_expr: ast.expr | None = None
+        for kw in node.keywords:
+            if kw.arg == "num_stages":
+                stage_expr = kw.value
+                break
+        if stage_expr is None and len(node.args) >= 3:
+            stage_expr = node.args[2]
+        if stage_expr is None:
+            stages.append(0)
+        elif (
+            isinstance(stage_expr, ast.Constant)
+            and isinstance(stage_expr.value, int)
+            and not isinstance(stage_expr.value, bool)
+        ):
+            stages.append(int(stage_expr.value))
+        else:
+            stages.append(None)
+    return stages
+
+
+def check_repair_monotonicity(
+    parent_source: str,
+    repaired_source: str,
+    *,
+    backend_kind: str = "tilelang_dsl",
+) -> list[str]:
+    """Reject repairs that regress vector/cube primitives or drop T.Pipelined stages."""
+    if backend_kind in _TRACKB_MONOTONICITY_BACKENDS:
+        masked_parent = strip_cpp_comments_and_strings(parent_source)
+        masked_repaired = strip_cpp_comments_and_strings(repaired_source)
+        had_core = any(tok in masked_parent for tok in _TRACKB_CORE_TOKENS)
+        has_core = any(tok in masked_repaired for tok in _TRACKB_CORE_TOKENS)
+        if had_core and not has_core:
+            return [
+                "monotonicity_regression_trackb_scalar_fallback: repair dropped all "
+                "Track-B vector/cube primitives"
+            ]
+        return []
+
+    try:
+        parent_tree = ast.parse(parent_source)
+    except SyntaxError:
+        return []
+    try:
+        repaired_tree = ast.parse(repaired_source)
+    except SyntaxError as exc:
+        return [f"syntax_error:{exc}"]
+
+    errors: list[str] = []
+    if _has_tracka_core_primitives(parent_tree) and not _has_tracka_core_primitives(repaired_tree):
+        errors.append(
+            "monotonicity_regression_scalar_fallback: repair dropped all "
+            "vector/matrix core primitives (T.SimdVF/T.SimtVF/T.gemm/T.simd.*)"
+        )
+    parent_stages = _extract_tracka_pipelined_stages(parent_tree)
+    if any(s is not None and s >= 1 for s in parent_stages):
+        repaired_stages = _extract_tracka_pipelined_stages(repaired_tree)
+        if not repaired_stages:
+            errors.append(
+                "monotonicity_regression_pipeline_dropped: repair removed T.Pipelined"
+            )
+        elif all(s == 0 for s in repaired_stages):
+            errors.append(
+                "monotonicity_regression_pipeline_disabled: repair set T.Pipelined num_stages=0"
+            )
+    return errors
 
 
 def check_npu_entrypoint_purity(
@@ -358,7 +594,8 @@ def check_npu_entrypoint_purity(
         errors.append(
             f"detached_decoy_primfunc:{entrypoint} never invokes tilelang.compile"
         )
-    if require_kernel_cache:
+    has_cache_dict = _has_module_kernel_cache(tree)
+    if require_kernel_cache or has_cache_dict or cache_loaded or cache_stored:
         cache_fns = {
             fname
             for fname, fnode in funcs.items()
@@ -369,52 +606,54 @@ def check_npu_entrypoint_purity(
                 for tok in ("tilelang.compile", "compile_ascend", "ctypes.CDLL")
             )
         }
-        cache_nodes = [
-            sub
-            for fname in cache_fns
-            if fname in funcs
-            for sub in ast.walk(funcs[fname])
-        ]
-        any_cache_loaded = cache_loaded or any(
-            isinstance(sub, ast.Name)
-            and sub.id == "_KERNEL_CACHE"
-            and isinstance(sub.ctx, ast.Load)
-            for sub in cache_nodes
-        )
-        any_cache_stored = cache_stored or any(
-            (
-                isinstance(sub, ast.Subscript)
-                and isinstance(sub.ctx, ast.Store)
-                and isinstance(sub.value, ast.Name)
-                and sub.value.id == "_KERNEL_CACHE"
+        errors.extend(_check_kernel_cache_key_pollution(funcs, cache_fns))
+        if require_kernel_cache:
+            cache_nodes = [
+                sub
+                for fname in cache_fns
+                if fname in funcs
+                for sub in ast.walk(funcs[fname])
+            ]
+            any_cache_loaded = cache_loaded or any(
+                isinstance(sub, ast.Name)
+                and sub.id == "_KERNEL_CACHE"
+                and isinstance(sub.ctx, ast.Load)
+                for sub in cache_nodes
             )
-            or (
-                isinstance(sub, ast.Call)
-                and isinstance(sub.func, ast.Attribute)
-                and isinstance(sub.func.value, ast.Name)
-                and sub.func.value.id == "_KERNEL_CACHE"
-                and sub.func.attr in ("setdefault", "update")
+            any_cache_stored = cache_stored or any(
+                (
+                    isinstance(sub, ast.Subscript)
+                    and isinstance(sub.ctx, ast.Store)
+                    and isinstance(sub.value, ast.Name)
+                    and sub.value.id == "_KERNEL_CACHE"
+                )
+                or (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and isinstance(sub.func.value, ast.Name)
+                    and sub.func.value.id == "_KERNEL_CACHE"
+                    and sub.func.attr in ("setdefault", "update")
+                )
+                for sub in cache_nodes
             )
-            for sub in cache_nodes
-        )
-        compile_path_text = "\n".join(
-            ast.get_source_segment(module_source, funcs[fname]) or ""
-            for fname in cache_fns
-            if fname in funcs
-        )
-        has_compile_call = any(
-            tok in compile_path_text
-            for tok in ("tilelang.compile", "compile_ascend", "ctypes.CDLL")
-        )
-        if not _has_module_kernel_cache(tree):
-            errors.append(
-                "missing_kernel_cache: module must define module-level _KERNEL_CACHE dict"
+            compile_path_text = "\n".join(
+                ast.get_source_segment(module_source, funcs[fname]) or ""
+                for fname in cache_fns
+                if fname in funcs
             )
-        elif not any_cache_loaded or (has_compile_call and not any_cache_stored):
-            errors.append(
-                "unpopulated_kernel_cache: reachable compilation path must look up "
-                "and populate _KERNEL_CACHE"
+            has_compile_call = any(
+                tok in compile_path_text
+                for tok in ("tilelang.compile", "compile_ascend", "ctypes.CDLL")
             )
+            if not has_cache_dict:
+                errors.append(
+                    "missing_kernel_cache: module must define module-level _KERNEL_CACHE dict"
+                )
+            elif not any_cache_loaded or (has_compile_call and not any_cache_stored):
+                errors.append(
+                    "unpopulated_kernel_cache: reachable compilation path must look up "
+                    "and populate _KERNEL_CACHE"
+                )
     return errors
 
 
@@ -492,16 +731,25 @@ def _split_selector_output(
     return builder_overrides, pc, cf
 
 
-def _ascend_target_context():
-    try:
-        from tilelang import tvm  # noqa: PLC0415
-        from tilelang.backend.module import create_backend_context  # noqa: PLC0415
+@contextlib.contextmanager
+def ascend_compile_session(
+    target: str = "ascend",
+    pass_configs: Mapping[str, object] | None = None,
+) -> Iterator[None]:
+    """Enter contiguous TVM target and optional PassContext for Ascend lowering."""
+    from tilelang import tvm  # noqa: PLC0415
+    from tilelang.backend.module import create_backend_context  # noqa: PLC0415
 
+    with contextlib.ExitStack() as stack:
         if tvm.target.Target.current(allow_none=True) is None:
-            return create_backend_context("ascend").target
-    except Exception:
-        pass
-    return contextlib.nullcontext()
+            stack.enter_context(create_backend_context(target).target)
+        if pass_configs is not None:
+            stack.enter_context(tvm.transform.PassContext(config=dict(pass_configs)))
+        yield
+
+
+def _ascend_target_context() -> contextlib.AbstractContextManager[None]:
+    return ascend_compile_session("ascend")
 
 
 _VLOOPV2_MISS_RE = re.compile(
@@ -2057,7 +2305,7 @@ def _resolve_prim_func_and_configs_from_dsl(
         if spec is None or spec.loader is None:
             raise RuntimeError("failed to create module spec for candidate DSL")
         mod = importlib.util.module_from_spec(spec)
-        with _ascend_target_context():
+        with ascend_compile_session("ascend"):
             spec.loader.exec_module(mod)
 
             if config_selector_name and hasattr(mod, config_selector_name):
@@ -2199,6 +2447,40 @@ def _ast_has_dsl_call(tree: ast.AST, *attrs: str) -> bool:
     return False
 
 
+def _resolve_stage_a_var_bindings(
+    dims: Mapping[str, object] | None,
+    var_bindings: Mapping[str, int] | None,
+) -> dict[str, int] | None:
+    resolved: dict[str, int] = {}
+    if dims:
+        for key, val in dims.items():
+            if isinstance(val, int) and not isinstance(val, bool):
+                key_str = str(key)
+                iv = int(val)
+                resolved[key_str] = iv
+                mapped = _HIR_TO_BUILDER_DIM_MAP.get(key_str)
+                if mapped:
+                    resolved.setdefault(mapped, iv)
+        b_val = resolved.get("B", resolved.get("b_dim"))
+        s_val = resolved.get("S", resolved.get("S_q", resolved.get("s_dim")))
+        nq_val = resolved.get("N_q", resolved.get("n_q"))
+        nkv_val = resolved.get("N_kv", resolved.get("n_kv"))
+        n_val = resolved.get("N", resolved.get("n_depth"))
+        if b_val is not None and s_val is not None:
+            resolved.setdefault("m_rows", b_val * s_val)
+            if nq_val is not None:
+                resolved.setdefault("q_total_rows", b_val * s_val * nq_val)
+            if n_val is not None:
+                resolved.setdefault("v_rows", n_val * b_val * s_val)
+        if s_val is not None and nq_val is not None and nkv_val is not None and nkv_val > 0:
+            resolved.setdefault("q_rows", s_val * (nq_val // nkv_val))
+    if var_bindings:
+        for key, val in var_bindings.items():
+            if isinstance(val, int) and not isinstance(val, bool):
+                resolved[str(key)] = int(val)
+    return resolved or None
+
+
 def run_stage_a_static(
     dsl_source: str,
     *,
@@ -2257,7 +2539,7 @@ def run_stage_a_static(
                     error_message="; ".join(purity_errs),
                     elapsed_ms=(time.monotonic() - t0) * 1000.0,
                 )
-        with _ascend_target_context():
+        with ascend_compile_session("ascend"):
             prim_func, sel_pc, sel_cf = _resolve_prim_func_and_configs_from_dsl(
                 dsl_source,
                 factory_name=factory_name,
@@ -2290,12 +2572,13 @@ def run_stage_a_static(
                 pass_configs,
                 compile_flags,
             )
+            resolved_var_bindings = _resolve_stage_a_var_bindings(dims, var_bindings)
             inspection: EnvelopeInspectionResult = inspect_tilelang_primfunc(
                 prim_func,
                 target=target,
                 pass_configs=merged_pc or None,
                 compile_flags=merged_cf or None,
-                var_bindings=var_bindings,
+                var_bindings=resolved_var_bindings,
             )
     except Exception as exc:
         return StageAResult(
@@ -2422,10 +2705,16 @@ def build_stage_b_driver_source(
         "from tilelang import tvm\n"
         "from tilelang.backend.module import create_backend_context\n"
         "from tvm import tirx, IRModule\n"
-        "def _ascend_ctx():\n"
-        "    if tvm.target.Target.current(allow_none=True) is None:\n"
-        "        return create_backend_context('ascend').target\n"
-        "    return contextlib.nullcontext()\n"
+        "@contextlib.contextmanager\n"
+        "def _ascend_compile_session(pass_configs=None):\n"
+        "    with contextlib.ExitStack() as _stack:\n"
+        "        if tvm.target.Target.current(allow_none=True) is None:\n"
+        "            _stack.enter_context(create_backend_context('ascend').target)\n"
+        "        if pass_configs is not None:\n"
+        "            _stack.enter_context(\n"
+        "                tvm.transform.PassContext(config=dict(pass_configs))\n"
+        "            )\n"
+        "        yield\n"
         f"_cfg = json.loads({payload!r})\n"
         "_src_text = pathlib.Path(_cfg['cand_path']).read_text(encoding='utf-8')\n"
         "_has_prim_marker = 'prim_func' in _src_text\n"
@@ -2445,7 +2734,7 @@ def build_stage_b_driver_source(
         "_kw = dict(_cfg['factory_kwargs'])\n"
         "_sel_pc, _sel_cf = {}, []\n"
         "_fn = None\n"
-        "with _ascend_ctx():\n"
+        "with _ascend_compile_session():\n"
         "    _spec.loader.exec_module(_mod)\n"
         "    _sname = _cfg['config_selector_name']\n"
         "    if _sname and callable(getattr(_mod, _sname, None)):\n"
@@ -2483,47 +2772,52 @@ def build_stage_b_driver_source(
         "            if (not _k.startswith('_') and callable(_v)\n"
         "                    and getattr(_v, '__module__', None) == _mod.__name__):\n"
         "                _fn = _v(**_filt(_v, _kw)); break\n"
-        "assert _fn is not None\n"
-        "if not isinstance(_fn, (tirx.PrimFunc, IRModule)) and callable(_fn):\n"
-        "    _compile_hook = getattr(_mod, 'compile_kernel', getattr(_mod, 'build_kernel', None))\n"
-        "    if not callable(_compile_hook):\n"
-        "        raise RuntimeError(\n"
-        "            'stage_b_non_kernel_callable: plain Python function lacks @T.prim_func or compile_kernel'\n"
+        "    assert _fn is not None\n"
+        "    if not isinstance(_fn, (tirx.PrimFunc, IRModule)) and callable(_fn):\n"
+        "        _compile_hook = getattr(\n"
+        "            _mod, 'compile_kernel', getattr(_mod, 'build_kernel', None)\n"
         "        )\n"
-        "    _compile_hook()\n"
-        "else:\n"
-        "    _merged_pc, _merged_cf = {}, []\n"
-        "    def _absorb_flags(items):\n"
-        "        for _f in items:\n"
-        "            if _f and _f not in _merged_cf:\n"
-        "                _merged_cf.append(_f)\n"
-        "    _attrs = getattr(_fn, 'attrs', None)\n"
-        "    if _attrs and hasattr(_attrs, 'items'):\n"
-        "        for _pk in ('tl.pass_configs', 'tilelang_pass_configs'):\n"
-        "            if _pk in _attrs and hasattr(_attrs[_pk], 'items'):\n"
-        "                for _ak, _av in _attrs[_pk].items():\n"
-        "                    _val = getattr(_av, 'value', _av)\n"
-        "                    if str(_ak) == 'tl.device_compile_flags':\n"
-        "                        _absorb_flags(_norm_flags(_val))\n"
-        "                    else:\n"
-        "                        _merged_pc[str(_ak)] = _val\n"
-        "        for _ck in ('tir.cce_flags', 'tilelang_compile_flags'):\n"
-        "            if _ck in _attrs:\n"
-        "                _absorb_flags(_norm_flags(_attrs[_ck]))\n"
-        "    _merged_pc.update(_sel_pc)\n"
-        "    _absorb_flags(_sel_cf)\n"
-        "    _merged_pc.update(_cfg['pass_configs'])\n"
-        "    _absorb_flags(_cfg['compile_flags'])\n"
-        "    _absorb_flags(['--cce-res-usage'])\n"
-        "    if _merged_cf:\n"
-        "        _merged_pc['tl.device_compile_flags'] = list(_merged_cf)\n"
-        "    with tvm.transform.PassContext(config=_merged_pc):\n"
-        "        _art = tilelang.lower(\n"
-        "            _fn, target='ascend', enable_device_compile=True\n"
-        "        )\n"
-        "    assert _art.kernel_source\n"
-        "    if _cfg.get('kernel_dump_path'):\n"
-        "        pathlib.Path(_cfg['kernel_dump_path']).write_text(str(_art.kernel_source), encoding='utf-8')\n"
+        "        if not callable(_compile_hook):\n"
+        "            raise RuntimeError(\n"
+        "                'stage_b_non_kernel_callable: plain Python function lacks '\n"
+        "                '@T.prim_func or compile_kernel'\n"
+        "            )\n"
+        "        _compile_hook()\n"
+        "    else:\n"
+        "        _merged_pc, _merged_cf = {}, []\n"
+        "        def _absorb_flags(items):\n"
+        "            for _f in items:\n"
+        "                if _f and _f not in _merged_cf:\n"
+        "                    _merged_cf.append(_f)\n"
+        "        _attrs = getattr(_fn, 'attrs', None)\n"
+        "        if _attrs and hasattr(_attrs, 'items'):\n"
+        "            for _pk in ('tl.pass_configs', 'tilelang_pass_configs'):\n"
+        "                if _pk in _attrs and hasattr(_attrs[_pk], 'items'):\n"
+        "                    for _ak, _av in _attrs[_pk].items():\n"
+        "                        _val = getattr(_av, 'value', _av)\n"
+        "                        if str(_ak) == 'tl.device_compile_flags':\n"
+        "                            _absorb_flags(_norm_flags(_val))\n"
+        "                        else:\n"
+        "                            _merged_pc[str(_ak)] = _val\n"
+        "            for _ck in ('tir.cce_flags', 'tilelang_compile_flags'):\n"
+        "                if _ck in _attrs:\n"
+        "                    _absorb_flags(_norm_flags(_attrs[_ck]))\n"
+        "        _merged_pc.update(_sel_pc)\n"
+        "        _absorb_flags(_sel_cf)\n"
+        "        _merged_pc.update(_cfg['pass_configs'])\n"
+        "        _absorb_flags(_cfg['compile_flags'])\n"
+        "        _absorb_flags(['--cce-res-usage'])\n"
+        "        if _merged_cf:\n"
+        "            _merged_pc['tl.device_compile_flags'] = list(_merged_cf)\n"
+        "        with _ascend_compile_session(_merged_pc):\n"
+        "            _art = tilelang.lower(\n"
+        "                _fn, target='ascend', enable_device_compile=True\n"
+        "            )\n"
+        "        assert _art.kernel_source\n"
+        "        if _cfg.get('kernel_dump_path'):\n"
+        "            pathlib.Path(_cfg['kernel_dump_path']).write_text(\n"
+        "                str(_art.kernel_source), encoding='utf-8'\n"
+        "            )\n"
     )
 
 
@@ -3819,8 +4113,10 @@ __all__ = [
     "StageAResult",
     "StageBResult",
     "StageCResult",
+    "ascend_compile_session",
     "build_stage_b_driver_source",
     "check_npu_entrypoint_purity",
+    "check_repair_monotonicity",
     "evaluate_ascendc_candidate",
     "ledger_to_json",
     "parse_cce_res_usage",

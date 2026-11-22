@@ -1487,3 +1487,177 @@ def {l3_contract.DYNAMIC_NODE}():
     ]
     assert failed_cases == [l3_contract.AR_NODE]
     assert not any(testcase.find("error") is not None for testcase in root.iter("testcase"))
+
+
+def _make_idempotence_cases() -> list[tuple[int, int, str, float]]:
+    buckets = [
+        (dim, dtype)
+        for dim in (64, 128, 256, 384, 512, 768, 1024, 1536)
+        for dtype in ("float16", "bfloat16")
+    ]
+    cases = [(4 + idx * 2, dim, dtype, 1e-5) for idx, (dim, dtype) in enumerate(buckets)]
+    for extra in range(4):
+        dim, dtype = buckets[extra]
+        cases.append((32 + extra * 8, dim, dtype, 1e-5))
+    assert len(cases) == 20
+    return cases
+
+
+def test_kernel_cache_idempotence_16_regimes_20_cases_passes() -> None:
+    kernel_cache: dict[tuple[int, str], str] = {}
+    cases = _make_idempotence_cases()
+
+    def run_case(case: tuple[int, int, str, float]) -> None:
+        _, dim, dtype, _ = case
+        key = (dim, dtype)
+        if key not in kernel_cache:
+            kernel_cache[key] = f"compiled_{dim}_{dtype}"
+
+    def perturb_case(case: tuple[int, int, str, float]) -> None:
+        m_dim, dim, dtype, eps = case
+        run_case((max(1, m_dim - 1), dim, dtype, eps))
+
+    for case in cases:
+        run_case(case)
+    assert len(kernel_cache) == 16
+
+    pass1_size, pass2_delta = l3_contract.verify_kernel_cache_idempotence(
+        cases,
+        run_case,
+        kernel_cache,
+        perturb_case_fn=perturb_case,
+    )
+    assert (pass1_size, pass2_delta) == (16, 0)
+    assert len(kernel_cache) == 16
+
+
+def test_kernel_cache_idempotence_rejects_dynamic_m_key() -> None:
+    kernel_cache: dict[tuple[int, int, str], str] = {}
+    cases = _make_idempotence_cases()
+
+    def run_case(case: tuple[int, int, str, float]) -> None:
+        m_dim, dim, dtype, _ = case
+        key = (m_dim, dim, dtype)
+        if key not in kernel_cache:
+            kernel_cache[key] = f"compiled_{m_dim}_{dim}_{dtype}"
+
+    def perturb_case(case: tuple[int, int, str, float]) -> None:
+        m_dim, dim, dtype, eps = case
+        run_case((max(1, m_dim - 1), dim, dtype, eps))
+
+    for case in cases:
+        run_case(case)
+    assert len(kernel_cache) == 20
+
+    with pytest.raises(l3_contract.ClassifiedTestFailure, match=r"Delta\|Cache\|"):
+        l3_contract.verify_kernel_cache_idempotence(
+            cases,
+            run_case,
+            kernel_cache,
+            perturb_case_fn=perturb_case,
+        )
+
+
+def test_kernel_cache_idempotence_rejects_float_eps_key() -> None:
+    kernel_cache: dict[tuple[int, str, float], str] = {}
+    cases = _make_idempotence_cases()
+    call_count = 0
+
+    def run_case(case: tuple[int, int, str, float]) -> None:
+        nonlocal call_count
+        call_count += 1
+        _, dim, dtype, eps = case
+        jitter_eps = eps if call_count <= len(cases) else eps + 1e-12
+        key = (dim, dtype, jitter_eps)
+        if key not in kernel_cache:
+            kernel_cache[key] = f"compiled_{dim}_{dtype}_{jitter_eps}"
+
+    for case in cases:
+        run_case(case)
+
+    with pytest.raises(l3_contract.ClassifiedTestFailure, match=r"Delta\|Cache\|"):
+        l3_contract.verify_kernel_cache_idempotence(
+            cases,
+            run_case,
+            kernel_cache,
+        )
+
+
+def test_kernel_cache_idempotence_rejects_pass1_runaway_and_eviction() -> None:
+    cases = _make_idempotence_cases()[:4]
+    runaway_cache: dict[int, str] = {idx: f"k{idx}" for idx in range(9)}
+    with pytest.raises(l3_contract.ClassifiedTestFailure, match="runaway"):
+        l3_contract.verify_kernel_cache_idempotence(
+            cases,
+            lambda _case: None,
+            runaway_cache,
+        )
+
+    thrashing_cache: dict[str, str] = {"initial": "v0"}
+
+    def swap_key(_case: tuple[int, int, str, float]) -> None:
+        thrashing_cache.clear()
+        thrashing_cache["evicted_replacement"] = "v1"
+
+    with pytest.raises(l3_contract.ClassifiedTestFailure, match="evicted=1"):
+        l3_contract.verify_kernel_cache_idempotence(
+            cases[:1],
+            swap_key,
+            thrashing_cache,
+        )
+
+
+def test_generic_outer_axis_perturbation_and_failure_recording(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    acceptance = _acceptance_module()
+    safe_tensors = [torch.randn(8, 64), torch.randn(64)]
+    perturbed = acceptance._perturb_outer_axis_tensors(safe_tensors, {})
+    assert isinstance(perturbed, list)
+    assert tuple(perturbed[0].shape) == (7, 64)
+    assert tuple(perturbed[1].shape) == (64,)
+
+    assert acceptance._perturb_outer_axis_tensors([torch.randn(3, 64)], {}) is None
+    assert acceptance._perturb_outer_axis_tensors([torch.randn(8, 8)], {}) is None
+    assert acceptance._perturb_outer_axis_tensors([torch.randn(8, 64)], {"rows": 8}) is None
+
+    contract = l3_contract.TargetContract(
+        operator="fake_op",
+        task="level1/fake_op",
+        task_dir=tmp_path,
+        nodes=(l3_contract.NodeContract(name=l3_contract.GENERIC_NODE, required_cases=("1",)),),
+        case_ids=("1",),
+    )
+    recorder = l3_contract.EvidenceRecorder(tmp_path / "evidence.json", contract)
+    case = cannbench_contract.Case(case_num=1, label="level1/fake_op_1", attrs={})
+    pass1_tensors = [torch.randn(8, 64), torch.randn(64)]
+    fake_harness = SimpleNamespace(
+        cases=[case],
+        prepare=lambda _case: pass1_tensors,
+        params=lambda _case, tensors: {"x": tensors[0], "w": tensors[1]},
+    )
+    kernel_cache: dict[tuple[int, int], str] = {}
+
+    def _op_api(*, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        kernel_cache[(int(x.shape[0]), int(x.shape[1]))] = "compiled"
+        return x + w
+
+    monkeypatch.setattr(torch.Tensor, "npu", lambda self: self, raising=False)
+    _op_api(x=pass1_tensors[0], w=pass1_tensors[1])
+    with recorder.node(l3_contract.GENERIC_NODE):
+        recorder.case_started(l3_contract.GENERIC_NODE, "1")
+        recorder.case_finished(l3_contract.GENERIC_NODE, "1", "passed")
+        with pytest.raises(l3_contract.ClassifiedTestFailure):
+            acceptance._verify_generic_kernel_cache_idempotence(
+                fake_harness,
+                _op_api,
+                kernel_cache,
+                recorder,
+            )
+
+    payload = json.loads((tmp_path / "evidence.json").read_text(encoding="utf-8"))
+    failure = _mapping(payload["failure"])
+    assert failure["kind"] == "candidate"
+    assert failure["comparator"] == "kernel_cache_idempotence"
+    assert failure["case"] == "1"

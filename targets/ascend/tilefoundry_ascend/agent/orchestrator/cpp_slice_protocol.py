@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -763,8 +764,16 @@ def splice_cpp_units_into_tu(
 def escalate_primfunc_to_trackb_tu(prim_func: object) -> str:
     """Lower an incumbent TileLang @T.prim_func into an operator-specific C++20 TU."""
     import tilelang  # noqa: PLC0415
+    from tilelang import tvm  # noqa: PLC0415
+    from tilelang.backend.module import create_backend_context  # noqa: PLC0415
 
-    lowered = tilelang.lower(prim_func, target="ascend")
+    target_ctx = (
+        create_backend_context("ascend").target
+        if tvm.target.Target.current(allow_none=True) is None
+        else contextlib.nullcontext()
+    )
+    with target_ctx:
+        lowered = tilelang.lower(prim_func, target="ascend")
     kernel_src = str(getattr(lowered, "kernel_source", "") or "").strip()
     if not kernel_src:
         raise RuntimeError("tilelang.lower returned empty kernel_source for Track-B escalation")
