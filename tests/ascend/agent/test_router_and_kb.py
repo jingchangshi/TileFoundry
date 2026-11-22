@@ -136,9 +136,9 @@ def test_seed_rules_yaml_completeness_and_sanitization() -> None:
     assert not re.search(r"\bmla\b", yaml_text.lower())
 
     rules = load_seed_rules()
-    assert len(rules) == 33
+    assert len(rules) == 35
     ids = {rule.rule_id for rule in rules}
-    for idx in range(1, 34):
+    for idx in range(1, 36):
         prefix = f"R{idx:02d}_"
         assert any(rid.startswith(prefix) for rid in ids)
     for rule in rules:
@@ -197,7 +197,7 @@ def test_safe_ast_evaluator_and_causal_rule_matching() -> None:
     )
     assert rules["R01_DUAL_COPY_1C2V_SPLIT"].matches(
         build_predicate_context(pure_vec_split)
-    ) is True
+    ) is False
 
     after_split = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
@@ -1534,3 +1534,103 @@ def test_r01_and_r31_guards_reject_pure_vector_dense_simtvf() -> None:
     assert rules["R31_SIMT_UB_PRIVATIZED_ATOMICS"].matches(
         build_predicate_context(indirect_simtvf_ledger)
     ) is True
+
+
+def test_p0_residual_l1_projection_and_p1_subcore_r35_r13_routing() -> None:
+    """Project L1 observation fields into predicates and route R35/R13 on pure-vector cores."""
+    from tilefoundry_ascend.agent.kb.schema import (  # noqa: PLC0415
+        SymptomFamily,
+        rank_symptom_families,
+    )
+    from tilefoundry_ascend.agent.orchestrator.residual_beam import (  # noqa: PLC0415
+        compute_static_dynamic_residual,
+    )
+    from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (  # noqa: PLC0415
+        BishengResourceSummary,
+    )
+
+    rules = {r.rule_id: r for r in load_seed_rules()}
+    scalar_trap_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 80, "AIV1.PIPE_V": 80},
+        waterlines={},
+    )
+    l1_zero_vec = BishengResourceSummary(
+        vec_regs=0,
+        scalar_regs=42,
+        spill_bytes=32,
+        stack_bytes=128,
+        vloopv2_loops=0,
+        software_loops=2,
+        vf_fusion_breaks=3,
+        dual_issue_ipc_collapse=0.4,
+        alias_serialized_buffers=2,
+        has_local_membar_in_vf_call=True,
+        dcache_dcci_flushes=1,
+    )
+    res_l1 = compute_static_dynamic_residual(
+        scalar_trap_ledger,
+        {"dur_us": 50.0, "aiv_vec": 0.005},
+        compiler_summary=l1_zero_vec,
+    )
+    ctx_from_res = build_predicate_context(scalar_trap_ledger, residual=res_l1)
+    assert ctx_from_res["has_l1_compiler_summary"] is True
+    assert ctx_from_res["l1_vec_regs"] == 0
+    assert ctx_from_res["l1_scalar_regs"] == 42
+    assert ctx_from_res["spill_bytes"] == 32
+    assert ctx_from_res["stack_bytes"] == 128
+    assert ctx_from_res["vloopv2_hit"] is False
+    assert ctx_from_res["vf_fusion_breaks"] == 3
+    assert ctx_from_res["dual_issue_ipc_collapse"] == pytest.approx(0.4)
+    assert ctx_from_res["alias_serialized_buffers"] == 2
+    assert ctx_from_res["has_local_membar_in_vf_call"] is True
+    assert ctx_from_res["dcache_dcci_flushes"] == 1
+    assert rules["R34_SCALAR_LOOP_TO_VECTOR_DMA_PIPELINE"].matches(ctx_from_res) is True
+    assert rank_symptom_families(ctx_from_res)[0][0] == SymptomFamily.SCALAR_LOOP_TRAP
+
+    pure_vec_imbal = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 120},
+        waterlines={},
+        grid_blocks=36,
+        wave_occupancy=36.0 / 56.0,
+    )
+    ctx_pure = build_predicate_context(pure_vec_imbal)
+    assert rules["R01_DUAL_COPY_1C2V_SPLIT"].matches(ctx_pure) is False
+    assert rules["R35_PURE_VECTOR_DUAL_SUBCORE_SPLIT"].matches(ctx_pure) is True
+    assert rules["R13_SPLIT_KV_WAVE_RECOVERY"].matches(ctx_pure) is True
+
+    obs_imbal = pure_vec_imbal.to_observation_5d()
+    assert obs_imbal.compute_issue.l0_aiv_subcore_imbalance is True
+    ranked_obs = dict(rank_symptom_families(obs_imbal))
+    assert ranked_obs[SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE] == pytest.approx(0.7)
+
+    roof_ctx = build_predicate_context(
+        build_objective_physical_ledger(
+            analysis_mode="readonly_envelope",
+            is_legal=True,
+            steady_state_ii=None,
+            pipe_cycles={"AIV0.PIPE_V": 60, "AIV1.PIPE_V": 60},
+            waterlines={},
+            gm_roundtrip_bytes=16384,
+            gm_traffic_scope="full_grid",
+        ),
+        prev_ledger=build_objective_physical_ledger(
+            analysis_mode="readonly_envelope",
+            is_legal=True,
+            steady_state_ii=None,
+            pipe_cycles={"AIV0.PIPE_V": 60, "AIV1.PIPE_V": 60},
+            waterlines={},
+            gm_roundtrip_bytes=32768,
+            gm_traffic_scope="full_grid",
+        ),
+        roofline={"min_gm_bytes": 16384, "compute_floor_us": 5.0},
+    )
+    assert roof_ctx["transfer_inflation_ratio"] == pytest.approx(2.0)
+    prev_ns = roof_ctx["prev"]
+    assert isinstance(prev_ns, dict)
+    assert prev_ns["transfer_inflation_ratio"] == pytest.approx(3.0)

@@ -14,7 +14,9 @@ import yaml
 
 from tilefoundry_ascend.ascend.passes.observation_space import (
     AxisResidual5D,
+    CompilerSummaryLike,
     ObservationVector5D,
+    RooflineSummaryLike,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 
@@ -29,6 +31,7 @@ class SymptomFamily(str, Enum):
     COMPUTE_INEFFECTIVE_THROUGHPUT = "COMPUTE_INEFFECTIVE_THROUGHPUT"
     COMPUTE_FIXPIPE_ACCUM_IMBALANCE = "COMPUTE_FIXPIPE_ACCUM_IMBALANCE"
     COMPUTE_1C2V_SUBCORE_IMBALANCE = "COMPUTE_1C2V_SUBCORE_IMBALANCE"
+    SCALAR_LOOP_TRAP = "SCALAR_LOOP_TRAP"
     SRAM_REGISTER_SPILL_STACK = "SRAM_REGISTER_SPILL_STACK"
     SRAM_UB_L1_BANK_CONFLICT = "SRAM_UB_L1_BANK_CONFLICT"
     SYNC_PSEUDO_DOUBLE_BUFFER = "SYNC_PSEUDO_DOUBLE_BUFFER"
@@ -44,6 +47,7 @@ SYMPTOM_FAMILY_TO_AXIS: dict[SymptomFamily, str] = {
     SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT: "compute_issue",
     SymptomFamily.COMPUTE_FIXPIPE_ACCUM_IMBALANCE: "compute_issue",
     SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE: "compute_issue",
+    SymptomFamily.SCALAR_LOOP_TRAP: "compute_issue",
     SymptomFamily.SRAM_REGISTER_SPILL_STACK: "onchip_sram_reg",
     SymptomFamily.SRAM_UB_L1_BANK_CONFLICT: "onchip_sram_reg",
     SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER: "pipeline_sync",
@@ -80,6 +84,10 @@ SYMPTOM_FAMILY_TO_FACETS: dict[SymptomFamily, tuple[str, ...]] = {
     SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE: (
         "grid_and_workspace_topology",
         "pipeline_and_sync_graph",
+    ),
+    SymptomFamily.SCALAR_LOOP_TRAP: (
+        "exec_mode_and_spr",
+        "dma_and_cache_hierarchy",
     ),
     SymptomFamily.SRAM_REGISTER_SPILL_STACK: (
         "tile_and_stage_knobs",
@@ -479,6 +487,8 @@ _RESIDUAL_DEFAULTS: dict[str, int | float | bool | str] = {
     "predicted_bottleneck_util": 0.0,
     "measured_aic_mac_ratio": 0.0,
     "measured_aiv_vec_ratio": 0.0,
+    "l2_aic_mac_ratio": 0.0,
+    "l2_aiv_vec_ratio": 0.0,
     "measured_mte2_wait_ratio": 0.0,
     "measured_sync_stall_ratio": 0.0,
     "unexplained_gap_ratio": 0.0,
@@ -486,6 +496,7 @@ _RESIDUAL_DEFAULTS: dict[str, int | float | bool | str] = {
     "effective_compute_eta": 0.0,
     "pseudo_double_buffer_serialized": False,
     "spill_bytes": 0,
+    "stack_bytes": 0,
     "vloopv2_hit": True,
     "l2_hit_rate": 1.0,
     "bank_conflict_ratio": 0.0,
@@ -501,6 +512,8 @@ _TELEMETRY_CONTEXT_DEFAULTS: dict[str, int | float | bool | str] = {
     "num_aiv_cores": 56,
     "ub_bank_conflict_risk": 0.0,
     "l1_bank_conflict_risk": 0.0,
+    "l1_vec_regs": 0,
+    "l1_scalar_regs": 0,
     "has_empty_group": False,
     "has_loop_carried_state": False,
     "compute_engine": "",
@@ -539,11 +552,15 @@ def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
     )
     ns["cube_cycles"] = cube_cycles
     ns["vec_cycles"] = vec_cycles
+    ns["l0_cube_cycles"] = cube_cycles
+    ns["l0_vec_cycles"] = vec_cycles
     ns["cube_to_vector_ratio"] = (
         round(cube_cycles / float(max(1, vec_cycles)), 6) if cube_cycles > 0 else 0.0
     )
     ns["wave_occupancy"] = float(ledger.wave_occupancy)
+    ns["l0_wave_occupancy"] = float(ledger.wave_occupancy)
     ns["grid_blocks"] = int(ledger.grid_blocks)
+    ns["l0_grid_blocks"] = int(ledger.grid_blocks)
     ns["active_grid_blocks"] = int(ledger.active_grid_blocks)
     ns["grid_is_symbolic"] = bool(ledger.grid_is_symbolic)
     ns["in_loop_pipe_all_barriers"] = int(ledger.in_loop_pipe_all_barriers)
@@ -662,11 +679,12 @@ def _embedded_observation(
 def _axis_residuals(
     ledger: ObjectivePhysicalLedger,
     residual: Mapping[str, object] | object | None,
+    roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
 ) -> AxisResidual5D:
     """Compute axis residuals from the measured observation, else the ledger's static L0 view."""
     observation = _embedded_observation(residual)
     if observation is None:
-        observation = ledger.to_observation_5d()
+        observation = ledger.to_observation_5d(roofline=roofline)
     return observation.compute_axis_residuals()
 
 
@@ -688,10 +706,11 @@ def build_predicate_context(
     *,
     features: object | None = None,
     residual: Mapping[str, object] | object | None = None,
-    compiler_summary: Mapping[str, object] | object | None = None,
+    compiler_summary: CompilerSummaryLike | Mapping[str, object] | None = None,
     prev_ledger: ObjectivePhysicalLedger | None = None,
     extra: Mapping[str, object] | None = None,
     target: object | None = None,
+    roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Assemble a flat and dotted-path dictionary for safe rule predicate evaluation.
 
@@ -730,20 +749,35 @@ def build_predicate_context(
             ctx["num_aiv_cores"] = int(dev.aiv_count)
 
     res_defaults: dict[str, int | float | bool | str] = dict(_RESIDUAL_DEFAULTS)
+    has_l1_summary = compiler_summary is not None
     if compiler_summary is not None:
         comp_vals = _extract_typed_defaults(compiler_summary, _RESIDUAL_DEFAULTS)
         if isinstance(compiler_summary, Mapping):
             sw = int(compiler_summary.get("software_loops", 0) or 0)
             vl = int(compiler_summary.get("vloopv2_loops", 0) or 0)
+            ctx["l1_vec_regs"] = int(compiler_summary.get("vec_regs", 0) or 0)
+            ctx["l1_scalar_regs"] = int(compiler_summary.get("scalar_regs", 0) or 0)
         else:
-            sw = int(getattr(compiler_summary, "software_loops", 0) or 0)
-            vl = int(getattr(compiler_summary, "vloopv2_loops", 0) or 0)
+            sw = int(compiler_summary.software_loops)
+            vl = int(compiler_summary.vloopv2_loops)
+            ctx["l1_vec_regs"] = int(compiler_summary.vec_regs)
+            ctx["l1_scalar_regs"] = int(compiler_summary.scalar_regs)
         if sw == 0 and vl == 0 and "vloopv2_hit" in comp_vals:
             comp_vals["vloopv2_hit"] = True
         res_defaults.update(comp_vals)
     if residual is not None:
         res_defaults.update(_extract_typed_defaults(residual, _RESIDUAL_DEFAULTS))
         ctx.update(_extract_typed_defaults(residual, _TELEMETRY_CONTEXT_DEFAULTS))
+        if (
+            res_defaults.get("measured_aic_mac_ratio", 0.0)
+            and not res_defaults.get("l2_aic_mac_ratio", 0.0)
+        ):
+            res_defaults["l2_aic_mac_ratio"] = res_defaults["measured_aic_mac_ratio"]
+        if (
+            res_defaults.get("measured_aiv_vec_ratio", 0.0)
+            and not res_defaults.get("l2_aiv_vec_ratio", 0.0)
+        ):
+            res_defaults["l2_aiv_vec_ratio"] = res_defaults["measured_aiv_vec_ratio"]
         embedded_obs = _embedded_observation(residual)
         if embedded_obs is not None:
             obs_payload = embedded_obs.to_dict()
@@ -765,8 +799,52 @@ def build_predicate_context(
                         raw_val = axis_payload.get(f"l2_{key}")
                 if isinstance(raw_val, (int, float)) and not isinstance(raw_val, bool):
                     res_defaults[key] = float(raw_val)
+            if not has_l1_summary and embedded_obs.has_l1_compiler_summary:
+                has_l1_summary = True
+                ctx["l1_vec_regs"] = int(embedded_obs.onchip_sram_reg.l1_vec_regs)
+                ctx["l1_scalar_regs"] = int(embedded_obs.onchip_sram_reg.l1_scalar_regs)
+                res_defaults["spill_bytes"] = max(
+                    int(res_defaults["spill_bytes"]),
+                    int(embedded_obs.onchip_sram_reg.l1_spill_bytes),
+                )
+                res_defaults["stack_bytes"] = max(
+                    int(res_defaults["stack_bytes"]),
+                    int(embedded_obs.onchip_sram_reg.l1_stack_bytes),
+                )
+                obs_vloop_hit = not (
+                    embedded_obs.compute_issue.l1_software_loops > 0
+                    and embedded_obs.compute_issue.l1_vloopv2_loops == 0
+                )
+                res_defaults["vloopv2_hit"] = (
+                    bool(res_defaults["vloopv2_hit"]) and obs_vloop_hit
+                )
+                res_defaults["vf_fusion_breaks"] = max(
+                    int(res_defaults["vf_fusion_breaks"]),
+                    int(embedded_obs.compute_issue.l1_vf_fusion_breaks),
+                )
+                res_defaults["dual_issue_ipc_collapse"] = max(
+                    float(res_defaults["dual_issue_ipc_collapse"]),
+                    float(embedded_obs.compute_issue.l1_dual_issue_collapse),
+                )
+                res_defaults["alias_serialized_buffers"] = max(
+                    int(res_defaults["alias_serialized_buffers"]),
+                    int(embedded_obs.pipeline_sync.l1_alias_serialized_buffers),
+                )
+                res_defaults["has_local_membar_in_vf_call"] = (
+                    bool(res_defaults["has_local_membar_in_vf_call"])
+                    or bool(embedded_obs.pipeline_sync.l1_local_membar_in_vf)
+                )
+                res_defaults["dcache_dcci_flushes"] = max(
+                    int(res_defaults["dcache_dcci_flushes"]),
+                    int(embedded_obs.offchip_dma.l1_dcache_dcci_flushes),
+                )
+    elif roofline is not None:
+        static_obs = ledger.to_observation_5d(roofline=roofline)
+        if static_obs.transfer_inflation_ratio > 0.0:
+            res_defaults["transfer_inflation_ratio"] = float(static_obs.transfer_inflation_ratio)
+    ctx["has_l1_compiler_summary"] = has_l1_summary
     ctx.update(res_defaults)
-    ctx.update(_axis_gap_context(_axis_residuals(ledger, residual)))
+    ctx.update(_axis_gap_context(_axis_residuals(ledger, residual, roofline=roofline)))
 
     if (
         float(ctx.get("ub_bank_conflict_risk", 0.0)) == 0.0
@@ -776,11 +854,15 @@ def build_predicate_context(
 
     if prev_ledger is not None:
         prev_ns = _ledger_to_namespace(prev_ledger)
-        prev_ns.update(_axis_gap_context(_axis_residuals(prev_ledger, None)))
+        prev_ns.update(_axis_gap_context(_axis_residuals(prev_ledger, None, roofline=roofline)))
         for key, val in _RESIDUAL_DEFAULTS.items():
             prev_ns.setdefault(key, val)
         for key, val in _TELEMETRY_CONTEXT_DEFAULTS.items():
             prev_ns.setdefault(key, val)
+        if roofline is not None:
+            prev_obs = prev_ledger.to_observation_5d(roofline=roofline)
+            if prev_obs.transfer_inflation_ratio > 0.0:
+                prev_ns["transfer_inflation_ratio"] = float(prev_obs.transfer_inflation_ratio)
         ctx["prev"] = prev_ns
     else:
         ctx["prev"] = dict(ctx)
@@ -884,6 +966,8 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
     )
     sw_loops = _read_signal_int(compute_map, "l1_software_loops")
     vl_loops = _read_signal_int(compute_map, "l1_vloopv2_loops")
+    vec_cycles = _read_signal_int(compute_map, "l0_vec_cycles")
+    subcore_imbalance = _read_signal_bool(compute_map, "l0_aiv_subcore_imbalance")
     return {
         "transfer_inflation_ratio": transfer_inflation,
         "effective_compute_eta": effective_eta,
@@ -903,13 +987,18 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
         "dual_issue_ipc_collapse": _read_signal_float(compute_map, "l1_dual_issue_collapse"),
         "measured_aiv_vec_ratio": _read_signal_float(compute_map, "l2_aiv_vec_ratio"),
         "measured_aic_mac_ratio": _read_signal_float(compute_map, "l2_aic_mac_ratio"),
+        "l2_aiv_vec_ratio": _read_signal_float(compute_map, "l2_aiv_vec_ratio"),
+        "l2_aic_mac_ratio": _read_signal_float(compute_map, "l2_aic_mac_ratio"),
         "aic_fixpipe_ratio": _read_signal_float(dma_map, "l2_fixpipe_ratio"),
         "AIC.PIPE_M": _read_signal_int(compute_map, "l0_cube_cycles"),
         "AIC.PIPE_FIX": 0,
-        "AIV0.PIPE_V": _read_signal_int(compute_map, "l0_vec_cycles"),
-        "AIV1.PIPE_V": _read_signal_int(compute_map, "l0_vec_cycles"),
+        "AIV0.PIPE_V": vec_cycles,
+        "AIV1.PIPE_V": 0 if subcore_imbalance else vec_cycles,
+        "l0_cube_cycles": _read_signal_int(compute_map, "l0_cube_cycles"),
+        "l0_vec_cycles": vec_cycles,
         "spill_bytes": _read_signal_int(sram_map, "l1_spill_bytes"),
         "stack_bytes": _read_signal_int(sram_map, "l1_stack_bytes"),
+        "l1_vec_regs": _read_signal_int(sram_map, "l1_vec_regs"),
         "max_overflow_bytes": _read_signal_int(sram_map, "l0_max_overflow_bytes"),
         "degraded_buffer_count": _read_signal_int(sram_map, "l0_degraded_single_buffers"),
         "bank_conflict_ratio": _read_signal_float(sram_map, "l2_bank_conflict_ratio"),
@@ -921,10 +1010,13 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
         "in_loop_pipe_all_barriers": _read_signal_int(sync_map, "l0_in_loop_pipe_all_barriers"),
         "has_local_membar_in_vf_call": _read_signal_bool(sync_map, "l1_local_membar_in_vf"),
         "wave_occupancy": _read_signal_float(grid_map, "l0_wave_occupancy", default=1.0),
+        "l0_wave_occupancy": _read_signal_float(grid_map, "l0_wave_occupancy", default=1.0),
         "grid_blocks": _read_signal_int(grid_map, "l0_grid_blocks", default=0),
+        "l0_grid_blocks": _read_signal_int(grid_map, "l0_grid_blocks", default=0),
         "num_aic_cores": 28,
         "num_aiv_cores": 56,
         "grid_is_symbolic": False,
+        "has_l1_compiler_summary": _read_signal_bool(payload, "has_l1_compiler_summary"),
     }
 
 
@@ -960,6 +1052,14 @@ def rank_symptom_families(
     pipe_fix = _read_signal_int(sig, "AIC.PIPE_FIX", "PIPE_FIX")
     aiv0_v = _read_signal_int(sig, "AIV0.PIPE_V")
     aiv1_v = _read_signal_int(sig, "AIV1.PIPE_V")
+    l0_cube_cycles = _read_signal_int(sig, "l0_cube_cycles", "AIC.PIPE_M", "PIPE_M")
+    l0_vec_cycles = _read_signal_int(
+        sig,
+        "l0_vec_cycles",
+        default=(aiv0_v + aiv1_v) if (aiv0_v or aiv1_v) else _read_signal_int(sig, "PIPE_V"),
+    )
+    l1_vec_regs = _read_signal_int(sig, "l1_vec_regs", "vec_regs")
+    has_l1_summary = _read_signal_bool(sig, "has_l1_compiler_summary")
 
     spill_bytes = _read_signal_int(sig, "spill_bytes")
     stack_bytes = _read_signal_int(sig, "stack_bytes", "l1_stack_bytes")
@@ -1096,6 +1196,11 @@ def rank_symptom_families(
         ),
     )
 
+    is_scalar_trap = (l0_cube_cycles == 0 and l0_vec_cycles == 0) or (
+        has_l1_summary and l1_vec_regs == 0 and aiv_vec < 0.02 and aic_mac == 0.0
+    )
+    scalar_loop_score = 1.0 if is_scalar_trap else 0.0
+
     scored: list[tuple[SymptomFamily, float]] = [
         (SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP, round(dma_roundtrip_score, 6)),
         (SymptomFamily.DMA_UNALIGNED_SHORT_BURST, round(short_burst_score, 6)),
@@ -1104,13 +1209,20 @@ def rank_symptom_families(
         (SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT, round(ineffective_compute_score, 6)),
         (SymptomFamily.COMPUTE_FIXPIPE_ACCUM_IMBALANCE, round(fixpipe_score, 6)),
         (SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE, round(subcore_imbalance_score, 6)),
+        (SymptomFamily.SCALAR_LOOP_TRAP, round(scalar_loop_score, 6)),
         (SymptomFamily.SRAM_REGISTER_SPILL_STACK, round(sram_spill_score, 6)),
         (SymptomFamily.SRAM_UB_L1_BANK_CONFLICT, round(bank_conflict_score, 6)),
         (SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER, round(pseudo_db_score, 6)),
         (SymptomFamily.SYNC_BARRIER_SERIALIZATION, round(barrier_score, 6)),
         (SymptomFamily.GRID_TAIL_WAVE_UNDERUTIL, round(grid_wave_score, 6)),
     ]
-    scored.sort(key=lambda item: (-item[1], item[0].value))
+    scored.sort(
+        key=lambda item: (
+            -item[1],
+            0 if item[0] == SymptomFamily.SCALAR_LOOP_TRAP else 1,
+            item[0].value,
+        )
+    )
     return scored
 
 

@@ -110,6 +110,12 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.serial(extent)",
         ),
         PrimitiveEntry(
+            "T.dynamic",
+            "SCALAR",
+            "tile_and_stage_knobs",
+            "T.dynamic(name, dtype=\"int32\")",
+        ),
+        PrimitiveEntry(
             "T.SimdVF",
             "PIPE_V",
             "exec_mode_and_spr",
@@ -206,6 +212,12 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.reduce_max(src, dst, dim=...)",
         ),
         PrimitiveEntry(
+            "T.reduce_absmax",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.reduce_absmax(src, dst, dim=...)",
+        ),
+        PrimitiveEntry(
             "T.simd.pset",
             "PIPE_V",
             "exec_mode_and_spr",
@@ -242,10 +254,34 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.simd.vexp(vec, mask=mask)",
         ),
         PrimitiveEntry(
+            "T.simd.vln",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.vln(vec, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vsqrt",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "T.simd.vsqrt(vec, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vabs",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vabs(vec, mask=mask)",
+        ),
+        PrimitiveEntry(
             "T.simd.vadd",
             "PIPE_V",
             "alg_compute_and_monoid",
             "T.simd.vadd(lhs, rhs, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vadds",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vadds(vec, scalar, mask=mask)",
         ),
         PrimitiveEntry(
             "T.simd.vsub",
@@ -272,6 +308,36 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.simd.vdiv(lhs, rhs, mask=mask)",
         ),
         PrimitiveEntry(
+            "T.simd.vmax",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vmax(lhs, rhs, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vmin",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vmin(lhs, rhs, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vmaxs",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vmaxs(vec, scalar, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vcadd",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vcadd(vec, mask=mask)",
+        ),
+        PrimitiveEntry(
+            "T.simd.vcmax",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "T.simd.vcmax(vec, mask=mask)",
+        ),
+        PrimitiveEntry(
             "T.simd.vsts",
             "PIPE_V",
             "exec_mode_and_spr",
@@ -293,7 +359,6 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
     forbidden_tokens=(
         "tilelang.language",
         "is_npu=",
-        "threads=",
         "T.Scope",
         "T.alloc_ub",
         "T.alloc_L1",
@@ -315,6 +380,26 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "with `T.simd.*` (f32 via NORM_B32; f16/bf16 via US_B16 -> vcvt(\"float32\") -> "
             "compute -> vcvt(tl_dtype) -> PK_B32), or under `with T.SimtVF(threads=128):` "
             "with lowercase T.cast."
+        ),
+        (
+            "T.simd.vrsqrt does not exist; implement rsqrt(x) inside `with T.SimdVF():` "
+            "via `T.simd.vsqrt(x, mask=mask)` and `T.simd.vdiv(T.simd.vdup(1.0, \"float32\", "
+            "mask=mask), sqrt_x, mask=mask)`."
+        ),
+        (
+            "Declare runtime-varying batch or outer extents with T.dynamic(\"m_rows\") "
+            "/ T.dynamic(\"b_dim\") / T.dynamic(\"s_dim\") / T.dynamic(\"s_kv\"); keep only "
+            "tl_dtype and static block tiles (bm, bn, tile_m, num_stages) as compile-time constants."
+        ),
+        (
+            "For matmul or coupled Cube+Vector workloads, use `with T.MixedKernel(28, sids=2) "
+            "as (bx, sid):` with T.alloc_l1, T.alloc_l0c, T.gemm, T.alloc_shared, and T.SimdVF."
+        ),
+        (
+            "For non-last-axis or high-rank reductions, reshape/view as 3D "
+            "(outer, reduce_extent, inner) on NPU, pad UB tiles to 64-element multiples with "
+            "T.simd.update_mask(rem, width=32/16), and guard all -inf rows so (-inf)-(-inf) "
+            "never yields spurious NaN."
         ),
     ),
 )
@@ -376,6 +461,9 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
     required_headers_or_imports=(
         "#include <tl_templates/ascend/common.h>",
         "#include <tl_templates/ascend/gemm.h>",
+        "#include <tl_templates/ascend/nd2nz_copy.h>",
+        "#include <tl_templates/ascend/dcache_bypass.h>",
+        "#include <tl_templates/ascend/reduce.h>",
         "#include <tl_templates/ascend/simd_inst.h>",
     ),
     primitives=(
@@ -383,13 +471,57 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
             "asc_copy_gm2ub_align",
             "PIPE_MTE2",
             "dma_and_cache_hierarchy",
-            "asc_copy_gm2ub_align(dst_ub, src_gm, rows, row_bytes, ...)",
+            (
+                "asc_copy_gm2ub_align(dst_ub, src_gm, size_bytes) | "
+                "(dst_ub, src_gm, burst_count, burst_len, left_pad, right_pad, src_gap, dst_gap) "
+                "[3/8/10 args only; non-const __gm__ T*]"
+            ),
         ),
         PrimitiveEntry(
             "asc_copy_ub2gm_align",
             "PIPE_MTE3",
             "dma_and_cache_hierarchy",
-            "asc_copy_ub2gm_align(dst_gm, src_ub, rows, row_bytes, ...)",
+            (
+                "asc_copy_ub2gm_align(dst_gm, src_ub, size_bytes) | "
+                "(dst_gm, src_ub, burst_count, burst_len, left_pad, right_pad, src_gap, dst_gap) "
+                "[3/7/8 args only; non-const __gm__ T*]"
+            ),
+        ),
+        PrimitiveEntry(
+            "asc_copy_gm2ub",
+            "PIPE_MTE2",
+            "dma_and_cache_hierarchy",
+            "asc_copy_gm2ub(dst_ub, src_gm, burst_count, burst_len, src_stride, dst_stride)",
+        ),
+        PrimitiveEntry(
+            "asc_copy_ub2gm",
+            "PIPE_MTE3",
+            "dma_and_cache_hierarchy",
+            "asc_copy_ub2gm(dst_gm, src_ub, burst_count, burst_len, dst_stride, src_stride)",
+        ),
+        PrimitiveEntry(
+            "get_block_idx",
+            "SCALAR",
+            "grid_and_workspace_topology",
+            "get_block_idx()",
+        ),
+        PrimitiveEntry(
+            "get_block_num",
+            "SCALAR",
+            "grid_and_workspace_topology",
+            "get_block_num()",
+        ),
+        PrimitiveEntry(
+            "get_subblockid",
+            "SCALAR",
+            "grid_and_workspace_topology",
+            "get_subblockid()",
+        ),
+        PrimitiveEntry(
+            "get_subblockdim",
+            "SCALAR",
+            "grid_and_workspace_topology",
+            "get_subblockdim()",
         ),
         PrimitiveEntry(
             "asc_copy_gm2l1_nd2nz",
@@ -492,6 +624,13 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
         "__shfl_sync",
         "__shfl_xor_sync",
         "__ballot_sync",
+        "__shared__",
+        "__syncthreads",
+        "threadIdx",
+        "blockIdx",
+        "blockDim",
+        "gridDim",
+        "get_subblocknum",
     ),
     prompt_notes=(
         "Compile target is Track-B CCE C++20 (-std=c++20 --npu-arch=dav-3510) via tl_templates.",
@@ -537,6 +676,24 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
             "CUDA warp intrinsics (__shfl_down_sync, __shfl_sync, __shfl_xor_sync, "
             "__ballot_sync, warpSize) do not exist on Ascend dav-3510; use explicit "
             "shared scratch or __simd_vf__ vector reductions instead."
+        ),
+        (
+            "Cast away const on __gm__ T* and __ubuf__ T* arguments passed to "
+            "asc_copy_gm2ub* / asc_copy_ub2gm* (passing const __gm__ T* fails bisheng "
+            "overload resolution), and never form negative base offsets (src_gm - pad) "
+            "before a tensor allocation."
+        ),
+        (
+            "Never mix PIPE_S scalar stores (dst_gm[i] = v) with PIPE_MTE3 asc_copy_ub2gm* "
+            "to the same output __gm__ buffer without explicit cache flushing: dirty 64B "
+            "Scalar DCache lines overwrite DMA stores with stale NaN bits. Route unaligned "
+            "tail stores through byte-granular asc_copy_ub2gm_align."
+        ),
+        (
+            "Invoke __simt_vf__ / __simd_vf__ functions inside __aicore__ kernels via "
+            "asc_vf_call<fn>(...), never <<<...>>> (chevron syntax is valid only in Host "
+            "extern \"C\" launchers calling __global__ kernels); query sub-cores with "
+            "get_subblockdim() and get_subblockid(), not get_subblocknum()."
         ),
     ),
 )

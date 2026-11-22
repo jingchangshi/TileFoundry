@@ -816,3 +816,34 @@ def test_stage_a_static_projects_case_ratios_into_router_features() -> None:
     assert projected.features.phi_1_static_affine_bounds == base.features.phi_1_static_affine_bounds
     assert projected.route is not None
     assert projected.route.track == "simt_vf"
+
+
+def test_compute_issue_axis_subcore_imbalance_and_legacy_checkpoint() -> None:
+    """Capture AIV0/AIV1 imbalance in from_tiers while keeping old checkpoints compatible."""
+    imbal_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 100},
+        waterlines={},
+    )
+    obs_imbal = ObservationVector5D.from_tiers(imbal_ledger)
+    assert obs_imbal.compute_issue.l0_aiv_subcore_imbalance is True
+    payload = obs_imbal.to_dict()
+    assert ObservationVector5D.from_dict(payload) == obs_imbal
+
+    legacy_compute = dict(payload["compute_issue"])
+    legacy_compute.pop("l0_aiv_subcore_imbalance", None)
+    legacy_payload = dict(payload)
+    legacy_payload["compute_issue"] = legacy_compute
+    restored_legacy = ObservationVector5D.from_dict(legacy_payload)
+    assert restored_legacy.compute_issue.l0_aiv_subcore_imbalance is False
+
+    bal_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 50, "AIV1.PIPE_V": 50},
+        waterlines={},
+    )
+    assert ObservationVector5D.from_tiers(bal_ledger).compute_issue.l0_aiv_subcore_imbalance is False

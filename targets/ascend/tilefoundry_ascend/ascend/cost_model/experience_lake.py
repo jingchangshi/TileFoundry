@@ -118,6 +118,9 @@ class CaseObservationRecord:
     projected_contig_bytes: int = 32768
     timestamp: float = field(default_factory=time.time)
     schema_version: int = 2
+    min_gm_bytes: float = 0.0
+    compute_floor_us: float = 0.0
+    transfer_inflation_ratio: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -147,6 +150,11 @@ class CaseObservationRecord:
             projected_contig_bytes=int(payload.get("projected_contig_bytes", 32768) or 32768),
             timestamp=float(payload.get("timestamp", 0.0) or 0.0),
             schema_version=int(payload.get("schema_version", 2) or 2),
+            min_gm_bytes=float(payload.get("min_gm_bytes", 0.0) or 0.0),
+            compute_floor_us=float(payload.get("compute_floor_us", 0.0) or 0.0),
+            transfer_inflation_ratio=float(
+                payload.get("transfer_inflation_ratio", 0.0) or 0.0
+            ),
         )
 
 

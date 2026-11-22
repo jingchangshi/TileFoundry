@@ -17,7 +17,10 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
     PerfTargetCampaignRunner,
     _should_trigger_p2_deep_dive,
 )
-from tilefoundry_ascend.agent.campaign.seed_synthesizer import select_initial_track_from_semantics
+from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
+    select_fallback_track_from_semantics,
+    select_initial_track_from_semantics,
+)
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     CandidateSurrogateResult,
     L3AcceptanceResult,
@@ -138,11 +141,11 @@ def _surrogate(
     return aggregate_surrogate_result(cid, "synthetic_op", metrics)
 
 
-def test_all_33_seed_rules_have_valid_symptom_family_and_anti_precondition(tmp_path: Path) -> None:
-    """Validate all 33 seed rules declare valid SymptomFamily values and anti_precondition ASTs."""
+def test_all_seed_rules_have_valid_symptom_family_and_anti_precondition(tmp_path: Path) -> None:
+    """Validate all 35 seed rules declare valid SymptomFamily values and anti_precondition ASTs."""
     rules = load_seed_rules()
-    assert len(rules) == 33
-    assert len(SymptomFamily) == 12
+    assert len(rules) == 35
+    assert len(SymptomFamily) == 13
     assert set(SYMPTOM_FAMILY_TO_AXIS) == set(SymptomFamily)
     assert set(SYMPTOM_FAMILY_TO_FACETS) == set(SymptomFamily)
 
@@ -338,7 +341,7 @@ def test_rank_symptom_families_and_p2_deep_dive_trigger_policy() -> None:
         extra={"transfer_inflation_ratio": 2.4},
     )
     ranked_rt = rank_symptom_families(ctx_rt)
-    assert len(ranked_rt) == 12
+    assert len(ranked_rt) == 13
     assert ranked_rt[0][0] == SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP
     assert ranked_rt[0][1] > 0.7
 
@@ -346,7 +349,7 @@ def test_rank_symptom_families_and_p2_deep_dive_trigger_policy() -> None:
         telemetry={"dur_us": 20.0, "sync_stall_ratio": 0.45, "bank_conflict_ratio": 0.30},
     )
     ranked_obs = rank_symptom_families(obs_spill)
-    assert len(ranked_obs) == 12
+    assert len(ranked_obs) == 13
     assert ranked_obs[0][0] == SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP
 
     tied = [
@@ -402,7 +405,7 @@ def test_online_rulebook_frozen_by_default_and_opt_in_distilled_sync(tmp_path: P
     )
 
     frozen_tracker = BayesianRuleTracker.from_experience_lake(lake_dir)
-    assert len(frozen_tracker.rules) == 33
+    assert len(frozen_tracker.rules) == 35
     assert "R_UNREVIEWED_DISTILLED_01" not in frozen_tracker.rules
     assert frozen_tracker.posteriors["R01_DUAL_COPY_1C2V_SPLIT"].successes == 1
 
@@ -867,6 +870,14 @@ def fused_attn(q, k, v):
             (aligned_ratio,),
             blueprints={"coupled": coupled_bp},
         )
+        == "tilelang_dsl"
+    )
+    assert (
+        select_fallback_track_from_semantics(
+            coupled_sem,
+            (aligned_ratio,),
+            blueprints={"coupled": coupled_bp},
+        )
         == "hybrid_trackb"
     )
 
@@ -908,6 +919,14 @@ def row_sum(x):
     )
     assert (
         select_initial_track_from_semantics(
+            reduce_sem,
+            (unaligned_ratio,),
+            blueprints={"vector": reduce_bp},
+        )
+        == "tilelang_dsl"
+    )
+    assert (
+        select_fallback_track_from_semantics(
             reduce_sem,
             (unaligned_ratio,),
             blueprints={"vector": reduce_bp},

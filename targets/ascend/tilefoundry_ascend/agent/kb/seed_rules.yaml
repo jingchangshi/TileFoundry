@@ -1,13 +1,13 @@
 rules:
   - rule_id: R01_DUAL_COPY_1C2V_SPLIT
     symptom_family: COMPUTE_1C2V_SUBCORE_IMBALANCE
-    regime_guard: "AIV0.PIPE_V > 0 or cube_to_vector_ratio > 0.0"
-    precondition: "AIV0.PIPE_V > 0 and AIV1.PIPE_V == 0"
+    regime_guard: "(AIV0.PIPE_V > 0 or cube_to_vector_ratio > 0.0) and (l0_cube_cycles > 0 or l2_aic_mac_ratio > 0.01)"
+    precondition: "(l0_cube_cycles > 0 or l2_aic_mac_ratio > 0.01) and AIV0.PIPE_V > 0 and AIV1.PIPE_V == 0"
     anti_precondition: "any_overflow_bytes > 0 or (has_simtvf and cube_to_vector_ratio == 0.0)"
     transform_template: |
       Partition the dominant output-row tile extent evenly across the two paired vector sub-cores
-      (half_rows = row_tile // 2) via T.dual_copy on coupled AIC->AIV L0C->UB writeout or
-      T.MixedKernel(blocks, sids=2) on pure-vector kernels so AIV0 and AIV1 execute concurrently.
+      (half_rows = row_tile // 2) via T.dual_copy on coupled AIC->AIV L0C->UB writeout inside
+      T.MixedKernel(blocks, sids=2) so AIV0 and AIV1 execute concurrently.
     expected_postcondition: "AIV1.PIPE_V > 0 and AIV0.PIPE_V <= prev.AIV0.PIPE_V"
     source_provenance: "ref:tilelang"
     alpha_prior: 3.0
@@ -234,7 +234,7 @@ rules:
   - rule_id: R13_SPLIT_KV_WAVE_RECOVERY
     symptom_family: GRID_TAIL_WAVE_UNDERUTIL
     regime_guard: "is_legal and (PIPE_M > 0 or PIPE_V > 0 or PIPE_MTE2 > 0)"
-    precondition: "(not grid_is_symbolic) and 0.0 < wave_occupancy < 0.5"
+    precondition: "(not grid_is_symbolic) and 0.0 < l0_wave_occupancy < 0.75 and l0_grid_blocks > 0 and ((l0_cube_cycles > 0 and l0_grid_blocks < num_aic_cores) or (l0_cube_cycles == 0 and l0_grid_blocks < num_aiv_cores))"
     anti_precondition: "any_overflow_bytes > 0 or spill_bytes > 0"
     transform_template: |
       Split the outer reduction or key-value sequence dimension across multiple grid blocks and
@@ -664,3 +664,46 @@ rules:
       Keep loop-carried state resident in __ubuf__/__cbuf__ across chunks inside __aicore__
       (zero GM roundtrips) and accumulate in-place in __cc__ via asc_mmad(..., initC=false).
     rationale: "On-chip recurrent state residency with L0C initC=false accumulation eliminates per-chunk GM state traffic."
+
+  - rule_id: R34_SCALAR_LOOP_TO_VECTOR_DMA_PIPELINE
+    symptom_family: SCALAR_LOOP_TRAP
+    regime_guard: "is_legal"
+    precondition: "(l0_cube_cycles == 0 and l0_vec_cycles == 0) or (has_l1_compiler_summary and l1_vec_regs == 0 and l2_aiv_vec_ratio < 0.02 and l2_aic_mac_ratio == 0.0)"
+    anti_precondition: "False"
+    transform_template: |
+      Replace scalar per-element global-memory loops with contiguous GM->UB (and GM->L1->L0C
+      for matmul/attention) DMA block transfers followed by wide SIMD vector execution under
+      T.SimdVF / simd_inst::* (or T.gemm / asc_mmad for matrix tiles) so vector/cube pipes
+      stay saturated instead of stalling on PIPE_S scalar memory accesses.
+    expected_postcondition: "l0_vec_cycles > 0 or l0_cube_cycles > 0"
+    source_provenance: "ref:asc_devkit"
+    alpha_prior: 3.5
+    beta_prior: 1.0
+    priority: 1
+    compatible_backends: ["tilelang_dsl", "cce_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Eliminate direct scalar __gm__ loops in __simt_vf__/__aicore__; stage contiguous tiles
+      into __ubuf__ via 3-arg/8-arg asc_copy_gm2ub_align(), execute wide simd_inst::* vector
+      passes (plus asc_copy_gm2l1_nd2nz / asc_mmad / asc_copy_l0c2ub for matmul/attention),
+      and write back uniformly via asc_copy_ub2gm_align() without mixing PIPE_S GM stores.
+    rationale: "Direct GM scalar loops starve all DMA, Vector SIMD, and Cube MMAD hardware pipelines."
+
+  - rule_id: R35_PURE_VECTOR_DUAL_SUBCORE_SPLIT
+    symptom_family: COMPUTE_1C2V_SUBCORE_IMBALANCE
+    regime_guard: "l0_cube_cycles == 0 and AIV0.PIPE_V > 0"
+    precondition: "l0_cube_cycles == 0 and AIV0.PIPE_V > 0 and AIV1.PIPE_V == 0"
+    anti_precondition: "any_overflow_bytes > 0 or has_simtvf"
+    transform_template: |
+      Partition pure-vector tile rows across both paired AIV sub-cores via
+      T.MixedKernel(blocks, sids=2) as (bx, sid) (or half_rows = row_tile // 2 per sub-core)
+      so AIV0 and AIV1 execute vector DMA and SIMD compute concurrently.
+    expected_postcondition: "AIV1.PIPE_V > 0 and AIV0.PIPE_V <= prev.AIV0.PIPE_V"
+    source_provenance: "ref:tilelang"
+    alpha_prior: 3.0
+    beta_prior: 1.0
+    priority: 10
+    compatible_backends: ["tilelang_dsl", "cce_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Split pure-vector tile work across paired AIV sub-cores using get_subblockid() == 0 vs 1
+      and half_rows = row_tile / 2 in __vector__ kernels so both AIV0 and AIV1 run concurrently.
+    rationale: "Pure-vector kernels using only AIV0 leave the paired AIV1 sub-core idle and halve effective vector and DMA throughput."

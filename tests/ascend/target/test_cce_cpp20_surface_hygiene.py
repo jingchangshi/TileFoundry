@@ -49,12 +49,19 @@ FORBIDDEN_CCE_TOKENS = (
     "__shfl_sync",
     "__shfl_xor_sync",
     "__ballot_sync",
+    "__shared__",
+    "__syncthreads",
+    "threadIdx",
+    "blockIdx",
+    "blockDim",
+    "gridDim",
+    "get_subblocknum",
 )
 
 CLEAN_TRACKB_SOURCE = (
     "#include <tl_templates/ascend/common.h>\n"
     'extern "C" __global__ void kernel_active() {\n'
-    "    asc_copy_gm2ub_align(ub, gm, 1, 128);\n"
+    "    asc_copy_gm2ub_align(ub, gm, 128);\n"
     "}\n"
 )
 
@@ -83,6 +90,9 @@ def test_cce_cpp20_surface_freezes_label_headers_and_two_sided_blacklist() -> No
     assert CCE_CPP20_SURFACE.required_headers_or_imports == (
         "#include <tl_templates/ascend/common.h>",
         "#include <tl_templates/ascend/gemm.h>",
+        "#include <tl_templates/ascend/nd2nz_copy.h>",
+        "#include <tl_templates/ascend/dcache_bypass.h>",
+        "#include <tl_templates/ascend/reduce.h>",
         "#include <tl_templates/ascend/simd_inst.h>",
     )
     assert CCE_CPP20_SURFACE.forbidden_tokens == FORBIDDEN_CCE_TOKENS
@@ -168,17 +178,28 @@ def test_tilelang_surface_registers_simd_register_primitives_and_parallel_math_b
     """Expose every verified T.simd intrinsic and steer scalar math out of plain T.Parallel."""
     entries = {entry.symbol: entry for entry in TILELANG_DSL_SURFACE.primitives}
     expected_signatures = {
+        "T.dynamic": 'T.dynamic(name, dtype="int32")',
+        "T.reduce_absmax": "T.reduce_absmax(src, dst, dim=...)",
         "T.simd.pset": 'T.simd.pset(width, "PAT_ALL")',
         "T.simd.update_mask": "T.simd.update_mask(count, width=32)",
         "T.simd.vdup": "T.simd.vdup(value, dtype, mask=mask)",
         "T.simd.vld": 'T.simd.vld(buf[offset], dist="NORM_B32")',
         "T.simd.vcvt": "T.simd.vcvt(vec, dtype, mask=mask, part=0)",
         "T.simd.vexp": "T.simd.vexp(vec, mask=mask)",
+        "T.simd.vln": "T.simd.vln(vec, mask=mask)",
+        "T.simd.vsqrt": "T.simd.vsqrt(vec, mask=mask)",
+        "T.simd.vabs": "T.simd.vabs(vec, mask=mask)",
         "T.simd.vadd": "T.simd.vadd(lhs, rhs, mask=mask)",
+        "T.simd.vadds": "T.simd.vadds(vec, scalar, mask=mask)",
         "T.simd.vsub": "T.simd.vsub(lhs, rhs, mask=mask)",
         "T.simd.vmul": "T.simd.vmul(lhs, rhs, mask=mask)",
         "T.simd.vmuls": "T.simd.vmuls(vec, scalar, mask=mask)",
         "T.simd.vdiv": "T.simd.vdiv(lhs, rhs, mask=mask)",
+        "T.simd.vmax": "T.simd.vmax(lhs, rhs, mask=mask)",
+        "T.simd.vmin": "T.simd.vmin(lhs, rhs, mask=mask)",
+        "T.simd.vmaxs": "T.simd.vmaxs(vec, scalar, mask=mask)",
+        "T.simd.vcadd": "T.simd.vcadd(vec, mask=mask)",
+        "T.simd.vcmax": "T.simd.vcmax(vec, mask=mask)",
         "T.simd.vsts": 'T.simd.vsts(buf[offset], vec, mask=mask, dist="PK_B32", extent=64)',
         "T.annotate_buffer_versions": "T.annotate_buffer_versions({buf: stages})",
         "T.annotate_unlimit_memory": 'T.annotate_unlimit_memory("shared")',
@@ -186,9 +207,20 @@ def test_tilelang_surface_registers_simd_register_primitives_and_parallel_math_b
     for symbol, signature in expected_signatures.items():
         assert symbol in entries, symbol
         assert entries[symbol].signature == signature
-        assert entries[symbol].pipe == "PIPE_V" or symbol.startswith("T.annotate")
+        assert (
+            entries[symbol].pipe == "PIPE_V"
+            or symbol.startswith("T.annotate")
+            or symbol == "T.dynamic"
+        )
     symbols = [entry.symbol for entry in TILELANG_DSL_SURFACE.primitives]
     assert len(symbols) == len(set(symbols))
+    assert "threads=" not in TILELANG_DSL_SURFACE.forbidden_tokens
+    assert all(
+        count == 0
+        for count in TILELANG_DSL_SURFACE.count_forbidden_tokens(
+            "with T.SimtVF(threads=128):\n    pass\n"
+        ).values()
+    )
 
     rendered = TILELANG_DSL_SURFACE.render_prompt_reference()
     ban = (
@@ -197,6 +229,8 @@ def test_tilelang_surface_registers_simd_register_primitives_and_parallel_math_b
     )
     assert ban in rendered
     assert "T.simd.vexp(vec, mask=mask)" in rendered
+    assert "T.simd.vsqrt(vec, mask=mask)" in rendered
+    assert "T.simd.vrsqrt does not exist" in rendered
     assert "T.simd.vcvt(vec, dtype, mask=mask, part=0)" in rendered
     assert 'vcvt("float32")' in rendered
     assert "US_B16" in rendered and "PK_B32" in rendered
@@ -360,14 +394,14 @@ def test_trackb_scoped_patch_rejects_duplicate_growth_of_preserved_token() -> No
 def test_trackb_scoped_patch_rejects_newly_introduced_forbidden_symbols() -> None:
     """Reject patches that newly write high-level AscendC or legacy 910B intrinsics."""
     high_level = _patch(
-        "    asc_copy_gm2ub_align(ub, gm, 1, 128);",
+        "    asc_copy_gm2ub_align(ub, gm, 128);",
         "    AscendC::DataCopyPad(ub, gm, 128);",
     )
     with pytest.raises(ValueError, match="introduces forbidden symbols: AscendC::"):
         apply_scoped_trackb_patch(CLEAN_TRACKB_SOURCE, high_level, active_kernel="kernel_active")
 
     legacy = _patch(
-        "    asc_copy_gm2ub_align(ub, gm, 1, 128);",
+        "    asc_copy_gm2ub_align(ub, gm, 128);",
         "    copy_gm_to_ubuf(ub, gm, 1, 128);",
     )
     with pytest.raises(ValueError, match="copy_gm_to_ubuf"):
@@ -377,14 +411,14 @@ def test_trackb_scoped_patch_rejects_newly_introduced_forbidden_symbols() -> Non
 def test_trackb_scoped_patch_allows_preserved_or_clean_replacements() -> None:
     """Allow clean edits and faithful rewrites that keep pre-existing legacy symbols."""
     clean = _patch(
-        "    asc_copy_gm2ub_align(ub, gm, 1, 128);",
-        "    asc_copy_gm2ub_align(ub, gm, 2, 256);",
+        "    asc_copy_gm2ub_align(ub, gm, 128);",
+        "    asc_copy_gm2ub_align(ub, gm, 256);",
     )
     updated, applied = apply_scoped_trackb_patch(
         CLEAN_TRACKB_SOURCE, clean, active_kernel="kernel_active"
     )
     assert applied == 1
-    assert "asc_copy_gm2ub_align(ub, gm, 2, 256);" in updated
+    assert "asc_copy_gm2ub_align(ub, gm, 256);" in updated
 
     legacy_source = (
         'extern "C" __global__ void kernel_active() {\n'

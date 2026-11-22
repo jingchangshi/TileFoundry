@@ -342,3 +342,34 @@ def test_per_regime_snapshots_upgrade_legacy_load_and_beam_roundtrip(tmp_path: P
     restored_legacy = BeamCandidate.from_dict(legacy_payload)
     assert restored_legacy.case_latencies_us == {}
     assert restored_legacy.policy == {}
+
+
+def test_case_observation_record_roofline_fields_and_legacy_compat() -> None:
+    """Persist roofline bounds on CaseObservationRecord and default legacy dicts to 0.0."""
+    rec = CaseObservationRecord(
+        run_id="r_roof",
+        operator="op/a",
+        regime_tag="small",
+        cand_sha="abc123",
+        eval_tier="l2_pass",
+        case_num=1,
+        measured_us=25.0,
+        accuracy_passed=True,
+        min_gm_bytes=65536.0,
+        compute_floor_us=10.5,
+        transfer_inflation_ratio=1.35,
+    )
+    payload = rec.to_dict()
+    restored = CaseObservationRecord.from_dict(payload)
+    assert restored.min_gm_bytes == pytest.approx(65536.0)
+    assert restored.compute_floor_us == pytest.approx(10.5)
+    assert restored.transfer_inflation_ratio == pytest.approx(1.35)
+
+    legacy_payload = dict(payload)
+    legacy_payload.pop("min_gm_bytes")
+    legacy_payload.pop("compute_floor_us")
+    legacy_payload.pop("transfer_inflation_ratio")
+    restored_legacy = CaseObservationRecord.from_dict(legacy_payload)
+    assert restored_legacy.min_gm_bytes == 0.0
+    assert restored_legacy.compute_floor_us == 0.0
+    assert restored_legacy.transfer_inflation_ratio == 0.0

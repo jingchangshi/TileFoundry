@@ -140,10 +140,12 @@ _INDIRECT_CALL_NAMES = frozenset(
         "topk",
     }
 )
-_QUANT_CALL_TOKENS = (
-    "quant",
+_SUBBYTE_OR_QUANT_CALL_TOKENS = (
     "dequant",
+    "antiquant",
     "int4",
+    "uint4",
+    "quint4x2",
     "q4",
     "w4",
     "awq",
@@ -151,15 +153,35 @@ _QUANT_CALL_TOKENS = (
     "nf4",
     "fp4",
     "mxfp",
+    "block_quant",
 )
-_LOW_PRECISION_DTYPE_ATTRS = frozenset(
+_SUBBYTE_OR_QUANT_IDENT_TOKENS = (
+    "dequant",
+    "antiquant",
+    "qweight",
+    "mxscale",
+    "block_size",
+    "blocksize",
+    "group_size",
+    "groupsize",
+    "weight_scale",
+    "activation_scale",
+    "int4",
+    "uint4",
+    "quint4x2",
+    "fp4",
+    "mxfp",
+    "q4_",
+    "awq",
+    "gptq",
+    "nf4",
+)
+_SUBBYTE_OR_QUANT_DTYPE_ATTRS = frozenset(
     {
         "int4",
         "uint4",
         "quint4x2",
         "qint8",
-        "int8",
-        "uint8",
         "float4_e2m1",
         "float4_e1m2",
         "float8_e4m3fn",
@@ -167,6 +189,20 @@ _LOW_PRECISION_DTYPE_ATTRS = frozenset(
         "float8_e8m0fnu",
         "float8_e4m3fnuz",
         "float8_e5m2fnuz",
+    }
+)
+_STANDARD_8BIT_DTYPE_ATTRS = frozenset({"int8", "uint8"})
+_BLOCK_SCALE_IDENT_NAMES = frozenset(
+    {
+        "scales",
+        "scale_inv",
+        "zero_point",
+        "zeros",
+        "qzeros",
+        "block_size",
+        "blocksize",
+        "group_size",
+        "groupsize",
     }
 )
 _DIM_KEYWORDS = frozenset({"dim", "axis"})
@@ -1062,12 +1098,24 @@ def _has_quant_evidence(
 ) -> bool:
     for call_name in call_names:
         lowered = call_name.lower()
-        if any(marker in lowered for marker in _QUANT_CALL_TOKENS):
+        if any(marker in lowered for marker in _SUBBYTE_OR_QUANT_CALL_TOKENS):
             return True
+    has_8bit_dtype = False
+    has_block_scale_ident = False
     for node in nodes:
-        if isinstance(node, ast.Attribute) and node.attr in _LOW_PRECISION_DTYPE_ATTRS:
-            return True
-    return False
+        if isinstance(node, ast.Attribute):
+            if node.attr in _SUBBYTE_OR_QUANT_DTYPE_ATTRS:
+                return True
+            if node.attr in _STANDARD_8BIT_DTYPE_ATTRS:
+                has_8bit_dtype = True
+        elif isinstance(node, (ast.Name, ast.arg)):
+            ident = node.id if isinstance(node, ast.Name) else node.arg
+            lowered_ident = ident.lower()
+            if any(marker in lowered_ident for marker in _SUBBYTE_OR_QUANT_IDENT_TOKENS):
+                return True
+            if lowered_ident in _BLOCK_SCALE_IDENT_NAMES:
+                has_block_scale_ident = True
+    return has_8bit_dtype and has_block_scale_ident
 
 
 def _positive_dim(dims: Mapping[str, int], names: Sequence[str]) -> int | None:

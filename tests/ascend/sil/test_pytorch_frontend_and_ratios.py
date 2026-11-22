@@ -69,7 +69,7 @@ _EXPECTED_SEMANTICS: dict[
     "rms_norm": (False, True, (), False, False, False, False, False, True),
     "softmax": (False, True, (), True, False, False, False, False, True),
     "apply_rotary_pos_emb": (False, False, (), False, False, False, False, True, False),
-    "add_rms_norm_dynamic_quant": (False, True, (-1,), False, False, True, False, True, True),
+    "add_rms_norm_dynamic_quant": (False, True, (-1,), False, False, False, False, True, True),
     "mhc_sinkhorn": (False, True, (-2, -1), True, False, False, True, True, True),
     "grouped_matmul": (True, False, (), False, False, False, True, False, False),
     "q4_0_dequant_matmul": (True, False, (), False, False, True, False, False, False),
@@ -1538,3 +1538,34 @@ def test_semantics_object_validates_entry_and_axes() -> None:
         _semantics(entry_name="  ")
     with pytest.raises(ValueError, match="must contain only ints"):
         _semantics(reduction_axes=(True,))
+
+
+def test_subbyte_or_block_quant_distinguishes_8bit_elementwise_from_dequant(
+    analyzer: PyTorchSemanticAnalyzer,
+) -> None:
+    """Standard int8/uint8 output stays False while dequant and sub-byte ops set True."""
+    elem_int8_src = dedent(
+        """
+        import torch
+
+        def per_token_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            scale = x.abs().amax(dim=-1, keepdim=True) / 127.0
+            y = torch.clamp((x / scale).round(), -128, 127).to(torch.int8)
+            return y, scale.squeeze(-1)
+        """
+    )
+    elem_sem = analyzer.analyze_source(elem_int8_src, entry_name="per_token_int8")
+    assert elem_sem.has_subbyte_or_block_quant is False
+
+    for lvl, op_name in (
+        ("level3", "q4_0_dequant_matmul"),
+        ("level3", "dequant_swiglu_quant"),
+        ("level3", "weight_quant_batch_matmul"),
+    ):
+        op_dir = DEFAULT_OPS_ROOT / lvl / op_name
+        if not op_dir.is_dir():
+            continue
+        source = (op_dir / "golden.py").read_text(encoding="utf-8")
+        proto = _yaml_mapping(op_dir / "proto.yaml")
+        sem = analyzer.analyze_source(source, entry_name=op_name, proto=proto)
+        assert sem.has_subbyte_or_block_quant is True, op_name

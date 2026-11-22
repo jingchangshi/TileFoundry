@@ -564,7 +564,7 @@ def test_campaign_runner_logs_all_tiers_and_keeps_prescreen_off(tmp_path: Path) 
         - Promoted candidate has merged Stage-B sfu_f16_ops in candidate artifact
         - Experience lake has pairwise delta for same-case fast vs baseline
     """
-    assert MarathonConfig("level2/softmax").enable_tilesize_prescreen is False
+    assert MarathonConfig("level2/softmax").enable_tilesize_prescreen is True
     assert MarathonConfig("level2/softmax").cost_prescreen_top_k is None
     assert CampaignConfig(operator_name="level2/softmax").enable_tilesize_prescreen is False
     assert CampaignConfig(operator_name="level2/softmax").cost_prescreen_top_k is None

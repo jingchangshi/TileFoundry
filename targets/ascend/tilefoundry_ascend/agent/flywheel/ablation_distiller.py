@@ -16,7 +16,6 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.kb.schema import (
     AscendCausalRule,
-    build_predicate_context,
     save_rules_yaml,
     validate_rule_predicate,
 )
@@ -2776,11 +2775,6 @@ class FlywheelDistiller:
                 continue
 
             self._tracker.admit_rule(rule)
-            ctx = build_predicate_context(
-                meas.stage_a_result.ledger,
-                features=meas.stage_a_result.features,
-            ) if meas.stage_a_result and meas.stage_a_result.ledger else {}
-            _ = ctx
             self._tracker.record_outcome(
                 rule.rule_id,
                 postcondition_realized=True,

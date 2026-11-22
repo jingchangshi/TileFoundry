@@ -357,6 +357,7 @@ class ComputeIssueAxis:
     l2_aiv_vec_ratio: float = 0.0
     l2_roofline_eta: float = 0.0
     effective_compute_eta: float = 0.0
+    l0_aiv_subcore_imbalance: bool = False
 
 
 @dataclass(frozen=True)
@@ -494,9 +495,9 @@ class ObservationVector5D:
         cube_cycles = _as_int(ledger.pipe_cycles.get("AIC.PIPE_M")) + _as_int(
             ledger.pipe_cycles.get("AIC.CUBE")
         )
-        vec_cycles = _as_int(ledger.pipe_cycles.get("AIV0.PIPE_V")) + _as_int(
-            ledger.pipe_cycles.get("AIV1.PIPE_V")
-        )
+        aiv0_v = _as_int(ledger.pipe_cycles.get("AIV0.PIPE_V"))
+        aiv1_v = _as_int(ledger.pipe_cycles.get("AIV1.PIPE_V"))
+        vec_cycles = aiv0_v + aiv1_v
         ub_waterline = ledger.waterlines.get("UB")
         l1_waterline = ledger.waterlines.get("L1")
         degraded_count = sum(
@@ -556,6 +557,7 @@ class ObservationVector5D:
                 l2_aiv_vec_ratio=_telemetry_float(tel, "aiv_vec_ratio", "aiv_vec"),
                 l2_roofline_eta=_telemetry_float(tel, "roofline_eta"),
                 effective_compute_eta=effective_compute_eta,
+                l0_aiv_subcore_imbalance=(aiv0_v > 0 and aiv1_v == 0),
             ),
             offchip_dma=OffChipMemoryDmaAxis(
                 l0_gm_roundtrip_bytes=ledger.gm_roundtrip_bytes,
@@ -638,9 +640,19 @@ class ObservationVector5D:
             if compute_utilization >= 0.5 and 0.0 < eff_eta < 0.5
             else 0.0
         )
+        scalar_trap = (
+            self.compute_issue.l0_cube_cycles == 0
+            and self.compute_issue.l0_vec_cycles == 0
+        ) or (
+            self.has_l1_compiler_summary
+            and self.onchip_sram_reg.l1_vec_regs == 0
+            and self.compute_issue.l2_aiv_vec_ratio < 0.02
+            and self.compute_issue.l2_aic_mac_ratio == 0.0
+        )
         compute_gap = min(
             1.0,
             max(
+                1.0 if scalar_trap else 0.0,
                 sw_loop_penalty,
                 self.compute_issue.l1_dual_issue_collapse,
                 0.25 * min(4, self.compute_issue.l1_vf_fusion_breaks),
@@ -738,6 +750,9 @@ class ObservationVector5D:
                 l2_aiv_vec_ratio=_as_float(compute_payload.get("l2_aiv_vec_ratio")),
                 l2_roofline_eta=_as_float(compute_payload.get("l2_roofline_eta")),
                 effective_compute_eta=_as_float(raw_eff_eta),
+                l0_aiv_subcore_imbalance=_as_bool(
+                    compute_payload.get("l0_aiv_subcore_imbalance")
+                ),
             ),
             offchip_dma=OffChipMemoryDmaAxis(
                 l0_gm_roundtrip_bytes=_as_int(dma_payload.get("l0_gm_roundtrip_bytes")),

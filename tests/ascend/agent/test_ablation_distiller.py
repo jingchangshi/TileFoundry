@@ -281,7 +281,7 @@ def test_unverifiable_stmt_rewrite_rejected_fail_closed(tmp_path: Path) -> None:
         '        A: T.Tensor((2, 128), "float32"),\n'
         '        B: T.Tensor((2, 128), "float32"),\n'
         "    ):\n"
-        "        with T.Kernel(2, threads=128) as bx:\n"
+        "        with T.Kernel(2) as bx:\n"
         '            buf = T.alloc_shared((128,), "float32")\n'
         "            T.copy(A[bx, 0:128], buf)\n"
         "            for i in T.serial(128):\n"
@@ -362,7 +362,7 @@ def test_hardware_gate_enforces_108x_and_wait_ratio_non_regression(tmp_path: Pat
         '        A: T.Tensor((2, 128), "float16"),\n'
         '        B: T.Tensor((2, 128), "float16"),\n'
         "    ):\n"
-        "        with T.Kernel(2, threads=128) as bx:\n"
+        "        with T.Kernel(2) as bx:\n"
         '            buf = T.alloc_shared((16, 70), "float16")\n'
         "            T.copy(A[bx, 0:70], buf[0, 0:70])\n"
         "            T.copy(buf[0, 0:70], B[bx, 0:70])\n"

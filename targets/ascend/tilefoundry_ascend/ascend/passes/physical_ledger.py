@@ -10,6 +10,7 @@ from typing import Literal
 from tilefoundry_ascend.ascend.passes.observation_space import (
     CompilerSummaryLike,
     ObservationVector5D,
+    RooflineSummaryLike,
 )
 
 
@@ -133,12 +134,14 @@ class ObjectivePhysicalLedger:
         *,
         compiler_summary: CompilerSummaryLike | None = None,
         telemetry: Mapping[str, object] | None = None,
+        roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
     ) -> ObservationVector5D:
-        """Project this L0 ledger plus L1/L2 telemetry onto the 5-axis observation space."""
+        """Project this L0 ledger plus L1/L2 telemetry and Roofline onto the 5-axis space."""
         return ObservationVector5D.from_tiers(
             self,
             compiler_summary=compiler_summary,
             telemetry=telemetry,
+            roofline=roofline,
         )
 
     def to_dict(self) -> dict[str, object]:
