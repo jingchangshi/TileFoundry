@@ -1,69 +1,12 @@
-flowchart TB
-    classDef prep fill:#EEF4FA,stroke:#1E3A8A,stroke-width:1.5px,color:#0F172A
-    classDef diag fill:#FEF7EB,stroke:#92400E,stroke-width:2px,color:#3B1D00
-    classDef synth fill:#ECFDF5,stroke:#065F46,stroke-width:1.5px,color:#062E22
-    classDef gate fill:#F5F3FF,stroke:#4C1D95,stroke-width:1.5px,color:#240E52
-    classDef drop fill:#FEF2F2,stroke:#991B1B,stroke-width:1.5px,color:#450A0A
+flowchart LR
+  S1["Stage 1: Operator Contract & Unified Session<br/>HIR/TIR Binding + Real-Anchor Specialization + Two-Snapshot Diff"]
+  S2["Stage 2: Regime Partition & Z3 Pipeline<br/>Physics Sub-Atom Classification + CoW Namespacing + Tail Guard"]
+  S3["Stage 3: Compiler Sink-Down & Cost Screening<br/>CompilerBehaviorRegistry + Tier-0/1/2 Hybrid Model"]
+  S4["Stage 4: Dual-Track Routing & Constraint Synthesis<br/>CapabilityGate + Layer 1/2/3 G1..G5 + Bounded explore_creative"]
+  S5["Stage 5: Pre-NPU Contract & Replay Gates (L0-L3)<br/>Static Key Audit + SILVerifier + Two-Pass Cache Idempotence"]
+  S6["Stage 6: Real-NPU Execution & Flywheel Convergence (L4)<br/>AgentGates Signed CANNBench + Anomaly Guard + FlywheelDistiller"]
 
-    subgraph S1["Stage 1: Operator Discovery, Physical Blueprinting & Baseline Anchoring"]
-        S1_DISCOVER["Operator Registry & Auto-Stratified Anchors\nCannbenchOpsRegistry parses proto/cases & 950PR metadata;\nMarathon auto-bootstraps seed kernels & salvages unpromoted beam winners"]:::prep
-        S1_BLUEPRINT["SIL Advisory & Optional Dialect-Neutral HIR Blueprint\nOpAdvisoryExtractor derives TopologyAxes, domain envelope & default policy;\ncompile_hir_blueprint emits Roofline, Z3 floor & reference ledger (zero virtual TIR)"]:::prep
-        S1_BASE["ExperienceLake Replay & NPU Baseline Anchoring\nReplay prior observations into 3-tier HybridAscendCostModel;\nmeasure baseline Eq.3 score, per-anchor latency & bottleneck MSProf via agent-gates"]:::prep
-        S1_DISCOVER -->|"Stratified anchors & seed module"| S1_BLUEPRINT
-        S1_BLUEPRINT -->|"SIL advisory & Roofline blueprint"| S1_BASE
-    end
-
-    subgraph S2["Stage 2: Stagnation-Discounted Regime Selection & Escalation Diagnostics"]
-        S2_PICK["Regime Rotation & Parent Selection\nScore headroom / (1 + 0.45 * stagnation) across unfrozen regimes;\nswitch parent to per-regime Stepping-Stone branch upon stagnation"]:::diag
-        S2_DIAG["Fixed-Point SIL Re-Solve, Cost Prediction & Tier Escalation\nRegimePiecewiseSolver bidirectional live-buffer re-solve + HybridCostModel;\nevaluate_track_escalation (DSL->InlineVF->AscendC) + ISAGapScanner 7-facet unlock"]:::diag
-        S2_PICK -->|"Active regime, parent slice & beam state"| S2_DIAG
-    end
-
-    subgraph S3["Stage 3: 3-Layer Progressive Constraint Synthesis & Stateless Generation"]
-        S3_RULE["Rule-Guided Exploitation Workers (K Parallel)\n3-axis Bayesian rule ranking + 3-layer progressive LLM constraints\n(L1 Redlines/Facets + L2 Grounded Dialect API + L3 Blueprint/Residual Delta)"]:::synth
-        S3_FREE["Rule-Blind Creative Exploration Workers (1 + Deficit)\nInject rule-blind negative structural exclusions & TileSizePrescreen hints;\nstateless generation through a pluggable LLM or agent backend with liveness monitoring"]:::synth
-        S3_SPLICE["Isolated AST Regime Splicing & Shell Materialization\npatch_regime_into_module isolates sibling regimes & prunes dead helpers;\nTrack-B materializes 7-facet coordination shells or strips locks at Top"]:::synth
-        S3_RULE -->|"Exploit patch"| S3_SPLICE
-        S3_FREE -->|"Explore patch"| S3_SPLICE
-    end
-
-    subgraph S4["Stage 4: 5-Tier Progressive Verification Pyramid (L0 -> L3)"]
-        S4_L0["L0 Static Ledger & 7-Facet Redline Precheck (Stage A)\nTileLang Two-Snapshot lowering diff -> ObjectivePhysicalLedger;\nAscendC SILVerifier 14 redlines + C++ CFG CrossCore flag balance"]:::gate
-        S4_PRE["Optional Cost-Model Prescreen (L0 -> L1)\nRank Stage-A passers by HybridAscendCostModel pred_us;\nretain Top-K candidates before offline compilation"]:::gate
-        S4_L1["L1 Offline Compiler Build & Behavior Audit (Stage B)\nConcurrent device compile with bounded syntax repair;\nextract 7-class compiler behavior penalties (spill, vloopv2, vf_break, alias, dcci)"]:::gate
-        S4_DROP["Fast Pre-Hardware Candidate Rejection\nUpdate Bayesian failure posteriors;\nexempt llm_transport timeouts & cost_prescreen drops from penalty"]:::drop
-        S4_L2["L2 Prewarmed Batched Anchor NPU Evaluation (Stage C)\nPrewarm reference & TileLang caches; single batched agent-gates run;\nenforce >=0.97x tail guard + gain threshold & collect bottleneck MSProf"]:::gate
-        S4_L3["L3 Full 20-Case Contract & Atomic Rollback Gate\nRun full contract + dynamic-shape cache-reuse suite;\natomically promote winner & checkpoint, or roll back to prior incumbent"]:::gate
-
-        S4_L0 -->|"Static legal"| S4_PRE
-        S4_L0 -->|"Redline / overflow"| S4_DROP
-        S4_PRE -->|"Top-K"| S4_L1
-        S4_PRE -->|"Filtered (exempt)"| S4_DROP
-        S4_L1 -->|"Compiled + summary"| S4_L2
-        S4_L1 -->|"Compile failed"| S4_DROP
-        S4_L2 -->|"Passes tail & gain"| S4_L3
-    end
-
-    subgraph S5["Stage 5: Per-Regime Beam Update, Online Calibration & Flywheel Distillation"]
-        S5_BEAM["Per-Regime Beam, ExperienceLake & KB Maintenance\nUpdate regime TwoLaneBeamSearch & prune stale sibling stepping stones;\nappend SHA artifacts + observations to ExperienceLake; run decay_and_revive"]:::synth
-        S5_FLY["Counterfactual / LOO Ablation & Micro-Probe Flywheel\nDecompose atomic AST/knob deltas; admit generalizable static rules to KB\nafter NPU micro-probe (>=1.08x speedup & non-regressing MTE2 wait)"]:::synth
-    end
-
-    subgraph S6["Stage 6: L4 Official Full-Suite Evaluation & Dynamic Tail Catch-Up"]
-        S6_L4["L4 Official CANNBench Full-Suite Benchmark\nEvaluate all suite cases to detect non-anchor tail regressions"]:::gate
-        S6_DONE["Deliver Verified Multi-Regime Kernel Module, Calibrated Lake & Distilled KB"]:::prep
-        S6_L4 -->|"All cases meet contract"| S6_DONE
-    end
-
-    S1_BASE -->|"Baseline score, anchors & calibrated model"| S2_PICK
-    S2_DIAG -->|"Ranked rules & 3-layer constraints"| S3_RULE
-    S2_DIAG -->|"Negative exclusions & tier/facet locks"| S3_FREE
-    S3_SPLICE -->|"Candidate module"| S4_L0
-    S4_L3 -->|"Promote or atomic rollback"| S5_BEAM
-    S4_L2 -->|"Eq.3-HAP, signature & MSProf/compiler residual"| S5_BEAM
-    S5_BEAM -->|"Target reached or budget exhausted"| S6_L4
-    S5_BEAM -->|"Significant gain (>=min_flywheel_gain)"| S5_FLY
-
-    S5_BEAM -.->|"Next regime optimization round"| S2_PICK
-    S6_L4 -.->|"Promote regressed tail cases via append_dynamic_anchor"| S2_PICK
-    S5_FLY -.->|"Admit verified causal rule into KB"| S3_RULE
+  S1 --> S2 --> S3 --> S4 --> S5 --> S6
+  S6 -. "Residual Outlier Guard & ExperienceLake Update" .-> S3
+  S6 -. "Causal Posterior & Anti-Precondition Crystallization" .-> S4
+  S6 -. "Sink-Down Detector Promotion" .-> S1

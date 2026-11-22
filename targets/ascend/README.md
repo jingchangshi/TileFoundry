@@ -17,7 +17,12 @@ python -m pip install -e . -e targets/ascend
 - `tilefoundry_ascend.ascend.cost_model` & `templates`: 3-tier `HybridAscendCostModel` (Tier-0 Roofline + 6-Pipe/AVE evaluator, Tier-1 compiler behavior penalties across 7 detectors, Tier-2 Ridge residual + MSProf pipe scales + pairwise Delta), `ExperienceLake` online calibration, and 7 dual-track (`tilelang_dsl` + `ascendc_template`) coordination shells.
 - `tilefoundry_ascend.agent`: 8D `CapabilityGate` router (`Router=ON/OFF` ablatable) with `ISAGapScanner`, 33 cross-operator causal rules with 3-axis factorized Bayesian tracking, unified 3-layer progressive LLM constraint synthesizer (`llm_constraints.py`), counterfactual `FlywheelDistiller`, and unattended `tilefoundry-ascend-campaign` / `tilefoundry-ascend-marathon` 5-tier (`L0-L4`) verification runners.
 
-## Architecture Diagrams
+## Architecture Diagrams & Companion Specs
 
-- [Ascend 4-Plane System Architecture](../../docs/reports/tilefoundry_ascend_architecture.mmd)
+- [Ascend End-to-End Architecture SVG](../../docs/reports/tilefoundry_ascend_e2e_architecture.svg)
+- [Ascend 5-Plane System Architecture](../../docs/reports/tilefoundry_ascend_architecture.mmd)
 - [Ascend 6-Stage End-to-End Flow](../../docs/reports/tilefoundry_ascend_e2e_flow.mmd)
+- [Architecture Overview](../../docs/ascend/00_architecture_overview.md)
+- [MECE Contracts and Routing](../../docs/ascend/01_mece_contracts_and_routing.md)
+- [Residual Convergence and Gates](../../docs/ascend/02_residual_convergence_and_gates.md)
+- [Project Governance & Engineering Rules](../../AGENTS.md)

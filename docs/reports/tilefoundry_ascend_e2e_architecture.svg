@@ -1,0 +1,190 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1120" width="1600" height="1120" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow-solid" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#334155"/>
+    </marker>
+    <marker id="arrow-feedback" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#7C3AED"/>
+    </marker>
+    <marker id="arrow-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#0F766E"/>
+    </marker>
+  </defs>
+
+  <!-- Solid Light Background -->
+  <rect x="0" y="0" width="1600" height="1120" fill="#F8FAFC"/>
+
+  <!-- Header -->
+  <text x="800" y="44" text-anchor="middle" font-size="24" font-weight="700" fill="#0F172A">TileFoundry Ascend End-to-End Architecture</text>
+  <text x="800" y="70" text-anchor="middle" font-size="14" font-weight="500" fill="#475569">Five Orthogonal Architectural Planes, Mechanism Sink-Down, &amp; Signed Hardware Verification</text>
+
+  <!-- PLANE 1 -->
+  <rect x="40" y="96" width="1410" height="164" rx="12" fill="#EFF6FF" stroke="#3B82F6" stroke-width="2"/>
+  <text x="64" y="124" font-size="15" font-weight="700" fill="#1D4ED8">PLANE 1 — SYMBOLIC CONTRACT &amp; COMPILATION PLANE</text>
+
+  <rect x="64" y="142" width="236" height="96" rx="8" fill="#FFFFFF" stroke="#93C5FD" stroke-width="1.5"/>
+  <text x="182" y="176" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Operator Contract</text>
+  <text x="182" y="200" text-anchor="middle" font-size="12" fill="#475569">Semantic spec &amp; anchor shapes</text>
+
+  <rect x="336" y="142" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#93C5FD" stroke-width="1.5"/>
+  <text x="460" y="176" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Unified Compile Session</text>
+  <text x="460" y="200" text-anchor="middle" font-size="12" fill="#475569">Contiguous target scope thru lowering</text>
+
+  <rect x="620" y="142" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#93C5FD" stroke-width="1.5"/>
+  <text x="744" y="176" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Real-Anchor Specialization</text>
+  <text x="744" y="200" text-anchor="middle" font-size="12" fill="#475569">Pre-lowering symbolic simplification</text>
+
+  <rect x="904" y="142" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#93C5FD" stroke-width="1.5"/>
+  <text x="1028" y="176" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Two-Snapshot Lowering Diff</text>
+  <text x="1028" y="200" text-anchor="middle" font-size="12" fill="#475569">Pre/post memory &amp; buffer envelope</text>
+
+  <rect x="1188" y="142" width="238" height="96" rx="8" fill="#FFFFFF" stroke="#93C5FD" stroke-width="1.5"/>
+  <text x="1307" y="176" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Formal Legality &amp; Pipeline</text>
+  <text x="1307" y="200" text-anchor="middle" font-size="12" fill="#475569">Hardware redlines &amp; modulo solver</text>
+
+  <path d="M 300 190 L 334 190" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 584 190 L 618 190" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 868 190 L 902 190" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 1152 190 L 1186 190" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+
+  <!-- PLANE 2 -->
+  <rect x="40" y="294" width="1410" height="164" rx="12" fill="#F0FDF4" stroke="#22C55E" stroke-width="2"/>
+  <text x="64" y="322" font-size="15" font-weight="700" fill="#15803D">PLANE 2 — MULTI-SHAPE REGIME DISPATCH &amp; ISOLATION PLANE</text>
+
+  <rect x="64" y="340" width="236" height="96" rx="8" fill="#FFFFFF" stroke="#86EFAC" stroke-width="1.5"/>
+  <text x="182" y="374" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Physics Ratio Classifier</text>
+  <text x="182" y="398" text-anchor="middle" font-size="12" fill="#475569">Sub-atom vs aligned shape separation</text>
+
+  <rect x="336" y="340" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#86EFAC" stroke-width="1.5"/>
+  <text x="460" y="374" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Weighted Regime Partition</text>
+  <text x="460" y="398" text-anchor="middle" font-size="12" fill="#475569">Lexicographic bounded regime clustering</text>
+
+  <rect x="620" y="340" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#86EFAC" stroke-width="1.5"/>
+  <text x="744" y="374" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Copy-on-Write Helper Isolation</text>
+  <text x="744" y="398" text-anchor="middle" font-size="12" fill="#475569">Per-regime symbols &amp; dead-code pruning</text>
+
+  <rect x="904" y="340" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#86EFAC" stroke-width="1.5"/>
+  <text x="1028" y="374" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Dual-Layer Tail Guard</text>
+  <text x="1028" y="398" text-anchor="middle" font-size="12" fill="#475569">Active floor &amp; sibling zero-regression</text>
+
+  <rect x="1188" y="340" width="238" height="96" rx="8" fill="#FFFFFF" stroke="#86EFAC" stroke-width="1.5"/>
+  <text x="1307" y="374" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Cache Replay Idempotence</text>
+  <text x="1307" y="398" text-anchor="middle" font-size="12" fill="#475569">Zero growth under replay &amp; key hygiene</text>
+
+  <path d="M 300 388 L 334 388" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 584 388 L 618 388" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 868 388 L 902 388" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 1152 388 L 1186 388" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+
+  <!-- PLANE 3 -->
+  <rect x="40" y="492" width="1410" height="164" rx="12" fill="#FFFBEB" stroke="#F59E0B" stroke-width="2"/>
+  <text x="64" y="520" font-size="15" font-weight="700" fill="#B45309">PLANE 3 — COMPILER SINK-DOWN &amp; 3-TIER RESIDUAL COST PLANE</text>
+
+  <rect x="64" y="538" width="236" height="96" rx="8" fill="#FFFFFF" stroke="#FCD34D" stroke-width="1.5"/>
+  <text x="182" y="572" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Compiler Pattern Detectors</text>
+  <text x="182" y="596" text-anchor="middle" font-size="12" fill="#475569">Scalar loop &amp; narrow bypass traps</text>
+
+  <rect x="336" y="538" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#FCD34D" stroke-width="1.5"/>
+  <text x="460" y="572" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Analytical Hardware Model</text>
+  <text x="460" y="596" text-anchor="middle" font-size="12" fill="#475569">Segmented HBM &amp; six-pipe evaluator</text>
+
+  <rect x="620" y="538" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#FCD34D" stroke-width="1.5"/>
+  <text x="744" y="572" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Deterministic Penalty Layer</text>
+  <text x="744" y="596" text-anchor="middle" font-size="12" fill="#475569">Structured sink-down cost adjustments</text>
+
+  <rect x="904" y="538" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#FCD34D" stroke-width="1.5"/>
+  <text x="1028" y="572" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Topology-Bucket Calibration</text>
+  <text x="1028" y="596" text-anchor="middle" font-size="12" fill="#475569">Orthogonal residual &amp; pairwise ranking</text>
+
+  <rect x="1188" y="538" width="238" height="96" rx="8" fill="#FFFFFF" stroke="#FCD34D" stroke-width="1.5"/>
+  <text x="1307" y="572" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Residual Outlier Quarantine</text>
+  <text x="1307" y="596" text-anchor="middle" font-size="12" fill="#475569">Isolated anomaly ledger prevents skew</text>
+
+  <path d="M 300 586 L 334 586" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 584 586 L 618 586" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 868 586 L 902 586" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 1152 586 L 1186 586" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+
+  <!-- PLANE 4 -->
+  <rect x="40" y="690" width="1410" height="164" rx="12" fill="#FAF5FF" stroke="#A855F7" stroke-width="2"/>
+  <text x="64" y="718" font-size="15" font-weight="700" fill="#7E22CE">PLANE 4 — DUAL-TRACK NEURO-SYMBOLIC EVOLUTION PLANE</text>
+
+  <rect x="64" y="736" width="236" height="96" rx="8" fill="#FFFFFF" stroke="#D8B4FE" stroke-width="1.5"/>
+  <text x="182" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Capability Track Router</text>
+  <text x="182" y="794" text-anchor="middle" font-size="12" fill="#475569">High-level pipeline vs explicit template</text>
+
+  <rect x="336" y="736" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#D8B4FE" stroke-width="1.5"/>
+  <text x="460" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Progressive Redline Constraints</text>
+  <text x="460" y="794" text-anchor="middle" font-size="12" fill="#475569">Unified Layer 1/2/3 &amp; escape paths</text>
+
+  <rect x="620" y="736" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#D8B4FE" stroke-width="1.5"/>
+  <text x="744" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Parent Monotonicity Lock</text>
+  <text x="744" y="794" text-anchor="middle" font-size="12" fill="#475569">Structural invariant guard across repairs</text>
+
+  <rect x="904" y="736" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#D8B4FE" stroke-width="1.5"/>
+  <text x="1028" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Bounded Creative Exploration</text>
+  <text x="1028" y="794" text-anchor="middle" font-size="12" fill="#475569">Rule-blind proposals under latency cap</text>
+
+  <rect x="1188" y="736" width="238" height="96" rx="8" fill="#FFFFFF" stroke="#D8B4FE" stroke-width="1.5"/>
+  <text x="1307" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Counterfactual Causal Flywheel</text>
+  <text x="1307" y="794" text-anchor="middle" font-size="12" fill="#475569">Bayesian knowledge &amp; sink-down growth</text>
+
+  <path d="M 300 784 L 334 784" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 584 784 L 618 784" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 868 784 L 902 784" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 1152 784 L 1186 784" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+
+  <!-- PLANE 5 -->
+  <rect x="40" y="888" width="1410" height="164" rx="12" fill="#F1F5F9" stroke="#475569" stroke-width="2"/>
+  <text x="64" y="916" font-size="15" font-weight="700" fill="#334155">PLANE 5 — FIVE-TIER VERIFICATION &amp; SIGNED EXECUTION CONTROL PLANE</text>
+
+  <rect x="64" y="934" width="236" height="96" rx="8" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1.5"/>
+  <text x="182" y="968" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Level 0: Static Key Audit</text>
+  <text x="182" y="992" text-anchor="middle" font-size="12" fill="#475569">Repo hygiene &amp; pure cache-key rules</text>
+
+  <rect x="336" y="934" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1.5"/>
+  <text x="460" y="968" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Level 1: Integrity &amp; Flag Balance</text>
+  <text x="460" y="992" text-anchor="middle" font-size="12" fill="#475569">Schedule redlines &amp; cross-core CFG</text>
+
+  <rect x="620" y="934" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1.5"/>
+  <text x="744" y="968" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Level 2: Envelope Screening</text>
+  <text x="744" y="992" text-anchor="middle" font-size="12" fill="#475569">Host lowering &amp; surrogate filtering</text>
+
+  <rect x="904" y="934" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1.5"/>
+  <text x="1028" y="968" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Level 3: Contract &amp; Replay</text>
+  <text x="1028" y="992" text-anchor="middle" font-size="12" fill="#475569">Full shape suite &amp; tail regression</text>
+
+  <rect x="1188" y="934" width="238" height="96" rx="8" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1.5"/>
+  <text x="1307" y="968" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Level 4: Signed NPU Receipts</text>
+  <text x="1307" y="992" text-anchor="middle" font-size="12" fill="#475569">Isolated lease &amp; official benchmark</text>
+
+  <path d="M 300 982 L 334 982" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 584 982 L 618 982" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 868 982 L 902 982" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 1152 982 L 1186 982" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
+
+  <!-- Orthogonal Inter-Plane Downward Backbone -->
+  <path d="M 745 260 L 745 292" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 745 458 L 745 490" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 745 656 L 745 688" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow-solid)"/>
+  <path d="M 745 854 L 745 886" stroke="#334155" stroke-width="2.5" fill="none" marker-end="url(#arrow-solid)"/>
+
+  <!-- Right-Margin Closed-Loop Feedback Channels -->
+  <rect x="1474" y="140" width="98" height="900" rx="10" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="1523" y="590" text-anchor="middle" font-size="13" font-weight="700" fill="#475569" transform="rotate(-90 1523 590)">CLOSED-LOOP HARDWARE TELEMETRY &amp; MECHANISM SINK-DOWN</text>
+
+  <!-- Feedback paths from Plane 5 back to Plane 4, Plane 3, Plane 1 -->
+  <path d="M 1450 982 L 1492 982 L 1492 784 L 1452 784" stroke="#7C3AED" stroke-width="2" stroke-dasharray="6,4" fill="none" marker-end="url(#arrow-feedback)"/>
+  <path d="M 1492 784 L 1492 586 L 1452 586" stroke="#7C3AED" stroke-width="2" stroke-dasharray="6,4" fill="none" marker-end="url(#arrow-feedback)"/>
+  <path d="M 1492 586 L 1492 190 L 1452 190" stroke="#0F766E" stroke-width="2" stroke-dasharray="6,4" fill="none" marker-end="url(#arrow-teal)"/>
+
+  <!-- Legend Footer -->
+  <text x="40" y="1090" font-size="12" font-weight="600" fill="#334155">Legend:</text>
+  <line x1="100" y1="1086" x2="145" y2="1086" stroke="#334155" stroke-width="2.5" marker-end="url(#arrow-solid)"/>
+  <text x="155" y="1090" font-size="12" fill="#475569">Forward Compilation &amp; Verification Flow</text>
+  <line x1="420" y1="1086" x2="465" y2="1086" stroke="#7C3AED" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrow-feedback)"/>
+  <text x="475" y="1090" font-size="12" fill="#475569">Telemetry Calibration &amp; Causal Evolution Loop</text>
+  <line x1="775" y1="1086" x2="820" y2="1086" stroke="#0F766E" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrow-teal)"/>
+  <text x="830" y="1090" font-size="12" fill="#475569">Verified Compiler Mechanism Sink-Down</text>
+</svg>

@@ -1,52 +1,58 @@
 flowchart TB
-    classDef hw fill:#EEF4FA,stroke:#1E3A8A,stroke-width:1.5px,color:#0F172A
-    classDef boundary fill:#FEF7EB,stroke:#92400E,stroke-width:2px,color:#3B1D00
-    classDef agent fill:#ECFDF5,stroke:#065F46,stroke-width:1.5px,color:#062E22
-    classDef verify fill:#F5F3FF,stroke:#4C1D95,stroke-width:1.5px,color:#240E52
+  subgraph P1["Plane 1: Symbolic Contract & Compilation Plane"]
+    direction LR
+    C1["Operator Contract & Shape Anchors"]
+    C2["Unified ascend_compile_session (HIR -> TIR)"]
+    C3["Pre-Lowering Anchor Specialization (PrimFunc.specialize)"]
+    C4["EnvelopeInspector Two-Snapshot Lowering Diff"]
+    C5["SILVerifier (14 Redlines + Cross-Core CFG) & Z3 Pipeline"]
+    C1 --> C2 --> C3 --> C4 --> C5
+  end
 
-    subgraph PLANE_1["Plane 1: Hardware Spec, Canonical Pipe IR & Dual-Track Shells (target, ir, templates)"]
-        P1_HW["Ascend Hardware Spec & Fact Projections\nDaVinci950 (dav_3510) + Ascend950PR (28C/56V) / 950DT (36C/72V)\n1C2V coupled block, 24-bit pipe mask, 216/248/256 KiB UB tiers,\n9 legal / 3 forbidden DMA paths & segmented HBM burst curve"]:::hw
-        P1_IR["Execution Domains & 19 Canonical Pipe Primitives\nSimdVF / SimtVF domains + 8 core HIR->TIR algebraic/sharding bindings\n6 DMA + 4 DualCopy/Sync + 1 MMAD + 8 parametric Vector/Reg ops\nPure pipe/storage abstraction without ISA enumeration bloat"]:::hw
-        P1_TPL["Dual-Track 3-Axis Coordination Shell Engine (7 Presets)\nTrack-A TileLang DSL + Track-B AscendC C++20 renderers\nKeyed by TopologyAxes with Top-lattice shell-lock stripping"]:::hw
-    end
+  subgraph P2["Plane 2: Multi-Shape Regime Dispatch & Isolation Plane"]
+    direction LR
+    R1["CasePhysicsRatios Classification (+ _subatom)"]
+    R2["Weighted Lexicographic Regime Partition (1..4 Regimes)"]
+    R3["patch_regime_into_module (CoW _{regime_tag}_* & Pruning)"]
+    R4["Dual-Layer Tail Guard (Active Floor + Sibling Zero-Regress)"]
+    R5["Kernel Cache Two-Pass Idempotence (Delta|Cache| == 0)"]
+    R1 --> R2 --> R3 --> R4 --> R5
+  end
 
-    subgraph PLANE_2["Plane 2: White-Box Static Analysis & Cost Modeling (Compiler Objectivity Boundary)"]
-        P2_SIL["SIL Contract & 7-Facet Redline Verifier\nOpAdvisoryExtractor + TopologyAxes + 7-facet MECE ConstraintRelaxationMask\nSILVerifier enforces 14 hardware redlines & C++ CFG CrossCore flag balance"]:::boundary
-        P2_SOLVER["Z3 Modulo & Piecewise Regime Solvers\nMode-A Z3 steady-state II & multi-buffer solver\nRegimePiecewiseSolver with bidirectional live-buffer fixed-point re-solve"]:::boundary
-        P2_ENV["Two-Snapshot Lowering Diff & Physical Ledger\nEnvelopeInspector diffs pre/post lowering implicit bloat & buffer degradation\nHirBlueprintPacket + dual-mode ObjectivePhysicalLedger telemetry"]:::boundary
-        P2_COST["3-Tier Hybrid Cost Model & Compiler Behavior Parser\nTier-0 Roofline + 6-Pipe/AVE schedule floor; Tier-1 compiler penalties (7 detectors)\nTier-2 global/bucketed Ridge residual + MSProf pipe scales + pairwise Delta"]:::boundary
-        P2_SIL -->|"Policy & 7-facet mask"| P2_SOLVER
-        P2_SOLVER -->|"Z3 II & regime plan"| P2_ENV
-        P2_ENV -->|"Physical ledger & microarch profile"| P2_COST
-    end
+  subgraph P3["Plane 3: BiSheng Sink-Down & 3-Tier Residual Cost Plane"]
+    direction LR
+    B1["CompilerBehaviorRegistry (BiSheng Detectors + Sink-Down)"]
+    B2["Tier-0 Roofline & 6-Pipe/AVE Evaluator (216/248/256 KiB UB)"]
+    B3["Tier-1 Deterministic Compiler Penalty Synthesizer"]
+    B4["Tier-2 HybridAscendCostModel (12/8 Residual Basis + Delta)"]
+    B5["ExperienceLake Topology Buckets & Anomaly Ledger"]
+    B1 --> B2 --> B3 --> B4 --> B5
+  end
 
-    subgraph PLANE_3["Plane 3: Capability Routing, Causal KB & Progressive Constraint Synthesis"]
-        P3_ROUTE["8D Capability Router & ISA Pipe-Gap Scanner\nCapabilityGate (Router ON/OFF ablatable) + 3-tier escalation (DSL->InlineVF->AscendC)\nISAGapScanner checks 27 devkit primitives across 7 pipes to relax MECE facets"]:::agent
-        P3_KB["33 Cross-Op Causal Rules & 3-Axis Bayesian Tracker\nAST-safe static predicates; global + factorized (ce/mr/ir) Beta-Binomial posteriors\nCooldown revival, lock-free JSONL shards & local-to-cross-op promotion"]:::agent
-        P3_PORT["3-Layer Progressive Constraints & Stateless Portfolio\nllm_constraints: L1 Redlines/Facets + L2 Grounded Target API + L3 Residual Delta\nK rule-exploit + rule-blind creative workers with TileSizePrescreen\nPluggable LLM or agent backend with liveness monitoring"]:::agent
-        P3_BEAM["Per-Regime Two-Lane Beam, ExperienceLake & Flywheel\nIsolated per-regime Exploit + Stepping-Stone beams with Eq.3-HAP objective\nSHA-addressed ExperienceLake replay; counterfactual/LOO micro-probe distillation"]:::agent
-        P3_ROUTE -->|"Tier escalation & ISA gaps"| P3_PORT
-        P3_KB -->|"3-axis ranked rules"| P3_PORT
-        P3_BEAM -->|"Parent slice, residual & exclusions"| P3_PORT
-        P3_BEAM -.->|"Hardware-verified causal rules"| P3_KB
-    end
+  subgraph P4["Plane 4: Dual-Track Neuro-Symbolic Evolution Plane"]
+    direction LR
+    E1["8D CapabilityGate & ISAGapScanner (Router=ON/OFF)"]
+    E2["Dual-Track Shells (tilelang_dsl + ascendc_template)"]
+    E3["33 Causal Rules (13 SymptomFamilies, 3-Axis Bayes)"]
+    E4["3-Layer Progressive Constraints (G1..G5 + Monotonicity)"]
+    E5["Rule-Blind Bounded explore_creative & FlywheelDistiller"]
+    E1 --> E2 --> E3 --> E4 --> E5
+  end
 
-    subgraph PLANE_4["Plane 4: Multi-Operator Campaign & 5-Tier Verification Pyramid"]
-        P4_CAMP["Multi-Op Campaign Controller & AST Regime Splicer\nCannbenchOpsRegistry auto-stratification; Marathon stagnation-discounted rotation\nIsolated per-regime AST symbol patching & dead-helper pruning"]:::verify
-        P4_PYRAMID["5-Tier Verification Pyramid (wrapping 3-stage GateFunnel A/B/C)\nL0 Static Ledger/SIL -> [Optional CostModel Top-K] -> L1 Offline Compile & Res Audit\n-> L2 Prewarmed Batched NPU Eval + MSProf -> L3 Full Contract & Rollback -> L4 Suite"]:::verify
-        P4_CAMP -->|"Assembled dual-track candidate"| P4_PYRAMID
-    end
+  subgraph P5["Plane 5: Five-Tier (L0-L4) Verification & AgentGates Control Plane"]
+    direction LR
+    G1["L0 Static Lint & Cache-Key Pollution Audit"]
+    G2["L1 Schedule Redlines G1..G5 & SILVerifier"]
+    G3["L2 Lowering Envelope & Bounded Cost Screening"]
+    G4["L3 Full Contract Suite & Replay Idempotence"]
+    G5["L4 Official CANNBench Real-NPU Signed Receipts"]
+    G1 --> G2 --> G3 --> G4 --> G5
+  end
 
-    P1_HW -->|"Redlines & burst curves"| P2_SIL
-    P1_HW -->|"24-bit masks & SRAM caps"| P2_SOLVER
-    P1_IR -->|"19 pipe/resource contracts"| P2_ENV
-    P1_TPL -->|"Coordination shells"| P4_CAMP
-
-    P2_COST -->|"Ledger, pred_us & blueprint delta"| P3_ROUTE
-    P2_COST -->|"Physical & compiler telemetry"| P3_KB
-    P2_COST -.->|"L0->L1 Top-K prescreen"| P4_PYRAMID
-
-    P3_PORT -->|"Regime kernel patches"| P4_CAMP
-
-    P4_PYRAMID -.->|"Eq.3, MSProf, compiler summary & rollback"| P3_BEAM
-    P3_BEAM -.->|"ExperienceLake observations & pair deltas"| P2_COST
+  P1 --> P2
+  P2 --> P3
+  P3 --> P4
+  P4 --> P5
+  P5 -. "Real-NPU Telemetry & Residual Quarantine" .-> P3
+  P5 -. "Counterfactual Causal Rules & Sink-Down Tickets" .-> P4
+  B1 -. "Deterministic Compiler Facts" .-> E4
