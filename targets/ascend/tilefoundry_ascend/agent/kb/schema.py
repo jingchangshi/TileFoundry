@@ -12,6 +12,7 @@ from pathlib import Path
 
 import yaml
 
+from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
 from tilefoundry_ascend.ascend.passes.observation_space import (
     AxisResidual5D,
     CompilerSummaryLike,
@@ -19,6 +20,7 @@ from tilefoundry_ascend.ascend.passes.observation_space import (
     RooflineSummaryLike,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
+from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios
 
 
 class SymptomFamily(str, Enum):
@@ -513,7 +515,12 @@ _TELEMETRY_CONTEXT_DEFAULTS: dict[str, int | float | bool | str] = {
     "ub_bank_conflict_risk": 0.0,
     "l1_bank_conflict_risk": 0.0,
     "l1_vec_regs": 0,
+    "vec_regs": 0,
     "l1_scalar_regs": 0,
+    "contig_atom_ratio": 1.0,
+    "working_set_sram_ratio": 0.0,
+    "scalar_compute_loop_fallback": 0.0,
+    "dcache_bypass_narrow_store": 0.0,
     "has_empty_group": False,
     "has_loop_carried_state": False,
     "compute_engine": "",
@@ -701,6 +708,39 @@ def _axis_gap_context(residuals: AxisResidual5D) -> dict[str, float | str]:
     return context
 
 
+def _extract_extra_signals(source: object | None) -> dict[str, float]:
+    out: dict[str, float] = {}
+    if source is None:
+        return out
+    raw_extra: object | None = None
+    if isinstance(source, BishengResourceSummary):
+        raw_extra = source.extra_signals
+    elif isinstance(source, Mapping):
+        raw_extra = source.get("extra_signals")
+        for key in ("scalar_compute_loop_fallback", "dcache_bypass_narrow_store"):
+            val = source.get(key)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                out[key] = float(val)
+    if isinstance(raw_extra, Mapping):
+        for key, val in raw_extra.items():
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                out[str(key)] = float(val)
+    return out
+
+
+def _apply_case_ratios(ctx: dict[str, object], raw_ratios: object | None) -> None:
+    if isinstance(raw_ratios, CasePhysicsRatios):
+        ctx["contig_atom_ratio"] = float(raw_ratios.contig_atom_ratio)
+        ctx["working_set_sram_ratio"] = float(raw_ratios.working_set_sram_ratio)
+    elif isinstance(raw_ratios, Mapping):
+        contig = raw_ratios.get("contig_atom_ratio")
+        if isinstance(contig, (int, float)) and not isinstance(contig, bool):
+            ctx["contig_atom_ratio"] = float(contig)
+        ws_ratio = raw_ratios.get("working_set_sram_ratio")
+        if isinstance(ws_ratio, (int, float)) and not isinstance(ws_ratio, bool):
+            ctx["working_set_sram_ratio"] = float(ws_ratio)
+
+
 def build_predicate_context(
     ledger: ObjectivePhysicalLedger,
     *,
@@ -711,6 +751,7 @@ def build_predicate_context(
     extra: Mapping[str, object] | None = None,
     target: object | None = None,
     roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
+    case_ratios: object | None = None,
 ) -> dict[str, object]:
     """Assemble a flat and dotted-path dictionary for safe rule predicate evaluation.
 
@@ -749,19 +790,25 @@ def build_predicate_context(
             ctx["num_aiv_cores"] = int(dev.aiv_count)
 
     res_defaults: dict[str, int | float | bool | str] = dict(_RESIDUAL_DEFAULTS)
+    extra_signals_map: dict[str, float] = {}
     has_l1_summary = compiler_summary is not None
     if compiler_summary is not None:
         comp_vals = _extract_typed_defaults(compiler_summary, _RESIDUAL_DEFAULTS)
         if isinstance(compiler_summary, Mapping):
             sw = int(compiler_summary.get("software_loops", 0) or 0)
             vl = int(compiler_summary.get("vloopv2_loops", 0) or 0)
-            ctx["l1_vec_regs"] = int(compiler_summary.get("vec_regs", 0) or 0)
+            vec_reg_val = int(compiler_summary.get("vec_regs", 0) or 0)
+            ctx["l1_vec_regs"] = vec_reg_val
+            ctx["vec_regs"] = vec_reg_val
             ctx["l1_scalar_regs"] = int(compiler_summary.get("scalar_regs", 0) or 0)
         else:
             sw = int(compiler_summary.software_loops)
             vl = int(compiler_summary.vloopv2_loops)
-            ctx["l1_vec_regs"] = int(compiler_summary.vec_regs)
+            vec_reg_val = int(compiler_summary.vec_regs)
+            ctx["l1_vec_regs"] = vec_reg_val
+            ctx["vec_regs"] = vec_reg_val
             ctx["l1_scalar_regs"] = int(compiler_summary.scalar_regs)
+        extra_signals_map.update(_extract_extra_signals(compiler_summary))
         if sw == 0 and vl == 0 and "vloopv2_hit" in comp_vals:
             comp_vals["vloopv2_hit"] = True
         res_defaults.update(comp_vals)
@@ -801,7 +848,9 @@ def build_predicate_context(
                     res_defaults[key] = float(raw_val)
             if not has_l1_summary and embedded_obs.has_l1_compiler_summary:
                 has_l1_summary = True
-                ctx["l1_vec_regs"] = int(embedded_obs.onchip_sram_reg.l1_vec_regs)
+                obs_vec_regs = int(embedded_obs.onchip_sram_reg.l1_vec_regs)
+                ctx["l1_vec_regs"] = obs_vec_regs
+                ctx["vec_regs"] = obs_vec_regs
                 ctx["l1_scalar_regs"] = int(embedded_obs.onchip_sram_reg.l1_scalar_regs)
                 res_defaults["spill_bytes"] = max(
                     int(res_defaults["spill_bytes"]),
@@ -838,6 +887,7 @@ def build_predicate_context(
                     int(res_defaults["dcache_dcci_flushes"]),
                     int(embedded_obs.offchip_dma.l1_dcache_dcci_flushes),
                 )
+        extra_signals_map.update(_extract_extra_signals(residual))
     elif roofline is not None:
         static_obs = ledger.to_observation_5d(roofline=roofline)
         if static_obs.transfer_inflation_ratio > 0.0:
@@ -845,6 +895,16 @@ def build_predicate_context(
     ctx["has_l1_compiler_summary"] = has_l1_summary
     ctx.update(res_defaults)
     ctx.update(_axis_gap_context(_axis_residuals(ledger, residual, roofline=roofline)))
+    if int(ctx.get("vec_regs", 0) or 0) == 0 and int(ctx.get("l1_vec_regs", 0) or 0) > 0:
+        ctx["vec_regs"] = int(ctx["l1_vec_regs"])
+    _apply_case_ratios(ctx, case_ratios)
+    ctx["extra_signals"] = dict(extra_signals_map)
+    ctx["scalar_compute_loop_fallback"] = float(
+        extra_signals_map.get("scalar_compute_loop_fallback", 0.0)
+    )
+    ctx["dcache_bypass_narrow_store"] = float(
+        extra_signals_map.get("dcache_bypass_narrow_store", 0.0)
+    )
 
     if (
         float(ctx.get("ub_bank_conflict_risk", 0.0)) == 0.0
@@ -859,6 +919,7 @@ def build_predicate_context(
             prev_ns.setdefault(key, val)
         for key, val in _TELEMETRY_CONTEXT_DEFAULTS.items():
             prev_ns.setdefault(key, val)
+        prev_ns.setdefault("extra_signals", {})
         if roofline is not None:
             prev_obs = prev_ledger.to_observation_5d(roofline=roofline)
             if prev_obs.transfer_inflation_ratio > 0.0:
@@ -873,6 +934,24 @@ def build_predicate_context(
             ctx["ub_utilization_ratio"] = float(extra["ub_occupancy_ratio"])
         elif "ub_utilization_ratio" in extra and "ub_occupancy_ratio" not in extra:
             ctx["ub_occupancy_ratio"] = float(extra["ub_utilization_ratio"])
+        if "vec_regs" in extra and "l1_vec_regs" not in extra:
+            ctx["l1_vec_regs"] = int(extra["vec_regs"])
+        elif "l1_vec_regs" in extra and "vec_regs" not in extra:
+            ctx["vec_regs"] = int(extra["l1_vec_regs"])
+        if "case_ratios" in extra:
+            _apply_case_ratios(ctx, extra.get("case_ratios"))
+        if "case_contig_atom_ratio" in extra and "contig_atom_ratio" not in extra:
+            ctx["contig_atom_ratio"] = float(extra["case_contig_atom_ratio"])
+        if "case_working_set_sram_ratio" in extra and "working_set_sram_ratio" not in extra:
+            ctx["working_set_sram_ratio"] = float(extra["case_working_set_sram_ratio"])
+        extra_signals_map.update(_extract_extra_signals(extra))
+        ctx["extra_signals"] = dict(extra_signals_map)
+        ctx["scalar_compute_loop_fallback"] = float(
+            extra_signals_map.get("scalar_compute_loop_fallback", 0.0)
+        )
+        ctx["dcache_bypass_narrow_store"] = float(
+            extra_signals_map.get("dcache_bypass_narrow_store", 0.0)
+        )
         extra_axes = extra.get("topology_axes")
         if isinstance(extra_axes, Mapping):
             for ak in ("compute_engine", "memory_ring", "iteration_regularity"):
@@ -999,6 +1078,11 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
         "spill_bytes": _read_signal_int(sram_map, "l1_spill_bytes"),
         "stack_bytes": _read_signal_int(sram_map, "l1_stack_bytes"),
         "l1_vec_regs": _read_signal_int(sram_map, "l1_vec_regs"),
+        "vec_regs": _read_signal_int(sram_map, "l1_vec_regs"),
+        "contig_atom_ratio": 1.0,
+        "working_set_sram_ratio": 0.0,
+        "scalar_compute_loop_fallback": 0.0,
+        "dcache_bypass_narrow_store": 0.0,
         "max_overflow_bytes": _read_signal_int(sram_map, "l0_max_overflow_bytes"),
         "degraded_buffer_count": _read_signal_int(sram_map, "l0_degraded_single_buffers"),
         "bank_conflict_ratio": _read_signal_float(sram_map, "l2_bank_conflict_ratio"),
@@ -1060,6 +1144,18 @@ def rank_symptom_families(
     )
     l1_vec_regs = _read_signal_int(sig, "l1_vec_regs", "vec_regs")
     has_l1_summary = _read_signal_bool(sig, "has_l1_compiler_summary")
+    raw_extra = sig.get("extra_signals")
+    extra_map = raw_extra if isinstance(raw_extra, Mapping) else {}
+    scalar_fallback = _read_signal_float(
+        sig,
+        "scalar_compute_loop_fallback",
+        default=_read_signal_float(extra_map, "scalar_compute_loop_fallback"),
+    )
+    dcache_bypass_amp = _read_signal_float(
+        sig,
+        "dcache_bypass_narrow_store",
+        default=_read_signal_float(extra_map, "dcache_bypass_narrow_store"),
+    )
 
     spill_bytes = _read_signal_int(sig, "spill_bytes")
     stack_bytes = _read_signal_int(sig, "stack_bytes", "l1_stack_bytes")
@@ -1091,6 +1187,11 @@ def rank_symptom_families(
     )
     dma_roundtrip_score = min(1.0, max(inflation_score, roundtrip_score))
 
+    bypass_burst_score = (
+        min(1.0, 0.85 + 0.15 * min(1.0, (dcache_bypass_amp - 1.0) / 31.0))
+        if dcache_bypass_amp > 1.0
+        else 0.0
+    )
     short_burst_score = min(
         1.0,
         max(
@@ -1098,6 +1199,7 @@ def rank_symptom_families(
             0.55 if (0 < contig_bytes < 16384) else 0.0,
             0.65 if unaligned_pad > 0 else 0.0,
             0.70 if mte2_inflight > 16 else 0.0,
+            bypass_burst_score,
         ),
     )
 
@@ -1196,8 +1298,10 @@ def rank_symptom_families(
         ),
     )
 
-    is_scalar_trap = (l0_cube_cycles == 0 and l0_vec_cycles == 0) or (
-        has_l1_summary and l1_vec_regs == 0 and aiv_vec < 0.02 and aic_mac == 0.0
+    is_scalar_trap = (
+        scalar_fallback > 0.0
+        or (l0_cube_cycles == 0 and l0_vec_cycles == 0)
+        or (has_l1_summary and l1_vec_regs == 0 and aiv_vec < 0.02 and aic_mac == 0.0)
     )
     scalar_loop_score = 1.0 if is_scalar_trap else 0.0
 

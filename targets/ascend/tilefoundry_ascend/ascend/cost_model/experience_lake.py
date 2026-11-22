@@ -448,6 +448,16 @@ class ExperienceLake:
             fh.write(line)
         return shard
 
+    def append_unmodeled_anomaly(self, record: Mapping[str, object]) -> Path:
+        """Append one compact outlier record to ``unmodeled_anomalies.jsonl``."""
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        anomaly_path = self.root_dir / "unmodeled_anomalies.jsonl"
+        payload = {str(k): v for k, v in record.items()}
+        line = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+        with anomaly_path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+        return anomaly_path
+
     def _load_observations(self) -> list[CaseObservationRecord]:
         observations: list[CaseObservationRecord] = []
         if self.runs_dir.is_dir():

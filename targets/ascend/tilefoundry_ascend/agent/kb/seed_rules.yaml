@@ -291,19 +291,24 @@ rules:
   - rule_id: R16_PADDED_PITCH_TAIL_MASKING
     symptom_family: DMA_UNALIGNED_SHORT_BURST
     regime_guard: "(not has_indirect_gather) and (PIPE_V > 0 or PIPE_MTE2 > 0 or has_simtvf)"
-    precondition: "(not has_indirect_gather) and (unaligned_dma_padding_bytes > 0 or (has_simtvf and cube_to_vector_ratio == 0.0))"
+    precondition: "(not has_indirect_gather) and (unaligned_dma_padding_bytes > 0 or contig_atom_ratio < 1.0 or (has_simtvf and cube_to_vector_ratio == 0.0))"
     anti_precondition: "transfer_inflation_ratio > 1.35 and gm_roundtrip_bytes > 0"
     transform_template: |
-      Pad inner UB and global-memory transfer strides to 32-byte alignment and replace scalar
-      T.SimtVF loops with predicated vector T.SimdVF() tail masking so DMA bursts stay aligned
-      and full SIMD vector pipelines execute without scalar fallback.
-    expected_postcondition: "unaligned_dma_padding_bytes < prev.unaligned_dma_padding_bytes or not has_simtvf"
+      When contig_atom_ratio < 1.0 or inner transfers are sub-32B, pack multiple short rows
+      contiguously in UB/GM to align 32B DMA burst transfers, pad inner UB/GM strides to 32B
+      alignment, and replace scalar T.SimtVF loops with predicated vector T.SimdVF() tail masking
+      so DMA bursts stay aligned and SIMD pipelines run without scalar fallback or bypass stores.
+    expected_postcondition: "unaligned_dma_padding_bytes < prev.unaligned_dma_padding_bytes or not has_simtvf or dma_burst_efficiency_ratio > prev.dma_burst_efficiency_ratio"
     source_provenance: "ref:asc_devkit"
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 14
-    compatible_backends: ["tilelang_dsl"]
-    rationale: "Replacing unaligned SIMT tails with 32B-padded SIMD masking eliminates DMA padding and scalar stalls."
+    compatible_backends: ["tilelang_dsl", "cce_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Pack multiple sub-32B rows contiguously (contig_atom_ratio < 1.0) into 32B-aligned
+      asc_copy_gm2ub_align() / asc_copy_ub2gm_align() bursts instead of narrow bypass GM stores,
+      and keep inner UB strides 32B-aligned for wide simd_inst::* tail-masked execution.
+    rationale: "Multi-row contiguous 32B packing and SIMD tail masking eliminate sub-32B DMA burst waste and scalar bypass stalls."
 
   - rule_id: R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK
     symptom_family: SRAM_REGISTER_SPILL_STACK
@@ -371,14 +376,15 @@ rules:
 
   - rule_id: R20_LOOP_FISSION_REDUCE_SFU_HIDING
     symptom_family: COMPUTE_INEFFECTIVE_THROUGHPUT
-    regime_guard: "is_legal and PIPE_M == 0 and PIPE_V > 0 and has_coupled_reduce_sfu_accum"
-    precondition: "has_coupled_reduce_sfu_accum and (dominant_pipe in ('PIPE_V', 'AIV0.PIPE_V', 'AIV1.PIPE_V') or measured_aiv_vec_ratio >= 0.35)"
+    regime_guard: "is_legal and PIPE_M == 0 and PIPE_V > 0 and (has_coupled_reduce_sfu_accum or (0.0 < effective_compute_eta < 0.45 and measured_aiv_vec_ratio >= 0.35))"
+    precondition: "(has_coupled_reduce_sfu_accum and (dominant_pipe in ('PIPE_V', 'AIV0.PIPE_V', 'AIV1.PIPE_V') or measured_aiv_vec_ratio >= 0.35)) or (0.0 < effective_compute_eta < 0.45 and measured_aiv_vec_ratio >= 0.35)"
     anti_precondition: "effective_compute_eta >= 0.60 or ub_occupancy_ratio > 0.82 or spill_bytes > 0"
     transform_template: |
       Split coupled reduce+SFU+wide-accumulation loops into two sequential loops (loop fission):
-      Pass 1 computes row reductions and SFU ops (vcadd/vsqrt/vexp) into compact UB scalar
-      weight buffers while prefetching GM tiles; Pass 2 streams wide vfma / (vmul + vadd)
-      accumulation across vector chunks with short independent dependency chains.
+      Pass 1 computes row reductions and SFU ops (vcadd/vsqrt/vexp) and hoists the scalar
+      reciprocal (1.0 / sum or rsqrt) into a scalar register while prefetching GM tiles; Pass 2
+      streams wide vector multiply (T.simd.vmuls / vmul instead of elementwise vdiv) and
+      vfma accumulation across vector chunks with short independent dependency chains.
     expected_postcondition: "not has_coupled_reduce_sfu_accum or measured_latency_us < prev.measured_latency_us"
     source_provenance: "ref:asc_devkit"
     alpha_prior: 2.5
@@ -386,9 +392,10 @@ rules:
     priority: 17
     compatible_backends: ["tilelang_dsl", "cce_trackb", "hybrid_trackb"]
     cpp20_transform_template: |
-      Split coupled simd_inst::vcadd/vexp reductions and wide simd_inst::vfma accumulation into
-      two separate loops inside __simd_vf__ to hide SFU latency chains.
-    rationale: "Fissioning reduce/SFU from wide vector accumulation hides long SFU latency chains."
+      Split coupled simd_inst::vcadd/vexp reductions from normalization, hoist the scalar
+      reciprocal once after the reduction sum, and apply wide simd_inst::vmul (instead of
+      elementwise vdiv) and simd_inst::vfma accumulation inside __simd_vf__ to hide SFU latency.
+    rationale: "Hoisting scalar reciprocals into vmul and fissioning reduce/SFU from wide accumulation eliminates slow elementwise vdiv and SFU latency stalls."
 
   - rule_id: R21_SUBROW_DEPTH_OR_WIDTH_CORE_SHARDING
     symptom_family: GRID_TAIL_WAVE_UNDERUTIL
@@ -457,14 +464,13 @@ rules:
   - rule_id: R24_VLOOPV2_LEGALIZATION_AND_DIRECT_VF
     symptom_family: COMPUTE_VECTOR_LOOP_DEGRADED
     regime_guard: "PIPE_V > 0 and (not has_indirect_gather)"
-    precondition: "(not vloopv2_hit) or in_loop_ub_reload_stores > 0"
-    anti_precondition: "effective_compute_eta >= 0.60 and vloopv2_hit"
+    precondition: "(not vloopv2_hit) or in_loop_ub_reload_stores > 0 or vf_fusion_breaks > 0"
+    anti_precondition: "spill_bytes > 0 or vec_regs > 56"
     transform_template: |
-      Legalize vector loops for hardware VLOOPv2 by converting induction variables to uint16_t
-      0-based unit-step (+1) invariant-bound loops (<= 4 nesting) with branchless Select
-      predication; when intra-VF LocalMemBar<VEC_STORE, VEC_LOAD>() reuse is required, emit
-      __no_simd_vf_fusion__ __simd_vf__ direct calls instead of asc_vf_call to avoid deadlock
-      and redundant recomputation.
+      Consolidate fragmented vector passes into a single T.SimdVF intra-register fusion kernel
+      using T.simd.alloc_local registers plus T.simd.mem_bar("VST_VLD") for UB reuse, and
+      legalize vector loops for hardware VLOOPv2 (uint16_t 0-based unit-step +1 loops with
+      branchless Select predication) to avoid UB store->load roundtrips and VF launch breaks.
     expected_postcondition: "vloopv2_hit or in_loop_ub_reload_stores < prev.in_loop_ub_reload_stores or PIPE_V < prev.PIPE_V"
     source_provenance: "ref:cann_samples"
     alpha_prior: 2.7
@@ -472,9 +478,10 @@ rules:
     priority: 15
     compatible_backends: ["tilelang_dsl", "cce_trackb", "hybrid_trackb"]
     cpp20_transform_template: |
-      Use 0-based unit-step uint16_t loops with simd_inst::vsel inside __simd_vf__ and annotate
-      __no_simd_vf_fusion__ __simd_vf__ when intra-VF LocalMemBar reuse is needed.
-    rationale: "Hardware VLOOPv2 loops and direct __no_simd_vf_fusion__ calls eliminate software branch overhead and UB recomputes."
+      Use 0-based unit-step uint16_t loops with simd_inst::vsel inside a single __simd_vf__
+      keeping intermediates in vector registers and using __no_simd_vf_fusion__ __simd_vf__
+      with LocalMemBar<VEC_STORE, VEC_LOAD>() when intra-VF UB reuse is needed.
+    rationale: "Single-VF intra-register fusion with VST_VLD barriers and VLOOPv2 legalization eliminates UB reload traffic and software branch overhead."
 
   - rule_id: R25_SCALAR_BOUND_SPILL_ELIMINATION
     symptom_family: SRAM_REGISTER_SPILL_STACK
@@ -646,24 +653,26 @@ rules:
 
   - rule_id: R33_PERSISTENT_STATE_RESIDENCY
     symptom_family: DMA_REDUNDANT_GM_ROUNDTRIP
-    regime_guard: "has_loop_carried_state or memory_ring == 'persistent_onchip_state'"
-    precondition: "gm_roundtrip_bytes > 0 or in_loop_ub_reload_stores > 0 or (has_loop_carried_state and PIPE_MTE2 > 0)"
-    anti_precondition: "UB.overflow_bytes > 0 or L1.overflow_bytes > 0"
+    regime_guard: "has_loop_carried_state or memory_ring == 'persistent_onchip_state' or (transfer_inflation_ratio > 1.30 and working_set_sram_ratio <= 1.0)"
+    precondition: "gm_roundtrip_bytes > 0 or in_loop_ub_reload_stores > 0 or (has_loop_carried_state and PIPE_MTE2 > 0) or (transfer_inflation_ratio > 1.30 and working_set_sram_ratio <= 1.0)"
+    anti_precondition: "UB.overflow_bytes > 0 or L1.overflow_bytes > 0 or working_set_sram_ratio > 1.0"
     transform_template: |
-      Bind persistent (B, H) ownership to cores and keep FP32 recurrent/Sinkhorn/TTT hidden
-      state resident inside UB/L1 across chunks and iterations (zero intermediate GM
-      roundtrips), halve exponential dynamic range with anchor = G_tail / 2, and accumulate
-      history + local chunk in-place in L0C via initC=false.
-    expected_postcondition: "gm_roundtrip_bytes < prev.gm_roundtrip_bytes or in_loop_ub_reload_stores < prev.in_loop_ub_reload_stores or PIPE_MTE2 <= prev.PIPE_MTE2"
+      When transfer_inflation_ratio > 1.30 and the single-row working set fits in UB, fuse
+      multi-pass stages into single-pass UB residency (load once from GM, keep row/tile
+      resident in UB across reduction/normalization/epilogue, write final output once to GM).
+      For recurrent kernels, bind persistent (B, H) ownership to cores and keep FP32 state
+      resident inside UB/L1 across chunks with anchor = G_tail / 2 and L0C initC=false.
+    expected_postcondition: "gm_roundtrip_bytes < prev.gm_roundtrip_bytes or in_loop_ub_reload_stores < prev.in_loop_ub_reload_stores or transfer_inflation_ratio < prev.transfer_inflation_ratio or PIPE_MTE2 <= prev.PIPE_MTE2"
     source_provenance: "ref:ops_transformer"
     alpha_prior: 2.9
     beta_prior: 1.0
     priority: 10
     compatible_backends: ["tilelang_dsl", "cce_trackb", "hybrid_trackb"]
     cpp20_transform_template: |
-      Keep loop-carried state resident in __ubuf__/__cbuf__ across chunks inside __aicore__
-      (zero GM roundtrips) and accumulate in-place in __cc__ via asc_mmad(..., initC=false).
-    rationale: "On-chip recurrent state residency with L0C initC=false accumulation eliminates per-chunk GM state traffic."
+      Load single-row working sets into __ubuf__ once and keep intermediate passes resident in
+      __ubuf__/__cbuf__ (zero GM roundtrips) when working_set_sram_ratio <= 1.0, and accumulate
+      recurrent history in-place in __cc__ via asc_mmad(..., initC=false).
+    rationale: "Single-pass UB residency and on-chip state persistence eliminate redundant GM read/write roundtrips."
 
   - rule_id: R34_SCALAR_LOOP_TO_VECTOR_DMA_PIPELINE
     symptom_family: SCALAR_LOOP_TRAP

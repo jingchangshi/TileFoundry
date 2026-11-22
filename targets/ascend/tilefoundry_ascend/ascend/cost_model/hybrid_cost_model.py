@@ -734,6 +734,7 @@ class HybridAscendCostModel:
         calibration_path: str | Path | None = None,
         behavior_registry: CompilerBehaviorRegistry | None = None,
         basis_registry: ResidualBasisRegistry | None = None,
+        anomaly_lake: ExperienceLake | str | Path | None = None,
     ) -> None:
         if not (0.0 < forgetting_factor <= 1.0):
             raise ValueError(
@@ -745,6 +746,25 @@ class HybridAscendCostModel:
         self.ridge_alpha = float(max(1e-6, ridge_alpha))
         self._forgetting_factor = float(forgetting_factor)
         self.calibration_path = Path(calibration_path) if calibration_path is not None else None
+        self.anomaly_lake: ExperienceLake | None
+        self.anomaly_path: Path | None
+        if isinstance(anomaly_lake, ExperienceLake):
+            self.anomaly_lake = anomaly_lake
+            self.anomaly_path = anomaly_lake.root_dir / "unmodeled_anomalies.jsonl"
+        elif anomaly_lake is not None:
+            raw_anomaly_path = Path(anomaly_lake).expanduser().resolve()
+            if raw_anomaly_path.suffix == ".jsonl":
+                self.anomaly_lake = None
+                self.anomaly_path = raw_anomaly_path
+            else:
+                self.anomaly_lake = ExperienceLake(raw_anomaly_path)
+                self.anomaly_path = self.anomaly_lake.root_dir / "unmodeled_anomalies.jsonl"
+        elif self.calibration_path is not None:
+            self.anomaly_lake = None
+            self.anomaly_path = self.calibration_path.parent / "unmodeled_anomalies.jsonl"
+        else:
+            self.anomaly_lake = None
+            self.anomaly_path = None
         self.behavior_registry: CompilerBehaviorRegistry = (
             behavior_registry
             if behavior_registry is not None
@@ -886,7 +906,11 @@ class HybridAscendCostModel:
             wave_ratio = max(1.0, waves / max(1e-6, ideal_waves))
         cube_floor_us = ideal_cube_us * wave_ratio
 
-        aiv_peak_flops_per_sec = float(aiv_cores) * float(DEFAULT_AIV_VEC_FLOPS_PER_CYCLE) * clock_hz
+        scalar_fallback = float(cf.extra_signals.get("scalar_compute_loop_fallback", 0.0) or 0.0)
+        vec_flops_per_cycle = (
+            1.0 if scalar_fallback > 0.0 else float(DEFAULT_AIV_VEC_FLOPS_PER_CYCLE)
+        )
+        aiv_peak_flops_per_sec = float(aiv_cores) * vec_flops_per_cycle * clock_hz
         vec_floor_us = (cf.vec_flops / aiv_peak_flops_per_sec) * 1e6 if cf.vec_flops > 0 else 0.0
         if cf.cube_flops <= 0 and cf.total_tiles > 0:
             vec_floor_us *= wave_ratio
@@ -905,6 +929,11 @@ class HybridAscendCostModel:
                 l2_hit_rate = round(0.40 * fit_ratio, 6)
 
         effective_gm_bytes = float(cf.gm_bytes) * (1.0 - l2_hit_rate)
+        dcache_bypass_amp = float(
+            cf.extra_signals.get("dcache_bypass_narrow_store", 0.0) or 0.0
+        )
+        if dcache_bypass_amp > 1.0:
+            effective_gm_bytes = effective_gm_bytes * (0.5 + 0.5 * dcache_bypass_amp)
         hbm_floor_us = (effective_gm_bytes / eff_hbm_bw) * 1e6 if effective_gm_bytes > 0 else 0.0
 
         l2_bw_bps = (
@@ -1006,7 +1035,10 @@ class HybridAscendCostModel:
                 pipe_scale_multipliers=scales,
             )
             cube_floor_us = max(cube_floor_us, sched.pipe_ns["CUBE"] * 1e-3)
-            vec_floor_us = max(vec_floor_us, sched.pipe_ns["VECTOR"] * 1e-3)
+            sched_vec_us = sched.pipe_ns["VECTOR"] * 1e-3
+            if scalar_fallback > 0.0:
+                sched_vec_us *= float(DEFAULT_AIV_VEC_FLOPS_PER_CYCLE)
+            vec_floor_us = max(vec_floor_us, sched_vec_us)
             fixpipe_floor_us = max(fixpipe_floor_us, sched.pipe_ns["FIXPIPE"] * 1e-3)
             hbm_floor_us = max(hbm_floor_us, (sched.pipe_ns["MTE2"] * 1e-3) * (1.0 - l2_hit_rate))
             mte1_us = sched.pipe_ns["MTE1"] * 1e-3
@@ -1178,6 +1210,24 @@ class HybridAscendCostModel:
         t01 = self._compute_tier0_and_tier1(cf)
         analytical_us = max(1e-6, t01.tier0_us + t01.tier1_penalty_us)
         bucket = topology_bucket_for_axes(cf.topology_axes)
+        log_residual = math.log(float(measured_us) / analytical_us)
+        if abs(log_residual) > 2.5:
+            anomaly_record: dict[str, object] = {
+                "measured_us": float(measured_us),
+                "analytical_us": analytical_us,
+                "log_residual": log_residual,
+                "topology_bucket": bucket,
+                "dominant_bound": t01.dominant,
+                "extra_signals": {str(k): float(v) for k, v in cf.extra_signals.items()},
+            }
+            if self.anomaly_lake is not None:
+                self.anomaly_lake.append_unmodeled_anomaly(anomaly_record)
+            elif self.anomaly_path is not None:
+                self.anomaly_path.parent.mkdir(parents=True, exist_ok=True)
+                line = json.dumps(anomaly_record, sort_keys=True, separators=(",", ":")) + "\n"
+                with self.anomaly_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+            return analytical_us
         sample = CalibrationSample(
             named_features=dict(t01.named_features),
             measured_us=float(measured_us),

@@ -96,7 +96,7 @@ def test_p0_chip_scaling_floors_persistence_and_observe_batch(tmp_path: Path) ->
     observations = [
         (cf, pred_coupled.pred_us * 1.4),
         (CostFeatures(gm_bytes=8192.0, vec_flops=1e9, topology_axes=axes), 9.5),
-        (CostFeatures(gm_bytes=65536.0, cube_flops=1e11, topology_axes=axes), 14.2),
+        (CostFeatures(gm_bytes=65536.0, cube_flops=1e11, topology_axes=axes), 80.0),
     ]
     for feat, lat in observations:
         m_seq.observe(feat, lat, persist=True)

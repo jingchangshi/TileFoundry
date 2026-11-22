@@ -89,7 +89,7 @@ def test_online_dedup_keys_and_exclude_run_id_prevent_double_counting(tmp_path: 
         )
 
     dims = {"M": 512, "N": 1024}
-    pmu_parent = {"dur_us": 100.0, "aiv_vec": 0.60, "aiv_mte2": 0.30}
+    pmu_parent = {"dur_us": 30.0, "aiv_vec": 0.60, "aiv_mte2": 0.30}
     pmu_child = {"dur_us": 60.0, "aiv_vec": 0.80, "aiv_mte2": 0.20}
 
     lake.append_observation(
@@ -100,7 +100,7 @@ def test_online_dedup_keys_and_exclude_run_id_prevent_double_counting(tmp_path: 
             cand_sha=parent_sha,
             eval_tier="baseline",
             case_num=1,
-            measured_us=100.0,
+            measured_us=30.0,
             accuracy_passed=True,
             case_dims=dims,
             t_hw_us=30.0,
@@ -144,15 +144,15 @@ def test_online_dedup_keys_and_exclude_run_id_prevent_double_counting(tmp_path: 
     wl_p = project_case_workload(parent_ledger, case_dims=dims, axes=axes)
     wl_c = project_case_workload(child_ledger, case_dims=dims, axes=axes)
 
-    cm_no_exclude.observe_msprof(wl_p, pmu_parent, measured_us=100.0, persist=False)
-    cm_no_exclude.observe(wl_p, 100.0, persist=False, refit=False)
+    cm_no_exclude.observe_msprof(wl_p, pmu_parent, measured_us=30.0, persist=False)
+    cm_no_exclude.observe(wl_p, 30.0, persist=False, refit=False)
     cm_no_exclude.mark_online_observation_key(
         cand_sha=parent_sha,
         operator="vec/norm",
         regime_tag="small",
         case_num=1,
         eval_tier="baseline",
-        measured_us=100.0,
+        measured_us=30.0,
     )
 
     cm_no_exclude.observe_msprof(wl_c, pmu_child, measured_us=60.0, persist=False)
@@ -165,7 +165,7 @@ def test_online_dedup_keys_and_exclude_run_id_prevent_double_counting(tmp_path: 
         eval_tier="l2_pass",
         measured_us=60.0,
     )
-    cm_no_exclude.observe_pair_delta(wl_c, 60.0, wl_p, 100.0, refit=False)
+    cm_no_exclude.observe_pair_delta(wl_c, 60.0, wl_p, 30.0, refit=False)
     cm_no_exclude.mark_online_pair_key(
         cand_sha=child_sha,
         parent_sha=parent_sha,

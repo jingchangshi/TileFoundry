@@ -60,8 +60,11 @@ from tilefoundry_ascend.ascend.templates import (
 
 
 def test_tier1_compiler_behavior_registry_detects_all_7_phenomena_and_custom_plugin() -> None:
-    """Verify all 7 built-in compiler phenomena + extensible register_compiler_detector plugin."""
-    assert len(DEFAULT_COMPILER_BEHAVIOR_REGISTRY.list_detectors()) == 7
+    """Verify all 9 built-in compiler phenomena + extensible register_compiler_detector plugin."""
+    detectors = DEFAULT_COMPILER_BEHAVIOR_REGISTRY.list_detectors()
+    assert len(detectors) == 9
+    assert "scalar_compute_loop_fallback" in detectors
+    assert "dcache_bypass_narrow_store" in detectors
 
     clean_res = "Vector Register Usage: 32\nScalar Register Usage: 16\nStack Frame Size: 128 bytes\n"
     clean_asm = "VLOOPv2 r0, 32\nVADD v0, v1, v2\n"

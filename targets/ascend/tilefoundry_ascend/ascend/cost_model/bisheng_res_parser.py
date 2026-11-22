@@ -251,6 +251,211 @@ def _detect_dcache_dcci_flushes(res_text: str = "", asm_or_dump_text: str = "") 
     return len(matches)
 
 
+def _strip_cpp_comments(text: str) -> str:
+    stripped = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+    return re.sub(r"//[^\n]*", "", stripped)
+
+
+def _extract_for_loop_bodies(text: str) -> list[str]:
+    bodies: list[str] = []
+    n = len(text)
+    for match in re.finditer(r"\bfor\s*\(", text):
+        pos = match.end()
+        paren_depth = 1
+        while pos < n and paren_depth > 0:
+            ch = text[pos]
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")":
+                paren_depth -= 1
+            pos += 1
+        if paren_depth != 0:
+            continue
+        while pos < n and text[pos].isspace():
+            pos += 1
+        if pos >= n:
+            continue
+        if text[pos] == "{":
+            pos += 1
+            start = pos
+            brace_depth = 1
+            while pos < n and brace_depth > 0:
+                ch = text[pos]
+                if ch == "{":
+                    brace_depth += 1
+                elif ch == "}":
+                    brace_depth -= 1
+                pos += 1
+            if brace_depth == 0:
+                bodies.append(text[start : pos - 1])
+        else:
+            semi = text.find(";", pos)
+            if semi != -1:
+                bodies.append(text[pos : semi + 1])
+    return bodies
+
+
+def _strip_subscripts(text: str) -> str:
+    out: list[str] = []
+    depth = 0
+    for ch in text:
+        if ch == "[":
+            if depth == 0:
+                out.append("[]")
+            depth += 1
+        elif ch == "]":
+            if depth > 0:
+                depth -= 1
+        elif depth == 0:
+            out.append(ch)
+    return "".join(out)
+
+
+_VEC_MATRIX_INST_RE = re.compile(
+    r"(?:simd_inst::|\bvloop_?v2\b|\basc_mmad\b|\b__simd_vf__\b|\basc_vf_call\b|\bvec_(?!reg))",
+    flags=re.IGNORECASE,
+)
+
+_SCALAR_COMPUTE_OP_RE = re.compile(
+    r"(?:\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<|>>|[+\-*/%&|^~]"
+    r"|\b(?:expf?|sqrtf?|rsqrtf?|logf?|tanhf?|fabsf?|fmaxf?|fminf?|powf?|fmaf?)\s*\()",
+)
+
+_BYPASS_DCACHE_RE = re.compile(r"\b(?:tl::)?write_gm_bypass_dcache\b")
+
+_TYPE_BYTES_PATTERNS: tuple[tuple[re.Pattern[str], float], ...] = (
+    (re.compile(r"\b(?:u?int8(?:_t)?|fp8\w*|float8\w*|e4m3\w*|e5m2\w*|char|bool)\b"), 1.0),
+    (
+        re.compile(
+            r"\b(?:half|__fp16|fp16|float16|bfloat16|bf16|__bf16|u?int16(?:_t)?)\b"
+        ),
+        2.0,
+    ),
+    (re.compile(r"\b(?:float32|fp32|float|u?int32(?:_t)?|int)\b"), 4.0),
+    (re.compile(r"\b(?:double|u?int64(?:_t)?)\b"), 8.0),
+)
+
+
+def _elem_bytes_from_type_str(type_str: str) -> float | None:
+    low = type_str.lower()
+    for pattern, size in _TYPE_BYTES_PATTERNS:
+        if pattern.search(low):
+            return size
+    return None
+
+
+def _infer_gm_elem_bytes(text: str, target_ptrs: set[str] | None = None) -> float:
+    tmpl = re.search(r"\b(?:tl::)?write_gm_bypass_dcache\s*<\s*([A-Za-z0-9_]+)", text)
+    if tmpl:
+        inferred = _elem_bytes_from_type_str(tmpl.group(1))
+        if inferred is not None:
+            return inferred
+    for decl_match in re.finditer(
+        r"__gm__\s+([^;(),={}]*?)\*+\s*(?:__restrict__\s*)?([A-Za-z_]\w*)",
+        text,
+    ):
+        type_part, var_name = decl_match.group(1), decl_match.group(2)
+        if target_ptrs and var_name not in target_ptrs:
+            continue
+        inferred = _elem_bytes_from_type_str(type_part)
+        if inferred is not None:
+            return inferred
+    inferred_any = _elem_bytes_from_type_str(text)
+    if inferred_any is not None:
+        return inferred_any
+    return 2.0
+
+
+def _detect_scalar_compute_loop_fallback(
+    res_text: str = "",
+    asm_or_dump_text: str = "",
+) -> dict[str, float]:
+    combined = "\n".join(part for part in (res_text, asm_or_dump_text) if part)
+    explicit = _match_float(
+        (r"\bscalar_compute_loop_fallback\s*[:=]\s*([0-9]*\.?[0-9]+)",),
+        combined,
+    )
+    if explicit is not None:
+        return {"scalar_compute_loop_fallback": float(explicit)} if explicit > 0.0 else {}
+    if re.search(
+        r"\bscalar_compute_loop_fallback\s*[:=]\s*(true|yes)",
+        combined,
+        flags=re.IGNORECASE,
+    ):
+        return {"scalar_compute_loop_fallback": 1.0}
+
+    src = asm_or_dump_text if asm_or_dump_text.strip() else combined
+    cleaned = _strip_cpp_comments(src)
+    if _VEC_MATRIX_INST_RE.search(cleaned):
+        return {}
+
+    for body in _extract_for_loop_bodies(cleaned):
+        has_buf_access = bool(
+            re.search(r"\b[A-Za-z_]\w*\s*\[[^\]]+\]", body)
+            or re.search(r"\*\s*\([^)]+\)", body)
+        )
+        if not has_buf_access:
+            continue
+        norm_body = body.replace("++", " ").replace("--", " ").replace("->", " ")
+        body_no_idx = _strip_subscripts(norm_body)
+        if _SCALAR_COMPUTE_OP_RE.search(body_no_idx):
+            return {"scalar_compute_loop_fallback": 1.0}
+    return {}
+
+
+def _detect_dcache_bypass_narrow_store(
+    res_text: str = "",
+    asm_or_dump_text: str = "",
+) -> dict[str, float]:
+    combined = "\n".join(part for part in (res_text, asm_or_dump_text) if part)
+    explicit = _match_float(
+        (r"\bdcache_bypass_narrow_store\s*[:=]\s*([0-9]*\.?[0-9]+)",),
+        combined,
+    )
+    if explicit is not None:
+        if explicit <= 0.0:
+            return {}
+        return {"dcache_bypass_narrow_store": max(4.0, min(64.0, float(explicit)))}
+
+    src = asm_or_dump_text if asm_or_dump_text.strip() else combined
+    cleaned = _strip_cpp_comments(src)
+    if _BYPASS_DCACHE_RE.search(cleaned):
+        elem_bytes = _infer_gm_elem_bytes(cleaned)
+        amp = max(4.0, min(64.0, 64.0 / elem_bytes))
+        return {"dcache_bypass_narrow_store": amp}
+
+    gm_ptrs = set(
+        re.findall(
+            r"__gm__\s+[^;(),={}]*?\*+\s*(?:__restrict__\s*)?([A-Za-z_]\w*)",
+            cleaned,
+        )
+    )
+    fallback_gm_ptrs = set(re.findall(r"\b(gm_[A-Za-z0-9_]+|[A-Za-z0-9_]+_gm)\b", cleaned))
+    candidate_ptrs = gm_ptrs | fallback_gm_ptrs
+    if not candidate_ptrs:
+        return {}
+
+    matched_ptrs: set[str] = set()
+    ptr_alt = "|".join(re.escape(p) for p in sorted(candidate_ptrs))
+    store_re = re.compile(
+        rf"\b({ptr_alt})\s*\[[^\]]+\]\s*(?:[+\-*/%&|^]?=)(?!=)"
+        rf"|\*\s*\(\s*({ptr_alt})\b[^)]*\)\s*(?:[+\-*/%&|^]?=)(?!=)"
+    )
+    for body in _extract_for_loop_bodies(cleaned):
+        for match in store_re.finditer(body):
+            ptr_name = match.group(1) or match.group(2)
+            if ptr_name:
+                matched_ptrs.add(ptr_name)
+
+    if not matched_ptrs:
+        return {}
+    elem_bytes = _infer_gm_elem_bytes(cleaned, target_ptrs=matched_ptrs)
+    if elem_bytes >= 32.0:
+        return {}
+    amp = max(4.0, min(64.0, 64.0 / elem_bytes))
+    return {"dcache_bypass_narrow_store": amp}
+
+
 def _detect_spill_and_stack(res_text: str = "", asm_or_dump_text: str = "") -> dict[str, int]:
     combined = "\n".join(part for part in (res_text, asm_or_dump_text) if part)
     vec_regs = _match_int(
@@ -393,6 +598,40 @@ def _penalty_dcache_dcci(summary: BishengResourceSummary, ctx: Mapping[str, Any]
         return 0.0
     base_ref = float(ctx.get("base_ref", 1.0))
     return min(2.0 * base_ref, float(summary.dcache_dcci_flushes) * max(1.5, 0.08 * base_ref))
+
+
+def _ctx_float(ctx: Mapping[str, object], key: str, default: float = 0.0) -> float:
+    raw = ctx.get(key)
+    if isinstance(raw, bool):
+        return default
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    return default
+
+
+def _penalty_scalar_compute_loop_fallback(
+    summary: BishengResourceSummary,
+    ctx: Mapping[str, object],
+) -> float:
+    severity = float(summary.extra_signals.get("scalar_compute_loop_fallback", 0.0) or 0.0)
+    if severity <= 0.0:
+        return 0.0
+    base_ref = max(1.0, _ctx_float(ctx, "base_ref", 1.0))
+    vec_floor_us = max(0.0, _ctx_float(ctx, "vec_floor_us", 0.0))
+    return max(vec_floor_us * 4.0, base_ref * 2.5) * min(4.0, severity)
+
+
+def _penalty_dcache_bypass_narrow_store(
+    summary: BishengResourceSummary,
+    ctx: Mapping[str, object],
+) -> float:
+    amp = float(summary.extra_signals.get("dcache_bypass_narrow_store", 0.0) or 0.0)
+    if amp <= 1.0:
+        return 0.0
+    base_ref = max(1.0, _ctx_float(ctx, "base_ref", 1.0))
+    hbm_floor_us = max(0.0, _ctx_float(ctx, "hbm_floor_us", 0.0))
+    eff_hbm = hbm_floor_us if hbm_floor_us > 0.0 else base_ref * 0.25
+    return eff_hbm * 0.5 * max(0.0, amp - 1.0)
 
 
 def _invoke_parse_fn(parse_fn: Callable[..., Any], res_text: str, asm_or_dump_text: str) -> Any:
@@ -638,6 +877,18 @@ def _build_default_registry() -> CompilerBehaviorRegistry:
         _penalty_dcache_dcci,
         summary_field="dcache_dcci_flushes",
         description="(g) Scalar dcci D-cache invalidation storms inside loops",
+    )
+    reg.register(
+        "scalar_compute_loop_fallback",
+        _detect_scalar_compute_loop_fallback,
+        _penalty_scalar_compute_loop_fallback,
+        description="(h) Scalar for-loop arithmetic/bitwise compute with zero vector/matrix ops",
+    )
+    reg.register(
+        "dcache_bypass_narrow_store",
+        _detect_dcache_bypass_narrow_store,
+        _penalty_dcache_bypass_narrow_store,
+        description="(i) Bypass-DCache or sub-32B elementwise GM stores causing 64B amplification",
     )
     return reg
 

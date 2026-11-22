@@ -701,10 +701,13 @@ def test_residual_basis_context_and_registry_validation() -> None:
     assert math.isclose(named["log_tier0_scale"], math.log1p(100.0) / 10.0)
 
 
-def test_unpenalized_intercept_and_widened_head0_cap_capture_cold_start_headroom() -> None:
-    """Capture large cold-start residuals while keeping Head-2 pairwise deltas bounded in +-2.5."""
+def test_unpenalized_intercept_and_widened_head0_cap_capture_cold_start_headroom(
+    tmp_path: Path,
+) -> None:
+    """Capture cold-start residuals up to 2.5 while quarantining extreme >2.5 outliers."""
     target = AscendTarget("ascend.950pr")
-    model = HybridAscendCostModel(target, ridge_alpha=1.0)
+    lake_dir = tmp_path / "lake"
+    model = HybridAscendCostModel(target, ridge_alpha=1.0, anomaly_lake=lake_dir)
     axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
     wl = CostFeatures(
         vec_flops=2e10,
@@ -716,11 +719,20 @@ def test_unpenalized_intercept_and_widened_head0_cap_capture_cold_start_headroom
     t0_us = model.predict(wl).tier0_physics_us
     assert t0_us > 0.0
     for _ in range(10):
-        model.observe(wl, 100.0 * t0_us, persist=False, refit=False)
+        model.observe(wl, 10.0 * t0_us, persist=False, refit=False)
     model._refit_ridge()
 
     pred = model.predict(wl)
-    assert pred.tier2_residual_factor > 20.0
+    assert pred.tier2_residual_factor > 8.0
+
+    sample_count_before = len(model._samples)
+    model.observe(wl, 100.0 * t0_us, persist=False, refit=False)
+    assert len(model._samples) == sample_count_before
+    anomaly_file = lake_dir / "unmodeled_anomalies.jsonl"
+    assert anomaly_file.is_file()
+    anomaly_rows = [json.loads(ln) for ln in anomaly_file.read_text(encoding="utf-8").splitlines() if ln]
+    assert len(anomaly_rows) == 1
+    assert anomaly_rows[0]["log_residual"] > 2.5
 
     wl_faster = CostFeatures(
         vec_flops=2e10,
