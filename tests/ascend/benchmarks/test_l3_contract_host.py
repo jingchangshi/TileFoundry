@@ -1612,15 +1612,46 @@ def test_generic_outer_axis_perturbation_and_failure_recording(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     acceptance = _acceptance_module()
-    safe_tensors = [torch.randn(8, 64), torch.randn(64)]
-    perturbed = acceptance._perturb_outer_axis_tensors(safe_tensors, {})
-    assert isinstance(perturbed, list)
-    assert tuple(perturbed[0].shape) == (7, 64)
-    assert tuple(perturbed[1].shape) == (64,)
+    safe_step1_tensors = [torch.randn(64, 16), torch.randn(16)]
+    perturbed_step1 = acceptance._perturb_outer_axis_tensors(safe_step1_tensors, {})
+    assert isinstance(perturbed_step1, list)
+    assert tuple(perturbed_step1[0].shape) == (63, 16)
+    assert tuple(perturbed_step1[1].shape) == (16,)
 
-    assert acceptance._perturb_outer_axis_tensors([torch.randn(3, 64)], {}) is None
-    assert acceptance._perturb_outer_axis_tensors([torch.randn(8, 8)], {}) is None
-    assert acceptance._perturb_outer_axis_tensors([torch.randn(8, 64)], {"rows": 8}) is None
+    safe_step32_tensors = [torch.randn(128, 64), torch.randn(64)]
+    perturbed_step32 = acceptance._perturb_outer_axis_tensors(safe_step32_tensors, {"dim": -1})
+    assert isinstance(perturbed_step32, list)
+    assert tuple(perturbed_step32[0].shape) == (96, 64)
+    assert tuple(perturbed_step32[1].shape) == (64,)
+
+    assert acceptance._perturb_outer_axis_tensors([torch.randn(63, 64)], {}) is None
+    assert acceptance._perturb_outer_axis_tensors([torch.randn(8, 64)], {}) is None
+    assert acceptance._perturb_outer_axis_tensors([torch.randn(128, 128)], {}) is None
+    assert acceptance._perturb_outer_axis_tensors([torch.randn(128, 64)], {"rows": 128}) is None
+    assert acceptance._perturb_outer_axis_tensors([torch.randn(512, 2049)], {"dim": 0}) is None
+    assert acceptance._perturb_outer_axis_tensors([torch.randn(512, 2049)], {"dim": -2}) is None
+    assert acceptance._perturb_outer_axis_tensors([torch.randn(512, 2049)], {"axis": 0}) is None
+    assert (
+        acceptance._perturb_outer_axis_tensors(
+            [torch.randn(128, 64)],
+            {"group_list": [64, 128]},
+        )
+        is None
+    )
+    assert (
+        acceptance._perturb_outer_axis_tensors(
+            [torch.randn(128, 64)],
+            {"meta": {"split": 2}},
+        )
+        is None
+    )
+    assert (
+        acceptance._perturb_outer_axis_tensors(
+            [torch.randn(128, 64), torch.randn(128)],
+            {},
+        )
+        is None
+    )
 
     contract = l3_contract.TargetContract(
         operator="fake_op",
@@ -1631,7 +1662,7 @@ def test_generic_outer_axis_perturbation_and_failure_recording(
     )
     recorder = l3_contract.EvidenceRecorder(tmp_path / "evidence.json", contract)
     case = cannbench_contract.Case(case_num=1, label="level1/fake_op_1", attrs={})
-    pass1_tensors = [torch.randn(8, 64), torch.randn(64)]
+    pass1_tensors = [torch.randn(96, 64), torch.randn(64)]
     fake_harness = SimpleNamespace(
         cases=[case],
         prepare=lambda _case: pass1_tensors,

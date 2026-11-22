@@ -5527,7 +5527,14 @@ class PerfTargetCampaignRunner:
         escalated: bool,
     ) -> tuple[str, str, str, BeamCandidate | None, str]:
         """Select parent module, full slice snippet, lane, and stepping stone cleanly."""
-        _, default_snippet = extract_regime_snippet(incumbent_source, regime_spec)
+        _, default_snippet = extract_regime_snippet(
+            incumbent_source,
+            regime_spec,
+            operator_entrypoint=_resolve_operator_entrypoint_safe(
+                self._config.operator_name
+            ),
+            sibling_specs=self._regime_specs,
+        )
         if not escalated:
             return incumbent_source, default_snippet, "exploit", None, ""
         for stone in regime_beam.stepping_stone_beam:
@@ -5554,7 +5561,14 @@ class PerfTargetCampaignRunner:
                         l0_probe.error_message[:160],
                     )
                     continue
-                _, hydrated_snippet = extract_regime_snippet(stone_patched, regime_spec)
+                _, hydrated_snippet = extract_regime_snippet(
+                    stone_patched,
+                    regime_spec,
+                    operator_entrypoint=_resolve_operator_entrypoint_safe(
+                        self._config.operator_name
+                    ),
+                    sibling_specs=self._regime_specs,
+                )
                 regime_beam.mark_parent_selected(stone)
                 hyp = stone.hypothesis if stone.worker_kind == "creative_explore" else ""
                 return stone_patched, hydrated_snippet, "stepping_stone", stone, hyp
@@ -6894,7 +6908,14 @@ class PerfTargetCampaignRunner:
         self._active_incumbent_source = incumbent_source
         self._active_regime_tag = regime_spec.regime_tag
         regime_beam = self.beam_for_regime(regime_spec.regime_tag)
-        func_name, _default_snippet = extract_regime_snippet(incumbent_source, regime_spec)
+        func_name, _default_snippet = extract_regime_snippet(
+            incumbent_source,
+            regime_spec,
+            operator_entrypoint=_resolve_operator_entrypoint_safe(
+                self._config.operator_name
+            ),
+            sibling_specs=self._regime_specs,
+        )
 
         escalated = stagnation_rounds >= self._config.stagnation_escalate_rounds
         creative_effort = "high"
@@ -7900,7 +7921,14 @@ class PerfTargetCampaignRunner:
                 regime_tag=regime_spec.regime_tag,
             )
             try:
-                _, canonical_slice = extract_regime_snippet(chk.patched_module_source, regime_spec)
+                _, canonical_slice = extract_regime_snippet(
+                    chk.patched_module_source,
+                    regime_spec,
+                    operator_entrypoint=_resolve_operator_entrypoint_safe(
+                        self._config.operator_name
+                    ),
+                    sibling_specs=self._regime_specs,
+                )
             except (SyntaxError, ValueError):
                 canonical_slice = chk.snippet_source
 

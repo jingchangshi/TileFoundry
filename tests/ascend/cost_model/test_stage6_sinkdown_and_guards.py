@@ -276,3 +276,35 @@ def test_topology_bucket_and_basis_gates_remain_intact() -> None:
         "is_aic_only": 8,
         "is_irregular_simt": 8,
     }
+
+
+def test_observe_pair_delta_skips_extreme_single_point_outliers() -> None:
+    """Head-2 observe_pair_delta skips pairs whose candidate or parent residual exceeds 2.5."""
+    target = AscendTarget("ascend.950pr")
+    model = HybridAscendCostModel(target)
+    axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
+    parent_wl = CostFeatures(
+        vec_flops=2.0e10,
+        gm_bytes=16.0e6,
+        total_tiles=56,
+        contig_burst_bytes=32768,
+        topology_axes=axes,
+    )
+    cand_wl = CostFeatures(
+        vec_flops=2.0e10,
+        gm_bytes=16.0e6,
+        total_tiles=84,
+        contig_burst_bytes=16384,
+        topology_axes=axes,
+    )
+    base_p = max(1e-6, model._compute_tier0_and_tier1(parent_wl).tier0_us)
+    base_c = max(1e-6, model._compute_tier0_and_tier1(cand_wl).tier0_us)
+
+    model.observe_pair_delta(cand_wl, base_c * 1.2, parent_wl, base_p * 1.1)
+    assert len(model._pair_deltas) == 1
+
+    model.observe_pair_delta(cand_wl, base_c * math.exp(2.6), parent_wl, base_p * 1.1)
+    assert len(model._pair_deltas) == 1
+
+    model.observe_pair_delta(cand_wl, base_c * 1.2, parent_wl, base_p * math.exp(-2.6))
+    assert len(model._pair_deltas) == 1

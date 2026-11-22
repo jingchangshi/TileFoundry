@@ -159,12 +159,17 @@ def test_head2_uses_only_within_case_varying_specs_and_roundtrips(tmp_path: Path
         topology_axes=axes,
     )
 
+    base_fast_us = model.predict(wl_fast).pred_us
+    base_slow_us = model.predict(wl_slow).pred_us
+    fast_us = base_fast_us * 0.9
+    slow_us = base_slow_us * 1.4
+
     for _ in range(3):
-        model.observe_pair_delta(wl_fast, 40.0, wl_slow, 160.0)
+        model.observe_pair_delta(wl_fast, fast_us, wl_slow, slow_us)
     assert model.active_head2_spec_names() == ()
     assert all(w == 0.0 for w in model.delta_weights)
 
-    model.observe_pair_delta(wl_fast, 40.0, wl_slow, 160.0)
+    model.observe_pair_delta(wl_fast, fast_us, wl_slow, slow_us)
     assert set(model.active_head2_spec_names()) == {
         "wave_tail_waste",
         "short_dma_burst_ind",
@@ -175,7 +180,7 @@ def test_head2_uses_only_within_case_varying_specs_and_roundtrips(tmp_path: Path
             assert val == 0.0
 
     for _ in range(2):
-        model.observe_pair_delta(wl_slow, 160.0, wl_fast, 40.0)
+        model.observe_pair_delta(wl_slow, slow_us, wl_fast, fast_us)
     assert len(model.active_head2_spec_names()) == 8
     ratio_fast = model.predict_delta_ratio(wl_fast, wl_slow)
     ratio_slow = model.predict_delta_ratio(wl_slow, wl_fast)

@@ -663,15 +663,26 @@ def _perturb_outer_axis_tensors(
     tensors: object,
     attrs: Mapping[str, object],
 ) -> object | None:
+    if "group_list" in attrs or any(
+        isinstance(val, (list, tuple, dict)) for val in attrs.values()
+    ):
+        return None
     flat = _collect_tensors(tensors)
     candidates = [
         tensor
         for tensor in flat
-        if tensor.ndim >= 2 and tensor.shape[0] >= 4 and tensor.is_floating_point()
+        if tensor.ndim >= 2 and tensor.shape[0] >= 64 and tensor.is_floating_point()
     ]
     if not candidates:
         return None
+    for axis_key in ("dim", "axis"):
+        raw_dim = attrs.get(axis_key)
+        if isinstance(raw_dim, int) and not isinstance(raw_dim, bool):
+            if any(raw_dim in (0, -tensor.ndim) for tensor in candidates):
+                return None
     outer_dim = candidates[0].shape[0]
+    if any(tensor.ndim == 1 and tensor.shape[0] == outer_dim for tensor in flat):
+        return None
     if any(outer_dim in tensor.shape[1:] for tensor in flat if tensor.ndim >= 2):
         return None
     if any(
@@ -679,9 +690,10 @@ def _perturb_outer_axis_tensors(
         for val in attrs.values()
     ):
         return None
+    step = 32 if outer_dim % 32 == 0 and outer_dim > 64 else 1
     return cannbench_contract.map_tensors(
         tensors,
-        lambda t: t[:-1].contiguous()
+        lambda t: t[:-step].contiguous()
         if isinstance(t, torch.Tensor) and t.ndim >= 2 and t.shape[0] == outer_dim
         else t,
     )

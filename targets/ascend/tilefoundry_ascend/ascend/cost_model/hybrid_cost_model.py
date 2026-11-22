@@ -1581,15 +1581,19 @@ class HybridAscendCostModel:
         t01_p = self._compute_tier0_and_tier1(cf_p)
         base_c = max(1e-6, t01_c.tier0_us + t01_c.tier1_penalty_us)
         base_p = max(1e-6, t01_p.tier0_us + t01_p.tier1_penalty_us)
+        cand_log_res = math.log(float(cand_us) / base_c)
+        parent_log_res = math.log(float(parent_us) / base_p)
+        actual_log_ratio = math.log(float(cand_us) / float(parent_us))
+        analytical_log_ratio = math.log(base_c / base_p)
+        delta_y = max(-2.5, min(2.5, actual_log_ratio - analytical_log_ratio))
+        if abs(cand_log_res) > 2.5 or abs(parent_log_res) > 2.5:
+            return delta_y
         head2_specs = self._basis_registry.head2_specs()
         named_delta = {
             spec.name: t01_c.named_features.get(spec.name, 0.0)
             - t01_p.named_features.get(spec.name, 0.0)
             for spec in head2_specs
         }
-        actual_log_ratio = math.log(float(cand_us) / float(parent_us))
-        analytical_log_ratio = math.log(base_c / base_p)
-        delta_y = max(-2.5, min(2.5, actual_log_ratio - analytical_log_ratio))
         self._pair_deltas.append((named_delta, delta_y))
         if refit:
             self._refit_delta_ridge()
