@@ -94,6 +94,7 @@ class StaticDynamicResidual:
     observation: ObservationVector5D | None = None
     transfer_inflation_ratio: float = 0.0
     effective_compute_eta: float = 0.0
+    stack_bytes: int = 0
 
     @property
     def has_l1_compiler_summary(self) -> bool:
@@ -117,6 +118,7 @@ class StaticDynamicResidual:
             "unexplained_gap_ratio": self.unexplained_gap_ratio,
             "pseudo_double_buffer_serialized": self.pseudo_double_buffer_serialized,
             "spill_bytes": self.spill_bytes,
+            "stack_bytes": self.stack_bytes,
             "bank_conflict_ratio": self.bank_conflict_ratio,
             "l2_hit_rate": self.l2_hit_rate,
             "vf_fusion_breaks": self.vf_fusion_breaks,
@@ -163,6 +165,11 @@ class StaticDynamicResidual:
             if observation is not None
             else 0.0
         )
+        default_stack = (
+            int(getattr(observation.onchip_sram_reg, "l1_stack_bytes", 0) or 0)
+            if observation is not None
+            else 0
+        )
         return cls(
             measured_latency_us=float(payload.get("measured_latency_us", 0.0)),
             predicted_bottleneck_util=float(payload.get("predicted_bottleneck_util", 0.0)),
@@ -175,6 +182,7 @@ class StaticDynamicResidual:
                 payload.get("pseudo_double_buffer_serialized", False)
             ),
             spill_bytes=int(payload.get("spill_bytes", 0)),
+            stack_bytes=max(0, _read_int(payload, "stack_bytes", default=default_stack)),
             bank_conflict_ratio=float(payload.get("bank_conflict_ratio", 0.0)),
             l2_hit_rate=float(payload.get("l2_hit_rate", 1.0)),
             vf_fusion_breaks=max(0, int(payload.get("vf_fusion_breaks", 0) or 0)),
@@ -267,6 +275,8 @@ def compute_static_dynamic_residual(
     )
     comp_spill = compiler_summary.spill_bytes if compiler_summary is not None else 0
     spill_bytes = max(0, comp_spill, _read_int(telemetry, "spill_bytes"))
+    comp_stack = compiler_summary.stack_bytes if compiler_summary is not None else 0
+    stack_bytes = max(0, comp_stack, _read_int(telemetry, "stack_bytes"))
     bank_conflict_ratio = max(
         0.0,
         min(
@@ -380,6 +390,7 @@ def compute_static_dynamic_residual(
         observation=observation,
         transfer_inflation_ratio=transfer_inflation_ratio,
         effective_compute_eta=observation.effective_compute_eta,
+        stack_bytes=stack_bytes,
     )
 
 
@@ -407,7 +418,7 @@ def compiler_summary_from_residual(
         vec_regs=observation.onchip_sram_reg.l1_vec_regs,
         scalar_regs=observation.onchip_sram_reg.l1_scalar_regs,
         spill_bytes=observation.onchip_sram_reg.l1_spill_bytes,
-        stack_bytes=observation.onchip_sram_reg.l1_stack_bytes,
+        stack_bytes=max(observation.onchip_sram_reg.l1_stack_bytes, residual.stack_bytes),
         vloopv2_loops=observation.compute_issue.l1_vloopv2_loops,
         software_loops=observation.compute_issue.l1_software_loops,
         has_local_membar_in_vf_call=observation.pipeline_sync.l1_local_membar_in_vf,
@@ -584,12 +595,15 @@ def _has_split_kv_multi(tree: ast.AST, dsl_source: str) -> bool:
 _SYNC_NOTIFY_EVENT_RE = re.compile(
     r"asc_sync_notify\s*\([^,]+,[^,]+,\s*((?:[^()]+|\([^()]*\))+)\)"
 )
+_CPP_CUBE_MMAD_RE = re.compile(
+    r"\b(?:asc_mmad(?:_mx|_sparse)?|ascend_gemm_l1)\s*(?:<[^;{}()]*>)?\s*\("
+)
 
 
 def extract_cpp_trackb_signature_tags(cpp_source: str) -> set[str]:
     """Extract structural mechanism tags from tl_templates/ascend C++20 kernel bodies."""
     tags: set[str] = set()
-    if "asc_mmad(" in cpp_source:
+    if _CPP_CUBE_MMAD_RE.search(cpp_source):
         tags.add("cpp:cube_mmad")
     if "asc_copy_gm2l1_nd2nz(" in cpp_source:
         tags.add("cpp:gm2l1_nd2nz")

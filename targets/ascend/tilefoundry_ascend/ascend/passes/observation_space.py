@@ -128,6 +128,12 @@ class PhysicalLedgerLike(Protocol):
     def has_lowbit_quant(self) -> bool: ...
 
     @property
+    def ub_scalar_compute_loops(self) -> int: ...
+
+    @property
+    def min_gm_dma_bytes(self) -> int: ...
+
+    @property
     def microarch_profile(self) -> Mapping[str, object]: ...
 
 
@@ -166,6 +172,9 @@ class CompilerSummaryLike(Protocol):
 
     @property
     def dcache_dcci_flushes(self) -> int: ...
+
+    @property
+    def extra_signals(self) -> Mapping[str, float]: ...
 
 
 def _as_int(value: object, default: int = 0) -> int:
@@ -358,6 +367,8 @@ class ComputeIssueAxis:
     l2_roofline_eta: float = 0.0
     effective_compute_eta: float = 0.0
     l0_aiv_subcore_imbalance: bool = False
+    l0_ub_scalar_compute_loops: int = 0
+    l1_scalar_compute_loop_fallback: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -375,6 +386,9 @@ class OffChipMemoryDmaAxis:
     l2_fixpipe_ratio: float = 0.0
     l2_cache_hit_rate: float = 1.0
     transfer_inflation_ratio: float = 0.0
+    l0_min_gm_dma_bytes: int = 0
+    l0_fixpipe_cycles: int = 0
+    l1_dcache_bypass_narrow_store: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -445,6 +459,10 @@ class AxisResidual5D:
     def unlock_causal_facets(self, current: ConstraintRelaxationMask) -> ConstraintRelaxationMask:
         """Map active axis residuals 1:1 onto minimal MECE 7-facet permission unlocks."""
         to_unlock: list[str] = []
+        if self.compute_issue_gap >= 0.45:
+            to_unlock.append("alg_compute_and_monoid")
+        if self.onchip_sram_reg_gap >= 0.45 or self.grid_wave_gap >= 0.40:
+            to_unlock.append("tile_and_stage_knobs")
         if self.compute_issue_gap >= 0.25:
             to_unlock.append("exec_mode_and_spr")
         if self.offchip_dma_gap >= 0.25:
@@ -498,6 +516,11 @@ class ObservationVector5D:
         aiv0_v = _as_int(ledger.pipe_cycles.get("AIV0.PIPE_V"))
         aiv1_v = _as_int(ledger.pipe_cycles.get("AIV1.PIPE_V"))
         vec_cycles = aiv0_v + aiv1_v
+        fixpipe_cycles = (
+            _as_int(ledger.pipe_cycles.get("AIC.PIPE_FIX"))
+            if "AIC.PIPE_FIX" in ledger.pipe_cycles
+            else _as_int(ledger.pipe_cycles.get("PIPE_FIX"))
+        )
         ub_waterline = ledger.waterlines.get("UB")
         l1_waterline = ledger.waterlines.get("L1")
         degraded_count = sum(
@@ -516,6 +539,10 @@ class ObservationVector5D:
         alias_serialized = compiler.alias_serialized_buffers if compiler is not None else 0
         dual_issue_collapse = compiler.dual_issue_ipc_collapse if compiler is not None else 0.0
         dcci_flushes = compiler.dcache_dcci_flushes if compiler is not None else 0
+        raw_extra = getattr(compiler, "extra_signals", None) if compiler is not None else None
+        extra_signals = raw_extra if isinstance(raw_extra, Mapping) else {}
+        ub_loops = max(0, _as_int(getattr(ledger, "ub_scalar_compute_loops", 0)))
+        min_dma = max(0, _as_int(getattr(ledger, "min_gm_dma_bytes", 0)))
 
         subkernel_count = max(1, _as_int(ledger.microarch_profile.get("subkernel_count"), 1))
         mte2_bytes_hint = _as_int(ledger.microarch_profile.get("mte2_bytes_hint"), 0)
@@ -544,6 +571,17 @@ class ObservationVector5D:
         else:
             effective_compute_eta = max(0.0, _telemetry_float(tel, "effective_compute_eta"))
 
+        scalar_loop_fallback = max(
+            float(ub_loops),
+            _as_float(extra_signals.get("scalar_compute_loop_fallback")),
+            _telemetry_float(tel, "scalar_compute_loop_fallback"),
+        )
+        narrow_store_bypass = max(
+            _as_float(extra_signals.get("dcache_bypass_narrow_store")),
+            _telemetry_float(tel, "dcache_bypass_narrow_store"),
+            (32.0 / float(min_dma)) if 0 < min_dma < 32 else 0.0,
+        )
+
         return cls(
             compute_issue=ComputeIssueAxis(
                 l0_cube_cycles=cube_cycles,
@@ -558,6 +596,8 @@ class ObservationVector5D:
                 l2_roofline_eta=_telemetry_float(tel, "roofline_eta"),
                 effective_compute_eta=effective_compute_eta,
                 l0_aiv_subcore_imbalance=(aiv0_v > 0 and aiv1_v == 0),
+                l0_ub_scalar_compute_loops=ub_loops,
+                l1_scalar_compute_loop_fallback=scalar_loop_fallback,
             ),
             offchip_dma=OffChipMemoryDmaAxis(
                 l0_gm_roundtrip_bytes=ledger.gm_roundtrip_bytes,
@@ -573,6 +613,9 @@ class ObservationVector5D:
                     tel, "l2_hit_rate", "l2_cache_hit_rate", default=1.0
                 ),
                 transfer_inflation_ratio=transfer_inflation_ratio,
+                l0_min_gm_dma_bytes=min_dma,
+                l0_fixpipe_cycles=fixpipe_cycles,
+                l1_dcache_bypass_narrow_store=narrow_store_bypass,
             ),
             onchip_sram_reg=OnChipSramRegAxis(
                 l0_max_overflow_bytes=ledger.max_overflow_bytes,
@@ -649,11 +692,21 @@ class ObservationVector5D:
             and self.compute_issue.l2_aiv_vec_ratio < 0.02
             and self.compute_issue.l2_aic_mac_ratio == 0.0
         )
+        scalar_loop_hazard = min(
+            1.0,
+            0.5
+            * max(
+                0.0,
+                float(self.compute_issue.l0_ub_scalar_compute_loops),
+                self.compute_issue.l1_scalar_compute_loop_fallback,
+            ),
+        )
         compute_gap = min(
             1.0,
             max(
                 1.0 if scalar_trap else 0.0,
                 sw_loop_penalty,
+                scalar_loop_hazard,
                 self.compute_issue.l1_dual_issue_collapse,
                 0.25 * min(4, self.compute_issue.l1_vf_fusion_breaks),
                 roofline_gap,
@@ -664,6 +717,10 @@ class ObservationVector5D:
             if self.offchip_dma.transfer_inflation_ratio > 1.30
             else 0.0
         )
+        narrow_store_hazard = min(
+            1.0,
+            max(0.0, self.offchip_dma.l1_dcache_bypass_narrow_store) / 4.0,
+        )
         dma_gap = min(
             1.0,
             max(
@@ -672,6 +729,7 @@ class ObservationVector5D:
                 1.0 - self.offchip_dma.l2_cache_hit_rate,
                 0.35 if self.offchip_dma.l1_dcache_dcci_flushes > 0 else 0.0,
                 inflation_gap,
+                narrow_store_hazard,
             ),
         )
         sram_gap = min(
@@ -679,6 +737,7 @@ class ObservationVector5D:
             max(
                 1.0 if self.onchip_sram_reg.l0_max_overflow_bytes > 0 else 0.0,
                 min(1.0, float(self.onchip_sram_reg.l1_spill_bytes) / 256.0),
+                min(1.0, max(0.0, float(self.onchip_sram_reg.l1_stack_bytes)) / 1024.0),
                 self.onchip_sram_reg.l2_bank_conflict_ratio,
                 self.onchip_sram_reg.l0_ub_bank_conflict_risk,
             ),
@@ -753,6 +812,12 @@ class ObservationVector5D:
                 l0_aiv_subcore_imbalance=_as_bool(
                     compute_payload.get("l0_aiv_subcore_imbalance")
                 ),
+                l0_ub_scalar_compute_loops=_as_int(
+                    compute_payload.get("l0_ub_scalar_compute_loops")
+                ),
+                l1_scalar_compute_loop_fallback=_as_float(
+                    compute_payload.get("l1_scalar_compute_loop_fallback")
+                ),
             ),
             offchip_dma=OffChipMemoryDmaAxis(
                 l0_gm_roundtrip_bytes=_as_int(dma_payload.get("l0_gm_roundtrip_bytes")),
@@ -768,6 +833,11 @@ class ObservationVector5D:
                 l2_fixpipe_ratio=_as_float(dma_payload.get("l2_fixpipe_ratio")),
                 l2_cache_hit_rate=_as_float(dma_payload.get("l2_cache_hit_rate"), 1.0),
                 transfer_inflation_ratio=_as_float(raw_inflation),
+                l0_min_gm_dma_bytes=_as_int(dma_payload.get("l0_min_gm_dma_bytes")),
+                l0_fixpipe_cycles=_as_int(dma_payload.get("l0_fixpipe_cycles")),
+                l1_dcache_bypass_narrow_store=_as_float(
+                    dma_payload.get("l1_dcache_bypass_narrow_store")
+                ),
             ),
             onchip_sram_reg=OnChipSramRegAxis(
                 l0_max_overflow_bytes=_as_int(sram_payload.get("l0_max_overflow_bytes")),
