@@ -17,7 +17,7 @@
 
   <!-- Header -->
   <text x="800" y="44" text-anchor="middle" font-size="24" font-weight="700" fill="#0F172A">TileFoundry Ascend End-to-End Architecture</text>
-  <text x="800" y="70" text-anchor="middle" font-size="14" font-weight="500" fill="#475569">Five Orthogonal Architectural Planes, Mechanism Sink-Down, &amp; Signed Hardware Verification</text>
+  <text x="800" y="70" text-anchor="middle" font-size="14" font-weight="500" fill="#475569">DaVinci950 (dav-3510, CANN 9.3) · Five Orthogonal Planes, Mechanism Sink-Down &amp; Signed Verification</text>
 
   <!-- PLANE 1 -->
   <rect x="40" y="96" width="1410" height="164" rx="12" fill="#EFF6FF" stroke="#3B82F6" stroke-width="2"/>
@@ -33,7 +33,7 @@
 
   <rect x="620" y="142" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#93C5FD" stroke-width="1.5"/>
   <text x="744" y="176" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Real-Anchor Specialization</text>
-  <text x="744" y="200" text-anchor="middle" font-size="12" fill="#475569">Pre-lowering symbolic simplification</text>
+  <text x="744" y="200" text-anchor="middle" font-size="12" fill="#475569">Positional binding &amp; non-zero div guard</text>
 
   <rect x="904" y="142" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#93C5FD" stroke-width="1.5"/>
   <text x="1028" y="176" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Two-Snapshot Lowering Diff</text>
@@ -83,7 +83,7 @@
 
   <rect x="64" y="538" width="236" height="96" rx="8" fill="#FFFFFF" stroke="#FCD34D" stroke-width="1.5"/>
   <text x="182" y="572" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Compiler Pattern Detectors</text>
-  <text x="182" y="596" text-anchor="middle" font-size="12" fill="#475569">Scalar loop &amp; narrow bypass traps</text>
+  <text x="182" y="596" text-anchor="middle" font-size="12" fill="#475569">8 detectors incl. .asc UB scalar loops</text>
 
   <rect x="336" y="538" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#FCD34D" stroke-width="1.5"/>
   <text x="460" y="572" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Analytical Hardware Model</text>
@@ -111,12 +111,12 @@
   <text x="64" y="718" font-size="15" font-weight="700" fill="#7E22CE">PLANE 4 — DUAL-TRACK NEURO-SYMBOLIC EVOLUTION PLANE</text>
 
   <rect x="64" y="736" width="236" height="96" rx="8" fill="#FFFFFF" stroke="#D8B4FE" stroke-width="1.5"/>
-  <text x="182" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Capability Track Router</text>
-  <text x="182" y="794" text-anchor="middle" font-size="12" fill="#475569">High-level pipeline vs explicit template</text>
+  <text x="182" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Zero-Phi MECE Track Router</text>
+  <text x="182" y="794" text-anchor="middle" font-size="12" fill="#475569">TopologyAxes, ISAGap &amp; physics ratios</text>
 
   <rect x="336" y="736" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#D8B4FE" stroke-width="1.5"/>
-  <text x="460" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Progressive Redline Constraints</text>
-  <text x="460" y="794" text-anchor="middle" font-size="12" fill="#475569">Unified Layer 1/2/3 &amp; escape paths</text>
+  <text x="460" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">On-Demand Layer-2 &amp; Redlines</text>
+  <text x="460" y="794" text-anchor="middle" font-size="12" fill="#475569">CANN 9.3 pruned API, G1..G5 &amp; guards</text>
 
   <rect x="620" y="736" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#D8B4FE" stroke-width="1.5"/>
   <text x="744" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Parent Monotonicity Lock</text>
@@ -124,11 +124,11 @@
 
   <rect x="904" y="736" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#D8B4FE" stroke-width="1.5"/>
   <text x="1028" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Bounded Creative Exploration</text>
-  <text x="1028" y="794" text-anchor="middle" font-size="12" fill="#475569">Rule-blind proposals under latency cap</text>
+  <text x="1028" y="794" text-anchor="middle" font-size="12" fill="#475569">+4 Stage-0 refine &amp; rule-blind explore</text>
 
   <rect x="1188" y="736" width="238" height="96" rx="8" fill="#FFFFFF" stroke="#D8B4FE" stroke-width="1.5"/>
-  <text x="1307" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Counterfactual Causal Flywheel</text>
-  <text x="1307" y="794" text-anchor="middle" font-size="12" fill="#475569">Bayesian knowledge &amp; sink-down growth</text>
+  <text x="1307" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">40-Rule Causal Flywheel</text>
+  <text x="1307" y="794" text-anchor="middle" font-size="12" fill="#475569">R01..R40, l2_pmu guard &amp; Bayesian KB</text>
 
   <path d="M 300 784 L 334 784" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
   <path d="M 584 784 L 618 784" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
@@ -157,7 +157,7 @@
 
   <rect x="1188" y="934" width="238" height="96" rx="8" fill="#FFFFFF" stroke="#94A3B8" stroke-width="1.5"/>
   <text x="1307" y="968" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">Level 4: Signed NPU Receipts</text>
-  <text x="1307" y="992" text-anchor="middle" font-size="12" fill="#475569">Isolated lease &amp; official benchmark</text>
+  <text x="1307" y="992" text-anchor="middle" font-size="12" fill="#475569">Worktree-isolated lease &amp; cannSeries v2</text>
 
   <path d="M 300 982 L 334 982" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
   <path d="M 584 982 L 618 982" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>

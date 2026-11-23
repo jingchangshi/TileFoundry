@@ -3,7 +3,7 @@ flowchart TB
     direction LR
     C1["Operator Contract & Shape Anchors"]
     C2["Unified ascend_compile_session (HIR -> TIR)"]
-    C3["Pre-Lowering Anchor Specialization (PrimFunc.specialize)"]
+    C3["Positional Anchor Specialization (PrimFunc.specialize + Non-Zero Div Bound)"]
     C4["EnvelopeInspector Two-Snapshot Lowering Diff"]
     C5["SILVerifier (14 Redlines + Cross-Core CFG) & Z3 Pipeline"]
     C1 --> C2 --> C3 --> C4 --> C5
@@ -21,7 +21,7 @@ flowchart TB
 
   subgraph P3["Plane 3: BiSheng Sink-Down & 3-Tier Residual Cost Plane"]
     direction LR
-    B1["CompilerBehaviorRegistry (BiSheng Detectors + Sink-Down)"]
+    B1["CompilerBehaviorRegistry (8 Detectors incl. .asc UB Scalar Loop)"]
     B2["Tier-0 Roofline & 6-Pipe/AVE Evaluator (216/248/256 KiB UB)"]
     B3["Tier-1 Deterministic Compiler Penalty Synthesizer"]
     B4["Tier-2 HybridAscendCostModel (12/8 Residual Basis + Delta)"]
@@ -31,10 +31,10 @@ flowchart TB
 
   subgraph P4["Plane 4: Dual-Track Neuro-Symbolic Evolution Plane"]
     direction LR
-    E1["8D CapabilityGate & ISAGapScanner (Router=ON/OFF)"]
+    E1["Zero-Phi MECE CapabilityGate (TopologyAxes + ISAGapScanner + CasePhysicsRatios)"]
     E2["Dual-Track Shells (tilelang_dsl + ascendc_template)"]
-    E3["33 Causal Rules (13 SymptomFamilies, 3-Axis Bayes)"]
-    E4["3-Layer Progressive Constraints (G1..G5 + Monotonicity)"]
+    E3["40 Causal Rules R01..R40 (13 SymptomFamilies, l2_pmu_available Guard)"]
+    E4["3-Layer Constraints (CANN 9.3 dav-3510 On-Demand L2 + G1..G5 + Stage-0 +4)"]
     E5["Rule-Blind Bounded explore_creative & FlywheelDistiller"]
     E1 --> E2 --> E3 --> E4 --> E5
   end
@@ -45,7 +45,7 @@ flowchart TB
     G2["L1 Schedule Redlines G1..G5 & SILVerifier"]
     G3["L2 Lowering Envelope & Bounded Cost Screening"]
     G4["L3 Full Contract Suite & Replay Idempotence"]
-    G5["L4 Official CANNBench Real-NPU Signed Receipts"]
+    G5["L4 Official CANNBench Real-NPU Signed v2 Receipts (cannSeries + Zero-Lock Worktrees)"]
     G1 --> G2 --> G3 --> G4 --> G5
   end
 

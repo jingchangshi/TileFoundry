@@ -1,10 +1,10 @@
 flowchart LR
-  S1["Stage 1: Operator Contract & Unified Session<br/>HIR/TIR Binding + Real-Anchor Specialization + Two-Snapshot Diff"]
+  S1["Stage 1: Operator Contract & Unified Session<br/>HIR/TIR Positional Binding + Non-Zero Div PrimFunc.specialize + Two-Snapshot Diff"]
   S2["Stage 2: Regime Partition & Z3 Pipeline<br/>Physics Sub-Atom Classification + CoW Namespacing + Tail Guard"]
-  S3["Stage 3: Compiler Sink-Down & Cost Screening<br/>CompilerBehaviorRegistry + Tier-0/1/2 Hybrid Model"]
-  S4["Stage 4: Dual-Track Routing & Constraint Synthesis<br/>CapabilityGate + Layer 1/2/3 G1..G5 + Bounded explore_creative"]
-  S5["Stage 5: Pre-NPU Contract & Replay Gates (L0-L3)<br/>Static Key Audit + SILVerifier + Two-Pass Cache Idempotence"]
-  S6["Stage 6: Real-NPU Execution & Flywheel Convergence (L4)<br/>AgentGates Signed CANNBench + Anomaly Guard + FlywheelDistiller"]
+  S3["Stage 3: Compiler Sink-Down & Cost Screening<br/>8-Detector .asc UB Scalar Sink-Down + Tier-0/1/2 Hybrid Model"]
+  S4["Stage 4: Dual-Track Routing & Constraint Synthesis<br/>Zero-Phi MECE Router + CANN 9.3 On-Demand L2 Pruning (G1..G5) + Stage-0 +4"]
+  S5["Stage 5: Pre-NPU Contract & Replay Gates (L0-L3)<br/>Static Key Audit + SILVerifier + R01..R40 l2_pmu_available Guard + Cache Idempotence"]
+  S6["Stage 6: Real-NPU Execution & Flywheel Convergence (L4)<br/>Worktree-Isolated AgentGates cannSeries v2 Receipts + Anomaly Guard + FlywheelDistiller"]
 
   S1 --> S2 --> S3 --> S4 --> S5 --> S6
   S6 -. "Residual Outlier Guard & ExperienceLake Update" .-> S3
