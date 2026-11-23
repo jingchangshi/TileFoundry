@@ -58,7 +58,8 @@ _REQUIRED_CANARY_SYMBOLS_BASE = (
 
 def _find_header_matches(cann_include: Path) -> list[str]:
     found: list[str] = []
-    targets = (
+    seen_paths: set[Path] = set()
+    targets: list[Path] = [
         cann_include / "c_api" / "asc_cube.h",
         cann_include / "c_api" / "asc_simd.h",
         cann_include / "simt_api" / "asc_simt.h",
@@ -67,19 +68,26 @@ def _find_header_matches(cann_include: Path) -> list[str]:
         cann_include / "c_api" / "sync" / "sync.h",
         cann_include / "c_api" / "spr" / "spr.h",
         cann_include / "simt_api" / "device_warp_functions.h",
-    )
+    ]
+    for sub in ("c_api", "simt_api"):
+        sub_dir = cann_include / sub
+        if sub_dir.is_dir():
+            targets.extend(sorted(sub_dir.rglob("*.h")))
     decl_pat = re.compile(
         r"(?:__aicore__|__SIMT_DEVICE_FUNCTIONS_DECL__)\s+"
         r"(?:inline\s+)?(?:[\w:]+\s+)+\*?\s*(asc_[a-zA-Z0-9_]+)\s*(?:<[^>]*>)?\s*\("
     )
+    macro_pat = re.compile(r"(?m)^\s*#\s*define\s+(asc_[a-zA-Z0-9_]+)\b")
     for path in targets:
-        if not path.is_file():
+        if path in seen_paths or not path.is_file():
             continue
+        seen_paths.add(path)
         text = path.read_text(encoding="utf-8", errors="ignore")
-        for match in decl_pat.finditer(text):
-            sym = match.group(1)
-            if sym not in found:
-                found.append(sym)
+        for pat in (decl_pat, macro_pat):
+            for match in pat.finditer(text):
+                sym = match.group(1)
+                if sym not in found:
+                    found.append(sym)
     return found
 
 

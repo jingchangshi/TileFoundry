@@ -142,11 +142,15 @@ def test_sync_canary_cann93_nd2nz_8arg_and_extract_snapshot_diff(
         encoding="utf-8",
     )
     rc = extract_snapshot(cann_home=tmp_path, series="cann_9_3")
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "Discovered 2 asc_* C-API symbols" in out
-    assert "missing:" in out
-    assert "extra: 1" in out
-    assert "asc_synthetic_extra_op" in out
-    assert "Missing snapshot asc_* symbols in headers:" in out
-    assert "asc_copy_l0c2gm" in out
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "Discovered 2 asc_* C-API symbols" in captured.out
+    assert "missing:" in captured.out
+    assert "extra: 1" in captured.out
+    assert "asc_synthetic_extra_op" in captured.out
+    assert "Missing snapshot asc_* symbols in headers:" in captured.err
+    assert "asc_copy_l0c2gm" in captured.err
+
+    rc_92 = extract_snapshot(cann_home=tmp_path, series="cann_9_2")
+    assert rc_92 == 0
+    assert "Skipping live header enforcement" in capsys.readouterr().out
