@@ -423,8 +423,6 @@ def test_pure_golden_mode_cli_marathon_provenance_and_typed_abi(
             pure_golden=True,
         ),
         target_module_path=target_mod,
-        authored_hir_path=sibling_model,
-        scheduled_hir_path=sibling_sched,
         cannbench_repo=cann_repo,
         anchors=anchors,
         regime_specs=regimes,
@@ -440,16 +438,12 @@ def test_pure_golden_mode_cli_marathon_provenance_and_typed_abi(
         },
         l3_contract_runner=lambda _p: L3AcceptanceResult(passed=True),
     )
-    assert runner._authored_hir_path is None
-    assert runner._scheduled_hir_path is None
 
     report = asyncio.run(runner.run())
     assert isinstance(report, CampaignReport)
     assert report.pure_golden_mode is True
     assert report.blueprint_provenance["pure_golden_mode"] is True
     assert report.blueprint_provenance["source_mode"] == "pure_golden"
-    assert report.blueprint_provenance["authored_hir_path"] is None
-    assert report.blueprint_provenance["scheduled_hir_path"] is None
     assert str(report.blueprint_provenance["golden_path"]).endswith("golden.py")
 
     report_dict = report.to_dict()

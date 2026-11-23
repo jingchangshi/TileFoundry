@@ -164,7 +164,6 @@ from tilefoundry_ascend.ascend.cost_model.microarch_profile import merge_microar
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
     HirBlueprintPacket,
     HirRooflineSummary,
-    compile_hir_blueprint,
 )
 from tilefoundry_ascend.ascend.passes.observation_space import (
     ObservationVector5D,
@@ -1558,7 +1557,7 @@ def _extract_regime_abi_context(
         f"```python\n{sigs_text}\n```\n"
         "Any custom @T.prim_func returned for this slice MUST keep the exact tensor/scalar "
         "parameter order, ranks, and dtypes above expected by _get_kernel (do NOT substitute "
-        "the HIR forward(...) parameter list, and do NOT import tilelang.language as T or use "
+        "the PyTorch golden entrypoint parameter list, and do NOT import tilelang.language as T or use "
         "T.Scope). _select_*_config() may return optional 'builder_kwargs': {...} forwarded to "
         "custom builders for compile-time constexpr specialization.\n\n"
     )
@@ -2434,8 +2433,6 @@ class PerfTargetCampaignRunner:
         source_root: str | Path | None = None,
         env_file: str | Path | None = None,
         cannbench_repo: str | Path | None = None,
-        authored_hir_path: str | Path | None = None,
-        scheduled_hir_path: str | Path | None = None,
         enable_track_router: bool = False,
         target: AscendTarget | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -2605,26 +2602,6 @@ class PerfTargetCampaignRunner:
             self._topology_axes = TopologyAxes.from_dict(topology_axes)
         else:
             self._topology_axes = None
-
-        if bool(self._config.pure_golden):
-            self._authored_hir_path: Path | None = None
-            self._scheduled_hir_path: Path | None = None
-        else:
-            if authored_hir_path is not None:
-                self._authored_hir_path = Path(authored_hir_path).resolve()
-            else:
-                sibling_model = self._target_module_path.parent / "model.py"
-                self._authored_hir_path = (
-                    sibling_model.resolve() if sibling_model.is_file() else None
-                )
-
-            if scheduled_hir_path is not None:
-                self._scheduled_hir_path = Path(scheduled_hir_path).resolve()
-            else:
-                sibling_sched = self._target_module_path.parent / "scheduled.py"
-                self._scheduled_hir_path = (
-                    sibling_sched.resolve() if sibling_sched.is_file() else None
-                )
 
         self._golden_abi_block_cache: str | None = None
         self._blueprint_provenance: dict[str, object] = {}
@@ -3016,26 +2993,11 @@ class PerfTargetCampaignRunner:
 
     def _update_blueprint_provenance(self, spec: CannbenchOpSpec | None) -> None:
         pure_mode = bool(self._config.pure_golden)
-        has_hir = self._authored_hir_path is not None or self._scheduled_hir_path is not None
-        if pure_mode:
-            source_mode = "pure_golden"
-        elif spec is not None and has_hir:
-            source_mode = "mixed"
-        elif has_hir:
-            source_mode = "authored_hir"
-        else:
-            source_mode = "pure_golden"
         self._blueprint_provenance = {
             "pure_golden_mode": pure_mode,
             "operator_name": self._config.operator_name,
             "golden_path": str(spec.golden_path) if spec is not None else "",
-            "authored_hir_path": (
-                str(self._authored_hir_path) if self._authored_hir_path is not None else None
-            ),
-            "scheduled_hir_path": (
-                str(self._scheduled_hir_path) if self._scheduled_hir_path is not None else None
-            ),
-            "source_mode": source_mode,
+            "source_mode": "pure_golden",
         }
 
     def _validated_regime_blueprints(
@@ -3103,103 +3065,58 @@ class PerfTargetCampaignRunner:
         return block
 
     def _build_semantic_first_regime_blueprints(self) -> dict[str, HirBlueprintPacket]:
-        """Build per-regime blueprints from PyTorch golden semantics and anchor dims.
-
-        Optional authored or scheduled HIR sources are forwarded so schedule deltas attach
-        without overriding the authoritative semantic Roofline.
-        """
-        authored_hir_source: str | None = None
-        if self._authored_hir_path is not None and self._authored_hir_path.is_file():
-            try:
-                authored_hir_source = self._authored_hir_path.read_text(encoding="utf-8")
-            except OSError as exc:
-                raise RuntimeError(
-                    f"cannot read authored HIR source at {self._authored_hir_path}: {exc}"
-                ) from exc
-        scheduled_hir_source: str | None = None
-        if self._scheduled_hir_path is not None and self._scheduled_hir_path.is_file():
-            try:
-                scheduled_hir_source = self._scheduled_hir_path.read_text(encoding="utf-8")
-            except OSError as exc:
-                raise RuntimeError(
-                    f"cannot read scheduled HIR source at {self._scheduled_hir_path}: {exc}"
-                ) from exc
-
+        """Build per-regime blueprints from PyTorch golden semantics and anchor dims."""
         spec = self._resolve_operator_spec()
         self._update_blueprint_provenance(spec)
-        if spec is not None:
-            if not spec.golden_path.is_file():
-                raise FileNotFoundError(
-                    f"official PyTorch golden reference missing for {spec.op_id} at "
-                    f"{spec.golden_path}"
-                )
-            try:
-                golden_source = spec.golden_path.read_text(encoding="utf-8")
-            except OSError as exc:
-                raise RuntimeError(
-                    f"cannot read PyTorch golden reference for {spec.op_id} at "
-                    f"{spec.golden_path}: {exc}"
-                ) from exc
-            analyzer = PyTorchSemanticAnalyzer(self._target)
-            try:
-                semantics = analyzer.analyze_source(
-                    golden_source,
-                    entry_name=spec.entrypoint,
-                    proto=spec.proto,
-                )
-            except (SyntaxError, ValueError) as exc:
-                raise RuntimeError(
-                    f"cannot analyze PyTorch golden semantics for {spec.op_id}: {exc}"
-                ) from exc
-            self._semantic_topology_axes = semantics.base_axes
-            packets: dict[str, HirBlueprintPacket] = {}
-            for regime_spec in self._regime_specs:
-                anchor_dims = (
-                    regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
-                )
-                rep_case = (
-                    RepresentativeCase.from_case_entry(
-                        regime_spec.representative_case_entry,
-                        proto=spec.proto,
-                    )
-                    if regime_spec.representative_case_entry
-                    else None
-                )
-                try:
-                    packets[regime_spec.regime_tag] = analyzer.build_universal_blueprint(
-                        semantics,
-                        anchor_dims,
-                        authored_hir_source=authored_hir_source,
-                        scheduled_hir_source=scheduled_hir_source,
-                        representative_case=rep_case,
-                    )
-                except (FileNotFoundError, OSError, SyntaxError, ValueError, KeyError) as exc:
-                    raise RuntimeError(
-                        f"failed to synthesize semantic-first HIR blueprint for {spec.op_id} "
-                        f"regime {regime_spec.regime_tag}: {type(exc).__name__}: {exc}"
-                    ) from exc
-            assert set(packets) == {regime.regime_tag for regime in self._regime_specs}
-            return packets
-
-        if authored_hir_source is None or not authored_hir_source.strip():
+        if spec is None:
             return {}
-
-        packets = {}
+        if not spec.golden_path.is_file():
+            raise FileNotFoundError(
+                f"official PyTorch golden reference missing for {spec.op_id} at "
+                f"{spec.golden_path}"
+            )
+        try:
+            golden_source = spec.golden_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot read PyTorch golden reference for {spec.op_id} at "
+                f"{spec.golden_path}: {exc}"
+            ) from exc
+        analyzer = PyTorchSemanticAnalyzer(self._target)
+        try:
+            semantics = analyzer.analyze_source(
+                golden_source,
+                entry_name=spec.entrypoint,
+                proto=spec.proto,
+            )
+        except (SyntaxError, ValueError) as exc:
+            raise RuntimeError(
+                f"cannot analyze PyTorch golden semantics for {spec.op_id}: {exc}"
+            ) from exc
+        self._semantic_topology_axes = semantics.base_axes
+        packets: dict[str, HirBlueprintPacket] = {}
         for regime_spec in self._regime_specs:
             anchor_dims = (
                 regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
             )
+            rep_case = (
+                RepresentativeCase.from_case_entry(
+                    regime_spec.representative_case_entry,
+                    proto=spec.proto,
+                )
+                if regime_spec.representative_case_entry
+                else None
+            )
             try:
-                packets[regime_spec.regime_tag] = compile_hir_blueprint(
-                    authored_hir_source,
-                    scheduled_hir_source=scheduled_hir_source,
-                    anchor_dims=anchor_dims,
-                    target=self._target,
+                packets[regime_spec.regime_tag] = analyzer.build_universal_blueprint(
+                    semantics,
+                    anchor_dims,
+                    representative_case=rep_case,
                 )
             except (FileNotFoundError, OSError, SyntaxError, ValueError, KeyError) as exc:
                 raise RuntimeError(
-                    f"failed to compile authored HIR blueprint for regime "
-                    f"{regime_spec.regime_tag}: {type(exc).__name__}: {exc}"
+                    f"failed to synthesize semantic-first blueprint for {spec.op_id} "
+                    f"regime {regime_spec.regime_tag}: {type(exc).__name__}: {exc}"
                 ) from exc
         assert set(packets) == {regime.regime_tag for regime in self._regime_specs}
         return packets
@@ -4163,6 +4080,7 @@ class PerfTargetCampaignRunner:
             residual is not None
             and (
                 residual.spill_bytes > 0
+                or int(getattr(residual, "stack_bytes", 0) or 0) > 0
                 or (not residual.vloopv2_hit)
                 or residual.vf_fusion_breaks > 0
                 or residual.alias_serialized_buffers > 0
@@ -4254,6 +4172,7 @@ class PerfTargetCampaignRunner:
             lines.extend(
                 [
                     f"spill_bytes: {residual.spill_bytes}",
+                    f"stack_bytes: {int(getattr(residual, 'stack_bytes', 0) or 0)}",
                     f"vloopv2_hit: {residual.vloopv2_hit}",
                     f"vf_fusion_breaks: {residual.vf_fusion_breaks}",
                     f"alias_serialized_buffers: {residual.alias_serialized_buffers}",
@@ -5726,6 +5645,14 @@ class PerfTargetCampaignRunner:
             if cand_compiler_summary is not None
             else compiler_summary_from_residual(cand_residual)
         )
+        pred_params = inspect.signature(build_predicate_context).parameters
+        prev_extra_kwargs: dict[str, object] = {}
+        if "prev_residual" in pred_params:
+            prev_extra_kwargs["prev_residual"] = parent_residual
+        if "prev_compiler_summary" in pred_params:
+            prev_extra_kwargs["prev_compiler_summary"] = compiler_summary_from_residual(
+                parent_residual
+            )
         post_ctx = build_predicate_context(
             ledger,
             features=features,
@@ -5733,6 +5660,7 @@ class PerfTargetCampaignRunner:
             compiler_summary=resolved_comp,
             prev_ledger=parent_ledger,
             roofline=roofline,
+            **prev_extra_kwargs,
         )
         prev_ns = post_ctx.setdefault("prev", {})
         if isinstance(prev_ns, dict):
@@ -5827,6 +5755,11 @@ class PerfTargetCampaignRunner:
         )
         self._flywheel._tracker = staging_tracker
         try:
+            distill_shapes = extract_ordered_tensor_shapes(
+                case_entry=regime_spec.representative_case_entry,
+                dims=anchor_dims or None,
+                proto=self._operator_proto_cache,
+            )
             distill_rep = self._flywheel.distill_from_pair(
                 baseline_dsl=baseline_source,
                 winner_dsl=winner_source,
@@ -5845,6 +5778,7 @@ class PerfTargetCampaignRunner:
                 operator_name=self._config.operator_name,
                 rule_scope="operator_local",
                 active_symptom_family=symptom_family,
+                ordered_tensor_shapes=distill_shapes,
             )
         finally:
             self._flywheel._tracker = orig_tracker
@@ -7166,12 +7100,17 @@ class PerfTargetCampaignRunner:
             or selected_stone.residual.measured_mte2_wait_ratio > 0.0
             or selected_stone.residual.measured_sync_stall_ratio > 0.0
             or selected_stone.residual.spill_bytes > 0
+            or int(getattr(selected_stone.residual, "stack_bytes", 0) or 0) > 0
             or (not selected_stone.residual.vloopv2_hit)
             or selected_stone.residual.vf_fusion_breaks > 0
             or selected_stone.residual.alias_serialized_buffers > 0
             or selected_stone.residual.dual_issue_ipc_collapse > 0.0
             or selected_stone.residual.dcache_dcci_flushes > 0
             or bool(selected_stone.residual.has_local_membar_in_vf_call)
+            or float(getattr(selected_stone.residual, "scalar_compute_loop_fallback", 0.0) or 0.0)
+            > 0.0
+            or float(getattr(selected_stone.residual, "dcache_bypass_narrow_store", 0.0) or 0.0)
+            > 0.0
         ):
             parent_residual = selected_stone.residual
         else:
@@ -7415,6 +7354,11 @@ class PerfTargetCampaignRunner:
                     exc,
                 )
             var_bindings = build_anchor_var_bindings(anchor_dims, kwargs=prescreen_kwargs)
+            prescreen_shapes = extract_ordered_tensor_shapes(
+                case_entry=regime_spec.representative_case_entry,
+                dims=anchor_dims,
+                proto=self._operator_proto_cache,
+            )
             prescreen_summary = build_prescreen_summary_from_kwargs(
                 prescreen_kwargs,
                 dsl_source=parent_module_source,
@@ -7429,6 +7373,7 @@ class PerfTargetCampaignRunner:
                 live_plan=live_plan,
                 blueprint=blueprint,
                 sil_advisory=self._sil_advisory,
+                ordered_tensor_shapes=prescreen_shapes,
             )
         else:
             prescreen_summary = ""
@@ -7578,8 +7523,9 @@ class PerfTargetCampaignRunner:
                 for cid, _ in raw_candidates
                 if meta_by_id[cid][0] == "creative_explore"
             }
-            raw_parent_analytical_us = float(parent_cost_pred.tier0_physics_us) + float(
-                parent_cost_pred.tier1_penalty_us
+            parent_l0_pred = self._cost_model.predict(parent_workload, bisheng_res=None)
+            raw_parent_analytical_us = float(parent_l0_pred.tier0_physics_us) + float(
+                parent_l0_pred.tier1_penalty_us
             )
             parent_analytical_us = (
                 raw_parent_analytical_us if raw_parent_analytical_us > 0.0 else None

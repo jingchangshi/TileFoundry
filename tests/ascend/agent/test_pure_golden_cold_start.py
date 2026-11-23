@@ -671,8 +671,6 @@ def test_pure_golden_registry_ast_check_and_marathon_isolation(
     )
     assert rc == 0
     assert captured["target_module_path"] == (state_dir / "pure_golden_ops" / "mla" / "kernels.py").resolve()
-    assert captured["authored_hir_path"] is None
-    assert captured["scheduled_hir_path"] is None
 
     ext_state_dir = tmp_path / "external_state"
     captured.clear()

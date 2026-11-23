@@ -1174,7 +1174,7 @@ def test_campaign_runner_synthesizes_blueprints_without_authored_model(
         cannbench_repo=repo,
     )
 
-    assert runner._authored_hir_path is None
+    assert runner._blueprint_provenance["source_mode"] == "pure_golden"
     assert set(runner._regime_blueprints) == {regime.regime_tag for regime in regimes}
     for packet in runner._regime_blueprints.values():
         assert packet.entry_name == "exp"
@@ -1197,29 +1197,27 @@ def test_campaign_runner_raises_when_official_golden_is_missing(tmp_path: Path) 
         )
 
 
-def test_campaign_runner_raises_on_authored_hir_read_error(
+def test_campaign_runner_raises_on_golden_read_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = _write_fixture_repo(tmp_path / "cann-bench")
-    authored_hir = tmp_path / "model.py"
-    authored_hir.write_text("# authored HIR\n", encoding="utf-8")
-    resolved_authored = authored_hir.resolve()
+    golden_file = (repo / "tasks" / "level1" / "exp" / "golden.py").resolve()
     real_read_text = Path.read_text
 
     def _guarded_read_text(self: Path, *args: object, **kwargs: object) -> str:
-        if self.resolve() == resolved_authored:
+        if self.resolve() == golden_file:
             raise OSError("permission denied")
         return real_read_text(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "read_text", _guarded_read_text)
-    with pytest.raises(RuntimeError, match="cannot read authored HIR source"):
+    with pytest.raises(RuntimeError, match="cannot read PyTorch golden reference"):
         PerfTargetCampaignRunner(
             config=CampaignConfig(operator_name="exp", max_rounds=1),
             target_module_path=_target_module(tmp_path),
             perf_target=PerfTargetSpec("exp", 1.5, 1.2, 0.9),
+            anchors=(AnchorCaseSpec("level1/exp", 1, "main", 2.0, 1.0),),
             regime_specs=_legacy_regime_specs(),
-            authored_hir_path=authored_hir,
             checkpoint_path=tmp_path / "ckpt.json",
             cannbench_repo=repo,
         )
@@ -1230,8 +1228,6 @@ def test_campaign_runner_raises_when_one_regime_blueprint_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repo = _write_fixture_repo(tmp_path / "cann-bench")
-    authored_hir = tmp_path / "model.py"
-    authored_hir.write_text("# authored HIR\n", encoding="utf-8")
 
     def _fail_blueprint(*args: object, **kwargs: object) -> HirBlueprintPacket:
         raise ValueError("unsupported operator construct")
@@ -1242,14 +1238,13 @@ def test_campaign_runner_raises_when_one_regime_blueprint_fails(
         _fail_blueprint,
     )
     with pytest.raises(
-        RuntimeError, match="failed to synthesize semantic-first HIR blueprint for exp regime vector"
+        RuntimeError, match="failed to synthesize semantic-first blueprint for exp regime vector"
     ):
         PerfTargetCampaignRunner(
             config=CampaignConfig(operator_name="exp", max_rounds=1),
             target_module_path=_target_module(tmp_path),
             perf_target=PerfTargetSpec("exp", 1.5, 1.2, 0.9),
             regime_specs=_legacy_regime_specs(),
-            authored_hir_path=authored_hir,
             checkpoint_path=tmp_path / "ckpt.json",
             cannbench_repo=repo,
         )

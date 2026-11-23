@@ -24,6 +24,7 @@ from tilefoundry_ascend.agent.orchestrator.e2e_evolution import EvolutionTraject
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
     StageAResult,
+    extract_ordered_tensor_shapes,
     run_stage_a_static,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
@@ -2461,6 +2462,10 @@ class FlywheelDistiller:
         ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
     ) -> FlywheelDistillationReport:
         """Run Leave-One-Out AST/config ablation directly on real candidate winner_dsl."""
+        resolved_shapes = extract_ordered_tensor_shapes(
+            dims=dims,
+            ordered_tensor_shapes=ordered_tensor_shapes,
+        )
         chunks = decompose_leave_one_out_ablations(baseline_dsl, winner_dsl)
         if max_loo_chunks is not None and int(max_loo_chunks) > 0:
             chunks = chunks[: int(max_loo_chunks)]
@@ -2475,7 +2480,7 @@ class FlywheelDistiller:
             factory_kwargs=factory_kwargs,
             config_selector_name=config_selector_name,
             dims=dims,
-            ordered_tensor_shapes=ordered_tensor_shapes,
+            ordered_tensor_shapes=resolved_shapes,
         )
         win_cost = (
             _ledger_cost_score(win_sa.ledger)
@@ -2491,7 +2496,7 @@ class FlywheelDistiller:
                 factory_kwargs=factory_kwargs,
                 config_selector_name=config_selector_name,
                 dims=dims,
-                ordered_tensor_shapes=ordered_tensor_shapes,
+                ordered_tensor_shapes=resolved_shapes,
             )
             funnel_results.append((chunk, eval_res))
 
@@ -2651,6 +2656,10 @@ class FlywheelDistiller:
         ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
     ) -> FlywheelDistillationReport:
         """Run full counterfactual ablation, micro-probe or LOO check, and KB admission."""
+        resolved_shapes = extract_ordered_tensor_shapes(
+            dims=dims,
+            ordered_tensor_shapes=ordered_tensor_shapes,
+        )
         if verify_on_candidate:
             return self.distill_leave_one_out(
                 baseline_dsl=baseline_dsl,
@@ -2669,7 +2678,7 @@ class FlywheelDistiller:
                 operator_name=operator_name,
                 rule_scope=rule_scope,
                 active_symptom_family=active_symptom_family,
-                ordered_tensor_shapes=ordered_tensor_shapes,
+                ordered_tensor_shapes=resolved_shapes,
             )
         chunks = decompose_ast_ablations(baseline_dsl, winner_dsl)
         kept: list[AblationMeasurement] = []
@@ -2683,7 +2692,7 @@ class FlywheelDistiller:
             factory_kwargs=factory_kwargs,
             config_selector_name=config_selector_name,
             dims=dims,
-            ordered_tensor_shapes=ordered_tensor_shapes,
+            ordered_tensor_shapes=resolved_shapes,
         )
         base_cost = (
             _ledger_cost_score(base_sa.ledger)
@@ -2699,7 +2708,7 @@ class FlywheelDistiller:
                 factory_kwargs=factory_kwargs,
                 config_selector_name=config_selector_name,
                 dims=dims,
-                ordered_tensor_shapes=ordered_tensor_shapes,
+                ordered_tensor_shapes=resolved_shapes,
             )
             funnel_results.append((chunk, eval_res))
 
@@ -2881,10 +2890,16 @@ class FlywheelDistiller:
         trajectory: EvolutionTrajectory,
         factory_name: str | None = None,
         factory_kwargs: Mapping[str, object] | None = None,
+        dims: Mapping[str, object] | None = None,
         kb_output_path: str | Path | None = None,
         active_symptom_family: str = "",
+        ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
     ) -> FlywheelDistillationReport:
         """Distill and verify causal rules directly from an EvolutionTrajectory winner."""
+        resolved_shapes = extract_ordered_tensor_shapes(
+            dims=dims,
+            ordered_tensor_shapes=ordered_tensor_shapes,
+        )
         return self.distill_from_pair(
             baseline_dsl=baseline_dsl,
             winner_dsl=trajectory.best_dsl_source,
@@ -2892,8 +2907,10 @@ class FlywheelDistiller:
             winner_latency_us=trajectory.best_latency_us,
             factory_name=factory_name,
             factory_kwargs=factory_kwargs,
+            dims=dims,
             kb_output_path=kb_output_path,
             active_symptom_family=active_symptom_family,
+            ordered_tensor_shapes=resolved_shapes,
         )
 
 

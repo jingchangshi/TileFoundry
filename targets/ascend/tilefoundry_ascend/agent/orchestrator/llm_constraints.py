@@ -390,7 +390,7 @@ def format_g5_parent_monotonicity_lock(*, include_blueprint_retention: bool = Fa
     lines = ["### G5 PARENT MONOTONICITY LOCK"]
     if include_blueprint_retention:
         lines.append(
-            "- Retain full Layer 1-3 blueprint architecture, HIR/Roofline floor targets, "
+            "- Retain full Layer 1-3 blueprint architecture, Roofline floor targets, "
             "and PyTorch golden semantics; never degrade into a bare blueprint-less syntax patch."
         )
     lines.extend(

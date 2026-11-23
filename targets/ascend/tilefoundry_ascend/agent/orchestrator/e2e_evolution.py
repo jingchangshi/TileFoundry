@@ -6,7 +6,7 @@ import ast
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
@@ -15,6 +15,7 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     GateFunnel,
     StageAResult,
     StageCResult,
+    extract_ordered_tensor_shapes,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     GenerationRequest,
@@ -37,7 +38,6 @@ from tilefoundry_ascend.agent.orchestrator.twin_bridge import verify_numerical_t
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
     HirBlueprintPacket,
     HirRooflineSummary,
-    compile_hir_blueprint,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
@@ -232,31 +232,58 @@ def _derive_anchor_dims_from_case(
     return dims
 
 
+def _resolve_ordered_shapes(
+    *,
+    anchor_dims: Mapping[str, int] | None,
+    proto: Mapping[str, object] | None,
+    representative_case: RepresentativeCase | Mapping[str, object] | None,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None,
+) -> tuple[tuple[int, ...], ...] | None:
+    if ordered_tensor_shapes is not None:
+        return extract_ordered_tensor_shapes(ordered_tensor_shapes=ordered_tensor_shapes)
+    case_entry: Mapping[str, object] | None = None
+    if isinstance(representative_case, RepresentativeCase):
+        case_entry = {
+            "input_shapes": list(representative_case.input_shapes),
+            "attrs": dict(representative_case.attrs),
+        }
+    elif isinstance(representative_case, Mapping):
+        case_entry = representative_case
+    return extract_ordered_tensor_shapes(
+        case_entry=case_entry,
+        dims=anchor_dims,
+        proto=proto,
+    )
+
+
+def _has_callable_entrypoint(source: str) -> bool:
+    if not source.strip():
+        return False
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and not node.name.startswith("_")
+        and node.name != "get_input"
+        for node in tree.body
+    )
+
+
 def _compile_blueprint_safe(
     hir_source: str,
     *,
-    scheduled_hir_source: str | None = None,
     anchor_dims: Mapping[str, int] | None = None,
     target: AscendTarget | None = None,
     entry_name: str | None = None,
     proto: Mapping[str, object] | None = None,
     representative_case: RepresentativeCase | Mapping[str, object] | None = None,
-    authored_hir_source: str | None = None,
     dtype_bytes: float = 2.0,
 ) -> HirBlueprintPacket | None:
-    """Compile authored HIR or PyTorch golden source into a unified blueprint packet."""
+    """Compile PyTorch golden source into a semantic-first blueprint packet."""
     if not hir_source.strip():
         return None
-    if "@module" in hir_source:
-        try:
-            return compile_hir_blueprint(
-                hir_source,
-                scheduled_hir_source=scheduled_hir_source,
-                anchor_dims=anchor_dims,
-                target=target,
-            )
-        except (FileNotFoundError, OSError):
-            return None
 
     resolved_entry = _resolve_golden_entry_name(
         hir_source,
@@ -285,8 +312,6 @@ def _compile_blueprint_safe(
         return analyzer.build_universal_blueprint(
             semantics,
             eff_dims,
-            authored_hir_source=authored_hir_source,
-            scheduled_hir_source=scheduled_hir_source,
             dtype_bytes=dtype_bytes,
             representative_case=rep_case,
         )
@@ -307,9 +332,6 @@ def _summarize_blueprint(packet: HirBlueprintPacket | None) -> dict[str, object]
         ),
         "lowering_diagnostics": list(packet.lowering_diagnostics),
         "provenance": packet.provenance.to_dict() if packet.provenance is not None else None,
-        "schedule_delta": (
-            packet.schedule_delta.to_dict() if packet.schedule_delta is not None else None
-        ),
     }
 
 
@@ -324,8 +346,8 @@ def build_hir_seed_request(
     """Build initial TileLang synthesis request under 3-layer progressive constraints."""
     target_factory = factory_name or "make_kernel"
     sys_prompt = (
-        "You are an Ascend 950PR TileLang compiler engineer. Translate the mathematical HIR "
-        "module below into a clean, unscheduled standalone Python factory function named "
+        "You are an Ascend 950PR TileLang compiler engineer. Translate the PyTorch golden "
+        "entrypoint below into a clean, unscheduled standalone Python factory function named "
         f"'{target_factory}' returning a @T.prim_func named 'main'. "
         "Import 'import tilelang.ascend.language as T'. Do NOT include "
         "'from __future__ import annotations'. Output ONLY valid Python code."
@@ -338,7 +360,7 @@ def build_hir_seed_request(
     user_prompt = (
         f"### SHAPE AND SIGNATURE CONTRACT\n{shape_contract.strip()}\n\n"
         f"{constraint_text}\n\n"
-        f"### MATHEMATICAL HIR SOURCE\n```python\n{hir_source.strip()}\n```\n"
+        f"### PYTORCH GOLDEN SOURCE\n```python\n{hir_source.strip()}\n```\n"
     )
     return GenerationRequest(
         role="exploit_rule",
@@ -359,22 +381,25 @@ async def synthesize_initial_dsl(
     max_seed_repairs: int = 2,
     target: AscendTarget | None = None,
     enable_track_router: bool = False,
-    scheduled_hir_source: str | None = None,
     anchor_dims: Mapping[str, int] | None = None,
     blueprint: HirBlueprintPacket | None = None,
     proto: Mapping[str, object] | None = None,
     representative_case: RepresentativeCase | Mapping[str, object] | None = None,
-    authored_hir_source: str | None = None,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> tuple[str, FunnelEvaluation]:
-    """Synthesize and funnel-validate an initial @T.prim_func seed from HIR or golden source."""
+    """Synthesize and funnel-validate an initial @T.prim_func seed from PyTorch golden source."""
     active_packet = blueprint or _compile_blueprint_safe(
         hir_source,
-        scheduled_hir_source=scheduled_hir_source,
         anchor_dims=anchor_dims,
         target=target,
         proto=proto,
         representative_case=representative_case,
-        authored_hir_source=authored_hir_source,
+    )
+    resolved_shapes = _resolve_ordered_shapes(
+        anchor_dims=anchor_dims,
+        proto=proto,
+        representative_case=representative_case,
+        ordered_tensor_shapes=ordered_tensor_shapes,
     )
     eval_funnel = (
         GateFunnel(
@@ -399,6 +424,7 @@ async def synthesize_initial_dsl(
         dsl_source,
         factory_name=factory_name,
         factory_kwargs=factory_kwargs,
+        ordered_tensor_shapes=resolved_shapes,
     )
     repairs = 0
     while not eval_res.passed and repairs < max(0, max_seed_repairs):
@@ -410,6 +436,7 @@ async def synthesize_initial_dsl(
             dsl_source,
             factory_name=factory_name,
             factory_kwargs=factory_kwargs,
+            ordered_tensor_shapes=resolved_shapes,
         )
     return dsl_source, eval_res
 
@@ -526,7 +553,7 @@ def _wrap_funnel_with_proxy(
         assert stage_a.ledger is not None
         acc_ok = True
         err_msg = ""
-        if hir_source.strip() and "@module" in hir_source:
+        if _has_callable_entrypoint(hir_source):
             twin_res = verify_numerical_twin(
                 hir_source,
                 dsl_src,
@@ -597,24 +624,27 @@ async def run_e2e_evolution(
     target: AscendTarget | None = None,
     explore_stepping_stone_on_stagnation: bool = True,
     enable_track_router: bool = False,
-    scheduled_hir_source: str | None = None,
     anchor_dims: Mapping[str, int] | None = None,
     proto: Mapping[str, object] | None = None,
     representative_case: RepresentativeCase | Mapping[str, object] | None = None,
-    authored_hir_source: str | None = None,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> EvolutionTrajectory:
-    """Drive dual-loop causal + creative evolution from golden or HIR to converged DSL."""
+    """Drive dual-loop causal + creative evolution from PyTorch golden to converged DSL."""
     active_tracker = tracker or BayesianRuleTracker.from_seed_yaml()
     active_beam = beam or TwoLaneBeamSearch()
     blueprint = _compile_blueprint_safe(
         hir_source,
-        scheduled_hir_source=scheduled_hir_source,
         anchor_dims=anchor_dims,
         target=target,
         entry_name=problem_name,
         proto=proto,
         representative_case=representative_case,
-        authored_hir_source=authored_hir_source,
+    )
+    resolved_shapes = _resolve_ordered_shapes(
+        anchor_dims=anchor_dims,
+        proto=proto,
+        representative_case=representative_case,
+        ordered_tensor_shapes=ordered_tensor_shapes,
     )
     blueprint_roofline = blueprint.roofline if blueprint is not None else None
     ideal_roofline_us = (
@@ -637,6 +667,7 @@ async def run_e2e_evolution(
             factory_name=factory_name,
             factory_kwargs=factory_kwargs,
             roofline=blueprint_roofline,
+            ordered_tensor_shapes=resolved_shapes,
         )
     else:
         baseline_dsl, base_eval = await synthesize_initial_dsl(
@@ -649,14 +680,16 @@ async def run_e2e_evolution(
             max_seed_repairs=max_seed_repairs,
             target=target,
             enable_track_router=enable_track_router,
-            scheduled_hir_source=scheduled_hir_source,
             anchor_dims=anchor_dims,
             blueprint=blueprint,
+            proto=proto,
+            representative_case=representative_case,
+            ordered_tensor_shapes=resolved_shapes,
         )
 
     if not base_eval.passed or base_eval.stage_a is None or base_eval.stage_a.ledger is None:
         raise RuntimeError(
-            f"Initial HIR baseline failed funnel ({base_eval.failed_stage}): "
+            f"Initial golden baseline failed funnel ({base_eval.failed_stage}): "
             f"{base_eval.error_message}"
         )
 
@@ -719,7 +752,7 @@ async def run_e2e_evolution(
     baseline_cand = BeamCandidate(
         candidate_id="r0_baseline",
         round_idx=0,
-        worker_kind="hir_baseline",
+        worker_kind="golden_baseline",
         rule_id=None,
         dsl_source=baseline_dsl,
         track=base_track,
@@ -730,7 +763,7 @@ async def run_e2e_evolution(
             bool(base_eval.stage_c.accuracy_passed) if base_eval.stage_c is not None else True
         ),
         structural_signature=extract_structural_signature(baseline_dsl, track=base_track),
-        hypothesis="unscheduled_hir_baseline",
+        hypothesis="golden_baseline",
         parent_id=None,
         features=stage_a.features if enable_track_router else None,
     )
@@ -771,8 +804,10 @@ async def run_e2e_evolution(
             round_idx=round_idx,
             factory_name=factory_name,
             factory_kwargs=factory_kw_dict,
+            dims=anchor_dims,
             ideal_roofline_us=ideal_roofline_us,
             blueprint=blueprint,
+            ordered_tensor_shapes=resolved_shapes,
         )
         round_rec, best_so_far_lat = _build_round_record(report, parent, best_so_far_lat)
         rounds.append(round_rec)

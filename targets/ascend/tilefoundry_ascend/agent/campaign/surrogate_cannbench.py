@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
+import importlib.util
 import json
 import logging
 import math
@@ -49,6 +51,7 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     _parse_cce_res_usage_with_summary,
     build_stage_b_driver_source,
     check_repair_monotonicity,
+    extract_ordered_tensor_shapes,
     run_stage_a_static,
     run_stage_b_compile,
 )
@@ -659,141 +662,6 @@ def ensure_npu_compare_shim_dir(
     return out_dir
 
 
-def _extract_concrete_shape_list(raw_shapes: object) -> list[tuple[int, ...]]:
-    """Extract concrete integer tensor shapes from single, multi, or nested payloads."""
-    if not isinstance(raw_shapes, (list, tuple)) or not raw_shapes:
-        return []
-    if all(isinstance(dim, int) and not isinstance(dim, bool) and dim >= 0 for dim in raw_shapes):
-        return [tuple(int(dim) for dim in raw_shapes)]
-    out: list[tuple[int, ...]] = []
-    for item in raw_shapes:
-        if item is None:
-            continue
-        if isinstance(item, (list, tuple)) and item:
-            if all(
-                isinstance(dim, int) and not isinstance(dim, bool) and dim >= 0 for dim in item
-            ):
-                out.append(tuple(int(dim) for dim in item))
-            else:
-                out.extend(_extract_concrete_shape_list(item))
-    return out
-
-
-def _resolve_proto_output_shapes(
-    proto: Mapping[str, object] | None,
-    *,
-    dims: Mapping[str, object] | None,
-    attrs: Mapping[str, object] | None,
-) -> list[tuple[int, ...]]:
-    """Resolve concrete output shapes from proto output specs when all axes are known."""
-    if not isinstance(proto, Mapping):
-        return []
-    op_block = (
-        proto["operator"]
-        if "outputs" not in proto and isinstance(proto.get("operator"), Mapping)
-        else proto
-    )
-    raw_outputs = op_block.get("outputs") if isinstance(op_block, Mapping) else None
-    if not isinstance(raw_outputs, Sequence) or isinstance(raw_outputs, (str, bytes)):
-        return []
-    dim_lookup: dict[str, int] = {}
-    for src in (attrs, dims):
-        if not isinstance(src, Mapping):
-            continue
-        for key, val in src.items():
-            if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
-                dim_lookup[str(key).strip().lower()] = int(val)
-    raw_layout = ""
-    for src in (attrs, dims):
-        if isinstance(src, Mapping):
-            for lkey in ("inputLayout", "input_layout", "layout"):
-                if isinstance(src.get(lkey), str) and str(src[lkey]).strip():
-                    raw_layout = str(src[lkey]).strip().upper()
-                    break
-        if raw_layout:
-            break
-    resolved: list[tuple[int, ...]] = []
-    for item in raw_outputs:
-        if not isinstance(item, Mapping):
-            continue
-        shape_spec = item.get("shape")
-        if not isinstance(shape_spec, str) or "[" not in shape_spec:
-            continue
-        matches = re.findall(r"(?:([A-Za-z0-9_]+)\s*:\s*)?\[([^\]]+)\]", shape_spec)
-        chosen = ""
-        if raw_layout:
-            for tag, inner in matches:
-                if tag.strip().upper() == raw_layout:
-                    chosen = inner
-                    break
-        if not chosen and matches:
-            chosen = matches[0][1]
-        if not chosen:
-            continue
-        tokens = [tok.strip() for tok in chosen.split(",") if tok.strip()]
-        shape_vals: list[int] = []
-        ok = bool(tokens)
-        for tok in tokens:
-            if tok.isdigit():
-                shape_vals.append(int(tok))
-            else:
-                matched = dim_lookup.get(tok.lower())
-                if matched is None:
-                    ok = False
-                    break
-                shape_vals.append(matched)
-        if ok:
-            resolved.append(tuple(shape_vals))
-    return resolved
-
-
-def extract_ordered_tensor_shapes(
-    *,
-    case_entry: Mapping[str, object] | None = None,
-    dims: Mapping[str, object] | None = None,
-    proto: Mapping[str, object] | None = None,
-    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
-) -> tuple[tuple[int, ...], ...] | None:
-    """Extract parameter-ordered concrete tensor shapes from case, dims, or proto specs."""
-    if ordered_tensor_shapes is not None:
-        explicit = _extract_concrete_shape_list(ordered_tensor_shapes)
-        return tuple(explicit) if explicit else None
-
-    for container in (case_entry, dims):
-        if isinstance(container, Mapping) and "ordered_tensor_shapes" in container:
-            explicit = _extract_concrete_shape_list(container.get("ordered_tensor_shapes"))
-            if explicit:
-                return tuple(explicit)
-
-    inputs: list[tuple[int, ...]] = []
-    outputs: list[tuple[int, ...]] = []
-    for container in (case_entry, dims):
-        if not isinstance(container, Mapping):
-            continue
-        if not inputs:
-            raw_in = (
-                container.get("input_shapes")
-                if "input_shapes" in container
-                else container.get("input_shape")
-            )
-            inputs = _extract_concrete_shape_list(raw_in)
-        if not outputs:
-            raw_out = (
-                container.get("output_shapes")
-                if "output_shapes" in container
-                else container.get("output_shape")
-            )
-            outputs = _extract_concrete_shape_list(raw_out)
-
-    if not outputs and proto is not None:
-        raw_attrs = case_entry.get("attrs") if isinstance(case_entry, Mapping) else None
-        attrs = raw_attrs if isinstance(raw_attrs, Mapping) else None
-        outputs = _resolve_proto_output_shapes(proto, dims=dims, attrs=attrs)
-
-    combined = [*inputs, *outputs]
-    return tuple(combined) if combined else None
-
-
 def run_l0_static_precheck(
     module_source: str,
     *,
@@ -993,19 +861,27 @@ def _extract_lowered_compiler_excerpt(
     max_chars: int = 2400,
 ) -> str:
     """Slice raw lowered CCE/TIR lines around reported :line: numbers or leading 24 lines."""
-    raw_source = str(
-        getattr(stage_b, "generated_cce", "") or getattr(stage_b, "lowered_tir", "") or ""
-    )
+    cce_source = str(getattr(stage_b, "generated_cce", "") or "")
+    tir_source = str(getattr(stage_b, "lowered_tir", "") or "")
+    has_cce = bool(cce_source.strip())
+    raw_source = cce_source if has_cce else tir_source
     if not raw_source.strip():
         return ""
     lines = raw_source.splitlines()
     if not lines:
         return ""
+    diag_text = stage_b.error_message or ""
     line_nums: list[int] = []
-    for match in re.finditer(r":(\d+)(?::\d+)?\b", stage_b.error_message or ""):
-        ln = int(match.group(1))
-        if 1 <= ln <= len(lines):
-            line_nums.append(ln)
+    if has_cce:
+        for match in re.finditer(r"\.cce:(\d+)(?::\d+)?\b", diag_text):
+            ln = int(match.group(1))
+            if 1 <= ln <= len(lines):
+                line_nums.append(ln)
+    if not line_nums:
+        for match in re.finditer(r":(\d+)(?::\d+)?\b", diag_text):
+            ln = int(match.group(1))
+            if 1 <= ln <= len(lines):
+                line_nums.append(ln)
     if line_nums:
         merged_ranges: list[list[int]] = []
         for ln in sorted(set(line_nums)):
@@ -1030,6 +906,143 @@ def _extract_lowered_compiler_excerpt(
         keep_len = max(0, max_chars - len(trunc_marker))
         return excerpt[:keep_len].rstrip() + trunc_marker
     return excerpt
+
+
+def _py_char_offset(lines: Sequence[str], lineno: int, col_offset: int) -> int:
+    prefix = sum(len(lines[idx]) for idx in range(lineno - 1))
+    line_bytes = lines[lineno - 1].encode("utf-8")
+    return prefix + len(line_bytes[:col_offset].decode("utf-8"))
+
+
+def _format_cpp_string_literal(cpp_text: str) -> str:
+    if '"""' not in cpp_text and not cpp_text.endswith('"'):
+        return f'r"""{cpp_text}"""'
+    return repr(cpp_text)
+
+
+def _detect_trackb_prologue_line_offset(raw_src: str, *, parent_source: str = "") -> int:
+    """Count lines prepended before trackb_src by a module's _render_trackb_tu renderer."""
+    sentinel = "__TF_TRACKB_SENTINEL_MARKER__"
+    for candidate_src in (raw_src, parent_source):
+        if not candidate_src or "def _render_trackb_tu" not in candidate_src:
+            continue
+        try:
+            with tempfile.TemporaryDirectory(prefix="tf_tb_offset_") as tmp_dir:
+                mod_path = Path(tmp_dir) / "tb_mod.py"
+                mod_path.write_text(candidate_src, encoding="utf-8")
+                spec = importlib.util.spec_from_file_location("_tf_tb_offset_mod", str(mod_path))
+                if spec is not None and spec.loader is not None:
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    render = getattr(mod, "_render_trackb_tu", None)
+                    if callable(render):
+                        rendered = render(trackb_src=sentinel)
+                        if isinstance(rendered, str) and sentinel in rendered:
+                            return rendered.split(sentinel, 1)[0].count("\n")
+        except Exception:
+            pass
+        try:
+            tree = ast.parse(candidate_src)
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == "_render_trackb_tu":
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Return) and sub.value is not None:
+                        if isinstance(sub.value, ast.BinOp) and isinstance(sub.value.op, ast.Add):
+                            left_src = ast.get_source_segment(candidate_src, sub.value.left) or ""
+                            if left_src:
+                                try:
+                                    val = ast.literal_eval(left_src)
+                                    if isinstance(val, str):
+                                        return val.count("\n")
+                                except Exception:
+                                    return left_src.count("\\n")
+    return 0
+
+
+def _compact_trackb_repair_source(
+    raw_src: str,
+    diag: str,
+    max_bytes: int = 14800,
+    *,
+    parent_source: str = "",
+) -> str:
+    """Slice oversized Track-B repair source while keeping hybrid Python AST valid."""
+    if len(raw_src.encode("utf-8")) <= max_bytes:
+        return raw_src
+    focus = extract_cpp_diagnostic_lines(diag)
+    try:
+        tree = ast.parse(raw_src)
+    except SyntaxError:
+        if "__global__" in raw_src or "__aicore__" in raw_src or "__simd_vf__" in raw_src:
+            return build_trackb_context_view(
+                raw_src,
+                max_bytes=max_bytes,
+                focus_lines=focus,
+                diagnostic_text=diag,
+            )
+        return raw_src
+
+    lines = raw_src.splitlines(keepends=True)
+    hits: list[tuple[str, str, int, int]] = []
+    for node in tree.body:
+        name: str | None = None
+        val: ast.AST | None = None
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            name, val = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, val = node.target.id, node.value
+        if (
+            name is not None
+            and isinstance(val, ast.Constant)
+            and isinstance(val.value, str)
+            and val.end_lineno is not None
+            and val.end_col_offset is not None
+            and any(
+                tok in val.value
+                for tok in ("__global__", "__aicore__", "__simd_vf__", "__simt_vf__")
+            )
+        ):
+            start_pos = _py_char_offset(lines, val.lineno, val.col_offset)
+            end_pos = _py_char_offset(lines, val.end_lineno, val.end_col_offset)
+            hits.append((name, val.value, start_pos, end_pos))
+
+    if not hits:
+        return raw_src
+
+    prologue_offset = _detect_trackb_prologue_line_offset(raw_src, parent_source=parent_source)
+    adjusted_focus = (
+        tuple(ln - prologue_offset for ln in focus if ln > prologue_offset)
+        if prologue_offset > 0
+        else focus
+    )
+    diag_for_view = "" if prologue_offset > 0 else diag
+
+    replacements: list[tuple[int, int, str]] = []
+    for sym_name, cpp_text, start_pos, end_pos in hits:
+        outer_bytes = len((raw_src[:start_pos] + raw_src[end_pos:]).encode("utf-8"))
+        cpp_budget = max(512, max_bytes - outer_bytes - 16)
+        view = build_trackb_context_view(
+            cpp_text,
+            module_source=raw_src,
+            trackb_symbol=sym_name,
+            max_bytes=cpp_budget,
+            focus_lines=adjusted_focus,
+            diagnostic_text=diag_for_view,
+        )
+        wrapped = view if view.startswith("\n") else f"\n{view}\n"
+        replacements.append((start_pos, end_pos, _format_cpp_string_literal(wrapped)))
+
+    updated = raw_src
+    for start_pos, end_pos, literal in reversed(replacements):
+        updated = updated[:start_pos] + literal + updated[end_pos:]
+    ast.parse(updated)
+    return updated
 
 
 async def run_l0_l1_round_filter(
@@ -1060,28 +1073,16 @@ async def run_l0_l1_round_filter(
     """Filter candidate snippets through L0 static, optional CostModel prescreen, and L1 compile."""
     max_attempts = max(0, max_syntax_repairs)
 
-    def _compact_trackb_repair_source(raw_src: str, diag: str, max_bytes: int = 14800) -> str:
-        if len(raw_src.encode("utf-8")) <= max_bytes:
-            return raw_src
-        focus = extract_cpp_diagnostic_lines(diag)
-        if "__global__" in raw_src or "__aicore__" in raw_src or "__simd_vf__" in raw_src:
-            return build_trackb_context_view(
-                raw_src,
-                max_bytes=max_bytes,
-                focus_lines=focus,
-                diagnostic_text=diag,
-            )
-        return raw_src
-
     async def _try_repair(
         cur_src: str,
         diag: str,
         *,
         lowered_excerpt: str = "",
+        lowered_excerpt_lang: str | None = None,
     ) -> tuple[str | None, str, bool]:
         assert repair_backend is not None
         repair_src = (
-            _compact_trackb_repair_source(cur_src, diag)
+            _compact_trackb_repair_source(cur_src, diag, parent_source=parent_source)
             if backend_kind in ("ascendc", "ascendc_template", "ascendc_trackb", "hybrid_trackb")
             else cur_src
         )
@@ -1097,6 +1098,7 @@ async def run_l0_l1_round_filter(
             vector_mode=vector_mode,
             ub_256kb_unlock=ub_256kb_unlock,
             lowered_excerpt=lowered_excerpt,
+            lowered_excerpt_lang=lowered_excerpt_lang,
         )
         try:
             raw_reply = await repair_backend.generate(req)
@@ -1243,10 +1245,14 @@ async def run_l0_l1_round_filter(
                     error_message=err,
                 )
             lowered_excerpt = _extract_lowered_compiler_excerpt(stage_b)
+            has_cce = bool(str(getattr(stage_b, "generated_cce", "") or "").strip())
+            has_tir = bool(str(getattr(stage_b, "lowered_tir", "") or "").strip())
+            excerpt_lang = "cpp" if has_cce else ("python" if has_tir else None)
             next_snippet, rep_err, is_transport = await _try_repair(
                 cur_snippet,
                 err,
                 lowered_excerpt=lowered_excerpt,
+                lowered_excerpt_lang=excerpt_lang,
             )
             if next_snippet is None:
                 return L0L1CandidateCheck(

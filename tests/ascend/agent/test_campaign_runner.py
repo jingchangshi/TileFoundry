@@ -2088,51 +2088,69 @@ def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
         assert stats.trials == prior_trials[rid]
 
 
-def test_np4_default_regime_specs_hir_dims_and_navigation_packets() -> None:
-    """Verify default regime representative_hir_dims compile into valid HIR/TIR packets."""
+def test_np4_default_regime_specs_golden_dims_and_navigation_packets() -> None:
+    """Verify default regime representative dims synthesize valid universal blueprints."""
     from tilefoundry_ascend.agent.campaign import get_default_regime_specs  # noqa: PLC0415
-    from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (  # noqa: PLC0415
-        compile_hir_blueprint,
+    from tilefoundry_ascend.ascend.sil.pytorch_frontend import (  # noqa: PLC0415
+        PyTorchSemanticAnalyzer,
     )
     from tilefoundry_ascend.ascend.target import AscendTarget  # noqa: PLC0415
 
-    repo_root = Path(__file__).resolve().parents[3]
     target = AscendTarget("ascend.950pr")
+    analyzer = PyTorchSemanticAnalyzer(target)
+    golden_sources = {
+        "attention_residual": (
+            "import math\nimport torch\n\n"
+            "def forward(v_stack, x, w, gamma):\n"
+            "    vf = v_stack.to(torch.float32)\n"
+            "    rms = torch.rsqrt(vf.pow(2).mean(dim=-1, keepdim=True) + 1e-6)\n"
+            "    scores = (vf * rms * gamma * w).sum(dim=-1) / math.sqrt(vf.shape[-1])\n"
+            "    probs = torch.softmax(scores, dim=0)\n"
+            "    return (0.5 * x.to(torch.float32) + 0.5 * (probs.unsqueeze(-1) * vf).sum(dim=0)).to(v_stack.dtype)\n"
+        ),
+        "mla": (
+            "import torch\n\n"
+            "def forward(q, k, v):\n"
+            "    scores = torch.matmul(q, k.transpose(-2, -1))\n"
+            "    probs = torch.softmax(scores, dim=-1)\n"
+            "    return torch.matmul(probs, v)\n"
+        ),
+    }
 
-    for op_name in ("attention_residual", "mla"):
-        op_dir = repo_root / "examples" / "ascend950pr_ops" / op_name
-        model_src = (op_dir / "model.py").read_text(encoding="utf-8")
-        sched_src = (op_dir / "scheduled.py").read_text(encoding="utf-8")
+    for op_name, golden_src in golden_sources.items():
+        semantics = analyzer.analyze_source(golden_src, entry_name="forward")
         specs = get_default_regime_specs(op_name)
         assert len(specs) == 3
         for spec in specs:
             assert spec.representative_hir_dims
             roundtrip = RegimeTargetSpec.from_dict(spec.to_dict())
             assert roundtrip.representative_hir_dims == spec.representative_hir_dims
-            pkt = compile_hir_blueprint(
-                model_src,
-                scheduled_hir_source=sched_src,
-                anchor_dims=spec.representative_hir_dims,
-                target=target,
-            )
+            dims = dict(spec.representative_anchor_dims or spec.representative_hir_dims)
+            if op_name == "mla":
+                dims.setdefault("D_qk", dims.get("D_nope", 128) + dims.get("D_rope", 64))
+            elif "M" not in dims and "total_elements" not in dims and "rows" not in dims:
+                dims["M"] = int(dims.get("S", 1)) * int(dims.get("B", 1))
+            pkt = analyzer.build_universal_blueprint(semantics, dims)
             assert pkt.roofline.ideal_roofline_us > 0.0
             assert not hasattr(pkt, "tir_script")
-            assert pkt.reference_ledger is not None
-            assert pkt.reference_ledger.is_legal is True
-            assert pkt.lowering_diagnostics == ()
+            assert pkt.provenance is not None
+            assert pkt.provenance.semantic_source == "pytorch_golden"
 
 
 def test_np4_campaign_autodiscovery_nav_injection_router_off_and_17_rules(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    """Verify sibling HIR/TIR autodiscovery, zero capability_gate calls, and R01-R17."""
+    """Verify golden blueprint synthesis, zero capability_gate calls, and R01-R21."""
     import tilefoundry_ascend.agent.router.capability_gate as cap_gate  # noqa: PLC0415
     from tilefoundry_ascend.agent.kb import build_predicate_context  # noqa: PLC0415
     from tilefoundry_ascend.agent.orchestrator import (  # noqa: PLC0415
         compute_static_dynamic_residual,
     )
     from tilefoundry_ascend.ascend.passes import build_scope_waterline  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.sil.pytorch_frontend import (  # noqa: PLC0415
+        PyTorchSemanticAnalyzer,
+    )
 
     router_calls: list[str] = []
 
@@ -2147,16 +2165,6 @@ def test_np4_campaign_autodiscovery_nav_injection_router_off_and_17_rules(
     monkeypatch.setattr(cap_gate.CapabilityGate, "route", _forbid_gate)
     monkeypatch.setattr(cap_gate, "route_execution_track", _forbid_route)
 
-    repo_root = Path(__file__).resolve().parents[3]
-    ar_dir = repo_root / "examples" / "ascend950pr_ops" / "attention_residual"
-    (tmp_path / "model.py").write_text(
-        (ar_dir / "model.py").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    (tmp_path / "scheduled.py").write_text(
-        (ar_dir / "scheduled.py").read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
     target_path = tmp_path / "kernels.py"
     target_path.write_text(_MULTI_REGIME_MODULE, encoding="utf-8")
 
@@ -2170,6 +2178,17 @@ def test_np4_campaign_autodiscovery_nav_injection_router_off_and_17_rules(
             representative_hir_dims={"N": 2, "B": 1, "S": 1, "D": 64},
         ),
     )
+    golden_src = (
+        "import torch\n\n"
+        "def forward(v_stack, x, w, gamma):\n"
+        "    rms = torch.rsqrt(v_stack.pow(2).mean(dim=-1, keepdim=True) + 1e-6)\n"
+        "    scores = (v_stack * rms * gamma * w).sum(dim=-1)\n"
+        "    probs = torch.softmax(scores, dim=0)\n"
+        "    return 0.5 * x + 0.5 * (probs.unsqueeze(-1) * v_stack).sum(dim=0)\n"
+    )
+    analyzer = PyTorchSemanticAnalyzer()
+    sem = analyzer.analyze_source(golden_src, entry_name="forward")
+    pkt = analyzer.build_universal_blueprint(sem, {"M": 2, "D": 64})
 
     disjoint_ssbuf_dsl = """
 def _build_regime_a(tile_m=2):
@@ -2215,6 +2234,7 @@ def _build_regime_a(tile_m=2):
         perf_target=PerfTargetSpec("synthetic_ar_op", 3.0, 2.0, 0.90),
         anchors=anchors,
         regime_specs=regimes,
+        regime_blueprints={"small_decode": pkt},
         llm_backend=backend,
         l1_compiler=lambda _src, _reg: StageBResult(passed=True),
         l2_batch_evaluator=_l2_eval,
@@ -2222,8 +2242,6 @@ def _build_regime_a(tile_m=2):
         checkpoint_path=tmp_path / "ckpt_np4.json",
     )
 
-    assert runner._authored_hir_path == (tmp_path / "model.py").resolve()
-    assert runner._scheduled_hir_path == (tmp_path / "scheduled.py").resolve()
     assert "small_decode" in runner._regime_blueprints
 
     active_by_id = {rule.rule_id: rule for rule in runner._tracker.active_rules()}

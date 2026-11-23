@@ -725,9 +725,9 @@ def build_trackb_context_view(
     footer = "\n\n".join(helper_summaries)
     overhead_bytes = len((static_header + "\n\n" + footer).encode("utf-8")) + 64
 
-    body_parts: list[str] = []
+    body_parts: list[tuple[str, _CppUnit | None]] = []
     if static_header:
-        body_parts.append(static_header)
+        body_parts.append((static_header, None))
 
     if target_unit is not None:
         ref_full_text = "\n\n".join(h.text.strip() for h in ref_helpers)
@@ -737,9 +737,11 @@ def build_trackb_context_view(
             + len(target_unit.text.encode("utf-8"))
         )
         if full_with_helpers <= max_bytes:
-            if ref_full_text:
-                body_parts.append(ref_full_text)
-            body_parts.append(target_unit.text.strip())
+            for rh in ref_helpers:
+                rh_text = rh.text.strip()
+                if rh_text:
+                    body_parts.append((rh_text, rh))
+            body_parts.append((target_unit.text.strip(), target_unit))
         else:
             focused_helpers = [
                 h
@@ -753,14 +755,14 @@ def build_trackb_context_view(
                 if h.signature
             )
             if ref_sum_text:
-                body_parts.append(ref_sum_text)
+                body_parts.append((ref_sum_text, None))
 
             target_has_focus = any(
                 target_unit.start_line <= fl <= target_unit.end_line for fl in resolved_focus
             )
             if focused_helpers:
                 fixed_bytes = (
-                    len("\n\n".join(p for p in body_parts if p).encode("utf-8"))
+                    len("\n\n".join(p for p, _ in body_parts if p).encode("utf-8"))
                     + (len(("\n\n" + footer).encode("utf-8")) if footer else 0)
                     + 16
                 )
@@ -772,7 +774,10 @@ def build_trackb_context_view(
                 raw_focused = [h.text.strip() for h in focused_helpers if h.text.strip()]
                 raw_focused_bytes = sum(len(t.encode("utf-8")) for t in raw_focused)
                 if raw_focused_bytes + 4 * len(raw_focused) <= helper_cap:
-                    body_parts.extend(raw_focused)
+                    for fh in focused_helpers:
+                        fh_text = fh.text.strip()
+                        if fh_text:
+                            body_parts.append((fh_text, fh))
                 else:
                     per_helper_budget = max(
                         256,
@@ -783,38 +788,76 @@ def build_trackb_context_view(
                         if not fh_text:
                             continue
                         body_parts.append(
-                            _truncate_kernel_body(
-                                fh_text,
-                                per_helper_budget,
-                                unit_start_line=fh.start_line,
-                                focus_lines=resolved_focus,
-                                focus_window=focus_window,
+                            (
+                                _truncate_kernel_body(
+                                    fh_text,
+                                    per_helper_budget,
+                                    unit_start_line=fh.start_line,
+                                    focus_lines=resolved_focus,
+                                    focus_window=focus_window,
+                                ),
+                                fh,
                             )
                         )
 
-            used_parts = [p for p in body_parts if p]
+            used_parts = [p for p, _ in body_parts if p]
             if footer:
                 used_parts.append(footer)
             used_now = len("\n\n".join(used_parts).encode("utf-8")) + 4
             remaining = max(256, max_bytes - used_now)
             body_parts.append(
-                _truncate_kernel_body(
-                    target_unit.text.strip(),
-                    remaining,
-                    unit_start_line=target_unit.start_line,
-                    focus_lines=resolved_focus,
-                    focus_window=focus_window,
+                (
+                    _truncate_kernel_body(
+                        target_unit.text.strip(),
+                        remaining,
+                        unit_start_line=target_unit.start_line,
+                        focus_lines=resolved_focus,
+                        focus_window=focus_window,
+                    ),
+                    target_unit,
                 )
             )
     elif ref_helpers:
-        body_parts.append("\n".join(ref_summaries))
+        body_parts.append(("\n".join(ref_summaries), None))
 
     if footer:
-        body_parts.append(footer)
+        body_parts.append((footer, None))
 
-    result = "\n\n".join(p for p in body_parts if p).strip()
+    non_empty_parts = [(p, unit) for p, unit in body_parts if p]
+    result = "\n\n".join(p for p, _ in non_empty_parts).strip()
     if len(result.encode("utf-8")) > max_bytes:
-        result = _truncate_kernel_body(result, max_bytes)
+        remapped_focus: list[int] = []
+        if resolved_focus:
+            cpp_lines = cpp_source.splitlines()
+            cur_line = 1
+            for part_idx, (part_text, unit) in enumerate(non_empty_parts):
+                p_text = part_text.strip() if part_idx in (0, len(non_empty_parts) - 1) else part_text
+                p_lines = p_text.splitlines()
+                if unit is not None:
+                    for fl in resolved_focus:
+                        if not (unit.start_line <= fl <= unit.end_line) or not (1 <= fl <= len(cpp_lines)):
+                            continue
+                        orig_line = cpp_lines[fl - 1].rstrip()
+                        raw_rel = fl - unit.start_line
+                        if 0 <= raw_rel < len(p_lines) and p_lines[raw_rel].rstrip() == orig_line:
+                            remapped_focus.append(cur_line + raw_rel)
+                            continue
+                        matches = [
+                            idx
+                            for idx, pln in enumerate(p_lines)
+                            if pln.rstrip() == orig_line
+                        ]
+                        if matches:
+                            best_idx = min(matches, key=lambda idx: abs(idx - raw_rel))
+                            remapped_focus.append(cur_line + best_idx)
+                cur_line += len(p_lines) + 1
+        result = _truncate_kernel_body(
+            result,
+            max_bytes,
+            unit_start_line=1,
+            focus_lines=tuple(sorted(set(remapped_focus))),
+            focus_window=focus_window,
+        )
     return result
 
 

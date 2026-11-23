@@ -38,17 +38,10 @@ _M3_OPS: tuple[str, ...] = (
     "kimi_delta_attention",
 )
 
-_ADD_HIR = (
-    "from __future__ import annotations\n"
-    "from tilefoundry.dsl import *\n"
-    "from tilefoundry_ascend import AscendTarget\n"
-    "TOPOS = (Topology('block', 1), Topology('aic', 1), "
-    "Topology('aiv', 2), Topology('lane', 64))\n"
-    "@module(entry='add_op', target=AscendTarget('ascend.950pr'), topologies=TOPOS)\n"
-    "class AddMod:\n"
-    "    @func\n"
-    "    def add_op(a: Tensor[(4, 8), 'f32'], b: Tensor[(4, 8), 'f32']) -> Tensor[(4, 8), 'f32']:\n"
-    "        return tf.cast(a + b, dtype='f32')\n"
+_ADD_GOLDEN = (
+    "import torch\n\n"
+    "def add_op(a, b):\n"
+    "    return a + b\n"
 )
 
 
@@ -188,8 +181,8 @@ def test_twin_bridge_value_range_zero_avoidance_and_numerical_twin() -> None:
 
     ok_cand = "def add_op(a, b):\n    return a + b\n"
     bad_cand = "def add_op(a, b):\n    return a - b\n"
-    ok_res = verify_numerical_twin(_ADD_HIR, ok_cand)
-    bad_res = verify_numerical_twin(_ADD_HIR, bad_cand)
+    ok_res = verify_numerical_twin(_ADD_GOLDEN, ok_cand)
+    bad_res = verify_numerical_twin(_ADD_GOLDEN, bad_cand)
     assert ok_res.passed is True, ok_res.error_message
     assert bad_res.passed is False
     assert "twin_numeric_mismatch" in bad_res.error_message
@@ -198,7 +191,7 @@ def test_twin_bridge_value_range_zero_avoidance_and_numerical_twin() -> None:
 def test_e2e_evolution_proxy_device_runs_numerical_twin() -> None:
     """Verify _wrap_funnel_with_proxy rejects wrong math operators via CPU twin comparison."""
     funnel = GateFunnel(skip_stage_b=True)
-    wrapped = _wrap_funnel_with_proxy(funnel, None, hir_source=_ADD_HIR, anchor_dims={})
+    wrapped = _wrap_funnel_with_proxy(funnel, None, hir_source=_ADD_GOLDEN, anchor_dims={})
     assert wrapped._device_runner is not None
     ledger = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",

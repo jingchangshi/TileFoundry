@@ -1,8 +1,7 @@
-"""Offline end-to-end tests driving dual-loop evolution from attention_residual and mla HIR."""
+"""Offline end-to-end tests driving dual-loop evolution from PyTorch golden fixtures."""
 
 import asyncio
 import json
-from pathlib import Path
 
 from tilefoundry_ascend.agent import (
     BayesianRuleTracker,
@@ -16,9 +15,32 @@ from tilefoundry_ascend.agent.orchestrator import (
     compute_static_dynamic_residual,
 )
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_AR_MODEL_PATH = _REPO_ROOT / "examples" / "ascend950pr_ops" / "attention_residual" / "model.py"
-_MLA_MODEL_PATH = _REPO_ROOT / "examples" / "ascend950pr_ops" / "mla" / "model.py"
+_AR_GOLDEN = """
+import math
+import torch
+
+def forward(v_stack, x, w, gamma):
+    vf = v_stack.to(torch.float32)
+    xf = x.to(torch.float32)
+    wf = w.to(torch.float32)
+    gf = gamma.to(torch.float32)
+    rms = torch.rsqrt(vf.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+    k = vf * rms * gf
+    d_dim = vf.shape[-1]
+    scores = (k * wf.view(1, 1, 1, d_dim)).sum(dim=-1) / math.sqrt(d_dim)
+    probs = torch.softmax(scores, dim=0)
+    agg = (probs.unsqueeze(-1) * vf).sum(dim=0)
+    return (0.5 * xf + 0.5 * agg).to(v_stack.dtype)
+"""
+
+_MLA_GOLDEN = """
+import torch
+
+def forward(q, k, v):
+    scores = torch.matmul(q, k.transpose(-2, -1))
+    probs = torch.softmax(scores, dim=-1)
+    return torch.matmul(probs, v)
+"""
 
 _BASELINE_DSL = """
 import tilelang.ascend.language as T
@@ -115,12 +137,8 @@ def _surrogate_device_runner(dsl_source: str, stage_a) -> StageCResult:
     )
 
 
-def test_e2e_evolution_offline_hir_to_converged_trajectories() -> None:
-    """Verify multi-round evolution from real attention_residual and mla HIR files."""
-    ar_hir = _AR_MODEL_PATH.read_text(encoding="utf-8")
-    mla_hir = _MLA_MODEL_PATH.read_text(encoding="utf-8")
-    assert "AttentionResidualModel" in ar_hir
-    assert "MlaModel" in mla_hir
+def test_e2e_evolution_offline_golden_to_converged_trajectories() -> None:
+    """Verify multi-round evolution from PyTorch golden forward() fixtures."""
 
     def _make_backend() -> MockLLMBackend:
         return MockLLMBackend(
@@ -147,8 +165,9 @@ def test_e2e_evolution_offline_hir_to_converged_trajectories() -> None:
 
     async def _run_both():
         ar_traj = await run_e2e_evolution(
-            problem_name="attention_residual_hir",
-            hir_source=ar_hir,
+            problem_name="forward",
+            hir_source=_AR_GOLDEN,
+            anchor_dims={"B": 1, "S": 4, "D": 64, "N": 4},
             shape_contract="make_kernel() returning fixed static benchmark tensor signature",
             backend=_make_backend(),
             funnel=funnel,
@@ -157,8 +176,9 @@ def test_e2e_evolution_offline_hir_to_converged_trajectories() -> None:
             k_rule_workers=2,
         )
         mla_traj = await run_e2e_evolution(
-            problem_name="mla_hir",
-            hir_source=mla_hir,
+            problem_name="forward",
+            hir_source=_MLA_GOLDEN,
+            anchor_dims={"B": 1, "S_q": 16, "S_kv": 16, "N_q": 4, "N_kv": 1, "D_qk": 64},
             shape_contract="make_kernel() returning fixed static benchmark tensor signature",
             backend=_make_backend(),
             funnel=funnel,
@@ -182,15 +202,15 @@ def test_e2e_evolution_offline_hir_to_converged_trajectories() -> None:
         assert len(payload["rounds"]) == 2
 
 
-def test_np3_hir_tir_navigation_router_off_and_scheduled_blueprint(monkeypatch) -> None:
-    """Verify router-off HIR/TIR navigation contract and zero capability_gate calls."""
+def test_np3_golden_navigation_router_off_and_universal_blueprint(monkeypatch) -> None:
+    """Verify router-off PyTorch golden navigation and zero capability_gate calls."""
     import tilefoundry_ascend.agent.router.capability_gate as cap_gate  # noqa: PLC0415
     from tilefoundry_ascend.agent.orchestrator import (  # noqa: PLC0415
         TwoLaneBeamSearch,
         build_hir_seed_request,
     )
-    from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (  # noqa: PLC0415
-        compile_hir_blueprint,
+    from tilefoundry_ascend.ascend.sil.pytorch_frontend import (  # noqa: PLC0415
+        PyTorchSemanticAnalyzer,
     )
     from tilefoundry_ascend.ascend.target import AscendTarget  # noqa: PLC0415
 
@@ -207,16 +227,14 @@ def test_np3_hir_tir_navigation_router_off_and_scheduled_blueprint(monkeypatch) 
     monkeypatch.setattr(cap_gate.CapabilityGate, "route", _forbid_gate)
     monkeypatch.setattr(cap_gate, "route_execution_track", _forbid_route)
 
-    ar_hir = _AR_MODEL_PATH.read_text(encoding="utf-8")
-    ar_sched = _AR_MODEL_PATH.with_name("scheduled.py").read_text(encoding="utf-8")
-    blueprint = compile_hir_blueprint(
-        ar_hir,
-        scheduled_hir_source=ar_sched,
-        anchor_dims={"N": 4, "B": 1, "S": 4, "D": 64},
-        target=AscendTarget("ascend.950pr"),
+    analyzer = PyTorchSemanticAnalyzer(AscendTarget("ascend.950pr"))
+    semantics = analyzer.analyze_source(_AR_GOLDEN, entry_name="forward")
+    blueprint = analyzer.build_universal_blueprint(
+        semantics,
+        {"M": 16, "D": 64},
     )
     seed_req = build_hir_seed_request(
-        ar_hir,
+        _AR_GOLDEN,
         "make_kernel()",
         blueprint=blueprint,
     )
@@ -239,10 +257,9 @@ def test_np3_hir_tir_navigation_router_off_and_scheduled_blueprint(monkeypatch) 
     beam = TwoLaneBeamSearch(exploit_width=1, stepping_stone_width=1)
     traj = asyncio.run(
         run_e2e_evolution(
-            problem_name="ar_hir_tir_nav",
-            hir_source=ar_hir,
-            scheduled_hir_source=ar_sched,
-            anchor_dims={"N": 4, "B": 1, "S": 4, "D": 64},
+            problem_name="forward",
+            hir_source=_AR_GOLDEN,
+            anchor_dims={"M": 4, "D": 64},
             shape_contract="make_kernel()",
             backend=backend,
             funnel=funnel,
@@ -261,7 +278,6 @@ def test_np3_hir_tir_navigation_router_off_and_scheduled_blueprint(monkeypatch) 
     assert traj.track == "unconstrained"
     assert beam.exploit_beam[0].features is None
     assert traj.hir_blueprint_summary
-    assert traj.hir_blueprint_summary["reference_ledger"] is not None
     assert traj.hir_blueprint_summary["roofline"]["ideal_roofline_us"] > 0.0
     payload = json.loads(traj.to_json())
     assert payload["feature_vector"] == {}
