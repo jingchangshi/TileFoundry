@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import hashlib
-import importlib.util
 import json
 import logging
 import math
@@ -41,8 +40,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     resolve_cannbench_tasks_root,
 )
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
-    build_trackb_context_view,
-    extract_cpp_diagnostic_lines,
+    parse_scoped_search_replace_blocks,
 )
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
@@ -59,7 +57,15 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     KernelLLMBackend,
     extract_python_dsl,
 )
-from tilefoundry_ascend.agent.orchestrator.portfolio_runner import build_syntax_repair_request
+from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
+    _ANY_FOLDING_MARKER_RE,
+    _compact_trackb_repair_source,
+    _detect_trackb_prologue_line_offset,
+    _resplice_trackb_omitted_spans,
+    build_syntax_repair_request,
+    extract_lowered_compiler_excerpt as _extract_lowered_compiler_excerpt,
+    extract_lowered_compiler_excerpt_with_lang,
+)
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
     extract_microarch_profile_from_cce,
 )
@@ -854,208 +860,19 @@ def _repair_timeout_message(error_message: str, is_transport: bool) -> str:
     return f"{error_message} [repair_timeout]" if is_transport else error_message
 
 
-def _extract_lowered_compiler_excerpt(
-    stage_b: StageBResult,
-    *,
-    window: int = 12,
-    max_chars: int = 2400,
-) -> str:
-    """Slice raw lowered CCE/TIR lines around reported :line: numbers or leading 24 lines."""
-    cce_source = str(getattr(stage_b, "generated_cce", "") or "")
-    tir_source = str(getattr(stage_b, "lowered_tir", "") or "")
-    has_cce = bool(cce_source.strip())
-    raw_source = cce_source if has_cce else tir_source
-    if not raw_source.strip():
-        return ""
-    lines = raw_source.splitlines()
-    if not lines:
-        return ""
-    diag_text = stage_b.error_message or ""
-    line_nums: list[int] = []
-    if has_cce:
-        for match in re.finditer(r"\.cce:(\d+)(?::\d+)?\b", diag_text):
-            ln = int(match.group(1))
-            if 1 <= ln <= len(lines):
-                line_nums.append(ln)
-    if not line_nums:
-        for match in re.finditer(r":(\d+)(?::\d+)?\b", diag_text):
-            ln = int(match.group(1))
-            if 1 <= ln <= len(lines):
-                line_nums.append(ln)
-    if line_nums:
-        merged_ranges: list[list[int]] = []
-        for ln in sorted(set(line_nums)):
-            start = max(1, ln - window)
-            end = min(len(lines), ln + window)
-            if merged_ranges and start <= merged_ranges[-1][1] + 1:
-                merged_ranges[-1][1] = max(merged_ranges[-1][1], end)
-            else:
-                merged_ranges.append([start, end])
-        excerpt_lines: list[str] = []
-        for idx, (start, end) in enumerate(merged_ranges):
-            if idx > 0:
-                excerpt_lines.append("...")
-            for ln in range(start, end + 1):
-                excerpt_lines.append(f"{ln}: {lines[ln - 1]}")
-        excerpt = "\n".join(excerpt_lines)
-    else:
-        limit = min(len(lines), 24)
-        excerpt = "\n".join(f"{ln}: {lines[ln - 1]}" for ln in range(1, limit + 1))
-    if len(excerpt) > max_chars:
-        trunc_marker = "\n/* ... lowered excerpt truncated ... */"
-        keep_len = max(0, max_chars - len(trunc_marker))
-        return excerpt[:keep_len].rstrip() + trunc_marker
-    return excerpt
-
-
-def _py_char_offset(lines: Sequence[str], lineno: int, col_offset: int) -> int:
-    prefix = sum(len(lines[idx]) for idx in range(lineno - 1))
-    line_bytes = lines[lineno - 1].encode("utf-8")
-    return prefix + len(line_bytes[:col_offset].decode("utf-8"))
-
-
-def _format_cpp_string_literal(cpp_text: str) -> str:
-    if '"""' not in cpp_text and not cpp_text.endswith('"'):
-        return f'r"""{cpp_text}"""'
-    return repr(cpp_text)
-
-
-def _detect_trackb_prologue_line_offset(raw_src: str, *, parent_source: str = "") -> int:
-    """Count lines prepended before trackb_src by a module's _render_trackb_tu renderer."""
-    sentinel = "__TF_TRACKB_SENTINEL_MARKER__"
-    for candidate_src in (raw_src, parent_source):
-        if not candidate_src or "def _render_trackb_tu" not in candidate_src:
-            continue
-        try:
-            with tempfile.TemporaryDirectory(prefix="tf_tb_offset_") as tmp_dir:
-                mod_path = Path(tmp_dir) / "tb_mod.py"
-                mod_path.write_text(candidate_src, encoding="utf-8")
-                spec = importlib.util.spec_from_file_location("_tf_tb_offset_mod", str(mod_path))
-                if spec is not None and spec.loader is not None:
-                    mod = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(mod)
-                    render = getattr(mod, "_render_trackb_tu", None)
-                    if callable(render):
-                        rendered = render(trackb_src=sentinel)
-                        if isinstance(rendered, str) and sentinel in rendered:
-                            return rendered.split(sentinel, 1)[0].count("\n")
-        except Exception:
-            pass
-        try:
-            tree = ast.parse(candidate_src)
-        except SyntaxError:
-            continue
-        for node in tree.body:
-            if isinstance(node, ast.FunctionDef) and node.name == "_render_trackb_tu":
-                for sub in ast.walk(node):
-                    if isinstance(sub, ast.Return) and sub.value is not None:
-                        if isinstance(sub.value, ast.BinOp) and isinstance(sub.value.op, ast.Add):
-                            left_src = ast.get_source_segment(candidate_src, sub.value.left) or ""
-                            if left_src:
-                                try:
-                                    val = ast.literal_eval(left_src)
-                                    if isinstance(val, str):
-                                        return val.count("\n")
-                                except Exception:
-                                    return left_src.count("\\n")
-    return 0
-
-
-def _compact_trackb_repair_source(
-    raw_src: str,
-    diag: str,
-    max_bytes: int = 14800,
-    *,
-    parent_source: str = "",
-) -> str:
-    """Slice oversized Track-B repair source while keeping hybrid Python AST valid."""
-    if len(raw_src.encode("utf-8")) <= max_bytes:
-        return raw_src
-    focus = extract_cpp_diagnostic_lines(diag)
-    try:
-        tree = ast.parse(raw_src)
-    except SyntaxError:
-        if "__global__" in raw_src or "__aicore__" in raw_src or "__simd_vf__" in raw_src:
-            return build_trackb_context_view(
-                raw_src,
-                max_bytes=max_bytes,
-                focus_lines=focus,
-                diagnostic_text=diag,
-            )
-        return raw_src
-
-    lines = raw_src.splitlines(keepends=True)
-    hits: list[tuple[str, str, int, int]] = []
-    for node in tree.body:
-        name: str | None = None
-        val: ast.AST | None = None
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Name)
-        ):
-            name, val = node.targets[0].id, node.value
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            name, val = node.target.id, node.value
-        if (
-            name is not None
-            and isinstance(val, ast.Constant)
-            and isinstance(val.value, str)
-            and val.end_lineno is not None
-            and val.end_col_offset is not None
-            and any(
-                tok in val.value
-                for tok in ("__global__", "__aicore__", "__simd_vf__", "__simt_vf__")
-            )
-        ):
-            start_pos = _py_char_offset(lines, val.lineno, val.col_offset)
-            end_pos = _py_char_offset(lines, val.end_lineno, val.end_col_offset)
-            hits.append((name, val.value, start_pos, end_pos))
-
-    if not hits:
-        return raw_src
-
-    prologue_offset = _detect_trackb_prologue_line_offset(raw_src, parent_source=parent_source)
-    adjusted_focus = (
-        tuple(ln - prologue_offset for ln in focus if ln > prologue_offset)
-        if prologue_offset > 0
-        else focus
-    )
-    diag_for_view = "" if prologue_offset > 0 else diag
-
-    replacements: list[tuple[int, int, str]] = []
-    for sym_name, cpp_text, start_pos, end_pos in hits:
-        outer_bytes = len((raw_src[:start_pos] + raw_src[end_pos:]).encode("utf-8"))
-        cpp_budget = max(512, max_bytes - outer_bytes - 16)
-        view = build_trackb_context_view(
-            cpp_text,
-            module_source=raw_src,
-            trackb_symbol=sym_name,
-            max_bytes=cpp_budget,
-            focus_lines=adjusted_focus,
-            diagnostic_text=diag_for_view,
-        )
-        wrapped = view if view.startswith("\n") else f"\n{view}\n"
-        replacements.append((start_pos, end_pos, _format_cpp_string_literal(wrapped)))
-
-    updated = raw_src
-    for start_pos, end_pos, literal in reversed(replacements):
-        updated = updated[:start_pos] + literal + updated[end_pos:]
-    ast.parse(updated)
-    return updated
-
-
 async def run_l0_l1_round_filter(
     candidates: Sequence[tuple[str, str]],
     *,
     patch_fn: Callable[[str], str],
     l0_checker: Callable[[str], StageAResult],
     l1_compiler: Callable[[str], StageBResult],
+    repatch_from_current_fn: Callable[[str, str], str] | None = None,
     repair_backend: KernelLLMBackend | None = None,
     max_syntax_repairs: int = 1,
     slice_hint: str = "",
     backend_kind: str = "tilelang_dsl",
     parent_source: str = "",
+    trackb_prologue_line_offset: int = 0,
     stage_a_cost_ranker: Callable[
         [Sequence[tuple[str, str, StageAResult]]], Sequence[tuple[str, float]]
     ]
@@ -1072,6 +889,13 @@ async def run_l0_l1_round_filter(
 ) -> list[L0L1CandidateCheck]:
     """Filter candidate snippets through L0 static, optional CostModel prescreen, and L1 compile."""
     max_attempts = max(0, max_syntax_repairs)
+    trackb_backends = (
+        "ascendc",
+        "ascendc_template",
+        "ascendc_trackb",
+        "cce_trackb",
+        "hybrid_trackb",
+    )
 
     async def _try_repair(
         cur_src: str,
@@ -1079,11 +903,18 @@ async def run_l0_l1_round_filter(
         *,
         lowered_excerpt: str = "",
         lowered_excerpt_lang: str | None = None,
+        extra_pre_compaction_sources: Sequence[str] = (),
     ) -> tuple[str | None, str, bool]:
         assert repair_backend is not None
+        is_trackb = backend_kind in trackb_backends
         repair_src = (
-            _compact_trackb_repair_source(cur_src, diag, parent_source=parent_source)
-            if backend_kind in ("ascendc", "ascendc_template", "ascendc_trackb", "hybrid_trackb")
+            _compact_trackb_repair_source(
+                cur_src,
+                diag,
+                parent_source=parent_source,
+                prologue_line_offset=trackb_prologue_line_offset,
+            )
+            if is_trackb
             else cur_src
         )
         req = build_syntax_repair_request(
@@ -1108,6 +939,19 @@ async def run_l0_l1_round_filter(
             repaired_src = extract_python_dsl(raw_reply)
         except Exception as exc:
             return None, f"{diag} | repair_parse: {type(exc).__name__}: {exc}", False
+        if is_trackb:
+            repaired_src = _resplice_trackb_omitted_spans(
+                repaired_src,
+                pre_compaction_source=cur_src,
+                parent_source=parent_source,
+                extra_sources=extra_pre_compaction_sources,
+            )
+            if _ANY_FOLDING_MARKER_RE.search(repaired_src):
+                return (
+                    None,
+                    f"{diag} | trackb_folding_marker_rejected: unresolvable folding marker",
+                    False,
+                )
         if parent_source.strip():
             violations = check_repair_monotonicity(
                 parent_source,
@@ -1128,12 +972,14 @@ async def run_l0_l1_round_filter(
         *,
         start_attempt: int = 0,
         repaired: bool = False,
+        initial_patch_fn: Callable[[str], str] | None = None,
     ) -> tuple[L0L1CandidateCheck | None, tuple[str, str, StageAResult, bool, int] | None]:
         snippet = cur_snippet
         is_repaired = repaired
+        active_patch_fn = initial_patch_fn or patch_fn
         for attempt in range(start_attempt, max_attempts + 1):
             try:
-                patched = patch_fn(snippet)
+                patched = active_patch_fn(snippet)
             except Exception as exc:
                 err = f"ast_patch_error: {type(exc).__name__}: {exc}"
                 if repair_backend is None or attempt >= max_attempts:
@@ -1165,8 +1011,10 @@ async def run_l0_l1_round_filter(
                     )
                 snippet = next_snippet
                 is_repaired = True
+                active_patch_fn = patch_fn
                 continue
 
+            active_patch_fn = patch_fn
             stage_a = await asyncio.to_thread(l0_checker, patched)
             if not stage_a.passed:
                 err = stage_a.error_message or "l0_static_failed"
@@ -1184,7 +1032,11 @@ async def run_l0_l1_round_filter(
                         ),
                         None,
                     )
-                next_snippet, rep_err, is_transport = await _try_repair(snippet, err)
+                next_snippet, rep_err, is_transport = await _try_repair(
+                    snippet,
+                    err,
+                    extra_pre_compaction_sources=(patched,),
+                )
                 if next_snippet is None:
                     return (
                         L0L1CandidateCheck(
@@ -1204,6 +1056,20 @@ async def run_l0_l1_round_filter(
                 continue
             return None, (snippet, patched, stage_a, is_repaired, attempt)
         raise RuntimeError("unreachable repair termination")
+
+    def _make_stage_b_repair_patch_fn(base_patched: str) -> Callable[[str], str]:
+        if repatch_from_current_fn is None or not base_patched.strip():
+            return patch_fn
+
+        def _patch_repaired(snip: str) -> str:
+            try:
+                return repatch_from_current_fn(base_patched, snip)
+            except Exception:
+                if not parse_scoped_search_replace_blocks(snip):
+                    return patch_fn(snip)
+                raise
+
+        return _patch_repaired
 
     async def _run_stage_b_and_repairs(
         cand_id: str,
@@ -1244,15 +1110,13 @@ async def run_l0_l1_round_filter(
                     stage_b=stage_b,
                     error_message=err,
                 )
-            lowered_excerpt = _extract_lowered_compiler_excerpt(stage_b)
-            has_cce = bool(str(getattr(stage_b, "generated_cce", "") or "").strip())
-            has_tir = bool(str(getattr(stage_b, "lowered_tir", "") or "").strip())
-            excerpt_lang = "cpp" if has_cce else ("python" if has_tir else None)
+            lowered_excerpt, excerpt_lang = extract_lowered_compiler_excerpt_with_lang(stage_b)
             next_snippet, rep_err, is_transport = await _try_repair(
                 cur_snippet,
                 err,
                 lowered_excerpt=lowered_excerpt,
                 lowered_excerpt_lang=excerpt_lang,
+                extra_pre_compaction_sources=(cur_patched,),
             )
             if next_snippet is None:
                 return L0L1CandidateCheck(
@@ -1271,6 +1135,7 @@ async def run_l0_l1_round_filter(
                 next_snippet,
                 start_attempt=cur_attempt + 1,
                 repaired=True,
+                initial_patch_fn=_make_stage_b_repair_patch_fn(cur_patched),
             )
             if failed_chk is not None:
                 return failed_chk

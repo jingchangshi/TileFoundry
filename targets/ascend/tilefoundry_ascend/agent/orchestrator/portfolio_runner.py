@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import inspect
 import json
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
@@ -13,6 +15,11 @@ from tilefoundry_ascend.agent.kb.schema import (
     AscendCausalRule,
     build_predicate_context,
     rank_symptom_families,
+)
+from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+    build_trackb_context_view,
+    extract_cpp_diagnostic_lines,
+    parse_scoped_search_replace_blocks,
 )
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     FunnelEvaluation,
@@ -178,7 +185,7 @@ _RULE_CONCEPT_DESCRIPTIONS: dict[str, str] = {
         "Asymmetric 1C2V stage fission and pipelined UB footprint compression"
     ),
     "R16_PADDED_PITCH_TAIL_MASKING": (
-        "32B-aligned vector pitch padding with SIMD tail masking"
+        "32B-aligned UB pitch padding and SIMD tail masking for atom-aligned non-32B-multiple rows"
     ),
     "R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK": (
         "Register-resident loop accumulation and full 256 KiB UB unlock"
@@ -827,6 +834,493 @@ def build_creative_request(
     )
 
 
+_TRACKB_CPP_QUALIFIERS: tuple[str, ...] = (
+    'extern "C" __global__',
+    "__global__",
+    "__aicore__",
+    "__simd_vf__",
+    "__simt_vf__",
+)
+
+_OMITTED_SPAN_MARKER_RE = re.compile(
+    r"^\s*/\*\s*(?:"
+    r"\.\.\.\s*(?P<count>\d+)\s+lines?\s+omitted\s*\.\.\."
+    r"|\[MIDDLE BODY OMITTED[^\n]*\]"
+    r"|\[LINES OMITTED OUTSIDE FOCUS WINDOW[^\n]*\]"
+    r")\s*\*/\s*$"
+)
+
+_ANY_FOLDING_MARKER_RE = re.compile(
+    r"/\*\s*\.\.\.\s*(?:\d+\s+)?lines?\s+omitted\s*\.\.\.\s*\*/"
+    r"|READ-ONLY SIBLING KERNEL"
+    r"|READ-ONLY HELPER"
+    r"|MIDDLE BODY OMITTED"
+    r"|LINES OMITTED OUTSIDE FOCUS WINDOW"
+)
+
+
+def extract_lowered_compiler_excerpt(
+    stage_b: object,
+    *,
+    window: int = 12,
+    max_chars: int = 2400,
+) -> str:
+    """Slice raw lowered CCE/TIR lines around reported :line: numbers or leading 24 lines."""
+    cce_source = str(getattr(stage_b, "generated_cce", "") or "")
+    tir_source = str(getattr(stage_b, "lowered_tir", "") or "")
+    has_cce = bool(cce_source.strip())
+    raw_source = cce_source if has_cce else tir_source
+    if not raw_source.strip():
+        return ""
+    lines = raw_source.splitlines()
+    if not lines:
+        return ""
+    diag_text = str(getattr(stage_b, "error_message", "") or "")
+    line_nums: list[int] = []
+    if has_cce:
+        for match in re.finditer(r"\.cce:(\d+)(?::\d+)?\b", diag_text):
+            ln = int(match.group(1))
+            if 1 <= ln <= len(lines):
+                line_nums.append(ln)
+    if not line_nums:
+        for match in re.finditer(r":(\d+)(?::\d+)?\b", diag_text):
+            ln = int(match.group(1))
+            if 1 <= ln <= len(lines):
+                line_nums.append(ln)
+    if line_nums:
+        merged_ranges: list[list[int]] = []
+        for ln in sorted(set(line_nums)):
+            start = max(1, ln - window)
+            end = min(len(lines), ln + window)
+            if merged_ranges and start <= merged_ranges[-1][1] + 1:
+                merged_ranges[-1][1] = max(merged_ranges[-1][1], end)
+            else:
+                merged_ranges.append([start, end])
+        excerpt_lines: list[str] = []
+        for idx, (start, end) in enumerate(merged_ranges):
+            if idx > 0:
+                excerpt_lines.append("...")
+            for ln in range(start, end + 1):
+                excerpt_lines.append(f"{ln}: {lines[ln - 1]}")
+        excerpt = "\n".join(excerpt_lines)
+    else:
+        limit = min(len(lines), 24)
+        excerpt = "\n".join(f"{ln}: {lines[ln - 1]}" for ln in range(1, limit + 1))
+    if len(excerpt) > max_chars:
+        trunc_marker = "\n/* ... lowered excerpt truncated ... */"
+        keep_len = max(0, max_chars - len(trunc_marker))
+        return excerpt[:keep_len].rstrip() + trunc_marker
+    return excerpt
+
+
+def extract_lowered_compiler_excerpt_with_lang(
+    stage_b: object | None,
+    *,
+    window: int = 12,
+    max_chars: int = 2400,
+) -> tuple[str, str | None]:
+    """Return bounded lowered excerpt and its fence language from StageBResult."""
+    if stage_b is None:
+        return "", None
+    excerpt = extract_lowered_compiler_excerpt(stage_b, window=window, max_chars=max_chars)
+    has_cce = bool(str(getattr(stage_b, "generated_cce", "") or "").strip())
+    has_tir = bool(str(getattr(stage_b, "lowered_tir", "") or "").strip())
+    lang = "cpp" if has_cce else ("python" if has_tir else None)
+    return excerpt, lang
+
+
+def _py_char_offset(lines: Sequence[str], lineno: int, col_offset: int) -> int:
+    prefix = sum(len(lines[idx]) for idx in range(lineno - 1))
+    line_bytes = lines[lineno - 1].encode("utf-8")
+    return prefix + len(line_bytes[:col_offset].decode("utf-8"))
+
+
+def _format_cpp_string_literal(cpp_text: str) -> str:
+    if '"""' not in cpp_text and not cpp_text.endswith('"'):
+        return f'r"""{cpp_text}"""'
+    return repr(cpp_text)
+
+
+def _eval_static_str_expr(expr: ast.AST, str_consts: Mapping[str, str]) -> str | None:
+    if isinstance(expr, ast.Constant) and isinstance(expr.value, str):
+        return expr.value
+    if isinstance(expr, ast.Name) and expr.id in str_consts:
+        return str_consts[expr.id]
+    if isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        left_val = _eval_static_str_expr(expr.left, str_consts)
+        right_val = _eval_static_str_expr(expr.right, str_consts)
+        if left_val is not None and right_val is not None:
+            return left_val + right_val
+    return None
+
+
+def _detect_trackb_prologue_line_offset(raw_src: str, *, parent_source: str = "") -> int:
+    """Count lines prepended before trackb_src using pure AST inspection."""
+    for candidate_src in (raw_src, parent_source):
+        if not candidate_src or "def _render_trackb_tu" not in candidate_src:
+            continue
+        try:
+            tree = ast.parse(candidate_src)
+        except SyntaxError:
+            continue
+        str_consts: dict[str, str] = {}
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                str_consts[node.targets[0].id] = node.value.value
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            ):
+                str_consts[node.target.id] = node.value.value
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == "_render_trackb_tu":
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Return) and sub.value is not None:
+                        if isinstance(sub.value, ast.BinOp) and isinstance(sub.value.op, ast.Add):
+                            left_val = _eval_static_str_expr(sub.value.left, str_consts)
+                            if left_val is not None:
+                                return left_val.count("\n")
+                            left_src = ast.get_source_segment(candidate_src, sub.value.left) or ""
+                            if left_src:
+                                return left_src.count("\\n")
+    return 0
+
+
+def _find_python_cpp_literal_spans(
+    source: str,
+    *,
+    require_cpp_tokens: bool = True,
+) -> list[tuple[str, str, int, int]]:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    lines = source.splitlines(keepends=True)
+    hits: list[tuple[str, str, int, int]] = []
+    for node in tree.body:
+        name: str | None = None
+        val: ast.AST | None = None
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            name, val = node.targets[0].id, node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            name, val = node.target.id, node.value
+        if (
+            name is not None
+            and isinstance(val, ast.Constant)
+            and isinstance(val.value, str)
+            and val.end_lineno is not None
+            and val.end_col_offset is not None
+        ):
+            if require_cpp_tokens and not any(
+                tok in val.value
+                for tok in ("__global__", "__aicore__", "__simd_vf__", "__simt_vf__")
+            ):
+                continue
+            start_pos = _py_char_offset(lines, val.lineno, val.col_offset)
+            end_pos = _py_char_offset(lines, val.end_lineno, val.end_col_offset)
+            hits.append((name, val.value, start_pos, end_pos))
+    return hits
+
+
+def _compact_trackb_repair_source(
+    raw_src: str,
+    diag: str,
+    max_bytes: int = 14800,
+    *,
+    parent_source: str = "",
+    prologue_line_offset: int = 0,
+) -> str:
+    """Slice oversized Track-B repair source while keeping hybrid Python AST valid."""
+    if len(raw_src.encode("utf-8")) <= max_bytes:
+        return raw_src
+    focus = extract_cpp_diagnostic_lines(diag)
+    try:
+        ast.parse(raw_src)
+    except SyntaxError:
+        if "__global__" in raw_src or "__aicore__" in raw_src or "__simd_vf__" in raw_src:
+            return build_trackb_context_view(
+                raw_src,
+                max_bytes=max_bytes,
+                focus_lines=focus,
+                diagnostic_text=diag,
+            )
+        return raw_src
+
+    hits = _find_python_cpp_literal_spans(raw_src, require_cpp_tokens=True)
+    if not hits:
+        return raw_src
+
+    prologue_offset = (
+        int(prologue_line_offset)
+        if prologue_line_offset > 0
+        else _detect_trackb_prologue_line_offset(raw_src, parent_source=parent_source)
+    )
+    adjusted_focus = (
+        tuple(ln - prologue_offset for ln in focus if ln > prologue_offset)
+        if prologue_offset > 0
+        else focus
+    )
+    diag_for_view = "" if prologue_offset > 0 else diag
+
+    raw_hit_bytes = [len(raw_src[s:e].encode("utf-8")) for _, _, s, e in hits]
+    non_cpp_outer_bytes = max(0, len(raw_src.encode("utf-8")) - sum(raw_hit_bytes))
+    avail_total = max(0, max_bytes - non_cpp_outer_bytes - 16 * len(hits))
+    per_hit_budget = max(512, avail_total // len(hits))
+    small_used = sum(b for b in raw_hit_bytes if b <= per_hit_budget)
+    large_count = sum(1 for b in raw_hit_bytes if b > per_hit_budget)
+    large_budget = (
+        max(per_hit_budget, (avail_total - small_used) // large_count)
+        if large_count > 0
+        else per_hit_budget
+    )
+
+    replacements: list[tuple[int, int, str]] = []
+    for idx, (sym_name, cpp_text, start_pos, end_pos) in enumerate(hits):
+        cpp_budget = per_hit_budget if raw_hit_bytes[idx] <= per_hit_budget else large_budget
+        view = build_trackb_context_view(
+            cpp_text,
+            module_source=raw_src,
+            trackb_symbol=sym_name,
+            max_bytes=cpp_budget,
+            focus_lines=adjusted_focus,
+            diagnostic_text=diag_for_view,
+        )
+        wrapped = view if view.startswith("\n") else f"\n{view}\n"
+        replacements.append((start_pos, end_pos, _format_cpp_string_literal(wrapped)))
+
+    updated = raw_src
+    for start_pos, end_pos, literal in reversed(replacements):
+        updated = updated[:start_pos] + literal + updated[end_pos:]
+    ast.parse(updated)
+    return updated
+
+
+def _match_omitted_anchor_span(
+    orig_lines: Sequence[str],
+    pre_anchor: Sequence[str],
+    post_anchor: Sequence[str],
+    *,
+    orig_cursor: int,
+    expected_count: int | None,
+    post_reaches_eof: bool,
+) -> tuple[int, int] | None:
+    n_pre = len(pre_anchor)
+    n_post = len(post_anchor)
+    orig_norm = [ln.rstrip() for ln in orig_lines]
+    pre_starts = [
+        idx
+        for idx in range(orig_cursor, len(orig_norm) - n_pre + 1)
+        if orig_norm[idx : idx + n_pre] == list(pre_anchor)
+    ]
+    post_starts = [
+        idx
+        for idx in range(orig_cursor + n_pre + 1, len(orig_norm) - n_post + 1)
+        if orig_norm[idx : idx + n_post] == list(post_anchor)
+    ]
+    pairs: list[tuple[int, int]] = []
+    for pre_i in pre_starts:
+        pre_end = pre_i + n_pre
+        for post_j in post_starts:
+            if pre_end >= post_j:
+                continue
+            if expected_count is not None and (post_j - pre_end) != expected_count:
+                continue
+            pairs.append((pre_end, post_j))
+    if len(pairs) == 1:
+        return pairs[0]
+    if len(pairs) > 1 and post_reaches_eof:
+        eof_pairs = [pair for pair in pairs if pair[1] + n_post == len(orig_norm)]
+        if len(eof_pairs) == 1:
+            return eof_pairs[0]
+    return None
+
+
+def _splice_cpp_omitted_spans(cand_cpp: str, orig_cpp: str) -> tuple[str, bool]:
+    """Restore omitted C++ spans using exact anchor lines from pre-compaction source."""
+    cand_lines = cand_cpp.splitlines()
+    orig_lines = orig_cpp.splitlines()
+    marker_hits: list[tuple[int, int | None]] = []
+    for idx, line in enumerate(cand_lines):
+        m = _OMITTED_SPAN_MARKER_RE.match(line)
+        if m is not None:
+            raw_count = m.group("count")
+            marker_hits.append((idx, int(raw_count) if raw_count is not None else None))
+    if not marker_hits:
+        return cand_cpp, not bool(_ANY_FOLDING_MARKER_RE.search(cand_cpp))
+
+    rebuilt: list[str] = []
+    cand_cursor = 0
+    orig_cursor = 0
+    for k, (m_idx, expected_count) in enumerate(marker_hits):
+        prev_limit = (marker_hits[k - 1][0] + 1) if k > 0 else 0
+        next_limit = marker_hits[k + 1][0] if k + 1 < len(marker_hits) else len(cand_lines)
+
+        b_end = m_idx
+        while b_end > prev_limit and not cand_lines[b_end - 1].strip():
+            b_end -= 1
+        a_start = m_idx + 1
+        while a_start < next_limit and not cand_lines[a_start].strip():
+            a_start += 1
+        if b_end <= prev_limit or a_start >= next_limit:
+            return cand_cpp, False
+
+        avail_pre = b_end - prev_limit
+        avail_post = next_limit - a_start
+        anchor_sizes = sorted(
+            (
+                (np_pre, np_post)
+                for np_pre in range(1, min(4, avail_pre) + 1)
+                for np_post in range(1, min(4, avail_post) + 1)
+            ),
+            key=lambda pair: (pair[0] + pair[1], min(pair[0], pair[1])),
+            reverse=True,
+        )
+        matched_span: tuple[int, int] | None = None
+        for np_pre, np_post in anchor_sizes:
+            pre_anchor = [ln.rstrip() for ln in cand_lines[b_end - np_pre : b_end]]
+            post_anchor = [ln.rstrip() for ln in cand_lines[a_start : a_start + np_post]]
+            if not any(s.strip() for s in pre_anchor) or not any(s.strip() for s in post_anchor):
+                continue
+            post_reaches_eof = (k + 1 == len(marker_hits)) and (
+                a_start + np_post == len(cand_lines)
+            )
+            matched_span = _match_omitted_anchor_span(
+                orig_lines,
+                pre_anchor,
+                post_anchor,
+                orig_cursor=orig_cursor,
+                expected_count=expected_count,
+                post_reaches_eof=post_reaches_eof,
+            )
+            if matched_span is not None:
+                break
+        if matched_span is None:
+            return cand_cpp, False
+
+        orig_pre_end, orig_post_start = matched_span
+        rebuilt.extend(cand_lines[cand_cursor:b_end])
+        rebuilt.extend(orig_lines[orig_pre_end:orig_post_start])
+        cand_cursor = a_start
+        orig_cursor = orig_post_start
+
+    rebuilt.extend(cand_lines[cand_cursor:])
+    restored = "\n".join(rebuilt)
+    if cand_cpp.endswith("\n"):
+        restored += "\n"
+    if _ANY_FOLDING_MARKER_RE.search(restored):
+        return cand_cpp, False
+    return restored, True
+
+
+def _collect_orig_cpp_map(sources: Sequence[str]) -> tuple[dict[str, str], list[str]]:
+    by_sym: dict[str, str] = {}
+    bare_list: list[str] = []
+    for src in sources:
+        if not src or not src.strip():
+            continue
+        hits = _find_python_cpp_literal_spans(src, require_cpp_tokens=False)
+        if hits:
+            for sym_name, cpp_text, _, _ in hits:
+                if sym_name not in by_sym:
+                    by_sym[sym_name] = cpp_text
+                bare_list.append(cpp_text)
+        else:
+            bare_list.append(src)
+    return by_sym, bare_list
+
+
+def _resplice_trackb_omitted_spans(
+    repaired_src: str,
+    *,
+    pre_compaction_source: str,
+    parent_source: str = "",
+    extra_sources: Sequence[str] = (),
+) -> str:
+    """Splice unchanged omitted C++ spans back into a repair reply when resolvable."""
+    if not repaired_src or parse_scoped_search_replace_blocks(repaired_src):
+        return repaired_src
+    if not _ANY_FOLDING_MARKER_RE.search(repaired_src):
+        return repaired_src
+
+    by_sym, bare_list = _collect_orig_cpp_map(
+        (pre_compaction_source, *extra_sources, parent_source)
+    )
+    if not by_sym and not bare_list:
+        return repaired_src
+
+    rep_hits = _find_python_cpp_literal_spans(repaired_src, require_cpp_tokens=False)
+    if rep_hits:
+        replacements: list[tuple[int, int, str]] = []
+        for sym_name, cpp_text, start_pos, end_pos in rep_hits:
+            if not _ANY_FOLDING_MARKER_RE.search(cpp_text):
+                continue
+            candidates: list[str] = []
+            if sym_name in by_sym:
+                candidates.append(by_sym[sym_name])
+            for raw_cand in bare_list:
+                if raw_cand not in candidates:
+                    candidates.append(raw_cand)
+            spliced_val: str | None = None
+            for orig_cpp in candidates:
+                res, ok = _splice_cpp_omitted_spans(cpp_text, orig_cpp)
+                if ok:
+                    spliced_val = res
+                    break
+            if spliced_val is not None:
+                replacements.append((start_pos, end_pos, _format_cpp_string_literal(spliced_val)))
+        if not replacements:
+            return repaired_src
+        updated = repaired_src
+        for start_pos, end_pos, literal in reversed(replacements):
+            updated = updated[:start_pos] + literal + updated[end_pos:]
+        try:
+            ast.parse(updated)
+        except SyntaxError:
+            return repaired_src
+        return updated
+
+    for orig_cpp in bare_list:
+        res, ok = _splice_cpp_omitted_spans(repaired_src, orig_cpp)
+        if ok:
+            return res
+    return repaired_src
+
+
+def _looks_like_python_primfunc_slice(source: str) -> bool:
+    """Return True when *source* is a Python @T.prim_func or def slice without Track-B C++."""
+    stripped = source.strip()
+    if not stripped:
+        return False
+    if parse_scoped_search_replace_blocks(stripped):
+        return False
+    if any(tok in stripped for tok in _TRACKB_CPP_QUALIFIERS):
+        return False
+    if "@T.prim_func" in stripped:
+        return True
+    if re.search(r"(?m)^\s*(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(", stripped):
+        return True
+    try:
+        tree = ast.parse(stripped)
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        for node in tree.body
+    )
+
+
 def build_syntax_repair_request(
     dsl_source: str,
     error_message: str,
@@ -847,7 +1341,15 @@ def build_syntax_repair_request(
     """Build bounded syntax/compile repair request routed to the active backend dialect."""
     hint_sentence = f" Authorized target: {slice_hint}." if slice_hint else ""
     surface = get_dialect_surface(backend_kind)
-    is_cpp = surface.dialect_id == "cce_cpp20"
+    is_cpp = (surface.dialect_id == "cce_cpp20") and not _looks_like_python_primfunc_slice(
+        dsl_source
+    )
+    effective_tier = (
+        "tilelang_dsl"
+        if (surface.dialect_id == "cce_cpp20" and not is_cpp)
+        else backend_kind
+    )
+    effective_surface = get_dialect_surface(effective_tier)
     fence_lang = "cpp" if is_cpp else "python"
     if is_cpp:
         sys_prompt = (
@@ -877,7 +1379,7 @@ def build_syntax_repair_request(
         ub_256kb_unlock=ub_256kb_unlock,
     )
     layer2_text = format_target_dialect_layer(
-        escalation_tier=backend_kind,
+        escalation_tier=effective_tier,
         topology_axes=topology_axes,
         freedom_mask=freedom_mask,
         case_ratios=case_ratios,
@@ -902,7 +1404,8 @@ def build_syntax_repair_request(
         )
     lowered_block = ""
     stripped_lowered = lowered_excerpt.strip()
-    if not is_cpp and stripped_lowered:
+    stripped_broken = dsl_source.strip()
+    if stripped_lowered and stripped_lowered not in stripped_broken:
         if len(stripped_lowered) > 2400:
             trunc_marker = "\n/* ... lowered excerpt truncated ... */"
             keep_len = max(0, 2400 - len(trunc_marker))
@@ -925,7 +1428,7 @@ def build_syntax_repair_request(
         )
     user_prompt = (
         f"{layer1_text}\n\n"
-        f"### VALID TARGET DIALECT PRIMITIVES ({surface.dialect_id})\n"
+        f"### VALID TARGET DIALECT PRIMITIVES ({effective_surface.dialect_id})\n"
         f"{layer2_text}\n\n"
         f"{g5_lock_text}\n\n"
         f"{sil_block}"
@@ -1011,20 +1514,27 @@ class PortfolioRunner:
             if roofline is not None
             else (blueprint.roofline if blueprint is not None else None)
         )
-        parent_features = _project_features_with_ratios(parent.features, case_ratios)
+        eff_case_ratios = (
+            case_ratios
+            if case_ratios is not None
+            else getattr(parent, "case_ratios", None)
+        )
+        parent_features = _project_features_with_ratios(parent.features, eff_case_ratios)
         active_axes = _derive_active_topology_axes(
             parent.ledger,
             features=parent_features,
             sil_advisory=sil_advisory,
             topology_axes=topology_axes,
-            case_ratios=case_ratios,
+            case_ratios=eff_case_ratios,
         )
         ctx = build_predicate_context(
             parent.ledger,
             features=parent_features,
             residual=parent.residual,
+            compiler_summary=compiler_summary_from_residual(parent.residual),
             extra={"topology_axes": active_axes},
             roofline=eff_roofline_obj,
+            case_ratios=eff_case_ratios,
         )
         symptom_ranking = rank_symptom_families(ctx)
         matched_rules = list(
@@ -1190,22 +1700,46 @@ class PortfolioRunner:
             ordered_tensor_shapes=resolved_shapes,
         )
         if not evaluation.passed and evaluation.failed_stage in ("stage_a", "stage_b"):
+            parent_dsl = spec.parent_candidate.dsl_source
             for _ in range(self._max_repairs):
+                lowered_excerpt, lowered_excerpt_lang = extract_lowered_compiler_excerpt_with_lang(
+                    evaluation.stage_b
+                )
+                repair_src = (
+                    _compact_trackb_repair_source(
+                        dsl_source,
+                        evaluation.error_message,
+                        parent_source=parent_dsl,
+                    )
+                    if escalation_tier
+                    in (
+                        "ascendc",
+                        "ascendc_template",
+                        "ascendc_trackb",
+                        "cce_trackb",
+                        "hybrid_trackb",
+                    )
+                    else dsl_source
+                )
                 repair_req = build_syntax_repair_request(
-                    dsl_source,
+                    repair_src,
                     evaluation.error_message,
                     sil_advisory=sil_advisory,
                     sil_verification=sil_verification,
                     backend_kind=escalation_tier,
+                    parent_source=parent_dsl,
                     freedom_mask=freedom_mask,
                     ub_256kb_unlock=bool(spec.parent_candidate.ledger.uses_unreserved_ubuf),
                     topology_axes=active_axes,
                     case_ratios=case_ratios,
+                    lowered_excerpt=lowered_excerpt,
+                    lowered_excerpt_lang=lowered_excerpt_lang,
                 )
                 try:
                     repaired_raw = await self._backend.generate(repair_req)
                 except Exception as exc:
                     return None, repaired, (spec.worker_id, "llm_transport", str(exc)[-400:]), False
+                pre_repair_dsl = dsl_source
                 try:
                     dsl_source = extract_python_dsl(repaired_raw)
                 except Exception as exc:
@@ -1216,7 +1750,18 @@ class PortfolioRunner:
                             topology_axes=active_axes,
                         )
                     return None, repaired, (spec.worker_id, "llm_parse", str(exc)[-400:]), False
-                parent_dsl = spec.parent_candidate.dsl_source
+                if escalation_tier in (
+                    "ascendc",
+                    "ascendc_template",
+                    "ascendc_trackb",
+                    "cce_trackb",
+                    "hybrid_trackb",
+                ):
+                    dsl_source = _resplice_trackb_omitted_spans(
+                        dsl_source,
+                        pre_compaction_source=pre_repair_dsl,
+                        parent_source=parent_dsl,
+                    )
                 if parent_dsl.strip():
                     violations = check_repair_monotonicity(
                         parent_dsl,

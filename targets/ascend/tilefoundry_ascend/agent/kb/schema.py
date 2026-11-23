@@ -1292,7 +1292,11 @@ def _read_signal_bool(
     return default
 
 
-def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
+def _observation_to_signal_dict(
+    obs: ObservationVector5D,
+    *,
+    case_ratios: object | None = None,
+) -> dict[str, object]:
     payload = obs.to_dict()
     compute = payload.get("compute_issue")
     dma = payload.get("offchip_dma")
@@ -1371,6 +1375,38 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
     subcore_imbalance = _read_signal_bool(compute_map, "l0_aiv_subcore_imbalance")
     obs_aiv_vec = _read_signal_float(compute_map, "l2_aiv_vec_ratio")
     obs_aic_mac = _read_signal_float(compute_map, "l2_aic_mac_ratio")
+    contig_atom_ratio = _read_signal_float(
+        payload,
+        "contig_atom_ratio",
+        default=_read_signal_float(
+            dma_map,
+            "contig_atom_ratio",
+            default=float(
+                getattr(
+                    obs,
+                    "contig_atom_ratio",
+                    getattr(obs.offchip_dma, "contig_atom_ratio", 1.0),
+                )
+                or 1.0
+            ),
+        ),
+    )
+    working_set_sram_ratio = _read_signal_float(
+        payload,
+        "working_set_sram_ratio",
+        default=_read_signal_float(
+            sram_map,
+            "working_set_sram_ratio",
+            default=float(
+                getattr(
+                    obs,
+                    "working_set_sram_ratio",
+                    getattr(obs.onchip_sram_reg, "working_set_sram_ratio", 0.0),
+                )
+                or 0.0
+            ),
+        ),
+    )
     out: dict[str, object] = {
         "transfer_inflation_ratio": transfer_inflation,
         "effective_compute_eta": effective_eta,
@@ -1401,8 +1437,8 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
         "stack_bytes": _read_signal_int(sram_map, "l1_stack_bytes"),
         "l1_vec_regs": _read_signal_int(sram_map, "l1_vec_regs"),
         "vec_regs": _read_signal_int(sram_map, "l1_vec_regs"),
-        "contig_atom_ratio": 1.0,
-        "working_set_sram_ratio": 0.0,
+        "contig_atom_ratio": contig_atom_ratio,
+        "working_set_sram_ratio": working_set_sram_ratio,
         "scalar_compute_loop_fallback": max(scalar_fallback, float(ub_scalar_loops)),
         "ub_scalar_compute_loops": ub_scalar_loops,
         "dcache_bypass_narrow_store": dcache_bypass,
@@ -1435,6 +1471,8 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
         "has_l1_compiler_summary": _read_signal_bool(payload, "has_l1_compiler_summary"),
         "measured_latency_us": _read_signal_float(grid_map, "l2_measured_latency_us"),
     }
+    if case_ratios is not None:
+        _apply_case_ratios(out, case_ratios)
     if (
         obs_aiv_vec > 0.0
         or obs_aic_mac > 0.0
@@ -1452,10 +1490,12 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
 
 def rank_symptom_families(
     obs_or_context: ObservationVector5D | Mapping[str, object],
+    *,
+    case_ratios: object | None = None,
 ) -> list[tuple[SymptomFamily, float]]:
     """Score and rank all 12 hardware SymptomFamily categories in descending severity."""
     sig: Mapping[str, object] = (
-        _observation_to_signal_dict(obs_or_context)
+        _observation_to_signal_dict(obs_or_context, case_ratios=case_ratios)
         if isinstance(obs_or_context, ObservationVector5D)
         else obs_or_context
     )
