@@ -318,3 +318,116 @@ def test_dtype_aware_cube_floor_precision_scaling() -> None:
     assert abs(fp8_rf.cube_floor_us * 2.0 - bf16_rf.cube_floor_us) < 1e-12
     assert abs(fp4_rf.cube_floor_us * 4.0 - bf16_rf.cube_floor_us) < 1e-12
     assert abs(fp32_rf.cube_floor_us - bf16_rf.cube_floor_us * 16.0) < 1e-12
+
+
+def test_ub_scalar_compute_loops_positive_and_false_positive_guards() -> None:
+    """Count innermost serial UB compute loops while filtering Parallel, DMA, and tiny loops."""
+    import tilelang.ascend.language as T  # noqa: PLC0415
+    from tilefoundry.ir.core import Call, Constant, Var  # noqa: PLC0415
+    from tilefoundry.ir.core.kinds import BinaryKind  # noqa: PLC0415
+    from tilefoundry.ir.tir.arith import Binary  # noqa: PLC0415
+    from tilefoundry.ir.tir.memory import AllocTensor  # noqa: PLC0415
+    from tilefoundry.ir.tir.stmts import (  # noqa: PLC0415
+        Evaluate,
+        ExecutionScope,
+        For,
+        LetStmt,
+        Sequential,
+    )
+    from tilefoundry.ir.types import DType, StorageKind, TensorType  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.ir.execution import SIMDVF_KIND  # noqa: PLC0415
+    from tilefoundry_ascend.ascend.schedule import inspect_tilelang_primfunc  # noqa: PLC0415
+
+    @T.prim_func
+    def serial_ub_compute(
+        X: T.Tensor((64,), "float32"),
+        Y: T.Tensor((64,), "float32"),
+    ):
+        with T.Kernel(1):
+            ub = T.alloc_shared((64,), "float32")
+            T.copy(X[0:64], ub)
+            for i in T.serial(64):
+                ub[i] = ub[i] + 1.0
+            T.copy(ub, Y[0:64])
+
+    @T.prim_func
+    def parallel_ub_compute(
+        X: T.Tensor((64,), "float32"),
+        Y: T.Tensor((64,), "float32"),
+    ):
+        with T.Kernel(1):
+            ub = T.alloc_shared((64,), "float32")
+            T.copy(X[0:64], ub)
+            for i in T.Parallel(64):
+                ub[i] = ub[i] + 1.0
+            T.copy(ub, Y[0:64])
+
+    @T.prim_func
+    def outer_dma_loop(
+        X: T.Tensor((8, 64), "float32"),
+        Y: T.Tensor((8, 64), "float32"),
+    ):
+        with T.Kernel(1):
+            ub = T.alloc_shared((64,), "float32")
+            for k in T.serial(8):
+                T.copy(X[k, 0:64], ub)
+                T.copy(ub, Y[k, 0:64])
+
+    @T.prim_func
+    def tiny_unrolled_loop(
+        X: T.Tensor((4,), "float32"),
+        Y: T.Tensor((4,), "float32"),
+    ):
+        with T.Kernel(1):
+            ub = T.alloc_shared((4,), "float32")
+            T.copy(X[0:4], ub)
+            for i in T.serial(4):
+                ub[i] = ub[i] + 1.0
+            T.copy(ub, Y[0:4])
+
+    assert inspect_tilelang_primfunc(serial_ub_compute).ledger.ub_scalar_compute_loops >= 1
+    assert inspect_tilelang_primfunc(parallel_ub_compute).ledger.ub_scalar_compute_loops == 0
+    assert inspect_tilelang_primfunc(outer_dma_loop).ledger.ub_scalar_compute_loops == 0
+    assert inspect_tilelang_primfunc(tiny_unrolled_loop).ledger.ub_scalar_compute_loops == 0
+
+    sc = TensorType.umat_scalar()
+    ub_ty = TensorType((64,), DType.f32, None, StorageKind.SMEM)
+    ub_a = Var("ub_a", type=ub_ty)
+    ub_b = Var("ub_b", type=ub_ty)
+    ub_c = Var("ub_c", type=ub_ty)
+    alloc_a = LetStmt(ub_a, Call(AllocTensor(tensor_type=ub_ty), (), type=ub_ty))
+    alloc_b = LetStmt(ub_b, Call(AllocTensor(tensor_type=ub_ty), (), type=ub_ty))
+    alloc_c = LetStmt(ub_c, Call(AllocTensor(tensor_type=ub_ty), (), type=ub_ty))
+    add_stmt = Evaluate(Binary(kind=BinaryKind.ADD), (ub_a, ub_b, ub_c))
+    iv = Var("i", type=sc)
+    tir_serial = Sequential(
+        (
+            alloc_a,
+            alloc_b,
+            alloc_c,
+            For(iv, Constant(0, type=sc), Constant(64, type=sc), Constant(1, type=sc), Sequential((add_stmt,))),
+        )
+    )
+    tir_simd = Sequential(
+        (
+            alloc_a,
+            alloc_b,
+            alloc_c,
+            ExecutionScope(
+                SIMDVF_KIND.name,
+                Sequential(
+                    (
+                        For(
+                            iv,
+                            Constant(0, type=sc),
+                            Constant(64, type=sc),
+                            Constant(1, type=sc),
+                            Sequential((add_stmt,)),
+                        ),
+                    )
+                ),
+            ),
+        )
+    )
+    assert inspect_tir_envelope(tir_serial).ledger.ub_scalar_compute_loops == 1
+    assert inspect_tir_envelope(tir_simd).ledger.ub_scalar_compute_loops == 0

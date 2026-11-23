@@ -307,7 +307,6 @@ class ResidualBasisContext:
     wave_ratio: float
     l2_hit_rate: float
     contig_burst_bytes: int
-    ub_occupancy_ratio: float
     axes: TopologyAxes | None
 
 
@@ -1132,7 +1131,6 @@ class HybridAscendCostModel:
             wave_ratio=wave_ratio,
             l2_hit_rate=l2_hit_rate,
             contig_burst_bytes=int(cf.contig_burst_bytes),
-            ub_occupancy_ratio=max(0.0, float(cf.ub_occupancy_ratio)),
             axes=cf.topology_axes,
         )
         named_features = self._basis_registry.extract_named(basis_ctx)

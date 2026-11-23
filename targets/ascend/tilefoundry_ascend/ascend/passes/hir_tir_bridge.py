@@ -38,6 +38,7 @@ from tilefoundry.visitor_registry.verify import verify_prim_function
 from tilefoundry_ascend.ascend.ir.tir.instructions import AscendMmad
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.schedule.envelope_inspector import inspect_tir_envelope
+from tilefoundry_ascend.ascend.sil.schema import VALID_FREEDOM_FACETS
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
 _SPECIAL_VECTOR_OP_EQUIV = 8
@@ -247,16 +248,18 @@ class BlueprintScheduleDelta:
     recommended_facets: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        facets = tuple(str(item) for item in self.recommended_facets)
+        invalid = [item for item in facets if item not in VALID_FREEDOM_FACETS]
+        if invalid:
+            raise ValueError(
+                f"Unknown recommended_facets {invalid!r}; expected subset of {VALID_FREEDOM_FACETS}"
+            )
         object.__setattr__(
             self,
             "z3_stage_summary",
             _filter_z3_pipeline_summary(self.z3_stage_summary),
         )
-        object.__setattr__(
-            self,
-            "recommended_facets",
-            tuple(str(item) for item in self.recommended_facets),
-        )
+        object.__setattr__(self, "recommended_facets", facets)
 
     def to_dict(self) -> dict[str, object]:
         """Serialize optional HIR schedule enrichment to a JSON-compatible mapping."""
@@ -1079,22 +1082,24 @@ def _derive_recommended_facets(
             facets.append(facet)
 
     if z3_stage_summary:
-        _add("sync_skeleton")
-        _add("loop_nesting")
+        _add("pipeline_and_sync_graph")
+        _add("tile_and_stage_knobs")
     if ledger is not None:
         if ledger.gm_roundtrip_bytes > 0:
-            _add("memory_space")
-            _add("sync_skeleton")
+            _add("dma_and_cache_hierarchy")
+            _add("sram_layout_and_aliasing")
+            _add("pipeline_and_sync_graph")
         if ledger.unaligned_dma_padding_bytes > 0 or 0 < ledger.dominant_contig_bytes < 16384:
-            _add("tile_shape")
-            _add("layout_cast")
+            _add("tile_and_stage_knobs")
+            _add("dma_and_cache_hierarchy")
         if ledger.in_loop_pipe_all_barriers > 0:
-            _add("sync_skeleton")
-            _add("loop_nesting")
+            _add("pipeline_and_sync_graph")
+            _add("tile_and_stage_knobs")
         if ledger.has_online_rescale_loop:
-            _add("loop_nesting")
+            _add("alg_compute_and_monoid")
+            _add("tile_and_stage_knobs")
         if ledger.ub_bank_conflict_risk > 0.08 or ledger.l1_bank_conflict_risk > 0.08:
-            _add("layout_cast")
+            _add("sram_layout_and_aliasing")
     return tuple(facets)
 
 
