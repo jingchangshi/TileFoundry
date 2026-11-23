@@ -12,12 +12,15 @@ from pathlib import Path
 import pytest
 import tilelang.ascend.language as T
 
-from tilefoundry.ir.core import Call, Constant, Var
-from tilefoundry.ir.hir.pipeline import PipelineSpec
-from tilefoundry.ir.tir.memory import AllocTensor
-from tilefoundry.ir.tir.stmts import Evaluate, For, LetStmt, Sequential
-from tilefoundry.ir.types import DType, StorageKind, TensorType
-from tilefoundry.ir.types.dim import DimVar
+from tilefoundry.vendor.tilelang_z3 import (
+    Buffer,
+    Capacity,
+    Edge,
+    Problem,
+    Resource,
+    Reuse,
+    Task,
+)
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
     PerfTargetSpec,
@@ -64,15 +67,11 @@ from tilefoundry_ascend.ascend.cost_model import (
     normalize_ns_to_z3_ticks,
     project_case_workload,
 )
-from tilefoundry_ascend.ascend.ir.tir.instructions import AscendGmToUb, AscendUbToGm
 from tilefoundry_ascend.ascend.passes.physical_ledger import build_objective_physical_ledger
-from tilefoundry_ascend.ascend.schedule.pipeline_solver import (
-    extract_tir_loop_problem,
-    solve_ascend_pipeline,
-)
+from tilefoundry_ascend.ascend.schedule.pipeline_solver import solve_ascend_pipeline
 from tilefoundry_ascend.ascend.schedule.regime_solver import RegimePiecewiseSolver
 from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
-from tilefoundry_ascend.ascend.target import AscendTarget
+from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
 
 def test_microarch_profile_tir_cce_extraction_and_merge() -> None:
@@ -204,29 +203,40 @@ def test_pipe_schedule_evaluator_ascend950_physics_and_z3_ticks() -> None:
     assert all(1 <= t <= 12 for t in ticks)
     assert ticks[0] <= ticks[1] <= ticks[2]
 
-    d_dyn = DimVar("D", 32, 1024)
-    gm_ty = TensorType((4, d_dyn), DType.f16, None, StorageKind.GMEM)
-    ub_ty = TensorType((d_dyn,), DType.f16, None, StorageKind.SMEM)
-    sc = TensorType.umat_scalar()
-    k = Var("k", type=sc)
-    gm_in = Var("gm_in", type=gm_ty)
-    gm_out = Var("gm_out", type=gm_ty)
-    ub_var = Var("ub_buf", type=ub_ty)
-    loop = For(
-        k,
-        Constant(0, type=sc),
-        Constant(4, type=sc),
-        Constant(1, type=sc),
-        Sequential(
-            (
-                LetStmt(ub_var, Call(AllocTensor(tensor_type=ub_ty), (), type=ub_ty)),
-                Evaluate(AscendGmToUb(), (gm_in, ub_var)),
-                Evaluate(AscendUbToGm(), (ub_var, gm_out)),
-            )
+    facts = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
+    problem = Problem(
+        tasks=(
+            Task(name="load", resources=(("aiv", "aiv0", "mte2", 1),), latency=1, stage=0),
+            Task(name="store", resources=(("aiv", "aiv0", "mte3", 1),), latency=1, stage=1),
         ),
-        pipeline=PipelineSpec(max_stage=1, max_buffer_versions=2, enable_offset=True),
+        buffers=(
+            Buffer(
+                name="ub_buf",
+                slot_bytes=512 * 2,
+                space="UB",
+                owner="aiv",
+                auto_min=1,
+                auto_max=2,
+            ),
+        ),
+        edges=(Edge(src="load", dst="store", distance=0, latency=1),),
+        reuses=(
+            Reuse(
+                buffer="ub_buf",
+                last_reader="store",
+                next_writer="load",
+                delta=0,
+                read_latency=1,
+            ),
+        ),
+        resources=(
+            Resource("aiv", "aiv0", "mte2", 1),
+            Resource("aiv", "aiv0", "mte3", 1),
+        ),
+        capacities=(Capacity("UB", "aiv", facts.ub_simdvf_usable_bytes),),
+        max_stage=1,
+        manual=True,
     )
-    problem, _ = extract_tir_loop_problem(loop, dim_hints={"D": 512})
     assert all(1 <= int(t.latency) <= 12 for t in problem.tasks)
     sched_res = solve_ascend_pipeline(problem)
     assert sched_res.assignment.ii >= 1
@@ -234,7 +244,7 @@ def test_pipe_schedule_evaluator_ascend950_physics_and_z3_ticks() -> None:
         {"regime_tag": "vec", "representative_dims": {"M": 4, "D": 512}},
         op_name="rms_norm",
         topology_axes=TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd"),
-        loop=loop,
+        problem=problem,
     )
     assert reg_res.ii is not None and reg_res.ii >= 1
 

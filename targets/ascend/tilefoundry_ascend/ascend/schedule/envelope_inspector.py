@@ -2,32 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
-from tilefoundry.ir.core import Call, Constant, Expr, Op, Var
-from tilefoundry.ir.core.kinds import UnaryKind
-from tilefoundry.ir.core.param_def import MemoryEffect, collect_param_defs
-from tilefoundry.ir.hir.tensor.slice import Slice
-from tilefoundry.ir.tir.memory import AllocTensor, Copy, Fill, PtrOf, TensorView
-from tilefoundry.ir.tir.prim_function import PrimFunction
-from tilefoundry.ir.tir.stmts import (
-    Evaluate,
-    ExecutionScope,
-    For,
-    If,
-    LetStmt,
-    MeshScope,
-    Sequential,
-    Stmt,
-    While,
-)
-from tilefoundry.ir.types import StorageKind, TensorType
-from tilefoundry.ir.types.mesh import levels as mesh_levels
-from tilefoundry.ir.types.mesh import size as mesh_size
-from tilefoundry.ir.types.utils import static_dim_value
+from tilelang import tvm
 from tilefoundry.vendor.tilelang_z3 import (
     Buffer,
     Capacity,
@@ -39,19 +20,6 @@ from tilefoundry.vendor.tilelang_z3 import (
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
     extract_microarch_profile_from_tirx,
 )
-from tilefoundry_ascend.ascend.ir.execution import SIMTVF_KIND
-from tilefoundry_ascend.ascend.ir.tir.instructions import (
-    AscendDualCopyL0cToUb,
-    AscendGmToL1,
-    AscendGmToUb,
-    AscendL0cToGm,
-    AscendL1ToL0A,
-    AscendL1ToL0B,
-    AscendMmad,
-    AscendRegToUb,
-    AscendUbToReg,
-    AscendVunary,
-)
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
     ScopeWaterline,
@@ -62,9 +30,7 @@ from tilefoundry_ascend.ascend.schedule.pipeline_solver import (
     _assign_dag_stages,
     _capacities_from_facts,
     _resources_for_tasks,
-    format_pipe_key,
     solve_pipeline_with_monotone_backoff,
-    task_resource_mask,
 )
 from tilefoundry_ascend.ascend.target import (
     AscendSpaceFacts,
@@ -76,9 +42,13 @@ _TILELANG_SCOPE_MAP: dict[str, str] = {
     "shared.dyn": "UB",
     "shared": "UB",
     "shared.l1": "L1",
+    "shared.l1.dyn": "L1",
     "shared.l0a": "L0A",
+    "shared.l0a.dyn": "L0A",
     "shared.l0b": "L0B",
+    "shared.l0b.dyn": "L0B",
     "shared.l0c": "L0C",
+    "shared.l0c.dyn": "L0C",
     "shared.ss": "SSBUF",
     "global": "GM",
 }
@@ -1072,9 +1042,28 @@ def _inspect_tilelang_block_dims(
     return block_dims, any_symbolic[0]
 
 
-def _is_disallowed_tirx_intrinsic(op_name: str) -> bool:
+def _is_sync_or_barrier_intrinsic(op_name: str) -> bool:
+    low = op_name.lower()
+    return any(
+        tok in low
+        for tok in (
+            "barrier",
+            "pipe_barrier",
+            "cross_flag",
+            "cross_core",
+            "set_flag",
+            "wait_flag",
+            "mbarrier",
+            "sync",
+        )
+    )
+
+
+def _is_disallowed_tirx_intrinsic(op_name: str, *, allow_sync: bool = False) -> bool:
     """Return True if *op_name* represents DMA, Cube, SIMD/SIMT, or barrier intrinsic."""
     low = op_name.lower()
+    if allow_sync and _is_sync_or_barrier_intrinsic(low):
+        return False
     if any(
         tok in low
         for tok in (
@@ -1152,6 +1141,7 @@ def _count_tirx_ub_scalar_compute_loops(
     ub_buf_names: set[str],
     *,
     tirx,
+    allow_sync_intrinsics: bool = False,
 ) -> int:
     """Count innermost serial UB scalar compute loops while filtering out outer/tiny/SIMD loops."""
     count = [0]
@@ -1236,7 +1226,7 @@ def _count_tirx_ub_scalar_compute_loops(
         def _visit(sub) -> None:
             if isinstance(sub, tirx.Call):
                 op_name = str(getattr(sub.op, "name", sub.op)).lower()
-                if _is_disallowed_tirx_intrinsic(op_name):
+                if _is_disallowed_tirx_intrinsic(op_name, allow_sync=allow_sync_intrinsics):
                     hit[0] = True
 
         tirx.stmt_functor.post_order_visit(expr, _visit)
@@ -4131,6 +4121,376 @@ def _specialize_primfunc_for_anchors(
     return spec_fn, spec_mod
 
 
+@tvm.ir.instrument.pass_instrument
+class ReadOnlyAscendPassTap:
+    """Read-only 4-tap TVM PassContext instrument for Ascend TileLang lowering."""
+
+    TARGET_PASSES: tuple[str, ...] = (
+        "tl.MaterializeMultiBuffer",
+        "tl.MergeUBAllocations",
+        "tl.InsertNd2Nz",
+        "tl.NormalizeAscendFractalStorage",
+        "tl.LowerTileOp",
+        "tl.AscendLowerTileOp",
+    )
+
+    def __init__(self) -> None:
+        self.observed_passes: list[str] = []
+        self.captured_mods: dict[str, object] = {}
+
+    def run_before_pass(self, mod, info) -> None:
+        """Capture pre-merge IRModule immediately before tl.MergeUBAllocations."""
+        if str(info.name) == "tl.MergeUBAllocations":
+            self.captured_mods["pre_merge"] = mod
+
+    def run_after_pass(self, mod, info) -> None:
+        """Record executed pass name and capture read-only IR snapshots at target taps."""
+        name = str(info.name)
+        self.observed_passes.append(name)
+        if name in self.TARGET_PASSES:
+            self.captured_mods[name] = mod
+
+
+@contextlib.contextmanager
+def _ascend_compile_session(
+    ctx_target: object,
+    *,
+    pass_configs: Mapping[str, object] | None = None,
+    instruments: Sequence[object] = (),
+):
+    cur_target = tvm.target.Target.current(allow_none=True)
+    cur_kind = str(getattr(getattr(cur_target, "kind", None), "name", "") or "")
+    target_ctx = (
+        ctx_target
+        if (cur_target is None or cur_kind != "ascend")
+        else contextlib.nullcontext()
+    )
+    with target_ctx, tvm.transform.PassContext(
+        config=dict(pass_configs or {}),
+        instruments=list(instruments),
+    ):
+        yield
+
+
+def _access_ptr_or_region_bytes(
+    arg,
+    *,
+    tirx,
+    DataTypeCls,
+    let_env: Mapping[object, object] | None = None,
+) -> int:
+    if isinstance(arg, tirx.Call):
+        op_name = str(getattr(arg.op, "name", arg.op)).lower()
+        if "access_ptr" in op_name and len(arg.args) >= 4:
+            dtype_obj = getattr(arg.args[0], "dtype", None)
+            ext = _static_tirx_int(arg.args[3])
+            if dtype_obj is not None and ext is not None and ext > 0:
+                elem_b = _dtype_bytes(dtype_obj, DataTypeCls)
+                return int(math.ceil(ext * elem_b))
+    _scope, total_b, _inner_b = _region_bytes(arg, tirx, DataTypeCls, let_env=let_env)
+    return total_b
+
+
+def _collect_post_lower_gm_dma_payloads(
+    stmt,
+    *,
+    tirx,
+    DataTypeCls,
+) -> tuple[list[int], list[int]]:
+    """Collect all positive lowered GM DMA byte payloads inside loops and function-wide."""
+    loop_sizes: list[int] = []
+    all_sizes: list[int] = []
+    let_stmt_cls = getattr(tirx, "LetStmt", None)
+    bind_cls = getattr(tirx, "Bind", None)
+
+    def _walk(node, *, in_loop: bool, let_env: dict[object, object]) -> None:
+        if node is None:
+            return
+        if isinstance(node, tirx.SeqStmt):
+            seq_env = dict(let_env)
+            for child in node.seq:
+                if bind_cls is not None and isinstance(child, bind_cls):
+                    seq_env[child.var] = _substitute_let_env(child.value, seq_env, tirx=tirx)
+                    if hasattr(child, "body"):
+                        _walk(child.body, in_loop=in_loop, let_env=dict(seq_env))
+                else:
+                    _walk(child, in_loop=in_loop, let_env=seq_env)
+            return
+        if let_stmt_cls is not None and isinstance(node, let_stmt_cls):
+            next_env = dict(let_env)
+            next_env[node.var] = _substitute_let_env(node.value, let_env, tirx=tirx)
+            _walk(node.body, in_loop=in_loop, let_env=next_env)
+            return
+        if bind_cls is not None and isinstance(node, bind_cls):
+            next_env = dict(let_env)
+            next_env[node.var] = _substitute_let_env(node.value, let_env, tirx=tirx)
+            if hasattr(node, "body"):
+                _walk(node.body, in_loop=in_loop, let_env=next_env)
+            return
+        if isinstance(node, tirx.For):
+            tb = getattr(node, "thread_binding", None)
+            trip = _static_tirx_int(node.extent) if tb is None else None
+            sub_loop = in_loop or (tb is None and (trip is None or trip > 1))
+            _walk(node.body, in_loop=sub_loop, let_env=let_env)
+            return
+        if isinstance(node, tirx.While):
+            _walk(node.body, in_loop=True, let_env=let_env)
+            return
+        if isinstance(node, tirx.IfThenElse):
+            _walk(node.then_case, in_loop=in_loop, let_env=let_env)
+            if node.else_case is not None:
+                _walk(node.else_case, in_loop=in_loop, let_env=let_env)
+            return
+        if isinstance(node, tirx.SBlockRealize):
+            _walk(node.block, in_loop=in_loop, let_env=let_env)
+            return
+        if isinstance(node, (tirx.SBlock, tirx.AttrStmt, tirx.AllocBuffer, tirx.DeclBuffer)):
+            if hasattr(node, "body"):
+                _walk(node.body, in_loop=in_loop, let_env=let_env)
+            return
+        if isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call):
+            op_name = str(getattr(node.value.op, "name", node.value.op)).lower()
+            args = list(node.value.args)
+            if "copy" in op_name and len(args) >= 2:
+                is_gm_name = (
+                    "gm_to_" in op_name
+                    or "_to_gm" in op_name
+                    or "_gm_" in op_name
+                )
+                src_s, _sb, _sin = _region_bytes(args[0], tirx, DataTypeCls, let_env=let_env)
+                dst_s, _db, _din = _region_bytes(args[1], tirx, DataTypeCls, let_env=let_env)
+                is_gm_region = (
+                    src_s is not None
+                    and dst_s is not None
+                    and src_s != dst_s
+                    and "GM" in (src_s, dst_s)
+                )
+                if is_gm_name or is_gm_region:
+                    b0 = _access_ptr_or_region_bytes(
+                        args[0], tirx=tirx, DataTypeCls=DataTypeCls, let_env=let_env
+                    )
+                    b1 = _access_ptr_or_region_bytes(
+                        args[1], tirx=tirx, DataTypeCls=DataTypeCls, let_env=let_env
+                    )
+                    xfer = max(b0, b1)
+                    if xfer > 0:
+                        all_sizes.append(xfer)
+                        if in_loop:
+                            loop_sizes.append(xfer)
+
+    _walk(stmt, in_loop=False, let_env={})
+    return loop_sizes, all_sizes
+
+
+def _collect_func_ub_buf_names(func, *, tirx) -> set[str]:
+    names: set[str] = set()
+
+    def _check_buf(buf) -> None:
+        raw_scope = str(buf.scope()).strip()
+        if _map_tilelang_scope(raw_scope) == "UB" or raw_scope == "local.ub":
+            names.add(buf.name)
+
+    for param in getattr(func, "params", ()):
+        buf = func.buffer_map.get(param) if hasattr(func, "buffer_map") else None
+        if buf is not None:
+            _check_buf(buf)
+
+    def _visit(node) -> None:
+        if isinstance(node, tirx.SBlock):
+            for buf in node.alloc_buffers:
+                _check_buf(buf)
+        elif isinstance(node, (tirx.AllocBuffer, tirx.DeclBuffer)):
+            _check_buf(node.buffer)
+
+    tirx.stmt_functor.post_order_visit(func.body, _visit)
+    return names
+
+
+def _detect_post_lower_dynamic_offset(func, *, tirx) -> bool:
+    mod_classes = tuple(
+        cls
+        for name in ("FloorMod", "Mod")
+        if (cls := getattr(tirx, name, None)) is not None
+    )
+    found = [False]
+
+    def _expr_has_loop_mod(expr, loop_vars: list[object]) -> bool:
+        if not mod_classes or not loop_vars or expr is None:
+            return False
+        hit = [False]
+
+        def _visit(sub) -> None:
+            if isinstance(sub, mod_classes):
+                fvs = _free_tirx_vars(sub.a, tirx=tirx)
+                if any(
+                    (hasattr(fv, "same_as") and fv.same_as(lv)) or fv is lv
+                    for fv in fvs
+                    for lv in loop_vars
+                ):
+                    hit[0] = True
+
+        tirx.stmt_functor.post_order_visit(expr, _visit)
+        return hit[0]
+
+    def _walk(node, loop_vars: list[object]) -> None:
+        if node is None or found[0]:
+            return
+        if isinstance(node, tirx.SeqStmt):
+            for child in node.seq:
+                _walk(child, loop_vars)
+            return
+        if isinstance(node, tirx.For):
+            ann = getattr(node, "annotations", None) or {}
+            kind_val = int(node.kind) if hasattr(node.kind, "value") else node.kind
+            stages_val = (
+                _static_tirx_int(ann.get("num_stages")) if "num_stages" in ann else None
+            )
+            if ann.get("enable_offset") or kind_val == 5 or (stages_val is not None and stages_val >= 2):
+                found[0] = True
+                return
+            next_vars = [*loop_vars, node.loop_var]
+            _walk(node.body, next_vars)
+            return
+        if isinstance(node, tirx.IfThenElse):
+            _walk(node.then_case, loop_vars)
+            if node.else_case is not None:
+                _walk(node.else_case, loop_vars)
+            return
+        if isinstance(node, tirx.SBlockRealize):
+            _walk(node.block, loop_vars)
+            return
+        if isinstance(node, (tirx.SBlock, tirx.AttrStmt, tirx.Bind, tirx.AllocBuffer, tirx.DeclBuffer)):
+            if hasattr(node, "body"):
+                _walk(node.body, loop_vars)
+            return
+        if isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call):
+            for arg in node.value.args:
+                if isinstance(arg, tirx.Call) and "access_ptr" in str(
+                    getattr(arg.op, "name", arg.op)
+                ).lower():
+                    if len(arg.args) >= 3 and _expr_has_loop_mod(arg.args[2], loop_vars):
+                        found[0] = True
+                        return
+
+    _walk(func.body, [])
+    return found[0]
+
+
+def _reconcile_post_lower_device_mod(
+    device_mod,
+    *,
+    spaces: AscendSpaceFacts,
+    tirx,
+    DataTypeCls,
+    pre_pipe_cycles: dict[str, int],
+    pre_barriers: int,
+    pre_min_gm_dma_bytes: int,
+    pre_dma_burst_eff: float,
+    pre_ub_scalar_loops: int,
+    pre_dyn_offset_pipe: bool,
+    explicit_aiv_split: int | None,
+    effective_aiv_split: int,
+) -> tuple[dict[str, int], int, int, float, int, bool]:
+    """Read-only scan lowered device PrimFuncs to reconcile barriers, DMA, scalar, and AIV pipes."""
+    if device_mod is None or not hasattr(device_mod, "functions"):
+        return (
+            dict(pre_pipe_cycles),
+            pre_barriers,
+            pre_min_gm_dma_bytes,
+            pre_dma_burst_eff,
+            pre_ub_scalar_loops,
+            pre_dyn_offset_pipe,
+        )
+    dev_funcs = [fn for fn in device_mod.functions.values() if isinstance(fn, tirx.PrimFunc)]
+    if not dev_funcs:
+        return (
+            dict(pre_pipe_cycles),
+            pre_barriers,
+            pre_min_gm_dma_bytes,
+            pre_dma_burst_eff,
+            pre_ub_scalar_loops,
+            pre_dyn_offset_pipe,
+        )
+
+    post_barriers = 0
+    post_loop_dma: list[int] = []
+    post_all_dma: list[int] = []
+    post_ub_scalar_loops = 0
+    post_dyn_offset = pre_dyn_offset_pipe
+    post_pipe_totals: dict[str, int] = {}
+
+    for dev_fn in dev_funcs:
+        post_barriers += _count_in_loop_pipe_all_barriers(dev_fn.body, tirx=tirx)
+        l_dma, a_dma = _collect_post_lower_gm_dma_payloads(
+            dev_fn.body, tirx=tirx, DataTypeCls=DataTypeCls
+        )
+        post_loop_dma.extend(l_dma)
+        post_all_dma.extend(a_dma)
+        ub_names = _collect_func_ub_buf_names(dev_fn, tirx=tirx)
+        post_ub_scalar_loops += _count_tirx_ub_scalar_compute_loops(
+            dev_fn.body,
+            ub_names,
+            tirx=tirx,
+            allow_sync_intrinsics=True,
+        )
+        if not post_dyn_offset and _detect_post_lower_dynamic_offset(dev_fn, tirx=tirx):
+            post_dyn_offset = True
+        dev_split = _detect_tilelang_aiv_split_factor(dev_fn, tirx=tirx)
+        scan_split = max(effective_aiv_split, dev_split) if explicit_aiv_split is None else explicit_aiv_split
+        dev_pipes, _mte2, _pad, _opq, _simt, _ill = _scan_tilelang_ast(
+            dev_fn,
+            spaces,
+            tirx=tirx,
+            DataTypeCls=DataTypeCls,
+            aiv_split_factor=scan_split,
+        )
+        for pkey, pval in dev_pipes.items():
+            post_pipe_totals[pkey] = post_pipe_totals.get(pkey, 0) + pval
+
+    reconciled_barriers = max(pre_barriers, post_barriers)
+    reconciled_ub_scalar = max(pre_ub_scalar_loops, post_ub_scalar_loops)
+
+    post_pool = [b for b in (post_loop_dma if post_loop_dma else post_all_dma) if b > 0]
+    if post_pool:
+        post_min = min(post_pool)
+        reconciled_min_dma = (
+            min(pre_min_gm_dma_bytes, post_min) if pre_min_gm_dma_bytes > 0 else post_min
+        )
+        total_dma = float(sum(post_pool))
+        weighted_inv = sum(
+            float(b) / max(1e-6, float(spaces.dma_burst_efficiency(int(b))))
+            for b in post_pool
+        )
+        post_eff = round(min(1.0, total_dma / max(1e-6, weighted_inv)), 4)
+        reconciled_burst_eff = (
+            min(pre_dma_burst_eff, post_eff) if pre_min_gm_dma_bytes > 0 else post_eff
+        )
+    else:
+        reconciled_min_dma = pre_min_gm_dma_bytes
+        reconciled_burst_eff = pre_dma_burst_eff
+
+    reconciled_pipes = dict(pre_pipe_cycles)
+    if explicit_aiv_split != 1:
+        pre_a0 = pre_pipe_cycles.get("AIV0.PIPE_V", 0)
+        pre_a1 = pre_pipe_cycles.get("AIV1.PIPE_V", 0)
+        post_a0 = post_pipe_totals.get("AIV0.PIPE_V", 0)
+        post_a1 = post_pipe_totals.get("AIV1.PIPE_V", 0)
+        if (post_a0 != post_a1) or (pre_a0 == 0 and pre_a1 == 0 and (post_a0 > 0 or post_a1 > 0)):
+            if post_a0 > 0:
+                reconciled_pipes["AIV0.PIPE_V"] = max(pre_a0, post_a0)
+            if post_a1 > 0:
+                reconciled_pipes["AIV1.PIPE_V"] = max(pre_a1, post_a1)
+
+    return (
+        reconciled_pipes,
+        reconciled_barriers,
+        reconciled_min_dma,
+        reconciled_burst_eff,
+        reconciled_ub_scalar,
+        post_dyn_offset,
+    )
+
+
 def specialize_primfunc_for_anchor(
     prim_func,
     *,
@@ -4138,7 +4498,6 @@ def specialize_primfunc_for_anchor(
     ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ):
     """Specialize a TileLang PrimFunc or IRModule for one anchor shape without lowering."""
-    from tilelang import tvm  # noqa: PLC0415
     from tvm import tirx  # noqa: PLC0415
 
     if isinstance(prim_func, tvm.IRModule):
@@ -4174,9 +4533,6 @@ def inspect_tilelang_primfunc(
     ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> EnvelopeInspectionResult:
     """Inspect a TileLang PrimFunc using Two-Snapshot IR Diff without bisheng compile."""
-    import contextlib  # noqa: PLC0415
-
-    from tilelang import tvm  # noqa: PLC0415
     from tilelang.backend.module import create_backend_context  # noqa: PLC0415
     from tilelang.engine.lower import lower_to_host_device_ir  # noqa: PLC0415
     from tilelang.utils.language import DataType as TLDataType  # noqa: PLC0415
@@ -4196,111 +4552,108 @@ def inspect_tilelang_primfunc(
         sym = str(entry_fn.attrs.get("global_symbol", "main")) if entry_fn.attrs else "main"
         mod_in = tvm.IRModule({sym: entry_fn})
 
-    entry_fn, mod_in = _specialize_primfunc_for_anchors(
-        entry_fn,
-        mod_in,
-        var_bindings,
-        tvm_mod=tvm,
-        tirx=tirx,
-        ordered_tensor_shapes=ordered_tensor_shapes,
-    )
-
-    cfg, merged_flags = _extract_primfunc_pass_configs_and_flags(
+    raw_cfg, _raw_flags = _extract_primfunc_pass_configs_and_flags(
         entry_fn,
         mod_in,
         pass_configs=pass_configs,
         compile_flags=compile_flags,
     )
-    ubuf_flag = "--cce-disable-vf-stack-reserved-ubuf"
-    unreserved_hint = bool(
-        unreserved_ubuf
-        or any(ubuf_flag in f for f in merged_flags)
-        or _attrs_contain_flag(cfg, ubuf_flag)
-    )
-
-    effective_aiv_split = (
-        aiv_split_factor
-        if aiv_split_factor is not None
-        else _detect_tilelang_aiv_split_factor(entry_fn, tirx=tirx)
-    )
-    explicit_snaps = _extract_tilelang_buffers_from_func(
-        entry_fn, tirx=tirx, DataTypeCls=TLDataType, prefer_allocate=False
-    )
-    requested_mb = _requested_multibuffer_names(entry_fn, tirx=tirx)
-    pipe_cycles, mte2_inflight, pad_bytes, opaque, has_simtvf, illegal_dma = _scan_tilelang_ast(
-        entry_fn,
-        spaces,
-        tirx=tirx,
-        DataTypeCls=TLDataType,
-        aiv_split_factor=effective_aiv_split,
-    )
-    telemetry = _collect_tilelang_telemetry(
-        entry_fn,
-        mod_in,
-        tirx=tirx,
-        DataTypeCls=TLDataType,
-        pipe_cycles=pipe_cycles,
-        unreserved_ubuf=unreserved_hint,
-        spaces=spaces,
-        aiv_split_factor=effective_aiv_split,
-        var_bindings=var_bindings,
-        tvm_mod=tvm,
-        ordered_tensor_shapes=ordered_tensor_shapes,
-    )
-    effective_unreserved = telemetry.uses_unreserved_ubuf
-    capacities = _scope_capacities(
-        spaces,
-        has_simtvf=has_simtvf,
-        unreserved_ubuf=effective_unreserved,
-    )
-
-    observed: list[str] = []
-    captured_mods: dict[str, object] = {}
-
-    @tvm.ir.instrument.pass_instrument
-    class _SnapshotCapture:
-        def run_before_pass(self, mod, info):
-            if info.name == "tl.MergeUBAllocations":
-                captured_mods["pre_merge"] = mod
-
-        def run_after_pass(self, mod, info):
-            observed.append(str(info.name))
-            if info.name in (
-                "tl.MaterializeMultiBuffer",
-                "tl.MergeUBAllocations",
-                "tl.InsertNd2Nz",
-                "tl.NormalizeAscendFractalStorage",
-            ):
-                captured_mods[str(info.name)] = mod
-
+    ctx = create_backend_context("ascend", None, "auto")
+    tap = ReadOnlyAscendPassTap()
     lowering_error: str | None = None
     device_mod = None
-    ctx = create_backend_context("ascend", None, "auto")
-    cur_target = tvm.target.Target.current(allow_none=True)
-    cur_kind = str(getattr(getattr(cur_target, "kind", None), "name", "") or "")
-    target_ctx = (
-        ctx.target
-        if (cur_target is None or cur_kind != "ascend")
-        else contextlib.nullcontext()
-    )
-    try:
-        with target_ctx, tvm.transform.PassContext(
-            config=cfg, instruments=[_SnapshotCapture()]
-        ):
-            _host_mod, device_mod, _params, _tgt, _htgt = lower_to_host_device_ir(mod_in, ctx)
-    except Exception as exc:
-        lowering_error = f"{type(exc).__name__}: {exc}"
 
+    with _ascend_compile_session(ctx.target, pass_configs=raw_cfg, instruments=[tap]):
+        entry_fn, mod_in = _specialize_primfunc_for_anchors(
+            entry_fn,
+            mod_in,
+            var_bindings,
+            tvm_mod=tvm,
+            tirx=tirx,
+            ordered_tensor_shapes=ordered_tensor_shapes,
+        )
+        cfg, merged_flags = _extract_primfunc_pass_configs_and_flags(
+            entry_fn,
+            mod_in,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+        )
+        ubuf_flag = "--cce-disable-vf-stack-reserved-ubuf"
+        unreserved_hint = bool(
+            unreserved_ubuf
+            or any(ubuf_flag in f for f in merged_flags)
+            or _attrs_contain_flag(cfg, ubuf_flag)
+        )
+        effective_aiv_split = (
+            aiv_split_factor
+            if aiv_split_factor is not None
+            else _detect_tilelang_aiv_split_factor(entry_fn, tirx=tirx)
+        )
+        explicit_snaps = _extract_tilelang_buffers_from_func(
+            entry_fn, tirx=tirx, DataTypeCls=TLDataType, prefer_allocate=False
+        )
+        requested_mb = _requested_multibuffer_names(entry_fn, tirx=tirx)
+        pipe_cycles, mte2_inflight, pad_bytes, opaque, has_simtvf, illegal_dma = (
+            _scan_tilelang_ast(
+                entry_fn,
+                spaces,
+                tirx=tirx,
+                DataTypeCls=TLDataType,
+                aiv_split_factor=effective_aiv_split,
+            )
+        )
+        telemetry = _collect_tilelang_telemetry(
+            entry_fn,
+            mod_in,
+            tirx=tirx,
+            DataTypeCls=TLDataType,
+            pipe_cycles=pipe_cycles,
+            unreserved_ubuf=unreserved_hint,
+            spaces=spaces,
+            aiv_split_factor=effective_aiv_split,
+            var_bindings=var_bindings,
+            tvm_mod=tvm,
+            ordered_tensor_shapes=ordered_tensor_shapes,
+        )
+        effective_unreserved = telemetry.uses_unreserved_ubuf
+        capacities = _scope_capacities(
+            spaces,
+            has_simtvf=has_simtvf,
+            unreserved_ubuf=effective_unreserved,
+        )
+        try:
+            with tvm.transform.PassContext(config=cfg, instruments=[tap]):
+                _host_mod, device_mod, _params, _tgt, _htgt = lower_to_host_device_ir(
+                    mod_in, ctx
+                )
+        except Exception as exc:
+            lowering_error = f"{type(exc).__name__}: {exc}"
+
+    captured_mods = tap.captured_mods
+    observed = tap.observed_passes
+
+    dev_snaps = _extract_tilelang_buffers_from_mod(
+        device_mod,
+        tirx=tirx,
+        DataTypeCls=TLDataType,
+        prefer_allocate=True,
+    )
     mat_snaps = _extract_tilelang_buffers_from_mod(
         captured_mods.get("tl.MaterializeMultiBuffer"),
         tirx=tirx,
         DataTypeCls=TLDataType,
         prefer_allocate=False,
     )
+    if not mat_snaps and dev_snaps:
+        mat_snaps = dev_snaps
+
     pre_merge_mod = (
         captured_mods.get("pre_merge")
+        or captured_mods.get("tl.LowerTileOp")
+        or captured_mods.get("tl.AscendLowerTileOp")
         or captured_mods.get("tl.InsertNd2Nz")
         or captured_mods.get("tl.NormalizeAscendFractalStorage")
+        or captured_mods.get("tl.MaterializeMultiBuffer")
         or device_mod
     )
     lowered_snaps = _extract_tilelang_buffers_from_mod(
@@ -4319,6 +4672,11 @@ def inspect_tilelang_primfunc(
     merged_peak: dict[str, int] = {}
     for snap in post_merge_snaps:
         merged_peak[snap.scope] = merged_peak.get(snap.scope, 0) + snap.bytes
+    dev_scope_totals: dict[str, int] = {}
+    for snap in dev_snaps:
+        dev_scope_totals[snap.scope] = dev_scope_totals.get(snap.scope, 0) + snap.bytes
+    for scope, dev_bytes in dev_scope_totals.items():
+        merged_peak[scope] = max(merged_peak.get(scope, 0), dev_bytes)
 
     degraded = _detect_degraded_buffers(explicit_snaps, mat_snaps, requested_mb)
     waterlines = _diff_snapshots_by_scope(
@@ -4330,6 +4688,28 @@ def inspect_tilelang_primfunc(
     )
     if lowering_error is not None and "lowering_rejected" not in opaque:
         opaque = (*opaque, "lowering_rejected")
+
+    (
+        pipe_cycles,
+        reconciled_barriers,
+        reconciled_min_dma,
+        reconciled_burst_eff,
+        reconciled_ub_scalar,
+        reconciled_dyn_offset,
+    ) = _reconcile_post_lower_device_mod(
+        device_mod,
+        spaces=spaces,
+        tirx=tirx,
+        DataTypeCls=TLDataType,
+        pre_pipe_cycles=pipe_cycles,
+        pre_barriers=telemetry.in_loop_pipe_all_barriers,
+        pre_min_gm_dma_bytes=telemetry.min_gm_dma_bytes,
+        pre_dma_burst_eff=telemetry.dma_burst_efficiency_ratio,
+        pre_ub_scalar_loops=telemetry.ub_scalar_compute_loops,
+        pre_dyn_offset_pipe=telemetry.uses_dynamic_offset_pipelining,
+        explicit_aiv_split=aiv_split_factor,
+        effective_aiv_split=effective_aiv_split,
+    )
 
     has_overflow = any(wl.overflow_bytes > 0 for wl in waterlines.values())
     solved_ii: int | None = None
@@ -4391,16 +4771,16 @@ def inspect_tilelang_primfunc(
         in_loop_ub_reload_stores=telemetry.in_loop_ub_reload_stores,
         uses_unreserved_ubuf=effective_unreserved,
         grid_is_symbolic=telemetry.grid_is_symbolic,
-        min_gm_dma_bytes=telemetry.min_gm_dma_bytes,
-        dma_burst_efficiency_ratio=telemetry.dma_burst_efficiency_ratio,
-        uses_dynamic_offset_pipelining=telemetry.uses_dynamic_offset_pipelining,
+        min_gm_dma_bytes=reconciled_min_dma,
+        dma_burst_efficiency_ratio=reconciled_burst_eff,
+        uses_dynamic_offset_pipelining=reconciled_dyn_offset,
         has_unlimit_memory_attr=telemetry.has_unlimit_memory_attr,
         has_coupled_reduce_sfu_accum=telemetry.has_coupled_reduce_sfu_accum,
         active_grid_blocks=telemetry.active_grid_blocks,
-        in_loop_pipe_all_barriers=telemetry.in_loop_pipe_all_barriers,
+        in_loop_pipe_all_barriers=reconciled_barriers,
         ub_bank_conflict_risk=telemetry.ub_bank_conflict_risk,
         l1_bank_conflict_risk=effective_l1_risk,
-        ub_scalar_compute_loops=telemetry.ub_scalar_compute_loops,
+        ub_scalar_compute_loops=reconciled_ub_scalar,
         microarch_profile=ma_prof.to_dict(),
     )
     return EnvelopeInspectionResult(
@@ -4413,735 +4793,10 @@ def inspect_tilelang_primfunc(
     )
 
 
-def _tir_tensor_bytes(tensor_type: TensorType) -> tuple[int, int]:
-    elems = 1
-    inner = 1
-    for idx, dim in enumerate(tensor_type.shape):
-        ext = static_dim_value(dim)
-        if ext is None or ext < 1:
-            return 0, 0
-        elems *= ext
-        if idx == len(tensor_type.shape) - 1:
-            inner = ext
-    total = (elems * tensor_type.dtype.bit_width + 7) // 8
-    inner_bytes = (inner * tensor_type.dtype.bit_width + 7) // 8
-    return total, inner_bytes
-
-
-def _infer_tir_space(op: Op | None, tensor_type: TensorType) -> str:
-    if tensor_type.storage is StorageKind.SMEM:
-        return "UB"
-    if isinstance(op, AscendL1ToL0A):
-        return "L0A"
-    if isinstance(op, AscendL1ToL0B):
-        return "L0B"
-    if isinstance(op, (AscendL0cToGm, AscendDualCopyL0cToUb)):
-        return "L0C"
-    return "L1"
-
-
-def _tir_for_static_trip_count(stmt: For) -> int | None:
-    """Compute static integer trip count for a TileFoundry TIR For loop."""
-    start_v = static_dim_value(stmt.start)
-    stop_v = static_dim_value(stmt.stop)
-    step_v = static_dim_value(stmt.step)
-    if start_v is None or stop_v is None or step_v is None or step_v <= 0:
-        return None
-    return max(0, (stop_v - start_v + step_v - 1) // step_v)
-
-
-def _resolve_tir_buffer_key(
-    expr: Expr,
-    env: dict[int, Expr],
-) -> tuple[str | None, StorageKind | None]:
-    """Resolve a TileFoundry TIR expression to its canonical buffer key and storage."""
-    seen: set[int] = set()
-    cur: object = expr
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
-        if isinstance(cur, Var):
-            if id(cur) in env:
-                nxt = env[id(cur)]
-                if isinstance(nxt, Call) and isinstance(nxt.target, AllocTensor):
-                    storage = cur.type.storage if isinstance(cur.type, TensorType) else None
-                    return cur.name, storage
-                cur = nxt
-                continue
-            if isinstance(cur.type, TensorType):
-                return cur.name, cur.type.storage
-            return None, None
-        if isinstance(cur, Call):
-            if isinstance(cur.target, TensorView) and cur.args:
-                arg0 = cur.args[0]
-                if isinstance(arg0, Constant) and isinstance(arg0.value, int):
-                    storage = (
-                        cur.type.storage if isinstance(cur.type, TensorType) else StorageKind.SMEM
-                    )
-                    return f"{storage.name}@{arg0.value}", storage
-                if isinstance(arg0, (Var, Call)):
-                    cur = arg0
-                    continue
-            if isinstance(cur.target, (PtrOf, Slice)) and cur.args:
-                if isinstance(cur.args[0], (Var, Call)):
-                    cur = cur.args[0]
-                    continue
-            if isinstance(cur.target, AllocTensor) and isinstance(cur.type, TensorType):
-                return f"alloc_{id(cur)}", cur.type.storage
-            if isinstance(cur.type, TensorType):
-                return f"buf_{id(cur)}", cur.type.storage
-            return None, None
-        return None, None
-    return None, None
-
-
-def _collect_tir_stmt_events(
-    stmt: Stmt | None,
-    env: dict[int, Expr],
-) -> tuple[
-    list[tuple[str, StorageKind | None, str]],
-    bool,
-    set[str],
-    set[str],
-    set[str],
-]:
-    """Collect ordered accesses, exp presence, UB loads/stores, and local alloc keys."""
-    events: list[tuple[str, StorageKind | None, str]] = []
-    has_exp = [False]
-    ub_loads: set[str] = set()
-    ub_stores: set[str] = set()
-    local_allocs: set[str] = set()
-
-    def _walk(node: Stmt | None) -> None:
-        if node is None:
-            return
-        if isinstance(node, Sequential):
-            for child in node.body:
-                _walk(child)
-            return
-        if isinstance(node, LetStmt):
-            env[id(node.var)] = node.value
-            if isinstance(node.value, Call) and isinstance(node.value.target, AllocTensor):
-                local_allocs.add(node.var.name)
-            return
-        if isinstance(node, (MeshScope, ExecutionScope, For, While)):
-            _walk(node.body)
-            return
-        if isinstance(node, If):
-            _walk(node.then_body)
-            _walk(node.else_body)
-            return
-        if isinstance(node, Evaluate) and isinstance(node.callable, Op):
-            op = node.callable
-            if isinstance(op, AscendVunary) and op.kind in (UnaryKind.EXP, UnaryKind.EXP2):
-                has_exp[0] = True
-            if isinstance(op, Fill):
-                if node.args:
-                    key, st = _resolve_tir_buffer_key(node.args[0], env)
-                    if key is not None:
-                        events.append((key, st, "write"))
-                return
-            if isinstance(op, AscendUbToReg) and len(node.args) >= 2:
-                src_key, src_st = _resolve_tir_buffer_key(node.args[0], env)
-                dst_key, dst_st = _resolve_tir_buffer_key(node.args[1], env)
-                if src_key is not None:
-                    events.append((src_key, src_st, "read"))
-                    if src_st is StorageKind.SMEM:
-                        ub_loads.add(src_key)
-                if dst_key is not None:
-                    events.append((dst_key, dst_st, "write"))
-                return
-            if isinstance(op, AscendRegToUb) and len(node.args) >= 2:
-                src_key, src_st = _resolve_tir_buffer_key(node.args[0], env)
-                dst_key, dst_st = _resolve_tir_buffer_key(node.args[1], env)
-                if src_key is not None:
-                    events.append((src_key, src_st, "read"))
-                if dst_key is not None:
-                    events.append((dst_key, dst_st, "write"))
-                    if dst_st is StorageKind.SMEM:
-                        ub_stores.add(dst_key)
-                return
-            if isinstance(op, Copy) and len(node.args) >= 2:
-                src_key, src_st = _resolve_tir_buffer_key(node.args[0], env)
-                dst_key, dst_st = _resolve_tir_buffer_key(node.args[1], env)
-                if src_key is not None:
-                    events.append((src_key, src_st, "read"))
-                if dst_key is not None:
-                    events.append((dst_key, dst_st, "write"))
-                if src_st is StorageKind.SMEM and dst_st is StorageKind.RMEM and src_key is not None:
-                    ub_loads.add(src_key)
-                if src_st is StorageKind.RMEM and dst_st is StorageKind.SMEM and dst_key is not None:
-                    ub_stores.add(dst_key)
-                return
-            input_defs = [p for p in collect_param_defs(type(op)) if p.kind == "input"]
-            for pdef, arg in zip(input_defs, node.args):
-                key, st = _resolve_tir_buffer_key(arg, env)
-                if key is None:
-                    continue
-                if pdef.effect & MemoryEffect.READ:
-                    events.append((key, st, "read"))
-                if pdef.effect & MemoryEffect.WRITE:
-                    events.append((key, st, "write"))
-
-    _walk(stmt)
-    return events, has_exp[0], ub_loads, ub_stores, local_allocs
-
-
-_TIR_DISALLOWED_LOOP_OPS = frozenset(
-    {
-        "AscendGmToUb",
-        "AscendUbToGm",
-        "AscendGmToL1",
-        "AscendL1ToL0A",
-        "AscendL1ToL0B",
-        "AscendL0cToGm",
-        "AscendDualCopy",
-        "AscendDualCopyL0cToUb",
-        "AscendDualCopyUbToL1",
-        "AscendMmad",
-        "AscendCrossCoreSync",
-        "AscendUbToReg",
-        "AscendRegToUb",
-        "AscendVcast",
-        "AscendVbinary",
-        "AscendVunary",
-        "AscendVreduce",
-        "AscendVwhere",
-        "AscendVclamp",
-        "Copy",
-        "CopyAsync",
-        "CpAsyncCommit",
-        "CpAsyncWait",
-        "Sync",
-        "FlagSet",
-        "FlagWait",
-        "Drain",
-    }
-)
-_TIR_COMPUTE_LOOP_OPS = frozenset(
-    {"Binary", "Unary", "Cast", "Clamp", "Where", "ReLU", "Reduce", "Dot"}
-)
-
-
-def _count_tir_ub_scalar_compute_loops(
-    stmt: Stmt | None,
-    root_env: Mapping[int, Expr],
-) -> int:
-    """Count innermost serial TileFoundry TIR For loops performing arithmetic over UB buffers."""
-    count = [0]
-
-    def _is_innermost_ub_scalar_body(
-        loop_body: Stmt | None,
-        init_env: Mapping[int, Expr],
-    ) -> bool:
-        local_env = dict(init_env)
-        aborted = [False]
-        found_compute = [False]
-
-        def _scan(node: Stmt | None) -> None:
-            if node is None or aborted[0]:
-                return
-            if isinstance(node, (For, While, ExecutionScope)):
-                aborted[0] = True
-                return
-            if isinstance(node, Sequential):
-                for ch in node.body:
-                    _scan(ch)
-                return
-            if isinstance(node, MeshScope):
-                _scan(node.body)
-                return
-            if isinstance(node, If):
-                _scan(node.then_body)
-                _scan(node.else_body)
-                return
-            if isinstance(node, LetStmt):
-                local_env[id(node.var)] = node.value
-                if isinstance(node.value, Call) and isinstance(node.value.target, Op):
-                    op_name = type(node.value.target).__name__
-                    if op_name in _TIR_DISALLOWED_LOOP_OPS:
-                        aborted[0] = True
-                        return
-                    if (
-                        op_name in _TIR_COMPUTE_LOOP_OPS
-                        and isinstance(node.var.type, TensorType)
-                        and node.var.type.storage is StorageKind.SMEM
-                    ):
-                        has_ub_or_gm_read = any(
-                            _resolve_tir_buffer_key(arg, local_env)[1]
-                            in (StorageKind.SMEM, StorageKind.GMEM)
-                            for arg in node.value.args
-                        )
-                        if has_ub_or_gm_read:
-                            found_compute[0] = True
-                return
-            if isinstance(node, Evaluate) and isinstance(node.callable, Op):
-                op = node.callable
-                op_name = type(op).__name__
-                if op_name in _TIR_DISALLOWED_LOOP_OPS:
-                    aborted[0] = True
-                    return
-                if op_name in _TIR_COMPUTE_LOOP_OPS:
-                    input_defs = [
-                        p for p in collect_param_defs(type(op)) if p.kind == "input"
-                    ]
-                    writes_ub = False
-                    reads_ub_or_gm = False
-                    for pdef, arg in zip(input_defs, node.args):
-                        _k, st = _resolve_tir_buffer_key(arg, local_env)
-                        if (pdef.effect & MemoryEffect.WRITE) and st is StorageKind.SMEM:
-                            writes_ub = True
-                        if (pdef.effect & MemoryEffect.READ) and st in (
-                            StorageKind.SMEM,
-                            StorageKind.GMEM,
-                        ):
-                            reads_ub_or_gm = True
-                    if writes_ub and reads_ub_or_gm:
-                        found_compute[0] = True
-
-        _scan(loop_body)
-        return (not aborted[0]) and found_compute[0]
-
-    def _walk(
-        node: Stmt | None,
-        *,
-        in_vector_scope: bool,
-        env: dict[int, Expr],
-    ) -> None:
-        if node is None:
-            return
-        if isinstance(node, Sequential):
-            for child in node.body:
-                _walk(child, in_vector_scope=in_vector_scope, env=env)
-            return
-        if isinstance(node, LetStmt):
-            env[id(node.var)] = node.value
-            return
-        if isinstance(node, MeshScope):
-            _walk(node.body, in_vector_scope=in_vector_scope, env=env)
-            return
-        if isinstance(node, ExecutionScope):
-            kind_low = str(getattr(node.kind, "name", node.kind)).lower()
-            next_vec = in_vector_scope or ("simd" in kind_low) or ("simt" in kind_low)
-            _walk(node.body, in_vector_scope=next_vec, env=env)
-            return
-        if isinstance(node, While):
-            _walk(node.body, in_vector_scope=in_vector_scope, env=env)
-            return
-        if isinstance(node, If):
-            _walk(node.then_body, in_vector_scope=in_vector_scope, env=env)
-            _walk(node.else_body, in_vector_scope=in_vector_scope, env=env)
-            return
-        if isinstance(node, For):
-            trip = _tir_for_static_trip_count(node)
-            valid_extent = trip is None or trip >= 8
-            is_pipelined = node.pipeline is not None
-            if not in_vector_scope and not is_pipelined and valid_extent:
-                if _is_innermost_ub_scalar_body(node.body, env):
-                    count[0] += 1
-                    return
-            _walk(node.body, in_vector_scope=in_vector_scope, env=dict(env))
-
-    _walk(stmt, in_vector_scope=False, env=dict(root_env))
-    return count[0]
-
-
-def _collect_tir_telemetry(
-    fn_or_stmt: PrimFunction | Stmt,
-    *,
-    pipe_cycles: dict[str, int],
-    unreserved_ubuf: bool,
-) -> tuple[_TelemetryFeatures, int]:
-    """Extract NP1 telemetry and AIV split factor from a TileFoundry TIR PrimFunction."""
-    body = fn_or_stmt.body if isinstance(fn_or_stmt, PrimFunction) else fn_or_stmt
-    flag = "--cce-disable-vf-stack-reserved-ubuf"
-    meta = getattr(fn_or_stmt, "metadata", ()) if isinstance(fn_or_stmt, PrimFunction) else ()
-    effective_unreserved = bool(
-        unreserved_ubuf or any(flag in str(item) for item in meta)
-    )
-
-    has_lowbit_buf = [False]
-    has_indirect_gather = [False]
-    cube_m_values: list[int] = []
-    gm_static_bytes: dict[str, int] = {}
-    gm_scalar_names: set[str] = set()
-    contig_candidates: list[tuple[int | None, int, int, int, int]] = []
-    scratch_candidates: list[tuple[int | None, int, int, int, int]] = []
-    aiv_split = [2 if any(k.startswith("AIV1.") for k in pipe_cycles) else 1]
-    max_grid_blocks = [1]
-
-    def _register_tensor(name: str, ttype: TensorType) -> None:
-        if _is_lowbit_dtype_name(ttype.dtype.name):
-            has_lowbit_buf[0] = True
-        if ttype.storage is not StorageKind.GMEM:
-            return
-        shape = ttype.shape
-        elem_bytes = ttype.dtype.bit_width / 8.0
-        static_dims = [static_dim_value(d) for d in shape]
-        dyn_cnt = sum(1 for d in static_dims if d is None)
-        if dyn_cnt == 0:
-            nbytes, _inner = _tir_tensor_bytes(ttype)
-            gm_static_bytes[name] = max(gm_static_bytes.get(name, 0), nbytes)
-            total_elems = math.prod(d for d in static_dims if d is not None) if shape else 0
-            if total_elems == 1:
-                gm_scalar_names.add(name)
-        else:
-            gm_static_bytes.setdefault(name, 0)
-            total_elems = None
-        if shape:
-            last_dim = static_dim_value(shape[-1])
-            if last_dim is not None and last_dim >= 1:
-                static_prod = int(
-                    math.ceil(
-                        math.prod(d for d in static_dims if d is not None) * elem_bytes
-                    )
-                )
-                contig = int(math.ceil(last_dim * elem_bytes))
-                entry = (total_elems, last_dim, dyn_cnt, static_prod, contig)
-                is_compiler_scratch = len(shape) == 1 and (
-                    name == "scratch" or name.startswith("scratch_")
-                )
-                if is_compiler_scratch:
-                    scratch_candidates.append(entry)
-                else:
-                    contig_candidates.append(entry)
-
-    if isinstance(fn_or_stmt, PrimFunction):
-        for param in fn_or_stmt.params:
-            if isinstance(param.type, TensorType):
-                _register_tensor(param.name, param.type)
-
-    loops: list[tuple[Stmt, dict[int, Expr], bool, bool]] = []
-    env: dict[int, Expr] = {}
-
-    def _walk(node: Stmt | None, *, active_block_product: int = 1) -> None:
-        if node is None:
-            return
-        if isinstance(node, Sequential):
-            for child in node.body:
-                _walk(child, active_block_product=active_block_product)
-            return
-        if isinstance(node, LetStmt):
-            env[id(node.var)] = node.value
-            if isinstance(node.var.type, TensorType):
-                _register_tensor(node.var.name, node.var.type)
-            return
-        if isinstance(node, MeshScope):
-            next_block = active_block_product
-            held_levels = mesh_levels(node.mesh)
-            for idx, top in enumerate(node.mesh.topologies):
-                top_name = getattr(top, "name", top)
-                ext = None
-                if idx < len(held_levels):
-                    ext = static_dim_value(mesh_size(held_levels[idx]))
-                if ext is None and hasattr(top, "size"):
-                    ext = static_dim_value(top.size)
-                if top_name == "block" and ext is not None and ext > 0:
-                    next_block *= ext
-                    max_grid_blocks[0] = max(max_grid_blocks[0], next_block)
-                elif top_name == "aiv" and ext is not None and ext >= 2:
-                    aiv_split[0] = max(aiv_split[0], ext)
-            _walk(node.body, active_block_product=next_block)
-            return
-        if isinstance(node, ExecutionScope):
-            _walk(node.body, active_block_product=active_block_product)
-            return
-        if isinstance(node, For):
-            trip = _tir_for_static_trip_count(node)
-            qualifies = trip is None or trip > 1
-            loops.append((node.body, dict(env), True, qualifies))
-            _walk(node.body, active_block_product=active_block_product)
-            return
-        if isinstance(node, While):
-            loops.append((node.body, dict(env), False, False))
-            _walk(node.body, active_block_product=active_block_product)
-            return
-        if isinstance(node, If):
-            _walk(node.then_body, active_block_product=active_block_product)
-            _walk(node.else_body, active_block_product=active_block_product)
-            return
-        if isinstance(node, Evaluate) and isinstance(node.callable, Op):
-            op = node.callable
-            if type(op)._op_schema.name == "index_select":
-                has_indirect_gather[0] = True
-            if isinstance(op, AscendMmad) and len(node.args) >= 2:
-                acc_ty = node.args[0].type
-                lhs_ty = node.args[1].type
-                m_val = None
-                if isinstance(acc_ty, TensorType) and len(acc_ty.shape) >= 2:
-                    m_val = static_dim_value(acc_ty.shape[-2])
-                elif isinstance(lhs_ty, TensorType) and len(lhs_ty.shape) >= 2:
-                    idx = -2 if op.a_layout == "MK" else -1
-                    m_val = static_dim_value(lhs_ty.shape[idx])
-                if m_val is not None and m_val > 0:
-                    cube_m_values.append(m_val)
-
-    _walk(body)
-
-    full_env: dict[int, Expr] = {}
-    all_events, _exp, _ul, _us, _la = _collect_tir_stmt_events(body, full_env)
-    gm_reads = {k for k, st, rw in all_events if st is StorageKind.GMEM and rw == "read"}
-    gm_writes = {k for k, st, rw in all_events if st is StorageKind.GMEM and rw == "write"}
-
-    gm_loop_scalars: set[str] = set()
-    has_online_rescale = False
-    ub_reload_store_bufs: set[str] = set()
-
-    for loop_body, loop_env, is_for, qualifies_trip in loops:
-        (
-            loop_events,
-            loop_has_exp,
-            loop_ub_loads,
-            loop_ub_stores,
-            local_allocs,
-        ) = _collect_tir_stmt_events(loop_body, loop_env)
-        for buf_key, st, _rw in loop_events:
-            if st is StorageKind.GMEM and buf_key in gm_scalar_names:
-                gm_loop_scalars.add(buf_key)
-        if is_for and qualifies_trip:
-            ub_reload_store_bufs.update(loop_ub_loads & loop_ub_stores)
-        if loop_has_exp and not has_online_rescale:
-            if _has_loop_carried_accumulator(loop_events, local_allocs):
-                has_online_rescale = True
-
-    gm_roundtrip_names = (gm_reads & gm_writes) | gm_loop_scalars
-    gm_roundtrip_bytes = sum(gm_static_bytes.get(name, 0) for name in gm_roundtrip_names)
-    active_contig_pool = contig_candidates if contig_candidates else scratch_candidates
-    tir_ub_scalar_loops = _count_tir_ub_scalar_compute_loops(body, env)
-
-    return (
-        _TelemetryFeatures(
-            grid_blocks=max_grid_blocks[0],
-            gm_roundtrip_bytes=gm_roundtrip_bytes,
-            dominant_contig_bytes=_select_dominant_contig_bytes(active_contig_pool),
-            effective_cube_m=min(cube_m_values) if cube_m_values else 0,
-            has_indirect_gather=has_indirect_gather[0],
-            has_lowbit_quant=bool(has_lowbit_buf[0] and pipe_cycles.get("AIC.PIPE_M", 0) > 0),
-            has_online_rescale_loop=has_online_rescale,
-            in_loop_ub_reload_stores=len(ub_reload_store_bufs),
-            uses_unreserved_ubuf=effective_unreserved,
-            ub_scalar_compute_loops=tir_ub_scalar_loops,
-        ),
-        aiv_split[0],
-    )
-
-
-def inspect_tir_envelope(
-    fn_or_stmt: PrimFunction | Stmt,
-    *,
-    target: AscendTarget | None = None,
-    unreserved_ubuf: bool = False,
-) -> EnvelopeInspectionResult:
-    """Read-only Mode B inspector for TileFoundry TIR containing dynamic or opaque scopes."""
-    resolved_target = target or AscendTarget("ascend.950pr")
-    spaces = resolved_target.get_facts(AscendSpaceFacts)
-    body = fn_or_stmt.body if isinstance(fn_or_stmt, PrimFunction) else fn_or_stmt
-
-    explicit_by_scope: dict[str, dict[str, int]] = {}
-    pipe_cycles: dict[str, int] = {}
-    opaque: list[str] = []
-    has_simtvf = [False]
-    illegal_dma = [False]
-    mte2_run = [0]
-    max_mte2 = [0]
-    pad_bytes = [0]
-
-    def _record_buf(name: str, ttype: TensorType, op_hint: Op | None = None) -> None:
-        if ttype.storage not in (StorageKind.SMEM, StorageKind.TMEM):
-            return
-        space = _infer_tir_space(op_hint, ttype)
-        nbytes, _ = _tir_tensor_bytes(ttype)
-        if nbytes > 0:
-            scope_map = explicit_by_scope.setdefault(space, {})
-            scope_map[name] = max(scope_map.get(name, 0), nbytes)
-
-    def _walk(stmt: Stmt | None, *, repeat: int = 1) -> None:
-        if stmt is None:
-            return
-        if isinstance(stmt, Sequential):
-            for child in stmt.body:
-                _walk(child, repeat=repeat)
-            return
-        if isinstance(stmt, LetStmt):
-            if isinstance(stmt.var.type, TensorType):
-                _record_buf(stmt.var.name, stmt.var.type)
-            return
-        if isinstance(stmt, While):
-            if "while_loop" not in opaque:
-                opaque.append("while_loop")
-            _walk(stmt.body, repeat=repeat)
-            return
-        if isinstance(stmt, For):
-            trip = _tir_for_static_trip_count(stmt)
-            if trip is None:
-                tag = f"dynamic_for:{stmt.induction_var.name}"
-                if tag not in opaque:
-                    opaque.append(tag)
-                _walk(stmt.body, repeat=repeat)
-            elif trip == 0:
-                return
-            else:
-                _walk(stmt.body, repeat=repeat * trip)
-            return
-        if isinstance(stmt, If):
-            if "conditional_branch" not in opaque:
-                opaque.append("conditional_branch")
-            _walk(stmt.then_body, repeat=repeat)
-            _walk(stmt.else_body, repeat=repeat)
-            return
-        if isinstance(stmt, ExecutionScope):
-            if getattr(stmt.kind, "name", stmt.kind) == SIMTVF_KIND.name:
-                has_simtvf[0] = True
-                if "simt_vf" not in opaque:
-                    opaque.append("simt_vf")
-            _walk(stmt.body, repeat=repeat)
-            return
-        if isinstance(stmt, MeshScope):
-            _walk(stmt.body, repeat=repeat)
-            return
-        if hasattr(stmt, "callable") and isinstance(stmt.callable, Op):
-            op = stmt.callable
-            arg_types = tuple(arg.type if isinstance(arg.type, TensorType) else None for arg in stmt.args)
-            res = getattr(op, "resource", None)
-            mask = task_resource_mask(
-                _tir_op_to_resources(op, arg_types)
-            )
-            for core_key, pipe_name in mask.to_core_pipe_pairs():
-                key = format_pipe_key(core_key, pipe_name)
-                pipe_cycles[key] = pipe_cycles.get(key, 0) + repeat
-            if res == "mte2_engine":
-                mte2_run[0] += repeat
-                max_mte2[0] = max(max_mte2[0], mte2_run[0])
-                for ty in arg_types:
-                    if isinstance(ty, TensorType) and ty.storage is StorageKind.SMEM:
-                        _total, inner_b = _tir_tensor_bytes(ty)
-                        rem = inner_b % spaces.ub_align_bytes
-                        if rem != 0:
-                            pad_bytes[0] += (spaces.ub_align_bytes - rem) * repeat
-            else:
-                mte2_run[0] = 0
-            if isinstance(op, (AscendGmToL1, AscendGmToUb)):
-                src_s = "GM"
-                dst_s = "L1" if isinstance(op, AscendGmToL1) else "UB"
-                if not spaces.is_dma_path_legal(src_s, dst_s):
-                    illegal_dma[0] = True
-
-    def _tir_op_to_resources(op: Op, arg_types: tuple[TensorType | None, ...]) -> tuple[tuple, ...]:
-        from tilefoundry_ascend.ascend.schedule.pipeline_solver import (  # noqa: PLC0415
-            _op_resources,
-        )
-
-        return _op_resources(op, arg_types)
-
-    _walk(body)
-    telemetry, tir_aiv_split = _collect_tir_telemetry(
-        fn_or_stmt,
-        pipe_cycles=pipe_cycles,
-        unreserved_ubuf=unreserved_ubuf,
-    )
-    effective_unreserved = telemetry.uses_unreserved_ubuf
-    caps = _scope_capacities(
-        spaces, has_simtvf=has_simtvf[0], unreserved_ubuf=effective_unreserved
-    )
-    waterlines = {
-        scope: build_scope_waterline(
-            scope=scope,
-            capacity_bytes=caps.get(scope, 0),
-            explicit_buffers=bufs,
-            implicit_buffers={},
-        )
-        for scope, bufs in sorted(explicit_by_scope.items())
-    }
-    snaps = tuple(
-        BufferSnapshot(name=name, scope=scope, bytes=nbytes, shape=(), dtype="tir")
-        for scope, bufs in sorted(explicit_by_scope.items())
-        for name, nbytes in sorted(bufs.items())
-    )
-    wave_occ = _compute_wave_occupancy(
-        telemetry.grid_blocks, spaces, pipe_cycles, tir_aiv_split
-    )
-    ub_risk_total = 0
-    ub_risk_conflict = 0
-    def _scan_tir_ub_bank(stmt: Stmt | None) -> None:
-        nonlocal ub_risk_total, ub_risk_conflict
-        if stmt is None:
-            return
-        if isinstance(stmt, Sequential):
-            for ch in stmt.body:
-                _scan_tir_ub_bank(ch)
-            return
-        if isinstance(stmt, LetStmt):
-            tt = stmt.var.type
-            if isinstance(tt, TensorType) and tt.storage is StorageKind.SMEM and len(tt.shape) >= 2:
-                dims = [static_dim_value(d) for d in tt.shape]
-                if all(d is not None and d > 0 for d in dims) and math.prod(dims[:-1]) > 1:
-                    nbytes, inner_b = _tir_tensor_bytes(tt)
-                    if nbytes > 0:
-                        ub_risk_total += nbytes
-                        if inner_b >= 512 and inner_b % 512 == 0:
-                            ub_risk_conflict += nbytes
-            return
-        if isinstance(stmt, (MeshScope, ExecutionScope, For, While)):
-            _scan_tir_ub_bank(stmt.body)
-        elif isinstance(stmt, If):
-            _scan_tir_ub_bank(stmt.then_body)
-            _scan_tir_ub_bank(stmt.else_body)
-
-    _scan_tir_ub_bank(body)
-    tir_ub_risk = (
-        round(min(1.0, ub_risk_conflict / float(ub_risk_total)), 4)
-        if ub_risk_total > 0 and ub_risk_conflict > 0
-        else 0.0
-    )
-    l1_bufs = explicit_by_scope.get("L1", {})
-    l1_total = sum(l1_bufs.values())
-    l1_full = max(1, spaces.l1_bytes)
-    l1_half = max(1, l1_full // 2)
-    if l1_total <= 0:
-        tir_l1_risk = 0.0
-    elif l1_total > l1_half:
-        tir_l1_risk = round(min(1.0, l1_total / float(l1_full)), 4)
-    elif len(l1_bufs) >= 2:
-        tir_l1_risk = round(min(0.5, l1_total / float(l1_half)), 4)
-    else:
-        tir_l1_risk = 0.0
-
-    ledger = build_objective_physical_ledger(
-        analysis_mode="readonly_envelope",
-        is_legal=not illegal_dma[0],
-        steady_state_ii=None,
-        pipe_cycles=pipe_cycles,
-        waterlines=waterlines,
-        mte2_inflight_per_aiv=max_mte2[0],
-        unaligned_dma_padding_bytes=pad_bytes[0],
-        opaque_dynamic_regions=tuple(opaque),
-        grid_blocks=telemetry.grid_blocks,
-        wave_occupancy=wave_occ,
-        gm_roundtrip_bytes=telemetry.gm_roundtrip_bytes,
-        dominant_contig_bytes=telemetry.dominant_contig_bytes,
-        effective_cube_m=telemetry.effective_cube_m,
-        has_indirect_gather=telemetry.has_indirect_gather,
-        has_lowbit_quant=telemetry.has_lowbit_quant,
-        has_online_rescale_loop=telemetry.has_online_rescale_loop,
-        in_loop_ub_reload_stores=telemetry.in_loop_ub_reload_stores,
-        uses_unreserved_ubuf=effective_unreserved,
-        ub_bank_conflict_risk=tir_ub_risk,
-        l1_bank_conflict_risk=tir_l1_risk,
-        ub_scalar_compute_loops=telemetry.ub_scalar_compute_loops,
-    )
-    return EnvelopeInspectionResult(
-        ledger=ledger,
-        explicit_snapshot=snaps,
-        lowered_snapshot=snaps,
-        merged_peak_bytes_by_scope={s: sum(b.values()) for s, b in explicit_by_scope.items()},
-        lowered_passes_observed=(),
-        lowering_error=None,
-    )
-
-
 __all__ = [
     "BufferSnapshot",
     "EnvelopeInspectionResult",
+    "ReadOnlyAscendPassTap",
     "inspect_tilelang_primfunc",
-    "inspect_tir_envelope",
     "specialize_primfunc_for_anchor",
 ]

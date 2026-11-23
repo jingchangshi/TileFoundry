@@ -8,13 +8,10 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
-from tilefoundry.ir.types import DType
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
     BlueprintProvenance,
-    BlueprintScheduleDelta,
     HirBlueprintPacket,
     HirRooflineSummary,
-    compile_hir_schedule_delta,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.sil.schema import (
@@ -1270,13 +1267,11 @@ class PyTorchSemanticAnalyzer:
         unit_rates = device.unit_flops_per_second
         aic_rates = unit_rates.get("aic", {})
         aiv_rates = unit_rates.get("aiv", {})
-        cube_peak = (
-            aic_rates.get(DType.from_name("bf16"))
-            or aic_rates.get(DType.from_name("f16"))
-            or 0
-        )
+        aic_by_name = {getattr(k, "name", str(k)): v for k, v in aic_rates.items()}
+        aiv_by_name = {getattr(k, "name", str(k)): v for k, v in aiv_rates.items()}
+        cube_peak = aic_by_name.get("bf16") or aic_by_name.get("f16") or 0
         vector_peak = (
-            aiv_rates.get(DType.from_name("f32"))
+            aiv_by_name.get("f32")
             or max(aiv_rates.values(), default=0)
             or device.aiv_lane_events_per_second
         )
@@ -1446,12 +1441,8 @@ class PyTorchSemanticAnalyzer:
         dtype_bytes: float = 2.0,
         representative_case: RepresentativeCase | None = None,
     ) -> HirBlueprintPacket:
-        """Build a semantic-first blueprint anchored to real dimensions and optional HIR delta.
-
-        Authoritative Roofline floors always derive from *semantics*, *anchor_dims*, and
-        *representative_case*. When *authored_hir_source* is supplied, optional schedule
-        enrichment attaches via ``schedule_delta`` without overwriting ``roofline``.
-        """
+        """Build a semantic-first blueprint anchored to real dimensions and PyTorch semantics."""
+        del authored_hir_source, scheduled_hir_source
         element_bytes = _validated_dtype_bytes(dtype_bytes)
         dims = {str(key): int(value) for key, value in anchor_dims.items()}
         work = self._estimate_analytical_work(
@@ -1503,45 +1494,23 @@ class PyTorchSemanticAnalyzer:
             cube_floor_us=cube_floor_us,
             vec_floor_us=vec_floor_us,
         )
-        has_authored_hir = bool(authored_hir_source is not None and authored_hir_source.strip())
-        has_scheduled_hir = bool(
-            has_authored_hir
-            and scheduled_hir_source is not None
-            and scheduled_hir_source.strip()
-        )
-        schedule_delta: BlueprintScheduleDelta | None = None
-        reference_ledger: ObjectivePhysicalLedger | None = None
-        diagnostics: tuple[str, ...] = ("analytical_pytorch_frontend",)
-        if has_authored_hir:
-            assert authored_hir_source is not None
-            schedule_delta, reference_ledger, hir_diags = compile_hir_schedule_delta(
-                authored_hir_source,
-                scheduled_hir_source=scheduled_hir_source if has_scheduled_hir else None,
-                anchor_dims=dims,
-                target=self.target,
-            )
-            if hir_diags:
-                diagnostics = (*diagnostics, *hir_diags)
         provenance = BlueprintProvenance(
-            semantic_source=(
-                "pytorch_golden_plus_hir" if has_authored_hir else "pytorch_golden"
-            ),
+            semantic_source="pytorch_golden",
             traffic_basis=work.traffic_basis,
             coordinate_scope="representative_anchor",
-            has_authored_hir=has_authored_hir,
-            has_scheduled_hir=has_scheduled_hir,
+            has_authored_hir=False,
+            has_scheduled_hir=False,
         )
         return HirBlueprintPacket(
             entry_name=semantics.entry_name,
             roofline=roofline,
-            reference_ledger=reference_ledger,
-            lowering_diagnostics=diagnostics,
+            reference_ledger=None,
+            lowering_diagnostics=("analytical_pytorch_frontend",),
             requested_anchor_dims=dict(dims),
             resolved_hir_dims=dict(work.resolved_dims),
             shape_exact_match=True,
             fallback_reason=None,
             provenance=provenance,
-            schedule_delta=schedule_delta,
         )
 
     build_blueprint = build_universal_blueprint

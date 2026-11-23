@@ -7,11 +7,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from tilefoundry.ir.tir.stmts import For, Stmt
-from tilefoundry_ascend.ascend.schedule.pipeline_solver import (
-    extract_tir_loop_problem,
-    solve_pipeline_with_monotone_backoff,
-)
+from tilefoundry.vendor.tilelang_z3 import Problem
+from tilefoundry_ascend.ascend.schedule.pipeline_solver import solve_pipeline_with_monotone_backoff
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
 from tilefoundry_ascend.ascend.sil.schema import (
     CasePhysicsRatios,
@@ -502,9 +499,9 @@ class RegimePiecewiseSolver:
         has_indirect_gather: bool,
         has_recurrence: bool,
         has_persistent_state: bool | None,
-        loop: For | None,
+        problem: Problem | None,
     ) -> bool:
-        if loop is None:
+        if problem is None:
             return True
         if has_empty_group or has_indirect_gather or has_recurrence or bool(has_persistent_state):
             return True
@@ -1041,8 +1038,7 @@ class RegimePiecewiseSolver:
         op_name: str = "",
         topology_axes: TopologyAxes | Mapping[str, object] | None = None,
         roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
-        loop: For | None = None,
-        fn_stmt: Stmt | None = None,
+        problem: Problem | None = None,
         input_dtypes: tuple[str, ...] = ("f16",),
         has_nan_inf_cases: bool = False,
         has_indirect_gather: bool = False,
@@ -1089,17 +1085,10 @@ class RegimePiecewiseSolver:
             has_indirect_gather=has_indirect_gather,
             has_recurrence=has_recurrence,
             has_persistent_state=has_persistent_state,
-            loop=loop,
+            problem=problem,
         ):
-            assert loop is not None
-            problem, _ = extract_tir_loop_problem(
-                loop,
-                target=self.target,
-                fn_stmt=fn_stmt,
-                unreserved_ubuf=unreserved_ubuf,
-                dim_hints=dims,
-                allow_dynamic_fallback=True,
-            )
+            assert problem is not None
+            del unreserved_ubuf
             z3_res = solve_pipeline_with_monotone_backoff(problem)
             base_plan = self._plan_analytical_regime(
                 regime_tag=tag,
@@ -1196,8 +1185,7 @@ class RegimePiecewiseSolver:
         op_name: str = "",
         topology_axes: TopologyAxes | Mapping[str, object] | None = None,
         roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
-        loop: For | None = None,
-        fn_stmt: Stmt | None = None,
+        problem: Problem | None = None,
         input_dtypes: tuple[str, ...] = ("f16",),
         has_nan_inf_cases: bool = False,
         has_indirect_gather: bool = False,
@@ -1241,8 +1229,7 @@ class RegimePiecewiseSolver:
                 op_name=op_name,
                 topology_axes=axes_obj,
                 roofline=roofline,
-                loop=loop,
-                fn_stmt=fn_stmt,
+                problem=problem,
                 input_dtypes=input_dtypes,
                 has_nan_inf_cases=has_nan_inf_cases,
                 has_indirect_gather=has_indirect_gather,
@@ -1269,8 +1256,7 @@ class RegimePiecewiseSolver:
         op_name: str = "",
         topology_axes: TopologyAxes | Mapping[str, object] | None = None,
         roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
-        loop: For | None = None,
-        fn_stmt: Stmt | None = None,
+        problem: Problem | None = None,
         input_dtypes: tuple[str, ...] = ("f16",),
         has_nan_inf_cases: bool = False,
         has_indirect_gather: bool = False,
@@ -1289,8 +1275,7 @@ class RegimePiecewiseSolver:
             op_name=op_name,
             topology_axes=topology_axes,
             roofline=roofline,
-            loop=loop,
-            fn_stmt=fn_stmt,
+            problem=problem,
             input_dtypes=input_dtypes,
             has_nan_inf_cases=has_nan_inf_cases,
             has_indirect_gather=has_indirect_gather,
@@ -1376,8 +1361,7 @@ def recompute_regime_for_live_buffers(
     op_name: str = "",
     topology_axes: TopologyAxes | Mapping[str, object] | None = None,
     roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
-    loop: For | None = None,
-    fn_stmt: Stmt | None = None,
+    problem: Problem | None = None,
     input_dtypes: tuple[str, ...] = ("f16",),
     has_nan_inf_cases: bool = False,
     has_indirect_gather: bool = False,
@@ -1399,8 +1383,7 @@ def recompute_regime_for_live_buffers(
             op_name=op_name,
             topology_axes=topology_axes,
             roofline=roofline,
-            loop=loop,
-            fn_stmt=fn_stmt,
+            problem=problem,
             input_dtypes=input_dtypes,
             has_nan_inf_cases=has_nan_inf_cases,
             has_indirect_gather=has_indirect_gather,

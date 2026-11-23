@@ -6,19 +6,21 @@ import pathlib
 
 import pytest
 
-from tilefoundry.ir.core import Call, Constant, Var
-from tilefoundry.ir.hir.pipeline import PipelineSpec
-from tilefoundry.ir.tir.memory import AllocTensor
-from tilefoundry.ir.tir.stmts import Evaluate, For, LetStmt, Sequential
-from tilefoundry.ir.types import DType, StorageKind, TensorType
-from tilefoundry.ir.types.dim import DimVar
+from tilefoundry.vendor.tilelang_z3 import (
+    Buffer,
+    Capacity,
+    Edge,
+    Problem,
+    Resource,
+    Reuse,
+    Task,
+)
 from tilefoundry_ascend.ascend.cost_model import (
     BishengResourceSummary,
     HybridAscendCostModel,
     parse_bisheng_res_usage,
     predict_cannbench_eq3_score,
 )
-from tilefoundry_ascend.ascend.ir.tir.instructions import AscendGmToUb, AscendUbToGm
 from tilefoundry_ascend.ascend.schedule.regime_solver import (
     SOLVER_MODE_ALGEBRAIC,
     RegimePiecewiseSolver,
@@ -34,33 +36,44 @@ from tilefoundry_ascend.ascend.sil import (
     SILVerifier,
     TopologyAxes,
 )
-from tilefoundry_ascend.ascend.target import AscendTarget
+from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
 
 def test_regime_solver_static_affine_loop_projects_to_z3():
-    """Verify static-affine / dim-substitutable TIR For loops project concrete dim_hints to Z3."""
-    d_dyn = DimVar("D", 32, 2048)
-    gm_ty = TensorType((4, d_dyn), DType.f32, None, StorageKind.GMEM)
-    ub_ty = TensorType((d_dyn,), DType.f32, None, StorageKind.SMEM)
-    sc = TensorType.umat_scalar()
-    k = Var("k", type=sc)
-    gm_in = Var("gm_in", type=gm_ty)
-    gm_out = Var("gm_out", type=gm_ty)
-    ub_var = Var("ub_buf", type=ub_ty)
-
-    loop = For(
-        k,
-        Constant(0, type=sc),
-        Constant(4, type=sc),
-        Constant(1, type=sc),
-        Sequential(
-            (
-                LetStmt(ub_var, Call(AllocTensor(tensor_type=ub_ty), (), type=ub_ty)),
-                Evaluate(AscendGmToUb(), (gm_in, ub_var)),
-                Evaluate(AscendUbToGm(), (ub_var, gm_out)),
-            )
+    """Verify static-affine Problem payloads project to Z3 modulo scheduling."""
+    facts = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
+    problem = Problem(
+        tasks=(
+            Task(name="load", resources=(("aiv", "aiv0", "mte2", 1),), latency=1, stage=0),
+            Task(name="store", resources=(("aiv", "aiv0", "mte3", 1),), latency=1, stage=1),
         ),
-        pipeline=PipelineSpec(max_stage=1, max_buffer_versions=2, enable_offset=True),
+        buffers=(
+            Buffer(
+                name="ub_buf",
+                slot_bytes=1024 * 4,
+                space="UB",
+                owner="aiv",
+                auto_min=1,
+                auto_max=2,
+            ),
+        ),
+        edges=(Edge(src="load", dst="store", distance=0, latency=1),),
+        reuses=(
+            Reuse(
+                buffer="ub_buf",
+                last_reader="store",
+                next_writer="load",
+                delta=0,
+                read_latency=1,
+            ),
+        ),
+        resources=(
+            Resource("aiv", "aiv0", "mte2", 1),
+            Resource("aiv", "aiv0", "mte3", 1),
+        ),
+        capacities=(Capacity("UB", "aiv", facts.ub_simdvf_usable_bytes),),
+        max_stage=1,
+        manual=True,
     )
 
     solver = RegimePiecewiseSolver()
@@ -73,7 +86,7 @@ def test_regime_solver_static_affine_loop_projects_to_z3():
         },
         op_name="rms_norm",
         topology_axes=simd_axes,
-        loop=loop,
+        problem=problem,
     )
     assert res.solver_mode == "z3_projected"
     assert res.ii is not None and res.ii >= 1

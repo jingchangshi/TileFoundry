@@ -1063,12 +1063,16 @@ def _normalize_cann_series_from_path(raw: str) -> str | None:
     return None
 
 
+def _clamp_implicit_cann_series(series: str) -> str:
+    return DEFAULT_CANN_SERIES if series == "cann_9_2" else series
+
+
 def resolve_cann_series(
     explicit: str | None = None,
     *,
     cann_home: str | Path | None = None,
 ) -> str:
-    """Resolve CANN snapshot series ('cann_9_2' or 'cann_9_3') with explicit/env/toolkit checks."""
+    """Resolve CANN snapshot series, clamping implicit/env/path cann_9_2 to cann_9_3."""
     if explicit is not None and str(explicit).strip():
         norm = str(explicit).strip().lower()
         if norm not in VALID_CANN_SERIES:
@@ -1084,15 +1088,15 @@ def resolve_cann_series(
                     f"Unsupported CANN series {raw!r} from {env_key}; "
                     f"expected one of {VALID_CANN_SERIES}"
                 )
-            return raw
+            return _clamp_implicit_cann_series(raw)
     if cann_home is not None:
         inferred = _normalize_cann_series_from_path(str(cann_home))
         if inferred is not None:
-            return inferred
+            return _clamp_implicit_cann_series(inferred)
     for env_key in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME"):
         inferred = _normalize_cann_series_from_path(os.environ.get(env_key, ""))
         if inferred is not None:
-            return inferred
+            return _clamp_implicit_cann_series(inferred)
     return DEFAULT_CANN_SERIES
 
 

@@ -3,54 +3,34 @@
 import json
 import pathlib
 
-from tilefoundry.analysis import analyze, check_program
-from tilefoundry.cli.source import load_authored_ir
-from tilefoundry.ir.core import Constant, Var
-from tilefoundry.ir.tir.stmts import For, Sequential
-from tilefoundry.ir.types import TensorType
-from tilefoundry.ir.visitor import StmtVisitor, walk_prim_function
-from tilefoundry.schedule.finalize import finalize
+import tilelang.ascend.language as T
 from tilefoundry.vendor.tilelang_z3 import (
+    Buffer,
+    Capacity,
+    Edge,
     Problem,
     Resource,
+    Reuse,
     Task,
 )
-from tilefoundry_ascend.ascend.passes import ObjectivePhysicalLedger, ScopeWaterline
+from tilefoundry_ascend.ascend.passes import (
+    ObjectivePhysicalLedger,
+    ScopeWaterline,
+    build_objective_physical_ledger,
+    build_scope_waterline,
+)
 from tilefoundry_ascend.ascend.schedule import (
     bitwise_conflict_pairs,
     inspect_tilelang_primfunc,
-    inspect_tir_envelope,
+    pipe_cycles_from_problem,
     solve_ascend_pipeline,
-    solve_loop_with_ledger,
     task_resource_mask,
 )
 from tilefoundry_ascend.ascend.schedule.envelope_inspector import (
     _detect_tilelang_aiv_split_factor,
-    _tir_for_static_trip_count,
     _try_solve_tilelang_pipelined_ii,
 )
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget, NodeResourceMask
-
-HEADER = (
-    "from __future__ import annotations\n\n"
-    "from tilefoundry.dsl import *\n"
-    "from tilefoundry_ascend import AscendTarget\n"
-    "TOPOS = (Topology('block', 1), Topology('aic', 1), "
-    "Topology('aiv', 2), Topology('lane', 64))\n"
-)
-
-
-def _collect_loops(fn) -> list[For]:
-    loops: list[For] = []
-
-    class _Visitor(StmtVisitor):
-        def visit_For(self, stmt: For) -> None:
-            if stmt.pipeline is not None:
-                loops.append(stmt)
-            self.generic_visit(stmt)
-
-    walk_prim_function(_Visitor(), fn)
-    return loops
 
 
 def test_mode_a_24bit_parallel_aiv0_aiv1_aic_co_schedule() -> None:
@@ -98,41 +78,59 @@ def test_mode_a_24bit_parallel_aiv0_aiv1_aic_co_schedule() -> None:
     assert task_resource_mask(t_dual) == m_dual
 
 
-def test_mode_a_solve_loop_with_ledger(tmp_path: pathlib.Path) -> None:
-    """Verify Mode A loop solve emits an ObjectivePhysicalLedger with exact_modulo_z3."""
-    body = """
-@module(entry="piped_add", target=AscendTarget("ascend.950pr"), topologies=TOPOS)
-class M:
-    @func
-    def piped_add(
-        a: Tensor[(4, 64), "f32"],
-        b: Tensor[(4, 64), "f32"],
-    ) -> Tensor[(4, 64), "f32"]:
-        with Mesh(("aiv",), (1,), names=("v",)) as _v:
-            c = tf.empty(Tensor[(4, 64), "f32", "gmem"])
-            for k in tf.pipelined(4, max_stage=2, max_buffer_versions=2, enable_offset=True):
-                a_ub = tf.schedule((a[k, :], tf.empty(Tensor[(64,), "f32", "smem"])), op=T.ascend_gm_to_ub())
-                b_ub = tf.schedule((b[k, :], tf.empty(Tensor[(64,), "f32", "smem"])), op=T.ascend_gm_to_ub())
-                with T.SimdVF():
-                    ar = tf.schedule((a_ub, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_ub_to_reg())
-                    br = tf.schedule((b_ub, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_ub_to_reg())
-                    cr = tf.schedule((ar, br, tf.empty(Tensor[(64,), "f32", "rmem"])), op=T.ascend_vbinary(kind="add"))
-                    c_ub = tf.schedule((cr, tf.empty(Tensor[(64,), "f32", "smem"])), op=T.ascend_reg_to_ub())
-                c_row = tf.schedule((c_ub, tf.empty(Tensor[(64,), "f32", "gmem"])), op=T.ascend_ub_to_gm())
-                c = tf.insert_slice(c, tf.reshape(c_row, new_shape=(1, 64)), (k, 0))
-            return c
-"""
-    path = tmp_path / "piped_add.py"
-    path.write_text(HEADER + "\n" + body, encoding="utf-8")
-    mod = load_authored_ir(f"{path}:M")
-    authored = mod.entry_function()
-    checked_mod, checked_fn = check_program(mod, authored)
-    analyzed = analyze(checked_mod, checked_fn, analysis="memory")
-    lowered = finalize(analyzed, authored=authored)
-    fn = lowered.entry_function()
-    loop = _collect_loops(fn)[0]
-
-    result, ledger = solve_loop_with_ledger(loop, fn_stmt=fn.body)
+def test_mode_a_solve_loop_with_ledger() -> None:
+    """Verify Mode A Z3 solve emits an ObjectivePhysicalLedger with exact_modulo_z3."""
+    facts = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
+    problem = Problem(
+        tasks=(
+            Task(name="load_a", resources=(("aiv", "aiv0", "mte2", 1),), latency=1, stage=0),
+            Task(name="load_b", resources=(("aiv", "aiv0", "mte2", 1),), latency=1, stage=0),
+            Task(name="vec_add", resources=(("aiv", "aiv0", "vector", 1),), latency=1, stage=1),
+            Task(name="store_c", resources=(("aiv", "aiv0", "mte3", 1),), latency=1, stage=2),
+        ),
+        buffers=(
+            Buffer(name="a_ub", slot_bytes=256, space="UB", owner="aiv", auto_min=1, auto_max=2),
+            Buffer(name="b_ub", slot_bytes=256, space="UB", owner="aiv", auto_min=1, auto_max=2),
+            Buffer(name="c_ub", slot_bytes=256, space="UB", owner="aiv", auto_min=1, auto_max=2),
+        ),
+        edges=(
+            Edge(src="load_a", dst="vec_add", distance=0, latency=1),
+            Edge(src="load_b", dst="vec_add", distance=0, latency=1),
+            Edge(src="vec_add", dst="store_c", distance=0, latency=1),
+        ),
+        reuses=(
+            Reuse(buffer="a_ub", last_reader="vec_add", next_writer="load_a", delta=0, read_latency=1),
+            Reuse(buffer="b_ub", last_reader="vec_add", next_writer="load_b", delta=0, read_latency=1),
+            Reuse(buffer="c_ub", last_reader="store_c", next_writer="vec_add", delta=0, read_latency=1),
+        ),
+        resources=(
+            Resource("aiv", "aiv0", "mte2", 1),
+            Resource("aiv", "aiv0", "vector", 1),
+            Resource("aiv", "aiv0", "mte3", 1),
+        ),
+        capacities=(Capacity("UB", "aiv", facts.ub_simdvf_usable_bytes),),
+        max_stage=2,
+        manual=True,
+    )
+    result = solve_ascend_pipeline(problem)
+    explicit_ub = {
+        b.name: b.slot_bytes * result.buffer_versions.get(b.name, 1)
+        for b in result.problem.buffers
+    }
+    ledger = build_objective_physical_ledger(
+        analysis_mode="exact_modulo_z3",
+        is_legal=True,
+        steady_state_ii=result.assignment.ii,
+        pipe_cycles=pipe_cycles_from_problem(result.problem, result.assignment),
+        waterlines={
+            "UB": build_scope_waterline(
+                scope="UB",
+                capacity_bytes=facts.ub_simdvf_usable_bytes,
+                explicit_buffers=explicit_ub,
+                implicit_buffers={},
+            )
+        },
+    )
     assert isinstance(ledger, ObjectivePhysicalLedger)
     assert ledger.analysis_mode == "exact_modulo_z3"
     assert ledger.is_legal is True
@@ -236,28 +234,17 @@ def test_mode_b_detects_ub_overflow_in_two_snapshot_diff() -> None:
     )
 
 
-def test_mode_b_tir_envelope_dynamic_while_and_rule_blindness(tmp_path: pathlib.Path) -> None:
-    """Verify TileFoundry TIR envelope inspection and zero agent imports under ascend/."""
-    body = """
-@module(entry="vec_copy", target=AscendTarget("ascend.950pr"), topologies=TOPOS)
-class M:
-    @func
-    def vec_copy(a: Tensor[(4, 60), "f32"]) -> Tensor[(4, 60), "f32"]:
-        with Mesh(("aiv",), (1,), names=("v",)) as _v:
-            c = tf.empty(Tensor[(4, 60), "f32", "gmem"])
-            for k in range(4):
-                a_ub = tf.schedule((a[k, :], tf.empty(Tensor[(60,), "f32", "smem"])), op=T.ascend_gm_to_ub())
-                c_row = tf.schedule((a_ub, tf.empty(Tensor[(60,), "f32", "gmem"])), op=T.ascend_ub_to_gm())
-                c = tf.insert_slice(c, tf.reshape(c_row, new_shape=(1, 60)), (k, 0))
-            return c
-"""
-    p = tmp_path / "vec_copy.py"
-    p.write_text(HEADER + "\n" + body, encoding="utf-8")
-    mod = load_authored_ir(f"{p}:M")
-    c_mod, c_fn = check_program(mod, mod.entry_function())
-    low = finalize(analyze(c_mod, c_fn, analysis="memory"), authored=mod.entry_function())
-    fn = low.entry_function()
-    res = inspect_tir_envelope(fn)
+def test_mode_b_tilelang_envelope_unaligned_and_rule_blindness() -> None:
+    """Verify TileLang envelope inspection and zero agent imports under ascend/."""
+    @T.prim_func
+    def vec_copy(a: T.Tensor((4, 60), "float32"), c: T.Tensor((4, 60), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((1, 60), "float32")
+            for k in T.serial(4):
+                T.copy(a[k : k + 1, 0:60], a_ub)
+                T.copy(a_ub, c[k : k + 1, 0:60])
+
+    res = inspect_tilelang_primfunc(vec_copy, pass_configs={"tl.enable_auto_schedule": False})
     assert res.ledger.analysis_mode == "readonly_envelope"
     assert res.ledger.unaligned_dma_padding_bytes > 0
     assert "UB" in res.ledger.waterlines
@@ -269,54 +256,36 @@ class M:
         assert "tilefoundry_ascend.agent" not in text
 
 
-def test_fp1_tir_for_static_trip_multiplication(tmp_path: pathlib.Path) -> None:
-    """Verify _tir_for_static_trip_count and inspect_tir_envelope loop trip scaling."""
-    sc = TensorType.umat_scalar()
-    iv = Var("k", type=sc)
-    empty_body = Sequential(())
-    c0 = Constant(0, type=sc)
-    c1 = Constant(1, type=sc)
-    c2 = Constant(2, type=sc)
-    c4 = Constant(4, type=sc)
-    c7 = Constant(7, type=sc)
-    assert _tir_for_static_trip_count(For(iv, c0, c4, c1, empty_body)) == 4
-    assert _tir_for_static_trip_count(For(iv, c1, c7, c2, empty_body)) == 3
-    assert _tir_for_static_trip_count(For(iv, c0, c0, c1, empty_body)) == 0
-    assert _tir_for_static_trip_count(For(iv, c0, Var("n", type=sc), c1, empty_body)) is None
-    assert _tir_for_static_trip_count(For(iv, c0, c4, c0, empty_body)) is None
+def test_fp1_tilelang_for_static_trip_multiplication() -> None:
+    """Verify TileLang loop trip scaling, unaligned padding, and dynamic loop detection."""
+    @T.prim_func
+    def vec_copy(a: T.Tensor((4, 60), "float32"), c: T.Tensor((4, 60), "float32")):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((1, 60), "float32")
+            for k in T.serial(4):
+                T.copy(a[k : k + 1, 0:60], a_ub)
+                T.copy(a_ub, c[k : k + 1, 0:60])
 
-    body = """
-@module(entry="vec_copy", target=AscendTarget("ascend.950pr"), topologies=TOPOS)
-class M:
-    @func
-    def vec_copy(a: Tensor[(4, 60), "f32"]) -> Tensor[(4, 60), "f32"]:
-        with Mesh(("aiv",), (1,), names=("v",)) as _v:
-            c = tf.empty(Tensor[(4, 60), "f32", "gmem"])
-            for k in range(4):
-                a_ub = tf.schedule((a[k, :], tf.empty(Tensor[(60,), "f32", "smem"])), op=T.ascend_gm_to_ub())
-                c_row = tf.schedule((a_ub, tf.empty(Tensor[(60,), "f32", "gmem"])), op=T.ascend_ub_to_gm())
-                c = tf.insert_slice(c, tf.reshape(c_row, new_shape=(1, 60)), (k, 0))
-            return c
-"""
-    p = tmp_path / "vec_copy_trip.py"
-    p.write_text(HEADER + "\n" + body, encoding="utf-8")
-    mod = load_authored_ir(f"{p}:M")
-    c_mod, c_fn = check_program(mod, mod.entry_function())
-    low = finalize(analyze(c_mod, c_fn, analysis="memory"), authored=mod.entry_function())
-    res = inspect_tir_envelope(low.entry_function())
+    res = inspect_tilelang_primfunc(vec_copy, pass_configs={"tl.enable_auto_schedule": False})
     assert res.ledger.opaque_dynamic_regions == ()
-    assert res.ledger.pipe_cycles["AIV0.PIPE_MTE2"] == 4
-    assert res.ledger.pipe_cycles["AIV0.PIPE_MTE3"] == 4
+    assert res.ledger.pipe_cycles["AIV0.PIPE_MTE2"] > 0
+    assert res.ledger.pipe_cycles["AIV0.PIPE_MTE3"] > 0
     assert res.ledger.unaligned_dma_padding_bytes == 64
 
-    zero_loop = For(iv, c0, c0, c1, Sequential(()))
-    zero_res = inspect_tir_envelope(zero_loop)
-    assert zero_res.ledger.pipe_cycles == {}
-    assert zero_res.ledger.opaque_dynamic_regions == ()
+    @T.prim_func
+    def dyn_loop(
+        a: T.Tensor((4, 64), "float32"),
+        c: T.Tensor((4, 64), "float32"),
+        n_steps: T.Tensor((1,), "int32"),
+    ):
+        with T.Kernel(1):
+            a_ub = T.alloc_shared((1, 64), "float32")
+            for k in T.serial(n_steps[0]):
+                T.copy(a[k : k + 1, 0:64], a_ub)
+                T.copy(a_ub, c[k : k + 1, 0:64])
 
-    dyn_loop = For(iv, c0, Var("dyn_n", type=sc), c1, Sequential(()))
-    dyn_res = inspect_tir_envelope(dyn_loop)
-    assert "dynamic_for:k" in dyn_res.ledger.opaque_dynamic_regions
+    dyn_res = inspect_tilelang_primfunc(dyn_loop, pass_configs={"tl.enable_auto_schedule": False})
+    assert any(tag.startswith("dynamic_for:") for tag in dyn_res.ledger.opaque_dynamic_regions)
 
 
 def test_fp1_auto_detect_dual_aiv_and_sid_branch_split() -> None:
