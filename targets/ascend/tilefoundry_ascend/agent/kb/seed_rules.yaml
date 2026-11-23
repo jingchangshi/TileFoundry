@@ -268,7 +268,7 @@ rules:
       Split the outer reduction or key-value sequence dimension across multiple grid blocks and
       paired vector sub-cores with a partial-state merge epilogue (or T.set_atomic reduction) so
       active core wave occupancy scales above half-chip saturation.
-    expected_postcondition: "wave_occupancy >= prev.wave_occupancy and measured_latency_us <= prev.measured_latency_us"
+    expected_postcondition: "wave_occupancy > prev.wave_occupancy or grid_blocks > prev.grid_blocks"
     source_provenance: "ref:ops_transformer"
     alpha_prior: 3.0
     beta_prior: 1.0
@@ -290,7 +290,7 @@ rules:
       Fold grouped query heads sharing the same key-value head into the Cube M-dimension tile
       before T.gemm so effective_cube_m reaches at least 16 rows and densely fills the 16x16
       fractal MMAD datapath without zero-padding waste.
-    expected_postcondition: "effective_cube_m >= 16 or measured_latency_us < prev.measured_latency_us"
+    expected_postcondition: "effective_cube_m >= 16 or effective_cube_m > prev.effective_cube_m"
     source_provenance: "ref:ops_transformer"
     alpha_prior: 3.0
     beta_prior: 1.0
@@ -312,7 +312,7 @@ rules:
       Apply asymmetric 1C2V stage fission by narrowing per-stage UB slices and staggering Cube
       consumption against paired AIV vector stages via T.Pipelined double buffering so UB peak
       allocation drops below saturation and steady-state initiation interval shrinks.
-    expected_postcondition: "UB.peak_allocated_bytes < prev.UB.peak_allocated_bytes or measured_latency_us < prev.measured_latency_us"
+    expected_postcondition: "UB.peak_allocated_bytes < prev.UB.peak_allocated_bytes or spill_bytes < prev.spill_bytes or steady_state_ii < prev.steady_state_ii"
     source_provenance: "ref:tilelang"
     alpha_prior: 2.5
     beta_prior: 1.0
@@ -325,7 +325,7 @@ rules:
     mechanism_tag: padded_pitch_tail_masking
     concept_description: "32B-aligned vector pitch padding with SIMD tail masking"
     regime_guard: "(not has_indirect_gather) and (PIPE_V > 0 or PIPE_MTE2 > 0 or has_simtvf)"
-    precondition: "(not has_indirect_gather) and (not (0 < min_gm_dma_bytes < 32)) and dcache_bypass_narrow_store == 0.0 and (unaligned_dma_padding_bytes > 0 or contig_atom_ratio < 1.0 or (has_simtvf and cube_to_vector_ratio == 0.0))"
+    precondition: "(not has_indirect_gather) and (not (0 < min_gm_dma_bytes < 32)) and dcache_bypass_narrow_store == 0.0 and contig_atom_ratio >= 1.0 and (unaligned_dma_padding_bytes > 0 or (has_simtvf and cube_to_vector_ratio == 0.0))"
     anti_precondition: "transfer_inflation_ratio > 1.35 and gm_roundtrip_bytes > 0"
     transform_template: |
       When contig_atom_ratio < 1.0 or inner transfers are sub-32B, pack multiple short rows
@@ -380,7 +380,7 @@ rules:
       not worsen. For idempotent row-independent outputs with total_rows >= tile_rows, clamp the
       tail block start row0 = min(block_idx * tile_rows, total_rows - tile_rows) to eliminate
       predicated cleanup branches.
-    expected_postcondition: "dma_burst_efficiency_ratio > prev.dma_burst_efficiency_ratio or wave_occupancy > prev.wave_occupancy or measured_latency_us < prev.measured_latency_us"
+    expected_postcondition: "dma_burst_efficiency_ratio > prev.dma_burst_efficiency_ratio or wave_occupancy > prev.wave_occupancy"
     source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
     beta_prior: 1.0
@@ -425,7 +425,7 @@ rules:
       reciprocal (1.0 / sum or rsqrt) into a scalar register while prefetching GM tiles; Pass 2
       streams wide vector multiply (T.simd.vmuls / vmul instead of elementwise vdiv) and
       vfma accumulation across vector chunks with short independent dependency chains.
-    expected_postcondition: "not has_coupled_reduce_sfu_accum or measured_latency_us < prev.measured_latency_us"
+    expected_postcondition: "not has_coupled_reduce_sfu_accum or PIPE_V < prev.PIPE_V"
     source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
     beta_prior: 1.0
@@ -451,7 +451,7 @@ rules:
       row-reduction stats per D-shard across cores or merge partial scalar reductions in
       UB/workspace before streaming disjoint 64-element-aligned output chunks in parallel across
       the full num_aiv_cores pool.
-    expected_postcondition: "wave_occupancy > prev.wave_occupancy or grid_blocks > prev.grid_blocks or measured_latency_us < prev.measured_latency_us"
+    expected_postcondition: "wave_occupancy > prev.wave_occupancy or grid_blocks > prev.grid_blocks"
     source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
     beta_prior: 1.0
@@ -796,7 +796,7 @@ rules:
       32B-aligned slices rather than strided per-element or cross-core shared cache lines so
       each core issues full aligned GM->UB and UB->GM bursts without L2 cache-line thrashing
       or partial writeback amplification.
-    expected_postcondition: "l2_hit_rate > prev.l2_hit_rate or dma_burst_efficiency_ratio > prev.dma_burst_efficiency_ratio or transfer_inflation_ratio < prev.transfer_inflation_ratio or measured_latency_us < prev.measured_latency_us"
+    expected_postcondition: "l2_hit_rate > prev.l2_hit_rate or dma_burst_efficiency_ratio > prev.dma_burst_efficiency_ratio or transfer_inflation_ratio < prev.transfer_inflation_ratio"
     source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
     beta_prior: 1.0
@@ -819,7 +819,7 @@ rules:
       loop-invariant scalar parameters and reciprocal constants out of the inner thread loop,
       process multiple independent elements or rows per thread to expose instruction-level
       parallelism, and eliminate redundant divisions or repeated UB loads per inner step.
-    expected_postcondition: "effective_compute_eta > prev.effective_compute_eta or measured_latency_us < prev.measured_latency_us"
+    expected_postcondition: "effective_compute_eta > prev.effective_compute_eta or PIPE_V < prev.PIPE_V"
     source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
     beta_prior: 1.0

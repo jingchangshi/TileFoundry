@@ -841,23 +841,40 @@ def _extract_extra_signals(source: object | None) -> dict[str, float]:
     if source is None:
         return out
     raw_extra: object | None = None
-    if isinstance(source, BishengResourceSummary):
-        raw_extra = source.extra_signals
-    elif isinstance(source, Mapping):
+    signal_keys = (
+        "scalar_compute_loop_fallback",
+        "dcache_bypass_narrow_store",
+        "ub_scalar_compute_loops",
+    )
+    if isinstance(source, Mapping):
         raw_extra = source.get("extra_signals")
-        for key in (
-            "scalar_compute_loop_fallback",
-            "dcache_bypass_narrow_store",
-            "ub_scalar_compute_loops",
-        ):
+        for key in signal_keys:
             val = source.get(key)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                out[key] = float(val)
+    else:
+        raw_extra = getattr(source, "extra_signals", None)
+        for key in signal_keys:
+            val = getattr(source, key, None)
             if isinstance(val, (int, float)) and not isinstance(val, bool):
                 out[key] = float(val)
     if isinstance(raw_extra, Mapping):
         for key, val in raw_extra.items():
             if isinstance(val, (int, float)) and not isinstance(val, bool):
-                out[str(key)] = float(val)
+                str_key = str(key)
+                if str_key in out:
+                    out[str_key] = max(out[str_key], float(val))
+                else:
+                    out[str_key] = float(val)
     return out
+
+
+def _merge_extra_signals(target: dict[str, float], incoming: Mapping[str, float]) -> None:
+    for key, val in incoming.items():
+        if key in target:
+            target[key] = max(target[key], val)
+        else:
+            target[key] = val
 
 
 def _apply_case_ratios(ctx: dict[str, object], raw_ratios: object | None) -> None:
@@ -873,22 +890,17 @@ def _apply_case_ratios(ctx: dict[str, object], raw_ratios: object | None) -> Non
             ctx["working_set_sram_ratio"] = float(ws_ratio)
 
 
-def build_predicate_context(
+def _populate_state_context(
     ledger: ObjectivePhysicalLedger,
     *,
     features: object | None = None,
     residual: Mapping[str, object] | object | None = None,
     compiler_summary: CompilerSummaryLike | Mapping[str, object] | None = None,
-    prev_ledger: ObjectivePhysicalLedger | None = None,
     extra: Mapping[str, object] | None = None,
     target: object | None = None,
     roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
     case_ratios: object | None = None,
-) -> dict[str, object]:
-    """Assemble a flat and dotted-path dictionary for safe rule predicate evaluation.
-
-    Both the current and previous levels expose the five 5D axis gaps and dominant_axis.
-    """
+) -> tuple[dict[str, object], dict[str, float], ObservationVector5D | None]:
     ctx = _ledger_to_namespace(ledger)
     if features is not None:
         if hasattr(features, "to_dict"):
@@ -940,7 +952,7 @@ def build_predicate_context(
             ctx["l1_vec_regs"] = vec_reg_val
             ctx["vec_regs"] = vec_reg_val
             ctx["l1_scalar_regs"] = int(compiler_summary.scalar_regs)
-        extra_signals_map.update(_extract_extra_signals(compiler_summary))
+        _merge_extra_signals(extra_signals_map, _extract_extra_signals(compiler_summary))
         if sw == 0 and vl == 0 and "vloopv2_hit" in comp_vals:
             comp_vals["vloopv2_hit"] = True
         res_defaults.update(comp_vals)
@@ -987,6 +999,29 @@ def build_predicate_context(
                         raw_val = axis_payload.get(f"l2_{key}")
                 if isinstance(raw_val, (int, float)) and not isinstance(raw_val, bool):
                     res_defaults[key] = float(raw_val)
+            obs_ub_loops = int(
+                getattr(embedded_obs.compute_issue, "l0_ub_scalar_compute_loops", 0) or 0
+            )
+            obs_scalar_fb = float(
+                getattr(embedded_obs.compute_issue, "l1_scalar_compute_loop_fallback", 0.0)
+                or 0.0
+            )
+            obs_narrow_store = float(
+                getattr(embedded_obs.offchip_dma, "l1_dcache_bypass_narrow_store", 0.0)
+                or 0.0
+            )
+            if obs_ub_loops > 0:
+                _merge_extra_signals(
+                    extra_signals_map, {"ub_scalar_compute_loops": float(obs_ub_loops)}
+                )
+            if obs_scalar_fb > 0.0:
+                _merge_extra_signals(
+                    extra_signals_map, {"scalar_compute_loop_fallback": obs_scalar_fb}
+                )
+            if obs_narrow_store > 0.0:
+                _merge_extra_signals(
+                    extra_signals_map, {"dcache_bypass_narrow_store": obs_narrow_store}
+                )
             if not has_l1_summary and embedded_obs.has_l1_compiler_summary:
                 has_l1_summary = True
                 obs_vec_regs = int(embedded_obs.onchip_sram_reg.l1_vec_regs)
@@ -1028,7 +1063,7 @@ def build_predicate_context(
                     int(res_defaults["dcache_dcci_flushes"]),
                     int(embedded_obs.offchip_dma.l1_dcache_dcci_flushes),
                 )
-        extra_signals_map.update(_extract_extra_signals(residual))
+        _merge_extra_signals(extra_signals_map, _extract_extra_signals(residual))
     elif roofline is not None:
         static_obs = ledger.to_observation_5d(roofline=roofline)
         if static_obs.transfer_inflation_ratio > 0.0:
@@ -1046,11 +1081,13 @@ def build_predicate_context(
     )
     ctx["ub_scalar_compute_loops"] = ub_loops
     ctx["scalar_compute_loop_fallback"] = max(
-        float(extra_signals_map.get("scalar_compute_loop_fallback", 0.0)),
+        float(ctx.get("scalar_compute_loop_fallback", 0.0) or 0.0),
+        float(extra_signals_map.get("scalar_compute_loop_fallback", 0.0) or 0.0),
         float(ub_loops),
     )
-    ctx["dcache_bypass_narrow_store"] = float(
-        extra_signals_map.get("dcache_bypass_narrow_store", 0.0)
+    ctx["dcache_bypass_narrow_store"] = max(
+        float(ctx.get("dcache_bypass_narrow_store", 0.0) or 0.0),
+        float(extra_signals_map.get("dcache_bypass_narrow_store", 0.0) or 0.0),
     )
     ctx["l2_pmu_available"] = _resolve_l2_pmu_flag(residual, embedded_obs, extra)
 
@@ -1059,19 +1096,62 @@ def build_predicate_context(
         and float(ctx.get("bank_conflict_ratio", 0.0)) > 0.0
     ):
         ctx["ub_bank_conflict_risk"] = float(ctx["bank_conflict_ratio"])
+    return ctx, extra_signals_map, embedded_obs
+
+
+def build_predicate_context(
+    ledger: ObjectivePhysicalLedger,
+    *,
+    features: object | None = None,
+    residual: Mapping[str, object] | object | None = None,
+    compiler_summary: CompilerSummaryLike | Mapping[str, object] | None = None,
+    prev_ledger: ObjectivePhysicalLedger | None = None,
+    prev_residual: object | None = None,
+    prev_compiler_summary: object | None = None,
+    prev_case_ratios: object | None = None,
+    extra: Mapping[str, object] | None = None,
+    target: object | None = None,
+    roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
+    case_ratios: object | None = None,
+) -> dict[str, object]:
+    """Assemble a flat and dotted-path dictionary for safe rule predicate evaluation.
+
+    Both the current and previous levels expose L0, L1, L2, and 5D axis gaps.
+    """
+    ctx, extra_signals_map, embedded_obs = _populate_state_context(
+        ledger,
+        features=features,
+        residual=residual,
+        compiler_summary=compiler_summary,
+        extra=extra,
+        target=target,
+        roofline=roofline,
+        case_ratios=case_ratios,
+    )
 
     if prev_ledger is not None:
-        prev_ns = _ledger_to_namespace(prev_ledger)
-        prev_ns.update(_axis_gap_context(_axis_residuals(prev_ledger, None, roofline=roofline)))
-        for key, val in _RESIDUAL_DEFAULTS.items():
-            prev_ns.setdefault(key, val)
-        for key, val in _TELEMETRY_CONTEXT_DEFAULTS.items():
-            prev_ns.setdefault(key, val)
-        prev_ns.setdefault("extra_signals", {})
-        if roofline is not None:
-            prev_obs = prev_ledger.to_observation_5d(roofline=roofline)
-            if prev_obs.transfer_inflation_ratio > 0.0:
-                prev_ns["transfer_inflation_ratio"] = float(prev_obs.transfer_inflation_ratio)
+        prev_ns, _, _ = _populate_state_context(
+            prev_ledger,
+            residual=prev_residual,
+            compiler_summary=prev_compiler_summary,
+            target=target,
+            roofline=roofline,
+            case_ratios=prev_case_ratios,
+        )
+        ctx["prev"] = prev_ns
+    elif (
+        prev_residual is not None
+        or prev_compiler_summary is not None
+        or prev_case_ratios is not None
+    ):
+        prev_ns, _, _ = _populate_state_context(
+            ledger,
+            residual=prev_residual,
+            compiler_summary=prev_compiler_summary,
+            target=target,
+            roofline=roofline,
+            case_ratios=prev_case_ratios,
+        )
         ctx["prev"] = prev_ns
     else:
         ctx["prev"] = dict(ctx)
@@ -1092,7 +1172,7 @@ def build_predicate_context(
             ctx["contig_atom_ratio"] = float(extra["case_contig_atom_ratio"])
         if "case_working_set_sram_ratio" in extra and "working_set_sram_ratio" not in extra:
             ctx["working_set_sram_ratio"] = float(extra["case_working_set_sram_ratio"])
-        extra_signals_map.update(_extract_extra_signals(extra))
+        _merge_extra_signals(extra_signals_map, _extract_extra_signals(extra))
         ctx["extra_signals"] = dict(extra_signals_map)
         if "ub_scalar_compute_loops" in extra and isinstance(
             extra["ub_scalar_compute_loops"], (int, float)
@@ -1105,11 +1185,13 @@ def build_predicate_context(
             )
         ctx["ub_scalar_compute_loops"] = ub_loops
         ctx["scalar_compute_loop_fallback"] = max(
-            float(extra_signals_map.get("scalar_compute_loop_fallback", 0.0)),
+            float(ctx.get("scalar_compute_loop_fallback", 0.0) or 0.0),
+            float(extra_signals_map.get("scalar_compute_loop_fallback", 0.0) or 0.0),
             float(ub_loops),
         )
-        ctx["dcache_bypass_narrow_store"] = float(
-            extra_signals_map.get("dcache_bypass_narrow_store", 0.0)
+        ctx["dcache_bypass_narrow_store"] = max(
+            float(ctx.get("dcache_bypass_narrow_store", 0.0) or 0.0),
+            float(extra_signals_map.get("dcache_bypass_narrow_store", 0.0) or 0.0),
         )
         extra_aiv = _first_present_float(
             extra, ("aiv_vec_ratio", "l2_aiv_vec_ratio", "measured_aiv_vec_ratio")
@@ -1220,6 +1302,46 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
     sw_loops = _read_signal_int(compute_map, "l1_software_loops")
     vl_loops = _read_signal_int(compute_map, "l1_vloopv2_loops")
     vec_cycles = _read_signal_int(compute_map, "l0_vec_cycles")
+    fixpipe_cycles = _read_signal_int(
+        compute_map,
+        "l0_fixpipe_cycles",
+        default=_read_signal_int(
+            dma_map,
+            "l0_fixpipe_cycles",
+            default=int(
+                getattr(
+                    obs.compute_issue,
+                    "l0_fixpipe_cycles",
+                    getattr(obs.offchip_dma, "l0_fixpipe_cycles", 0),
+                )
+                or 0
+            ),
+        ),
+    )
+    ub_scalar_loops = _read_signal_int(
+        compute_map,
+        "l0_ub_scalar_compute_loops",
+        default=int(getattr(obs.compute_issue, "l0_ub_scalar_compute_loops", 0) or 0),
+    )
+    scalar_fallback = _read_signal_float(
+        compute_map,
+        "l1_scalar_compute_loop_fallback",
+        default=float(
+            getattr(obs.compute_issue, "l1_scalar_compute_loop_fallback", 0.0) or 0.0
+        ),
+    )
+    dcache_bypass = _read_signal_float(
+        dma_map,
+        "l1_dcache_bypass_narrow_store",
+        default=float(
+            getattr(obs.offchip_dma, "l1_dcache_bypass_narrow_store", 0.0) or 0.0
+        ),
+    )
+    min_gm_dma_bytes = _read_signal_int(
+        dma_map,
+        "l0_min_gm_dma_bytes",
+        default=int(getattr(obs.offchip_dma, "l0_min_gm_dma_bytes", 0) or 0),
+    )
     subcore_imbalance = _read_signal_bool(compute_map, "l0_aiv_subcore_imbalance")
     obs_aiv_vec = _read_signal_float(compute_map, "l2_aiv_vec_ratio")
     obs_aic_mac = _read_signal_float(compute_map, "l2_aic_mac_ratio")
@@ -1234,6 +1356,7 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
             dma_map, "l0_dma_burst_efficiency", default=1.0
         ),
         "unaligned_dma_padding_bytes": _read_signal_int(dma_map, "l0_unaligned_padding_bytes"),
+        "min_gm_dma_bytes": min_gm_dma_bytes,
         "mte2_inflight_per_aiv": _read_signal_int(dma_map, "l0_mte2_inflight_per_aiv"),
         "l2_hit_rate": _read_signal_float(dma_map, "l2_cache_hit_rate", default=1.0),
         "measured_mte2_wait_ratio": _read_signal_float(dma_map, "l2_mte2_wait_ratio"),
@@ -1242,7 +1365,8 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
         "dual_issue_ipc_collapse": _read_signal_float(compute_map, "l1_dual_issue_collapse"),
         "aic_fixpipe_ratio": _read_signal_float(dma_map, "l2_fixpipe_ratio"),
         "AIC.PIPE_M": _read_signal_int(compute_map, "l0_cube_cycles"),
-        "AIC.PIPE_FIX": 0,
+        "AIC.PIPE_FIX": fixpipe_cycles,
+        "PIPE_FIX": fixpipe_cycles,
         "AIV0.PIPE_V": vec_cycles,
         "AIV1.PIPE_V": 0 if subcore_imbalance else vec_cycles,
         "l0_cube_cycles": _read_signal_int(compute_map, "l0_cube_cycles"),
@@ -1253,9 +1377,9 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
         "vec_regs": _read_signal_int(sram_map, "l1_vec_regs"),
         "contig_atom_ratio": 1.0,
         "working_set_sram_ratio": 0.0,
-        "scalar_compute_loop_fallback": 0.0,
-        "ub_scalar_compute_loops": 0,
-        "dcache_bypass_narrow_store": 0.0,
+        "scalar_compute_loop_fallback": max(scalar_fallback, float(ub_scalar_loops)),
+        "ub_scalar_compute_loops": ub_scalar_loops,
+        "dcache_bypass_narrow_store": dcache_bypass,
         "l2_pmu_available": (
             1
             if (

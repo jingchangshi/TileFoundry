@@ -12,7 +12,7 @@ Every candidate kernel maps to one cell in `TopologyAxes` (`3 x 6 x 4 = 72` orth
 | `memory_ring` | `VALID_MEMORY_RINGS` (6) | `gm_ub_stream`, `ub_random_atomic`, `gm_l1_l0_fixpipe`, `l0c_ub_epilogue`, `bidirectional_cv_ring`, `persistent_onchip_state` |
 | `iteration_regularity` | `VALID_ITERATION_REGULARITIES` (4) | `affine_simd`, `irregular_simt`, `ragged_group`, `dynamic_opcode_stream` |
 
-Multi-shape dispatch (`ascend/sil/`, `pytorch_frontend.py`, `regime_solver.py`) classifies cases purely from physical ratios (zero operator-name branching):
+Multi-shape dispatch (`ascend/sil/`, single semantic frontend `PyTorchSemanticAnalyzer` in `pytorch_frontend.py`, `regime_solver.py`) classifies cases purely from physical ratios (zero operator-name branching):
 
 - **`CasePhysicsRatios` & 5D `PhaseSignature`**: Computes `stride_ratio`, `contig_atom_ratio`, `is_atom_aligned`, `working_set_sram_ratio`, `working_set_vreg_ratio`, `wave_occupancy_ratio`, `oi_ridge_ratio`, `inner_contiguous_bytes`, and `has_empty_group`, projecting to `phase_signature = (engine, layout, residency, alignment, wave)`.
 - **Sub-Atom Separation**: When `contig_atom_ratio < 1.0`, reduction cases receive the distinct `_subatom` tag (`sub_atom_simt` alignment band) so sub-atom reductions never merge silently with wide aligned vector reductions.
@@ -66,4 +66,4 @@ Every diagnosed waste maps deterministically to the closed 13-member `SymptomFam
 | `SYNC_BARRIER_SERIALIZATION` | `pipeline_sync` | `pipeline_and_sync_graph`, `tile_and_stage_knobs` |
 | `GRID_TAIL_WAVE_UNDERUTIL` | `grid_wave` | `grid_and_workspace_topology`, `tile_and_stage_knobs` |
 
-- **Frozen Online KB (`agent/kb/`)**: `seed_rules.yaml` holds 41 cross-operator causal rules (`R01..R41`) evaluated read-only online under a strict AST inequality whitelist (`_ALLOWED_AST_NODES`), ranked by 3-axis factorized Bayesian tracking (`ce:*`, `mr:*`, `ir:*`), and pruned against repeated dead-ends via Scoped Tabu (`excluded_mechanisms`).
+- **Frozen Online KB (`agent/kb/`)**: `seed_rules.yaml` holds 41 orthogonal atomic causal rules (`R01..R41`, zero latency-noise escapes) evaluated read-only online under a strict AST inequality whitelist (`_ALLOWED_AST_NODES`), ranked by 3-axis factorized Bayesian tracking (`ce:*`, `mr:*`, `ir:*`), and pruned against repeated dead-ends via Scoped Tabu (`excluded_mechanisms`).
