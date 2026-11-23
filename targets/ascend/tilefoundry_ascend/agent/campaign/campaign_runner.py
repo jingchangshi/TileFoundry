@@ -996,12 +996,19 @@ _TRACKB_FOLDING_MARKERS: tuple[str, ...] = (
     "READ-ONLY SIBLING KERNEL",
     "READ-ONLY HELPER",
     "MIDDLE BODY OMITTED",
+    "LINES OMITTED OUTSIDE FOCUS WINDOW",
+)
+
+_TRACKB_OMITTED_MARKER_RE = re.compile(
+    r"/\*\s*\.\.\.\s*(?:\d+\s+)?lines?\s+omitted\s*\.\.\.\s*\*/"
 )
 
 
 def _reject_trackb_folding_markers(candidate_text: str, regime_tag: str) -> None:
     """Reject a Track-B reply that echoes truncated-context folding markers."""
     found = [marker for marker in _TRACKB_FOLDING_MARKERS if marker in candidate_text]
+    if _TRACKB_OMITTED_MARKER_RE.search(candidate_text):
+        found.append("lines omitted")
     if found:
         raise ValueError(
             f"Track-B candidate for regime {regime_tag!r} echoes truncated context markers "
@@ -7570,10 +7577,23 @@ class PerfTargetCampaignRunner:
                 focus_lines=parent_focus_lines,
                 diagnostic_text=parent_diag_text,
             )
-            l0_l1_checks = await run_l0_l1_round_filter(
-                raw_candidates,
-                patch_fn=lambda snip: patch_regime_into_module(
-                    parent_module_source,
+            trackb_prologue_line_offset = 0
+            if regime_spec.runtime_backend in ("ascendc_trackb", "cce_trackb", "hybrid_trackb"):
+                sentinel = "__TF_TRACKB_SENTINEL__"
+                try:
+                    rendered_probe = self._instantiate_trackb_tu(
+                        parent_module_source,
+                        sentinel,
+                        regime_spec,
+                    )
+                except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+                    rendered_probe = ""
+                if isinstance(rendered_probe, str) and sentinel in rendered_probe:
+                    trackb_prologue_line_offset = rendered_probe.split(sentinel, 1)[0].count("\n")
+
+            def _patch_against(base_mod_src: str, snip: str) -> str:
+                return patch_regime_into_module(
+                    base_mod_src,
                     regime_spec,
                     snip,
                     operator_entrypoint=_resolve_operator_entrypoint_safe(
@@ -7581,6 +7601,13 @@ class PerfTargetCampaignRunner:
                     ),
                     sibling_specs=self._regime_specs,
                     active_kernel=round_active_kernel,
+                )
+
+            l0_l1_checks = await run_l0_l1_round_filter(
+                raw_candidates,
+                patch_fn=lambda snip: _patch_against(parent_module_source, snip),
+                repatch_from_current_fn=lambda cur_mod_src, snip: _patch_against(
+                    cur_mod_src, snip
                 ),
                 l0_checker=_candidate_l0_check,
                 l1_compiler=lambda mod_src: self._run_l1(mod_src, regime_spec),
@@ -7589,6 +7616,7 @@ class PerfTargetCampaignRunner:
                 slice_hint=self._slice_contract_instruction(func_name, regime_spec),
                 backend_kind=regime_spec.runtime_backend,
                 parent_source=repair_parent_source,
+                trackb_prologue_line_offset=trackb_prologue_line_offset,
                 stage_a_cost_ranker=stage_a_ranker,
                 cost_prescreen_top_k=prescreen_top_k,
                 sil_advisory=self._sil_advisory,

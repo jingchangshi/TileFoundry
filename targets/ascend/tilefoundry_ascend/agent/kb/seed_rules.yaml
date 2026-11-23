@@ -323,15 +323,15 @@ rules:
   - rule_id: R16_PADDED_PITCH_TAIL_MASKING
     symptom_family: DMA_UNALIGNED_SHORT_BURST
     mechanism_tag: padded_pitch_tail_masking
-    concept_description: "32B-aligned vector pitch padding with SIMD tail masking"
+    concept_description: "32B-aligned UB pitch padding and SIMD tail masking for atom-aligned non-32B-multiple rows"
     regime_guard: "(not has_indirect_gather) and (PIPE_V > 0 or PIPE_MTE2 > 0 or has_simtvf)"
     precondition: "(not has_indirect_gather) and (not (0 < min_gm_dma_bytes < 32)) and dcache_bypass_narrow_store == 0.0 and contig_atom_ratio >= 1.0 and (unaligned_dma_padding_bytes > 0 or (has_simtvf and cube_to_vector_ratio == 0.0))"
     anti_precondition: "transfer_inflation_ratio > 1.35 and gm_roundtrip_bytes > 0"
     transform_template: |
-      When contig_atom_ratio < 1.0 or inner transfers are sub-32B, pack multiple short rows
-      contiguously in UB/GM to align 32B DMA burst transfers, pad inner UB/GM strides to 32B
-      alignment, and replace scalar T.SimtVF loops with predicated vector T.SimdVF() tail masking
-      so DMA bursts stay aligned and SIMD pipelines run without scalar fallback or bypass stores.
+      For atom-aligned rows (contig_atom_ratio >= 1.0, min_gm_dma_bytes >= 32) whose inner
+      contiguous span is not a multiple of 32B, pad inner UB row pitch/stride to 32B alignment
+      and replace scalar T.SimtVF loops with predicated vector T.SimdVF() tail masking so each
+      row keeps 32B-aligned UB access and SIMD execution without unaligned padding waste.
     expected_postcondition: "unaligned_dma_padding_bytes < prev.unaligned_dma_padding_bytes or not has_simtvf or dma_burst_efficiency_ratio > prev.dma_burst_efficiency_ratio"
     source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
@@ -339,10 +339,10 @@ rules:
     priority: 14
     compatible_backends: ["tilelang_dsl", "cce_trackb", "hybrid_trackb"]
     cpp20_transform_template: |
-      Pack multiple sub-32B rows contiguously (contig_atom_ratio < 1.0) into 32B-aligned
-      asc_copy_gm2ub_align() / asc_copy_ub2gm_align() bursts instead of narrow bypass GM stores,
-      and keep inner UB strides 32B-aligned for wide simd_inst::* tail-masked execution.
-    rationale: "Multi-row contiguous 32B packing and SIMD tail masking eliminate sub-32B DMA burst waste and scalar bypass stalls."
+      For atom-aligned rows (contig_atom_ratio >= 1.0, min_gm_dma_bytes >= 32) whose inner
+      contiguous span is not a 32B multiple, pad UB row pitch to 32B alignment with
+      asc_copy_gm2ub_align() / asc_copy_ub2gm_align() and use tail-masked simd_inst::* vector ops.
+    rationale: "32B-aligned UB pitch padding and predicated SIMD tail masking eliminate alignment waste and scalar fallback on atom-aligned non-32B-multiple rows."
 
   - rule_id: R17_RMEM_ACCUMULATOR_HOIST
     symptom_family: SRAM_REGISTER_SPILL_STACK
