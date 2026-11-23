@@ -5230,8 +5230,6 @@ def _blueprint_packet(entry_name: str = "exp") -> HirBlueprintPacket:
     return HirBlueprintPacket(
         entry_name=entry_name,
         roofline=roofline,
-        z3_pipeline_summary={},
-        reference_ledger=None,
         lowering_diagnostics=(),
     )
 
@@ -7172,7 +7170,15 @@ def test_build_syntax_repair_request_lowered_excerpt_and_extractor() -> None:
         backend_kind="cce_cpp20",
         lowered_excerpt="int x = 1;",
     )
-    assert "### COMPILER LOWERED EXCERPT" not in req_cpp.user_prompt
+    assert "### COMPILER LOWERED EXCERPT (READ-ONLY CONTEXT)" in req_cpp.user_prompt
+
+    req_cpp_dup = build_syntax_repair_request(
+        "__aicore__ void k() {\n    int x = 1;\n}",
+        "error at line 1",
+        backend_kind="cce_cpp20",
+        lowered_excerpt="int x = 1;",
+    )
+    assert "### COMPILER LOWERED EXCERPT" not in req_cpp_dup.user_prompt
 
     class _DummyStageB:
         passed = False

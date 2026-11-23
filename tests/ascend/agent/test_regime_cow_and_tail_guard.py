@@ -274,8 +274,6 @@ def _tail_guard_runner(
         spec.regime_tag: HirBlueprintPacket(
             entry_name="exp",
             roofline=roofline,
-            z3_pipeline_summary={},
-            reference_ledger=None,
             lowering_diagnostics=(),
         )
         for spec in specs
@@ -422,8 +420,6 @@ def test_stage6_zero_shot_prescreen_and_experience_lake_anomaly_wiring(
         spec_a.regime_tag: HirBlueprintPacket(
             entry_name="exp",
             roofline=roofline,
-            z3_pipeline_summary={},
-            reference_ledger=None,
             lowering_diagnostics=(),
         )
     }

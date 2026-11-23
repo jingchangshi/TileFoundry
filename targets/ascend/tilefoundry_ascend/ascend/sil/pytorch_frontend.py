@@ -1495,13 +1495,10 @@ class PyTorchSemanticAnalyzer:
             semantic_source="pytorch_golden",
             traffic_basis=work.traffic_basis,
             coordinate_scope="representative_anchor",
-            has_authored_hir=False,
-            has_scheduled_hir=False,
         )
         return HirBlueprintPacket(
             entry_name=semantics.entry_name,
             roofline=roofline,
-            reference_ledger=None,
             lowering_diagnostics=("analytical_pytorch_frontend",),
             requested_anchor_dims=dict(dims),
             resolved_hir_dims=dict(work.resolved_dims),

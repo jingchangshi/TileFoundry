@@ -805,7 +805,6 @@ def test_prepare_seed_blueprints_cover_every_semantic_regime() -> None:
         assert packet.roofline.min_gm_bytes > 0
         assert packet.roofline.ideal_roofline_us > 0.0
         assert packet.provenance.semantic_source == "pytorch_golden"
-        assert packet.z3_pipeline_summary == {}
         assert packet.requested_anchor_dims == (
             regime.representative_anchor_dims or regime.representative_hir_dims
         )
@@ -1181,7 +1180,6 @@ def test_campaign_runner_synthesizes_blueprints_without_authored_model(
         assert packet.roofline.min_gm_bytes > 0
         assert packet.roofline.ideal_roofline_us > 0.0
         assert packet.provenance.semantic_source == "pytorch_golden"
-        assert packet.z3_pipeline_summary == {}
 
 
 def test_campaign_runner_raises_when_official_golden_is_missing(tmp_path: Path) -> None:

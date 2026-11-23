@@ -229,7 +229,7 @@ def format_blueprint_delta_section(
     *,
     current_ledger: ObjectivePhysicalLedger | None = None,
 ) -> str:
-    """Render Layer 3 dialect-neutral Roofline, Z3 floor, and physical ledger deltas.
+    """Render Layer 3 dialect-neutral Roofline and physical ledger deltas.
 
     Microsecond floors render through repr so a positive value below 1e-4
     stays nonzero and round-trips.
@@ -262,57 +262,31 @@ def format_blueprint_delta_section(
         )
     if blueprint.fallback_reason:
         lines.append(f"- fallback_reason: {blueprint.fallback_reason}")
-    if blueprint.z3_pipeline_summary:
-        lines.append(
-            f"- Ideal Z3 Schedule Floor: {json.dumps(blueprint.z3_pipeline_summary, sort_keys=True)}"
-        )
     if blueprint.lowering_diagnostics:
         lines.append(f"- Blueprint Diagnostics: {list(blueprint.lowering_diagnostics)}")
 
-    ref_led = blueprint.reference_ledger
-    if current_ledger is not None and ref_led is not None:
+    if current_ledger is not None:
         if blueprint.shape_exact_match:
-            ref_ub = _ub_peak_bytes(ref_led)
             cur_ub = _ub_peak_bytes(current_ledger)
-            ub_delta = cur_ub - ref_ub
-            gm_delta = current_ledger.gm_roundtrip_bytes - ref_led.gm_roundtrip_bytes
-            if (
-                ref_led.steady_state_ii is not None
-                and current_ledger.steady_state_ii is not None
-            ):
-                ii_delta = str(current_ledger.steady_state_ii - ref_led.steady_state_ii)
-            else:
-                ii_delta = "n/a"
+            gm_delta = current_ledger.gm_roundtrip_bytes - rf.min_gm_bytes
             lines.extend(
                 [
+                    f"- steady_state_ii: candidate={current_ledger.steady_state_ii}",
+                    f"- dominant_pipe: candidate={current_ledger.dominant_pipe}",
+                    f"- ub_peak_bytes: candidate={cur_ub}",
                     (
-                        f"- steady_state_ii: floor={ref_led.steady_state_ii}, "
-                        f"candidate={current_ledger.steady_state_ii}, delta={ii_delta}"
-                    ),
-                    (
-                        f"- dominant_pipe: floor={ref_led.dominant_pipe}, "
-                        f"candidate={current_ledger.dominant_pipe}"
-                    ),
-                    f"- ub_peak_bytes: floor={ref_ub}, candidate={cur_ub}, delta={ub_delta:+d}",
-                    (
-                        f"- gm_roundtrip_bytes: floor={ref_led.gm_roundtrip_bytes}, "
+                        f"- gm_roundtrip_bytes: floor={rf.min_gm_bytes}, "
                         f"candidate={current_ledger.gm_roundtrip_bytes}, delta={gm_delta:+d}"
                     ),
                 ]
             )
         else:
-            lines.append(
-                f"- dominant_pipe: floor={ref_led.dominant_pipe}, "
-                f"candidate={current_ledger.dominant_pipe}"
-            )
-            all_scopes = sorted(set(ref_led.waterlines) | set(current_ledger.waterlines))
-            for scope in all_scopes:
+            lines.append(f"- dominant_pipe: candidate={current_ledger.dominant_pipe}")
+            for scope in sorted(current_ledger.waterlines):
                 topo = _SCOPE_TOPOLOGY_MAP.get(scope, scope)
-                ref_pct = _format_scope_pct(ref_led.waterlines.get(scope))
                 cur_pct = _format_scope_pct(current_ledger.waterlines.get(scope))
                 lines.append(
-                    f"- scope_utilization[{scope} -> {topo}]: "
-                    f"floor={ref_pct}, candidate={cur_pct}"
+                    f"- scope_utilization[{scope} -> {topo}]: candidate={cur_pct}"
                 )
         if (
             current_ledger.min_gm_dma_bytes > 0

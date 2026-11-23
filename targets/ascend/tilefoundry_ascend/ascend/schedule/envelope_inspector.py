@@ -91,6 +91,50 @@ def _map_tilelang_scope(raw_scope: str) -> str | None:
     return _TILELANG_SCOPE_MAP.get(raw_scope.strip())
 
 
+_EXTERN_CALL_TAILS = frozenset(
+    ("call_extern", "call_pure_extern", "call_intrin", "call_llvm_intrin")
+)
+
+
+def _op_name_str(op: object) -> str:
+    """Return the raw string name of a TIR call op."""
+    return str(getattr(op, "name", op))
+
+
+def _unwrapped_extern_symbol(call: object) -> str | None:
+    """Return target symbol name when *call* is call_extern/call_intrin with string args[0]."""
+    op_name = _op_name_str(getattr(call, "op", ""))
+    tail = op_name.rsplit(".", 1)[-1].lower()
+    if tail not in _EXTERN_CALL_TAILS:
+        return None
+    args = getattr(call, "args", ())
+    if not args:
+        return None
+    first = args[0]
+    if isinstance(first, str) and first:
+        return first
+    val = getattr(first, "value", None)
+    if isinstance(val, str) and val:
+        return val
+    return None
+
+
+def _effective_tirx_call_name(call: object) -> str:
+    """Resolve effective op name, unwrapping call_extern/call_intrin target symbols."""
+    sym = _unwrapped_extern_symbol(call)
+    if sym is not None:
+        return sym
+    return _op_name_str(getattr(call, "op", ""))
+
+
+def _effective_tirx_call_args(call: object) -> list[object]:
+    """Return target arguments of a TIR call, skipping extern symbol name if unwrapped."""
+    args = list(getattr(call, "args", ()))
+    if _unwrapped_extern_symbol(call) is not None and args:
+        return args[1:]
+    return args
+
+
 def _static_shape_ints(shape: object) -> tuple[int, ...] | None:
     dims: list[int] = []
     for dim in shape:
@@ -219,12 +263,13 @@ def _collect_tilelang_expr_rw(
 
     def _pre(node):
         if isinstance(node, tirx.Call):
-            op_name = str(getattr(node.op, "name", node.op)).lower()
+            op_name = _effective_tirx_call_name(node).lower()
+            call_args = _effective_tirx_call_args(node)
             if _is_tilelang_exp_op(op_name):
                 has_exp[0] = True
-            if "vld" in op_name and node.args:
-                _record_ub_access(node.args[0], is_store=False)
-                for rest in node.args[1:]:
+            if "vld" in op_name and call_args:
+                _record_ub_access(call_args[0], is_store=False)
+                for rest in call_args[1:]:
                     sub_ev, sub_exp, sub_ul, sub_us = _collect_tilelang_expr_rw(rest, tirx=tirx)
                     events.extend(sub_ev)
                     if sub_exp:
@@ -232,9 +277,9 @@ def _collect_tilelang_expr_rw(
                     ub_loads.extend(sub_ul)
                     ub_stores.extend(sub_us)
                 return False
-            if "vsts" in op_name and node.args:
-                _record_ub_access(node.args[0], is_store=True)
-                for rest in node.args[1:]:
+            if "vsts" in op_name and call_args:
+                _record_ub_access(call_args[0], is_store=True)
+                for rest in call_args[1:]:
                     sub_ev, sub_exp, sub_ul, sub_us = _collect_tilelang_expr_rw(rest, tirx=tirx)
                     events.extend(sub_ev)
                     if sub_exp:
@@ -272,8 +317,8 @@ def _collect_tilelang_expr_rw(
                     if rw & 2:
                         events.append((bl.buffer.name, scope, "write"))
                 return False
-            if "copy" in op_name and len(node.args) >= 2:
-                for arg, default_rw in ((node.args[0], "read"), (node.args[1], "write")):
+            if "copy" in op_name and len(call_args) >= 2:
+                for arg, default_rw in ((call_args[0], "read"), (call_args[1], "write")):
                     if isinstance(arg, tirx.BufferRegion):
                         scope = _map_tilelang_scope(arg.buffer.scope())
                         if scope is not None:
@@ -1224,7 +1269,7 @@ def _count_tirx_ub_scalar_compute_loops(
 
         def _visit(sub) -> None:
             if isinstance(sub, tirx.Call):
-                op_name = str(getattr(sub.op, "name", sub.op)).lower()
+                op_name = _effective_tirx_call_name(sub).lower()
                 if _is_disallowed_tirx_intrinsic(op_name, allow_sync=allow_sync_intrinsics):
                     hit[0] = True
 
@@ -1241,7 +1286,7 @@ def _count_tirx_ub_scalar_compute_loops(
             if arith_types and isinstance(sub, arith_types):
                 has_arith[0] = True
             elif isinstance(sub, tirx.Call):
-                op_name = str(getattr(sub.op, "name", sub.op)).lower()
+                op_name = _effective_tirx_call_name(sub).lower()
                 if _is_tirx_math_call(op_name):
                     has_arith[0] = True
             elif isinstance(sub, tirx.BufferLoad):
@@ -1596,15 +1641,16 @@ def _collect_tilelang_telemetry(
         elif isinstance(node, tirx.While):
             loops.append((node.body, False, False))
         elif isinstance(node, tirx.Call):
-            op_name = str(getattr(node.op, "name", node.op)).lower()
-            if ("gemm" in op_name or "mmad" in op_name) and len(node.args) >= 3:
-                m_val = _static_tirx_int(node.args[5]) if len(node.args) > 5 else None
+            op_name = _effective_tirx_call_name(node).lower()
+            call_args = _effective_tirx_call_args(node)
+            if ("gemm" in op_name or "mmad" in op_name) and len(call_args) >= 3:
+                m_val = _static_tirx_int(call_args[5]) if len(call_args) > 5 else None
                 if m_val is None:
-                    _s, _t, _i = _region_bytes(node.args[0], tirx, DataTypeCls)
-                    if isinstance(node.args[0], tirx.Call) and len(node.args[0].args) >= 4:
-                        ext = _static_shape_ints(node.args[0].args[2:])
+                    _s, _t, _i = _region_bytes(call_args[0], tirx, DataTypeCls)
+                    if isinstance(call_args[0], tirx.Call) and len(call_args[0].args) >= 4:
+                        ext = _static_shape_ints(call_args[0].args[2:])
                         if ext and len(ext) >= 2:
-                            trans_a = _static_tirx_int(node.args[3]) if len(node.args) > 3 else 0
+                            trans_a = _static_tirx_int(call_args[3]) if len(call_args) > 3 else 0
                             m_val = ext[-1] if trans_a else ext[-2]
                 if m_val is not None and m_val > 0:
                     cube_m_values.append(m_val)
@@ -2113,7 +2159,7 @@ def _detect_tilelang_aiv_split_factor(func, *, tirx) -> int:
                 if val is not None and val >= 2:
                     detected[0] = 2
         elif isinstance(node, tirx.Call):
-            op_name = str(getattr(node.op, "name", node.op)).lower()
+            op_name = _effective_tirx_call_name(node).lower()
             ann = getattr(node, "annotations", None) or {}
             if (
                 "dual_copy" in op_name
@@ -2132,7 +2178,7 @@ def _is_sid_expr(expr, sid_vars: set[object], tirx) -> bool:
         name = str(getattr(expr, "name_hint", "")).lower()
         return any(expr.same_as(v) for v in sid_vars) or "subblock" in name or name == "sid"
     if isinstance(expr, tirx.Call):
-        op_name = str(getattr(expr.op, "name", expr.op)).lower()
+        op_name = _effective_tirx_call_name(expr).lower()
         return "subblock" in op_name or "get_subblock_idx" in op_name
     return False
 
@@ -2240,8 +2286,8 @@ def _collect_gm_dma_payloads(
                 _walk(node.body, in_loop=in_loop, let_env=let_env)
             return
         if isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call):
-            op_name = str(getattr(node.value.op, "name", node.value.op))
-            args = list(node.value.args)
+            op_name = _effective_tirx_call_name(node.value).lower()
+            args = _effective_tirx_call_args(node.value)
             if "copy" in op_name and len(args) >= 2:
                 src_s, xfer_b, _in1 = _region_bytes(
                     args[0], tirx, DataTypeCls, let_env=let_env
@@ -2297,7 +2343,7 @@ def _count_in_loop_pipe_all_barriers(stmt, *, tirx) -> int:
                 _walk(node.body, in_loop=in_loop)
             return
         if isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call):
-            op_name = str(getattr(node.value.op, "name", node.value.op)).lower()
+            op_name = _effective_tirx_call_name(node.value).lower()
             if "pipe_barrier" in op_name and in_loop:
                 for arg in node.value.args:
                     val = getattr(arg, "value", arg)
@@ -2333,7 +2379,7 @@ def _detect_coupled_reduce_sfu_accum(
 
         def _pre(node):
             if isinstance(node, tirx.Call):
-                op_name = str(getattr(node.op, "name", node.op)).lower()
+                op_name = _effective_tirx_call_name(node).lower()
                 if _is_reduce_or_sfu_call(op_name):
                     sfu_flag[0] = True
             return True
@@ -2794,7 +2840,8 @@ def _scan_tilelang_ast(
                     stmt.value, let_env, tirx=tirx
                 )
             if isinstance(stmt, tirx.Bind) and isinstance(getattr(stmt, "value", None), tirx.Call):
-                b_op = str(getattr(stmt.value.op, "name", stmt.value.op)).lower()
+                b_op = _effective_tirx_call_name(stmt.value).lower()
+                b_args = _effective_tirx_call_args(stmt.value)
                 if (
                     ("simd" in b_op or "vec" in b_op)
                     and "vld" not in b_op
@@ -2802,7 +2849,7 @@ def _scan_tilelang_ast(
                 ):
                     mte2_run[0] = 0
                     vec_cyc = _estimate_dav3510_vec_cycles(
-                        b_op, list(stmt.value.args), tirx, DataTypeCls
+                        b_op, b_args, tirx, DataTypeCls
                     )
                     _emit_aiv_pipe("PIPE_V", repeat * vec_cyc, guarded_aiv=guarded_aiv)
             if hasattr(stmt, "body"):
@@ -2822,8 +2869,8 @@ def _scan_tilelang_ast(
             _add_pipe(f"{core}.PIPE_S", repeat)
             return
         if isinstance(stmt, tirx.Evaluate) and isinstance(stmt.value, tirx.Call):
-            op_name = str(getattr(stmt.value.op, "name", stmt.value.op))
-            args = list(stmt.value.args)
+            op_name = _effective_tirx_call_name(stmt.value).lower()
+            args = _effective_tirx_call_args(stmt.value)
             if "copy" in op_name and len(args) >= 2:
                 src_s, xfer_b, inner_b = _region_bytes(
                     args[0], tirx, DataTypeCls, let_env=let_env
@@ -3047,7 +3094,7 @@ def _extract_vf_accesses(
             scope = _map_tilelang_scope(node.buffer.scope())
             _add_unique(writes, node.buffer.name, scope)
         elif isinstance(node, tirx.Call):
-            op_name = str(getattr(node.op, "name", node.op)).lower()
+            op_name = _effective_tirx_call_name(node).lower()
             if "simd" in op_name or "vec" in op_name:
                 op_count[0] += 1
             if "access_ptr" in op_name and len(node.args) >= 3:
@@ -3202,8 +3249,8 @@ def _extract_pipelined_loop_tasks(
             )
             return
         if isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call):
-            op_name = str(getattr(node.value.op, "name", node.value.op)).lower()
-            args = list(node.value.args)
+            op_name = _effective_tirx_call_name(node.value).lower()
+            args = _effective_tirx_call_args(node.value)
             if "copy" in op_name and len(args) >= 2:
                 src_n, src_s, src_b = _tilelang_arg_buf(args[0], tirx, DataTypeCls)
                 dst_n, dst_s, dst_b = _tilelang_arg_buf(args[1], tirx, DataTypeCls)
@@ -4262,13 +4309,15 @@ def _collect_post_lower_gm_dma_payloads(
                 _walk(node.body, in_loop=in_loop, let_env=let_env)
             return
         if isinstance(node, tirx.Evaluate) and isinstance(node.value, tirx.Call):
-            op_name = str(getattr(node.value.op, "name", node.value.op)).lower()
-            args = list(node.value.args)
+            op_name = _effective_tirx_call_name(node.value).lower()
+            args = _effective_tirx_call_args(node.value)
             if "copy" in op_name and len(args) >= 2:
                 is_gm_name = (
                     "gm_to_" in op_name
                     or "_to_gm" in op_name
                     or "_gm_" in op_name
+                    or "gm2" in op_name
+                    or "2gm" in op_name
                 )
                 src_s, _sb, _sin = _region_bytes(args[0], tirx, DataTypeCls, let_env=let_env)
                 dst_s, _db, _din = _region_bytes(args[1], tirx, DataTypeCls, let_env=let_env)

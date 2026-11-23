@@ -241,8 +241,6 @@ def test_modelless_semantic_first_blueprints_softmax_parity_and_backtest(
         traffic_basis="declared_io_exact",
         coordinate_scope="representative_anchor",
     )
-    assert sm_packet.z3_pipeline_summary == {}
-    assert "traffic_basis" not in sm_packet.z3_pipeline_summary
     rebuilt_sm = HirBlueprintPacket.from_dict(json.loads(json.dumps(sm_packet.to_dict())))
     assert rebuilt_sm == sm_packet
 
@@ -255,7 +253,6 @@ def test_modelless_semantic_first_blueprints_softmax_parity_and_backtest(
     assert e2e_pkt.roofline.min_gm_bytes == 268_435_456
     assert e2e_pkt.provenance is not None
     assert e2e_pkt.provenance.semantic_source == "pytorch_golden"
-    assert e2e_pkt.z3_pipeline_summary == {}
     summary = _summarize_blueprint(e2e_pkt)
     assert summary["provenance"] == e2e_pkt.provenance.to_dict()
 
@@ -438,7 +435,6 @@ def test_universal_blueprint_anchors_real_dims_from_pytorch_golden() -> None:
     assert roundtrip == pkt
     replaced = dataclasses.replace(pkt, fallback_reason="test_note")
     assert replaced.fallback_reason == "test_note"
-    assert replaced.z3_pipeline_summary == pkt.z3_pipeline_summary
 
     ar_golden = dedent(
         """
@@ -459,36 +455,6 @@ def test_universal_blueprint_anchors_real_dims_from_pytorch_golden() -> None:
     ar_pkt = analyzer.build_universal_blueprint(ar_semantics, ar_unaligned_dims)
     assert ar_pkt.roofline.anchor_dims["D"] == 1000
     assert ar_pkt.roofline.ideal_roofline_us > 0.0
-
-
-def test_hir_blueprint_packet_strips_legacy_non_z3_keys() -> None:
-    """HirBlueprintPacket.z3_pipeline_summary never leaks non-Z3 metadata keys."""
-    roofline = HirRooflineSummary(
-        anchor_dims={"M": 64, "D": 128},
-        compute_flops=1024,
-        min_gm_bytes=4096,
-        arithmetic_intensity=0.25,
-        compute_floor_us=0.1,
-        memory_floor_us=0.2,
-        ideal_roofline_us=0.2,
-        dominant_bound="memory",
-    )
-    legacy_pkt = HirBlueprintPacket(
-        entry_name="demo",
-        roofline=roofline,
-        z3_pipeline_summary={
-            "traffic_basis": "estimated",
-            "source": "pytorch_semantic_frontend",
-            "k_loop": {"ii": 8, "stages": {"load": 0}, "phases": {}, "versions": {}},
-        },
-        reference_ledger=None,
-        lowering_diagnostics=(),
-    )
-    assert "traffic_basis" not in legacy_pkt.z3_pipeline_summary
-    assert "source" not in legacy_pkt.z3_pipeline_summary
-    assert legacy_pkt.z3_pipeline_summary == {
-        "k_loop": {"ii": 8, "stages": {"load": 0}, "phases": {}, "versions": {}}
-    }
 
 
 def test_objective_physical_ledger_gm_traffic_scope_and_total_gm_bytes() -> None:
@@ -730,4 +696,3 @@ def test_real_stock_operators_build_blueprints_without_model_py(tmp_path: Path) 
         assert pkt.roofline.ideal_roofline_us > 0.0
         assert pkt.provenance is not None
         assert pkt.provenance.semantic_source == "pytorch_golden"
-        assert pkt.z3_pipeline_summary == {}

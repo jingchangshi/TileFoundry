@@ -1347,8 +1347,15 @@ _CPP_DTYPE_BYTES: dict[str, int] = {
     "uint8_t": 1,
     "int8_t": 1,
     "char": 1,
+    "int8": 1,
+    "uint8": 1,
+    "fp8": 1,
+    "fp8_t": 1,
     "half": 2,
+    "__bf16": 2,
     "bfloat16_t": 2,
+    "bfloat16": 2,
+    "float16_t": 2,
     "uint16_t": 2,
     "int16_t": 2,
     "float": 4,
@@ -1476,8 +1483,38 @@ def _strip_outer_parens(expr: str) -> str:
     return text
 
 
+_CPP_CAST_RE = re.compile(
+    r"\(\s*(?:u?int(?:8|16|32|64)_t|size_t|unsigned(?:\s+(?:int|long|short))?|"
+    r"int|long|short|float|double|half|__bf16|bfloat16_t|bfloat16)\s*\)"
+)
+
+
+def _strip_cpp_casts(expr: str) -> str:
+    """Drop C-style scalar casts and static_cast wrappers for numeric folding."""
+    cleaned = expr
+    for _ in range(4):
+        updated = re.sub(r"\bstatic_cast\s*<[^<>]+>\s*", "", cleaned)
+        updated = _CPP_CAST_RE.sub("", updated)
+        if updated == cleaned:
+            break
+        cleaned = updated
+    return cleaned
+
+
+def _rewrite_known_sizeof(expr: str) -> str:
+    """Replace sizeof(T) for known concrete C++ scalar types with byte widths."""
+    return re.sub(
+        r"\bsizeof\s*\(\s*([A-Za-z_]\w*)\s*\)",
+        lambda m: str(_CPP_DTYPE_BYTES[m.group(1)]) if m.group(1) in _CPP_DTYPE_BYTES else m.group(0),
+        expr,
+    )
+
+
 def _safe_eval_cpp_int(expr: str, env: Mapping[str, int]) -> int | None:
     cleaned = re.sub(r"\b(\d+)[uUlL]+\b", r"\1", str(expr or "").strip())
+    if not cleaned:
+        return None
+    cleaned = _strip_cpp_casts(_rewrite_known_sizeof(cleaned)).strip()
     if not cleaned:
         return None
     py_expr = _rewrite_cpp_ternary(_strip_outer_parens(cleaned))
@@ -1748,8 +1785,8 @@ def _template_bindings(
     return values, types
 
 
-def _resolve_cpp_consts(cpp_source: str) -> dict[str, int]:
-    """Fold constexpr and #define integers with template args, aliases, and sizeof widths."""
+def _resolve_cpp_consts_and_types(cpp_source: str) -> tuple[dict[str, int], dict[str, int]]:
+    """Fold constexpr and #define integers along with resolved template type byte widths."""
     stripped = strip_cpp_comments_and_strings(cpp_source)
     define_source = re.sub(r"\\\r?\n", " ", stripped)
     declarations = [
@@ -1779,7 +1816,12 @@ def _resolve_cpp_consts(cpp_source: str) -> dict[str, int]:
         type_bytes.update(types)
         if consts == previous:
             break
-    return consts
+    return consts, type_bytes
+
+
+def _resolve_cpp_consts(cpp_source: str) -> dict[str, int]:
+    """Fold constexpr and #define integers with template args, aliases, and sizeof widths."""
+    return _resolve_cpp_consts_and_types(cpp_source)[0]
 
 
 def _stage_multiplicity(
@@ -1938,6 +1980,102 @@ def _extract_call_args_at(masked_src: str, open_paren_idx: int) -> list[str]:
     return []
 
 
+def _resolve_dma_bound_consts(
+    masked_src: str, consts: Mapping[str, int]
+) -> dict[str, int]:
+    """Fold local tile clamp upper bounds such as `if (n_cur > BN) n_cur = BN;`."""
+    env = dict(consts)
+    for m in re.finditer(
+        r"\bif\s*\(\s*([A-Za-z_]\w*)\s*>\s*([^;{}()]+?)\s*\)\s*\1\s*=\s*([^;]+);",
+        masked_src,
+    ):
+        var_name = m.group(1)
+        if var_name in env:
+            continue
+        bound = _safe_eval_cpp_int(m.group(3), env)
+        if bound is not None and bound > 0:
+            env[var_name] = bound
+    return env
+
+
+def _resolve_l0c2gm_dst_elem_bytes(
+    fname: str,
+    args: Sequence[str],
+    masked_src: str,
+    call_pos: int,
+    consts: Mapping[str, int],
+    type_bytes: Mapping[str, int],
+) -> int:
+    """Infer destination element byte width for asc_copy_l0c2gm from type, pointer, or quant."""
+    low_fname = fname.lower()
+    if low_fname.endswith(("_s8", "_u8", "_i8", "_fp8")):
+        return 1
+    if low_fname.endswith(("_f16", "_bf16")):
+        return 2
+    if low_fname.endswith(("_f32", "_s32", "_i32")):
+        return 4
+
+    def _width_for_type_token(token: str) -> int | None:
+        if token in type_bytes:
+            return int(type_bytes[token])
+        if token in _CPP_DTYPE_BYTES:
+            return int(_CPP_DTYPE_BYTES[token])
+        low_tok = token.lower()
+        if "int8" in low_tok or "uint8" in low_tok or "fp8" in low_tok:
+            return 1
+        if "half" in low_tok or "bf16" in low_tok or "bfloat16" in low_tok or "fp16" in low_tok:
+            return 2
+        if "float" in low_tok or "int32" in low_tok or "uint32" in low_tok:
+            return 4
+        return None
+
+    dst_arg = args[0] if args else ""
+    cast_m = re.search(r"__gm__\s+(?:const\s+)?([A-Za-z_]\w*)\s*\*", dst_arg)
+    if cast_m is not None:
+        width = _width_for_type_token(cast_m.group(1))
+        if width is not None:
+            return width
+
+    stripped_dst = _strip_cpp_casts(dst_arg).strip()
+    ident_m = re.match(r"^[&(]*([A-Za-z_]\w*)\b", stripped_dst)
+    if ident_m is not None:
+        ptr_name = ident_m.group(1)
+        prefix_src = masked_src[:call_pos]
+        fn_starts = [
+            fm.start()
+            for fm in re.finditer(r"\b(?:template\s*<|__global__|__aicore__)\b", prefix_src)
+        ]
+        scope_src = prefix_src[fn_starts[-1] :] if fn_starts else prefix_src
+        decl_matches = list(
+            re.finditer(
+                rf"__gm__\s+(?:const\s+)?([A-Za-z_]\w*)\s*\*\s*{re.escape(ptr_name)}\b",
+                scope_src,
+            )
+        )
+        if not decl_matches and scope_src is not prefix_src:
+            decl_matches = list(
+                re.finditer(
+                    rf"__gm__\s+(?:const\s+)?([A-Za-z_]\w*)\s*\*\s*{re.escape(ptr_name)}\b",
+                    prefix_src,
+                )
+            )
+        if decl_matches:
+            width = _width_for_type_token(decl_matches[-1].group(1))
+            if width is not None:
+                return width
+
+    if len(args) >= 9:
+        q_arg = args[8].lower()
+        if any(tok in q_arg for tok in ("int8", "s8", "fp8", "e4m3", "e5m2")):
+            return 1
+        if any(tok in q_arg for tok in ("f16", "fp16", "bf16", "bfloat16", "half")):
+            return 2
+        q_val = _safe_eval_cpp_int(args[8], consts)
+        if q_val is not None:
+            return 4 if q_val == 0 else 2
+    return 4
+
+
 def _extract_trackb_dma_and_pipe_signals(
     cpp_source: str,
     consts: Mapping[str, int],
@@ -1954,11 +2092,14 @@ def _extract_trackb_dma_and_pipe_signals(
     ub_stages: int,
     l1_stages: int,
     case_ratios: CasePhysicsRatios | None,
+    type_bytes: Mapping[str, int] | None = None,
 ) -> dict[str, object]:
     """Extract deterministic physical ledger signals from reachable C++20 source."""
     masked = strip_cpp_comments_and_strings(cpp_source)
     lower = masked.lower()
     loop_spans = _extract_cpp_loop_spans(masked)
+    dma_consts = _resolve_dma_bound_consts(masked, consts)
+    resolved_types = dict(type_bytes) if type_bytes is not None else {}
 
     pipe_all_positions: set[int] = set()
     for b_start, b_end in loop_spans:
@@ -1982,36 +2123,39 @@ def _extract_trackb_dma_and_pipe_signals(
         args = _extract_call_args_at(masked, dm.end() - 1)
         if fname in ("asc_copy_gm2ub_align", "asc_copy_ub2gm_align"):
             if len(args) == 3:
-                sz = _safe_eval_cpp_int(args[2], consts)
+                sz = _safe_eval_cpp_int(args[2], dma_consts)
                 if sz is not None and sz > 0:
                     dma_bytes.append(sz)
                     contig_candidates.append(sz)
             elif len(args) >= 4:
-                nburst = _safe_eval_cpp_int(args[2], consts)
-                row_b = _safe_eval_cpp_int(args[3], consts)
+                nburst = _safe_eval_cpp_int(args[2], dma_consts)
+                row_b = _safe_eval_cpp_int(args[3], dma_consts)
                 if row_b is not None and row_b > 0:
                     contig_candidates.append(row_b)
                     total_b = row_b * nburst if (nburst is not None and nburst > 0) else row_b
                     dma_bytes.append(total_b)
         elif fname in ("asc_copy_gm2ub", "asc_copy_ub2gm") and len(args) >= 4:
-            nburst = _safe_eval_cpp_int(args[2], consts)
-            blen = _safe_eval_cpp_int(args[3], consts)
+            nburst = _safe_eval_cpp_int(args[2], dma_consts)
+            blen = _safe_eval_cpp_int(args[3], dma_consts)
             if blen is not None and blen > 0:
                 row_b = blen * 32
                 contig_candidates.append(row_b)
                 dma_bytes.append(row_b * nburst if (nburst is not None and nburst > 0) else row_b)
         elif fname.startswith("asc_copy_gm2l1") and len(args) >= 6:
-            rows = _safe_eval_cpp_int(args[4], consts)
-            cols = _safe_eval_cpp_int(args[5], consts)
+            rows = _safe_eval_cpp_int(args[4], dma_consts)
+            cols = _safe_eval_cpp_int(args[5], dma_consts)
             if cols is not None and cols > 0:
                 row_b = cols * 2
                 contig_candidates.append(row_b)
                 dma_bytes.append(row_b * rows if (rows is not None and rows > 0) else row_b)
         elif fname.startswith("asc_copy_l0c2gm") and len(args) >= 4:
-            rows = _safe_eval_cpp_int(args[2], consts)
-            cols = _safe_eval_cpp_int(args[3], consts)
+            cols = _safe_eval_cpp_int(args[2], dma_consts)
+            rows = _safe_eval_cpp_int(args[3], dma_consts)
             if cols is not None and cols > 0:
-                row_b = cols * 2
+                elem_b = _resolve_l0c2gm_dst_elem_bytes(
+                    fname, args, masked, dm.start(), dma_consts, resolved_types
+                )
+                row_b = cols * elem_b
                 contig_candidates.append(row_b)
                 dma_bytes.append(row_b * rows if (rows is not None and rows > 0) else row_b)
 
@@ -2154,7 +2298,7 @@ def _build_ascendc_static_ledger(
     facts = ascend_space_facts(resolved_target)
     lower = cpp_source.lower()
 
-    consts = _resolve_cpp_consts(cpp_source)
+    consts, type_bytes = _resolve_cpp_consts_and_types(cpp_source)
 
     ub_offsets: list[tuple[str, int, int]] = []
     l1_offsets: list[tuple[str, int, int]] = []
@@ -2371,6 +2515,7 @@ def _build_ascendc_static_ledger(
         ub_stages=ub_stages,
         l1_stages=l1_stages,
         case_ratios=case_ratios,
+        type_bytes=type_bytes,
     )
 
     pipe_cycles: dict[str, int] = {}
@@ -3302,21 +3447,32 @@ def build_stage_b_driver_source(
         "                str(_fn), encoding='utf-8'\n"
         "            )\n"
         "        with _ascend_compile_session(_merged_pc):\n"
-        "            _pre_art = tilelang.lower(\n"
-        "                _fn, target='ascend', enable_device_compile=False\n"
-        "            )\n"
+        "            try:\n"
+        "                _art = tilelang.lower(\n"
+        "                    _fn, target='ascend', enable_device_compile=True\n"
+        "                )\n"
+        "            except Exception:\n"
+        "                try:\n"
+        "                    _pre_art = tilelang.lower(\n"
+        "                        _fn, target='ascend', enable_device_compile=False\n"
+        "                    )\n"
+        "                    if _cfg.get('tir_dump_path'):\n"
+        "                        _tir_txt = str(getattr(_pre_art, 'device_mod', None) or _fn)\n"
+        "                        pathlib.Path(_cfg['tir_dump_path']).write_text(\n"
+        "                            _tir_txt, encoding='utf-8'\n"
+        "                        )\n"
+        "                    if _cfg.get('kernel_dump_path') and getattr(_pre_art, 'kernel_source', None):\n"
+        "                        pathlib.Path(_cfg['kernel_dump_path']).write_text(\n"
+        "                            str(_pre_art.kernel_source), encoding='utf-8'\n"
+        "                        )\n"
+        "                except Exception:\n"
+        "                    pass\n"
+        "                raise\n"
         "            if _cfg.get('tir_dump_path'):\n"
-        "                _tir_txt = str(getattr(_pre_art, 'device_mod', None) or _fn)\n"
+        "                _tir_txt = str(getattr(_art, 'device_mod', None) or _fn)\n"
         "                pathlib.Path(_cfg['tir_dump_path']).write_text(\n"
         "                    _tir_txt, encoding='utf-8'\n"
         "                )\n"
-        "            if _cfg.get('kernel_dump_path') and getattr(_pre_art, 'kernel_source', None):\n"
-        "                pathlib.Path(_cfg['kernel_dump_path']).write_text(\n"
-        "                    str(_pre_art.kernel_source), encoding='utf-8'\n"
-        "                )\n"
-        "            _art = tilelang.lower(\n"
-        "                _fn, target='ascend', enable_device_compile=True\n"
-        "            )\n"
         "        assert _art.kernel_source\n"
         "        if _cfg.get('kernel_dump_path'):\n"
         "            pathlib.Path(_cfg['kernel_dump_path']).write_text(\n"
@@ -3711,20 +3867,11 @@ _TRANSFER_CALL_SPECS: dict[str, tuple[str, int, int, str]] = {
     "gm_to_ub": ("asc_copy_gm2ub", 2, 3, "bytes"),
     "l1_to_l0a": ("asc_copy_l12l0a", 4, 5, "elem"),
     "l1_to_l0b": ("asc_copy_l12l0b", 4, 5, "elem"),
-    "l0c_to_ub": ("asc_copy_l0c2ub", 2, 3, "float"),
-    "l0c_to_l1": ("asc_copy_l0c2l1", 2, 3, "float"),
-    "l0c_to_gm": ("asc_copy_l0c2gm", 2, 3, "float"),
+    "l0c_to_ub": ("asc_copy_l0c2ub", 3, 2, "float"),
+    "l0c_to_l1": ("asc_copy_l0c2l1", 3, 2, "float"),
+    "l0c_to_gm": ("asc_copy_l0c2gm", 3, 2, "float"),
     "ub_to_gm": ("asc_copy_ub2gm", 2, 3, "bytes"),
 }
-
-
-def _strip_cpp_casts(expr: str) -> str:
-    """Drop C-style scalar casts so call arguments can be folded numerically."""
-    return re.sub(
-        r"\(\s*(?:u?int(?:8|16|32|64)_t|size_t|unsigned|int|float|double|half)\s*\)",
-        "",
-        expr,
-    )
 
 
 def _eval_call_arg(expr: str, consts: Mapping[str, int], elem_bytes: int) -> int | None:
@@ -3810,7 +3957,7 @@ def _median_payload(values: Sequence[int]) -> int:
 
 def _estimate_transfer_granularity(cpp_source: str) -> dict[str, int]:
     """Estimate per-instruction transfer bytes from copy-call operands or tile extents."""
-    consts = _resolve_cpp_consts(cpp_source)
+    consts, type_bytes = _resolve_cpp_consts_and_types(cpp_source)
     estimates: dict[str, int] = {}
     for route in _TRANSFER_ROUTES:
         source_payloads = _source_call_payloads(cpp_source, route, consts)
@@ -4026,6 +4173,7 @@ def run_stage_b_ascendc_compile(
                 passed=False,
                 error_message=f"stage_b_ascendc_compile_failed (rc={proc.returncode}): {detail}",
                 elapsed_sec=time.monotonic() - t0,
+                generated_cce=cpp_source,
                 spill_bytes=spill_bytes,
                 vloopv2_hit=vloopv2_hit,
                 compiler_summary=summary,
@@ -4049,6 +4197,7 @@ def run_stage_b_ascendc_compile(
                 passed=False,
                 error_message=inst_err,
                 elapsed_sec=time.monotonic() - t0,
+                generated_cce=cpp_source,
                 spill_bytes=spill_bytes,
                 vloopv2_hit=vloopv2_hit,
                 compiler_summary=summary,
