@@ -2075,6 +2075,43 @@ def build_cost_features_from_ledger(
         existing_val = float(extra_signals.get("scalar_compute_loop_fallback", 0.0) or 0.0)
         extra_signals["scalar_compute_loop_fallback"] = max(existing_val, float(ub_loops))
 
+    min_gm_dma = int(_read_attr_or_key(ledger, "min_gm_dma_bytes", 0) or 0)
+    if 0 < min_gm_dma < 32:
+        existing_dcache = float(extra_signals.get("dcache_bypass_narrow_store", 0.0) or 0.0)
+        extra_signals["dcache_bypass_narrow_store"] = max(
+            existing_dcache,
+            32.0 / float(min_gm_dma),
+        )
+
+    ub_bank_risk = float(_read_attr_or_key(ledger, "ub_bank_conflict_risk", 0.0) or 0.0)
+    if ub_bank_risk > 0.0:
+        existing_ub_conflict = float(merged.get("ub_bank_conflict_ratio", 0.0) or 0.0)
+        merged["ub_bank_conflict_ratio"] = max(
+            existing_ub_conflict,
+            min(1.0, ub_bank_risk),
+        )
+
+    l1_bank_risk = float(_read_attr_or_key(ledger, "l1_bank_conflict_risk", 0.0) or 0.0)
+    if l1_bank_risk > 0.0 and not bool(policy.get("l1_half_bank_split", False)):
+        merged["l1_half_bank_split"] = False
+        merged["l1_stages"] = max(2, int(merged.get("l1_stages", 1) or 1))
+
+    unaligned_pad = int(_read_attr_or_key(ledger, "unaligned_dma_padding_bytes", 0) or 0)
+    if unaligned_pad > 0:
+        merged["has_unaligned_tail"] = True
+
+    active_blocks = int(_read_attr_or_key(ledger, "active_grid_blocks", 0) or 0)
+    if active_blocks > 0:
+        is_coupled = eff_axes is not None and eff_axes.compute_engine == "coupled_1c2v"
+        if int(policy.get("active_aic_cores") or 0) <= 0:
+            merged["active_aic_cores"] = min(max(1, int(facts.num_aic_cores)), active_blocks)
+        if int(policy.get("active_aiv_cores") or 0) <= 0:
+            aiv_cap = max(1, int(facts.num_aiv_cores))
+            merged["active_aiv_cores"] = min(
+                aiv_cap,
+                active_blocks * 2 if is_coupled else active_blocks,
+            )
+
     merged.update(
         {
             "cube_flops": cube_flops,

@@ -573,7 +573,7 @@ def prescreen_live_ir_neighborhood(
     live_plan: object | None = None,
     blueprint: object | None = None,
     sil_advisory: object | None = None,
-    ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> str:
     """Run bounded Stage A live-IR dry-runs across aligned tile variants around center."""
     params, has_varkw = inspect_builder_tile_params(dsl_source, factory_name)
