@@ -38,6 +38,23 @@ _MARKDOWN_FENCE_LINE_RE = re.compile(r"^\s*```[A-Za-z0-9_+.-]*\s*$")
 _DEVICE_QUALIFIER_RE = re.compile(
     r"__(?:global|aicore|simd_vf|simt_vf|simd_callee|simt_callee)__\b"
 )
+_DIAG_FILE_LINE_RE = re.compile(
+    r"(?:\.(?:cce|cpp|cc|cu|h)|<source>|input):(\d+)(?::\d+)?:\s*(?:fatal\s+)?(?:error|warning):"
+)
+_DIAG_WORD_LINE_RE = re.compile(r"\bline\s+(\d+)\b")
+
+
+def extract_cpp_diagnostic_lines(diagnostic_text: str) -> tuple[int, ...]:
+    """Extract sorted unique positive 1-indexed line numbers from C++ diagnostics."""
+    if not diagnostic_text:
+        return ()
+    lines: set[int] = set()
+    for pat in (_DIAG_FILE_LINE_RE, _DIAG_WORD_LINE_RE):
+        for match in pat.finditer(diagnostic_text):
+            line_num = int(match.group(1))
+            if line_num > 0:
+                lines.add(line_num)
+    return tuple(sorted(lines))
 
 
 def strip_markdown_fence_lines(text: str) -> str:
@@ -63,6 +80,8 @@ class _CppUnit:
     start_char: int
     end_char: int
     line_count: int
+    start_line: int = 1
+    end_line: int = 1
 
 
 def strip_cpp_comments_and_strings(text: str) -> str:
@@ -214,6 +233,8 @@ def _split_cpp_units(cpp_source: str) -> tuple[list[str], list[_CppUnit]]:
                     start_char=start_char,
                     end_char=end_char,
                     line_count=(j - start_i + 1),
+                    start_line=start_i + 1,
+                    end_line=j + 1,
                 )
             )
             i = j + 1
@@ -230,6 +251,8 @@ def _split_cpp_units(cpp_source: str) -> tuple[list[str], list[_CppUnit]]:
                     start_char=start_char,
                     end_char=end_char,
                     line_count=1,
+                    start_line=i + 1,
+                    end_line=i + 1,
                 )
             )
         i += 1
@@ -450,15 +473,57 @@ def resolve_instantiated_trackb_kernel(
     return None
 
 
-def _truncate_kernel_body(kernel_text: str, max_bytes: int) -> str:
+def _merge_line_spans(spans: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    ordered = sorted((s, e) for s, e in spans if s < e)
+    if not ordered:
+        return []
+    merged: list[tuple[int, int]] = [ordered[0]]
+    for start, end in ordered[1:]:
+        prev_start, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (prev_start, max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _render_line_spans(
+    lines: Sequence[str],
+    spans: Sequence[tuple[int, int]],
+    marker: str,
+) -> str:
+    if not spans:
+        return ""
+    chunks: list[str] = []
+    last_idx = len(spans) - 1
+    for idx, (start, end) in enumerate(spans):
+        seg = "".join(lines[start:end])
+        if idx < last_idx:
+            chunks.append(seg.rstrip("\r\n"))
+        else:
+            chunks.append(seg)
+    return marker.join(chunks)
+
+
+def _truncate_kernel_body(
+    kernel_text: str,
+    max_bytes: int,
+    *,
+    unit_start_line: int = 1,
+    focus_lines: Sequence[int] = (),
+    focus_window: int = 25,
+) -> str:
+    """Truncate a C++ body to *max_bytes* while optionally preserving focused line windows."""
     if len(kernel_text.encode("utf-8")) <= max_bytes:
         return kernel_text
     lines = kernel_text.splitlines(keepends=True)
     if len(lines) <= 20:
         encoded = kernel_text.encode("utf-8")[: max(128, max_bytes - 48)]
         return encoded.decode("utf-8", errors="ignore").rstrip() + "\n}"
-    marker = "\n    /* [MIDDLE BODY OMITTED TO FIT <15KB SCOPED VIEW; PATCH VISIBLE LINES] */\n"
-    budget = max(256, max_bytes - len(marker.encode("utf-8")))
+    middle_marker = (
+        "\n    /* [MIDDLE BODY OMITTED TO FIT <15KB SCOPED VIEW; PATCH VISIBLE LINES] */\n"
+    )
+    budget = max(256, max_bytes - len(middle_marker.encode("utf-8")))
     head_budget = budget // 2
     tail_budget = budget - head_budget
 
@@ -480,7 +545,109 @@ def _truncate_kernel_body(kernel_text: str, max_bytes: int) -> str:
         tail_lines.append(ln)
         used_tail += b
     tail_lines.reverse()
-    return "".join(head_lines).rstrip() + marker + "".join(tail_lines).lstrip("\n")
+
+    rel_indices = sorted(
+        {
+            int(ln) - int(unit_start_line)
+            for ln in focus_lines
+            if 0 <= int(ln) - int(unit_start_line) < len(lines)
+        }
+    )
+    omitted_start = len(head_lines)
+    omitted_end = len(lines) - len(tail_lines)
+    if not any(omitted_start <= rel < omitted_end for rel in rel_indices):
+        return "".join(head_lines).rstrip() + middle_marker + "".join(tail_lines).lstrip("\n")
+
+    focus_marker = "\n    /* [LINES OMITTED OUTSIDE FOCUS WINDOW; PATCH VISIBLE LINES] */\n"
+    total_lines = len(lines)
+    line_bytes = [len(ln.encode("utf-8")) for ln in lines]
+    win = max(0, int(focus_window))
+
+    def _pick_head(budget_limit: int, min_lines: int) -> int:
+        end = 0
+        acc = 0
+        while end < total_lines:
+            nb = acc + line_bytes[end]
+            if end >= min_lines and nb > budget_limit:
+                break
+            if end > 0 and nb > int(max_bytes * 0.35):
+                break
+            acc = nb
+            end += 1
+        return max(1, end)
+
+    def _pick_tail(budget_limit: int, min_lines: int, floor_idx: int) -> int:
+        start = total_lines
+        acc = 0
+        while start > floor_idx:
+            nb = acc + line_bytes[start - 1]
+            if (total_lines - start) >= min_lines and nb > budget_limit:
+                break
+            if start < total_lines and nb > int(max_bytes * 0.25):
+                break
+            acc = nb
+            start -= 1
+        return min(total_lines - 1, start) if total_lines > floor_idx else floor_idx
+
+    min_head = min(6, total_lines)
+    head_end = _pick_head(int(max_bytes * 0.20), min_head)
+    min_tail = min(4, max(0, total_lines - head_end))
+    tail_start = _pick_tail(int(max_bytes * 0.15), min_tail, head_end)
+
+    full_spans = _merge_line_spans(
+        [
+            (0, head_end),
+            *((max(0, rel - win), min(total_lines, rel + win + 1)) for rel in rel_indices),
+            (tail_start, total_lines),
+        ]
+    )
+    rendered = _render_line_spans(lines, full_spans, focus_marker)
+    if len(rendered.encode("utf-8")) <= max_bytes:
+        return rendered
+
+    head_end = min(head_end, min_head)
+    tail_start = max(tail_start, total_lines - min(4, max(0, total_lines - head_end)))
+    trimmed_spans = _merge_line_spans(
+        [
+            (0, head_end),
+            *((max(0, rel - win), min(total_lines, rel + win + 1)) for rel in rel_indices),
+            (tail_start, total_lines),
+        ]
+    )
+    rendered = _render_line_spans(lines, trimmed_spans, focus_marker)
+    if len(rendered.encode("utf-8")) <= max_bytes:
+        return rendered
+
+    best_rendered = ""
+    for r in range(win, -1, -1):
+        cand_spans = _merge_line_spans(
+            [
+                (0, head_end),
+                *((max(0, rel - r), min(total_lines, rel + r + 1)) for rel in rel_indices),
+                (tail_start, total_lines),
+            ]
+        )
+        cand = _render_line_spans(lines, cand_spans, focus_marker)
+        if len(cand.encode("utf-8")) <= max_bytes:
+            return cand
+        if r == 0:
+            best_rendered = cand
+
+    for h_lim, t_lim in ((2, 2), (1, 1)):
+        cand_spans = _merge_line_spans(
+            [
+                (0, min(h_lim, total_lines)),
+                *((rel, rel + 1) for rel in rel_indices),
+                (max(total_lines - t_lim, min(h_lim, total_lines)), total_lines),
+            ]
+        )
+        cand = _render_line_spans(lines, cand_spans, focus_marker)
+        if len(cand.encode("utf-8")) <= max_bytes:
+            return cand
+        best_rendered = cand
+
+    encoded = best_rendered.encode("utf-8")[: max(128, max_bytes - 48)]
+    return encoded.decode("utf-8", errors="ignore").rstrip() + "\n}"
 
 
 def build_trackb_context_view(
@@ -492,8 +659,15 @@ def build_trackb_context_view(
     trackb_symbol: str = "",
     launcher_preview: str = "",
     max_bytes: int = 14800,
+    focus_lines: Sequence[int] = (),
+    focus_window: int = 25,
+    diagnostic_text: str = "",
 ) -> str:
     """Build a bounded (<15 KB) scoped C++20 context view for Track-B editing."""
+    diag_lines = extract_cpp_diagnostic_lines(diagnostic_text) if diagnostic_text else ()
+    resolved_focus = tuple(
+        sorted({int(ln) for ln in (*focus_lines, *diag_lines) if int(ln) > 0})
+    )
     directives, units = _split_cpp_units(cpp_source)
     target_name = select_active_trackb_kernel(
         cpp_source,
@@ -567,12 +741,71 @@ def build_trackb_context_view(
                 body_parts.append(ref_full_text)
             body_parts.append(target_unit.text.strip())
         else:
-            ref_sum_text = "\n".join(ref_summaries)
+            focused_helpers = [
+                h
+                for h in ref_helpers
+                if any(h.start_line <= fl <= h.end_line for fl in resolved_focus)
+            ]
+            unfocused_ref_helpers = [h for h in ref_helpers if h not in focused_helpers]
+            ref_sum_text = "\n".join(
+                f"/* [HELPER SUMMARY] */ {h.signature};"
+                for h in unfocused_ref_helpers
+                if h.signature
+            )
             if ref_sum_text:
                 body_parts.append(ref_sum_text)
-            used_now = len("\n\n".join(body_parts).encode("utf-8")) + len(footer.encode("utf-8")) + 64
-            remaining = max(1024, max_bytes - used_now)
-            body_parts.append(_truncate_kernel_body(target_unit.text.strip(), remaining))
+
+            target_has_focus = any(
+                target_unit.start_line <= fl <= target_unit.end_line for fl in resolved_focus
+            )
+            if focused_helpers:
+                fixed_bytes = (
+                    len("\n\n".join(p for p in body_parts if p).encode("utf-8"))
+                    + (len(("\n\n" + footer).encode("utf-8")) if footer else 0)
+                    + 16
+                )
+                avail_code = max(512, max_bytes - fixed_bytes)
+                helper_cap = max(
+                    256,
+                    int(avail_code * (0.45 if target_has_focus else 0.65)),
+                )
+                raw_focused = [h.text.strip() for h in focused_helpers if h.text.strip()]
+                raw_focused_bytes = sum(len(t.encode("utf-8")) for t in raw_focused)
+                if raw_focused_bytes + 4 * len(raw_focused) <= helper_cap:
+                    body_parts.extend(raw_focused)
+                else:
+                    per_helper_budget = max(
+                        256,
+                        (helper_cap - 4 * len(focused_helpers)) // len(focused_helpers),
+                    )
+                    for fh in focused_helpers:
+                        fh_text = fh.text.strip()
+                        if not fh_text:
+                            continue
+                        body_parts.append(
+                            _truncate_kernel_body(
+                                fh_text,
+                                per_helper_budget,
+                                unit_start_line=fh.start_line,
+                                focus_lines=resolved_focus,
+                                focus_window=focus_window,
+                            )
+                        )
+
+            used_parts = [p for p in body_parts if p]
+            if footer:
+                used_parts.append(footer)
+            used_now = len("\n\n".join(used_parts).encode("utf-8")) + 4
+            remaining = max(256, max_bytes - used_now)
+            body_parts.append(
+                _truncate_kernel_body(
+                    target_unit.text.strip(),
+                    remaining,
+                    unit_start_line=target_unit.start_line,
+                    focus_lines=resolved_focus,
+                    focus_window=focus_window,
+                )
+            )
     elif ref_helpers:
         body_parts.append("\n".join(ref_summaries))
 
@@ -907,6 +1140,7 @@ __all__ = [
     "apply_scoped_trackb_patch",
     "build_trackb_context_view",
     "escalate_primfunc_to_trackb_tu",
+    "extract_cpp_diagnostic_lines",
     "extract_reachable_trackb_source",
     "extract_trackb_launcher_preview",
     "parse_scoped_search_replace_blocks",

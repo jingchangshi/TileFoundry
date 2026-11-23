@@ -29,6 +29,7 @@ from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     apply_scoped_trackb_patch,
     build_trackb_context_view,
     escalate_primfunc_to_trackb_tu,
+    extract_cpp_diagnostic_lines,
     extract_reachable_trackb_source,
     parse_scoped_search_replace_blocks,
     resolve_instantiated_trackb_kernel,
@@ -36,8 +37,10 @@ from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     splice_cpp_units_into_tu,
 )
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    StageBResult,
     _resolve_agent_gates_bin,
     _resolve_prim_func_from_dsl,
+    build_stage_b_driver_source,
     evaluate_ascendc_candidate,
 )
 from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios, ConstraintRelaxationMask
@@ -1044,3 +1047,104 @@ def test_markdown_fence_stripping_and_agent_gates_relative_resolution(
     monkeypatch.setattr("shutil.which", lambda _name: None)
     monkeypatch.setenv("TILEFOUNDRY_NPU_ENV_FILE", str(env_file))
     assert _resolve_agent_gates_bin() == str(ag_bin)
+
+
+def test_build_trackb_context_view_preserves_diagnostic_focus_window_and_helper() -> None:
+    """Preserve middle-line focus windows and focused helpers within max_bytes."""
+    assert extract_cpp_diagnostic_lines(
+        "kernel.cce:210:17: error: bad op\n"
+        "<source>:45: fatal error: missing\n"
+        "input:12:3: warning: unused\n"
+        "failed at line 305\n"
+    ) == (12, 45, 210, 305)
+
+    header = ["#include <tl_templates/ascend/common.h>", ""]
+    body = [
+        'extern "C" __global__ __vector__ void big_focus_kernel(__gm__ float* x, __gm__ float* out) {'
+    ]
+    for idx in range(1, 410):
+        body.append(
+            f"    float v_{idx:03d} = x[{idx}] + 0.125f * (float){idx}; /* pad_{idx:03d}_payload */"
+        )
+    body.append("    out[0] = v_409;")
+    body.append("}")
+    cpp_lines = header + body
+    cpp_source = "\n".join(cpp_lines) + "\n"
+    assert len(cpp_source.encode("utf-8")) > 20480
+
+    view = build_trackb_context_view(
+        cpp_source,
+        active_kernel="big_focus_kernel",
+        max_bytes=12000,
+        diagnostic_text="kernel.cce:210:17: error: invalid vector operand",
+    )
+    assert len(view.encode("utf-8")) <= 12000
+    assert "LINES OMITTED OUTSIDE FOCUS WINDOW" in view
+    assert "extern \"C\" __global__ __vector__ void big_focus_kernel" in view
+    assert "out[0] = v_409;" in view
+    for lineno in range(185, 236):
+        assert cpp_lines[lineno - 1] in view
+
+    helper_lines = [
+        "#include <tl_templates/ascend/common.h>",
+        "__simd_vf__ inline void focused_helper(__ubuf__ float* u) {",
+    ]
+    for h_idx in range(1, 20):
+        helper_lines.append(f"    u[{h_idx}] = u[{h_idx}] + 1.0f; /* helper_step_{h_idx:02d} */")
+    helper_lines.append("}")
+    focus_helper_line = 12
+    assert "helper_step_" in helper_lines[focus_helper_line - 1]
+    big_caller = [
+        'extern "C" __global__ __vector__ void big_caller(__gm__ float* x, __ubuf__ float* u) {',
+        "    focused_helper(u);",
+    ]
+    for idx in range(1, 360):
+        big_caller.append(
+            f"    float k_{idx:03d} = x[{idx}] * 2.0f + (float){idx}; /* caller_pad_{idx:03d} */"
+        )
+    big_caller.append("}")
+    helper_cpp = "\n".join(helper_lines + big_caller) + "\n"
+    assert len(helper_cpp.encode("utf-8")) > 16384
+
+    helper_view = build_trackb_context_view(
+        helper_cpp,
+        active_kernel="big_caller",
+        max_bytes=10000,
+        diagnostic_text=f"kernel.cce:{focus_helper_line}:5: error: helper op mismatch",
+    )
+    assert len(helper_view.encode("utf-8")) <= 10000
+    assert "/* [HELPER SUMMARY] */" not in helper_view
+    assert helper_lines[focus_helper_line - 1] in helper_view
+
+
+def test_evaluate_ascendc_candidate_accepts_templated_ascend_gemm_l1() -> None:
+    """Accept templated ascend_gemm_l1 calls under require_cube_engine and record AIC.PIPE_M."""
+    cpp = (
+        "#include <tl_templates/ascend/common.h>\n"
+        'extern "C" __global__ __aicore__ void cube_shell_kernel(\n'
+        "    __gm__ half* a, __gm__ half* b, __gm__ float* c\n"
+        ") {\n"
+        "    __cbuf__ half* l1_a = (__cbuf__ half*)0;\n"
+        "    __cbuf__ half* l1_b = (__cbuf__ half*)32768;\n"
+        "    __cc__ float* l0c = (__cc__ float*)0;\n"
+        "    asc_copy_gm2l1(l1_a, a, 128, 32);\n"
+        "    asc_copy_gm2l1(l1_b, b, 32, 64);\n"
+        "    ascend_gemm_l1<128, 64, 128, 32, false, half, float>(l1_a, l1_b, l0c, true);\n"
+        "    asc_copy_l0c2gm(c, l0c, 128, 64);\n"
+        "}\n"
+    )
+    res = evaluate_ascendc_candidate(
+        cpp,
+        freedom_mask=ConstraintRelaxationMask.top(),
+        require_cube_engine=True,
+    )
+    assert res.passed is True, res.error_message
+    assert res.ledger is not None
+    assert int(res.ledger.pipe_cycles.get("AIC.PIPE_M", 0)) > 0
+
+    sb = StageBResult(passed=False, generated_cce="cce", lowered_tir="tir")
+    assert sb.generated_cce == "cce"
+    assert sb.lowered_tir == "tir"
+    drv = build_stage_b_driver_source("/tmp/x.py", tir_dump_path="/tmp/lowered_tir.tir")
+    assert "tir_dump_path" in drv
+    assert "/tmp/lowered_tir.tir" in drv

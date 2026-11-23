@@ -75,6 +75,8 @@ class StageBResult:
     compiler_summary: BishengResourceSummary | None = None
     microarch_profile: dict[str, object] | None = None
     full_diagnostic: str = ""
+    generated_cce: str = ""
+    lowered_tir: str = ""
 
 
 @dataclass(frozen=True)
@@ -2083,7 +2085,12 @@ def _build_ascendc_static_ledger(
     mte2_src_cnt = len(re.findall(r"\basc_copy_gm2(?:ub|l1)\w*\s*\(", cpp_source))
     mte3_src_cnt = len(re.findall(r"\basc_copy_ub2gm\w*\s*\(", cpp_source))
     fix_src_cnt = len(re.findall(r"\basc_copy_l0c2\w*\s*\(", cpp_source))
-    mmad_src_cnt = len(re.findall(r"\basc_mmad(?:_mx)?\s*\(", cpp_source))
+    mmad_src_cnt = len(
+        re.findall(
+            r"\b(?:asc_mmad(?:_mx|_sparse)?|ascend_gemm_l1)\s*(?:<[^;{}()]*>)?\s*\(",
+            cpp_source,
+        )
+    )
     vf_src_cnt = len(re.findall(r"\b(?:simd_inst|Reg)::\w+\s*(?:<[^>]*>)?\s*\(", cpp_source))
 
     mte2_cnt = max(mte2_src_cnt, dis_counts["mte2"])
@@ -2202,7 +2209,12 @@ def evaluate_ascendc_candidate(
     errors = [*redline_errs, *facet_report.errors]
     masked_src = strip_cpp_comments_and_strings(reachable_cpp)
     if require_cube_engine:
-        mmad_hits = len(re.findall(r"\b(?:asc_mmad(?:_mx)?|ascend_gemm_l1)\s*\(", masked_src))
+        mmad_hits = len(
+            re.findall(
+                r"\b(?:asc_mmad(?:_mx|_sparse)?|ascend_gemm_l1)\s*(?:<[^;{}()]*>)?\s*\(",
+                masked_src,
+            )
+        )
         if mmad_hits == 0 and int(ledger.pipe_cycles.get("AIC.PIPE_M", 0)) == 0:
             errors.append(
                 "missing_cube_engine_primitives: matmul/attention kernel contains zero "
@@ -2870,6 +2882,7 @@ def build_stage_b_driver_source(
     dims: Mapping[str, object] | None = None,
     enable_device_compile: bool = True,
     kernel_dump_path: str | Path | None = None,
+    tir_dump_path: str | Path | None = None,
 ) -> str:
     """Build standalone Python driver lowering and device-compiling a candidate DSL file."""
     if not enable_device_compile:
@@ -2885,6 +2898,7 @@ def build_stage_b_driver_source(
             "pass_configs": ext_pc,
             "compile_flags": ext_cf,
             "kernel_dump_path": str(kernel_dump_path) if kernel_dump_path is not None else None,
+            "tir_dump_path": str(tir_dump_path) if tir_dump_path is not None else None,
         }
     )
     return (
@@ -2996,6 +3010,10 @@ def build_stage_b_driver_source(
         "        _absorb_flags(['--cce-res-usage'])\n"
         "        if _merged_cf:\n"
         "            _merged_pc['tl.device_compile_flags'] = list(_merged_cf)\n"
+        "        if _cfg.get('tir_dump_path'):\n"
+        "            pathlib.Path(_cfg['tir_dump_path']).write_text(\n"
+        "                str(_fn), encoding='utf-8'\n"
+        "            )\n"
         "        with _ascend_compile_session(_merged_pc):\n"
         "            _art = tilelang.lower(\n"
         "                _fn, target='ascend', enable_device_compile=True\n"
@@ -3034,6 +3052,7 @@ def run_stage_b_compile(
         cand_path = Path(tmp_dir) / "candidate_dsl.py"
         cand_path.write_text(dsl_source, encoding="utf-8")
         kernel_dump_path = Path(tmp_dir) / "lowered_kernel.cce"
+        tir_dump_path = Path(tmp_dir) / "lowered_tir.tir"
         driver = build_stage_b_driver_source(
             cand_path,
             factory_name=factory_name,
@@ -3043,6 +3062,7 @@ def run_stage_b_compile(
             compile_flags=compile_flags,
             dims=dims,
             kernel_dump_path=kernel_dump_path,
+            tir_dump_path=tir_dump_path,
         )
         try:
             proc = subprocess.run(
@@ -3054,14 +3074,31 @@ def run_stage_b_compile(
                 timeout=timeout_sec,
             )
         except subprocess.TimeoutExpired:
+            lowered_dump = (
+                kernel_dump_path.read_text(encoding="utf-8", errors="ignore")
+                if kernel_dump_path.is_file()
+                else ""
+            )
+            lowered_tir_dump = (
+                tir_dump_path.read_text(encoding="utf-8", errors="ignore")
+                if tir_dump_path.is_file()
+                else ""
+            )
             return StageBResult(
                 passed=False,
                 error_message=f"stage_b_compile_timeout:{timeout_sec}s",
                 elapsed_sec=time.monotonic() - t0,
+                generated_cce=lowered_dump,
+                lowered_tir=lowered_tir_dump,
             )
         lowered_dump = (
             kernel_dump_path.read_text(encoding="utf-8", errors="ignore")
             if kernel_dump_path.is_file()
+            else ""
+        )
+        lowered_tir_dump = (
+            tir_dump_path.read_text(encoding="utf-8", errors="ignore")
+            if tir_dump_path.is_file()
             else ""
         )
     combined_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
@@ -3086,6 +3123,8 @@ def run_stage_b_compile(
             compiler_summary=summary,
             microarch_profile=ma_profile,
             full_diagnostic=raw_detail,
+            generated_cce=lowered_dump,
+            lowered_tir=lowered_tir_dump,
         )
     return StageBResult(
         passed=True,
@@ -3094,6 +3133,8 @@ def run_stage_b_compile(
         vloopv2_hit=vloopv2_hit,
         compiler_summary=summary,
         microarch_profile=ma_profile,
+        generated_cce=lowered_dump,
+        lowered_tir=lowered_tir_dump,
     )
 
 
@@ -4079,6 +4120,7 @@ class GateFunnel:
         backend_kind: str | None = None,
         freedom_mask: object | None = None,
         roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
+        ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
     ) -> FunnelEvaluation:
         """Run Stage A, Stage B, and Stage C sequentially with early rejection."""
         if backend_kind in ("ascendc", "ascendc_template"):
@@ -4100,6 +4142,7 @@ class GateFunnel:
                 dims=dims,
                 var_bindings=var_bindings,
                 enable_track_router=self._enable_track_router,
+                ordered_tensor_shapes=ordered_tensor_shapes,
             )
         if not stage_a.passed or stage_a.ledger is None:
             return FunnelEvaluation(
@@ -4227,6 +4270,7 @@ def prescreen_dsl_tile_kwargs(
     pass_configs: dict[str, object] | None = None,
     compile_flags: Sequence[str] | str | None = None,
     dims: Mapping[str, object] | None = None,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> tuple[dict[str, object], StageAResult]:
     """Run Stage A across tile kwargs and pick the lowest-cost legal configuration."""
     if not candidate_kwargs_list:
@@ -4245,6 +4289,7 @@ def prescreen_dsl_tile_kwargs(
             config_selector_name=config_selector_name,
             dims=dims,
             var_bindings=var_bindings,
+            ordered_tensor_shapes=ordered_tensor_shapes,
         )
         ledger = res.ledger
         if not res.passed or ledger is None:
