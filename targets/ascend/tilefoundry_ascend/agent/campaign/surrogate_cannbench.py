@@ -982,6 +982,52 @@ def _repair_timeout_message(error_message: str, is_transport: bool) -> str:
     return f"{error_message} [repair_timeout]" if is_transport else error_message
 
 
+def _extract_lowered_compiler_excerpt(
+    stage_b: StageBResult,
+    *,
+    window: int = 12,
+    max_chars: int = 2400,
+) -> str:
+    """Slice raw lowered CCE/TIR lines around reported :line: numbers or leading 24 lines."""
+    raw_source = str(
+        getattr(stage_b, "generated_cce", "") or getattr(stage_b, "lowered_tir", "") or ""
+    )
+    if not raw_source.strip():
+        return ""
+    lines = raw_source.splitlines()
+    if not lines:
+        return ""
+    line_nums: list[int] = []
+    for match in re.finditer(r":(\d+)(?::\d+)?\b", stage_b.error_message or ""):
+        ln = int(match.group(1))
+        if 1 <= ln <= len(lines):
+            line_nums.append(ln)
+    if line_nums:
+        merged_ranges: list[list[int]] = []
+        for ln in sorted(set(line_nums)):
+            start = max(1, ln - window)
+            end = min(len(lines), ln + window)
+            if merged_ranges and start <= merged_ranges[-1][1] + 1:
+                merged_ranges[-1][1] = max(merged_ranges[-1][1], end)
+            else:
+                merged_ranges.append([start, end])
+        excerpt_lines: list[str] = []
+        for idx, (start, end) in enumerate(merged_ranges):
+            if idx > 0:
+                excerpt_lines.append("...")
+            for ln in range(start, end + 1):
+                excerpt_lines.append(f"{ln}: {lines[ln - 1]}")
+        excerpt = "\n".join(excerpt_lines)
+    else:
+        limit = min(len(lines), 24)
+        excerpt = "\n".join(f"{ln}: {lines[ln - 1]}" for ln in range(1, limit + 1))
+    if len(excerpt) > max_chars:
+        trunc_marker = "\n/* ... lowered excerpt truncated ... */"
+        keep_len = max(0, max_chars - len(trunc_marker))
+        return excerpt[:keep_len].rstrip() + trunc_marker
+    return excerpt
+
+
 async def run_l0_l1_round_filter(
     candidates: Sequence[tuple[str, str]],
     *,
@@ -1010,7 +1056,12 @@ async def run_l0_l1_round_filter(
     """Filter candidate snippets through L0 static, optional CostModel prescreen, and L1 compile."""
     max_attempts = max(0, max_syntax_repairs)
 
-    async def _try_repair(cur_src: str, diag: str) -> tuple[str | None, str, bool]:
+    async def _try_repair(
+        cur_src: str,
+        diag: str,
+        *,
+        lowered_excerpt: str = "",
+    ) -> tuple[str | None, str, bool]:
         assert repair_backend is not None
         req = build_syntax_repair_request(
             cur_src,
@@ -1023,6 +1074,7 @@ async def run_l0_l1_round_filter(
             freedom_mask=freedom_mask,
             vector_mode=vector_mode,
             ub_256kb_unlock=ub_256kb_unlock,
+            lowered_excerpt=lowered_excerpt,
         )
         try:
             raw_reply = await repair_backend.generate(req)
@@ -1168,7 +1220,12 @@ async def run_l0_l1_round_filter(
                     stage_b=stage_b,
                     error_message=err,
                 )
-            next_snippet, rep_err, is_transport = await _try_repair(cur_snippet, err)
+            lowered_excerpt = _extract_lowered_compiler_excerpt(stage_b)
+            next_snippet, rep_err, is_transport = await _try_repair(
+                cur_snippet,
+                err,
+                lowered_excerpt=lowered_excerpt,
+            )
             if next_snippet is None:
                 return L0L1CandidateCheck(
                     candidate_id=cand_id,

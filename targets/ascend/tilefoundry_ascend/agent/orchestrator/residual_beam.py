@@ -89,6 +89,8 @@ class StaticDynamicResidual:
     dcache_dcci_flushes: int = 0
     has_local_membar_in_vf_call: bool = False
     vloopv2_hit: bool = True
+    scalar_compute_loop_fallback: float = 0.0
+    dcache_bypass_narrow_store: float = 0.0
     observation: ObservationVector5D | None = None
     transfer_inflation_ratio: float = 0.0
     effective_compute_eta: float = 0.0
@@ -123,6 +125,8 @@ class StaticDynamicResidual:
             "dcache_dcci_flushes": self.dcache_dcci_flushes,
             "has_local_membar_in_vf_call": self.has_local_membar_in_vf_call,
             "vloopv2_hit": self.vloopv2_hit,
+            "scalar_compute_loop_fallback": self.scalar_compute_loop_fallback,
+            "dcache_bypass_narrow_store": self.dcache_bypass_narrow_store,
             "transfer_inflation_ratio": self.transfer_inflation_ratio,
             "effective_compute_eta": self.effective_compute_eta,
             "observation": (
@@ -149,6 +153,16 @@ class StaticDynamicResidual:
             observation.transfer_inflation_ratio if observation is not None else 0.0
         )
         default_eff_eta = observation.effective_compute_eta if observation is not None else 0.0
+        default_scalar_fallback = (
+            float(getattr(observation.compute_issue, "l1_scalar_compute_loop_fallback", 0.0) or 0.0)
+            if observation is not None
+            else 0.0
+        )
+        default_narrow_store = (
+            float(getattr(observation.offchip_dma, "l1_dcache_bypass_narrow_store", 0.0) or 0.0)
+            if observation is not None
+            else 0.0
+        )
         return cls(
             measured_latency_us=float(payload.get("measured_latency_us", 0.0)),
             predicted_bottleneck_util=float(payload.get("predicted_bottleneck_util", 0.0)),
@@ -171,6 +185,22 @@ class StaticDynamicResidual:
             dcache_dcci_flushes=max(0, int(payload.get("dcache_dcci_flushes", 0) or 0)),
             has_local_membar_in_vf_call=bool(payload.get("has_local_membar_in_vf_call", False)),
             vloopv2_hit=bool(payload.get("vloopv2_hit", True)),
+            scalar_compute_loop_fallback=max(
+                0.0,
+                _read_float(
+                    payload,
+                    "scalar_compute_loop_fallback",
+                    default=default_scalar_fallback,
+                ),
+            ),
+            dcache_bypass_narrow_store=max(
+                0.0,
+                _read_float(
+                    payload,
+                    "dcache_bypass_narrow_store",
+                    default=default_narrow_store,
+                ),
+            ),
             observation=observation,
             transfer_inflation_ratio=max(
                 0.0, _read_float(payload, "transfer_inflation_ratio", default=default_inflation)
@@ -302,6 +332,20 @@ def compute_static_dynamic_residual(
     else:
         vloopv2_hit = True
 
+    raw_extra = getattr(compiler_summary, "extra_signals", None)
+    extra_map = raw_extra if isinstance(raw_extra, Mapping) else {}
+    scalar_fallback = max(
+        0.0,
+        _read_float(telemetry, "scalar_compute_loop_fallback"),
+        _read_float(extra_map, "scalar_compute_loop_fallback"),
+        float(ledger.ub_scalar_compute_loops),
+    )
+    narrow_store = max(
+        0.0,
+        _read_float(telemetry, "dcache_bypass_narrow_store"),
+        _read_float(extra_map, "dcache_bypass_narrow_store"),
+    )
+
     observation = ObservationVector5D.from_tiers(
         ledger,
         compiler_summary=compiler_summary,
@@ -331,6 +375,8 @@ def compute_static_dynamic_residual(
         dcache_dcci_flushes=dcache_dcci_flushes,
         has_local_membar_in_vf_call=has_local_membar_in_vf_call,
         vloopv2_hit=vloopv2_hit,
+        scalar_compute_loop_fallback=round(scalar_fallback, 6),
+        dcache_bypass_narrow_store=round(narrow_store, 6),
         observation=observation,
         transfer_inflation_ratio=transfer_inflation_ratio,
         effective_compute_eta=observation.effective_compute_eta,
@@ -348,6 +394,15 @@ def compiler_summary_from_residual(
     observation = residual.observation
     if observation is None or not observation.has_l1_compiler_summary:
         return None
+    extra_signals: dict[str, float] = {}
+    if residual.scalar_compute_loop_fallback > 0.0:
+        extra_signals["scalar_compute_loop_fallback"] = float(
+            residual.scalar_compute_loop_fallback
+        )
+    if residual.dcache_bypass_narrow_store > 0.0:
+        extra_signals["dcache_bypass_narrow_store"] = float(
+            residual.dcache_bypass_narrow_store
+        )
     return BishengResourceSummary(
         vec_regs=observation.onchip_sram_reg.l1_vec_regs,
         scalar_regs=observation.onchip_sram_reg.l1_scalar_regs,
@@ -360,6 +415,7 @@ def compiler_summary_from_residual(
         alias_serialized_buffers=observation.pipeline_sync.l1_alias_serialized_buffers,
         dual_issue_ipc_collapse=observation.compute_issue.l1_dual_issue_collapse,
         dcache_dcci_flushes=observation.offchip_dma.l1_dcache_dcci_flushes,
+        extra_signals=extra_signals,
     )
 
 

@@ -180,6 +180,9 @@ _RULE_CONCEPT_DESCRIPTIONS: dict[str, str] = {
     "R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK": (
         "Register-resident loop accumulation and full 256 KiB UB unlock"
     ),
+    "R17_RMEM_ACCUMULATOR_HOIST": (
+        "Register-resident loop accumulation hoisting"
+    ),
     "R18_WAVE_QUANTIZED_BURST_TILING": (
         "Wave-quantized pure-vector tiling co-selected with HBM DMA burst curve"
     ),
@@ -207,6 +210,9 @@ _RULE_CONCEPT_DESCRIPTIONS: dict[str, str] = {
     "R26_SWAT_SNAKE_AND_TAIL_WAVE_SPLIT": (
         "SWAT serpentine tile swizzle (WINDOW_LEN=4) and tail-wave sub-tile / DPSK Stream-K rebalance"
     ),
+    "R26_UB_256KB_SPR_UNLOCK": (
+        "Full 256 KiB UB unlock via SPR / PURE_SIMDVF_UBUF_FLAGS"
+    ),
     "R27_L2_CACHE_BYPASS_SINGLE_USE": (
         "Bypass L2 allocation (CACHE_MODE_DISABLE) on single-use operands when M_tiles==1 or streaming KV"
     ),
@@ -216,6 +222,9 @@ _RULE_CONCEPT_DESCRIPTIONS: dict[str, str] = {
     "R29_W4_AIV_UNPACK_AND_FIXPIPE_SCALE_FOLD": (
         "AIV INT4/FP4 unpack via DIST_UNPACK4_B8 or bit-shift + FixPipe deq_scale=64 fold on dav-3510"
     ),
+    "R29_W4_AIV_SUBBYTE_UNPACK": (
+        "AIV INT4/FP4 sub-byte unpack via DIST_UNPACK4_B8 or bit-shift"
+    ),
     "R30_REGBASE_MX_QUANT_DATABLOCK": (
         "RegBase microscaling MXFP8/MXFP4 quant via DIST_DINTLV_B16, ReduceDataBlock<MAX>, and SetCtrlSpr"
     ),
@@ -224,6 +233,9 @@ _RULE_CONCEPT_DESCRIPTIONS: dict[str, str] = {
     ),
     "R32_GROUPED_ROLLING_CORE_AND_EMPTY_SKIP": (
         "Grouped MatMul rolling core assignment ((endBlockIdx+1)%coreNum) with m==0 empty-group fast skip"
+    ),
+    "R32_GROUPED_ROLLING_CORE_DISPATCH": (
+        "Grouped MatMul rolling core dispatch ((endBlockIdx+1)%coreNum)"
     ),
     "R33_PERSISTENT_STATE_RESIDENCY": (
         "Persistent on-chip UB/L1 FP32 state residency across chunks/iterations with initC=false accumulation"
@@ -263,6 +275,12 @@ _SIGNATURE_DESCRIPTIONS: dict[str, str] = {
 def _describe_rule_concept(rule: AscendCausalRule) -> str:
     if rule.rule_id in _RULE_CONCEPT_DESCRIPTIONS:
         return _RULE_CONCEPT_DESCRIPTIONS[rule.rule_id]
+    concept_or_rationale = (
+        str(getattr(rule, "concept_description", "") or "").strip()
+        or str(rule.rationale or "").strip()
+    )
+    if concept_or_rationale:
+        return concept_or_rationale
     lower_id = rule.rule_id.lower()
     if "dual_copy" in lower_id or "1c2v" in lower_id:
         return "1C2V row-splitting via dual_copy across paired AIV sub-cores"
@@ -807,6 +825,7 @@ def build_syntax_repair_request(
     ub_256kb_unlock: bool = False,
     topology_axes: TopologyAxes | None = None,
     case_ratios: CasePhysicsRatios | None = None,
+    lowered_excerpt: str = "",
 ) -> GenerationRequest:
     """Build bounded syntax/compile repair request routed to the active backend dialect."""
     hint_sentence = f" Authorized target: {slice_hint}." if slice_hint else ""
@@ -864,6 +883,19 @@ def build_syntax_repair_request(
         parent_block = (
             f"### PARENT AUTHORIZED SOURCE\n```{fence_lang}\n{bounded_parent}\n```\n\n"
         )
+    lowered_block = ""
+    stripped_lowered = lowered_excerpt.strip()
+    if not is_cpp and stripped_lowered:
+        if len(stripped_lowered) > 2400:
+            trunc_marker = "\n/* ... lowered excerpt truncated ... */"
+            keep_len = max(0, 2400 - len(trunc_marker))
+            bounded_excerpt = stripped_lowered[:keep_len].rstrip() + trunc_marker
+        else:
+            bounded_excerpt = stripped_lowered
+        lowered_block = (
+            f"### COMPILER LOWERED EXCERPT (READ-ONLY CONTEXT)\n"
+            f"```cpp\n{bounded_excerpt}\n```\n\n"
+        )
     user_prompt = (
         f"{layer1_text}\n\n"
         f"### VALID TARGET DIALECT PRIMITIVES ({surface.dialect_id})\n"
@@ -872,6 +904,7 @@ def build_syntax_repair_request(
         f"{sil_block}"
         f"{parent_block}"
         f"### COMPILER / GATE DIAGNOSTIC\n{error_message}\n\n"
+        f"{lowered_block}"
         f"### BROKEN KERNEL SOURCE\n```{fence_lang}\n{dsl_source}\n```\n"
     )
     return GenerationRequest(
@@ -895,7 +928,7 @@ class PortfolioRunner:
         k_rule_workers: int = 2,
         max_syntax_repairs: int = 1,
         enable_track_router: bool = False,
-        enable_tilesize_prescreen: bool = False,
+        enable_tilesize_prescreen: bool = True,
         cost_model: HybridAscendCostModel | None = None,
     ) -> None:
         self._backend = backend

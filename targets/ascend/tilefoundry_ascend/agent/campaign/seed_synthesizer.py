@@ -1379,7 +1379,14 @@ async def prepare_operator_seed_or_takeover(
             return True
         if attempt > base_attempts + max_extra_attempts:
             return False
-        if not attempt_stages or attempt_stages[-1] != "oracle":
+        if not attempt_stages:
+            return False
+        trailing_non_oracle = 0
+        for stage_name in reversed(attempt_stages):
+            if stage_name == "oracle":
+                break
+            trailing_non_oracle += 1
+        if trailing_non_oracle > 1:
             return False
         if len(oracle_error_history) < 2:
             return False
