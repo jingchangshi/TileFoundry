@@ -142,12 +142,13 @@ def _surrogate(
 
 
 def test_all_seed_rules_have_valid_symptom_family_and_anti_precondition(tmp_path: Path) -> None:
-    """Validate all 40 seed rules declare valid SymptomFamily values and anti_precondition ASTs."""
+    """Validate all 41 seed rules declare SymptomFamily, mechanism_tag, and anti_precondition."""
     rules = load_seed_rules()
-    assert len(rules) == 40
+    assert len(rules) == 41
     assert len(SymptomFamily) == 13
     assert set(SYMPTOM_FAMILY_TO_AXIS) == set(SymptomFamily)
     assert set(SYMPTOM_FAMILY_TO_FACETS) == set(SymptomFamily)
+    assert len({r.mechanism_tag for r in rules}) == 41
 
     base_mask = ConstraintRelaxationMask.bottom()
     for fam, facets in SYMPTOM_FAMILY_TO_FACETS.items():
@@ -159,12 +160,16 @@ def test_all_seed_rules_have_valid_symptom_family_and_anti_precondition(tmp_path
     covered_families: set[SymptomFamily] = set()
     for rule in rules:
         assert rule.symptom_family, f"{rule.rule_id} missing symptom_family"
+        assert rule.mechanism_tag, f"{rule.rule_id} missing mechanism_tag"
+        assert rule.concept_description, f"{rule.rule_id} missing concept_description"
         fam = SymptomFamily(rule.symptom_family)
         covered_families.add(fam)
         validate_rule_predicate(rule.anti_precondition)
         roundtrip = AscendCausalRule.from_dict(rule.to_dict())
         assert roundtrip.symptom_family == rule.symptom_family
         assert roundtrip.anti_precondition == rule.anti_precondition
+        assert roundtrip.mechanism_tag == rule.mechanism_tag
+        assert roundtrip.concept_description == rule.concept_description
     assert covered_families == set(SymptomFamily)
 
     with pytest.raises(ValueError, match="invalid symptom_family"):
@@ -405,7 +410,7 @@ def test_online_rulebook_frozen_by_default_and_opt_in_distilled_sync(tmp_path: P
     )
 
     frozen_tracker = BayesianRuleTracker.from_experience_lake(lake_dir)
-    assert len(frozen_tracker.rules) == 40
+    assert len(frozen_tracker.rules) == 41
     assert "R_UNREVIEWED_DISTILLED_01" not in frozen_tracker.rules
     assert frozen_tracker.posteriors["R01_DUAL_COPY_1C2V_SPLIT"].successes == 1
 

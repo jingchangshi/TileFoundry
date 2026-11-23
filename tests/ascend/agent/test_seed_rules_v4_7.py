@@ -1,4 +1,4 @@
-"""Tests for v4.7 seed rules (R01..R40), reachable UB scalar loop detection, and L2 PMU gating."""
+"""Tests for v4.8 MECE seed rules (R01..R41), UB scalar loop detection, and L2 PMU gating."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ from textwrap import dedent
 import pytest
 
 from tilefoundry_ascend.agent.kb import (
+    AscendCausalRule,
+    SymptomFamily,
     build_predicate_context,
     load_seed_rules,
     validate_rule_predicate,
@@ -20,23 +22,53 @@ from tilefoundry_ascend.ascend.cost_model import (
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     ObjectivePhysicalLedger,
     build_objective_physical_ledger,
+    build_scope_waterline,
 )
 
 
-def test_seed_rules_exact_40_clean_provenance_and_ast_validity() -> None:
-    """Verify exact 40 seed rules R01..R40, zero legacy provenance/910B, and AST validity."""
+def test_seed_rules_exact_41_mece_provenance_and_ast_validity() -> None:
+    """Verify 41 atomic rules R01..R41, CE over 13 families, unique mechanism tags, and ASTs."""
     rules = load_seed_rules()
-    assert len(rules) == 40
+    assert len(rules) == 41
     rule_ids = [r.rule_id for r in rules]
-    assert len(set(rule_ids)) == 40
+    assert len(set(rule_ids)) == 41
     for idx, rule_id in enumerate(rule_ids, start=1):
         assert rule_id.startswith(f"R{idx:02d}_")
 
     by_id = {r.rule_id: r for r in rules}
+    assert "R17_RMEM_ACCUMULATOR_HOIST" in by_id
+    assert "R26_UB_256KB_SPR_UNLOCK" in by_id
+    assert "R29_W4_AIV_SUBBYTE_UNPACK" in by_id
+    assert "R32_GROUPED_ROLLING_CORE_DISPATCH" in by_id
     assert "R34_SCALAR_LOOP_TO_VECTOR_DMA_PIPELINE" in by_id
     assert "R38_COALESCE_SUB32B_TAIL_DMA_STORE" in by_id
-    assert "R39_COUPLED_1C2V_FIXPIPE_L0C2UB_15ARG_PIPELINE" in by_id
+    assert "R39_FIXPIPE_DEQ_SCALE_FOLD" in by_id
     assert "R40_SIMTVF_FP32_WIDEN_BEFORE_SUBBYTE_QUANT" in by_id
+    assert "R41_EMPTY_GROUP_ZERO_TOKEN_SKIP" in by_id
+
+    r02 = by_id["R02_ONCHIP_L0C_TO_UB_DIRECT"]
+    assert "asc_copy_l0c2ub" in r02.cpp20_transform_template
+    assert "asc_set_l0c_copy_nz_para" in r02.cpp20_transform_template
+
+    covered_families = {SymptomFamily(r.symptom_family) for r in rules}
+    assert covered_families == set(SymptomFamily)
+    mechanism_tags = {r.mechanism_tag for r in rules}
+    assert len(mechanism_tags) == 41
+    assert all(tag.strip() for tag in mechanism_tags)
+    assert all(r.concept_description.strip() for r in rules)
+
+    default_rule = AscendCausalRule(
+        rule_id="R_CUSTOM_TEST",
+        regime_guard="is_legal",
+        precondition="PIPE_V > 0",
+        transform_template="Optimize vector pass.",
+        expected_postcondition="PIPE_V <= prev.PIPE_V",
+        source_provenance="ref:test",
+    )
+    assert default_rule.mechanism_tag == "r_custom_test"
+    reloaded = AscendCausalRule.from_dict(r02.to_dict())
+    assert reloaded.mechanism_tag == r02.mechanism_tag
+    assert reloaded.concept_description == r02.concept_description
 
     for rule in rules:
         assert rule.source_provenance != "ref:asc_devkit"
@@ -44,6 +76,8 @@ def test_seed_rules_exact_40_clean_provenance_and_ast_validity() -> None:
         combined_text = "\n".join(
             [
                 rule.rule_id,
+                rule.mechanism_tag,
+                rule.concept_description,
                 rule.regime_guard,
                 rule.precondition,
                 rule.anti_precondition,
@@ -59,6 +93,166 @@ def test_seed_rules_exact_40_clean_provenance_and_ast_validity() -> None:
         validate_rule_predicate(rule.precondition)
         validate_rule_predicate(rule.anti_precondition)
         validate_rule_predicate(rule.expected_postcondition)
+
+
+def test_all_41_rules_default_context_and_pairwise_me_matrix() -> None:
+    """Verify default eval safety and 0% collision across all 7 ME rule families/pairs."""
+    rules = {r.rule_id: r for r in load_seed_rules()}
+    minimal_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 16},
+        waterlines={},
+    )
+    default_ctx = build_predicate_context(minimal_ledger, prev_ledger=minimal_ledger)
+    assert "dcache_bypass_narrow_store" in default_ctx
+    assert "has_empty_group" in default_ctx
+    for rule in rules.values():
+        assert isinstance(rule.matches(default_ctx), bool)
+        assert isinstance(rule.postcondition_realized(default_ctx), bool)
+
+    def _ctx(
+        *,
+        pipes: dict[str, int] | None = None,
+        ii: int | None = 2,
+        waterlines: dict[str, object] | None = None,
+        extra: dict[str, object] | None = None,
+        **ledger_kw: object,
+    ) -> dict[str, object]:
+        ledger = build_objective_physical_ledger(
+            analysis_mode="readonly_envelope",
+            is_legal=True,
+            steady_state_ii=ii,
+            pipe_cycles=pipes or {"AIC.PIPE_M": 64, "AIV0.PIPE_V": 64},
+            waterlines=waterlines or {},
+            **ledger_kw,
+        )
+        return build_predicate_context(ledger, extra=extra)
+
+    ub_90 = build_scope_waterline(
+        scope="UB",
+        capacity_bytes=253952,
+        explicit_buffers={"x": 230000},
+        implicit_buffers={},
+    )
+    l1_ok = build_scope_waterline(
+        scope="L1",
+        capacity_bytes=524288,
+        explicit_buffers={"x": 160000},
+        implicit_buffers={},
+    )
+
+    me_groups: list[tuple[tuple[str, ...], list[dict[str, object]]]] = [
+        (
+            ("R10_BACKWARD_SYNC_CV_PINGPONG", "R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION"),
+            [
+                _ctx(pipes={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 64, "AIV0.PIPE_V": 40}, ii=4),
+                _ctx(pipes={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 64}, ii=4),
+            ],
+        ),
+        (
+            ("R13_SPLIT_KV_WAVE_RECOVERY", "R21_SUBROW_DEPTH_OR_WIDTH_CORE_SHARDING"),
+            [
+                _ctx(pipes={"AIC.PIPE_M": 64}, grid_blocks=4, wave_occupancy=0.14),
+                _ctx(pipes={"AIV0.PIPE_V": 64}, grid_blocks=2, wave_occupancy=2.0 / 56.0),
+                _ctx(pipes={"AIV0.PIPE_V": 64}, grid_blocks=1, wave_occupancy=1.0 / 56.0),
+            ],
+        ),
+        (
+            ("R17_RMEM_ACCUMULATOR_HOIST", "R26_UB_256KB_SPR_UNLOCK"),
+            [
+                _ctx(pipes={"AIV0.PIPE_V": 64}, waterlines={"UB": ub_90}, in_loop_ub_reload_stores=2),
+                _ctx(pipes={"AIV0.PIPE_V": 64}, waterlines={"UB": ub_90}, in_loop_ub_reload_stores=0),
+            ],
+        ),
+        (
+            (
+                "R24_VLOOPV2_LEGALIZATION_AND_DIRECT_VF",
+                "R30_REGBASE_MX_QUANT_DATABLOCK",
+                "R40_SIMTVF_FP32_WIDEN_BEFORE_SUBBYTE_QUANT",
+            ),
+            [
+                _ctx(
+                    pipes={"AIV0.PIPE_V": 64},
+                    has_lowbit_quant=False,
+                    in_loop_ub_reload_stores=2,
+                ),
+                _ctx(
+                    pipes={"AIV0.PIPE_V": 64},
+                    has_lowbit_quant=True,
+                    in_loop_ub_reload_stores=2,
+                ),
+                _ctx(
+                    pipes={"AIV0.PIPE_V": 64},
+                    has_lowbit_quant=True,
+                    opaque_dynamic_regions=("simt_vf",),
+                ),
+            ],
+        ),
+        (
+            ("R29_W4_AIV_SUBBYTE_UNPACK", "R39_FIXPIPE_DEQ_SCALE_FOLD"),
+            [
+                _ctx(
+                    pipes={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 64, "AIV0.PIPE_V": 64},
+                    has_lowbit_quant=True,
+                ),
+                _ctx(
+                    pipes={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 64, "AIV0.PIPE_V": 16},
+                    has_lowbit_quant=True,
+                ),
+            ],
+        ),
+        (
+            ("R32_GROUPED_ROLLING_CORE_DISPATCH", "R41_EMPTY_GROUP_ZERO_TOKEN_SKIP"),
+            [
+                _ctx(
+                    pipes={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 32},
+                    wave_occupancy=0.50,
+                    extra={"has_empty_group": False, "iteration_regularity": "ragged_group"},
+                ),
+                _ctx(
+                    pipes={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 32},
+                    wave_occupancy=0.50,
+                    extra={"has_empty_group": True, "iteration_regularity": "ragged_group"},
+                ),
+            ],
+        ),
+        (
+            ("R16_PADDED_PITCH_TAIL_MASKING", "R38_COALESCE_SUB32B_TAIL_DMA_STORE"),
+            [
+                _ctx(
+                    pipes={"AIV0.PIPE_V": 64, "AIV0.PIPE_MTE3": 32},
+                    unaligned_dma_padding_bytes=16,
+                    min_gm_dma_bytes=64,
+                ),
+                _ctx(
+                    pipes={"AIV0.PIPE_V": 64, "AIV0.PIPE_MTE3": 32},
+                    min_gm_dma_bytes=16,
+                ),
+                _ctx(
+                    pipes={"AIV0.PIPE_V": 64, "AIV0.PIPE_MTE3": 32},
+                    unaligned_dma_padding_bytes=16,
+                    extra={"dcache_bypass_narrow_store": 4.0},
+                ),
+            ],
+        ),
+    ]
+
+    for group_ids, probe_ctxs in me_groups:
+        fired: set[str] = set()
+        for probe_ctx in probe_ctxs:
+            matched = [rid for rid in group_ids if rules[rid].matches(probe_ctx)]
+            assert len(matched) <= 1, f"ME collision in {group_ids}: {matched}"
+            fired.update(matched)
+        assert fired == set(group_ids), f"Not all rules fired in {group_ids}: {fired}"
+
+    ctx_r28_ub_only = _ctx(
+        pipes={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 32},
+        waterlines={"L1": l1_ok, "UB": ub_90},
+        has_online_rescale_loop=True,
+    )
+    assert rules["R28_INPLACE_L1_SLOT_ALIASING"].matches(ctx_r28_ub_only) is False
 
 
 def test_reachable_ub_scalar_compute_loop_detector_and_dead_helper_isolation() -> None:

@@ -116,7 +116,7 @@ def test_capability_router_extracts_semantic_features_and_routes_tracks() -> Non
 
 
 def test_seed_rules_yaml_completeness_and_sanitization() -> None:
-    """Verify seed_rules.yaml loads R01..R17 with pure ledger predicates and sanitization."""
+    """Verify seed_rules.yaml loads R01..R41 with pure ledger predicates and sanitization."""
     yaml_text = default_seed_rules_path().read_text(encoding="utf-8")
     assert "/home/" not in yaml_text
     assert "/Users/" not in yaml_text
@@ -144,14 +144,17 @@ def test_seed_rules_yaml_completeness_and_sanitization() -> None:
     assert not re.search(r"\bmla\b", yaml_text.lower())
 
     rules = load_seed_rules()
-    assert len(rules) == 40
+    assert len(rules) == 41
     ids = {rule.rule_id for rule in rules}
-    for idx in range(1, 41):
+    for idx in range(1, 42):
         prefix = f"R{idx:02d}_"
         assert any(rid.startswith(prefix) for rid in ids)
+    assert len({rule.mechanism_tag for rule in rules}) == 41
+    assert all(rule.concept_description.strip() for rule in rules)
     for rule in rules:
         validate_rule_predicate(rule.regime_guard)
         validate_rule_predicate(rule.precondition)
+        validate_rule_predicate(rule.anti_precondition)
         validate_rule_predicate(rule.expected_postcondition)
 
 
@@ -634,7 +637,7 @@ def test_all_17_seed_rules_fire_with_features_none() -> None:
             _res(18.0),
         ),
         (
-            "R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK",
+            "R17_RMEM_ACCUMULATOR_HOIST",
             build_objective_physical_ledger(
                 analysis_mode="readonly_envelope",
                 is_legal=True,
@@ -971,6 +974,19 @@ def test_r16_preserves_simtvf_on_indirect_gather_and_r22_to_r33_fire() -> None:
         implicit_buffers={},
     )
 
+    ub_full_reserved = build_scope_waterline(
+        scope="UB",
+        capacity_bytes=253952,
+        explicit_buffers={"x": 230000},
+        implicit_buffers={},
+    )
+    ub_unlocked = build_scope_waterline(
+        scope="UB",
+        capacity_bytes=262144,
+        explicit_buffers={"x": 230000},
+        implicit_buffers={},
+    )
+
     def _mk_ledger(**kw):
         base = dict(
             analysis_mode="readonly_envelope",
@@ -1016,11 +1032,21 @@ def test_r16_preserves_simtvf_on_indirect_gather_and_r22_to_r33_fire() -> None:
             {"spill_bytes": 0},
         ),
         (
-            "R26_SWAT_SNAKE_AND_TAIL_WAVE_SPLIT",
-            _mk_ledger(grid_blocks=40, wave_occupancy=0.40),
-            _mk_ledger(grid_blocks=56, wave_occupancy=1.0),
-            {"l2_hit_rate": 0.55, "measured_mte2_wait_ratio": 0.30},
-            {"l2_hit_rate": 0.92, "measured_mte2_wait_ratio": 0.12},
+            "R26_UB_256KB_SPR_UNLOCK",
+            _mk_ledger(
+                pipe_cycles={"AIV0.PIPE_V": 64},
+                waterlines={"UB": ub_full_reserved},
+                uses_unreserved_ubuf=False,
+                in_loop_ub_reload_stores=0,
+            ),
+            _mk_ledger(
+                pipe_cycles={"AIV0.PIPE_V": 64},
+                waterlines={"UB": ub_unlocked},
+                uses_unreserved_ubuf=True,
+                in_loop_ub_reload_stores=0,
+            ),
+            {},
+            {},
         ),
         (
             "R27_L2_CACHE_BYPASS_SINGLE_USE",
@@ -1037,7 +1063,7 @@ def test_r16_preserves_simtvf_on_indirect_gather_and_r22_to_r33_fire() -> None:
             {},
         ),
         (
-            "R29_W4_AIV_UNPACK_AND_FIXPIPE_SCALE_FOLD",
+            "R29_W4_AIV_SUBBYTE_UNPACK",
             _mk_ledger(pipe_cycles={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 64}, has_lowbit_quant=True),
             _mk_ledger(pipe_cycles={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 32}, has_lowbit_quant=True),
             {},
@@ -1058,11 +1084,11 @@ def test_r16_preserves_simtvf_on_indirect_gather_and_r22_to_r33_fire() -> None:
             {"spill_bytes": 0, "measured_sync_stall_ratio": 0.05},
         ),
         (
-            "R32_GROUPED_ROLLING_CORE_AND_EMPTY_SKIP",
+            "R32_GROUPED_ROLLING_CORE_DISPATCH",
             _mk_ledger(wave_occupancy=0.45),
             _mk_ledger(wave_occupancy=0.95),
-            {"has_empty_group": True, "iteration_regularity": "ragged_group", "measured_sync_stall_ratio": 0.20},
-            {"has_empty_group": True, "iteration_regularity": "ragged_group", "measured_sync_stall_ratio": 0.05},
+            {"has_empty_group": False, "iteration_regularity": "ragged_group", "measured_sync_stall_ratio": 0.20},
+            {"has_empty_group": False, "iteration_regularity": "ragged_group", "measured_sync_stall_ratio": 0.05},
         ),
         (
             "R33_PERSISTENT_STATE_RESIDENCY",
@@ -1070,6 +1096,41 @@ def test_r16_preserves_simtvf_on_indirect_gather_and_r22_to_r33_fire() -> None:
             _mk_ledger(pipe_cycles={"AIV0.PIPE_V": 48, "AIV0.PIPE_MTE2": 16}, gm_roundtrip_bytes=0),
             {"has_loop_carried_state": True, "memory_ring": "persistent_onchip_state"},
             {"has_loop_carried_state": True, "memory_ring": "persistent_onchip_state"},
+        ),
+        (
+            "R39_FIXPIPE_DEQ_SCALE_FOLD",
+            _mk_ledger(
+                pipe_cycles={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 64, "AIV0.PIPE_V": 16},
+                has_lowbit_quant=True,
+            ),
+            _mk_ledger(
+                pipe_cycles={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 32, "AIV0.PIPE_V": 16},
+                has_lowbit_quant=True,
+            ),
+            {},
+            {},
+        ),
+        (
+            "R40_SIMTVF_FP32_WIDEN_BEFORE_SUBBYTE_QUANT",
+            _mk_ledger(
+                pipe_cycles={"AIV0.PIPE_V": 64},
+                has_lowbit_quant=True,
+                opaque_dynamic_regions=("simt_vf",),
+            ),
+            _mk_ledger(
+                pipe_cycles={"AIV0.PIPE_V": 48},
+                has_lowbit_quant=True,
+                opaque_dynamic_regions=("simt_vf",),
+            ),
+            {"spill_bytes": 16},
+            {"spill_bytes": 0},
+        ),
+        (
+            "R41_EMPTY_GROUP_ZERO_TOKEN_SKIP",
+            _mk_ledger(wave_occupancy=0.45),
+            _mk_ledger(wave_occupancy=0.95),
+            {"has_empty_group": True, "iteration_regularity": "ragged_group", "measured_sync_stall_ratio": 0.20},
+            {"has_empty_group": True, "iteration_regularity": "ragged_group", "measured_sync_stall_ratio": 0.05},
         ),
     ]
 
@@ -1409,8 +1470,27 @@ def test_dual_track_kb_backend_filtering_and_cpp20_rendering(tmp_path: Path) -> 
     tilelang_ids = {
         r.rule_id for r in tracker.rank_applicable_rules(ctx, runtime_backend="tilelang_dsl")
     }
-    assert "R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION" in tilelang_ids
     assert "R19_STATIC_PINGPONG_UNROLL_NO_ALIAS" in tilelang_ids
+
+    cube_only_ctx = build_predicate_context(
+        build_objective_physical_ledger(
+            analysis_mode="exact_modulo_z3",
+            is_legal=True,
+            steady_state_ii=4,
+            pipe_cycles={"AIC.PIPE_M": 64, "AIC.PIPE_FIX": 64},
+            waterlines={},
+        )
+    )
+    cube_tilelang_ids = {
+        r.rule_id
+        for r in tracker.rank_applicable_rules(cube_only_ctx, runtime_backend="tilelang_dsl")
+    }
+    cube_trackb_ids = {
+        r.rule_id
+        for r in tracker.rank_applicable_rules(cube_only_ctx, runtime_backend="ascendc_trackb")
+    }
+    assert "R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION" in cube_tilelang_ids
+    assert "R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION" not in cube_trackb_ids
 
     trackb_rules = tracker.rank_applicable_rules(ctx, runtime_backend="ascendc_trackb")
     trackb_ids = {r.rule_id for r in trackb_rules}
