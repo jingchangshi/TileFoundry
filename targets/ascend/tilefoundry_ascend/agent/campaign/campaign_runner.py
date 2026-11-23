@@ -242,7 +242,7 @@ class CampaignConfig:
     l4_retry_backoff_sec: float = 45.0
     warmup: int = 3
     repeat: int = 5
-    enable_tilesize_prescreen: bool = False
+    enable_tilesize_prescreen: bool = True
     cost_prescreen_top_k: int | None = None
     exploit_effort: str = "medium"
     round_regime_tags: tuple[str, ...] = ()
@@ -4127,6 +4127,8 @@ class PerfTargetCampaignRunner:
                 or residual.dual_issue_ipc_collapse > 0.0
                 or residual.dcache_dcci_flushes > 0
                 or bool(residual.has_local_membar_in_vf_call)
+                or residual.scalar_compute_loop_fallback > 0.0
+                or residual.dcache_bypass_narrow_store > 0.0
             )
         )
         p2_lines: list[str] = []
@@ -4216,6 +4218,8 @@ class PerfTargetCampaignRunner:
                     f"dual_issue_ipc_collapse: {residual.dual_issue_ipc_collapse:.4f}",
                     f"dcache_dcci_flushes: {residual.dcache_dcci_flushes}",
                     f"has_local_membar_in_vf_call: {residual.has_local_membar_in_vf_call}",
+                    f"scalar_compute_loop_fallback: {residual.scalar_compute_loop_fallback:.1f}",
+                    f"dcache_bypass_narrow_store: {residual.dcache_bypass_narrow_store:.1f}",
                 ]
             )
         if p2_lines:
@@ -8852,7 +8856,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--env-file", default=None, help="Path to tilefoundry-npu env.sh.")
     parser.add_argument(
         "--enable-tilesize-prescreen",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Enable tile-size prescreen guidance table in creative prompts.",
     )
     parser.add_argument(

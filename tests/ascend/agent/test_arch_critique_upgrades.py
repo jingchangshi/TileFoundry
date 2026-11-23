@@ -476,8 +476,8 @@ def test_mece_7_facet_freedom_lattice_and_composable_compute_slot() -> None:
 
 
 def test_tilesize_prescreen_default_off_per_dtype_half_l1_and_ablation_gate() -> None:
-    """Verify default-off enforcement, per-dtype Cube MACs/Half-L1 scoring, and ablation gate."""
-    assert CampaignConfig(operator_name="rms_norm").enable_tilesize_prescreen is False
+    """Verify default-on enforcement, per-dtype Cube MACs/Half-L1 scoring, and ablation gate."""
+    assert CampaignConfig(operator_name="rms_norm").enable_tilesize_prescreen is True
     assert (
         inspect.signature(MarathonConfig).parameters["enable_tilesize_prescreen"].default
         is True
@@ -486,7 +486,7 @@ def test_tilesize_prescreen_default_off_per_dtype_half_l1_and_ablation_gate() ->
         inspect.signature(PortfolioRunner.__init__)
         .parameters["enable_tilesize_prescreen"]
         .default
-        is False
+        is True
     )
 
     facts = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)

@@ -2233,7 +2233,6 @@ def _build_regime_a(tile_m=2):
         "R14_GQA_HEAD_M_FOLDING",
         "R15_ASYMMETRIC_1C2V_STAGE_FISSION",
         "R16_PADDED_PITCH_TAIL_MASKING",
-        "R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK",
         "R18_WAVE_QUANTIZED_BURST_TILING",
         "R19_STATIC_PINGPONG_UNROLL_NO_ALIAS",
         "R20_LOOP_FISSION_REDUCE_SFU_HIDING",
@@ -2241,6 +2240,7 @@ def _build_regime_a(tile_m=2):
     )
     for rid in expected_new_rules:
         assert rid in active_by_id
+    r17_id = next(rid for rid in active_by_id if rid.startswith("R17_"))
 
     led_r13 = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
@@ -2298,7 +2298,7 @@ def _build_regime_a(tile_m=2):
     )
     assert active_by_id["R15_ASYMMETRIC_1C2V_STAGE_FISSION"].matches(ctx_r15_r17)
     assert active_by_id["R16_PADDED_PITCH_TAIL_MASKING"].matches(ctx_r15_r17)
-    assert active_by_id["R17_RMEM_ACCUM_AND_256KB_UB_UNLOCK"].matches(ctx_r15_r17)
+    assert active_by_id[r17_id].matches(ctx_r15_r17)
 
     report = asyncio.run(runner.run(resume=False))
     assert report.total_rounds == 2
@@ -4527,13 +4527,13 @@ def test_wp_final4_pluggable_prescreen_cube_norm_stepping_stone_and_msprof_sync(
     )
 
     default_cfg = CampaignConfig(operator_name="mla")
-    assert default_cfg.enable_tilesize_prescreen is False
+    assert default_cfg.enable_tilesize_prescreen is True
     parsed_default = build_arg_parser().parse_args(["--operator", "mla"])
-    parsed_enabled = build_arg_parser().parse_args(
-        ["--operator", "mla", "--enable-tilesize-prescreen"]
+    parsed_disabled = build_arg_parser().parse_args(
+        ["--operator", "mla", "--no-enable-tilesize-prescreen"]
     )
-    assert parsed_default.enable_tilesize_prescreen is False
-    assert parsed_enabled.enable_tilesize_prescreen is True
+    assert parsed_default.enable_tilesize_prescreen is True
+    assert parsed_disabled.enable_tilesize_prescreen is False
 
     anchors = (AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 2.0),)
     regimes = (RegimeTargetSpec("regime_a", ("_build_regime_a",), {"bm": 64, "bn": 64, "bk": 64}),)
@@ -7056,3 +7056,138 @@ def test_resolve_campaign_device_plan_only_narrows_to_visible_cards() -> None:
             env_device_ids=("0", "2"),
             visible_device_ids=("3",),
         )
+
+
+def test_format_msprof_section_prints_stage6_compiler_hazards() -> None:
+    """Ensure Stage-6 scalar fallback and dcache bypass hazards print even when legacy 7 clean."""
+    from tilefoundry_ascend.agent.orchestrator.residual_beam import (  # noqa: PLC0415
+        StaticDynamicResidual,
+        compiler_summary_from_residual,
+        compute_static_dynamic_residual,
+    )
+
+    clean_residual = StaticDynamicResidual(
+        measured_latency_us=10.0,
+        predicted_bottleneck_util=0.9,
+        measured_aic_mac_ratio=0.0,
+        measured_aiv_vec_ratio=0.0,
+        measured_mte2_wait_ratio=0.0,
+        measured_sync_stall_ratio=0.0,
+        unexplained_gap_ratio=0.0,
+        vloopv2_hit=True,
+    )
+    assert PerfTargetCampaignRunner._format_msprof_section(clean_residual) == ""
+
+    hazard_residual = StaticDynamicResidual(
+        measured_latency_us=10.0,
+        predicted_bottleneck_util=0.9,
+        measured_aic_mac_ratio=0.0,
+        measured_aiv_vec_ratio=0.0,
+        measured_mte2_wait_ratio=0.0,
+        measured_sync_stall_ratio=0.0,
+        unexplained_gap_ratio=0.0,
+        vloopv2_hit=True,
+        scalar_compute_loop_fallback=2.0,
+        dcache_bypass_narrow_store=8.0,
+    )
+    rendered = PerfTargetCampaignRunner._format_msprof_section(hazard_residual)
+    assert "### HARDWARE MSPROF TELEMETRY" in rendered
+    assert "scalar_compute_loop_fallback: 2.0" in rendered
+    assert "dcache_bypass_narrow_store: 8.0" in rendered
+
+    ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=16,
+        pipe_cycles={"AIV0.PIPE_V": 16},
+        waterlines={},
+    )
+    summary = BishengResourceSummary(
+        vec_regs=16,
+        extra_signals={
+            "scalar_compute_loop_fallback": 3.0,
+            "dcache_bypass_narrow_store": 12.0,
+        },
+    )
+    computed = compute_static_dynamic_residual(
+        ledger,
+        {"dur_us": 10.0},
+        compiler_summary=summary,
+    )
+    assert computed.scalar_compute_loop_fallback == 3.0
+    assert computed.dcache_bypass_narrow_store == 12.0
+    roundtrip = StaticDynamicResidual.from_dict(computed.to_dict())
+    assert roundtrip.scalar_compute_loop_fallback == 3.0
+    assert roundtrip.dcache_bypass_narrow_store == 12.0
+    recovered = compiler_summary_from_residual(roundtrip)
+    assert recovered is not None
+    assert recovered.extra_signals["scalar_compute_loop_fallback"] == 3.0
+    assert recovered.extra_signals["dcache_bypass_narrow_store"] == 12.0
+
+
+def test_build_syntax_repair_request_lowered_excerpt_and_extractor() -> None:
+    """Verify bounded Track-A lowered excerpt placement and Track-B suppression."""
+    from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (  # noqa: PLC0415
+        _extract_lowered_compiler_excerpt,
+    )
+    from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (  # noqa: PLC0415
+        build_syntax_repair_request,
+    )
+
+    long_excerpt = "\n".join(f"int line_{i} = {i};" for i in range(400))
+    req = build_syntax_repair_request(
+        "def kernel():\n    pass\n",
+        "error at line 1",
+        lowered_excerpt=long_excerpt,
+    )
+    assert "### COMPILER LOWERED EXCERPT (READ-ONLY CONTEXT)" in req.user_prompt
+    excerpt_pos = req.user_prompt.index("### COMPILER LOWERED EXCERPT (READ-ONLY CONTEXT)")
+    broken_pos = req.user_prompt.index("### BROKEN KERNEL SOURCE")
+    assert excerpt_pos < broken_pos
+    section_body = req.user_prompt[excerpt_pos:broken_pos]
+    inner_code = section_body.split("```cpp\n", 1)[1].split("\n```", 1)[0]
+    assert len(inner_code) <= 2400
+
+    req_cpp = build_syntax_repair_request(
+        "__aicore__ void k() {}",
+        "error at line 1",
+        backend_kind="cce_cpp20",
+        lowered_excerpt="int x = 1;",
+    )
+    assert "### COMPILER LOWERED EXCERPT" not in req_cpp.user_prompt
+
+    class _DummyStageB:
+        passed = False
+        error_message = "kernel.cce:20:5: error: undeclared identifier"
+        generated_cce = "\n".join(f"stmt_{i};" for i in range(1, 51))
+        lowered_tir = ""
+
+    sliced = _extract_lowered_compiler_excerpt(_DummyStageB())
+    assert "8: stmt_8;" in sliced
+    assert "32: stmt_32;" in sliced
+    assert "7: stmt_7;" not in sliced
+    assert "33: stmt_33;" not in sliced
+
+
+def test_campaign_cli_prescreen_flags_and_top_k() -> None:
+    """Verify cli.py parses --no-enable-tilesize-prescreen and --cost-prescreen-top-k."""
+    from tilefoundry_ascend.agent.campaign.cli import (  # noqa: PLC0415
+        build_arg_parser as build_cli_parser,
+    )
+
+    parser = build_cli_parser()
+    defaults = parser.parse_args(["--operator", "rms_norm"])
+    assert defaults.enable_tilesize_prescreen is True
+    assert defaults.cost_prescreen_top_k is None
+
+    disabled = parser.parse_args(
+        [
+            "--operator",
+            "rms_norm",
+            "--no-enable-tilesize-prescreen",
+            "--cost-prescreen-top-k",
+            "3",
+        ]
+    )
+    assert disabled.enable_tilesize_prescreen is False
+    assert disabled.cost_prescreen_top_k == 3

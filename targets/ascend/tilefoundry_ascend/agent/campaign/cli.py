@@ -77,6 +77,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-file", default=None, help="Override target kernels.py path.")
     parser.add_argument("--campaign-kb", default=None, help="Optional YAML path for distilled rules.")
     parser.add_argument("--k-rule-workers", type=int, default=2)
+    parser.add_argument(
+        "--enable-tilesize-prescreen",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable tile-size prescreen guidance table in creative prompts.",
+    )
+    parser.add_argument(
+        "--cost-prescreen-top-k",
+        type=int,
+        default=None,
+        help="Keep only the top-K cost-model candidates during creative prescreen.",
+    )
     return parser
 
 
@@ -103,6 +115,10 @@ def main(argv: list[str] | None = None) -> int:
             k_rule_workers=int(args.k_rule_workers),
             run_final_l4=True if args.run_final_l4 else True,
             resume=True if args.resume else None,
+            enable_tilesize_prescreen=bool(args.enable_tilesize_prescreen),
+            cost_prescreen_top_k=(
+                int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
+            ),
             llm_backend=args.llm_backend,
             exploit_model=args.exploit_model,
             explore_model=args.explore_model,
@@ -140,6 +156,10 @@ def main(argv: list[str] | None = None) -> int:
         run_final_l4=bool(args.run_final_l4),
         device_id=primary_device_id,
         device_ids=tuple(device for device in device_pool if device != primary_device_id),
+        enable_tilesize_prescreen=bool(args.enable_tilesize_prescreen),
+        cost_prescreen_top_k=(
+            int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
+        ),
     )
     tracker = BayesianRuleTracker.from_seed_yaml()
     flywheel = FlywheelDistiller(

@@ -566,7 +566,7 @@ def test_campaign_runner_logs_all_tiers_and_keeps_prescreen_off(tmp_path: Path) 
     """
     assert MarathonConfig("level2/softmax").enable_tilesize_prescreen is True
     assert MarathonConfig("level2/softmax").cost_prescreen_top_k is None
-    assert CampaignConfig(operator_name="level2/softmax").enable_tilesize_prescreen is False
+    assert CampaignConfig(operator_name="level2/softmax").enable_tilesize_prescreen is True
     assert CampaignConfig(operator_name="level2/softmax").cost_prescreen_top_k is None
 
     mod_src = '''

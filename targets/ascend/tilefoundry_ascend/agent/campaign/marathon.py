@@ -431,6 +431,7 @@ def _run_stage0_track_a_gates(
     contract: GoldenEntrypointContract | None = None,
     semantics: PyTorchOpSemantics | None = None,
     enforce_hardware_engines: bool = True,
+    op_proto: Mapping[str, object] | None = None,
 ) -> tuple[bool, str, ObjectivePhysicalLedger | None]:
     contract_error = _stage0_entrypoint_contract_error(
         module_source,
@@ -460,6 +461,7 @@ def _run_stage0_track_a_gates(
     ordered_tensor_shapes = extract_ordered_tensor_shapes(
         case_entry=regime_spec.representative_case_entry,
         dims=dims,
+        proto=op_proto,
     )
     static = run_stage_a_static(
         module_source,
@@ -499,6 +501,7 @@ def _validate_stage0_track_a(
     env_file: Path | None,
     contract: GoldenEntrypointContract | None = None,
     semantics: PyTorchOpSemantics | None = None,
+    op_proto: Mapping[str, object] | None = None,
 ) -> tuple[bool, str]:
     """Run L0 static purity/waterline and L1 device compilation for a Track-A seed."""
     passed, err, _ = _run_stage0_track_a_gates(
@@ -510,6 +513,7 @@ def _validate_stage0_track_a(
         contract=contract,
         semantics=semantics,
         enforce_hardware_engines=True,
+        op_proto=op_proto,
     )
     return passed, err
 
@@ -648,6 +652,7 @@ def _validate_stage0_hybrid_track_b(
     env_file: Path | None,
     contract: GoldenEntrypointContract | None = None,
     semantics: PyTorchOpSemantics | None = None,
+    op_proto: Mapping[str, object] | None = None,
 ) -> tuple[bool, str]:
     """Validate hybrid Track-B TU and optional TileLang @T.prim_func builder."""
     has_prim = _has_prim_func_builder(module_source, regime_spec.builder_candidates)
@@ -674,6 +679,7 @@ def _validate_stage0_hybrid_track_b(
         contract=contract,
         semantics=semantics,
         enforce_hardware_engines=False,
+        op_proto=op_proto,
     )
     if not passed_ta:
         return False, error_ta
@@ -691,6 +697,7 @@ def build_stage0_static_validator(
     env_file: Path | None,
     entrypoint_contract: GoldenEntrypointContract | None = None,
     semantics: PyTorchOpSemantics | None = None,
+    op_proto: Mapping[str, object] | None = None,
 ) -> Callable[[str, str], tuple[bool, str]]:
     """Build the L0/L1 gate pair the bounded Stage-0 seed loop invokes per attempt."""
     assert regime_specs, "Stage-0 seed synthesis requires at least one regime specification"
@@ -724,6 +731,7 @@ def build_stage0_static_validator(
                     env_file=env_file,
                     contract=entrypoint_contract,
                     semantics=semantics,
+                    op_proto=op_proto,
                 )
             else:
                 passed, error = _validate_stage0_track_a(
@@ -734,6 +742,7 @@ def build_stage0_static_validator(
                     env_file=env_file,
                     contract=entrypoint_contract,
                     semantics=semantics,
+                    op_proto=op_proto,
                 )
             if not passed:
                 failures.append(f"[{regime_spec.regime_tag}] {error}")
@@ -892,6 +901,7 @@ def prepare_marathon_seed(
             env_file=env_file,
             entrypoint_contract=golden_contract,
             semantics=semantics,
+            op_proto=spec.proto,
         )
 
     init_path = target_module.parent / "__init__.py"

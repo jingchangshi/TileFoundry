@@ -270,7 +270,7 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
     assert checks[1].passed is False and checks[1].failed_tier == "stage_a"
     assert checks[2].passed is True and checks[3].passed is True
 
-    assert CampaignConfig(operator_name="softmax").enable_tilesize_prescreen is False
+    assert CampaignConfig(operator_name="softmax").enable_tilesize_prescreen is True
     mod_file = tmp_path / "mod.py"
     base_src = "def kernel(m_dim=64):\n    # BASE\n    return m_dim\n"
     mod_file.write_text(base_src, encoding="utf-8")
