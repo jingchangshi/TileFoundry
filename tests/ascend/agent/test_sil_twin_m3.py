@@ -71,8 +71,24 @@ def test_sil_verifier_tl_templates_facets_and_sync_lock_pairing() -> None:
         "asc_mmad(c, a, b, 16, 16, 16, 0, true, false, true);",
         no_alg,
     ).passed
+    assert not verify_source_against_facets(
+        "ascend_gemm_l1<64, 64, 64, 32, false, half, float>(c, a, b, 1, 0, 0);",
+        no_alg,
+    ).passed
+    assert not verify_source_against_facets(
+        "asc_mmad_mx(c, a, b, 16, 16, 16, 0);",
+        no_alg,
+    ).passed
     assert verify_source_against_facets(
         "asc_mmad(c, a, b, 16, 16, 16, 0, true, false, true);",
+        bot,
+    ).passed
+    assert verify_source_against_facets(
+        "ascend_gemm_l1<64, 64, 64, 32, false, half, float>(c, a, b, 1, 0, 0);",
+        bot,
+    ).passed
+    assert verify_source_against_facets(
+        "asc_mmad_mx(c, a, b, 16, 16, 16, 0);",
         bot,
     ).passed
     assert not verify_source_against_facets(
@@ -89,6 +105,14 @@ def test_sil_verifier_tl_templates_facets_and_sync_lock_pairing() -> None:
     ).passed
     assert not verify_source_against_facets(
         "asc_sync_notify(PIPE_M, PIPE_FIX, EVENT_ID0); asc_sync_wait(PIPE_M, PIPE_FIX, EVENT_ID0);",
+        bot,
+    ).passed
+    assert not verify_source_against_facets(
+        "asc_sync_block_arrive(PIPE_FIX, 0); asc_sync_block_wait(PIPE_V, 0);",
+        bot,
+    ).passed
+    assert not verify_source_against_facets(
+        "asc_sync_pipe(PIPE_V);",
         bot,
     ).passed
     assert not verify_source_against_facets(

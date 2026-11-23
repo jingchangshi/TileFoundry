@@ -99,11 +99,19 @@ def test_ascendc_templates_reflect_policy_knobs_and_hardware_idioms():
     assert "ReduceDataBlock" in cpp_reg
 
     cpp_simt = render_template(SHELL_AIV_SIMT_ATOMIC, {"simt_threads": 512, "ub_bank_pad_datablocks": 8}, track="ascendc").ascendc_cpp
-    assert "__simt_vf__ __launch_bounds__(512)" in cpp_simt
-    assert "asc_atomic_cas" in cpp_simt and "__shfl" in cpp_simt and "Simt::UintDiv" in cpp_simt
-    assert "512U" in cpp_simt
+    assert "<c_api/asc_cube.h>" not in cpp_simt
+    assert "constexpr uint32_t SIMT_THREADS = 512U;" in cpp_simt
+    assert "__simt_vf__ __launch_bounds__(SIMT_THREADS)" in cpp_simt
+    assert "asc_atomic_cas" in cpp_simt and "asc_shfl(slot, 0)" in cpp_simt
+    assert "__shfl(" not in cpp_simt and "Simt::UintDiv" in cpp_simt
+    assert (
+        "asc_vf_call<HybridSimtHashProbeVF>(\n"
+        "            dim3(SIMT_THREADS, 1, 1), keys, tableKeys, tableVals,\n"
+        "            warpAtomicScratch, numKeys, tableMask, divNumCols);"
+    ) in cpp_simt
 
     cpp_gemm = render_template(SHELL_AIC_GEMM_FIXPIPE, {"swizzle_window": 4, "l1_stages": 1, "sync_mode": "unit_flag", "w4_mode": "w4a16"}, track="ascendc").ascendc_cpp
+    assert "constexpr uint32_t TOTAL_L1_SIZE = 524288U;" in cpp_gemm
     assert "windowLen = 4U" in cpp_gemm
     assert "(TOTAL_L1_SIZE >> 1)" in cpp_gemm
     assert "asc_load_l2_cache_mode::NOTALLOC_DROP" in cpp_gemm

@@ -1,4 +1,8 @@
-"""Track-B CCE (C++20) parameterized templates for canonical Ascend 950 (dav-3510) 3-axis shells."""
+"""Track-B CCE (C++20) templates for canonical Ascend 950 (dav-3510) 3-axis shells.
+
+Templates target cann_9_3 (dav-3510) exclusively; cann_9_2 is an inert placeholder.
+Cube shells keep static #include <c_api/asc_cube.h>.
+"""
 
 from __future__ import annotations
 
@@ -114,13 +118,13 @@ def render_simt_and_hybrid_ub_cpp(policy: Mapping[str, object] | None = None) ->
     pad_slots = max(8, p["ub_bank_pad_datablocks"])
     return f"""// Ascend 950 (dav-3510) Paradigm 2: SIMT + Hybrid SIMD/SIMT UB
 #include <tl_templates/ascend/common.h>
-#include <c_api/asc_cube.h>
 #include <c_api/asc_simd.h>
 #include <simt_api/asc_simt.h>
+constexpr uint32_t SIMT_THREADS = {threads}U;
 constexpr uint32_t UB_WARP_PAD = {pad_slots}U;  // +8 padding eliminates warp atomic bank conflicts
 constexpr uint32_t SIMT_DISPATCH_BYTES_THRESHOLD = 512U;
 
-__simt_vf__ __launch_bounds__({threads}) void HybridSimtHashProbeVF(
+__simt_vf__ __launch_bounds__(SIMT_THREADS) void HybridSimtHashProbeVF(
     __gm__ uint64_t* keys, __gm__ uint64_t* tableKeys, __gm__ int32_t* tableVals,
     __ubuf__ float* warpAtomicScratch, uint32_t numKeys, uint32_t tableMask,
     Simt::UintDiv divNumCols) {{
@@ -130,7 +134,7 @@ __simt_vf__ __launch_bounds__({threads}) void HybridSimtHashProbeVF(
     if (tid >= numKeys) return;
 
     const uint64_t k = keys[tid];
-    // Leader-only asc_atomic_cas + __shfl warp broadcast hash probing
+    // Leader-only asc_atomic_cas + asc_shfl warp broadcast hash probing
     int32_t slot = -1;
     if (lane == 0U) {{
         uint32_t pos = static_cast<uint32_t>((k * 0xff51afd7ed558ccdULL) & tableMask);
@@ -143,7 +147,7 @@ __simt_vf__ __launch_bounds__({threads}) void HybridSimtHashProbeVF(
             pos = (pos + 1U) & tableMask;
         }}
     }}
-    slot = __shfl(slot, 0);
+    slot = asc_shfl(slot, 0);
     auto [rowIdx, colIdx] = divNumCols.DivMod(tid);
     const uint32_t scratchIdx = warpId * (32U + UB_WARP_PAD) + lane;
     if (slot >= 0) {{
@@ -151,10 +155,15 @@ __simt_vf__ __launch_bounds__({threads}) void HybridSimtHashProbeVF(
     }}
 }}
 
-__aicore__ inline void AdaptiveSimdOrSimtDispatch(uint32_t rowBytes) {{
+__aicore__ inline void AdaptiveSimdOrSimtDispatch(
+    uint32_t rowBytes, __gm__ uint64_t* keys, __gm__ uint64_t* tableKeys,
+    __gm__ int32_t* tableVals, __ubuf__ float* warpAtomicScratch,
+    uint32_t numKeys, uint32_t tableMask, Simt::UintDiv divNumCols) {{
     // Reserve 8KB stack + >=32KB SIMT Data Cache inside 256KB UB
     if (rowBytes <= SIMT_DISPATCH_BYTES_THRESHOLD) {{
-        asc_vf_call<HybridSimtHashProbeVF>(dim3(SIMT_THREADS, 1, 1));
+        asc_vf_call<HybridSimtHashProbeVF>(
+            dim3(SIMT_THREADS, 1, 1), keys, tableKeys, tableVals,
+            warpAtomicScratch, numKeys, tableMask, divNumCols);
     }} else {{
         // >512B contiguous rows route through SIMD DMA + RegBase VF
         asc_sync_pipe(PIPE_MTE2);
@@ -185,6 +194,7 @@ def render_dense_and_quant_gemm_cpp(policy: Mapping[str, object] | None = None) 
 #include <c_api/asc_cube.h>
 #include <c_api/asc_simd.h>
 
+constexpr uint32_t TOTAL_L1_SIZE = 524288U;  // 512 KiB L1 capacity on dav-3510
 // Scalar-spill-free param struct (<= 64B, zero dynamic array indexing)
 struct alignas(16) GemmSwatTiling {{
     uint32_t mTiles, nTiles, kTiles, coreNum;

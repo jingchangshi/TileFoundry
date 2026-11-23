@@ -1,6 +1,6 @@
 # TileFoundry Ascend Governance & Sliced Routing
 
-## Block A: Dual Axioms & Eight Non-Negotiable Guardrails
+## Block A: Dual Axioms & Nine Non-Negotiable Guardrails
 
 - **Axiom 1 (Hardware & Contract First)**: Correctness is defined by SIL contracts, L3 replay/invariant gates, and L4 CANNBench; never relax contracts or rely on single-shape or host-proxy fits.
 - **Axiom 2 (Compiler Truth Over Heuristics)**: Sink deterministic degradations into IR lowering, `SILVerifier`, Z3 pipeline solver, `EnvelopeInspector`, and `CompilerBehaviorRegistry`, not prompt patches.
@@ -12,6 +12,7 @@
 6. **CoW Helper Isolation**: `patch_regime_into_module` namespaces helpers `_{regime_tag}_*`, prunes dead helpers, and enforces `>= 0.97x` active / `>= 0.98x` sibling tail guards.
 7. **Closed KB & Scoped Tabu**: Use closed 13 `SymptomFamily`, read-only online `seed_rules.yaml` (`anti_precondition`, AST whitelist), 3-axis Bayesian tracking, and Scoped Tabu (`excluded_mechanisms`).
 8. **Pure Cache & Honest Gates**: No magic cache cap (`len(cases) // 2`) or float-tol/host-ptr keys; enforce L3 two-pass `Delta|Cache| == 0` idempotence and L4 `AgentGates` v2 receipts.
+9. **CANN 9.3 Active Target Only (`cann_9_2` Placeholder)**: Treat `cann_9_3` (`dav-3510`) as the sole active SDK target across templates, dialect surfaces, verifiers, and audits; `cann_9_2` is retained strictly as an inert placeholder—never add `cann_9_2` runtime shims, conditional header branches, or compatibility regressions.
 
 ## Block B: Section-Sliced Read Routing (DO NOT Read Full Specs)
 

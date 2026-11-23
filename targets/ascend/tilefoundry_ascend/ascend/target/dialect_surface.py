@@ -1,4 +1,7 @@
-"""Single source of truth for Ascend TileLang DSL and Track-B CCE C++20 surfaces."""
+"""Ascend TileLang DSL and Track-B CCE C++20 surface definitions.
+
+Active SDK target is cann_9_3 (dav-3510) exclusively; cann_9_2 is an inert placeholder.
+"""
 
 from __future__ import annotations
 
@@ -1130,7 +1133,10 @@ def _load_cached_cann_surface(series: str) -> DialectSurfaceSpec:
 
 
 def load_cann_surface(cann_series: str | None = None) -> DialectSurfaceSpec:
-    """Load a self-contained dav-3510 C++20 DialectSurfaceSpec from TOML snapshot resources."""
+    """Load a self-contained dav-3510 C++20 DialectSurfaceSpec from TOML snapshot resources.
+
+    CCE_CPP20_SURFACE binds to DEFAULT_CANN_SERIES ("cann_9_3"); cann_9_2 is inert.
+    """
     return _load_cached_cann_surface(resolve_cann_series(cann_series))
 
 

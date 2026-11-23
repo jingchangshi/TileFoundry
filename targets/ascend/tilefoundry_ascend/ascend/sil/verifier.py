@@ -1156,7 +1156,8 @@ _L1_BYTES_DECL_RE = re.compile(r"\bl1_bytes\s*=\s*(\d+)", re.IGNORECASE)
 _TILE_DIM_DECL_RE = re.compile(r"\b(?:CUBE_)?TILE_([MNK])\s*=\s*(\d+)")
 
 _FACET_ALG_COMPUTE_RE = re.compile(
-    r"\b(?:Reg::[A-Za-z_]\w*|Mmad|T\.gemm|asc_mmad|asc_reduce_[A-Za-z0-9_]+)\b"
+    r"\b(?:Reg::[A-Za-z_]\w*|Mmad|T\.gemm|ascend_gemm_l1|"
+    r"asc_mmad(?:_mx|_sparse)?|asc_reduce_[A-Za-z0-9_]+)\b"
 )
 _FACET_TILE_STAGE_RE = re.compile(
     r"\b(?:CUBE_TILE_M|CUBE_TILE_N|CUBE_TILE_K|TILE_M|TILE_N|TILE_K|"
@@ -1180,7 +1181,8 @@ _FACET_DMA_CACHE_RE = re.compile(
 _FACET_PIPELINE_SYNC_RE = re.compile(
     r"\b(?:STAGE_[A-Z0-9_]+|CrossCoreSetFlag|CrossCoreWaitFlag|PipeBarrier|LocalMemBar|"
     r"HwMutexLock|HwMutexUnlock|enUnitFlag|unitFlag|"
-    r"asc_sync_notify|asc_sync_wait|asc_lock|asc_unlock)\b"
+    r"asc_sync_notify|asc_sync_wait|asc_sync_block_arrive|asc_sync_block_wait|"
+    r"asc_sync_pipe|asc_lock|asc_unlock)\b"
     r"|\b(?:cmatrixInitVal|initC)\s*=\s*false\b"
     r"|\b(?<![A-Za-z0-9_])(?:SetFlag|WaitFlag)\b(?=\s*(?:<|\())"
 )

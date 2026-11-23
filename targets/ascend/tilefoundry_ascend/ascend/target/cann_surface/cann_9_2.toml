@@ -1,3 +1,5 @@
+# INERT PLACEHOLDER ONLY: Active TileFoundry Ascend engineering targets cann_9_3 exclusively.
+# Do not build conditional header guards or compatibility shims for cann_9_2.
 [surface]
 cann_series = "cann_9_2"
 cce_arch = "dav-3510"

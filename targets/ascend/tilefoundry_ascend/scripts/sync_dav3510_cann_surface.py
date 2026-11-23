@@ -59,13 +59,19 @@ _REQUIRED_CANARY_SYMBOLS_BASE = (
 def _find_header_matches(cann_include: Path) -> list[str]:
     found: list[str] = []
     targets = (
+        cann_include / "c_api" / "asc_cube.h",
+        cann_include / "c_api" / "asc_simd.h",
+        cann_include / "simt_api" / "asc_simt.h",
         cann_include / "c_api" / "cube_datamove" / "cube_datamove.h",
         cann_include / "c_api" / "cube_compute" / "cube_compute.h",
         cann_include / "c_api" / "sync" / "sync.h",
         cann_include / "c_api" / "spr" / "spr.h",
         cann_include / "simt_api" / "device_warp_functions.h",
     )
-    decl_pat = re.compile(r"__aicore__\s+inline\s+\w+\s+(asc_[a-zA-Z0-9_]+)\s*\(")
+    decl_pat = re.compile(
+        r"(?:__aicore__|__SIMT_DEVICE_FUNCTIONS_DECL__)\s+"
+        r"(?:inline\s+)?(?:[\w:]+\s+)+\*?\s*(asc_[a-zA-Z0-9_]+)\s*(?:<[^>]*>)?\s*\("
+    )
     for path in targets:
         if not path.is_file():
             continue
@@ -261,6 +267,12 @@ def extract_snapshot(
     """Audit live CANN headers against the tracked snapshot and emit synced TOML."""
     if series not in VALID_CANN_SERIES:
         raise ValueError(f"Unsupported series {series!r}; expected {VALID_CANN_SERIES}")
+    if series == "cann_9_2":
+        print(
+            "Skipping live header enforcement for inert placeholder series cann_9_2 "
+            "(active target: cann_9_3)."
+        )
+        return 0
     asc_inc = cann_home / "x86_64-linux" / "asc" / "include"
     if not asc_inc.is_dir():
         asc_inc = cann_home / "asc" / "include"
@@ -278,7 +290,7 @@ def extract_snapshot(
     snapshot_set = set(snapshot_asc)
     missing_from_headers = sorted(snapshot_set - discovered_set)
     extra_in_headers = sorted(discovered_set - snapshot_set)
-    if output_path is not None:
+    if output_path is not None and not missing_from_headers:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(base_toml, encoding="utf-8")
     print(
@@ -286,10 +298,13 @@ def extract_snapshot(
         f"(snapshot asc_*: {len(snapshot_asc)}, missing: {len(missing_from_headers)}, "
         f"extra: {len(extra_in_headers)})."
     )
-    if missing_from_headers:
-        print(f"Missing snapshot asc_* symbols in headers: {', '.join(missing_from_headers)}")
     if extra_in_headers:
         print(f"Extra header asc_* symbols not in snapshot: {', '.join(extra_in_headers)}")
+    if missing_from_headers:
+        sys.stderr.write(
+            f"Missing snapshot asc_* symbols in headers: {', '.join(missing_from_headers)}\n"
+        )
+        return 1
     return 0
 
 
