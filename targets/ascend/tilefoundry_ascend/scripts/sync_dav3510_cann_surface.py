@@ -80,6 +80,12 @@ def _find_header_matches(cann_include: Path) -> list[str]:
 def _build_canary_source(cann_series: str) -> str:
     extra_header = "#include <c_api/asc_cube.h>\n" if cann_series == "cann_9_3" else ""
     if cann_series == "cann_9_3":
+        nd2nz_calls = """    asc_copy_gm2l1_nd2nz(
+        l1_a, gm_a, 64ULL, asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM, 64U, 64U, 4096ULL, false
+    );
+    asc_copy_gm2l1_nd2nz(
+        l1_b, gm_b, 64ULL, asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM, 64U, 64U, 4096ULL, false
+    );"""
         l0c2gm_call = """    asc_copy_l0c2gm(
         gm_c, l0c, 64, 64, 64, 64,
         asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM,
@@ -89,6 +95,8 @@ def _build_canary_source(cann_series: str) -> str:
         false, true, false, false
     );"""
     else:
+        nd2nz_calls = """    asc_copy_gm2l1_nd2nz(l1_a, gm_a, 1, 64, 64, 0, 64, 1, 64, 0);
+    asc_copy_gm2l1_nd2nz(l1_b, gm_b, 1, 64, 64, 0, 64, 1, 64, 0);"""
         l0c2gm_call = """    asc_copy_l0c2gm(
         gm_c, l0c, 64, 64, 64, 64,
         0U, 0ULL, 0U,
@@ -129,8 +137,7 @@ def _build_canary_source(cann_series: str) -> str:
         "    __cbuf__ bfloat16_t* l1_b = reinterpret_cast<__cbuf__ bfloat16_t*>(32768);\n"
         "    __cc__ float* l0c = reinterpret_cast<__cc__ float*>(0);\n"
         "    __ubuf__ float* ub_tmp = reinterpret_cast<__ubuf__ float*>(0);\n"
-        "    asc_copy_gm2l1_nd2nz(l1_a, gm_a, 1, 64, 64, 0, 64, 1, 64, 0);\n"
-        "    asc_copy_gm2l1_nd2nz(l1_b, gm_b, 1, 64, 64, 0, 64, 1, 64, 0);\n"
+        f"{nd2nz_calls}\n"
         "    asc_sync_notify(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);\n"
         "    asc_sync_wait(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);\n"
         "    asc_unlock(PIPE_MTE1, 0, ASC_LOCK_BLOCK);\n"
@@ -259,12 +266,30 @@ def extract_snapshot(
         asc_inc = cann_home / "asc" / "include"
     discovered = _find_header_matches(asc_inc)
     base_toml = (_CANN_SURFACE_DIR / f"{series}.toml").read_text(encoding="utf-8")
+    snapshot_data = tomllib.loads(base_toml)
+    snapshot_asc = sorted(
+        {
+            str(entry.get("symbol", "")).strip()
+            for entry in snapshot_data.get("primitives", [])
+            if isinstance(entry, dict) and str(entry.get("symbol", "")).startswith("asc_")
+        }
+    )
+    discovered_set = set(discovered)
+    snapshot_set = set(snapshot_asc)
+    missing_from_headers = sorted(snapshot_set - discovered_set)
+    extra_in_headers = sorted(discovered_set - snapshot_set)
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(base_toml, encoding="utf-8")
     print(
-        f"Discovered {len(discovered)} asc_* C-API symbols under {asc_inc} for {series}."
+        f"Discovered {len(discovered)} asc_* C-API symbols under {asc_inc} for {series} "
+        f"(snapshot asc_*: {len(snapshot_asc)}, missing: {len(missing_from_headers)}, "
+        f"extra: {len(extra_in_headers)})."
     )
+    if missing_from_headers:
+        print(f"Missing snapshot asc_* symbols in headers: {', '.join(missing_from_headers)}")
+    if extra_in_headers:
+        print(f"Extra header asc_* symbols not in snapshot: {', '.join(extra_in_headers)}")
     return 0
 
 

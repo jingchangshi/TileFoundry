@@ -17,9 +17,9 @@ _AUDIENCE_BANNER = (
 
 _EXPECTED_SECTIONS: dict[str, tuple[str, ...]] = {
     "01_mece_contracts_and_routing.md": (
-        "## [SEC-M1] Problem Space & Bounded 2-4 Regimes",
-        "## [SEC-M2] Action Lattice, 3-Layer Prompt & COW Isolation",
-        "## [SEC-M3] 5D Observation, 13 Symptom Families & Frozen KB",
+        "## [SEC-C1] Problem Space & Bounded 2-4 Regimes",
+        "## [SEC-C2] Action Lattice, 3-Layer Prompt & COW Isolation",
+        "## [SEC-C3] 5D Observation, 13 Symptom Families & Frozen KB",
     ),
     "02_residual_convergence_and_gates.md": (
         "## [SEC-G1] 3-Tier Cost Model Sink-Down & Sample-Gated Basis",
@@ -29,11 +29,11 @@ _EXPECTED_SECTIONS: dict[str, tuple[str, ...]] = {
 }
 
 _REQUIRED_SEC_IDS = frozenset(
-    {"SEC-M1", "SEC-M2", "SEC-M3", "SEC-G1", "SEC-G2", "SEC-G3"}
+    {"SEC-C1", "SEC-C2", "SEC-C3", "SEC-G1", "SEC-G2", "SEC-G3"}
 )
 
 _ROUTE_PATTERN = re.compile(
-    r"\|\s*[^|\n]+\|\s*`\[(SEC-[MG]\d+)\]`\s*\|\s*"
+    r"\|\s*[^|\n]+\|\s*`\[(SEC-[CG]\d+)\]`\s*\|\s*"
     r"\[[^\]]+\(`L(\d+)-L(\d+)`\)\]\((\./docs/ascend/[^)#]+)#L(\d+)-L(\d+)\)\s*\|"
 )
 

@@ -201,6 +201,7 @@ def project_case_workload(
             "dominant_contig_bytes": getattr(base_ledger, "dominant_contig_bytes", 32768),
             "steady_state_ii": getattr(base_ledger, "steady_state_ii", 0),
             "waterlines": getattr(base_ledger, "waterlines", {}),
+            "ub_scalar_compute_loops": getattr(base_ledger, "ub_scalar_compute_loops", 0),
         }
 
     dims = dict(case_dims or {})
@@ -331,6 +332,17 @@ def project_case_workload(
             if ub_cap > 0 and ub_peak >= 0:
                 ub_occ_ratio = float(ub_peak) / float(ub_cap)
 
+    raw_extra = pol.get("extra_signals")
+    extra_signals: dict[str, float] = (
+        {str(k): float(v) for k, v in raw_extra.items()}
+        if isinstance(raw_extra, Mapping)
+        else {}
+    )
+    ub_loops = max(0, int(ledger_map.get("ub_scalar_compute_loops", 0) or 0))
+    if ub_loops > 0:
+        existing_val = float(extra_signals.get("scalar_compute_loop_fallback", 0.0) or 0.0)
+        extra_signals["scalar_compute_loop_fallback"] = max(existing_val, float(ub_loops))
+
     out: dict[str, object] = dict(pol)
     out.update(
         {
@@ -347,6 +359,7 @@ def project_case_workload(
             "pipeline_depth": max(1, prof.pipeline_depth),
             "kernel_launches": max(1, prof.subkernel_count),
             "profile_is_per_core_full_loop": is_fixed_grid_full_loop,
+            "extra_signals": extra_signals,
             "microarch_profile": prof.to_dict(),
         }
     )

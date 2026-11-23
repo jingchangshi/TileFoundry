@@ -15,7 +15,7 @@ Optimization insights follow a strict downward graduation path so structural slo
 | Tier | Component | Deterministic Scope & Detectors |
 | :--- | :--- | :--- |
 | Tier-0 | Hardware Physics & 6-Pipe/AVE | Segmented HBM burst-bandwidth curves, vector/cube/scalar/MTE/FixPipe overlap, UB modes (`216 / 248 / 256 KiB`), wave occupancy, narrow unaligned & scalar-loop analytical penalties |
-| Tier-1 | `CompilerBehaviorRegistry` (`_build_default_registry`) | 7 baseline detectors (`register_stack_spill`, `loop_vectorization_vloopv2`, `vf_local_membar`, `vf_fusion_breaks`, `alias_serialized_buffers`, `dual_issue_ipc_collapse`, `dcache_dcci_flushes`) + 2 Stage-6 sink-down detectors (`scalar_compute_loop_fallback` covering TIR + reachable Track-B `__ubuf__`/`__gm__` scalar loops, `dcache_bypass_narrow_store`) |
+| Tier-1 | `CompilerBehaviorRegistry` (`_build_default_registry`) | 9 detectors: 7 baseline (`register_stack_spill`, `loop_vectorization_vloopv2`, `vf_local_membar`, `vf_fusion_breaks`, `alias_serialized_buffers`, `dual_issue_ipc_collapse`, `dcache_dcci_flushes`) + 2 Stage-6 sink-down (`scalar_compute_loop_fallback` covering TIR + reachable Track-B `__ubuf__`/`__gm__` scalar loops, `dcache_bypass_narrow_store`) |
 | Tier-2 | `ResidualBasisRegistry` & `ExperienceLake` | `TopologyAxes`-bucketed Ridge log-residual calibration (`12` global `head0_specs`, `8` within-case `varies_within_case=True` `head2_specs` for zero-intercept pairwise delta ranking) |
 
 `ResidualBasisRegistry` gates each basis term by minimum effective bucket samples (`2/4/6/8`) and quarantines extreme outliers:

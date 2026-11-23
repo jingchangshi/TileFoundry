@@ -2,7 +2,7 @@
 
 Companion docs: [Architecture Overview](./00_architecture_overview.md) | [Residual Convergence and Gates](./02_residual_convergence_and_gates.md) | [Ascend Plugin README](../../targets/ascend/README.md)
 
-## [SEC-M1] Problem Space & Bounded 2-4 Regimes
+## [SEC-C1] Problem Space & Bounded 2-4 Regimes
 
 Every candidate kernel maps to one cell in `TopologyAxes` (`3 x 6 x 4 = 72` orthogonal cells) used to isolate empirical calibration across `ExperienceLake` and `HybridAscendCostModel`:
 
@@ -19,7 +19,7 @@ Multi-shape dispatch (`ascend/sil/`, `pytorch_frontend.py`, `regime_solver.py`) 
 - **Weighted Lexicographic `2..4` Bounded Partition (`partition_case_regimes`)**: Enforces `1 <= min_partitions <= max_partitions` (default `min_partitions=2`, `max_partitions=4`) producing `CasePhysicsRegimeGroup` buckets. Excess clusters merge by minimum 5D `_phase_distance` (`engine` +100, `layout` +30, `sub_atom_simt` alignment +20 vs +3, `residency` +2, `wave` +1); single-cluster inputs split along `_PHASE_SPLIT_AXES = ("wave", "residency", "alignment", "layout", "engine")` or by dtype-aware `case_workload_scale`.
 - **SIL Formal Legality**: `OpAdvisoryExtractor` emits `AdvisoryEnvelope`; `SILVerifier` enforces 14 hardware redlines plus C++ CFG cross-core flag-balance invariants.
 
-## [SEC-M2] Action Lattice, 3-Layer Prompt & COW Isolation
+## [SEC-C2] Action Lattice, 3-Layer Prompt & COW Isolation
 
 Legal transformation freedom is partitioned into the 7-facet `ConstraintRelaxationMask` (`VALID_FREEDOM_FACETS`):
 
@@ -41,7 +41,7 @@ Legal transformation freedom is partitioned into the 7-facet `ConstraintRelaxati
 - **`syntax_repair` & `explore_creative` Discipline**: Syntax repair and Stage-0 retries apply `L1 + L2 + G5` Parent Monotonicity Lock (`format_g5_parent_monotonicity_lock`, forbidding dropping `T.Pipelined` stages or downgrading execution domains). `explore_creative` remains `Rule-Blind` to L3 heuristics, gated by L1 legality, compilation, and bounded analytical pass-through (`predicted_us <= 1.5 * parent_analytical_us`).
 - **CoW Helper Isolation (`patch_regime_into_module`)**: Clones/prefixes regime-local helpers as `_{regime_tag}_*` instead of mutating shared helpers in place, prunes unreachable dead helpers, and enforces the dual-layer orthogonal tail guard (`>= 0.97x` worst case in active regime; `>= 0.98x` untouched sibling regimes with single-point anti-jitter recheck).
 
-## [SEC-M3] 5D Observation, 13 Symptom Families & Frozen KB
+## [SEC-C3] 5D Observation, 13 Symptom Families & Frozen KB
 
 `ObservationVector5D` and `AxisResidual5D` (`observation_space.py`, `msprof_report_parser.py`) bridge L0 physical ledger, L1 BiSheng compiler summary, and L2 MSProf telemetry across 5 orthogonal axes (`compute_issue`, `offchip_dma`, `onchip_sram_reg`, `pipeline_sync`, `grid_irregularity`/`grid_wave`):
 

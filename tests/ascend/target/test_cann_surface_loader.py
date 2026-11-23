@@ -11,10 +11,16 @@ from tilefoundry_ascend.ascend.target import (
     DEFAULT_CANN_SERIES,
     VALID_CANN_SERIES,
     AscendTarget,
+    get_dialect_surface,
     load_cann_surface,
     resolve_cann_series,
 )
-from tilefoundry_ascend.scripts.sync_dav3510_cann_surface import validate_snapshot_schema
+from tilefoundry_ascend.ascend.target.dialect_surface import resolve_trackb_cce_surface
+from tilefoundry_ascend.scripts.sync_dav3510_cann_surface import (
+    _build_canary_source,
+    extract_snapshot,
+    validate_snapshot_schema,
+)
 
 _CANN_SURFACE_DIR = (
     Path(__file__).resolve().parents[3]
@@ -86,3 +92,61 @@ def test_dual_cann_surface_snapshots_schema_and_signatures(series: str) -> None:
     else:
         assert "asc_mmad_mx" not in by_sym
         assert "unit_flag_mode" in by_sym["asc_copy_l0c2gm"].signature
+
+
+def test_dynamic_cann_series_resolution_without_module_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolve cann_9_2 and cann_9_3 dynamically on TILEFOUNDRY_CANN_SERIES toggles."""
+    monkeypatch.delenv("TILEFOUNDRY_NPU_CANN_SERIES", raising=False)
+    monkeypatch.delenv("ASCEND_HOME_PATH", raising=False)
+    monkeypatch.delenv("ASCEND_TOOLKIT_HOME", raising=False)
+
+    monkeypatch.setenv("TILEFOUNDRY_CANN_SERIES", "cann_9_2")
+    surf_92 = get_dialect_surface("cce_trackb")
+    trackb_92 = resolve_trackb_cce_surface("cce_trackb")
+    assert surf_92.display_label == "CCE C++20 (dav-3510 / CANN 9.2)"
+    assert trackb_92 is surf_92
+    sig_92 = {e.symbol: e.signature for e in surf_92.primitives}["asc_copy_l0c2gm"]
+    assert "asc_store_l2_cache_mode" not in sig_92
+    assert sig_92.count(",") == 10
+
+    monkeypatch.setenv("TILEFOUNDRY_CANN_SERIES", "cann_9_3")
+    surf_93 = get_dialect_surface("cce_trackb")
+    trackb_93 = resolve_trackb_cce_surface("cce_trackb")
+    assert surf_93.display_label == "CCE C++20 (dav-3510 / CANN 9.3)"
+    assert trackb_93 is surf_93
+    sig_93 = {e.symbol: e.signature for e in surf_93.primitives}["asc_copy_l0c2gm"]
+    assert "asc_store_l2_cache_mode" in sig_93
+    assert sig_93.count(",") == 13
+
+
+def test_sync_canary_cann93_nd2nz_8arg_and_extract_snapshot_diff(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify CANN 9.3 8-arg nd2nz Canary coverage and extract_snapshot symbol diffing."""
+    canary_93 = _build_canary_source("cann_9_3")
+    assert "asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM" in canary_93
+    assert "asc_copy_gm2l1_nd2nz(\n        l1_a, gm_a, 64ULL," in canary_93
+    assert "asc_copy_gm2l1_nd2nz(l1_a, gm_a, 1," not in canary_93
+
+    canary_92 = _build_canary_source("cann_9_2")
+    assert "asc_copy_gm2l1_nd2nz(l1_a, gm_a, 1, 64, 64, 0, 64, 1, 64, 0);" in canary_92
+
+    hdr_dir = tmp_path / "x86_64-linux" / "asc" / "include" / "c_api" / "cube_datamove"
+    hdr_dir.mkdir(parents=True)
+    (hdr_dir / "cube_datamove.h").write_text(
+        "__aicore__ inline void asc_copy_gm2l1_nd2nz();\n"
+        "__aicore__ inline void asc_synthetic_extra_op();\n",
+        encoding="utf-8",
+    )
+    rc = extract_snapshot(cann_home=tmp_path, series="cann_9_3")
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Discovered 2 asc_* C-API symbols" in out
+    assert "missing:" in out
+    assert "extra: 1" in out
+    assert "asc_synthetic_extra_op" in out
+    assert "Missing snapshot asc_* symbols in headers:" in out
+    assert "asc_copy_l0c2gm" in out

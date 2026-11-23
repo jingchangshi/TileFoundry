@@ -62,6 +62,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     _format_env_line,
     _validate_llm_api_key_env,
     collect_bottleneck_msprof_via_agent_gates,
+    extract_ordered_tensor_shapes,
     run_l1_compile_check,
     run_l3_full_contract_via_agent_gates,
     run_l4_official_cannbench_via_agent_gates,
@@ -456,15 +457,21 @@ def _run_stage0_track_a_gates(
         enforce_hardware_engines and semantics is not None and not semantics.has_indirect_index
     )
     req_cube = bool(enforce_hardware_engines and semantics is not None and semantics.has_matmul)
+    ordered_tensor_shapes = extract_ordered_tensor_shapes(
+        case_entry=regime_spec.representative_case_entry,
+        dims=dims,
+    )
     static = run_stage_a_static(
         module_source,
         factory_name=resolved.builder_name,
         factory_kwargs=resolved.builder_kwargs,
         pass_configs=resolved.pass_configs or None,
         compile_flags=resolved.compile_flags or None,
+        dims=dims or None,
         case_ratios=regime_spec.representative_case_ratios,
         require_hardware_dma=req_dma,
         require_cube_engine=req_cube,
+        ordered_tensor_shapes=ordered_tensor_shapes,
     )
     if not static.passed:
         return False, f"L0 static/waterline rejection: {static.error_message}", static.ledger

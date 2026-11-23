@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from tilefoundry.ir.core import Call, Constant, Expr, Op, Var
@@ -3266,6 +3266,228 @@ def _extract_primfunc_pass_configs_and_flags(
     return cfg, flags
 
 
+def _collect_div_denominators(entry_fn, *, tirx=None) -> list[object]:
+    """Collect denominator PrimExprs from division/modulo ops across body and buffers."""
+    if tirx is None:
+        from tvm import tirx as _tirx  # noqa: PLC0415
+
+        tirx = _tirx
+    div_classes = tuple(
+        cls
+        for name in ("FloorDiv", "FloorMod", "Div", "Mod")
+        if (cls := getattr(tirx, name, None)) is not None
+    )
+    if not div_classes or entry_fn is None:
+        return []
+    raw_denoms: list[object] = []
+    let_env: dict[object, object] = {}
+    let_classes = tuple(
+        cls
+        for name in ("LetStmt", "Bind", "Let")
+        if (cls := getattr(tirx, name, None)) is not None
+    )
+    alloc_classes = tuple(
+        cls
+        for name in ("AllocBuffer", "DeclBuffer")
+        if (cls := getattr(tirx, name, None)) is not None
+    )
+    sblock_cls = getattr(tirx, "SBlock", None)
+
+    def _add_denom(expr) -> None:
+        if expr is None:
+            return
+        if not any(
+            (hasattr(expr, "same_as") and expr.same_as(prev)) or expr is prev
+            for prev in raw_denoms
+        ):
+            raw_denoms.append(expr)
+
+    def _scan_obj(obj) -> None:
+        if obj is not None:
+            tirx.stmt_functor.post_order_visit(obj, _visit)
+
+    def _scan_buffer(buf) -> None:
+        for expr in (
+            *getattr(buf, "shape", ()),
+            *(getattr(buf, "strides", ()) or ()),
+            getattr(buf, "elem_offset", None),
+        ):
+            _scan_obj(expr)
+
+    def _visit(node) -> None:
+        if let_classes and isinstance(node, let_classes):
+            var_obj = getattr(node, "var", None)
+            val_obj = getattr(node, "value", None)
+            if var_obj is not None and val_obj is not None:
+                let_env[var_obj] = val_obj
+        if isinstance(node, div_classes):
+            _add_denom(getattr(node, "b", None))
+        if alloc_classes and isinstance(node, alloc_classes):
+            buf = getattr(node, "buffer", None)
+            if buf is not None:
+                _scan_buffer(buf)
+        if sblock_cls is not None and isinstance(node, sblock_cls):
+            for buf in getattr(node, "alloc_buffers", ()) or ():
+                _scan_buffer(buf)
+
+    _scan_obj(getattr(entry_fn, "body", None))
+    for buf in (getattr(entry_fn, "buffer_map", None) or {}).values():
+        _scan_buffer(buf)
+
+    if not let_env:
+        return raw_denoms
+    expanded: list[object] = []
+    for denom in raw_denoms:
+        sub = _substitute_let_env(denom, let_env, tirx=tirx)
+        if not any(
+            (hasattr(sub, "same_as") and sub.same_as(prev)) or sub is prev
+            for prev in expanded
+        ):
+            expanded.append(sub)
+    return expanded
+
+
+def _max_nonzero_const_magnitude(expr, *, tirx) -> int:
+    """Return the largest nonzero integer constant magnitude inside *expr*, else 1."""
+    max_val = 1
+    int_imm_cls = getattr(tirx, "IntImm", None)
+    if int_imm_cls is None or expr is None:
+        return max_val
+
+    def _visit(node) -> None:
+        nonlocal max_val
+        if isinstance(node, int_imm_cls):
+            val = _static_tirx_int(node)
+            if val is not None and val != 0:
+                max_val = max(max_val, abs(int(val)))
+
+    tirx.stmt_functor.post_order_visit(expr, _visit)
+    return max_val
+
+
+def _ensure_positive_denominators(
+    denominators: Sequence[object],
+    spec_var_map: dict[object, object],
+    recorded_vars: list[object],
+    allowed_vars: Sequence[object],
+    *,
+    is_handle_or_data: Callable[[object], bool],
+    tirx,
+    tvm_mod,
+    max_rounds: int = 24,
+) -> None:
+    """Iteratively raise free integer vars so every static denominator simplifies >= 1."""
+    if not denominators:
+        return
+
+    def _same_var(lhs, rhs) -> bool:
+        return (hasattr(lhs, "same_as") and lhs.same_as(rhs)) or lhs is rhs
+
+    def _find_key(var_obj):
+        for key in spec_var_map:
+            if _same_var(var_obj, key):
+                return key
+        return None
+
+    def _is_allowed_int_var(var_obj) -> bool:
+        if not isinstance(var_obj, tirx.Var) or is_handle_or_data(var_obj):
+            return False
+        dtype_str = str(getattr(var_obj, "dtype", "int32") or "int32").lower()
+        if dtype_str == "handle" or "int" not in dtype_str:
+            return False
+        return any(_same_var(var_obj, allowed) for allowed in allowed_vars)
+
+    for denom in denominators:
+        for fv in _free_tirx_vars(denom, tirx=tirx):
+            if not _is_allowed_int_var(fv):
+                continue
+            if _find_key(fv) is None:
+                dtype_str = str(getattr(fv, "dtype", "int32") or "int32")
+                recorded_vars.append(fv)
+                spec_var_map[fv] = tirx.IntImm(dtype_str, 1)
+
+    analyzer = tvm_mod.arith.Analyzer()
+    for _ in range(max_rounds):
+        changed = False
+        for denom in denominators:
+            sub_denom = (
+                tirx.stmt_functor.substitute(denom, spec_var_map) if spec_var_map else denom
+            )
+            simp_val = _static_tirx_int(analyzer.simplify(sub_denom))
+            if simp_val is None or simp_val > 0:
+                continue
+            candidates = [
+                fv for fv in _free_tirx_vars(denom, tirx=tirx) if _is_allowed_int_var(fv)
+            ]
+            if not candidates:
+                continue
+            max_const = _max_nonzero_const_magnitude(denom, tirx=tirx)
+
+            def _next_val(cur_v: int, floor_const: int = max_const) -> int:
+                return max(floor_const, 1) if cur_v <= 0 else max(cur_v * 2, floor_const, 1)
+
+            nonpos_keys = []
+            for fv in candidates:
+                key = _find_key(fv)
+                if key is not None:
+                    cur_v = _static_tirx_int(spec_var_map[key])
+                    if cur_v is not None and cur_v <= 0:
+                        nonpos_keys.append((key, cur_v))
+            if nonpos_keys:
+                for key, cur_v in nonpos_keys:
+                    dtype_str = str(getattr(key, "dtype", "int32") or "int32")
+                    spec_var_map[key] = tirx.IntImm(dtype_str, _next_val(cur_v))
+                changed = True
+                continue
+
+            if len(candidates) == 1:
+                key = _find_key(candidates[0])
+                if key is not None:
+                    cur_v = _static_tirx_int(spec_var_map[key])
+                    cur_int = 0 if cur_v is None else int(cur_v)
+                    dtype_str = str(getattr(key, "dtype", "int32") or "int32")
+                    spec_var_map[key] = tirx.IntImm(dtype_str, _next_val(cur_int))
+                    changed = True
+                continue
+
+            best_key = None
+            best_next = 0
+            best_trial = simp_val
+            for fv in candidates:
+                key = _find_key(fv)
+                if key is None:
+                    continue
+                cur_v = _static_tirx_int(spec_var_map[key])
+                cur_int = 0 if cur_v is None else int(cur_v)
+                cand_next = _next_val(cur_int)
+                dtype_str = str(getattr(key, "dtype", "int32") or "int32")
+                trial_map = dict(spec_var_map)
+                trial_map[key] = tirx.IntImm(dtype_str, cand_next)
+                trial_sub = tirx.stmt_functor.substitute(denom, trial_map)
+                trial_val = _static_tirx_int(analyzer.simplify(trial_sub))
+                if trial_val is not None and trial_val > best_trial:
+                    best_trial = trial_val
+                    best_key = key
+                    best_next = cand_next
+
+            if best_key is not None:
+                dtype_str = str(getattr(best_key, "dtype", "int32") or "int32")
+                spec_var_map[best_key] = tirx.IntImm(dtype_str, best_next)
+                changed = True
+            else:
+                for fv in candidates:
+                    key = _find_key(fv)
+                    if key is None:
+                        continue
+                    cur_v = _static_tirx_int(spec_var_map[key])
+                    cur_int = 0 if cur_v is None else int(cur_v)
+                    dtype_str = str(getattr(key, "dtype", "int32") or "int32")
+                    spec_var_map[key] = tirx.IntImm(dtype_str, _next_val(cur_int))
+                    changed = True
+        if not changed:
+            break
+
+
 def _collect_divisor_vars(stmt, tirx=None) -> list[object]:
     """Collect free TIR variables appearing in division or modulo denominators."""
     if tirx is None:
@@ -3362,10 +3584,16 @@ def _specialize_primfunc_for_anchors(
 
     for param in getattr(entry_fn, "params", ()):
         _maybe_bind(param)
+    buffer_free_vars: list[object] = []
     for buf in buffer_map.values():
         for expr in (*getattr(buf, "shape", ()), *(getattr(buf, "strides", ()) or ()), buf.elem_offset):
             for fv in _free_tirx_vars(expr, tirx=tirx):
                 _maybe_bind(fv)
+                if not any(
+                    (hasattr(fv, "same_as") and fv.same_as(prev)) or fv is prev
+                    for prev in buffer_free_vars
+                ):
+                    buffer_free_vars.append(fv)
     body_free_vars = _free_tirx_vars(entry_fn.body, tirx=tirx)
     for fv in body_free_vars:
         _maybe_bind(fv)
@@ -3446,45 +3674,16 @@ def _specialize_primfunc_for_anchors(
         spec_var_map[fv] = tirx.IntImm(dtype_str, int(fallback_numel))
 
     params_list = list(getattr(entry_fn, "params", ()))
-    divisor_vars = _collect_divisor_vars(entry_fn.body, tirx=tirx)
-    for buf in buffer_map.values():
-        for expr in (
-            *getattr(buf, "shape", ()),
-            *(getattr(buf, "strides", ()) or ()),
-            buf.elem_offset,
-        ):
-            for dv in _collect_divisor_vars(expr, tirx=tirx):
-                if not any(
-                    (hasattr(dv, "same_as") and dv.same_as(prev)) or dv is prev
-                    for prev in divisor_vars
-                ):
-                    divisor_vars.append(dv)
-
-    for dv in divisor_vars:
-        if not isinstance(dv, tirx.Var) or _is_handle_or_data(dv):
-            continue
-        dtype_str = str(getattr(dv, "dtype", "int32") or "int32")
-        if dtype_str.lower() == "handle" or "int" not in dtype_str.lower():
-            continue
-        matched_key = next(
-            (
-                k
-                for k in spec_var_map
-                if (hasattr(dv, "same_as") and dv.same_as(k)) or dv is k
-            ),
-            None,
-        )
-        if matched_key is not None:
-            bound_val = _static_tirx_int(spec_var_map[matched_key])
-            if bound_val is not None and bound_val <= 0:
-                spec_var_map[matched_key] = tirx.IntImm(dtype_str, max(1, int(bound_val)))
-        elif any(
-            (hasattr(dv, "same_as") and dv.same_as(p)) or dv is p for p in params_list
-        ) or any(
-            (hasattr(dv, "same_as") and dv.same_as(bfv)) or dv is bfv for bfv in body_free_vars
-        ):
-            recorded_vars.append(dv)
-            spec_var_map[dv] = tirx.IntImm(dtype_str, max(1, 1))
+    denominators = _collect_div_denominators(entry_fn, tirx=tirx)
+    _ensure_positive_denominators(
+        denominators,
+        spec_var_map,
+        recorded_vars,
+        [*params_list, *buffer_free_vars, *body_free_vars],
+        is_handle_or_data=_is_handle_or_data,
+        tirx=tirx,
+        tvm_mod=tvm_mod,
+    )
 
     if not spec_var_map:
         return entry_fn, mod_in
@@ -3505,12 +3704,7 @@ def _specialize_primfunc_for_anchors(
         if extra_params
         else entry_fn
     )
-    try:
-        spec_fn = tmp_fn.specialize(spec_var_map)
-    except Exception as exc:
-        if "divide by zero" not in str(exc).lower():
-            raise
-        spec_fn = entry_fn
+    spec_fn = tmp_fn.specialize(spec_var_map)
 
     target_gvar = None
     for gvar, fn in mod_in.functions.items():
@@ -3530,18 +3724,14 @@ def _specialize_primfunc_for_anchors(
         updated_funcs[target_gvar] = spec_fn
     spec_mod = tvm_mod.IRModule(updated_funcs, attrs=getattr(mod_in, "attrs", None))
     if hasattr(tirx, "transform") and hasattr(tirx.transform, "Simplify"):
-        try:
-            spec_mod = tirx.transform.Simplify()(spec_mod)
-            if target_gvar in spec_mod.functions:
-                spec_fn = spec_mod.functions[target_gvar]
-            else:
-                for fn in spec_mod.functions.values():
-                    if isinstance(fn, tirx.PrimFunc):
-                        spec_fn = fn
-                        break
-        except Exception as exc:
-            if "divide by zero" not in str(exc).lower():
-                raise
+        spec_mod = tirx.transform.Simplify()(spec_mod)
+        if target_gvar in spec_mod.functions:
+            spec_fn = spec_mod.functions[target_gvar]
+        else:
+            for fn in spec_mod.functions.values():
+                if isinstance(fn, tirx.PrimFunc):
+                    spec_fn = fn
+                    break
     return spec_fn, spec_mod
 
 

@@ -2066,6 +2066,17 @@ def build_cost_features_from_ledger(
         ub_occ_ratio = float(policy.get("ub_occupancy_ratio", 0.0) or 0.0)
 
     merged: dict[str, object] = dict(policy)
+    raw_extra = merged.get("extra_signals")
+    extra_signals: dict[str, float] = (
+        {str(k): float(v) for k, v in raw_extra.items()}
+        if isinstance(raw_extra, Mapping)
+        else {}
+    )
+    ub_loops = max(0, int(_read_attr_or_key(ledger, "ub_scalar_compute_loops", 0) or 0))
+    if ub_loops > 0:
+        existing_val = float(extra_signals.get("scalar_compute_loop_fallback", 0.0) or 0.0)
+        extra_signals["scalar_compute_loop_fallback"] = max(existing_val, float(ub_loops))
+
     merged.update(
         {
             "cube_flops": cube_flops,
@@ -2082,6 +2093,7 @@ def build_cost_features_from_ledger(
             "loop_trips": max(1, merged_prof.inner_loop_trips) if not merged_prof.is_empty else 1,
             "pipeline_depth": max(1, merged_prof.pipeline_depth) if not merged_prof.is_empty else 1,
             "ub_occupancy_ratio": ub_occ_ratio,
+            "extra_signals": extra_signals,
             "microarch_profile": merged_prof.to_dict() if not merged_prof.is_empty else {},
         }
     )

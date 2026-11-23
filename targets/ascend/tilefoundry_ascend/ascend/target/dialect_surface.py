@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import tomllib
@@ -1092,9 +1093,8 @@ def resolve_cann_series(
     return DEFAULT_CANN_SERIES
 
 
-def load_cann_surface(cann_series: str | None = None) -> DialectSurfaceSpec:
-    """Load a self-contained dav-3510 C++20 DialectSurfaceSpec from TOML snapshot resources."""
-    series = resolve_cann_series(cann_series)
+@functools.lru_cache(maxsize=4)
+def _load_cached_cann_surface(series: str) -> DialectSurfaceSpec:
     snap_path = _CANN_SURFACE_DIR / f"{series}.toml"
     data = tomllib.loads(snap_path.read_text(encoding="utf-8"))
     meta = data.get("surface", {})
@@ -1129,6 +1129,11 @@ def load_cann_surface(cann_series: str | None = None) -> DialectSurfaceSpec:
     )
 
 
+def load_cann_surface(cann_series: str | None = None) -> DialectSurfaceSpec:
+    """Load a self-contained dav-3510 C++20 DialectSurfaceSpec from TOML snapshot resources."""
+    return _load_cached_cann_surface(resolve_cann_series(cann_series))
+
+
 CCE_CPP20_SURFACE = load_cann_surface(DEFAULT_CANN_SERIES)
 TL_TEMPLATES_CPP20_SURFACE = CCE_CPP20_SURFACE
 INLINE_ASCENDC_VF_SURFACE = INLINE_CCE_VF_SURFACE
@@ -1151,7 +1156,7 @@ def resolve_trackb_cce_surface(
     """Resolve the verified CCE C++20 surface for the selected CANN series."""
     norm = str(backend_or_tier or "cce_cpp20").strip().lower()
     if norm in _TRACKB_CCE_ALIASES:
-        return load_cann_surface(cann_series) if cann_series is not None else CCE_CPP20_SURFACE
+        return _load_cached_cann_surface(resolve_cann_series(cann_series))
     raise ValueError(f"Unsupported Track-B CCE dialect identifier: {backend_or_tier!r}")
 
 
@@ -1163,7 +1168,7 @@ def get_dialect_surface(
     """Resolve the verified DialectSurfaceSpec for a backend or escalation tier."""
     norm = str(backend_or_tier or "tilelang_dsl").strip().lower()
     if norm in _TRACKB_CCE_ALIASES or norm == "ascendc":
-        return load_cann_surface(cann_series) if cann_series is not None else CCE_CPP20_SURFACE
+        return _load_cached_cann_surface(resolve_cann_series(cann_series))
     if norm in ("inline_cce_vf", "inline_ascendc_vf"):
         return INLINE_CCE_VF_SURFACE
     return TILELANG_DSL_SURFACE

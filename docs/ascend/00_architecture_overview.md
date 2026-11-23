@@ -2,7 +2,7 @@
 
 # TileFoundry Ascend End-to-End Architecture Overview
 
-TileFoundry Ascend couples deterministic symbolic compilation with dual-track neuro-symbolic schedule evolution for DaVinci950 (`dav-3510`, `CANN 9.3`, `Ascend950PR` / `Ascend950DT`, backed by unified `davinci_950.toml` + `cann_9_3.toml`). Every design boundary separates hardware law, multi-shape dispatch, analytical/compiler performance modeling, agent synthesis, and signed verification into orthogonal planes so no heuristic regression can mask correctness errors or mislead evolution.
+TileFoundry Ascend couples deterministic symbolic compilation with dual-track neuro-symbolic schedule evolution for DaVinci950 (`dav-3510`, `CANN 9.2 / 9.3`, `Ascend950PR` / `Ascend950DT`, backed by unified `davinci_950.toml` + `cann_9_2.toml` / `cann_9_3.toml`). Every design boundary separates hardware law, multi-shape dispatch, analytical/compiler performance modeling, agent synthesis, and signed verification into orthogonal planes so no heuristic regression can mask correctness errors or mislead evolution.
 
 Companion specifications:
 
@@ -23,8 +23,8 @@ Companion specifications:
 | :--- | :--- | :--- |
 | Plane 1: Symbolic Contract & Compilation | `ascend_compile_session`, `EnvelopeInspector`, `SILVerifier`, Z3 pipeline solver | Contiguous target context through `tilelang.lower`, positional anchor binding + non-zero divisor guard (`PrimFunc.specialize` + `arith.Analyzer`), Two-Snapshot diff, 14 hardware redlines + C++ CFG flag balance |
 | Plane 2: Multi-Shape Regime Dispatch & Isolation | `CasePhysicsRatios`, `partition_case_regimes`, `patch_regime_into_module` | `_subatom` separation (`contig_atom_ratio < 1.0`), weighted lexicographic `2..4` bounded partition, CoW `_{regime_tag}_*` helper isolation, dead-helper pruning, dual-layer tail guard, `Delta\|Cache\| == 0` |
-| Plane 3: BiSheng Sink-Down & 3-Tier Residual Cost | `CompilerBehaviorRegistry`, `HybridAscendCostModel`, `ResidualBasisRegistry`, `ExperienceLake` | Deterministic sink-down across 8 detectors (including reachable `.asc` Track-B UB scalar compute loops) into Tier-0/1 penalties, `TopologyAxes` bucketed Tier-2 Ridge calibration (`12`/`8` specs), `\|ln(m/a)\| > 2.5` anomaly quarantine |
-| Plane 4: Dual-Track Neuro-Symbolic Evolution | `CapabilityGate`, `ISAGapScanner`, `llm_constraints.py`, `seed_rules.yaml`, `FlywheelDistiller` | Zero-phi MECE `CapabilityGate` (`TopologyAxes` + `ISAGapScanner` + `CasePhysicsRatios`, `Router=ON/OFF`), on-demand CANN 9.3 Layer-2 prompt pruning + `G1..G5`, Stage-0 `+4` monotonic refinement, `Rule-Blind` bounded `explore_creative`, 13 `SymptomFamily` + 40 frozen KB rules (`R01..R40` with `l2_pmu_available` guard) + Scoped Tabu |
+| Plane 3: BiSheng Sink-Down & 3-Tier Residual Cost | `CompilerBehaviorRegistry`, `HybridAscendCostModel`, `ResidualBasisRegistry`, `ExperienceLake` | Deterministic sink-down across 9 detectors (7 baseline + 2 sink-down: `scalar_compute_loop_fallback` covering TIR + reachable Track-B `__ubuf__`/`__gm__` loops, and `dcache_bypass_narrow_store`) into Tier-0/1 penalties, `TopologyAxes` bucketed Tier-2 Ridge calibration (`12`/`8` specs), `\|ln(m/a)\| > 2.5` anomaly quarantine |
+| Plane 4: Dual-Track Neuro-Symbolic Evolution | `CapabilityGate`, `ISAGapScanner`, `llm_constraints.py`, `seed_rules.yaml`, `FlywheelDistiller` | Zero-phi MECE `CapabilityGate` (`TopologyAxes` + `ISAGapScanner` + `CasePhysicsRatios`, `Router=ON/OFF`), on-demand CANN 9.2 / 9.3 Layer-2 prompt pruning + `G1..G5`, Stage-0 `+4` monotonic refinement, `Rule-Blind` bounded `explore_creative`, 13 `SymptomFamily` + 40 frozen KB rules (`R01..R40` with `l2_pmu_available` guard) + Scoped Tabu |
 | Plane 5: Five-Tier (`L0`–`L4`) Verification & `AgentGates` | `scripts/*_lint.py`, `gate_funnel.py`, `l3_contract.py`, `test_npu_acceptance.py` | `L0` static/key audit -> `L1` SIL/`G1..G5` -> `L2` lowering/cost -> `L3` replay idempotence & tail guard -> `L4` CANNBench via multi-worktree zero-lock `AgentGates` `cannSeries`-bound signed `v2` (`tilefoundry-npu` / `tilefoundry-npu-cpu`) |
 
 ## Six-Stage End-to-End Lifecycle
@@ -33,8 +33,8 @@ Companion specifications:
 | :--- | :--- | :--- | :--- |
 | Stage 1 | Contract parsing, unified `ascend_compile_session`, positional binding & non-zero div specialization, Two-Snapshot diff | Plane 1 | Lowered IR envelope & safety diagnostics |
 | Stage 2 | `CasePhysicsRatios`, `2..4` regime partition, CoW helper isolation, Z3 modulo pipeline | Plane 1, Plane 2 | Regime dispatch table & zero sibling clobbering |
-| Stage 3 | 8-detector `.asc` UB scalar sink-down, Tier-0/1 analytical penalties, Tier-2 residual scoring | Plane 3 | Ranked candidates & `unmodeled_anomalies.jsonl` quarantine |
-| Stage 4 | Zero-phi MECE `CapabilityGate` routing, CANN 9.3 on-demand Layer-2 pruning (`G1..G5`), Stage-0 `+4` refinement | Plane 4 | Validated IR/source mutations preserving parent monotonicity |
+| Stage 3 | 9-detector sink-down (7 baseline + 2 sink-down incl. Track-B UB/GM loops & DCache bypass narrow stores), Tier-0/1 analytical penalties, Tier-2 residual scoring | Plane 3 | Ranked candidates & `unmodeled_anomalies.jsonl` quarantine |
+| Stage 4 | Zero-phi MECE `CapabilityGate` routing, CANN 9.2 / 9.3 on-demand Layer-2 pruning (`G1..G5`), Stage-0 `+4` refinement | Plane 4 | Validated IR/source mutations preserving parent monotonicity |
 | Stage 5 | `L0`–`L3` host verification: 6 lints, key audit, two-pass cache idempotence, tail guard | Plane 2, Plane 5 | Signed host pass (`tilefoundry-npu-cpu`) |
 | Stage 6 | `L4` worktree-isolated CANNBench on leased NPU, `R01..R40` + `l2_pmu_available` guard, `FlywheelDistiller` | Plane 3, Plane 4, Plane 5 | `cannSeries`-bound signed `v2` receipt (`tilefoundry-npu`) & KB distillation |
 

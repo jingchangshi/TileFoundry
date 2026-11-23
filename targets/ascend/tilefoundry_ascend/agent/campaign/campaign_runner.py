@@ -66,6 +66,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     bottleneck_anchor_for_regime,
     collect_bottleneck_msprof_via_agent_gates,
     collect_p2_deep_dive_via_agent_gates,
+    extract_ordered_tensor_shapes,
     run_l0_l1_round_filter,
     run_l1_compile_check,
     run_l3_full_contract_via_agent_gates,
@@ -2592,6 +2593,7 @@ class PerfTargetCampaignRunner:
         self._l1_summary_cache: dict[tuple[str, str], BishengResourceSummary | None] = {}
         self._active_kernel_cache: dict[tuple[str, str], str | None] = {}
         self._operator_semantics_cache: PyTorchOpSemantics | None = None
+        self._operator_proto_cache: Mapping[str, object] | None = None
         self._operator_semantics_loaded: bool = False
         self._active_incumbent_source: str = ""
         self._pending_promotion: PendingPromotion | None = None
@@ -3427,6 +3429,7 @@ class PerfTargetCampaignRunner:
             ).resolve(self._config.operator_name)
         except (FileNotFoundError, KeyError, ValueError):
             return None
+        self._operator_proto_cache = spec.proto if isinstance(spec.proto, Mapping) else None
         if not spec.golden_path.is_file():
             return None
         try:
@@ -3497,6 +3500,11 @@ class PerfTargetCampaignRunner:
             anchor_dims,
             kwargs=resolved.builder_kwargs,
         )
+        ordered_tensor_shapes = extract_ordered_tensor_shapes(
+            case_entry=regime_spec.representative_case_entry,
+            dims=anchor_dims,
+            proto=self._operator_proto_cache,
+        )
         primary_res = run_stage_a_static(
             module_source,
             factory_name=resolved.builder_name,
@@ -3509,6 +3517,7 @@ class PerfTargetCampaignRunner:
             case_ratios=regime_spec.representative_case_ratios,
             require_hardware_dma=req_dma,
             require_cube_engine=bool(req_cube and not (is_hybrid and tb_extracted is not None)),
+            ordered_tensor_shapes=ordered_tensor_shapes,
         )
         if not primary_res.passed:
             if is_hybrid and tb_extracted is not None and not has_prim_func:
@@ -3543,6 +3552,7 @@ class PerfTargetCampaignRunner:
                 case_ratios=regime_spec.representative_case_ratios,
                 require_hardware_dma=req_dma,
                 require_cube_engine=False,
+                ordered_tensor_shapes=ordered_tensor_shapes,
             )
             if not combine_res.passed:
                 return StageAResult(

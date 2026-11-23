@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from tilefoundry_ascend.agent.kb.schema import (
@@ -23,6 +25,7 @@ from tilefoundry_ascend.ascend.target.dialect_surface import (
     get_dialect_surface,
     resolve_trackb_cce_surface,
 )
+from tilefoundry_ascend.ascend.templates.ascendc_templates import ASCENDC_RENDERERS
 
 TRACKB_ALIASES = (
     "cce_cpp20",
@@ -441,3 +444,32 @@ def test_trackb_scoped_patch_allows_preserved_or_clean_replacements() -> None:
     )
     assert applied_legacy == 1
     assert "int x = 2;" in patched
+
+
+def test_all_ascendc_renderers_emit_pure_dav3510_without_forbidden_or_legacy_tokens() -> None:
+    """Ensure every Track-B shell renderer emits pure dav-3510 C++20 without legacy tokens."""
+    legacy_tokens = (
+        "PipeBarrier",
+        "LocalTensor",
+        "Mmad",
+        "MmadParams",
+        "DataCopy",
+        "Nd2NzParams",
+        "FixpipeParamsArch3510",
+        "SetL2CacheHint",
+        "CrossCoreSetFlag",
+        "CrossCoreWaitFlag",
+    )
+    assert len(ASCENDC_RENDERERS) == 7
+    for axes, renderer in ASCENDC_RENDERERS.items():
+        rendered = renderer()
+        non_zero_forbidden = {
+            tok: cnt
+            for tok, cnt in CCE_CPP20_SURFACE.count_forbidden_tokens(rendered).items()
+            if cnt > 0
+        }
+        assert non_zero_forbidden == {}, f"{axes.key()} emitted forbidden tokens"
+        for tok in legacy_tokens:
+            assert re.search(rf"\b{re.escape(tok)}\b", rendered) is None, (
+                f"{axes.key()} emitted legacy token {tok!r}"
+            )

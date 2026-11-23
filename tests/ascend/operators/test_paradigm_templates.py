@@ -106,20 +106,27 @@ def test_ascendc_templates_reflect_policy_knobs_and_hardware_idioms():
     cpp_gemm = render_template(SHELL_AIC_GEMM_FIXPIPE, {"swizzle_window": 4, "l1_stages": 1, "sync_mode": "unit_flag", "w4_mode": "w4a16"}, track="ascendc").ascendc_cpp
     assert "windowLen = 4U" in cpp_gemm
     assert "(TOTAL_L1_SIZE >> 1)" in cpp_gemm
-    assert "CACHE_MODE_DISABLE" in cpp_gemm
+    assert "asc_load_l2_cache_mode::NOTALLOC_DROP" in cpp_gemm
+    assert "asc_copy_gm2l1_nd2nz" in cpp_gemm
+    assert "ascend_gemm_l1<" in cpp_gemm
     assert "FIXPIPE_DEQ_SCALE = 64U" in cpp_gemm
 
     cpp_grp = render_template(SHELL_CV_RAGGED_EPILOGUE, {}, track="ascendc").ascendc_cpp
     assert "(endBlockIdx + 1U) % coreNum" in cpp_grp
-    assert "CrossCoreSetFlag" in cpp_grp and "dualDstCtl = 0b01U" in cpp_grp
+    assert "asc_sync_block_arrive" in cpp_grp
+    assert "asc_copy_l0c2ub" in cpp_grp
+    assert "asc_dual_dst_mode::DUAL_DST_SPLIT_M" in cpp_grp
 
     cpp_cv = render_template(SHELL_CV_RING_PIPELINE, {"tile_mnk": (96, 112, 64), "l1_stages": 3}, track="ascendc").ascendc_cpp
     assert "CUBE_TILE_M = 96U" in cpp_cv and "CUBE_TILE_N = 112U" in cpp_cv
-    assert "Nd2NzParams" in cpp_cv
+    assert "asc_copy_l0c2ub" in cpp_cv
+    assert "asc_copy_ub2l1" in cpp_cv
+    assert "asc_sync_block_arrive" in cpp_cv
 
     cpp_pcs = render_template(SHELL_CV_PERSISTENT_STATE, {}, track="ascendc").ascendc_cpp
     assert "0.5f * gTail" in cpp_pcs
-    assert "cmatrixInitVal = false" in cpp_pcs
+    assert "ascend_gemm_l1<" in cpp_pcs
+    assert "asc_sync_pipe(PIPE_V)" in cpp_pcs
 
     cpp_vm = render_template(SHELL_AIV_STRIPED_VM, {"tile_mnk": (32, 256, 1)}, track="ascendc").ascendc_cpp
     assert "VM_NUM_REGS = 32U" in cpp_vm and "VM_W_SLICE = 256U" in cpp_vm

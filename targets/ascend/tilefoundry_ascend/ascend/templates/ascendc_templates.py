@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Mapping
 
 from tilefoundry_ascend.ascend.templates.registry import (
     SHELL_AIC_GEMM_FIXPIPE,
@@ -24,7 +24,7 @@ def _cpp_dtype(dtype: str) -> str:
     }.get(dtype, "half")
 
 
-def render_pure_regbase_simd_cpp(policy: dict[str, Any] | None = None) -> str:
+def render_pure_regbase_simd_cpp(policy: Mapping[str, object] | None = None) -> str:
     """Shell 1 (aiv_only/gm_ub_stream/affine_simd): RegBase C++20 template.
 
     Disables SIMD VF fusion and exposes ``__simd_vf__`` vector functions.
@@ -104,7 +104,7 @@ __no_simd_vf_fusion__ __simd_vf__ void RegBaseRowKernelVF(
 """
 
 
-def render_simt_and_hybrid_ub_cpp(policy: dict[str, Any] | None = None) -> str:
+def render_simt_and_hybrid_ub_cpp(policy: Mapping[str, object] | None = None) -> str:
     """Shell 2 (aiv_only/ub_random_atomic/irregular_simt): hybrid SIMT template.
 
     Uses ``__simt_vf__`` kernels with ``__launch_bounds__(512)``.
@@ -114,9 +114,9 @@ def render_simt_and_hybrid_ub_cpp(policy: dict[str, Any] | None = None) -> str:
     pad_slots = max(8, p["ub_bank_pad_datablocks"])
     return f"""// Ascend 950 (dav-3510) Paradigm 2: SIMT + Hybrid SIMD/SIMT UB
 #include <tl_templates/ascend/common.h>
+#include <c_api/asc_cube.h>
 #include <c_api/asc_simd.h>
-
-constexpr uint32_t SIMT_THREADS = {threads}U;
+#include <simt_api/asc_simt.h>
 constexpr uint32_t UB_WARP_PAD = {pad_slots}U;  // +8 padding eliminates warp atomic bank conflicts
 constexpr uint32_t SIMT_DISPATCH_BYTES_THRESHOLD = 512U;
 
@@ -157,13 +157,13 @@ __aicore__ inline void AdaptiveSimdOrSimtDispatch(uint32_t rowBytes) {{
         asc_vf_call<HybridSimtHashProbeVF>(dim3(SIMT_THREADS, 1, 1));
     }} else {{
         // >512B contiguous rows route through SIMD DMA + RegBase VF
-        PipeBarrier<PIPE_MTE2>();
+        asc_sync_pipe(PIPE_MTE2);
     }}
 }}
 """
 
 
-def render_dense_and_quant_gemm_cpp(policy: dict[str, Any] | None = None) -> str:
+def render_dense_and_quant_gemm_cpp(policy: Mapping[str, object] | None = None) -> str:
     """Shell 3 (aic_only/gm_l1_l0_fixpipe/affine_simd): CATLASS GEMM template.
 
     Covers ``asc::te`` graded kernels plus W4A16 and MXA8W4 variants.
@@ -181,6 +181,8 @@ def render_dense_and_quant_gemm_cpp(policy: dict[str, Any] | None = None) -> str
     w4_mode = p["w4_mode"]
     return f"""// Ascend 950 (dav-3510) Paradigm 3: Dense & Quantized GEMM (W4A16 / MXA8W4)
 #include <tl_templates/ascend/common.h>
+#include <tl_templates/ascend/gemm.h>
+#include <c_api/asc_cube.h>
 #include <c_api/asc_simd.h>
 
 // Scalar-spill-free param struct (<= 64B, zero dynamic array indexing)
@@ -206,27 +208,30 @@ __aicore__ inline void ComputeSwatSerpentineCoord(
 }}
 
 __aicore__ inline void LaunchGemmCoreTile(
-    LocalTensor<half>& l1A, LocalTensor<half>& l1B, LocalTensor<float>& l0C,
+    __cbuf__ half* l1A, __cbuf__ half* l1B, __cc__ float* l0C,
     __gm__ half* gmA, __gm__ uint8_t* gmW4, uint32_t l1Slot, uint32_t deqScaleMode) {{
     // Half-L1 bank isolation: (TOTAL_L1_SIZE >> 1) * slot
     const uint32_t l1HalfOffset = (TOTAL_L1_SIZE >> 1) * (l1Slot & 1U);
     (void)l1HalfOffset;
     // Disable L2 cache pollution on 1-tile streaming operands
-    SetL2CacheHint(gmA, CacheMode::CACHE_MODE_DISABLE);
+    asc_copy_gm2l1_nd2nz(
+        l1A, gmA, static_cast<uint64_t>({bk}U), asc_load_l2_cache_mode::NOTALLOC_DROP,
+        static_cast<uint16_t>({bm}U), {bk}U, static_cast<uint64_t>({bm}U) * {bk}U, false);
     // w4_mode={w4_mode}: AIV DIST_UNPACK4_B8 -> UB->L1 or FP4->FP8 bit-shift + FixPipe deq_scale=64 fold
     constexpr uint32_t FIXPIPE_DEQ_SCALE = 64U;
     constexpr uint32_t UNIT_FLAG_MODE = {unit_flag_expr};
     (void)FIXPIPE_DEQ_SCALE;
     (void)UNIT_FLAG_MODE;
     (void)deqScaleMode;
-    MmadParams mmadParams;
-    mmadParams.unitFlag = UNIT_FLAG_MODE;
-    Mmad(l0C, l1A, l1B, mmadParams);
+    (void)gmW4;
+    asc_unlock(PIPE_MTE1, 0, ASC_LOCK_BLOCK);
+    ascend_gemm_l1<{bm}, {bk}, {bn}, 32, false, half, float>(l0C, l1A, l1B, 1, 0, UNIT_FLAG_MODE);
+    asc_lock(PIPE_M, 0, ASC_LOCK_BLOCK);
 }}
 """
 
 
-def render_grouped_gemm_epilogue_cpp(policy: dict[str, Any] | None = None) -> str:
+def render_grouped_gemm_epilogue_cpp(policy: Mapping[str, object] | None = None) -> str:
     """Shell 4 (coupled_1c2v/l0c_ub_epilogue/ragged_group): grouped MatMul.
 
     Fuses the SwiGLU and quantization epilogue.
@@ -235,10 +240,12 @@ def render_grouped_gemm_epilogue_cpp(policy: dict[str, Any] | None = None) -> st
     bm, bn, bk = p["tile_mnk"]
     return f"""// Ascend 950 (dav-3510) Paradigm 4: Grouped GEMM + Direct L0C->UB SPLIT_M + Fused SwiGLU
 #include <tl_templates/ascend/common.h>
+#include <c_api/asc_cube.h>
 #include <c_api/asc_simd.h>
 
 __aicore__ inline void GroupedGemmRollingDispatch(
-    uint32_t numGroups, const __gm__ int32_t* groupEnds, uint32_t coreIdx, uint32_t coreNum) {{
+    uint32_t numGroups, const __gm__ int32_t* groupEnds, uint32_t coreIdx, uint32_t coreNum,
+    __ubuf__ float* ubOut, __cc__ float* l0cIn) {{
     uint32_t startBlockIdx = 0U;
     int32_t prevEnd = 0;
     for (uint32_t g = 0U; g < numGroups; ++g) {{
@@ -247,8 +254,8 @@ __aicore__ inline void GroupedGemmRollingDispatch(
         prevEnd = gEnd;
         if (m <= 0) {{
             // m == 0 empty-group fast skip while preserving mandatory empty-subblock sync parity
-            CrossCoreSetFlag<0x2, PIPE_FIX>(0);
-            CrossCoreWaitFlag(0);
+            asc_sync_block_arrive(PIPE_FIX, 0);
+            asc_sync_block_wait(PIPE_V, 0);
             continue;
         }}
         // Per-group BaseMBalance + rolling (endBlockIdx + 1) % coreNum
@@ -256,12 +263,13 @@ __aicore__ inline void GroupedGemmRollingDispatch(
         const uint32_t endBlockIdx = (startBlockIdx + mTiles - 1U) % coreNum;
         for (uint32_t mt = 0U; mt < mTiles; ++mt) {{
             if (((startBlockIdx + mt) % coreNum) == coreIdx) {{
-                // L0C->UB SPLIT_M direct FixPipe (dualDstCtl=0b01) -> RegBase SwiGLU + dynamic quant
-                FixpipeParamsArch3510 fixParams;
-                fixParams.mSize = {bm}U / 2U;  // SPLIT_M across 2 AIV subblocks
-                fixParams.nSize = {bn}U;
-                fixParams.dualDstCtl = 0b01U;
-                (void)fixParams;
+                // L0C->UB SPLIT_M direct FixPipe (DUAL_DST_SPLIT_M) -> RegBase SwiGLU + dynamic quant
+                asc_copy_l0c2ub(
+                    ubOut, l0cIn, static_cast<uint16_t>({bn}U), static_cast<uint16_t>({bm}U / 2U),
+                    {bn}U, static_cast<uint16_t>({bn}U), 0,
+                    asc_dual_dst_mode::DUAL_DST_SPLIT_M, asc_unit_flag_mode::DISABLE,
+                    static_cast<asc_quant_mode>(0), asc_relu_pre_mode::NONE,
+                    false, true, false, false);
             }}
         }}
         startBlockIdx = (endBlockIdx + 1U) % coreNum;
@@ -270,7 +278,7 @@ __aicore__ inline void GroupedGemmRollingDispatch(
 """
 
 
-def render_heterogeneous_cv_ring_cpp(policy: dict[str, Any] | None = None) -> str:
+def render_heterogeneous_cv_ring_cpp(policy: Mapping[str, object] | None = None) -> str:
     """Shell 5 (coupled_1c2v/bidirectional_cv_ring/affine_simd): heterogeneous CV ring.
 
     Tile rows stay at or above 82 so the Cube path remains compute-bound.
@@ -281,71 +289,74 @@ def render_heterogeneous_cv_ring_cpp(policy: dict[str, Any] | None = None) -> st
     stages = max(3, p["l1_stages"])
     return f"""// Ascend 950 (dav-3510) Paradigm 5: Heterogeneous {stages}-Stage CV Ring (GQA / MLA / SparseFA)
 #include <tl_templates/ascend/common.h>
+#include <c_api/asc_cube.h>
 #include <c_api/asc_simd.h>
 
 constexpr uint32_t CV_RING_STAGES = {stages}U;
-constexpr uint32_t CUBE_TILE_M = {eff_bm}U;  // M >= 82 keeps AIC Mmad compute-bound (e.g. 96x112)
+constexpr uint32_t CUBE_TILE_M = {eff_bm}U;  // M >= 82 keeps AIC Cube compute-bound (e.g. 96x112)
 constexpr uint32_t CUBE_TILE_N = {bn}U;
 constexpr uint32_t CUBE_TILE_K = {bk}U;
 
 __aicore__ inline void HeterogeneousCVRingStep(
-    LocalTensor<float>& l0cS, LocalTensor<half>& ubP, LocalTensor<half>& l1KropeAliasP,
+    __cc__ float* l0cS, __ubuf__ float* ubS, __ubuf__ half* ubP, __cbuf__ half* l1KropeAliasP,
     uint32_t kvBlockIdx, const __gm__ int32_t* sparseBlockOffsets) {{
     // AIV-ahead sparse block offset resolution
     const int32_t kvPhysOffset = (sparseBlockOffsets != nullptr) ? sparseBlockOffsets[kvBlockIdx] : static_cast<int32_t>(kvBlockIdx * CUBE_TILE_N);
     (void)kvPhysOffset;
     // 1. L0C->UB SPLIT_M FixPipe
-    FixpipeParamsArch3510 sFix;
-    sFix.mSize = CUBE_TILE_M / 2U;
-    sFix.nSize = CUBE_TILE_N;
-    sFix.dualDstCtl = 0b10U;
+    asc_copy_l0c2ub(
+        ubS, l0cS, static_cast<uint16_t>(CUBE_TILE_N), static_cast<uint16_t>(CUBE_TILE_M / 2U),
+        CUBE_TILE_N, static_cast<uint16_t>(CUBE_TILE_N), 0,
+        asc_dual_dst_mode::DUAL_DST_SPLIT_M, asc_unit_flag_mode::DISABLE,
+        static_cast<asc_quant_mode>(0), asc_relu_pre_mode::NONE,
+        false, true, false, false);
     // 2. AIV RegBase online softmax + cast -> ubP
-    // 3. UB->L1 Nd2Nz aliasing K_rope L1 slot in-place for P
-    Nd2NzParams nd2nz;
-    nd2nz.ndNum = 1U;
-    nd2nz.nValue = CUBE_TILE_M / 2U;
-    nd2nz.dValue = CUBE_TILE_N;
-    DataCopy(l1KropeAliasP, ubP, nd2nz);
-    CrossCoreSetFlag<0x2, PIPE_MTE3>(1);
-    CrossCoreWaitFlag(1);
+    // 3. UB->L1 alias copy into K_rope L1 slot in-place for P
+    asc_copy_ub2l1(
+        l1KropeAliasP, ubP, 1U,
+        static_cast<uint16_t>((CUBE_TILE_M / 2U) * CUBE_TILE_N * sizeof(half) / 32U),
+        0U, 0U);
+    asc_sync_block_arrive(PIPE_MTE3, 1);
+    asc_sync_block_wait(PIPE_M, 1);
 }}
 """
 
 
-def render_persistent_chunk_state_cpp(policy: dict[str, Any] | None = None) -> str:
+def render_persistent_chunk_state_cpp(policy: Mapping[str, object] | None = None) -> str:
     """Shell 6 (coupled_1c2v/persistent_onchip_state/affine_simd): persistent state.
 
     Keeps chunk and recurrent state on chip across the (B, H) grid.
     """
     p = normalize_schedule_policy(SHELL_CV_PERSISTENT_STATE, policy)
     bm, bn, bk = p["tile_mnk"]
-    return """// Ascend 950 (dav-3510) Paradigm 6: Persistent (B, H) Chunk State (KDA / Sinkhorn / LaCT-TTT)
+    return f"""// Ascend 950 (dav-3510) Paradigm 6: Persistent (B, H) Chunk State (KDA / Sinkhorn / LaCT-TTT)
 #include <tl_templates/ascend/common.h>
+#include <tl_templates/ascend/gemm.h>
+#include <c_api/asc_cube.h>
 #include <c_api/asc_simd.h>
 
 __aicore__ inline void PersistentChunkStateLoop(
-    __ubuf__ float* stateUb, LocalTensor<float>& l0cH, LocalTensor<half>& l1A, LocalTensor<half>& l1B,
-    uint32_t numChunks, float gTail) {
+    __ubuf__ float* stateUb, __cc__ float* l0cH, __cbuf__ half* l1A, __cbuf__ half* l1B,
+    uint32_t numChunks, float gTail) {{
     // Exp range halving: anchor = G_tail / 2 splits exp(g_t) -> exp(g_t - anchor) * exp(anchor)
     const float anchor = 0.5f * gTail;
     (void)anchor;
-    for (uint32_t ch = 0U; ch < numChunks; ++ch) {
-        // Zero intermediate GM state roundtrips: FP32 state remains UB/L1/L0C resident
-        MmadParams mmad;
-        mmad.isBias = false;
-        mmad.cmatrixInitVal = false;  // initC=false in-place L0C accumulation (history + local)
-        Mmad(l0cH, l1A, l1B, mmad);
-    }
+    for (uint32_t ch = 0U; ch < numChunks; ++ch) {{
+        // Zero intermediate GM state roundtrips: FP32 state remains UB/L1/L0C resident (clear_accum=0)
+        asc_unlock(PIPE_MTE1, 0, ASC_LOCK_BLOCK);
+        ascend_gemm_l1<{bm}, {bk}, {bn}, 32, false, half, float>(l0cH, l1A, l1B, 0, 0, 0);
+        asc_lock(PIPE_M, 0, ASC_LOCK_BLOCK);
+    }}
     // 5-step Newton-Schulz on-chip loop for Muon/LaCT-TTT orthogonalization
-    for (uint32_t ns = 0U; ns < 5U; ++ns) {
-        PipeBarrier<PIPE_V>();
-    }
+    for (uint32_t ns = 0U; ns < 5U; ++ns) {{
+        asc_sync_pipe(PIPE_V);
+    }}
     (void)stateUb;
-}
+}}
 """
 
 
-def render_striped_register_vm_cpp(policy: dict[str, Any] | None = None) -> str:
+def render_striped_register_vm_cpp(policy: Mapping[str, object] | None = None) -> str:
     """Shell 7 (aiv_only/persistent_onchip_state/dynamic_opcode_stream): striped VM.
 
     Partitions the horizontal W dimension across register-resident stripes.

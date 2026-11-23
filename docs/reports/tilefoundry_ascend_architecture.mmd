@@ -1,58 +1,55 @@
 flowchart TB
-  subgraph P1["Plane 1: Symbolic Contract & Compilation Plane"]
+  subgraph P1["第一平面：语义契约与统一编译平面"]
     direction LR
-    C1["Operator Contract & Shape Anchors"]
-    C2["Unified ascend_compile_session (HIR -> TIR)"]
-    C3["Positional Anchor Specialization (PrimFunc.specialize + Non-Zero Div Bound)"]
-    C4["EnvelopeInspector Two-Snapshot Lowering Diff"]
-    C5["SILVerifier (14 Redlines + Cross-Core CFG) & Z3 Pipeline"]
+    C1["算子语义契约与锚点形状"]
+    C2["连续编译上下文会话"]
+    C3["真实锚点按位特化与防除零保护"]
+    C4["编译前后双快照缓存包络比对"]
+    C5["十四项硬件红线与模调度流水求解"]
     C1 --> C2 --> C3 --> C4 --> C5
   end
 
-  subgraph P2["Plane 2: Multi-Shape Regime Dispatch & Isolation Plane"]
+  subgraph P2["第二平面：多形状物理相态分派与隔离平面"]
     direction LR
-    R1["CasePhysicsRatios Classification (+ _subatom)"]
-    R2["Weighted Lexicographic Regime Partition (1..4 Regimes)"]
-    R3["patch_regime_into_module (CoW _{regime_tag}_* & Pruning)"]
-    R4["Dual-Layer Tail Guard (Active Floor + Sibling Zero-Regress)"]
-    R5["Kernel Cache Two-Pass Idempotence (Delta|Cache| == 0)"]
+    R1["物理特征比值与子原子归约分类"]
+    R2["加权字典序 2~4 有界相态聚类"]
+    R3["写时复制符号隔离与死代码清理"]
+    R4["双层尾部性能防退化护栏"]
+    R5["纯形状缓存键与双遍重放零增长"]
     R1 --> R2 --> R3 --> R4 --> R5
   end
 
-  subgraph P3["Plane 3: BiSheng Sink-Down & 3-Tier Residual Cost Plane"]
+  subgraph P3["第三平面：编译器机制下沉与三层残差代价平面"]
     direction LR
-    B1["CompilerBehaviorRegistry (8 Detectors incl. .asc UB Scalar Loop)"]
-    B2["Tier-0 Roofline & 6-Pipe/AVE Evaluator (216/248/256 KiB UB)"]
-    B3["Tier-1 Deterministic Compiler Penalty Synthesizer"]
-    B4["Tier-2 HybridAscendCostModel (12/8 Residual Basis + Delta)"]
-    B5["ExperienceLake Topology Buckets & Anomaly Ledger"]
+    B1["底层编译器行为惩罚(7类)+2类下沉检测"]
+    B2["第一层：Roofline 分段带宽与六流水线模型"]
+    B3["第二层：确定性编译退化惩罚折算"]
+    B4["第三层：三维拓扑分桶岭回归与成对排序"]
+    B5["经验湖同桶校准与极端离群点隔离"]
     B1 --> B2 --> B3 --> B4 --> B5
   end
 
-  subgraph P4["Plane 4: Dual-Track Neuro-Symbolic Evolution Plane"]
+  subgraph P4["第四平面：双轨神经符号调度进化平面"]
     direction LR
-    E1["Zero-Phi MECE CapabilityGate (TopologyAxes + ISAGapScanner + CasePhysicsRatios)"]
-    E2["Dual-Track Shells (tilelang_dsl + ascendc_template)"]
-    E3["40 Causal Rules R01..R40 (13 SymptomFamilies, l2_pmu_available Guard)"]
-    E4["3-Layer Constraints (CANN 9.3 dav-3510 On-Demand L2 + G1..G5 + Stage-0 +4)"]
-    E5["Rule-Blind Bounded explore_creative & FlywheelDistiller"]
+    E1["三维正交拓扑与硬件指令缺口路由器"]
+    E2["TileLang 方言轨 + Track-B CCE (C++20) 轨"]
+    E3["两级按需裁剪 CANN 9.2/9.3 接口与三层约束"]
+    E4["父代单调性锁定与冷启动单调收敛延展"]
+    E5["四十条因果规则、实测计数器守卫与飞轮蒸馏"]
     E1 --> E2 --> E3 --> E4 --> E5
   end
 
-  subgraph P5["Plane 5: Five-Tier (L0-L4) Verification & AgentGates Control Plane"]
+  subgraph P5["第五平面：五层渐进验证门禁与受控执行平面"]
     direction LR
-    G1["L0 Static Lint & Cache-Key Pollution Audit"]
-    G2["L1 Schedule Redlines G1..G5 & SILVerifier"]
-    G3["L2 Lowering Envelope & Bounded Cost Screening"]
-    G4["L3 Full Contract Suite & Replay Idempotence"]
-    G5["L4 Official CANNBench Real-NPU Signed v2 Receipts (cannSeries + Zero-Lock Worktrees)"]
+    G1["L0 静态卫生与缓存键纯净度审计"]
+    G2["L1 调度红线与异构核间同步对称校验"]
+    G3["L2 编译包络与代理代价模型初筛"]
+    G4["L3 全量形状契约与重放幂等验证"]
+    G5["L4 多工作树零锁真机评测与版本签名凭据"]
     G1 --> G2 --> G3 --> G4 --> G5
   end
 
-  P1 --> P2
-  P2 --> P3
-  P3 --> P4
-  P4 --> P5
-  P5 -. "Real-NPU Telemetry & Residual Quarantine" .-> P3
-  P5 -. "Counterfactual Causal Rules & Sink-Down Tickets" .-> P4
-  B1 -. "Deterministic Compiler Facts" .-> E4
+  P1 --> P2 --> P3 --> P4 --> P5
+  P5 -. "实测时延与硬件计数器回流校准经验湖" .-> P3
+  P5 -. "更新三维拓扑因果后验权重与局部禁忌表" .-> P4
+  B1 -. "将共性编译悬崖固化为静态检测规则" .-> P1

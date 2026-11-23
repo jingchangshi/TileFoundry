@@ -1,12 +1,12 @@
 flowchart LR
-  S1["Stage 1: Operator Contract & Unified Session<br/>HIR/TIR Positional Binding + Non-Zero Div PrimFunc.specialize + Two-Snapshot Diff"]
-  S2["Stage 2: Regime Partition & Z3 Pipeline<br/>Physics Sub-Atom Classification + CoW Namespacing + Tail Guard"]
-  S3["Stage 3: Compiler Sink-Down & Cost Screening<br/>8-Detector .asc UB Scalar Sink-Down + Tier-0/1/2 Hybrid Model"]
-  S4["Stage 4: Dual-Track Routing & Constraint Synthesis<br/>Zero-Phi MECE Router + CANN 9.3 On-Demand L2 Pruning (G1..G5) + Stage-0 +4"]
-  S5["Stage 5: Pre-NPU Contract & Replay Gates (L0-L3)<br/>Static Key Audit + SILVerifier + R01..R40 l2_pmu_available Guard + Cache Idempotence"]
-  S6["Stage 6: Real-NPU Execution & Flywheel Convergence (L4)<br/>Worktree-Isolated AgentGates cannSeries v2 Receipts + Anomaly Guard + FlywheelDistiller"]
+  S1["阶段一：语义契约与统一编译会话<br/>算子锚点按位特化 + 防除零保护 + 编译前后双快照比对"]
+  S2["阶段二：多形状物理相态与流水调度<br/>子原子归约分类 + 2~4 有界相态聚类 + 写时复制隔离与尾部护栏"]
+  S3["阶段三：机制下沉与三层残差代价初筛<br/>底层编译器行为惩罚(7类)+2类下沉 + Roofline/六流水线 + 岭回归校准"]
+  S4["阶段四：双轨调度路由与三层约束合成<br/>三维拓扑指令缺口路由 + TileLang/Track-B CCE (C++20) + CANN 9.2/9.3 按需裁剪"]
+  S5["阶段五：真机前契约与重放幂等门禁 (L0-L3)<br/>纯形状缓存键审计 + 十四项红线与同步对称校验 + 实测计数器守卫"]
+  S6["阶段六：真机受控评测与飞轮收敛 (L4)<br/>多工作树零锁真机评测 + 版本签名凭据 + 离群隔离与因果规则蒸馏"]
 
   S1 --> S2 --> S3 --> S4 --> S5 --> S6
-  S6 -. "Residual Outlier Guard & ExperienceLake Update" .-> S3
-  S6 -. "Causal Posterior & Anti-Precondition Crystallization" .-> S4
-  S6 -. "Sink-Down Detector Promotion" .-> S1
+  S6 -. "实测时延、计数器与离群点回流更新经验湖" .-> S3
+  S6 -. "三维拓扑因果后验权重与反前提条件固化" .-> S4
+  S6 -. "共性编译退化机制下沉为静态检测规则" .-> S1

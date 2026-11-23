@@ -1056,11 +1056,12 @@ def _validate_stage0_entrypoint_and_alias(
     return validate_entrypoint_signature_compatibility(module_source, contract)
 
 
-def _extract_oracle_numeric_error(oracle_detail: str) -> float | None:
-    """Extract the primary finite numerical error metric from an L3 oracle detail string."""
+def _extract_oracle_numeric_errors(oracle_detail: str) -> dict[str, float]:
+    """Extract all finite non-negative oracle error metrics from an L3 detail string."""
     if not oracle_detail:
-        return None
-    for key in ("max_abs_diff", "max_diff", "mere", "mare", "abs_diff"):
+        return {}
+    errors: dict[str, float] = {}
+    for key in ("mere", "mare", "max_abs_diff", "max_diff", "abs_diff"):
         match = re.search(
             rf"\b{key}\s*[=:]\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|nan|inf|-inf)\b",
             oracle_detail,
@@ -1072,10 +1073,42 @@ def _extract_oracle_numeric_error(oracle_detail: str) -> float | None:
             val = float(match.group(1))
         except ValueError:
             continue
-        if not math.isfinite(val) or val < 0.0:
-            return None
-        return val
+        if math.isfinite(val) and val >= 0.0:
+            errors[key] = val
+    return errors
+
+
+def _extract_oracle_numeric_error(oracle_detail: str) -> float | None:
+    """Extract the primary finite numerical error metric from an L3 oracle detail string."""
+    errors = _extract_oracle_numeric_errors(oracle_detail)
+    for key in ("max_abs_diff", "max_diff", "mere", "mare", "abs_diff"):
+        if key in errors:
+            return errors[key]
     return None
+
+
+def _is_oracle_converging(
+    prev_metrics: Mapping[str, float],
+    curr_metrics: Mapping[str, float],
+) -> bool:
+    """Return True when shared oracle metrics improve >=5% without max-diff blowup."""
+    shared = [
+        key
+        for key in ("mere", "mare", "max_abs_diff", "max_diff", "abs_diff")
+        if key in prev_metrics and key in curr_metrics
+    ]
+    if not shared:
+        return False
+    if not any(curr_metrics[key] < 0.95 * prev_metrics[key] for key in shared):
+        return False
+    for bound_key in ("max_abs_diff", "max_diff"):
+        if (
+            bound_key in prev_metrics
+            and bound_key in curr_metrics
+            and curr_metrics[bound_key] > 1.05 * prev_metrics[bound_key]
+        ):
+            return False
+    return True
 
 
 async def prepare_operator_seed_or_takeover(
@@ -1264,7 +1297,7 @@ async def prepare_operator_seed_or_takeover(
     track_a_oracle_attempts = 0
     last_l0_l1_passing_dsl_source: str | None = None
     attempt_stages: list[Literal["static", "oracle"]] = []
-    oracle_errors: list[float] = []
+    oracle_error_history: list[dict[str, float]] = []
     track_a_budget = (
         max(2, max_seed_attempts // 2)
         if active_track == "tilelang_dsl" and max_seed_attempts >= 4
@@ -1276,7 +1309,7 @@ async def prepare_operator_seed_or_takeover(
         candidate_source: str,
         *,
         stage: Literal["static", "oracle"] = "static",
-        oracle_error: float | None = None,
+        oracle_errors: Mapping[str, float] | None = None,
     ) -> None:
         nonlocal active_track, attempt, blueprint_block, constraint_block, contract_block
         nonlocal l0_l1_validator, last_error, last_rejected_error, last_rejected_source
@@ -1289,10 +1322,17 @@ async def prepare_operator_seed_or_takeover(
         else:
             last_rejected_source = candidate_source
         attempt_stages.append(stage)
-        if stage == "oracle" and oracle_error is not None:
-            oracle_errors.append(oracle_error)
-        else:
-            oracle_errors.clear()
+        if stage == "oracle":
+            if oracle_errors:
+                oracle_error_history.append(dict(oracle_errors))
+            else:
+                oracle_error_history.clear()
+        elif (
+            len(attempt_stages) >= 2
+            and attempt_stages[-1] == "static"
+            and attempt_stages[-2] == "static"
+        ):
+            oracle_error_history.clear()
         if active_track == "tilelang_dsl":
             if stage == "static":
                 track_a_static_failures += 1
@@ -1339,13 +1379,11 @@ async def prepare_operator_seed_or_takeover(
             return True
         if attempt > base_attempts + max_extra_attempts:
             return False
-        return (
-            len(attempt_stages) >= 2
-            and attempt_stages[-1] == "oracle"
-            and attempt_stages[-2] == "oracle"
-            and len(oracle_errors) >= 2
-            and oracle_errors[-1] < 0.95 * oracle_errors[-2]
-        )
+        if not attempt_stages or attempt_stages[-1] != "oracle":
+            return False
+        if len(oracle_error_history) < 2:
+            return False
+        return _is_oracle_converging(oracle_error_history[-2], oracle_error_history[-1])
 
     while _should_continue_seed_loop():
         attempts_used = attempt
@@ -1494,7 +1532,7 @@ async def prepare_operator_seed_or_takeover(
             f"NPU numerical mismatch against PyTorch golden:\n{oracle_detail}",
             synthesized_src,
             stage="oracle",
-            oracle_error=_extract_oracle_numeric_error(oracle_detail),
+            oracle_errors=_extract_oracle_numeric_errors(oracle_detail),
         )
 
     raise RuntimeError(

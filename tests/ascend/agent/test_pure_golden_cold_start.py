@@ -2391,3 +2391,205 @@ def test_stage0_monotonic_plus_four_oracle_refinement_unlock_and_stop() -> None:
         )
     assert static_step == 3
 
+
+def test_stage0_multimetric_mere_convergence_and_intervening_static_unlock() -> None:
+    """Unlock +4 via MERE drop with flat max_diff and survive one intervening static fail."""
+    golden = dedent(
+        """
+        import torch
+
+        def vec_op(x: torch.Tensor) -> torch.Tensor:
+            return torch.exp(x)
+        """
+    )
+    proto = {
+        "name": "vec_op",
+        "inputs": [{"name": "x", "dtype": "float32"}],
+        "outputs": [{"name": "y", "dtype": "float32"}],
+    }
+    cases = [{"case_id": 1, "input_shape": [[64, 128]], "dtype": ["float32"], "attrs": {}}]
+    seed_src = dedent(
+        """
+        import torch
+
+        def vec_op(x: torch.Tensor) -> torch.Tensor:
+            return torch.exp(x)
+
+        kernel = vec_op
+        """
+    ).strip()
+    digest = hashlib.sha256(seed_src.encode("utf-8")).hexdigest()
+
+    def _always_static(_regimes: tuple[RegimeTargetSpec, ...], *, semantics: object | None = None):
+        _ = semantics
+        return lambda _src, _track: (True, "")
+
+    mere_calls = 0
+
+    def _mere_converging_then_pass(src: str) -> OracleAccuracyResult:
+        nonlocal mere_calls
+        mere_calls += 1
+        checkpoints = (
+            (5.0, 0.50),
+            (4.8, 0.50),
+            (4.6, 0.49),
+            (4.4, 0.49),
+            (4.2, 0.49),
+            (2.0, 0.48),
+            (1.5, 0.47),
+            (1.1, 0.46),
+            (0.8, 0.45),
+        )
+        if mere_calls <= len(checkpoints):
+            mere_val, max_diff_val = checkpoints[mere_calls - 1]
+            return OracleAccuracyResult(
+                passed=False,
+                error_message=f"MERE={mere_val:.4f}, max_diff={max_diff_val:.4f}",
+                l3_state="FAILED",
+                failure_kind="candidate",
+            )
+        assert hashlib.sha256(src.encode("utf-8")).hexdigest() == digest
+        return OracleAccuracyResult(
+            passed=True,
+            candidate_sha256=digest,
+            l3_run_id="run-mere-pass",
+            l3_receipt_path="/tmp/mere-pass.json",
+            l3_state="FINISHED",
+        )
+
+    outcome = asyncio.run(
+        prepare_operator_seed_or_takeover(
+            operator_name="level1/vec_op",
+            entrypoint="vec_op",
+            pytorch_golden_source=golden,
+            proto=proto,
+            cases=cases,
+            legacy_regime_specs=None,
+            llm_backend=_ScriptedBackend([seed_src]),
+            l0_l1_validator_factory=_always_static,
+            oracle_accuracy_validator=_mere_converging_then_pass,
+            force_cold_start=True,
+            max_seed_attempts=8,
+            max_oracle_refinement_extension=4,
+        )
+    )
+    assert outcome.attempts_used == 10
+    assert mere_calls == 10
+
+    one_static_step = 0
+
+    def _one_intervening_static(
+        _regimes: tuple[RegimeTargetSpec, ...],
+        *,
+        semantics: object | None = None,
+    ):
+        _ = semantics
+
+        def _check(_src: str, _track: str) -> tuple[bool, str]:
+            nonlocal one_static_step
+            one_static_step += 1
+            if one_static_step == 2:
+                return False, "single repaired syntax error"
+            return True, ""
+
+        return _check
+
+    one_static_oracle_calls = 0
+
+    def _oracle_across_single_static(src: str) -> OracleAccuracyResult:
+        nonlocal one_static_oracle_calls
+        one_static_oracle_calls += 1
+        if one_static_oracle_calls == 1:
+            return OracleAccuracyResult(
+                passed=False,
+                error_message="MERE=2.0, max_diff=0.48",
+                l3_state="FAILED",
+                failure_kind="candidate",
+            )
+        if one_static_oracle_calls == 2:
+            return OracleAccuracyResult(
+                passed=False,
+                error_message="MERE=1.5, max_diff=0.47",
+                l3_state="FAILED",
+                failure_kind="candidate",
+            )
+        assert hashlib.sha256(src.encode("utf-8")).hexdigest() == digest
+        return OracleAccuracyResult(
+            passed=True,
+            candidate_sha256=digest,
+            l3_run_id="run-single-static-pass",
+            l3_receipt_path="/tmp/single-static-pass.json",
+            l3_state="FINISHED",
+        )
+
+    outcome_single = asyncio.run(
+        prepare_operator_seed_or_takeover(
+            operator_name="level1/vec_op",
+            entrypoint="vec_op",
+            pytorch_golden_source=golden,
+            proto=proto,
+            cases=cases,
+            legacy_regime_specs=None,
+            llm_backend=_ScriptedBackend([seed_src]),
+            l0_l1_validator_factory=_one_intervening_static,
+            oracle_accuracy_validator=_oracle_across_single_static,
+            force_cold_start=True,
+            max_seed_attempts=3,
+            max_oracle_refinement_extension=4,
+        )
+    )
+    assert outcome_single.attempts_used == 4
+    assert one_static_step == 4
+    assert one_static_oracle_calls == 3
+
+    two_static_step = 0
+
+    def _two_consecutive_static(
+        _regimes: tuple[RegimeTargetSpec, ...],
+        *,
+        semantics: object | None = None,
+    ):
+        _ = semantics
+
+        def _check(_src: str, _track: str) -> tuple[bool, str]:
+            nonlocal two_static_step
+            two_static_step += 1
+            if two_static_step in (2, 3):
+                return False, "consecutive syntax failure"
+            return True, ""
+
+        return _check
+
+    two_static_oracle_calls = 0
+
+    def _oracle_after_two_static(_src: str) -> OracleAccuracyResult:
+        nonlocal two_static_oracle_calls
+        two_static_oracle_calls += 1
+        mere_val = 2.0 if two_static_oracle_calls == 1 else 1.5
+        return OracleAccuracyResult(
+            passed=False,
+            error_message=f"MERE={mere_val:.1f}, max_diff=0.48",
+            l3_state="FAILED",
+            failure_kind="candidate",
+        )
+
+    with pytest.raises(RuntimeError, match="after 4 attempts"):
+        asyncio.run(
+            prepare_operator_seed_or_takeover(
+                operator_name="level1/vec_op",
+                entrypoint="vec_op",
+                pytorch_golden_source=golden,
+                proto=proto,
+                cases=cases,
+                legacy_regime_specs=None,
+                llm_backend=_ScriptedBackend([seed_src]),
+                l0_l1_validator_factory=_two_consecutive_static,
+                oracle_accuracy_validator=_oracle_after_two_static,
+                force_cold_start=True,
+                max_seed_attempts=4,
+                max_oracle_refinement_extension=4,
+            )
+        )
+    assert two_static_step == 4
+    assert two_static_oracle_calls == 2
+

@@ -19,9 +19,9 @@
 
 | Target Code Scope | `[SEC-*]` | Exact Sliced Route |
 | :--- | :--- | :--- |
-| `ascend/sil/`, `pytorch_frontend.py`, `regime_solver.py` | `[SEC-M1]` | [`01_mece_contracts_and_routing.md` (`L5-L21`)](./docs/ascend/01_mece_contracts_and_routing.md#L5-L21) |
-| `orchestrator/llm_constraints.py`, `portfolio_runner.py`, `seed_synthesizer.py`, `campaign_runner.py` | `[SEC-M2]` | [`01_mece_contracts_and_routing.md` (`L22-L43`)](./docs/ascend/01_mece_contracts_and_routing.md#L22-L43) |
-| `observation_space.py`, `msprof_report_parser.py`, `agent/kb/` | `[SEC-M3]` | [`01_mece_contracts_and_routing.md` (`L44-L69`)](./docs/ascend/01_mece_contracts_and_routing.md#L44-L69) |
+| `ascend/sil/`, `pytorch_frontend.py`, `regime_solver.py` | `[SEC-C1]` | [`01_mece_contracts_and_routing.md` (`L5-L21`)](./docs/ascend/01_mece_contracts_and_routing.md#L5-L21) |
+| `orchestrator/llm_constraints.py`, `portfolio_runner.py`, `seed_synthesizer.py`, `campaign_runner.py` | `[SEC-C2]` | [`01_mece_contracts_and_routing.md` (`L22-L43`)](./docs/ascend/01_mece_contracts_and_routing.md#L22-L43) |
+| `observation_space.py`, `msprof_report_parser.py`, `agent/kb/` | `[SEC-C3]` | [`01_mece_contracts_and_routing.md` (`L44-L69`)](./docs/ascend/01_mece_contracts_and_routing.md#L44-L69) |
 | `cost_model/` | `[SEC-G1]` | [`02_residual_convergence_and_gates.md` (`L5-L31`)](./docs/ascend/02_residual_convergence_and_gates.md#L5-L31) |
 | `gate_funnel.py`, `envelope_inspector.py`, `verifier.py` | `[SEC-G2]` | [`02_residual_convergence_and_gates.md` (`L32-L38`)](./docs/ascend/02_residual_convergence_and_gates.md#L32-L38) |
 | `test_npu_acceptance.py`, `l3_contract.py`, `surrogate_cannbench.py` | `[SEC-G3]` | [`02_residual_convergence_and_gates.md` (`L39-L53`)](./docs/ascend/02_residual_convergence_and_gates.md#L39-L53) |

@@ -655,6 +655,141 @@ def ensure_npu_compare_shim_dir(
     return out_dir
 
 
+def _extract_concrete_shape_list(raw_shapes: object) -> list[tuple[int, ...]]:
+    """Extract concrete integer tensor shapes from single, multi, or nested payloads."""
+    if not isinstance(raw_shapes, (list, tuple)) or not raw_shapes:
+        return []
+    if all(isinstance(dim, int) and not isinstance(dim, bool) and dim >= 0 for dim in raw_shapes):
+        return [tuple(int(dim) for dim in raw_shapes)]
+    out: list[tuple[int, ...]] = []
+    for item in raw_shapes:
+        if item is None:
+            continue
+        if isinstance(item, (list, tuple)) and item:
+            if all(
+                isinstance(dim, int) and not isinstance(dim, bool) and dim >= 0 for dim in item
+            ):
+                out.append(tuple(int(dim) for dim in item))
+            else:
+                out.extend(_extract_concrete_shape_list(item))
+    return out
+
+
+def _resolve_proto_output_shapes(
+    proto: Mapping[str, object] | None,
+    *,
+    dims: Mapping[str, object] | None,
+    attrs: Mapping[str, object] | None,
+) -> list[tuple[int, ...]]:
+    """Resolve concrete output shapes from proto output specs when all axes are known."""
+    if not isinstance(proto, Mapping):
+        return []
+    op_block = (
+        proto["operator"]
+        if "outputs" not in proto and isinstance(proto.get("operator"), Mapping)
+        else proto
+    )
+    raw_outputs = op_block.get("outputs") if isinstance(op_block, Mapping) else None
+    if not isinstance(raw_outputs, Sequence) or isinstance(raw_outputs, (str, bytes)):
+        return []
+    dim_lookup: dict[str, int] = {}
+    for src in (attrs, dims):
+        if not isinstance(src, Mapping):
+            continue
+        for key, val in src.items():
+            if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
+                dim_lookup[str(key).strip().lower()] = int(val)
+    raw_layout = ""
+    for src in (attrs, dims):
+        if isinstance(src, Mapping):
+            for lkey in ("inputLayout", "input_layout", "layout"):
+                if isinstance(src.get(lkey), str) and str(src[lkey]).strip():
+                    raw_layout = str(src[lkey]).strip().upper()
+                    break
+        if raw_layout:
+            break
+    resolved: list[tuple[int, ...]] = []
+    for item in raw_outputs:
+        if not isinstance(item, Mapping):
+            continue
+        shape_spec = item.get("shape")
+        if not isinstance(shape_spec, str) or "[" not in shape_spec:
+            continue
+        matches = re.findall(r"(?:([A-Za-z0-9_]+)\s*:\s*)?\[([^\]]+)\]", shape_spec)
+        chosen = ""
+        if raw_layout:
+            for tag, inner in matches:
+                if tag.strip().upper() == raw_layout:
+                    chosen = inner
+                    break
+        if not chosen and matches:
+            chosen = matches[0][1]
+        if not chosen:
+            continue
+        tokens = [tok.strip() for tok in chosen.split(",") if tok.strip()]
+        shape_vals: list[int] = []
+        ok = bool(tokens)
+        for tok in tokens:
+            if tok.isdigit():
+                shape_vals.append(int(tok))
+            else:
+                matched = dim_lookup.get(tok.lower())
+                if matched is None:
+                    ok = False
+                    break
+                shape_vals.append(matched)
+        if ok:
+            resolved.append(tuple(shape_vals))
+    return resolved
+
+
+def extract_ordered_tensor_shapes(
+    *,
+    case_entry: Mapping[str, object] | None = None,
+    dims: Mapping[str, object] | None = None,
+    proto: Mapping[str, object] | None = None,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
+) -> tuple[tuple[int, ...], ...] | None:
+    """Extract parameter-ordered concrete tensor shapes from case, dims, or proto specs."""
+    if ordered_tensor_shapes is not None:
+        explicit = _extract_concrete_shape_list(ordered_tensor_shapes)
+        return tuple(explicit) if explicit else None
+
+    for container in (case_entry, dims):
+        if isinstance(container, Mapping) and "ordered_tensor_shapes" in container:
+            explicit = _extract_concrete_shape_list(container.get("ordered_tensor_shapes"))
+            if explicit:
+                return tuple(explicit)
+
+    inputs: list[tuple[int, ...]] = []
+    outputs: list[tuple[int, ...]] = []
+    for container in (case_entry, dims):
+        if not isinstance(container, Mapping):
+            continue
+        if not inputs:
+            raw_in = (
+                container.get("input_shapes")
+                if "input_shapes" in container
+                else container.get("input_shape")
+            )
+            inputs = _extract_concrete_shape_list(raw_in)
+        if not outputs:
+            raw_out = (
+                container.get("output_shapes")
+                if "output_shapes" in container
+                else container.get("output_shape")
+            )
+            outputs = _extract_concrete_shape_list(raw_out)
+
+    if not outputs and proto is not None:
+        raw_attrs = case_entry.get("attrs") if isinstance(case_entry, Mapping) else None
+        attrs = raw_attrs if isinstance(raw_attrs, Mapping) else None
+        outputs = _resolve_proto_output_shapes(proto, dims=dims, attrs=attrs)
+
+    combined = [*inputs, *outputs]
+    return tuple(combined) if combined else None
+
+
 def run_l0_static_precheck(
     module_source: str,
     *,
@@ -665,8 +800,17 @@ def run_l0_static_precheck(
     compile_flags: Sequence[str] | str | None = None,
     dims: Mapping[str, object] | None = None,
     var_bindings: Mapping[str, int] | None = None,
+    case_entry: Mapping[str, object] | None = None,
+    proto: Mapping[str, object] | None = None,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> StageAResult:
     """Run Tier L0 static AST, ledger, and router inspection on Host CPU."""
+    resolved_shapes = extract_ordered_tensor_shapes(
+        case_entry=case_entry,
+        dims=dims,
+        proto=proto,
+        ordered_tensor_shapes=ordered_tensor_shapes,
+    )
     return run_stage_a_static(
         module_source,
         factory_name=builder_name,
@@ -676,6 +820,7 @@ def run_l0_static_precheck(
         config_selector_name=config_selector_name,
         dims=dims,
         var_bindings=var_bindings,
+        ordered_tensor_shapes=resolved_shapes,
     )
 
 
@@ -4157,6 +4302,7 @@ __all__ = [
     "collect_bottleneck_msprof_via_agent_gates",
     "collect_p2_deep_dive_via_agent_gates",
     "ensure_npu_compare_shim_dir",
+    "extract_ordered_tensor_shapes",
     "lookup_case_static_spec",
     "prewarm_anchor_reference_cache",
     "prewarm_surrogate_tilelang_cache",

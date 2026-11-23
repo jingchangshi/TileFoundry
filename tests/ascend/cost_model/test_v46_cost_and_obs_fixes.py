@@ -19,6 +19,7 @@ from tilefoundry_ascend.agent.kb import (
 from tilefoundry_ascend.ascend.cost_model import (
     Ascend950PipeScheduleEvaluator,
     HybridAscendCostModel,
+    build_cost_features_from_ledger,
     extract_microarch_profile_from_tirx,
     project_case_workload,
 )
@@ -222,3 +223,75 @@ def test_dynamic_total_elements_t_copy_specializes_mte2_and_gm_to_ub() -> None:
     )
     assert mte2_cycles > 0
     assert int(res.ledger.microarch_profile.get("gm_to_ub_bytes", 0)) > 0
+
+
+def test_ub_scalar_compute_loops_propagates_to_cost_features_and_projection() -> None:
+    """Propagate ub_scalar_compute_loops from ledger to 1.0 FLOP/cycle scalar penalty."""
+    target = AscendTarget("ascend.950pr")
+    model = HybridAscendCostModel(target)
+    axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
+
+    clean_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 4000, "AIV0.PIPE_MTE2": 200},
+        waterlines={},
+        grid_blocks=56,
+        gm_roundtrip_bytes=65536,
+        dominant_contig_bytes=32768,
+        ub_scalar_compute_loops=0,
+    )
+    scalar_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 4000, "AIV0.PIPE_MTE2": 200},
+        waterlines={},
+        grid_blocks=56,
+        gm_roundtrip_bytes=65536,
+        dominant_contig_bytes=32768,
+        ub_scalar_compute_loops=2,
+    )
+
+    cf_clean = build_cost_features_from_ledger(clean_ledger, target=target, axes=axes)
+    cf_scalar = build_cost_features_from_ledger(scalar_ledger, target=target, axes=axes)
+    assert "scalar_compute_loop_fallback" not in cf_clean.extra_signals
+    assert cf_scalar.extra_signals.get("scalar_compute_loop_fallback") == pytest.approx(2.0)
+
+    pred_cf_clean = model.predict(cf_clean)
+    pred_cf_scalar = model.predict(cf_scalar)
+    assert pred_cf_scalar.vec_floor_us == pytest.approx(pred_cf_clean.vec_floor_us * 128.0)
+    assert pred_cf_scalar.pred_us > pred_cf_clean.pred_us * 10.0
+
+    wl_clean = project_case_workload(
+        clean_ledger,
+        case_dims={"M": 512, "N": 128},
+        axes=axes,
+        target=target,
+    )
+    wl_scalar = project_case_workload(
+        scalar_ledger,
+        case_dims={"M": 512, "N": 128},
+        axes=axes,
+        target=target,
+    )
+    assert wl_scalar["extra_signals"] == {"scalar_compute_loop_fallback": 2.0}
+
+    pred_wl_clean = model.predict(wl_clean)
+    pred_wl_scalar = model.predict(wl_scalar)
+    assert pred_wl_scalar.vec_floor_us == pytest.approx(pred_wl_clean.vec_floor_us * 128.0)
+    assert pred_wl_scalar.pred_us > pred_wl_clean.pred_us * 10.0
+
+    cf_mapped = build_cost_features_from_ledger(
+        {
+            "grid_blocks": 56,
+            "pipe_cycles": {"AIV0.PIPE_V": 4000},
+            "gm_roundtrip_bytes": 65536,
+            "ub_scalar_compute_loops": 3,
+        },
+        target=target,
+        live_plan={"extra_signals": {"scalar_compute_loop_fallback": 1.0}},
+        axes=axes,
+    )
+    assert cf_mapped.extra_signals.get("scalar_compute_loop_fallback") == pytest.approx(3.0)
