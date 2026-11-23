@@ -38,6 +38,10 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     resolve_cannbench_repo,
     resolve_cannbench_tasks_root,
 )
+from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+    build_trackb_context_view,
+    extract_cpp_diagnostic_lines,
+)
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageAResult,
     StageBResult,
@@ -1056,6 +1060,19 @@ async def run_l0_l1_round_filter(
     """Filter candidate snippets through L0 static, optional CostModel prescreen, and L1 compile."""
     max_attempts = max(0, max_syntax_repairs)
 
+    def _compact_trackb_repair_source(raw_src: str, diag: str, max_bytes: int = 14800) -> str:
+        if len(raw_src.encode("utf-8")) <= max_bytes:
+            return raw_src
+        focus = extract_cpp_diagnostic_lines(diag)
+        if "__global__" in raw_src or "__aicore__" in raw_src or "__simd_vf__" in raw_src:
+            return build_trackb_context_view(
+                raw_src,
+                max_bytes=max_bytes,
+                focus_lines=focus,
+                diagnostic_text=diag,
+            )
+        return raw_src
+
     async def _try_repair(
         cur_src: str,
         diag: str,
@@ -1063,8 +1080,13 @@ async def run_l0_l1_round_filter(
         lowered_excerpt: str = "",
     ) -> tuple[str | None, str, bool]:
         assert repair_backend is not None
+        repair_src = (
+            _compact_trackb_repair_source(cur_src, diag)
+            if backend_kind in ("ascendc", "ascendc_template", "ascendc_trackb", "hybrid_trackb")
+            else cur_src
+        )
         req = build_syntax_repair_request(
-            cur_src,
+            repair_src,
             diag,
             slice_hint=slice_hint,
             sil_advisory=sil_advisory,

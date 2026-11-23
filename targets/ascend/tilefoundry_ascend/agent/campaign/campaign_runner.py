@@ -100,6 +100,7 @@ from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     apply_scoped_trackb_patch,
     build_trackb_context_view,
     escalate_primfunc_to_trackb_tu,
+    extract_cpp_diagnostic_lines,
     parse_scoped_search_replace_blocks,
     resolve_instantiated_trackb_kernel,
     select_active_trackb_kernel,
@@ -1759,6 +1760,43 @@ def _trackb_python_residual(patch_text: str) -> str:
     return residual
 
 
+def _extract_p2_focus_lines_and_diag(
+    p2_diag: Mapping[str, object] | None,
+) -> tuple[tuple[int, ...], str]:
+    """Extract sorted source focus line numbers and raw diagnostic text from p2_diag."""
+    if not p2_diag:
+        return (), ""
+    focus: set[int] = set()
+    diag_parts: list[str] = []
+    for key in ("diagnostic_text", "error_message", "compiler_diagnostic"):
+        raw_val = p2_diag.get(key)
+        if isinstance(raw_val, str) and raw_val.strip():
+            diag_parts.append(raw_val.strip())
+            focus.update(extract_cpp_diagnostic_lines(raw_val))
+    raw_hotspots = p2_diag.get("p2_hotspots") or p2_diag.get("source_line_hotspots") or ()
+    if isinstance(raw_hotspots, Sequence) and not isinstance(raw_hotspots, (str, bytes)):
+        for spot in list(raw_hotspots):
+            if isinstance(spot, Mapping):
+                loc = spot.get("source_location") or ""
+            elif hasattr(spot, "source_location"):
+                loc = getattr(spot, "source_location", "") or ""
+            else:
+                loc = spot
+            loc_str = str(loc).strip()
+            if not loc_str:
+                continue
+            for m in re.finditer(r":(\d+)(?::\d+)?\b", loc_str):
+                ln = int(m.group(1))
+                if ln > 0:
+                    focus.add(ln)
+    raw_lines = p2_diag.get("focus_lines")
+    if isinstance(raw_lines, Sequence) and not isinstance(raw_lines, (str, bytes)):
+        for item in raw_lines:
+            if isinstance(item, int) and not isinstance(item, bool) and item > 0:
+                focus.add(item)
+    return tuple(sorted(focus)), "\n".join(diag_parts)
+
+
 def _compact_trackb_snippet_source(
     snippet_source: str,
     regime_spec: RegimeTargetSpec,
@@ -1766,6 +1804,8 @@ def _compact_trackb_snippet_source(
     incumbent_source: str = "",
     max_bytes: int = 14800,
     active_kernel: str | None = None,
+    focus_lines: Sequence[int] = (),
+    diagnostic_text: str = "",
 ) -> str:
     if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
         return snippet_source
@@ -1788,6 +1828,8 @@ def _compact_trackb_snippet_source(
             trackb_symbol=sym_name,
             max_bytes=max_bytes,
             active_kernel=active_kernel,
+            focus_lines=focus_lines,
+            diagnostic_text=diagnostic_text,
         )
         wrapped = view if view.startswith("\n") else f"\n{view}\n"
         replacements.append((start_pos, end_pos, _format_raw_cpp_literal(wrapped)))
@@ -4878,12 +4920,15 @@ class PerfTargetCampaignRunner:
     ) -> GenerationRequest:
         module_source = incumbent_source or snippet_source
         active_kernel = self._resolve_active_trackb_kernel(module_source, regime_spec)
+        focus_lines, diag_text = _extract_p2_focus_lines_and_diag(p2_diag)
         snippet_source = _compact_trackb_snippet_source(
             snippet_source,
             regime_spec,
             incumbent_source=incumbent_source,
             max_bytes=14800,
             active_kernel=active_kernel,
+            focus_lines=focus_lines,
+            diagnostic_text=diag_text,
         )
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
         esc_tier, hotpath_section = self._format_trackb_hotpath_section(
@@ -4995,12 +5040,15 @@ class PerfTargetCampaignRunner:
     ) -> GenerationRequest:
         module_source = incumbent_source or snippet_source
         active_kernel = self._resolve_active_trackb_kernel(module_source, regime_spec)
+        focus_lines, diag_text = _extract_p2_focus_lines_and_diag(p2_diag)
         snippet_source = _compact_trackb_snippet_source(
             snippet_source,
             regime_spec,
             incumbent_source=incumbent_source,
             max_bytes=14800,
             active_kernel=active_kernel,
+            focus_lines=focus_lines,
+            diagnostic_text=diag_text,
         )
         slice_desc = self._slice_contract_instruction(func_name, regime_spec)
         esc_tier, hotpath_section = self._format_trackb_hotpath_section(
@@ -7574,11 +7622,16 @@ class PerfTargetCampaignRunner:
                 )
                 or ""
             )
+            parent_focus_lines, parent_diag_text = _extract_p2_focus_lines_and_diag(
+                parent_p2_diag
+            )
             repair_parent_source = _compact_trackb_snippet_source(
                 parent_snippet,
                 regime_spec,
                 incumbent_source=parent_module_source,
                 active_kernel=round_active_kernel,
+                focus_lines=parent_focus_lines,
+                diagnostic_text=parent_diag_text,
             )
             l0_l1_checks = await run_l0_l1_round_filter(
                 raw_candidates,

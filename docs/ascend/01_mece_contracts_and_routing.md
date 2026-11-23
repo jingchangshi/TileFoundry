@@ -66,4 +66,4 @@ Every diagnosed waste maps deterministically to the closed 13-member `SymptomFam
 | `SYNC_BARRIER_SERIALIZATION` | `pipeline_sync` | `pipeline_and_sync_graph`, `tile_and_stage_knobs` |
 | `GRID_TAIL_WAVE_UNDERUTIL` | `grid_wave` | `grid_and_workspace_topology`, `tile_and_stage_knobs` |
 
-- **Frozen Online KB (`agent/kb/`)**: `seed_rules.yaml` holds 40 cross-operator causal rules (`R01..R40`) evaluated read-only online under a strict AST inequality whitelist (`_ALLOWED_AST_NODES`), ranked by 3-axis factorized Bayesian tracking (`ce:*`, `mr:*`, `ir:*`), and pruned against repeated dead-ends via Scoped Tabu (`excluded_mechanisms`).
+- **Frozen Online KB (`agent/kb/`)**: `seed_rules.yaml` holds 41 cross-operator causal rules (`R01..R41`) evaluated read-only online under a strict AST inequality whitelist (`_ALLOWED_AST_NODES`), ranked by 3-axis factorized Bayesian tracking (`ce:*`, `mr:*`, `ir:*`), and pruned against repeated dead-ends via Scoped Tabu (`excluded_mechanisms`).

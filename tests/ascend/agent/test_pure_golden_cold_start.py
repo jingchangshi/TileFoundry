@@ -2349,9 +2349,9 @@ def test_stage0_monotonic_plus_four_oracle_refinement_unlock_and_stop() -> None:
         )
     assert stall_calls == 3
 
-    static_step = 0
+    one_static_step = 0
 
-    def _fail_static_on_third(
+    def _tolerate_one_static_on_third(
         _regimes: tuple[RegimeTargetSpec, ...],
         *,
         semantics: object | None = None,
@@ -2359,15 +2359,68 @@ def test_stage0_monotonic_plus_four_oracle_refinement_unlock_and_stop() -> None:
         _ = semantics
 
         def _check(_src: str, _track: str) -> tuple[bool, str]:
-            nonlocal static_step
-            static_step += 1
-            if static_step == 3:
+            nonlocal one_static_step
+            one_static_step += 1
+            if one_static_step == 3:
+                return False, "single compile hiccup during refinement"
+            return True, ""
+
+        return _check
+
+    def _converge_after_one_static(_src: str) -> OracleAccuracyResult:
+        if one_static_step >= 5:
+            return OracleAccuracyResult(
+                passed=True,
+                candidate_sha256=digest,
+                l3_run_id="run-one-hiccup-pass",
+                l3_receipt_path="/tmp/one-hiccup-pass.json",
+                l3_state="FINISHED",
+            )
+        return OracleAccuracyResult(
+            passed=False,
+            error_message=f"max_abs_diff={1.0 / (2 ** one_static_step):.6e}",
+            l3_state="FAILED",
+            failure_kind="candidate",
+        )
+
+    survived = asyncio.run(
+        prepare_operator_seed_or_takeover(
+            operator_name="level1/vec_op",
+            entrypoint="vec_op",
+            pytorch_golden_source=golden,
+            proto=proto,
+            cases=cases,
+            legacy_regime_specs=None,
+            llm_backend=_ScriptedBackend([seed_src.strip()]),
+            l0_l1_validator_factory=_tolerate_one_static_on_third,
+            oracle_accuracy_validator=_converge_after_one_static,
+            force_cold_start=True,
+            max_seed_attempts=2,
+            max_oracle_refinement_extension=4,
+        )
+    )
+    assert survived.attempts_used == 5
+    assert one_static_step == 5
+
+    two_static_step = 0
+
+    def _fail_two_static_in_extension(
+        _regimes: tuple[RegimeTargetSpec, ...],
+        *,
+        semantics: object | None = None,
+    ):
+        _ = semantics
+
+        def _check(_src: str, _track: str) -> tuple[bool, str]:
+            nonlocal two_static_step
+            two_static_step += 1
+            if two_static_step in (3, 4):
                 return False, "compile error during refinement"
             return True, ""
 
         return _check
 
-    with pytest.raises(RuntimeError, match="after 3 attempts"):
+    with pytest.raises(RuntimeError, match="after 4 attempts"):
         asyncio.run(
             prepare_operator_seed_or_takeover(
                 operator_name="level1/vec_op",
@@ -2377,10 +2430,10 @@ def test_stage0_monotonic_plus_four_oracle_refinement_unlock_and_stop() -> None:
                 cases=cases,
                 legacy_regime_specs=None,
                 llm_backend=_ScriptedBackend([seed_src.strip()]),
-                l0_l1_validator_factory=_fail_static_on_third,
+                l0_l1_validator_factory=_fail_two_static_in_extension,
                 oracle_accuracy_validator=lambda _s: OracleAccuracyResult(
                     passed=False,
-                    error_message=f"max_abs_diff={1.0 / (2 ** static_step):.6e}",
+                    error_message=f"max_abs_diff={1.0 / (2 ** two_static_step):.6e}",
                     l3_state="FAILED",
                     failure_kind="candidate",
                 ),
@@ -2389,7 +2442,7 @@ def test_stage0_monotonic_plus_four_oracle_refinement_unlock_and_stop() -> None:
                 max_oracle_refinement_extension=4,
             )
         )
-    assert static_step == 3
+    assert two_static_step == 4
 
 
 def test_stage0_multimetric_mere_convergence_and_intervening_static_unlock() -> None:

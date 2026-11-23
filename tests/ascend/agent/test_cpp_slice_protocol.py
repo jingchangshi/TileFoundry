@@ -22,6 +22,7 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     AnchorEvalMetrics,
     CandidateSurrogateResult,
+    run_l0_l1_round_filter,
 )
 from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, load_seed_rules
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
@@ -37,6 +38,7 @@ from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     splice_cpp_units_into_tu,
 )
 from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    StageAResult,
     StageBResult,
     _resolve_agent_gates_bin,
     _resolve_prim_func_from_dsl,
@@ -1148,3 +1150,108 @@ def test_evaluate_ascendc_candidate_accepts_templated_ascend_gemm_l1() -> None:
     drv = build_stage_b_driver_source("/tmp/x.py", tir_dump_path="/tmp/lowered_tir.tir")
     assert "tir_dump_path" in drv
     assert "/tmp/lowered_tir.tir" in drv
+
+
+def test_wired_p2_hotspot_and_repair_focus_preservation(tmp_path: Path) -> None:
+    """Verify campaign_runner p2_diag and surrogate repair retain focused Track-B lines."""
+    import asyncio  # noqa: PLC0415
+
+    cpp_body = [
+        "#include <tl_templates/ascend/common.h>",
+        'extern "C" __global__ __vector__ void wired_focus_kernel(__gm__ float* x, __gm__ float* y) {',
+    ]
+    for idx in range(1, 360):
+        cpp_body.append(
+            f"    float r_{idx:03d} = x[{idx}] + 0.5f * (float){idx}; /* wire_payload_{idx:03d} */"
+        )
+    cpp_body.append("    y[0] = r_359;")
+    cpp_body.append("}")
+    cpp_text = "\n".join(cpp_body) + "\n"
+    assert len(cpp_text.encode("utf-8")) > 16384
+
+    mod_file = tmp_path / "wired_mod.py"
+    mod_file.write_text(
+        f'_WIRED_CPP = r"""\n{cpp_text}"""\n'
+        "def _select_wired():\n    return {}\n",
+        encoding="utf-8",
+    )
+    spec = RegimeTargetSpec(
+        regime_tag="main",
+        builder_candidates=("_select_wired",),
+        sample_builder_kwargs={},
+        representative_hir_dims={"total_elements": 4096, "M": 64, "D": 64},
+        editable_symbols=("_WIRED_CPP", "_select_wired"),
+        runtime_backend="ascendc_trackb",
+        trackb_symbols=("_WIRED_CPP",),
+    )
+    runner = PerfTargetCampaignRunner(
+        config=CampaignConfig(operator_name="level2/softmax", max_rounds=1),
+        target_module_path=mod_file,
+        regime_specs=[spec],
+    )
+    ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 100},
+        waterlines={},
+    )
+    surrogate_res = CandidateSurrogateResult(
+        candidate_id="base",
+        operator_name="level2/softmax",
+        all_passed=True,
+        avg_speedup=1.0,
+        min_case_speedup=1.0,
+        avg_roofline_eta=0.2,
+        surrogate_score=50.0,
+    )
+    rule = AscendCausalRule(
+        rule_id="R_WIRE_TEST",
+        regime_guard="True",
+        precondition="True",
+        transform_template="NOP",
+        expected_postcondition="True",
+        source_provenance="test",
+        compatible_backends=("ascendc_trackb",),
+        cpp20_transform_template="Optimize middle loop.",
+    )
+    req = runner._build_exploit_regime_request(
+        snippet_source=mod_file.read_text(encoding="utf-8"),
+        func_name="_select_wired",
+        regime_spec=spec,
+        rule=rule,
+        best_result=surrogate_res,
+        parent_ledger=ledger,
+        parent_residual=compute_static_dynamic_residual(ledger, {"dur_us": 10.0}),
+        p2_diag={
+            "p2_hotspots": [{"source_location": "kernel.cce:210", "instruction_count": 320}]
+        },
+    )
+    assert "wire_payload_208" in req.user_prompt
+    assert "LINES OMITTED OUTSIDE FOCUS WINDOW" in req.user_prompt
+
+    captured_prompts: list[str] = []
+
+    class _RecordingRepairBackend:
+        async def generate(self, request: object) -> str:
+            captured_prompts.append(str(getattr(request, "user_prompt", "")))
+            return cpp_text
+
+    checks = asyncio.run(
+        run_l0_l1_round_filter(
+            [("cand_wire", cpp_text)],
+            patch_fn=lambda src: src,
+            l0_checker=lambda _src: StageAResult(passed=True, prim_func=None, ledger=ledger),
+            l1_compiler=lambda _src: StageBResult(
+                passed=False,
+                error_message="kernel.cce:210:9: error: invalid operand",
+            ),
+            repair_backend=_RecordingRepairBackend(),
+            max_syntax_repairs=1,
+            backend_kind="ascendc_trackb",
+        )
+    )
+    assert len(checks) == 1
+    assert len(captured_prompts) == 1
+    assert "wire_payload_208" in captured_prompts[0]
+    assert "LINES OMITTED OUTSIDE FOCUS WINDOW" in captured_prompts[0]
