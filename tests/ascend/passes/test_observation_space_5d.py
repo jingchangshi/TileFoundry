@@ -15,12 +15,17 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     compute_static_dynamic_residual,
 )
 from tilefoundry_ascend.agent.router.capability_gate import (
+    CapabilityGate,
     EscalationDecision,
     RouteDecision,
-    StructuralFeatures,
     normalize_router_tier,
     route_from_op_spec,
     route_initial_by_input_contract,
+)
+from tilefoundry_ascend.agent.router.isa_gap_scanner import (
+    PipeGapBreakdown,
+    PipeGapReport,
+    scan_tilelang_pipe_gaps,
 )
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
 from tilefoundry_ascend.ascend.passes.observation_space import (
@@ -602,52 +607,80 @@ _PROTO: dict[str, object] = {
         "memory_ring": "gm_ub_stream",
         "iteration_regularity": "affine_simd",
     },
-    "structural_features": {
-        "phi_1": True,
-        "phi_2": 0.0,
-        "phi_3": "none",
-        "phi_4": False,
-        "phi_5": "none",
-        "phi_6": False,
-    },
 }
 
 
-def test_structural_features_project_real_case_ratios() -> None:
-    ratios = CasePhysicsRatios(
+def test_capability_gate_suitability_score_and_ablation() -> None:
+    base_axes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
+    assert CapabilityGate.suitability_score(base_axes) == 1.0
+
+    cv_axes = TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "affine_simd")
+    state_axes = TopologyAxes("aiv_only", "persistent_onchip_state", "affine_simd")
+    opcode_axes = TopologyAxes("aiv_only", "persistent_onchip_state", "dynamic_opcode_stream")
+    ragged_axes = TopologyAxes("coupled_1c2v", "l0c_ub_epilogue", "ragged_group")
+    assert CapabilityGate.suitability_score(cv_axes) < 1.0
+    assert CapabilityGate.suitability_score(state_axes) < 1.0
+    assert CapabilityGate.suitability_score(opcode_axes) < CapabilityGate.suitability_score(
+        state_axes
+    )
+    assert CapabilityGate.suitability_score(ragged_axes) < 1.0
+
+    subatom_ratios = CasePhysicsRatios(
         case_id=7,
         stride_ratio=1.0,
-        contig_atom_ratio=1.0,
-        is_atom_aligned=True,
+        contig_atom_ratio=0.5,
+        is_atom_aligned=False,
         working_set_sram_ratio=0.1,
         working_set_vreg_ratio=0.1,
         wave_occupancy_ratio=0.375,
         oi_ridge_ratio=1.0,
-        inner_contiguous_bytes=48,
+        inner_contiguous_bytes=16,
     )
-    features = StructuralFeatures.from_case_ratios(
-        ratios,
-        static_affine_bounds=False,
-        cube_to_vector_ratio=2.0,
-        quant_granularity="per_tensor",
-        indirect_sparse_gather=True,
-        cross_iter_recurrence="none",
-        dynamic_cross_core_handoff=False,
+    assert CapabilityGate.suitability_score(base_axes, case_ratios=subatom_ratios) < 1.0
+
+    live_gaps = scan_tilelang_pipe_gaps()
+    assert 0.0 < CapabilityGate.suitability_score(base_axes, pipe_gaps=live_gaps) < 1.0
+    assert CapabilityGate.suitability_score(ragged_axes, pipe_gaps=live_gaps) == 0.0
+
+    blocking_gap = PipeGapReport(
+        surface_source="mock",
+        pipes={
+            "pipe_v_simd_simt": PipeGapBreakdown(
+                pipe="pipe_v_simd_simt",
+                total_capabilities=1,
+                supported_primitives=(),
+                missing_primitives=("simd_vld_vst",),
+                coverage_ratio=0.0,
+            )
+        },
+        supported_primitives=(),
+        missing_primitives=("simd_vld_vst",),
+        coverage_ratio=0.0,
     )
-    assert features.phi_7_inner_contiguous_bytes == 48
-    assert features.phi_8_persistent_wave_occupancy == 0.375
-    assert features.phi_2_cube_to_vector_ratio == 2.0
-    assert features.phi_3_quant_granularity == "per_tensor"
-    assert features.phi_4_indirect_sparse_gather is True
+    assert CapabilityGate.suitability_score(base_axes, pipe_gaps=blocking_gap) == 0.0
+    blocked_decision = CapabilityGate.route(base_axes, pipe_gaps=blocking_gap)
+    assert blocked_decision.suitability_score == 0.0
+    assert blocked_decision.recommended_backend_tier == "ascendc_template"
+
+    ablation_decision = CapabilityGate.route(
+        ragged_axes,
+        pipe_gaps=live_gaps,
+        router_enabled=False,
+    )
+    assert ablation_decision.track == "developer"
+    assert ablation_decision.recommended_backend_tier == "tilelang_dsl"
+    assert ablation_decision.features is None
 
 
 def test_router_without_case_ratios_never_fabricates_alignment_defaults() -> None:
     decision = route_from_op_spec(_PROTO)
-    assert decision.features.phi_7_inner_contiguous_bytes == 0
-    assert decision.features.phi_8_persistent_wave_occupancy == 0.0
+    assert decision.features is not None
+    assert decision.features["inner_contiguous_bytes"] == 0
+    assert decision.features["persistent_wave_occupancy"] == 0.0
     initial = route_initial_by_input_contract(_PROTO)
-    assert initial.features.phi_7_inner_contiguous_bytes == 0
-    assert initial.features.phi_8_persistent_wave_occupancy == 0.0
+    assert initial.features is not None
+    assert initial.features["inner_contiguous_bytes"] == 0
+    assert initial.features["persistent_wave_occupancy"] == 0.0
 
 
 def test_router_consumes_case_ratios_and_case_specialized_axes() -> None:
@@ -665,13 +698,15 @@ def test_router_consumes_case_ratios_and_case_specialized_axes() -> None:
     )
     expected_axes = TopologyAxes("aiv_only", "gm_ub_stream", "ragged_group")
     decision = route_from_op_spec(_PROTO, case_ratios=ratios)
-    assert decision.features.phi_7_inner_contiguous_bytes == 256
-    assert decision.features.phi_8_persistent_wave_occupancy == 0.2
+    assert decision.features is not None
+    assert decision.features["inner_contiguous_bytes"] == 256
+    assert decision.features["persistent_wave_occupancy"] == 0.2
     assert decision.topology_axes == expected_axes
     assert any("case ratios" in reason for reason in decision.rationale)
     initial = route_initial_by_input_contract(_PROTO, case_ratios=ratios)
-    assert initial.features.phi_7_inner_contiguous_bytes == 256
-    assert initial.features.phi_8_persistent_wave_occupancy == 0.2
+    assert initial.features is not None
+    assert initial.features["inner_contiguous_bytes"] == 256
+    assert initial.features["persistent_wave_occupancy"] == 0.2
     assert initial.topology_axes == expected_axes
 
 
@@ -710,22 +745,13 @@ def test_router_tier_aliases_normalize_to_internal_ids_at_the_boundary() -> None
     with pytest.raises(ValueError, match="unsupported router tier"):
         normalize_router_tier("unknown_tier")
 
-    features = StructuralFeatures(
-        phi_1_static_affine_bounds=False,
-        phi_2_cube_to_vector_ratio=0.0,
-        phi_3_quant_granularity="none",
-        phi_4_indirect_sparse_gather=False,
-        phi_5_cross_iter_recurrence="none",
-        phi_6_dynamic_cross_core_handoff=False,
-        phi_7_inner_contiguous_bytes=0,
-        phi_8_persistent_wave_occupancy=0.0,
-    )
     decision = RouteDecision(
         track="developer",
-        features=features,
+        topology_axes=TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd"),
         rationale=(),
         recommended_primitives=(),
         recommended_backend_tier="cce_cpp20",
+        features={"static_affine_bounds": False},
     )
     assert decision.recommended_backend_tier == "ascendc_template"
     escalation = EscalationDecision(
@@ -777,8 +803,8 @@ def test_trackb_stage_a_without_case_ratios_never_fabricates_physical_case() -> 
     )
     assert unprojected.passed is True
     assert unprojected.features is not None
-    assert unprojected.features.phi_7_inner_contiguous_bytes == 0
-    assert unprojected.features.phi_8_persistent_wave_occupancy == 0.0
+    assert unprojected.features["inner_contiguous_bytes"] == 0
+    assert unprojected.features["persistent_wave_occupancy"] == 0.0
     assert unprojected.route is not None
     assert unprojected.route.track == "developer"
 
@@ -790,8 +816,8 @@ def test_trackb_stage_a_without_case_ratios_never_fabricates_physical_case() -> 
     )
     assert projected.passed is True
     assert projected.features is not None
-    assert projected.features.phi_7_inner_contiguous_bytes == 16
-    assert projected.features.phi_8_persistent_wave_occupancy == 0.25
+    assert projected.features["inner_contiguous_bytes"] == 16
+    assert projected.features["persistent_wave_occupancy"] == 0.25
     assert projected.route is not None
     assert projected.route.track == "simt_vf"
 
@@ -811,9 +837,9 @@ def test_stage_a_static_projects_case_ratios_into_router_features() -> None:
     )
     assert projected.passed is True
     assert projected.features is not None
-    assert projected.features.phi_7_inner_contiguous_bytes == ratios.inner_contiguous_bytes
-    assert projected.features.phi_8_persistent_wave_occupancy == ratios.wave_occupancy_ratio
-    assert projected.features.phi_1_static_affine_bounds == base.features.phi_1_static_affine_bounds
+    assert projected.features["inner_contiguous_bytes"] == ratios.inner_contiguous_bytes
+    assert projected.features["persistent_wave_occupancy"] == ratios.wave_occupancy_ratio
+    assert projected.features["static_affine_bounds"] == base.features["static_affine_bounds"]
     assert projected.route is not None
     assert projected.route.track == "simt_vf"
 

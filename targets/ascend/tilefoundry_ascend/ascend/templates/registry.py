@@ -859,7 +859,13 @@ def _infer_entry_core_attr(
     has_aiv = "ASCEND_IS_AIV" in body
     if has_aic and has_aiv:
         return "__mix__(1, 2)"
-    if ("Mmad(" in body or "FixpipeParams" in body) and not has_aiv and "Reg::" not in body:
+    if (
+        "Mmad(" in body
+        or "FixpipeParams" in body
+        or "asc_mmad(" in body
+        or "ascend_gemm_l1" in body
+        or "asc_copy_l0c2" in body
+    ) and not has_aiv and "Reg::" not in body:
         return "__cube__"
     return "__vector__"
 
@@ -1141,11 +1147,14 @@ def materialize_top_translation_unit(
     )
     cleaned = _SHELL_CONTRACT_LINE_RE.sub("", raw_cpp).strip()
 
-    has_tl_templates = "tl_templates/ascend/" in cleaned
-    has_kernel_op_inc = bool(
+    has_tl_templates = "tl_templates/ascend/" in cleaned or "c_api/asc_" in cleaned
+    has_legacy_op = bool(
         re.search(r'^\s*#\s*include\s+[<"]kernel_operator\.h[>"]', cleaned, re.MULTILINE)
     )
-    has_using_ns = bool(re.search(r"^\s*using\s+namespace\s+AscendC\s*;", cleaned, re.MULTILINE))
+    if has_legacy_op:
+        raise ValueError("Legacy kernel_operator.h is not allowed in dav-3510 translation units.")
+    if re.search(r"^\s*using\s+namespace\s+AscendC\s*;", cleaned, re.MULTILINE):
+        raise ValueError("Legacy 'using namespace AscendC;' is not allowed in dav-3510 translation units.")
 
     core_attr = _infer_entry_core_attr(cleaned, axes=axes)
     entry_fn = _sanitize_c_ident(f"{op_name}_kernel", "ascend_top_kernel")
@@ -1173,15 +1182,9 @@ def materialize_top_translation_unit(
     if axes is not None:
         header_lines.append(f"// topology_axes={axes.key()}")
 
-    if not has_kernel_op_inc:
-        if has_tl_templates:
-            pass
-        else:
-            header_lines.append('#include "kernel_operator.h"')
-            if not has_using_ns:
-                header_lines.append("using namespace AscendC;")
-    elif not has_using_ns and not has_tl_templates:
-        cleaned = "using namespace AscendC;\n\n" + cleaned
+    if not has_tl_templates:
+        header_lines.append("#include <tl_templates/ascend/common.h>")
+        header_lines.append("#include <c_api/asc_simd.h>")
 
     parts: list[str] = ["\n".join(header_lines)]
 

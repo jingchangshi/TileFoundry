@@ -380,29 +380,24 @@ def infer_contraction_and_axes_from_proto(
 
 
 def _extract_feature_flags(features: object | None) -> dict[str, Any]:
-    if features is None:
+    if not isinstance(features, Mapping):
         return {}
-    if isinstance(features, Mapping):
-        return {
-            "static_bounds": bool(features.get("phi_1", features.get("static_affine_bounds", True))),
-            "cube_ratio": float(features.get("phi_2", features.get("cube_to_vector_ratio", 0.0)) or 0.0),
-            "quant": str(features.get("phi_3", features.get("quant_granularity", "none"))),
-            "indirect": bool(features.get("phi_4", features.get("indirect_sparse_gather", False))),
-            "recurrence": str(features.get("phi_5", features.get("cross_iter_recurrence", "none"))),
-            "handoff": bool(features.get("phi_6", features.get("dynamic_cross_core_handoff", False))),
-            "inner_bytes": int(features.get("phi_7", features.get("inner_contiguous_bytes", 0)) or 0),
-        }
-    if hasattr(features, "phi_2_cube_to_vector_ratio"):
-        return {
-            "static_bounds": bool(getattr(features, "phi_1_static_affine_bounds", True)),
-            "cube_ratio": float(getattr(features, "phi_2_cube_to_vector_ratio", 0.0) or 0.0),
-            "quant": str(getattr(features, "phi_3_quant_granularity", "none")),
-            "indirect": bool(getattr(features, "phi_4_indirect_sparse_gather", False)),
-            "recurrence": str(getattr(features, "phi_5_cross_iter_recurrence", "none")),
-            "handoff": bool(getattr(features, "phi_6_dynamic_cross_core_handoff", False)),
-            "inner_bytes": int(getattr(features, "phi_7_inner_contiguous_bytes", 0) or 0),
-        }
-    return {}
+    cube_ratio_raw = features.get("cube_to_vector_ratio")
+    if cube_ratio_raw is None and features.get("uses_cube"):
+        cube_ratio = 1.0
+    else:
+        cube_ratio = float(cube_ratio_raw or 0.0)
+    return {
+        "static_bounds": bool(features.get("static_affine_bounds", True)),
+        "cube_ratio": cube_ratio,
+        "quant": str(features.get("quant_granularity", "none")),
+        "indirect": bool(
+            features.get("indirect_sparse_gather", features.get("uses_simt", False))
+        ),
+        "recurrence": str(features.get("cross_iter_recurrence", "none")),
+        "handoff": bool(features.get("dynamic_cross_core_handoff", False)),
+        "inner_bytes": int(features.get("inner_contiguous_bytes", 0) or 0),
+    }
 
 
 def resolve_canonical_topology_axes(

@@ -60,7 +60,7 @@ def test_materialize_top_tu_from_slot_shell_and_lowered_tilelang() -> None:
         slot,
         host_signature="void launch_custom_1c2v_fused(void* stream, void* x, void* y)",
     )
-    assert '#include "kernel_operator.h"' in tu_slot
+    assert "#include <tl_templates/ascend/common.h>" in tu_slot
     assert 'extern "C" __global__ __aicore__' in tu_slot
     assert "__mix__(1, 2)" in tu_slot
     assert "launch_custom_1c2v_fused" in tu_slot
@@ -76,7 +76,7 @@ def test_materialize_top_tu_from_slot_shell_and_lowered_tilelang() -> None:
         policy={"row_pack_factor": 4, "ub_256kb_unlock": True},
         host_signature={"name": "launch_simd_stream", "args": [("float*", "x"), ("float*", "y")]},
     )
-    assert '#include "kernel_operator.h"' in tu_shell
+    assert "#include <tl_templates/ascend/common.h>" in tu_shell
     assert 'extern "C" __global__ __aicore__' in tu_shell
     assert "launch_simd_stream" in tu_shell
     assert "Synthesized Compute Slot" not in tu_shell
@@ -273,8 +273,8 @@ def test_stage_b_ascendc_real_bisheng_compile_and_gate_funnel_dispatch() -> None
     assert ev_ok.stage_b is not None and ev_ok.stage_b.passed is True
 
     bad_cpp = """
-#include "kernel_operator.h"
-using namespace AscendC;
+#include <tl_templates/ascend/common.h>
+#include <c_api/asc_simd.h>
 extern "C" __global__ __aicore__ __vector__ void broken_k(__gm__ float* x) {
     undeclared_symbol_xyz = 42;
 }

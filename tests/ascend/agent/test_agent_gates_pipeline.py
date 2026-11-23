@@ -282,7 +282,7 @@ def test_stage_b_compile_results_keep_untruncated_full_diagnostic(
     track_b = run_stage_b_ascendc_compile(
         'extern "C" __global__ void kernel_active() {}\n',
         bisheng_bin=bisheng,
-        asc_devkit_include=include_dir,
+        extra_include_dirs=(include_dir,),
     )
     assert track_b.passed is False
     assert track_b.full_diagnostic == diagnostic

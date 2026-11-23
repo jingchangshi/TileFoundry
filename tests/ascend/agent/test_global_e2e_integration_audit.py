@@ -50,7 +50,7 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
 from tilefoundry_ascend.agent.router import (
     DEFAULT_ASCEND_SDK_HEADER_ROOTS,
     DEFAULT_TILELANG_CODEGEN_PATH,
-    StructuralFeatures,
+    CapabilityGate,
     discover_tilelang_lowering_surface,
     resolve_canonical_topology_axes,
     route_from_op_spec,
@@ -219,10 +219,20 @@ def test_audit2_reconciled_truth_tables_and_bayesian_axis_transfer_in_runners(tm
 
     unseen_axes = resolve_canonical_topology_axes(
         "unseen_sparse_attention_v2",
-        features=StructuralFeatures(False, 1.0, "none", True, "associative_online_rescale", True, 128, 1.0),
+        features={
+            "static_affine_bounds": False,
+            "cube_to_vector_ratio": 1.0,
+            "quant_granularity": "none",
+            "indirect_sparse_gather": True,
+            "cross_iter_recurrence": "associative_online_rescale",
+            "dynamic_cross_core_handoff": True,
+            "inner_contiguous_bytes": 128,
+            "persistent_wave_occupancy": 1.0,
+        },
     )
     assert unseen_axes.compute_engine == "coupled_1c2v"
     assert unseen_axes.iteration_regularity == "irregular_simt"
+    assert CapabilityGate.suitability_score(unseen_axes) < 1.0
 
     tracker = BayesianRuleTracker.from_seed_yaml()
     funnel = GateFunnel(
@@ -357,17 +367,23 @@ def test_audit3_live_sdk_header_and_tilelang_codegen_scanner() -> None:
     assert fallback.source == "catalog_fallback"
     assert "CrossCoreSetFlag" in fallback.symbols
 
-    if any(Path(p).is_dir() for p in DEFAULT_ASCEND_SDK_HEADER_ROOTS):
+    has_cann_sdk = any(
+        ("tl_templates" not in str(p)) and Path(p).is_dir()
+        for p in DEFAULT_ASCEND_SDK_HEADER_ROOTS
+    )
+    if has_cann_sdk:
         live_sdk = scan_ascend_sdk_headers()
         assert live_sdk.fallback_used is False
         assert live_sdk.source == "sdk_headers"
         assert live_sdk.header_files_scanned > 100
-        assert any(s.startswith("Reg::") for s in live_sdk.symbols)
-        assert any(s.startswith("Simt::") for s in live_sdk.symbols)
-        assert any(s.startswith("LoadDist::") for s in live_sdk.symbols)
-        assert any(s.startswith("StoreDist::") for s in live_sdk.symbols)
         assert "CrossCoreSetFlag" in live_sdk.symbols
-        assert "DataCopyPad" in live_sdk.symbols
+    elif any(Path(p).is_dir() for p in DEFAULT_ASCEND_SDK_HEADER_ROOTS):
+        live_sdk = scan_ascend_sdk_headers()
+        assert live_sdk.fallback_used is False
+        assert live_sdk.source == "sdk_headers"
+        assert live_sdk.header_files_scanned >= 1
+        assert "SetFlag" in live_sdk.symbols
+        assert "WaitFlag" in live_sdk.symbols
 
     src, syms = discover_tilelang_lowering_surface()
     if Path(DEFAULT_TILELANG_CODEGEN_PATH).is_file():

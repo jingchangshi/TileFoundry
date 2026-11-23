@@ -1,4 +1,4 @@
-"""Automated ISA-gap scanner comparing asc-devkit hardware ISA against TileLang lowering."""
+"""Automated ISA-gap scanner comparing CANN dav-3510 hardware ISA against TileLang lowering."""
 
 from __future__ import annotations
 
@@ -22,11 +22,11 @@ VALID_HARDWARE_PIPES: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class IsaPrimitiveSpec:
-    """One asc-devkit hardware capability and its expected TileLang lowering symbol(s)."""
+    """One CANN dav-3510 hardware capability and its expected TileLang lowering symbol(s)."""
 
     name: str
     hardware_pipe: str
-    ascend_devkit_intrinsic: str
+    cann_intrinsic: str
     tilelang_symbols: tuple[str, ...]
     workaround_track: str = "ascendc_template"
     description: str = ""
@@ -54,7 +54,7 @@ class PipeGapBreakdown:
 
 @dataclass(frozen=True)
 class PipeGapReport:
-    """Diff between asc-devkit hardware ISA surface and TileLang lowering surface by pipe."""
+    """Diff between CANN dav-3510 hardware ISA surface and TileLang lowering surface by pipe."""
 
     surface_source: str
     pipes: dict[str, PipeGapBreakdown]
@@ -78,11 +78,11 @@ class PipeGapReport:
         }
 
 
-ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
+DAV3510_CANN_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="fp4_e2m1_dtype",
         hardware_pipe="pipe_m_cube",
-        ascend_devkit_intrinsic="fp4_e2m1fnx2",
+        cann_intrinsic="fp4_e2m1fnx2",
         tilelang_symbols=("float4_e2m1fn", "float4_e2m1fnx2"),
         workaround_track="ascendc_template",
         description="Packed 4-bit FP4 E2M1 tensor representation",
@@ -90,7 +90,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="mx_e8m0_blockscale_gemm",
         hardware_pipe="pipe_m_cube",
-        ascend_devkit_intrinsic="MmadBlockScaled<e8m0>",
+        cann_intrinsic="MmadBlockScaled<e8m0>",
         tilelang_symbols=("gemm_blockscaled", "float8_e8m0fnu"),
         workaround_track="ascendc_template",
         description="Block-scaled MX GEMM with E8M0 microscaling factors",
@@ -98,7 +98,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="mx_spr_scale_config",
         hardware_pipe="pipe_s_scalar_spr",
-        ascend_devkit_intrinsic="SetMxScaleSPR / QuantMx",
+        cann_intrinsic="SetMxScaleSPR / QuantMx",
         tilelang_symbols=("set_mx_scale_spr", "ascend_mx_quant"),
         workaround_track="ascendc_template",
         description="Hardware SPR microscaling configuration and online MX quantization",
@@ -106,7 +106,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="subbyte_q4_bitshift_unpack",
         hardware_pipe="pipe_v_simd_simt",
-        ascend_devkit_intrinsic="BitUnpackQ4_0 / FixPipeDeqScale",
+        cann_intrinsic="BitUnpackQ4_0 / FixPipeDeqScale",
         tilelang_symbols=("bit_unpack_q4", "fixpipe_deq_scale"),
         workaround_track="ascendc_template",
         description="Sub-byte INT4/Q4_0 register bitshift unpack and FixPipe dequant scale",
@@ -114,7 +114,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="cube_mmad_sparse",
         hardware_pipe="pipe_m_cube",
-        ascend_devkit_intrinsic="MmadSparse",
+        cann_intrinsic="MmadSparse",
         tilelang_symbols=("gemm_sparse", "mmad_sparse", "ascend_mmad_sparse"),
         workaround_track="ascendc_template",
         description="2:4 structured sparse Cube MMAD execution primitive",
@@ -122,7 +122,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="fixpipe_deq_scale",
         hardware_pipe="pipe_fix_fixpipe",
-        ascend_devkit_intrinsic="FixPipeDeqScale",
+        cann_intrinsic="FixPipeDeqScale",
         tilelang_symbols=("fixpipe_deq_scale", "ascend_fixpipe_deq_scale"),
         workaround_track="ascendc_template",
         description="FixPipe hardware per-channel/block dequantization scaling",
@@ -130,7 +130,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="scalar_set_ctrl_spr",
         hardware_pipe="pipe_s_scalar_spr",
-        ascend_devkit_intrinsic="SetCtrlSpr",
+        cann_intrinsic="SetCtrlSpr",
         tilelang_symbols=("set_ctrl_spr", "ascend_set_ctrl_spr"),
         workaround_track="ascendc_template",
         description="Scalar SPR control register configuration for quantized/MX modes",
@@ -138,7 +138,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="simd_vld_vst",
         hardware_pipe="pipe_v_simd_simt",
-        ascend_devkit_intrinsic="Reg::Load / Reg::Store",
+        cann_intrinsic="Reg::Load / Reg::Store",
         tilelang_symbols=("simd.vld", "simd.vst2", "simd.vsts"),
         workaround_track="inline_ascendc_vf",
         description="Register-base UB load/store intrinsics",
@@ -146,7 +146,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="simd_vgather_vscatter",
         hardware_pipe="pipe_v_simd_simt",
-        ascend_devkit_intrinsic="Reg::Gather / Reg::Scatter",
+        cann_intrinsic="Reg::Gather / Reg::Scatter",
         tilelang_symbols=("simd.vgather2", "simd.vgatherb", "simd.vscatter"),
         workaround_track="inline_ascendc_vf",
         description="Register-base indexed gather/scatter",
@@ -154,7 +154,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="regbase_dist_unpack_pack",
         hardware_pipe="pipe_v_simd_simt",
-        ascend_devkit_intrinsic="LoadDist::DIST_UNPACK_B16 / StoreDist::DIST_PACK_B32",
+        cann_intrinsic="LoadDist::DIST_UNPACK_B16 / StoreDist::DIST_PACK_B32",
         tilelang_symbols=("simd.dist_unpack_b16", "simd.dist_pack_b32"),
         workaround_track="inline_ascendc_vf",
         description="Explicit RegBase DIST_UNPACK_B16 / DIST_PACK_B32 lane distribution",
@@ -162,7 +162,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="regbase_reduce_data_block",
         hardware_pipe="pipe_v_simd_simt",
-        ascend_devkit_intrinsic="Reg::ReduceDataBlock",
+        cann_intrinsic="Reg::ReduceDataBlock",
         tilelang_symbols=("simd.reduce_data_block", "simd.reduce_datablock"),
         workaround_track="inline_ascendc_vf",
         description="Hardware 32B DataBlock intra-vector reduction intrinsic",
@@ -170,7 +170,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="crosscore_flag_set_wait",
         hardware_pipe="pipe_sync_barrier_mutex",
-        ascend_devkit_intrinsic="CrossCoreSetFlag / CrossCoreWaitFlag",
+        cann_intrinsic="CrossCoreSetFlag / CrossCoreWaitFlag",
         tilelang_symbols=("ascend_cross_core_set_flag", "ascend_cross_core_wait_flag"),
         workaround_track="ascendc_template",
         description="Cross-core AIC/AIV synchronization flags",
@@ -178,7 +178,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="crosscore_mode4_dual_dst",
         hardware_pipe="pipe_sync_barrier_mutex",
-        ascend_devkit_intrinsic="CrossCoreSetFlag<mode=4, dualDstCtl>",
+        cann_intrinsic="CrossCoreSetFlag<mode=4, dualDstCtl>",
         tilelang_symbols=("ascend_cross_core_mode4", "cross_core_dual_dst"),
         workaround_track="ascendc_template",
         description="Mode-4 symmetric 1C2V dual-destination cross-core signaling",
@@ -186,7 +186,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="hardware_mutex_28",
         hardware_pipe="pipe_sync_barrier_mutex",
-        ascend_devkit_intrinsic="HwMutexLock / HwMutexUnlock",
+        cann_intrinsic="HwMutexLock / HwMutexUnlock",
         tilelang_symbols=("ascend_hw_mutex_lock", "hw_mutex_lock"),
         workaround_track="ascendc_template",
         description="28 hardware mutex locks for inter-core atomic serialization",
@@ -194,7 +194,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="simt_warp_shuffle_ballot",
         hardware_pipe="pipe_v_simd_simt",
-        ascend_devkit_intrinsic="__shfl / __ballot",
+        cann_intrinsic="__shfl / __ballot",
         tilelang_symbols=("shfl_sync", "ballot_sync", "activemask"),
         workaround_track="ascendc_template",
         description="SIMT warp shuffle and ballot collectives",
@@ -202,7 +202,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="simt_atomic_add_minmax",
         hardware_pipe="pipe_v_simd_simt",
-        ascend_devkit_intrinsic="atomicAdd / atomicMax / atomicMin",
+        cann_intrinsic="atomicAdd / atomicMax / atomicMin",
         tilelang_symbols=("atomic_add", "atomic_max", "atomic_min"),
         workaround_track="ascendc_template",
         description="Standard warp/block atomic arithmetic",
@@ -210,7 +210,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="simt_gm_atomic_cas",
         hardware_pipe="pipe_v_simd_simt",
-        ascend_devkit_intrinsic="asc_atomic_cas",
+        cann_intrinsic="asc_atomic_cas",
         tilelang_symbols=("atomic_cas", "asc_atomic_cas"),
         workaround_track="ascendc_template",
         description="In-place global memory compare-and-swap atomic",
@@ -218,7 +218,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="simt_uint_div_fast",
         hardware_pipe="pipe_v_simd_simt",
-        ascend_devkit_intrinsic="Simt::UintDiv",
+        cann_intrinsic="Simt::UintDiv",
         tilelang_symbols=("simt.uint_div", "uint_div"),
         workaround_track="ascendc_template",
         description="Strength-reduced integer divider for dynamic SIMT stride indexing",
@@ -226,7 +226,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="dma_dual_copy_and_nd2nz",
         hardware_pipe="pipe_mte2_mte3_dma",
-        ascend_devkit_intrinsic="DataCopy / Nd2NzParams",
+        cann_intrinsic="DataCopy / Nd2NzParams",
         tilelang_symbols=("dual_copy", "ascend_nd2nz_post_copy", "copy"),
         workaround_track="ascendc_template",
         description="Dual-core copy and UB->L1 ND2NZ fractal layout conversion",
@@ -234,7 +234,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="dma_l2_cache_mode_disable",
         hardware_pipe="pipe_mte2_mte3_dma",
-        ascend_devkit_intrinsic="CACHE_MODE_DISABLE / L2BypassHint",
+        cann_intrinsic="CACHE_MODE_DISABLE / L2BypassHint",
         tilelang_symbols=("dma_cache_mode_disable", "l2_cache_bypass_hint"),
         workaround_track="ascendc_template",
         description="Per-operand GM->L1/UB L2 cache bypass hint",
@@ -242,7 +242,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="dma_datacopy_pad_unaligned",
         hardware_pipe="pipe_mte2_mte3_dma",
-        ascend_devkit_intrinsic="DataCopyPad",
+        cann_intrinsic="DataCopyPad",
         tilelang_symbols=("datacopy_pad", "ascend_datacopy_pad"),
         workaround_track="ascendc_template",
         description="Hardware 32B-unaligned DataCopyPad tail DMA",
@@ -250,7 +250,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="mte1_load_2d_3d",
         hardware_pipe="pipe_mte1_l1_to_l0",
-        ascend_devkit_intrinsic="Load2D / Load3D",
+        cann_intrinsic="Load2D / Load3D",
         tilelang_symbols=("load_2d", "load_3d", "ascend_load2d", "ascend_load3d"),
         workaround_track="ascendc_template",
         description="MTE1 L1->L0A/L0B 2D fractal and 3D im2col tile loading",
@@ -258,7 +258,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="fixpipe_l0c_to_ub_split_m",
         hardware_pipe="pipe_fix_fixpipe",
-        ascend_devkit_intrinsic="L0CToUbSplitM",
+        cann_intrinsic="L0CToUbSplitM",
         tilelang_symbols=("l0c_to_ub_split_m", "ascend_l0c_to_ub_split_m", "fixpipe_l0c_to_ub"),
         workaround_track="ascendc_template",
         description="FixPipe direct L0C->UB SPLIT_M routing across coupled AIV sub-blocks",
@@ -266,7 +266,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="scalar_dcci_cache_invalidate",
         hardware_pipe="pipe_s_scalar_spr",
-        ascend_devkit_intrinsic="dcci",
+        cann_intrinsic="dcci",
         tilelang_symbols=("dcci", "ascend_dcci"),
         workaround_track="ascendc_template",
         description="Scalar data-cache clean/invalidate for SIMT-to-SIMD/GM coherence",
@@ -274,7 +274,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="simd_vci_vcmax",
         hardware_pipe="pipe_v_simd_simt",
-        ascend_devkit_intrinsic="Reg::Vci / Reg::Vcmax",
+        cann_intrinsic="Reg::Vci / Reg::Vcmax",
         tilelang_symbols=("simd.vci", "simd.vcmax", "simd.vcmin"),
         workaround_track="inline_ascendc_vf",
         description="Index generation and vector max/min reduction",
@@ -282,7 +282,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="hardware_bitonic_sort32",
         hardware_pipe="pipe_v_simd_simt",
-        ascend_devkit_intrinsic="BitonicSort32 / Sort32",
+        cann_intrinsic="BitonicSort32 / Sort32",
         tilelang_symbols=("bitonic_sort32", "simd.sort32"),
         workaround_track="ascendc_template",
         description="Hardware 32-element bitonic sort unit",
@@ -290,7 +290,7 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
     IsaPrimitiveSpec(
         name="hardware_mrgsort4_topk",
         hardware_pipe="pipe_v_simd_simt",
-        ascend_devkit_intrinsic="MrgSort4 / TopK",
+        cann_intrinsic="MrgSort4 / TopK",
         tilelang_symbols=("mrgsort4", "hardware_topk", "simd.mrgsort4"),
         workaround_track="ascendc_template",
         description="Hardware 4-way merge sort and TopK selector",
@@ -300,16 +300,18 @@ ASCEND_DEVKIT_ISA_CATALOG: tuple[IsaPrimitiveSpec, ...] = (
 
 def _default_ascend_sdk_header_roots() -> tuple[str, ...]:
     roots: list[str] = []
-    env_devkit = os.environ.get("TILEFOUNDRY_NPU_ASC_DEVKIT_REPO", "").strip()
-    if env_devkit:
-        roots.append(str(Path(env_devkit).expanduser() / "include"))
-    sibling_devkit = Path(__file__).resolve().parents[5].parent / "asc-devkit" / "include"
-    roots.append(str(sibling_devkit))
     for env_key in ("ASCEND_TOOLKIT_HOME", "ASCEND_HOME_PATH"):
         cann = os.environ.get(env_key, "").strip()
         if cann:
-            roots.append(str(Path(cann).expanduser() / "x86_64-linux" / "include" / "ascendc"))
-            roots.append(str(Path(cann).expanduser() / "include" / "ascendc"))
+            base = Path(cann).expanduser()
+            roots.append(str(base / "x86_64-linux" / "asc" / "include"))
+            roots.append(str(base / "aarch64-linux" / "asc" / "include"))
+            roots.append(str(base / "asc" / "include"))
+            roots.append(str(base / "x86_64-linux" / "include"))
+            roots.append(str(base / "include"))
+    sibling_tl = Path(__file__).resolve().parents[5].parent / "tilelang" / "src" / "tl_templates" / "ascend"
+    if sibling_tl.is_dir():
+        roots.append(str(sibling_tl))
     return tuple(dict.fromkeys(roots))
 
 
@@ -517,8 +519,8 @@ def scan_ascend_sdk_headers(
             raise FileNotFoundError(
                 f"No Ascend SDK or tl_templates headers found under {roots_preview}"
             )
-        for spec in ASCEND_DEVKIT_ISA_CATALOG:
-            for part in spec.ascend_devkit_intrinsic.split("/"):
+        for spec in DAV3510_CANN_ISA_CATALOG:
+            for part in spec.cann_intrinsic.split("/"):
                 tok = part.strip()
                 if not tok:
                     continue
@@ -673,10 +675,10 @@ def scan_tilelang_pipe_gaps(
     *,
     tilelang_surface: Iterable[str] | object | None = None,
     pipes: Iterable[str] | None = None,
-    devkit_catalog: Iterable[IsaPrimitiveSpec] | None = None,
+    cann_catalog: Iterable[IsaPrimitiveSpec] | None = None,
     allow_offline_catalog: bool = False,
 ) -> PipeGapReport:
-    """Diff asc-devkit hardware capabilities against TileLang across the 7 hardware pipes."""
+    """Diff CANN dav-3510 hardware capabilities against TileLang across the 7 hardware pipes."""
     surface_source, surface = _resolve_surface(
         tilelang_surface,
         allow_offline_catalog=allow_offline_catalog,
@@ -689,7 +691,7 @@ def scan_tilelang_pipe_gaps(
                 f"Unknown hardware pipe {pipe!r}; expected one of {VALID_HARDWARE_PIPES}"
             )
 
-    catalog = tuple(devkit_catalog) if devkit_catalog is not None else ASCEND_DEVKIT_ISA_CATALOG
+    catalog = tuple(cann_catalog) if cann_catalog is not None else DAV3510_CANN_ISA_CATALOG
 
     pipe_reports: dict[str, PipeGapBreakdown] = {}
     all_supported: list[str] = []
@@ -728,7 +730,7 @@ def scan_tilelang_pipe_gaps(
 
 
 __all__ = [
-    "ASCEND_DEVKIT_ISA_CATALOG",
+    "DAV3510_CANN_ISA_CATALOG",
     "DEFAULT_ASCEND_SDK_HEADER_ROOTS",
     "DEFAULT_TILELANG_CODEGEN_PATH",
     "IsaPrimitiveSpec",

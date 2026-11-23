@@ -196,15 +196,15 @@ def test_np3_hir_tir_navigation_router_off_and_scheduled_blueprint(monkeypatch) 
 
     router_calls: list[str] = []
 
-    def _forbid_extract(*_args, **_kwargs):
-        router_calls.append("extract")
-        raise AssertionError("extract_structural_features must not be called")
+    def _forbid_gate(*_args, **_kwargs):
+        router_calls.append("gate")
+        raise AssertionError("CapabilityGate.route must not be called")
 
     def _forbid_route(*_args, **_kwargs):
         router_calls.append("route")
         raise AssertionError("route_execution_track must not be called")
 
-    monkeypatch.setattr(cap_gate, "extract_structural_features", _forbid_extract)
+    monkeypatch.setattr(cap_gate.CapabilityGate, "route", _forbid_gate)
     monkeypatch.setattr(cap_gate, "route_execution_track", _forbid_route)
 
     ar_hir = _AR_MODEL_PATH.read_text(encoding="utf-8")

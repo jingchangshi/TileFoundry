@@ -142,9 +142,9 @@ def _surrogate(
 
 
 def test_all_seed_rules_have_valid_symptom_family_and_anti_precondition(tmp_path: Path) -> None:
-    """Validate all 37 seed rules declare valid SymptomFamily values and anti_precondition ASTs."""
+    """Validate all 40 seed rules declare valid SymptomFamily values and anti_precondition ASTs."""
     rules = load_seed_rules()
-    assert len(rules) == 37
+    assert len(rules) == 40
     assert len(SymptomFamily) == 13
     assert set(SYMPTOM_FAMILY_TO_AXIS) == set(SymptomFamily)
     assert set(SYMPTOM_FAMILY_TO_FACETS) == set(SymptomFamily)
@@ -405,7 +405,7 @@ def test_online_rulebook_frozen_by_default_and_opt_in_distilled_sync(tmp_path: P
     )
 
     frozen_tracker = BayesianRuleTracker.from_experience_lake(lake_dir)
-    assert len(frozen_tracker.rules) == 37
+    assert len(frozen_tracker.rules) == 40
     assert "R_UNREVIEWED_DISTILLED_01" not in frozen_tracker.rules
     assert frozen_tracker.posteriors["R01_DUAL_COPY_1C2V_SPLIT"].successes == 1
 

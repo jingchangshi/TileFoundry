@@ -51,7 +51,6 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
 )
 from tilefoundry_ascend.agent.router.capability_gate import (
     EscalationDecision,
-    StructuralFeatures,
     evaluate_track_escalation,
 )
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
@@ -483,17 +482,22 @@ def _coerce_topology_axes_opt(raw: object | None) -> TopologyAxes | None:
 
 
 def _project_features_with_ratios(
-    features: StructuralFeatures | None,
+    features: Mapping[str, object] | None,
     case_ratios: CasePhysicsRatios | None,
-) -> StructuralFeatures | None:
-    """Project real per-case physics ratios onto the compatibility phi_7/phi_8 view."""
-    if features is None or case_ratios is None:
-        return features
-    return replace(
-        features,
-        phi_7_inner_contiguous_bytes=case_ratios.inner_contiguous_bytes,
-        phi_8_persistent_wave_occupancy=case_ratios.wave_occupancy_ratio,
-    )
+) -> dict[str, object] | None:
+    """Project real per-case physics ratios onto a semantic feature dict."""
+    if features is None:
+        return None
+    if case_ratios is None:
+        return features if isinstance(features, dict) else {str(k): v for k, v in features.items()}
+    projected: dict[str, object] = {str(k): v for k, v in features.items()}
+    projected["inner_contiguous_bytes"] = case_ratios.inner_contiguous_bytes
+    projected["persistent_wave_occupancy"] = case_ratios.wave_occupancy_ratio
+    projected["wave_occupancy_ratio"] = case_ratios.wave_occupancy_ratio
+    projected["contig_atom_ratio"] = case_ratios.contig_atom_ratio
+    projected["oi_ridge_ratio"] = case_ratios.oi_ridge_ratio
+    projected["has_empty_group"] = case_ratios.has_empty_group
+    return projected
 
 
 def _derive_active_topology_axes(
@@ -655,6 +659,7 @@ def _resolve_constraint_section(
     sil_verification: object | None = None,
     freedom_mask: ConstraintRelaxationMask | None = None,
     excluded_mechanisms: Sequence[str] = (),
+    active_symptom: str | None = None,
 ) -> str:
     """Build the unified 3-layer progressive LLM constraint section."""
     enable_router = bool(
@@ -672,6 +677,9 @@ def _resolve_constraint_section(
         current_ledger=parent.ledger,
         excluded_mechanisms=excluded_mechanisms,
         extra_blueprint_context=blueprint_context,
+        topology_axes=parent.topology_axes,
+        active_symptom=active_symptom,
+        case_ratios=parent.case_ratios,
     )
     return f"{rendered}\n\n" if rendered else ""
 
@@ -703,6 +711,11 @@ def build_exploit_request(
         sil_advisory=sil_advisory,
         sil_verification=sil_verification,
         freedom_mask=freedom_mask,
+        active_symptom=(
+            rule.symptom_family.value
+            if hasattr(rule.symptom_family, "value")
+            else str(rule.symptom_family)
+        ),
     )
     user_prompt = (
         f"{constraint_section}"
@@ -792,6 +805,8 @@ def build_syntax_repair_request(
     freedom_mask: ConstraintRelaxationMask | None = None,
     vector_mode: str = "simdvf",
     ub_256kb_unlock: bool = False,
+    topology_axes: TopologyAxes | None = None,
+    case_ratios: CasePhysicsRatios | None = None,
 ) -> GenerationRequest:
     """Build bounded syntax/compile repair request routed to the active backend dialect."""
     hint_sentence = f" Authorized target: {slice_hint}." if slice_hint else ""
@@ -804,7 +819,7 @@ def build_syntax_repair_request(
             "surface. Fix the syntax, API, sync-pairing, or SRAM-capacity failure reported "
             "below without altering tensor semantics. Output ONLY valid C++20 SEARCH/REPLACE "
             "hunks or authorized kernel code matching the target regime contract. "
-            "Do NOT emit high-level AscendC classes or legacy 910B raw CCE intrinsics."
+            "Do NOT emit high-level AscendC classes or legacy non-dav-3510 CCE intrinsics."
             f"{hint_sentence}"
         )
     else:
@@ -825,7 +840,12 @@ def build_syntax_repair_request(
         vector_mode=vector_mode,
         ub_256kb_unlock=ub_256kb_unlock,
     )
-    layer2_text = format_target_dialect_layer(escalation_tier=backend_kind)
+    layer2_text = format_target_dialect_layer(
+        escalation_tier=backend_kind,
+        topology_axes=topology_axes,
+        freedom_mask=freedom_mask,
+        case_ratios=case_ratios,
+    )
     g5_lock_text = format_g5_parent_monotonicity_lock()
     sil_text = format_sil_diagnostics_section(
         sil_advisory=sil_advisory,
@@ -1099,6 +1119,8 @@ class PortfolioRunner:
                     backend_kind=escalation_tier,
                     freedom_mask=freedom_mask,
                     ub_256kb_unlock=bool(spec.parent_candidate.ledger.uses_unreserved_ubuf),
+                    topology_axes=active_axes,
+                    case_ratios=case_ratios,
                 )
                 try:
                     repaired_raw = await self._backend.generate(repair_req)
@@ -1166,7 +1188,7 @@ class PortfolioRunner:
         stage_features = evaluation.stage_a.features
         worker_features = _project_features_with_ratios(
             stage_features
-            if isinstance(stage_features, StructuralFeatures)
+            if isinstance(stage_features, Mapping)
             else spec.parent_candidate.features,
             case_ratios,
         )

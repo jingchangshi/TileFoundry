@@ -67,7 +67,7 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
 from tilefoundry_ascend.agent.orchestrator.llm_constraints import (
     build_progressive_llm_constraints,
 )
-from tilefoundry_ascend.agent.router.capability_gate import RouteDecision, StructuralFeatures
+from tilefoundry_ascend.agent.router.capability_gate import RouteDecision
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import HirBlueprintPacket
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger, ScopeWaterline
@@ -195,7 +195,7 @@ def _get_kernel(
     return compiled
 
 
-def exp(x, base=-1.0, scale=1.0, shift=0.0):
+def exp(x: "torch.Tensor", base=-1.0, scale=1.0, shift=0.0):
     """Compute elementwise exp on NPU tensors through the compiled kernel."""
     flat = x.reshape(-1, x.shape[-1])
     out = _get_kernel(int(flat.shape[0]), int(flat.shape[1]), "float16")(flat)
@@ -226,7 +226,7 @@ def _get_kernel(M: int = 1024, D: int = 1024) -> object:
     return _KERNEL_CACHE.get(key)
 
 
-def exp(x, index):
+def exp(x: "torch.Tensor", index: "torch.Tensor"):
     """Dispatch gather through the bisheng-compiled Track-B library."""
     raise RuntimeError("offline test fixture has no compiled Track-B library")
 
@@ -489,7 +489,7 @@ def test_prepare_seed_trackb_uses_cce_cpp20_surface() -> None:
     outcome = _prepare(golden_source=_GATHER_GOLDEN, backend=backend)
     assert outcome.initial_track == "cce_trackb"
     assert "dialect=cce_cpp20" in backend.requests[0].user_prompt
-    assert "CCE C++20 (tl_templates/ascend)" in backend.requests[0].system_prompt
+    assert CCE_CPP20_SURFACE.display_label in backend.requests[0].system_prompt
     assert outcome.regime_specs
     assert all(regime.runtime_backend == "ascendc_trackb" for regime in outcome.regime_specs)
     assert all(regime.trackb_symbols == ("EXP_TRACKB_CU",) for regime in outcome.regime_specs)
@@ -1274,7 +1274,7 @@ def test_layer3_roofline_reaches_both_track_prompts(tmp_path: Path) -> None:
         escalation_tier="cce_cpp20",
         blueprint=packet,
     )
-    assert "CCE C++20 (tl_templates/ascend)" in cce_prompt
+    assert CCE_CPP20_SURFACE.display_label in cce_prompt
 
 
 def test_marathon_cli_exposes_cold_start_prescreen_and_target_file_flags() -> None:
@@ -1551,19 +1551,21 @@ def _trackb_route(regime: RegimeTargetSpec) -> RouteDecision:
     assert ratios is not None
     return RouteDecision(
         track="developer",
-        features=StructuralFeatures(
-            phi_1_static_affine_bounds=True,
-            phi_2_cube_to_vector_ratio=0.0,
-            phi_3_quant_granularity="none",
-            phi_4_indirect_sparse_gather=False,
-            phi_5_cross_iter_recurrence="none",
-            phi_6_dynamic_cross_core_handoff=False,
-            phi_7_inner_contiguous_bytes=ratios.inner_contiguous_bytes,
-            phi_8_persistent_wave_occupancy=ratios.wave_occupancy_ratio,
-        ),
         rationale=("evidence fixture",),
         recommended_primitives=(),
         recommended_backend_tier="ascendc_template",
+        case_ratios=ratios,
+        suitability_score=0.85,
+        features={
+            "static_affine_bounds": True,
+            "cube_to_vector_ratio": 0.0,
+            "quant_granularity": "none",
+            "indirect_sparse_gather": False,
+            "cross_iter_recurrence": "none",
+            "dynamic_cross_core_handoff": False,
+            "inner_contiguous_bytes": ratios.inner_contiguous_bytes,
+            "persistent_wave_occupancy": ratios.wave_occupancy_ratio,
+        },
     )
 
 

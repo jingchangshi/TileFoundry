@@ -1,10 +1,11 @@
-"""Eight-dimensional structural feature extractor and pure 3-axis TopologyAxes / 3-track router."""
+"""Pure 3-axis TopologyAxes CapabilityGate router and Track escalation evaluator."""
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from tilefoundry.ir.core.expr import Call, Constant, Expr
 from tilefoundry.ir.core.expr import Tuple as IrTuple
@@ -27,6 +28,7 @@ from tilefoundry.ir.tir.stmts import (
 from tilefoundry.ir.types import TensorType, TupleType
 from tilefoundry.ir.types.mesh import flattened_levels
 from tilefoundry.ir.types.utils import static_dim_value
+from tilefoundry_ascend.agent.router.isa_gap_scanner import PipeGapReport
 from tilefoundry_ascend.ascend.ir.execution import SIMDVF_KIND, SIMTVF_KIND
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
 from tilefoundry_ascend.ascend.sil.op_analyzer import resolve_canonical_topology_axes
@@ -107,115 +109,45 @@ def _primitives_for_axes(axes: TopologyAxes) -> tuple[str, ...]:
     return ("T.Pipelined", "T.Stage", "T.SimdVF", "T.dual_copy")
 
 
-@dataclass(frozen=True)
-class StructuralFeatures:
-    """Normalized 8-dimensional structural kernel feature vector phi_1..phi_8."""
+_BLOCKING_GAP_BY_RING: dict[str, tuple[str, ...]] = {
+    "gm_ub_stream": ("dma_dual_copy_and_nd2nz", "simd_vld_vst"),
+    "gm_l1_l0_fixpipe": ("dma_dual_copy_and_nd2nz",),
+    "bidirectional_cv_ring": ("dma_dual_copy_and_nd2nz", "crosscore_flag_set_wait"),
+    "persistent_onchip_state": ("dma_dual_copy_and_nd2nz",),
+    "l0c_ub_epilogue": ("fixpipe_l0c_to_ub_split_m",),
+    "ub_random_atomic": (
+        "simt_gm_atomic_cas",
+        "hardware_mutex_28",
+        "simd_vgather_vscatter",
+    ),
+}
 
-    phi_1_static_affine_bounds: bool
-    phi_2_cube_to_vector_ratio: float
-    phi_3_quant_granularity: str
-    phi_4_indirect_sparse_gather: bool
-    phi_5_cross_iter_recurrence: str
-    phi_6_dynamic_cross_core_handoff: bool
-    phi_7_inner_contiguous_bytes: int
-    phi_8_persistent_wave_occupancy: float
+_BLOCKING_GAP_BY_REGULARITY: dict[str, tuple[str, ...]] = {
+    "irregular_simt": ("simt_gm_atomic_cas", "hardware_mutex_28", "simd_vgather_vscatter"),
+    "ragged_group": ("fixpipe_l0c_to_ub_split_m",),
+    "dynamic_opcode_stream": ("scalar_set_ctrl_spr", "simt_gm_atomic_cas"),
+}
 
-    def __post_init__(self) -> None:
-        if self.phi_3_quant_granularity not in VALID_QUANT_GRANULARITIES:
-            raise ValueError(
-                f"invalid quant granularity {self.phi_3_quant_granularity!r}"
-            )
-        if self.phi_5_cross_iter_recurrence not in VALID_RECURRENCES:
-            raise ValueError(
-                f"invalid recurrence kind {self.phi_5_cross_iter_recurrence!r}"
-            )
+_RING_SCORE_DEDUCTION: dict[str, float] = {
+    "bidirectional_cv_ring": 0.15,
+    "persistent_onchip_state": 0.20,
+    "l0c_ub_epilogue": 0.25,
+    "ub_random_atomic": 0.35,
+}
 
-    def as_tuple(self) -> tuple[bool, float, str, bool, str, bool, int, float]:
-        """Return ordered tuple (phi_1, ..., phi_8)."""
-        return (
-            self.phi_1_static_affine_bounds,
-            self.phi_2_cube_to_vector_ratio,
-            self.phi_3_quant_granularity,
-            self.phi_4_indirect_sparse_gather,
-            self.phi_5_cross_iter_recurrence,
-            self.phi_6_dynamic_cross_core_handoff,
-            self.phi_7_inner_contiguous_bytes,
-            self.phi_8_persistent_wave_occupancy,
-        )
+_REGULARITY_SCORE_DEDUCTION: dict[str, float] = {
+    "dynamic_opcode_stream": 0.35,
+    "ragged_group": 0.25,
+    "irregular_simt": 0.25,
+}
 
-    def to_dict(self) -> dict[str, object]:
-        """Return feature values keyed by phi_1..phi_8 and symbolic names."""
-        return {
-            "phi_1": self.phi_1_static_affine_bounds,
-            "phi_2": self.phi_2_cube_to_vector_ratio,
-            "phi_3": self.phi_3_quant_granularity,
-            "phi_4": self.phi_4_indirect_sparse_gather,
-            "phi_5": self.phi_5_cross_iter_recurrence,
-            "phi_6": self.phi_6_dynamic_cross_core_handoff,
-            "phi_7": self.phi_7_inner_contiguous_bytes,
-            "phi_8": self.phi_8_persistent_wave_occupancy,
-            "static_affine_bounds": self.phi_1_static_affine_bounds,
-            "cube_to_vector_ratio": self.phi_2_cube_to_vector_ratio,
-            "quant_granularity": self.phi_3_quant_granularity,
-            "indirect_sparse_gather": self.phi_4_indirect_sparse_gather,
-            "cross_iter_recurrence": self.phi_5_cross_iter_recurrence,
-            "dynamic_cross_core_handoff": self.phi_6_dynamic_cross_core_handoff,
-            "inner_contiguous_bytes": self.phi_7_inner_contiguous_bytes,
-            "persistent_wave_occupancy": self.phi_8_persistent_wave_occupancy,
-        }
 
-    @classmethod
-    def from_dict(cls, payload: Mapping[str, object]) -> StructuralFeatures:
-        """Reconstruct StructuralFeatures from phi_1..phi_8 or symbolic dictionary keys."""
-
-        def _pick(short_key: str, long_key: str, default: object) -> object:
-            if short_key in payload:
-                return payload[short_key]
-            if long_key in payload:
-                return payload[long_key]
-            full_key = f"{short_key}_{long_key}"
-            if full_key in payload:
-                return payload[full_key]
-            return default
-
-        return cls(
-            phi_1_static_affine_bounds=bool(_pick("phi_1", "static_affine_bounds", True)),
-            phi_2_cube_to_vector_ratio=float(_pick("phi_2", "cube_to_vector_ratio", 0.0)),
-            phi_3_quant_granularity=str(_pick("phi_3", "quant_granularity", "none")),
-            phi_4_indirect_sparse_gather=bool(_pick("phi_4", "indirect_sparse_gather", False)),
-            phi_5_cross_iter_recurrence=str(_pick("phi_5", "cross_iter_recurrence", "none")),
-            phi_6_dynamic_cross_core_handoff=bool(
-                _pick("phi_6", "dynamic_cross_core_handoff", False)
-            ),
-            phi_7_inner_contiguous_bytes=int(_pick("phi_7", "inner_contiguous_bytes", 0)),
-            phi_8_persistent_wave_occupancy=float(
-                _pick("phi_8", "persistent_wave_occupancy", 0.0)
-            ),
-        )
-
-    @classmethod
-    def from_case_ratios(
-        cls,
-        ratios: CasePhysicsRatios,
-        *,
-        static_affine_bounds: bool,
-        cube_to_vector_ratio: float,
-        quant_granularity: str,
-        indirect_sparse_gather: bool,
-        cross_iter_recurrence: str,
-        dynamic_cross_core_handoff: bool,
-    ) -> StructuralFeatures:
-        """Project real per-case physics ratios into the compatibility phi_1..phi_8 view."""
-        return cls(
-            phi_1_static_affine_bounds=static_affine_bounds,
-            phi_2_cube_to_vector_ratio=cube_to_vector_ratio,
-            phi_3_quant_granularity=quant_granularity,
-            phi_4_indirect_sparse_gather=indirect_sparse_gather,
-            phi_5_cross_iter_recurrence=cross_iter_recurrence,
-            phi_6_dynamic_cross_core_handoff=dynamic_cross_core_handoff,
-            phi_7_inner_contiguous_bytes=ratios.inner_contiguous_bytes,
-            phi_8_persistent_wave_occupancy=ratios.wave_occupancy_ratio,
-        )
+def _coerce_axes(raw: TopologyAxes | Mapping[str, object]) -> TopologyAxes:
+    if isinstance(raw, TopologyAxes):
+        return raw
+    if isinstance(raw, Mapping):
+        return TopologyAxes.from_dict(raw)
+    raise TypeError(f"Expected TopologyAxes or Mapping, got {type(raw).__name__}")
 
 
 @dataclass(frozen=True)
@@ -223,20 +155,26 @@ class RouteDecision:
     """Selected DSL lowering track, 3-axis TopologyAxes, and backend tier."""
 
     track: str
-    features: StructuralFeatures
-    rationale: tuple[str, ...]
-    recommended_primitives: tuple[str, ...]
     topology_axes: TopologyAxes = TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
+    rationale: tuple[str, ...] = ()
+    recommended_primitives: tuple[str, ...] = ()
     recommended_backend_tier: str = "tilelang_dsl"
+    case_ratios: CasePhysicsRatios | None = None
+    pipe_gaps: PipeGapReport | None = None
+    suitability_score: float = 1.0
+    features: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if self.track not in VALID_TRACKS:
             raise ValueError(f"unsupported route track {self.track!r}")
         if isinstance(self.topology_axes, Mapping):
-            object.__setattr__(self, "topology_axes", TopologyAxes.from_dict(self.topology_axes))
+            object.__setattr__(
+                self, "topology_axes", TopologyAxes.from_dict(self.topology_axes)
+            )
         elif not isinstance(self.topology_axes, TopologyAxes):
             raise TypeError(
-                f"RouteDecision.topology_axes must be TopologyAxes, got {type(self.topology_axes).__name__}"
+                "RouteDecision.topology_axes must be TopologyAxes, "
+                f"got {type(self.topology_axes).__name__}"
             )
         normalized_tier = normalize_router_tier(self.recommended_backend_tier)
         if normalized_tier not in VALID_BACKEND_TIERS:
@@ -244,6 +182,178 @@ class RouteDecision:
                 f"unsupported backend tier {self.recommended_backend_tier!r}"
             )
         object.__setattr__(self, "recommended_backend_tier", normalized_tier)
+        score = float(self.suitability_score)
+        if not math.isfinite(score) or score < 0.0 or score > 1.0:
+            raise ValueError(
+                f"RouteDecision.suitability_score must be in [0.0, 1.0], got {score!r}"
+            )
+        object.__setattr__(self, "suitability_score", score)
+        if self.features is not None:
+            if not isinstance(self.features, Mapping):
+                raise TypeError(
+                    "RouteDecision.features must be Mapping or None, "
+                    f"got {type(self.features).__name__}"
+                )
+            object.__setattr__(
+                self,
+                "features",
+                {str(k): v for k, v in self.features.items()},
+            )
+
+
+class CapabilityGate:
+    """Pure 3-axis TopologyAxes router and ISA suitability scorer."""
+
+    @staticmethod
+    def suitability_score(
+        topology_axes: TopologyAxes,
+        pipe_gaps: PipeGapReport | None = None,
+        case_ratios: CasePhysicsRatios | None = None,
+    ) -> float:
+        """Compute deterministic [0.0, 1.0] DSL suitability score from 3 axes, gaps, and ratios."""
+        base_axes = _coerce_axes(topology_axes)
+        axes = case_ratios.effective_axes(base_axes) if case_ratios is not None else base_axes
+
+        blocking_prims: set[str] = set(_BLOCKING_GAP_BY_RING.get(axes.memory_ring, ()))
+        blocking_prims.update(_BLOCKING_GAP_BY_REGULARITY.get(axes.iteration_regularity, ()))
+        if axes.uses_cube and axes.memory_ring == "persistent_onchip_state":
+            blocking_prims.add("crosscore_flag_set_wait")
+
+        if pipe_gaps is not None:
+            for prim in blocking_prims:
+                if pipe_gaps.has_gap(prim):
+                    return 0.0
+
+        score = 1.0
+        score -= _RING_SCORE_DEDUCTION.get(axes.memory_ring, 0.0)
+        score -= _REGULARITY_SCORE_DEDUCTION.get(axes.iteration_regularity, 0.0)
+        if case_ratios is not None and case_ratios.contig_atom_ratio < 1.0:
+            score -= 0.20
+
+        if pipe_gaps is not None and pipe_gaps.missing_primitives:
+            non_blocking = sum(
+                1 for prim in pipe_gaps.missing_primitives if prim not in blocking_prims
+            )
+            if non_blocking > 0:
+                score -= min(0.25, 0.015 * float(non_blocking))
+
+        return round(max(0.0, min(1.0, score)), 6)
+
+    @staticmethod
+    def route(
+        topology_axes: TopologyAxes,
+        *,
+        pipe_gaps: PipeGapReport | None = None,
+        case_ratios: CasePhysicsRatios | None = None,
+        router_enabled: bool = True,
+        semantic_features: Mapping[str, object] | None = None,
+    ) -> RouteDecision:
+        """Route a 3-axis TopologyAxes coordinate to execution track and backend tier."""
+        base_axes = _coerce_axes(topology_axes)
+        if not router_enabled:
+            return RouteDecision(
+                track="developer",
+                topology_axes=base_axes,
+                rationale=("track router disabled (ablation); neutral developer route",),
+                recommended_primitives=_primitives_for_axes(base_axes),
+                recommended_backend_tier="tilelang_dsl",
+                case_ratios=case_ratios,
+                pipe_gaps=pipe_gaps,
+                suitability_score=1.0,
+                features=None,
+            )
+
+        axes = case_ratios.effective_axes(base_axes) if case_ratios is not None else base_axes
+        score = CapabilityGate.suitability_score(
+            axes, pipe_gaps=pipe_gaps, case_ratios=case_ratios
+        )
+
+        feat_dict: dict[str, object] = (
+            {str(k): v for k, v in semantic_features.items()}
+            if semantic_features is not None
+            else {}
+        )
+        feat_dict["compute_engine"] = axes.compute_engine
+        feat_dict["memory_ring"] = axes.memory_ring
+        feat_dict["iteration_regularity"] = axes.iteration_regularity
+        feat_dict["uses_cube"] = axes.uses_cube
+        feat_dict["suitability_score"] = score
+        if case_ratios is not None:
+            feat_dict["inner_contiguous_bytes"] = case_ratios.inner_contiguous_bytes
+            feat_dict["persistent_wave_occupancy"] = case_ratios.wave_occupancy_ratio
+            feat_dict["wave_occupancy_ratio"] = case_ratios.wave_occupancy_ratio
+            feat_dict["contig_atom_ratio"] = case_ratios.contig_atom_ratio
+            feat_dict["oi_ridge_ratio"] = case_ratios.oi_ridge_ratio
+            feat_dict["has_empty_group"] = case_ratios.has_empty_group
+
+        has_handoff = bool(feat_dict.get("dynamic_cross_core_handoff", False))
+        has_indirect = bool(feat_dict.get("indirect_sparse_gather", False))
+        simt_dom = bool(feat_dict.get("simt_dominant", False))
+        is_non_assoc = str(feat_dict.get("cross_iter_recurrence", "none")) == "non_associative_scan"
+        inner_bytes = int(feat_dict.get("inner_contiguous_bytes", 0) or 0)
+        sub32_width = (0 < inner_bytes < 32) or (
+            case_ratios is not None and case_ratios.contig_atom_ratio < 1.0
+        )
+
+        reasons: list[str] = [f"3-axis route -> {axes.key()} (score={score:.3f})"]
+        if axes.memory_ring in ("bidirectional_cv_ring", "l0c_ub_epilogue") or has_handoff or (
+            axes.uses_cube
+            and (has_indirect or axes.iteration_regularity in ("irregular_simt", "ragged_group"))
+        ):
+            track = "manual_ssbuf"
+            if has_indirect:
+                reasons.append("indirect sparse/page gather detected")
+            if has_handoff:
+                reasons.append("dynamic cross-core metadata/scale handoff detected")
+        elif (
+            axes.memory_ring in ("ub_random_atomic", "persistent_onchip_state")
+            or axes.iteration_regularity in ("irregular_simt", "dynamic_opcode_stream")
+            or is_non_assoc
+            or simt_dom
+            or (sub32_width and not axes.uses_cube)
+        ):
+            track = "simt_vf"
+            if simt_dom:
+                reasons.append("fine-grained thread-level vector reduction flagged")
+            if is_non_assoc:
+                reasons.append("non-associative cross-iteration recurrence")
+            if sub32_width and not axes.uses_cube:
+                reasons.append("sub-32B innermost contiguous vector width")
+        else:
+            track = "developer"
+
+        quant = str(feat_dict.get("quant_granularity", "none"))
+        if (
+            score == 0.0
+            or axes.memory_ring in ("ub_random_atomic", "l0c_ub_epilogue", "persistent_onchip_state")
+            or axes.iteration_regularity in ("irregular_simt", "ragged_group", "dynamic_opcode_stream")
+            or (axes.memory_ring == "gm_l1_l0_fixpipe" and quant != "none")
+            or bool(feat_dict.get("requires_subbyte_dtype", False))
+            or bool(feat_dict.get("requires_inplace_gm_cas", False))
+        ):
+            backend_tier = "ascendc_template"
+            if score == 0.0:
+                reasons.append("blocking TileLang ISA gap detected; escalating to ascendc_template")
+        else:
+            backend_tier = "tilelang_dsl"
+
+        if case_ratios is not None:
+            reasons.append(
+                f"case ratios contig_bytes={case_ratios.inner_contiguous_bytes}B "
+                f"wave_occ={case_ratios.wave_occupancy_ratio:.3f} -> {axes.key()}"
+            )
+
+        return RouteDecision(
+            track=track,
+            topology_axes=axes,
+            rationale=tuple(reasons),
+            recommended_primitives=_primitives_for_axes(axes),
+            recommended_backend_tier=backend_tier,
+            case_ratios=case_ratios,
+            pipe_gaps=pipe_gaps,
+            suitability_score=score,
+            features=feat_dict,
+        )
 
 
 @dataclass(frozen=True)
@@ -866,19 +976,92 @@ def _scan_tilefoundry_ir(fn_or_stmt) -> dict[str, object]:
     }
 
 
-def extract_structural_features(
+def _infer_axes_from_semantic_dict(
+    semantic: Mapping[str, object],
+    *,
+    simt_dominant: bool = False,
+) -> TopologyAxes:
+    if all(
+        k in semantic for k in ("compute_engine", "memory_ring", "iteration_regularity")
+    ):
+        return TopologyAxes.from_dict(semantic)
+    static_bounds = bool(semantic.get("static_affine_bounds", True))
+    cube_ratio = float(semantic.get("cube_to_vector_ratio", 0.0) or 0.0)
+    uses_cube = bool(semantic.get("uses_cube", False)) or cube_ratio > 0.0
+    quant = str(semantic.get("quant_granularity", "none"))
+    indirect = bool(semantic.get("indirect_sparse_gather", False))
+    recurrence = str(semantic.get("cross_iter_recurrence", "none"))
+    handoff = bool(semantic.get("dynamic_cross_core_handoff", False))
+    inner_bytes = int(semantic.get("inner_contiguous_bytes", 0) or 0)
+    is_non_assoc = recurrence == "non_associative_scan"
+    is_cv_ring = (
+        uses_cube
+        and (recurrence == "associative_online_rescale" or handoff or indirect)
+        and (static_bounds or indirect)
+    )
+    is_grouped = uses_cube and not is_cv_ring and not static_bounds
+    is_simt = (
+        not uses_cube
+        and not is_non_assoc
+        and (
+            simt_dominant
+            or indirect
+            or handoff
+            or (0 < inner_bytes < 32)
+            or not static_bounds
+        )
+    )
+    if is_non_assoc:
+        return TopologyAxes(
+            compute_engine="coupled_1c2v" if uses_cube else "aiv_only",
+            memory_ring="persistent_onchip_state",
+            iteration_regularity=(
+                "dynamic_opcode_stream" if (not static_bounds and not uses_cube) else "affine_simd"
+            ),
+        )
+    if is_cv_ring:
+        return TopologyAxes(
+            compute_engine="coupled_1c2v",
+            memory_ring="bidirectional_cv_ring",
+            iteration_regularity="irregular_simt" if indirect else "affine_simd",
+        )
+    if is_grouped:
+        return TopologyAxes(
+            compute_engine="coupled_1c2v",
+            memory_ring="l0c_ub_epilogue",
+            iteration_regularity="ragged_group",
+        )
+    if uses_cube:
+        return TopologyAxes(
+            compute_engine=(
+                "coupled_1c2v" if (quant != "none" or handoff) else "aic_only"
+            ),
+            memory_ring="gm_l1_l0_fixpipe",
+            iteration_regularity="affine_simd",
+        )
+    if is_simt:
+        return TopologyAxes(
+            compute_engine="aiv_only",
+            memory_ring="ub_random_atomic",
+            iteration_regularity="irregular_simt",
+        )
+    return TopologyAxes(
+        compute_engine="aiv_only",
+        memory_ring="gm_ub_stream",
+        iteration_regularity="affine_simd",
+    )
+
+
+def _analyze_ir_and_ledger(
     ir_obj: object | None = None,
     *,
     ledger: ObjectivePhysicalLedger | None = None,
     target: AscendTarget | None = None,
-    total_tiles: int | None = None,
-    quant_granularity: str | None = None,
-    cross_iter_recurrence: str | None = None,
-    indirect_sparse_gather: bool | None = None,
-    dynamic_cross_core_handoff: bool | None = None,
-    inner_contiguous_bytes: int | None = None,
-) -> StructuralFeatures:
-    """Compute the 8-dimensional structural vector phi_1..phi_8 from IR and ledger."""
+    simt_dominant: bool = False,
+    case_ratios: CasePhysicsRatios | None = None,
+    semantic_features: Mapping[str, object] | None = None,
+) -> tuple[TopologyAxes, dict[str, object]]:
+    """Derive 3-axis TopologyAxes and plain semantic features from IR and ledger."""
     resolved_target = target or AscendTarget("ascend.950pr")
     aic_count = max(1, resolved_target.device.aic_count)
 
@@ -910,6 +1093,7 @@ def extract_structural_features(
                 info = _scan_tilelang_features(target_fn)
 
     static_bounds = bool(info["static_bounds"])
+    has_simt_flag = bool(info["has_simt_vf"])
     if ledger is not None:
         dynamic_tags = {"while_loop", "data_dependent_branch"}
         if any(
@@ -917,6 +1101,8 @@ def extract_structural_features(
             for tag in ledger.opaque_dynamic_regions
         ):
             static_bounds = False
+        if "simt_vf" in ledger.opaque_dynamic_regions:
+            has_simt_flag = True
 
     ratio = _ratio_from_ledger(ledger)
     if ratio == 0.0:
@@ -925,180 +1111,99 @@ def extract_structural_features(
         elif info["has_cube"]:
             ratio = 2.0
 
-    quant = quant_granularity or str(info["quant"])
-    indirect = (
-        indirect_sparse_gather
-        if indirect_sparse_gather is not None
-        else bool(info["indirect_gather"])
-    )
-    recurrence = cross_iter_recurrence or str(info["recurrence"])
-    handoff = (
-        dynamic_cross_core_handoff
-        if dynamic_cross_core_handoff is not None
-        else bool(info["dynamic_handoff"])
-    )
-    inner_b = (
-        inner_contiguous_bytes
-        if inner_contiguous_bytes is not None
-        else int(info["inner_bytes"])
-    )
-    tiles = total_tiles if total_tiles is not None else int(info["total_tiles"])
+    tiles = int(info["total_tiles"])
     occupancy = float(tiles) / float(aic_count) if tiles > 0 else 0.0
+    inner_b = int(info["inner_bytes"])
+    if case_ratios is not None:
+        inner_b = case_ratios.inner_contiguous_bytes
+        occupancy = case_ratios.wave_occupancy_ratio
 
-    return StructuralFeatures(
-        phi_1_static_affine_bounds=static_bounds,
-        phi_2_cube_to_vector_ratio=ratio,
-        phi_3_quant_granularity=quant,
-        phi_4_indirect_sparse_gather=indirect,
-        phi_5_cross_iter_recurrence=recurrence,
-        phi_6_dynamic_cross_core_handoff=handoff,
-        phi_7_inner_contiguous_bytes=inner_b,
-        phi_8_persistent_wave_occupancy=occupancy,
+    merged: dict[str, object] = {
+        "static_affine_bounds": static_bounds,
+        "cube_to_vector_ratio": ratio,
+        "quant_granularity": str(info["quant"]),
+        "indirect_sparse_gather": bool(info["indirect_gather"]),
+        "cross_iter_recurrence": str(info["recurrence"]),
+        "dynamic_cross_core_handoff": bool(info["dynamic_handoff"]),
+        "inner_contiguous_bytes": inner_b,
+        "persistent_wave_occupancy": occupancy,
+        "uses_cube": ratio > 0.0,
+        "simt_dominant": bool(simt_dominant or has_simt_flag),
+    }
+    if semantic_features is not None:
+        for k, v in semantic_features.items():
+            merged[str(k)] = v
+
+    axes = _infer_axes_from_semantic_dict(
+        merged,
+        simt_dominant=bool(merged.get("simt_dominant", False)),
     )
-
-
-def _infer_axes_from_features(
-    features: StructuralFeatures, *, simt_dominant: bool
-) -> TopologyAxes:
-    """Infer pure 3-axis TopologyAxes directly from StructuralFeatures."""
-    uses_cube = features.phi_2_cube_to_vector_ratio > 0.0
-    is_non_assoc = features.phi_5_cross_iter_recurrence == "non_associative_scan"
-    is_cv_ring = uses_cube and (
-        features.phi_5_cross_iter_recurrence == "associative_online_rescale"
-        or features.phi_6_dynamic_cross_core_handoff
-        or features.phi_4_indirect_sparse_gather
-    ) and (features.phi_1_static_affine_bounds or features.phi_4_indirect_sparse_gather)
-    is_grouped = uses_cube and not is_cv_ring and not features.phi_1_static_affine_bounds
-    is_simt = (
-        not uses_cube
-        and not is_non_assoc
-        and (
-            simt_dominant
-            or features.phi_4_indirect_sparse_gather
-            or features.phi_6_dynamic_cross_core_handoff
-            or (0 < features.phi_7_inner_contiguous_bytes < 32)
-            or not features.phi_1_static_affine_bounds
-        )
-    )
-    if is_non_assoc:
-        return TopologyAxes(
-            compute_engine="coupled_1c2v" if uses_cube else "aiv_only",
-            memory_ring="persistent_onchip_state",
-            iteration_regularity="dynamic_opcode_stream"
-            if (not features.phi_1_static_affine_bounds and not uses_cube)
-            else "affine_simd",
-        )
-    if is_cv_ring:
-        return TopologyAxes(
-            compute_engine="coupled_1c2v",
-            memory_ring="bidirectional_cv_ring",
-            iteration_regularity="irregular_simt"
-            if features.phi_4_indirect_sparse_gather
-            else "affine_simd",
-        )
-    if is_grouped:
-        return TopologyAxes(
-            compute_engine="coupled_1c2v",
-            memory_ring="l0c_ub_epilogue",
-            iteration_regularity="ragged_group",
-        )
-    if uses_cube:
-        return TopologyAxes(
-            compute_engine="coupled_1c2v"
-            if (features.phi_3_quant_granularity != "none" or features.phi_6_dynamic_cross_core_handoff)
-            else "aic_only",
-            memory_ring="gm_l1_l0_fixpipe",
-            iteration_regularity="affine_simd",
-        )
-    if is_simt:
-        return TopologyAxes(
-            compute_engine="aiv_only",
-            memory_ring="ub_random_atomic",
-            iteration_regularity="irregular_simt",
-        )
-    return TopologyAxes(
-        compute_engine="aiv_only",
-        memory_ring="gm_ub_stream",
-        iteration_regularity="affine_simd",
-    )
-
-
-def _backend_tier_for_axes(axes: TopologyAxes, features: StructuralFeatures) -> str:
-    if axes.memory_ring in ("ub_random_atomic", "l0c_ub_epilogue", "persistent_onchip_state"):
-        return "ascendc_template"
-    if axes.iteration_regularity in ("irregular_simt", "ragged_group", "dynamic_opcode_stream"):
-        return "ascendc_template"
-    if axes.memory_ring == "gm_l1_l0_fixpipe" and features.phi_3_quant_granularity != "none":
-        return "ascendc_template"
-    return "tilelang_dsl"
+    if case_ratios is not None:
+        axes = case_ratios.effective_axes(axes)
+    return axes, merged
 
 
 def route_execution_track(
-    features: StructuralFeatures,
+    target_or_ir: object | None = None,
     *,
+    ledger: ObjectivePhysicalLedger | None = None,
+    target: AscendTarget | None = None,
+    pipe_gaps: PipeGapReport | None = None,
+    case_ratios: CasePhysicsRatios | None = None,
+    router_enabled: bool = True,
     simt_dominant: bool = False,
+    semantic_features: Mapping[str, object] | None = None,
 ) -> RouteDecision:
-    """Select Ascend execution track, 3-axis TopologyAxes, and backend tier."""
-    reasons: list[str] = []
-    axes = _infer_axes_from_features(features, simt_dominant=simt_dominant)
-    backend_tier = _backend_tier_for_axes(axes, features)
-
-    if features.phi_4_indirect_sparse_gather or features.phi_6_dynamic_cross_core_handoff:
-        if features.phi_4_indirect_sparse_gather:
-            reasons.append("phi_4 indirect sparse/page gather detected")
-        if features.phi_6_dynamic_cross_core_handoff:
-            reasons.append("phi_6 dynamic cross-core metadata/scale handoff detected")
-        return RouteDecision(
-            track="manual_ssbuf",
-            features=features,
-            rationale=tuple(reasons),
-            recommended_primitives=("T.Scope", "T.alloc_ss", "T.dual_copy", "T.Persistent"),
-            topology_axes=axes,
-            recommended_backend_tier=backend_tier,
+    """Route TopologyAxes, semantic dict, or IR+ledger via CapabilityGate."""
+    if isinstance(target_or_ir, TopologyAxes):
+        merged = (
+            {str(k): v for k, v in semantic_features.items()}
+            if semantic_features is not None
+            else {}
         )
-
-    if not features.phi_1_static_affine_bounds and features.phi_2_cube_to_vector_ratio > 0.0:
-        reasons.append("dynamic bounds paired with coupled Cube/Vector execution")
-        return RouteDecision(
-            track="manual_ssbuf",
-            features=features,
-            rationale=tuple(reasons),
-            recommended_primitives=("T.Scope", "T.alloc_ss", "T.dual_copy"),
-            topology_axes=axes,
-            recommended_backend_tier=backend_tier,
-        )
-
-    is_non_assoc = features.phi_5_cross_iter_recurrence == "non_associative_scan"
-    unaligned_vec = (
-        0 < features.phi_7_inner_contiguous_bytes < 32
-        and features.phi_2_cube_to_vector_ratio == 0.0
-    )
-    if simt_dominant or is_non_assoc or unaligned_vec or not features.phi_1_static_affine_bounds:
         if simt_dominant:
-            reasons.append("fine-grained thread-level vector reduction flagged")
-        if is_non_assoc:
-            reasons.append("phi_5 non-associative cross-iteration recurrence")
-        if unaligned_vec:
-            reasons.append("phi_7 sub-32B innermost contiguous vector width")
-        if not features.phi_1_static_affine_bounds:
-            reasons.append("phi_1 non-affine bounds on pure vector loop")
-        return RouteDecision(
-            track="simt_vf",
-            features=features,
-            rationale=tuple(reasons),
-            recommended_primitives=("T.SimtVF", "T.get_thread_binding", "T.Persistent"),
-            topology_axes=axes,
-            recommended_backend_tier=backend_tier,
+            merged["simt_dominant"] = True
+        return CapabilityGate.route(
+            target_or_ir,
+            pipe_gaps=pipe_gaps,
+            case_ratios=case_ratios,
+            router_enabled=router_enabled,
+            semantic_features=merged or None,
         )
 
-    reasons.append("phi_1 affine static bounds with no indirect gather or dynamic handoff")
-    return RouteDecision(
-        track="developer",
-        features=features,
-        rationale=tuple(reasons),
-        recommended_primitives=_primitives_for_axes(axes),
-        topology_axes=axes,
-        recommended_backend_tier=backend_tier,
+    if isinstance(target_or_ir, Mapping):
+        merged = {str(k): v for k, v in target_or_ir.items()}
+        if semantic_features is not None:
+            for k, v in semantic_features.items():
+                merged[str(k)] = v
+        if simt_dominant:
+            merged["simt_dominant"] = True
+        axes = _infer_axes_from_semantic_dict(
+            merged,
+            simt_dominant=bool(merged.get("simt_dominant", False)),
+        )
+        return CapabilityGate.route(
+            axes,
+            pipe_gaps=pipe_gaps,
+            case_ratios=case_ratios,
+            router_enabled=router_enabled,
+            semantic_features=merged,
+        )
+
+    axes, merged = _analyze_ir_and_ledger(
+        target_or_ir,
+        ledger=ledger,
+        target=target,
+        simt_dominant=simt_dominant,
+        case_ratios=case_ratios,
+        semantic_features=semantic_features,
+    )
+    return CapabilityGate.route(
+        axes,
+        pipe_gaps=pipe_gaps,
+        case_ratios=case_ratios,
+        router_enabled=router_enabled,
+        semantic_features=merged,
     )
 
 
@@ -1160,6 +1265,8 @@ def route_from_op_spec(
     proto_or_advisory: Mapping[str, object],
     *,
     case_ratios: CasePhysicsRatios | None = None,
+    pipe_gaps: PipeGapReport | None = None,
+    router_enabled: bool = True,
 ) -> RouteDecision:
     """Route a cann-bench proto.yaml or AdvisoryEnvelope dict to 3-axis TopologyAxes & 3 tracks."""
     _op_name, dtypes, desc_text = _extract_op_name_and_dtypes(proto_or_advisory)
@@ -1191,55 +1298,37 @@ def route_from_op_spec(
         has_quant_op=has_quant_structural,
     )
 
-    raw_sf = proto_or_advisory.get("structural_features")
-    if isinstance(raw_sf, Mapping):
-        base_features = StructuralFeatures.from_dict(raw_sf)
-    else:
-        base_features = None
-
     axes = (
         explicit_axes
         if explicit_axes is not None
-        else resolve_canonical_topology_axes(proto_or_advisory, features=base_features)
+        else resolve_canonical_topology_axes(proto_or_advisory)
     )
-
-    if base_features is None:
-        uses_cube = axes.uses_cube
-        base_features = StructuralFeatures(
-            phi_1_static_affine_bounds=axes.iteration_regularity == "affine_simd",
-            phi_2_cube_to_vector_ratio=1.0 if uses_cube else 0.0,
-            phi_3_quant_granularity=quant,
-            phi_4_indirect_sparse_gather=(axes.iteration_regularity == "irregular_simt"),
-            phi_5_cross_iter_recurrence=(
-                "non_associative_scan"
-                if axes.memory_ring == "persistent_onchip_state"
-                else (
-                    "associative_online_rescale"
-                    if axes.memory_ring == "bidirectional_cv_ring"
-                    else "none"
-                )
-            ),
-            phi_6_dynamic_cross_core_handoff=axes.memory_ring
-            in ("l0c_ub_epilogue", "bidirectional_cv_ring"),
-            phi_7_inner_contiguous_bytes=int(
-                proto_or_advisory.get("inner_contiguous_bytes", 0)
-            ),
-            phi_8_persistent_wave_occupancy=float(
-                proto_or_advisory.get("wave_occupancy", 0.0)
-            ),
-        )
-    decision = route_execution_track(base_features)
-    routed = RouteDecision(
-        track=decision.track,
-        features=base_features,
-        rationale=(f"structural op_spec route -> {axes.key()}",),
-        recommended_primitives=_primitives_for_axes(axes),
-        topology_axes=axes,
-        recommended_backend_tier=_backend_tier_for_axes(axes, base_features),
+    semantic_features: dict[str, object] = {
+        "static_affine_bounds": axes.iteration_regularity == "affine_simd",
+        "cube_to_vector_ratio": 1.0 if axes.uses_cube else 0.0,
+        "quant_granularity": quant,
+        "indirect_sparse_gather": axes.iteration_regularity == "irregular_simt",
+        "cross_iter_recurrence": (
+            "non_associative_scan"
+            if axes.memory_ring == "persistent_onchip_state"
+            else (
+                "associative_online_rescale"
+                if axes.memory_ring == "bidirectional_cv_ring"
+                else "none"
+            )
+        ),
+        "dynamic_cross_core_handoff": axes.memory_ring
+        in ("l0c_ub_epilogue", "bidirectional_cv_ring"),
+        "inner_contiguous_bytes": int(proto_or_advisory.get("inner_contiguous_bytes", 0) or 0),
+        "persistent_wave_occupancy": float(proto_or_advisory.get("wave_occupancy", 0.0) or 0.0),
+    }
+    return CapabilityGate.route(
+        axes,
+        pipe_gaps=pipe_gaps,
+        case_ratios=case_ratios,
+        router_enabled=router_enabled,
+        semantic_features=semantic_features,
     )
-    if case_ratios is None:
-        return routed
-    return apply_case_ratios(routed, case_ratios)
 
 
 def _is_subbyte_dtype(dtype_str: str) -> bool:
@@ -1250,11 +1339,12 @@ def _is_subbyte_dtype(dtype_str: str) -> bool:
 
 
 def route_initial_by_input_contract(
-    features_or_spec: StructuralFeatures | Mapping[str, object] | object,
+    spec_or_axes: TopologyAxes | Mapping[str, object] | object,
     *,
     case_ratios: CasePhysicsRatios | None = None,
+    pipe_gaps: PipeGapReport | None = None,
 ) -> RouteDecision:
-    """Causal t=0 router: escalate to ascendc_template ONLY for DSL-unrepresentable input contracts.
+    """Causal t=0 router: escalate to ascendc_template ONLY for DSL-unrepresentable contracts.
 
     Starts every unseen/standard operator on ``tilelang_dsl`` without hindsight bias unless the
     input/output semantic contract itself requires:
@@ -1266,35 +1356,33 @@ def route_initial_by_input_contract(
     gm_cas_reasons: list[str] = []
     opcode_reasons: list[str] = []
 
-    if isinstance(features_or_spec, StructuralFeatures):
-        features = features_or_spec
-        if features.phi_3_quant_granularity == "mixed_fp8_fp4":
-            subbyte_reasons.append("input_contract: sub-byte FP4 mixed_fp8_fp4 dtype")
-        if case_ratios is not None:
-            features = _project_ratio_features(features, case_ratios)
-        decision = route_execution_track(features)
+    if isinstance(spec_or_axes, TopologyAxes):
         axes = (
-            case_ratios.effective_axes(decision.topology_axes)
+            case_ratios.effective_axes(spec_or_axes)
             if case_ratios is not None
-            else decision.topology_axes
+            else spec_or_axes
         )
-        track = decision.track
-        prims = (
-            _primitives_for_axes(axes)
-            if case_ratios is not None
-            else decision.recommended_primitives
-        )
+        if axes.iteration_regularity == "dynamic_opcode_stream":
+            opcode_reasons.append("input_contract: dynamic bytecode/opcode stream required")
+        routed = CapabilityGate.route(axes, pipe_gaps=pipe_gaps, case_ratios=case_ratios)
+        features = dict(routed.features) if routed.features is not None else {}
+        track = routed.track
+        prims = routed.recommended_primitives
+        score = routed.suitability_score
     else:
-        if isinstance(features_or_spec, Mapping):
-            spec_map: Mapping[str, object] = features_or_spec
-        elif hasattr(features_or_spec, "to_dict") and callable(getattr(features_or_spec, "to_dict")):
-            spec_map = features_or_spec.to_dict()  # type: ignore[assignment]
+        if isinstance(spec_or_axes, Mapping):
+            spec_map: Mapping[str, object] = spec_or_axes
+        elif hasattr(spec_or_axes, "to_dict") and callable(getattr(spec_or_axes, "to_dict")):
+            raw_dict = spec_or_axes.to_dict()
+            if not isinstance(raw_dict, Mapping):
+                raise TypeError("to_dict() must return a Mapping")
+            spec_map = raw_dict
         else:
             raise TypeError(
-                f"Expected StructuralFeatures, Mapping, or SIL object, got {type(features_or_spec).__name__}"
+                f"Expected TopologyAxes, Mapping, or SIL object, got {type(spec_or_axes).__name__}"
             )
 
-        op_name, dtypes, _desc_text = _extract_op_name_and_dtypes(spec_map)
+        _op_name, dtypes, _desc_text = _extract_op_name_and_dtypes(spec_map)
         op_block = spec_map.get("operator")
         source: Mapping[str, object] = op_block if isinstance(op_block, Mapping) else spec_map
         contract_text = " ".join(
@@ -1360,49 +1448,23 @@ def route_initial_by_input_contract(
         ):
             opcode_reasons.append("input_contract: dynamic bytecode/opcode stream required")
 
-        raw_sf = spec_map.get("structural_features")
-        if isinstance(raw_sf, Mapping) and raw_sf:
-            features = StructuralFeatures.from_dict(raw_sf)
-            if features.phi_3_quant_granularity == "mixed_fp8_fp4" and not subbyte_reasons:
-                subbyte_reasons.append("input_contract: sub-byte FP4 mixed_fp8_fp4 dtype")
-        else:
-            has_fp8 = False
-            has_fp4 = bool(subbyte_hits)
-            has_i8 = False
-            for dt in dtypes:
-                fp8_f, fp4_f, i8_f = _classify_dtype_flags(dt)
-                has_fp8 = has_fp8 or fp8_f
-                has_fp4 = has_fp4 or fp4_f
-                has_i8 = has_i8 or i8_f
-            quant = _resolve_quant_granularity(
-                has_fp8=has_fp8,
-                has_fp4=has_fp4,
-                has_i8=has_i8,
-                has_quant_op=any(tok in contract_text for tok in ("quant", "antiquant")),
-            )
-            uses_cube = bool(spec_map.get("uses_cube", False)) or (
-                isinstance(raw_axes, Mapping)
-                and str(raw_axes.get("compute_engine", "")) in ("aic_only", "coupled_1c2v")
-            )
-            features = StructuralFeatures(
-                phi_1_static_affine_bounds=(reg_val in ("", "affine_simd")),
-                phi_2_cube_to_vector_ratio=1.0 if uses_cube else 0.0,
-                phi_3_quant_granularity=quant,
-                phi_4_indirect_sparse_gather=bool(
-                    spec_map.get("has_indirect_gather", reg_val == "irregular_simt")
-                ),
-                phi_5_cross_iter_recurrence=(
-                    "non_associative_scan" if bool(spec_map.get("has_persistent_state", False)) else "none"
-                ),
-                phi_6_dynamic_cross_core_handoff=bool(
-                    spec_map.get("has_dead_l1_slice", False)
-                ),
-                phi_7_inner_contiguous_bytes=int(spec_map.get("inner_contiguous_bytes", 0)),
-                phi_8_persistent_wave_occupancy=float(spec_map.get("wave_occupancy", 0.0)),
-            )
+        has_fp8 = False
+        has_fp4 = bool(subbyte_hits)
+        has_i8 = False
+        for dt in dtypes:
+            fp8_f, fp4_f, i8_f = _classify_dtype_flags(dt)
+            has_fp8 = has_fp8 or fp8_f
+            has_fp4 = has_fp4 or fp4_f
+            has_i8 = has_i8 or i8_f
+        quant = _resolve_quant_granularity(
+            has_fp8=has_fp8,
+            has_fp4=has_fp4,
+            has_i8=has_i8,
+            has_quant_op=any(tok in contract_text for tok in ("quant", "antiquant")),
+        )
+        if quant == "mixed_fp8_fp4" and not subbyte_reasons:
+            subbyte_reasons.append("input_contract: sub-byte FP4 mixed_fp8_fp4 dtype")
 
-        if case_ratios is not None:
-            features = _project_ratio_features(features, case_ratios)
         if isinstance(raw_axes, TopologyAxes):
             axes = raw_axes
         elif isinstance(raw_axes, Mapping) and all(
@@ -1410,7 +1472,7 @@ def route_initial_by_input_contract(
         ):
             axes = TopologyAxes.from_dict(raw_axes)
         else:
-            axes = resolve_canonical_topology_axes(spec_map, features=features)
+            axes = resolve_canonical_topology_axes(spec_map)
         if case_ratios is not None:
             axes = case_ratios.effective_axes(axes)
         if opcode_reasons and axes.iteration_regularity != "dynamic_opcode_stream":
@@ -1419,38 +1481,63 @@ def route_initial_by_input_contract(
                 memory_ring="persistent_onchip_state",
                 iteration_regularity="dynamic_opcode_stream",
             )
-        track = route_execution_track(features).track
-        prims = _primitives_for_axes(axes)
+
+        semantic_features: dict[str, object] = {
+            "static_affine_bounds": reg_val in ("", "affine_simd"),
+            "cube_to_vector_ratio": 1.0 if axes.uses_cube else 0.0,
+            "quant_granularity": quant,
+            "indirect_sparse_gather": bool(
+                spec_map.get("has_indirect_gather", reg_val == "irregular_simt")
+            ),
+            "cross_iter_recurrence": (
+                "non_associative_scan"
+                if bool(spec_map.get("has_persistent_state", False))
+                else "none"
+            ),
+            "dynamic_cross_core_handoff": bool(spec_map.get("has_dead_l1_slice", False)),
+            "inner_contiguous_bytes": int(spec_map.get("inner_contiguous_bytes", 0) or 0),
+            "persistent_wave_occupancy": float(spec_map.get("wave_occupancy", 0.0) or 0.0),
+            "requires_subbyte_dtype": bool(subbyte_reasons),
+            "requires_inplace_gm_cas": bool(gm_cas_reasons),
+        }
+        routed = CapabilityGate.route(
+            axes,
+            pipe_gaps=pipe_gaps,
+            case_ratios=case_ratios,
+            semantic_features=semantic_features,
+        )
+        features = dict(routed.features) if routed.features is not None else semantic_features
+        track = routed.track
+        prims = routed.recommended_primitives
+        score = routed.suitability_score
 
     hard_walls = [*subbyte_reasons, *gm_cas_reasons, *opcode_reasons]
     if hard_walls:
         return RouteDecision(
             track=track,
-            features=features,
+            topology_axes=axes,
             rationale=tuple(hard_walls),
             recommended_primitives=prims,
-            topology_axes=axes,
             recommended_backend_tier="ascendc_template",
+            case_ratios=case_ratios,
+            pipe_gaps=pipe_gaps,
+            suitability_score=score,
+            features=features,
         )
 
     return RouteDecision(
         track=track,
-        features=features,
-        rationale=("t=0 input contract representable in TileLang DSL; starting on tilelang_dsl without hindsight bias",),
-        recommended_primitives=prims,
         topology_axes=axes,
+        rationale=(
+            "t=0 input contract representable in TileLang DSL; "
+            "starting on tilelang_dsl without hindsight bias",
+        ),
+        recommended_primitives=prims,
         recommended_backend_tier="tilelang_dsl",
-    )
-
-
-def _project_ratio_features(
-    features: StructuralFeatures,
-    ratios: CasePhysicsRatios,
-) -> StructuralFeatures:
-    return replace(
-        features,
-        phi_7_inner_contiguous_bytes=ratios.inner_contiguous_bytes,
-        phi_8_persistent_wave_occupancy=ratios.wave_occupancy_ratio,
+        case_ratios=case_ratios,
+        pipe_gaps=pipe_gaps,
+        suitability_score=score,
+        features=features,
     )
 
 
@@ -1458,23 +1545,32 @@ def apply_case_ratios(
     decision: RouteDecision,
     ratios: CasePhysicsRatios,
 ) -> RouteDecision:
-    """Project real per-case physics ratios onto a route's compatibility feature view."""
-    features = _project_ratio_features(decision.features, ratios)
-    axes = ratios.effective_axes(decision.topology_axes)
-    backend_tier = _backend_tier_for_axes(axes, features)
-    if decision.recommended_backend_tier == "ascendc_template":
-        backend_tier = "ascendc_template"
+    """Project real per-case physics ratios onto a RouteDecision."""
+    routed = CapabilityGate.route(
+        decision.topology_axes,
+        pipe_gaps=decision.pipe_gaps,
+        case_ratios=ratios,
+        semantic_features=decision.features,
+    )
+    backend_tier = (
+        "ascendc_template"
+        if decision.recommended_backend_tier == "ascendc_template"
+        else routed.recommended_backend_tier
+    )
     return RouteDecision(
-        track=route_execution_track(features).track,
-        features=features,
+        track=routed.track,
+        topology_axes=routed.topology_axes,
         rationale=(
             *decision.rationale,
-            f"case ratios phi_7={ratios.inner_contiguous_bytes}B "
-            f"phi_8={ratios.wave_occupancy_ratio:.3f} -> {axes.key()}",
+            f"case ratios contig_bytes={ratios.inner_contiguous_bytes}B "
+            f"wave_occ={ratios.wave_occupancy_ratio:.3f} -> {routed.topology_axes.key()}",
         ),
-        recommended_primitives=_primitives_for_axes(axes),
-        topology_axes=axes,
+        recommended_primitives=routed.recommended_primitives,
         recommended_backend_tier=backend_tier,
+        case_ratios=ratios,
+        pipe_gaps=decision.pipe_gaps,
+        suitability_score=routed.suitability_score,
+        features=routed.features,
     )
 
 
@@ -1486,12 +1582,14 @@ def evaluate_track_escalation(
     stagnation_rounds: int,
     dominant_bound: str = "",
     compiler_summary: object | None = None,
-    structural_features: StructuralFeatures | Mapping[str, object] | None = None,
+    structural_features: Mapping[str, object] | None = None,
 ) -> EscalationDecision:
     """Closed-loop t>0 escalation from tilelang_dsl -> inline_ascendc_vf or ascendc_template."""
     tier = normalize_router_tier(current_tier)
     if tier not in VALID_ESCALATION_TIERS:
-        raise ValueError(f"Unsupported current_tier {current_tier!r}; expected one of {VALID_ESCALATION_TIERS}")
+        raise ValueError(
+            f"Unsupported current_tier {current_tier!r}; expected one of {VALID_ESCALATION_TIERS}"
+        )
 
     if roofline_eta >= target_eta:
         return EscalationDecision(
@@ -1501,16 +1599,21 @@ def evaluate_track_escalation(
             trigger_reasons=("roofline_target_met",),
         )
 
+    sf_map: dict[str, object] = (
+        {str(k): v for k, v in structural_features.items()}
+        if isinstance(structural_features, Mapping)
+        else (
+            {str(k): v for k, v in structural_features.to_dict().items()}
+            if hasattr(structural_features, "to_dict")
+            else {}
+        )
+    )
+
     if tier == "ascendc_template":
         from tilefoundry_ascend.ascend.templates.registry import (  # noqa: PLC0415
             relax_facets_for_bottleneck,
         )
 
-        sf_map = (
-            structural_features
-            if isinstance(structural_features, Mapping)
-            else (structural_features.to_dict() if hasattr(structural_features, "to_dict") else {})
-        )
         raw_existing_mask = sf_map.get("freedom_mask")
         base_mask = (
             ConstraintRelaxationMask.from_dict(raw_existing_mask)
@@ -1528,9 +1631,12 @@ def evaluate_track_escalation(
             l1_overflow=bool(sf_map.get("l1_overflow", False)),
             ub_overflow=bool(sf_map.get("ub_overflow", False)),
         )
-        if bool(sf_map.get("has_dead_l1_slice", False) or sf_map.get("requires_custom_ring_or_aliasing", False)):
+        if bool(
+            sf_map.get("has_dead_l1_slice", False)
+            or sf_map.get("requires_custom_ring_or_aliasing", False)
+        ):
             relaxed_mask = relaxed_mask.unlock("sram_layout_and_aliasing", "pipeline_and_sync_graph")
-        if bool(sf_map.get("phi_6", sf_map.get("dynamic_cross_core_handoff", False))):
+        if bool(sf_map.get("dynamic_cross_core_handoff", False)):
             relaxed_mask = relaxed_mask.unlock("pipeline_and_sync_graph")
         if stagnation_rounds >= 4 and roofline_eta < min(0.65, float(target_eta)):
             relaxed_mask = ConstraintRelaxationMask.top()
@@ -1551,31 +1657,26 @@ def evaluate_track_escalation(
         )
 
     if compiler_summary is None:
-        comp: dict[str, Any] = {}
+        comp: dict[str, object] = {}
     elif isinstance(compiler_summary, Mapping):
-        comp = dict(compiler_summary)
+        comp = {str(k): v for k, v in compiler_summary.items()}
     elif hasattr(compiler_summary, "to_dict") and callable(getattr(compiler_summary, "to_dict")):
-        comp = dict(compiler_summary.to_dict())
+        comp = {str(k): v for k, v in compiler_summary.to_dict().items()}
     else:
         comp = {
             "spill_bytes": getattr(compiler_summary, "spill_bytes", 0),
             "vloopv2_loops": getattr(compiler_summary, "vloopv2_loops", 0),
             "software_loops": getattr(compiler_summary, "software_loops", 0),
-            "has_local_membar_in_vf_call": getattr(compiler_summary, "has_local_membar_in_vf_call", False),
+            "has_local_membar_in_vf_call": getattr(
+                compiler_summary, "has_local_membar_in_vf_call", False
+            ),
             "vf_fusion_breaks": getattr(compiler_summary, "vf_fusion_breaks", 0),
-            "alias_serialized_buffers": getattr(compiler_summary, "alias_serialized_buffers", 0),
+            "alias_serialized_buffers": getattr(
+                compiler_summary, "alias_serialized_buffers", 0
+            ),
             "dual_issue_ipc_collapse": getattr(compiler_summary, "dual_issue_ipc_collapse", 0.0),
             "dcache_dcci_flushes": getattr(compiler_summary, "dcache_dcci_flushes", 0),
         }
-
-    if structural_features is None:
-        sf: dict[str, Any] = {}
-    elif isinstance(structural_features, StructuralFeatures):
-        sf = structural_features.to_dict()
-    elif isinstance(structural_features, Mapping):
-        sf = dict(structural_features)
-    else:
-        sf = {}
 
     vf_breaks = int(comp.get("vf_fusion_breaks", 0) or 0)
     alias_ser = int(comp.get("alias_serialized_buffers", 0) or 0)
@@ -1586,15 +1687,20 @@ def evaluate_track_escalation(
     dcci_flushes = int(comp.get("dcache_dcci_flushes", 0) or 0)
     spill_bytes = int(comp.get("spill_bytes", 0) or 0)
 
-    cube_ratio = float(sf.get("phi_2", sf.get("cube_to_vector_ratio", 0.0)) or 0.0)
-    uses_cube = bool(sf.get("uses_cube", False)) or cube_ratio > 0.0
+    cube_ratio = float(sf_map.get("cube_to_vector_ratio", 0.0) or 0.0)
+    uses_cube = bool(sf_map.get("uses_cube", False)) or cube_ratio > 0.0
     cross_core = bool(
-        sf.get("phi_6", sf.get("dynamic_cross_core_handoff", False))
-        or sf.get("cross_core_mode4_blocked", False)
+        sf_map.get("dynamic_cross_core_handoff", False)
+        or sf_map.get("cross_core_mode4_blocked", False)
     )
-    dead_l1 = bool(sf.get("has_dead_l1_slice", False) or sf.get("dead_l1_reuse_blocked", False))
-    indirect = bool(sf.get("phi_4", sf.get("indirect_sparse_gather", False)))
-    dist_wall = bool(sf.get("requires_dist_unpack", False) or sf.get("ub_load_store_bottleneck", False))
+    dead_l1 = bool(
+        sf_map.get("has_dead_l1_slice", False) or sf_map.get("dead_l1_reuse_blocked", False)
+    )
+    indirect = bool(sf_map.get("indirect_sparse_gather", False))
+    dist_wall = bool(
+        sf_map.get("requires_dist_unpack", False)
+        or sf_map.get("ub_load_store_bottleneck", False)
+    )
     dom = dominant_bound.strip().lower()
 
     reasons: list[str] = []
@@ -1648,8 +1754,8 @@ def evaluate_track_escalation(
             ConstraintRelaxationMask.bottom(),
             dominant_bound=dominant_bound,
             compiler_summary=comp,
-            l1_overflow=bool(sf.get("l1_overflow", False)),
-            ub_overflow=bool(sf.get("ub_overflow", False)),
+            l1_overflow=bool(sf_map.get("l1_overflow", False)),
+            ub_overflow=bool(sf_map.get("ub_overflow", False)),
         )
         if dead_l1 or alias_ser > 0:
             relaxed_mask = relaxed_mask.unlock("sram_layout_and_aliasing")
@@ -1696,16 +1802,15 @@ def evaluate_track_escalation(
 
 
 __all__ = [
+    "CapabilityGate",
     "EscalationDecision",
     "RouteDecision",
-    "StructuralFeatures",
     "VALID_BACKEND_TIERS",
     "VALID_ESCALATION_TIERS",
     "VALID_QUANT_GRANULARITIES",
     "VALID_RECURRENCES",
     "VALID_TRACKS",
     "apply_case_ratios",
-    "extract_structural_features",
     "evaluate_track_escalation",
     "normalize_router_tier",
     "resolve_canonical_topology_axes",

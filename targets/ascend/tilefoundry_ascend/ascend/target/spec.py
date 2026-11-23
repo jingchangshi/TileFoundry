@@ -65,6 +65,11 @@ def build_davinci_950(document: HardwareDocument) -> DaVinci950:
     )
     architecture = DaVinci950(
         name=reader.text("identity.name"),
+        series=reader.text("identity.series"),
+        cce_arch=reader.text("identity.cce_arch"),
+        supported_skus=reader.names("identity.supported_skus"),
+        default_cann_series=reader.text("toolchain.default_cann_series"),
+        supported_cann_series=reader.names("toolchain.supported_cann_series"),
         supported_compute_dtypes=_dtypes(reader.names("instruction.compute_dtypes"), document),
         capabilities=reader.names("capabilities"),
         aic_per_block=reader.integer("compute.aic_per_block", unit="count"),

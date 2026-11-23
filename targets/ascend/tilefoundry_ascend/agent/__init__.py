@@ -62,9 +62,8 @@ from tilefoundry_ascend.agent.orchestrator import (
     verify_twin_cpu_reference,
 )
 from tilefoundry_ascend.agent.router import (
+    CapabilityGate,
     RouteDecision,
-    StructuralFeatures,
-    extract_structural_features,
     route_execution_track,
 )
 
@@ -79,6 +78,7 @@ __all__ = [
     "CampaignReport",
     "CampaignRoundRecord",
     "CandidateSurrogateResult",
+    "CapabilityGate",
     "EvolutionRoundRecord",
     "EvolutionTrajectory",
     "FlywheelDistillationReport",
@@ -96,7 +96,6 @@ __all__ = [
     "RulePosterior",
     "StaticDynamicResidual",
     "StreamWatchdogConfig",
-    "StructuralFeatures",
     "TileConfigCandidate",
     "TwoLaneBeamSearch",
     "UnsafePredicateError",
@@ -108,7 +107,6 @@ __all__ = [
     "format_hardware_and_sil_layer",
     "format_target_dialect_layer",
     "default_seed_rules_path",
-    "extract_structural_features",
     "format_prescreen_summary",
     "generate_aligned_neighborhood",
     "get_default_anchors",

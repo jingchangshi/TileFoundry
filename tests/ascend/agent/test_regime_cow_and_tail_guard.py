@@ -25,7 +25,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     build_anchor_metrics,
 )
 from tilefoundry_ascend.agent.orchestrator import MockLLMBackend, StageAResult, StageBResult
-from tilefoundry_ascend.agent.router import extract_structural_features, route_execution_track
+from tilefoundry_ascend.agent.router import CapabilityGate, route_execution_track
 from tilefoundry_ascend.ascend.cost_model import CostFeatures
 from tilefoundry_ascend.ascend.passes import (
     HirBlueprintPacket,
@@ -235,8 +235,8 @@ def _dummy_stage_a(source: str) -> StageAResult:
         grid_blocks=20,
         wave_occupancy=0.60,
     )
-    feats = extract_structural_features(None, ledger=ledger)
-    route = route_execution_track(feats)
+    route = route_execution_track(None, ledger=ledger)
+    feats = route.features
     return StageAResult(passed=True, prim_func=None, ledger=ledger, features=feats, route=route)
 
 
@@ -462,8 +462,8 @@ def test_stage6_zero_shot_prescreen_and_experience_lake_anomaly_wiring(
             grid_blocks=20,
             wave_occupancy=0.60,
         )
-        feats = extract_structural_features(None, ledger=ledger)
-        route = route_execution_track(feats)
+        route = route_execution_track(None, ledger=ledger)
+        feats = route.features
         return StageAResult(passed=True, prim_func=None, ledger=ledger, features=feats, route=route)
 
     l1_calls: list[str] = []

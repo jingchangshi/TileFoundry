@@ -491,6 +491,9 @@ _RESIDUAL_DEFAULTS: dict[str, int | float | bool | str] = {
     "measured_aiv_vec_ratio": 0.0,
     "l2_aic_mac_ratio": 0.0,
     "l2_aiv_vec_ratio": 0.0,
+    "aic_mac_ratio": 0.0,
+    "aiv_vec_ratio": 0.0,
+    "l2_pmu_available": 0,
     "measured_mte2_wait_ratio": 0.0,
     "measured_sync_stall_ratio": 0.0,
     "unexplained_gap_ratio": 0.0,
@@ -514,6 +517,7 @@ _TELEMETRY_CONTEXT_DEFAULTS: dict[str, int | float | bool | str] = {
     "num_aiv_cores": 56,
     "ub_bank_conflict_risk": 0.0,
     "l1_bank_conflict_risk": 0.0,
+    "ub_scalar_compute_loops": 0,
     "l1_vec_regs": 0,
     "vec_regs": 0,
     "l1_scalar_regs": 0,
@@ -528,6 +532,115 @@ _TELEMETRY_CONTEXT_DEFAULTS: dict[str, int | float | bool | str] = {
     "memory_ring": "",
     "iteration_regularity": "",
 }
+
+_PMU_L2_FIELD_NAMES = frozenset(
+    {
+        "l2_aic_mac_ratio",
+        "l2_aiv_vec_ratio",
+        "l2_mte2_wait_ratio",
+        "l2_fixpipe_ratio",
+        "l2_cache_hit_rate",
+        "l2_bank_conflict_ratio",
+        "l2_sync_stall_ratio",
+        "l2_pseudo_double_buffer",
+    }
+)
+
+_EXPLICIT_L2_PMU_KEYS = frozenset(
+    {
+        "l2_aic_mac_ratio",
+        "l2_aiv_vec_ratio",
+        "measured_aic_mac_ratio",
+        "measured_aiv_vec_ratio",
+        "aic_mac_ratio",
+        "aiv_vec_ratio",
+        "aic_mad",
+        "aiv_vec",
+        "measured_mte2_wait_ratio",
+        "mte2_wait_ratio",
+        "aiv_mte2",
+        "aic_mte2",
+        "measured_sync_stall_ratio",
+        "sync_stall_ratio",
+        "bank_conflict_ratio",
+        "ub_bank_conflict_ratio",
+        "resource_conflict_ratio",
+        "l2_hit_rate",
+        "l2_cache_hit_rate",
+        "aic_fixpipe_ratio",
+        "aic_fixpipe",
+        "pseudo_double_buffer_serialized",
+    }
+)
+
+
+def _first_present_float(source: object, keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        if isinstance(source, Mapping):
+            if key not in source:
+                continue
+            raw = source[key]
+        elif hasattr(source, key):
+            raw = getattr(source, key)
+        else:
+            continue
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return float(raw)
+    return None
+
+
+def _resolve_l2_pmu_flag(
+    residual: Mapping[str, object] | object | None,
+    embedded_obs: ObservationVector5D | None,
+    extra: Mapping[str, object] | None,
+) -> int:
+    available = 0
+    if residual is not None:
+        if isinstance(residual, Mapping) and "l2_pmu_available" in residual:
+            raw_flag = residual["l2_pmu_available"]
+            if isinstance(raw_flag, bool):
+                available = 1 if raw_flag else 0
+            elif isinstance(raw_flag, (int, float)):
+                available = 1 if int(raw_flag) != 0 else 0
+        elif embedded_obs is not None:
+            if embedded_obs.has_l2_telemetry and not bool(
+                getattr(embedded_obs, "is_analytical_proxy", False)
+            ):
+                if any(f in _PMU_L2_FIELD_NAMES for f in embedded_obs.measured_l2_fields):
+                    available = 1
+                elif not embedded_obs.measured_l2_fields and (
+                    embedded_obs.compute_issue.l2_aiv_vec_ratio > 0.0
+                    or embedded_obs.compute_issue.l2_aic_mac_ratio > 0.0
+                ):
+                    available = 1
+        elif isinstance(residual, Mapping):
+            if not bool(residual.get("is_analytical_proxy", False)) and any(
+                k in residual for k in _EXPLICIT_L2_PMU_KEYS
+            ):
+                available = 1
+        elif (
+            float(getattr(residual, "measured_aiv_vec_ratio", 0.0) or 0.0) > 0.0
+            or float(getattr(residual, "measured_aic_mac_ratio", 0.0) or 0.0) > 0.0
+            or float(getattr(residual, "measured_mte2_wait_ratio", 0.0) or 0.0) > 0.0
+            or float(getattr(residual, "measured_sync_stall_ratio", 0.0) or 0.0) > 0.0
+            or float(getattr(residual, "bank_conflict_ratio", 0.0) or 0.0) > 0.0
+            or float(getattr(residual, "l2_hit_rate", 1.0) or 1.0) < 1.0
+            or bool(getattr(residual, "pseudo_double_buffer_serialized", False))
+        ):
+            available = 1
+
+    if extra:
+        if "l2_pmu_available" in extra:
+            raw_flag = extra["l2_pmu_available"]
+            if isinstance(raw_flag, bool):
+                available = 1 if raw_flag else 0
+            elif isinstance(raw_flag, (int, float)):
+                available = 1 if int(raw_flag) != 0 else 0
+        elif not bool(extra.get("is_analytical_proxy", False)) and any(
+            k in extra for k in _EXPLICIT_L2_PMU_KEYS
+        ):
+            available = 1
+    return available
 
 
 def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
@@ -721,7 +834,11 @@ def _extract_extra_signals(source: object | None) -> dict[str, float]:
         raw_extra = source.extra_signals
     elif isinstance(source, Mapping):
         raw_extra = source.get("extra_signals")
-        for key in ("scalar_compute_loop_fallback", "dcache_bypass_narrow_store"):
+        for key in (
+            "scalar_compute_loop_fallback",
+            "dcache_bypass_narrow_store",
+            "ub_scalar_compute_loops",
+        ):
             val = source.get(key)
             if isinstance(val, (int, float)) and not isinstance(val, bool):
                 out[key] = float(val)
@@ -816,20 +933,29 @@ def build_predicate_context(
         if sw == 0 and vl == 0 and "vloopv2_hit" in comp_vals:
             comp_vals["vloopv2_hit"] = True
         res_defaults.update(comp_vals)
+    embedded_obs: ObservationVector5D | None = None
     if residual is not None:
         res_defaults.update(_extract_typed_defaults(residual, _RESIDUAL_DEFAULTS))
         ctx.update(_extract_typed_defaults(residual, _TELEMETRY_CONTEXT_DEFAULTS))
-        if (
-            res_defaults.get("measured_aic_mac_ratio", 0.0)
-            and not res_defaults.get("l2_aic_mac_ratio", 0.0)
-        ):
-            res_defaults["l2_aic_mac_ratio"] = res_defaults["measured_aic_mac_ratio"]
-        if (
-            res_defaults.get("measured_aiv_vec_ratio", 0.0)
-            and not res_defaults.get("l2_aiv_vec_ratio", 0.0)
-        ):
-            res_defaults["l2_aiv_vec_ratio"] = res_defaults["measured_aiv_vec_ratio"]
         embedded_obs = _embedded_observation(residual)
+        res_aic = _first_present_float(
+            residual, ("l2_aic_mac_ratio", "measured_aic_mac_ratio", "aic_mac_ratio")
+        )
+        if res_aic is None and embedded_obs is not None:
+            res_aic = float(embedded_obs.compute_issue.l2_aic_mac_ratio)
+        if res_aic is not None:
+            res_defaults["l2_aic_mac_ratio"] = res_aic
+            res_defaults["measured_aic_mac_ratio"] = res_aic
+            res_defaults["aic_mac_ratio"] = res_aic
+        res_aiv = _first_present_float(
+            residual, ("l2_aiv_vec_ratio", "measured_aiv_vec_ratio", "aiv_vec_ratio")
+        )
+        if res_aiv is None and embedded_obs is not None:
+            res_aiv = float(embedded_obs.compute_issue.l2_aiv_vec_ratio)
+        if res_aiv is not None:
+            res_defaults["l2_aiv_vec_ratio"] = res_aiv
+            res_defaults["measured_aiv_vec_ratio"] = res_aiv
+            res_defaults["aiv_vec_ratio"] = res_aiv
         if embedded_obs is not None:
             obs_payload = embedded_obs.to_dict()
             dma_payload = obs_payload.get("offchip_dma")
@@ -903,12 +1029,19 @@ def build_predicate_context(
         ctx["vec_regs"] = int(ctx["l1_vec_regs"])
     _apply_case_ratios(ctx, case_ratios)
     ctx["extra_signals"] = dict(extra_signals_map)
-    ctx["scalar_compute_loop_fallback"] = float(
-        extra_signals_map.get("scalar_compute_loop_fallback", 0.0)
+    ub_loops = max(
+        int(ctx.get("ub_scalar_compute_loops", 0) or 0),
+        int(extra_signals_map.get("ub_scalar_compute_loops", 0) or 0),
+    )
+    ctx["ub_scalar_compute_loops"] = ub_loops
+    ctx["scalar_compute_loop_fallback"] = max(
+        float(extra_signals_map.get("scalar_compute_loop_fallback", 0.0)),
+        float(ub_loops),
     )
     ctx["dcache_bypass_narrow_store"] = float(
         extra_signals_map.get("dcache_bypass_narrow_store", 0.0)
     )
+    ctx["l2_pmu_available"] = _resolve_l2_pmu_flag(residual, embedded_obs, extra)
 
     if (
         float(ctx.get("ub_bank_conflict_risk", 0.0)) == 0.0
@@ -950,12 +1083,38 @@ def build_predicate_context(
             ctx["working_set_sram_ratio"] = float(extra["case_working_set_sram_ratio"])
         extra_signals_map.update(_extract_extra_signals(extra))
         ctx["extra_signals"] = dict(extra_signals_map)
-        ctx["scalar_compute_loop_fallback"] = float(
-            extra_signals_map.get("scalar_compute_loop_fallback", 0.0)
+        if "ub_scalar_compute_loops" in extra and isinstance(
+            extra["ub_scalar_compute_loops"], (int, float)
+        ) and not isinstance(extra["ub_scalar_compute_loops"], bool):
+            ub_loops = max(0, int(extra["ub_scalar_compute_loops"]))
+        else:
+            ub_loops = max(
+                int(ctx.get("ub_scalar_compute_loops", 0) or 0),
+                int(extra_signals_map.get("ub_scalar_compute_loops", 0) or 0),
+            )
+        ctx["ub_scalar_compute_loops"] = ub_loops
+        ctx["scalar_compute_loop_fallback"] = max(
+            float(extra_signals_map.get("scalar_compute_loop_fallback", 0.0)),
+            float(ub_loops),
         )
         ctx["dcache_bypass_narrow_store"] = float(
             extra_signals_map.get("dcache_bypass_narrow_store", 0.0)
         )
+        extra_aiv = _first_present_float(
+            extra, ("aiv_vec_ratio", "l2_aiv_vec_ratio", "measured_aiv_vec_ratio")
+        )
+        if extra_aiv is not None:
+            ctx["aiv_vec_ratio"] = extra_aiv
+            ctx["l2_aiv_vec_ratio"] = extra_aiv
+            ctx["measured_aiv_vec_ratio"] = extra_aiv
+        extra_aic = _first_present_float(
+            extra, ("aic_mac_ratio", "l2_aic_mac_ratio", "measured_aic_mac_ratio")
+        )
+        if extra_aic is not None:
+            ctx["aic_mac_ratio"] = extra_aic
+            ctx["l2_aic_mac_ratio"] = extra_aic
+            ctx["measured_aic_mac_ratio"] = extra_aic
+        ctx["l2_pmu_available"] = _resolve_l2_pmu_flag(residual, embedded_obs, extra)
         extra_axes = extra.get("topology_axes")
         if isinstance(extra_axes, Mapping):
             for ak in ("compute_engine", "memory_ring", "iteration_regularity"):
@@ -1084,7 +1243,17 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
         "contig_atom_ratio": 1.0,
         "working_set_sram_ratio": 0.0,
         "scalar_compute_loop_fallback": 0.0,
+        "ub_scalar_compute_loops": 0,
         "dcache_bypass_narrow_store": 0.0,
+        "l2_pmu_available": (
+            1
+            if (
+                obs.has_l2_telemetry
+                and not bool(getattr(obs, "is_analytical_proxy", False))
+                and any(f in _PMU_L2_FIELD_NAMES for f in obs.measured_l2_fields)
+            )
+            else 0
+        ),
         "max_overflow_bytes": _read_signal_int(sram_map, "l0_max_overflow_bytes"),
         "degraded_buffer_count": _read_signal_int(sram_map, "l0_degraded_single_buffers"),
         "bank_conflict_ratio": _read_signal_float(sram_map, "l2_bank_conflict_ratio"),
@@ -1105,11 +1274,18 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
         "has_l1_compiler_summary": _read_signal_bool(payload, "has_l1_compiler_summary"),
         "measured_latency_us": _read_signal_float(grid_map, "l2_measured_latency_us"),
     }
-    if obs_aiv_vec > 0.0 or obs_aic_mac > 0.0:
+    if (
+        obs_aiv_vec > 0.0
+        or obs_aic_mac > 0.0
+        or "l2_aiv_vec_ratio" in obs.measured_l2_fields
+        or "l2_aic_mac_ratio" in obs.measured_l2_fields
+    ):
         out["measured_aiv_vec_ratio"] = obs_aiv_vec
         out["measured_aic_mac_ratio"] = obs_aic_mac
         out["l2_aiv_vec_ratio"] = obs_aiv_vec
         out["l2_aic_mac_ratio"] = obs_aic_mac
+        out["aiv_vec_ratio"] = obs_aiv_vec
+        out["aic_mac_ratio"] = obs_aic_mac
     return out
 
 

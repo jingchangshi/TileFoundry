@@ -22,10 +22,7 @@ from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     format_sil_diagnostics_section,
 )
 from tilefoundry_ascend.agent.orchestrator.residual_beam import BeamCandidate
-from tilefoundry_ascend.agent.router.capability_gate import (
-    EscalationDecision,
-    StructuralFeatures,
-)
+from tilefoundry_ascend.agent.router.capability_gate import EscalationDecision
 from tilefoundry_ascend.ascend.passes import (
     build_objective_physical_ledger,
     build_scope_waterline,
@@ -151,29 +148,29 @@ def test_regime_ratio_line_reports_unavailable_when_representative_ratio_is_miss
     )
 
 
-def _structural_features() -> StructuralFeatures:
-    return StructuralFeatures(
-        phi_1_static_affine_bounds=True,
-        phi_2_cube_to_vector_ratio=1.25,
-        phi_3_quant_granularity="per_tensor",
-        phi_4_indirect_sparse_gather=False,
-        phi_5_cross_iter_recurrence="none",
-        phi_6_dynamic_cross_core_handoff=False,
-        phi_7_inner_contiguous_bytes=64,
-        phi_8_persistent_wave_occupancy=1.0,
-    )
+def _semantic_features() -> dict[str, object]:
+    return {
+        "static_affine_bounds": True,
+        "cube_to_vector_ratio": 1.25,
+        "quant_granularity": "per_tensor",
+        "indirect_sparse_gather": False,
+        "cross_iter_recurrence": "none",
+        "dynamic_cross_core_handoff": False,
+        "inner_contiguous_bytes": 64,
+        "persistent_wave_occupancy": 1.0,
+    }
 
 
-def test_project_features_with_ratios_replaces_only_phi_7_and_phi_8() -> None:
-    """The compatibility features carry real contiguous bytes and wave occupancy."""
-    features = _structural_features()
+def test_project_features_with_ratios_updates_contig_bytes_and_occupancy() -> None:
+    """Projected semantic features carry real contiguous bytes and wave occupancy."""
+    features = _semantic_features()
     projected = _project_features_with_ratios(features, _RATIO_CASE_2)
     assert projected is not None
-    assert projected.phi_7_inner_contiguous_bytes == 256
-    assert projected.phi_8_persistent_wave_occupancy == 0.25
-    assert projected.phi_2_cube_to_vector_ratio == features.phi_2_cube_to_vector_ratio
-    assert projected.phi_3_quant_granularity == features.phi_3_quant_granularity
-    assert features.phi_7_inner_contiguous_bytes == 64
+    assert projected["inner_contiguous_bytes"] == 256
+    assert projected["persistent_wave_occupancy"] == 0.25
+    assert projected["cube_to_vector_ratio"] == features["cube_to_vector_ratio"]
+    assert projected["quant_granularity"] == features["quant_granularity"]
+    assert features["inner_contiguous_bytes"] == 64
     assert _project_features_with_ratios(None, _RATIO_CASE_2) is None
     assert _project_features_with_ratios(features, None) is features
 
@@ -201,7 +198,7 @@ def test_derive_active_topology_axes_applies_case_ratio_phase_transition() -> No
 def test_check_round_escalation_forwards_projected_features(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Escalation receives the ratio-projected features instead of the stale phi view."""
+    """Escalation receives the ratio-projected semantic features."""
     captured: dict[str, object] = {}
 
     def _spy(
@@ -212,7 +209,7 @@ def test_check_round_escalation_forwards_projected_features(
         stagnation_rounds: int,
         dominant_bound: str = "",
         compiler_summary: object | None = None,
-        structural_features: StructuralFeatures | Mapping[str, object] | None = None,
+        structural_features: Mapping[str, object] | None = None,
     ) -> EscalationDecision:
         captured["current_tier"] = current_tier
         captured["roofline_eta"] = roofline_eta
@@ -259,7 +256,7 @@ def test_check_round_escalation_forwards_projected_features(
         residual=residual,
         latency_us=20.0,
         accuracy_passed=True,
-        features=_structural_features(),
+        features=_semantic_features(),
     )
     runner = PortfolioRunner(
         backend=MockLLMBackend(),
@@ -273,8 +270,8 @@ def test_check_round_escalation_forwards_projected_features(
     )
     assert report.escalation.trigger_reasons == ("spy",)
     forwarded = captured["structural_features"]
-    assert isinstance(forwarded, StructuralFeatures)
-    assert forwarded.phi_7_inner_contiguous_bytes == 256
-    assert forwarded.phi_8_persistent_wave_occupancy == 0.25
+    assert isinstance(forwarded, dict)
+    assert forwarded["inner_contiguous_bytes"] == 256
+    assert forwarded["persistent_wave_occupancy"] == 0.25
     assert candidate.features is not None
-    assert candidate.features.phi_7_inner_contiguous_bytes == 64
+    assert candidate.features["inner_contiguous_bytes"] == 64

@@ -38,8 +38,8 @@ def render_pure_regbase_simd_cpp(policy: dict[str, Any] | None = None) -> str:
     ub_budget = "256 * 1024" if p["ub_256kb_unlock"] else "248 * 1024"
     return f"""// Ascend 950 (dav-3510) Paradigm 1: Pure RegBase SIMD VF
 // Flags: --cce-disable-vf-stack-reserved-ubuf --cce-disable-asc-reserved-ubuf (ub_256kb_unlock={p["ub_256kb_unlock"]})
-#include "kernel_operator.h"
-using namespace AscendC;
+#include <tl_templates/ascend/common.h>
+#include <c_api/asc_simd.h>
 
 constexpr uint32_t ROW_PACK_FACTOR = {row_pack}U;
 constexpr uint32_t MULTI_ROW_UNROLL = {unroll}U;
@@ -113,8 +113,8 @@ def render_simt_and_hybrid_ub_cpp(policy: dict[str, Any] | None = None) -> str:
     threads = p["simt_threads"] or 512
     pad_slots = max(8, p["ub_bank_pad_datablocks"])
     return f"""// Ascend 950 (dav-3510) Paradigm 2: SIMT + Hybrid SIMD/SIMT UB
-#include "kernel_operator.h"
-using namespace AscendC;
+#include <tl_templates/ascend/common.h>
+#include <c_api/asc_simd.h>
 
 constexpr uint32_t SIMT_THREADS = {threads}U;
 constexpr uint32_t UB_WARP_PAD = {pad_slots}U;  // +8 padding eliminates warp atomic bank conflicts
@@ -180,8 +180,8 @@ def render_dense_and_quant_gemm_cpp(policy: dict[str, Any] | None = None) -> str
     )
     w4_mode = p["w4_mode"]
     return f"""// Ascend 950 (dav-3510) Paradigm 3: Dense & Quantized GEMM (W4A16 / MXA8W4)
-#include "kernel_operator.h"
-using namespace AscendC;
+#include <tl_templates/ascend/common.h>
+#include <c_api/asc_simd.h>
 
 // Scalar-spill-free param struct (<= 64B, zero dynamic array indexing)
 struct alignas(16) GemmSwatTiling {{
@@ -234,8 +234,8 @@ def render_grouped_gemm_epilogue_cpp(policy: dict[str, Any] | None = None) -> st
     p = normalize_schedule_policy(SHELL_CV_RAGGED_EPILOGUE, policy)
     bm, bn, bk = p["tile_mnk"]
     return f"""// Ascend 950 (dav-3510) Paradigm 4: Grouped GEMM + Direct L0C->UB SPLIT_M + Fused SwiGLU
-#include "kernel_operator.h"
-using namespace AscendC;
+#include <tl_templates/ascend/common.h>
+#include <c_api/asc_simd.h>
 
 __aicore__ inline void GroupedGemmRollingDispatch(
     uint32_t numGroups, const __gm__ int32_t* groupEnds, uint32_t coreIdx, uint32_t coreNum) {{
@@ -280,8 +280,8 @@ def render_heterogeneous_cv_ring_cpp(policy: dict[str, Any] | None = None) -> st
     eff_bm = max(82, bm)
     stages = max(3, p["l1_stages"])
     return f"""// Ascend 950 (dav-3510) Paradigm 5: Heterogeneous {stages}-Stage CV Ring (GQA / MLA / SparseFA)
-#include "kernel_operator.h"
-using namespace AscendC;
+#include <tl_templates/ascend/common.h>
+#include <c_api/asc_simd.h>
 
 constexpr uint32_t CV_RING_STAGES = {stages}U;
 constexpr uint32_t CUBE_TILE_M = {eff_bm}U;  // M >= 82 keeps AIC Mmad compute-bound (e.g. 96x112)
@@ -320,8 +320,8 @@ def render_persistent_chunk_state_cpp(policy: dict[str, Any] | None = None) -> s
     p = normalize_schedule_policy(SHELL_CV_PERSISTENT_STATE, policy)
     bm, bn, bk = p["tile_mnk"]
     return """// Ascend 950 (dav-3510) Paradigm 6: Persistent (B, H) Chunk State (KDA / Sinkhorn / LaCT-TTT)
-#include "kernel_operator.h"
-using namespace AscendC;
+#include <tl_templates/ascend/common.h>
+#include <c_api/asc_simd.h>
 
 __aicore__ inline void PersistentChunkStateLoop(
     __ubuf__ float* stateUb, LocalTensor<float>& l0cH, LocalTensor<half>& l1A, LocalTensor<half>& l1B,
@@ -353,8 +353,8 @@ def render_striped_register_vm_cpp(policy: dict[str, Any] | None = None) -> str:
     p = normalize_schedule_policy(SHELL_AIV_STRIPED_VM, policy)
     num_regs, w_slice, _ = p["tile_mnk"]
     return f"""// Ascend 950 (dav-3510) Paradigm 7: Striped Register-Resident VM (tensor_program_vm)
-#include "kernel_operator.h"
-using namespace AscendC;
+#include <tl_templates/ascend/common.h>
+#include <c_api/asc_simd.h>
 
 constexpr uint32_t VM_NUM_REGS = {num_regs}U;
 constexpr uint32_t VM_W_SLICE = {w_slice}U;  // Horizontal W-dimension slice 100% UB-resident per AIV

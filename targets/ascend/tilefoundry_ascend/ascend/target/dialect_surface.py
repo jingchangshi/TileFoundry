@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import os
 import re
+import tomllib
+from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 DialectId = Literal["tilelang_dsl", "inline_cce_vf", "cce_cpp20"]
+VALID_CANN_SERIES: tuple[str, ...] = ("cann_9_2", "cann_9_3")
+DEFAULT_CANN_SERIES: str = "cann_9_3"
+_CANN_SURFACE_DIR = Path(__file__).resolve().parent / "cann_surface"
 
 _IDENTIFIER_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 
@@ -25,6 +32,105 @@ class PrimitiveEntry:
     pipe: str
     facet: str
     signature: str
+    cann_series: tuple[str, ...] = VALID_CANN_SERIES
+    pipes: tuple[str, ...] = ()
+    facets: tuple[str, ...] = ()
+    required_headers: tuple[str, ...] = ()
+    pitfall: str = ""
+    symptoms: tuple[str, ...] = ()
+
+
+LOWERING_GUARDRAILS: tuple[str, ...] = (
+    (
+        "G-L1 (TIR Boolean): Ban Python `and`/`or`/`not` on TIR `PrimExpr`; "
+        "require `tirx.all(...)` / `tirx.any(...)`."
+    ),
+    (
+        "G-L2 (SimtVF Sub-Word Casts): Inside `T.SimtVF`, ban sub-word vector casts "
+        "(`int8x2`/`int8x4`); widen to `float32` scalar or aligned register first before "
+        "scalar or 32B-aligned writeback."
+    ),
+    (
+        "G-L3 (Track-B BF16 Math): In Track-B CCE C++20, ban direct `+ - * /` or `sqrtf` "
+        "on `__bf16`/`bfloat16_t`; cast explicitly to `float` first then convert back."
+    ),
+    (
+        "G-L4 (Wide Vector Store): Ban wide vector `BufferStore` (e.g., `float32x64`) "
+        "on scalar indices; use `T.copy` for tile moves and keep `T.SimtVF` lane width <= 8."
+    ),
+)
+
+_SYMPTOM_FACET_MAP: dict[str, tuple[str, ...]] = {
+    "DMA_REDUNDANT_GM_ROUNDTRIP": (
+        "dma_and_cache_hierarchy",
+        "sram_layout_and_aliasing",
+        "pipeline_and_sync_graph",
+    ),
+    "DMA_UNALIGNED_SHORT_BURST": (
+        "tile_and_stage_knobs",
+        "dma_and_cache_hierarchy",
+    ),
+    "DMA_L2_THRASH_REUSE_MISS": (
+        "grid_and_workspace_topology",
+        "dma_and_cache_hierarchy",
+    ),
+    "COMPUTE_VECTOR_LOOP_DEGRADED": (
+        "exec_mode_and_spr",
+        "alg_compute_and_monoid",
+    ),
+    "COMPUTE_INEFFECTIVE_THROUGHPUT": (
+        "exec_mode_and_spr",
+        "tile_and_stage_knobs",
+    ),
+    "COMPUTE_FIXPIPE_ACCUM_IMBALANCE": (
+        "tile_and_stage_knobs",
+        "sram_layout_and_aliasing",
+    ),
+    "COMPUTE_1C2V_SUBCORE_IMBALANCE": (
+        "grid_and_workspace_topology",
+        "pipeline_and_sync_graph",
+    ),
+    "SCALAR_LOOP_TRAP": (
+        "exec_mode_and_spr",
+        "dma_and_cache_hierarchy",
+    ),
+    "SRAM_REGISTER_SPILL_STACK": (
+        "tile_and_stage_knobs",
+        "exec_mode_and_spr",
+    ),
+    "SRAM_UB_L1_BANK_CONFLICT": ("sram_layout_and_aliasing",),
+    "SYNC_PSEUDO_DOUBLE_BUFFER": (
+        "pipeline_and_sync_graph",
+        "sram_layout_and_aliasing",
+    ),
+    "SYNC_BARRIER_SERIALIZATION": (
+        "pipeline_and_sync_graph",
+        "tile_and_stage_knobs",
+    ),
+    "GRID_TAIL_WAVE_UNDERUTIL": (
+        "grid_and_workspace_topology",
+        "tile_and_stage_knobs",
+    ),
+}
+
+_CRITICAL_SIGNATURE_SYMBOLS: tuple[str, ...] = (
+    "asc_copy_l0c2ub",
+    "ascend_gemm_l1",
+    "asc_copy_l0c2gm",
+    "asc_mmad",
+    "asc_copy_gm2l1_nd2nz",
+    "asc_copy_gm2ub_align",
+    "asc_copy_ub2gm_align",
+    "asc_vf_call",
+    "__simt_vf__",
+    "T.MixedKernel",
+    "T.Kernel",
+    "T.gemm",
+    "T.dual_copy",
+    "T.SimdVF",
+    "T.SimtVF",
+    "T.copy",
+)
 
 
 @dataclass(frozen=True)
@@ -45,7 +151,12 @@ class DialectSurfaceSpec:
             f"- Imports / Headers: {', '.join(self.required_headers_or_imports)}",
         ]
         for entry in self.primitives:
-            lines.append(f"- `{entry.signature}` [{entry.pipe} | facet={entry.facet}]")
+            if entry.pitfall:
+                lines.append(
+                    f"- `{entry.signature}` [{entry.pipe} | facet={entry.facet}] -- {entry.pitfall}"
+                )
+            else:
+                lines.append(f"- `{entry.signature}` [{entry.pipe} | facet={entry.facet}]")
         if self.forbidden_tokens:
             joined = ", ".join(f"`{tok}`" for tok in self.forbidden_tokens)
             lines.append(f"- Strictly Forbidden Symbols: {joined}")
@@ -577,7 +688,7 @@ INLINE_CCE_VF_SURFACE = DialectSurfaceSpec(
     ),
 )
 
-CCE_CPP20_SURFACE = DialectSurfaceSpec(
+_BASE_CCE_CPP20_SURFACE = DialectSurfaceSpec(
     dialect_id="cce_cpp20",
     display_label="CCE C++20 (tl_templates/ascend)",
     required_headers_or_imports=(
@@ -805,10 +916,10 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
             "simd_inst::vadd(lhs, rhs, mask, MODE_ZEROING)",
         ),
         PrimitiveEntry(
-            "Simt::GetThreadIdx",
+            "asc_shfl",
             "PIPE_V",
             "grid_and_workspace_topology",
-            "Simt::GetThreadIdx<0>() [inside __simt_vf__ only]",
+            "asc_shfl(var, src_lane, warpSize) [inside __simt_vf__ only]",
         ),
     ),
     forbidden_tokens=(
@@ -837,7 +948,7 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
     ),
     prompt_notes=(
         "Compile target is Track-B CCE C++20 (-std=c++20 --npu-arch=dav-3510) via tl_templates.",
-        "Do NOT emit high-level AscendC classes or legacy 910B raw CCE intrinsics.",
+        "Do NOT emit high-level AscendC classes or legacy non-dav-3510 CCE intrinsics.",
         "Every asc_sync_notify and asc_lock MUST pair symmetrically across all CFG paths.",
         (
             "The __simd_vf__ stack frame is exactly 0 bytes: never declare local C arrays "
@@ -928,6 +1039,97 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
     ),
 )
 
+
+def _normalize_cann_series_from_path(raw: str) -> str | None:
+    text = raw.strip()
+    if not text:
+        return None
+    if "9.2" in text or "cann_9_2" in text:
+        return "cann_9_2"
+    if "9.3" in text or "9.4" in text or "cann_9_3" in text:
+        return "cann_9_3"
+    cand = Path(text).expanduser()
+    for ver_file in (cand / "version.info", cand / "ascend_toolkit_install.info"):
+        if ver_file.is_file():
+            content = ver_file.read_text(encoding="utf-8", errors="ignore")
+            if "9.2." in content:
+                return "cann_9_2"
+            if "9.3." in content or "9.4." in content:
+                return "cann_9_3"
+    return None
+
+
+def resolve_cann_series(
+    explicit: str | None = None,
+    *,
+    cann_home: str | Path | None = None,
+) -> str:
+    """Resolve CANN snapshot series ('cann_9_2' or 'cann_9_3') with explicit/env/toolkit checks."""
+    if explicit is not None and str(explicit).strip():
+        norm = str(explicit).strip().lower()
+        if norm not in VALID_CANN_SERIES:
+            raise ValueError(
+                f"Unsupported CANN series {explicit!r}; expected one of {VALID_CANN_SERIES}"
+            )
+        return norm
+    for env_key in ("TILEFOUNDRY_CANN_SERIES", "TILEFOUNDRY_NPU_CANN_SERIES"):
+        raw = os.environ.get(env_key, "").strip().lower()
+        if raw:
+            if raw not in VALID_CANN_SERIES:
+                raise ValueError(
+                    f"Unsupported CANN series {raw!r} from {env_key}; "
+                    f"expected one of {VALID_CANN_SERIES}"
+                )
+            return raw
+    if cann_home is not None:
+        inferred = _normalize_cann_series_from_path(str(cann_home))
+        if inferred is not None:
+            return inferred
+    for env_key in ("ASCEND_HOME_PATH", "ASCEND_TOOLKIT_HOME"):
+        inferred = _normalize_cann_series_from_path(os.environ.get(env_key, ""))
+        if inferred is not None:
+            return inferred
+    return DEFAULT_CANN_SERIES
+
+
+def load_cann_surface(cann_series: str | None = None) -> DialectSurfaceSpec:
+    """Load a self-contained dav-3510 C++20 DialectSurfaceSpec from TOML snapshot resources."""
+    series = resolve_cann_series(cann_series)
+    snap_path = _CANN_SURFACE_DIR / f"{series}.toml"
+    data = tomllib.loads(snap_path.read_text(encoding="utf-8"))
+    meta = data.get("surface", {})
+    raw_prims = data.get("primitives", [])
+    primitives = tuple(
+        PrimitiveEntry(
+            symbol=str(item["symbol"]),
+            pipe=str(item["pipe"]),
+            facet=str(item["facet"]),
+            signature=str(item["signature"]),
+            cann_series=(series,),
+            pipes=tuple(str(p) for p in item.get("pipes", ())),
+            facets=tuple(str(f) for f in item.get("facets", ())),
+            required_headers=tuple(str(h) for h in item.get("required_headers", ())),
+            pitfall=str(item.get("pitfall", "")),
+            symptoms=tuple(str(s) for s in item.get("symptoms", ())),
+        )
+        for item in raw_prims
+    )
+    headers = tuple(str(h) for h in meta.get("umbrella_headers", ()))
+    toml_forbidden = tuple(str(t) for t in meta.get("forbidden_tokens", ()))
+    merged_forbidden = tuple(
+        dict.fromkeys([*toml_forbidden, *_BASE_CCE_CPP20_SURFACE.forbidden_tokens])
+    )
+    return DialectSurfaceSpec(
+        dialect_id="cce_cpp20",
+        display_label=str(meta.get("display_label", f"CCE C++20 ({series})")),
+        required_headers_or_imports=headers or _BASE_CCE_CPP20_SURFACE.required_headers_or_imports,
+        primitives=primitives,
+        forbidden_tokens=merged_forbidden,
+        prompt_notes=_BASE_CCE_CPP20_SURFACE.prompt_notes,
+    )
+
+
+CCE_CPP20_SURFACE = load_cann_surface(DEFAULT_CANN_SERIES)
 TL_TEMPLATES_CPP20_SURFACE = CCE_CPP20_SURFACE
 INLINE_ASCENDC_VF_SURFACE = INLINE_CCE_VF_SURFACE
 
@@ -941,26 +1143,348 @@ _TRACKB_CCE_ALIASES = (
 )
 
 
-def resolve_trackb_cce_surface(backend_or_tier: str) -> DialectSurfaceSpec:
-    """Resolve the verified CCE C++20 surface while keeping legacy aliases compatible."""
+def resolve_trackb_cce_surface(
+    backend_or_tier: str,
+    *,
+    cann_series: str | None = None,
+) -> DialectSurfaceSpec:
+    """Resolve the verified CCE C++20 surface for the selected CANN series."""
     norm = str(backend_or_tier or "cce_cpp20").strip().lower()
     if norm in _TRACKB_CCE_ALIASES:
-        return CCE_CPP20_SURFACE
+        return load_cann_surface(cann_series) if cann_series is not None else CCE_CPP20_SURFACE
     raise ValueError(f"Unsupported Track-B CCE dialect identifier: {backend_or_tier!r}")
 
 
-def get_dialect_surface(backend_or_tier: str) -> DialectSurfaceSpec:
+def get_dialect_surface(
+    backend_or_tier: str,
+    *,
+    cann_series: str | None = None,
+) -> DialectSurfaceSpec:
     """Resolve the verified DialectSurfaceSpec for a backend or escalation tier."""
     norm = str(backend_or_tier or "tilelang_dsl").strip().lower()
     if norm in _TRACKB_CCE_ALIASES or norm == "ascendc":
-        return CCE_CPP20_SURFACE
+        return load_cann_surface(cann_series) if cann_series is not None else CCE_CPP20_SURFACE
     if norm in ("inline_cce_vf", "inline_ascendc_vf"):
         return INLINE_CCE_VF_SURFACE
     return TILELANG_DSL_SURFACE
 
 
+def _is_cube_or_coupled_entry(entry: PrimitiveEntry) -> bool:
+    if entry.pipe in ("PIPE_M", "PIPE_MTE1", "PIPE_FIX", "L1", "L0A", "L0B", "L0C"):
+        return True
+    if any(
+        p in ("pipe_m_cube", "pipe_mte1_l1_to_l0", "pipe_fix_fixpipe") for p in entry.pipes
+    ):
+        return True
+    sym_l = entry.symbol.lower()
+    return any(
+        tok in sym_l
+        for tok in (
+            "gemm",
+            "mmad",
+            "_l1",
+            "2l1",
+            "l12l0",
+            "l0a",
+            "l0b",
+            "l0c",
+            "dual_copy",
+            "mixedkernel",
+            "sync_block_",
+        )
+    )
+
+
+def _is_coupled_only_entry(entry: PrimitiveEntry) -> bool:
+    sym_l = entry.symbol.lower()
+    return any(
+        tok in sym_l
+        for tok in ("mixedkernel", "dual_copy", "sync_block_", "l0c2ub", "ub2l1")
+    )
+
+
+def _is_simt_entry(entry: PrimitiveEntry) -> bool:
+    sym_l = entry.symbol.lower()
+    if "simt" in sym_l or entry.symbol in ("asc_vf_call", "asc_shfl", "asc_reduce_add"):
+        return True
+    return "__simt_vf__" in entry.pitfall.lower() or "__simt_vf__" in entry.signature.lower()
+
+
+def _is_aiv_vector_entry(entry: PrimitiveEntry) -> bool:
+    if _is_simt_entry(entry):
+        return True
+    if entry.pipe in ("PIPE_V", "UB") or "pipe_v_simd_simt" in entry.pipes:
+        return True
+    sym_l = entry.symbol.lower()
+    return any(tok in sym_l for tok in ("gm2ub", "ub2gm", "ub2ub", "simdvf", "alloc_shared"))
+
+
+def _core_symbols_for(
+    dialect_id: str,
+    topology_axes: "TopologyAxes | None",
+    simt_allowed: bool,
+    is_subatom: bool,
+) -> set[str]:
+    engine = topology_axes.compute_engine if topology_axes is not None else "aiv_only"
+    ring = topology_axes.memory_ring if topology_axes is not None else ""
+    reg = topology_axes.iteration_regularity if topology_axes is not None else ""
+    want_simt = simt_allowed and (
+        topology_axes is None or reg == "irregular_simt" or is_subatom
+    )
+    if dialect_id in ("tilelang_dsl", "inline_cce_vf"):
+        core = {"T.Kernel", "T.Pipelined", "T.serial", "T.copy"}
+        if engine == "aic_only":
+            core.update({"T.alloc_l1", "T.alloc_l0a", "T.alloc_l0b", "T.alloc_l0c", "T.gemm"})
+        elif engine == "coupled_1c2v":
+            core.update(
+                {
+                    "T.MixedKernel",
+                    "T.alloc_l1",
+                    "T.alloc_l0c",
+                    "T.alloc_shared",
+                    "T.gemm",
+                    "T.dual_copy",
+                    "T.SimdVF",
+                }
+            )
+            if ring in ("persistent_onchip_state", "bidirectional_cv_ring"):
+                core.add("T.alloc_ss")
+        else:
+            core.update({"T.alloc_shared", "T.SimdVF", "T.simd.vld", "T.simd.vsts", "T.fill"})
+        if want_simt and engine != "aic_only":
+            core.add("T.SimtVF")
+        return core
+    if engine == "aic_only":
+        return {
+            "asc_copy_gm2l1_nd2nz",
+            "asc_copy_l12l0a",
+            "asc_copy_l12l0b",
+            "ascend_gemm_l1",
+            "asc_mmad",
+            "asc_copy_l0c2gm",
+            "asc_sync_notify",
+            "asc_sync_wait",
+            "asc_lock",
+            "asc_unlock",
+        }
+    if engine == "coupled_1c2v":
+        core = {
+            "asc_copy_gm2l1_nd2nz",
+            "ascend_gemm_l1",
+            "asc_mmad",
+            "asc_copy_l0c2ub",
+            "asc_copy_gm2ub_align",
+            "asc_copy_ub2gm_align",
+            "asc_sync_notify",
+            "asc_sync_wait",
+            "asc_sync_block_arrive",
+            "asc_sync_block_wait",
+            "asc_lock",
+            "asc_unlock",
+        }
+        if want_simt:
+            core.update({"asc_vf_call", "asc_shfl", "asc_reduce_add", "__simt_vf__"})
+        return core
+    core = {
+        "asc_copy_gm2ub",
+        "asc_copy_gm2ub_align",
+        "asc_copy_ub2gm",
+        "asc_copy_ub2gm_align",
+        "asc_sync_notify",
+        "asc_sync_wait",
+        "asc_create_mask_b32",
+        "simd_inst::vlds_norm",
+        "simd_inst::vsts_1st",
+        "simd_inst::vadd",
+    }
+    if want_simt:
+        core.update({"asc_vf_call", "asc_shfl", "asc_reduce_add", "__simt_vf__"})
+    return core
+
+
+def filter_primitives_on_demand(
+    surface: DialectSurfaceSpec,
+    *,
+    track: str = "both",
+    topology_axes: "TopologyAxes | None" = None,
+    freedom_mask: "ConstraintRelaxationMask | None" = None,
+    active_symptom: str | None = None,
+    case_ratios: "CasePhysicsRatios | None" = None,
+) -> tuple[PrimitiveEntry, ...]:
+    """Run B2-fixed two-stage on-demand primitive pruning over a DialectSurfaceSpec."""
+    unlocked = (
+        None
+        if (freedom_mask is None or freedom_mask.is_unrestricted_top)
+        else set(freedom_mask.unlocked_facet_names())
+    )
+    is_subatom = case_ratios is not None and case_ratios.contig_atom_ratio < 1.0
+    track_norm = str(track or "both").strip().lower()
+    simt_allowed = (
+        topology_axes is None
+        or topology_axes.iteration_regularity == "irregular_simt"
+        or is_subatom
+        or unlocked is None
+        or "exec_mode_and_spr" in unlocked
+        or track_norm in ("simt_vf", "simtvf")
+    )
+    engine = topology_axes.compute_engine if topology_axes is not None else ""
+    if engine == "aic_only":
+        simt_allowed = False
+    core_symbols = _core_symbols_for(
+        surface.dialect_id,
+        topology_axes,
+        simt_allowed,
+        is_subatom,
+    )
+
+    stage1: list[PrimitiveEntry] = []
+    for entry in surface.primitives:
+        if engine == "aiv_only" and _is_cube_or_coupled_entry(entry):
+            continue
+        if engine == "aic_only" and (_is_aiv_vector_entry(entry) or _is_coupled_only_entry(entry)):
+            continue
+        if not simt_allowed and _is_simt_entry(entry):
+            continue
+        if unlocked is not None:
+            entry_facets = {entry.facet, *entry.facets}
+            if not (entry_facets & unlocked) and entry.symbol not in core_symbols:
+                continue
+        stage1.append(entry)
+
+    if not stage1 and surface.primitives:
+        stage1 = list(surface.primitives)
+
+    if active_symptom is None or not str(active_symptom).strip():
+        return tuple(stage1)
+
+    sym_key = str(active_symptom).strip().upper()
+    direct = [
+        entry
+        for entry in stage1
+        if any(s.strip().upper() == sym_key for s in entry.symptoms)
+    ]
+    if direct:
+        return tuple(direct)
+    target_facets = set(_SYMPTOM_FACET_MAP.get(sym_key, ()))
+    if target_facets:
+        facet_matched = [
+            entry
+            for entry in stage1
+            if ({entry.facet, *entry.facets} & target_facets)
+        ]
+        if facet_matched:
+            return tuple(facet_matched)
+    return tuple(stage1)
+
+
+def _priority_sort_key(entry: PrimitiveEntry) -> tuple[int, str]:
+    try:
+        return (_CRITICAL_SIGNATURE_SYMBOLS.index(entry.symbol), entry.symbol)
+    except ValueError:
+        return (len(_CRITICAL_SIGNATURE_SYMBOLS), entry.symbol)
+
+
+def _note_relevant(
+    note: str,
+    entries: Sequence[PrimitiveEntry],
+    has_simt: bool,
+    has_cube: bool,
+) -> bool:
+    low = note.lower()
+    if "do not emit" in low:
+        return True
+    if ("__simt_vf__" in low or "t.simtvf" in low) and not has_simt:
+        return False
+    if any(tok in low for tok in ("t.gemm", "ascend_gemm_l1", "asc_mmad", "t.mixedkernel")):
+        if not has_cube:
+            return False
+    return True
+
+
+def render_layer2_surface(
+    surface: DialectSurfaceSpec,
+    *,
+    primitives: Sequence[PrimitiveEntry] | None = None,
+    include_guardrails: bool = True,
+    max_chars: int = 10000,
+) -> str:
+    """Render compact Layer-2 dialect markdown guaranteed <= max_chars."""
+    entries = tuple(primitives) if primitives is not None else surface.primitives
+    header_lines = [
+        f"Verified `{surface.display_label}` (`{surface.dialect_id}`) callable surface:",
+        f"- Imports / Headers: {', '.join(surface.required_headers_or_imports)}",
+    ]
+    tail_lines: list[str] = []
+    if surface.forbidden_tokens:
+        joined = ", ".join(f"`{tok}`" for tok in surface.forbidden_tokens)
+        tail_lines.append(f"- Strictly Forbidden Symbols: {joined}")
+    if include_guardrails:
+        tail_lines.append("- Lowering Guardrails:")
+        for rule in LOWERING_GUARDRAILS:
+            tail_lines.append(f"  * {rule}")
+
+    has_simt = any(_is_simt_entry(e) for e in entries)
+    has_cube = any(_is_cube_or_coupled_entry(e) for e in entries)
+    relevant_notes = [
+        note
+        for note in surface.prompt_notes
+        if _note_relevant(note, entries, has_simt, has_cube)
+    ]
+    prioritized_notes = sorted(
+        relevant_notes,
+        key=lambda n: (
+            0
+            if "Do NOT emit" in n
+            else (
+                1
+                if ("__simt_vf__" in n or "T.SimtVF" in n)
+                else (2 if len(n) <= 180 else 3)
+            )
+        ),
+    )
+    must_keep_notes = [n for n in prioritized_notes if "Do NOT emit" in n]
+    optional_notes = [n for n in prioritized_notes if "Do NOT emit" not in n]
+    must_keep_lines = [f"- {n}" for n in must_keep_notes]
+
+    fixed_block = "\n".join([*header_lines, *tail_lines, *must_keep_lines])
+    if len(fixed_block) >= max_chars:
+        return fixed_block[:max_chars]
+
+    remaining = max_chars - len(fixed_block)
+    ordered_entries = sorted(entries, key=_priority_sort_key)
+    selected_prim_lines: list[str] = []
+    for entry in ordered_entries:
+        line = f"- `{entry.signature}` [{entry.pipe}]"
+        cost = len(line) + 1
+        if cost <= remaining:
+            selected_prim_lines.append(line)
+            remaining -= cost
+
+    entry_order = {entry.signature: idx for idx, entry in enumerate(entries)}
+    selected_prim_lines.sort(
+        key=lambda line: entry_order.get(line.split("`", 2)[1], len(entries))
+    )
+
+    notes_budget = min(remaining, 700)
+    selected_note_lines = list(must_keep_lines)
+    for note in optional_notes:
+        line = f"- {note}"
+        cost = len(line) + 1
+        if cost <= notes_budget:
+            selected_note_lines.append(line)
+            notes_budget -= cost
+
+    rendered = "\n".join(
+        [*header_lines, *selected_prim_lines, *tail_lines, *selected_note_lines]
+    )
+    return rendered[:max_chars] if len(rendered) > max_chars else rendered
+
+
 __all__ = [
     "CCE_CPP20_SURFACE",
+    "DEFAULT_CANN_SERIES",
+    "LOWERING_GUARDRAILS",
+    "VALID_CANN_SERIES",
     "DialectId",
     "DialectSurfaceSpec",
     "INLINE_ASCENDC_VF_SURFACE",
@@ -968,6 +1492,10 @@ __all__ = [
     "PrimitiveEntry",
     "TILELANG_DSL_SURFACE",
     "TL_TEMPLATES_CPP20_SURFACE",
+    "filter_primitives_on_demand",
     "get_dialect_surface",
+    "load_cann_surface",
+    "render_layer2_surface",
+    "resolve_cann_series",
     "resolve_trackb_cce_surface",
 ]

@@ -581,16 +581,16 @@ def _classify_core_role_cond(cond: str) -> str | None:
 
     role: str | None = None
     if text == "ASCEND_IS_AIC" or re.fullmatch(
-        r"(?:AscendC::)?g_coreType\s*==\s*(?:AscendC::)?AIC", text
+        r"g_coreType\s*==\s*AIC", text
     ):
         role = "aic"
     elif text == "ASCEND_IS_AIV" or re.fullmatch(
-        r"(?:AscendC::)?g_coreType\s*==\s*(?:AscendC::)?AIV", text
+        r"g_coreType\s*==\s*AIV", text
     ):
         role = "aiv"
-    elif re.fullmatch(r"(?:AscendC::)?g_coreType\s*!=\s*(?:AscendC::)?AIV", text):
+    elif re.fullmatch(r"g_coreType\s*!=\s*AIV", text):
         role = "aic"
-    elif re.fullmatch(r"(?:AscendC::)?g_coreType\s*!=\s*(?:AscendC::)?AIC", text):
+    elif re.fullmatch(r"g_coreType\s*!=\s*AIC", text):
         role = "aiv"
 
     if role is None:

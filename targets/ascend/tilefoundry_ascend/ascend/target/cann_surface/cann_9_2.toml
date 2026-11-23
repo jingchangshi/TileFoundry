@@ -1,0 +1,415 @@
+[surface]
+cann_series = "cann_9_2"
+cce_arch = "dav-3510"
+hardware_series = "ascend_950"
+display_label = "CCE C++20 (dav-3510 / CANN 9.2)"
+default_std = "c++20"
+required_compile_flags = ["--npu-arch=dav-3510", "--cce-aicore-only", "-x", "cce", "-std=c++20"]
+umbrella_headers = [
+  "#include <tl_templates/ascend/common.h>",
+  "#include <tl_templates/ascend/gemm.h>",
+  "#include <tl_templates/ascend/nd2nz_copy.h>",
+  "#include <tl_templates/ascend/dcache_bypass.h>",
+  "#include <tl_templates/ascend/reduce.h>",
+  "#include <tl_templates/ascend/simd_inst.h>",
+  "#include <c_api/asc_simd.h>",
+  "#include <simt_api/asc_simt.h>",
+]
+forbidden_tokens = [
+  "kernel_operator.h",
+  "using namespace AscendC;",
+  "using namespace AscendC",
+  "AscendC::",
+  "910B",
+  "tl::ascend::",
+]
+
+[[primitives]]
+symbol = "ascend_gemm_l1"
+pipe = "PIPE_M"
+pipes = ["pipe_m_cube", "pipe_mte1_l1_to_l0"]
+facet = "pipeline_and_sync_graph"
+facets = ["pipeline_and_sync_graph", "tile_and_stage_knobs", "sram_layout_and_aliasing"]
+required_headers = ["<tl_templates/ascend/gemm.h>"]
+signature = "template <int M, int K, int N, int TILE_K_SUB, bool TRANS_B, typename InT, typename AccumT> __aicore__ inline void ascend_gemm_l1(__cc__ AccumT* cc_ptr, __cbuf__ InT* cbuf_a_ptr, __cbuf__ InT* cbuf_b_ptr, int clear_accum, int buf_offset = 0, int unit_flag_ctrl = 0)"
+pitfall = "Global-scope template (not tl::ascend::); order is <M, K, N, TILE_K_SUB, TRANS_B, InT>; pair with asc_unlock(PIPE_MTE1, 0, ASC_LOCK_BLOCK) before and asc_lock(PIPE_M, 0, ASC_LOCK_BLOCK) after."
+
+[[primitives]]
+symbol = "asc_mmad"
+pipe = "PIPE_M"
+pipes = ["pipe_m_cube"]
+facet = "alg_compute_and_monoid"
+facets = ["alg_compute_and_monoid", "pipeline_and_sync_graph", "tile_and_stage_knobs"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_mmad(__cc__ float* c_matrix, __ca__ bfloat16_t* a_matrix, __cb__ bfloat16_t* b_matrix, uint16_t m, uint16_t k, uint16_t n, asc_unit_flag_mode unit_flag_mode, bool k_direction_align, bool c_matrix_source, bool c_matrix_init_val)"
+pitfall = "L0A/L0B operands use __ca__/__cb__ fractal layout and pass asc_unit_flag_mode::DISABLE cleanly into __cc__ L0C."
+
+[[primitives]]
+symbol = "asc_copy_gm2l1_nd2nz"
+pipe = "PIPE_MTE2"
+pipes = ["pipe_mte2_mte3_dma", "pipe_s_scalar_spr"]
+facet = "sram_layout_and_aliasing"
+facets = ["sram_layout_and_aliasing", "dma_and_cache_hierarchy", "pipeline_and_sync_graph"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_copy_gm2l1_nd2nz(__cbuf__ bfloat16_t* dst, __gm__ bfloat16_t* src, uint16_t nd_num, uint16_t n_value, uint16_t d_value, uint16_t src_nd_matrix_stride, uint16_t src_d_value, uint16_t dst_nz_c0_stride, uint16_t dst_nz_n_stride, uint16_t dst_nz_matrix_stride)"
+pitfall = "Prefer 10-arg ND2NZ directly into L1 __cbuf__ over manual scalar loops before Cube GEMM."
+
+[[primitives]]
+symbol = "asc_copy_l12l0a"
+pipe = "PIPE_MTE1"
+pipes = ["pipe_mte1_l1_to_l0"]
+facet = "sram_layout_and_aliasing"
+facets = ["sram_layout_and_aliasing", "pipeline_and_sync_graph"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_copy_l12l0a(__ca__ bfloat16_t* dst, __cbuf__ bfloat16_t* src, uint16_t start_index, uint8_t repeat, uint16_t src_stride, uint16_t dst_gap)"
+pitfall = "L0A expects 512B-aligned fractal NZ tiles."
+
+[[primitives]]
+symbol = "asc_copy_l12l0b"
+pipe = "PIPE_MTE1"
+pipes = ["pipe_mte1_l1_to_l0"]
+facet = "sram_layout_and_aliasing"
+facets = ["sram_layout_and_aliasing", "pipeline_and_sync_graph"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_copy_l12l0b(__cb__ bfloat16_t* dst, __cbuf__ bfloat16_t* src, uint16_t start_index, uint8_t repeat, uint16_t src_stride, uint16_t dst_gap)"
+pitfall = "L0B expects 512B-aligned fractal ZN/NZ tiles."
+
+[[primitives]]
+symbol = "asc_set_l0c_copy_nz_para"
+pipe = "PIPE_FIX"
+pipes = ["pipe_fix_fixpipe", "pipe_s_scalar_spr"]
+facet = "sram_layout_and_aliasing"
+facets = ["sram_layout_and_aliasing", "exec_mode_and_spr", "pipeline_and_sync_graph"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_set_l0c_copy_nz_para(uint16_t matrix_num, uint16_t src_nz_matrix_stride, uint32_t dst_matrix_stride)"
+pitfall = "Call before asc_copy_l0c2ub / asc_copy_l0c2gm when draining batched multi-matrix L0C outputs."
+
+[[primitives]]
+symbol = "asc_copy_l0c2ub"
+pipe = "PIPE_FIX"
+pipes = ["pipe_fix_fixpipe"]
+facet = "pipeline_and_sync_graph"
+facets = ["pipeline_and_sync_graph", "sram_layout_and_aliasing", "exec_mode_and_spr"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_copy_l0c2ub(__ubuf__ float* dst, __cc__ float* src, uint16_t n_size, uint16_t m_size, uint32_t dst_stride, uint16_t src_stride, int8_t sub_blockid, asc_dual_dst_mode dual_dst_ctrl, asc_unit_flag_mode unit_flag_mode, asc_quant_mode quant_pre_mode, asc_relu_pre_mode relu_pre_mode, bool enable_channel_split, bool enable_nz2nd, bool enable_nz2dn, bool enable_clip_relu_pre)"
+pitfall = "Exact 15 args with (n_size, m_size) order; use asc_dual_dst_mode::DUAL_DST_SPLIT_M in 1C2V coupled epilogues."
+
+[[primitives]]
+symbol = "asc_copy_l0c2gm"
+pipe = "PIPE_FIX"
+pipes = ["pipe_fix_fixpipe", "pipe_mte2_mte3_dma"]
+facet = "dma_and_cache_hierarchy"
+facets = ["dma_and_cache_hierarchy", "pipeline_and_sync_graph", "exec_mode_and_spr"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_copy_l0c2gm(__gm__ float* dst, __cc__ float* src, uint16_t n_size, uint16_t m_size, uint32_t dst_stride_dst_d, uint16_t src_stride, uint8_t unit_flag_mode, uint64_t quant_pre, uint8_t relu_pre, bool channel_split, bool nz2nd_en)"
+pitfall = "CANN 9.2 shared 11-arg FixPipe L0C->GM signature uses (n_size, m_size) order."
+
+[[primitives]]
+symbol = "asc_copy_ub2l1"
+pipe = "PIPE_MTE3"
+pipes = ["pipe_mte2_mte3_dma"]
+facet = "dma_and_cache_hierarchy"
+facets = ["dma_and_cache_hierarchy", "sram_layout_and_aliasing", "pipeline_and_sync_graph"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_copy_ub2l1(__cbuf__ void* dst, __ubuf__ void* src, uint16_t burst_count, uint16_t burst_len, uint16_t src_gap, uint16_t dst_gap)"
+pitfall = "burst_len is in 32-byte blocks and dst_gap/src_gap follow 32B alignment."
+
+[[primitives]]
+symbol = "asc_copy_gm2ub"
+pipe = "PIPE_MTE2"
+pipes = ["pipe_mte2_mte3_dma"]
+facet = "dma_and_cache_hierarchy"
+facets = ["dma_and_cache_hierarchy", "tile_and_stage_knobs"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_copy_gm2ub(__ubuf__ void* dst, __gm__ void* src, uint16_t burst_count, uint16_t burst_len, uint16_t src_gap, uint16_t dst_gap)"
+pitfall = "burst_len and stride unit is 32B blocks on dav-3510; use size overload only for contiguous 1D blocks."
+
+[[primitives]]
+symbol = "asc_copy_gm2ub_align"
+pipe = "PIPE_MTE2"
+pipes = ["pipe_mte2_mte3_dma"]
+facet = "dma_and_cache_hierarchy"
+facets = ["dma_and_cache_hierarchy", "sram_layout_and_aliasing"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_copy_gm2ub_align(__ubuf__ bfloat16_t* dst, __gm__ bfloat16_t* src, uint16_t burst_count, uint32_t burst_len, uint8_t left_padding_num, uint8_t right_padding_num, uint32_t src_gap, uint32_t dst_gap)"
+pitfall = "Unaligned byte-granularity GM->UB copy supporting 3/8/10-arg forms without manual tail padding loops."
+
+[[primitives]]
+symbol = "asc_copy_ub2gm"
+pipe = "PIPE_MTE3"
+pipes = ["pipe_mte2_mte3_dma"]
+facet = "dma_and_cache_hierarchy"
+facets = ["dma_and_cache_hierarchy", "tile_and_stage_knobs"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_copy_ub2gm(__gm__ void* dst, __ubuf__ void* src, uint16_t burst_count, uint16_t burst_len, uint16_t src_gap, uint16_t dst_gap)"
+pitfall = "Pair PIPE_V -> PIPE_MTE3 with asc_sync_notify / asc_sync_wait before reading UB stores."
+
+[[primitives]]
+symbol = "asc_copy_ub2gm_align"
+pipe = "PIPE_MTE3"
+pipes = ["pipe_mte2_mte3_dma"]
+facet = "dma_and_cache_hierarchy"
+facets = ["dma_and_cache_hierarchy", "sram_layout_and_aliasing"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_copy_ub2gm_align(__gm__ bfloat16_t* dst, __ubuf__ bfloat16_t* src, uint16_t burst_count, uint32_t burst_len, uint32_t src_gap, uint32_t dst_gap)"
+pitfall = "Unaligned byte-granularity UB->GM copy supporting 3/7/8-arg forms for tail writes."
+
+[[primitives]]
+symbol = "asc_copy_ub2ub"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "sram_layout_and_aliasing"
+facets = ["sram_layout_and_aliasing", "alg_compute_and_monoid"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_copy_ub2ub(__ubuf__ void* dst, __ubuf__ void* src, uint16_t burst_count, uint16_t burst_len, uint16_t src_gap, uint16_t dst_gap)"
+pitfall = "Keep UB tiles in vector registers across chains rather than redundant UB->UB copies."
+
+[[primitives]]
+symbol = "asc_sync_notify"
+pipe = "PIPE_SYNC"
+pipes = ["pipe_sync_barrier_mutex"]
+facet = "pipeline_and_sync_graph"
+facets = ["pipeline_and_sync_graph"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_sync_notify(pipe_t pipe, pipe_t tpipe, event_t id)"
+pitfall = "Match every asc_sync_notify(src, dst, id) with asc_sync_wait(src, dst, id) on the consumer pipe."
+
+[[primitives]]
+symbol = "asc_sync_wait"
+pipe = "PIPE_SYNC"
+pipes = ["pipe_sync_barrier_mutex"]
+facet = "pipeline_and_sync_graph"
+facets = ["pipeline_and_sync_graph"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_sync_wait(pipe_t pipe, pipe_t tpipe, event_t id)"
+pitfall = "Use distinct EVENT_ID0..EVENT_ID7 enum values across ring stages; pass EVENT_ID0 cleanly."
+
+[[primitives]]
+symbol = "asc_sync_pipe"
+pipe = "PIPE_SYNC"
+pipes = ["pipe_sync_barrier_mutex"]
+facet = "pipeline_and_sync_graph"
+facets = ["pipeline_and_sync_graph"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_sync_pipe(pipe_t pipe)"
+pitfall = "Intra-pipe barrier serializes dependent vector/DMA instructions on the same pipe."
+
+[[primitives]]
+symbol = "asc_sync_block_arrive"
+pipe = "PIPE_SYNC"
+pipes = ["pipe_sync_barrier_mutex"]
+facet = "pipeline_and_sync_graph"
+facets = ["pipeline_and_sync_graph", "grid_and_workspace_topology"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_sync_block_arrive(pipe_t pipe, int64_t flag_id)"
+pitfall = "Replaces legacy CrossCoreSetFlag in pure dav-3510 C++20 AIC/AIV coupled kernels."
+
+[[primitives]]
+symbol = "asc_sync_block_wait"
+pipe = "PIPE_SYNC"
+pipes = ["pipe_sync_barrier_mutex"]
+facet = "pipeline_and_sync_graph"
+facets = ["pipeline_and_sync_graph", "grid_and_workspace_topology"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_sync_block_wait(pipe_t pipe, int64_t flag_id)"
+pitfall = "Must execute on all participating AIC/AIV cores of the block to prevent deadlock."
+
+[[primitives]]
+symbol = "asc_lock"
+pipe = "PIPE_SYNC"
+pipes = ["pipe_sync_barrier_mutex"]
+facet = "pipeline_and_sync_graph"
+facets = ["pipeline_and_sync_graph"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_lock(pipe_t pipe, uint8_t mutex_id, const asc_mutex_execute_mode mode)"
+pitfall = "Pair with asc_unlock and keep mutex_id within dav-3510 28 hardware mutex registers."
+
+[[primitives]]
+symbol = "asc_unlock"
+pipe = "PIPE_SYNC"
+pipes = ["pipe_sync_barrier_mutex"]
+facet = "pipeline_and_sync_graph"
+facets = ["pipeline_and_sync_graph"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_unlock(pipe_t pipe, uint8_t mutex_id, const asc_mutex_execute_mode mode)"
+pitfall = "Use ASC_LOCK_BLOCK around MTE1/M ping-pong L0C critical sections."
+
+[[primitives]]
+symbol = "asc_get_ctrl"
+pipe = "PIPE_S"
+pipes = ["pipe_s_scalar_spr"]
+facet = "exec_mode_and_spr"
+facets = ["exec_mode_and_spr"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline int64_t asc_get_ctrl()"
+pitfall = "Snapshot CTRL SPR before modifying FP/rounding bits and restore on exit."
+
+[[primitives]]
+symbol = "asc_set_ctrl"
+pipe = "PIPE_S"
+pipes = ["pipe_s_scalar_spr"]
+facet = "exec_mode_and_spr"
+facets = ["exec_mode_and_spr"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_set_ctrl(uint64_t config)"
+pitfall = "Always restore saved CTRL bits so downstream kernels inherit clean SPR state."
+
+[[primitives]]
+symbol = "asc_dcci_entire_all"
+pipe = "PIPE_S"
+pipes = ["pipe_s_scalar_spr", "pipe_mte2_mte3_dma"]
+facet = "dma_and_cache_hierarchy"
+facets = ["dma_and_cache_hierarchy", "exec_mode_and_spr"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline void asc_dcci_entire_all()"
+pitfall = "Flush/invalidate scalar D-cache lines before cross-core scalar->vector/GM visibility."
+
+[[primitives]]
+symbol = "asc_create_mask_b32"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "alg_compute_and_monoid"
+facets = ["alg_compute_and_monoid", "tile_and_stage_knobs"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "vector_bool asc_create_mask_b32(uint64_t pattern)"
+pitfall = "Use inside __simd_vf__ functions for 64-lane f32/i32 vector predication."
+
+[[primitives]]
+symbol = "simd_inst::update_mask_b32"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "tile_and_stage_knobs"
+facets = ["tile_and_stage_knobs", "alg_compute_and_monoid"]
+required_headers = ["<tl_templates/ascend/common.h>"]
+signature = "vector_bool simd_inst::update_mask_b32(int count)"
+pitfall = "Builds tail predicates in __simd_vf__ without scalar fallback loops."
+
+[[primitives]]
+symbol = "simd_inst::vlds_brc_elem"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "alg_compute_and_monoid"
+facets = ["alg_compute_and_monoid", "sram_layout_and_aliasing"]
+required_headers = ["<tl_templates/ascend/common.h>"]
+signature = "template <typename T> auto simd_inst::vlds_brc_elem(__ubuf__ T* base, int32_t offset)"
+pitfall = "Broadcasts a scalar element from __ubuf__ across vector lanes inside __simd_vf__."
+
+[[primitives]]
+symbol = "simd_inst::vlds_norm"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "alg_compute_and_monoid"
+facets = ["alg_compute_and_monoid", "sram_layout_and_aliasing"]
+required_headers = ["<tl_templates/ascend/common.h>"]
+signature = "template <typename T> auto simd_inst::vlds_norm(__ubuf__ T* base, int32_t offset)"
+pitfall = "Vector load inside __simd_vf__; replaces manual scalar for-loop reads over __ubuf__."
+
+[[primitives]]
+symbol = "simd_inst::vdup"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "alg_compute_and_monoid"
+facets = ["alg_compute_and_monoid"]
+required_headers = ["<tl_templates/ascend/common.h>"]
+signature = "template <typename T> auto simd_inst::vdup(T val, vector_bool mask, int mode)"
+pitfall = "Vector constant fill on PIPE_V inside __simd_vf__."
+
+[[primitives]]
+symbol = "simd_inst::vdupv"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "exec_mode_and_spr"
+facets = ["exec_mode_and_spr", "alg_compute_and_monoid"]
+required_headers = ["<tl_templates/ascend/common.h>"]
+signature = "template <typename SrcVec> SrcVec simd_inst::vdupv(SrcVec src, vector_bool mask, Pos pos, Mode mode)"
+pitfall = "Broadcasts lane-0/pos of reduced vector register across all vector lanes inside __simd_vf__."
+
+[[primitives]]
+symbol = "simd_inst::vadd"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "alg_compute_and_monoid"
+facets = ["alg_compute_and_monoid"]
+required_headers = ["<tl_templates/ascend/common.h>"]
+signature = "template <typename VecT> auto simd_inst::vadd(VecT lhs, VecT rhs, vector_bool mask, int mode)"
+pitfall = "Vector add inside __simd_vf__; pass MODE_ZEROING or MODE_MERGING explicitly."
+
+[[primitives]]
+symbol = "simd_inst::vmul"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "alg_compute_and_monoid"
+facets = ["alg_compute_and_monoid"]
+required_headers = ["<tl_templates/ascend/common.h>"]
+signature = "template <typename VecT> auto simd_inst::vmul(VecT lhs, VecT rhs, vector_bool mask, int mode)"
+pitfall = "Vector multiply inside __simd_vf__."
+
+[[primitives]]
+symbol = "simd_inst::vexp"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "alg_compute_and_monoid"
+facets = ["alg_compute_and_monoid"]
+required_headers = ["<tl_templates/ascend/common.h>"]
+signature = "template <typename VecT> auto simd_inst::vexp(VecT src, vector_bool mask, int mode)"
+pitfall = "Vector exp on PIPE_V inside __simd_vf__; use vexp_1ulp_ftz_false when subnormals matter."
+
+[[primitives]]
+symbol = "simd_inst::vcmax"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "alg_compute_and_monoid"
+facets = ["alg_compute_and_monoid"]
+required_headers = ["<tl_templates/ascend/common.h>"]
+signature = "template <typename VecT> auto simd_inst::vcmax(VecT src, vector_bool mask, int mode)"
+pitfall = "Vector intra-register max reduction inside __simd_vf__."
+
+[[primitives]]
+symbol = "simd_inst::vsts_1st"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "sram_layout_and_aliasing"
+facets = ["sram_layout_and_aliasing", "alg_compute_and_monoid"]
+required_headers = ["<tl_templates/ascend/common.h>"]
+signature = "template <typename VecT, typename T> void simd_inst::vsts_1st(VecT data, __ubuf__ T* base, int32_t offset, vector_bool mask)"
+pitfall = "Stores vector register back to __ubuf__ inside __simd_vf__."
+
+[[primitives]]
+symbol = "asc_vf_call"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt", "pipe_s_scalar_spr"]
+facet = "exec_mode_and_spr"
+facets = ["exec_mode_and_spr", "grid_and_workspace_topology"]
+required_headers = ["<simt_api/asc_simt.h>"]
+signature = "template <auto funcPtr, typename ArgT> __aicore__ inline void asc_vf_call(dim3 threadNums, ArgT arg)"
+pitfall = "Launch full SIMT warps/CTAs (at least 32-128 threads in dim3) from __global__ __aicore__/__vector__."
+
+[[primitives]]
+symbol = "asc_shfl"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "exec_mode_and_spr"
+facets = ["exec_mode_and_spr", "alg_compute_and_monoid"]
+required_headers = ["<simt_api/asc_simt.h>"]
+signature = "__SIMT_DEVICE_FUNCTIONS_DECL__ inline float asc_shfl(float var, int32_t src_lane, int32_t width = warpSize)"
+pitfall = "Callable only inside __simt_vf__ / __simt_callee__ warp functions."
+
+[[primitives]]
+symbol = "asc_reduce_add"
+pipe = "PIPE_V"
+pipes = ["pipe_v_simd_simt"]
+facet = "exec_mode_and_spr"
+facets = ["exec_mode_and_spr", "alg_compute_and_monoid"]
+required_headers = ["<simt_api/asc_simt.h>"]
+signature = "__SIMT_DEVICE_FUNCTIONS_DECL__ inline float asc_reduce_add(float val)"
+pitfall = "Warp-wide SIMT sum reduction inside __simt_vf__."
+
+[[primitives]]
+symbol = "asc_atomic_cas"
+pipe = "PIPE_MTE3"
+pipes = ["pipe_v_simd_simt", "pipe_mte2_mte3_dma"]
+facet = "grid_and_workspace_topology"
+facets = ["grid_and_workspace_topology", "exec_mode_and_spr"]
+required_headers = ["<c_api/asc_simd.h>"]
+signature = "__aicore__ inline uint32_t asc_atomic_cas(__gm__ uint32_t* address, uint32_t compare, uint32_t val)"
+pitfall = "Use global-memory atomics sparingly for cross-block state or dynamic tail arbitration."

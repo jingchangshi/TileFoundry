@@ -147,7 +147,8 @@ _AGENT_GATES_ALLOWED_ENV_KEYS = frozenset(
         "TILEFOUNDRY_NPU_TILELANG_REPO",
         "TILEFOUNDRY_NPU_CANNBOT_DSL_REPO",
         "TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO",
-        "TILEFOUNDRY_NPU_ASC_DEVKIT_REPO",
+        "TILEFOUNDRY_NPU_CANN_SERIES",
+        "TILEFOUNDRY_CANN_SERIES",
     }
 )
 _ADAPTER_TOOLCHAIN_ENV_KEYS: tuple[str, ...] = (
@@ -1150,7 +1151,6 @@ def discover_marathon_environment(
     sibling_keys = (
         ("TILEFOUNDRY_NPU_CANNBOT_DSL_REPO", "cannbot-dsl"),
         ("TILEFOUNDRY_NPU_OPS_TRANSFORMER_REPO", "ops-transformer"),
-        ("TILEFOUNDRY_NPU_ASC_DEVKIT_REPO", "asc-devkit"),
     )
     for key, folder_name in sibling_keys:
         if not values.get(key):

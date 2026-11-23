@@ -17,10 +17,10 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
 )
 from tilefoundry_ascend.agent.router import (
     VALID_HARDWARE_PIPES,
+    CapabilityGate,
     EscalationDecision,
     PipeGapBreakdown,
     PipeGapReport,
-    StructuralFeatures,
     evaluate_track_escalation,
     route_execution_track,
     route_from_op_spec,
@@ -301,9 +301,22 @@ def test_causal_t0_router_t_gt_0_escalation_and_isa_gap_scanner() -> None:
         ).recommended_backend_tier
         == "ascendc_template"
     )
-    assert route_execution_track(
-        StructuralFeatures(True, 0.0, "none", False, "none", False, 128, 1.0)
-    ).track == "developer"
+    assert (
+        route_execution_track(
+            TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
+        ).track
+        == "developer"
+    )
+    assert CapabilityGate.suitability_score(
+        TopologyAxes("aiv_only", "gm_ub_stream", "affine_simd")
+    ) == 1.0
+    assert (
+        CapabilityGate.route(
+            TopologyAxes("aiv_only", "ub_random_atomic", "irregular_simt"),
+            router_enabled=False,
+        ).track
+        == "developer"
+    )
 
     no_esc = evaluate_track_escalation(
         current_tier="tilelang_dsl",
@@ -347,7 +360,11 @@ def test_causal_t0_router_t_gt_0_escalation_and_isa_gap_scanner() -> None:
         stagnation_rounds=2,
         dominant_bound="cube",
         compiler_summary=BishengResourceSummary(alias_serialized_buffers=2),
-        structural_features={"phi_2": 1.0, "phi_6": True, "has_dead_l1_slice": True},
+        structural_features={
+            "cube_to_vector_ratio": 1.0,
+            "dynamic_cross_core_handoff": True,
+            "has_dead_l1_slice": True,
+        },
     )
     assert esc_tpl.should_escalate is True
     assert esc_tpl.to_tier == "ascendc_template"

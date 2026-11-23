@@ -17,10 +17,16 @@ from tilefoundry_ascend.ascend.passes.physical_ledger import (
 from tilefoundry_ascend.ascend.sil.schema import (
     VALID_FREEDOM_FACETS,
     AdvisoryEnvelope,
+    CasePhysicsRatios,
     ConstraintRelaxationMask,
     HardwareLegalityBounds,
+    TopologyAxes,
 )
-from tilefoundry_ascend.ascend.target.dialect_surface import get_dialect_surface
+from tilefoundry_ascend.ascend.target.dialect_surface import (
+    filter_primitives_on_demand,
+    get_dialect_surface,
+    render_layer2_surface,
+)
 
 _SCOPE_TOPOLOGY_MAP: dict[str, str] = {
     "UB": "smem (AIV)",
@@ -169,35 +175,53 @@ def format_target_dialect_layer(
     enable_track_router: bool = False,
     pipe_gap_report: PipeGapReport | None = None,
     excluded_mechanisms: Sequence[str] = (),
+    topology_axes: TopologyAxes | None = None,
+    freedom_mask: ConstraintRelaxationMask | None = None,
+    active_symptom: str | None = None,
+    case_ratios: CasePhysicsRatios | None = None,
+    cann_series: str | None = None,
 ) -> str:
     """Render Layer 2: grounded target-dialect callable surface and negative exclusions."""
     tier = str(escalation_tier or "tilelang_dsl").strip().lower()
-    dialect = get_dialect_surface(tier)
-    surface = dialect.render_prompt_reference()
+    dialect = get_dialect_surface(tier, cann_series=cann_series)
+    header = f"### LAYER 2: TARGET DIALECT API SURFACE (tier={tier}, dialect={dialect.dialect_id})"
 
-    lines = [
-        f"### LAYER 2: TARGET DIALECT API SURFACE (tier={tier}, dialect={dialect.dialect_id})",
-        surface,
-    ]
+    footer_lines: list[str] = []
     if enable_track_router and track and track not in ("", "unconstrained"):
-        lines.append(f"- Routed Execution Track: {track}")
+        footer_lines.append(f"- Routed Execution Track: {track}")
 
     gap_report = pipe_gap_report
     if gap_report is None and tier == "tilelang_dsl":
         gap_report = scan_tilelang_pipe_gaps()
     if gap_report is not None and gap_report.missing_primitives:
         missing_preview = list(gap_report.missing_primitives[:6])
-        lines.append(
+        footer_lines.append(
             f"- TileLang Lowering Coverage: {gap_report.coverage_ratio:.2f} "
-            f"(unsupported devkit primitives in pure DSL: {', '.join(missing_preview)})"
+            f"(unsupported CANN dav-3510 primitives in pure DSL: {', '.join(missing_preview)})"
         )
 
     if excluded_mechanisms:
-        lines.append("- Negative Structural Exclusions (do NOT duplicate):")
+        footer_lines.append("- Negative Structural Exclusions (do NOT duplicate):")
         for item in excluded_mechanisms:
-            lines.append(f"  * {item}")
+            footer_lines.append(f"  * {item}")
 
-    return "\n".join(lines)
+    overhead = len(header) + 1 + sum(len(line) + 1 for line in footer_lines)
+    surface_budget = max(512, 10000 - overhead)
+    filtered = filter_primitives_on_demand(
+        dialect,
+        track=track,
+        topology_axes=topology_axes,
+        freedom_mask=freedom_mask,
+        active_symptom=active_symptom,
+        case_ratios=case_ratios,
+    )
+    surface = render_layer2_surface(
+        dialect,
+        primitives=filtered,
+        include_guardrails=True,
+        max_chars=surface_budget,
+    )
+    return "\n".join([header, surface, *footer_lines])
 
 
 def format_blueprint_delta_section(
@@ -320,8 +344,17 @@ def build_progressive_llm_constraints(
     pipe_gap_report: PipeGapReport | None = None,
     excluded_mechanisms: Sequence[str] = (),
     extra_blueprint_context: str = "",
+    topology_axes: TopologyAxes | None = None,
+    active_symptom: str | None = None,
+    case_ratios: CasePhysicsRatios | None = None,
+    cann_series: str | None = None,
 ) -> str:
     """Assemble the complete 3-layer progressive LLM constraint block."""
+    resolved_axes = topology_axes
+    if resolved_axes is None and sil_advisory is not None:
+        advisory_axes = getattr(sil_advisory, "topology_axes", None)
+        if isinstance(advisory_axes, TopologyAxes):
+            resolved_axes = advisory_axes
     sections = [
         format_hardware_and_sil_layer(
             sil_advisory=sil_advisory,
@@ -336,6 +369,11 @@ def build_progressive_llm_constraints(
             enable_track_router=enable_track_router,
             pipe_gap_report=pipe_gap_report,
             excluded_mechanisms=excluded_mechanisms,
+            topology_axes=resolved_axes,
+            freedom_mask=freedom_mask,
+            active_symptom=active_symptom,
+            case_ratios=case_ratios,
+            cann_series=cann_series,
         ),
     ]
     if blueprint is not None:

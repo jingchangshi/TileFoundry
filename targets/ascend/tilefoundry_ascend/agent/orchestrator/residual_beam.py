@@ -7,7 +7,6 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
-from tilefoundry_ascend.agent.router.capability_gate import StructuralFeatures
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import BishengResourceSummary
 from tilefoundry_ascend.ascend.passes.observation_space import (
     CompilerSummaryLike,
@@ -16,6 +15,7 @@ from tilefoundry_ascend.ascend.passes.observation_space import (
     compute_transfer_inflation_ratio,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
+from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios, TopologyAxes
 
 _NOVELTY_TOKENS = (
     "T.alloc_ss",
@@ -672,7 +672,9 @@ class BeamCandidate:
     structural_signature: tuple[str, ...] = ()
     hypothesis: str = ""
     parent_id: str | None = None
-    features: StructuralFeatures | None = None
+    features: dict[str, object] | None = None
+    topology_axes: TopologyAxes | None = None
+    case_ratios: CasePhysicsRatios | None = None
     objective_score: float | None = None
     case_latencies_us: dict[int, float] = field(default_factory=dict)
     policy: dict[str, object] = field(default_factory=dict)
@@ -680,6 +682,37 @@ class BeamCandidate:
     def __post_init__(self) -> None:
         if not self.track:
             object.__setattr__(self, "track", "unconstrained")
+        if self.features is not None:
+            if isinstance(self.features, Mapping):
+                object.__setattr__(
+                    self,
+                    "features",
+                    {str(k): v for k, v in self.features.items()},
+                )
+            else:
+                raise TypeError(
+                    f"BeamCandidate.features must be Mapping or None, got {type(self.features).__name__}"
+                )
+        if self.topology_axes is not None:
+            if isinstance(self.topology_axes, Mapping):
+                object.__setattr__(
+                    self, "topology_axes", TopologyAxes.from_dict(self.topology_axes)
+                )
+            elif not isinstance(self.topology_axes, TopologyAxes):
+                raise TypeError(
+                    "BeamCandidate.topology_axes must be TopologyAxes or None, "
+                    f"got {type(self.topology_axes).__name__}"
+                )
+        if self.case_ratios is not None:
+            if isinstance(self.case_ratios, Mapping):
+                object.__setattr__(
+                    self, "case_ratios", CasePhysicsRatios.from_dict(self.case_ratios)
+                )
+            elif not isinstance(self.case_ratios, CasePhysicsRatios):
+                raise TypeError(
+                    "BeamCandidate.case_ratios must be CasePhysicsRatios or None, "
+                    f"got {type(self.case_ratios).__name__}"
+                )
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-serializable dictionary representation."""
@@ -697,7 +730,13 @@ class BeamCandidate:
             "structural_signature": list(self.structural_signature),
             "hypothesis": self.hypothesis,
             "parent_id": self.parent_id,
-            "features": self.features.to_dict() if self.features is not None else None,
+            "features": dict(self.features) if self.features is not None else None,
+            "topology_axes": (
+                self.topology_axes.to_dict() if self.topology_axes is not None else None
+            ),
+            "case_ratios": (
+                self.case_ratios.to_dict() if self.case_ratios is not None else None
+            ),
             "objective_score": self.objective_score,
             "case_latencies_us": {
                 int(case_id): float(lat) for case_id, lat in self.case_latencies_us.items()
@@ -721,12 +760,24 @@ class BeamCandidate:
             else StaticDynamicResidual.from_dict(raw_residual)
         )
         raw_features = payload.get("features")
-        if raw_features is None:
-            features = None
-        elif isinstance(raw_features, StructuralFeatures):
-            features = raw_features
+        if isinstance(raw_features, Mapping):
+            features: dict[str, object] | None = {str(k): v for k, v in raw_features.items()}
         else:
-            features = StructuralFeatures.from_dict(raw_features)
+            features = None
+        raw_axes = payload.get("topology_axes")
+        if isinstance(raw_axes, TopologyAxes):
+            topology_axes: TopologyAxes | None = raw_axes
+        elif isinstance(raw_axes, Mapping):
+            topology_axes = TopologyAxes.from_dict(raw_axes)
+        else:
+            topology_axes = None
+        raw_ratios = payload.get("case_ratios")
+        if isinstance(raw_ratios, CasePhysicsRatios):
+            case_ratios: CasePhysicsRatios | None = raw_ratios
+        elif isinstance(raw_ratios, Mapping):
+            case_ratios = CasePhysicsRatios.from_dict(raw_ratios)
+        else:
+            case_ratios = None
         raw_rule = payload.get("rule_id")
         raw_parent = payload.get("parent_id")
         raw_sig = payload.get("structural_signature") or ()
@@ -760,6 +811,8 @@ class BeamCandidate:
             hypothesis=str(payload.get("hypothesis", "")),
             parent_id=str(raw_parent) if raw_parent is not None else None,
             features=features,
+            topology_axes=topology_axes,
+            case_ratios=case_ratios,
             objective_score=float(raw_obj) if raw_obj is not None else None,
             case_latencies_us=case_latencies_us,
             policy=policy,

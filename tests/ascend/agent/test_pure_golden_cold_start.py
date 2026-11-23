@@ -48,10 +48,12 @@ from tilefoundry_ascend.agent.campaign.seed_synthesizer import (
 from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     FAST_RESPONSE_SCHEMA,
     L3AcceptanceResult,
+    _NPU_COMPARE_SHIM_SOURCE,
     _V2GateExecution,
     _collect_profile_via_agent_gates,
     _fast_wire_operator_name,
     _format_l3_failure_detail,
+    _format_worst_element_diagnostic,
     _submit_fast_gate,
     run_l0_l1_round_filter,
     run_l4_official_cannbench_via_agent_gates,
@@ -2068,4 +2070,324 @@ def test_cce_cpp20_surface_warns_against_simtvf_ubuf_flags_and_raw_ub_casts() ->
     assert "__simt_vf__" in rendered
     assert "(__ubuf__" in rendered
     assert "507035" in rendered
+
+
+def test_worst_element_diagnostic_and_npu_compare_shim_ast(tmp_path: Path) -> None:
+    """Verify _format_worst_element_diagnostic and formatted shim AST + compare_case_result."""
+    import ast  # noqa: PLC0415
+    import sys  # noqa: PLC0415
+    import types  # noqa: PLC0415
+    import torch  # noqa: PLC0415
+
+    assert _format_worst_element_diagnostic("bad", "bad") == ""
+    assert _format_worst_element_diagnostic(torch.zeros((2, 2)), torch.zeros((2, 3))) == ""
+    assert _format_worst_element_diagnostic(torch.zeros((0,)), torch.zeros((0,))) == ""
+
+    actual = torch.tensor([[1.0, 2.0, 3.0], [4.0, 10.5, 6.0]], dtype=torch.float32)
+    golden = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.5, 6.0]], dtype=torch.float32)
+    diag = _format_worst_element_diagnostic(actual, golden)
+    assert diag.startswith("worst_element=(idx=[1, 1], ref=5.5, got=10.5, abs_diff=5.000000e+00")
+    assert "rel_err=" in diag
+
+    actual_mixed = torch.tensor([[float("nan"), 1.0], [2.0, 7.0]], dtype=torch.float32)
+    golden_mixed = torch.tensor([[0.0, 1.0], [2.0, 3.0]], dtype=torch.float32)
+    mixed_diag = _format_worst_element_diagnostic(actual_mixed, golden_mixed)
+    assert "idx=[1, 1]" in mixed_diag
+    assert "abs_diff=4.000000e+00" in mixed_diag
+
+    fake_cann = tmp_path / "cann_repo"
+    (fake_cann / "src" / "kernel_eval" / "utils").mkdir(parents=True)
+    rendered_shim = _NPU_COMPARE_SHIM_SOURCE.format(cann_repo=str(fake_cann))
+    ast.parse(rendered_shim)
+
+    fake_compare_mod = types.ModuleType("kernel_eval.utils.compare")
+
+    def _fake_compare_tensors(act, gold, **_kw):
+        _ = (act, gold)
+        return types.SimpleNamespace(
+            passed=False,
+            error_msg="",
+            mere=0.25,
+            mare=0.35,
+            max_diff=5.0,
+        )
+
+    fake_compare_mod.compare_tensors = _fake_compare_tensors
+    fake_utils_mod = types.ModuleType("kernel_eval.utils")
+    fake_utils_mod.compare = fake_compare_mod
+    fake_root_mod = types.ModuleType("kernel_eval")
+    fake_root_mod.utils = fake_utils_mod
+
+    saved_mods = {
+        k: sys.modules.get(k)
+        for k in ("kernel_eval", "kernel_eval.utils", "kernel_eval.utils.compare")
+    }
+    sys.modules["kernel_eval"] = fake_root_mod
+    sys.modules["kernel_eval.utils"] = fake_utils_mod
+    sys.modules["kernel_eval.utils.compare"] = fake_compare_mod
+    try:
+        ns: dict[str, object] = {}
+        exec(compile(rendered_shim, "npu_compare_shim.py", "exec"), ns)
+        res = ns["compare_case_result"](case_id="1", actual=actual_mixed, golden=golden_mixed)
+        assert res.passed is False
+        assert "NaN position mismatch" in res.message
+        assert "worst_element=(idx=[1, 1]" in res.message
+        assert "raw=MERE=2.500000e-01" in res.message
+    finally:
+        for key, prev in saved_mods.items():
+            if prev is None:
+                sys.modules.pop(key, None)
+            else:
+                sys.modules[key] = prev
+
+
+def test_stage0_rejects_wrong_entrypoint_before_l0_l1_and_oracle_budget() -> None:
+    """Reject wrong-entrypoint or missing-alias modules at Stage-0 before spending L0/L1/L3."""
+    golden = dedent(
+        """
+        import torch
+
+        def target_op(x: torch.Tensor) -> torch.Tensor:
+            return torch.exp(x)
+        """
+    )
+    proto = {
+        "name": "target_op",
+        "inputs": [{"name": "x", "dtype": "float32"}],
+        "outputs": [{"name": "y", "dtype": "float32"}],
+    }
+    cases = [{"case_id": 1, "input_shape": [[64, 128]], "dtype": ["float32"], "attrs": {}}]
+    contract = extract_golden_entrypoint_contract(golden, "target_op", proto=proto)
+
+    decoy_wrong_name = dedent(
+        """
+        import torch
+
+        def decoy_op(x: torch.Tensor) -> torch.Tensor:
+            return x
+
+        kernel = decoy_op
+        """
+    )
+    missing_alias = dedent(
+        """
+        import torch
+
+        def target_op(x: torch.Tensor) -> torch.Tensor:
+            return x
+        """
+    )
+    good_seed = dedent(
+        """
+        import torch
+
+        def target_op(x: torch.Tensor) -> torch.Tensor:
+            return torch.exp(x)
+
+        kernel = target_op
+        """
+    )
+
+    l0_calls = 0
+    oracle_calls = 0
+
+    def _counting_factory(
+        _regimes: tuple[RegimeTargetSpec, ...],
+        *,
+        semantics: object | None = None,
+    ) -> Callable[[str, str], tuple[bool, str]]:
+        _ = semantics
+
+        def _validate(_src: str, _track: str) -> tuple[bool, str]:
+            nonlocal l0_calls
+            l0_calls += 1
+            return True, ""
+
+        return _validate
+
+    def _counting_oracle(src: str) -> OracleAccuracyResult:
+        nonlocal oracle_calls
+        oracle_calls += 1
+        return OracleAccuracyResult(
+            passed=True,
+            candidate_sha256=hashlib.sha256(src.encode("utf-8")).hexdigest(),
+            l3_run_id="run-stage0-entry",
+            l3_receipt_path="/tmp/stage0-entry.json",
+            l3_state="FINISHED",
+        )
+
+    backend = _ScriptedBackend([decoy_wrong_name, missing_alias, good_seed])
+    outcome = asyncio.run(
+        prepare_operator_seed_or_takeover(
+            operator_name="level1/target_op",
+            entrypoint="target_op",
+            pytorch_golden_source=golden,
+            proto=proto,
+            cases=cases,
+            legacy_regime_specs=None,
+            llm_backend=backend,
+            l0_l1_validator_factory=_counting_factory,
+            oracle_accuracy_validator=_counting_oracle,
+            force_cold_start=True,
+            max_seed_attempts=3,
+            golden_contract=contract,
+        )
+    )
+    assert outcome.attempts_used == 3
+    assert l0_calls == 1
+    assert oracle_calls == 1
+    assert "does not define the public entrypoint target_op" in backend.requests[1].user_prompt
+    assert "does not bind `kernel = target_op`" in backend.requests[2].user_prompt
+
+
+def test_stage0_monotonic_plus_four_oracle_refinement_unlock_and_stop() -> None:
+    """Grant up to +4 extra oracle attempts on >=5% error drop and stop on stall or static fail."""
+    golden = dedent(
+        """
+        import torch
+
+        def vec_op(x: torch.Tensor) -> torch.Tensor:
+            return torch.exp(x)
+        """
+    )
+    proto = {
+        "name": "vec_op",
+        "inputs": [{"name": "x", "dtype": "float32"}],
+        "outputs": [{"name": "y", "dtype": "float32"}],
+    }
+    cases = [{"case_id": 1, "input_shape": [[64, 128]], "dtype": ["float32"], "attrs": {}}]
+    seed_src = dedent(
+        """
+        import torch
+
+        def vec_op(x: torch.Tensor) -> torch.Tensor:
+            return torch.exp(x)
+
+        kernel = vec_op
+        """
+    )
+    digest = hashlib.sha256(seed_src.strip().encode("utf-8")).hexdigest()
+
+    def _always_static(_regimes: tuple[RegimeTargetSpec, ...], *, semantics: object | None = None):
+        _ = semantics
+        return lambda _src, _track: (True, "")
+
+    unlock_calls = 0
+
+    def _monotonic_then_pass(src: str) -> OracleAccuracyResult:
+        nonlocal unlock_calls
+        unlock_calls += 1
+        errors = (1.0, 0.8, 0.6, 0.4, 0.2)
+        if unlock_calls <= len(errors):
+            err_val = errors[unlock_calls - 1]
+            return OracleAccuracyResult(
+                passed=False,
+                error_message=(
+                    f"worst_element=(idx=[0], ref=1.0, got=2.0, abs_diff={err_val:.6e})"
+                ),
+                l3_state="FAILED",
+                failure_kind="candidate",
+            )
+        assert hashlib.sha256(src.encode("utf-8")).hexdigest() == digest
+        return OracleAccuracyResult(
+            passed=True,
+            candidate_sha256=digest,
+            l3_run_id="run-ext-pass",
+            l3_receipt_path="/tmp/ext-pass.json",
+            l3_state="FINISHED",
+        )
+
+    outcome = asyncio.run(
+        prepare_operator_seed_or_takeover(
+            operator_name="level1/vec_op",
+            entrypoint="vec_op",
+            pytorch_golden_source=golden,
+            proto=proto,
+            cases=cases,
+            legacy_regime_specs=None,
+            llm_backend=_ScriptedBackend([seed_src.strip()]),
+            l0_l1_validator_factory=_always_static,
+            oracle_accuracy_validator=_monotonic_then_pass,
+            force_cold_start=True,
+            max_seed_attempts=2,
+            max_oracle_refinement_extension=4,
+        )
+    )
+    assert outcome.attempts_used == 6
+    assert unlock_calls == 6
+
+    stall_calls = 0
+
+    def _stall_on_third(_src: str) -> OracleAccuracyResult:
+        nonlocal stall_calls
+        stall_calls += 1
+        errors = (1.0, 0.8, 0.78)
+        err_val = errors[min(stall_calls - 1, len(errors) - 1)]
+        return OracleAccuracyResult(
+            passed=False,
+            error_message=f"MERE=0.1, max_diff={err_val:.6e}",
+            l3_state="FAILED",
+            failure_kind="candidate",
+        )
+
+    with pytest.raises(RuntimeError, match="after 3 attempts"):
+        asyncio.run(
+            prepare_operator_seed_or_takeover(
+                operator_name="level1/vec_op",
+                entrypoint="vec_op",
+                pytorch_golden_source=golden,
+                proto=proto,
+                cases=cases,
+                legacy_regime_specs=None,
+                llm_backend=_ScriptedBackend([seed_src.strip()]),
+                l0_l1_validator_factory=_always_static,
+                oracle_accuracy_validator=_stall_on_third,
+                force_cold_start=True,
+                max_seed_attempts=2,
+                max_oracle_refinement_extension=4,
+            )
+        )
+    assert stall_calls == 3
+
+    static_step = 0
+
+    def _fail_static_on_third(
+        _regimes: tuple[RegimeTargetSpec, ...],
+        *,
+        semantics: object | None = None,
+    ):
+        _ = semantics
+
+        def _check(_src: str, _track: str) -> tuple[bool, str]:
+            nonlocal static_step
+            static_step += 1
+            if static_step == 3:
+                return False, "compile error during refinement"
+            return True, ""
+
+        return _check
+
+    with pytest.raises(RuntimeError, match="after 3 attempts"):
+        asyncio.run(
+            prepare_operator_seed_or_takeover(
+                operator_name="level1/vec_op",
+                entrypoint="vec_op",
+                pytorch_golden_source=golden,
+                proto=proto,
+                cases=cases,
+                legacy_regime_specs=None,
+                llm_backend=_ScriptedBackend([seed_src.strip()]),
+                l0_l1_validator_factory=_fail_static_on_third,
+                oracle_accuracy_validator=lambda _s: OracleAccuracyResult(
+                    passed=False,
+                    error_message=f"max_abs_diff={1.0 / (2 ** static_step):.6e}",
+                    l3_state="FAILED",
+                    failure_kind="candidate",
+                ),
+                force_cold_start=True,
+                max_seed_attempts=2,
+                max_oracle_refinement_extension=4,
+            )
+        )
+    assert static_step == 3
 

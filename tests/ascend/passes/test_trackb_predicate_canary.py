@@ -16,8 +16,8 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
 
 _CANARY_ASC_SOURCE = """\
 #include <tl_templates/ascend/common.h>
-#include <basic_api/kernel_common.h>
-#include <simt_api/cpp/kernel_simt_common_intf.h>
+#include <c_api/asc_simd.h>
+#include <simt_api/asc_simt.h>
 
 __simd_vf__ void vf_predicate_canary(__ubuf__ float* dst_ub, __ubuf__ float* scalar_ub, int rem) {
     vector_bool m32 = asc_create_mask_b32(PAT_ALL);
@@ -38,8 +38,7 @@ __simt_vf__ __launch_bounds__(128) void simt_tid_canary(
     __gm__ const float* in,
     int n
 ) {
-    using namespace AscendC;
-    uint32_t tid = Simt::GetThreadIdx<0>();
+    uint32_t tid = threadIdx.x;
     if ((int)tid < n) {
         out[tid] = in[tid] + 1.0f;
     }
@@ -52,7 +51,7 @@ extern "C" __global__ __vector__ void canary_kernel(__gm__ float* out, __gm__ fl
 
 
 def test_bisheng_dav3510_compiles_trackb_predicate_and_simt_canary() -> None:
-    """Compile verified mask, broadcast, vadd, and Simt::GetThreadIdx primitives on bisheng."""
+    """Compile verified mask, broadcast, vadd, and SIMT threadIdx primitives on bisheng."""
     bisheng_bin = shutil.which("bisheng")
     if bisheng_bin is None:
         pytest.skip("bisheng compiler not present on PATH")

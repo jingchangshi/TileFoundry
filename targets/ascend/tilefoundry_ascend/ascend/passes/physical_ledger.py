@@ -94,6 +94,7 @@ class ObjectivePhysicalLedger:
     in_loop_pipe_all_barriers: int = 0
     ub_bank_conflict_risk: float = 0.0
     l1_bank_conflict_risk: float = 0.0
+    ub_scalar_compute_loops: int = 0
     microarch_profile: dict[str, object] = field(default_factory=dict)
     gm_traffic_scope: Literal["per_tile", "full_grid"] = "per_tile"
 
@@ -213,6 +214,7 @@ class ObjectivePhysicalLedger:
             in_loop_pipe_all_barriers=int(payload.get("in_loop_pipe_all_barriers", 0)),
             ub_bank_conflict_risk=float(payload.get("ub_bank_conflict_risk", 0.0)),
             l1_bank_conflict_risk=float(payload.get("l1_bank_conflict_risk", 0.0)),
+            ub_scalar_compute_loops=int(payload.get("ub_scalar_compute_loops", 0)),
             microarch_profile=dict(payload.get("microarch_profile") or {}),
             gm_traffic_scope=gm_traffic_scope,
         )
@@ -287,6 +289,7 @@ def build_objective_physical_ledger(
     in_loop_pipe_all_barriers: int = 0,
     ub_bank_conflict_risk: float = 0.0,
     l1_bank_conflict_risk: float = 0.0,
+    ub_scalar_compute_loops: int = 0,
     microarch_profile: Mapping[str, object] | None = None,
     gm_traffic_scope: Literal["per_tile", "full_grid"] = "per_tile",
 ) -> ObjectivePhysicalLedger:
@@ -326,6 +329,7 @@ def build_objective_physical_ledger(
         in_loop_pipe_all_barriers=int(in_loop_pipe_all_barriers),
         ub_bank_conflict_risk=min(1.0, max(0.0, float(ub_bank_conflict_risk))),
         l1_bank_conflict_risk=min(1.0, max(0.0, float(l1_bank_conflict_risk))),
+        ub_scalar_compute_loops=max(0, int(ub_scalar_compute_loops)),
         microarch_profile=dict(microarch_profile or {}),
         gm_traffic_scope=gm_traffic_scope,
     )

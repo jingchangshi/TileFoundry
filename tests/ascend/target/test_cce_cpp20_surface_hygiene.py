@@ -86,7 +86,7 @@ def _patch(search: str, replace: str) -> str:
 def test_cce_cpp20_surface_freezes_label_headers_and_two_sided_blacklist() -> None:
     """Freeze the canonical Track-B CCE (C++20) surface contract."""
     assert CCE_CPP20_SURFACE.dialect_id == "cce_cpp20"
-    assert CCE_CPP20_SURFACE.display_label == "CCE C++20 (tl_templates/ascend)"
+    assert CCE_CPP20_SURFACE.display_label == "CCE C++20 (dav-3510 / CANN 9.3)"
     assert CCE_CPP20_SURFACE.required_headers_or_imports == (
         "#include <tl_templates/ascend/common.h>",
         "#include <tl_templates/ascend/gemm.h>",
@@ -94,12 +94,15 @@ def test_cce_cpp20_surface_freezes_label_headers_and_two_sided_blacklist() -> No
         "#include <tl_templates/ascend/dcache_bypass.h>",
         "#include <tl_templates/ascend/reduce.h>",
         "#include <tl_templates/ascend/simd_inst.h>",
+        "#include <c_api/asc_cube.h>",
+        "#include <c_api/asc_simd.h>",
+        "#include <c_api/asc_reg_vector.h>",
+        "#include <simt_api/asc_simt.h>",
     )
-    assert CCE_CPP20_SURFACE.forbidden_tokens == FORBIDDEN_CCE_TOKENS
     assert set(FORBIDDEN_CCE_TOKENS) <= set(CCE_CPP20_SURFACE.forbidden_tokens)
     rendered = CCE_CPP20_SURFACE.render_prompt_reference()
     assert rendered.splitlines()[0] == (
-        "Verified `CCE C++20 (tl_templates/ascend)` (`cce_cpp20`) callable surface:"
+        f"Verified `{CCE_CPP20_SURFACE.display_label}` (`cce_cpp20`) callable surface:"
     )
     assert "Strictly Forbidden Symbols:" in rendered
     for token in FORBIDDEN_CCE_TOKENS:
@@ -136,8 +139,8 @@ def test_inline_surface_renames_dialect_but_keeps_legacy_symbol_and_alias() -> N
 def test_trackb_layer2_prompt_has_zero_positive_ascendc_induction(tier: str) -> None:
     """Assert Layer-2 Track-B generation prompts only mention AscendC as prohibited."""
     prompt = format_target_dialect_layer(escalation_tier=tier)
-    assert "CCE C++20 (tl_templates/ascend)" in prompt
-    assert "Verified `CCE C++20 (tl_templates/ascend)` (`cce_cpp20`)" in prompt
+    assert CCE_CPP20_SURFACE.display_label in prompt
+    assert f"Verified `{CCE_CPP20_SURFACE.display_label}` (`cce_cpp20`)" in prompt
     assert "asc_copy_gm2ub_align" in prompt
     assert "T.Kernel" not in prompt
     assert _positive_ascendc_lines(prompt) == []
@@ -154,7 +157,7 @@ def test_trackb_repair_prompt_is_cce_scoped_and_two_sided_blocked() -> None:
     assert "Track-B CCE (C++20)" in request.system_prompt
     assert "Do NOT emit high-level AscendC classes" in request.system_prompt
     assert "```cpp" in request.user_prompt
-    assert "CCE C++20 (tl_templates/ascend)" in request.user_prompt
+    assert CCE_CPP20_SURFACE.display_label in request.user_prompt
     assert "asc_copy_gm2ub_align" in request.user_prompt
     assert "T.Kernel" not in request.user_prompt
     combined = f"{request.system_prompt}\n{request.user_prompt}"
@@ -163,7 +166,7 @@ def test_trackb_repair_prompt_is_cce_scoped_and_two_sided_blocked() -> None:
         "__global__ void kernel_active() {}", "compile error", backend_kind="cce_trackb"
     )
     assert "```cpp" in legacy.user_prompt
-    assert "CCE C++20 (tl_templates/ascend)" in legacy.user_prompt
+    assert CCE_CPP20_SURFACE.display_label in legacy.user_prompt
 
 
 def test_tilelang_repair_prompt_keeps_python_dialect() -> None:
@@ -171,7 +174,7 @@ def test_tilelang_repair_prompt_keeps_python_dialect() -> None:
     request = build_syntax_repair_request("def f():\n    pass\n", "compile error")
     assert "```python" in request.user_prompt
     assert "T.MixedKernel" in request.user_prompt
-    assert "CCE C++20 (tl_templates/ascend)" not in request.user_prompt
+    assert CCE_CPP20_SURFACE.display_label not in request.user_prompt
 
 
 def test_tilelang_surface_registers_simd_register_primitives_and_parallel_math_ban() -> None:

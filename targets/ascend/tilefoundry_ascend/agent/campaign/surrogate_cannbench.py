@@ -449,6 +449,41 @@ def aggregate_surrogate_result(
     )
 
 
+def _format_worst_element_diagnostic(actual: object, golden: object) -> str:
+    """Summarize the single finite element with largest absolute difference."""
+    import torch  # noqa: PLC0415
+
+    if not isinstance(actual, torch.Tensor) or not isinstance(golden, torch.Tensor):
+        return ""
+    if actual.shape != golden.shape or actual.numel() == 0:
+        return ""
+    if actual.is_complex() or golden.is_complex():
+        return ""
+    with torch.no_grad():
+        act = actual.detach().cpu().to(dtype=torch.float64)
+        gold = golden.detach().cpu().to(dtype=torch.float64)
+        diff = (act - gold).abs()
+        finite_mask = torch.isfinite(diff) & torch.isfinite(act) & torch.isfinite(gold)
+        if not bool(finite_mask.any().item()):
+            return ""
+        masked_diff = torch.where(finite_mask, diff, torch.full_like(diff, -1.0))
+        flat_idx = int(torch.argmax(masked_diff.reshape(-1)).item())
+        rem = flat_idx
+        coord_rev: list[int] = []
+        for dim in reversed(tuple(int(d) for d in act.shape)):
+            coord_rev.append(rem % dim)
+            rem //= dim
+        coord = list(reversed(coord_rev))
+        ref_val = float(gold.reshape(-1)[flat_idx].item())
+        got_val = float(act.reshape(-1)[flat_idx].item())
+        abs_diff = float(diff.reshape(-1)[flat_idx].item())
+        rel_err = abs_diff / max(abs(ref_val), 1e-12)
+        return (
+            f"worst_element=(idx={coord}, ref={ref_val:.6g}, got={got_val:.6g}, "
+            f"abs_diff={abs_diff:.6e}, rel_err={rel_err:.6e})"
+        )
+
+
 _NPU_COMPARE_SHIM_SOURCE = '''"""Runtime bridge adapting kernel_eval.utils.compare to npu_compare API."""
 
 from __future__ import annotations
@@ -519,6 +554,41 @@ def _format_nonfinite_diagnostic(actual: object, golden: object) -> str:
     return ""
 
 
+def _format_worst_element_diagnostic(actual: object, golden: object) -> str:
+    """Summarize the single finite element with largest absolute difference."""
+    import torch  # noqa: PLC0415
+
+    if not isinstance(actual, torch.Tensor) or not isinstance(golden, torch.Tensor):
+        return ""
+    if actual.shape != golden.shape or actual.numel() == 0:
+        return ""
+    if actual.is_complex() or golden.is_complex():
+        return ""
+    with torch.no_grad():
+        act = actual.detach().cpu().to(dtype=torch.float64)
+        gold = golden.detach().cpu().to(dtype=torch.float64)
+        diff = (act - gold).abs()
+        finite_mask = torch.isfinite(diff) & torch.isfinite(act) & torch.isfinite(gold)
+        if not bool(finite_mask.any().item()):
+            return ""
+        masked_diff = torch.where(finite_mask, diff, torch.full_like(diff, -1.0))
+        flat_idx = int(torch.argmax(masked_diff.reshape(-1)).item())
+        rem = flat_idx
+        coord_rev: list[int] = []
+        for dim in reversed(tuple(int(d) for d in act.shape)):
+            coord_rev.append(rem % dim)
+            rem //= dim
+        coord = list(reversed(coord_rev))
+        ref_val = float(gold.reshape(-1)[flat_idx].item())
+        got_val = float(act.reshape(-1)[flat_idx].item())
+        abs_diff = float(diff.reshape(-1)[flat_idx].item())
+        rel_err = abs_diff / max(abs(ref_val), 1e-12)
+        return (
+            f"worst_element=(idx={{coord}}, ref={{ref_val:.6g}}, got={{got_val:.6g}}, "
+            f"abs_diff={{abs_diff:.6e}}, rel_err={{rel_err:.6e}})"
+        )
+
+
 def compare_case_result(
     *,
     case_id: str,
@@ -554,8 +624,15 @@ def compare_case_result(
         f"MERE={{res.mere:.6e}}, MARE={{res.mare:.6e}}, max_diff={{res.max_diff:.6e}}"
     )
     if not bool(res.passed):
-        diag = _format_nonfinite_diagnostic(actual, golden)
-        if diag and diag not in msg:
+        diag_parts: list[str] = []
+        nonfinite_diag = _format_nonfinite_diagnostic(actual, golden)
+        if nonfinite_diag and nonfinite_diag not in msg:
+            diag_parts.append(nonfinite_diag)
+        worst_diag = _format_worst_element_diagnostic(actual, golden)
+        if worst_diag and worst_diag not in msg:
+            diag_parts.append(worst_diag)
+        if diag_parts:
+            diag = "; ".join(diag_parts)
             msg = f"{{diag}}; raw={{msg}}" if msg else diag
     return SimpleNamespace(passed=bool(res.passed), message=msg)
 '''

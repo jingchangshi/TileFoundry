@@ -1,4 +1,4 @@
-"""Structural feature extraction, execution-track routing, and 7-pipe ISA gap scanning."""
+"""Pure 3-axis CapabilityGate router, execution-track routing, and 7-pipe ISA gap scanning."""
 
 from tilefoundry_ascend.agent.router.capability_gate import (
     VALID_BACKEND_TIERS,
@@ -6,18 +6,19 @@ from tilefoundry_ascend.agent.router.capability_gate import (
     VALID_QUANT_GRANULARITIES,
     VALID_RECURRENCES,
     VALID_TRACKS,
+    CapabilityGate,
     EscalationDecision,
     RouteDecision,
-    StructuralFeatures,
+    apply_case_ratios,
     evaluate_track_escalation,
-    extract_structural_features,
+    normalize_router_tier,
     resolve_canonical_topology_axes,
     route_execution_track,
     route_from_op_spec,
     route_initial_by_input_contract,
 )
 from tilefoundry_ascend.agent.router.isa_gap_scanner import (
-    ASCEND_DEVKIT_ISA_CATALOG,
+    DAV3510_CANN_ISA_CATALOG,
     DEFAULT_ASCEND_SDK_HEADER_ROOTS,
     DEFAULT_TILELANG_CODEGEN_PATH,
     VALID_HARDWARE_PIPES,
@@ -31,7 +32,8 @@ from tilefoundry_ascend.agent.router.isa_gap_scanner import (
 )
 
 __all__ = [
-    "ASCEND_DEVKIT_ISA_CATALOG",
+    "CapabilityGate",
+    "DAV3510_CANN_ISA_CATALOG",
     "DEFAULT_ASCEND_SDK_HEADER_ROOTS",
     "DEFAULT_TILELANG_CODEGEN_PATH",
     "EscalationDecision",
@@ -40,16 +42,16 @@ __all__ = [
     "PipeGapReport",
     "RouteDecision",
     "SdkHeaderScanResult",
-    "StructuralFeatures",
     "VALID_BACKEND_TIERS",
     "VALID_ESCALATION_TIERS",
     "VALID_HARDWARE_PIPES",
     "VALID_QUANT_GRANULARITIES",
     "VALID_RECURRENCES",
     "VALID_TRACKS",
+    "apply_case_ratios",
     "discover_tilelang_lowering_surface",
     "evaluate_track_escalation",
-    "extract_structural_features",
+    "normalize_router_tier",
     "resolve_canonical_topology_axes",
     "route_execution_track",
     "route_from_op_spec",

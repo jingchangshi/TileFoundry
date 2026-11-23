@@ -8,11 +8,11 @@ from tilefoundry_ascend.agent import (
     AgyCliLLMBackend,
     BayesianRuleTracker,
     BeamCandidate,
+    CapabilityGate,
     GateFunnel,
     GenerationRequest,
     MockLLMBackend,
     PortfolioRunner,
-    StructuralFeatures,
     TileConfigCandidate,
     TwoLaneBeamSearch,
     format_prescreen_summary,
@@ -320,29 +320,14 @@ def test_two_lane_beam_novelty_preservation_and_roundtrip() -> None:
     """Verify stepping-stone novelty persists until selected and beam/features roundtrip."""
     import pytest  # noqa: PLC0415
 
+    from tilefoundry_ascend.ascend.sil.schema import (  # noqa: PLC0415
+        CasePhysicsRatios,
+        TopologyAxes,
+    )
+
     ledger = _make_legal_ledger(ii=500)
     res = compute_static_dynamic_residual(ledger, {"dur_us": 20.0})
-    feat = StructuralFeatures(
-        phi_1_static_affine_bounds=False,
-        phi_2_cube_to_vector_ratio=1.25,
-        phi_3_quant_granularity="per_token_or_block",
-        phi_4_indirect_sparse_gather=True,
-        phi_5_cross_iter_recurrence="associative_online_rescale",
-        phi_6_dynamic_cross_core_handoff=True,
-        phi_7_inner_contiguous_bytes=64,
-        phi_8_persistent_wave_occupancy=2.0,
-    )
-    short_payload = {
-        "phi_1": False,
-        "phi_2": 1.25,
-        "phi_3": "per_token_or_block",
-        "phi_4": True,
-        "phi_5": "associative_online_rescale",
-        "phi_6": True,
-        "phi_7": 64,
-        "phi_8": 2.0,
-    }
-    long_payload = {
+    feat: dict[str, object] = {
         "static_affine_bounds": False,
         "cube_to_vector_ratio": 1.25,
         "quant_granularity": "per_token_or_block",
@@ -352,9 +337,18 @@ def test_two_lane_beam_novelty_preservation_and_roundtrip() -> None:
         "inner_contiguous_bytes": 64,
         "persistent_wave_occupancy": 2.0,
     }
-    assert StructuralFeatures.from_dict(short_payload) == feat
-    assert StructuralFeatures.from_dict(long_payload) == feat
-    assert StructuralFeatures.from_dict(feat.to_dict()) == feat
+    axes = TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "irregular_simt")
+    ratios = CasePhysicsRatios(
+        case_id=1,
+        stride_ratio=1.0,
+        contig_atom_ratio=1.0,
+        is_atom_aligned=True,
+        working_set_sram_ratio=0.4,
+        working_set_vreg_ratio=0.3,
+        wave_occupancy_ratio=2.0,
+        oi_ridge_ratio=1.5,
+        inner_contiguous_bytes=64,
+    )
 
     def _cand(cid: str, rnd: int, lat: float, sig: tuple[str, ...]) -> BeamCandidate:
         return BeamCandidate(
@@ -370,6 +364,8 @@ def test_two_lane_beam_novelty_preservation_and_roundtrip() -> None:
             accuracy_passed=True,
             structural_signature=sig,
             features=feat,
+            topology_axes=axes,
+            case_ratios=ratios,
         )
 
     beam = TwoLaneBeamSearch(exploit_width=1, stepping_stone_width=1)
@@ -398,6 +394,8 @@ def test_two_lane_beam_novelty_preservation_and_roundtrip() -> None:
     assert roundtrip.stepping_stone_width == 1
     assert roundtrip.exploited_signatures == beam.exploited_signatures
     assert roundtrip.exploit_beam[0].features == feat
+    assert roundtrip.exploit_beam[0].topology_axes == axes
+    assert roundtrip.exploit_beam[0].case_ratios == ratios
     assert roundtrip.stepping_stone_beam[0].candidate_id == "c_fresh"
     assert roundtrip.exploit_beam[0].ledger.to_dict() == ledger.to_dict()
     assert pytest.approx(roundtrip.exploit_beam[0].residual.predicted_bottleneck_util) == (
@@ -476,7 +474,7 @@ def make_kernel(bm: int = 128, bn: int = 128, bk: int = 64, num_stages: int = 2)
 
 
 def test_fp3_unmatched_rules_not_padded_and_transport_error_exempt() -> None:
-    """Verify phi_2 matching, zero padding trials on unmatched rules, and transport exemption."""
+    """Verify cube rule matching, zero padding trials on unmatched rules, and exemptions."""
     stage_a_seed = run_stage_a_static(_SEED_DSL, factory_name="make_kernel")
     assert stage_a_seed.passed and stage_a_seed.ledger is not None
     seed_res = compute_static_dynamic_residual(stage_a_seed.ledger, {"dur_us": 40.0})
@@ -564,16 +562,16 @@ def test_fp3_unmatched_rules_not_padded_and_transport_error_exempt() -> None:
         residual=compute_static_dynamic_residual(sparse_ledger, {"dur_us": 20.0}),
         latency_us=20.0,
         accuracy_passed=True,
-        features=StructuralFeatures(
-            phi_1_static_affine_bounds=True,
-            phi_2_cube_to_vector_ratio=0.0,
-            phi_3_quant_granularity="none",
-            phi_4_indirect_sparse_gather=False,
-            phi_5_cross_iter_recurrence="none",
-            phi_6_dynamic_cross_core_handoff=False,
-            phi_7_inner_contiguous_bytes=128,
-            phi_8_persistent_wave_occupancy=0.0,
-        ),
+        features={
+            "static_affine_bounds": True,
+            "cube_to_vector_ratio": 0.0,
+            "quant_granularity": "none",
+            "indirect_sparse_gather": False,
+            "cross_iter_recurrence": "none",
+            "dynamic_cross_core_handoff": False,
+            "inner_contiguous_bytes": 128,
+            "persistent_wave_occupancy": 0.0,
+        },
     )
     creative_json = json.dumps(
         {
@@ -626,15 +624,15 @@ def test_stage_a_track_router_disabled_by_default_and_primitive_menu(monkeypatch
 
     calls: list[str] = []
 
-    def _boom_extract(*_args, **_kwargs):
-        calls.append("extract")
+    def _boom_gate(*_args, **_kwargs):
+        calls.append("gate")
         raise AssertionError("capability_gate must not run when enable_track_router=False")
 
     def _boom_route(*_args, **_kwargs):
         calls.append("route")
         raise AssertionError("capability_gate must not run when enable_track_router=False")
 
-    monkeypatch.setattr(cap_gate, "extract_structural_features", _boom_extract)
+    monkeypatch.setattr(cap_gate.CapabilityGate, "route", _boom_gate)
     monkeypatch.setattr(cap_gate, "route_execution_track", _boom_route)
 
     st_default = run_stage_a_static(_SEED_DSL, factory_name="make_kernel")

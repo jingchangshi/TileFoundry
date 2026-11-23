@@ -241,7 +241,8 @@ def test_all_60_cannbench_ops_unified_sil_router_solver_template_cost_pipeline(t
             rendered_via_dict = render_template(route.topology_axes, pol.to_dict(), track="both")
             assert rendered_via_reg.prim_func is not None
             assert rendered_via_dict.prim_func is not None
-            assert "Kernel" in rendered_via_reg.ascendc_cpp or "AscendC" in rendered_via_reg.ascendc_cpp
+            assert "#include <tl_templates/ascend/common.h>" in rendered_via_reg.ascendc_cpp
+            assert "AscendC" not in rendered_via_reg.ascendc_cpp
 
             gm_bytes = float(advisory.roofline.get("median_gm_bytes") or 65536)
             uses_cube = bool(advisory.structural_features.get("uses_cube", False))

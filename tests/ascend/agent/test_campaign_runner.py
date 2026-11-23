@@ -56,7 +56,7 @@ from tilefoundry_ascend.agent.campaign.campaign_runner import (
 from tilefoundry_ascend.agent.campaign.marathon import build_marathon_arg_parser
 from tilefoundry_ascend.agent.kb import build_predicate_context
 from tilefoundry_ascend.agent.orchestrator import StageAResult, StageBResult, TwoLaneBeamSearch
-from tilefoundry_ascend.agent.router import extract_structural_features, route_execution_track
+from tilefoundry_ascend.agent.router import CapabilityGate, route_execution_track
 from tilefoundry_ascend.ascend.cost_model import BishengResourceSummary
 from tilefoundry_ascend.ascend.passes import (
     HirBlueprintPacket,
@@ -164,8 +164,8 @@ def _make_stage_a(source: str) -> StageAResult:
         grid_blocks=20,
         wave_occupancy=0.60,
     )
-    feats = extract_structural_features(None, ledger=ledger)
-    route = route_execution_track(feats)
+    route = route_execution_track(None, ledger=ledger)
+    feats = route.features
     return StageAResult(
         passed=True,
         prim_func=None,
@@ -2136,15 +2136,15 @@ def test_np4_campaign_autodiscovery_nav_injection_router_off_and_17_rules(
 
     router_calls: list[str] = []
 
-    def _forbid_extract(*_args, **_kwargs):
-        router_calls.append("extract")
-        raise AssertionError("extract_structural_features must not be called")
+    def _forbid_gate(*_args, **_kwargs):
+        router_calls.append("gate")
+        raise AssertionError("CapabilityGate.route must not be called")
 
     def _forbid_route(*_args, **_kwargs):
         router_calls.append("route")
         raise AssertionError("route_execution_track must not be called")
 
-    monkeypatch.setattr(cap_gate, "extract_structural_features", _forbid_extract)
+    monkeypatch.setattr(cap_gate.CapabilityGate, "route", _forbid_gate)
     monkeypatch.setattr(cap_gate, "route_execution_track", _forbid_route)
 
     repo_root = Path(__file__).resolve().parents[3]

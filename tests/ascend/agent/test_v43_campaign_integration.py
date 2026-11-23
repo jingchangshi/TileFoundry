@@ -43,7 +43,7 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     StaticDynamicResidual,
     TwoLaneBeamSearch,
 )
-from tilefoundry_ascend.agent.router import extract_structural_features, route_execution_track
+from tilefoundry_ascend.agent.router import CapabilityGate, route_execution_track
 from tilefoundry_ascend.ascend.cost_model import BishengResourceSummary
 from tilefoundry_ascend.ascend.cost_model.experience_lake import (
     ExperienceLake,
@@ -180,8 +180,8 @@ def _make_stage_a(
         min_gm_dma_bytes=gm_bytes,
         waterlines=waterlines,
     )
-    feats = extract_structural_features(None, ledger=ledger)
-    route = route_execution_track(feats)
+    route = route_execution_track(None, ledger=ledger)
+    feats = route.features
     return StageAResult(
         passed=True,
         prim_func=None,

@@ -4084,11 +4084,12 @@ class PerfTargetCampaignRunner:
             else ""
         )
         return (
-            f"authorized slice symbols ({syms}){helper_note}. You may output ONLY the "
-            "subset of functions or prefixed macros you modified (e.g., just _select_*_config, "
-            "a single helper macro, or one builder); omitted sibling symbols in this regime "
-            "automatically inherit their parent implementation. Do NOT define or modify public "
-            "entrypoints or symbols from other regimes"
+            f"authorized slice symbols ({syms}){helper_note} for entrypoint '{func_name}'. "
+            "You may output ONLY the subset of functions or prefixed macros you modified "
+            "(e.g., just _select_*_config, a single helper macro, or one builder); omitted "
+            "sibling symbols in this regime automatically inherit their parent implementation. "
+            f"Preserve exact public entrypoint '{func_name}' and `kernel = {func_name}` without "
+            "renaming or modifying symbols from other regimes"
         )
 
     @staticmethod
@@ -4897,6 +4898,12 @@ class PerfTargetCampaignRunner:
             ub_256kb_unlock=bool(parent_ledger.uses_unreserved_ubuf) if parent_ledger else False,
             blueprint=blueprint,
             current_ledger=parent_ledger,
+            topology_axes=self._derive_topology_axes(parent_ledger),
+            active_symptom=(
+                rule.symptom_family.value
+                if hasattr(rule.symptom_family, "value")
+                else str(rule.symptom_family)
+            ),
         )
         track_section = f"{constraint_text}\n\n"
         nav_section = ""
@@ -5022,6 +5029,7 @@ class PerfTargetCampaignRunner:
             blueprint=blueprint,
             current_ledger=parent_ledger,
             excluded_mechanisms=excluded_mechanisms,
+            topology_axes=self._derive_topology_axes(parent_ledger),
         )
         track_section = f"{constraint_text}\n\n"
         nav_section = ""
@@ -7215,11 +7223,7 @@ class PerfTargetCampaignRunner:
                     current_tier = "tilelang_dsl"
                 elif current_tier in ("ascendc_trackb", "hybrid_trackb"):
                     current_tier = "ascendc_template"
-            sf_ctx = (
-                parent_features.to_dict()
-                if hasattr(parent_features, "to_dict")
-                else (dict(parent_features) if isinstance(parent_features, Mapping) else {})
-            )
+            sf_ctx = dict(parent_features) if isinstance(parent_features, Mapping) else {}
             sf_ctx["l1_overflow"] = l1_overflow
             sf_ctx["ub_overflow"] = ub_overflow
             sf_ctx["freedom_mask"] = active_mask
@@ -7227,9 +7231,7 @@ class PerfTargetCampaignRunner:
             case_ratios = regime_spec.representative_case_ratios
             if case_ratios is not None:
                 sf_ctx["representative_case_id"] = case_ratios.case_id
-                sf_ctx["phi_7"] = case_ratios.inner_contiguous_bytes
                 sf_ctx["inner_contiguous_bytes"] = case_ratios.inner_contiguous_bytes
-                sf_ctx["phi_8"] = case_ratios.wave_occupancy_ratio
                 sf_ctx["persistent_wave_occupancy"] = case_ratios.wave_occupancy_ratio
             escalation_decision = evaluate_track_escalation(
                 current_tier=current_tier,

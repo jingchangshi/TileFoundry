@@ -26,6 +26,7 @@ from tilefoundry_ascend.agent.orchestrator.residual_beam import (
 )
 from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
     BishengResourceSummary,
+    count_reachable_ub_scalar_compute_loops,
     parse_bisheng_res_usage,
 )
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
@@ -55,7 +56,7 @@ class StageAResult:
     passed: bool
     prim_func: object | None
     ledger: ObjectivePhysicalLedger | None
-    features: object | None = None
+    features: dict[str, object] | None = None
     route: object | None = None
     error_message: str = ""
     elapsed_ms: float = 0.0
@@ -2119,6 +2120,7 @@ def _build_ascendc_static_ledger(
 
     is_legal = all(wl.overflow_bytes == 0 for wl in waterlines.values())
     steady_ii = max(pipe_cycles.values()) if pipe_cycles else None
+    ub_scalar_loops = count_reachable_ub_scalar_compute_loops(cpp_source)
     return build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
         is_legal=is_legal,
@@ -2129,6 +2131,7 @@ def _build_ascendc_static_ledger(
         wave_occupancy=wave_occupancy,
         ub_bank_conflict_risk=ub_bank_conflict_risk,
         has_indirect_gather=uses_simt,
+        ub_scalar_compute_loops=ub_scalar_loops,
         microarch_profile=ma_dict,
     )
 
@@ -2233,11 +2236,10 @@ def evaluate_ascendc_candidate(
     if ledger.max_overflow_bytes > 0:
         errors.append(f"max_overflow_bytes={ledger.max_overflow_bytes}")
 
-    features: object | None = None
+    features: dict[str, object] | None = None
     route: object | None = None
     if enable_track_router:
         from tilefoundry_ascend.agent.router.capability_gate import (  # noqa: PLC0415
-            StructuralFeatures,
             route_execution_track,
         )
 
@@ -2248,29 +2250,29 @@ def evaluate_ascendc_candidate(
         static_affine_bounds = not uses_simt
         cube_to_vector_ratio = 1.0 if uses_cube else 0.0
         quant_granularity = "per_token_or_block" if "deq_scale" in lower else "none"
-        features = (
-            StructuralFeatures.from_case_ratios(
-                case_ratios,
-                static_affine_bounds=static_affine_bounds,
-                cube_to_vector_ratio=cube_to_vector_ratio,
-                quant_granularity=quant_granularity,
-                indirect_sparse_gather=uses_simt,
-                cross_iter_recurrence="none",
-                dynamic_cross_core_handoff=uses_ssbuf,
-            )
-            if case_ratios is not None
-            else StructuralFeatures(
-                phi_1_static_affine_bounds=static_affine_bounds,
-                phi_2_cube_to_vector_ratio=cube_to_vector_ratio,
-                phi_3_quant_granularity=quant_granularity,
-                phi_4_indirect_sparse_gather=uses_simt,
-                phi_5_cross_iter_recurrence="none",
-                phi_6_dynamic_cross_core_handoff=uses_ssbuf,
-                phi_7_inner_contiguous_bytes=0,
-                phi_8_persistent_wave_occupancy=0.0,
-            )
+        semantic_features: dict[str, object] = {
+            "static_affine_bounds": static_affine_bounds,
+            "cube_to_vector_ratio": cube_to_vector_ratio,
+            "quant_granularity": quant_granularity,
+            "indirect_sparse_gather": uses_simt,
+            "cross_iter_recurrence": "none",
+            "dynamic_cross_core_handoff": uses_ssbuf,
+            "inner_contiguous_bytes": (
+                case_ratios.inner_contiguous_bytes if case_ratios is not None else 0
+            ),
+            "persistent_wave_occupancy": (
+                case_ratios.wave_occupancy_ratio if case_ratios is not None else 0.0
+            ),
+            "uses_cube": uses_cube,
+        }
+        route = route_execution_track(
+            semantic_features,
+            ledger=ledger,
+            target=target,
+            case_ratios=case_ratios,
+            simt_dominant=uses_simt,
         )
-        route = route_execution_track(features, simt_dominant=uses_simt)
+        features = dict(route.features) if route.features is not None else semantic_features
 
     if errors:
         return StageAResult(
@@ -2668,6 +2670,7 @@ def run_stage_a_static(
     case_ratios: CasePhysicsRatios | None = None,
     require_hardware_dma: bool = False,
     require_cube_engine: bool = False,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> StageAResult:
     """Run millisecond Stage A AST, Two-Snapshot IR Diff, and optional track routing."""
     t0 = time.monotonic()
@@ -2765,6 +2768,7 @@ def run_stage_a_static(
                 pass_configs=merged_pc or None,
                 compile_flags=merged_cf or None,
                 var_bindings=resolved_var_bindings,
+                ordered_tensor_shapes=ordered_tensor_shapes,
             )
     except Exception as exc:
         return StageAResult(
@@ -2778,23 +2782,20 @@ def run_stage_a_static(
         )
 
     ledger = inspection.ledger
-    features: object | None = None
+    features: dict[str, object] | None = None
     route: object | None = None
     if enable_track_router:
         from tilefoundry_ascend.agent.router.capability_gate import (  # noqa: PLC0415
-            extract_structural_features,
             route_execution_track,
         )
 
-        structural = extract_structural_features(prim_func, ledger=ledger, target=target)
-        if case_ratios is not None:
-            structural = replace(
-                structural,
-                phi_7_inner_contiguous_bytes=case_ratios.inner_contiguous_bytes,
-                phi_8_persistent_wave_occupancy=case_ratios.wave_occupancy_ratio,
-            )
-        features = structural
-        route = route_execution_track(structural)
+        route = route_execution_track(
+            prim_func,
+            ledger=ledger,
+            target=target,
+            case_ratios=case_ratios,
+        )
+        features = dict(route.features) if route.features is not None else None
     if not ledger.is_legal:
         reasons: list[str] = []
         if ledger.max_overflow_bytes > 0:
@@ -3098,9 +3099,14 @@ def run_stage_b_compile(
 
 _CANN_INCLUDE_SUBDIRS: tuple[str, ...] = (
     "include",
+    "x86_64-linux/asc",
+    "x86_64-linux/asc/include",
     "x86_64-linux/include",
+    "aarch64-linux/asc",
+    "aarch64-linux/asc/include",
     "aarch64-linux/include",
     "runtime/include",
+    "asc",
     "asc/include",
     "tools/tikcpp/tikcfw",
     "compiler/tikcpp/tikcfw",
@@ -3536,14 +3542,6 @@ def _detect_tilelang_include_dir() -> str | None:
     return None
 
 
-def _default_asc_devkit_include() -> str:
-    env_devkit = os.environ.get("TILEFOUNDRY_NPU_ASC_DEVKIT_REPO", "").strip()
-    if env_devkit:
-        return str(Path(env_devkit).expanduser() / "include")
-    sibling = Path(__file__).resolve().parents[5].parent / "asc-devkit" / "include"
-    return str(sibling) if sibling.is_dir() else ""
-
-
 def run_stage_b_ascendc_compile(
     cpp_source: str,
     *,
@@ -3551,12 +3549,12 @@ def run_stage_b_ascendc_compile(
     compile_flags: Sequence[str] | str | None = None,
     bisheng_bin: str | Path | None = None,
     cann_root: str | Path | None = None,
-    asc_devkit_include: str | Path | None = None,
+    extra_include_dirs: Sequence[str | Path] | str | Path | None = None,
     timeout_sec: int = 120,
     enable_device_compile: bool = True,
     verify_shared_link: bool = False,
 ) -> StageBResult:
-    """Verify native AscendC C++ translation unit compilation via bisheng in an isolated tempdir."""
+    """Verify dav-3510 C++20 translation unit compilation via bisheng in an isolated tempdir."""
     if not enable_device_compile:
         raise ValueError("enable_device_compile=False bypass has been removed")
     t0 = time.monotonic()
@@ -3578,18 +3576,9 @@ def run_stage_b_ascendc_compile(
     extra_flags = _normalize_flag_list(compile_flags)
     has_explicit_std = any(f.startswith("-std=") for f in extra_flags)
     has_explicit_x = "-x" in extra_flags
-    has_tl_templates = "tl_templates/ascend/" in cpp_source
-    has_kernel_op = bool(
-        re.search(r'^\s*#\s*include\s+[<"]kernel_operator\.h[>"]', cpp_source, re.MULTILINE)
-    )
+    has_tl_templates = "tl_templates/ascend/" in cpp_source or "c_api/asc_" in cpp_source
 
-    std_flags: list[str] = []
-    if not has_explicit_std:
-        std_flags = (
-            ["-std=c++20"]
-            if (has_tl_templates and not has_kernel_op)
-            else ["-std=c++17"]
-        )
+    std_flags: list[str] = [] if has_explicit_std else ["-std=c++20"]
 
     include_flags: list[str] = []
     seen_inc_flags = set(extra_flags)
@@ -3600,13 +3589,15 @@ def run_stage_b_ascendc_compile(
             seen_inc_flags.add(flag)
             include_flags.append(flag)
 
-    asc_inc_str = (
-        str(asc_devkit_include).strip()
-        if asc_devkit_include is not None
-        else _default_asc_devkit_include()
-    )
-    _add_inc(asc_inc_str)
-    if has_tl_templates:
+    if extra_include_dirs is not None:
+        extra_inc_list = (
+            [extra_include_dirs]
+            if isinstance(extra_include_dirs, (str, Path))
+            else list(extra_include_dirs)
+        )
+        for inc_item in extra_inc_list:
+            _add_inc(str(inc_item).strip())
+    if has_tl_templates or True:
         tl_inc = _detect_tilelang_include_dir()
         if tl_inc:
             _add_inc(tl_inc)

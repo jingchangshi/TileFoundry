@@ -10,6 +10,41 @@ origin = "vendor"
 source = "CANN dav-3510 (DaVinci 950) compiler target specification"
 conditions = "Architecture triple name recognized by bisheng and tilelang Ascend backends"
 
+[facts.identity.series]
+value = "ascend_950"
+unit = "name"
+origin = "vendor"
+source = "CANN dav-3510 (DaVinci 950) hardware family specification"
+conditions = "Canonical Ascend 950 architecture family identifier"
+
+[facts.identity.cce_arch]
+value = "dav-3510"
+unit = "name"
+origin = "vendor"
+source = "CANN dav-3510 (DaVinci 950) compiler flag specification"
+conditions = "Compiler flag value passed to bisheng --npu-arch"
+
+[facts.identity.supported_skus]
+value = ["ascend_950pr", "ascend_950dt"]
+unit = "name"
+origin = "vendor"
+source = "Ascend 950 SKU catalog specification"
+conditions = "Device SKUs built on the DaVinci 950 architecture"
+
+[facts.toolchain.default_cann_series]
+value = "cann_9_3"
+unit = "name"
+origin = "vendor"
+source = "CANN dav-3510 toolchain surface snapshot catalog"
+conditions = "Default CANN C++20 surface snapshot selected when unconfigured"
+
+[facts.toolchain.supported_cann_series]
+value = ["cann_9_2", "cann_9_3"]
+unit = "name"
+origin = "vendor"
+source = "CANN dav-3510 toolchain surface snapshot catalog"
+conditions = "Self-contained CANN C++20 surface snapshots supported for dav-3510"
+
 [facts.capabilities]
 value = ["ascend.dma", "ascend.mmad", "ascend.vector", "ascend.dual_copy"]
 unit = "name"
@@ -38,14 +73,14 @@ value = [
 ]
 unit = "name"
 origin = "vendor"
-source = "CANN dav-3510 Cube and Vector instruction reference (asc-devkit / catlass)"
+source = "CANN dav-3510 Cube and Vector instruction reference (CANN_dav3510 / catlass)"
 conditions = "Cube and Vector supported compute dtypes on dav-3510; i4/u4 are forbidden on Cube"
 
 [facts.instruction.forbidden_cube_dtypes]
 value = ["i4", "u4"]
 unit = "name"
 origin = "vendor"
-source = "CANN dav-3510 Cube MMAD specification (asc-devkit / cannbot-dsl)"
+source = "CANN dav-3510 Cube MMAD specification (CANN_dav3510 / cannbot-dsl)"
 conditions = "Cube MMAD hardware does not support int4/uint4 inputs on dav-3510"
 
 [facts.compute.aic_per_block]
@@ -87,28 +122,28 @@ conditions = "32-byte alignment required for UB vector slices and MTE transfers"
 value = 8
 unit = "count"
 origin = "vendor"
-source = "CANN dav-3510 Unified Buffer bank organization (asc-devkit / cannbot-dsl)"
+source = "CANN dav-3510 Unified Buffer bank organization (CANN_dav3510 / cannbot-dsl)"
 conditions = "Unified Buffer is organized into 8 bank groups"
 
 [facts.memory.ub.banks_per_group]
 value = 2
 unit = "count"
 origin = "vendor"
-source = "CANN dav-3510 Unified Buffer bank organization (asc-devkit / cannbot-dsl)"
+source = "CANN dav-3510 Unified Buffer bank organization (CANN_dav3510 / cannbot-dsl)"
 conditions = "Each UB bank group contains 2 banks (16 banks total)"
 
 [facts.memory.ub.bank_bytes]
 value = 16384
 unit = "byte"
 origin = "vendor"
-source = "CANN dav-3510 Unified Buffer bank capacity (asc-devkit / cannbot-dsl)"
+source = "CANN dav-3510 Unified Buffer bank capacity (CANN_dav3510 / cannbot-dsl)"
 conditions = "16 KiB per UB bank (8 * 2 * 16 KiB = 256 KiB total nominal UB)"
 
 [facts.memory.ub.datablock_bytes]
 value = 32
 unit = "byte"
 origin = "vendor"
-source = "CANN dav-3510 Unified Buffer datablock size (asc-devkit / cannbot-dsl)"
+source = "CANN dav-3510 Unified Buffer datablock size (CANN_dav3510 / cannbot-dsl)"
 conditions = "32-byte UB datablock access width"
 
 [facts.memory.l1.align_bytes]
@@ -122,14 +157,14 @@ conditions = "32-byte transfer granularity between GM/UB and L1"
 value = 2
 unit = "count"
 origin = "vendor"
-source = "CANN dav-3510 L1 scratchpad bank organization (asc-devkit / catlass)"
+source = "CANN dav-3510 L1 scratchpad bank organization (CANN_dav3510 / catlass)"
 conditions = "512 KiB L1 is partitioned into 2 independent banks"
 
 [facts.memory.l1.bank_bytes]
 value = 262144
 unit = "byte"
 origin = "vendor"
-source = "CANN dav-3510 L1 scratchpad bank capacity (asc-devkit / catlass)"
+source = "CANN dav-3510 L1 scratchpad bank capacity (CANN_dav3510 / catlass)"
 conditions = "256 KiB per L1 bank (2 * 256 KiB = 512 KiB total L1)"
 
 [facts.memory.l0a.align_bytes]
@@ -143,7 +178,7 @@ conditions = "16x16 fractal matrix alignment for L1 to L0A load"
 value = "NZ"
 unit = "name"
 origin = "vendor"
-source = "CANN dav-3510 Cube L0A fractal layout specification (catlass / asc-devkit)"
+source = "CANN dav-3510 Cube L0A fractal layout specification (catlass / CANN_dav3510)"
 conditions = "L0A left-hand matrix fractal layout is NZ (zN)"
 
 [facts.memory.l0b.align_bytes]
@@ -157,7 +192,7 @@ conditions = "16x16 fractal matrix alignment for L1 to L0B load"
 value = "ZN"
 unit = "name"
 origin = "vendor"
-source = "CANN dav-3510 Cube L0B fractal layout specification (catlass / asc-devkit)"
+source = "CANN dav-3510 Cube L0B fractal layout specification (catlass / CANN_dav3510)"
 conditions = "L0B right-hand matrix fractal layout is ZN (nZ)"
 
 [facts.memory.l0c.align_bytes]
@@ -171,21 +206,21 @@ conditions = "16x16 fp32 fractal accumulator alignment for MMAD and Fixpipe"
 value = "NZ"
 unit = "name"
 origin = "vendor"
-source = "CANN dav-3510 Cube L0C fractal layout specification (catlass / asc-devkit)"
+source = "CANN dav-3510 Cube L0C fractal layout specification (catlass / CANN_dav3510)"
 conditions = "L0C accumulator fractal layout is NZ"
 
 [facts.memory.bias_table.per_aic]
 value = 4096
 unit = "byte"
 origin = "vendor"
-source = "CANN dav-3510 Cube BiasTable buffer specification (asc-devkit / catlass)"
+source = "CANN dav-3510 Cube BiasTable buffer specification (CANN_dav3510 / catlass)"
 conditions = "4 KiB BiasTable scratchpad per AIC core"
 
 [facts.memory.fixbuf.per_aic]
 value = 16384
 unit = "byte"
 origin = "vendor"
-source = "CANN dav-3510 Cube FixPipe buffer specification (asc-devkit / catlass)"
+source = "CANN dav-3510 Cube FixPipe buffer specification (CANN_dav3510 / catlass)"
 conditions = "16 KiB FixBuf capacity per AIC core"
 
 [facts.memory.l2.bytes_per_cycle_per_aic]
@@ -227,7 +262,7 @@ conditions = "16x16x16 f16/bf16 matrix multiply-accumulate per fractal atom"
 value = 4095
 unit = "element"
 origin = "vendor"
-source = "CANN dav-3510 Cube MMAD dimension limit (asc-devkit / catlass)"
+source = "CANN dav-3510 Cube MMAD dimension limit (CANN_dav3510 / catlass)"
 conditions = "Maximum M, N, or K dimension encoded in a single MMAD instruction"
 
 [facts.memory.ssbuf.align_bytes]
@@ -286,89 +321,89 @@ conditions = "Peak FixPipe L0C->UB/L1/GM transfer throughput in bytes per cycle"
 value = 15
 unit = "count"
 origin = "vendor"
-source = "CANN dav-3510 CrossCoreSetFlag / CrossCoreWaitFlag hardware queue limit (cannbot-dsl / asc-devkit)"
+source = "CANN dav-3510 CrossCoreSetFlag / CrossCoreWaitFlag hardware queue limit (cannbot-dsl / CANN_dav3510)"
 conditions = "Maximum hardware cross-core synchronization flag queue depth"
 
 [facts.microarch.hardware_mutex_count]
 value = 28
 unit = "count"
 origin = "vendor"
-source = "CANN dav-3510 hardware mutex register specification (asc-devkit)"
+source = "CANN dav-3510 hardware mutex register specification (CANN_dav3510)"
 conditions = "28 hardware mutex locks available for inter-core synchronization"
 
 [facts.throughput.cube_macs_per_cycle.f4e2m1]
 value = 16384
 unit = "mac/cycle"
 origin = "vendor"
-source = "CANN dav-3510 Cube MMAD throughput table (asc-devkit / catlass / cannbot-dsl)"
+source = "CANN dav-3510 Cube MMAD throughput table (CANN_dav3510 / catlass / cannbot-dsl)"
 conditions = "16384 fp4 (e2m1) MACs per cycle per AIC core"
 
 [facts.throughput.cube_macs_per_cycle.f4e1m2]
 value = 16384
 unit = "mac/cycle"
 origin = "vendor"
-source = "CANN dav-3510 Cube MMAD throughput table (asc-devkit / catlass / cannbot-dsl)"
+source = "CANN dav-3510 Cube MMAD throughput table (CANN_dav3510 / catlass / cannbot-dsl)"
 conditions = "16384 fp4 (e1m2) MACs per cycle per AIC core"
 
 [facts.throughput.cube_macs_per_cycle.fp8e4m3]
 value = 8192
 unit = "mac/cycle"
 origin = "vendor"
-source = "CANN dav-3510 Cube MMAD throughput table (asc-devkit / catlass / cannbot-dsl)"
+source = "CANN dav-3510 Cube MMAD throughput table (CANN_dav3510 / catlass / cannbot-dsl)"
 conditions = "8192 fp8 (e4m3) MACs per cycle per AIC core"
 
 [facts.throughput.cube_macs_per_cycle.fp8e5m2]
 value = 8192
 unit = "mac/cycle"
 origin = "vendor"
-source = "CANN dav-3510 Cube MMAD throughput table (asc-devkit / catlass / cannbot-dsl)"
+source = "CANN dav-3510 Cube MMAD throughput table (CANN_dav3510 / catlass / cannbot-dsl)"
 conditions = "8192 fp8 (e5m2) MACs per cycle per AIC core"
 
 [facts.throughput.cube_macs_per_cycle.hif8]
 value = 8192
 unit = "mac/cycle"
 origin = "vendor"
-source = "CANN dav-3510 Cube MMAD throughput table (asc-devkit / catlass / cannbot-dsl)"
+source = "CANN dav-3510 Cube MMAD throughput table (CANN_dav3510 / catlass / cannbot-dsl)"
 conditions = "8192 HiFloat8 MACs per cycle per AIC core"
 
 [facts.throughput.cube_macs_per_cycle.i8]
 value = 8192
 unit = "mac/cycle"
 origin = "vendor"
-source = "CANN dav-3510 Cube MMAD throughput table (asc-devkit / catlass / cannbot-dsl)"
+source = "CANN dav-3510 Cube MMAD throughput table (CANN_dav3510 / catlass / cannbot-dsl)"
 conditions = "8192 int8 MACs per cycle per AIC core"
 
 [facts.throughput.cube_macs_per_cycle.u8]
 value = 8192
 unit = "mac/cycle"
 origin = "vendor"
-source = "CANN dav-3510 Cube MMAD throughput table (asc-devkit / catlass / cannbot-dsl)"
+source = "CANN dav-3510 Cube MMAD throughput table (CANN_dav3510 / catlass / cannbot-dsl)"
 conditions = "8192 uint8 MACs per cycle per AIC core"
 
 [facts.throughput.cube_macs_per_cycle.f16]
 value = 4096
 unit = "mac/cycle"
 origin = "vendor"
-source = "CANN dav-3510 Cube MMAD throughput table (asc-devkit / catlass / cannbot-dsl)"
+source = "CANN dav-3510 Cube MMAD throughput table (CANN_dav3510 / catlass / cannbot-dsl)"
 conditions = "4096 fp16 MACs per cycle per AIC core"
 
 [facts.throughput.cube_macs_per_cycle.bf16]
 value = 4096
 unit = "mac/cycle"
 origin = "vendor"
-source = "CANN dav-3510 Cube MMAD throughput table (asc-devkit / catlass / cannbot-dsl)"
+source = "CANN dav-3510 Cube MMAD throughput table (CANN_dav3510 / catlass / cannbot-dsl)"
 conditions = "4096 bf16 MACs per cycle per AIC core"
 
 [facts.throughput.cube_macs_per_cycle.hf32]
 value = 2048
 unit = "mac/cycle"
 origin = "vendor"
-source = "CANN dav-3510 Cube MMAD throughput table (asc-devkit / catlass / cannbot-dsl)"
+source = "CANN dav-3510 Cube MMAD throughput table (CANN_dav3510 / catlass / cannbot-dsl)"
 conditions = "2048 hf32 MACs per cycle per AIC core"
 
 [facts.throughput.cube_macs_per_cycle.f32]
 value = 256
 unit = "mac/cycle"
 origin = "vendor"
-source = "CANN dav-3510 Cube MMAD throughput table (asc-devkit / catlass / cannbot-dsl)"
+source = "CANN dav-3510 Cube MMAD throughput table (CANN_dav3510 / catlass / cannbot-dsl)"
 conditions = "256 IEEE fp32 MACs per cycle per AIC core"

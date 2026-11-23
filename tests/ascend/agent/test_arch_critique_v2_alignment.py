@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from tilefoundry_ascend.agent.kb import AscendCausalRule, BayesianRuleTracker
 from tilefoundry_ascend.agent.router import (
-    ASCEND_DEVKIT_ISA_CATALOG,
+    DAV3510_CANN_ISA_CATALOG,
     VALID_HARDWARE_PIPES,
     PipeGapReport,
     scan_tilelang_pipe_gaps,
@@ -343,7 +343,7 @@ def test_orthogonal_7_hardware_pipes_taxonomy_and_gap_scanner() -> None:
         "pipe_sync_barrier_mutex",
     )
 
-    for spec in ASCEND_DEVKIT_ISA_CATALOG:
+    for spec in DAV3510_CANN_ISA_CATALOG:
         assert spec.hardware_pipe in VALID_HARDWARE_PIPES
 
     pipe_report = scan_tilelang_pipe_gaps()

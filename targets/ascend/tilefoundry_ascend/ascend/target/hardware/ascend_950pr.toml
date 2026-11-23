@@ -108,7 +108,7 @@ conditions = "512 KiB L1 buffer per AIC core"
 value = 134217728
 unit = "byte"
 origin = "vendor"
-source = "CANN dav-3510 L2 cache specification (asc-devkit / catlass)"
+source = "CANN dav-3510 L2 cache specification (CANN_dav3510 / catlass)"
 conditions = "128 MiB device-shared L2 cache capacity"
 
 [facts.memory.l0a.per_aic]

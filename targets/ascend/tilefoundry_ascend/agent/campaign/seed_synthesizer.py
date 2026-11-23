@@ -6,6 +6,7 @@ import ast
 import hashlib
 import json
 import logging
+import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -957,6 +958,60 @@ class Stage0StaticValidatorFactory(Protocol):
         ...
 
 
+def _validate_stage0_entrypoint_and_alias(
+    module_source: str,
+    contract: GoldenEntrypointContract,
+) -> str:
+    """Verify exact entrypoint definition, kernel alias binding, and signature ABI."""
+    try:
+        tree = ast.parse(module_source)
+    except SyntaxError as exc:
+        return f"seed module syntax error: {exc}"
+    if not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == contract.entrypoint
+        for node in tree.body
+    ):
+        return f"seed module does not define the public entrypoint {contract.entrypoint}"
+    kernel_target: str | None = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            continue
+        if any(isinstance(target, ast.Name) and target.id == "kernel" for target in targets):
+            kernel_target = value.id if isinstance(value, ast.Name) else ""
+    if kernel_target != contract.entrypoint:
+        return f"seed module does not bind `kernel = {contract.entrypoint}`"
+    return validate_entrypoint_signature_compatibility(module_source, contract)
+
+
+def _extract_oracle_numeric_error(oracle_detail: str) -> float | None:
+    """Extract the primary finite numerical error metric from an L3 oracle detail string."""
+    if not oracle_detail:
+        return None
+    for key in ("max_abs_diff", "max_diff", "mere", "mare", "abs_diff"):
+        match = re.search(
+            rf"\b{key}\s*[=:]\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|nan|inf|-inf)\b",
+            oracle_detail,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            continue
+        try:
+            val = float(match.group(1))
+        except ValueError:
+            continue
+        if not math.isfinite(val) or val < 0.0:
+            return None
+        return val
+    return None
+
+
 async def prepare_operator_seed_or_takeover(
     *,
     operator_name: str,
@@ -973,6 +1028,7 @@ async def prepare_operator_seed_or_takeover(
     scheduled_hir_source: str | None = None,
     force_cold_start: bool = False,
     max_seed_attempts: int = 4,
+    max_oracle_refinement_extension: int = 4,
     max_transport_retries: int = 2,
     max_env_retries: int = 3,
     desc_text: str = "",
@@ -1092,6 +1148,8 @@ async def prepare_operator_seed_or_takeover(
             escalation_tier=tier,
             freedom_mask=ConstraintRelaxationMask.top(),
             blueprint=first_bp,
+            topology_axes=semantics.base_axes,
+            case_ratios=ratios[0] if ratios else None,
         )
         params = _seed_parameter_specs(specs)
         s_prompt = _seed_system_prompt(
@@ -1127,6 +1185,8 @@ async def prepare_operator_seed_or_takeover(
         blueprint_block,
     ) = _prepare_track_state(active_track)
 
+    base_attempts = max(1, max_seed_attempts)
+    max_extra_attempts = max(0, max_oracle_refinement_extension)
     last_error = ""
     last_rejected_source: str | None = None
     last_rejected_error = ""
@@ -1136,6 +1196,8 @@ async def prepare_operator_seed_or_takeover(
     track_a_static_failures = 0
     track_a_oracle_attempts = 0
     last_l0_l1_passing_dsl_source: str | None = None
+    attempt_stages: list[Literal["static", "oracle"]] = []
+    oracle_errors: list[float] = []
     track_a_budget = (
         max(2, max_seed_attempts // 2)
         if active_track == "tilelang_dsl" and max_seed_attempts >= 4
@@ -1147,6 +1209,7 @@ async def prepare_operator_seed_or_takeover(
         candidate_source: str,
         *,
         stage: Literal["static", "oracle"] = "static",
+        oracle_error: float | None = None,
     ) -> None:
         nonlocal active_track, attempt, blueprint_block, constraint_block, contract_block
         nonlocal l0_l1_validator, last_error, last_rejected_error, last_rejected_source
@@ -1158,6 +1221,11 @@ async def prepare_operator_seed_or_takeover(
             last_rejected_source = last_l0_l1_passing_dsl_source
         else:
             last_rejected_source = candidate_source
+        attempt_stages.append(stage)
+        if stage == "oracle" and oracle_error is not None:
+            oracle_errors.append(oracle_error)
+        else:
+            oracle_errors.clear()
         if active_track == "tilelang_dsl":
             if stage == "static":
                 track_a_static_failures += 1
@@ -1169,7 +1237,7 @@ async def prepare_operator_seed_or_takeover(
             and last_l0_l1_passing_dsl_source is None
             and track_a_budget > 0
             and track_a_static_failures >= track_a_budget
-            and attempt <= max_seed_attempts
+            and attempt <= base_attempts
         ):
             fallback_track = select_fallback_track_from_semantics(
                 semantics,
@@ -1199,7 +1267,20 @@ async def prepare_operator_seed_or_takeover(
                 last_rejected_source = None
                 last_rejected_error = ""
 
-    while attempt <= max(1, max_seed_attempts):
+    def _should_continue_seed_loop() -> bool:
+        if attempt <= base_attempts:
+            return True
+        if attempt > base_attempts + max_extra_attempts:
+            return False
+        return (
+            len(attempt_stages) >= 2
+            and attempt_stages[-1] == "oracle"
+            and attempt_stages[-2] == "oracle"
+            and len(oracle_errors) >= 2
+            and oracle_errors[-1] < 0.95 * oracle_errors[-2]
+        )
+
+    while _should_continue_seed_loop():
         attempts_used = attempt
         request = GenerationRequest(
             role=(
@@ -1233,6 +1314,23 @@ async def prepare_operator_seed_or_takeover(
             continue
 
         transport_retries = 0
+        if golden_contract is not None:
+            entry_err = _validate_stage0_entrypoint_and_alias(synthesized_src, golden_contract)
+            if entry_err:
+                logger.info(
+                    "STAGE0_ATTEMPT op=%s attempt=%d track=%s stage=entrypoint_contract detail=%s",
+                    operator_name,
+                    attempt,
+                    active_track,
+                    entry_err.replace("\n", " ")[:500],
+                )
+                _record_candidate_failure(
+                    f"Stage-0 entrypoint contract rejection:\n{entry_err}",
+                    synthesized_src,
+                    stage="static",
+                )
+                continue
+
         ok_static, static_err = l0_l1_validator(synthesized_src, active_track)
         if not ok_static:
             logger.info(
@@ -1329,6 +1427,7 @@ async def prepare_operator_seed_or_takeover(
             f"NPU numerical mismatch against PyTorch golden:\n{oracle_detail}",
             synthesized_src,
             stage="oracle",
+            oracle_error=_extract_oracle_numeric_error(oracle_detail),
         )
 
     raise RuntimeError(

@@ -1,8 +1,8 @@
 rules:
   - rule_id: R01_DUAL_COPY_1C2V_SPLIT
     symptom_family: COMPUTE_1C2V_SUBCORE_IMBALANCE
-    regime_guard: "(AIV0.PIPE_V > 0 or cube_to_vector_ratio > 0.0) and (l0_cube_cycles > 0 or l2_aic_mac_ratio > 0.01)"
-    precondition: "(l0_cube_cycles > 0 or l2_aic_mac_ratio > 0.01) and AIV0.PIPE_V > 0 and AIV1.PIPE_V == 0"
+    regime_guard: "(AIV0.PIPE_V > 0 or cube_to_vector_ratio > 0.0) and (l0_cube_cycles > 0 or (l2_pmu_available == 1 and l2_aic_mac_ratio > 0.01))"
+    precondition: "(l0_cube_cycles > 0 or (l2_pmu_available == 1 and l2_aic_mac_ratio > 0.01)) and AIV0.PIPE_V > 0 and AIV1.PIPE_V == 0"
     anti_precondition: "any_overflow_bytes > 0 or (has_simtvf and cube_to_vector_ratio == 0.0)"
     transform_template: |
       Partition the dominant output-row tile extent evenly across the two paired vector sub-cores
@@ -23,14 +23,14 @@ rules:
   - rule_id: R02_ONCHIP_L0C_TO_UB_DIRECT
     symptom_family: DMA_REDUNDANT_GM_ROUNDTRIP
     regime_guard: "cube_to_vector_ratio > 0.0"
-    precondition: "AIC.PIPE_FIX > 0 and (gm_roundtrip_bytes > 0 or (AIV0.PIPE_MTE2 > 0 and (UB.implicit_bloat_bytes > 0 or steady_state_ii > 1 or measured_mte2_wait_ratio > 0.2)))"
+    precondition: "AIC.PIPE_FIX > 0 and (gm_roundtrip_bytes > 0 or (AIV0.PIPE_MTE2 > 0 and (UB.implicit_bloat_bytes > 0 or steady_state_ii > 1 or (l2_pmu_available == 1 and measured_mte2_wait_ratio > 0.2))))"
     anti_precondition: "UB.overflow_bytes > 0 or L1.overflow_bytes > 0"
     transform_template: |
       Eliminate global-memory intermediate roundtrips between matrix accumulation and vector
       post-processing by routing direct on-chip L0C->UB via T.dual_copy(l0c, ub, unit_flag_ctrl=3)
       and UB->L1 feedback via on-chip buffers; never emit deprecated L1->GM stores.
     expected_postcondition: "(gm_roundtrip_bytes < prev.gm_roundtrip_bytes or AIV0.PIPE_MTE2 <= prev.AIV0.PIPE_MTE2) and is_legal"
-    source_provenance: "ref:asc_devkit"
+    source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 3.0
     beta_prior: 1.0
     priority: 15
@@ -84,7 +84,7 @@ rules:
   - rule_id: R05_SSBUF_RING_METADATA_HANDOFF
     symptom_family: SYNC_BARRIER_SERIALIZATION
     regime_guard: "has_indirect_gather or has_dynamic_control or has_online_rescale_loop or SSBUF.explicit_bytes > 0"
-    precondition: "measured_sync_stall_ratio > 0.15 or (has_dynamic_control and (PIPE_V > 0 or cube_to_vector_ratio > 0.0))"
+    precondition: "(l2_pmu_available == 1 and measured_sync_stall_ratio > 0.15) or (has_dynamic_control and (PIPE_V > 0 or cube_to_vector_ratio > 0.0))"
     anti_precondition: "pseudo_double_buffer_serialized or SSBUF.overflow_bytes > 0"
     transform_template: |
       Move small cross-core descriptors, offsets, and rescale scalars into 8B-aligned 3 KiB SSBUF
@@ -138,7 +138,7 @@ rules:
   - rule_id: R08_PERSISTENT_SWIZZLE_L2_LOCALITY
     symptom_family: DMA_L2_THRASH_REUSE_MISS
     regime_guard: "wave_occupancy >= 0.75 or grid_blocks >= 28"
-    precondition: "predicted_bottleneck_util > 0.75 and (unexplained_gap_ratio > 0.25 or measured_mte2_wait_ratio > 0.25)"
+    precondition: "predicted_bottleneck_util > 0.75 and l2_pmu_available == 1 and (unexplained_gap_ratio > 0.25 or measured_mte2_wait_ratio > 0.25)"
     anti_precondition: "transfer_inflation_ratio > 1.35 and gm_roundtrip_bytes > 0"
     transform_template: |
       Wrap block dispatch in T.Persistent with 2D diagonal/group swizzling across active AIC groups
@@ -178,7 +178,7 @@ rules:
   - rule_id: R10_BACKWARD_SYNC_CV_PINGPONG
     symptom_family: SYNC_BARRIER_SERIALIZATION
     regime_guard: "cube_to_vector_ratio > 0.0 and (has_dynamic_control or PIPE_V > 0)"
-    precondition: "steady_state_ii > 1 or measured_sync_stall_ratio > 0.12"
+    precondition: "steady_state_ii > 1 or (l2_pmu_available == 1 and measured_sync_stall_ratio > 0.12)"
     anti_precondition: "pseudo_double_buffer_serialized or any_overflow_bytes > 0"
     transform_template: |
       Decouple AIC producer and dual-AIV consumer execution using dual-slot ping-pong parity
@@ -198,7 +198,7 @@ rules:
   - rule_id: R11_L2_NZ_PAD_BANK_CONFLICT_AVOID
     symptom_family: SRAM_UB_L1_BANK_CONFLICT
     regime_guard: "dominant_contig_bytes >= 64 and dominant_contig_bytes % 256 == 0 and ub_utilization_ratio <= 0.75"
-    precondition: "unexplained_gap_ratio > 0.25 and (measured_mte2_wait_ratio > 0.15 or measured_aiv_vec_ratio > 0.0)"
+    precondition: "l2_pmu_available == 1 and unexplained_gap_ratio > 0.25 and (measured_mte2_wait_ratio > 0.15 or measured_aiv_vec_ratio > 0.0)"
     anti_precondition: "spill_bytes > 0 or ub_occupancy_ratio > 0.82"
     transform_template: |
       Pad internal N1 fractal major stride or stagger per-subcore UB bank offsets on 2D NZ scratchpads
@@ -217,7 +217,7 @@ rules:
   - rule_id: R12_UNIT_FLAG_FIXPIPE_CHAIN_FUSION
     symptom_family: SYNC_BARRIER_SERIALIZATION
     regime_guard: "cube_to_vector_ratio > 0.0 and AIC.PIPE_M > 0 and AIC.PIPE_FIX > 0"
-    precondition: "steady_state_ii > 1 or measured_sync_stall_ratio > 0.15"
+    precondition: "steady_state_ii > 1 or (l2_pmu_available == 1 and measured_sync_stall_ratio > 0.15)"
     anti_precondition: "pseudo_double_buffer_serialized"
     transform_template: |
       Enable hardware unit_flag handoff between T.gemm(unit_flag_ctrl=2/3) and its downstream
@@ -299,7 +299,7 @@ rules:
       alignment, and replace scalar T.SimtVF loops with predicated vector T.SimdVF() tail masking
       so DMA bursts stay aligned and SIMD pipelines run without scalar fallback or bypass stores.
     expected_postcondition: "unaligned_dma_padding_bytes < prev.unaligned_dma_padding_bytes or not has_simtvf or dma_burst_efficiency_ratio > prev.dma_burst_efficiency_ratio"
-    source_provenance: "ref:asc_devkit"
+    source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 14
@@ -345,7 +345,7 @@ rules:
       tail block start row0 = min(block_idx * tile_rows, total_rows - tile_rows) to eliminate
       predicated cleanup branches.
     expected_postcondition: "dma_burst_efficiency_ratio > prev.dma_burst_efficiency_ratio or wave_occupancy > prev.wave_occupancy or measured_latency_us < prev.measured_latency_us"
-    source_provenance: "ref:asc_devkit"
+    source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 14
@@ -358,7 +358,7 @@ rules:
   - rule_id: R19_STATIC_PINGPONG_UNROLL_NO_ALIAS
     symptom_family: SYNC_PSEUDO_DOUBLE_BUFFER
     regime_guard: "is_legal and (uses_dynamic_offset_pipelining or pseudo_double_buffer_serialized or in_loop_pipe_all_barriers > 0)"
-    precondition: "pseudo_double_buffer_serialized or in_loop_pipe_all_barriers > 0 or measured_mte2_wait_ratio >= 0.32 or measured_sync_stall_ratio >= 0.20"
+    precondition: "pseudo_double_buffer_serialized or in_loop_pipe_all_barriers > 0 or (l2_pmu_available == 1 and (measured_mte2_wait_ratio >= 0.32 or measured_sync_stall_ratio >= 0.20))"
     anti_precondition: "any_overflow_bytes > 0 or (pipeline_depth >= 2 and in_loop_pipe_all_barriers == 0 and not pseudo_double_buffer_serialized and measured_mte2_wait_ratio >= 0.40)"
     transform_template: |
       Replace T.Pipelined(..., annotations={"enable_offset": True}) dynamic modulo buffer
@@ -367,7 +367,7 @@ rules:
       writeback completes, and prune redundant end-of-tile PIPE_ALL barriers so backend codegen
       avoids pointer-alias serialization.
     expected_postcondition: "not uses_dynamic_offset_pipelining or in_loop_pipe_all_barriers < prev.in_loop_pipe_all_barriers or measured_mte2_wait_ratio < prev.measured_mte2_wait_ratio or measured_latency_us < prev.measured_latency_us"
-    source_provenance: "ref:asc_devkit"
+    source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 15
@@ -376,8 +376,8 @@ rules:
 
   - rule_id: R20_LOOP_FISSION_REDUCE_SFU_HIDING
     symptom_family: COMPUTE_INEFFECTIVE_THROUGHPUT
-    regime_guard: "is_legal and PIPE_M == 0 and PIPE_V > 0 and (has_coupled_reduce_sfu_accum or (0.0 < effective_compute_eta < 0.45 and measured_aiv_vec_ratio >= 0.35))"
-    precondition: "(has_coupled_reduce_sfu_accum and (dominant_pipe in ('PIPE_V', 'AIV0.PIPE_V', 'AIV1.PIPE_V') or measured_aiv_vec_ratio >= 0.35)) or (0.0 < effective_compute_eta < 0.45 and measured_aiv_vec_ratio >= 0.35)"
+    regime_guard: "is_legal and PIPE_M == 0 and PIPE_V > 0 and (has_coupled_reduce_sfu_accum or (l2_pmu_available == 1 and 0.0 < effective_compute_eta < 0.45 and measured_aiv_vec_ratio >= 0.35))"
+    precondition: "(has_coupled_reduce_sfu_accum and (dominant_pipe in ('PIPE_V', 'AIV0.PIPE_V', 'AIV1.PIPE_V') or (l2_pmu_available == 1 and measured_aiv_vec_ratio >= 0.35))) or (l2_pmu_available == 1 and 0.0 < effective_compute_eta < 0.45 and measured_aiv_vec_ratio >= 0.35)"
     anti_precondition: "effective_compute_eta >= 0.60 or ub_occupancy_ratio > 0.82 or spill_bytes > 0"
     transform_template: |
       Split coupled reduce+SFU+wide-accumulation loops into two sequential loops (loop fission):
@@ -386,7 +386,7 @@ rules:
       streams wide vector multiply (T.simd.vmuls / vmul instead of elementwise vdiv) and
       vfma accumulation across vector chunks with short independent dependency chains.
     expected_postcondition: "not has_coupled_reduce_sfu_accum or measured_latency_us < prev.measured_latency_us"
-    source_provenance: "ref:asc_devkit"
+    source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 17
@@ -410,7 +410,7 @@ rules:
       UB/workspace before streaming disjoint 64-element-aligned output chunks in parallel across
       the full num_aiv_cores pool.
     expected_postcondition: "wave_occupancy > prev.wave_occupancy or grid_blocks > prev.grid_blocks or measured_latency_us < prev.measured_latency_us"
-    source_provenance: "ref:asc_devkit"
+    source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 19
@@ -423,7 +423,7 @@ rules:
   - rule_id: R22_HALF_L1_BANK_ISOLATION
     symptom_family: SRAM_UB_L1_BANK_CONFLICT
     regime_guard: "cube_to_vector_ratio > 0.0 and is_legal"
-    precondition: "l1_bank_conflict_risk > 0.0 or (L1.peak_allocated_bytes > 262144 and (measured_mte2_wait_ratio > 0.15 or unexplained_gap_ratio > 0.20))"
+    precondition: "l1_bank_conflict_risk > 0.0 or (L1.peak_allocated_bytes > 262144 and l2_pmu_available == 1 and (measured_mte2_wait_ratio > 0.15 or unexplained_gap_ratio > 0.20))"
     anti_precondition: "spill_bytes > 0 or L1.overflow_bytes > 0"
     transform_template: |
       Partition L1 ping/pong slots across the two 256 KiB physical L1 banks using
@@ -451,7 +451,7 @@ rules:
       base offsets by +8 DataBlocks (+256 B) across the 8x2x16 KiB UB bank groups so
       DATA_BLOCK_COPY ND2NZ and RegBase vector loads avoid 16-bank port collisions.
     expected_postcondition: "ub_bank_conflict_risk < prev.ub_bank_conflict_risk or PIPE_V < prev.PIPE_V or unexplained_gap_ratio < prev.unexplained_gap_ratio"
-    source_provenance: "ref:asc_devkit"
+    source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.8
     beta_prior: 1.0
     priority: 17
@@ -507,7 +507,7 @@ rules:
   - rule_id: R26_SWAT_SNAKE_AND_TAIL_WAVE_SPLIT
     symptom_family: DMA_L2_THRASH_REUSE_MISS
     regime_guard: "cube_to_vector_ratio > 0.0 and (not grid_is_symbolic)"
-    precondition: "(grid_blocks > num_aic_cores and (l2_hit_rate < 0.80 or measured_mte2_wait_ratio > 0.20)) or (0.0 < wave_occupancy and wave_occupancy <= 0.50)"
+    precondition: "(grid_blocks > num_aic_cores and l2_pmu_available == 1 and (l2_hit_rate < 0.80 or measured_mte2_wait_ratio > 0.20)) or (0.0 < wave_occupancy and wave_occupancy <= 0.50)"
     anti_precondition: "transfer_inflation_ratio > 1.35 and gm_roundtrip_bytes > 0"
     transform_template: |
       Apply WINDOW_LEN=4 SWAT serpentine tile ordering along M/N for L2 spatial locality and
@@ -527,7 +527,7 @@ rules:
   - rule_id: R27_L2_CACHE_BYPASS_SINGLE_USE
     symptom_family: DMA_L2_THRASH_REUSE_MISS
     regime_guard: "PIPE_M > 0 or PIPE_MTE2 > 0"
-    precondition: "l2_hit_rate < 0.70 and (measured_mte2_wait_ratio > 0.15 or grid_blocks <= num_aic_cores)"
+    precondition: "l2_pmu_available == 1 and l2_hit_rate < 0.70 and (measured_mte2_wait_ratio > 0.15 or grid_blocks <= num_aic_cores)"
     anti_precondition: "transfer_inflation_ratio > 1.35 and gm_roundtrip_bytes > 0"
     transform_template: |
       Apply SetL2CacheHint(CACHE_MODE_DISABLE) on single-use streaming operands (e.g., B matrix
@@ -610,7 +610,7 @@ rules:
   - rule_id: R31_SIMT_UB_PRIVATIZED_ATOMICS
     symptom_family: SYNC_BARRIER_SERIALIZATION
     regime_guard: "has_indirect_gather"
-    precondition: "has_indirect_gather and (spill_bytes > 0 or measured_sync_stall_ratio > 0.10 or PIPE_V > 0)"
+    precondition: "has_indirect_gather and (spill_bytes > 0 or (l2_pmu_available == 1 and measured_sync_stall_ratio > 0.10) or PIPE_V > 0)"
     anti_precondition: "pseudo_double_buffer_serialized or UB.overflow_bytes > 0"
     transform_template: |
       For irregular gather/scatter/hash/histogram ops, allocate contention-free privatized
@@ -633,7 +633,7 @@ rules:
   - rule_id: R32_GROUPED_ROLLING_CORE_AND_EMPTY_SKIP
     symptom_family: GRID_TAIL_WAVE_UNDERUTIL
     regime_guard: "cube_to_vector_ratio > 0.0 and (has_empty_group or iteration_regularity == 'ragged_group' or memory_ring == 'l0c_ub_epilogue')"
-    precondition: "has_empty_group or wave_occupancy < 0.85 or measured_sync_stall_ratio > 0.10"
+    precondition: "has_empty_group or wave_occupancy < 0.85 or (l2_pmu_available == 1 and measured_sync_stall_ratio > 0.10)"
     anti_precondition: "pseudo_double_buffer_serialized"
     transform_template: |
       Schedule grouped matrix tiles with continuous cross-group core rotation
@@ -677,15 +677,15 @@ rules:
   - rule_id: R34_SCALAR_LOOP_TO_VECTOR_DMA_PIPELINE
     symptom_family: SCALAR_LOOP_TRAP
     regime_guard: "is_legal"
-    precondition: "scalar_compute_loop_fallback > 0 or ((l2_aiv_vec_ratio < 0.05 and l2_aic_mac_ratio < 0.02) and ((l0_cube_cycles == 0 and l0_vec_cycles == 0 and not has_simtvf) or (has_l1_compiler_summary and l1_vec_regs == 0)))"
-    anti_precondition: "l2_aiv_vec_ratio >= 0.15 or l2_aic_mac_ratio >= 0.05"
+    precondition: "scalar_compute_loop_fallback > 0 or ub_scalar_compute_loops > 0 or (l0_cube_cycles == 0 and l0_vec_cycles == 0 and not has_simtvf) or (l2_pmu_available == 1 and aiv_vec_ratio < 0.15 and aic_mac_ratio < 0.10)"
+    anti_precondition: "contig_atom_ratio < 1.0 or (l2_pmu_available == 1 and aiv_vec_ratio >= 0.15)"
     transform_template: |
       Replace scalar per-element global-memory loops with contiguous GM->UB (and GM->L1->L0C
       for matmul/attention) DMA block transfers followed by wide SIMD vector execution under
       T.SimdVF / simd_inst::* (or T.gemm / asc_mmad for matrix tiles) so vector/cube pipes
       stay saturated instead of stalling on PIPE_S scalar memory accesses.
     expected_postcondition: "l0_vec_cycles > 0 or l0_cube_cycles > 0"
-    source_provenance: "ref:asc_devkit"
+    source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 3.5
     beta_prior: 1.0
     priority: 1
@@ -720,7 +720,7 @@ rules:
   - rule_id: R36_SUBATOM_CONTIGUOUS_ALIGNED_CORE_SLICE
     symptom_family: DMA_UNALIGNED_SHORT_BURST
     regime_guard: "is_legal and (not has_indirect_gather) and (PIPE_V > 0 or PIPE_MTE2 > 0 or has_simtvf)"
-    precondition: "contig_atom_ratio < 1.0 and (l2_hit_rate < 0.55 or dma_burst_efficiency_ratio < 0.85 or transfer_inflation_ratio > 1.02)"
+    precondition: "contig_atom_ratio < 1.0 and ((l2_pmu_available == 1 and l2_hit_rate < 0.55) or dma_burst_efficiency_ratio < 0.85 or transfer_inflation_ratio > 1.02)"
     anti_precondition: "any_overflow_bytes > 0 or has_indirect_gather"
     transform_template: |
       When contig_atom_ratio < 1.0, partition work across AIV cores in contiguous multi-row
@@ -728,7 +728,7 @@ rules:
       each core issues full aligned GM->UB and UB->GM bursts without L2 cache-line thrashing
       or partial writeback amplification.
     expected_postcondition: "l2_hit_rate > prev.l2_hit_rate or dma_burst_efficiency_ratio > prev.dma_burst_efficiency_ratio or transfer_inflation_ratio < prev.transfer_inflation_ratio or measured_latency_us < prev.measured_latency_us"
-    source_provenance: "ref:asc_devkit"
+    source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 13
@@ -741,7 +741,7 @@ rules:
   - rule_id: R37_SIMTVF_MULTIROW_ILP_CONSTANT_HOIST
     symptom_family: COMPUTE_INEFFECTIVE_THROUGHPUT
     regime_guard: "is_legal and has_simtvf"
-    precondition: "has_simtvf and l2_aiv_vec_ratio >= 0.50 and 0.0 < effective_compute_eta < 0.35"
+    precondition: "has_simtvf and l2_pmu_available == 1 and l2_aiv_vec_ratio >= 0.50 and 0.0 < effective_compute_eta < 0.35"
     anti_precondition: "spill_bytes > 0 or any_overflow_bytes > 0"
     transform_template: |
       Inside T.SimtVF kernels with high vector activity but low effective throughput, hoist
@@ -749,7 +749,7 @@ rules:
       process multiple independent elements or rows per thread to expose instruction-level
       parallelism, and eliminate redundant divisions or repeated UB loads per inner step.
     expected_postcondition: "effective_compute_eta > prev.effective_compute_eta or measured_latency_us < prev.measured_latency_us"
-    source_provenance: "ref:asc_devkit"
+    source_provenance: "ref:cann_dav3510_isa"
     alpha_prior: 2.5
     beta_prior: 1.0
     priority: 15
@@ -758,3 +758,64 @@ rules:
       Hoist loop-invariant constants and scalar reciprocals outside __simt_vf__ inner loops and
       unroll multi-row/multi-element accumulators per thread to increase ILP without UB spills.
     rationale: "Hoisting loop-invariant constants and multi-row ILP removes SIMT latency bubbles and redundant UB/SFU stalls."
+
+  - rule_id: R38_COALESCE_SUB32B_TAIL_DMA_STORE
+    symptom_family: DMA_UNALIGNED_SHORT_BURST
+    regime_guard: "is_legal and (PIPE_MTE3 > 0 or PIPE_V > 0) and (not has_indirect_gather)"
+    precondition: "dcache_bypass_narrow_store > 0.0 or (0 < min_gm_dma_bytes < 32) or (unaligned_dma_padding_bytes > 0 and contig_atom_ratio >= 1.0)"
+    anti_precondition: "any_overflow_bytes > 0 or transfer_inflation_ratio > 1.35"
+    transform_template: |
+      Coalesce sub-32B tail global-memory stores inside UB into 32B-aligned contiguous bursts
+      via T.copy / asc_copy_ub2gm_align() instead of emitting narrow DCache-bypass scalar GM
+      writes that amplify 64B cache-line writeback traffic on dav-3510.
+    expected_postcondition: "dcache_bypass_narrow_store < prev.dcache_bypass_narrow_store or min_gm_dma_bytes >= 32 or unaligned_dma_padding_bytes < prev.unaligned_dma_padding_bytes"
+    source_provenance: "ref:cann_dav3510_isa"
+    alpha_prior: 2.8
+    beta_prior: 1.0
+    priority: 14
+    compatible_backends: ["tilelang_dsl", "cce_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Stage sub-32B tail outputs in __ubuf__ and emit 32B-aligned asc_copy_ub2gm_align()
+      bursts instead of narrow scalar GM stores or write_gm_bypass_dcache.
+    rationale: "Coalescing sub-32B tail stores in UB eliminates 64B DCache-bypass writeback amplification."
+
+  - rule_id: R39_COUPLED_1C2V_FIXPIPE_L0C2UB_15ARG_PIPELINE
+    symptom_family: COMPUTE_FIXPIPE_ACCUM_IMBALANCE
+    regime_guard: "is_legal and cube_to_vector_ratio > 0.0 and (AIC.PIPE_FIX > 0 or l0_cube_cycles > 0)"
+    precondition: "AIC.PIPE_FIX > 0 and (steady_state_ii > 1 or gm_roundtrip_bytes > 0 or AIV1.PIPE_V == 0)"
+    anti_precondition: "UB.overflow_bytes > 0 or L0C.overflow_bytes > 0"
+    transform_template: |
+      Route coupled 1C2V FixPipe drain directly from L0C to UB using the dav-3510
+      asc_copy_l0c2ub() 15-arg hardware epilogue pipeline (fused dequant scale, clip, and
+      unit_flag handoff) across paired AIV0/AIV1 sub-cores so FixPipe overlaps with subsequent
+      MMAD accumulation.
+    expected_postcondition: "steady_state_ii <= prev.steady_state_ii and gm_roundtrip_bytes <= prev.gm_roundtrip_bytes"
+    source_provenance: "ref:cann_dav3510_isa"
+    alpha_prior: 2.8
+    beta_prior: 1.0
+    priority: 16
+    compatible_backends: ["cce_trackb", "hybrid_trackb", "tilelang_dsl"]
+    cpp20_transform_template: |
+      Use dav-3510 asc_copy_l0c2ub() with fused FixPipe scale/clip operands and paired
+      asc_sync_notify flags across AIV0/AIV1 sub-cores instead of draining through GM.
+    rationale: "Fused 1C2V L0C->UB FixPipe pipelining eliminates intermediate GM traffic and sub-core drain bubbles."
+
+  - rule_id: R40_SIMTVF_FP32_WIDEN_BEFORE_SUBBYTE_QUANT
+    symptom_family: COMPUTE_VECTOR_LOOP_DEGRADED
+    regime_guard: "is_legal and has_lowbit_quant and (PIPE_V > 0 or has_simtvf)"
+    precondition: "has_lowbit_quant and (has_simtvf or (not vloopv2_hit) or spill_bytes > 0)"
+    anti_precondition: "UB.overflow_bytes > 0 or ub_occupancy_ratio > 0.88"
+    transform_template: |
+      Widen sub-byte (FP4/FP8/INT4) operands to FP32 in UB or RegBase vector registers before
+      applying per-group scale, reciprocal, and rounding/clamp inside __simd_vf__ or
+      __simt_vf__, then pack cleanly on store without scalar per-element fallback loops.
+    expected_postcondition: "spill_bytes <= prev.spill_bytes and is_legal"
+    source_provenance: "ref:cann_dav3510_isa"
+    alpha_prior: 2.7
+    beta_prior: 1.0
+    priority: 18
+    compatible_backends: ["tilelang_dsl", "cce_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Widen sub-byte operands to float32 inside __simd_vf__ / __simt_vf__ before scale and
+      clamp arithmetic, then emit packed SIMD/aligned UB stores.
+    rationale: "FP32 widening before sub-byte quantization prevents precision loss, scalar fallback, and register spills."

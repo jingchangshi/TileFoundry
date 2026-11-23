@@ -11,6 +11,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
+
 _UNIT_MULTIPLIER: dict[str, int] = {
     "": 1,
     "b": 1,
@@ -312,7 +314,8 @@ def _strip_subscripts(text: str) -> str:
 
 
 _VEC_MATRIX_INST_RE = re.compile(
-    r"(?:simd_inst::|\bvloop_?v2\b|\basc_mmad(?:_mx)?\b|\bascend_gemm_l1\b|\bvec_(?!reg))",
+    r"(?:simd_inst::|\bvloop_?v2\b|\basc_mmad(?:_mx)?\b|\bascend_gemm_l1\b"
+    r"|\basc_simd_\w+|\basc_v(?!f_call\b)\w+|\bReg::|\bvec_(?!reg))",
     flags=re.IGNORECASE,
 )
 
@@ -323,6 +326,9 @@ _SIMT_VF_CALL_DIM3_RE = re.compile(
 )
 _GM_PTR_NAME_RE = re.compile(
     r"__gm__\s+[^;(),={}]*?\*+\s*(?:__restrict__\s*)?([A-Za-z_]\w*)"
+)
+_UB_PTR_NAME_RE = re.compile(
+    r"__ubuf__\s+[^;(),={}]*?\*+\s*(?:__restrict__\s*)?([A-Za-z_]\w*)"
 )
 
 _SCALAR_COMPUTE_OP_RE = re.compile(
@@ -482,6 +488,38 @@ def _has_parallel_simt_kernel(cleaned: str) -> bool:
     return bool((bounds and max(bounds) >= 32) or (dim3_threads and max(dim3_threads) >= 32))
 
 
+def count_reachable_ub_scalar_compute_loops(cpp_source: str) -> int:
+    """Count reachable scalar compute loops operating on __ubuf__ or __gm__ buffers."""
+    if not cpp_source or not cpp_source.strip():
+        return 0
+    src = (
+        _extract_reachable_trackb_text(cpp_source)
+        if re.search(r"\b__global__\b", cpp_source)
+        else cpp_source
+    )
+    cleaned = _strip_cpp_comments(src)
+    if _has_parallel_simt_kernel(cleaned):
+        return 0
+    buf_ptrs = set(_UB_PTR_NAME_RE.findall(cleaned)) | set(_GM_PTR_NAME_RE.findall(cleaned))
+    if not buf_ptrs:
+        return 0
+    ptr_alt = "|".join(re.escape(p) for p in sorted(buf_ptrs))
+    buf_access_re = re.compile(
+        rf"\b(?:{ptr_alt})\s*\[[^\]]+\]|\*\s*\(?\s*(?:{ptr_alt})\b"
+    )
+    count = 0
+    for body in _extract_for_loop_bodies(cleaned):
+        if _VEC_MATRIX_INST_RE.search(body):
+            continue
+        if not buf_access_re.search(body):
+            continue
+        norm_body = body.replace("++", " ").replace("--", " ").replace("->", " ")
+        body_no_idx = _strip_subscripts(norm_body)
+        if _SCALAR_COMPUTE_OP_RE.search(body_no_idx):
+            count += 1
+    return count
+
+
 def _detect_scalar_compute_loop_fallback(
     res_text: str = "",
     asm_or_dump_text: str = "",
@@ -503,6 +541,9 @@ def _detect_scalar_compute_loop_fallback(
     src = asm_or_dump_text if asm_or_dump_text.strip() else combined
     if re.search(r"\b__global__\b", src):
         src = _extract_reachable_trackb_text(src)
+    ub_loops = count_reachable_ub_scalar_compute_loops(src)
+    if ub_loops > 0:
+        return {"scalar_compute_loop_fallback": float(ub_loops)}
     cleaned = _strip_cpp_comments(src)
     if _VEC_MATRIX_INST_RE.search(cleaned) or _has_parallel_simt_kernel(cleaned):
         return {}
@@ -531,6 +572,34 @@ def _detect_scalar_compute_loop_fallback(
         if _SCALAR_COMPUTE_OP_RE.search(body_no_idx):
             return {"scalar_compute_loop_fallback": 1.0}
     return {}
+
+
+def detect_scalar_compute_loop_fallback(
+    tir_ledger: ObjectivePhysicalLedger | None = None,
+    *,
+    ub_scalar_compute_loops: int = 0,
+    cpp_source: str = "",
+    extra_signals: Mapping[str, object] | None = None,
+) -> float:
+    """Return scalar-compute fallback severity from ledger, C++ source, and signals."""
+    loop_count = max(0, int(ub_scalar_compute_loops))
+    if tir_ledger is not None:
+        loop_count = max(loop_count, max(0, int(tir_ledger.ub_scalar_compute_loops)))
+    explicit = 0.0
+    if extra_signals is not None:
+        raw_sig = extra_signals.get("scalar_compute_loop_fallback", 0.0)
+        if isinstance(raw_sig, (int, float)) and not isinstance(raw_sig, bool):
+            explicit = max(explicit, float(raw_sig))
+        raw_loops = extra_signals.get("ub_scalar_compute_loops", 0)
+        if isinstance(raw_loops, (int, float)) and not isinstance(raw_loops, bool):
+            loop_count = max(loop_count, max(0, int(raw_loops)))
+    if cpp_source:
+        cpp_loops = count_reachable_ub_scalar_compute_loops(cpp_source)
+        loop_count = max(loop_count, cpp_loops)
+        if loop_count == 0:
+            detected = _detect_scalar_compute_loop_fallback(asm_or_dump_text=cpp_source)
+            explicit = max(explicit, float(detected.get("scalar_compute_loop_fallback", 0.0)))
+    return max(explicit, float(loop_count))
 
 
 def _detect_dcache_bypass_narrow_store(
@@ -1066,6 +1135,8 @@ __all__ = [
     "CompilerBehaviorDetector",
     "CompilerBehaviorRegistry",
     "DEFAULT_COMPILER_BEHAVIOR_REGISTRY",
+    "count_reachable_ub_scalar_compute_loops",
+    "detect_scalar_compute_loop_fallback",
     "parse_bisheng_res_usage",
     "parse_bisheng_resources",
     "register_compiler_detector",

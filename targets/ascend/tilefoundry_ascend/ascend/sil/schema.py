@@ -1437,6 +1437,10 @@ class ConstraintRelaxationMask:
         """Return ordered tuple of currently unlocked facet names."""
         return tuple(f for f in VALID_FREEDOM_FACETS if getattr(self, f))
 
+    def unlocked_facet_names(self) -> tuple[str, ...]:
+        """Return ordered tuple of currently unlocked facet names."""
+        return self.unlocked_facets()
+
     def locked_facets(self) -> tuple[str, ...]:
         """Return ordered tuple of currently locked facet names."""
         return tuple(f for f in VALID_FREEDOM_FACETS if not getattr(self, f))

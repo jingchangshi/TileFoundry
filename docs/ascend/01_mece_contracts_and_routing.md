@@ -33,10 +33,10 @@ Legal transformation freedom is partitioned into the 7-facet `ConstraintRelaxati
 | `pipeline_and_sync_graph` | Locked | Cross-pipe event allocation, software pipelining, ping-pong double buffering, flag balance |
 | `grid_and_workspace_topology` | Locked | Asymmetric core mapping, dynamic tail balancing, GM workspace partitioning |
 
-- **Dual-Track Routing (`CapabilityGate`)**: Combines 8D structural suitability with `ISAGapScanner` to select `tilelang_dsl` vs `ascendc_template` (`Router=ON/OFF` ablatable) across `seed_synthesizer.py`, `portfolio_runner.py`, and `campaign_runner.py`.
+- **Dual-Track Routing (`CapabilityGate`)**: Combines 3-axis `(TopologyAxes, PipeGapReport, CasePhysicsRatios)` routing with `ISAGapScanner` to select `tilelang_dsl` vs `ascendc_template` (`Router=ON/OFF` ablatable) across `seed_synthesizer.py`, `portfolio_runner.py`, and `campaign_runner.py`.
 - **Unified 3-Layer Prompt (`llm_constraints.py`, zero Layer 1.5)**:
   - **L1 (`format_hardware_and_sil_layer`)**: DaVinci950 memory caps, 14 `SILVerifier` redlines, Z3 modulo pipeline bounds, 7-facet lock state, and universal Schedule Integrity Redlines `G1..G4`—each paired with its canonical escape path (`G1` vector/matrix over scalar loops, `G2` `>=32B` burst packing over `<32B` DCache-bypass stores, `G3` `T.dynamic` + 2D `T.copy` over key pollution/unrolled copies, `G4` disjoint `coupled_1c2v` subcore GM slices).
-  - **L2 (`format_target_dialect_layer`)**: Legal `T.ascend_*` dialect idioms, dual-track shells, and `seed_rules.yaml` entries guarded by `anti_precondition` predicates.
+  - **L2 (`format_target_dialect_layer`)**: CANN 9.3 `dav-3510` API surface (`cann_9_2` placeholder), two-stage on-demand pruning, 4 lowering guardrails, and `seed_rules.yaml` entries guarded by `anti_precondition` and `l2_pmu_available`.
   - **L3 (Causal Feedback)**: Top-ranked KB hypotheses matched to the active `SymptomFamily` and 3-axis Bayesian utility.
 - **`syntax_repair` & `explore_creative` Discipline**: Syntax repair and Stage-0 retries apply `L1 + L2 + G5` Parent Monotonicity Lock (`format_g5_parent_monotonicity_lock`, forbidding dropping `T.Pipelined` stages or downgrading execution domains). `explore_creative` remains `Rule-Blind` to L3 heuristics, gated by L1 legality, compilation, and bounded analytical pass-through (`predicted_us <= 1.5 * parent_analytical_us`).
 - **CoW Helper Isolation (`patch_regime_into_module`)**: Clones/prefixes regime-local helpers as `_{regime_tag}_*` instead of mutating shared helpers in place, prunes unreachable dead helpers, and enforces the dual-layer orthogonal tail guard (`>= 0.97x` worst case in active regime; `>= 0.98x` untouched sibling regimes with single-point anti-jitter recheck).
@@ -66,4 +66,4 @@ Every diagnosed waste maps deterministically to the closed 13-member `SymptomFam
 | `SYNC_BARRIER_SERIALIZATION` | `pipeline_sync` | `pipeline_and_sync_graph`, `tile_and_stage_knobs` |
 | `GRID_TAIL_WAVE_UNDERUTIL` | `grid_wave` | `grid_and_workspace_topology`, `tile_and_stage_knobs` |
 
-- **Frozen Online KB (`agent/kb/`)**: `seed_rules.yaml` holds 33 cross-operator causal rules evaluated read-only online under a strict AST inequality whitelist (`_ALLOWED_AST_NODES`), ranked by 3-axis factorized Bayesian tracking (`ce:*`, `mr:*`, `ir:*`), and pruned against repeated dead-ends via Scoped Tabu (`excluded_mechanisms`).
+- **Frozen Online KB (`agent/kb/`)**: `seed_rules.yaml` holds 40 cross-operator causal rules (`R01..R40`) evaluated read-only online under a strict AST inequality whitelist (`_ALLOWED_AST_NODES`), ranked by 3-axis factorized Bayesian tracking (`ce:*`, `mr:*`, `ir:*`), and pruned against repeated dead-ends via Scoped Tabu (`excluded_mechanisms`).

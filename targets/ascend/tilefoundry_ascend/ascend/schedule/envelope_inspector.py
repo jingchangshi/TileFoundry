@@ -614,12 +614,13 @@ def _augment_var_bindings_from_buffers(
     var_bindings: Mapping[str, int] | None,
     *,
     tirx,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> tuple[dict[str, int], list[tuple[object, int]]]:
-    if not var_bindings:
+    if not var_bindings and not ordered_tensor_shapes:
         return {}, []
     eff: dict[str, int] = {
         str(k): int(v)
-        for k, v in var_bindings.items()
+        for k, v in (var_bindings or {}).items()
         if isinstance(v, int) and not isinstance(v, bool)
     }
     lower_eff = {k.lower(): v for k, v in eff.items()}
@@ -642,6 +643,7 @@ def _augment_var_bindings_from_buffers(
                 lower_eff.setdefault(cname.lower(), int(val))
 
     buffer_map = getattr(entry_fn, "buffer_map", None) or {}
+    tensor_idx = 0
     for param in getattr(entry_fn, "params", ()):
         buf = buffer_map.get(param)
         if buf is None:
@@ -657,6 +659,18 @@ def _augment_var_bindings_from_buffers(
                 matched = _match_binding_for_var(fv, eff, lower_eff)
                 if matched is not None:
                     _bind_var(fv, matched)
+        if ordered_tensor_shapes is not None and tensor_idx < len(ordered_tensor_shapes):
+            pos_shape = ordered_tensor_shapes[tensor_idx]
+            if len(shape) == len(pos_shape):
+                for dim_expr, dim_val in zip(shape, pos_shape):
+                    if (
+                        isinstance(dim_expr, tirx.Var)
+                        and not _is_already_bound(dim_expr)
+                        and isinstance(dim_val, int)
+                        and not isinstance(dim_val, bool)
+                    ):
+                        _bind_var(dim_expr, max(1, int(dim_val)))
+        tensor_idx += 1
         if len(shape) == 2:
             d0, d1 = shape
             if isinstance(d0, tirx.Var) and not _is_already_bound(d0) and _static_tirx_int(d1) is not None:
@@ -1069,6 +1083,7 @@ def _collect_tilelang_telemetry(
     aiv_split_factor: int = 1,
     var_bindings: Mapping[str, int] | None = None,
     tvm_mod: object | None = None,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> _TelemetryFeatures:
     """Extract NP1 structural, quantization, and layout telemetry from a TVM PrimFunc."""
     flag = "--cce-disable-vf-stack-reserved-ubuf"
@@ -1222,6 +1237,7 @@ def _collect_tilelang_telemetry(
         entry_fn,
         var_bindings,
         tirx=tirx,
+        ordered_tensor_shapes=ordered_tensor_shapes,
     )
     resolved_dims, any_symbolic_grid = _inspect_tilelang_block_dims(
         entry_fn.body,
@@ -3250,6 +3266,41 @@ def _extract_primfunc_pass_configs_and_flags(
     return cfg, flags
 
 
+def _collect_divisor_vars(stmt, tirx=None) -> list[object]:
+    """Collect free TIR variables appearing in division or modulo denominators."""
+    if tirx is None:
+        from tvm import tirx as _tirx  # noqa: PLC0415
+
+        tirx = _tirx
+    div_classes = tuple(
+        cls
+        for name in ("FloorDiv", "FloorMod", "Div", "Mod")
+        if (cls := getattr(tirx, name, None)) is not None
+    )
+    if not div_classes or stmt is None:
+        return []
+    found: list[object] = []
+
+    def _add_var(var_obj) -> None:
+        if not isinstance(var_obj, tirx.Var):
+            return
+        if not any(
+            (hasattr(var_obj, "same_as") and var_obj.same_as(prev)) or var_obj is prev
+            for prev in found
+        ):
+            found.append(var_obj)
+
+    def _visit(node) -> None:
+        if isinstance(node, div_classes):
+            denom = getattr(node, "b", None)
+            if denom is not None:
+                for fv in _free_tirx_vars(denom, tirx=tirx):
+                    _add_var(fv)
+
+    tirx.stmt_functor.post_order_visit(stmt, _visit)
+    return found
+
+
 def _specialize_primfunc_for_anchors(
     entry_fn,
     mod_in,
@@ -3257,13 +3308,17 @@ def _specialize_primfunc_for_anchors(
     *,
     tvm_mod,
     tirx,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ):
     """Specialize an isolated PrimFunc copy using concrete anchor var_bindings."""
-    if not var_bindings:
+    if not var_bindings and not ordered_tensor_shapes:
         return entry_fn, mod_in
 
     eff_bindings, var_obj_bindings = _augment_var_bindings_from_buffers(
-        entry_fn, var_bindings, tirx=tirx
+        entry_fn,
+        var_bindings,
+        tirx=tirx,
+        ordered_tensor_shapes=ordered_tensor_shapes,
     )
     if not eff_bindings and not var_obj_bindings:
         return entry_fn, mod_in
@@ -3390,10 +3445,50 @@ def _specialize_primfunc_for_anchors(
         recorded_vars.append(fv)
         spec_var_map[fv] = tirx.IntImm(dtype_str, int(fallback_numel))
 
+    params_list = list(getattr(entry_fn, "params", ()))
+    divisor_vars = _collect_divisor_vars(entry_fn.body, tirx=tirx)
+    for buf in buffer_map.values():
+        for expr in (
+            *getattr(buf, "shape", ()),
+            *(getattr(buf, "strides", ()) or ()),
+            buf.elem_offset,
+        ):
+            for dv in _collect_divisor_vars(expr, tirx=tirx):
+                if not any(
+                    (hasattr(dv, "same_as") and dv.same_as(prev)) or dv is prev
+                    for prev in divisor_vars
+                ):
+                    divisor_vars.append(dv)
+
+    for dv in divisor_vars:
+        if not isinstance(dv, tirx.Var) or _is_handle_or_data(dv):
+            continue
+        dtype_str = str(getattr(dv, "dtype", "int32") or "int32")
+        if dtype_str.lower() == "handle" or "int" not in dtype_str.lower():
+            continue
+        matched_key = next(
+            (
+                k
+                for k in spec_var_map
+                if (hasattr(dv, "same_as") and dv.same_as(k)) or dv is k
+            ),
+            None,
+        )
+        if matched_key is not None:
+            bound_val = _static_tirx_int(spec_var_map[matched_key])
+            if bound_val is not None and bound_val <= 0:
+                spec_var_map[matched_key] = tirx.IntImm(dtype_str, max(1, int(bound_val)))
+        elif any(
+            (hasattr(dv, "same_as") and dv.same_as(p)) or dv is p for p in params_list
+        ) or any(
+            (hasattr(dv, "same_as") and dv.same_as(bfv)) or dv is bfv for bfv in body_free_vars
+        ):
+            recorded_vars.append(dv)
+            spec_var_map[dv] = tirx.IntImm(dtype_str, max(1, 1))
+
     if not spec_var_map:
         return entry_fn, mod_in
 
-    params_list = list(getattr(entry_fn, "params", ()))
     extra_params = [
         v
         for v in recorded_vars
@@ -3410,7 +3505,12 @@ def _specialize_primfunc_for_anchors(
         if extra_params
         else entry_fn
     )
-    spec_fn = tmp_fn.specialize(spec_var_map)
+    try:
+        spec_fn = tmp_fn.specialize(spec_var_map)
+    except Exception as exc:
+        if "divide by zero" not in str(exc).lower():
+            raise
+        spec_fn = entry_fn
 
     target_gvar = None
     for gvar, fn in mod_in.functions.items():
@@ -3430,15 +3530,50 @@ def _specialize_primfunc_for_anchors(
         updated_funcs[target_gvar] = spec_fn
     spec_mod = tvm_mod.IRModule(updated_funcs, attrs=getattr(mod_in, "attrs", None))
     if hasattr(tirx, "transform") and hasattr(tirx.transform, "Simplify"):
-        spec_mod = tirx.transform.Simplify()(spec_mod)
-        if target_gvar in spec_mod.functions:
-            spec_fn = spec_mod.functions[target_gvar]
-        else:
-            for fn in spec_mod.functions.values():
-                if isinstance(fn, tirx.PrimFunc):
-                    spec_fn = fn
-                    break
+        try:
+            spec_mod = tirx.transform.Simplify()(spec_mod)
+            if target_gvar in spec_mod.functions:
+                spec_fn = spec_mod.functions[target_gvar]
+            else:
+                for fn in spec_mod.functions.values():
+                    if isinstance(fn, tirx.PrimFunc):
+                        spec_fn = fn
+                        break
+        except Exception as exc:
+            if "divide by zero" not in str(exc).lower():
+                raise
     return spec_fn, spec_mod
+
+
+def specialize_primfunc_for_anchor(
+    prim_func,
+    *,
+    var_bindings: Mapping[str, int] | None = None,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
+):
+    """Specialize a TileLang PrimFunc or IRModule for one anchor shape without lowering."""
+    from tilelang import tvm  # noqa: PLC0415
+    from tvm import tirx  # noqa: PLC0415
+
+    if isinstance(prim_func, tvm.IRModule):
+        funcs = [fn for fn in prim_func.functions.values() if isinstance(fn, tirx.PrimFunc)]
+        if not funcs:
+            raise ValueError("IRModule contains no PrimFunc entries")
+        entry_fn = funcs[0]
+        mod_in = prim_func
+    else:
+        entry_fn = prim_func
+        sym = str(entry_fn.attrs.get("global_symbol", "main")) if entry_fn.attrs else "main"
+        mod_in = tvm.IRModule({sym: entry_fn})
+
+    return _specialize_primfunc_for_anchors(
+        entry_fn,
+        mod_in,
+        var_bindings,
+        tvm_mod=tvm,
+        tirx=tirx,
+        ordered_tensor_shapes=ordered_tensor_shapes,
+    )
 
 
 def inspect_tilelang_primfunc(
@@ -3450,6 +3585,7 @@ def inspect_tilelang_primfunc(
     aiv_split_factor: int | None = None,
     unreserved_ubuf: bool = False,
     var_bindings: Mapping[str, int] | None = None,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> EnvelopeInspectionResult:
     """Inspect a TileLang PrimFunc using Two-Snapshot IR Diff without bisheng compile."""
     import contextlib  # noqa: PLC0415
@@ -3480,6 +3616,7 @@ def inspect_tilelang_primfunc(
         var_bindings,
         tvm_mod=tvm,
         tirx=tirx,
+        ordered_tensor_shapes=ordered_tensor_shapes,
     )
 
     cfg, merged_flags = _extract_primfunc_pass_configs_and_flags(
@@ -3522,6 +3659,7 @@ def inspect_tilelang_primfunc(
         aiv_split_factor=effective_aiv_split,
         var_bindings=var_bindings,
         tvm_mod=tvm,
+        ordered_tensor_shapes=ordered_tensor_shapes,
     )
     effective_unreserved = telemetry.uses_unreserved_ubuf
     capacities = _scope_capacities(
@@ -4256,4 +4394,5 @@ __all__ = [
     "EnvelopeInspectionResult",
     "inspect_tilelang_primfunc",
     "inspect_tir_envelope",
+    "specialize_primfunc_for_anchor",
 ]

@@ -1,4 +1,4 @@
-"""Unit tests for WP3 8-dim capability router, causal rules KB, and Bayesian tracker."""
+"""Unit tests for pure 3-axis CapabilityGate router, causal rules KB, and Bayesian tracker."""
 
 import re
 from pathlib import Path
@@ -8,10 +8,10 @@ import pytest
 from tilefoundry_ascend.agent import (
     AscendCausalRule,
     BayesianRuleTracker,
+    CapabilityGate,
     UnsafePredicateError,
     build_predicate_context,
     default_seed_rules_path,
-    extract_structural_features,
     load_seed_rules,
     route_execution_track,
     safe_eval_predicate,
@@ -27,11 +27,12 @@ from tilefoundry_ascend.ascend.passes import (
     build_objective_physical_ledger,
     build_scope_waterline,
 )
+from tilefoundry_ascend.ascend.sil.schema import TopologyAxes
 from tilefoundry_ascend.ascend.target import AscendTarget
 
 
-def test_capability_router_extracts_8_features_and_routes_tracks() -> None:
-    """Verify phi_1..phi_8 extraction across developer, simt_vf, and manual_ssbuf tracks."""
+def test_capability_router_extracts_semantic_features_and_routes_tracks() -> None:
+    """Verify CapabilityGate and 3-axis routing across developer, simt_vf, and manual_ssbuf."""
     import tilelang.ascend.language as T  # noqa: PLC0415
 
     @T.prim_func
@@ -56,17 +57,19 @@ def test_capability_router_extracts_8_features_and_routes_tracks() -> None:
         pipe_cycles={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 16},
         waterlines={},
     )
-    f_dev = extract_structural_features(static_gemm, ledger=dev_ledger)
-    assert len(f_dev.as_tuple()) == 8
-    assert f_dev.phi_1_static_affine_bounds is True
-    assert f_dev.phi_2_cube_to_vector_ratio == pytest.approx(4.0)
-    assert f_dev.phi_4_indirect_sparse_gather is False
-    assert f_dev.phi_6_dynamic_cross_core_handoff is False
-    assert f_dev.phi_7_inner_contiguous_bytes == 128
-    assert f_dev.phi_8_persistent_wave_occupancy == pytest.approx(
+    d_dev = route_execution_track(static_gemm, ledger=dev_ledger)
+    assert d_dev.track == "developer"
+    assert d_dev.topology_axes == TopologyAxes("aic_only", "gm_l1_l0_fixpipe", "affine_simd")
+    assert d_dev.features is not None
+    assert d_dev.features["static_affine_bounds"] is True
+    assert d_dev.features["cube_to_vector_ratio"] == pytest.approx(4.0)
+    assert d_dev.features["indirect_sparse_gather"] is False
+    assert d_dev.features["dynamic_cross_core_handoff"] is False
+    assert d_dev.features["inner_contiguous_bytes"] == 128
+    assert d_dev.features["persistent_wave_occupancy"] == pytest.approx(
         56.0 / float(AscendTarget("ascend.950pr").device.aic_count)
     )
-    assert route_execution_track(f_dev).track == "developer"
+    assert CapabilityGate.suitability_score(d_dev.topology_axes) == 1.0
 
     @T.prim_func
     def ssbuf_indirect(
@@ -85,13 +88,15 @@ def test_capability_router_extracts_8_features_and_routes_tracks() -> None:
                     ub[i, j] = T.Cast("float32", src[row_idx, j])
             T.copy(ub, out)
 
-    f_ss = extract_structural_features(ssbuf_indirect)
-    assert f_ss.phi_3_quant_granularity == "mixed_fp8_fp4"
-    assert f_ss.phi_4_indirect_sparse_gather is True
-    assert f_ss.phi_6_dynamic_cross_core_handoff is True
-    assert route_execution_track(f_ss).track == "manual_ssbuf"
+    d_ss = route_execution_track(ssbuf_indirect)
+    assert d_ss.features is not None
+    assert d_ss.features["quant_granularity"] == "mixed_fp8_fp4"
+    assert d_ss.features["indirect_sparse_gather"] is True
+    assert d_ss.features["dynamic_cross_core_handoff"] is True
+    assert d_ss.track == "manual_ssbuf"
 
-    f_simt = extract_structural_features(
+    d_simt = route_execution_track(
+        None,
         ledger=build_objective_physical_ledger(
             analysis_mode="readonly_envelope",
             is_legal=True,
@@ -100,11 +105,14 @@ def test_capability_router_extracts_8_features_and_routes_tracks() -> None:
             waterlines={},
             opaque_dynamic_regions=("while_loop",),
         ),
-        cross_iter_recurrence="non_associative_scan",
-        inner_contiguous_bytes=16,
+        semantic_features={
+            "cross_iter_recurrence": "non_associative_scan",
+            "inner_contiguous_bytes": 16,
+        },
     )
-    assert f_simt.phi_1_static_affine_bounds is False
-    assert route_execution_track(f_simt).track == "simt_vf"
+    assert d_simt.features is not None
+    assert d_simt.features["static_affine_bounds"] is False
+    assert d_simt.track == "simt_vf"
 
 
 def test_seed_rules_yaml_completeness_and_sanitization() -> None:
@@ -136,9 +144,9 @@ def test_seed_rules_yaml_completeness_and_sanitization() -> None:
     assert not re.search(r"\bmla\b", yaml_text.lower())
 
     rules = load_seed_rules()
-    assert len(rules) == 37
+    assert len(rules) == 40
     ids = {rule.rule_id for rule in rules}
-    for idx in range(1, 38):
+    for idx in range(1, 41):
         prefix = f"R{idx:02d}_"
         assert any(rid.startswith(prefix) for rid in ids)
     for rule in rules:
@@ -788,7 +796,7 @@ def test_bayesian_rule_tracker_ranking_pruning_and_roundtrip(tmp_path: Path) -> 
     )
     ctx = build_predicate_context(
         ledger,
-        features=extract_structural_features(ledger=ledger),
+        features=route_execution_track(None, ledger=ledger).features,
     )
     top_before = tracker.rank_applicable_rules(ctx, top_k=2)
     assert len(top_before) == 2
@@ -810,7 +818,7 @@ def test_bayesian_rule_tracker_ranking_pruning_and_roundtrip(tmp_path: Path) -> 
 
     custom_rule = AscendCausalRule(
         rule_id="R99_DISTILLED_CUSTOM",
-        regime_guard="phi_2 > 0.0",
+        regime_guard="cube_to_vector_ratio > 0.0",
         precondition="AIC.PIPE_FIX > AIC.PIPE_M",
         transform_template="Adjust inner accumulation span cleanly.",
         expected_postcondition="AIC.PIPE_FIX <= AIC.PIPE_M",
@@ -1135,15 +1143,17 @@ def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
         body=loop_expr,
         return_type=x_ty,
     )
-    f_hir = extract_structural_features(hir_fn)
-    assert f_hir.phi_2_cube_to_vector_ratio > 0.0
-    assert f_hir.phi_3_quant_granularity == "per_token_or_block"
-    assert f_hir.phi_5_cross_iter_recurrence == "non_associative_scan"
-    assert f_hir.phi_7_inner_contiguous_bytes == 32
+    d_hir = route_execution_track(hir_fn)
+    assert d_hir.features is not None
+    assert float(d_hir.features["cube_to_vector_ratio"]) > 0.0
+    assert d_hir.features["quant_granularity"] == "per_token_or_block"
+    assert d_hir.features["cross_iter_recurrence"] == "non_associative_scan"
+    assert d_hir.features["inner_contiguous_bytes"] == 32
 
-    f_hir_gather = extract_structural_features(quant_call)
-    assert f_hir_gather.phi_3_quant_granularity == "per_token_or_block"
-    assert f_hir_gather.phi_4_indirect_sparse_gather is True
+    d_hir_gather = route_execution_track(quant_call)
+    assert d_hir_gather.features is not None
+    assert d_hir_gather.features["quant_granularity"] == "per_token_or_block"
+    assert d_hir_gather.features["indirect_sparse_gather"] is True
 
     block_mesh = Mesh((Topology("block", 14),), Layout((14,)))
     tmem = StorageKind.TMEM
@@ -1175,13 +1185,14 @@ def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
             ),
         )),
     )
-    f_tir = extract_structural_features(pf)
-    assert f_tir.phi_1_static_affine_bounds is True
-    assert f_tir.phi_2_cube_to_vector_ratio == pytest.approx(1.0)
-    assert f_tir.phi_4_indirect_sparse_gather is True
-    assert f_tir.phi_6_dynamic_cross_core_handoff is True
-    assert f_tir.phi_7_inner_contiguous_bytes == 128
-    assert f_tir.phi_8_persistent_wave_occupancy == pytest.approx(
+    d_tir = route_execution_track(pf)
+    assert d_tir.features is not None
+    assert d_tir.features["static_affine_bounds"] is True
+    assert d_tir.features["cube_to_vector_ratio"] == pytest.approx(1.0)
+    assert d_tir.features["indirect_sparse_gather"] is True
+    assert d_tir.features["dynamic_cross_core_handoff"] is True
+    assert d_tir.features["inner_contiguous_bytes"] == 128
+    assert d_tir.features["persistent_wave_occupancy"] == pytest.approx(
         14.0 / float(AscendTarget("ascend.950pr").device.aic_count)
     )
 
@@ -1200,8 +1211,9 @@ def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
                     m_buf[i] = m_new
             T.copy(x_ub, Out)
 
-    f_online = extract_structural_features(online_max_exp_loop)
-    assert f_online.phi_5_cross_iter_recurrence == "associative_online_rescale"
+    d_online = route_execution_track(online_max_exp_loop)
+    assert d_online.features is not None
+    assert d_online.features["cross_iter_recurrence"] == "associative_online_rescale"
 
     @T.prim_func
     def sequential_state_scan(
@@ -1216,10 +1228,11 @@ def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
                     state[j] = state[j] * Decay[t, j] + X[t, j]
                     Out[t, j] = state[j]
 
-    f_scan = extract_structural_features(sequential_state_scan)
-    assert f_scan.phi_5_cross_iter_recurrence == "non_associative_scan"
-    assert route_execution_track(f_scan).track == "simt_vf"
-    assert route_execution_track(f_scan).topology_axes.memory_ring == "persistent_onchip_state"
+    d_scan = route_execution_track(sequential_state_scan)
+    assert d_scan.features is not None
+    assert d_scan.features["cross_iter_recurrence"] == "non_associative_scan"
+    assert d_scan.track == "simt_vf"
+    assert d_scan.topology_axes.memory_ring == "persistent_onchip_state"
 
 
 def test_topology_axes_routing_and_60_cannbench_ops() -> None:
