@@ -796,6 +796,61 @@ def _seed_system_prompt(
     )
 
 
+def _strip_leading_license_comments(source: str) -> str:
+    """Strip leading blank and hash-comment header lines from Python reference source."""
+    lines = source.splitlines()
+    idx = 0
+    while idx < len(lines):
+        stripped = lines[idx].strip()
+        if not stripped or stripped.startswith("#"):
+            idx += 1
+            continue
+        break
+    cleaned = "\n".join(lines[idx:]).strip()
+    return cleaned if cleaned else source.strip()
+
+
+def _compact_proto_for_prompt(proto: Mapping[str, object]) -> dict[str, object]:
+    """Return a compact copy of proto dropping prose-only description metadata."""
+    compacted: dict[str, object] = {}
+    for key, value in proto.items():
+        key_str = str(key)
+        if key_str in ("inputs", "outputs", "attrs") and isinstance(value, (list, tuple)):
+            items: list[object] = []
+            for entry in value:
+                if isinstance(entry, Mapping):
+                    items.append(
+                        {
+                            str(k): v
+                            for k, v in entry.items()
+                            if str(k) != "description"
+                        }
+                    )
+                else:
+                    items.append(entry)
+            compacted[key_str] = items
+        elif isinstance(value, Mapping):
+            compacted[key_str] = _compact_proto_for_prompt(value)
+        else:
+            compacted[key_str] = value
+    return compacted
+
+
+def _compact_case_for_prompt(case: Mapping[str, object]) -> dict[str, object]:
+    """Return a compact case dictionary removing verbose prose and uniform dtype lists."""
+    compacted: dict[str, object] = {}
+    for key, value in case.items():
+        key_str = str(key)
+        if key_str in ("note", "operator", "value_range"):
+            continue
+        if key_str == "dtype" and isinstance(value, (list, tuple)) and value:
+            if all(isinstance(item, str) for item in value) and len(set(value)) == 1:
+                compacted[key_str] = value[0]
+                continue
+        compacted[key_str] = value
+    return compacted
+
+
 def _official_contract_section(
     proto: Mapping[str, object],
     cases: Sequence[Mapping[str, object]],
@@ -804,14 +859,23 @@ def _official_contract_section(
     entrypoint: str = "",
 ) -> str:
     """Render proto.yaml, cases.yaml and the semantic regime instantiations for the prompt."""
+    compact_proto_json = json.dumps(
+        _compact_proto_for_prompt(proto),
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    compact_case_lines = "\n".join(
+        json.dumps(_compact_case_for_prompt(case), sort_keys=True, ensure_ascii=False)
+        for case in cases
+    )
     lines = [
         "### OFFICIAL PROTO CONTRACT",
         "```json",
-        json.dumps(proto, indent=2, sort_keys=True, ensure_ascii=False),
+        compact_proto_json,
         "```",
         "### OFFICIAL CASES (dtypes and attrs are authoritative; every case must pass)",
         "```json",
-        json.dumps([dict(case) for case in cases], indent=2, sort_keys=True, ensure_ascii=False),
+        compact_case_lines,
         "```",
         "### CAMPAIGN REGIME INSTANTIATIONS (partitioned from golden+proto+cases semantics)",
     ]
@@ -821,7 +885,7 @@ def _official_contract_section(
             f"{key}={value!r}" for key, value in sorted(regime.sample_builder_kwargs.items())
         )
         dispatch_note = (
-            f" (or `{shared_sel}({kwargs})`)"
+            f" (or `{shared_sel}(...)` with the same kwargs)"
             if shared_sel and regime.config_selector_fn != shared_sel
             else ""
         )
@@ -846,13 +910,15 @@ def _blueprint_summary_section(
                 f"Stage-0 blueprint synthesis missing regime {regime.regime_tag!r}"
             )
         roofline = packet.roofline
-        kwargs = ", ".join(
-            f"{key}={value!r}" for key, value in sorted(regime.sample_builder_kwargs.items())
+        resolved_dims_repr = (
+            "same"
+            if packet.resolved_hir_dims == packet.requested_anchor_dims
+            else str(packet.resolved_hir_dims)
         )
         lines.append(
-            f"- regime `{regime.regime_tag}`: kwargs({kwargs}); entry={packet.entry_name}; "
+            f"- regime `{regime.regime_tag}`: entry={packet.entry_name}; "
             f"anchor_dims={packet.requested_anchor_dims}; "
-            f"resolved_hir_dims={packet.resolved_hir_dims}; "
+            f"resolved_hir_dims={resolved_dims_repr}; "
             f"ideal_roofline_us={float(roofline.ideal_roofline_us):.4f}; "
             f"compute_floor_us={float(roofline.compute_floor_us):.4f}; "
             f"memory_floor_us={float(roofline.memory_floor_us):.4f}; "
@@ -1111,9 +1177,10 @@ async def prepare_operator_seed_or_takeover(
         )
     )
     golden_abi_block = format_golden_entrypoint_prompt_block(contract)
+    clean_golden_source = _strip_leading_license_comments(pytorch_golden_source)
     golden_block = (
         "### PYTORCH MATHEMATICAL REFERENCE (GOLDEN ORACLE)\n"
-        f"```python\n{pytorch_golden_source.strip()}\n```\n\n"
+        f"```python\n{clean_golden_source}\n```\n\n"
     )
     first_bp = next(iter(blueprints.values()), None)
 
