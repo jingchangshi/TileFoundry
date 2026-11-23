@@ -2165,9 +2165,9 @@ def test_marathon_passes_seed_blueprints_and_topology_axes_to_runner(
     assert captured["regime_specs"] == seed_outcome.regime_specs
 
 
-def test_prepare_seed_pivots_to_trackb_after_oracle_l3_failures() -> None:
-    """Oracle L3 candidate failures count toward Track-A budget and pivot cleanly."""
-    backend = _ScriptedBackend([_SEED_MODULE, _SEED_MODULE, _SEED_MODULE, _TRACKB_SEED_MODULE])
+def test_prepare_seed_stays_on_tilelang_dsl_during_oracle_l3_accuracy_refinement() -> None:
+    """Oracle L3 numerical failures stay on tilelang_dsl under stage-monotonic pivot."""
+    backend = _ScriptedBackend([_SEED_MODULE, _SEED_MODULE, _SEED_MODULE, _SEED_MODULE])
     seen_tracks: list[str] = []
 
     def _recording_static_factory(
@@ -2205,7 +2205,6 @@ def test_prepare_seed_pivots_to_trackb_after_oracle_l3_failures() -> None:
         l0_l1_validator_factory=_recording_static_factory,
         oracle_accuracy_validator=_fail_tracka_then_pass,
     )
-    assert outcome.initial_track == "cce_trackb"
+    assert outcome.initial_track == "tilelang_dsl"
     assert outcome.attempts_used == 4
-    assert seen_tracks == ["tilelang_dsl", "tilelang_dsl", "tilelang_dsl", "cce_trackb"]
-    assert "CCE C++20" in backend.requests[3].system_prompt
+    assert seen_tracks == ["tilelang_dsl", "tilelang_dsl", "tilelang_dsl", "tilelang_dsl"]
