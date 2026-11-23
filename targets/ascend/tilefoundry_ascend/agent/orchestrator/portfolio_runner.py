@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -17,6 +18,7 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     FunnelEvaluation,
     GateFunnel,
     check_repair_monotonicity,
+    extract_ordered_tensor_shapes,
 )
 from tilefoundry_ascend.agent.orchestrator.llm_client import (
     CREATIVE_RESPONSE_SCHEMA,
@@ -37,6 +39,7 @@ from tilefoundry_ascend.agent.orchestrator.llm_constraints import (
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate,
     TwoLaneBeamSearch,
+    compiler_summary_from_residual,
     compute_static_dynamic_residual,
     extract_structural_signature,
 )
@@ -335,6 +338,9 @@ def build_prescreen_summary_from_kwargs(
     live_plan: object | None = None,
     blueprint: object | None = None,
     sil_advisory: object | None = None,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
+    case_entry: Mapping[str, object] | None = None,
+    proto: Mapping[str, object] | None = None,
 ) -> str:
     """Build live-IR or analytical dual-accumulator tile prescreen summary."""
     if not kwargs:
@@ -373,6 +379,12 @@ def build_prescreen_summary_from_kwargs(
     )
 
     if dsl_source and factory_name:
+        resolved_shapes = extract_ordered_tensor_shapes(
+            case_entry=case_entry,
+            dims=dims,
+            proto=proto,
+            ordered_tensor_shapes=ordered_tensor_shapes,
+        )
         try:
             live_summary = prescreen_live_ir_neighborhood(
                 dsl_source,
@@ -389,6 +401,7 @@ def build_prescreen_summary_from_kwargs(
                 live_plan=live_plan,
                 blueprint=blueprint,
                 sil_advisory=sil_advisory,
+                ordered_tensor_shapes=resolved_shapes,
             )
             if live_summary:
                 return live_summary
@@ -735,6 +748,9 @@ def build_exploit_request(
             else str(rule.symptom_family)
         ),
     )
+    fence_lang = (
+        "cpp" if get_dialect_surface(escalation_tier).dialect_id == "cce_cpp20" else "python"
+    )
     user_prompt = (
         f"{constraint_section}"
         f"### SELECTED CAUSAL RULE\n"
@@ -744,7 +760,7 @@ def build_exploit_request(
         f"Expected Postcondition: {rule.expected_postcondition}\n\n"
         f"### OBJECTIVE PHYSICAL LEDGER\n{parent.ledger.to_json()}\n\n"
         f"### STATIC-DYNAMIC RESIDUAL\n{json.dumps(parent.residual.to_dict(), indent=2)}\n\n"
-        f"### CURRENT KERNEL SOURCE\n```python\n{parent.dsl_source}\n```\n"
+        f"### CURRENT KERNEL SOURCE\n```{fence_lang}\n{parent.dsl_source}\n```\n"
     )
     return GenerationRequest(
         role="exploit_rule",
@@ -826,6 +842,7 @@ def build_syntax_repair_request(
     topology_axes: TopologyAxes | None = None,
     case_ratios: CasePhysicsRatios | None = None,
     lowered_excerpt: str = "",
+    lowered_excerpt_lang: str | None = None,
 ) -> GenerationRequest:
     """Build bounded syntax/compile repair request routed to the active backend dialect."""
     hint_sentence = f" Authorized target: {slice_hint}." if slice_hint else ""
@@ -892,9 +909,19 @@ def build_syntax_repair_request(
             bounded_excerpt = stripped_lowered[:keep_len].rstrip() + trunc_marker
         else:
             bounded_excerpt = stripped_lowered
+        if lowered_excerpt_lang in ("cpp", "python"):
+            excerpt_fence = str(lowered_excerpt_lang)
+        elif (
+            "@T.prim_func" in bounded_excerpt
+            or "I.ir_module" in bounded_excerpt
+            or ("def " in bounded_excerpt and "#include" not in bounded_excerpt)
+        ):
+            excerpt_fence = "python"
+        else:
+            excerpt_fence = "cpp"
         lowered_block = (
             f"### COMPILER LOWERED EXCERPT (READ-ONLY CONTEXT)\n"
-            f"```cpp\n{bounded_excerpt}\n```\n\n"
+            f"```{excerpt_fence}\n{bounded_excerpt}\n```\n\n"
         )
     user_prompt = (
         f"{layer1_text}\n\n"
@@ -968,8 +995,17 @@ class PortfolioRunner:
         cost_model: HybridAscendCostModel | None = None,
         escalation_tier: str = "tilelang_dsl",
         roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
+        ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
+        case_entry: Mapping[str, object] | None = None,
+        proto: Mapping[str, object] | None = None,
     ) -> tuple[WorkerSpec, ...]:
         """Select matching causal rules and fill remaining slots with creative explorers."""
+        resolved_shapes = extract_ordered_tensor_shapes(
+            case_entry=case_entry,
+            dims=dims,
+            proto=proto,
+            ordered_tensor_shapes=ordered_tensor_shapes,
+        )
         eff_roofline_obj = (
             roofline
             if roofline is not None
@@ -1045,6 +1081,7 @@ class PortfolioRunner:
                 axes=active_axes,
                 blueprint=blueprint,
                 sil_advisory=sil_advisory,
+                ordered_tensor_shapes=resolved_shapes,
             )
         else:
             prescreen_summary = ""
@@ -1099,7 +1136,16 @@ class PortfolioRunner:
         topology_axes: object | None = None,
         case_ratios: CasePhysicsRatios | None = None,
         escalation_tier: str = "tilelang_dsl",
+        ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
+        case_entry: Mapping[str, object] | None = None,
+        proto: Mapping[str, object] | None = None,
     ) -> tuple[BeamCandidate | None, bool, tuple[str, str, str] | None, bool]:
+        resolved_shapes = extract_ordered_tensor_shapes(
+            case_entry=case_entry,
+            dims=dims,
+            proto=proto,
+            ordered_tensor_shapes=ordered_tensor_shapes,
+        )
         active_axes = _derive_active_topology_axes(
             spec.parent_candidate.ledger,
             features=_project_features_with_ratios(
@@ -1141,6 +1187,7 @@ class PortfolioRunner:
             dims=dims,
             var_bindings=var_bindings,
             roofline=spec.roofline,
+            ordered_tensor_shapes=resolved_shapes,
         )
         if not evaluation.passed and evaluation.failed_stage in ("stage_a", "stage_b"):
             for _ in range(self._max_repairs):
@@ -1202,6 +1249,7 @@ class PortfolioRunner:
                     dims=dims,
                     var_bindings=var_bindings,
                     roofline=spec.roofline,
+                    ordered_tensor_shapes=resolved_shapes,
                 )
                 if evaluation.passed:
                     break
@@ -1280,6 +1328,14 @@ class PortfolioRunner:
             acc_ok = True
 
         if spec.rule is not None:
+            pred_params = inspect.signature(build_predicate_context).parameters
+            prev_extra_kwargs: dict[str, object] = {}
+            if "prev_residual" in pred_params:
+                prev_extra_kwargs["prev_residual"] = spec.parent_candidate.residual
+            if "prev_compiler_summary" in pred_params:
+                prev_extra_kwargs["prev_compiler_summary"] = compiler_summary_from_residual(
+                    spec.parent_candidate.residual
+                )
             post_ctx = build_predicate_context(
                 ledger,
                 features=worker_features,
@@ -1287,6 +1343,7 @@ class PortfolioRunner:
                 compiler_summary=comp_summary,
                 prev_ledger=spec.parent_candidate.ledger,
                 roofline=spec.roofline,
+                **prev_extra_kwargs,
             )
             prev_ns = post_ctx.get("prev")
             if isinstance(prev_ns, dict):
@@ -1350,8 +1407,17 @@ class PortfolioRunner:
         case_ratios: CasePhysicsRatios | None = None,
         escalation_tier: str = "tilelang_dsl",
         roofline: RooflineSummaryLike | Mapping[str, object] | None = None,
+        ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
+        case_entry: Mapping[str, object] | None = None,
+        proto: Mapping[str, object] | None = None,
     ) -> PortfolioRoundReport:
         """Execute one parallel portfolio round across Rule and Creative workers."""
+        resolved_shapes = extract_ordered_tensor_shapes(
+            case_entry=case_entry,
+            dims=dims,
+            proto=proto,
+            ordered_tensor_shapes=ordered_tensor_shapes,
+        )
         active_axes = _derive_active_topology_axes(
             parent.ledger,
             features=_project_features_with_ratios(parent.features, case_ratios),
@@ -1378,6 +1444,7 @@ class PortfolioRunner:
             case_ratios=case_ratios,
             escalation_tier=escalation_tier,
             roofline=roofline,
+            ordered_tensor_shapes=resolved_shapes,
         )
         stagger_sec = (
             1.5
@@ -1408,6 +1475,7 @@ class PortfolioRunner:
                 topology_axes=active_axes,
                 case_ratios=case_ratios,
                 escalation_tier=escalation_tier,
+                ordered_tensor_shapes=resolved_shapes,
             )
 
         outcomes = await asyncio.gather(

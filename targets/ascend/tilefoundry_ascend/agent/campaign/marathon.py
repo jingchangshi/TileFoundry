@@ -928,8 +928,6 @@ def prepare_marathon_seed(
                     op_logger=op_logger,
                 ),
                 existing_module_path=None if effective_cold_start else target_module,
-                authored_hir_source=None,
-                scheduled_hir_source=None,
                 force_cold_start=effective_cold_start,
                 max_seed_attempts=8,
                 desc_text=desc_text,
@@ -2130,8 +2128,6 @@ def run_operator_marathon(
             source_root=worktree,
             env_file=env_file,
             cannbench_repo=cannbench_repo,
-            authored_hir_path=None,
-            scheduled_hir_path=None,
             regime_blueprints=(
                 seed_outcome.blueprints_by_regime if seed_outcome is not None else None
             ),

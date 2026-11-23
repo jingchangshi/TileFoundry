@@ -213,6 +213,7 @@ _TRACKB_MONOTONICITY_BACKENDS: frozenset[str] = frozenset(
 _TRACKB_CORE_TOKENS: tuple[str, ...] = (
     "simd_inst::",
     "asc_mmad",
+    "ascend_gemm_l1",
     "__simd_vf__",
     "__simt_vf__",
 )
@@ -1884,6 +1885,259 @@ def _declared_stage_bytes(
     return 0
 
 
+def _extract_cpp_loop_spans(masked_src: str) -> list[tuple[int, int]]:
+    """Return character spans ``(body_start, body_end)`` of C++ for/while loop bodies."""
+    spans: list[tuple[int, int]] = []
+    n = len(masked_src)
+    for m in re.finditer(r"\b(?:for|while)\s*\(", masked_src):
+        pos = m.end() - 1
+        paren_depth = 0
+        while pos < n:
+            ch = masked_src[pos]
+            if ch == "(":
+                paren_depth += 1
+            elif ch == ")":
+                paren_depth -= 1
+                if paren_depth == 0:
+                    pos += 1
+                    break
+            pos += 1
+        while pos < n and masked_src[pos].isspace():
+            pos += 1
+        if pos >= n or masked_src[pos] != "{":
+            continue
+        body_start = pos + 1
+        brace_depth = 1
+        pos += 1
+        while pos < n and brace_depth > 0:
+            if masked_src[pos] == "{":
+                brace_depth += 1
+            elif masked_src[pos] == "}":
+                brace_depth -= 1
+            pos += 1
+        spans.append((body_start, max(body_start, pos - 1)))
+    return spans
+
+
+def _extract_call_args_at(masked_src: str, open_paren_idx: int) -> list[str]:
+    """Return top-level comma-separated arguments starting at ``open_paren_idx``."""
+    n = len(masked_src)
+    if open_paren_idx < 0 or open_paren_idx >= n or masked_src[open_paren_idx] != "(":
+        return []
+    depth = 0
+    pos = open_paren_idx
+    while pos < n:
+        ch = masked_src[pos]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return _split_cpp_args(masked_src[open_paren_idx + 1 : pos])
+        pos += 1
+    return []
+
+
+def _extract_trackb_dma_and_pipe_signals(
+    cpp_source: str,
+    consts: Mapping[str, int],
+    facts: object,
+    explicit_l1: Mapping[str, int],
+    *,
+    uses_cube: bool,
+    uses_256kb_ub: bool,
+    tile_m: int,
+    tile_n: int,
+    mte2_cnt: int,
+    mte3_cnt: int,
+    mmad_cnt: int,
+    ub_stages: int,
+    l1_stages: int,
+    case_ratios: CasePhysicsRatios | None,
+) -> dict[str, object]:
+    """Extract deterministic physical ledger signals from reachable C++20 source."""
+    masked = strip_cpp_comments_and_strings(cpp_source)
+    lower = masked.lower()
+    loop_spans = _extract_cpp_loop_spans(masked)
+
+    pipe_all_positions: set[int] = set()
+    for b_start, b_end in loop_spans:
+        body = masked[b_start:b_end]
+        for pm in re.finditer(r"\b(?:pipe_barrier|asc_sync_pipe)\s*\(\s*PIPE_ALL\s*\)", body):
+            pipe_all_positions.add(b_start + pm.start())
+    in_loop_pipe_all = len(pipe_all_positions)
+
+    has_dual_subcore = bool(
+        re.search(r"\b(?:get_subblockid|GetSubBlockIdx|get_subblock_idx)\s*\(", masked)
+    )
+
+    dma_bytes: list[int] = []
+    contig_candidates: list[int] = []
+    gm_dma_pat = re.compile(
+        r"\b(asc_copy_gm2ub_align|asc_copy_ub2gm_align|asc_copy_gm2ub|asc_copy_ub2gm|"
+        r"asc_copy_gm2l1(?:_nd2nz|_dn2nz)?|asc_copy_l0c2gm\w*)\s*\("
+    )
+    for dm in gm_dma_pat.finditer(masked):
+        fname = dm.group(1)
+        args = _extract_call_args_at(masked, dm.end() - 1)
+        if fname in ("asc_copy_gm2ub_align", "asc_copy_ub2gm_align"):
+            if len(args) == 3:
+                sz = _safe_eval_cpp_int(args[2], consts)
+                if sz is not None and sz > 0:
+                    dma_bytes.append(sz)
+                    contig_candidates.append(sz)
+            elif len(args) >= 4:
+                nburst = _safe_eval_cpp_int(args[2], consts)
+                row_b = _safe_eval_cpp_int(args[3], consts)
+                if row_b is not None and row_b > 0:
+                    contig_candidates.append(row_b)
+                    total_b = row_b * nburst if (nburst is not None and nburst > 0) else row_b
+                    dma_bytes.append(total_b)
+        elif fname in ("asc_copy_gm2ub", "asc_copy_ub2gm") and len(args) >= 4:
+            nburst = _safe_eval_cpp_int(args[2], consts)
+            blen = _safe_eval_cpp_int(args[3], consts)
+            if blen is not None and blen > 0:
+                row_b = blen * 32
+                contig_candidates.append(row_b)
+                dma_bytes.append(row_b * nburst if (nburst is not None and nburst > 0) else row_b)
+        elif fname.startswith("asc_copy_gm2l1") and len(args) >= 6:
+            rows = _safe_eval_cpp_int(args[4], consts)
+            cols = _safe_eval_cpp_int(args[5], consts)
+            if cols is not None and cols > 0:
+                row_b = cols * 2
+                contig_candidates.append(row_b)
+                dma_bytes.append(row_b * rows if (rows is not None and rows > 0) else row_b)
+        elif fname.startswith("asc_copy_l0c2gm") and len(args) >= 4:
+            rows = _safe_eval_cpp_int(args[2], consts)
+            cols = _safe_eval_cpp_int(args[3], consts)
+            if cols is not None and cols > 0:
+                row_b = cols * 2
+                contig_candidates.append(row_b)
+                dma_bytes.append(row_b * rows if (rows is not None and rows > 0) else row_b)
+
+    min_gm_dma_bytes = min(dma_bytes) if dma_bytes else 0
+    if dma_bytes and hasattr(facts, "dma_burst_efficiency"):
+        total_dma = float(sum(dma_bytes))
+        weighted_inv = sum(
+            float(b) / max(1e-6, float(facts.dma_burst_efficiency(int(b))))
+            for b in dma_bytes
+        )
+        dma_burst_eff = round(min(1.0, total_dma / max(1e-6, weighted_inv)), 4)
+    else:
+        dma_burst_eff = 1.0
+
+    if contig_candidates:
+        dominant_contig_bytes = max(contig_candidates)
+    elif case_ratios is not None and case_ratios.inner_contiguous_bytes > 0:
+        dominant_contig_bytes = int(case_ratios.inner_contiguous_bytes)
+    elif mte2_cnt > 0 or mte3_cnt > 0:
+        dominant_contig_bytes = tile_n * 2
+    else:
+        dominant_contig_bytes = 0
+
+    cube_m_vals: list[int] = []
+    if uses_cube or mmad_cnt > 0:
+        for gm in re.finditer(r"\bascend_gemm_l1\s*<([^;{}()]+)>\s*\(", masked):
+            t_args = _split_cpp_args(gm.group(1))
+            if t_args:
+                m_val = _safe_eval_cpp_int(t_args[0], consts)
+                if m_val is not None and m_val > 0:
+                    cube_m_vals.append(m_val)
+        for mm in re.finditer(r"\basc_mmad(?:_mx|_sparse)?\s*(?:<[^;{}()]*>)?\s*\(", masked):
+            c_args = _extract_call_args_at(masked, mm.end() - 1)
+            if len(c_args) >= 4:
+                m_val = _safe_eval_cpp_int(c_args[3], consts)
+                if m_val is not None and m_val > 0:
+                    cube_m_vals.append(m_val)
+    effective_cube_m = (
+        min(cube_m_vals)
+        if cube_m_vals
+        else (tile_m if (uses_cube or mmad_cnt > 0) else 0)
+    )
+
+    has_lowbit_quant = bool(
+        re.search(
+            r"\b(?:int4|uint4|fp4|f4e2m1|f4e1m2|int4b_t|deq_scale|quant_mode|asc_mmad_mx)\b",
+            masked,
+        )
+    )
+
+    has_online_rescale_loop = False
+    exp_re = re.compile(r"\b(?:vexp|exp2|expf|exp|Exp)\s*(?:<[^>]*>)?\s*\(")
+    rescale_re = re.compile(
+        r"\b(?:vcmax|vcadd|vcmin|vreduce|ReduceMax|ReduceSum|asc_reduce_\w+|"
+        r"vmul|vdiv|vfma|vmad|Mul|Div)\b|\*=|\+="
+    )
+    for b_start, b_end in loop_spans:
+        body = masked[b_start:b_end]
+        if exp_re.search(body) and rescale_re.search(body):
+            has_online_rescale_loop = True
+            break
+
+    l1_total = sum(explicit_l1.values())
+    l1_full = max(1, int(getattr(facts, "l1_bytes", 524288)))
+    l1_half = max(1, l1_full // 2)
+    has_l1_half_iso = "l1_half_bank_split" in lower or "half_bank" in lower
+    if l1_total <= 0 or has_l1_half_iso:
+        l1_bank_conflict_risk = 0.0
+    elif l1_total > l1_half:
+        l1_bank_conflict_risk = round(min(1.0, l1_total / float(l1_full)), 4)
+    elif len(explicit_l1) >= 2:
+        l1_bank_conflict_risk = round(min(0.5, l1_total / float(l1_half)), 4)
+    else:
+        l1_bank_conflict_risk = 0.0
+
+    mte2_inflight = 0
+    if mte2_cnt > 0:
+        cur_run = 0
+        max_run = 0
+        mte2_events: set[str] = set()
+        for tok_m in re.finditer(
+            r"\b(asc_copy_gm2(?:ub|l1)\w*)\s*\(|"
+            r"\basc_sync_(?:notify|wait)\s*\(\s*([^)]+)\)",
+            masked,
+        ):
+            if tok_m.group(1):
+                cur_run += 1
+                max_run = max(max_run, cur_run)
+            else:
+                sync_args = _split_cpp_args(tok_m.group(2) or "")
+                if any(a.strip() == "PIPE_MTE2" for a in sync_args[:2]):
+                    if len(sync_args) >= 3:
+                        mte2_events.add(sync_args[2].strip())
+                    if "wait" in tok_m.group(0):
+                        cur_run = 0
+        mte2_inflight = max(1, max_run, len(mte2_events), 2 if ub_stages > 1 else 1)
+
+    strides = _stage_stride_elems(cpp_source, consts)
+    uses_dyn_offset = bool(
+        strides
+        or re.search(r"\b(?:stg|stage|stg_id|stage_id|nstg)\b[^;\n]*[?:]", masked)
+        or (
+            (ub_stages >= 2 or l1_stages >= 2)
+            and re.search(
+                r"\b\w+\s*&\s*1\b|\b\w+\s*%\s*(?:2|STAGES|NUM_STAGES)\b",
+                masked,
+            )
+        )
+    )
+
+    return {
+        "has_dual_subcore": has_dual_subcore,
+        "uses_unreserved_ubuf": uses_256kb_ub,
+        "in_loop_pipe_all_barriers": in_loop_pipe_all,
+        "min_gm_dma_bytes": min_gm_dma_bytes,
+        "dma_burst_efficiency_ratio": dma_burst_eff,
+        "dominant_contig_bytes": dominant_contig_bytes,
+        "effective_cube_m": effective_cube_m,
+        "has_lowbit_quant": has_lowbit_quant,
+        "has_online_rescale_loop": has_online_rescale_loop,
+        "l1_bank_conflict_risk": l1_bank_conflict_risk,
+        "mte2_inflight_per_aiv": mte2_inflight,
+        "uses_dynamic_offset_pipelining": uses_dyn_offset,
+    }
+
+
 def _build_ascendc_static_ledger(
     cpp_source: str,
     *,
@@ -2102,15 +2356,37 @@ def _build_ascendc_static_ledger(
     spill_penalty = int(compiler_summary.spill_bytes) * 2 if compiler_summary else 0
     sw_loop_mult = 2 if (compiler_summary and not compiler_summary.vloopv2_hit) else 1
 
+    signals = _extract_trackb_dma_and_pipe_signals(
+        cpp_source,
+        consts,
+        facts,
+        explicit_l1,
+        uses_cube=uses_cube,
+        uses_256kb_ub=uses_256kb_ub,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        mte2_cnt=mte2_cnt,
+        mte3_cnt=mte3_cnt,
+        mmad_cnt=mmad_cnt,
+        ub_stages=ub_stages,
+        l1_stages=l1_stages,
+        case_ratios=case_ratios,
+    )
+
     pipe_cycles: dict[str, int] = {}
     if mte2_cnt > 0:
         pipe_cycles["AIV0.PIPE_MTE2"] = mte2_cnt * max(16, (tile_m * tile_n * 2) // 64)
     if mte3_cnt > 0:
         pipe_cycles["AIV0.PIPE_MTE3"] = mte3_cnt * max(16, (tile_m * tile_n * 2) // 64)
     if vf_cnt > 0:
-        pipe_cycles["AIV0.PIPE_V"] = (
-            vf_cnt * max(8, (tile_m * tile_n) // 64) * sw_loop_mult + spill_penalty
-        )
+        total_vec = vf_cnt * max(8, (tile_m * tile_n) // 64) * sw_loop_mult + spill_penalty
+        if bool(signals["has_dual_subcore"]):
+            aiv0_vec = max(1, total_vec // 2)
+            aiv1_vec = max(1, total_vec - aiv0_vec)
+            pipe_cycles["AIV0.PIPE_V"] = aiv0_vec
+            pipe_cycles["AIV1.PIPE_V"] = aiv1_vec
+        else:
+            pipe_cycles["AIV0.PIPE_V"] = total_vec
     if mmad_cnt > 0:
         pipe_cycles["AIC.PIPE_M"] = mmad_cnt * max(16, (tile_m * tile_n * tile_k) // 4096)
     if fix_cnt > 0:
@@ -2134,10 +2410,21 @@ def _build_ascendc_static_ledger(
         steady_state_ii=steady_ii,
         pipe_cycles=pipe_cycles,
         waterlines=waterlines,
+        mte2_inflight_per_aiv=int(signals["mte2_inflight_per_aiv"]),
         grid_blocks=grid_blocks,
         wave_occupancy=wave_occupancy,
-        ub_bank_conflict_risk=ub_bank_conflict_risk,
+        dominant_contig_bytes=int(signals["dominant_contig_bytes"]),
+        effective_cube_m=int(signals["effective_cube_m"]),
         has_indirect_gather=uses_simt,
+        has_lowbit_quant=bool(signals["has_lowbit_quant"]),
+        has_online_rescale_loop=bool(signals["has_online_rescale_loop"]),
+        uses_unreserved_ubuf=bool(signals["uses_unreserved_ubuf"]),
+        min_gm_dma_bytes=int(signals["min_gm_dma_bytes"]),
+        dma_burst_efficiency_ratio=float(signals["dma_burst_efficiency_ratio"]),
+        uses_dynamic_offset_pipelining=bool(signals["uses_dynamic_offset_pipelining"]),
+        in_loop_pipe_all_barriers=int(signals["in_loop_pipe_all_barriers"]),
+        ub_bank_conflict_risk=ub_bank_conflict_risk,
+        l1_bank_conflict_risk=float(signals["l1_bank_conflict_risk"]),
         ub_scalar_compute_loops=ub_scalar_loops,
         microarch_profile=ma_dict,
     )
@@ -2256,7 +2543,7 @@ def evaluate_ascendc_candidate(
         )
 
         lower = reachable_cpp.lower()
-        uses_cube = "mmad" in lower or "l0c" in lower
+        uses_cube = "mmad" in lower or "l0c" in lower or "ascend_gemm_l1" in lower
         uses_simt = "__simt_vf__" in reachable_cpp or "Simt::" in reachable_cpp
         uses_ssbuf = "ssbuf" in lower or "crosscore" in lower
         static_affine_bounds = not uses_simt
@@ -3015,6 +3302,18 @@ def build_stage_b_driver_source(
         "                str(_fn), encoding='utf-8'\n"
         "            )\n"
         "        with _ascend_compile_session(_merged_pc):\n"
+        "            _pre_art = tilelang.lower(\n"
+        "                _fn, target='ascend', enable_device_compile=False\n"
+        "            )\n"
+        "            if _cfg.get('tir_dump_path'):\n"
+        "                _tir_txt = str(getattr(_pre_art, 'device_mod', None) or _fn)\n"
+        "                pathlib.Path(_cfg['tir_dump_path']).write_text(\n"
+        "                    _tir_txt, encoding='utf-8'\n"
+        "                )\n"
+        "            if _cfg.get('kernel_dump_path') and getattr(_pre_art, 'kernel_source', None):\n"
+        "                pathlib.Path(_cfg['kernel_dump_path']).write_text(\n"
+        "                    str(_pre_art.kernel_source), encoding='utf-8'\n"
+        "                )\n"
         "            _art = tilelang.lower(\n"
         "                _fn, target='ascend', enable_device_compile=True\n"
         "            )\n"
@@ -4340,6 +4639,141 @@ def ledger_to_json(ledger: ObjectivePhysicalLedger | None) -> str:
     return ledger.to_json()
 
 
+def _extract_concrete_shape_list(raw_shapes: object) -> list[tuple[int, ...]]:
+    """Extract concrete integer tensor shapes from single, multi, or nested payloads."""
+    if not isinstance(raw_shapes, (list, tuple)) or not raw_shapes:
+        return []
+    if all(isinstance(dim, int) and not isinstance(dim, bool) and dim >= 0 for dim in raw_shapes):
+        return [tuple(int(dim) for dim in raw_shapes)]
+    out: list[tuple[int, ...]] = []
+    for item in raw_shapes:
+        if item is None:
+            continue
+        if isinstance(item, (list, tuple)) and item:
+            if all(
+                isinstance(dim, int) and not isinstance(dim, bool) and dim >= 0 for dim in item
+            ):
+                out.append(tuple(int(dim) for dim in item))
+            else:
+                out.extend(_extract_concrete_shape_list(item))
+    return out
+
+
+def _resolve_proto_output_shapes(
+    proto: Mapping[str, object] | None,
+    *,
+    dims: Mapping[str, object] | None,
+    attrs: Mapping[str, object] | None,
+) -> list[tuple[int, ...]]:
+    """Resolve concrete output shapes from proto output specs when all axes are known."""
+    if not isinstance(proto, Mapping):
+        return []
+    op_block = (
+        proto["operator"]
+        if "outputs" not in proto and isinstance(proto.get("operator"), Mapping)
+        else proto
+    )
+    raw_outputs = op_block.get("outputs") if isinstance(op_block, Mapping) else None
+    if not isinstance(raw_outputs, Sequence) or isinstance(raw_outputs, (str, bytes)):
+        return []
+    dim_lookup: dict[str, int] = {}
+    for src in (attrs, dims):
+        if not isinstance(src, Mapping):
+            continue
+        for key, val in src.items():
+            if isinstance(val, int) and not isinstance(val, bool) and val >= 0:
+                dim_lookup[str(key).strip().lower()] = int(val)
+    raw_layout = ""
+    for src in (attrs, dims):
+        if isinstance(src, Mapping):
+            for lkey in ("inputLayout", "input_layout", "layout"):
+                if isinstance(src.get(lkey), str) and str(src[lkey]).strip():
+                    raw_layout = str(src[lkey]).strip().upper()
+                    break
+        if raw_layout:
+            break
+    resolved: list[tuple[int, ...]] = []
+    for item in raw_outputs:
+        if not isinstance(item, Mapping):
+            continue
+        shape_spec = item.get("shape")
+        if not isinstance(shape_spec, str) or "[" not in shape_spec:
+            continue
+        matches = re.findall(r"(?:([A-Za-z0-9_]+)\s*:\s*)?\[([^\]]+)\]", shape_spec)
+        chosen = ""
+        if raw_layout:
+            for tag, inner in matches:
+                if tag.strip().upper() == raw_layout:
+                    chosen = inner
+                    break
+        if not chosen and matches:
+            chosen = matches[0][1]
+        if not chosen:
+            continue
+        tokens = [tok.strip() for tok in chosen.split(",") if tok.strip()]
+        shape_vals: list[int] = []
+        ok = bool(tokens)
+        for tok in tokens:
+            if tok.isdigit():
+                shape_vals.append(int(tok))
+            else:
+                matched = dim_lookup.get(tok.lower())
+                if matched is None:
+                    ok = False
+                    break
+                shape_vals.append(matched)
+        if ok:
+            resolved.append(tuple(shape_vals))
+    return resolved
+
+
+def extract_ordered_tensor_shapes(
+    *,
+    case_entry: Mapping[str, object] | None = None,
+    dims: Mapping[str, object] | None = None,
+    proto: Mapping[str, object] | None = None,
+    ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
+) -> tuple[tuple[int, ...], ...] | None:
+    """Extract parameter-ordered concrete tensor shapes from case, dims, or proto specs."""
+    if ordered_tensor_shapes is not None:
+        explicit = _extract_concrete_shape_list(ordered_tensor_shapes)
+        return tuple(explicit) if explicit else None
+
+    for container in (case_entry, dims):
+        if isinstance(container, Mapping) and "ordered_tensor_shapes" in container:
+            explicit = _extract_concrete_shape_list(container.get("ordered_tensor_shapes"))
+            if explicit:
+                return tuple(explicit)
+
+    inputs: list[tuple[int, ...]] = []
+    outputs: list[tuple[int, ...]] = []
+    for container in (case_entry, dims):
+        if not isinstance(container, Mapping):
+            continue
+        if not inputs:
+            raw_in = (
+                container.get("input_shapes")
+                if "input_shapes" in container
+                else container.get("input_shape")
+            )
+            inputs = _extract_concrete_shape_list(raw_in)
+        if not outputs:
+            raw_out = (
+                container.get("output_shapes")
+                if "output_shapes" in container
+                else container.get("output_shape")
+            )
+            outputs = _extract_concrete_shape_list(raw_out)
+
+    if not outputs and proto is not None:
+        raw_attrs = case_entry.get("attrs") if isinstance(case_entry, Mapping) else None
+        attrs = raw_attrs if isinstance(raw_attrs, Mapping) else None
+        outputs = _resolve_proto_output_shapes(proto, dims=dims, attrs=attrs)
+
+    combined = [*inputs, *outputs]
+    return tuple(combined) if combined else None
+
+
 __all__ = [
     "FunnelEvaluation",
     "GateFunnel",
@@ -4351,6 +4785,7 @@ __all__ = [
     "check_npu_entrypoint_purity",
     "check_repair_monotonicity",
     "evaluate_ascendc_candidate",
+    "extract_ordered_tensor_shapes",
     "ledger_to_json",
     "parse_cce_res_usage",
     "prescreen_dsl_tile_kwargs",

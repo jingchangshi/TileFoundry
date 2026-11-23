@@ -51,10 +51,6 @@ from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
 )
 from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_MLA_DIR = _REPO_ROOT / "examples" / "ascend950pr_ops" / "mla"
-_AR_DIR = _REPO_ROOT / "examples" / "ascend950pr_ops" / "attention_residual"
-
 
 def _write_modelless_task_repo(root: Path) -> Path:
     tasks_root = root / "tasks"
@@ -245,10 +241,7 @@ def test_modelless_semantic_first_blueprints_softmax_parity_and_backtest(
         semantic_source="pytorch_golden",
         traffic_basis="declared_io_exact",
         coordinate_scope="representative_anchor",
-        has_authored_hir=False,
-        has_scheduled_hir=False,
     )
-    assert sm_packet.schedule_delta is None
     assert sm_packet.z3_pipeline_summary == {}
     assert "traffic_basis" not in sm_packet.z3_pipeline_summary
     rebuilt_sm = HirBlueprintPacket.from_dict(json.loads(json.dumps(sm_packet.to_dict())))
@@ -266,7 +259,6 @@ def test_modelless_semantic_first_blueprints_softmax_parity_and_backtest(
     assert e2e_pkt.z3_pipeline_summary == {}
     summary = _summarize_blueprint(e2e_pkt)
     assert summary["provenance"] == e2e_pkt.provenance.to_dict()
-    assert summary["schedule_delta"] is None
 
     assert agent_verify_parity is verify_reference_cpu_parity
     assert orchestrator_verify_parity is verify_reference_cpu_parity
@@ -397,22 +389,20 @@ def test_modelless_semantic_first_blueprints_softmax_parity_and_backtest(
     assert bt.p0_p1_loco_cv.mean_intra_group_spearman_rho == pytest.approx(1.0)
 
 
-def test_authored_hir_enriches_schedule_delta_without_overwriting_anchor_roofline() -> None:
-    """Supplying model.py and scheduled.py never overwrites real anchor Roofline dimensions."""
-    mla_model_src = (_MLA_DIR / "model.py").read_text(encoding="utf-8")
-    mla_sched_src = (_MLA_DIR / "scheduled.py").read_text(encoding="utf-8")
+def test_universal_blueprint_anchors_real_dims_from_pytorch_golden() -> None:
+    """Build universal blueprints from PyTorch golden forward() with exact anchor dims."""
     analyzer = PyTorchSemanticAnalyzer()
     mla_golden = dedent(
         """
         import torch
 
-        def mla(q, k, v):
+        def forward(q, k, v):
             scores = torch.matmul(q, k.transpose(-2, -1))
             probs = torch.softmax(scores, dim=-1)
             return torch.matmul(probs, v)
         """
     )
-    semantics = analyzer.analyze_source(mla_golden, entry_name="mla")
+    semantics = analyzer.analyze_source(mla_golden, entry_name="forward")
     real_anchor_dims = {
         "B": 4,
         "S_q": 256,
@@ -429,64 +419,47 @@ def test_authored_hir_enriches_schedule_delta_without_overwriting_anchor_rooflin
         output_dtype="bfloat16",
     )
 
-    golden_only = analyzer.build_universal_blueprint(
+    pkt = analyzer.build_universal_blueprint(
         semantics,
         real_anchor_dims,
-        representative_case=rep_case,
-    )
-    enriched = analyzer.build_universal_blueprint(
-        semantics,
-        real_anchor_dims,
-        authored_hir_source=mla_model_src,
-        scheduled_hir_source=mla_sched_src,
         representative_case=rep_case,
     )
 
-    assert enriched.roofline == golden_only.roofline
-    assert enriched.roofline.anchor_dims["S_q"] == 256
-    assert enriched.roofline.anchor_dims["S_kv"] == 4096
-    assert enriched.roofline.ideal_roofline_us > 10.0
-    assert enriched.provenance == BlueprintProvenance(
-        semantic_source="pytorch_golden_plus_hir",
+    assert pkt.entry_name == "forward"
+    assert pkt.roofline.anchor_dims["S_q"] == 256
+    assert pkt.roofline.anchor_dims["S_kv"] == 4096
+    assert pkt.roofline.ideal_roofline_us > 10.0
+    assert pkt.provenance == BlueprintProvenance(
+        semantic_source="pytorch_golden",
         traffic_basis="declared_io_exact",
         coordinate_scope="representative_anchor",
-        has_authored_hir=True,
-        has_scheduled_hir=True,
     )
-    assert enriched.schedule_delta is not None
-    assert enriched.schedule_delta.scheduled_ledger is not None
-    assert enriched.reference_ledger == enriched.schedule_delta.scheduled_ledger
-    assert enriched.z3_pipeline_summary == enriched.schedule_delta.z3_stage_summary
-    assert enriched.z3_pipeline_summary
-    assert "traffic_basis" not in enriched.z3_pipeline_summary
-    assert "source" not in enriched.z3_pipeline_summary
 
-    roundtrip = HirBlueprintPacket.from_dict(json.loads(json.dumps(enriched.to_dict())))
-    assert roundtrip == enriched
-    replaced = dataclasses.replace(enriched, fallback_reason="test_note")
+    roundtrip = HirBlueprintPacket.from_dict(json.loads(json.dumps(pkt.to_dict())))
+    assert roundtrip == pkt
+    replaced = dataclasses.replace(pkt, fallback_reason="test_note")
     assert replaced.fallback_reason == "test_note"
-    assert replaced.z3_pipeline_summary == enriched.z3_pipeline_summary
+    assert replaced.z3_pipeline_summary == pkt.z3_pipeline_summary
 
-    ar_model_src = (_AR_DIR / "model.py").read_text(encoding="utf-8")
-    ar_sched_src = (_AR_DIR / "scheduled.py").read_text(encoding="utf-8")
+    ar_golden = dedent(
+        """
+        import torch
+
+        def forward(v_stack, x, w, gamma):
+            rms = torch.rsqrt(v_stack.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+            scores = (v_stack * rms * gamma * w).sum(dim=-1)
+            probs = torch.softmax(scores, dim=0)
+            return 0.5 * x + 0.5 * (probs.unsqueeze(-1) * v_stack).sum(dim=0)
+        """
+    )
+    ar_semantics = analyzer.analyze_source(ar_golden, entry_name="forward")
     ar_unaligned_dims = {
-        "B": 2,
-        "S_q": 16,
-        "S_kv": 16,
-        "N_q": 8,
-        "N_kv": 8,
+        "M": 16,
         "D": 1000,
     }
-    ar_enriched = analyzer.build_universal_blueprint(
-        semantics,
-        ar_unaligned_dims,
-        authored_hir_source=ar_model_src,
-        scheduled_hir_source=ar_sched_src,
-    )
-    assert ar_enriched.roofline.anchor_dims["D_qk"] == 1000
-    assert ar_enriched.schedule_delta is not None
-    assert ar_enriched.schedule_delta.scheduled_ledger is not None
-    assert any("hir_default_dims_fallback" in d for d in ar_enriched.lowering_diagnostics)
+    ar_pkt = analyzer.build_universal_blueprint(ar_semantics, ar_unaligned_dims)
+    assert ar_pkt.roofline.anchor_dims["D"] == 1000
+    assert ar_pkt.roofline.ideal_roofline_us > 0.0
 
 
 def test_hir_blueprint_packet_strips_legacy_non_z3_keys() -> None:
@@ -707,9 +680,27 @@ def test_regime_solver_algebraic_mode_roofline_twopass_and_monotone_caliper() ->
     assert l1_caliper.policy["l1_estimated_bytes"] <= facts.l1_bytes
 
 
-def test_verify_reference_cpu_parity_optional_hir_crosscheck() -> None:
-    """Verify PyTorch golden parity can optionally cross-check HIR Twin when supplied."""
-    ar_model_src = (_AR_DIR / "model.py").read_text(encoding="utf-8")
+def test_verify_reference_cpu_parity_with_pytorch_golden_source() -> None:
+    """Verify PyTorch golden parity via golden_source and dual contract/stress profiles."""
+    ar_golden_src = dedent(
+        """
+        import math
+        import torch
+
+        def forward(v_stack, x, w, gamma):
+            vf = v_stack.to(torch.float32)
+            xf = x.to(torch.float32)
+            wf = w.to(torch.float32)
+            gf = gamma.to(torch.float32)
+            rms = torch.rsqrt(vf.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+            k = vf * rms * gf
+            d_dim = vf.shape[-1]
+            scores = (k * wf.view(1, 1, 1, d_dim)).sum(dim=-1) / math.sqrt(d_dim)
+            probs = torch.softmax(scores, dim=0)
+            agg = (probs.unsqueeze(-1) * vf).sum(dim=0)
+            return ((1.0 - 0.5) * xf + 0.5 * agg).to(v_stack.dtype)
+        """
+    )
 
     def _ar_ref(
         v_stack: torch.Tensor,
@@ -731,19 +722,20 @@ def test_verify_reference_cpu_parity_optional_hir_crosscheck() -> None:
 
     ok, msg = verify_reference_cpu_parity(
         _ar_ref,
-        golden_fn=_ar_ref,
+        golden_source=ar_golden_src,
+        entry_name="forward",
         input_specs=[
             ((4, 1, 4, 64), "bfloat16"),
             ((1, 4, 64), "bfloat16"),
             ((64,), "bfloat16"),
             ((64,), "bfloat16"),
         ],
-        authored_hir_source=ar_model_src,
         test_dims={"N": 4, "B": 1, "S": 4, "D": 64},
         dual_profile=True,
     )
     assert ok is True, msg
-    assert "hir_twin=ok" in msg
+    assert "reference_cpu_parity_passed" in msg
+    assert "stress_profile=ok" in msg
 
 
 @pytest.mark.skipif(
@@ -783,5 +775,4 @@ def test_real_stock_operators_build_blueprints_without_model_py(tmp_path: Path) 
         assert pkt.roofline.ideal_roofline_us > 0.0
         assert pkt.provenance is not None
         assert pkt.provenance.semantic_source == "pytorch_golden"
-        assert pkt.provenance.has_authored_hir is False
         assert pkt.z3_pipeline_summary == {}

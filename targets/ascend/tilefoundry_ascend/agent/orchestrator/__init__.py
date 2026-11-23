@@ -15,6 +15,7 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     StageBResult,
     StageCResult,
     evaluate_ascendc_candidate,
+    extract_ordered_tensor_shapes,
     prescreen_dsl_tile_kwargs,
     run_stage_a_static,
     run_stage_b_ascendc_compile,
@@ -69,9 +70,8 @@ from tilefoundry_ascend.agent.orchestrator.tilesize_prescreen import (
     prescreen_tile_configs,
 )
 from tilefoundry_ascend.agent.orchestrator.twin_bridge import (
-    build_tilelang_runtime_twin,
+    verify_numerical_twin,
     verify_reference_cpu_parity,
-    verify_twin_cpu_reference,
 )
 
 __all__ = [
@@ -108,7 +108,6 @@ __all__ = [
     "build_hir_seed_request",
     "build_syntax_repair_request",
     "build_progressive_llm_constraints",
-    "build_tilelang_runtime_twin",
     "format_blueprint_delta_section",
     "format_hardware_and_sil_layer",
     "format_target_dialect_layer",
@@ -117,6 +116,7 @@ __all__ = [
     "evaluate_ascendc_candidate",
     "evaluate_tile_candidate",
     "extract_creative_payload",
+    "extract_ordered_tensor_shapes",
     "extract_python_dsl",
     "extract_structural_signature",
     "format_prescreen_summary",
@@ -130,6 +130,6 @@ __all__ = [
     "run_stage_c_agent_gates",
     "synthesize_pybind_extension_wrapper",
     "synthesize_initial_dsl",
+    "verify_numerical_twin",
     "verify_reference_cpu_parity",
-    "verify_twin_cpu_reference",
 ]

@@ -965,16 +965,12 @@ def _build_blueprints(
     semantics: PyTorchOpSemantics,
     regime_specs: Sequence[RegimeTargetSpec],
     *,
-    authored_hir_source: str | None,
-    scheduled_hir_source: str | None,
     proto: Mapping[str, object] | None = None,
 ) -> dict[str, HirBlueprintPacket]:
     return {
         regime.regime_tag: analyzer.build_universal_blueprint(
             semantics,
             regime.representative_anchor_dims or regime.representative_hir_dims,
-            authored_hir_source=authored_hir_source,
-            scheduled_hir_source=scheduled_hir_source,
             representative_case=(
                 RepresentativeCase.from_case_entry(
                     regime.representative_case_entry,
@@ -1123,8 +1119,6 @@ async def prepare_operator_seed_or_takeover(
     l0_l1_validator_factory: Stage0StaticValidatorFactory,
     oracle_accuracy_validator: Callable[[str], OracleAccuracyResult],
     existing_module_path: Path | None = None,
-    authored_hir_source: str | None = None,
-    scheduled_hir_source: str | None = None,
     force_cold_start: bool = False,
     max_seed_attempts: int = 4,
     max_oracle_refinement_extension: int = 4,
@@ -1166,8 +1160,6 @@ async def prepare_operator_seed_or_takeover(
                 analyzer,
                 semantics,
                 incumbent_regimes,
-                authored_hir_source=authored_hir_source,
-                scheduled_hir_source=scheduled_hir_source,
                 proto=proto,
             ),
             attempts_used=0,
@@ -1195,8 +1187,6 @@ async def prepare_operator_seed_or_takeover(
         analyzer,
         semantics,
         provisional_regimes,
-        authored_hir_source=authored_hir_source,
-        scheduled_hir_source=scheduled_hir_source,
         proto=proto,
     )
     contract = (

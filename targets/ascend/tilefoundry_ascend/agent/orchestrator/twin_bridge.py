@@ -1,4 +1,4 @@
-"""Runtime twin bridge and HIR/TIR navigation prompt formatting for Ascend agents."""
+"""CPU reference parity and CANNBench contract oracle for Ascend agents."""
 
 from __future__ import annotations
 
@@ -8,235 +8,15 @@ import inspect
 import math
 import runpy
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import torch
 import yaml
 
-from tilefoundry.analysis import check_program
-from tilefoundry.analysis.check import program_dim_vars
-from tilefoundry.cli.source import load_authored_ir
-from tilefoundry.evaluator import EvalError, TensorValue, TupleValue, evaluate, to_torch_dtype
-from tilefoundry.ir.core.module import Module
-from tilefoundry.ir.hir.pipeline import (
-    normalize_pipeline_references,
-    rebind_cloned_pipeline_references,
-)
-from tilefoundry.ir.types import TensorType, TupleType
-from tilefoundry.ir.types.substitute import dim_vars_by_name
-from tilefoundry.ir.types.utils import static_dim_value
-from tilefoundry.runtime import DictResource, runtime_func, runtime_module
-
-
-def _coerce_output_to_cpu_tensors(value: object, expected_type: object) -> object:
-    """Convert candidate runner outputs into CPU torch.Tensors matching *expected_type*."""
-    if isinstance(expected_type, TupleType):
-        if isinstance(value, TupleValue):
-            items = value.elements
-        elif isinstance(value, (tuple, list)):
-            items = tuple(value)
-        else:
-            raise TypeError(
-                f"Expected tuple output of length {len(expected_type.fields)}, "
-                f"got {type(value).__name__}"
-            )
-        if len(items) != len(expected_type.fields):
-            raise ValueError(
-                f"Expected {len(expected_type.fields)} tuple outputs, got {len(items)}"
-            )
-        return tuple(
-            _coerce_output_to_cpu_tensors(item, field_t)
-            for item, field_t in zip(items, expected_type.fields, strict=True)
-        )
-
-    if isinstance(expected_type, TensorType):
-        if isinstance(value, TensorValue):
-            value = value.data
-        try:
-            target_dtype = to_torch_dtype(expected_type.dtype)
-        except EvalError:
-            target_dtype = None
-        if isinstance(value, torch.Tensor):
-            tensor = value.detach().cpu()
-            if target_dtype is not None and tensor.dtype != target_dtype:
-                tensor = tensor.to(dtype=target_dtype)
-            return tensor
-        if target_dtype is not None:
-            return torch.as_tensor(value, dtype=target_dtype, device="cpu")
-        return torch.as_tensor(value, device="cpu")
-
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
-    return value
-
-
-def _make_twin_method(ir_fn, runner: Callable[..., object], cls_name: str):
-    """Build a @runtime_func method preserving *ir_fn* name and non-const signature."""
-    non_const_names = [
-        param.name for param in ir_fn.params if not getattr(param, "is_const", False)
-    ]
-    sig_params = [
-        inspect.Parameter("self", inspect.Parameter.POSITIONAL_OR_KEYWORD),
-        *(
-            inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-            for name in non_const_names
-        ),
-    ]
-
-    def _method(self, *args):
-        raw_out = runner(*args)
-        return _coerce_output_to_cpu_tensors(raw_out, ir_fn.return_type)
-
-    _method.__name__ = ir_fn.name
-    _method.__qualname__ = f"{cls_name}.{ir_fn.name}"
-    _method.__signature__ = inspect.Signature(sig_params)
-    return runtime_func(_method)
-
-
-def _make_unimplemented_runner(fn_name: str) -> Callable[..., object]:
-    """Build a fallback runner for auxiliary module functions not bound to the kernel."""
-
-    def _unimplemented(*_args: object) -> object:
-        raise NotImplementedError(f"Runtime twin function {fn_name!r} has no bound runner")
-
-    return _unimplemented
-
-
-def build_tilelang_runtime_twin(
-    authored_mod: Module,
-    kernel_runner: Callable[..., object],
-    *,
-    func_name: str | None = None,
-):
-    """Construct a @runtime_module twin class wrapping *kernel_runner* for *authored_mod*."""
-    if func_name is not None:
-        target_fn = authored_mod.lookup(func_name)
-    elif authored_mod.entry is not None:
-        target_fn = authored_mod.entry_function()
-    elif len(authored_mod.functions) == 1:
-        target_fn = authored_mod.functions[0]
-    else:
-        raise ValueError(
-            f"Module {authored_mod.name!r} declares no entry and {len(authored_mod.functions)} "
-            f"functions; specify func_name"
-        )
-
-    cls_name = f"{authored_mod.name}TileLangTwin"
-    namespace: dict[str, object] = {"__module__": __name__}
-    for fn in authored_mod.functions:
-        runner = kernel_runner if fn.name == target_fn.name else _make_unimplemented_runner(fn.name)
-        namespace[fn.name] = _make_twin_method(fn, runner, cls_name)
-
-    twin_base = type(cls_name, (), namespace)
-    return runtime_module(authored_mod)(twin_base)
-
-
-def _load_authored_module(
-    source: str,
-    tmpdir: Path,
-    *,
-    test_dims: Mapping[str, int] | None,
-) -> Module:
-    """Load HIR module from *source* via build(**matched_dims) or load_authored_ir."""
-    path = tmpdir / "authored_hir.py"
-    path.write_text(source, encoding="utf-8")
-    if test_dims:
-        try:
-            ns = runpy.run_path(str(path))
-            build_fn = ns.get("build")
-            if callable(build_fn):
-                sig = inspect.signature(build_fn)
-                matched = {
-                    str(k): int(v)
-                    for k, v in test_dims.items()
-                    if str(k) in sig.parameters
-                    and sig.parameters[str(k)].kind
-                    in (
-                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                        inspect.Parameter.KEYWORD_ONLY,
-                    )
-                }
-                if matched:
-                    built = build_fn(**matched)
-                    if isinstance(built, Module):
-                        return built
-        except (ValueError, AssertionError, TypeError):
-            pass
-    return load_authored_ir(str(path))
-
-
-def _check_module_dims(mod: Module, *, test_dims: Mapping[str, int] | None):
-    """Specialize declared DimVars using *test_dims* and return (checked_mod, checked_fn)."""
-    normalize_pipeline_references(mod)
-    authored_fn = mod.entry_function()
-    declared = set(program_dim_vars(mod, authored_fn).keys()) | set(
-        dim_vars_by_name(mod.effective_topologies())
-    )
-    filtered = (
-        {str(k): int(v) for k, v in test_dims.items() if str(k) in declared}
-        if test_dims
-        else {}
-    )
-    checked_mod, checked_fn = check_program(
-        mod, authored_fn, dims=filtered if filtered else None
-    )
-    rebind_cloned_pipeline_references(checked_mod)
-    return checked_mod, checked_fn
-
-
-def _concrete_shape(ttype: TensorType, test_dims: Mapping[str, int] | None) -> tuple[int, ...]:
-    """Resolve static integer shape for *ttype*, falling back to *test_dims* or DimVar.lo."""
-    dims: list[int] = []
-    for dim in ttype.shape:
-        val = static_dim_value(dim)
-        if val is not None:
-            dims.append(int(val))
-            continue
-        dim_name = getattr(dim, "name", None)
-        if test_dims and dim_name and str(dim_name) in test_dims:
-            dims.append(int(test_dims[str(dim_name)]))
-            continue
-        lo = getattr(dim, "lo", None)
-        if isinstance(lo, int) and lo > 0:
-            dims.append(lo)
-            continue
-        raise ValueError(f"Unresolved dynamic shape dimension {dim!r} in {ttype.shape!r}")
-    return tuple(dims)
-
-
-def _synthesize_seeded_tensor(
-    ttype: TensorType,
-    generator: torch.Generator,
-    *,
-    test_dims: Mapping[str, int] | None,
-    param_name: str = "",
-    domain_profile: str = "contract",
-) -> torch.Tensor:
-    """Create a deterministic CPU tensor matching *ttype* shape, dtype, and profile."""
-    shape = _concrete_shape(ttype, test_dims)
-    target_dtype = to_torch_dtype(ttype.dtype)
-    if target_dtype.is_floating_point:
-        norm_name = str(param_name).strip().lower()
-        if domain_profile == "contract" and norm_name in ("w", "weight_zero", "bias_zero"):
-            return torch.zeros(shape, dtype=target_dtype)
-        scale = 0.5 if domain_profile == "contract" else 1.0
-        vals = torch.randn(shape, generator=generator, dtype=torch.float32) * scale
-        return vals.to(target_dtype)
-    if target_dtype == torch.bool:
-        return torch.randint(0, 2, shape, generator=generator, dtype=torch.int64).to(target_dtype)
-    return torch.randint(0, 4, shape, generator=generator, dtype=target_dtype)
-
 
 def _max_abs_diff(ref_out: object, cand_out: object) -> float:
-    if isinstance(ref_out, TensorValue):
-        ref_out = ref_out.data
-    elif isinstance(ref_out, TupleValue):
-        ref_out = tuple(
-            item.data if isinstance(item, TensorValue) else item for item in ref_out.elements
-        )
     if isinstance(ref_out, tuple) and isinstance(cand_out, (tuple, list)):
         if len(ref_out) != len(cand_out):
             return float("inf")
@@ -247,7 +27,9 @@ def _max_abs_diff(ref_out: object, cand_out: object) -> float:
     if isinstance(ref_out, torch.Tensor) and isinstance(cand_out, torch.Tensor):
         if tuple(ref_out.shape) != tuple(cand_out.shape):
             return float("inf")
-        diff = (cand_out.detach().cpu().to(torch.float32) - ref_out.detach().cpu().to(torch.float32)).abs()
+        diff = (
+            cand_out.detach().cpu().to(torch.float32) - ref_out.detach().cpu().to(torch.float32)
+        ).abs()
         return float(diff.max().item()) if diff.numel() > 0 else 0.0
     return float("inf")
 
@@ -259,14 +41,7 @@ def _compare_outputs(
     rtol: float,
     atol: float,
 ) -> tuple[bool, str]:
-    """Compare oracle and twin outputs, casting low-precision floats to float32."""
-    if isinstance(ref_out, TensorValue):
-        ref_out = ref_out.data
-    elif isinstance(ref_out, TupleValue):
-        ref_out = tuple(
-            item.data if isinstance(item, TensorValue) else item for item in ref_out.elements
-        )
-
+    """Compare oracle and candidate outputs, casting low-precision floats to float32."""
     if isinstance(ref_out, tuple):
         if not isinstance(cand_out, (tuple, list)) or len(cand_out) != len(ref_out):
             return (
@@ -307,93 +82,6 @@ def _compare_outputs(
     except AssertionError as exc:
         return False, f"twin_numeric_mismatch: {exc}"
     return True, f"shape={tuple(ref_cpu.shape)}, dtype={ref_cpu.dtype}"
-
-
-def verify_twin_cpu_reference(
-    authored_hir_source: str,
-    candidate_runner: Callable[..., object],
-    *,
-    test_dims: Mapping[str, int] | None = None,
-    rtol: float = 1e-2,
-    atol: float = 1e-2,
-    dual_profile: bool = False,
-) -> tuple[bool, str]:
-    """Compare *candidate_runner* via a @runtime_module twin against CPU HIR evaluation."""
-    def _eval_profile(
-        checked_mod,
-        checked_fn,
-        *,
-        profile: str,
-        seed: int,
-    ) -> tuple[bool, str, float]:
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(seed)
-        inputs: list[torch.Tensor] = []
-        for param in checked_fn.params:
-            if not isinstance(param.type, TensorType):
-                return (
-                    False,
-                    f"twin_unsupported_param_type: {param.name} has {type(param.type).__name__}",
-                    float("inf"),
-                )
-            inputs.append(
-                _synthesize_seeded_tensor(
-                    param.type,
-                    generator,
-                    test_dims=test_dims,
-                    param_name=param.name,
-                    domain_profile=profile,
-                )
-            )
-        ref_out = evaluate(checked_fn, *inputs)
-        twin_cls = build_tilelang_runtime_twin(
-            checked_mod,
-            candidate_runner,
-            func_name=checked_fn.name,
-        )
-        twin = twin_cls()
-        const_weights = {
-            param.name: tensor
-            for param, tensor in zip(checked_fn.params, inputs, strict=True)
-            if getattr(param, "is_const", False)
-        }
-        if const_weights:
-            twin.load(DictResource(const_weights))
-        activations = [
-            tensor
-            for param, tensor in zip(checked_fn.params, inputs, strict=True)
-            if not getattr(param, "is_const", False)
-        ]
-        cand_out = getattr(twin, checked_fn.name)(*activations)
-        ok, detail = _compare_outputs(ref_out, cand_out, rtol=rtol, atol=atol)
-        max_abs = _max_abs_diff(ref_out, cand_out)
-        return ok, detail, max_abs
-
-    try:
-        with tempfile.TemporaryDirectory(prefix="tf_twin_ref_") as tmp_dir:
-            authored_mod = _load_authored_module(
-                authored_hir_source,
-                Path(tmp_dir),
-                test_dims=test_dims,
-            )
-        checked_mod, checked_fn = _check_module_dims(authored_mod, test_dims=test_dims)
-        ok, detail, _ = _eval_profile(checked_mod, checked_fn, profile="contract", seed=0)
-        if not ok:
-            return False, detail
-        stress_suffix = ""
-        if dual_profile:
-            stress_ok, _stress_detail, stress_err = _eval_profile(
-                checked_mod,
-                checked_fn,
-                profile="stress",
-                seed=17,
-            )
-            stress_tag = "ok" if stress_ok else "warn"
-            stress_suffix = f", stress_profile={stress_tag}(max_abs={stress_err:.3e})"
-    except Exception as exc:
-        return False, f"twin_execution_error: {type(exc).__name__}: {exc}"
-
-    return True, f"twin_cpu_reference_passed: entry={checked_fn.name}, {detail}{stress_suffix}"
 
 
 def _load_golden_callable(
@@ -557,35 +245,17 @@ def verify_reference_cpu_parity(
     input_specs: Sequence[tuple[Sequence[int], str]] | None = None,
     sample_inputs: Sequence[torch.Tensor] | None = None,
     attrs: Mapping[str, object] | None = None,
-    authored_hir_source: str | None = None,
     test_dims: Mapping[str, int] | None = None,
     rtol: float = 1e-2,
     atol: float = 1e-2,
     dual_profile: bool = True,
     seed: int = 0,
 ) -> tuple[bool, str]:
-    """Compare *candidate_runner* against PyTorch golden CPU reference without model.py.
-
-    Evaluates deterministic contract and optional stress inputs on CPU in float64/float32
-    reference precision, and optionally cross-checks the HIR Twin when *authored_hir_source*
-    is explicitly provided.
-    """
-    has_hir = bool(authored_hir_source is not None and authored_hir_source.strip())
+    """Compare *candidate_runner* against a PyTorch golden CPU reference callable."""
     if golden_fn is None and (golden_source is None or not golden_source.strip()):
-        if has_hir:
-            assert authored_hir_source is not None
-            return verify_twin_cpu_reference(
-                authored_hir_source,
-                candidate_runner,
-                test_dims=test_dims,
-                rtol=rtol,
-                atol=atol,
-                dual_profile=dual_profile,
-            )
         return (
             False,
-            "reference_parity_missing_golden: provide golden_fn, golden_source, "
-            "or authored_hir_source",
+            "reference_parity_missing_golden: provide golden_fn or golden_source",
         )
 
     call_attrs = dict(attrs or {})
@@ -636,33 +306,18 @@ def verify_reference_cpu_parity(
             if not stress_ok:
                 return False, f"reference_cpu_parity_mismatch(stress): {stress_detail}"
             stress_suffix = f", stress_profile=ok(max_abs={stress_err:.3e})"
-
-        hir_suffix = ""
-        if has_hir:
-            assert authored_hir_source is not None
-            hir_ok, hir_detail = verify_twin_cpu_reference(
-                authored_hir_source,
-                candidate_runner,
-                test_dims=test_dims,
-                rtol=rtol,
-                atol=atol,
-                dual_profile=dual_profile,
-            )
-            if not hir_ok:
-                return False, f"hir_twin_crosscheck_failed: {hir_detail}"
-            hir_suffix = ", hir_twin=ok"
     except Exception as exc:
         return False, f"reference_parity_execution_error: {type(exc).__name__}: {exc}"
 
     return (
         True,
-        f"reference_cpu_parity_passed: entry={ref_name}, {detail}{stress_suffix}{hir_suffix}",
+        f"reference_cpu_parity_passed: entry={ref_name}, {detail}{stress_suffix}",
     )
 
 
 @dataclass(frozen=True)
 class NumericalTwinResult:
-    """Result of CPU numerical twin comparison between authored HIR and candidate source."""
+    """Result of CPU numerical parity comparison between golden and candidate source."""
 
     passed: bool
     error_message: str = ""
@@ -673,27 +328,10 @@ def _resolve_candidate_cpu_runner(
     candidate_source: str,
     *,
     entry_name: str,
-    anchor_dims: Mapping[str, int] | None,
 ) -> tuple[Callable[..., object] | None, str]:
-    """Extract a CPU-evaluable callable from candidate HIR or Python module source."""
+    """Extract a CPU-evaluable callable from Python candidate module source."""
     if not candidate_source.strip():
         return None, "twin_empty_candidate_source"
-    if "@module" in candidate_source:
-        try:
-            with tempfile.TemporaryDirectory(prefix="tf_twin_cand_") as tmp_dir:
-                cand_mod = _load_authored_module(
-                    candidate_source,
-                    Path(tmp_dir),
-                    test_dims=anchor_dims,
-                )
-            _checked_cand_mod, checked_cand_fn = _check_module_dims(
-                cand_mod,
-                test_dims=anchor_dims,
-            )
-            return (lambda *args: evaluate(checked_cand_fn, *args)), ""
-        except Exception as exc:
-            return None, f"twin_candidate_hir_error: {type(exc).__name__}: {exc}"
-
     try:
         with tempfile.TemporaryDirectory(prefix="tf_twin_py_") as tmp_dir:
             cand_path = Path(tmp_dir) / "candidate_mod.py"
@@ -741,44 +379,47 @@ def _resolve_candidate_cpu_runner(
 
 
 def verify_numerical_twin(
-    hir_source: str,
+    reference_source: str,
     candidate_source: str,
     *,
+    entry_name: str | None = None,
+    input_specs: Sequence[tuple[Sequence[int], str]] | None = None,
+    sample_inputs: Sequence[torch.Tensor] | None = None,
+    attrs: Mapping[str, object] | None = None,
     anchor_dims: Mapping[str, int] | None = None,
     rtol: float = 1e-2,
     atol: float = 1e-2,
+    dual_profile: bool = True,
 ) -> NumericalTwinResult:
-    """Verify candidate_source against authored HIR via CPU interpreter evaluation."""
-    if not hir_source.strip():
-        return NumericalTwinResult(passed=False, error_message="twin_empty_hir_source")
+    """Verify candidate_source against Python/PyTorch golden source on CPU."""
+    if not reference_source.strip():
+        return NumericalTwinResult(passed=False, error_message="twin_empty_reference_source")
     try:
-        with tempfile.TemporaryDirectory(prefix="tf_twin_hir_") as tmp_dir:
-            authored_mod = _load_authored_module(
-                hir_source,
-                Path(tmp_dir),
-                test_dims=anchor_dims,
-            )
-        _checked_mod, checked_fn = _check_module_dims(authored_mod, test_dims=anchor_dims)
+        ref_fn, ref_name = _load_golden_callable(reference_source, entry_name=entry_name)
     except Exception as exc:
         return NumericalTwinResult(
             passed=False,
-            error_message=f"twin_hir_load_error: {type(exc).__name__}: {exc}",
+            error_message=f"twin_reference_load_error: {type(exc).__name__}: {exc}",
         )
 
     runner, err = _resolve_candidate_cpu_runner(
         candidate_source,
-        entry_name=checked_fn.name,
-        anchor_dims=anchor_dims,
+        entry_name=ref_name,
     )
     if runner is None:
         return NumericalTwinResult(passed=False, error_message=err)
 
-    ok, detail = verify_twin_cpu_reference(
-        hir_source,
+    ok, detail = verify_reference_cpu_parity(
         runner,
+        golden_fn=ref_fn,
+        entry_name=ref_name,
+        input_specs=input_specs,
+        sample_inputs=sample_inputs,
+        attrs=attrs,
         test_dims=anchor_dims,
         rtol=rtol,
         atol=atol,
+        dual_profile=dual_profile,
     )
     return NumericalTwinResult(
         passed=ok,
@@ -832,7 +473,7 @@ _BIT_VIEW_DTYPES: dict[torch.dtype, torch.dtype] = {
 }
 
 
-def _clone_tensor_tree(value: Any) -> Any:
+def _clone_tensor_tree(value: object) -> object:
     """Deeply clone tensors inside nested lists/tuples/dicts to isolate in-place aliasing."""
     if isinstance(value, torch.Tensor):
         return value.detach().clone()
@@ -845,11 +486,11 @@ def _clone_tensor_tree(value: Any) -> Any:
     return value
 
 
-def _flatten_output_tensors(value: Any) -> list[torch.Tensor]:
+def _flatten_output_tensors(value: object) -> list[object]:
     if isinstance(value, torch.Tensor):
         return [value]
     if isinstance(value, (list, tuple)):
-        out: list[torch.Tensor] = []
+        out: list[object] = []
         for item in value:
             if isinstance(item, (list, tuple)):
                 out.extend(_flatten_output_tensors(item))
@@ -864,8 +505,8 @@ def _dtype_str_from_torch(dtype: torch.dtype) -> str:
 
 
 def compare_cannbench_tensor(
-    actual: torch.Tensor,
-    golden: torch.Tensor,
+    actual: object,
+    golden: object,
     *,
     threshold: float | None = None,
     precision_thresholds: Mapping[str, float] | None = None,
@@ -1072,7 +713,7 @@ def _coerce_vr_endpoint(val: object) -> object:
 def _synthesize_contract_tensor(
     shape: Sequence[int] | None,
     dtype_str: str,
-    value_range: Any,
+    value_range: object,
     generator: torch.Generator,
     *,
     param_name: str = "",
@@ -1118,7 +759,10 @@ def _synthesize_contract_tensor(
                 return float("-inf")
             if v == "nan":
                 return float("nan")
-        return float(v)  # type: ignore[arg-type]
+            return float(v)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+        raise TypeError(f"Unsupported value_range endpoint: {v!r}")
 
     if tdtype == torch.bool:
         lo_i = max(0, min(1, int(_to_float(lo_raw))))
@@ -1210,17 +854,21 @@ class CannbenchContractOracle:
             raise ValueError("Either operator_name or task_dir must be provided")
 
         proto_raw = yaml.safe_load((self.task_dir / "proto.yaml").read_text(encoding="utf-8")) or {}
-        self.proto: dict[str, Any] = dict(proto_raw.get("operator") or proto_raw)
+        self.proto: dict[str, object] = dict(proto_raw.get("operator") or proto_raw)
+        raw_prec = self.proto.get("precision_thresholds")
+        prec_map = raw_prec if isinstance(raw_prec, Mapping) else {}
         self.precision_thresholds: dict[str, float] = {
             str(k).lower(): float(v)
-            for k, v in (self.proto.get("precision_thresholds") or {}).items()
+            for k, v in prec_map.items()
         }
         cases_raw = yaml.safe_load((self.task_dir / "cases.yaml").read_text(encoding="utf-8")) or {}
-        self.cases: list[dict[str, Any]] = [
+        self.cases: list[dict[str, object]] = [
             dict(row) for row in (cases_raw.get("cases") or ()) if isinstance(row, Mapping)
         ]
-        self._cases_by_id: dict[int, dict[str, Any]] = {
-            int(c["case_id"]): c for c in self.cases if "case_id" in c
+        self._cases_by_id: dict[int, dict[str, object]] = {
+            int(c["case_id"]): c
+            for c in self.cases
+            if "case_id" in c and isinstance(c["case_id"], int)
         }
 
         ref_file = self.task_dir / "reference.py"
@@ -1246,7 +894,7 @@ class CannbenchContractOracle:
             raise AttributeError(f"No reference callable found in {ref_file}")
         self.get_input = getattr(mod, "get_input", None)
 
-    def get_case(self, case_num: int) -> dict[str, Any]:
+    def get_case(self, case_num: int) -> dict[str, object]:
         """Return parsed cases.yaml dictionary for *case_num*."""
         cid = int(case_num)
         if cid not in self._cases_by_id:
@@ -1264,29 +912,33 @@ class CannbenchContractOracle:
         case_num: int,
         *,
         seed: int | None = None,
-    ) -> tuple[list[Any], dict[str, Any]]:
+    ) -> tuple[list[object], dict[str, object]]:
         """Synthesize faithful CPU tensors and call kwargs for *case_num*."""
         case = self.get_case(case_num)
         gen = torch.Generator(device="cpu")
         gen.manual_seed(self._deterministic_seed(case_num, seed))
 
         raw_shapes = case.get("input_shape") or []
-        if raw_shapes and isinstance(raw_shapes[0], int):
-            shapes: list[Any] = [raw_shapes]
-        else:
+        if isinstance(raw_shapes, (list, tuple)) and raw_shapes and isinstance(raw_shapes[0], int):
+            shapes: list[object] = [raw_shapes]
+        elif isinstance(raw_shapes, (list, tuple)):
             shapes = list(raw_shapes)
+        else:
+            shapes = []
 
         raw_dtypes = case.get("dtype") or ["float32"]
         if isinstance(raw_dtypes, str):
-            dtypes: list[Any] = [raw_dtypes]
-        else:
+            dtypes: list[object] = [raw_dtypes]
+        elif isinstance(raw_dtypes, (list, tuple)):
             dtypes = list(raw_dtypes)
+        else:
+            dtypes = ["float32"]
         if len(dtypes) == 1 and len(shapes) > 1:
             dtypes = dtypes * len(shapes)
 
         raw_vr = case.get("value_range")
-        if not raw_vr:
-            value_ranges: list[Any] = [None] * len(shapes)
+        if not raw_vr or not isinstance(raw_vr, (list, tuple)):
+            value_ranges: list[object] = [None] * len(shapes)
         elif not isinstance(raw_vr[0], (list, tuple)):
             value_ranges = [raw_vr] * len(shapes)
         else:
@@ -1294,8 +946,9 @@ class CannbenchContractOracle:
             if len(value_ranges) < len(shapes):
                 value_ranges.extend([value_ranges[-1]] * (len(shapes) - len(value_ranges)))
 
-        proto_inputs = self.proto.get("inputs") or []
-        tensors: list[Any] = []
+        raw_proto_inputs = self.proto.get("inputs")
+        proto_inputs = list(raw_proto_inputs) if isinstance(raw_proto_inputs, Sequence) else []
+        tensors: list[object] = []
         for idx, sh in enumerate(shapes):
             dt = dtypes[idx] if idx < len(dtypes) else dtypes[-1]
             vr = value_ranges[idx] if idx < len(value_ranges) else value_ranges[-1]
@@ -1310,7 +963,7 @@ class CannbenchContractOracle:
                 and sh
                 and isinstance(sh[0], list)
             ):
-                sub_list: list[Any] = []
+                sub_list: list[object] = []
                 for j, sub_sh in enumerate(sh):
                     sub_dt = dt[j] if isinstance(dt, list) and j < len(dt) else dt
                     sub_vr = vr[j] if isinstance(vr, list) and j < len(vr) and isinstance(vr[j], (list, tuple)) else vr
@@ -1321,15 +974,17 @@ class CannbenchContractOracle:
                     )
                 tensors.append(sub_list)
             else:
+                sh_seq = sh if isinstance(sh, Sequence) and not isinstance(sh, (str, bytes)) else None
                 tensors.append(
                     _synthesize_contract_tensor(
-                        sh, str(dt), vr, gen, param_name=pname
+                        sh_seq, str(dt), vr, gen, param_name=pname
                     )
                 )
 
-        attrs = dict(case.get("attrs") or {})
+        raw_attrs = case.get("attrs")
+        attrs = dict(raw_attrs) if isinstance(raw_attrs, Mapping) else {}
         if callable(self.get_input):
-            gi_params = {
+            gi_params: dict[str, object] = {
                 str(item.get("name", f"arg_{i}")): tensors[i] if i < len(tensors) else None
                 for i, item in enumerate(proto_inputs)
                 if isinstance(item, Mapping)
@@ -1339,25 +994,30 @@ class CannbenchContractOracle:
             gi_params.setdefault("skip2_exist", True)
             sig_gi = inspect.signature(self.get_input)
             if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_gi.parameters.values()):
-                tensors = list(self.get_input(**gi_params))
+                gi_out = self.get_input(**gi_params)
             else:
                 filtered_gi = {k: v for k, v in gi_params.items() if k in sig_gi.parameters}
-                tensors = list(self.get_input(**filtered_gi))
+                gi_out = self.get_input(**filtered_gi)
+            assert isinstance(gi_out, Iterable) or isinstance(gi_out, Sequence)
+            tensors = list(gi_out)
 
+        assert self.reference_fn is not None
         call_kwargs = self._build_call_params(self.reference_fn, case, tensors)
         return tensors, call_kwargs
 
     def _build_call_params(
         self,
-        fn: Callable[..., Any],
-        case: Mapping[str, Any],
-        tensors: Sequence[Any],
-    ) -> dict[str, Any]:
+        fn: Callable[..., object],
+        case: Mapping[str, object],
+        tensors: Sequence[object],
+    ) -> dict[str, object]:
         sig = inspect.signature(fn)
-        params: dict[str, Any] = {}
+        params: dict[str, object] = {}
         tensor_idx = 0
-        attrs = dict(case.get("attrs") or {})
-        proto_inputs = self.proto.get("inputs") or []
+        raw_attrs = case.get("attrs")
+        attrs = dict(raw_attrs) if isinstance(raw_attrs, Mapping) else {}
+        raw_proto_inputs = self.proto.get("inputs")
+        proto_inputs = list(raw_proto_inputs) if isinstance(raw_proto_inputs, Sequence) else []
         proto_tensor_names = [
             str(item.get("name", ""))
             for item in proto_inputs
@@ -1390,20 +1050,22 @@ class CannbenchContractOracle:
     def reference_output(
         self,
         case_num: int,
-        raw_tensors: Sequence[Any] | None = None,
+        raw_tensors: Sequence[object] | None = None,
         *,
         seed: int | None = None,
         native: bool = False,
-    ) -> Any:
+    ) -> object:
         """Compute cloned, aliasing-safe oracle reference output for *case_num*."""
         if raw_tensors is None:
             raw_tensors, _ = self.synthesize_case_inputs(case_num, seed=seed)
         case = self.get_case(case_num)
-        cloned = _clone_tensor_tree(list(raw_tensors))
+        cloned_obj = _clone_tensor_tree(list(raw_tensors))
+        cloned = list(cloned_obj) if isinstance(cloned_obj, list) else list(raw_tensors)
         suffix = "_bench" if native else "_oracle"
         fn = getattr(self.reference_module, f"{self.op_name}{suffix}", self.reference_fn)
+        assert callable(fn)
         if not native:
-            def _promote_double(val: Any) -> Any:
+            def _promote_double(val: object) -> object:
                 if isinstance(val, torch.Tensor):
                     return val.double() if val.is_floating_point() else val
                 if isinstance(val, list):
@@ -1417,32 +1079,35 @@ class CannbenchContractOracle:
                 with torch.no_grad():
                     return fn(**self._build_call_params(fn, case, promoted))
             except Exception:
-                cloned = _clone_tensor_tree(list(raw_tensors))
+                recloned = _clone_tensor_tree(list(raw_tensors))
+                cloned = list(recloned) if isinstance(recloned, list) else list(raw_tensors)
         with torch.no_grad():
             return fn(**self._build_call_params(fn, case, cloned))
 
     def verify_candidate(
         self,
-        candidate_fn: Callable[..., Any],
+        candidate_fn: Callable[..., object],
         *,
         case_nums: Sequence[int] | None = None,
         seed: int | None = None,
-    ) -> tuple[bool, list[dict[str, Any]]]:
+    ) -> tuple[bool, list[dict[str, object]]]:
         """Validate candidate callable against oracle across selected cases."""
         targets = (
             [int(c) for c in case_nums]
             if case_nums is not None
-            else [int(c["case_id"]) for c in self.cases]
+            else [int(c["case_id"]) for c in self.cases if isinstance(c.get("case_id"), int)]
         )
-        proto_outputs = self.proto.get("outputs") or []
-        case_reports: list[dict[str, Any]] = []
+        raw_proto_outputs = self.proto.get("outputs")
+        proto_outputs = list(raw_proto_outputs) if isinstance(raw_proto_outputs, Sequence) else []
+        case_reports: list[dict[str, object]] = []
         all_passed = True
 
         for cid in targets:
             case = self.get_case(cid)
             raw_tensors, _ = self.synthesize_case_inputs(cid, seed=seed)
             oracle_out = self.reference_output(cid, raw_tensors, seed=seed, native=False)
-            cand_tensors = _clone_tensor_tree(raw_tensors)
+            cand_obj = _clone_tensor_tree(raw_tensors)
+            cand_tensors = list(cand_obj) if isinstance(cand_obj, Sequence) else list(raw_tensors)
             cand_params = self._build_call_params(candidate_fn, case, cand_tensors)
             actual_out = candidate_fn(**cand_params)
 
@@ -1459,7 +1124,7 @@ class CannbenchContractOracle:
                 )
                 continue
 
-            out_details: list[dict[str, Any]] = []
+            out_details: list[dict[str, object]] = []
             case_ok = True
             for i, (act_t, gold_t) in enumerate(zip(actual_list, gold_list)):
                 if i < len(proto_outputs) and isinstance(proto_outputs[i], Mapping):
@@ -1489,9 +1154,7 @@ class CannbenchContractOracle:
 __all__ = [
     "CannbenchContractOracle",
     "NumericalTwinResult",
-    "build_tilelang_runtime_twin",
     "compare_cannbench_tensor",
     "verify_numerical_twin",
     "verify_reference_cpu_parity",
-    "verify_twin_cpu_reference",
 ]

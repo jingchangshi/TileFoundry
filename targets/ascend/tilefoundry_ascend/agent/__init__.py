@@ -49,7 +49,7 @@ from tilefoundry_ascend.agent.orchestrator import (
     TileConfigCandidate,
     TwoLaneBeamSearch,
     build_progressive_llm_constraints,
-    build_tilelang_runtime_twin,
+    extract_ordered_tensor_shapes,
     format_blueprint_delta_section,
     format_hardware_and_sil_layer,
     format_prescreen_summary,
@@ -58,8 +58,8 @@ from tilefoundry_ascend.agent.orchestrator import (
     prescreen_dsl_tile_kwargs,
     prescreen_tile_configs,
     run_e2e_evolution,
+    verify_numerical_twin,
     verify_reference_cpu_parity,
-    verify_twin_cpu_reference,
 )
 from tilefoundry_ascend.agent.router import (
     CapabilityGate,
@@ -102,7 +102,7 @@ __all__ = [
     "append_dynamic_anchor",
     "build_predicate_context",
     "build_progressive_llm_constraints",
-    "build_tilelang_runtime_twin",
+    "extract_ordered_tensor_shapes",
     "format_blueprint_delta_section",
     "format_hardware_and_sil_layer",
     "format_target_dialect_layer",
@@ -120,6 +120,6 @@ __all__ = [
     "safe_eval_predicate",
     "save_rules_yaml",
     "validate_rule_predicate",
+    "verify_numerical_twin",
     "verify_reference_cpu_parity",
-    "verify_twin_cpu_reference",
 ]

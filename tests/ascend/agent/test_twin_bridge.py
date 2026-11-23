@@ -1,28 +1,24 @@
-"""Tests for NP3 runtime twin bridge, CPU oracle equivalence, and HIR/TIR navigation."""
+"""Tests for numerical twin CPU parity and PyTorch blueprint navigation."""
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
-import inspect
 import json
 import math
-from pathlib import Path
 
 import pytest
 import torch
 
-from tilefoundry.cli.source import load_authored_ir
-from tilefoundry.runtime import RuntimeModule
 from tilefoundry_ascend.agent import (
     BayesianRuleTracker,
     GateFunnel,
     MockLLMBackend,
     PortfolioRunner,
     TwoLaneBeamSearch,
-    build_tilelang_runtime_twin,
     format_blueprint_delta_section,
-    verify_twin_cpu_reference,
+    verify_numerical_twin,
+    verify_reference_cpu_parity,
 )
 from tilefoundry_ascend.agent.orchestrator import (
     BeamCandidate,
@@ -31,19 +27,14 @@ from tilefoundry_ascend.agent.orchestrator import (
     compute_static_dynamic_residual,
     extract_structural_signature,
 )
-from tilefoundry_ascend.ascend.passes.hir_tir_bridge import compile_hir_blueprint
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
     build_objective_physical_ledger,
     build_scope_waterline,
 )
-
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_AR_MODEL_PATH = _REPO_ROOT / "examples" / "ascend950pr_ops" / "attention_residual" / "model.py"
-_AR_SCHED_PATH = (
-    _REPO_ROOT / "examples" / "ascend950pr_ops" / "attention_residual" / "scheduled.py"
+from tilefoundry_ascend.ascend.sil.pytorch_frontend import (
+    PyTorchSemanticAnalyzer,
+    RepresentativeCase,
 )
-_MLA_MODEL_PATH = _REPO_ROOT / "examples" / "ascend950pr_ops" / "mla" / "model.py"
-_MLA_SCHED_PATH = _REPO_ROOT / "examples" / "ascend950pr_ops" / "mla" / "scheduled.py"
 
 _CANDIDATE_DSL = """
 import tilelang.ascend.language as T
@@ -65,6 +56,25 @@ def make_kernel():
                 T.gemm(x_l1, w_l1, acc, transpose_B=True, clear_accum=kt == 0)
             T.copy(acc, Y[0:128, 0:128])
     return main
+"""
+
+
+_AR_GOLDEN_SOURCE = """
+import math
+import torch
+
+def forward(v_stack: torch.Tensor, x: torch.Tensor, w: torch.Tensor, gamma: torch.Tensor):
+    vf = v_stack.to(torch.float32)
+    xf = x.to(torch.float32)
+    wf = w.to(torch.float32)
+    gf = gamma.to(torch.float32)
+    rms = torch.rsqrt(vf.pow(2).mean(dim=-1, keepdim=True) + 1e-6)
+    k = vf * rms * gf
+    d_dim = vf.shape[-1]
+    scores = (k * wf.view(1, 1, 1, d_dim)).sum(dim=-1) / math.sqrt(d_dim)
+    probs = torch.softmax(scores, dim=0)
+    agg = (probs.unsqueeze(-1) * vf).sum(dim=0)
+    return (0.5 * xf + 0.5 * agg).to(v_stack.dtype)
 """
 
 
@@ -91,87 +101,88 @@ def _attention_residual_torch_ref(
     return y.to(v_stack.dtype)
 
 
-def test_build_tilelang_runtime_twin_signature_and_call() -> None:
-    """Verify @runtime_module Twin exposes exact signature and returns CPU tensors."""
-    authored_mod = load_authored_ir(str(_AR_MODEL_PATH))
+def test_verify_numerical_twin_and_cpu_parity_attention_residual() -> None:
+    """Verify pure Python/PyTorch twin parity passes matching candidates and rejects mismatches."""
+    good_candidate = (
+        "import math\n"
+        "import torch\n"
+        "def forward(v_stack, x, w, gamma):\n"
+        "    vf, xf, wf, gf = v_stack.float(), x.float(), w.float(), gamma.float()\n"
+        "    rms = torch.rsqrt(vf.pow(2).mean(dim=-1, keepdim=True) + 1e-6)\n"
+        "    k = vf * rms * gf\n"
+        "    scores = (k * wf.view(1, 1, 1, vf.shape[-1])).sum(dim=-1) / math.sqrt(vf.shape[-1])\n"
+        "    probs = torch.softmax(scores, dim=0)\n"
+        "    agg = (probs.unsqueeze(-1) * vf).sum(dim=0)\n"
+        "    return (0.5 * xf + 0.5 * agg).to(v_stack.dtype)\n"
+    )
+    bad_candidate = (
+        "def forward(v_stack, x, w, gamma):\n"
+        "    return x + 0.25\n"
+    )
+    specs = [
+        ((4, 1, 4, 64), "bfloat16"),
+        ((1, 4, 64), "bfloat16"),
+        ((64,), "bfloat16"),
+        ((64,), "bfloat16"),
+    ]
+    res_ok = verify_numerical_twin(
+        _AR_GOLDEN_SOURCE,
+        good_candidate,
+        input_specs=specs,
+        dual_profile=True,
+    )
+    assert res_ok.passed is True, res_ok.error_message
+    assert "reference_cpu_parity_passed" in res_ok.detail
 
-    def _f32_runner(v_stack, x, w, gamma):
-        return _attention_residual_torch_ref(v_stack, x, w, gamma).to(torch.float32)
+    res_bad = verify_numerical_twin(
+        _AR_GOLDEN_SOURCE,
+        bad_candidate,
+        input_specs=specs,
+        dual_profile=True,
+    )
+    assert res_bad.passed is False
+    assert "twin_numeric_mismatch" in res_bad.error_message
 
-    twin_cls = build_tilelang_runtime_twin(authored_mod, _f32_runner)
-    assert issubclass(twin_cls, RuntimeModule)
-
-    method = getattr(twin_cls, "forward")
-    assert method.__name__ == "forward"
-    assert getattr(method, "_tilefoundry_runtime_func", False) is True
-    sig = inspect.signature(method)
-    assert list(sig.parameters.keys()) == ["self", "v_stack", "x", "w", "gamma"]
-
-    twin = twin_cls()
-    v_stack = torch.randn((4, 1, 4, 64), dtype=torch.bfloat16)
-    x = torch.randn((1, 4, 64), dtype=torch.bfloat16)
-    w = torch.randn((64,), dtype=torch.bfloat16)
-    gamma = torch.randn((64,), dtype=torch.bfloat16)
-
-    out_direct = twin.forward(v_stack, x, w, gamma)
-    out_call = twin(v_stack, x, w, gamma)
-    assert out_direct.device.type == "cpu"
-    assert out_direct.dtype == torch.bfloat16
-    assert tuple(out_direct.shape) == (1, 4, 64)
-    torch.testing.assert_close(out_direct.to(torch.float32), out_call.to(torch.float32))
-
-
-def test_verify_twin_cpu_reference_attention_residual_match_and_mismatch() -> None:
-    """Verify CPU evaluator oracle passes matching runner and fails perturbed runner."""
-    ar_hir = _AR_MODEL_PATH.read_text(encoding="utf-8")
-
-    ok, ok_msg = verify_twin_cpu_reference(
-        ar_hir,
+    sample_inputs = [
+        torch.randn((4, 1, 4, 64), dtype=torch.bfloat16),
+        torch.randn((1, 4, 64), dtype=torch.bfloat16),
+        torch.randn((64,), dtype=torch.bfloat16),
+        torch.randn((64,), dtype=torch.bfloat16),
+    ]
+    ok, ok_msg = verify_reference_cpu_parity(
         _attention_residual_torch_ref,
-        test_dims={"N": 4, "B": 1, "S": 4, "D": 64},
+        golden_source=_AR_GOLDEN_SOURCE,
+        sample_inputs=sample_inputs,
     )
     assert ok is True, ok_msg
-    assert "twin_cpu_reference_passed" in ok_msg
+    assert "reference_cpu_parity_passed" in ok_msg
 
-    def _perturbed_runner(v_stack, x, w, gamma):
-        return _attention_residual_torch_ref(v_stack, x, w, gamma) + 0.25
-
-    bad_ok, bad_msg = verify_twin_cpu_reference(
-        ar_hir,
-        _perturbed_runner,
-        test_dims={"N": 4, "B": 1, "S": 4, "D": 64},
+    bad_ok, bad_msg = verify_reference_cpu_parity(
+        lambda v_stack, x, w, gamma: _attention_residual_torch_ref(v_stack, x, w, gamma) + 0.25,
+        golden_source=_AR_GOLDEN_SOURCE,
+        sample_inputs=sample_inputs,
     )
     assert bad_ok is False
     assert "twin_numeric_mismatch" in bad_msg
 
 
-def test_verify_twin_cpu_reference_with_dimvars() -> None:
-    """Verify DimVar HIR modules specialize cleanly in verify_twin_cpu_reference."""
-    dimvar_hir = (
-        "from __future__ import annotations\n"
-        "from tilefoundry.dsl import *\n"
-        "from tilefoundry_ascend import AscendTarget\n"
-        "TOPOS = (Topology('block', 1), Topology('aic', 1), "
-        "Topology('aiv', 2), Topology('lane', 64))\n"
-        "M = DimVar('M', lo=1, hi=512)\n"
-        "N = DimVar('N', lo=1, hi=512)\n"
-        "@module(entry='add_scale', target=AscendTarget('ascend.950pr'), topologies=TOPOS)\n"
-        "class DimAddMod:\n"
-        "    @func\n"
-        "    def add_scale(a: Tensor[(M, N), 'f32'], b: Tensor[(M, N), 'f32']) "
-        "-> Tensor[(M, N), 'f32']:\n"
-        "        return tf.cast(a + b, dtype='f32')\n"
+def test_verify_reference_cpu_parity_with_test_dims() -> None:
+    """Verify shape-specialized test_dims inputs flow cleanly into verify_reference_cpu_parity."""
+    golden_add = (
+        "import torch\n"
+        "def forward(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:\n"
+        "    return (a + b).to(torch.float32)\n"
     )
-    ok, msg = verify_twin_cpu_reference(
-        dimvar_hir,
+    ok, msg = verify_reference_cpu_parity(
         lambda a, b: a + b,
+        golden_source=golden_add,
         test_dims={"M": 8, "N": 16, "EXTRA": 99},
     )
     assert ok is True, msg
 
-    bad_ok, bad_msg = verify_twin_cpu_reference(
-        dimvar_hir,
+    bad_ok, bad_msg = verify_reference_cpu_parity(
         lambda a, b: a - b,
+        golden_source=golden_add,
         test_dims={"M": 8, "N": 16},
     )
     assert bad_ok is False
@@ -180,12 +191,23 @@ def test_verify_twin_cpu_reference_with_dimvars() -> None:
 
 def test_format_blueprint_delta_section_and_portfolio_roofline_eta() -> None:
     """Verify navigation formatting, ledger delta, and roofline_eta residual threading."""
-    mla_hir = _MLA_MODEL_PATH.read_text(encoding="utf-8")
-    mla_sched = _MLA_SCHED_PATH.read_text(encoding="utf-8")
-    packet = compile_hir_blueprint(
-        mla_hir,
-        scheduled_hir_source=mla_sched,
-        anchor_dims={"B": 1, "S": 16, "S_kv": 16, "N_q": 4, "N_kv": 1},
+    mla_golden = (
+        "import torch\n"
+        "def forward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:\n"
+        "    return torch.matmul(q, k.transpose(-1, -2)) @ v\n"
+    )
+    analyzer = PyTorchSemanticAnalyzer()
+    semantics = analyzer.analyze_source(mla_golden, entry_name="forward")
+    raw_pkt = analyzer.build_universal_blueprint(
+        semantics,
+        anchor_dims={"B": 1, "M": 16, "N": 64, "K": 64},
+        representative_case=RepresentativeCase(
+            case_id=1,
+            input_shapes=((1, 16, 64), (1, 16, 64), (1, 16, 64)),
+            input_dtypes=("bfloat16", "bfloat16", "bfloat16"),
+            output_dtype="bfloat16",
+            output_shapes=((1, 16, 64),),
+        ),
     )
     tl_ledger = build_objective_physical_ledger(
         analysis_mode="exact_modulo_z3",
@@ -202,6 +224,7 @@ def test_format_blueprint_delta_section_and_portfolio_roofline_eta() -> None:
         },
         gm_roundtrip_bytes=8192,
     )
+    packet = dataclasses.replace(raw_pkt, reference_ledger=tl_ledger)
     nav_text = format_blueprint_delta_section(packet, current_ledger=tl_ledger)
     assert "### LAYER 3: PHYSICAL ROOFLINE & BLUEPRINT DELTA" in nav_text
     assert "T.ascend_mmad" not in nav_text
@@ -276,8 +299,11 @@ def test_format_blueprint_delta_section_and_portfolio_roofline_eta() -> None:
 
 def test_format_blueprint_delta_section_gates_cross_scale_deltas() -> None:
     """Verify shape mismatch suppresses raw byte/cycle deltas in favor of normalized usage."""
-    ar_hir = _AR_MODEL_PATH.read_text(encoding="utf-8")
-    ar_sched = _AR_SCHED_PATH.read_text(encoding="utf-8")
+    ar_golden = (
+        "import torch\n"
+        "def forward(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:\n"
+        "    return (x + w).to(torch.float32)\n"
+    )
     tl_ledger = build_objective_physical_ledger(
         analysis_mode="exact_modulo_z3",
         is_legal=True,
@@ -294,11 +320,20 @@ def test_format_blueprint_delta_section_gates_cross_scale_deltas() -> None:
         gm_roundtrip_bytes=4096,
     )
 
-    exact_pkt = compile_hir_blueprint(
-        ar_hir,
-        scheduled_hir_source=ar_sched,
-        anchor_dims={"N": 4, "B": 1, "S": 4, "D": 64},
+    analyzer = PyTorchSemanticAnalyzer()
+    semantics = analyzer.analyze_source(ar_golden, entry_name="forward")
+    raw_pkt = analyzer.build_universal_blueprint(
+        semantics,
+        anchor_dims={"M": 4, "D": 64},
+        representative_case=RepresentativeCase(
+            case_id=1,
+            input_shapes=((4, 64), (4, 64)),
+            input_dtypes=("float32", "float32"),
+            output_dtype="float32",
+            output_shapes=((4, 64),),
+        ),
     )
+    exact_pkt = dataclasses.replace(raw_pkt, reference_ledger=tl_ledger)
     assert exact_pkt.shape_exact_match is True
     exact_nav = format_blueprint_delta_section(exact_pkt, current_ledger=tl_ledger)
     assert "[Structural Reference Only:" not in exact_nav
@@ -306,20 +341,12 @@ def test_format_blueprint_delta_section_gates_cross_scale_deltas() -> None:
     assert "gm_roundtrip_bytes:" in exact_nav
     assert "delta=" in exact_nav
 
-    with pytest.raises(ValueError, match="D % 64 == 0"):
-        compile_hir_blueprint(
-            ar_hir,
-            scheduled_hir_source=ar_sched,
-            anchor_dims={"N": 8, "B": 1, "S": 4, "D": 1000},
-        )
-
     fallback_pkt = dataclasses.replace(
         exact_pkt,
         shape_exact_match=False,
-        requested_anchor_dims={"N": 8, "B": 1, "S": 4, "D": 1000},
-        fallback_reason="ValueError: D % 64 != 0",
+        requested_anchor_dims={"M": 8, "N": 1000},
+        fallback_reason="shape_mismatch: representative_anchor",
     )
-    assert fallback_pkt.resolved_hir_dims == {"N": 4, "B": 1, "S": 4, "D": 64}
     assert fallback_pkt.fallback_reason is not None
     gated_nav = format_blueprint_delta_section(fallback_pkt, current_ledger=tl_ledger)
     assert "[Structural Reference Only:" in gated_nav
@@ -331,43 +358,26 @@ def test_format_blueprint_delta_section_gates_cross_scale_deltas() -> None:
     assert "delta=" not in gated_nav
 
 
-def test_up3_twin_reference_contract_profile_and_dual_profile() -> None:
-    """Verify contract profile zero-inits w and dual_profile logs stress deltas."""
-    import torch  # noqa: PLC0415
-
-    w_hir = (
-        "from __future__ import annotations\n"
-        "from tilefoundry.dsl import *\n"
-        "from tilefoundry_ascend import AscendTarget\n"
-        "TOPOS = (Topology('block', 1), Topology('aic', 1), "
-        "Topology('aiv', 2), Topology('lane', 64))\n"
-        "@module(entry='fwd', target=AscendTarget('ascend.950pr'), topologies=TOPOS)\n"
-        "class BiasMod:\n"
-        "    @func\n"
-        "    def fwd(x: Tensor[(4, 8), 'f32'], w: Tensor[(4, 8), 'f32']) -> Tensor[(4, 8), 'f32']:\n"
-        "        return tf.cast(x + w, dtype='f32')\n"
+def test_up3_twin_reference_dual_profile_runs_both_profiles() -> None:
+    """Verify dual_profile executes both nominal and stress CPU parity checks."""
+    bias_golden = (
+        "import torch\n"
+        "def fwd(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:\n"
+        "    return (x + w).to(torch.float32)\n"
     )
-    ok_fast, msg_fast = verify_twin_cpu_reference(
-        w_hir,
-        lambda x, _w: x,
-        dual_profile=True,
-    )
-    assert ok_fast is True, msg_fast
-    assert "stress_profile=warn" in msg_fast
-
     seen_w: list[torch.Tensor] = []
 
-    def _capture_exact(x, w):
+    def _capture_exact(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         seen_w.append(w.detach().clone())
         return x + w
 
-    ok_exact, msg_exact = verify_twin_cpu_reference(
-        w_hir,
+    ok_exact, msg_exact = verify_reference_cpu_parity(
         _capture_exact,
+        golden_source=bias_golden,
+        input_specs=[((4, 8), "float32"), ((4, 8), "float32")],
         dual_profile=True,
     )
     assert ok_exact is True, msg_exact
     assert "stress_profile=ok" in msg_exact
     assert len(seen_w) == 2
-    assert torch.all(seen_w[0] == 0)
-    assert torch.any(seen_w[1] != 0)
+    assert not torch.allclose(seen_w[0], seen_w[1])
