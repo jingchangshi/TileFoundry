@@ -243,6 +243,7 @@ class PyTorchOpSemantics:
     preserves_input_shape: bool = False
     has_conv: bool = False
     transcendental_op_count: int = 0
+    has_gemm_contraction: bool | None = None
 
     def __post_init__(self) -> None:
         if not self.entry_name.strip():
@@ -254,6 +255,8 @@ class PyTorchOpSemantics:
         if self.transcendental_op_count < 0:
             raise ValueError("PyTorchOpSemantics.transcendental_op_count must be non-negative")
         object.__setattr__(self, "reduction_axes", axes)
+        if self.has_gemm_contraction is None:
+            object.__setattr__(self, "has_gemm_contraction", bool(self.has_matmul))
 
     @property
     def base_axes(self) -> TopologyAxes:
@@ -1247,6 +1250,29 @@ def _priced_traffic(
     return total_bytes, traffic_basis
 
 
+def _einsum_is_gemm_contraction(call_node: ast.Call) -> bool:
+    """Return True iff *call_node* represents a rank-2+ bilinear GEMM-style contraction."""
+    if not call_node.args:
+        return True
+    first_arg = call_node.args[0]
+    if not (isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str)):
+        return True
+    eq = first_arg.value.replace(" ", "").replace("...", "")
+    if "->" in eq:
+        lhs_str, rhs_str = eq.split("->", 1)
+    else:
+        lhs_str = eq
+        letters = [ch for ch in lhs_str if ch.isalpha()]
+        rhs_str = "".join(ch for ch in letters if letters.count(ch) == 1)
+    terms = lhs_str.split(",")
+    if len(terms) != 2:
+        return True
+    a0 = {ch for ch in terms[0] if ch.isalpha()}
+    a1 = {ch for ch in terms[1] if ch.isalpha()}
+    out = {ch for ch in rhs_str if ch.isalpha()}
+    return bool((a0 & a1) - out) and bool((a0 - a1) & out) and bool((a1 - a0) & out)
+
+
 class PyTorchSemanticAnalyzer:
     """Recover PyTorch semantics, physics ratios, and analytical HIR blueprints."""
 
@@ -1338,6 +1364,7 @@ class PyTorchSemanticAnalyzer:
         reduction_axes: set[int] = set()
         has_matmult = False
         has_loop = False
+        has_einsum_gemm = False
         transcendental_op_count = 0
         for node in nodes:
             if isinstance(node, ast.MatMult):
@@ -1350,6 +1377,8 @@ class PyTorchSemanticAnalyzer:
                     call_names.add(call_name)
                     if call_name in _TRANSCENDENTAL_CALL_NAMES:
                         transcendental_op_count += 1
+                    if call_name == "einsum" and _einsum_is_gemm_contraction(node):
+                        has_einsum_gemm = True
                 if call_name in _REDUCTION_CALL_NAMES:
                     for keyword in node.keywords:
                         if keyword.arg in _DIM_KEYWORDS:
@@ -1370,9 +1399,14 @@ class PyTorchSemanticAnalyzer:
             )
 
         preserves_input_shape = _detect_return_shape_preservation(entry, resolve_call)
+        non_einsum_gemm_names = _MATMUL_CALL_NAMES - {"einsum", "mv", "addmv"}
+        has_gemm_contraction = (
+            has_matmult or bool(call_names & non_einsum_gemm_names) or has_einsum_gemm
+        )
         return PyTorchOpSemantics(
             entry_name=entry_name,
             has_matmul=has_matmult or bool(call_names & _MATMUL_CALL_NAMES),
+            has_gemm_contraction=has_gemm_contraction,
             has_reduction=bool(call_names & _REDUCTION_CALL_NAMES),
             reduction_axes=tuple(sorted(reduction_axes)),
             has_online_exp_max=has_exp and has_max,

@@ -3797,6 +3797,9 @@ def _max_nonzero_const_magnitude(expr, *, tirx) -> int:
     return max_val
 
 
+_MAX_SAFE_SPEC_INT = 1 << 22
+
+
 def _ensure_positive_denominators(
     denominators: Sequence[object],
     spec_var_map: dict[object, object],
@@ -3808,7 +3811,7 @@ def _ensure_positive_denominators(
     tvm_mod,
     max_rounds: int = 24,
 ) -> None:
-    """Iteratively raise free integer vars so every static denominator simplifies >= 1."""
+    """Iteratively adjust free integer vars so every static denominator simplifies >= 1."""
     if not denominators:
         return
 
@@ -3839,14 +3842,29 @@ def _ensure_positive_denominators(
                 spec_var_map[fv] = tirx.IntImm(dtype_str, 1)
 
     analyzer = tvm_mod.arith.Analyzer()
+
+    def _safe_simplify_int(expr) -> tuple[int | None, bool]:
+        try:
+            return _static_tirx_int(analyzer.simplify(expr)), False
+        except Exception:
+            return None, True
+
+    def _set_var_val(key, new_val: int) -> bool:
+        cur_v = _static_tirx_int(spec_var_map[key])
+        if cur_v is not None and int(cur_v) == int(new_val):
+            return False
+        dtype_str = str(getattr(key, "dtype", "int32") or "int32")
+        spec_var_map[key] = tirx.IntImm(dtype_str, int(new_val))
+        return True
+
     for _ in range(max_rounds):
         changed = False
         for denom in denominators:
             sub_denom = (
                 tirx.stmt_functor.substitute(denom, spec_var_map) if spec_var_map else denom
             )
-            simp_val = _static_tirx_int(analyzer.simplify(sub_denom))
-            if simp_val is None or simp_val > 0:
+            simp_val, simp_err = _safe_simplify_int(sub_denom)
+            if not simp_err and (simp_val is None or simp_val > 0):
                 continue
             candidates = [
                 fv for fv in _free_tirx_vars(denom, tirx=tirx) if _is_allowed_int_var(fv)
@@ -3856,7 +3874,8 @@ def _ensure_positive_denominators(
             max_const = _max_nonzero_const_magnitude(denom, tirx=tirx)
 
             def _next_val(cur_v: int, floor_const: int = max_const) -> int:
-                return max(floor_const, 1) if cur_v <= 0 else max(cur_v * 2, floor_const, 1)
+                raw = max(floor_const, 1) if cur_v <= 0 else max(cur_v * 2, floor_const, 1)
+                return min(_MAX_SAFE_SPEC_INT, raw)
 
             nonpos_keys = []
             for fv in candidates:
@@ -3867,9 +3886,8 @@ def _ensure_positive_denominators(
                         nonpos_keys.append((key, cur_v))
             if nonpos_keys:
                 for key, cur_v in nonpos_keys:
-                    dtype_str = str(getattr(key, "dtype", "int32") or "int32")
-                    spec_var_map[key] = tirx.IntImm(dtype_str, _next_val(cur_v))
-                changed = True
+                    if _set_var_val(key, _next_val(cur_v)):
+                        changed = True
                 continue
 
             if len(candidates) == 1:
@@ -3877,45 +3895,87 @@ def _ensure_positive_denominators(
                 if key is not None:
                     cur_v = _static_tirx_int(spec_var_map[key])
                     cur_int = 0 if cur_v is None else int(cur_v)
-                    dtype_str = str(getattr(key, "dtype", "int32") or "int32")
-                    spec_var_map[key] = tirx.IntImm(dtype_str, _next_val(cur_int))
-                    changed = True
+                    if _set_var_val(key, _next_val(cur_int)):
+                        changed = True
                 continue
 
-            best_key = None
-            best_next = 0
-            best_trial = simp_val
+            cur_ints: dict[int, int] = {}
+            cand_keys: list[tuple[object, int]] = []
             for fv in candidates:
                 key = _find_key(fv)
                 if key is None:
                     continue
                 cur_v = _static_tirx_int(spec_var_map[key])
                 cur_int = 0 if cur_v is None else int(cur_v)
-                cand_next = _next_val(cur_int)
+                cur_ints[id(key)] = cur_int
+                cand_keys.append((key, cur_int))
+
+            best_key = None
+            best_next = 0
+            best_trial = None if (simp_err or simp_val is None) else int(simp_val)
+            for key, cur_int in cand_keys:
+                other_prod = 1
+                for o_key, o_int in cand_keys:
+                    if o_key is not key:
+                        other_prod = min(_MAX_SAFE_SPEC_INT, other_prod * max(1, o_int))
+                double_val = _next_val(cur_int)
+                boost_val = min(
+                    _MAX_SAFE_SPEC_INT,
+                    max(
+                        double_val,
+                        cur_int * max(max_const, 2) * 2,
+                        other_prod * max(max_const, 1),
+                    ),
+                )
+                probe_vals = [double_val] if boost_val == double_val else [boost_val, double_val]
+                dtype_str = str(getattr(key, "dtype", "int32") or "int32")
+                for cand_next in probe_vals:
+                    if cand_next == cur_int:
+                        continue
+                    trial_map = dict(spec_var_map)
+                    trial_map[key] = tirx.IntImm(dtype_str, cand_next)
+                    trial_sub = tirx.stmt_functor.substitute(denom, trial_map)
+                    trial_val, trial_err = _safe_simplify_int(trial_sub)
+                    if trial_err or trial_val is None:
+                        continue
+                    if trial_val > 0 and (best_trial is None or trial_val > best_trial or best_trial <= 0):
+                        best_trial = trial_val
+                        best_key = key
+                        best_next = cand_next
+                        break
+                    if best_trial is None or trial_val > best_trial:
+                        best_trial = trial_val
+                        best_key = key
+                        best_next = cand_next
+
+            if best_key is not None and (best_trial is not None and best_trial > 0):
+                if _set_var_val(best_key, best_next):
+                    changed = True
+                continue
+
+            for key, cur_int in cand_keys:
+                if cur_int <= 1:
+                    continue
                 dtype_str = str(getattr(key, "dtype", "int32") or "int32")
                 trial_map = dict(spec_var_map)
-                trial_map[key] = tirx.IntImm(dtype_str, cand_next)
+                trial_map[key] = tirx.IntImm(dtype_str, 1)
                 trial_sub = tirx.stmt_functor.substitute(denom, trial_map)
-                trial_val = _static_tirx_int(analyzer.simplify(trial_sub))
-                if trial_val is not None and trial_val > best_trial:
-                    best_trial = trial_val
+                trial_val, trial_err = _safe_simplify_int(trial_sub)
+                if not trial_err and trial_val is not None and trial_val > 0:
                     best_key = key
-                    best_next = cand_next
+                    best_next = 1
+                    best_trial = trial_val
+                    break
 
             if best_key is not None:
-                dtype_str = str(getattr(best_key, "dtype", "int32") or "int32")
-                spec_var_map[best_key] = tirx.IntImm(dtype_str, best_next)
-                changed = True
-            else:
-                for fv in candidates:
-                    key = _find_key(fv)
-                    if key is None:
-                        continue
-                    cur_v = _static_tirx_int(spec_var_map[key])
-                    cur_int = 0 if cur_v is None else int(cur_v)
-                    dtype_str = str(getattr(key, "dtype", "int32") or "int32")
-                    spec_var_map[key] = tirx.IntImm(dtype_str, _next_val(cur_int))
+                if _set_var_val(best_key, best_next):
                     changed = True
+            else:
+                growable = [(key, cur_int) for key, cur_int in cand_keys if cur_int < _MAX_SAFE_SPEC_INT]
+                if growable:
+                    min_key, min_cur = min(growable, key=lambda item: item[1])
+                    if _set_var_val(min_key, _next_val(min_cur)):
+                        changed = True
         if not changed:
             break
 

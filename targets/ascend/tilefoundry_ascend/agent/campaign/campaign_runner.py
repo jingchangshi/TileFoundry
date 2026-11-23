@@ -3330,6 +3330,26 @@ class PerfTargetCampaignRunner:
                     )
         return ConstraintRelaxationMask.bottom()
 
+    def _resolve_trackb_baseline_tu(
+        self,
+        regime_spec: RegimeTargetSpec,
+    ) -> str | None:
+        """Return baseline Track-B TU for differential forbidden-token checks."""
+        if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
+            return None
+        baseline_src = self._active_incumbent_source
+        if not baseline_src and self._target_module_path.is_file():
+            try:
+                baseline_src = self._target_module_path.read_text(encoding="utf-8")
+            except OSError:
+                baseline_src = ""
+        if not baseline_src:
+            return None
+        base_tb = _extract_trackb_cpp_source(baseline_src, regime_spec)
+        if base_tb is None:
+            return None
+        return self._instantiate_trackb_tu(baseline_src, base_tb[1], regime_spec)
+
     def _compile_trackb_stage_b(
         self,
         cpp_source: str,
@@ -3416,13 +3436,16 @@ class PerfTargetCampaignRunner:
     ) -> StageAResult:
         op_semantics = self._resolve_operator_semantics_for_gates()
         req_dma = bool(op_semantics is not None and not op_semantics.has_indirect_index)
-        req_cube = bool(op_semantics is not None and op_semantics.has_matmul)
+        req_cube = bool(op_semantics is not None and op_semantics.has_gemm_contraction)
         is_hybrid = regime_spec.runtime_backend == "hybrid_trackb"
         has_prim_func = _has_prim_func_builder(module_source, regime_spec.builder_candidates)
         tb_extracted = (
             _extract_trackb_cpp_source(module_source, regime_spec)
             if regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
             else None
+        )
+        baseline_tb_tu = (
+            self._resolve_trackb_baseline_tu(regime_spec) if tb_extracted is not None else None
         )
         if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
             active_mask = self._resolve_trackb_freedom_mask(regime_spec)
@@ -3435,6 +3458,7 @@ class PerfTargetCampaignRunner:
                 target=self._target,
                 enable_track_router=self._enable_track_router,
                 case_ratios=regime_spec.representative_case_ratios,
+                baseline_cpp_source=baseline_tb_tu,
                 require_hardware_dma=req_dma,
                 require_cube_engine=req_cube,
                 module_source=module_source,
@@ -3497,6 +3521,7 @@ class PerfTargetCampaignRunner:
                     target=self._target,
                     enable_track_router=self._enable_track_router,
                     case_ratios=regime_spec.representative_case_ratios,
+                    baseline_cpp_source=baseline_tb_tu,
                     require_hardware_dma=req_dma,
                     require_cube_engine=req_cube,
                     module_source=module_source,
@@ -3540,6 +3565,7 @@ class PerfTargetCampaignRunner:
                 target=self._target,
                 enable_track_router=self._enable_track_router,
                 case_ratios=regime_spec.representative_case_ratios,
+                baseline_cpp_source=baseline_tb_tu,
                 require_hardware_dma=req_dma,
                 require_cube_engine=False,
                 module_source=module_source,

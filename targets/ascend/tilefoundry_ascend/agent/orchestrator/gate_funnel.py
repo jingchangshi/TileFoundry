@@ -985,7 +985,7 @@ def _split_top_level_call_args(inner: str) -> list[str]:
 
 
 def _collect_global_kernel_names(masked_source: str) -> set[str]:
-    """Collect function identifiers declared or defined with the ``__global__`` qualifier."""
+    """Collect function identifiers declared with ``__global__``, directly or via macros."""
     globals_set: set[str] = set()
     for match in re.finditer(r"\b__global__\b", masked_source):
         tail = masked_source[match.end() : match.end() + 512]
@@ -1009,6 +1009,59 @@ def _collect_global_kernel_names(masked_source: str) -> set[str]:
                 paren_depth += 1
             elif ch == ")" and paren_depth > 0:
                 paren_depth -= 1
+
+    joined = re.sub(r"\\\r?\n", " ", masked_source)
+    macro_specs: list[tuple[str, tuple[str, ...], str]] = []
+    non_define_lines: list[str] = []
+    define_re = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s+(.*)$")
+    for raw_line in joined.splitlines():
+        m_def = define_re.match(raw_line)
+        if m_def is None:
+            non_define_lines.append(raw_line)
+            continue
+        macro_name, raw_params, body = m_def.group(1), m_def.group(2), m_def.group(3)
+        global_m = re.search(r"\b__global__\b", body)
+        if global_m is None:
+            continue
+        after_global = body[global_m.end() :]
+        paren_depth = 0
+        name_expr = ""
+        for idx, ch in enumerate(after_global):
+            if ch == "(":
+                if paren_depth == 0:
+                    prefix = after_global[:idx].rstrip()
+                    expr_m = re.search(
+                        r"([A-Za-z_]\w*(?:\s*##\s*[A-Za-z_]\w*)*)\s*$",
+                        prefix,
+                    )
+                    if expr_m is not None:
+                        cand_expr = expr_m.group(1).strip()
+                        if cand_expr not in ("__mix__", "__launch_bounds__", "decltype"):
+                            name_expr = cand_expr
+                            break
+                paren_depth += 1
+            elif ch == ")" and paren_depth > 0:
+                paren_depth -= 1
+        if name_expr:
+            params = tuple(p.strip() for p in raw_params.split(",") if p.strip())
+            if params:
+                macro_specs.append((macro_name, params, name_expr))
+
+    if macro_specs:
+        non_define_src = "\n".join(non_define_lines)
+        for macro_name, params, name_expr in macro_specs:
+            expr_tokens = re.split(r"\s*##\s*", name_expr)
+            for inv_m in re.finditer(rf"\b{re.escape(macro_name)}\s*\(", non_define_src):
+                inner = _extract_balanced_paren_arg_list(non_define_src, inv_m.end() - 1)
+                if inner is None:
+                    continue
+                args = _split_top_level_call_args(inner)
+                if len(args) < len(params):
+                    continue
+                param_map = dict(zip(params, args))
+                expanded = "".join(param_map.get(tok, tok) for tok in expr_tokens)
+                if re.fullmatch(r"[A-Za-z_]\w*", expanded):
+                    globals_set.add(expanded)
     return globals_set
 
 
