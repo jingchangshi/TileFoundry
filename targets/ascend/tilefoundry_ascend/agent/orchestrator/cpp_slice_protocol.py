@@ -34,6 +34,22 @@ _IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
 _C_CONTROL_KEYWORDS = frozenset({"if", "for", "while", "switch", "return", "sizeof", "alignof"})
 _SIBLING_MARKER_RE = re.compile(r"/\*\s*\[READ-ONLY SIBLING KERNEL:")
 _LAUNCH_CONFIG_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;{}]*>)?\s*<<<")
+_MARKDOWN_FENCE_LINE_RE = re.compile(r"^\s*```[A-Za-z0-9_+.-]*\s*$")
+_DEVICE_QUALIFIER_RE = re.compile(
+    r"__(?:global|aicore|simd_vf|simt_vf|simd_callee|simt_callee)__\b"
+)
+
+
+def strip_markdown_fence_lines(text: str) -> str:
+    """Strip leading, trailing, or embedded Markdown code fence lines from LLM C++ output."""
+    if "```" not in text:
+        return text
+    kept = [
+        line
+        for line in text.splitlines(keepends=True)
+        if not _MARKDOWN_FENCE_LINE_RE.match(line.rstrip("\r\n"))
+    ]
+    return "".join(kept).strip("\n") + ("\n" if text.endswith("\n") and kept else "")
 
 
 @dataclass(frozen=True)
@@ -172,7 +188,10 @@ def _split_cpp_units(cpp_source: str) -> tuple[list[str], list[_CppUnit]]:
             block_text = cpp_source[start_char:end_char]
             sig_head = block_text.split("{", 1)[0].strip()
             is_struct = bool(
-                re.match(r"^(?:struct|enum|using|typedef)\b", sig_head)
+                re.match(
+                    r"^(?:template\s*<[^>]*>\s*)?(?:struct|enum|using|typedef)\b",
+                    sig_head,
+                )
                 or (
                     re.match(r"^(?:static\s+)?constexpr\b", sig_head)
                     and ("(" not in sig_head or "=" in sig_head.split("(", 1)[0])
@@ -252,15 +271,45 @@ def extract_trackb_launcher_preview(module_source: str, *, max_bytes: int = 1600
     return joined
 
 
+def _host_launcher_units(
+    units: Sequence[_CppUnit],
+    *,
+    outside_cpp: str = "",
+) -> tuple[list[_CppUnit], set[str]]:
+    """Collect non-device host launcher units and kernel names they launch via <<<...>>>."""
+    host_units = [
+        u
+        for u in units
+        if u.kind == "helper"
+        and not _DEVICE_QUALIFIER_RE.search(u.signature)
+        and "<<<" in u.text
+    ]
+    prioritized: list[_CppUnit] = []
+    fallback: list[_CppUnit] = []
+    for unit in host_units:
+        if outside_cpp and unit.name and re.search(rf"\b{re.escape(unit.name)}\b", outside_cpp):
+            prioritized.append(unit)
+        else:
+            fallback.append(unit)
+    ordered = prioritized if prioritized else fallback
+    launched: set[str] = set()
+    for unit in ordered:
+        masked = strip_cpp_comments_and_strings(unit.text)
+        for m in _LAUNCH_CONFIG_RE.finditer(masked):
+            launched.add(m.group(1))
+    return ordered, launched
+
+
 def select_active_trackb_kernel(
     cpp_source: str,
     *,
     active_kernel: str | None = None,
-    regime_tag: str = "",
-    module_source: str = "",
+    regime_tag: str | None = "",
+    module_source: str | None = "",
 ) -> str | None:
     """Resolve the active ``__global__`` kernel name for scoped Track-B context extraction."""
-    _, units = _split_cpp_units(cpp_source)
+    clean_cpp = strip_markdown_fence_lines(cpp_source)
+    _, units = _split_cpp_units(clean_cpp)
     kernels = [u for u in units if u.kind == "kernel" and u.name]
     if not kernels:
         return None
@@ -269,6 +318,19 @@ def select_active_trackb_kernel(
             if unit.name == active_kernel:
                 return unit.name
         return None
+    mod_src = str(module_source or "")
+    outside_cpp = mod_src.replace(cpp_source, "").replace(clean_cpp, "") if mod_src else ""
+    _, cpp_launched_names = _host_launcher_units(units, outside_cpp=outside_cpp)
+    outside_launched_names = (
+        {
+            unit.name
+            for unit in kernels
+            if re.search(rf"\b{re.escape(unit.name)}\s*(?:<[^>]*>)?\s*<<<", outside_cpp)
+        }
+        if outside_cpp
+        else set()
+    )
+    launched_names = outside_launched_names or cpp_launched_names
     tag = str(regime_tag or "").lower()
     if tag:
         tokens = [tok for tok in re.split(r"[^a-z0-9]+", tag) if len(tok) >= 3]
@@ -276,20 +338,20 @@ def select_active_trackb_kernel(
             kernels,
             key=lambda u: (
                 -sum(1 for t in tokens if t in u.name.lower()),
+                -(1 if u.name in launched_names else 0),
                 -u.line_count,
             ),
         )
         if scored and any(t in scored[0].name.lower() for t in tokens):
             return scored[0].name
-    if module_source:
-        outside_cpp = module_source.replace(cpp_source, "")
-        launched = [
-            unit
-            for unit in kernels
-            if re.search(rf"\b{re.escape(unit.name)}\s*(?:<[^>]*>)?\s*<<<", outside_cpp)
-        ]
+    if outside_launched_names:
+        launched = [u for u in kernels if u.name in outside_launched_names]
+        return max(launched, key=lambda u: u.line_count).name
+    if cpp_launched_names:
+        launched = [u for u in kernels if u.name in cpp_launched_names]
         if launched:
             return max(launched, key=lambda u: u.line_count).name
+    if outside_cpp:
         called = [
             unit
             for unit in kernels
@@ -298,6 +360,62 @@ def select_active_trackb_kernel(
         if called:
             return max(called, key=lambda u: u.line_count).name
     return kernels[0].name
+
+
+def extract_reachable_trackb_source(
+    cpp_source: str,
+    *,
+    module_source: str | None = None,
+    regime_tag: str | None = None,
+) -> tuple[str, str]:
+    """Extract the launched entry kernel and its static reachable C++20 subgraph."""
+    clean_cpp = strip_markdown_fence_lines(cpp_source)
+    directives, units = _split_cpp_units(clean_cpp)
+    entry_kernel = select_active_trackb_kernel(
+        clean_cpp,
+        regime_tag=regime_tag or "",
+        module_source=module_source or "",
+    )
+    if entry_kernel is None:
+        return "", clean_cpp
+
+    entry_unit = next((u for u in units if u.kind == "kernel" and u.name == entry_kernel), None)
+    if entry_unit is None:
+        return "", clean_cpp
+
+    callables_by_name = {
+        u.name: u for u in units if u.kind in ("kernel", "helper") and u.name
+    }
+    reached_names = _helper_call_closure(entry_unit, callables_by_name)
+    reached_names.add(entry_kernel)
+
+    host_launchers, _ = _host_launcher_units(units)
+    entry_launch_re = re.compile(rf"\b{re.escape(entry_kernel)}\s*(?:<[^;{{}}]*>)?\s*<<<")
+    kept_launcher_starts = {
+        u.start_char
+        for u in host_launchers
+        if entry_launch_re.search(strip_cpp_comments_and_strings(u.text))
+    }
+
+    kept_units: list[_CppUnit] = []
+    for unit in units:
+        if unit.kind == "global_decl":
+            kept_units.append(unit)
+        elif unit.start_char == entry_unit.start_char:
+            kept_units.append(unit)
+        elif unit.kind in ("kernel", "helper") and unit.name in reached_names:
+            kept_units.append(unit)
+        elif unit.start_char in kept_launcher_starts:
+            kept_units.append(unit)
+
+    parts: list[str] = []
+    if directives:
+        parts.append("\n".join(directives))
+    for unit in sorted(kept_units, key=lambda u: u.start_char):
+        text = unit.text.strip()
+        if text:
+            parts.append(text)
+    return entry_kernel, "\n\n".join(parts) + ("\n" if parts else "")
 
 
 def resolve_instantiated_trackb_kernel(
@@ -469,8 +587,12 @@ def build_trackb_context_view(
 
 def parse_scoped_search_replace_blocks(patch_text: str) -> list[tuple[str, str]]:
     """Parse SEARCH/REPLACE patch hunks from scoped Track-B candidate output."""
+    cleaned_patch = strip_markdown_fence_lines(patch_text)
     for pat in _SEARCH_REPLACE_PATTERNS:
-        matches = [(m.group(1), m.group(2)) for m in pat.finditer(patch_text)]
+        matches = [
+            (strip_markdown_fence_lines(m.group(1)), strip_markdown_fence_lines(m.group(2)))
+            for m in pat.finditer(cleaned_patch)
+        ]
         if matches:
             return matches
     return []
@@ -691,7 +813,8 @@ def splice_cpp_units_into_tu(
     unit name. With *active_kernel* set, only that kernel and its exclusive helpers
     are replaceable, so a candidate can never overwrite a read-only sibling kernel.
     """
-    _, candidate_units = _split_cpp_units(candidate_cpp)
+    clean_candidate = strip_markdown_fence_lines(candidate_cpp)
+    _, candidate_units = _split_cpp_units(clean_candidate)
     replacements = [u for u in candidate_units if u.kind in ("kernel", "helper") and u.name]
     if not replacements:
         raise ValueError("candidate_cpp does not contain any bare C++ kernel or helper definition")
@@ -784,10 +907,12 @@ __all__ = [
     "apply_scoped_trackb_patch",
     "build_trackb_context_view",
     "escalate_primfunc_to_trackb_tu",
+    "extract_reachable_trackb_source",
     "extract_trackb_launcher_preview",
     "parse_scoped_search_replace_blocks",
     "resolve_instantiated_trackb_kernel",
     "select_active_trackb_kernel",
     "splice_cpp_units_into_tu",
     "strip_cpp_comments_and_strings",
+    "strip_markdown_fence_lines",
 ]

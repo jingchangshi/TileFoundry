@@ -29,11 +29,18 @@ from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     apply_scoped_trackb_patch,
     build_trackb_context_view,
     escalate_primfunc_to_trackb_tu,
+    extract_reachable_trackb_source,
+    parse_scoped_search_replace_blocks,
     resolve_instantiated_trackb_kernel,
     select_active_trackb_kernel,
     splice_cpp_units_into_tu,
 )
-from tilefoundry_ascend.agent.orchestrator.gate_funnel import _resolve_prim_func_from_dsl
+from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
+    _resolve_agent_gates_bin,
+    _resolve_prim_func_from_dsl,
+    evaluate_ascendc_candidate,
+)
+from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios, ConstraintRelaxationMask
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
     BeamCandidate,
     compute_static_dynamic_residual,
@@ -883,3 +890,157 @@ def test_split_and_splice_recognize_static_inline_aicore_and_bare_helpers() -> N
     assert "brand_new_si" in spliced
     assert "brand_new_sa" in spliced
     assert "kernel_sibling" in spliced
+
+
+def test_extract_reachable_trackb_source_and_evaluate_dead_cube_and_single_lane_simt() -> None:
+    """Resolve launched kernel, prune dead cube/helpers, and reject single-lane SIMT traps."""
+    cpp = (
+        "#include <tl_templates/ascend/common.h>\n"
+        "struct TileCfg { int m; };\n"
+        "enum PipeKind { P_VEC = 0 };\n"
+        "using ScalarT = float;\n"
+        "typedef int IndexT;\n"
+        "constexpr int kTile = 64;\n"
+        "__aicore__ inline void dead_aicore_helper(__gm__ float* p) {\n"
+        "    asc_mmad(p, p, p, 16, 16, 16, asc_unit_flag_mode::DISABLE, true, false, true);\n"
+        "}\n"
+        "__simd_vf__ inline void dead_simdvf_helper(__ubuf__ float* u) {\n"
+        "    u[0] = 0.0f;\n"
+        "}\n"
+        'extern "C" __global__ __aicore__ void gqa_cube_mmad(__gm__ float* q, __gm__ float* out) {\n'
+        "    dead_aicore_helper(q);\n"
+        "    out[0] = q[0];\n"
+        "}\n"
+        "__simt_callee__ inline float live_simt_helper(float v) {\n"
+        "    return v + 1.0f;\n"
+        "}\n"
+        "__simt_vf__ __launch_bounds__(128) void live_vf(__gm__ float* q, __gm__ float* out) {\n"
+        "    out[0] = live_simt_helper(q[0]);\n"
+        "}\n"
+        'extern "C" __global__ __vector__ void gqa_kernel(__gm__ float* q, __gm__ float* out) {\n'
+        "    asc_vf_call<live_vf>(dim3(128, 1, 1), q, out);\n"
+        "}\n"
+        'extern "C" int launch_gqa(void* stream, void* q, void* out) {\n'
+        "    gqa_kernel<<<28, nullptr, stream>>>((__gm__ float*)q, (__gm__ float*)out);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    module_src = (
+        f'CPP_SRC = r"""\n{cpp}\n"""\n'
+        "def run_op(lib, stream, q, out):\n"
+        "    return lib.launch_gqa(stream, q, out)\n"
+    )
+    assert select_active_trackb_kernel(cpp, module_source=module_src) == "gqa_kernel"
+    entry, reachable = extract_reachable_trackb_source(cpp, module_source=module_src)
+    assert entry == "gqa_kernel"
+    for kept in ("struct TileCfg", "enum PipeKind", "using ScalarT", "typedef int IndexT", "kTile"):
+        assert kept in reachable
+    assert "live_vf" in reachable
+    assert "live_simt_helper" in reachable
+    assert "gqa_cube_mmad" not in reachable
+    assert "dead_aicore_helper" not in reachable
+    assert "dead_simdvf_helper" not in reachable
+    assert "asc_mmad" not in reachable
+
+    cube_res = evaluate_ascendc_candidate(
+        cpp,
+        module_source=module_src,
+        require_cube_engine=True,
+    )
+    assert cube_res.passed is False
+    assert "missing_cube_engine_primitives" in cube_res.error_message
+
+    simt_1_bounds = (
+        "#include <tl_templates/ascend/common.h>\n"
+        "__simt_vf__ __launch_bounds__(1) void bad_vf(__gm__ float* out) {\n"
+        "    out[0] = 1.0f;\n"
+        "}\n"
+        'extern "C" __global__ __vector__ void bad_kernel(__gm__ float* out) {\n'
+        "    asc_vf_call<bad_vf>(dim3(128, 1, 1), out);\n"
+        "}\n"
+    )
+    res_1_bounds = evaluate_ascendc_candidate(simt_1_bounds)
+    assert res_1_bounds.passed is False
+    assert "degenerated_single_lane_simt" in res_1_bounds.error_message
+
+    simt_1_dim3 = simt_1_bounds.replace("__launch_bounds__(1)", "__launch_bounds__(128)").replace(
+        "dim3(128, 1, 1)", "dim3(1, 1, 1)"
+    )
+    res_1_dim3 = evaluate_ascendc_candidate(simt_1_dim3)
+    assert res_1_dim3.passed is False
+    assert "degenerated_single_lane_simt" in res_1_dim3.error_message
+
+    empty_ratios = CasePhysicsRatios(
+        case_id=1,
+        stride_ratio=1.0,
+        contig_atom_ratio=1.0,
+        is_atom_aligned=True,
+        working_set_sram_ratio=0.1,
+        working_set_vreg_ratio=0.1,
+        wave_occupancy_ratio=0.25,
+        oi_ridge_ratio=1.0,
+        inner_contiguous_bytes=64,
+        has_empty_group=True,
+    )
+    assert (
+        evaluate_ascendc_candidate(
+            simt_1_bounds,
+            freedom_mask=ConstraintRelaxationMask.top(),
+            case_ratios=empty_ratios,
+        ).passed
+        is True
+    )
+
+
+def test_markdown_fence_stripping_and_agent_gates_relative_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Strip markdown fences in Track-B extraction/splicing and resolve agent-gates cleanly."""
+    fenced_patch = (
+        "```cpp\n"
+        "<<<<<<< SEARCH\n"
+        "    int step = 1;\n"
+        "=======\n"
+        "```c++\n"
+        "    int step = 4;\n"
+        "```\n"
+        ">>>>>>> REPLACE\n"
+        "```\n"
+    )
+    hunks = parse_scoped_search_replace_blocks(fenced_patch)
+    assert len(hunks) == 1
+    assert "```" not in hunks[0][1]
+    assert "int step = 4;" in hunks[0][1]
+
+    base_tu = (
+        "#include <tl_templates/ascend/common.h>\n"
+        'extern "C" __global__ __vector__ void kernel_active(__gm__ float* x) {\n'
+        "    x[0] = 1.0f;\n"
+        "}\n"
+    )
+    fenced_cand = (
+        "```cpp\n"
+        'extern "C" __global__ __vector__ void kernel_active(__gm__ float* x) {\n'
+        "```\n"
+        "    x[0] = 2.0f;\n"
+        "}\n"
+        "```\n"
+    )
+    spliced, count = splice_cpp_units_into_tu(base_tu, fenced_cand, active_kernel="kernel_active")
+    assert count == 1
+    assert "x[0] = 2.0f;" in spliced
+    assert "```" not in spliced
+
+    ag_dir = tmp_path / "AgentGates"
+    ag_bin = ag_dir / ".venv" / "bin" / "agent-gates"
+    ag_bin.parent.mkdir(parents=True)
+    ag_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    env_file = ag_dir / "configs" / "npu.env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_text("", encoding="utf-8")
+
+    monkeypatch.delenv("TILEFOUNDRY_NPU_AGENT_GATES_BIN", raising=False)
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+    monkeypatch.setenv("TILEFOUNDRY_NPU_ENV_FILE", str(env_file))
+    assert _resolve_agent_gates_bin() == str(ag_bin)

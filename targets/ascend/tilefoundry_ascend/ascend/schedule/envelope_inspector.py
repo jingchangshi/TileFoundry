@@ -555,7 +555,33 @@ _DIM_ALIAS_GROUPS: tuple[tuple[str, ...], ...] = (
     ("g", "g_dim", "groups", "num_groups"),
     ("d", "d_dim", "head_dim", "d_nope"),
     ("s_kv", "kv_len", "s_kv_dim"),
+    ("total_elements", "total_elems", "n_elems", "num_elements", "numel"),
 )
+
+
+def _lookup_stem_binding(
+    cname: str,
+    eff: Mapping[str, int],
+    lower_eff: Mapping[str, int],
+) -> int | None:
+    if cname and cname in eff:
+        return eff[cname]
+    lc = cname.lower()
+    if lc and lc in lower_eff:
+        return lower_eff[lc]
+    for suffix in ("_dim", "_size", "_len", "_count", "_rows", "_cols"):
+        if lc.endswith(suffix):
+            stem = lc[: -len(suffix)]
+            if stem in lower_eff:
+                return lower_eff[stem]
+        elif lc and f"{lc}{suffix}" in lower_eff:
+            return lower_eff[f"{lc}{suffix}"]
+    for group in _DIM_ALIAS_GROUPS:
+        if lc in group:
+            for alias in group:
+                if alias in lower_eff:
+                    return lower_eff[alias]
+    return None
 
 
 def _match_binding_for_var(
@@ -567,23 +593,19 @@ def _match_binding_for_var(
     exact_name = str(getattr(var, "name", "") or "")
     hint_name = str(getattr(var, "name_hint", "") or "")
     for cname in (exact_name, hint_name):
-        if cname and cname in eff:
-            return eff[cname]
+        direct = _lookup_stem_binding(cname, eff, lower_eff)
+        if direct is not None:
+            return direct
         lc = cname.lower()
-        if lc and lc in lower_eff:
-            return lower_eff[lc]
-        for suffix in ("_dim", "_size", "_len", "_count", "_rows", "_cols"):
-            if lc.endswith(suffix):
-                stem = lc[: -len(suffix)]
-                if stem in lower_eff:
-                    return lower_eff[stem]
-            elif lc and f"{lc}{suffix}" in lower_eff:
-                return lower_eff[f"{lc}{suffix}"]
-        for group in _DIM_ALIAS_GROUPS:
-            if lc in group:
-                for alias in group:
-                    if alias in lower_eff:
-                        return lower_eff[alias]
+        pad_stem = ""
+        if "_pad" in lc:
+            pad_stem = lc[: lc.find("_pad")]
+        elif lc.startswith("pad_"):
+            pad_stem = lc[4:]
+        if pad_stem:
+            base_val = _lookup_stem_binding(pad_stem, eff, lower_eff)
+            if base_val is not None and base_val > 0:
+                return ((int(base_val) + 31) // 32) * 32
     return None
 
 
@@ -653,6 +675,69 @@ def _augment_var_bindings_from_buffers(
                     _bind_var(d1, kv_val)
                 elif isinstance(d2, tirx.Var) and not _is_already_bound(d2) and _static_tirx_int(d1) is not None:
                     _bind_var(d2, kv_val)
+
+    numel_aliases = ("total_elements", "total_elems", "n_elems", "num_elements", "numel")
+    if not any(alias in lower_eff for alias in numel_aliases):
+        synth_numel = 0
+        for param in getattr(entry_fn, "params", ()):
+            buf = buffer_map.get(param)
+            if buf is None:
+                continue
+            buf_shape = list(getattr(buf, "shape", ()) or ())
+            if not buf_shape:
+                continue
+            axis_vals: list[int] = []
+            all_known = True
+            for dim_expr in buf_shape:
+                sval = _static_tirx_int(dim_expr)
+                if sval is not None and sval > 0:
+                    axis_vals.append(int(sval))
+                elif isinstance(dim_expr, tirx.Var):
+                    mval = _match_binding_for_var(dim_expr, eff, lower_eff)
+                    if mval is not None and mval > 0:
+                        axis_vals.append(int(mval))
+                    else:
+                        all_known = False
+                        break
+                else:
+                    all_known = False
+                    break
+            if all_known and axis_vals:
+                prod_val = math.prod(axis_vals)
+                if prod_val > synth_numel:
+                    synth_numel = prod_val
+        if synth_numel <= 0:
+            b_val = _lookup_stem_binding("b", eff, lower_eff)
+            h_val = _lookup_stem_binding("h", eff, lower_eff)
+            s_val = _lookup_stem_binding("s", eff, lower_eff)
+            m_val = _lookup_stem_binding("m", eff, lower_eff)
+            n_val = _lookup_stem_binding("n", eff, lower_eff)
+            d_val = _lookup_stem_binding("d", eff, lower_eff)
+            k_val = _lookup_stem_binding("k", eff, lower_eff)
+            row_axes = 1
+            has_axis = False
+            if m_val is not None and m_val > 0:
+                if b_val and s_val and m_val >= b_val * s_val:
+                    row_axes = m_val
+                else:
+                    row_axes = (b_val or 1) * (h_val or 1) * m_val
+                has_axis = True
+            elif s_val is not None and s_val > 0:
+                row_axes = (b_val or 1) * (h_val or 1) * s_val
+                has_axis = True
+            elif b_val is not None and b_val > 0:
+                row_axes = b_val * (h_val or 1)
+                has_axis = True
+            col_val = n_val or d_val or k_val
+            if col_val is not None and col_val > 0:
+                synth_numel = row_axes * col_val
+            elif has_axis:
+                synth_numel = row_axes
+        if synth_numel > 0:
+            for alias in numel_aliases:
+                eff.setdefault(alias, int(synth_numel))
+                lower_eff.setdefault(alias, int(synth_numel))
+
     return eff, obj_bindings
 
 
@@ -3226,8 +3311,84 @@ def _specialize_primfunc_for_anchors(
         for expr in (*getattr(buf, "shape", ()), *(getattr(buf, "strides", ()) or ()), buf.elem_offset):
             for fv in _free_tirx_vars(expr, tirx=tirx):
                 _maybe_bind(fv)
-    for fv in _free_tirx_vars(entry_fn.body, tirx=tirx):
+    body_free_vars = _free_tirx_vars(entry_fn.body, tirx=tirx)
+    for fv in body_free_vars:
         _maybe_bind(fv)
+
+    max_known_numel = max(
+        (
+            int(lower_eff[k])
+            for k in ("total_elements", "total_elems", "n_elems", "num_elements", "numel")
+            if k in lower_eff and int(lower_eff[k]) > 0
+        ),
+        default=0,
+    )
+    for buf in buffer_map.values():
+        axis_ints: list[int] = []
+        ok = True
+        for dim_expr in getattr(buf, "shape", ()) or ():
+            sv = _static_tirx_int(dim_expr)
+            if sv is not None and sv > 0:
+                axis_ints.append(int(sv))
+            elif dim_expr in spec_var_map:
+                bound_sv = _static_tirx_int(spec_var_map[dim_expr])
+                if bound_sv is not None and bound_sv > 0:
+                    axis_ints.append(int(bound_sv))
+                else:
+                    ok = False
+                    break
+            else:
+                ok = False
+                break
+        if ok and axis_ints:
+            max_known_numel = max(max_known_numel, math.prod(axis_ints))
+    fallback_numel = max_known_numel if max_known_numel > 0 else 1024
+
+    def _is_body_free_int_var(var_obj) -> bool:
+        if not isinstance(var_obj, tirx.Var) or _is_handle_or_data(var_obj):
+            return False
+        dtype_str = str(getattr(var_obj, "dtype", "int32") or "int32").lower()
+        if dtype_str == "handle" or "int" not in dtype_str:
+            return False
+        if any(
+            (hasattr(var_obj, "same_as") and var_obj.same_as(prev)) or var_obj is prev
+            for prev in recorded_vars
+        ):
+            return False
+        return any(
+            (hasattr(var_obj, "same_as") and var_obj.same_as(bfv)) or var_obj is bfv
+            for bfv in body_free_vars
+        )
+
+    remaining_free_vars: list[object] = []
+
+    def _collect_expr_free_vars(expr) -> None:
+        if expr is None:
+            return
+        for fv in _free_tirx_vars(expr, tirx=tirx):
+            if _is_body_free_int_var(fv) and not any(
+                (hasattr(fv, "same_as") and fv.same_as(prev)) or fv is prev
+                for prev in remaining_free_vars
+            ):
+                remaining_free_vars.append(fv)
+
+    def _visit_remaining(node) -> None:
+        if isinstance(node, tirx.For):
+            _collect_expr_free_vars(node.extent)
+        elif isinstance(node, (tirx.BufferLoad, tirx.BufferStore)):
+            for idx_expr in getattr(node, "indices", ()) or ():
+                _collect_expr_free_vars(idx_expr)
+        elif isinstance(node, tirx.Call):
+            op_name = str(getattr(node.op, "name", node.op)).lower()
+            if "copy" in op_name or "region" in op_name or "access_ptr" in op_name:
+                for arg in getattr(node, "args", ()) or ():
+                    _collect_expr_free_vars(arg)
+
+    tirx.stmt_functor.post_order_visit(entry_fn.body, _visit_remaining)
+    for fv in remaining_free_vars:
+        dtype_str = str(getattr(fv, "dtype", "int32") or "int32")
+        recorded_vars.append(fv)
+        spec_var_map[fv] = tirx.IntImm(dtype_str, int(fallback_numel))
 
     if not spec_var_map:
         return entry_fn, mod_in

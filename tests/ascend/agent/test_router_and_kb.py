@@ -136,9 +136,9 @@ def test_seed_rules_yaml_completeness_and_sanitization() -> None:
     assert not re.search(r"\bmla\b", yaml_text.lower())
 
     rules = load_seed_rules()
-    assert len(rules) == 35
+    assert len(rules) == 37
     ids = {rule.rule_id for rule in rules}
-    for idx in range(1, 36):
+    for idx in range(1, 38):
         prefix = f"R{idx:02d}_"
         assert any(rid.startswith(prefix) for rid in ids)
     for rule in rules:

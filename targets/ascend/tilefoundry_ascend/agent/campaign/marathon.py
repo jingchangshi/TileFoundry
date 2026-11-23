@@ -554,6 +554,8 @@ def _run_stage0_track_b_gates(
     symbol, cpp_source = extracted
     try:
         instantiated_tu = _instantiate_stage0_trackb_tu(module_source, cpp_source, regime_spec)
+    except FileNotFoundError:
+        raise
     except (
         SyntaxError,
         AttributeError,
@@ -764,6 +766,12 @@ def build_stage0_oracle_validator(
                 is_transient_blocked_env = False
                 break
             err_low = (result.error_message or "").lower()
+            if result.failure_kind != "candidate" and (
+                "cannot locate 'agent-gates'" in err_low
+                or "env.sh file is required" in err_low
+                or "filenotfounderror" in err_low
+            ):
+                raise FileNotFoundError(result.error_message)
             is_transient_blocked_env = result.failure_kind != "candidate" and (
                 "blocked_env" in err_low or "resource busy" in err_low
             )
@@ -1481,6 +1489,8 @@ def build_resilient_l2_evaluator(
                 timeout_sec=660,
             )
             return L2BatchResults(res, {cid: run_id for cid in res})
+        except FileNotFoundError:
+            raise
         except Exception as exc:
             if len(cand_list) <= 1:
                 raise
@@ -1509,6 +1519,8 @@ def build_resilient_l2_evaluator(
                     )
                     merged.update(one_res)
                     run_ids.update({cand_id: run_id for cand_id in one_res})
+                except FileNotFoundError:
+                    raise
                 except Exception as sub_exc:
                     last_exc = sub_exc
                     log.warning(
@@ -1623,6 +1635,8 @@ def salvage_unpromoted_beam_winner(
             cand_file.write_text(patched_src, encoding="utf-8")
             try:
                 res_map = l2_evaluator([(cid, cand_file)], active_anchors)
+            except FileNotFoundError:
+                raise
             except Exception as exc:
                 log.warning("SALVAGE_SKIPPED %s L2 eval failed: %s", cid, exc)
                 continue
@@ -1932,6 +1946,8 @@ def run_operator_marathon(
                     op_logger=op_logger,
                     pure_golden=cfg.pure_golden,
                 )
+            except FileNotFoundError:
+                raise
             except (OSError, RuntimeError, ValueError) as exc:
                 op_logger.error("STAGE0_SEED_FAILED op=%s error=%s", cfg.operator_name, exc)
                 return 2

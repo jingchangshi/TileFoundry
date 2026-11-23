@@ -665,6 +665,7 @@ class CampaignReport:
     active_anchors: tuple[AnchorCaseSpec, ...] = ()
     admitted_rule_ids: tuple[str, ...] = ()
     l4_result: L4CannbenchResult | None = None
+    l4_status: str = "not_run"
     pending_promotion: PendingPromotion | None = None
     pending_l4: PendingL4 | None = None
     promotion_blocked: bool = False
@@ -688,6 +689,7 @@ class CampaignReport:
             "active_anchors": [a.to_dict() for a in self.active_anchors],
             "admitted_rule_ids": list(self.admitted_rule_ids),
             "l4_result": self.l4_result.to_dict() if self.l4_result else None,
+            "l4_status": self.l4_status,
             "pending_promotion": (
                 self.pending_promotion.to_dict() if self.pending_promotion else None
             ),
@@ -1100,6 +1102,7 @@ def _active_trackb_kernel(
     raw_cpp_source: str,
     *,
     regime_tag: str,
+    module_source: str | None = None,
 ) -> str:
     """Resolve the launched kernel from instantiation truth, never from name heuristics."""
     resolved = resolve_instantiated_trackb_kernel(instantiated_tu, raw_cpp_source)
@@ -1119,6 +1122,14 @@ def _active_trackb_kernel(
     )
     if len(primary) == 1:
         return next(iter(primary))
+    if module_source:
+        mod_selected = select_active_trackb_kernel(
+            raw_cpp_source,
+            regime_tag=regime_tag,
+            module_source=module_source,
+        )
+        if mod_selected is not None:
+            return mod_selected
     if not launched:
         raise ValueError(
             f"Track-B instantiation for regime {regime_tag!r} contains multiple kernels "
@@ -3310,6 +3321,7 @@ class PerfTargetCampaignRunner:
                     rendered,
                     extracted[1],
                     regime_tag=regime_spec.regime_tag,
+                    module_source=module_source,
                 )
         return self._active_kernel_cache[cache_key]
 
@@ -3456,6 +3468,8 @@ class PerfTargetCampaignRunner:
                 case_ratios=regime_spec.representative_case_ratios,
                 require_hardware_dma=req_dma,
                 require_cube_engine=req_cube,
+                module_source=module_source,
+                regime_tag=regime_spec.regime_tag,
             )
 
         anchor_dims = (
@@ -3510,6 +3524,8 @@ class PerfTargetCampaignRunner:
                     case_ratios=regime_spec.representative_case_ratios,
                     require_hardware_dma=req_dma,
                     require_cube_engine=req_cube,
+                    module_source=module_source,
+                    regime_tag=regime_spec.regime_tag,
                 )
             return primary_res
         combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
@@ -3550,6 +3566,8 @@ class PerfTargetCampaignRunner:
                 case_ratios=regime_spec.representative_case_ratios,
                 require_hardware_dma=req_dma,
                 require_cube_engine=False,
+                module_source=module_source,
+                regime_tag=regime_spec.regime_tag,
             )
             total_ms = primary_res.elapsed_ms + tb_res.elapsed_ms
             if not tb_res.passed:
@@ -4029,11 +4047,6 @@ class PerfTargetCampaignRunner:
         exclude_regime: str | None = None,
     ) -> RegimeTargetSpec | None:
         by_tag = {r.regime_tag: r for r in self._regime_specs}
-        if current_regime and current_regime not in frozen_regimes and current_regime in by_tag:
-            spec = by_tag[current_regime]
-            if not self._is_regime_satisfied(spec, best_result, active_anchors):
-                return spec
-
         candidates = [
             spec
             for spec in self._regime_specs
@@ -4041,8 +4054,6 @@ class PerfTargetCampaignRunner:
             and not self._is_regime_satisfied(spec, best_result, active_anchors)
         ]
         if not candidates and allow_satisfied_fallback:
-            if current_regime and current_regime not in frozen_regimes and current_regime in by_tag:
-                return by_tag[current_regime]
             candidates = [
                 spec for spec in self._regime_specs if spec.regime_tag not in frozen_regimes
             ]
@@ -4051,10 +4062,16 @@ class PerfTargetCampaignRunner:
         if exclude_regime and any(spec.regime_tag != exclude_regime for spec in candidates):
             candidates = [spec for spec in candidates if spec.regime_tag != exclude_regime]
         candidates.sort(
-            key=lambda s: best_result.regime_headroom(s.regime_tag),
-            reverse=True,
+            key=lambda s: (-best_result.regime_headroom(s.regime_tag), s.regime_tag),
         )
-        return candidates[0]
+        top_spec = candidates[0]
+        candidate_tags = {spec.regime_tag for spec in candidates}
+        if current_regime and current_regime in candidate_tags and current_regime in by_tag:
+            top_headroom = best_result.regime_headroom(top_spec.regime_tag)
+            cur_headroom = best_result.regime_headroom(current_regime)
+            if top_headroom - cur_headroom <= 0.02:
+                return by_tag[current_regime]
+        return top_spec
 
     @staticmethod
     def _slice_contract_instruction(func_name: str, regime_spec: RegimeTargetSpec) -> str:
@@ -5692,6 +5709,8 @@ class PerfTargetCampaignRunner:
         rel_gain: float = 0.0,
         worker_kind: str = "",
         round_idx: int = 0,
+        rule_id: str | None = None,
+        symptom_family: str = "",
     ) -> list[str]:
         """Distill counterfactual causal rules into offline staging without mutating frozen KB."""
         if self._flywheel is None:
@@ -5755,6 +5774,7 @@ class PerfTargetCampaignRunner:
                 max_loo_chunks=3,
                 operator_name=self._config.operator_name,
                 rule_scope="operator_local",
+                active_symptom_family=symptom_family,
             )
         finally:
             self._flywheel._tracker = orig_tracker
@@ -5794,6 +5814,8 @@ class PerfTargetCampaignRunner:
                         "regime_tag": regime_spec.regime_tag,
                         "round_idx": int(round_idx),
                         "worker_kind": str(worker_kind),
+                        "rule_id": rule_id,
+                        "symptom_family": symptom_family,
                         "parent_sha": self._source_sha256(baseline_source),
                         "winner_sha": self._source_sha256(winner_source),
                         "baseline_latency_us": float(baseline_latency_us),
@@ -7712,6 +7734,24 @@ class PerfTargetCampaignRunner:
                     self._target_module_path,
                     on_execution_started=_record_l3_started,
                 )
+                for busy_backoff_sec in (2.0, 5.0, 10.0):
+                    if (
+                        l3_res.passed
+                        or l3_res.failure_kind == FAILURE_KIND_CANDIDATE
+                        or "resource busy:" not in (l3_res.error_message or "").lower()
+                    ):
+                        break
+                    logger.warning(
+                        "Round %d L3 hit transient resource busy (%s); retrying after %.1fs",
+                        round_idx,
+                        (l3_res.error_message or "")[:160],
+                        busy_backoff_sec,
+                    )
+                    time.sleep(busy_backoff_sec)
+                    l3_res = self._run_l3_contract(
+                        self._target_module_path,
+                        on_execution_started=_record_l3_started,
+                    )
                 self._active_promotion = None
                 if l3_res.passed:
                     promoted = True
@@ -8094,7 +8134,9 @@ class PerfTargetCampaignRunner:
             self._prune_stale_sibling_stepping_stones(regime_spec, top_chk.snippet_source)
 
         if promoted and top_chk is not None and top_res is not None:
-            top_wkind = meta_by_id[top_chk.candidate_id][0]
+            top_wkind, top_rule_obj, _top_hyp = meta_by_id[top_chk.candidate_id]
+            top_rule_id = top_rule_obj.rule_id if top_rule_obj is not None else None
+            top_symptom_family = ranked_families[0][0] if ranked_families else ""
             eff_gain = max(rel_gain, local_rel_gain)
             top_local_eval = top_res.for_regime(regime_spec.regime_tag)
             best_local_eval = best_result.for_regime(regime_spec.regime_tag)
@@ -8123,6 +8165,8 @@ class PerfTargetCampaignRunner:
                             rel_gain=eff_gain,
                             worker_kind=top_wkind,
                             round_idx=round_idx,
+                            rule_id=top_rule_id,
+                            symptom_family=top_symptom_family,
                         )
                     )
                     admitted_rule_ids.extend(round_admitted)
@@ -8152,6 +8196,8 @@ class PerfTargetCampaignRunner:
                             "regime_tag": regime_spec.regime_tag,
                             "round_idx": int(round_idx),
                             "worker_kind": top_wkind,
+                            "rule_id": top_rule_id,
+                            "symptom_family": top_symptom_family,
                             "parent_sha": self._source_sha256(incumbent_source),
                             "winner_sha": self._source_sha256(new_incumbent),
                             "baseline_latency_us": float(fly_base_lat),
@@ -8700,6 +8746,19 @@ class PerfTargetCampaignRunner:
             best_result=best_result,
             stop_reason=stop_reason,
         )
+        l4_status = "not_run"
+        if l4_result is not None:
+            l4_err = l4_result.error_message or ""
+            if l4_result.passed:
+                l4_status = "passed"
+            elif not promotion_blocked and (
+                "BLOCKED_ENV" in l4_err
+                or "BLOCKED_EXIT_CODE: 75" in l4_err
+                or "occupancy" in l4_err.lower()
+            ):
+                l4_status = "deferred_shared_host"
+            else:
+                l4_status = "failed"
         return CampaignReport(
             operator_name=self._config.operator_name,
             stop_reason=stop_reason,
@@ -8714,6 +8773,7 @@ class PerfTargetCampaignRunner:
             active_anchors=tuple(active_anchors),
             admitted_rule_ids=tuple(admitted_rule_ids),
             l4_result=l4_result,
+            l4_status=l4_status,
             pending_promotion=pending_promotion,
             pending_l4=self._pending_l4,
             promotion_blocked=promotion_blocked,

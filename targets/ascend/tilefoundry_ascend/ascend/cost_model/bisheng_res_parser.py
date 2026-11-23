@@ -312,8 +312,17 @@ def _strip_subscripts(text: str) -> str:
 
 
 _VEC_MATRIX_INST_RE = re.compile(
-    r"(?:simd_inst::|\bvloop_?v2\b|\basc_mmad\b|\b__simd_vf__\b|\basc_vf_call\b|\bvec_(?!reg))",
+    r"(?:simd_inst::|\bvloop_?v2\b|\basc_mmad(?:_mx)?\b|\bascend_gemm_l1\b|\bvec_(?!reg))",
     flags=re.IGNORECASE,
+)
+
+_SIMT_LAUNCH_BOUNDS_RE = re.compile(r"__launch_bounds__\s*\(\s*(\d+)\s*\)")
+_SIMT_VF_CALL_DIM3_RE = re.compile(
+    r"\basc_vf_call\s*<[^>]+>\s*\(\s*dim3\s*\(\s*(\d+)"
+    r"(?:\s*,\s*(\d+)\s*(?:,\s*(\d+)\s*)?)?\s*\)"
+)
+_GM_PTR_NAME_RE = re.compile(
+    r"__gm__\s+[^;(),={}]*?\*+\s*(?:__restrict__\s*)?([A-Za-z_]\w*)"
 )
 
 _SCALAR_COMPUTE_OP_RE = re.compile(
@@ -366,6 +375,113 @@ def _infer_gm_elem_bytes(text: str, target_ptrs: set[str] | None = None) -> floa
     return 2.0
 
 
+_CPP_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}()]*>)?\s*\(")
+_CPP_TMPL_ARGS_RE = re.compile(r"\b[A-Za-z_]\w*\s*<([^;{}()]+)>\s*\(")
+_CPP_LAUNCH_RE = re.compile(r"\b([A-Za-z_]\w*)\s*(?:<[^;{}]*>)?\s*<<<")
+
+
+def _extract_header_fn_name(sig_head: str) -> str:
+    cleaned = re.sub(r"\b(?:const|noexcept|override|final)\s*$", "", sig_head.strip()).rstrip()
+    if not cleaned.endswith(")"):
+        return ""
+    depth = 0
+    open_idx = -1
+    for idx in range(len(cleaned) - 1, -1, -1):
+        if cleaned[idx] == ")":
+            depth += 1
+        elif cleaned[idx] == "(":
+            depth -= 1
+            if depth == 0:
+                open_idx = idx
+                break
+    if open_idx <= 0:
+        return ""
+    ident = re.search(r"([A-Za-z_]\w*)\s*$", cleaned[:open_idx].rstrip())
+    if ident is None:
+        return ""
+    name = ident.group(1)
+    if name in ("if", "for", "while", "switch", "decltype", "__launch_bounds__", "__mix__"):
+        return ""
+    return name
+
+
+def _extract_reachable_trackb_text(src: str) -> str:
+    """Return the launched __global__ kernel and its transitive callee bodies."""
+    masked = _strip_cpp_comments(src)
+    blocks: list[tuple[str, bool, str]] = []
+    depth = 0
+    stmt_start = 0
+    i = 0
+    n = len(masked)
+    while i < n:
+        ch = masked[i]
+        if ch == ";" and depth == 0:
+            stmt_start = i + 1
+        elif ch == "{" and depth == 0:
+            sig_head = masked[stmt_start:i].strip()
+            fn_name = _extract_header_fn_name(sig_head)
+            brace_depth = 1
+            j = i + 1
+            while j < n and brace_depth > 0:
+                if masked[j] == "{":
+                    brace_depth += 1
+                elif masked[j] == "}":
+                    brace_depth -= 1
+                j += 1
+            if fn_name:
+                blocks.append((fn_name, "__global__" in sig_head, src[stmt_start:j]))
+            stmt_start = j
+            i = j
+            continue
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+            if depth == 0:
+                stmt_start = i + 1
+        i += 1
+
+    kernels = {name for name, is_global, _ in blocks if is_global}
+    if not kernels:
+        return src
+    launched = [m.group(1) for m in _CPP_LAUNCH_RE.finditer(masked) if m.group(1) in kernels]
+    entry = launched[0] if launched else next(name for name, is_global, _ in blocks if is_global)
+    by_name = {name: text for name, _, text in blocks}
+    reached: set[str] = set()
+    pending = [entry]
+    while pending:
+        cur_name = pending.pop()
+        if cur_name in reached or cur_name not in by_name:
+            continue
+        reached.add(cur_name)
+        body_masked = _strip_cpp_comments(by_name[cur_name])
+        for cm in _CPP_CALL_RE.finditer(body_masked):
+            if cm.group(1) in by_name and cm.group(1) not in reached:
+                pending.append(cm.group(1))
+        for tm in _CPP_TMPL_ARGS_RE.finditer(body_masked):
+            for ident in re.findall(r"\b([A-Za-z_]\w*)\b", tm.group(1)):
+                if ident in by_name and ident not in reached:
+                    pending.append(ident)
+    kept = [text for name, _, text in blocks if name in reached]
+    return "\n\n".join(kept) if kept else src
+
+
+def _has_parallel_simt_kernel(cleaned: str) -> bool:
+    if not re.search(r"\b__simt_vf__\b", cleaned):
+        return False
+    bounds = [int(m.group(1)) for m in _SIMT_LAUNCH_BOUNDS_RE.finditer(cleaned)]
+    dim3_threads = [
+        int(m.group(1)) * int(m.group(2) or 1) * int(m.group(3) or 1)
+        for m in _SIMT_VF_CALL_DIM3_RE.finditer(cleaned)
+    ]
+    if bounds and max(bounds) < 32:
+        return False
+    if dim3_threads and max(dim3_threads) < 32:
+        return False
+    return bool((bounds and max(bounds) >= 32) or (dim3_threads and max(dim3_threads) >= 32))
+
+
 def _detect_scalar_compute_loop_fallback(
     res_text: str = "",
     asm_or_dump_text: str = "",
@@ -385,11 +501,25 @@ def _detect_scalar_compute_loop_fallback(
         return {"scalar_compute_loop_fallback": 1.0}
 
     src = asm_or_dump_text if asm_or_dump_text.strip() else combined
+    if re.search(r"\b__global__\b", src):
+        src = _extract_reachable_trackb_text(src)
     cleaned = _strip_cpp_comments(src)
-    if _VEC_MATRIX_INST_RE.search(cleaned):
+    if _VEC_MATRIX_INST_RE.search(cleaned) or _has_parallel_simt_kernel(cleaned):
         return {}
 
+    gm_ptrs = set(_GM_PTR_NAME_RE.findall(cleaned))
+    gm_access_re = (
+        re.compile(
+            rf"\b(?:{'|'.join(re.escape(p) for p in sorted(gm_ptrs))})\s*\[[^\]]+\]"
+            rf"|\*\s*\(?\s*(?:{'|'.join(re.escape(p) for p in sorted(gm_ptrs))})\b"
+        )
+        if gm_ptrs
+        else None
+    )
+
     for body in _extract_for_loop_bodies(cleaned):
+        if gm_access_re is not None and gm_access_re.search(body):
+            return {"scalar_compute_loop_fallback": 1.0}
         has_buf_access = bool(
             re.search(r"\b[A-Za-z_]\w*\s*\[[^\]]+\]", body)
             or re.search(r"\*\s*\([^)]+\)", body)

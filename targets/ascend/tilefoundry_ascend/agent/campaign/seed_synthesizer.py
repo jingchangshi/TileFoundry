@@ -1133,27 +1133,42 @@ async def prepare_operator_seed_or_takeover(
     attempt = 1
     attempts_used = 0
     transport_retries = 0
-    track_a_failures = 0
+    track_a_static_failures = 0
+    track_a_oracle_attempts = 0
+    last_l0_l1_passing_dsl_source: str | None = None
     track_a_budget = (
         max(2, max_seed_attempts // 2)
         if active_track == "tilelang_dsl" and max_seed_attempts >= 4
         else 0
     )
 
-    def _record_candidate_failure(error_text: str, candidate_source: str) -> None:
+    def _record_candidate_failure(
+        error_text: str,
+        candidate_source: str,
+        *,
+        stage: Literal["static", "oracle"] = "static",
+    ) -> None:
         nonlocal active_track, attempt, blueprint_block, constraint_block, contract_block
         nonlocal l0_l1_validator, last_error, last_rejected_error, last_rejected_source
-        nonlocal runtime_backend, regime_specs, system_prompt, track_a_failures
+        nonlocal runtime_backend, regime_specs, system_prompt
+        nonlocal track_a_static_failures, track_a_oracle_attempts
         last_error = error_text
-        last_rejected_source = candidate_source
         last_rejected_error = error_text
+        if stage == "static" and last_l0_l1_passing_dsl_source is not None:
+            last_rejected_source = last_l0_l1_passing_dsl_source
+        else:
+            last_rejected_source = candidate_source
         if active_track == "tilelang_dsl":
-            track_a_failures += 1
+            if stage == "static":
+                track_a_static_failures += 1
+            else:
+                track_a_oracle_attempts += 1
         attempt += 1
         if (
             active_track == "tilelang_dsl"
+            and last_l0_l1_passing_dsl_source is None
             and track_a_budget > 0
-            and track_a_failures >= track_a_budget
+            and track_a_static_failures >= track_a_budget
             and attempt <= max_seed_attempts
         ):
             fallback_track = select_fallback_track_from_semantics(
@@ -1163,12 +1178,13 @@ async def prepare_operator_seed_or_takeover(
             )
             if fallback_track != active_track:
                 logger.info(
-                    "STAGE0_TRACK_PIVOT op=%s attempt=%d from=%s to=%s failures=%d",
+                    "STAGE0_TRACK_PIVOT op=%s attempt=%d from=%s to=%s static_failures=%d oracle_attempts=%d",
                     operator_name,
                     attempt,
                     active_track,
                     fallback_track,
-                    track_a_failures,
+                    track_a_static_failures,
+                    track_a_oracle_attempts,
                 )
                 active_track = fallback_track
                 (
@@ -1229,8 +1245,13 @@ async def prepare_operator_seed_or_takeover(
             _record_candidate_failure(
                 f"L0/L1 static or compiler rejection:\n{static_err}",
                 synthesized_src,
+                stage="static",
             )
             continue
+
+        if active_track == "tilelang_dsl":
+            last_l0_l1_passing_dsl_source = synthesized_src
+            track_a_static_failures = 0
 
         evidence = oracle_accuracy_validator(synthesized_src)
         env_retries = 0
@@ -1307,6 +1328,7 @@ async def prepare_operator_seed_or_takeover(
         _record_candidate_failure(
             f"NPU numerical mismatch against PyTorch golden:\n{oracle_detail}",
             synthesized_src,
+            stage="oracle",
         )
 
     raise RuntimeError(

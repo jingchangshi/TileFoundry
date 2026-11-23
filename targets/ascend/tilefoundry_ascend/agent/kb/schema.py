@@ -521,6 +521,7 @@ _TELEMETRY_CONTEXT_DEFAULTS: dict[str, int | float | bool | str] = {
     "working_set_sram_ratio": 0.0,
     "scalar_compute_loop_fallback": 0.0,
     "dcache_bypass_narrow_store": 0.0,
+    "pipeline_depth": 1,
     "has_empty_group": False,
     "has_loop_carried_state": False,
     "compute_engine": "",
@@ -600,6 +601,9 @@ def _ledger_to_namespace(ledger: ObjectivePhysicalLedger) -> dict[str, object]:
             ns[key] = float(raw_val)
         else:
             ns[key] = str(raw_val)
+    raw_prof = getattr(ledger, "microarch_profile", None)
+    if isinstance(raw_prof, Mapping) and "pipeline_depth" in raw_prof:
+        ns["pipeline_depth"] = max(1, int(raw_prof.get("pipeline_depth", 1) or 1))
 
     total_bloat = 0
     degraded_total = 0
@@ -1047,7 +1051,9 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
     vl_loops = _read_signal_int(compute_map, "l1_vloopv2_loops")
     vec_cycles = _read_signal_int(compute_map, "l0_vec_cycles")
     subcore_imbalance = _read_signal_bool(compute_map, "l0_aiv_subcore_imbalance")
-    return {
+    obs_aiv_vec = _read_signal_float(compute_map, "l2_aiv_vec_ratio")
+    obs_aic_mac = _read_signal_float(compute_map, "l2_aic_mac_ratio")
+    out: dict[str, object] = {
         "transfer_inflation_ratio": transfer_inflation,
         "effective_compute_eta": effective_eta,
         "roofline_eta": _read_signal_float(compute_map, "l2_roofline_eta"),
@@ -1064,10 +1070,6 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
         "vloopv2_hit": not (sw_loops > 0 and vl_loops == 0),
         "vf_fusion_breaks": _read_signal_int(compute_map, "l1_vf_fusion_breaks"),
         "dual_issue_ipc_collapse": _read_signal_float(compute_map, "l1_dual_issue_collapse"),
-        "measured_aiv_vec_ratio": _read_signal_float(compute_map, "l2_aiv_vec_ratio"),
-        "measured_aic_mac_ratio": _read_signal_float(compute_map, "l2_aic_mac_ratio"),
-        "l2_aiv_vec_ratio": _read_signal_float(compute_map, "l2_aiv_vec_ratio"),
-        "l2_aic_mac_ratio": _read_signal_float(compute_map, "l2_aic_mac_ratio"),
         "aic_fixpipe_ratio": _read_signal_float(dma_map, "l2_fixpipe_ratio"),
         "AIC.PIPE_M": _read_signal_int(compute_map, "l0_cube_cycles"),
         "AIC.PIPE_FIX": 0,
@@ -1101,7 +1103,14 @@ def _observation_to_signal_dict(obs: ObservationVector5D) -> dict[str, object]:
         "num_aiv_cores": 56,
         "grid_is_symbolic": False,
         "has_l1_compiler_summary": _read_signal_bool(payload, "has_l1_compiler_summary"),
+        "measured_latency_us": _read_signal_float(grid_map, "l2_measured_latency_us"),
     }
+    if obs_aiv_vec > 0.0 or obs_aic_mac > 0.0:
+        out["measured_aiv_vec_ratio"] = obs_aiv_vec
+        out["measured_aic_mac_ratio"] = obs_aic_mac
+        out["l2_aiv_vec_ratio"] = obs_aiv_vec
+        out["l2_aic_mac_ratio"] = obs_aic_mac
+    return out
 
 
 def rank_symptom_families(
@@ -1298,11 +1307,34 @@ def rank_symptom_families(
         ),
     )
 
-    is_scalar_trap = (
-        scalar_fallback > 0.0
-        or (l0_cube_cycles == 0 and l0_vec_cycles == 0)
-        or (has_l1_summary and l1_vec_regs == 0 and aiv_vec < 0.02 and aic_mac == 0.0)
+    has_l2_pmu = (
+        any(
+            k in sig
+            for k in (
+                "measured_aiv_vec_ratio",
+                "aiv_vec_ratio",
+                "measured_aic_mac_ratio",
+                "aic_mac_ratio",
+            )
+        )
+        and (
+            aiv_vec > 0.0
+            or aic_mac > 0.0
+            or mte2_wait > 0.0
+            or sync_stall > 0.0
+            or _read_signal_float(sig, "measured_latency_us") > 0.0
+        )
     )
+    has_simtvf = _read_signal_bool(sig, "has_simtvf")
+    if scalar_fallback > 0.0:
+        is_scalar_trap = True
+    elif has_l2_pmu:
+        is_scalar_trap = aiv_vec < 0.05 and aic_mac < 0.02
+    else:
+        is_scalar_trap = (
+            (l0_cube_cycles == 0 and l0_vec_cycles == 0 and not has_simtvf)
+            or (has_l1_summary and l1_vec_regs == 0)
+        )
     scalar_loop_score = 1.0 if is_scalar_trap else 0.0
 
     scored: list[tuple[SymptomFamily, float]] = [

@@ -308,3 +308,48 @@ def test_observe_pair_delta_skips_extreme_single_point_outliers() -> None:
 
     model.observe_pair_delta(cand_wl, base_c * 1.2, parent_wl, base_p * math.exp(-2.6))
     assert len(model._pair_deltas) == 1
+
+
+def test_trackb_reachable_asc_scalar_compute_loop_fallback_detector() -> None:
+    """Detect scalar loop fallback only in reachable Track-B kernels lacking vector/cube/SIMT."""
+    dead_cube_scalar_live = (
+        "#include <tl_templates/ascend/common.h>\n"
+        'extern "C" __global__ __aicore__ void gqa_cube_mmad(__gm__ float* a) {\n'
+        "    asc_mmad(a, a, a, 16, 16, 16, asc_unit_flag_mode::DISABLE, true, false, true);\n"
+        "}\n"
+        'extern "C" __global__ __vector__ void gqa_kernel(__gm__ float* q, __gm__ float* out) {\n'
+        "    for (int i = 0; i < 64; ++i) {\n"
+        "        out[i] += q[i] * 0.5f;\n"
+        "    }\n"
+        "}\n"
+        'extern "C" int launch(void* stream, void* q, void* out) {\n'
+        "    gqa_kernel<<<28, nullptr, stream>>>((__gm__ float*)q, (__gm__ float*)out);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    summary_scalar = parse_bisheng_res_usage(asm_or_dump_text=dead_cube_scalar_live)
+    assert summary_scalar.extra_signals.get("scalar_compute_loop_fallback", 0.0) >= 1.0
+
+    single_lane_simt = (
+        "#include <tl_templates/ascend/common.h>\n"
+        "__simt_vf__ __launch_bounds__(1) void vf_one(__gm__ float* q, __gm__ float* out) {\n"
+        "    for (int i = 0; i < 64; ++i) {\n"
+        "        out[i] = q[i] + 1.0f;\n"
+        "    }\n"
+        "}\n"
+        'extern "C" __global__ __vector__ void k_one(__gm__ float* q, __gm__ float* out) {\n'
+        "    asc_vf_call<vf_one>(dim3(1, 1, 1), q, out);\n"
+        "}\n"
+        'extern "C" int launch(void* stream, void* q, void* out) {\n'
+        "    k_one<<<28, nullptr, stream>>>((__gm__ float*)q, (__gm__ float*)out);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    summary_1lane = parse_bisheng_res_usage(asm_or_dump_text=single_lane_simt)
+    assert summary_1lane.extra_signals.get("scalar_compute_loop_fallback", 0.0) >= 1.0
+
+    wide_simt = single_lane_simt.replace("__launch_bounds__(1)", "__launch_bounds__(128)").replace(
+        "dim3(1, 1, 1)", "dim3(128, 1, 1)"
+    )
+    summary_wide = parse_bisheng_res_usage(asm_or_dump_text=wide_simt)
+    assert summary_wide.extra_signals.get("scalar_compute_loop_fallback", 0.0) == 0.0

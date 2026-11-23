@@ -2173,8 +2173,10 @@ def test_l4_v2_timeout_includes_execution_id(tmp_path: Path, monkeypatch) -> Non
     assert "timed out" in result.error_message
 
 
-def test_agent_gates_bin_has_no_sibling_venv_fallback(tmp_path: Path, monkeypatch) -> None:
-    """The CLI must come from explicit configuration or PATH, never a sibling checkout."""
+def test_agent_gates_bin_resolves_relative_sibling_venv_when_env_missing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Resolve sibling AgentGates/.venv/bin/agent-gates when explicit config and PATH miss."""
     source_root = tmp_path / "TileFoundry"
     source_root.mkdir()
     sibling = tmp_path / "AgentGates" / ".venv" / "bin" / "agent-gates"
@@ -2182,6 +2184,6 @@ def test_agent_gates_bin_has_no_sibling_venv_fallback(tmp_path: Path, monkeypatc
     sibling.write_text("#!/bin/sh\n", encoding="utf-8")
     sibling.chmod(0o755)
     monkeypatch.delenv("TILEFOUNDRY_NPU_AGENT_GATES_BIN", raising=False)
+    monkeypatch.delenv("TILEFOUNDRY_NPU_ENV_FILE", raising=False)
     monkeypatch.setattr(surrogate_cannbench.shutil, "which", lambda _name: None)
-    with pytest.raises(FileNotFoundError):
-        surrogate_cannbench._resolve_agent_gates_bin(source_root)
+    assert surrogate_cannbench._resolve_agent_gates_bin(source_root) == str(sibling)

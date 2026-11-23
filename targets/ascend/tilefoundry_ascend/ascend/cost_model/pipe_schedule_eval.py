@@ -138,6 +138,7 @@ class Ascend950PipeScheduleEvaluator:
         is_coupled_1c2v: bool = False,
         ledger_steady_state_ii: int = 0,
         pipe_scale_multipliers: Mapping[str, float] | None = None,
+        profile_is_per_core_full_loop: bool = False,
     ) -> Ascend950PipeScheduleResult:
         """Compute single-wave continuous pipe ns, AVE score, steady II, and drain bubble."""
         prof = MicroarchProfile.coerce(profile)
@@ -153,7 +154,10 @@ class Ascend950PipeScheduleEvaluator:
 
         is_cube_work = cube_flops > 0.0 or prof.cube_mmad_count > 0 or prof.cube_macs_total > 0
         active_grid = aic_cores if is_cube_work else aiv_cores
-        if total_tiles > 0:
+        if profile_is_per_core_full_loop:
+            waves = 1.0
+            block_from_chip_scale = 1.0 / float(max(1, total_tiles if total_tiles > 0 else active_grid))
+        elif total_tiles > 0:
             waves = float(max(1, math.ceil(total_tiles / max(1, active_grid))))
             block_from_chip_scale = 1.0 / float(max(1, total_tiles))
         else:
@@ -190,8 +194,9 @@ class Ascend950PipeScheduleEvaluator:
         aiv_peak_flops_per_ns = 128.0 * self.clock_ghz
         vec_flop_ns = vec_block_flops / max(1e-6, aiv_peak_flops_per_ns)
         ave_issue_ns = (ave_weighted_issues * 8.0) / max(0.1, self.clock_ghz)
+        scalar_issue_ns = float(prof.scalar_ops) / max(0.1, self.clock_ghz)
         cv_vec_factor = 0.5 if is_coupled_1c2v else 1.0
-        ave_compute_ns = max(vec_flop_ns, ave_issue_ns) * cv_vec_factor
+        ave_compute_ns = max(vec_flop_ns, ave_issue_ns, scalar_issue_ns) * cv_vec_factor
 
         ub_load_ns = (float(prof.ub_load_bytes) / 512.0) / max(0.1, self.clock_ghz)
         ub_store_ns = (float(prof.ub_store_bytes) / 256.0) / max(0.1, self.clock_ghz)

@@ -100,6 +100,7 @@ class MicroarchProfile:
     sfu_f32_ops: int = 0
     reduce_ops: int = 0
     slot0_only_ops: int = 0
+    scalar_ops: int = 0
     ub_load_bytes: int = 0
     ub_store_bytes: int = 0
 
@@ -339,6 +340,7 @@ def extract_microarch_profile_from_tirx(
         "sfu_f32_ops": 0,
         "reduce_ops": 0,
         "slot0_only_ops": 0,
+        "scalar_ops": 0,
         "ub_load_bytes": 0,
         "ub_store_bytes": 0,
         "gm_to_l1_bytes": 0,
@@ -373,6 +375,15 @@ def extract_microarch_profile_from_tirx(
             return "int"
         return "f32"
 
+    def _is_scalar_dtype(dtype_str: str) -> bool:
+        low = str(dtype_str or "").strip().lower()
+        if not low or low in ("void", "handle"):
+            return True
+        try:
+            return int(TLDataType(low).lanes) <= 1
+        except Exception:
+            return "x" not in low
+
     def _record_buf(buf: object) -> None:
         nonlocal ub_total_bytes, ub_conflict_bytes
         scope = _map_tl_scope_name(buf.scope()) if hasattr(buf, "scope") else None
@@ -401,14 +412,14 @@ def extract_microarch_profile_from_tirx(
         elif scope == "L1":
             l1_buffers.append(total_b)
 
-    def _scan_expr(expr: object, *, repeat: int) -> str:
+    def _scan_expr(expr: object, *, repeat: int, in_simtvf: bool = False) -> str:
         if expr is None:
             return ""
         dt_str = str(getattr(expr, "dtype", ""))
         if isinstance(expr, tirx.Call):
             op_name = str(getattr(expr.op, "name", expr.op)).lower()
             args = list(expr.args)
-            arg_dtypes = [_scan_expr(a, repeat=repeat) for a in args]
+            arg_dtypes = [_scan_expr(a, repeat=repeat, in_simtvf=in_simtvf) for a in args]
             eff_dt = next((d for d in arg_dtypes if d), dt_str)
             fam = _classify_dtype_family(eff_dt)
             if any(tok in op_name for tok in ("vintlv", "vdintlv", "interleave")):
@@ -422,11 +433,16 @@ def extract_microarch_profile_from_tirx(
                 c["reduce_ops"] += repeat
             elif "simd" in op_name or "vec" in op_name or "cast" in op_name or "fma" in op_name:
                 if fam == "int":
-                    c["int_alu_ops"] += repeat
+                    if _is_scalar_dtype(eff_dt):
+                        c["scalar_ops"] += repeat
+                    else:
+                        c["int_alu_ops"] += repeat
                 else:
                     c["fp_alu_ops"] += repeat
             return eff_dt
         if isinstance(expr, tirx.BufferLoad):
+            for idx_expr in getattr(expr, "indices", ()) or ():
+                _scan_expr(idx_expr, repeat=repeat, in_simtvf=in_simtvf)
             scope = _map_tl_scope_name(expr.buffer.scope())
             if scope == "UB":
                 try:
@@ -437,22 +453,30 @@ def extract_microarch_profile_from_tirx(
                 c["ub_load_bytes"] += repeat * b
             return str(getattr(expr, "dtype", ""))
         if isinstance(expr, (tirx.Add, tirx.Sub, tirx.Mul, tirx.Div, tirx.FloorDiv, tirx.Mod, tirx.Min, tirx.Max)):
-            ld = _scan_expr(expr.a, repeat=repeat)
-            rd = _scan_expr(expr.b, repeat=repeat)
-            fam = _classify_dtype_family(ld or rd or dt_str)
+            ld = _scan_expr(expr.a, repeat=repeat, in_simtvf=in_simtvf)
+            rd = _scan_expr(expr.b, repeat=repeat, in_simtvf=in_simtvf)
+            eff_dt = ld or rd or dt_str
+            fam = _classify_dtype_family(eff_dt)
             if fam == "int":
-                c["int_alu_ops"] += repeat
+                if (
+                    isinstance(expr, (tirx.FloorDiv, tirx.Mod, tirx.Min, tirx.Max))
+                    or _is_scalar_dtype(eff_dt)
+                    or in_simtvf
+                ):
+                    c["scalar_ops"] += repeat
+                else:
+                    c["int_alu_ops"] += repeat
             else:
                 c["fp_alu_ops"] += repeat
-            return ld or rd or dt_str
+            return eff_dt
         return dt_str
 
-    def _walk(stmt: object, *, repeat: int = 1) -> None:
+    def _walk(stmt: object, *, repeat: int = 1, in_simtvf: bool = False) -> None:
         if stmt is None:
             return
         if isinstance(stmt, tirx.SeqStmt):
             for ch in stmt.seq:
-                _walk(ch, repeat=repeat)
+                _walk(ch, repeat=repeat, in_simtvf=in_simtvf)
             return
         if isinstance(stmt, tirx.For):
             ann = getattr(stmt, "annotations", None) or {}
@@ -461,48 +485,62 @@ def extract_microarch_profile_from_tirx(
                 c["pipeline_depth"] = max(c["pipeline_depth"], max(1, _safe_int(raw_stages, 1)))
             tb = getattr(stmt, "thread_binding", None)
             if tb is not None:
-                _walk(stmt.body, repeat=repeat)
+                _walk(stmt.body, repeat=repeat, in_simtvf=in_simtvf)
                 return
             trip = _eval_tirx_expr_int(stmt.extent, var_bindings)
-            eff_trip = trip if (trip is not None and trip > 0) else 1
+            kind_raw = getattr(stmt, "kind", 0)
+            kind_val = int(getattr(kind_raw, "value", kind_raw)) if isinstance(getattr(kind_raw, "value", kind_raw), int) else -1
+            is_parallel_for = kind_val == 1 or "parallel" in str(kind_raw).lower()
+            if in_simtvf and is_parallel_for and trip is not None and trip > 0:
+                eff_trip = max(1, math.ceil(trip / 64))
+            else:
+                eff_trip = trip if (trip is not None and trip > 0) else 1
             if eff_trip > 1:
                 c["inner_loop_trips"] = max(c["inner_loop_trips"], eff_trip)
-            _walk(stmt.body, repeat=repeat * eff_trip)
+            _walk(stmt.body, repeat=repeat * eff_trip, in_simtvf=in_simtvf)
             return
         if isinstance(stmt, tirx.While):
-            _walk(stmt.body, repeat=repeat)
+            _walk(stmt.body, repeat=repeat, in_simtvf=in_simtvf)
             return
         if isinstance(stmt, tirx.IfThenElse):
-            _walk(stmt.then_case, repeat=repeat)
+            _walk(stmt.then_case, repeat=repeat, in_simtvf=in_simtvf)
             if stmt.else_case is not None:
-                _walk(stmt.else_case, repeat=repeat)
+                _walk(stmt.else_case, repeat=repeat, in_simtvf=in_simtvf)
             return
         if isinstance(stmt, tirx.AttrStmt):
+            attr_key = str(getattr(stmt, "attr_key", "")).lower()
+            node_low = str(getattr(stmt, "node", "")).lower()
             ann_val = _safe_int(getattr(stmt, "value", None), 0)
-            if "stage" in str(getattr(stmt, "attr_key", "")).lower() and ann_val > 1:
+            if "stage" in attr_key and ann_val > 1:
                 c["pipeline_depth"] = max(c["pipeline_depth"], ann_val)
-            _walk(stmt.body, repeat=repeat)
+            next_simtvf = in_simtvf or ("simt" in attr_key) or ("simt" in node_low) or (attr_key == "pragma_parallel")
+            _walk(stmt.body, repeat=repeat, in_simtvf=next_simtvf)
             return
         if isinstance(stmt, (tirx.SBlockRealize,)):
-            _walk(stmt.block, repeat=repeat)
+            _walk(stmt.block, repeat=repeat, in_simtvf=in_simtvf)
             return
         if isinstance(stmt, tirx.SBlock):
             for buf in getattr(stmt, "alloc_buffers", ()) or ():
                 _record_buf(buf)
-            _walk(stmt.body, repeat=repeat)
+            blk_name = str(getattr(stmt, "name_hint", "")).lower()
+            blk_ann = getattr(stmt, "annotations", None) or {}
+            next_simtvf = in_simtvf or ("simt" in blk_name) or ("tl.vf_source_index" in blk_ann)
+            _walk(stmt.body, repeat=repeat, in_simtvf=next_simtvf)
             return
         if isinstance(stmt, (tirx.AllocBuffer, tirx.DeclBuffer)):
             if hasattr(stmt, "buffer"):
                 _record_buf(stmt.buffer)
             if hasattr(stmt, "body"):
-                _walk(stmt.body, repeat=repeat)
+                _walk(stmt.body, repeat=repeat, in_simtvf=in_simtvf)
             return
         if isinstance(stmt, tirx.Bind):
-            _scan_expr(stmt.value, repeat=repeat)
+            _scan_expr(stmt.value, repeat=repeat, in_simtvf=in_simtvf)
             if hasattr(stmt, "body"):
-                _walk(stmt.body, repeat=repeat)
+                _walk(stmt.body, repeat=repeat, in_simtvf=in_simtvf)
             return
         if isinstance(stmt, tirx.BufferStore):
+            for idx_expr in getattr(stmt, "indices", ()) or ():
+                _scan_expr(idx_expr, repeat=repeat, in_simtvf=in_simtvf)
             scope = _map_tl_scope_name(stmt.buffer.scope())
             if scope == "UB":
                 try:
@@ -511,7 +549,7 @@ def extract_microarch_profile_from_tirx(
                 except Exception:
                     b = max(1, int(math.ceil(_dtype_bytes_strict(getattr(stmt.value, "dtype", "")))))
                 c["ub_store_bytes"] += repeat * b
-            _scan_expr(stmt.value, repeat=repeat)
+            _scan_expr(stmt.value, repeat=repeat, in_simtvf=in_simtvf)
             return
         if isinstance(stmt, tirx.Evaluate) and isinstance(stmt.value, tirx.Call):
             op_name = str(getattr(stmt.value.op, "name", stmt.value.op)).lower()
@@ -576,7 +614,7 @@ def extract_microarch_profile_from_tirx(
             if "pipe_barrier" in op_name or "pipe_all" in op_name:
                 c["pipe_all_barriers"] += repeat
                 return
-            _scan_expr(stmt.value, repeat=repeat)
+            _scan_expr(stmt.value, repeat=repeat, in_simtvf=in_simtvf)
 
     for fn in funcs:
         for buf in (getattr(fn, "buffer_map", {}) or {}).values():
@@ -711,6 +749,7 @@ def merge_microarch_profiles(
         sfu_f32_ops=max(pa.sfu_f32_ops, pb.sfu_f32_ops),
         reduce_ops=max(pa.reduce_ops, pb.reduce_ops),
         slot0_only_ops=max(pa.slot0_only_ops, pb.slot0_only_ops),
+        scalar_ops=max(pa.scalar_ops, pb.scalar_ops),
         ub_load_bytes=_prefer_tir_bytes(pa.ub_load_bytes, pb.ub_load_bytes),
         ub_store_bytes=_prefer_tir_bytes(pa.ub_store_bytes, pb.ub_store_bytes),
         gm_to_l1_bytes=_prefer_tir_bytes(pa.gm_to_l1_bytes, pb.gm_to_l1_bytes),

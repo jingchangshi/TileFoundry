@@ -212,6 +212,20 @@ def project_case_workload(
     s_kv = _pick_dim(dims, ("S_kv", "s_kv")) or 0
     g_dim = _pick_dim(dims, ("G", "E", "num_experts", "groups")) or 1
 
+    s_dim = _pick_dim(dims, ("S", "s_dim", "S_q", "seq_len")) or 0
+    m_rows_dim = _pick_dim(dims, ("m_rows",))
+    has_explicit_m = _pick_dim(dims, ("M", "m_dim")) is not None
+    eff_b_dim = b_dim
+    if (
+        m_rows_dim is not None
+        and b_dim > 1
+        and (
+            (not has_explicit_m and m_dim == m_rows_dim and m_dim >= b_dim * max(1, s_dim))
+            or (s_dim > 0 and m_rows_dim == b_dim * s_dim and m_dim == m_rows_dim)
+        )
+    ):
+        eff_b_dim = 1
+
     tile_mnk = pol.get("tile_mnk")
     bm = (
         int(tile_mnk[0])
@@ -225,13 +239,23 @@ def project_case_workload(
     )
 
     base_grid = max(1, int(ledger_map.get("grid_blocks", 1) or 1))
-    if m_dim > 0 and n_dim > 0 and ("M" in dims or "m_dim" in dims or "N" in dims or "n_dim" in dims):
-        proj_tiles = max(1, math.ceil(m_dim / max(1, bm)) * math.ceil(n_dim / max(1, bn)) * b_dim * g_dim)
+    is_fixed_grid_full_loop = (
+        not bool(ledger_map.get("grid_is_symbolic", False))
+        and (prof.gm_to_ub_bytes + prof.gm_to_l1_bytes) > 0
+    )
+    if is_fixed_grid_full_loop:
+        proj_tiles = base_grid
+    elif m_dim > 0 and n_dim > 0 and ("M" in dims or "m_dim" in dims or "N" in dims or "n_dim" in dims):
+        proj_tiles = max(
+            1,
+            math.ceil(m_dim / max(1, bm)) * math.ceil(n_dim / max(1, bn)) * eff_b_dim * g_dim,
+        )
     elif m_dim > 0:
         heads = _pick_dim(dims, ("H", "N_q", "num_heads")) or 1
-        proj_tiles = max(1, b_dim * heads * math.ceil(m_dim / max(1, bm)))
+        proj_tiles = max(1, eff_b_dim * heads * math.ceil(m_dim / max(1, bm)))
     else:
         proj_tiles = base_grid
+    chip_scale = float(base_grid) if is_fixed_grid_full_loop else float(proj_tiles)
 
     dtype_name = str(pol.get("cube_operand_dtype") or pol.get("dtype") or "f16")
     elem_b = 4 if "32" in dtype_name else 2
@@ -244,10 +268,10 @@ def project_case_workload(
     vec_flops = 0.0
     if m_dim > 0 and k_dim > 0 and n_dim > 0:
         eff_k = max(k_dim, s_kv)
-        case_gm = float(b_dim * g_dim * (m_dim * eff_k + eff_k * n_dim + m_dim * n_dim) * elem_b)
+        case_gm = float(eff_b_dim * g_dim * (m_dim * eff_k + eff_k * n_dim + m_dim * n_dim) * elem_b)
     elif m_dim > 0 and (k_dim > 0 or n_dim > 0):
         width = max(k_dim, n_dim)
-        case_gm = float(b_dim * g_dim * m_dim * width * 2 * elem_b)
+        case_gm = float(eff_b_dim * g_dim * m_dim * width * 2 * elem_b)
 
     base_gm_raw = float(ledger_map.get("gm_roundtrip_bytes", 0) or 0)
     gm_scope = str(ledger_map.get("gm_traffic_scope", "per_tile") or "per_tile")
@@ -273,15 +297,15 @@ def project_case_workload(
 
     if cube_c > 0 or prof.cube_macs_total > 0 or prof.cube_mmad_count > 0:
         block_macs = max(float(prof.cube_macs_total), float(cube_c) * macs_per_cyc)
-        cube_flops = block_macs * 2.0 * float(proj_tiles)
+        cube_flops = block_macs * 2.0 * chip_scale
         if m_dim > 0 and k_dim > 0 and n_dim > 0:
-            cube_flops = max(cube_flops, float(b_dim * g_dim * 2 * m_dim * n_dim * max(k_dim, s_kv)))
+            cube_flops = max(cube_flops, float(eff_b_dim * g_dim * 2 * m_dim * n_dim * max(k_dim, s_kv)))
         if t_hw_us > 0.0:
             cube_peak = float(facts.num_aic_cores) * macs_per_cyc * 2.0 * clock_hz
             cube_flops = max(cube_flops, float(t_hw_us) * 1e-6 * cube_peak)
 
     if vec_c > 0 or prof.total_vector_ops > 0:
-        vec_flops = max(float(vec_c) * 128.0, float(prof.total_vector_ops) * 128.0) * float(proj_tiles)
+        vec_flops = max(float(vec_c) * 128.0, float(prof.total_vector_ops) * 128.0) * chip_scale
     elif t_hw_us > 0.0 and cube_flops <= 0.0:
         vec_peak = float(facts.num_aiv_cores) * 128.0 * clock_hz
         vec_flops = float(t_hw_us) * 1e-6 * vec_peak
@@ -290,7 +314,7 @@ def project_case_workload(
     if fixpipe_bytes <= 0.0 and cube_flops > 0.0:
         fixpipe_bytes = 0.25 * case_gm
     else:
-        fixpipe_bytes *= float(proj_tiles)
+        fixpipe_bytes *= chip_scale
 
     ub_occ_ratio = float(pol.get("ub_occupancy_ratio", 0.0) or 0.0)
     raw_waterlines = ledger_map.get("waterlines")
@@ -322,6 +346,7 @@ def project_case_workload(
             "loop_trips": max(1, prof.inner_loop_trips),
             "pipeline_depth": max(1, prof.pipeline_depth),
             "kernel_launches": max(1, prof.subkernel_count),
+            "profile_is_per_core_full_loop": is_fixed_grid_full_loop,
             "microarch_profile": prof.to_dict(),
         }
     )

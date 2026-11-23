@@ -1074,6 +1074,25 @@ async def run_l0_l1_round_filter(
                     cursor:
                 ]:
                     pred_us = pred_by_id.get(rem_cid, float("inf"))
+                    raw_ana_ratio = float("nan")
+                    if (
+                        parent_analytical_us is not None
+                        and math.isfinite(float(parent_analytical_us))
+                        and float(parent_analytical_us) > 0.0
+                    ):
+                        analytical_us = (
+                            float(stage_a_analytical_scorer(rem_cid, rem_patched, rem_sa))
+                            if stage_a_analytical_scorer is not None
+                            else pred_us
+                        )
+                        if math.isfinite(analytical_us):
+                            raw_ana_ratio = analytical_us / float(parent_analytical_us)
+                    err_msg = (
+                        f"cost_prescreen_pruned:pred_us={pred_us:.2f},"
+                        f"analytical_ratio={raw_ana_ratio:.3f}"
+                        if math.isfinite(raw_ana_ratio)
+                        else f"cost_prescreen_pruned:pred_us={pred_us:.2f}"
+                    )
                     results_by_idx[rem_idx] = L0L1CandidateCheck(
                         candidate_id=rem_cid,
                         passed=False,
@@ -1083,7 +1102,7 @@ async def run_l0_l1_round_filter(
                         repaired=rem_rep,
                         stage_a=rem_sa,
                         stage_b=None,
-                        error_message=f"cost_prescreen_pruned:pred_us={pred_us:.2f}",
+                        error_message=err_msg,
                     )
                 break
             chk = await _run_stage_b_and_repairs(
@@ -1097,14 +1116,40 @@ async def run_l0_l1_round_filter(
 
 
 def _resolve_agent_gates_bin(source_root: Path | None = None) -> str:
-    """Resolve the AgentGates CLI from explicit configuration or the installed entry point."""
-    _ = source_root
+    """Resolve the AgentGates CLI from explicit configuration, PATH, or relative sibling venv."""
     env_bin = os.environ.get("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "").strip()
     if env_bin and Path(env_bin).is_file():
         return env_bin
     on_path = shutil.which("agent-gates")
     if on_path:
         return on_path
+    candidates: list[Path] = []
+    env_file_raw = os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
+    if env_file_raw:
+        env_path = Path(env_file_raw).expanduser().resolve()
+        ag_root = env_path.parent
+        candidates.append(ag_root / ".venv" / "bin" / "agent-gates")
+        if env_path.is_file():
+            cfg_bin = (
+                parse_simple_env_file(env_path)
+                .get("TILEFOUNDRY_NPU_AGENT_GATES_BIN", "")
+                .strip()
+            )
+            if cfg_bin:
+                candidates.insert(0, Path(cfg_bin).expanduser())
+    if source_root is not None:
+        candidates.append(
+            Path(source_root).expanduser().resolve().parent
+            / "AgentGates"
+            / ".venv"
+            / "bin"
+            / "agent-gates"
+        )
+    repo_root = Path(__file__).resolve().parents[5]
+    candidates.append(repo_root.parent / "AgentGates" / ".venv" / "bin" / "agent-gates")
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
     raise FileNotFoundError(
         "Cannot locate 'agent-gates' binary. Set TILEFOUNDRY_NPU_AGENT_GATES_BIN or PATH."
     )
@@ -2366,6 +2411,8 @@ def _run_v2_gate(
                 root=root,
                 timeout_sec=min(_V2_SUBMIT_TIMEOUT_SEC, max(1.0, deadline - started)),
             )
+        except FileNotFoundError:
+            raise
         except (OSError, subprocess.TimeoutExpired) as exc:
             return _failed("", f"{gate_id} doctor failed: {exc}")
         if doctor_proc.returncode != 0 or doctor.get("status") != "PASS":
@@ -2388,6 +2435,8 @@ def _run_v2_gate(
                 root=root,
                 timeout_sec=min(_V2_SUBMIT_TIMEOUT_SEC, max(1.0, deadline - started)),
             )
+        except FileNotFoundError:
+            raise
         except (OSError, subprocess.TimeoutExpired) as exc:
             return _failed("", f"{gate_id} submit failed: {exc}")
         if proc.returncode != 0:
@@ -3251,6 +3300,8 @@ def run_l3_full_contract_via_agent_gates(
     try:
         agent_gates_bin = _resolve_agent_gates_bin(root)
         workspace = _agent_gates_workspace_name(root)
+    except FileNotFoundError:
+        raise
     except (OSError, ValueError) as exc:
         return _fail(str(exc))
     target_path = str(candidate)

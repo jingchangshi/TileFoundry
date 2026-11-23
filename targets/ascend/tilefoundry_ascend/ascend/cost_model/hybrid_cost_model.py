@@ -195,6 +195,7 @@ class CostFeatures:
     loop_trips: int = 1
     pipeline_depth: int = 1
     ub_occupancy_ratio: float = 0.0
+    profile_is_per_core_full_loop: bool = False
 
     @classmethod
     def coerce(
@@ -1033,6 +1034,7 @@ class HybridAscendCostModel:
                 is_coupled_1c2v=is_coupled,
                 ledger_steady_state_ii=cf.steady_state_ii,
                 pipe_scale_multipliers=scales,
+                profile_is_per_core_full_loop=cf.profile_is_per_core_full_loop,
             )
             cube_floor_us = max(cube_floor_us, sched.pipe_ns["CUBE"] * 1e-3)
             sched_vec_us = sched.pipe_ns["VECTOR"] * 1e-3

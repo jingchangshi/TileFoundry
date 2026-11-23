@@ -16,6 +16,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.kb.schema import (
     AscendCausalRule,
+    SymptomFamily,
     save_rules_yaml,
     validate_rule_predicate,
 )
@@ -2283,6 +2284,55 @@ def _rule_predicates_for_kind(
     )
 
 
+_EDIT_KIND_TO_SYMPTOM_FAMILY: dict[str, SymptomFamily] = {
+    "core_parallelism": SymptomFamily.GRID_TAIL_WAVE_UNDERUTIL,
+    "pipeline_versions": SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER,
+    "coalesced_copy": SymptomFamily.DMA_UNALIGNED_SHORT_BURST,
+    "ssbuf_handoff": SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP,
+    "dual_copy_1c2v": SymptomFamily.COMPUTE_1C2V_SUBCORE_IMBALANCE,
+    "barrier_prune": SymptomFamily.SYNC_BARRIER_SERIALIZATION,
+    "pad_alignment": SymptomFamily.SRAM_UB_L1_BANK_CONFLICT,
+    "static_pingpong_unroll": SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER,
+    "loop_fission_sfu": SymptomFamily.COMPUTE_VECTOR_LOOP_DEGRADED,
+}
+
+
+def _infer_symptom_family(
+    chunk: AstEditChunk,
+    ledger: ObjectivePhysicalLedger | None,
+    active_symptom_family: str = "",
+) -> str:
+    cleaned = str(active_symptom_family or "").strip()
+    if cleaned:
+        try:
+            return SymptomFamily(cleaned).value
+        except ValueError:
+            pass
+    mapped = _EDIT_KIND_TO_SYMPTOM_FAMILY.get(chunk.edit_kind)
+    if mapped is not None:
+        return mapped.value
+    if ledger is not None:
+        if ledger.in_loop_pipe_all_barriers > 0:
+            return SymptomFamily.SYNC_BARRIER_SERIALIZATION.value
+        if any(wl.degraded_single_buffers for wl in ledger.waterlines.values()) or (
+            ledger.uses_dynamic_offset_pipelining
+        ):
+            return SymptomFamily.SYNC_PSEUDO_DOUBLE_BUFFER.value
+        if ledger.dma_burst_efficiency_ratio < 0.7:
+            return SymptomFamily.DMA_UNALIGNED_SHORT_BURST.value
+        if 0.0 < ledger.wave_occupancy < 0.75:
+            return SymptomFamily.GRID_TAIL_WAVE_UNDERUTIL.value
+    return SymptomFamily.COMPUTE_INEFFECTIVE_THROUGHPUT.value
+
+
+def _anti_precondition_for_kind(chunk: AstEditChunk) -> str:
+    if chunk.edit_kind == "core_parallelism":
+        return "any_overflow_bytes > 0 or spill_bytes > 0 or has_indirect_gather"
+    if chunk.edit_kind == "barrier_prune":
+        return "any_overflow_bytes > 0 or has_dynamic_control"
+    return "any_overflow_bytes > 0 or spill_bytes > 0"
+
+
 def _is_rule_text_clean(rule: AscendCausalRule) -> tuple[bool, str]:
     joined = " ".join(rule.as_six_tuple()).lower()
     if rule.cpp20_transform_template:
@@ -2298,6 +2348,7 @@ def _is_rule_text_clean(rule: AscendCausalRule) -> tuple[bool, str]:
     try:
         validate_rule_predicate(rule.regime_guard)
         validate_rule_predicate(rule.precondition)
+        validate_rule_predicate(rule.anti_precondition)
         validate_rule_predicate(rule.expected_postcondition)
     except Exception as exc:
         return False, f"invalid predicate: {exc}"
@@ -2313,9 +2364,12 @@ def distill_causal_rule(
     probe_metrics: Mapping[str, float] | None = None,
     scope: str = "cross_op",
     origin_operator: str = "",
+    active_symptom_family: str = "",
 ) -> AscendCausalRule:
     """Synthesize a pure-English 6-tuple AscendCausalRule from a verified AST edit."""
     regime_guard, precondition, expected_post = _rule_predicates_for_kind(chunk, ledger)
+    anti_precondition = _anti_precondition_for_kind(chunk)
+    symptom_family = _infer_symptom_family(chunk, ledger, active_symptom_family)
     template = _generalize_template_text(chunk)
     speedup = float((probe_metrics or {}).get("speedup", 1.0))
     rationale = (
@@ -2344,6 +2398,8 @@ def distill_causal_rule(
         origin_operator=origin_operator,
         compatible_backends=backends,
         cpp20_transform_template=cpp_template,
+        symptom_family=symptom_family,
+        anti_precondition=anti_precondition,
     )
 
 
@@ -2401,6 +2457,7 @@ class FlywheelDistiller:
         max_loo_chunks: int | None = 3,
         operator_name: str = "",
         rule_scope: str = "operator_local",
+        active_symptom_family: str = "",
     ) -> FlywheelDistillationReport:
         """Run Leave-One-Out AST/config ablation directly on real candidate winner_dsl."""
         chunks = decompose_leave_one_out_ablations(baseline_dsl, winner_dsl)
@@ -2520,6 +2577,7 @@ class FlywheelDistiller:
                 probe_metrics=metrics,
                 scope=rule_scope,
                 origin_operator=operator_name,
+                active_symptom_family=active_symptom_family,
             )
             clean_ok, clean_err = _is_rule_text_clean(rule)
             if not clean_ok:
@@ -2586,6 +2644,7 @@ class FlywheelDistiller:
         max_loo_chunks: int | None = 3,
         operator_name: str = "",
         rule_scope: str = "cross_op",
+        active_symptom_family: str = "",
     ) -> FlywheelDistillationReport:
         """Run full counterfactual ablation, micro-probe or LOO check, and KB admission."""
         if verify_on_candidate:
@@ -2605,6 +2664,7 @@ class FlywheelDistiller:
                 max_loo_chunks=max_loo_chunks,
                 operator_name=operator_name,
                 rule_scope=rule_scope,
+                active_symptom_family=active_symptom_family,
             )
         chunks = decompose_ast_ablations(baseline_dsl, winner_dsl)
         kept: list[AblationMeasurement] = []
@@ -2758,6 +2818,7 @@ class FlywheelDistiller:
                 probe_metrics=metrics,
                 scope=rule_scope,
                 origin_operator=operator_name,
+                active_symptom_family=active_symptom_family,
             )
             clean_ok, clean_err = _is_rule_text_clean(rule)
             if not clean_ok:
@@ -2814,6 +2875,7 @@ class FlywheelDistiller:
         factory_name: str | None = None,
         factory_kwargs: Mapping[str, object] | None = None,
         kb_output_path: str | Path | None = None,
+        active_symptom_family: str = "",
     ) -> FlywheelDistillationReport:
         """Distill and verify causal rules directly from an EvolutionTrajectory winner."""
         return self.distill_from_pair(
@@ -2824,6 +2886,7 @@ class FlywheelDistiller:
             factory_name=factory_name,
             factory_kwargs=factory_kwargs,
             kb_output_path=kb_output_path,
+            active_symptom_family=active_symptom_family,
         )
 
 

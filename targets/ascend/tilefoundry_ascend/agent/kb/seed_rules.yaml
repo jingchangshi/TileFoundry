@@ -359,7 +359,7 @@ rules:
     symptom_family: SYNC_PSEUDO_DOUBLE_BUFFER
     regime_guard: "is_legal and (uses_dynamic_offset_pipelining or pseudo_double_buffer_serialized or in_loop_pipe_all_barriers > 0)"
     precondition: "pseudo_double_buffer_serialized or in_loop_pipe_all_barriers > 0 or measured_mte2_wait_ratio >= 0.32 or measured_sync_stall_ratio >= 0.20"
-    anti_precondition: "any_overflow_bytes > 0"
+    anti_precondition: "any_overflow_bytes > 0 or (pipeline_depth >= 2 and in_loop_pipe_all_barriers == 0 and not pseudo_double_buffer_serialized and measured_mte2_wait_ratio >= 0.40)"
     transform_template: |
       Replace T.Pipelined(..., annotations={"enable_offset": True}) dynamic modulo buffer
       indexing with explicit static ping-pong double buffers (buf_a, buf_b) inside a 2x-unrolled
@@ -677,8 +677,8 @@ rules:
   - rule_id: R34_SCALAR_LOOP_TO_VECTOR_DMA_PIPELINE
     symptom_family: SCALAR_LOOP_TRAP
     regime_guard: "is_legal"
-    precondition: "(l0_cube_cycles == 0 and l0_vec_cycles == 0) or (has_l1_compiler_summary and l1_vec_regs == 0 and l2_aiv_vec_ratio < 0.02 and l2_aic_mac_ratio == 0.0)"
-    anti_precondition: "False"
+    precondition: "scalar_compute_loop_fallback > 0 or ((l2_aiv_vec_ratio < 0.05 and l2_aic_mac_ratio < 0.02) and ((l0_cube_cycles == 0 and l0_vec_cycles == 0 and not has_simtvf) or (has_l1_compiler_summary and l1_vec_regs == 0)))"
+    anti_precondition: "l2_aiv_vec_ratio >= 0.15 or l2_aic_mac_ratio >= 0.05"
     transform_template: |
       Replace scalar per-element global-memory loops with contiguous GM->UB (and GM->L1->L0C
       for matmul/attention) DMA block transfers followed by wide SIMD vector execution under
@@ -716,3 +716,45 @@ rules:
       Split pure-vector tile work across paired AIV sub-cores using get_subblockid() == 0 vs 1
       and half_rows = row_tile / 2 in __vector__ kernels so both AIV0 and AIV1 run concurrently.
     rationale: "Pure-vector kernels using only AIV0 leave the paired AIV1 sub-core idle and halve effective vector and DMA throughput."
+
+  - rule_id: R36_SUBATOM_CONTIGUOUS_ALIGNED_CORE_SLICE
+    symptom_family: DMA_UNALIGNED_SHORT_BURST
+    regime_guard: "is_legal and (not has_indirect_gather) and (PIPE_V > 0 or PIPE_MTE2 > 0 or has_simtvf)"
+    precondition: "contig_atom_ratio < 1.0 and (l2_hit_rate < 0.55 or dma_burst_efficiency_ratio < 0.85 or transfer_inflation_ratio > 1.02)"
+    anti_precondition: "any_overflow_bytes > 0 or has_indirect_gather"
+    transform_template: |
+      When contig_atom_ratio < 1.0, partition work across AIV cores in contiguous multi-row
+      32B-aligned slices rather than strided per-element or cross-core shared cache lines so
+      each core issues full aligned GM->UB and UB->GM bursts without L2 cache-line thrashing
+      or partial writeback amplification.
+    expected_postcondition: "l2_hit_rate > prev.l2_hit_rate or dma_burst_efficiency_ratio > prev.dma_burst_efficiency_ratio or transfer_inflation_ratio < prev.transfer_inflation_ratio or measured_latency_us < prev.measured_latency_us"
+    source_provenance: "ref:asc_devkit"
+    alpha_prior: 2.5
+    beta_prior: 1.0
+    priority: 13
+    compatible_backends: ["tilelang_dsl", "cce_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Assign contiguous >= 32B multi-row GM slices per core and align asc_copy_gm2ub_align() /
+      asc_copy_ub2gm_align() block boundaries to 32B sectors to prevent L2 cache-line bouncing.
+    rationale: "Contiguous 32B-aligned core slicing eliminates sub-atom cache-line false sharing and DMA burst waste."
+
+  - rule_id: R37_SIMTVF_MULTIROW_ILP_CONSTANT_HOIST
+    symptom_family: COMPUTE_INEFFECTIVE_THROUGHPUT
+    regime_guard: "is_legal and has_simtvf"
+    precondition: "has_simtvf and l2_aiv_vec_ratio >= 0.50 and 0.0 < effective_compute_eta < 0.35"
+    anti_precondition: "spill_bytes > 0 or any_overflow_bytes > 0"
+    transform_template: |
+      Inside T.SimtVF kernels with high vector activity but low effective throughput, hoist
+      loop-invariant scalar parameters and reciprocal constants out of the inner thread loop,
+      process multiple independent elements or rows per thread to expose instruction-level
+      parallelism, and eliminate redundant divisions or repeated UB loads per inner step.
+    expected_postcondition: "effective_compute_eta > prev.effective_compute_eta or measured_latency_us < prev.measured_latency_us"
+    source_provenance: "ref:asc_devkit"
+    alpha_prior: 2.5
+    beta_prior: 1.0
+    priority: 15
+    compatible_backends: ["tilelang_dsl", "cce_trackb", "hybrid_trackb"]
+    cpp20_transform_template: |
+      Hoist loop-invariant constants and scalar reciprocals outside __simt_vf__ inner loops and
+      unroll multi-row/multi-element accumulators per thread to increase ILP without UB spills.
+    rationale: "Hoisting loop-invariant constants and multi-row ILP removes SIMT latency bubbles and redundant UB/SFU stalls."

@@ -509,6 +509,20 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "T.copy(B_gm[...], b_l1, transpose=True) before T.gemm(a_l1, b_l1, c_l0c, "
             "transpose_B=True, clear_accum=...)."
         ),
+        (
+            "Inside `with T.SimdVF():`, store vector register results to UB exclusively via "
+            "`T.simd.vsts(...)` (never assign a vector expression directly like `ub_buf[off] = vec_expr`)."
+        ),
+        (
+            "Keep UB float32 scalar-slot offsets 32-byte aligned (`off % 8 == 0`, e.g., `(row, 8)` "
+            "stride rows) whenever storing with `dist=\"ONEPT_B32\"` or loading with `dist=\"BRC_B32\"`."
+        ),
+        (
+            "Inside `with T.MixedKernel(blocks, sids=2) as (bx, sid):`, every `UB -> GM` `T.copy` "
+            "to a shared GM/workspace buffer must write disjoint `sid`-partitioned slices "
+            "(e.g., `sid * half_m : (sid + 1) * half_m`, paired with `T.assume(...)` when needed) "
+            "so AIV0 and AIV1 never collide on `PIPE_MTE3`."
+        ),
     ),
 )
 
@@ -736,6 +750,66 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
             "exec_mode_and_spr",
             "__simt_vf__ __launch_bounds__(N) void simt_fn(...)",
         ),
+        PrimitiveEntry(
+            "asc_create_mask_b32",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "vector_bool m32 = asc_create_mask_b32(PAT_ALL)",
+        ),
+        PrimitiveEntry(
+            "asc_create_mask_b16",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "vector_bool m16 = asc_create_mask_b16(PAT_ALL)",
+        ),
+        PrimitiveEntry(
+            "simd_inst::update_mask_b32",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "vector_bool m32_tail = simd_inst::update_mask_b32(rem)",
+        ),
+        PrimitiveEntry(
+            "simd_inst::update_mask_b16",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "vector_bool m16_tail = simd_inst::update_mask_b16(rem * 2)",
+        ),
+        PrimitiveEntry(
+            "simd_inst::vdup",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "simd_inst::vdup<T>(scalar, mask, MODE_ZEROING)",
+        ),
+        PrimitiveEntry(
+            "simd_inst::vcvt",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "simd_inst::vcvt<DstT>(src_vec, mask, ROUND_R, RS_ENABLE, PART_EVEN, MODE_ZEROING)",
+        ),
+        PrimitiveEntry(
+            "simd_inst::vlds_brc_elem",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "simd_inst::vlds_brc_elem<T>(ub_ptr, offset)",
+        ),
+        PrimitiveEntry(
+            "simd_inst::vsts_1st",
+            "PIPE_V",
+            "exec_mode_and_spr",
+            "simd_inst::vsts_1st(vec, ub_ptr, offset, mask)",
+        ),
+        PrimitiveEntry(
+            "simd_inst::vadd",
+            "PIPE_V",
+            "alg_compute_and_monoid",
+            "simd_inst::vadd(lhs, rhs, mask, MODE_ZEROING)",
+        ),
+        PrimitiveEntry(
+            "Simt::GetThreadIdx",
+            "PIPE_V",
+            "grid_and_workspace_topology",
+            "Simt::GetThreadIdx<0>() [inside __simt_vf__ only]",
+        ),
     ),
     forbidden_tokens=(
         "kernel_operator.h",
@@ -835,6 +909,21 @@ CCE_CPP20_SURFACE = DialectSurfaceSpec(
             "simd_inst::* intrinsics and avoid scalar float math, casts, or scalar UB "
             "element accesses inside vector loops (`bisheng` rejects unsupported scalar "
             "instructions in AIV loops)."
+        ),
+        (
+            "Never use pge_b32 as a true mask or invent nonexistent simd_inst::* or asc_* "
+            "names outside the verified surface above; use asc_create_mask_b32(PAT_ALL) / "
+            "asc_create_mask_b16(PAT_ALL) for full masks and simd_inst::update_mask_b32(rem) / "
+            "simd_inst::update_mask_b16(rem * 2) for tail masks."
+        ),
+        (
+            "Every __simd_vf__ function must return void (for example "
+            "`__simd_vf__ inline void vf_fn(...)`), never returning a vector or scalar type."
+        ),
+        (
+            "Parallelize __simt_vf__ across >=32 threads (`__launch_bounds__(128)` and "
+            "`dim3(128, 1, 1)`) using `Simt::GetThreadIdx<0>()` (never `threadIdx` and "
+            "never single-lane `__launch_bounds__(1)`)."
         ),
     ),
 )

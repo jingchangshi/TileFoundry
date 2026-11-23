@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
+    extract_reachable_trackb_source,
     strip_cpp_comments_and_strings,
 )
 from tilefoundry_ascend.agent.orchestrator.residual_beam import (
@@ -2144,6 +2145,8 @@ def evaluate_ascendc_candidate(
     baseline_cpp_source: str | None = None,
     require_hardware_dma: bool = False,
     require_cube_engine: bool = False,
+    module_source: str | None = None,
+    regime_tag: str | None = None,
 ) -> StageAResult:
     """Validate a Track-B AscendC C++ candidate via 7-facet checks and static ledger."""
     t0 = time.monotonic()
@@ -2163,6 +2166,12 @@ def evaluate_ascendc_candidate(
         verify_source_against_facets,
     )
 
+    _, reachable_cpp = extract_reachable_trackb_source(
+        cpp_source,
+        module_source=module_source,
+        regime_tag=regime_tag,
+    )
+
     active_mask = freedom_mask if freedom_mask is not None else ConstraintRelaxationMask.bottom()
     active_verifier = verifier if verifier is not None else SILVerifier()
     if hasattr(active_verifier, "verify_source_against_facets"):
@@ -2175,7 +2184,7 @@ def evaluate_ascendc_candidate(
         )
 
     redline_errs = _check_custom_kernel_redlines(cpp_source)
-    ledger = _build_ascendc_static_ledger(cpp_source, target=target, case_ratios=case_ratios)
+    ledger = _build_ascendc_static_ledger(reachable_cpp, target=target, case_ratios=case_ratios)
 
     if baseline_cpp_source is not None:
         forbidden_tokens = CCE_CPP20_SURFACE.introduced_forbidden_tokens(
@@ -2188,7 +2197,7 @@ def evaluate_ascendc_candidate(
             if count > 0
         )
     errors = [*redline_errs, *facet_report.errors]
-    masked_src = strip_cpp_comments_and_strings(cpp_source)
+    masked_src = strip_cpp_comments_and_strings(reachable_cpp)
     if require_cube_engine:
         mmad_hits = len(re.findall(r"\b(?:asc_mmad(?:_mx)?|ascend_gemm_l1)\s*\(", masked_src))
         if mmad_hits == 0 and int(ledger.pipe_cycles.get("AIC.PIPE_M", 0)) == 0:
@@ -2206,6 +2215,19 @@ def evaluate_ascendc_candidate(
                 "missing_hardware_dma_staging: Track-B kernel performs raw scalar __gm__ "
                 "loops with zero GM->UB/L1 DMA transfers"
             )
+    if case_ratios is None or not getattr(case_ratios, "has_empty_group", False):
+        if re.search(r"\b__simt_vf__\b", masked_src) and (
+            re.search(r"__launch_bounds__\s*\(\s*1\s*\)", masked_src)
+            or re.search(
+                r"\basc_vf_call\s*<[^>]+>\s*\(\s*dim3\s*\(\s*1\s*,\s*1\s*,\s*1\s*\)",
+                masked_src,
+            )
+        ):
+            errors.append(
+                "degenerated_single_lane_simt: __simt_vf__ launched with 1 thread wastes "
+                "127/128 SIMT lanes; parallelize across >=32 threads via "
+                "Simt::GetThreadIdx<0>() or use __simd_vf__"
+            )
     if forbidden_tokens:
         errors.append(f"cce_forbidden_tokens: {', '.join(forbidden_tokens)}")
     if ledger.max_overflow_bytes > 0:
@@ -2219,9 +2241,9 @@ def evaluate_ascendc_candidate(
             route_execution_track,
         )
 
-        lower = cpp_source.lower()
+        lower = reachable_cpp.lower()
         uses_cube = "mmad" in lower or "l0c" in lower
-        uses_simt = "__simt_vf__" in cpp_source or "Simt::" in cpp_source
+        uses_simt = "__simt_vf__" in reachable_cpp or "Simt::" in reachable_cpp
         uses_ssbuf = "ssbuf" in lower or "crosscore" in lower
         static_affine_bounds = not uses_simt
         cube_to_vector_ratio = 1.0 if uses_cube else 0.0
@@ -2447,6 +2469,156 @@ def _ast_has_dsl_call(tree: ast.AST, *attrs: str) -> bool:
     return False
 
 
+_SRAM_ALLOC_ATTRS = frozenset(
+    {"alloc_shared", "alloc_l1", "alloc_l0a", "alloc_l0b", "alloc_l0c", "alloc_ss"}
+)
+
+
+def _expr_base_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Subscript):
+        return _expr_base_name(node.value)
+    return None
+
+
+def _expr_names(node: ast.AST) -> set[str]:
+    return {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
+
+
+def _is_sid_partition_guard(test: ast.AST, sid_var: str) -> bool:
+    for sub in ast.walk(test):
+        if isinstance(sub, ast.Compare) and isinstance(sub.left, ast.Name) and sub.left.id == sid_var:
+            if any(isinstance(op, (ast.Eq, ast.NotEq)) for op in sub.ops):
+                return True
+        if isinstance(sub, ast.Compare) and any(
+            isinstance(comp, ast.Name) and comp.id == sid_var for comp in sub.comparators
+        ):
+            if any(isinstance(op, (ast.Eq, ast.NotEq)) for op in sub.ops):
+                return True
+    return False
+
+
+def _extract_mixed_kernel_sids2(node: ast.AST) -> tuple[ast.With, str] | None:
+    if not isinstance(node, ast.With):
+        return None
+    for item in node.items:
+        call = item.context_expr
+        if not _is_t_dsl_call(call, "MixedKernel"):
+            continue
+        assert isinstance(call, ast.Call)
+        sids_val: object = None
+        for kw in call.keywords:
+            if kw.arg == "sids" and isinstance(kw.value, ast.Constant):
+                sids_val = kw.value.value
+                break
+        if sids_val != 2:
+            continue
+        if isinstance(item.optional_vars, (ast.Tuple, ast.List)) and len(item.optional_vars.elts) >= 2:
+            sid_node = item.optional_vars.elts[1]
+            if isinstance(sid_node, ast.Name) and sid_node.id != "_":
+                return node, sid_node.id
+    return None
+
+
+def _uncovered_1c2v_subcore_mte3_writes(tree: ast.AST) -> list[int]:
+    """Return line numbers of UB->GM T.copy writes lacking sid partitioning in sids=2."""
+    bad_lines: list[int] = []
+    for fn_node in ast.walk(tree):
+        if not isinstance(fn_node, ast.FunctionDef):
+            continue
+        param_names = {arg.arg for arg in fn_node.args.args}
+        for sub_node in ast.walk(fn_node):
+            extracted = _extract_mixed_kernel_sids2(sub_node)
+            if extracted is None:
+                continue
+            with_node, sid_var = extracted
+            ub_buffers: set[str] = set()
+            sram_buffers: set[str] = set()
+            for stmt in ast.walk(with_node):
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and len(stmt.targets) == 1
+                    and isinstance(stmt.targets[0], ast.Name)
+                    and isinstance(stmt.value, ast.Call)
+                ):
+                    for attr in _SRAM_ALLOC_ATTRS:
+                        if _is_t_dsl_call(stmt.value, attr):
+                            name = stmt.targets[0].id
+                            sram_buffers.add(name)
+                            if attr == "alloc_shared":
+                                ub_buffers.add(name)
+                            break
+
+            sid_tainted: set[str] = {sid_var}
+            for _ in range(6):
+                changed = False
+                for stmt in ast.walk(with_node):
+                    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                        tgt = stmt.targets[0]
+                        if isinstance(tgt, ast.Name) and (_expr_names(stmt.value) & sid_tainted):
+                            if tgt.id not in sid_tainted:
+                                sid_tainted.add(tgt.id)
+                                changed = True
+                    elif (
+                        isinstance(stmt, ast.AnnAssign)
+                        and stmt.value is not None
+                        and isinstance(stmt.target, ast.Name)
+                        and (_expr_names(stmt.value) & sid_tainted)
+                    ):
+                        if stmt.target.id not in sid_tainted:
+                            sid_tainted.add(stmt.target.id)
+                            changed = True
+                    elif isinstance(stmt, ast.For) and isinstance(stmt.target, ast.Name):
+                        if (
+                            isinstance(stmt.iter, ast.Call)
+                            and len(stmt.iter.args) >= 2
+                            and (_expr_names(stmt.iter) & sid_tainted)
+                            and stmt.target.id not in sid_tainted
+                        ):
+                            sid_tainted.add(stmt.target.id)
+                            changed = True
+                if not changed:
+                    break
+
+            def _scan_stmts(stmts: Sequence[ast.stmt], *, sid_guarded: bool) -> None:
+                for st in stmts:
+                    if isinstance(st, ast.If):
+                        guarded = sid_guarded or _is_sid_partition_guard(st.test, sid_var)
+                        _scan_stmts(st.body, sid_guarded=guarded)
+                        _scan_stmts(st.orelse, sid_guarded=guarded)
+                        continue
+                    if isinstance(st, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)):
+                        _scan_stmts(st.body, sid_guarded=sid_guarded)
+                        if hasattr(st, "orelse"):
+                            _scan_stmts(st.orelse, sid_guarded=sid_guarded)
+                        continue
+                    if sid_guarded:
+                        continue
+                    for inner in ast.walk(st):
+                        if not _is_t_dsl_call(inner, "copy"):
+                            continue
+                        assert isinstance(inner, ast.Call)
+                        if len(inner.args) < 2:
+                            continue
+                        src_name = _expr_base_name(inner.args[0])
+                        dst_arg = inner.args[1]
+                        dst_name = _expr_base_name(dst_arg)
+                        if src_name not in ub_buffers or dst_name is None:
+                            continue
+                        is_gm_target = (dst_name in param_names) or (dst_name not in sram_buffers)
+                        if not is_gm_target:
+                            continue
+                        if isinstance(dst_arg, ast.Subscript):
+                            if not (_expr_names(dst_arg.slice) & sid_tainted):
+                                bad_lines.append(inner.lineno)
+                        else:
+                            bad_lines.append(inner.lineno)
+
+            _scan_stmts(with_node.body, sid_guarded=False)
+    return sorted(set(bad_lines))
+
+
 def _resolve_stage_a_var_bindings(
     dims: Mapping[str, object] | None,
     var_bindings: Mapping[str, int] | None,
@@ -2525,6 +2697,20 @@ def run_stage_a_static(
                     f"{', '.join(f'T.{op}' for op in parallel_math)}; move elementwise math "
                     "under with T.SimdVF(): with T.simd.vcvt / T.simd.vexp, or under "
                     "with T.SimtVF(threads=128): with T.cast"
+                ),
+                elapsed_ms=(time.monotonic() - t0) * 1000.0,
+            )
+        uncovered_1c2v_lines = _uncovered_1c2v_subcore_mte3_writes(parsed_tree)
+        if uncovered_1c2v_lines:
+            return StageAResult(
+                passed=False,
+                prim_func=None,
+                ledger=None,
+                error_message=(
+                    "uncovered_1c2v_subcore_mte3_write: T.MixedKernel(sids=2) writes shared "
+                    "GM/workspace buffer without partitioning slices by 'sid' "
+                    "(causes insert_sync AIV0.MTE3->AIV1.MTE3 fatal); "
+                    "partition rows as sid * half_m : (sid + 1) * half_m"
                 ),
                 elapsed_ms=(time.monotonic() - t0) * 1000.0,
             )
@@ -3715,6 +3901,17 @@ def _resolve_agent_gates_bin() -> str:
     found = shutil.which("agent-gates")
     if found:
         return found
+    candidates: list[Path] = []
+    env_file = os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
+    if env_file:
+        env_path = Path(env_file).expanduser().resolve()
+        for ag_root in (env_path.parent, env_path.parent.parent):
+            candidates.append(ag_root / ".venv" / "bin" / "agent-gates")
+    repo_root = Path(__file__).resolve().parents[5]
+    candidates.append(repo_root.parent / "AgentGates" / ".venv" / "bin" / "agent-gates")
+    for cand in candidates:
+        if cand.is_file():
+            return str(cand)
     raise FileNotFoundError(
         "Cannot locate 'agent-gates'. Set TILEFOUNDRY_NPU_AGENT_GATES_BIN or add to PATH."
     )
