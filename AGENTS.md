@@ -2,21 +2,21 @@
 
 ## Block A: Dual Axioms & Nine Non-Negotiable Guardrails
 
-- **Axiom 1 (Hardware & Contract First)**: Correctness is defined by SIL contracts, L3 replay/invariant gates, and L4 CANNBench; never relax contracts or rely on single-shape or host-proxy fits.
-- **Axiom 2 (Compiler Truth Over Heuristics)**: Sink deterministic degradations into IR lowering, `SILVerifier`, Z3 pipeline solver, `EnvelopeInspector`, and `CompilerBehaviorRegistry`, not prompt patches.
-1. **Zero Op-Name Branching**: Generic passes (HIR, Z3, TIR, CostModel, Router) dispatch on physical ratios, `TopologyAxes`, and IR attrs—never operator names.
+- **Axiom 1 (Hardware & Contract First)**: Correctness is defined by SIL contracts and L3/L4 CANNBench gates; never relax contracts or rely on single-shape or host-proxy fits.
+- **Axiom 2 (Compiler Truth Over Heuristics)**: Sink deterministic degradations into IR lowering, `SILVerifier`, Z3 solver, `EnvelopeInspector`, and `CompilerBehaviorRegistry`, not prompt patches.
+1. **Zero Op-Name Branching**: Generic passes (HIR, Z3, TIR, CostModel, Router) dispatch on physical ratios, `TopologyAxes`, and IR attrs—never op names.
 2. **Bounded `2..4` Regimes**: `partition_case_regimes` splits `_subatom` (`contig_atom_ratio < 1.0`) from aligned reductions via weighted lexicographic merge (`1 <= min <= len <= 4`).
-3. **Topology Buckets & Prescreen**: `ExperienceLake` isolates `TopologyAxes` buckets; Tier-0/1 prescreen runs all `CompilerBehaviorRegistry` detectors (`|ln(m/a)| > 2.5` to `unmodeled_anomalies.jsonl`).
+3. **Topology Buckets & Prescreen**: `ExperienceLake` isolates `TopologyAxes` buckets; Tier-0/1 prescreen runs `CompilerBehaviorRegistry` detectors (`|ln(m/a)| > 2.5` -> `unmodeled_anomalies.jsonl`).
 4. **Orthogonal 3-Layer Prompt & `G5`**: Zero Layer 1.5; L1 (`G1..G4` + paired escapes), L2 (`T.ascend_*` + `seed_rules.yaml`), L3 (KB); `explore_creative` is `Rule-Blind` (`<= 1.5x` parent analytical); `syntax_repair` enforces `G5` lock.
-5. **Contiguous Session & Two-Snapshot**: Hold `ascend_compile_session` across HIR-to-TIR, `PrimFunc.specialize` + `arith.Analyzer`, and `tilelang.lower`; keep `EnvelopeInspector` Two-Snapshot diff.
-6. **CoW Helper Isolation**: `patch_regime_into_module` namespaces helpers `_{regime_tag}_*`, prunes dead helpers, and enforces `>= 0.97x` active / `>= 0.98x` sibling tail guards.
-7. **Closed KB & Scoped Tabu**: Use closed 13 `SymptomFamily`, read-only online `seed_rules.yaml` (`anti_precondition`, AST whitelist), 3-axis Bayesian tracking, and Scoped Tabu (`excluded_mechanisms`).
+5. **Contiguous Session & Two-Snapshot**: Hold `ascend_compile_session` across HIR-to-TIR, `PrimFunc.specialize` + `arith.Analyzer`, and `tilelang.lower`; keep Two-Snapshot diff.
+6. **CoW Helper Isolation**: `patch_regime_into_module` prefixes helpers `_{regime_tag}_*`, prunes dead helpers, and enforces `>= 0.97x` active / `>= 0.98x` sibling tail guards.
+7. **Closed KB & Scoped Tabu**: Closed 13 `SymptomFamily`, read-only online `seed_rules.yaml` (`anti_precondition`, AST whitelist), 3-axis Bayesian tracking, and `excluded_mechanisms` tabu.
 8. **Pure Cache & Honest Gates**: No magic cache cap (`len(cases) // 2`) or float-tol/host-ptr keys; enforce L3 two-pass `Delta|Cache| == 0` idempotence and L4 `AgentGates` v2 receipts.
-9. **CANN 9.3 Active Target Only (`cann_9_2` Placeholder)**: Treat `cann_9_3` (`dav-3510`) as the sole active SDK target across templates, dialect surfaces, verifiers, and audits; `cann_9_2` is retained strictly as an inert placeholder—never add `cann_9_2` runtime shims, conditional header branches, or compatibility regressions.
+9. **CANN 9.3 Only (`cann_9_2` Placeholder)**: Target `cann_9_3` (`dav-3510`) exclusively across templates, dialect surfaces, verifiers, and audits; keep `cann_9_2` inert (no runtime shims or header branches).
 
 ## Block B: Section-Sliced Read Routing (DO NOT Read Full Specs)
 
-> **Routing Rule**: Routine coding subtasks **DO NOT** read [Architecture Overview](./docs/ascend/00_architecture_overview.md) and **NEVER** read full `01_*.md` or `02_*.md`; slice **ONLY** the matched `[SEC-*]` `L<start>-L<end>` range below.
+> **Routing Rule**: Routine subtasks **DO NOT** read [Architecture Overview](./docs/ascend/00_architecture_overview.md) and **NEVER** read full `01_*.md` or `02_*.md`; slice **ONLY** the matched `[SEC-*]` range below.
 
 | Target Code Scope | `[SEC-*]` | Exact Sliced Route |
 | :--- | :--- | :--- |
@@ -31,7 +31,7 @@ Index (human/plugin entry only): [Ascend Plugin README](./targets/ascend/README.
 
 ## Block C: Worker Isolation, Hygiene Lints & AgentGates Execution
 
-- **Inner Worker Isolation**: Inner marathon/campaign operator-generation workers MUST run in an empty temp dir (`TemporaryDirectory`) and NEVER mount or read repo `.md` files.
+- **Worker Isolation**: Inner campaign operator-gen workers MUST run in an empty temp dir (`TemporaryDirectory`) and NEVER read repo `.md` files.
 - **Static Lints (`./scripts/`)**: Run `no_machine_paths_lint.py`, `spec_refs_lint.py`, `spec_rules_lint.py`, `comment_hygiene_lint.py`, `spec_entropy_lint.py`, and `forward_references_lint.py` on touched files.
-- **Execution & Env**: NEVER export `TILEFOUNDRY_NPU_*` in parent shells or create `.venv`/`venv` inside the repo. Run host/NPU verification via `AgentGates` `agent-gates` signed v2 (`tilefoundry-npu-cpu` / `tilefoundry-npu`).
-- **Python Discipline**: Keep flat typed Python (no `Any`, `cast`, `# type: ignore`, or `TYPE_CHECKING`), explicit failure semantics, and full assertion strength.
+- **Execution & Env**: NEVER export `TILEFOUNDRY_NPU_*` or create `.venv`/`venv` in-repo. Verify via `AgentGates` `agent-gates` signed v2 (`tilefoundry-npu-cpu` / `tilefoundry-npu`).
+- **Python Discipline**: Flat typed Python (no `Any`, `cast`, `# type: ignore`, or `TYPE_CHECKING`), explicit failure semantics, and full assertion strength.

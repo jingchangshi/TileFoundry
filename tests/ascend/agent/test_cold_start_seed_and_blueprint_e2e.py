@@ -379,10 +379,11 @@ def _install_accepting_gates(
         env_file: Path | None,
         entrypoint_contract: GoldenEntrypointContract | None = None,
         semantics: PyTorchOpSemantics | None = None,
+        op_proto: Mapping[str, object] | None = None,
     ) -> Callable[[str, str], tuple[bool, str]]:
         assert regime_specs
         assert entrypoint == "exp"
-        _ = (worktree, env_file, entrypoint_contract, semantics)
+        _ = (worktree, env_file, entrypoint_contract, semantics, op_proto)
 
         def _validate(module_source: str, track: str) -> tuple[bool, str]:
             return True, ""

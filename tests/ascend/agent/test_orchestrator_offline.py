@@ -515,7 +515,22 @@ def test_fp3_unmatched_rules_not_padded_and_transport_error_exempt() -> None:
         factory_kwargs={"bm": 64, "bn": 64, "bk": 64},
     )
     default_creative = next(s for s in default_specs if s.worker_kind == "creative_explore")
-    assert "### TILE PRESCREEN GUIDANCE" not in default_creative.request.user_prompt
+    assert "### TILE PRESCREEN GUIDANCE" in default_creative.request.user_prompt
+
+    disabled_runner = PortfolioRunner(
+        backend=MockLLMBackend(),
+        funnel=funnel,
+        tracker=tracker,
+        k_rule_workers=2,
+        enable_tilesize_prescreen=False,
+    )
+    disabled_specs = disabled_runner.plan_workers(
+        cube_parent,
+        1,
+        factory_kwargs={"bm": 64, "bn": 64, "bk": 64},
+    )
+    disabled_creative = next(s for s in disabled_specs if s.worker_kind == "creative_explore")
+    assert "### TILE PRESCREEN GUIDANCE" not in disabled_creative.request.user_prompt
 
     runner = PortfolioRunner(
         backend=MockLLMBackend(),
