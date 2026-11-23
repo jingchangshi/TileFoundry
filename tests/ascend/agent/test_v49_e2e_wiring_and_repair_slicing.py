@@ -97,8 +97,8 @@ __aicore__ inline void helper_compute(
     __simd_vf__ void (*vf_tag)() = nullptr;
     __cbuf__ half* l1_a = (__cbuf__ half*)(0x0000);
     __cbuf__ half* l1_b = (__cbuf__ half*)(0x20000);
-    asc_copy_gm2l1_nd(l1_a, gm_in, 128, 32, 32, 128);
-    asc_copy_gm2l1_nd(l1_b, gm_in, 128, 32, 32, 128);
+    asc_copy_gm2l1_nd2nz(l1_a, gm_in, 128, static_cast<asc_load_l2_cache_mode>(0), 32, 128, 0, 0);
+    asc_copy_gm2l1_nd2nz(l1_b, gm_in, 128, static_cast<asc_load_l2_cache_mode>(0), 32, 128, 0, 0);
     ascend_gemm_l1<16, 32, 32>(l1_a, l1_b);
     __ubuf__ int4b_t* q_ptr = (__ubuf__ int4b_t*)stage_ptr;
     for (int k = 0; k < loop_k; ++k) {
@@ -152,10 +152,16 @@ extern "C" __global__ __aicore__ void test_gemm_l1_kernel(
 ) {
     __cbuf__ half* l1_a = (__cbuf__ half*)(0x0000);
     __cbuf__ half* l1_b = (__cbuf__ half*)(0x10000);
-    asc_copy_gm2l1_nd(l1_a, x, 128, 32, 32, 128);
-    asc_copy_gm2l1_nd(l1_b, w, 128, 32, 32, 128);
+    __cc__ float* l0c = (__cc__ float*)(0x0000);
+    asc_copy_gm2l1_nd2nz(l1_a, x, 128, static_cast<asc_load_l2_cache_mode>(0), 32, 128, 0, 0);
+    asc_copy_gm2l1_nd2nz(l1_b, w, 128, static_cast<asc_load_l2_cache_mode>(0), 32, 128, 0, 0);
     ascend_gemm_l1<16, 32, 32>(l1_a, l1_b);
-    asc_copy_l0c2gm_f32(y, l1_a, 16, 32);
+    asc_copy_l0c2gm(
+        y, l0c, (uint16_t)32, (uint16_t)16, (uint32_t)32, (uint16_t)16,
+        static_cast<asc_store_l2_cache_mode>(0), static_cast<asc_unit_flag_mode>(0),
+        static_cast<asc_quant_mode>(0), static_cast<asc_relu_pre_mode>(0),
+        false, true, false, false
+    );
 }
 """
     stage_a = evaluate_ascendc_candidate(
@@ -165,23 +171,25 @@ extern "C" __global__ __aicore__ void test_gemm_l1_kernel(
     assert stage_a.passed is True, stage_a.error_message
     assert stage_a.ledger is not None
     assert stage_a.ledger.effective_cube_m == 16
+    assert stage_a.ledger.min_gm_dma_bytes == 2048
 
 
 def test_stage_b_driver_dumps_before_device_compile() -> None:
-    """Verify build_stage_b_driver_source dumps pre-compile TIR and .cce first."""
+    """Verify build_stage_b_driver_source compiles once and salvages dumps on failure."""
     src = build_stage_b_driver_source(
         Path("/tmp/fake_kernel.py"),
         factory_name="make_kernel",
         tir_dump_path="/tmp/fake.tir",
         kernel_dump_path="/tmp/fake.cce",
     )
-    pre_idx = src.index("enable_device_compile=False")
-    tir_dump_idx = src.index("tir_dump_path")
-    cce_dump_idx = src.index("kernel_dump_path")
-    post_idx = src.index("enable_device_compile=True")
-    assert pre_idx < post_idx
-    assert cce_dump_idx < post_idx
-    assert tir_dump_idx < post_idx
+    session_src = src[src.index("with _ascend_compile_session(_merged_pc):") :]
+    pre_idx = session_src.index("enable_device_compile=False")
+    tir_dump_idx = session_src.index("tir_dump_path")
+    cce_dump_idx = session_src.index("kernel_dump_path")
+    post_idx = session_src.index("enable_device_compile=True")
+    assert post_idx < pre_idx
+    assert post_idx < cce_dump_idx
+    assert post_idx < tir_dump_idx
 
 
 def test_lowered_compiler_excerpt_prioritizes_cce_and_fences() -> None:

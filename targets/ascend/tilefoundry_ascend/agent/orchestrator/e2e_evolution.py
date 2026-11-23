@@ -326,10 +326,6 @@ def _summarize_blueprint(packet: HirBlueprintPacket | None) -> dict[str, object]
     return {
         "entry_name": packet.entry_name,
         "roofline": packet.roofline.to_dict(),
-        "z3_pipeline_summary": dict(packet.z3_pipeline_summary),
-        "reference_ledger": (
-            packet.reference_ledger.to_dict() if packet.reference_ledger is not None else None
-        ),
         "lowering_diagnostics": list(packet.lowering_diagnostics),
         "provenance": packet.provenance.to_dict() if packet.provenance is not None else None,
     }

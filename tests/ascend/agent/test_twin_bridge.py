@@ -224,7 +224,7 @@ def test_format_blueprint_delta_section_and_portfolio_roofline_eta() -> None:
         },
         gm_roundtrip_bytes=8192,
     )
-    packet = dataclasses.replace(raw_pkt, reference_ledger=tl_ledger)
+    packet = raw_pkt
     nav_text = format_blueprint_delta_section(packet, current_ledger=tl_ledger)
     assert "### LAYER 3: PHYSICAL ROOFLINE & BLUEPRINT DELTA" in nav_text
     assert "T.ascend_mmad" not in nav_text
@@ -333,7 +333,7 @@ def test_format_blueprint_delta_section_gates_cross_scale_deltas() -> None:
             output_shapes=((4, 64),),
         ),
     )
-    exact_pkt = dataclasses.replace(raw_pkt, reference_ledger=tl_ledger)
+    exact_pkt = raw_pkt
     assert exact_pkt.shape_exact_match is True
     exact_nav = format_blueprint_delta_section(exact_pkt, current_ledger=tl_ledger)
     assert "[Structural Reference Only:" not in exact_nav

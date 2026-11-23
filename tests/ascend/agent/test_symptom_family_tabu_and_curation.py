@@ -119,8 +119,6 @@ def _dummy_blueprint(regime_tag: str = "reg_a") -> dict[str, HirBlueprintPacket]
         regime_tag: HirBlueprintPacket(
             entry_name="reg_a",
             roofline=roofline,
-            z3_pipeline_summary={},
-            reference_ledger=None,
             lowering_diagnostics=(),
             requested_anchor_dims={"M": 128, "D": 128},
             resolved_hir_dims={"M": 128, "D": 128},
@@ -865,8 +863,6 @@ def fused_attn(q, k, v):
             cube_floor_us=4.0,
             vec_floor_us=2.0,
         ),
-        z3_pipeline_summary={},
-        reference_ledger=None,
         lowering_diagnostics=(),
     )
     assert (
@@ -918,8 +914,6 @@ def row_sum(x):
             vector_flops=103_424,
             vec_floor_us=0.5,
         ),
-        z3_pipeline_summary={},
-        reference_ledger=None,
         lowering_diagnostics=(),
     )
     assert (

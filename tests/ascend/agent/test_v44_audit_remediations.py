@@ -823,13 +823,6 @@ def test_p0_2_trackb_compile_flags_strip_ubuf_on_simt_vf(
                     ideal_roofline_us=1.0,
                     dominant_bound="memory",
                 ),
-                reference_ledger=build_objective_physical_ledger(
-                    analysis_mode="readonly_envelope",
-                    is_legal=True,
-                    steady_state_ii=10,
-                    pipe_cycles={"AIV0.PIPE_V": 10},
-                    waterlines={},
-                ),
             )
         },
         l2_batch_evaluator=lambda _c, _a: {},
@@ -911,7 +904,6 @@ def test_p1_1_experience_lake_and_e2e_evolution_persist_roofline(tmp_path: Path)
     bp = HirBlueprintPacket(
         entry_name="op",
         roofline=roofline,
-        reference_ledger=ledger,
     )
     anchor = AnchorCaseSpec("level2/rms_norm", 1, "r0", 20.0, 3.0)
     runner = PerfTargetCampaignRunner(
@@ -1047,13 +1039,6 @@ def test_p1_2_hybrid_and_tracka_cube_dma_aggregate_gate(
                     memory_floor_us=1.0,
                     ideal_roofline_us=1.0,
                     dominant_bound="memory",
-                ),
-                reference_ledger=build_objective_physical_ledger(
-                    analysis_mode="readonly_envelope",
-                    is_legal=True,
-                    steady_state_ii=10,
-                    pipe_cycles={"AIC.PIPE_M": 10},
-                    waterlines={},
                 ),
             )
         },
