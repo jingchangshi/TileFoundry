@@ -332,6 +332,8 @@ class AscendCausalRule:
     cpp20_transform_template: str = ""
     symptom_family: str = ""
     anti_precondition: str = "False"
+    mechanism_tag: str = ""
+    concept_description: str = ""
 
     def __post_init__(self) -> None:
         if not self.rule_id or not self.transform_template.strip():
@@ -360,6 +362,11 @@ class AscendCausalRule:
         object.__setattr__(self, "symptom_family", cleaned_family)
         anti_expr = str(self.anti_precondition or "False").strip() or "False"
         object.__setattr__(self, "anti_precondition", anti_expr)
+        cleaned_mech = str(self.mechanism_tag or "").strip() or self.rule_id.lower()
+        object.__setattr__(self, "mechanism_tag", cleaned_mech)
+        object.__setattr__(
+            self, "concept_description", str(self.concept_description or "").strip()
+        )
         validate_rule_predicate(self.regime_guard)
         validate_rule_predicate(self.precondition)
         validate_rule_predicate(self.anti_precondition)
@@ -430,6 +437,8 @@ class AscendCausalRule:
             "origin_operator": self.origin_operator,
             "compatible_backends": list(self.compatible_backends),
             "cpp20_transform_template": self.cpp20_transform_template,
+            "mechanism_tag": self.mechanism_tag,
+            "concept_description": self.concept_description,
         }
         return payload
 
@@ -460,6 +469,8 @@ class AscendCausalRule:
             cpp20_transform_template=str(entry.get("cpp20_transform_template", "") or ""),
             symptom_family=str(entry.get("symptom_family", "") or ""),
             anti_precondition=str(entry.get("anti_precondition", "False") or "False"),
+            mechanism_tag=str(entry.get("mechanism_tag", "") or ""),
+            concept_description=str(entry.get("concept_description", "") or ""),
         )
 
 
