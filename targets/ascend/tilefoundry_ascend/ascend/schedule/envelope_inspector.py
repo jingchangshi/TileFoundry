@@ -455,6 +455,7 @@ class _TelemetryFeatures:
     in_loop_pipe_all_barriers: int = 0
     ub_bank_conflict_risk: float = 0.0
     l1_bank_conflict_risk: float = 0.0
+    ub_scalar_compute_loops: int = 0
 
 
 def _collect_tirx_expr_vars(expr, *, tirx) -> list[object]:
@@ -1071,6 +1072,390 @@ def _inspect_tilelang_block_dims(
     return block_dims, any_symbolic[0]
 
 
+def _is_disallowed_tirx_intrinsic(op_name: str) -> bool:
+    """Return True if *op_name* represents DMA, Cube, SIMD/SIMT, or barrier intrinsic."""
+    low = op_name.lower()
+    if any(
+        tok in low
+        for tok in (
+            "copy",
+            "dual_copy",
+            "dma",
+            "region",
+            "access_ptr",
+            "gemm",
+            "mmad",
+            "ascend_",
+            "simd",
+            "simt",
+            "vld",
+            "vsts",
+            "pset",
+            "vadd",
+            "vmul",
+            "vsub",
+            "vexp",
+            "vcadd",
+            "vreduce",
+            "reduce_",
+            "barrier",
+            "pipe_barrier",
+            "cross_flag",
+            "cross_core",
+            "set_flag",
+            "wait_flag",
+            "mbarrier",
+            "sync",
+        )
+    ):
+        return True
+    return bool(re.search(r"(?:^|[._])(?:mad|vec)(?:$|[._])", low))
+
+
+def _is_tirx_math_call(op_name: str) -> bool:
+    """Return True if *op_name* is an elementwise/scalar math call rather than an intrinsic."""
+    low = op_name.lower()
+    if _is_disallowed_tirx_intrinsic(low):
+        return False
+    return low.startswith("tir.") or any(
+        tok in low
+        for tok in (
+            "exp",
+            "log",
+            "sqrt",
+            "rsqrt",
+            "sin",
+            "cos",
+            "tan",
+            "tanh",
+            "erf",
+            "abs",
+            "fabs",
+            "floor",
+            "ceil",
+            "round",
+            "pow",
+            "fma",
+            "sigmoid",
+            "max",
+            "min",
+            "div",
+            "mod",
+            "select",
+            "cast",
+        )
+    )
+
+
+def _count_tirx_ub_scalar_compute_loops(
+    stmt,
+    ub_buf_names: set[str],
+    *,
+    tirx,
+) -> int:
+    """Count innermost serial UB scalar compute loops while filtering out outer/tiny/SIMD loops."""
+    count = [0]
+    let_stmt_cls = getattr(tirx, "LetStmt", None)
+    bind_cls = getattr(tirx, "Bind", None)
+    alloc_cls = getattr(tirx, "Allocate", None)
+    arith_types = tuple(
+        cls
+        for name in (
+            "Add",
+            "Sub",
+            "Mul",
+            "Div",
+            "FloorDiv",
+            "Mod",
+            "Max",
+            "Min",
+            "Select",
+            "Cast",
+        )
+        if (cls := getattr(tirx, name, None)) is not None
+    )
+
+    def _is_ub_buf(buf) -> bool:
+        raw_scope = str(buf.scope()).strip()
+        return (
+            buf.name in ub_buf_names
+            or _map_tilelang_scope(raw_scope) == "UB"
+            or raw_scope == "local.ub"
+        )
+
+    def _is_ub_or_gm_buf(buf) -> bool:
+        raw_scope = str(buf.scope()).strip()
+        mapped = _map_tilelang_scope(raw_scope)
+        return (
+            buf.name in ub_buf_names
+            or mapped in ("UB", "GM")
+            or raw_scope in ("local.ub", "global")
+        )
+
+    def _is_vector_sblock(node) -> bool:
+        ann = getattr(node, "annotations", None) or {}
+        hint = str(getattr(node, "name_hint", "")).lower()
+        return (
+            "simd_vf" in hint
+            or "simt_vf" in hint
+            or "tl.simdvf_lanes" in ann
+            or "tl.vf_source_index" in ann
+        )
+
+    def _is_vector_attr(node) -> bool:
+        key = str(getattr(node, "attr_key", "")).lower()
+        node_low = str(getattr(node, "node", "")).lower()
+        if (
+            "simdvf" in key
+            or "simtvf" in key
+            or "simt" in key
+            or "simt" in node_low
+            or key == "pragma_parallel"
+        ):
+            return True
+        if "thread_extent" in key:
+            tag = str(getattr(node.node, "thread_tag", "")).lower()
+            iv = getattr(node.node, "var", None)
+            iv_name = str(getattr(iv, "name_hint", "")).lower()
+            if (
+                "blockidx" not in tag
+                and "blockidx" not in iv_name
+                and "cthread" not in tag
+                and "subblock" not in tag
+                and "cthread" not in iv_name
+                and "subblock" not in iv_name
+            ):
+                return True
+        return False
+
+    def _expr_has_disallowed_intrinsic(expr) -> bool:
+        if expr is None:
+            return False
+        hit = [False]
+
+        def _visit(sub) -> None:
+            if isinstance(sub, tirx.Call):
+                op_name = str(getattr(sub.op, "name", sub.op)).lower()
+                if _is_disallowed_tirx_intrinsic(op_name):
+                    hit[0] = True
+
+        tirx.stmt_functor.post_order_visit(expr, _visit)
+        return hit[0]
+
+    def _expr_has_arith_and_load(expr) -> bool:
+        if expr is None:
+            return False
+        has_arith = [False]
+        has_load = [False]
+
+        def _visit(sub) -> None:
+            if arith_types and isinstance(sub, arith_types):
+                has_arith[0] = True
+            elif isinstance(sub, tirx.Call):
+                op_name = str(getattr(sub.op, "name", sub.op)).lower()
+                if _is_tirx_math_call(op_name):
+                    has_arith[0] = True
+            elif isinstance(sub, tirx.BufferLoad):
+                if _is_ub_or_gm_buf(sub.buffer):
+                    has_load[0] = True
+
+        tirx.stmt_functor.post_order_visit(expr, _visit)
+        return has_arith[0] and has_load[0]
+
+    def _is_innermost_ub_scalar_body(loop_body, init_env: dict[object, object]) -> bool:
+        aborted = [False]
+        found_store = [False]
+
+        def _scan_body(node, env: dict[object, object]) -> None:
+            if node is None or aborted[0]:
+                return
+            if isinstance(node, (tirx.For, tirx.While)):
+                aborted[0] = True
+                return
+            if isinstance(node, tirx.SeqStmt):
+                seq_env = dict(env)
+                for child in node.seq:
+                    if bind_cls is not None and isinstance(child, bind_cls):
+                        if _expr_has_disallowed_intrinsic(child.value):
+                            aborted[0] = True
+                            return
+                        seq_env[child.var] = _substitute_let_env(
+                            child.value, seq_env, tirx=tirx
+                        )
+                        if hasattr(child, "body"):
+                            _scan_body(child.body, dict(seq_env))
+                    else:
+                        _scan_body(child, seq_env)
+                return
+            if let_stmt_cls is not None and isinstance(node, let_stmt_cls):
+                if _expr_has_disallowed_intrinsic(node.value):
+                    aborted[0] = True
+                    return
+                next_env = dict(env)
+                next_env[node.var] = _substitute_let_env(node.value, env, tirx=tirx)
+                _scan_body(node.body, next_env)
+                return
+            if bind_cls is not None and isinstance(node, bind_cls):
+                if _expr_has_disallowed_intrinsic(node.value):
+                    aborted[0] = True
+                    return
+                next_env = dict(env)
+                next_env[node.var] = _substitute_let_env(node.value, env, tirx=tirx)
+                if hasattr(node, "body"):
+                    _scan_body(node.body, next_env)
+                return
+            if isinstance(node, tirx.IfThenElse):
+                if _expr_has_disallowed_intrinsic(node.condition):
+                    aborted[0] = True
+                    return
+                _scan_body(node.then_case, env)
+                if node.else_case is not None:
+                    _scan_body(node.else_case, env)
+                return
+            if isinstance(node, tirx.SBlockRealize):
+                _scan_body(node.block, env)
+                return
+            if isinstance(node, tirx.SBlock):
+                if _is_vector_sblock(node):
+                    aborted[0] = True
+                    return
+                if getattr(node, "init", None) is not None:
+                    _scan_body(node.init, env)
+                _scan_body(node.body, env)
+                return
+            if isinstance(node, tirx.AttrStmt):
+                if _is_vector_attr(node):
+                    aborted[0] = True
+                    return
+                _scan_body(node.body, env)
+                return
+            if isinstance(node, (tirx.AllocBuffer, tirx.DeclBuffer)) or (
+                alloc_cls is not None and isinstance(node, alloc_cls)
+            ):
+                if hasattr(node, "body"):
+                    _scan_body(node.body, env)
+                return
+            if isinstance(node, tirx.Evaluate):
+                if _expr_has_disallowed_intrinsic(node.value):
+                    aborted[0] = True
+                return
+            if isinstance(node, tirx.BufferStore):
+                if _expr_has_disallowed_intrinsic(node.value) or any(
+                    _expr_has_disallowed_intrinsic(idx) for idx in node.indices
+                ):
+                    aborted[0] = True
+                    return
+                if _is_ub_buf(node.buffer):
+                    sub_val = _substitute_let_env(node.value, env, tirx=tirx)
+                    if _expr_has_arith_and_load(sub_val):
+                        found_store[0] = True
+
+        _scan_body(loop_body, init_env)
+        return (not aborted[0]) and found_store[0]
+
+    def _walk(node, *, in_vector_scope: bool, let_env: dict[object, object]) -> None:
+        if node is None:
+            return
+        if isinstance(node, tirx.SeqStmt):
+            seq_env = dict(let_env)
+            for child in node.seq:
+                if bind_cls is not None and isinstance(child, bind_cls):
+                    seq_env[child.var] = _substitute_let_env(
+                        child.value, seq_env, tirx=tirx
+                    )
+                    if hasattr(child, "body"):
+                        _walk(
+                            child.body,
+                            in_vector_scope=in_vector_scope,
+                            let_env=dict(seq_env),
+                        )
+                else:
+                    _walk(child, in_vector_scope=in_vector_scope, let_env=seq_env)
+            return
+        if let_stmt_cls is not None and isinstance(node, let_stmt_cls):
+            next_env = dict(let_env)
+            next_env[node.var] = _substitute_let_env(node.value, let_env, tirx=tirx)
+            _walk(node.body, in_vector_scope=in_vector_scope, let_env=next_env)
+            return
+        if bind_cls is not None and isinstance(node, bind_cls):
+            next_env = dict(let_env)
+            next_env[node.var] = _substitute_let_env(node.value, let_env, tirx=tirx)
+            if hasattr(node, "body"):
+                _walk(node.body, in_vector_scope=in_vector_scope, let_env=next_env)
+            return
+        if isinstance(node, tirx.IfThenElse):
+            _walk(node.then_case, in_vector_scope=in_vector_scope, let_env=let_env)
+            if node.else_case is not None:
+                _walk(node.else_case, in_vector_scope=in_vector_scope, let_env=let_env)
+            return
+        if isinstance(node, tirx.SBlockRealize):
+            _walk(node.block, in_vector_scope=in_vector_scope, let_env=let_env)
+            return
+        if isinstance(node, tirx.SBlock):
+            next_vec = in_vector_scope or _is_vector_sblock(node)
+            if getattr(node, "init", None) is not None:
+                _walk(node.init, in_vector_scope=next_vec, let_env=let_env)
+            _walk(node.body, in_vector_scope=next_vec, let_env=let_env)
+            return
+        if isinstance(node, tirx.AttrStmt):
+            next_vec = in_vector_scope or _is_vector_attr(node)
+            _walk(node.body, in_vector_scope=next_vec, let_env=let_env)
+            return
+        if isinstance(node, (tirx.AllocBuffer, tirx.DeclBuffer)) or (
+            alloc_cls is not None and isinstance(node, alloc_cls)
+        ):
+            if hasattr(node, "body"):
+                _walk(node.body, in_vector_scope=in_vector_scope, let_env=let_env)
+            return
+        if isinstance(node, tirx.While):
+            _walk(node.body, in_vector_scope=in_vector_scope, let_env=let_env)
+            return
+        if isinstance(node, tirx.For):
+            tb = getattr(node, "thread_binding", None)
+            if tb is not None:
+                tag = str(getattr(tb, "thread_tag", "")).lower()
+                next_vec = in_vector_scope or (
+                    "blockidx" not in tag and "cthread" not in tag and "subblock" not in tag
+                )
+                _walk(node.body, in_vector_scope=next_vec, let_env=let_env)
+                return
+            kind_raw = getattr(node, "kind", 0)
+            kind_val = (
+                int(getattr(kind_raw, "value", kind_raw))
+                if isinstance(getattr(kind_raw, "value", kind_raw), int)
+                else -1
+            )
+            kind_str = str(kind_raw).lower()
+            ann = getattr(node, "annotations", None) or {}
+            stages_val = _static_tirx_int(ann.get("num_stages")) if "num_stages" in ann else None
+            is_pipelined = (
+                kind_val == 5
+                or "pipelined" in kind_str
+                or "num_stages" in ann
+                or (stages_val is not None and stages_val >= 1)
+                or bool(ann.get("enable_offset"))
+                or (ann.get("software_pipeline_stage") is not None)
+            )
+            is_serial = (
+                kind_val == 0
+                and not any(
+                    tok in kind_str
+                    for tok in ("parallel", "vectorized", "unrolled", "thread")
+                )
+                and not is_pipelined
+            )
+            trip = _static_tirx_int(node.extent)
+            valid_extent = trip is None or trip >= 8
+            if not in_vector_scope and is_serial and valid_extent:
+                if _is_innermost_ub_scalar_body(node.body, let_env):
+                    count[0] += 1
+                    return
+            _walk(node.body, in_vector_scope=in_vector_scope, let_env=let_env)
+
+    _walk(stmt, in_vector_scope=False, let_env={})
+    return count[0]
+
+
 def _collect_tilelang_telemetry(
     entry_fn,
     mod_in,
@@ -1104,6 +1489,7 @@ def _collect_tilelang_telemetry(
     cube_m_values: list[int] = []
     gm_static_bytes: dict[str, int] = {}
     ub_static_bytes: dict[str, int] = {}
+    ub_buf_names: set[str] = set()
     l1_static_bytes: dict[str, int] = {}
     ub_2d_total_bytes = [0]
     ub_2d_conflict_bytes = [0]
@@ -1120,7 +1506,10 @@ def _collect_tilelang_telemetry(
         dtype_str = str(buf.dtype)
         if _is_lowbit_dtype_name(dtype_str):
             has_lowbit_buf[0] = True
-        scope = _map_tilelang_scope(buf.scope())
+        raw_scope = str(buf.scope()).strip()
+        scope = _map_tilelang_scope(raw_scope)
+        if scope == "UB" or raw_scope == "local.ub":
+            ub_buf_names.add(buf.name)
         static_shape = _static_shape_ints(buf.shape)
         if scope == "UB" and static_shape is not None:
             ub_bytes = _buffer_bytes(static_shape, buf.dtype, DataTypeCls)
@@ -1342,6 +1731,12 @@ def _collect_tilelang_telemetry(
     else:
         l1_bank_conflict_risk = 0.0
 
+    ub_scalar_loops = _count_tirx_ub_scalar_compute_loops(
+        entry_fn.body,
+        ub_buf_names,
+        tirx=tirx,
+    )
+
     return _TelemetryFeatures(
         grid_blocks=grid_blocks,
         gm_roundtrip_bytes=gm_roundtrip_bytes,
@@ -1362,6 +1757,7 @@ def _collect_tilelang_telemetry(
         in_loop_pipe_all_barriers=in_loop_pipe_all,
         ub_bank_conflict_risk=ub_bank_conflict_risk,
         l1_bank_conflict_risk=l1_bank_conflict_risk,
+        ub_scalar_compute_loops=ub_scalar_loops,
     )
 
 
@@ -4004,6 +4400,7 @@ def inspect_tilelang_primfunc(
         in_loop_pipe_all_barriers=telemetry.in_loop_pipe_all_barriers,
         ub_bank_conflict_risk=telemetry.ub_bank_conflict_risk,
         l1_bank_conflict_risk=effective_l1_risk,
+        ub_scalar_compute_loops=telemetry.ub_scalar_compute_loops,
         microarch_profile=ma_prof.to_dict(),
     )
     return EnvelopeInspectionResult(
@@ -4189,6 +4586,165 @@ def _collect_tir_stmt_events(
     return events, has_exp[0], ub_loads, ub_stores, local_allocs
 
 
+_TIR_DISALLOWED_LOOP_OPS = frozenset(
+    {
+        "AscendGmToUb",
+        "AscendUbToGm",
+        "AscendGmToL1",
+        "AscendL1ToL0A",
+        "AscendL1ToL0B",
+        "AscendL0cToGm",
+        "AscendDualCopy",
+        "AscendDualCopyL0cToUb",
+        "AscendDualCopyUbToL1",
+        "AscendMmad",
+        "AscendCrossCoreSync",
+        "AscendUbToReg",
+        "AscendRegToUb",
+        "AscendVcast",
+        "AscendVbinary",
+        "AscendVunary",
+        "AscendVreduce",
+        "AscendVwhere",
+        "AscendVclamp",
+        "Copy",
+        "CopyAsync",
+        "CpAsyncCommit",
+        "CpAsyncWait",
+        "Sync",
+        "FlagSet",
+        "FlagWait",
+        "Drain",
+    }
+)
+_TIR_COMPUTE_LOOP_OPS = frozenset(
+    {"Binary", "Unary", "Cast", "Clamp", "Where", "ReLU", "Reduce", "Dot"}
+)
+
+
+def _count_tir_ub_scalar_compute_loops(
+    stmt: Stmt | None,
+    root_env: Mapping[int, Expr],
+) -> int:
+    """Count innermost serial TileFoundry TIR For loops performing arithmetic over UB buffers."""
+    count = [0]
+
+    def _is_innermost_ub_scalar_body(
+        loop_body: Stmt | None,
+        init_env: Mapping[int, Expr],
+    ) -> bool:
+        local_env = dict(init_env)
+        aborted = [False]
+        found_compute = [False]
+
+        def _scan(node: Stmt | None) -> None:
+            if node is None or aborted[0]:
+                return
+            if isinstance(node, (For, While, ExecutionScope)):
+                aborted[0] = True
+                return
+            if isinstance(node, Sequential):
+                for ch in node.body:
+                    _scan(ch)
+                return
+            if isinstance(node, MeshScope):
+                _scan(node.body)
+                return
+            if isinstance(node, If):
+                _scan(node.then_body)
+                _scan(node.else_body)
+                return
+            if isinstance(node, LetStmt):
+                local_env[id(node.var)] = node.value
+                if isinstance(node.value, Call) and isinstance(node.value.target, Op):
+                    op_name = type(node.value.target).__name__
+                    if op_name in _TIR_DISALLOWED_LOOP_OPS:
+                        aborted[0] = True
+                        return
+                    if (
+                        op_name in _TIR_COMPUTE_LOOP_OPS
+                        and isinstance(node.var.type, TensorType)
+                        and node.var.type.storage is StorageKind.SMEM
+                    ):
+                        has_ub_or_gm_read = any(
+                            _resolve_tir_buffer_key(arg, local_env)[1]
+                            in (StorageKind.SMEM, StorageKind.GMEM)
+                            for arg in node.value.args
+                        )
+                        if has_ub_or_gm_read:
+                            found_compute[0] = True
+                return
+            if isinstance(node, Evaluate) and isinstance(node.callable, Op):
+                op = node.callable
+                op_name = type(op).__name__
+                if op_name in _TIR_DISALLOWED_LOOP_OPS:
+                    aborted[0] = True
+                    return
+                if op_name in _TIR_COMPUTE_LOOP_OPS:
+                    input_defs = [
+                        p for p in collect_param_defs(type(op)) if p.kind == "input"
+                    ]
+                    writes_ub = False
+                    reads_ub_or_gm = False
+                    for pdef, arg in zip(input_defs, node.args):
+                        _k, st = _resolve_tir_buffer_key(arg, local_env)
+                        if (pdef.effect & MemoryEffect.WRITE) and st is StorageKind.SMEM:
+                            writes_ub = True
+                        if (pdef.effect & MemoryEffect.READ) and st in (
+                            StorageKind.SMEM,
+                            StorageKind.GMEM,
+                        ):
+                            reads_ub_or_gm = True
+                    if writes_ub and reads_ub_or_gm:
+                        found_compute[0] = True
+
+        _scan(loop_body)
+        return (not aborted[0]) and found_compute[0]
+
+    def _walk(
+        node: Stmt | None,
+        *,
+        in_vector_scope: bool,
+        env: dict[int, Expr],
+    ) -> None:
+        if node is None:
+            return
+        if isinstance(node, Sequential):
+            for child in node.body:
+                _walk(child, in_vector_scope=in_vector_scope, env=env)
+            return
+        if isinstance(node, LetStmt):
+            env[id(node.var)] = node.value
+            return
+        if isinstance(node, MeshScope):
+            _walk(node.body, in_vector_scope=in_vector_scope, env=env)
+            return
+        if isinstance(node, ExecutionScope):
+            kind_low = str(getattr(node.kind, "name", node.kind)).lower()
+            next_vec = in_vector_scope or ("simd" in kind_low) or ("simt" in kind_low)
+            _walk(node.body, in_vector_scope=next_vec, env=env)
+            return
+        if isinstance(node, While):
+            _walk(node.body, in_vector_scope=in_vector_scope, env=env)
+            return
+        if isinstance(node, If):
+            _walk(node.then_body, in_vector_scope=in_vector_scope, env=env)
+            _walk(node.else_body, in_vector_scope=in_vector_scope, env=env)
+            return
+        if isinstance(node, For):
+            trip = _tir_for_static_trip_count(node)
+            valid_extent = trip is None or trip >= 8
+            is_pipelined = node.pipeline is not None
+            if not in_vector_scope and not is_pipelined and valid_extent:
+                if _is_innermost_ub_scalar_body(node.body, env):
+                    count[0] += 1
+                    return
+            _walk(node.body, in_vector_scope=in_vector_scope, env=dict(env))
+
+    _walk(stmt, in_vector_scope=False, env=dict(root_env))
+    return count[0]
+
+
 def _collect_tir_telemetry(
     fn_or_stmt: PrimFunction | Stmt,
     *,
@@ -4350,6 +4906,7 @@ def _collect_tir_telemetry(
     gm_roundtrip_names = (gm_reads & gm_writes) | gm_loop_scalars
     gm_roundtrip_bytes = sum(gm_static_bytes.get(name, 0) for name in gm_roundtrip_names)
     active_contig_pool = contig_candidates if contig_candidates else scratch_candidates
+    tir_ub_scalar_loops = _count_tir_ub_scalar_compute_loops(body, env)
 
     return (
         _TelemetryFeatures(
@@ -4362,6 +4919,7 @@ def _collect_tir_telemetry(
             has_online_rescale_loop=has_online_rescale,
             in_loop_ub_reload_stores=len(ub_reload_store_bufs),
             uses_unreserved_ubuf=effective_unreserved,
+            ub_scalar_compute_loops=tir_ub_scalar_loops,
         ),
         aiv_split[0],
     )
@@ -4568,6 +5126,7 @@ def inspect_tir_envelope(
         uses_unreserved_ubuf=effective_unreserved,
         ub_bank_conflict_risk=tir_ub_risk,
         l1_bank_conflict_risk=tir_l1_risk,
+        ub_scalar_compute_loops=telemetry.ub_scalar_compute_loops,
     )
     return EnvelopeInspectionResult(
         ledger=ledger,

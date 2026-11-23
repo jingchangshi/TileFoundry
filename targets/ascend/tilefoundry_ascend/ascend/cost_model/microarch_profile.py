@@ -651,11 +651,29 @@ def extract_microarch_profile_from_cce(source_text: str) -> MicroarchProfile:
         return MicroarchProfile()
     clean = _strip_cpp_comments(raw)
 
-    subkernels = len(re.findall(r"\b__aicore__\b", clean))
-    cube_mmad = len(re.findall(r"\b(?:Mmad|mmad|mad|cube::gemm|gemm_v\d)\b\s*[(<]", clean))
-    cv_sync = len(re.findall(r"\bCrossCore(?:Set|Wait)Flag\b", clean))
-    pipe_all = len(re.findall(r"\bpipe_barrier\s*\(\s*PIPE_ALL\s*\)", clean))
-    reduce_cnt = len(re.findall(r"\b(?:Reduce(?:Max|Min|Sum)|vcmax|vcmin|vcadd|reduce_(?:sum|max))\b", clean, flags=re.IGNORECASE))
+    subkernels = len(re.findall(r"\b__(?:aicore|simd_vf|simt_vf)__\b(?!\s*\()", clean))
+    cube_mmad = len(
+        re.findall(
+            r"\b(?:Mmad|mmad|mad|cube::gemm|gemm_v\d|asc_mmad(?:_mx|_sparse)?|ascend_gemm_l1)\b\s*[(<]",
+            clean,
+        )
+    )
+    cv_sync = len(
+        re.findall(
+            r"\b(?:CrossCore(?:Set|Wait)Flag|asc_sync_(?:notify|wait|block_arrive|block_wait))\b",
+            clean,
+        )
+    )
+    pipe_all = len(
+        re.findall(r"\b(?:pipe_barrier|asc_sync_pipe)\s*\(\s*PIPE_ALL\s*\)", clean)
+    )
+    reduce_cnt = len(
+        re.findall(
+            r"\b(?:Reduce(?:Max|Min|Sum)|vcmax|vcmin|vcadd|reduce_(?:sum|max)|asc_reduce_\w+)\b",
+            clean,
+            flags=re.IGNORECASE,
+        )
+    )
     slot0_cnt = len(re.findall(r"\b(?:vintlv|vdintlv|Interleave|DeInterleave)\b", clean, flags=re.IGNORECASE))
 
     sfu_matches = re.findall(
@@ -676,15 +694,15 @@ def extract_microarch_profile_from_cce(source_text: str) -> MicroarchProfile:
     int_alu = len(re.findall(r"\b(?:viadd|vimul|vand|vor|vshl|vshr)\b", clean))
 
     unit_xfer = 32768
-    gm_l1 = len(re.findall(r"\bcopy_gm_to_cbuf\b", clean)) * unit_xfer
-    gm_ub = len(re.findall(r"\bcopy_gm_to_ubuf\b", clean)) * unit_xfer
+    gm_l1 = len(re.findall(r"\b(?:copy_gm_to_cbuf|asc_copy_gm2l1\w*)\b", clean)) * unit_xfer
+    gm_ub = len(re.findall(r"\b(?:copy_gm_to_ubuf|asc_copy_gm2ub\w*)\b", clean)) * unit_xfer
     l1_l0a = len(re.findall(r"\bcopy_cbuf_to_ca\b", clean)) * unit_xfer
     l1_l0b = len(re.findall(r"\bcopy_cbuf_to_cb\b", clean)) * unit_xfer
-    l0c_ub = len(re.findall(r"\bcopy_matrix_cc_to_ubuf\b", clean)) * unit_xfer
+    l0c_ub = len(re.findall(r"\b(?:copy_matrix_cc_to_ubuf|asc_copy_l0c2ub\w*)\b", clean)) * unit_xfer
     l0c_l1 = len(re.findall(r"\bcopy_matrix_cc_to_cbuf\b", clean)) * unit_xfer
-    l0c_gm = len(re.findall(r"\bcopy_matrix_cc_to_gm\b|\bFixpipe\b", clean)) * unit_xfer
-    ub_l1 = len(re.findall(r"\bcopy_ubuf_to_cbuf\b", clean)) * unit_xfer
-    ub_gm = len(re.findall(r"\bcopy_ubuf_to_gm\b", clean)) * unit_xfer
+    l0c_gm = len(re.findall(r"\b(?:copy_matrix_cc_to_gm|Fixpipe|asc_copy_l0c2gm\w*)\b", clean)) * unit_xfer
+    ub_l1 = len(re.findall(r"\b(?:copy_ubuf_to_cbuf|asc_copy_ub2l1\w*)\b", clean)) * unit_xfer
+    ub_gm = len(re.findall(r"\b(?:copy_ubuf_to_gm|asc_copy_ub2gm\w*)\b", clean)) * unit_xfer
 
     simt_factor = 1.0
     if re.search(r"__simt_vf__|__shared__", clean):

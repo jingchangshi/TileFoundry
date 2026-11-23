@@ -25,6 +25,7 @@ from tilefoundry_ascend.ascend.cost_model import (
     ResidualBasisSpec,
     build_cost_features_from_ledger,
     compute_source_sha256,
+    extract_microarch_profile_from_cce,
     project_case_workload,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import (
@@ -511,27 +512,29 @@ def test_rebuild_from_experience_lake_and_custom_basis_registration(tmp_path: Pa
     assert model.weights == pytest.approx(weights_first, rel=1e-12)
 
     custom_spec = ResidualBasisSpec(
-        name="wave_x_high_ub",
+        name="wave_x_l2_miss",
         varies_within_case=True,
         min_bucket_samples=4,
-        extractor=lambda ctx: max(0.0, ctx.wave_ratio - 1.0) * ctx.ub_occupancy_ratio,
+        extractor=lambda ctx: max(0.0, ctx.wave_ratio - 1.0) * (1.0 - ctx.l2_hit_rate),
     )
     model.basis_registry.register(custom_spec)
     replayed_custom = model.rebuild_from_experience_lake(lake)
     assert replayed_custom == 9
     assert len(model.weights) == 13
     assert len(model.delta_weights) == 9
-    assert "wave_x_high_ub" in model.weights_by_name
-    assert "wave_x_high_ub" in model.delta_weights_by_name
-    assert "wave_x_high_ub" in model.active_head0_spec_names("global")
-    assert "wave_x_high_ub" in model.active_head2_spec_names()
+    assert "wave_x_l2_miss" in model.weights_by_name
+    assert "wave_x_l2_miss" in model.delta_weights_by_name
+    assert "wave_x_l2_miss" in model.active_head0_spec_names("global")
+    assert "wave_x_l2_miss" in model.active_head2_spec_names()
 
     probe_cf = build_cost_features_from_ledger(parent_ledger, axes=axes)
     assert probe_cf.ub_occupancy_ratio == pytest.approx(200000.0 / 262144.0)
     probe_pred = model.predict(probe_cf)
-    assert "wave_x_high_ub" in probe_pred.named_features
-    expected_custom = max(0.0, probe_pred.wave_quantization_ratio - 1.0) * probe_cf.ub_occupancy_ratio
-    assert probe_pred.named_features["wave_x_high_ub"] == pytest.approx(expected_custom)
+    assert "wave_x_l2_miss" in probe_pred.named_features
+    expected_custom = max(0.0, probe_pred.wave_quantization_ratio - 1.0) * (
+        1.0 - probe_pred.l2_hit_rate
+    )
+    assert probe_pred.named_features["wave_x_l2_miss"] == pytest.approx(expected_custom)
     assert expected_custom > 0.0
 
 
@@ -667,10 +670,10 @@ def test_residual_basis_context_and_registry_validation() -> None:
     reg = ResidualBasisRegistry()
     cloned = reg.clone()
     custom = ResidualBasisSpec(
-        name="ub_pressure",
+        name="burst_kb",
         varies_within_case=True,
         min_bucket_samples=4,
-        extractor=lambda ctx: ctx.ub_occupancy_ratio,
+        extractor=lambda ctx: ctx.contig_burst_bytes / 1024.0,
     )
     cloned.register(custom)
     assert len(reg.head0_specs()) == 12
@@ -688,11 +691,10 @@ def test_residual_basis_context_and_registry_validation() -> None:
         wave_ratio=1.25,
         l2_hit_rate=0.30,
         contig_burst_bytes=8192,
-        ub_occupancy_ratio=0.75,
         axes=TopologyAxes("coupled_1c2v", "bidirectional_cv_ring", "affine_simd"),
     )
     named = cloned.extract_named(ctx)
-    assert named["ub_pressure"] == pytest.approx(0.75)
+    assert named["burst_kb"] == pytest.approx(8.0)
     assert named["cube_bound_share"] == pytest.approx(0.40)
     assert named["vec_bound_share"] == pytest.approx(0.20)
     assert named["wave_tail_waste"] == pytest.approx(0.25)
@@ -770,3 +772,30 @@ def test_unpenalized_intercept_and_widened_head0_cap_capture_cold_start_headroom
     )
     residual_multiplier = ratio / max(1e-6, analytical_ratio)
     assert residual_multiplier <= math.exp(2.5) + 1e-6
+
+
+def test_extract_microarch_profile_from_cce_cann93_dav3510_apis() -> None:
+    """Extract Cube, DMA, sync, reduce, and subkernel counts on CANN 9.3 dav-3510 C-API."""
+    cce_src = """
+    extern "C" __global__ __aicore__ void cube_k() {
+        asc_copy_gm2l1_nd2nz(a_l1, a_gm, 128, 0, 128, 128, 128, false);
+        ascend_gemm_l1<128, 64, 128, 32, false, half, float>(l0c, a_l1, b_l1, 1);
+        asc_copy_l0c2ub(ub_out, l0c);
+        asc_sync_notify(0);
+    }
+    __simd_vf__ inline void vec_k(__ubuf__ float* ub_out, __gm__ float* out_gm) {
+        asc_sync_wait(0);
+        asc_reduce_max(ub_out, ub_out);
+        asc_sync_pipe(PIPE_ALL);
+        asc_copy_ub2gm(out_gm, ub_out);
+    }
+    """
+    prof = extract_microarch_profile_from_cce(cce_src)
+    assert prof.subkernel_count == 2
+    assert prof.cube_mmad_count == 1
+    assert prof.gm_to_l1_bytes > 0
+    assert prof.l0c_to_ub_bytes > 0
+    assert prof.ub_to_gm_bytes > 0
+    assert prof.cv_sync_barriers == 2
+    assert prof.pipe_all_barriers == 1
+    assert prof.reduce_ops == 1
