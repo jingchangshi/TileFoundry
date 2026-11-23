@@ -1,6 +1,6 @@
 # TileFoundry Ascend Target Plugin
 
-`tilefoundry-ascend` provides the `ascend` target backend and dual-track neuro-symbolic optimization stack for Ascend 950PR / 950DT (`DaVinci950`, `dav-3510`, `CANN 9.2 / 9.3`).
+`tilefoundry-ascend` provides the `ascend` target backend and dual-track neuro-symbolic optimization stack for Ascend 950PR / 950DT (`DaVinci950`, `dav-3510`, `CANN 9.3` sole active line; `cann_9_2` inert placeholder).
 
 ## Installation
 
@@ -10,12 +10,11 @@ python -m pip install -e . -e targets/ascend
 
 ## Package Architecture
 
-- `tilefoundry_ascend.ascend.target`: Unified `davinci_950.toml` + `cann_9_2.toml` / `cann_9_3.toml` (`dav-3510`) surface snapshots and offline compiler verifier (`sync_dav3510_cann_surface.py`), `Ascend950PR` / `Ascend950DT` device models, 24-bit `NodeResourceMask`, mode-aware UB capacities (`216 / 248 / 256 KiB`), legal DMA topology, and segmented HBM burst-bandwidth curves.
-- `tilefoundry_ascend.ascend.ir` & `visitor_registry`: `SimdVF` and `SimtVF` execution domains, 19 canonical pipe- and resource-defining `T.ascend_*` TIR primitives, and 8 core HIR-to-TIR algebraic and sharding bindings.
-- `tilefoundry_ascend.ascend.sil`: Scheduling-Interface-Layer (`TopologyAxes`, 7-facet MECE `ConstraintRelaxationMask`, `OpAdvisoryExtractor`, and `SILVerifier` with 14 hardware redlines plus C++ CFG cross-core flag-balance verification).
-- `tilefoundry_ascend.ascend.schedule` & `passes`: Mode-A Z3 modulo pipeline solver (`ValidateAscendPipelines` / `ResolveAscendPipelines`), `RegimePiecewiseSolver` with bidirectional live-buffer fixed-point re-solving, Two-Snapshot lowering diff `EnvelopeInspector`, `ObjectivePhysicalLedger`, and dialect-neutral `HirBlueprintPacket`.
+- `tilefoundry_ascend.ascend.target`: Unified `davinci_950.toml` + `cann_9_3.toml` (`dav-3510`, `cann_9_2.toml` inert placeholder) surface snapshots and offline compiler verifier (`sync_dav3510_cann_surface.py`), `Ascend950PR` / `Ascend950DT` device models, 24-bit `NodeResourceMask`, mode-aware UB capacities (`216 / 248 / 256 KiB`), legal DMA topology, and segmented HBM burst-bandwidth curves.
+- `tilefoundry_ascend.ascend.sil`: Single semantic frontend `PyTorchSemanticAnalyzer`, Scheduling-Interface-Layer (`TopologyAxes`, 7-facet MECE `ConstraintRelaxationMask`, `OpAdvisoryExtractor`, and `SILVerifier` with 14 hardware redlines plus C++ CFG cross-core flag-balance verification).
+- `tilefoundry_ascend.ascend.passes`: TileLang internal pass read-only extractor `ReadOnlyAscendPassTap`, `RegimePiecewiseSolver` with bidirectional live-buffer fixed-point re-solving, Two-Snapshot lowering diff `EnvelopeInspector`, `ObjectivePhysicalLedger`, `ObservationVector5D`, and dialect-neutral `HirBlueprintPacket`.
 - `tilefoundry_ascend.ascend.cost_model` & `templates`: 3-tier `HybridAscendCostModel` (Tier-0 Roofline + 6-Pipe/AVE evaluator, Tier-1 compiler behavior penalties across 9 detectors: 7 baseline + 2 sink-down `scalar_compute_loop_fallback` covering TIR + reachable Track-B `__ubuf__`/`__gm__` loops and `dcache_bypass_narrow_store`, Tier-2 Ridge residual + MSProf pipe scales + pairwise Delta), `ExperienceLake` online calibration, and 7 dual-track (`tilelang_dsl` + `ascendc_template`) coordination shells.
-- `tilefoundry_ascend.agent`: Zero-phi MECE `CapabilityGate` router (`TopologyAxes` + `ISAGapScanner` + `CasePhysicsRatios`, `Router=ON/OFF` ablatable), 40 cross-operator causal rules (`R01..R40` with `l2_pmu_available` guard) and 3-axis factorized Bayesian tracking, unified 3-layer progressive LLM constraint synthesizer (`llm_constraints.py`) with on-demand CANN 9.2 / 9.3 Layer-2 prompt pruning and Stage-0 `+4` monotonic refinement, counterfactual `FlywheelDistiller`, and unattended `tilefoundry-ascend-campaign` / `tilefoundry-ascend-marathon` 5-tier (`L0-L4`) verification runners.
+- `tilefoundry_ascend.agent`: Zero-phi MECE `CapabilityGate` router (`TopologyAxes` + `ISAGapScanner` + `CasePhysicsRatios`, `Router=ON/OFF` ablatable), 13 closed `SymptomFamily` -> 41 orthogonal atomic causal rules (`R01..R41` with `l2_pmu_available` guard and zero latency-noise escapes) and 3-axis factorized Bayesian tracking, unified 3-layer progressive LLM constraint synthesizer (`llm_constraints.py`) with on-demand `cann_9_3` Layer-2 prompt pruning and Stage-0 `+4` monotonic refinement, counterfactual `FlywheelDistiller`, and unattended `tilefoundry-ascend-campaign` / `tilefoundry-ascend-marathon` 5-tier (`L0-L4`) verification runners.
 
 ## Architecture Diagrams & Companion Specs
 

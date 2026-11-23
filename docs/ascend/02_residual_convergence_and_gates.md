@@ -31,10 +31,10 @@ Optimization insights follow a strict downward graduation path so structural slo
 
 ## [SEC-G2] Unified Compile Session & Anchor-Specialized Two-Snapshot Ledger
 
-- **Unified `ascend_compile_session`**: Host lowering and driver build entrypoints (`build_stage_b_driver_source` and companions) must hold one contiguous `_ascend_ctx()` scope across HIR-to-TIR binding, anchor specialization, and `tilelang.lower`. Exiting the target context prior to lowering strips hardware UB/L1 ceilings, vector lane widths, and target flags.
+- **Unified `ascend_compile_session`**: Host lowering and driver build entrypoints (`build_stage_b_driver_source` and companions) must hold one contiguous `_ascend_ctx()` scope across `PyTorchSemanticAnalyzer`, anchor specialization, and `tilelang.lower` + `ReadOnlyAscendPassTap`. Exiting the target context prior to lowering strips hardware UB/L1 ceilings, vector lane widths, and target flags.
 - **Pre-Lowering Anchor Specialization**: `EnvelopeInspector` (`envelope_inspector.py`, `gate_funnel.py`, `verifier.py`) specializes dynamic-shape `PrimFunc` schedules with real anchor dimensions via `PrimFunc.specialize` and simplifies bounds with `arith.Analyzer` *before* snapshot capture so peak UB/L1 bytes, double-buffering, and contiguous burst widths reflect physical reality.
 - **Preserved Two-Snapshot Diff**: Pre-lowering intended buffers and post-lowering physical buffers are compared side-by-side (`degraded_single_buffers`, lowered stage count, serialized barriers, `ObjectivePhysicalLedger`) across all canonical canary operators with zero operator-name branching.
-- **Formal Legality**: `SILVerifier` enforces 14 hardware redlines plus C++ CFG cross-core flag-balance checks; `ValidateAscendPipelines` / `ResolveAscendPipelines` solve modulo pipeline schedules via Z3.
+- **Formal Legality & Read-Only Pass Tap**: `SILVerifier` enforces 14 hardware redlines plus C++ CFG cross-core flag-balance checks; `ReadOnlyAscendPassTap` extracts read-only TileLang internal pass waterlines and pipeline metrics.
 
 ## [SEC-G3] Compilation Idempotence & Orthogonal Tail Guard
 
@@ -43,7 +43,7 @@ Every candidate promotion passes the 5-tier verification pyramid (`L0`–`L4`):
 | Tier | Scope | Enforced Guarantees |
 | :--- | :--- | :--- |
 | `L0` | Static repo & AST audit | 6 repo hygiene lints (`scripts/*_lint.py`), AST inequality whitelist, static rejection of float-tolerance or host-pointer keys in `_KERNEL_CACHE` |
-| `L1` | Schedule & CFG legality | `SILVerifier` (14 redlines + C++ cross-core CFG flag balance), Schedule Redlines `G1..G5`, Z3 pipeline resolution |
+| `L1` | Schedule & CFG legality | `SILVerifier` (14 redlines + C++ cross-core CFG flag balance), Schedule Redlines `G1..G5`, `ReadOnlyAscendPassTap` waterline checks |
 | `L2` | Lowered host envelope | Contiguous `ascend_compile_session`, real-anchor Two-Snapshot diff, Tier-0/1/2 sanity & bounded `explore_creative` pass-through (`<= 1.5x`) |
 | `L3` | Full contract & idempotence | Full operator shape suite (`l3_contract.py`), Dual-Layer Tail Guard, Two-Pass Compilation Idempotence (`Delta\|Cache\| == 0`) |
 | `L4` | Official real-NPU gate | CANNBench protocol correctness & latency (`surrogate_cannbench.py`, `test_npu_acceptance.py`) via `AgentGates` leased NPU & signed v2 receipt |

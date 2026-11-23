@@ -1145,117 +1145,89 @@ def test_r16_preserves_simtvf_on_indirect_gather_and_r22_to_r33_fire() -> None:
 
 
 def test_scan_tilefoundry_ir_and_tilelang_structural_detection() -> None:
-    """Verify real HIR/TIR scanning and structural TileLang recurrence detection."""
+    """Verify ObjectivePhysicalLedger + CasePhysicsRatios routing and TileLang scan detection."""
     import tilelang.ascend.language as T  # noqa: PLC0415
 
-    from tilefoundry.ir.core import Call, Constant, Var  # noqa: PLC0415
-    from tilefoundry.ir.hir.function import Function as HirFunction  # noqa: PLC0415
-    from tilefoundry.ir.hir.loop_region import LoopRegion  # noqa: PLC0415
-    from tilefoundry.ir.hir.nn.matmul import MatMul  # noqa: PLC0415
-    from tilefoundry.ir.hir.tensor.index_select import IndexSelect  # noqa: PLC0415
-    from tilefoundry.ir.hir.tensor.quant import Quant  # noqa: PLC0415
-    from tilefoundry.ir.tir.prim_function import PrimFunction  # noqa: PLC0415
-    from tilefoundry.ir.tir.stmts import (  # noqa: PLC0415
-        Evaluate,
-        ExecutionScope,
-        For,
-        MeshScope,
-        Sequential,
-    )
-    from tilefoundry.ir.types import DType, StorageKind, TensorType, TupleType  # noqa: PLC0415
-    from tilefoundry.ir.types.layout import Layout  # noqa: PLC0415
-    from tilefoundry.ir.types.mesh import Mesh, Topology  # noqa: PLC0415
-    from tilefoundry_ascend.ascend.ir.execution import SIMTVF_KIND  # noqa: PLC0415
-    from tilefoundry_ascend.ascend.ir.tir.instructions import (  # noqa: PLC0415
-        AscendDualCopyL0cToUb,
-        AscendMmad,
-    )
+    from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios  # noqa: PLC0415
 
-    gmem = StorageKind.GMEM
-    x_ty = TensorType(shape=(16, 64), dtype=DType.bf16, layout=Layout((16, 64)), storage=gmem)
-    w_ty = TensorType(shape=(64, 64), dtype=DType.fp8e4m3, layout=Layout((64, 64)), storage=gmem)
-    idx_ty = TensorType(shape=(8,), dtype=DType.i32, layout=Layout((8,)), storage=gmem)
-    scalar_ty = TensorType(shape=(), dtype=DType.i32, layout=Layout(()), storage=StorageKind.RMEM)
-    x_var = Var("x", type=x_ty)
-    w_var = Var("w", type=w_ty)
-    idx_var = Var("idx", type=idx_ty)
-
-    gather_call = Call(IndexSelect(dim=0), (x_var, idx_var), type=TensorType(shape=(8, 64), dtype=DType.bf16, layout=Layout((8, 64)), storage=gmem))
-    quant_ty = TupleType(fields=(
-        TensorType(shape=(8, 64), dtype=DType.fp8e4m3, layout=Layout((8, 64)), storage=gmem),
-        TensorType(shape=(8, 1), dtype=DType.f32, layout=Layout((8, 1)), storage=gmem),
-    ))
-    quant_call = Call(Quant(group=64), (gather_call,), type=quant_ty)
-    mm_call = Call(MatMul(), (x_var, w_var), type=TensorType(shape=(16, 64), dtype=DType.bf16, layout=Layout((16, 64)), storage=gmem))
-    carry_var = Var("state", type=x_ty)
-    loop_expr = LoopRegion(
-        induction_var=Var("t", type=scalar_ty),
-        params=(carry_var,),
-        args=(mm_call,),
-        body=carry_var,
-        yield_values=(mm_call,),
-        extent=4,
-        step=1,
-        type=x_ty,
+    hybrid_ledger = build_objective_physical_ledger(
+        analysis_mode="exact_modulo_z3",
+        is_legal=True,
+        steady_state_ii=2,
+        pipe_cycles={"AIC.PIPE_M": 64, "AIV0.PIPE_V": 64},
+        waterlines={},
+        grid_blocks=14,
+        wave_occupancy=14.0 / float(AscendTarget("ascend.950pr").device.aic_count),
+        has_indirect_gather=True,
+        has_lowbit_quant=True,
+        has_online_rescale_loop=True,
+        opaque_dynamic_regions=("simt_vf",),
     )
-    hir_fn = HirFunction.build(
-        name="hybrid_hir",
-        params=(x_var, w_var, idx_var),
-        body=loop_expr,
-        return_type=x_ty,
+    aligned_ratios = CasePhysicsRatios(
+        case_id=1,
+        stride_ratio=1.0,
+        contig_atom_ratio=4.0,
+        is_atom_aligned=True,
+        working_set_sram_ratio=0.35,
+        working_set_vreg_ratio=0.25,
+        wave_occupancy_ratio=14.0 / float(AscendTarget("ascend.950pr").device.aic_count),
+        oi_ridge_ratio=1.5,
+        inner_contiguous_bytes=128,
     )
-    d_hir = route_execution_track(hir_fn)
-    assert d_hir.features is not None
-    assert float(d_hir.features["cube_to_vector_ratio"]) > 0.0
-    assert d_hir.features["quant_granularity"] == "per_token_or_block"
-    assert d_hir.features["cross_iter_recurrence"] == "non_associative_scan"
-    assert d_hir.features["inner_contiguous_bytes"] == 32
-
-    d_hir_gather = route_execution_track(quant_call)
-    assert d_hir_gather.features is not None
-    assert d_hir_gather.features["quant_granularity"] == "per_token_or_block"
-    assert d_hir_gather.features["indirect_sparse_gather"] is True
-
-    block_mesh = Mesh((Topology("block", 14),), Layout((14,)))
-    tmem = StorageKind.TMEM
-    smem = StorageKind.SMEM
-    a_var = Var("a", type=TensorType(shape=(16, 64), dtype=DType.f16, layout=Layout((16, 64)), storage=tmem))
-    b_var = Var("b", type=TensorType(shape=(64, 64), dtype=DType.f16, layout=Layout((64, 64)), storage=tmem))
-    c_var = Var("c", type=TensorType(shape=(16, 64), dtype=DType.f32, layout=Layout((16, 64)), storage=tmem))
-    ub_var = Var("ub", type=TensorType(shape=(16, 64), dtype=DType.f32, layout=Layout((16, 64)), storage=smem))
-    pf = PrimFunction(
-        name="tir_cube_simt_dual",
-        params=(a_var, b_var, c_var),
-        body=Sequential((
-            MeshScope(
-                mesh=block_mesh,
-                binding=Var("bid", type=scalar_ty),
-                body=Sequential((
-                    For(
-                        induction_var=Var("k", type=scalar_ty),
-                        start=Constant(0, type=scalar_ty),
-                        stop=Constant(4, type=scalar_ty),
-                        step=Constant(1, type=scalar_ty),
-                        body=Sequential((
-                            Evaluate(AscendMmad(), (c_var, a_var, b_var)),
-                            Evaluate(AscendDualCopyL0cToUb(), (c_var, ub_var)),
-                            ExecutionScope(kind=SIMTVF_KIND.name, body=Sequential(())),
-                        )),
-                    ),
-                )),
-            ),
-        )),
+    d_phys = route_execution_track(
+        None,
+        ledger=hybrid_ledger,
+        case_ratios=aligned_ratios,
+        semantic_features={
+            "quant_granularity": "per_token_or_block",
+            "indirect_sparse_gather": True,
+            "dynamic_cross_core_handoff": True,
+            "cross_iter_recurrence": "associative_online_rescale",
+        },
     )
-    d_tir = route_execution_track(pf)
-    assert d_tir.features is not None
-    assert d_tir.features["static_affine_bounds"] is True
-    assert d_tir.features["cube_to_vector_ratio"] == pytest.approx(1.0)
-    assert d_tir.features["indirect_sparse_gather"] is True
-    assert d_tir.features["dynamic_cross_core_handoff"] is True
-    assert d_tir.features["inner_contiguous_bytes"] == 128
-    assert d_tir.features["persistent_wave_occupancy"] == pytest.approx(
+    assert d_phys.features is not None
+    assert d_phys.features["static_affine_bounds"] is True
+    assert d_phys.features["cube_to_vector_ratio"] == pytest.approx(1.0)
+    assert d_phys.features["quant_granularity"] == "per_token_or_block"
+    assert d_phys.features["indirect_sparse_gather"] is True
+    assert d_phys.features["dynamic_cross_core_handoff"] is True
+    assert d_phys.features["inner_contiguous_bytes"] == 128
+    assert d_phys.features["persistent_wave_occupancy"] == pytest.approx(
         14.0 / float(AscendTarget("ascend.950pr").device.aic_count)
     )
+    assert d_phys.topology_axes == TopologyAxes(
+        "coupled_1c2v", "bidirectional_cv_ring", "irregular_simt"
+    )
+
+    subatom_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=None,
+        pipe_cycles={"AIV0.PIPE_V": 48},
+        waterlines={},
+        min_gm_dma_bytes=16,
+    )
+    subatom_ratios = CasePhysicsRatios(
+        case_id=2,
+        stride_ratio=2.0,
+        contig_atom_ratio=0.5,
+        is_atom_aligned=False,
+        working_set_sram_ratio=0.20,
+        working_set_vreg_ratio=0.20,
+        wave_occupancy_ratio=0.5,
+        oi_ridge_ratio=0.25,
+        inner_contiguous_bytes=16,
+    )
+    d_subatom = route_execution_track(
+        None,
+        ledger=subatom_ledger,
+        case_ratios=subatom_ratios,
+    )
+    assert d_subatom.features is not None
+    assert d_subatom.features["inner_contiguous_bytes"] == 16
+    assert d_subatom.features["persistent_wave_occupancy"] == pytest.approx(0.5)
+    assert d_subatom.topology_axes.iteration_regularity == "irregular_simt"
+    assert d_subatom.track == "simt_vf"
 
     @T.prim_func
     def online_max_exp_loop(X: T.Tensor((16, 64), "float32"), Out: T.Tensor((16, 64), "float32")):

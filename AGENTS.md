@@ -4,13 +4,13 @@
 
 - **Axiom 1 (Hardware & Contract First)**: Correctness is defined by SIL contracts and L3/L4 CANNBench gates; never relax contracts or rely on single-shape or host-proxy fits.
 - **Axiom 2 (Compiler Truth Over Heuristics)**: Sink deterministic degradations into IR lowering, `SILVerifier`, Z3 solver, `EnvelopeInspector`, and `CompilerBehaviorRegistry`, not prompt patches.
-1. **Zero Op-Name Branching**: Generic passes (HIR, Z3, TIR, CostModel, Router) dispatch on physical ratios, `TopologyAxes`, and IR attrs—never op names.
+1. **Zero Op-Name Branching**: Generic passes (`SIL`, `EnvelopeInspector`, `CostModel`, `CapabilityGate`) dispatch on physical ratios, `TopologyAxes`, and IR attrs—never op names.
 2. **Bounded `2..4` Regimes**: `partition_case_regimes` splits `_subatom` (`contig_atom_ratio < 1.0`) from aligned reductions via weighted lexicographic merge (`1 <= min <= len <= 4`).
 3. **Topology Buckets & Prescreen**: `ExperienceLake` isolates `TopologyAxes` buckets; Tier-0/1 prescreen runs `CompilerBehaviorRegistry` detectors (`|ln(m/a)| > 2.5` -> `unmodeled_anomalies.jsonl`).
-4. **Orthogonal 3-Layer Prompt & `G5`**: Zero Layer 1.5; L1 (`G1..G4` + paired escapes), L2 (`T.ascend_*` + `seed_rules.yaml`), L3 (KB); `explore_creative` is `Rule-Blind` (`<= 1.5x` parent analytical); `syntax_repair` enforces `G5` lock.
-5. **Contiguous Session & Two-Snapshot**: Hold `ascend_compile_session` across HIR-to-TIR, `PrimFunc.specialize` + `arith.Analyzer`, and `tilelang.lower`; keep Two-Snapshot diff.
+4. **Orthogonal 3-Layer Prompt & `G5`**: Zero Layer 1.5; L1 (`G1..G4` + paired escapes), L2 (`cann_9_3` TileLang/CCE + `seed_rules.yaml`), L3 (KB); `explore_creative` is `Rule-Blind` (`<= 1.5x` parent analytical); `syntax_repair` enforces `G5` lock.
+5. **Contiguous Session & Two-Snapshot**: Hold `ascend_compile_session` across `PyTorchSemanticAnalyzer`, `PrimFunc.specialize` + `arith.Analyzer`, and `tilelang.lower` + `ReadOnlyAscendPassTap`; keep Two-Snapshot diff.
 6. **CoW Helper Isolation**: `patch_regime_into_module` prefixes helpers `_{regime_tag}_*`, prunes dead helpers, and enforces `>= 0.97x` active / `>= 0.98x` sibling tail guards.
-7. **Closed KB & Scoped Tabu**: Closed 13 `SymptomFamily`, read-only online `seed_rules.yaml` (`anti_precondition`, AST whitelist), 3-axis Bayesian tracking, and `excluded_mechanisms` tabu.
+7. **Closed KB & Scoped Tabu**: Closed 13 `SymptomFamily` -> 41 orthogonal atomic rules (`seed_rules.yaml`, zero latency-noise escapes, AST whitelist), 3-axis Bayesian tracking, and `excluded_mechanisms` tabu.
 8. **Pure Cache & Honest Gates**: No magic cache cap (`len(cases) // 2`) or float-tol/host-ptr keys; enforce L3 two-pass `Delta|Cache| == 0` idempotence and L4 `AgentGates` v2 receipts.
 9. **CANN 9.3 Only (`cann_9_2` Placeholder)**: Target `cann_9_3` (`dav-3510`) exclusively across templates, dialect surfaces, verifiers, and audits; keep `cann_9_2` inert (no runtime shims or header branches).
 

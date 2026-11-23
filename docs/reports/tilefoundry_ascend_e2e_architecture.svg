@@ -15,7 +15,7 @@
   <rect x="0" y="0" width="1600" height="1120" fill="#F8FAFC"/>
 
   <text x="800" y="44" text-anchor="middle" font-size="24" font-weight="700" fill="#0F172A">TileFoundry Ascend 端到端系统架构</text>
-  <text x="800" y="70" text-anchor="middle" font-size="14" font-weight="500" fill="#475569">DaVinci950 (dav-3510, CANN 9.2 / 9.3) · 五大计算与控制平面、编译器机制下沉与受控真机签名验证</text>
+  <text x="800" y="70" text-anchor="middle" font-size="14" font-weight="500" fill="#475569">DaVinci950 (dav-3510, CANN 9.3 主线 / cann_9_2 占位) · 五大计算与控制平面、编译器机制下沉与受控真机签名验证</text>
 
   <!-- PLANE 1 -->
   <rect x="40" y="96" width="1410" height="164" rx="12" fill="#EFF6FF" stroke="#3B82F6" stroke-width="2"/>
@@ -27,7 +27,7 @@
 
   <rect x="336" y="142" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#93C5FD" stroke-width="1.5"/>
   <text x="460" y="176" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">连续编译上下文会话</text>
-  <text x="460" y="200" text-anchor="middle" font-size="12" fill="#475569">贯穿高层降级至底层生成</text>
+  <text x="460" y="200" text-anchor="middle" font-size="12" fill="#475569">PyTorchSemanticAnalyzer -> TileLang</text>
 
   <rect x="620" y="142" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#93C5FD" stroke-width="1.5"/>
   <text x="744" y="176" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">真实锚点按位特化</text>
@@ -38,8 +38,8 @@
   <text x="1028" y="200" text-anchor="middle" font-size="12" fill="#475569">编译前后片上容量与突发检查</text>
 
   <rect x="1188" y="142" width="238" height="96" rx="8" fill="#FFFFFF" stroke="#93C5FD" stroke-width="1.5"/>
-  <text x="1307" y="176" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">十四项红线与模调度</text>
-  <text x="1307" y="200" text-anchor="middle" font-size="12" fill="#475569">硬件红线、同步对称与流水求解</text>
+  <text x="1307" y="176" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">十四项红线与只读探针</text>
+  <text x="1307" y="200" text-anchor="middle" font-size="12" fill="#475569">硬件红线、同步对称与 Pass 探针</text>
 
   <path d="M 300 190 L 334 190" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
   <path d="M 584 190 L 618 190" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
@@ -118,15 +118,15 @@
 
   <rect x="620" y="736" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#D8B4FE" stroke-width="1.5"/>
   <text x="744" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">三层正交约束与红线</text>
-  <text x="744" y="794" text-anchor="middle" font-size="12" fill="#475569">CANN 9.2/9.3 两级按需裁剪</text>
+  <text x="744" y="794" text-anchor="middle" font-size="12" fill="#475569">CANN 9.3 (dav-3510) 两级按需裁剪</text>
 
   <rect x="904" y="736" width="248" height="96" rx="8" fill="#FFFFFF" stroke="#D8B4FE" stroke-width="1.5"/>
   <text x="1028" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">单调锁定与冷启动延展</text>
   <text x="1028" y="794" text-anchor="middle" font-size="12" fill="#475569">父代单调性锁与多指标收敛延展</text>
 
   <rect x="1188" y="736" width="238" height="96" rx="8" fill="#FFFFFF" stroke="#D8B4FE" stroke-width="1.5"/>
-  <text x="1307" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">四十条规则因果飞轮</text>
-  <text x="1307" y="794" text-anchor="middle" font-size="12" fill="#475569">实测计数器守卫、禁忌与蒸馏</text>
+  <text x="1307" y="770" text-anchor="middle" font-size="14" font-weight="700" fill="#0F172A">13症状41正交规则飞轮</text>
+  <text x="1307" y="794" text-anchor="middle" font-size="12" fill="#475569">零时延噪声逃逸、禁忌与蒸馏</text>
 
   <path d="M 300 784 L 334 784" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
   <path d="M 584 784 L 618 784" stroke="#334155" stroke-width="2" fill="none" marker-end="url(#arrow-solid)"/>
@@ -170,7 +170,13 @@
 
   <!-- Right-Margin Closed-Loop Feedback Channels -->
   <rect x="1474" y="140" width="98" height="900" rx="10" fill="#FFFFFF" stroke="#CBD5E1" stroke-width="1.5"/>
-  <text x="1523" y="590" text-anchor="middle" font-size="13" font-weight="700" fill="#475569" transform="rotate(-90 1523 590)">闭环硬件遥测回流与编译器退化机制下沉固化</text>
+  <text x="1532" y="490" text-anchor="middle" font-size="13" font-weight="700" fill="#475569">
+    <tspan x="1532" dy="0">闭环硬件</tspan>
+    <tspan x="1532" dy="22">遥测回流</tspan>
+    <tspan x="1532" dy="28">与编译器</tspan>
+    <tspan x="1532" dy="22">退化机制</tspan>
+    <tspan x="1532" dy="22">下沉固化</tspan>
+  </text>
 
   <path d="M 1450 982 L 1492 982 L 1492 784 L 1452 784" stroke="#7C3AED" stroke-width="2" stroke-dasharray="6,4" fill="none" marker-end="url(#arrow-feedback)"/>
   <path d="M 1492 784 L 1492 586 L 1452 586" stroke="#7C3AED" stroke-width="2" stroke-dasharray="6,4" fill="none" marker-end="url(#arrow-feedback)"/>

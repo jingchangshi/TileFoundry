@@ -13,8 +13,12 @@ from tilefoundry_ascend.agent.kb import (
     load_seed_rules,
     validate_rule_predicate,
 )
-from tilefoundry_ascend.agent.orchestrator.residual_beam import compute_static_dynamic_residual
+from tilefoundry_ascend.agent.orchestrator.residual_beam import (
+    StaticDynamicResidual,
+    compute_static_dynamic_residual,
+)
 from tilefoundry_ascend.ascend.cost_model import (
+    BishengResourceSummary,
     count_reachable_ub_scalar_compute_loops,
     detect_scalar_compute_loop_fallback,
     parse_bisheng_res_usage,
@@ -24,6 +28,7 @@ from tilefoundry_ascend.ascend.passes.physical_ledger import (
     build_objective_physical_ledger,
     build_scope_waterline,
 )
+from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios
 
 
 def test_seed_rules_exact_41_mece_provenance_and_ast_validity() -> None:
@@ -89,6 +94,7 @@ def test_seed_rules_exact_41_mece_provenance_and_ast_validity() -> None:
             ]
         )
         assert "910b" not in combined_text.lower()
+        assert "measured_latency_us" not in rule.expected_postcondition
         validate_rule_predicate(rule.regime_guard)
         validate_rule_predicate(rule.precondition)
         validate_rule_predicate(rule.anti_precondition)
@@ -219,12 +225,23 @@ def test_all_41_rules_default_context_and_pairwise_me_matrix() -> None:
             ],
         ),
         (
-            ("R16_PADDED_PITCH_TAIL_MASKING", "R38_COALESCE_SUB32B_TAIL_DMA_STORE"),
+            (
+                "R16_PADDED_PITCH_TAIL_MASKING",
+                "R36_SUBATOM_CONTIGUOUS_ALIGNED_CORE_SLICE",
+                "R38_COALESCE_SUB32B_TAIL_DMA_STORE",
+            ),
             [
                 _ctx(
                     pipes={"AIV0.PIPE_V": 64, "AIV0.PIPE_MTE3": 32},
                     unaligned_dma_padding_bytes=16,
                     min_gm_dma_bytes=64,
+                ),
+                _ctx(
+                    pipes={"AIV0.PIPE_V": 64, "AIV0.PIPE_MTE2": 32},
+                    unaligned_dma_padding_bytes=16,
+                    min_gm_dma_bytes=64,
+                    dma_burst_efficiency_ratio=0.60,
+                    extra={"contig_atom_ratio": 0.5},
                 ),
                 _ctx(
                     pipes={"AIV0.PIPE_V": 64, "AIV0.PIPE_MTE3": 32},
@@ -393,3 +410,142 @@ def test_l2_pmu_available_gating_and_r34_anti_precondition() -> None:
     assert ctx_low_vec["l2_pmu_available"] == 1
     assert ctx_low_vec["aiv_vec_ratio"] == pytest.approx(0.05)
     assert r34.matches(ctx_low_vec) is True
+
+
+def test_residual_stage6_signals_and_prev_namespace_closure() -> None:
+    """Preserve Stage-6 signals on StaticDynamicResidual and L1/L2 fields in prev.*."""
+    rules = {r.rule_id: r for r in load_seed_rules()}
+    pre_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=8,
+        pipe_cycles={"AIV0.PIPE_V": 80, "AIV0.PIPE_MTE2": 64, "AIV0.PIPE_MTE3": 32},
+        waterlines={},
+        min_gm_dma_bytes=16,
+        dma_burst_efficiency_ratio=0.55,
+    )
+    post_ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=4,
+        pipe_cycles={"AIV0.PIPE_V": 40, "AIV0.PIPE_MTE2": 32, "AIV0.PIPE_MTE3": 16},
+        waterlines={},
+        min_gm_dma_bytes=64,
+        dma_burst_efficiency_ratio=0.92,
+    )
+    pre_comp = BishengResourceSummary(
+        vec_regs=32,
+        scalar_regs=20,
+        spill_bytes=128,
+        stack_bytes=64,
+        extra_signals={"ub_scalar_compute_loops": 2.0},
+    )
+    post_comp = BishengResourceSummary(vec_regs=48, scalar_regs=16, spill_bytes=0, stack_bytes=0)
+    pre_obs = pre_ledger.to_observation_5d(
+        compiler_summary=pre_comp,
+        telemetry={
+            "dur_us": 42.0,
+            "aiv_vec_ratio": 0.12,
+            "mte2_wait_ratio": 0.40,
+            "l2_hit_rate": 0.45,
+        },
+    )
+    pre_res = StaticDynamicResidual(
+        measured_latency_us=42.0,
+        predicted_bottleneck_util=0.75,
+        measured_aic_mac_ratio=0.0,
+        measured_aiv_vec_ratio=0.12,
+        measured_mte2_wait_ratio=0.40,
+        measured_sync_stall_ratio=0.10,
+        unexplained_gap_ratio=0.25,
+        spill_bytes=128,
+        l2_hit_rate=0.45,
+        scalar_compute_loop_fallback=2.5,
+        dcache_bypass_narrow_store=4.0,
+        observation=pre_obs,
+    )
+    post_res = StaticDynamicResidual(
+        measured_latency_us=18.0,
+        predicted_bottleneck_util=0.85,
+        measured_aic_mac_ratio=0.0,
+        measured_aiv_vec_ratio=0.72,
+        measured_mte2_wait_ratio=0.15,
+        measured_sync_stall_ratio=0.04,
+        unexplained_gap_ratio=0.05,
+        spill_bytes=0,
+        l2_hit_rate=0.88,
+        scalar_compute_loop_fallback=0.0,
+        dcache_bypass_narrow_store=0.0,
+    )
+    pre_ratios = CasePhysicsRatios(
+        case_id=1,
+        stride_ratio=1.0,
+        contig_atom_ratio=0.5,
+        is_atom_aligned=False,
+        working_set_sram_ratio=0.4,
+        working_set_vreg_ratio=0.3,
+        wave_occupancy_ratio=0.5,
+        oi_ridge_ratio=0.4,
+        inner_contiguous_bytes=16,
+    )
+
+    pre_ctx = build_predicate_context(
+        pre_ledger,
+        residual=pre_res,
+        extra={"marker_flag": True},
+    )
+    assert pre_ctx["scalar_compute_loop_fallback"] == pytest.approx(2.5)
+    assert pre_ctx["dcache_bypass_narrow_store"] == pytest.approx(4.0)
+    assert pre_ctx["extra_signals"]["scalar_compute_loop_fallback"] == pytest.approx(2.5)
+    assert pre_ctx["extra_signals"]["dcache_bypass_narrow_store"] == pytest.approx(4.0)
+    assert rules["R34_SCALAR_LOOP_TO_VECTOR_DMA_PIPELINE"].matches(pre_ctx) is True
+    assert rules["R16_PADDED_PITCH_TAIL_MASKING"].matches(pre_ctx) is False
+    assert rules["R38_COALESCE_SUB32B_TAIL_DMA_STORE"].matches(pre_ctx) is True
+
+    post_ctx = build_predicate_context(
+        post_ledger,
+        residual=post_res,
+        compiler_summary=post_comp,
+        prev_ledger=pre_ledger,
+        prev_residual=pre_res,
+        prev_compiler_summary=pre_comp,
+        prev_case_ratios=pre_ratios,
+    )
+    prev = post_ctx["prev"]
+    assert isinstance(prev, dict)
+    assert prev["stack_bytes"] == 64
+    assert prev["spill_bytes"] == 128
+    assert prev["vec_regs"] == 32
+    assert prev["l1_vec_regs"] == 32
+    assert prev["l2_hit_rate"] == pytest.approx(0.45)
+    assert prev["scalar_compute_loop_fallback"] == pytest.approx(2.5)
+    assert prev["dcache_bypass_narrow_store"] == pytest.approx(4.0)
+    assert prev["contig_atom_ratio"] == pytest.approx(0.5)
+    assert prev["onchip_sram_reg_gap"] > 0.0
+    assert rules["R38_COALESCE_SUB32B_TAIL_DMA_STORE"].postcondition_realized(post_ctx) is True
+    assert rules["R36_SUBATOM_CONTIGUOUS_ALIGNED_CORE_SLICE"].postcondition_realized(post_ctx) is True
+    assert rules["R25_SCALAR_BOUND_SPILL_ELIMINATION"].postcondition_realized(post_ctx) is True
+
+    from tilefoundry_ascend.agent.kb.schema import _observation_to_signal_dict  # noqa: PLC0415
+
+    obs = pre_ledger.to_observation_5d()
+    sig_default = _observation_to_signal_dict(obs)
+    assert sig_default["min_gm_dma_bytes"] in (0, 16)
+    assert sig_default["AIC.PIPE_FIX"] == 0
+    assert sig_default["PIPE_FIX"] == 0
+    assert sig_default["dcache_bypass_narrow_store"] == pytest.approx(0.0)
+    assert sig_default["ub_scalar_compute_loops"] == 0
+    assert sig_default["scalar_compute_loop_fallback"] == pytest.approx(0.0)
+
+    object.__setattr__(obs.compute_issue, "l0_fixpipe_cycles", 96)
+    object.__setattr__(obs.compute_issue, "l0_ub_scalar_compute_loops", 3)
+    object.__setattr__(obs.compute_issue, "l1_scalar_compute_loop_fallback", 3.5)
+    object.__setattr__(obs.offchip_dma, "l1_dcache_bypass_narrow_store", 6.0)
+    object.__setattr__(obs.offchip_dma, "l0_min_gm_dma_bytes", 16)
+    sig_populated = _observation_to_signal_dict(obs)
+    assert sig_populated["AIC.PIPE_FIX"] == 96
+    assert sig_populated["PIPE_FIX"] == 96
+    assert sig_populated["min_gm_dma_bytes"] == 16
+    assert sig_populated["dcache_bypass_narrow_store"] == pytest.approx(6.0)
+    assert sig_populated["ub_scalar_compute_loops"] == 3
+    assert sig_populated["scalar_compute_loop_fallback"] == pytest.approx(3.5)
