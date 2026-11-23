@@ -2458,6 +2458,7 @@ class FlywheelDistiller:
         operator_name: str = "",
         rule_scope: str = "operator_local",
         active_symptom_family: str = "",
+        ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
     ) -> FlywheelDistillationReport:
         """Run Leave-One-Out AST/config ablation directly on real candidate winner_dsl."""
         chunks = decompose_leave_one_out_ablations(baseline_dsl, winner_dsl)
@@ -2474,6 +2475,7 @@ class FlywheelDistiller:
             factory_kwargs=factory_kwargs,
             config_selector_name=config_selector_name,
             dims=dims,
+            ordered_tensor_shapes=ordered_tensor_shapes,
         )
         win_cost = (
             _ledger_cost_score(win_sa.ledger)
@@ -2489,6 +2491,7 @@ class FlywheelDistiller:
                 factory_kwargs=factory_kwargs,
                 config_selector_name=config_selector_name,
                 dims=dims,
+                ordered_tensor_shapes=ordered_tensor_shapes,
             )
             funnel_results.append((chunk, eval_res))
 
@@ -2645,6 +2648,7 @@ class FlywheelDistiller:
         operator_name: str = "",
         rule_scope: str = "cross_op",
         active_symptom_family: str = "",
+        ordered_tensor_shapes: Sequence[tuple[int, ...]] | None = None,
     ) -> FlywheelDistillationReport:
         """Run full counterfactual ablation, micro-probe or LOO check, and KB admission."""
         if verify_on_candidate:
@@ -2665,6 +2669,7 @@ class FlywheelDistiller:
                 operator_name=operator_name,
                 rule_scope=rule_scope,
                 active_symptom_family=active_symptom_family,
+                ordered_tensor_shapes=ordered_tensor_shapes,
             )
         chunks = decompose_ast_ablations(baseline_dsl, winner_dsl)
         kept: list[AblationMeasurement] = []
@@ -2678,6 +2683,7 @@ class FlywheelDistiller:
             factory_kwargs=factory_kwargs,
             config_selector_name=config_selector_name,
             dims=dims,
+            ordered_tensor_shapes=ordered_tensor_shapes,
         )
         base_cost = (
             _ledger_cost_score(base_sa.ledger)
@@ -2693,6 +2699,7 @@ class FlywheelDistiller:
                 factory_kwargs=factory_kwargs,
                 config_selector_name=config_selector_name,
                 dims=dims,
+                ordered_tensor_shapes=ordered_tensor_shapes,
             )
             funnel_results.append((chunk, eval_res))
 
