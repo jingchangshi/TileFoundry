@@ -1436,13 +1436,10 @@ class PyTorchSemanticAnalyzer:
         semantics: PyTorchOpSemantics,
         anchor_dims: Mapping[str, int],
         *,
-        authored_hir_source: str | None = None,
-        scheduled_hir_source: str | None = None,
         dtype_bytes: float = 2.0,
         representative_case: RepresentativeCase | None = None,
     ) -> HirBlueprintPacket:
         """Build a semantic-first blueprint anchored to real dimensions and PyTorch semantics."""
-        del authored_hir_source, scheduled_hir_source
         element_bytes = _validated_dtype_bytes(dtype_bytes)
         dims = {str(key): int(value) for key, value in anchor_dims.items()}
         work = self._estimate_analytical_work(

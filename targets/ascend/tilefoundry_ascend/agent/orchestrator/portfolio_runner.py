@@ -1328,22 +1328,15 @@ class PortfolioRunner:
             acc_ok = True
 
         if spec.rule is not None:
-            pred_params = inspect.signature(build_predicate_context).parameters
-            prev_extra_kwargs: dict[str, object] = {}
-            if "prev_residual" in pred_params:
-                prev_extra_kwargs["prev_residual"] = spec.parent_candidate.residual
-            if "prev_compiler_summary" in pred_params:
-                prev_extra_kwargs["prev_compiler_summary"] = compiler_summary_from_residual(
-                    spec.parent_candidate.residual
-                )
             post_ctx = build_predicate_context(
                 ledger,
                 features=worker_features,
                 residual=residual,
                 compiler_summary=comp_summary,
                 prev_ledger=spec.parent_candidate.ledger,
+                prev_residual=spec.parent_candidate.residual,
+                prev_compiler_summary=compiler_summary_from_residual(spec.parent_candidate.residual),
                 roofline=spec.roofline,
-                **prev_extra_kwargs,
             )
             prev_ns = post_ctx.get("prev")
             if isinstance(prev_ns, dict):

@@ -56,11 +56,12 @@ def test_resolve_cann_series_precedence_and_validation(
 
     assert resolve_cann_series() == DEFAULT_CANN_SERIES
     monkeypatch.setenv("ASCEND_HOME_PATH", "/opt/Ascend/cann-9.2.0")
-    assert resolve_cann_series() == "cann_9_2"
+    assert resolve_cann_series() == "cann_9_3"
     monkeypatch.setenv("TILEFOUNDRY_NPU_CANN_SERIES", "cann_9_3")
     assert resolve_cann_series() == "cann_9_3"
     monkeypatch.setenv("TILEFOUNDRY_CANN_SERIES", "cann_9_2")
-    assert resolve_cann_series() == "cann_9_2"
+    assert resolve_cann_series() == "cann_9_3"
+    assert resolve_cann_series("cann_9_2") == "cann_9_2"
     assert resolve_cann_series("cann_9_3") == "cann_9_3"
 
     with pytest.raises(ValueError, match="Unsupported CANN series"):
@@ -97,14 +98,17 @@ def test_dual_cann_surface_snapshots_schema_and_signatures(series: str) -> None:
 def test_dynamic_cann_series_resolution_without_module_reload(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Resolve cann_9_2 and cann_9_3 dynamically on TILEFOUNDRY_CANN_SERIES toggles."""
+    """Verify env cann_9_2 clamps to cann_9_3 while explicit cann_9_2 remains selectable."""
     monkeypatch.delenv("TILEFOUNDRY_NPU_CANN_SERIES", raising=False)
     monkeypatch.delenv("ASCEND_HOME_PATH", raising=False)
     monkeypatch.delenv("ASCEND_TOOLKIT_HOME", raising=False)
 
     monkeypatch.setenv("TILEFOUNDRY_CANN_SERIES", "cann_9_2")
-    surf_92 = get_dialect_surface("cce_trackb")
-    trackb_92 = resolve_trackb_cce_surface("cce_trackb")
+    clamped_surf = get_dialect_surface("cce_trackb")
+    assert clamped_surf.display_label == "CCE C++20 (dav-3510 / CANN 9.3)"
+
+    surf_92 = get_dialect_surface("cce_trackb", cann_series="cann_9_2")
+    trackb_92 = resolve_trackb_cce_surface("cce_trackb", cann_series="cann_9_2")
     assert surf_92.display_label == "CCE C++20 (dav-3510 / CANN 9.2)"
     assert trackb_92 is surf_92
     sig_92 = {e.symbol: e.signature for e in surf_92.primitives}["asc_copy_l0c2gm"]

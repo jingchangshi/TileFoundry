@@ -981,13 +981,14 @@ def test_p1_1_experience_lake_and_e2e_evolution_persist_roofline(tmp_path: Path)
             return main
         """
     )
-    ar_hir = (
-        Path(__file__).resolve().parents[3]
-        / "examples"
-        / "ascend950pr_ops"
-        / "attention_residual"
-        / "model.py"
-    ).read_text(encoding="utf-8")
+    ar_golden = dedent(
+        """
+        import torch
+
+        def ar_roofline(h, x, w):
+            return torch.matmul(x + h, w)
+        """
+    )
     funnel = GateFunnel(
         compile_runner=lambda _dsl: StageBResult(passed=True),
         device_runner=lambda _dsl, sa: StageCResult(
@@ -1001,11 +1002,12 @@ def test_p1_1_experience_lake_and_e2e_evolution_persist_roofline(tmp_path: Path)
     traj = asyncio.run(
         run_e2e_evolution(
             problem_name="ar_roofline",
-            hir_source=ar_hir,
+            hir_source=ar_golden,
             shape_contract="make_kernel()",
             backend=MockLLMBackend(responses={}, default_response=dsl_src),
             funnel=funnel,
             initial_dsl_source=dsl_src,
+            anchor_dims={"M": 128, "N": 128, "K": 128},
             num_rounds=1,
             k_rule_workers=1,
         )

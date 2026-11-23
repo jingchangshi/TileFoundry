@@ -958,7 +958,33 @@ def _populate_state_context(
         res_defaults.update(comp_vals)
     embedded_obs: ObservationVector5D | None = None
     if residual is not None:
-        res_defaults.update(_extract_typed_defaults(residual, _RESIDUAL_DEFAULTS))
+        res_vals = _extract_typed_defaults(residual, _RESIDUAL_DEFAULTS)
+        if has_l1_summary:
+            max_hazards = {
+                "spill_bytes",
+                "stack_bytes",
+                "vf_fusion_breaks",
+                "alias_serialized_buffers",
+                "dual_issue_ipc_collapse",
+                "dcache_dcci_flushes",
+                "scalar_compute_loop_fallback",
+                "dcache_bypass_narrow_store",
+            }
+            for key, val in res_vals.items():
+                if key in max_hazards:
+                    cur = res_defaults[key]
+                    if isinstance(cur, float) or isinstance(val, float):
+                        res_defaults[key] = max(float(cur), float(val))
+                    else:
+                        res_defaults[key] = max(int(cur), int(val))
+                elif key == "vloopv2_hit":
+                    res_defaults[key] = bool(res_defaults[key]) and bool(val)
+                elif key == "has_local_membar_in_vf_call":
+                    res_defaults[key] = bool(res_defaults[key]) or bool(val)
+                else:
+                    res_defaults[key] = val
+        else:
+            res_defaults.update(res_vals)
         ctx.update(_extract_typed_defaults(residual, _TELEMETRY_CONTEXT_DEFAULTS))
         embedded_obs = _embedded_observation(residual)
         res_aic = _first_present_float(

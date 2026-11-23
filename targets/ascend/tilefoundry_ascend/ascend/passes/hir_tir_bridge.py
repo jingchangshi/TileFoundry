@@ -401,14 +401,8 @@ class HirBlueprintPacket:
         return "\n".join(lines)
 
 
-def compile_hir_blueprint(*_a: object, **_kw: object) -> HirBlueprintPacket:
-    """Removed HIR-to-TIR blueprint compiler stub for Phase-1 import compatibility."""
-    raise RuntimeError("removed")
-
-
 __all__ = [
     "BlueprintProvenance",
     "HirBlueprintPacket",
     "HirRooflineSummary",
-    "compile_hir_blueprint",
 ]

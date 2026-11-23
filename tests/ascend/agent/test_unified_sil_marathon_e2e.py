@@ -10,12 +10,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tilefoundry.ir.core import Call, Constant, Var
-from tilefoundry.ir.hir.pipeline import PipelineSpec
-from tilefoundry.ir.tir.memory import AllocTensor
-from tilefoundry.ir.tir.stmts import Evaluate, For, LetStmt, Sequential
-from tilefoundry.ir.types import DType, StorageKind, TensorType
-from tilefoundry.ir.types.dim import DimVar
+from tilefoundry.vendor.tilelang_z3 import Buffer, Capacity, Edge, Problem, Resource, Reuse, Task
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     OPERATOR_METADATA,
     AnchorCaseSpec,
@@ -71,12 +66,8 @@ from tilefoundry_ascend.agent.router.capability_gate import (
 from tilefoundry_ascend.ascend.cost_model import (
     HybridAscendCostModel,
 )
-from tilefoundry_ascend.ascend.ir.tir.instructions import AscendGmToUb, AscendUbToGm
 from tilefoundry_ascend.ascend.passes.physical_ledger import build_objective_physical_ledger
-from tilefoundry_ascend.ascend.schedule.pipeline_solver import (
-    extract_tir_loop_problem,
-    solve_ascend_pipeline,
-)
+from tilefoundry_ascend.ascend.schedule.pipeline_solver import solve_ascend_pipeline
 from tilefoundry_ascend.ascend.schedule.regime_solver import RegimePiecewiseSolver
 from tilefoundry_ascend.ascend.sil import (
     AdvisoryEnvelope,
@@ -94,7 +85,7 @@ from tilefoundry_ascend.ascend.sil.schema import (
     VALID_MEMORY_RINGS,
     TopologyAxes,
 )
-from tilefoundry_ascend.ascend.target import AscendTarget
+from tilefoundry_ascend.ascend.target import AscendSpaceFacts, AscendTarget
 from tilefoundry_ascend.ascend.templates import (
     get_template_registry,
     render_template,
@@ -116,35 +107,6 @@ IMPLEMENTED_OPS: tuple[str, ...] = (
 
 def _cannbench_tasks_dir() -> Path:
     return default_source_root().parent / "cann-bench" / "tasks"
-
-
-def _make_static_ub_loop(*, max_stage: int = 1, max_versions: int = 2, with_pipeline: bool = True) -> For:
-    d_dyn = DimVar("D", 32, 2048)
-    gm_ty = TensorType((4, d_dyn), DType.f32, None, StorageKind.GMEM)
-    ub_ty = TensorType((d_dyn,), DType.f32, None, StorageKind.SMEM)
-    sc = TensorType.umat_scalar()
-    k = Var("k", type=sc)
-    gm_in = Var("gm_in", type=gm_ty)
-    gm_out = Var("gm_out", type=gm_ty)
-    ub_var = Var("ub_buf", type=ub_ty)
-    return For(
-        k,
-        Constant(0, type=sc),
-        Constant(4, type=sc),
-        Constant(1, type=sc),
-        Sequential(
-            (
-                LetStmt(ub_var, Call(AllocTensor(tensor_type=ub_ty), (), type=ub_ty)),
-                Evaluate(AscendGmToUb(), (gm_in, ub_var)),
-                Evaluate(AscendUbToGm(), (ub_var, gm_out)),
-            )
-        ),
-        pipeline=(
-            PipelineSpec(max_stage=max_stage, max_buffer_versions=max_versions, enable_offset=True)
-            if with_pipeline
-            else None
-        ),
-    )
 
 
 def test_all_10_implemented_ops_resolve_metadata_and_regime_selectors() -> None:
@@ -371,11 +333,38 @@ def test_sil_verifier_catches_invalid_policies_and_solvers_fallback_cleanly() ->
         assert rep.passed is False, f"{label} unexpectedly passed"
         assert any(expected_substr in err for err in rep.errors), (label, rep.errors)
 
-    loop = _make_static_ub_loop(with_pipeline=True)
-    problem, _ = extract_tir_loop_problem(
-        loop,
-        dim_hints={"D": 1024},
-        allow_dynamic_fallback=True,
+    facts = AscendTarget("ascend.950pr").get_facts(AscendSpaceFacts)
+    problem = Problem(
+        tasks=(
+            Task(name="load", resources=(("aiv", "aiv0", "mte2", 1),), latency=1, stage=0),
+            Task(name="vec", resources=(("aiv", "aiv0", "vector", 1),), latency=1, stage=1),
+            Task(name="store", resources=(("aiv", "aiv0", "mte3", 1),), latency=1, stage=2),
+        ),
+        buffers=(
+            Buffer(
+                name="ub_in",
+                slot_bytes=8192,
+                space="UB",
+                owner="aiv",
+                auto_min=1,
+                auto_max=2,
+            ),
+        ),
+        edges=(
+            Edge(src="load", dst="vec", distance=0, latency=1),
+            Edge(src="vec", dst="store", distance=0, latency=1),
+        ),
+        reuses=(
+            Reuse(buffer="ub_in", last_reader="vec", next_writer="load", delta=0, read_latency=1),
+        ),
+        resources=(
+            Resource(owner="aiv", core="aiv0", pipe="mte2", capacity=1),
+            Resource(owner="aiv", core="aiv0", pipe="vector", capacity=1),
+            Resource(owner="aiv", core="aiv0", pipe="mte3", capacity=1),
+        ),
+        capacities=(Capacity(space="UB", owner="aiv", bytes=facts.ub_usable_bytes),),
+        max_stage=2,
+        manual=True,
     )
     fallback_pipe = solve_ascend_pipeline(
         problem,
@@ -385,21 +374,7 @@ def test_sil_verifier_catches_invalid_policies_and_solvers_fallback_cleanly() ->
     assert "invalid l1_stages" in fallback_pipe.fallback_reason
     assert fallback_pipe.assignment.ii >= 1
 
-    from tilefoundry.ir.hir.pipeline import PipelineError  # noqa: PLC0415
-
-    unpipelined_loop = _make_static_ub_loop(with_pipeline=False)
     regime_solver = RegimePiecewiseSolver()
-    with pytest.raises(PipelineError, match="PIPELINE_MISSING"):
-        regime_solver.solve_regime(
-            {
-                "regime_tag": "main",
-                "representative_dims": {"M": 16, "N": 1024, "D": 1024},
-                "has_unaligned_tail": False,
-            },
-            op_name="rms_norm",
-            topology_axes=ax_simd,
-            loop=unpipelined_loop,
-        )
     analytical_reg = regime_solver.solve_regime(
         {
             "regime_tag": "main",
@@ -408,7 +383,6 @@ def test_sil_verifier_catches_invalid_policies_and_solvers_fallback_cleanly() ->
         },
         op_name="rms_norm",
         topology_axes=ax_simd,
-        loop=None,
     )
     assert analytical_reg.solver_mode == "algebraic_piecewise"
     assert verifier.verify_policy(

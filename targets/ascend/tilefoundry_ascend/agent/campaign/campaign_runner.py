@@ -4080,7 +4080,7 @@ class PerfTargetCampaignRunner:
             residual is not None
             and (
                 residual.spill_bytes > 0
-                or int(getattr(residual, "stack_bytes", 0) or 0) > 0
+                or residual.stack_bytes > 0
                 or (not residual.vloopv2_hit)
                 or residual.vf_fusion_breaks > 0
                 or residual.alias_serialized_buffers > 0
@@ -4172,7 +4172,7 @@ class PerfTargetCampaignRunner:
             lines.extend(
                 [
                     f"spill_bytes: {residual.spill_bytes}",
-                    f"stack_bytes: {int(getattr(residual, 'stack_bytes', 0) or 0)}",
+                    f"stack_bytes: {residual.stack_bytes}",
                     f"vloopv2_hit: {residual.vloopv2_hit}",
                     f"vf_fusion_breaks: {residual.vf_fusion_breaks}",
                     f"alias_serialized_buffers: {residual.alias_serialized_buffers}",
@@ -5645,22 +5645,15 @@ class PerfTargetCampaignRunner:
             if cand_compiler_summary is not None
             else compiler_summary_from_residual(cand_residual)
         )
-        pred_params = inspect.signature(build_predicate_context).parameters
-        prev_extra_kwargs: dict[str, object] = {}
-        if "prev_residual" in pred_params:
-            prev_extra_kwargs["prev_residual"] = parent_residual
-        if "prev_compiler_summary" in pred_params:
-            prev_extra_kwargs["prev_compiler_summary"] = compiler_summary_from_residual(
-                parent_residual
-            )
         post_ctx = build_predicate_context(
             ledger,
             features=features,
             residual=cand_residual,
             compiler_summary=resolved_comp,
             prev_ledger=parent_ledger,
+            prev_residual=parent_residual,
+            prev_compiler_summary=compiler_summary_from_residual(parent_residual),
             roofline=roofline,
-            **prev_extra_kwargs,
         )
         prev_ns = post_ctx.setdefault("prev", {})
         if isinstance(prev_ns, dict):
@@ -7100,17 +7093,15 @@ class PerfTargetCampaignRunner:
             or selected_stone.residual.measured_mte2_wait_ratio > 0.0
             or selected_stone.residual.measured_sync_stall_ratio > 0.0
             or selected_stone.residual.spill_bytes > 0
-            or int(getattr(selected_stone.residual, "stack_bytes", 0) or 0) > 0
+            or selected_stone.residual.stack_bytes > 0
             or (not selected_stone.residual.vloopv2_hit)
             or selected_stone.residual.vf_fusion_breaks > 0
             or selected_stone.residual.alias_serialized_buffers > 0
             or selected_stone.residual.dual_issue_ipc_collapse > 0.0
             or selected_stone.residual.dcache_dcci_flushes > 0
             or bool(selected_stone.residual.has_local_membar_in_vf_call)
-            or float(getattr(selected_stone.residual, "scalar_compute_loop_fallback", 0.0) or 0.0)
-            > 0.0
-            or float(getattr(selected_stone.residual, "dcache_bypass_narrow_store", 0.0) or 0.0)
-            > 0.0
+            or selected_stone.residual.scalar_compute_loop_fallback > 0.0
+            or selected_stone.residual.dcache_bypass_narrow_store > 0.0
         ):
             parent_residual = selected_stone.residual
         else:

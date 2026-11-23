@@ -27,7 +27,6 @@ from tilefoundry_ascend.ascend.cost_model.calibration_backtest import (
 )
 from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (
     BlueprintProvenance,
-    BlueprintScheduleDelta,
     HirBlueprintPacket,
     HirRooflineSummary,
 )
@@ -490,50 +489,6 @@ def test_hir_blueprint_packet_strips_legacy_non_z3_keys() -> None:
     assert legacy_pkt.z3_pipeline_summary == {
         "k_loop": {"ii": 8, "stages": {"load": 0}, "phases": {}, "versions": {}}
     }
-    delta = BlueprintScheduleDelta(
-        z3_stage_summary={
-            "traffic_basis": "estimated",
-            "main_loop": {"ii": 16, "stages": {}, "phases": {}, "versions": {}},
-        },
-        recommended_facets=("dma_and_cache_hierarchy", "pipeline_and_sync_graph"),
-    )
-    assert "traffic_basis" not in delta.z3_stage_summary
-    assert BlueprintScheduleDelta.from_dict(delta.to_dict()) == delta
-
-
-def test_blueprint_schedule_delta_validates_and_derives_canonical_7_facets() -> None:
-    """Reject legacy facet names and emit canonical 7-facet names."""
-    from tilefoundry_ascend.ascend.passes.hir_tir_bridge import (  # noqa: PLC0415
-        _derive_recommended_facets,
-    )
-    from tilefoundry_ascend.ascend.sil.schema import VALID_FREEDOM_FACETS  # noqa: PLC0415
-
-    with pytest.raises(ValueError, match="Unknown recommended_facets"):
-        BlueprintScheduleDelta(recommended_facets=("sync_skeleton",))
-
-    ledger = build_objective_physical_ledger(
-        analysis_mode="readonly_envelope",
-        is_legal=True,
-        steady_state_ii=16,
-        pipe_cycles={"AIV0.PIPE_V": 120},
-        waterlines={},
-        gm_roundtrip_bytes=65536,
-        unaligned_dma_padding_bytes=64,
-        dominant_contig_bytes=4096,
-        in_loop_pipe_all_barriers=1,
-        has_online_rescale_loop=True,
-        ub_bank_conflict_risk=0.25,
-    )
-    derived = _derive_recommended_facets(ledger, {"main_loop": {"ii": 16}})
-    assert derived
-    assert all(facet in VALID_FREEDOM_FACETS for facet in derived)
-    assert "alg_compute_and_monoid" in derived
-    assert "dma_and_cache_hierarchy" in derived
-    assert "sram_layout_and_aliasing" in derived
-    assert "pipeline_and_sync_graph" in derived
-    assert "tile_and_stage_knobs" in derived
-    delta = BlueprintScheduleDelta(recommended_facets=derived)
-    assert delta.recommended_facets == derived
 
 
 def test_objective_physical_ledger_gm_traffic_scope_and_total_gm_bytes() -> None:

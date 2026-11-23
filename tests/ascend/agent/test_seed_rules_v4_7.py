@@ -530,14 +530,14 @@ def test_residual_stage6_signals_and_prev_namespace_closure() -> None:
 
     obs = pre_ledger.to_observation_5d()
     sig_default = _observation_to_signal_dict(obs)
-    assert sig_default["min_gm_dma_bytes"] in (0, 16)
+    assert sig_default["min_gm_dma_bytes"] == 16
     assert sig_default["AIC.PIPE_FIX"] == 0
     assert sig_default["PIPE_FIX"] == 0
-    assert sig_default["dcache_bypass_narrow_store"] == pytest.approx(0.0)
+    assert sig_default["dcache_bypass_narrow_store"] == pytest.approx(2.0)
     assert sig_default["ub_scalar_compute_loops"] == 0
     assert sig_default["scalar_compute_loop_fallback"] == pytest.approx(0.0)
 
-    object.__setattr__(obs.compute_issue, "l0_fixpipe_cycles", 96)
+    object.__setattr__(obs.offchip_dma, "l0_fixpipe_cycles", 96)
     object.__setattr__(obs.compute_issue, "l0_ub_scalar_compute_loops", 3)
     object.__setattr__(obs.compute_issue, "l1_scalar_compute_loop_fallback", 3.5)
     object.__setattr__(obs.offchip_dma, "l1_dcache_bypass_narrow_store", 6.0)

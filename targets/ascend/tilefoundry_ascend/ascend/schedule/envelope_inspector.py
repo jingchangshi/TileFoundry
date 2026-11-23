@@ -8,7 +8,6 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
-from tilelang import tvm
 from tilefoundry.vendor.tilelang_z3 import (
     Buffer,
     Capacity,
@@ -4121,7 +4120,18 @@ def _specialize_primfunc_for_anchors(
     return spec_fn, spec_mod
 
 
-@tvm.ir.instrument.pass_instrument
+def _pass_instrument_if_available(cls: type) -> type:
+    """Attach tvm.ir.instrument.pass_instrument when TileLang runtime is available."""
+    try:
+        from tilelang import tvm as tvm_mod  # noqa: PLC0415
+    except ImportError:
+        return cls
+    instr = getattr(getattr(tvm_mod, "ir", None), "instrument", None)
+    decorator = getattr(instr, "pass_instrument", None)
+    return decorator(cls) if callable(decorator) else cls
+
+
+@_pass_instrument_if_available
 class ReadOnlyAscendPassTap:
     """Read-only 4-tap TVM PassContext instrument for Ascend TileLang lowering."""
 
@@ -4158,6 +4168,8 @@ def _ascend_compile_session(
     pass_configs: Mapping[str, object] | None = None,
     instruments: Sequence[object] = (),
 ):
+    from tilelang import tvm  # noqa: PLC0415
+
     cur_target = tvm.target.Target.current(allow_none=True)
     cur_kind = str(getattr(getattr(cur_target, "kind", None), "name", "") or "")
     target_ctx = (
@@ -4196,10 +4208,11 @@ def _collect_post_lower_gm_dma_payloads(
     *,
     tirx,
     DataTypeCls,
-) -> tuple[list[int], list[int]]:
-    """Collect all positive lowered GM DMA byte payloads inside loops and function-wide."""
+) -> tuple[list[int], list[int], bool]:
+    """Collect lowered GM DMA byte payloads inside loops, function-wide, and loop presence."""
     loop_sizes: list[int] = []
     all_sizes: list[int] = []
+    seen_in_loop_gm = [False]
     let_stmt_cls = getattr(tirx, "LetStmt", None)
     bind_cls = getattr(tirx, "Bind", None)
 
@@ -4266,6 +4279,8 @@ def _collect_post_lower_gm_dma_payloads(
                     and "GM" in (src_s, dst_s)
                 )
                 if is_gm_name or is_gm_region:
+                    if in_loop:
+                        seen_in_loop_gm[0] = True
                     b0 = _access_ptr_or_region_bytes(
                         args[0], tirx=tirx, DataTypeCls=DataTypeCls, let_env=let_env
                     )
@@ -4279,7 +4294,7 @@ def _collect_post_lower_gm_dma_payloads(
                             loop_sizes.append(xfer)
 
     _walk(stmt, in_loop=False, let_env={})
-    return loop_sizes, all_sizes
+    return loop_sizes, all_sizes, seen_in_loop_gm[0]
 
 
 def _collect_func_ub_buf_names(func, *, tirx) -> set[str]:
@@ -4415,15 +4430,17 @@ def _reconcile_post_lower_device_mod(
     post_barriers = 0
     post_loop_dma: list[int] = []
     post_all_dma: list[int] = []
+    seen_any_in_loop_gm_dma = False
     post_ub_scalar_loops = 0
     post_dyn_offset = pre_dyn_offset_pipe
     post_pipe_totals: dict[str, int] = {}
 
     for dev_fn in dev_funcs:
         post_barriers += _count_in_loop_pipe_all_barriers(dev_fn.body, tirx=tirx)
-        l_dma, a_dma = _collect_post_lower_gm_dma_payloads(
+        l_dma, a_dma, seen_loop = _collect_post_lower_gm_dma_payloads(
             dev_fn.body, tirx=tirx, DataTypeCls=DataTypeCls
         )
+        seen_any_in_loop_gm_dma = seen_any_in_loop_gm_dma or seen_loop
         post_loop_dma.extend(l_dma)
         post_all_dma.extend(a_dma)
         ub_names = _collect_func_ub_buf_names(dev_fn, tirx=tirx)
@@ -4450,7 +4467,8 @@ def _reconcile_post_lower_device_mod(
     reconciled_barriers = max(pre_barriers, post_barriers)
     reconciled_ub_scalar = max(pre_ub_scalar_loops, post_ub_scalar_loops)
 
-    post_pool = [b for b in (post_loop_dma if post_loop_dma else post_all_dma) if b > 0]
+    raw_pool = post_loop_dma if (post_loop_dma or seen_any_in_loop_gm_dma) else post_all_dma
+    post_pool = [b for b in raw_pool if b > 0]
     if post_pool:
         post_min = min(post_pool)
         reconciled_min_dma = (
@@ -4498,6 +4516,7 @@ def specialize_primfunc_for_anchor(
     ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ):
     """Specialize a TileLang PrimFunc or IRModule for one anchor shape without lowering."""
+    from tilelang import tvm  # noqa: PLC0415
     from tvm import tirx  # noqa: PLC0415
 
     if isinstance(prim_func, tvm.IRModule):
@@ -4533,6 +4552,7 @@ def inspect_tilelang_primfunc(
     ordered_tensor_shapes: Sequence[Sequence[int]] | None = None,
 ) -> EnvelopeInspectionResult:
     """Inspect a TileLang PrimFunc using Two-Snapshot IR Diff without bisheng compile."""
+    from tilelang import tvm  # noqa: PLC0415
     from tilelang.backend.module import create_backend_context  # noqa: PLC0415
     from tilelang.engine.lower import lower_to_host_device_ir  # noqa: PLC0415
     from tilelang.utils.language import DataType as TLDataType  # noqa: PLC0415
