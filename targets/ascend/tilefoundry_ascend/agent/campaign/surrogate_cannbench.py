@@ -19,6 +19,7 @@ import time
 import tomllib
 import uuid
 from collections.abc import Callable, Collection, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -66,10 +67,16 @@ from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     extract_lowered_compiler_excerpt as _extract_lowered_compiler_excerpt,
     extract_lowered_compiler_excerpt_with_lang,
 )
+from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import (
+    is_paradigm_shift_exempt,
+)
 from tilefoundry_ascend.ascend.cost_model.microarch_profile import (
     extract_microarch_profile_from_cce,
 )
-from tilefoundry_ascend.ascend.sil.schema import ConstraintRelaxationMask
+from tilefoundry_ascend.ascend.sil.schema import (
+    ConstraintRelaxationMask,
+    TopologyAxes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +144,7 @@ class AnchorEvalMetrics:
     roofline_eta: float
     eq3_score: float
     error_message: str = ""
+    ring_burst_k: int = 1
 
     def to_dict(self) -> dict[str, object]:
         """Serialize anchor evaluation metrics to a JSON-compatible dictionary."""
@@ -151,6 +159,7 @@ class AnchorEvalMetrics:
             "roofline_eta": round(self.roofline_eta, 6),
             "eq3_score": round(self.eq3_score, 6),
             "error_message": self.error_message,
+            "ring_burst_k": int(self.ring_burst_k),
         }
 
     @classmethod
@@ -167,6 +176,7 @@ class AnchorEvalMetrics:
             roofline_eta=float(payload["roofline_eta"]),
             eq3_score=float(payload["eq3_score"]),
             error_message=str(payload.get("error_message", "")),
+            ring_burst_k=max(1, int(payload.get("ring_burst_k", 1) or 1)),
         )
 
 
@@ -399,6 +409,7 @@ def build_anchor_metrics(
     accuracy_passed: bool,
     cand_us: float,
     error_message: str = "",
+    ring_burst_k: int = 1,
 ) -> AnchorEvalMetrics:
     """Compute speedup, Roofline eta, and Eq.3 score from measured latency."""
     valid_lat = accuracy_passed and math.isfinite(cand_us) and cand_us > 0.0
@@ -417,7 +428,198 @@ def build_anchor_metrics(
         roofline_eta=eta,
         eq3_score=eq3,
         error_message=error_message,
+        ring_burst_k=max(1, int(ring_burst_k)),
     )
+
+
+COLD_L2_HW_THRESHOLD_US = 5.0
+COLD_L2_PROBE_THRESHOLD_US = 8.0
+RING_BURST_MIN_K = 24
+RING_BURST_MAX_K = 32
+RING_BURST_TARGET_BYTES = 64 * 1024 * 1024
+RING_BURST_MAX_VRAM_BYTES = 1024 * 1024 * 1024
+
+
+def compute_ring_burst_k(
+    per_call_bytes: int,
+    *,
+    t_hw_us: float | None = None,
+    first_probe_us: float | None = None,
+    min_k: int = RING_BURST_MIN_K,
+    max_k: int = RING_BURST_MAX_K,
+    target_bytes: int = RING_BURST_TARGET_BYTES,
+    max_vram_bytes: int = RING_BURST_MAX_VRAM_BYTES,
+) -> int:
+    """Return rotating ring-buffer burst factor K for cold-L2 micro-anchor timing."""
+    needs_burst = (
+        (t_hw_us is not None and math.isfinite(float(t_hw_us)) and 0.0 < float(t_hw_us) < COLD_L2_HW_THRESHOLD_US)
+        or (
+            first_probe_us is not None
+            and math.isfinite(float(first_probe_us))
+            and 0.0 < float(first_probe_us) < COLD_L2_PROBE_THRESHOLD_US
+        )
+    )
+    if not needs_burst:
+        return 1
+    safe_min = max(1, int(min_k))
+    safe_max = max(safe_min, int(max_k))
+    call_bytes = max(0, int(per_call_bytes))
+    if call_bytes <= 0:
+        return safe_min
+    vram_cap = max(1, int(max_vram_bytes) // call_bytes)
+    if vram_cap < safe_min:
+        return max(1, vram_cap)
+    if call_bytes < target_bytes:
+        scaled = math.ceil(float(target_bytes) / float(call_bytes))
+        desired = min(safe_max, max(safe_min, scaled))
+    else:
+        desired = safe_min
+    return max(1, min(desired, vram_cap))
+
+
+def _tensor_nbytes(obj: object) -> int:
+    if hasattr(obj, "numel") and hasattr(obj, "element_size"):
+        return max(0, int(obj.numel()) * int(obj.element_size()))
+    if hasattr(obj, "nbytes"):
+        return max(0, int(obj.nbytes))
+    return 0
+
+
+def estimate_params_io_bytes(params: object) -> int:
+    """Estimate total input/output tensor bytes referenced by a call parameter container."""
+    total = 0
+    seen: set[int] = set()
+
+    def _walk(item: object) -> None:
+        nonlocal total
+        if isinstance(item, Mapping):
+            for val in item.values():
+                _walk(val)
+            return
+        if isinstance(item, (list, tuple)):
+            for val in item:
+                _walk(val)
+            return
+        nbytes = _tensor_nbytes(item)
+        if nbytes > 0:
+            obj_id = id(item)
+            if obj_id not in seen:
+                seen.add(obj_id)
+                total += nbytes
+
+    _walk(params)
+    return total
+
+
+def _clone_param_tree(item: object, clone_fn: Callable[[object], object] | None) -> object:
+    if isinstance(item, Mapping):
+        return {k: _clone_param_tree(v, clone_fn) for k, v in item.items()}
+    if isinstance(item, tuple):
+        return tuple(_clone_param_tree(v, clone_fn) for v in item)
+    if isinstance(item, list):
+        return [_clone_param_tree(v, clone_fn) for v in item]
+    if _tensor_nbytes(item) > 0:
+        if clone_fn is not None:
+            return clone_fn(item)
+        if hasattr(item, "clone") and callable(item.clone):
+            return item.clone()
+    return item
+
+
+def allocate_rotating_ring_params(
+    params: object,
+    k: int,
+    *,
+    clone_fn: Callable[[object], object] | None = None,
+) -> list[object]:
+    """Pre-allocate *k* independent input/output parameter buffer copies for cold-L2 bursts."""
+    count = max(1, int(k))
+    return [_clone_param_tree(params, clone_fn) for _ in range(count)]
+
+
+def measure_npu_ring_burst_us(
+    func: Callable[..., object],
+    params: object,
+    *,
+    warmup: int = 3,
+    repeat: int = 5,
+    t_hw_us: float | None = None,
+    first_probe_us: float | None = None,
+    event_factory: Callable[[], object] | None = None,
+    synchronize_fn: Callable[[], None] | None = None,
+    clone_fn: Callable[[object], object] | None = None,
+    max_vram_bytes: int = RING_BURST_MAX_VRAM_BYTES,
+) -> tuple[float, int]:
+    """Measure micro-anchor latency with cold-L2 rotating ring-buffer burst enqueueing."""
+    import statistics  # noqa: PLC0415
+
+    if event_factory is None or synchronize_fn is None:
+        import torch  # noqa: PLC0415
+
+        if event_factory is None:
+            event_factory = lambda: torch.npu.Event(enable_timing=True)
+        if synchronize_fn is None:
+            synchronize_fn = torch.npu.synchronize
+
+    def _invoke(p: object) -> None:
+        if isinstance(p, Mapping):
+            func(**p)
+        elif isinstance(p, (list, tuple)):
+            func(*p)
+        else:
+            func(p)
+
+    def _time_single(p: object, reps: int) -> float:
+        samples: list[float] = []
+        for _ in range(max(1, int(reps))):
+            start_ev = event_factory()
+            end_ev = event_factory()
+            start_ev.record()
+            _invoke(p)
+            end_ev.record()
+            synchronize_fn()
+            samples.append(float(start_ev.elapsed_time(end_ev)) * 1000.0)
+        return float(statistics.median(samples))
+
+    for _ in range(max(1, int(warmup))):
+        _invoke(params)
+    synchronize_fn()
+
+    eff_probe_us = first_probe_us
+    if eff_probe_us is None and (t_hw_us is None or float(t_hw_us) >= COLD_L2_HW_THRESHOLD_US):
+        eff_probe_us = _time_single(params, 1)
+
+    per_call_bytes = estimate_params_io_bytes(params)
+    k = compute_ring_burst_k(
+        per_call_bytes,
+        t_hw_us=t_hw_us,
+        first_probe_us=eff_probe_us,
+        max_vram_bytes=max_vram_bytes,
+    )
+    if k <= 1:
+        return _time_single(params, repeat), 1
+
+    try:
+        ring_inputs = allocate_rotating_ring_params(params, k, clone_fn=clone_fn)
+    except RuntimeError:
+        return _time_single(params, repeat), 1
+
+    for step in range(min(k, max(1, int(warmup)))):
+        _invoke(ring_inputs[step % k])
+    synchronize_fn()
+
+    samples_us: list[float] = []
+    for _ in range(max(1, int(repeat))):
+        start_ev = event_factory()
+        end_ev = event_factory()
+        start_ev.record()
+        for step in range(k):
+            _invoke(ring_inputs[step % k])
+        end_ev.record()
+        synchronize_fn()
+        total_us = float(start_ev.elapsed_time(end_ev)) * 1000.0
+        samples_us.append(total_us / float(k))
+    return float(statistics.median(samples_us)), k
 
 
 def aggregate_surrogate_result(
@@ -860,6 +1062,110 @@ def _repair_timeout_message(error_message: str, is_transport: bool) -> str:
     return f"{error_message} [repair_timeout]" if is_transport else error_message
 
 
+def _strip_cpp_comments_keep_strings(text: str) -> str:
+    """Strip C/C++ line and block comments while keeping string literals intact."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_str = ""
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(nxt)
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = ""
+            i += 1
+            continue
+        if ch in ('"', "'"):
+            in_str = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "/" and nxt == "/":
+            i += 2
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _normalize_trackb_cpp_literal(text: str) -> str:
+    cleaned = _strip_cpp_comments_keep_strings(text)
+    collapsed = " ".join(cleaned.split())
+    return hashlib.sha256(collapsed.encode("utf-8")).hexdigest()
+
+
+_CPP_LITERAL_MARKERS = ("__global__", "__aicore__", "__ubuf__", "__simd_vf__", "#include", 'extern "C"')
+
+
+class _NormalizedAstStrings(ast.NodeTransformer):
+    """Canonicalize Track-B C++ string literals inside Python AST before dumping."""
+
+    def visit_Constant(self, node: ast.Constant) -> ast.AST:
+        if isinstance(node.value, str) and any(tok in node.value for tok in _CPP_LITERAL_MARKERS):
+            return ast.copy_location(
+                ast.Constant(value=f"__cpp_tu__:{_normalize_trackb_cpp_literal(node.value)}"),
+                node,
+            )
+        return node
+
+
+def _normalized_module_ast_signature(source: str) -> str | None:
+    """Return canonical AST+TU sha256 signature for Python module source, or None on SyntaxError."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    normalized = _NormalizedAstStrings().visit(tree)
+    ast.fix_missing_locations(normalized)
+    dumped = ast.dump(normalized, include_attributes=False)
+    return hashlib.sha256(dumped.encode("utf-8")).hexdigest()
+
+
+_GLOBAL_KERNEL_DEF_RE = re.compile(
+    r"__global__\s+(?:__aicore__|__vector__|__cube__|__mix__\([^)]*\)|\s)*void\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _count_trackb_workspace_stages(source: str) -> int:
+    """Count distinct __global__ kernels and _plan_workspace_bytes stage hooks in *source*."""
+    kernels = set(_GLOBAL_KERNEL_DEF_RE.findall(source))
+    has_ws = bool(re.search(r"(?m)^\s*def\s+(?:_[a-z0-9_]+_)?plan_workspace_bytes\b", source))
+    return len(kernels) + (1 if has_ws else 0)
+
+
+def _extract_candidate_topology_axes(
+    stage_a: StageAResult,
+) -> TopologyAxes | None:
+    route = getattr(stage_a, "route", None)
+    if route is not None:
+        r_axes = (
+            route.get("topology_axes")
+            if isinstance(route, Mapping)
+            else getattr(route, "topology_axes", None)
+        )
+        if isinstance(r_axes, TopologyAxes):
+            return r_axes
+        if isinstance(r_axes, Mapping) and all(
+            k in r_axes for k in ("compute_engine", "memory_ring", "iteration_regularity")
+        ):
+            return TopologyAxes.from_dict(r_axes)
+    return None
+
+
 async def run_l0_l1_round_filter(
     candidates: Sequence[tuple[str, str]],
     *,
@@ -872,12 +1178,14 @@ async def run_l0_l1_round_filter(
     slice_hint: str = "",
     backend_kind: str = "tilelang_dsl",
     parent_source: str = "",
+    parent_module_source: str = "",
     trackb_prologue_line_offset: int = 0,
     stage_a_cost_ranker: Callable[
         [Sequence[tuple[str, str, StageAResult]]], Sequence[tuple[str, float]]
     ]
     | None = None,
     cost_prescreen_top_k: int | None = None,
+    cost_coarse_reject_ratio: float = 3.0,
     sil_advisory: object | None = None,
     sil_verification: object | None = None,
     freedom_mask: ConstraintRelaxationMask | None = None,
@@ -886,9 +1194,30 @@ async def run_l0_l1_round_filter(
     creative_candidate_ids: Collection[str] = (),
     parent_analytical_us: float | None = None,
     stage_a_analytical_scorer: Callable[[str, str, StageAResult], float] | None = None,
+    parent_topology_axes: TopologyAxes | None = None,
+    candidate_topology_axes_fn: Callable[[str, StageAResult], TopologyAxes | None] | None = None,
+    parent_workspace_stages: int | None = None,
+    candidate_workspace_stages_fn: Callable[[str, StageAResult], int] | None = None,
 ) -> list[L0L1CandidateCheck]:
-    """Filter candidate snippets through L0 static, optional CostModel prescreen, and L1 compile."""
+    """Filter candidates via noop guard, L0 static, optional cost prescreen, and L1 compile."""
     max_attempts = max(0, max_syntax_repairs)
+    baseline_compare_source = (
+        parent_module_source if parent_module_source.strip() else parent_source
+    )
+    baseline_ast_sig = (
+        _normalized_module_ast_signature(baseline_compare_source)
+        if baseline_compare_source.strip()
+        else None
+    )
+    eff_parent_ws_stages = (
+        int(parent_workspace_stages)
+        if parent_workspace_stages is not None
+        else (
+            _count_trackb_workspace_stages(baseline_compare_source)
+            if baseline_compare_source.strip()
+            else 0
+        )
+    )
     trackb_backends = (
         "ascendc",
         "ascendc_template",
@@ -1015,6 +1344,21 @@ async def run_l0_l1_round_filter(
                 continue
 
             active_patch_fn = patch_fn
+            if baseline_ast_sig is not None:
+                patched_sig = _normalized_module_ast_signature(patched)
+                if patched_sig is not None and patched_sig == baseline_ast_sig:
+                    return (
+                        L0L1CandidateCheck(
+                            candidate_id=cand_id,
+                            passed=False,
+                            failed_tier="noop_identical",
+                            patched_module_source=patched,
+                            snippet_source=snippet,
+                            repaired=is_repaired,
+                            error_message="noop_identical_to_parent",
+                        ),
+                        None,
+                    )
             stage_a = await asyncio.to_thread(l0_checker, patched)
             if not stage_a.passed:
                 err = stage_a.error_message or "l0_static_failed"
@@ -1177,9 +1521,39 @@ async def run_l0_l1_round_filter(
             cur_snippet, patched, stage_a, repaired, attempt = passed_state
             passers.append((idx, cid, cur_snippet, patched, stage_a, repaired, attempt))
 
-    if len(passers) > top_k:
+    if not passers:
+        return [results_by_idx[i] for i in range(len(candidates))]
+
+    creative_id_set = {str(cid) for cid in creative_candidate_ids}
+    exempt_passers: list[tuple[int, str, str, str, StageAResult, bool, int]] = []
+    same_topo_passers: list[tuple[int, str, str, str, StageAResult, bool, int]] = []
+    for item in passers:
+        _idx, cid, _snip, patched, stage_a, _rep, _att = item
+        cand_axes = (
+            candidate_topology_axes_fn(patched, stage_a)
+            if candidate_topology_axes_fn is not None
+            else _extract_candidate_topology_axes(stage_a)
+        )
+        cand_ws_stages = (
+            int(candidate_workspace_stages_fn(patched, stage_a))
+            if candidate_workspace_stages_fn is not None
+            else _count_trackb_workspace_stages(patched)
+        )
+        if is_paradigm_shift_exempt(
+            cand_axes,
+            parent_topology_axes,
+            cand_workspace_stages=cand_ws_stages,
+            parent_workspace_stages=eff_parent_ws_stages,
+            is_creative=(cid in creative_id_set),
+        ):
+            exempt_passers.append(item)
+        else:
+            same_topo_passers.append(item)
+
+    if len(same_topo_passers) > top_k:
         rank_input = [
-            (cid, patched, stage_a) for _idx, cid, _snip, patched, stage_a, _rep, _att in passers
+            (cid, patched, stage_a)
+            for _idx, cid, _snip, patched, stage_a, _rep, _att in same_topo_passers
         ]
         ranked_pairs = list(stage_a_cost_ranker(rank_input))
         pred_by_id: dict[str, float] = {}
@@ -1189,41 +1563,23 @@ async def run_l0_l1_round_filter(
             if sid not in pred_by_id:
                 pred_by_id[sid] = float(rscore)
                 order_by_id[sid] = rank_idx
-        sorted_passers = sorted(
-            passers,
+        sorted_same = sorted(
+            same_topo_passers,
             key=lambda item: (
                 pred_by_id.get(item[1], float("inf")),
-                order_by_id.get(item[1], len(passers) + item[0]),
+                order_by_id.get(item[1], len(same_topo_passers) + item[0]),
                 item[0],
             ),
         )
-        kept_passers = sorted_passers[:top_k]
-        reserve_passers = sorted_passers[top_k:]
-        creative_id_set = {str(cid) for cid in creative_candidate_ids}
-        if (
-            creative_id_set
-            and parent_analytical_us is not None
-            and float(parent_analytical_us) > 0.0
-            and not any(item[1] in creative_id_set for item in kept_passers)
-        ):
-            max_creative_us = 1.5 * float(parent_analytical_us)
-            for r_idx, item in enumerate(reserve_passers):
-                r_cid = item[1]
-                if r_cid not in creative_id_set:
-                    continue
-                analytical_us = (
-                    float(stage_a_analytical_scorer(r_cid, item[3], item[4]))
-                    if stage_a_analytical_scorer is not None
-                    else pred_by_id.get(r_cid, float("inf"))
-                )
-                if math.isfinite(analytical_us) and analytical_us <= max_creative_us:
-                    kept_passers.append(reserve_passers.pop(r_idx))
-                    break
+        kept_same = sorted_same[:top_k]
+        reserve_same = sorted_same[top_k:]
     else:
         pred_by_id = {}
-        kept_passers = passers
-        reserve_passers = []
+        kept_same = same_topo_passers
+        reserve_same = []
 
+    kept_passers = [*exempt_passers, *kept_same]
+    kept_same_ids = {item[1] for item in kept_same}
     passed_l1 = 0
     if kept_passers:
         stage_b_checks = await asyncio.gather(
@@ -1232,51 +1588,53 @@ async def run_l0_l1_round_filter(
                 for _idx, cid, cur_snippet, patched, stage_a, repaired, attempt in kept_passers
             )
         )
-        for (idx, *_rest), chk in zip(kept_passers, stage_b_checks):
+        for (idx, cid, *_rest), chk in zip(kept_passers, stage_b_checks):
             results_by_idx[idx] = chk
-            if chk.passed:
+            if chk.passed and cid in kept_same_ids:
                 passed_l1 += 1
 
-    if reserve_passers:
-        for cursor, (idx, cid, cur_snippet, patched, stage_a, repaired, attempt) in enumerate(
-            reserve_passers
-        ):
-            if passed_l1 >= top_k:
-                for rem_idx, rem_cid, rem_snip, rem_patched, rem_sa, rem_rep, _ in reserve_passers[
-                    cursor:
-                ]:
-                    pred_us = pred_by_id.get(rem_cid, float("inf"))
-                    raw_ana_ratio = float("nan")
-                    if (
-                        parent_analytical_us is not None
-                        and math.isfinite(float(parent_analytical_us))
-                        and float(parent_analytical_us) > 0.0
-                    ):
-                        analytical_us = (
-                            float(stage_a_analytical_scorer(rem_cid, rem_patched, rem_sa))
-                            if stage_a_analytical_scorer is not None
-                            else pred_us
-                        )
-                        if math.isfinite(analytical_us):
-                            raw_ana_ratio = analytical_us / float(parent_analytical_us)
-                    err_msg = (
-                        f"cost_prescreen_pruned:pred_us={pred_us:.2f},"
-                        f"analytical_ratio={raw_ana_ratio:.3f}"
-                        if math.isfinite(raw_ana_ratio)
-                        else f"cost_prescreen_pruned:pred_us={pred_us:.2f}"
-                    )
-                    results_by_idx[rem_idx] = L0L1CandidateCheck(
-                        candidate_id=rem_cid,
-                        passed=False,
-                        failed_tier="cost_prescreen",
-                        patched_module_source=rem_patched,
-                        snippet_source=rem_snip,
-                        repaired=rem_rep,
-                        stage_a=rem_sa,
-                        stage_b=None,
-                        error_message=err_msg,
-                    )
-                break
+    if reserve_same:
+        has_parent_ana = (
+            parent_analytical_us is not None
+            and math.isfinite(float(parent_analytical_us))
+            and float(parent_analytical_us) > 0.0
+        )
+        eff_reject_ratio = max(1.0, float(cost_coarse_reject_ratio))
+        for idx, cid, cur_snippet, patched, stage_a, repaired, attempt in reserve_same:
+            pred_us = pred_by_id.get(cid, float("inf"))
+            raw_ana_ratio = float("nan")
+            if has_parent_ana:
+                analytical_us = (
+                    float(stage_a_analytical_scorer(cid, patched, stage_a))
+                    if stage_a_analytical_scorer is not None
+                    else pred_us
+                )
+                if math.isfinite(analytical_us):
+                    raw_ana_ratio = analytical_us / float(parent_analytical_us)
+                else:
+                    raw_ana_ratio = float("inf")
+            should_prune = passed_l1 >= top_k and (
+                (not has_parent_ana) or raw_ana_ratio > eff_reject_ratio
+            )
+            if should_prune:
+                err_msg = (
+                    f"cost_prescreen_pruned:pred_us={pred_us:.2f},"
+                    f"analytical_ratio={raw_ana_ratio:.3f}"
+                    if math.isfinite(raw_ana_ratio)
+                    else f"cost_prescreen_pruned:pred_us={pred_us:.2f}"
+                )
+                results_by_idx[idx] = L0L1CandidateCheck(
+                    candidate_id=cid,
+                    passed=False,
+                    failed_tier="cost_prescreen",
+                    patched_module_source=patched,
+                    snippet_source=cur_snippet,
+                    repaired=repaired,
+                    stage_a=stage_a,
+                    stage_b=None,
+                    error_message=err_msg,
+                )
+                continue
             chk = await _run_stage_b_and_repairs(
                 cid, cur_snippet, patched, stage_a, repaired, attempt
             )
@@ -1414,11 +1772,11 @@ def prewarm_anchor_reference_cache(
     return resolved_cache
 
 
-_PREWARM_TL_DRIVER_TEMPLATE = """import importlib.util
+_PREWARM_TL_PLAN_TEMPLATE = """import importlib.util
 import inspect
+import json
 import logging
 import sys
-import tilelang
 
 sys.path.insert(0, {ascend_target_dir!r})
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
@@ -1441,14 +1799,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tilefoundry_ascend.prewarm")
 
-def _freeze(val):
+def _json_safe(val):
     if isinstance(val, dict):
-        return tuple((str(k), _freeze(v)) for k, v in sorted(val.items()))
+        return {{str(k): _json_safe(v) for k, v in sorted(val.items())}}
     if isinstance(val, (list, tuple)):
-        return tuple(_freeze(x) for x in val)
+        return [_json_safe(x) for x in val]
     if isinstance(val, set):
-        return tuple(sorted(_freeze(x) for x in val))
-    return val
+        return sorted((_json_safe(x) for x in val), key=lambda x: json.dumps(x, sort_keys=True))
+    if isinstance(val, (str, int, float, bool)) or val is None:
+        return val
+    return str(val)
 
 op_name = {op_name!r}
 case_ids = {case_ids_json}
@@ -1471,25 +1831,21 @@ for cid_num in case_ids:
             exc,
         )
 
+tasks = []
+errors = []
+
 for idx, (cid, mod_path) in enumerate(cand_paths):
     try:
-        mod_name = f"_tf_warm_{{idx}}"
+        mod_name = f"_tf_warm_plan_{{idx}}"
         spec = importlib.util.spec_from_file_location(mod_name, mod_path)
         if spec is None or spec.loader is None:
             raise RuntimeError(f"Failed to load module spec from {{mod_path}}")
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
     except Exception as exc:
-        logger.warning(
-            "Prewarm module load skipped for candidate=%s (%s): %s: %s",
-            cid,
-            mod_path,
-            type(exc).__name__,
-            exc,
-        )
+        errors.append(f"candidate={{cid}} module_load_failed: {{type(exc).__name__}}: {{exc}}")
         continue
 
-    seen_keys = set()
     get_kernel_fn = getattr(mod, "_get_kernel", None)
     combine_fn = getattr(mod, "_get_combine_kernel", None)
 
@@ -1531,9 +1887,11 @@ for idx, (cid, mod_path) in enumerate(cand_paths):
                         ):
                             pool[str(sk)] = sv
             pool.update(resolved.builder_kwargs)
+            pc_safe = dict(resolved.pass_configs) if isinstance(resolved.pass_configs, dict) else {{}}
+            cf_list = [str(f) for f in resolved.compile_flags]
             pool["builder_fn"] = builder_fn
-            pool["pass_configs"] = dict(resolved.pass_configs)
-            pool["compile_flags"] = tuple(resolved.compile_flags)
+            pool["pass_configs"] = pc_safe
+            pool["compile_flags"] = tuple(cf_list)
             pool["extra_builder_kwargs"] = dict(raw_bk) if raw_bk else None
             pool["extra_combine_kwargs"] = dict(raw_ck) if raw_ck else None
 
@@ -1551,115 +1909,126 @@ for idx, (cid, mod_path) in enumerate(cand_paths):
                 )
                 if has_req:
                     gk_kwargs = _filter_callable_kwargs(get_kernel_fn, pool)
-                    sig_key = (
-                        "_get_kernel",
-                        resolved.builder_name,
-                        tuple(
-                            (k, _freeze(v))
-                            for k, v in sorted(gk_kwargs.items())
-                            if k != "builder_fn"
-                        ),
-                    )
-                    if sig_key not in seen_keys:
-                        seen_keys.add(sig_key)
-                        get_kernel_fn(**gk_kwargs)
+                    serial_gk = {{
+                        str(k): _json_safe(v)
+                        for k, v in sorted(gk_kwargs.items())
+                        if k != "builder_fn"
+                    }}
+                    tasks.append({{
+                        "candidate_id": cid,
+                        "case_num": int(cid_num),
+                        "mod_path": mod_path,
+                        "mode": "_get_kernel",
+                        "builder_name": resolved.builder_name,
+                        "kwargs": serial_gk,
+                        "pass_configs": _json_safe(pc_safe),
+                        "compile_flags": cf_list,
+                    }})
                     splits = int(pool.get("num_kv_splits", 1) or 1)
                     if splits > 1 and callable(combine_fn):
                         comb_kwargs = _filter_callable_kwargs(combine_fn, pool)
-                        comb_key = (
-                            "_get_combine_kernel",
-                            tuple((k, _freeze(v)) for k, v in sorted(comb_kwargs.items())),
-                        )
-                        if comb_key not in seen_keys:
-                            seen_keys.add(comb_key)
-                            combine_fn(**comb_kwargs)
+                        serial_comb = {{
+                            str(k): _json_safe(v)
+                            for k, v in sorted(comb_kwargs.items())
+                        }}
+                        tasks.append({{
+                            "candidate_id": cid,
+                            "case_num": int(cid_num),
+                            "mod_path": mod_path,
+                            "mode": "_get_combine_kernel",
+                            "builder_name": "_get_combine_kernel",
+                            "kwargs": serial_comb,
+                            "pass_configs": _json_safe(pc_safe),
+                            "compile_flags": cf_list,
+                        }})
                     used_get_kernel = True
 
             if not used_get_kernel:
                 generic_pool = dict(resolved.builder_kwargs)
                 generic_pool.update(raw_bk)
                 b_kwargs = _filter_callable_kwargs(builder_fn, generic_pool)
-                pc_dict = dict(resolved.pass_configs)
-                cf_tuple = tuple(resolved.compile_flags)
-                sig_key = (
-                    "generic",
-                    resolved.builder_name,
-                    tuple((k, _freeze(v)) for k, v in sorted(b_kwargs.items())),
-                    _freeze(pc_dict),
-                    cf_tuple,
-                )
-                if sig_key not in seen_keys:
-                    seen_keys.add(sig_key)
-                    prog = builder_fn(**b_kwargs)
-                    tilelang.compile(
-                        prog,
-                        target="ascend",
-                        pass_configs=pc_dict or None,
-                        compile_flags=list(cf_tuple) if cf_tuple else None,
-                    )
+                serial_bk = {{
+                    str(k): _json_safe(v)
+                    for k, v in sorted(b_kwargs.items())
+                }}
+                tasks.append({{
+                    "candidate_id": cid,
+                    "case_num": int(cid_num),
+                    "mod_path": mod_path,
+                    "mode": "generic",
+                    "builder_name": resolved.builder_name,
+                    "kwargs": serial_bk,
+                    "pass_configs": _json_safe(pc_safe),
+                    "compile_flags": cf_list,
+                }})
         except Exception as exc:
-            logger.warning(
-                "Prewarm compile skipped for candidate=%s case=%s: %s: %s",
-                cid,
-                cid_num,
-                type(exc).__name__,
-                exc,
+            errors.append(
+                f"candidate={{cid}} case={{cid_num}} plan_failed: {{type(exc).__name__}}: {{exc}}"
             )
+
+print(json.dumps({{"tasks": tasks, "errors": errors}}), flush=True)
 """
 
 
-def lookup_case_static_spec(
-    operator_name: str,
-    case_num: int,
-    *,
-    cannbench_repo: str | Path | None = None,
-    env_file: str | Path | None = None,
-) -> dict[str, object]:
-    """Read static dims, tl_dtype, and attributes directly from cases.yaml."""
-    repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
-    task = get_operator_task(operator_name)
-    cases_path = resolve_cannbench_tasks_root(repo) / task / "cases.yaml"
-    if not cases_path.is_file():
-        raise FileNotFoundError(f"cases.yaml not found at {cases_path}")
-    parsed = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
-    cases_list = parsed.get("cases") or []
-    target_id = int(case_num)
-    entry: Mapping[str, object] | None = None
-    for row in cases_list:
-        if isinstance(row, Mapping) and int(row.get("case_id", -1)) == target_id:
-            entry = row
-            break
-    if entry is None:
-        raise KeyError(f"case_num={target_id} missing in {cases_path}")
+_PREWARM_TL_WORKER_TEMPLATE = """import importlib.util
+import json
+import sys
+import tilelang
 
-    spec = lookup_case_dims(
-        operator_name,
-        target_id,
-        cannbench_repo=repo,
-        env_file=env_file,
+task = json.loads({task_json!r})
+spec = importlib.util.spec_from_file_location("_tf_warm_exec", task["mod_path"])
+if spec is None or spec.loader is None:
+    raise RuntimeError(f"Failed to load module spec from {{task['mod_path']}}")
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+mode = task["mode"]
+kwargs = dict(task["kwargs"])
+if mode == "_get_kernel":
+    fn = getattr(mod, "_get_kernel")
+    kwargs["builder_fn"] = getattr(mod, task["builder_name"])
+    if "compile_flags" in kwargs and isinstance(kwargs["compile_flags"], list):
+        kwargs["compile_flags"] = tuple(kwargs["compile_flags"])
+    fn(**kwargs)
+elif mode == "_get_combine_kernel":
+    fn = getattr(mod, "_get_combine_kernel")
+    if "compile_flags" in kwargs and isinstance(kwargs["compile_flags"], list):
+        kwargs["compile_flags"] = tuple(kwargs["compile_flags"])
+    fn(**kwargs)
+else:
+    builder_fn = getattr(mod, task["builder_name"])
+    prog = builder_fn(**kwargs)
+    pc_dict = task.get("pass_configs") or {{}}
+    cf_list = task.get("compile_flags") or []
+    tilelang.compile(
+        prog,
+        target="ascend",
+        pass_configs=pc_dict or None,
+        compile_flags=list(cf_list) if cf_list else None,
     )
-    raw_dtype = entry.get("dtype", "bfloat16")
-    if isinstance(raw_dtype, (list, tuple)):
-        tl_dtype = str(raw_dtype[0]) if raw_dtype else "bfloat16"
-    else:
-        tl_dtype = str(raw_dtype)
-    tl_dtype = tl_dtype.strip() or "bfloat16"
-    if tl_dtype.startswith("torch."):
-        tl_dtype = tl_dtype[len("torch.") :]
-    spec["tl_dtype"] = tl_dtype
-    if "inputLayout" in spec and "input_layout" not in spec:
-        spec["input_layout"] = str(spec["inputLayout"]).upper()
-    if "is_causal" in spec:
-        spec["is_causal"] = bool(spec["is_causal"])
-    if (
-        "B" in spec
-        and "S" in spec
-        and "m_rows" not in spec
-        and isinstance(spec["B"], int)
-        and isinstance(spec["S"], int)
-    ):
-        spec["m_rows"] = int(spec["B"]) * int(spec["S"])
-    return spec
+"""
+
+
+def _merge_prewarm_cache_tree(src_dir: Path, dst_dir: Path) -> None:
+    """Merge an isolated worker's TileLang cache outputs into the shared session cache."""
+    if not src_dir.is_dir():
+        return
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for item in sorted(src_dir.rglob("*")):
+        rel = item.relative_to(src_dir)
+        target = dst_dir / rel
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if item.name == "compiled_entries.jsonl" and target.is_file():
+            existing = target.read_text(encoding="utf-8")
+            addition = item.read_text(encoding="utf-8")
+            if existing and not existing.endswith("\n"):
+                existing += "\n"
+            target.write_text(existing + addition, encoding="utf-8")
+        elif not target.exists():
+            shutil.copy2(item, target)
 
 
 def prewarm_surrogate_tilelang_cache(
@@ -1674,7 +2043,7 @@ def prewarm_surrogate_tilelang_cache(
     source_root: str | Path | None = None,
     timeout_sec: int = 300,
 ) -> Path:
-    """Pre-compile candidate anchor kernels into TileLang disk cache on Host CPU."""
+    """Pre-compile deduplicated candidate anchor kernels into TileLang disk cache on Host CPU."""
     root = Path(source_root).resolve() if source_root is not None else default_source_root()
     repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
     resolved_ref_cache = Path(cache_dir) if cache_dir is not None else _default_surrogate_cache_dir()
@@ -1719,13 +2088,27 @@ def prewarm_surrogate_tilelang_cache(
         pp_parts.append(run_env["PYTHONPATH"])
     run_env["PYTHONPATH"] = os.pathsep.join(pp_parts)
 
+    need_cann_source = bool(
+        cann_setup and Path(cann_setup).is_file() and shutil.which("bisheng") is None
+    )
+
+    def _build_argv(script_path: Path) -> list[str]:
+        if need_cann_source:
+            bash_cmd = (
+                f"set +u && source {shlex.quote(cann_setup)} >/dev/null 2>&1 "
+                f"&& exec {shlex.quote(python_bin)} {shlex.quote(str(script_path))}"
+            )
+            return ["/bin/bash", "-c", bash_cmd]
+        return [python_bin, str(script_path)]
+
     case_ids = [int(a.case_num) for a in anchors]
     cand_paths = [(str(cid), str(Path(p).resolve())) for cid, p in candidates]
 
     with tempfile.TemporaryDirectory(prefix="tf_tl_prewarm_") as tmp_dir:
-        driver_path = Path(tmp_dir) / "prewarm_tl_driver.py"
-        driver_path.write_text(
-            _PREWARM_TL_DRIVER_TEMPLATE.format(
+        tmp_root = Path(tmp_dir)
+        plan_path = tmp_root / "prewarm_tl_plan.py"
+        plan_path.write_text(
+            _PREWARM_TL_PLAN_TEMPLATE.format(
                 ascend_target_dir=str(root / "targets" / "ascend"),
                 op_name=operator_name,
                 case_ids_json=json.dumps(case_ids),
@@ -1734,30 +2117,103 @@ def prewarm_surrogate_tilelang_cache(
             ),
             encoding="utf-8",
         )
-        if cann_setup and Path(cann_setup).is_file() and shutil.which("bisheng") is None:
-            bash_cmd = (
-                f"set +u && source {shlex.quote(cann_setup)} >/dev/null 2>&1 "
-                f"&& exec {shlex.quote(python_bin)} {shlex.quote(str(driver_path))}"
-            )
-            argv = ["/bin/bash", "-c", bash_cmd]
-        else:
-            argv = [python_bin, str(driver_path)]
-        proc = subprocess.run(
-            argv,
+        plan_proc = subprocess.run(
+            _build_argv(plan_path),
             text=True,
             capture_output=True,
             cwd=str(root),
             env=run_env,
             timeout=timeout_sec,
         )
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()[-1000:]
-        raise RuntimeError(f"prewarm_surrogate_tilelang_cache failed: {detail}")
-    if proc.stderr and proc.stderr.strip():
-        logging.getLogger(__name__).warning(
-            "prewarm_surrogate_tilelang_cache warnings: %s",
-            proc.stderr.strip()[-1000:],
-        )
+        if plan_proc.returncode != 0:
+            detail = (plan_proc.stderr or plan_proc.stdout or "").strip()[-1000:]
+            raise RuntimeError(f"prewarm_surrogate_tilelang_cache failed: {detail}")
+        if plan_proc.stderr and plan_proc.stderr.strip():
+            logging.getLogger(__name__).warning(
+                "prewarm_surrogate_tilelang_cache warnings: %s",
+                plan_proc.stderr.strip()[-1000:],
+            )
+
+        plan_payload = json.loads((plan_proc.stdout or "{}").strip().splitlines()[-1])
+        plan_errors = [str(e) for e in plan_payload.get("errors", ())]
+        if plan_errors:
+            raise RuntimeError(
+                f"prewarm_surrogate_tilelang_cache failed: {'; '.join(plan_errors)[:1000]}"
+            )
+
+        deduped_tasks: list[dict[str, object]] = []
+        seen_keys: set[tuple[str, str, tuple[str, ...]]] = set()
+        for task in plan_payload.get("tasks", ()):
+            if not isinstance(task, Mapping):
+                continue
+            builder_name = str(task.get("builder_name", ""))
+            canonical_kwargs_json = json.dumps(
+                {
+                    "mode": task.get("mode", ""),
+                    "kwargs": task.get("kwargs", {}),
+                    "pass_configs": task.get("pass_configs", {}),
+                },
+                sort_keys=True,
+            )
+            compile_flags = tuple(str(f) for f in (task.get("compile_flags") or ()))
+            dedup_key = (builder_name, canonical_kwargs_json, compile_flags)
+            if dedup_key in seen_keys:
+                continue
+            seen_keys.add(dedup_key)
+            deduped_tasks.append(dict(task))
+
+        if not deduped_tasks:
+            return resolved_tl_cache
+
+        def _compile_one(idx: int, task: dict[str, object]) -> tuple[int, Path]:
+            worker_dir = tmp_root / f"worker_{idx}"
+            worker_cache = worker_dir / "tl_cache"
+            worker_cache.mkdir(parents=True, exist_ok=True)
+            worker_script = worker_dir / "compile_task.py"
+            worker_script.write_text(
+                _PREWARM_TL_WORKER_TEMPLATE.format(task_json=json.dumps(task, sort_keys=True)),
+                encoding="utf-8",
+            )
+            worker_env = dict(run_env)
+            worker_env["TILELANG_CACHE_DIR"] = str(worker_cache)
+            proc = subprocess.run(
+                _build_argv(worker_script),
+                text=True,
+                capture_output=True,
+                cwd=str(root),
+                env=worker_env,
+                timeout=timeout_sec,
+            )
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip()[-800:]
+                raise RuntimeError(
+                    f"candidate={task.get('candidate_id')} case={task.get('case_num')} "
+                    f"builder={task.get('builder_name')}: {detail}"
+                )
+            return idx, worker_cache
+
+        max_workers = min(4, len(deduped_tasks))
+        compile_errors: list[str] = []
+        worker_caches: dict[int, Path] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(_compile_one, idx, task)
+                for idx, task in enumerate(deduped_tasks)
+            ]
+            for fut in futures:
+                try:
+                    idx, worker_cache = fut.result()
+                    worker_caches[idx] = worker_cache
+                except Exception as exc:
+                    compile_errors.append(str(exc))
+
+        if compile_errors:
+            raise RuntimeError(
+                f"prewarm_surrogate_tilelang_cache failed: {'; '.join(compile_errors)[:1000]}"
+            )
+        for idx in range(len(deduped_tasks)):
+            _merge_prewarm_cache_tree(worker_caches[idx], resolved_tl_cache)
+
     return resolved_tl_cache
 
 
@@ -3222,6 +3678,114 @@ def _l3_candidate_numeric_failure(
     return False
 
 
+_CANDIDATE_KERNEL_STAGES = frozenset({"kernel", "compile", "cache_idempotence"})
+_CANDIDATE_KERNEL_DETAIL_SIGNALS = (
+    "exceeded vf stack size",
+    "ascend compilation failed",
+    "bisheng",
+    "ld.lld",
+    "undefined symbol",
+    "tvmerror",
+    "l3 cache idempotence violation",
+    "syntaxerror",
+    "nameerror",
+    "typeerror",
+    "attributeerror",
+    "keyerror",
+    "valueerror",
+    "importerror",
+    "ub overflow",
+    "out of ubuf",
+    "kernel launch",
+)
+_INFRA_KERNEL_DETAIL_EXCLUDES = (
+    "device offline",
+    "device unavailable",
+    "npu-smi",
+    "drverror",
+    "e39999",
+    "ez9999",
+    "aclrtgetdevice",
+    "timeout",
+    "reference cache",
+    "no space left",
+    "permission denied",
+    "segmentation fault",
+    "bus error",
+)
+
+
+def _is_candidate_kernel_marker(
+    row: Mapping[str, object],
+    *,
+    node_records: Mapping[str, Mapping[str, object]],
+) -> bool:
+    role = str(row.get("role") or "").strip().lower()
+    if role == "baseline":
+        return False
+    stage = str(row.get("stage") or "").strip().lower()
+    if stage not in _CANDIDATE_KERNEL_STAGES:
+        return False
+    node_name = row.get("node")
+    if not isinstance(node_name, str) or not node_name:
+        return False
+    node = node_records.get(node_name)
+    if not isinstance(node, Mapping):
+        return False
+    if str(node.get("status") or "").strip().lower() not in {"failed", "error"}:
+        return False
+    case_id = row.get("case")
+    if case_id is not None:
+        cases = node.get("cases")
+        if (
+            not isinstance(cases, Mapping)
+            or str(cases.get(str(case_id)) or "").strip().lower() not in {"failed", "error"}
+        ):
+            return False
+    detail_text = f"{row.get('exceptionType') or ''} {row.get('detail') or ''}".lower()
+    if any(excl in detail_text for excl in _INFRA_KERNEL_DETAIL_EXCLUDES):
+        return False
+    kind = str(row.get("kind") or "").strip().lower()
+    if kind == "candidate" and (role == "candidate" or stage in {"kernel", "compile"}):
+        return True
+    return any(sig in detail_text for sig in _CANDIDATE_KERNEL_DETAIL_SIGNALS)
+
+
+def _l3_candidate_kernel_failure(
+    structured: Mapping[str, object],
+    evidence: Mapping[str, object],
+    raw_category: str,
+) -> bool:
+    """Return True when L3 evidence unambiguously binds a candidate compile/kernel failure."""
+    if raw_category not in {"candidate", "infrastructure", "environment"}:
+        return False
+    rows: list[Mapping[str, object]] = []
+    raw_failures = evidence.get("failures")
+    if isinstance(raw_failures, Sequence) and not isinstance(raw_failures, (str, bytes)):
+        for item in raw_failures:
+            if isinstance(item, Mapping):
+                rows.append(item)
+    if not rows:
+        rows.append(structured)
+    nodes = evidence.get("nodes")
+    if not isinstance(nodes, Sequence) or isinstance(nodes, (str, bytes)):
+        return False
+    node_records = {
+        str(node.get("name")): node
+        for node in nodes
+        if isinstance(node, Mapping) and node.get("name")
+    }
+    matched = False
+    for row in rows:
+        if _is_candidate_kernel_marker(row, node_records=node_records):
+            matched = True
+            continue
+        kind = str(row.get("kind") or "").strip().lower()
+        if kind in {"infrastructure", "coverage"}:
+            return False
+    return matched
+
+
 def _l3_failure_kind(
     observation: Mapping[str, object],
     evidence: Mapping[str, object],
@@ -3250,11 +3814,27 @@ def _l3_failure_kind(
     phase = str(evidence.get("phase") or "").strip().lower()
     if phase != "finished":
         return FAILURE_KIND_INFRASTRUCTURE
+    timing = evidence.get("timing")
+    if isinstance(timing, Mapping) and not timing.get("finishedAt"):
+        return FAILURE_KIND_INFRASTRUCTURE
+    interpreter = evidence.get("interpreter")
+    if isinstance(interpreter, Mapping) and interpreter.get("match") is False:
+        return FAILURE_KIND_INFRASTRUCTURE
+    ref_cache = evidence.get("referenceCache")
+    if isinstance(ref_cache, Mapping):
+        if ref_cache.get("errors"):
+            return FAILURE_KIND_INFRASTRUCTURE
+        if ref_cache.get("required") is True and ref_cache.get("usable") is False:
+            return FAILURE_KIND_INFRASTRUCTURE
+    if isinstance(coverage, Mapping) and coverage.get("referenceCacheProblem"):
+        return FAILURE_KIND_INFRASTRUCTURE
     raw = _l3_signed_failure_category(observation, evidence)
     structured = _l3_structured_failure(observation, evidence)
     if structured is None:
         return FAILURE_KIND_INFRASTRUCTURE
     if _l3_candidate_numeric_failure(structured, evidence, raw):
+        return FAILURE_KIND_CANDIDATE
+    if _l3_candidate_kernel_failure(structured, evidence, raw):
         return FAILURE_KIND_CANDIDATE
     return FAILURE_KIND_INFRASTRUCTURE
 
