@@ -23,6 +23,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TypeVar
 
+import yaml
+
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
     AnchorCaseSpec,
     CannbenchOpSpec,
@@ -42,6 +44,7 @@ from tilefoundry_ascend.agent.campaign.anchor_specs import (
     get_input_domain_envelope,
     get_operator_entrypoint,
     get_operator_module_relpath,
+    get_operator_task,
     lookup_case_dims,
     lookup_case_metadata,
     parse_simple_env_file,
@@ -152,6 +155,12 @@ from tilefoundry_ascend.ascend.cost_model import (
     HybridAscendCostModel,
     build_cost_features_from_ledger,
 )
+from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import (
+    CostGateDecision,
+    CostModelMode,
+    evaluate_cost_gate_policy,
+    is_paradigm_shift_exempt,
+)
 from tilefoundry_ascend.ascend.cost_model.experience_lake import (
     CandidateArtifactRecord,
     CaseObservationRecord,
@@ -248,6 +257,26 @@ class CampaignConfig:
     round_regime_tags: tuple[str, ...] = ()
     allow_unreviewed_distilled_rules: bool = False
     pure_golden: bool = False
+    cost_model_mode: str = "auto"
+    cost_disengage_eta: float = 0.65
+    cost_slow_gain_threshold: float = 0.03
+
+
+LAUNCH_FLOOR_US: dict[str, float] = {
+    "tilelang_dsl": 2.2,
+    "ascendc_trackb": 1.4,
+    "hybrid_trackb": 1.4,
+}
+ABS_JITTER_FLOOR_US: float = 0.35
+
+
+def _launch_floor_us_for_backend(runtime_backend: str) -> float:
+    norm = normalize_runtime_backend(runtime_backend)
+    if norm in LAUNCH_FLOOR_US:
+        return LAUNCH_FLOOR_US[norm]
+    if norm in ("ascendc_template", "ascendc", "cce_trackb"):
+        return 1.4
+    return 2.2
 
 
 def _should_trigger_p2_deep_dive(
@@ -377,6 +406,11 @@ class CampaignRoundRecord:
     pruned_rule_ids: tuple[str, ...] = ()
     promotion_attempts: tuple[dict[str, str], ...] = ()
     trackb_evidence: tuple[dict[str, object], ...] = ()
+    cost_model_mode: str = "auto"
+    cost_model_engaged: bool = False
+    cost_model_reason: str = ""
+    local_rel_gain: float = 0.0
+    tail_guard_reject_reason: str = ""
 
     def to_dict(self) -> dict[str, object]:
         """Serialize CampaignRoundRecord into a JSON-compatible dictionary."""
@@ -399,6 +433,11 @@ class CampaignRoundRecord:
             "pruned_rule_ids": list(self.pruned_rule_ids),
             "promotion_attempts": [dict(item) for item in self.promotion_attempts],
             "trackb_evidence": [dict(item) for item in self.trackb_evidence],
+            "cost_model_mode": self.cost_model_mode,
+            "cost_model_engaged": self.cost_model_engaged,
+            "cost_model_reason": self.cost_model_reason,
+            "local_rel_gain": round(self.local_rel_gain, 6),
+            "tail_guard_reject_reason": self.tail_guard_reject_reason,
         }
 
     @classmethod
@@ -437,6 +476,11 @@ class CampaignRoundRecord:
                 for item in payload.get("trackb_evidence", ())
                 if isinstance(item, Mapping)
             ),
+            cost_model_mode=str(payload.get("cost_model_mode", "auto") or "auto"),
+            cost_model_engaged=bool(payload.get("cost_model_engaged", False)),
+            cost_model_reason=str(payload.get("cost_model_reason", "") or ""),
+            local_rel_gain=float(payload.get("local_rel_gain", 0.0) or 0.0),
+            tail_guard_reject_reason=str(payload.get("tail_guard_reject_reason", "") or ""),
         )
 
 
@@ -815,6 +859,26 @@ def _load_module_and_run_selector(
     pass_configs: dict[str, object] = {}
     compile_flags: list[str] = []
     combine_kwargs: dict[str, object] = {}
+
+    def _absorb_pass_configs(raw_pc: object) -> None:
+        if isinstance(raw_pc, Mapping):
+            for k, v in raw_pc.items():
+                if str(k) == "tl.device_compile_flags":
+                    for fl in _norm_flag_seq(v):
+                        if fl not in compile_flags:
+                            compile_flags.append(fl)
+                else:
+                    pass_configs[str(k)] = v
+        elif raw_pc is not None:
+            for fl in _norm_flag_seq(raw_pc):
+                if fl not in compile_flags:
+                    compile_flags.append(fl)
+
+    _absorb_pass_configs(context.pop("pass_configs", None))
+    for fl in _norm_flag_seq(context.pop("compile_flags", None)):
+        if fl not in compile_flags:
+            compile_flags.append(fl)
+
     selector_name = regime_spec.config_selector_fn
     if not (selector_name and callable(getattr(mod, selector_name, None))):
         for cand_sym in regime_spec.editable_symbols:
@@ -826,19 +890,7 @@ def _load_module_and_run_selector(
         sel_args = _filter_callable_kwargs(selector_fn, context)
         sel_out = selector_fn(**sel_args)
         if isinstance(sel_out, Mapping):
-            raw_pc = sel_out.get("pass_configs")
-            if isinstance(raw_pc, Mapping):
-                for k, v in raw_pc.items():
-                    if str(k) == "tl.device_compile_flags":
-                        for fl in _norm_flag_seq(v):
-                            if fl not in compile_flags:
-                                compile_flags.append(fl)
-                    else:
-                        pass_configs[str(k)] = v
-            elif raw_pc is not None:
-                for fl in _norm_flag_seq(raw_pc):
-                    if fl not in compile_flags:
-                        compile_flags.append(fl)
+            _absorb_pass_configs(sel_out.get("pass_configs"))
             for fl in _norm_flag_seq(sel_out.get("compile_flags")):
                 if fl not in compile_flags:
                     compile_flags.append(fl)
@@ -1026,10 +1078,21 @@ def _strip_trackb_patch_hunks(patch_text: str) -> str:
 
 def _looks_like_bare_trackb_cpp(candidate_text: str) -> bool:
     """Return True when a Track-B reply carries bare C++ units rather than Python."""
+    if _parses_as_python(candidate_text):
+        return False
     if re.search(r"(?m)^\s*(?:async\s+)?def\s+", candidate_text):
         return False
+    if "<<<<<<< SEARCH" in candidate_text or (
+        "=======" in candidate_text and ">>>>>>> REPLACE" in candidate_text
+    ):
+        return False
     _, units = _split_cpp_units(candidate_text)
-    return any(unit.kind in ("kernel", "helper") and unit.name for unit in units)
+    if any(unit.kind in ("kernel", "helper") and unit.name for unit in units):
+        return True
+    return bool(
+        re.search(r"(?m)^\s*#include\b", candidate_text)
+        or re.search(r"(?m)^\s*(?:static\s+inline|constexpr)\b", candidate_text)
+    )
 
 
 def _parses_as_python(candidate_text: str) -> bool:
@@ -1181,6 +1244,40 @@ def _launched_trackb_kernels(
         {name for _depth, name in launches},
         {name for depth, name in launches if depth == shallowest},
     )
+
+
+def _ordered_top_level_trackb_kernels(
+    instantiated_tu: str,
+    raw_cpp_source: str,
+    kernels: set[str],
+) -> tuple[str, ...]:
+    """Return distinct top-level launched ``__global__`` kernels in launch order."""
+    masked = strip_cpp_comments_and_strings(instantiated_tu)
+    regions = (
+        [masked[len(raw_cpp_source) :], masked]
+        if instantiated_tu.startswith(raw_cpp_source) and len(instantiated_tu) > len(raw_cpp_source)
+        else [masked]
+    )
+    for launch_region in regions:
+        launches: list[tuple[int, str]] = []
+        depth = 0
+        scanned = 0
+        for match in _LAUNCH_CONFIG_RE.finditer(launch_region):
+            depth += launch_region.count("{", scanned, match.start()) - launch_region.count(
+                "}", scanned, match.start()
+            )
+            scanned = match.start()
+            name = match.group(1)
+            if name in kernels:
+                launches.append((depth, name))
+        if launches:
+            shallowest = min(depth for depth, _name in launches)
+            ordered: list[str] = []
+            for depth, name in launches:
+                if depth == shallowest and name not in ordered:
+                    ordered.append(name)
+            return tuple(ordered)
+    return ()
 
 
 def _trackb_kernel_names(cpp_source: str) -> set[str]:
@@ -1399,6 +1496,12 @@ def extract_regime_snippet(
 
     seed_names = [sym.name for sym in seed_symbols]
     seed_name_set = set(seed_names)
+    ws_planner_names = {"_plan_workspace_bytes", f"_{regime_spec.regime_tag}_plan_workspace_bytes"}
+    for sym in symbols:
+        if sym.name in ws_planner_names and sym.name not in seed_name_set:
+            seed_symbols.append(sym)
+            seed_names.append(sym.name)
+            seed_name_set.add(sym.name)
     closure_helpers: set[str] = set()
     if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
         excluded = _other_regime_forbidden_symbols(
@@ -2122,11 +2225,12 @@ def patch_regime_into_module(
         seed_roots=active_seed_roots,
     )
 
+    ws_planner_names = {"_plan_workspace_bytes", f"_{regime_spec.regime_tag}_plan_workspace_bytes"}
     for sym in cand_symbols:
         name = sym.name
         if name in forbidden:
             raise ValueError(f"Candidate cannot define or modify protected symbol {name!r}.")
-        if name in editable_set:
+        if name in editable_set or name in ws_planner_names:
             continue
         if (prefix and name.startswith(prefix)) or name.startswith(cow_prefix):
             continue
@@ -2150,7 +2254,7 @@ def patch_regime_into_module(
         for sym in cand_symbols
     }
 
-    active_own_symbols = set(editable_set) | {
+    active_own_symbols = set(editable_set) | ws_planner_names | {
         sym.name
         for sym in orig_symbols
         if (prefix and sym.name.startswith(prefix)) or sym.name.startswith(cow_prefix)
@@ -2264,11 +2368,15 @@ def patch_regime_into_module(
         for name in merged_ast_by_name
         if name not in prunable_orig_helpers and name not in prunable_cand_cow
     ]
+    for ws_name in ws_planner_names:
+        if ws_name in merged_ast_by_name and ws_name not in seed_roots:
+            seed_roots.append(ws_name)
     live_helpers = _collect_referenced_helper_names(
         merged_ast_by_name,
         helper_names=all_helper_names,
         seed_roots=seed_roots,
     )
+    live_helpers.update(ws_planner_names & set(merged_ast_by_name))
 
     new_helper_names = [
         name
@@ -2625,6 +2733,8 @@ class PerfTargetCampaignRunner:
         self._pending_promotion: PendingPromotion | None = None
         self._active_promotion: PendingPromotion | None = None
         self._pending_l4: PendingL4 | None = None
+        self._last_local_rel_gain_by_regime: dict[str, float] = {}
+        self._last_tail_guard_reject_reason: str = ""
         if (
             self._flywheel is not None
             and self._flywheel._probe_runner is None
@@ -3253,6 +3363,25 @@ class PerfTargetCampaignRunner:
             require_renderer=False,
         )
 
+    def _resolve_active_trackb_kernels(
+        self,
+        module_source: str,
+        regime_spec: RegimeTargetSpec,
+    ) -> tuple[str, ...]:
+        """Resolve ordered active Track-B ``__global__`` kernels for single or multi-stage TUs."""
+        if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
+            return ()
+        extracted = _extract_trackb_cpp_source(module_source, regime_spec)
+        if extracted is None:
+            return ()
+        rendered = self._instantiate_trackb_tu(module_source, extracted[1], regime_spec)
+        kernels = _trackb_kernel_names(extracted[1])
+        ordered = _ordered_top_level_trackb_kernels(rendered, extracted[1], kernels)
+        if ordered:
+            return ordered
+        single = self._resolve_active_trackb_kernel(module_source, regime_spec)
+        return (single,) if single else ()
+
     def _resolve_active_trackb_kernel(
         self,
         module_source: str,
@@ -3260,9 +3389,8 @@ class PerfTargetCampaignRunner:
     ) -> str | None:
         """Resolve the launched Track-B kernel from instantiation truth, else the raw TU.
 
-        A pass-through renderer leaves the launcher inside Python, so the raw
-        translation unit is scanned for the kernel the module starts instead of
-        demanding a C++ launcher stub it never had.
+        Supports ordered dual-stage/multi-stage ``__global__`` launches without
+        breaking single-stage resolution.
         """
         if regime_spec.runtime_backend not in ("ascendc_trackb", "hybrid_trackb"):
             return None
@@ -3285,12 +3413,28 @@ class PerfTargetCampaignRunner:
                     )
                 self._active_kernel_cache[cache_key] = fallback
             else:
-                self._active_kernel_cache[cache_key] = _active_trackb_kernel(
-                    rendered,
-                    extracted[1],
-                    regime_tag=regime_spec.regime_tag,
-                    module_source=module_source,
-                )
+                try:
+                    self._active_kernel_cache[cache_key] = _active_trackb_kernel(
+                        rendered,
+                        extracted[1],
+                        regime_tag=regime_spec.regime_tag,
+                        module_source=module_source,
+                    )
+                except ValueError as exc:
+                    if "no unique top-level launch target" not in str(exc):
+                        raise
+                    kernels = _trackb_kernel_names(extracted[1])
+                    ordered = _ordered_top_level_trackb_kernels(rendered, extracted[1], kernels)
+                    if not ordered:
+                        raise
+                    tagged = select_active_trackb_kernel(
+                        extracted[1],
+                        regime_tag=regime_spec.regime_tag,
+                        module_source=module_source,
+                    )
+                    self._active_kernel_cache[cache_key] = (
+                        tagged if tagged in ordered else ordered[0]
+                    )
         return self._active_kernel_cache[cache_key]
 
     def _resolve_trackb_freedom_mask(
@@ -3615,6 +3759,79 @@ class PerfTargetCampaignRunner:
             return self._l0_checker(module_source, regime_spec)
         return self._default_l0_checker(module_source, regime_spec)
 
+    def _resolve_max_row_width_dims(
+        self,
+        regime_spec: RegimeTargetSpec,
+    ) -> dict[str, object] | None:
+        """Return the largest-row-width / hidden-dim case dims known for this operator."""
+        candidates: list[dict[str, object]] = []
+        tasks_root = self._resolve_cannbench_tasks_root()
+        if tasks_root is not None:
+            try:
+                task = get_operator_task(self._config.operator_name)
+                cases_path = tasks_root / task / "cases.yaml"
+                if cases_path.is_file():
+                    parsed = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
+                    for row in parsed.get("cases") or ():
+                        if isinstance(row, Mapping) and row.get("case_id") is not None:
+                            cnum = int(row["case_id"])
+                            dims = self._lookup_case_dims_safe(cnum, regime_spec.regime_tag)
+                            if dims:
+                                candidates.append(dict(dims))
+            except (FileNotFoundError, KeyError, OSError, ValueError, TypeError):
+                pass
+        for anc in self._initial_anchors:
+            dims = self._lookup_case_dims_safe(int(anc.case_num), anc.regime_tag)
+            if dims:
+                candidates.append(dict(dims))
+        for spec in self._regime_specs:
+            rep = spec.representative_anchor_dims or spec.representative_hir_dims
+            if rep:
+                candidates.append(dict(rep))
+        if not candidates:
+            return None
+
+        row_width_keys = (
+            "D",
+            "d_dim",
+            "K",
+            "N",
+            "hidden_dim",
+            "d_nope",
+            "d_rope",
+            "inner",
+            "inner_dim",
+            "S",
+            "s_dim",
+            "seq_len",
+        )
+
+        def _row_width_score(dims: Mapping[str, object]) -> tuple[int, int]:
+            width = 1
+            has_width_key = False
+            for key in row_width_keys:
+                val = dims.get(key)
+                if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+                    width *= val
+                    has_width_key = True
+            total_prod = 1
+            for val in dims.values():
+                if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+                    total_prod *= val
+            return (width if has_width_key else total_prod, total_prod)
+
+        return max(candidates, key=_row_width_score)
+
+    @staticmethod
+    def _has_vf_stack_overflow(stage_b: StageBResult) -> bool:
+        if not stage_b.passed:
+            diag = f"{stage_b.error_message}\n{stage_b.full_diagnostic}".lower()
+            if "exceeded vf stack size" in diag or "vf_stack" in diag or "stack" in diag:
+                return True
+        if stage_b.compiler_summary is not None and int(stage_b.compiler_summary.stack_bytes) > 0:
+            return True
+        return False
+
     def _run_l1(self, module_source: str, regime_spec: RegimeTargetSpec) -> StageBResult:
         if self._l1_compiler is not None:
             return self._l1_compiler(module_source, regime_spec)
@@ -3628,9 +3845,45 @@ class PerfTargetCampaignRunner:
                 module_source, tb_extracted[1], regime_spec
             )
             sel_flags = self._resolve_trackb_selector_flags(module_source, regime_spec)
-            if sel_flags:
-                return self._compile_trackb_stage_b(instantiated_tu, selector_flags=sel_flags)
-            return self._compile_trackb_stage_b(instantiated_tu)
+            tb_res = (
+                self._compile_trackb_stage_b(instantiated_tu, selector_flags=sel_flags)
+                if sel_flags
+                else self._compile_trackb_stage_b(instantiated_tu)
+            )
+            uses_unreserved_ubuf = any(
+                "--cce-disable-vf-stack-reserved-ubuf" in str(fl) for fl in sel_flags
+            )
+            if tb_res.passed and uses_unreserved_ubuf:
+                max_dims = self._resolve_max_row_width_dims(regime_spec)
+                anchor_dims = (
+                    regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+                )
+                if max_dims and max_dims != dict(anchor_dims or {}):
+                    max_spec = replace(regime_spec, representative_anchor_dims=dict(max_dims))
+                    max_tu = self._instantiate_trackb_tu(module_source, tb_extracted[1], max_spec)
+                    max_flags = self._resolve_trackb_selector_flags(module_source, max_spec)
+                    max_b = (
+                        self._compile_trackb_stage_b(max_tu, selector_flags=max_flags)
+                        if max_flags
+                        else self._compile_trackb_stage_b(max_tu)
+                    )
+                    if not max_b.passed or self._has_vf_stack_overflow(max_b):
+                        stack_bytes = (
+                            int(max_b.compiler_summary.stack_bytes)
+                            if max_b.compiler_summary is not None
+                            else 0
+                        )
+                        return StageBResult(
+                            passed=False,
+                            error_message=(
+                                f"stage_b_max_row_width_vf_stack_overflow: stack_bytes={stack_bytes} "
+                                f"({max_b.error_message})"
+                            ),
+                            full_diagnostic=max_b.full_diagnostic,
+                            compiler_summary=max_b.compiler_summary,
+                            elapsed_sec=tb_res.elapsed_sec + max_b.elapsed_sec,
+                        )
+            return tb_res
 
         anchor_dims = (
             regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
@@ -3678,6 +3931,52 @@ class PerfTargetCampaignRunner:
                 return self._compile_trackb_stage_b(instantiated_tu)
             return primary_b
         final_b = primary_b
+        uses_unreserved_ubuf = any(
+            "--cce-disable-vf-stack-reserved-ubuf" in str(fl) for fl in resolved.compile_flags
+        )
+        if uses_unreserved_ubuf:
+            max_dims = self._resolve_max_row_width_dims(regime_spec)
+            if max_dims and max_dims != dict(anchor_dims or {}):
+                try:
+                    max_resolved = resolve_regime_config(module_source, regime_spec, dims=max_dims)
+                except (
+                    SyntaxError,
+                    AttributeError,
+                    ImportError,
+                    KeyError,
+                    NameError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ):
+                    max_resolved = resolved
+                max_b = run_l1_compile_check(
+                    module_source,
+                    builder_name=max_resolved.builder_name,
+                    builder_kwargs=max_resolved.builder_kwargs,
+                    config_selector_name=regime_spec.config_selector_fn or None,
+                    pass_configs=max_resolved.pass_configs or None,
+                    compile_flags=max_resolved.compile_flags or None,
+                    dims=max_dims,
+                    source_root=self._source_root,
+                    env_file=self._env_file,
+                )
+                if not max_b.passed or self._has_vf_stack_overflow(max_b):
+                    stack_bytes = (
+                        int(max_b.compiler_summary.stack_bytes)
+                        if max_b.compiler_summary is not None
+                        else 0
+                    )
+                    return StageBResult(
+                        passed=False,
+                        error_message=(
+                            f"stage_b_max_row_width_vf_stack_overflow: stack_bytes={stack_bytes} "
+                            f"({max_b.error_message})"
+                        ),
+                        full_diagnostic=max_b.full_diagnostic,
+                        compiler_summary=max_b.compiler_summary,
+                        elapsed_sec=final_b.elapsed_sec + max_b.elapsed_sec,
+                    )
         combine_elapsed_sec = 0.0
         combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
         if combine_spec is not None:
@@ -3799,6 +4098,62 @@ class PerfTargetCampaignRunner:
                 return None
         return l2_results.get(candidate_id)
 
+    @staticmethod
+    def _regime_closure_ast_hash(
+        module_source: str,
+        spec: RegimeTargetSpec,
+        *,
+        operator_entrypoint: str = "",
+        sibling_specs: Sequence[RegimeTargetSpec] = (),
+    ) -> str | None:
+        """Compute canonical AST+Track-B-TU hash for one regime's reachable closure."""
+        try:
+            _primary, snippet = extract_regime_snippet(
+                module_source,
+                spec,
+                operator_entrypoint=operator_entrypoint,
+                sibling_specs=sibling_specs,
+            )
+            tree = ast.parse(snippet)
+        except (SyntaxError, ValueError):
+            return None
+        from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
+            _normalized_module_ast_signature,
+        )  # noqa: PLC0415
+
+        _ = tree
+        return _normalized_module_ast_signature(snippet)
+
+    def _unchanged_sibling_regimes(
+        self,
+        incumbent_src: str,
+        candidate_src: str,
+        active_regime_spec: RegimeTargetSpec,
+    ) -> set[str]:
+        """Return sibling regime tags whose Python AST + Track-B TU closure is unchanged."""
+        if not incumbent_src.strip() or not candidate_src.strip():
+            return set()
+        op_entry = _resolve_operator_entrypoint_safe(self._config.operator_name)
+        unchanged: set[str] = set()
+        for spec in self._regime_specs:
+            if spec.regime_tag == active_regime_spec.regime_tag:
+                continue
+            inc_hash = self._regime_closure_ast_hash(
+                incumbent_src,
+                spec,
+                operator_entrypoint=op_entry,
+                sibling_specs=self._regime_specs,
+            )
+            cand_hash = self._regime_closure_ast_hash(
+                candidate_src,
+                spec,
+                operator_entrypoint=op_entry,
+                sibling_specs=self._regime_specs,
+            )
+            if inc_hash is not None and cand_hash is not None and inc_hash == cand_hash:
+                unchanged.add(spec.regime_tag)
+        return unchanged
+
     def _evaluate_dual_layer_tail_guard(
         self,
         *,
@@ -3808,8 +4163,10 @@ class PerfTargetCampaignRunner:
         best_result: CandidateSurrogateResult,
         regime_spec: RegimeTargetSpec,
         active_anchors: Sequence[AnchorCaseSpec],
+        incumbent_source: str = "",
     ) -> tuple[bool, CandidateSurrogateResult]:
-        """Enforce active-regime tail floor and 0.98x untouched-sibling guard."""
+        """Enforce active-regime tail floor and 0.98x changed-sibling guard with noise floor."""
+        self._last_tail_guard_reject_reason = ""
         top_local = top_res.for_regime(regime_spec.regime_tag)
         best_local = best_result.for_regime(regime_spec.regime_tag)
         if top_local.anchors and best_local.anchors:
@@ -3819,6 +4176,7 @@ class PerfTargetCampaignRunner:
         else:
             active_tail_ok = top_res.min_case_speedup >= 0.97 * best_result.min_case_speedup
         if not active_tail_ok:
+            self._last_tail_guard_reject_reason = "active_tail_regression"
             return False, top_res
 
         def _has_promotion_gain(cand_res: CandidateSurrogateResult) -> bool:
@@ -3843,20 +4201,51 @@ class PerfTargetCampaignRunner:
                     )
                 )
             )
-            return global_gain_ok or local_gain_ok
+            progressive_gain_ok = False
+            if cand_local.anchors and best_local.anchors:
+                cand_lat = cand_local.mean_latency_us()
+                best_lat = best_local.mean_latency_us()
+                cand_local_rel = max(
+                    (cand_local.avg_speedup - best_local.avg_speedup)
+                    / max(best_local.avg_speedup, 1e-6),
+                    (
+                        (best_lat - cand_lat) / max(best_lat, 1e-6)
+                        if (cand_lat > 0.0 and best_lat > 0.0)
+                        else 0.0
+                    ),
+                )
+                progressive_gain_ok = (
+                    cand_local_rel >= self._config.min_l2_gain_for_l3
+                    and surrogate_gain > 0.02
+                )
+            return global_gain_ok or local_gain_ok or progressive_gain_ok
 
+        eff_incumbent = incumbent_source or self._active_incumbent_source
+        unchanged_siblings = (
+            self._unchanged_sibling_regimes(eff_incumbent, candidate_source, regime_spec)
+            if eff_incumbent and eff_incumbent != candidate_source
+            else set()
+        )
         best_by_case = {int(a.case_num): a for a in best_result.anchors}
         dipped_siblings: list[tuple[AnchorEvalMetrics, AnchorEvalMetrics]] = []
         for cand_anchor in top_res.anchors:
             if cand_anchor.regime_tag == regime_spec.regime_tag:
                 continue
+            if cand_anchor.regime_tag in unchanged_siblings:
+                continue
             best_anchor = best_by_case.get(int(cand_anchor.case_num))
             if best_anchor is None:
                 continue
-            if cand_anchor.speedup < 0.98 * best_anchor.speedup:
+            if (
+                cand_anchor.speedup < 0.98 * best_anchor.speedup
+                and cand_anchor.cand_us > 0.0
+                and best_anchor.cand_us > 0.0
+                and cand_anchor.cand_us > best_anchor.cand_us * 1.02 + ABS_JITTER_FLOOR_US
+            ):
                 dipped_siblings.append((cand_anchor, best_anchor))
 
         if len(dipped_siblings) >= 2:
+            self._last_tail_guard_reject_reason = "multi_sibling_regression"
             return False, top_res
 
         updated_top_res = top_res
@@ -3869,6 +4258,7 @@ class PerfTargetCampaignRunner:
                     and top_local.avg_speedup >= 1.02 * best_local.avg_speedup
                 )
             ):
+                self._last_tail_guard_reject_reason = "insufficient_gain"
                 return False, top_res
             dipped_cand_anchor, dipped_best_anchor = dipped_siblings[0]
             anchor_spec_by_case = {int(a.case_num): a for a in active_anchors}
@@ -3885,6 +4275,7 @@ class PerfTargetCampaignRunner:
                 candidate_id, candidate_source, dipped_spec
             )
             if recheck_res is None or not recheck_res.all_passed:
+                self._last_tail_guard_reject_reason = "recheck_failed"
                 return False, top_res
             recheck_anchor = next(
                 (
@@ -3894,11 +4285,19 @@ class PerfTargetCampaignRunner:
                 ),
                 None,
             )
-            if (
+            recheck_regressed = (
                 recheck_anchor is None
                 or not recheck_anchor.accuracy_passed
-                or recheck_anchor.speedup < 0.98 * dipped_best_anchor.speedup
-            ):
+                or (
+                    recheck_anchor.speedup < 0.98 * dipped_best_anchor.speedup
+                    and recheck_anchor.cand_us > 0.0
+                    and dipped_best_anchor.cand_us > 0.0
+                    and recheck_anchor.cand_us
+                    > dipped_best_anchor.cand_us * 1.02 + ABS_JITTER_FLOOR_US
+                )
+            )
+            if recheck_regressed:
+                self._last_tail_guard_reject_reason = "recheck_failed"
                 return False, top_res
             merged_anchors = tuple(
                 recheck_anchor
@@ -3913,7 +4312,10 @@ class PerfTargetCampaignRunner:
                 error_message=top_res.error_message,
             )
 
-        return _has_promotion_gain(updated_top_res), updated_top_res
+        if not _has_promotion_gain(updated_top_res):
+            self._last_tail_guard_reject_reason = "insufficient_gain"
+            return False, updated_top_res
+        return True, updated_top_res
 
     def _run_l3_contract(
         self,
@@ -4038,6 +4440,26 @@ class PerfTargetCampaignRunner:
             return None
         return next(spec for spec in self._regime_specs if spec.regime_tag == tag)
 
+    @staticmethod
+    def _regime_mean_recoverable_excess_us(
+        best_result: CandidateSurrogateResult,
+        regime_spec: RegimeTargetSpec,
+    ) -> float | None:
+        """Compute mean recoverable pure-silicon excess (us) above launch floor for a regime."""
+        matched = [
+            a
+            for a in best_result.anchors
+            if a.regime_tag == regime_spec.regime_tag and a.cand_us > 0.0
+        ]
+        if not matched:
+            return None
+        floor_us = _launch_floor_us_for_backend(regime_spec.runtime_backend)
+        excesses = [
+            max(0.0, float(a.cand_us) - max(floor_us, float(a.t_hw_us)))
+            for a in matched
+        ]
+        return sum(excesses) / len(excesses)
+
     def _select_active_regime(
         self,
         current_regime: str | None,
@@ -4063,9 +4485,14 @@ class PerfTargetCampaignRunner:
             return None
         if exclude_regime and any(spec.regime_tag != exclude_regime for spec in candidates):
             candidates = [spec for spec in candidates if spec.regime_tag != exclude_regime]
-        candidates.sort(
-            key=lambda s: (-best_result.regime_headroom(s.regime_tag), s.regime_tag),
-        )
+
+        def _urgency_key(spec: RegimeTargetSpec) -> tuple[int, float, float, str]:
+            rec = self._regime_mean_recoverable_excess_us(best_result, spec)
+            has_excess = 1 if (rec is None or rec > 0.0) else 0
+            rec_val = float(rec) if rec is not None else 0.0
+            return (-has_excess, -best_result.regime_headroom(spec.regime_tag), -rec_val, spec.regime_tag)
+
+        candidates.sort(key=_urgency_key)
         top_spec = candidates[0]
         candidate_tags = {spec.regime_tag for spec in candidates}
         if current_regime and current_regime in candidate_tags and current_regime in by_tag:
@@ -4076,9 +4503,21 @@ class PerfTargetCampaignRunner:
         return top_spec
 
     @staticmethod
-    def _slice_contract_instruction(func_name: str, regime_spec: RegimeTargetSpec) -> str:
+    def _slice_contract_instruction(
+        func_name: str,
+        regime_spec: RegimeTargetSpec,
+        *,
+        operator_entrypoint: str = "",
+    ) -> str:
+        kernel_name_warning = ""
+        if operator_entrypoint == "kernel":
+            kernel_name_warning = (
+                " CRITICAL: the public operator entrypoint is named 'kernel', so you MUST NOT "
+                "define a top-level '@T.prim_func def kernel' or 'def kernel'; name any inner "
+                "prim_func differently (e.g., '_ar_kernel_impl') and return it from the builder."
+            )
         if not regime_spec.editable_symbols:
-            return f"function '{func_name}'"
+            return f"function '{func_name}'{kernel_name_warning}"
         syms = ", ".join(regime_spec.editable_symbols)
         helper_note = (
             f" or '{regime_spec.allowed_helper_prefix}*' helpers"
@@ -4091,7 +4530,7 @@ class PerfTargetCampaignRunner:
             "(e.g., just _select_*_config, a single helper macro, or one builder); omitted "
             "sibling symbols in this regime automatically inherit their parent implementation. "
             f"Preserve exact public entrypoint '{func_name}' and `kernel = {func_name}` without "
-            "renaming or modifying symbols from other regimes"
+            f"renaming or modifying symbols from other regimes{kernel_name_warning}"
         )
 
     @staticmethod
@@ -4882,7 +5321,14 @@ class PerfTargetCampaignRunner:
             focus_lines=focus_lines,
             diagnostic_text=diag_text,
         )
-        slice_desc = self._slice_contract_instruction(func_name, regime_spec)
+        op_entry = _resolve_operator_entrypoint_safe(
+            str(getattr(getattr(self, "_config", None), "operator_name", "") or "")
+        )
+        slice_desc = self._slice_contract_instruction(
+            func_name,
+            regime_spec,
+            operator_entrypoint=op_entry,
+        )
         esc_tier, hotpath_section = self._format_trackb_hotpath_section(
             regime_spec,
             active_kernel=active_kernel,
@@ -5002,7 +5448,14 @@ class PerfTargetCampaignRunner:
             focus_lines=focus_lines,
             diagnostic_text=diag_text,
         )
-        slice_desc = self._slice_contract_instruction(func_name, regime_spec)
+        op_entry = _resolve_operator_entrypoint_safe(
+            str(getattr(getattr(self, "_config", None), "operator_name", "") or "")
+        )
+        slice_desc = self._slice_contract_instruction(
+            func_name,
+            regime_spec,
+            operator_entrypoint=op_entry,
+        )
         esc_tier, hotpath_section = self._format_trackb_hotpath_section(
             regime_spec,
             active_kernel=active_kernel,
@@ -5259,6 +5712,9 @@ class PerfTargetCampaignRunner:
                 }
         self._restore_diag_stats(payload.get("stagnation_diagnosis_stats"))
         rounds = [CampaignRoundRecord.from_dict(r) for r in payload.get("rounds", ())]
+        self._last_local_rel_gain_by_regime = {}
+        for rec in rounds:
+            self._last_local_rel_gain_by_regime[rec.regime_tag] = float(rec.local_rel_gain)
         raw_stag_map = payload.get("stagnation_by_regime")
         if isinstance(raw_stag_map, Mapping):
             stagnation_by_regime = {str(k): int(v) for k, v in raw_stag_map.items()}
@@ -7021,6 +7477,22 @@ class PerfTargetCampaignRunner:
 
         regime_best = best_result.for_regime(regime_spec.regime_tag)
         local_best = regime_best if regime_best.anchors else best_result
+        prev_local_rel_gain = self._last_local_rel_gain_by_regime.get(regime_spec.regime_tag)
+        mean_recoverable_excess_us = self._regime_mean_recoverable_excess_us(
+            best_result, regime_spec
+        )
+        gate_decision = evaluate_cost_gate_policy(
+            mode=self._config.cost_model_mode,
+            enable_prescreen_flag=bool(self._config.enable_tilesize_prescreen),
+            round_idx=round_idx,
+            stagnation_rounds=stagnation_rounds,
+            incumbent_roofline_eta=float(local_best.avg_roofline_eta),
+            target_roofline_eta=float(self._perf_target.target_roofline_eta),
+            prev_local_rel_gain=prev_local_rel_gain,
+            mean_recoverable_excess_us=mean_recoverable_excess_us,
+            disengage_roofline_eta=float(self._config.cost_disengage_eta),
+            slow_gain_threshold=float(self._config.cost_slow_gain_threshold),
+        )
         parent_axes = self._derive_topology_axes(
             parent_ledger,
             features=parent_features,
@@ -7159,6 +7631,13 @@ class PerfTargetCampaignRunner:
                 **_case_ratio_predicate_entries(regime_spec.representative_case_ratios),
             },
         )
+        if not gate_decision.engaged:
+            ctx["use_uncalibrated_analytical"] = False
+            if parent_l1_summary is None and not cached_parent_msprof:
+                ctx["scalar_compute_loop_fallback"] = 0.0
+                extra_sig_map = ctx.get("extra_signals")
+                if isinstance(extra_sig_map, dict):
+                    extra_sig_map.pop("scalar_compute_loop_fallback", None)
         ranked_families = rank_symptom_families(ctx)
         parent_p2_diag: dict[str, object] | None = None
         if _should_trigger_p2_deep_dive(stagnation_rounds, ranked_families):
@@ -7316,6 +7795,36 @@ class PerfTargetCampaignRunner:
                 symptom_ranking=ranked_families,
             )
         )
+        bp_semantics = getattr(blueprint, "semantics", None)
+        op_semantics_for_shift = self._resolve_operator_semantics_for_gates()
+        has_recurrent_loop = bool(
+            getattr(bp_semantics, "has_recurrent_loop", False)
+            or getattr(op_semantics_for_shift, "has_recurrent_loop", False)
+        )
+        if (
+            stagnation_rounds >= 2
+            and float(local_best.avg_roofline_eta) < 0.15
+            and has_recurrent_loop
+        ):
+            coupled_axes = replace(parent_axes, compute_engine="coupled_1c2v")
+            shift_rules = list(
+                self._tracker.rank_applicable_rules(
+                    ctx,
+                    top_k=max(1, self._config.k_rule_workers),
+                    topology_axes=coupled_axes,
+                    operator_name=self._config.operator_name,
+                    runtime_backend=regime_spec.runtime_backend,
+                    regime_tag=regime_spec.regime_tag,
+                    parent_sha=parent_sha,
+                    current_round=round_idx,
+                    symptom_ranking=ranked_families,
+                )
+            )
+            seen_rule_ids = {r.rule_id for r in ranked_rules}
+            for srule in shift_rules:
+                if srule.rule_id not in seen_rule_ids:
+                    ranked_rules.append(srule)
+                    seen_rule_ids.add(srule.rule_id)
 
         worker_specs: list[tuple[str, str, AscendCausalRule | None, GenerationRequest]] = []
         for idx, rule in enumerate(ranked_rules[: self._config.k_rule_workers]):
@@ -7345,7 +7854,7 @@ class PerfTargetCampaignRunner:
             ranked_rules,
             regime_beam.exploited_signatures,
         )
-        if self._config.enable_tilesize_prescreen:
+        if gate_decision.engaged and gate_decision.allow_prompt_guidance:
             anchor_dims = (
                 regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
             )
@@ -7516,7 +8025,12 @@ class PerfTargetCampaignRunner:
         round_active_kernel = ""
         if raw_candidates:
             prescreen_top_k: int | None = None
-            if self._config.enable_tilesize_prescreen:
+            stage_a_ranker = None
+            parent_analytical_us: float | None = None
+            score_stage_a_analytical_fn: (
+                Callable[[str, str, StageAResult], float] | None
+            ) = None
+            if gate_decision.engaged and gate_decision.allow_candidate_pruning:
                 if (
                     self._config.cost_prescreen_top_k is not None
                     and int(self._config.cost_prescreen_top_k) > 0
@@ -7524,52 +8038,55 @@ class PerfTargetCampaignRunner:
                     prescreen_top_k = int(self._config.cost_prescreen_top_k)
                 elif self._config.cost_prescreen_top_k is None and len(raw_candidates) >= 3:
                     prescreen_top_k = 2
-            stage_a_ranker = (
-                (
-                    lambda passers: [
-                        (item.candidate_id, item.pred_us)
-                        for item in rank_stage_a_candidates_with_cost_model(
-                            passers,
-                            cost_model=self._cost_model,
-                            live_plan=live_plan,
-                            axes=parent_axes,
-                            blueprint=blueprint,
-                            sil_advisory=self._sil_advisory,
-                            parent_ledger=parent_ledger,
-                        )
-                    ]
+                stage_a_ranker = (
+                    (
+                        lambda passers: [
+                            (item.candidate_id, item.pred_us)
+                            for item in rank_stage_a_candidates_with_cost_model(
+                                passers,
+                                cost_model=self._cost_model,
+                                live_plan=live_plan,
+                                axes=parent_axes,
+                                blueprint=blueprint,
+                                sil_advisory=self._sil_advisory,
+                                parent_ledger=parent_ledger,
+                            )
+                        ]
+                    )
+                    if prescreen_top_k is not None
+                    else None
                 )
-                if prescreen_top_k is not None
-                else None
-            )
+                parent_l0_pred = self._cost_model.predict(parent_workload, bisheng_res=None)
+                raw_parent_analytical_us = float(parent_l0_pred.tier0_physics_us) + float(
+                    parent_l0_pred.tier1_penalty_us
+                )
+                parent_analytical_us = (
+                    raw_parent_analytical_us if raw_parent_analytical_us > 0.0 else None
+                )
+
+                def _score_stage_a_analytical(
+                    _cid: str,
+                    _patched_src: str,
+                    stage_a: StageAResult,
+                ) -> float:
+                    features = build_cost_features_from_ledger(
+                        stage_a.ledger,
+                        live_plan=live_plan,
+                        axes=parent_axes,
+                        blueprint=blueprint,
+                        sil_advisory=self._sil_advisory,
+                        target=self._cost_model.target,
+                    )
+                    pred = self._cost_model.predict(features)
+                    return float(pred.tier0_physics_us) + float(pred.tier1_penalty_us)
+
+                score_stage_a_analytical_fn = _score_stage_a_analytical
+
             creative_candidate_ids = {
                 cid
                 for cid, _ in raw_candidates
                 if meta_by_id[cid][0] == "creative_explore"
             }
-            parent_l0_pred = self._cost_model.predict(parent_workload, bisheng_res=None)
-            raw_parent_analytical_us = float(parent_l0_pred.tier0_physics_us) + float(
-                parent_l0_pred.tier1_penalty_us
-            )
-            parent_analytical_us = (
-                raw_parent_analytical_us if raw_parent_analytical_us > 0.0 else None
-            )
-
-            def _score_stage_a_analytical(
-                _cid: str,
-                _patched_src: str,
-                stage_a: StageAResult,
-            ) -> float:
-                features = build_cost_features_from_ledger(
-                    stage_a.ledger,
-                    live_plan=live_plan,
-                    axes=parent_axes,
-                    blueprint=blueprint,
-                    sil_advisory=self._sil_advisory,
-                    target=self._cost_model.target,
-                )
-                pred = self._cost_model.predict(features)
-                return float(pred.tier0_physics_us) + float(pred.tier1_penalty_us)
 
             def _candidate_l0_check(mod_src: str) -> StageAResult:
                 dead_err = _detect_trackb_dead_code_edit(
@@ -7617,14 +8134,14 @@ class PerfTargetCampaignRunner:
                 if isinstance(rendered_probe, str) and sentinel in rendered_probe:
                     trackb_prologue_line_offset = rendered_probe.split(sentinel, 1)[0].count("\n")
 
+            op_entry = _resolve_operator_entrypoint_safe(self._config.operator_name)
+
             def _patch_against(base_mod_src: str, snip: str) -> str:
                 return patch_regime_into_module(
                     base_mod_src,
                     regime_spec,
                     snip,
-                    operator_entrypoint=_resolve_operator_entrypoint_safe(
-                        self._config.operator_name
-                    ),
+                    operator_entrypoint=op_entry,
                     sibling_specs=self._regime_specs,
                     active_kernel=round_active_kernel,
                 )
@@ -7639,12 +8156,18 @@ class PerfTargetCampaignRunner:
                 l1_compiler=lambda mod_src: self._run_l1(mod_src, regime_spec),
                 repair_backend=backend if self._config.max_syntax_repairs > 0 else None,
                 max_syntax_repairs=self._config.max_syntax_repairs,
-                slice_hint=self._slice_contract_instruction(func_name, regime_spec),
+                slice_hint=self._slice_contract_instruction(
+                    func_name,
+                    regime_spec,
+                    operator_entrypoint=op_entry,
+                ),
                 backend_kind=regime_spec.runtime_backend,
                 parent_source=repair_parent_source,
+                parent_module_source=parent_module_source,
                 trackb_prologue_line_offset=trackb_prologue_line_offset,
                 stage_a_cost_ranker=stage_a_ranker,
                 cost_prescreen_top_k=prescreen_top_k,
+                cost_coarse_reject_ratio=float(gate_decision.coarse_reject_ratio),
                 sil_advisory=self._sil_advisory,
                 freedom_mask=active_mask,
                 ub_256kb_unlock=(
@@ -7652,7 +8175,15 @@ class PerfTargetCampaignRunner:
                 ),
                 creative_candidate_ids=creative_candidate_ids,
                 parent_analytical_us=parent_analytical_us,
-                stage_a_analytical_scorer=_score_stage_a_analytical,
+                stage_a_analytical_scorer=score_stage_a_analytical_fn,
+                parent_topology_axes=parent_axes,
+                candidate_topology_axes_fn=lambda _mod_src, sa: self._derive_topology_axes(
+                    sa.ledger,
+                    features=sa.features,
+                    route=sa.route,
+                )
+                if sa.ledger is not None
+                else None,
             )
 
         passed_checks = [chk for chk in l0_l1_checks if chk.passed]
@@ -7730,12 +8261,14 @@ class PerfTargetCampaignRunner:
         local_rel_gain = 0.0
         stagnation_after = stagnation_rounds + 1
         promotion_attempts: tuple[dict[str, str], ...] = ()
+        tail_guard_reject_reason = ""
 
         if passing_candidates:
             top_chk, top_res = max(
                 passing_candidates,
                 key=lambda item: _surrogate_rank_key(item[1]),
             )
+            self._last_tail_guard_reject_reason = ""
             tail_guard_ok, top_res = self._evaluate_dual_layer_tail_guard(
                 candidate_id=top_chk.candidate_id,
                 candidate_source=top_chk.patched_module_source,
@@ -7743,7 +8276,10 @@ class PerfTargetCampaignRunner:
                 best_result=best_result,
                 regime_spec=regime_spec,
                 active_anchors=active_anchors,
+                incumbent_source=incumbent_source,
             )
+            if not tail_guard_ok:
+                tail_guard_reject_reason = self._last_tail_guard_reject_reason or "tail_guard_rejected"
             best_round_speedup = top_res.avg_speedup
             best_round_surrogate_score = top_res.surrogate_score
             rel_gain = (
@@ -8349,6 +8885,7 @@ class PerfTargetCampaignRunner:
             parent_l1_summary=parent_l1_summary,
             parent_l1_summary_source=parent_l1_summary_source,
         )
+        self._last_local_rel_gain_by_regime[regime_spec.regime_tag] = float(local_rel_gain)
         record = CampaignRoundRecord(
             round_idx=round_idx,
             regime_tag=regime_spec.regime_tag,
@@ -8368,6 +8905,11 @@ class PerfTargetCampaignRunner:
             pruned_rule_ids=pruned_rules,
             promotion_attempts=promotion_attempts,
             trackb_evidence=trackb_evidence,
+            cost_model_mode=str(gate_decision.mode),
+            cost_model_engaged=bool(gate_decision.engaged),
+            cost_model_reason=str(gate_decision.reason),
+            local_rel_gain=float(local_rel_gain),
+            tail_guard_reject_reason=tail_guard_reject_reason,
         )
         return (
             record,
@@ -8911,6 +9453,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Keep only the top-K cost-model candidates during creative prescreen.",
     )
     parser.add_argument(
+        "--cost-model-mode",
+        choices=("auto", "coarse_only", "off"),
+        default="auto",
+        help="Cost model prescreen gate policy mode.",
+    )
+    parser.add_argument(
+        "--cost-disengage-eta",
+        type=float,
+        default=0.65,
+        help="Roofline eta threshold above which cost model auto-disengages.",
+    )
+    parser.add_argument(
+        "--cost-slow-gain-threshold",
+        type=float,
+        default=0.03,
+        help="Local relative gain threshold below which cost model disengages when eta >= disengage_eta.",
+    )
+    parser.add_argument(
         "--pure-golden",
         action="store_true",
         help="Disable authored/scheduled HIR paths and synthesize blueprints strictly from golden.py.",
@@ -8936,6 +9496,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         cost_prescreen_top_k=(
             int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
         ),
+        cost_model_mode=str(args.cost_model_mode),
+        cost_disengage_eta=float(args.cost_disengage_eta),
+        cost_slow_gain_threshold=float(args.cost_slow_gain_threshold),
         pure_golden=bool(args.pure_golden),
     )
     tracker = BayesianRuleTracker.from_seed_yaml()

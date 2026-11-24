@@ -89,6 +89,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Keep only the top-K cost-model candidates during creative prescreen.",
     )
+    parser.add_argument(
+        "--cost-model-mode",
+        choices=("auto", "coarse_only", "off"),
+        default="auto",
+        help="Cost model prescreen gate policy mode.",
+    )
+    parser.add_argument(
+        "--cost-disengage-eta",
+        type=float,
+        default=0.65,
+        help="Roofline eta threshold above which cost model auto-disengages.",
+    )
+    parser.add_argument(
+        "--cost-slow-gain-threshold",
+        type=float,
+        default=0.03,
+        help="Local relative gain threshold below which cost model disengages when eta >= disengage_eta.",
+    )
     return parser
 
 
@@ -160,6 +178,9 @@ def main(argv: list[str] | None = None) -> int:
         cost_prescreen_top_k=(
             int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
         ),
+        cost_model_mode=str(args.cost_model_mode),
+        cost_disengage_eta=float(args.cost_disengage_eta),
+        cost_slow_gain_threshold=float(args.cost_slow_gain_threshold),
     )
     tracker = BayesianRuleTracker.from_seed_yaml()
     flywheel = FlywheelDistiller(
