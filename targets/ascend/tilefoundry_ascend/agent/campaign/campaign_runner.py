@@ -411,6 +411,8 @@ class CampaignRoundRecord:
     cost_model_reason: str = ""
     local_rel_gain: float = 0.0
     tail_guard_reject_reason: str = ""
+    paradigm_shift_active: bool = False
+    paradigm_shift_rule_ids: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         """Serialize CampaignRoundRecord into a JSON-compatible dictionary."""
@@ -438,6 +440,8 @@ class CampaignRoundRecord:
             "cost_model_reason": self.cost_model_reason,
             "local_rel_gain": round(self.local_rel_gain, 6),
             "tail_guard_reject_reason": self.tail_guard_reject_reason,
+            "paradigm_shift_active": bool(self.paradigm_shift_active),
+            "paradigm_shift_rule_ids": list(self.paradigm_shift_rule_ids),
         }
 
     @classmethod
@@ -481,7 +485,29 @@ class CampaignRoundRecord:
             cost_model_reason=str(payload.get("cost_model_reason", "") or ""),
             local_rel_gain=float(payload.get("local_rel_gain", 0.0) or 0.0),
             tail_guard_reject_reason=str(payload.get("tail_guard_reject_reason", "") or ""),
+            paradigm_shift_active=bool(payload.get("paradigm_shift_active", False)),
+            paradigm_shift_rule_ids=tuple(
+                str(x) for x in payload.get("paradigm_shift_rule_ids", ())
+            ),
         )
+
+
+def _interleave_paradigm_shift_rules(
+    base_rules: Sequence[AscendCausalRule],
+    shift_rules: Sequence[AscendCausalRule],
+) -> list[AscendCausalRule]:
+    """Interleave cross-topology shift rules ahead of same-topology tie-breaks."""
+    merged: list[AscendCausalRule] = []
+    seen_ids: set[str] = set()
+    for idx in range(max(len(base_rules), len(shift_rules))):
+        for seq in (shift_rules, base_rules):
+            if idx >= len(seq):
+                continue
+            rule = seq[idx]
+            if rule.rule_id not in seen_ids:
+                merged.append(rule)
+                seen_ids.add(rule.rule_id)
+    return merged
 
 
 @dataclass(frozen=True)
@@ -5441,6 +5467,7 @@ class PerfTargetCampaignRunner:
         parent_hypothesis: str = "",
         sil_policy_section: str = "",
         p2_diag: Mapping[str, object] | None = None,
+        paradigm_shift: bool = False,
     ) -> GenerationRequest:
         module_source = incumbent_source or snippet_source
         active_kernel = self._resolve_active_trackb_kernel(module_source, regime_spec)
@@ -5536,8 +5563,17 @@ class PerfTargetCampaignRunner:
             if incumbent_source
             else golden_abi_block
         )
+        shift_section = (
+            "### PARADIGM SHIFT CROSS-TOPOLOGY UNLOCK\n"
+            "Cross-topology paradigm shift active (full_slice_rewrite authorized): "
+            "CostModel prescreen is disengaged; explore coupled_1c2v AIC+AIV chunked "
+            "GEMM, multi-stage GM workspace, or multi-core tiling across the regime slice.\n\n"
+            if paradigm_shift
+            else ""
+        )
         user_prompt = (
             f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
+            f"{shift_section}"
             f"{hotpath_section}"
             f"{track_section}"
             f"{sil_policy_section}"
@@ -5559,6 +5595,7 @@ class PerfTargetCampaignRunner:
             user_prompt=user_prompt,
             json_schema=None,
             effort=effort,
+            paradigm_shift=bool(paradigm_shift),
         )
 
     def _evaluate_single_baseline(
@@ -7807,11 +7844,13 @@ class PerfTargetCampaignRunner:
             getattr(bp_semantics, "has_recurrent_loop", False)
             or getattr(op_semantics_for_shift, "has_recurrent_loop", False)
         )
-        if (
+        paradigm_shift_active = bool(
             stagnation_rounds >= 2
             and float(local_best.avg_roofline_eta) < 0.15
             and has_recurrent_loop
-        ):
+        )
+        shift_rule_id_set: set[str] = set()
+        if paradigm_shift_active:
             coupled_axes = replace(parent_axes, compute_engine="coupled_1c2v")
             shift_rules = list(
                 self._tracker.rank_applicable_rules(
@@ -7826,14 +7865,15 @@ class PerfTargetCampaignRunner:
                     symptom_ranking=ranked_families,
                 )
             )
-            seen_rule_ids = {r.rule_id for r in ranked_rules}
-            for srule in shift_rules:
-                if srule.rule_id not in seen_rule_ids:
-                    ranked_rules.append(srule)
-                    seen_rule_ids.add(srule.rule_id)
+            shift_rule_id_set = {r.rule_id for r in shift_rules}
+            ranked_rules = _interleave_paradigm_shift_rules(ranked_rules, shift_rules)
 
+        selected_rules = ranked_rules[: self._config.k_rule_workers]
+        dispatched_shift_rule_ids = tuple(
+            r.rule_id for r in selected_rules if r.rule_id in shift_rule_id_set
+        )
         worker_specs: list[tuple[str, str, AscendCausalRule | None, GenerationRequest]] = []
-        for idx, rule in enumerate(ranked_rules[: self._config.k_rule_workers]):
+        for idx, rule in enumerate(selected_rules):
             worker_specs.append(
                 (
                     f"r{round_idx}_rule_{idx}",
@@ -7947,6 +7987,7 @@ class PerfTargetCampaignRunner:
                         parent_hypothesis=selected_stone_hypothesis,
                         sil_policy_section=sil_policy_section,
                         p2_diag=parent_p2_diag,
+                        paradigm_shift=paradigm_shift_active,
                     ),
                 )
             )
@@ -8922,6 +8963,8 @@ class PerfTargetCampaignRunner:
             cost_model_reason=str(gate_decision.reason),
             local_rel_gain=float(local_rel_gain),
             tail_guard_reject_reason=tail_guard_reject_reason,
+            paradigm_shift_active=paradigm_shift_active,
+            paradigm_shift_rule_ids=dispatched_shift_rule_ids,
         )
         return (
             record,

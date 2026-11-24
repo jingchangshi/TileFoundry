@@ -1041,3 +1041,213 @@ def kernel(x):
         admitted_rule_ids=[],
     )
     assert "coupled_1c2v" in seen_rank_axes
+
+
+@pytest.mark.anyio
+async def test_paradigm_shift_interleaves_coupled_1c2v_rules_before_k_slice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify coupled_1c2v shift rules survive slicing and wire creative paradigm_shift."""
+    from tilefoundry_ascend.agent.kb.schema import AscendCausalRule, SymptomFamily
+    from tilefoundry_ascend.agent.orchestrator.llm_client import (
+        GenerationRequest,
+        _is_paradigm_shift_request,
+    )
+    from tilefoundry_ascend.agent.router.capability_gate import route_execution_track
+    from tilefoundry_ascend.ascend.passes.physical_ledger import build_objective_physical_ledger
+
+    mod_src = '''
+def _build_small():
+    return 1
+
+def _build_large():
+    return 2
+
+def kernel(x):
+    return x
+'''
+    runner = _make_dummy_runner(tmp_path)
+    runner._target_module_path.write_text(mod_src, encoding="utf-8")
+
+    captured_requests: list[GenerationRequest] = []
+
+    class _SpyLLM:
+        async def generate(
+            self,
+            req: GenerationRequest,
+            *,
+            effort_override: object = None,
+        ) -> str:
+            _ = effort_override
+            captured_requests.append(req)
+            if req.role == "explore_creative":
+                return json.dumps(
+                    {
+                        "physical_hypothesis": "Cross-topology rewrite",
+                        "target_local_metric": "aic_aiv",
+                        "dsl_source": "def _build_small():\n    return 2\n",
+                    }
+                )
+            return "def _build_small():\n    return 3\n"
+
+    runner._backend = _SpyLLM()
+    ledger = build_objective_physical_ledger(
+        analysis_mode="readonly_envelope",
+        is_legal=True,
+        steady_state_ii=10,
+        pipe_cycles={"AIV0.PIPE_V": 10},
+        waterlines={},
+        grid_blocks=16,
+        wave_occupancy=0.5,
+    )
+    route = route_execution_track(None, ledger=ledger)
+    runner._l0_checker = lambda _src, _reg: StageAResult(
+        passed=True,
+        prim_func=None,
+        ledger=ledger,
+        features=route.features,
+        route=route,
+    )
+    runner._l1_compiler = lambda _src, _reg: StageBResult(passed=True)
+
+    aiv_r0 = AscendCausalRule(
+        rule_id="R08_AIV",
+        regime_guard="True",
+        precondition="True",
+        transform_template="AIV_PRIMARY_MARKER",
+        expected_postcondition="True",
+        source_provenance="test",
+    )
+    aiv_r1 = AscendCausalRule(
+        rule_id="R11_AIV",
+        regime_guard="True",
+        precondition="True",
+        transform_template="AIV_SECOND_MARKER",
+        expected_postcondition="True",
+        source_provenance="test",
+    )
+    coupled_r0 = AscendCausalRule(
+        rule_id="R01_SHIFT",
+        regime_guard="True",
+        precondition="True",
+        transform_template="COUPLED_SHIFT_PRIMARY_MARKER",
+        expected_postcondition="True",
+        source_provenance="test",
+    )
+    coupled_r1 = AscendCausalRule(
+        rule_id="R02_SHIFT",
+        regime_guard="True",
+        precondition="True",
+        transform_template="COUPLED_SHIFT_SECOND_MARKER",
+        expected_postcondition="True",
+        source_provenance="test",
+    )
+
+    def _fake_rank_rules(*_args: object, **kwargs: object) -> list[AscendCausalRule]:
+        axes = kwargs.get("topology_axes")
+        if axes is not None and getattr(axes, "compute_engine", "") == "coupled_1c2v":
+            return [coupled_r0, coupled_r1]
+        return [aiv_r0, aiv_r1]
+
+    class _RecurrentSemantics:
+        has_recurrent_loop = True
+
+    async def _empty_filter(
+        _candidates: Sequence[tuple[str, str]],
+        **_kwargs: object,
+    ) -> list[surrogate_cannbench.L0L1CandidateCheck]:
+        return []
+
+    monkeypatch.setattr(
+        campaign_runner,
+        "rank_symptom_families",
+        lambda _ctx: [(next(iter(SymptomFamily)), 1.0)],
+    )
+    monkeypatch.setattr(runner._tracker, "rank_applicable_rules", _fake_rank_rules)
+    monkeypatch.setattr(campaign_runner, "run_l0_l1_round_filter", _empty_filter)
+    monkeypatch.setattr(campaign_runner, "scan_tilelang_pipe_gaps", lambda: None)
+    from tilefoundry_ascend.agent.orchestrator import llm_constraints
+
+    monkeypatch.setattr(llm_constraints, "format_target_dialect_layer", lambda *_a, **_kw: "")
+    monkeypatch.setattr(runner, "_collect_msprof_for_regimes", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner, "_resolve_operator_semantics_for_gates", lambda: _RecurrentSemantics())
+
+    low_eta_result = surrogate_cannbench.CandidateSurrogateResult(
+        candidate_id="base",
+        operator_name="rms_norm",
+        all_passed=True,
+        avg_speedup=1.0,
+        min_case_speedup=1.0,
+        avg_roofline_eta=0.05,
+        surrogate_score=1.0,
+        anchors=(
+            surrogate_cannbench.AnchorEvalMetrics(
+                case_num=0,
+                regime_tag="small",
+                accuracy_passed=True,
+                cand_us=10.0,
+                ref_perf_us=10.0,
+                t_hw_us=1.0,
+                speedup=1.0,
+                roofline_eta=0.05,
+                eq3_score=1.0,
+            ),
+        ),
+    )
+    rec, *_rest = await runner._execute_single_round(
+        round_idx=3,
+        regime_spec=runner._regime_specs[0],
+        incumbent_source=mod_src,
+        best_result=low_eta_result,
+        active_anchors=runner._initial_anchors[:1],
+        stagnation_rounds=2,
+        admitted_rule_ids=[],
+    )
+
+    assert rec.paradigm_shift_active is True
+    assert rec.paradigm_shift_rule_ids == ("R01_SHIFT",)
+    exploit_reqs = [req for req in captured_requests if req.role == "exploit_rule"]
+    creative_reqs = [req for req in captured_requests if req.role == "explore_creative"]
+    assert len(exploit_reqs) == 2
+    assert any("R01_SHIFT" in req.user_prompt for req in exploit_reqs)
+    assert any("R08_AIV" in req.user_prompt for req in exploit_reqs)
+    assert not any("R11_AIV" in req.user_prompt for req in exploit_reqs)
+    assert len(creative_reqs) == 1
+    assert creative_reqs[0].paradigm_shift is True
+    assert _is_paradigm_shift_request(creative_reqs[0]) is True
+    assert "### PARADIGM SHIFT CROSS-TOPOLOGY UNLOCK" in creative_reqs[0].user_prompt
+
+
+def test_campaign_round_record_paradigm_shift_roundtrip() -> None:
+    """Verify CampaignRoundRecord preserves paradigm shift fields with legacy defaults."""
+    rec = campaign_runner.CampaignRoundRecord(
+        round_idx=6,
+        regime_tag="reduce_strided",
+        builder_name="build_kda",
+        parent_lane="stepping_stone",
+        creative_effort="high",
+        l0_l1_passed_ids=(),
+        l0_l1_failed=(),
+        best_round_speedup=0.04,
+        best_so_far_speedup=0.04,
+        promoted=False,
+        rolled_back_l3=False,
+        stagnation_rounds_after=3,
+        paradigm_shift_active=True,
+        paradigm_shift_rule_ids=("R01", "R03"),
+    )
+    encoded = rec.to_dict()
+    assert encoded["paradigm_shift_active"] is True
+    assert encoded["paradigm_shift_rule_ids"] == ["R01", "R03"]
+
+    decoded = campaign_runner.CampaignRoundRecord.from_dict(encoded)
+    assert decoded.paradigm_shift_active is True
+    assert decoded.paradigm_shift_rule_ids == ("R01", "R03")
+
+    legacy_payload = dict(encoded)
+    legacy_payload.pop("paradigm_shift_active", None)
+    legacy_payload.pop("paradigm_shift_rule_ids", None)
+    legacy_decoded = campaign_runner.CampaignRoundRecord.from_dict(legacy_payload)
+    assert legacy_decoded.paradigm_shift_active is False
+    assert legacy_decoded.paradigm_shift_rule_ids == ()
