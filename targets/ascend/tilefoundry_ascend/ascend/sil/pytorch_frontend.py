@@ -244,6 +244,7 @@ class PyTorchOpSemantics:
     has_conv: bool = False
     transcendental_op_count: int = 0
     has_gemm_contraction: bool | None = None
+    has_associative_outer_recurrence: bool = False
 
     def __post_init__(self) -> None:
         if not self.entry_name.strip():
@@ -1274,6 +1275,81 @@ def _einsum_is_gemm_contraction(call_node: ast.Call) -> bool:
     return bool((a0 & a1) - out) and bool((a0 - a1) & out) and bool((a1 - a0) & out)
 
 
+_NONLINEAR_STATE_WRAPPERS = frozenset(
+    {"tanh", "sigmoid", "relu", "gelu", "silu", "softmax", "exp", "rsqrt"}
+)
+
+
+def _loop_has_linear_outer_state_recurrence(nodes: Sequence[ast.AST]) -> bool:
+    """Detect loop-carried linear state updates with bilinear outer-product terms.
+
+    Matches any loop body updating a state variable via additive accumulation
+    combined with a rank-expanding bilinear product (unsqueeze multiply, outer,
+    einsum, or matmul/vec-mat projection) without nonlinear state wrapping.
+    """
+    for node in nodes:
+        if not isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            continue
+        body_nodes = [sub for stmt in node.body for sub in ast.walk(stmt)]
+        has_additive_carry = any(
+            isinstance(sub, ast.AugAssign) and isinstance(sub.op, (ast.Add, ast.Sub))
+            for sub in body_nodes
+        ) or any(
+            isinstance(sub, ast.Assign)
+            and any(isinstance(op, (ast.Add, ast.Sub)) for op in ast.walk(sub.value))
+            for sub in body_nodes
+        )
+        if not has_additive_carry:
+            continue
+        loop_calls = {
+            name
+            for sub in body_nodes
+            if isinstance(sub, ast.Call)
+            and (name := _call_leaf_name(sub.func)) is not None
+        }
+        has_bilinear_term = (
+            any(isinstance(sub, ast.MatMult) for sub in body_nodes)
+            or bool(loop_calls & {"outer", "einsum", "matmul", "bmm", "mm", "addmm"})
+            or (
+                "unsqueeze" in loop_calls
+                and any(
+                    isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Mult)
+                    for sub in body_nodes
+                )
+            )
+        )
+        if not has_bilinear_term:
+            continue
+        state_wrapped_nonlinear = False
+        for sub in body_nodes:
+            if not isinstance(sub, ast.Assign):
+                continue
+            base_val = _shape_transparent_base(sub.value)
+            if not isinstance(base_val, ast.Call):
+                continue
+            cname = _call_leaf_name(base_val.func)
+            if cname not in _NONLINEAR_STATE_WRAPPERS:
+                continue
+            target_names: set[str] = set()
+            for target in sub.targets:
+                target_names |= _assignment_target_names(target)
+            loaded_in_call = {
+                inner.id
+                for inner in ast.walk(base_val)
+                if isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load)
+            }
+            has_carry_expr = any(
+                isinstance(inner, (ast.Add, ast.Sub, ast.MatMult))
+                for inner in ast.walk(base_val)
+            )
+            if (target_names & loaded_in_call) or has_carry_expr:
+                state_wrapped_nonlinear = True
+                break
+        if not state_wrapped_nonlinear:
+            return True
+    return False
+
+
 class PyTorchSemanticAnalyzer:
     """Recover PyTorch semantics, physics ratios, and analytical HIR blueprints."""
 
@@ -1414,6 +1490,9 @@ class PyTorchSemanticAnalyzer:
             has_indirect_index=bool(call_names & _INDIRECT_CALL_NAMES),
             has_subbyte_or_block_quant=_has_quant_evidence(nodes, call_names),
             has_recurrent_loop=has_loop,
+            has_associative_outer_recurrence=bool(
+                has_loop and _loop_has_linear_outer_state_recurrence(nodes)
+            ),
             mutates_inputs=_detect_input_mutation(nodes, _entry_parameters(entry)),
             preserves_input_shape=preserves_input_shape,
             has_conv=bool(call_names & _CONV_CALL_NAMES),
