@@ -1636,6 +1636,55 @@ def test_fast_bindings_treat_candidate_change_as_infrastructure(tmp_path: Path) 
     assert "changed during evaluation" in str(failure.value)
 
 
+def test_measure_npu_ring_burst_resamples_once_on_high_cv() -> None:
+    """Verify ring-burst discards first noisy burst when CV > 0.25 and resamples once."""
+
+    @dataclass(frozen=True)
+    class _TensorStub:
+        nbytes: int
+
+    class _EventStub:
+        def __init__(self, clock: list[float]) -> None:
+            self._clock = clock
+            self._ts = 0.0
+
+        def record(self) -> None:
+            self._ts = self._clock[0]
+
+        def elapsed_time(self, end_event: _EventStub) -> float:
+            return end_event._ts - self._ts
+
+    burst_call = 0
+    clock = [1.0]
+    first_round_ms = [0.002 * 24, 0.020 * 24, 0.002 * 24]
+    second_round_ms = [0.003 * 24, 0.003 * 24, 0.003 * 24]
+    recorded_durations = iter(first_round_ms + second_round_ms)
+    invoke_count = 0
+
+    def _fn(x: _TensorStub) -> None:
+        nonlocal invoke_count, burst_call
+        _ = x
+        invoke_count += 1
+        if invoke_count > 2 and (invoke_count - 2) % 24 == 1:
+            burst_call += 1
+            clock[0] += next(recorded_durations, 0.003 * 24)
+
+    avg_us, burst_k = measure_npu_ring_burst_us(
+        _fn,
+        (_TensorStub(4 * 1024 * 1024),),
+        warmup=1,
+        repeat=3,
+        t_hw_us=1.5,
+        first_probe_us=1.5,
+        event_factory=lambda: _EventStub(clock),
+        synchronize_fn=lambda: None,
+        clone_fn=lambda obj: obj,
+    )
+    assert burst_k == 24
+    assert burst_call == 6
+    assert avg_us == pytest.approx(3.0)
+
+
 def test_surrogate_anchor_batch_npu() -> None:
     """Evaluate configured or baseline 10-anchor surrogate batch inside AgentGates lease."""
     _require_npu_env()
