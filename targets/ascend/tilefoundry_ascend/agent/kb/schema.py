@@ -1703,16 +1703,26 @@ def rank_symptom_families(
         )
     )
     has_simtvf = _read_signal_bool(sig, "has_simtvf")
-    if scalar_fallback > 0.0:
-        is_scalar_trap = True
-    elif has_l2_pmu:
-        is_scalar_trap = aiv_vec < 0.05 and aic_mac < 0.02
+    if has_l2_pmu:
+        if aiv_vec >= 0.08 or aic_mac >= 0.05:
+            scalar_loop_score = (
+                min(0.40, 0.15 * scalar_fallback) if scalar_fallback > 0.0 else 0.0
+            )
+        elif scalar_fallback > 0.0 or (aiv_vec < 0.05 and aic_mac < 0.02):
+            scalar_loop_score = 1.0
+        else:
+            scalar_loop_score = 0.0
+    elif scalar_fallback > 0.0:
+        if l0_cube_cycles > 0 or l0_vec_cycles > 0 or has_simtvf:
+            scalar_loop_score = min(0.55, 0.25 * scalar_fallback)
+        else:
+            scalar_loop_score = 1.0
     else:
         is_scalar_trap = (
             (l0_cube_cycles == 0 and l0_vec_cycles == 0 and not has_simtvf)
             or (has_l1_summary and l1_vec_regs == 0)
         )
-    scalar_loop_score = 1.0 if is_scalar_trap else 0.0
+        scalar_loop_score = 1.0 if is_scalar_trap else 0.0
 
     scored: list[tuple[SymptomFamily, float]] = [
         (SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP, round(dma_roundtrip_score, 6)),
@@ -1729,13 +1739,7 @@ def rank_symptom_families(
         (SymptomFamily.SYNC_BARRIER_SERIALIZATION, round(barrier_score, 6)),
         (SymptomFamily.GRID_TAIL_WAVE_UNDERUTIL, round(grid_wave_score, 6)),
     ]
-    scored.sort(
-        key=lambda item: (
-            -item[1],
-            0 if item[0] == SymptomFamily.SCALAR_LOOP_TRAP else 1,
-            item[0].value,
-        )
-    )
+    scored.sort(key=lambda item: (-item[1], item[0].value))
     return scored
 
 

@@ -11,6 +11,12 @@ from tilefoundry_ascend.ascend.cost_model.bisheng_res_parser import (
     parse_bisheng_resources,
     register_compiler_detector,
 )
+from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import (
+    CostGateDecision,
+    CostModelMode,
+    evaluate_cost_gate_policy,
+    is_paradigm_shift_exempt,
+)
 from tilefoundry_ascend.ascend.cost_model.experience_lake import (
     CandidateArtifactRecord,
     CaseObservationRecord,
@@ -94,7 +100,9 @@ __all__ = [
     "CompilerBehaviorDetector",
     "CompilerBehaviorRegistry",
     "CostFeatures",
+    "CostGateDecision",
     "CostModelEvalReport",
+    "CostModelMode",
     "CostPrediction",
     "ExperienceLake",
     "HybridAscendCostModel",
@@ -107,9 +115,11 @@ __all__ = [
     "compute_source_sha256",
     "count_reachable_ub_scalar_compute_loops",
     "detect_scalar_compute_loop_fallback",
+    "evaluate_cost_gate_policy",
     "evaluate_cost_model_ranking",
     "extract_microarch_profile_from_cce",
     "extract_microarch_profile_from_tirx",
+    "is_paradigm_shift_exempt",
     "load_official_reports",
     "merge_microarch_profiles",
     "normalize_ns_to_z3_ticks",
