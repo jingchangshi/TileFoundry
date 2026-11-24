@@ -3623,7 +3623,8 @@ class PerfTargetCampaignRunner:
         )
         if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
             active_mask = self._resolve_trackb_freedom_mask(regime_spec)
-            instantiated_tu = self._instantiate_trackb_tu(
+            instantiated_tu = self._invoke_with_optional_kwargs(
+                self._instantiate_trackb_tu,
                 module_source,
                 tb_extracted[1],
                 regime_spec,
@@ -3691,7 +3692,8 @@ class PerfTargetCampaignRunner:
         if not primary_res.passed:
             if is_hybrid and tb_extracted is not None and not has_prim_func:
                 active_mask = self._resolve_trackb_freedom_mask(regime_spec)
-                instantiated_tu = self._instantiate_trackb_tu(
+                instantiated_tu = self._invoke_with_optional_kwargs(
+                    self._instantiate_trackb_tu,
                     module_source,
                     tb_extracted[1],
                     regime_spec,
@@ -3740,7 +3742,8 @@ class PerfTargetCampaignRunner:
         if is_hybrid and tb_extracted is not None:
             tb_sym, tb_cpp = tb_extracted
             active_mask = self._resolve_trackb_freedom_mask(regime_spec)
-            instantiated_tu = self._instantiate_trackb_tu(
+            instantiated_tu = self._invoke_with_optional_kwargs(
+                self._instantiate_trackb_tu,
                 module_source,
                 tb_cpp,
                 regime_spec,
