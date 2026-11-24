@@ -3720,7 +3720,10 @@ def _submit_fast_gate(
         raise RuntimeError("fast request file changed after it was written")
     backoff = (8.0, 12.0, 16.0, 20.0, 25.0, 30.0)
     max_retries = 14
-    max_pool_passes = 2
+    occupancy_backoff = (4.0, 6.0, 8.0, 10.0, 15.0)
+    max_pool_passes = 16
+    occupancy_budget = min(max(float(timeout_sec), 10.0), 240.0)
+    total_occupancy_sleep = 0.0
     rejected_cards: set[str] = set()
     execution: _V2GateExecution | None = None
     for pass_idx in range(max_pool_passes):
@@ -3783,14 +3786,20 @@ def _submit_fast_gate(
                 continue
             break
         else:
-            if contaminated_in_pass and pass_idx + 1 < max_pool_passes:
+            if (
+                contaminated_in_pass
+                and pass_idx + 1 < max_pool_passes
+                and total_occupancy_sleep < occupancy_budget
+            ):
                 remaining = _normalize_device_pool(
                     device_id,
                     device_pool,
                     excluded=rejected_cards,
                 )
                 if remaining:
-                    time.sleep(4.0)
+                    wait_sec = occupancy_backoff[min(pass_idx, len(occupancy_backoff) - 1)]
+                    time.sleep(wait_sec)
+                    total_occupancy_sleep += wait_sec
                     continue
         break
     assert execution is not None

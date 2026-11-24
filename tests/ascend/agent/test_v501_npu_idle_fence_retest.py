@@ -682,3 +682,128 @@ def test_marathon_cli_parses_disable_early_goal_stop_and_pure_golden(
     assert rc == 0
     assert captured[0].pure_golden is True
     assert captured[0].disable_early_goal_stop is True
+
+
+def test_submit_fast_gate_progressive_occupancy_backoff_and_budget_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_submit_fast_gate uses progressive backoff across passes and stops at budget."""
+    req_path = tmp_path / "req.json"
+    req_bytes = b'{"schema": "tilefoundry-fast-request/v1"}\n'
+    req_path.write_bytes(req_bytes)
+    req_sha = hashlib.sha256(req_bytes).hexdigest()
+    resp_path = tmp_path / "resp.json"
+
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "order_candidates_by_idle_preflight",
+        lambda device_id, pool=(), excluded=(): tuple(
+            c for c in ("1", "2") if c not in excluded
+        ),
+    )
+    monkeypatch.setattr(surrogate_cannbench, "_source_identity_matches", lambda *_a: True)
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(surrogate_cannbench.time, "sleep", lambda sec: sleeps.append(float(sec)))
+
+    attempts = 0
+
+    def _fake_v2_pass4(**kwargs: object) -> surrogate_cannbench._V2GateExecution:
+        nonlocal attempts
+        attempts += 1
+        dev = str(kwargs.get("device_id") or "")
+        if attempts < 8:
+            return surrogate_cannbench._V2GateExecution(
+                execution_id=f"exec-occ-{attempts}",
+                report={
+                    "status": "BLOCKED_ENV",
+                    "gates": [
+                        {
+                            "gateId": surrogate_cannbench.AGENT_GATES_DEVICE_FAST_GATE,
+                            "status": "BLOCKED_ENV",
+                            "failures": ["BLOCKED_EXIT_CODE: 75"],
+                            "observations": {"errorCategory": "occupancy"},
+                        }
+                    ],
+                },
+                verification={"satisfied": False},
+                device_id=dev,
+            )
+        resp_path.write_text(
+            json.dumps(
+                {
+                    "schema": surrogate_cannbench.FAST_RESPONSE_SCHEMA,
+                    "request_id": "req-prog",
+                    "request_sha256": req_sha,
+                    "mode": "batch",
+                    "status": "ok",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return surrogate_cannbench._V2GateExecution(
+            execution_id="exec-pass-4",
+            run_id="run-pass-4",
+            report={"status": "PASS", "gates": []},
+            verification={"satisfied": True},
+            device_id=dev,
+        )
+
+    monkeypatch.setattr(surrogate_cannbench, "_run_v2_gate", _fake_v2_pass4)
+    raw, final_exec = surrogate_cannbench._submit_fast_gate(
+        agent_gates_bin="agent-gates",
+        root=tmp_path,
+        workspace="tilefoundry",
+        request_id="req-prog",
+        request_relative_path="req.json",
+        request_path=req_path,
+        response_path=resp_path,
+        request_sha256=req_sha,
+        mode="batch",
+        timeout_sec=180.0,
+        device_id="1",
+        device_pool=("1", "2"),
+    )
+    assert attempts == 8
+    assert sleeps == [4.0, 6.0, 8.0]
+    assert final_exec.run_id == "run-pass-4"
+    assert raw["status"] == "ok"
+
+    sleeps.clear()
+
+    def _fake_v2_always_busy(**kwargs: object) -> surrogate_cannbench._V2GateExecution:
+        return surrogate_cannbench._V2GateExecution(
+            execution_id="exec-busy",
+            report={
+                "status": "BLOCKED_ENV",
+                "gates": [
+                    {
+                        "gateId": surrogate_cannbench.AGENT_GATES_DEVICE_FAST_GATE,
+                        "status": "BLOCKED_ENV",
+                        "failures": ["BLOCKED_EXIT_CODE: 75"],
+                        "observations": {"errorCategory": "occupancy"},
+                    }
+                ],
+            },
+            verification={"satisfied": False, "failures": ["BLOCKED_EXIT_CODE: 75"]},
+            device_id=str(kwargs.get("device_id") or ""),
+        )
+
+    monkeypatch.setattr(surrogate_cannbench, "_run_v2_gate", _fake_v2_always_busy)
+    with pytest.raises(RuntimeError, match="did not verify"):
+        surrogate_cannbench._submit_fast_gate(
+            agent_gates_bin="agent-gates",
+            root=tmp_path,
+            workspace="tilefoundry",
+            request_id="req-exhaust",
+            request_relative_path="req.json",
+            request_path=req_path,
+            response_path=resp_path,
+            request_sha256=req_sha,
+            mode="batch",
+            timeout_sec=15.0,
+            device_id="1",
+            device_pool=("1", "2"),
+        )
+    assert sleeps == [4.0, 6.0, 8.0]
