@@ -8,15 +8,18 @@ import difflib
 import hashlib
 import json
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import CannbenchOpsRegistry
 from tilefoundry_ascend.agent.kb.bayesian_tracker import BayesianRuleTracker
 from tilefoundry_ascend.agent.kb.schema import (
+    SYMPTOM_FAMILY_TO_FACETS,
     AscendCausalRule,
     SymptomFamily,
+    normalize_runtime_backend,
+    safe_eval_predicate,
     save_rules_yaml,
     validate_rule_predicate,
 )
@@ -28,6 +31,7 @@ from tilefoundry_ascend.agent.orchestrator.gate_funnel import (
     run_stage_a_static,
 )
 from tilefoundry_ascend.ascend.passes.physical_ledger import ObjectivePhysicalLedger
+from tilefoundry_ascend.ascend.sil.schema import VALID_FREEDOM_FACETS
 
 _STATIC_DISALLOWED_PROVENANCE_TOKENS = frozenset(
     {
@@ -2231,38 +2235,39 @@ def _rule_predicates_for_kind(
     if chunk.edit_kind == "core_parallelism":
         return (
             "is_legal and any_overflow_bytes == 0 and not has_indirect_gather",
-            "wave_occupancy < 0.75 or PIPE_V > 0 or PIPE_MTE2 > 0",
-            "measured_latency_us <= prev.measured_latency_us",
+            "(wave_occupancy > 0.0 and wave_occupancy < 0.75) or PIPE_V > 0 or PIPE_MTE2 > 0",
+            "measured_latency_us < prev.measured_latency_us",
         )
     if chunk.edit_kind == "coalesced_copy":
         return (
             "is_legal and dominant_contig_bytes >= 64",
             "mte2_inflight_per_aiv > 8 or PIPE_MTE2 > PIPE_M",
-            "mte2_inflight_per_aiv <= prev.mte2_inflight_per_aiv and any_overflow_bytes == 0",
+            "mte2_inflight_per_aiv < prev.mte2_inflight_per_aiv and any_overflow_bytes == 0",
         )
     if chunk.edit_kind == "ssbuf_handoff":
         return (
             "is_legal and (has_dynamic_control or cube_to_vector_ratio >= 0.0)",
             "unexplained_gap_ratio >= 0.15 or measured_sync_stall_ratio > 0.05",
-            "measured_sync_stall_ratio <= prev.measured_sync_stall_ratio",
+            "measured_sync_stall_ratio < prev.measured_sync_stall_ratio",
         )
     if chunk.edit_kind == "dual_copy_1c2v":
         return (
             "is_legal and (cube_to_vector_ratio > 0.0 or AIV0.PIPE_V > 0)",
             "PIPE_MTE2 > 0 or PIPE_V > 0 or measured_mte2_wait_ratio > 0.1",
-            "any_overflow_bytes == 0 and measured_latency_us <= prev.measured_latency_us",
+            "any_overflow_bytes == 0 and measured_latency_us < prev.measured_latency_us",
         )
     if chunk.edit_kind == "barrier_prune":
         return (
             "is_legal and not has_dynamic_control",
             "in_loop_pipe_all_barriers > 0 or measured_sync_stall_ratio > 0.05 or PIPE_V > 0",
-            "in_loop_pipe_all_barriers <= prev.in_loop_pipe_all_barriers and any_overflow_bytes == 0",
+            "in_loop_pipe_all_barriers < prev.in_loop_pipe_all_barriers and any_overflow_bytes == 0",
         )
     if chunk.edit_kind == "pad_alignment":
         return (
             "is_legal and dominant_contig_bytes >= 16",
             "unaligned_dma_padding_bytes > 0 or PIPE_MTE2 > 0 or PIPE_V > 0",
-            "unaligned_dma_padding_bytes <= prev.unaligned_dma_padding_bytes and any_overflow_bytes == 0",
+            "unaligned_dma_padding_bytes < prev.unaligned_dma_padding_bytes "
+            "and any_overflow_bytes == 0",
         )
     if chunk.edit_kind == "static_pingpong_unroll":
         return (
@@ -2280,8 +2285,8 @@ def _rule_predicates_for_kind(
     _ = dom
     return (
         "is_legal and any_overflow_bytes == 0",
-        "degraded_buffer_count >= 0 and (PIPE_V > 0 or PIPE_MTE2 > 0)",
-        "degraded_buffer_count <= prev.degraded_buffer_count and any_overflow_bytes == 0",
+        "degraded_buffer_count > 0 and (PIPE_V > 0 or PIPE_MTE2 > 0)",
+        "degraded_buffer_count < prev.degraded_buffer_count and any_overflow_bytes == 0",
     )
 
 
@@ -2334,7 +2339,133 @@ def _anti_precondition_for_kind(chunk: AstEditChunk) -> str:
     return "any_overflow_bytes > 0 or spill_bytes > 0"
 
 
-def _is_rule_text_clean(rule: AscendCausalRule) -> tuple[bool, str]:
+_CANONICAL_FREEDOM_FACETS: frozenset[str] = frozenset(VALID_FREEDOM_FACETS)
+_TRACKB_TOPOLOGY_TOKENS: frozenset[str] = frozenset(
+    {
+        "cce_cpp20",
+        "ascendc_trackb",
+        "hybrid_trackb",
+        "cce_trackb",
+        "ascendc_template",
+        "ascendc",
+        "hybrid",
+        "tl_templates_cpp20",
+    }
+)
+
+
+def _extract_rule_facets(rule: AscendCausalRule) -> tuple[str, ...]:
+    raw_facets = getattr(rule, "recommended_facets", None)
+    if raw_facets is not None:
+        if isinstance(raw_facets, str):
+            return tuple(f.strip() for f in raw_facets.split(",") if f.strip())
+        if isinstance(raw_facets, Iterable):
+            return tuple(str(f).strip() for f in raw_facets if str(f).strip())
+        return ()
+    family_name = str(getattr(rule, "symptom_family", "") or "").strip()
+    if family_name:
+        try:
+            return SYMPTOM_FAMILY_TO_FACETS.get(SymptomFamily(family_name), ())
+        except ValueError:
+            return ()
+    return ()
+
+
+def _rule_covers_trackb(rule: AscendCausalRule) -> bool:
+    tokens: list[str] = []
+    for raw in getattr(rule, "compatible_backends", ()) or ():
+        tokens.append(str(raw).strip())
+    app_topos = getattr(rule, "applicable_topologies", None)
+    if isinstance(app_topos, str):
+        tokens.extend(t.strip() for t in app_topos.split(",") if t.strip())
+    elif isinstance(app_topos, Iterable):
+        tokens.extend(str(t).strip() for t in app_topos if str(t).strip())
+    for tok in tokens:
+        low = tok.lower()
+        norm = normalize_runtime_backend(low) or low
+        if low in _TRACKB_TOPOLOGY_TOKENS or norm in _TRACKB_TOPOLOGY_TOKENS:
+            return True
+    return False
+
+
+def _is_zero_literal(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return not isinstance(node.value, bool) and float(node.value) == 0.0
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        return _is_zero_literal(node.operand)
+    return False
+
+
+def _has_tautological_ge_zero(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        left = node.left
+        for op, right in zip(node.ops, node.comparators):
+            if isinstance(op, ast.GtE) and _is_zero_literal(right):
+                return True
+            if isinstance(op, ast.LtE) and _is_zero_literal(left):
+                return True
+            left = right
+    return False
+
+
+def _build_zero_ideal_env(tree: ast.AST) -> dict[str, object]:
+    env: dict[str, object] = {"is_legal": True, "vloopv2_hit": True}
+    skip_names = frozenset({"True", "False", "None", "abs", "min", "max"})
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            parts: list[str] = []
+            cur: ast.AST = node
+            while isinstance(cur, ast.Attribute):
+                parts.append(cur.attr)
+                cur = cur.value
+            if isinstance(cur, ast.Name):
+                parts.append(cur.id)
+                dotted = ".".join(reversed(parts))
+                if dotted not in env:
+                    env[dotted] = 0
+        elif isinstance(node, ast.Name) and node.id not in skip_names:
+            if node.id not in env:
+                env[node.id] = 0
+    return env
+
+
+def _node_references_prev(node: ast.AST) -> bool:
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name):
+            if sub.value.id == "prev":
+                return True
+    return False
+
+
+def _validate_postcondition_strictness(tree: ast.AST) -> tuple[bool, str]:
+    has_strict_improvement = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            has_strict_improvement = True
+        elif isinstance(node, ast.Compare):
+            left = node.left
+            for op, right in zip(node.ops, node.comparators):
+                if isinstance(op, (ast.Lt, ast.Gt)):
+                    has_strict_improvement = True
+                elif isinstance(op, (ast.LtE, ast.GtE)):
+                    if _node_references_prev(left) or _node_references_prev(right):
+                        return (
+                            False,
+                            "expected_postcondition uses non-strict <= or >= against prev",
+                        )
+                left = right
+    if not has_strict_improvement:
+        return (
+            False,
+            "expected_postcondition lacks strict improvement comparison (<, >, or not)",
+        )
+    return True, ""
+
+
+def _validate_distilled_rule(rule: AscendCausalRule) -> tuple[bool, str]:
+    """Enforce provenance, freedom-facet, Track-B template, and strict convergence gates."""
     joined = " ".join(rule.as_six_tuple()).lower()
     if rule.cpp20_transform_template:
         joined = f"{joined} {rule.cpp20_transform_template.lower()}"
@@ -2348,12 +2479,36 @@ def _is_rule_text_clean(rule: AscendCausalRule) -> tuple[bool, str]:
         return False, "filesystem path leaked into rule text"
     try:
         validate_rule_predicate(rule.regime_guard)
-        validate_rule_predicate(rule.precondition)
+        pre_tree = validate_rule_predicate(rule.precondition)
         validate_rule_predicate(rule.anti_precondition)
-        validate_rule_predicate(rule.expected_postcondition)
+        post_tree = validate_rule_predicate(rule.expected_postcondition)
     except Exception as exc:
         return False, f"invalid predicate: {exc}"
+
+    facets = _extract_rule_facets(rule)
+    if not facets:
+        return False, "missing or empty recommended_facets"
+    invalid_facets = [f for f in facets if f not in _CANONICAL_FREEDOM_FACETS]
+    if invalid_facets:
+        return False, f"invalid recommended_facets {invalid_facets!r}"
+
+    if _rule_covers_trackb(rule) and not str(rule.cpp20_transform_template or "").strip():
+        return False, "Track-B applicable rule requires non-empty cpp20_transform_template"
+
+    if _has_tautological_ge_zero(pre_tree):
+        return False, "precondition contains tautological >= 0 comparison"
+    zero_env = _build_zero_ideal_env(pre_tree)
+    if safe_eval_predicate(rule.precondition, zero_env):
+        return False, "precondition is tautological on all-zero ideal residual vector"
+
+    post_ok, post_err = _validate_postcondition_strictness(post_tree)
+    if not post_ok:
+        return False, post_err
     return True, ""
+
+
+def _is_rule_text_clean(rule: AscendCausalRule) -> tuple[bool, str]:
+    return _validate_distilled_rule(rule)
 
 
 def distill_causal_rule(
@@ -2379,9 +2534,7 @@ def distill_causal_rule(
     )
     is_cpp_chunk = chunk.chunk_id.startswith("cpp_loo_") or chunk.edit_kind == "cpp_hunk_edit"
     backends: tuple[str, ...] = (
-        ("ascendc_trackb", "hybrid_trackb")
-        if is_cpp_chunk
-        else ("tilelang_dsl", "ascendc_trackb", "hybrid_trackb")
+        ("ascendc_trackb", "hybrid_trackb") if is_cpp_chunk else ("tilelang_dsl",)
     )
     cpp_template = template if is_cpp_chunk else ""
     return AscendCausalRule(
@@ -2587,7 +2740,7 @@ class FlywheelDistiller:
                 origin_operator=operator_name,
                 active_symptom_family=active_symptom_family,
             )
-            clean_ok, clean_err = _is_rule_text_clean(rule)
+            clean_ok, clean_err = _validate_distilled_rule(rule)
             if not clean_ok:
                 outcomes.append(
                     DistilledRuleOutcome(
@@ -2836,7 +2989,7 @@ class FlywheelDistiller:
                 origin_operator=operator_name,
                 active_symptom_family=active_symptom_family,
             )
-            clean_ok, clean_err = _is_rule_text_clean(rule)
+            clean_ok, clean_err = _validate_distilled_rule(rule)
             if not clean_ok:
                 outcomes.append(
                     DistilledRuleOutcome(
@@ -2922,6 +3075,7 @@ __all__ = [
     "FlywheelDistiller",
     "MicroProbeSpec",
     "_build_disallowed_provenance_tokens",
+    "_validate_distilled_rule",
     "decompose_ast_ablations",
     "decompose_cpp_string_leave_one_out",
     "decompose_leave_one_out_ablations",

@@ -97,6 +97,14 @@ _EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 _TimeoutStage: TypeAlias = Literal["startup", "idle_stall", "active_ceiling", "after_eof"]
 
 
+_CREATIVE_DEFAULT_CEILING_SEC = 480.0
+_PARADIGM_SHIFT_CEILING_SEC = 720.0
+_REGIME_HEADER_RE = re.compile(
+    r"^###\s*TARGET REGIME\s*\n\s*([A-Za-z0-9_.-]+)\s*:",
+    re.MULTILINE,
+)
+
+
 def _config_value(overrides: Mapping[str, str] | None, *keys: str, default: str = "") -> str:
     for source in (overrides or {}, os.environ):
         for key in keys:
@@ -120,6 +128,38 @@ class GenerationRequest:
     user_prompt: str
     json_schema: dict[str, object] | None = None
     effort: str | None = None
+    active_timeout_sec: float | None = None
+    paradigm_shift: bool = False
+    role_hint: str = ""
+    session_scope: str = ""
+    regime_tag: str = ""
+
+
+def _is_creative_request(req: GenerationRequest) -> bool:
+    hint = req.role_hint.lower()
+    return req.role == "explore_creative" or "explore_creative" in hint or "creative" in hint
+
+
+def _is_paradigm_shift_request(req: GenerationRequest) -> bool:
+    if req.paradigm_shift:
+        return True
+    haystack = f"{req.role_hint}\n{req.system_prompt}\n{req.user_prompt}".lower()
+    return (
+        "paradigm_shift" in haystack
+        or "paradigmshift" in haystack
+        or "full_slice_rewrite" in haystack
+    )
+
+
+def _request_session_scope(req: GenerationRequest) -> str:
+    if req.session_scope.strip():
+        return req.session_scope.strip()
+    if req.regime_tag.strip():
+        return req.regime_tag.strip()
+    match = _REGIME_HEADER_RE.search(req.user_prompt)
+    if match is not None:
+        return match.group(1).strip()
+    return "default"
 
 
 @dataclass(frozen=True, init=False)
@@ -527,6 +567,8 @@ class AgyCliLLMBackend:
         raw_conc = os.environ.get("TILEFOUNDRY_NPU_AGY_MAX_CONCURRENCY", "").strip()
         conc = max_concurrency or (int(raw_conc) if raw_conc else 3)
         self._sem = asyncio.Semaphore(max(1, conc))
+        self._consecutive_active_ceiling_timeouts: dict[tuple[str, str], int] = {}
+        self._active_ceiling_cooldown: set[tuple[str, str]] = set()
 
         self._explicit_watchdog = watchdog is not None or hard_timeout_sec is not None
         if watchdog is not None:
@@ -581,6 +623,8 @@ class AgyCliLLMBackend:
         if self._explicit_watchdog:
             return self._watchdog
         ceiling = self._routing.timeout_for_role(role)
+        if role == "explore_creative":
+            ceiling = max(_CREATIVE_DEFAULT_CEILING_SEC, ceiling)
         max_503_retries, backoff_503, jitter_503 = _capacity_503_policy_from_env(self._overrides)
         return StreamWatchdogConfig(
             startup_timeout_sec=min(60.0, ceiling),
@@ -589,6 +633,32 @@ class AgyCliLLMBackend:
             capacity_503_max_retries=max_503_retries,
             capacity_503_backoff_sec=backoff_503,
             capacity_503_jitter_sec=jitter_503,
+        )
+
+    def watchdog_for_request(self, req: GenerationRequest) -> StreamWatchdogConfig:
+        """Resolve request-aware watchdog ceiling, scaling creative and ParadigmShift tiers."""
+        if self._explicit_watchdog:
+            return self._watchdog
+        eff_role = "explore_creative" if _is_creative_request(req) else req.role
+        cfg = self.watchdog_for_role(eff_role)
+        ceiling = cfg.active_ceiling_timeout_sec
+        if _is_paradigm_shift_request(req):
+            ceiling = max(_PARADIGM_SHIFT_CEILING_SEC, ceiling)
+        if (
+            req.active_timeout_sec is not None
+            and math.isfinite(req.active_timeout_sec)
+            and req.active_timeout_sec > 0.0
+        ):
+            ceiling = float(req.active_timeout_sec)
+        if ceiling == cfg.active_ceiling_timeout_sec:
+            return cfg
+        return replace(
+            cfg,
+            startup_timeout_sec=min(60.0, ceiling),
+            idle_stall_timeout_sec=min(
+                180.0 if eff_role in _REASONING_ROLES else 120.0, ceiling
+            ),
+            active_ceiling_timeout_sec=ceiling,
         )
 
     def select_effort(
@@ -639,7 +709,7 @@ class AgyCliLLMBackend:
             if model_id.endswith(tier_suffix):
                 effort = tier_suffix[1:]
                 break
-        cfg = self.watchdog_for_role(req.role)
+        cfg = self.watchdog_for_request(req)
         resolved_log = (
             str(log_file)
             if log_file is not None
@@ -735,7 +805,7 @@ class AgyCliLLMBackend:
             if model_override
             else self.select_model(req.role, effort=effort)
         )
-        cfg = self.watchdog_for_role(req.role)
+        cfg = self.watchdog_for_request(req)
         with (
             tempfile.TemporaryDirectory(prefix="tf_agy_worker_") as sandbox_dir,
             tempfile.TemporaryDirectory(prefix="tf_agy_log_") as log_dir,
@@ -893,6 +963,7 @@ class AgyCliLLMBackend:
                                     f"exceeded (role={req.role}, model={model_id})"
                                 ),
                                 retriable=True,
+                                timeout_stage="active_ceiling",
                             )
                         if not got_init and (now - start_ts) > cfg.startup_timeout_sec:
                             await _terminate_process_group(proc)
@@ -902,6 +973,7 @@ class AgyCliLLMBackend:
                                     f"exceeded (role={req.role}, model={model_id})"
                                 ),
                                 retriable=True,
+                                timeout_stage="startup",
                             )
                         effective_idle_sec = (
                             max(cfg.idle_stall_timeout_sec, cfg.active_ceiling_timeout_sec)
@@ -916,6 +988,7 @@ class AgyCliLLMBackend:
                                     f"exceeded (role={req.role}, model={model_id})"
                                 ),
                                 retriable=True,
+                                timeout_stage="idle_stall",
                             )
 
                 await proc.wait()
@@ -950,17 +1023,49 @@ class AgyCliLLMBackend:
             f"### SYSTEM INSTRUCTIONS\n{req.system_prompt}\n\n"
             f"### USER INPUT\n{req.user_prompt}\n"
         )
-        cfg = self.watchdog_for_role(req.role)
+        cfg = self.watchdog_for_request(req)
+        scope_key = (_request_session_scope(req), req.role)
+        used_cooldown = scope_key in self._active_ceiling_cooldown
+        if used_cooldown:
+            self._active_ceiling_cooldown.discard(scope_key)
+        cooldown_model = "gemini-4-hydrogen-medium" if used_cooldown else None
+        eff_effort_override = "medium" if used_cooldown else effort_override
+        base_model = self.select_model(req.role)
+
+        async def _attempt(retry_model_override: str | None) -> str:
+            active_override = retry_model_override or cooldown_model
+            active_model = (
+                self._agy_model_id(active_override) if active_override else base_model
+            )
+            try:
+                result = await self._run_single_attempt(
+                    req,
+                    full_prompt,
+                    effort_override=eff_effort_override,
+                    model_override=active_override,
+                )
+            except _AttemptFailure as failure:
+                if (
+                    failure.timeout_stage == "active_ceiling"
+                    and not used_cooldown
+                    and _is_creative_request(req)
+                    and active_model.lower() == "gemini-4-hydrogen-high"
+                ):
+                    count = self._consecutive_active_ceiling_timeouts.get(scope_key, 0) + 1
+                    if count >= 2:
+                        self._active_ceiling_cooldown.add(scope_key)
+                        self._consecutive_active_ceiling_timeouts[scope_key] = 0
+                    else:
+                        self._consecutive_active_ceiling_timeouts[scope_key] = count
+                raise
+            self._consecutive_active_ceiling_timeouts[scope_key] = 0
+            return result
+
         return await _run_with_503_retry(
             sem=self._sem,
             cfg=cfg,
             fallback_model=self._fallback_model,
-            attempt_fn=lambda model_override: self._run_single_attempt(
-                req,
-                full_prompt,
-                effort_override=effort_override,
-                model_override=model_override,
-            ),
+            attempt_fn=_attempt,
         )
 
 
