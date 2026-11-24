@@ -28,13 +28,15 @@ Optimization insights follow a strict downward graduation path so structural slo
 | `>= 8` | `is_coupled_1c2v`, `is_aic_only`, `is_irregular_simt` |
 
 - **Anomaly Guard (`|ln(m/a)| > 2.5`)**: Samples where `|ln(measured / analytical)| > 2.5` are logged to `unmodeled_anomalies.jsonl` and excluded from Ridge residual fitting; pairwise delta/log-residual targets are clamped to `[-2.5, 2.5]`.
+- **Adaptive CostModel Lifecycle (`cost_model_mode="auto"`)**: Early rounds coarsely filter clearly degraded same-topology candidates; once approaching Roofline/launch floor (`eta >= 0.65` or reclaimable silicon headroom `<= 1.0 us`) or on slow/stagnant iterations (gain `< 3%` or `stagnation >= 1`), CostModel prescreening auto-disables for free exploration while Stage-A hard legality stays always on. Legacy `explore_creative <= 1.5x` truncation is abolished in favor of full pass-through to Stage-B/L2.
 
 ## [SEC-G2] Unified Compile Session & Anchor-Specialized Two-Snapshot Ledger
 
 - **Unified `ascend_compile_session`**: Host lowering and driver build entrypoints (`build_stage_b_driver_source` and companions) must hold one contiguous `_ascend_ctx()` scope across `PyTorchSemanticAnalyzer`, anchor specialization, and `tilelang.lower` + `ReadOnlyAscendPassTap`. Exiting the target context prior to lowering strips hardware UB/L1 ceilings, vector lane widths, and target flags.
 - **Pre-Lowering Anchor Specialization**: `EnvelopeInspector` (`envelope_inspector.py`, `gate_funnel.py`, `verifier.py`) specializes dynamic-shape `PrimFunc` schedules with real anchor dimensions via `PrimFunc.specialize` and simplifies bounds with `arith.Analyzer` *before* snapshot capture so peak UB/L1 bytes, double-buffering, and contiguous burst widths reflect physical reality.
 - **Preserved Two-Snapshot Diff**: Pre-lowering intended buffers and post-lowering physical buffers are compared side-by-side (`degraded_single_buffers`, lowered stage count, serialized barriers, `ObjectivePhysicalLedger`) across all canonical canary operators with zero operator-name branching.
-- **Formal Legality & Read-Only Pass Tap**: `SILVerifier` enforces 14 hardware redlines plus C++ CFG cross-core flag-balance checks; `ReadOnlyAscendPassTap` extracts read-only TileLang internal pass waterlines and pipeline metrics.
+- **Formal Legality & Read-Only Pass Tap**: `SILVerifier` enforces 14 hardware redlines plus C++ CFG cross-core flag-balance checks and Stage-A TileLang AST rules (`T.Stage`, `T.Parallel`); `ReadOnlyAscendPassTap` extracts read-only TileLang internal pass waterlines and pipeline metrics.
+- **CANN 9.3 Sole Active Mainline & No `syntax_repair` Heuristic KB**: Target `cann_9_3` (`dav-3510`) exclusively (`cann_9_2` is an inert placeholder). `syntax_repair` feeds back only objective compiler diagnostic slices and the `G5` monotonicity lock; mapping error codes to heuristic prescriptions is forbidden.
 
 ## [SEC-G3] Compilation Idempotence & Orthogonal Tail Guard
 
@@ -43,8 +45,8 @@ Every candidate promotion passes the 5-tier verification pyramid (`L0`–`L4`):
 | Tier | Scope | Enforced Guarantees |
 | :--- | :--- | :--- |
 | `L0` | Static repo & AST audit | 6 repo hygiene lints (`scripts/*_lint.py`), AST inequality whitelist, static rejection of float-tolerance or host-pointer keys in `_KERNEL_CACHE` |
-| `L1` | Schedule & CFG legality | `SILVerifier` (14 redlines + C++ cross-core CFG flag balance), Schedule Redlines `G1..G5`, `ReadOnlyAscendPassTap` waterline checks |
-| `L2` | Lowered host envelope | Contiguous `ascend_compile_session`, real-anchor Two-Snapshot diff, Tier-0/1/2 sanity & bounded `explore_creative` pass-through (`<= 1.5x`) |
+| `L1` | Schedule & CFG legality | `SILVerifier` (14 redlines + C++ cross-core CFG flag balance + TileLang AST checks), Schedule Redlines `G1..G5`, `ReadOnlyAscendPassTap` waterline checks |
+| `L2` | Lowered host envelope | Contiguous `ascend_compile_session`, real-anchor Two-Snapshot diff, Tier-0/1/2 sanity & full `explore_creative` pass-through to Stage-B/L2 |
 | `L3` | Full contract & idempotence | Full operator shape suite (`l3_contract.py`), Dual-Layer Tail Guard, Two-Pass Compilation Idempotence (`Delta\|Cache\| == 0`) |
 | `L4` | Official real-NPU gate | CANNBench protocol correctness & latency (`surrogate_cannbench.py`, `test_npu_acceptance.py`) via `AgentGates` leased NPU & signed v2 receipt |
 

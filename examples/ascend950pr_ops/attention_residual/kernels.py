@@ -3,6 +3,7 @@
 import contextlib
 import math
 import os
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 
 import tilelang
@@ -403,8 +404,34 @@ def _choose_ar_tile_m(d_dim: int, schedule_mode: str) -> int:
     return max(1, min(8, max_rows))
 
 
-def _ar_default_flags(schedule_mode: str) -> list[str]:
-    return list(PURE_SIMDVF_UBUF_FLAGS) if schedule_mode == "tuned" else []
+_VF_STACK_DISABLE_FLAG = "--cce-disable-vf-stack-reserved-ubuf"
+_VF_STACK_RESERVE_UB_THRESHOLD = 224 * 1024
+
+
+def _estimate_ar_static_ub_bytes(
+    n_depth: int,
+    d_dim: int,
+    tile_m: int,
+    schedule_mode: str,
+    tl_dtype: str = "bfloat16",
+) -> int:
+    elem_bytes = 4 if tl_dtype == "float32" else 2
+    d_alloc = ((int(d_dim) + 63) // 64) * 64
+    rows = max(1, int(tile_m))
+    num_stages = 2 if (schedule_mode == "tuned" and int(n_depth) >= 2) else 1
+    fixed_bytes = (2 * elem_bytes + 4) * d_alloc
+    if rows > 1:
+        fixed_bytes += num_stages * d_alloc * elem_bytes
+    per_row_bytes = (num_stages * elem_bytes + elem_bytes + 4) * d_alloc + 64
+    return fixed_bytes + rows * per_row_bytes
+
+
+def _ar_default_flags(schedule_mode: str, *, static_ub_bytes: int = 0) -> list[str]:
+    if schedule_mode != "tuned":
+        return []
+    if static_ub_bytes > _VF_STACK_RESERVE_UB_THRESHOLD:
+        return list(PURE_SIMDVF_UBUF_FLAGS)
+    return [flag for flag in PURE_SIMDVF_UBUF_FLAGS if flag != _VF_STACK_DISABLE_FLAG]
 
 
 @T.macro
@@ -519,11 +546,16 @@ def _select_ar_small_decode_config(
     schedule_mode: str = "tuned",
     m_rows: int = 1,
 ) -> dict[str, object]:
-    _ = (n_depth, d_dim, tl_dtype, m_rows)
+    _ = m_rows
+    tile_m = 1
+    static_ub_bytes = _estimate_ar_static_ub_bytes(
+        n_depth, d_dim, tile_m, schedule_mode, tl_dtype
+    )
     return {
-        "tile_m": 1,
+        "tile_m": tile_m,
+        "static_ub_bytes": static_ub_bytes,
         "pass_configs": {},
-        "compile_flags": _ar_default_flags(schedule_mode),
+        "compile_flags": _ar_default_flags(schedule_mode, static_ub_bytes=static_ub_bytes),
     }
 
 
@@ -939,13 +971,17 @@ def _select_ar_unaligned_config(
     schedule_mode: str = "tuned",
     m_rows: int = 4,
 ) -> dict[str, object]:
-    _ = (n_depth, tl_dtype)
+    tile_m = _choose_ar_tile_m_for_rows(
+        d_dim, m_rows, schedule_mode, allow_unaligned=True
+    )
+    static_ub_bytes = _estimate_ar_static_ub_bytes(
+        n_depth, d_dim, tile_m, schedule_mode, tl_dtype
+    )
     return {
-        "tile_m": _choose_ar_tile_m_for_rows(
-            d_dim, m_rows, schedule_mode, allow_unaligned=True
-        ),
+        "tile_m": tile_m,
+        "static_ub_bytes": static_ub_bytes,
         "pass_configs": {},
-        "compile_flags": _ar_default_flags(schedule_mode),
+        "compile_flags": _ar_default_flags(schedule_mode, static_ub_bytes=static_ub_bytes),
     }
 
 
@@ -1306,13 +1342,17 @@ def _select_ar_aligned_config(
     schedule_mode: str = "tuned",
     m_rows: int = 2048,
 ) -> dict[str, object]:
-    _ = (n_depth, tl_dtype)
+    tile_m = _choose_ar_tile_m_for_rows(
+        d_dim, m_rows, schedule_mode, allow_unaligned=False
+    )
+    static_ub_bytes = _estimate_ar_static_ub_bytes(
+        n_depth, d_dim, tile_m, schedule_mode, tl_dtype
+    )
     return {
-        "tile_m": _choose_ar_tile_m_for_rows(
-            d_dim, m_rows, schedule_mode, allow_unaligned=False
-        ),
+        "tile_m": tile_m,
+        "static_ub_bytes": static_ub_bytes,
         "pass_configs": {},
-        "compile_flags": _ar_default_flags(schedule_mode),
+        "compile_flags": _ar_default_flags(schedule_mode, static_ub_bytes=static_ub_bytes),
     }
 
 
@@ -1546,13 +1586,63 @@ def _freeze_attr_value(val: object) -> object:
     return val
 
 
-def _normalize_pass_configs_key(pass_configs: dict[str, object] | None) -> tuple[tuple[str, object], ...]:
+def _split_pass_configs_and_flags(
+    raw_pass_configs: object,
+    raw_compile_flags: object,
+) -> tuple[dict[str, object], tuple[str, ...]]:
+    pc_dict: dict[str, object] = {}
+    flags: list[str] = []
+
+    def _add_flag(flag_text: str) -> None:
+        cleaned = flag_text.strip()
+        if cleaned and cleaned not in flags:
+            flags.append(cleaned)
+
+    if isinstance(raw_pass_configs, Mapping):
+        for k, v in raw_pass_configs.items():
+            pc_dict[str(k)] = v
+    elif isinstance(raw_pass_configs, str):
+        for tok in raw_pass_configs.split():
+            _add_flag(tok)
+    elif isinstance(raw_pass_configs, Iterable):
+        for item in raw_pass_configs:
+            if (
+                isinstance(item, (tuple, list))
+                and len(item) == 2
+                and not isinstance(item, str)
+            ):
+                pc_dict[str(item[0])] = item[1]
+            else:
+                _add_flag(str(item))
+
+    if isinstance(raw_compile_flags, str):
+        for tok in raw_compile_flags.split():
+            _add_flag(tok)
+    elif isinstance(raw_compile_flags, Iterable):
+        for item in raw_compile_flags:
+            _add_flag(str(item))
+    elif raw_compile_flags is not None:
+        _add_flag(str(raw_compile_flags))
+
+    return pc_dict, tuple(flags)
+
+
+def _normalize_pass_configs_key(pass_configs: object) -> tuple[tuple[str, object], ...]:
     if not pass_configs:
         return ()
-    return tuple(
+    if isinstance(pass_configs, Mapping):
+        return tuple(
+            (str(k), _freeze_attr_value(v))
+            for k, v in sorted(pass_configs.items(), key=lambda item: str(item[0]))
+        )
+    pc_dict, extra_flags = _split_pass_configs_and_flags(pass_configs, None)
+    items: list[tuple[str, object]] = [
         (str(k), _freeze_attr_value(v))
-        for k, v in sorted(pass_configs.items(), key=lambda item: str(item[0]))
-    )
+        for k, v in sorted(pc_dict.items(), key=lambda item: str(item[0]))
+    ]
+    if extra_flags:
+        items.append(("__compile_flags__", extra_flags))
+    return tuple(items)
 
 
 def _get_kernel(
@@ -1563,17 +1653,21 @@ def _get_kernel(
     schedule_mode: str,
     *,
     builder_fn=None,
-    pass_configs: dict[str, object] | None = None,
-    compile_flags: list[str] | tuple[str, ...] | None = None,
+    pass_configs: object = None,
+    compile_flags: list[str] | tuple[str, ...] | str | None = None,
     extra_builder_kwargs: dict[str, object] | None = None,
 ):
     resolved_builder = builder_fn or _build_attention_residual_prim_func
-    pc_dict = dict(pass_configs or {})
+    pc_dict, parsed_flags = _split_pass_configs_and_flags(pass_configs, compile_flags)
     extra_bk = dict(extra_builder_kwargs or {})
     if compile_flags is None:
-        flags_tuple = tuple(PURE_SIMDVF_UBUF_FLAGS) if schedule_mode == "tuned" else ()
+        static_ub_bytes = _estimate_ar_static_ub_bytes(
+            n_depth, d_dim, tile_m, schedule_mode, tl_dtype
+        )
+        default_flags = _ar_default_flags(schedule_mode, static_ub_bytes=static_ub_bytes)
+        flags_tuple = tuple(dict.fromkeys([*default_flags, *parsed_flags]))
     else:
-        flags_tuple = tuple(str(f) for f in compile_flags)
+        flags_tuple = parsed_flags
     key = (
         resolved_builder.__name__,
         n_depth,
@@ -1653,8 +1747,19 @@ def attention_residual(
         cfg = dict(selector_fn(n_depth, d_dim, tl_dtype, schedule_mode, m_rows=m_rows))
         _DISPATCH_CACHE[dispatch_key] = cfg
     tile_m = int(cfg["tile_m"])
-    pass_configs = dict(cfg.get("pass_configs") or {})
-    compile_flags = tuple(str(f) for f in (cfg.get("compile_flags") or ()))
+    pass_configs, compile_flags = _split_pass_configs_and_flags(
+        cfg.get("pass_configs"), cfg.get("compile_flags")
+    )
+    raw_ub = cfg.get("static_ub_bytes")
+    static_ub_bytes = (
+        int(raw_ub)
+        if isinstance(raw_ub, int) and not isinstance(raw_ub, bool)
+        else _estimate_ar_static_ub_bytes(n_depth, d_dim, tile_m, schedule_mode, tl_dtype)
+    )
+    if static_ub_bytes <= _VF_STACK_RESERVE_UB_THRESHOLD:
+        compile_flags = tuple(f for f in compile_flags if f != _VF_STACK_DISABLE_FLAG)
+    elif schedule_mode == "tuned" and _VF_STACK_DISABLE_FLAG not in compile_flags:
+        compile_flags = (*compile_flags, _VF_STACK_DISABLE_FLAG)
     raw_bk = cfg.get("builder_kwargs")
     extra_builder_kwargs = dict(raw_bk) if isinstance(raw_bk, dict) else None
     kernel = _get_kernel(

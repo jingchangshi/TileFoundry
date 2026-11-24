@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 from tilefoundry_ascend.agent.campaign.anchor_specs import (
@@ -242,7 +242,7 @@ class MarathonConfig:
     repeat: int = 5
     enable_tilesize_prescreen: bool = True
     cost_prescreen_top_k: int | None = None
-    prewarm_l3: bool = True
+    cost_model_mode: str = "auto"
     salvage_beam_candidates: bool = True
     resume: bool | None = None
     escalate_model: str | None = None
@@ -400,7 +400,7 @@ def _aggregate_hardware_engine_error(
     active_ledgers = [ledger for ledger in ledgers if ledger is not None]
     if not active_ledgers:
         return ""
-    if semantics.has_matmul:
+    if bool(semantics.has_gemm_contraction):
         has_cube = any(int(lg.pipe_cycles.get("AIC.PIPE_M", 0)) > 0 for lg in active_ledgers)
         if not has_cube:
             return (
@@ -457,7 +457,11 @@ def _run_stage0_track_a_gates(
     req_dma = bool(
         enforce_hardware_engines and semantics is not None and not semantics.has_indirect_index
     )
-    req_cube = bool(enforce_hardware_engines and semantics is not None and semantics.has_matmul)
+    req_cube = bool(
+        enforce_hardware_engines
+        and semantics is not None
+        and bool(semantics.has_gemm_contraction)
+    )
     ordered_tensor_shapes = extract_ordered_tensor_shapes(
         case_entry=regime_spec.representative_case_entry,
         dims=dims,
@@ -583,7 +587,11 @@ def _run_stage0_track_b_gates(
     req_dma = bool(
         enforce_hardware_engines and semantics is not None and not semantics.has_indirect_index
     )
-    req_cube = bool(enforce_hardware_engines and semantics is not None and semantics.has_matmul)
+    req_cube = bool(
+        enforce_hardware_engines
+        and semantics is not None
+        and bool(semantics.has_gemm_contraction)
+    )
     verdict = evaluate_ascendc_candidate(
         instantiated_tu,
         freedom_mask=ConstraintRelaxationMask.top(),
@@ -1419,57 +1427,6 @@ class ExtremeCampaignRunner(PerfTargetCampaignRunner):
             )
 
 
-def build_prewarmed_l3_runner(
-    *,
-    operator_name: str,
-    worktree: Path,
-    env_file: Path,
-    device_id: str,
-    prewarm_l3: bool = True,
-    op_logger: logging.Logger | None = None,
-) -> Callable[..., L3AcceptanceResult]:
-    """Build the L3 runner; the adapter owns environment, cache and prompt loading.
-
-    ``prewarm_l3`` remains accepted so existing marathon configurations keep parsing,
-    but promotion evidence now comes from the adapter-owned V2 gate, which prepares
-    its own interpreter, cache policy and compare bridge inside the workspace.
-    """
-    _ = env_file, prewarm_l3
-    log = op_logger or logger
-    default_device_id = str(device_id)
-
-    def _run_l3(
-        module_path: Path,
-        *,
-        resume_execution_id: str = "",
-        resume_run_id: str = "",
-        device_id: str = "",
-        on_execution_started: Callable[[str, str], None] | None = None,
-    ) -> L3AcceptanceResult:
-        result = run_l3_full_contract_via_agent_gates(
-            operator_name=operator_name,
-            candidate_module_path=module_path,
-            source_root=worktree,
-            device_id=str(device_id or default_device_id),
-            resume_execution_id=resume_execution_id,
-            resume_run_id=resume_run_id,
-            on_execution_started=on_execution_started,
-        )
-        log.info(
-            "L3_CONTRACT_DONE op=%s passed=%s elapsed=%.1fs run_id=%s execution_id=%s "
-            "failure_kind=%s",
-            operator_name,
-            result.passed,
-            result.elapsed_sec,
-            result.run_id,
-            result.execution_id,
-            result.failure_kind,
-        )
-        return result
-
-    return _run_l3
-
-
 def build_resilient_l2_evaluator(
     *,
     operator_name: str,
@@ -1991,14 +1948,34 @@ def run_operator_marathon(
         repeat=cfg.repeat,
         op_logger=op_logger,
     )
-    l3_runner = build_prewarmed_l3_runner(
-        operator_name=cfg.operator_name,
-        worktree=worktree,
-        env_file=env_file,
-        device_id=primary_device_id,
-        prewarm_l3=cfg.prewarm_l3,
-        op_logger=op_logger,
-    )
+    def l3_runner(
+        module_path: Path,
+        *,
+        resume_execution_id: str = "",
+        resume_run_id: str = "",
+        device_id: str = "",
+        on_execution_started: Callable[[str, str], None] | None = None,
+    ) -> L3AcceptanceResult:
+        result = run_l3_full_contract_via_agent_gates(
+            operator_name=cfg.operator_name,
+            candidate_module_path=module_path,
+            source_root=worktree,
+            device_id=str(device_id or primary_device_id),
+            resume_execution_id=resume_execution_id,
+            resume_run_id=resume_run_id,
+            on_execution_started=on_execution_started,
+        )
+        op_logger.info(
+            "L3_CONTRACT_DONE op=%s passed=%s elapsed=%.1fs run_id=%s execution_id=%s "
+            "failure_kind=%s",
+            cfg.operator_name,
+            result.passed,
+            result.elapsed_sec,
+            result.run_id,
+            result.execution_id,
+            result.failure_kind,
+        )
+        return result
 
     lake_dir = resolve_default_experience_lake_dir(
         worktree=worktree,
@@ -2031,6 +2008,9 @@ def run_operator_marathon(
         min_optimization_rounds=cfg.min_optimization_rounds,
         per_anchor_max_us={},
     )
+    extra_campaign_kwargs: dict[str, str] = {}
+    if any(f.name == "cost_model_mode" for f in fields(CampaignConfig)):
+        extra_campaign_kwargs["cost_model_mode"] = cfg.cost_model_mode
     campaign_cfg = CampaignConfig(
         operator_name=cfg.operator_name,
         max_rounds=cfg.max_rounds,
@@ -2055,6 +2035,7 @@ def run_operator_marathon(
         exploit_effort=cfg.exploit_effort,
         round_regime_tags=tuple(cfg.round_regime_tags),
         pure_golden=cfg.pure_golden,
+        **extra_campaign_kwargs,
     )
     tracker = BayesianRuleTracker.from_experience_lake(lake_dir)
     flywheel = FlywheelDistiller(
@@ -2701,6 +2682,11 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Keep only the top-K cost-model candidates during creative prescreen.",
     )
+    parser.add_argument(
+        "--cost-model-mode",
+        default="auto",
+        help="Cost model lifecycle mode (e.g. auto, off, always).",
+    )
 
 
 def build_marathon_arg_parser() -> argparse.ArgumentParser:
@@ -2785,6 +2771,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         cost_prescreen_top_k=(
             int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
         ),
+        cost_model_mode=str(args.cost_model_mode),
         llm_backend=args.llm_backend,
         exploit_model=args.exploit_model,
         explore_model=args.explore_model,
@@ -2800,7 +2787,6 @@ __all__ = [
     "MarathonConfig",
     "atomic_write_text",
     "build_marathon_arg_parser",
-    "build_prewarmed_l3_runner",
     "build_resilient_l2_evaluator",
     "build_stage0_oracle_validator",
     "build_stage0_static_validator",

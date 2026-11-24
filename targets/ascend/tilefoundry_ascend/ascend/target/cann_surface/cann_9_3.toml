@@ -445,3 +445,33 @@ facets = ["grid_and_workspace_topology", "exec_mode_and_spr"]
 required_headers = ["<c_api/asc_cube.h>"]
 signature = "__aicore__ inline uint32_t asc_atomic_cas(__gm__ uint32_t* address, uint32_t compare, uint32_t val)"
 pitfall = "Use global-memory atomics sparingly for cross-block state or dynamic tail arbitration."
+
+[[primitives]]
+symbol = "T.Stage"
+pipe = "PIPE_SYNC"
+pipes = ["pipe_sync_barrier_mutex"]
+facet = "pipeline_and_sync_graph"
+facets = ["pipeline_and_sync_graph"]
+required_headers = ["<tl_templates/ascend/common.h>"]
+signature = "with T.Stage(stage_id):"
+pitfall = "Nonzero T.Stage(k>0) requires outer T.Pipelined(..., num_stages>=2); never nest inside T.SimdVF/T.Parallel."
+
+[[primitives]]
+symbol = "T.assume_no_conflict"
+pipe = "PIPE_SYNC"
+pipes = ["pipe_sync_barrier_mutex"]
+facet = "sram_layout_and_aliasing"
+facets = ["sram_layout_and_aliasing", "pipeline_and_sync_graph"]
+required_headers = ["<tl_templates/ascend/common.h>"]
+signature = "T.assume_no_conflict(buf)"
+pitfall = "Assert disjoint UB/L1 buffer slices across concurrent stages."
+
+[[primitives]]
+symbol = "AscendMGroupedTileScheduler"
+pipe = "SCALAR"
+pipes = ["pipe_s_scalar_spr"]
+facet = "grid_and_workspace_topology"
+facets = ["grid_and_workspace_topology", "tile_and_stage_knobs"]
+required_headers = ["<tl_templates/ascend/common.h>"]
+signature = "AscendMGroupedTileScheduler(problem_sizes, tile_m, tile_n)"
+pitfall = "Use for ragged_group / grouped workloads to balance block-to-tile assignment."

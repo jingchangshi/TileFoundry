@@ -548,6 +548,27 @@ TILELANG_DSL_SURFACE = DialectSurfaceSpec(
             "sram_layout_and_aliasing",
             "T.annotate_unlimit_memory(\"shared\")",
         ),
+        PrimitiveEntry(
+            "T.Stage",
+            "PIPE_SYNC",
+            "pipeline_and_sync_graph",
+            "with T.Stage(stage_id):",
+            facets=("pipeline_and_sync_graph",),
+        ),
+        PrimitiveEntry(
+            "T.assume_no_conflict",
+            "PIPE_SYNC",
+            "sram_layout_and_aliasing",
+            "T.assume_no_conflict(buf)",
+            facets=("sram_layout_and_aliasing", "pipeline_and_sync_graph"),
+        ),
+        PrimitiveEntry(
+            "AscendMGroupedTileScheduler",
+            "SCALAR",
+            "grid_and_workspace_topology",
+            "AscendMGroupedTileScheduler(problem_sizes, tile_m, tile_n)",
+            facets=("grid_and_workspace_topology", "tile_and_stage_knobs"),
+        ),
     ),
     forbidden_tokens=(
         "tilelang.language",
@@ -1268,6 +1289,8 @@ def _core_symbols_for(
             core.update({"T.alloc_shared", "T.SimdVF", "T.simd.vld", "T.simd.vsts", "T.fill"})
         if want_simt and engine != "aic_only":
             core.add("T.SimtVF")
+        if reg == "ragged_group":
+            core.add("AscendMGroupedTileScheduler")
         return core
     if engine == "aic_only":
         return {
@@ -1354,6 +1377,12 @@ def filter_primitives_on_demand(
 
     stage1: list[PrimitiveEntry] = []
     for entry in surface.primitives:
+        if (
+            entry.symbol == "AscendMGroupedTileScheduler"
+            and topology_axes is not None
+            and topology_axes.iteration_regularity != "ragged_group"
+        ):
+            continue
         if engine == "aiv_only" and _is_cube_or_coupled_entry(entry):
             continue
         if engine == "aic_only" and (_is_aiv_vector_entry(entry) or _is_coupled_only_entry(entry)):
