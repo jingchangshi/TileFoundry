@@ -557,6 +557,7 @@ def measure_npu_ring_burst_us(
     """Measure micro-anchor latency with cold-L2 rotating ring-buffer burst enqueueing."""
     import statistics  # noqa: PLC0415
 
+    is_real_npu = event_factory is None and synchronize_fn is None
     if event_factory is None or synchronize_fn is None:
         import torch  # noqa: PLC0415
 
@@ -630,8 +631,25 @@ def measure_npu_ring_burst_us(
     if len(samples_us) >= 3:
         med = float(statistics.median(samples_us))
         cv = float(statistics.pstdev(samples_us)) / max(med, 1e-9)
-        if cv > 0.25:
-            samples_us = _collect_burst_samples()
+        if cv > 0.12:
+            batches: list[tuple[list[float], float, float]] = [(samples_us, med, cv)]
+            for _ in range(2):
+                if is_real_npu:
+                    time.sleep(0.02)
+                retry_samples = _collect_burst_samples()
+                retry_med = float(statistics.median(retry_samples))
+                retry_cv = float(statistics.pstdev(retry_samples)) / max(retry_med, 1e-9)
+                batches.append((retry_samples, retry_med, retry_cv))
+                if retry_cv <= 0.12:
+                    break
+            clean_batches = [b for b in batches if b[2] <= 0.12]
+            if clean_batches:
+                best = min(clean_batches, key=lambda b: (b[1], b[2]))
+                return float(best[1]), k
+            pooled = sorted(val for batch, _, _ in batches for val in batch)
+            keep = max(3, (len(pooled) + 1) // 2)
+            return float(statistics.median(pooled[:keep])), k
+        return med, k
     return float(statistics.median(samples_us)), k
 
 
@@ -2475,12 +2493,14 @@ def _run_npu_smi_query(smi: str, args: Sequence[str]) -> str | None:
     return None
 
 
-def _probe_host_card_idle(device_id: str) -> bool | None:
-    """Return True if card has 0 compute processes, False if busy/locked, None if unavailable.
+def _probe_host_card_load(
+    device_id: str,
+    *,
+    max_quiet_hbm_mb: int = 16384,
+) -> tuple[int, int, int] | None:
+    """Probe card lock/quarantine/process load as (tier, total_mem_mb, proc_count).
 
-    Lock files and quarantine sidecars are checked before invoking ``npu-smi``.
-    Supports both 5-column (Ascend950PR with Slot ID) and 4-column ``npu-smi info -m``
-    layouts and queries ``proc-mem -i <npu_id>`` without ``-c 0``.
+    Tiers: 0=free, 1=quiet shared (<=max_quiet_hbm_mb), 2=heavy shared, 3=locked/quarantined.
     """
     txt = str(device_id or "").strip()
     if not txt.isdigit():
@@ -2496,17 +2516,17 @@ def _probe_host_card_idle(device_id: str) -> bool | None:
     lease_file = lock_root / f"{lease_hash}.lock"
     quarantine_file = Path(f"{lease_file}.quarantine.json")
     if quarantine_file.is_file():
-        return False
+        return (3, 999999, 999999)
     if lease_file.is_file():
         try:
             fd = os.open(lease_file, os.O_RDONLY)
         except OSError:
-            return False
+            return (3, 999999, 999999)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
-            return False
+            return (3, 999999, 999999)
         finally:
             os.close(fd)
     smi = shutil.which(os.environ.get("AGENT_GATES_SMI_COMMAND") or "npu-smi")
@@ -2533,11 +2553,23 @@ def _probe_host_card_idle(device_id: str) -> bool | None:
         return None
     if not re.search(rf"^\s*NPU ID\s*:\s*{npu_id}\s*$", proc_out, re.MULTILINE):
         return None
-    if re.search(r"Process id\s*:\s*\d+", proc_out):
-        return False
+    proc_ids = re.findall(r"Process id\s*:\s*\d+", proc_out)
+    if proc_ids:
+        mem_matches = re.findall(r"Process memory\(MB\)\s*:\s*(\d+)", proc_out)
+        total_mem_mb = sum(int(val) for val in mem_matches)
+        tier = 1 if total_mem_mb <= max_quiet_hbm_mb else 2
+        return (tier, total_mem_mb, len(proc_ids))
     if re.search(r"^\s*No process in device\.?\s*$", proc_out, re.MULTILINE):
-        return True
+        return (0, 0, 0)
     return None
+
+
+def _probe_host_card_idle(device_id: str) -> bool | None:
+    """Return True if card has 0 compute processes, False if busy/locked, None if unavailable."""
+    load = _probe_host_card_load(device_id)
+    if load is None:
+        return None
+    return load[0] == 0
 
 
 def order_candidates_by_idle_preflight(
@@ -2545,22 +2577,38 @@ def order_candidates_by_idle_preflight(
     device_pool: Sequence[str] = (),
     excluded: Collection[str] = (),
 ) -> tuple[str, ...]:
-    """Order candidate cards with idle cards first, unknown middle, busy last."""
+    """Order candidate cards: free, unknown, quiet shared (lightest first), heavy, locked."""
     candidates = _normalize_device_pool(device_id, device_pool, excluded=excluded)
     if len(candidates) <= 1:
         return candidates
-    idle_cards: list[str] = []
+    tier0: list[str] = []
     unknown_cards: list[str] = []
-    busy_cards: list[str] = []
-    for card in candidates:
-        status = _probe_host_card_idle(card)
-        if status is True:
-            idle_cards.append(card)
-        elif status is False:
-            busy_cards.append(card)
-        else:
+    tier1: list[tuple[int, int, int, str]] = []
+    tier2: list[tuple[int, int, int, str]] = []
+    tier3: list[str] = []
+    for pool_idx, card in enumerate(candidates):
+        load = _probe_host_card_load(card)
+        if load is None:
             unknown_cards.append(card)
-    return (*idle_cards, *unknown_cards, *busy_cards)
+            continue
+        tier, total_mem_mb, proc_count = load
+        if tier == 0:
+            tier0.append(card)
+        elif tier == 1:
+            tier1.append((total_mem_mb, proc_count, pool_idx, card))
+        elif tier == 2:
+            tier2.append((total_mem_mb, proc_count, pool_idx, card))
+        else:
+            tier3.append(card)
+    tier1.sort(key=lambda row: (row[0], row[1], row[2]))
+    tier2.sort(key=lambda row: (row[0], row[1], row[2]))
+    return (
+        *tier0,
+        *unknown_cards,
+        *[row[3] for row in tier1],
+        *[row[3] for row in tier2],
+        *tier3,
+    )
 
 
 def select_idle_campaign_device(

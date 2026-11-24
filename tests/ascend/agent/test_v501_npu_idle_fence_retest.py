@@ -807,3 +807,156 @@ def test_submit_fast_gate_progressive_occupancy_backoff_and_budget_cap(
             device_pool=("1", "2"),
         )
     assert sleeps == [4.0, 6.0, 8.0]
+
+
+def test_order_candidates_by_idle_preflight_ranks_quiet_shared_before_heavy_and_locked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Quiet shared cards rank by ascending HBM/proc count ahead of heavy and locked cards."""
+    monkeypatch.setenv("AGENT_GATES_DEVICE_LOCK_ROOT", str(tmp_path / "locks"))
+    (tmp_path / "locks").mkdir()
+    monkeypatch.setattr(surrogate_cannbench.shutil, "which", lambda _cmd: "/usr/bin/npu-smi")
+    monkeypatch.setattr(surrogate_cannbench.time, "sleep", lambda _s: None)
+
+    def _fake_smi(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if cmd[1:] == ["info", "-m"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=(
+                    "NPU ID  Slot ID  Chip ID  Chip Phy-ID  Chip Name\n"
+                    "0       74       0        0            Ascend950PR\n"
+                    "1       76       0        1            Ascend950PR\n"
+                    "2       84       0        2            Ascend950PR\n"
+                ),
+                stderr="",
+            )
+        if cmd[1:] == ["info", "-t", "proc-mem", "-i", "0"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=(
+                    "NPU ID                         : 0\n"
+                    "Process id:101  Process name:python            Process memory(MB):47000\n"
+                ),
+                stderr="",
+            )
+        if cmd[1:] == ["info", "-t", "proc-mem", "-i", "1"]:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout=(
+                    "NPU ID                         : 1\n"
+                    "Process id:201  Process name:python            Process memory(MB):1084\n"
+                ),
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout=(
+                "NPU ID                         : 2\n"
+                "Process id:301  Process name:python            Process memory(MB):2000\n"
+                "Process id:302  Process name:python            Process memory(MB):1050\n"
+                "Process id:303  Process name:python            Process memory(MB):1000\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(surrogate_cannbench.subprocess, "run", _fake_smi)
+    assert surrogate_cannbench.order_candidates_by_idle_preflight(
+        "0", ("0", "1", "2")
+    ) == ("1", "2", "0")
+
+
+def test_measure_npu_ring_burst_us_rejects_upper_tail_contention_spikes() -> None:
+    """High-CV bursts retry up to 2x and take cleaner retry or lower-half envelope median."""
+
+    class _ClockEvent:
+        def __init__(self, clock: list[float]) -> None:
+            self._clock = clock
+            self._t = 0.0
+
+        def record(self) -> None:
+            self._t = self._clock[0]
+
+        def elapsed_time(self, other: _ClockEvent) -> float:
+            return (other._t - self._t) / 1000.0
+
+    clock = [0.0]
+
+    def _clean_fn(_x: object) -> None:
+        clock[0] += 3.0
+
+    clean_us, clean_k = surrogate_cannbench.measure_npu_ring_burst_us(
+        _clean_fn,
+        object(),
+        warmup=1,
+        repeat=3,
+        t_hw_us=2.0,
+        first_probe_us=3.0,
+        event_factory=lambda: _ClockEvent(clock),
+        synchronize_fn=lambda: None,
+        clone_fn=lambda o: o,
+    )
+    assert clean_k >= 1
+    assert clean_us == pytest.approx(3.0)
+
+    k = surrogate_cannbench.compute_ring_burst_k(0, t_hw_us=2.0, first_probe_us=10.0)
+    assert k >= 1
+    warmup_calls = 1 + min(k, 1)
+
+    step_idx = [0]
+    pattern_per_call = [
+        *([10.0] * warmup_calls),
+        *([5.0] * k),
+        *([6.0] * k),
+        *([25.0] * k),
+        *([5.0] * (3 * k)),
+    ]
+
+    def _retry_clean_fn(_x: object) -> None:
+        val = pattern_per_call[min(step_idx[0], len(pattern_per_call) - 1)]
+        step_idx[0] += 1
+        clock[0] += val
+
+    retried_us, retried_k = surrogate_cannbench.measure_npu_ring_burst_us(
+        _retry_clean_fn,
+        object(),
+        warmup=1,
+        repeat=3,
+        t_hw_us=2.0,
+        first_probe_us=10.0,
+        event_factory=lambda: _ClockEvent(clock),
+        synchronize_fn=lambda: None,
+        clone_fn=lambda o: o,
+    )
+    assert retried_k == k
+    assert retried_us == pytest.approx(5.0)
+
+    step_idx_3 = [0]
+    noisy_pattern = [
+        *([10.0] * warmup_calls),
+        *([5.0] * k), *([6.0] * k), *([30.0] * k),
+        *([5.5] * k), *([6.5] * k), *([35.0] * k),
+        *([5.2] * k), *([6.2] * k), *([40.0] * k),
+    ]
+
+    def _all_noisy_fn(_x: object) -> None:
+        val = noisy_pattern[min(step_idx_3[0], len(noisy_pattern) - 1)]
+        step_idx_3[0] += 1
+        clock[0] += val
+
+    env_us, _ = surrogate_cannbench.measure_npu_ring_burst_us(
+        _all_noisy_fn,
+        object(),
+        warmup=1,
+        repeat=3,
+        t_hw_us=2.0,
+        first_probe_us=10.0,
+        event_factory=lambda: _ClockEvent(clock),
+        synchronize_fn=lambda: None,
+        clone_fn=lambda o: o,
+    )
+    assert env_us < 6.0
