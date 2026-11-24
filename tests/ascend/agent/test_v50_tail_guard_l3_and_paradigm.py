@@ -1040,7 +1040,8 @@ def kernel(x):
         stagnation_rounds=2,
         admitted_rule_ids=[],
     )
-    assert "coupled_1c2v" in seen_rank_axes
+    assert "coupled_1c2v" not in seen_rank_axes
+    assert runner._freedom_masks[runner._regime_specs[0].regime_tag].is_unrestricted_top is True
 
 
 @pytest.mark.anyio
@@ -1144,8 +1145,12 @@ def kernel(x):
         source_provenance="test",
     )
 
+    seen_rank_axes: list[str] = []
+
     def _fake_rank_rules(*_args: object, **kwargs: object) -> list[AscendCausalRule]:
         axes = kwargs.get("topology_axes")
+        if axes is not None and hasattr(axes, "compute_engine"):
+            seen_rank_axes.append(str(axes.compute_engine))
         if axes is not None and getattr(axes, "compute_engine", "") == "coupled_1c2v":
             return [coupled_r0, coupled_r1]
         return [aiv_r0, aiv_r1]
@@ -1206,17 +1211,23 @@ def kernel(x):
     )
 
     assert rec.paradigm_shift_active is True
-    assert rec.paradigm_shift_rule_ids == ("R01_SHIFT",)
+    assert rec.paradigm_shift_rule_ids == ()
+    assert "coupled_1c2v" not in seen_rank_axes
+    regime_tag = runner._regime_specs[0].regime_tag
+    assert runner._freedom_masks[regime_tag].is_unrestricted_top is True
     exploit_reqs = [req for req in captured_requests if req.role == "exploit_rule"]
     creative_reqs = [req for req in captured_requests if req.role == "explore_creative"]
     assert len(exploit_reqs) == 2
-    assert any("R01_SHIFT" in req.user_prompt for req in exploit_reqs)
     assert any("R08_AIV" in req.user_prompt for req in exploit_reqs)
-    assert not any("R11_AIV" in req.user_prompt for req in exploit_reqs)
-    assert len(creative_reqs) == 1
-    assert creative_reqs[0].paradigm_shift is True
-    assert _is_paradigm_shift_request(creative_reqs[0]) is True
-    assert "### PARADIGM SHIFT CROSS-TOPOLOGY UNLOCK" in creative_reqs[0].user_prompt
+    assert any("R11_AIV" in req.user_prompt for req in exploit_reqs)
+    assert not any("R01_SHIFT" in req.user_prompt for req in exploit_reqs)
+    assert len(creative_reqs) == 2
+    for creq in creative_reqs:
+        assert creq.paradigm_shift is True
+        assert _is_paradigm_shift_request(creq) is True
+        assert "### PARADIGM SHIFT CROSS-TOPOLOGY UNLOCK" in creq.user_prompt
+        assert "UNRESTRICTED TOP (all 7 facets unlocked)" in creq.user_prompt
+        assert "- locked_facets: none (top)" in creq.user_prompt
 
 
 def test_campaign_round_record_paradigm_shift_roundtrip() -> None:
