@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
@@ -342,6 +343,9 @@ class L3AcceptanceResult:
     device_id: str = ""
     state: str = ""
     execution_terminal: bool = True
+    blocked_env_category: str = ""
+    failed_case_nums: tuple[int, ...] = ()
+    failure_stage: str = ""
 
 
 @dataclass(frozen=True)
@@ -608,17 +612,26 @@ def measure_npu_ring_burst_us(
         _invoke(ring_inputs[step % k])
     synchronize_fn()
 
-    samples_us: list[float] = []
-    for _ in range(max(1, int(repeat))):
-        start_ev = event_factory()
-        end_ev = event_factory()
-        start_ev.record()
-        for step in range(k):
-            _invoke(ring_inputs[step % k])
-        end_ev.record()
-        synchronize_fn()
-        total_us = float(start_ev.elapsed_time(end_ev)) * 1000.0
-        samples_us.append(total_us / float(k))
+    def _collect_burst_samples() -> list[float]:
+        collected: list[float] = []
+        for _ in range(max(1, int(repeat))):
+            start_ev = event_factory()
+            end_ev = event_factory()
+            start_ev.record()
+            for step in range(k):
+                _invoke(ring_inputs[step % k])
+            end_ev.record()
+            synchronize_fn()
+            total_us = float(start_ev.elapsed_time(end_ev)) * 1000.0
+            collected.append(total_us / float(k))
+        return collected
+
+    samples_us = _collect_burst_samples()
+    if len(samples_us) >= 3:
+        med = float(statistics.median(samples_us))
+        cv = float(statistics.pstdev(samples_us)) / max(med, 1e-9)
+        if cv > 0.25:
+            samples_us = _collect_burst_samples()
     return float(statistics.median(samples_us)), k
 
 
@@ -2423,12 +2436,154 @@ def _run_agent_gates_cmd(
     return last_proc, last_parsed
 
 
+def _normalize_device_pool(
+    device_id: str,
+    device_pool: Sequence[str] = (),
+    excluded: Collection[str] = (),
+) -> tuple[str, ...]:
+    """Return canonical deduplicated decimal card IDs excluding rejected cards."""
+    ordered: list[str] = []
+    for raw in (device_id, *device_pool):
+        txt = str(raw or "").strip()
+        if txt.isdigit():
+            canon = str(int(txt))
+            if canon not in ordered and canon not in excluded:
+                ordered.append(canon)
+    return tuple(ordered)
+
+
+def _run_npu_smi_query(smi: str, args: Sequence[str]) -> str | None:
+    """Run read-only npu-smi query with short backoff retries on transient exit 215."""
+    retry_backoffs = (0.15, 0.35)
+    for attempt in range(len(retry_backoffs) + 1):
+        try:
+            proc = subprocess.run(
+                [smi, *args],
+                capture_output=True,
+                text=True,
+                timeout=10.0,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode == 0:
+            return proc.stdout or ""
+        if proc.returncode == 215 and attempt < len(retry_backoffs):
+            time.sleep(retry_backoffs[attempt])
+            continue
+        return None
+    return None
+
+
+def _probe_host_card_idle(device_id: str) -> bool | None:
+    """Return True if card has 0 compute processes, False if busy/locked, None if unavailable.
+
+    Lock files and quarantine sidecars are checked before invoking ``npu-smi``.
+    Supports both 5-column (Ascend950PR with Slot ID) and 4-column ``npu-smi info -m``
+    layouts and queries ``proc-mem -i <npu_id>`` without ``-c 0``.
+    """
+    txt = str(device_id or "").strip()
+    if not txt.isdigit():
+        return None
+    dev_idx = int(txt)
+    lock_dir_raw = os.environ.get("AGENT_GATES_DEVICE_LOCK_ROOT", "").strip()
+    lock_root = (
+        Path(lock_dir_raw).expanduser()
+        if lock_dir_raw
+        else Path.home() / ".local/state/agent-gates/locks"
+    )
+    lease_hash = hashlib.sha256(f"npu:{dev_idx}".encode()).hexdigest()
+    lease_file = lock_root / f"{lease_hash}.lock"
+    quarantine_file = Path(f"{lease_file}.quarantine.json")
+    if quarantine_file.is_file():
+        return False
+    if lease_file.is_file():
+        try:
+            fd = os.open(lease_file, os.O_RDONLY)
+        except OSError:
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
+    smi = shutil.which(os.environ.get("AGENT_GATES_SMI_COMMAND") or "npu-smi")
+    if smi is None:
+        return None
+    map_out = _run_npu_smi_query(smi, ("info", "-m"))
+    if map_out is None:
+        return None
+    npu_ids: list[int] = []
+    for line in map_out.splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and all(field.isdigit() for field in fields[:4]):
+            if int(fields[3]) == dev_idx:
+                npu_ids.append(int(fields[0]))
+        elif len(fields) >= 3 and all(field.isdigit() for field in fields[:3]):
+            if int(fields[2]) == dev_idx:
+                npu_ids.append(int(fields[0]))
+    unique_ids = sorted(set(npu_ids))
+    if len(unique_ids) != 1:
+        return None
+    npu_id = unique_ids[0]
+    proc_out = _run_npu_smi_query(smi, ("info", "-t", "proc-mem", "-i", str(npu_id)))
+    if proc_out is None:
+        return None
+    if not re.search(rf"^\s*NPU ID\s*:\s*{npu_id}\s*$", proc_out, re.MULTILINE):
+        return None
+    if re.search(r"Process id\s*:\s*\d+", proc_out):
+        return False
+    if re.search(r"^\s*No process in device\.?\s*$", proc_out, re.MULTILINE):
+        return True
+    return None
+
+
+def order_candidates_by_idle_preflight(
+    device_id: str,
+    device_pool: Sequence[str] = (),
+    excluded: Collection[str] = (),
+) -> tuple[str, ...]:
+    """Order candidate cards with idle cards first, unknown middle, busy last."""
+    candidates = _normalize_device_pool(device_id, device_pool, excluded=excluded)
+    if len(candidates) <= 1:
+        return candidates
+    idle_cards: list[str] = []
+    unknown_cards: list[str] = []
+    busy_cards: list[str] = []
+    for card in candidates:
+        status = _probe_host_card_idle(card)
+        if status is True:
+            idle_cards.append(card)
+        elif status is False:
+            busy_cards.append(card)
+        else:
+            unknown_cards.append(card)
+    return (*idle_cards, *unknown_cards, *busy_cards)
+
+
+def select_idle_campaign_device(
+    device_id: str,
+    device_pool: Sequence[str] = (),
+    excluded: Collection[str] = (),
+) -> str:
+    """Select the highest-priority idle or fallback device from the candidate pool."""
+    ordered = order_candidates_by_idle_preflight(
+        device_id,
+        device_pool,
+        excluded=excluded,
+    )
+    return ordered[0] if ordered else str(device_id or "").strip()
+
+
 def run_multi_operator_surrogate_batch_via_agent_gates(
     batches: Sequence[tuple[str, Sequence[tuple[str, str | Path]], Sequence[AnchorCaseSpec]]],
     *,
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     device_id: str = "1",
+    device_pool: Sequence[str] = (),
     warmup: int = 3,
     repeat: int = 5,
     require_all_passed: bool = False,
@@ -2543,6 +2698,7 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
         mode="batch",
         timeout_sec=float(timeout_sec),
         device_id=str(device_id),
+        device_pool=device_pool,
     )
     _verify_fast_bindings(raw_resp, staged)
     _verify_fast_coverage(
@@ -2592,6 +2748,7 @@ def run_surrogate_batch_via_agent_gates(
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     device_id: str = "1",
+    device_pool: Sequence[str] = (),
     warmup: int = 3,
     repeat: int = 5,
     require_all_passed: bool = False,
@@ -2604,6 +2761,7 @@ def run_surrogate_batch_via_agent_gates(
         source_root=source_root,
         env_file=env_file,
         device_id=device_id,
+        device_pool=device_pool,
         warmup=warmup,
         repeat=repeat,
         require_all_passed=require_all_passed,
@@ -2632,6 +2790,7 @@ def _collect_profile_via_agent_gates(
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     device_id: str = "1",
+    device_pool: Sequence[str] = (),
     warmup: int = 1,
     repeat: int = 3,
     timeout_sec: int = 300,
@@ -2736,6 +2895,7 @@ def _collect_profile_via_agent_gates(
         mode="profile",
         timeout_sec=float(timeout_sec),
         device_id=str(device_id),
+        device_pool=device_pool,
     )
     _verify_fast_bindings(
         raw_resp,
@@ -2773,6 +2933,7 @@ def collect_bottleneck_msprof_via_agent_gates(
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     device_id: str = "1",
+    device_pool: Sequence[str] = (),
     warmup: int = 1,
     repeat: int = 3,
     timeout_sec: int = 300,
@@ -2786,6 +2947,7 @@ def collect_bottleneck_msprof_via_agent_gates(
         source_root=source_root,
         env_file=env_file,
         device_id=device_id,
+        device_pool=device_pool,
         warmup=warmup,
         repeat=repeat,
         timeout_sec=timeout_sec,
@@ -2810,6 +2972,7 @@ def collect_p2_deep_dive_via_agent_gates(
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     device_id: str = "1",
+    device_pool: Sequence[str] = (),
     warmup: int = 1,
     repeat: int = 3,
     timeout_sec: int = 300,
@@ -2823,6 +2986,7 @@ def collect_p2_deep_dive_via_agent_gates(
         source_root=source_root,
         env_file=env_file,
         device_id=device_id,
+        device_pool=device_pool,
         warmup=warmup,
         repeat=repeat,
         timeout_sec=timeout_sec,
@@ -2948,24 +3112,29 @@ def _gate_failure_text(row: Mapping[str, object]) -> str:
     return str(raw_failures or "")
 
 
-def _blocked_env_category(report: Mapping[str, object]) -> str:
-    """Return the signed BLOCKED_ENV category across both L4 gate rows.
+def _blocked_env_category(
+    report: Mapping[str, object],
+    gate_ids: Sequence[str] = (
+        AGENT_GATES_DEVICE_FAST_GATE,
+        AGENT_GATES_L3_PROMOTION_GATE,
+        AGENT_GATES_L4_CANNBENCH_GATE,
+        AGENT_GATES_L4_CANNBENCH_PREP_GATE,
+    ),
+) -> str:
+    """Return the signed BLOCKED_ENV category across device-fast, L3, and L4 gate rows.
 
-    The official gate can record the preemption itself, or the prep gate can be
-    blocked first while the official gate only records ``DEPENDENCY_NOT_PASSED``.
-    A shared build lock also ends as BLOCKED_ENV, so the receipt's
-    ``errorCategory`` distinguishes an occupied card from a machine-wide
-    environment fault. Missing or unparsable categories stay unclassified and
-    never trigger card rotation.
+    Missing or unparsable categories stay unclassified and never trigger card rotation.
     """
-    for gate_id in (AGENT_GATES_L4_CANNBENCH_GATE, AGENT_GATES_L4_CANNBENCH_PREP_GATE):
+    for gate_id in gate_ids:
         row, observation = _gate_observation(report, gate_id)
         if row is None:
             continue
         blocked = _gate_recorded_status(row).upper() == "BLOCKED_ENV"
         if not blocked and "BLOCKED_EXIT_CODE: 75" not in _gate_failure_text(row):
             continue
-        category = str(observation.get("errorCategory") or "").strip().lower()
+        category = str(
+            observation.get("errorCategory") or observation.get("failureCategory") or ""
+        ).strip().lower()
         if category:
             return category
     return ""
@@ -3544,35 +3713,86 @@ def _submit_fast_gate(
     mode: str,
     timeout_sec: float,
     device_id: str,
+    device_pool: Sequence[str] = (),
 ) -> tuple[Mapping[str, object], _V2GateExecution]:
-    """Submit the device-fast dynamic target, verify its receipt, and load the response."""
+    """Submit the device-fast target with idle card selection and contamination retest."""
     if _sha256_file(request_path) != request_sha256:
         raise RuntimeError("fast request file changed after it was written")
     backoff = (8.0, 12.0, 16.0, 20.0, 25.0, 30.0)
     max_retries = 14
+    max_pool_passes = 2
+    rejected_cards: set[str] = set()
     execution: _V2GateExecution | None = None
-    for retry_idx in range(max_retries + 1):
-        execution = _run_v2_gate(
-            agent_gates_bin=agent_gates_bin,
-            root=root,
-            workspace=workspace,
-            gate_id=AGENT_GATES_DEVICE_FAST_GATE,
-            target=f"fast/{request_id}",
-            candidate_path=request_relative_path,
-            timeout_sec=timeout_sec,
-            device_id=device_id,
+    for pass_idx in range(max_pool_passes):
+        candidates = order_candidates_by_idle_preflight(
+            device_id,
+            device_pool,
+            excluded=rejected_cards,
         )
-        if not _is_fast_transient_build_lock(execution) or retry_idx >= max_retries:
+        if not candidates:
+            if not rejected_cards and str(device_id or "").strip():
+                candidates = (str(device_id).strip(),)
+            else:
+                break
+        contaminated_in_pass = False
+        for idx, card in enumerate(candidates):
+            attempt_exec: _V2GateExecution | None = None
+            for retry_idx in range(max_retries + 1):
+                attempt_exec = _run_v2_gate(
+                    agent_gates_bin=agent_gates_bin,
+                    root=root,
+                    workspace=workspace,
+                    gate_id=AGENT_GATES_DEVICE_FAST_GATE,
+                    target=f"fast/{request_id}",
+                    candidate_path=request_relative_path,
+                    timeout_sec=timeout_sec,
+                    device_id=card,
+                )
+                if not _is_fast_transient_build_lock(attempt_exec) or retry_idx >= max_retries:
+                    break
+                wait_sec = backoff[min(retry_idx, len(backoff) - 1)]
+                logger.info(
+                    "FAST_GATE_RETRY_BUILD_LOCK request=%s retry=%d/%d wait=%.1fs",
+                    request_id,
+                    retry_idx + 1,
+                    max_retries,
+                    wait_sec,
+                )
+                time.sleep(wait_sec)
+            assert attempt_exec is not None
+            execution = attempt_exec
+            blocked_category = _blocked_env_category(
+                attempt_exec.report,
+                (AGENT_GATES_DEVICE_FAST_GATE,),
+            )
+            if attempt_exec.device_rejected or blocked_category == "occupancy":
+                response_path.unlink(missing_ok=True)
+                if attempt_exec.device_rejected:
+                    rejected_cards.add(card)
+                reason = "device_rejected" if attempt_exec.device_rejected else "occupancy"
+                next_card = candidates[idx + 1] if idx + 1 < len(candidates) else "backoff"
+                logger.warning(
+                    "FAST_GATE_CONTAMINATION_RETEST request=%s tainted_device=%s "
+                    "reason=%s next_card=%s",
+                    request_id,
+                    card,
+                    reason,
+                    next_card,
+                )
+                contaminated_in_pass = True
+                continue
             break
-        wait_sec = backoff[min(retry_idx, len(backoff) - 1)]
-        logger.info(
-            "FAST_GATE_RETRY_BUILD_LOCK request=%s retry=%d/%d wait=%.1fs",
-            request_id,
-            retry_idx + 1,
-            max_retries,
-            wait_sec,
-        )
-        time.sleep(wait_sec)
+        else:
+            if contaminated_in_pass and pass_idx + 1 < max_pool_passes:
+                remaining = _normalize_device_pool(
+                    device_id,
+                    device_pool,
+                    excluded=rejected_cards,
+                )
+                if remaining:
+                    time.sleep(4.0)
+                    continue
+        break
     assert execution is not None
     if execution.transport_error:
         raise RuntimeError(f"AgentGates device-fast batch failed: {execution.transport_error}")
@@ -3907,6 +4127,61 @@ def classify_l3_observation_failure(
     return kind, kind != FAILURE_KIND_CANDIDATE
 
 
+def _parse_l3_case_num(raw: object) -> int | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    if isinstance(raw, str):
+        txt = raw.strip()
+        if txt.isdigit():
+            return int(txt)
+    return None
+
+
+def _extract_l3_failed_case_nums(evidence: Mapping[str, object]) -> tuple[int, ...]:
+    """Extract sorted deduplicated failed or errored case indices from L3 evidence."""
+    found: set[int] = set()
+
+    def _add_case(raw: object) -> None:
+        parsed = _parse_l3_case_num(raw)
+        if parsed is not None:
+            found.add(parsed)
+
+    ev_failure = evidence.get("failure")
+    if isinstance(ev_failure, Mapping):
+        _add_case(ev_failure.get("case"))
+
+    failures_seq = evidence.get("failures")
+    if isinstance(failures_seq, Sequence) and not isinstance(failures_seq, (str, bytes)):
+        for item in failures_seq:
+            if isinstance(item, Mapping):
+                _add_case(item.get("case"))
+
+    nodes = evidence.get("nodes")
+    if isinstance(nodes, Sequence) and not isinstance(nodes, (str, bytes)):
+        for node in nodes:
+            if not isinstance(node, Mapping):
+                continue
+            node_fail = node.get("failure")
+            if isinstance(node_fail, Mapping):
+                _add_case(node_fail.get("case"))
+            cases = node.get("cases")
+            if isinstance(cases, Mapping):
+                for case_key, case_status in cases.items():
+                    if str(case_status or "").strip().lower() in {"failed", "error"}:
+                        _add_case(case_key)
+
+    return tuple(sorted(found))
+
+
+def _l3_failure_stage(evidence: Mapping[str, object]) -> str:
+    primary = _select_primary_l3_failure(evidence)
+    if not isinstance(primary, Mapping):
+        return ""
+    return str(primary.get("stage") or "").strip().lower()
+
+
 def l3_failure_result_from_observation(
     observation: Mapping[str, object],
     *,
@@ -3918,6 +4193,7 @@ def l3_failure_result_from_observation(
     device_id: str = "",
     state: str = "",
     execution_terminal: bool = True,
+    blocked_env_category: str = "",
 ) -> L3AcceptanceResult:
     """Map an adapter L3 observation to the campaign failure result."""
     evidence = _l3_evidence_payload(observation)
@@ -3935,6 +4211,9 @@ def l3_failure_result_from_observation(
         device_id=device_id,
         state=state,
         execution_terminal=execution_terminal,
+        blocked_env_category=blocked_env_category,
+        failed_case_nums=_extract_l3_failed_case_nums(evidence),
+        failure_stage=_l3_failure_stage(evidence),
     )
 
 
@@ -4049,6 +4328,7 @@ def run_l3_full_contract_via_agent_gates(
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     device_id: str = "1",
+    device_pool: Sequence[str] = (),
     timeout_sec: int = DEFAULT_L3_PROMOTION_WAIT_SEC,
     resume_execution_id: str = "",
     resume_run_id: str = "",
@@ -4073,6 +4353,7 @@ def run_l3_full_contract_via_agent_gates(
         result_device_id: str = "",
         state: str = "",
         execution_terminal: bool = True,
+        blocked_env_category: str = "",
     ) -> L3AcceptanceResult:
         return L3AcceptanceResult(
             passed=False,
@@ -4087,6 +4368,7 @@ def run_l3_full_contract_via_agent_gates(
             device_id=result_device_id or result_device,
             state=state,
             execution_terminal=execution_terminal,
+            blocked_env_category=blocked_env_category,
         )
 
     if operator_name is None or candidate_module_path is None:
@@ -4112,19 +4394,72 @@ def run_l3_full_contract_via_agent_gates(
         return _fail(str(exc))
     target_path = str(candidate)
 
-    execution = _run_v2_gate(
-        agent_gates_bin=agent_gates_bin,
-        root=root,
-        workspace=workspace,
-        gate_id=AGENT_GATES_L3_PROMOTION_GATE,
-        target=target_task,
-        candidate_path=relative,
-        timeout_sec=timeout_sec,
-        device_id=result_device,
-        resume_execution_id=resume_execution_id,
-        resume_run_id=resume_run_id,
-        on_execution_started=on_execution_started,
-    )
+    blocked_env_category = ""
+    if resume_execution_id or resume_run_id:
+        execution = _run_v2_gate(
+            agent_gates_bin=agent_gates_bin,
+            root=root,
+            workspace=workspace,
+            gate_id=AGENT_GATES_L3_PROMOTION_GATE,
+            target=target_task,
+            candidate_path=relative,
+            timeout_sec=timeout_sec,
+            device_id=result_device,
+            resume_execution_id=resume_execution_id,
+            resume_run_id=resume_run_id,
+            on_execution_started=on_execution_started,
+        )
+        blocked_env_category = _blocked_env_category(
+            execution.report,
+            (AGENT_GATES_L3_PROMOTION_GATE,),
+        )
+    else:
+        rejected_cards: set[str] = set()
+        candidates = order_candidates_by_idle_preflight(
+            result_device,
+            device_pool,
+            excluded=rejected_cards,
+        )
+        if not candidates:
+            candidates = (result_device,)
+        execution_opt: _V2GateExecution | None = None
+        for idx, card in enumerate(candidates):
+            result_device = card
+            attempt_exec = _run_v2_gate(
+                agent_gates_bin=agent_gates_bin,
+                root=root,
+                workspace=workspace,
+                gate_id=AGENT_GATES_L3_PROMOTION_GATE,
+                target=target_task,
+                candidate_path=relative,
+                timeout_sec=timeout_sec,
+                device_id=card,
+                resume_execution_id="",
+                resume_run_id="",
+                on_execution_started=on_execution_started,
+            )
+            execution_opt = attempt_exec
+            blocked_env_category = _blocked_env_category(
+                attempt_exec.report,
+                (AGENT_GATES_L3_PROMOTION_GATE,),
+            )
+            if attempt_exec.device_rejected or blocked_env_category == "occupancy":
+                if attempt_exec.device_rejected and card:
+                    rejected_cards.add(card)
+                if idx + 1 < len(candidates):
+                    logger.warning(
+                        "L3_CONTAMINATION_RETEST task=%s tainted_device=%s "
+                        "reason=%s next_card=%s",
+                        target_task,
+                        card,
+                        "device_rejected" if attempt_exec.device_rejected else "occupancy",
+                        candidates[idx + 1],
+                    )
+                    continue
+            break
+        assert execution_opt is not None
+        execution = execution_opt
+
     if execution.transport_error:
         return _fail(
             execution.transport_error,
@@ -4134,6 +4469,7 @@ def run_l3_full_contract_via_agent_gates(
             result_device_id=execution.device_id,
             state=execution.state,
             execution_terminal=execution.execution_terminal,
+            blocked_env_category=blocked_env_category,
         )
     row, observation = _gate_observation(execution.report, AGENT_GATES_L3_PROMOTION_GATE)
     if row is None:
@@ -4145,11 +4481,14 @@ def run_l3_full_contract_via_agent_gates(
             result_device_id=execution.device_id,
             state=execution.state,
             execution_terminal=execution.execution_terminal,
+            blocked_env_category=blocked_env_category,
         )
     evidence = _l3_evidence_payload(observation)
     coverage_raw = evidence.get("coverage")
     coverage = coverage_raw if isinstance(coverage_raw, Mapping) else None
     recorded_status = _gate_recorded_status(row)
+    failed_case_nums = _extract_l3_failed_case_nums(evidence)
+    failure_stage = _l3_failure_stage(evidence)
 
     def _reject(message: str, *, failure_kind: str) -> L3AcceptanceResult:
         return L3AcceptanceResult(
@@ -4167,6 +4506,9 @@ def run_l3_full_contract_via_agent_gates(
             device_id=execution.device_id or result_device,
             state=execution.state,
             execution_terminal=execution.execution_terminal,
+            blocked_env_category=blocked_env_category,
+            failed_case_nums=failed_case_nums,
+            failure_stage=failure_stage,
         )
 
     if recorded_status != "PASS":
@@ -4373,6 +4715,7 @@ def run_micro_probe_via_agent_gates(
     source_root: str | Path | None = None,
     env_file: str | Path | None = None,
     device_id: str = "1",
+    device_pool: Sequence[str] = (),
     min_speedup: float = 1.08,
     timeout_sec: int = 360,
     prewarm_cache: bool = True,
@@ -4455,6 +4798,7 @@ def run_micro_probe_via_agent_gates(
         mode="micro_probe",
         timeout_sec=float(timeout_sec),
         device_id=str(device_id),
+        device_pool=device_pool,
     )
     _verify_fast_bindings(raw_resp, staged)
     _verify_fast_coverage(raw_resp, expected_candidates=2, expected_msprof_targets=0)
@@ -4888,6 +5232,7 @@ __all__ = [
     "ensure_npu_compare_shim_dir",
     "extract_ordered_tensor_shapes",
     "lookup_case_static_spec",
+    "order_candidates_by_idle_preflight",
     "prewarm_anchor_reference_cache",
     "prewarm_surrogate_tilelang_cache",
     "run_l0_l1_round_filter",
@@ -4898,4 +5243,5 @@ __all__ = [
     "run_micro_probe_via_agent_gates",
     "run_multi_operator_surrogate_batch_via_agent_gates",
     "run_surrogate_batch_via_agent_gates",
+    "select_idle_campaign_device",
 ]

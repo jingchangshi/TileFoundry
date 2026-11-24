@@ -1433,6 +1433,7 @@ def build_resilient_l2_evaluator(
     worktree: Path,
     env_file: Path,
     device_id: str,
+    device_pool: Sequence[str] = (),
     warmup: int = 3,
     repeat: int = 5,
     batch_fn: Callable[..., tuple[dict[str, CandidateSurrogateResult], str, str]] | None = None,
@@ -1447,6 +1448,9 @@ def build_resilient_l2_evaluator(
         anc_seq: Sequence[AnchorCaseSpec],
     ) -> L2BatchResults:
         cand_list = list(cands)
+        pool_kwargs: dict[str, object] = (
+            {"device_pool": device_pool} if batch_fn is None and len(device_pool) > 1 else {}
+        )
         try:
             res, run_id, _rcp = eval_fn(
                 operator_name,
@@ -1459,6 +1463,7 @@ def build_resilient_l2_evaluator(
                 repeat=repeat,
                 require_all_passed=False,
                 timeout_sec=660,
+                **pool_kwargs,
             )
             return L2BatchResults(res, {cid: run_id for cid in res})
         except FileNotFoundError:
@@ -1488,6 +1493,7 @@ def build_resilient_l2_evaluator(
                         repeat=repeat,
                         require_all_passed=False,
                         timeout_sec=360,
+                        **pool_kwargs,
                     )
                     merged.update(one_res)
                     run_ids.update({cand_id: run_id for cand_id in one_res})
@@ -1944,6 +1950,7 @@ def run_operator_marathon(
         worktree=worktree,
         env_file=env_file,
         device_id=primary_device_id,
+        device_pool=device_pool,
         warmup=cfg.warmup,
         repeat=cfg.repeat,
         op_logger=op_logger,
@@ -1956,6 +1963,11 @@ def run_operator_marathon(
         device_id: str = "",
         on_execution_started: Callable[[str, str], None] | None = None,
     ) -> L3AcceptanceResult:
+        l3_kwargs: dict[str, object] = (
+            {"device_pool": device_pool}
+            if len(device_pool) > 1 and not resume_execution_id and not resume_run_id
+            else {}
+        )
         result = run_l3_full_contract_via_agent_gates(
             operator_name=cfg.operator_name,
             candidate_module_path=module_path,
@@ -1964,6 +1976,7 @@ def run_operator_marathon(
             resume_execution_id=resume_execution_id,
             resume_run_id=resume_run_id,
             on_execution_started=on_execution_started,
+            **l3_kwargs,
         )
         op_logger.info(
             "L3_CONTRACT_DONE op=%s passed=%s elapsed=%.1fs run_id=%s execution_id=%s "
@@ -2048,6 +2061,7 @@ def run_operator_marathon(
             device_id=primary_device_id,
             min_speedup=1.08,
             timeout_sec=360,
+            **({"device_pool": device_pool} if len(device_pool) > 1 else {}),
         ),
     )
     pure_anchors: tuple[AnchorCaseSpec, ...] | None = None
@@ -2074,6 +2088,7 @@ def run_operator_marathon(
             env_file=env_file,
             device_id=primary_device_id,
             timeout_sec=600,
+            **({"device_pool": device_pool} if len(device_pool) > 1 else {}),
         )
 
     def _l4_fn(mod_path: Path, **kwargs: object) -> object:
@@ -2687,6 +2702,11 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         default="auto",
         help="Cost model lifecycle mode (e.g. auto, off, always).",
     )
+    parser.add_argument(
+        "--disable-early-goal-stop",
+        action="store_true",
+        help="Disable early stopping when Roofline/speedup goal is reached.",
+    )
 
 
 def build_marathon_arg_parser() -> argparse.ArgumentParser:
@@ -2762,6 +2782,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         round_regime_tags=tuple(args.round_regime or ()),
         max_wall_clock_min=float(args.max_wall_clock_min),
         k_rule_workers=int(args.k_rule_workers),
+        disable_early_goal_stop=bool(args.disable_early_goal_stop),
         run_final_l4=not bool(args.no_final_l4),
         resume=False if args.fresh else None,
         salvage_beam_candidates=not bool(args.no_salvage),

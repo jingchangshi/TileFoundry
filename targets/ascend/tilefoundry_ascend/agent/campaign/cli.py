@@ -107,6 +107,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=0.03,
         help="Local relative gain threshold below which cost model disengages when eta >= disengage_eta.",
     )
+    parser.add_argument(
+        "--pure-golden",
+        action="store_true",
+        help="Isolate synthesis from authored HIR, DEFAULT_REGIME_SPECS, and repo incumbents.",
+    )
+    parser.add_argument(
+        "--disable-early-goal-stop",
+        action="store_true",
+        help="Disable early stopping when Roofline/speedup goal is reached.",
+    )
     return parser
 
 
@@ -131,13 +141,15 @@ def main(argv: list[str] | None = None) -> int:
                 else 720.0
             ),
             k_rule_workers=int(args.k_rule_workers),
-            run_final_l4=True if args.run_final_l4 else True,
+            disable_early_goal_stop=bool(args.disable_early_goal_stop),
+            run_final_l4=True,
             resume=True if args.resume else None,
             enable_tilesize_prescreen=bool(args.enable_tilesize_prescreen),
             cost_prescreen_top_k=(
                 int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
             ),
             cost_model_mode=str(args.cost_model_mode),
+            pure_golden=bool(args.pure_golden),
             llm_backend=args.llm_backend,
             exploit_model=args.exploit_model,
             explore_model=args.explore_model,
@@ -172,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
         max_rounds=max_rounds,
         max_wall_clock_min=max_wall_clock_min,
         k_rule_workers=args.k_rule_workers,
+        disable_early_goal_stop=bool(args.disable_early_goal_stop),
         run_final_l4=bool(args.run_final_l4),
         device_id=primary_device_id,
         device_ids=tuple(device for device in device_pool if device != primary_device_id),
@@ -182,6 +195,7 @@ def main(argv: list[str] | None = None) -> int:
         cost_model_mode=str(args.cost_model_mode),
         cost_disengage_eta=float(args.cost_disengage_eta),
         cost_slow_gain_threshold=float(args.cost_slow_gain_threshold),
+        pure_golden=bool(args.pure_golden),
     )
     tracker = BayesianRuleTracker.from_seed_yaml()
     flywheel = FlywheelDistiller(
@@ -193,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
                 source_root=args.source_root,
                 env_file=args.env_file,
                 device_id=primary_device_id,
+                device_pool=device_pool,
             )
         )
         if args.env_file
