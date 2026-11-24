@@ -48,6 +48,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     aggregate_surrogate_result,
     build_anchor_metrics,
     ensure_npu_compare_shim_dir,
+    measure_npu_ring_burst_us,
 )
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
     MicroProbeSpec,
@@ -813,17 +814,39 @@ def _evaluate_operator_batch(
                     err_msg = ""
                     if not passed:
                         err_msg = json.dumps(details)[:300]
-                    cand_us = _measure_npu_latency_us(
-                        lambda f=fn, p=params: f(**p),
-                        warmup=warmup,
-                        repeat=repeat,
-                    )
+                    ring_burst_k = 1
+                    if 0.0 < float(spec.t_hw_us) < 5.0:
+                        cand_us, ring_burst_k = measure_npu_ring_burst_us(
+                            fn,
+                            params,
+                            warmup=warmup,
+                            repeat=repeat,
+                            t_hw_us=spec.t_hw_us,
+                            max_vram_bytes=512 * 1024 * 1024,
+                        )
+                    else:
+                        cand_us = _measure_npu_latency_us(
+                            lambda f=fn, p=params: f(**p),
+                            warmup=warmup,
+                            repeat=repeat,
+                        )
+                        if 0.0 < cand_us < 8.0:
+                            cand_us, ring_burst_k = measure_npu_ring_burst_us(
+                                fn,
+                                params,
+                                warmup=warmup,
+                                repeat=repeat,
+                                t_hw_us=spec.t_hw_us,
+                                first_probe_us=cand_us,
+                                max_vram_bytes=512 * 1024 * 1024,
+                            )
                     per_cand_metrics[cid].append(
                         build_anchor_metrics(
                             spec,
                             accuracy_passed=passed,
                             cand_us=cand_us,
                             error_message=err_msg,
+                            ring_burst_k=ring_burst_k,
                         )
                     )
                     if passed and msprof_out is not None and int(spec.case_num) in msprof_case_set:

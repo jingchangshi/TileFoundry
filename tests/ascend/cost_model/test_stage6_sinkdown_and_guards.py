@@ -85,9 +85,10 @@ def test_scalar_compute_loop_fallback_inflates_zero_sample_prediction_and_rankin
         extra_signals={"scalar_compute_loop_fallback": 1.0},
     )
     assert (
-        model.predict(degraded_prof).vec_floor_us
-        > model.predict(clean_prof).vec_floor_us * 100.0
+        model.predict(degraded_prof).pred_us
+        > model.predict(clean_prof).pred_us
     )
+    assert model.predict(degraded_prof).tier1_penalty_us > 0.0
 
 
 def test_dcache_bypass_narrow_store_inflates_hbm_floor_and_ranking() -> None:

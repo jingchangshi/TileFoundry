@@ -2137,8 +2137,8 @@ def test_marathon_passes_seed_blueprints_and_topology_axes_to_runner(
     )
     monkeypatch.setattr(
         marathon,
-        "build_prewarmed_l3_runner",
-        lambda **_kw: (lambda _path: L3AcceptanceResult(passed=True)),
+        "run_l3_full_contract_via_agent_gates",
+        lambda **_kw: L3AcceptanceResult(passed=True),
     )
     monkeypatch.setattr(
         marathon,

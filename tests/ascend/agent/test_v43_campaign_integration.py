@@ -489,7 +489,7 @@ def test_pure_golden_mode_cli_marathon_provenance_and_typed_abi(
     )
     monkeypatch.setattr(marathon, "create_llm_backend_from_env", lambda **_k: backend)
     monkeypatch.setattr(marathon, "build_resilient_l2_evaluator", lambda **_k: (lambda c, a: {}))
-    monkeypatch.setattr(marathon, "build_prewarmed_l3_runner", lambda **_k: (lambda _p: None))
+    monkeypatch.setattr(marathon, "run_l3_full_contract_via_agent_gates", lambda **_k: None)
     monkeypatch.setattr(marathon, "resolve_default_experience_lake_dir", lambda **_k: None)
     monkeypatch.setattr(marathon, "ExtremeCampaignRunner", _CapturingRunner)
 

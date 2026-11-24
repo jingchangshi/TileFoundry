@@ -45,6 +45,7 @@ from tilefoundry_ascend.ascend.schedule.envelope_inspector import (
     inspect_tilelang_primfunc,
 )
 from tilefoundry_ascend.ascend.sil.schema import CasePhysicsRatios
+from tilefoundry_ascend.ascend.sil.verifier import verify_tilelang_ast
 from tilefoundry_ascend.ascend.target import PURE_SIMDVF_UBUF_FLAGS, AscendTarget
 from tilefoundry_ascend.ascend.target.dialect_surface import CCE_CPP20_SURFACE
 
@@ -3212,6 +3213,15 @@ def run_stage_a_static(
                     "(causes insert_sync AIV0.MTE3->AIV1.MTE3 fatal); "
                     "partition rows as sid * half_m : (sid + 1) * half_m"
                 ),
+                elapsed_ms=(time.monotonic() - t0) * 1000.0,
+            )
+        tl_ast_report = verify_tilelang_ast(dsl_source)
+        if not tl_ast_report.passed:
+            return StageAResult(
+                passed=False,
+                prim_func=None,
+                ledger=None,
+                error_message="; ".join(tl_ast_report.errors),
                 elapsed_ms=(time.monotonic() - t0) * 1000.0,
             )
         entry_name = _detect_module_entrypoint(parsed_tree)

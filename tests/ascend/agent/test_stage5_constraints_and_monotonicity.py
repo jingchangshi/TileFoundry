@@ -310,7 +310,7 @@ def test_run_l0_l1_round_filter_rejects_repair_monotonicity_violations() -> None
 
 
 def test_run_l0_l1_round_filter_bounded_creative_passthrough() -> None:
-    """Promote 1 creative candidate into L1 iff analytical_us <= 1.5 * parent_analytical_us."""
+    """Exempt creative_explore from 1.5x cutoff while pruning >ratio rule candidates."""
     ledger = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
         is_legal=True,
@@ -357,7 +357,7 @@ def test_run_l0_l1_round_filter_bounded_creative_passthrough() -> None:
             stage_a_cost_ranker=lambda _items: [
                 ("rule_0", 10.0),
                 ("rule_1", 12.0),
-                ("creative_0", 16.0),
+                ("creative_0", 25.0),
             ],
             cost_prescreen_top_k=2,
             creative_candidate_ids={"creative_0"},
@@ -367,6 +367,5 @@ def test_run_l0_l1_round_filter_bounded_creative_passthrough() -> None:
     by_id_over = {chk.candidate_id: chk for chk in checks_over}
     assert by_id_over["rule_0"].passed is True
     assert by_id_over["rule_1"].passed is True
-    assert by_id_over["creative_0"].passed is False
-    assert by_id_over["creative_0"].failed_tier == "cost_prescreen"
-    assert set(l1_seen_over) == {"src_r0", "src_r1"}
+    assert by_id_over["creative_0"].passed is True
+    assert set(l1_seen_over) == {"src_r0", "src_r1", "src_c0"}

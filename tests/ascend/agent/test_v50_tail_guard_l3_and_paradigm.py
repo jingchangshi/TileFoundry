@@ -987,7 +987,7 @@ def kernel(x):
     )
     assert rec.cost_model_engaged is False
     assert rec.cost_model_mode == "auto"
-    assert "auto_disengaged" in rec.cost_model_reason
+    assert rec.cost_model_reason == "near_theoretical_limit"
     assert prescreen_calls == 0
     assert seen_contexts and seen_contexts[0].get("use_uncalibrated_analytical") is False
     assert seen_filter_kwargs

@@ -3845,13 +3845,14 @@ class PerfTargetCampaignRunner:
                 module_source, tb_extracted[1], regime_spec
             )
             sel_flags = self._resolve_trackb_selector_flags(module_source, regime_spec)
+            effective_flags = resolve_trackb_compile_flags(instantiated_tu, sel_flags)
             tb_res = (
                 self._compile_trackb_stage_b(instantiated_tu, selector_flags=sel_flags)
                 if sel_flags
                 else self._compile_trackb_stage_b(instantiated_tu)
             )
             uses_unreserved_ubuf = any(
-                "--cce-disable-vf-stack-reserved-ubuf" in str(fl) for fl in sel_flags
+                "--cce-disable-vf-stack-reserved-ubuf" in str(fl) for fl in effective_flags
             )
             if tb_res.passed and uses_unreserved_ubuf:
                 max_dims = self._resolve_max_row_width_dims(regime_spec)
@@ -3862,12 +3863,16 @@ class PerfTargetCampaignRunner:
                     max_spec = replace(regime_spec, representative_anchor_dims=dict(max_dims))
                     max_tu = self._instantiate_trackb_tu(module_source, tb_extracted[1], max_spec)
                     max_flags = self._resolve_trackb_selector_flags(module_source, max_spec)
-                    max_b = (
-                        self._compile_trackb_stage_b(max_tu, selector_flags=max_flags)
-                        if max_flags
-                        else self._compile_trackb_stage_b(max_tu)
-                    )
-                    if not max_b.passed or self._has_vf_stack_overflow(max_b):
+                    max_eff_flags = resolve_trackb_compile_flags(max_tu, max_flags)
+                    if max_tu != instantiated_tu or max_eff_flags != effective_flags:
+                        max_b = (
+                            self._compile_trackb_stage_b(max_tu, selector_flags=max_flags)
+                            if max_flags
+                            else self._compile_trackb_stage_b(max_tu)
+                        )
+                    if (max_tu != instantiated_tu or max_eff_flags != effective_flags) and (
+                        not max_b.passed or self._has_vf_stack_overflow(max_b)
+                    ):
                         stack_bytes = (
                             int(max_b.compiler_summary.stack_bytes)
                             if max_b.compiler_summary is not None

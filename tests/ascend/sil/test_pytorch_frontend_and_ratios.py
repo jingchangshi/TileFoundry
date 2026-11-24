@@ -91,7 +91,7 @@ _EXPECTED_AXES: dict[str, str] = {
     "mhc_sinkhorn": "aiv_only/persistent_onchip_state/affine_simd",
     "grouped_matmul": "coupled_1c2v/l0c_ub_epilogue/affine_simd",
     "q4_0_dequant_matmul": "coupled_1c2v/l0c_ub_epilogue/affine_simd",
-    "attention_residual": "coupled_1c2v/bidirectional_cv_ring/affine_simd",
+    "attention_residual": "aiv_only/gm_ub_stream/affine_simd",
     "mla": "coupled_1c2v/bidirectional_cv_ring/affine_simd",
     "gqa": "coupled_1c2v/bidirectional_cv_ring/affine_simd",
     "dynamic_mx_quant": "aiv_only/gm_ub_stream/affine_simd",

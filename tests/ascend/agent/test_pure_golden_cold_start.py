@@ -647,7 +647,7 @@ def test_pure_golden_registry_ast_check_and_marathon_isolation(
     monkeypatch.setattr(marathon, "configure_marathon_process_env", lambda **_kw: {"TILEFOUNDRY_NPU_CANNBENCH_REPO": str(tasks_root.parent)})
     monkeypatch.setattr(marathon, "create_llm_backend_from_env", lambda **_kw: MockLLMBackend())
     monkeypatch.setattr(marathon, "build_resilient_l2_evaluator", lambda **_kw: (lambda c, a: {}))
-    monkeypatch.setattr(marathon, "build_prewarmed_l3_runner", lambda **_kw: (lambda _p: None))
+    monkeypatch.setattr(marathon, "run_l3_full_contract_via_agent_gates", lambda **_kw: None)
     monkeypatch.setattr(marathon, "resolve_default_experience_lake_dir", lambda **_kw: None)
     monkeypatch.setattr(marathon, "ExtremeCampaignRunner", _CapturingRunner)
 
@@ -1531,7 +1531,7 @@ def test_marathon_auto_resume_skips_stage0_prepare_seed_unless_fresh(
     monkeypatch.setattr(marathon, "configure_marathon_process_env", lambda **_kw: {})
     monkeypatch.setattr(marathon, "create_llm_backend_from_env", lambda **_kw: MockLLMBackend())
     monkeypatch.setattr(marathon, "build_resilient_l2_evaluator", lambda **_kw: (lambda c, a: {}))
-    monkeypatch.setattr(marathon, "build_prewarmed_l3_runner", lambda **_kw: (lambda _p: None))
+    monkeypatch.setattr(marathon, "run_l3_full_contract_via_agent_gates", lambda **_kw: None)
     monkeypatch.setattr(marathon, "resolve_default_experience_lake_dir", lambda **_kw: None)
     monkeypatch.setattr(marathon, "CannbenchOpsRegistry", _FakeRegistry)
     monkeypatch.setattr(marathon, "ExtremeCampaignRunner", _FakeRunner)

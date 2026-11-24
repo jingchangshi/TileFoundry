@@ -272,7 +272,7 @@ def test_campaign_entrypoints_inject_selected_provider(
     monkeypatch.setattr(marathon, "ExtremeCampaignRunner", Runner)
     monkeypatch.setattr(marathon, "_ensure_sys_paths", lambda _: None)
     monkeypatch.setattr(marathon, "build_resilient_l2_evaluator", lambda **_: None)
-    monkeypatch.setattr(marathon, "build_prewarmed_l3_runner", lambda **_: None)
+    monkeypatch.setattr(marathon, "run_l3_full_contract_via_agent_gates", lambda **_: None)
     monkeypatch.setattr(marathon, "salvage_unpromoted_beam_winner", lambda **_: None)
     monkeypatch.setattr(marathon, "create_llm_backend_from_env", make_backend)
     target = tmp_path / "kernels.py"
@@ -436,25 +436,50 @@ def test_marathon_l3_runner_forwards_resume_and_authorized_card(
         seen.append(dict(kwargs))
         return L3AcceptanceResult(passed=True)
 
-    monkeypatch.setattr(marathon, "run_l3_full_contract_via_agent_gates", _fake_l3)
-    runner = marathon.build_prewarmed_l3_runner(
-        operator_name="mla",
-        worktree=tmp_path,
-        env_file=tmp_path / "env.sh",
-        device_id="1",
-        prewarm_l3=False,
-    )
     def callback(*_args) -> None:
         return None
 
-    result = runner(
-        tmp_path / "kernels.py",
-        resume_execution_id="exec-saved",
-        resume_run_id="run-saved",
-        device_id="6",
-        on_execution_started=callback,
+    class _Report:
+        def to_dict(self):
+            return {"status": "ok"}
+
+    class _Runner:
+        def __init__(self, **kwargs):
+            self.l3_runner = kwargs["l3_contract_runner"]
+
+        async def run(self, *, resume):
+            _ = resume
+            res = self.l3_runner(
+                tmp_path / "kernels.py",
+                resume_execution_id="exec-saved",
+                resume_run_id="run-saved",
+                device_id="6",
+                on_execution_started=callback,
+            )
+            assert res.passed is True
+            return _Report()
+
+    monkeypatch.setattr(marathon, "run_l3_full_contract_via_agent_gates", _fake_l3)
+    monkeypatch.setattr(marathon, "_resolve_worktree", lambda _c: (tmp_path, tmp_path))
+    monkeypatch.setattr(marathon, "_ensure_sys_paths", lambda _w: None)
+    monkeypatch.setattr(marathon, "_configure_marathon_logging", lambda _p: None)
+    monkeypatch.setattr(marathon, "ensure_marathon_env_file", lambda **_k: tmp_path / "env.sh")
+    monkeypatch.setattr(marathon, "configure_marathon_process_env", lambda **_k: {})
+    monkeypatch.setattr(marathon, "create_llm_backend_from_env", lambda **_k: MockLLMBackend())
+    monkeypatch.setattr(marathon, "build_resilient_l2_evaluator", lambda **_k: (lambda c, a: {}))
+    monkeypatch.setattr(marathon, "resolve_default_experience_lake_dir", lambda **_k: None)
+    monkeypatch.setattr(marathon, "ExtremeCampaignRunner", _Runner)
+    (tmp_path / "kernels.py").touch()
+    rc = marathon.run_operator_marathon(
+        marathon.MarathonConfig(
+            operator_name="mla",
+            state_dir=tmp_path / "state",
+            target_module_path=tmp_path / "kernels.py",
+            auto_bootstrap_seed=False,
+            salvage_beam_candidates=False,
+        )
     )
-    assert result.passed is True
+    assert rc == 0
     assert seen == [
         {
             "operator_name": "mla",
@@ -559,7 +584,7 @@ def test_marathon_entrypoint_resolves_managed_device_pool(
     monkeypatch.setattr(marathon, "ExtremeCampaignRunner", Runner)
     monkeypatch.setattr(marathon, "_ensure_sys_paths", lambda _: None)
     monkeypatch.setattr(marathon, "build_resilient_l2_evaluator", lambda **_: None)
-    monkeypatch.setattr(marathon, "build_prewarmed_l3_runner", lambda **_: None)
+    monkeypatch.setattr(marathon, "run_l3_full_contract_via_agent_gates", lambda **_: None)
     monkeypatch.setattr(marathon, "salvage_unpromoted_beam_winner", lambda **_: None)
     target = tmp_path / "kernels.py"
     target.touch()
@@ -616,7 +641,7 @@ def test_marathon_entrypoint_narrows_managed_pool_to_parent_visibility(
     monkeypatch.setattr(marathon, "ExtremeCampaignRunner", Runner)
     monkeypatch.setattr(marathon, "_ensure_sys_paths", lambda _: None)
     monkeypatch.setattr(marathon, "build_resilient_l2_evaluator", lambda **_: None)
-    monkeypatch.setattr(marathon, "build_prewarmed_l3_runner", lambda **_: None)
+    monkeypatch.setattr(marathon, "run_l3_full_contract_via_agent_gates", lambda **_: None)
     monkeypatch.setattr(marathon, "salvage_unpromoted_beam_winner", lambda **_: None)
     target = tmp_path / "kernels.py"
     target.touch()

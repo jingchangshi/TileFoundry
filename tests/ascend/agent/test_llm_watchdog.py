@@ -473,10 +473,10 @@ def test_agent_flag_stripping_and_tier_adaptive_watchdog(
     xhigh_cfg = backend.watchdog_for_model("gemini-4-hydrogen-xhigh")
     assert (med_cfg.idle_stall_timeout_sec, med_cfg.active_ceiling_timeout_sec) == (120.0, 360.0)
     assert med_cfg.startup_timeout_sec == 60.0
-    assert (high_cfg.idle_stall_timeout_sec, high_cfg.active_ceiling_timeout_sec) == (180.0, 360.0)
+    assert (high_cfg.idle_stall_timeout_sec, high_cfg.active_ceiling_timeout_sec) == (180.0, 480.0)
     assert (xhigh_cfg.idle_stall_timeout_sec, xhigh_cfg.active_ceiling_timeout_sec) == (
         180.0,
-        360.0,
+        480.0,
     )
 
     cmd_med = backend.build_command(exploit_req, "P")
@@ -485,11 +485,11 @@ def test_agent_flag_stripping_and_tier_adaptive_watchdog(
     assert "gemini-4-hydrogen-medium" in cmd_med
     assert "--print-timeout=360s" in cmd_med
     assert "gemini-4-hydrogen-high" in cmd_high
-    assert "--print-timeout=360s" in cmd_high
+    assert "--print-timeout=480s" in cmd_high
     assert "gemini-4-hydrogen-high" in cmd_xhigh
     assert "gemini-4-hydrogen-xhigh" not in cmd_xhigh
     assert "--effort=high" in cmd_xhigh
-    assert "--print-timeout=360s" in cmd_xhigh
+    assert "--print-timeout=480s" in cmd_xhigh
 
     mock = MockLLMBackend(default_response="ok")
     asyncio.run(mock.generate(exploit_req))

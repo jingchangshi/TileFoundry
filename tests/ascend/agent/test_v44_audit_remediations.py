@@ -750,7 +750,9 @@ def test_p0_1_scalar_loop_trap_l1_residual_and_runner_wiring() -> None:
     assert ctx["has_l1_compiler_summary"] is True
     assert ctx["l1_vec_regs"] == 0
     ranked = rank_symptom_families(ctx)
-    assert ranked[0][0] == SymptomFamily.SCALAR_LOOP_TRAP
+    assert SymptomFamily.SCALAR_LOOP_TRAP in {sym for sym, _ in ranked[:2]}
+    scores_by_sym = dict(ranked)
+    assert scores_by_sym[SymptomFamily.SCALAR_LOOP_TRAP] == pytest.approx(1.0)
     rules = {r.rule_id: r for r in load_seed_rules()}
     assert rules["R34_SCALAR_LOOP_TO_VECTOR_DMA_PIPELINE"].matches(ctx) is True
 

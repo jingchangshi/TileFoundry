@@ -1059,7 +1059,7 @@ class PortfolioRunner:
         enable_track_router: bool = False,
         enable_tilesize_prescreen: bool = True,
         cost_model: HybridAscendCostModel | None = None,
-        cost_model_mode: str = "adaptive",
+        cost_model_mode: str = "auto",
     ) -> None:
         self._backend = backend
         self._funnel = funnel

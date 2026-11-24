@@ -117,8 +117,8 @@ def matmul_einsum(q, k):
     vec_sem = analyzer.analyze_source(vec_src, entry_name="attention_residual")
     assert vec_sem.has_matmul is True
     assert vec_sem.has_gemm_contraction is False
-    assert vec_sem.base_axes.compute_engine == "coupled_1c2v"
-    assert vec_sem.base_axes.memory_ring == "bidirectional_cv_ring"
+    assert vec_sem.base_axes.compute_engine == "aiv_only"
+    assert vec_sem.base_axes.memory_ring == "gm_ub_stream"
 
     gemm_sem = analyzer.analyze_source(gemm_src, entry_name="matmul_einsum")
     assert gemm_sem.has_matmul is True

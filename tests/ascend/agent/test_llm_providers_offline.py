@@ -288,7 +288,7 @@ def test_factory_preserves_agy_aliases_and_neutral_mock(
     assert backend.select_model("explore_creative") == "legacy-explore"
     assert backend.select_model("escalate_trackb") == "legacy-escalate-high"
     assert backend.select_model("syntax_repair") == "new-repair"
-    assert backend.watchdog_for_role("explore_creative").active_ceiling_timeout_sec == 360
+    assert backend.watchdog_for_role("explore_creative").active_ceiling_timeout_sec == 480.0
 
     mock = create_llm_backend_from_env(_settings(BACKEND="mock", EXPLOIT_MODEL="mock-model"))
     assert isinstance(mock, MockLLMBackend)

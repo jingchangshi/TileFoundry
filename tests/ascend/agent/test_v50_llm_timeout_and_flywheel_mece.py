@@ -311,27 +311,7 @@ def test_portfolio_plan_workers_respects_cost_gate_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify PortfolioRunner.plan_workers suppresses prescreen when CostGatePolicy disengages."""
-    policy_mod_name = "tilefoundry_ascend.ascend.cost_model.cost_gate_policy"
-    if importlib.util.find_spec(policy_mod_name) is None:
-        mock_mod = ModuleType(policy_mod_name)
-
-        def _fake_eval(**kwargs: object) -> SimpleNamespace:
-            eta = float(kwargs.get("incumbent_roofline_eta", 0.0) or 0.0)
-            disengage = float(kwargs.get("disengage_roofline_eta", 0.85) or 0.85)
-            engaged = bool(kwargs.get("enable_prescreen_flag", True)) and eta < disengage
-            return SimpleNamespace(
-                mode=kwargs.get("mode", "adaptive"),
-                engaged=engaged,
-                reason="roofline_eta_reached" if not engaged else "active",
-                coarse_reject_ratio=0.0,
-                allow_prompt_guidance=engaged,
-                allow_candidate_pruning=engaged,
-            )
-
-        setattr(mock_mod, "CostGateDecision", SimpleNamespace)
-        setattr(mock_mod, "CostModelMode", str)
-        setattr(mock_mod, "evaluate_cost_gate_policy", _fake_eval)
-        monkeypatch.setitem(sys.modules, policy_mod_name, mock_mod)
+    _ = monkeypatch
 
     sa = GateFunnel(skip_stage_b=True).evaluate(
         _sample_small_dsl(),
