@@ -104,6 +104,7 @@ from tilefoundry_ascend.agent.orchestrator.cpp_slice_protocol import (
     build_trackb_context_view,
     escalate_primfunc_to_trackb_tu,
     extract_cpp_diagnostic_lines,
+    extract_reachable_trackb_source,
     parse_scoped_search_replace_blocks,
     resolve_instantiated_trackb_kernel,
     select_active_trackb_kernel,
@@ -130,7 +131,10 @@ from tilefoundry_ascend.agent.orchestrator.llm_client import (
     extract_python_dsl,
     sanitize_effort,
 )
-from tilefoundry_ascend.agent.orchestrator.llm_constraints import build_progressive_llm_constraints
+from tilefoundry_ascend.agent.orchestrator.llm_constraints import (
+    build_progressive_llm_constraints,
+    format_g5_parent_monotonicity_lock,
+)
 from tilefoundry_ascend.agent.orchestrator.portfolio_runner import (
     CREATIVE_FOCUS_HINTS,
     build_prescreen_summary_from_kwargs,
@@ -199,6 +203,7 @@ from tilefoundry_ascend.ascend.sil.schema import (
 )
 from tilefoundry_ascend.ascend.sil.verifier import verify_source_against_facets
 from tilefoundry_ascend.ascend.target import AscendTarget
+import tilefoundry_ascend.ascend.templates.registry as templates_registry
 from tilefoundry_ascend.ascend.templates.registry import relax_facets_for_bottleneck
 
 logger = logging.getLogger(__name__)
@@ -291,6 +296,7 @@ def _should_trigger_p2_deep_dive(
 
 
 _DEVICE_ID_PATTERN = re.compile(r"[0-9]+")
+_L3_CASE_NUM_RE = re.compile(r"\bcase=(\d+)\b")
 CAMPAIGN_DEVICE_IDS_ENV_KEY = "TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS"
 
 
@@ -490,24 +496,6 @@ class CampaignRoundRecord:
                 str(x) for x in payload.get("paradigm_shift_rule_ids", ())
             ),
         )
-
-
-def _interleave_paradigm_shift_rules(
-    base_rules: Sequence[AscendCausalRule],
-    shift_rules: Sequence[AscendCausalRule],
-) -> list[AscendCausalRule]:
-    """Interleave cross-topology shift rules ahead of same-topology tie-breaks."""
-    merged: list[AscendCausalRule] = []
-    seen_ids: set[str] = set()
-    for idx in range(max(len(base_rules), len(shift_rules))):
-        for seq in (shift_rules, base_rules):
-            if idx >= len(seq):
-                continue
-            rule = seq[idx]
-            if rule.rule_id not in seen_ids:
-                merged.append(rule)
-                seen_ids.add(rule.rule_id)
-    return merged
 
 
 @dataclass(frozen=True)
@@ -1136,6 +1124,7 @@ def _render_trackb_tu_from_module(
     regime_spec: RegimeTargetSpec,
     *,
     require_renderer: bool,
+    anchor_dims_override: Mapping[str, object] | None = None,
 ) -> str:
     """Render a module's Track-B launcher with the shared dimension merge.
 
@@ -1156,6 +1145,8 @@ def _render_trackb_tu_from_module(
         **regime_spec.representative_hir_dims,
         **regime_spec.representative_anchor_dims,
     }
+    if anchor_dims_override:
+        dims.update(anchor_dims_override)
     try:
         resolved = resolve_regime_config(module_source, regime_spec, dims=dims)
         alias_sources = {
@@ -2658,13 +2649,15 @@ class PerfTargetCampaignRunner:
             ) = msprof_collector
         elif l2_batch_evaluator is None:
             self._msprof_collector = (
-                lambda op_name, cand_path, anc_seq: collect_bottleneck_msprof_via_agent_gates(
+                lambda op_name, cand_path, anc_seq: self._invoke_with_optional_kwargs(
+                    collect_bottleneck_msprof_via_agent_gates,
                     op_name,
                     cand_path,
                     anc_seq,
                     source_root=self._source_root,
                     env_file=self._env_file,
                     device_id=self._config.device_id,
+                    device_pool=self._l4_device_pool,
                 )
             )
         else:
@@ -2676,13 +2669,15 @@ class PerfTargetCampaignRunner:
             ) = p2_deep_dive_collector
         elif l2_batch_evaluator is None and self._env_file is not None:
             self._p2_deep_dive_collector = (
-                lambda op_name, cand_path, anc_seq: collect_p2_deep_dive_via_agent_gates(
+                lambda op_name, cand_path, anc_seq: self._invoke_with_optional_kwargs(
+                    collect_p2_deep_dive_via_agent_gates,
                     op_name,
                     cand_path,
                     anc_seq,
                     source_root=self._source_root,
                     env_file=self._env_file,
                     device_id=self._config.device_id,
+                    device_pool=self._l4_device_pool,
                 )
             )
         else:
@@ -2770,11 +2765,13 @@ class PerfTargetCampaignRunner:
                 or bool(os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip())
             )
         ):
-            self._flywheel._probe_runner = lambda spec: run_micro_probe_via_agent_gates(
+            self._flywheel._probe_runner = lambda spec: self._invoke_with_optional_kwargs(
+                run_micro_probe_via_agent_gates,
                 spec,
                 source_root=self._source_root,
                 env_file=self._env_file,
                 device_id=self._config.device_id,
+                device_pool=self._l4_device_pool,
                 min_speedup=self._flywheel._min_probe_speedup,
             )
 
@@ -3380,6 +3377,8 @@ class PerfTargetCampaignRunner:
         module_source: str,
         cpp_source: str,
         regime_spec: RegimeTargetSpec,
+        *,
+        anchor_dims_override: Mapping[str, object] | None = None,
     ) -> str:
         """Instantiate Track-B C++20 TU via module _render_trackb_tu if present."""
         return _render_trackb_tu_from_module(
@@ -3387,6 +3386,7 @@ class PerfTargetCampaignRunner:
             cpp_source,
             regime_spec,
             require_renderer=False,
+            anchor_dims_override=anchor_dims_override,
         )
 
     def _resolve_active_trackb_kernels(
@@ -3603,6 +3603,8 @@ class PerfTargetCampaignRunner:
         self,
         module_source: str,
         regime_spec: RegimeTargetSpec,
+        *,
+        anchor_dims_override: Mapping[str, object] | None = None,
     ) -> StageAResult:
         op_semantics = self._resolve_operator_semantics_for_gates()
         req_dma = bool(op_semantics is not None and not op_semantics.has_indirect_index)
@@ -3620,7 +3622,10 @@ class PerfTargetCampaignRunner:
         if regime_spec.runtime_backend == "ascendc_trackb" and tb_extracted is not None:
             active_mask = self._resolve_trackb_freedom_mask(regime_spec)
             instantiated_tu = self._instantiate_trackb_tu(
-                module_source, tb_extracted[1], regime_spec
+                module_source,
+                tb_extracted[1],
+                regime_spec,
+                anchor_dims_override=anchor_dims_override,
             )
             return evaluate_ascendc_candidate(
                 instantiated_tu,
@@ -3635,8 +3640,10 @@ class PerfTargetCampaignRunner:
                 regime_tag=regime_spec.regime_tag,
             )
 
-        anchor_dims = (
-            regime_spec.representative_anchor_dims or regime_spec.representative_hir_dims
+        anchor_dims = dict(
+            anchor_dims_override
+            or regime_spec.representative_anchor_dims
+            or regime_spec.representative_hir_dims
         )
         try:
             resolved = resolve_regime_config(module_source, regime_spec, dims=anchor_dims)
@@ -3683,7 +3690,10 @@ class PerfTargetCampaignRunner:
             if is_hybrid and tb_extracted is not None and not has_prim_func:
                 active_mask = self._resolve_trackb_freedom_mask(regime_spec)
                 instantiated_tu = self._instantiate_trackb_tu(
-                    module_source, tb_extracted[1], regime_spec
+                    module_source,
+                    tb_extracted[1],
+                    regime_spec,
+                    anchor_dims_override=anchor_dims_override,
                 )
                 return evaluate_ascendc_candidate(
                     instantiated_tu,
@@ -3728,7 +3738,12 @@ class PerfTargetCampaignRunner:
         if is_hybrid and tb_extracted is not None:
             tb_sym, tb_cpp = tb_extracted
             active_mask = self._resolve_trackb_freedom_mask(regime_spec)
-            instantiated_tu = self._instantiate_trackb_tu(module_source, tb_cpp, regime_spec)
+            instantiated_tu = self._instantiate_trackb_tu(
+                module_source,
+                tb_cpp,
+                regime_spec,
+                anchor_dims_override=anchor_dims_override,
+            )
             tb_res = evaluate_ascendc_candidate(
                 instantiated_tu,
                 freedom_mask=active_mask,
@@ -3780,10 +3795,25 @@ class PerfTargetCampaignRunner:
             )
         return primary_res
 
-    def _run_l0(self, module_source: str, regime_spec: RegimeTargetSpec) -> StageAResult:
+    def _run_l0(
+        self,
+        module_source: str,
+        regime_spec: RegimeTargetSpec,
+        *,
+        anchor_dims_override: Mapping[str, object] | None = None,
+    ) -> StageAResult:
         if self._l0_checker is not None:
-            return self._l0_checker(module_source, regime_spec)
-        return self._default_l0_checker(module_source, regime_spec)
+            return self._invoke_with_optional_kwargs(
+                self._l0_checker,
+                module_source,
+                regime_spec,
+                anchor_dims_override=anchor_dims_override,
+            )
+        return self._default_l0_checker(
+            module_source,
+            regime_spec,
+            anchor_dims_override=anchor_dims_override,
+        )
 
     def _resolve_max_row_width_dims(
         self,
@@ -4087,13 +4117,15 @@ class PerfTargetCampaignRunner:
             if isinstance(evaluated, L2BatchResults):
                 return dict(evaluated), dict(evaluated.run_ids)
             return dict(evaluated), {}
-        results, run_id, _receipt = run_surrogate_batch_via_agent_gates(
+        results, run_id, _receipt = self._invoke_with_optional_kwargs(
+            run_surrogate_batch_via_agent_gates,
             self._config.operator_name,
             candidates,
             active_anchors,
             source_root=self._source_root,
             env_file=self._env_file,
             device_id=self._config.device_id,
+            device_pool=self._l4_device_pool,
             warmup=self._config.warmup,
             repeat=self._config.repeat,
             require_all_passed=False,
@@ -4362,6 +4394,7 @@ class PerfTargetCampaignRunner:
                 self._l3_contract_runner,
                 module_path,
                 device_id=requested_device,
+                device_pool=self._l4_device_pool,
                 on_execution_started=on_execution_started,
             )
         return self._invoke_with_optional_kwargs(
@@ -4371,6 +4404,7 @@ class PerfTargetCampaignRunner:
             source_root=self._source_root,
             env_file=self._env_file,
             device_id=requested_device,
+            device_pool=self._l4_device_pool,
             on_execution_started=on_execution_started,
         )
 
@@ -6359,16 +6393,33 @@ class PerfTargetCampaignRunner:
                 logger.debug("Appending winning edge skipped: %s", exc)
         return list(distill_rep.admitted_rule_ids)
 
+    def _next_l3_alt_card(self, pending: PendingPromotion, attempted_device: str) -> str:
+        tried = {
+            str(item.get("device_id", "")).strip()
+            for item in pending.attempts
+            if str(item.get("device_id", "")).strip()
+        }
+        if attempted_device.strip():
+            tried.add(attempted_device.strip())
+        if pending.device_id.strip():
+            tried.add(pending.device_id.strip())
+        untried = [dev for dev in self._l4_device_pool if dev not in tried]
+        if not untried:
+            return ""
+        if len(untried) > 1 and untried[0] == self._l4_device_pool[0]:
+            return untried[1]
+        return untried[0]
+
     def _can_retry_on_alt_card(self, pending: PendingPromotion, attempted_device: str) -> bool:
-        retry_device = self._retry_device_id
-        return bool(
-            retry_device
-            and not pending.retry_used
-            and retry_device != (attempted_device or pending.device_id)
-        )
+        return bool(self._next_l3_alt_card(pending, attempted_device))
 
     @staticmethod
-    def _promotion_attempt(result: L3AcceptanceResult, device_id: str) -> dict[str, str]:
+    def _promotion_attempt(
+        result: L3AcceptanceResult,
+        device_id: str,
+        *,
+        candidate_sha256: str = "",
+    ) -> dict[str, str]:
         """One auditable L3 attempt, including the card and candidate identity."""
         return {
             "execution_id": result.execution_id,
@@ -6384,7 +6435,7 @@ class PerfTargetCampaignRunner:
             ).lower(),
             "device_id": result.device_id or device_id,
             "state": result.state,
-            "candidate_sha256": result.candidate_sha256,
+            "candidate_sha256": result.candidate_sha256 or candidate_sha256,
             "execution_terminal": str(result.execution_terminal).lower(),
         }
 
@@ -6393,8 +6444,8 @@ class PerfTargetCampaignRunner:
         pending: PendingPromotion,
         attempts: tuple[dict[str, str], ...],
     ) -> L3AcceptanceResult:
-        """Start one fresh L3 execution on the explicitly authorized alternate card."""
-        retry_device = self._retry_device_id
+        """Start one fresh L3 execution on the next untried authorized pool card."""
+        retry_device = self._next_l3_alt_card(pending, pending.device_id)
         assert retry_device
         retry_pending = replace(
             pending,
@@ -6597,10 +6648,67 @@ class PerfTargetCampaignRunner:
             self._persist_runtime_state("pending_promotion", None)
             return incumbent_source, best_result, stagnation_by_regime, None, False
 
+        def _retry_alt_cards(
+            start_result: L3AcceptanceResult | None,
+            last_device: str,
+        ) -> tuple[
+            str,
+            CandidateSurrogateResult,
+            dict[str, int],
+            PendingPromotion | None,
+            bool,
+        ]:
+            nonlocal current
+            tried_alt_cards: set[str] = set()
+            latest_result = start_result
+            while self._can_retry_on_alt_card(current, last_device):
+                target_dev = self._next_l3_alt_card(current, last_device)
+                if not target_dev or target_dev in tried_alt_cards:
+                    break
+                tried_alt_cards.add(target_dev)
+                retry_result = self._retry_l3_on_alt_card(current, tuple(attempts))
+                attempts.append(
+                    self._promotion_attempt(
+                        retry_result,
+                        target_dev or current.device_id,
+                        candidate_sha256=current.candidate_sha256,
+                    )
+                )
+                current = replace(
+                    current,
+                    execution_id=retry_result.execution_id or current.execution_id,
+                    run_id=retry_result.run_id or current.run_id,
+                    receipt_path=retry_result.receipt_path or current.receipt_path,
+                    error_message=retry_result.error_message or current.error_message,
+                    attempts=tuple(attempts),
+                    device_id=target_dev or retry_result.device_id or current.device_id,
+                    execution_terminal=retry_result.execution_terminal,
+                    retry_used=True,
+                )
+                if retry_result.passed:
+                    return _promote()
+                if not retry_result.execution_terminal:
+                    return _keep_pending(retry_result, terminal=False)
+                if retry_result.failure_kind == FAILURE_KIND_CANDIDATE:
+                    return _candidate_failure(retry_result)
+                latest_result = retry_result
+                last_device = retry_result.device_id or target_dev
+            if latest_result is not None:
+                return _keep_pending(latest_result, terminal=latest_result.execution_terminal)
+            self._pending_promotion = pending
+            self._active_promotion = pending if not pending.execution_terminal else None
+            return incumbent_source, best_result, stagnation_by_regime, pending, True
+
         result: L3AcceptanceResult | None = None
         if pending.execution_id and (not pending.execution_terminal or pending.run_id):
             result = self._resume_l3_contract(self._target_module_path, pending)
-            attempts.append(self._promotion_attempt(result, pending.device_id))
+            attempts.append(
+                self._promotion_attempt(
+                    result,
+                    pending.device_id,
+                    candidate_sha256=pending.candidate_sha256,
+                )
+            )
             current = replace(
                 pending,
                 execution_id=result.execution_id or pending.execution_id,
@@ -6618,51 +6726,11 @@ class PerfTargetCampaignRunner:
             if result.failure_kind == FAILURE_KIND_CANDIDATE:
                 return _candidate_failure(result)
             if self._can_retry_on_alt_card(current, result.device_id):
-                retry_result = self._retry_l3_on_alt_card(current, tuple(attempts))
-                attempts.append(
-                    self._promotion_attempt(retry_result, current.device_id)
-                )
-                current = replace(
-                    current,
-                    execution_id=retry_result.execution_id or current.execution_id,
-                    run_id=retry_result.run_id or current.run_id,
-                    receipt_path=retry_result.receipt_path or current.receipt_path,
-                    error_message=retry_result.error_message or current.error_message,
-                    attempts=tuple(attempts),
-                    device_id=retry_result.device_id or current.device_id,
-                    execution_terminal=retry_result.execution_terminal,
-                    retry_used=True,
-                )
-                if retry_result.passed:
-                    return _promote()
-                if not retry_result.execution_terminal:
-                    return _keep_pending(retry_result, terminal=False)
-                if retry_result.failure_kind == FAILURE_KIND_CANDIDATE:
-                    return _candidate_failure(retry_result)
-                return _keep_pending(retry_result, terminal=retry_result.execution_terminal)
+                return _retry_alt_cards(result, result.device_id)
             return _keep_pending(result, terminal=True)
 
-        if self._can_retry_on_alt_card(pending, pending.device_id):
-            retry_result = self._retry_l3_on_alt_card(pending, tuple(attempts))
-            attempts.append(self._promotion_attempt(retry_result, pending.device_id))
-            current = replace(
-                pending,
-                execution_id=retry_result.execution_id or pending.execution_id,
-                run_id=retry_result.run_id or pending.run_id,
-                receipt_path=retry_result.receipt_path or pending.receipt_path,
-                error_message=retry_result.error_message or pending.error_message,
-                attempts=tuple(attempts),
-                device_id=retry_result.device_id or pending.device_id,
-                execution_terminal=retry_result.execution_terminal,
-                retry_used=True,
-            )
-            if retry_result.passed:
-                return _promote()
-            if not retry_result.execution_terminal:
-                return _keep_pending(retry_result, terminal=False)
-            if retry_result.failure_kind == FAILURE_KIND_CANDIDATE:
-                return _candidate_failure(retry_result)
-            return _keep_pending(retry_result, terminal=retry_result.execution_terminal)
+        if self._can_retry_on_alt_card(current, current.device_id):
+            return _retry_alt_cards(None, current.device_id)
         self._pending_promotion = pending
         self._active_promotion = pending if not pending.execution_terminal else None
         return incumbent_source, best_result, stagnation_by_regime, pending, True
@@ -7427,6 +7495,333 @@ class PerfTargetCampaignRunner:
             )
         return tuple(evidence)
 
+    @staticmethod
+    def _extract_l3_failed_case_nums(l3_res: L3AcceptanceResult) -> list[int]:
+        raw_cases = getattr(l3_res, "failed_case_nums", ()) or ()
+        case_nums: list[int] = []
+        seen: set[int] = set()
+        for item in raw_cases:
+            if isinstance(item, int) and not isinstance(item, bool):
+                cnum = int(item)
+                if cnum not in seen:
+                    seen.add(cnum)
+                    case_nums.append(cnum)
+        if not case_nums and l3_res.error_message:
+            for match in _L3_CASE_NUM_RE.finditer(l3_res.error_message):
+                cnum = int(match.group(1))
+                if cnum not in seen:
+                    seen.add(cnum)
+                    case_nums.append(cnum)
+        return case_nums
+
+    def _promote_l3_counterexample_anchors(
+        self,
+        l3_res: L3AcceptanceResult,
+        incumbent_source: str,
+        regime_spec: RegimeTargetSpec,
+        active_anchors: list[AnchorCaseSpec],
+    ) -> list[int]:
+        """Promote up to 2 L3 counterexample cases into active_anchors in-place."""
+        case_nums = self._extract_l3_failed_case_nums(l3_res)
+        existing_cases = {int(a.case_num) for a in active_anchors}
+        target_cases = [c for c in case_nums if c not in existing_cases][:2]
+        if not target_cases:
+            return []
+        try:
+            task_name = get_operator_task(self._config.operator_name)
+        except (FileNotFoundError, KeyError, ValueError):
+            task_name = f"operator/{self._config.operator_name}"
+        bp = self._regime_blueprints.get(regime_spec.regime_tag)
+        default_t_hw = (
+            float(bp.roofline.ideal_roofline_us)
+            if bp is not None and bp.roofline.ideal_roofline_us > 0.0
+            else 1.0
+        )
+        regime_anchors = [a for a in active_anchors if a.regime_tag == regime_spec.regime_tag]
+        fallback_ref = (
+            max(1.0, float(regime_anchors[0].ref_perf_us))
+            if regime_anchors
+            else (max(1.0, float(active_anchors[0].ref_perf_us)) if active_anchors else 10.0)
+        )
+        fallback_hw = (
+            max(0.1, float(regime_anchors[0].t_hw_us))
+            if regime_anchors
+            else (max(0.1, float(active_anchors[0].t_hw_us)) if active_anchors else default_t_hw)
+        )
+        promoted_cases: list[int] = []
+        for cnum in target_cases:
+            ref_perf_us: float | None = None
+            t_hw_us: float | None = None
+            try:
+                meta_ref, meta_hw = lookup_case_metadata(
+                    self._config.operator_name,
+                    cnum,
+                    cannbench_repo=self._cannbench_repo,
+                    env_file=self._env_file,
+                )
+                if meta_ref > 0.0:
+                    ref_perf_us = float(meta_ref)
+                if meta_hw > 0.0:
+                    t_hw_us = float(meta_hw)
+            except (FileNotFoundError, OSError, KeyError, ValueError, json.JSONDecodeError):
+                pass
+            if t_hw_us is None:
+                t_hw_us = fallback_hw
+            if ref_perf_us is None and incumbent_source.strip():
+                probe_spec = AnchorCaseSpec(
+                    task=task_name,
+                    case_num=cnum,
+                    regime_tag=regime_spec.regime_tag,
+                    ref_perf_us=fallback_ref,
+                    t_hw_us=t_hw_us,
+                )
+                try:
+                    with tempfile.TemporaryDirectory(prefix="tf_l3_cx_anchor_") as tmp_dir:
+                        inc_file = Path(tmp_dir) / "incumbent.py"
+                        inc_file.write_text(incumbent_source, encoding="utf-8")
+                        l2_probe, _ = self._run_l2_batch([("incumbent", inc_file)], [probe_spec])
+                    inc_res = l2_probe.get("incumbent")
+                    if inc_res is not None:
+                        for anc_m in inc_res.anchors:
+                            if int(anc_m.case_num) == cnum and anc_m.cand_us > 0.0:
+                                ref_perf_us = float(anc_m.cand_us)
+                                break
+                except (
+                    OSError,
+                    subprocess.SubprocessError,
+                    TimeoutError,
+                    json.JSONDecodeError,
+                    RuntimeError,
+                    FileNotFoundError,
+                    KeyError,
+                    ValueError,
+                ):
+                    pass
+            if ref_perf_us is None or ref_perf_us <= 0.0:
+                ref_perf_us = fallback_ref
+            active_anchors.append(
+                AnchorCaseSpec(
+                    task=task_name,
+                    case_num=cnum,
+                    regime_tag=regime_spec.regime_tag,
+                    ref_perf_us=ref_perf_us,
+                    t_hw_us=t_hw_us,
+                )
+            )
+            promoted_cases.append(cnum)
+        return promoted_cases
+
+    async def _attempt_l3_counterexample_repair(
+        self,
+        *,
+        backend: KernelLLMBackend,
+        top_chk: L0L1CandidateCheck,
+        l3_res: L3AcceptanceResult,
+        incumbent_source: str,
+        best_result: CandidateSurrogateResult,
+        regime_spec: RegimeTargetSpec,
+        active_anchors: Sequence[AnchorCaseSpec],
+        active_mask: ConstraintRelaxationMask,
+        bn_dims: Mapping[str, int] | None,
+        round_idx: int,
+        func_name: str,
+        parent_lane: str,
+        creative_effort: str,
+    ) -> tuple[L0L1CandidateCheck, CandidateSurrogateResult, L3AcceptanceResult] | None:
+        """Perform one-shot unfolded repair on a candidate that failed L3 validation."""
+        cand_mod_src = top_chk.patched_module_source
+        op_entry = _resolve_operator_entrypoint_safe(self._config.operator_name)
+        try:
+            _, unfolded_dsl = extract_regime_snippet(
+                cand_mod_src,
+                regime_spec,
+                operator_entrypoint=op_entry,
+                sibling_specs=self._regime_specs,
+            )
+        except (SyntaxError, ValueError):
+            unfolded_dsl = top_chk.snippet_source
+        unfolded_cpp = ""
+        is_trackb = regime_spec.runtime_backend in ("ascendc_trackb", "hybrid_trackb")
+        if is_trackb and regime_spec.trackb_symbols:
+            tb_extracted = _extract_trackb_cpp_source(cand_mod_src, regime_spec)
+            if tb_extracted is not None:
+                _entry_k, unfolded_cpp = extract_reachable_trackb_source(
+                    tb_extracted[1],
+                    module_source=cand_mod_src,
+                    regime_tag=regime_spec.regime_tag,
+                )
+        failed_cases = self._extract_l3_failed_case_nums(l3_res)
+        case_dims_payload: dict[str, dict[str, object]] = {}
+        for cnum in failed_cases:
+            case_dims_payload[str(cnum)] = self._lookup_case_dims_safe(
+                cnum, regime_spec.regime_tag
+            )
+        slice_desc = self._slice_contract_instruction(
+            func_name,
+            regime_spec,
+            operator_entrypoint=op_entry,
+        )
+        g5_lock = format_g5_parent_monotonicity_lock()
+        sys_prompt = (
+            "You are an Ascend 950PR kernel correctness repair engineer. Fix ONLY the tail, "
+            "boundary, NaN/numerical precision, or idempotence defect that caused the L3 "
+            "counterexample failure below while preserving the fast main-loop tiling and "
+            f"pipelining structure and {slice_desc}."
+        )
+        cpp_section = (
+            "### UNFOLDED TRACK-B REACHABLE CLOSURE (NO OMITTED HELPERS)\n"
+            f"```cpp\n{unfolded_cpp}\n```\n\n"
+            if unfolded_cpp.strip()
+            else ""
+        )
+        user_prompt = (
+            f"### TARGET REGIME\n{regime_spec.regime_tag}: {regime_spec.description}\n\n"
+            "### L3 COUNTEREXAMPLE FAILURE\n"
+            f"- failed_case_nums: {failed_cases}\n"
+            f"- error_message: {l3_res.error_message}\n\n"
+            f"### COUNTEREXAMPLE CASE DIMS\n{json.dumps(case_dims_payload, indent=2)}\n\n"
+            "### COUNTEREXAMPLE REPAIR CONSTRAINTS\n"
+            "- Keep the fast main-loop tiling, pipelining, and execution domain intact.\n"
+            "- Fix ONLY tail/boundary predicates, numerical overflow/NaN handling, or "
+            "idempotence bugs.\n\n"
+            f"{g5_lock}\n\n"
+            f"{cpp_section}"
+            f"### UNFOLDED CANDIDATE SLICE\n```python\n{unfolded_dsl}\n```\n"
+        )
+        req = GenerationRequest(
+            role="syntax_repair",
+            role_hint="l3_counterexample_repair",
+            regime_tag=regime_spec.regime_tag,
+            system_prompt=sys_prompt,
+            user_prompt=user_prompt,
+            json_schema=None,
+            effort="high",
+        )
+        try:
+            raw_reply = await backend.generate(req)
+            repaired_snippet = extract_python_dsl(raw_reply)
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            TimeoutError,
+            RuntimeError,
+            ConnectionError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
+            return None
+        if not repaired_snippet.strip():
+            return None
+
+        active_kernel = (
+            self._resolve_active_trackb_kernel(cand_mod_src, regime_spec) or ""
+        )
+        repair_cand_id = f"{top_chk.candidate_id}_l3fix"
+
+        def _patch_cand(snip: str) -> str:
+            return patch_regime_into_module(
+                cand_mod_src,
+                regime_spec,
+                snip,
+                operator_entrypoint=op_entry,
+                sibling_specs=self._regime_specs,
+                active_kernel=active_kernel,
+            )
+
+        def _repair_l0(mod_src: str) -> StageAResult:
+            dead_err = _detect_trackb_dead_code_edit(cand_mod_src, mod_src, regime_spec)
+            if dead_err is not None:
+                return StageAResult(
+                    passed=False,
+                    prim_func=None,
+                    ledger=None,
+                    error_message=dead_err,
+                    backend_kind="ascendc",
+                )
+            return self._run_l0(
+                mod_src,
+                regime_spec,
+                anchor_dims_override=bn_dims or None,
+            )
+
+        checks = await run_l0_l1_round_filter(
+            [(repair_cand_id, repaired_snippet)],
+            patch_fn=_patch_cand,
+            l0_checker=_repair_l0,
+            l1_compiler=lambda mod_src: self._run_l1(mod_src, regime_spec),
+            repair_backend=None,
+            max_syntax_repairs=0,
+            slice_hint=slice_desc,
+            backend_kind=regime_spec.runtime_backend,
+            parent_source=unfolded_dsl,
+            parent_module_source=cand_mod_src,
+            freedom_mask=active_mask,
+        )
+        if not checks or not checks[0].passed:
+            return None
+        repaired_chk = checks[0]
+        try:
+            with tempfile.TemporaryDirectory(prefix="tf_l3_cx_repair_") as tmp_dir:
+                cand_file = Path(tmp_dir) / f"{repaired_chk.candidate_id}.py"
+                cand_file.write_text(repaired_chk.patched_module_source, encoding="utf-8")
+                l2_res, _ = self._run_l2_batch(
+                    [(repaired_chk.candidate_id, cand_file)], active_anchors
+                )
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            TimeoutError,
+            json.JSONDecodeError,
+            RuntimeError,
+        ):
+            return None
+        repaired_res = l2_res.get(repaired_chk.candidate_id)
+        if repaired_res is None or not repaired_res.all_passed:
+            return None
+        tail_ok, repaired_res = self._evaluate_dual_layer_tail_guard(
+            candidate_id=repaired_chk.candidate_id,
+            candidate_source=repaired_chk.patched_module_source,
+            top_res=repaired_res,
+            best_result=best_result,
+            regime_spec=regime_spec,
+            active_anchors=active_anchors,
+            incumbent_source=incumbent_source,
+        )
+        if not tail_ok:
+            return None
+
+        _atomic_write_text(self._target_module_path, repaired_chk.patched_module_source)
+        repaired_sha = self._source_sha256(repaired_chk.patched_module_source)
+
+        def _record_repair_l3_started(execution_id: str, device: str) -> None:
+            provisional = PendingPromotion(
+                candidate_source=repaired_chk.patched_module_source,
+                candidate_sha256=repaired_sha,
+                target_path=str(self._target_module_path),
+                round_idx=round_idx,
+                regime_tag=regime_spec.regime_tag,
+                candidate_result=repaired_res,
+                candidate_id=repaired_chk.candidate_id,
+                builder_name=func_name,
+                parent_lane=parent_lane,
+                creative_effort=creative_effort,
+                execution_id=execution_id,
+                device_id=device,
+                execution_terminal=False,
+            )
+            self._active_promotion = provisional
+            self._pending_promotion = provisional
+            self._persist_runtime_state("active_promotion", provisional.to_dict())
+
+        repaired_l3 = self._run_l3_contract(
+            self._target_module_path,
+            on_execution_started=_record_repair_l3_started,
+        )
+        self._active_promotion = None
+        return repaired_chk, repaired_res, repaired_l3
+
     async def _execute_single_round(
         self,
         *,
@@ -7455,6 +7850,7 @@ class PerfTargetCampaignRunner:
         counting stagnation; a live or queued execution keeps the exact candidate
         bytes because replacing them would silently change the code under test.
         """
+        working_anchors = active_anchors if isinstance(active_anchors, list) else list(active_anchors)
         backend = self._get_backend()
         self._active_incumbent_source = incumbent_source
         self._active_regime_tag = regime_spec.regime_tag
@@ -7496,8 +7892,27 @@ class PerfTargetCampaignRunner:
             )
         )
 
-        base_stage_a = self._run_l0(incumbent_source, regime_spec)
-        parent_ledger = stone_ledger if stone_ledger is not None else base_stage_a.ledger
+        bn_anchor = bottleneck_anchor_for_regime(best_result, regime_spec.regime_tag)
+        bn_dims: dict[str, int] | None = None
+        if bn_anchor is not None:
+            resolved_bn = self._lookup_case_dims_safe(
+                bn_anchor.case_num, regime_spec.regime_tag
+            )
+            if resolved_bn:
+                bn_dims = {
+                    str(k): int(v)
+                    for k, v in resolved_bn.items()
+                    if isinstance(v, int) and not isinstance(v, bool)
+                }
+        base_stage_a = self._invoke_with_optional_kwargs(
+            self._run_l0,
+            parent_module_source,
+            regime_spec,
+            anchor_dims_override=bn_dims or None,
+        )
+        parent_ledger = (
+            base_stage_a.ledger if base_stage_a.ledger is not None else stone_ledger
+        )
         if parent_ledger is None:
             raise RuntimeError(
                 f"Stage-A L0 produced no ledger for regime {regime_spec.regime_tag!r}: "
@@ -7595,7 +8010,7 @@ class PerfTargetCampaignRunner:
             self._collect_msprof_for_regimes(
                 parent_module_source,
                 best_result,
-                active_anchors,
+                working_anchors,
                 [regime_spec],
             )
         parent_sha = self._source_sha256(parent_module_source)
@@ -7695,7 +8110,7 @@ class PerfTargetCampaignRunner:
             parent_p2_diag = self._collect_p2_deep_dive_for_regime(
                 parent_module_source,
                 best_result,
-                active_anchors,
+                working_anchors,
                 regime_spec,
             )
         parent_comp_summary = compiler_summary_from_residual(parent_residual)
@@ -7731,6 +8146,20 @@ class PerfTargetCampaignRunner:
         parent_cost_pred = self._cost_model.predict(
             parent_workload,
             bisheng_res=parent_comp_summary,
+        )
+        bp_semantics = getattr(blueprint, "semantics", None)
+        op_semantics_for_shift = self._resolve_operator_semantics_for_gates()
+        has_promotable_recurrence = bool(
+            getattr(bp_semantics, "has_associative_outer_recurrence", False)
+            or getattr(op_semantics_for_shift, "has_associative_outer_recurrence", False)
+            or getattr(bp_semantics, "has_recurrent_loop", False)
+            or getattr(op_semantics_for_shift, "has_recurrent_loop", False)
+        )
+        paradigm_shift_active = bool(
+            stagnation_rounds >= 2
+            and float(local_best.avg_roofline_eta) < 0.15
+            and has_promotable_recurrence
+            and parent_axes.compute_engine == "aiv_only"
         )
         active_mask = self._resolve_trackb_freedom_mask(regime_spec)
         escalation_decision = None
@@ -7817,6 +8246,14 @@ class PerfTargetCampaignRunner:
         else:
             self._freedom_masks.setdefault(regime_spec.regime_tag, active_mask)
 
+        if paradigm_shift_active:
+            active_mask = getattr(
+                templates_registry,
+                "unlock_cross_topology_paradigm_shift",
+                lambda _m: ConstraintRelaxationMask.top(),
+            )(active_mask)
+            self._freedom_masks[regime_spec.regime_tag] = active_mask
+
         sil_policy_section = self._format_sil_live_policy_section(
             live_plan=live_plan,
             active_mask=active_mask,
@@ -7838,40 +8275,8 @@ class PerfTargetCampaignRunner:
                 symptom_ranking=ranked_families,
             )
         )
-        bp_semantics = getattr(blueprint, "semantics", None)
-        op_semantics_for_shift = self._resolve_operator_semantics_for_gates()
-        has_recurrent_loop = bool(
-            getattr(bp_semantics, "has_recurrent_loop", False)
-            or getattr(op_semantics_for_shift, "has_recurrent_loop", False)
-        )
-        paradigm_shift_active = bool(
-            stagnation_rounds >= 2
-            and float(local_best.avg_roofline_eta) < 0.15
-            and has_recurrent_loop
-        )
-        shift_rule_id_set: set[str] = set()
-        if paradigm_shift_active:
-            coupled_axes = replace(parent_axes, compute_engine="coupled_1c2v")
-            shift_rules = list(
-                self._tracker.rank_applicable_rules(
-                    ctx,
-                    top_k=max(1, self._config.k_rule_workers),
-                    topology_axes=coupled_axes,
-                    operator_name=self._config.operator_name,
-                    runtime_backend=regime_spec.runtime_backend,
-                    regime_tag=regime_spec.regime_tag,
-                    parent_sha=parent_sha,
-                    current_round=round_idx,
-                    symptom_ranking=ranked_families,
-                )
-            )
-            shift_rule_id_set = {r.rule_id for r in shift_rules}
-            ranked_rules = _interleave_paradigm_shift_rules(ranked_rules, shift_rules)
-
         selected_rules = ranked_rules[: self._config.k_rule_workers]
-        dispatched_shift_rule_ids = tuple(
-            r.rule_id for r in selected_rules if r.rule_id in shift_rule_id_set
-        )
+        dispatched_shift_rule_ids: tuple[str, ...] = ()
         worker_specs: list[tuple[str, str, AscendCausalRule | None, GenerationRequest]] = []
         for idx, rule in enumerate(selected_rules):
             worker_specs.append(
@@ -7957,7 +8362,7 @@ class PerfTargetCampaignRunner:
         else:
             prescreen_summary = ""
         deficit = max(0, self._config.k_rule_workers - len(ranked_rules))
-        total_creative = 1 + deficit
+        total_creative = max(2, 1 + deficit) if paradigm_shift_active else (1 + deficit)
         for c_idx in range(total_creative):
             wid = f"r{round_idx}_creative" if c_idx == 0 else f"r{round_idx}_creative_{c_idx}"
             hint = (
@@ -8153,7 +8558,12 @@ class PerfTargetCampaignRunner:
                         error_message=dead_err,
                         backend_kind="ascendc",
                     )
-                return self._run_l0(mod_src, regime_spec)
+                return self._invoke_with_optional_kwargs(
+                    self._run_l0,
+                    mod_src,
+                    regime_spec,
+                    anchor_dims_override=bn_dims or None,
+                )
 
             round_active_kernel = (
                 self._resolve_active_trackb_kernel(
@@ -8282,7 +8692,7 @@ class PerfTargetCampaignRunner:
                     cand_file.write_text(chk.patched_module_source, encoding="utf-8")
                     cand_paths.append((chk.candidate_id, cand_file))
                 try:
-                    l2_results, l2_run_ids = self._run_l2_batch(cand_paths, active_anchors)
+                    l2_results, l2_run_ids = self._run_l2_batch(cand_paths, working_anchors)
                 except (OSError, subprocess.SubprocessError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
                     logger.warning(
                         "Round %d L2 batch failed after retries: %s",
@@ -8328,7 +8738,7 @@ class PerfTargetCampaignRunner:
                 top_res=top_res,
                 best_result=best_result,
                 regime_spec=regime_spec,
-                active_anchors=active_anchors,
+                active_anchors=working_anchors,
                 incumbent_source=incumbent_source,
             )
             if not tail_guard_ok:
@@ -8402,18 +8812,88 @@ class PerfTargetCampaignRunner:
                         on_execution_started=_record_l3_started,
                     )
                 self._active_promotion = None
+                inline_attempts: list[dict[str, str]] = [
+                    self._promotion_attempt(
+                        l3_res,
+                        l3_res.device_id or self._config.device_id,
+                        candidate_sha256=candidate_sha,
+                    )
+                ]
+                if (
+                    not l3_res.passed
+                    and l3_res.execution_terminal
+                    and l3_res.failure_kind == FAILURE_KIND_INFRASTRUCTURE
+                    and (
+                        getattr(l3_res, "blocked_env_category", "") == "occupancy"
+                        or l3_res.failure_category == "occupancy"
+                    )
+                    and len(self._l4_device_pool) > 1
+                ):
+                    pool_pending = PendingPromotion(
+                        candidate_source=top_chk.patched_module_source,
+                        candidate_sha256=l3_res.candidate_sha256 or candidate_sha,
+                        target_path=l3_res.target_path or str(self._target_module_path),
+                        round_idx=round_idx,
+                        regime_tag=regime_spec.regime_tag,
+                        candidate_result=top_res,
+                        candidate_id=top_chk.candidate_id,
+                        builder_name=func_name,
+                        parent_lane=parent_lane,
+                        creative_effort=creative_effort,
+                        execution_id=l3_res.execution_id,
+                        run_id=l3_res.run_id,
+                        receipt_path=l3_res.receipt_path,
+                        error_message=l3_res.error_message,
+                        attempts=tuple(inline_attempts),
+                        device_id=l3_res.device_id or self._config.device_id,
+                        execution_terminal=l3_res.execution_terminal,
+                    )
+                    tried_inline_cards: set[str] = set()
+                    while self._can_retry_on_alt_card(pool_pending, pool_pending.device_id):
+                        next_dev = self._next_l3_alt_card(pool_pending, pool_pending.device_id)
+                        if not next_dev or next_dev in tried_inline_cards:
+                            break
+                        tried_inline_cards.add(next_dev)
+                        l3_res = self._retry_l3_on_alt_card(pool_pending, tuple(inline_attempts))
+                        inline_attempts.append(
+                            self._promotion_attempt(
+                                l3_res,
+                                next_dev or l3_res.device_id or self._config.device_id,
+                                candidate_sha256=candidate_sha,
+                            )
+                        )
+                        pool_pending = replace(
+                            pool_pending,
+                            execution_id=l3_res.execution_id or pool_pending.execution_id,
+                            run_id=l3_res.run_id or pool_pending.run_id,
+                            receipt_path=l3_res.receipt_path or pool_pending.receipt_path,
+                            error_message=l3_res.error_message or pool_pending.error_message,
+                            attempts=tuple(inline_attempts),
+                            device_id=next_dev or l3_res.device_id or pool_pending.device_id,
+                            execution_terminal=l3_res.execution_terminal,
+                            retry_used=True,
+                        )
+                        if (
+                            l3_res.passed
+                            or not l3_res.execution_terminal
+                            or l3_res.failure_kind == FAILURE_KIND_CANDIDATE
+                        ):
+                            break
+
                 if l3_res.passed:
                     promoted = True
                     new_incumbent = top_chk.patched_module_source
                     new_best = top_res
                     stagnation_after = 0
+                    if len(inline_attempts) > 1:
+                        promotion_attempts = tuple(inline_attempts)
                     self._pending_promotion = None
                     self._persist_runtime_state("active_promotion", None)
                     self._persist_runtime_state("pending_promotion", None)
                     self._collect_msprof_for_regimes(
                         top_chk.patched_module_source,
                         top_res,
-                        active_anchors,
+                        working_anchors,
                         [regime_spec],
                     )
                 elif (
@@ -8431,23 +8911,6 @@ class PerfTargetCampaignRunner:
                         rolled_back_l3 = False
                     promotion_blocked = True
                     stagnation_after = stagnation_rounds
-                    attempt = {
-                        "execution_id": l3_res.execution_id,
-                        "run_id": l3_res.run_id,
-                        "receipt_path": l3_res.receipt_path,
-                        "error_message": l3_res.error_message,
-                        "failure_kind": l3_res.failure_kind,
-                        "failure_category": l3_res.failure_category,
-                        "pending": str(
-                            l3_res.pending
-                            or l3_res.failure_kind != FAILURE_KIND_CANDIDATE
-                            or not l3_res.execution_terminal
-                        ).lower(),
-                        "device_id": l3_res.device_id or self._config.device_id,
-                        "state": l3_res.state,
-                        "candidate_sha256": l3_res.candidate_sha256 or candidate_sha,
-                        "execution_terminal": str(l3_res.execution_terminal).lower(),
-                    }
                     self._pending_promotion = PendingPromotion(
                         candidate_source=top_chk.patched_module_source,
                         candidate_sha256=l3_res.candidate_sha256 or candidate_sha,
@@ -8463,9 +8926,10 @@ class PerfTargetCampaignRunner:
                         run_id=l3_res.run_id,
                         receipt_path=l3_res.receipt_path,
                         error_message=l3_res.error_message,
-                        attempts=(attempt,),
+                        attempts=tuple(inline_attempts),
                         device_id=l3_res.device_id or self._config.device_id,
                         execution_terminal=l3_res.execution_terminal,
+                        retry_used=len(inline_attempts) > 1,
                     )
                     promotion_attempts = self._pending_promotion.attempts
                     self._persist_runtime_state(
@@ -8479,19 +8943,96 @@ class PerfTargetCampaignRunner:
                             "active_promotion", self._pending_promotion.to_dict()
                         )
                 else:
-                    promotion_attempts = (
-                        self._promotion_attempt(l3_res, self._config.device_id),
+                    self._promote_l3_counterexample_anchors(
+                        l3_res,
+                        incumbent_source,
+                        regime_spec,
+                        working_anchors,
                     )
-                    restore_error = self._write_source_and_verify(
-                        self._target_module_path, incumbent_source
+                    repaired_tuple = await self._attempt_l3_counterexample_repair(
+                        backend=backend,
+                        top_chk=top_chk,
+                        l3_res=l3_res,
+                        incumbent_source=incumbent_source,
+                        best_result=best_result,
+                        regime_spec=regime_spec,
+                        active_anchors=working_anchors,
+                        active_mask=active_mask,
+                        bn_dims=bn_dims,
+                        round_idx=round_idx,
+                        func_name=func_name,
+                        parent_lane=parent_lane,
+                        creative_effort=creative_effort,
                     )
-                    if restore_error:
-                        raise RuntimeError(restore_error)
-                    rolled_back_l3 = True
-                    stagnation_after = stagnation_rounds + 1
-                    self._pending_promotion = None
-                    self._persist_runtime_state("active_promotion", None)
-                    self._persist_runtime_state("pending_promotion", None)
+                    if repaired_tuple is not None:
+                        repaired_chk, repaired_res, repaired_l3 = repaired_tuple
+                        inline_attempts.append(
+                            self._promotion_attempt(
+                                repaired_l3,
+                                self._config.device_id,
+                                candidate_sha256=self._source_sha256(
+                                    repaired_chk.patched_module_source
+                                ),
+                            )
+                        )
+                        if repaired_l3.passed:
+                            orig_meta = meta_by_id.get(
+                                top_chk.candidate_id,
+                                ("l3_counterexample_repair", None, ""),
+                            )
+                            meta_by_id[repaired_chk.candidate_id] = orig_meta
+                            passed_checks.append(repaired_chk)
+                            l2_results[repaired_chk.candidate_id] = repaired_res
+                            top_chk = repaired_chk
+                            top_res = repaired_res
+                            l3_res = repaired_l3
+                            best_round_speedup = top_res.avg_speedup
+                            best_round_surrogate_score = top_res.surrogate_score
+                            rel_gain = (
+                                (top_res.avg_speedup - best_result.avg_speedup)
+                                / max(best_result.avg_speedup, 1e-6)
+                            )
+                            top_local = top_res.for_regime(regime_spec.regime_tag)
+                            best_local = best_result.for_regime(regime_spec.regime_tag)
+                            if top_local.anchors and best_local.anchors:
+                                top_local_lat = top_local.mean_latency_us()
+                                best_local_lat = best_local.mean_latency_us()
+                                local_rel_gain = max(
+                                    (top_local.avg_speedup - best_local.avg_speedup)
+                                    / max(best_local.avg_speedup, 1e-6),
+                                    (
+                                        (best_local_lat - top_local_lat)
+                                        / max(best_local_lat, 1e-6)
+                                        if (top_local_lat > 0.0 and best_local_lat > 0.0)
+                                        else 0.0
+                                    ),
+                                )
+                            promoted = True
+                            new_incumbent = repaired_chk.patched_module_source
+                            new_best = repaired_res
+                            stagnation_after = 0
+                            promotion_attempts = tuple(inline_attempts)
+                            self._pending_promotion = None
+                            self._persist_runtime_state("active_promotion", None)
+                            self._persist_runtime_state("pending_promotion", None)
+                            self._collect_msprof_for_regimes(
+                                repaired_chk.patched_module_source,
+                                repaired_res,
+                                working_anchors,
+                                [regime_spec],
+                            )
+                    if not promoted:
+                        promotion_attempts = tuple(inline_attempts)
+                        restore_error = self._write_source_and_verify(
+                            self._target_module_path, incumbent_source
+                        )
+                        if restore_error:
+                            raise RuntimeError(restore_error)
+                        rolled_back_l3 = True
+                        stagnation_after = stagnation_rounds + 1
+                        self._pending_promotion = None
+                        self._persist_runtime_state("active_promotion", None)
+                        self._persist_runtime_state("pending_promotion", None)
 
         beam_updates: list[BeamCandidate] = []
         top_chk_id = top_chk.candidate_id if top_chk is not None else None
@@ -8588,7 +9129,7 @@ class PerfTargetCampaignRunner:
             self._record_surrogate_observations(
                 source=chk.patched_module_source,
                 result=res,
-                active_anchors=active_anchors,
+                active_anchors=working_anchors,
                 parent_source=parent_module_source,
                 parent_result=stone_parent_result,
                 parent_ledger=parent_ledger,
@@ -8809,7 +9350,7 @@ class PerfTargetCampaignRunner:
                             winner_latency_us=fly_win_lat,
                             func_name=func_name,
                             regime_spec=regime_spec,
-                            active_anchors=active_anchors,
+                            active_anchors=working_anchors,
                             topology_axes=parent_axes,
                             rel_gain=eff_gain,
                             worker_kind=top_wkind,
@@ -9453,7 +9994,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max-rounds", type=int, default=12)
     parser.add_argument("--max-wall-clock-min", type=float, default=180.0)
-    parser.add_argument("--device-id", default="1", help="Authorized NPU device ID.")
+    parser.add_argument(
+        "--device-id",
+        default="",
+        help=(
+            "Authorized NPU device ID; defaults to the first card declared by "
+            "TILEFOUNDRY_NPU_CAMPAIGN_DEVICE_IDS, else 1."
+        ),
+    )
     parser.add_argument(
         "--device-ids",
         type=parse_device_ids,
@@ -9536,6 +10084,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Execute PerfTargetCampaignRunner from CLI arguments and emit JSON summary."""
     args = build_arg_parser().parse_args(list(argv) if argv is not None else None)
+    env_hint = args.env_file or os.environ.get("TILEFOUNDRY_NPU_ENV_FILE", "").strip()
+    env_values = parse_simple_env_file(Path(env_hint).expanduser()) if env_hint else {}
+    primary_device_id, device_pool = resolve_campaign_device_plan(
+        device_id=str(args.device_id),
+        device_ids=tuple(args.device_ids),
+        env_device_ids=parse_device_ids(
+            env_values.get(CAMPAIGN_DEVICE_IDS_ENV_KEY, "")
+        ),
+        visible_device_ids=parse_device_ids(
+            os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
+        ),
+    )
+    llm_backend = create_llm_backend_from_env(overrides=env_values or None)
     cfg = CampaignConfig(
         operator_name=args.operator,
         max_rounds=args.max_rounds,
@@ -9544,9 +10105,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_surrogate_gain=args.min_surrogate_gain,
         disable_early_goal_stop=bool(args.disable_early_goal_stop),
         run_final_l4=bool(args.run_final_l4),
-        device_id=str(args.device_id),
+        device_id=primary_device_id,
         retry_device_id=str(args.retry_device_id),
-        device_ids=tuple(args.device_ids),
+        device_ids=tuple(d for d in device_pool if d != primary_device_id),
         enable_tilesize_prescreen=bool(args.enable_tilesize_prescreen),
         cost_prescreen_top_k=(
             int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
@@ -9564,6 +10125,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     runner = PerfTargetCampaignRunner(
         config=cfg,
         target_module_path=args.target_module,
+        llm_backend=llm_backend,
         tracker=tracker,
         flywheel_distiller=flywheel,
         checkpoint_path=args.checkpoint,
