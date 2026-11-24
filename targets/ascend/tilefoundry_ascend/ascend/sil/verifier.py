@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import math
 import re
 from collections.abc import Mapping
@@ -331,6 +332,11 @@ class SILVerifier:
     ) -> VerificationReport:
         """Verify AscendC source text against 7-facet MECE locks and hardware invariants."""
         return verify_source_against_facets(source_text, mask, max_flag_depth=max_flag_depth)
+
+    @staticmethod
+    def verify_tilelang_ast(source_text: str) -> VerificationReport:
+        """Verify TileLang Python DSL AST for legal T.Stage and T.Parallel usage."""
+        return verify_tilelang_ast(source_text)
 
 
 def verify_policy_envelope(
@@ -1368,3 +1374,192 @@ def verify_source_against_facets(
         warnings=tuple(warnings),
         suggested_fixes=suggested_fixes,
     )
+
+
+def _is_t_dsl_call(node: ast.AST, *attrs: str) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in attrs
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "T"
+    )
+
+
+def _extract_int_constant(node: ast.AST) -> int | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+        return int(node.value)
+    if (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, ast.USub)
+        and isinstance(node.operand, ast.Constant)
+        and isinstance(node.operand.value, int)
+        and not isinstance(node.operand.value, bool)
+    ):
+        return -int(node.operand.value)
+    return None
+
+
+def _pipelined_has_stage_offset(call: ast.Call) -> bool:
+    stage_expr: ast.AST | None = call.args[1] if len(call.args) >= 2 else None
+    if stage_expr is None:
+        for kw in call.keywords:
+            if kw.arg == "num_stages":
+                stage_expr = kw.value
+                break
+    if stage_expr is not None:
+        stage_val = _extract_int_constant(stage_expr)
+        return stage_val >= 2 if stage_val is not None else True
+    for kw in call.keywords:
+        if kw.arg == "annotations" and isinstance(kw.value, ast.Dict):
+            for key_node, val_node in zip(kw.value.keys, kw.value.values):
+                if (
+                    isinstance(key_node, ast.Constant)
+                    and key_node.value == "enable_offset"
+                    and isinstance(val_node, ast.Constant)
+                    and bool(val_node.value)
+                ):
+                    return True
+    return False
+
+
+def _extract_stage_index(call: ast.Call) -> int | None:
+    if call.args:
+        return _extract_int_constant(call.args[0])
+    for kw in call.keywords:
+        if kw.arg in ("stage", "stage_id"):
+            return _extract_int_constant(kw.value)
+    return None
+
+
+def verify_tilelang_ast(source_text: str) -> VerificationReport:
+    """Enforce Stage-A TileLang Python AST rules for T.Stage and T.Parallel bodies."""
+    try:
+        tree = ast.parse(source_text)
+    except SyntaxError as exc:
+        return VerificationReport(
+            passed=False,
+            errors=(f"[tilelang_ast] SyntaxError at line {exc.lineno}: {exc.msg}",),
+        )
+
+    errors: list[str] = []
+
+    def _visit(
+        node: ast.AST,
+        *,
+        in_parallel: bool,
+        in_simdvf: bool,
+        in_pipelined_stages: bool,
+    ) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for child in ast.iter_child_nodes(node):
+                _visit(
+                    child,
+                    in_parallel=False,
+                    in_simdvf=False,
+                    in_pipelined_stages=False,
+                )
+            return
+
+        if isinstance(node, (ast.With, ast.AsyncWith)):
+            next_simdvf = in_simdvf or any(
+                _is_t_dsl_call(item.context_expr, "SimdVF") for item in node.items
+            )
+            for item in node.items:
+                _visit(
+                    item.context_expr,
+                    in_parallel=in_parallel,
+                    in_simdvf=in_simdvf,
+                    in_pipelined_stages=in_pipelined_stages,
+                )
+                if item.optional_vars is not None:
+                    _visit(
+                        item.optional_vars,
+                        in_parallel=in_parallel,
+                        in_simdvf=in_simdvf,
+                        in_pipelined_stages=in_pipelined_stages,
+                    )
+            for stmt in node.body:
+                _visit(
+                    stmt,
+                    in_parallel=in_parallel,
+                    in_simdvf=next_simdvf,
+                    in_pipelined_stages=in_pipelined_stages,
+                )
+            return
+
+        if isinstance(node, (ast.For, ast.AsyncFor)):
+            _visit(
+                node.target,
+                in_parallel=in_parallel,
+                in_simdvf=in_simdvf,
+                in_pipelined_stages=in_pipelined_stages,
+            )
+            _visit(
+                node.iter,
+                in_parallel=in_parallel,
+                in_simdvf=in_simdvf,
+                in_pipelined_stages=in_pipelined_stages,
+            )
+            next_parallel = in_parallel or _is_t_dsl_call(node.iter, "Parallel")
+            next_pipelined = in_pipelined_stages or (
+                isinstance(node.iter, ast.Call)
+                and _is_t_dsl_call(node.iter, "Pipelined")
+                and _pipelined_has_stage_offset(node.iter)
+            )
+            for stmt in node.body:
+                _visit(
+                    stmt,
+                    in_parallel=next_parallel,
+                    in_simdvf=in_simdvf,
+                    in_pipelined_stages=next_pipelined,
+                )
+            for stmt in node.orelse:
+                _visit(
+                    stmt,
+                    in_parallel=in_parallel,
+                    in_simdvf=in_simdvf,
+                    in_pipelined_stages=in_pipelined_stages,
+                )
+            return
+
+        if isinstance(node, ast.Call):
+            if _is_t_dsl_call(node, "Stage"):
+                if in_simdvf:
+                    errors.append(
+                        f"[tilelang_ast] T.Stage(...) is forbidden inside T.SimdVF() "
+                        f"(line {node.lineno})"
+                    )
+                if in_parallel:
+                    errors.append(
+                        f"[tilelang_ast] T.Stage(...) is forbidden inside T.Parallel() "
+                        f"(line {node.lineno})"
+                    )
+                stage_idx = _extract_stage_index(node)
+                if stage_idx is not None and stage_idx != 0 and not in_pipelined_stages:
+                    errors.append(
+                        f"[tilelang_ast] Nonzero T.Stage({stage_idx}) requires an enclosing "
+                        f"T.Pipelined(..., num_stages>=2) context (line {node.lineno})"
+                    )
+            if in_parallel and _is_t_dsl_call(node, "copy", "gemm", "gemm_v0"):
+                assert isinstance(node.func, ast.Attribute)
+                errors.append(
+                    f"[tilelang_ast] Block-level T.{node.func.attr}(...) is forbidden inside "
+                    f"T.Parallel() loop body (line {node.lineno})"
+                )
+
+        for child in ast.iter_child_nodes(node):
+            _visit(
+                child,
+                in_parallel=in_parallel,
+                in_simdvf=in_simdvf,
+                in_pipelined_stages=in_pipelined_stages,
+            )
+
+    _visit(
+        tree,
+        in_parallel=False,
+        in_simdvf=False,
+        in_pipelined_stages=False,
+    )
+    return VerificationReport(passed=len(errors) == 0, errors=tuple(errors))

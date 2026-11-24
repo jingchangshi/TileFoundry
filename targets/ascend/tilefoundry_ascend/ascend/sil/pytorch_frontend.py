@@ -261,7 +261,8 @@ class PyTorchOpSemantics:
     @property
     def base_axes(self) -> TopologyAxes:
         """Return the base topology axes implied by the recovered semantics."""
-        coupled = self.has_matmul and (
+        is_gemm = bool(self.has_gemm_contraction)
+        coupled = is_gemm and (
             self.has_online_exp_max
             or self.has_subbyte_or_block_quant
             or self.has_indirect_index
@@ -269,18 +270,18 @@ class PyTorchOpSemantics:
         )
         if coupled:
             compute_engine = "coupled_1c2v"
-        elif self.has_matmul:
+        elif is_gemm:
             compute_engine = "aic_only"
         else:
             compute_engine = "aiv_only"
 
-        if self.has_recurrent_loop and not self.has_matmul:
+        if self.has_recurrent_loop and not is_gemm:
             memory_ring = "persistent_onchip_state"
         elif coupled and self.has_online_exp_max:
             memory_ring = "bidirectional_cv_ring"
         elif coupled:
             memory_ring = "l0c_ub_epilogue"
-        elif self.has_matmul:
+        elif is_gemm:
             memory_ring = "gm_l1_l0_fixpipe"
         elif self.has_indirect_index:
             memory_ring = "ub_random_atomic"
