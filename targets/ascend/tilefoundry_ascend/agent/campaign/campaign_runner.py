@@ -203,8 +203,10 @@ from tilefoundry_ascend.ascend.sil.schema import (
 )
 from tilefoundry_ascend.ascend.sil.verifier import verify_source_against_facets
 from tilefoundry_ascend.ascend.target import AscendTarget
-import tilefoundry_ascend.ascend.templates.registry as templates_registry
-from tilefoundry_ascend.ascend.templates.registry import relax_facets_for_bottleneck
+from tilefoundry_ascend.ascend.templates.registry import (
+    relax_facets_for_bottleneck,
+    unlock_cross_topology_paradigm_shift,
+)
 
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
@@ -8247,11 +8249,7 @@ class PerfTargetCampaignRunner:
             self._freedom_masks.setdefault(regime_spec.regime_tag, active_mask)
 
         if paradigm_shift_active:
-            active_mask = getattr(
-                templates_registry,
-                "unlock_cross_topology_paradigm_shift",
-                lambda _m: ConstraintRelaxationMask.top(),
-            )(active_mask)
+            active_mask = unlock_cross_topology_paradigm_shift(active_mask)
             self._freedom_masks[regime_spec.regime_tag] = active_mask
 
         sil_policy_section = self._format_sil_live_policy_section(
