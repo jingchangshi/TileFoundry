@@ -877,7 +877,13 @@ def kernel(x):
     runner._target_module_path.write_text(mod_src, encoding="utf-8")
 
     class _FakeLLM:
-        async def generate(self, req: object) -> str:
+        async def generate(
+            self,
+            req: object,
+            *,
+            effort_override: object = None,
+        ) -> str:
+            _ = effort_override
             if getattr(req, "role", "") == "explore_creative":
                 return json.dumps(
                     {
@@ -888,7 +894,7 @@ def kernel(x):
                 )
             return "def _build_small():\n    return 3\n"
 
-    runner._llm_backend = _FakeLLM()
+    runner._backend = _FakeLLM()
     ledger = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
         is_legal=True,
