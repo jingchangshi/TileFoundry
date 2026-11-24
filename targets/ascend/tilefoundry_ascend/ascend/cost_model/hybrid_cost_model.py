@@ -906,9 +906,31 @@ class HybridAscendCostModel:
             wave_ratio = max(1.0, waves / max(1e-6, ideal_waves))
         cube_floor_us = ideal_cube_us * wave_ratio
 
+        prof = MicroarchProfile.coerce(cf.microarch_profile) if cf.microarch_profile else MicroarchProfile()
+        has_cube_or_simd_backbone = (
+            cf.cube_flops > 0.0
+            or prof.cube_mmad_count > 0
+            or prof.cube_macs_total > 0
+            or prof.fp_alu_ops > 0
+            or prof.int_alu_ops > 0
+            or prof.sfu_f16_ops > 0
+            or prof.sfu_f32_ops > 0
+            or prof.reduce_ops > 0
+            or prof.slot0_only_ops > 0
+            or (
+                cf.topology_axes is not None
+                and cf.topology_axes.iteration_regularity == "irregular_simt"
+            )
+            or float(cf.extra_signals.get("has_simtvf", 0.0) or 0.0) > 0.0
+            or float(cf.extra_signals.get("has_simd", 0.0) or 0.0) > 0.0
+            or float(cf.extra_signals.get("measured_aiv_vec_ratio", 0.0) or 0.0) >= 0.08
+            or float(cf.extra_signals.get("l2_aiv_vec_ratio", 0.0) or 0.0) >= 0.08
+        )
         scalar_fallback = float(cf.extra_signals.get("scalar_compute_loop_fallback", 0.0) or 0.0)
         vec_flops_per_cycle = (
-            1.0 if scalar_fallback > 0.0 else float(DEFAULT_AIV_VEC_FLOPS_PER_CYCLE)
+            1.0
+            if (scalar_fallback > 0.0 and not has_cube_or_simd_backbone)
+            else float(DEFAULT_AIV_VEC_FLOPS_PER_CYCLE)
         )
         aiv_peak_flops_per_sec = float(aiv_cores) * vec_flops_per_cycle * clock_hz
         vec_floor_us = (cf.vec_flops / aiv_peak_flops_per_sec) * 1e6 if cf.vec_flops > 0 else 0.0
@@ -975,7 +997,6 @@ class HybridAscendCostModel:
         else:
             cv_sync_us = 0.0
 
-        prof = MicroarchProfile.coerce(cf.microarch_profile) if cf.microarch_profile else MicroarchProfile()
         has_work = (
             cf.cube_flops > 0.0
             or cf.vec_flops > 0.0
@@ -1037,8 +1058,6 @@ class HybridAscendCostModel:
             )
             cube_floor_us = max(cube_floor_us, sched.pipe_ns["CUBE"] * 1e-3)
             sched_vec_us = sched.pipe_ns["VECTOR"] * 1e-3
-            if scalar_fallback > 0.0:
-                sched_vec_us *= float(DEFAULT_AIV_VEC_FLOPS_PER_CYCLE)
             vec_floor_us = max(vec_floor_us, sched_vec_us)
             fixpipe_floor_us = max(fixpipe_floor_us, sched.pipe_ns["FIXPIPE"] * 1e-3)
             hbm_floor_us = max(hbm_floor_us, (sched.pipe_ns["MTE2"] * 1e-3) * (1.0 - l2_hit_rate))

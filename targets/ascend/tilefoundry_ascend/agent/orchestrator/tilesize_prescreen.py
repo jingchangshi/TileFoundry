@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from itertools import product
 
@@ -13,6 +13,7 @@ from tilefoundry_ascend.ascend.cost_model.calibration_backtest import (
     PrescreenAblationSample,
     evaluate_prescreen_ablation,
 )
+from tilefoundry_ascend.ascend.cost_model.cost_gate_policy import is_paradigm_shift_exempt
 from tilefoundry_ascend.ascend.cost_model.hybrid_cost_model import (
     CostFeatures,
     CostPrediction,
@@ -500,6 +501,17 @@ class CostRankedCandidate:
     dominant_bound: str
     topology_bucket: str
     ledger: object | None = None
+    parent_relative_ratio: float = 1.0
+    coarse_reject_exempt: bool = False
+    coarse_rejected: bool = False
+
+    def exceeds_coarse_reject_ratio(self, coarse_reject_ratio: float = 3.0) -> bool:
+        """Return True when candidate cost exceeds the parent ratio cap without exemption."""
+        if self.coarse_reject_exempt:
+            return False
+        if not math.isfinite(coarse_reject_ratio) or coarse_reject_ratio <= 0.0:
+            return False
+        return self.parent_relative_ratio > float(coarse_reject_ratio)
 
 
 def rank_stage_a_candidates_with_cost_model(
@@ -512,6 +524,9 @@ def rank_stage_a_candidates_with_cost_model(
     sil_advisory: object | None = None,
     parent_ledger: object | None = None,
     parent_features: CostFeatures | None = None,
+    coarse_reject_ratio: float = 3.0,
+    creative_candidate_ids: Collection[str] | None = None,
+    parent_workspace_stages: int = 0,
 ) -> list[CostRankedCandidate]:
     """Rank Stage-A passers by parent-relative delta cost, ascending, with stable ties."""
     parent_cf = parent_features
@@ -525,22 +540,50 @@ def rank_stage_a_candidates_with_cost_model(
             target=cost_model.target,
         )
     parent_pred = cost_model.predict(parent_cf) if parent_cf is not None else None
+    raw_parent_axes = (
+        axes
+        if isinstance(axes, TopologyAxes)
+        else getattr(parent_ledger, "topology_axes", None)
+    )
+    eff_parent_axes = raw_parent_axes if isinstance(raw_parent_axes, TopologyAxes) else None
+    creative_ids = frozenset(str(cid) for cid in (creative_candidate_ids or ()))
     scored: list[tuple[float, int, CostRankedCandidate]] = []
     for idx, (cand_id, _patched_src, stage_a) in enumerate(candidates):
         ledger = getattr(stage_a, "ledger", None)
+        raw_cand_axes = getattr(ledger, "topology_axes", None)
+        cand_axes = (
+            raw_cand_axes if isinstance(raw_cand_axes, TopologyAxes) else eff_parent_axes
+        )
         features = build_cost_features_from_ledger(
             ledger,
             live_plan=live_plan,
-            axes=axes,
+            axes=cand_axes,
             blueprint=blueprint,
             sil_advisory=sil_advisory,
             target=cost_model.target,
         )
         pred = cost_model.predict(features)
         score = float(pred.pred_us)
+        rel_ratio = 1.0
         if parent_pred is not None and parent_cf is not None:
-            ratio = cost_model.predict_delta_ratio(features, parent_cf)
-            score = float(parent_pred.pred_us) * float(ratio)
+            ratio = float(cost_model.predict_delta_ratio(features, parent_cf))
+            score = float(parent_pred.pred_us) * ratio
+            rel_ratio = ratio
+        cand_ws_stages = int(getattr(ledger, "workspace_stages", parent_workspace_stages) or 0)
+        exempt = is_paradigm_shift_exempt(
+            cand_axes,
+            eff_parent_axes,
+            cand_workspace_stages=cand_ws_stages,
+            parent_workspace_stages=int(parent_workspace_stages),
+            is_creative=str(cand_id) in creative_ids,
+        )
+        rejected = (
+            parent_pred is not None
+            and not exempt
+            and math.isfinite(coarse_reject_ratio)
+            and float(coarse_reject_ratio) > 0.0
+            and rel_ratio > float(coarse_reject_ratio)
+        )
         ranked_item = CostRankedCandidate(
             candidate_id=str(cand_id),
             pred_us=score,
@@ -549,6 +592,9 @@ def rank_stage_a_candidates_with_cost_model(
             dominant_bound=str(pred.dominant_bound),
             topology_bucket=str(pred.topology_bucket),
             ledger=ledger,
+            parent_relative_ratio=rel_ratio,
+            coarse_reject_exempt=exempt,
+            coarse_rejected=rejected,
         )
         scored.append((ranked_item.pred_us, idx, ranked_item))
     scored.sort(key=lambda entry: (entry[0], entry[1]))

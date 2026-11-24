@@ -258,11 +258,12 @@ def _strip_cpp_comments(text: str) -> str:
     return re.sub(r"//[^\n]*", "", stripped)
 
 
-def _extract_for_loop_bodies(text: str) -> list[str]:
-    bodies: list[str] = []
+def _extract_for_loops(text: str) -> list[tuple[str, str]]:
+    loops: list[tuple[str, str]] = []
     n = len(text)
     for match in re.finditer(r"\bfor\s*\(", text):
-        pos = match.end()
+        header_start = match.end()
+        pos = header_start
         paren_depth = 1
         while pos < n and paren_depth > 0:
             ch = text[pos]
@@ -273,6 +274,7 @@ def _extract_for_loop_bodies(text: str) -> list[str]:
             pos += 1
         if paren_depth != 0:
             continue
+        header = text[header_start : pos - 1]
         while pos < n and text[pos].isspace():
             pos += 1
         if pos >= n:
@@ -289,12 +291,16 @@ def _extract_for_loop_bodies(text: str) -> list[str]:
                     brace_depth -= 1
                 pos += 1
             if brace_depth == 0:
-                bodies.append(text[start : pos - 1])
+                loops.append((header, text[start : pos - 1]))
         else:
             semi = text.find(";", pos)
             if semi != -1:
-                bodies.append(text[pos : semi + 1])
-    return bodies
+                loops.append((header, text[pos : semi + 1]))
+    return loops
+
+
+def _extract_for_loop_bodies(text: str) -> list[str]:
+    return [body for _, body in _extract_for_loops(text)]
 
 
 def _strip_subscripts(text: str) -> str:
@@ -331,12 +337,47 @@ _UB_PTR_NAME_RE = re.compile(
     r"__ubuf__\s+[^;(),={}]*?\*+\s*(?:__restrict__\s*)?([A-Za-z_]\w*)"
 )
 
+_ASC_PRIM_CALL_RE = re.compile(r"\basc_\w+\s*(?:<[^;{}()]*>)?\s*\(")
+_NESTED_FOR_RE = re.compile(r"\bfor\s*\(")
+
 _SCALAR_COMPUTE_OP_RE = re.compile(
     r"(?:\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<|>>|[+\-*/%&|^~]"
     r"|\b(?:expf?|sqrtf?|rsqrtf?|logf?|tanhf?|fabsf?|fmaxf?|fminf?|powf?|fmaf?)\s*\()",
 )
 
 _BYPASS_DCACHE_RE = re.compile(r"\b(?:tl::)?write_gm_bypass_dcache\b")
+
+
+def _static_loop_bound_lt_threshold(header: str, threshold: int = 32) -> bool:
+    parts = header.split(";")
+    if len(parts) != 3:
+        return False
+    init_part, cond_part, step_part = (part.strip() for part in parts)
+    cond_lt = re.fullmatch(r"([A-Za-z_]\w*)\s*(<=|<)\s*(\d+)[uUlL]*", cond_part)
+    if cond_lt is not None:
+        var = cond_lt.group(1)
+        upper = int(cond_lt.group(3)) + (1 if cond_lt.group(2) == "<=" else 0)
+    else:
+        cond_gt = re.fullmatch(r"(\d+)[uUlL]*\s*(>=|>)\s*([A-Za-z_]\w*)", cond_part)
+        if cond_gt is None:
+            return False
+        var = cond_gt.group(3)
+        upper = int(cond_gt.group(1)) + (1 if cond_gt.group(2) == ">=" else 0)
+    init_m = re.search(rf"\b{re.escape(var)}\s*=\s*(-?\d+)[uUlL]*\b", init_part)
+    if init_m is None:
+        return False
+    start = int(init_m.group(1))
+    if re.fullmatch(rf"(?:\+\+\s*{re.escape(var)}|{re.escape(var)}\s*\+\+)", step_part):
+        step = 1
+    else:
+        add_m = re.fullmatch(rf"{re.escape(var)}\s*\+=\s*(\d+)[uUlL]*", step_part)
+        if add_m is None:
+            return False
+        step = int(add_m.group(1))
+    if step <= 0:
+        return False
+    trips = max(0, (upper - start + step - 1) // step)
+    return trips < threshold
 
 _TYPE_BYTES_PATTERNS: tuple[tuple[re.Pattern[str], float], ...] = (
     (re.compile(r"\b(?:u?int8(?:_t)?|fp8\w*|float8\w*|e4m3\w*|e5m2\w*|char|bool)\b"), 1.0),
@@ -489,7 +530,7 @@ def _has_parallel_simt_kernel(cleaned: str) -> bool:
 
 
 def count_reachable_ub_scalar_compute_loops(cpp_source: str) -> int:
-    """Count reachable scalar compute loops operating on __ubuf__ or __gm__ buffers."""
+    """Count innermost reachable scalar compute loops operating on __ubuf__ buffers."""
     if not cpp_source or not cpp_source.strip():
         return 0
     src = (
@@ -500,16 +541,20 @@ def count_reachable_ub_scalar_compute_loops(cpp_source: str) -> int:
     cleaned = _strip_cpp_comments(src)
     if _has_parallel_simt_kernel(cleaned):
         return 0
-    buf_ptrs = set(_UB_PTR_NAME_RE.findall(cleaned)) | set(_GM_PTR_NAME_RE.findall(cleaned))
-    if not buf_ptrs:
+    ub_ptrs = set(_UB_PTR_NAME_RE.findall(cleaned))
+    if not ub_ptrs:
         return 0
-    ptr_alt = "|".join(re.escape(p) for p in sorted(buf_ptrs))
+    ptr_alt = "|".join(re.escape(p) for p in sorted(ub_ptrs))
     buf_access_re = re.compile(
         rf"\b(?:{ptr_alt})\s*\[[^\]]+\]|\*\s*\(?\s*(?:{ptr_alt})\b"
     )
     count = 0
-    for body in _extract_for_loop_bodies(cleaned):
-        if _VEC_MATRIX_INST_RE.search(body):
+    for header, body in _extract_for_loops(cleaned):
+        if _NESTED_FOR_RE.search(body):
+            continue
+        if _VEC_MATRIX_INST_RE.search(body) or _ASC_PRIM_CALL_RE.search(body):
+            continue
+        if _static_loop_bound_lt_threshold(header, 32):
             continue
         if not buf_access_re.search(body):
             continue
@@ -549,23 +594,32 @@ def _detect_scalar_compute_loop_fallback(
         return {}
 
     gm_ptrs = set(_GM_PTR_NAME_RE.findall(cleaned))
-    gm_access_re = (
+    gm_alt = "|".join(re.escape(p) for p in sorted(gm_ptrs))
+    gm_write_re = (
         re.compile(
-            rf"\b(?:{'|'.join(re.escape(p) for p in sorted(gm_ptrs))})\s*\[[^\]]+\]"
-            rf"|\*\s*\(?\s*(?:{'|'.join(re.escape(p) for p in sorted(gm_ptrs))})\b"
+            rf"(?:\b(?:{gm_alt})\s*\[[^\]]+\]|\*\s*\(?\s*(?:{gm_alt})[^;={{}}]*\))"
+            r"\s*(?:[+\-*/%&|^]?=)(?!=)"
         )
         if gm_ptrs
         else None
     )
+    generic_write_re = re.compile(
+        r"(?:\b[A-Za-z_]\w*\s*\[[^\]]+\]|\*\s*\([^)]+\))\s*(?:[+\-*/%&|^]?=)(?!=)"
+    )
 
-    for body in _extract_for_loop_bodies(cleaned):
-        if gm_access_re is not None and gm_access_re.search(body):
-            return {"scalar_compute_loop_fallback": 1.0}
-        has_buf_access = bool(
-            re.search(r"\b[A-Za-z_]\w*\s*\[[^\]]+\]", body)
-            or re.search(r"\*\s*\([^)]+\)", body)
+    for header, body in _extract_for_loops(cleaned):
+        if _NESTED_FOR_RE.search(body):
+            continue
+        if _VEC_MATRIX_INST_RE.search(body) or _ASC_PRIM_CALL_RE.search(body):
+            continue
+        if _static_loop_bound_lt_threshold(header, 32):
+            continue
+        has_write = (
+            bool(gm_write_re.search(body))
+            if gm_write_re is not None
+            else bool(generic_write_re.search(body))
         )
-        if not has_buf_access:
+        if not has_write:
             continue
         norm_body = body.replace("++", " ").replace("--", " ").replace("->", " ")
         body_no_idx = _strip_subscripts(norm_body)
@@ -817,7 +871,9 @@ def _penalty_scalar_compute_loop_fallback(
         return 0.0
     base_ref = max(1.0, _ctx_float(ctx, "base_ref", 1.0))
     vec_floor_us = max(0.0, _ctx_float(ctx, "vec_floor_us", 0.0))
-    return max(vec_floor_us * 4.0, base_ref * 2.5) * min(4.0, severity)
+    if vec_floor_us > 0.0:
+        return min(1.5 * vec_floor_us, 0.35 * severity * max(vec_floor_us, 1.0))
+    return min(1.5 * base_ref, 0.35 * severity * base_ref)
 
 
 def _penalty_dcache_bypass_narrow_store(
