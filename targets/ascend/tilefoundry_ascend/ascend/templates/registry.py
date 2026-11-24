@@ -256,6 +256,14 @@ def relax_facets_for_bottleneck(
     )
 
 
+def unlock_cross_topology_paradigm_shift(
+    mask: ConstraintRelaxationMask,
+) -> ConstraintRelaxationMask:
+    """Unlock all 7 MECE AST freedom facets when SIL authorizes cross-topology promotion."""
+    _ = mask
+    return ConstraintRelaxationMask.top()
+
+
 class SchedulePolicy(TypedDict, total=False):
     """Parameterization contract shared by SIL, TileLang, and AscendC shell templates."""
 
@@ -1256,4 +1264,5 @@ __all__ = [
     "relax_facets_for_bottleneck",
     "render_template",
     "resolve_canonical_shell_axes",
+    "unlock_cross_topology_paradigm_shift",
 ]
