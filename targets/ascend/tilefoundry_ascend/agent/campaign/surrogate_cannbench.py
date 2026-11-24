@@ -2031,6 +2031,60 @@ def _merge_prewarm_cache_tree(src_dir: Path, dst_dir: Path) -> None:
             shutil.copy2(item, target)
 
 
+def lookup_case_static_spec(
+    operator_name: str,
+    case_num: int,
+    *,
+    cannbench_repo: str | Path | None = None,
+    env_file: str | Path | None = None,
+) -> dict[str, object]:
+    """Read static dims, tl_dtype, and attributes directly from cases.yaml."""
+    repo = resolve_cannbench_repo(cannbench_repo=cannbench_repo, env_file=env_file)
+    task = get_operator_task(operator_name)
+    cases_path = resolve_cannbench_tasks_root(repo) / task / "cases.yaml"
+    if not cases_path.is_file():
+        raise FileNotFoundError(f"cases.yaml not found at {cases_path}")
+    parsed = yaml.safe_load(cases_path.read_text(encoding="utf-8")) or {}
+    cases_list = parsed.get("cases") or []
+    target_id = int(case_num)
+    entry: Mapping[str, object] | None = None
+    for row in cases_list:
+        if isinstance(row, Mapping) and int(row.get("case_id", -1)) == target_id:
+            entry = row
+            break
+    if entry is None:
+        raise KeyError(f"case_num={target_id} missing in {cases_path}")
+
+    spec = lookup_case_dims(
+        operator_name,
+        target_id,
+        cannbench_repo=repo,
+        env_file=env_file,
+    )
+    raw_dtype = entry.get("dtype", "bfloat16")
+    if isinstance(raw_dtype, (list, tuple)):
+        tl_dtype = str(raw_dtype[0]) if raw_dtype else "bfloat16"
+    else:
+        tl_dtype = str(raw_dtype)
+    tl_dtype = tl_dtype.strip() or "bfloat16"
+    if tl_dtype.startswith("torch."):
+        tl_dtype = tl_dtype[len("torch.") :]
+    spec["tl_dtype"] = tl_dtype
+    if "inputLayout" in spec and "input_layout" not in spec:
+        spec["input_layout"] = str(spec["inputLayout"]).upper()
+    if "is_causal" in spec:
+        spec["is_causal"] = bool(spec["is_causal"])
+    if (
+        "B" in spec
+        and "S" in spec
+        and "m_rows" not in spec
+        and isinstance(spec["B"], int)
+        and isinstance(spec["S"], int)
+    ):
+        spec["m_rows"] = int(spec["B"]) * int(spec["S"])
+    return spec
+
+
 def prewarm_surrogate_tilelang_cache(
     operator_name: str,
     candidates: Sequence[tuple[str, str | Path]],

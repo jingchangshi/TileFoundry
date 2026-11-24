@@ -814,8 +814,9 @@ def _evaluate_operator_batch(
                     err_msg = ""
                     if not passed:
                         err_msg = json.dumps(details)[:300]
+                    has_npu_event = hasattr(getattr(torch, "npu", None), "Event")
                     ring_burst_k = 1
-                    if 0.0 < float(spec.t_hw_us) < 5.0:
+                    if has_npu_event and 0.0 < float(spec.t_hw_us) < 5.0:
                         cand_us, ring_burst_k = measure_npu_ring_burst_us(
                             fn,
                             params,
@@ -830,7 +831,7 @@ def _evaluate_operator_batch(
                             warmup=warmup,
                             repeat=repeat,
                         )
-                        if 0.0 < cand_us < 8.0:
+                        if has_npu_event and 0.0 < cand_us < 8.0:
                             cand_us, ring_burst_k = measure_npu_ring_burst_us(
                                 fn,
                                 params,

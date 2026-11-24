@@ -1213,7 +1213,7 @@ class PortfolioRunner:
                     else (
                         max(0.0, float(parent.latency_us) - float(eff_roofline))
                         if eff_roofline > 0.0 and parent.latency_us > 0.0
-                        else 0.0
+                        else None
                     )
                 )
                 eff_mode = cost_model_mode if cost_model_mode is not None else self._cost_model_mode

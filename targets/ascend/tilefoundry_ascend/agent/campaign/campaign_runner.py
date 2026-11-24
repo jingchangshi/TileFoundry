@@ -3955,33 +3955,34 @@ class PerfTargetCampaignRunner:
                     ValueError,
                 ):
                     max_resolved = resolved
-                max_b = run_l1_compile_check(
-                    module_source,
-                    builder_name=max_resolved.builder_name,
-                    builder_kwargs=max_resolved.builder_kwargs,
-                    config_selector_name=regime_spec.config_selector_fn or None,
-                    pass_configs=max_resolved.pass_configs or None,
-                    compile_flags=max_resolved.compile_flags or None,
-                    dims=max_dims,
-                    source_root=self._source_root,
-                    env_file=self._env_file,
-                )
-                if not max_b.passed or self._has_vf_stack_overflow(max_b):
-                    stack_bytes = (
-                        int(max_b.compiler_summary.stack_bytes)
-                        if max_b.compiler_summary is not None
-                        else 0
+                if max_resolved != resolved:
+                    max_b = run_l1_compile_check(
+                        module_source,
+                        builder_name=max_resolved.builder_name,
+                        builder_kwargs=max_resolved.builder_kwargs,
+                        config_selector_name=regime_spec.config_selector_fn or None,
+                        pass_configs=max_resolved.pass_configs or None,
+                        compile_flags=max_resolved.compile_flags or None,
+                        dims=max_dims,
+                        source_root=self._source_root,
+                        env_file=self._env_file,
                     )
-                    return StageBResult(
-                        passed=False,
-                        error_message=(
-                            f"stage_b_max_row_width_vf_stack_overflow: stack_bytes={stack_bytes} "
-                            f"({max_b.error_message})"
-                        ),
-                        full_diagnostic=max_b.full_diagnostic,
-                        compiler_summary=max_b.compiler_summary,
-                        elapsed_sec=final_b.elapsed_sec + max_b.elapsed_sec,
-                    )
+                    if not max_b.passed or self._has_vf_stack_overflow(max_b):
+                        stack_bytes = (
+                            int(max_b.compiler_summary.stack_bytes)
+                            if max_b.compiler_summary is not None
+                            else 0
+                        )
+                        return StageBResult(
+                            passed=False,
+                            error_message=(
+                                f"stage_b_max_row_width_vf_stack_overflow: stack_bytes={stack_bytes} "
+                                f"({max_b.error_message})"
+                            ),
+                            full_diagnostic=max_b.full_diagnostic,
+                            compiler_summary=max_b.compiler_summary,
+                            elapsed_sec=final_b.elapsed_sec + max_b.elapsed_sec,
+                        )
         combine_elapsed_sec = 0.0
         combine_spec = self._resolve_combine_gate_spec(module_source, regime_spec, resolved)
         if combine_spec is not None:
@@ -8041,8 +8042,14 @@ class PerfTargetCampaignRunner:
                     and int(self._config.cost_prescreen_top_k) > 0
                 ):
                     prescreen_top_k = int(self._config.cost_prescreen_top_k)
-                elif self._config.cost_prescreen_top_k is None and len(raw_candidates) >= 3:
-                    prescreen_top_k = 2
+                elif self._config.cost_prescreen_top_k is None:
+                    non_creative_count = sum(
+                        1
+                        for cid, _ in raw_candidates
+                        if meta_by_id[cid][0] != "creative_explore"
+                    )
+                    if non_creative_count >= 2:
+                        prescreen_top_k = max(1, non_creative_count - 1)
                 stage_a_ranker = (
                     (
                         lambda passers: [

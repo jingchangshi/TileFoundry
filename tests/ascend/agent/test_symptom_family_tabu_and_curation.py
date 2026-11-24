@@ -91,7 +91,7 @@ def _build_reg_a(tile_m=4):
 """
 
 _FLAT_RULE_SLICE = """
-def _build_reg_a(tile_m=1):
+def _build_reg_a(tile_m=3):
     @T.prim_func
     def main(X: T.Tensor((128, 128), "bfloat16"), Y: T.Tensor((128, 128), "bfloat16")):
         with T.Kernel(1):

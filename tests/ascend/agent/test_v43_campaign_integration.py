@@ -1097,6 +1097,7 @@ def test_stagnation_diagnosis_six_taxonomy_and_checkpoint_roundtrip(
         l3_passed: bool,
         prescreen: bool = False,
         top_k: int | None = None,
+        cost_model_mode: str = "auto",
         k_rule_workers: int | None = None,
         max_rounds: int = 2,
         ckpt_path: Path | None = None,
@@ -1114,11 +1115,13 @@ def test_stagnation_diagnosis_six_taxonomy_and_checkpoint_roundtrip(
                     {
                         "physical_hypothesis": f"hyp_{idx}",
                         "target_local_metric": "latency_us",
-                        "dsl_source": _REG_A_IMPROVED,
+                        "dsl_source": _REG_A_IMPROVED.replace(
+                            "tile_m=32", f"tile_m={32 + idx}"
+                        ),
                     }
                 )
                 if req.role == "explore_creative"
-                else _REG_A_IMPROVED
+                else _REG_A_IMPROVED.replace("tile_m=32", f"tile_m={32 + idx}")
             )
         )
         runner = PerfTargetCampaignRunner(
@@ -1130,6 +1133,7 @@ def test_stagnation_diagnosis_six_taxonomy_and_checkpoint_roundtrip(
                 ),
                 enable_tilesize_prescreen=prescreen,
                 cost_prescreen_top_k=top_k,
+                cost_model_mode=cost_model_mode,
                 min_surrogate_gain=0.1,
                 stagnation_freeze_rounds=10,
             ),
@@ -1219,16 +1223,39 @@ def test_stagnation_diagnosis_six_taxonomy_and_checkpoint_roundtrip(
     assert rep_l1_wall.stagnation_diagnosis["primary_stagnation_cause"] == "l0_l1_compile_wall"
     assert rep_l1_wall.stagnation_diagnosis["regimes"]["reg_a"]["l1_compiler_penalty_rejects"] > 0
 
+    dummy_rule_2 = AscendCausalRule(
+        rule_id="R_ANY_2",
+        symptom_family=SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP.value,
+        regime_guard="is_legal",
+        precondition="PIPE_V > 0",
+        transform_template="Tune tile 2.",
+        expected_postcondition="PIPE_V <= prev.PIPE_V",
+        source_provenance="test",
+    )
+    dummy_rule_3 = AscendCausalRule(
+        rule_id="R_ANY_3",
+        symptom_family=SymptomFamily.DMA_REDUNDANT_GM_ROUNDTRIP.value,
+        regime_guard="is_legal",
+        precondition="PIPE_V > 0",
+        transform_template="Tune tile 3.",
+        expected_postcondition="PIPE_V <= prev.PIPE_V",
+        source_provenance="test",
+    )
     rep_prescreen = _run_diag_scenario(
         "prescreen",
-        rules=[dummy_rule],
-        l0_fn=ok_l0,
+        rules=[dummy_rule, dummy_rule_2, dummy_rule_3],
+        l0_fn=lambda src, _r: (
+            _make_stage_a(pipe_cycles={"AIV0.PIPE_V": 50000})
+            if "tile_m=16" not in src
+            else _make_stage_a()
+        ),
         l1_fn=ok_l1,
         l2_lat=100.0,
         l3_passed=True,
         prescreen=True,
         top_k=1,
-        k_rule_workers=2,
+        cost_model_mode="coarse_only",
+        k_rule_workers=3,
     )
     assert rep_prescreen.stagnation_diagnosis["primary_stagnation_cause"] == "cost_prescreen_mismatch"
     assert rep_prescreen.stagnation_diagnosis["regimes"]["reg_a"]["cost_prescreen_filtered_count"] >= 2

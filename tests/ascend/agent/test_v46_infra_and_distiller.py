@@ -128,6 +128,7 @@ def test_cost_prescreen_pruned_includes_analytical_ratio_and_fallbacks() -> None
     candidates = [
         ("rule_0", "src_r0"),
         ("rule_1", "src_r1"),
+        ("rule_2", "src_r2"),
         ("creative_0", "src_c0"),
     ]
     checks_with_ratio = asyncio.run(
@@ -139,34 +140,37 @@ def test_cost_prescreen_pruned_includes_analytical_ratio_and_fallbacks() -> None
             stage_a_cost_ranker=lambda _items: [
                 ("rule_0", 10.0),
                 ("rule_1", 12.0),
+                ("rule_2", 35.0),
                 ("creative_0", 25.0),
             ],
             cost_prescreen_top_k=2,
             creative_candidate_ids={"creative_0"},
             parent_analytical_us=10.0,
-            stage_a_analytical_scorer=lambda _cid, _p, _sa: 18.0,
+            stage_a_analytical_scorer=lambda cid, _p, _sa: 35.0 if cid == "rule_2" else 18.0,
         )
     )
-    pruned = {c.candidate_id: c for c in checks_with_ratio}["creative_0"]
+    results_by_id = {c.candidate_id: c for c in checks_with_ratio}
+    assert results_by_id["creative_0"].passed is True
+    pruned = results_by_id["rule_2"]
     assert pruned.failed_tier == "cost_prescreen"
-    assert pruned.error_message == "cost_prescreen_pruned:pred_us=25.00,analytical_ratio=1.800"
+    assert pruned.error_message == "cost_prescreen_pruned:pred_us=35.00,analytical_ratio=3.500"
 
     checks_no_parent = asyncio.run(
         run_l0_l1_round_filter(
-            candidates,
+            [("rule_0", "src_r0"), ("rule_1", "src_r1"), ("rule_2", "src_r2")],
             patch_fn=lambda s: s,
             l0_checker=lambda _s: StageAResult(passed=True, prim_func=None, ledger=ledger),
             l1_compiler=lambda _s: StageBResult(passed=True),
             stage_a_cost_ranker=lambda _items: [
                 ("rule_0", 10.0),
                 ("rule_1", 12.0),
-                ("creative_0", 25.0),
+                ("rule_2", 25.0),
             ],
             cost_prescreen_top_k=2,
             parent_analytical_us=0.0,
         )
     )
-    pruned_fallback = {c.candidate_id: c for c in checks_no_parent}["creative_0"]
+    pruned_fallback = {c.candidate_id: c for c in checks_no_parent}["rule_2"]
     assert pruned_fallback.error_message == "cost_prescreen_pruned:pred_us=25.00"
 
 

@@ -479,7 +479,7 @@ def test_anchor_registry_dynamic_append_and_eq3_scoring(tmp_path: Path) -> None:
 def test_campaign_early_stop_on_goal_met_and_roofline_saturated(tmp_path: Path) -> None:
     """Verify early termination on goal_met (with flywheel admission) and roofline_saturated."""
     anchors = (
-        AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 10.0, 4.0),
+        AnchorCaseSpec("level4/attention_residual", 2, "regime_a", 30.0, 4.0),
         AnchorCaseSpec("level4/attention_residual", 4, "regime_b", 20.0, 8.0),
     )
     regimes = (
@@ -514,7 +514,7 @@ def test_campaign_early_stop_on_goal_met_and_roofline_saturated(tmp_path: Path) 
                 )
             else:
                 out[cid] = _make_surrogate_result(
-                    cid, "attention_residual", tuple(active_anchors), {2: 12.0, 4: 24.0}
+                    cid, "attention_residual", tuple(active_anchors), {2: 36.0, 4: 10.0}
                 )
         return out
 
@@ -578,7 +578,7 @@ def test_campaign_early_stop_on_goal_met_and_roofline_saturated(tmp_path: Path) 
                 )
             else:
                 out[cid] = _make_surrogate_result(
-                    cid, "attention_residual", tuple(active_anchors), {2: 12.0, 4: 24.0}
+                    cid, "attention_residual", tuple(active_anchors), {2: 36.0, 4: 10.0}
                 )
         return out
 
@@ -2061,6 +2061,7 @@ def test_fp3_campaign_beam_persistence_roofline_eta_and_transport_exemption(
             max_rounds=2,
             stagnation_escalate_rounds=1,
             enable_tilesize_prescreen=True,
+            cost_model_mode="coarse_only",
         ),
         target_module_path=target_path,
         perf_target=PerfTargetSpec("attention_residual", 3.0, 2.0, 0.90),
@@ -2920,8 +2921,13 @@ def test_all_six_production_regimes_extract_resolve_and_pass_stage_a() -> None:
             )
             assert stage_a.passed, f"{op_name}/{spec.regime_tag}: {stage_a.error_message}"
             assert stage_a.ledger is not None and stage_a.ledger.is_legal
-            assert stage_a.ledger.uses_unreserved_ubuf is True
-            assert stage_a.ledger.waterlines["UB"].capacity_bytes == 262144
+            has_unreserved_flag = any(
+                "--cce-disable-vf-stack-reserved-ubuf" in str(fl)
+                for fl in resolved.compile_flags
+            )
+            assert stage_a.ledger.uses_unreserved_ubuf is has_unreserved_flag
+            expected_ub_cap = 262144 if has_unreserved_flag else 253952
+            assert stage_a.ledger.waterlines["UB"].capacity_bytes == expected_ub_cap
 
     decode_fn = mla_kernels._build_mla_split_kv_decode_func(num_kv_splits=4)
     combine_fn = mla_kernels._build_mla_split_kv_combine_func(num_kv_splits=4)
@@ -4139,7 +4145,11 @@ def test_wp_final1_pruned_inline_regimes_partial_override_and_mla_combine_gate(
     monkeypatch.setattr(cr_mod, "run_l1_compile_check", _fake_l1)
     l1_bad = runner._run_l1(broken_combine_mod, split_spec)
     assert not l1_bad.passed
-    assert l1_builders == ["_build_mla_split_kv_decode_func", "_build_mla_split_kv_combine_func"]
+    assert l1_builders == [
+        "_build_mla_split_kv_decode_func",
+        "_build_mla_split_kv_decode_func",
+        "_build_mla_split_kv_combine_func",
+    ]
     assert "combine_kernel(_build_mla_split_kv_combine_func): broken combine ir" == l1_bad.error_message
 
 
@@ -4266,7 +4276,7 @@ def test_wp_final2_prewarm_builder_kwargs_and_local_regime_l3_promotion(
         AnchorCaseSpec("level4/attention_residual", 3, "regime_b", 10.0, 2.0),
         AnchorCaseSpec("level4/attention_residual", 4, "regime_b", 10.0, 2.0),
         AnchorCaseSpec("level4/attention_residual", 5, "regime_b", 10.0, 2.0),
-        AnchorCaseSpec("level4/attention_residual", 6, "regime_b", 10.0, 2.0),
+        AnchorCaseSpec("level4/attention_residual", 6, "regime_a", 10.0, 2.0),
     )
     regimes = (
         RegimeTargetSpec("regime_a", ("_build_regime_a",), {}),
@@ -4898,7 +4908,7 @@ def _build_reg_a(tile_m=4):
     return main
 """
     flat_dsl = """
-def _build_reg_a(tile_m=1):
+def _build_reg_a(tile_m=3):
     @T.prim_func
     def main(X: T.Tensor((128, 128), "bfloat16"), Y: T.Tensor((128, 128), "bfloat16")):
         with T.Kernel(1):

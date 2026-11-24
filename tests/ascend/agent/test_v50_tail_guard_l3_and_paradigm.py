@@ -878,8 +878,15 @@ def kernel(x):
 
     class _FakeLLM:
         async def generate(self, req: object) -> str:
-            _ = req
-            return "def _build_small():\n    return 1\n"
+            if getattr(req, "role", "") == "explore_creative":
+                return json.dumps(
+                    {
+                        "physical_hypothesis": "Adjust small builder variant",
+                        "target_local_metric": "aiv_vec",
+                        "dsl_source": "def _build_small():\n    return 2\n",
+                    }
+                )
+            return "def _build_small():\n    return 3\n"
 
     runner._llm_backend = _FakeLLM()
     ledger = build_objective_physical_ledger(

@@ -489,7 +489,7 @@ def test_agent_flag_stripping_and_tier_adaptive_watchdog(
     assert "gemini-4-hydrogen-high" in cmd_xhigh
     assert "gemini-4-hydrogen-xhigh" not in cmd_xhigh
     assert "--effort=high" in cmd_xhigh
-    assert "--print-timeout=480s" in cmd_xhigh
+    assert "--print-timeout=360s" in cmd_xhigh
 
     mock = MockLLMBackend(default_response="ok")
     asyncio.run(mock.generate(exploit_req))

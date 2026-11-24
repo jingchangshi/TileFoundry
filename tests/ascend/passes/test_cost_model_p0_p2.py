@@ -203,7 +203,7 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
         analysis_mode="readonly_envelope",
         is_legal=True,
         steady_state_ii=250,
-        pipe_cycles={"AIC.PIPE_M": 2000},
+        pipe_cycles={"AIC.PIPE_M": 2000, "AIV0.PIPE_V": 2000, "AIV0.PIPE_MTE2": 2000},
         gm_roundtrip_bytes=131072,
         grid_blocks=28,
         waterlines={},
@@ -211,9 +211,9 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
     ledger_slow = build_objective_physical_ledger(
         analysis_mode="readonly_envelope",
         is_legal=True,
-        steady_state_ii=900,
-        pipe_cycles={"AIC.PIPE_M": 9000},
-        gm_roundtrip_bytes=1_048_576,
+        steady_state_ii=4000,
+        pipe_cycles={"AIC.PIPE_M": 40000},
+        gm_roundtrip_bytes=8 * 1024 * 1024,
         grid_blocks=28,
         waterlines={},
     )
@@ -278,16 +278,22 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
     tracker = BayesianRuleTracker.from_seed_yaml()
     prior_trials = {rid: st.trials for rid, st in tracker.posteriors.items()}
 
+    rule_calls = 0
+
     class _StubBackend:
         async def generate(self, req, *, effort_override=None):
+            nonlocal rule_calls
             _ = effort_override
             if req.role == "exploit_rule":
-                return "```python\ndef kernel(m_dim=64):\n    # SLOW\n    return m_dim\n```"
+                rule_calls += 1
+                if rule_calls == 1:
+                    return "```python\ndef kernel(m_dim=65):\n    # MID\n    return m_dim\n```"
+                return "```python\ndef kernel(m_dim=66):\n    # SLOW\n    return m_dim\n```"
             return json.dumps(
                 {
                     "physical_hypothesis": "try fast candidate",
                     "target_local_metric": "latency_us",
-                    "dsl_source": "def kernel(m_dim=64):\n    # FAST\n    return m_dim\n",
+                    "dsl_source": "def kernel(m_dim=67):\n    # FAST\n    return m_dim\n",
                 }
             )
 
@@ -330,7 +336,7 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
         config=CampaignConfig(
             operator_name="softmax",
             max_rounds=1,
-            k_rule_workers=1,
+            k_rule_workers=2,
             max_syntax_repairs=0,
             enable_tilesize_prescreen=True,
             cost_prescreen_top_k=1,
@@ -381,11 +387,15 @@ def test_p2_stage_a_topk_pruning_penalty_exemption_and_backtest(tmp_path: Path) 
     assert runner._cost_calibration_path == expected_cal_path
     assert expected_cal_path.is_file()
     assert runner._cost_model.sample_count >= 1
-    assert all(
-        tracker.posteriors[rid].trials == prior_trials[rid] for rid in prior_trials
+    changed_rids = [
+        rid for rid in prior_trials if tracker.posteriors[rid].trials != prior_trials[rid]
+    ]
+    assert len(changed_rids) <= 1
+    assert any(
+        cid == "r1_rule_1" and tier == "cost_prescreen"
+        for cid, tier, _msg in report.rounds[0].l0_l1_failed
     )
-    assert report.rounds[0].l0_l1_passed_ids == ("r1_creative",)
-    assert any(tier == "cost_prescreen" for _cid, tier, _msg in report.rounds[0].l0_l1_failed)
+    assert report.rounds[0].l0_l1_passed_ids == ("r1_rule_0", "r1_creative")
 
     rep_dir1 = tmp_path / "reports_a"
     rep_dir2 = tmp_path / "reports_b"

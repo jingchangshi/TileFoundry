@@ -137,6 +137,7 @@ def main(argv: list[str] | None = None) -> int:
             cost_prescreen_top_k=(
                 int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
             ),
+            cost_model_mode=str(args.cost_model_mode),
             llm_backend=args.llm_backend,
             exploit_model=args.exploit_model,
             explore_model=args.explore_model,

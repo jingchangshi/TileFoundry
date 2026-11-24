@@ -433,13 +433,13 @@ def test_stage6_zero_shot_prescreen_and_experience_lake_anomaly_wiring(
     )
     backend = MockLLMBackend(
         responses={
-            "exploit_rule": [fast_cand, fast_cand],
+            "exploit_rule": [fast_cand, slow_cand],
             "explore_creative": [
                 json.dumps(
                     {
-                        "physical_hypothesis": "Slow scalar outlier",
+                        "physical_hypothesis": "Keep creative unpruned explore candidate",
                         "target_local_metric": "aiv_vec",
-                        "dsl_source": slow_cand,
+                        "dsl_source": fast_cand,
                     }
                 )
             ],

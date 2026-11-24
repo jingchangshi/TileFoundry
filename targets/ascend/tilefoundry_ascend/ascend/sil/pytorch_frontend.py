@@ -1979,6 +1979,14 @@ def _stream_work(
         cols = dims["cols"]
         if rows > 0 and cols > 0:
             elements = rows * cols
+    d_col = _positive_dim(dims, ("D", "d_dim", "cols"))
+    seq_or_m = _positive_dim(
+        dims, ("S", "s_dim", "T", "t_dim", "seq_len", "M", "m_rows", "rows")
+    )
+    n_depth = _positive_dim(dims, ("N", "n_depth", "n_layers"))
+    batch = _positive_dim(dims, ("B", "batch"))
+    if elements is None and d_col is not None and seq_or_m is not None:
+        elements = (n_depth or 1) * (batch or 1) * seq_or_m * d_col
     if elements is None:
         raise ValueError(
             "analytical Roofline requires total_elements, M x D, or rows x cols anchor dims"
@@ -1995,6 +2003,9 @@ def _stream_work(
         if len(first_shape) >= 2 and all(dim > 0 for dim in first_shape):
             resolved_dims["rows"] = math.prod(first_shape[:-1])
             resolved_dims["cols"] = first_shape[-1]
+    elif d_col is not None and seq_or_m is not None:
+        resolved_dims["rows"] = (n_depth or 1) * (batch or 1) * seq_or_m
+        resolved_dims["cols"] = d_col
     ops_per_element = 3 if kind == "reduction" else 1
     sfu_multiplier = max(
         1 if semantics.has_online_exp_max else 0,
