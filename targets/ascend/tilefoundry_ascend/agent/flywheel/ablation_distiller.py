@@ -2410,8 +2410,36 @@ def _has_tautological_ge_zero(tree: ast.AST) -> bool:
     return False
 
 
+_IDEAL_UNIT_EFFICIENCY_NAMES = frozenset(
+    {
+        "effective_compute_eta",
+        "roofline_eta",
+        "dma_burst_efficiency_ratio",
+        "contig_atom_ratio",
+        "wave_occupancy",
+        "wave_occupancy_ratio",
+        "l2_hit_rate",
+        "cube_util_ratio",
+        "vec_util_ratio",
+    }
+)
+_IDEAL_CONTIG_BYTE_NAMES = frozenset({"dominant_contig_bytes", "inner_contiguous_bytes"})
+_IDEAL_BOOL_TRUE_NAMES = frozenset({"is_legal", "vloopv2_hit", "is_atom_aligned"})
+
+
+def _ideal_default_for_symbol(symbol: str) -> object:
+    leaf = symbol.rsplit(".", 1)[-1]
+    if leaf in _IDEAL_BOOL_TRUE_NAMES:
+        return True
+    if leaf in _IDEAL_UNIT_EFFICIENCY_NAMES:
+        return 1.0
+    if leaf in _IDEAL_CONTIG_BYTE_NAMES:
+        return 32768
+    return 0
+
+
 def _build_zero_ideal_env(tree: ast.AST) -> dict[str, object]:
-    env: dict[str, object] = {"is_legal": True, "vloopv2_hit": True}
+    env: dict[str, object] = {"is_legal": True, "vloopv2_hit": True, "is_atom_aligned": True}
     skip_names = frozenset({"True", "False", "None", "abs", "min", "max"})
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
@@ -2424,10 +2452,10 @@ def _build_zero_ideal_env(tree: ast.AST) -> dict[str, object]:
                 parts.append(cur.id)
                 dotted = ".".join(reversed(parts))
                 if dotted not in env:
-                    env[dotted] = 0
+                    env[dotted] = _ideal_default_for_symbol(dotted)
         elif isinstance(node, ast.Name) and node.id not in skip_names:
             if node.id not in env:
-                env[node.id] = 0
+                env[node.id] = _ideal_default_for_symbol(node.id)
     return env
 
 
