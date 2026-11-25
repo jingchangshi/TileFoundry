@@ -264,7 +264,7 @@ def test_attention_residual_small_decode_2d_saturation_v52() -> None:
     src = (
         REPO_ROOT / "examples/ascend950pr_ops/attention_residual/kernels.py"
     ).read_text(encoding="utf-8")
-    assert "elif m_rows < 56:" in src
+    assert "elif m_rows < 16 or (m_rows < 56 and d_dim >= 1024):" in src
 
 
 def test_attention_residual_stage_a_all_regimes_and_tail_v52() -> None:
