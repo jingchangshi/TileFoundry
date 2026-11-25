@@ -2573,7 +2573,7 @@ def _run_npu_smi_query(smi: str, args: Sequence[str]) -> str | None:
                     return None
                 returncode = child.returncode
                 stdout = stdout_raw or ""
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, TypeError):
             return None
         if returncode == 0:
             return stdout
