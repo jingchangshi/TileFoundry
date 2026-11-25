@@ -609,3 +609,114 @@ def test_funnel_telemetry_error_normalization_and_ledger_sha_pruning() -> None:
         )
         is None
     )
+
+
+def test_incumbent_slot_regex_and_l3_occupancy_backoff_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """incumbent_slot activates paired burst while L3 retries transient occupancy across passes."""
+    import re
+    import time
+
+    assert re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", "incumbent_slot")
+
+    clock = [0.0]
+
+    def _inc_fn(_params: object) -> None:
+        clock[0] += 20.0
+
+    def _fast_fn(_params: object) -> None:
+        clock[0] += 10.0
+
+    stats = surrogate_cannbench.measure_paired_interleaved_micro_burst(
+        [("incumbent_slot", _inc_fn), ("cand_fast", _fast_fn)],
+        object(),
+        warmup=1,
+        repeat=7,
+        t_hw_us=10.0,
+        first_probe_us=20.0,
+        event_factory=lambda: _DriftingClockEvent(clock),
+        synchronize_fn=lambda: None,
+        clone_fn=lambda obj: obj,
+    )
+    assert stats["incumbent_slot"][3] == pytest.approx(1.0)
+    assert stats["cand_fast"][3] == pytest.approx(2.0, rel=0.05)
+
+    cand_file = tmp_path / "examples" / "ascend950pr_ops" / "mla" / "kernels.py"
+    cand_file.parent.mkdir(parents=True)
+    cand_file.write_text("# dummy candidate\n", encoding="utf-8")
+
+    attempts: list[str] = []
+    sleeps: list[float] = []
+
+    def _fake_v2_gate(**kwargs):
+        dev = str(kwargs["device_id"])
+        attempts.append(dev)
+        if len(attempts) <= 2:
+            return surrogate_cannbench._V2GateExecution(
+                execution_id=f"exec_{len(attempts)}",
+                run_id=f"run_{len(attempts)}",
+                receipt_path=str(tmp_path / f"receipt_{len(attempts)}.json"),
+                report={
+                    "gates": [
+                        {
+                            "gateId": surrogate_cannbench.AGENT_GATES_L3_PROMOTION_GATE,
+                            "status": "BLOCKED_ENV",
+                            "observations": {"errorCategory": "occupancy"},
+                        }
+                    ]
+                },
+                device_id=dev,
+                state="FINISHED",
+                execution_terminal=True,
+                transport_error="",
+                device_rejected=False,
+            )
+        return surrogate_cannbench._V2GateExecution(
+            execution_id="exec_3",
+            run_id="run_3",
+            receipt_path=str(tmp_path / "receipt_3.json"),
+            report={
+                "gates": [
+                    {
+                        "gateId": surrogate_cannbench.AGENT_GATES_L3_PROMOTION_GATE,
+                        "status": "PASS",
+                        "observations": {
+                            "l3Contract": {
+                                "operator": "mla",
+                                "promotion_eligible": True,
+                                "coverage": {"all_cases_passed": True},
+                            }
+                        },
+                    }
+                ]
+            },
+            device_id=dev,
+            state="FINISHED",
+            execution_terminal=True,
+            transport_error="",
+            device_rejected=False,
+        )
+
+    monkeypatch.setattr(surrogate_cannbench, "get_operator_task", lambda _op: "level4/mla")
+    monkeypatch.setattr(surrogate_cannbench, "_resolve_agent_gates_bin", lambda _r: Path("ag"))
+    monkeypatch.setattr(surrogate_cannbench, "_agent_gates_workspace_name", lambda _r: "ws")
+    monkeypatch.setattr(
+        surrogate_cannbench,
+        "_call_order_candidates_by_idle_preflight",
+        lambda d, pool, excluded=(), env_vals=None: ("0", "1"),
+    )
+    monkeypatch.setattr(surrogate_cannbench, "_run_v2_gate", _fake_v2_gate)
+    monkeypatch.setattr(surrogate_cannbench, "_source_identity_matches", lambda *_a: True)
+    monkeypatch.setattr(time, "sleep", lambda sec: sleeps.append(float(sec)))
+
+    res = surrogate_cannbench.run_l3_full_contract_via_agent_gates(
+        operator_name="mla",
+        candidate_module_path=cand_file,
+        source_root=tmp_path,
+        device_id="0",
+        device_pool=("0", "1"),
+    )
+    assert res.run_id == "run_3"
+    assert attempts == ["0", "1", "0"]
+    assert sleeps == [15.0]

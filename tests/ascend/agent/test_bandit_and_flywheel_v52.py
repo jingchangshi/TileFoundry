@@ -851,7 +851,8 @@ def test_g_phase0_lattice_warmstart_and_paired_l2_incumbent_slot(
     assert "'tile_m': 16" in target_path.read_text(encoding="utf-8")
     assert report.best_result.avg_speedup == pytest.approx(4.0)
     assert seen_batch_cids[0] == ["incumbent_baseline"]
-    assert seen_batch_cids[1][0] == "__incumbent__"
+    assert seen_batch_cids[1][0] == "incumbent_slot"
+    assert "incumbent_slot" not in report.best_result.candidate_id
     assert "__incumbent__" not in report.best_result.candidate_id
 
     @dataclass(frozen=True)

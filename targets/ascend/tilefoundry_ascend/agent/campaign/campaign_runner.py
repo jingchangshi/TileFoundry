@@ -4415,6 +4415,7 @@ class PerfTargetCampaignRunner:
         should_prepend_incumbent = bool(
             len(candidates) >= 1
             and eff_inc_src.strip()
+            and "incumbent_slot" not in cand_ids
             and "__incumbent__" not in cand_ids
             and "incumbent_baseline" not in cand_ids
         )
@@ -4444,14 +4445,14 @@ class PerfTargetCampaignRunner:
 
         if should_prepend_incumbent:
             with tempfile.TemporaryDirectory(prefix="tf_camp_inc_") as inc_dir:
-                inc_path = Path(inc_dir) / "__incumbent__.py"
+                inc_path = Path(inc_dir) / "incumbent_slot.py"
                 inc_path.write_text(eff_inc_src, encoding="utf-8")
-                results, run_ids = _dispatch([("__incumbent__", inc_path), *candidates])
+                results, run_ids = _dispatch([("incumbent_slot", inc_path), *candidates])
         else:
             results, run_ids = _dispatch(candidates)
 
-        inc_slot_result = results.pop("__incumbent__", None)
-        run_ids.pop("__incumbent__", None)
+        inc_slot_result = results.pop("incumbent_slot", None)
+        run_ids.pop("incumbent_slot", None)
         return self._normalize_paired_l2_results(results, inc_slot_result), run_ids
 
     def _recheck_single_sibling_anchor(

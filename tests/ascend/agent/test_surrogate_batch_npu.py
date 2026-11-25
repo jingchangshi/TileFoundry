@@ -874,7 +874,7 @@ def _evaluate_operator_batch(
                     base_params = harness.params(case, base_npu_tensors)
                     incumbent_passed = bool(
                         loaded_cands
-                        and loaded_cands[0][0] == "__incumbent__"
+                        and loaded_cands[0][0] in {"incumbent_slot", "__incumbent__"}
                         and passed_cands[0][0] == 0
                     )
                     if len(passed_cands) >= 2 and has_npu_event and paired_interleaved:

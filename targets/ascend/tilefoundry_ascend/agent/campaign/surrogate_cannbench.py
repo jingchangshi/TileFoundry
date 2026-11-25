@@ -4819,48 +4819,90 @@ def run_l3_full_contract_via_agent_gates(
         )
     else:
         rejected_cards: set[str] = set()
-        candidates = _call_order_candidates_by_idle_preflight(
-            result_device,
-            device_pool,
-            excluded=rejected_cards,
-            env_vals=env_vals,
-        )
-        if not candidates:
-            candidates = (result_device,)
+        initial_device_id = result_device
+        occupancy_backoff = (15.0, 30.0, 45.0)
+        max_pool_passes = 4
+        occupancy_budget = 120.0
+        total_occupancy_sleep = 0.0
         execution_opt: _V2GateExecution | None = None
-        for idx, card in enumerate(candidates):
-            result_device = card
-            attempt_exec = _run_v2_gate(
-                agent_gates_bin=agent_gates_bin,
-                root=root,
-                workspace=workspace,
-                gate_id=AGENT_GATES_L3_PROMOTION_GATE,
-                target=target_task,
-                candidate_path=relative,
-                timeout_sec=timeout_sec,
-                device_id=card,
-                resume_execution_id="",
-                resume_run_id="",
-                on_execution_started=on_execution_started,
+        for pass_idx in range(max_pool_passes):
+            candidates = _call_order_candidates_by_idle_preflight(
+                initial_device_id,
+                device_pool,
+                excluded=rejected_cards,
+                env_vals=env_vals,
             )
-            execution_opt = attempt_exec
-            blocked_env_category = _blocked_env_category(
-                attempt_exec.report,
-                (AGENT_GATES_L3_PROMOTION_GATE,),
-            )
-            if attempt_exec.device_rejected or blocked_env_category == "occupancy":
-                if attempt_exec.device_rejected and card:
-                    rejected_cards.add(card)
-                if idx + 1 < len(candidates):
-                    logger.warning(
-                        "L3_CONTAMINATION_RETEST task=%s tainted_device=%s "
-                        "reason=%s next_card=%s",
-                        target_task,
-                        card,
-                        "device_rejected" if attempt_exec.device_rejected else "occupancy",
-                        candidates[idx + 1],
+            if not candidates:
+                if not rejected_cards and initial_device_id:
+                    candidates = (initial_device_id,)
+                else:
+                    break
+            saw_occupancy_in_pass = False
+            for idx, card in enumerate(candidates):
+                result_device = card
+                attempt_exec = _run_v2_gate(
+                    agent_gates_bin=agent_gates_bin,
+                    root=root,
+                    workspace=workspace,
+                    gate_id=AGENT_GATES_L3_PROMOTION_GATE,
+                    target=target_task,
+                    candidate_path=relative,
+                    timeout_sec=timeout_sec,
+                    device_id=card,
+                    resume_execution_id="",
+                    resume_run_id="",
+                    on_execution_started=on_execution_started,
+                )
+                execution_opt = attempt_exec
+                blocked_env_category = _blocked_env_category(
+                    attempt_exec.report,
+                    (AGENT_GATES_L3_PROMOTION_GATE,),
+                )
+                if attempt_exec.device_rejected or blocked_env_category == "occupancy":
+                    if attempt_exec.device_rejected and card:
+                        rejected_cards.add(card)
+                    else:
+                        saw_occupancy_in_pass = True
+                    if idx + 1 < len(candidates):
+                        logger.warning(
+                            "L3_CONTAMINATION_RETEST task=%s tainted_device=%s "
+                            "reason=%s next_card=%s",
+                            target_task,
+                            card,
+                            "device_rejected" if attempt_exec.device_rejected else "occupancy",
+                            candidates[idx + 1],
+                        )
+                        continue
+                else:
+                    break
+            else:
+                if (
+                    saw_occupancy_in_pass
+                    and pass_idx + 1 < max_pool_passes
+                    and total_occupancy_sleep < occupancy_budget
+                ):
+                    remaining = _call_order_candidates_by_idle_preflight(
+                        initial_device_id,
+                        device_pool,
+                        excluded=rejected_cards,
+                        env_vals=env_vals,
                     )
-                    continue
+                    if not remaining and not rejected_cards and initial_device_id:
+                        remaining = (initial_device_id,)
+                    if remaining:
+                        wait_sec = min(
+                            occupancy_backoff[min(pass_idx, len(occupancy_backoff) - 1)],
+                            occupancy_budget - total_occupancy_sleep,
+                        )
+                        logger.warning(
+                            "L3_CONTAMINATION_RETEST task=%s tainted_device=%s "
+                            "reason=occupancy next_card=backoff",
+                            target_task,
+                            result_device,
+                        )
+                        time.sleep(wait_sec)
+                        total_occupancy_sleep += wait_sec
+                        continue
             break
         assert execution_opt is not None
         execution = execution_opt
