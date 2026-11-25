@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -77,6 +78,37 @@ def _cube_macs_for_dtype(facts: AscendSpaceFacts, dtype_name: str, *, hf32: bool
             pass
     key = "hf32" if (hf32 and dtype_name.strip().lower() in ("f32", "float32")) else dtype_name.strip().lower()
     return CUBE_MACS_PER_CYCLE.get(key, 4096)
+
+
+def _huber_location(
+    values: Sequence[float],
+    delta: float = 1.35,
+    iters: int = 12,
+) -> float:
+    """Estimate robust scalar location via pure-Python IRLS Huber weighting."""
+    vals = [float(v) for v in values if math.isfinite(float(v))]
+    if not vals:
+        return 0.0
+    if len(vals) == 1:
+        return vals[0]
+    mu = float(statistics.median(vals))
+    eff_delta = max(1e-6, float(delta))
+    for _ in range(max(1, int(iters))):
+        w_sum = 0.0
+        wy_sum = 0.0
+        for y in vals:
+            diff = abs(y - mu)
+            w = 1.0 if diff <= eff_delta else (eff_delta / diff)
+            w_sum += w
+            wy_sum += w * y
+        if w_sum <= 0.0:
+            break
+        new_mu = wy_sum / w_sum
+        if abs(new_mu - mu) <= 1e-12:
+            mu = new_mu
+            break
+        mu = new_mu
+    return mu
 
 
 def _solve_linear_system(a: list[list[float]], b: list[float]) -> list[float]:
@@ -778,6 +810,10 @@ class HybridAscendCostModel:
             spec.name: 0.0 for spec in self._basis_registry.head0_specs()
         }
         self._bucket_weights_by_name: dict[str, dict[str, float]] = {}
+        self._global_intercept: float = 0.0
+        self._bucket_intercepts: dict[str, float] = {}
+        self._bucket_sample_counts: dict[str, int] = {}
+        self._quarantined_sample_ids: set[int] = set()
         self._active_global_specs: tuple[str, ...] = ()
         self._active_bucket_specs: dict[str, tuple[str, ...]] = {}
         self._pipe_evaluator = Ascend950PipeScheduleEvaluator(self.target)
@@ -805,28 +841,38 @@ class HybridAscendCostModel:
     @property
     def weights(self) -> tuple[float, ...]:
         specs = self._basis_registry.head0_specs()
-        return tuple(self._weights_by_name.get(spec.name, 0.0) for spec in specs)
+        eff = self.weights_by_name
+        return tuple(eff.get(spec.name, 0.0) for spec in specs)
 
     @property
     def weights_by_name(self) -> dict[str, float]:
         specs = self._basis_registry.head0_specs()
-        return {spec.name: self._weights_by_name.get(spec.name, 0.0) for spec in specs}
+        out = {spec.name: self._weights_by_name.get(spec.name, 0.0) for spec in specs}
+        if "intercept" in out and "intercept" in self._active_global_specs:
+            out["intercept"] = out["intercept"] + self._global_intercept
+        return out
 
     @property
     def bucket_weights(self) -> dict[str, tuple[float, ...]]:
         specs = self._basis_registry.head0_specs()
+        eff_buckets = self.bucket_weights_by_name
         return {
             bucket: tuple(wmap.get(spec.name, 0.0) for spec in specs)
-            for bucket, wmap in self._bucket_weights_by_name.items()
+            for bucket, wmap in eff_buckets.items()
         }
 
     @property
     def bucket_weights_by_name(self) -> dict[str, dict[str, float]]:
         specs = self._basis_registry.head0_specs()
-        return {
-            bucket: {spec.name: wmap.get(spec.name, 0.0) for spec in specs}
-            for bucket, wmap in self._bucket_weights_by_name.items()
-        }
+        out: dict[str, dict[str, float]] = {}
+        for bucket, wmap in self._bucket_weights_by_name.items():
+            b_out = {spec.name: wmap.get(spec.name, 0.0) for spec in specs}
+            if "intercept" in b_out and "intercept" in self._active_bucket_specs.get(bucket, ()):
+                b_out["intercept"] = b_out["intercept"] + self._bucket_intercepts.get(
+                    bucket, self._global_intercept
+                )
+            out[bucket] = b_out
+        return out
 
     @property
     def delta_weights(self) -> tuple[float, ...]:
@@ -1185,7 +1231,8 @@ class HybridAscendCostModel:
         head0_specs = self._basis_registry.head0_specs()
         feat_vec = self._basis_registry.vectorize(t01.named_features, head0_specs)
         weight_map = self._bucket_weights_by_name.get(bucket, self._weights_by_name)
-        log_res = sum(
+        intercept = self._bucket_intercepts.get(bucket, self._global_intercept)
+        log_res = intercept + sum(
             weight_map.get(spec.name, 0.0) * t01.named_features.get(spec.name, 0.0)
             for spec in head0_specs
         )
@@ -1213,6 +1260,15 @@ class HybridAscendCostModel:
             named_features=dict(t01.named_features),
         )
 
+    def _write_anomaly_record(self, anomaly_record: dict[str, object]) -> None:
+        if self.anomaly_lake is not None:
+            self.anomaly_lake.append_unmodeled_anomaly(anomaly_record)
+        elif self.anomaly_path is not None:
+            self.anomaly_path.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps(anomaly_record, sort_keys=True, separators=(",", ":")) + "\n"
+            with self.anomaly_path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+
     def observe(
         self,
         workload: CostFeatures | Mapping[str, object],
@@ -1230,7 +1286,13 @@ class HybridAscendCostModel:
         analytical_us = max(1e-6, t01.tier0_us + t01.tier1_penalty_us)
         bucket = topology_bucket_for_axes(cf.topology_axes)
         log_residual = math.log(float(measured_us) / analytical_us)
-        if abs(log_residual) > 2.5:
+        is_extreme_corruption = (not math.isfinite(log_residual)) or abs(log_residual) > 8.0
+        is_established_bucket_outlier = (
+            bucket in self._bucket_intercepts
+            and self._bucket_sample_counts.get(bucket, 0) >= 3
+            and abs(log_residual - self._bucket_intercepts[bucket]) > 2.0
+        )
+        if is_extreme_corruption or is_established_bucket_outlier:
             anomaly_record: dict[str, object] = {
                 "measured_us": float(measured_us),
                 "analytical_us": analytical_us,
@@ -1239,13 +1301,7 @@ class HybridAscendCostModel:
                 "dominant_bound": t01.dominant,
                 "extra_signals": {str(k): float(v) for k, v in cf.extra_signals.items()},
             }
-            if self.anomaly_lake is not None:
-                self.anomaly_lake.append_unmodeled_anomaly(anomaly_record)
-            elif self.anomaly_path is not None:
-                self.anomaly_path.parent.mkdir(parents=True, exist_ok=True)
-                line = json.dumps(anomaly_record, sort_keys=True, separators=(",", ":")) + "\n"
-                with self.anomaly_path.open("a", encoding="utf-8") as fh:
-                    fh.write(line)
+            self._write_anomaly_record(anomaly_record)
             return analytical_us
         sample = CalibrationSample(
             named_features=dict(t01.named_features),
@@ -1360,18 +1416,65 @@ class HybridAscendCostModel:
         if not self._samples:
             self._weights_by_name = {spec.name: 0.0 for spec in head0_specs}
             self._bucket_weights_by_name = {}
+            self._global_intercept = 0.0
+            self._bucket_intercepts = {}
+            self._bucket_sample_counts = {}
             self._active_global_specs = ()
             self._active_bucket_specs = {}
             return
-        global_rows: list[tuple[Mapping[str, float], float]] = []
-        by_bucket: dict[str, list[tuple[Mapping[str, float], float]]] = {}
+
+        raw_entries: list[tuple[CalibrationSample, str, float]] = []
+        raw_ys: list[float] = []
+        raw_by_bucket: dict[str, list[float]] = {}
         for sample in self._samples:
             y = math.log(max(1e-6, sample.measured_us) / max(1e-6, sample.analytical_us))
-            row = (sample.named_features, y)
-            global_rows.append(row)
-            if sample.topology_bucket and sample.topology_bucket != "global":
-                by_bucket.setdefault(sample.topology_bucket, []).append(row)
+            b_key = (
+                sample.topology_bucket
+                if (sample.topology_bucket and sample.topology_bucket != "global")
+                else "global"
+            )
+            raw_entries.append((sample, b_key, y))
+            raw_ys.append(y)
+            if b_key != "global":
+                raw_by_bucket.setdefault(b_key, []).append(y)
 
+        self._global_intercept = _huber_location(raw_ys)
+        new_bucket_intercepts: dict[str, float] = {}
+        for bucket, ys in raw_by_bucket.items():
+            new_bucket_intercepts[bucket] = (
+                _huber_location(ys) if len(ys) >= 2 else self._global_intercept
+            )
+        self._bucket_intercepts = new_bucket_intercepts
+
+        global_rows: list[tuple[Mapping[str, float], float]] = []
+        by_bucket: dict[str, list[tuple[Mapping[str, float], float]]] = {}
+        for sample, b_key, y in raw_entries:
+            beta_0_b = (
+                self._bucket_intercepts.get(b_key, self._global_intercept)
+                if b_key != "global"
+                else self._global_intercept
+            )
+            centered_y = y - beta_0_b
+            if abs(centered_y) > 2.0:
+                sample_key = id(sample)
+                if sample_key not in self._quarantined_sample_ids:
+                    self._quarantined_sample_ids.add(sample_key)
+                    self._write_anomaly_record(
+                        {
+                            "measured_us": float(sample.measured_us),
+                            "analytical_us": float(sample.analytical_us),
+                            "log_residual": float(y),
+                            "centered_residual": float(centered_y),
+                            "topology_bucket": b_key,
+                        }
+                    )
+                continue
+            row = (sample.named_features, centered_y)
+            global_rows.append(row)
+            if b_key != "global":
+                by_bucket.setdefault(b_key, []).append(row)
+
+        self._bucket_sample_counts = {bkt: len(rows) for bkt, rows in by_bucket.items()}
         self._weights_by_name, self._active_global_specs = self._solve_gated_ridge(
             global_rows,
             head0_specs,
@@ -1412,6 +1515,10 @@ class HybridAscendCostModel:
                 "samples": [s.to_dict() for s in self._samples],
                 "weights": list(self.weights),
                 "weights_by_name": self.weights_by_name,
+                "global_intercept": float(self._global_intercept),
+                "bucket_intercepts": {
+                    str(k): float(v) for k, v in self._bucket_intercepts.items()
+                },
                 "delta_weights": list(self.delta_weights),
                 "delta_weights_by_name": self.delta_weights_by_name,
                 "pair_deltas": [
@@ -1439,10 +1546,13 @@ class HybridAscendCostModel:
         if not raw:
             self._samples = []
             self._pair_deltas = []
+            self._quarantined_sample_ids = set()
             self._refit_ridge()
             self._refit_delta_ridge()
             return 0
         samples: list[CalibrationSample] = []
+        loaded_global_intercept: float | None = None
+        loaded_bucket_intercepts: dict[str, float] | None = None
         head2_specs = self._basis_registry.head2_specs()
         if src.suffix == ".jsonl" or not raw.startswith("{"):
             for line in raw.splitlines():
@@ -1453,6 +1563,11 @@ class HybridAscendCostModel:
             payload = json.loads(raw)
             for item in payload.get("samples") or ():
                 samples.append(CalibrationSample.from_dict(item))
+            if payload.get("global_intercept") is not None:
+                loaded_global_intercept = float(payload["global_intercept"])
+            raw_bi = payload.get("bucket_intercepts")
+            if isinstance(raw_bi, Mapping):
+                loaded_bucket_intercepts = {str(k): float(v) for k, v in raw_bi.items()}
             raw_pmap = payload.get("msprof_pipe_scales")
             if isinstance(raw_pmap, Mapping):
                 loaded_scales: dict[str, dict[str, tuple[float, float]]] = {}
@@ -1489,7 +1604,13 @@ class HybridAscendCostModel:
                     loaded_deltas.append((named_dx, float(item.get("delta_y", 0.0))))
                 self._pair_deltas = loaded_deltas
         self._samples = samples
+        self._quarantined_sample_ids = set()
         self._refit_ridge()
+        if not self._samples:
+            if loaded_global_intercept is not None:
+                self._global_intercept = loaded_global_intercept
+            if loaded_bucket_intercepts is not None:
+                self._bucket_intercepts = loaded_bucket_intercepts
         self._refit_delta_ridge()
         return len(self._samples)
 
@@ -1870,6 +1991,10 @@ class HybridAscendCostModel:
         self._samples = []
         self._weights_by_name = {spec.name: 0.0 for spec in head0_specs}
         self._bucket_weights_by_name = {}
+        self._global_intercept = 0.0
+        self._bucket_intercepts = {}
+        self._bucket_sample_counts = {}
+        self._quarantined_sample_ids = set()
         self._active_global_specs = ()
         self._active_bucket_specs = {}
         self._msprof_pipe_scales = {}

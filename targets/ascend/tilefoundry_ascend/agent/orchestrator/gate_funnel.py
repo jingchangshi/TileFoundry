@@ -110,16 +110,25 @@ _HIR_TO_BUILDER_DIM_MAP: dict[str, str] = {
     "N": "n_depth",
     "B": "b_dim",
     "S": "s_dim",
+    "S1": "s1_dim",
+    "S2": "s2_dim",
     "S_kv": "s_kv",
     "D": "d_dim",
     "N_q": "n_q",
+    "N1": "n_q",
     "N_kv": "n_kv",
+    "N2": "n_kv",
+    "G": "g_ratio",
     "D_nope": "d_nope",
     "D_rope": "d_rope",
     "M": "m_dim",
     "K": "k_dim",
     "H": "num_heads",
     "E": "num_experts",
+    "topK": "top_k",
+    "topk": "top_k",
+    "sparse_size": "top_k",
+    "T": "t_dim",
 }
 
 _PARAM_DIM_FALLBACK_ALIASES: dict[str, tuple[str, ...]] = {
@@ -135,6 +144,12 @@ _PARAM_DIM_FALLBACK_ALIASES: dict[str, tuple[str, ...]] = {
     "b_dim": ("B", "b", "batch"),
     "s": ("S", "s_dim", "seq_len"),
     "s_dim": ("S", "s", "seq_len"),
+    "s1_dim": ("S1", "S", "s_dim"),
+    "s2_dim": ("S2", "S_kv", "s_kv"),
+    "n_q": ("N_q", "N1", "num_heads"),
+    "n_kv": ("N_kv", "N2"),
+    "top_k": ("topK", "topk", "sparse_size", "k_sparse"),
+    "t_dim": ("T", "S", "s_dim"),
 }
 
 
@@ -3135,15 +3150,20 @@ def _resolve_stage_a_var_bindings(
                     resolved.setdefault(mapped, iv)
         b_val = resolved.get("B", resolved.get("b_dim"))
         s_val = resolved.get("S", resolved.get("S_q", resolved.get("s_dim")))
+        s1_val = resolved.get("S1", resolved.get("s1_dim", s_val))
         nq_val = resolved.get("N_q", resolved.get("n_q"))
         nkv_val = resolved.get("N_kv", resolved.get("n_kv"))
         n_val = resolved.get("N", resolved.get("n_depth"))
         if b_val is not None and s_val is not None:
             resolved.setdefault("m_rows", b_val * s_val)
-            if nq_val is not None:
-                resolved.setdefault("q_total_rows", b_val * s_val * nq_val)
             if n_val is not None:
                 resolved.setdefault("v_rows", n_val * b_val * s_val)
+        if b_val is not None and s1_val is not None and nq_val is not None:
+            resolved.setdefault("q_total_rows", b_val * s1_val * nq_val)
+        n1_val = resolved.get("N1", nq_val)
+        n2_val = resolved.get("N2", nkv_val)
+        if n1_val is not None and n2_val is not None and n2_val > 0:
+            resolved.setdefault("g_ratio", max(1, n1_val // n2_val))
         if s_val is not None and nq_val is not None and nkv_val is not None and nkv_val > 0:
             resolved.setdefault("q_rows", s_val * (nq_val // nkv_val))
     if var_bindings:

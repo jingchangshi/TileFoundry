@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import functools
+import inspect
 import math
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -931,8 +933,312 @@ def format_prescreen_summary(scores: Sequence[PrescreenScore]) -> str:
     return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class LatticeSweepCandidate:
+    """Zero-LLM Stage-A evaluated tile lattice candidate and predicted cost."""
+
+    knob_overrides: dict[str, int]
+    patched_source: str
+    pred_us: float
+    dominant_bound: str
+    ub_bytes: int
+    l1_bytes: int
+
+
+def _extract_selector_base_config(
+    module_source: str,
+    selector_fn_name: str,
+    sample_builder_kwargs: Mapping[str, object],
+    dims: Mapping[str, int] | None,
+) -> dict[str, object]:
+    """Extract baseline selector config via direct module call with AST dict fallback."""
+    tree = ast.parse(module_source)
+    from tilefoundry_ascend.agent.orchestrator.gate_funnel import (  # noqa: PLC0415
+        _filter_kwargs_for_callable,
+        _merge_dims_into_kwargs,
+    )
+
+    merged_kwargs = _merge_dims_into_kwargs(sample_builder_kwargs, dims)
+    ns: dict[str, object] = {}
+    try:
+        exec(compile(tree, "<lattice_selector_probe>", "exec"), ns)
+        sel_fn = ns.get(selector_fn_name)
+        if callable(sel_fn):
+            call_kw = _filter_kwargs_for_callable(sel_fn, merged_kwargs)
+            sel_out = sel_fn(**call_kw)
+            if isinstance(sel_out, Mapping):
+                return {str(k): v for k, v in sel_out.items()}
+    except Exception:
+        pass
+
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or node.name != selector_fn_name:
+            continue
+        local_ints: dict[str, int] = {}
+        for arg_name, arg_val in merged_kwargs.items():
+            if isinstance(arg_val, int) and not isinstance(arg_val, bool):
+                local_ints[arg_name] = int(arg_val)
+        for stmt in node.body:
+            if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+                tgt = stmt.targets[0]
+                if (
+                    isinstance(tgt, ast.Name)
+                    and isinstance(stmt.value, ast.Constant)
+                    and isinstance(stmt.value.value, int)
+                    and not isinstance(stmt.value.value, bool)
+                ):
+                    local_ints[tgt.id] = int(stmt.value.value)
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Return) and isinstance(inner.value, ast.Dict):
+                parsed: dict[str, object] = {}
+                for k_node, v_node in zip(inner.value.keys, inner.value.values):
+                    if not (isinstance(k_node, ast.Constant) and isinstance(k_node.value, str)):
+                        continue
+                    if isinstance(v_node, ast.Constant):
+                        parsed[k_node.value] = v_node.value
+                    elif isinstance(v_node, ast.Name) and v_node.id in local_ints:
+                        parsed[k_node.value] = local_ints[v_node.id]
+                if parsed:
+                    return parsed
+    return {}
+
+
+def _generate_lattice_override_grid(
+    base_cfg: Mapping[str, object],
+    facts: AscendSpaceFacts,
+    max_points: int,
+) -> list[dict[str, int]]:
+    """Generate bounded hardware-feasible knob override points for Cube, Vector, or State."""
+    cap = max(1, int(max_points))
+    has_stages = "num_stages" in base_cfg
+    stage_vals = (1, 2) if has_stages else (None,)
+
+    if all(k in base_cfg for k in ("bm", "bn", "bk")):
+        dtype_str = str(base_cfg.get("dtype") or base_cfg.get("tl_dtype") or "f16").lower()
+        dtype_bytes = 4 if ("32" in dtype_str and "bf" not in dtype_str and "hf" not in dtype_str) else 2
+        bm_base = int(base_cfg["bm"]) if isinstance(base_cfg["bm"], int) else 64
+        bn_base = int(base_cfg["bn"]) if isinstance(base_cfg["bn"], int) else 128
+        bk_base = int(base_cfg["bk"]) if isinstance(base_cfg["bk"], int) else 64
+        st_base = (
+            int(base_cfg["num_stages"])
+            if (has_stages and isinstance(base_cfg["num_stages"], int))
+            else 1
+        )
+        bm_opts = tuple(dict.fromkeys((bm_base, 32, 64, 128)))
+        bn_opts = tuple(dict.fromkeys((bn_base, 64, 128, 256)))
+        bk_opts = tuple(dict.fromkeys((bk_base, 32, 64, 128)))
+        st_opts = tuple(dict.fromkeys((st_base, 1, 2))) if has_stages else (None,)
+
+        scored_points: list[tuple[int, float, dict[str, int]]] = []
+        seen_cube: set[tuple[int, int, int, int | None]] = set()
+        for bm in bm_opts:
+            for bn in bn_opts:
+                for bk in bk_opts:
+                    if bm <= 0 or bn <= 0 or bk <= 0 or bm % 16 != 0 or bn % 16 != 0 or bk % 16 != 0:
+                        continue
+                    for st in st_opts:
+                        key = (bm, bn, bk, st)
+                        if key in seen_cube:
+                            continue
+                        seen_cube.add(key)
+                        eff_st = st if st is not None else 1
+                        ev = evaluate_tile_candidate(
+                            TileConfigCandidate(
+                                bm=bm,
+                                bn=bn,
+                                bk=bk,
+                                stages=eff_st,
+                                dtype_bytes=dtype_bytes,
+                                accum_bytes=4,
+                            ),
+                            facts,
+                            dtype=dtype_str,
+                        )
+                        if ev.l1_bytes > facts.l1_bytes or ev.l0c_bytes > facts.l0c_bytes:
+                            continue
+                        if not ev.is_feasible:
+                            continue
+                        ov: dict[str, int] = {"bm": int(bm), "bn": int(bn), "bk": int(bk)}
+                        if has_stages and st is not None:
+                            ov["num_stages"] = int(st)
+                        is_base = 0 if (bm == bm_base and bn == bn_base and bk == bk_base and st == (st_base if has_stages else None)) else 1
+                        scored_points.append((is_base, -ev.score, ov))
+        scored_points.sort(key=lambda item: (item[0], item[1]))
+        return [item[2] for item in scored_points[:cap]]
+
+    if "chunk_t" in base_cfg:
+        ct_base = int(base_cfg["chunk_t"]) if isinstance(base_cfg["chunk_t"], int) else 32
+        ct_opts = tuple(dict.fromkeys((ct_base, 16, 32, 64)))
+        has_dv = "dv_tile" in base_cfg
+        dv_base = (
+            int(base_cfg["dv_tile"]) if (has_dv and isinstance(base_cfg["dv_tile"], int)) else 32
+        )
+        dv_opts = tuple(dict.fromkeys((dv_base, 32, 64))) if has_dv else (None,)
+        st_base = (
+            int(base_cfg["num_stages"])
+            if (has_stages and isinstance(base_cfg["num_stages"], int))
+            else 1
+        )
+        st_opts = tuple(dict.fromkeys((st_base, 1, 2))) if has_stages else (None,)
+        grid: list[dict[str, int]] = []
+        for ct in ct_opts:
+            for dv in dv_opts:
+                for st in st_opts:
+                    ov = {"chunk_t": int(ct)}
+                    if has_dv and dv is not None:
+                        ov["dv_tile"] = int(dv)
+                    if has_stages and st is not None:
+                        ov["num_stages"] = int(st)
+                    grid.append(ov)
+                    if len(grid) >= cap:
+                        return grid
+        return grid
+
+    if "tile_m" in base_cfg:
+        tm_base = int(base_cfg["tile_m"]) if isinstance(base_cfg["tile_m"], int) else 4
+        tm_opts = tuple(dict.fromkeys((tm_base, 1, 2, 4, 8, 16, 32)))
+        st_base = (
+            int(base_cfg["num_stages"])
+            if (has_stages and isinstance(base_cfg["num_stages"], int))
+            else 1
+        )
+        st_opts = tuple(dict.fromkeys((st_base, 1, 2))) if has_stages else stage_vals
+        grid = []
+        for tm in tm_opts:
+            for st in st_opts:
+                ov = {"tile_m": int(tm)}
+                if has_stages and st is not None:
+                    ov["num_stages"] = int(st)
+                grid.append(ov)
+                if len(grid) >= cap:
+                    return grid
+        return grid
+
+    return []
+
+
+def _patch_selector_source(
+    module_source: str,
+    selector_fn_name: str,
+    overrides: Mapping[str, int],
+) -> str:
+    """Wrap selector_fn_name minimally via AST line insertion to apply *overrides*."""
+    tree = ast.parse(module_source)
+    target_node: ast.FunctionDef | None = None
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == selector_fn_name:
+            target_node = node
+            break
+    if target_node is None or target_node.end_lineno is None:
+        raise ValueError(f"Selector function {selector_fn_name!r} not found at module top level")
+    lines = module_source.splitlines(keepends=True)
+    insert_at = int(target_node.end_lineno)
+    ov_literal = repr({str(k): int(v) for k, v in overrides.items()})
+    orig_alias = f"_tf_sweep_orig_{selector_fn_name}"
+    wrapper_block = (
+        "\n"
+        "import functools as _tf_sweep_functools\n"
+        f"{orig_alias} = {selector_fn_name}\n"
+        f"@_tf_sweep_functools.wraps({orig_alias})\n"
+        f"def {selector_fn_name}(*args, **kwargs):\n"
+        f"    _tf_sweep_cfg = dict({orig_alias}(*args, **kwargs))\n"
+        f"    _tf_sweep_cfg.update({ov_literal})\n"
+        "    return _tf_sweep_cfg\n"
+    )
+    if insert_at > 0 and not lines[insert_at - 1].endswith("\n"):
+        lines[insert_at - 1] = lines[insert_at - 1] + "\n"
+    patched = "".join([*lines[:insert_at], wrapper_block, *lines[insert_at:]])
+    ast.parse(patched)
+    return patched
+
+
+def sweep_executable_lattice_zero_llm(
+    module_source: str,
+    *,
+    selector_fn_name: str,
+    builder_fn_name: str,
+    sample_builder_kwargs: Mapping[str, object],
+    dims: Mapping[str, int] | None,
+    cost_model: HybridAscendCostModel,
+    max_points: int = 24,
+    top_k: int = 3,
+) -> list[LatticeSweepCandidate]:
+    """Sweep bounded tile lattice with Stage-A static analysis and cost scoring (0 LLM)."""
+    if top_k <= 0 or max_points <= 0:
+        return []
+    base_cfg = _extract_selector_base_config(
+        module_source,
+        selector_fn_name,
+        sample_builder_kwargs,
+        dims,
+    )
+    if not base_cfg:
+        return []
+    override_grid = _generate_lattice_override_grid(base_cfg, cost_model.facts, max_points)
+    if not override_grid:
+        return []
+
+    from tilefoundry_ascend.agent.orchestrator.gate_funnel import (  # noqa: PLC0415
+        run_stage_a_static,
+    )
+
+    candidates: list[LatticeSweepCandidate] = []
+    for ov in override_grid:
+        try:
+            patched_source = _patch_selector_source(module_source, selector_fn_name, ov)
+        except (SyntaxError, ValueError):
+            continue
+        stage_a = run_stage_a_static(
+            patched_source,
+            factory_name=builder_fn_name,
+            factory_kwargs={**sample_builder_kwargs, **ov},
+            target=cost_model.target,
+            config_selector_name=selector_fn_name,
+            dims=dims,
+        )
+        ledger = stage_a.ledger
+        if not stage_a.passed or ledger is None:
+            continue
+        if not getattr(ledger, "is_legal", True):
+            continue
+        if int(getattr(ledger, "max_overflow_bytes", 0) or 0) > 0:
+            continue
+        waterlines = getattr(ledger, "waterlines", None) or {}
+        if any(int(getattr(wl, "overflow_bytes", 0) or 0) > 0 for wl in waterlines.values()):
+            continue
+        ub_wl = waterlines.get("UB")
+        l1_wl = waterlines.get("L1")
+        ub_bytes = int(getattr(ub_wl, "peak_allocated_bytes", 0) or 0)
+        l1_bytes = int(getattr(l1_wl, "peak_allocated_bytes", 0) or 0)
+
+        policy_hint: dict[str, object] = {**base_cfg, **ov}
+        if all(k in ov for k in ("bm", "bn", "bk")):
+            policy_hint["tile_mnk"] = [ov["bm"], ov["bn"], ov["bk"]]
+        if "num_stages" in ov:
+            policy_hint["l1_stages"] = ov["num_stages"]
+        cf = build_cost_features_from_ledger(
+            ledger,
+            live_plan={"policy": policy_hint},
+            target=cost_model.target,
+        )
+        pred = cost_model.predict(cf)
+        candidates.append(
+            LatticeSweepCandidate(
+                knob_overrides=dict(ov),
+                patched_source=patched_source,
+                pred_us=float(pred.pred_us),
+                dominant_bound=str(pred.dominant_bound),
+                ub_bytes=ub_bytes,
+                l1_bytes=l1_bytes,
+            )
+        )
+    candidates.sort(key=lambda item: (item.pred_us, item.ub_bytes))
+    return candidates[: int(top_k)]
+
+
 __all__ = [
     "CostRankedCandidate",
+    "LatticeSweepCandidate",
     "PrescreenAblationReport",
     "PrescreenAblationSample",
     "PrescreenScore",
@@ -946,4 +1252,5 @@ __all__ = [
     "prescreen_live_ir_neighborhood",
     "prescreen_tile_configs",
     "rank_stage_a_candidates_with_cost_model",
+    "sweep_executable_lattice_zero_llm",
 ]
