@@ -1235,12 +1235,13 @@ def test_coverage_precedes_candidate_for_an_unexplained_missing_case(
     with recorder.node("node_one"):
         recorder.case_finished("node_one", "1", "failed", "numeric mismatch", failure=candidate)
     with recorder.node("node_two"):
-        recorder.case_finished("node_two", "4", "passed")
+        pass
     payload = recorder.payload()
     failure = _mapping(payload["failure"])
     assert failure["kind"] == "coverage"
     assert failure["category"] == "missing_case"
-    assert failure["case"] == "2"
+    assert failure["node"] == "node_two"
+    assert failure["case"] == "4"
     failures = payload["failures"]
     assert isinstance(failures, list)
     assert [row["kind"] for row in failures] == ["candidate", "coverage"]

@@ -848,7 +848,7 @@ class HybridAscendCostModel:
     def weights_by_name(self) -> dict[str, float]:
         specs = self._basis_registry.head0_specs()
         out = {spec.name: self._weights_by_name.get(spec.name, 0.0) for spec in specs}
-        if "intercept" in out and self._samples:
+        if "intercept" in out and "intercept" in self._active_global_specs:
             out["intercept"] = out["intercept"] + self._global_intercept
         return out
 
@@ -867,7 +867,7 @@ class HybridAscendCostModel:
         out: dict[str, dict[str, float]] = {}
         for bucket, wmap in self._bucket_weights_by_name.items():
             b_out = {spec.name: wmap.get(spec.name, 0.0) for spec in specs}
-            if "intercept" in b_out:
+            if "intercept" in b_out and "intercept" in self._active_bucket_specs.get(bucket, ()):
                 b_out["intercept"] = b_out["intercept"] + self._bucket_intercepts.get(
                     bucket, self._global_intercept
                 )
@@ -1438,21 +1438,32 @@ class HybridAscendCostModel:
             if b_key != "global":
                 raw_by_bucket.setdefault(b_key, []).append(y)
 
-        self._global_intercept = _huber_location(raw_ys)
+        intercept_spec = next((spec for spec in head0_specs if spec.name == "intercept"), None)
+        intercept_thresh = (
+            _sample_gate_threshold(intercept_spec.min_bucket_samples, self._forgetting_factor)
+            if intercept_spec is not None
+            else 2.0
+        )
+        raw_global_eff = _effective_sample_count(len(raw_ys), self._forgetting_factor)
+        raw_global_intercept = _huber_location(raw_ys)
+        global_unlocked = bool(intercept_spec is not None and raw_global_eff >= intercept_thresh)
+        self._global_intercept = raw_global_intercept if global_unlocked else 0.0
         new_bucket_intercepts: dict[str, float] = {}
         for bucket, ys in raw_by_bucket.items():
-            new_bucket_intercepts[bucket] = (
-                _huber_location(ys) if len(ys) >= 2 else self._global_intercept
-            )
+            b_eff = _effective_sample_count(len(ys), self._forgetting_factor)
+            if len(ys) >= 2 and b_eff >= intercept_thresh:
+                new_bucket_intercepts[bucket] = _huber_location(ys)
+            elif global_unlocked:
+                new_bucket_intercepts[bucket] = self._global_intercept
         self._bucket_intercepts = new_bucket_intercepts
 
         global_rows: list[tuple[Mapping[str, float], float]] = []
         by_bucket: dict[str, list[tuple[Mapping[str, float], float]]] = {}
         for sample, b_key, y in raw_entries:
             beta_0_b = (
-                self._bucket_intercepts.get(b_key, self._global_intercept)
+                self._bucket_intercepts.get(b_key, raw_global_intercept)
                 if b_key != "global"
-                else self._global_intercept
+                else raw_global_intercept
             )
             centered_y = y - beta_0_b
             if abs(centered_y) > 2.0:
@@ -1476,23 +1487,35 @@ class HybridAscendCostModel:
 
         centered_specs = tuple(spec for spec in head0_specs if spec.name != "intercept")
         self._bucket_sample_counts = {bkt: len(rows) for bkt, rows in by_bucket.items()}
-        self._weights_by_name, self._active_global_specs = self._solve_gated_ridge(
+        clean_global_eff = _effective_sample_count(len(global_rows), self._forgetting_factor)
+        clean_global_unlocked = bool(
+            intercept_spec is not None and clean_global_eff >= intercept_thresh
+        )
+        if not clean_global_unlocked:
+            self._global_intercept = 0.0
+        self._weights_by_name, slope_global_specs = self._solve_gated_ridge(
             global_rows,
             centered_specs,
             alpha=self.ridge_alpha,
         )
         self._weights_by_name.setdefault("intercept", 0.0)
+        self._active_global_specs = (
+            ("intercept", *slope_global_specs) if clean_global_unlocked else slope_global_specs
+        )
 
         shrink_alpha = max(2.0, self.ridge_alpha * 2.0)
         new_bucket_weights: dict[str, dict[str, float]] = {}
         new_active_bucket_specs: dict[str, tuple[str, ...]] = {}
         for bucket, b_rows in by_bucket.items():
-            b_weights, b_active = self._solve_gated_ridge(
+            b_eff = _effective_sample_count(len(b_rows), self._forgetting_factor)
+            b_intercept_unlocked = bool(intercept_spec is not None and b_eff >= intercept_thresh)
+            b_weights, b_slope_specs = self._solve_gated_ridge(
                 b_rows,
                 centered_specs,
                 alpha=shrink_alpha,
                 prior_weights=self._weights_by_name,
             )
+            b_active = ("intercept", *b_slope_specs) if b_intercept_unlocked else b_slope_specs
             if not b_active:
                 continue
             b_weights.setdefault("intercept", 0.0)

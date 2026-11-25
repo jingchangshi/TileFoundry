@@ -1361,9 +1361,20 @@ class ExtremeCampaignRunner(PerfTargetCampaignRunner):
         *,
         allow_satisfied_fallback: bool = False,
         exclude_regime: str | None = None,
+        stagnation_by_regime: Mapping[str, int] | None = None,
     ) -> RegimeTargetSpec | None:
         by_tag = {r.regime_tag: r for r in self._regime_specs}
-        if current_regime and current_regime not in frozen_regimes and current_regime in by_tag:
+        stag_map = (
+            {str(k): int(v) for k, v in stagnation_by_regime.items()}
+            if stagnation_by_regime is not None
+            else self._live_stag_by_regime
+        )
+        if (
+            current_regime
+            and current_regime != exclude_regime
+            and current_regime not in frozen_regimes
+            and current_regime in by_tag
+        ):
             spec = by_tag[current_regime]
             if not self._is_regime_satisfied(spec, best_result, active_anchors):
                 return spec
@@ -1377,6 +1388,7 @@ class ExtremeCampaignRunner(PerfTargetCampaignRunner):
         if not candidates and allow_satisfied_fallback:
             if (
                 current_regime
+                and current_regime != exclude_regime
                 and current_regime not in frozen_regimes
                 and current_regime in by_tag
             ):
@@ -1390,7 +1402,7 @@ class ExtremeCampaignRunner(PerfTargetCampaignRunner):
             candidates = [spec for spec in candidates if spec.regime_tag != exclude_regime]
         candidates.sort(
             key=lambda s: best_result.regime_headroom(s.regime_tag)
-            / (1.0 + self._stagnation_discount * self._live_stag_by_regime.get(s.regime_tag, 0)),
+            / (1.0 + self._stagnation_discount * stag_map.get(s.regime_tag, 0)),
             reverse=True,
         )
         return candidates[0]
