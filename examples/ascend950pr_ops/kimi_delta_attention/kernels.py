@@ -41,6 +41,8 @@ def _select_kimi_delta_attention_config(
     t_dim: int = 64,
     use_qk_l2norm: bool = True,
     schedule_mode: str = "tuned",
+    chunk_t_override: int = 0,
+    dv_tile_override: int = 0,
 ) -> dict[str, object]:
     """Select persistent (B, H) UB-resident state regime and chunking for KDA."""
     dk_alloc = ((max(1, int(dk)) + 63) // 64) * 64
@@ -50,7 +52,10 @@ def _select_kimi_delta_attention_config(
         regime = "persistent_ub_state_resident"
     else:
         regime = "chunked_dv_tile_state"
-    chunk_t = min(max(1, int(t_dim)), 64 if schedule_mode == "tuned" else 16)
+    default_chunk_t = min(max(1, int(t_dim)), 64 if schedule_mode == "tuned" else 16)
+    chunk_t = int(chunk_t_override) if int(chunk_t_override) > 0 else default_chunk_t
+    default_dv_tile = 64 if state_bytes > 192 * 1024 else dv_alloc
+    dv_tile = int(dv_tile_override) if int(dv_tile_override) > 0 else default_dv_tile
     return {
         "regime": regime,
         "dk": int(dk),
@@ -58,6 +63,7 @@ def _select_kimi_delta_attention_config(
         "tl_dtype": tl_dtype,
         "use_qk_l2norm": bool(use_qk_l2norm),
         "chunk_t": chunk_t,
+        "dv_tile": dv_tile,
         "pass_configs": {},
         "compile_flags": list(PURE_SIMDVF_UBUF_FLAGS) if schedule_mode == "tuned" else [],
     }
@@ -1874,6 +1880,304 @@ void dispatch_stage1_stage2(
   }
 }
 
+// ============================================================================
+// Kernel 4: DV_TILE=64 UB-Resident Column-Tiled Kernel (Dk<=256, BT=16 DBuf)
+// ============================================================================
+template <typename T>
+__simd_vf__ inline void kda_dv64_block_vf(
+    __ubuf__ float* state_ub,
+    __ubuf__ T* q_in,
+    __ubuf__ T* k_in,
+    __ubuf__ T* v_in,
+    __ubuf__ float* g_in,
+    __ubuf__ float* beta_in,
+    __ubuf__ float* qf_ub,
+    __ubuf__ float* kf_ub,
+    __ubuf__ T* out_ub,
+    int32_t t_cur, int32_t Dk, int32_t dk_pad, int32_t dv_cur,
+    int32_t use_l2norm, float scale_val) {
+  auto m32 = asc_create_mask_b32(PAT_ALL);
+  auto mv32 = make_mask_b32((uint32_t)dv_cur);
+  auto mv16 = make_mask_b16((uint32_t)(dv_cur * 2));
+  auto v_zero = V::vdup<float>(0.0f, m32, MODE_ZEROING);
+  auto v_one = V::vdup<float>(1.0f, m32, MODE_ZEROING);
+  auto v_eps = V::vdup<float>(1.0e-6f, m32, MODE_ZEROING);
+
+  int32_t dk_chunks = (Dk + 63) / 64;
+  int32_t dk_tail = Dk - (dk_chunks - 1) * 64;
+
+  for (int32_t t = 0; t < t_cur; ++t) {
+    if (dk_chunks == 1) {
+      auto mc = (Dk == 64) ? m32 : make_mask_b32((uint32_t)Dk);
+      auto qv = load_f32_vec(q_in, t * dk_pad);
+      auto kv = load_f32_vec(k_in, t * dk_pad);
+      auto gv = V::vlds_norm(g_in + t * dk_pad, 0);
+      auto ev = V::vexp(gv, mc, MODE_ZEROING);
+      if (use_l2norm) {
+        auto q_sum = V::vdupv(V::vcadd(V::vmul(qv, qv, mc, MODE_ZEROING), mc, MODE_ZEROING), m32, POS_LOWEST, MODE_ZEROING);
+        auto k_sum = V::vdupv(V::vcadd(V::vmul(kv, kv, mc, MODE_ZEROING), mc, MODE_ZEROING), m32, POS_LOWEST, MODE_ZEROING);
+        auto q_den = V::vsqrt(V::vadd(q_sum, v_eps, m32, MODE_ZEROING), m32, MODE_ZEROING);
+        auto k_den = V::vsqrt(V::vadd(k_sum, v_eps, m32, MODE_ZEROING), m32, MODE_ZEROING);
+        auto q_sc = V::vmuls(V::vdiv_0ulp_ftz_true(v_one, q_den, m32, MODE_ZEROING), scale_val, m32, MODE_ZEROING);
+        auto k_sc = V::vdiv_0ulp_ftz_true(v_one, k_den, m32, MODE_ZEROING);
+        qv = V::vmul(qv, q_sc, mc, MODE_ZEROING);
+        kv = V::vmul(kv, k_sc, mc, MODE_ZEROING);
+      } else {
+        qv = V::vmuls(qv, scale_val, mc, MODE_ZEROING);
+      }
+      V::vsts_norm(qv, qf_ub + t * dk_pad, 0, mc);
+      V::vsts_norm(kv, kf_ub + t * dk_pad, 0, mc);
+      V::vsts_norm(ev, g_in + t * dk_pad, 0, mc);
+    } else {
+      auto q_sq = v_zero;
+      auto k_sq = v_zero;
+      for (int32_t c = 0; c < dk_chunks; ++c) {
+        int32_t w = (c == dk_chunks - 1) ? dk_tail : 64;
+        auto mc = (w == 64) ? m32 : make_mask_b32((uint32_t)w);
+        int32_t off = t * dk_pad + c * 64;
+        auto qv = load_f32_vec(q_in, off);
+        auto kv = load_f32_vec(k_in, off);
+        auto ev = V::vexp(V::vlds_norm(g_in + off, 0), mc, MODE_ZEROING);
+        if (use_l2norm) {
+          q_sq = V::vadd(q_sq, V::vmul(qv, qv, mc, MODE_ZEROING), m32, MODE_ZEROING);
+          k_sq = V::vadd(k_sq, V::vmul(kv, kv, mc, MODE_ZEROING), m32, MODE_ZEROING);
+        } else {
+          qv = V::vmuls(qv, scale_val, mc, MODE_ZEROING);
+        }
+        V::vsts_norm(qv, qf_ub + off, 0, mc);
+        V::vsts_norm(kv, kf_ub + off, 0, mc);
+        V::vsts_norm(ev, g_in + off, 0, mc);
+      }
+      if (use_l2norm) {
+        auto q_sum = V::vdupv(V::vcadd(q_sq, m32, MODE_ZEROING), m32, POS_LOWEST, MODE_ZEROING);
+        auto k_sum = V::vdupv(V::vcadd(k_sq, m32, MODE_ZEROING), m32, POS_LOWEST, MODE_ZEROING);
+        auto q_sc = V::vmuls(V::vdiv_0ulp_ftz_true(v_one, V::vsqrt(V::vadd(q_sum, v_eps, m32, MODE_ZEROING), m32, MODE_ZEROING), m32, MODE_ZEROING), scale_val, m32, MODE_ZEROING);
+        auto k_sc = V::vdiv_0ulp_ftz_true(v_one, V::vsqrt(V::vadd(k_sum, v_eps, m32, MODE_ZEROING), m32, MODE_ZEROING), m32, MODE_ZEROING);
+        V::vsts_1st(q_sc, beta_in + t * 8 + 1, 0, m32);
+        V::vsts_1st(k_sc, beta_in + t * 8 + 2, 0, m32);
+      }
+    }
+  }
+  asc_mem_bar(VST_VLD);
+
+  if (dk_chunks > 1 && use_l2norm) {
+    for (int32_t t = 0; t < t_cur; ++t) {
+      auto q_sc = V::vlds_brc_elem(beta_in + t * 8 + 1, 0);
+      auto k_sc = V::vlds_brc_elem(beta_in + t * 8 + 2, 0);
+      for (int32_t c = 0; c < dk_chunks; ++c) {
+        int32_t w = (c == dk_chunks - 1) ? dk_tail : 64;
+        auto mc = (w == 64) ? m32 : make_mask_b32((uint32_t)w);
+        int32_t off = t * dk_pad + c * 64;
+        V::vsts_norm(V::vmul(V::vlds_norm(qf_ub + off, 0), q_sc, mc, MODE_ZEROING), qf_ub + off, 0, mc);
+        V::vsts_norm(V::vmul(V::vlds_norm(kf_ub + off, 0), k_sc, mc, MODE_ZEROING), kf_ub + off, 0, mc);
+      }
+    }
+    asc_mem_bar(VST_VLD);
+  }
+
+  for (int32_t t = 0; t < t_cur; ++t) {
+    auto k_dot_h = v_zero;
+    for (int32_t d = 0; d < Dk; ++d) {
+      auto e_s = V::vlds_brc_elem(g_in + t * dk_pad + d, 0);
+      auto k_s = V::vlds_brc_elem(kf_ub + t * dk_pad + d, 0);
+      auto h_row = V::vlds_norm(state_ub + d * 64, 0);
+      auto h_dec = V::vmul(h_row, e_s, mv32, MODE_ZEROING);
+      V::vsts_norm(h_dec, state_ub + d * 64, 0, mv32);
+      k_dot_h = V::vadd(k_dot_h, V::vmul(h_dec, k_s, mv32, MODE_ZEROING), mv32, MODE_ZEROING);
+    }
+    asc_mem_bar(VST_VLD);
+    auto v_t = load_f32_vec(v_in, t * 64);
+    auto b_t = V::vlds_brc_elem(beta_in + t * 8, 0);
+    auto delta = V::vmul(V::vsub(v_t, k_dot_h, mv32, MODE_ZEROING), b_t, mv32, MODE_ZEROING);
+    auto out_acc = v_zero;
+    for (int32_t d = 0; d < Dk; ++d) {
+      auto k_s = V::vlds_brc_elem(kf_ub + t * dk_pad + d, 0);
+      auto q_s = V::vlds_brc_elem(qf_ub + t * dk_pad + d, 0);
+      auto h_dec = V::vlds_norm(state_ub + d * 64, 0);
+      auto h_new = V::vadd(h_dec, V::vmul(delta, k_s, mv32, MODE_ZEROING), mv32, MODE_ZEROING);
+      V::vsts_norm(h_new, state_ub + d * 64, 0, mv32);
+      out_acc = V::vadd(out_acc, V::vmul(h_new, q_s, mv32, MODE_ZEROING), mv32, MODE_ZEROING);
+    }
+    if (t + 1 < t_cur) asc_mem_bar(VST_VLD);
+    store_f32_vec(out_ub, t * 64, out_acc, mv32, mv16);
+  }
+  asc_mem_bar(VST_VLD);
+}
+
+template <typename T>
+__aicore__ inline void kda_dv64_issue_tb(
+    __gm__ T* q, __gm__ T* k, __gm__ T* v, __gm__ float* g, __gm__ float* beta,
+    __ubuf__ T* q_dst, __ubuf__ T* k_dst, __ubuf__ T* v_dst, __ubuf__ float* g_dst, __ubuf__ float* beta_dst,
+    int32_t b, int32_t h, int32_t T_len, int32_t H, int32_t Dk, int32_t Dv, int32_t dk_pad,
+    int32_t dv0, int32_t dv_cur, int32_t t0, int32_t t_cur) {
+  int64_t qk_off = (((int64_t)b * T_len + t0) * H + h) * Dk;
+  int64_t v_off = (((int64_t)b * T_len + t0) * H + h) * Dv + dv0;
+  int64_t b_off = ((int64_t)b * T_len + t0) * H + h;
+  asc_copy_gm2ub_align((__ubuf__ uint8_t*)q_dst, (__gm__ uint8_t*)(q + qk_off),
+                       (uint32_t)t_cur, (uint32_t)(Dk * sizeof(T)), 0, 0, false,
+                       asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
+                       (uint64_t)(H * Dk * sizeof(T)), (uint32_t)(dk_pad * sizeof(T)));
+  asc_copy_gm2ub_align((__ubuf__ uint8_t*)k_dst, (__gm__ uint8_t*)(k + qk_off),
+                       (uint32_t)t_cur, (uint32_t)(Dk * sizeof(T)), 0, 0, false,
+                       asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
+                       (uint64_t)(H * Dk * sizeof(T)), (uint32_t)(dk_pad * sizeof(T)));
+  asc_copy_gm2ub_align((__ubuf__ uint8_t*)v_dst, (__gm__ uint8_t*)(v + v_off),
+                       (uint32_t)t_cur, (uint32_t)(dv_cur * sizeof(T)), 0, 0, false,
+                       asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
+                       (uint64_t)(H * Dv * sizeof(T)), (uint32_t)(64 * sizeof(T)));
+  asc_copy_gm2ub_align((__ubuf__ uint8_t*)g_dst, (__gm__ uint8_t*)(g + qk_off),
+                       (uint32_t)t_cur, (uint32_t)(Dk * 4), 0, 0, false,
+                       asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
+                       (uint64_t)(H * Dk * 4), (uint32_t)(dk_pad * 4));
+  asc_copy_gm2ub_align((__ubuf__ uint8_t*)beta_dst, (__gm__ uint8_t*)(beta + b_off),
+                       (uint32_t)t_cur, (uint32_t)4, 0, 0, false,
+                       asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
+                       (uint64_t)(H * 4), (uint32_t)32);
+}
+
+template <typename T>
+__aicore__ inline void kda_dv64_ub_impl(
+    __gm__ T* q, __gm__ T* k, __gm__ T* v, __gm__ float* g, __gm__ float* beta, __gm__ float* init_state,
+    __gm__ T* y, __gm__ float* final_state,
+    int32_t B, int32_t T_len, int32_t H, int32_t Dk, int32_t Dv,
+    int32_t use_l2norm, float scale_val) {
+  asc_init();
+  __ubuf__ uint8_t* ub = (__ubuf__ uint8_t*)0;
+  __ubuf__ float* state_ub = (__ubuf__ float*)(ub + 0);
+
+  __ubuf__ T* q_in0 = (__ubuf__ T*)(ub + 65536);
+  __ubuf__ T* k_in0 = (__ubuf__ T*)(ub + 81920);
+  __ubuf__ T* v_in0 = (__ubuf__ T*)(ub + 98304);
+  __ubuf__ float* g_in0 = (__ubuf__ float*)(ub + 102400);
+  __ubuf__ float* beta_in0 = (__ubuf__ float*)(ub + 118784);
+
+  __ubuf__ T* q_in1 = (__ubuf__ T*)(ub + 119296);
+  __ubuf__ T* k_in1 = (__ubuf__ T*)(ub + 135680);
+  __ubuf__ T* v_in1 = (__ubuf__ T*)(ub + 152064);
+  __ubuf__ float* g_in1 = (__ubuf__ float*)(ub + 156160);
+  __ubuf__ float* beta_in1 = (__ubuf__ float*)(ub + 172544);
+
+  __ubuf__ T* out_ub0 = (__ubuf__ T*)(ub + 173056);
+  __ubuf__ T* out_ub1 = (__ubuf__ T*)(ub + 177152);
+  __ubuf__ float* qf_ub = (__ubuf__ float*)(ub + 181248);
+  __ubuf__ float* kf_ub = (__ubuf__ float*)(ub + 197632);
+
+  constexpr int32_t BT = 16;
+  int32_t dk_pad = ((Dk + 63) / 64) * 64;
+  int32_t dv_tiles = (Dv + 63) / 64;
+  int32_t total_tasks = B * H * dv_tiles;
+  int32_t ncores = (int32_t)block_num;
+  int32_t cid = (int32_t)block_idx;
+  int32_t base = total_tasks / ncores;
+  int32_t rem = total_tasks % ncores;
+  int32_t start = cid * base + (cid < rem ? cid : rem);
+  int32_t count = base + (cid < rem ? 1 : 0);
+  int32_t t_blocks = (T_len + BT - 1) / BT;
+
+  for (int32_t lt = 0; lt < count; ++lt) {
+    int32_t tid = start + lt;
+    int32_t bh = tid / dv_tiles;
+    int32_t dv_t = tid % dv_tiles;
+    int32_t b = bh / H;
+    int32_t h = bh % H;
+    int32_t dv0 = dv_t * 64;
+    int32_t dv_cur = (Dv - dv0 < 64) ? (Dv - dv0) : 64;
+    int64_t state_off = ((int64_t)b * H + h) * Dk * Dv + dv0;
+
+    asc_copy_gm2ub_align((__ubuf__ uint8_t*)state_ub, (__gm__ uint8_t*)(init_state + state_off),
+                         (uint32_t)Dk, (uint32_t)(dv_cur * 4), 0, 0, false,
+                         asc_load_l2_cache_mode::NORMAL_FIRST_VICTIM,
+                         (uint64_t)(Dv * 4), (uint32_t)(64 * 4));
+    int32_t t_cur0 = (T_len < BT) ? T_len : BT;
+    kda_dv64_issue_tb<T>(
+        q, k, v, g, beta, q_in0, k_in0, v_in0, g_in0, beta_in0,
+        b, h, T_len, H, Dk, Dv, dk_pad, dv0, dv_cur, 0, t_cur0);
+    asc_sync_notify(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    asc_sync_notify(PIPE_V, PIPE_MTE2, EVENT_ID1);
+    asc_sync_notify(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    asc_sync_notify(PIPE_MTE3, PIPE_V, EVENT_ID1);
+
+    for (int32_t tb = 0; tb < t_blocks; ++tb) {
+      int32_t buf = tb & 1;
+      event_t ev = buf ? EVENT_ID1 : EVENT_ID0;
+      event_t nxt_ev = buf ? EVENT_ID0 : EVENT_ID1;
+      if (tb + 1 < t_blocks) {
+        int32_t nxt_t0 = (tb + 1) * BT;
+        int32_t nxt_t_cur = (T_len - nxt_t0 < BT) ? (T_len - nxt_t0) : BT;
+        __ubuf__ T* nxt_q = buf ? q_in0 : q_in1;
+        __ubuf__ T* nxt_k = buf ? k_in0 : k_in1;
+        __ubuf__ T* nxt_v = buf ? v_in0 : v_in1;
+        __ubuf__ float* nxt_g = buf ? g_in0 : g_in1;
+        __ubuf__ float* nxt_beta = buf ? beta_in0 : beta_in1;
+        asc_sync_wait(PIPE_V, PIPE_MTE2, nxt_ev);
+        kda_dv64_issue_tb<T>(
+            q, k, v, g, beta, nxt_q, nxt_k, nxt_v, nxt_g, nxt_beta,
+            b, h, T_len, H, Dk, Dv, dk_pad, dv0, dv_cur, nxt_t0, nxt_t_cur);
+        asc_sync_notify(PIPE_MTE2, PIPE_V, nxt_ev);
+      }
+
+      int32_t t0 = tb * BT;
+      int32_t t_cur = (T_len - t0 < BT) ? (T_len - t0) : BT;
+      __ubuf__ T* cur_q = buf ? q_in1 : q_in0;
+      __ubuf__ T* cur_k = buf ? k_in1 : k_in0;
+      __ubuf__ T* cur_v = buf ? v_in1 : v_in0;
+      __ubuf__ float* cur_g = buf ? g_in1 : g_in0;
+      __ubuf__ float* cur_beta = buf ? beta_in1 : beta_in0;
+      __ubuf__ T* cur_out = buf ? out_ub1 : out_ub0;
+
+      asc_sync_wait(PIPE_MTE2, PIPE_V, ev);
+      asc_sync_wait(PIPE_MTE3, PIPE_V, ev);
+      kda_dv64_block_vf<T>(state_ub, cur_q, cur_k, cur_v, cur_g, cur_beta, qf_ub, kf_ub, cur_out,
+                           t_cur, Dk, dk_pad, dv_cur, use_l2norm, scale_val);
+      asc_sync_notify(PIPE_V, PIPE_MTE2, ev);
+      asc_sync_notify(PIPE_V, PIPE_MTE3, ev);
+      asc_sync_wait(PIPE_V, PIPE_MTE3, ev);
+      int64_t y_off = (((int64_t)b * T_len + t0) * H + h) * Dv + dv0;
+      asc_copy_ub2gm_align((__gm__ uint8_t*)(y + y_off), (__ubuf__ uint8_t*)cur_out,
+                           (uint32_t)t_cur, (uint32_t)(dv_cur * sizeof(T)),
+                           asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM,
+                           (uint64_t)(H * Dv * sizeof(T)), (uint32_t)(64 * sizeof(T)));
+      asc_sync_notify(PIPE_MTE3, PIPE_V, ev);
+    }
+
+    asc_sync_wait(PIPE_V, PIPE_MTE2, EVENT_ID0);
+    asc_sync_wait(PIPE_V, PIPE_MTE2, EVENT_ID1);
+    asc_sync_wait(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    asc_sync_wait(PIPE_MTE3, PIPE_V, EVENT_ID1);
+
+    asc_sync_notify(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    asc_sync_wait(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    asc_copy_ub2gm_align((__gm__ uint8_t*)(final_state + state_off), (__ubuf__ uint8_t*)state_ub,
+                         (uint32_t)Dk, (uint32_t)(dv_cur * 4),
+                         asc_store_l2_cache_mode::NORMAL_FIRST_VICTIM,
+                         (uint64_t)(Dv * 4), (uint32_t)(64 * 4));
+    asc_sync_notify(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    asc_sync_wait(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    asc_sync_notify(PIPE_MTE3, PIPE_V, EVENT_ID0);
+    asc_sync_wait(PIPE_MTE3, PIPE_V, EVENT_ID0);
+  }
+  asc_sync();
+}
+
+extern "C" __global__ __aicore__ __vector__ void kda_dv64_ub_f16(
+    __gm__ half* q, __gm__ half* k, __gm__ half* v, __gm__ float* g, __gm__ float* beta, __gm__ float* init_state,
+    __gm__ half* y, __gm__ float* final_state,
+    int32_t B, int32_t T_len, int32_t H, int32_t Dk, int32_t Dv, int32_t use_l2norm, float scale_val) {
+  kda_dv64_ub_impl<half>(q, k, v, g, beta, init_state, y, final_state, B, T_len, H, Dk, Dv, use_l2norm, scale_val);
+}
+extern "C" __global__ __aicore__ __vector__ void kda_dv64_ub_bf16(
+    __gm__ bfloat16_t* q, __gm__ bfloat16_t* k, __gm__ bfloat16_t* v, __gm__ float* g, __gm__ float* beta, __gm__ float* init_state,
+    __gm__ bfloat16_t* y, __gm__ float* final_state,
+    int32_t B, int32_t T_len, int32_t H, int32_t Dk, int32_t Dv, int32_t use_l2norm, float scale_val) {
+  kda_dv64_ub_impl<bfloat16_t>(q, k, v, g, beta, init_state, y, final_state, B, T_len, H, Dk, Dv, use_l2norm, scale_val);
+}
+extern "C" __global__ __aicore__ __vector__ void kda_dv64_ub_f32(
+    __gm__ float* q, __gm__ float* k, __gm__ float* v, __gm__ float* g, __gm__ float* beta, __gm__ float* init_state,
+    __gm__ float* y, __gm__ float* final_state,
+    int32_t B, int32_t T_len, int32_t H, int32_t Dk, int32_t Dv, int32_t use_l2norm, float scale_val) {
+  kda_dv64_ub_impl<float>(q, k, v, g, beta, init_state, y, final_state, B, T_len, H, Dk, Dv, use_l2norm, scale_val);
+}
+
 extern "C" void launch_kda(
     void* stream,
     void* q, void* k, void* v, void* g, void* beta, void* init_state,
@@ -1882,6 +2186,28 @@ extern "C" void launch_kda(
     int32_t B, int32_t T_len, int32_t H, int32_t Dk, int32_t Dv,
     int32_t use_l2norm, float scale_val, int32_t dtype_code) {
   int32_t dv_tiles = (Dv + 63) / 64;
+  if (Dk > 128 || Dv > 128 || (int64_t)Dk * Dv * 4 > 192 * 1024 || (Dk <= 16 && T_len > 64)) {
+    int32_t tasks = B * H * dv_tiles;
+    uint32_t grid = (uint32_t)(tasks < 56 ? tasks : 56);
+    if (dtype_code == 0) {
+      kda_dv64_ub_f16<<<grid, nullptr, stream>>>(
+          (__gm__ half*)q, (__gm__ half*)k, (__gm__ half*)v, (__gm__ float*)g, (__gm__ float*)beta,
+          (__gm__ float*)init_state, (__gm__ half*)y, (__gm__ float*)final_state,
+          B, T_len, H, Dk, Dv, use_l2norm, scale_val);
+    } else if (dtype_code == 1) {
+      kda_dv64_ub_bf16<<<grid, nullptr, stream>>>(
+          (__gm__ bfloat16_t*)q, (__gm__ bfloat16_t*)k, (__gm__ bfloat16_t*)v, (__gm__ float*)g, (__gm__ float*)beta,
+          (__gm__ float*)init_state, (__gm__ bfloat16_t*)y, (__gm__ float*)final_state,
+          B, T_len, H, Dk, Dv, use_l2norm, scale_val);
+    } else {
+      kda_dv64_ub_f32<<<grid, nullptr, stream>>>(
+          (__gm__ float*)q, (__gm__ float*)k, (__gm__ float*)v, (__gm__ float*)g, (__gm__ float*)beta,
+          (__gm__ float*)init_state, (__gm__ float*)y, (__gm__ float*)final_state,
+          B, T_len, H, Dk, Dv, use_l2norm, scale_val);
+    }
+    return;
+  }
+
   if (T_len <= 4 || (Dk <= 16) || (Dk <= 32 && T_len <= 32)) {
     int32_t tasks = B * H * dv_tiles;
     uint32_t grid = (uint32_t)(tasks < 56 ? tasks : 56);
@@ -2059,7 +2385,14 @@ def _run_track_b(
     elem_sz = 2 if qc.dtype in (torch.float16, torch.bfloat16) else 4
     dcode = {torch.float16: 0, torch.bfloat16: 1, torch.float32: 2}[qc.dtype]
 
-    if T_len <= 4 or Dk <= 16 or (Dk <= 32 and T_len <= 32):
+    if (
+        T_len <= 4
+        or Dk <= 16
+        or (Dk <= 32 and T_len <= 32)
+        or Dk > 128
+        or Dv > 128
+        or Dk * Dv * 4 > 192 * 1024
+    ):
         ws_ptrs = (0, 0, 0, 0, 0, 0)
     else:
         dk_pad = ((Dk + 63) // 64) * 64
@@ -2155,7 +2488,7 @@ def kimi_delta_attention(
             out[:, tok] = torch.sum(state * qf[:, tok].unsqueeze(-1), dim=-2)
         return out.to(q.dtype), state
 
-    if schedule_mode == "tuned" and dk <= 128 and v.shape[-1] <= 128:
+    if schedule_mode == "tuned" and dk <= 256 and v.shape[-1] <= 512:
         res = _run_track_b(q, k, v, g, beta, initial_state, use_qk_l2norm, eff_scale)
         if res is not None:
             return res
