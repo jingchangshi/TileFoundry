@@ -70,6 +70,85 @@ def _ascend_target_ctx():
     return contextlib.nullcontext()
 
 
+def _compute_mla_l1_half_bank_plan(
+    *,
+    bm: int,
+    bn: int,
+    d_nope: int,
+    d_rope: int,
+    d0: int,
+    d1: int,
+    d1_alloc: int,
+    num_stages: int,
+    schedule_mode: str,
+) -> tuple[bool, int, int, int, int, int, int, int, int, int, int, int]:
+    """Compute Half-Bank L1 (2x256 KiB) addresses isolating Q/P from K/V."""
+    if schedule_mode != "tuned":
+        return (False, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0)
+    l1_half = 262144
+    elem_bytes = 2
+    q_nope_bytes = bm * d_nope * elem_bytes
+    q_rope_bytes = bm * d_rope * elem_bytes
+    p_bytes = bm * bn * elem_bytes
+    bank0_end = q_nope_bytes + q_rope_bytes + p_bytes
+
+    k_nope_slot = bn * d_nope * elem_bytes
+    k_rope_slot = bn * d_rope * elem_bytes
+    v0_slot = d0 * bn * elem_bytes
+    v1_slot = d1_alloc * bn * elem_bytes if d1 > 0 else 0
+
+    candidates = (
+        ((2, 2, 2, 1), (2, 2, 1, 1), (1, 1, 1, 1))
+        if num_stages >= 2
+        else ((1, 1, 1, 1),)
+    )
+    for kn_v, kr_v, v0_v, v1_v in candidates:
+        bank1_need = (
+            kn_v * k_nope_slot
+            + kr_v * k_rope_slot
+            + v0_v * v0_slot
+            + (v1_v * v1_slot if d1 > 0 else 0)
+        )
+        if bank0_end <= l1_half and bank1_need <= l1_half:
+            addr_qn = 0
+            addr_qr = q_nope_bytes
+            addr_p = q_nope_bytes + q_rope_bytes
+            addr_kn = l1_half
+            addr_kr = addr_kn + kn_v * k_nope_slot
+            addr_v0 = addr_kr + kr_v * k_rope_slot
+            addr_v1 = addr_v0 + v0_v * v0_slot
+            return (
+                True,
+                kn_v,
+                kr_v,
+                v0_v,
+                v1_v,
+                addr_qn,
+                addr_qr,
+                addr_p,
+                addr_kn,
+                addr_kr,
+                addr_v0,
+                addr_v1,
+            )
+    return (False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+
+def _resolve_mla_tile_params(
+    bm: int,
+    bn: int,
+    num_stages: int,
+    schedule_mode: str,
+) -> tuple[int, int]:
+    if bn != 64:
+        raise ValueError(f"MLA unsupported bn={bn}")
+    if int(num_stages) > 0:
+        eff_stages = 2 if (int(num_stages) >= 2 and schedule_mode == "tuned") else 1
+    else:
+        eff_stages = 2 if schedule_mode == "tuned" else 1
+    return bn, eff_stages
+
+
 def _build_mla_prim_func(
     n_q: int,
     n_kv: int,
@@ -81,13 +160,16 @@ def _build_mla_prim_func(
     bm: int,
     aligned_group_q: bool,
     schedule_mode: str,
+    bn: int = 64,
+    num_stages: int = 0,
+    **_extra_kwargs,
 ):
     if d_nope % 64 != 0 or d_rope % 64 != 0:
         raise ValueError(f"MLA requires d_nope ({d_nope}) and d_rope ({d_rope}) divisible by 64")
     if bm not in (32, 64, 128):
         raise ValueError(f"MLA unsupported bm={bm}")
     rows_per_sid = bm // 2
-    bn = 64
+    bn, num_stages = _resolve_mla_tile_params(bm, int(bn), int(num_stages), schedule_mode)
     d0 = min(d_nope, 256)
     d1 = d_nope - d0
     d1_alloc = max(d1, 64)
@@ -98,8 +180,7 @@ def _build_mla_prim_func(
     d_rope_chunks = d_rope // 64
     num_cores = 28
 
-    num_stages = 2 if schedule_mode == "tuned" else 1
-    pipe_ann = {"enable_offset": True} if schedule_mode == "tuned" else None
+    pipe_ann = {"enable_offset": True} if (num_stages >= 2 and schedule_mode == "tuned") else None
 
     b_dim = T.dynamic("b_dim")
     q_rows_sym = T.dynamic("q_rows")
@@ -290,6 +371,16 @@ def _build_mla_prim_func(
                             O_ub[r, off], o_new, mask=m32, dist="NORM_B32"
                         )
 
+    (
+        use_l1_iso, kn_v, kr_v, v0_v, v1_v,
+        addr_qn, addr_qr, addr_p, addr_kn, addr_kr, addr_v0, addr_v1,
+    ) = _compute_mla_l1_half_bank_plan(
+        bm=bm, bn=bn, d_nope=d_nope, d_rope=d_rope,
+        d0=d0, d1=d1, d1_alloc=d1_alloc, num_stages=num_stages,
+        schedule_mode=schedule_mode,
+    )
+    func_attrs = {"half_l1": True, "l1_half_bank_split": True} if use_l1_iso else {}
+
     @T.prim_func
     def main(
         Q_nope: T.Tensor(q_nope_shape, tl_dtype),
@@ -300,6 +391,7 @@ def _build_mla_prim_func(
         Out: T.Tensor(q_nope_shape, tl_dtype),
         scale_val: T.float32,
     ):
+        T.func_attr(func_attrs)
         with T.MixedKernel(num_cores, sids=2) as (bx, sid):
             q_nope_l1 = T.alloc_l1((bm, d_nope), tl_dtype)
             q_rope_l1 = T.alloc_l1((bm, d_rope), tl_dtype)
@@ -325,7 +417,7 @@ def _build_mla_prim_func(
                 else T.alloc_shared((rows_per_sid, d1_alloc), "float32")
             )
             O_ub = T.alloc_shared((rows_per_sid, d_nope), "float32")
-            out_tile_rows = 8 if (bm == 128 and rows_per_sid % 8 == 0) else rows_per_sid
+            out_tile_rows = 8 if (eff_aligned_group_q and bm == 128 and rows_per_sid % 8 == 0) else rows_per_sid
             out_ub = T.alloc_shared((out_tile_rows, d_nope), tl_dtype)
             m_ub = T.alloc_shared((rows_per_sid, 8), "float32")
             l_ub = T.alloc_shared((rows_per_sid, 8), "float32")
@@ -352,7 +444,11 @@ def _build_mla_prim_func(
             if d1 > 0 and d1 != d0:
                 pinned[o1_l0c] = 1
                 pinned[O_tmp1_ub] = 1
-            if schedule_mode != "tuned":
+            if use_l1_iso:
+                pinned.update({k_nope_l1: kn_v, k_rope_l1: kr_v, v0_l1: v0_v})
+                if d1 > 0:
+                    pinned[v1_l1] = v1_v
+            elif schedule_mode != "tuned":
                 pinned.update(
                     {
                         k_nope_l1: 1,
@@ -362,6 +458,18 @@ def _build_mla_prim_func(
                     }
                 )
             T.annotate_buffer_versions(pinned)
+            if use_l1_iso:
+                l1_addrs = {
+                    q_nope_l1: addr_qn,
+                    q_rope_l1: addr_qr,
+                    p_l1: addr_p,
+                    k_nope_l1: addr_kn,
+                    k_rope_l1: addr_kr,
+                    v0_l1: addr_v0,
+                }
+                if d1 > 0:
+                    l1_addrs[v1_l1] = addr_v1
+                T.annotate_buffer_addresses(l1_addrs)
             if bm == 128:
                 T.annotate_unlimit_memory("shared")
 
@@ -625,6 +733,8 @@ def _build_mla_split_kv_decode_func(
     aligned_group_q: bool = True,
     num_kv_splits: int = 1,
     schedule_mode: str = "tuned",
+    bn: int = 64,
+    num_stages: int = 0,
     **_extra_kwargs,
 ):
     splits = max(1, int(num_kv_splits))
@@ -635,7 +745,7 @@ def _build_mla_split_kv_decode_func(
     if bm not in (32, 64, 128):
         raise ValueError(f"MLA unsupported bm={bm}")
     rows_per_sid = bm // 2
-    bn = 64
+    bn, num_stages = _resolve_mla_tile_params(bm, int(bn), int(num_stages), schedule_mode)
     d0 = min(d_nope, 256)
     d1 = d_nope - d0
     d1_alloc = max(d1, 64)
@@ -646,8 +756,16 @@ def _build_mla_split_kv_decode_func(
     d_rope_chunks = d_rope // 64
     num_cores = 28
 
-    num_stages = 2 if schedule_mode == "tuned" else 1
-    pipe_ann = {"enable_offset": True} if schedule_mode == "tuned" else None
+    pipe_ann = {"enable_offset": True} if (num_stages >= 2 and schedule_mode == "tuned") else None
+    (
+        use_l1_iso, kn_v, kr_v, v0_v, v1_v,
+        addr_qn, addr_qr, addr_p, addr_kn, addr_kr, addr_v0, addr_v1,
+    ) = _compute_mla_l1_half_bank_plan(
+        bm=bm, bn=bn, d_nope=d_nope, d_rope=d_rope,
+        d0=d0, d1=d1, d1_alloc=d1_alloc, num_stages=num_stages,
+        schedule_mode=schedule_mode,
+    )
+    func_attrs = {"half_l1": True, "l1_half_bank_split": True} if use_l1_iso else {}
 
     b_dim = T.dynamic("b_dim")
     q_total_rows = T.dynamic("q_total_rows")
@@ -889,6 +1007,7 @@ def _build_mla_split_kv_decode_func(
             Out: T.Tensor(q_nope_shape, tl_dtype),
             scale_val: T.float32,
         ):
+            T.func_attr(func_attrs)
             with T.MixedKernel(num_cores, sids=2) as (bx, sid):
                 q_nope_l1 = T.alloc_l1((bm, d_nope), tl_dtype)
                 q_rope_l1 = T.alloc_l1((bm, d_rope), tl_dtype)
@@ -919,7 +1038,7 @@ def _build_mla_split_kv_decode_func(
                 )
                 O_ub = T.alloc_shared((rows_per_sid, d_nope), "float32")
                 out_tile_rows = (
-                    8 if (bm == 128 and rows_per_sid % 8 == 0) else rows_per_sid
+                    8 if (eff_aligned_group_q and bm == 128 and rows_per_sid % 8 == 0) else rows_per_sid
                 )
                 out_ub = T.alloc_shared((out_tile_rows, d_nope), tl_dtype)
                 m_ub = T.alloc_shared((rows_per_sid, 8), "float32")
@@ -947,7 +1066,11 @@ def _build_mla_split_kv_decode_func(
                 if d1 > 0 and d1 != d0:
                     pinned[o1_l0c] = 1
                     pinned[O_tmp1_ub] = 1
-                if schedule_mode != "tuned":
+                if use_l1_iso:
+                    pinned.update({k_nope_l1: kn_v, k_rope_l1: kr_v, v0_l1: v0_v})
+                    if d1 > 0:
+                        pinned[v1_l1] = v1_v
+                elif schedule_mode != "tuned":
                     pinned.update(
                         {
                             k_nope_l1: 1,
@@ -957,6 +1080,18 @@ def _build_mla_split_kv_decode_func(
                         }
                     )
                 T.annotate_buffer_versions(pinned)
+                if use_l1_iso:
+                    l1_addrs = {
+                        q_nope_l1: addr_qn,
+                        q_rope_l1: addr_qr,
+                        p_l1: addr_p,
+                        k_nope_l1: addr_kn,
+                        k_rope_l1: addr_kr,
+                        v0_l1: addr_v0,
+                    }
+                    if d1 > 0:
+                        l1_addrs[v1_l1] = addr_v1
+                    T.annotate_buffer_addresses(l1_addrs)
                 if bm == 128:
                     T.annotate_unlimit_memory("shared")
 
@@ -1429,6 +1564,7 @@ def _build_mla_split_kv_decode_func(
         lse_partial: T.Tensor((splits, q_total_rows), "float32"),
         scale_val: T.float32,
     ):
+        T.func_attr(func_attrs)
         with T.MixedKernel(num_cores, sids=2) as (bx, sid):
             q_nope_l1 = T.alloc_l1((bm, d_nope), tl_dtype)
             q_rope_l1 = T.alloc_l1((bm, d_rope), tl_dtype)
@@ -1488,7 +1624,11 @@ def _build_mla_split_kv_decode_func(
             if d1 > 0 and d1 != d0:
                 pinned[o1_l0c] = 1
                 pinned[O_tmp1_ub] = 1
-            if schedule_mode != "tuned":
+            if use_l1_iso:
+                pinned.update({k_nope_l1: kn_v, k_rope_l1: kr_v, v0_l1: v0_v})
+                if d1 > 0:
+                    pinned[v1_l1] = v1_v
+            elif schedule_mode != "tuned":
                 pinned.update(
                     {
                         k_nope_l1: 1,
@@ -1498,6 +1638,18 @@ def _build_mla_split_kv_decode_func(
                     }
                 )
             T.annotate_buffer_versions(pinned)
+            if use_l1_iso:
+                l1_addrs = {
+                    q_nope_l1: addr_qn,
+                    q_rope_l1: addr_qr,
+                    p_l1: addr_p,
+                    k_nope_l1: addr_kn,
+                    k_rope_l1: addr_kr,
+                    v0_l1: addr_v0,
+                }
+                if d1 > 0:
+                    l1_addrs[v1_l1] = addr_v1
+                T.annotate_buffer_addresses(l1_addrs)
             if bm == 128:
                 T.annotate_unlimit_memory("shared")
 
@@ -1849,6 +2001,44 @@ def _mla_default_flags(schedule_mode: str) -> list[str]:
     return list(PURE_SIMDVF_UBUF_FLAGS) if schedule_mode == "tuned" else []
 
 
+def _select_mla_common_overrides(
+    *,
+    b_dim: int,
+    s_dim: int,
+    n_q: int,
+    n_kv: int,
+    d_nope: int,
+    d_rope: int,
+    input_layout: str,
+    schedule_mode: str,
+    bm_override: int,
+    bn_override: int,
+    num_stages_override: int,
+) -> tuple[int, int, int, bool, bool]:
+    """Resolve common MLA tile knobs and Half-Bank L1 isolation flags."""
+    q_rows = s_dim * (n_q // n_kv)
+    bm, aligned_group_q = _choose_mla_bm(
+        b_dim, n_kv, q_rows, d_nope, input_layout, schedule_mode
+    )
+    if int(bm_override) > 0:
+        bm = int(bm_override)
+        aligned_group_q = (input_layout == "BNSD" or n_kv == 1) and (q_rows % bm) == 0
+    bn = 64
+    if int(bn_override) > 0:
+        bn = 128 if int(bn_override) >= 128 else 64
+    if int(num_stages_override) > 0:
+        num_stages = 2 if (int(num_stages_override) >= 2 and schedule_mode == "tuned") else 1
+    else:
+        num_stages = 2 if schedule_mode == "tuned" else 1
+    elem_bytes = 2
+    bank0_bytes = bm * (d_nope + d_rope + bn) * elem_bytes
+    d0 = min(d_nope, 256)
+    d1 = max(0, d_nope - d0)
+    bank1_bytes = (2 * bn * (d_nope + d_rope) + bn * d0 + (bn * d1)) * elem_bytes
+    l1_half_bank_split = schedule_mode == "tuned" and bank0_bytes <= 262144 and bank1_bytes <= 262144
+    return bm, bn, num_stages, aligned_group_q, l1_half_bank_split
+
+
 def _select_mla_decode_config(
     b_dim: int = 1,
     s_dim: int = 1,
@@ -1861,27 +2051,45 @@ def _select_mla_decode_config(
     input_layout: str = "BSND",
     is_causal: bool = False,
     schedule_mode: str = "tuned",
+    bm_override: int = 0,
+    bn_override: int = 0,
+    num_stages_override: int = 0,
 ) -> dict[str, object]:
-    _ = (d_rope, tl_dtype, is_causal)
+    _ = (tl_dtype, is_causal)
     q_rows = s_dim * (n_q // n_kv)
-    bm, aligned_group_q = _choose_mla_bm(
-        b_dim, n_kv, q_rows, d_nope, input_layout, schedule_mode
+    bm, bn, num_stages, aligned_group_q, l1_half_bank_split = _select_mla_common_overrides(
+        b_dim=b_dim,
+        s_dim=s_dim,
+        n_q=n_q,
+        n_kv=n_kv,
+        d_nope=d_nope,
+        d_rope=d_rope,
+        input_layout=input_layout,
+        schedule_mode=schedule_mode,
+        bm_override=bm_override,
+        bn_override=bn_override,
+        num_stages_override=num_stages_override,
     )
     splits = 1
     if schedule_mode == "tuned" and s_kv >= 1024 and q_rows >= 64 and (q_rows % 64) == 0:
         m_tiles = b_dim * n_kv * ((q_rows + bm - 1) // bm)
         if m_tiles < 14:
-            if q_rows >= 64:
+            if int(bm_override) <= 0 and q_rows >= 64:
                 bm = 64
                 aligned_group_q = input_layout == "BNSD" or n_kv == 1
                 m_tiles = b_dim * n_kv * ((q_rows + 63) // 64)
-            kv_blocks = max(1, s_kv // 64)
+            kv_blocks = max(1, s_kv // bn)
             target_splits = (28 + m_tiles - 1) // m_tiles
             splits = max(1, min(14, min(kv_blocks, target_splits)))
     return {
         "bm": bm,
+        "bn": bn,
+        "num_stages": num_stages,
         "aligned_group_q": aligned_group_q,
         "num_kv_splits": splits,
+        "l1_half_bank_split": l1_half_bank_split,
+        "l1_nope_bank_stride_bytes": bm * d_nope * 2,
+        "l1_rope_bank_offset_bytes": 262144 + 2 * bn * d_nope * 2,
         "pass_configs": {},
         "compile_flags": _mla_default_flags(schedule_mode),
     }
@@ -1899,16 +2107,33 @@ def _select_mla_bnsd_config(
     input_layout: str = "BNSD",
     is_causal: bool = True,
     schedule_mode: str = "tuned",
+    bm_override: int = 0,
+    bn_override: int = 0,
+    num_stages_override: int = 0,
 ) -> dict[str, object]:
-    _ = (s_kv, d_rope, tl_dtype, is_causal)
-    q_rows = s_dim * (n_q // n_kv)
-    bm, aligned_group_q = _choose_mla_bm(
-        b_dim, n_kv, q_rows, d_nope, input_layout, schedule_mode
+    _ = (s_kv, tl_dtype, is_causal)
+    bm, bn, num_stages, aligned_group_q, l1_half_bank_split = _select_mla_common_overrides(
+        b_dim=b_dim,
+        s_dim=s_dim,
+        n_q=n_q,
+        n_kv=n_kv,
+        d_nope=d_nope,
+        d_rope=d_rope,
+        input_layout=input_layout,
+        schedule_mode=schedule_mode,
+        bm_override=bm_override,
+        bn_override=bn_override,
+        num_stages_override=num_stages_override,
     )
     return {
         "bm": bm,
+        "bn": bn,
+        "num_stages": num_stages,
         "aligned_group_q": aligned_group_q,
         "num_kv_splits": 1,
+        "l1_half_bank_split": l1_half_bank_split,
+        "l1_nope_bank_stride_bytes": bm * d_nope * 2,
+        "l1_rope_bank_offset_bytes": 262144 + 2 * bn * d_nope * 2,
         "pass_configs": {},
         "compile_flags": _mla_default_flags(schedule_mode),
     }
@@ -1925,6 +2150,8 @@ def _build_mla_bnsd_gather_func(
     bm: int = 64,
     aligned_group_q: bool = False,
     schedule_mode: str = "tuned",
+    bn: int = 64,
+    num_stages: int = 0,
     **_extra_kwargs,
 ):
     if input_layout != "BNSD":
@@ -1938,7 +2165,7 @@ def _build_mla_bnsd_gather_func(
     if bm not in (32, 64, 128):
         raise ValueError(f"MLA unsupported bm={bm}")
     rows_per_sid = bm // 2
-    bn = 64
+    bn, num_stages = _resolve_mla_tile_params(bm, int(bn), int(num_stages), schedule_mode)
     d0 = min(d_nope, 256)
     d1 = d_nope - d0
     d1_alloc = max(d1, 64)
@@ -1949,8 +2176,16 @@ def _build_mla_bnsd_gather_func(
     d_rope_chunks = d_rope // 64
     num_cores = 28
 
-    num_stages = 2 if schedule_mode == "tuned" else 1
-    pipe_ann = {"enable_offset": True} if schedule_mode == "tuned" else None
+    pipe_ann = {"enable_offset": True} if (num_stages >= 2 and schedule_mode == "tuned") else None
+    (
+        use_l1_iso, kn_v, kr_v, v0_v, v1_v,
+        addr_qn, addr_qr, addr_p, addr_kn, addr_kr, addr_v0, addr_v1,
+    ) = _compute_mla_l1_half_bank_plan(
+        bm=bm, bn=bn, d_nope=d_nope, d_rope=d_rope,
+        d0=d0, d1=d1, d1_alloc=d1_alloc, num_stages=num_stages,
+        schedule_mode=schedule_mode,
+    )
+    func_attrs = {"half_l1": True, "l1_half_bank_split": True} if use_l1_iso else {}
 
     b_dim = T.dynamic("b_dim")
     q_rows_sym = T.dynamic("q_rows")
@@ -2128,6 +2363,7 @@ def _build_mla_bnsd_gather_func(
         Out: T.Tensor(q_nope_shape, tl_dtype),
         scale_val: T.float32,
     ):
+        T.func_attr(func_attrs)
         with T.MixedKernel(num_cores, sids=2) as (bx, sid):
             q_nope_l1 = T.alloc_l1((bm, d_nope), tl_dtype)
             q_rope_l1 = T.alloc_l1((bm, d_rope), tl_dtype)
@@ -2158,7 +2394,7 @@ def _build_mla_bnsd_gather_func(
             )
             O_ub = T.alloc_shared((rows_per_sid, d_nope), "float32")
             out_tile_rows = (
-                8 if (bm == 128 and rows_per_sid % 8 == 0) else rows_per_sid
+                8 if (aligned_group_q and bm == 128 and rows_per_sid % 8 == 0) else rows_per_sid
             )
             out_ub = T.alloc_shared((out_tile_rows, d_nope), tl_dtype)
             m_ub = T.alloc_shared((rows_per_sid, 8), "float32")
@@ -2186,7 +2422,11 @@ def _build_mla_bnsd_gather_func(
             if d1 > 0 and d1 != d0:
                 pinned[o1_l0c] = 1
                 pinned[O_tmp1_ub] = 1
-            if schedule_mode != "tuned":
+            if use_l1_iso:
+                pinned.update({k_nope_l1: kn_v, k_rope_l1: kr_v, v0_l1: v0_v})
+                if d1 > 0:
+                    pinned[v1_l1] = v1_v
+            elif schedule_mode != "tuned":
                 pinned.update(
                     {
                         k_nope_l1: 1,
@@ -2196,6 +2436,18 @@ def _build_mla_bnsd_gather_func(
                     }
                 )
             T.annotate_buffer_versions(pinned)
+            if use_l1_iso:
+                l1_addrs = {
+                    q_nope_l1: addr_qn,
+                    q_rope_l1: addr_qr,
+                    p_l1: addr_p,
+                    k_nope_l1: addr_kn,
+                    k_rope_l1: addr_kr,
+                    v0_l1: addr_v0,
+                }
+                if d1 > 0:
+                    l1_addrs[v1_l1] = addr_v1
+                T.annotate_buffer_addresses(l1_addrs)
             if bm == 128:
                 T.annotate_unlimit_memory("shared")
 
@@ -2432,16 +2684,33 @@ def _select_mla_prefill_config(
     input_layout: str = "BSND",
     is_causal: bool = True,
     schedule_mode: str = "tuned",
+    bm_override: int = 0,
+    bn_override: int = 0,
+    num_stages_override: int = 0,
 ) -> dict[str, object]:
-    _ = (s_kv, d_rope, tl_dtype, is_causal)
-    q_rows = s_dim * (n_q // n_kv)
-    bm, aligned_group_q = _choose_mla_bm(
-        b_dim, n_kv, q_rows, d_nope, input_layout, schedule_mode
+    _ = (s_kv, tl_dtype, is_causal)
+    bm, bn, num_stages, aligned_group_q, l1_half_bank_split = _select_mla_common_overrides(
+        b_dim=b_dim,
+        s_dim=s_dim,
+        n_q=n_q,
+        n_kv=n_kv,
+        d_nope=d_nope,
+        d_rope=d_rope,
+        input_layout=input_layout,
+        schedule_mode=schedule_mode,
+        bm_override=bm_override,
+        bn_override=bn_override,
+        num_stages_override=num_stages_override,
     )
     return {
         "bm": bm,
+        "bn": bn,
+        "num_stages": num_stages,
         "aligned_group_q": aligned_group_q,
         "num_kv_splits": 1,
+        "l1_half_bank_split": l1_half_bank_split,
+        "l1_nope_bank_stride_bytes": bm * d_nope * 2,
+        "l1_rope_bank_offset_bytes": 262144 + 2 * bn * d_nope * 2,
         "pass_configs": {},
         "compile_flags": _mla_default_flags(schedule_mode),
     }
@@ -2458,6 +2727,8 @@ def _build_mla_prefill_func(
     bm: int = 128,
     aligned_group_q: bool = True,
     schedule_mode: str = "tuned",
+    bn: int = 64,
+    num_stages: int = 0,
     **_extra_kwargs,
 ):
     if input_layout != "BSND":
@@ -2471,7 +2742,7 @@ def _build_mla_prefill_func(
     if bm not in (32, 64, 128):
         raise ValueError(f"MLA unsupported bm={bm}")
     rows_per_sid = bm // 2
-    bn = 64
+    bn, num_stages = _resolve_mla_tile_params(bm, int(bn), int(num_stages), schedule_mode)
     d0 = min(d_nope, 256)
     d1 = d_nope - d0
     d1_alloc = max(d1, 64)
@@ -2482,8 +2753,16 @@ def _build_mla_prefill_func(
     d_rope_chunks = d_rope // 64
     num_cores = 28
 
-    num_stages = 2 if schedule_mode == "tuned" else 1
-    pipe_ann = {"enable_offset": True} if schedule_mode == "tuned" else None
+    pipe_ann = {"enable_offset": True} if (num_stages >= 2 and schedule_mode == "tuned") else None
+    (
+        use_l1_iso, kn_v, kr_v, v0_v, v1_v,
+        addr_qn, addr_qr, addr_p, addr_kn, addr_kr, addr_v0, addr_v1,
+    ) = _compute_mla_l1_half_bank_plan(
+        bm=bm, bn=bn, d_nope=d_nope, d_rope=d_rope,
+        d0=d0, d1=d1, d1_alloc=d1_alloc, num_stages=num_stages,
+        schedule_mode=schedule_mode,
+    )
+    func_attrs = {"half_l1": True, "l1_half_bank_split": True} if use_l1_iso else {}
 
     b_dim = T.dynamic("b_dim")
     q_rows_sym = T.dynamic("q_rows")
@@ -2672,6 +2951,7 @@ def _build_mla_prefill_func(
         Out: T.Tensor(q_nope_shape, tl_dtype),
         scale_val: T.float32,
     ):
+        T.func_attr(func_attrs)
         with T.MixedKernel(num_cores, sids=2) as (bx, sid):
             q_nope_l1 = T.alloc_l1((bm, d_nope), tl_dtype)
             q_rope_l1 = T.alloc_l1((bm, d_rope), tl_dtype)
@@ -2702,7 +2982,7 @@ def _build_mla_prefill_func(
             )
             O_ub = T.alloc_shared((rows_per_sid, d_nope), "float32")
             out_tile_rows = (
-                8 if (bm == 128 and rows_per_sid % 8 == 0) else rows_per_sid
+                8 if (eff_aligned_group_q and bm == 128 and rows_per_sid % 8 == 0) else rows_per_sid
             )
             out_ub = T.alloc_shared((out_tile_rows, d_nope), tl_dtype)
             m_ub = T.alloc_shared((rows_per_sid, 8), "float32")
@@ -2730,7 +3010,11 @@ def _build_mla_prefill_func(
             if d1 > 0 and d1 != d0:
                 pinned[o1_l0c] = 1
                 pinned[O_tmp1_ub] = 1
-            if schedule_mode != "tuned":
+            if use_l1_iso:
+                pinned.update({k_nope_l1: kn_v, k_rope_l1: kr_v, v0_l1: v0_v})
+                if d1 > 0:
+                    pinned[v1_l1] = v1_v
+            elif schedule_mode != "tuned":
                 pinned.update(
                     {
                         k_nope_l1: 1,
@@ -2740,6 +3024,18 @@ def _build_mla_prefill_func(
                     }
                 )
             T.annotate_buffer_versions(pinned)
+            if use_l1_iso:
+                l1_addrs = {
+                    q_nope_l1: addr_qn,
+                    q_rope_l1: addr_qr,
+                    p_l1: addr_p,
+                    k_nope_l1: addr_kn,
+                    k_rope_l1: addr_kr,
+                    v0_l1: addr_v0,
+                }
+                if d1 > 0:
+                    l1_addrs[v1_l1] = addr_v1
+                T.annotate_buffer_addresses(l1_addrs)
             if bm == 128:
                 T.annotate_unlimit_memory("shared")
 
@@ -3187,11 +3483,19 @@ __global__ __mix__(1, 2) void mla_kv_reuse_c1c1c2(
   constexpr int K_NOPE_STAGE = BN * D_NOPE;
   constexpr int K_ROPE_STAGE = BN * D_ROPE;
 
+  constexpr int L1_HALF_BANK_BYTES = 262144;
+  constexpr int Q_P_END_BYTES = (Q_NOPE_ELEMS + Q_ROPE_ELEMS + 2 * P_ELEMS) * 2;
+  constexpr int K_NOPE_STAGE_BYTES = K_NOPE_STAGE * 2;
+  constexpr int l1_half_bank_split = (Q_P_END_BYTES + K_NOPE_STAGE_BYTES <= L1_HALF_BANK_BYTES) ? 1 : 0;
+  constexpr int K_NOPE_BASE_BYTES = (Q_P_END_BYTES + K_NOPE_STAGE_BYTES <= L1_HALF_BANK_BYTES)
+      ? (L1_HALF_BANK_BYTES - K_NOPE_STAGE_BYTES)
+      : Q_P_END_BYTES;
+
   __cbuf__ InT* q_nope_l1 = (__cbuf__ InT*)0;
   __cbuf__ InT* q_rope_l1 = (__cbuf__ InT*)(Q_NOPE_ELEMS * 2);
   __cbuf__ InT* p_l1_base = (__cbuf__ InT*)((Q_NOPE_ELEMS + Q_ROPE_ELEMS) * 2);
-  __cbuf__ InT* k_nope_l1_base = (__cbuf__ InT*)((Q_NOPE_ELEMS + Q_ROPE_ELEMS + 2 * P_ELEMS) * 2);
-  __cbuf__ InT* k_rope_l1_base = (__cbuf__ InT*)((Q_NOPE_ELEMS + Q_ROPE_ELEMS + 2 * P_ELEMS + 2 * K_NOPE_STAGE) * 2);
+  __cbuf__ InT* k_nope_l1_base = (__cbuf__ InT*)(K_NOPE_BASE_BYTES);
+  __cbuf__ InT* k_rope_l1_base = (__cbuf__ InT*)(K_NOPE_BASE_BYTES + 2 * K_NOPE_STAGE_BYTES);
 
   __cc__ float* s_l0c = (__cc__ float*)0;
   __cc__ float* o_l0c = (__cc__ float*)(BM * BN * 4);
@@ -4084,6 +4388,8 @@ def mla(
         )
         _DISPATCH_CACHE[dispatch_key] = cfg
     bm = int(cfg["bm"])
+    bn = int(cfg.get("bn", 64))
+    num_stages = int(cfg.get("num_stages", 2 if schedule_mode == "tuned" else 1))
     aligned_group_q = bool(cfg["aligned_group_q"])
     num_kv_splits = (
         max(1, int(num_kv_splits_override))
@@ -4093,7 +4399,9 @@ def mla(
     pass_configs = dict(cfg.get("pass_configs") or {})
     compile_flags = tuple(str(f) for f in (cfg.get("compile_flags") or ()))
     raw_bk = cfg.get("builder_kwargs")
-    extra_builder_kwargs = dict(raw_bk) if isinstance(raw_bk, dict) else None
+    extra_builder_kwargs = dict(raw_bk) if isinstance(raw_bk, dict) else {}
+    extra_builder_kwargs.setdefault("bn", bn)
+    extra_builder_kwargs.setdefault("num_stages", num_stages)
     raw_ck = cfg.get("combine_kwargs")
     extra_combine_kwargs = dict(raw_ck) if isinstance(raw_ck, dict) else None
 
