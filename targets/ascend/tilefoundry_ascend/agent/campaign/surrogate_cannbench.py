@@ -6,6 +6,7 @@ import ast
 import asyncio
 import fcntl
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -2723,6 +2724,36 @@ def order_candidates_by_idle_preflight(
     )
 
 
+def _call_order_candidates_by_idle_preflight(
+    device_id: str,
+    device_pool: Sequence[str],
+    *,
+    excluded: Collection[str],
+    env_vals: Mapping[str, str] | None,
+) -> tuple[str, ...]:
+    """Forward env_vals to order_candidates_by_idle_preflight only when supported."""
+    if env_vals is not None:
+        try:
+            sig = inspect.signature(order_candidates_by_idle_preflight)
+            accepts_env = "env_vals" in sig.parameters or any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+        except (TypeError, ValueError):
+            accepts_env = False
+        if accepts_env:
+            return order_candidates_by_idle_preflight(
+                device_id,
+                device_pool,
+                excluded=excluded,
+                env_vals=env_vals,
+            )
+    return order_candidates_by_idle_preflight(
+        device_id,
+        device_pool,
+        excluded=excluded,
+    )
+
+
 def select_idle_campaign_device(
     device_id: str,
     device_pool: Sequence[str] = (),
@@ -2730,11 +2761,11 @@ def select_idle_campaign_device(
     env_vals: Mapping[str, str] | None = None,
 ) -> str:
     """Select the highest-priority idle or fallback device from the candidate pool."""
-    ordered = order_candidates_by_idle_preflight(
+    ordered = _call_order_candidates_by_idle_preflight(
         device_id,
         device_pool,
         excluded=excluded,
-        **({"env_vals": env_vals} if env_vals is not None else {}),
+        env_vals=env_vals,
     )
     return ordered[0] if ordered else str(device_id or "").strip()
 
@@ -3909,11 +3940,11 @@ def _submit_fast_gate(
     selected_card = ""
     execution: _V2GateExecution | None = None
     for pass_idx in range(max_pool_passes):
-        candidates = order_candidates_by_idle_preflight(
+        candidates = _call_order_candidates_by_idle_preflight(
             device_id,
             device_pool,
             excluded=rejected_cards,
-            **({"env_vals": env_vals} if env_vals is not None else {}),
+            env_vals=env_vals,
         )
         if not candidates:
             if not rejected_cards and str(device_id or "").strip():
@@ -4619,11 +4650,11 @@ def run_l3_full_contract_via_agent_gates(
         )
     else:
         rejected_cards: set[str] = set()
-        candidates = order_candidates_by_idle_preflight(
+        candidates = _call_order_candidates_by_idle_preflight(
             result_device,
             device_pool,
             excluded=rejected_cards,
-            **({"env_vals": env_vals} if env_vals is not None else {}),
+            env_vals=env_vals,
         )
         if not candidates:
             candidates = (result_device,)
