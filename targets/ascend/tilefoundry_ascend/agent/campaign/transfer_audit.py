@@ -215,18 +215,58 @@ def _build_rule_provenance(
     return provenance, distilled_ids
 
 
+def _build_rule_origin_timestamps(
+    distilled_rules: Mapping[str, Mapping[str, object]],
+    winning_edges: Sequence[Mapping[str, object]],
+) -> dict[str, float]:
+    """Resolve earliest positive origin timestamp per distilled rule id."""
+    origin_ts: dict[str, float] = {}
+
+    def _record_ts(rid: str, raw_ts: object) -> None:
+        ts_val = _coerce_float(raw_ts, 0.0)
+        if ts_val <= 0.0:
+            return
+        prev = origin_ts.get(rid)
+        if prev is None or ts_val < prev:
+            origin_ts[rid] = ts_val
+
+    for rid, rdict in distilled_rules.items():
+        _record_ts(rid, rdict.get("origin_timestamp"))
+        _record_ts(rid, rdict.get("timestamp"))
+
+    for edge in winning_edges:
+        raw_ts = edge.get("origin_timestamp") or edge.get("timestamp")
+        staged_ids = _extract_string_list(edge.get("staged_rule_ids"))
+        staged_ids.extend(_extract_string_list(edge.get("distilled_rule_ids")))
+        for s_rid in staged_ids:
+            _record_ts(s_rid, raw_ts)
+        edge_rid = str(edge.get("rule_id") or "").strip()
+        if edge_rid and (
+            edge_rid in distilled_rules
+            or str(edge.get("rule_origin") or "").strip().lower() == "distilled"
+        ):
+            _record_ts(edge_rid, raw_ts)
+    return origin_ts
+
+
 def _build_distilled_transfer_matrix(
     indexed_rule_events: Sequence[tuple[int, Mapping[str, object]]],
     provenance_by_rule: Mapping[str, tuple[str, str]],
     distilled_rule_ids: set[str],
+    origin_ts_by_rule: Mapping[str, float] | None = None,
 ) -> list[dict[str, object]]:
-    """Build directed source->target transfer metrics across funnel hits."""
+    """Build directed source->target transfer metrics across distilled-rule hits."""
     grouped: dict[tuple[str, str, str], list[tuple[int, Mapping[str, object]]]] = defaultdict(list)
     for idx, ev in indexed_rule_events:
         rid = str(ev.get("rule_id") or "").strip()
-        if not rid or rid not in provenance_by_rule:
+        if not rid or rid not in distilled_rule_ids or rid not in provenance_by_rule:
             continue
+        src_op, _src_quad = provenance_by_rule[rid]
         target_op = str(ev.get("operator") or "unknown").strip() or "unknown"
+        origin_ts = float((origin_ts_by_rule or {}).get(rid, 0.0) or 0.0)
+        ev_ts = _coerce_float(ev.get("timestamp"), 0.0)
+        if target_op == src_op and not (ev_ts > origin_ts):
+            continue
         raw_axes = ev.get("topology_axes")
         target_quad = format_topology_quadrant(
             raw_axes if isinstance(raw_axes, Mapping) else None
@@ -261,7 +301,7 @@ def _build_distilled_transfer_matrix(
                 "target_operator": target_op,
                 "target_quadrant": target_quad,
                 "rule_id": rid,
-                "rule_origin": "distilled" if rid in distilled_rule_ids else "seed",
+                "rule_origin": "distilled",
                 "dispatches": len(rows),
                 "l3_promoted_count": promos,
                 "first_hit_delta_speedup": round(first_hit, 6),
@@ -371,6 +411,7 @@ def summarize_funnel_and_transfer(
     provenance_by_rule, distilled_rule_ids = _build_rule_provenance(
         distilled_rules, winning_edges
     )
+    origin_ts_by_rule = _build_rule_origin_timestamps(distilled_rules, winning_edges)
 
     rule_rows = _compute_rule_quadrant_metrics(by_rule_quad)
     low_efficiency_rules: list[dict[str, object]] = []
@@ -434,7 +475,10 @@ def summarize_funnel_and_transfer(
     }
 
     transfer_matrix = _build_distilled_transfer_matrix(
-        indexed_rule_events, provenance_by_rule, distilled_rule_ids
+        indexed_rule_events,
+        provenance_by_rule,
+        distilled_rule_ids,
+        origin_ts_by_rule=origin_ts_by_rule,
     )
 
     return {

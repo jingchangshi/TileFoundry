@@ -758,16 +758,33 @@ def _classify_config_key_edit(key_name: str, before_src: str, after_src: str) ->
 def _find_dict_literals_by_context(tree: ast.Module) -> dict[str, ast.Dict]:
     """Collect constant-key Dict literals keyed by enclosing function/assignment path."""
     found: dict[str, ast.Dict] = {}
+    counts: dict[str, int] = {}
+
+    def _record(prefix: str, node: ast.Dict) -> None:
+        occ = counts.get(prefix, 0)
+        counts[prefix] = occ + 1
+        key = prefix if occ == 0 else f"{prefix}#{occ}"
+        found[key] = node
+
+    def _stmt_key(fn_prefix: str, idx: int, stmt: ast.stmt) -> str:
+        if isinstance(stmt, ast.Return):
+            return f"{fn_prefix}:return"
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        ):
+            return f"{fn_prefix}:assign:{stmt.targets[0].id}"
+        return f"{fn_prefix}:{idx}"
 
     def _visit(node: ast.AST, prefix: str) -> None:
         if isinstance(node, ast.FunctionDef):
             fn_prefix = f"{prefix}/{node.name}" if prefix else node.name
             for idx, stmt in enumerate(node.body):
-                _visit(stmt, f"{fn_prefix}:{idx}" if not isinstance(stmt, ast.Return) else f"{fn_prefix}:return")
+                _visit(stmt, _stmt_key(fn_prefix, idx, stmt))
             return
         if isinstance(node, ast.Dict):
-            found[prefix] = node
-            return
+            _record(prefix, node)
         for child in ast.iter_child_nodes(node):
             _visit(child, prefix)
 
@@ -849,6 +866,247 @@ def _extract_config_dict_loo_chunks(
                             ablated_dsl=dsl,
                         )
                     )
+
+
+def _extract_config_dict_forward_chunks(
+    base_tree: ast.Module,
+    win_tree: ast.Module,
+    chunks: list[AstEditChunk],
+    seen_dsls: set[str],
+) -> None:
+    """Create forward single-key AST chunks updating one dict config entry in baseline_dsl."""
+    base_dicts = _find_dict_literals_by_context(base_tree)
+    win_dicts = _find_dict_literals_by_context(win_tree)
+    for ctx_key, w_dict in win_dicts.items():
+        b_dict = base_dicts.get(ctx_key)
+        if b_dict is None:
+            continue
+        b_map = _dict_key_map(b_dict)
+        w_map = _dict_key_map(w_dict)
+        for k, (_w_idx, w_val) in w_map.items():
+            w_val_src = _node_key(w_val)
+            patched = copy.deepcopy(base_tree)
+            p_dict = _find_dict_literals_by_context(patched).get(ctx_key)
+            if p_dict is None:
+                continue
+            if k in b_map:
+                b_idx, b_val = b_map[k]
+                b_val_src = _node_key(b_val)
+                if b_val_src == w_val_src or b_idx >= len(p_dict.values):
+                    continue
+                p_dict.values[b_idx] = copy.deepcopy(w_val)
+                dsl = _render_patched(patched)
+                if dsl not in seen_dsls:
+                    seen_dsls.add(dsl)
+                    chunks.append(
+                        AstEditChunk(
+                            chunk_id=f"edit_{len(chunks)}",
+                            edit_kind=_classify_config_key_edit(k, b_val_src, w_val_src),
+                            target_path=f"{ctx_key}/dict:{k}",
+                            before_src=f"{k}: {b_val_src}",
+                            after_src=f"{k}: {w_val_src}",
+                            ablated_dsl=dsl,
+                        )
+                    )
+            else:
+                p_dict.keys.append(ast.Constant(value=k))
+                p_dict.values.append(copy.deepcopy(w_val))
+                dsl = _render_patched(patched)
+                if dsl not in seen_dsls:
+                    seen_dsls.add(dsl)
+                    chunks.append(
+                        AstEditChunk(
+                            chunk_id=f"edit_{len(chunks)}",
+                            edit_kind=_classify_config_key_edit(k, "", w_val_src),
+                            target_path=f"{ctx_key}/dict_add:{k}",
+                            before_src="",
+                            after_src=f"{k}: {w_val_src}",
+                            ablated_dsl=dsl,
+                        )
+                    )
+
+
+def _is_trackb_render_fn(name: str) -> bool:
+    return name == "_render_trackb_tu" or (
+        name.startswith("_render_") and name.endswith("_trackb_launcher")
+    )
+
+
+def _extract_func_default_loo_chunks(
+    base_tree: ast.Module,
+    win_tree: ast.Module,
+    chunks: list[AstEditChunk],
+    seen_dsls: set[str],
+) -> None:
+    """Revert changed default parameters one at a time on selector and Track-B renderers."""
+    base_funcs = {
+        n.name: n for n in base_tree.body if isinstance(n, ast.FunctionDef)
+    }
+    for w_idx, w_node in enumerate(win_tree.body):
+        if not isinstance(w_node, ast.FunctionDef):
+            continue
+        fname = w_node.name
+        if not (
+            _is_trackb_render_fn(fname)
+            or (fname.startswith("_select_") and fname.endswith("_config"))
+        ):
+            continue
+        b_node = base_funcs.get(fname)
+        if b_node is None:
+            continue
+
+        def _pos_defaults(fn: ast.FunctionDef) -> dict[str, tuple[int, ast.expr]]:
+            pos = [*fn.args.posonlyargs, *fn.args.args]
+            offset = len(pos) - len(fn.args.defaults)
+            return {
+                pos[offset + i].arg: (i, d)
+                for i, d in enumerate(fn.args.defaults)
+                if offset + i >= 0
+            }
+
+        b_pos = _pos_defaults(b_node)
+        w_pos = _pos_defaults(w_node)
+        for arg_name, (d_idx, w_def) in w_pos.items():
+            if arg_name not in b_pos:
+                continue
+            b_def = b_pos[arg_name][1]
+            b_src, w_src = _node_key(b_def), _node_key(w_def)
+            if b_src == w_src:
+                continue
+            patched = copy.deepcopy(win_tree)
+            p_fn = patched.body[w_idx]
+            if isinstance(p_fn, ast.FunctionDef) and d_idx < len(p_fn.args.defaults):
+                p_fn.args.defaults[d_idx] = copy.deepcopy(b_def)
+                dsl = _render_patched(patched)
+                if dsl not in seen_dsls:
+                    seen_dsls.add(dsl)
+                    prefix = "trackb_tu_" if _is_trackb_render_fn(fname) else "loo_"
+                    chunks.append(
+                        AstEditChunk(
+                            chunk_id=f"{prefix}{len(chunks)}",
+                            edit_kind=_classify_config_key_edit(arg_name, b_src, w_src),
+                            target_path=f"{fname}/default:{arg_name}",
+                            before_src=f"{arg_name}={b_src}",
+                            after_src=f"{arg_name}={w_src}",
+                            ablated_dsl=dsl,
+                        )
+                    )
+
+        b_kw = {
+            arg.arg: kw_def
+            for arg, kw_def in zip(b_node.args.kwonlyargs, b_node.args.kw_defaults)
+            if kw_def is not None
+        }
+        for k_idx, (arg, w_def) in enumerate(
+            zip(w_node.args.kwonlyargs, w_node.args.kw_defaults)
+        ):
+            if w_def is None or arg.arg not in b_kw:
+                continue
+            b_def = b_kw[arg.arg]
+            b_src, w_src = _node_key(b_def), _node_key(w_def)
+            if b_src == w_src:
+                continue
+            patched = copy.deepcopy(win_tree)
+            p_fn = patched.body[w_idx]
+            if isinstance(p_fn, ast.FunctionDef) and k_idx < len(p_fn.args.kw_defaults):
+                p_fn.args.kw_defaults[k_idx] = copy.deepcopy(b_def)
+                dsl = _render_patched(patched)
+                if dsl not in seen_dsls:
+                    seen_dsls.add(dsl)
+                    prefix = "trackb_tu_" if _is_trackb_render_fn(fname) else "loo_"
+                    chunks.append(
+                        AstEditChunk(
+                            chunk_id=f"{prefix}{len(chunks)}",
+                            edit_kind=_classify_config_key_edit(arg.arg, b_src, w_src),
+                            target_path=f"{fname}/kw_default:{arg.arg}",
+                            before_src=f"{arg.arg}={b_src}",
+                            after_src=f"{arg.arg}={w_src}",
+                            ablated_dsl=dsl,
+                        )
+                    )
+
+
+def _extract_trackb_render_template_loo_chunks(
+    baseline_dsl: str,
+    winner_dsl: str,
+    base_tree: ast.Module,
+    win_tree: ast.Module,
+    chunks: list[AstEditChunk],
+    seen_dsls: set[str],
+) -> None:
+    """Decompose multi-line C++ template parameter blocks inside Track-B renderer functions."""
+    base_funcs = {
+        n.name: n for n in base_tree.body if isinstance(n, ast.FunctionDef)
+    }
+    for top_idx, w_fn in enumerate(win_tree.body):
+        if not isinstance(w_fn, ast.FunctionDef) or not _is_trackb_render_fn(w_fn.name):
+            continue
+        b_fn = base_funcs.get(w_fn.name)
+        if b_fn is None:
+            continue
+        b_tags = [_node_tag(s) for s in b_fn.body]
+        w_tags = [_node_tag(s) for s in w_fn.body]
+        matcher = difflib.SequenceMatcher(a=b_tags, b=w_tags, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag not in ("equal", "replace"):
+                continue
+            span = min(i2 - i1, j2 - j1)
+            for k in range(span):
+                b_stmt = b_fn.body[i1 + k]
+                w_stmt = w_fn.body[j1 + k]
+                if _node_key(b_stmt) == _node_key(w_stmt):
+                    continue
+                b_seg = ast.get_source_segment(baseline_dsl, b_stmt) or ""
+                w_seg = ast.get_source_segment(winner_dsl, w_stmt) or ""
+                if not b_seg.strip() or not w_seg.strip():
+                    continue
+                b_lines = b_seg.splitlines(keepends=True)
+                w_lines = w_seg.splitlines(keepends=True)
+                if len(b_lines) <= 1 and len(w_lines) <= 1:
+                    continue
+                line_matcher = difflib.SequenceMatcher(
+                    a=b_lines, b=w_lines, autojunk=False
+                )
+                diff_ops = [
+                    op for op in line_matcher.get_opcodes() if op[0] != "equal"
+                ]
+                if len(diff_ops) < 2:
+                    continue
+                for op_idx, (_op, bi1, bi2, wj1, wj2) in enumerate(diff_ops):
+                    mid = list(b_lines[bi1:bi2])
+                    if mid and wj2 < len(w_lines) and not mid[-1].endswith("\n"):
+                        mid[-1] = mid[-1] + "\n"
+                    ablated_stmt_raw = "".join([*w_lines[:wj1], *mid, *w_lines[wj2:]])
+                    try:
+                        parsed_stmt = ast.parse(ablated_stmt_raw)
+                    except SyntaxError:
+                        continue
+                    if len(parsed_stmt.body) != 1:
+                        continue
+                    patched = copy.deepcopy(win_tree)
+                    if _set_stmt_by_path(
+                        patched, (top_idx, j1 + k), parsed_stmt.body[0]
+                    ):
+                        dsl = _render_patched(patched)
+                        if dsl not in seen_dsls:
+                            seen_dsls.add(dsl)
+                            before_part = "".join(b_lines[bi1:bi2]).strip()
+                            after_part = "".join(w_lines[wj1:wj2]).strip()
+                            kind = _classify_cpp_hunk_kind(before_part, after_part)
+                            if kind == "cpp_hunk_edit" and (
+                                "<<<" in f"{before_part}{after_part}"
+                            ):
+                                kind = "core_parallelism"
+                            chunks.append(
+                                AstEditChunk(
+                                    chunk_id=f"trackb_tu_{len(chunks)}_{op_idx}",
+                                    edit_kind=kind,
+                                    target_path=f"{w_fn.name}/template_L{wj1 + 1}",
+                                    before_src=before_part,
+                                    after_src=after_part,
+                                    ablated_dsl=dsl,
+                                )
+                            )
 
 
 def _extract_leave_one_out_stmt_deltas(
@@ -1303,6 +1561,10 @@ def decompose_leave_one_out_ablations(
                 chunks.append(ch)
 
     _extract_config_dict_loo_chunks(base_tree, win_tree, chunks, seen_dsls)
+    _extract_func_default_loo_chunks(base_tree, win_tree, chunks, seen_dsls)
+    _extract_trackb_render_template_loo_chunks(
+        baseline_dsl, winner_dsl, base_tree, win_tree, chunks, seen_dsls
+    )
     _extract_leave_one_out_stmt_deltas(
         win_tree,
         base_tree.body,
@@ -1328,6 +1590,7 @@ def decompose_ast_ablations(baseline_dsl: str, winner_dsl: str) -> tuple[AstEdit
     new_defs = {name: stmt for name, stmt in win_defs_list if name not in base_defs}
     def_order = [name for name, _stmt in win_defs_list if name in new_defs]
 
+    _extract_config_dict_forward_chunks(base_tree, win_tree, chunks, seen_dsls)
     _extract_stmt_list_deltas(
         base_tree,
         base_tree.body,
@@ -2560,7 +2823,13 @@ def distill_causal_rule(
         f"Counterfactual single-variable ablation verified on Ascend 950 micro-probe "
         f"({chunk.edit_kind}, speedup={speedup:.3f}x)."
     )
-    is_cpp_chunk = chunk.chunk_id.startswith("cpp_loo_") or chunk.edit_kind == "cpp_hunk_edit"
+    is_cpp_chunk = (
+        chunk.chunk_id.startswith("cpp_loo_")
+        or chunk.chunk_id.startswith("trackb_tu_")
+        or chunk.edit_kind == "cpp_hunk_edit"
+        or "_render_trackb_tu" in chunk.target_path
+        or "_trackb_launcher" in chunk.target_path
+    )
     backends: tuple[str, ...] = (
         ("ascendc_trackb", "hybrid_trackb") if is_cpp_chunk else ("tilelang_dsl",)
     )
