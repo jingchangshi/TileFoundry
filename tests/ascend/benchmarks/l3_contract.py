@@ -1158,8 +1158,17 @@ class EvidenceRecorder:
                     )
         cases = observed.get("cases")
         if isinstance(cases, Mapping):
+            candidate_failed_nodes = {
+                str(item.get("node") or "").strip()
+                for item in self.failures
+                if isinstance(item, Mapping)
+                and str(item.get("kind") or "").strip().lower() == "candidate"
+                and str(item.get("node") or "").strip()
+            }
             for key in cases.get("missing") or []:
                 node_name, _, case_id = str(key).partition(":")
+                if node_name in candidate_failed_nodes:
+                    continue
                 if not self._has_failure(node=node_name, case_id=case_id):
                     return coverage_failure(
                         node=node_name,

@@ -44,6 +44,10 @@ _DIAG_FILE_LINE_RE = re.compile(
 _DIAG_WORD_LINE_RE = re.compile(r"\bline\s+(\d+)\b")
 
 
+class PatchAnchorMissError(ValueError):
+    """Raised when a Track-B C++ patch fails to match or produces zero effective change."""
+
+
 def extract_cpp_diagnostic_lines(diagnostic_text: str) -> tuple[int, ...]:
     """Extract sorted unique positive 1-indexed line numbers from C++ diagnostics."""
     if not diagnostic_text:
@@ -1016,13 +1020,15 @@ def apply_scoped_trackb_patch(
 
     hunks = parse_scoped_search_replace_blocks(patch_text)
     if not hunks:
-        raise ValueError("patch_text must contain at least one valid SEARCH/REPLACE block")
+        raise PatchAnchorMissError(
+            "patch_text must contain at least one valid SEARCH/REPLACE block"
+        )
 
     updated = cpp_source
     applied = 0
     for search_block, replace_block in hunks:
         if not search_block.strip():
-            raise ValueError("Empty SEARCH block is forbidden")
+            raise PatchAnchorMissError("Empty SEARCH block is forbidden")
         _reject_introduced_forbidden_tokens(search_block, replace_block)
 
         if active_kernel is not None:
@@ -1042,7 +1048,7 @@ def apply_scoped_trackb_patch(
         if match_count == 0:
             fallback = _normalized_line_matches(updated, search_block)
             if not fallback:
-                raise ValueError("SEARCH block did not match target C++ source")
+                raise PatchAnchorMissError("SEARCH block did not match target C++ source")
             if len(fallback) > 1:
                 raise ValueError(
                     f"Ambiguous SEARCH block matched {len(fallback)} locations; "
@@ -1074,6 +1080,10 @@ def apply_scoped_trackb_patch(
         updated = updated[:match_start] + replace_block + updated[match_end:]
         applied += 1
 
+    if applied == 0 or updated.strip() == cpp_source.strip():
+        raise PatchAnchorMissError(
+            "Track-B patch applied zero effective changes to target C++ source"
+        )
     return updated, applied
 
 
@@ -1157,6 +1167,10 @@ def splice_cpp_units_into_tu(
         helper_blob = "\n\n".join(h.text.strip() for h in new_helpers)
         prefix = "" if (min_start == 0 or updated[min_start - 1] == "\n") else "\n"
         updated = updated[:min_start] + prefix + helper_blob + "\n\n" + updated[min_start:]
+    if updated.strip() == cpp_source.strip():
+        raise PatchAnchorMissError(
+            "Spliced C++ units are identical to parent Track-B translation unit"
+        )
     return updated, len(targets) + len(new_helpers)
 
 
@@ -1801,6 +1815,7 @@ def compact_creative_source_slice(
 
 __all__ = [
     "CREATIVE_SOURCE_MAX_BYTES",
+    "PatchAnchorMissError",
     "_ANY_FOLDING_MARKER_RE",
     "_OMITTED_SPAN_MARKER_RE",
     "_TRACKB_CPP_QUALIFIERS",

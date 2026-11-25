@@ -50,6 +50,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     ensure_npu_compare_shim_dir,
     measure_npu_ring_burst_stats,
     measure_npu_ring_burst_us,
+    measure_paired_interleaved_micro_burst,
 )
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
     MicroProbeSpec,
@@ -826,7 +827,12 @@ def _evaluate_operator_batch(
             def _native_fn(c=case, ts=tensors, h=harness, ch=cache):
                 return ch.get(c, "native", lambda: h.reference_output(c, ts, native=True))
 
-            for cid, fn, mod_obj in loaded_cands:
+            paired_interleaved = bool(batch.get("paired_interleaved", True))
+            has_npu_event = hasattr(getattr(torch, "npu", None), "Event")
+            passed_cands: list[tuple[int, str, object, object]] = []
+            metrics_by_cid: dict[str, AnchorEvalMetrics] = {}
+
+            for orig_idx, (cid, fn, mod_obj) in enumerate(loaded_cands):
                 npu_tensors = None
                 params = None
                 actual = None
@@ -838,91 +844,157 @@ def _evaluate_operator_batch(
                     passed, details = harness.compare(
                         case, actual, oracle, tensors, _native_fn
                     )
-                    err_msg = ""
-                    if not passed:
-                        err_msg = json.dumps(details)[:300]
-                    has_npu_event = hasattr(getattr(torch, "npu", None), "Event")
-                    ring_burst_k = 1
-                    burst_batch_cv = 0.0
-                    spike_retries = 0
-                    if has_npu_event and 0.0 < float(spec.t_hw_us) < 5.0:
-                        cand_us, ring_burst_k, burst_batch_cv, spike_retries = (
-                            measure_npu_ring_burst_stats(
-                                fn,
-                                params,
-                                warmup=warmup,
-                                repeat=repeat,
-                                t_hw_us=spec.t_hw_us,
-                                max_vram_bytes=512 * 1024 * 1024,
-                            )
-                        )
-                    elif has_npu_event:
-                        cand_us, burst_batch_cv = _measure_npu_latency_stats_us(
-                            lambda f=fn, p=params: f(**p),
-                            warmup=warmup,
-                            repeat=repeat,
-                        )
-                        if 0.0 < cand_us < 8.0:
-                            cand_us, ring_burst_k, burst_batch_cv, spike_retries = (
-                                measure_npu_ring_burst_stats(
-                                    fn,
-                                    params,
-                                    warmup=warmup,
-                                    repeat=repeat,
-                                    t_hw_us=spec.t_hw_us,
-                                    first_probe_us=cand_us,
-                                    max_vram_bytes=512 * 1024 * 1024,
-                                )
-                            )
+                    if passed:
+                        passed_cands.append((orig_idx, cid, fn, mod_obj))
                     else:
-                        cand_us = _measure_npu_latency_us(
-                            lambda f=fn, p=params: f(**p),
-                            warmup=warmup,
-                            repeat=repeat,
-                        )
-                    per_cand_metrics[cid].append(
-                        build_anchor_metrics(
-                            spec,
-                            accuracy_passed=passed,
-                            cand_us=cand_us,
-                            error_message=err_msg,
-                            ring_burst_k=ring_burst_k,
-                            burst_batch_cv=burst_batch_cv,
-                            spike_retries=spike_retries,
-                        )
-                    )
-                    if passed and msprof_out is not None and int(spec.case_num) in msprof_case_set:
-                        msprof_out.setdefault(cid, {})[str(int(spec.case_num))] = (
-                            _measure_msprof_detail_metrics(
-                                lambda f=fn, p=params: f(**p),
-                                warmup=msprof_warmup,
-                                repeat=msprof_repeat,
-                                operator_name=op_name,
-                                candidate_id=cid,
-                                module_path=cand_paths[cid],
-                                entrypoint=entrypoint,
-                                case_num=int(spec.case_num),
-                                source_root=source_root,
-                                cannbench_repo=cannbench_repo,
-                                compiled_obj_paths=_discover_compiled_objects(
-                                    mod_obj, cand_paths[cid]
-                                ),
-                            )
-                        )
-                except Exception as exc:
-                    per_cand_metrics[cid].append(
-                        build_anchor_metrics(
+                        metrics_by_cid[cid] = build_anchor_metrics(
                             spec,
                             accuracy_passed=False,
                             cand_us=0.0,
-                            error_message=f"{type(exc).__name__}: {exc}"[:300],
+                            error_message=json.dumps(details)[:300],
                         )
+                except Exception as exc:
+                    metrics_by_cid[cid] = build_anchor_metrics(
+                        spec,
+                        accuracy_passed=False,
+                        cand_us=0.0,
+                        error_message=f"{type(exc).__name__}: {exc}"[:300],
                     )
                 finally:
                     actual = None
                     params = None
                     npu_tensors = None
                     torch.npu.empty_cache()
+
+            if passed_cands:
+                base_npu_tensors = None
+                base_params = None
+                try:
+                    base_npu_tensors = contract_mod.map_tensors(tensors, lambda x: x.npu())
+                    base_params = harness.params(case, base_npu_tensors)
+                    incumbent_passed = bool(
+                        loaded_cands
+                        and loaded_cands[0][0] == "__incumbent__"
+                        and passed_cands[0][0] == 0
+                    )
+                    if len(passed_cands) >= 2 and has_npu_event and paired_interleaved:
+                        paired_stats = measure_paired_interleaved_micro_burst(
+                            [(cid, fn) for _orig_idx, cid, fn, _mod in passed_cands],
+                            base_params,
+                            warmup=warmup,
+                            repeat=repeat,
+                            t_hw_us=spec.t_hw_us,
+                            max_vram_bytes=512 * 1024 * 1024,
+                        )
+                        for pos, (_orig_idx, cid, _fn, _mod) in enumerate(passed_cands):
+                            cand_us, ring_burst_k, raw_cv, med_r, rel_mad = paired_stats[cid]
+                            if incumbent_passed:
+                                if pos == 0:
+                                    paired_speedup = 1.0
+                                    cand_rel_mad = 0.0
+                                    burst_cv = raw_cv
+                                else:
+                                    paired_speedup = med_r
+                                    cand_rel_mad = rel_mad
+                                    burst_cv = rel_mad
+                            else:
+                                paired_speedup = 0.0
+                                cand_rel_mad = rel_mad if pos > 0 else 0.0
+                                burst_cv = raw_cv
+                            metrics_by_cid[cid] = build_anchor_metrics(
+                                spec,
+                                accuracy_passed=True,
+                                cand_us=cand_us,
+                                ring_burst_k=ring_burst_k,
+                                burst_batch_cv=burst_cv,
+                                spike_retries=0,
+                                paired_speedup_vs_incumbent=paired_speedup,
+                                paired_rel_mad=cand_rel_mad,
+                            )
+                    else:
+                        for _orig_idx, cid, fn, _mod in passed_cands:
+                            ring_burst_k = 1
+                            burst_batch_cv = 0.0
+                            spike_retries = 0
+                            if has_npu_event and 0.0 < float(spec.t_hw_us) < 5.0:
+                                cand_us, ring_burst_k, burst_batch_cv, spike_retries = (
+                                    measure_npu_ring_burst_stats(
+                                        fn,
+                                        base_params,
+                                        warmup=warmup,
+                                        repeat=repeat,
+                                        t_hw_us=spec.t_hw_us,
+                                        max_vram_bytes=512 * 1024 * 1024,
+                                    )
+                                )
+                            elif has_npu_event:
+                                cand_us, burst_batch_cv = _measure_npu_latency_stats_us(
+                                    lambda f=fn, p=base_params: f(**p),
+                                    warmup=warmup,
+                                    repeat=repeat,
+                                )
+                                if 0.0 < cand_us < 8.0:
+                                    cand_us, ring_burst_k, burst_batch_cv, spike_retries = (
+                                        measure_npu_ring_burst_stats(
+                                            fn,
+                                            base_params,
+                                            warmup=warmup,
+                                            repeat=repeat,
+                                            t_hw_us=spec.t_hw_us,
+                                            first_probe_us=cand_us,
+                                            max_vram_bytes=512 * 1024 * 1024,
+                                        )
+                                    )
+                            else:
+                                cand_us = _measure_npu_latency_us(
+                                    lambda f=fn, p=base_params: f(**p),
+                                    warmup=warmup,
+                                    repeat=repeat,
+                                )
+                            metrics_by_cid[cid] = build_anchor_metrics(
+                                spec,
+                                accuracy_passed=True,
+                                cand_us=cand_us,
+                                ring_burst_k=ring_burst_k,
+                                burst_batch_cv=burst_batch_cv,
+                                spike_retries=spike_retries,
+                            )
+
+                    if msprof_out is not None and int(spec.case_num) in msprof_case_set:
+                        for _orig_idx, cid, fn, mod_obj in passed_cands:
+                            msprof_out.setdefault(cid, {})[str(int(spec.case_num))] = (
+                                _measure_msprof_detail_metrics(
+                                    lambda f=fn, p=base_params: f(**p),
+                                    warmup=msprof_warmup,
+                                    repeat=msprof_repeat,
+                                    operator_name=op_name,
+                                    candidate_id=cid,
+                                    module_path=cand_paths[cid],
+                                    entrypoint=entrypoint,
+                                    case_num=int(spec.case_num),
+                                    source_root=source_root,
+                                    cannbench_repo=cannbench_repo,
+                                    compiled_obj_paths=_discover_compiled_objects(
+                                        mod_obj, cand_paths[cid]
+                                    ),
+                                )
+                            )
+                except Exception as exc:
+                    for _orig_idx, cid, _fn, _mod in passed_cands:
+                        if cid not in metrics_by_cid:
+                            metrics_by_cid[cid] = build_anchor_metrics(
+                                spec,
+                                accuracy_passed=False,
+                                cand_us=0.0,
+                                error_message=f"{type(exc).__name__}: {exc}"[:300],
+                            )
+                finally:
+                    base_params = None
+                    base_npu_tensors = None
+                    torch.npu.empty_cache()
+
+            for cid, _fn, _mod in loaded_cands:
+                per_cand_metrics[cid].append(metrics_by_cid[cid])
 
     for _cid, _fn, mod_obj in loaded_cands:
         cache_obj = getattr(mod_obj, "_KERNEL_CACHE", None)

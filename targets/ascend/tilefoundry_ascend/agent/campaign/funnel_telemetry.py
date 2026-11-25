@@ -17,6 +17,15 @@ ANOMALY_LOG_ERROR_THRESHOLD: float = 1.20
 _ERROR_CODE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("NOOP_IDENTICAL", re.compile(r"noop_identical|identical_to_parent", re.IGNORECASE)),
     (
+        "PATCH_ANCHOR_MISS",
+        re.compile(
+            r"patch_anchor_miss|patchanchormiss|search block did not match|"
+            r"identical to parent track-b|zero effective change|"
+            r"valid search/replace block|empty search block",
+            re.IGNORECASE,
+        ),
+    ),
+    (
         "VF_STACK_OVERFLOW",
         re.compile(
             r"exceeded vf stack size|vf_stack|stack frame size|stack overflow",
@@ -33,11 +42,32 @@ _ERROR_CODE_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("FREEDOM_MASK_VIOLATION", re.compile(r"freedom_mask|locked_facet", re.IGNORECASE)),
     (
         "TRACKB_SLICE_SPLICE_ERR",
-        re.compile(r"omitted_span|trackb.*dead_code|splice", re.IGNORECASE),
+        re.compile(
+            r"omitted_span|dead_code.*trackb|trackb.*dead_code|splice",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "SIGNATURE_CONTRACT_MISMATCH",
+        re.compile(
+            r"signature.*mismatch|missing regime symbols|entrypoint.*not define|"
+            r"arity|unexpected keyword",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "DYNAMIC_STRIDE_CONTRACT_ERR",
+        re.compile(
+            r"stride.*contract|non[-_\s]?contiguous|buffer_map.*shape",
+            re.IGNORECASE,
+        ),
     ),
     (
         "CCE_UNDECLARED_INTRINSIC",
-        re.compile(r"undeclared identifier|no matching function", re.IGNORECASE),
+        re.compile(
+            r"undeclared identifier|no matching function|implicit declaration|unknown type name",
+            re.IGNORECASE,
+        ),
     ),
     ("COST_COARSE_REJECT", re.compile(r"cost_prescreen|coarse_reject", re.IGNORECASE)),
 )
@@ -206,6 +236,9 @@ class DeterministicSearchBoundaryLedger:
         added = False
         if cand_sha and error_code_norm in {
             "NOOP_IDENTICAL",
+            "PATCH_ANCHOR_MISS",
+            "TRACKB_SLICE_SPLICE_ERR",
+            "SIGNATURE_CONTRACT_MISMATCH",
             "VF_STACK_OVERFLOW",
             "UB_SRAM_OVERFLOW",
             "L1_SRAM_OVERFLOW",
