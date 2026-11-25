@@ -1466,6 +1466,9 @@ class CannbenchOpsRegistry:
         anchor_case_ids_by_tag: dict[str, list[int]] = {}
         for anchor in spec.anchors:
             anchor_case_ids_by_tag.setdefault(anchor.regime_tag, []).append(anchor.case_num)
+        mod_text = "" if self._pure_golden else self._module_source(spec)
+        defined_funcs = _defined_top_level_functions(mod_text) if mod_text else {}
+        render_extras = _discover_trackb_render_symbols(defined_funcs) if defined_funcs else ()
         hydrated: list[RegimeTargetSpec] = []
         for regime in regimes:
             member_case_ids = [
@@ -1489,9 +1492,13 @@ class CannbenchOpsRegistry:
                 member_case_ids,
                 key=lambda case_id: (workload_bytes_by_case[case_id], case_id),
             )
+            extra_editable = render_extras if regime.trackb_symbols else ()
             hydrated.append(
                 replace(
                     regime,
+                    editable_symbols=tuple(
+                        dict.fromkeys((*regime.editable_symbols, *extra_editable))
+                    ),
                     representative_case_entry=dict(
                         raw_case_by_case_id[representative_case_id]
                     ),
@@ -1519,7 +1526,7 @@ class CannbenchOpsRegistry:
             if is_pure
             else infer_module_runtime_backend(mod_text, spec.entrypoint)
         )
-        regimes = build_semantic_regime_specs(
+        return build_semantic_regime_specs(
             operator_name=op_id,
             entrypoint=spec.entrypoint,
             cases=spec.cases,
@@ -1529,43 +1536,8 @@ class CannbenchOpsRegistry:
             case_ratios=partition.ratios,
             runtime_backend=runtime_backend,
             trackb_symbols=discovered_tb,
+            module_text=mod_text,
         )
-        if not is_pure and mod_text:
-            shared_sel = f"_select_{spec.entrypoint}_config"
-            shared_bld = f"_build_{spec.entrypoint}_prim_func"
-            render_sym = ("_render_trackb_tu",) if discovered_tb and "def _render_trackb_tu(" in mod_text else ()
-            adapted: list[RegimeTargetSpec] = []
-            for regime in regimes:
-                per_sel = f"_select_{spec.entrypoint}_{regime.regime_tag}_config"
-                if f"def {per_sel}(" in mod_text:
-                    adapted.append(
-                        replace(
-                            regime,
-                            config_selector_fn=per_sel,
-                            editable_symbols=tuple(dict.fromkeys((*regime.editable_symbols, *render_sym))),
-                        )
-                    )
-                elif f"def {shared_sel}(" in mod_text:
-                    adapted.append(
-                        replace(
-                            regime,
-                            config_selector_fn=shared_sel,
-                            editable_symbols=tuple(
-                                dict.fromkeys(
-                                    (
-                                        *regime.editable_symbols,
-                                        shared_sel,
-                                        shared_bld,
-                                        *render_sym,
-                                    )
-                                )
-                            ),
-                        )
-                    )
-                else:
-                    adapted.append(regime)
-            regimes = tuple(adapted)
-        return regimes
 
 
 _ENGINE_PHASE_TAGS: dict[EnginePhase, str] = {
@@ -1774,6 +1746,263 @@ def semantic_regime_representative(
     )
 
 
+def _defined_top_level_functions(module_text: str) -> dict[str, ast.FunctionDef]:
+    """Return top-level Python function definitions keyed by name."""
+    if not module_text.strip():
+        return {}
+    try:
+        tree = ast.parse(module_text)
+    except SyntaxError:
+        return {}
+    return {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+
+def _discover_trackb_render_symbols(
+    defined_funcs: Mapping[str, ast.FunctionDef],
+) -> tuple[str, ...]:
+    """Collect Track-B TU renderer and launcher functions present in *defined_funcs*."""
+    found: list[str] = []
+    if "_render_trackb_tu" in defined_funcs:
+        found.append("_render_trackb_tu")
+    for name in sorted(defined_funcs):
+        if name.startswith("_render_") and name.endswith("_trackb_launcher"):
+            found.append(name)
+    return tuple(dict.fromkeys(found))
+
+
+def _extract_shape_aliases(func: ast.FunctionDef) -> tuple[dict[str, tuple[str, int]], dict[str, ast.expr]]:
+    """Collect simple ``dk = q.shape[-1]`` aliases and boolean flag assignments."""
+    shape_aliases: dict[str, tuple[str, int]] = {}
+    bool_exprs: dict[str, ast.expr] = {}
+    for stmt in func.body:
+        if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+            continue
+        target = stmt.targets[0]
+        val = stmt.value
+        if (
+            isinstance(target, ast.Name)
+            and isinstance(val, ast.Subscript)
+            and isinstance(val.value, ast.Attribute)
+            and val.value.attr == "shape"
+            and isinstance(val.value.value, ast.Name)
+            and isinstance(val.slice, (ast.Constant, ast.UnaryOp))
+        ):
+            idx_val: int | None = None
+            if isinstance(val.slice, ast.Constant) and isinstance(val.slice.value, int):
+                idx_val = int(val.slice.value)
+            elif (
+                isinstance(val.slice, ast.UnaryOp)
+                and isinstance(val.slice.op, ast.USub)
+                and isinstance(val.slice.operand, ast.Constant)
+                and isinstance(val.slice.operand.value, int)
+            ):
+                idx_val = -int(val.slice.operand.value)
+            if idx_val is not None:
+                shape_aliases[target.id] = (val.value.value.id, idx_val)
+        elif (
+            isinstance(target, ast.Tuple)
+            and isinstance(val, ast.Attribute)
+            and val.attr == "shape"
+            and isinstance(val.value, ast.Name)
+        ):
+            for idx, elt in enumerate(target.elts):
+                if isinstance(elt, ast.Name):
+                    shape_aliases[elt.id] = (val.value.id, idx)
+        elif isinstance(target, ast.Name) and isinstance(val, (ast.BoolOp, ast.Compare)):
+            bool_exprs[target.id] = val
+    return shape_aliases, bool_exprs
+
+
+def _lookup_tensor_shape_dim(
+    tensor_name: str,
+    axis: int,
+    int_dims: Mapping[str, int],
+) -> int | None:
+    prefix = f"{tensor_name}_dim_"
+    indexed: dict[int, int] = {}
+    for key, val in int_dims.items():
+        if key.startswith(prefix):
+            suffix = key[len(prefix) :]
+            if suffix.isdigit():
+                indexed[int(suffix)] = int(val)
+    if not indexed:
+        return None
+    rank = max(indexed) + 1
+    resolved_axis = axis + rank if axis < 0 else axis
+    return indexed.get(resolved_axis)
+
+
+def _eval_guard_value(
+    node: ast.AST,
+    int_dims: Mapping[str, int],
+    shape_aliases: Mapping[str, tuple[str, int]],
+) -> object:
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, (ast.Tuple, ast.List)):
+        elts = [_eval_guard_value(elt, int_dims, shape_aliases) for elt in node.elts]
+        if any(elt is None for elt in elts):
+            return None
+        return tuple(elts)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        inner = _eval_guard_value(node.operand, int_dims, shape_aliases)
+        if isinstance(inner, (int, float)) and not isinstance(inner, bool):
+            return -inner
+        return None
+    if isinstance(node, ast.Name):
+        if node.id == "schedule_mode":
+            return "tuned"
+        if node.id in int_dims:
+            return int(int_dims[node.id])
+        low = node.id.lower()
+        for key, val in int_dims.items():
+            if key.lower() == low:
+                return int(val)
+        if node.id in shape_aliases:
+            tensor_name, axis = shape_aliases[node.id]
+            return _lookup_tensor_shape_dim(tensor_name, axis, int_dims)
+        return None
+    if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "shape"
+        and isinstance(node.value.value, ast.Name)
+    ):
+        idx = _eval_guard_value(node.slice, int_dims, shape_aliases)
+        if isinstance(idx, int) and not isinstance(idx, bool):
+            return _lookup_tensor_shape_dim(node.value.value.id, idx, int_dims)
+    return None
+
+
+def _eval_guard_predicate(
+    node: ast.AST,
+    int_dims: Mapping[str, int],
+    shape_aliases: Mapping[str, tuple[str, int]],
+    bool_exprs: Mapping[str, ast.expr],
+    seen_vars: set[str],
+) -> bool | None:
+    if isinstance(node, ast.BoolOp):
+        vals = [
+            _eval_guard_predicate(v, int_dims, shape_aliases, bool_exprs, seen_vars)
+            for v in node.values
+        ]
+        if isinstance(node.op, ast.And):
+            if any(v is False for v in vals):
+                return False
+            if all(v is True for v in vals):
+                return True
+            return None
+        if any(v is True for v in vals):
+            return True
+        if all(v is False for v in vals):
+            return False
+        return None
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        inner = _eval_guard_predicate(
+            node.operand, int_dims, shape_aliases, bool_exprs, seen_vars
+        )
+        return (not inner) if inner is not None else None
+    if isinstance(node, ast.Name) and node.id in bool_exprs and node.id not in seen_vars:
+        seen_vars.add(node.id)
+        res = _eval_guard_predicate(
+            bool_exprs[node.id], int_dims, shape_aliases, bool_exprs, seen_vars
+        )
+        seen_vars.remove(node.id)
+        return res
+    if isinstance(node, ast.Compare):
+        left = _eval_guard_value(node.left, int_dims, shape_aliases)
+        if left is None:
+            return None
+        cur = left
+        for op, comp in zip(node.ops, node.comparators):
+            right = _eval_guard_value(comp, int_dims, shape_aliases)
+            if right is None:
+                return None
+            if isinstance(op, ast.Lt) and isinstance(cur, (int, float)) and isinstance(right, (int, float)):
+                ok = cur < right
+            elif isinstance(op, ast.LtE) and isinstance(cur, (int, float)) and isinstance(right, (int, float)):
+                ok = cur <= right
+            elif isinstance(op, (ast.Gt, ast.GtE)):
+                return None
+            elif isinstance(op, ast.Eq):
+                ok = cur == right
+            elif isinstance(op, ast.NotEq):
+                ok = cur != right
+            elif isinstance(op, ast.In) and isinstance(right, tuple):
+                ok = cur in right
+            elif isinstance(op, ast.NotIn) and isinstance(right, tuple):
+                ok = cur not in right
+            else:
+                return None
+            if not ok:
+                return False
+            cur = right
+        return True
+    return None
+
+
+def _infer_regime_runtime_backend(
+    module_text: str,
+    entrypoint: str,
+    module_backend: str,
+    trackb_symbols: Sequence[str],
+    int_dims: Mapping[str, int],
+) -> str:
+    """Resolve regime-level runtime_backend for hybrid modules with shape-guarded Track-B."""
+    if module_backend != "hybrid_trackb" or not module_text.strip() or not int_dims:
+        return module_backend
+    funcs = _defined_top_level_functions(module_text)
+    entry_fn = funcs.get(entrypoint)
+    if entry_fn is None:
+        return module_backend
+
+    tb_funcs: set[str] = set()
+    for fname, fnode in funcs.items():
+        if fname == entrypoint:
+            continue
+        seg = ast.get_source_segment(module_text, fnode) or ""
+        if any(sym in seg for sym in trackb_symbols) or "_get_track_b_lib" in seg:
+            tb_funcs.add(fname)
+    changed = True
+    while changed:
+        changed = False
+        for fname, fnode in funcs.items():
+            if fname == entrypoint or fname in tb_funcs:
+                continue
+            for sub in ast.walk(fnode):
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id in tb_funcs:
+                    tb_funcs.add(fname)
+                    changed = True
+                    break
+
+    def _body_reaches_trackb(stmts: Sequence[ast.stmt]) -> bool:
+        for st in stmts:
+            for sub in ast.walk(st):
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
+                    if sub.func.id in tb_funcs or sub.func.id == "_get_track_b_lib":
+                        return True
+                elif isinstance(sub, ast.Name) and sub.id in trackb_symbols:
+                    return True
+        return False
+
+    shape_aliases, bool_exprs = _extract_shape_aliases(entry_fn)
+    guard_outcomes: list[bool] = []
+    for node in ast.walk(entry_fn):
+        if not isinstance(node, ast.If):
+            continue
+        if not _body_reaches_trackb(node.body):
+            continue
+        test_seg = ast.get_source_segment(module_text, node.test) or ""
+        if "device.type" in test_seg:
+            continue
+        res = _eval_guard_predicate(node.test, int_dims, shape_aliases, bool_exprs, set())
+        if res is not None:
+            guard_outcomes.append(res)
+    if guard_outcomes and not any(guard_outcomes):
+        return "tilelang_dsl"
+    return module_backend
+
+
 def build_semantic_regime_specs(
     *,
     operator_name: str,
@@ -1785,6 +2014,7 @@ def build_semantic_regime_specs(
     case_ratios: Sequence[CasePhysicsRatios],
     runtime_backend: str,
     trackb_symbols: Sequence[str] = (),
+    module_text: str = "",
 ) -> tuple[RegimeTargetSpec, ...]:
     """Partition official cases into campaign regime specs through WP1's mapping.
 
@@ -1805,6 +2035,8 @@ def build_semantic_regime_specs(
         has_reduction=has_reduction,
         case_ratios=case_ratios,
     )
+    defined_funcs = _defined_top_level_functions(module_text) if module_text.strip() else {}
+    render_syms = _discover_trackb_render_symbols(defined_funcs) if defined_funcs else ()
     shared_selector = f"_select_{entrypoint}_config"
     shared_builder = f"_build_{entrypoint}_prim_func"
     multi_regime = len(groups) > 1
@@ -1822,39 +2054,114 @@ def build_semantic_regime_specs(
                 f"semantic regime {tag!r} for {operator_name!r} case {case_id} has no "
                 "concrete integer dimensions for Stage-0 instantiation"
             )
+        regime_backend = _infer_regime_runtime_backend(
+            module_text,
+            entrypoint,
+            runtime_backend,
+            trackb_symbols,
+            int_dims,
+        )
+        regime_trackb_syms = tuple(trackb_symbols) if regime_backend != "tilelang_dsl" else ()
         per_regime_selector = f"_select_{entrypoint}_{tag}_config"
         per_regime_builder = f"_build_{entrypoint}_{tag}_prim_func"
         legacy_per_regime_builder = f"_build_{entrypoint}_{tag}_func"
-        extra_trackb = ("_render_trackb_tu",) if trackb_symbols else ()
-        if multi_regime:
-            selector_fn = per_regime_selector
-            builder_candidates = (
-                per_regime_builder,
-                legacy_per_regime_builder,
-                shared_builder,
-                "make_kernel",
-            )
-            editable = (
-                per_regime_selector,
-                per_regime_builder,
-                legacy_per_regime_builder,
-                *trackb_symbols,
-                *extra_trackb,
-            )
+        if regime_trackb_syms:
+            extra_trackb = render_syms if defined_funcs else ("_render_trackb_tu",)
         else:
-            selector_fn = shared_selector
-            builder_candidates = (
-                shared_builder,
-                per_regime_builder,
-                legacy_per_regime_builder,
-                "make_kernel",
-            )
-            editable = (
-                shared_selector,
-                shared_builder,
-                *trackb_symbols,
-                *extra_trackb,
-            )
+            extra_trackb = ()
+        if multi_regime:
+            if defined_funcs:
+                selector_fn = (
+                    per_regime_selector
+                    if per_regime_selector in defined_funcs
+                    else (shared_selector if shared_selector in defined_funcs else per_regime_selector)
+                )
+                resolved_builders = [
+                    fn
+                    for fn in (per_regime_builder, legacy_per_regime_builder)
+                    if fn in defined_funcs
+                ]
+                if not resolved_builders and shared_builder in defined_funcs:
+                    resolved_builders = [shared_builder]
+                if not resolved_builders:
+                    resolved_builders = [per_regime_builder, legacy_per_regime_builder]
+                builder_candidates = tuple(
+                    dict.fromkeys(
+                        (
+                            *resolved_builders,
+                            per_regime_builder,
+                            legacy_per_regime_builder,
+                            shared_builder,
+                            "make_kernel",
+                        )
+                    )
+                )
+                editable = (
+                    selector_fn,
+                    *resolved_builders,
+                    *regime_trackb_syms,
+                    *extra_trackb,
+                )
+            else:
+                selector_fn = per_regime_selector
+                builder_candidates = (
+                    per_regime_builder,
+                    legacy_per_regime_builder,
+                    shared_builder,
+                    "make_kernel",
+                )
+                editable = (
+                    per_regime_selector,
+                    per_regime_builder,
+                    legacy_per_regime_builder,
+                    *regime_trackb_syms,
+                    *extra_trackb,
+                )
+        else:
+            if defined_funcs:
+                selector_fn = (
+                    shared_selector
+                    if shared_selector in defined_funcs
+                    else (per_regime_selector if per_regime_selector in defined_funcs else shared_selector)
+                )
+                resolved_builders = [
+                    fn
+                    for fn in (shared_builder, per_regime_builder, legacy_per_regime_builder)
+                    if fn in defined_funcs
+                ]
+                if not resolved_builders:
+                    resolved_builders = [shared_builder]
+                builder_candidates = tuple(
+                    dict.fromkeys(
+                        (
+                            *resolved_builders,
+                            shared_builder,
+                            per_regime_builder,
+                            legacy_per_regime_builder,
+                            "make_kernel",
+                        )
+                    )
+                )
+                editable = (
+                    selector_fn,
+                    *resolved_builders,
+                    *regime_trackb_syms,
+                    *extra_trackb,
+                )
+            else:
+                selector_fn = shared_selector
+                builder_candidates = (
+                    shared_builder,
+                    per_regime_builder,
+                    legacy_per_regime_builder,
+                    "make_kernel",
+                )
+                editable = (
+                    shared_selector,
+                    shared_builder,
+                    *regime_trackb_syms,
+                    *extra_trackb,
+                )
         regimes.append(
             RegimeTargetSpec(
                 regime_tag=tag,
@@ -1866,8 +2173,8 @@ def build_semantic_regime_specs(
                 config_selector_fn=selector_fn,
                 editable_symbols=tuple(dict.fromkeys(editable)),
                 allowed_helper_prefix=f"_{operator_name}_{tag}_",
-                runtime_backend=runtime_backend,
-                trackb_symbols=tuple(trackb_symbols),
+                runtime_backend=regime_backend,
+                trackb_symbols=regime_trackb_syms,
                 representative_case_entry=dict(group.representative_case_entry),
                 representative_case_ratios=group.representative_case_ratios,
             )
