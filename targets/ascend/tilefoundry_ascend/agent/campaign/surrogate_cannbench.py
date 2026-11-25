@@ -152,6 +152,8 @@ class AnchorEvalMetrics:
     burst_batch_cv: float = 0.0
     spike_retries: int = 0
     card_ext_hbm_mb: int = 0
+    paired_speedup_vs_incumbent: float = 0.0
+    paired_rel_mad: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         """Serialize anchor evaluation metrics to a JSON-compatible dictionary."""
@@ -170,6 +172,8 @@ class AnchorEvalMetrics:
             "burst_batch_cv": round(self.burst_batch_cv, 6),
             "spike_retries": int(self.spike_retries),
             "card_ext_hbm_mb": int(self.card_ext_hbm_mb),
+            "paired_speedup_vs_incumbent": round(self.paired_speedup_vs_incumbent, 6),
+            "paired_rel_mad": round(self.paired_rel_mad, 6),
         }
 
     @classmethod
@@ -190,6 +194,10 @@ class AnchorEvalMetrics:
             burst_batch_cv=float(payload.get("burst_batch_cv", 0.0) or 0.0),
             spike_retries=max(0, int(payload.get("spike_retries", 0) or 0)),
             card_ext_hbm_mb=max(0, int(payload.get("card_ext_hbm_mb", 0) or 0)),
+            paired_speedup_vs_incumbent=float(
+                payload.get("paired_speedup_vs_incumbent", 0.0) or 0.0
+            ),
+            paired_rel_mad=float(payload.get("paired_rel_mad", 0.0) or 0.0),
         )
 
 
@@ -429,6 +437,8 @@ def build_anchor_metrics(
     burst_batch_cv: float = 0.0,
     spike_retries: int = 0,
     card_ext_hbm_mb: int = 0,
+    paired_speedup_vs_incumbent: float = 0.0,
+    paired_rel_mad: float = 0.0,
 ) -> AnchorEvalMetrics:
     """Compute speedup, Roofline eta, and Eq.3 score from measured latency."""
     valid_lat = accuracy_passed and math.isfinite(cand_us) and cand_us > 0.0
@@ -439,6 +449,18 @@ def build_anchor_metrics(
     safe_cv = (
         float(burst_batch_cv)
         if math.isfinite(float(burst_batch_cv)) and float(burst_batch_cv) >= 0.0
+        else 0.0
+    )
+    safe_paired_speedup = (
+        float(paired_speedup_vs_incumbent)
+        if valid_lat
+        and math.isfinite(float(paired_speedup_vs_incumbent))
+        and float(paired_speedup_vs_incumbent) >= 0.0
+        else 0.0
+    )
+    safe_paired_rel_mad = (
+        float(paired_rel_mad)
+        if math.isfinite(float(paired_rel_mad)) and float(paired_rel_mad) >= 0.0
         else 0.0
     )
     return AnchorEvalMetrics(
@@ -456,6 +478,8 @@ def build_anchor_metrics(
         burst_batch_cv=safe_cv,
         spike_retries=max(0, int(spike_retries)),
         card_ext_hbm_mb=max(0, int(card_ext_hbm_mb)),
+        paired_speedup_vs_incumbent=safe_paired_speedup,
+        paired_rel_mad=safe_paired_rel_mad,
     )
 
 
@@ -570,6 +594,32 @@ def _median_and_cv(samples: Sequence[float]) -> tuple[float, float]:
     return med, cv
 
 
+def _invoke_callable(func: Callable[..., object], params: object) -> None:
+    if isinstance(params, Mapping):
+        func(**params)
+    elif isinstance(params, (list, tuple)):
+        func(*params)
+    else:
+        func(params)
+
+
+def _resolve_npu_timing_fns(
+    event_factory: Callable[[], object] | None,
+    synchronize_fn: Callable[[], None] | None,
+) -> tuple[Callable[[], object], Callable[[], None]]:
+    if event_factory is not None and synchronize_fn is not None:
+        return event_factory, synchronize_fn
+    import torch  # noqa: PLC0415
+
+    eff_event = (
+        event_factory
+        if event_factory is not None
+        else (lambda: torch.npu.Event(enable_timing=True))
+    )
+    eff_sync = synchronize_fn if synchronize_fn is not None else torch.npu.synchronize
+    return eff_event, eff_sync
+
+
 def measure_npu_ring_burst_stats(
     func: Callable[..., object],
     params: object,
@@ -585,37 +635,23 @@ def measure_npu_ring_burst_stats(
 ) -> tuple[float, int, float, int]:
     """Measure micro-anchor latency returning (median_us, ring_burst_k, cv, spike_retries)."""
     is_real_npu = event_factory is None and synchronize_fn is None
-    if event_factory is None or synchronize_fn is None:
-        import torch  # noqa: PLC0415
-
-        if event_factory is None:
-            event_factory = lambda: torch.npu.Event(enable_timing=True)
-        if synchronize_fn is None:
-            synchronize_fn = torch.npu.synchronize
-
-    def _invoke(p: object) -> None:
-        if isinstance(p, Mapping):
-            func(**p)
-        elif isinstance(p, (list, tuple)):
-            func(*p)
-        else:
-            func(p)
+    eff_event, eff_sync = _resolve_npu_timing_fns(event_factory, synchronize_fn)
 
     def _time_single_samples(p: object, reps: int) -> list[float]:
         samples: list[float] = []
         for _ in range(max(1, int(reps))):
-            start_ev = event_factory()
-            end_ev = event_factory()
+            start_ev = eff_event()
+            end_ev = eff_event()
             start_ev.record()
-            _invoke(p)
+            _invoke_callable(func, p)
             end_ev.record()
-            synchronize_fn()
+            eff_sync()
             samples.append(float(start_ev.elapsed_time(end_ev)) * 1000.0)
         return samples
 
     for _ in range(max(1, int(warmup))):
-        _invoke(params)
-    synchronize_fn()
+        _invoke_callable(func, params)
+    eff_sync()
 
     eff_probe_us = first_probe_us
     if eff_probe_us is None and (t_hw_us is None or float(t_hw_us) >= COLD_L2_HW_THRESHOLD_US):
@@ -639,19 +675,19 @@ def measure_npu_ring_burst_stats(
         return med, 1, cv, 0
 
     for step in range(min(k, max(1, int(warmup)))):
-        _invoke(ring_inputs[step % k])
-    synchronize_fn()
+        _invoke_callable(func, ring_inputs[step % k])
+    eff_sync()
 
     def _collect_burst_samples() -> list[float]:
         collected: list[float] = []
         for _ in range(max(1, int(repeat))):
-            start_ev = event_factory()
-            end_ev = event_factory()
+            start_ev = eff_event()
+            end_ev = eff_event()
             start_ev.record()
             for step in range(k):
-                _invoke(ring_inputs[step % k])
+                _invoke_callable(func, ring_inputs[step % k])
             end_ev.record()
-            synchronize_fn()
+            eff_sync()
             total_us = float(start_ev.elapsed_time(end_ev)) * 1000.0
             collected.append(total_us / float(k))
         return collected
@@ -713,6 +749,103 @@ def measure_npu_ring_burst_us(
         max_vram_bytes=max_vram_bytes,
     )
     return med, k
+
+
+def measure_paired_interleaved_micro_burst(
+    candidates: Sequence[tuple[str, Callable[..., object]]],
+    params: object,
+    *,
+    warmup: int = 3,
+    repeat: int = 7,
+    t_hw_us: float | None = None,
+    first_probe_us: float | None = None,
+    event_factory: Callable[[], object] | None = None,
+    synchronize_fn: Callable[[], None] | None = None,
+    clone_fn: Callable[[object], object] | None = None,
+    max_vram_bytes: int = RING_BURST_MAX_VRAM_BYTES,
+) -> dict[str, tuple[float, int, float, float, float]]:
+    """Run B-round interleaved micro-burst timing across candidates on shared buffers.
+
+    Returns ``{cid: (median_us, ring_burst_k, raw_cv, med_ratio_vs_0, paired_rel_mad)}``.
+    """
+    if not candidates:
+        return {}
+    eff_event, eff_sync = _resolve_npu_timing_fns(event_factory, synchronize_fn)
+
+    def _time_once(
+        fn: Callable[..., object],
+        ring_inputs: Sequence[object],
+        round_idx: int,
+        k: int,
+    ) -> float:
+        start_ev = eff_event()
+        end_ev = eff_event()
+        start_ev.record()
+        for step in range(k):
+            _invoke_callable(fn, ring_inputs[(round_idx + step) % len(ring_inputs)])
+        end_ev.record()
+        eff_sync()
+        return (float(start_ev.elapsed_time(end_ev)) * 1000.0) / float(k)
+
+    warm_iters = max(1, int(warmup))
+    for _cid, fn in candidates:
+        for _ in range(warm_iters):
+            _invoke_callable(fn, params)
+    eff_sync()
+
+    eff_probe_us = first_probe_us
+    if eff_probe_us is None and (
+        t_hw_us is None
+        or not math.isfinite(float(t_hw_us))
+        or float(t_hw_us) >= COLD_L2_HW_THRESHOLD_US
+    ):
+        eff_probe_us = _time_once(candidates[0][1], (params,), 0, 1)
+
+    per_call_bytes = estimate_params_io_bytes(params)
+    k = compute_ring_burst_k(
+        per_call_bytes,
+        t_hw_us=t_hw_us,
+        first_probe_us=eff_probe_us,
+        max_vram_bytes=max_vram_bytes,
+    )
+    ring_inputs: list[object] = [params]
+    if k > 1:
+        try:
+            ring_inputs = allocate_rotating_ring_params(params, k, clone_fn=clone_fn)
+            for step in range(min(k, warm_iters)):
+                _invoke_callable(candidates[0][1], ring_inputs[step % k])
+            eff_sync()
+        except RuntimeError:
+            k = 1
+            ring_inputs = [params]
+
+    num_rounds = max(7, int(repeat))
+    num_cands = len(candidates)
+    samples_by_idx: list[list[float]] = [[] for _ in range(num_cands)]
+    for round_idx in range(num_rounds):
+        for offset in range(num_cands):
+            idx = (offset + round_idx) % num_cands
+            _cid, fn = candidates[idx]
+            samples_by_idx[idx].append(_time_once(fn, ring_inputs, round_idx, k))
+
+    ref_samples = samples_by_idx[0]
+    out: dict[str, tuple[float, int, float, float, float]] = {}
+    for idx, (cid, _fn) in enumerate(candidates):
+        cand_samples = samples_by_idx[idx]
+        cand_us, raw_cv = _median_and_cv(cand_samples)
+        if idx == 0:
+            med_r = 1.0
+            rel_mad = 0.0
+        else:
+            ratios = [
+                ref_samples[b] / max(cand_samples[b], 1e-9)
+                for b in range(num_rounds)
+            ]
+            med_r = float(statistics.median(ratios))
+            mad_r = float(statistics.median([abs(x - med_r) for x in ratios]))
+            rel_mad = mad_r / max(med_r, 1e-9)
+        out[cid] = (cand_us, k, raw_cv, med_r, rel_mad)
+    return out
 
 
 def aggregate_surrogate_result(
@@ -4119,6 +4252,29 @@ def _l3_structured_failure(
     return None
 
 
+def _candidate_failed_node_names(rows: Sequence[Mapping[str, object]]) -> set[str]:
+    """Return node names that carry an explicit structured candidate failure row."""
+    return {
+        str(row.get("node") or "").strip()
+        for row in rows
+        if str(row.get("kind") or "").strip().lower() == "candidate"
+        and str(row.get("node") or "").strip()
+    }
+
+
+def _is_collateral_missing_case_row(
+    row: Mapping[str, object],
+    candidate_failed_nodes: set[str],
+) -> bool:
+    """Return True only for collateral missing_case rows on a candidate-failed node."""
+    if str(row.get("kind") or "").strip().lower() != "coverage":
+        return False
+    if str(row.get("category") or "").strip().lower() != "missing_case":
+        return False
+    node_name = str(row.get("node") or "").strip()
+    return bool(node_name and node_name in candidate_failed_nodes)
+
+
 def _l3_candidate_numeric_failure(
     marker: Mapping[str, object],
     evidence: Mapping[str, object],
@@ -4157,11 +4313,13 @@ def _l3_candidate_numeric_failure(
         return False
     failures = evidence.get("failures")
     if isinstance(failures, Sequence) and not isinstance(failures, (str, bytes)):
+        failure_rows = [row for row in failures if isinstance(row, Mapping)]
+        candidate_nodes = _candidate_failed_node_names([marker, *failure_rows])
         blocked = {"infrastructure", "coverage"}
         if any(
-            isinstance(row, Mapping)
-            and str(row.get("kind") or "").strip().lower() in blocked
-            for row in failures
+            str(row.get("kind") or "").strip().lower() in blocked
+            and not _is_collateral_missing_case_row(row, candidate_nodes)
+            for row in failure_rows
         ):
             return False
     nodes = evidence.get("nodes")
@@ -4278,10 +4436,21 @@ def _l3_candidate_kernel_failure(
         for node in nodes
         if isinstance(node, Mapping) and node.get("name")
     }
+    candidate_nodes = {
+        str(row.get("node") or "").strip()
+        for row in rows
+        if str(row.get("node") or "").strip()
+        and (
+            str(row.get("kind") or "").strip().lower() == "candidate"
+            or _is_candidate_kernel_marker(row, node_records=node_records)
+        )
+    }
     matched = False
     for row in rows:
         if _is_candidate_kernel_marker(row, node_records=node_records):
             matched = True
+            continue
+        if _is_collateral_missing_case_row(row, candidate_nodes):
             continue
         kind = str(row.get("kind") or "").strip().lower()
         if kind in {"infrastructure", "coverage"}:
@@ -5470,6 +5639,7 @@ __all__ = [
     "extract_ordered_tensor_shapes",
     "lookup_case_static_spec",
     "measure_npu_ring_burst_stats",
+    "measure_paired_interleaved_micro_burst",
     "order_candidates_by_idle_preflight",
     "prewarm_anchor_reference_cache",
     "prewarm_surrogate_tilelang_cache",
