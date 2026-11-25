@@ -2105,16 +2105,21 @@ def _compact_trackb_snippet_source(
         return snippet_source
     lines = snippet_source.splitlines(keepends=True)
     hits = _find_top_level_str_assign_span(tree, lines, set(regime_spec.trackb_symbols))
+    surrounding_bytes = len(snippet_source.encode("utf-8")) - sum(
+        len(snippet_source[start_pos:end_pos].encode("utf-8"))
+        for _sym, _cpp, start_pos, end_pos in hits
+    )
+    cpp_budget = max(4096, (max_bytes - surrounding_bytes - 128) // max(1, len(hits)))
     replacements: list[tuple[int, int, str]] = []
     for sym_name, cpp_text, start_pos, end_pos in hits:
-        if len(cpp_text.encode("utf-8")) <= max_bytes:
+        if len(cpp_text.encode("utf-8")) <= cpp_budget:
             continue
         view = build_trackb_context_view(
             cpp_text,
             regime_tag=regime_spec.regime_tag,
             module_source=incumbent_source or snippet_source,
             trackb_symbol=sym_name,
-            max_bytes=max_bytes,
+            max_bytes=cpp_budget,
             active_kernel=active_kernel,
             focus_lines=focus_lines,
             diagnostic_text=diagnostic_text,

@@ -359,6 +359,13 @@ def select_active_trackb_kernel(
     )
     launched_names = outside_launched_names or cpp_launched_names
     tag = str(regime_tag or "").lower()
+
+    def _kernel_rank(unit: _CppUnit) -> tuple[int, int]:
+        is_f32_fallback = (
+            "f32" in unit.name.lower() or "fp32" in unit.name.lower()
+        ) and ("f32" not in tag and "fp32" not in tag)
+        return (0 if is_f32_fallback else 1, unit.line_count)
+
     if tag:
         tokens = [tok for tok in re.split(r"[^a-z0-9]+", tag) if len(tok) >= 3]
         scored = sorted(
@@ -366,18 +373,19 @@ def select_active_trackb_kernel(
             key=lambda u: (
                 -sum(1 for t in tokens if t in u.name.lower()),
                 -(1 if u.name in launched_names else 0),
-                -u.line_count,
+                -_kernel_rank(u)[0],
+                -_kernel_rank(u)[1],
             ),
         )
         if scored and any(t in scored[0].name.lower() for t in tokens):
             return scored[0].name
     if outside_launched_names:
         launched = [u for u in kernels if u.name in outside_launched_names]
-        return max(launched, key=lambda u: u.line_count).name
+        return max(launched, key=_kernel_rank).name
     if cpp_launched_names:
         launched = [u for u in kernels if u.name in cpp_launched_names]
         if launched:
-            return max(launched, key=lambda u: u.line_count).name
+            return max(launched, key=_kernel_rank).name
     if outside_cpp:
         called = [
             unit
@@ -385,7 +393,7 @@ def select_active_trackb_kernel(
             if f"{unit.name}<" in outside_cpp or f"{unit.name}(" in outside_cpp
         ]
         if called:
-            return max(called, key=lambda u: u.line_count).name
+            return max(called, key=_kernel_rank).name
     return kernels[0].name
 
 

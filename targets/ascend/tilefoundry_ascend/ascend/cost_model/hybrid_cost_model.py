@@ -848,7 +848,7 @@ class HybridAscendCostModel:
     def weights_by_name(self) -> dict[str, float]:
         specs = self._basis_registry.head0_specs()
         out = {spec.name: self._weights_by_name.get(spec.name, 0.0) for spec in specs}
-        if "intercept" in out and "intercept" in self._active_global_specs:
+        if "intercept" in out and self._samples:
             out["intercept"] = out["intercept"] + self._global_intercept
         return out
 
@@ -867,7 +867,7 @@ class HybridAscendCostModel:
         out: dict[str, dict[str, float]] = {}
         for bucket, wmap in self._bucket_weights_by_name.items():
             b_out = {spec.name: wmap.get(spec.name, 0.0) for spec in specs}
-            if "intercept" in b_out and "intercept" in self._active_bucket_specs.get(bucket, ()):
+            if "intercept" in b_out:
                 b_out["intercept"] = b_out["intercept"] + self._bucket_intercepts.get(
                     bucket, self._global_intercept
                 )
@@ -1474,12 +1474,14 @@ class HybridAscendCostModel:
             if b_key != "global":
                 by_bucket.setdefault(b_key, []).append(row)
 
+        centered_specs = tuple(spec for spec in head0_specs if spec.name != "intercept")
         self._bucket_sample_counts = {bkt: len(rows) for bkt, rows in by_bucket.items()}
         self._weights_by_name, self._active_global_specs = self._solve_gated_ridge(
             global_rows,
-            head0_specs,
+            centered_specs,
             alpha=self.ridge_alpha,
         )
+        self._weights_by_name.setdefault("intercept", 0.0)
 
         shrink_alpha = max(2.0, self.ridge_alpha * 2.0)
         new_bucket_weights: dict[str, dict[str, float]] = {}
@@ -1487,12 +1489,13 @@ class HybridAscendCostModel:
         for bucket, b_rows in by_bucket.items():
             b_weights, b_active = self._solve_gated_ridge(
                 b_rows,
-                head0_specs,
+                centered_specs,
                 alpha=shrink_alpha,
                 prior_weights=self._weights_by_name,
             )
             if not b_active:
                 continue
+            b_weights.setdefault("intercept", 0.0)
             new_bucket_weights[bucket] = b_weights
             new_active_bucket_specs[bucket] = b_active
         self._bucket_weights_by_name = new_bucket_weights
