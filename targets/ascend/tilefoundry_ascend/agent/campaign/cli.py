@@ -149,6 +149,8 @@ def main(argv: list[str] | None = None) -> int:
                 int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
             ),
             cost_model_mode=str(args.cost_model_mode),
+            cost_disengage_eta=float(args.cost_disengage_eta),
+            cost_slow_gain_threshold=float(args.cost_slow_gain_threshold),
             pure_golden=bool(args.pure_golden),
             llm_backend=args.llm_backend,
             exploit_model=args.exploit_model,

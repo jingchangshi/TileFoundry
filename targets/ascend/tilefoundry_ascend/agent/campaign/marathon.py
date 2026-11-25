@@ -243,6 +243,9 @@ class MarathonConfig:
     enable_tilesize_prescreen: bool = True
     cost_prescreen_top_k: int | None = None
     cost_model_mode: str = "auto"
+    cost_disengage_eta: float = 0.65
+    cost_slow_gain_threshold: float = 0.03
+    allow_unreviewed_distilled_rules: bool = False
     salvage_beam_candidates: bool = True
     resume: bool | None = None
     escalate_model: str | None = None
@@ -2021,9 +2024,16 @@ def run_operator_marathon(
         min_optimization_rounds=cfg.min_optimization_rounds,
         per_anchor_max_us={},
     )
-    extra_campaign_kwargs: dict[str, str] = {}
-    if any(f.name == "cost_model_mode" for f in fields(CampaignConfig)):
-        extra_campaign_kwargs["cost_model_mode"] = cfg.cost_model_mode
+    extra_campaign_kwargs: dict[str, object] = {}
+    campaign_field_names = {f.name for f in fields(CampaignConfig)}
+    for field_name in (
+        "cost_model_mode",
+        "cost_disengage_eta",
+        "cost_slow_gain_threshold",
+        "allow_unreviewed_distilled_rules",
+    ):
+        if field_name in campaign_field_names:
+            extra_campaign_kwargs[field_name] = getattr(cfg, field_name)
     campaign_cfg = CampaignConfig(
         operator_name=cfg.operator_name,
         max_rounds=cfg.max_rounds,
@@ -2050,7 +2060,10 @@ def run_operator_marathon(
         pure_golden=cfg.pure_golden,
         **extra_campaign_kwargs,
     )
-    tracker = BayesianRuleTracker.from_experience_lake(lake_dir)
+    tracker = BayesianRuleTracker.from_experience_lake(
+        lake_dir,
+        allow_unreviewed_distilled_rules=cfg.allow_unreviewed_distilled_rules,
+    )
     flywheel = FlywheelDistiller(
         funnel=GateFunnel(skip_stage_b=True),
         tracker=tracker,
@@ -2699,8 +2712,26 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--cost-model-mode",
+        choices=("auto", "coarse_only", "off"),
         default="auto",
-        help="Cost model lifecycle mode (e.g. auto, off, always).",
+        help="Cost model prescreen gate policy mode.",
+    )
+    parser.add_argument(
+        "--cost-disengage-eta",
+        type=float,
+        default=0.65,
+        help="Roofline eta threshold above which cost model auto-disengages.",
+    )
+    parser.add_argument(
+        "--cost-slow-gain-threshold",
+        type=float,
+        default=0.03,
+        help="Local relative gain threshold below which cost model disengages when eta >= disengage_eta.",
+    )
+    parser.add_argument(
+        "--allow-unreviewed-distilled-rules",
+        action="store_true",
+        help="Allow unreviewed distilled experience-lake rules during campaign.",
     )
     parser.add_argument(
         "--disable-early-goal-stop",
@@ -2793,6 +2824,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             int(args.cost_prescreen_top_k) if args.cost_prescreen_top_k is not None else None
         ),
         cost_model_mode=str(args.cost_model_mode),
+        cost_disengage_eta=float(args.cost_disengage_eta),
+        cost_slow_gain_threshold=float(args.cost_slow_gain_threshold),
+        allow_unreviewed_distilled_rules=bool(args.allow_unreviewed_distilled_rules),
         llm_backend=args.llm_backend,
         exploit_model=args.exploit_model,
         explore_model=args.explore_model,

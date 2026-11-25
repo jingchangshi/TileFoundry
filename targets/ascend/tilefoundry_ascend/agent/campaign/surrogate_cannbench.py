@@ -13,15 +13,17 @@ import os
 import re
 import shlex
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 import uuid
 from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
 
@@ -146,6 +148,9 @@ class AnchorEvalMetrics:
     eq3_score: float
     error_message: str = ""
     ring_burst_k: int = 1
+    burst_batch_cv: float = 0.0
+    spike_retries: int = 0
+    card_ext_hbm_mb: int = 0
 
     def to_dict(self) -> dict[str, object]:
         """Serialize anchor evaluation metrics to a JSON-compatible dictionary."""
@@ -161,6 +166,9 @@ class AnchorEvalMetrics:
             "eq3_score": round(self.eq3_score, 6),
             "error_message": self.error_message,
             "ring_burst_k": int(self.ring_burst_k),
+            "burst_batch_cv": round(self.burst_batch_cv, 6),
+            "spike_retries": int(self.spike_retries),
+            "card_ext_hbm_mb": int(self.card_ext_hbm_mb),
         }
 
     @classmethod
@@ -178,6 +186,9 @@ class AnchorEvalMetrics:
             eq3_score=float(payload["eq3_score"]),
             error_message=str(payload.get("error_message", "")),
             ring_burst_k=max(1, int(payload.get("ring_burst_k", 1) or 1)),
+            burst_batch_cv=float(payload.get("burst_batch_cv", 0.0) or 0.0),
+            spike_retries=max(0, int(payload.get("spike_retries", 0) or 0)),
+            card_ext_hbm_mb=max(0, int(payload.get("card_ext_hbm_mb", 0) or 0)),
         )
 
 
@@ -414,6 +425,9 @@ def build_anchor_metrics(
     cand_us: float,
     error_message: str = "",
     ring_burst_k: int = 1,
+    burst_batch_cv: float = 0.0,
+    spike_retries: int = 0,
+    card_ext_hbm_mb: int = 0,
 ) -> AnchorEvalMetrics:
     """Compute speedup, Roofline eta, and Eq.3 score from measured latency."""
     valid_lat = accuracy_passed and math.isfinite(cand_us) and cand_us > 0.0
@@ -421,6 +435,11 @@ def build_anchor_metrics(
     speedup = (spec.ref_perf_us / safe_lat) if (valid_lat and spec.ref_perf_us > 0.0) else 0.0
     eta = (spec.t_hw_us / safe_lat) if (valid_lat and spec.t_hw_us > 0.0) else 0.0
     eq3 = compute_case_eq3_score(spec.ref_perf_us, safe_lat, spec.t_hw_us) if valid_lat else 0.0
+    safe_cv = (
+        float(burst_batch_cv)
+        if math.isfinite(float(burst_batch_cv)) and float(burst_batch_cv) >= 0.0
+        else 0.0
+    )
     return AnchorEvalMetrics(
         case_num=spec.case_num,
         regime_tag=spec.regime_tag,
@@ -433,6 +452,9 @@ def build_anchor_metrics(
         eq3_score=eq3,
         error_message=error_message,
         ring_burst_k=max(1, int(ring_burst_k)),
+        burst_batch_cv=safe_cv,
+        spike_retries=max(0, int(spike_retries)),
+        card_ext_hbm_mb=max(0, int(card_ext_hbm_mb)),
     )
 
 
@@ -541,7 +563,13 @@ def allocate_rotating_ring_params(
     return [_clone_param_tree(params, clone_fn) for _ in range(count)]
 
 
-def measure_npu_ring_burst_us(
+def _median_and_cv(samples: Sequence[float]) -> tuple[float, float]:
+    med = float(statistics.median(samples))
+    cv = float(statistics.pstdev(samples)) / max(med, 1e-9) if len(samples) >= 2 else 0.0
+    return med, cv
+
+
+def measure_npu_ring_burst_stats(
     func: Callable[..., object],
     params: object,
     *,
@@ -553,10 +581,8 @@ def measure_npu_ring_burst_us(
     synchronize_fn: Callable[[], None] | None = None,
     clone_fn: Callable[[object], object] | None = None,
     max_vram_bytes: int = RING_BURST_MAX_VRAM_BYTES,
-) -> tuple[float, int]:
-    """Measure micro-anchor latency with cold-L2 rotating ring-buffer burst enqueueing."""
-    import statistics  # noqa: PLC0415
-
+) -> tuple[float, int, float, int]:
+    """Measure micro-anchor latency returning (median_us, ring_burst_k, cv, spike_retries)."""
     is_real_npu = event_factory is None and synchronize_fn is None
     if event_factory is None or synchronize_fn is None:
         import torch  # noqa: PLC0415
@@ -574,7 +600,7 @@ def measure_npu_ring_burst_us(
         else:
             func(p)
 
-    def _time_single(p: object, reps: int) -> float:
+    def _time_single_samples(p: object, reps: int) -> list[float]:
         samples: list[float] = []
         for _ in range(max(1, int(reps))):
             start_ev = event_factory()
@@ -584,7 +610,7 @@ def measure_npu_ring_burst_us(
             end_ev.record()
             synchronize_fn()
             samples.append(float(start_ev.elapsed_time(end_ev)) * 1000.0)
-        return float(statistics.median(samples))
+        return samples
 
     for _ in range(max(1, int(warmup))):
         _invoke(params)
@@ -592,7 +618,7 @@ def measure_npu_ring_burst_us(
 
     eff_probe_us = first_probe_us
     if eff_probe_us is None and (t_hw_us is None or float(t_hw_us) >= COLD_L2_HW_THRESHOLD_US):
-        eff_probe_us = _time_single(params, 1)
+        eff_probe_us = float(statistics.median(_time_single_samples(params, 1)))
 
     per_call_bytes = estimate_params_io_bytes(params)
     k = compute_ring_burst_k(
@@ -602,12 +628,14 @@ def measure_npu_ring_burst_us(
         max_vram_bytes=max_vram_bytes,
     )
     if k <= 1:
-        return _time_single(params, repeat), 1
+        med, cv = _median_and_cv(_time_single_samples(params, repeat))
+        return med, 1, cv, 0
 
     try:
         ring_inputs = allocate_rotating_ring_params(params, k, clone_fn=clone_fn)
     except RuntimeError:
-        return _time_single(params, repeat), 1
+        med, cv = _median_and_cv(_time_single_samples(params, repeat))
+        return med, 1, cv, 0
 
     for step in range(min(k, max(1, int(warmup)))):
         _invoke(ring_inputs[step % k])
@@ -628,29 +656,62 @@ def measure_npu_ring_burst_us(
         return collected
 
     samples_us = _collect_burst_samples()
-    if len(samples_us) >= 3:
-        med = float(statistics.median(samples_us))
-        cv = float(statistics.pstdev(samples_us)) / max(med, 1e-9)
-        if cv > 0.12:
-            batches: list[tuple[list[float], float, float]] = [(samples_us, med, cv)]
-            for _ in range(2):
-                if is_real_npu:
-                    time.sleep(0.02)
-                retry_samples = _collect_burst_samples()
-                retry_med = float(statistics.median(retry_samples))
-                retry_cv = float(statistics.pstdev(retry_samples)) / max(retry_med, 1e-9)
-                batches.append((retry_samples, retry_med, retry_cv))
-                if retry_cv <= 0.12:
-                    break
-            clean_batches = [b for b in batches if b[2] <= 0.12]
-            if clean_batches:
-                best = min(clean_batches, key=lambda b: (b[1], b[2]))
-                return float(best[1]), k
-            pooled = sorted(val for batch, _, _ in batches for val in batch)
-            keep = max(3, (len(pooled) + 1) // 2)
-            return float(statistics.median(pooled[:keep])), k
-        return med, k
-    return float(statistics.median(samples_us)), k
+    if len(samples_us) < 3:
+        med, cv = _median_and_cv(samples_us)
+        return med, k, cv, 0
+
+    med, cv = _median_and_cv(samples_us)
+    if cv <= 0.12:
+        return med, k, cv, 0
+
+    batches: list[tuple[list[float], float, float]] = [(samples_us, med, cv)]
+    spike_retries = 0
+    for _ in range(2):
+        spike_retries += 1
+        if is_real_npu:
+            time.sleep(0.02)
+        retry_samples = _collect_burst_samples()
+        retry_med, retry_cv = _median_and_cv(retry_samples)
+        batches.append((retry_samples, retry_med, retry_cv))
+        if retry_cv <= 0.12:
+            break
+    clean_batches = [b for b in batches if b[2] <= 0.12]
+    if clean_batches:
+        best = min(clean_batches, key=lambda b: (b[1], b[2]))
+        return float(best[1]), k, float(best[2]), spike_retries
+    pooled = sorted(val for batch, _, _ in batches for val in batch)
+    keep = max(3, (len(pooled) + 1) // 2)
+    lower_med, lower_cv = _median_and_cv(pooled[:keep])
+    return lower_med, k, lower_cv, spike_retries
+
+
+def measure_npu_ring_burst_us(
+    func: Callable[..., object],
+    params: object,
+    *,
+    warmup: int = 3,
+    repeat: int = 5,
+    t_hw_us: float | None = None,
+    first_probe_us: float | None = None,
+    event_factory: Callable[[], object] | None = None,
+    synchronize_fn: Callable[[], None] | None = None,
+    clone_fn: Callable[[object], object] | None = None,
+    max_vram_bytes: int = RING_BURST_MAX_VRAM_BYTES,
+) -> tuple[float, int]:
+    """Measure micro-anchor latency with cold-L2 rotating ring-buffer burst enqueueing."""
+    med, k, _cv, _retries = measure_npu_ring_burst_stats(
+        func,
+        params,
+        warmup=warmup,
+        repeat=repeat,
+        t_hw_us=t_hw_us,
+        first_probe_us=first_probe_us,
+        event_factory=event_factory,
+        synchronize_fn=synchronize_fn,
+        clone_fn=clone_fn,
+        max_vram_bytes=max_vram_bytes,
+    )
+    return med, k
 
 
 def aggregate_surrogate_result(
@@ -2470,23 +2531,53 @@ def _normalize_device_pool(
     return tuple(ordered)
 
 
+_STDLIB_SUBPROCESS_RUN = subprocess.run
+
+
 def _run_npu_smi_query(smi: str, args: Sequence[str]) -> str | None:
     """Run read-only npu-smi query with short backoff retries on transient exit 215."""
     retry_backoffs = (0.15, 0.35)
     for attempt in range(len(retry_backoffs) + 1):
         try:
-            proc = subprocess.run(
-                [smi, *args],
-                capture_output=True,
-                text=True,
-                timeout=10.0,
-                check=False,
-            )
+            if subprocess.run is not _STDLIB_SUBPROCESS_RUN:
+                proc = subprocess.run(
+                    [smi, *args],
+                    capture_output=True,
+                    text=True,
+                    timeout=10.0,
+                    check=False,
+                )
+                returncode = proc.returncode
+                stdout = proc.stdout or ""
+            else:
+                child = subprocess.Popen(
+                    [smi, *args],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                timed_out = False
+
+                def _kill_child() -> None:
+                    nonlocal timed_out
+                    timed_out = True
+                    child.kill()
+
+                timer = threading.Timer(10.0, _kill_child)
+                timer.start()
+                try:
+                    stdout_raw, _stderr_raw = child.communicate()
+                finally:
+                    timer.cancel()
+                if timed_out:
+                    return None
+                returncode = child.returncode
+                stdout = stdout_raw or ""
         except (OSError, subprocess.SubprocessError):
             return None
-        if proc.returncode == 0:
-            return proc.stdout or ""
-        if proc.returncode == 215 and attempt < len(retry_backoffs):
+        if returncode == 0:
+            return stdout
+        if returncode == 215 and attempt < len(retry_backoffs):
             time.sleep(retry_backoffs[attempt])
             continue
         return None
@@ -2496,7 +2587,8 @@ def _run_npu_smi_query(smi: str, args: Sequence[str]) -> str | None:
 def _probe_host_card_load(
     device_id: str,
     *,
-    max_quiet_hbm_mb: int = 16384,
+    max_quiet_hbm_mb: int | None = None,
+    env_vals: Mapping[str, str] | None = None,
 ) -> tuple[int, int, int] | None:
     """Probe card lock/quarantine/process load as (tier, total_mem_mb, proc_count).
 
@@ -2506,7 +2598,21 @@ def _probe_host_card_load(
     if not txt.isdigit():
         return None
     dev_idx = int(txt)
-    lock_dir_raw = os.environ.get("AGENT_GATES_DEVICE_LOCK_ROOT", "").strip()
+    if max_quiet_hbm_mb is not None:
+        resolved_max_hbm = max(256, int(max_quiet_hbm_mb))
+    else:
+        raw_hbm = (
+            (env_vals.get("TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB", "") if env_vals is not None else "")
+            or os.environ.get("TILEFOUNDRY_NPU_SHARED_MAX_HBM_MB", "")
+        ).strip()
+        try:
+            resolved_max_hbm = max(256, int(raw_hbm)) if raw_hbm else 16384
+        except ValueError:
+            resolved_max_hbm = 16384
+    lock_dir_raw = (
+        (env_vals.get("AGENT_GATES_DEVICE_LOCK_ROOT", "") if env_vals is not None else "")
+        or os.environ.get("AGENT_GATES_DEVICE_LOCK_ROOT", "")
+    ).strip()
     lock_root = (
         Path(lock_dir_raw).expanduser()
         if lock_dir_raw
@@ -2529,7 +2635,12 @@ def _probe_host_card_load(
             return (3, 999999, 999999)
         finally:
             os.close(fd)
-    smi = shutil.which(os.environ.get("AGENT_GATES_SMI_COMMAND") or "npu-smi")
+    smi_cmd = (
+        (env_vals.get("AGENT_GATES_SMI_COMMAND", "") if env_vals is not None else "").strip()
+        or os.environ.get("AGENT_GATES_SMI_COMMAND")
+        or "npu-smi"
+    )
+    smi = shutil.which(smi_cmd)
     if smi is None:
         return None
     map_out = _run_npu_smi_query(smi, ("info", "-m"))
@@ -2557,7 +2668,7 @@ def _probe_host_card_load(
     if proc_ids:
         mem_matches = re.findall(r"Process memory\(MB\)\s*:\s*(\d+)", proc_out)
         total_mem_mb = sum(int(val) for val in mem_matches)
-        tier = 1 if total_mem_mb <= max_quiet_hbm_mb else 2
+        tier = 1 if total_mem_mb <= resolved_max_hbm else 2
         return (tier, total_mem_mb, len(proc_ids))
     if re.search(r"^\s*No process in device\.?\s*$", proc_out, re.MULTILINE):
         return (0, 0, 0)
@@ -2576,6 +2687,7 @@ def order_candidates_by_idle_preflight(
     device_id: str,
     device_pool: Sequence[str] = (),
     excluded: Collection[str] = (),
+    env_vals: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
     """Order candidate cards: free, unknown, quiet shared (lightest first), heavy, locked."""
     candidates = _normalize_device_pool(device_id, device_pool, excluded=excluded)
@@ -2587,7 +2699,7 @@ def order_candidates_by_idle_preflight(
     tier2: list[tuple[int, int, int, str]] = []
     tier3: list[str] = []
     for pool_idx, card in enumerate(candidates):
-        load = _probe_host_card_load(card)
+        load = _probe_host_card_load(card, env_vals=env_vals)
         if load is None:
             unknown_cards.append(card)
             continue
@@ -2615,12 +2727,14 @@ def select_idle_campaign_device(
     device_id: str,
     device_pool: Sequence[str] = (),
     excluded: Collection[str] = (),
+    env_vals: Mapping[str, str] | None = None,
 ) -> str:
     """Select the highest-priority idle or fallback device from the candidate pool."""
     ordered = order_candidates_by_idle_preflight(
         device_id,
         device_pool,
         excluded=excluded,
+        **({"env_vals": env_vals} if env_vals is not None else {}),
     )
     return ordered[0] if ordered else str(device_id or "").strip()
 
@@ -2747,12 +2861,19 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
         timeout_sec=float(timeout_sec),
         device_id=str(device_id),
         device_pool=device_pool,
+        env_vals=env_vals,
     )
     _verify_fast_bindings(raw_resp, staged)
     _verify_fast_coverage(
         raw_resp,
         expected_candidates=sum(len(cands) for _op, cands, _anchors in batches),
         expected_msprof_targets=0,
+    )
+    raw_ext_hbm = raw_resp.get("_selected_card_ext_hbm_mb", 0)
+    selected_card_ext_hbm_mb = (
+        max(0, int(raw_ext_hbm))
+        if isinstance(raw_ext_hbm, (int, float)) and not isinstance(raw_ext_hbm, bool)
+        else 0
     )
     operators_raw = _fast_response_mapping(raw_resp, "operators")
     out_by_op: dict[str, dict[str, CandidateSurrogateResult]] = {}
@@ -2772,6 +2893,16 @@ def run_multi_operator_surrogate_batch_via_agent_gates(
                     f"fast response has no result for {op_name}/{candidate_id}"
                 )
             result = CandidateSurrogateResult.from_dict(item)
+            if selected_card_ext_hbm_mb > 0 and any(
+                anc.card_ext_hbm_mb == 0 for anc in result.anchors
+            ):
+                updated_anchors = tuple(
+                    replace(anc, card_ext_hbm_mb=selected_card_ext_hbm_mb)
+                    if anc.card_ext_hbm_mb == 0
+                    else anc
+                    for anc in result.anchors
+                )
+                result = replace(result, anchors=updated_anchors)
             parsed_candidates[candidate_id] = result
             if not result.all_passed:
                 failures.append(f"{op_name}/{candidate_id}")
@@ -2944,6 +3075,7 @@ def _collect_profile_via_agent_gates(
         timeout_sec=float(timeout_sec),
         device_id=str(device_id),
         device_pool=device_pool,
+        env_vals=env_vals,
     )
     _verify_fast_bindings(
         raw_resp,
@@ -3762,6 +3894,7 @@ def _submit_fast_gate(
     timeout_sec: float,
     device_id: str,
     device_pool: Sequence[str] = (),
+    env_vals: Mapping[str, str] | None = None,
 ) -> tuple[Mapping[str, object], _V2GateExecution]:
     """Submit the device-fast target with idle card selection and contamination retest."""
     if _sha256_file(request_path) != request_sha256:
@@ -3773,12 +3906,14 @@ def _submit_fast_gate(
     occupancy_budget = min(max(float(timeout_sec), 10.0), 240.0)
     total_occupancy_sleep = 0.0
     rejected_cards: set[str] = set()
+    selected_card = ""
     execution: _V2GateExecution | None = None
     for pass_idx in range(max_pool_passes):
         candidates = order_candidates_by_idle_preflight(
             device_id,
             device_pool,
             excluded=rejected_cards,
+            **({"env_vals": env_vals} if env_vals is not None else {}),
         )
         if not candidates:
             if not rejected_cards and str(device_id or "").strip():
@@ -3832,6 +3967,7 @@ def _submit_fast_gate(
                 )
                 contaminated_in_pass = True
                 continue
+            selected_card = card
             break
         else:
             if (
@@ -3892,6 +4028,11 @@ def _submit_fast_gate(
         mode=mode,
     )
     _raise_for_fast_status(status, raw)
+    probe_card = selected_card or execution.device_id or str(device_id or "").strip()
+    load = _probe_host_card_load(probe_card, env_vals=env_vals) if probe_card else None
+    selected_card_ext_hbm_mb = int(load[1]) if (load is not None and load[0] < 3) else 0
+    if selected_card_ext_hbm_mb > 0:
+        raw.setdefault("_selected_card_ext_hbm_mb", selected_card_ext_hbm_mb)
     return raw, execution
 
 
@@ -4397,7 +4538,13 @@ def run_l3_full_contract_via_agent_gates(
     TileFoundry supplies only the canonical target and the workspace-relative candidate;
     the signed receipt must bind the actual imported candidate digest and full coverage.
     """
-    _ = env_file
+    env_vals: dict[str, str] | None = None
+    try:
+        resolved_env = _resolve_env_file_path(env_file)
+    except FileNotFoundError:
+        resolved_env = None
+    if resolved_env is not None:
+        env_vals = parse_simple_env_file(resolved_env)
     result_device = str(device_id or "")
     started = time.monotonic()
 
@@ -4476,6 +4623,7 @@ def run_l3_full_contract_via_agent_gates(
             result_device,
             device_pool,
             excluded=rejected_cards,
+            **({"env_vals": env_vals} if env_vals is not None else {}),
         )
         if not candidates:
             candidates = (result_device,)
@@ -4856,6 +5004,7 @@ def run_micro_probe_via_agent_gates(
         timeout_sec=float(timeout_sec),
         device_id=str(device_id),
         device_pool=device_pool,
+        env_vals=env_vals,
     )
     _verify_fast_bindings(raw_resp, staged)
     _verify_fast_coverage(raw_resp, expected_candidates=2, expected_msprof_targets=0)
@@ -5289,6 +5438,7 @@ __all__ = [
     "ensure_npu_compare_shim_dir",
     "extract_ordered_tensor_shapes",
     "lookup_case_static_spec",
+    "measure_npu_ring_burst_stats",
     "order_candidates_by_idle_preflight",
     "prewarm_anchor_reference_cache",
     "prewarm_surrogate_tilelang_cache",

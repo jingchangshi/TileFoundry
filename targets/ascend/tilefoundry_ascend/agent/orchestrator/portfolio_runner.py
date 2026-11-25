@@ -1109,7 +1109,7 @@ class PortfolioRunner:
         target_roofline_eta: float = 0.85,
         prev_local_rel_gain: float | None = None,
         mean_recoverable_excess_us: float | None = None,
-        disengage_roofline_eta: float = 0.85,
+        disengage_roofline_eta: float = 0.65,
         slow_gain_threshold: float = 0.03,
         focus_lines: Sequence[int] = (),
     ) -> tuple[WorkerSpec, ...]:

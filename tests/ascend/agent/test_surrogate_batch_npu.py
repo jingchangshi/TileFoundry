@@ -48,6 +48,7 @@ from tilefoundry_ascend.agent.campaign.surrogate_cannbench import (
     aggregate_surrogate_result,
     build_anchor_metrics,
     ensure_npu_compare_shim_dir,
+    measure_npu_ring_burst_stats,
     measure_npu_ring_burst_us,
 )
 from tilefoundry_ascend.agent.flywheel.ablation_distiller import (
@@ -147,6 +148,32 @@ def _measure_npu_latency_us(fn_call, *, warmup: int, repeat: int) -> float:
             torch.npu.synchronize()
             samples_ms.append(float(start_ev.elapsed_time(end_ev)))
         return float(statistics.median(samples_ms)) * 1000.0
+
+
+def _measure_npu_latency_stats_us(
+    fn_call,
+    *,
+    warmup: int,
+    repeat: int,
+) -> tuple[float, float]:
+    """Collect NPU Event latency samples and return (median_us, batch_cv)."""
+    if not hasattr(getattr(torch, "npu", None), "Event"):
+        return float(_measure_npu_latency_us(fn_call, warmup=warmup, repeat=repeat)), 0.0
+    for _ in range(max(1, warmup)):
+        fn_call()
+    torch.npu.synchronize()
+    samples_us: list[float] = []
+    for _ in range(max(1, repeat)):
+        start_ev = torch.npu.Event(enable_timing=True)
+        end_ev = torch.npu.Event(enable_timing=True)
+        start_ev.record()
+        fn_call()
+        end_ev.record()
+        torch.npu.synchronize()
+        samples_us.append(float(start_ev.elapsed_time(end_ev)) * 1000.0)
+    med = float(statistics.median(samples_us))
+    cv = float(statistics.pstdev(samples_us)) / max(med, 1e-9) if len(samples_us) >= 2 else 0.0
+    return med, cv
 
 
 def _normalize_pmu_ratio(raw_val: int | float) -> float:
@@ -816,31 +843,43 @@ def _evaluate_operator_batch(
                         err_msg = json.dumps(details)[:300]
                     has_npu_event = hasattr(getattr(torch, "npu", None), "Event")
                     ring_burst_k = 1
+                    burst_batch_cv = 0.0
+                    spike_retries = 0
                     if has_npu_event and 0.0 < float(spec.t_hw_us) < 5.0:
-                        cand_us, ring_burst_k = measure_npu_ring_burst_us(
-                            fn,
-                            params,
+                        cand_us, ring_burst_k, burst_batch_cv, spike_retries = (
+                            measure_npu_ring_burst_stats(
+                                fn,
+                                params,
+                                warmup=warmup,
+                                repeat=repeat,
+                                t_hw_us=spec.t_hw_us,
+                                max_vram_bytes=512 * 1024 * 1024,
+                            )
+                        )
+                    elif has_npu_event:
+                        cand_us, burst_batch_cv = _measure_npu_latency_stats_us(
+                            lambda f=fn, p=params: f(**p),
                             warmup=warmup,
                             repeat=repeat,
-                            t_hw_us=spec.t_hw_us,
-                            max_vram_bytes=512 * 1024 * 1024,
                         )
+                        if 0.0 < cand_us < 8.0:
+                            cand_us, ring_burst_k, burst_batch_cv, spike_retries = (
+                                measure_npu_ring_burst_stats(
+                                    fn,
+                                    params,
+                                    warmup=warmup,
+                                    repeat=repeat,
+                                    t_hw_us=spec.t_hw_us,
+                                    first_probe_us=cand_us,
+                                    max_vram_bytes=512 * 1024 * 1024,
+                                )
+                            )
                     else:
                         cand_us = _measure_npu_latency_us(
                             lambda f=fn, p=params: f(**p),
                             warmup=warmup,
                             repeat=repeat,
                         )
-                        if has_npu_event and 0.0 < cand_us < 8.0:
-                            cand_us, ring_burst_k = measure_npu_ring_burst_us(
-                                fn,
-                                params,
-                                warmup=warmup,
-                                repeat=repeat,
-                                t_hw_us=spec.t_hw_us,
-                                first_probe_us=cand_us,
-                                max_vram_bytes=512 * 1024 * 1024,
-                            )
                     per_cand_metrics[cid].append(
                         build_anchor_metrics(
                             spec,
@@ -848,6 +887,8 @@ def _evaluate_operator_batch(
                             cand_us=cand_us,
                             error_message=err_msg,
                             ring_burst_k=ring_burst_k,
+                            burst_batch_cv=burst_batch_cv,
+                            spike_retries=spike_retries,
                         )
                     )
                     if passed and msprof_out is not None and int(spec.case_num) in msprof_case_set:
