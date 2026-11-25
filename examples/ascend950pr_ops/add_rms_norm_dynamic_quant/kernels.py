@@ -35,6 +35,8 @@ def _select_add_rms_norm_dynamic_quant_config(
 ) -> dict[str, object]:
     """Select UB-resident single-pass row packing for Add+RMSNorm+DynamicQuant."""
     d_alloc = ((max(1, int(d_dim)) + 63) // 64) * 64
+    raw_m = max(1, int(m_rows))
+    eff_m_rows = raw_m if raw_m < 128 else (1 << (raw_m - 1).bit_length())
     ub_budget = 256 * 1024 - 4096 if schedule_mode == "tuned" else 192 * 1024
     cache_g_f32 = d_alloc <= 8192
     gamma_bytes = d_alloc * (6 if cache_g_f32 else 2)
@@ -45,9 +47,9 @@ def _select_add_rms_norm_dynamic_quant_config(
             2
             if (
                 schedule_mode == "tuned"
-                and m_rows >= 56 * 2
+                and eff_m_rows >= 56 * 2
                 and d_alloc <= 8192
-                and not (m_rows <= 512 and d_dim <= 512)
+                and not (eff_m_rows <= 512 and d_dim <= 512)
             )
             else 1
         )
@@ -67,15 +69,15 @@ def _select_add_rms_norm_dynamic_quant_config(
         )
         if (d_dim % 64) != 0:
             max_rows = min(max_rows, 32)
-        if m_rows <= 512 and d_dim <= 512:
-            max_rows = max(1, min(max_rows, (m_rows + 55) // 56))
-        elif max_rows > 1 and m_rows >= 112 and m_rows < 56 * max_rows * 2:
-            max_rows = max(1, min(max_rows, max(1, m_rows // 112)))
-        elif max_rows > 1 and m_rows < 56 * max_rows:
-            max_rows = max(1, min(max_rows, max(1, m_rows // 56)))
+        if eff_m_rows <= 512 and d_dim <= 512:
+            max_rows = max(1, min(max_rows, (eff_m_rows + 55) // 56))
+        elif max_rows > 1 and eff_m_rows >= 112 and eff_m_rows < 56 * max_rows * 2:
+            max_rows = max(1, min(max_rows, max(1, eff_m_rows // 112)))
+        elif max_rows > 1 and eff_m_rows < 56 * max_rows:
+            max_rows = max(1, min(max_rows, max(1, eff_m_rows // 56)))
         if (d_dim % 64) == 0 and d_dim < 512:
             cacheline_rows = 512 // math.gcd(512, d_dim)
-            if max_rows >= cacheline_rows and m_rows >= 56 * cacheline_rows * 2:
+            if max_rows >= cacheline_rows and eff_m_rows >= 56 * cacheline_rows * 2:
                 max_rows = max(cacheline_rows, (max_rows // cacheline_rows) * cacheline_rows)
         elif (d_dim % 64) == 0 and max_rows >= 8:
             max_rows = max(4, (max_rows // 4) * 4)

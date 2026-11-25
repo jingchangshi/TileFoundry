@@ -260,34 +260,7 @@ def _build_sparse_flash_attention_prim_func(
                         bn_cur = T.min(bn, top_k - j_base)
                         T.copy(SI[group_id, j_base : j_base + bn_cur], si_ub[:bn_cur])
 
-                        if k_row_stride == 1:
-                            j_valid = T.if_then_else(
-                                bn_cur == bn,
-                                half_bn,
-                                T.max(0, T.min(half_bn, bn_cur - sid * half_bn)),
-                            )
-                            j_cur = T.alloc_var("int32", 0)
-                            while j_cur < j_valid:
-                                raw_idx = si_ub[sid * half_bn + j_cur]
-                                safe_idx = T.min(T.max(raw_idx, 0), s2_dim - 1)
-                                run_len = T.alloc_var("int32", 1)
-                                while (
-                                    (j_cur + run_len < j_valid)
-                                    and (si_ub[sid * half_bn + j_cur + run_len] == raw_idx + run_len)
-                                    and (safe_idx + run_len < s2_dim)
-                                ):
-                                    run_len = run_len + 1
-                                k_gm_row = k_base_row + safe_idx
-                                T.copy(
-                                    K[k_gm_row : k_gm_row + run_len, 0:dk_val],
-                                    K_ub[j_cur : j_cur + run_len, 0:dk_val],
-                                )
-                                j_cur = j_cur + run_len
-                            if bn_cur < bn:
-                                for j_pad in T.serial(half_bn - j_valid):
-                                    jj = j_valid + j_pad
-                                    T.copy(K[k_base_row : k_base_row + 1, 0:dk_val], K_ub[jj : jj + 1, 0:dk_val])
-                        elif bn_cur == bn:
+                        if bn_cur == bn:
                             for j_out in T.serial(half_bn // unroll_j):
                                 for ju in T.unroll(unroll_j):
                                     j = j_out * unroll_j + ju
